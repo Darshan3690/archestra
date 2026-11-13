@@ -1,0 +1,912 @@
+import { describe, expect, test } from "vitest";
+import type { Gemini, OpenAi } from "@/types";
+import {
+  createOpenaiToGeminiStreamTranslator,
+  geminiResponseToOpenai,
+  geminiToOpenai,
+  openaiResponseToGemini,
+  openaiToGemini,
+} from "./gemini-openai-translator";
+
+type OpenAiRequest = OpenAi.Types.ChatCompletionsRequest;
+
+// the translator emits `tools: [{ functionDeclarations: [...] }]`; the Gemini
+// `tools` field is a wider union, so reach the parameters through this shape.
+type SanitizedToolParams = {
+  properties: Record<string, { enum?: unknown; description?: string }>;
+};
+type EmittedTools = Array<{
+  functionDeclarations: Array<{ parameters: SanitizedToolParams }>;
+}>;
+
+function req(overrides: Partial<OpenAiRequest> = {}): OpenAiRequest {
+  return {
+    model: "gemini-2.5-pro",
+    messages: [{ role: "user", content: "hello" }],
+    ...overrides,
+  } as OpenAiRequest;
+}
+
+function firstToolParams(tools: unknown): SanitizedToolParams {
+  return (tools as EmittedTools)[0].functionDeclarations[0].parameters;
+}
+
+describe("openaiToGemini — reasoning and output limits", () => {
+  test.each([
+    ["gemini-2.5-flash", "minimal", { thinkingBudget: 1024 }],
+    ["gemini-2.5-pro", "low", { thinkingBudget: 1024 }],
+    ["gemini-2.5-flash", "medium", { thinkingBudget: 8192 }],
+    ["gemini-2.5-flash-lite", "high", { thinkingBudget: 24576 }],
+    ["gemini-2.5-flash-lite-preview-09-2025", "low", { thinkingBudget: 1024 }],
+    ["gemini-2.5-flash", "none", { thinkingBudget: 0 }],
+    ["gemini-2.5-flash-lite", "none", { thinkingBudget: 0 }],
+    ["gemini-3-flash-preview", "minimal", { thinkingLevel: "minimal" }],
+    ["gemini-3.6-flash", "low", { thinkingLevel: "low" }],
+    ["gemini-3.6-flash-latest", "low", { thinkingLevel: "low" }],
+    ["gemini-3.8-flash", "medium", { thinkingLevel: "medium" }],
+    ["gemini-3-pro-preview", "minimal", { thinkingLevel: "low" }],
+    ["gemini-3.1-pro-preview", "minimal", { thinkingLevel: "low" }],
+    [
+      "gemini-3.1-pro-preview-customtools",
+      "medium",
+      { thinkingLevel: "medium" },
+    ],
+    ["gemini-3-pro-preview", "high", { thinkingLevel: "high" }],
+  ] as const)("maps %s effort %s", (model, reasoning_effort, expected) => {
+    const { geminiBody } = openaiToGemini(req({ model, reasoning_effort }));
+    expect(geminiBody.generationConfig?.thinkingConfig).toEqual(expected);
+  });
+
+  test.each([
+    ["gemini-3.99-flash", "low"],
+    ["gemini-4-argon", "medium"],
+    ["gemini-4-new-family-preview", "high"],
+    ["gemini-3.10-pro", "minimal"],
+    ["gemini-3.80-flash", "minimal"],
+  ] as const)("forwards %s effort %s for provider validation", (model, reasoning_effort) => {
+    const { geminiBody } = openaiToGemini(req({ model, reasoning_effort }));
+    expect(geminiBody.generationConfig?.thinkingConfig).toEqual({
+      thinkingLevel: reasoning_effort,
+    });
+  });
+
+  test.each([
+    ["gemini-2.5-pro", "none"],
+    ["gemini-3.6-flash", "none"],
+    ["gemini-3.7-flash", "minimal"],
+    ["gemini-3.8-flash", "minimal"],
+    ["gemini-3-pro-preview", "medium"],
+    ["gemini-3.6-flash", "xhigh"],
+    ["gemini-3.6-flash", "max"],
+    ["gemini-2.0-flash", "low"],
+    ["gemini-3.1-flash-lite-image", "low"],
+    ["gemini-4-argon-preview-tts", "low"],
+    ["gemma-4-31b-it", "low"],
+    ["gemini-3.99-flash", "none"],
+    ["gemini-4-argon", "max"],
+  ] as const)("rejects unsupported %s effort %s", (model, reasoning_effort) => {
+    expect(() => openaiToGemini(req({ model, reasoning_effort }))).toThrowError(
+      expect.objectContaining({ statusCode: 400 }),
+    );
+  });
+
+  test.each([
+    undefined,
+    null,
+  ])("preserves model defaults for effort %s", (reasoning_effort) => {
+    const { geminiBody } = openaiToGemini(
+      req({ model: "gemini-3.99-flash", reasoning_effort }),
+    );
+    expect(geminiBody.generationConfig?.thinkingConfig).toBeUndefined();
+    expect(geminiBody.generationConfig?.maxOutputTokens).toBeUndefined();
+  });
+
+  test.each([
+    [undefined, 32, 32],
+    [64, 32, 32],
+    [64, null, 64],
+    [64, undefined, 64],
+  ])("maps output caps %s / %s to %s", (max_tokens, max_completion_tokens, expected) => {
+    const { geminiBody } = openaiToGemini(
+      req({ max_tokens, max_completion_tokens, stream: true }),
+    );
+    expect(geminiBody.generationConfig?.maxOutputTokens).toBe(expected);
+    expect(geminiBody._isStreaming).toBe(true);
+  });
+});
+
+describe("openaiToGemini — tool schema sanitization", () => {
+  // the OpenAI-compatible Gemini path must run tool parameters through the same
+  // sanitizer as the native adapter, or a non-string enum 400s at Gemini.
+  test("strips a non-string enum from tool parameters", () => {
+    const request = req({
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "set_flag",
+            description: "toggle a flag",
+            parameters: {
+              type: "object",
+              properties: {
+                enabled: { type: "boolean", enum: [true] },
+              },
+            },
+          },
+        },
+      ],
+      // biome-ignore lint/suspicious/noExplicitAny: minimal tool shape for the test
+    } as any);
+
+    const { geminiBody } = openaiToGemini(request);
+    const params = firstToolParams(geminiBody.tools);
+
+    expect(params.properties.enabled.enum).toBeUndefined();
+    // the dropped literal is folded into the description so the hint survives.
+    expect(params.properties.enabled.description).toContain("true");
+  });
+
+  test("leaves a string enum untouched", () => {
+    const request = req({
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "pick",
+            description: "pick one",
+            parameters: {
+              type: "object",
+              properties: {
+                color: { type: "string", enum: ["red", "green"] },
+              },
+            },
+          },
+        },
+      ],
+      // biome-ignore lint/suspicious/noExplicitAny: minimal tool shape for the test
+    } as any);
+
+    const { geminiBody } = openaiToGemini(request);
+    const params = firstToolParams(geminiBody.tools);
+
+    expect(params.properties.color.enum).toEqual(["red", "green"]);
+  });
+});
+
+describe("openaiToGemini — multimodal user content", () => {
+  test("forwards a base64 image as inlineData instead of dropping it", () => {
+    const request = req({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "describe this" },
+            {
+              type: "image_url",
+              image_url: { url: "data:image/png;base64,AAAABBBB" },
+            },
+          ],
+        },
+      ],
+      // biome-ignore lint/suspicious/noExplicitAny: minimal multimodal message
+    } as any);
+
+    const { geminiBody } = openaiToGemini(request);
+
+    expect(geminiBody.contents[0].parts).toEqual([
+      { text: "describe this" },
+      { inlineData: { mimeType: "image/png", data: "AAAABBBB" } },
+    ]);
+  });
+
+  test("rejects an http image URL Gemini cannot inline", () => {
+    const request = req({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "look at this" },
+            {
+              type: "image_url",
+              image_url: { url: "https://example.com/cat.png" },
+            },
+          ],
+        },
+      ],
+      // biome-ignore lint/suspicious/noExplicitAny: minimal multimodal message
+    } as any);
+
+    expect(() => openaiToGemini(request)).toThrow(
+      "remote URLs cannot be translated",
+    );
+  });
+
+  test("forwards base64 input_audio as inlineData", () => {
+    const request = req({
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_audio",
+              input_audio: { data: "QUJD", format: "wav" },
+            },
+          ],
+        },
+      ],
+      // biome-ignore lint/suspicious/noExplicitAny: minimal multimodal message
+    } as any);
+
+    const { geminiBody } = openaiToGemini(request);
+
+    expect(geminiBody.contents[0].parts).toEqual([
+      { inlineData: { mimeType: "audio/wav", data: "QUJD" } },
+    ]);
+  });
+
+  test("still emits a plain text part for a string user message", () => {
+    const { geminiBody } = openaiToGemini(req());
+    expect(geminiBody.contents[0].parts).toEqual([{ text: "hello" }]);
+  });
+
+  test("forwards tool-result text into the functionResponse payload", () => {
+    const request = req({
+      messages: [
+        { role: "user", content: "go" },
+        {
+          role: "tool",
+          tool_call_id: "call_1",
+          content: [{ type: "text", text: "the result" }],
+        },
+      ],
+      // biome-ignore lint/suspicious/noExplicitAny: minimal tool-result message
+    } as any);
+
+    const { geminiBody } = openaiToGemini(request);
+    // contents[0] is the user message; contents[1] is the tool result.
+    expect(geminiBody.contents[1].parts).toEqual([
+      {
+        functionResponse: {
+          id: "call_1",
+          name: "tool_result",
+          response: { content: "the result" },
+        },
+      },
+    ]);
+  });
+});
+
+describe("geminiResponseToOpenai — blocked replies", () => {
+  const ctx = {
+    chatcmplId: "chatcmpl-test",
+    createdUnix: 1_700_000_000,
+    requestedModel: "gemini-2.5-flash",
+  };
+
+  test("maps a candidate blocked without content to an empty content_filter choice", () => {
+    const result = geminiResponseToOpenai(
+      {
+        candidates: [{ finishReason: "SAFETY" }],
+      } as Gemini.Types.GenerateContentResponse,
+      ctx,
+    );
+
+    expect(result.choices[0].finish_reason).toBe("content_filter");
+    expect(result.choices[0].message.content).toBeNull();
+  });
+
+  test("maps a prompt-blocked reply with no candidates to content_filter", () => {
+    const result = geminiResponseToOpenai(
+      {
+        promptFeedback: { blockReason: "SAFETY" },
+      } as Gemini.Types.GenerateContentResponse,
+      ctx,
+    );
+
+    expect(result.choices[0].finish_reason).toBe("content_filter");
+    expect(result.choices[0].message.content).toBeNull();
+  });
+
+  test("still reports stop for an ordinary completion", () => {
+    const result = geminiResponseToOpenai(
+      {
+        candidates: [
+          {
+            finishReason: "STOP",
+            content: { role: "model", parts: [{ text: "hi" }] },
+          },
+        ],
+      } as Gemini.Types.GenerateContentResponse,
+      ctx,
+    );
+
+    expect(result.choices[0].finish_reason).toBe("stop");
+    expect(result.choices[0].message.content).toBe("hi");
+  });
+});
+
+describe("Gemini 3 thought signature round-trip", () => {
+  const ctx = {
+    chatcmplId: "chatcmpl-test",
+    createdUnix: 1,
+    requestedModel: "gemini-3.7-flash",
+  };
+
+  test("a functionCall's thoughtSignature survives the OpenAI wire format", () => {
+    const response = geminiResponseToOpenai(
+      {
+        candidates: [
+          {
+            finishReason: "STOP",
+            content: {
+              role: "model",
+              parts: [
+                {
+                  functionCall: { name: "run_command", args: { cmd: "ls" } },
+                  thoughtSignature: "sig-abc/123==",
+                },
+              ],
+            },
+          },
+        ],
+      } as Gemini.Types.GenerateContentResponse,
+      ctx,
+    );
+
+    const toolCall = firstToolCall(response);
+    // The wire id carries the signature; the client just echoes it.
+    expect(toolCall.id).toMatch(/^gemsig-/);
+
+    const { geminiBody } = openaiToGemini({
+      model: "gemini-3.7-flash",
+      messages: [
+        { role: "user", content: "list files" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [toolCall],
+        },
+        {
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: "ok",
+        },
+      ],
+    } as unknown as Parameters<typeof openaiToGemini>[0]);
+
+    const modelTurn = geminiBody.contents[1];
+    expect(modelTurn.role).toBe("model");
+    expect(modelTurn.parts[0]).toMatchObject({
+      functionCall: { name: "run_command", args: { cmd: "ls" } },
+      thoughtSignature: "sig-abc/123==",
+    });
+    // The marker never reaches Gemini: functionCall/functionResponse ids match
+    // and are free of the encoding.
+    const functionCallId = (
+      modelTurn.parts[0] as { functionCall: { id?: string } }
+    ).functionCall.id;
+    const toolTurn = geminiBody.contents[2];
+    const functionResponseId = (
+      toolTurn.parts[0] as { functionResponse: { id?: string } }
+    ).functionResponse.id;
+    expect(functionCallId).not.toMatch(/gemsig-/);
+    expect(functionResponseId).toBe(functionCallId);
+    // Gemini 3 also rejects a functionResponse whose name does not match the
+    // function that was called; the name is resolved from the assistant turn.
+    expect(
+      (toolTurn.parts[0] as { functionResponse: { name: string } })
+        .functionResponse.name,
+    ).toBe("run_command");
+  });
+
+  test("parallel tool results fold into one Gemini user turn", () => {
+    const { geminiBody } = openaiToGemini({
+      model: "gemini-3.7-flash",
+      messages: [
+        { role: "user", content: "weather in Toronto and Ottawa" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call-1",
+              type: "function",
+              function: {
+                name: "get_weather",
+                arguments: '{"city":"Toronto"}',
+              },
+            },
+            {
+              id: "call-2",
+              type: "function",
+              function: { name: "get_weather", arguments: '{"city":"Ottawa"}' },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "call-1", content: "Sunny 22C" },
+        { role: "tool", tool_call_id: "call-2", content: "Rainy 18C" },
+        { role: "assistant", content: "It differs." },
+        { role: "user", content: "thanks" },
+      ],
+    } as unknown as Parameters<typeof openaiToGemini>[0]);
+
+    // Gemini rejects the history when the response-part count does not match
+    // the call turn: both results must land in ONE user turn.
+    expect(geminiBody.contents.map((entry) => entry.role)).toEqual([
+      "user",
+      "model",
+      "user",
+      "model",
+      "user",
+    ]);
+    const responseTurn = geminiBody.contents[2];
+    expect(responseTurn.parts).toHaveLength(2);
+    expect(
+      responseTurn.parts.map(
+        (part) =>
+          (part as { functionResponse: { id: string } }).functionResponse.id,
+      ),
+    ).toEqual(["call-1", "call-2"]);
+  });
+
+  test("unsigned tool calls keep plain ids and use the imported-history marker", () => {
+    const response = geminiResponseToOpenai(
+      {
+        candidates: [
+          {
+            finishReason: "STOP",
+            content: {
+              role: "model",
+              parts: [{ functionCall: { id: "call-1", name: "fn", args: {} } }],
+            },
+          },
+        ],
+      } as Gemini.Types.GenerateContentResponse,
+      ctx,
+    );
+    const toolCall = firstToolCall(response);
+    expect(toolCall.id).toBe("call-1");
+
+    const { geminiBody } = openaiToGemini({
+      model: "gemini-3.7-flash",
+      messages: [{ role: "assistant", content: null, tool_calls: [toolCall] }],
+    } as unknown as Parameters<typeof openaiToGemini>[0]);
+    expect(geminiBody.contents[0].parts[0]).toEqual({
+      functionCall: { id: "call-1", name: "fn", args: {} },
+      thoughtSignature: "skip_thought_signature_validator",
+    });
+  });
+});
+
+describe("openaiToGemini — trailing model turn repair", () => {
+  // Gemini 400s with "Requests ending with a model turn are not supported."
+  // when `contents` ends with role `model`, but the OpenAI wire contract lets
+  // a request end with an assistant message. The translator must repair that
+  // shape instead of forwarding a request Google will reject.
+
+  test("appends a minimal user turn after a trailing assistant text message", () => {
+    const { geminiBody } = openaiToGemini(
+      req({
+        messages: [
+          { role: "user", content: "hello" },
+          { role: "assistant", content: "hi there" },
+        ],
+      }),
+    );
+
+    expect(geminiBody.contents.at(-1)).toEqual({
+      role: "user",
+      parts: [{ text: "Continue." }],
+    });
+  });
+
+  test("answers a trailing unanswered tool call with a synthetic functionResponse", () => {
+    const { geminiBody } = openaiToGemini(
+      req({
+        messages: [
+          { role: "user", content: "run it" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call-1",
+                type: "function",
+                function: { name: "run_command", arguments: '{"cmd":"ls"}' },
+              },
+            ],
+          },
+        ],
+        // biome-ignore lint/suspicious/noExplicitAny: minimal tool-call message
+      } as any),
+    );
+
+    // id and name are copied from the call — Gemini 3 validates both against
+    // the functionCall turn the response answers.
+    expect(geminiBody.contents.at(-1)).toEqual({
+      role: "user",
+      parts: [
+        {
+          functionResponse: {
+            id: "call-1",
+            name: "run_command",
+            response: {
+              content:
+                "Tool execution was interrupted before it produced a result. The tool did not run; do not assume it did.",
+            },
+          },
+        },
+      ],
+    });
+  });
+
+  test("answers every call of trailing parallel tool calls in one user turn", () => {
+    const { geminiBody } = openaiToGemini(
+      req({
+        messages: [
+          { role: "user", content: "weather in Toronto and Ottawa" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call-1",
+                type: "function",
+                function: {
+                  name: "get_weather",
+                  arguments: '{"city":"Toronto"}',
+                },
+              },
+              {
+                id: "call-2",
+                type: "function",
+                function: {
+                  name: "get_weather",
+                  arguments: '{"city":"Ottawa"}',
+                },
+              },
+            ],
+          },
+        ],
+        // biome-ignore lint/suspicious/noExplicitAny: minimal tool-call message
+      } as any),
+    );
+
+    // Gemini rejects the history when the response-part count does not match
+    // the call turn, so both synthetic responses share one user turn.
+    const responseTurn = geminiBody.contents.at(-1);
+    expect(responseTurn?.role).toBe("user");
+    expect(
+      responseTurn?.parts.map(
+        (part) =>
+          (part as { functionResponse: { id: string } }).functionResponse.id,
+      ),
+    ).toEqual(["call-1", "call-2"]);
+  });
+
+  test("prefers synthetic responses over the continue turn when a trailing assistant message mixes text and tool calls", () => {
+    const { geminiBody } = openaiToGemini(
+      req({
+        messages: [
+          { role: "user", content: "go" },
+          {
+            role: "assistant",
+            content: "let me check",
+            tool_calls: [
+              {
+                id: "call-1",
+                type: "function",
+                function: { name: "check", arguments: "{}" },
+              },
+            ],
+          },
+        ],
+        // biome-ignore lint/suspicious/noExplicitAny: minimal tool-call message
+      } as any),
+    );
+
+    const responseTurn = geminiBody.contents.at(-1);
+    expect(responseTurn?.role).toBe("user");
+    expect(responseTurn?.parts).toHaveLength(1);
+    expect("functionResponse" in (responseTurn?.parts[0] ?? {})).toBe(true);
+  });
+
+  test("leaves a history that already ends with a user turn untouched", () => {
+    const { geminiBody } = openaiToGemini(
+      req({
+        messages: [
+          { role: "user", content: "hello" },
+          { role: "assistant", content: "hi" },
+          { role: "user", content: "what is 2+2?" },
+        ],
+      }),
+    );
+
+    expect(geminiBody.contents).toHaveLength(3);
+    expect(geminiBody.contents.at(-1)?.role).toBe("user");
+  });
+});
+
+function firstToolCall(response: ReturnType<typeof geminiResponseToOpenai>) {
+  const toolCall = response.choices[0].message.tool_calls?.[0];
+  if (!toolCall) throw new Error("expected a tool call");
+  return toolCall;
+}
+
+describe("native Gemini mixed-provider translation", () => {
+  const request: Gemini.Types.GenerateContentRequest = {
+    contents: [{ role: "user", parts: [{ text: "hello" }] }],
+  };
+  test("preserves parallel repeated-name results by id and retains inline media", () => {
+    const translated = geminiToOpenai({
+      ...request,
+      contents: [
+        ...request.contents,
+        {
+          role: "model",
+          parts: [
+            {
+              functionCall: { id: "first", name: "lookup", args: { x: 1 } },
+              thoughtSignature: "private-signature",
+            },
+            { functionCall: { id: "second", name: "lookup", args: { x: 2 } } },
+          ],
+        },
+        {
+          role: "user",
+          parts: [
+            {
+              functionResponse: {
+                id: "second",
+                name: "lookup",
+                response: { value: 2 },
+              },
+            },
+            {
+              functionResponse: {
+                id: "first",
+                name: "lookup",
+                response: { value: 1 },
+              },
+            },
+            { inlineData: { mimeType: "image/png", data: "cG5n" } },
+          ],
+        },
+      ],
+    });
+    expect(translated.messages.slice(2)).toEqual([
+      { role: "tool", tool_call_id: "call_1_1", content: '{"value":2}' },
+      { role: "tool", tool_call_id: "call_1_0", content: '{"value":1}' },
+      {
+        role: "user",
+        content: [
+          {
+            type: "image_url",
+            image_url: { url: "data:image/png;base64,cG5n" },
+          },
+        ],
+      },
+    ]);
+    expect(JSON.stringify(translated)).not.toContain("private-signature");
+  });
+  test.each([
+    { cachedContent: "cached/test" },
+    { tools: [{ googleSearch: {} }] },
+    { tools: [{ functionDeclarations: [], codeExecution: {} }] },
+    { generationConfig: { candidateCount: 2 } },
+    { generationConfig: { responseMimeType: "application/json" } },
+    { generationConfig: { responseModalities: ["IMAGE"] } },
+    {
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              fileData: { fileUri: "gs://private/file", mimeType: "image/png" },
+            },
+          ],
+        },
+      ],
+    },
+  ])("rejects unrepresentable features rather than dropping them: %j", (extra) => {
+    expect(() =>
+      geminiToOpenai({
+        ...request,
+        ...extra,
+      } as Gemini.Types.GenerateContentRequest),
+    ).toThrow("cannot translate");
+  });
+  test("maps system, schema, tool choice, sampling and output limit", () => {
+    expect(
+      geminiToOpenai({
+        ...request,
+        systemInstruction: { parts: [{ text: "system" }] },
+        generationConfig: {
+          maxOutputTokens: 37,
+          temperature: 0.2,
+          topP: 0.9,
+          stopSequences: ["END"],
+          thinkingConfig: { includeThoughts: true, thinkingBudget: -1 },
+        },
+        tools: [
+          {
+            functionDeclarations: [
+              {
+                name: "lookup",
+                description: "Lookup",
+                parameters: {
+                  type: "OBJECT",
+                  properties: { x: { type: "STRING" } },
+                },
+              },
+            ],
+          },
+        ],
+        toolConfig: {
+          functionCallingConfig: {
+            mode: "ANY",
+            allowedFunctionNames: ["lookup"],
+          },
+        },
+      }),
+    ).toMatchObject({
+      max_tokens: 37,
+      temperature: 0.2,
+      top_p: 0.9,
+      stop: ["END"],
+      tool_choice: "required",
+      tools: [
+        {
+          function: {
+            name: "lookup",
+            parameters: {
+              type: "object",
+              properties: { x: { type: "string" } },
+            },
+          },
+        },
+      ],
+      messages: [{ role: "system", content: "system" }, { role: "user" }],
+    });
+  });
+  test("does not claim an interrupted or malformed tool stream completed", () => {
+    const translator = createOpenaiToGeminiStreamTranslator();
+    expect(() => translator.finish()).toThrow("ended before it finished");
+    translator.translate({
+      id: "reply",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "other",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: "one",
+                type: "function",
+                function: { name: "lookup", arguments: '{"x":' },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+    });
+    expect(() => translator.finish()).toThrow("invalid function arguments");
+  });
+  test("marks only translated foreign tool calls for subsequent Gemini validation", () => {
+    const response = openaiResponseToGemini({
+      id: "reply",
+      object: "chat.completion",
+      created: 1,
+      model: "other",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "one",
+                type: "function",
+                function: { name: "lookup", arguments: '{"x":1}' },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+          logprobs: null,
+        },
+      ],
+    } as OpenAi.Types.ChatCompletionsResponse);
+    expect(response.candidates?.[0]?.content?.parts).toEqual([
+      {
+        functionCall: { id: "one", name: "lookup", args: { x: 1 } },
+        thoughtSignature: "skip_thought_signature_validator",
+      },
+    ]);
+  });
+});
+
+test("foreign parallel tool history reaches Gemini with its inline image and import markers", () => {
+  const { geminiBody } = openaiToGemini(
+    req({
+      messages: [
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "foreign-one",
+              type: "function",
+              function: { name: "lookup", arguments: "{}" },
+            },
+            {
+              id: "foreign-two",
+              type: "function",
+              function: { name: "lookup", arguments: "{}" },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          tool_call_id: "foreign-one",
+          content: [
+            { type: "text", text: "one" },
+            {
+              type: "image_url",
+              image_url: { url: "data:image/png;base64,cG5n" },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "foreign-two", content: "two" },
+      ],
+    } as unknown as Partial<OpenAiRequest>),
+  );
+  expect(geminiBody.contents[0].parts).toEqual([
+    {
+      functionCall: { id: "foreign-one", name: "lookup", args: {} },
+      thoughtSignature: "skip_thought_signature_validator",
+    },
+    {
+      functionCall: { id: "foreign-two", name: "lookup", args: {} },
+      thoughtSignature: "skip_thought_signature_validator",
+    },
+  ]);
+  expect(geminiBody.contents[1].parts).toEqual([
+    {
+      functionResponse: {
+        id: "foreign-one",
+        name: "lookup",
+        response: { content: "one" },
+      },
+    },
+    {
+      functionResponse: {
+        id: "foreign-two",
+        name: "lookup",
+        response: { content: "two" },
+      },
+    },
+    { inlineData: { mimeType: "image/png", data: "cG5n" } },
+  ]);
+});
+
+test("rejects provider file references instead of dropping them on Gemini fallback", () => {
+  expect(() =>
+    openaiToGemini({
+      model: "pool",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Read this" },
+            { type: "file", file: { file_id: "file-source-provider" } },
+          ],
+        },
+      ],
+    } as unknown as Parameters<typeof openaiToGemini>[0]),
+  ).toThrow("inline file data");
+});

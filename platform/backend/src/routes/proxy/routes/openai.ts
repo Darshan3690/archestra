@@ -1,36 +1,223 @@
+import { isCodexOriginator, RouteId } from "@archestra/shared";
 import fastifyHttpProxy from "@fastify/http-proxy";
-import { RouteId } from "@shared";
+import type { FastifyRequest } from "fastify";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
 import config from "@/config";
 import logger from "@/logging";
-import { constructResponseSchema, OpenAi, UuidIdSchema } from "@/types";
 import {
+  fetchOpenAiModels,
+  isChatModelId,
+} from "@/routes/chat/model-fetchers/openai";
+import {
+  ApiError,
+  Azure,
+  constructResponseSchema,
+  OpenAi,
+  UuidIdSchema,
+} from "@/types";
+import {
+  openAiEmbeddingsAdapterFactory,
   openAiResponsesAdapterFactory,
+  openAiResponsesCompactAdapterFactory,
   openaiAdapterFactory,
 } from "../adapters";
-import { PROXY_API_PREFIX, PROXY_BODY_LIMIT } from "../common";
+import {
+  EmbeddingWireResponseSchema,
+  withEmbeddingEncoding,
+} from "../adapters/embeddings-wire";
+import { openaiImagesAdapterFactory } from "../adapters/openai-images";
+import {
+  CHAT_COMPLETIONS_SUFFIX,
+  EMBEDDINGS_SUFFIX,
+  OPENAI_HANDLED_ENDPOINT_SUFFIXES,
+  PROXY_API_PREFIX,
+  PROXY_BODY_LIMIT,
+  RESPONSES_COMPACT_SUFFIX,
+  RESPONSES_SUFFIX,
+} from "../common";
+import {
+  handleImageEdit,
+  ImageEditMultipartBodySchema,
+  parseImageEditRequest,
+} from "../image-edit-handler";
+import {
+  createPassthroughAuthenticator,
+  isJwtLike,
+  resolveAgent,
+  validatePassthroughVirtualKey,
+  virtualKeyRateLimiter,
+} from "../llm-proxy-auth";
 import { handleLLMProxy } from "../llm-proxy-handler";
+import { passthroughReplyOptions } from "../passthrough-log";
+import { registerAudioRoutes } from "./audio";
+import {
+  extractBearerToken,
+  OpenAiModelsHeadersSchema,
+  OpenAiModelsListResponseSchema,
+  resolveProxyModelsApiKey,
+  toOpenAiModelsList,
+} from "./proxy-model-listing";
 import { createProxyPreHandler } from "./proxy-prehandler";
+
+const OpenAiModelsWithCodexSchema = OpenAiModelsListResponseSchema.extend({
+  models: z
+    .array(
+      z.object({ slug: z.string(), display_name: z.string() }).passthrough(),
+    )
+    .optional(),
+});
+
+const CodexModelsSchema = z.object({
+  models: z.array(
+    z.object({ slug: z.string(), display_name: z.string() }).passthrough(),
+  ),
+});
 
 const openAiProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
   const API_PREFIX = `${PROXY_API_PREFIX}/openai`;
-  const CHAT_COMPLETIONS_SUFFIX = "/chat/completions";
-  const RESPONSES_SUFFIX = "/responses";
+  const IMAGES_SUFFIX = "/images/generations";
+  await registerAudioRoutes(fastify, "openai");
 
-  logger.info("[UnifiedProxy] Registering unified OpenAI routes");
+  logger.debug("[UnifiedProxy] Registering unified OpenAI routes");
 
   await fastify.register(fastifyHttpProxy, {
     upstream: config.llm.openai.baseUrl,
     prefix: API_PREFIX,
     rewritePrefix: "",
+    replyOptions: passthroughReplyOptions(),
     preHandler: createProxyPreHandler({
       apiPrefix: API_PREFIX,
-      endpointSuffix: [CHAT_COMPLETIONS_SUFFIX, RESPONSES_SUFFIX],
+      endpointSuffix: OPENAI_HANDLED_ENDPOINT_SUFFIXES,
       upstream: config.llm.openai.baseUrl,
       providerName: "OpenAI",
+      authenticate: createPassthroughAuthenticator("openai"),
+      logProvider: "openai",
     }),
   });
+
+  for (const withAgent of [false, true]) {
+    fastify.post(
+      `${API_PREFIX}${withAgent ? "/:agentId" : ""}${IMAGES_SUFFIX}`,
+      {
+        bodyLimit: PROXY_BODY_LIMIT,
+        schema: {
+          operationId: withAgent
+            ? RouteId.OpenAiImagesWithAgent
+            : RouteId.OpenAiImagesWithDefaultAgent,
+          description: "Generate images with OpenAI",
+          tags: ["LLM Proxy"],
+          ...(withAgent ? { params: z.object({ agentId: UuidIdSchema }) } : {}),
+          body: Azure.API.ImageGenerationRequestSchema,
+          headers: OpenAi.API.ChatCompletionsHeadersSchema,
+          response: constructResponseSchema(
+            Azure.API.ImageGenerationResponseSchema,
+          ),
+        },
+      },
+      async (request, reply) =>
+        handleLLMProxy(
+          request.body,
+          request,
+          reply,
+          openaiImagesAdapterFactory,
+        ),
+    );
+  }
+
+  for (const withAgent of [false, true]) {
+    fastify.post(
+      `${API_PREFIX}${withAgent ? "/:agentId" : ""}/images/edits`,
+      {
+        bodyLimit: PROXY_BODY_LIMIT,
+        schema: {
+          operationId: withAgent
+            ? RouteId.OpenAiImageEditsWithAgent
+            : RouteId.OpenAiImageEditsWithDefaultAgent,
+          description:
+            "Edit images with OpenAI using bounded multipart image inputs and an optional PNG mask. Returns a complete image response; streaming is unsupported.",
+          consumes: ["multipart/form-data"],
+          body: ImageEditMultipartBodySchema,
+          tags: ["LLM Proxy"],
+          ...(withAgent ? { params: z.object({ agentId: UuidIdSchema }) } : {}),
+          headers: OpenAi.API.ChatCompletionsHeadersSchema,
+          response: constructResponseSchema(
+            Azure.API.ImageGenerationResponseSchema,
+          ),
+        },
+      },
+      async (request, reply) =>
+        handleImageEdit({
+          parsed: await parseImageEditRequest(request),
+          provider: "openai",
+          request,
+          reply,
+        }),
+    );
+  }
+
+  fastify.post(
+    `${API_PREFIX}${EMBEDDINGS_SUFFIX}`,
+    {
+      bodyLimit: PROXY_BODY_LIMIT,
+      schema: {
+        operationId: RouteId.OpenAiEmbeddingsWithDefaultAgent,
+        description: "Create embeddings with OpenAI (uses default agent)",
+        tags: ["LLM Proxy"],
+        body: OpenAi.API.EmbeddingRequestSchema,
+        headers: OpenAi.API.ChatCompletionsHeadersSchema,
+        response: constructResponseSchema(EmbeddingWireResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      logger.debug(
+        { url: request.url },
+        "[UnifiedProxy] Handling OpenAI embeddings request (default agent)",
+      );
+      return handleLLMProxy(
+        request.body as OpenAi.Types.EmbeddingRequest,
+        request,
+        reply,
+        withEmbeddingEncoding(
+          openAiEmbeddingsAdapterFactory,
+          request.body.encoding_format,
+        ),
+      );
+    },
+  );
+
+  fastify.post(
+    `${API_PREFIX}/:agentId${EMBEDDINGS_SUFFIX}`,
+    {
+      bodyLimit: PROXY_BODY_LIMIT,
+      schema: {
+        operationId: RouteId.OpenAiEmbeddingsWithAgent,
+        description: "Create embeddings with OpenAI for a specific agent",
+        tags: ["LLM Proxy"],
+        params: z.object({
+          agentId: UuidIdSchema,
+        }),
+        body: OpenAi.API.EmbeddingRequestSchema,
+        headers: OpenAi.API.ChatCompletionsHeadersSchema,
+        response: constructResponseSchema(EmbeddingWireResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      logger.debug(
+        { url: request.url, agentId: request.params.agentId },
+        "[UnifiedProxy] Handling OpenAI embeddings request (with agent)",
+      );
+      return handleLLMProxy(
+        request.body as OpenAi.Types.EmbeddingRequest,
+        request,
+        reply,
+        withEmbeddingEncoding(
+          openAiEmbeddingsAdapterFactory,
+          request.body.encoding_format,
+        ),
+      );
+    },
+  );
 
   fastify.post(
     `${API_PREFIX}${RESPONSES_SUFFIX}`,
@@ -90,6 +277,67 @@ const openAiProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
   );
 
   fastify.post(
+    `${API_PREFIX}${RESPONSES_COMPACT_SUFFIX}`,
+    {
+      bodyLimit: PROXY_BODY_LIMIT,
+      schema: {
+        operationId: RouteId.OpenAiResponsesCompactWithDefaultAgent,
+        description: "Compact an OpenAI response (uses default agent)",
+        tags: ["LLM Proxy"],
+        body: OpenAi.API.ResponsesCompactRequestSchema,
+        headers: OpenAi.API.ChatCompletionsHeadersSchema,
+        response: constructResponseSchema(
+          OpenAi.API.ResponsesCompactedResponseSchema,
+        ),
+      },
+    },
+    async (request, reply) => {
+      logger.debug(
+        { url: request.url },
+        "[UnifiedProxy] Handling OpenAI responses compact request (default agent)",
+      );
+      return handleLLMProxy(
+        request.body as OpenAi.Types.ResponsesCompactRequest,
+        request,
+        reply,
+        openAiResponsesCompactAdapterFactory,
+      );
+    },
+  );
+
+  fastify.post(
+    `${API_PREFIX}/:agentId${RESPONSES_COMPACT_SUFFIX}`,
+    {
+      bodyLimit: PROXY_BODY_LIMIT,
+      schema: {
+        operationId: RouteId.OpenAiResponsesCompactWithAgent,
+        description: "Compact an OpenAI response for a specific agent",
+        tags: ["LLM Proxy"],
+        params: z.object({
+          agentId: UuidIdSchema,
+        }),
+        body: OpenAi.API.ResponsesCompactRequestSchema,
+        headers: OpenAi.API.ChatCompletionsHeadersSchema,
+        response: constructResponseSchema(
+          OpenAi.API.ResponsesCompactedResponseSchema,
+        ),
+      },
+    },
+    async (request, reply) => {
+      logger.debug(
+        { url: request.url, agentId: request.params.agentId },
+        "[UnifiedProxy] Handling OpenAI responses compact request (with agent)",
+      );
+      return handleLLMProxy(
+        request.body as OpenAi.Types.ResponsesCompactRequest,
+        request,
+        reply,
+        openAiResponsesCompactAdapterFactory,
+      );
+    },
+  );
+
+  fastify.post(
     `${API_PREFIX}${CHAT_COMPLETIONS_SUFFIX}`,
     {
       bodyLimit: PROXY_BODY_LIMIT,
@@ -140,6 +388,146 @@ const openAiProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
       );
       return handleLLMProxy(request.body, request, reply, openaiAdapterFactory);
     },
+  );
+
+  /**
+   * Lists OpenAI models for a virtual or raw key. A dedicated route is needed
+   * so it takes precedence over this prefix's catch-all http-proxy, which
+   * would otherwise forward an `arch_*` key to api.openai.com unresolved and
+   * 401. Returns OpenAI's native models shape.
+   */
+  async function handleListModels(
+    request: FastifyRequest,
+    agentId: string | undefined,
+  ) {
+    const headers = request.raw.headers;
+    const bearer = extractBearerToken(headers.authorization);
+    const originator =
+      typeof headers.originator === "string" ? headers.originator : undefined;
+    const isCodex = isCodexOriginator(originator);
+    if (isCodex && originator && bearer && isJwtLike(bearer)) {
+      if (typeof headers["chatgpt-account-id"] !== "string") {
+        throw new ApiError(400, "Codex ChatGPT login requires an account ID.");
+      }
+      const passthroughToken = headers["x-archestra-virtual-key"];
+      if (typeof passthroughToken !== "string") {
+        throw new ApiError(
+          401,
+          "Codex ChatGPT login requires a passthrough virtual key.",
+        );
+      }
+      await virtualKeyRateLimiter.check({
+        ip: request.ip,
+        credential: passthroughToken,
+      });
+      try {
+        await validatePassthroughVirtualKey({
+          tokenValue: passthroughToken,
+          agent: await resolveAgent(agentId),
+        });
+        await virtualKeyRateLimiter.recordSuccess({
+          credential: passthroughToken,
+        });
+      } catch (error) {
+        if (error instanceof ApiError && error.statusCode === 401) {
+          await virtualKeyRateLimiter.recordFailure({
+            ip: request.ip,
+            credential: passthroughToken,
+          });
+        }
+        throw error;
+      }
+      const url = new URL(`${config.llm.openai.codex.apiBaseUrl}/models`);
+      const clientVersion = new URL(
+        request.url,
+        "http://localhost",
+      ).searchParams.get("client_version");
+      if (clientVersion) {
+        url.searchParams.set("client_version", clientVersion);
+      }
+      const upstream = await fetch(url, {
+        headers: {
+          authorization: `Bearer ${bearer}`,
+          "chatgpt-account-id": headers["chatgpt-account-id"],
+          originator,
+        },
+        signal: AbortSignal.timeout(15_000),
+      }).catch(() => {
+        throw new ApiError(502, "Unable to fetch Codex subscription models.");
+      });
+      if (!upstream.ok) {
+        throw new ApiError(
+          upstream.status >= 500 ? 502 : upstream.status,
+          "Unable to fetch Codex subscription models.",
+        );
+      }
+      const result = CodexModelsSchema.safeParse(
+        await upstream.json().catch(() => null),
+      );
+      if (!result.success) {
+        throw new ApiError(502, "Invalid Codex subscription models response.");
+      }
+      const models = result.data.models.map((model) => ({
+        id: model.slug,
+        displayName: model.display_name,
+        provider: "openai" as const,
+      }));
+      return {
+        ...toOpenAiModelsList(models, "openai"),
+        models: result.data.models,
+      };
+    }
+    const { apiKey, baseUrl, extraHeaders } = await resolveProxyModelsApiKey({
+      request,
+      agentId,
+      provider: "openai",
+      token: extractBearerToken(request.headers.authorization),
+    });
+    logger.debug({ agentId }, "[UnifiedProxy] Listing OpenAI models");
+    // Clients fill their model pickers from this list, so it keeps the chat
+    // filter. The fetcher also returns image and audio models for sync.
+    const models = (
+      await fetchOpenAiModels(apiKey, baseUrl, extraHeaders)
+    ).filter((model) => isChatModelId(model.id));
+    const list = toOpenAiModelsList(models, "openai");
+    return isCodex
+      ? {
+          ...list,
+          models: models.map((model) => ({
+            slug: model.id,
+            display_name: model.displayName,
+          })),
+        }
+      : list;
+  }
+
+  fastify.get(
+    `${API_PREFIX}/models`,
+    {
+      schema: {
+        operationId: RouteId.OpenAiListModelsWithDefaultAgent,
+        description: "List OpenAI models (default agent)",
+        tags: ["LLM Proxy"],
+        headers: OpenAiModelsHeadersSchema,
+        response: constructResponseSchema(OpenAiModelsWithCodexSchema),
+      },
+    },
+    async (request) => handleListModels(request, undefined),
+  );
+
+  fastify.get(
+    `${API_PREFIX}/:agentId/models`,
+    {
+      schema: {
+        operationId: RouteId.OpenAiListModelsWithAgent,
+        description: "List OpenAI models (specific agent)",
+        tags: ["LLM Proxy"],
+        params: z.object({ agentId: UuidIdSchema }),
+        headers: OpenAiModelsHeadersSchema,
+        response: constructResponseSchema(OpenAiModelsWithCodexSchema),
+      },
+    },
+    async (request) => handleListModels(request, request.params.agentId),
   );
 };
 

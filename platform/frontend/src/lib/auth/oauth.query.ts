@@ -1,5 +1,6 @@
-import { archestraApiSdk, type archestraApiTypes } from "@shared";
+import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
 import { useMutation, useQuery } from "@tanstack/react-query";
+import { throwOnApiError, toApiError } from "@/lib/utils/api";
 
 const {
   initiateOAuth,
@@ -40,10 +41,11 @@ export function useOAuthClientInfo(clientId: string | null) {
       const response = await getOAuthClientInfo({
         query: { client_id: clientId },
       });
-      if (response.error) {
-        return null;
-      }
-      return response.data;
+      throwOnApiError(response.error, {
+        allowNotFound: true,
+        toastOnError: false,
+      });
+      return response.data ?? null;
     },
     enabled: !!clientId,
   });
@@ -71,9 +73,10 @@ export function useSubmitOAuthConsent() {
       data: archestraApiTypes.SubmitOAuthConsentData["body"],
     ): Promise<archestraApiTypes.SubmitOAuthConsentResponses["200"]> => {
       const response = await submitOAuthConsent({ body: data });
-      if (response.error || !response.data) {
-        throw new Error("Failed to process consent");
-      }
+      // The consent form shows the server's reason inline (e.g. an expired
+      // request), so surface it instead of a generic failure.
+      if (response.error) throw toApiError(response.error);
+      if (!response.data) throw new Error("Failed to process consent");
       return response.data;
     },
   });

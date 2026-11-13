@@ -1,0 +1,169 @@
+import { ADMIN_ROLE_NAME, MEMBER_ROLE_NAME } from "@archestra/shared";
+import MemberModel from "@/models/member";
+import { describe, expect, test } from "@/test";
+import skillRoutes from "./skill.routes";
+import {
+  seedBuiltInSkill,
+  seedImportedSkill,
+  useSkillRouteTestApp,
+} from "./skill.test-helpers";
+
+describe("GET /api/skills/source-repos", () => {
+  const ctx = useSkillRouteTestApp(skillRoutes);
+
+  test("non-admins see repositories only for skills within their scope", async ({
+    makeTeam,
+    makeTeamMember,
+    makeUser,
+  }) => {
+    await MemberModel.updateRole(
+      ctx.user.id,
+      ctx.organizationId,
+      MEMBER_ROLE_NAME,
+    );
+    const otherAuthor = await makeUser();
+    const team = await makeTeam(ctx.organizationId, ctx.user.id);
+    await makeTeamMember(team.id, ctx.user.id);
+    const inaccessibleTeam = await makeTeam(ctx.organizationId, otherAuthor.id);
+
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "org-imported",
+      sourceRef: "shared/org-repo@main:SKILL.md",
+      access: "org",
+    });
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "own-imported",
+      sourceRef: "mine/personal-repo@main:SKILL.md",
+      authorId: ctx.user.id,
+    });
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "team-imported",
+      sourceRef: "team/team-repo@main:SKILL.md",
+      access: { teams: [team.id] },
+    });
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "private-imported",
+      sourceRef: "secret/private-repo@main:SKILL.md",
+      authorId: otherAuthor.id,
+    });
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "inaccessible-team-imported",
+      sourceRef: "secret/team-repo@main:SKILL.md",
+      access: { teams: [inaccessibleTeam.id] },
+    });
+
+    const response = await ctx.app.inject({
+      method: "GET",
+      url: "/api/skills/source-repos",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().repos).toEqual([
+      "mine/personal-repo",
+      "shared/org-repo",
+      "team/team-repo",
+    ]);
+  });
+
+  test("admins see repositories from all skills in the organization", async ({
+    makeUser,
+  }) => {
+    await MemberModel.updateRole(
+      ctx.user.id,
+      ctx.organizationId,
+      ADMIN_ROLE_NAME,
+    );
+    const otherAuthor = await makeUser();
+
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "org-imported",
+      sourceRef: "shared/org-repo@main:SKILL.md",
+      access: "org",
+    });
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "private-imported",
+      sourceRef: "secret/private-repo@main:SKILL.md",
+      authorId: otherAuthor.id,
+    });
+
+    const response = await ctx.app.inject({
+      method: "GET",
+      url: "/api/skills/source-repos",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().repos).toEqual([
+      "secret/private-repo",
+      "shared/org-repo",
+    ]);
+  });
+
+  test("built-in skills are not offered as repositories", async () => {
+    await MemberModel.updateRole(
+      ctx.user.id,
+      ctx.organizationId,
+      ADMIN_ROLE_NAME,
+    );
+
+    await seedBuiltInSkill({
+      organizationId: ctx.organizationId,
+      name: "Platform Operations",
+      builtInSkillId: "archestra-platform-operations",
+    });
+    await seedBuiltInSkill({
+      organizationId: ctx.organizationId,
+      name: "Build App",
+      builtInSkillId: "build-app",
+    });
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "org-imported",
+      sourceRef: "shared/org-repo@main:SKILL.md",
+      access: "org",
+    });
+
+    const response = await ctx.app.inject({
+      method: "GET",
+      url: "/api/skills/source-repos",
+    });
+
+    expect(response.statusCode).toBe(200);
+    // A built-in skill's `builtin:<id>` ref is an identity token, not a
+    // repository — and it embeds the unbranded product id, so surfacing it
+    // would leak that id into a white-labeled deployment's filter.
+    expect(response.json().repos).toEqual(["shared/org-repo"]);
+  });
+
+  test("non-admins with no accessible imported skills see no repositories", async ({
+    makeUser,
+  }) => {
+    await MemberModel.updateRole(
+      ctx.user.id,
+      ctx.organizationId,
+      MEMBER_ROLE_NAME,
+    );
+    const otherAuthor = await makeUser();
+
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "private-imported",
+      sourceRef: "secret/private-repo@main:SKILL.md",
+      authorId: otherAuthor.id,
+    });
+
+    const response = await ctx.app.inject({
+      method: "GET",
+      url: "/api/skills/source-repos",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().repos).toEqual([]);
+  });
+});

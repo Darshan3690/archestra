@@ -1,62 +1,120 @@
 "use client";
 
+import type { ReactNode } from "react";
 import { useMemo } from "react";
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import { cn } from "@/lib/utils";
+  usageStrokeColor,
+  usageTextColor,
+} from "@/lib/chat/context-window-status";
+import { cn } from "@/lib/utils/tailwind";
+
+// ============================================================================
+// Progress ring — the shared circular gauge
+// ============================================================================
+
+/**
+ * Geometry per size. Kept explicit rather than derived so the composer's ring
+ * stays pixel-identical; `xs` is sized for an inline glyph slot beside
+ * `text-xs` copy, as in the context window panel's notes.
+ */
+const RING_GEOMETRY = {
+  xs: { box: "size-4", viewBox: 16, radius: 6, stroke: 2 },
+  sm: { box: "size-5", viewBox: 20, radius: 8, stroke: 2 },
+  md: { box: "size-6", viewBox: 24, radius: 10, stroke: 2.5 },
+} as const;
+
+export type ProgressRingSize = keyof typeof RING_GEOMETRY;
+
+/**
+ * A circular progress gauge. Used for the composer's context indicator and,
+ * at `xs`, wherever a note needs to show the same value it is talking about
+ * rather than a decorative icon.
+ */
+export function ProgressRing({
+  percent,
+  size = "sm",
+  className,
+  arcClassName,
+  trackClassName = "stroke-muted-foreground/80",
+  children,
+}: {
+  /** Fill, 0–100. Clamped. */
+  percent: number;
+  size?: ProgressRingSize;
+  className?: string;
+  /** Stroke color class for the filled arc. */
+  arcClassName?: string;
+  /** Stroke color class for the unfilled track. */
+  trackClassName?: string;
+  children?: ReactNode;
+}) {
+  const { box, viewBox, radius, stroke } = RING_GEOMETRY[size];
+  const center = viewBox / 2;
+  const circumference = 2 * Math.PI * radius;
+  const filled = Math.min(Math.max(percent, 0), 100);
+  const strokeDashoffset = circumference - (filled / 100) * circumference;
+
+  return (
+    <div
+      className={cn(
+        "relative inline-flex shrink-0 items-center justify-center",
+        box,
+        className,
+      )}
+    >
+      <svg
+        className="absolute inset-0 -rotate-90"
+        width={viewBox}
+        height={viewBox}
+        viewBox={`0 0 ${viewBox} ${viewBox}`}
+        aria-hidden="true"
+      >
+        {/* Track */}
+        <circle
+          cx={center}
+          cy={center}
+          r={radius}
+          fill="none"
+          strokeWidth={stroke}
+          className={trackClassName}
+        />
+        {/* Progress arc */}
+        <circle
+          cx={center}
+          cy={center}
+          r={radius}
+          fill="none"
+          strokeWidth={stroke}
+          strokeLinecap="round"
+          strokeDasharray={circumference}
+          strokeDashoffset={strokeDashoffset}
+          className={cn("transition-all duration-300", arcClassName)}
+        />
+      </svg>
+      {children}
+    </div>
+  );
+}
+
+// ============================================================================
+// Context indicator — the composer's token-aware ring
+// ============================================================================
 
 interface ContextIndicatorProps {
-  /** Current token usage (prompt + completion tokens used so far) */
+  /** Current prompt-token estimate or provider count. */
   tokensUsed: number;
-  /** Maximum context window size for the model */
+  /** Maximum context window size for the model. */
   maxTokens: number | null;
   /** Optional className for the container */
   className?: string;
-  /** Size of the indicator */
+  /** Size of the indicator. */
   size?: "sm" | "md";
 }
 
 /**
- * Format token count for display (e.g., 128000 -> "128K")
- */
-function formatTokenCount(count: number): string {
-  if (count >= 1_000_000) {
-    return `${(count / 1_000_000).toFixed(1)}M`;
-  }
-  if (count >= 1000) {
-    return `${(count / 1000).toFixed(1)}K`;
-  }
-  return count.toString();
-}
-
-/**
- * Get color based on usage percentage.
- * Green (0-50%), Yellow (50-75%), Orange (75-90%), Red (90%+)
- */
-function getUsageColor(percentage: number): string {
-  if (percentage >= 90) return "text-red-500";
-  if (percentage >= 75) return "text-orange-500";
-  if (percentage >= 50) return "text-yellow-500";
-  return "text-emerald-500";
-}
-
-/**
- * Get stroke color for SVG based on usage percentage.
- */
-function getStrokeColor(percentage: number): string {
-  if (percentage >= 90) return "stroke-red-500";
-  if (percentage >= 75) return "stroke-orange-500";
-  if (percentage >= 50) return "stroke-yellow-500";
-  return "stroke-emerald-500";
-}
-
-/**
- * Circular progress indicator showing context window usage.
- * Inspired by Vercel AI Elements Context component.
+ * Circular progress ring showing context-window usage. Purely presentational:
+ * the surfaces that host it own the hover copy and the click behaviour (in
+ * chat, `ContextWindowDialog` supplies both).
  */
 export function ContextIndicator({
   tokensUsed,
@@ -64,152 +122,33 @@ export function ContextIndicator({
   className,
   size = "sm",
 }: ContextIndicatorProps) {
-  const { percentage, circumference, strokeDashoffset } = useMemo(() => {
-    if (!maxTokens || maxTokens === 0) {
-      return { percentage: 0, circumference: 0, strokeDashoffset: 0 };
-    }
+  const percentage = useMemo(() => {
+    if (!maxTokens || maxTokens === 0) return 0;
+    return Math.min((tokensUsed / maxTokens) * 100, 100);
+  }, [tokensUsed, maxTokens]);
 
-    const pct = Math.min((tokensUsed / maxTokens) * 100, 100);
-    // SVG circle parameters
-    const radius = size === "sm" ? 8 : 10;
-    const circ = 2 * Math.PI * radius;
-    const offset = circ - (pct / 100) * circ;
-
-    return {
-      percentage: pct,
-      circumference: circ,
-      strokeDashoffset: offset,
-    };
-  }, [tokensUsed, maxTokens, size]);
-
-  // Don't render if no max tokens or no usage
   if (!maxTokens) {
     return null;
   }
 
-  const dimensions = size === "sm" ? "size-5" : "size-6";
-  const svgSize = size === "sm" ? 20 : 24;
-  const radius = size === "sm" ? 8 : 10;
-  const strokeWidth = size === "sm" ? 2 : 2.5;
-  const center = svgSize / 2;
-
   return (
-    <TooltipProvider delayDuration={300}>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <div
-            className={cn(
-              "relative inline-flex items-center justify-center cursor-default",
-              dimensions,
-              className,
-            )}
-          >
-            {/* Background circle */}
-            <svg
-              className="absolute inset-0 -rotate-90"
-              width={svgSize}
-              height={svgSize}
-              viewBox={`0 0 ${svgSize} ${svgSize}`}
-              aria-hidden="true"
-            >
-              {/* Track */}
-              <circle
-                cx={center}
-                cy={center}
-                r={radius}
-                fill="none"
-                strokeWidth={strokeWidth}
-                className="stroke-muted"
-              />
-              {/* Progress */}
-              <circle
-                cx={center}
-                cy={center}
-                r={radius}
-                fill="none"
-                strokeWidth={strokeWidth}
-                strokeLinecap="round"
-                strokeDasharray={circumference}
-                strokeDashoffset={strokeDashoffset}
-                className={cn(
-                  "transition-all duration-300",
-                  getStrokeColor(percentage),
-                )}
-              />
-            </svg>
-            {/* Percentage text (only show for md size) */}
-            {size === "md" && (
-              <span
-                className={cn(
-                  "text-[8px] font-medium tabular-nums",
-                  getUsageColor(percentage),
-                )}
-              >
-                {Math.round(percentage)}
-              </span>
-            )}
-          </div>
-        </TooltipTrigger>
-        <TooltipContent side="top" className="text-xs">
-          <div className="flex flex-col gap-0.5">
-            <span className="font-medium">Context Usage</span>
-            <span className="text-muted-foreground">
-              {formatTokenCount(tokensUsed)} / {formatTokenCount(maxTokens)}{" "}
-              tokens ({Math.round(percentage)}%)
-            </span>
-          </div>
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
-  );
-}
-
-/**
- * Compact context badge showing tokens used / max tokens.
- * Alternative to circular indicator for inline display.
- */
-export function ContextBadge({
-  tokensUsed,
-  maxTokens,
-  className,
-}: Omit<ContextIndicatorProps, "size">) {
-  if (!maxTokens) {
-    return null;
-  }
-
-  const percentage = Math.min((tokensUsed / maxTokens) * 100, 100);
-
-  return (
-    <TooltipProvider delayDuration={300}>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <div
-            className={cn(
-              "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium tabular-nums bg-muted/50",
-              getUsageColor(percentage),
-              className,
-            )}
-          >
-            <span>{formatTokenCount(tokensUsed)}</span>
-            <span className="text-muted-foreground">/</span>
-            <span className="text-muted-foreground">
-              {formatTokenCount(maxTokens)}
-            </span>
-          </div>
-        </TooltipTrigger>
-        <TooltipContent side="top" className="text-xs">
-          <div className="flex flex-col gap-0.5">
-            <span className="font-medium">Context Usage</span>
-            <span className="text-muted-foreground">
-              {tokensUsed.toLocaleString()} / {maxTokens.toLocaleString()}{" "}
-              tokens
-            </span>
-            <span className="text-muted-foreground">
-              {Math.round(percentage)}% of context window used
-            </span>
-          </div>
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
+    <ProgressRing
+      percent={percentage}
+      size={size}
+      className={className}
+      arcClassName={usageStrokeColor(percentage)}
+    >
+      {/* Percentage label inside ring — only for md size */}
+      {size === "md" && (
+        <span
+          className={cn(
+            "text-[8px] font-medium tabular-nums",
+            usageTextColor(percentage),
+          )}
+        >
+          {Math.round(percentage)}
+        </span>
+      )}
+    </ProgressRing>
   );
 }

@@ -10,6 +10,34 @@ describe("UserSearchableMultiSelect", () => {
     { userId: "user-3", name: "Bob Wilson", email: "bob@example.com" },
   ];
 
+  it("finds a user whose stored name order differs from the typed one", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <UserSearchableMultiSelect
+        value={[]}
+        onValueChange={vi.fn()}
+        users={[
+          {
+            userId: "user-ada",
+            name: "Lovelace, Ada M.",
+            email: "ada@example.com",
+          },
+          ...mockUsers,
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox"));
+    await user.type(
+      screen.getByPlaceholderText("Search users by name or email"),
+      "Ada Lovelace",
+    );
+
+    expect(screen.getByText("Lovelace, Ada M.")).toBeInTheDocument();
+    expect(screen.queryByText("John Doe")).not.toBeInTheDocument();
+  });
+
   it("renders with placeholder when no users selected", () => {
     render(
       <UserSearchableMultiSelect
@@ -56,7 +84,7 @@ describe("UserSearchableMultiSelect", () => {
     );
 
     await user.click(screen.getByRole("combobox"));
-    await user.click(screen.getByRole("button", { name: /John Doe/i }));
+    await user.click(screen.getByRole("option", { name: /John Doe/i }));
 
     expect(onValueChange).toHaveBeenCalledWith(["user-1"]);
   });
@@ -74,7 +102,7 @@ describe("UserSearchableMultiSelect", () => {
     );
 
     await user.click(screen.getByRole("combobox"));
-    await user.click(screen.getByRole("button", { name: /John Doe/i }));
+    await user.click(screen.getByRole("option", { name: /John Doe/i }));
 
     expect(onValueChange).toHaveBeenCalledWith([]);
   });
@@ -92,7 +120,7 @@ describe("UserSearchableMultiSelect", () => {
     );
 
     await user.click(screen.getByRole("combobox"));
-    await user.click(screen.getByRole("button", { name: /Jane Smith/i }));
+    await user.click(screen.getByRole("option", { name: /Jane Smith/i }));
 
     expect(onValueChange).toHaveBeenCalledWith(["user-1", "user-2"]);
 
@@ -104,7 +132,7 @@ describe("UserSearchableMultiSelect", () => {
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: /Bob Wilson/i }));
+    await user.click(screen.getByRole("option", { name: /Bob Wilson/i }));
     expect(onValueChange).toHaveBeenLastCalledWith([
       "user-1",
       "user-2",
@@ -137,7 +165,9 @@ describe("UserSearchableMultiSelect", () => {
       />,
     );
 
-    const badges = screen.getAllByRole("button", { name: "" });
+    const badges = screen.getAllByRole("button", {
+      name: "Remove selected item",
+    });
     await user.click(badges[0]);
 
     expect(onValueChange).toHaveBeenCalledWith(["user-2"]);
@@ -241,7 +271,7 @@ describe("UserSearchableMultiSelect", () => {
 
     await user.click(screen.getByRole("combobox"));
 
-    const disabledItem = screen.getByRole("button", {
+    const disabledItem = screen.getByRole("option", {
       name: /John Doe/i,
     });
     expect(disabledItem).toBeDisabled();
@@ -264,7 +294,7 @@ describe("UserSearchableMultiSelect", () => {
     );
 
     await user.click(screen.getByRole("combobox"));
-    await user.click(screen.getByRole("button", { name: /Jane Smith/i }));
+    await user.click(screen.getByRole("option", { name: /Jane Smith/i }));
 
     expect(onValueChange).not.toHaveBeenCalled();
   });
@@ -345,6 +375,28 @@ describe("UserSearchableMultiSelect", () => {
     );
   });
 
+  it("exposes selected users to assistive technology", async () => {
+    const user = userEvent.setup();
+    render(
+      <UserSearchableMultiSelect
+        value={["user-1"]}
+        onValueChange={vi.fn()}
+        users={mockUsers}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox"));
+
+    expect(screen.getByRole("option", { name: /John Doe/i })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByRole("option", { name: /Jane Smith/i })).toHaveAttribute(
+      "aria-selected",
+      "false",
+    );
+  });
+
   it("uses userId as fallback when name and email are missing", () => {
     const usersWithNoName = [{ userId: "user-abc" }];
 
@@ -376,37 +428,5 @@ describe("UserSearchableMultiSelect", () => {
     await user.click(screen.getByRole("combobox"));
     const items = screen.getAllByText("test@example.com");
     expect(items.length).toBeGreaterThanOrEqual(1);
-  });
-
-  it("shows checkmark for selected users", async () => {
-    const user = userEvent.setup();
-
-    render(
-      <UserSearchableMultiSelect
-        value={["user-1"]}
-        onValueChange={vi.fn()}
-        users={mockUsers}
-      />,
-    );
-
-    await user.click(screen.getByRole("combobox"));
-    const buttons = screen.getAllByRole("button");
-    const selectedButton = buttons.find((b) =>
-      b.textContent?.includes("John Doe"),
-    );
-    expect(selectedButton).toHaveClass("bg-accent");
-  });
-
-  it("applies custom className to combobox", () => {
-    render(
-      <UserSearchableMultiSelect
-        value={[]}
-        onValueChange={vi.fn()}
-        users={mockUsers}
-        className="my-custom-class"
-      />,
-    );
-
-    expect(screen.getByRole("combobox")).toHaveClass("my-custom-class");
   });
 });

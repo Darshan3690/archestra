@@ -1,0 +1,211 @@
+import { eq, sql } from "drizzle-orm";
+import { CacheKey } from "@/cache-manager";
+import db, { schema } from "@/database";
+import { McpGatewayTaskModel } from "@/models";
+import { mcpGatewayTaskReaper } from "@/services/mcp-gateway-task-reaper";
+import { describe, expect, test } from "@/test";
+
+const TTL_MS = 30 * 60 * 1000;
+
+/**
+ * The post-TTL lifecycle the Tasks extension sanctions: after the TTL a
+ * server "MAY mark a task as `failed` … and subsequently delete it at any
+ * time". Step one settles orphans (a `working` row past expiry belongs to a
+ * dead executor); step two purges rows past the retention grace.
+ */
+describe("MCP gateway task reaper", () => {
+  /** Create a row whose expiry is `expiresInMs` from now (negative = past). */
+  async function makeTask(
+    agentId: string,
+    expiresInMs: number,
+    status?: "completed" | "failed" | "cancelled",
+  ) {
+    const task = await McpGatewayTaskModel.create({
+      agentId,
+      principal: "user:reaper-test",
+      toolName: "slow-lab__slow_report",
+      ttlMs: expiresInMs,
+    });
+    if (status === "completed") {
+      await McpGatewayTaskModel.completeIfWorking(task.id, { ok: true });
+    } else if (status === "failed") {
+      await McpGatewayTaskModel.failIfWorking(task.id, { code: -32603 });
+    } else if (status === "cancelled") {
+      await McpGatewayTaskModel.cancelIfWorking(task.id);
+    }
+    return task;
+  }
+
+  async function rowById(taskId: string) {
+    const [row] = await db
+      .select()
+      .from(schema.mcpGatewayTasksTable)
+      .where(eq(schema.mcpGatewayTasksTable.id, taskId));
+    return row ?? null;
+  }
+
+  test("marks expired working rows failed and leaves everything else alone", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent();
+    const orphan = await makeTask(agent.id, -1_000);
+    const liveWorking = await makeTask(agent.id, TTL_MS);
+    const expiredCompleted = await makeTask(agent.id, -1_000, "completed");
+    const expiredCancelled = await makeTask(agent.id, -1_000, "cancelled");
+
+    const failed = await McpGatewayTaskModel.failExpired();
+
+    expect(failed).toBe(1);
+    const orphanRow = await rowById(orphan.id);
+    expect(orphanRow?.status).toBe("failed");
+    // The error explains what happened, in the JSON-RPC shape tasks/get serves.
+    expect(orphanRow?.error).toMatchObject({
+      code: -32603,
+      message: expect.stringContaining("expired"),
+    });
+
+    // A still-live execution is untouched; terminal outcomes are never
+    // rewritten — a completed task must not become a failed one.
+    expect((await rowById(liveWorking.id))?.status).toBe("working");
+    expect((await rowById(expiredCompleted.id))?.status).toBe("completed");
+    expect((await rowById(expiredCancelled.id))?.status).toBe("cancelled");
+  });
+
+  test("purges rows past the grace window regardless of status, keeps the rest", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent();
+    const pastGraceWorking = await makeTask(agent.id, -TTL_MS - 60_000);
+    const pastGraceCompleted = await makeTask(
+      agent.id,
+      -TTL_MS - 60_000,
+      "completed",
+    );
+    // Expired, but within the grace window: kept for operator inspection.
+    const withinGrace = await makeTask(agent.id, -1_000, "failed");
+    const live = await makeTask(agent.id, TTL_MS);
+
+    const purged = await McpGatewayTaskModel.purgeExpired({ graceMs: TTL_MS });
+
+    expect(purged).toBe(2);
+    expect(await rowById(pastGraceWorking.id)).toBeNull();
+    expect(await rowById(pastGraceCompleted.id)).toBeNull();
+    expect(await rowById(withinGrace.id)).not.toBeNull();
+    expect(await rowById(live.id)).not.toBeNull();
+  });
+
+  test("a sweep runs the spec sequence: orphans become failed first, deletion only after grace", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent();
+    // Freshly-expired orphan: must be marked failed by this sweep, NOT
+    // deleted — it is within the grace window.
+    const freshOrphan = await makeTask(agent.id, -1_000);
+    // Long-dead orphan: past the grace, this sweep removes it entirely.
+    const oldOrphan = await makeTask(agent.id, -TTL_MS - 60_000);
+
+    // The cache is created by Keyv in production, outside Drizzle migrations.
+    await db.execute(
+      sql`CREATE TABLE IF NOT EXISTS keyv_cache (key TEXT PRIMARY KEY, value TEXT)`,
+    );
+    const abandonedReply = `keyv:${CacheKey.LegacySseMessages}-orphan`;
+    await db.execute(sql`INSERT INTO keyv_cache (key, value) VALUES (
+      ${abandonedReply}, ${JSON.stringify({ value: [{ id: 1 }], expires: Date.now() - 1_000 })}
+    )`);
+    const abandonedHistory = `keyv:${CacheKey.OpenAppaHitlReviewHistory}-orphan`;
+    const liveHistory = `keyv:${CacheKey.OpenAppaHitlReviewHistory}-live`;
+    for (const [key, expires] of [
+      [abandonedHistory, Date.now() - 1_000],
+      [liveHistory, Date.now() + TTL_MS],
+    ] as const) {
+      await db.execute(sql`INSERT INTO keyv_cache (key, value) VALUES (
+        ${key}, ${JSON.stringify({ value: { outcome: "review_cancelled" }, expires })}
+      )`);
+    }
+    // A download ticket is kept for resumes and read by nobody after it expires.
+    const abandonedTicket = `keyv:${CacheKey.AgentWorkspaceTransferTicket}-orphan`;
+    const liveTicket = `keyv:${CacheKey.AgentWorkspaceTransferTicket}-live`;
+    for (const [key, expires] of [
+      [abandonedTicket, Date.now() - 1_000],
+      [liveTicket, Date.now() + TTL_MS],
+    ] as const) {
+      await db.execute(sql`INSERT INTO keyv_cache (key, value) VALUES (
+        ${key}, ${JSON.stringify({ value: { direction: "download" }, expires })}
+      )`);
+    }
+    // One-time token ids and idle authentication budgets must also expire.
+    const expiringKeys = {
+      expired: [
+        `keyv:${CacheKey.GitHubActionsTokenJti}-expired`,
+        `keyv:${CacheKey.McpGatewayRateLimit}-expired`,
+        `keyv:${CacheKey.GitHubActionsTokenRateLimit}-198.51.100.1`,
+      ],
+      live: [
+        `keyv:${CacheKey.GitHubActionsTokenJti}-live`,
+        `keyv:${CacheKey.McpGatewayRateLimit}-live`,
+        `keyv:${CacheKey.GitHubActionsTokenRateLimit}-198.51.100.2`,
+      ],
+    };
+    for (const [keys, expires] of [
+      [expiringKeys.expired, Date.now() - 1_000],
+      [expiringKeys.live, Date.now() + TTL_MS],
+    ] as const) {
+      for (const key of keys) {
+        await db.execute(sql`INSERT INTO keyv_cache (key, value) VALUES (
+          ${key}, ${JSON.stringify({ value: true, expires })}
+        )`);
+      }
+    }
+
+    const outcome = await mcpGatewayTaskReaper.sweep();
+
+    // Both orphans were `working` past expiry, so both are marked failed;
+    // only the one past the grace is then purged.
+    expect(outcome).toEqual({ failed: 2, purged: 1 });
+    expect((await rowById(freshOrphan.id))?.status).toBe("failed");
+    expect(await rowById(oldOrphan.id)).toBeNull();
+    const cached = await db.execute(
+      sql`SELECT key FROM keyv_cache WHERE key = ${abandonedReply}`,
+    );
+    expect(cached.rows).toEqual([]);
+    const history = await db.execute(
+      sql`SELECT key FROM keyv_cache WHERE key IN (${abandonedHistory}, ${liveHistory})`,
+    );
+    expect(history.rows).toEqual([{ key: liveHistory }]);
+    const tickets = await db.execute(
+      sql`SELECT key FROM keyv_cache WHERE key IN (${abandonedTicket}, ${liveTicket})`,
+    );
+    expect(tickets.rows).toEqual([{ key: liveTicket }]);
+    const githubActions = await db.execute<{ key: string }>(
+      sql`SELECT key FROM keyv_cache WHERE key IN (${sql.join(
+        [...expiringKeys.expired, ...expiringKeys.live].map(
+          (key) => sql`${key}`,
+        ),
+        sql`, `,
+      )})`,
+    );
+    expect(githubActions.rows.map((row) => row.key).sort()).toEqual(
+      [...expiringKeys.live].sort(),
+    );
+  });
+
+  test("a concurrent settle beats the reaper, matching the cancellation race rule", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent();
+    const task = await makeTask(agent.id, -1_000);
+
+    // The execution's outcome lands just before the sweep's guarded UPDATE.
+    await McpGatewayTaskModel.completeIfWorking(task.id, {
+      content: [{ type: "text", text: "made it" }],
+    });
+    const failed = await McpGatewayTaskModel.failExpired();
+
+    expect(failed).toBe(0);
+    const row = await rowById(task.id);
+    expect(row?.status).toBe("completed");
+    expect(row?.result).toMatchObject({
+      content: [{ type: "text", text: "made it" }],
+    });
+  });
+});

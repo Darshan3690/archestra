@@ -1,0 +1,164 @@
+"use client";
+
+import { Pencil, X } from "lucide-react";
+import type * as React from "react";
+import { ExternalDocsLink } from "@/components/external-docs-link";
+import { Button } from "@/components/ui/button";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { cn } from "@/lib/utils/tailwind";
+
+interface McpServerPillShellProps {
+  /**
+   * Render the pill as a statement rather than a control: no pencil, no
+   * popover, no remove button. Used where the assignment is shown for
+   * reference — the Connect page, or a reader who cannot change it.
+   */
+  readOnly?: boolean;
+  /** Rendered inside the pill trigger, e.g. an `<McpCatalogIcon />`. */
+  icon: React.ReactNode;
+  displayName: string;
+  /** Number shown in the pill as `(count)`. */
+  count: number;
+  /** No tools selected: the pill goes dashed and grows an adjacent remove button. */
+  isEmpty: boolean;
+  /** Draws the primary border to mark unsaved/pending selection. */
+  highlighted?: boolean;
+  /** Muted qualifier shown after the count, e.g. an out-of-environment flag. */
+  note?: string;
+  description?: string | null;
+  docsUrl?: string | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onRemove: () => void;
+  removeAriaLabel?: string;
+  triggerTestId?: string;
+  /** The popover body below the header (e.g. a `ToolChecklist`). */
+  children: React.ReactNode;
+}
+
+/**
+ * The visual chrome shared by every MCP-server pill — the trigger button, the
+ * empty/remove affordance, and the popover header. Callers own the popover body
+ * (passed as children) and all data/state, so the agent and app tool editors
+ * render an identical pill without sharing their (incompatible) data wiring.
+ */
+export function McpServerPillShell({
+  readOnly = false,
+  icon,
+  displayName,
+  count,
+  isEmpty,
+  highlighted,
+  note,
+  description,
+  docsUrl,
+  open,
+  onOpenChange,
+  onRemove,
+  removeAriaLabel,
+  triggerTestId,
+  children,
+}: McpServerPillShellProps) {
+  if (readOnly) {
+    return (
+      <span className="inline-flex h-8 max-w-full min-w-0 items-center gap-1.5 rounded-md border px-3 text-xs opacity-70">
+        {icon}
+        <span className="min-w-0 truncate font-medium">{displayName}</span>
+        <span className="shrink-0 text-muted-foreground">({count})</span>
+        {note ? (
+          <span className="shrink-0 font-normal text-muted-foreground">
+            {note}
+          </span>
+        ) : null}
+      </span>
+    );
+  }
+
+  return (
+    <Popover open={open} onOpenChange={onOpenChange} modal>
+      <div className="flex max-w-full min-w-0 items-center">
+        <PopoverTrigger asChild>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className={cn(
+              "min-w-0 max-w-full flex-1",
+              isEmpty && "border-dashed opacity-50",
+              isEmpty && "rounded-r-none border-r-0",
+              highlighted && "border-primary opacity-100",
+            )}
+            data-testid={triggerTestId}
+          >
+            {icon}
+            <span className="min-w-0 truncate font-medium">{displayName}</span>
+            <span className="shrink-0 text-muted-foreground">({count})</span>
+            {note ? (
+              <span className="shrink-0 font-normal text-muted-foreground">
+                {note}
+              </span>
+            ) : null}
+            <Pencil className="h-3 w-3 shrink-0 text-muted-foreground" />
+          </Button>
+        </PopoverTrigger>
+        {isEmpty && (
+          <Button
+            type="button"
+            variant="outline"
+            size="icon-sm"
+            className="rounded-l-none border-dashed opacity-50 hover:opacity-100"
+            onClick={(e) => {
+              e.stopPropagation();
+              onRemove();
+            }}
+            aria-label={removeAriaLabel ?? `Remove ${displayName}`}
+          >
+            <X className="h-3 w-3" />
+          </Button>
+        )}
+      </div>
+      <PopoverContent
+        className="flex max-h-[min(500px,var(--radix-popover-content-available-height))] w-[420px] max-w-[calc(100vw-2rem)] min-w-0 flex-col overflow-hidden p-0"
+        side="bottom"
+        align="start"
+        sideOffset={8}
+        avoidCollisions
+        collisionPadding={16}
+      >
+        <div className="flex min-w-0 shrink-0 items-start justify-between gap-2 border-b p-4">
+          <div className="min-w-0 flex-1">
+            <h4 className="truncate font-semibold">{displayName}</h4>
+            {description && (
+              <p className="mt-1 [overflow-wrap:anywhere] text-sm text-muted-foreground">
+                {description}
+                {docsUrl ? (
+                  <>
+                    {" "}
+                    <ExternalDocsLink href={docsUrl} iconClassName="size-3.5">
+                      Docs
+                    </ExternalDocsLink>
+                  </>
+                ) : null}
+              </p>
+            )}
+          </div>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            className="shrink-0"
+            onClick={() => onOpenChange(false)}
+            aria-label="Close"
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
+        {children}
+      </PopoverContent>
+    </Popover>
+  );
+}

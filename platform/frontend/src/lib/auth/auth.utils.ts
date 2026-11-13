@@ -1,16 +1,39 @@
-import { type Permissions, type Resource, resourceLabels } from "@shared";
+import {
+  type Action,
+  isPermissionActionGranted,
+  ManagedResourceSchema,
+  type Permissions,
+  type Resource,
+  resourceLabels,
+  type ScopedPermission,
+} from "@archestra/shared";
 
 /**
  * Format a Permissions object into a human-readable "Missing permissions: ..." string
  * using resource display labels.
  */
 export function formatMissingPermissions(permissions: Permissions): string {
-  const parts = Object.entries(permissions).map(([resource, actions]) => {
-    const label = resourceLabels[resource as Resource] ?? resource;
-    return `${label} (${actions.join(", ")})`;
-  });
+  return `Missing permissions: ${describeResources(permissions).join(SEPARATOR)}`;
+}
 
-  return `Missing permissions: ${parts.join(", ")}`;
+/**
+ * The one wording for "you may not do this". A tooltip alone leaves keyboard
+ * and screen reader users with a control that is refused for no stated reason,
+ * so every refusal renders this string as text as well.
+ *
+ * It names the permissions the action requires rather than the subset the user
+ * happens to be missing: the sentence describes the gate, and the required set
+ * is what an admin needs to hear to grant it.
+ */
+export function formatPermissionConstraint(permissions: Permissions): string {
+  const resources = describeResources(permissions);
+  const noun = resources.length > 1 ? "permissions" : "permission";
+
+  return `Available to roles with the ${resources.join(SEPARATOR)} ${noun}`;
+}
+
+export function permissionResourceLabel(resource: string): string {
+  return resourceLabels[resource as Resource] ?? resource;
 }
 
 export function hasPermissions(
@@ -32,7 +55,13 @@ export function hasPermissions(
     }
 
     for (const action of actions) {
-      if (!(userActions as readonly string[]).includes(action)) {
+      if (
+        !isPermissionActionGranted({
+          resource: resource as Resource,
+          grantedActions: userActions as readonly Action[],
+          requiredAction: action as Action,
+        })
+      ) {
         return false;
       }
     }
@@ -40,3 +69,65 @@ export function hasPermissions(
 
   return true;
 }
+
+/** Whether the grants include `action` on this one item, or on every item. */
+export function holdsItemGrant(params: {
+  grants: readonly ScopedPermission[] | undefined;
+  resource: ScopedPermission["resource"];
+  action: ScopedPermission["action"];
+  id: string;
+}): boolean {
+  return (
+    params.grants?.some(
+      (grant) =>
+        grant.resource === params.resource &&
+        grant.action === params.action &&
+        (grant.scope === "*" || grant.scope === params.id),
+    ) ?? false
+  );
+}
+
+/** A page may discover a granted object; mutations still use exact target checks. */
+export function hasPagePermissions(params: {
+  userPermissions: Permissions | undefined;
+  required: Permissions;
+  capabilities: readonly ScopedPermission[];
+}): boolean {
+  return Object.entries(params.required).every(([resource, actions]) =>
+    actions.every(
+      (action) =>
+        hasPermissions(params.userPermissions, { [resource]: [action] }) ||
+        (capabilityCanGrantPageAction(resource, action) &&
+          params.capabilities.some(
+            (grant) => grant.resource === resource && grant.action === action,
+          )),
+    ),
+  );
+}
+
+/**
+ * Whether hasPagePermissions can use the scoped capabilities for any of
+ * `required`. A page that cannot is decided by role permissions alone, so it
+ * need not wait for the capabilities.
+ */
+export function pageUsesCapabilities(required: Permissions): boolean {
+  return Object.entries(required).some(([resource, actions]) =>
+    actions.some((action) => capabilityCanGrantPageAction(resource, action)),
+  );
+}
+
+/** Only a read on a resource with object grants can come from a grant. */
+function capabilityCanGrantPageAction(resource: string, action: string) {
+  return action === "read" && ManagedResourceSchema.safeParse(resource).success;
+}
+
+/** One "Label (action, action)" entry per resource, in declaration order. */
+function describeResources(permissions: Permissions): string[] {
+  return Object.entries(permissions).map(([resource, actions]) => {
+    const label = permissionResourceLabel(resource);
+    return `${label} (${actions.join(SEPARATOR)})`;
+  });
+}
+
+/** Both lists a permission sentence contains read as one, so they separate alike. */
+const SEPARATOR = ", ";

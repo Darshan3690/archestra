@@ -1,0 +1,666 @@
+import {
+  archestraApiSdk,
+  type archestraApiTypes,
+  type Permissions,
+} from "@archestra/shared";
+import {
+  type QueryClient,
+  queryOptions,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { toast } from "sonner";
+import {
+  authQueryKeys,
+  useHasPermissions,
+  type useSession,
+} from "@/lib/auth/auth.query";
+import { hasPermissions } from "@/lib/auth/auth.utils";
+import { toBulkOutcome } from "@/lib/bulk-action";
+import {
+  ENCRYPTED_CHAT_KEY_HEADER,
+  generateEncryptedChatKey,
+  storeEncryptedChatKey,
+} from "@/lib/chat/encrypted-chat";
+import { PERSISTED_QUERY_META } from "@/lib/query-persistence";
+import { handleApiError, throwOnApiError } from "@/lib/utils/api";
+
+const {
+  bulkDeleteApps,
+  getApps,
+  getApp,
+  getExternalApp,
+  getAppVersionSummaries,
+  restoreAppVersion: restoreAppVersionApi,
+  getAppTools,
+  createApp,
+  updateApp,
+  enableApp,
+  disableApp,
+  lockApp,
+  unlockApp,
+  deleteApp,
+  assignToolToApp,
+  unassignToolFromApp,
+  openAppInChat,
+  openExternalAppInChat,
+  pinApp,
+  unpinApp,
+  pinExternalApp,
+  unpinExternalApp,
+  getAppLabelKeys,
+  getAppLabelValues,
+} = archestraApiSdk;
+
+type AppsQuery = NonNullable<archestraApiTypes.GetAppsData["query"]>;
+type AppsParams = Pick<
+  AppsQuery,
+  | "limit"
+  | "offset"
+  | "search"
+  | "scope"
+  | "authorIds"
+  | "excludeAuthorIds"
+  | "access"
+  | "sharedWith"
+  | "owner"
+  | "labels"
+  | "pinned"
+>;
+type AppDetailQueryOptions = { toastOnError?: boolean };
+
+// ===== Query hooks =====
+
+export const APPS_FIRST_PAGE = { limit: 100, offset: 0 } as const;
+
+/** Warm only the bounded initial list, after authenticated navigation intent. */
+export function prefetchApps(queryClient: QueryClient) {
+  const session = queryClient.getQueryData<
+    ReturnType<typeof useSession>["data"]
+  >(authQueryKeys.session());
+  const permissions = queryClient.getQueryData<Permissions>(
+    authQueryKeys.userPermissions(),
+  );
+  if (!session?.user || !hasPermissions(permissions, { app: ["read"] })) return;
+  return queryClient.prefetchQuery(appsQueryOptions(APPS_FIRST_PAGE, false));
+}
+
+/**
+ * The sidebar's read of the pinned apps. The server seeds a full page load of
+ * a shell-seeded route with it, under the same key.
+ */
+export const SIDEBAR_PINNED_APPS_QUERY = {
+  limit: 100,
+  offset: 0,
+  pinned: true,
+} as const satisfies AppsParams;
+
+/** The cache key of one page of the apps list. */
+export function appsQueryKey(params: AppsParams) {
+  return ["apps", "paginated", params] as const;
+}
+
+export function useApps(
+  params: AppsParams,
+  options?: { enabled?: boolean; toastOnError?: boolean },
+) {
+  // The endpoint requires app:read; skip the request for users whose role
+  // lacks it (e.g. the chat sidebar mounts this for everyone) instead of 403ing.
+  const { data: canReadApps } = useHasPermissions({ app: ["read"] });
+  return useQuery({
+    ...appsQueryOptions(params, options?.toastOnError),
+    enabled: (options?.enabled ?? true) && !!canReadApps,
+    // The sidebar's pinned list comes back on refresh with the rest of it.
+    meta: params.pinned === true ? PERSISTED_QUERY_META : undefined,
+    placeholderData: (previousData) => previousData,
+  });
+}
+
+export function useAppLabelKeys() {
+  const { data: canReadApps } = useHasPermissions({ app: ["read"] });
+  return useQuery({
+    queryKey: ["apps", "labels", "keys"],
+    enabled: !!canReadApps,
+    queryFn: async () => {
+      const { data, error } = await getAppLabelKeys();
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? [];
+    },
+  });
+}
+
+export function useAppLabelValues(params?: { key?: string }) {
+  const { key } = params || {};
+  return useQuery({
+    queryKey: ["apps", "labels", "values", key],
+    queryFn: async () => {
+      const { data, error } = await getAppLabelValues({
+        query: key ? { key } : {},
+      });
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? [];
+    },
+    enabled: key !== undefined,
+  });
+}
+
+// Resolves an external UI-providing app by catalog id: its UI resource plus the
+// caller's accessible installs and default install for the run-page selector.
+export function useExternalApp(
+  catalogId: string | null,
+  options?: AppDetailQueryOptions,
+) {
+  const toastOnError = options?.toastOnError;
+  return useQuery({
+    queryKey: ["apps", "external", catalogId],
+    enabled: !!catalogId,
+    queryFn: async () => {
+      const { data, error } = await getExternalApp({
+        path: { catalogId: catalogId as string },
+      });
+      throwOnApiError(error, { allowNotFound: true, toastOnError });
+      return data ?? null;
+    },
+  });
+}
+
+export function useApp(appId: string | null, options?: AppDetailQueryOptions) {
+  const toastOnError = options?.toastOnError;
+  return useQuery({
+    queryKey: ["apps", appId],
+    enabled: !!appId,
+    queryFn: async () => {
+      const { data, error } = await getApp({
+        path: { appId: appId as string },
+      });
+      throwOnApiError(error, { allowNotFound: true, toastOnError });
+      return data ?? null;
+    },
+  });
+}
+
+export function useAppVersions(appId: string | null) {
+  return useQuery({
+    queryKey: ["apps", appId, "versions"],
+    enabled: !!appId,
+    queryFn: async () => {
+      const { data, error } = await getAppVersionSummaries({
+        path: { appId: appId as string },
+      });
+      throwOnApiError(error, { allowNotFound: true });
+      return data ?? [];
+    },
+  });
+}
+
+export function useAppTools(appId: string | null) {
+  return useQuery({
+    queryKey: ["apps", appId, "tools"],
+    enabled: !!appId,
+    queryFn: async () => {
+      const { data, error } = await getAppTools({
+        path: { appId: appId as string },
+      });
+      throwOnApiError(error, { allowNotFound: true });
+      return data ?? [];
+    },
+  });
+}
+
+// ===== Mutation hooks =====
+
+export function useCreateApp() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (body: archestraApiTypes.CreateAppData["body"]) => {
+      const { data, error } = await createApp({ body });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (data) => {
+      if (!data) return;
+      queryClient.invalidateQueries({ queryKey: ["apps"] });
+      toast.success("App created");
+    },
+  });
+}
+
+// Opens an existing app in chat: the backend creates a conversation with the app
+// already rendered and returns its id to navigate to. No cache to invalidate —
+// the caller navigates to `/chat/<conversationId>` on success.
+//
+// Pass `encryptedChat` to open it as an encrypted chat. Opening an app is a browser
+// POST, so it carries the conversation key on exactly the header the composer's
+// toggle uses: the key is generated here, the server fingerprints and
+// escrow-wraps it, and it is stored under the new conversation id before the
+// caller navigates — the same order `useCreateConversation` relies on.
+export function useOpenAppInChat() {
+  return useMutation({
+    mutationFn: async (params: string | OpenAppInChatParams) => {
+      const { appId, encryptedChat } =
+        typeof params === "string"
+          ? { appId: params, encryptedChat: false }
+          : params;
+      const encryptedChatKey = encryptedChat
+        ? generateEncryptedChatKey()
+        : null;
+      const { data, error } = await openAppInChat({
+        path: { appId },
+        headers: encryptedChatKey
+          ? { [ENCRYPTED_CHAT_KEY_HEADER]: encryptedChatKey }
+          : undefined,
+      });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      if (data?.conversationId && encryptedChatKey) {
+        storeEncryptedChatKey(data.conversationId, encryptedChatKey);
+      }
+      return data;
+    },
+  });
+}
+
+/** Open an app in chat, optionally as an encrypted chat. */
+export type OpenAppInChatParams = { appId: string; encryptedChat?: boolean };
+
+// Opens an external (MCP-server) app in chat against a concrete install: the
+// backend creates a conversation and returns its id plus how it was set up —
+// `mode: "render"` (UI seeded inline) or `mode: "prompt"` (empty conversation
+// plus an opening prompt for the caller to send, used when the tool has
+// required inputs). The caller navigates to `/chat/<conversationId>` on
+// success.
+export function useOpenExternalAppInChat() {
+  return useMutation({
+    mutationFn: async (params: {
+      mcpServerId: string;
+      resourceUri: string;
+      /** See {@link useOpenAppInChat} — same key flow. */
+      encryptedChat?: boolean;
+    }) => {
+      const encryptedChatKey = params.encryptedChat
+        ? generateEncryptedChatKey()
+        : null;
+      const { data, error } = await openExternalAppInChat({
+        path: { mcpServerId: params.mcpServerId },
+        body: { resourceUri: params.resourceUri },
+        headers: encryptedChatKey
+          ? { [ENCRYPTED_CHAT_KEY_HEADER]: encryptedChatKey }
+          : undefined,
+      });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      if (data?.conversationId && encryptedChatKey) {
+        storeEncryptedChatKey(data.conversationId, encryptedChatKey);
+      }
+      return data;
+    },
+  });
+}
+
+/**
+ * The identity of a pinnable Apps-surface item, matching the list's
+ * discriminated union: owned apps by id, external apps by (install, resource,
+ * tool). The tool name is part of the identity because several tools of one
+ * server can share a ui:// resource yet list as separate tiles — a pin must
+ * land on one tile, not the group.
+ */
+export type PinAppTarget =
+  | { source: "owned"; appId: string }
+  | {
+      source: "external";
+      mcpServerId: string;
+      resourceUri: string;
+      toolName: string;
+    };
+
+type AppsListResponse = archestraApiTypes.GetAppsResponses["200"];
+type AppListItem = AppsListResponse["data"][number];
+
+function matchesPinTarget(app: AppListItem, target: PinAppTarget): boolean {
+  return target.source === "owned"
+    ? app.source === "owned" && app.id === target.appId
+    : app.source === "external" &&
+        app.mcpServerId === target.mcpServerId &&
+        app.resourceUri === target.resourceUri &&
+        app.toolName === target.toolName;
+}
+
+/**
+ * Flip `pinnedAt` for the target across every cached apps list (the Apps page
+ * and the sidebar Pinned section may hold separate entries, e.g. with a search
+ * active), so all surfaces reflect a pin/unpin together and immediately.
+ */
+function writePinToAppsLists(params: {
+  queryClient: ReturnType<typeof useQueryClient>;
+  target: PinAppTarget;
+  pinnedAt: string | null;
+}): void {
+  const { queryClient, target, pinnedAt } = params;
+  queryClient.setQueriesData<AppsListResponse>(
+    { queryKey: ["apps", "paginated"] },
+    (old) =>
+      old && {
+        ...old,
+        data: old.data.map((app) =>
+          matchesPinTarget(app, target) ? { ...app, pinnedAt } : app,
+        ),
+      },
+  );
+}
+
+/** Pin/unpin an app for the current user (personal — toggle by `pinned`). */
+export function usePinApp() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      pinned,
+      target,
+    }: {
+      pinned: boolean;
+      target: PinAppTarget;
+    }) => {
+      const { error } =
+        target.source === "owned"
+          ? pinned
+            ? await pinApp({ path: { appId: target.appId } })
+            : await unpinApp({ path: { appId: target.appId } })
+          : pinned
+            ? await pinExternalApp({
+                path: { mcpServerId: target.mcpServerId },
+                body: {
+                  resourceUri: target.resourceUri,
+                  toolName: target.toolName,
+                },
+              })
+            : await unpinExternalApp({
+                path: { mcpServerId: target.mcpServerId },
+                query: {
+                  resourceUri: target.resourceUri,
+                  toolName: target.toolName,
+                },
+              });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return true;
+    },
+    // Optimistically flip the pin in every cached list so the card grid and
+    // the sidebar move together without waiting a full list round-trip.
+    onMutate: async ({ pinned, target }) => {
+      await queryClient.cancelQueries({ queryKey: ["apps", "paginated"] });
+      const previousLists = queryClient.getQueriesData<AppsListResponse>({
+        queryKey: ["apps", "paginated"],
+      });
+      writePinToAppsLists({
+        queryClient,
+        target,
+        pinnedAt: pinned ? new Date().toISOString() : null,
+      });
+      return { previousLists };
+    },
+    // mutationFn reports failures by resolving `null` (the error was already
+    // toasted), so the rollback lives here rather than in onError.
+    onSuccess: (ok, _variables, context) => {
+      if (!ok) {
+        for (const [queryKey, data] of context.previousLists) {
+          queryClient.setQueryData(queryKey, data);
+        }
+        return;
+      }
+      queryClient.invalidateQueries({ queryKey: ["apps"] });
+    },
+  });
+}
+
+export function useUpdateApp() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      appId,
+      body,
+    }: {
+      appId: string;
+      body: archestraApiTypes.UpdateAppData["body"];
+    }) => {
+      const { data, error } = await updateApp({ path: { appId }, body });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (data, variables) => {
+      if (!data) return;
+      queryClient.invalidateQueries({ queryKey: ["apps"] });
+      queryClient.invalidateQueries({ queryKey: ["apps", variables.appId] });
+      // Visibility/environment edits write through to the app's backing catalog,
+      // which drives the MCP registry card — refresh it too.
+      queryClient.invalidateQueries({ queryKey: ["mcp-catalog"] });
+      toast.success("App updated");
+    },
+  });
+}
+
+export function useRestoreAppVersion() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      appId,
+      version,
+      baseVersion,
+    }: {
+      appId: string;
+      version: number;
+      baseVersion: number;
+    }) => {
+      const { data, error } = await restoreAppVersionApi({
+        path: { appId, version },
+        body: { baseVersion },
+      });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (data, variables) => {
+      if (!data) return;
+      queryClient.invalidateQueries({ queryKey: ["apps"] });
+      queryClient.invalidateQueries({
+        queryKey: ["apps", variables.appId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["apps", variables.appId, "versions"],
+      });
+      toast.success(
+        data.latestVersion === variables.baseVersion
+          ? "That version is already current"
+          : `Restored as version ${data.latestVersion}`,
+      );
+    },
+  });
+}
+
+// Enable/disable an app. Separate from useUpdateApp so the transition has its
+// own toast and its own cache invalidation — an enabled app newly exposes its
+// launch tool to gateways/agents (and vice versa), so the MCP catalog must
+// refresh alongside the apps list.
+export function useSetAppEnabled() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      appId,
+      enabled,
+    }: {
+      appId: string;
+      enabled: boolean;
+    }) => {
+      const { data, error } = await (enabled
+        ? enableApp({ path: { appId } })
+        : disableApp({ path: { appId } }));
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (data, variables) => {
+      if (!data) return;
+      queryClient.invalidateQueries({ queryKey: ["apps"] });
+      queryClient.invalidateQueries({ queryKey: ["apps", variables.appId] });
+      queryClient.invalidateQueries({ queryKey: ["mcp-catalog"] });
+      toast.success(variables.enabled ? "App enabled" : "App disabled");
+    },
+  });
+}
+
+// Lock/unlock an app. Like enable/disable, a distinct lifecycle transition
+// with its own endpoint: a locked app refuses all chat-driven modification
+// (and REST html replacement/deletion) until unlocked.
+export function useSetAppLocked() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      appId,
+      locked,
+    }: {
+      appId: string;
+      locked: boolean;
+    }) => {
+      const { data, error } = await (locked
+        ? lockApp({ path: { appId } })
+        : unlockApp({ path: { appId } }));
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (data, variables) => {
+      if (!data) return;
+      queryClient.invalidateQueries({ queryKey: ["apps"] });
+      queryClient.invalidateQueries({ queryKey: ["apps", variables.appId] });
+      toast.success(variables.locked ? "App locked" : "App unlocked");
+    },
+  });
+}
+
+/** Deletes a selection of apps in one request; a locked app comes back in `failed`. */
+export function useBulkDeleteApps() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (apps: readonly { id: string; name: string }[]) =>
+      bulkDeleteApps({
+        body: { ids: apps.map((app) => app.id) },
+      }).then(({ data, error }) => {
+        throwOnApiError(error, { toastOnError: false });
+        return toBulkOutcome(data ?? { succeeded: [], failed: [] });
+      }),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["apps"] }),
+  });
+}
+
+export function useDeleteApp() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (appId: string) => {
+      const { data, error } = await deleteApp({ path: { appId } });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (data) => {
+      if (!data) return;
+      queryClient.invalidateQueries({ queryKey: ["apps"] });
+      // Deleting an app tears down its backing catalog — refresh the registry.
+      queryClient.invalidateQueries({ queryKey: ["mcp-catalog"] });
+      toast.success("App deleted");
+    },
+  });
+}
+
+export function useAssignToolToApp() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      appId,
+      toolId,
+      body,
+    }: {
+      appId: string;
+      toolId: string;
+      body: archestraApiTypes.AssignToolToAppData["body"];
+    }) => {
+      const { data, error } = await assignToolToApp({
+        path: { appId, toolId },
+        body,
+      });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (data, variables) => {
+      if (!data) return;
+      queryClient.invalidateQueries({
+        queryKey: ["apps", variables.appId, "tools"],
+      });
+    },
+  });
+}
+
+function appsQueryOptions(params: AppsParams, toastOnError?: boolean) {
+  return queryOptions({
+    queryKey: appsQueryKey(params),
+    queryFn: async ({ signal }) => {
+      const { data, error } = await getApps({ query: params, signal });
+      // TanStack aborts this request when its observer disappears (for example,
+      // when navigating away from Chat). The generated SDK returns that
+      // cancellation in `error`; hand it back to TanStack without reporting it
+      // as an API failure or sending it through Next's dev error overlay.
+      if (signal.aborted) throw signal.reason;
+      throwOnApiError(error, { toastOnError });
+      return data;
+    },
+  });
+}
+
+export function useUnassignToolFromApp() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      appId,
+      toolId,
+    }: {
+      appId: string;
+      toolId: string;
+    }) => {
+      const { data, error } = await unassignToolFromApp({
+        path: { appId, toolId },
+      });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (data, variables) => {
+      if (!data) return;
+      queryClient.invalidateQueries({
+        queryKey: ["apps", variables.appId, "tools"],
+      });
+    },
+  });
+}

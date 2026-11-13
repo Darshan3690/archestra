@@ -1,9 +1,10 @@
 "use client";
 
-import { archestraApiSdk, type archestraApiTypes } from "@shared";
-import { useQuery } from "@tanstack/react-query";
+import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import type { CallerIdentity } from "@/components/executed-as-badge";
 import { DEFAULT_TABLE_LIMIT } from "@/consts";
-import { handleApiError } from "@/lib/utils";
+import { throwOnApiError } from "@/lib/utils/api";
 
 type MCPGatewayAuthMethod =
   archestraApiTypes.GetMcpToolCallResponses["200"]["authMethod"];
@@ -18,6 +19,8 @@ export function formatAuthMethod(authMethod: MCPGatewayAuthMethod): string {
       return "Org Token";
     case "team_token":
       return "Team Token";
+    case "service_account_token":
+      return "Service Account";
     case "external_idp":
       return "External IdP";
     case "session":
@@ -25,118 +28,160 @@ export function formatAuthMethod(authMethod: MCPGatewayAuthMethod): string {
   }
 }
 
+/**
+ * Who a tool call ran on behalf of, for the calls the platform served itself.
+ * A call made with a gateway token carries no user, and an auditor still needs
+ * an identity for it: the token acts for its team or for the organization, so
+ * that is who made the call. A service account normally carries its own name;
+ * one that has since been deleted still reads as a service account rather than
+ * an unknown caller. The auth method stays visible in its own column.
+ */
+export function formatCallerIdentity(row: {
+  userName: string | null;
+  authMethod: MCPGatewayAuthMethod | null;
+}): CallerIdentity | null {
+  if (row.userName) {
+    return { name: row.userName, scope: "personal" };
+  }
+  switch (row.authMethod) {
+    case "org_token":
+      return { name: null, scope: "org" };
+    case "team_token":
+      return { name: null, scope: "team" };
+    case "service_account_token":
+      return { name: "Service account", scope: "org" };
+    default:
+      // Every other method authenticates a person, so a missing name means the
+      // user is gone — there is nothing to name them by.
+      return null;
+  }
+}
+
 const { getMcpToolCall, getMcpToolCalls } = archestraApiSdk;
 
 export function useMcpToolCalls({
   agentId,
+  mcpServerName,
+  userId,
   startDate,
   endDate,
-  search,
   limit = DEFAULT_TABLE_LIMIT,
-  offset = 0,
-  sortBy,
-  sortDirection = "desc",
-  initialData,
+  cursor,
+  enabled = true,
 }: {
   agentId?: string;
+  mcpServerName?: string;
+  userId?: string;
   startDate?: string;
   endDate?: string;
-  search?: string;
   limit?: number;
-  offset?: number;
-  sortBy?: NonNullable<
-    archestraApiTypes.GetMcpToolCallsData["query"]
-  >["sortBy"];
-  sortDirection?: NonNullable<
-    archestraApiTypes.GetMcpToolCallsData["query"]
-  >["sortDirection"];
-  initialData?: archestraApiTypes.GetMcpToolCallsResponses["200"];
+  cursor?: string;
+  enabled?: boolean;
 } = {}) {
   return useQuery({
     queryKey: [
       "mcpToolCalls",
       agentId,
+      mcpServerName,
+      userId,
       startDate,
       endDate,
-      search,
       limit,
-      offset,
-      sortBy,
-      sortDirection,
+      cursor,
     ],
+    // A new page or a minute tick keeps the rows on screen until the
+    // answer lands, so the table never blanks and loses its scroll.
+    placeholderData: keepPreviousData,
     queryFn: async () => {
       const response = await getMcpToolCalls({
         query: {
           ...(agentId ? { agentId } : {}),
+          ...(mcpServerName ? { mcpServerName } : {}),
+          ...(userId ? { userId } : {}),
           ...(startDate ? { startDate } : {}),
           ...(endDate ? { endDate } : {}),
-          ...(search ? { search } : {}),
           limit,
-          offset,
-          ...(sortBy ? { sortBy } : {}),
-          sortDirection,
+          ...(cursor ? { cursor } : {}),
         },
       });
-      if (response.error) {
-        handleApiError(response.error);
-        return {
-          data: [],
-          pagination: {
-            currentPage: 1,
-            limit,
-            total: 0,
-            totalPages: 0,
-            hasNext: false,
-            hasPrev: false,
-          },
-        };
-      }
+      // Screen renders its own QueryLoadError panel; don't also toast.
+      throwOnApiError(response.error, { toastOnError: false });
       return (
         response.data ?? {
           data: [],
           pagination: {
-            currentPage: 1,
             limit,
-            total: 0,
-            totalPages: 0,
+            nextCursor: null,
             hasNext: false,
-            hasPrev: false,
           },
         }
       );
     },
-    // Only use initialData for the first page (offset 0) with default sorting and default limit
-    initialData:
-      offset === 0 &&
-      limit === DEFAULT_TABLE_LIMIT &&
-      !agentId &&
-      sortBy === "createdAt" &&
-      sortDirection === "desc" &&
-      !startDate &&
-      !endDate &&
-      !search
-        ? initialData
-        : undefined,
+    enabled,
   });
 }
 
 export function useMcpToolCall({
   mcpToolCallId,
-  initialData,
+  enabled = true,
 }: {
   mcpToolCallId: string;
-  initialData?: archestraApiTypes.GetMcpToolCallResponses["200"];
+  enabled?: boolean;
 }) {
   return useQuery({
     queryKey: ["mcpToolCalls", mcpToolCallId],
     queryFn: async () => {
       const response = await getMcpToolCall({ path: { mcpToolCallId } });
-      if (response.error) {
-        handleApiError(response.error);
-        return null;
-      }
+      throwOnApiError(response.error, { allowNotFound: true });
       return response.data ?? null;
     },
-    initialData,
+    enabled,
   });
 }
+
+/**
+ * The MCP tool calls an LLM session issued within one time window, newest
+ * first: the session page lays them on the same axis as the requests it
+ * shows. One page of the largest size, since a window spans one page of
+ * requests; `pagination.hasNext` says when it holds more than that.
+ */
+export function useSessionMcpToolCalls({
+  sessionId,
+  startDate,
+  endDate,
+  enabled = true,
+}: {
+  sessionId: string;
+  startDate?: string;
+  endDate?: string;
+  enabled?: boolean;
+}) {
+  return useQuery({
+    queryKey: ["mcpToolCalls", "session", sessionId, startDate, endDate],
+    queryFn: async () => {
+      const response = await getMcpToolCalls({
+        query: {
+          sessionId,
+          ...(startDate ? { startDate } : {}),
+          ...(endDate ? { endDate } : {}),
+          limit: SESSION_TOOL_CALLS_LIMIT,
+        },
+      });
+      throwOnApiError(response.error);
+      return (
+        response.data ?? {
+          data: [],
+          pagination: {
+            limit: SESSION_TOOL_CALLS_LIMIT,
+            nextCursor: null,
+            hasNext: false,
+          },
+        }
+      );
+    },
+    enabled,
+  });
+}
+
+/** The list endpoint's largest page. */
+const SESSION_TOOL_CALLS_LIMIT = 100;

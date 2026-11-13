@@ -1,0 +1,386 @@
+import type { APIRequestContext, Page } from "@playwright/test";
+import { expect, test } from "./fixtures";
+import type { MswControl } from "./helpers/msw-control";
+
+const PROJECT_ID = "5d9a3c1e-7b42-4f0a-9c6e-2a8b1d4e6f70";
+const PROJECT_PATH = `/api/projects/${PROJECT_ID}`;
+
+test.use({ viewport: { width: 1280, height: 800 } });
+
+test("renders project instructions as markdown in the sidebar", async ({
+  page,
+  mswControl,
+  request,
+}) => {
+  await mockProject(mswControl, request, {
+    instructions: "# Release rules\n\nAlways run **the smoke suite** first.",
+    fileCount: 0,
+  });
+  await page.goto(`/projects/${PROJECT_ID}`);
+
+  const sidebar = projectSidebar(page);
+  await expect(
+    sidebar.getByRole("heading", { name: "Release rules" }),
+  ).toBeVisible();
+  await expect(sidebar.getByText("the smoke suite")).toBeVisible();
+  await expect(sidebar.getByText("# Release rules")).toHaveCount(0);
+});
+
+test("keeps schedules on screen when the project has many files", async ({
+  page,
+  mswControl,
+  request,
+}) => {
+  await mockProject(mswControl, request, { instructions: "", fileCount: 40 });
+  await page.goto(`/projects/${PROJECT_ID}`);
+
+  const sidebar = projectSidebar(page);
+  await expect(
+    sidebar.getByRole("button", { name: "file-01.md", exact: true }),
+  ).toBeVisible();
+  await expect(
+    sidebar.getByRole("heading", { name: "Schedules" }),
+  ).toBeInViewport();
+  await expect(sidebar.getByText("Nightly digest")).toBeInViewport();
+
+  // The file list scrolls on its own instead of stretching the sidebar.
+  const lastFile = sidebar.getByRole("button", {
+    name: "file-40.md",
+    exact: true,
+  });
+  await expect(lastFile).not.toBeInViewport();
+  await lastFile.scrollIntoViewIfNeeded();
+  await expect(lastFile).toBeInViewport();
+  await expect(
+    sidebar.getByRole("heading", { name: "Schedules" }),
+  ).toBeInViewport();
+});
+
+test("separates the empty files state from the schedules divider", async ({
+  page,
+  mswControl,
+  request,
+}) => {
+  await mockProject(mswControl, request, { instructions: "", fileCount: 0 });
+  await page.goto(`/projects/${PROJECT_ID}`);
+
+  const sidebar = projectSidebar(page);
+  const empty = sidebar.getByText(
+    "Add files for your agent to use in this project.",
+  );
+  await expect(empty).toBeVisible();
+  const emptyBox = await empty.boundingBox();
+  // The divider under the Files section is the next block's top border, so it
+  // sits at the section's bottom edge.
+  const sectionBox = await empty
+    .locator("xpath=ancestor::section[1]")
+    .boundingBox();
+  if (!emptyBox || !sectionBox) {
+    throw new Error("Empty files state must be rendered in its section");
+  }
+  const gap = sectionBox.y + sectionBox.height - (emptyBox.y + emptyBox.height);
+  expect(gap).toBeGreaterThanOrEqual(12);
+});
+
+test("opens project JSON as formatted code", async ({
+  page,
+  mswControl,
+  request,
+}) => {
+  await mockProject(mswControl, request, { instructions: "", fileCount: 0 });
+  await mswControl.registerMany([
+    {
+      method: "get",
+      url: `${PROJECT_PATH}/files`,
+      body: [
+        {
+          id: "json-row",
+          downloadRef: "json-preview",
+          filename: "report.json",
+          mimeType: "application/json",
+          sizeBytes: 64,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          downloadable: true,
+          projectId: PROJECT_ID,
+          projectName: "Release train",
+        },
+      ],
+    },
+    {
+      method: "get",
+      url: "/api/skill-sandbox/artifacts/json-preview",
+      body: { items: [{ count: 42 }], ok: true },
+    },
+  ]);
+  await page.goto(`/projects/${PROJECT_ID}`);
+  await page.getByRole("button", { name: "report.json", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "report.json" });
+  await expect(dialog).toBeVisible();
+  const code = dialog.getByRole("region", { name: "Code sample, json" });
+  await expect(code).toBeVisible();
+  // A short file should fit its content instead of reserving 90% of the viewport.
+  await expect
+    .poll(async () => (await dialog.boundingBox())?.height ?? 800)
+    .toBeLessThan(500);
+  await expect.poll(() => code.textContent()).toContain('\n  "items": [\n');
+  await expect(
+    dialog.getByRole("button", { name: "Copy to clipboard" }),
+  ).toBeVisible();
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+
+  await mswControl.use({
+    method: "get",
+    url: "/api/skill-sandbox/artifacts/json-preview",
+    body: {
+      rows: Array.from({ length: 150 }, (_, i) => ({
+        index: i,
+        value: "Example",
+      })),
+    },
+  });
+  await page.getByRole("button", { name: "report.json", exact: true }).click();
+  await expect(code).toBeVisible();
+  await expect
+    .poll(async () => (await dialog.boundingBox())?.height ?? 800)
+    .toBeLessThanOrEqual(721);
+  await expect.poll(() => code.textContent()).toContain('"index": 149');
+  // The long body scrolls while the dialog header and close action stay visible.
+  await expect(
+    dialog.getByRole("heading", { name: "report.json" }),
+  ).toBeInViewport();
+  await expect(
+    dialog.getByRole("button", { name: "Close", exact: true }),
+  ).toBeInViewport();
+});
+
+test("opens CSV in a table and fits the short preview", async ({
+  page,
+  mswControl,
+  request,
+}) => {
+  await mockProject(mswControl, request, { instructions: "", fileCount: 0 });
+  await mswControl.use({
+    method: "get",
+    url: `${PROJECT_PATH}/files`,
+    body: [
+      {
+        id: "csv-row",
+        downloadRef: "preview-fixture-report.csv",
+        filename: "report.csv",
+        mimeType: "text/csv",
+        sizeBytes: 100,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        downloadable: true,
+        projectId: PROJECT_ID,
+        projectName: "Release train",
+      },
+    ],
+  });
+  await page.goto(`/projects/${PROJECT_ID}`);
+  await page.getByRole("button", { name: "report.csv", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "report.csv" });
+  await expect(dialog.getByRole("table")).toBeVisible();
+  await expect(
+    dialog.getByRole("cell", { name: "Example, Alpha", exact: true }),
+  ).toBeVisible();
+  await expect(
+    dialog.getByRole("cell", { name: "Example Beta", exact: true }),
+  ).toBeVisible();
+  await expect
+    .poll(async () => (await dialog.boundingBox())?.height ?? 800)
+    .toBeLessThan(350);
+});
+
+test("keeps a long wide CSV inside the viewport with a sticky header", async ({
+  page,
+  mswControl,
+  request,
+}) => {
+  await mockProject(mswControl, request, { instructions: "", fileCount: 0 });
+  await mswControl.use({
+    method: "get",
+    url: `${PROJECT_PATH}/files`,
+    body: [
+      {
+        id: "wide-csv-row",
+        downloadRef: "preview-fixture-wide.csv",
+        filename: "wide-report.csv",
+        mimeType: "text/csv",
+        sizeBytes: 10000,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        downloadable: true,
+        projectId: PROJECT_ID,
+        projectName: "Release train",
+      },
+    ],
+  });
+  await page.goto(`/projects/${PROJECT_ID}`);
+  await page
+    .getByRole("button", { name: "wide-report.csv", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", { name: "wide-report.csv" });
+  await expect(dialog.getByText("150 rows · 13 columns")).toBeVisible();
+  await expect(
+    dialog.getByRole("columnheader", { name: "Team", exact: true }),
+  ).toBeVisible();
+  const scroller = dialog.locator('[data-slot="table-container"]');
+  await expect
+    .poll(() =>
+      scroller.evaluate(
+        (el) =>
+          el.scrollWidth > el.clientWidth && el.scrollHeight > el.clientHeight,
+      ),
+    )
+    .toBe(true);
+  await scroller.evaluate((el) => {
+    el.scrollTop = el.scrollHeight;
+    el.scrollLeft = el.scrollWidth;
+  });
+  await expect(
+    dialog.getByRole("columnheader", { name: "Notes", exact: true }),
+  ).toBeInViewport();
+  await expect(
+    dialog.getByRole("cell", {
+      name: "Synthetic comparison row 150: a longer note that keeps its full text",
+      exact: true,
+    }),
+  ).toBeInViewport();
+  await expect(
+    dialog.getByRole("heading", { name: "wide-report.csv", exact: true }),
+  ).toBeInViewport();
+  const box = await dialog.boundingBox();
+  expect(box?.height).toBeLessThanOrEqual(721);
+  expect(box?.width).toBeLessThanOrEqual(1280);
+});
+
+function projectSidebar(page: Page) {
+  return page.locator("section", { hasText: "Instructions" }).locator("..");
+}
+
+async function mockProject(
+  mswControl: MswControl,
+  request: APIRequestContext,
+  params: { instructions: string; fileCount: number },
+) {
+  const permissions = await (
+    await request.get("/internal-test/api/api/user/permissions")
+  ).json();
+  await mswControl.use({
+    method: "get",
+    url: "/api/user/permissions",
+    body: {
+      ...permissions,
+      project: ["read", "create", "update", "delete"],
+      file: ["manage"],
+    },
+  });
+  await mswControl.use({
+    method: "get",
+    url: PROJECT_PATH,
+    body: {
+      id: PROJECT_ID,
+      name: "Release train",
+      description: null,
+      icon: null,
+      viewerRole: "owner",
+      ownerName: "Admin",
+      createdBy: null,
+      labels: [],
+      conversationCount: 0,
+      visibility: "user",
+      shareTeamNames: null,
+      shareUserNames: null,
+      pinnedAt: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      deletedAt: null,
+      shareTeamIds: null,
+      shareUserIds: null,
+      defaultAgent: null,
+    },
+  });
+  await mswControl.use({
+    method: "get",
+    url: `${PROJECT_PATH}/instructions`,
+    body: { content: params.instructions },
+  });
+  await mswControl.use({
+    method: "get",
+    url: `${PROJECT_PATH}/files`,
+    body: Array.from({ length: params.fileCount }, (_, i) => {
+      const n = String(i + 1).padStart(2, "0");
+      return {
+        id: `file-row-${n}`,
+        downloadRef: `ref-${n}`,
+        filename: `file-${n}.md`,
+        mimeType: "text/markdown",
+        sizeBytes: 128,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        downloadable: true,
+        projectId: PROJECT_ID,
+        projectName: "Release train",
+      };
+    }),
+  });
+  await mswControl.use({
+    method: "get",
+    url: `${PROJECT_PATH}/conversations`,
+    body: [],
+  });
+  await mswControl.use({
+    method: "get",
+    url: `${PROJECT_PATH}/runs`,
+    body: [],
+  });
+  await mswControl.use({
+    method: "get",
+    url: "/api/members/default-model",
+    body: { modelId: null, chatApiKeyId: null },
+  });
+  await mswControl.use({
+    method: "get",
+    url: "/api/schedule-triggers/trigger-1/runs",
+    body: {
+      data: [],
+      pagination: {
+        currentPage: 1,
+        limit: 1,
+        total: 0,
+        totalPages: 0,
+        hasNext: false,
+        hasPrev: false,
+      },
+    },
+  });
+  await mswControl.use({
+    method: "get",
+    url: "/api/schedule-triggers",
+    body: {
+      data: [
+        {
+          id: "trigger-1",
+          organizationId: "org-1",
+          name: "Nightly digest",
+          agentId: "agent-1",
+          projectId: PROJECT_ID,
+          messageTemplate: "Summarize the day",
+          cronExpression: "0 2 * * *",
+          timezone: "UTC",
+          enabled: true,
+          actorUserId: "user-1",
+          lastExecutedAt: null,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          agent: { id: "agent-1", name: "Reporter", agentType: "agent" },
+        },
+      ],
+      pagination: {
+        currentPage: 1,
+        limit: 20,
+        total: 1,
+        totalPages: 1,
+        hasNext: false,
+        hasPrev: false,
+      },
+    },
+  });
+}

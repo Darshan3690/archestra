@@ -1,6 +1,9 @@
-import { archestraApiSdk, type archestraApiTypes } from "@shared";
+import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
 import { useQuery } from "@tanstack/react-query";
-import { useIsAuthenticated } from "@/lib/auth/auth.hook";
+import { awaitBootstrapSeed } from "@/lib/auth/auth.query";
+import { useIsAuthenticated } from "@/lib/auth/use-is-authenticated";
+import { PERSISTED_QUERY_META } from "@/lib/query-persistence";
+import { throwOnApiError } from "@/lib/utils/api";
 import appConfig, { DEFAULT_BACKEND_URL } from "./config";
 
 const { getConfig } = archestraApiSdk;
@@ -14,17 +17,31 @@ export function useConfig() {
   const isAuthenticated = useIsAuthenticated();
   return useQuery({
     queryKey: ["config"],
-    queryFn: async () => (await getConfig()).data ?? null,
+    queryFn: async ({ client }) => {
+      const seed = await awaitBootstrapSeed(client);
+      if (seed) return seed.config;
+      const { data, error } = await getConfig();
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? null;
+    },
     staleTime: 5 * 60 * 1000,
     enabled: isAuthenticated,
+    meta: PERSISTED_QUERY_META,
   });
 }
 
 export function usePublicConfig() {
   return useQuery({
     queryKey: ["public-config"],
-    queryFn: async () => (await archestraApiSdk.getPublicConfig()).data ?? null,
+    queryFn: async ({ client }) => {
+      const seed = await awaitBootstrapSeed(client);
+      if (seed?.publicConfig) return seed.publicConfig;
+      const { data, error } = await archestraApiSdk.getPublicConfig();
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? null;
+    },
     staleTime: 5 * 60 * 1000,
+    meta: PERSISTED_QUERY_META,
   });
 }
 
@@ -40,6 +57,23 @@ export function useDisableInvitations(): boolean | undefined {
   return data.disableInvitations;
 }
 
+export function useDisableImpersonation(): boolean | undefined {
+  const { data, isLoading } = usePublicConfig();
+  if (isLoading || !data) return undefined;
+  return data.disableImpersonation;
+}
+
+/**
+ * Effective enterprise-core flag from the public (unauthenticated) config.
+ * Use this on pre-login surfaces (sign-in page, SSO picker); authenticated
+ * pages should use {@link useEnterpriseFeature}("core") instead.
+ */
+export function usePublicEnterpriseCoreActive(): boolean | undefined {
+  const { data, isLoading } = usePublicConfig();
+  if (isLoading || !data) return undefined;
+  return data.enterpriseCoreActive;
+}
+
 export function useProviderBaseUrls() {
   const { data, ...rest } = useConfig();
   return { data: data?.providerBaseUrls ?? null, ...rest };
@@ -53,6 +87,11 @@ export function useFeature<K extends keyof FeaturesResponse>(
   return data.features[flag];
 }
 
+/** The dedicated MCP App sandbox domain configured for this deployment. */
+export function useMcpSandboxDomain(): string | null | undefined {
+  return useFeature("mcpSandboxDomain");
+}
+
 type EnterpriseFeatures = ConfigResponse["enterpriseFeatures"];
 type EnterpriseFeatureKey = keyof EnterpriseFeatures;
 
@@ -62,10 +101,17 @@ export function useEnterpriseFeature(feature: EnterpriseFeatureKey): boolean {
   return data.enterpriseFeatures[feature] ?? false;
 }
 
-export function usePublicBaseUrl(): string {
+export type SmallTeamTierState = ConfigResponse["smallTeamTier"];
+
+export function useSmallTeamTier(): SmallTeamTierState | undefined {
+  const { data } = useConfig();
+  return data?.smallTeamTier;
+}
+
+export function usePublicBaseUrl(options?: { ignoreNgrok?: boolean }): string {
   const { data, isLoading } = useConfig();
   if (isLoading || !data) return "";
-  if (data.features.ngrokDomain) {
+  if (!options?.ignoreNgrok && data.features.ngrokDomain) {
     const domain = data.features.ngrokDomain.replace(/^https?:\/\//, "");
     return `https://${domain}`;
   }

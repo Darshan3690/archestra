@@ -1,0 +1,57 @@
+name: Scan Platform Image Bytes
+description: Validate, pull, and byte-scan exact full and slim Platform images (log in to Docker Hub first)
+
+inputs:
+  image-sha:
+    description: "Exact SHA tag produced by Platform E2E"
+    required: true
+  full-image:
+    description: "Optional retained immutable full Platform image reference"
+    default: ""
+  slim-image:
+    description: "Optional retained immutable slim Platform image reference (required with full-image)"
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve, pull, and pin exact image bytes
+      id: images
+      shell: bash
+      env:
+        IMAGE_REPO: ghcr.io/archestra-ai/ci/platform
+        IMAGE_SHA: ${{ inputs.image-sha }}
+        FULL_IMAGE: ${{ inputs.full-image }}
+        SLIM_IMAGE: ${{ inputs.slim-image }}
+      run: |
+        set -euo pipefail
+        [[ "$IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+        if [ -n "$FULL_IMAGE$SLIM_IMAGE" ]; then
+          for image in "$FULL_IMAGE" "$SLIM_IMAGE"; do
+            test "${image%@*}" = "$IMAGE_REPO"
+            [[ "${image#*@}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          done
+          full_ref=$(bash .github/scripts/resolve-attested-image.sh "$FULL_IMAGE")
+          slim_ref=$(bash .github/scripts/resolve-attested-image.sh "$SLIM_IMAGE")
+          test "$full_ref" = "$FULL_IMAGE"
+          test "$slim_ref" = "$SLIM_IMAGE"
+        else
+          full_ref=$(bash .github/scripts/resolve-attested-image.sh "${IMAGE_REPO}:${IMAGE_SHA}-e2e")
+          slim_ref=$(bash .github/scripts/resolve-attested-image.sh "${IMAGE_REPO}:${IMAGE_SHA}-e2e-slim")
+        fi
+        docker pull --platform linux/amd64 "$full_ref"
+        docker pull --platform linux/amd64 "$slim_ref"
+        full_id=$(docker image inspect "$full_ref" --format '{{.Id}}')
+        slim_id=$(docker image inspect "$slim_ref" --format '{{.Id}}')
+        [[ "$full_id" =~ ^sha256:[0-9a-f]{64}$ && "$slim_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+        echo "full=local://${full_id}" >> "$GITHUB_OUTPUT"
+        echo "slim=local://${slim_id}" >> "$GITHUB_OUTPUT"
+
+    - name: Scan exact full and slim image bytes for CVEs
+      uses: $/.github/actions/scan-docker-image
+      with:
+        image: ${{ steps.images.outputs.full }}
+        additional-images: ${{ steps.images.outputs.slim }}
+        platform: linux/amd64
+        concurrent: "false"
+        exit-code: "true"

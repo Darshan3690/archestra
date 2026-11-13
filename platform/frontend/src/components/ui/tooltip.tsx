@@ -3,7 +3,7 @@
 import * as TooltipPrimitive from "@radix-ui/react-tooltip";
 import type * as React from "react";
 
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/utils/tailwind";
 
 function TooltipProvider({
   delayDuration = 0,
@@ -36,9 +36,9 @@ function TooltipTrigger({
 
 function TooltipContent({
   className,
-  sideOffset = 0,
+  sideOffset = 6,
   children,
-  noArrow = false,
+  noArrow = true,
   ...props
 }: React.ComponentProps<typeof TooltipPrimitive.Content> & {
   noArrow?: boolean;

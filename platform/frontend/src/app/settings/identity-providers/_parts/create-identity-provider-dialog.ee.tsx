@@ -1,11 +1,11 @@
 "use client";
 
-import { zodResolver } from "@hookform/resolvers/zod";
 import {
   E2eTestId,
   IdentityProviderFormSchema,
   type IdentityProviderFormValues,
-} from "@shared";
+} from "@archestra/shared";
+import { zodResolver } from "@hookform/resolvers/zod";
 import { useCallback, useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
 import { Button } from "@/components/ui/button";
@@ -135,7 +135,7 @@ export function CreateIdentityProviderDialog({
       activeSection={validActiveSection}
       navItems={navItems}
       onActiveSectionChange={setActiveSection}
-      onSubmit={form.handleSubmit(onSubmit)}
+      onSubmit={onSubmit}
       footer={
         <>
           <Button type="button" variant="outline" onClick={handleClose}>

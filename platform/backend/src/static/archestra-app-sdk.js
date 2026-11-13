@@ -1,0 +1,831 @@
+/**
+ * Archestra Apps SDK v1 — the client microframework injected into every owned
+ * MCP App at serve time (see services/apps/app-sdk-injection.ts).
+ *
+ * Apps author pure UI against `window.archestra`:
+ *   archestra.ready                 — promise; resolves when the host handshake completes
+ *   archestra.user                  — { id, name, email } of the authenticated viewer (auto-auth)
+ *   archestra.storage.user.*        — get/set/list/delete, private to the viewer
+ *   archestra.storage.shared.*      — get/set/list/delete, shared by all users of the app
+ *     (values are plain JSON; get(key) resolves to an entry { value, revision,
+ *     owner } or null when absent, list() to [{key, value, revision, owner}];
+ *     set(key, value, { ifRevision, owned }) resolves to { revision, owner } and
+ *     by default rejects with { code: "conflict" } when the key changed since
+ *     this app last read it — pass { ifRevision: null } to force last-writer-wins,
+ *     or a number to guard on that exact revision — and { code: "forbidden" } on
+ *     an owned-key violation; delete clears a key)
+ *   archestra.files.list(query?)    — the app's persistent files, [{ id, ref, filename,
+ *                                     mimeType, sizeBytes, createdAt }] (optionally filtered
+ *                                     by a filename substring); re-list to pick up files an
+ *                                     agent copied in since the last call
+ *   archestra.files.read(file)      — resolves to a browser File (name, type, bytes) for a
+ *                                     filename string or an { id } / { filename } object (a
+ *                                     list() entry spreads straight in); feed it to
+ *                                     URL.createObjectURL, .text(), .arrayBuffer(), …
+ *   archestra.files.save(filename, data, opts) — write a string, Blob/File, ArrayBuffer, or
+ *                                     typed array; replaces a same-named file by default
+ *                                     (opts: { overwrite: false } to fail instead, { mimeType });
+ *                                     resolves to { id, filename, mimeType, sizeBytes, overwritten }
+ *   archestra.files.delete(file)    — permanently remove a file (filename string or { id })
+ *   archestra.files.onChange(cb)    — subscribe to store changes (host signal when the chat
+ *                                     agent copies a file in, plus this instance's own
+ *                                     save/delete); no payload — re-list. Returns unsubscribe.
+ *   archestra.llm.complete(prompt, opts) — one host LLM completion (opts: { system, jsonMode });
+ *                                     resolves to the text, rejects with { code: "llm_quota" }
+ *                                     on a usage limit or { code: "llm_unavailable" } otherwise
+ *   archestra.llm.prompt`...`       — tagged-template prompt builder (pure string, no round-trip)
+ *   archestra.tools.call(name,args) — call an assigned tool with the viewer's credentials;
+ *                                     resolves with the tool's data unwrapped from the MCP
+ *                                     envelope (structuredContent when the tool provides it,
+ *                                     else { text, resources: [{ uri, mimeType, text | dataUrl }] }
+ *                                     when it carries embedded resources (file contents),
+ *                                     else JSON parsed from its text output, else the raw
+ *                                     text, else { media: [{ type, mimeType, dataUrl }] }
+ *                                     for image/audio-only results, else null); throws
+ *                                     { code: "auth_required", url } when the upstream MCP
+ *                                     server needs (re)authentication
+ *   archestra.tools.list()          — the app's assigned tools (name/description/inputSchema)
+ *   archestra.ui.openLink(url) / archestra.ui.requestDisplayMode(mode)
+ *   archestra.ui.updateModelContext(text) — report what the app is showing so the
+ *                                     chat model can answer "this file" questions;
+ *                                     files.read auto-reports until the app calls this
+ *   archestra.context               — { appId, version } of the running app (sync)
+ *
+ * Delivery contract (both globals are injected before this file loads):
+ *   window.__ARCHESTRA_APP_CONTEXT__  — per-viewer bootstrap { user, tools, appId, version, sdkUrl } (backend)
+ *   window.__ARCHESTRA_APP_SDK_URL__  — ext-apps guest SDK bundle URL (sandbox proxy, same-origin fallback)
+ *   (the bundle URL is read from context.sdkUrl first, so a foreign host needs no proxy global)
+ *
+ * Classic (non-module) script: `window.archestra` exists synchronously before
+ * any app script. Connects eagerly at load — the host only delivers
+ * toolInput/toolResult after the guest handshake, so an app that never calls a
+ * method must still complete it. Failure is loud: every method rejects with
+ * the original connect error. This file must not use dynamic code generation
+ * — the sandbox CSP forbids it and the violation listener only mutes the
+ * ext-apps bundle's own probe.
+ */
+(() => {
+  "use strict";
+
+  // Render-loop diagnostics: runtime errors are posted to the parent (the
+  // sandbox proxy forwards them to the host), where they are validated,
+  // capped, and surfaced back to the authoring model. Same channel shape as
+  // the proxy's CSP-violation forwarding. Never include viewer identity here:
+  // diagnostics post with targetOrigin "*".
+  const postDiagnostic = (errorType, message) => {
+    try {
+      window.parent.postMessage(
+        {
+          type: "mcp-apps:runtime-error",
+          errorType,
+          message: String(message).slice(0, 1000),
+          timestamp: Date.now(),
+        },
+        "*",
+      );
+    } catch {
+      // never let diagnostics reporting break the app
+    }
+  };
+  window.addEventListener("error", (e) => {
+    postDiagnostic(
+      "error",
+      e.message + (e.filename ? " (" + e.filename + ":" + e.lineno + ")" : ""),
+    );
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    const r = e.reason;
+    postDiagnostic(
+      "unhandledrejection",
+      (r && (r.stack || r.message)) || String(r),
+    );
+  });
+  const formatConsoleArgs = (args) =>
+    args
+      .map((a) => {
+        if (a instanceof Error) return a.message;
+        if (typeof a === "string") return a;
+        try {
+          return JSON.stringify(a);
+        } catch {
+          return String(a);
+        }
+      })
+      .join(" ");
+  // console.error is always reported (it's a failure signal). console.log/warn/
+  // info are reported too — so the authoring model can see what the app logged —
+  // but throttled per second so a chatty render can't crowd out real errors.
+  let logBudget = 10;
+  let logWindowStart = Date.now();
+  const hookConsole = (level, errorType, throttled) => {
+    const original = console[level].bind(console);
+    console[level] = (...args) => {
+      original(...args);
+      if (throttled) {
+        const now = Date.now();
+        if (now - logWindowStart > 1000) {
+          logBudget = 10;
+          logWindowStart = now;
+        }
+        if (logBudget <= 0) return;
+        logBudget--;
+      }
+      postDiagnostic(errorType, formatConsoleArgs(args));
+    };
+  };
+  hookConsole("error", "console.error", false);
+  hookConsole("warn", "console.warn", true);
+  hookConsole("info", "console.info", true);
+  hookConsole("log", "console.log", true);
+
+  const context = window.__ARCHESTRA_APP_CONTEXT__ || {};
+
+  const connectPromise = (async () => {
+    // A strict foreign host (claude.ai) refuses any cross-origin <script src>,
+    // so the connector inlines the ext-apps bundle ahead of this script and
+    // exposes it as a global — prefer it and never touch the network. Otherwise
+    // (Archestra's own render) import it from the platform origin the host's CSP
+    // allows.
+    let App;
+    let PostMessageTransport;
+    const preloaded = window.__ARCHESTRA_EXT_APPS__;
+    if (preloaded && preloaded.App && preloaded.PostMessageTransport) {
+      ({ App, PostMessageTransport } = preloaded);
+    } else {
+      const sdkUrl = context.sdkUrl || window.__ARCHESTRA_APP_SDK_URL__;
+      if (!sdkUrl) {
+        throw new Error(
+          "Archestra Apps SDK: host did not provide the guest SDK URL",
+        );
+      }
+      ({ App, PostMessageTransport } = await import(sdkUrl));
+    }
+    // the guest bundle observes document.body for size reporting at connect
+    // time; a blocking <head> script (e.g. a CDN library) can let the
+    // handshake win the race against <body> parsing, so wait for the DOM.
+    // The readyState check keeps this hang-proof: once parsing is past
+    // "loading" the event will never fire again.
+    if (
+      typeof document !== "undefined" &&
+      !document.body &&
+      document.readyState === "loading"
+    ) {
+      await new Promise((resolve) =>
+        document.addEventListener("DOMContentLoaded", resolve, { once: true }),
+      );
+    }
+    const app = new App({ name: "archestra-app-sdk", version: "1.0.0" }, {});
+    await app.connect(new PostMessageTransport(window.parent, window.parent));
+    return app;
+  })();
+  connectPromise.catch((err) => {
+    console.error("Archestra Apps SDK: connect failed", err);
+  });
+  const ready = connectPromise.then(() => undefined);
+  // the connect failure is already reported above; don't double-report when an
+  // app never awaits ready
+  ready.catch(() => {});
+
+  // Render lint: an element carrying the `hidden` attribute that still occupies
+  // a visible box means a CSS rule is overriding `hidden`, leaving a modal or
+  // toggled element stuck visible. The base sheet's `[hidden]` reset prevents the
+  // ordinary case; this is the backstop for what slips past it — an app that
+  // beats the reset with its own `!important`, or a render where the base sheet
+  // never loaded. Such a render throws nothing and violates no CSP, so only a DOM
+  // check catches it before validate_app reports "clean".
+  const reportHiddenOverridden = () => {
+    try {
+      const offenders = [];
+      for (const el of document.querySelectorAll("[hidden]")) {
+        // `hidden="until-found"` is intentionally in the layout (find-in-page),
+        // so it is not an override; only the boolean form should stay unpainted.
+        if (el.getAttribute("hidden") === "until-found") continue;
+        // A visible box, not merely a layout box: a collapsed element (height:0,
+        // an app's own animation/disclosure state) is not "stuck visible".
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        const id = el.id ? "#" + el.id : "";
+        const cls = el.classList.length ? "." + [...el.classList].join(".") : "";
+        offenders.push(el.tagName.toLowerCase() + id + cls);
+        if (offenders.length >= 5) break;
+      }
+      if (offenders.length > 0) {
+        // `render-check` is the general channel for proactive render-correctness
+        // checks; the specific check is named in brackets so the model — and the
+        // host's dedup, keyed on the message prefix — can tell them apart. A new
+        // check posts here rather than minting its own diagnostic type.
+        postDiagnostic(
+          "render-check",
+          "[hidden-overridden] Element(s) with the `hidden` attribute are still " +
+            "rendered — a CSS rule (e.g. `display:` on the element) is overriding " +
+            "`hidden`, leaving them stuck visible: " +
+            offenders.join(", "),
+        );
+      }
+    } catch {
+      // render lint is best-effort; never surface a failure to the app
+    }
+  };
+  // Scan the DOM twice (the host dedupes): once as soon as the initial markup is
+  // parsed and laid out, and once after the handshake so anything the app's own
+  // `ready.then` handler painted is covered too. The first scan does NOT wait for
+  // `ready` on purpose — posting is a raw postMessage the host records regardless
+  // of the handshake, so scanning at DOMContentLoaded lands the diagnostic before
+  // the host's ~1.5s render-settle snapshot; waiting for a slow handshake would
+  // let that clean snapshot win and mask a statically-broken render from
+  // validate_app. The two rAFs let layout settle before getBoundingClientRect.
+  const scheduleHiddenCheck = () =>
+    requestAnimationFrame(() => requestAnimationFrame(reportHiddenOverridden));
+  // Guarded for non-browser hosts (e.g. the SDK's own Node unit tests run it
+  // against a minimal window with no `document`).
+  if (typeof document !== "undefined") {
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", scheduleHiddenCheck, {
+        once: true,
+      });
+    } else {
+      scheduleHiddenCheck();
+    }
+    ready.then(scheduleHiddenCheck).catch(() => {});
+  }
+
+  // A connect that neither resolves nor rejects means the host accepted our
+  // postMessage but never answered ui/initialize — its sandbox doesn't relay to
+  // an MCP-Apps bridge (a wrapper/proxy frame, or a non-conformant host). That
+  // failure is otherwise invisible (the app just sees a forever-pending ready),
+  // so surface it as a diagnostic. A resolve or reject cancels it.
+  const HANDSHAKE_TIMEOUT_MS = 10000;
+  const handshakeTimer = setTimeout(() => {
+    postDiagnostic(
+      "error",
+      "host handshake (ui/initialize) did not complete within " +
+        HANDSHAKE_TIMEOUT_MS +
+        "ms — the host may not relay postMessage to its MCP-Apps bridge",
+    );
+  }, HANDSHAKE_TIMEOUT_MS);
+  connectPromise.then(
+    () => clearTimeout(handshakeTimer),
+    () => clearTimeout(handshakeTimer),
+  );
+
+  // Canonical built-in tool names. Kept in sync with @archestra/shared
+  // constants by a backend drift-guard test (app-sdk-injection.test.ts).
+  const APP_DATA_TOOLS = {
+    get: "archestra__app_data_get",
+    set: "archestra__app_data_set",
+    list: "archestra__app_data_list",
+    delete: "archestra__app_data_delete",
+  };
+  const LLM_COMPLETE_TOOL = "archestra__llm_complete";
+  const FILE_TOOLS = {
+    search: "archestra__search_files",
+    readRaw: "archestra__read_file_raw",
+    save: "archestra__save_file",
+    delete: "archestra__delete_file",
+  };
+
+  // Upper bound for one host tool round-trip, overriding the MCP SDK's 60s
+  // default request timeout. A reasoning model spends minutes thinking before
+  // the completion returns, so the guest must not gate tool calls stricter
+  // than the platform's own upstream LLM client ceiling (10 minutes).
+  const TOOL_CALL_TIMEOUT_MS = 10 * 60 * 1000;
+
+  const textOf = (result) =>
+    (result.content || [])
+      .filter((c) => c && c.type === "text")
+      .map((c) => c.text)
+      .join("\n");
+
+  // Structured platform error attached to tool results (auth_required,
+  // auth_expired, ...) — in _meta and mirrored in structuredContent.
+  const archestraErrorOf = (result) =>
+    (result._meta && result._meta.archestraError) ||
+    (result.structuredContent && result.structuredContent.archestraError) ||
+    null;
+
+  /**
+   * Call a tool and resolve with the raw MCP result envelope. Internal raw
+   * path — the storage/llm wrappers read the envelope directly; tools.call
+   * unwraps it (see unwrapToolResult). Tool-level failures throw — apps
+   * handle one error channel instead of checking isError:
+   * - upstream MCP needs (re)auth → { code: "auth_required", url } so the app
+   *   can show the error message with the url as a clickable link that calls
+   *   archestra.ui.openLink(url) — the sandbox blocks popups, so a plain
+   *   target="_blank" link cannot open (the user authenticates in the
+   *   registry UI);
+   * - any other tool error → { code: "tool_error" } with the error text.
+   */
+  const callTool = async (name, args) => {
+    const app = await connectPromise;
+    const result = await app.callServerTool(
+      { name, arguments: args || {} },
+      { timeout: TOOL_CALL_TIMEOUT_MS },
+    );
+    if (result.isError) {
+      const platformError = archestraErrorOf(result);
+      if (
+        platformError &&
+        (platformError.type === "auth_required" ||
+          platformError.type === "auth_expired")
+      ) {
+        const url =
+          platformError.actionUrl ||
+          platformError.reauthUrl ||
+          platformError.installUrl ||
+          null;
+        throw Object.assign(
+          new Error(
+            'Tool "' +
+              name +
+              '" requires authentication' +
+              (url ? " — open " + url : ""),
+          ),
+          { code: "auth_required", url },
+        );
+      }
+      // Storage writes surface optimistic-concurrency and ownership rejections,
+      // and llm.complete surfaces quota/unavailable, as typed codes so apps can
+      // branch (retry on conflict, warn on forbidden, back off on llm_quota)
+      // instead of parsing a message string.
+      if (
+        platformError &&
+        (platformError.type === "conflict" ||
+          platformError.type === "forbidden" ||
+          platformError.type === "llm_quota" ||
+          platformError.type === "llm_unavailable")
+      ) {
+        throw Object.assign(
+          new Error(
+            textOf(result) ||
+              platformError.message ||
+              'Tool "' + name + '" was rejected',
+          ),
+          { code: platformError.type },
+        );
+      }
+      throw Object.assign(
+        new Error(textOf(result) || 'Tool "' + name + '" failed'),
+        { code: "tool_error" },
+      );
+    }
+    return result;
+  };
+
+  // Tool results are untrusted: only a strict type/subtype mimeType and
+  // base64-alphabet data may enter a data URL, so a malicious block can never
+  // smuggle quotes/markup into an attribute an app interpolates.
+  const SAFE_MIME_TYPE = /^[\w.+-]+\/[\w.+-]+$/;
+  const SAFE_BASE64 = /^[A-Za-z0-9+/=]+$/;
+
+  // Embedded resources (MCP `resource` blocks) carry content the text blocks
+  // only announce — a file-read tool returns "downloaded file" as text and the
+  // file body here. Text contents pass through as data; a blob becomes a
+  // dataUrl (null when its base64 is unsafe) typed by the mimeType's
+  // type/subtype essence, or application/octet-stream when that is unsafe.
+  const resourcesOf = (result) =>
+    (result.content || [])
+      .filter(
+        (c) =>
+          c &&
+          c.type === "resource" &&
+          c.resource &&
+          typeof c.resource === "object",
+      )
+      .map((c) => {
+        const r = c.resource;
+        const mimeType = typeof r.mimeType === "string" ? r.mimeType : null;
+        const entry = {
+          uri: typeof r.uri === "string" ? r.uri : null,
+          mimeType,
+        };
+        if (typeof r.text === "string") {
+          entry.text = r.text;
+        } else {
+          const essence = mimeType ? mimeType.split(";")[0].trim() : "";
+          entry.dataUrl =
+            typeof r.blob === "string" && SAFE_BASE64.test(r.blob)
+              ? "data:" +
+                (SAFE_MIME_TYPE.test(essence)
+                  ? essence
+                  : "application/octet-stream") +
+                ";base64," +
+                r.blob
+              : null;
+        }
+        return entry;
+      });
+
+  // Unwrap a successful envelope into the data an app actually wants:
+  // structuredContent when it is a non-null object, else { text, resources }
+  // when the result carries embedded resources, else JSON parsed from the
+  // joined text blocks, else the raw text, else { media } for image/audio-only
+  // results (dataUrl drops straight into an <img>/<audio> src), else null.
+  // Mirrored server-side by unwrapToolResultForPreview in
+  // archestra-mcp-server/apps.ts (this file is injected browser JS, so the
+  // two implementations cannot share code) — keep them in step.
+  const unwrapToolResult = (result) => {
+    const sc = result.structuredContent;
+    if (sc && typeof sc === "object") return sc;
+    const text = textOf(result);
+    const resources = resourcesOf(result);
+    if (resources.length) return { text, resources };
+    if (text.trim()) {
+      try {
+        return JSON.parse(text.trim());
+      } catch {
+        return text;
+      }
+    }
+    const media = (result.content || [])
+      .filter(
+        (c) =>
+          c &&
+          (c.type === "image" || c.type === "audio") &&
+          typeof c.data === "string" &&
+          SAFE_BASE64.test(c.data) &&
+          typeof c.mimeType === "string" &&
+          SAFE_MIME_TYPE.test(c.mimeType),
+      )
+      .map((c) => ({
+        type: c.type,
+        mimeType: c.mimeType,
+        dataUrl: "data:" + c.mimeType + ";base64," + c.data,
+      }));
+    return media.length ? { media } : null;
+  };
+
+  // Each value is an entry { value, revision, owner }: revision powers optimistic
+  // concurrency — a later set of the same key guards on it automatically, failing
+  // a write that raced another instance with { code: "conflict" } (opts.ifRevision
+  // overrides the guard); owner is the viewer id that claimed the (shared) key, or
+  // null when unclaimed. delete is guarded by ownership rather than revision.
+  const storagePartition = (scope) => {
+    // The revision last seen for each key, from a get or a successful set. A
+    // write guards on it by default so a read-modify-write that raced another
+    // instance of this app is rejected as a conflict rather than silently
+    // overwriting the other's committed value.
+    const seenRevisions = new Map();
+    return Object.freeze({
+      get: async (key) => {
+        const sc = (await callTool(APP_DATA_TOOLS.get, { key, scope }))
+          .structuredContent;
+        const entry =
+          sc && sc.revision != null
+            ? { value: sc.value, revision: sc.revision, owner: sc.owner ?? null }
+            : null;
+        // Cache the revision so a later set of this key guards on it. An absent
+        // key caches 0 (insert-if-absent) so two instances racing to create the
+        // same key conflict rather than one silently overwriting the other.
+        seenRevisions.set(key, entry ? entry.revision : 0);
+        return entry;
+      },
+      // By default a write guards on the revision last seen for the key this
+      // session (a conflict rejects with { code: "conflict" }). opts.ifRevision
+      // overrides that guard: a number writes only if the stored revision
+      // matches (0 = create, i.e. fail if the key already exists); null opts out
+      // entirely (last-writer-wins). opts.owned: claim a new shared key for the
+      // viewer so only they (or the app's author/admins) may overwrite it.
+      set: async (key, value, opts) => {
+        const expectedRevision =
+          opts && "ifRevision" in opts
+            ? (opts.ifRevision === null ? undefined : opts.ifRevision)
+            : seenRevisions.get(key);
+        const sc = (
+          await callTool(APP_DATA_TOOLS.set, {
+            key,
+            value,
+            scope,
+            expectedRevision,
+            claimOwner: opts?.owned,
+          })
+        ).structuredContent;
+        if (sc && sc.revision != null) seenRevisions.set(key, sc.revision);
+        return { revision: sc?.revision, owner: sc?.owner ?? null };
+      },
+      list: async () => {
+        const entries =
+          (await callTool(APP_DATA_TOOLS.list, { scope })).structuredContent
+            ?.entries || [];
+        // Cache each listed revision so an edit flow that loads via list() then
+        // saves one record still guards that write on the revision it loaded.
+        for (const e of entries) {
+          if (e && e.revision != null) seenRevisions.set(e.key, e.revision);
+        }
+        return entries;
+      },
+      // delete is guarded by ownership (an owned shared key can only be removed
+      // by its owner or the app's author/admins), not by revision.
+      delete: async (key) => {
+        await callTool(APP_DATA_TOOLS.delete, { key, scope });
+        seenRevisions.delete(key);
+      },
+    });
+  };
+
+  // The app's persistent file store (private to this app + viewer), as typed
+  // sugar over the built-in file tools — the same tools remain callable through
+  // archestra.tools.call for anything the sugar doesn't cover (read_file's
+  // paged text window, edit_file, the sandbox transfer pair). Files an agent
+  // copies in from the chat land here under their own names; subscribe with
+  // files.onChange to re-list the moment that happens (and still re-list when
+  // the user opens a picker — not every host sends the signal).
+
+  // Model-context reporting: the host relays this to the chat model so "the
+  // file I'm looking at" resolves. files.read auto-reports the file it just
+  // returned — right for the common picker/viewer app — until the app calls
+  // archestra.ui.updateModelContext itself; an explicit report is richer and
+  // permanently wins over the heuristic. Both are fire-and-forget: a host
+  // without the handler (standalone page, some external hosts) just rejects
+  // and the app never notices.
+  let explicitModelContext = false;
+  const reportModelContext = (text) => {
+    connectPromise
+      .then((app) =>
+        app.updateModelContext({ content: [{ type: "text", text }] }),
+      )
+      .catch(() => {});
+  };
+
+  const fileChangeListeners = new Set();
+  // A throwing subscriber must not starve the other listeners or break the
+  // notification path.
+  const notifyFileChange = () => {
+    for (const listener of fileChangeListeners) {
+      try {
+        listener();
+      } catch (err) {
+        postDiagnostic(
+          "error",
+          "archestra.files.onChange listener threw: " +
+            ((err && (err.stack || err.message)) || String(err)),
+        );
+      }
+    }
+  };
+  connectPromise
+    .then((app) => {
+      // resources/list_changed has no dedicated handler in the guest bridge, so
+      // it reaches the protocol's fallback slot; other unhandled notification
+      // methods are ignored here on purpose.
+      app.fallbackNotificationHandler = async (notification) => {
+        if (
+          notification &&
+          notification.method === "notifications/resources/list_changed"
+        ) {
+          notifyFileChange();
+        }
+      };
+    })
+    .catch(() => {});
+  const fileSelector = (file) => {
+    if (typeof file === "string" && file) return { filename: file };
+    if (file && typeof file === "object") {
+      if (typeof file.id === "string" && file.id) return { id: file.id };
+      if (typeof file.filename === "string" && file.filename) {
+        return { filename: file.filename };
+      }
+    }
+    throw new TypeError(
+      "archestra.files: identify a file by a filename string, or { id } / { filename }",
+    );
+  };
+  const bytesFromBase64 = (b64) => {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  };
+  const base64FromBytes = (bytes) => {
+    // chunked: String.fromCharCode over a whole large file overflows the
+    // argument limit, and per-byte string concatenation is quadratic
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(bin);
+  };
+  const filesApi = Object.freeze({
+    list: async (query) => {
+      const sc = (
+        await callTool(FILE_TOOLS.search, query ? { query } : {})
+      ).structuredContent;
+      return (sc && sc.files) || [];
+    },
+    // Resolves to a browser File — name, type, and bytes together — so the app
+    // hands it straight to URL.createObjectURL / .text() / .arrayBuffer()
+    // whatever the format (3D models, PDFs, images, text alike).
+    read: async (file) => {
+      const sc = (await callTool(FILE_TOOLS.readRaw, fileSelector(file)))
+        .structuredContent;
+      // callTool already threw on isError; a success without the structured
+      // payload is a platform-contract break — fail with a named error, not a
+      // null-property crash.
+      if (!sc || typeof sc.contentBase64 !== "string") {
+        throw Object.assign(
+          new Error("archestra.files.read: the file tool returned no content"),
+          { code: "tool_error" },
+        );
+      }
+      if (!explicitModelContext) {
+        reportModelContext(
+          'The app is showing the file "' +
+            sc.filename +
+            '" (' +
+            sc.mimeType +
+            ", " +
+            sc.sizeBytes +
+            " bytes) from its file store.",
+        );
+      }
+      return new File([bytesFromBase64(sc.contentBase64)], sc.filename, {
+        type: sc.mimeType || "application/octet-stream",
+      });
+    },
+    // Upserts by default: a same-named file is replaced in place, keeping its
+    // id — the natural "save" of an app writing the same document repeatedly.
+    // Pass { overwrite: false } to make an existing name an error instead.
+    save: async (filename, data, opts) => {
+      const args = {
+        filename,
+        overwrite: !(opts && opts.overwrite === false),
+      };
+      let mimeType = opts && opts.mimeType;
+      if (typeof data === "string") {
+        args.content = data;
+      } else {
+        let bytes;
+        if (typeof Blob !== "undefined" && data instanceof Blob) {
+          if (!mimeType && data.type) mimeType = data.type;
+          bytes = new Uint8Array(await data.arrayBuffer());
+        } else if (data instanceof ArrayBuffer) {
+          bytes = new Uint8Array(data);
+        } else if (ArrayBuffer.isView(data)) {
+          bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        } else {
+          throw new TypeError(
+            "archestra.files.save: data must be a string, Blob, ArrayBuffer, or typed array",
+          );
+        }
+        args.contentBase64 = base64FromBytes(bytes);
+      }
+      if (mimeType) args.mimeType = mimeType;
+      const sc = (await callTool(FILE_TOOLS.save, args)).structuredContent;
+      if (!sc || !sc.fileId) {
+        throw Object.assign(
+          new Error("archestra.files.save: the file tool returned no result"),
+          { code: "tool_error" },
+        );
+      }
+      notifyFileChange();
+      return {
+        id: sc.fileId,
+        filename: sc.filename,
+        mimeType: sc.mimeType,
+        sizeBytes: sc.sizeBytes,
+        overwritten: !!sc.overwritten,
+      };
+    },
+    delete: async (file) => {
+      await callTool(FILE_TOOLS.delete, fileSelector(file));
+      notifyFileChange();
+    },
+    // Subscribe to file-store changes; returns an unsubscribe function. Fires
+    // after this instance's own save/delete, and when the host signals that
+    // something else changed the store (in Archestra chat: the agent copied a
+    // file in). The event carries no payload — re-list to see what changed.
+    onChange: (listener) => {
+      if (typeof listener !== "function") {
+        throw new TypeError("archestra.files.onChange: pass a function");
+      }
+      fileChangeListeners.add(listener);
+      return () => {
+        fileChangeListeners.delete(listener);
+      };
+    },
+  });
+
+  // A single host LLM completion. Runs as the viewer through the org's app
+  // runtime model (the app can't pick one); jsonMode steers the model to emit
+  // a single JSON value the app then parses. Rejects with { code: "llm_quota" }
+  // when usage limits are hit and { code: "llm_unavailable" } otherwise.
+  const llmComplete = async (prompt, opts) => {
+    const result = await callTool(LLM_COMPLETE_TOOL, {
+      prompt,
+      system: opts && opts.system,
+      jsonMode: opts && opts.jsonMode,
+    });
+    return textOf(result);
+  };
+
+  // Tagged-template prompt builder (Spark's llmPrompt): interpolates values into
+  // a plain string. A pure client helper — no host round-trip.
+  const llmPrompt = (strings, ...values) =>
+    strings.reduce(
+      (out, str, i) =>
+        out + str + (i < values.length ? String(values[i]) : ""),
+      "",
+    );
+
+  window.archestra = Object.freeze({
+    ready,
+    user: Object.freeze(context.user || null),
+    storage: Object.freeze({
+      user: storagePartition("user"),
+      shared: storagePartition("app"),
+    }),
+    files: filesApi,
+    llm: Object.freeze({
+      complete: llmComplete,
+      prompt: llmPrompt,
+    }),
+    tools: Object.freeze({
+      call: async (name, args) => unwrapToolResult(await callTool(name, args)),
+      // assigned-tool descriptors embedded at serve time (already filtered to
+      // what the app may call); async to allow a live listing later without an
+      // API break
+      list: async () => (context.tools || []).map((t) => ({ ...t })),
+    }),
+    ui: Object.freeze({
+      openLink: async (url) => {
+        await (await connectPromise).openLink({ url });
+      },
+      requestDisplayMode: async (mode) => {
+        await (await connectPromise).requestDisplayMode({ mode });
+      },
+      // Tell the host — and through it the chat model — what the app is
+      // currently showing ("Viewing invoice-2026.pdf, page 3"). One short line
+      // of plain text; the latest call replaces earlier reports. Calling this
+      // once turns off files.read's automatic "showing file X" heuristic for
+      // the rest of the session — an app that reports explicitly knows its own
+      // state better. Fire-and-forget on hosts without the capability.
+      updateModelContext: (text) => {
+        if (typeof text !== "string" || !text.trim()) {
+          throw new TypeError(
+            "archestra.ui.updateModelContext: pass a non-empty string",
+          );
+        }
+        explicitModelContext = true;
+        reportModelContext(text);
+      },
+    }),
+    // Read-only app metadata so an app can reference itself (e.g. build a link
+    // to its own run page, show its version). Injected at serve time.
+    context: Object.freeze({
+      appId: context.appId || null,
+      version: context.version ?? null,
+    }),
+  });
+
+  // Best-effort render screenshot. The host can't capture the app (the iframe is
+  // cross-origin), so the app self-captures its own DOM and posts it to the
+  // parent, which forwards it to the server to feed get_app_diagnostics — letting
+  // the authoring model see how the app actually looks. The capture library is
+  // pulled lazily from the platform CDN allowlist (script-src, not the blocked
+  // connect-src). Never blocks or breaks the app; any failure is silent.
+  const loadCaptureLib = () =>
+    new Promise((resolve, reject) => {
+      if (window.html2canvas) return resolve(window.html2canvas);
+      const s = document.createElement("script");
+      s.src =
+        "https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js";
+      s.onload = () => resolve(window.html2canvas);
+      s.onerror = () => reject(new Error("capture lib failed to load"));
+      document.head.appendChild(s);
+    });
+  const captureRenderScreenshot = async () => {
+    try {
+      if (!document.body) return;
+      const html2canvas = await loadCaptureLib();
+      if (typeof html2canvas !== "function") return;
+      const canvas = await html2canvas(document.body, {
+        scale: 0.5,
+        logging: false,
+        backgroundColor: null,
+        useCORS: true,
+      });
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.6);
+      // ~1.1MB of binary once base64 is decoded; the ingest endpoint caps too.
+      if (dataUrl.length > 1_500_000) return;
+      window.parent.postMessage(
+        {
+          type: "mcp-apps:screenshot",
+          version: context.version ?? null,
+          dataUrl,
+        },
+        "*",
+      );
+    } catch {
+      // diagnostics are best-effort; never surface a capture failure to the app
+    }
+  };
+  // Only the author captures (they read it back via get_app_diagnostics); other
+  // viewers skip it entirely — no third-party lib load, no DOM rasterize. Wait
+  // for the handshake, then give the app a beat to paint before capturing.
+  if (context.captureScreenshot) {
+    ready
+      .then(() => {
+        setTimeout(captureRenderScreenshot, 1500);
+      })
+      .catch(() => {});
+  }
+})();

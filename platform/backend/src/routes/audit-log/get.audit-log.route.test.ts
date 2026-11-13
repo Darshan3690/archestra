@@ -1,0 +1,607 @@
+/**
+ * Contract: GET /api/audit-logs
+ * - Requires a successful permission check for RouteId.GetAuditLogs (admin-only).
+ * - Returns cursor-paginated audit rows strictly scoped to request.organizationId.
+ * - Query filters map to AuditLogModel.findCursorPaginated; invalid limits → 400.
+ * - actorId, action (dotted), outcome, actorType, resourceType, resourceId filters
+ *   narrow results; unknown filter values that fail the closed enum are rejected
+ *   with 400.
+ * - Results are always newest-first; retired free-text search and sorting
+ *   parameters are silently ignored.
+ * - Legacy actorUserId param is not accepted by the route; it is silently ignored
+ *   (Fastify strips unknown query params) — the regression guard verifies results are
+ *   NOT narrowed when only actorUserId is passed.
+ * - 403 when the caller's role lacks the route's permission.
+ */
+
+import { RouteId } from "@archestra/shared";
+import { requiredEndpointPermissionsMap } from "@archestra/shared/access-control";
+import { vi } from "vitest";
+import { hasPermission } from "@/auth";
+import { auth as betterAuth } from "@/auth/better-auth";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { MemberModel } from "@/models";
+import AuditLogModel from "@/models/audit-log";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import { ApiError, type AuditLog, type User } from "@/types";
+
+type SeedAuditLogInput = Parameters<typeof AuditLogModel.create>[0] & {
+  createdAt?: Date;
+};
+
+function seedRow(
+  organizationId: string,
+  overrides: Partial<Omit<SeedAuditLogInput, "organizationId">> = {},
+) {
+  const input: SeedAuditLogInput = {
+    actorId: null,
+    actorType: "user",
+    actorName: "Test Actor",
+    actorEmail: "actor@example.com",
+    action: "auth.signed_in",
+    outcome: "success",
+    occurredAt: new Date(),
+    resourceType: null,
+    resourceId: null,
+    before: null,
+    after: null,
+    httpMethod: null,
+    httpPath: "/api/auth/sign-in/email",
+    httpRoute: null,
+    httpStatus: null,
+    sourceIp: null,
+    userAgent: null,
+    ...overrides,
+    organizationId,
+  };
+  return AuditLogModel.create(input);
+}
+
+describe("GET /api/audit-logs", () => {
+  let app: FastifyInstanceWithZod;
+  let organizationId: string;
+  let user: User;
+
+  beforeEach(async ({ makeMember, makeOrganization, makeUser }) => {
+    vi.spyOn(betterAuth.api, "getSession").mockImplementation(
+      async () => ({ user: { id: user.id } }) as never,
+    );
+
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    user = await makeUser();
+    await makeMember(user.id, organizationId, { role: "admin" });
+
+    app = createFastifyInstance();
+
+    // Simulate auth middleware: inject authenticated user + org.
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { user: User }).user = user;
+      (request as typeof request & { organizationId: string }).organizationId =
+        organizationId;
+    });
+
+    // The route's permission gate that fastifyAuthPlugin normally applies,
+    // checked against the caller's real role.
+    app.addHook("preHandler", async (request) => {
+      const result = await hasPermission(
+        requiredEndpointPermissionsMap[RouteId.GetAuditLogs] ?? {},
+        request.headers,
+      );
+      if (!result.success) {
+        throw new ApiError(403, "Forbidden");
+      }
+    });
+
+    const { default: auditLogRoutes } = await import("./audit-log.routes");
+    await app.register(auditLogRoutes);
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await app.close();
+  });
+
+  test("returns 200 with paginated payload containing seeded rows", async () => {
+    const row = await seedRow(organizationId);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(Array.isArray(body.data)).toBe(true);
+    expect(body.data.length).toBeGreaterThan(0);
+    expect(body.pagination).toMatchObject({
+      limit: 20,
+      hasNext: false,
+      nextCursor: null,
+    });
+    expect(body.data.some((r: AuditLog) => r.id === row.id)).toBe(true);
+  });
+
+  test("returns rows whose action is not in this build's registered set", async () => {
+    // Rows persisted by other releases can carry actions this build doesn't
+    // register; read-back must not fail response serialization on them.
+    const row = await seedRow(organizationId, {
+      action: "futureFeature.created" as Parameters<
+        typeof AuditLogModel.create
+      >[0]["action"],
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    const returned = body.data.find((r: AuditLog) => r.id === row.id);
+    expect(returned?.action).toBe("futureFeature.created");
+  });
+
+  test("returns 403 for the member role", async () => {
+    await MemberModel.updateRole(user.id, organizationId, "member");
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs",
+    });
+
+    expect(response.statusCode).toBe(403);
+  });
+
+  test("returns 403 for the editor role", async () => {
+    await MemberModel.updateRole(user.id, organizationId, "editor");
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs",
+    });
+
+    expect(response.statusCode).toBe(403);
+  });
+
+  test("cross-org isolation: rows from another org are not returned", async ({
+    makeOrganization,
+  }) => {
+    const otherOrg = await makeOrganization();
+
+    const ownRow = await seedRow(organizationId);
+    const otherRow = await seedRow(otherOrg.id);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    const ids = body.data.map((r: AuditLog) => r.id);
+    expect(ids).toContain(ownRow.id);
+    expect(ids).not.toContain(otherRow.id);
+  });
+
+  test("cross-org isolation: filtering by another org resource id returns nothing", async ({
+    makeOrganization,
+  }) => {
+    const otherOrg = await makeOrganization();
+    const otherRow = await seedRow(otherOrg.id, {
+      resourceId: "cross-org-only-resource-id-zz99",
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/audit-logs?resourceId=${encodeURIComponent(otherRow.resourceId ?? "")}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.data.some((r: AuditLog) => r.id === otherRow.id)).toBe(false);
+  });
+
+  test("actorId filter narrows results", async ({ makeUser }) => {
+    const targetUser = await makeUser();
+    const targeted = await seedRow(organizationId, {
+      actorId: targetUser.id,
+    });
+    await seedRow(organizationId, { actorId: null });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/audit-logs?actorId=${targetUser.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.data.length).toBeGreaterThan(0);
+    expect(body.data.every((r: AuditLog) => r.actorId === targetUser.id)).toBe(
+      true,
+    );
+    expect(body.data.some((r: AuditLog) => r.id === targeted.id)).toBe(true);
+  });
+
+  test("legacy actorUserId param is ignored — does not narrow results (regression guard)", async ({
+    makeUser,
+  }) => {
+    const user1 = await makeUser();
+    const user2 = await makeUser();
+
+    await seedRow(organizationId, { actorId: user1.id });
+    await seedRow(organizationId, { actorId: user2.id });
+
+    // actorUserId is no longer a recognised param; it must NOT silently filter.
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/audit-logs?actorUserId=${user1.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    // Both rows must be present — if actorUserId were re-wired as a filter
+    // only one row would come back and this assertion would catch the regression.
+    expect(body.data).toHaveLength(2);
+  });
+
+  test("outcome filter narrows results to matching outcome", async () => {
+    const deniedRow = await seedRow(organizationId, { outcome: "denied" });
+    await seedRow(organizationId, { outcome: "success" });
+    await seedRow(organizationId, { outcome: "failure" });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs?outcome=denied",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.data.length).toBeGreaterThan(0);
+    expect(body.data.every((r: AuditLog) => r.outcome === "denied")).toBe(true);
+    expect(body.data.some((r: AuditLog) => r.id === deniedRow.id)).toBe(true);
+  });
+
+  test("invalid outcome value is rejected with 400", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs?outcome=partial",
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  test("actorType filter narrows results to matching actor type", async () => {
+    const apiKeyRow = await seedRow(organizationId, { actorType: "api_key" });
+    await seedRow(organizationId, { actorType: "user" });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs?actorType=api_key",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.data.length).toBeGreaterThan(0);
+    expect(body.data.every((r: AuditLog) => r.actorType === "api_key")).toBe(
+      true,
+    );
+    expect(body.data.some((r: AuditLog) => r.id === apiKeyRow.id)).toBe(true);
+  });
+
+  test("invalid actorType value is rejected with 400", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs?actorType=robot",
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  test("action filter narrows results", async () => {
+    const signInRow = await seedRow(organizationId, {
+      action: "auth.signed_in",
+    });
+    await seedRow(organizationId, { action: "auth.signed_out" });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs?action=auth.signed_in",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.data.length).toBeGreaterThan(0);
+    expect(
+      body.data.every((r: AuditLog) => r.action === "auth.signed_in"),
+    ).toBe(true);
+    expect(body.data.some((r: AuditLog) => r.id === signInRow.id)).toBe(true);
+  });
+
+  test("invalid action value (non-dotted legacy name) is rejected with 400", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs?action=create",
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  test("resourceType filter narrows results", async () => {
+    const agentRow = await seedRow(organizationId, { resourceType: "agent" });
+    await seedRow(organizationId, { resourceType: null });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs?resourceType=agent",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.data.length).toBeGreaterThan(0);
+    expect(body.data.every((r: AuditLog) => r.resourceType === "agent")).toBe(
+      true,
+    );
+    expect(body.data.some((r: AuditLog) => r.id === agentRow.id)).toBe(true);
+  });
+
+  test("resourceId filter narrows results", async () => {
+    const targeted = await seedRow(organizationId, {
+      resourceType: "agent",
+      resourceId: "agent-under-audit",
+    });
+    await seedRow(organizationId, {
+      resourceType: "agent",
+      resourceId: "other-agent",
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs?resourceId=agent-under-audit",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.data).toHaveLength(1);
+    expect(body.data[0].id).toBe(targeted.id);
+  });
+
+  test("combined action + resourceType filters AND together", async () => {
+    await seedRow(organizationId, {
+      action: "agent.created",
+      resourceType: "agent",
+      resourceId: "match-both",
+    });
+    await seedRow(organizationId, {
+      action: "agent.deleted",
+      resourceType: "agent",
+      resourceId: "wrong-action",
+    });
+    await seedRow(organizationId, {
+      action: "agent.created",
+      resourceType: "role",
+      resourceId: "wrong-type",
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs?action=agent.created&resourceType=agent",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.data).toHaveLength(1);
+    expect(body.data[0].resourceId).toBe("match-both");
+  });
+
+  test("combined outcome + actorType filters AND together", async () => {
+    await seedRow(organizationId, {
+      outcome: "denied",
+      actorType: "api_key",
+      resourceId: "match",
+    });
+    await seedRow(organizationId, {
+      outcome: "success",
+      actorType: "api_key",
+      resourceId: "wrong-outcome",
+    });
+    await seedRow(organizationId, {
+      outcome: "denied",
+      actorType: "user",
+      resourceId: "wrong-type",
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs?outcome=denied&actorType=api_key",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.data).toHaveLength(1);
+    expect(body.data[0].resourceId).toBe("match");
+  });
+
+  test("cursor pages with identical timestamps do not repeat or skip rows", async () => {
+    const createdAt = new Date("2026-01-02T03:04:05.000Z");
+    const seeded = await Promise.all(
+      Array.from({ length: 5 }, (_, i) =>
+        seedRow(organizationId, {
+          actorEmail: `page-user-${i}@example.com`,
+          createdAt,
+        }),
+      ),
+    );
+
+    const page1 = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs?limit=2",
+    });
+    const p1 = page1.json();
+    const page2 = await app.inject({
+      method: "GET",
+      url: `/api/audit-logs?limit=2&cursor=${encodeURIComponent(p1.pagination.nextCursor)}`,
+    });
+    const p2 = page2.json();
+    const page3 = await app.inject({
+      method: "GET",
+      url: `/api/audit-logs?limit=2&cursor=${encodeURIComponent(p2.pagination.nextCursor)}`,
+    });
+    const p3 = page3.json();
+
+    expect(page1.statusCode).toBe(200);
+    expect(page2.statusCode).toBe(200);
+    expect(page3.statusCode).toBe(200);
+
+    const ids = [...p1.data, ...p2.data, ...p3.data].map(
+      (row: AuditLog) => row.id,
+    );
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toEqual(expect.arrayContaining(seeded.map((row) => row.id)));
+    expect(p3.pagination).toMatchObject({
+      hasNext: false,
+      nextCursor: null,
+    });
+  });
+
+  test("startDate / endDate boundary filtering works correctly", async () => {
+    const row = await seedRow(organizationId);
+    const past = new Date("2000-01-01T00:00:00.000Z");
+    const future = new Date("2099-01-01T00:00:00.000Z");
+
+    const inRangeResponse = await app.inject({
+      method: "GET",
+      url: `/api/audit-logs?startDate=${past.toISOString()}&endDate=${future.toISOString()}`,
+    });
+    expect(inRangeResponse.statusCode).toBe(200);
+    const inRange = inRangeResponse.json();
+    expect(inRange.data.some((r: AuditLog) => r.id === row.id)).toBe(true);
+
+    const tooEarlyResponse = await app.inject({
+      method: "GET",
+      url: `/api/audit-logs?endDate=${past.toISOString()}`,
+    });
+    expect(tooEarlyResponse.statusCode).toBe(200);
+    const tooEarly = tooEarlyResponse.json();
+    expect(tooEarly.data.every((r: AuditLog) => r.id !== row.id)).toBe(true);
+  });
+
+  test("returns empty data when no rows match the filter", async () => {
+    await seedRow(organizationId, { action: "auth.signed_in" });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs?action=auth.signed_up",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.data).toEqual([]);
+    expect(body.pagination).toMatchObject({
+      hasNext: false,
+      nextCursor: null,
+    });
+  });
+
+  test("sortBy is not an accepted query param (regression guard)", async () => {
+    await seedRow(organizationId);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs?sortBy=actorEmail",
+    });
+
+    expect(response.statusCode).toBeLessThan(500);
+    if (response.statusCode === 200) {
+      const body = response.json();
+      expect(Array.isArray(body.data)).toBe(true);
+    }
+  });
+
+  test("limit above the configured maximum is rejected with 400", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs?limit=99999",
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  test("legacy offsets and malformed cursors serve the newest page", async () => {
+    const newest = await seedRow(organizationId, {
+      createdAt: new Date("2099-01-01T00:00:00.000Z"),
+    });
+
+    for (const query of ["offset=999&page=999", "cursor=truncated"] as const) {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/audit-logs?limit=1&${query}`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().data[0].id).toBe(newest.id);
+    }
+  });
+
+  test("ignores retired search and sort inputs and stays newest-first", async () => {
+    await seedRow(organizationId, {
+      actorEmail: "search-target@example.com",
+      createdAt: new Date("2098-01-01T00:00:00.000Z"),
+    });
+    const newest = await seedRow(organizationId, {
+      actorEmail: "newest@example.com",
+      createdAt: new Date("2099-01-01T00:00:00.000Z"),
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/audit-logs?limit=1&sortDirection=asc&search=search-target",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().data[0].id).toBe(newest.id);
+  });
+
+  describe("own-vs-all visibility (auditLog:read vs auditLog:admin)", () => {
+    test("without auditLog:admin, only the caller's own actions are returned — an actorId filter for someone else is overridden", async ({
+      makeUser,
+    }) => {
+      const other = await makeUser();
+      await seedRow(organizationId, { actorId: user.id, actorEmail: "me@x" });
+      await seedRow(organizationId, { actorId: other.id, actorEmail: "o@x" });
+      await seedRow(organizationId, { actorId: null });
+
+      await MemberModel.updateRole(user.id, organizationId, "platform_admin");
+
+      const list = await app.inject({
+        method: "GET",
+        url: "/api/audit-logs?limit=10",
+      });
+      expect(list.statusCode).toBe(200);
+      expect(list.json().data).toHaveLength(1);
+      expect(list.json().data[0].actorId).toBe(user.id);
+
+      const forced = await app.inject({
+        method: "GET",
+        url: `/api/audit-logs?limit=10&actorId=${other.id}`,
+      });
+      expect(forced.json().data).toHaveLength(1);
+      expect(forced.json().data[0].actorId).toBe(user.id);
+    });
+
+    test("with auditLog:admin the whole trail is visible", async ({
+      makeUser,
+    }) => {
+      const other = await makeUser();
+      await seedRow(organizationId, { actorId: user.id });
+      await seedRow(organizationId, { actorId: other.id });
+
+      const list = await app.inject({
+        method: "GET",
+        url: "/api/audit-logs?limit=10",
+      });
+      expect(list.json().data).toHaveLength(2);
+    });
+  });
+});

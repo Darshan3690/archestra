@@ -1,6 +1,9 @@
 "use client";
 
-import { LABELS_ENTRY_DELIMITER, LABELS_VALUE_DELIMITER } from "@shared";
+import {
+  LABELS_ENTRY_DELIMITER,
+  LABELS_VALUE_DELIMITER,
+} from "@archestra/shared";
 import { Check, ChevronDown, Search, X } from "lucide-react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useMemo, useState } from "react";
@@ -11,7 +14,10 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { cn } from "@/lib/utils";
+import { UnstyledButton } from "@/components/ui/unstyled-button";
+import type { QueryParamsAdapter } from "@/lib/hooks/use-query-params-adapter";
+import { parseLabelsParam } from "@/lib/labels-param";
+import { cn } from "@/lib/utils/tailwind";
 
 export interface LabelSelectProps {
   labelKeys: string[] | undefined;
@@ -20,11 +26,19 @@ export interface LabelSelectProps {
     selectedValues: string[];
     onToggleValue: (key: string, value: string) => void;
   }>;
+  /**
+   * Trigger styling. Filter bars pass `filterControlClass({ active })` so the
+   * control matches the rest of the row.
+   */
+  className?: string;
+  queryParamsAdapter?: QueryParamsAdapter;
 }
 
 export function LabelSelect({
   labelKeys,
   LabelKeyRowComponent,
+  className,
+  queryParamsAdapter,
 }: LabelSelectProps) {
   const searchParams = useSearchParams();
   const router = useRouter();
@@ -32,7 +46,8 @@ export function LabelSelect({
   const [open, setOpen] = useState(false);
   const [keySearch, setKeySearch] = useState("");
 
-  const labelsParam = searchParams.get("labels");
+  const activeSearchParams = queryParamsAdapter?.searchParams ?? searchParams;
+  const labelsParam = activeSearchParams.get("labels");
   const parsed = useMemo(() => parseLabelsParam(labelsParam), [labelsParam]);
 
   const totalSelected = useMemo(() => {
@@ -49,8 +64,18 @@ export function LabelSelect({
 
   const updateLabels = useCallback(
     (updated: Record<string, string[]>) => {
-      const params = new URLSearchParams(searchParams.toString());
       const serialized = serializeLabels(updated);
+      if (queryParamsAdapter) {
+        queryParamsAdapter.updateQueryParams(
+          {
+            labels: serialized || null,
+            page: activeSearchParams.has("page") ? "1" : undefined,
+          },
+          { history: "replace" },
+        );
+        return;
+      }
+      const params = new URLSearchParams(searchParams.toString());
       if (serialized) {
         params.set("labels", serialized);
       } else {
@@ -61,7 +86,7 @@ export function LabelSelect({
       }
       router.replace(`${pathname}?${params.toString()}`, { scroll: false });
     },
-    [searchParams, router, pathname],
+    [activeSearchParams, searchParams, router, pathname, queryParamsAdapter],
   );
 
   const handleToggleValue = useCallback(
@@ -89,9 +114,15 @@ export function LabelSelect({
           variant="outline"
           role="combobox"
           aria-expanded={open}
+          aria-label={
+            totalSelected > 0
+              ? `Filter by labels, ${totalSelected} selected`
+              : "Filter by labels"
+          }
           className={cn(
             "w-[180px] justify-between font-normal",
             !totalSelected && "text-muted-foreground",
+            className,
           )}
         >
           <span className="truncate">
@@ -161,7 +192,7 @@ export function LabelKeyRowBase({
   return (
     <Popover open={open} onOpenChange={handleOpenChange}>
       <PopoverTrigger asChild>
-        <button
+        <UnstyledButton
           type="button"
           className={cn(
             "relative flex w-full cursor-default select-none items-center justify-between rounded-sm px-2 py-1.5 text-sm outline-none transition-colors hover:bg-accent hover:text-accent-foreground",
@@ -172,9 +203,14 @@ export function LabelKeyRowBase({
           {selectedValues.length > 0 && (
             <Badge variant="secondary" className="ml-2 h-5 px-1.5 text-xs">
               {selectedValues.length}
+              <span className="sr-only">
+                {selectedValues.length === 1
+                  ? "value selected"
+                  : "values selected"}
+              </span>
             </Badge>
           )}
-        </button>
+        </UnstyledButton>
       </PopoverTrigger>
       <PopoverContent
         className="w-[220px] p-0"
@@ -200,7 +236,7 @@ export function LabelKeyRowBase({
             filteredValues.map((value) => {
               const isSelected = selectedValues.includes(value);
               return (
-                <button
+                <UnstyledButton
                   type="button"
                   key={value}
                   onClick={() => onToggleValue(labelKey, value)}
@@ -216,7 +252,7 @@ export function LabelKeyRowBase({
                     )}
                   />
                   <span className="truncate">{value}</span>
-                </button>
+                </UnstyledButton>
               );
             })
           )}
@@ -251,13 +287,13 @@ export function LabelFilterBadges({
             className="gap-1 pr-1"
           >
             {key}: {value}
-            <button
+            <UnstyledButton
               type="button"
               onClick={() => onRemoveLabel(key, value)}
               className="ml-0.5 rounded-full hover:bg-muted-foreground/20 p-0.5"
             >
               <X className="h-3 w-3" />
-            </button>
+            </UnstyledButton>
           </Badge>
         )),
       )}
@@ -265,26 +301,16 @@ export function LabelFilterBadges({
   );
 }
 
-export function parseLabelsParam(
-  labels: string | null,
-): Record<string, string[]> | null {
-  if (!labels) return null;
-  const result: Record<string, string[]> = {};
-  for (const entry of labels.split(LABELS_ENTRY_DELIMITER)) {
-    const colonIdx = entry.indexOf(":");
-    if (colonIdx === -1) continue;
-    const key = entry.slice(0, colonIdx).trim();
-    const values = entry
-      .slice(colonIdx + 1)
-      .split(LABELS_VALUE_DELIMITER)
-      .map((v) => v.trim())
-      .filter(Boolean);
-    if (key && values.length > 0) {
-      result[key] = values;
-    }
-  }
-  return Object.keys(result).length > 0 ? result : null;
+/**
+ * The `?labels=` filter as a key -> values map, for a list page that narrows
+ * its rows in the browser rather than re-querying.
+ */
+export function useSelectedLabels(): Record<string, string[]> | null {
+  const labelsParam = useSearchParams().get("labels");
+  return useMemo(() => parseLabelsParam(labelsParam), [labelsParam]);
 }
+
+export { parseLabelsParam };
 
 export function serializeLabels(
   labels: Record<string, string[]>,

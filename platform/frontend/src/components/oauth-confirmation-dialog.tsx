@@ -1,16 +1,14 @@
 "use client";
 
-import { AlertCircle, ShieldCheck, User } from "lucide-react";
+import { ShieldCheck, User } from "lucide-react";
 import { useState } from "react";
 import {
   type McpServerInstallScope,
   SelectMcpServerCredentialTypeAndTeams,
 } from "@/app/mcp/registry/_parts/select-mcp-server-credential-type-and-teams";
 import { StandardFormDialog } from "@/components/standard-dialog";
-import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { useFeature } from "@/lib/config/config.query";
 
 export interface OAuthInstallResult {
   /** Installation scope (personal, team, org) */
@@ -33,6 +31,14 @@ interface OAuthConfirmationDialogProps {
   personalOnly?: boolean;
   /** When true, only organization-wide installation is allowed */
   orgOnly?: boolean;
+  /**
+   * When true, the dialog re-authorizes an existing connection rather than
+   * installing a new one. Re-auth keeps the connection's existing scope, so the
+   * scope/credential-type selector is skipped — rendering it would surface an
+   * "Already installed" dead-end (no scope is installable) and hide the
+   * "Continue to Authorization" button.
+   */
+  isReauth?: boolean;
 }
 
 export function OAuthConfirmationDialog({
@@ -45,6 +51,7 @@ export function OAuthConfirmationDialog({
   preselectedTeamId,
   personalOnly = false,
   orgOnly = false,
+  isReauth = false,
 }: OAuthConfirmationDialogProps) {
   const [scope, setScope] = useState<McpServerInstallScope>(
     orgOnly ? "org" : preselectedTeamId ? "team" : "personal",
@@ -53,7 +60,6 @@ export function OAuthConfirmationDialog({
     preselectedTeamId ?? null,
   );
   const [canInstall, setCanInstall] = useState(true);
-  const byosEnabled = useFeature("byosEnabled");
 
   const handleConfirm = () => {
     onConfirm({ scope, teamId: selectedTeamId });
@@ -106,28 +112,24 @@ export function OAuthConfirmationDialog({
         ) : null
       }
     >
-      {canInstall && byosEnabled ? (
-        <Alert
-          variant="default"
-          className="border-amber-500/50 bg-amber-50 dark:bg-amber-950/20"
-        >
-          <AlertCircle className="h-4 w-4 text-amber-600 dark:text-amber-500" />
-          <AlertDescription className="text-amber-700 dark:text-amber-400">
-            Read-only Vault Secret Manager doesn't support OAuth credentials.
-            They will be stored in the database.
-          </AlertDescription>
-        </Alert>
-      ) : null}
+      {null}
 
-      <SelectMcpServerCredentialTypeAndTeams
-        onTeamChange={setSelectedTeamId}
-        onScopeChange={setScope}
-        catalogId={catalogId}
-        onCanInstallChange={setCanInstall}
-        preselectedTeamId={preselectedTeamId}
-        personalOnly={personalOnly}
-        orgOnly={orgOnly}
-      />
+      {isReauth ? (
+        <p className="text-muted-foreground text-sm">
+          You'll re-authorize your existing {serverName} connection. Its access
+          settings stay the same.
+        </p>
+      ) : (
+        <SelectMcpServerCredentialTypeAndTeams
+          onTeamChange={setSelectedTeamId}
+          onScopeChange={setScope}
+          catalogId={catalogId}
+          onCanInstallChange={setCanInstall}
+          preselectedTeamId={preselectedTeamId}
+          personalOnly={personalOnly}
+          orgOnly={orgOnly}
+        />
+      )}
     </StandardFormDialog>
   );
 }

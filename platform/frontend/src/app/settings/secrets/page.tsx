@@ -4,11 +4,10 @@ import { RefreshCw, Server } from "lucide-react";
 import { useCallback, useEffect } from "react";
 import { useSetSettingsAction } from "@/app/settings/layout";
 import {
-  SettingsCardHeader,
+  SettingsBlock,
   SettingsSectionStack,
 } from "@/components/settings/settings-block";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Card, CardContent } from "@/components/ui/card";
+import { InlineNotice, InlineNoticeText } from "@/components/ui/inline-notice";
 import { PermissionButton } from "@/components/ui/permission-button";
 import {
   useCheckSecretsConnectivity,
@@ -32,14 +31,15 @@ export default function SecretsSettingsPage() {
 
     setActionButton(
       <PermissionButton
-        permissions={{ secret: ["update"] }}
+        permissions={{ organizationSettings: ["update"] }}
+        size="sm"
         onClick={handleCheckConnectivity}
         disabled={checkConnectivityMutation.isPending}
       >
         {checkConnectivityMutation.isPending && (
           <RefreshCw className="h-4 w-4 animate-spin" />
         )}
-        Check Vault Connectivity
+        <span>Check Vault Connectivity</span>
       </PermissionButton>,
     );
 
@@ -52,11 +52,7 @@ export default function SecretsSettingsPage() {
   ]);
 
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <p className="text-lg text-muted-foreground">Loading...</p>
-      </div>
-    );
+    return null;
   }
 
   // Don't render anything if not using Vault storage
@@ -66,16 +62,15 @@ export default function SecretsSettingsPage() {
 
   return (
     <SettingsSectionStack>
-      <Card>
-        <SettingsCardHeader
-          title={
-            <span className="flex items-center gap-2">
-              <Server className="h-5 w-5" />
-              Secrets Storage
-            </span>
-          }
-        />
-        <CardContent className="space-y-4">
+      <SettingsBlock
+        title={
+          <span className="flex items-center gap-2">
+            <Server className="h-4 w-4" />
+            Secrets Storage
+          </span>
+        }
+      >
+        <div className="space-y-4">
           <div className="text-sm font-mono bg-muted p-3 rounded space-y-1">
             {Object.entries(secretsType.meta).map(([key, value]) => (
               <p key={key}>
@@ -85,27 +80,30 @@ export default function SecretsSettingsPage() {
           </div>
 
           {checkConnectivityMutation.isError && (
-            <Alert variant="destructive">
-              <AlertTitle>Connection Failed</AlertTitle>
-              <AlertDescription>
+            <InlineNotice variant="error">
+              <span className="font-medium">Connection Failed</span>
+              <InlineNoticeText>
                 {checkConnectivityMutation.error?.message ||
                   "Failed to connect to Vault"}
-              </AlertDescription>
-            </Alert>
+              </InlineNoticeText>
+            </InlineNotice>
           )}
 
           {checkConnectivityMutation.isSuccess &&
             checkConnectivityMutation.data && (
-              <Alert>
-                <AlertTitle>Connection Successful</AlertTitle>
-                <AlertDescription>
+              <InlineNotice variant="neutral">
+                <span className="font-medium">Connection Successful</span>
+                <InlineNoticeText>
                   Found {checkConnectivityMutation.data.secretCount} secret
-                  {checkConnectivityMutation.data.secretCount === 1 ? "" : "s"}.
-                </AlertDescription>
-              </Alert>
+                  {checkConnectivityMutation.data.secretCount === 1 ? null : (
+                    <span>s</span>
+                  )}
+                  .
+                </InlineNoticeText>
+              </InlineNotice>
             )}
-        </CardContent>
-      </Card>
+        </div>
+      </SettingsBlock>
     </SettingsSectionStack>
   );
 }

@@ -2,7 +2,12 @@
  * ChatOps constants and configuration
  */
 
-import { TimeInMs } from "@shared";
+import { TimeInMs } from "@archestra/shared";
+import {
+  MAX_ATTACHMENT_SIZE,
+  MAX_ATTACHMENTS_PER_EMAIL,
+  MAX_TOTAL_ATTACHMENTS_SIZE,
+} from "@/agents/incoming-email/constants";
 import type { ChatOpsConnectionMode } from "@/types";
 
 /**
@@ -54,12 +59,79 @@ export const CHATOPS_CHANNEL_DISCOVERY = {
 };
 
 /**
+ * Sticky auto-reply for MS Teams team channels.
+ *
+ * The bot must be @mentioned to start replying in a channel thread; once
+ * mentioned, it keeps replying to that thread without further mentions until
+ * this TTL lapses (so stale threads stop auto-replying on their own).
+ *
+ * A user can also end it early — sending a mute command (see isThreadMuteCommand)
+ * drops the activation so the bot goes quiet until @mentioned again.
+ */
+export const CHATOPS_CHANNEL_AUTO_REPLY = {
+  /** How long a thread stays "active" after the last @mention (30 days) */
+  ACTIVE_TTL_MS: TimeInMs.Day * 30,
+};
+
+/**
+ * A subtle one-time footer hint, appended to the bot's FIRST reply in a channel
+ * thread (see claimThreadMuteHint), teaching users the off switch for sticky
+ * auto-reply without the verbosity of the /help command. Plain text (no
+ * provider-specific markup) so it renders identically in Slack and MS Teams; the
+ * 🔇 glyph matches the mute reaction, which is honored on any message in the
+ * thread rather than only the bot's own replies — so the hint says so, and
+ * nobody has to hunt for the right message to react to.
+ */
+export const THREAD_MUTE_HINT =
+  'Reply "mute" or react 🔇 to any message in this thread to stop auto-replies; @mention me to resume';
+
+/** Slack's native Stop control cancels a turn without muting the thread. */
+export const SLACK_THREAD_MUTE_HINT = `Press Stop to cancel only the current answer. ${THREAD_MUTE_HINT}`;
+
+/** Jira has no mute-reaction ingress; its project label is a persistent stop. */
+export const JIRA_THREAD_MUTE_HINT =
+  'Reply "mute" to stop auto-replies; @mention me to resume. The archestra-mute label blocks replies until removed.';
+
+/**
+ * In group conversations the agent hears every message but should not answer
+ * every one. When it decides no reply is needed it answers with exactly this
+ * token, and the chatops layer posts nothing instead of a message.
+ */
+export const CHATOPS_NO_REPLY_SENTINEL = "[NO_REPLY]";
+
+/**
+ * Posted to the chat when a server-side session's history was compacted into
+ * a summary — without it, the model suddenly "forgetting" details reads as
+ * the bot being broken. Plain text so it renders identically everywhere.
+ */
+export const CHATOPS_CONTEXT_COMPACTED_NOTICE =
+  "🗜️ This conversation got long, so I've summarized the older messages to keep answering well. Recent messages are kept as-is — if something important got lost, just mention it again.";
+
+/**
+ * A chat without reply threads (a DM or a plain group chat) is one rolling
+ * server-side session. After this long without a message, the next message
+ * starts a new session, so yesterday's topic does not leak into today's.
+ */
+export const CHATOPS_CHAT_SESSION_IDLE_ROLLOVER_MS = 8 * TimeInMs.Hour;
+
+/** Reply to a reset command. */
+export const CHATOPS_SESSION_RESET_REPLY =
+  "🆕 Started a new conversation. I no longer have the earlier messages in this chat in context.";
+
+/**
+ * Hint on the first reply after an idle rollover. Without it, the agent
+ * forgetting the earlier topic reads as a bug.
+ */
+export const CHATOPS_SESSION_ROLLOVER_HINT = `New conversation: this chat was idle for more than ${CHATOPS_CHAT_SESSION_IDLE_ROLLOVER_MS / TimeInMs.Hour} hours, so earlier messages are not in my context. Send "reset" to start over at any time.`;
+
+/**
  * Bot commands recognized by the chatops system
  */
 export const CHATOPS_COMMANDS = {
   SELECT_AGENT: "/select-agent",
   STATUS: "/status",
   HELP: "/help",
+  SIGN_OUT: "/sign-out",
 } as const;
 
 /**
@@ -68,18 +140,52 @@ export const CHATOPS_COMMANDS = {
 export const SLACK_DEFAULT_CONNECTION_MODE: ChatOpsConnectionMode =
   "socket" as const;
 
+/**
+ * How long connecting to Slack (a credential check, or opening the Socket
+ * Mode connection) may take. Without a bound, a network that drops traffic to
+ * Slack hangs saving the Slack config until the caller gives up.
+ */
+export const SLACK_CONNECT_TIMEOUT_MS = 10 * TimeInMs.Second;
+
+/**
+ * How long a Telegram account-linking code stays valid. Codes are one-shot
+ * and minted in both directions: by the web UI (carried to the bot via a
+ * t.me ?start= deep link) and by the bot (carried to the web via a sign-in
+ * link in its /start reply).
+ */
+export const TELEGRAM_LINK_CODE_TTL_MS = 15 * 60 * 1000;
+
 /** @public — re-exported for testability */
-export { SLACK_SLASH_COMMANDS } from "@shared";
+export { SLACK_SLASH_COMMANDS } from "@archestra/shared";
 
 /**
  * Attachment limits for chatops file downloads.
  * Reuses the same limits as the incoming email module for consistency.
  */
 export const CHATOPS_ATTACHMENT_LIMITS = {
-  /** Maximum size for a single attachment in bytes (10MB) */
-  MAX_ATTACHMENT_SIZE: 10 * 1024 * 1024,
-  /** Maximum total size for all attachments per message in bytes (25MB) */
-  MAX_TOTAL_ATTACHMENTS_SIZE: 25 * 1024 * 1024,
-  /** Maximum number of attachments to process per message */
-  MAX_ATTACHMENTS_PER_MESSAGE: 20,
+  MAX_ATTACHMENT_SIZE,
+  MAX_TOTAL_ATTACHMENTS_SIZE,
+  MAX_ATTACHMENTS_PER_MESSAGE: MAX_ATTACHMENTS_PER_EMAIL,
+  /**
+   * Target raw size for an image sent inline to the model. Chosen so the
+   * base64-encoded payload (~+33%) stays under the ~5 MB per-image limit
+   * common to vision providers (e.g. Anthropic). Oversized images are shrunk
+   * to fit this before delivery; heuristic, conservative.
+   */
+  MAX_MODEL_INLINE_IMAGE_SIZE: 3.75 * 1024 * 1024,
+  /**
+   * Longest-edge cap for a shrunk image. 1568 px is the standard-tier vision
+   * resolution (Anthropic), plenty for screenshot legibility and cheaper in
+   * tokens/decode memory than the high-res tier — a safe default across models.
+   */
+  MAX_MODEL_INLINE_IMAGE_DIMENSION: 1568,
+  /**
+   * Upper bound on the compressed bytes we will download for an oversized
+   * image in order to attempt shrinking. Bounds per-image transfer/buffer
+   * memory (chatops handlers run concurrently and uncapped); an image larger
+   * than this is skipped without downloading. Sized to cover phone screenshots
+   * (~16 MB) with headroom. The decoded-bitmap bomb guard lives in the Rust
+   * shrinker's decode limits, not here.
+   */
+  MAX_CONVERTIBLE_IMAGE_SIZE: 20 * 1024 * 1024,
 } as const;

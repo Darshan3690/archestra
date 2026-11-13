@@ -1,0 +1,48 @@
+{
+  "name": "joshuarileydev__mac-apps-launcher",
+  "display_name": "mac-apps-launcher",
+  "description": "MCP server from JoshuaRileyDev/mac-apps-launcher",
+  "author": {
+    "name": "JoshuaRileyDev"
+  },
+  "server": {
+    "command": "npx",
+    "args": ["-y", "@joshuarileydev/mac-apps-launcher-mcp-server"],
+    "env": {},
+    "type": "local"
+  },
+  "tools": [],
+  "prompts": [],
+  "keywords": [],
+  "user_config": {},
+  "readme": "# Mac Apps Launcher MCP Server\n\nA Model Context Protocol (MCP) server for launching and managing macOS applications.\n\n## Features\n\n- List all applications installed in the `/Applications` folder\n- Launch applications by name\n- Open files with specific applications\n\n## Installation\nAdd the following to your Claude Config JSON file\n```\n{\n  \"mcpServers\": {\n    \"simulator\": {\n      \"command\": \"npx\",\n      \"args\": [\n        \"y\",\n        \"@joshuarileydev/mac-apps-launcher-mcp-server\"\n      ]\n    }\n  }\n}\n```",
+  "category": "Local files",
+  "archestra_config": {
+    "client_config_permutations": {
+      "joshuarileydev-mac-apps-launcher-mcp-server": {
+        "command": "npx",
+        "args": ["-y", "@joshuarileydev/mac-apps-launcher-mcp-server"],
+        "env": {}
+      }
+    },
+    "oauth": {
+      "provider": null,
+      "required": false
+    },
+    "works_in_archestra": false
+  },
+  "github_info": {
+    "owner": "JoshuaRileyDev",
+    "repo": "mac-apps-launcher",
+    "url": "https://github.com/JoshuaRileyDev/mac-apps-launcher",
+    "name": "mac-apps-launcher",
+    "path": null,
+    "stars": 14,
+    "contributors": 1,
+    "issues": 4,
+    "releases": false,
+    "ci_cd": false,
+    "latest_commit_hash": "c848fee1a39ac26474722463e3126360ffb4c659"
+  },
+  "programming_language": "JavaScript"
+}

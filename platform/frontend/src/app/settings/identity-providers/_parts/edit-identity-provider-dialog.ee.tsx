@@ -1,11 +1,11 @@
 "use client";
 
-import { zodResolver } from "@hookform/resolvers/zod";
 import {
   E2eTestId,
   IdentityProviderFormSchema,
   type IdentityProviderFormValues,
-} from "@shared";
+} from "@archestra/shared";
+import { zodResolver } from "@hookform/resolvers/zod";
 import { Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
@@ -30,12 +30,14 @@ interface EditIdentityProviderDialogProps {
   identityProviderId: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  initialSection?: IdentityProviderDialogSection;
 }
 
 export function EditIdentityProviderDialog({
   identityProviderId,
   open,
   onOpenChange,
+  initialSection,
 }: EditIdentityProviderDialogProps) {
   const { data: provider, isLoading } = useIdentityProvider(identityProviderId);
   const updateIdentityProvider = useUpdateIdentityProvider();
@@ -133,6 +135,11 @@ export function EditIdentityProviderDialog({
     }
   }, [provider, form]);
 
+  useEffect(() => {
+    if (!open || !provider?.id) return;
+    setActiveSection(initialSection ?? "general");
+  }, [initialSection, open, provider?.id]);
+
   const onSubmit = useCallback(
     async (data: IdentityProviderFormValues) => {
       if (!provider) return;
@@ -180,7 +187,7 @@ export function EditIdentityProviderDialog({
         activeSection={validActiveSection}
         navItems={navItems}
         onActiveSectionChange={setActiveSection}
-        onSubmit={form.handleSubmit(onSubmit)}
+        onSubmit={onSubmit}
         sidebarFooter={
           <PermissionButton
             type="button"
@@ -227,6 +234,7 @@ export function EditIdentityProviderDialog({
           <OidcConfigForm
             form={form}
             identityProviderId={provider.id}
+            configuredSecretPaths={provider.configuredSecretPaths}
             activeSection={
               validActiveSection as Exclude<
                 IdentityProviderDialogSection,

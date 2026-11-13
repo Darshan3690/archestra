@@ -1,0 +1,2068 @@
+import { azureModelEvidence } from "@archestra/shared/azure-models";
+import { describe, expect, test } from "@/test";
+import LlmProviderApiKeyModel from "./llm-provider-api-key";
+import LlmProviderApiKeyModelLinkModel from "./llm-provider-api-key-model";
+import ModelModel from "./model";
+
+describe("ModelModel", () => {
+  describe("create", () => {
+    test("can create model", async () => {
+      const model = await ModelModel.create({
+        externalId: "openai/gpt-4o",
+        provider: "openai",
+        modelId: "gpt-4o",
+        description: "GPT-4o is a multimodal model",
+        contextLength: 128000,
+        inputModalities: ["text", "image"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.000005",
+        completionPricePerToken: "0.000015",
+        lastSyncedAt: new Date(),
+      });
+
+      expect(model.id).toBeDefined();
+      expect(model.externalId).toBe("openai/gpt-4o");
+      expect(model.provider).toBe("openai");
+      expect(model.modelId).toBe("gpt-4o");
+      expect(model.description).toBe("GPT-4o is a multimodal model");
+      expect(model.contextLength).toBe(128000);
+      expect(model.inputModalities).toEqual(["text", "image"]);
+      expect(model.outputModalities).toEqual(["text"]);
+      expect(model.supportsToolCalling).toBe(true);
+      expect(model.promptPricePerToken).toBe("0.000005000000");
+      expect(model.completionPricePerToken).toBe("0.000015000000");
+    });
+  });
+
+  describe("findByProviderAndModelId", () => {
+    test("returns null when model does not exist", async () => {
+      const model = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "nonexistent-model",
+      );
+      expect(model).toBeNull();
+    });
+
+    test("can find model by provider and model ID", async () => {
+      await ModelModel.create({
+        externalId: "anthropic/claude-3-5-sonnet",
+        provider: "anthropic",
+        modelId: "claude-3-5-sonnet",
+        description: "Claude 3.5 Sonnet",
+        contextLength: 200000,
+        inputModalities: ["text", "image"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.000003",
+        completionPricePerToken: "0.000015",
+        lastSyncedAt: new Date(),
+      });
+
+      const model = await ModelModel.findByProviderAndModelId(
+        "anthropic",
+        "claude-3-5-sonnet",
+      );
+
+      expect(model).not.toBeNull();
+      expect(model?.provider).toBe("anthropic");
+      expect(model?.modelId).toBe("claude-3-5-sonnet");
+    });
+
+    test("disambiguates same model ID across different providers", async () => {
+      await ModelModel.create({
+        externalId: "openai/shared-model",
+        provider: "openai",
+        modelId: "shared-model",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        promptPricePerToken: "0.000010",
+        completionPricePerToken: "0.000030",
+        lastSyncedAt: new Date(),
+      });
+      await ModelModel.create({
+        externalId: "anthropic/shared-model",
+        provider: "anthropic",
+        modelId: "shared-model",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        promptPricePerToken: "0.000003",
+        completionPricePerToken: "0.000015",
+        lastSyncedAt: new Date(),
+      });
+
+      const openaiModel = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "shared-model",
+      );
+      const anthropicModel = await ModelModel.findByProviderAndModelId(
+        "anthropic",
+        "shared-model",
+      );
+
+      expect(openaiModel?.provider).toBe("openai");
+      expect(openaiModel?.promptPricePerToken).toBe("0.000010000000");
+      expect(anthropicModel?.provider).toBe("anthropic");
+      expect(anthropicModel?.promptPricePerToken).toBe("0.000003000000");
+    });
+  });
+
+  describe("findAll", () => {
+    test("filters by multiple providers", async () => {
+      await ModelModel.create({
+        externalId: "openai/find-all-provider-filter",
+        provider: "openai",
+        modelId: "find-all-provider-filter",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        promptPricePerToken: "0.000010",
+        completionPricePerToken: "0.000030",
+        lastSyncedAt: new Date(),
+      });
+      await ModelModel.create({
+        externalId: "anthropic/find-all-provider-filter",
+        provider: "anthropic",
+        modelId: "find-all-provider-filter",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        promptPricePerToken: "0.000003",
+        completionPricePerToken: "0.000015",
+        lastSyncedAt: new Date(),
+      });
+      await ModelModel.create({
+        externalId: "gemini/find-all-provider-filter",
+        provider: "gemini",
+        modelId: "find-all-provider-filter",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        promptPricePerToken: "0.000001",
+        completionPricePerToken: "0.000002",
+        lastSyncedAt: new Date(),
+      });
+
+      const models = await ModelModel.findAll({
+        providers: ["anthropic", "gemini"],
+      });
+
+      expect(models.map((model) => model.provider).sort()).toEqual([
+        "anthropic",
+        "gemini",
+      ]);
+    });
+
+    test("returns no models for an empty provider filter", async () => {
+      await ModelModel.create({
+        externalId: "openai/empty-provider-filter",
+        provider: "openai",
+        modelId: "empty-provider-filter",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        promptPricePerToken: "0.000010",
+        completionPricePerToken: "0.000030",
+        lastSyncedAt: new Date(),
+      });
+
+      await expect(ModelModel.findAll({ providers: [] })).resolves.toEqual([]);
+    });
+  });
+
+  describe("findByProviderModelIds", () => {
+    test("returns empty map when no keys provided", async () => {
+      const map = await ModelModel.findByProviderModelIds([]);
+      expect(map.size).toBe(0);
+    });
+
+    test("returns models for matching keys", async () => {
+      await ModelModel.create({
+        externalId: "openai/gpt-4o",
+        provider: "openai",
+        modelId: "gpt-4o",
+        description: "GPT-4o",
+        contextLength: 128000,
+        inputModalities: ["text", "image"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.000005",
+        completionPricePerToken: "0.000015",
+        lastSyncedAt: new Date(),
+      });
+
+      await ModelModel.create({
+        externalId: "anthropic/claude-3-opus",
+        provider: "anthropic",
+        modelId: "claude-3-opus",
+        description: "Claude 3 Opus",
+        contextLength: 200000,
+        inputModalities: ["text", "image"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.000015",
+        completionPricePerToken: "0.000075",
+        lastSyncedAt: new Date(),
+      });
+
+      const map = await ModelModel.findByProviderModelIds([
+        { provider: "openai", modelId: "gpt-4o" },
+        { provider: "anthropic", modelId: "claude-3-opus" },
+        { provider: "openai", modelId: "nonexistent" },
+      ]);
+
+      expect(map.size).toBe(2);
+      expect(map.get("openai:gpt-4o")?.modelId).toBe("gpt-4o");
+      expect(map.get("anthropic:claude-3-opus")?.modelId).toBe("claude-3-opus");
+      expect(map.get("openai:nonexistent")).toBeUndefined();
+    });
+
+    test("only returns requested records via database-level filtering", async () => {
+      // Create multiple records in the database
+      await ModelModel.create({
+        externalId: "openai/gpt-4o",
+        provider: "openai",
+        modelId: "gpt-4o",
+        description: "GPT-4o",
+        contextLength: 128000,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.000005",
+        completionPricePerToken: "0.000015",
+        lastSyncedAt: new Date(),
+      });
+
+      await ModelModel.create({
+        externalId: "openai/gpt-3.5-turbo",
+        provider: "openai",
+        modelId: "gpt-3.5-turbo",
+        description: "GPT-3.5 Turbo",
+        contextLength: 16000,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.000001",
+        completionPricePerToken: "0.000002",
+        lastSyncedAt: new Date(),
+      });
+
+      await ModelModel.create({
+        externalId: "anthropic/claude-3-opus",
+        provider: "anthropic",
+        modelId: "claude-3-opus",
+        description: "Claude 3 Opus",
+        contextLength: 200000,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.000015",
+        completionPricePerToken: "0.000075",
+        lastSyncedAt: new Date(),
+      });
+
+      // Request only one of the three records
+      const map = await ModelModel.findByProviderModelIds([
+        { provider: "openai", modelId: "gpt-4o" },
+      ]);
+
+      // Should only return the requested record, not all records in the table
+      expect(map.size).toBe(1);
+      expect(map.get("openai:gpt-4o")?.modelId).toBe("gpt-4o");
+      expect(map.get("openai:gpt-3.5-turbo")).toBeUndefined();
+      expect(map.get("anthropic:claude-3-opus")).toBeUndefined();
+    });
+  });
+
+  describe("upsert", () => {
+    test("creates new model if it does not exist", async () => {
+      const model = await ModelModel.upsert({
+        externalId: "openai/gpt-4-turbo",
+        provider: "openai",
+        modelId: "gpt-4-turbo",
+        description: "GPT-4 Turbo",
+        contextLength: 128000,
+        inputModalities: ["text", "image"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.00001",
+        completionPricePerToken: "0.00003",
+        lastSyncedAt: new Date(),
+      });
+
+      expect(model.id).toBeDefined();
+      expect(model.modelId).toBe("gpt-4-turbo");
+    });
+
+    test("updates existing model on conflict", async () => {
+      // Create initial model
+      const initial = await ModelModel.create({
+        externalId: "openai/gpt-4o-mini",
+        provider: "openai",
+        modelId: "gpt-4o-mini",
+        description: "Initial description",
+        contextLength: 128000,
+        outputLength: 16384,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: false,
+        promptPricePerToken: "0.00001",
+        completionPricePerToken: "0.00003",
+        lastSyncedAt: new Date(),
+      });
+
+      // Upsert with updated data
+      const updated = await ModelModel.upsert({
+        externalId: "openai/gpt-4o-mini",
+        provider: "openai",
+        modelId: "gpt-4o-mini",
+        description: "Updated description",
+        contextLength: 256000,
+        outputLength: 32000,
+        inputModalities: ["text", "image"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.00002",
+        completionPricePerToken: "0.00006",
+        lastSyncedAt: new Date(),
+      });
+
+      expect(updated.id).toBe(initial.id);
+      expect(updated.description).toBe("Updated description");
+      // contextLength, inputModalities, supportsToolCalling are NOT updated on
+      // conflict to preserve user-edited values
+      expect(updated.contextLength).toBe(128000);
+      expect(updated.inputModalities).toEqual(["text"]);
+      expect(updated.supportsToolCalling).toBe(false);
+      // outputLength is not user-editable and tracks the provider cap, so a
+      // fresh synced value overwrites the previous one.
+      expect(updated.outputLength).toBe(32000);
+    });
+  });
+
+  describe("bulkUpsert", () => {
+    test("returns empty array when no data provided", async () => {
+      const results = await ModelModel.bulkUpsert([]);
+      expect(results).toEqual([]);
+    });
+
+    test("can bulk upsert multiple records", async () => {
+      const results = await ModelModel.bulkUpsert([
+        {
+          externalId: "google/gemini-pro",
+          provider: "gemini",
+          modelId: "gemini-pro",
+          description: "Gemini Pro",
+          contextLength: 32000,
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+          supportsToolCalling: true,
+          promptPricePerToken: "0.0000005",
+          completionPricePerToken: "0.0000015",
+          lastSyncedAt: new Date(),
+        },
+        {
+          externalId: "google/gemini-flash",
+          provider: "gemini",
+          modelId: "gemini-flash",
+          description: "Gemini Flash",
+          contextLength: 1000000,
+          inputModalities: ["text", "image", "video"],
+          outputModalities: ["text"],
+          supportsToolCalling: true,
+          promptPricePerToken: "0.00000025",
+          completionPricePerToken: "0.0000005",
+          lastSyncedAt: new Date(),
+        },
+      ]);
+
+      expect(results).toHaveLength(2);
+
+      // Verify both were persisted
+      const all = await ModelModel.findAll();
+      expect(all).toHaveLength(2);
+    });
+
+    test("handles large batches correctly (more than batch size of 50)", async () => {
+      // Create 150 test models to verify batching works across multiple batches
+      const models = Array.from({ length: 150 }, (_, i) => ({
+        externalId: `test-provider/model-${i}`,
+        provider: "openai" as const,
+        modelId: `test-model-${i}`,
+        description: `Test Model ${i}`,
+        contextLength: 128000,
+        inputModalities: ["text" as const],
+        outputModalities: ["text" as const],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.000001",
+        completionPricePerToken: "0.000002",
+        lastSyncedAt: new Date(),
+      }));
+
+      const results = await ModelModel.bulkUpsert(models);
+
+      // All 150 models should be inserted
+      expect(results).toHaveLength(150);
+
+      // Verify all were persisted
+      const all = await ModelModel.findAll();
+      expect(all).toHaveLength(150);
+
+      // Verify some specific models to ensure data integrity
+      const first = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "test-model-0",
+      );
+      expect(first).not.toBeNull();
+      expect(first?.description).toBe("Test Model 0");
+
+      const last = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "test-model-149",
+      );
+      expect(last).not.toBeNull();
+      expect(last?.description).toBe("Test Model 149");
+    });
+
+    test("batching handles updates correctly", async () => {
+      // First create 100 models
+      const models = Array.from({ length: 100 }, (_, i) => ({
+        externalId: `test-provider/update-model-${i}`,
+        provider: "anthropic" as const,
+        modelId: `update-model-${i}`,
+        description: `Original Description ${i}`,
+        contextLength: 100000,
+        inputModalities: ["text" as const],
+        outputModalities: ["text" as const],
+        supportsToolCalling: false,
+        promptPricePerToken: "0.000001",
+        completionPricePerToken: "0.000002",
+        lastSyncedAt: new Date(),
+      }));
+
+      await ModelModel.bulkUpsert(models);
+
+      // Update all with new descriptions
+      const updatedModels = models.map((m, i) => ({
+        ...m,
+        description: `Updated Description ${i}`,
+        contextLength: 200000,
+        supportsToolCalling: true,
+      }));
+
+      const results = await ModelModel.bulkUpsert(updatedModels);
+
+      expect(results).toHaveLength(100);
+
+      // Verify updates were applied
+      const updated = await ModelModel.findByProviderAndModelId(
+        "anthropic",
+        "update-model-50",
+      );
+      expect(updated?.description).toBe("Updated Description 50");
+      // contextLength and supportsToolCalling are NOT updated on conflict
+      // to preserve user-edited values
+      expect(updated?.contextLength).toBe(100000);
+      expect(updated?.supportsToolCalling).toBe(false);
+    });
+
+    test("updates outputLength to the freshly synced cap, keeping it only when the sync omits it", async () => {
+      const base = (modelId: string, outputLength: number | null) => ({
+        externalId: `openai/${modelId}`,
+        provider: "openai" as const,
+        modelId,
+        description: modelId,
+        contextLength: 128000,
+        outputLength,
+        inputModalities: ["text" as const],
+        outputModalities: ["text" as const],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.000001",
+        completionPricePerToken: "0.000002",
+        lastSyncedAt: new Date(),
+      });
+
+      await ModelModel.bulkUpsert([
+        base("cap-lowered", 64000),
+        base("cap-null", null),
+        base("cap-cleared", 16384),
+      ]);
+      await ModelModel.bulkUpsert([
+        base("cap-lowered", 4096), // provider corrected the cap downward
+        base("cap-null", 8192), // backfills the previously-null cap
+        base("cap-cleared", null), // sync omits it → last known value kept
+      ]);
+
+      const lowered = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "cap-lowered",
+      );
+      const filled = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "cap-null",
+      );
+      const cleared = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "cap-cleared",
+      );
+      expect(lowered?.outputLength).toBe(4096);
+      expect(filled?.outputLength).toBe(8192);
+      expect(cleared?.outputLength).toBe(16384);
+    });
+
+    test("preserves manual embedding dimension overrides on non-full sync", async () => {
+      const [created] = await ModelModel.bulkUpsert([
+        {
+          externalId: "openai/custom-embed-toggle",
+          provider: "openai",
+          modelId: "custom-embed-toggle",
+          description: "Custom Embed Toggle",
+          contextLength: 8192,
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+          supportsToolCalling: false,
+          promptPricePerToken: "0.000001",
+          completionPricePerToken: "0.000002",
+          embeddingDimensions: null,
+          lastSyncedAt: new Date(),
+        },
+      ]);
+
+      await ModelModel.update(created.id, { embeddingDimensions: 1536 });
+
+      await ModelModel.bulkUpsert([
+        {
+          externalId: "openai/custom-embed-toggle",
+          provider: "openai",
+          modelId: "custom-embed-toggle",
+          description: "Updated Custom Embed Toggle",
+          contextLength: 16384,
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+          supportsToolCalling: false,
+          promptPricePerToken: "0.000003",
+          completionPricePerToken: "0.000004",
+          embeddingDimensions: null,
+          lastSyncedAt: new Date(),
+        },
+      ]);
+
+      const updated = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "custom-embed-toggle",
+      );
+      expect(updated?.embeddingDimensions).toBe(1536);
+    });
+
+    const ollamaBase = {
+      externalId: "ollama/llama3",
+      provider: "ollama" as const,
+      modelId: "llama3",
+      description: "Llama 3",
+      contextLength: 8192,
+      inputModalities: ["text" as const],
+      outputModalities: ["text" as const],
+      supportsToolCalling: false,
+      promptPricePerToken: null,
+      completionPricePerToken: null,
+      lastSyncedAt: new Date(),
+    };
+
+    test("keeps the last known default parameters when a non-full sync omits them", async () => {
+      await ModelModel.bulkUpsert([
+        { ...ollamaBase, defaultParameters: { num_ctx: 4096 } },
+      ]);
+      await ModelModel.bulkUpsert([{ ...ollamaBase, defaultParameters: null }]);
+
+      const updated = await ModelModel.findByProviderAndModelId(
+        "ollama",
+        "llama3",
+      );
+      expect(updated?.defaultParameters).toEqual({ num_ctx: 4096 });
+    });
+
+    test("refreshes default parameters on non-full sync when the provider reports new values", async () => {
+      await ModelModel.bulkUpsert([
+        { ...ollamaBase, defaultParameters: { num_ctx: 4096 } },
+      ]);
+      await ModelModel.bulkUpsert([
+        { ...ollamaBase, defaultParameters: { num_ctx: 8192 } },
+      ]);
+
+      const updated = await ModelModel.findByProviderAndModelId(
+        "ollama",
+        "llama3",
+      );
+      expect(updated?.defaultParameters).toEqual({ num_ctx: 8192 });
+    });
+
+    test("clears the proxy-discovery flag when a provider catalog returns the model", async () => {
+      // The proxy saw this id before any key had synced it, so the row exists
+      // as proxy-discovered.
+      await ModelModel.ensureModelExists("claude-opus-4-7", "anthropic");
+      const discovered = await ModelModel.findByProviderAndModelId(
+        "anthropic",
+        "claude-opus-4-7",
+      );
+      expect(discovered?.discoveredViaLlmProxy).toBe(true);
+
+      // A configured provider's own catalog now returns it, which makes it a
+      // synced model that key deletion should be able to clean up.
+      await ModelModel.bulkUpsert(
+        [
+          {
+            externalId: "anthropic/claude-opus-4-7",
+            provider: "anthropic",
+            modelId: "claude-opus-4-7",
+            inputModalities: ["text"],
+            outputModalities: ["text"],
+            promptPricePerToken: "0.000005",
+            completionPricePerToken: "0.000025",
+            lastSyncedAt: new Date(),
+          },
+        ],
+        { fromProviderCatalog: true },
+      );
+
+      const synced = await ModelModel.findByProviderAndModelId(
+        "anthropic",
+        "claude-opus-4-7",
+      );
+      expect(synced?.discoveredViaLlmProxy).toBe(false);
+    });
+
+    test("keeps the proxy-discovery flag when the registry import names the model", async () => {
+      // The models.dev import upserts the whole registry regardless of which
+      // providers are configured, so a model appearing there is no evidence the
+      // caller can actually reach it. Only a configured provider's own catalog
+      // is, so this path must leave the row's protection alone.
+      await ModelModel.ensureModelExists("gpt-4o", "openai");
+
+      await ModelModel.bulkUpsert([
+        {
+          externalId: "openai/gpt-4o",
+          provider: "openai",
+          modelId: "gpt-4o",
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+          promptPricePerToken: "0.0000025",
+          completionPricePerToken: "0.00001",
+          lastSyncedAt: new Date(),
+        },
+      ]);
+
+      const stillProxyDiscovered = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "gpt-4o",
+      );
+      expect(stillProxyDiscovered?.discoveredViaLlmProxy).toBe(true);
+    });
+
+    test("preserves custom price overrides on conflict", async () => {
+      const created = await ModelModel.create({
+        externalId: "openai/custom-priced",
+        provider: "openai",
+        modelId: "custom-priced",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+      await ModelModel.update(created.id, {
+        customPricePerMillionInput: "12.00",
+        customPricePerMillionOutput: "36.00",
+      });
+
+      await ModelModel.bulkUpsert([
+        {
+          externalId: "openai/custom-priced",
+          provider: "openai",
+          modelId: "custom-priced",
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+          promptPricePerToken: "0.000001",
+          completionPricePerToken: "0.000002",
+          lastSyncedAt: new Date(),
+        },
+      ]);
+
+      const after = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "custom-priced",
+      );
+      expect(after?.customPricePerMillionInput).toBe("12.00000000");
+      expect(after?.customPricePerMillionOutput).toBe("36.00000000");
+    });
+  });
+
+  describe("bulkUpsertFull", () => {
+    test("overwrites an existing outputLength with the provider value", async () => {
+      const model = {
+        externalId: "openai/full-refresh",
+        provider: "openai" as const,
+        modelId: "full-refresh",
+        description: "Full Refresh",
+        contextLength: 128000,
+        outputLength: 16384,
+        inputModalities: ["text" as const],
+        outputModalities: ["text" as const],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.000001",
+        completionPricePerToken: "0.000002",
+        lastSyncedAt: new Date(),
+      };
+
+      await ModelModel.bulkUpsert([model]);
+      await ModelModel.bulkUpsertFull([{ ...model, outputLength: 64000 }]);
+
+      const refreshed = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "full-refresh",
+      );
+      expect(refreshed?.outputLength).toBe(64000);
+    });
+
+    test("overwrites default parameters on full refresh", async () => {
+      const base = {
+        externalId: "ollama/llama3-full",
+        provider: "ollama" as const,
+        modelId: "llama3-full",
+        description: "Llama 3",
+        contextLength: 8192,
+        inputModalities: ["text" as const],
+        outputModalities: ["text" as const],
+        supportsToolCalling: false,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        lastSyncedAt: new Date(),
+      };
+      await ModelModel.bulkUpsert([
+        { ...base, defaultParameters: { num_ctx: 4096 } },
+      ]);
+      await ModelModel.bulkUpsertFull([
+        { ...base, defaultParameters: { num_ctx: 8192 } },
+      ]);
+
+      const refreshed = await ModelModel.findByProviderAndModelId(
+        "ollama",
+        "llama3-full",
+      );
+      expect(refreshed?.defaultParameters).toEqual({ num_ctx: 8192 });
+    });
+
+    test("clears the proxy-discovery flag when a catalog sync returns the model", async () => {
+      await ModelModel.ensureModelExists("gpt-4o-full", "openai");
+      const discovered = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "gpt-4o-full",
+      );
+      expect(discovered?.discoveredViaLlmProxy).toBe(true);
+
+      await ModelModel.bulkUpsertFull([
+        {
+          externalId: "openai/gpt-4o-full",
+          provider: "openai",
+          modelId: "gpt-4o-full",
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+          promptPricePerToken: "0.0000025",
+          completionPricePerToken: "0.00001",
+          lastSyncedAt: new Date(),
+        },
+      ]);
+
+      const synced = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "gpt-4o-full",
+      );
+      expect(synced?.discoveredViaLlmProxy).toBe(false);
+    });
+
+    test("resets custom price overrides on full refresh", async () => {
+      const created = await ModelModel.create({
+        externalId: "openai/full-custom-priced",
+        provider: "openai",
+        modelId: "full-custom-priced",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+      await ModelModel.update(created.id, {
+        customPricePerMillionInput: "12.00",
+        customPricePerMillionOutput: "36.00",
+      });
+
+      await ModelModel.bulkUpsertFull([
+        {
+          externalId: "openai/full-custom-priced",
+          provider: "openai",
+          modelId: "full-custom-priced",
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+          promptPricePerToken: "0.000001",
+          completionPricePerToken: "0.000002",
+          lastSyncedAt: new Date(),
+        },
+      ]);
+
+      const after = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "full-custom-priced",
+      );
+      expect(after?.customPricePerMillionInput).toBeNull();
+      expect(after?.customPricePerMillionOutput).toBeNull();
+    });
+
+    test("resets custom limit overrides on full refresh", async () => {
+      const created = await ModelModel.create({
+        externalId: "openai/full-custom-limits",
+        provider: "openai",
+        modelId: "full-custom-limits",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+      await ModelModel.update(created.id, {
+        customContextLength: 32000,
+        customOutputLength: 4096,
+      });
+
+      await ModelModel.bulkUpsertFull([
+        {
+          externalId: "openai/full-custom-limits",
+          provider: "openai",
+          modelId: "full-custom-limits",
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+          contextLength: 128000,
+          outputLength: 16384,
+          lastSyncedAt: new Date(),
+        },
+      ]);
+
+      // Same contract as the custom prices above: a full refresh puts the row
+      // back to what the provider says, so an override that would keep
+      // shadowing the freshly synced numbers has to go with them.
+      const after = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "full-custom-limits",
+      );
+      expect(after?.customContextLength).toBeNull();
+      expect(after?.customOutputLength).toBeNull();
+      expect(after?.contextLength).toBe(128000);
+      expect(after?.outputLength).toBe(16384);
+    });
+  });
+
+  describe("applyAuthoritativeCapabilities", () => {
+    test("rewrites modalities and tool support and keeps every override", async () => {
+      // Stored as a chat model, the way an older build classified it.
+      const created = await ModelModel.create({
+        externalId: "openai/gpt-realtime-fixture",
+        provider: "openai",
+        modelId: "gpt-realtime-fixture",
+        contextLength: 128000,
+        outputLength: 16384,
+        inputModalities: ["text", "audio", "image"],
+        outputModalities: ["text", "audio"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.000004",
+        lastSyncedAt: new Date(),
+      });
+      await ModelModel.update(created.id, {
+        customPricePerMillionInput: "1.50",
+        customPricePerMillionOutput: "3.00",
+        customPricePerMillionCacheRead: "0.25",
+        customPricePerMillionCacheWrite: "2.00",
+        customContextLength: 32000,
+        customOutputLength: 4096,
+      });
+
+      await ModelModel.applyAuthoritativeCapabilities([
+        {
+          provider: "openai",
+          modelId: "gpt-realtime-fixture",
+          inputModalities: ["text", "audio"],
+          outputModalities: ["audio"],
+          supportsToolCalling: false,
+        },
+        // Nothing is stored under this id, so nothing may be created for it.
+        {
+          provider: "openai",
+          modelId: "never-synced",
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+          supportsToolCalling: true,
+        },
+      ]);
+
+      const after = await ModelModel.findById(created.id);
+      expect(after).toMatchObject({
+        inputModalities: ["text", "audio"],
+        outputModalities: ["audio"],
+        supportsToolCalling: false,
+        customPricePerMillionInput: "1.50000000",
+        customPricePerMillionOutput: "3.00000000",
+        customPricePerMillionCacheRead: "0.25000000",
+        customPricePerMillionCacheWrite: "2.00000000",
+        customContextLength: 32000,
+        customOutputLength: 4096,
+        contextLength: 128000,
+        outputLength: 16384,
+        promptPricePerToken: "0.000004000000",
+      });
+      expect(
+        await ModelModel.findByProviderAndModelId("openai", "never-synced"),
+      ).toBeNull();
+    });
+  });
+
+  describe("delete", () => {
+    test("returns false when model does not exist", async () => {
+      const result = await ModelModel.delete("openai", "nonexistent");
+      expect(result).toBe(false);
+    });
+
+    test("can delete model by provider and model ID", async () => {
+      await ModelModel.create({
+        externalId: "cohere/command-r",
+        provider: "cohere",
+        modelId: "command-r",
+        description: "Command R",
+        contextLength: 128000,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.0000005",
+        completionPricePerToken: "0.0000015",
+        lastSyncedAt: new Date(),
+      });
+
+      const result = await ModelModel.delete("cohere", "command-r");
+      expect(result).toBe(true);
+
+      const model = await ModelModel.findByProviderAndModelId(
+        "cohere",
+        "command-r",
+      );
+      expect(model).toBeNull();
+    });
+  });
+
+  describe("ensureModelExists", () => {
+    test("creates a new model with discoveredViaLlmProxy=true", async () => {
+      await ModelModel.ensureModelExists("gpt-4o-mini", "openai");
+
+      const model = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "gpt-4o-mini",
+      );
+      expect(model).not.toBeNull();
+      expect(model?.discoveredViaLlmProxy).toBe(true);
+      expect(model?.externalId).toBe("openai/gpt-4o-mini");
+    });
+
+    test("does not mark existing provider-synced models as proxy-discovered", async () => {
+      // Create model via normal sync (discoveredViaLlmProxy defaults to false)
+      await ModelModel.create({
+        externalId: "anthropic/claude-3-5-sonnet",
+        provider: "anthropic",
+        modelId: "claude-3-5-sonnet",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+
+      const before = await ModelModel.findByProviderAndModelId(
+        "anthropic",
+        "claude-3-5-sonnet",
+      );
+      expect(before?.discoveredViaLlmProxy).toBe(false);
+
+      // LLM Proxy request triggers ensureModelExists
+      await ModelModel.ensureModelExists("claude-3-5-sonnet", "anthropic");
+
+      const after = await ModelModel.findByProviderAndModelId(
+        "anthropic",
+        "claude-3-5-sonnet",
+      );
+      expect(after?.discoveredViaLlmProxy).toBe(false);
+    });
+
+    test("a repeat call neither duplicates the row nor resets its fields", async () => {
+      await ModelModel.ensureModelExists("repeat-model", "openai");
+      const first = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "repeat-model",
+      );
+      await ModelModel.update(first?.id ?? "", {
+        customPricePerMillionInput: "4.00",
+      });
+
+      await ModelModel.ensureModelExists("repeat-model", "openai");
+
+      const all = await ModelModel.findAll({ provider: "openai" });
+      expect(all.filter((m) => m.modelId === "repeat-model")).toHaveLength(1);
+      const after = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "repeat-model",
+      );
+      expect(after?.id).toBe(first?.id);
+      expect(after?.customPricePerMillionInput).toBe("4.00000000");
+    });
+  });
+
+  describe("findLlmProxyModels", () => {
+    test("returns only models with discoveredViaLlmProxy=true", async () => {
+      // Create a regular synced model
+      await ModelModel.create({
+        externalId: "openai/gpt-4o",
+        provider: "openai",
+        modelId: "gpt-4o",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+
+      // Create an LLM Proxy-discovered model
+      await ModelModel.ensureModelExists("custom-model", "openai");
+
+      const proxyModels = await ModelModel.findLlmProxyModels();
+      expect(proxyModels).toHaveLength(1);
+      expect(proxyModels[0].modelId).toBe("custom-model");
+    });
+  });
+
+  describe("deleteOrphanedModels", () => {
+    test("deletes provider-synced models used by chat after their last API key is deleted", async ({
+      makeOrganization,
+      makeSecret,
+      makeLlmProviderApiKey,
+    }) => {
+      const org = await makeOrganization();
+      const model = await ModelModel.create({
+        externalId: "anthropic/claude-opus-4-7",
+        provider: "anthropic",
+        modelId: "claude-opus-4-7",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const apiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+        provider: "anthropic",
+      });
+      await LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
+        apiKey.id,
+        [{ id: model.id, modelId: model.modelId }],
+        "anthropic",
+      );
+
+      await ModelModel.ensureModelExists("claude-opus-4-7", "anthropic");
+      await LlmProviderApiKeyModel.delete(apiKey.id);
+
+      expect(await ModelModel.deleteOrphanedModels()).toBe(1);
+      expect(
+        await ModelModel.findByProviderAndModelId(
+          "anthropic",
+          "claude-opus-4-7",
+        ),
+      ).toBeNull();
+    });
+
+    test("deletes models without API key links that are not from LLM Proxy", async ({
+      makeOrganization,
+      makeSecret,
+      makeLlmProviderApiKey,
+    }) => {
+      const org = await makeOrganization();
+
+      // Create a model with no API key link (orphaned, not from proxy)
+      await ModelModel.create({
+        externalId: "openai/orphan-model",
+        provider: "openai",
+        modelId: "orphan-model",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+
+      // Create an LLM Proxy-discovered model (no API key link but should be preserved)
+      await ModelModel.ensureModelExists("proxy-model", "openai");
+
+      // Create a model WITH an API key link (should be preserved)
+      const linkedModel = await ModelModel.create({
+        externalId: "openai/linked-model",
+        provider: "openai",
+        modelId: "linked-model",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+
+      // Create an API key and link the model
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const apiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+        provider: "openai",
+      });
+      await LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
+        apiKey.id,
+        [{ id: linkedModel.id, modelId: linkedModel.modelId }],
+        "openai",
+      );
+
+      const deletedCount = await ModelModel.deleteOrphanedModels();
+
+      // Only the orphan without proxy flag should be deleted
+      expect(deletedCount).toBe(1);
+
+      // Verify the proxy model and linked model still exist
+      const proxyModel = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "proxy-model",
+      );
+      expect(proxyModel).not.toBeNull();
+
+      const linked = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "linked-model",
+      );
+      expect(linked).not.toBeNull();
+
+      // Verify the orphan was deleted
+      const orphan = await ModelModel.findByProviderAndModelId(
+        "openai",
+        "orphan-model",
+      );
+      expect(orphan).toBeNull();
+    });
+  });
+
+  describe("toCapabilities", () => {
+    test("returns null values when model is null", () => {
+      const capabilities = ModelModel.toCapabilities(null);
+
+      expect(capabilities.contextLength).toBeNull();
+      expect(capabilities.inputModalities).toBeNull();
+      expect(capabilities.outputModalities).toBeNull();
+      expect(capabilities.supportsToolCalling).toBeNull();
+      expect(capabilities.pricePerMillionInput).toBeNull();
+      expect(capabilities.pricePerMillionOutput).toBeNull();
+    });
+
+    test("converts model to capabilities format", async () => {
+      const model = await ModelModel.create({
+        externalId: "openai/gpt-4o",
+        provider: "openai",
+        modelId: "gpt-4o",
+        description: "GPT-4o",
+        contextLength: 128000,
+        inputModalities: ["text", "image"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.000005",
+        completionPricePerToken: "0.000015",
+        lastSyncedAt: new Date(),
+      });
+
+      const capabilities = ModelModel.toCapabilities(model);
+
+      expect(capabilities.contextLength).toBe(128000);
+      expect(capabilities.inputModalities).toEqual(["text", "image"]);
+      expect(capabilities.outputModalities).toEqual(["text"]);
+      expect(capabilities.supportsToolCalling).toBe(true);
+      expect(capabilities.pricePerMillionInput).toBe("5");
+      expect(capabilities.pricePerMillionOutput).toBe("15");
+    });
+  });
+
+  describe.each([
+    {
+      modelId: "gpt-image-1",
+      input: ["text"] as const,
+      output: ["image"] as const,
+    },
+    {
+      modelId: "gpt-realtime-translate",
+      input: ["audio"] as const,
+      output: ["text", "audio"] as const,
+    },
+    {
+      modelId: "gpt-audio",
+      input: ["text", "audio"] as const,
+      output: ["text", "audio"] as const,
+    },
+  ])("Azure media Chat capabilities: $modelId", ({
+    modelId,
+    input,
+    output,
+  }) => {
+    test("offers the media model in Chat without advertising agent tools", async () => {
+      const model = await ModelModel.create({
+        externalId: `azure/${modelId}`,
+        provider: "azure",
+        modelId,
+        inputModalities: [...input],
+        outputModalities: [...output],
+        supportsToolCalling: true,
+        lastSyncedAt: new Date(),
+      });
+      const scopedModel = {
+        ...model,
+        azureCapabilities: azureModelEvidence({
+          underlyingModelName: modelId,
+          source: "deployment",
+        }),
+      };
+      expect(ModelModel.supportsTextChat(scopedModel)).toBe(true);
+      expect(ModelModel.toCapabilities(scopedModel).supportsToolCalling).toBe(
+        false,
+      );
+    });
+  });
+
+  describe("supportsTextChat", () => {
+    test("returns false when a model is marked as ignored", async () => {
+      const model = await ModelModel.create({
+        externalId: "openai/gpt-4o",
+        provider: "openai",
+        modelId: "gpt-4o",
+        description: null,
+        contextLength: null,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        lastSyncedAt: new Date(),
+        ignored: true,
+      });
+
+      expect(ModelModel.supportsTextChat(model)).toBe(false);
+    });
+
+    test("returns true when modalities include text input and output", async () => {
+      const model = await ModelModel.create({
+        externalId: "gemini/gemini-2.5-flash",
+        provider: "gemini",
+        modelId: "gemini-2.5-flash",
+        description: null,
+        contextLength: null,
+        inputModalities: ["text", "image"],
+        outputModalities: ["text"],
+        supportsToolCalling: null,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        lastSyncedAt: new Date(),
+      });
+
+      expect(ModelModel.supportsTextChat(model)).toBe(true);
+    });
+
+    test("returns false when input modalities do not include text", async () => {
+      const model = await ModelModel.create({
+        externalId: "gemini/gemini-live-2.5-flash-native-audio",
+        provider: "gemini",
+        modelId: "gemini-live-2.5-flash-native-audio",
+        description: null,
+        contextLength: null,
+        inputModalities: ["audio"],
+        outputModalities: ["audio"],
+        supportsToolCalling: null,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        lastSyncedAt: new Date(),
+      });
+
+      expect(ModelModel.supportsTextChat(model)).toBe(false);
+    });
+
+    test("returns false when output modalities do not include text", async () => {
+      const model = await ModelModel.create({
+        externalId: "gemini/gemini-2.5-flash-image-preview",
+        provider: "gemini",
+        modelId: "gemini-2.5-flash-image-preview",
+        description: null,
+        contextLength: null,
+        inputModalities: ["text", "image"],
+        outputModalities: ["image"],
+        supportsToolCalling: null,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        lastSyncedAt: new Date(),
+      });
+
+      expect(ModelModel.supportsTextChat(model)).toBe(false);
+    });
+
+    test("returns false for embedding models", async () => {
+      const model = await ModelModel.create({
+        externalId: "gemini/gemini-embedding-001",
+        provider: "gemini",
+        modelId: "gemini-embedding-001",
+        description: null,
+        contextLength: null,
+        inputModalities: ["text"],
+        outputModalities: [],
+        supportsToolCalling: false,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        lastSyncedAt: new Date(),
+      });
+
+      expect(ModelModel.supportsTextChat(model)).toBe(false);
+    });
+
+    test("returns true when modalities are unknown", async () => {
+      const model = await ModelModel.create({
+        externalId: "openai/gpt-4o",
+        provider: "openai",
+        modelId: "gpt-4o",
+        description: null,
+        contextLength: null,
+        inputModalities: null,
+        outputModalities: null,
+        supportsToolCalling: null,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        lastSyncedAt: new Date(),
+      });
+
+      expect(ModelModel.supportsTextChat(model)).toBe(true);
+    });
+  });
+
+  describe("update", () => {
+    test("can update ignored alongside editable model settings", async () => {
+      const model = await ModelModel.create({
+        externalId: "openai/gpt-4o-mini",
+        provider: "openai",
+        modelId: "gpt-4o-mini",
+        description: null,
+        contextLength: 128000,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.000001",
+        completionPricePerToken: "0.000002",
+        lastSyncedAt: new Date(),
+      });
+
+      const updated = await ModelModel.update(model.id, {
+        ignored: true,
+        inputModalities: ["text", "image"],
+        outputModalities: ["text"],
+      });
+
+      expect(updated).not.toBeNull();
+      expect(updated?.ignored).toBe(true);
+      expect(updated?.inputModalities).toEqual(["text", "image"]);
+    });
+
+    test("can update embedding dimensions alongside editable model settings", async () => {
+      const model = await ModelModel.create({
+        externalId: "openai/text-embedding-3-small",
+        provider: "openai",
+        modelId: "text-embedding-3-small",
+        description: null,
+        contextLength: 8192,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: false,
+        promptPricePerToken: "0.000001",
+        completionPricePerToken: "0.000002",
+        embeddingDimensions: null,
+        lastSyncedAt: new Date(),
+      });
+
+      const updated = await ModelModel.update(model.id, {
+        embeddingDimensions: 1536,
+        ignored: true,
+      });
+
+      expect(updated).not.toBeNull();
+      expect(updated?.embeddingDimensions).toBe(1536);
+      expect(updated?.ignored).toBe(true);
+    });
+
+    test("clears embedding dimensions when a model is no longer used for embeddings", async () => {
+      const model = await ModelModel.create({
+        externalId: "openai/text-embedding-3-large",
+        provider: "openai",
+        modelId: "text-embedding-3-large",
+        description: null,
+        contextLength: 8192,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: false,
+        promptPricePerToken: "0.000001",
+        completionPricePerToken: "0.000002",
+        embeddingDimensions: 1536,
+        lastSyncedAt: new Date(),
+      });
+
+      const updated = await ModelModel.update(model.id, {
+        embeddingDimensions: null,
+      });
+
+      expect(updated).not.toBeNull();
+      expect(updated?.embeddingDimensions).toBeNull();
+    });
+  });
+
+  describe("getEffectivePricing — cache prices", () => {
+    test("derives cache prices from the input price via multiplier when none synced", async () => {
+      const model = await ModelModel.create({
+        externalId: "anthropic/derive-cache",
+        provider: "anthropic",
+        modelId: "derive-cache",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        promptPricePerToken: "0.000010", // $10/M input
+        completionPricePerToken: "0.000030",
+        lastSyncedAt: new Date(),
+      });
+
+      const pricing = ModelModel.getEffectivePricing(model);
+      // anthropic multipliers: read 0.1, write 1.25 → $1 / $12.5 per M
+      expect(pricing.pricePerMillionCacheRead).toBe("1");
+      expect(pricing.pricePerMillionCacheWrite).toBe("12.5");
+      expect(pricing.cacheSource).toBe("derived_multiplier");
+    });
+
+    test("uses synced cache prices when present", async () => {
+      const model = await ModelModel.create({
+        externalId: "anthropic/synced-cache",
+        provider: "anthropic",
+        modelId: "synced-cache",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        promptPricePerToken: "0.000003",
+        completionPricePerToken: "0.000015",
+        cacheReadPricePerToken: "0.0000003", // $0.30/M
+        cacheWritePricePerToken: "0.00000375", // $3.75/M
+        lastSyncedAt: new Date(),
+      });
+
+      const pricing = ModelModel.getEffectivePricing(model);
+      expect(pricing.pricePerMillionCacheRead).toBe("0.3");
+      expect(pricing.pricePerMillionCacheWrite).toBe("3.75");
+      expect(pricing.cacheSource).toBe("models_dev");
+    });
+
+    test("custom cache overrides win over synced prices", async () => {
+      const model = await ModelModel.create({
+        externalId: "anthropic/custom-cache-eff",
+        provider: "anthropic",
+        modelId: "custom-cache-eff",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        promptPricePerToken: "0.000003",
+        completionPricePerToken: "0.000015",
+        cacheReadPricePerToken: "0.0000003",
+        cacheWritePricePerToken: "0.00000375",
+        lastSyncedAt: new Date(),
+      });
+      await ModelModel.update(model.id, {
+        customPricePerMillionCacheRead: "0.50",
+        customPricePerMillionCacheWrite: "4.00",
+      });
+      const updated = await ModelModel.findById(model.id);
+
+      const pricing = ModelModel.getEffectivePricing(updated);
+      expect(pricing.pricePerMillionCacheRead).toBe("0.50000000");
+      expect(pricing.pricePerMillionCacheWrite).toBe("4.00000000");
+      expect(pricing.cacheSource).toBe("custom");
+    });
+
+    test("keeps a synced cache-read price and derives the missing write (OpenAI shape)", async () => {
+      // models.dev gives OpenAI a cache_read price but no cache_write.
+      const model = await ModelModel.create({
+        externalId: "openai/gpt-cache",
+        provider: "openai",
+        modelId: "gpt-cache",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        promptPricePerToken: "0.0000025", // $2.50/M input
+        completionPricePerToken: "0.00001",
+        cacheReadPricePerToken: "0.00000125", // $1.25/M synced read, no write
+        lastSyncedAt: new Date(),
+      });
+
+      const pricing = ModelModel.getEffectivePricing(model);
+      // Read uses the accurate synced price, NOT the multiplier (2.50 * 0.25 = 0.625).
+      expect(pricing.pricePerMillionCacheRead).toBe("1.25");
+      // OpenAI does not charge for cache writes → multiplier write 0.
+      expect(pricing.pricePerMillionCacheWrite).toBe("0");
+      // The real synced read wins the label; the known-zero derived write must
+      // not flag the model as estimated.
+      expect(pricing.cacheSource).toBe("models_dev");
+    });
+
+    test("preserves sub-cent cache-read precision (no 2-decimal rounding)", async () => {
+      const model = await ModelModel.create({
+        externalId: "deepseek/cache-precision",
+        provider: "deepseek",
+        modelId: "cache-precision",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        promptPricePerToken: "0.00000027",
+        completionPricePerToken: "0.0000011",
+        cacheReadPricePerToken: "0.000000014", // $0.014/M
+        cacheWritePricePerToken: "0.00000027", // $0.27/M
+        lastSyncedAt: new Date(),
+      });
+
+      const pricing = ModelModel.getEffectivePricing(model);
+      // 2-decimal rounding would have collapsed this to "0.01" (−29%).
+      expect(pricing.pricePerMillionCacheRead).toBe("0.014");
+      expect(pricing.pricePerMillionCacheWrite).toBe("0.27");
+    });
+
+    test("leaves cache unpriced for a provider with no cache pricing model", async () => {
+      const model = await ModelModel.create({
+        externalId: "cohere/no-cache",
+        provider: "cohere",
+        modelId: "no-cache",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        promptPricePerToken: "0.000010",
+        completionPricePerToken: "0.000030",
+        lastSyncedAt: new Date(),
+      });
+
+      const pricing = ModelModel.getEffectivePricing(model);
+      expect(pricing.pricePerMillionCacheRead).toBeNull();
+      expect(pricing.pricePerMillionCacheWrite).toBeNull();
+      expect(pricing.cacheSource).toBeNull();
+    });
+
+    test("derives cache prices from the provider hint when the model is unknown (default tier)", () => {
+      const pricing = ModelModel.getEffectivePricing(
+        null,
+        "some-unknown-model",
+        "anthropic",
+      );
+      // default input price $50/M, anthropic read multiplier 0.1 → $5/M
+      expect(pricing.source).toBe("default");
+      expect(pricing.pricePerMillionCacheRead).toBe("5");
+      expect(pricing.cacheSource).toBe("derived_multiplier");
+    });
+
+    // Ollama charges no per-token rate on either transport, so the generic
+    // estimate would bill local inference at $50/M against a real rate of zero.
+    test.each([
+      "ollama",
+      "ollama-native",
+    ] as const)("prices an unpriced %s model at zero rather than the generic estimate", async (provider) => {
+      const model = await ModelModel.create({
+        externalId: `${provider}/qwen3:8b`,
+        provider,
+        modelId: "qwen3:8b",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+
+      const pricing = ModelModel.getEffectivePricing(model);
+
+      expect(pricing.pricePerMillionInput).toBe("0.00");
+      expect(pricing.pricePerMillionOutput).toBe("0.00");
+    });
+
+    test("keeps an unknown vLLM price distinct from explicit zero", async () => {
+      const model = await ModelModel.create({
+        externalId: "vllm/synthetic-unpriced",
+        provider: "vllm",
+        modelId: "synthetic-unpriced",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+      });
+      for (const row of [model, null]) {
+        const price = ModelModel.getEffectivePricing(
+          row,
+          model.modelId,
+          "vllm",
+        );
+        expect(price.pricePerMillionInput).toBeNull();
+        expect(price.pricePerMillionOutput).toBeNull();
+      }
+      const free = ModelModel.getEffectivePricing({
+        ...model,
+        customPricePerMillionInput: "0",
+        customPricePerMillionOutput: "0",
+      });
+      expect(free.pricePerMillionInput).toBe("0");
+      expect(free.pricePerMillionOutput).toBe("0");
+    });
+
+    test("prices an unknown Ollama model at zero from the provider hint alone", () => {
+      const pricing = ModelModel.getEffectivePricing(
+        null,
+        "some-local-model",
+        "ollama",
+      );
+
+      expect(pricing.pricePerMillionInput).toBe("0.00");
+      expect(pricing.pricePerMillionOutput).toBe("0.00");
+    });
+
+    test("leaves the generic estimate in place for other providers", () => {
+      const pricing = ModelModel.getEffectivePricing(
+        null,
+        "some-unknown-model",
+        "openai",
+      );
+
+      expect(pricing.pricePerMillionInput).toBe("50.00");
+    });
+  });
+
+  describe("configuredParameters (native Ollama)", () => {
+    async function makeNativeModel() {
+      return ModelModel.create({
+        externalId: "ollama/llama3.2",
+        provider: "ollama-native",
+        modelId: "llama3.2",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+    }
+
+    test("persists configured parameters via update", async () => {
+      const created = await makeNativeModel();
+      expect(created.configuredParameters).toBeNull();
+
+      const updated = await ModelModel.update(created.id, {
+        configuredParameters: {
+          num_ctx: 8192,
+          num_predict: 1024,
+          reasoning_effort: "medium",
+          stop: ["END"],
+        },
+      });
+      expect(updated?.configuredParameters).toEqual({
+        num_ctx: 8192,
+        num_predict: 1024,
+        reasoning_effort: "medium",
+        stop: ["END"],
+      });
+
+      // Round-trips through a fresh read.
+      const reloaded = await ModelModel.findByProviderAndModelId(
+        "ollama-native",
+        "llama3.2",
+      );
+      expect(reloaded?.configuredParameters?.num_ctx).toBe(8192);
+    });
+
+    test("clears configured parameters when set to null", async () => {
+      const created = await makeNativeModel();
+      await ModelModel.update(created.id, {
+        configuredParameters: { num_ctx: 4096 },
+      });
+      const cleared = await ModelModel.update(created.id, {
+        configuredParameters: null,
+      });
+      expect(cleared?.configuredParameters).toBeNull();
+    });
+
+    test("resolveEffectiveContextLength prefers a configured num_ctx over the architectural value", async () => {
+      const created = await ModelModel.create({
+        externalId: "ollama/nemotron",
+        provider: "ollama-native",
+        modelId: "nemotron",
+        contextLength: 262144,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+      // No configured num_ctx → architectural value.
+      expect(ModelModel.resolveEffectiveContextLength(created)).toBe(262144);
+
+      const updated = await ModelModel.update(created.id, {
+        configuredParameters: { num_ctx: 8192 },
+      });
+      // Configured num_ctx wins (the window Ollama actually enforces).
+      expect(
+        ModelModel.resolveEffectiveContextLength(
+          updated as NonNullable<typeof updated>,
+        ),
+      ).toBe(8192);
+    });
+
+    test("resolveEffectiveContextLength clamps a num_ctx above the architectural window", async () => {
+      const created = await ModelModel.create({
+        externalId: "ollama/clamped",
+        provider: "ollama-native",
+        modelId: "clamped",
+        contextLength: 131072,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+      const updated = await ModelModel.update(created.id, {
+        configuredParameters: { num_ctx: 1310720 },
+      });
+
+      // An unclamped value drives the context ring and the step-context guard,
+      // so auto-compaction would fire 10x too late and conversations would die
+      // of context overflow while the ring still showed free space.
+      expect(
+        ModelModel.resolveEffectiveContextLength(
+          updated as NonNullable<typeof updated>,
+        ),
+      ).toBe(131072);
+    });
+
+    test("resolveEffectiveContextLength ignores configuredParameters on other providers", async () => {
+      const created = await ModelModel.create({
+        externalId: "anthropic/claude",
+        provider: "anthropic",
+        modelId: "claude-test",
+        contextLength: 200000,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+      const updated = await ModelModel.update(created.id, {
+        configuredParameters: { num_ctx: 100000000 },
+      });
+
+      // Nothing sends num_ctx to a paid provider, so honouring it here would
+      // only stop compaction and ship unbounded history — with the bill as the
+      // sole feedback signal.
+      expect(
+        ModelModel.resolveEffectiveContextLength(
+          updated as NonNullable<typeof updated>,
+        ),
+      ).toBe(200000);
+    });
+
+    test("resolveEffectiveContextLength uses a Modelfile num_ctx when nothing is configured", async () => {
+      // Reproduced against Ollama 0.32.0: `qwen3-8k` is qwen3:4b built with
+      // `PARAMETER num_ctx 8192`. /api/show reports the architectural 262144 in
+      // model_info AND the 8192 cap in the parameters block, which we already
+      // parse into defaultParameters and previously never read — so the ring
+      // promised 262K while Ollama truncated at 8K and compaction never fired.
+      const created = await ModelModel.create({
+        externalId: "ollama/qwen3-8k",
+        provider: "ollama-native",
+        modelId: "qwen3-8k:latest",
+        contextLength: 262144,
+        defaultParameters: { num_ctx: 8192, temperature: 0.6 },
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+
+      expect(ModelModel.resolveEffectiveContextLength(created)).toBe(8192);
+
+      // A configured value still outranks the Modelfile — Archestra sends it,
+      // and a request-level num_ctx is highest precedence in Ollama.
+      const updated = await ModelModel.update(created.id, {
+        configuredParameters: { num_ctx: 32768 },
+      });
+      expect(
+        ModelModel.resolveEffectiveContextLength(
+          updated as NonNullable<typeof updated>,
+        ),
+      ).toBe(32768);
+    });
+
+    test("resolveEffectiveContextLength applies a Modelfile num_ctx on the /v1 transport too", async () => {
+      // The Modelfile cap is a property of the model, not of the transport.
+      const created = await ModelModel.create({
+        externalId: "ollama/qwen3-8k-v1",
+        provider: "ollama",
+        modelId: "qwen3-8k-v1",
+        contextLength: 262144,
+        defaultParameters: { num_ctx: 8192 },
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+
+      expect(ModelModel.resolveEffectiveContextLength(created)).toBe(8192);
+    });
+
+    test("resolveEffectiveContextLength ignores an unusable Modelfile num_ctx", async () => {
+      // defaultParameters is parsed from a free-form text block, so the value
+      // arrives as a string as often as a number and can be junk outright. A bad
+      // parse must fall back to the architectural window rather than propagate
+      // into the context ring and the compaction threshold.
+      const created = await ModelModel.create({
+        externalId: "ollama/stringy",
+        provider: "ollama-native",
+        modelId: "stringy",
+        contextLength: 262144,
+        defaultParameters: { num_ctx: "8192" },
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+      // A numeric string is still a real cap — coerce it.
+      expect(ModelModel.resolveEffectiveContextLength(created)).toBe(8192);
+
+      for (const num_ctx of ["not-a-number", "0", "-1", "8192.5"]) {
+        const junk = await ModelModel.create({
+          externalId: `ollama/junk-${num_ctx}`,
+          provider: "ollama-native",
+          modelId: `junk-${num_ctx}`,
+          contextLength: 262144,
+          defaultParameters: { num_ctx },
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+          lastSyncedAt: new Date(),
+        });
+        expect(ModelModel.resolveEffectiveContextLength(junk)).toBe(262144);
+      }
+    });
+
+    test("resolveEffectiveContextLength falls back when contextLength is null", async () => {
+      const created = await makeNativeModel();
+      expect(created.contextLength).toBeNull();
+      expect(ModelModel.resolveEffectiveContextLength(created)).toBeNull();
+
+      const updated = await ModelModel.update(created.id, {
+        configuredParameters: { num_ctx: 8192 },
+      });
+      // With no architectural value to clamp against, the configured window is
+      // the only thing known about the model.
+      expect(
+        ModelModel.resolveEffectiveContextLength(
+          updated as NonNullable<typeof updated>,
+        ),
+      ).toBe(8192);
+    });
+
+    test("findByIdForAudit includes configuredParameters", async () => {
+      const created = await makeNativeModel();
+      await ModelModel.update(created.id, {
+        configuredParameters: { num_predict: 1 },
+      });
+
+      // Omitting it made a parameters-only save produce an empty before/after
+      // diff: the only other field it moves is `updatedAt`, which the audit
+      // hook strips.
+      const snapshot = await ModelModel.findByIdForAudit(created.id, "org-1");
+      expect(snapshot?.configuredParameters).toEqual({ num_predict: 1 });
+    });
+
+    test("leaves configured parameters untouched when the field is omitted", async () => {
+      const created = await makeNativeModel();
+      await ModelModel.update(created.id, {
+        configuredParameters: { top_k: 40 },
+      });
+      // A pricing-only update must not wipe the stored parameters.
+      const afterUnrelated = await ModelModel.update(created.id, {
+        ignored: true,
+      });
+      expect(afterUnrelated?.configuredParameters).toEqual({ top_k: 40 });
+    });
+  });
+
+  describe("admin-set context/output limits", () => {
+    async function makeUnreportedModel() {
+      // The shape this feature exists for: a row a proxy request created, with
+      // no catalog entry behind it, so neither limit is known.
+      return ModelModel.create({
+        externalId: "vllm/local-llama",
+        provider: "vllm",
+        modelId: "local-llama",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+    }
+
+    test("an override supplies the window and output ceiling a provider never reported", async () => {
+      const created = await makeUnreportedModel();
+      expect(ModelModel.resolveEffectiveContextLength(created)).toBeNull();
+      expect(ModelModel.resolveEffectiveOutputLength(created)).toBeNull();
+
+      const updated = await ModelModel.update(created.id, {
+        customContextLength: 128000,
+        customOutputLength: 8192,
+      });
+
+      expect(
+        ModelModel.resolveEffectiveContextLength(
+          updated as NonNullable<typeof updated>,
+        ),
+      ).toBe(128000);
+      expect(
+        ModelModel.resolveEffectiveOutputLength(
+          updated as NonNullable<typeof updated>,
+        ),
+      ).toBe(8192);
+    });
+
+    test("an override wins over the synced value", async () => {
+      const created = await ModelModel.create({
+        externalId: "openai/gpt-fixture",
+        provider: "openai",
+        modelId: "gpt-fixture",
+        contextLength: 128000,
+        outputLength: 4096,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+
+      const updated = await ModelModel.update(created.id, {
+        customContextLength: 32000,
+        customOutputLength: 16000,
+      });
+
+      // The synced columns are left intact, so clearing the override restores
+      // the provider's own figures.
+      expect(updated?.contextLength).toBe(128000);
+      expect(updated?.outputLength).toBe(4096);
+      expect(
+        ModelModel.resolveArchitecturalContextLength(
+          updated as NonNullable<typeof updated>,
+        ),
+      ).toBe(32000);
+      expect(
+        ModelModel.resolveEffectiveOutputLength(
+          updated as NonNullable<typeof updated>,
+        ),
+      ).toBe(16000);
+
+      const cleared = await ModelModel.update(created.id, {
+        customContextLength: null,
+        customOutputLength: null,
+      });
+      expect(
+        ModelModel.resolveArchitecturalContextLength(
+          cleared as NonNullable<typeof cleared>,
+        ),
+      ).toBe(128000);
+      expect(
+        ModelModel.resolveEffectiveOutputLength(
+          cleared as NonNullable<typeof cleared>,
+        ),
+      ).toBe(4096);
+    });
+
+    test("an Ollama Modelfile still caps an admin-set window", async () => {
+      // The override states what the model architecturally has; `num_ctx` is
+      // what Ollama will actually run with, and remains the smaller of the two.
+      const created = await ModelModel.create({
+        externalId: "ollama/capped",
+        provider: "ollama-native",
+        modelId: "capped",
+        defaultParameters: { num_ctx: "8192" },
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+      const updated = await ModelModel.update(created.id, {
+        customContextLength: 131072,
+      });
+
+      expect(
+        ModelModel.resolveEffectiveContextLength(
+          updated as NonNullable<typeof updated>,
+        ),
+      ).toBe(8192);
+    });
+
+    test("leaves the overrides untouched when the fields are omitted", async () => {
+      const created = await makeUnreportedModel();
+      await ModelModel.update(created.id, {
+        customContextLength: 65536,
+        customOutputLength: 4096,
+      });
+      const afterUnrelated = await ModelModel.update(created.id, {
+        ignored: true,
+      });
+      expect(afterUnrelated?.customContextLength).toBe(65536);
+      expect(afterUnrelated?.customOutputLength).toBe(4096);
+    });
+
+    test("findByIdForAudit reports the resolved limits", async () => {
+      const created = await makeUnreportedModel();
+      await ModelModel.update(created.id, { customOutputLength: 8192 });
+
+      // Without the resolved output limit here, a max-output-only save moves
+      // nothing but `updatedAt` (which the audit hook strips) and the audit
+      // diff comes out empty.
+      const snapshot = await ModelModel.findByIdForAudit(created.id, "org-1");
+      expect(snapshot?.outputLength).toBe(8192);
+      expect(snapshot?.contextLength).toBeNull();
+    });
+  });
+});
+
+describe("published context pricing", () => {
+  test("uses coherent prices for stale rows and missing rows at strict boundaries", async () => {
+    const row = await ModelModel.create({
+      provider: "github-copilot",
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      modelId: "gpt-6.1-sol",
+      externalId: "github-copilot/gpt-6.1-sol",
+      promptPricePerToken: "0.000099",
+      completionPricePerToken: "0.000099",
+      cacheReadPricePerToken: "0.000099",
+      cacheWritePricePerToken: "0.000099",
+    });
+    for (const model of [row, null])
+      for (const tokens of [271999, 272000, 272001]) {
+        const prices = ModelModel.getEffectivePricing(
+          model,
+          "gpt-6.1-sol",
+          "github-copilot",
+          tokens,
+        );
+        expect(Number(prices.pricePerMillionInput)).toBe(
+          tokens > 272000 ? 4 : 2,
+        );
+        expect(Number(prices.pricePerMillionOutput)).toBe(
+          tokens > 272000 ? 15 : 10,
+        );
+        expect(Number(prices.pricePerMillionCacheRead)).toBe(
+          tokens > 272000 ? 0.2 : 0.1,
+        );
+        expect(Number(prices.pricePerMillionCacheWrite)).toBe(
+          tokens > 272000 ? 5 : 2.5,
+        );
+        expect(prices.source).toBe("provider");
+        expect(prices.cacheSource).toBe("provider");
+      }
+  });
+
+  test("keeps selected-instance prices and unpublished directions instead of adding a catalog surcharge", async () => {
+    const row = await ModelModel.create({
+      provider: "github-copilot",
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      modelId: "claude-haiku-5.5",
+      externalId: "github-copilot/claude-haiku-5.5",
+    });
+    const instance = ModelModel.withProviderPricing(row, [
+      {
+        promptPricePerToken: "0.000003",
+        completionPricePerToken: "0.000004",
+        cacheReadPricePerToken: null,
+        cacheWritePricePerToken: null,
+      },
+    ]);
+    const pricing = ModelModel.getEffectivePricing(
+      instance,
+      undefined,
+      undefined,
+      100001,
+    );
+    expect(Number(pricing.pricePerMillionInput)).toBe(3);
+    expect(Number(pricing.pricePerMillionOutput)).toBe(4);
+    expect(pricing.pricePerMillionCacheRead).toBeNull();
+    expect(ModelModel.getLongContextThreshold(instance)).toBeNull();
+    expect(
+      ModelModel.getEffectivePricing(null, "grok-4.7", "github-copilot", 200001)
+        .pricePerMillionCacheWrite,
+    ).toBeNull();
+    expect(
+      ModelModel.getEffectivePricing(null, "claude-haiku-5.5", "vllm", 100001)
+        .pricePerMillionInput,
+    ).toBeNull();
+  });
+});

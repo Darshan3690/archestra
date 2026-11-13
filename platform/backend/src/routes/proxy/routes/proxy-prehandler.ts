@@ -1,9 +1,38 @@
-import type {
-  FastifyReply,
-  FastifyRequest,
-  HookHandlerDoneFunction,
+import { Readable } from "node:stream";
+import * as zlib from "node:zlib";
+import {
+  type SupportedProvider,
+  SupportedProvidersSchema,
+} from "@archestra/shared";
+import {
+  errorCodes,
+  type FastifyReply,
+  type FastifyRequest,
+  type HookHandlerDoneFunction,
 } from "fastify";
+import { mayHoldAttestationToken } from "@/archestra-mcp-server/tool-attestation";
 import logger from "@/logging";
+import { LimitValidationService } from "@/models/limit";
+import LlmThroughputModel from "@/models/llm-throughput";
+import ModelModel from "@/models/model";
+import {
+  mayHoldOpenAppaPayload,
+  sanitizeForwardedRequest,
+} from "@/openappa/request";
+import {
+  fireworksModelAliases,
+  isFireworksEndpoint,
+  resolveFireworksModel,
+} from "@/services/fireworks-model";
+import { ThroughputError } from "@/services/llm-throughput";
+import { ApiError } from "@/types";
+import {
+  beginPassthroughLog,
+  notePassthroughRequestBody,
+  type PassthroughIdentity,
+} from "../passthrough-log";
+import { captureClientRuntimeEvidence } from "../utils/client-runtime-evidence";
+import { removeMarkersFromBody } from "../utils/gateway-tool-declarations";
 
 const UUID_REGEX =
   /^\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(\/.*)?$/i;
@@ -13,16 +42,54 @@ const UUID_REGEX =
  * 1. Rejects POST requests matching the custom-handled endpoint suffix with a 400
  * 2. Strips agent UUIDs from the URL path so the proxy forwards to the correct upstream
  * 3. Logs the rewrite or pass-through for debugging
+ * 4. Takes the gateway's tool attestation markers and OpenAPPA's provider-bound
+ *    payloads out of a forwarded JSON body
+ *
+ * `rejectUnhandledPaths` (GitHub Copilot): every supported endpoint has its own
+ * explicit route, so anything reaching this catch-all proxy is unsupported.
+ * Forwarding it would relay the caller's raw GitHub OAuth token upstream (the
+ * Copilot API only accepts the short-lived exchanged bearer), yielding a
+ * confusing 401 — so reject with a clear 400 instead.
  */
 export function createProxyPreHandler(params: {
   apiPrefix: string;
-  endpointSuffix: string | string[];
+  endpointSuffix: string | readonly string[];
   upstream: string;
+  resolveUpstream?: (request: FastifyRequest) => string;
   providerName: string;
   rewritePrefix?: string;
   skipErrorResponse?: Record<string, unknown>;
+  rejectUnhandledPaths?: boolean;
+  beforeCleanBody?: (request: FastifyRequest, body: unknown) => Promise<void>;
+  /**
+   * Platform check that runs before anything else, so a rejected request never
+   * reaches the rewrite or the upstream. Receives the agent UUID from the URL,
+   * if any, because the rewrite strips it.
+   */
+  authenticate?: (params: {
+    request: FastifyRequest;
+    agentId?: string;
+  }) => Promise<PassthroughIdentity | undefined>;
+  /**
+   * When set, every forwarded call is logged as a `<provider>:passthrough`
+   * interaction. It also names the provider whose free operations stay
+   * available under a budget.
+   */
+  logProvider?: SupportedProvider;
 }) {
-  const { apiPrefix, endpointSuffix, upstream, providerName } = params;
+  const { apiPrefix, endpointSuffix, upstream, resolveUpstream, providerName } =
+    params;
+  // Provider identity comes from this route's configured namespace, never the
+  // body or caller's credential. Custom compatible models keep that identity.
+  const provider = SupportedProvidersSchema.safeParse(
+    apiPrefix.split("/").at(-1),
+  );
+  const beforeCleanBody = params.logProvider
+    ? async (request: FastifyRequest, body: unknown) => {
+        notePassthroughRequestBody(request, body);
+        await params.beforeCleanBody?.(request, body);
+      }
+    : params.beforeCleanBody;
   const rewritePrefix = params.rewritePrefix ?? "";
   const skipErrorResponse = params.skipErrorResponse ?? {
     error: {
@@ -31,15 +98,15 @@ export function createProxyPreHandler(params: {
     },
   };
 
-  return (
+  const rewritePreHandler = (
     request: FastifyRequest,
     reply: FastifyReply,
     next: HookHandlerDoneFunction,
   ) => {
+    captureClientRuntimeEvidence(request);
     const urlPath = request.url.split("?")[0];
-    const endpointSuffixes = Array.isArray(endpointSuffix)
-      ? endpointSuffix
-      : [endpointSuffix];
+    const endpointSuffixes =
+      typeof endpointSuffix === "string" ? [endpointSuffix] : endpointSuffix;
 
     const matchedSuffix = endpointSuffixes.find((suffix) =>
       urlPath.endsWith(suffix),
@@ -59,8 +126,42 @@ export function createProxyPreHandler(params: {
       return;
     }
 
+    if (params.rejectUnhandledPaths) {
+      logger.info(
+        { method: request.method, url: request.url, action: "reject" },
+        `${providerName} proxy preHandler: rejecting unsupported endpoint`,
+      );
+      // OpenAI-compatible clients (e.g. VS Code Copilot BYOK) build this path
+      // from a configured base URL, so a stray suffix like "/v1" or a bad
+      // LLM proxy id lands here even though the endpoint itself is supported.
+      // Echo the offending path and the expected base-URL shape so the
+      // misconfiguration is visible in the client, not only in server logs.
+      // Derived from the configured suffixes rather than hardcoded, so a
+      // provider that gains a surface (e.g. Copilot's /responses) cannot end up
+      // telling clients that surface is unsupported. Every caller that opts
+      // into rejection also registers /models, which is a GET route and so
+      // never appears in endpointSuffixes.
+      const supportedEndpoints = [...endpointSuffixes, "/models"].join(", ");
+      reply.code(400).send({
+        error: {
+          message:
+            `${providerName} only supports the ${supportedEndpoints} endpoints; ` +
+            `got ${request.method} ${urlPath}. The configured base URL must be exactly ` +
+            `"${apiPrefix}" or "${apiPrefix}/<llm-proxy-id>" with no extra path segments ` +
+            `(e.g. no trailing "/v1") — the client appends the endpoint path itself.`,
+          type: "invalid_request_error",
+        },
+      });
+      return;
+    }
+
+    const resolvedUpstream = resolveUpstream?.(request) ?? upstream;
+    const upstreamPathPrefix = resolveUpstream
+      ? new URL(resolvedUpstream).pathname.replace(/\/+$/, "")
+      : "";
     const pathAfterPrefix = request.url.replace(apiPrefix, "");
     const uuidMatch = pathAfterPrefix.match(UUID_REGEX);
+    const forwardedPath = uuidMatch ? uuidMatch[2] || "" : pathAfterPrefix;
 
     if (uuidMatch) {
       const remainingPath = uuidMatch[2] || "";
@@ -72,8 +173,8 @@ export function createProxyPreHandler(params: {
           method: request.method,
           originalUrl,
           rewrittenUrl: request.raw.url,
-          upstream,
-          finalProxyUrl: `${upstream}${rewritePrefix}${remainingPath}`,
+          upstream: resolvedUpstream,
+          finalProxyUrl: `${resolvedUpstream}${rewritePrefix}${remainingPath}`,
         },
         `${providerName} proxy preHandler: URL rewritten (UUID stripped)`,
       );
@@ -82,13 +183,463 @@ export function createProxyPreHandler(params: {
         {
           method: request.method,
           url: request.url,
-          upstream,
-          finalProxyUrl: `${upstream}${rewritePrefix}${pathAfterPrefix}`,
+          upstream: resolvedUpstream,
+          finalProxyUrl: `${resolvedUpstream}${rewritePrefix}${pathAfterPrefix}`,
         },
         `${providerName} proxy preHandler: proxying request`,
       );
     }
 
-    next();
+    // Strip last: the body hooks (e.g. Claude Code's count observer) still
+    // read X-Archestra-* headers such as the agent id, and match request.url
+    // before any upstream base-path prefix is added for @fastify/http-proxy.
+    cleanForwardedBody(
+      request,
+      beforeCleanBody,
+      provider.success
+        ? { provider: provider.data, baseUrl: resolvedUpstream }
+        : undefined,
+    ).then(() => {
+      if (upstreamPathPrefix) {
+        request.raw.url = `${apiPrefix}${upstreamPathPrefix}${forwardedPath}`;
+      }
+      stripArchestraRequestHeaders(request);
+      next();
+    }, next);
   };
+
+  const { authenticate } = params;
+  return (
+    request: FastifyRequest,
+    reply: FastifyReply,
+    next: HookHandlerDoneFunction,
+  ) => {
+    const agentId = request.url.replace(apiPrefix, "").match(UUID_REGEX)?.[1];
+    // .catch rather than a second .then argument, so a synchronous throw in
+    // the rewrite reaches Fastify instead of becoming an unhandled rejection.
+    Promise.resolve()
+      .then(async () => {
+        const identity = await authenticate?.({ request, agentId });
+        if (params.logProvider) {
+          const relative = request.url.replace(apiPrefix, "");
+          beginPassthroughLog(request, {
+            provider: params.logProvider,
+            identity,
+            pathAndQuery: relative.match(UUID_REGEX)?.[2] ?? relative,
+          });
+        }
+        // Raw passthrough has neither resolved billing ownership nor a usage
+        // adapter. Fail explicitly rather than let it evade configured quotas.
+        // Metadata, stored results, file transfer and cancellation do not start
+        // inference. Keep these available even when another key has a quota.
+        if (isNonInferenceOperation(request)) return;
+        let configured: boolean;
+        try {
+          configured = await LlmThroughputModel.hasRules();
+        } catch {
+          throw new ThroughputError({
+            status: 503,
+            code: "archestra_quota_storage_unavailable",
+            message: "The gateway cannot verify its throughput quota.",
+          });
+        }
+        if (configured)
+          throw new ThroughputError({
+            status: 400,
+            code: "archestra_quota_unsupported_endpoint",
+            message:
+              "Throughput limits require a supported native inference endpoint. Unhandled inference operations are disabled while throughput limits are configured.",
+          });
+        // Nor can a forwarded call be charged to a spend budget: it names no
+        // model and reports no cost to settle. Refuse it while any hard budget
+        // applies to the caller, unless the provider bills nothing for it.
+        if (!identity || isFreeOperation(request, params.logProvider)) return;
+        const violation = await LimitValidationService.checkLimitsBeforeRequest(
+          {
+            unmeteredOperation: true,
+            allowUnattributed: !!identity.serviceAccountId,
+            agentId: identity.agent.id,
+            agent: identity.agent,
+            userId: identity.userId,
+            virtualKeyId: identity.virtualKeyId,
+            passthroughVirtualKeyId: identity.passthroughVirtualKeyId,
+            llmOauthClientId: identity.authenticatedApp?.id,
+            billingTeamId: identity.billingTeamId,
+            teamMemberUserId: identity.userId ?? null,
+          },
+        );
+        if (violation) throw new ApiError(402, violation[1]);
+      })
+      .then(() => rewritePreHandler(request, reply, next))
+      .catch((error) => {
+        if (error instanceof ThroughputError) {
+          reply.code(error.status).send({
+            error: {
+              message: error.message,
+              type: "archestra_throughput_error",
+              code: error.code,
+            },
+          });
+          return;
+        }
+        next(error);
+      });
+  };
+}
+
+/**
+ * Cleans a JSON body before a catch-all proxy forwards it upstream: the
+ * gateway's tool attestation markers and OpenAPPA's provider-bound payloads
+ * (notice records and signed offers, control receipts, ask_user offers,
+ * trajectory stamps) never reach a provider. The
+ * dedicated routes do both in handleLLMProxy, but clients also send their tool
+ * list and history to endpoints only the catch-all serves: Anthropic's
+ * `/v1/messages/count_tokens`, OpenAI's `/responses/input_tokens`, Gemini's
+ * `:countTokens`.
+ *
+ * The catch-all hands its preHandler the raw body stream, so a JSON body is
+ * read here, within the route's body limit, and put back: byte for byte when
+ * nothing in it changed, re-serialized when something did. Native Ollama
+ * inference validates JSON independently of the content headers, like its
+ * upstream decoder; other opaque bodies are forwarded as they are.
+ */
+export async function cleanForwardedBody(
+  request: FastifyRequest,
+  beforeCleanBody?: (request: FastifyRequest, body: unknown) => Promise<void>,
+  availability?: { provider: SupportedProvider; baseUrl?: string },
+): Promise<void> {
+  const nativeOllama =
+    availability?.provider === "ollama" ||
+    availability?.provider === "ollama-native";
+  const path = request.url.split("?")[0].replace(/\/+$/, "");
+  const metadata =
+    isNonInferenceOperation(request) ||
+    /\/(?:tokenize|detokenize)$/.test(path) ||
+    (nativeOllama &&
+      /\/api\/(?:show|pull|push|create|copy|delete|blobs\/[^/]+)$/.test(path));
+  const validateBody =
+    availability && !metadata
+      ? async (body: unknown) => {
+          // Fastify may already have parsed text/plain into a string, while
+          // the catch-all parser leaves other bodies as raw streams.
+          if (typeof body === "string" || Buffer.isBuffer(body)) {
+            try {
+              body = JSON.parse(body.toString());
+            } catch {
+              if (nativeOllama)
+                throw new ApiError(
+                  400,
+                  "Native Ollama inference requests must contain one valid JSON body.",
+                );
+              return;
+            }
+          }
+          if (!body || typeof body !== "object") return;
+          let model = "model" in body ? body.model : undefined;
+          if (nativeOllama) {
+            // Go accepts case-insensitive field names, but its null/duplicate
+            // handling differs from JSON.parse. Never authorize one model and
+            // forward an ambiguous body that Ollama could decode as another.
+            const fields = Object.entries(body).filter(
+              ([key]) => key.toLowerCase() === "model",
+            );
+            if (
+              fields.length > 1 ||
+              (fields.length === 1 && typeof fields[0][1] !== "string")
+            ) {
+              throw new ApiError(
+                400,
+                "Native Ollama requests must name a single string model.",
+              );
+            }
+            model = fields[0]?.[1];
+          }
+          if (typeof model !== "string") return;
+          const resolved = await resolveFireworksModel({
+            provider: availability.provider,
+            model,
+            baseUrl: availability.baseUrl,
+          });
+          await ModelModel.assertAvailable({
+            provider: availability.provider,
+            modelId: resolved.model,
+            aliases: isFireworksEndpoint(availability.baseUrl)
+              ? fireworksModelAliases(resolved.model)
+              : undefined,
+          });
+        }
+      : undefined;
+  const encoding = request.headers["content-encoding"]?.trim().toLowerCase();
+  // Ollama decompresses zstd on its compatible endpoints. Inspect a bounded
+  // copy, then forward the original bytes and headers unchanged.
+  const zstdBody =
+    nativeOllama &&
+    validateBody &&
+    encoding === "zstd" &&
+    /\/v1\/(?:chat\/completions|completions|embeddings|responses|images\/(?:generations|edits)|messages)$/.test(
+      path,
+    );
+  const encodedBody =
+    zstdBody ||
+    (validateBody && !nativeOllama && encoding && encoding !== "identity");
+  const multipartBody =
+    validateBody &&
+    (!nativeOllama || /\/v1\/audio\/transcriptions$/.test(path)) &&
+    request.headers["content-type"]
+      ?.toLowerCase()
+      .startsWith("multipart/form-data");
+  const decodeBody = async (bytes: Buffer): Promise<Buffer> => {
+    // Decode a bounded inspection copy. HTTP applies stacked encodings in order,
+    // so undo them in reverse; the original request bytes still go upstream.
+    for (const name of (encoding ?? "").split(",").reverse()) {
+      const decoders: Record<
+        string,
+        (
+          input: Buffer,
+          options: { maxOutputLength: number },
+          callback: (error: Error | null, decoded: Buffer) => void,
+        ) => void
+      > = {
+        gzip: zlib.gunzip,
+        deflate: zlib.inflate,
+        br: zlib.brotliDecompress,
+        zstd: zlib.zstdDecompress,
+      };
+      const key = name.trim();
+      const decoder = Object.hasOwn(decoders, key) ? decoders[key] : undefined;
+      if (key === "identity") continue;
+      if (typeof decoder !== "function")
+        throw new ApiError(415, "Unsupported model request content encoding.");
+      try {
+        bytes = await new Promise<Buffer>((resolve, reject) => {
+          decoder(
+            bytes,
+            { maxOutputLength: request.routeOptions.bodyLimit },
+            (error, decoded) => (error ? reject(error) : resolve(decoded)),
+          );
+        });
+      } catch (error) {
+        if (
+          error &&
+          typeof error === "object" &&
+          "code" in error &&
+          error.code === "ERR_BUFFER_TOO_LARGE"
+        )
+          throw new errorCodes.FST_ERR_CTP_BODY_TOO_LARGE();
+        throw new ApiError(400, "Invalid compressed model request.");
+      }
+    }
+    return bytes;
+  };
+  const body = request.body;
+  if (!(body instanceof Readable)) {
+    await validateBody?.(
+      encodedBody && (typeof body === "string" || Buffer.isBuffer(body))
+        ? await decodeBody(Buffer.from(body))
+        : body,
+    );
+    return;
+  }
+  // Native endpoints can parse JSON regardless of Content-Type. Inspect those
+  // bytes for availability too; otherwise a different header bypasses Hidden.
+  if (!isUncompressedJson(request.headers) && !validateBody) {
+    return;
+  }
+  const raw = await readBody({
+    stream: body,
+    limit: request.routeOptions.bodyLimit,
+    contentLength: request.headers["content-length"],
+  });
+  if (multipartBody) {
+    const decoded = encodedBody ? await decodeBody(raw) : raw;
+    let form: FormData;
+    try {
+      form = await new Response(new Uint8Array(decoded), {
+        headers: { "content-type": request.headers["content-type"] ?? "" },
+      }).formData();
+    } catch {
+      throw new ApiError(400, "Invalid multipart model request.");
+    }
+    let model = form.get("model");
+    if (nativeOllama) {
+      // Ollama uses Go's FormValue: query parameters precede multipart fields.
+      const query = request.url.includes("?")
+        ? request.url.slice(request.url.indexOf("?") + 1)
+        : "";
+      // Go discards malformed query pairs; do not authorize a different fallback
+      // model because URLSearchParams tolerates malformed escapes or semicolons.
+      try {
+        if (query.includes(";")) throw new Error("Ambiguous query");
+        decodeURIComponent(query.replace(/\+/g, " "));
+      } catch {
+        throw new ApiError(400, "Invalid multipart model query.");
+      }
+      model = new URLSearchParams(query).get("model") ?? model;
+    } else if (
+      form.getAll("model").length > 1 ||
+      (model !== null && typeof model !== "string")
+    ) {
+      // Providers disagree on first/last duplicate fields. Require an
+      // unambiguous model without altering the file or forwarded form bytes.
+      throw new ApiError(
+        400,
+        "Multipart requests must name a single string model.",
+      );
+    }
+    await validateBody({ model });
+    request.body = Readable.from([raw], { objectMode: false });
+    return;
+  }
+  if (encodedBody) {
+    await validateBody(await decodeBody(raw));
+    request.body = Readable.from([raw], { objectMode: false });
+    return;
+  }
+  // @fastify/reply-from pipes a stream upstream as it is, and serializes an
+  // object for an application/json request with a fresh content-length.
+  request.body =
+    (await cleanedJson(
+      raw,
+      beforeCleanBody && ((body) => beforeCleanBody(request, body)),
+      validateBody,
+    )) ?? Readable.from([raw], { objectMode: false });
+}
+
+/**
+ * Removes every `X-Archestra-*` header before a catch-all proxy forwards the
+ * request. These headers carry Archestra's own credentials and routing hints
+ * (the passthrough key in `X-Archestra-Virtual-Key` above all), which must
+ * never reach a third-party provider. Runs after authentication has read them.
+ */
+export function stripArchestraRequestHeaders(request: FastifyRequest): void {
+  for (const headers of new Set([request.headers, request.raw.headers])) {
+    for (const name of Object.keys(headers)) {
+      if (
+        name.toLowerCase().startsWith("x-archestra-") ||
+        name.toLowerCase() === "provider-api-key-id"
+      ) {
+        delete headers[name];
+      }
+    }
+  }
+}
+
+// === Internal helpers ===
+
+/** The parsed body once something in it was removed; null to forward the bytes as they came. */
+async function cleanedJson(
+  raw: Buffer,
+  beforeCleanBody?: (body: unknown) => Promise<void>,
+  validateBody?: (body: unknown) => Promise<void>,
+): Promise<object | null> {
+  const markers = mayHoldAttestationToken(raw);
+  const payloads = mayHoldOpenAppaPayload(raw);
+  if (!markers && !payloads && !beforeCleanBody && !validateBody) return null;
+  let body: unknown;
+  try {
+    body = JSON.parse(raw.toString("utf8"));
+  } catch {
+    // Native providers can accept a first JSON value and ignore trailing
+    // bytes. The availability validator must reject such ambiguous input.
+    await validateBody?.(raw);
+    return null;
+  }
+  if (typeof body !== "object" || body === null) return null;
+  // Availability is an execution gate, unlike the optional logging observer.
+  // Its errors must reach Fastify and stop forwarding.
+  await validateBody?.(body);
+  if (beforeCleanBody) {
+    try {
+      await beforeCleanBody(body);
+    } catch {
+      // Optional observers must never prevent ordinary proxy forwarding.
+    }
+  }
+  const removedMarkers = markers && removeMarkersFromBody(body);
+  const removedPayloads = payloads && sanitizeForwardedRequest(body);
+  return removedMarkers || removedPayloads ? body : null;
+}
+
+function isUncompressedJson(headers: FastifyRequest["headers"]): boolean {
+  const mediaType = headers["content-type"]?.split(";")[0].trim().toLowerCase();
+  const encoding = headers["content-encoding"]?.trim().toLowerCase();
+  return (
+    mediaType === "application/json" && (!encoding || encoding === "identity")
+  );
+}
+
+/**
+ * Buffers a request body, failing with Fastify's own 413 past `limit`. Stops
+ * listening rather than destroying the stream, so the error reply still
+ * reaches the client.
+ */
+function readBody(params: {
+  stream: Readable;
+  limit: number;
+  contentLength: string | undefined;
+}): Promise<Buffer> {
+  const { stream, limit } = params;
+  return new Promise((resolve, reject) => {
+    if (Number(params.contentLength) > limit) {
+      reject(new errorCodes.FST_ERR_CTP_BODY_TOO_LARGE());
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    const stop = () => {
+      stream.off("data", onData);
+      stream.off("end", onEnd);
+      stream.off("error", onError);
+    };
+    const onData = (chunk: Buffer | string) => {
+      const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      size += bytes.length;
+      if (size > limit) {
+        stop();
+        reject(new errorCodes.FST_ERR_CTP_BODY_TOO_LARGE());
+        return;
+      }
+      chunks.push(bytes);
+    };
+    const onEnd = () => {
+      stop();
+      resolve(Buffer.concat(chunks));
+    };
+    const onError = (error: Error) => {
+      stop();
+      reject(error);
+    };
+    stream.on("data", onData);
+    stream.on("end", onEnd);
+    stream.on("error", onError);
+  });
+}
+
+function isNonInferenceOperation(request: FastifyRequest): boolean {
+  const path = request.url.split("?")[0].replace(/\/+$/, "");
+  // Realtime upgrades can start generation even though the handshake is GET.
+  if (request.headers.upgrade || /\/(?:realtime|live)(?:\/|$)/i.test(path))
+    return false;
+  if (["GET", "HEAD", "OPTIONS", "DELETE"].includes(request.method))
+    return true;
+  if (request.method !== "POST") return false;
+  return (
+    /(?:\/count_tokens|\/input_tokens|:countTokens)$/.test(path) ||
+    /\/files(?:\/[^/]+)?(?::upload)?$/.test(path) ||
+    /\/uploads(?:\/[^/]+(?:\/(?:parts|complete|cancel))?)?$/.test(path) ||
+    /\/(?:batches|responses)\/[^/]+\/cancel$/.test(path)
+  );
+}
+
+/** Inference the provider never bills: OpenAI charges nothing for moderation. */
+function isFreeOperation(
+  request: FastifyRequest,
+  provider: SupportedProvider | undefined,
+): boolean {
+  const path = request.url.split("?")[0].replace(/\/+$/, "");
+  return (
+    provider === "openai" &&
+    request.method === "POST" &&
+    /\/moderations$/.test(path)
+  );
 }

@@ -1,0 +1,2040 @@
+import {
+  DEFAULT_GIT_WEB_URLS,
+  type GitProvider,
+  MAX_SKILL_COMPATIBILITY_LENGTH,
+  MAX_SKILL_DESCRIPTION_LENGTH,
+  type ResourcePermissionGrant,
+} from "@archestra/shared";
+import {
+  and,
+  asc,
+  count,
+  desc,
+  eq,
+  getTableColumns,
+  gt,
+  ilike,
+  inArray,
+  isNotNull,
+  isNull,
+  like,
+  ne,
+  not,
+  notInArray,
+  or,
+  type SQL,
+  sql,
+} from "drizzle-orm";
+import db, { schema, type Transaction, withDbTransaction } from "@/database";
+import { notDeleted } from "@/database/schemas/soft-deletable-table";
+import { hardDelete, restore, softDelete } from "@/database/soft-delete";
+import logger from "@/logging";
+import { skillInEnvironmentPredicate } from "@/services/environments/environment-isolation";
+import {
+  getDisabledBuiltInSkillSourceRefs,
+  isBuiltInSkillSourceRef,
+} from "@/skills/built-in-skills";
+import { SKILL_MANIFEST_FILENAME } from "@/skills/parser";
+import {
+  buildSkillPublicationArtifacts,
+  computeFileDigest,
+} from "@/skills/skill-manifest-serializer";
+import type {
+  InsertSkill,
+  InsertSkillFile,
+  PublishableSkill,
+  Skill,
+  SkillManifestSource,
+  SortDirection,
+  UpdateSkill,
+} from "@/types";
+import { ApiError } from "@/types";
+import type {
+  SkillFileEncoding,
+  SkillFileKind,
+  SkillGithubSyncInterval,
+  SkillSortBy,
+} from "@/types/skill";
+import type { ResourceVisibilityScope } from "@/types/visibility";
+import { trackBackgroundWork } from "@/utils/background-work";
+import { chunkForBulkStatement } from "@/utils/db";
+import CreatedByModel from "./created-by";
+import ResourcePermissionPolicyModel, {
+  type ObjectPolicy,
+} from "./resource-permission-policy";
+import ResourcePermissionSubjectModel, {
+  type ResourceAccessFilter,
+} from "./resource-permission-subject";
+import SkillVersionModel, { type VersionFileInput } from "./skill-version";
+
+/**
+ * Every `skills` column except `content` — the projection the MCP publication
+ * queries select.
+ *
+ * Shared with `AgentSkillModel.findSkillsByAgent`, which resolves the same
+ * surface for Custom mode, so the two modes can never disagree about which
+ * columns a published skill carries.
+ */
+export function publishableSkillColumns() {
+  const { content: _body, ...columns } = getTableColumns(schema.skillsTable);
+  return columns;
+}
+
+/**
+ * Match the skills a `skill://` URI names.
+ *
+ * A name is unique per `(organization, author)`, so an author-form URI (a
+ * set `authorId`) names at most one live row: `skills_org_author_name_idx`
+ * makes it so. The author segment of a skill a service account wrote is the
+ * service account, the same key the index uses. A bare URI (`authorId` null) names every skill with that name,
+ * whoever wrote it; the caller picks one (see `resolveExposedSkill`). The
+ * publication gates (`publishableSkillPredicate`) are composed alongside this
+ * predicate by each query, not folded in here.
+ *
+ * Shared by both publication modes so a URI resolves to the same rows whether
+ * the gateway is in Auto or Custom mode.
+ */
+export function skillUriKeyPredicate(params: {
+  name: string;
+  authorId: string | null;
+}): SQL | undefined {
+  return params.authorId === null
+    ? eq(schema.skillsTable.name, params.name)
+    : and(
+        eq(schema.skillsTable.name, params.name),
+        sql`${skillNameOwnerKey()} = ${params.authorId}`,
+      );
+}
+
+/**
+ * Every publication gate that is a property of the skill row itself, as one
+ * SQL predicate: not templated (per-user Handlebars rendering has no stable
+ * bytes to digest), not agent-delegated (delegation has no MCP counterpart),
+ * spec-compliant frontmatter (SEP-2640 hosts refuse entries whose URI segment
+ * breaks the Agent Skills naming rules or whose fields exceed its length
+ * limits), an owner for the author segment of its URI (or, with no owner,
+ * publication to the whole organization), no unpublishable file path, and publication artifacts present
+ * for the row and every file it publishes.
+ *
+ * SQL rather than TypeScript so the paging `LIMIT` bounds the work: a gate
+ * settled after the window is cut forces the caller to re-read until the page
+ * fills, which on a catalog dense in unpublishable skills degrades to a full
+ * scan per page. The TS twins in `services/agent-skill-resolution.ts` remain
+ * only as assertions; `skill.test.ts` pins the name and path gates against
+ * their TypeScript counterparts so the two cannot drift.
+ */
+export function publishableSkillPredicate(): SQL | undefined {
+  return and(
+    eq(schema.skillsTable.templated, false),
+    isNull(schema.skillsTable.agentName),
+    // Twin of `isSpecCompliantSkillName` (shared/agent-skills.ts): 1-64 chars,
+    // lowercase ASCII runs with single hyphens between them.
+    //
+    // `COLLATE "C"` because `[a-z]` is a collation-dependent range in Postgres:
+    // under the glibc UTF-8 locales most deployments run, accented letters sort
+    // inside it, so `café` would pass here and be rejected by the TypeScript
+    // twin — which withholds the row, logs an invariant violation, and shortens
+    // the page. C collation is plain byte ordering, which is what the twin does.
+    sql`char_length(${schema.skillsTable.name}) <= 64
+      AND ${schema.skillsTable.name} COLLATE "C" ~ '^[a-z0-9]+(-[a-z0-9]+)*$'`,
+    // Twins of `isSpecCompliantSkillDescription` / `isSpecCompliantSkillCompatibility`
+    // (shared/agent-skills.ts). `char_length` counts code points, which is what
+    // the TypeScript twins count. An empty compatibility gates like NULL — the
+    // serializer omits it — so only its upper bound appears here.
+    sql`char_length(${schema.skillsTable.description}) BETWEEN 1 AND ${MAX_SKILL_DESCRIPTION_LENGTH}`,
+    sql`char_length(coalesce(${schema.skillsTable.compatibility}, '')) <= ${MAX_SKILL_COMPATIBILITY_LENGTH}`,
+    // A skill with no author (a built-in, or one whose author row was
+    // deleted: `author_id` is ON DELETE SET NULL) is addressed by its bare
+    // URI, which a caller resolves only among the skills it can read. So such
+    // a skill is published only when it is published to the organization,
+    // where every caller can read it. An orphaned personal skill is withheld.
+    or(
+      sql`${skillNameOwnerKey()} IS NOT NULL`,
+      ResourcePermissionPolicyModel.organizationAccessCondition({
+        organizationId: schema.skillsTable.organizationId,
+        resource: "skill",
+        scopeColumn: schema.skillsTable.id,
+        action: "read",
+      }),
+    ),
+    publishableFilePathsPredicate(),
+    nonCollidingFilePathsPredicate(),
+    // Twin of `storedArtifacts` (services/skill-publication.ts): both halves
+    // are written together, so either being null means the row predates
+    // migration 0407 or an invalidating write reset it.
+    isNotNull(schema.skillsTable.frontmatterBlob),
+    isNotNull(schema.skillsTable.digest),
+    digestedFilesPredicate(),
+  );
+}
+
+/**
+ * Excludes skills holding a resource-file path no `skill://` URI can name.
+ *
+ * The SQL twin of `isPublishableSkillFilePath`. The verdict turns on
+ * `skill_files.path`, a different table from the one paging keys off, so
+ * settling it in application code means reading every candidate's files before
+ * a window can be cut. In SQL it is a semi-join the paging `LIMIT` sits behind.
+ *
+ * Mirrors `hasRoundTrippableSegments`: at least one segment, no empty segment
+ * (a leading, trailing or doubled `/`), and no `.` or `..` segment.
+ */
+function publishableFilePathsPredicate(): SQL {
+  return sql`NOT EXISTS (
+    SELECT 1
+    FROM ${schema.skillFilesTable}
+    WHERE ${schema.skillFilesTable.skillId} = ${schema.skillsTable.id}
+      AND (
+        ${schema.skillFilesTable.path} !~ '^[^/]+(/[^/]+)*$'
+        OR ${schema.skillFilesTable.path} ~ '(^|/)[.]{1,2}(/|$)'
+      )
+  )`;
+}
+
+/**
+ * Excludes skills where one stored path is a parent directory of another.
+ *
+ * The SQL twin of `hasPublishableFilePathSet`. `left(...)` rather than `LIKE`
+ * because a path is user-supplied text: `_` and `%` in it are LIKE wildcards,
+ * which would withhold skills whose paths merely resemble one another.
+ */
+function nonCollidingFilePathsPredicate(): SQL {
+  return sql`NOT EXISTS (
+    SELECT 1
+    FROM ${schema.skillFilesTable} AS parent_file
+    JOIN ${schema.skillFilesTable} AS child_file
+      ON child_file.skill_id = parent_file.skill_id
+    WHERE parent_file.skill_id = ${schema.skillsTable.id}
+      AND left(child_file.path, char_length(parent_file.path) + 1)
+          = parent_file.path || '/'
+  )`;
+}
+
+/**
+ * Excludes skills holding a resource file that carries no digest.
+ *
+ * The SQL twin of the file loop in `resolveSkillPublicationArtifacts`, which
+ * withholds the whole skill rather than the file: a resource list missing one
+ * of a skill's readable files is, to a conforming host, a verification
+ * failure. A stored top-level `SKILL.md` is exempt in both places — the served
+ * manifest is composed from the skill row, so whatever a legacy row holds
+ * under that path is shadowed and never published.
+ *
+ * Settled in SQL for the same reason as the path gate: the verdict lives in
+ * `skill_files`, so in application code it would be a read of every
+ * candidate's files before a window could be cut — and a page cut before the
+ * verdict can come back empty with a cursor, which plenty of clients read as
+ * "this gateway publishes nothing".
+ */
+function digestedFilesPredicate(): SQL {
+  return sql`NOT EXISTS (
+    SELECT 1
+    FROM ${schema.skillFilesTable}
+    WHERE ${schema.skillFilesTable.skillId} = ${schema.skillsTable.id}
+      AND ${schema.skillFilesTable.digest} IS NULL
+      AND ${schema.skillFilesTable.path} <> ${SKILL_MANIFEST_FILENAME}
+  )`;
+}
+
+/**
+ * The keyset page window: rows strictly after `afterId` in id order.
+ *
+ * Keyset rather than OFFSET because the exposed set changes under a client that
+ * pages it — an offset would silently skip a skill whenever one ahead of the
+ * window is deleted, where resuming after an id cannot.
+ */
+export function afterIdPredicate(afterId: string | undefined): SQL | undefined {
+  return afterId ? gt(schema.skillsTable.id, afterId) : undefined;
+}
+
+/** Filter both catalog discovery and direct reads when a built-in feature is off. */
+export function enabledSkillPredicate(): SQL | undefined {
+  const disabled = getDisabledBuiltInSkillSourceRefs();
+  return disabled.length
+    ? or(
+        ne(schema.skillsTable.sourceType, "built_in"),
+        isNull(schema.skillsTable.sourceRef),
+        notInArray(schema.skillsTable.sourceRef, disabled),
+      )
+    : undefined;
+}
+
+class SkillModel {
+  /**
+   * The skills with `scope` set from each skill's grants instead of the
+   * retired column, which every new skill stores as `personal`: `org` when
+   * they reach the organization or a role, `team` when they reach a team,
+   * `personal` otherwise. Name precedence and API responses read this.
+   */
+  static async withGrantedScope<
+    T extends { id: string; organizationId: string; scope: string },
+  >(
+    skills: T[],
+    /** These skills' policies, when the caller already loaded them. */
+    policies?: ObjectPolicy[],
+  ): Promise<(T & { scope: ResourceVisibilityScope })[]> {
+    const idsByOrganization = new Map<string, string[]>();
+    for (const skill of skills) {
+      idsByOrganization.set(skill.organizationId, [
+        ...(idsByOrganization.get(skill.organizationId) ?? []),
+        skill.id,
+      ]);
+    }
+    const audiences = new Map<string, ResourceVisibilityScope>();
+    for (const [organizationId, scopes] of idsByOrganization) {
+      const found = await ResourcePermissionPolicyModel.findAudiences({
+        organizationId,
+        resource: "skill",
+        scopes,
+        policies,
+      });
+      for (const [id, { audience }] of found) audiences.set(id, audience);
+    }
+    return skills.map((skill) => ({
+      ...skill,
+      scope: audiences.get(skill.id) ?? "personal",
+    }));
+  }
+
+  static async transferOwnership(params: {
+    id: string;
+    organizationId: string;
+    previousOwnerId: string | null;
+    updatedAt: Date;
+    ownerId: string;
+  }): Promise<boolean> {
+    const rows = await db
+      .update(schema.skillsTable)
+      .set({
+        authorId: params.ownerId,
+        createdByServiceAccountId: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(schema.skillsTable.id, params.id),
+          eq(schema.skillsTable.organizationId, params.organizationId),
+          params.previousOwnerId === null
+            ? isNull(schema.skillsTable.authorId)
+            : eq(schema.skillsTable.authorId, params.previousOwnerId),
+          sql`date_trunc('milliseconds', ${schema.skillsTable.updatedAt}) = ${params.updatedAt.toISOString()}::timestamp`,
+          notDeleted(schema.skillsTable),
+        ),
+      )
+      .returning({ id: schema.skillsTable.id });
+    return rows.length === 1;
+  }
+
+  static async findByOrganization(params: {
+    organizationId: string;
+    limit?: number;
+    offset?: number;
+    search?: string;
+    /** Omit manifest bodies from list-only consumers at the SQL boundary. */
+    includeContent?: boolean;
+    sourceRepo?: string;
+    /** When set, restricts results to these skill IDs (scope filtering). */
+    accessibleSkillIds?: string[];
+    /** When set, excludes these skill IDs (agent All-mode blocklist). */
+    excludedSkillIds?: string[];
+    /** Keep only rows that can be served over the MCP skill surface. */
+    publishableOverMcp?: boolean;
+    /**
+     * When set (null = Default environment), restricts results to skills
+     * visible from that environment: strict match, built-in skills exempt.
+     * Omit for management surfaces that list every environment.
+     */
+    environmentId?: string | null;
+    /**
+     * Only skills published to the whole organization for `use` by their
+     * grants — what a gateway serves in Auto mode.
+     */
+    publishedToOrganization?: boolean;
+    scope?: ResourceVisibilityScope;
+    /** Restrict team-scoped results to skills assigned to these teams. */
+    teamIds?: string[];
+    /** Restrict personal-scoped results to these authors. */
+    authorIds?: string[];
+    /** Hide skills authored by these users (authorless rows are kept). */
+    excludeAuthorIds?: string[];
+    /**
+     * When set, hides personal skills owned by other users (the admin
+     * default view; mirrors the agents list).
+     */
+    excludeOtherPersonalForUserId?: string;
+    /** Active rows (default) or the soft-deleted trash. */
+    status?: SkillRecordStatus;
+    /** Skill ids matching a `?labels=` filter; omit when not filtering. */
+    labelFilteredIds?: string[];
+    /** The list's "Show" filter; omit when not filtering. */
+    access?: ResourceAccessFilter;
+    sorting?: { sortBy?: SkillSortBy; sortDirection?: SortDirection };
+  }): Promise<Skill[]> {
+    let query = db
+      .select({
+        ...getTableColumns(schema.skillsTable),
+        content:
+          params.includeContent === false
+            ? sql<string>`''`.as("content")
+            : schema.skillsTable.content,
+      })
+      .from(schema.skillsTable)
+      .where(and(...buildOrgFilters(params)))
+      .orderBy(...buildOrderBy(params.sorting))
+      .$dynamic();
+
+    if (params.limit !== undefined) {
+      query = query.limit(params.limit);
+    }
+    if (params.offset !== undefined) {
+      query = query.offset(params.offset);
+    }
+
+    return await query;
+  }
+
+  /**
+   * Ids and names of the skills the default list shows, in its order: the
+   * same filters as `findByOrganization`, without the row bodies or the
+   * per-row metadata the list attaches. For pickers and setups that need to
+   * name or send every visible skill.
+   */
+  static async findNamesByOrganization(params: {
+    organizationId: string;
+    limit: number;
+    accessibleSkillIds?: string[];
+    status?: SkillRecordStatus;
+  }): Promise<{ id: string; name: string }[]> {
+    return await db
+      .select({ id: schema.skillsTable.id, name: schema.skillsTable.name })
+      .from(schema.skillsTable)
+      .where(and(...buildOrgFilters(params)))
+      .orderBy(...buildOrderBy())
+      .limit(params.limit);
+  }
+
+  static async countByOrganization(params: {
+    organizationId: string;
+    search?: string;
+    sourceRepo?: string;
+    accessibleSkillIds?: string[];
+    /** Same agent-policy exclusion filter as `findByOrganization`. */
+    excludedSkillIds?: string[];
+    /** Same MCP-publication filter as `findByOrganization`. */
+    publishableOverMcp?: boolean;
+    /** Same environment-visibility filter as `findByOrganization`. */
+    environmentId?: string | null;
+    /**
+     * Only skills published to the whole organization for `use` by their
+     * grants — what a gateway serves in Auto mode.
+     */
+    publishedToOrganization?: boolean;
+    scope?: ResourceVisibilityScope;
+    teamIds?: string[];
+    authorIds?: string[];
+    excludeAuthorIds?: string[];
+    excludeOtherPersonalForUserId?: string;
+    /** Active rows (default) or the soft-deleted trash. */
+    status?: SkillRecordStatus;
+    /** Skill ids matching a `?labels=` filter; omit when not filtering. */
+    labelFilteredIds?: string[];
+    /** Same "Show" filter as `findByOrganization`. */
+    access?: ResourceAccessFilter;
+  }): Promise<number> {
+    const [result] = await db
+      .select({ count: count() })
+      .from(schema.skillsTable)
+      .where(and(...buildOrgFilters(params)));
+
+    return result?.count ?? 0;
+  }
+
+  /**
+   * Distinct repository identities across the org's imported skills, derived
+   * from the `source_ref` provenance column (formatted as
+   * `owner/repo@ref:path`).
+   *
+   * Built-in skills also carry a `source_ref`, but it is a `builtin:<id>`
+   * identity token rather than a repository — and one that embeds the
+   * unbranded product id, which would leak into the white-labeled repository
+   * filter. They are excluded, matching how the skills table suppresses the
+   * same refs in favor of the app-name badge.
+   */
+  static async findDistinctSourceRepos(params: {
+    organizationId: string;
+    /** when set, restricts results to these skill IDs (scope filtering). */
+    accessibleSkillIds?: string[];
+  }): Promise<string[]> {
+    const rows = await db
+      .selectDistinct({
+        sourceRef: schema.skillsTable.sourceRef,
+        sourceOrigin: schema.skillsTable.sourceOrigin,
+        sourceProvider: schema.skillsTable.sourceProvider,
+      })
+      .from(schema.skillsTable)
+      .where(
+        and(
+          ...buildOrgFilters(params),
+          isNotNull(schema.skillsTable.sourceRef),
+        ),
+      );
+
+    const repos = new Set<string>();
+    for (const { sourceRef, sourceOrigin, sourceProvider } of rows) {
+      if (!sourceRef) continue;
+      if (isBuiltInSkillSourceRef(sourceRef)) continue;
+      const atIdx = sourceRef.indexOf("@");
+      const repo = atIdx === -1 ? sourceRef : sourceRef.slice(0, atIdx);
+      if (!repo) continue;
+      // `owner/repo` on github.com; the full web URL on every other host,
+      // gitlab.com included, so the same path on two hosts stays distinct.
+      const webOrigin =
+        sourceOrigin ?? DEFAULT_GIT_WEB_URLS[sourceProvider ?? "github"];
+      repos.add(
+        webOrigin === DEFAULT_GIT_WEB_URLS.github
+          ? repo
+          : `${webOrigin}/${repo}`,
+      );
+    }
+    return [...repos].sort();
+  }
+
+  static async findById(id: string): Promise<Skill | null> {
+    const [result] = await db
+      .select()
+      .from(schema.skillsTable)
+      .where(
+        and(
+          eq(schema.skillsTable.id, id),
+          notDeleted(schema.skillsTable),
+          enabledSkillPredicate(),
+        ),
+      );
+
+    return result ?? null;
+  }
+
+  static async findByIds(ids: string[]): Promise<Skill[]> {
+    if (ids.length === 0) return [];
+    return await db
+      .select()
+      .from(schema.skillsTable)
+      .where(
+        and(
+          inArray(schema.skillsTable.id, ids),
+          notDeleted(schema.skillsTable),
+          enabledSkillPredicate(),
+        ),
+      );
+  }
+
+  /**
+   * Environment assignments for a batch of skills, keyed by skill id. Every
+   * requested id is present — an unassigned skill maps to an empty array — so
+   * the result feeds `skillVisibleInEnvironment` without a missing-key case.
+   */
+  static async findEnvironmentIdsBySkillIds(
+    ids: string[],
+  ): Promise<Map<string, string[]>> {
+    const result = new Map<string, string[]>(ids.map((id) => [id, []]));
+    if (ids.length === 0) return result;
+
+    const rows = await db
+      .select({
+        skillId: schema.skillEnvironmentsTable.skillId,
+        environmentId: schema.skillEnvironmentsTable.environmentId,
+      })
+      .from(schema.skillEnvironmentsTable)
+      .where(inArray(schema.skillEnvironmentsTable.skillId, ids));
+
+    for (const row of rows) {
+      result.get(row.skillId)?.push(row.environmentId);
+    }
+    return result;
+  }
+
+  /**
+   * One keyset page of the org-scoped skills visible in an environment, in id
+   * order, already stripped of this agent's exclusions and of anything whose
+   * file paths cannot be published.
+   *
+   * Backs Auto mode for the gateway's `skill://` surface, which is deliberately
+   * org-scope only: team and personal skills reach a gateway only by explicit
+   * assignment.
+   *
+   * Bounded on purpose. This read used to return the whole org and let the
+   * route settle publishability afterwards, which made a single `skills/list`
+   * page cost a full catalog scan plus a full `skill_files` scan — and cost it
+   * again on the next page. Every filter that can be a predicate is one, so
+   * `limit` bounds the work rather than merely trimming its result.
+   *
+   * Projects `content` away: a body is needed only for the single skill a
+   * manifest read renders (see {@link SkillModel.findManifestSourceById}).
+   */
+  static async findOrgScopedInEnvironment(params: {
+    organizationId: string;
+    environmentId: string | null;
+    /** Drop the skills this agent has excluded from its Auto-mode surface. */
+    excludedForAgentId: string;
+    /** Resume after this id; omit to start at the first page. */
+    afterId?: string;
+    limit: number;
+  }): Promise<PublishableSkill[]> {
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    return await db
+      .select(publishableSkillColumns())
+      .from(schema.skillsTable)
+      .where(
+        and(
+          eq(schema.skillsTable.organizationId, params.organizationId),
+          ResourcePermissionPolicyModel.organizationAccessCondition({
+            organizationId: params.organizationId,
+            resource: "skill",
+            scopeColumn: schema.skillsTable.id,
+            action: "use",
+          }),
+          skillInEnvironmentPredicate(params.environmentId),
+          notDeleted(schema.skillsTable),
+          enabledSkillPredicate(),
+          notExcludedByAgentPredicate(params.excludedForAgentId),
+          publishableSkillPredicate(),
+          afterIdPredicate(params.afterId),
+        ),
+      )
+      .orderBy(asc(schema.skillsTable.id))
+      .limit(params.limit);
+    // SPDX-SnippetEnd
+  }
+
+  /**
+   * The org-scoped skills a `skill://` URI names: at most one for an author
+   * URI, every skill of that name for a bare one (capped at
+   * {@link MAX_URI_MATCHES}).
+   *
+   * The by-key twin of {@link SkillModel.findOrgScopedInEnvironment}: serving
+   * one skill's manifest or one of its files does not need the org's catalog,
+   * only the rows the URI addresses. Same predicates, so a skill reachable
+   * through the listing is reachable through its own URI and no other.
+   * `readableBy` narrows the rows further to the skills that caller can read.
+   */
+  static async findOrgScopedByUriKey(params: {
+    organizationId: string;
+    environmentId: string | null;
+    name: string;
+    authorId: string | null;
+    readableBy?: { userId: string | null };
+  }): Promise<PublishableSkill[]> {
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    return await db
+      .select(publishableSkillColumns())
+      .from(schema.skillsTable)
+      .where(
+        and(
+          eq(schema.skillsTable.organizationId, params.organizationId),
+          ResourcePermissionPolicyModel.organizationAccessCondition({
+            organizationId: params.organizationId,
+            resource: "skill",
+            scopeColumn: schema.skillsTable.id,
+            action: "use",
+          }),
+          skillUriKeyPredicate(params),
+          await skillReadablePredicate({
+            organizationId: params.organizationId,
+            readableBy: params.readableBy,
+          }),
+          skillInEnvironmentPredicate(params.environmentId),
+          notDeleted(schema.skillsTable),
+          enabledSkillPredicate(),
+          publishableSkillPredicate(),
+        ),
+      )
+      .orderBy(asc(schema.skillsTable.id))
+      .limit(MAX_URI_MATCHES);
+    // SPDX-SnippetEnd
+  }
+
+  /**
+   * Everything one skill's `SKILL.md` is composed from, in a single row read.
+   *
+   * Single-row on purpose, and the only read a manifest may be served from. The
+   * published blob and the body it wraps are written together and kept together
+   * by migration 0407's invalidation trigger, but that is a guarantee about the
+   * row, not about a reader: composing the blob from a snapshot taken when the
+   * skill was resolved and the body from a second read moments later produces
+   * bytes that were never committed — matching neither the digest advertised
+   * before the intervening write nor the one advertised after. One read cannot
+   * straddle a write, so it cannot tear.
+   *
+   * Null when the row was deleted since it was resolved — soft deletion
+   * included, since that is the only kind this surface sees. Without the
+   * filter, a read already in flight when someone deletes a skill would serve
+   * its manifest one last time.
+   */
+  static async findManifestSourceById(
+    id: string,
+  ): Promise<SkillManifestSource | null> {
+    const [row] = await db
+      .select({
+        name: schema.skillsTable.name,
+        description: schema.skillsTable.description,
+        license: schema.skillsTable.license,
+        compatibility: schema.skillsTable.compatibility,
+        allowedTools: schema.skillsTable.allowedTools,
+        metadata: schema.skillsTable.metadata,
+        content: schema.skillsTable.content,
+        frontmatterBlob: schema.skillsTable.frontmatterBlob,
+        digest: schema.skillsTable.digest,
+      })
+      .from(schema.skillsTable)
+      .where(
+        and(
+          eq(schema.skillsTable.id, id),
+          notDeleted(schema.skillsTable),
+          enabledSkillPredicate(),
+        ),
+      )
+      .limit(1);
+
+    return row ?? null;
+  }
+
+  /**
+   * One keyset page of skills whose publication artifacts are missing — rows
+   * written before migration 0407, or reset by a write outside the model
+   * layer. Read only by the periodic backfill
+   * (services/skill-publication-backfill.ts); every model write path stores
+   * the artifacts together with the bytes they cover, and the gateway
+   * withholds a row in this state rather than serving it undigested.
+   *
+   * Soft-deleted rows are included on purpose: digesting them is idempotent
+   * and makes a later restore servable immediately.
+   */
+  static async findRowSizesMissingPublicationArtifacts(params: {
+    /** Resume after this id; omit to start at the first page. */
+    afterId?: string;
+    limit: number;
+  }): Promise<Array<{ id: string; chars: number }>> {
+    return await db
+      .select({
+        id: schema.skillsTable.id,
+        chars: sql<number>`char_length(${schema.skillsTable.content})`,
+      })
+      .from(schema.skillsTable)
+      .where(
+        and(
+          or(
+            isNull(schema.skillsTable.frontmatterBlob),
+            isNull(schema.skillsTable.digest),
+          ),
+          afterIdPredicate(params.afterId),
+        ),
+      )
+      .orderBy(asc(schema.skillsTable.id))
+      .limit(params.limit);
+  }
+
+  /**
+   * The manifest fields of specific still-undigested skills — the second half
+   * of the backfill's read, sized by
+   * {@link SkillModel.findRowSizesMissingPublicationArtifacts}.
+   *
+   * The artifact-missing filter is re-applied because a model-layer write may
+   * have digested a row since its size was read; such a row needs nothing and
+   * is simply absent from the result.
+   */
+  static async findManifestSourcesMissingArtifacts(
+    ids: string[],
+  ): Promise<
+    Array<
+      Pick<
+        Skill,
+        | "id"
+        | "name"
+        | "description"
+        | "license"
+        | "compatibility"
+        | "allowedTools"
+        | "metadata"
+        | "content"
+      >
+    >
+  > {
+    if (ids.length === 0) return [];
+
+    return await db
+      .select({
+        id: schema.skillsTable.id,
+        name: schema.skillsTable.name,
+        description: schema.skillsTable.description,
+        license: schema.skillsTable.license,
+        compatibility: schema.skillsTable.compatibility,
+        allowedTools: schema.skillsTable.allowedTools,
+        metadata: schema.skillsTable.metadata,
+        content: schema.skillsTable.content,
+      })
+      .from(schema.skillsTable)
+      .where(
+        and(
+          inArray(schema.skillsTable.id, ids),
+          or(
+            isNull(schema.skillsTable.frontmatterBlob),
+            isNull(schema.skillsTable.digest),
+          ),
+        ),
+      );
+  }
+
+  /**
+   * How many skills still lack publication artifacts.
+   *
+   * Read by the backfill to report what remains after a failed pass: the
+   * listing query filters these rows out, so without this number a withheld
+   * catalog looks exactly like an empty one.
+   */
+  static async countRowsMissingPublicationArtifacts(): Promise<number> {
+    const [row] = await db
+      .select({ value: count() })
+      .from(schema.skillsTable)
+      .where(
+        or(
+          isNull(schema.skillsTable.frontmatterBlob),
+          isNull(schema.skillsTable.digest),
+        ),
+      );
+    return row?.value ?? 0;
+  }
+
+  /**
+   * Locate a shipped built-in skill by its stable `source_ref` within an org.
+   *
+   * Deliberately includes soft-deleted rows: the startup seeder uses this to
+   * reconcile shipped definitions, and a soft-deleted built-in must be seen
+   * (and skipped) there — otherwise every boot would resurrect it as a fresh
+   * copy. Deleting a built-in skill is a durable opt-out.
+   */
+  static async findBuiltIn(params: {
+    organizationId: string;
+    sourceRef: string;
+  }): Promise<Skill | null> {
+    const [result] = await db
+      .select()
+      .from(schema.skillsTable)
+      .where(
+        and(
+          eq(schema.skillsTable.organizationId, params.organizationId),
+          eq(schema.skillsTable.sourceType, "built_in"),
+          eq(schema.skillsTable.sourceRef, params.sourceRef),
+        ),
+      );
+
+    return result ?? null;
+  }
+
+  /**
+   * All skills sharing a name within an org. Since name uniqueness is now
+   * per-scope (personal names per author, shared names per org), a single
+   * `(org, name)` can resolve to several rows — a caller's personal skill plus
+   * a team/org skill of the same name. Callers filter these by accessibility
+   * and pick one; `findByName` returns an arbitrary row and must not be used
+   * for access-scoped lookup.
+   */
+  static async findAllByName(
+    organizationId: string,
+    name: string,
+  ): Promise<Skill[]> {
+    return await db
+      .select()
+      .from(schema.skillsTable)
+      .where(
+        and(
+          eq(schema.skillsTable.organizationId, organizationId),
+          eq(schema.skillsTable.name, name),
+          notDeleted(schema.skillsTable),
+          enabledSkillPredicate(),
+        ),
+      )
+      .orderBy(desc(schema.skillsTable.createdAt), desc(schema.skillsTable.id));
+  }
+
+  /**
+   * Of `names`, the ones an import by `userId` would collide with: the
+   * importer's own live skills of that name, mirroring
+   * `skills_org_author_name_idx`. Another author's skill of the same name is
+   * no collision. Backs the discover "name exists" hint.
+   */
+  static async findImportNameCollisions(params: {
+    organizationId: string;
+    userId: string;
+    names: string[];
+  }): Promise<Set<string>> {
+    if (params.names.length === 0) return new Set();
+
+    const rows = await db
+      .select({ name: schema.skillsTable.name })
+      .from(schema.skillsTable)
+      .where(
+        and(
+          eq(schema.skillsTable.organizationId, params.organizationId),
+          inArray(schema.skillsTable.name, params.names),
+          // mirrors the unique index, which excludes soft-deleted rows — a
+          // deleted skill's name is free for re-use.
+          notDeleted(schema.skillsTable),
+          eq(schema.skillsTable.authorId, params.userId),
+        ),
+      );
+
+    return new Set(rows.map((row) => row.name));
+  }
+
+  /**
+   * Create a skill, its bundled resource files, and its team assignments in
+   * one transaction.
+   *
+   * Returns `null` when the author already has a live skill of that name
+   * (`skills_org_author_name_idx`). The insert is atomic (`ON CONFLICT DO
+   * NOTHING`), so this is race-free against concurrent creates.
+   * When `environmentIds` are supplied the junction rows are inserted in the
+   * same transaction, so a failed assignment cannot leave a restricted skill
+   * unrestricted. Who can reach the skill is its initial grants alone.
+   */
+  static async createWithFiles(params: {
+    skill: Omit<InsertSkill, "scope">;
+    initialPermissionGrants?: ResourcePermissionGrant[];
+    /** Publish to the whole organization; for system callers only. */
+    publishToOrganization?: boolean;
+    files: Omit<InsertSkillFile, "skillId">[];
+    /** Environments the skill is restricted to; empty/omitted = every environment. */
+    environmentIds?: string[];
+    /**
+     * Git commit the initial bytes came from, stamped on version 1. Passed
+     * only by the GitHub import; see `skill_versions.source_commit`.
+     */
+    versionSourceCommit?: string;
+    tx?: Transaction;
+  }): Promise<Skill | null> {
+    const run = async (tx: Transaction): Promise<Skill | null> => {
+      const [skill] = await tx
+        .insert(schema.skillsTable)
+        .values(
+          await CreatedByModel.forInsert({
+            data: {
+              ...params.skill,
+              latestVersion: 1,
+              // Publication artifacts are derived from the columns written in this
+              // same statement, so a skill is publishable from the moment it exists.
+              ...buildSkillPublicationArtifacts(params.skill),
+            },
+            userIdField: "authorId",
+            transaction: tx,
+          }),
+        )
+        .onConflictDoNothing()
+        .returning();
+
+      if (!skill) return null;
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      await ResourcePermissionPolicyModel.createInitial({
+        tx,
+        organizationId: skill.organizationId,
+        resource: "skill",
+        scope: skill.id,
+        grants: params.initialPermissionGrants,
+        authorId: skill.authorId,
+        publishToOrganization: params.publishToOrganization,
+      });
+      // SPDX-SnippetEnd
+
+      if (params.files.length > 0) {
+        // Digest written with the bytes it covers; the application is the
+        // single digest producer (see `computeFileDigest`).
+        await tx.insert(schema.skillFilesTable).values(
+          params.files.map((file) => ({
+            ...file,
+            skillId: skill.id,
+            digest: computeFileDigest({
+              content: file.content,
+              encoding: file.encoding ?? "utf8",
+            }),
+          })),
+        );
+      }
+
+      if (params.environmentIds && params.environmentIds.length > 0) {
+        await tx.insert(schema.skillEnvironmentsTable).values(
+          params.environmentIds.map((environmentId) => ({
+            skillId: skill.id,
+            environmentId,
+          })),
+        );
+      }
+
+      // every skill starts at immutable version 1.
+      const versionFiles = toVersionFiles(params.files);
+      await SkillVersionModel.insertVersion(tx, {
+        skillId: skill.id,
+        version: 1,
+        content: skill.content,
+        contentHash: SkillVersionModel.computeContentHash({
+          content: skill.content,
+          files: versionFiles,
+        }),
+        files: versionFiles,
+        sourceCommit: params.versionSourceCommit,
+      });
+
+      return skill;
+    };
+    return params.tx ? run(params.tx) : withDbTransaction(run);
+  }
+
+  /**
+   * Update a skill's metadata, resource files, and team assignments atomically.
+   *
+   * Passing `files` replaces the full set; omitting it leaves files untouched.
+   * Passing `teamIds` / `environmentIds` replaces those assignments (an empty
+   * array clears them); omitting them leaves them untouched. Doing the
+   * metadata, file, and junction writes in one transaction means a failed sync
+   * (e.g. a team deleted mid-request) rolls the whole update back, so a scope
+   * change can never be committed with a team set that leaves the skill
+   * orphaned.
+   *
+   * `expectedLatestVersion` anchors the edit to the head it was computed from:
+   * the update is a compare-and-set that throws `ApiError(409)` (rolling back)
+   * if the skill has already moved past it, so a stale snapshot cannot clobber
+   * a concurrent write. It is opt-in per caller: `edit_skill` always passes one
+   * (its schema requires `baseVersion`), the REST update route forwards one only
+   * when the client sends it, and `update_skill` never does — it composes a whole
+   * manifest from its arguments and owes nothing to a prior read.
+   */
+  static async updateWithFiles(params: {
+    id: string;
+    skill: UpdateSkill;
+    files?: Omit<InsertSkillFile, "skillId">[];
+    teamIds?: string[];
+    /** Replaces the environment assignments; [] clears them (every environment). */
+    environmentIds?: string[];
+    expectedLatestVersion?: number;
+    /**
+     * Git commit the new bytes came from, stamped on the forked version and
+     * dropped when the payload is unchanged and nothing forks. Passed only by
+     * the GitHub sync; see `skill_versions.source_commit`.
+     */
+    versionSourceCommit?: string;
+  }): Promise<Skill | null> {
+    return await withDbTransaction(async (tx) => {
+      const [skill] = await tx
+        .update(schema.skillsTable)
+        .set(params.skill)
+        .where(
+          and(
+            eq(schema.skillsTable.id, params.id),
+            notDeleted(schema.skillsTable),
+          ),
+        )
+        .returning();
+
+      if (!skill) return null;
+
+      // The UPDATE above locked the row for this tx, so latestVersion is the
+      // committed head; a mismatch means a concurrent edit forked past the base
+      // this edit was computed from — reject and roll back before forking.
+      if (
+        params.expectedLatestVersion !== undefined &&
+        skill.latestVersion !== params.expectedLatestVersion
+      ) {
+        // Carries an internal code because the update route raises other 409s
+        // (a name collision, a read-only GitHub-synced skill) and a client that
+        // has to offer a reload cannot tell them apart on the status alone.
+        // The message stays client-neutral: it reaches both the REST route and
+        // `edit_skill`, so the caller appends its own way back rather than
+        // being named here.
+        throw new ApiError(
+          409,
+          `Skill "${skill.name}" has moved to version ${skill.latestVersion}; the edit was based on version ${params.expectedLatestVersion}.`,
+          "skill_version_conflict",
+        );
+      }
+
+      if (params.files !== undefined) {
+        await tx
+          .delete(schema.skillFilesTable)
+          .where(eq(schema.skillFilesTable.skillId, params.id));
+
+        if (params.files.length > 0) {
+          // Digest written with the bytes, as on insert above.
+          await tx.insert(schema.skillFilesTable).values(
+            params.files.map((file) => ({
+              ...file,
+              skillId: params.id,
+              digest: computeFileDigest({
+                content: file.content,
+                encoding: file.encoding ?? "utf8",
+              }),
+            })),
+          );
+        }
+      }
+
+      if (params.teamIds !== undefined) {
+        await tx
+          .delete(schema.skillTeamsTable)
+          .where(eq(schema.skillTeamsTable.skillId, params.id));
+
+        if (params.teamIds.length > 0) {
+          await tx
+            .insert(schema.skillTeamsTable)
+            .values(
+              params.teamIds.map((teamId) => ({ skillId: params.id, teamId })),
+            );
+        }
+      }
+
+      if (params.environmentIds !== undefined) {
+        await tx
+          .delete(schema.skillEnvironmentsTable)
+          .where(eq(schema.skillEnvironmentsTable.skillId, params.id));
+
+        if (params.environmentIds.length > 0) {
+          await tx.insert(schema.skillEnvironmentsTable).values(
+            params.environmentIds.map((environmentId) => ({
+              skillId: params.id,
+              environmentId,
+            })),
+          );
+        }
+      }
+
+      // fork an immutable version iff the canonical payload changed. The hash is
+      // computed over the resulting file set (read back here so an omitted
+      // `files` reuses the untouched rows).
+      const currentFiles = await tx
+        .select()
+        .from(schema.skillFilesTable)
+        .where(eq(schema.skillFilesTable.skillId, params.id))
+        .orderBy(asc(schema.skillFilesTable.path));
+      const versionFiles = toVersionFiles(currentFiles);
+      const contentHash = SkillVersionModel.computeContentHash({
+        content: skill.content,
+        files: versionFiles,
+      });
+      const latest = await SkillVersionModel.findBySkillAndVersion(
+        params.id,
+        skill.latestVersion,
+        tx,
+      );
+
+      // Refresh what the gateway publishes from the row this update produced.
+      // Frontmatter lives on the skill, not on the version, so this covers a
+      // frontmatter-only edit that forks nothing — and fills in a legacy row
+      // whose artifacts were never computed. Folded into the version bump when
+      // there is one, so the common path still writes the row once.
+      const artifacts = buildSkillPublicationArtifacts(skill);
+      const artifactsChanged =
+        skill.frontmatterBlob !== artifacts.frontmatterBlob ||
+        skill.digest !== artifacts.digest;
+
+      if (!latest || latest.contentHash !== contentHash) {
+        const nextVersion = skill.latestVersion + 1;
+        await SkillVersionModel.insertVersion(tx, {
+          skillId: params.id,
+          version: nextVersion,
+          content: skill.content,
+          contentHash,
+          files: versionFiles,
+          sourceCommit: params.versionSourceCommit,
+        });
+        const [bumped] = await tx
+          .update(schema.skillsTable)
+          .set({ latestVersion: nextVersion, ...artifacts })
+          .where(eq(schema.skillsTable.id, params.id))
+          .returning();
+        return bumped ?? skill;
+      }
+
+      if (artifactsChanged) {
+        const [refreshed] = await tx
+          .update(schema.skillsTable)
+          .set(artifacts)
+          .where(eq(schema.skillsTable.id, params.id))
+          .returning();
+        return refreshed ?? skill;
+      }
+
+      return skill;
+    });
+  }
+
+  /**
+   * Persist publication artifacts computed by the startup backfill for rows
+   * that predate migration 0407 (its twin reader is
+   * {@link SkillModel.findRowSizesMissingPublicationArtifacts}).
+   *
+   * The `IS NULL` guard keeps the write from clobbering an edit that landed
+   * between the backfill's read and its write, and `updatedAt` is untouched
+   * because filling a derived column is not an edit (raw SQL never fires the
+   * `$onUpdate` stamp the query builder would).
+   */
+  static async fillPublicationArtifacts(
+    rows: Array<{ id: string; frontmatterBlob: string; digest: string }>,
+  ): Promise<void> {
+    for (const chunk of chunkForBulkStatement(rows)) {
+      const values = sql.join(
+        chunk.map(
+          (row) =>
+            sql`(${row.id}::uuid, ${row.frontmatterBlob}::text, ${row.digest}::text)`,
+        ),
+        sql`, `,
+      );
+      await db.execute(sql`
+        UPDATE skills AS s
+        SET frontmatter_blob = v.frontmatter_blob, digest = v.digest
+        FROM (VALUES ${values}) AS v(id, frontmatter_blob, digest)
+        WHERE s.id = v.id
+          AND (s.digest IS NULL OR s.frontmatter_blob IS NULL)
+      `);
+    }
+  }
+
+  /**
+   * GitHub-synced skills whose per-row interval has elapsed since the last
+   * sync (never-synced rows are always due). Backs the `check_due_skill_
+   * github_syncs` worker tick; uses the partial `skills_github_sync_due_idx`.
+   */
+  static async findDueGithubSyncs(): Promise<Skill[]> {
+    return await db
+      .select()
+      .from(schema.skillsTable)
+      .where(
+        and(
+          isNotNull(schema.skillsTable.githubSyncInterval),
+          notDeleted(schema.skillsTable),
+          sql`(${schema.skillsTable.lastSyncedAt} IS NULL OR ${schema.skillsTable.lastSyncedAt} <= now() - CASE ${schema.skillsTable.githubSyncInterval}
+            WHEN '15m' THEN interval '15 minutes'
+            WHEN '1h' THEN interval '1 hour'
+            ELSE interval '1 day'
+          END)`,
+        ),
+      );
+  }
+
+  /**
+   * Synced skills whose scheduled pulls authenticate with this stored PAT.
+   * Deleting the PAT is blocked while this is non-zero. Soft-deleted skills
+   * don't count — they no longer sync, so they must not block credential
+   * deletion (their FK is ON DELETE SET NULL).
+   */
+  static async countSyncedReferencingGithubPat(
+    githubPatId: string,
+  ): Promise<number> {
+    const [result] = await db
+      .select({ count: count() })
+      .from(schema.skillsTable)
+      .where(
+        and(
+          eq(schema.skillsTable.githubPatId, githubPatId),
+          isNotNull(schema.skillsTable.githubSyncInterval),
+          notDeleted(schema.skillsTable),
+        ),
+      );
+    return result?.count ?? 0;
+  }
+
+  /** Same guard for GitHub App configs referenced by synced skills. */
+  static async countSyncedReferencingGithubAppConfig(
+    githubAppConfigId: string,
+  ): Promise<number> {
+    const [result] = await db
+      .select({ count: count() })
+      .from(schema.skillsTable)
+      .where(
+        and(
+          eq(schema.skillsTable.githubAppConfigId, githubAppConfigId),
+          isNotNull(schema.skillsTable.githubSyncInterval),
+          notDeleted(schema.skillsTable),
+        ),
+      );
+    return result?.count ?? 0;
+  }
+
+  /**
+   * Stamp the outcome of a sync attempt: `lastSyncedAt` = now, `lastSyncError`
+   * set (failure) or cleared (success). `updatedAt` is preserved — the stamp
+   * itself is bookkeeping, not an edit; a content change goes through
+   * `updateWithFiles` and bumps `updatedAt` there.
+   */
+  static async markGithubSyncResult(
+    id: string,
+    error: string | null,
+  ): Promise<void> {
+    await db
+      .update(schema.skillsTable)
+      .set({
+        lastSyncedAt: new Date(),
+        lastSyncError: error,
+        updatedAt: sql`${schema.skillsTable.updatedAt}`,
+      })
+      .where(
+        and(eq(schema.skillsTable.id, id), notDeleted(schema.skillsTable)),
+      );
+  }
+
+  /**
+   * Change a synced skill's pull frequency, or disconnect it (`sync: null`):
+   * clears the schedule, tracking ref, App config, and last error, leaving the
+   * skill an editable snapshot with its `github` provenance intact.
+   */
+  static async setGithubSync(
+    id: string,
+    sync: { interval: SkillGithubSyncInterval } | null,
+  ): Promise<Skill | null> {
+    const [updated] = await db
+      .update(schema.skillsTable)
+      .set(
+        sync
+          ? { githubSyncInterval: sync.interval }
+          : {
+              githubSyncInterval: null,
+              githubSyncRef: null,
+              githubAppConfigId: null,
+              githubPatId: null,
+              gitlabTokenId: null,
+              lastSyncError: null,
+            },
+      )
+      .where(and(eq(schema.skillsTable.id, id), notDeleted(schema.skillsTable)))
+      .returning();
+    return updated ?? null;
+  }
+
+  /**
+   * Point a synced skill at another repository, branch, folder, or credential.
+   * The caller has already fetched the skill from there, so the pull it stands
+   * for has just succeeded.
+   */
+  static async setGitSource(
+    id: string,
+    source: {
+      sourceOrigin: string | null;
+      sourceProvider: GitProvider;
+      githubSyncRef: string | null;
+      githubSyncInterval: SkillGithubSyncInterval;
+      githubAppConfigId: string | null;
+      githubPatId: string | null;
+      gitlabTokenId: string | null;
+    },
+  ): Promise<Skill | null> {
+    const [updated] = await db
+      .update(schema.skillsTable)
+      .set({ ...source, lastSyncedAt: new Date(), lastSyncError: null })
+      .where(and(eq(schema.skillsTable.id, id), notDeleted(schema.skillsTable)))
+      .returning();
+    return updated ?? null;
+  }
+
+  /**
+   * Count one activation: bump `usageCount`, stamp `lastUsedAt`, and append a
+   * `skill_usage_events` row attributing the activation to `userId` (which
+   * backs per-user usage analytics). `updatedAt` is explicitly preserved — a
+   * usage tick is not an edit. Fire-and-forget: never throws and needs no
+   * awaiting (metrics must not fail or slow an activation); the writes are
+   * registered as background work so the test teardown can drain them, and
+   * they are independent so an event failure never loses the counter tick.
+   *
+   * `sessionId` and `contextTokens` are what make an activation costable — the
+   * session whose following turns carried the skill, and the tokens the injected
+   * block itself added. Both are optional: a caller that cannot supply them
+   * records an activation with no cost dimension rather than none at all.
+   */
+  static recordUsage(params: {
+    skillId: string;
+    userId: string | null;
+    /** LLM session the activation happened in (`interactions.session_id`). */
+    sessionId?: string | null;
+    /** Measured tokens of the injected activation block. */
+    contextTokens?: number | null;
+  }): void {
+    const { skillId, userId, sessionId, contextTokens } = params;
+    const usedAt = new Date();
+    const counterWrite = db
+      .update(schema.skillsTable)
+      .set({
+        usageCount: sql`${schema.skillsTable.usageCount} + 1`,
+        lastUsedAt: usedAt,
+        updatedAt: sql`${schema.skillsTable.updatedAt}`,
+      })
+      .where(
+        and(eq(schema.skillsTable.id, skillId), notDeleted(schema.skillsTable)),
+      );
+    const eventWrite = db.insert(schema.skillUsageEventsTable).values({
+      skillId,
+      userId,
+      sessionId: sessionId ?? null,
+      contextTokens: contextTokens ?? null,
+      createdAt: usedAt,
+    });
+    trackBackgroundWork(
+      Promise.allSettled([counterWrite, eventWrite]).then((results) => {
+        for (const result of results) {
+          if (result.status === "rejected") {
+            logger.warn(
+              { error: result.reason, skillId },
+              "[Skills] Failed to record usage",
+            );
+          }
+        }
+      }),
+    );
+  }
+
+  /**
+   * Soft-delete a skill (frees its name for re-use via the partial unique
+   * indexes). Files, versions, and visibility grants are kept for restore, but
+   * agent and gateway bindings are removed: restoring a skill must not silently
+   * republish or re-enable it anywhere.
+   */
+  static async delete(id: string): Promise<boolean> {
+    return (await SkillModel.deleteMany([id])) > 0;
+  }
+
+  /**
+   * Soft-delete a batch of skills in one statement. Returns how many rows
+   * transitioned from active to deleted, so an id already deleted by a
+   * concurrent request is not double-counted.
+   */
+  static async deleteMany(ids: string[]): Promise<number> {
+    if (ids.length === 0) return 0;
+    const uniqueIds = [...new Set(ids)];
+    return await withDbTransaction(async (tx) => {
+      const count = await softDelete(
+        tx,
+        schema.skillsTable,
+        inArray(schema.skillsTable.id, uniqueIds),
+      );
+      if (count === 0) return 0;
+
+      await SkillModel.removeAgentBindings(uniqueIds, tx);
+      return count;
+    });
+  }
+
+  /**
+   * Soft-delete every skill a user authored that its grants give to nobody
+   * else, ahead of deleting the user. `skills.author_id` is `ON DELETE SET
+   * NULL`, so without this those skills would survive as active orphans that
+   * nobody can reach. A skill the author shared by grant (with a person, a
+   * team, a role or the organization) survives: its recipients still use it.
+   * Soft rather than hard so no cascade FK can make it fail: a user who asked
+   * to be removed must still be removed, and an admin can purge the rows
+   * later.
+   */
+  static async deletePersonalSkillsForUser(
+    userId: string,
+    tx?: Transaction,
+  ): Promise<number> {
+    const table = schema.skillsTable;
+    return await softDelete(
+      tx ?? db,
+      table,
+      and(
+        eq(table.authorId, userId),
+        ResourcePermissionPolicyModel.reachesOnlyOwner({
+          organizationId: table.organizationId,
+          resource: "skill",
+          scopeColumn: table.id,
+          ownerColumn: table.authorId,
+        }),
+      ),
+    );
+  }
+
+  /**
+   * Restore a soft-deleted skill by clearing `deletedAt`. A pure un-delete:
+   * no other column is touched. The GitHub sync config and credentials are
+   * left as-is — if the skill's credential was nulled (FK `ON DELETE SET
+   * NULL`) while it was deleted, the sync handler simply falls back to an
+   * unauthenticated (public) pull and, for a now-private repo, records a
+   * `lastSyncError` without crashing. Returns whether a soft-deleted row
+   * transitioned back to active.
+   */
+  static async restore(id: string, tx?: Transaction): Promise<boolean> {
+    const count = await restore(
+      tx ?? db,
+      schema.skillsTable,
+      eq(schema.skillsTable.id, id),
+    );
+    return count > 0;
+  }
+
+  /**
+   * Permanently destroy a soft-deleted skill: every version (and, by cascade,
+   * every version file), then the skill row itself — which cascades its files,
+   * team/user grants, environment assignments, usage events, share links, and
+   * connection-setup links. Irreversible.
+   *
+   * Versions must go FIRST and explicitly. `skill_versions.skill_id` is
+   * `ON DELETE SET NULL`, so deleting the skill alone would silently ORPHAN the
+   * version rows and their file contents — leaving the skill's actual bytes
+   * behind, unreachable and undeletable, which is the opposite of what a purge
+   * is for.
+   *
+   * That delete can fail: `skill_sandbox_skill_mounts.skill_version_id` is
+   * `ON DELETE RESTRICT`, so a sandbox still holding this skill blocks it. The
+   * violation is deliberately NOT caught here — an aborted Postgres transaction
+   * cannot be continued from the inside, so the caller catches it outside this
+   * transaction and answers 409.
+   *
+   * Returns false if there was no soft-deleted row to take, which is how a
+   * restore that won the race reports itself.
+   */
+  static async purge(params: {
+    id: string;
+    organizationId: string;
+  }): Promise<boolean> {
+    return withDbTransaction(async (tx) => {
+      // The row lock is the race guard: a concurrent restore either commits
+      // first (leaving no soft-deleted row for us to find) or blocks until this
+      // transaction commits and then finds no row at all.
+      const [locked] = await tx
+        .select({ id: schema.skillsTable.id })
+        .from(schema.skillsTable)
+        .where(
+          and(
+            eq(schema.skillsTable.id, params.id),
+            eq(schema.skillsTable.organizationId, params.organizationId),
+            isNotNull(schema.skillsTable.deletedAt),
+          ),
+        )
+        .for("update")
+        .limit(1);
+      if (!locked) return false;
+
+      await tx
+        .delete(schema.skillVersionsTable)
+        .where(eq(schema.skillVersionsTable.skillId, params.id));
+      await hardDelete(
+        tx,
+        schema.skillsTable,
+        eq(schema.skillsTable.id, params.id),
+      );
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      await ResourcePermissionPolicyModel.deleteForTarget({
+        tx,
+        resources: ["skill"],
+        scope: params.id,
+      });
+      // SPDX-SnippetEnd
+      return true;
+    });
+  }
+
+  /**
+   * The soft-deleted row scoped to its org — the restore route's lookup, used
+   * to authorize and conflict-check before un-deleting. `findById`/`findByIds`
+   * filter deleted rows, so they cannot serve this path.
+   */
+  static async findDeletedById(
+    id: string,
+    organizationId: string,
+  ): Promise<Skill | null> {
+    const [row] = await db
+      .select()
+      .from(schema.skillsTable)
+      .where(
+        and(
+          eq(schema.skillsTable.id, id),
+          eq(schema.skillsTable.organizationId, organizationId),
+          isNotNull(schema.skillsTable.deletedAt),
+        ),
+      )
+      .limit(1);
+    return row ?? null;
+  }
+
+  /**
+   * Whether restoring `skill` would collide with an active skill of the same
+   * name and author (`skills_org_author_name_idx`). Returns a 409 message, or
+   * null when clear. Advisory only: the unique index is the real guard, so the
+   * restore route also maps its violation to a 409 in case a create races
+   * this check.
+   */
+  static async getRestoreConflictMessage(skill: Skill): Promise<string | null> {
+    const owner = skill.authorId ?? skill.createdByServiceAccountId;
+    // The index leaves a skill with no author and no service account
+    // unconstrained, so such a row can never collide.
+    if (!owner) return null;
+    const [conflict] = await db
+      .select({ id: schema.skillsTable.id })
+      .from(schema.skillsTable)
+      .where(
+        and(
+          eq(schema.skillsTable.organizationId, skill.organizationId),
+          sql`${skillNameOwnerKey()} = ${owner}`,
+          eq(schema.skillsTable.name, skill.name),
+          ne(schema.skillsTable.id, skill.id),
+          notDeleted(schema.skillsTable),
+        ),
+      )
+      .limit(1);
+    return conflict
+      ? `Cannot restore: a skill named "${skill.name}" by the same author already exists.`
+      : null;
+  }
+
+  /**
+   * Identity of a skill for the audit trail, and nothing else. The
+   * permanent-delete route uses this rather than {@link findByIdForAudit}: a
+   * purge is audited by identity only, never by keeping a copy of the content
+   * it destroyed. Includes soft-deleted rows — the purge target is always one.
+   */
+  static async findIdentityForAudit(
+    id: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [row] = await db
+      .select({
+        id: schema.skillsTable.id,
+        name: schema.skillsTable.name,
+      })
+      .from(schema.skillsTable)
+      .where(
+        and(
+          eq(schema.skillsTable.id, id),
+          eq(schema.skillsTable.organizationId, organizationId),
+        ),
+      )
+      .limit(1);
+    return row ?? null;
+  }
+
+  /**
+   * Audit lookup for the bulk routes: the visibility-relevant columns of
+   * several skills at once, scoped to an org and including soft-deleted rows —
+   * a bulk delete's "after" side has to name the skills it just removed.
+   *
+   * Sorted by id so two reads of an unchanged batch produce an identical
+   * snapshot and the audit diff stays empty; row order from the DB is
+   * unspecified.
+   */
+  static async findVisibilityForAudit(params: {
+    ids: string[];
+    organizationId: string;
+  }): Promise<
+    Array<{
+      id: string;
+      name: string;
+      scope: ResourceVisibilityScope;
+      deleted: boolean;
+    }>
+  > {
+    if (params.ids.length === 0) return [];
+    const rows = await db
+      .select({
+        id: schema.skillsTable.id,
+        name: schema.skillsTable.name,
+        scope: schema.skillsTable.scope,
+        deletedAt: schema.skillsTable.deletedAt,
+      })
+      .from(schema.skillsTable)
+      .where(
+        and(
+          inArray(schema.skillsTable.id, params.ids),
+          eq(schema.skillsTable.organizationId, params.organizationId),
+        ),
+      )
+      .orderBy(asc(schema.skillsTable.id));
+    return rows.map(({ deletedAt, ...row }) => ({
+      ...row,
+      deleted: deletedAt !== null,
+    }));
+  }
+
+  /** Audit lookup: the raw row scoped to an org, including soft-deleted. */
+  static async findByIdForAudit(
+    id: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [row] = await db
+      .select()
+      .from(schema.skillsTable)
+      .where(
+        and(
+          eq(schema.skillsTable.id, id),
+          eq(schema.skillsTable.organizationId, organizationId),
+        ),
+      )
+      .limit(1);
+    if (!row) return null;
+
+    // environment assignments live in a junction table; include them (sorted
+    // for a stable diff) so an environment change shows up in the audit record.
+    const environmentIds = await db
+      .select({
+        environmentId: schema.skillEnvironmentsTable.environmentId,
+      })
+      .from(schema.skillEnvironmentsTable)
+      .where(eq(schema.skillEnvironmentsTable.skillId, id));
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    return {
+      ...row,
+      environmentIds: environmentIds.map((r) => r.environmentId).sort(),
+      resourcePermissions:
+        (
+          await ResourcePermissionPolicyModel.find({
+            organizationId,
+            resource: "skill",
+            scope: id,
+          })
+        )?.grants ?? [],
+    };
+    // SPDX-SnippetEnd
+  }
+
+  private static async removeAgentBindings(
+    skillIds: string[],
+    tx: Transaction,
+  ): Promise<void> {
+    const affectedPolicyAgents = await tx
+      .selectDistinct({
+        agentId: schema.agentActivationSkillRulesTable.agentId,
+      })
+      .from(schema.agentActivationSkillRulesTable)
+      .where(
+        and(
+          eq(schema.agentActivationSkillRulesTable.source, "native"),
+          inArray(schema.agentActivationSkillRulesTable.skillId, skillIds),
+        ),
+      );
+
+    await tx
+      .delete(schema.agentSkillsTable)
+      .where(inArray(schema.agentSkillsTable.skillId, skillIds));
+    await tx
+      .delete(schema.agentExcludedSkillsTable)
+      .where(inArray(schema.agentExcludedSkillsTable.skillId, skillIds));
+    await tx
+      .delete(schema.agentActivationSkillRulesTable)
+      .where(
+        and(
+          eq(schema.agentActivationSkillRulesTable.source, "native"),
+          inArray(schema.agentActivationSkillRulesTable.skillId, skillIds),
+        ),
+      );
+
+    const affectedAgentIds = affectedPolicyAgents.map(({ agentId }) => agentId);
+    if (affectedAgentIds.length > 0) {
+      await tx
+        .update(schema.agentsTable)
+        .set({
+          activationSkillPolicyRevision: sql`${schema.agentsTable.activationSkillPolicyRevision} + 1`,
+        })
+        .where(inArray(schema.agentsTable.id, affectedAgentIds));
+    }
+  }
+}
+
+/**
+ * Excludes the skills an agent has taken off its Auto-mode surface.
+ *
+ * A semi-join rather than the id list the by-key path probes with, for the same
+ * reason the file-path gate is one: it has to compose with the paging `LIMIT`,
+ * and an exclusion set an admin can grow without bound must not be materialized
+ * to cut a fifty-row window.
+ */
+function notExcludedByAgentPredicate(agentId: string): SQL {
+  return sql`NOT EXISTS (
+    SELECT 1
+    FROM ${schema.agentExcludedSkillsTable}
+    WHERE ${schema.agentExcludedSkillsTable.skillId} = ${schema.skillsTable.id}
+      AND ${schema.agentExcludedSkillsTable.agentId} = ${agentId}
+  )`;
+}
+
+/** Normalize a resource file set into the shape a version snapshot stores. */
+function toVersionFiles(
+  files: {
+    path: string;
+    content: string;
+    encoding?: SkillFileEncoding;
+    kind: SkillFileKind;
+  }[],
+): VersionFileInput[] {
+  return files.map((file) => ({
+    path: file.path,
+    content: file.content,
+    encoding: file.encoding ?? "utf8",
+    kind: file.kind,
+  }));
+}
+
+/**
+ * Order clause for the skills list. Defaults to most-used first;
+ * `createdAt desc` breaks ties so never-used skills list newest-first.
+ */
+function buildOrderBy(sorting?: {
+  sortBy?: SkillSortBy;
+  sortDirection?: SortDirection;
+}) {
+  const direction = sorting?.sortDirection === "asc" ? asc : desc;
+  const column = {
+    usageCount: schema.skillsTable.usageCount,
+    // never-used skills sort as oldest (asc first / desc last), instead of
+    // Postgres's default NULLS FIRST on desc.
+    lastUsedAt: sql`COALESCE(${schema.skillsTable.lastUsedAt}, '-infinity'::timestamp)`,
+    name: schema.skillsTable.name,
+    createdAt: schema.skillsTable.createdAt,
+  }[sorting?.sortBy ?? "usageCount"];
+  // `id` closes the ordering: rows created in one transaction share a
+  // `createdAt` (Postgres `now()` is transaction time), so without it a page
+  // boundary — or the marketplace's skill cap — could fall differently on
+  // each query for the same data.
+  return [
+    direction(column),
+    desc(schema.skillsTable.createdAt),
+    asc(schema.skillsTable.id),
+  ];
+}
+
+function buildOrgFilters(params: {
+  organizationId: string;
+  search?: string;
+  sourceRepo?: string;
+  accessibleSkillIds?: string[];
+  excludedSkillIds?: string[];
+  publishableOverMcp?: boolean;
+  environmentId?: string | null;
+  publishedToOrganization?: boolean;
+  scope?: ResourceVisibilityScope;
+  teamIds?: string[];
+  authorIds?: string[];
+  excludeAuthorIds?: string[];
+  excludeOtherPersonalForUserId?: string;
+  status?: SkillRecordStatus;
+  /**
+   * Skill ids matching the caller's `?labels=` filter, resolved once by the
+   * route so the list and count queries agree without resolving twice.
+   */
+  labelFilteredIds?: string[];
+  access?: ResourceAccessFilter;
+}) {
+  const normalizedSearch = params.search?.trim();
+  const normalizedSourceRepo = params.sourceRepo?.trim();
+  const sourceRepo = parseSourceRepoFilter(normalizedSourceRepo);
+  return [
+    eq(schema.skillsTable.organizationId, params.organizationId),
+    // Only the org list/count methods pass `status`; every other caller
+    // (source-repo scan, name lookups, etc.) omits it and stays active-only.
+    getSkillStatusCondition(params.status ?? "active"),
+    enabledSkillPredicate(),
+    ...(params.accessibleSkillIds !== undefined
+      ? [inArray(schema.skillsTable.id, params.accessibleSkillIds)]
+      : []),
+    ...(params.excludedSkillIds?.length
+      ? [notInArray(schema.skillsTable.id, params.excludedSkillIds)]
+      : []),
+    ...(params.publishableOverMcp ? [publishableSkillPredicate()] : []),
+    ...(params.labelFilteredIds !== undefined
+      ? [inArray(schema.skillsTable.id, params.labelFilteredIds)]
+      : []),
+    ...(params.environmentId !== undefined
+      ? [skillInEnvironmentPredicate(params.environmentId)]
+      : []),
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    ...(params.publishedToOrganization
+      ? [
+          ResourcePermissionPolicyModel.organizationAccessCondition({
+            organizationId: params.organizationId,
+            resource: "skill",
+            scopeColumn: schema.skillsTable.id,
+            action: "use",
+          }),
+        ]
+      : []),
+    ...(params.access
+      ? [
+          ResourcePermissionPolicyModel.accessRelationCondition({
+            ...params.access,
+            organizationId: schema.skillsTable.organizationId,
+            resource: "skill",
+            scopeColumn: schema.skillsTable.id,
+            ownerColumn: schema.skillsTable.authorId,
+          }),
+        ]
+      : []),
+    // SPDX-SnippetEnd
+    // The audience and team filters read each skill's grants, not the
+    // retired scope column and team rows.
+    ...(params.scope
+      ? [
+          ResourcePermissionPolicyModel.audienceIs({
+            organizationId: schema.skillsTable.organizationId,
+            resource: "skill",
+            scopeColumn: schema.skillsTable.id,
+            ownerColumn: schema.skillsTable.authorId,
+            audience: params.scope,
+          }),
+        ]
+      : []),
+    ...(params.teamIds?.length
+      ? [
+          ResourcePermissionPolicyModel.grantsReadToAnyTeam({
+            organizationId: schema.skillsTable.organizationId,
+            resource: "skill",
+            scopeColumn: schema.skillsTable.id,
+            teamIds: params.teamIds,
+          }),
+        ]
+      : []),
+    ...(params.authorIds?.length
+      ? [inArray(schema.skillsTable.authorId, params.authorIds)]
+      : []),
+    ...(params.excludeAuthorIds?.length
+      ? [
+          or(
+            isNull(schema.skillsTable.authorId),
+            notInArray(schema.skillsTable.authorId, params.excludeAuthorIds),
+          ),
+        ]
+      : []),
+    // Hide other people's author-only skills: those whose grants reach
+    // nobody but their author. A shared skill and a built-in (no author) stay.
+    ...(params.excludeOtherPersonalForUserId
+      ? [
+          or(
+            isNull(schema.skillsTable.authorId),
+            eq(
+              schema.skillsTable.authorId,
+              params.excludeOtherPersonalForUserId,
+            ),
+            not(
+              ResourcePermissionPolicyModel.reachesOnlyOwner({
+                organizationId: schema.skillsTable.organizationId,
+                resource: "skill",
+                scopeColumn: schema.skillsTable.id,
+                ownerColumn: schema.skillsTable.authorId,
+              }),
+            ),
+          ),
+        ]
+      : []),
+    ...(normalizedSearch
+      ? [
+          or(
+            ilike(schema.skillsTable.name, `%${normalizedSearch}%`),
+            ilike(schema.skillsTable.description, `%${normalizedSearch}%`),
+          ),
+        ]
+      : []),
+    ...(normalizedSourceRepo
+      ? [
+          like(schema.skillsTable.sourceRef, `${sourceRepo.repo}@%`),
+          sourceRepo.origin
+            ? eq(schema.skillsTable.sourceOrigin, sourceRepo.origin)
+            : isNull(schema.skillsTable.sourceOrigin),
+          // Without an origin, the provider tells github.com from gitlab.com.
+          ...(sourceRepo.origin
+            ? []
+            : [
+                sourceRepo.provider === "gitlab"
+                  ? eq(schema.skillsTable.sourceProvider, "gitlab")
+                  : or(
+                      isNull(schema.skillsTable.sourceProvider),
+                      eq(schema.skillsTable.sourceProvider, "github"),
+                    ),
+              ]),
+        ]
+      : []),
+  ];
+}
+
+/**
+ * A repository filter as `findDistinctSourceRepos` lists it. github.com and
+ * gitlab.com are stored without an origin, so the provider tells them apart.
+ */
+function parseSourceRepoFilter(value: string | undefined): {
+  repo: string;
+  origin: string | null;
+  provider: GitProvider;
+} {
+  if (value && /^https?:\/\//i.test(value)) {
+    try {
+      const url = new URL(value);
+      const repo = url.pathname.replace(/^\/+|\/+$/g, "");
+      if (url.origin === DEFAULT_GIT_WEB_URLS.github)
+        return { repo, origin: null, provider: "github" };
+      if (url.origin === DEFAULT_GIT_WEB_URLS.gitlab)
+        return { repo, origin: null, provider: "gitlab" };
+      return { repo, origin: url.origin, provider: "github" };
+    } catch {
+      // An invalid filter simply matches no stored repository.
+    }
+  }
+  return { repo: value ?? "", origin: null, provider: "github" };
+}
+
+type SkillRecordStatus = "active" | "deleted";
+
+/** Active rows vs the soft-deleted trash, for the list `status` filter. */
+function getSkillStatusCondition(status: SkillRecordStatus): SQL {
+  return status === "deleted"
+    ? isNotNull(schema.skillsTable.deletedAt)
+    : notDeleted(schema.skillsTable);
+}
+
+export default SkillModel;
+
+/** How many skills a bare `skill://` URI may match before the list is cut. */
+export const MAX_URI_MATCHES = 20;
+
+/**
+ * Narrows a skill query to what one caller can read: a user through the
+ * grants, a caller with no user through what is published to the whole
+ * organization. Undefined (no narrowing) when no caller is given.
+ */
+export async function skillReadablePredicate(params: {
+  organizationId: string;
+  readableBy?: { userId: string | null };
+}): Promise<SQL | undefined> {
+  if (!params.readableBy) return undefined;
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  return params.readableBy.userId === null
+    ? ResourcePermissionPolicyModel.organizationAccessCondition({
+        organizationId: params.organizationId,
+        resource: "skill",
+        scopeColumn: schema.skillsTable.id,
+        action: "read",
+      })
+    : ResourcePermissionPolicyModel.grantCondition({
+        ...(await ResourcePermissionSubjectModel.resolvePrincipal({
+          organizationId: params.organizationId,
+          userId: params.readableBy.userId,
+        })),
+        resource: "skill",
+        action: "read",
+        scopeColumn: schema.skillsTable.id,
+      });
+  // SPDX-SnippetEnd
+}
+
+/**
+ * The key that makes a skill name unique within an organization: the author,
+ * or the service account for a skill a service account wrote. Null for a
+ * skill with neither (a built-in, or one whose author was deleted), which the
+ * unique index leaves unconstrained.
+ */
+function skillNameOwnerKey(): SQL {
+  return sql`coalesce(${schema.skillsTable.authorId}, ${schema.skillsTable.createdByServiceAccountId}::text)`;
+}

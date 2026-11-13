@@ -1,11 +1,10 @@
-import type { SupportedProvider } from "@shared";
-import {
-  isAnthropicAzureFoundryEntraIdEnabled,
-  isAzureOpenAiEntraIdEnabled,
-} from "@/clients/azure-openai-credentials";
-import { isAzureAiFoundryBaseUrl } from "@/clients/azure-url";
+import type { SupportedProvider } from "@archestra/shared";
+import { isAnthropicKeylessAuthEnabled } from "@/clients/anthropic-keyless-auth";
+import { anthropicVertexClient } from "@/clients/anthropic-vertex";
+import { anthropicWorkloadIdentity } from "@/clients/anthropic-workload-identity";
+import { isAzureOpenAiEntraIdEnabled } from "@/clients/azure-openai-credentials";
 import { isBedrockIamAuthEnabled } from "@/clients/bedrock-credentials";
-import { isVertexAiEnabled } from "@/clients/gemini-client";
+import { isVertexAiEnabled } from "@/clients/gemini-vertex-ai";
 import { modelsDevClient } from "@/clients/models-dev-client";
 import config from "@/config";
 import logger from "@/logging";
@@ -14,12 +13,29 @@ import {
   LlmProviderApiKeyModelLinkModel,
   ModelModel,
 } from "@/models";
-import { fetchAnthropicModels } from "@/routes/chat/model-fetchers/anthropic";
+import {
+  fetchAnthropicModels,
+  fetchAnthropicModelsViaVertexAi,
+} from "@/routes/chat/model-fetchers/anthropic";
 import { fetchAzureModels } from "@/routes/chat/model-fetchers/azure";
 import { fetchBedrockModelsViaIam } from "@/routes/chat/model-fetchers/bedrock";
 import { fetchGeminiModelsViaVertexAi } from "@/routes/chat/model-fetchers/gemini";
+import type { FetchedModelCapabilities } from "@/routes/chat/model-fetchers/types";
 import { buildModelsToUpsert } from "@/services/model-sync";
 import type { CreateModel } from "@/types";
+
+/**
+ * A keyless provider's model list. `capabilities` is preserved (not stripped to
+ * `{ id, displayName }`) so authoritative facts like an embedding model's
+ * dimension survive the sync — e.g. Bedrock Titan embedding models.
+ */
+type CustomModelFetch = () => Promise<
+  Array<{
+    id: string;
+    displayName: string;
+    capabilities?: FetchedModelCapabilities;
+  }>
+>;
 
 /**
  * Configuration for a keyless provider that uses system API keys.
@@ -29,7 +45,7 @@ interface KeylessProviderConfig {
   name: string;
   isEnabled: () => boolean;
   /** Custom fetch function for providers that need special handling (e.g., Vertex AI) */
-  customFetch: () => Promise<Array<{ id: string; displayName: string }>>;
+  customFetch: CustomModelFetch;
 }
 
 /**
@@ -49,7 +65,7 @@ class SystemKeyManager {
   private readonly keylessProviders: KeylessProviderConfig[] = [
     {
       provider: "gemini",
-      name: "Vertex AI",
+      name: "Vertex AI (Gemini)",
       isEnabled: () => isVertexAiEnabled(),
       customFetch: async () => {
         const models = await fetchGeminiModelsViaVertexAi();
@@ -67,16 +83,24 @@ class SystemKeyManager {
       },
     },
     {
+      // One entry covers every keyless Anthropic auth method: system keys are
+      // looked up per provider, so separate entries would delete each other.
       provider: "anthropic",
-      name: "Anthropic Azure Foundry Entra ID",
-      isEnabled: () =>
-        isAnthropicAzureFoundryEntraIdEnabled() &&
-        isAzureAiFoundryBaseUrl(config.llm.anthropic.baseUrl),
+      // Lazy so the created key's name reflects whichever method is actually
+      // active at sync time, not the value captured at class construction.
+      get name() {
+        if (anthropicVertexClient.isEnabled()) {
+          return "Vertex AI (Anthropic)";
+        }
+        return anthropicWorkloadIdentity.isEnabled()
+          ? "Anthropic Workload Identity Federation"
+          : "Anthropic Azure Foundry Entra ID";
+      },
+      isEnabled: () => isAnthropicKeylessAuthEnabled(),
       customFetch: async () => {
-        const models = await fetchAnthropicModels(
-          "",
-          config.llm.anthropic.baseUrl,
-        );
+        const models = anthropicVertexClient.isEnabled()
+          ? await fetchAnthropicModelsViaVertexAi()
+          : await fetchAnthropicModels("", config.llm.anthropic.baseUrl);
         return models.map((m) => ({ id: m.id, displayName: m.displayName }));
       },
     },
@@ -86,7 +110,13 @@ class SystemKeyManager {
       isEnabled: () => isBedrockIamAuthEnabled(),
       customFetch: async () => {
         const models = await fetchBedrockModelsViaIam();
-        return models.map((m) => ({ id: m.id, displayName: m.displayName }));
+        // Preserve capabilities so Titan embedding models keep their dimension
+        // (which marks them as embedding models) through the sync.
+        return models.map((m) => ({
+          id: m.id,
+          displayName: m.displayName,
+          capabilities: m.capabilities,
+        }));
       },
     },
   ];
@@ -97,13 +127,15 @@ class SystemKeyManager {
    *
    * @param organizationId - The organization to create system keys for
    */
-  async syncSystemKeys(organizationId: string): Promise<void> {
-    logger.info({ organizationId }, "Starting system API keys sync");
+  async syncSystemKeys(organizationId: string): Promise<SupportedProvider[]> {
+    const failedProviders: SupportedProvider[] = [];
+    logger.debug({ organizationId }, "Starting system API keys sync");
 
     for (const providerConfig of this.keylessProviders) {
       try {
         await this.syncProviderSystemKey(organizationId, providerConfig);
       } catch (error) {
+        failedProviders.push(providerConfig.provider);
         logger.error(
           {
             provider: providerConfig.provider,
@@ -116,7 +148,8 @@ class SystemKeyManager {
       }
     }
 
-    logger.info({ organizationId }, "Completed system API keys sync");
+    logger.debug({ organizationId }, "Completed system API keys sync");
+    return failedProviders;
   }
 
   /**
@@ -133,7 +166,13 @@ class SystemKeyManager {
 
     if (enabled) {
       if (existingKey) {
-        // Key exists, sync models
+        // Keep auto-managed labels current when naming becomes more specific or
+        // when an Anthropic deployment changes its keyless auth method.
+        if (existingKey.name !== name) {
+          await LlmProviderApiKeyModel.update(existingKey.id, { name });
+        }
+
+        // Sync models after reconciling the system-managed metadata.
         logger.debug(
           { provider, apiKeyId: existingKey.id },
           "System key exists, syncing models",
@@ -172,7 +211,7 @@ class SystemKeyManager {
   private async syncModelsForSystemKey(
     apiKeyId: string,
     provider: SupportedProvider,
-    customFetch: () => Promise<Array<{ id: string; displayName: string }>>,
+    customFetch: CustomModelFetch,
   ): Promise<void> {
     try {
       await this.syncModelsWithCustomFetch(apiKeyId, provider, customFetch);
@@ -185,6 +224,7 @@ class SystemKeyManager {
         },
         "Failed to sync models for system key",
       );
+      throw error;
     }
   }
 
@@ -194,7 +234,7 @@ class SystemKeyManager {
   private async syncModelsWithCustomFetch(
     apiKeyId: string,
     provider: SupportedProvider,
-    customFetch: () => Promise<Array<{ id: string; displayName: string }>>,
+    customFetch: CustomModelFetch,
   ): Promise<void> {
     const models = await customFetch();
 
@@ -224,14 +264,16 @@ class SystemKeyManager {
       modelsDevData,
     });
 
-    const upsertedModels = await ModelModel.bulkUpsert(modelsToUpsert);
+    const upsertedModels = await ModelModel.bulkUpsert(modelsToUpsert, {
+      fromProviderCatalog: true,
+    });
 
     logger.info(
       { provider, apiKeyId, upsertedCount: upsertedModels.length },
       "Upserted models to database",
     );
 
-    // Link models to the API key with fastest/best detection
+    // Link models to the API key with best-model detection
     const modelsWithIds = upsertedModels.map((m) => ({
       id: m.id,
       modelId: m.modelId,

@@ -1,0 +1,159 @@
+import Fastify, { type FastifyInstance } from "fastify";
+import {
+  serializerCompiler,
+  validatorCompiler,
+  type ZodTypeProvider,
+} from "fastify-type-provider-zod";
+import { vi } from "vitest";
+import { auth as betterAuth } from "@/auth/better-auth";
+import { InternalMcpCatalogModel } from "@/models";
+import {
+  accessGrants,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  type TestAccess,
+  test,
+} from "@/test";
+import { ApiError, type User } from "@/types";
+import internalMcpCatalogRoutes from "./internal-mcp-catalog";
+
+// hasPermission is mocked success so any incidental check passes; the catalog
+// scope gate uses getPermissionsForUserContext (the REAL member role), so this
+// verifies the handler restricts a member to their own personal items even with
+// the route-level `mcpRegistry:update` grant.
+
+describe("member catalog update is limited to own personal items", () => {
+  let app: FastifyInstance;
+  let organizationId: string;
+  let member: User;
+
+  beforeEach(async ({ makeMember, makeOrganization, makeUser }) => {
+    vi.clearAllMocks();
+    vi.spyOn(betterAuth.api, "getSession").mockImplementation(
+      async () => ({ user: { id: member.id } }) as never,
+    );
+
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    member = await makeUser();
+    await makeMember(member.id, organization.id, { role: "member" });
+
+    app = Fastify().withTypeProvider<ZodTypeProvider>();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    app.setErrorHandler((error, _request, reply) => {
+      if (error instanceof ApiError) {
+        return reply.status(error.statusCode).send({
+          error: { message: error.message, type: error.type },
+        });
+      }
+      const err = error as Error & { statusCode?: number };
+      return reply.status(err.statusCode ?? 500).send({
+        error: { message: err.message },
+      });
+    });
+    app.addHook("onRequest", async (request) => {
+      (
+        request as typeof request & { user: User; organizationId: string }
+      ).user = member;
+      (
+        request as typeof request & { user: User; organizationId: string }
+      ).organizationId = organization.id;
+    });
+    await app.register(internalMcpCatalogRoutes);
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await app.close();
+  });
+
+  function makeRemoteCatalog(access: TestAccess, authorId: string) {
+    return InternalMcpCatalogModel.create(
+      {
+        name: `cat-${crypto.randomUUID().slice(0, 8)}`,
+        serverType: "remote",
+        serverUrl: "https://example.com/mcp/",
+      },
+      { organizationId, authorId, ...accessGrants(access) },
+    );
+  }
+
+  test("member can update their OWN personal catalog item", async () => {
+    const catalog = await makeRemoteCatalog("personal", member.id);
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/internal_mcp_catalog/${catalog.id}`,
+      payload: { description: "updated by owner" },
+    });
+    expect(response.statusCode).toBe(200);
+  });
+
+  test("member cannot update another creator’s organization-shared catalog item", async ({
+    makeUser,
+  }) => {
+    const author = await makeUser();
+    const catalog = await makeRemoteCatalog("org", author.id);
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/internal_mcp_catalog/${catalog.id}`,
+      payload: { description: "should be blocked" },
+    });
+    expect(response.statusCode).toBe(403);
+  });
+
+  test("member CANNOT update another user's personal catalog item", async ({
+    makeUser,
+  }) => {
+    const other = await makeUser();
+    const catalog = await makeRemoteCatalog("personal", other.id);
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/internal_mcp_catalog/${catalog.id}`,
+      payload: { description: "should be blocked" },
+    });
+    // Another user's personal item isn't even visible to the member, so the
+    // scoped lookup 404s before the modify check — still blocked, just unseen.
+    expect(response.statusCode).toBe(404);
+  });
+
+  test("a member cannot change what their own entry runs, only describe it", async () => {
+    const catalog = await InternalMcpCatalogModel.create(
+      {
+        name: `local-${crypto.randomUUID().slice(0, 8)}`,
+        serverType: "local",
+        localConfig: { dockerImage: "ghcr.io/acme/ok:1", command: "node" },
+      },
+      { organizationId, authorId: member.id },
+    );
+
+    const swapped = await app.inject({
+      method: "PUT",
+      url: `/api/internal_mcp_catalog/${catalog.id}`,
+      payload: { localConfig: { dockerImage: "ghcr.io/evil/x:1" } },
+    });
+    expect(swapped.statusCode).toBe(403);
+    expect(swapped.json().error.message).toBe(
+      "Changing what this MCP server runs or connects to needs permission to add MCP servers to the registry.",
+    );
+    expect(
+      (await InternalMcpCatalogModel.findById(catalog.id))?.localConfig
+        ?.dockerImage,
+    ).toBe("ghcr.io/acme/ok:1");
+
+    // Its stored config sent back unchanged is no change.
+    const described = await app.inject({
+      method: "PUT",
+      url: `/api/internal_mcp_catalog/${catalog.id}`,
+      payload: {
+        description: "Notes for me",
+        serverType: "local",
+        localConfig: { dockerImage: "ghcr.io/acme/ok:1", command: "node" },
+      },
+    });
+    expect(described.statusCode, described.body).toBe(200);
+    expect(described.json().description).toBe("Notes for me");
+  });
+});

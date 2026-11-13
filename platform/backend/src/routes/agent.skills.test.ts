@@ -1,0 +1,1322 @@
+import {
+  ADMIN_ROLE_NAME,
+  ARCHESTRA_MCP_CATALOG_ID,
+  type RouteId,
+  TOOL_LOAD_SKILL_SHORT_NAME,
+} from "@archestra/shared";
+import { requiredEndpointPermissionsMap } from "@archestra/shared/access-control";
+import { and, eq } from "drizzle-orm";
+import { type Mock, vi } from "vitest";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
+import {
+  getAgentTypePermissionChecker,
+  hasPermission,
+  userHasPermission,
+} from "@/auth";
+import config from "@/config";
+import db, { schema } from "@/database";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { registerAuditLogHook } from "@/middleware/audit-log-hook";
+import {
+  AgentExcludedToolModel,
+  EnvironmentModel,
+  ExternalMcpSkillUsageEventModel,
+  McpCatalogSkillModel,
+  OrganizationModel,
+  PluginModel,
+  PluginSkillUsageEventModel,
+  SkillTeamModel,
+  ToolModel,
+} from "@/models";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import SkillModel from "@/models/skill";
+import { agentToolExclusionsService } from "@/services/agent-tool-exclusions";
+import {
+  accessGrants,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  type TestAccess,
+  test,
+} from "@/test";
+import { ApiError, type InsertSkill, type Skill, type User } from "@/types";
+import { drainBackgroundWork } from "@/utils/background-work";
+
+vi.mock("@/auth");
+
+const mockGetAgentTypePermissionChecker = getAgentTypePermissionChecker as Mock;
+const mockHasPermission = hasPermission as Mock;
+
+describe("agent skills routes", () => {
+  let app: FastifyInstanceWithZod;
+  let user: User;
+  let organizationId: string;
+  let requireMock: Mock;
+  const originalSkillsEnabled = config.mcpGateway.skillsEnabled;
+
+  beforeEach(async ({ makeOrganization, makeUser, makeMember }) => {
+    vi.clearAllMocks();
+
+    user = await makeUser();
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    await makeMember(user.id, organizationId);
+
+    requireMock = vi.fn();
+    mockGetAgentTypePermissionChecker.mockResolvedValue({
+      require: requireMock,
+      isAdmin: vi.fn().mockReturnValue(true),
+      isTeamAdmin: vi.fn().mockReturnValue(true),
+      isMigrated: vi.fn().mockReturnValue(false),
+      allowsScoped: vi.fn().mockReturnValue(true),
+      hasBaseAction: vi.fn().mockReturnValue(true),
+      hasAnyReadPermission: vi.fn().mockReturnValue(true),
+      hasAnyAdminPermission: vi.fn().mockReturnValue(true),
+      // The list route asks which agent types the caller may read at all, so
+      // the mock answers with every generic type, matching its admin stance.
+      getAgentTypesWithPermission: vi
+        .fn()
+        .mockReturnValue(["profile", "mcp_gateway", "agent"]),
+      getAgentTypesWithScopedPermission: vi
+        .fn()
+        .mockReturnValue(["profile", "mcp_gateway", "agent"]),
+    });
+    mockHasPermission.mockResolvedValue({ success: true, error: null });
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { user: unknown }).user = user;
+      (request as typeof request & { organizationId: string }).organizationId =
+        organizationId;
+
+      // Replicates the middleware's gate against the real permission map, so
+      // these tests exercise the route -> map wiring rather than assuming it.
+      const routeId = request.routeOptions.schema?.operationId as
+        | RouteId
+        | undefined;
+      const required = routeId
+        ? requiredEndpointPermissionsMap[routeId]
+        : undefined;
+      if (required && Object.keys(required).length > 0) {
+        const result = await hasPermission(required, request.headers);
+        if (!result.success) throw new ApiError(403, "Forbidden");
+      }
+    });
+    registerAuditLogHook(app);
+
+    const { default: agentRoutes } = await import("./agent");
+    await app.register(agentRoutes);
+  });
+
+  afterEach(async () => {
+    config.mcpGateway.skillsEnabled = originalSkillsEnabled;
+    vi.restoreAllMocks();
+    await app.close();
+  });
+
+  async function makeSkill(
+    overrides: Partial<Omit<InsertSkill, "scope">> & {
+      access?: TestAccess;
+    } = {},
+    environmentIds: string[] = [],
+  ): Promise<Skill> {
+    const { access = "org", ...skillOverrides } = overrides;
+    const skill = await SkillModel.createWithFiles({
+      skill: {
+        organizationId,
+        name: `skill-${crypto.randomUUID().slice(0, 8)}`,
+        description: "A test skill",
+        content: "# Instructions",
+        ...skillOverrides,
+      },
+      files: [],
+      environmentIds,
+      ...accessGrants(access),
+    });
+    if (!skill) throw new Error("failed to create test skill");
+    return skill;
+  }
+
+  /**
+   * One org-wide plugin skill and one org-scoped MCP skill, each with a
+   * recorded activation, plus spies on both usage summaries. Activation and
+   * count paths must list these skills without aggregating that usage.
+   *
+   * Side effects for the rest of the test: turns `config.mcpGateway.skillsEnabled`
+   * on and makes `userHasPermission` resolve true; `afterEach` restores the
+   * flag and the mocks.
+   */
+  async function seedUsedPluginAndExternalSkills(params: {
+    catalogId: string;
+    mcpServerId: string;
+  }) {
+    config.mcpGateway.skillsEnabled = true;
+    vi.mocked(userHasPermission).mockResolvedValue(true);
+    const plugin = await PluginModel.create({
+      organizationId,
+      userId: user.id,
+      input: {
+        displayName: "Release bundle",
+        description: "Release tooling",
+        clientType: "claude-code",
+        supportedPlatforms: ["posix"],
+        files: [
+          {
+            path: "skills/release-notes/SKILL.md",
+            content:
+              "---\nname: release-notes\ndescription: Draft release notes.\n---\n# Notes",
+            encoding: "utf8",
+            mode: "100644",
+          },
+        ],
+      },
+      ...accessGrants("org"),
+    });
+    if (!plugin) throw new Error("failed to create test plugin");
+    await McpCatalogSkillModel.syncCatalog({
+      catalogId: params.catalogId,
+      generation:
+        (await McpCatalogSkillModel.beginRefresh(params.catalogId)) ?? 0,
+      skills: [
+        {
+          uri: "skill://example/triage/SKILL.md",
+          name: "triage",
+          description: "Triage incidents.",
+          frontmatter: { name: "triage", description: "Triage incidents." },
+          resources: null,
+        },
+      ],
+    });
+    PluginSkillUsageEventModel.recordUsage({
+      pluginId: plugin.id,
+      skillPath: "skills/release-notes",
+      userId: user.id,
+    });
+    ExternalMcpSkillUsageEventModel.recordUsage({
+      mcpServerId: params.mcpServerId,
+      uri: "skill://example/triage/SKILL.md",
+      userId: user.id,
+    });
+    await drainBackgroundWork();
+    return {
+      pluginSummaries: vi.spyOn(PluginSkillUsageEventModel, "getSummaries"),
+      externalSummaries: vi.spyOn(
+        ExternalMcpSkillUsageEventModel,
+        "getSummaries",
+      ),
+    };
+  }
+
+  /**
+   * Promote the request user to the built-in admin role, which is what carries
+   * `skill:admin`. The agent-type checker is mocked wide open in this file, so
+   * this is the only thing that moves the skill-side permission.
+   */
+  async function promoteCallerToSkillAdmin(): Promise<void> {
+    await db
+      .update(schema.membersTable)
+      .set({ role: ADMIN_ROLE_NAME })
+      .where(
+        and(
+          eq(schema.membersTable.userId, user.id),
+          eq(schema.membersTable.organizationId, organizationId),
+        ),
+      );
+  }
+
+  test("GET activation-skills returns the caller-relative skill catalog for an internal agent", async ({
+    makeAgent,
+  }) => {
+    await OrganizationModel.patch(organizationId, { skillToolsEnabled: true });
+    await ToolModel.seedArchestraTools(ARCHESTRA_MCP_CATALOG_ID);
+    const agent = await makeAgent({
+      agentType: "agent",
+      organizationId,
+      environmentId: null,
+    });
+    await ToolModel.assignSkillToolsToAgent(agent.id, organizationId);
+    const skill = await makeSkill({
+      name: "incident-response",
+      description: "Respond to incidents",
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agents/activation-skills?agentId=${agent.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      enabled: true,
+      data: [
+        {
+          reference: { source: "native", skillId: skill.id },
+          name: "incident-response",
+          activationName: "incident-response",
+          description: "Respond to incidents",
+          // Derived from the skill's grants: it reaches the organization.
+          scope: "org",
+          providerName: null,
+        },
+      ],
+      pagination: {
+        currentPage: 1,
+        limit: 20,
+        total: 1,
+        totalPages: 1,
+        hasNext: false,
+        hasPrev: false,
+      },
+    });
+    expect(response.body).not.toContain("# Instructions");
+  });
+
+  test("GET activation-skills previews the selected environment for a new agent", async () => {
+    await OrganizationModel.patch(organizationId, { skillToolsEnabled: true });
+    const environment = await EnvironmentModel.create({
+      organizationId,
+      name: "Preview Environment",
+    });
+    const otherEnvironment = await EnvironmentModel.create({
+      organizationId,
+      name: "Other Environment",
+    });
+    const visible = await makeSkill({ name: "visible-here" }, [environment.id]);
+    await makeSkill({ name: "elsewhere" }, [otherEnvironment.id]);
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agents/activation-skills?environmentId=${environment.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      enabled: true,
+      data: [
+        {
+          reference: { source: "native", skillId: visible.id },
+          name: "visible-here",
+          activationName: "visible-here",
+          scope: "org",
+        },
+      ],
+    });
+  });
+
+  test("GET activation-skills reports a disabled agent without exposing the catalog", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      agentType: "agent",
+      organizationId,
+    });
+    await makeSkill({ name: "not-reachable" });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agents/activation-skills?agentId=${agent.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      enabled: false,
+      data: [],
+      pagination: {
+        currentPage: 1,
+        limit: 20,
+        total: 0,
+        totalPages: 0,
+        hasNext: false,
+        hasPrev: false,
+      },
+    });
+  });
+
+  test("GET activation-skills follows Auto-mode dynamic load_skill availability", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      agentType: "agent",
+      organizationId,
+      accessAllTools: true,
+    });
+    await makeSkill({ name: "dynamically-reachable" });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agents/activation-skills?agentId=${agent.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      enabled: true,
+      data: [{ name: "dynamically-reachable" }],
+    });
+  });
+
+  test("GET activation-skills honors an active load_skill exclusion", async ({
+    makeAgent,
+  }) => {
+    await OrganizationModel.patch(organizationId, { skillToolsEnabled: true });
+    await ToolModel.seedArchestraTools(ARCHESTRA_MCP_CATALOG_ID);
+    const agent = await makeAgent({
+      agentType: "agent",
+      organizationId,
+      accessAllTools: true,
+    });
+    const loadSkill = await ToolModel.findByName(
+      archestraMcpBranding.getToolName(TOOL_LOAD_SKILL_SHORT_NAME),
+    );
+    if (!loadSkill) throw new Error("Expected load_skill tool");
+    await agentToolExclusionsService.replaceExclusions({
+      agentId: agent.id,
+      organizationId,
+      excludedToolIds: [loadSkill.id],
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agents/activation-skills?agentId=${agent.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      enabled: false,
+      data: [],
+      pagination: { total: 0 },
+    });
+  });
+
+  test("GET activation-skills paginates the sorted accessible catalog", async ({
+    makeAgent,
+  }) => {
+    await OrganizationModel.patch(organizationId, { skillToolsEnabled: true });
+    await ToolModel.seedArchestraTools(ARCHESTRA_MCP_CATALOG_ID);
+    const agent = await makeAgent({
+      agentType: "agent",
+      organizationId,
+    });
+    await ToolModel.assignSkillToolsToAgent(agent.id, organizationId);
+    await makeSkill({ name: "alpha" });
+    await makeSkill({ name: "bravo" });
+    await makeSkill({ name: "charlie" });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agents/activation-skills?agentId=${agent.id}&limit=2&offset=2`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      enabled: true,
+      data: [{ name: "charlie" }],
+      pagination: {
+        currentPage: 2,
+        limit: 2,
+        total: 3,
+        totalPages: 2,
+        hasNext: false,
+        hasPrev: true,
+      },
+    });
+  });
+
+  test("GET activation-skills searches the full catalog before pagination", async ({
+    makeAgent,
+  }) => {
+    await OrganizationModel.patch(organizationId, { skillToolsEnabled: true });
+    await ToolModel.seedArchestraTools(ARCHESTRA_MCP_CATALOG_ID);
+    const agent = await makeAgent({
+      agentType: "agent",
+      organizationId,
+    });
+    await ToolModel.assignSkillToolsToAgent(agent.id, organizationId);
+    await makeSkill({ name: "alpha", description: "Routine work" });
+    await makeSkill({ name: "bravo", description: "Routine work" });
+    await makeSkill({
+      name: "charlie",
+      description: "Handles SEVERE incidents",
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agents/activation-skills?agentId=${agent.id}&limit=2&offset=0&search=severe`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      enabled: true,
+      data: [{ name: "charlie" }],
+      pagination: {
+        currentPage: 1,
+        limit: 2,
+        total: 1,
+        totalPages: 1,
+        hasNext: false,
+        hasPrev: false,
+      },
+    });
+  });
+
+  test("GET agents includes the caller-visible activation skill count on internal agents", async ({
+    makeAgent,
+  }) => {
+    await promoteCallerToSkillAdmin();
+    await ToolModel.seedArchestraTools(ARCHESTRA_MCP_CATALOG_ID);
+    const suffix = crypto.randomUUID().slice(0, 8);
+    const enabledAgent = await makeAgent({
+      name: `Enabled ${suffix}`,
+      agentType: "agent",
+      organizationId,
+      environmentId: null,
+    });
+    await makeAgent({
+      name: `Disabled ${suffix}`,
+      agentType: "agent",
+      organizationId,
+      environmentId: null,
+    });
+    await OrganizationModel.patch(organizationId, { skillToolsEnabled: true });
+    await ToolModel.assignSkillToolsToAgent(enabledAgent.id, organizationId);
+    await makeSkill({ name: `listed-${suffix}` });
+
+    const plainResponse = await app.inject({
+      method: "GET",
+      url: `/api/agents?agentTypes=agent&name=${suffix}&limit=10&offset=0`,
+    });
+    expect(plainResponse.statusCode).toBe(200);
+    expect(plainResponse.json().data[0]).not.toHaveProperty(
+      "activationSkillsCount",
+    );
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agents?agentTypes=agent&name=${suffix}&limit=10&offset=0&includeActivationSkillsCount=true`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const counts = new Map(
+      response
+        .json()
+        .data.map((agent: { name: string; activationSkillsCount: number }) => [
+          agent.name,
+          agent.activationSkillsCount,
+        ]),
+    );
+    expect(counts.get(`Enabled ${suffix}`)).toBe(1);
+    expect(counts.get(`Disabled ${suffix}`)).toBe(0);
+  });
+
+  test("GET agents counts dynamic skills and honors load_skill exclusions", async ({
+    makeAgent,
+  }) => {
+    await promoteCallerToSkillAdmin();
+    await ToolModel.seedArchestraTools(ARCHESTRA_MCP_CATALOG_ID);
+    const suffix = crypto.randomUUID().slice(0, 8);
+    const loadSkillName = archestraMcpBranding.getToolName(
+      TOOL_LOAD_SKILL_SHORT_NAME,
+    );
+    const dynamicAgent = await makeAgent({
+      name: `Dynamic ${suffix}`,
+      agentType: "agent",
+      organizationId,
+      accessAllTools: true,
+    });
+    await agentToolExclusionsService.replaceExclusions({
+      agentId: dynamicAgent.id,
+      organizationId,
+      excludedToolIds: [],
+    });
+    expect(
+      await ToolModel.findByNameForAgent(loadSkillName, dynamicAgent.id),
+    ).toBeNull();
+
+    await OrganizationModel.patch(organizationId, { skillToolsEnabled: true });
+    const excludedAgent = await makeAgent({
+      name: `Excluded ${suffix}`,
+      agentType: "agent",
+      organizationId,
+      accessAllTools: true,
+    });
+    const loadSkill = await ToolModel.findByName(loadSkillName);
+    if (!loadSkill) throw new Error("Expected load_skill tool");
+    await agentToolExclusionsService.replaceExclusions({
+      agentId: excludedAgent.id,
+      organizationId,
+      excludedToolIds: [loadSkill.id],
+    });
+    await makeSkill({ name: `counted-${suffix}` });
+
+    const batchExclusions = vi.spyOn(
+      AgentExcludedToolModel,
+      "findExcludedToolRowsByAgents",
+    );
+    const perAgentToolReads = vi.spyOn(ToolModel, "getMcpToolsByAgent");
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agents?agentTypes=agent&name=${suffix}&limit=10&offset=0&includeActivationSkillsCount=true`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const counts = new Map(
+      response
+        .json()
+        .data.map((agent: { name: string; activationSkillsCount: number }) => [
+          agent.name,
+          agent.activationSkillsCount,
+        ]),
+    );
+    expect(counts.get(`Dynamic ${suffix}`)).toBe(1);
+    expect(counts.get(`Excluded ${suffix}`)).toBe(0);
+    expect(batchExclusions).toHaveBeenCalledTimes(1);
+    expect(perAgentToolReads).not.toHaveBeenCalled();
+  });
+
+  test("GET activation-skills lists plugin and MCP skills without summarizing their usage", async ({
+    makeAgent,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      authorId: user.id,
+    });
+    const server = await makeMcpServer({
+      catalogId: catalog.id,
+      serverType: "remote",
+      scope: "org",
+      ownerId: user.id,
+    });
+    const { pluginSummaries, externalSummaries } =
+      await seedUsedPluginAndExternalSkills({
+        catalogId: catalog.id,
+        mcpServerId: server.id,
+      });
+    await OrganizationModel.patch(organizationId, { skillToolsEnabled: true });
+    await ToolModel.seedArchestraTools(ARCHESTRA_MCP_CATALOG_ID);
+    const agent = await makeAgent({
+      agentType: "agent",
+      organizationId,
+      environmentId: null,
+    });
+    await ToolModel.assignSkillToolsToAgent(agent.id, organizationId);
+
+    for (const view of ["eligible", "effective"]) {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/agents/activation-skills?agentId=${agent.id}&view=${view}`,
+      });
+
+      expect(response.statusCode, response.body).toBe(200);
+      expect(
+        response
+          .json()
+          .data.map(
+            (skill: { reference: { source: string } }) =>
+              skill.reference.source,
+          )
+          .sort(),
+      ).toEqual(["external_mcp", "plugin"]);
+      expect(response.body).not.toContain("usageCount");
+    }
+    expect(pluginSummaries).not.toHaveBeenCalled();
+    expect(externalSummaries).not.toHaveBeenCalled();
+  });
+
+  test("GET agents counts plugin and MCP skills without summarizing their usage", async ({
+    makeAgent,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    await promoteCallerToSkillAdmin();
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      authorId: user.id,
+    });
+    const server = await makeMcpServer({
+      catalogId: catalog.id,
+      serverType: "remote",
+      scope: "org",
+      ownerId: user.id,
+    });
+    const { pluginSummaries, externalSummaries } =
+      await seedUsedPluginAndExternalSkills({
+        catalogId: catalog.id,
+        mcpServerId: server.id,
+      });
+    await OrganizationModel.patch(organizationId, { skillToolsEnabled: true });
+    await ToolModel.seedArchestraTools(ARCHESTRA_MCP_CATALOG_ID);
+    const suffix = crypto.randomUUID().slice(0, 8);
+    const agent = await makeAgent({
+      name: `Counted ${suffix}`,
+      agentType: "agent",
+      organizationId,
+      environmentId: null,
+    });
+    await ToolModel.assignSkillToolsToAgent(agent.id, organizationId);
+    await makeSkill({ name: `native-${suffix}` });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agents?agentTypes=agent&name=${suffix}&limit=10&offset=0&includeActivationSkillsCount=true`,
+    });
+
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json().data).toEqual([
+      expect.objectContaining({ id: agent.id, activationSkillsCount: 3 }),
+    ]);
+    expect(pluginSummaries).not.toHaveBeenCalled();
+    expect(externalSummaries).not.toHaveBeenCalled();
+  });
+
+  test("GET returns the defaults and PUT round-trips a full replace", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ organizationId });
+    const first = await makeSkill();
+    const second = await makeSkill();
+    const skillIds = [first.id, second.id].sort();
+
+    const emptyResponse = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agent.id}/skills`,
+    });
+    expect(emptyResponse.statusCode).toBe(200);
+    expect(emptyResponse.json()).toEqual({
+      accessAllSkills: false,
+      skillIds: [],
+      skills: [],
+    });
+
+    const putResponse = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds },
+    });
+    expect(putResponse.statusCode).toBe(200);
+    expect(putResponse.json()).toMatchObject({
+      accessAllSkills: false,
+      skillIds,
+    });
+
+    const getResponse = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agent.id}/skills`,
+    });
+    expect(getResponse.json()).toMatchObject({
+      accessAllSkills: false,
+      skillIds,
+    });
+
+    // Full replace: flipping to Auto mode with an empty set clears assignments.
+    const clearResponse = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: true, skillIds: [] },
+    });
+    expect(clearResponse.statusCode).toBe(200);
+    expect(clearResponse.json()).toEqual({
+      accessAllSkills: true,
+      skillIds: [],
+      skills: [],
+    });
+  });
+
+  test("returns 404 for an agent belonging to another organization", async ({
+    makeAgent,
+    makeOrganization,
+  }) => {
+    const otherOrg = await makeOrganization();
+    const foreignAgent = await makeAgent({ organizationId: otherOrg.id });
+
+    const getResponse = await app.inject({
+      method: "GET",
+      url: `/api/agents/${foreignAgent.id}/skills`,
+    });
+    expect(getResponse.statusCode).toBe(404);
+
+    const putResponse = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${foreignAgent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [] },
+    });
+    expect(putResponse.statusCode).toBe(404);
+  });
+
+  test("returns 404 when the caller lacks the agent-type permission", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ organizationId });
+    requireMock.mockImplementation(() => {
+      throw new Error("missing permission");
+    });
+
+    const getResponse = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agent.id}/skills`,
+    });
+    expect(getResponse.statusCode).toBe(404);
+    expect(requireMock).toHaveBeenCalledWith(agent.agentType, {
+      action: "read",
+      scope: agent.id,
+    });
+
+    const putResponse = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [] },
+    });
+    expect(putResponse.statusCode).toBe(404);
+    expect(requireMock).toHaveBeenCalledWith(agent.agentType, {
+      action: "update",
+      scope: agent.id,
+    });
+  });
+
+  test("returns 403 when the caller's role has no skill:read", async ({
+    makeAgent,
+  }) => {
+    // Gateway permission is not enough on its own. `mcpGateway:update` is a
+    // default member permission, and publishing hands a skill's whole body to
+    // every holder of the gateway's token — so a role deliberately stripped of
+    // the skill resource must not reach these routes, in either direction: the
+    // GET discloses skill names and scopes, the PUT decides what is served.
+    const agent = await makeAgent({ organizationId });
+    mockHasPermission.mockResolvedValue({
+      success: false,
+      error: "Forbidden",
+    });
+
+    const getResponse = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agent.id}/skills`,
+    });
+    expect(getResponse.statusCode).toBe(403);
+
+    const putResponse = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [] },
+    });
+    expect(putResponse.statusCode).toBe(403);
+    expect(mockHasPermission).toHaveBeenCalledWith(
+      { skill: ["read"] },
+      expect.anything(),
+    );
+  });
+
+  test("PUT rejects skills that are not visible in this organization with a 404", async ({
+    makeAgent,
+    makeOrganization,
+  }) => {
+    const agent = await makeAgent({ organizationId });
+    const otherOrg = await makeOrganization();
+    const foreignSkill = await makeSkill({ organizationId: otherOrg.id });
+
+    // A foreign-org skill and a nonexistent id answer identically, so the
+    // endpoint cannot be used to probe which skill ids exist elsewhere.
+    for (const skillId of [foreignSkill.id, crypto.randomUUID()]) {
+      const response = await app.inject({
+        method: "PUT",
+        url: `/api/agents/${agent.id}/skills`,
+        payload: { accessAllSkills: false, skillIds: [skillId] },
+      });
+      expect(response.statusCode, skillId).toBe(404);
+    }
+  });
+
+  test("PUT refuses to publish a team skill the caller cannot read", async ({
+    makeAgent,
+    makeTeam,
+  }) => {
+    // `mcpGateway:update` is a default member permission, so gateway access
+    // alone must not let someone publish — and thereby read, through the
+    // gateway's token, forever — a team skill they were never given.
+    const agent = await makeAgent({ organizationId });
+    const team = await makeTeam(organizationId, user.id);
+    const teamSkill = await makeSkill({ access: "personal" });
+    await SkillTeamModel.syncSkillTeams(teamSkill.id, [team.id]);
+
+    const denied = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [teamSkill.id] },
+    });
+    // Byte-identical to the nonexistent-id answer, so the endpoint cannot be
+    // used to discover which skill ids the organization holds.
+    expect(denied.statusCode).toBe(404);
+    expect(denied.json().error.message).toBe(
+      `Skill not found: ${teamSkill.id}`,
+    );
+
+    const assignments = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agent.id}/skills`,
+    });
+    expect(assignments.json()).toMatchObject({ skillIds: [] });
+  });
+
+  test("PUT requires sharing authority before publishing a team skill", async ({
+    makeAgent,
+    makeTeam,
+    makeTeamMember,
+  }) => {
+    const agent = await makeAgent({ organizationId });
+    const team = await makeTeam(organizationId, user.id);
+    const teamSkill = await makeSkill({ access: "personal" });
+    await SkillTeamModel.syncSkillTeams(teamSkill.id, [team.id]);
+    await makeTeamMember(team.id, user.id);
+
+    const key = {
+      organizationId,
+      resource: "skill" as const,
+      scope: teamSkill.id,
+    };
+    const policy = await ResourcePermissionPolicyModel.find(key);
+    const granted = await ResourcePermissionPolicyModel.replace({
+      ...key,
+      revision: policy?.revision ?? 0,
+      grants: [
+        { subject: { type: "team", id: team.id }, actions: ["read", "use"] },
+      ],
+    });
+    expect(granted).not.toBeNull();
+    if (!granted) throw new Error("Expected persisted resource policy");
+    const denied = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [teamSkill.id] },
+    });
+    expect(denied.statusCode).toBe(422);
+    expect(denied.json().error.message).toContain("manage permissions");
+    await ResourcePermissionPolicyModel.replace({
+      ...key,
+      revision: granted.revision,
+      grants: [
+        {
+          subject: { type: "team", id: team.id },
+          actions: ["read", "use", "manage-permissions"],
+        },
+      ],
+    });
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [teamSkill.id] },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ skillIds: [teamSkill.id] });
+  });
+
+  test("PUT publishes a team skill for a skill admin who is not on the team", async ({
+    makeAgent,
+    makeTeam,
+  }) => {
+    // `skill:admin` bypasses scope restrictions here exactly as it does on the
+    // skill routes themselves.
+    const agent = await makeAgent({ organizationId });
+    const team = await makeTeam(organizationId, user.id);
+    const teamSkill = await makeSkill({ access: "personal" });
+    await SkillTeamModel.syncSkillTeams(teamSkill.id, [team.id]);
+    await promoteCallerToSkillAdmin();
+
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [teamSkill.id] },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ skillIds: [teamSkill.id] });
+  });
+
+  test("PUT answers 404, not the publishability 422, for someone else's personal skill", async ({
+    makeAgent,
+    makeUser,
+  }) => {
+    // The scope rejection would confirm the id names a real personal skill and
+    // name its author; the access check runs first and refuses to say so.
+    const agent = await makeAgent({ organizationId });
+    const colleague = await makeUser();
+    const theirs = await makeSkill({
+      access: "personal",
+      authorId: colleague.id,
+    });
+
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [theirs.id] },
+    });
+    expect(response.statusCode).toBe(404);
+    expect(response.json().error.message).toBe(`Skill not found: ${theirs.id}`);
+  });
+
+  test("PUT publishes the caller's own personal skill on a shared gateway", async ({
+    makeAgent,
+  }) => {
+    // Publication is the author's call: their personal skill can go on any
+    // gateway they can edit, not only the auto-provisioned personal one.
+    const agent = await makeAgent({ organizationId });
+    const mine = await makeSkill({ access: "personal", authorId: user.id });
+
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [mine.id] },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ skillIds: [mine.id] });
+  });
+
+  test("PUT permits a wildcard permission manager to publish another creator’s skill", async ({
+    makeAgent,
+    makeUser,
+  }) => {
+    // Publication authority follows scoped grants, independently of authorship.
+    const agent = await makeAgent({ organizationId });
+    const colleague = await makeUser();
+    const theirs = await makeSkill({
+      access: "personal",
+      authorId: colleague.id,
+    });
+    await promoteCallerToSkillAdmin();
+
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [theirs.id] },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().skillIds).toEqual([theirs.id]);
+  });
+
+  test("PUT surfaces unpublishable skills as a 422 with the reason", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ organizationId });
+    const templated = await makeSkill({ templated: true });
+    const badName = await makeSkill({ name: "My Skill" });
+
+    const templatedResponse = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [templated.id] },
+    });
+    expect(templatedResponse.statusCode).toBe(422);
+    expect(templatedResponse.json().error.message).toMatch(/templated/i);
+
+    const badNameResponse = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [badName.id] },
+    });
+    expect(badNameResponse.statusCode).toBe(422);
+    expect(badNameResponse.json().error.message).toMatch(/Agent Skills/);
+  });
+
+  // Skills are published as `skill://` resources to the client holding a
+  // gateway's token, so MCP gateways are the only publishing surface: an LLM
+  // proxy has no MCP surface at all, and an internal agent reaches skills
+  // through `load_skill` in its own runtime. Rejected rather than stored, so
+  // the editor and the API agree on where the section exists.
+  for (const agentType of ["llm_proxy", "agent"] as const) {
+    test(`PUT rejects a ${agentType}, which is not a publishing surface`, async ({
+      makeAgent,
+    }) => {
+      const nonGateway = await makeAgent({ organizationId, agentType });
+      const skill = await makeSkill();
+
+      const assignments = await app.inject({
+        method: "PUT",
+        url: `/api/agents/${nonGateway.id}/skills`,
+        payload: { accessAllSkills: false, skillIds: [skill.id] },
+      });
+      expect(assignments.statusCode).toBe(400);
+      expect(assignments.json().error.message).toMatch(/MCP gateways only/i);
+
+      const exclusions = await app.inject({
+        method: "PUT",
+        url: `/api/agents/${nonGateway.id}/skill-exclusions`,
+        payload: { excludedSkillIds: [skill.id] },
+      });
+      expect(exclusions.statusCode).toBe(400);
+    });
+  }
+
+  test("GET omits soft-deleted skills, so its result always round-trips through PUT", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ organizationId });
+    const kept = await makeSkill();
+    const deleted = await makeSkill();
+
+    await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: {
+        accessAllSkills: false,
+        skillIds: [kept.id, deleted.id].sort(),
+      },
+    });
+    await SkillModel.delete(deleted.id);
+
+    // The deleted id must not come back: `findByIds` filters deleted rows, so
+    // a PUT echoing a GET that still contained it would 404.
+    const getResponse = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agent.id}/skills`,
+    });
+    expect(getResponse.json()).toMatchObject({
+      accessAllSkills: false,
+      skillIds: [kept.id],
+      skills: [{ id: kept.id, name: kept.name }],
+    });
+
+    const roundTrip = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: getResponse.json(),
+    });
+    expect(roundTrip.statusCode).toBe(200);
+  });
+
+  test("GET keeps an assignment whose skill later left the environment", async ({
+    makeAgent,
+  }) => {
+    // The gateway stops SERVING such a skill, but the assignment is still
+    // configuration the admin chose. Dropping it from the GET would be
+    // destructive rather than cosmetic: the response is the PUT body, and PUT
+    // is a full replace, so the next save would delete an assignment nobody
+    // touched.
+    const production = await EnvironmentModel.create({
+      organizationId,
+      name: "production",
+    });
+    const staging = await EnvironmentModel.create({
+      organizationId,
+      name: "staging",
+    });
+    const agent = await makeAgent({
+      organizationId,
+      environmentId: production.id,
+    });
+    const skill = await makeSkill({}, [production.id]);
+
+    const assigned = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [skill.id] },
+    });
+    expect(assigned.statusCode).toBe(200);
+
+    // The skill is rebound to another environment out from under the gateway.
+    await SkillModel.updateWithFiles({
+      id: skill.id,
+      skill: { description: skill.description },
+      environmentIds: [staging.id],
+    });
+
+    const getResponse = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agent.id}/skills`,
+    });
+    expect(getResponse.json()).toMatchObject({
+      skillIds: [skill.id],
+      skills: [{ id: skill.id, name: skill.name }],
+    });
+  });
+
+  test("PUT rejects a skill outside the gateway's environment with a 422", async ({
+    makeAgent,
+  }) => {
+    const production = await EnvironmentModel.create({
+      organizationId,
+      name: "production",
+    });
+    const staging = await EnvironmentModel.create({
+      organizationId,
+      name: "staging",
+    });
+    const agent = await makeAgent({
+      organizationId,
+      environmentId: production.id,
+    });
+    const stagingSkill = await makeSkill({}, [staging.id]);
+    const productionSkill = await makeSkill({}, [production.id]);
+
+    const rejected = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [stagingSkill.id] },
+    });
+    expect(rejected.statusCode).toBe(422);
+    expect(rejected.json().error.message).toMatch(/environment/i);
+
+    const accepted = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [productionSkill.id] },
+    });
+    expect(accepted.statusCode).toBe(200);
+  });
+
+  test("PUT keeps a stored assignment whose skill left the environment, gating only new adds", async ({
+    makeAgent,
+  }) => {
+    // The publishability gates judge ids being ADDED, never the echoed stored
+    // set — otherwise this drifted entry would wedge every later save until
+    // someone hunted it down and removed it.
+    const production = await EnvironmentModel.create({
+      organizationId,
+      name: "production",
+    });
+    const staging = await EnvironmentModel.create({
+      organizationId,
+      name: "staging",
+    });
+    const agent = await makeAgent({
+      organizationId,
+      environmentId: production.id,
+    });
+    const rebound = await makeSkill({}, [production.id]);
+
+    await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [rebound.id] },
+    });
+    await SkillModel.updateWithFiles({
+      id: rebound.id,
+      skill: { description: rebound.description },
+      environmentIds: [staging.id],
+    });
+
+    // The GET body stays a valid PUT body after the drift.
+    const getResponse = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agent.id}/skills`,
+    });
+    const roundTrip = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: getResponse.json(),
+    });
+    expect(roundTrip.statusCode).toBe(200);
+
+    // Unrelated edits keep working alongside the drifted entry.
+    const added = await makeSkill({}, [production.id]);
+    const grow = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: {
+        accessAllSkills: false,
+        skillIds: [rebound.id, added.id].sort(),
+      },
+    });
+    expect(grow.statusCode).toBe(200);
+    expect(grow.json()).toMatchObject({
+      skillIds: [rebound.id, added.id].sort(),
+    });
+
+    // Only stored entries are exempt: a NEW out-of-environment skill still 422s.
+    const fresh = await makeSkill({}, [staging.id]);
+    const rejected = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: {
+        accessAllSkills: false,
+        skillIds: [rebound.id, added.id, fresh.id].sort(),
+      },
+    });
+    expect(rejected.statusCode).toBe(422);
+    expect(rejected.json().error.message).toMatch(/environment/i);
+  });
+
+  test("PUT by another editor keeps a stored personal skill it could not itself publish", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    // Author A publishes their personal skill; editor B later grows the set.
+    // B could never ADD A's skill — 404 unreadable, or 422 as a skill admin —
+    // but re-echoing it must not wedge B's otherwise-valid save into silently
+    // unpublishing A's skill.
+    const agent = await makeAgent({ organizationId });
+    const theirs = await makeSkill({ access: "personal", authorId: user.id });
+    const seeded = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [theirs.id] },
+    });
+    expect(seeded.statusCode).toBe(200);
+
+    const editor = await makeUser();
+    await makeMember(editor.id, organizationId);
+    user = editor;
+
+    const orgSkill = await makeSkill();
+    const grow = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: {
+        accessAllSkills: false,
+        skillIds: [theirs.id, orgSkill.id].sort(),
+      },
+    });
+    expect(grow.statusCode).toBe(200);
+    expect(grow.json()).toMatchObject({
+      skillIds: [theirs.id, orgSkill.id].sort(),
+    });
+
+    // Same for a skill admin, whom the author-only gate would otherwise 422.
+    await promoteCallerToSkillAdmin();
+    const another = await makeSkill();
+    const adminGrow = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: {
+        accessAllSkills: false,
+        skillIds: [theirs.id, orgSkill.id, another.id].sort(),
+      },
+    });
+    expect(adminGrow.statusCode).toBe(200);
+  });
+
+  test("PUT writes an agent.updated audit record capturing the published set", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ organizationId });
+    const skill = await makeSkill();
+
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/skills`,
+      payload: { accessAllSkills: false, skillIds: [skill.id] },
+    });
+    expect(response.statusCode).toBe(200);
+
+    const auditRows = await db
+      .select({
+        action: schema.auditLogsTable.action,
+        before: schema.auditLogsTable.before,
+        after: schema.auditLogsTable.after,
+      })
+      .from(schema.auditLogsTable)
+      .where(
+        and(
+          eq(schema.auditLogsTable.action, "agent.updated"),
+          eq(schema.auditLogsTable.resourceId, agent.id),
+        ),
+      );
+
+    // Publishing a skill to every holder of this gateway's token is exactly
+    // the admin action the audit log must show — a skillIds-only change must
+    // never diff as empty.
+    expect(auditRows).toHaveLength(1);
+    expect(auditRows[0].before).toMatchObject({ skillIds: [] });
+    expect(auditRows[0].after).toMatchObject({ skillIds: [skill.id] });
+  });
+});

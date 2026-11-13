@@ -1,4 +1,9 @@
-import { describe, expect, test } from "@/test";
+import { createHash } from "node:crypto";
+import AnthropicProvider from "@anthropic-ai/sdk";
+import { ArchestraInternalErrorCode } from "@archestra/shared";
+import { describe, expect, test, vi } from "vitest";
+import { policyView } from "@/openappa/result-view";
+import { anthropicStreamPromise } from "@/test/llm-provider-stubs";
 import type { Anthropic } from "@/types";
 import { anthropicAdapterFactory } from "./anthropic";
 
@@ -117,9 +122,272 @@ describe("AnthropicResponseAdapter", () => {
       ]);
     });
   });
+
+  describe("toRefusalResponse", () => {
+    // A refusal replaces the whole message: the model's own text and any tool
+    // call that was allowed are dropped along with the blocked one, and the
+    // turn is reported as finished.
+    test("replaces all content and reports end_turn", () => {
+      const adapter = anthropicAdapterFactory.createResponseAdapter({
+        ...createMockResponse([
+          { type: "text", text: "Checking the cluster." },
+          { type: "tool_use", id: "toolu_ok", name: "allowed_tool", input: {} },
+          { type: "tool_use", id: "toolu_no", name: "blocked_tool", input: {} },
+        ]),
+        stop_reason: "tool_use",
+      });
+
+      const refusal = adapter.toRefusalResponse("refusal", "blocked message");
+
+      expect(refusal.content).toEqual([
+        { type: "text", text: "blocked message", citations: [] },
+      ]);
+      expect(refusal.stop_reason).toBe("end_turn");
+    });
+  });
+
+  describe("getUsage", () => {
+    test("captures the 1h portion of the cache-creation split", () => {
+      const response = {
+        ...createMockResponse([{ type: "text", text: "hi" }]),
+        usage: {
+          input_tokens: 5,
+          output_tokens: 10,
+          cache_read_input_tokens: 2000,
+          cache_creation_input_tokens: 1000,
+          cache_creation: {
+            ephemeral_1h_input_tokens: 400,
+            ephemeral_5m_input_tokens: 600,
+          },
+        },
+      } as Anthropic.Types.MessagesResponse;
+
+      const adapter = anthropicAdapterFactory.createResponseAdapter(response);
+
+      expect(adapter.getUsage()).toEqual({
+        inputTokens: 5,
+        outputTokens: 10,
+        cacheReadTokens: 2000,
+        cacheWriteTokens: 1000,
+        cacheWrite1hTokens: 400,
+      });
+    });
+  });
+});
+
+// Availability checks compare the names a caller declared against the names the
+// model called. These two adapters disagree about provider built-ins, and that
+// disagreement decides whether a call is treated as available — pinned here so
+// any change to either side is visible.
+describe("declared tools vs called tools", () => {
+  const messages = [
+    { role: "user", content: "Hello" },
+  ] as Anthropic.Types.MessagesRequest["messages"];
+
+  test("getTools omits provider built-ins, which carry a type and no input schema", () => {
+    const tools = [
+      {
+        name: "github__list_issues",
+        description: "list issues",
+        input_schema: { type: "object", properties: {} },
+      },
+      { type: "bash_20250124", name: "bash" },
+      { type: "text_editor_20250124", name: "str_replace_editor" },
+    ] as unknown as Anthropic.Types.MessagesRequest["tools"];
+
+    const adapter = anthropicAdapterFactory.createRequestAdapter(
+      createMockRequest(messages, { tools }),
+    );
+
+    expect(adapter.getTools().map((t) => t.name)).toEqual([
+      "github__list_issues",
+    ]);
+  });
+
+  test("a tool declared without a type counts as custom", () => {
+    const tools = [
+      { name: "bash", input_schema: { type: "object", properties: {} } },
+    ] as unknown as Anthropic.Types.MessagesRequest["tools"];
+
+    const adapter = anthropicAdapterFactory.createRequestAdapter(
+      createMockRequest(messages, { tools }),
+    );
+
+    expect(adapter.getTools().map((t) => t.name)).toEqual(["bash"]);
+  });
+
+  test("getToolCalls returns built-in tool calls, which getTools never lists", () => {
+    const adapter = anthropicAdapterFactory.createResponseAdapter(
+      createMockResponse([
+        { type: "tool_use", id: "toolu_bash", name: "bash", input: {} },
+      ]),
+    );
+
+    expect(adapter.getToolCalls().map((c) => c.name)).toEqual(["bash"]);
+  });
 });
 
 describe("AnthropicRequestAdapter", () => {
+  test.each([
+    { content: [] },
+    { content: "" },
+    { content: " \n" },
+    { content: [{ type: "text" as const, text: " \n" }] },
+  ])("drops an empty system placeholder after compaction (%j)", ({
+    content,
+  }) => {
+    const messages: Anthropic.Types.MessagesRequest["messages"] = [
+      { role: "user", content: "Before compaction" },
+      { role: "system", content },
+      { role: "user", content: "Continue after compaction" },
+    ];
+    const request = createMockRequest(messages);
+    const forwarded = anthropicAdapterFactory
+      .createRequestAdapter(request)
+      .toProviderRequest();
+    expect(forwarded.messages).toEqual([messages[0], messages[2]]);
+    expect(request.messages).toEqual(messages);
+  });
+
+  test("preserves real system instructions and conversational tool boundaries", () => {
+    const messages: Anthropic.Types.MessagesRequest["messages"] = [
+      {
+        role: "system",
+        content: [
+          { type: "text", text: "\n" },
+          {
+            type: "text",
+            text: "Keep this instruction",
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+      },
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "call-1", name: "read", input: {} }],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "call-1", content: "" }],
+      },
+    ];
+    expect(
+      anthropicAdapterFactory
+        .createRequestAdapter(createMockRequest(messages))
+        .toProviderRequest().messages,
+    ).toEqual([
+      {
+        role: "system",
+        content: [
+          {
+            type: "text",
+            text: "Keep this instruction",
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+      },
+      messages[1],
+      messages[2],
+    ]);
+  });
+
+  describe("declared tools", () => {
+    const messages = [
+      { role: "user", content: "Hello" },
+    ] as Anthropic.Types.MessagesRequest["messages"];
+
+    const tools = [
+      {
+        name: "github__list_issues",
+        description: "list issues",
+        input_schema: { type: "object", properties: {} },
+      },
+      // Provider built-ins carry a `type` and no input schema.
+      { type: "bash_20250124", name: "bash" },
+      { type: "text_editor_20250124", name: "str_replace_editor" },
+    ] as unknown as Anthropic.Types.MessagesRequest["tools"];
+
+    // getTools() feeds persistence and other callers that want schemas, so it
+    // drops the schema-less built-ins. That loss is why availability is read
+    // from the request body instead — see utils/declared-tool-names.
+    test("getTools drops built-ins that carry no schema", () => {
+      const adapter = anthropicAdapterFactory.createRequestAdapter(
+        createMockRequest(messages, { tools }),
+      );
+
+      expect(adapter.getTools().map((t) => t.name)).toEqual([
+        "github__list_issues",
+      ]);
+    });
+
+    test("a request declaring only built-ins has no schema-carrying tools", () => {
+      const adapter = anthropicAdapterFactory.createRequestAdapter(
+        createMockRequest(messages, {
+          tools: [
+            { type: "bash_20250124", name: "bash" },
+          ] as unknown as Anthropic.Types.MessagesRequest["tools"],
+        }),
+      );
+
+      expect(adapter.getTools()).toEqual([]);
+      // The caller did declare a tool, so the request still counts as having
+      // one even though nothing schema-carrying survives getTools().
+      expect(adapter.hasTools()).toBe(true);
+    });
+
+    test("is empty when no tools are declared", () => {
+      const adapter = anthropicAdapterFactory.createRequestAdapter(
+        createMockRequest(messages),
+      );
+
+      expect(adapter.getTools()).toEqual([]);
+      expect(adapter.hasTools()).toBe(false);
+    });
+  });
+
+  describe("getMessages - tool result error status", () => {
+    // toCommonFormat feeds getMessages(). Dropping is_error there records
+    // every tool result as a success even when the tool reported an error.
+    test.each([
+      ["true", { is_error: true }, true],
+      ["false", { is_error: false }, false],
+      ["absent", {}, false],
+    ] as const)("propagates is_error %s onto the common tool call", (_label, extension, isError) => {
+      const messages = [
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "tool_1", name: "read", input: {} },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tool_1",
+              content: "result body",
+              ...extension,
+            },
+          ],
+        },
+      ] as unknown as Anthropic.Types.MessagesRequest["messages"];
+
+      const adapter = anthropicAdapterFactory.createRequestAdapter(
+        createMockRequest(messages),
+      );
+
+      const toolMessage = adapter
+        .getMessages()
+        .find((message) => message.toolCalls);
+      expect(toolMessage?.toolCalls?.[0]).toMatchObject({
+        id: "tool_1",
+        name: "read",
+        isError,
+      });
+    });
+  });
+
   describe("toProviderRequest - tool results handling", () => {
     test("handles empty tool results (no tool_result blocks)", () => {
       const messages = [
@@ -132,6 +400,213 @@ describe("AnthropicRequestAdapter", () => {
 
       expect(result.messages).toHaveLength(1);
       expect(result.messages[0].role).toBe("user");
+    });
+
+    describe("a tool search result", () => {
+      const references = [
+        { type: "tool_reference", tool_name: "mcp__many__probe_tool_0" },
+      ];
+      const history = () =>
+        [
+          { role: "user", content: "use the probe tool" },
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_0",
+                name: "ToolSearch",
+                input: { query: "select:mcp__many__probe_tool_0" },
+              },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_0",
+                content: references,
+              },
+            ],
+          },
+        ] as unknown as Anthropic.Types.MessagesRequest["messages"];
+      const sentResult = (update: string) => {
+        const adapter = anthropicAdapterFactory.createRequestAdapter(
+          createMockRequest(history()),
+        );
+        adapter.applyToolResultUpdates({ toolu_0: update });
+        const content = adapter.toProviderRequest().messages[2]
+          .content as Array<{
+          content: unknown;
+        }>;
+        return content[0].content;
+      };
+
+      test("keeps its tool_reference blocks when the approved output is the result as sent", () => {
+        expect(sentResult(JSON.stringify(references))).toEqual(references);
+      });
+
+      test("replaces them with the approved text when the output changed", () => {
+        expect(sentResult("withheld")).toBe("withheld");
+      });
+    });
+
+    describe("an image tool result", () => {
+      // Above OpenAPPA's old 64 KiB default, as a pasted screenshot is.
+      const data = Buffer.alloc(200_000, 7).toString("base64");
+      const hash = (value: string) =>
+        createHash("sha256").update(value).digest("hex");
+      const blocks = [
+        { type: "text", text: "Read the file" },
+        {
+          type: "image",
+          source: { type: "base64", media_type: "image/png", data },
+        },
+      ];
+      const sentResultFor = (sentBlocks: unknown[], update: string) => {
+        const messages = [
+          { role: "user", content: "look at the screenshot" },
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_img",
+                name: "Read",
+                input: { file_path: "/tmp/shot.png" },
+              },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_img",
+                content: sentBlocks,
+              },
+            ],
+          },
+        ] as unknown as Anthropic.Types.MessagesRequest["messages"];
+        const adapter = anthropicAdapterFactory.createRequestAdapter(
+          createMockRequest(messages),
+        );
+        adapter.applyToolResultUpdates({ toolu_img: update });
+        const content = adapter.toProviderRequest().messages[2]
+          .content as Array<{ content: unknown }>;
+        return content[0].content;
+      };
+      const sentResult = (update: string) => sentResultFor(blocks, update);
+
+      test("is forwarded byte-identical, text and image, when the approved output is the result as sent", () => {
+        const sent = sentResult(
+          JSON.stringify(policyView(blocks)),
+        ) as typeof blocks;
+        expect(sent).toHaveLength(2);
+        expect(sent[0]).toEqual(blocks[0]);
+        const image = sent[1] as (typeof blocks)[1] & {
+          source: { data: string };
+        };
+        expect(image.type).toBe("image");
+        expect(hash(image.source.data)).toBe(hash(data));
+      });
+
+      test("is not forwarded as an image when the runtime rewrote the text beside it", () => {
+        // A sanitizer rewrote the text part: the approved output is no longer
+        // the result as sent, so the replaced output wins and no image block
+        // reaches the provider.
+        const rewritten = JSON.stringify(
+          policyView([{ ...blocks[0], text: "[redacted]" }, blocks[1]]),
+        );
+        const sent = sentResult(rewritten);
+        expect(typeof sent).toBe("string");
+        expect(sent).toBe(rewritten);
+        // The model reads the marker, never the bytes.
+        expect(sent).toContain("[binary image/png, 200000 bytes, sha256 ");
+        expect(sent).not.toContain(data.slice(0, 64));
+      });
+
+      test("a later request with the same bytes under the same id still forwards the image", () => {
+        // The client resends the history, and the runtime answers from its stored decision.
+        const stored = JSON.stringify(policyView(blocks));
+        const first = sentResult(stored) as typeof blocks;
+        const later = sentResult(stored) as typeof blocks;
+        expect(
+          hash((later[1] as { source: { data: string } }).source.data),
+        ).toBe(hash((first[1] as { source: { data: string } }).source.data));
+      });
+
+      test("different bytes under the same id are not forwarded", () => {
+        const stored = JSON.stringify(policyView(blocks));
+        const other = Buffer.alloc(200_000, 9).toString("base64");
+        const sent = sentResultFor(
+          [
+            blocks[0],
+            { ...blocks[1], source: { ...blocks[1].source, data: other } },
+          ],
+          stored,
+        );
+        expect(typeof sent).toBe("string");
+        expect(sent).toBe(stored);
+        expect(sent).not.toContain(other.slice(0, 64));
+      });
+
+      test("keeps a text-only result as text blocks when it is kept as sent", () => {
+        const textBlocks = [
+          { type: "text", text: "first" },
+          { type: "text", text: "second" },
+        ];
+        const adapter = anthropicAdapterFactory.createRequestAdapter(
+          createMockRequest([
+            { role: "user", content: "go" },
+            {
+              role: "assistant",
+              content: [
+                { type: "tool_use", id: "toolu_t", name: "Read", input: {} },
+              ],
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_t",
+                  content: textBlocks,
+                },
+              ],
+            },
+          ] as unknown as Anthropic.Types.MessagesRequest["messages"]),
+        );
+        adapter.applyToolResultUpdates({
+          toolu_t: JSON.stringify(textBlocks),
+        });
+        const content = adapter.toProviderRequest().messages[2]
+          .content as Array<{ content: unknown }>;
+        expect(content[0].content).toEqual(textBlocks);
+      });
+
+      test("keeps the client's blocks for a result approved before binary parts were replaced by markers", () => {
+        // A stored decision from before the policy view holds the full JSON.
+        const sent = sentResult(JSON.stringify(blocks)) as typeof blocks;
+        expect(sent).toHaveLength(2);
+        expect(
+          hash((sent[1] as { source: { data: string } }).source.data),
+        ).toBe(hash(data));
+      });
+
+      test("keeps a legacy placeholder for a result that was not carried", () => {
+        const placeholder =
+          "[appa] the result was not carried; nothing was admitted";
+        expect(sentResult(placeholder)).toBe(placeholder);
+      });
+
+      test("is not forwarded when the approved output replaces it", () => {
+        const placeholder = "[appa] withheld";
+        const sent = sentResult(placeholder);
+        expect(sent).toBe(placeholder);
+        expect(JSON.stringify(sent)).not.toContain(data.slice(0, 64));
+      });
     });
 
     test("preserves successful tool results in user message with tool_result blocks", () => {
@@ -326,6 +801,51 @@ describe("AnthropicRequestAdapter", () => {
       }>;
       expect(content[0].content).toBe('{"modified": "data", "extra": "field"}');
     });
+
+    test("an empty semantic update removes every raw tool-result content block", () => {
+      const messages = [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "spawn",
+              name: "wait_agent",
+              input: {},
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "spawn",
+              content: [
+                { type: "text", text: "RAW child return" },
+                { type: "text", text: "RAW unsigned sibling" },
+              ],
+              is_error: false,
+            },
+          ],
+        },
+      ] as unknown as Anthropic.Types.MessagesRequest["messages"];
+      const adapter = anthropicAdapterFactory.createRequestAdapter(
+        createMockRequest(messages),
+      );
+
+      adapter.applyToolResultUpdates({ spawn: "" });
+      const forwarded = adapter.toProviderRequest();
+      const resultContent = forwarded.messages[1].content as Array<{
+        type: string;
+        content?: unknown;
+      }>;
+
+      expect(JSON.stringify(forwarded)).not.toContain("RAW");
+      expect(resultContent).toEqual([
+        expect.objectContaining({ type: "tool_result", content: "" }),
+      ]);
+    });
   });
 
   describe("toProviderRequest - MCP image handling", () => {
@@ -441,4 +961,1332 @@ describe("AnthropicRequestAdapter", () => {
       ]);
     });
   });
+});
+
+describe("anthropicAdapterFactory.executeStream", () => {
+  function sseEvent(event: string, data: unknown): string {
+    return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  }
+
+  // builds a real Anthropic client whose transport returns a canned SSE body,
+  // so the real SDK stream parsing runs without hitting the network.
+  function clientWithSseBody(body: string): AnthropicProvider {
+    const fakeFetch = (async () =>
+      new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      })) as unknown as typeof globalThis.fetch;
+    return new AnthropicProvider({ apiKey: "test-key", fetch: fakeFetch });
+  }
+
+  // partial_json fragments that concatenate into more than one JSON value. The
+  // SDK's messages.stream() helper eagerly partial-parses the accumulated buffer
+  // and throws on this; the raw create() stream must tolerate it.
+  test("does not throw when tool input deltas concatenate into two JSON values", async () => {
+    const body =
+      sseEvent("message_start", {
+        type: "message_start",
+        message: {
+          id: "msg_1",
+          type: "message",
+          role: "assistant",
+          model: "claude-3-5-sonnet-20241022",
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      }) +
+      sseEvent("content_block_start", {
+        type: "content_block_start",
+        index: 0,
+        content_block: {
+          type: "tool_use",
+          id: "toolu_1",
+          name: "do_thing",
+          input: {},
+        },
+      }) +
+      sseEvent("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: '{"city":"SF"}' },
+      }) +
+      sseEvent("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: '{"unit":"c"}' },
+      }) +
+      sseEvent("content_block_stop", { type: "content_block_stop", index: 0 }) +
+      sseEvent("message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: "tool_use", stop_sequence: null },
+        usage: { output_tokens: 2 },
+      }) +
+      sseEvent("message_stop", { type: "message_stop" });
+
+    const client = clientWithSseBody(body);
+    const stream = await anthropicAdapterFactory.executeStream(
+      client,
+      createMockRequest([{ role: "user", content: "hi" }]),
+    );
+
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+    for await (const event of stream) {
+      adapter.processChunk(event);
+    }
+
+    // Reading the buffered events is what hands them to the client.
+    adapter.getRawToolCallEvents();
+    const response = adapter.toProviderResponse();
+    const toolUse = response.content.find((block) => block.type === "tool_use");
+    expect(toolUse).toBeDefined();
+    // malformed accumulated arguments fall back to empty input rather than crashing.
+    expect((toolUse as { input: unknown }).input).toEqual({});
+  });
+
+  test("reports a tool called with no input as an empty object", () => {
+    // Anthropic streams no partial_json for a tool whose input is `{}`.
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+    for (const chunk of [
+      {
+        type: "message_start",
+        message: {
+          id: "msg_empty",
+          type: "message",
+          role: "assistant",
+          model: "claude-3-5-sonnet-20241022",
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      },
+      {
+        type: "content_block_start",
+        index: 0,
+        content_block: {
+          type: "tool_use",
+          id: "toolu_empty",
+          name: "get_time",
+          input: {},
+        },
+      },
+      { type: "content_block_stop", index: 0 },
+    ]) {
+      adapter.processChunk(chunk as never);
+    }
+
+    expect(adapter.state.toolCalls).toEqual([
+      expect.objectContaining({ id: "toolu_empty", arguments: "{}" }),
+    ]);
+  });
+
+  test("attributes interleaved tool input deltas to their own blocks", () => {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+    const start = (index: number, id: string) => ({
+      type: "content_block_start",
+      index,
+      content_block: { type: "tool_use", id, name: "get_weather", input: {} },
+    });
+    const delta = (index: number, partial_json: string) => ({
+      type: "content_block_delta",
+      index,
+      delta: { type: "input_json_delta", partial_json },
+    });
+    for (const chunk of [
+      {
+        type: "message_start",
+        message: {
+          id: "msg_interleaved",
+          type: "message",
+          role: "assistant",
+          model: "claude-3-5-sonnet-20241022",
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      },
+      start(0, "toolu_a"),
+      delta(0, '{"city":'),
+      start(1, "toolu_b"),
+      delta(1, '{"city":"Oslo"}'),
+      delta(0, '"SF"}'),
+      { type: "content_block_stop", index: 1 },
+      { type: "content_block_stop", index: 0 },
+    ]) {
+      adapter.processChunk(chunk as never);
+    }
+
+    expect(
+      adapter.state.toolCalls.map((call) => [
+        call.id,
+        JSON.parse(call.arguments),
+      ]),
+    ).toEqual([
+      ["toolu_a", { city: "SF" }],
+      ["toolu_b", { city: "Oslo" }],
+    ]);
+  });
+
+  test("parses tool input from well-formed incremental deltas", async () => {
+    const body =
+      sseEvent("message_start", {
+        type: "message_start",
+        message: {
+          id: "msg_2",
+          type: "message",
+          role: "assistant",
+          model: "claude-3-5-sonnet-20241022",
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      }) +
+      sseEvent("content_block_start", {
+        type: "content_block_start",
+        index: 0,
+        content_block: {
+          type: "tool_use",
+          id: "toolu_2",
+          name: "do_thing",
+          input: {},
+        },
+      }) +
+      sseEvent("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: '{"city":' },
+      }) +
+      sseEvent("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: '"SF"}' },
+      }) +
+      sseEvent("content_block_stop", { type: "content_block_stop", index: 0 }) +
+      sseEvent("message_stop", { type: "message_stop" });
+
+    const client = clientWithSseBody(body);
+    const stream = await anthropicAdapterFactory.executeStream(
+      client,
+      createMockRequest([{ role: "user", content: "hi" }]),
+    );
+
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+    for await (const event of stream) {
+      adapter.processChunk(event);
+    }
+
+    // Reading the buffered events is what hands them to the client.
+    adapter.getRawToolCallEvents();
+    const response = adapter.toProviderResponse();
+    const toolUse = response.content.find((block) => block.type === "tool_use");
+    expect((toolUse as { input: unknown }).input).toEqual({ city: "SF" });
+  });
+});
+
+describe("AnthropicStreamAdapter content block forwarding", () => {
+  type Chunk = Parameters<
+    ReturnType<
+      typeof anthropicAdapterFactory.createStreamAdapter
+    >["processChunk"]
+  >[0];
+
+  // Claude Code streams with interleaved thinking; thinking events must reach
+  // the client immediately (it replays them, signed, on the next turn), while
+  // client tool_use events stay held back for policy evaluation.
+  test("forwards thinking events and holds back tool_use events", () => {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+
+    const thinkingStart = adapter.processChunk({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "thinking", thinking: "", signature: "" },
+    } as Chunk);
+    expect(thinkingStart.sseData).toContain("content_block_start");
+    expect(thinkingStart.isToolCallChunk).toBe(false);
+
+    const thinkingDelta = adapter.processChunk({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "thinking_delta", thinking: "Let me think" },
+    } as Chunk);
+    expect(thinkingDelta.sseData).toContain("thinking_delta");
+
+    const signatureDelta = adapter.processChunk({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "signature_delta", signature: "sig-abc" },
+    } as Chunk);
+    expect(signatureDelta.sseData).toContain("signature_delta");
+
+    const toolStart = adapter.processChunk({
+      type: "content_block_start",
+      index: 1,
+      content_block: {
+        type: "tool_use",
+        id: "toolu_1",
+        name: "do_thing",
+        input: {},
+      },
+    } as Chunk);
+    expect(toolStart.sseData).toBeNull();
+    expect(toolStart.isToolCallChunk).toBe(true);
+
+    const toolDelta = adapter.processChunk({
+      type: "content_block_delta",
+      index: 1,
+      delta: { type: "input_json_delta", partial_json: '{"city":"SF"}' },
+    } as Chunk);
+    expect(toolDelta.sseData).toBeNull();
+    expect(toolDelta.isToolCallChunk).toBe(true);
+    expect(adapter.state.toolCalls[0].arguments).toBe('{"city":"SF"}');
+  });
+
+  test("forwards server_tool_use input deltas without polluting client tool calls", () => {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+
+    // a held-back client tool call, then a server tool block
+    adapter.processChunk({
+      type: "content_block_start",
+      index: 0,
+      content_block: {
+        type: "tool_use",
+        id: "toolu_1",
+        name: "do_thing",
+        input: {},
+      },
+    } as Chunk);
+
+    const serverStart = adapter.processChunk({
+      type: "content_block_start",
+      index: 1,
+      content_block: {
+        type: "server_tool_use",
+        id: "srvtoolu_1",
+        name: "web_search",
+        input: {},
+      },
+    } as Chunk);
+    expect(serverStart.sseData).toContain("server_tool_use");
+    expect(serverStart.isToolCallChunk).toBe(false);
+
+    const serverDelta = adapter.processChunk({
+      type: "content_block_delta",
+      index: 1,
+      delta: { type: "input_json_delta", partial_json: '{"query":"x"}' },
+    } as Chunk);
+    expect(serverDelta.sseData).toContain("input_json_delta");
+    expect(serverDelta.isToolCallChunk).toBe(false);
+    // the server tool's input must not leak into the client tool call
+    expect(adapter.state.toolCalls).toHaveLength(1);
+    expect(adapter.state.toolCalls[0].arguments).toBe("");
+  });
+});
+
+// A client applies deltas by index but appends blocks in arrival order, so the
+// indices it is given must be contiguous and in the order it receives them —
+// whatever the upstream numbering was, and whichever blocks were withheld.
+describe("AnthropicStreamAdapter content-block renumbering", () => {
+  type Chunk = Parameters<
+    ReturnType<
+      typeof anthropicAdapterFactory.createStreamAdapter
+    >["processChunk"]
+  >[0];
+
+  function indicesIn(
+    events: (string | Uint8Array | null | undefined)[],
+  ): number[] {
+    return events
+      .filter((e): e is string => typeof e === "string")
+      .flatMap((e) =>
+        [...e.matchAll(/"index":(\d+)/g)].map((m) => Number(m[1])),
+      );
+  }
+
+  /** Upstream: text@0, tool_use@1 (withheld), text@2. */
+  function streamTextAroundToolCall() {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+    const live: (string | Uint8Array | null | undefined)[] = [];
+    const push = (chunk: Chunk) => {
+      live.push(adapter.processChunk(chunk).sseData);
+    };
+    push({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    } as Chunk);
+    push({ type: "content_block_stop", index: 0 } as Chunk);
+    push({
+      type: "content_block_start",
+      index: 1,
+      content_block: {
+        type: "tool_use",
+        id: "toolu_1",
+        name: "list",
+        input: {},
+      },
+    } as Chunk);
+    push({ type: "content_block_stop", index: 1 } as Chunk);
+    push({
+      type: "content_block_start",
+      index: 2,
+      content_block: { type: "text", text: "" },
+    } as Chunk);
+    push({ type: "content_block_stop", index: 2 } as Chunk);
+    return { adapter, live };
+  }
+
+  test("a withheld tool block leaves no gap in the indices the client sees", () => {
+    const { live } = streamTextAroundToolCall();
+
+    // Upstream numbered these 0 and 2; the client must see 0 and 1.
+    expect(indicesIn(live)).toEqual([0, 0, 1, 1]);
+  });
+
+  test("a released tool block takes the next free index, not its upstream one", () => {
+    const { adapter, live } = streamTextAroundToolCall();
+
+    const flushed = adapter.getRawToolCallEvents();
+
+    expect(indicesIn(live)).toEqual([0, 0, 1, 1]);
+    expect(indicesIn(flushed)).toEqual([2, 2]);
+  });
+
+  test("reading the buffered events twice keeps the same index", () => {
+    const { adapter } = streamTextAroundToolCall();
+
+    const first = adapter.getRawToolCallEvents();
+    const second = adapter.getRawToolCallEvents();
+
+    expect(indicesIn(second)).toEqual(indicesIn(first));
+  });
+
+  test("a refusal block takes the next free index after the live blocks", () => {
+    const { adapter } = streamTextAroundToolCall();
+
+    const refusal = adapter.formatCompleteTextSSE("blocked").join("");
+
+    // The tool block was never released, so 2 is free for the refusal.
+    expect(indicesIn([refusal])).toEqual([2, 2, 2]);
+  });
+
+  // A thinking block and its signature have to be replayed verbatim on the next
+  // turn or the upstream API rejects the conversation, so renumbering must move
+  // its index without touching its payload — and it must not inherit the index
+  // of the tool block withheld after it.
+  test("a thinking block keeps its signature and is renumbered around a withheld call", () => {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+    const live: (string | Uint8Array | null | undefined)[] = [];
+    const push = (chunk: Chunk) => {
+      live.push(adapter.processChunk(chunk).sseData);
+    };
+
+    push({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "thinking", thinking: "" },
+    } as Chunk);
+    push({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "signature_delta", signature: "sig_abc123" },
+    } as Chunk);
+    push({ type: "content_block_stop", index: 0 } as Chunk);
+    push({
+      type: "content_block_start",
+      index: 1,
+      content_block: {
+        type: "tool_use",
+        id: "toolu_1",
+        name: "list",
+        input: {},
+      },
+    } as Chunk);
+    push({ type: "content_block_stop", index: 1 } as Chunk);
+    push({
+      type: "content_block_start",
+      index: 2,
+      content_block: { type: "text", text: "" },
+    } as Chunk);
+    push({ type: "content_block_stop", index: 2 } as Chunk);
+
+    const wire = live
+      .filter((e): e is string => typeof e === "string")
+      .join("");
+    expect(wire).toContain("sig_abc123");
+    expect(wire).toContain('"type":"thinking"');
+    // Thinking at 0, the text that followed the withheld call at 1.
+    expect(indicesIn(live)).toEqual([0, 0, 0, 1, 1]);
+  });
+
+  // One withheld block can only ever be off by one, which several bugs survive.
+  // Two withheld blocks split by live text is where an index is reused or
+  // skipped: each released block has to take the next free index in flush
+  // order, and the text between them must not inherit either one's number.
+  test("several withheld blocks each take their own index in flush order", () => {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+    const live: (string | Uint8Array | null | undefined)[] = [];
+    const push = (chunk: Chunk) => {
+      live.push(adapter.processChunk(chunk).sseData);
+    };
+    // Upstream: text@0, tool@1, text@2, tool@3, text@4.
+    for (const [index, kind] of [
+      [0, "text"],
+      [1, "tool"],
+      [2, "text"],
+      [3, "tool"],
+      [4, "text"],
+    ] as const) {
+      push({
+        type: "content_block_start",
+        index,
+        content_block:
+          kind === "text"
+            ? { type: "text", text: "" }
+            : {
+                type: "tool_use",
+                id: `toolu_${index}`,
+                name: "list",
+                input: {},
+              },
+      } as Chunk);
+      push({ type: "content_block_stop", index } as Chunk);
+    }
+
+    // The three text blocks are the only ones live, so they must be 0, 1, 2.
+    expect(indicesIn(live)).toEqual([0, 0, 1, 1, 2, 2]);
+
+    // Both calls then take the next two free indices, in the order they were
+    // buffered — never reusing an index the client already applied text to.
+    const flushed = adapter.getRawToolCallEvents();
+    expect(indicesIn(flushed)).toEqual([3, 3, 4, 4]);
+
+    adapter.getRawToolCallEvents();
+    expect(
+      adapter.toProviderResponse().content.filter((b) => b.type === "tool_use"),
+    ).toMatchObject([{ id: "toolu_1" }, { id: "toolu_3" }]);
+  });
+});
+
+describe("AnthropicStreamAdapter policy refusal terminal", () => {
+  type Chunk = Parameters<
+    ReturnType<
+      typeof anthropicAdapterFactory.createStreamAdapter
+    >["processChunk"]
+  >[0];
+
+  // Reproduces the reported incident: a blocked tool-call turn must not end the
+  // stream with the upstream "tool_use" stop reason, or Claude Code reads the
+  // text-only refusal as a malformed tool call and retries it.
+  function streamBlockedToolTurn() {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+    // A text block streams live at index 0...
+    adapter.processChunk({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    } as Chunk);
+    adapter.processChunk({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "let me check" },
+    } as Chunk);
+    adapter.processChunk({
+      type: "content_block_stop",
+      index: 0,
+    } as Chunk);
+    // ...then a tool_use block at index 1 is buffered (held back)...
+    adapter.processChunk({
+      type: "content_block_start",
+      index: 1,
+      content_block: {
+        type: "tool_use",
+        id: "toolu_1",
+        name: "list",
+        input: {},
+      },
+    } as Chunk);
+    adapter.processChunk({
+      type: "content_block_delta",
+      index: 1,
+      delta: { type: "input_json_delta", partial_json: '{"a":1}' },
+    } as Chunk);
+    adapter.processChunk({
+      type: "content_block_stop",
+      index: 1,
+    } as Chunk);
+    // ...and the upstream turn ends with a tool_use stop reason.
+    adapter.processChunk({
+      type: "message_delta",
+      delta: { stop_reason: "tool_use", stop_sequence: null },
+      usage: { output_tokens: 5 },
+    } as Chunk);
+    return adapter;
+  }
+
+  test("formatEndSSE closes a refused stream as end_turn, not the upstream tool_use", () => {
+    const adapter = streamBlockedToolTurn();
+
+    adapter.formatCompleteTextSSE(
+      "Archestra LLM Proxy blocked unsafe tool call",
+    );
+    const endEvents = adapter.formatEndSSE();
+
+    expect(endEvents).toContain('"stop_reason":"end_turn"');
+    expect(endEvents).not.toContain('"stop_reason":"tool_use"');
+  });
+
+  // The refusal takes the next index the client has not been given. A withheld
+  // tool block never took one, so the number it would have had upstream is
+  // still free.
+  test("formatCompleteTextSSE ignores tool_use indices when choosing its own", () => {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    } as Chunk);
+    adapter.processChunk({ type: "content_block_stop", index: 0 } as Chunk);
+    adapter.processChunk({
+      type: "content_block_start",
+      index: 1,
+      content_block: {
+        type: "tool_use",
+        id: "toolu_1",
+        name: "list",
+        input: {},
+      },
+    } as Chunk);
+    adapter.processChunk({ type: "content_block_stop", index: 1 } as Chunk);
+
+    const refusal = adapter.formatCompleteTextSSE("blocked").join("");
+
+    // Withheld tool blocks leave their index free, so 1 is correct here.
+    expect(refusal).toContain('"index":1');
+    expect(refusal).not.toContain('"index":2');
+  });
+
+  test("refusal text block is placed after already-streamed blocks (no index reuse)", () => {
+    const adapter = streamBlockedToolTurn();
+
+    const refusalEvents = adapter.formatCompleteTextSSE("blocked").join("");
+
+    // index 0 was already streamed (the text block); the refusal must use index 1.
+    expect(refusalEvents).toContain('"index":1');
+    expect(refusalEvents).not.toContain('"index":0');
+  });
+
+  // A turn cut short before the gate ran — an upstream drop, an abort —
+  // delivered no tool calls, so recording them would assert a delivery, and a
+  // policy decision, that never happened.
+  test("toProviderResponse omits tool calls that were never released", () => {
+    const adapter = streamBlockedToolTurn();
+
+    const response = adapter.toProviderResponse();
+
+    expect(response.content.some((block) => block.type === "tool_use")).toBe(
+      false,
+    );
+  });
+
+  // Upstream reported `tool_use` because it did emit calls, but they were
+  // withheld, so the recorded turn holds none. Keeping the upstream reason
+  // would leave a record that contradicts its own content and reads as though
+  // a tool result is owed for a call nobody can point to.
+  test("a turn whose calls were never released is not recorded as owing a result", () => {
+    const adapter = streamBlockedToolTurn();
+
+    const response = adapter.toProviderResponse();
+
+    expect(response.content.some((block) => block.type === "tool_use")).toBe(
+      false,
+    );
+    expect(response.stop_reason).toBe("end_turn");
+  });
+
+  test("a turn whose calls were released keeps the tool_use stop reason", () => {
+    const adapter = streamBlockedToolTurn();
+
+    adapter.getRawToolCallEvents();
+    const response = adapter.toProviderResponse();
+
+    expect(response.content.some((block) => block.type === "tool_use")).toBe(
+      true,
+    );
+    expect(response.stop_reason).toBe("tool_use");
+  });
+
+  // Only `tool_use` is ever rewritten, and only when the content disagrees with
+  // it. Every other reason is the upstream's to state — a turn truncated by
+  // max_tokens still has to say so, or a client cannot tell it was cut off.
+  test("a stop reason other than tool_use is passed through untouched", () => {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+
+    adapter.processChunk({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    } as Chunk);
+    adapter.processChunk({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "truncated" },
+    } as Chunk);
+    adapter.processChunk({
+      type: "message_delta",
+      delta: { stop_reason: "max_tokens", stop_sequence: null },
+      usage: { output_tokens: 5 },
+    } as Chunk);
+
+    expect(adapter.toProviderResponse().stop_reason).toBe("max_tokens");
+  });
+
+  // Thinking blocks stream to the client but were never accumulated, so the
+  // reconstructed turn — the one persisted as the interaction — recorded a
+  // reasoning turn as though the model had gone straight to its answer. The
+  // signature rides with the block: it is what makes a thinking block
+  // replayable, and a record without it describes something upstream rejects.
+  test("toProviderResponse records the reasoning the model produced", () => {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+
+    adapter.processChunk({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "thinking", thinking: "", signature: "" },
+    } as Chunk);
+    adapter.processChunk({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "thinking_delta", thinking: "weighing it up" },
+    } as Chunk);
+    adapter.processChunk({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "signature_delta", signature: "sig-abc" },
+    } as Chunk);
+    adapter.processChunk({ type: "content_block_stop", index: 0 } as Chunk);
+
+    adapter.processChunk({
+      type: "content_block_start",
+      index: 1,
+      content_block: { type: "text", text: "" },
+    } as Chunk);
+    adapter.processChunk({
+      type: "content_block_delta",
+      index: 1,
+      delta: { type: "text_delta", text: "the answer" },
+    } as Chunk);
+    adapter.processChunk({ type: "content_block_stop", index: 1 } as Chunk);
+
+    const response = adapter.toProviderResponse();
+
+    // Reasoning leads, matching the order upstream emitted it.
+    expect(response.content).toEqual([
+      { type: "thinking", thinking: "weighing it up", signature: "sig-abc" },
+      { type: "text", text: "the answer", citations: null },
+    ]);
+  });
+
+  // A governed child return that never crossed must not survive into the
+  // persisted turn: the interaction record is part of what later requests
+  // and reviewers read back.
+  test("a replaced response drops the raw answer and its reasoning", () => {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+
+    adapter.processChunk({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "thinking", thinking: "", signature: "" },
+    } as Chunk);
+    adapter.processChunk({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "thinking_delta", thinking: "raw deliberation" },
+    } as Chunk);
+    adapter.processChunk({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "signature_delta", signature: "sig-abc" },
+    } as Chunk);
+    adapter.processChunk({ type: "content_block_stop", index: 0 } as Chunk);
+    adapter.processChunk({
+      type: "content_block_start",
+      index: 1,
+      content_block: { type: "text", text: "" },
+    } as Chunk);
+    adapter.processChunk({
+      type: "content_block_delta",
+      index: 1,
+      delta: { type: "text_delta", text: "REPORT-RAW-KOALA-0831" },
+    } as Chunk);
+    adapter.processChunk({ type: "content_block_stop", index: 1 } as Chunk);
+
+    adapter.prepareResponseReplacement?.();
+    adapter.formatCompleteTextSSE("SUMMARY(24 characters): safe");
+    const response = adapter.toProviderResponse();
+
+    expect(response.content).toEqual([
+      { type: "text", text: "SUMMARY(24 characters): safe", citations: null },
+    ]);
+  });
+
+  test("toProviderResponse records a redacted thinking block", () => {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+
+    adapter.processChunk({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "redacted_thinking", data: "encrypted-blob" },
+    } as Chunk);
+    adapter.processChunk({ type: "content_block_stop", index: 0 } as Chunk);
+
+    const response = adapter.toProviderResponse();
+
+    expect(response.content).toEqual([
+      { type: "redacted_thinking", data: "encrypted-blob" },
+    ]);
+  });
+
+  test("toProviderResponse records tool calls once they are released", () => {
+    const adapter = streamBlockedToolTurn();
+
+    adapter.getRawToolCallEvents();
+    const response = adapter.toProviderResponse();
+
+    expect(
+      response.content.filter((block) => block.type === "tool_use"),
+    ).toMatchObject([{ id: "toolu_1", name: "list" }]);
+  });
+
+  test("governed replacement clears released calls and raw stream state", () => {
+    const adapter = streamBlockedToolTurn();
+    expect(adapter.getRawToolCallEvents()).not.toHaveLength(0);
+
+    adapter.prepareResponseReplacement?.();
+    const replacement = adapter
+      .formatCompleteTextSSE("SUMMARY(24 characters): safe")
+      .join("");
+    const endEvents = adapter.formatEndSSE();
+    const response = adapter.toProviderResponse();
+
+    expect(adapter.getRawToolCallEvents()).toEqual([]);
+    expect(replacement).toContain('"index":0');
+    expect(endEvents).toContain('"stop_reason":"end_turn"');
+    expect(endEvents).not.toContain('"stop_reason":"tool_use"');
+    expect(response.stop_reason).toBe("end_turn");
+    expect(response.content).toEqual([
+      { type: "text", text: "SUMMARY(24 characters): safe", citations: null },
+    ]);
+  });
+
+  // The record has to describe the turn the CLIENT saw. "let me check" was
+  // streamed live and the refusal was appended after it as a further block, so
+  // both belong. Keeping only the refusal deleted the model's own answer from
+  // history — a later reader (conversation replay, a summarizer, a human
+  // debugging the run) then saw a turn in which the model never spoke.
+  test("toProviderResponse keeps the streamed text and appends the refusal", () => {
+    const adapter = streamBlockedToolTurn();
+
+    adapter.formatCompleteTextSSE("blocked message");
+    const response = adapter.toProviderResponse();
+
+    expect(response.stop_reason).toBe("end_turn");
+    expect(response.content).toEqual([
+      { type: "text", text: "let me check", citations: null },
+      { type: "text", text: "blocked message", citations: null },
+    ]);
+    // The blocked call was never delivered, so it must not appear in the record.
+    expect(response.content.some((block) => block.type === "tool_use")).toBe(
+      false,
+    );
+  });
+});
+
+describe("anthropicAdapterFactory.execute", () => {
+  test("reports upstream response headers to the proxy", async () => {
+    const responseHeaders = new Headers({
+      "content-type": "application/json",
+      "anthropic-ratelimit-unified-status": "rejected",
+      "anthropic-ratelimit-unified-overage-status": "allowed",
+    });
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify(
+            createMockResponse([{ type: "text", text: "ok", citations: null }]),
+          ),
+          { status: 200, headers: responseHeaders },
+        ),
+      );
+    const onResponseHeaders = vi.fn();
+
+    try {
+      const client = anthropicAdapterFactory.createClient("test-key", {
+        source: "api",
+        onResponseHeaders,
+      });
+
+      await anthropicAdapterFactory.execute(
+        client,
+        createMockRequest([{ role: "user", content: "hi" }]),
+      );
+
+      expect(onResponseHeaders).toHaveBeenCalledTimes(1);
+      expect(
+        onResponseHeaders.mock.calls[0]?.[0].get(
+          "anthropic-ratelimit-unified-overage-status",
+        ),
+      ).toBe("allowed");
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  test("does not use headers from a failed upstream attempt for billing", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          type: "error",
+          error: { type: "invalid_request_error", message: "Invalid request" },
+        }),
+        {
+          status: 400,
+          headers: {
+            "content-type": "application/json",
+            "anthropic-ratelimit-unified-status": "rejected",
+            "anthropic-ratelimit-unified-overage-status": "allowed",
+          },
+        },
+      ),
+    );
+    const onResponseHeaders = vi.fn();
+
+    try {
+      const client = anthropicAdapterFactory.createClient("test-key", {
+        source: "api",
+        onResponseHeaders,
+      });
+
+      await expect(
+        anthropicAdapterFactory.execute(
+          client,
+          createMockRequest([{ role: "user", content: "hi" }]),
+        ),
+      ).rejects.toBeDefined();
+      expect(onResponseHeaders).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  // Claude Code sends large max_tokens (e.g. 32000) non-streaming. Such a
+  // request would exceed the SDK's ~10-minute non-streaming limit, so — rather
+  // than attempt it non-streaming (which the client's explicit timeout would
+  // cap) — the proxy serves it over the streaming Messages API and returns the
+  // accumulated final Message. The result is forwarded, never 500-ed. Uses the
+  // real client so the real routing decision runs; only the stream transport is
+  // stubbed.
+  test("serves a large-max_tokens request over the streaming API and forwards the result", async () => {
+    const client = anthropicAdapterFactory.createClient("test-key", {
+      source: "api",
+    }) as AnthropicProvider;
+
+    const finalMessage = createMockResponse([
+      { type: "text", text: "ok", citations: null },
+    ]);
+    const stream = vi.spyOn(client.messages, "stream").mockReturnValue({
+      finalMessage: () => Promise.resolve(finalMessage),
+    } as unknown as ReturnType<typeof client.messages.stream>);
+    const create = vi.spyOn(client.messages, "create");
+
+    const response = await anthropicAdapterFactory.execute(
+      client,
+      createMockRequest([{ role: "user", content: "hi" }], {
+        model: "claude-opus-4-20250514",
+        max_tokens: 64000,
+      }),
+    );
+
+    // Routed to streaming (max_tokens=64000 > the ~21k non-streaming limit),
+    // never the non-streaming path.
+    expect(stream).toHaveBeenCalledTimes(1);
+    expect(create).not.toHaveBeenCalled();
+    expect(response.content[0]).toMatchObject({ type: "text", text: "ok" });
+  });
+});
+
+describe("anthropicAdapterFactory balance-too-low message", () => {
+  // The SDK nests the provider body as error.error.{type,message}.
+  function sdkError(
+    status: number,
+    type: string,
+    message: string,
+  ): { status: number; error: { error: { type: string; message: string } } } {
+    return { status, error: { error: { type, message } } };
+  }
+
+  test("returns one unified message for both out-of-credit and usage-limit blocks", () => {
+    const creditError = sdkError(
+      402,
+      "billing_error",
+      "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.",
+    );
+    // A usage/spend cap: HTTP 400 with a non-standard `api_validation_error`
+    // type, so it's detected off the body message.
+    const limitError = sdkError(
+      400,
+      "api_validation_error",
+      "You have reached your specified API usage limits.",
+    );
+
+    for (const error of [creditError, limitError]) {
+      expect(anthropicAdapterFactory.extractInternalCode(error)).toBe(
+        ArchestraInternalErrorCode.ProviderInsufficientBalance,
+      );
+    }
+
+    const creditMessage =
+      anthropicAdapterFactory.extractErrorMessage(creditError);
+    const limitMessage =
+      anthropicAdapterFactory.extractErrorMessage(limitError);
+
+    // Same message for both; no Anthropic raw text / Console steering.
+    expect(creditMessage).toBe(limitMessage);
+    expect(creditMessage).toMatch(/remaining usage balance is too low/i);
+    expect(creditMessage).toMatch(/please contact your administrator/i);
+    expect(creditMessage).not.toMatch(/Plans & Billing/i);
+  });
+
+  test("does not flag an ordinary error, relays its message verbatim", () => {
+    const error = sdkError(
+      400,
+      "invalid_request_error",
+      'messages: roles must alternate between "user" and "assistant"',
+    );
+    expect(anthropicAdapterFactory.extractInternalCode(error)).toBeUndefined();
+    expect(anthropicAdapterFactory.extractErrorMessage(error)).toContain(
+      "roles must alternate",
+    );
+  });
+});
+
+describe("anthropicAdapterFactory.execute - long-request routing", () => {
+  const messages = [
+    { role: "user", content: "hi" },
+  ] as Anthropic.Types.MessagesRequest["messages"];
+
+  test("routes to non-streaming create() when the request fits the non-streaming limit", async () => {
+    const response = createMockResponse([{ type: "text", text: "ok" }]);
+    const create = vi.fn().mockResolvedValue(response);
+    const stream = vi.fn();
+    // The SDK guard returns a timeout (does not throw) → request fits.
+    const calculateNonstreamingTimeout = vi.fn().mockReturnValue(600000);
+    const client = {
+      calculateNonstreamingTimeout,
+      messages: { create, stream },
+    };
+
+    const result = await anthropicAdapterFactory.execute(
+      client,
+      createMockRequest(messages, { max_tokens: 1024 }),
+    );
+
+    expect(result).toBe(response);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(stream).not.toHaveBeenCalled();
+    // The routing decision is keyed on the request's own max_tokens.
+    expect(calculateNonstreamingTimeout).toHaveBeenCalledWith(1024);
+  });
+
+  test("routes to the streaming API and returns the final message when the request is too long for non-streaming", async () => {
+    const response = createMockResponse([{ type: "text", text: "done" }]);
+    const create = vi.fn();
+    const finalMessage = vi.fn().mockResolvedValue(response);
+    const stream = vi.fn().mockReturnValue({ finalMessage });
+    // The SDK guard throws → max_tokens implies a >10-minute completion.
+    const calculateNonstreamingTimeout = vi.fn(() => {
+      throw new Error(
+        "Streaming is required for operations that may take longer than 10 minutes",
+      );
+    });
+    const client = {
+      calculateNonstreamingTimeout,
+      messages: { create, stream },
+    };
+
+    const result = await anthropicAdapterFactory.execute(
+      client,
+      createMockRequest(messages, { max_tokens: 64000 }),
+    );
+
+    // Same shape a non-streaming create() would have returned.
+    expect(result).toBe(response);
+    expect(stream).toHaveBeenCalledTimes(1);
+    expect(finalMessage).toHaveBeenCalledTimes(1);
+    // The non-streaming path is skipped entirely for long requests.
+    expect(create).not.toHaveBeenCalled();
+  });
+});
+
+describe("anthropicAdapterFactory - unsupported sampling params", () => {
+  const messages = [
+    { role: "user", content: "hi" },
+  ] as Anthropic.Types.MessagesRequest["messages"];
+
+  // Shape of the Anthropic 400 for a model that rejects a sampling param.
+  function deprecatedTemperatureError() {
+    return new Error(
+      '400 {"type":"error","error":{"type":"invalid_request_error","message":"`temperature` is deprecated for this model."},"request_id":"req_x"}',
+    );
+  }
+
+  test("execute strips the rejected param and retries once, preserving others", async () => {
+    const response = createMockResponse([{ type: "text", text: "ok" }]);
+    const create = vi
+      .fn()
+      .mockRejectedValueOnce(deprecatedTemperatureError())
+      .mockResolvedValueOnce(response);
+    const client = { messages: { create } };
+
+    const result = await anthropicAdapterFactory.execute(
+      client,
+      createMockRequest(messages, { temperature: 0.7, top_p: 0.9 }),
+    );
+
+    expect(result).toBe(response);
+    expect(create).toHaveBeenCalledTimes(2);
+    // First attempt carried temperature; the retry dropped it.
+    expect(create.mock.calls[0][0]).toMatchObject({ temperature: 0.7 });
+    expect(create.mock.calls[1][0]).not.toHaveProperty("temperature");
+    // top_p wasn't named in the error, so it survives the retry.
+    expect(create.mock.calls[1][0]).toMatchObject({ top_p: 0.9 });
+  });
+
+  test("execute does not retry when the rejected param wasn't set", async () => {
+    const create = vi.fn().mockRejectedValue(deprecatedTemperatureError());
+    const client = { messages: { create } };
+
+    await expect(
+      anthropicAdapterFactory.execute(client, createMockRequest(messages)),
+    ).rejects.toThrow("temperature");
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  test("execute rethrows unrelated errors without retrying", async () => {
+    const create = vi.fn().mockRejectedValue(new Error("overloaded_error"));
+    const client = { messages: { create } };
+
+    await expect(
+      anthropicAdapterFactory.execute(
+        client,
+        createMockRequest(messages, { temperature: 0.5 }),
+      ),
+    ).rejects.toThrow("overloaded_error");
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  test("executeStream applies the same fallback and keeps stream: true", async () => {
+    async function* emptyStream(): AsyncGenerator<never> {}
+    const create = vi
+      .fn()
+      .mockImplementationOnce(() =>
+        anthropicStreamPromise(Promise.reject(deprecatedTemperatureError())),
+      )
+      .mockImplementationOnce(() => anthropicStreamPromise(emptyStream()));
+    const client = { messages: { create } };
+
+    await anthropicAdapterFactory.executeStream(
+      client,
+      createMockRequest(messages, { temperature: 0.7 }),
+    );
+
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(create.mock.calls[1][0]).not.toHaveProperty("temperature");
+    expect(create.mock.calls[1][0]).toMatchObject({ stream: true });
+  });
+});
+
+// The proxy swallows the upstream `message_delta` and synthesizes its own after
+// policy evaluation, and rebuilds the turn as a `MessagesResponse` for the
+// interaction log. Both used to report `output_tokens` (plus, for the response,
+// `input_tokens`) and nothing else — so a prompt that was 99% cache reads was
+// described on the wire and in storage as a prompt of the few tokens that
+// missed, contradicting the interaction row's own cache_read_tokens column.
+describe("AnthropicStreamAdapter carries cache usage to the end of the turn", () => {
+  const messageStart = {
+    type: "message_start",
+    message: {
+      id: "msg_cached",
+      model: "claude-opus-4-5",
+      usage: {
+        input_tokens: 4,
+        output_tokens: 1,
+        cache_read_input_tokens: 90_000,
+        cache_creation_input_tokens: 1_200,
+        cache_creation: {
+          ephemeral_1h_input_tokens: 400,
+          ephemeral_5m_input_tokens: 800,
+        },
+      },
+    },
+  };
+
+  function streamCachedTurn() {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+    adapter.processChunk(messageStart as never);
+    adapter.processChunk({
+      type: "message_delta",
+      delta: { stop_reason: "end_turn", stop_sequence: null },
+      usage: { output_tokens: 55 },
+    } as never);
+    return adapter;
+  }
+
+  // `formatEndSSE` is typed `string | Uint8Array` across the adapter interface
+  // (some providers encode their own bytes), so decode before parsing frames.
+  function endEventUsage(endSse: string | Uint8Array): unknown {
+    const text =
+      typeof endSse === "string" ? endSse : new TextDecoder().decode(endSse);
+    const deltaFrame = text
+      .split("\n\n")
+      .find((frame) => frame.startsWith("event: message_delta"));
+    return JSON.parse(
+      (deltaFrame as string).replace(/^event: message_delta\ndata: /, ""),
+    ).usage;
+  }
+
+  test("the synthesized message_delta reports the turn's cumulative usage", () => {
+    expect(endEventUsage(streamCachedTurn().formatEndSSE())).toMatchObject({
+      input_tokens: 4,
+      output_tokens: 55,
+      cache_read_input_tokens: 90_000,
+      cache_creation_input_tokens: 1_200,
+    });
+  });
+
+  test("the reconstructed response persists the cache counts and their TTL split", () => {
+    expect(streamCachedTurn().toProviderResponse().usage).toEqual({
+      input_tokens: 4,
+      output_tokens: 55,
+      cache_read_input_tokens: 90_000,
+      cache_creation_input_tokens: 1_200,
+      cache_creation: {
+        ephemeral_1h_input_tokens: 400,
+        ephemeral_5m_input_tokens: 800,
+      },
+    });
+  });
+
+  // The stream adapter's own accumulator is what the interaction row and the
+  // cost calc read, so the rebuilt response has to agree with it — otherwise the
+  // stored body and the stored columns describe different turns.
+  test("agrees with the accumulator the interaction row is written from", () => {
+    const adapter = streamCachedTurn();
+    const usage = adapter.toProviderResponse().usage;
+
+    expect(usage.cache_read_input_tokens).toBe(
+      adapter.state.usage?.cacheReadTokens,
+    );
+    expect(usage.cache_creation_input_tokens).toBe(
+      adapter.state.usage?.cacheWriteTokens,
+    );
+  });
+
+  test("a turn that wrote nothing to the cache omits the TTL split", () => {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      type: "message_start",
+      message: {
+        id: "msg_plain",
+        model: "claude-opus-4-5",
+        usage: { input_tokens: 100, output_tokens: 1 },
+      },
+    } as never);
+
+    expect(adapter.toProviderResponse().usage).toEqual({
+      input_tokens: 100,
+      output_tokens: 1,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    });
+  });
+});
+
+describe("AnthropicRequestAdapter replayed tool-call ids", () => {
+  test("fits a foreign call id after the result update looked it up", () => {
+    const geminiCallId = `gemsig-${"s".repeat(450)}.gemini-call-read-1`;
+    const request = createMockRequest([
+      { role: "user", content: "Read a.txt" },
+      {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: geminiCallId, name: "read", input: {} },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: geminiCallId, content: "SECRET" },
+        ],
+      },
+    ] as Anthropic.Types.MessagesRequest["messages"]);
+
+    const adapter = anthropicAdapterFactory.createRequestAdapter(request);
+    adapter.applyToolResultUpdates({ [geminiCallId]: "sanitized" });
+    const messages = adapter.toProviderRequest().messages;
+
+    const [toolUse] = messages[1].content as Array<{ id: string }>;
+    const [toolResult] = messages[2].content as Array<{
+      tool_use_id: string;
+    }>;
+    expect(toolUse.id).toMatch(/^call_[0-9a-f]{32}$/);
+    expect(toolResult.tool_use_id).toBe(toolUse.id);
+    expect(JSON.stringify(messages)).toContain("sanitized");
+    expect(JSON.stringify(messages)).not.toContain("SECRET");
+  });
+
+  test("keeps an id Anthropic minted", () => {
+    const request = createMockRequest([
+      {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "toolu_01AbC", name: "read", input: {} },
+        ],
+      },
+    ] as Anthropic.Types.MessagesRequest["messages"]);
+
+    const adapter = anthropicAdapterFactory.createRequestAdapter(request);
+
+    expect(adapter.toProviderRequest().messages).toEqual(request.messages);
+  });
+});
+
+test("retains unknown usage and cache fields while marking unsupported cache accounting incomplete", () => {
+  const adapter = anthropicAdapterFactory.createStreamAdapter();
+  adapter.processChunk({
+    type: "message_start",
+    message: {
+      id: "msg_usage",
+      model: "executor",
+      usage: {
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_creation_input_tokens: 50,
+        provider_accounting_note: "retained",
+        cache_creation: {
+          ephemeral_5m_input_tokens: 50,
+          future_ttl_tokens: 12,
+        },
+      },
+    },
+  } as never);
+  expect(adapter.toProviderResponse().usage).toMatchObject({
+    provider_accounting_note: "retained",
+    cache_creation: { future_ttl_tokens: 12 },
+  });
+  expect(adapter.state.usage?.billingUsage?.status).toBe("incomplete");
 });

@@ -1,7 +1,9 @@
-import { DEFAULT_APP_NAME } from "@shared";
+import { DEFAULT_APP_NAME } from "@archestra/shared";
+import { useTheme } from "next-themes";
 import { useAppearanceSettings } from "@/lib/organization.query";
 
 export const DEFAULT_APP_LOGO = "/logo-icon.svg";
+const DEFAULT_APP_LOGO_DARK = "/logo-icon-dark.svg";
 
 /**
  * Returns the configured app name, preferring authenticated organization data
@@ -14,8 +16,15 @@ export function useAppName(): string {
 
 /**
  * Returns the configured app icon logo with a stable frontend fallback.
+ * Picks the dark-mode variant when active and configured, otherwise falls back
+ * to the light variant.
  */
 export function useAppIconLogo(): string {
   const { data: appearance } = useAppearanceSettings();
-  return appearance?.iconLogo ?? DEFAULT_APP_LOGO;
+  const { resolvedTheme } = useTheme();
+  const dark = appearance?.iconLogoDark;
+  const light = appearance?.iconLogo;
+  if (resolvedTheme === "dark" && dark) return dark;
+  if (light) return light;
+  return resolvedTheme === "dark" ? DEFAULT_APP_LOGO_DARK : DEFAULT_APP_LOGO;
 }

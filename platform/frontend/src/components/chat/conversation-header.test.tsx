@@ -1,0 +1,241 @@
+import type { archestraApiTypes } from "@archestra/shared";
+import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { MOBILE_HEADER_TITLE_CONTAINER_ID } from "./chat-help-link";
+import { ConversationHeader } from "./conversation-header";
+
+const viewport = vi.hoisted(() => ({ isMobile: false }));
+
+vi.mock("@/lib/hooks/use-mobile", () => ({
+  useIsMobile: () => viewport.isMobile,
+}));
+
+vi.mock("@/lib/schedule-trigger.query", () => ({
+  useScheduleTriggerRun: () => ({
+    data: { createdAt: "2026-01-15T09:30:00", runKind: "manual" },
+  }),
+}));
+
+type Conversation = archestraApiTypes.GetChatConversationResponses["200"];
+type Panel = Parameters<typeof ConversationHeader>[0]["panel"];
+
+// The header only reads title / messages / projectId off the conversation; a
+// minimal shape keeps the fixture readable without the full API type.
+function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
+  return {
+    id: "conv-1",
+    title: "My chat",
+    messages: [],
+    projectId: null,
+    ...overrides,
+  } as Conversation;
+}
+
+function makePanel(overrides: Partial<Panel> = {}): Panel {
+  return {
+    isOpen: false,
+    activeTab: "files",
+    scheduledRun: null,
+    isArtifactOpen: false,
+    isBrowserVisible: false,
+    isAppsVisible: false,
+    showBrowserButton: true,
+    onClose: vi.fn(),
+    onOpenTab: vi.fn(),
+    ...overrides,
+  };
+}
+
+function renderHeader(panelOverrides: Partial<Panel> = {}) {
+  const panel = makePanel(panelOverrides);
+  render(
+    <ConversationHeader
+      conversationId="conv-1"
+      conversation={makeConversation()}
+      messageCount={2}
+      isTitleAnimating={false}
+      panel={panel}
+    />,
+  );
+  return panel;
+}
+
+describe("ConversationHeader — top-bar tab strip", () => {
+  it("uses the run time and invocation kind instead of the repeated prompt title", () => {
+    renderHeader({ scheduledRun: { triggerId: "trigger-1", runId: "run-1" } });
+    expect(
+      screen.getByRole("heading", { name: /^Run · .+ · Manual$/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "My chat" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps only the chat title in a scheduled-run header", () => {
+    const title = "Daily summary";
+    render(
+      <ConversationHeader
+        conversationId="conv-1"
+        conversation={makeConversation({ title })}
+        scheduleTriggerId="trigger-1"
+        messageCount={2}
+        isTitleAnimating={false}
+        panel={makePanel()}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: title })).toBeInTheDocument();
+    expect(screen.getAllByText(title)).toHaveLength(1);
+    expect(
+      screen.queryByTitle(`Scheduled task: ${title}`),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows Files / Browser / Apps while the panel is collapsed", () => {
+    renderHeader({ isOpen: false });
+    expect(screen.getByRole("tab", { name: "Files" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Browser" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Apps" })).toBeInTheDocument();
+  });
+
+  it("keeps the same tabs visible while the panel is open (no jump)", () => {
+    renderHeader({ isOpen: true });
+    expect(screen.getByRole("tab", { name: "Files" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Browser" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Apps" })).toBeInTheDocument();
+  });
+
+  it("highlights the active tab only while the panel is open", () => {
+    renderHeader({ isOpen: true, activeTab: "files" });
+    expect(screen.getByRole("tab", { name: "Files" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
+  it("highlights no tab while the panel is collapsed", () => {
+    renderHeader({ isOpen: false, activeTab: "files" });
+    for (const name of ["Files", "Browser", "Apps"]) {
+      expect(screen.getByRole("tab", { name })).toHaveAttribute(
+        "aria-selected",
+        "false",
+      );
+    }
+  });
+
+  it("clicking a DIFFERENT tab switches to it and does not close", async () => {
+    const user = userEvent.setup();
+    // "files" is active + open; clicking Browser must switch, not collapse
+    // (this is the regression: it used to close the whole panel).
+    const panel = renderHeader({ isOpen: true, activeTab: "files" });
+
+    await user.click(screen.getByRole("tab", { name: "Browser" }));
+
+    expect(panel.onOpenTab).toHaveBeenCalledWith("browser");
+    expect(panel.onClose).not.toHaveBeenCalled();
+  });
+
+  it("clicking the ACTIVE tab while open collapses the panel (and does not reopen)", async () => {
+    const user = userEvent.setup();
+    const panel = renderHeader({ isOpen: true, activeTab: "files" });
+
+    await user.click(screen.getByRole("tab", { name: "Files" }));
+
+    expect(panel.onClose).toHaveBeenCalledTimes(1);
+    expect(panel.onOpenTab).not.toHaveBeenCalled();
+  });
+
+  it("clicking the active tab while collapsed opens it", async () => {
+    const user = userEvent.setup();
+    const panel = renderHeader({ isOpen: false, activeTab: "files" });
+
+    await user.click(screen.getByRole("tab", { name: "Files" }));
+
+    expect(panel.onOpenTab).toHaveBeenCalledWith("files");
+    expect(panel.onClose).not.toHaveBeenCalled();
+  });
+
+  it("hides Browser when the browser button is unavailable", () => {
+    renderHeader({ showBrowserButton: false });
+    expect(
+      screen.queryByRole("tab", { name: "Browser" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Files" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Apps" })).toBeInTheDocument();
+  });
+
+  it("shows the Runs tab only for scheduled-run chats", () => {
+    renderHeader({ scheduledRun: null });
+    expect(screen.queryByRole("tab", { name: "Runs" })).not.toBeInTheDocument();
+  });
+
+  it("renders the Runs tab when the chat is a scheduled run", () => {
+    renderHeader({ scheduledRun: { triggerId: "t1", runId: null } });
+    expect(screen.getByRole("tab", { name: "Runs" })).toBeInTheDocument();
+  });
+});
+
+describe("ConversationHeader — mobile overflow menu", () => {
+  it("offers Show Apps and opens the apps tab", async () => {
+    const user = userEvent.setup();
+    const panel = renderHeader({ isOpen: false });
+
+    await user.click(screen.getByRole("button", { name: "More options" }));
+    await user.click(screen.getByRole("menuitem", { name: "Show Apps" }));
+
+    expect(panel.onOpenTab).toHaveBeenCalledWith("apps");
+    expect(panel.onClose).not.toHaveBeenCalled();
+  });
+
+  it("offers Hide Apps while the apps tab is showing and closes the panel", async () => {
+    const user = userEvent.setup();
+    const panel = renderHeader({
+      isOpen: true,
+      activeTab: "apps",
+      isAppsVisible: true,
+    });
+
+    await user.click(screen.getByRole("button", { name: "More options" }));
+    await user.click(screen.getByRole("menuitem", { name: "Hide Apps" }));
+
+    expect(panel.onClose).toHaveBeenCalledTimes(1);
+    expect(panel.onOpenTab).not.toHaveBeenCalled();
+  });
+});
+
+describe("ConversationHeader — mobile top bar", () => {
+  afterEach(() => {
+    viewport.isMobile = false;
+    document.getElementById(MOBILE_HEADER_TITLE_CONTAINER_ID)?.remove();
+  });
+
+  it("moves the title and its menu into the app shell's bar on phones", () => {
+    viewport.isMobile = true;
+    const shellBarSlot = document.createElement("div");
+    shellBarSlot.id = MOBILE_HEADER_TITLE_CONTAINER_ID;
+    document.body.appendChild(shellBarSlot);
+
+    renderHeader();
+
+    const slot = within(shellBarSlot);
+    expect(slot.getByRole("heading", { name: "My chat" })).toBeInTheDocument();
+    expect(
+      slot.getByRole("button", { name: "More options" }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByRole("heading", { name: "My chat" })).toHaveLength(1);
+  });
+
+  it("keeps its own bar on wider screens", () => {
+    const shellBarSlot = document.createElement("div");
+    shellBarSlot.id = MOBILE_HEADER_TITLE_CONTAINER_ID;
+    document.body.appendChild(shellBarSlot);
+
+    renderHeader();
+
+    expect(shellBarSlot).toBeEmptyDOMElement();
+    expect(
+      screen.getByRole("heading", { name: "My chat" }),
+    ).toBeInTheDocument();
+  });
+});

@@ -1,0 +1,48 @@
+{
+  "name": "axliupore__mcp-code-runner",
+  "display_name": "mcp-code-runner",
+  "description": "MCP server from axliupore/mcp-code-runner",
+  "author": {
+    "name": "axliupore"
+  },
+  "server": {
+    "command": "docker",
+    "args": ["run", "axliupore/mcp-code-runner"],
+    "env": {},
+    "type": "local",
+    "docker_image": "axliupore/mcp-code-runner"
+  },
+  "tools": [],
+  "prompts": [],
+  "keywords": [],
+  "user_config": {},
+  "readme": "# mcp-code-runner\n\n[![smithery badge](https://smithery.ai/badge/@axliupore/mcp-code-runner)](https://smithery.ai/server/@axliupore/mcp-code-runner)\n\n\n基于 MCP 协议的代码执行器，最后是通过 Docker 来进行代码执行的，所以本机上需要有 Docker 的环境.\n\n## 支持功能\n\n- [x] 支持 MCP 协议\n- [x] 支持代码执行，获得代码执行的结果\n- [ ] 获取代码执行的时间、内存等信息",
+  "category": "Development",
+  "archestra_config": {
+    "client_config_permutations": {
+      "axliupore-mcp-code-runner": {
+        "command": "npx",
+        "args": ["-y", "@axliupore/mcp-code-runner"]
+      }
+    },
+    "oauth": {
+      "provider": null,
+      "required": false
+    },
+    "works_in_archestra": false
+  },
+  "github_info": {
+    "owner": "axliupore",
+    "repo": "mcp-code-runner",
+    "url": "https://github.com/axliupore/mcp-code-runner",
+    "name": "axliupore__mcp-code-runner",
+    "path": null,
+    "stars": 13,
+    "contributors": 1,
+    "issues": 1,
+    "releases": false,
+    "ci_cd": false,
+    "latest_commit_hash": "3f66cbf9ab36254710da0d8bfc9557bee06941dd"
+  },
+  "programming_language": "TypeScript"
+}

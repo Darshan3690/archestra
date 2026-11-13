@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+// SPDX-FileCopyrightText: 2026 Archestra Inc.
+
+import { DocsPage, getDocsUrl } from "@archestra/shared";
+import { Info } from "lucide-react";
+import {
+  HoverCard,
+  HoverCardContent,
+  HoverCardTrigger,
+} from "@/components/ui/hover-card";
+import { UnstyledButton } from "@/components/ui/unstyled-button";
+import { useSmallTeamTier } from "@/lib/config/config.query";
+
+const SALES_EMAIL = "sales@archestra.ai";
+
+interface SmallTeamTierBannerProps {
+  /**
+   * Name of the enterprise feature this page covers (e.g. "SSO", "Idle
+   * hibernation").
+   *
+   * Passing a name asserts that the WHOLE named feature stops working
+   * without a license, because the copy says exactly that. Only pass one
+   * where that is true — where the licence gates a page's whole subject,
+   * the way SSO does. Omit it on every other page, including the ones whose
+   * subject is only PARTLY gated (Knowledge: creating knowledge bases,
+   * indexing and retrieval keep working above the threshold; only
+   * team-scoped connector visibility and auto-sync permissions are gated),
+   * and the ones that are not an enterprise feature at all (Settings →
+   * Users, Settings → Organization). The generic copy those get names the
+   * gated capabilities rather than the feature, so it stays true of a
+   * partly-gated page.
+   */
+  featureName?: string;
+  /**
+   * Render as an icon that reveals the notice on hover, instead of a block
+   * that sits above the page content.
+   *
+   * The full banner earns its space where licensing is the subject — the
+   * settings pages. On a working surface it is a standing interruption above
+   * every visit to a page whose licensing state has not changed, so those
+   * pages opt into this instead.
+   */
+  compact?: boolean;
+}
+
+export function SmallTeamTierBanner({
+  featureName,
+  compact = false,
+}: SmallTeamTierBannerProps) {
+  const tier = useSmallTeamTier();
+
+  if (!tier || !tier.communicate) {
+    return null;
+  }
+
+  const pricingUrl = getDocsUrl(DocsPage.PlatformOverview, "licensing");
+  const enabled = tier.smallTeam || tier.envFlag;
+  const userWord = tier.userCount === 1 ? "user" : "users";
+
+  const copy = bannerCopy({ tier, featureName, enabled, userWord });
+
+  const links = (
+    <>
+      <a
+        href={`mailto:${SALES_EMAIL}`}
+        className="text-foreground underline decoration-dotted underline-offset-4 hover:decoration-solid"
+      >
+        {SALES_EMAIL}
+      </a>{" "}
+      ·{" "}
+      <a
+        href={pricingUrl}
+        target="_blank"
+        rel="noreferrer"
+        className="text-foreground underline decoration-dotted underline-offset-4 hover:decoration-solid"
+      >
+        Pricing
+      </a>
+    </>
+  );
+
+  if (compact) {
+    return (
+      <HoverCard openDelay={150}>
+        <HoverCardTrigger asChild>
+          <UnstyledButton
+            type="button"
+            aria-label="Licensing for this feature"
+            className="inline-flex text-muted-foreground/70 transition-colors hover:text-foreground"
+          >
+            <Info className="h-4 w-4" />
+          </UnstyledButton>
+        </HoverCardTrigger>
+        {/* Deliberately NOT pointer-events-none: the sales and pricing links
+            inside have to stay clickable. */}
+        <HoverCardContent align="start" className="w-80 text-sm">
+          <p className="leading-relaxed text-muted-foreground">
+            {copy} {links}
+          </p>
+        </HoverCardContent>
+      </HoverCard>
+    );
+  }
+
+  return (
+    <div className="mb-6 rounded-md border border-border/60 bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+      <p className="leading-relaxed">
+        {copy} {links}
+      </p>
+    </div>
+  );
+}
+
+// The tier is "free for teams under <threshold> users" (strict comparison on
+// the backend), so the copy phrases it the way the pricing model does instead
+// of naming a max user count.
+function bannerCopy({
+  tier,
+  featureName,
+  enabled,
+  userWord,
+}: {
+  tier: NonNullable<ReturnType<typeof useSmallTeamTier>>;
+  featureName: string | undefined;
+  enabled: boolean;
+  userWord: string;
+}): string {
+  const freeTier = `the free tier for teams under ${tier.threshold} users`;
+  if (featureName) {
+    return enabled
+      ? `${featureName} is an enterprise feature, enabled for this instance because you have ${tier.userCount} ${userWord} (within ${freeTier}).`
+      : `${featureName} is an enterprise feature. Your instance has ${tier.userCount} ${userWord}, which exceeds ${freeTier}, so it is disabled until a license is activated.`;
+  }
+  return enabled
+    ? `Your instance has ${tier.userCount} ${userWord} — within ${freeTier}. Enterprise features (RBAC, SSO, Knowledge Base with access control) are included.`
+    : `Your instance has ${tier.userCount} ${userWord} — exceeding ${freeTier}. Enterprise features (RBAC, SSO, Knowledge Base with access control) are disabled until a license is activated.`;
+}

@@ -20,8 +20,8 @@ wiremock:
 keycloak:
   enabled: true
   image:
-    registry: europe-west1-docker.pkg.dev
-    repository: friendly-path-465518-r6/archestra-public/keycloak
+    registry: ghcr.io
+    repository: archestra-ai/ci/keycloak
     tag: "pr46048-5afbf42"
     pullPolicy: IfNotPresent
   # Admin credentials for e2e testing
@@ -67,35 +67,8 @@ keycloak:
     failureThreshold: 30
     periodSeconds: 10
     timeoutSeconds: 5
-  # Groups for role mapping tests
-  groups:
-    - name: "archestra-admins"
-    - name: "archestra-users"
-  # Test users for SSO E2E tests
-  # The first user (admin) should match the Archestra admin user created during onboarding
-  # so that SSO login can link to an existing account
-  testUsers:
-    # Admin user - in archestra-admins group for role mapping tests
-    - username: "admin"
-      email: "admin@example.com"
-      password: "password"
-      firstName: "Admin"
-      lastName: "User"
-      attributes:
-        demo_token_value: "admin_user_token"
-      groups:
-        - "archestra-admins"
-    # Member user - in archestra-users group, should get member role
-    - username: "member"
-      email: "member@example.com"
-      password: "memberpass"
-      firstName: "Member"
-      lastName: "User"
-      attributes:
-        demo_token_value: "member_user_token"
-      groups:
-        - "archestra-users"
-  # Realm configuration for e2e testing
+  # Realm fixture (clients, groups, test users) lives in files/archestra-realm.json,
+  # shared with the lite e2e harness which docker-mounts the same file.
   # Set import: true to auto-import the realm on startup
   realm:
     import: true
@@ -104,7 +77,7 @@ keycloak:
 mcpServerJwks:
   enabled: true
   image:
-    repository: europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/mcp-server-jwks-keycloak
+    repository: ghcr.io/archestra-ai/ci/mcp-server-jwks-keycloak
     tag: "0.0.3"
     pullPolicy: IfNotPresent
   # JWT audience claim the server expects (must match Keycloak client's audience mapper)
@@ -127,7 +100,7 @@ mcpServerJwks:
 mcpExampleOAuth:
   enabled: true
   image:
-    repository: europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/mcp-example-oauth-server
+    repository: ghcr.io/archestra-ai/ci/mcp-example-oauth-server
     tag: "0.0.1"
     pullPolicy: IfNotPresent
   # Service configuration
@@ -148,7 +121,7 @@ mcpExampleOAuth:
 mcpServerIdJag:
   enabled: true
   image:
-    repository: europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/mcp-server-id-jag
+    repository: ghcr.io/archestra-ai/ci/mcp-server-id-jag
     tag: "0.0.4"
     pullPolicy: IfNotPresent
   gatewayAudience: "id-jag-gateway-client"
@@ -166,7 +139,7 @@ mcpServerIdJag:
       cpu: 500m
       memory: 256Mi
 
-# HashiCorp Vault configuration for BYOS (Bring Your Own Secrets) testing
+# HashiCorp Vault test configuration
 vault:
   enabled: true
   image:

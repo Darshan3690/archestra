@@ -1,0 +1,696 @@
+import {
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const { mockUseFeature } = vi.hoisted(() => ({ mockUseFeature: vi.fn() }));
+
+vi.mock("next/navigation");
+vi.mock("@/lib/auth/auth.query");
+vi.mock("@/lib/config/config.query", () => ({
+  useFeature: mockUseFeature,
+}));
+vi.mock("@/lib/hooks/use-app-name");
+vi.mock("@/lib/organization.query");
+// The scope check behind Edit/Delete asks which teams the caller belongs to.
+vi.mock("@/lib/teams/team.query");
+vi.mock("@/lib/skills/skill.query", () => ({
+  useAllMatchingSkills: () => ({ data: [] }),
+  useBulkDeleteSkills: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useSkillsList: vi.fn(),
+  useSkillsPaginated: vi.fn(),
+  useSkillSourceRepos: vi.fn(),
+  useExternalMcpSkills: vi.fn(),
+  usePluginSkills: vi.fn(),
+  useRestoreSkill: vi.fn(),
+  usePermanentlyDeleteSkill: vi.fn(),
+}));
+// Filter chrome reads the URL and the org's teams; the row actions are what
+// this file is about.
+vi.mock("@/components/resource-scope-filter", () => ({
+  ActiveFilterBadges: () => null,
+  ResourceDeletedStatusFilter: () => null,
+  ResourceScopeFilter: () => null,
+  useScopeFilterParams: () => ({ hasActiveScopeFilters: false }),
+}));
+vi.mock("@/components/search-input", () => ({ SearchInput: () => null }));
+// The label filter runs its own `useQuery` for keys and values, which needs a
+// QueryClientProvider this file deliberately does not stand up.
+vi.mock("@/components/entity-label-filter", () => ({
+  EntityLabelFilter: () => null,
+}));
+vi.mock("./_parts/skill-version-history-dialog", () => ({
+  SkillVersionHistoryDialog: () => null,
+}));
+vi.mock("./_parts/delete-skill-dialog", () => ({
+  DeleteSkillDialog: () => null,
+}));
+vi.mock("@/lib/entity-labels.query");
+
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import {
+  useHasPermissions,
+  useMissingPermissions,
+  useScopedCapabilities,
+  useSession,
+} from "@/lib/auth/auth.query";
+import { useAppName } from "@/lib/hooks/use-app-name";
+import { useIsGlobalAdmin } from "@/lib/organization.query";
+import {
+  useExternalMcpSkills,
+  usePermanentlyDeleteSkill,
+  usePluginSkills,
+  useRestoreSkill,
+  useSkillSourceRepos,
+  useSkillsList,
+  useSkillsPaginated,
+} from "@/lib/skills/skill.query";
+import { useMyTeams } from "@/lib/teams/team.query";
+import SkillsPage from "./page.client";
+
+const MINE = {
+  id: "skill-1",
+  name: "pdf-tools",
+  description: "Work with PDFs.",
+  scope: "personal",
+  authorId: "user-1",
+  authorName: "Me",
+  sourceType: "manual",
+  sourceRef: null,
+  githubSyncInterval: null,
+  lastSyncedAt: null,
+  lastSyncError: null,
+  templated: false,
+  compatibility: null,
+  fileCount: 2,
+  usageCount: 3,
+  usageUserCount: 1,
+  lastUsedAt: null,
+  deletedAt: null,
+  teams: [],
+  users: [],
+  environments: [],
+};
+
+/** Somebody else's personal skill: `skill:update` does not reach it. */
+const SOMEONE_ELSES = {
+  ...MINE,
+  id: "skill-2",
+  name: "sql-helper",
+  authorId: "user-99",
+  authorName: "Dana",
+};
+
+const PLUGIN_SKILL = {
+  source: "plugin" as const,
+  pluginId: "11111111-1111-4111-8111-111111111111",
+  pluginName: "STE bundle",
+  pluginSlug: "ste-bundle-11111111",
+  pluginEnabled: true,
+  scope: "org" as const,
+  clientType: "claude-code" as const,
+  supportedPlatforms: ["posix" as const],
+  skillPath: "skills/ste-writing",
+  name: "ste-writing",
+  description: "Write plainly.",
+  compatibility: null,
+  fileCount: 2,
+  usageCount: 0,
+  usageUserCount: 0,
+  lastUsedAt: null,
+};
+
+function mockSkills(data: unknown[]) {
+  vi.mocked(useSkillsList).mockReturnValue({
+    data,
+    isFetching: false,
+    isLoadingError: false,
+    refetch: vi.fn(),
+    // biome-ignore lint/suspicious/noExplicitAny: partial query result is enough
+  } as any);
+  vi.mocked(useSkillsPaginated).mockReturnValue({
+    data: { data, pagination: { total: data.length } },
+    isPending: false,
+    isFetching: false,
+    isLoadingError: false,
+    refetch: vi.fn(),
+    // biome-ignore lint/suspicious/noExplicitAny: partial query result is enough
+  } as any);
+}
+
+/**
+ * Answers every permission question yes, apart from the `skill:admin` and
+ * `skill:team-admin` oversight grants, which are what the ownership check
+ * actually turns on.
+ */
+function mockPermissions({ skillAdmin }: { skillAdmin: boolean }) {
+  vi.mocked(useScopedCapabilities).mockReturnValue({
+    data: skillAdmin
+      ? [
+          {
+            organizationId: "org-1",
+            resource: "skill",
+            scope: "*",
+            action: "update",
+          },
+        ]
+      : [],
+    isPending: false,
+  } as unknown as ReturnType<typeof useScopedCapabilities>);
+  vi.mocked(useHasPermissions).mockImplementation(
+    (permissions: Record<string, string[]>) => {
+      const actions = permissions.skill ?? [];
+      const asksForOversight =
+        actions.includes("admin") || actions.includes("team-admin");
+      return {
+        data: asksForOversight ? skillAdmin : true,
+        // biome-ignore lint/suspicious/noExplicitAny: partial query result is enough
+      } as any;
+    },
+  );
+}
+
+const openRowMenu = (skillName: string) =>
+  userEvent.click(
+    screen.getByRole("button", { name: `More actions ${skillName}` }),
+  );
+
+describe("SkillsPage rows", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.localStorage.removeItem("archestra-skills-view");
+    mockUseFeature.mockReturnValue(false);
+    vi.mocked(useRouter).mockReturnValue({
+      push: vi.fn(),
+      replace: vi.fn(),
+    } as unknown as ReturnType<typeof useRouter>);
+    vi.mocked(usePathname).mockReturnValue("/skills");
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams() as ReturnType<typeof useSearchParams>,
+    );
+    vi.mocked(useAppName).mockReturnValue("Archestra");
+    vi.mocked(useSession).mockReturnValue({
+      data: { user: { id: "user-1" } },
+      // biome-ignore lint/suspicious/noExplicitAny: partial session is enough
+    } as any);
+    // Every RBAC answer is yes except the two oversight grants, so anything
+    // still refused below was refused by the ownership check and by nothing
+    // else.
+    mockPermissions({ skillAdmin: false });
+    vi.mocked(useMissingPermissions).mockReturnValue({});
+    vi.mocked(useMyTeams).mockReturnValue({
+      data: [],
+      // biome-ignore lint/suspicious/noExplicitAny: partial query result is enough
+    } as any);
+    vi.mocked(useIsGlobalAdmin).mockReturnValue({
+      isGlobalAdmin: false,
+      isLoading: false,
+    });
+    vi.mocked(useSkillSourceRepos).mockReturnValue({
+      data: { repos: [] },
+      // biome-ignore lint/suspicious/noExplicitAny: partial query result is enough
+    } as any);
+    vi.mocked(useRestoreSkill).mockReturnValue({
+      mutate: vi.fn(),
+      // biome-ignore lint/suspicious/noExplicitAny: partial mutation is enough
+    } as any);
+    vi.mocked(usePermanentlyDeleteSkill).mockReturnValue({
+      mutateAsync: vi.fn(),
+      isPending: false,
+      // biome-ignore lint/suspicious/noExplicitAny: partial mutation is enough
+    } as any);
+    vi.mocked(usePluginSkills).mockReturnValue({
+      data: [],
+      isFetching: false,
+      // biome-ignore lint/suspicious/noExplicitAny: partial query result is enough
+    } as any);
+    vi.mocked(useExternalMcpSkills).mockReturnValue({
+      data: [],
+      isFetching: false,
+      // biome-ignore lint/suspicious/noExplicitAny: partial query result is enough
+    } as any);
+    mockSkills([MINE]);
+  });
+
+  /**
+   * Skills used to render five icon buttons in the row, Delete among them,
+   * where the agent rows render two and a menu. Same table, same job, two
+   * dialects.
+   */
+  it("shows Chat and Edit in the row and folds the rest into the row menu", async () => {
+    render(<SkillsPage />);
+
+    expect(screen.queryByText("Standalone skills")).not.toBeInTheDocument();
+    expect(screen.queryByText("Skills from plugins")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Chat pdf-tools")).toBeInTheDocument();
+    expect(screen.getByLabelText("Edit pdf-tools")).toBeInTheDocument();
+    // Delete is one click away from Edit no longer.
+    expect(screen.queryByLabelText("Delete pdf-tools")).toBeNull();
+
+    await openRowMenu("pdf-tools");
+
+    expect(screen.getByRole("menuitem", { name: "Usage" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("menuitem", { name: "Version history" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("menuitem", { name: "Delete" }),
+    ).toBeInTheDocument();
+  });
+
+  it("merges plugin skills into the main table and puts the plugin after the skill name", () => {
+    mockUseFeature.mockImplementation((name: string) => name === "plugins");
+    vi.mocked(usePluginSkills).mockReturnValue({
+      data: [PLUGIN_SKILL],
+      isFetching: false,
+      // biome-ignore lint/suspicious/noExplicitAny: partial query result is enough
+    } as any);
+
+    render(<SkillsPage />);
+
+    expect(screen.queryByRole("columnheader", { name: "Plugin" })).toBeNull();
+    expect(screen.getByText("ste-writing")).toBeInTheDocument();
+    expect(screen.getByText("STE bundle · Plugin")).toBeInTheDocument();
+    expect(screen.getByTitle("STE bundle · Plugin")).toBeVisible();
+    expect(
+      screen.getByRole("checkbox", { name: "Select ste-writing" }),
+    ).toBeDisabled();
+  });
+
+  it("shows a compact compatibility icon beside the name without opening the row", async () => {
+    const push = vi.fn();
+    vi.mocked(useRouter).mockReturnValue({
+      push,
+      replace: vi.fn(),
+    } as unknown as ReturnType<typeof useRouter>);
+    mockSkills([
+      {
+        ...MINE,
+        compatibility:
+          "requires an external review tool — nitpicker, codex, or opencode — configured for this workspace before the skill can run",
+      },
+    ]);
+
+    render(<SkillsPage />);
+
+    const nameRow = screen.getByText("pdf-tools").closest("div");
+    const icon = screen.getByRole("img", { name: "Compatibility notes" });
+    // The indicator lives in the name's own row, not trailing after the
+    // description as a separate block competing for the row's width.
+    expect(nameRow).toContainElement(icon);
+    expect(screen.queryByText("compatibility")).not.toBeInTheDocument();
+
+    await userEvent.hover(icon);
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("requires an external review tool");
+    await userEvent.click(icon);
+    expect(push).not.toHaveBeenCalled();
+  });
+
+  it("uses plain source text instead of a visibility column in the table", () => {
+    mockSkills([{ ...MINE, sourceRef: "tools/review@main:skills/pdf" }]);
+
+    render(<SkillsPage />);
+
+    expect(screen.getByRole("columnheader", { name: "Source" })).toBeVisible();
+    expect(
+      screen.queryByRole("columnheader", { name: "Visibility" }),
+    ).not.toBeInTheDocument();
+    const row = screen.getByText("pdf-tools").closest("tr");
+    expect(row).not.toBeNull();
+    const source = within(row as HTMLElement).getByText("tools/review");
+    expect(source).toBeVisible();
+    expect(source.tagName).toBe("CODE");
+  });
+
+  it("labels built-in skills by origin instead of the app name", () => {
+    mockSkills([
+      { ...MINE, sourceType: "built_in", sourceRef: "builtin:pdf-tools" },
+    ]);
+
+    render(<SkillsPage />);
+
+    const row = screen.getByText("pdf-tools").closest("tr");
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLElement).getByText("Built in")).toBeVisible();
+    expect(within(row as HTMLElement).queryByText("Archestra")).toBeNull();
+  });
+
+  it("keeps projected MCP and plugin skills disabled and out of bulk selection", async () => {
+    mockUseFeature.mockImplementation(
+      (name: string) =>
+        name === "plugins" || name === "mcpGatewaySkillsEnabled",
+    );
+    vi.mocked(useExternalMcpSkills).mockReturnValue({
+      data: [
+        {
+          source: "external_mcp",
+          id: "22222222-2222-4222-8222-222222222222",
+          catalogId: "33333333-3333-4333-8333-333333333333",
+          mcpServerId: "44444444-4444-4444-8444-444444444444",
+          scope: "org",
+          serverName: "Release server",
+          icon: null,
+          name: "release-notes",
+          description: "Prepare release notes.",
+          uri: "skill://release/SKILL.md",
+          resources: null,
+          usageCount: 2,
+          usageUserCount: 1,
+          lastUsedAt: null,
+        },
+      ],
+      isFetching: false,
+      // biome-ignore lint/suspicious/noExplicitAny: partial query result is enough
+    } as any);
+    vi.mocked(usePluginSkills).mockReturnValue({
+      data: [PLUGIN_SKILL],
+      isFetching: false,
+      // biome-ignore lint/suspicious/noExplicitAny: partial query result is enough
+    } as any);
+
+    render(<SkillsPage />);
+
+    expect(
+      screen.queryByRole("columnheader", { name: "MCP server" }),
+    ).toBeNull();
+    expect(screen.queryByRole("columnheader", { name: "Plugin" })).toBeNull();
+    expect(screen.getByText("Release server · MCP")).toBeInTheDocument();
+    expect(screen.getByText("STE bundle · Plugin")).toBeInTheDocument();
+    expect(screen.getByTitle("Release server · MCP")).toBeVisible();
+    expect(screen.getByTitle("STE bundle · Plugin")).toBeVisible();
+
+    const standalone = screen.getByRole("checkbox", {
+      name: "Select pdf-tools",
+    });
+    const mcp = screen.getByRole("checkbox", {
+      name: "Select release-notes",
+    });
+    const plugin = screen.getByRole("checkbox", {
+      name: "Select ste-writing",
+    });
+    expect(standalone).toBeEnabled();
+    expect(mcp).toBeDisabled();
+    expect(plugin).toBeDisabled();
+
+    await userEvent.click(standalone);
+    expect(
+      screen.getByText("1 skill selected", {
+        selector: '[aria-hidden="true"]',
+      }),
+    ).toBeVisible();
+  });
+
+  it("opens a plugin from its source in table and card views", async () => {
+    const push = vi.fn();
+    vi.mocked(useRouter).mockReturnValue({
+      push,
+      replace: vi.fn(),
+    } as unknown as ReturnType<typeof useRouter>);
+    mockUseFeature.mockImplementation((name: string) => name === "plugins");
+    vi.mocked(usePluginSkills).mockReturnValue({
+      data: [PLUGIN_SKILL],
+      isFetching: false,
+      // biome-ignore lint/suspicious/noExplicitAny: partial query result is enough
+    } as any);
+
+    render(<SkillsPage />);
+
+    const pluginHref = `/plugins/${PLUGIN_SKILL.pluginId}`;
+    const sourceLink = screen.getByRole("link", {
+      name: "STE bundle · Plugin",
+    });
+    expect(sourceLink).toHaveAttribute("href", pluginHref);
+    sourceLink.addEventListener("click", (event) => event.preventDefault());
+    await userEvent.click(sourceLink);
+    expect(push).not.toHaveBeenCalledWith(
+      expect.stringContaining("/skills/plugins/"),
+    );
+
+    cleanup();
+    window.localStorage.setItem("archestra-skills-view", "cards");
+    render(<SkillsPage />);
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("columnheader", { name: "Skill" }),
+      ).not.toBeInTheDocument(),
+    );
+    const cardSourceLink = screen.getByRole("link", {
+      name: "STE bundle · Plugin",
+    });
+    expect(cardSourceLink).toHaveAttribute("href", pluginHref);
+    cardSourceLink.addEventListener("click", (event) => event.preventDefault());
+    push.mockClear();
+    await userEvent.click(cardSourceLink);
+    expect(push).not.toHaveBeenCalledWith(
+      expect.stringContaining("/skills/plugins/"),
+    );
+  });
+
+  it("shows plugin sources without a detail link for readers", async () => {
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions: Record<string, string[]>) =>
+        // biome-ignore lint/suspicious/noExplicitAny: partial query result is enough
+        ({ data: !permissions.plugin?.includes("update") }) as any,
+    );
+    mockUseFeature.mockImplementation((name: string) => name === "plugins");
+    vi.mocked(usePluginSkills).mockReturnValue({
+      data: [PLUGIN_SKILL],
+      isFetching: false,
+      // biome-ignore lint/suspicious/noExplicitAny: partial query result is enough
+    } as any);
+
+    render(<SkillsPage />);
+    expect(screen.getByText("STE bundle · Plugin")).toBeVisible();
+    expect(
+      screen.queryByRole("link", { name: "STE bundle · Plugin" }),
+    ).not.toBeInTheDocument();
+
+    cleanup();
+    window.localStorage.setItem("archestra-skills-view", "cards");
+    render(<SkillsPage />);
+    expect(screen.getByText("STE bundle · Plugin")).toBeVisible();
+    expect(
+      screen.queryByRole("link", { name: "STE bundle · Plugin" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("disables projected skill selection in card view", async () => {
+    window.localStorage.setItem("archestra-skills-view", "cards");
+    mockUseFeature.mockImplementation((name: string) => name === "plugins");
+    vi.mocked(usePluginSkills).mockReturnValue({
+      data: [PLUGIN_SKILL],
+      isFetching: false,
+      // biome-ignore lint/suspicious/noExplicitAny: partial query result is enough
+    } as any);
+
+    render(<SkillsPage />);
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("columnheader", { name: "Skill" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(
+      screen.getByRole("checkbox", { name: "Select ste-writing" }),
+    ).toBeDisabled();
+  });
+
+  it("does not load standalone skills for a projected-only view", () => {
+    mockUseFeature.mockImplementation((name: string) => name === "plugins");
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("kind=plugin") as ReturnType<typeof useSearchParams>,
+    );
+    vi.mocked(usePluginSkills).mockReturnValue({
+      data: [PLUGIN_SKILL],
+      isFetching: false,
+      // biome-ignore lint/suspicious/noExplicitAny: partial query result is enough
+    } as any);
+
+    render(<SkillsPage />);
+
+    expect(vi.mocked(useSkillsList)).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ enabled: false }),
+    );
+  });
+
+  it("lists skills without their SKILL.md bodies in both the complete and paged views", () => {
+    mockUseFeature.mockImplementation(
+      (name: string) => name === "mcpGatewaySkillsEnabled",
+    );
+
+    render(<SkillsPage />);
+
+    // The default view walks every page; the table never shows a body.
+    expect(vi.mocked(useSkillsList)).toHaveBeenCalledWith(
+      expect.objectContaining({ includeContent: false }),
+      expect.objectContaining({ enabled: true }),
+    );
+    expect(vi.mocked(useSkillsPaginated)).toHaveBeenCalledWith(
+      expect.objectContaining({ includeContent: false }),
+      expect.anything(),
+    );
+  });
+
+  it("uses one server page and its total for a standalone-only active view", () => {
+    mockUseFeature.mockImplementation(
+      (name: string) => name === "mcpGatewaySkillsEnabled",
+    );
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("kind=standalone&pageSize=10") as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+    vi.mocked(useSkillsPaginated).mockReturnValue({
+      data: { data: [MINE], pagination: { total: 250 } },
+      isPending: false,
+      isFetching: false,
+      isLoadingError: false,
+      refetch: vi.fn(),
+      // biome-ignore lint/suspicious/noExplicitAny: partial query result is enough
+    } as any);
+
+    render(<SkillsPage />);
+
+    expect(screen.getByText("pdf-tools")).toBeInTheDocument();
+    expect(screen.getByText("Page 1 of 25")).toBeInTheDocument();
+    expect(vi.mocked(useSkillsPaginated)).toHaveBeenCalledWith(
+      expect.objectContaining({ limit: 10, offset: 0 }),
+      expect.objectContaining({ enabled: true }),
+    );
+    expect(vi.mocked(useSkillsList)).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ enabled: false }),
+    );
+  });
+
+  it("keeps the complete standalone list for name-based edit links", () => {
+    const replace = vi.fn();
+    vi.mocked(useRouter).mockReturnValue({
+      push: vi.fn(),
+      replace,
+    } as unknown as ReturnType<typeof useRouter>);
+    mockUseFeature.mockImplementation(
+      (name: string) => name === "mcpGatewaySkillsEnabled",
+    );
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("kind=standalone&openEdit=pdf-tools") as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+
+    render(<SkillsPage />);
+
+    expect(vi.mocked(useSkillsList)).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ enabled: true }),
+    );
+    expect(vi.mocked(useSkillsPaginated)).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ enabled: false }),
+    );
+    expect(replace).toHaveBeenCalledWith(`/skills/${MINE.id}`);
+  });
+
+  it("clamps a stale card page after filters shrink the collection", async () => {
+    const push = vi.fn();
+    vi.mocked(useRouter).mockReturnValue({
+      push,
+      replace: vi.fn(),
+    } as unknown as ReturnType<typeof useRouter>);
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("page=3&pageSize=10") as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+    window.localStorage.setItem("archestra-skills-view", "cards");
+
+    render(<SkillsPage />);
+
+    await waitFor(() =>
+      expect(push).toHaveBeenCalledWith("/skills?page=1&pageSize=10", {
+        scroll: false,
+      }),
+    );
+  });
+
+  it("clears the active label filter", async () => {
+    const push = vi.fn();
+    vi.mocked(useRouter).mockReturnValue({
+      push,
+      replace: vi.fn(),
+    } as unknown as ReturnType<typeof useRouter>);
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("labels=region%3Anorth&page=3") as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+
+    render(<SkillsPage />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Clear" }));
+    expect(push).toHaveBeenCalledWith("/skills?page=1", { scroll: false });
+  });
+
+  it("refuses Edit and Delete on somebody else's skill, with the reason", async () => {
+    // Skills were the only agent-shaped entity with no ownership gate in the
+    // frontend: `skill:update` alone lit up Edit on every row and the save
+    // came back 403.
+    mockSkills([SOMEONE_ELSES]);
+    render(<SkillsPage />);
+
+    expect(screen.getByLabelText("Edit sql-helper")).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    // Chat is not a mutation, so it stays available.
+    expect(screen.getByLabelText("Chat sql-helper")).not.toHaveAttribute(
+      "aria-disabled",
+    );
+
+    await openRowMenu("sql-helper");
+
+    expect(screen.getByRole("menuitem", { name: /Delete/ })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    expect(
+      screen.queryByRole("menuitem", { name: /Edit labels/ }),
+    ).not.toBeInTheDocument();
+    // One description per refused control: the row's Edit and the menu's
+    // Delete. Labels are edited in the canonical skill edit wizard.
+    expect(screen.getAllByText(/Only this skill's author/)).toHaveLength(2);
+  });
+
+  it("allows a wildcard update grant to edit another person’s skill", () => {
+    mockPermissions({ skillAdmin: true });
+    mockSkills([SOMEONE_ELSES]);
+    render(<SkillsPage />);
+
+    expect(screen.getByLabelText("Edit sql-helper")).not.toHaveAttribute(
+      "aria-disabled",
+    );
+  });
+
+  it("keeps permanent delete in the trash row's menu, not beside Restore", async () => {
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("status=deleted") as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+    mockSkills([{ ...MINE, deletedAt: "2026-08-19T00:00:00.000Z" }]);
+    render(<SkillsPage />);
+
+    expect(screen.getByLabelText("Restore pdf-tools")).toBeInTheDocument();
+    await openRowMenu("pdf-tools");
+    expect(
+      screen.getByRole("menuitem", { name: /Delete permanently/ }),
+    ).toBeInTheDocument();
+  });
+});

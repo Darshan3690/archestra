@@ -1,0 +1,42 @@
+{
+  "name": "weaviate__mcp-server-weaviate",
+  "display_name": "mcp-server-weaviate",
+  "description": "MCP (Model Context Protocol) server for Weaviate",
+  "author": {
+    "name": "weaviate"
+  },
+  "server": {
+    "command": "python",
+    "args": ["${__dirname}/server/main.py"],
+    "env": {},
+    "type": "local"
+  },
+  "tools": [],
+  "prompts": [],
+  "keywords": [],
+  "user_config": {},
+  "readme": "# Weaviate MCP Server\n\n## Instructions\n\nBuild the server:\n```\nmake build\n```\n\nRun the test client\n```\nmake run-client\n```\n\n## Tools\n\n### Insert One\nInsert an object into weaviate.\n\n**Request body:**\n```json\n{}\n```\n\n**Response body**\n```json\n{}\n```\n\n### Query\nRetrieve objects from weaviate with hybrid search.\n\n**Request body:**\n```json\n{}\n```\n\n**Response body**\n```json\n{}\n```\n",
+  "category": "AI Tools",
+  "archestra_config": {
+    "client_config_permutations": {},
+    "oauth": {
+      "provider": null,
+      "required": false
+    },
+    "works_in_archestra": false
+  },
+  "github_info": {
+    "owner": "weaviate",
+    "repo": "mcp-server-weaviate",
+    "url": "https://github.com/weaviate/mcp-server-weaviate",
+    "name": "weaviate__mcp-server-weaviate",
+    "path": null,
+    "stars": 150,
+    "contributors": 1,
+    "issues": 0,
+    "releases": false,
+    "ci_cd": false,
+    "latest_commit_hash": "4db6a8f0aacfbca38b44510c60dc5f8afed0439b"
+  },
+  "programming_language": "Go"
+}

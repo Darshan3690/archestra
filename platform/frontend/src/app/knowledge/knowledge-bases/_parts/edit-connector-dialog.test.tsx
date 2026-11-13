@@ -1,7 +1,15 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { Button } from "@/components/ui/button";
 import { EditConnectorDialog } from "./edit-connector-dialog";
 
 // Radix Popper / floating-ui needs ResizeObserver as a real constructor
@@ -54,9 +62,9 @@ vi.mock("@/lib/knowledge/connector.query", () => ({
   }),
 }));
 
-vi.mock("@/lib/teams/team.query", () => ({
-  useTeams: () => ({ data: [] }),
-}));
+vi.mock("@/lib/teams/team.query");
+
+import { useTeams } from "@/lib/teams/team.query";
 
 type ConnectorFixture = Parameters<typeof EditConnectorDialog>[0]["connector"];
 
@@ -68,8 +76,10 @@ function makeAsanaConnector(
     name: "Engineering Asana",
     description: "",
     visibility: "org-wide",
+    syncPermissionsFromSource: false,
     teamIds: [],
     connectorType: "asana",
+    environmentId: null,
     config: {
       type: "asana",
       workspaceGid: "1234567890",
@@ -78,6 +88,8 @@ function makeAsanaConnector(
       ...overrides,
     },
     schedule: "0 */6 * * *",
+    ftsLanguage: "english",
+    permissionSyncIntervalSeconds: 1800,
     enabled: true,
   } as ConnectorFixture;
 }
@@ -101,9 +113,474 @@ function renderDialog(connector: ConnectorFixture = makeAsanaConnector()) {
   return { onOpenChange };
 }
 
+describe("EditConnectorDialog - GitHub repository settings", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMutateAsync.mockResolvedValue({ id: "conn-github" });
+  });
+
+  const legacyConnector = () =>
+    ({
+      ...makeAsanaConnector(),
+      id: "conn-github",
+      connectorType: "github",
+      config: {
+        type: "github",
+        githubUrl: "https://api.github.com",
+        owner: "example-org",
+        repos: ["repo-a", "repo-b"],
+        includeIssues: false,
+        includePullRequests: true,
+        includeRepositoryFiles: true,
+        includePaths: ["legacy"],
+        labelsToSkip: ["skip"],
+      },
+    }) as ConnectorFixture;
+
+  function loadedOverridesConnector(): ConnectorFixture {
+    const connector = legacyConnector();
+    connector.config = {
+      ...connector.config,
+      includeIssues: true,
+      includePaths: ["docs"],
+      repositoryOverrides: [
+        {
+          repository: "example-org/repo-a",
+          includeIssues: false,
+          includePaths: ["custom-docs"],
+        },
+      ],
+    } as ConnectorFixture["config"];
+    return connector;
+  }
+
+  async function advanced(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(screen.getByRole("button", { name: /Advanced/ }));
+  }
+  async function openRow(
+    user: ReturnType<typeof userEvent.setup>,
+    repository = "example-org/repo-a",
+  ) {
+    const row = within(
+      screen.getByRole("group", { name: `Repository ${repository}` }),
+    );
+    await user.click(
+      row.getByRole("button", {
+        name: `Repository settings for ${repository}`,
+      }),
+    );
+    return row;
+  }
+  async function save(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+    await waitFor(() => expect(mockMutateAsync).toHaveBeenCalledTimes(1));
+    return mockMutateAsync.mock.calls[0][0].body.config;
+  }
+  it.each([
+    "all",
+    "selected",
+  ])("shows file filter errors inline in %s mode and saves after correction", async (mode) => {
+    const user = userEvent.setup();
+    const connector = legacyConnector();
+    if (mode === "all") {
+      connector.config = {
+        ...connector.config,
+        repos: [],
+      } as ConnectorFixture["config"];
+    }
+    renderDialog(connector);
+    await advanced(user);
+    const scope = mode === "selected" ? await openRow(user) : screen;
+    const input = scope.getByLabelText("File Types (optional)");
+    fireEvent.change(input, { target: { value: "docs/*.md" } });
+    if (mode === "selected") {
+      await user.click(
+        scope.getByRole("button", {
+          name: "Repository settings for example-org/repo-a",
+        }),
+      );
+    }
+    await user.click(screen.getByRole("button", { name: /General/ }));
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+    await waitFor(() => expect(input).toBeVisible());
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(scope.getByText(/Use a file extension/)).toBeVisible();
+    expect(mockMutateAsync).not.toHaveBeenCalled();
+    fireEvent.change(input, {
+      target: { value: ".md, *.yaml, Dockerfile, *" },
+    });
+    await waitFor(() =>
+      expect(scope.queryByText(/Use a file extension/)).not.toBeInTheDocument(),
+    );
+    const config = await save(user);
+    const settings = mode === "all" ? config : config.repositoryOverrides[0];
+    expect(settings.fileTypes).toEqual([".md", "*.yaml", "Dockerfile", "*"]);
+  });
+  it("keeps invalid saved filters actionable when repository files are disabled", async () => {
+    const user = userEvent.setup();
+    renderDialog(legacyConnector());
+    await advanced(user);
+    const row = await openRow(user);
+    const input = row.getByLabelText("File Types (optional)");
+    fireEvent.change(input, { target: { value: "docs/*.md" } });
+    await user.click(
+      row.getByRole("switch", { name: "Include Repository Files" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+    await waitFor(() => expect(input).toBeVisible());
+    expect(row.getByText(/Use a file extension/)).toBeVisible();
+    expect(mockMutateAsync).not.toHaveBeenCalled();
+    await user.clear(input);
+    await waitFor(() =>
+      expect(row.queryByText(/Use a file extension/)).not.toBeInTheDocument(),
+    );
+    expect(input).toBeVisible();
+    await user.type(input, ".md");
+    expect(input).toBeVisible();
+    const config = await save(user);
+    expect(config.repositoryOverrides[0]).toMatchObject({
+      includeRepositoryFiles: false,
+      fileTypes: [".md"],
+    });
+  });
+  it("shows qualified legacy cards and preserves the actual flat config on unchanged save", async () => {
+    const user = userEvent.setup();
+    const connector = legacyConnector();
+    renderDialog(connector);
+    await advanced(user);
+    const row = await openRow(user);
+    expect(row.getByLabelText("Repository")).toHaveValue("example-org/repo-a");
+    expect(
+      row.getByRole("switch", { name: "Include Issues" }),
+    ).not.toBeChecked();
+    expect(row.getByLabelText("Folders (optional)")).toHaveValue("legacy");
+    expect(
+      screen.queryByText(/Issues:|Pull Requests:|Repository Files:/),
+    ).not.toBeInTheDocument();
+    await user.click(row.getByLabelText("Repository"));
+    await user.tab();
+    expect(await save(user)).toEqual(connector.config);
+  });
+  it("hydrates qualified canonical policies as independent concrete settings", async () => {
+    const user = userEvent.setup();
+    renderDialog(loadedOverridesConnector());
+    await advanced(user);
+    const row = await openRow(user);
+    expect(
+      row.getByRole("switch", { name: "Include Issues" }),
+    ).not.toBeChecked();
+    expect(row.getByLabelText("Folders (optional)")).toHaveValue("custom-docs");
+    await user.click(row.getByRole("switch", { name: "Include Issues" }));
+    fireEvent.change(row.getByLabelText("Folders (optional)"), {
+      target: { value: "" },
+    });
+    fireEvent.change(row.getByLabelText("Labels to Skip (optional)"), {
+      target: { value: "" },
+    });
+    const config = await save(user);
+    expect(config.repos).toEqual(["example-org/repo-a", "example-org/repo-b"]);
+    expect(config.repositoryOverrides).toEqual([
+      {
+        repository: "example-org/repo-a",
+        includeIssues: true,
+        includePullRequests: true,
+        includeRepositoryFiles: true,
+        labelsToSkip: [],
+        fileTypes: [],
+        includePaths: [],
+        excludePaths: [],
+      },
+      {
+        repository: "example-org/repo-b",
+        includeIssues: true,
+        includePullRequests: true,
+        includeRepositoryFiles: true,
+        labelsToSkip: ["skip"],
+        fileTypes: [],
+        includePaths: ["docs"],
+        excludePaths: [],
+      },
+    ]);
+  });
+  it.each([
+    "mode",
+    "owner",
+  ])("keeps settings attached through a blank rename and %s change", async (boundary) => {
+    const user = userEvent.setup();
+    renderDialog(loadedOverridesConnector());
+    await advanced(user);
+    const row = await openRow(user);
+    fireEvent.change(row.getByLabelText("Repository"), {
+      target: { value: "" },
+    });
+    if (boundary === "mode") {
+      await user.click(
+        screen.getByRole("radio", { name: "All accessible repositories" }),
+      );
+      await user.click(
+        screen.getByRole("radio", { name: "Selected repositories" }),
+      );
+    } else {
+      await user.click(screen.getByRole("button", { name: /General/ }));
+      fireEvent.change(screen.getByLabelText(/^Owner$/), {
+        target: { value: "other-owner" },
+      });
+      await advanced(user);
+    }
+    const draft = within(
+      screen.getByRole("group", { name: "Repository New repository" }),
+    );
+    fireEvent.change(draft.getByLabelText("Repository"), {
+      target: { value: "example-org/renamed" },
+    });
+    const config = await save(user);
+    expect(config.repositoryOverrides[0]).toMatchObject({
+      repository: "example-org/renamed",
+      includeIssues: false,
+      includePaths: ["custom-docs"],
+    });
+  });
+  it("keeps displayed identities and settings when Owner changes without retargeting bare names", async () => {
+    const user = userEvent.setup();
+    renderDialog(legacyConnector());
+    fireEvent.change(screen.getByLabelText(/^Owner$/), {
+      target: { value: "other-owner" },
+    });
+    await advanced(user);
+    const row = await openRow(user);
+    expect(row.getByLabelText("Folders (optional)")).toHaveValue("legacy");
+    const config = await save(user);
+    expect(config.repos).toEqual(["example-org/repo-a", "example-org/repo-b"]);
+    expect(config.repositoryOverrides[0]).toMatchObject({
+      repository: "example-org/repo-a",
+      includeIssues: false,
+      includePaths: ["legacy"],
+    });
+  });
+  it("removes one complete row while retaining the other's independent settings", async () => {
+    const user = userEvent.setup();
+    renderDialog(loadedOverridesConnector());
+    await advanced(user);
+    await user.click(
+      screen.getByRole("button", {
+        name: "Remove repository example-org/repo-a",
+      }),
+    );
+    const config = await save(user);
+    expect(config.repos).toEqual(["example-org/repo-b"]);
+    expect(config.repositoryOverrides).toHaveLength(1);
+    expect(config.repositoryOverrides[0]).toMatchObject({
+      repository: "example-org/repo-b",
+      includeIssues: true,
+      includePaths: ["docs"],
+    });
+  });
+  it("starts All to Selected empty and new cards use standard defaults", async () => {
+    const connector = legacyConnector();
+    connector.config = {
+      ...connector.config,
+      repos: [],
+    } as ConnectorFixture["config"];
+    const user = userEvent.setup();
+    renderDialog(connector);
+    await advanced(user);
+    await user.click(
+      screen.getByRole("radio", { name: "Selected repositories" }),
+    );
+    expect(
+      screen.queryByRole("group", { name: /Repository / }),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Add repository" }));
+    const row = within(
+      screen.getByRole("group", { name: "Repository New repository" }),
+    );
+    fireEvent.change(row.getByLabelText("Repository"), {
+      target: { value: "example-org/new-repo" },
+    });
+    expect(row.getByRole("switch", { name: "Include Issues" })).toBeChecked();
+    expect(
+      row.getByRole("switch", { name: "Include Repository Files" }),
+    ).not.toBeChecked();
+    expect(row.getByLabelText("Labels to Skip (optional)")).toHaveValue("");
+    const config = await save(user);
+    expect(config.repositoryOverrides).toEqual([
+      {
+        repository: "example-org/new-repo",
+        includeIssues: true,
+        includePullRequests: true,
+        includeRepositoryFiles: false,
+        labelsToSkip: [],
+        fileTypes: [],
+        includePaths: [],
+        excludePaths: [],
+      },
+    ]);
+  });
+  it.each([
+    "",
+    "repo-a",
+    "invalid/owner/repo",
+    "org/a,org/b",
+  ])("keeps invalid repository %s visible on save", async (name) => {
+    const user = userEvent.setup();
+    renderDialog(legacyConnector());
+    await advanced(user);
+    await user.click(screen.getByRole("button", { name: "Add repository" }));
+    const row = within(
+      screen.getByRole("group", { name: "Repository New repository" }),
+    );
+    fireEvent.change(row.getByLabelText("Repository"), {
+      target: { value: name },
+    });
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+    expect(
+      await screen.findByText(
+        name ? "Use owner/repo" : "Repository is required",
+      ),
+    ).toBeVisible();
+    expect(mockMutateAsync).not.toHaveBeenCalled();
+  });
+  it("rejects duplicate qualified names ignoring case", async () => {
+    const user = userEvent.setup();
+    renderDialog(legacyConnector());
+    await advanced(user);
+    await user.click(screen.getByRole("button", { name: "Add repository" }));
+    const row = within(
+      screen.getByRole("group", { name: "Repository New repository" }),
+    );
+    fireEvent.change(row.getByLabelText("Repository"), {
+      target: { value: "EXAMPLE-ORG/REPO-A" },
+    });
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+    expect(
+      (await screen.findAllByText("Each repository can be selected only once"))
+        .length,
+    ).toBeGreaterThan(0);
+    expect(mockMutateAsync).not.toHaveBeenCalled();
+  });
+  it("does not turn removing all selected repositories into discovery", async () => {
+    const user = userEvent.setup();
+    renderDialog(legacyConnector());
+    await advanced(user);
+    for (const name of ["example-org/repo-a", "example-org/repo-b"])
+      await user.click(
+        screen.getByRole("button", { name: `Remove repository ${name}` }),
+      );
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+    expect(
+      await screen.findByText(
+        "Add at least one repository or choose All accessible repositories.",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("radio", { name: "Selected repositories" }),
+    ).toBeChecked();
+    expect(mockMutateAsync).not.toHaveBeenCalled();
+  });
+  it("preserves flat All settings on untouched save", async () => {
+    const user = userEvent.setup();
+    const connector = legacyConnector();
+    connector.config = {
+      ...connector.config,
+      repos: [],
+    } as ConnectorFixture["config"];
+    renderDialog(connector);
+    await advanced(user);
+    expect(
+      screen.getByRole("switch", { name: "Include Issues" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Add repository" }),
+    ).not.toBeInTheDocument();
+    expect(await save(user)).toEqual(connector.config);
+  });
+  it("keeps independent mode drafts and saves only the active configuration", async () => {
+    const user = userEvent.setup();
+    renderDialog(loadedOverridesConnector());
+    await advanced(user);
+    const row = await openRow(user);
+    fireEvent.change(row.getByLabelText("Folders (optional)"), {
+      target: { value: "manual-only" },
+    });
+    await user.click(
+      screen.getByRole("radio", { name: "All accessible repositories" }),
+    );
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Folders (optional)" }),
+      { target: { value: "shared-only" } },
+    );
+    await user.click(
+      screen.getByRole("radio", { name: "Selected repositories" }),
+    );
+    expect(
+      within(
+        screen.getByRole("group", { name: "Repository example-org/repo-a" }),
+      ).getByLabelText("Folders (optional)"),
+    ).toHaveValue("manual-only");
+    await user.click(
+      screen.getByRole("radio", { name: "All accessible repositories" }),
+    );
+    expect(
+      screen.getByRole("textbox", { name: "Folders (optional)" }),
+    ).toHaveValue("shared-only");
+    const config = await save(user);
+    expect(config).toMatchObject({
+      repos: [],
+      repositoryOverrides: [],
+      includePaths: ["shared-only"],
+    });
+    expect(config).not.toHaveProperty("repositoryEntries");
+    expect(config).not.toHaveProperty("repositoryLegacyBaseline");
+  });
+  it("discards unsaved mode and repository edits on cancel and reopen", async () => {
+    const user = userEvent.setup();
+    const connector = loadedOverridesConnector();
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    function Harness() {
+      const [open, setOpen] = useState(true);
+      return (
+        <>
+          <Button onClick={() => setOpen(true)}>Reopen connector</Button>
+          <EditConnectorDialog
+            connector={connector}
+            open={open}
+            onOpenChange={setOpen}
+          />
+        </>
+      );
+    }
+    render(
+      <QueryClientProvider client={queryClient}>
+        <Harness />
+      </QueryClientProvider>,
+    );
+    await advanced(user);
+    const row = await openRow(user);
+    fireEvent.change(row.getByLabelText("Repository"), {
+      target: { value: "example-org/unsaved" },
+    });
+    await user.click(
+      screen.getByRole("radio", { name: "All accessible repositories" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByRole("button", { name: "Reopen connector" }));
+    await advanced(user);
+    const restored = await openRow(user);
+    expect(restored.getByLabelText("Folders (optional)")).toHaveValue(
+      "custom-docs",
+    );
+    expect(mockMutateAsync).not.toHaveBeenCalled();
+  });
+});
+
 describe("EditConnectorDialog - Asana", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(useTeams).mockReturnValue({
+      data: [],
+    } as unknown as ReturnType<typeof useTeams>);
   });
 
   it("submits array fields as arrays when the user does not edit them", async () => {
@@ -165,6 +642,13 @@ describe("EditConnectorDialog - Asana", () => {
     });
   });
 
+  it("does not show the permissions sync frequency picker for a non-auto-sync connector", () => {
+    renderDialog();
+    expect(
+      screen.queryByText("Permissions Sync Frequency"),
+    ).not.toBeInTheDocument();
+  });
+
   it("includes credentials only when a new token is provided", async () => {
     mockMutateAsync.mockResolvedValue({ id: "conn-asana-1" });
     const user = userEvent.setup();
@@ -184,5 +668,732 @@ describe("EditConnectorDialog - Asana", () => {
     expect(call[0].body.credentials).toEqual({ apiToken: "new-pat-xyz" });
     // Asana does not use the email field
     expect(call[0].body.credentials).not.toHaveProperty("email");
+  });
+});
+
+describe("EditConnectorDialog - Jira admin API key", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(useTeams).mockReturnValue({
+      data: [],
+    } as unknown as ReturnType<typeof useTeams>);
+  });
+
+  function makeJiraAutoSyncConnector(): ConnectorFixture {
+    return {
+      id: "conn-jira-1",
+      name: "Engineering Jira",
+      description: "",
+      visibility: "auto-sync-permissions",
+      syncPermissionsFromSource: true,
+      teamIds: [],
+      connectorType: "jira",
+      environmentId: null,
+      config: {
+        type: "jira",
+        jiraBaseUrl: "https://test.atlassian.net",
+        isCloud: true,
+        projectKey: "TEST",
+      },
+      schedule: "0 */6 * * *",
+      ftsLanguage: "english",
+      permissionSyncIntervalSeconds: 1800,
+      enabled: true,
+    } as ConnectorFixture;
+  }
+
+  it("submits the admin API key alone, without the API token", async () => {
+    mockMutateAsync.mockResolvedValue({ id: "conn-jira-1" });
+    const user = userEvent.setup();
+    renderDialog(makeJiraAutoSyncConnector());
+
+    fireEvent.change(screen.getByLabelText(/Organization admin API key/), {
+      target: { value: "org-admin-key" },
+    });
+
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    await waitFor(() => {
+      expect(mockMutateAsync).toHaveBeenCalledTimes(1);
+    });
+
+    const [call] = mockMutateAsync.mock.calls;
+    // The backend merges submitted fields over the stored secret, so the
+    // admin key must survive an empty token field instead of being dropped.
+    expect(call[0].body.credentials).toEqual({ adminApiKey: "org-admin-key" });
+  });
+
+  it("keeps the connector requirement and the admin-key note on separate fields", () => {
+    renderDialog(makeJiraAutoSyncConnector());
+
+    // The API token is the identity whose Jira permissions decide what the
+    // snapshot can read; the org admin key only resolves managed-account
+    // emails. Two credentials, two problems, two docs sections.
+    const apiTokenItem = screen
+      .getByLabelText(/^API Token$/)
+      .closest('[data-slot="form-item"]') as HTMLElement;
+    expect(
+      within(apiTokenItem).getByRole("link", { name: /Learn more/ }),
+    ).toHaveAttribute(
+      "href",
+      "https://archestra.ai/docs/knowledge/connectors/jira#jira-auto-sync-permissions",
+    );
+
+    const adminKeyItem = screen
+      .getByLabelText(/Organization admin API key/)
+      .closest('[data-slot="form-item"]') as HTMLElement;
+    expect(
+      within(adminKeyItem).getByRole("link", { name: /Learn more/ }),
+    ).toHaveAttribute(
+      "href",
+      "https://archestra.ai/docs/knowledge/connectors/jira#organization-admin-api-key",
+    );
+  });
+
+  it("places the Jira admin key directly below the permission sync switch", () => {
+    renderDialog(makeJiraAutoSyncConnector());
+    const toggle = screen.getByRole("switch", {
+      name: "Sync permissions from the source",
+    });
+    const adminKey = screen.getByLabelText(/Organization admin API key/);
+
+    expect(toggle.parentElement?.nextElementSibling).toBe(
+      adminKey.closest('[data-slot="form-item"]'),
+    );
+  });
+
+  it("submits a corrected email alone, without re-entering the token", async () => {
+    mockMutateAsync.mockResolvedValue({ id: "conn-jira-1" });
+    const user = userEvent.setup();
+    renderDialog(makeJiraAutoSyncConnector());
+
+    // Correcting a typo'd credential email must not be silently dropped just
+    // because the token field is left empty to keep the existing token.
+    fireEvent.change(screen.getByRole("textbox", { name: /^Email/ }), {
+      target: { value: "correct@example.com" },
+    });
+
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    await waitFor(() => {
+      expect(mockMutateAsync).toHaveBeenCalledTimes(1);
+    });
+
+    const [call] = mockMutateAsync.mock.calls;
+    expect(call[0].body.credentials).toEqual({ email: "correct@example.com" });
+  });
+});
+
+describe("EditConnectorDialog - Perforce permission sync", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(useTeams).mockReturnValue({
+      data: [],
+    } as unknown as ReturnType<typeof useTeams>);
+  });
+
+  function makePerforceAutoSyncConnector(): ConnectorFixture {
+    return {
+      id: "conn-p4-1",
+      name: "Docs Depot",
+      description: "",
+      visibility: "auto-sync-permissions",
+      syncPermissionsFromSource: true,
+      teamIds: [],
+      connectorType: "perforce",
+      environmentId: null,
+      config: {
+        type: "perforce",
+        serverUrl: "https://perforce.example.com:8080",
+        depotPaths: ["//depot/docs"],
+        p4Port: "ssl:perforce.example.com:1666",
+        adminUsername: "p4admin",
+      },
+      schedule: "0 */6 * * *",
+      ftsLanguage: "english",
+      permissionSyncIntervalSeconds: 1800,
+      enabled: true,
+    } as ConnectorFixture;
+  }
+
+  it("shows the permission sync fields with the stored config values", () => {
+    renderDialog(makePerforceAutoSyncConnector());
+
+    expect(screen.getByLabelText(/^P4 Port$/)).toHaveValue(
+      "ssl:perforce.example.com:1666",
+    );
+    expect(screen.getByLabelText(/^Admin Username$/)).toHaveValue("p4admin");
+    // The stored admin password never round-trips into the form.
+    expect(screen.getByLabelText(/^Admin Password$/)).toHaveValue("");
+  });
+
+  it("points the admin account, not the ticket, at the Perforce setup docs", () => {
+    renderDialog(makePerforceAutoSyncConnector());
+
+    const adminPasswordItem = screen
+      .getByLabelText(/^Admin Password$/)
+      .closest('[data-slot="form-item"]') as HTMLElement;
+    expect(adminPasswordItem).toHaveTextContent(
+      /Auto-sync permissions needs an account that can read the full protections table/,
+    );
+    expect(
+      within(adminPasswordItem).getByRole("link", { name: /Learn more/ }),
+    ).toHaveAttribute(
+      "href",
+      "https://archestra.ai/docs/knowledge/connectors/perforce#perforce-auto-sync-permissions",
+    );
+
+    // The edit-mode note and the requirement share one description. Two
+    // stacked description blocks under a single field read as a rendering bug.
+    const descriptions = adminPasswordItem.querySelectorAll(
+      '[data-slot="form-description"]',
+    );
+    expect(descriptions).toHaveLength(1);
+    expect(descriptions[0]).toHaveTextContent(
+      /Leave empty to keep the existing password\..*needs an account that can read the full protections table/,
+    );
+
+    // The login ticket belongs to the content identity, which only needs read
+    // on the depot paths — putting the admin requirement there would be wrong.
+    const loginTicketItem = screen
+      .getByLabelText(/^Login Ticket$/)
+      .closest('[data-slot="form-item"]') as HTMLElement;
+    expect(
+      within(loginTicketItem).queryByRole("link", { name: /Learn more/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("saves without a P4 port, which the backend derives from the Server URL", async () => {
+    mockMutateAsync.mockResolvedValue({ id: "conn-p4-1" });
+    const user = userEvent.setup();
+    const connector = makePerforceAutoSyncConnector();
+    delete (connector.config as { p4Port?: string }).p4Port;
+    renderDialog(connector);
+
+    // The derived address is shown as the placeholder so it is not a mystery.
+    expect(screen.getByLabelText(/^P4 Port$/)).toHaveAttribute(
+      "placeholder",
+      "perforce.example.com:1666 (derived from Server URL)",
+    );
+
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    await waitFor(() => {
+      expect(mockMutateAsync).toHaveBeenCalledTimes(1);
+    });
+    const [call] = mockMutateAsync.mock.calls;
+    expect(call[0].body.config).not.toHaveProperty("p4Port");
+    expect(call[0].body.config).toMatchObject({ adminUsername: "p4admin" });
+  });
+
+  it("keeps the stored admin password when the field is left blank", async () => {
+    mockMutateAsync.mockResolvedValue({ id: "conn-p4-1" });
+    const user = userEvent.setup();
+    renderDialog(makePerforceAutoSyncConnector());
+
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    await waitFor(() => {
+      expect(mockMutateAsync).toHaveBeenCalledTimes(1);
+    });
+
+    const [call] = mockMutateAsync.mock.calls;
+    // A blank password must not clobber the stored credential.
+    expect(call[0].body).not.toHaveProperty("credentials");
+    expect(call[0].body.config).toMatchObject({
+      type: "perforce",
+      p4Port: "ssl:perforce.example.com:1666",
+      adminUsername: "p4admin",
+    });
+  });
+
+  it("submits a new admin password alone, without the login ticket", async () => {
+    mockMutateAsync.mockResolvedValue({ id: "conn-p4-1" });
+    const user = userEvent.setup();
+    renderDialog(makePerforceAutoSyncConnector());
+
+    fireEvent.change(screen.getByLabelText(/^Admin Password$/), {
+      target: { value: "new-admin-password" },
+    });
+
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    await waitFor(() => {
+      expect(mockMutateAsync).toHaveBeenCalledTimes(1);
+    });
+
+    const [call] = mockMutateAsync.mock.calls;
+    // The backend merges submitted fields over the stored secret, so the
+    // admin password must survive an empty token field instead of being
+    // dropped.
+    expect(call[0].body.credentials).toEqual({
+      adminApiKey: "new-admin-password",
+    });
+  });
+});
+
+describe("EditConnectorDialog - permission sync interval (auto-sync)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(useTeams).mockReturnValue({
+      data: [],
+    } as unknown as ReturnType<typeof useTeams>);
+  });
+
+  function makeAutoSyncGithubConnector(): ConnectorFixture {
+    return {
+      id: "conn-gh-1",
+      name: "Engineering GitHub",
+      description: "",
+      visibility: "auto-sync-permissions",
+      syncPermissionsFromSource: true,
+      teamIds: [],
+      connectorType: "github",
+      environmentId: null,
+      config: {
+        type: "github",
+        githubUrl: "https://api.github.com",
+        owner: "test-org",
+        authMethod: "pat",
+      },
+      schedule: "0 */6 * * *",
+      ftsLanguage: "english",
+      permissionSyncIntervalSeconds: 1800,
+      enabled: true,
+    } as ConnectorFixture;
+  }
+
+  it("shows the picker with the connector's saved interval and submits a new one", async () => {
+    mockMutateAsync.mockResolvedValue({ id: "conn-gh-1" });
+    const user = userEvent.setup();
+    renderDialog(makeAutoSyncGithubConnector());
+
+    // The picker lives in the Advanced section, under the content schedule.
+    await user.click(screen.getByRole("button", { name: /Advanced/ }));
+    expect(
+      await screen.findByText("Permissions Sync Frequency"),
+    ).toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("combobox", { name: /Permissions Sync Frequency/ }),
+    );
+    // Saved 1800s marks its preset as the selected option.
+    expect(
+      await screen.findByRole("option", { name: "Every 30 minutes" }),
+    ).toHaveAttribute("aria-selected", "true");
+    await user.click(screen.getByRole("option", { name: "Every hour" }));
+
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+    await waitFor(() => {
+      expect(mockMutateAsync).toHaveBeenCalledTimes(1);
+    });
+
+    const [call] = mockMutateAsync.mock.calls;
+    expect(call[0].body.permissionSyncIntervalSeconds).toBe(3600);
+  });
+});
+
+describe("EditConnectorDialog - Notion auto-sync limitation note", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(useTeams).mockReturnValue({
+      data: [],
+    } as unknown as ReturnType<typeof useTeams>);
+  });
+
+  function makeNotionConnector(
+    visibility: ConnectorFixture["visibility"],
+  ): ConnectorFixture {
+    return {
+      id: "conn-notion-1",
+      name: "Company Notion",
+      description: "",
+      visibility,
+      syncPermissionsFromSource: visibility === "auto-sync-permissions",
+      teamIds: [],
+      connectorType: "notion",
+      environmentId: null,
+      config: { type: "notion" },
+      schedule: "0 */6 * * *",
+      ftsLanguage: "english",
+      permissionSyncIntervalSeconds: 1800,
+      enabled: true,
+    } as ConnectorFixture;
+  }
+
+  it("shows the workspace-audience note for auto-sync Notion", () => {
+    renderDialog(makeNotionConnector("auto-sync-permissions"));
+
+    const note = screen.getByText(
+      /every synced page visible to all workspace members/,
+    );
+    expect(note).toBeInTheDocument();
+    // The recommendation sentence rides in the same note. What the credential
+    // itself needs lives on the Integration Token field instead, so this note
+    // carries no docs link of its own.
+    expect(note).toHaveTextContent(/Share only workspace-appropriate/);
+    expect(within(note).queryByRole("link")).not.toBeInTheDocument();
+  });
+
+  it("hides the note for a Notion connector without auto-sync visibility", () => {
+    renderDialog(makeNotionConnector("org-wide"));
+    expect(
+      screen.queryByText(/every synced page visible to all workspace members/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not show the Notion note on other auto-sync connector types", () => {
+    renderDialog({
+      id: "conn-gh-2",
+      name: "Engineering GitHub",
+      description: "",
+      visibility: "auto-sync-permissions",
+      syncPermissionsFromSource: true,
+      teamIds: [],
+      connectorType: "github",
+      environmentId: null,
+      config: {
+        type: "github",
+        githubUrl: "https://api.github.com",
+        owner: "test-org",
+        authMethod: "pat",
+      },
+      schedule: "0 */6 * * *",
+      ftsLanguage: "english",
+      permissionSyncIntervalSeconds: 1800,
+      enabled: true,
+    } as ConnectorFixture);
+    expect(
+      screen.queryByText(/every synced page visible to all workspace members/),
+    ).not.toBeInTheDocument();
+  });
+});
+
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+describe("EditConnectorDialog - permission sync capability", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(useTeams).mockReturnValue({ data: [] } as unknown as ReturnType<
+      typeof useTeams
+    >);
+    mockMutateAsync.mockResolvedValue({ id: "conn-jira-1" });
+  });
+
+  function makeJiraConnector(
+    visibility: ConnectorFixture["visibility"],
+    teamIds: string[] = [],
+  ): ConnectorFixture {
+    return {
+      id: "conn-jira-1",
+      name: "Engineering Jira",
+      description: "",
+      visibility,
+      syncPermissionsFromSource: visibility === "auto-sync-permissions",
+      teamIds,
+      connectorType: "jira",
+      environmentId: null,
+      config: {
+        type: "jira",
+        jiraBaseUrl: "https://test.atlassian.net",
+        isCloud: true,
+        projectKey: "TEST",
+      },
+      schedule: "0 */6 * * *",
+      ftsLanguage: "english",
+      permissionSyncIntervalSeconds: 1800,
+      enabled: true,
+    } as ConnectorFixture;
+  }
+
+  it("keeps permission sync on when an unrelated field is saved", async () => {
+    const user = userEvent.setup();
+    renderDialog(makeJiraConnector("auto-sync-permissions"));
+
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    await waitFor(() => expect(mockMutateAsync).toHaveBeenCalledTimes(1));
+    const { body } = mockMutateAsync.mock.calls[0][0];
+    expect(body.visibility).toBe("auto-sync-permissions");
+    expect(body.permissionSyncIntervalSeconds).toBe(1800);
+  });
+
+  it("reads permission sync from its own column, not the visibility value", async () => {
+    // A connector created since the create API dropped `visibility` carries
+    // the switch alone; the dialog must show it on and keep it on.
+    const user = userEvent.setup();
+    renderDialog({
+      ...makeJiraConnector("org-wide"),
+      syncPermissionsFromSource: true,
+    });
+
+    expect(
+      screen.getByRole("switch", { name: /Sync permissions from the source/ }),
+    ).toBeChecked();
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    await waitFor(() => expect(mockMutateAsync).toHaveBeenCalledTimes(1));
+    const { body } = mockMutateAsync.mock.calls[0][0];
+    expect(body.visibility).toBe("auto-sync-permissions");
+  });
+
+  it("stops syncing permissions when the capability is switched off", async () => {
+    const user = userEvent.setup();
+    renderDialog(makeJiraConnector("auto-sync-permissions"));
+
+    await user.click(
+      screen.getByRole("switch", { name: /Sync permissions from the source/ }),
+    );
+    // The fields that only exist for a permission-syncing connector go with it.
+    expect(
+      screen.queryByLabelText(/Organization admin API key/),
+    ).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    await waitFor(() => expect(mockMutateAsync).toHaveBeenCalledTimes(1));
+    const { body } = mockMutateAsync.mock.calls[0][0];
+    expect(body.visibility).toBe("org-wide");
+    expect(body).not.toHaveProperty("permissionSyncIntervalSeconds");
+  });
+
+  it("leaves a connector's stored sharing value alone on an ordinary save", async () => {
+    const user = userEvent.setup();
+    renderDialog(makeJiraConnector("team-scoped", ["engineering"]));
+
+    // Sharing moved to grants, so the dialog no longer offers this choice —
+    // and must not quietly rewrite the column it no longer shows.
+    expect(
+      screen.queryByRole("button", { name: /Teams Share/ }),
+    ).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    await waitFor(() => expect(mockMutateAsync).toHaveBeenCalledTimes(1));
+    const { body } = mockMutateAsync.mock.calls[0][0];
+    expect(body.visibility).toBe("team-scoped");
+    expect(body.teamIds).toEqual(["engineering"]);
+  });
+});
+
+describe("EditConnectorDialog - SharePoint publication status", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(useTeams).mockReturnValue({ data: [] } as unknown as ReturnType<
+      typeof useTeams
+    >);
+    mockMutateAsync.mockResolvedValue({ id: "conn-sharepoint-1" });
+  });
+
+  it.each([
+    undefined,
+    "draft",
+    "published",
+    "both",
+  ] as const)("preserves %s on an unrelated edit", async (status) => {
+    const user = userEvent.setup();
+    renderDialog({
+      ...makeAsanaConnector(),
+      id: "conn-sharepoint-1",
+      connectorType: "sharepoint",
+      config: {
+        type: "sharepoint",
+        tenantId: "test-tenant",
+        siteUrl: "https://tenant.sharepoint.com",
+        pagePublicationStatus: status,
+      },
+    });
+    await user.click(screen.getByRole("button", { name: /Advanced/ }));
+    expect(
+      screen.getByRole("combobox", { name: "Page publication status" }),
+    ).toHaveTextContent(
+      status === "draft"
+        ? "Draft only"
+        : status === "published"
+          ? "Published only"
+          : "Both",
+    );
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+    await waitFor(() => expect(mockMutateAsync).toHaveBeenCalledTimes(1));
+    expect(
+      mockMutateAsync.mock.calls[0][0].body.config.pagePublicationStatus,
+    ).toBe(status);
+  });
+
+  it("saves a changed selection and preserves it while pages are disabled", async () => {
+    const user = userEvent.setup();
+    renderDialog({
+      ...makeAsanaConnector(),
+      id: "conn-sharepoint-1",
+      connectorType: "sharepoint",
+      config: {
+        type: "sharepoint",
+        tenantId: "test-tenant",
+        siteUrl: "https://tenant.sharepoint.com",
+      },
+    });
+    await user.click(screen.getByRole("button", { name: /Advanced/ }));
+    await user.click(
+      screen.getByRole("combobox", { name: "Page publication status" }),
+    );
+    await user.click(screen.getByRole("option", { name: "Draft only" }));
+    await user.click(screen.getByRole("switch", { name: "Include Pages" }));
+    expect(
+      screen.queryByRole("combobox", { name: "Page publication status" }),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole("switch", { name: "Include Pages" }));
+    expect(
+      screen.getByRole("combobox", { name: "Page publication status" }),
+    ).toHaveTextContent("Draft only");
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+    await waitFor(() => expect(mockMutateAsync).toHaveBeenCalledTimes(1));
+    expect(mockMutateAsync.mock.calls[0][0].body.config).toMatchObject({
+      pagePublicationStatus: "draft",
+      includePages: true,
+    });
+  });
+});
+// SPDX-SnippetEnd
+
+describe("EditConnectorDialog - Salesforce OAuth migration", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(useTeams).mockReturnValue({ data: [] } as unknown as ReturnType<
+      typeof useTeams
+    >);
+  });
+  function salesforceConnector(oauth: boolean): ConnectorFixture {
+    return {
+      ...makeAsanaConnector(),
+      connectorType: "salesforce",
+      config: {
+        type: "salesforce",
+        loginUrl: oauth
+          ? "https://example.my.salesforce.com"
+          : "https://login.salesforce.com",
+        ...(oauth
+          ? { authMethod: "oauth_client_credentials", clientId: "consumer-key" }
+          : {}),
+        objects: ["Account"],
+      },
+    } as ConnectorFixture;
+  }
+  it("preserves legacy authentication and stored credentials when saving an existing connector", async () => {
+    mockMutateAsync.mockResolvedValue({ id: "conn-salesforce" });
+    const user = userEvent.setup();
+    renderDialog(salesforceConnector(false));
+    expect(
+      screen.getByRole("combobox", { name: "Authentication" }),
+    ).toHaveTextContent("Username/password (legacy)");
+    expect(screen.queryByLabelText("Consumer Key")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+    await waitFor(() => expect(mockMutateAsync).toHaveBeenCalledOnce());
+    expect(mockMutateAsync.mock.calls[0][0].body).toMatchObject({
+      config: {
+        authMethod: "soap_legacy",
+        loginUrl: "https://login.salesforce.com",
+        objects: ["Account"],
+      },
+    });
+    expect(mockMutateAsync.mock.calls[0][0].body.credentials).toBeUndefined();
+  });
+  it("can return to legacy after exploring OAuth and keep stored credentials", async () => {
+    mockMutateAsync.mockResolvedValue({ id: "conn-salesforce" });
+    const user = userEvent.setup();
+    renderDialog(salesforceConnector(false));
+    await user.click(screen.getByRole("combobox", { name: "Authentication" }));
+    await user.click(
+      screen.getByRole("option", {
+        name: "OAuth client credentials (recommended)",
+      }),
+    );
+    await user.click(screen.getByRole("combobox", { name: "Authentication" }));
+    await user.click(
+      screen.getByRole("option", { name: "Username/password (legacy)" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+    await waitFor(() => expect(mockMutateAsync).toHaveBeenCalledOnce());
+    expect(mockMutateAsync.mock.calls[0][0].body.config).toMatchObject({
+      authMethod: "soap_legacy",
+      loginUrl: "https://login.salesforce.com",
+    });
+    expect(mockMutateAsync.mock.calls[0][0].body.credentials).toBeUndefined();
+  });
+  it("clears typed legacy credentials when switching to OAuth", async () => {
+    const user = userEvent.setup();
+    renderDialog(salesforceConnector(false));
+    fireEvent.change(screen.getByLabelText(/^Password/), {
+      target: { value: "legacy-password" },
+    });
+    fireEvent.change(screen.getByLabelText(/^Username/), {
+      target: { value: "legacy@example.com" },
+    });
+    await user.click(screen.getByRole("combobox", { name: "Authentication" }));
+    await user.click(
+      screen.getByRole("option", {
+        name: "OAuth client credentials (recommended)",
+      }),
+    );
+    expect(screen.getByLabelText("Consumer Secret")).toHaveValue("");
+    expect(screen.getByLabelText("My Domain URL")).toHaveValue("");
+    expect(screen.queryByLabelText(/^Username/)).not.toBeInTheDocument();
+  });
+  it("requires a replacement secret and submits an explicit OAuth configuration for a legacy connector", async () => {
+    mockMutateAsync.mockResolvedValue({ id: "conn-salesforce" });
+    const user = userEvent.setup();
+    renderDialog(salesforceConnector(false));
+    expect(screen.getByText("Migrate before Summer ’27")).toBeInTheDocument();
+    expect(screen.getByLabelText(/^Username/)).toBeInTheDocument();
+    await user.click(screen.getByRole("combobox", { name: "Authentication" }));
+    await user.click(
+      screen.getByRole("option", {
+        name: "OAuth client credentials (recommended)",
+      }),
+    );
+    expect(
+      screen.getByPlaceholderText(
+        "Enter a new Salesforce OAuth consumer secret",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText(/^Email/)).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(/^My Domain URL$/), {
+      target: { value: "https://example.my.salesforce.com" },
+    });
+    fireEvent.change(screen.getByLabelText(/^Consumer Key$/), {
+      target: { value: "consumer-key" },
+    });
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+    expect(mockMutateAsync).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(
+        "Enter a new OAuth consumer secret to migrate this connector",
+      ),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(/^Consumer Secret$/), {
+      target: { value: "consumer-secret" },
+    });
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+    await waitFor(() => expect(mockMutateAsync).toHaveBeenCalledOnce());
+    expect(mockMutateAsync.mock.calls[0][0].body).toMatchObject({
+      config: {
+        authMethod: "oauth_client_credentials",
+        clientId: "consumer-key",
+        loginUrl: "https://example.my.salesforce.com",
+        objects: ["Account"],
+      },
+      credentials: { apiToken: "consumer-secret" },
+    });
+  });
+  it("keeps the stored OAuth secret when editing a migrated connector", async () => {
+    mockMutateAsync.mockResolvedValue({ id: "conn-salesforce" });
+    const user = userEvent.setup();
+    renderDialog(salesforceConnector(true));
+    expect(
+      screen.queryByRole("combobox", { name: "Authentication" }),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+    await waitFor(() => expect(mockMutateAsync).toHaveBeenCalledOnce());
+    expect(mockMutateAsync.mock.calls[0][0].body.credentials).toBeUndefined();
   });
 });

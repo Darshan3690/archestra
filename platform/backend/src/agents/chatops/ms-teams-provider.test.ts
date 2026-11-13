@@ -1,12 +1,27 @@
+import { Activity } from "@microsoft/agents-activity";
+import { CloudAdapter, TurnContext } from "@microsoft/agents-hosting";
+import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import MSTeamsProvider from "./ms-teams-provider";
+import { ChatOpsMsTeamsUserConnectionModel } from "@/models";
+import { setupTestCacheManager } from "@/test/cache-manager";
+import { useMswServer } from "@/test/msw";
+import type {
+  ChatThreadMessageFile,
+  IncomingChatMessage,
+  ThreadFileOutcome,
+} from "@/types";
+import MSTeamsProvider, {
+  buildApprovalDecisionCard,
+} from "./ms-teams-provider";
 
 /**
- * Tests for @mention filtering in parseWebhookNotification.
+ * Tests for bot @mention detection (wasBotMentioned).
  *
- * In team channels (conversationType === "channel"), the bot should only
- * respond when explicitly @mentioned. Group chats and personal chats are
- * unaffected — all messages are processed.
+ * In team channels the bot stays quiet until @mentioned, then keeps replying
+ * to the thread. That gating now lives in the webhook route (mention detection
+ * + channel-activation); parseWebhookNotification no longer drops un-mentioned
+ * channel messages. These tests cover the mention-detection primitive and the
+ * fact that parsing itself is mention-agnostic.
  */
 
 function makeActivity(overrides: Record<string, unknown> = {}) {
@@ -55,8 +70,169 @@ function createProvider(): MSTeamsProvider {
   return provider;
 }
 
-describe("MSTeamsProvider @mention filtering", () => {
-  test("channel message WITH bot @mention returns parsed message", async () => {
+describe("MSTeamsProvider.wasBotMentioned", () => {
+  test("true when the bot is @mentioned", () => {
+    const provider = createProvider();
+    expect(provider.wasBotMentioned(makeActivity())).toBe(true);
+  });
+
+  test("false when there are no mention entities", () => {
+    const provider = createProvider();
+    expect(provider.wasBotMentioned(makeActivity({ entities: [] }))).toBe(
+      false,
+    );
+  });
+
+  test("false when the entities array is missing", () => {
+    const provider = createProvider();
+    expect(
+      provider.wasBotMentioned(makeActivity({ entities: undefined })),
+    ).toBe(false);
+  });
+
+  test("false when a DIFFERENT user is mentioned", () => {
+    const provider = createProvider();
+    expect(
+      provider.wasBotMentioned(
+        makeActivity({
+          entities: [
+            {
+              type: "mention",
+              mentioned: { id: "other-user-id", name: "SomeoneElse" },
+            },
+          ],
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  test("matches when mentioned.id has 28: prefix but recipient.id does not", () => {
+    const provider = createProvider();
+    expect(
+      provider.wasBotMentioned(
+        makeActivity({
+          recipient: { id: "app-id-123", name: "TestBot" },
+          entities: [
+            {
+              type: "mention",
+              mentioned: { id: "28:app-id-123", name: "TestBot" },
+            },
+          ],
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  test("matches IDs case-insensitively", () => {
+    const provider = createProvider();
+    expect(
+      provider.wasBotMentioned(
+        makeActivity({
+          recipient: { id: "28:APP-ID-123", name: "TestBot" },
+          entities: [
+            {
+              type: "mention",
+              mentioned: { id: "28:app-id-123", name: "TestBot" },
+            },
+          ],
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  test("false when the bot has no recipient id", () => {
+    const provider = createProvider();
+    expect(
+      provider.wasBotMentioned(makeActivity({ recipient: { name: "Bot" } })),
+    ).toBe(false);
+  });
+});
+
+describe("MSTeamsProvider.parseMuteReaction", () => {
+  const CHANNEL = "19:abcdef@thread.tacv2";
+  const ROOT = "1700000000000";
+  const channelReaction = (overrides: Record<string, unknown> = {}) => ({
+    type: "messageReaction",
+    conversation: {
+      id: `${CHANNEL};messageid=${ROOT}`,
+      conversationType: "channel",
+    },
+    channelData: { channel: { id: CHANNEL } },
+    reactionsAdded: [{ type: "1f507_mutedspeaker" }],
+    ...overrides,
+  });
+
+  test("returns channel + thread (root from conversation id) for a mute reaction", () => {
+    const provider = createProvider();
+    expect(provider.parseMuteReaction(channelReaction())).toEqual({
+      channelId: CHANNEL,
+      threadId: ROOT,
+    });
+  });
+
+  test("accepts the shushing-face reaction id too", () => {
+    const provider = createProvider();
+    expect(
+      provider.parseMuteReaction(
+        channelReaction({ reactionsAdded: [{ type: "lipssealed" }] }),
+      ),
+    ).not.toBeNull();
+  });
+
+  test("derives the thread root from conversation id, NOT replyToId", () => {
+    const provider = createProvider();
+    // replyToId points at the reacted (bot reply) message, which must be ignored.
+    const result = provider.parseMuteReaction(
+      channelReaction({ replyToId: "9999-bot-reply-message-id" }),
+    );
+    expect(result?.threadId).toBe(ROOT);
+  });
+
+  test("null for a non-mute reaction", () => {
+    const provider = createProvider();
+    expect(
+      provider.parseMuteReaction(
+        channelReaction({ reactionsAdded: [{ type: "like" }] }),
+      ),
+    ).toBeNull();
+  });
+
+  test("null when the activity is not a messageReaction", () => {
+    const provider = createProvider();
+    expect(
+      provider.parseMuteReaction(channelReaction({ type: "message" })),
+    ).toBeNull();
+  });
+
+  test("null outside team channels (no sticky state to clear)", () => {
+    const provider = createProvider();
+    expect(
+      provider.parseMuteReaction(
+        channelReaction({
+          conversation: {
+            id: `${CHANNEL};messageid=${ROOT}`,
+            conversationType: "groupChat",
+          },
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  test("null when the thread root can't be resolved (no false mute)", () => {
+    const provider = createProvider();
+    // conversation id without ;messageid= — we must NOT guess a key.
+    expect(
+      provider.parseMuteReaction(
+        channelReaction({
+          conversation: { id: CHANNEL, conversationType: "channel" },
+        }),
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("MSTeamsProvider.parseWebhookNotification is mention-agnostic", () => {
+  test("channel message WITH @mention is parsed", async () => {
     const provider = createProvider();
     const result = await provider.parseWebhookNotification(makeActivity(), {});
 
@@ -64,77 +240,14 @@ describe("MSTeamsProvider @mention filtering", () => {
     expect(result?.text).toBe("hello world");
   });
 
-  test("channel message WITHOUT bot @mention returns null", async () => {
+  test("channel message WITHOUT @mention is still parsed (gating moved to the route)", async () => {
     const provider = createProvider();
     const result = await provider.parseWebhookNotification(
       makeActivity({ entities: [] }),
       {},
     );
 
-    expect(result).toBeNull();
-  });
-
-  test("channel message with @mention of DIFFERENT user returns null", async () => {
-    const provider = createProvider();
-    const result = await provider.parseWebhookNotification(
-      makeActivity({
-        entities: [
-          {
-            type: "mention",
-            mentioned: { id: "other-user-id", name: "SomeoneElse" },
-          },
-        ],
-      }),
-      {},
-    );
-
-    expect(result).toBeNull();
-  });
-
-  test("matches when mentioned.id has 28: prefix but recipient.id does not", async () => {
-    const provider = createProvider();
-    const result = await provider.parseWebhookNotification(
-      makeActivity({
-        recipient: { id: "app-id-123", name: "TestBot" },
-        entities: [
-          {
-            type: "mention",
-            mentioned: { id: "28:app-id-123", name: "TestBot" },
-          },
-        ],
-      }),
-      {},
-    );
-
     expect(result).not.toBeNull();
-  });
-
-  test("matches IDs case-insensitively", async () => {
-    const provider = createProvider();
-    const result = await provider.parseWebhookNotification(
-      makeActivity({
-        recipient: { id: "28:APP-ID-123", name: "TestBot" },
-        entities: [
-          {
-            type: "mention",
-            mentioned: { id: "28:app-id-123", name: "TestBot" },
-          },
-        ],
-      }),
-      {},
-    );
-
-    expect(result).not.toBeNull();
-  });
-
-  test("channel message with no entities array returns null", async () => {
-    const provider = createProvider();
-    const result = await provider.parseWebhookNotification(
-      makeActivity({ entities: undefined }),
-      {},
-    );
-
-    expect(result).toBeNull();
   });
 
   test("group chat message without @mention returns parsed message", async () => {
@@ -167,6 +280,82 @@ describe("MSTeamsProvider @mention filtering", () => {
     );
 
     expect(result).not.toBeNull();
+  });
+
+  // Teams gating (isThreadMuteCommand via applyChannelGate) runs at the route
+  // level, not in this method — see chatops.ts. That gate matches on the exact
+  // cleaned text, so a literal ":mute:"/":shushing_face:" message must reach it
+  // unmangled, the same way any other un-mentioned channel text does.
+  test.each([
+    ":mute:",
+    ":shushing_face:",
+  ])("a literal %j message is parsed unmangled (mute gating happens at the route)", async (text) => {
+    const provider = createProvider();
+    const result = await provider.parseWebhookNotification(
+      makeActivity({ text, entities: [] }),
+      {},
+    );
+
+    expect(result).not.toBeNull();
+    expect(result?.text).toBe(text);
+  });
+});
+
+describe("MSTeamsProvider conversation sessions", () => {
+  test("1:1 and group chats keep their history server-side; channel threads read Graph", async () => {
+    const provider = createProvider();
+    const channel = await provider.parseWebhookNotification(
+      makeActivity({ replyToId: "root-1" }),
+      {},
+    );
+    const personal = await provider.parseWebhookNotification(
+      makeActivity({
+        conversation: { id: "a:b", conversationType: "personal" },
+        channelData: { tenant: { id: "tenant-1" } },
+      }),
+      {},
+    );
+    const group = await provider.parseWebhookNotification(
+      makeActivity({
+        conversation: {
+          id: "19:meeting_abc@thread.v2",
+          conversationType: "groupChat",
+        },
+        channelData: { tenant: { id: "tenant-1" } },
+      }),
+      {},
+    );
+    if (!channel || !personal || !group) throw new Error("not parsed");
+
+    expect(provider.usesServerSideSessionsFor(channel)).toBe(false);
+    expect(provider.usesServerSideSessionsFor(personal)).toBe(true);
+    expect(provider.usesServerSideSessionsFor(group)).toBe(true);
+  });
+
+  test("a quoted reply in a 1:1 chat stays in the chat's single conversation", async () => {
+    const provider = createProvider();
+    const result = await provider.parseWebhookNotification(
+      makeActivity({
+        conversation: { id: "a:b", conversationType: "personal" },
+        replyToId: "quoted-message-id",
+        channelData: { tenant: { id: "tenant-1" } },
+      }),
+      {},
+    );
+
+    expect(result?.threadId).toBeUndefined();
+    expect(result?.isThreadReply).toBe(false);
+  });
+
+  test("a channel reply keeps its thread", async () => {
+    const provider = createProvider();
+    const result = await provider.parseWebhookNotification(
+      makeActivity({ replyToId: "root-1" }),
+      {},
+    );
+
+    expect(result?.threadId).toBe("root-1");
+    expect(result?.isThreadReply).toBe(true);
   });
 });
 
@@ -225,6 +414,168 @@ describe("MSTeamsProvider file attachment downloads", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  test("file-only message (empty text + file attachment) is parsed with attachments", async () => {
+    const provider = createProvider();
+    const fileContent = Buffer.from("file-only teams message");
+
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response(fileContent, { status: 200 }),
+    );
+
+    const result = await provider.parseWebhookNotification(
+      makeActivity({
+        text: undefined,
+        attachments: [
+          {
+            contentType: "application/pdf",
+            contentUrl: "https://teams.blob.core.windows.net/files/report.pdf",
+            name: "report.pdf",
+          },
+        ],
+      }),
+      {},
+    );
+
+    expect(result).not.toBeNull();
+    expect(result?.text).toBe("");
+    expect(result?.attachments).toHaveLength(1);
+    expect(result?.attachments?.[0].name).toBe("report.pdf");
+  });
+
+  test.each([
+    "http://contoso.sharepoint.com/sites/Engineering/Documents/file.pdf",
+    "https://user:pass@contoso.sharepoint.com/sites/Engineering/Documents/file.pdf",
+    "https://contoso.sharepoint.com:444/sites/Engineering/Documents/file.pdf",
+    "https://contoso.sharepoint.com.evil.example/sites/Engineering/Documents/file.pdf",
+    "https://graph.microsoft.com/v1.0/me/drive/root",
+  ])("rejects unsafe reference URL %s without requesting it", async (contentUrl) => {
+    const message = await createProvider().parseWebhookNotification(
+      makeActivity({
+        attachments: [
+          { contentType: "reference", contentUrl, name: "file.pdf" },
+        ],
+      }),
+      {},
+    );
+    expect(message?.attachments).toBeUndefined();
+    expect(message?.skippedAttachments?.[0].reason).toBe("download_failed");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("rejects a redirect to an untrusted host before requesting it", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: { location: "http://127.0.0.1/private" },
+      }),
+    );
+    const outcomes = await createProvider().downloadFiles([
+      {
+        url: "https://teams.blob.core.windows.net/files/report.pdf",
+        mimetype: "application/pdf",
+        name: "report.pdf",
+      },
+    ]);
+    expect(outcomes[0].status).toBe("skipped");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  test("authenticated downloads strip the bot token on a validated cross-origin redirect", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(
+        HttpResponse.json({ access_token: "bot-token-123" }),
+      )
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 302,
+          headers: {
+            location: "https://download.files.1drv.com/report.pdf",
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response("%PDF-1.7 file", {
+          headers: { "content-type": "application/pdf" },
+        }),
+      );
+    const message = await createProvider().parseWebhookNotification(
+      makeActivity({
+        attachments: [
+          {
+            contentType: "application/pdf",
+            contentUrl:
+              "https://smba.trafficmanager.net/amer/v3/attachments/report.pdf",
+            name: "report.pdf",
+          },
+        ],
+      }),
+      {},
+    );
+    expect(message?.attachments).toHaveLength(1);
+    expect(vi.mocked(fetch).mock.calls[2]).toEqual([
+      "https://download.files.1drv.com/report.pdf",
+      { headers: {}, redirect: "manual" },
+    ]);
+  });
+
+  test("message with neither text nor attachments returns null", async () => {
+    const provider = createProvider();
+
+    const result = await provider.parseWebhookNotification(
+      makeActivity({ text: undefined, attachments: undefined }),
+      {},
+    );
+
+    expect(result).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("a file whose download fails reaches the agent as skipped, so it can say so", async () => {
+    const provider = createProvider();
+
+    // The download fails (e.g. expired), so no attachment survives.
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(null, { status: 404 }));
+
+    const result = await provider.parseWebhookNotification(
+      makeActivity({
+        text: undefined,
+        attachments: [
+          {
+            contentType: "application/pdf",
+            contentUrl: "https://teams.blob.core.windows.net/files/report.pdf",
+            name: "report.pdf",
+          },
+        ],
+      }),
+      {},
+    );
+
+    expect(result?.attachments).toBeUndefined();
+    expect(result?.skippedAttachments).toEqual([
+      { name: "report.pdf", reason: "download_failed" },
+    ]);
+  });
+
+  test("card-only message with empty text returns null (cards are not files)", async () => {
+    const provider = createProvider();
+
+    const result = await provider.parseWebhookNotification(
+      makeActivity({
+        text: undefined,
+        attachments: [
+          {
+            contentType: "application/vnd.microsoft.card.adaptive",
+            content: JSON.stringify({ type: "AdaptiveCard" }),
+          },
+        ],
+      }),
+      {},
+    );
+
+    expect(result).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   test("downloads file attachment and returns base64 content", async () => {
     const provider = createProvider();
     const fileContent = Buffer.from("image bytes here");
@@ -257,7 +608,7 @@ describe("MSTeamsProvider file attachment downloads", () => {
     // Blob URLs are not on the serviceUrl domain — no auth header sent
     expect(fetch).toHaveBeenCalledWith(
       "https://teams.blob.core.windows.net/files/photo.png",
-      undefined,
+      { headers: {}, redirect: "manual" },
     );
   });
 
@@ -303,7 +654,10 @@ describe("MSTeamsProvider file attachment downloads", () => {
     // File download should include auth header
     expect(vi.mocked(fetch).mock.calls[1]).toEqual([
       "https://smba.trafficmanager.net/amer/v3/attachments/photo.png",
-      { headers: { Authorization: "Bearer bot-token-123" } },
+      {
+        headers: { Authorization: "Bearer bot-token-123" },
+        redirect: "manual",
+      },
     ]);
   });
 
@@ -525,6 +879,187 @@ describe("MSTeamsProvider file attachment downloads", () => {
 });
 
 // =============================================================================
+// downloadFiles — positionally aligned per-file outcomes
+// =============================================================================
+
+describe("MSTeamsProvider.downloadFiles", () => {
+  const MB = 1024 * 1024;
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // History files come with pre-authenticated Azure Blob URLs (allowed host,
+  // no serviceUrl auth needed).
+  function makeFile(name: string): ChatThreadMessageFile {
+    return {
+      url: `https://teams.blob.core.windows.net/files/${name}`,
+      mimetype: "application/pdf",
+      name,
+    };
+  }
+
+  function outcomeName(outcome: ThreadFileOutcome): string | undefined {
+    return outcome.status === "delivered"
+      ? outcome.attachment.name
+      : outcome.skipped.name;
+  }
+
+  test("failed download yields a skipped outcome at its position, others delivered", async () => {
+    const provider = createProvider();
+    const okContent = Buffer.from("pdf bytes");
+
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response("Forbidden", { status: 403 }))
+      .mockResolvedValueOnce(new Response(okContent, { status: 200 }));
+
+    const outcomes = await provider.downloadFiles([
+      makeFile("broken.pdf"),
+      makeFile("fine.pdf"),
+    ]);
+
+    expect(outcomes).toEqual([
+      {
+        status: "skipped",
+        skipped: { name: "broken.pdf", reason: "download_failed" },
+      },
+      {
+        status: "delivered",
+        attachment: {
+          contentType: "application/pdf",
+          contentBase64: okContent.toString("base64"),
+          name: "fine.pdf",
+        },
+      },
+    ]);
+  });
+
+  test("oversized Content-Length yields too_large without buffering the body", async () => {
+    const provider = createProvider();
+    const declaredSize = 11 * MB;
+
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response(Buffer.from("tiny body"), {
+        status: 200,
+        headers: { "content-length": String(declaredSize) },
+      }),
+    );
+
+    const outcomes = await provider.downloadFiles([makeFile("huge.pdf")]);
+
+    expect(outcomes).toEqual([
+      {
+        status: "skipped",
+        skipped: {
+          name: "huge.pdf",
+          sizeBytes: declaredSize,
+          reason: "too_large",
+        },
+      },
+    ]);
+  });
+
+  test("crossing the 25MB total budget skips that file and all remaining files without fetching them", async () => {
+    const provider = createProvider();
+    const nineMb = () => Buffer.alloc(9 * MB, "x");
+
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(nineMb(), { status: 200 }))
+      .mockResolvedValueOnce(new Response(nineMb(), { status: 200 }))
+      .mockResolvedValueOnce(new Response(nineMb(), { status: 200 }));
+
+    const files = [
+      makeFile("f1.pdf"),
+      makeFile("f2.pdf"),
+      makeFile("f3.pdf"), // 9 + 9 + 9 = 27MB > 25MB — crosses the budget
+      makeFile("f4.pdf"), // never downloaded, still gets an outcome
+    ];
+    const outcomes = await provider.downloadFiles(files);
+
+    expect(outcomes).toHaveLength(4);
+    expect(outcomes[0].status).toBe("delivered");
+    expect(outcomes[1].status).toBe("delivered");
+    expect(outcomes[2]).toEqual({
+      status: "skipped",
+      skipped: {
+        name: "f3.pdf",
+        sizeBytes: 9 * MB,
+        reason: "total_limit_reached",
+      },
+    });
+    expect(outcomes[3]).toEqual({
+      status: "skipped",
+      skipped: { name: "f4.pdf", reason: "total_limit_reached" },
+    });
+    // The remaining file after budget exhaustion is not downloaded
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  test("files past the 20-per-message cap are skipped as too_many", async () => {
+    const provider = createProvider();
+
+    // A fresh Response per call — response bodies are single-use
+    vi.mocked(fetch).mockImplementation(async () => {
+      return new Response(Buffer.from("data"), { status: 200 });
+    });
+
+    const files = Array.from({ length: 22 }, (_, i) =>
+      makeFile(`file-${i}.pdf`),
+    );
+    const outcomes = await provider.downloadFiles(files);
+
+    expect(outcomes).toHaveLength(22);
+    for (let i = 0; i < 20; i++) {
+      expect(outcomes[i].status).toBe("delivered");
+    }
+    expect(outcomes[20]).toEqual({
+      status: "skipped",
+      skipped: { name: "file-20.pdf", reason: "too_many" },
+    });
+    expect(outcomes[21]).toEqual({
+      status: "skipped",
+      skipped: { name: "file-21.pdf", reason: "too_many" },
+    });
+    expect(fetch).toHaveBeenCalledTimes(20);
+  });
+
+  test("mixed branches in one call stay positionally aligned with the input", async () => {
+    const provider = createProvider();
+
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(Buffer.from("one"), { status: 200 }))
+      .mockResolvedValueOnce(new Response("Not Found", { status: 404 }))
+      .mockRejectedValueOnce(new Error("Network timeout"))
+      .mockResolvedValueOnce(
+        new Response(Buffer.from("four"), { status: 200 }),
+      );
+
+    const files = [
+      makeFile("delivered-1.pdf"),
+      makeFile("http-error.pdf"),
+      makeFile("network-error.pdf"),
+      makeFile("delivered-2.pdf"),
+    ];
+    const outcomes = await provider.downloadFiles(files);
+
+    expect(outcomes).toHaveLength(files.length);
+    expect(outcomes.map((o) => o.status)).toEqual([
+      "delivered",
+      "skipped",
+      "skipped",
+      "delivered",
+    ]);
+    files.forEach((file, i) => {
+      expect(outcomeName(outcomes[i])).toBe(file.name);
+    });
+  });
+});
+
+// =============================================================================
 // convertToThreadMessages — file metadata
 // =============================================================================
 
@@ -623,4 +1158,1705 @@ describe("MSTeamsProvider.convertToThreadMessages file metadata", () => {
       },
     ]);
   });
+
+  test("retains a file-only (empty text) history message and exposes its files metadata", () => {
+    const provider = createProvider();
+
+    // biome-ignore lint/suspicious/noExplicitAny: test-only — invoke private method
+    const result = (provider as any).convertToThreadMessages(
+      [
+        {
+          id: "msg-1",
+          from: { user: { id: "user-1", displayName: "Alice" } },
+          body: { content: "" },
+          createdDateTime: new Date().toISOString(),
+          attachments: [
+            {
+              contentType: "image/png",
+              contentUrl:
+                "https://teams.blob.core.windows.net/img/screenshot.png",
+              name: "screenshot.png",
+            },
+          ],
+        },
+        {
+          // Empty text AND no files — this one must still be filtered out
+          id: "msg-2",
+          from: { user: { id: "user-1", displayName: "Alice" } },
+          body: { content: "" },
+          createdDateTime: new Date().toISOString(),
+          attachments: [],
+        },
+        {
+          // Empty-text BOT message with a file — still filtered out: the
+          // manager never downloads bot files, so retaining it would render
+          // a turn with no file and no skip note.
+          id: "msg-3",
+          from: { application: { id: "app-id-123", displayName: "Bot" } },
+          body: { content: "" },
+          createdDateTime: new Date().toISOString(),
+          attachments: [
+            {
+              contentType: "application/pdf",
+              contentUrl:
+                "https://teams.blob.core.windows.net/img/bot-report.pdf",
+              name: "bot-report.pdf",
+            },
+          ],
+        },
+      ],
+      undefined,
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0].messageId).toBe("msg-1");
+    expect(result[0].text).toBe("");
+    expect(result[0].files).toEqual([
+      {
+        url: "https://teams.blob.core.windows.net/img/screenshot.png",
+        mimetype: "image/png",
+        name: "screenshot.png",
+      },
+    ]);
+  });
+});
+
+describe("MSTeamsProvider.sendReply", () => {
+  // Drives a reply through the conversationReference branch (no live
+  // turnContext) and returns the text handed to context.sendActivity.
+  async function captureReplyText(
+    options: Pick<
+      Parameters<MSTeamsProvider["sendReply"]>[0],
+      "footer" | "hint" | "conversationUrl"
+    > & { text?: string },
+  ): Promise<string> {
+    const provider = createProvider();
+    const sendActivity = vi.fn().mockResolvedValue({ id: "reply-1" });
+    const continueConversation = vi.fn(
+      async (
+        _appId: string,
+        _ref: unknown,
+        callback: (context: {
+          sendActivity: typeof sendActivity;
+        }) => Promise<void>,
+      ) => {
+        await callback({ sendActivity });
+      },
+    );
+    // biome-ignore lint/suspicious/noExplicitAny: test-only — mock adapter
+    (provider as any).adapter = { continueConversation };
+
+    await provider.sendReply({
+      originalMessage: {
+        messageId: "msg-1",
+        channelId: "19:abc@thread.tacv2",
+        workspaceId: "team-uuid",
+        senderId: "user-1",
+        senderName: "Alice",
+        text: "hi",
+        rawText: "hi",
+        timestamp: new Date(),
+        isThreadReply: false,
+        metadata: { conversationReference: { foo: "bar" } },
+      },
+      ...options,
+      text: options.text ?? "Here is your answer",
+    });
+
+    return sendActivity.mock.calls[0][0] as string;
+  }
+
+  test("puts the mute hint on its own italic line above the footer", async () => {
+    const text = await captureReplyText({
+      footer: "🤖 Agent",
+      hint: 'Reply "mute" to stop',
+    });
+
+    expect(text).toBe(
+      'Here is your answer\n\n---\n\n_Reply "mute" to stop_\n\n🤖 Agent',
+    );
+  });
+
+  test("renders the hint under its own separator when there is no footer", async () => {
+    const text = await captureReplyText({ hint: 'Reply "mute" to stop' });
+
+    expect(text).toBe('Here is your answer\n\n---\n\n_Reply "mute" to stop_');
+  });
+
+  test("renders a labeled conversation link beside the hint above the footer", async () => {
+    const text = await captureReplyText({
+      hint: 'Reply "mute" to stop',
+      conversationUrl: "https://example.com/chat/runs/session",
+      footer: "🤖 Agent",
+    });
+
+    expect(text).toBe(
+      'Here is your answer\n\n---\n\n_Reply "mute" to stop · [Open conversation](https://example.com/chat/runs/session)_\n\n🤖 Agent',
+    );
+  });
+
+  test("renders one branding line when the model signed off with the footer itself", async () => {
+    const text = await captureReplyText({
+      // The model copied the footer off an earlier bot reply in the thread.
+      text: "Here is your answer\n\n---\n\n🤖 Agent",
+      footer: "🤖 Agent",
+    });
+
+    expect(text).toBe("Here is your answer\n\n---\n\n🤖 Agent");
+  });
+});
+
+describe("MSTeamsProvider detached placeholders", () => {
+  const server = useMswServer(
+    http.get(
+      "https://login.microsoftonline.com/:tenant/v2.0/.well-known/openid-configuration",
+      ({ params }) =>
+        HttpResponse.json({
+          authorization_endpoint: `https://login.microsoftonline.com/${params.tenant}/oauth2/v2.0/authorize`,
+          token_endpoint: `https://login.microsoftonline.com/${params.tenant}/oauth2/v2.0/token`,
+          issuer: `https://login.microsoftonline.com/${params.tenant}/v2.0`,
+          jwks_uri: `https://login.microsoftonline.com/${params.tenant}/discovery/v2.0/keys`,
+        }),
+    ),
+    http.post(
+      "https://login.microsoftonline.com/:tenant/oauth2/v2.0/token",
+      () =>
+        HttpResponse.json({
+          token_type: "Bearer",
+          access_token: "connector-token",
+          expires_in: 3600,
+        }),
+    ),
+  );
+
+  async function detachedReply() {
+    const provider = new MSTeamsProvider({
+      enabled: true,
+      appId: "22222222-2222-4222-8222-222222222222",
+      appSecret: "test-secret",
+      tenantId: "11111111-1111-4111-8111-111111111111",
+      graphTenantId: "",
+      graphClientId: "",
+      graphClientSecret: "",
+    });
+    await provider.initialize();
+    const activity = makeActivity({
+      conversation: { id: "chat", conversationType: "channel" },
+    });
+    const message = await provider.parseWebhookNotification(activity, {});
+    if (!message) throw new Error("Expected message");
+    message.metadata = {
+      conversationReference:
+        Activity.fromObject(activity).getConversationReference(),
+      placeholderActivityId: "placeholder",
+    };
+    return { provider, message };
+  }
+
+  test.each([
+    false,
+    true,
+  ])("finishes a detached placeholder with update failure=%s", async (updateFails) => {
+    const requests: Array<{ method: string; body?: unknown }> = [];
+    server.use(
+      http.put(
+        "https://smba.trafficmanager.net/amer/v3/conversations/chat/activities/placeholder",
+        async ({ request }) => {
+          requests.push({ method: "PUT", body: await request.json() });
+          return updateFails
+            ? HttpResponse.json({ error: "missing" }, { status: 404 })
+            : HttpResponse.json({ id: "placeholder" });
+        },
+      ),
+      http.post(
+        "https://smba.trafficmanager.net/amer/v3/conversations/chat/activities/msg-1",
+        async ({ request }) => {
+          requests.push({ method: "POST", body: await request.json() });
+          return HttpResponse.json({ id: "replacement" });
+        },
+      ),
+    );
+    const { provider, message } = await detachedReply();
+
+    const id = await provider.sendReply({
+      originalMessage: message,
+      text: "Finished",
+      conversationUrl: "https://example.com/chat/runs/session",
+    });
+
+    expect(id).toBe(updateFails ? "replacement" : "placeholder");
+    expect(requests.map(({ method }) => method)).toEqual(
+      updateFails ? ["PUT", "POST"] : ["PUT"],
+    );
+    expect(requests.at(-1)?.body).toMatchObject({
+      type: "message",
+      text: "Finished\n\n---\n\n_[Open conversation](https://example.com/chat/runs/session)_",
+    });
+    if (!updateFails) {
+      expect(message.metadata?.placeholderActivityId).toBeUndefined();
+    }
+  });
+
+  test("removes a detached placeholder when the agent stays silent", async () => {
+    const deleted: string[] = [];
+    server.use(
+      http.delete(
+        "https://smba.trafficmanager.net/amer/v3/conversations/chat/activities/:id",
+        ({ params }) => {
+          deleted.push(String(params.id));
+          return new HttpResponse(null, { status: 204 });
+        },
+      ),
+    );
+    const { provider, message } = await detachedReply();
+
+    await provider.clearTypingStatus("chat", "", message.metadata);
+    await provider.clearTypingStatus("chat", "", message.metadata);
+
+    expect(deleted).toEqual(["placeholder"]);
+    expect(message.metadata?.placeholderActivityId).toBeUndefined();
+  });
+});
+
+describe("MSTeamsProvider.addApprovalRequestForm", () => {
+  type Card = {
+    fallbackText?: string;
+    body: Array<Record<string, unknown>>;
+  };
+  type Action = {
+    type: string;
+    title: string;
+    data?: Record<string, unknown>;
+    targetElements?: string[];
+  };
+
+  // Drives the form through the conversationReference branch (no live
+  // turnContext) and captures the Adaptive Card sent to the channel.
+  async function captureApprovalCard(options: {
+    toolName: string;
+    toolArgs?: Record<string, unknown>;
+    reviewText?: string;
+  }): Promise<Card> {
+    const provider = createProvider();
+    const sendActivity = vi.fn().mockResolvedValue(undefined);
+    const continueConversation = vi.fn(
+      async (
+        _appId: string,
+        _ref: unknown,
+        callback: (context: {
+          sendActivity: typeof sendActivity;
+        }) => Promise<void>,
+      ) => {
+        await callback({ sendActivity });
+      },
+    );
+    // biome-ignore lint/suspicious/noExplicitAny: test-only — mock adapter
+    (provider as any).adapter = { continueConversation };
+
+    await provider.addApprovalRequestForm({
+      channelId: "19:abc@thread.tacv2",
+      threadId: "19:abc@thread.tacv2",
+      approvalId: "appr-1",
+      taskId: "task-1",
+      toolName: options.toolName,
+      toolArgs: options.toolArgs,
+      reviewText: options.reviewText,
+      originalMessage: {
+        messageId: "msg-1",
+        channelId: "19:abc@thread.tacv2",
+        workspaceId: "team-uuid",
+        senderId: "user-1",
+        senderEmail: "user@example.com",
+        senderName: "Alice",
+        text: "do it",
+        rawText: "do it",
+        timestamp: new Date(),
+        isThreadReply: false,
+        metadata: { conversationReference: { foo: "bar" } },
+      },
+    });
+
+    const activity = sendActivity.mock.calls[0][0];
+    return activity.attachments[0].content as Card;
+  }
+
+  const actionSets = (card: Card) =>
+    card.body.filter((b) => b.type === "ActionSet") as Array<{
+      id?: string;
+      isVisible?: boolean;
+      actions: Action[];
+    }>;
+
+  test("shows the tool, a review line, and Approve/Deny submit actions", async () => {
+    const card = await captureApprovalCard({
+      toolName: "context7__query-docs",
+      toolArgs: { libraryId: "/vercel/next.js" },
+    });
+
+    const texts = card.body.filter((b) => b.type === "TextBlock");
+    expect(texts.map((b) => b.text)).toEqual([
+      "Approval required",
+      "context7__query-docs",
+      "Review this tool call before it can continue.",
+    ]);
+    expect(texts[1].fontType).toBe("Monospace");
+
+    const [visibleSet] = actionSets(card);
+    const submits = visibleSet.actions.filter(
+      (a) => a.type === "Action.Submit",
+    );
+    expect(submits.map((a) => a.title)).toEqual(["Approve", "Deny"]);
+    expect(submits.map((a) => a.data?.approved)).toEqual([true, false]);
+    expect(submits[1].data).toMatchObject({
+      action: "approvalDecision",
+      approvalId: "appr-1",
+      taskId: "task-1",
+      toolName: "context7__query-docs",
+      toolLabel: "context7__query-docs",
+    });
+  });
+
+  test("keeps arguments in a hidden fact set behind a Show/Hide toggle", async () => {
+    const card = await captureApprovalCard({
+      toolName: "github__create_issue",
+      toolArgs: {
+        repo: "octo/repo",
+        labels: ["bug"],
+        body: "x".repeat(600),
+      },
+    });
+
+    const container = card.body.find((b) => b.type === "Container") as {
+      id: string;
+      isVisible: boolean;
+      items: Array<{ type: string; facts: { title: string; value: string }[] }>;
+    };
+    expect(container.isVisible).toBe(false);
+    const facts = container.items[0].facts;
+    expect(facts.map((f) => f.title)).toEqual(["repo", "labels", "body"]);
+    expect(facts[0].value).toBe("octo/repo");
+    expect(facts[1].value).toBe('["bug"]');
+    expect(facts[2].value.length).toBeLessThan(600);
+    expect(facts[2].value).toContain("(truncated)");
+
+    const [showSet, hideSet] = actionSets(card);
+    expect(showSet.isVisible).not.toBe(false);
+    expect(hideSet.isVisible).toBe(false);
+    const toggleOf = (set: { actions: Action[] }) =>
+      set.actions.find((a) => a.type === "Action.ToggleVisibility");
+    expect(toggleOf(showSet)?.title).toBe("Show arguments");
+    expect(toggleOf(hideSet)?.title).toBe("Hide arguments");
+    // Each toggle flips the arguments and both action sets, so the label
+    // swaps along with the arguments.
+    for (const set of [showSet, hideSet]) {
+      expect(toggleOf(set)?.targetElements?.sort()).toEqual(
+        [container.id, showSet.id, hideSet.id].sort(),
+      );
+    }
+  });
+
+  test("omits the toggle and arguments when there are none", async () => {
+    const card = await captureApprovalCard({
+      toolName: "dangerous_tool",
+      toolArgs: {},
+    });
+
+    expect(card.body.some((b) => b.type === "Container")).toBe(false);
+    const sets = actionSets(card);
+    expect(sets).toHaveLength(1);
+    expect(sets[0].actions.map((a) => a.title)).toEqual(["Approve", "Deny"]);
+  });
+
+  test("falls back to the review text when there is no structured tool", async () => {
+    const card = await captureApprovalCard({
+      toolName: "execute_remedy_plan",
+      reviewText: "Send a Slack message to #general",
+    });
+
+    const texts = card.body.filter((b) => b.type === "TextBlock");
+    expect(texts.map((b) => b.text)).toEqual([
+      "Approval required",
+      "Send a Slack message to #general",
+    ]);
+    expect(texts[1].fontType).toBe("Monospace");
+    const [set] = actionSets(card);
+    expect(set.actions.map((a) => a.title)).toEqual(["Approve", "Deny"]);
+    expect(set.actions[0].data?.toolLabel).toBeUndefined();
+  });
+});
+
+describe("buildApprovalDecisionCard", () => {
+  test("approved: tool and a bold green 'Approved by' line, no actions", () => {
+    const card = buildApprovalDecisionCard({
+      toolLabel: "context7__query-docs",
+      approved: true,
+      deciderName: "Alice",
+    }) as { body: Array<Record<string, unknown>> };
+
+    expect(card.body).toEqual([
+      expect.objectContaining({
+        text: "context7__query-docs",
+        fontType: "Monospace",
+      }),
+      expect.objectContaining({
+        text: "Approved by Alice",
+        color: "Good",
+        weight: "Bolder",
+      }),
+    ]);
+    expect(card.body.some((b) => b.type === "ActionSet")).toBe(false);
+  });
+
+  test("denied: red 'Denied by' line", () => {
+    const card = buildApprovalDecisionCard({
+      toolLabel: "context7__query-docs",
+      approved: false,
+      deciderName: "Bob",
+    }) as { body: Array<Record<string, unknown>> };
+
+    expect(card.body[1]).toMatchObject({
+      text: "Denied by Bob",
+      color: "Attention",
+    });
+  });
+
+  test("drops the decider and tool when they are unknown", () => {
+    const card = buildApprovalDecisionCard({ approved: false }) as {
+      body: Array<Record<string, unknown>>;
+    };
+
+    expect(card.body).toHaveLength(1);
+    expect(card.body[0].text).toBe("Denied");
+  });
+});
+
+// =============================================================================
+// Inline images in thread history
+// =============================================================================
+
+/** Entra endpoints the Graph app credential talks to, answering with fixed tokens. */
+function graphAuthHandlers() {
+  return [
+    http.get(
+      "https://login.microsoftonline.com/:tenant/v2.0/.well-known/openid-configuration",
+      ({ params }) =>
+        HttpResponse.json({
+          authorization_endpoint: `https://login.microsoftonline.com/${params.tenant}/oauth2/v2.0/authorize`,
+          token_endpoint: `https://login.microsoftonline.com/${params.tenant}/oauth2/v2.0/token`,
+          issuer: `https://login.microsoftonline.com/${params.tenant}/v2.0`,
+          jwks_uri: `https://login.microsoftonline.com/${params.tenant}/discovery/v2.0/keys`,
+        }),
+    ),
+    http.get(
+      "https://login.microsoftonline.com/common/discovery/instance",
+      () =>
+        HttpResponse.json({
+          tenant_discovery_endpoint:
+            "https://login.microsoftonline.com/tenant/v2.0/.well-known/openid-configuration",
+          metadata: [],
+        }),
+    ),
+    http.post(
+      "https://login.microsoftonline.com/:tenant/oauth2/v2.0/token",
+      async ({ request }) => {
+        const scope = new URLSearchParams(await request.text()).get("scope");
+        return HttpResponse.json({
+          token_type: "Bearer",
+          access_token: scope?.includes("graph.microsoft.com")
+            ? "graph-token"
+            : "connector-token",
+          expires_in: 3600,
+        });
+      },
+    ),
+  ];
+}
+
+describe("MSTeamsProvider inline images in thread history", () => {
+  const TEAM_ID = "33333333-3333-4333-8333-333333333333";
+  const CHANNEL_ID = "19:history@thread.tacv2";
+  const HOSTED_CONTENT_URL = `https://graph.microsoft.com/v1.0/teams/${TEAM_ID}/channels/${CHANNEL_ID}/messages/root-1/hostedContents/aWQ9eF8w/$value`;
+  const PNG_BYTES = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01,
+  ]);
+
+  const server = useMswServer(...graphAuthHandlers());
+
+  test("a screenshot pasted into an earlier thread message is delivered with the Graph token", async () => {
+    server.use(
+      http.get(
+        `https://graph.microsoft.com/v1.0/teams/${TEAM_ID}/channels/:channelId/messages/root-1`,
+        () =>
+          HttpResponse.json({
+            id: "root-1",
+            from: { user: { id: "user-1", displayName: "Alice" } },
+            createdDateTime: "2026-10-20T10:00:00Z",
+            body: {
+              contentType: "html",
+              content: `<p><at id="0">TestBot</at></p><p><img src="${HOSTED_CONTENT_URL}" alt="image"></p><p>what does this show?</p>`,
+            },
+            attachments: [],
+          }),
+      ),
+      http.get(
+        `https://graph.microsoft.com/v1.0/teams/${TEAM_ID}/channels/:channelId/messages/root-1/replies`,
+        () => HttpResponse.json({ value: [] }),
+      ),
+      http.get(
+        `https://graph.microsoft.com/v1.0/teams/${TEAM_ID}/channels/:channelId/messages/root-1/hostedContents/aWQ9eF8w/$value`,
+        ({ request }) =>
+          request.headers.get("authorization") === "Bearer graph-token"
+            ? new HttpResponse(PNG_BYTES, {
+                headers: { "content-type": "image/png" },
+              })
+            : new HttpResponse(null, { status: 401 }),
+      ),
+    );
+    const provider = new MSTeamsProvider({
+      enabled: true,
+      appId: "22222222-2222-4222-8222-222222222222",
+      appSecret: "test-secret",
+      tenantId: "11111111-1111-4111-8111-111111111111",
+      graphTenantId: "11111111-1111-4111-8111-111111111111",
+      graphClientId: "22222222-2222-4222-8222-222222222222",
+      graphClientSecret: "test-secret",
+    });
+    await provider.initialize();
+
+    const history = await provider.getThreadHistory({
+      channelId: CHANNEL_ID,
+      workspaceId: TEAM_ID,
+      threadId: "root-1",
+      excludeMessageId: "reply-1",
+    });
+    expect(history).toHaveLength(1);
+    expect(history[0].text).toContain("what does this show?");
+
+    const outcomes = await provider.downloadFiles(history[0].files ?? []);
+
+    expect(outcomes).toEqual([
+      {
+        status: "delivered",
+        attachment: {
+          contentType: "image/png",
+          contentBase64: PNG_BYTES.toString("base64"),
+        },
+      },
+    ]);
+  });
+
+  test("only Graph hosted-content images are taken from a message body", () => {
+    const provider = createProvider();
+    const body = [
+      `<img src="${HOSTED_CONTENT_URL}">`,
+      // Same image as the asyncgw object, which the bot cannot authenticate to
+      '<img src="https://ca-prod.asyncgw.teams.microsoft.com/v1/objects/0-eca/views/imgo">',
+      // Look-alike host must never receive the Graph token
+      `<img src="${HOSTED_CONTENT_URL.replace("graph.microsoft.com", "graph.microsoft.com.evil.example")}">`,
+      '<img src="https://graph.microsoft.com/v1.0/me/photo/$value">',
+      "<p>see above</p>",
+    ].join("");
+
+    // biome-ignore lint/suspicious/noExplicitAny: test-only — invoke private method
+    const result = (provider as any).convertToThreadMessages(
+      [
+        {
+          id: "msg-1",
+          from: { user: { id: "user-1", displayName: "Alice" } },
+          body: { contentType: "html", content: body },
+          createdDateTime: new Date().toISOString(),
+          attachments: [],
+        },
+      ],
+      undefined,
+    );
+
+    expect(result[0].files).toEqual([
+      { url: HOSTED_CONTENT_URL, mimetype: "image/*" },
+    ]);
+  });
+});
+
+// =============================================================================
+// Agent-selection card keeps the first message's files
+// =============================================================================
+
+describe("MSTeamsProvider agent-selection card attachments", () => {
+  setupTestCacheManager();
+
+  const screenshot = {
+    contentType: "image/png",
+    contentBase64: Buffer.from("png-bytes").toString("base64"),
+  };
+
+  function firstMessage(
+    overrides: Partial<IncomingChatMessage> = {},
+  ): IncomingChatMessage {
+    return {
+      messageId: "msg-1",
+      channelId: "a:dm-conversation",
+      workspaceId: null,
+      senderId: "aad-user-1",
+      senderName: "Alice",
+      text: "",
+      rawText: "",
+      timestamp: new Date(),
+      isThreadReply: false,
+      attachments: [screenshot],
+      ...overrides,
+    };
+  }
+
+  /** Send the card and return the data its Confirm button submits. */
+  async function sendCard(message: IncomingChatMessage) {
+    const sent: Activity[] = [];
+    const adapter = new CloudAdapter();
+    adapter.sendActivities = async (_context, activities) => {
+      sent.push(...activities);
+      return activities.map(() => ({ id: "card" }));
+    };
+    const context = new TurnContext(
+      adapter,
+      Activity.fromObject({
+        type: "message",
+        channelId: "msteams",
+        serviceUrl: "https://smba.trafficmanager.net/amer/",
+        conversation: { id: message.channelId, conversationType: "personal" },
+        from: { id: "29:user-1", aadObjectId: message.senderId },
+        recipient: { id: "28:app-id-123", name: "TestBot" },
+      }),
+    );
+    await createProvider().sendAgentSelectionCard({
+      message,
+      agents: [{ id: "agent-1", name: "Helper" }],
+      isWelcome: true,
+      providerContext: context,
+    });
+    const card = sent[0]?.attachments?.[0]?.content as {
+      actions: { data: Record<string, unknown> }[];
+    };
+    return card.actions[0].data;
+  }
+
+  test("an image-only first message is replayed with its files, once, to its sender", async () => {
+    const provider = createProvider();
+    const data = await sendCard(firstMessage());
+
+    // The card carries a key, never the file itself.
+    expect(JSON.stringify(data)).not.toContain(screenshot.contentBase64);
+    const key = String(data.pendingAttachmentsKey);
+
+    expect(
+      await provider.takeAgentSelectionAttachments({
+        key,
+        senderId: "aad-someone-else",
+        channelId: "a:dm-conversation",
+      }),
+    ).toEqual([]);
+    expect(
+      await provider.takeAgentSelectionAttachments({
+        key,
+        senderId: "aad-user-1",
+        channelId: "a:other-conversation",
+      }),
+    ).toEqual([]);
+    expect(
+      await provider.takeAgentSelectionAttachments({
+        key,
+        senderId: "aad-user-1",
+        channelId: "a:dm-conversation",
+      }),
+    ).toEqual([screenshot]);
+    expect(
+      await provider.takeAgentSelectionAttachments({
+        key,
+        senderId: "aad-user-1",
+        channelId: "a:dm-conversation",
+      }),
+    ).toEqual([]);
+  });
+
+  test("a first message without files adds no key to the card", async () => {
+    const data = await sendCard(
+      firstMessage({ text: "hello", attachments: undefined }),
+    );
+
+    expect(data.pendingAttachmentsKey).toBeUndefined();
+    expect(data.originalMessageText).toBe("hello");
+  });
+});
+
+describe("MSTeamsProvider files sent in Teams messages", () => {
+  const TEAM_ID = "33333333-3333-4333-8333-333333333333";
+  const CHANNEL_ID = "19:files@thread.tacv2";
+  const CHAT_ID = "19:group-chat@thread.v2";
+  // Teams message ids are the message's epoch-millisecond timestamp.
+  const GROUP_MESSAGE_ID = "1792632504796";
+  const ROOT_MESSAGE_ID = "1792632400000";
+  const REPLY_MESSAGE_ID = "1792632504797";
+  const PDF_BYTES = Buffer.from("%PDF-1.7 test document");
+  const server = useMswServer(...graphAuthHandlers());
+
+  function makeGraphProvider(): MSTeamsProvider {
+    return new MSTeamsProvider({
+      enabled: true,
+      appId: "22222222-2222-4222-8222-222222222222",
+      appSecret: "test-secret",
+      tenantId: "11111111-1111-4111-8111-111111111111",
+      graphTenantId: "11111111-1111-4111-8111-111111111111",
+      graphClientId: "22222222-2222-4222-8222-222222222222",
+      graphClientSecret: "test-secret",
+    });
+  }
+
+  /** Graph's site, library and file endpoints for one SharePoint file. */
+  function sharePointFile(params: {
+    host: string;
+    sitePath: string;
+    libraryUrl: string;
+    itemPath: string;
+    status?: number;
+  }) {
+    return [
+      http.get(
+        "https://graph.microsoft.com/v1.0/sites/:host/:kind/:name",
+        ({ request }) => {
+          if (request.headers.get("authorization") !== "Bearer graph-token") {
+            return new HttpResponse(null, { status: 401 });
+          }
+          if (params.status)
+            return new HttpResponse(null, { status: params.status });
+          const path = decodeURIComponent(new URL(request.url).pathname);
+          return path === `/v1.0/sites/${params.host}:/${params.sitePath}`
+            ? HttpResponse.json({ id: "site-1" })
+            : new HttpResponse(null, { status: 404 });
+        },
+      ),
+      http.get("https://graph.microsoft.com/v1.0/sites/site-1/drives", () =>
+        HttpResponse.json({
+          value: [
+            {
+              id: "drive-other",
+              webUrl: `https://${params.host}/${params.sitePath}/Other`,
+            },
+            { id: "drive-1", webUrl: params.libraryUrl },
+          ],
+        }),
+      ),
+      http.get(
+        "https://graph.microsoft.com/v1.0/drives/drive-1/:root/:folder/:file/content",
+        ({ request }) => {
+          const path = decodeURIComponent(new URL(request.url).pathname);
+          return request.headers.get("authorization") ===
+            "Bearer graph-token" &&
+            path === `/v1.0/drives/drive-1/root:/${params.itemPath}:/content`
+            ? new HttpResponse(PDF_BYTES, {
+                headers: { "content-type": "application/octet-stream" },
+              })
+            : new HttpResponse(null, { status: 404 });
+        },
+      ),
+    ];
+  }
+
+  test.each([
+    "https://contoso-my.sharepoint.com/download.aspx?UniqueId=abc&tempauth=signed",
+    "https://contoso-my.sharepoint.com/personal/alice_contoso_com/Documents/Microsoft%20Teams%20Chat%20Files/report.pdf?sig=signed",
+  ])("a DM file is downloaded directly from its supplied signed link %s", async (downloadUrl) => {
+    server.use(
+      // The page URL needs a SharePoint login the bot does not have.
+      http.get(
+        "https://contoso-my.sharepoint.com/personal/:user/:library/:folder/:file",
+        ({ request }) =>
+          new URL(request.url).searchParams.has("sig")
+            ? new HttpResponse(PDF_BYTES, {
+                headers: { "content-type": "application/octet-stream" },
+              })
+            : new HttpResponse(null, { status: 403 }),
+      ),
+      http.get(
+        "https://contoso-my.sharepoint.com/download.aspx",
+        ({ request }) =>
+          request.headers.get("authorization")
+            ? new HttpResponse(null, { status: 400 })
+            : new HttpResponse(PDF_BYTES, {
+                headers: { "content-type": "application/octet-stream" },
+              }),
+      ),
+    );
+    const provider = createProvider();
+
+    const message = await provider.parseWebhookNotification(
+      makeActivity({
+        text: "summarize this",
+        conversation: { id: "a:dm-1", conversationType: "personal" },
+        attachments: [
+          {
+            contentType: "application/vnd.microsoft.teams.file.download.info",
+            contentUrl:
+              "https://contoso-my.sharepoint.com/personal/alice_contoso_com/Documents/Microsoft Teams Chat Files/report.pdf",
+            name: "report.pdf",
+            content: {
+              downloadUrl,
+              uniqueId: "abc",
+              fileType: "pdf",
+            },
+          },
+        ],
+      }),
+      {},
+    );
+
+    expect(message?.attachments).toEqual([
+      {
+        contentType: "application/pdf",
+        contentBase64: PDF_BYTES.toString("base64"),
+        name: "report.pdf",
+      },
+    ]);
+  });
+
+  test.each([
+    { mode: "post", reply: false },
+    { mode: "thread reply", reply: true },
+  ])("a file sent in a channel $mode is read from SharePoint with the Graph token", async ({
+    reply,
+  }) => {
+    server.use(
+      http.get(
+        `https://graph.microsoft.com/v1.0/teams/${TEAM_ID}/channels/:channelId/messages/${reply ? `${ROOT_MESSAGE_ID}/replies/${REPLY_MESSAGE_ID}` : REPLY_MESSAGE_ID}`,
+        () =>
+          HttpResponse.json({
+            id: REPLY_MESSAGE_ID,
+            attachments: [
+              {
+                id: "att-1",
+                contentType: "reference",
+                contentUrl:
+                  "https://contoso.sharepoint.com/sites/Engineering/Shared%20Documents/General/Design%20spec.pdf",
+                name: "Design spec.pdf",
+              },
+            ],
+          }),
+      ),
+      ...sharePointFile({
+        host: "contoso.sharepoint.com",
+        sitePath: "sites/Engineering",
+        libraryUrl:
+          "https://contoso.sharepoint.com/sites/Engineering/Shared%20Documents",
+        itemPath: "General/Design spec.pdf",
+      }),
+    );
+    const provider = makeGraphProvider();
+    await provider.initialize();
+
+    const outcomes = await provider.downloadMessageFiles({
+      messageId: REPLY_MESSAGE_ID,
+      channelId: CHANNEL_ID,
+      workspaceId: TEAM_ID,
+      threadId: reply ? ROOT_MESSAGE_ID : undefined,
+      senderId: "user-1",
+      senderName: "Alice",
+      text: "",
+      rawText: "",
+      timestamp: new Date(),
+      isThreadReply: true,
+      metadata: { conversationType: "channel" },
+    });
+
+    expect(outcomes).toEqual([
+      {
+        status: "delivered",
+        attachment: {
+          contentType: "application/pdf",
+          contentBase64: PDF_BYTES.toString("base64"),
+          name: "Design spec.pdf",
+        },
+      },
+    ]);
+  });
+
+  test.each([
+    { contentType: "reference", prefix: "" },
+    { contentType: "application/pdf", prefix: "" },
+    { contentType: "reference", prefix: "/:b:/r" },
+  ])("activity SharePoint files with $contentType and $prefix use Graph, including private-channel sites", async ({
+    contentType,
+    prefix,
+  }) => {
+    server.use(
+      ...sharePointFile({
+        host: "contoso.sharepoint.com",
+        sitePath: "sites/Engineering-Private",
+        libraryUrl:
+          "https://contoso.sharepoint.com/sites/Engineering-Private/Shared%20Documents",
+        itemPath: "General/Design spec.pdf",
+      }),
+    );
+    const provider = makeGraphProvider();
+    await provider.initialize();
+    const message = await provider.parseWebhookNotification(
+      makeActivity({
+        attachments: [
+          {
+            contentType,
+            contentUrl: `https://contoso.sharepoint.com${prefix}/sites/Engineering-Private/Shared%20Documents/General/Design%20spec.pdf`,
+            name: "Design spec.pdf",
+          },
+        ],
+      }),
+      {},
+    );
+    expect(message?.attachments?.[0]).toEqual({
+      contentType: "application/pdf",
+      contentBase64: PDF_BYTES.toString("base64"),
+      name: "Design spec.pdf",
+    });
+  });
+
+  test("missing site consent reports a skipped file without fetching the SharePoint page", async () => {
+    server.use(
+      ...sharePointFile({
+        host: "contoso.sharepoint.com",
+        sitePath: "sites/Engineering",
+        libraryUrl:
+          "https://contoso.sharepoint.com/sites/Engineering/Shared%20Documents",
+        itemPath: "General/Design spec.pdf",
+        status: 403,
+      }),
+    );
+    const provider = makeGraphProvider();
+    await provider.initialize();
+    const message = await provider.parseWebhookNotification(
+      makeActivity({
+        attachments: [
+          {
+            contentType: "application/pdf",
+            contentUrl:
+              "https://contoso.sharepoint.com/sites/Engineering/Shared%20Documents/General/Design%20spec.pdf",
+            name: "Design spec.pdf",
+          },
+        ],
+      }),
+      {},
+    );
+    expect(message?.attachments).toBeUndefined();
+    expect(message?.skippedAttachments).toEqual([
+      {
+        name: "Design spec.pdf",
+        reason: "download_failed",
+        sizeBytes: undefined,
+      },
+    ]);
+  });
+
+  test("file-only channel activities survive parsing for the later Graph lookup", async () => {
+    const provider = makeGraphProvider();
+    await provider.initialize();
+    const message = await provider.parseWebhookNotification(
+      makeActivity({ text: undefined, attachments: undefined }),
+      {},
+    );
+    expect(message?.text).toBe("");
+    expect(message?.metadata?.conversationType).toBe("channel");
+  });
+
+  test("files processed from the activity are not downloaded again from Graph", async () => {
+    const fileUrl =
+      "https://contoso.sharepoint.com/sites/Engineering/Shared%20Documents/General/report.pdf";
+    server.use(
+      http.get(
+        `https://graph.microsoft.com/v1.0/teams/${TEAM_ID}/channels/:channelId/messages/${ROOT_MESSAGE_ID}`,
+        () =>
+          HttpResponse.json({
+            attachments: [
+              {
+                contentType: "reference",
+                contentUrl: fileUrl,
+                name: "report.pdf",
+              },
+            ],
+          }),
+      ),
+    );
+    const provider = makeGraphProvider();
+    await provider.initialize();
+    const outcomes = await provider.downloadMessageFiles({
+      messageId: ROOT_MESSAGE_ID,
+      channelId: CHANNEL_ID,
+      workspaceId: TEAM_ID,
+      senderId: "user-1",
+      senderName: "Alice",
+      text: "summarize",
+      rawText: "summarize",
+      timestamp: new Date(),
+      isThreadReply: false,
+      metadata: {
+        conversationType: "channel",
+        teamsActivityFileUrls: [fileUrl],
+      },
+    });
+    expect(outcomes).toEqual([]);
+  });
+
+  test("a file sent in a group chat is read from the sender's OneDrive", async () => {
+    server.use(
+      http.get(
+        `https://graph.microsoft.com/v1.0/chats/:chatId/messages/${GROUP_MESSAGE_ID}`,
+        () =>
+          HttpResponse.json({
+            id: GROUP_MESSAGE_ID,
+            attachments: [
+              {
+                id: "att-1",
+                contentType: "reference",
+                contentUrl:
+                  "https://contoso-my.sharepoint.com/personal/alice_contoso_com/Documents/Microsoft%20Teams%20Chat%20Files/report.pdf",
+                name: "report.pdf",
+              },
+            ],
+          }),
+      ),
+      ...sharePointFile({
+        host: "contoso-my.sharepoint.com",
+        sitePath: "personal/alice_contoso_com",
+        libraryUrl:
+          "https://contoso-my.sharepoint.com/personal/alice_contoso_com/Documents",
+        itemPath: "Microsoft Teams Chat Files/report.pdf",
+      }),
+    );
+    const provider = makeGraphProvider();
+    await provider.initialize();
+
+    const outcomes = await provider.downloadMessageFiles({
+      messageId: GROUP_MESSAGE_ID,
+      channelId: CHAT_ID,
+      workspaceId: null,
+      senderId: "user-1",
+      senderName: "Alice",
+      text: "what's in this?",
+      rawText: "what's in this?",
+      timestamp: new Date(),
+      isThreadReply: false,
+      metadata: { conversationType: "groupChat" },
+    });
+
+    expect(outcomes).toEqual([
+      {
+        status: "delivered",
+        attachment: {
+          contentType: "application/pdf",
+          contentBase64: PDF_BYTES.toString("base64"),
+          name: "report.pdf",
+        },
+      },
+    ]);
+  });
+
+  test("without a Graph file permission the file is reported as not downloaded", async () => {
+    server.use(
+      http.get(
+        `https://graph.microsoft.com/v1.0/chats/:chatId/messages/${GROUP_MESSAGE_ID}`,
+        () =>
+          HttpResponse.json({
+            id: GROUP_MESSAGE_ID,
+            attachments: [
+              {
+                contentType: "reference",
+                contentUrl:
+                  "https://contoso-my.sharepoint.com/personal/alice_contoso_com/Documents/Microsoft%20Teams%20Chat%20Files/report.pdf",
+                name: "report.pdf",
+              },
+            ],
+          }),
+      ),
+      ...sharePointFile({
+        host: "contoso-my.sharepoint.com",
+        sitePath: "personal/alice_contoso_com",
+        libraryUrl:
+          "https://contoso-my.sharepoint.com/personal/alice_contoso_com/Documents",
+        itemPath: "Microsoft Teams Chat Files/report.pdf",
+        status: 403,
+      }),
+    );
+    const provider = makeGraphProvider();
+    await provider.initialize();
+
+    const outcomes = await provider.downloadMessageFiles({
+      messageId: GROUP_MESSAGE_ID,
+      channelId: CHAT_ID,
+      workspaceId: null,
+      senderId: "user-1",
+      senderName: "Alice",
+      text: "what's in this?",
+      rawText: "what's in this?",
+      timestamp: new Date(),
+      isThreadReply: false,
+      metadata: { conversationType: "groupChat" },
+    });
+
+    expect(outcomes).toEqual([
+      {
+        status: "skipped",
+        skipped: { name: "report.pdf", reason: "download_failed" },
+      },
+    ]);
+  });
+
+  test("a direct message has no Graph files to read", async () => {
+    const provider = makeGraphProvider();
+    await provider.initialize();
+
+    const outcomes = await provider.downloadMessageFiles({
+      messageId: GROUP_MESSAGE_ID,
+      channelId: "a:dm-1",
+      workspaceId: null,
+      senderId: "user-1",
+      senderName: "Alice",
+      text: "hi",
+      rawText: "hi",
+      timestamp: new Date(),
+      isThreadReply: false,
+      metadata: { conversationType: "personal" },
+    });
+
+    expect(outcomes).toEqual([]);
+  });
+});
+
+describe("MSTeamsProvider group-chat files read with the sender's sign-in", () => {
+  const TENANT_ID = "11111111-1111-4111-8111-111111111111";
+  const APP_ID = "22222222-2222-4222-8222-222222222222";
+  const SENDER_ID = "44444444-4444-4444-8444-444444444444";
+  const CHAT_ID = "19:group-chat@thread.v2";
+  const MESSAGE_ID = "1792632504796";
+  const ONEDRIVE =
+    "https://contoso-my.sharepoint.com/personal/alice_contoso_com";
+  const PDF_BYTES = Buffer.from("%PDF-1.7 group chat document");
+  const server = useMswServer(...graphAuthHandlers());
+  setupTestCacheManager();
+
+  function makeProvider(groupChatFileSignIn = true): MSTeamsProvider {
+    return new MSTeamsProvider({
+      enabled: true,
+      appId: APP_ID,
+      appSecret: "test-secret",
+      tenantId: TENANT_ID,
+      graphTenantId: TENANT_ID,
+      graphClientId: APP_ID,
+      graphClientSecret: "test-secret",
+      groupChatFileSignIn,
+    });
+  }
+
+  function groupChatMessage(
+    overrides: Partial<IncomingChatMessage> = {},
+  ): IncomingChatMessage {
+    return {
+      messageId: MESSAGE_ID,
+      channelId: CHAT_ID,
+      workspaceId: null,
+      senderId: SENDER_ID,
+      senderName: "Alice",
+      senderEmail: "alice@contoso.com",
+      text: "what's in this?",
+      rawText: "what's in this?",
+      timestamp: new Date(),
+      isThreadReply: false,
+      metadata: { conversationType: "groupChat", tenantId: TENANT_ID },
+      ...overrides,
+    };
+  }
+
+  /** The Graph message, the sender's drive, and its file, readable only with `user-token`. */
+  function groupChatFile(fileUrl: string) {
+    return [
+      http.get(
+        `https://graph.microsoft.com/v1.0/chats/:chatId/messages/${MESSAGE_ID}`,
+        () =>
+          HttpResponse.json({
+            id: MESSAGE_ID,
+            attachments: [
+              {
+                contentType: "reference",
+                contentUrl: fileUrl,
+                name: "report.pdf",
+              },
+            ],
+          }),
+      ),
+      http.get("https://graph.microsoft.com/v1.0/me/drive", ({ request }) =>
+        request.headers.get("authorization") === "Bearer user-token"
+          ? HttpResponse.json({
+              id: "drive-alice",
+              webUrl: `${ONEDRIVE}/Documents`,
+            })
+          : new HttpResponse(null, { status: 401 }),
+      ),
+      http.get(
+        "https://graph.microsoft.com/v1.0/drives/drive-alice/:root/:folder/:file/content",
+        ({ request }) => {
+          const path = decodeURIComponent(new URL(request.url).pathname);
+          return request.headers.get("authorization") === "Bearer user-token" &&
+            path ===
+              "/v1.0/drives/drive-alice/root:/Microsoft Teams Chat Files/report.pdf:/content"
+            ? new HttpResponse(PDF_BYTES, {
+                headers: { "content-type": "application/octet-stream" },
+              })
+            : new HttpResponse(null, { status: 404 });
+        },
+      ),
+    ];
+  }
+
+  async function signInSender(): Promise<void> {
+    await ChatOpsMsTeamsUserConnectionModel.save({
+      tenantId: TENANT_ID,
+      aadObjectId: SENDER_ID,
+      scope: "Files.Read",
+      tokens: {
+        accessToken: "user-token",
+        refreshToken: "user-refresh",
+        accessTokenExpiresAt: Date.now() + 60 * 60 * 1000,
+      },
+    });
+  }
+
+  test("a sender who has not signed in gets their file marked as needing sign-in", async () => {
+    server.use(
+      ...groupChatFile(
+        `${ONEDRIVE}/Documents/Microsoft%20Teams%20Chat%20Files/report.pdf`,
+      ),
+    );
+    const provider = makeProvider();
+    await provider.initialize();
+
+    const outcomes = await provider.downloadMessageFiles(groupChatMessage());
+
+    expect(outcomes).toEqual([
+      {
+        status: "skipped",
+        skipped: { name: "report.pdf", reason: "sign_in_required" },
+      },
+    ]);
+  });
+
+  test("a signed-in sender's file is read from their own OneDrive with their token", async () => {
+    server.use(
+      ...groupChatFile(
+        `${ONEDRIVE}/Documents/Microsoft%20Teams%20Chat%20Files/report.pdf`,
+      ),
+    );
+    await signInSender();
+    const provider = makeProvider();
+    await provider.initialize();
+
+    const outcomes = await provider.downloadMessageFiles(groupChatMessage());
+
+    expect(outcomes).toEqual([
+      {
+        status: "delivered",
+        attachment: {
+          contentType: "application/pdf",
+          contentBase64: PDF_BYTES.toString("base64"),
+          name: "report.pdf",
+        },
+      },
+    ]);
+  });
+
+  test("the sender's token never reads a file from someone else's OneDrive", async () => {
+    server.use(
+      ...groupChatFile(
+        "https://contoso-my.sharepoint.com/personal/bob_contoso_com/Documents/Microsoft%20Teams%20Chat%20Files/report.pdf",
+      ),
+    );
+    await signInSender();
+    const provider = makeProvider();
+    await provider.initialize();
+
+    const outcomes = await provider.downloadMessageFiles(groupChatMessage());
+
+    expect(outcomes).toEqual([
+      {
+        status: "skipped",
+        skipped: { name: "report.pdf", reason: "download_failed" },
+      },
+    ]);
+  });
+
+  test("with sign-in off, a group-chat file is tried with the app's own grant only", async () => {
+    server.use(
+      ...groupChatFile(
+        `${ONEDRIVE}/Documents/Microsoft%20Teams%20Chat%20Files/report.pdf`,
+      ),
+      http.get(
+        "https://graph.microsoft.com/v1.0/sites/:host/:kind/:name",
+        () => new HttpResponse(null, { status: 403 }),
+      ),
+    );
+    await signInSender();
+    const provider = makeProvider(false);
+    await provider.initialize();
+
+    const outcomes = await provider.downloadMessageFiles(groupChatMessage());
+
+    expect(outcomes).toEqual([
+      {
+        status: "skipped",
+        skipped: { name: "report.pdf", reason: "download_failed" },
+      },
+    ]);
+  });
+
+  test("the sign-in card goes to the chat and its link starts the sender's Microsoft sign-in", async () => {
+    const provider = makeProvider();
+    await provider.initialize();
+    const sent: Activity[] = [];
+    // biome-ignore lint/suspicious/noExplicitAny: test-only — bypass private field
+    (provider as any).adapter = {
+      continueConversation: async (
+        _appId: string,
+        _ref: unknown,
+        logic: (context: {
+          sendActivity: (a: Activity) => void;
+        }) => Promise<void>,
+      ) => logic({ sendActivity: (activity) => sent.push(activity) }),
+    };
+
+    const posted = await provider.requestFileSignIn({
+      message: groupChatMessage({
+        metadata: {
+          conversationType: "groupChat",
+          tenantId: TENANT_ID,
+          conversationReference: { conversation: { id: CHAT_ID } },
+        },
+      }),
+      fileNames: ["report.pdf"],
+    });
+
+    expect(posted).toBe(true);
+    const card = sent[0]?.attachments?.[0]?.content as {
+      body: Array<{ text: string }>;
+      actions: Array<{ url: string }>;
+    };
+    expect(card.body[0].text).toContain("Alice");
+    expect(card.body[0].text).toContain("report.pdf");
+    const key = new URL(card.actions[0].url).searchParams.get("key") ?? "";
+    const authorize = new URL((await provider.beginUserSignIn(key)) ?? "");
+    expect(authorize.origin).toBe("https://login.microsoftonline.com");
+    expect(authorize.searchParams.get("client_id")).toBe(APP_ID);
+    expect(authorize.searchParams.get("login_hint")).toBe("alice@contoso.com");
+  });
+
+  test("no sign-in is offered to someone from another tenant", async () => {
+    const provider = makeProvider();
+    await provider.initialize();
+
+    const posted = await provider.requestFileSignIn({
+      message: groupChatMessage({
+        metadata: { conversationType: "groupChat", tenantId: "other-tenant" },
+      }),
+      fileNames: ["report.pdf"],
+    });
+
+    expect(posted).toBe(false);
+  });
+});
+
+describe("MSTeamsProvider channel files read with the sender's sign-in", () => {
+  const TENANT_ID = "11111111-1111-4111-8111-111111111111";
+  const APP_ID = "22222222-2222-4222-8222-222222222222";
+  const TEAM_ID = "33333333-3333-4333-8333-333333333333";
+  const SENDER_ID = "44444444-4444-4444-8444-444444444444";
+  const CHANNEL_ID = "19:files@thread.tacv2";
+  const MESSAGE_ID = "1792632504796";
+  const SITE = "https://contoso.sharepoint.com/sites/Engineering";
+  const CHANNEL_FILE = `${SITE}/Shared%20Documents/General/Design%20spec.pdf`;
+  const OTHER_SITE_FILE =
+    "https://contoso.sharepoint.com/sites/Finance/Shared%20Documents/Budget/Design%20spec.pdf";
+  const APP_PDF = Buffer.from("%PDF-1.7 read with the app's site grant");
+  const USER_PDF = Buffer.from("%PDF-1.7 read with the sender's sign-in");
+  const server = useMswServer(...graphAuthHandlers());
+  setupTestCacheManager();
+
+  function makeProvider(): MSTeamsProvider {
+    return new MSTeamsProvider({
+      enabled: true,
+      appId: APP_ID,
+      appSecret: "test-secret",
+      tenantId: TENANT_ID,
+      graphTenantId: TENANT_ID,
+      graphClientId: APP_ID,
+      graphClientSecret: "test-secret",
+      groupChatFileSignIn: true,
+    });
+  }
+
+  function channelMessage(): IncomingChatMessage {
+    return {
+      messageId: MESSAGE_ID,
+      channelId: CHANNEL_ID,
+      workspaceId: TEAM_ID,
+      senderId: SENDER_ID,
+      senderName: "Alice",
+      senderEmail: "alice@contoso.com",
+      text: "summarize this",
+      rawText: "summarize this",
+      timestamp: new Date(),
+      isThreadReply: false,
+      metadata: {
+        conversationType: "channel",
+        tenantId: TENANT_ID,
+        conversationReference: { conversation: { id: CHANNEL_ID } },
+      },
+    };
+  }
+
+  /**
+   * A channel message sharing `fileUrl`. The app reads the team's site only
+   * when `appGranted`; the sender's token opens the channel's General folder.
+   */
+  function channelFile(params: { fileUrl: string; appGranted: boolean }) {
+    return [
+      http.get(
+        `https://graph.microsoft.com/v1.0/teams/${TEAM_ID}/channels/:channelId/messages/${MESSAGE_ID}`,
+        () =>
+          HttpResponse.json({
+            id: MESSAGE_ID,
+            attachments: [
+              {
+                contentType: "reference",
+                contentUrl: params.fileUrl,
+                name: "Design spec.pdf",
+              },
+            ],
+          }),
+      ),
+      http.get(
+        "https://graph.microsoft.com/v1.0/sites/:host/:kind/:name",
+        ({ request }) =>
+          params.appGranted &&
+          request.headers.get("authorization") === "Bearer graph-token"
+            ? HttpResponse.json({ id: "site-1" })
+            : new HttpResponse(null, { status: 403 }),
+      ),
+      http.get("https://graph.microsoft.com/v1.0/sites/site-1/drives", () =>
+        HttpResponse.json({
+          value: [{ id: "drive-app", webUrl: `${SITE}/Shared%20Documents` }],
+        }),
+      ),
+      http.get(
+        "https://graph.microsoft.com/v1.0/drives/drive-app/:root/:folder/:file/content",
+        () =>
+          new HttpResponse(APP_PDF, {
+            headers: { "content-type": "application/octet-stream" },
+          }),
+      ),
+      http.get(
+        `https://graph.microsoft.com/v1.0/teams/${TEAM_ID}/channels/:channelId/filesFolder`,
+        ({ request }) =>
+          request.headers.get("authorization") === "Bearer user-token"
+            ? HttpResponse.json({
+                id: "folder-general",
+                webUrl: `${SITE}/Shared%20Documents/General`,
+                parentReference: { driveId: "drive-user" },
+              })
+            : new HttpResponse(null, { status: 403 }),
+      ),
+      http.get(
+        "https://graph.microsoft.com/v1.0/drives/drive-user/items/:folder/:file/content",
+        ({ request }) => {
+          const path = decodeURIComponent(new URL(request.url).pathname);
+          return request.headers.get("authorization") === "Bearer user-token" &&
+            path ===
+              "/v1.0/drives/drive-user/items/folder-general:/Design spec.pdf:/content"
+            ? new HttpResponse(USER_PDF, {
+                headers: { "content-type": "application/octet-stream" },
+              })
+            : new HttpResponse(null, { status: 404 });
+        },
+      ),
+    ];
+  }
+
+  async function signInSender(scope: string): Promise<void> {
+    await ChatOpsMsTeamsUserConnectionModel.save({
+      tenantId: TENANT_ID,
+      aadObjectId: SENDER_ID,
+      scope,
+      tokens: {
+        accessToken: "user-token",
+        refreshToken: "user-refresh",
+        accessTokenExpiresAt: Date.now() + 60 * 60 * 1000,
+      },
+    });
+  }
+
+  function delivered(bytes: Buffer) {
+    return [
+      {
+        status: "delivered",
+        attachment: {
+          contentType: "application/pdf",
+          contentBase64: bytes.toString("base64"),
+          name: "Design spec.pdf",
+        },
+      },
+    ];
+  }
+
+  test("a channel file the app has no site grant for asks its sender to sign in", async () => {
+    server.use(...channelFile({ fileUrl: CHANNEL_FILE, appGranted: false }));
+    const provider = makeProvider();
+    await provider.initialize();
+
+    const outcomes = await provider.downloadMessageFiles(channelMessage());
+
+    expect(outcomes).toEqual([
+      {
+        status: "skipped",
+        skipped: { name: "Design spec.pdf", reason: "sign_in_required" },
+      },
+    ]);
+  });
+
+  test("a team the app's site grant covers needs no sign-in", async () => {
+    server.use(...channelFile({ fileUrl: CHANNEL_FILE, appGranted: true }));
+    const provider = makeProvider();
+    await provider.initialize();
+
+    const outcomes = await provider.downloadMessageFiles(channelMessage());
+
+    expect(outcomes).toEqual(delivered(APP_PDF));
+  });
+
+  test("a sender signed in for channel files has the file read from the channel's folder with their token", async () => {
+    server.use(...channelFile({ fileUrl: CHANNEL_FILE, appGranted: false }));
+    await signInSender("openid https://graph.microsoft.com/Files.Read.All");
+    const provider = makeProvider();
+    await provider.initialize();
+
+    const outcomes = await provider.downloadMessageFiles(channelMessage());
+
+    expect(outcomes).toEqual(delivered(USER_PDF));
+  });
+
+  test("a sign-in made for group-chat files still asks the sender to sign in for a channel file", async () => {
+    server.use(...channelFile({ fileUrl: CHANNEL_FILE, appGranted: false }));
+    await signInSender("openid Files.Read");
+    const provider = makeProvider();
+    await provider.initialize();
+
+    const outcomes = await provider.downloadMessageFiles(channelMessage());
+
+    expect(outcomes).toEqual([
+      {
+        status: "skipped",
+        skipped: { name: "Design spec.pdf", reason: "sign_in_required" },
+      },
+    ]);
+  });
+
+  test("the sender's token never reads a file outside the channel's folder", async () => {
+    server.use(...channelFile({ fileUrl: OTHER_SITE_FILE, appGranted: false }));
+    await signInSender("openid Files.Read.All");
+    const provider = makeProvider();
+    await provider.initialize();
+
+    const outcomes = await provider.downloadMessageFiles(channelMessage());
+
+    expect(outcomes).toEqual([
+      {
+        status: "skipped",
+        skipped: { name: "Design spec.pdf", reason: "download_failed" },
+      },
+    ]);
+  });
+
+  test.each([
+    ["another team's site", OTHER_SITE_FILE, "download_failed"],
+    ["the channel's folder", CHANNEL_FILE, "sign_in_required"],
+    [
+      "a OneDrive",
+      "https://contoso-my.sharepoint.com/personal/bob_contoso_com/Documents/Design%20spec.pdf",
+      "sign_in_required",
+    ],
+  ])("once the channel's folder is known, a denied file in %s gets %s", async (_where, fileUrl, reason) => {
+    // A signed-in sender's message shows the bot where the channel's folder is.
+    server.use(...channelFile({ fileUrl: CHANNEL_FILE, appGranted: false }));
+    await signInSender("openid https://graph.microsoft.com/Files.Read.All");
+    const provider = makeProvider();
+    await provider.initialize();
+    await provider.downloadMessageFiles(channelMessage());
+
+    server.use(...channelFile({ fileUrl, appGranted: false }));
+    const outcomes = await provider.downloadMessageFiles({
+      ...channelMessage(),
+      senderId: "55555555-5555-4555-8555-555555555555",
+    });
+
+    expect(outcomes).toEqual([
+      { status: "skipped", skipped: { name: "Design spec.pdf", reason } },
+    ]);
+  });
+
+  test("the sign-in card in a channel asks Microsoft for every file the sender can open", async () => {
+    const provider = makeProvider();
+    await provider.initialize();
+    const sent: Activity[] = [];
+    // biome-ignore lint/suspicious/noExplicitAny: test-only — bypass private field
+    (provider as any).adapter = {
+      continueConversation: async (
+        _appId: string,
+        _ref: unknown,
+        logic: (context: {
+          sendActivity: (a: Activity) => void;
+        }) => Promise<void>,
+      ) => logic({ sendActivity: (activity) => sent.push(activity) }),
+    };
+
+    const posted = await provider.requestFileSignIn({
+      message: channelMessage(),
+      fileNames: ["Design spec.pdf"],
+    });
+
+    expect(posted).toBe(true);
+    const card = sent[0]?.attachments?.[0]?.content as {
+      actions: Array<{ url: string }>;
+    };
+    const key = new URL(card.actions[0].url).searchParams.get("key") ?? "";
+    const authorize = new URL((await provider.beginUserSignIn(key)) ?? "");
+    expect(authorize.searchParams.get("scope")?.split(" ")).toContain(
+      "https://graph.microsoft.com/Files.Read.All",
+    );
+  });
+});
+
+test.each([
+  ["Change which agent handles the conversation", "/select-agent"],
+  ["Change which agent handles this conversation", "/select-agent"],
+  ["Show current agent for this conversation", "/status"],
+  ["Show available commands", "/help"],
+  ["Stop the bot reading your group-chat files", "/sign-out"],
+  ["Stop the bot reading your files", "/sign-out"],
+])("old menu text %s invokes %s after removing the mention", async (description, command) => {
+  const message = await createProvider().parseWebhookNotification(
+    makeActivity({ text: `<at>TestBot</at> ${description}` }),
+    {},
+  );
+  expect(message?.text).toBe(command);
+  expect(message?.rawText).toContain(description);
+});
+
+test("ordinary prose mentioning agent selection stays ordinary prose", async () => {
+  const message = await createProvider().parseWebhookNotification(
+    makeActivity({
+      text: "Please change which agent handles this conversation later",
+    }),
+    {},
+  );
+  expect(message?.text).toBe(
+    "Please change which agent handles this conversation later",
+  );
 });

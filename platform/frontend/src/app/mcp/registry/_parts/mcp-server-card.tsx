@@ -4,10 +4,14 @@ import {
   type archestraApiTypes,
   E2eTestId,
   getManageCredentialsButtonTestId,
+  MCP_CATALOG_EDIT_QUERY_PARAM,
   type McpDeploymentStatusEntry,
-} from "@shared";
+} from "@archestra/shared";
 import {
-  AlertTriangle,
+  Copy,
+  FileSearch,
+  Globe,
+  Laptop,
   MessageSquare,
   Pencil,
   Plus,
@@ -16,20 +20,34 @@ import {
   User,
   Wrench,
 } from "lucide-react";
-import { useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import {
+  type MouseEventHandler,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { toast } from "sonner";
-
+import { LabelTags } from "@/components/label-tags";
 import { McpCatalogIcon } from "@/components/mcp-catalog-icon";
-import { ResourceVisibilityBadge } from "@/components/resource-visibility-badge";
+import { TableCard } from "@/components/table-card-view";
+import { TableRowActions } from "@/components/table-row-actions";
 import {
   Avatar,
   AvatarFallback,
   AvatarGroup,
   AvatarGroupCount,
 } from "@/components/ui/avatar";
-
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { PermissionButton } from "@/components/ui/permission-button";
 import {
   Tooltip,
@@ -37,25 +55,55 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { TruncatedTooltip } from "@/components/ui/truncated-tooltip";
+import { UnstyledButton } from "@/components/ui/unstyled-button";
 import { LOCAL_MCP_DISABLED_MESSAGE } from "@/consts";
-import { fetchInternalAgents, useCreateProfile } from "@/lib/agent.query";
-import { useBulkAssignTools } from "@/lib/agent-tools.query";
 import { useHasPermissions, useSession } from "@/lib/auth/auth.query";
+import { copyToClipboard } from "@/lib/clipboard";
 import { useFeature } from "@/lib/config/config.query";
-import { fetchCatalogTools } from "@/lib/mcp/internal-mcp-catalog.query";
-import { useMcpServers } from "@/lib/mcp/mcp-server.query";
-import { useTeams } from "@/lib/teams/team.query";
+import { useEnvironments } from "@/lib/environment.query";
+import { DESKTOP_MCP_COPY } from "@/lib/mcp/desktop-mcp";
+import { useReinstallInternalMcpCatalogItem } from "@/lib/mcp/internal-mcp-catalog.query";
+import type { McpRegistryRow } from "@/lib/mcp/mcp-registry.query";
+import type { McpDeploymentFeedState } from "@/lib/mcp/mcp-server.query";
+import {
+  canReinstallInstall,
+  type McpServerIssue,
+} from "@/lib/mcp/mcp-server-issues";
+import { useAssignableTeams } from "@/lib/teams/team.query";
+import { isCardShowingInstallInProgress } from "./card-install-state";
+import { useCanModifyCatalogItem } from "./catalog-edit-access";
+import { clearCatalogEditParam } from "./catalog-edit-link";
+import { resolveCatalogEnvironmentLabel } from "./catalog-environment-label";
+import { shouldShowMcpCardChatButton } from "./chat-button-visibility";
 import {
   computeDeploymentStatusSummary,
-  DeploymentStatusDot,
+  DeploymentStatusIconDot,
+  STATE_PRIORITY,
 } from "./deployment-status";
-import { InstallationProgress } from "./installation-progress";
+import { desktopAddAction } from "./desktop-mcp-install";
 import {
-  McpServerSettingsDialog,
-  type SettingsPage,
-} from "./mcp-server-settings-dialog";
-import { UninstallServerDialog } from "./uninstall-server-dialog";
+  DesktopMcpNoDeviceStatus,
+  DesktopMcpWaitingStatus,
+} from "./desktop-mcp-install-status";
+import { CatalogEditNoAccess } from "./edit-catalog-dialog";
+import { InstallationProgress } from "./installation-progress";
+import { McpCapabilityBadges } from "./mcp-capability-badges";
+import {
+  InstallBlockedTooltip,
+  installBlockedSummary,
+  useMcpInstallBlockers,
+} from "./mcp-credential-blockers";
+import { McpServerIssueBadge } from "./mcp-server-issue-badge";
+import { McpServerIssueNotice } from "./mcp-server-issue-notice";
+import { OAuthReauthIndicator } from "./oauth-reauth-indicator";
+import { useRegistryPageServers } from "./registry-page-servers";
+import { isOwnPersonalInstall } from "./uninstall-scope";
+import {
+  UninstallServerDialog,
+  type UninstallServerInstall,
+} from "./uninstall-server-dialog";
+import { useChatWithCatalogItem } from "./use-chat-with-catalog-item";
+import { useDesktopInstallState } from "./use-desktop-install-state";
 
 export type CatalogItem =
   archestraApiTypes.GetInternalMcpCatalogResponses["200"][number];
@@ -63,8 +111,11 @@ export type CatalogItem =
 export type InstalledServer =
   archestraApiTypes.GetMcpServersResponses["200"][number];
 
+/** One row of the registry's paged list: what the cards and table read. */
+export type RegistryListItem = McpRegistryRow;
+
 export type McpServerCardProps = {
-  item: CatalogItem;
+  item: RegistryListItem;
   installedServer?: InstalledServer | null;
   installingItemId: string | null;
   installationStatus?:
@@ -75,24 +126,41 @@ export type McpServerCardProps = {
     | "discovering-tools"
     | null;
   deploymentStatuses: Record<string, McpDeploymentStatusEntry>;
+  /**
+   * Whether the live deployment feed has anything to say yet. Without it an
+   * empty `deploymentStatuses` reads as "still loading" forever on every
+   * deployment that has no Kubernetes runtime at all.
+   */
+  deploymentFeedState: McpDeploymentFeedState;
+  /** This item's outstanding issues, from the registry's shared computation. */
+  issues?: McpServerIssue[];
   onInstallRemoteServer: () => void;
   onInstallLocalServer: () => void;
-  onReinstall: () => void | Promise<void>;
-  onDetails: () => void;
-  onEdit: () => void;
-  onDelete: () => void;
+  /**
+   * Trigger a reinstall. `flaggedInstalls` is the set of installs the caller
+   * wants reinstalled — derived from `reinstallRequired`. Empty/undefined means
+   * "decide in the handler".
+   */
+  onReinstall: (
+    flaggedInstalls?: Array<{
+      id: string;
+      name: string;
+    }>,
+    options?: { alsoReinstallCatalog?: boolean },
+  ) => void | Promise<void>;
   onCancelInstallation?: (serverId: string) => void;
-  /** Called when user wants to add a personal connection from manage dialog */
-  onAddPersonalConnection?: () => void;
-  /** Called when user wants to add a team connection for a specific team */
-  onAddSharedConnection?: (teamId: string) => void;
-  /** Called when user wants to add an organization-wide connection */
-  onAddOrgConnection?: () => void;
-  /** When true, renders as a built-in Playwright server (non-editable, personal-only) */
+  /** When true, renders as an automatically managed Playwright runtime. */
   isBuiltInPlaywright?: boolean;
+  selection?: {
+    selected: boolean;
+    onSelectedChange: (selected: boolean) => void;
+    onSelectionClick: MouseEventHandler<HTMLButtonElement>;
+    disabled?: boolean;
+    disabledTooltip?: string;
+  };
 };
 
-export type McpServerCardVariant = "remote" | "local" | "builtin";
+export type McpServerCardVariant = "remote" | "local" | "builtin" | "desktop";
 
 export type McpServerCardBaseProps = McpServerCardProps & {
   variant: McpServerCardVariant;
@@ -105,35 +173,54 @@ export function McpServerCard({
   installingItemId,
   installationStatus,
   deploymentStatuses,
+  deploymentFeedState: _deploymentFeedState,
+  issues,
   onInstallRemoteServer,
   onInstallLocalServer,
   onReinstall,
-  onDetails: _onDetails,
-  onEdit: _onEdit,
-  onDelete,
   onCancelInstallation,
-  onAddPersonalConnection,
-  onAddSharedConnection,
-  onAddOrgConnection,
   isBuiltInPlaywright = false,
+  selection,
 }: McpServerCardBaseProps) {
   const isPlaywrightVariant = isBuiltInPlaywright;
 
-  const createAgent = useCreateProfile();
-  const bulkAssignTools = useBulkAssignTools();
-  const [isChatCreating, setIsChatCreating] = useState(false);
+  const { startChatById, isCreating: isChatCreating } =
+    useChatWithCatalogItem();
 
-  const isByosEnabled = useFeature("byosEnabled");
   const { data: session } = useSession();
   const currentUserId = session?.user?.id;
-  const { data: userIsMcpServerAdmin } = useHasPermissions({
-    mcpServerInstallation: ["admin"],
-  });
   const isLocalMcpEnabled = useFeature("orchestratorK8sRuntime");
+  const installBlockers = useMcpInstallBlockers(item);
 
-  // Fetch all MCP servers to get installations for logs dropdown
-  const { data: allMcpServers } = useMcpServers();
-  const { data: teams } = useTeams();
+  // A named, explicit environment is useful placement information. The
+  // implicit Default is the baseline and stays unlabeled. Built-in servers
+  // aren't environment-scoped, so skip them.
+  const { data: environmentList } = useEnvironments();
+  const environmentLabel =
+    variant === "builtin"
+      ? null
+      : resolveCatalogEnvironmentLabel({
+          environmentId: item.environmentId,
+          environments: environmentList?.environments ?? [],
+        });
+
+  // Whether the current user can edit this catalog item: an admin, a team-admin
+  // member of the item's teams, or the author of a personal item. Gates the
+  // inline edit form opened via the `?edit=<id>` deep link.
+  const { canModify: canEditCatalog, isLoading: canEditCatalogLoading } =
+    useCanModifyCatalogItem(variant !== "builtin" ? item : null);
+
+  // The installs of the items on this page, loaded once by the list.
+  const allMcpServers = useRegistryPageServers();
+  // Teams the user may install a shared connection for: any team for an install
+  // admin, otherwise only the teams they belong to.
+  const { data: isMcpServerInstallAdmin } = useHasPermissions(
+    { mcpRegistry: ["update"] },
+    "*",
+  );
+  const { data: teams } = useAssignableTeams({
+    isResourceAdmin: !!isMcpServerInstallAdmin,
+  });
 
   // Compute if user can create new installation (personal or team)
   // This is used to determine if the Connect button should be shown
@@ -159,141 +246,193 @@ export function McpServerCard({
       teams?.filter((t) => !teamsWithInstallation.includes(t.id)) ?? [];
 
     // Can create new installation if:
-    // - Personal installation not yet created AND byos is not enabled
     // - There are teams available without this server
-    return (
-      (!hasPersonalInstallation && !isByosEnabled) || availableTeams.length > 0
-    );
+    return !hasPersonalInstallation || availableTeams.length > 0;
   })();
 
   // Dialog state
-  const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
-  const [settingsInitialPage, setSettingsInitialPage] = useState<
-    SettingsPage | undefined
-  >(undefined);
-  const [logsInitialServerId, setLogsInitialServerId] = useState<string | null>(
-    null,
-  );
-  const [uninstallingServer, setUninstallingServer] = useState<{
-    id: string;
-    name: string;
-  } | null>(null);
+  const [uninstallDialogOpen, setUninstallDialogOpen] = useState(false);
+  // Shown when a shared `?edit=<id>` link targets this item but the current
+  // user can't edit it.
+  const [editNoAccessOpen, setEditNoAccessOpen] = useState(false);
 
-  const openSettingsPage = (page: SettingsPage) => {
-    setSettingsInitialPage(page);
-    setSettingsDialogOpen(true);
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const pathname = usePathname();
+
+  // Navigate to the catalog item detail page, optionally on a specific tab
+  // and with a pre-selected install for the logs view.
+  const goToItemPage = (tab?: string, serverId?: string) => {
+    const params = new URLSearchParams();
+    if (tab) params.set("tab", tab);
+    if (serverId) params.set("server", serverId);
+    const qs = params.toString();
+    router.push(`/mcp/registry/${item.id}${qs ? `?${qs}` : ""}`);
+  };
+  // ── Shareable edit deep-link (`?edit=<catalogId>`) ──────────────────────
+  // Legacy links: the editor now lives on the item detail page, so a shared
+  // `?edit=<id>` link redirects there for users who can edit, and shows a
+  // "no access" dialog for everyone else.
+  const editParam = searchParams.get(MCP_CATALOG_EDIT_QUERY_PARAM);
+  const deepLinkHandledRef = useRef(false);
+
+  const clearEditParam = () => {
+    if (!searchParams.get(MCP_CATALOG_EDIT_QUERY_PARAM)) return;
+    const qs = clearCatalogEditParam(searchParams.toString());
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
   };
 
-  const handleChatWithMcpServer = async () => {
-    setIsChatCreating(true);
-    const agentName = item.name;
-    try {
-      // Get or create: check if a personal agent with this name already exists for the current user
-      const existingAgents = await fetchInternalAgents();
-      const existing = existingAgents?.find(
-        (a) => a.name === agentName && a.authorId === currentUserId,
-      );
-
-      const agent =
-        existing ??
-        (await createAgent.mutateAsync({
-          name: agentName,
-          agentType: "agent",
-          scope: "personal",
-          teams: [],
-          icon: item.icon ?? undefined,
-        }));
-
-      const tools = await fetchCatalogTools(item.id);
-
-      if (agent && tools && tools.length > 0) {
-        const assignments = tools.map((tool) => ({
-          agentId: agent.id,
-          toolId: tool.id,
-          resolveAtCallTime: true,
-        }));
-        await bulkAssignTools.mutateAsync({ assignments });
-      }
-
-      if (agent) {
-        window.location.href = `/chat/new?agent_id=${agent.id}`;
-      }
-    } catch {
-      toast.error("Failed to create chat agent");
-    } finally {
-      setIsChatCreating(false);
+  // Resolve a shared link once per mount, after the edit-permission check
+  // resolves so non-editors aren't redirected to a form they can't use.
+  // Builtin items aren't editable, so canEditCatalog is false for them.
+  useEffect(() => {
+    if (deepLinkHandledRef.current) return;
+    if (canEditCatalogLoading) return;
+    if (editParam !== item.id) return;
+    deepLinkHandledRef.current = true;
+    if (canEditCatalog) {
+      router.replace(`/mcp/registry/${item.id}/edit`);
+    } else {
+      setEditNoAccessOpen(true);
     }
-  };
+  }, [editParam, item.id, canEditCatalog, canEditCatalogLoading, router]);
 
   const mcpServerOfCurrentCatalogItem = allMcpServers?.filter(
     (s) => s.catalogId === item.id,
   );
 
-  // Find the current user's personal connection for this catalog item
-  const personalServer = mcpServerOfCurrentCatalogItem?.find(
-    (s) => s.ownerId === currentUserId && !s.teamId,
+  // Find the current user's personal connection for this catalog item. An
+  // org-wide install the user created is not theirs to uninstall here.
+  const personalServer = mcpServerOfCurrentCatalogItem?.find((s) =>
+    isOwnPersonalInstall(s, currentUserId),
   );
-  const hasPersonalConnection = !!personalServer;
 
-  // Aggregate all installations for this catalog item (for logs dropdown)
-  let localInstalls: NonNullable<typeof allMcpServers> = [];
-  if (
-    installedServer?.catalogId &&
-    variant === "local" &&
-    allMcpServers &&
-    allMcpServers.length > 0
-  ) {
-    localInstalls = allMcpServers
-      .filter(({ catalogId, serverType }) => {
-        return (
-          catalogId === installedServer.catalogId && serverType === "local"
-        );
-      })
-      .sort((a, b) => {
-        // Sort by createdAt ascending (oldest first, most recent last)
-        return (
-          new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
-        );
-      });
-  }
+  const allServersForCatalog = useMemo(
+    () => (allMcpServers ?? []).filter((s) => s.catalogId === item.id),
+    [allMcpServers, item.id],
+  );
+  const personalServersForCatalog = allServersForCatalog.filter((s) =>
+    isOwnPersonalInstall(s, currentUserId),
+  );
+  const hasPersonalConnection =
+    personalServersForCatalog.length > 0 || !!personalServer;
+  // Install is offered only while the viewer has no connection they can use —
+  // the same rule as the registry's Installed filter and the server page,
+  // decided by the server for the row.
+  const isInstalledForViewer = item.install.installedForViewer;
 
-  // All installations for this catalog item (local + remote, for Inspector)
-  const allInstalls: NonNullable<typeof allMcpServers> =
-    localInstalls.length > 0
-      ? localInstalls
-      : (mcpServerOfCurrentCatalogItem ?? []).sort(
-          (a, b) =>
-            new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
-        );
+  // The most recent personal install for this catalog item, if any.
+  const uninstallInstalls: UninstallServerInstall[] = (() => {
+    const install = personalServersForCatalog
+      .slice()
+      .sort(
+        (a, b) =>
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+      )[0];
+    return install
+      ? [
+          {
+            server: {
+              id: install.id,
+              name: install.name,
+              scope: install.scope,
+              teamId: install.teamId,
+              serverType: install.serverType,
+            },
+          },
+        ]
+      : [];
+  })();
 
-  const needsReinstall = installedServer?.reinstallRequired;
+  const handleUninstallClick = () => {
+    if (uninstallInstalls.length > 0) {
+      setUninstallDialogOpen(true);
+    }
+  };
+
+  // Gated like its Install and Reinstall siblings: removing a connection is
+  // its own capability, and offering the button to a role without it only
+  // buys the user a 403 from the delete call behind the dialog.
+  const uninstallButton = hasPersonalConnection ? (
+    <PermissionButton
+      permissions={{ mcpServerInstallation: ["delete"] }}
+      variant="outline"
+      size="sm"
+      className="flex-1 px-2.5"
+      onClick={handleUninstallClick}
+    >
+      {variant === "desktop" ? DESKTOP_MCP_COPY.remove : "Uninstall"}
+    </PermissionButton>
+  ) : null;
+
+  // The reinstall button follows `canReinstallInstall`: an installs admin
+  // reinstalls others' connections, except a personal one waiting for its
+  // owner's new values.
+  const userFlaggedInstalls = allServersForCatalog.filter(
+    (s) =>
+      s.reinstallRequired &&
+      canReinstallInstall({
+        server: s,
+        viewer: {
+          userId: currentUserId ?? null,
+          canManageInstalls: !!isMcpServerInstallAdmin,
+        },
+      }),
+  );
+  const needsReinstall = userFlaggedInstalls.length > 0;
+  const triggerReinstall = () =>
+    onReinstall(
+      userFlaggedInstalls.map((s) => ({
+        id: s.id,
+        name: s.name,
+      })),
+    );
 
   // Check if the K8s deployment has failed (e.g. CrashLoopBackOff) even while installation is "pending"
   const installedDeploymentStatus = installedServer?.id
     ? deploymentStatuses[installedServer.id]
     : null;
   const isDeploymentFailed = installedDeploymentStatus?.state === "failed";
-  const installationError =
+  const _installationError =
     installationStatus === "error"
       ? (installedServer?.localInstallationError ?? "Installation failed")
       : null;
 
   const _mcpServersCount = mcpServerOfCurrentCatalogItem?.length ?? 0;
 
-  // Check for OAuth refresh errors on any credential the user can see
-  // The backend already filters mcpServerOfCurrentCatalogItem to only include visible credentials
-  const isOAuthServer = !!item.oauthConfig;
-  const hasOAuthRefreshError =
-    isOAuthServer &&
-    (mcpServerOfCurrentCatalogItem?.some((s) => s.oauthRefreshError) ?? false);
-
-  const isInstalling = Boolean(
-    !isDeploymentFailed &&
-      (installingItemId === item.id ||
-        (variant === "local" &&
-          (installationStatus === "pending" ||
-            (installationStatus === "discovering-tools" && installedServer)))),
+  // Worst live issue first, since issues are kind-ordered; an item whose only
+  // trouble the viewer muted still shows it, muted.
+  const statusIssue =
+    issues?.find((issue) => !issue.muted) ?? issues?.[0] ?? null;
+  // The re-auth marker follows the shared issue rule: it shows only when a
+  // connection the viewer's own calls resolve to lost its sign-in, never for a
+  // colleague's connection an admin merely sees. It is a click target when the
+  // viewer may re-authenticate that connection; the detailed reason lives on
+  // the credentials tab. The issue badge already says "Needs
+  // re-authentication", so a second marker for it on the same row is skipped.
+  const viewerReauthIssue = issues?.find(
+    (issue) => issue.kind === "needs-reauth" && issue.onViewerConnection,
   );
+  const oauthReauthIndicator =
+    viewerReauthIssue && statusIssue?.kind !== "needs-reauth" ? (
+      <OAuthReauthIndicator
+        onActivate={
+          viewerReauthIssue.audience === "you"
+            ? () => goToItemPage("credentials")
+            : undefined
+        }
+      />
+    ) : null;
+
+  const isInstalling = isCardShowingInstallInProgress({
+    deploymentFailed: isDeploymentFailed,
+    viewerTriggeredInstall: installingItemId === item.id,
+    variant,
+    installationStatus,
+    hasInstalledServer: !!installedServer,
+    installationOwnedByViewer:
+      !!currentUserId && installedServer?.ownerId === currentUserId,
+  });
 
   const isCurrentUserAuthenticated =
     currentUserId && installedServer?.users
@@ -302,12 +441,53 @@ export function McpServerCard({
   const isRemoteVariant = variant === "remote";
   const isBuiltinVariant = variant === "builtin";
 
-  // Check if logs are available (local variant with at least one installation)
-  const isLogsAvailable = variant === "local";
+  // Catalog-scope reinstall: surfaces a banner + button on multi-tenant
+  // local catalogs whose execution config (image, command, args, transport)
+  // was edited. One click recreates the shared pod for everyone and cascades
+  // tool sync. Gated by `canEditCatalog` (admin, a team-admin member of the
+  // item's teams, or the personal-scope owner) since only those users can
+  // apply catalog-scope changes.
+  const needsCatalogReinstall =
+    variant === "local" &&
+    item.multitenant === true &&
+    item.catalogReinstallRequired === true;
+  const reinstallCatalogMutation = useReinstallInternalMcpCatalogItem();
+  const triggerCatalogReinstall = () =>
+    reinstallCatalogMutation.mutate(item.id);
 
-  // Collect server IDs for deployment status indicator
-  const deploymentServerIds = (allMcpServers ?? [])
-    .filter((s) => s.catalogId === item.id && s.serverType === "local")
+  // Show ONE Reinstall button. For admins on a multi-tenant local catalog,
+  // a single click drives both the per-install input collection (existing
+  // modal flow) and the shared-pod recreate. For tenants, a precedence
+  // rule hides the per-install button while the catalog flag is pending —
+  // there's nothing useful they can do until the admin recreates the pod.
+  const showAdminCatalogReinstall = needsCatalogReinstall && canEditCatalog;
+  const showCombinedReinstall =
+    showAdminCatalogReinstall ||
+    (needsReinstall && !needsCatalogReinstall && isCurrentUserAuthenticated);
+
+  const triggerCombinedReinstall = () => {
+    if (showAdminCatalogReinstall && needsReinstall) {
+      // Admin owes input AND catalog needs recreate: open the existing
+      // per-install modal; on submit, parent chains catalog reinstall.
+      return onReinstall(
+        userFlaggedInstalls.map((s) => ({
+          id: s.id,
+          name: s.name,
+        })),
+        { alsoReinstallCatalog: true },
+      );
+    }
+    if (showAdminCatalogReinstall) {
+      // Admin doesn't owe input — fire catalog reinstall directly.
+      return triggerCatalogReinstall();
+    }
+    // Tenant or admin without a catalog flag — existing per-install flow.
+    return triggerReinstall();
+  };
+
+  // Collect server IDs for deployment status indicator.
+  const deploymentServerIds = allServersForCatalog
+    .filter((s) => s.serverType === "local")
     .map((s) => s.id);
 
   // Multi-tenant catalogs alias one K8s pod across many mcp_server rows.
@@ -315,13 +495,6 @@ export function McpServerCard({
   // (one stays "pending" while another flips to "failed"), so before any
   // summary or per-row dot is computed, canonicalize the state per podName
   // by picking the highest-priority observation. All rows then agree.
-  const STATE_PRIORITY: Record<string, number> = {
-    failed: 4,
-    running: 3,
-    succeeded: 3,
-    pending: 2,
-    not_created: 1,
-  };
   const effectiveDeploymentStatuses = (() => {
     if (!item.multitenant) return deploymentStatuses;
     const canonicalByPod = new Map<string, string>();
@@ -353,34 +526,42 @@ export function McpServerCard({
     deploymentServerIds,
     effectiveDeploymentStatuses,
   );
+  const deploymentStatusIndicator = deploymentSummary ? (
+    <DeploymentStatusIconDot summary={deploymentSummary} />
+  ) : null;
+  const primaryIssueAction = statusIssue ? (
+    <McpServerIssueNotice
+      item={item}
+      issues={issues ?? []}
+      servers={allServersForCatalog}
+      variant="primary-action"
+    />
+  ) : null;
   const toolsCount = item.toolCount ?? 0;
 
-  const chatButton =
-    toolsCount > 0 ? (
-      <Button
-        variant="outline"
-        size="sm"
-        className="flex-1"
-        disabled={isChatCreating}
-        onClick={handleChatWithMcpServer}
-      >
-        <MessageSquare className="h-4 w-4" />
-        {isChatCreating ? "Creating..." : "Chat"}
-      </Button>
-    ) : null;
-
-  const settingsButton = (
+  const chatButton = shouldShowMcpCardChatButton({
+    toolsCount,
+    isBuiltin: isBuiltinVariant,
+    hasInstallation: isInstalledForViewer,
+  }) ? (
     <Button
-      variant="ghost"
-      size="icon"
-      className="h-8 w-8"
-      onClick={() => openSettingsPage("configuration")}
+      variant="outline"
+      size="sm"
+      className="flex-1"
+      disabled={isChatCreating}
+      aria-label={`Chat using ${item.name}`}
+      onClick={() => startChatById(item.id)}
     >
-      <Pencil className="h-4 w-4" />
+      <MessageSquare className="h-4 w-4" />
+      {isChatCreating ? "Creating..." : "Chat"}
     </Button>
-  );
+  ) : null;
 
-  const MAX_AVATARS = 4;
+  // A 4th connection folds into the +N count rather than lengthening the
+  // stack: the stack is the widest fixed item in the compact info row, and
+  // every extra circle comes straight out of the width the scope badge's name
+  // has left to truncate into.
+  const MAX_AVATARS = 3;
   const connectionAvatars: Array<{
     type: "team" | "user";
     label: string;
@@ -427,183 +608,206 @@ export function McpServerCard({
   }
   const extraCount = connectionAvatars.length - MAX_AVATARS;
 
-  const showAuthorAvatar =
-    item.scope === "personal" && Boolean(item.authorName);
+  const showApprovalPanel = item.imageApprovalRequired === true;
 
-  const hasCompactInfoContent =
-    showAuthorAvatar ||
-    toolsCount > 0 ||
-    (variant === "local" && deploymentServerIds.length > 0) ||
-    (!isBuiltinVariant && (connectionAvatars.length > 0 || hasOrgConnection));
+  /** Who is connected and whether a connection needs attention. */
+  const hasTrailingCluster =
+    !isBuiltinVariant &&
+    !isPlaywrightVariant &&
+    (connectionAvatars.length > 0 ||
+      hasOrgConnection ||
+      Boolean(oauthReauthIndicator));
 
+  /** Operational details shown alongside resource metadata. */
+  const hasOperationalDetails = toolsCount > 0 || hasTrailingCluster;
+  const hasCardMetadata = Boolean(
+    environmentLabel ||
+      statusIssue ||
+      item.providesUi ||
+      item.providesSkills ||
+      showApprovalPanel,
+  );
+
+  const hasCompactInfoContent = hasCardMetadata || hasOperationalDetails;
+
+  /*
+    This usually fits on one line at the grid's card width, but operational
+    states can add several badges and connection avatars at once. Let those
+    fixed items wrap rather than paint outside a single-column card.
+
+    Fixed items are `shrink-0` and the badge is the single elastic cell, so
+    pressure lands on the one thing that can absorb it — a long author or team
+    name truncates (its `title` keeps it readable) before the row wraps.
+
+    Nothing separates the items but the gap. The 1px rules that used to sit
+    between them cost ~21px each once their two gaps are counted — around a
+    fifth of the row — which is most of what a name has to truncate into.
+  */
   const compactInfoRow = hasCompactInfoContent ? (
-    <div className="flex items-center gap-3 text-sm text-muted-foreground border-t pt-3">
-      {showAuthorAvatar && (
-        <>
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Avatar className="size-6 border-2 border-background">
-                  <AvatarFallback className="text-[10px]">
-                    {item.authorName?.slice(0, 2).toUpperCase()}
-                  </AvatarFallback>
-                </Avatar>
-              </TooltipTrigger>
-              <TooltipContent>Author: {item.authorName}</TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
-          {(toolsCount > 0 ||
-            (variant === "local" && deploymentServerIds.length > 0) ||
-            (!isBuiltinVariant &&
-              (connectionAvatars.length > 0 || hasOrgConnection))) && (
-            <div className="h-4 w-px bg-border" />
-          )}
-        </>
+    <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2 text-sm text-muted-foreground">
+      {environmentLabel && (
+        <Badge variant="outline" className="shrink-0 text-muted-foreground">
+          <span className="max-w-32 truncate">{environmentLabel}</span>
+        </Badge>
+      )}
+      {statusIssue && (
+        <span
+          className="shrink-0"
+          data-testid={
+            statusIssue.kind === "failed-to-start"
+              ? `${E2eTestId.McpServerError}-${item.name}-default`
+              : undefined
+          }
+        >
+          <McpServerIssueBadge issue={statusIssue} />
+        </span>
+      )}
+      <McpCapabilityBadges
+        providesUi={item.providesUi}
+        providesSkills={item.providesSkills}
+        skillCount={item.skillCount}
+        className="shrink-0"
+      />
+      {showApprovalPanel && (
+        <Badge variant="outline" className="shrink-0">
+          Image needs approval
+        </Badge>
       )}
       {toolsCount > 0 && (
-        <>
-          <div className="flex items-center gap-1">
-            <Wrench className="h-3.5 w-3.5" />
-            <span data-testid={`${E2eTestId.McpServerToolsCount}`}>
-              {toolsCount}
-            </span>
-          </div>
-          <div className="h-4 w-px bg-border" />
-        </>
+        <div className="flex shrink-0 items-center gap-1">
+          <Wrench className="h-3.5 w-3.5" />
+          <span data-testid={`${E2eTestId.McpServerToolsCount}`}>
+            {toolsCount}
+          </span>
+        </div>
       )}
-      {variant === "local" && deploymentServerIds.length > 0 && (
-        <>
-          {deploymentSummary ? (
-            <button
-              type="button"
-              onClick={() => openSettingsPage("debug-logs")}
-              className="flex items-center gap-1.5 cursor-pointer hover:text-foreground transition-colors"
-            >
-              <DeploymentStatusDot state={deploymentSummary.overallState} />
-              <span>
-                {deploymentSummary.running}/{deploymentSummary.total}
-              </span>
-            </button>
-          ) : (
-            <span className="relative flex h-2 w-2 shrink-0">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-muted-foreground/50 opacity-75" />
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-muted-foreground/50" />
-            </span>
-          )}
-          <div className="h-4 w-px bg-border" />
-        </>
-      )}
-      {!isBuiltinVariant && hasOrgConnection && (
-        <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                onClick={() => openSettingsPage("connections")}
-                className="inline-flex items-center rounded-full"
-              >
-                <ResourceVisibilityBadge
-                  scope="org"
-                  teams={undefined}
-                  authorId={undefined}
-                  authorName={undefined}
-                  currentUserId={undefined}
-                />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent>
-              Installed organization-wide. Manage credentials to review.
-            </TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
-      )}
-      {!isBuiltinVariant && connectionAvatars.length > 0 && (
-        <div className="flex items-center gap-2">
-          <AvatarGroup>
-            {connectionAvatars.slice(0, MAX_AVATARS).map((entry) => {
-              const connDeployment = computeDeploymentStatusSummary(
-                entry.serverIds,
-                effectiveDeploymentStatuses,
-              );
-              const borderClass = connDeployment
-                ? {
-                    running: "border-green-600 dark:border-green-800",
-                    pending: "border-yellow-500 dark:border-yellow-600",
-                    failed: "border-red-500 dark:border-red-700",
-                    degraded: "border-orange-500 dark:border-orange-600",
-                  }[connDeployment.overallState]
-                : "border-background";
-              return (
-                <TooltipProvider key={entry.key}>
+      {/*
+        Trailing cluster, pushed to the card's right edge by `ml-auto` so the
+        avatar stacks line up down a column of cards instead of each starting
+        wherever its neighbour's name happened to end.
+      */}
+      {hasTrailingCluster && (
+        <div className="ml-auto flex shrink-0 items-center gap-2">
+          {(connectionAvatars.length > 0 || hasOrgConnection) && (
+            <AvatarGroup>
+              {hasOrgConnection && (
+                <TooltipProvider>
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <Avatar className={`size-6 border-2 ${borderClass}`}>
-                        <AvatarFallback
-                          className={`text-[10px] ${entry.type === "team" ? "bg-accent" : ""}`}
-                        >
-                          {entry.label.slice(0, 2).toUpperCase()}
-                        </AvatarFallback>
-                      </Avatar>
+                      <UnstyledButton
+                        type="button"
+                        aria-label={`Installed organization-wide, manage credentials for ${item.name}`}
+                        onClick={() => goToItemPage("credentials")}
+                      >
+                        <Avatar className="size-6 border-2 border-background cursor-pointer">
+                          <AvatarFallback className="bg-amber-500/10 text-amber-800 dark:text-amber-400">
+                            <Globe className="h-3 w-3" />
+                          </AvatarFallback>
+                        </Avatar>
+                      </UnstyledButton>
                     </TooltipTrigger>
                     <TooltipContent>
-                      {entry.type === "team"
-                        ? `Team: ${entry.label}`
-                        : entry.label}
+                      Installed organization-wide. Manage credentials to review.
                     </TooltipContent>
                   </Tooltip>
                 </TooltipProvider>
-              );
-            })}
-            {extraCount > 0 && (
-              <AvatarGroupCount className="size-6 text-[10px]">
-                +{extraCount}
-              </AvatarGroupCount>
-            )}
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Avatar
-                    className="size-6 border-2 border-background cursor-pointer hover:opacity-80 transition-opacity"
-                    onClick={() => openSettingsPage("connections")}
-                    data-testid={getManageCredentialsButtonTestId(item.name)}
-                  >
-                    <AvatarFallback className="text-muted-foreground bg-muted">
-                      <Plus className="h-3 w-3" />
-                    </AvatarFallback>
-                  </Avatar>
-                </TooltipTrigger>
-                <TooltipContent>Manage credentials</TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
-          </AvatarGroup>
-          {hasOAuthRefreshError && (
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <AlertTriangle className="h-4 w-4 text-amber-500 cursor-help" />
-                </TooltipTrigger>
-                <TooltipContent className="max-w-xs">
-                  <p className="font-medium mb-1">Authentication failed</p>
-                  <p className="text-xs text-muted-foreground">
-                    Some connections need re-authentication.
-                  </p>
-                </TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
+              )}
+              {connectionAvatars.slice(0, MAX_AVATARS).map((entry) => {
+                const connDeployment = computeDeploymentStatusSummary(
+                  entry.serverIds,
+                  effectiveDeploymentStatuses,
+                );
+                const borderClass = connDeployment
+                  ? {
+                      running: "border-green-600 dark:border-green-800",
+                      pending: "border-yellow-500 dark:border-yellow-600",
+                      failed: "border-red-500 dark:border-red-700",
+                      degraded: "border-orange-500 dark:border-orange-600",
+                      // SPDX-SnippetBegin
+                      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+                      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+                      hibernated: "border-muted-foreground",
+                      waking: "border-muted-foreground",
+                      // SPDX-SnippetEnd
+                    }[connDeployment.overallState]
+                  : "border-background";
+                return (
+                  <TooltipProvider key={entry.key}>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Avatar className={`size-6 border-2 ${borderClass}`}>
+                          <AvatarFallback
+                            className={`text-[10px] ${entry.type === "team" ? "bg-accent" : ""}`}
+                          >
+                            {entry.label.slice(0, 2).toUpperCase()}
+                          </AvatarFallback>
+                        </Avatar>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        {entry.type === "team"
+                          ? `Team: ${entry.label}`
+                          : entry.label}
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                );
+              })}
+              {extraCount > 0 && (
+                <AvatarGroupCount className="size-6 text-[10px]">
+                  +{extraCount}
+                </AvatarGroupCount>
+              )}
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <UnstyledButton
+                      type="button"
+                      aria-label={`Manage credentials for ${item.name}`}
+                      onClick={() => goToItemPage("credentials")}
+                      data-testid={getManageCredentialsButtonTestId(item.name)}
+                    >
+                      <Avatar className="size-6 border-2 border-background cursor-pointer hover:opacity-80 transition-opacity">
+                        <AvatarFallback className="text-muted-foreground bg-muted">
+                          <Plus className="h-3 w-3" />
+                        </AvatarFallback>
+                      </Avatar>
+                    </UnstyledButton>
+                  </TooltipTrigger>
+                  <TooltipContent>Manage credentials</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            </AvatarGroup>
           )}
+          {oauthReauthIndicator}
         </div>
       )}
     </div>
   ) : null;
 
+  const remoteInstallButton = (
+    <PermissionButton
+      permissions={{ mcpServerInstallation: ["create"] }}
+      onClick={onInstallRemoteServer}
+      size="sm"
+      variant="outline"
+      className="flex-1"
+      aria-label={`Install ${item.name}`}
+    >
+      <User className="h-4 w-4" />
+      Install
+    </PermissionButton>
+  );
+
   const remoteCardContent = (
     <>
-      <div className="flex flex-wrap gap-2">
+      <div className="flex flex-nowrap gap-2 [&>*]:min-w-0">
+        {primaryIssueAction}
         {chatButton}
         {!isInstalling && isCurrentUserAuthenticated && needsReinstall && (
           <PermissionButton
-            permissions={{ mcpServerInstallation: ["update"] }}
-            onClick={onReinstall}
+            permissions={{ mcpServerInstallation: ["create"] }}
+            onClick={triggerReinstall}
+            disabled={showApprovalPanel}
             size="sm"
             variant="outline"
             className="flex-1 text-destructive border-destructive/30 hover:bg-destructive/10"
@@ -612,47 +816,91 @@ export function McpServerCard({
             Reinstall
           </PermissionButton>
         )}
-        {!isInstalling &&
-          (hasPersonalConnection ? (
-            <Button
-              variant="outline"
-              size="sm"
-              className="flex-1"
-              onClick={() => {
-                if (personalServer) {
-                  setUninstallingServer({
-                    id: personalServer.id,
-                    name: personalServer.name,
-                  });
-                }
-              }}
-            >
-              Uninstall
-            </Button>
-          ) : (
-            <PermissionButton
-              permissions={{ mcpServerInstallation: ["create"] }}
-              onClick={onInstallRemoteServer}
-              size="sm"
-              variant="outline"
-              className="flex-1"
-            >
-              <User className="h-4 w-4" />
-              Install
-            </PermissionButton>
-          ))}
+        {!isInstalling && (
+          <>
+            {uninstallButton}
+            {!hasPersonalConnection && remoteInstallButton}
+          </>
+        )}
       </div>
     </>
+  );
+
+  // `showApprovalPanel` is declared above (before the card-content variants).
+  // An admin reviews the config (→ edit page) and approves; the requester gets a
+  // copy-link to share.
+  const isInstallAdmin = !!isMcpServerInstallAdmin;
+
+  const copyApprovalLink = () => {
+    void copyToClipboard(
+      `${window.location.origin}/mcp/registry/${item.id}/edit`,
+    );
+    toast.success("Link copied — share it with an admin to approve this image");
+  };
+
+  // When the image is gated, the full-width approval banner at the top of the
+  // card body explains it and carries the action — so drop the inline install
+  // button entirely (it would only fail the gate).
+  const localInstallButton = showApprovalPanel ? null : installBlockers.length >
+      0 && isLocalMcpEnabled ? (
+    <div className="flex-1">
+      <PermissionButton
+        permissions={{ mcpServerInstallation: ["create"] }}
+        disabled
+        tooltip={installBlockedSummary(installBlockers)}
+        reasonContent={<InstallBlockedTooltip blockers={installBlockers} />}
+        size="sm"
+        variant="outline"
+        className="w-full"
+        data-testid={`${E2eTestId.ConnectCatalogItemButton}-${item.name}`}
+      >
+        <Server className="h-4 w-4" />
+        Install
+      </PermissionButton>
+    </div>
+  ) : (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <div className="flex-1">
+            <PermissionButton
+              permissions={{ mcpServerInstallation: ["create"] }}
+              onClick={onInstallLocalServer}
+              disabled={!isLocalMcpEnabled}
+              size="sm"
+              variant="outline"
+              className="w-full"
+              data-testid={`${E2eTestId.ConnectCatalogItemButton}-${item.name}`}
+            >
+              <Server className="h-4 w-4" />
+              Install
+            </PermissionButton>
+          </div>
+        </TooltipTrigger>
+        {!isLocalMcpEnabled && (
+          <TooltipContent side="bottom">
+            <p>{LOCAL_MCP_DISABLED_MESSAGE}</p>
+          </TooltipContent>
+        )}
+      </Tooltip>
+    </TooltipProvider>
   );
 
   const localCardContent = (
     <>
-      <div className="flex flex-wrap gap-2">
+      <div className="flex flex-nowrap gap-2 [&>*]:min-w-0">
+        {primaryIssueAction}
         {chatButton}
-        {!isInstalling && isCurrentUserAuthenticated && needsReinstall && (
+        {!isInstalling && showCombinedReinstall && (
           <PermissionButton
-            permissions={{ mcpServerInstallation: ["update"] }}
-            onClick={onReinstall}
+            permissions={
+              showAdminCatalogReinstall
+                ? { mcpRegistry: ["update"] }
+                : { mcpServerInstallation: ["create"] }
+            }
+            permissionScope={showAdminCatalogReinstall ? item.id : undefined}
+            onClick={triggerCombinedReinstall}
+            disabled={reinstallCatalogMutation.isPending || showApprovalPanel}
             size="sm"
             variant="outline"
             className="flex-1 text-destructive border-destructive/30 hover:bg-destructive/10"
@@ -661,276 +909,194 @@ export function McpServerCard({
             Reinstall
           </PermissionButton>
         )}
-        {!isInstalling &&
-          (hasPersonalConnection ? (
-            <Button
-              variant="outline"
-              size="sm"
-              className="flex-1"
-              onClick={() => {
-                if (personalServer) {
-                  setUninstallingServer({
-                    id: personalServer.id,
-                    name: personalServer.name,
-                  });
-                }
-              }}
-            >
-              Uninstall
-            </Button>
-          ) : (
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <div className="flex-1">
-                    <PermissionButton
-                      permissions={{ mcpServerInstallation: ["create"] }}
-                      onClick={onInstallLocalServer}
-                      disabled={!isLocalMcpEnabled}
-                      size="sm"
-                      variant="outline"
-                      className="w-full"
-                      data-testid={`${E2eTestId.ConnectCatalogItemButton}-${item.name}`}
-                    >
-                      <Server className="h-4 w-4" />
-                      Install
-                    </PermissionButton>
-                  </div>
-                </TooltipTrigger>
-                {!isLocalMcpEnabled && (
-                  <TooltipContent side="bottom">
-                    <p>{LOCAL_MCP_DISABLED_MESSAGE}</p>
-                  </TooltipContent>
-                )}
-              </Tooltip>
-            </TooltipProvider>
-          ))}
-      </div>
-    </>
-  );
-
-  const playwrightCardContent = (
-    <>
-      <div className="flex flex-wrap gap-2">
-        {chatButton}
-        {!isInstalling && isCurrentUserAuthenticated && needsReinstall && (
-          <PermissionButton
-            permissions={{ mcpServerInstallation: ["update"] }}
-            onClick={onReinstall}
-            size="sm"
-            variant="outline"
-            className="flex-1 text-destructive border-destructive/30 hover:bg-destructive/10"
-          >
-            <RefreshCw className="h-4 w-4" />
-            Reinstall
-          </PermissionButton>
+        {!isInstalling && (
+          <>
+            {uninstallButton}
+            {!hasPersonalConnection && localInstallButton}
+          </>
         )}
-        {!isInstalling &&
-          (hasPersonalConnection ? (
-            <Button
-              variant="outline"
-              size="sm"
-              className="flex-1"
-              onClick={() => {
-                if (personalServer) {
-                  setUninstallingServer({
-                    id: personalServer.id,
-                    name: personalServer.name,
-                  });
-                }
-              }}
-            >
-              Uninstall
-            </Button>
-          ) : (
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <div className="flex-1">
-                    <PermissionButton
-                      permissions={{ mcpServerInstallation: ["create"] }}
-                      onClick={onInstallLocalServer}
-                      disabled={!isLocalMcpEnabled}
-                      size="sm"
-                      variant="outline"
-                      className="w-full"
-                      data-testid={`${E2eTestId.ConnectCatalogItemButton}-${item.name}`}
-                    >
-                      <Server className="h-4 w-4" />
-                      Install
-                    </PermissionButton>
-                  </div>
-                </TooltipTrigger>
-                {!isLocalMcpEnabled && (
-                  <TooltipContent side="bottom">
-                    <p>{LOCAL_MCP_DISABLED_MESSAGE}</p>
-                  </TooltipContent>
-                )}
-              </Tooltip>
-            </TooltipProvider>
-          ))}
       </div>
     </>
   );
 
   const builtinCardContent = (
     <>
-      <div>{chatButton}</div>
+      <div className="flex flex-nowrap gap-2 [&>*]:min-w-0">
+        {primaryIssueAction}
+        {chatButton}
+      </div>
     </>
+  );
+
+  // A desktop MCP server runs on the computer of the user who adds it: only
+  // the viewer's own installation counts, and the card says where it stands
+  // on that computer, with Remove from my computer.
+  const desktopState = useDesktopInstallState({
+    items: [item],
+    // Undefined while they load, so the card shows nothing until then.
+    servers: allMcpServers ? allServersForCatalog : undefined,
+  })(item);
+  const desktopAdd = desktopAddAction({
+    state: desktopState,
+    installedForViewer: isInstalledForViewer,
+  });
+  const desktopInstallButton = desktopAdd ? (
+    <PermissionButton
+      permissions={{ mcpServerInstallation: ["create"] }}
+      onClick={onInstallRemoteServer}
+      disabled={isInstalling || desktopAdd.disabledReason !== null}
+      tooltip={desktopAdd.disabledReason ?? undefined}
+      size="sm"
+      variant="outline"
+      className="flex-1"
+      aria-label={`Connect ${item.name} from my device`}
+    >
+      <Laptop className="h-4 w-4" />
+      {DESKTOP_MCP_COPY.add}
+    </PermissionButton>
+  ) : null;
+  const desktopCardContent = (
+    <div className="space-y-2">
+      <div className="flex flex-wrap gap-2">
+        {primaryIssueAction}
+        {chatButton}
+        {uninstallButton}
+        {desktopInstallButton}
+      </div>
+      {desktopState === "waiting" && (
+        <DesktopMcpWaitingStatus className="text-xs text-muted-foreground" />
+      )}
+      {desktopState === "no-device" && (
+        <DesktopMcpNoDeviceStatus className="text-xs text-muted-foreground" />
+      )}
+    </div>
   );
 
   const dialogs = (
     <>
-      <McpServerSettingsDialog
-        open={settingsDialogOpen}
+      <Dialog
+        open={editNoAccessOpen}
         onOpenChange={(open) => {
-          setSettingsDialogOpen(open);
-          if (!open) {
-            setLogsInitialServerId(null);
-            setSettingsInitialPage(undefined);
-          }
+          setEditNoAccessOpen(open);
+          if (!open) clearEditParam();
         }}
-        initialPage={settingsInitialPage}
-        item={item}
-        variant={variant}
-        showConnections={!isBuiltinVariant}
-        connectionCount={mcpServerOfCurrentCatalogItem?.length ?? 0}
-        showDebug={isLogsAvailable}
-        showInspector
-        showYaml={variant === "local"}
-        onAddPersonalConnection={onAddPersonalConnection}
-        onAddSharedConnection={onAddSharedConnection}
-        onAddOrgConnection={onAddOrgConnection}
-        installs={allInstalls}
-        deploymentStatuses={deploymentStatuses}
-        deploymentServerIds={deploymentServerIds}
-        onReinstall={() => onReinstall()}
-        logsInitialServerId={logsInitialServerId}
-        hasPersonalConnection={hasPersonalConnection}
-        onConnect={
-          onAddPersonalConnection ??
-          (variant === "local" ? onInstallLocalServer : onInstallRemoteServer)
-        }
-        needsReinstall={
-          !!needsReinstall && !isInstalling && isCurrentUserAuthenticated
-        }
-        onDelete={!isPlaywrightVariant ? onDelete : undefined}
-      />
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader className="sr-only">
+            <DialogTitle>No access</DialogTitle>
+            <DialogDescription>
+              You don't have access to edit this catalog item.
+            </DialogDescription>
+          </DialogHeader>
+          <CatalogEditNoAccess />
+        </DialogContent>
+      </Dialog>
 
       <UninstallServerDialog
-        server={uninstallingServer}
-        onClose={() => setUninstallingServer(null)}
+        open={uninstallDialogOpen}
+        onClose={() => setUninstallDialogOpen(false)}
+        installs={uninstallInstalls}
         isCancelingInstallation={isInstalling}
         onCancelInstallation={onCancelInstallation}
       />
     </>
   );
 
-  return (
-    <Card
-      className="flex flex-col relative pt-4 gap-4 h-full"
-      data-testid={`${E2eTestId.McpServerCard}-${item.name}`}
+  const approvalAction = showApprovalPanel ? (
+    <Button
+      type="button"
+      variant="outline"
+      size="sm"
+      className="w-full"
+      onClick={
+        isInstallAdmin
+          ? () => router.push(`/mcp/registry/${item.id}/edit`)
+          : copyApprovalLink
+      }
     >
-      <CardHeader className="gap-0">
-        <div className="flex items-start justify-between gap-4 overflow-hidden">
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2 mb-1 overflow-hidden w-full">
-              <McpCatalogIcon icon={item.icon} catalogId={item.id} size={20} />
-              <TruncatedTooltip content={item.name}>
-                <span className="text-lg font-semibold whitespace-nowrap text-ellipsis overflow-hidden">
-                  {item.name}
-                </span>
-              </TruncatedTooltip>
-            </div>
-            {item.description && (
-              <p className="text-xs text-muted-foreground line-clamp-2">
-                {item.description}
-              </p>
-            )}
-          </div>
-          {(userIsMcpServerAdmin ||
-            (item.scope === "personal" && item.authorId === currentUserId)) &&
-            settingsButton}
-        </div>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-4 flex-grow">
-        {variant === "local" && installationError && installedServer && (
-          <div
-            className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
-            data-testid={`${E2eTestId.McpServerError}-${item.name}`}
-          >
-            <div className="flex items-start gap-2">
-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-              <div className="min-w-0 flex-1">
-                <p className="font-medium">Installation failed</p>
-                <p className="truncate text-xs" title={installationError}>
-                  {installationError}
-                </p>
-              </div>
-              <div className="flex shrink-0 flex-col items-end gap-1">
-                <Button
-                  variant="link"
-                  size="sm"
-                  className="h-auto p-0 text-destructive"
-                  data-testid={`${E2eTestId.McpLogsViewButton}-${item.name}`}
-                  onClick={() => {
-                    setSettingsInitialPage("debug-logs");
-                    setLogsInitialServerId(installedServer.id);
-                    setSettingsDialogOpen(true);
-                  }}
-                >
-                  View logs
-                </Button>
-                <Button
-                  variant="link"
-                  size="sm"
-                  className="h-auto p-0 text-destructive"
-                  data-testid={`${E2eTestId.McpLogsEditConfigButton}-${item.name}`}
-                  onClick={() => {
-                    setSettingsInitialPage("configuration");
-                    setSettingsDialogOpen(true);
-                  }}
-                >
-                  Edit config
-                </Button>
-              </div>
-            </div>
-          </div>
-        )}
-        {variant === "local" && isInstalling && (
-          <div className="bg-muted/50 rounded-md overflow-hidden">
-            <div className="px-3 py-2">
-              <InstallationProgress
-                status={
-                  installationStatus === "error"
-                    ? null
-                    : (installationStatus ?? null)
-                }
-                serverId={installedServer?.id}
-                deploymentStatuses={deploymentStatuses}
-                onMoreDetails={() => {
-                  setSettingsInitialPage("debug-logs");
-                  if (installedServer?.id) {
-                    setLogsInitialServerId(installedServer.id);
-                  }
-                  setSettingsDialogOpen(true);
-                }}
-              />
-            </div>
-          </div>
-        )}
-        <div className="mt-auto flex flex-col gap-4">
-          {compactInfoRow}
-          {isBuiltinVariant
-            ? builtinCardContent
-            : isPlaywrightVariant
-              ? playwrightCardContent
-              : isRemoteVariant
-                ? remoteCardContent
-                : localCardContent}
-        </div>
-      </CardContent>
+      {isInstallAdmin ? <FileSearch /> : <Copy />}
+      <span>{isInstallAdmin ? "Review config" : "Copy approval link"}</span>
+    </Button>
+  ) : null;
+  const cardActions =
+    approvalAction ??
+    (isBuiltinVariant || isPlaywrightVariant
+      ? builtinCardContent
+      : isRemoteVariant
+        ? remoteCardContent
+        : variant === "desktop"
+          ? desktopCardContent
+          : localCardContent);
+  const hasCardBody = Boolean(
+    compactInfoRow || (variant === "local" && isInstalling),
+  );
+  const cardBody = hasCardBody ? (
+    <div className="space-y-3">
+      {compactInfoRow}
+      {variant === "local" && isInstalling && (
+        <InstallationProgress
+          status={
+            installationStatus === "error" ? null : (installationStatus ?? null)
+          }
+          serverId={installedServer?.id}
+          deploymentStatuses={deploymentStatuses}
+          onMoreDetails={() => goToItemPage("logs", installedServer?.id)}
+        />
+      )}
+    </div>
+  ) : undefined;
+
+  return (
+    <>
+      <TableCard
+        testId={`${E2eTestId.McpServerCard}-${item.name}`}
+        title={
+          <span className="flex min-w-0 items-center gap-1.5">
+            <span className="truncate">{item.name}</span>
+            <LabelTags labels={item.labels} />
+          </span>
+        }
+        description={item.description}
+        icon={
+          <span className="relative flex size-9 items-center justify-center overflow-hidden rounded-lg border bg-muted/30">
+            <McpCatalogIcon
+              icon={item.iconUrl ?? item.icon}
+              catalogId={item.id}
+              size={20}
+            />
+            {deploymentStatusIndicator}
+          </span>
+        }
+        actions={
+          <TableRowActions
+            itemName={item.name}
+            actions={
+              canEditCatalog
+                ? [
+                    {
+                      icon: <Pencil className="h-4 w-4" />,
+                      label: "Server settings for",
+                      tooltip: "Server settings",
+                      testId: `${E2eTestId.McpServerSettingsButton}-${item.name}`,
+                      onClick: () => goToItemPage(),
+                    },
+                  ]
+                : []
+            }
+          />
+        }
+        selected={selection?.selected}
+        selectionDisabled={selection?.disabled}
+        selectionDisabledTooltip={selection?.disabledTooltip}
+        onSelectedChange={selection?.onSelectedChange}
+        onSelectionClick={selection?.onSelectionClick}
+        selectionLabel={selection ? `Select ${item.name}` : undefined}
+        onNavigate={() => goToItemPage()}
+        footer={cardActions}
+      >
+        {cardBody}
+      </TableCard>
       {dialogs}
-    </Card>
+    </>
   );
 }

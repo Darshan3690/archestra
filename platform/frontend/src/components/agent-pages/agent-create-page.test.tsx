@@ -1,0 +1,683 @@
+import { E2eTestId, getAgentCatalogImages } from "@archestra/shared";
+import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { AgentFormProps } from "@/components/agent-form";
+import { useHasPermissions } from "@/lib/auth/auth.query";
+import { useFeature } from "@/lib/config/config.query";
+import { useK8sCapabilities } from "@/lib/environment.query";
+import { useAppName } from "@/lib/hooks/use-app-name";
+import { useOrganization } from "@/lib/organization.query";
+import { makeOrganization } from "@/mocks/data/organization";
+import { AgentCreatePage } from "./agent-create-page";
+
+vi.mock("@/lib/agent-runtime-templates.query", () => ({
+  useRuntimeTemplateCatalog: () => ({
+    data: [],
+    isFetching: false,
+    isPending: false,
+    isError: false,
+    refetch: vi.fn(),
+  }),
+  useResolveRuntimeTemplate: () => ({ isPending: false, mutate: vi.fn() }),
+}));
+vi.mock("next/navigation");
+vi.mock("@/lib/organization.query");
+vi.mock("@/lib/auth/auth.query");
+vi.mock("@/lib/config/config.query");
+vi.mock("@/lib/environment.query");
+vi.mock("@/lib/hooks/use-app-name");
+
+// The form itself is covered by agent-form.test.tsx; here it is a stub whose
+// props are what the page is expected to hand it, plus a way to fire
+// `onCreated` and report dirtiness.
+const formProps = vi.fn<(props: AgentFormProps) => void>();
+const formState = { hasRuntime: false };
+vi.mock("@/components/agent-form", () => ({
+  AgentForm: (props: AgentFormProps) => {
+    formProps(props);
+    return (
+      <div>
+        <button type="button" onClick={() => props.onDirtyChange?.(true)}>
+          make dirty
+        </button>
+        <button
+          type="button"
+          onClick={() =>
+            props.onCreated?.({
+              id: "new-1",
+              name: "Fresh",
+              hasRuntime: formState.hasRuntime,
+            })
+          }
+        >
+          fire created
+        </button>
+        {props.footer?.({
+          formId: "agent-form",
+          isCreate: true,
+          isSaving: false,
+          isDirty: false,
+          canSubmit: true,
+          readOnly: false,
+          hasRuntime: formState.hasRuntime,
+        })}
+      </div>
+    );
+  },
+}));
+
+const push = vi.fn();
+
+function mockPermissions({
+  canRead,
+  isPending = false,
+}: {
+  canRead: boolean | undefined;
+  isPending?: boolean;
+}) {
+  vi.mocked(useHasPermissions).mockReturnValue({
+    data: canRead,
+    isPending,
+  } as unknown as ReturnType<typeof useHasPermissions>);
+}
+
+function renderAgentCreatePage({
+  canCreateAgent = true,
+}: {
+  canCreateAgent?: boolean;
+} = {}) {
+  return render(
+    <AgentCreatePage kind="agent" canCreateAgent={canCreateAgent} />,
+  );
+}
+
+describe("AgentCreatePage", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(useOrganization).mockReturnValue({
+      data: makeOrganization(),
+    } as ReturnType<typeof useOrganization>);
+    mockPermissions({ canRead: true });
+    vi.mocked(useFeature).mockReturnValue(false);
+    vi.mocked(useAppName).mockReturnValue("Archestra");
+    vi.mocked(usePathname).mockReturnValue("/agents/new");
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams() as ReturnType<typeof useSearchParams>,
+    );
+    vi.mocked(useRouter).mockReturnValue({
+      push,
+      replace: vi.fn(),
+    } as unknown as ReturnType<typeof useRouter>);
+  });
+
+  it.each([
+    false,
+    true,
+  ])("lists only enabled messaging channels (Jira and email enabled: %s)", (enabled) => {
+    vi.mocked(useOrganization).mockReturnValue({
+      data: makeOrganization({
+        messagingChannelOverrides: {
+          telegram: { hidden: true },
+          jira: { hidden: !enabled },
+          email: { hidden: !enabled },
+        },
+      }),
+    } as ReturnType<typeof useOrganization>);
+    vi.mocked(useK8sCapabilities).mockReturnValue({
+      data: undefined,
+    } as unknown as ReturnType<typeof useK8sCapabilities>);
+    renderAgentCreatePage();
+
+    expect(screen.getByText("Slack")).toBeInTheDocument();
+    expect(screen.getByText("MS Teams")).toBeInTheDocument();
+    expect(screen.queryByText("Telegram")).not.toBeInTheDocument();
+    for (const label of ["Jira", "Email"]) {
+      if (enabled) expect(screen.getByText(label)).toBeInTheDocument();
+      else expect(screen.queryByText(label)).not.toBeInTheDocument();
+    }
+  });
+
+  it("greys out Popular agents and explains how to enable them when the cluster lacks the Agent Sandbox controller", async () => {
+    const user = userEvent.setup();
+    vi.mocked(useK8sCapabilities).mockReturnValue({
+      data: {
+        agentSandbox: {
+          installed: false,
+          missingResources: ["sandboxes.agents.x-k8s.io"],
+          message: "not installed",
+        },
+      },
+    } as unknown as ReturnType<typeof useK8sCapabilities>);
+    renderAgentCreatePage();
+
+    expect(
+      screen
+        .getAllByRole("heading", { level: 2 })
+        .map((heading) => heading.textContent),
+    ).toEqual(["Choose an agent", "Connect an external agent"]);
+    expect(
+      screen.getByText("Some agent options are unavailable."),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Show details" }),
+    ).toHaveAttribute("aria-expanded", "false");
+    await user.click(screen.getByRole("button", { name: "Show details" }));
+    expect(screen.getByText(/Missing API resources/)).toHaveTextContent(
+      "sandboxes.agents.x-k8s.io",
+    );
+    for (const name of [
+      "Claude Code",
+      "Codex",
+      "OpenCode",
+      "Hermes",
+      "OpenClaw",
+      "Grok Build",
+      "Kimi Code",
+      "GitHub Copilot CLI",
+    ]) {
+      const card = screen.getByRole("button", { name: new RegExp(name, "i") });
+      expect(card).toBeDisabled();
+      expect(card).toHaveAccessibleDescription(
+        "Requires the Agent Sandbox controller.",
+      );
+    }
+    await user.click(screen.getByRole("button", { name: /claude code/i }));
+    expect(formProps).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: /^archestra built into/i }),
+    ).toBeEnabled();
+  });
+
+  it("lets an Agent creator open the A2A form", async () => {
+    const user = userEvent.setup();
+    renderAgentCreatePage({ canCreateAgent: true });
+
+    const externalAgentChoice = screen.getByRole("button", {
+      name: /connect via a2a/i,
+    });
+    expect(externalAgentChoice).toBeEnabled();
+    await user.click(externalAgentChoice);
+    expect(push).toHaveBeenCalledWith("/agents/a2a/new");
+    expect(formProps).not.toHaveBeenCalled();
+  });
+
+  it("explains every disabled choice for someone who cannot create agents", () => {
+    vi.mocked(useFeature).mockImplementation((feature) =>
+      feature === "agentRuntime" ? true : undefined,
+    );
+    renderAgentCreatePage({ canCreateAgent: false });
+
+    for (const name of [
+      /^archestra built into/i,
+      /codex/i,
+      /connect via a2a/i,
+    ]) {
+      const choice = screen.getByRole("button", { name });
+      expect(choice).toBeDisabled();
+      expect(choice).toHaveAccessibleDescription(
+        "Requires permission to create agents.",
+      );
+    }
+  });
+
+  it.each([
+    false,
+    undefined,
+  ])("hides runtime choices until Configure runtime is granted (%s)", (allowed) => {
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions) =>
+        ({
+          data: permissions.agent?.includes("configure-runtime")
+            ? allowed
+            : true,
+          isPending:
+            permissions.agent?.includes("configure-runtime") &&
+            allowed === undefined,
+        }) as ReturnType<typeof useHasPermissions>,
+    );
+    renderAgentCreatePage();
+    expect(
+      screen.getByRole("button", { name: /^archestra built into/i }),
+    ).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: /connect via a2a/i }),
+    ).toBeEnabled();
+    for (const name of [/claude code/i, /codex/i, /custom image/i]) {
+      expect(screen.queryByRole("button", { name })).not.toBeInTheDocument();
+    }
+    expect(
+      screen.queryByText("Configure runtime permission required"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Some agent options are unavailable."),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: "Loading Agent Runtimes" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers maintained Agent templates and prefills the existing create wizard", async () => {
+    const user = userEvent.setup();
+    vi.mocked(useFeature).mockImplementation((feature) =>
+      feature === "agentRuntime"
+        ? true
+        : feature === "agentRuntimeCatalogImages"
+          ? getAgentCatalogImages({ registry: "archestra.local", tag: "dev" })
+          : undefined,
+    );
+
+    renderAgentCreatePage();
+
+    expect(
+      screen.getByRole("heading", { level: 2, name: "Choose an agent" }),
+    ).toBeInTheDocument();
+    expect(
+      screen
+        .getAllByRole("heading", { level: 2 })
+        .map((heading) => heading.textContent),
+    ).toEqual(["Choose an agent", "Connect an external agent"]);
+    for (const name of [
+      "Claude Code",
+      "Codex",
+      "OpenCode",
+      "Hermes",
+      "OpenClaw",
+      "Grok Build",
+      "Kimi Code",
+      "GitHub Copilot CLI",
+    ]) {
+      expect(
+        screen.getByRole("button", { name: new RegExp(name, "i") }),
+      ).toBeInTheDocument();
+    }
+    // The built-in agent and runtime templates share one catalog.
+    const codingAgents = screen
+      .getByRole("heading", { level: 2, name: "Choose an agent" })
+      .closest("section") as HTMLElement;
+    expect(
+      within(codingAgents)
+        .getAllByRole("button")
+        .map((button) => button.querySelector(".font-medium")?.textContent),
+    ).toEqual([
+      "Archestra",
+      "Claude Code",
+      "Codex",
+      "OpenCode",
+      "Hermes",
+      "OpenClaw",
+      "Grok Build",
+      "Kimi Code",
+      "GitHub Copilot CLI",
+      "Custom image",
+    ]);
+    expect(formProps).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: /codex/i }));
+
+    expect(formProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        onChangeRuntimeTemplate: expect.any(Function),
+        initialValues: expect.objectContaining({
+          name: "Codex",
+          icon: "/model-logos/openai.svg",
+          runtime: expect.objectContaining({
+            command: ["archestra-codex"],
+            image: "archestra.local/agent-codex:dev",
+            credentials: [],
+          }),
+        }),
+      }),
+    );
+    expect(screen.getByRole("button", { name: "Catalog" })).toBeInTheDocument();
+  });
+
+  it("starts a custom image agent from the catalog with an empty image to fill in", async () => {
+    const user = userEvent.setup();
+    vi.mocked(useFeature).mockImplementation((feature) =>
+      feature === "agentRuntime"
+        ? true
+        : feature === "agentRuntimeCatalogImages"
+          ? getAgentCatalogImages({ registry: "archestra.local", tag: "dev" })
+          : undefined,
+    );
+
+    renderAgentCreatePage();
+    await user.click(screen.getByRole("button", { name: /custom image/i }));
+
+    expect(formProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        onChangeRuntimeTemplate: expect.any(Function),
+        initialValues: {
+          runtime: expect.objectContaining({ image: "", command: null }),
+        },
+      }),
+    );
+  });
+
+  it("prefills OpenCode with its maintained Responses runtime", async () => {
+    const user = userEvent.setup();
+    vi.mocked(useFeature).mockImplementation((feature) =>
+      feature === "agentRuntime"
+        ? true
+        : feature === "agentRuntimeCatalogImages"
+          ? getAgentCatalogImages({ registry: "archestra.local", tag: "dev" })
+          : undefined,
+    );
+
+    renderAgentCreatePage();
+    await user.click(screen.getByRole("button", { name: /opencode/i }));
+
+    expect(formProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        initialValues: expect.objectContaining({
+          name: "OpenCode",
+          icon: "/agent-logos/opencode.svg",
+          runtime: expect.objectContaining({
+            image: "archestra.local/agent-opencode:dev",
+            command: ["archestra-opencode"],
+            inferenceProtocol: "openai_responses",
+            steerMode: "tmux_keys",
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("prefills OpenClaw with its compatible Chat Completions transport", async () => {
+    const user = userEvent.setup();
+    vi.mocked(useFeature).mockImplementation((feature) =>
+      feature === "agentRuntime"
+        ? true
+        : feature === "agentRuntimeCatalogImages"
+          ? getAgentCatalogImages({ registry: "archestra.local", tag: "dev" })
+          : undefined,
+    );
+
+    renderAgentCreatePage();
+    await user.click(screen.getByRole("button", { name: /openclaw/i }));
+
+    expect(formProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        initialValues: expect.objectContaining({
+          name: "OpenClaw",
+          runtime: expect.objectContaining({
+            command: ["archestra-openclaw"],
+            inferenceProtocol: "openai_chat",
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("prefills Claude Code with native personal sign-in", async () => {
+    const user = userEvent.setup();
+    vi.mocked(useFeature).mockImplementation((feature) =>
+      feature === "agentRuntime" ? true : undefined,
+    );
+
+    renderAgentCreatePage();
+    await user.click(screen.getByRole("button", { name: /claude code/i }));
+
+    expect(formProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        initialValues: expect.objectContaining({
+          runtime: expect.objectContaining({
+            command: ["archestra-claude-code"],
+            credentials: [],
+            claudeCode: { authentication: "subscription", model: "opus" },
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("mounts the whole form once, showing the first step, and only the last step may submit", async () => {
+    const user = userEvent.setup();
+    render(<AgentCreatePage kind="mcp_gateway" />);
+    expect(formProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        agentType: "mcp_gateway",
+        activeSection: "configuration",
+        submitEnabled: false,
+      }),
+    );
+    // Every group stays mounted: no `sections` narrows the form to one step.
+    expect(formProps.mock.lastCall?.[0].sections).toBeUndefined();
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Create MCP Gateway" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "MCP Gateways" }),
+    ).toBeInTheDocument();
+    // The last step alone offers to create; earlier steps only move on.
+    expect(screen.queryByTestId(E2eTestId.AgentSetupSubmitButton)).toBeNull();
+
+    const next = () => screen.getByTestId(E2eTestId.AgentSetupNextButton);
+    expect(next()).toHaveTextContent("Tools & Knowledge");
+    await user.click(next());
+    expect(formProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({ activeSection: "tools", submitEnabled: false }),
+    );
+    expect(next()).toHaveTextContent("Advanced");
+    await user.click(next());
+    expect(formProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        activeSection: "advanced",
+        submitEnabled: true,
+      }),
+    );
+    expect(screen.queryByTestId(E2eTestId.AgentSetupNextButton)).toBeNull();
+    const create = screen.getByTestId(E2eTestId.AgentSetupSubmitButton);
+    expect(create).toHaveAttribute("type", "submit");
+    expect(create).toHaveTextContent("Create MCP Gateway");
+    // Back to an earlier step (through the stepper) keeps the same form mount.
+    await user.click(screen.getByTestId(`${E2eTestId.AgentSetupStep}-tools`));
+    expect(formProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({ activeSection: "tools", submitEnabled: false }),
+    );
+  });
+
+  it("names the create action after what opening the agent starts", async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderAgentCreatePage();
+    await user.click(
+      screen.getByRole("button", { name: /^archestra built into/i }),
+    );
+    expect(
+      screen.getByTestId(E2eTestId.AgentSetupSubmitButton),
+    ).toHaveTextContent("Create and chat");
+
+    formState.hasRuntime = true;
+    rerender(<AgentCreatePage kind="agent" canCreateAgent />);
+    // It opens on its own page rather than in chat, so it promises no run.
+    expect(
+      screen.getByTestId(E2eTestId.AgentSetupSubmitButton),
+    ).toHaveTextContent("Create Agent");
+    formState.hasRuntime = false;
+  });
+
+  it("opens chat with the newly created agent selected", async () => {
+    const user = userEvent.setup();
+    renderAgentCreatePage();
+    await user.click(
+      screen.getByRole("button", { name: /^archestra built into/i }),
+    );
+    await user.click(screen.getByRole("button", { name: "fire created" }));
+    expect(push).toHaveBeenCalledWith("/chat?agentId=new-1");
+  });
+
+  it("opens the agent details when the creator can read agents but cannot chat", async () => {
+    const user = userEvent.setup();
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions) =>
+        ({ data: !("chat" in permissions), isPending: false }) as ReturnType<
+          typeof useHasPermissions
+        >,
+    );
+    renderAgentCreatePage();
+    await user.click(
+      screen.getByRole("button", { name: /^archestra built into/i }),
+    );
+    expect(screen.getByRole("button", { name: "Create Agent" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "fire created" }));
+    expect(push).toHaveBeenCalledWith("/agents/new-1");
+  });
+
+  it("keeps a newly created MCP gateway on its connection instructions", async () => {
+    const user = userEvent.setup();
+    render(<AgentCreatePage kind="mcp_gateway" />);
+    await user.click(screen.getByRole("button", { name: "fire created" }));
+    expect(push).toHaveBeenCalledWith("/mcp/gateways/new-1");
+  });
+
+  it("opens a newly created Claude Code agent on its own page, where its setup is listed", async () => {
+    const user = userEvent.setup();
+    vi.mocked(useFeature).mockImplementation((feature) =>
+      feature === "agentRuntime" ? true : undefined,
+    );
+    renderAgentCreatePage();
+
+    await user.click(screen.getByRole("button", { name: /claude code/i }));
+    formState.hasRuntime = true;
+    try {
+      await user.click(screen.getByRole("button", { name: "fire created" }));
+    } finally {
+      formState.hasRuntime = false;
+    }
+
+    expect(push).toHaveBeenCalledWith("/agents/new-1");
+  });
+
+  it("stays put with a success state when the creator may not read what it made", async () => {
+    const user = userEvent.setup();
+    mockPermissions({ canRead: false });
+    renderAgentCreatePage();
+    await user.click(
+      screen.getByRole("button", { name: /^archestra built into/i }),
+    );
+
+    await user.click(screen.getByRole("button", { name: "fire created" }));
+    expect(push).not.toHaveBeenCalled();
+    expect(screen.getByText("Agent created")).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Create Agent" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/you do not have permission to view it/i),
+    ).toBeInTheDocument();
+    // Nowhere to send them: the list needs the same read permission, so
+    // neither the shell's back link nor a button to it is offered.
+    expect(screen.queryByRole("link")).toBeNull();
+    expect(screen.queryByRole("button", { name: "fire created" })).toBeNull();
+  });
+
+  it("waits for the read permission before deciding where a created record goes", async () => {
+    const user = userEvent.setup();
+    // The create lands while the permission check is still in flight.
+    mockPermissions({ canRead: undefined, isPending: true });
+    const { rerender } = renderAgentCreatePage();
+    await user.click(
+      screen.getByRole("button", { name: /^archestra built into/i }),
+    );
+    await user.click(screen.getByRole("button", { name: "fire created" }));
+
+    // Neither answer yet: no blind navigation, and no "you cannot see it".
+    expect(push).not.toHaveBeenCalled();
+    expect(
+      screen.queryByText(/you do not have permission to view it/i),
+    ).toBeNull();
+
+    mockPermissions({ canRead: true });
+    rerender(<AgentCreatePage kind="agent" canCreateAgent />);
+    expect(push).toHaveBeenCalledWith("/chat?agentId=new-1");
+  });
+
+  it("shows the success state when the pending permission settles to a no", async () => {
+    const user = userEvent.setup();
+    mockPermissions({ canRead: undefined, isPending: true });
+    const { rerender } = renderAgentCreatePage();
+    await user.click(
+      screen.getByRole("button", { name: /^archestra built into/i }),
+    );
+    await user.click(screen.getByRole("button", { name: "fire created" }));
+
+    mockPermissions({ canRead: false });
+    rerender(<AgentCreatePage kind="agent" canCreateAgent />);
+    expect(push).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(/you do not have permission to view it/i),
+    ).toBeInTheDocument();
+  });
+
+  it("returns to the source chooser from the scratch form", async () => {
+    const user = userEvent.setup();
+    renderAgentCreatePage();
+
+    await user.click(
+      screen.getByRole("button", { name: /^archestra built into/i }),
+    );
+    await user.click(screen.getByRole("button", { name: "Catalog" }));
+    expect(
+      screen.getByRole("button", { name: /connect via a2a/i }),
+    ).toBeInTheDocument();
+    expect(formProps).toHaveBeenCalled();
+  });
+
+  it("returns to the source chooser from the top Agents back link", async () => {
+    const user = userEvent.setup();
+    renderAgentCreatePage();
+
+    await user.click(
+      screen.getByRole("button", { name: /^archestra built into/i }),
+    );
+    await user.click(screen.getByRole("link", { name: "Agents" }));
+
+    expect(push).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: /connect via a2a/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("asks before returning to the catalog discards a dirty draft", async () => {
+    const user = userEvent.setup();
+    renderAgentCreatePage();
+
+    await user.click(
+      screen.getByRole("button", { name: /^archestra built into/i }),
+    );
+    await user.click(screen.getByRole("button", { name: "make dirty" }));
+    await user.click(screen.getByRole("button", { name: "Catalog" }));
+
+    expect(
+      screen.getByRole("heading", { name: "Discard unsaved changes?" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /connect via a2a/i }),
+    ).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(
+      screen.getByRole("button", { name: /connect via a2a/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("asks before the top back link returns a dirty form to the catalog", async () => {
+    const user = userEvent.setup();
+    renderAgentCreatePage();
+
+    await user.click(
+      screen.getByRole("button", { name: /^archestra built into/i }),
+    );
+    await user.click(screen.getByRole("button", { name: "make dirty" }));
+    await user.click(screen.getByRole("link", { name: "Agents" }));
+    expect(push).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: /discard changes/i }));
+    expect(push).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: /connect via a2a/i }),
+    ).toBeInTheDocument();
+  });
+});

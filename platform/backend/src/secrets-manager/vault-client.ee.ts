@@ -1,14 +1,13 @@
 import fs from "node:fs/promises";
+import { ApiError } from "@archestra/shared";
 import { Sha256 } from "@aws-crypto/sha256-js";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
-import { ApiError } from "@shared";
 import { SignatureV4 } from "@smithy/signature-v4";
 import Vault from "node-vault";
 import logger from "@/logging";
-import type {
-  VaultConfig,
-  VaultFolderConnectivityResult,
-  VaultSecretListItem,
+import {
+  SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
+  type VaultConfig,
 } from "@/types/secrets-manager";
 import { extractVaultErrorMessage } from "./utils";
 
@@ -21,7 +20,7 @@ import { extractVaultErrorMessage } from "./utils";
  * standalone scripts (e.g. vault-env-injector init container) that run
  * before the database URL is available.
  *
- * ReadonlyVaultSecretManager and VaultSecretManager extend this class
+ * VaultSecretManager extends this class
  * to add the DB-dependent ISecretManager interface methods.
  */
 export class VaultClient {
@@ -56,67 +55,9 @@ export class VaultClient {
   } {
     return {
       meta: {
-        description: "External Vault (BYOS - Bring Your Own Secrets)",
+        description: "Vault",
       },
     };
-  }
-
-  /**
-   * List secrets in a Vault folder.
-   * Requires LIST permission on the folder path.
-   */
-  async listSecretsInFolder(
-    folderPath: string,
-  ): Promise<VaultSecretListItem[]> {
-    logger.debug(
-      { folderPath },
-      "VaultClient.listSecretsInFolder: listing secrets",
-    );
-
-    try {
-      await this.ensureInitialized();
-    } catch (error) {
-      this.handleVaultError(error, "listSecretsInFolder", { folderPath });
-    }
-
-    const listPath = this.getListPath(folderPath);
-
-    try {
-      const result = await this.executeWithK8sTokenRefresh(
-        () => this.client.list(listPath),
-        "listSecretsInFolder",
-      );
-      const keys = (result?.data?.keys as string[] | undefined) ?? [];
-
-      // Filter out folder entries (they end with /)
-      const secretKeys = keys.filter((key) => !key.endsWith("/"));
-
-      // Normalize folder path by removing trailing slashes to avoid double slashes in the path
-      const normalizedFolderPath = folderPath.replace(/\/+$/, "");
-
-      const items: VaultSecretListItem[] = secretKeys.map((name) => ({
-        name,
-        path: `${normalizedFolderPath}/${name}`,
-      }));
-
-      logger.info(
-        { folderPath, count: items.length },
-        "VaultClient.listSecretsInFolder: completed",
-      );
-      return items;
-    } catch (error) {
-      // Vault returns 404 when the path doesn't exist (no secrets)
-      const vaultError = error as { response?: { statusCode?: number } };
-      if (vaultError.response?.statusCode === 404) {
-        logger.debug(
-          { folderPath },
-          "VaultClient.listSecretsInFolder: folder empty or not found",
-        );
-        return [];
-      }
-
-      this.handleVaultError(error, "listSecretsInFolder", { folderPath });
-    }
   }
 
   /**
@@ -136,7 +77,7 @@ export class VaultClient {
     }
 
     try {
-      const vaultResponse = await this.executeWithK8sTokenRefresh(
+      const vaultResponse = await this.executeWithTokenRefresh(
         () => this.client.read(vaultPath),
         "getSecretFromPath",
       );
@@ -149,78 +90,14 @@ export class VaultClient {
 
       return secretData;
     } catch (error) {
-      this.handleVaultError(error, "getSecretFromPath", { vaultPath });
-    }
-  }
-
-  /**
-   * Check connectivity to a Vault folder path.
-   * Returns connection status and secret count.
-   */
-  async checkFolderConnectivity(
-    folderPath: string,
-  ): Promise<VaultFolderConnectivityResult> {
-    logger.debug(
-      { folderPath },
-      "VaultClient.checkFolderConnectivity: checking connectivity",
-    );
-
-    try {
-      await this.ensureInitialized();
-    } catch (error) {
-      const errorMessage = extractVaultErrorMessage(error);
-      return {
-        connected: false,
-        secretCount: 0,
-        error: `Authentication failed: ${errorMessage}`,
-      };
-    }
-
-    const listPath = this.getListPath(folderPath);
-
-    try {
-      const result = await this.executeWithK8sTokenRefresh(
-        () => this.client.list(listPath),
-        "checkFolderConnectivity",
-      );
-      const keys = (result?.data?.keys as string[] | undefined) ?? [];
-      const secretCount = keys.filter((key) => !key.endsWith("/")).length;
-
-      logger.info(
-        { folderPath, secretCount },
-        "VaultClient.checkFolderConnectivity: connected",
-      );
-
-      return {
-        connected: true,
-        secretCount,
-      };
-    } catch (error) {
       const vaultError = error as { response?: { statusCode?: number } };
-
-      // 404 means path exists but is empty - still connected
       if (vaultError.response?.statusCode === 404) {
-        logger.info(
-          { folderPath },
-          "VaultClient.checkFolderConnectivity: connected (empty folder)",
+        throw new ApiError(
+          404,
+          "Vault secret not found. Check the selected secret path.",
         );
-        return {
-          connected: true,
-          secretCount: 0,
-        };
       }
-
-      const errorMessage = extractVaultErrorMessage(error);
-      logger.warn(
-        { folderPath, error: errorMessage },
-        "VaultClient.checkFolderConnectivity: failed",
-      );
-
-      return {
-        connected: false,
-        secretCount: 0,
-        error: errorMessage,
-      };
+      this.handleVaultError(error, "getSecretFromPath", { vaultPath });
     }
   }
 
@@ -245,7 +122,13 @@ export class VaultClient {
       this.initialized = true;
     } catch (error) {
       logger.error({ error }, "VaultClient: initialization failed");
-      throw new ApiError(500, extractVaultErrorMessage(error));
+      const apiError = new ApiError(
+        503,
+        extractVaultErrorMessage(error),
+        SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
+      );
+      apiError.cause = error;
+      throw apiError;
     }
   }
 
@@ -263,7 +146,13 @@ export class VaultClient {
       throw error;
     }
 
-    throw new ApiError(500, extractVaultErrorMessage(error));
+    const apiError = new ApiError(
+      503,
+      extractVaultErrorMessage(error),
+      SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
+    );
+    apiError.cause = error;
+    throw apiError;
   }
 
   /**
@@ -280,51 +169,51 @@ export class VaultClient {
   }
 
   /**
-   * Write data to a Vault path with auth and K8s token refresh.
+   * Write data to a Vault path with auth and token refresh.
    */
   protected async writeToPath(
     path: string,
     payload: Record<string, unknown>,
   ): Promise<void> {
     await this.ensureInitialized();
-    await this.executeWithK8sTokenRefresh(
+    await this.executeWithTokenRefresh(
       () => this.client.write(path, payload),
       "writeToPath",
     );
   }
 
   /**
-   * Delete a secret at a Vault path with auth and K8s token refresh.
+   * Delete a secret at a Vault path with auth and token refresh.
    */
   protected async deleteAtPath(path: string): Promise<void> {
     await this.ensureInitialized();
-    await this.executeWithK8sTokenRefresh(
+    await this.executeWithTokenRefresh(
       () => this.client.delete(path),
       "deleteAtPath",
     );
   }
 
   /**
-   * Read a secret from a Vault path with auth and K8s token refresh.
+   * Read a secret from a Vault path with auth and token refresh.
    */
   protected async readFromPath(
     path: string,
   ): Promise<{ data: Record<string, unknown> }> {
     await this.ensureInitialized();
-    return await this.executeWithK8sTokenRefresh(
+    return await this.executeWithTokenRefresh(
       () => this.client.read(path),
       "readFromPath",
     );
   }
 
   /**
-   * List keys at a Vault path with auth and K8s token refresh.
+   * List keys at a Vault path with auth and token refresh.
    * Returns an empty array if the path does not exist (404).
    */
   protected async listKeysAtPath(path: string): Promise<string[]> {
     await this.ensureInitialized();
     try {
-      const result = await this.executeWithK8sTokenRefresh(
+      const result = await this.executeWithTokenRefresh(
         () => this.client.list(path),
         "listKeysAtPath",
       );
@@ -342,13 +231,6 @@ export class VaultClient {
    * Get the list path for a folder based on KV version.
    * KV v2 requires using the metadata path for list operations.
    */
-  protected getListPath(folderPath: string): string {
-    if (this.config.kvVersion === "1") {
-      return folderPath;
-    }
-    // For KV v2, replace /data/ with /metadata/ in the path
-    return folderPath.replace("/data/", "/metadata/");
-  }
 
   /**
    * Extract secret data from Vault read response based on KV version.
@@ -369,36 +251,37 @@ export class VaultClient {
   // ============================================================
 
   /**
-   * Check if an error is a 4xx HTTP error from Vault
+   * Check whether refreshing a login-issued token could recover the request.
    */
-  private isVault4xxError(error: unknown): boolean {
+  private isVaultAuthenticationError(error: unknown): boolean {
     const vaultError = error as { response?: { statusCode?: number } };
     const statusCode = vaultError.response?.statusCode;
-    return statusCode !== undefined && statusCode >= 400 && statusCode < 500;
+    return statusCode === 401 || statusCode === 403;
   }
 
   /**
-   * Execute a Vault operation with automatic token refresh for K8s auth.
-   * If a 4xx error occurs and K8s auth is used, re-authenticate and retry once.
+   * Execute a Vault operation with automatic token refresh.
+   * If a 401/403 error occurs under an auth method that can mint a fresh client
+   * token (Kubernetes or AWS IAM login), re-authenticate and retry once.
+   * Static token auth has nothing to refresh, so its errors propagate as-is.
    */
-  private async executeWithK8sTokenRefresh<T>(
+  private async executeWithTokenRefresh<T>(
     operation: () => Promise<T>,
     operationName: string,
   ): Promise<T> {
     try {
       return await operation();
     } catch (error) {
-      // Only retry for K8s auth method and 4xx errors
-      if (
-        this.config.authMethod !== "kubernetes" ||
-        !this.isVault4xxError(error)
-      ) {
+      const canReauthenticate =
+        this.config.authMethod === "kubernetes" ||
+        this.config.authMethod === "aws";
+      if (!canReauthenticate || !this.isVaultAuthenticationError(error)) {
         throw error;
       }
 
       logger.info(
-        { operationName },
-        "VaultClient: received 4xx error with K8s auth, re-authenticating",
+        { operationName, authMethod: this.config.authMethod },
+        "VaultClient: authentication rejected, re-authenticating",
       );
 
       // Reset initialization state and re-authenticate
@@ -408,7 +291,7 @@ export class VaultClient {
       } catch (authError) {
         logger.error(
           { authError, operationName },
-          "VaultClient: re-authentication failed after 4xx error",
+          "VaultClient: re-authentication failed",
         );
         throw authError;
       }
@@ -443,7 +326,9 @@ export class VaultClient {
         { error, tokenPath, role: this.config.k8sRole },
         "VaultClient: Kubernetes authentication failed",
       );
-      throw new ApiError(500, extractVaultErrorMessage(error));
+      // Throw raw (like loginWithAws): ensureInitialized owns the single
+      // ApiError wrap, so wrapping here would only bury the Vault detail.
+      throw error;
     }
   }
 

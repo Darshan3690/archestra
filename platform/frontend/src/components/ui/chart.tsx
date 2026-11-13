@@ -3,7 +3,7 @@
 import * as React from "react";
 import * as RechartsPrimitive from "recharts";
 
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/utils/tailwind";
 
 // Format: { THEME_NAME: CSS_SELECTOR }
 const THEMES = { light: "", dark: ".dark" } as const;
@@ -55,7 +55,7 @@ function ChartContainer({
         data-slot="chart"
         data-chart={chartId}
         className={cn(
-          "[&_.recharts-cartesian-axis-tick_text]:fill-muted-foreground [&_.recharts-cartesian-grid_line[stroke='#ccc']]:stroke-border/50 [&_.recharts-curve.recharts-tooltip-cursor]:stroke-border [&_.recharts-polar-grid_[stroke='#ccc']]:stroke-border [&_.recharts-radial-bar-background-sector]:fill-muted [&_.recharts-rectangle.recharts-tooltip-cursor]:fill-muted [&_.recharts-reference-line_[stroke='#ccc']]:stroke-border flex aspect-video justify-center text-xs [&_.recharts-dot[stroke='#fff']]:stroke-transparent [&_.recharts-layer]:outline-hidden [&_.recharts-sector]:outline-hidden [&_.recharts-sector[stroke='#fff']]:stroke-transparent [&_.recharts-surface]:outline-hidden",
+          "[&_.recharts-cartesian-axis-tick_text]:fill-muted-foreground [&_.recharts-cartesian-grid_line[stroke='#ccc']]:stroke-border/50 [&_.recharts-curve.recharts-tooltip-cursor]:stroke-border [&_.recharts-polar-grid_[stroke='#ccc']]:stroke-border [&_.recharts-radial-bar-background-sector]:fill-muted [&_.recharts-rectangle.recharts-tooltip-cursor]:fill-muted [&_.recharts-reference-line_[stroke='#ccc']]:stroke-border flex aspect-video justify-center text-xs [&_.recharts-dot[stroke='#fff']]:stroke-transparent [&_.recharts-layer]:outline-hidden [&_.recharts-sector]:outline-hidden [&_.recharts-sector[stroke='#fff']]:stroke-transparent [&_.recharts-surface]:outline-hidden [&_.recharts-surface_[tabindex='-1']:focus:not(:focus-visible)]:outline-none",
           className,
         )}
         {...props}
@@ -318,7 +318,12 @@ function ChartLegendContent({
   return (
     <div
       className={cn(
-        "flex items-center justify-center gap-4",
+        // `flex-wrap` and the shrinkable items below are what keep a legend
+        // inside its chart. Recharts sizes the legend wrapper to the chart
+        // width, so a single centred row of long series names (model ids such
+        // as "vendor/some-long-model-name") spills past *both* edges of the
+        // card and off the viewport on a phone.
+        "flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5",
         verticalAlign === "top" ? "pb-3" : "pt-3",
         className,
       )}
@@ -333,7 +338,10 @@ function ChartLegendContent({
             <div
               key={item.value}
               className={cn(
-                "[&>svg]:text-muted-foreground flex items-center gap-1.5 [&>svg]:h-3 [&>svg]:w-3",
+                // `min-w-0` + `max-w-full` let an item narrower than its own
+                // label shrink instead of overflowing the row, so a name too
+                // long for one line wraps rather than being clipped.
+                "[&>svg]:text-muted-foreground flex min-w-0 max-w-full items-center gap-1.5 [&>svg]:h-3 [&>svg]:w-3",
               )}
             >
               {itemConfig?.icon && !hideIcon ? (
@@ -346,7 +354,7 @@ function ChartLegendContent({
                   }}
                 />
               )}
-              {itemConfig?.label}
+              <span className="min-w-0 break-words">{itemConfig?.label}</span>
             </div>
           );
         })}

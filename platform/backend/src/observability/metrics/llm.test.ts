@@ -27,14 +27,18 @@ vi.mock("prom-client", () => {
     },
   };
 });
+vi.mock("@/logging");
 
+import logger from "@/logging";
 import {
   getObservableFetch,
   getObservableGenAI,
   initializeMetrics,
   reportBlockedTools,
+  reportLLMCacheCost,
   reportLLMCost,
   reportLLMTokens,
+  reportRequestDuration,
   reportTimeToFirstToken,
   reportTokensPerSecond,
 } from "./llm";
@@ -50,34 +54,32 @@ describe("getObservableFetch", () => {
   });
 
   test("records duration and tokens on successful request", async () => {
-    const mockResponse = {
-      ok: true,
-      status: 200,
-      headers: new Headers({ "content-type": "application/json" }),
-      clone: () => ({
-        json: async () => ({
-          usage: { prompt_tokens: 100, completion_tokens: 50 },
-          model: "gpt-4",
-        }),
-      }),
-    } as Response;
+    const mockResponse = jsonResponse({
+      usage: { prompt_tokens: 100, completion_tokens: 50 },
+      model: "gpt-4",
+    });
 
     globalThis.fetch = vi.fn().mockResolvedValue(mockResponse);
 
     const observableFetch = getObservableFetch("openai", testAgent, "api");
 
-    await observableFetch("https://api.openai.com/v1/chat", {
+    const response = await observableFetch("https://api.openai.com/v1/chat", {
       method: "POST",
       body: JSON.stringify({ model: "gpt-4" }),
+    });
+    // Token extraction consumes the body once; the SDK still reads all of it.
+    expect(await response.json()).toEqual({
+      usage: { prompt_tokens: 100, completion_tokens: 50 },
+      model: "gpt-4",
     });
 
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
         provider: "openai",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "gpt-4",
         status_code: "200",
@@ -89,10 +91,10 @@ describe("getObservableFetch", () => {
     expect(counterInc).toHaveBeenCalledWith({
       labels: {
         provider: "openai",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "gpt-4",
         type: "input",
@@ -104,10 +106,10 @@ describe("getObservableFetch", () => {
     expect(counterInc).toHaveBeenCalledWith({
       labels: {
         provider: "openai",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "gpt-4",
         type: "output",
@@ -116,6 +118,107 @@ describe("getObservableFetch", () => {
       exemplarLabels: expect.any(Object),
     });
   });
+
+  test("records cache tokens on a non-streaming response with cached prompt", async () => {
+    const mockResponse = jsonResponse({
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 50,
+        prompt_tokens_details: { cached_tokens: 30 },
+      },
+      model: "gpt-4",
+    });
+
+    globalThis.fetch = vi.fn().mockResolvedValue(mockResponse);
+
+    const observableFetch = getObservableFetch("openai", testAgent, "api");
+    await observableFetch("https://api.openai.com/v1/chat", { method: "POST" });
+
+    // cached_tokens (30) is a subset of prompt_tokens, so uncached input = 70
+    // and the cache counter records the 30 reads with cache_type=read.
+    expect(counterInc).toHaveBeenCalledWith({
+      labels: {
+        provider: "openai",
+        agent_id: testAgent.id,
+        agent_name: testAgent.name,
+        agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
+        source: "api",
+        model: "gpt-4",
+        type: "input",
+      },
+      value: 70,
+      exemplarLabels: expect.any(Object),
+    });
+    expect(counterInc).toHaveBeenCalledWith({
+      labels: {
+        provider: "openai",
+        agent_id: testAgent.id,
+        agent_name: testAgent.name,
+        agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
+        source: "api",
+        model: "gpt-4",
+        cache_type: "read",
+      },
+      value: 30,
+      exemplarLabels: expect.any(Object),
+    });
+  });
+
+  // `openai`, `azure` and `perplexity` each serve two wire shapes, and the
+  // Responses one names its counts `input_tokens`/`output_tokens`. Read with
+  // the chat-completions extractor, `prompt_tokens` is undefined, the uncached
+  // subtraction yields NaN, and the reporter's falsy guard then drops the turn
+  // from the token metric altogether — silently, since nothing is ever wrong,
+  // only missing. So every provider that serves both shapes must sniff.
+  for (const provider of ["openai", "azure", "perplexity"] as const) {
+    test(`${provider}: counts tokens on a Responses-shaped body`, async () => {
+      const mockResponse = jsonResponse({
+        usage: {
+          input_tokens: 4321,
+          input_tokens_details: { cached_tokens: 4000 },
+          output_tokens: 77,
+          output_tokens_details: { reasoning_tokens: 11 },
+          total_tokens: 4398,
+        },
+        model: "gpt-4o",
+      });
+
+      globalThis.fetch = vi.fn().mockResolvedValue(mockResponse);
+
+      const observableFetch = getObservableFetch(provider, testAgent, "api");
+      await observableFetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+      });
+
+      const labels = {
+        provider,
+        agent_id: testAgent.id,
+        agent_name: testAgent.name,
+        agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
+        source: "api",
+        model: "gpt-4o",
+      };
+      // Cached reads are a subset of input_tokens, so uncached input = 321.
+      expect(counterInc).toHaveBeenCalledWith({
+        labels: { ...labels, type: "input" },
+        value: 321,
+        exemplarLabels: expect.any(Object),
+      });
+      expect(counterInc).toHaveBeenCalledWith({
+        labels: { ...labels, type: "output" },
+        value: 77,
+        exemplarLabels: expect.any(Object),
+      });
+      expect(counterInc).toHaveBeenCalledWith({
+        labels: { ...labels, cache_type: "read" },
+        value: 4000,
+        exemplarLabels: expect.any(Object),
+      });
+    });
+  }
 
   test("records duration with 4xx status code", async () => {
     const mockResponse = {
@@ -135,10 +238,10 @@ describe("getObservableFetch", () => {
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
         provider: "anthropic",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "unknown",
         status_code: "400",
@@ -166,10 +269,10 @@ describe("getObservableFetch", () => {
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
         provider: "openai",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "unknown",
         status_code: "503",
@@ -191,10 +294,10 @@ describe("getObservableFetch", () => {
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
         provider: "openai",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "unknown",
         status_code: "0",
@@ -204,17 +307,32 @@ describe("getObservableFetch", () => {
     });
   });
 
+  test("handler-owned token reporting retains HTTP duration without duplicating tokens", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(
+            JSON.stringify({ usage: { input_tokens: 200, output_tokens: 75 } }),
+            { headers: { "content-type": "application/json" } },
+          ),
+        ),
+    );
+    const observableFetch = getObservableFetch("anthropic", testAgent, "api", {
+      reportTokens: false,
+    });
+    await observableFetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+    });
+    expect(histogramObserve).toHaveBeenCalledTimes(1);
+    expect(counterInc).not.toHaveBeenCalled();
+  });
+
   test("records tokens for Anthropic response format", async () => {
-    const mockResponse = {
-      ok: true,
-      status: 200,
-      headers: new Headers({ "content-type": "application/json" }),
-      clone: () => ({
-        json: async () => ({
-          usage: { input_tokens: 200, output_tokens: 75 },
-        }),
-      }),
-    } as Response;
+    const mockResponse = jsonResponse({
+      usage: { input_tokens: 200, output_tokens: 75 },
+    });
 
     globalThis.fetch = vi.fn().mockResolvedValue(mockResponse);
 
@@ -227,10 +345,10 @@ describe("getObservableFetch", () => {
     expect(counterInc).toHaveBeenCalledWith({
       labels: expect.objectContaining({
         provider: "anthropic",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "unknown",
         type: "input",
@@ -242,10 +360,10 @@ describe("getObservableFetch", () => {
     expect(counterInc).toHaveBeenCalledWith({
       labels: expect.objectContaining({
         provider: "anthropic",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "unknown",
         type: "output",
@@ -335,10 +453,10 @@ describe("getObservableGenAI", () => {
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
         provider: "gemini",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "unknown",
         status_code: "200",
@@ -350,10 +468,10 @@ describe("getObservableGenAI", () => {
     expect(counterInc).toHaveBeenCalledWith({
       labels: expect.objectContaining({
         provider: "gemini",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "unknown",
         type: "input",
@@ -365,10 +483,10 @@ describe("getObservableGenAI", () => {
     expect(counterInc).toHaveBeenCalledWith({
       labels: expect.objectContaining({
         provider: "gemini",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "unknown",
         type: "output",
@@ -393,10 +511,10 @@ describe("getObservableGenAI", () => {
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
         provider: "gemini",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "unknown",
         status_code: "400",
@@ -419,10 +537,10 @@ describe("getObservableGenAI", () => {
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
         provider: "gemini",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "unknown",
         status_code: "0",
@@ -512,10 +630,10 @@ describe("getObservableGenAI", () => {
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
         provider: "gemini",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "gemini-2.5-pro",
         status_code: "200",
@@ -546,10 +664,10 @@ describe("getObservableGenAI", () => {
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
         provider: "gemini",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "unknown",
         status_code: "429",
@@ -670,16 +788,49 @@ describe("reportLLMCost", () => {
     initializeMetrics([]);
   });
 
-  test("records cost with model", () => {
-    reportLLMCost("openai", testAgent, "gpt-4", 0.05, "api");
+  test("zero settled cost is quiet while missing cost warns once per model", () => {
+    const params = {
+      provider: "openai" as const,
+      profile: testAgent,
+      model: "gpt-4",
+      source: "api" as const,
+      billingMode: "metered" as const,
+    };
+    reportLLMCost({ ...params, cost: 0 });
+    expect(counterInc).not.toHaveBeenCalled();
+    expect(logger.warn).not.toHaveBeenCalled();
+    reportLLMCost({ ...params, cost: undefined });
+    reportLLMCost({ ...params, cost: undefined });
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      { provider: "openai", model: "gpt-4" },
+      "Cost not specified when reporting",
+    );
+    reportLLMCost({ ...params, model: "gpt-5", cost: undefined });
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+    expect(counterInc).not.toHaveBeenCalled();
+  });
+
+  test("records cost with model and metered billing mode", () => {
+    reportLLMCost({
+      provider: "openai",
+      profile: testAgent,
+      model: "gpt-4",
+      cost: 0.05,
+      source: "api",
+      billingMode: "metered",
+      authMethod: "virtual_key",
+    });
 
     expect(counterInc).toHaveBeenCalledWith({
       labels: {
         provider: "openai",
-        external_agent_id: "",
+        billing_mode: "metered",
+        auth_method: "virtual_key",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "gpt-4",
       },
@@ -688,38 +839,29 @@ describe("reportLLMCost", () => {
     });
   });
 
-  test("records cost without model", () => {
-    reportLLMCost("anthropic", testAgent, "unknown", 0.02, "api");
+  test("records cost without model, labeling subscription billing mode", () => {
+    reportLLMCost({
+      provider: "anthropic",
+      profile: testAgent,
+      model: "unknown",
+      cost: 0.02,
+      source: "api",
+      billingMode: "subscription",
+    });
 
     expect(counterInc).toHaveBeenCalledWith({
       labels: {
         provider: "anthropic",
-        external_agent_id: "",
+        billing_mode: "subscription",
+        auth_method: "unknown",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "unknown",
       },
       value: 0.02,
-      exemplarLabels: expect.any(Object),
-    });
-  });
-
-  test("records cost with external agent id", () => {
-    reportLLMCost("openai", testAgent, "gpt-4", 0.05, "api", "external-123");
-
-    expect(counterInc).toHaveBeenCalledWith({
-      labels: {
-        provider: "openai",
-        external_agent_id: "external-123",
-        agent_id: testAgent.id,
-        agent_name: testAgent.name,
-        agent_type: testAgent.agentType,
-        source: "api",
-        model: "gpt-4",
-      },
-      value: 0.05,
       exemplarLabels: expect.any(Object),
     });
   });
@@ -746,10 +888,10 @@ describe("reportLLMTokens with model", () => {
     expect(counterInc).toHaveBeenCalledWith({
       labels: {
         provider: "openai",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "gpt-4",
         type: "input",
@@ -761,51 +903,10 @@ describe("reportLLMTokens with model", () => {
     expect(counterInc).toHaveBeenCalledWith({
       labels: {
         provider: "openai",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
-        source: "api",
-        model: "gpt-4",
-        type: "output",
-      },
-      value: 50,
-      exemplarLabels: expect.any(Object),
-    });
-  });
-
-  test("records tokens with external agent id", () => {
-    reportLLMTokens(
-      "openai",
-      testAgent,
-      { input: 100, output: 50 },
-      "gpt-4",
-      "api",
-      "external-456",
-    );
-
-    expect(counterInc).toHaveBeenCalledWith({
-      labels: {
-        provider: "openai",
-        external_agent_id: "external-456",
-        agent_id: testAgent.id,
-        agent_name: testAgent.name,
-        agent_type: testAgent.agentType,
-        source: "api",
-        model: "gpt-4",
-        type: "input",
-      },
-      value: 100,
-      exemplarLabels: expect.any(Object),
-    });
-
-    expect(counterInc).toHaveBeenCalledWith({
-      labels: {
-        provider: "openai",
-        external_agent_id: "external-456",
-        agent_id: testAgent.id,
-        agent_name: testAgent.name,
-        agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "gpt-4",
         type: "output",
@@ -831,28 +932,10 @@ describe("reportBlockedTools with model", () => {
     expect(counterInc).toHaveBeenCalledWith({
       labels: {
         provider: "openai",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
-        source: "api",
-        model: "gpt-4",
-      },
-      value: 3,
-      exemplarLabels: expect.any(Object),
-    });
-  });
-
-  test("records blocked tools with external agent id", () => {
-    reportBlockedTools("openai", testAgent, 3, "gpt-4", "api", "external-789");
-
-    expect(counterInc).toHaveBeenCalledWith({
-      labels: {
-        provider: "openai",
-        external_agent_id: "external-789",
-        agent_id: testAgent.id,
-        agent_name: testAgent.name,
-        agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "gpt-4",
       },
@@ -877,10 +960,10 @@ describe("reportTimeToFirstToken", () => {
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
         provider: "openai",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "gpt-4",
       },
@@ -895,10 +978,10 @@ describe("reportTimeToFirstToken", () => {
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
         provider: "anthropic",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "unknown",
       },
@@ -920,39 +1003,14 @@ describe("reportTimeToFirstToken", () => {
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
         provider: "gemini",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "gemini-pro",
       },
       value: 0.3,
-      exemplarLabels: expect.any(Object),
-    });
-  });
-
-  test("records TTFT with external agent id", () => {
-    reportTimeToFirstToken(
-      "openai",
-      testAgent,
-      "gpt-4",
-      0.5,
-      "api",
-      "external-ttft-123",
-    );
-
-    expect(histogramObserve).toHaveBeenCalledWith({
-      labels: {
-        provider: "openai",
-        external_agent_id: "external-ttft-123",
-        agent_id: testAgent.id,
-        agent_name: testAgent.name,
-        agent_type: testAgent.agentType,
-        source: "api",
-        model: "gpt-4",
-      },
-      value: 0.5,
       exemplarLabels: expect.any(Object),
     });
   });
@@ -974,10 +1032,10 @@ describe("reportTokensPerSecond", () => {
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
         provider: "openai",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "gpt-4",
       },
@@ -993,10 +1051,10 @@ describe("reportTokensPerSecond", () => {
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
         provider: "anthropic",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "unknown",
       },
@@ -1030,10 +1088,10 @@ describe("reportTokensPerSecond", () => {
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
         provider: "gemini",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "gemini-pro",
       },
@@ -1049,10 +1107,10 @@ describe("reportTokensPerSecond", () => {
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
         provider: "anthropic",
-        external_agent_id: "",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
         model: "claude-3",
       },
@@ -1060,31 +1118,222 @@ describe("reportTokensPerSecond", () => {
       exemplarLabels: expect.any(Object),
     });
   });
+});
 
-  test("records tokens per second with external agent id", () => {
-    // 100 tokens in 2 seconds = 50 tokens/sec
-    reportTokensPerSecond(
-      "openai",
+describe("reportRequestDuration", () => {
+  let testAgent: Agent;
+
+  beforeEach(async ({ makeAgent }) => {
+    vi.clearAllMocks();
+    testAgent = await makeAgent();
+    initializeMetrics([]);
+  });
+
+  test("records duration with a success status code", () => {
+    reportRequestDuration(
+      "bedrock",
       testAgent,
-      "gpt-4",
-      100,
-      2,
+      "claude-sonnet",
+      1.5,
+      "200",
       "api",
-      "external-tps-123",
     );
 
     expect(histogramObserve).toHaveBeenCalledWith({
       labels: {
-        provider: "openai",
-        external_agent_id: "external-tps-123",
+        provider: "bedrock",
         agent_id: testAgent.id,
         agent_name: testAgent.name,
         agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
         source: "api",
-        model: "gpt-4",
+        model: "claude-sonnet",
+        status_code: "200",
       },
-      value: 50,
+      value: 1.5,
+      exemplarLabels: expect.any(Object),
+    });
+  });
+
+  test("records duration with an error status code", () => {
+    reportRequestDuration(
+      "bedrock",
+      testAgent,
+      "claude-sonnet",
+      0.2,
+      "400",
+      "chat",
+    );
+
+    expect(histogramObserve).toHaveBeenCalledWith({
+      labels: {
+        provider: "bedrock",
+        agent_id: testAgent.id,
+        agent_name: testAgent.name,
+        agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
+        source: "chat",
+        model: "claude-sonnet",
+        status_code: "400",
+      },
+      value: 0.2,
+      exemplarLabels: expect.any(Object),
+    });
+  });
+
+  test("falls back to unknown model label", () => {
+    reportRequestDuration("bedrock", testAgent, "unknown", 3, "0", "api");
+
+    expect(histogramObserve).toHaveBeenCalledWith({
+      labels: expect.objectContaining({
+        provider: "bedrock",
+        model: "unknown",
+        status_code: "0",
+      }),
+      value: 3,
       exemplarLabels: expect.any(Object),
     });
   });
 });
+
+describe("reportLLMTokens cache tokens", () => {
+  let testAgent: Agent;
+
+  beforeEach(async ({ makeAgent }) => {
+    vi.clearAllMocks();
+    testAgent = await makeAgent();
+    initializeMetrics([]);
+  });
+
+  test("emits llm_cache_tokens_total with read and write cache_type", () => {
+    reportLLMTokens(
+      "anthropic",
+      testAgent,
+      { input: 5, output: 10, cacheRead: 1000, cacheWrite: 200 },
+      "claude-sonnet",
+      "api",
+    );
+
+    expect(counterInc).toHaveBeenCalledWith({
+      labels: {
+        provider: "anthropic",
+        agent_id: testAgent.id,
+        agent_name: testAgent.name,
+        agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
+        source: "api",
+        model: "claude-sonnet",
+        cache_type: "read",
+      },
+      value: 1000,
+      exemplarLabels: expect.any(Object),
+    });
+    expect(counterInc).toHaveBeenCalledWith({
+      labels: {
+        provider: "anthropic",
+        agent_id: testAgent.id,
+        agent_name: testAgent.name,
+        agent_type: testAgent.agentType,
+        organization_id: testAgent.organizationId,
+        source: "api",
+        model: "claude-sonnet",
+        cache_type: "write",
+      },
+      value: 200,
+      exemplarLabels: expect.any(Object),
+    });
+  });
+
+  test("does not emit cache tokens when there is no cache usage", () => {
+    reportLLMTokens(
+      "anthropic",
+      testAgent,
+      { input: 5, output: 10, cacheRead: 0, cacheWrite: 0 },
+      "claude-sonnet",
+      "api",
+    );
+
+    expect(counterInc).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        labels: expect.objectContaining({ cache_type: expect.any(String) }),
+      }),
+    );
+  });
+});
+
+describe("reportLLMCacheCost", () => {
+  let testAgent: Agent;
+
+  beforeEach(async ({ makeAgent }) => {
+    vi.clearAllMocks();
+    testAgent = await makeAgent();
+    initializeMetrics([]);
+  });
+
+  test("emits cache cost and gross read savings", () => {
+    reportLLMCacheCost(
+      "anthropic",
+      testAgent,
+      "claude-sonnet",
+      { cacheCost: 0.012, cacheReadSavings: 0.09 },
+      "api",
+    );
+
+    const expectedLabels = {
+      provider: "anthropic",
+      agent_id: testAgent.id,
+      agent_name: testAgent.name,
+      agent_type: testAgent.agentType,
+      organization_id: testAgent.organizationId,
+      source: "api",
+      model: "claude-sonnet",
+    };
+
+    expect(counterInc).toHaveBeenCalledWith({
+      labels: expectedLabels,
+      value: 0.012,
+      exemplarLabels: expect.any(Object),
+    });
+    expect(counterInc).toHaveBeenCalledWith({
+      labels: expectedLabels,
+      value: 0.09,
+      exemplarLabels: expect.any(Object),
+    });
+  });
+
+  test("does not emit when cost and savings are absent or non-positive", () => {
+    reportLLMCacheCost(
+      "openai",
+      testAgent,
+      "gpt-4",
+      { cacheCost: 0, cacheReadSavings: undefined },
+      "api",
+    );
+
+    expect(counterInc).not.toHaveBeenCalled();
+  });
+
+  test("emits only savings when there is no cache cost", () => {
+    reportLLMCacheCost(
+      "anthropic",
+      testAgent,
+      "claude-sonnet",
+      { cacheCost: undefined, cacheReadSavings: 0.05 },
+      "api",
+    );
+
+    expect(counterInc).toHaveBeenCalledTimes(1);
+    expect(counterInc).toHaveBeenCalledWith({
+      labels: expect.objectContaining({ provider: "anthropic" }),
+      value: 0.05,
+      exemplarLabels: expect.any(Object),
+    });
+  });
+});
+
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}

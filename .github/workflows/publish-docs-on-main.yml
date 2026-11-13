@@ -1,0 +1,20 @@
+name: Publish Docs on Main
+
+# Refresh archestra.ai on every main commit, including docs and catalog changes.
+on:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+jobs:
+  trigger-website-deploy:
+    name: Publish Docs to archestra.ai
+    permissions:
+      contents: read
+    uses: $/.github/workflows/trigger-website-deploy.yml
+    # Passed by name so the website-deploy environment can supply the values.
+    secrets:
+      ARCHESTRA_WEBSITE_DEPLOY_GITHUB_APP_ID: ${{ secrets.ARCHESTRA_WEBSITE_DEPLOY_GITHUB_APP_ID }}
+      ARCHESTRA_WEBSITE_DEPLOY_GITHUB_APP_PRIVATE_KEY: ${{ secrets.ARCHESTRA_WEBSITE_DEPLOY_GITHUB_APP_PRIVATE_KEY }}

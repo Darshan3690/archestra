@@ -1,0 +1,1153 @@
+import { randomUUID } from "node:crypto";
+import {
+  calculatePaginationMeta,
+  createPaginatedResponseSchema,
+  PaginationQuerySchema,
+  parseLabelsParam,
+  ResourceAccessQuerySchema,
+  ResourceOwnerQuerySchema,
+  ResourcePermissionGrantSchema,
+  ResourceSharedWithQuerySchema,
+  RouteId,
+} from "@archestra/shared";
+import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
+import { z } from "zod";
+import config from "@/config";
+import { extractText } from "@/knowledge-base/file-upload/extract";
+import {
+  hashFileContent,
+  indexFilesIntoKnowledgeBase,
+} from "@/knowledge-base/file-upload/index-file";
+import {
+  ConversationAttachmentModel,
+  ConversationModel,
+  CreatedByModel,
+  KbConnectorDocumentCountModel,
+  KbDirectoryModel,
+  KbFileLabelModel,
+  KbFileModel,
+  KnowledgeBaseModel,
+  lookupCreator,
+  OrganizationModel,
+  TeamModel,
+} from "@/models";
+import type { KbFileViewer } from "@/models/kb-file";
+import ResourcePermissionSubjectModel from "@/models/resource-permission-subject";
+import { resolveDefaultEnvironmentForNewResource } from "@/services/environments/environment";
+import {
+  findAccessibleKnowledgeBase,
+  findAccessibleKnowledgeBasesForFiles,
+} from "@/services/knowledge-base-access";
+import { upsertKnowledgeFile } from "@/services/knowledge-file-ingestion";
+import { ResourcePermissions } from "@/services/resource-permissions";
+import { readRowBytes } from "@/skills-sandbox/file-storage";
+import {
+  ApiError,
+  constructResponseSchema,
+  KbDirectoryWithTeamsSchema,
+  KbFileSchema,
+  LabelWithDetailsSchema,
+} from "@/types";
+import { isUniqueConstraintError } from "@/utils/db";
+import {
+  BulkDeleteBodySchema,
+  BulkOutcomeSchema,
+  runBulk,
+} from "../bulk-route";
+import {
+  isSafeInlineMimeType,
+  sanitizeAttachmentContentType,
+} from "../chat/attachment-content-type";
+import { registerEntityLabelRoutes } from "../entity-labels";
+
+const FileParamsSchema = z.object({ fileId: z.string().uuid() });
+const DirectoryParamsSchema = z.object({ directoryId: z.string().uuid() });
+
+const knowledgeFileRoutes: FastifyPluginAsyncZod = async (fastify) => {
+  registerEntityLabelRoutes(fastify, {
+    basePath: "/api/knowledge-files",
+    tag: "Knowledge Files",
+    entityNamePlural: "knowledge files",
+    model: KbFileLabelModel,
+    keysOperationId: RouteId.GetKnowledgeFileLabelKeys,
+    valuesOperationId: RouteId.GetKnowledgeFileLabelValues,
+  });
+
+  // ===== Files =====
+
+  fastify.get(
+    "/api/knowledge-files",
+    {
+      schema: {
+        operationId: RouteId.GetKnowledgeFiles,
+        description: "List documents in the knowledge file repository",
+        tags: ["Knowledge Files"],
+        querystring: PaginationQuerySchema.extend({
+          directoryId: z.string().optional(),
+          search: z.string().optional(),
+          labels: z
+            .string()
+            .optional()
+            .describe(
+              "Filter by labels. Format: key1:val1|val2;key2:val3. AND across keys, OR within values.",
+            ),
+          access: ResourceAccessQuerySchema,
+          sharedWith: ResourceSharedWithQuerySchema,
+          owner: ResourceOwnerQuerySchema,
+        }),
+        response: constructResponseSchema(
+          createPaginatedResponseSchema(KbFileSchema),
+        ),
+      },
+    },
+    async (request) => {
+      const { limit, offset, directoryId, search, labels } = request.query;
+      const viewer = await resolveViewer(request);
+      const access = await ResourcePermissionSubjectModel.resolveAccessFilter({
+        userId: request.user.id,
+        organizationId: request.organizationId,
+        relations: request.query.access,
+        sharedWith: request.query.sharedWith,
+        ownerIds: request.query.owner,
+      });
+
+      const parsedLabels = parseLabelsParam(labels);
+      const labelFilteredIds = parsedLabels
+        ? await KbFileLabelModel.getIdsMatchingLabels(parsedLabels)
+        : undefined;
+
+      const { items, total } = await KbFileModel.findPaginated({
+        organizationId: request.organizationId,
+        viewer,
+        // "root" is a distinct filter from "no filter", so it needs its own
+        // sentinel rather than an absent parameter.
+        directoryId:
+          directoryId === undefined
+            ? undefined
+            : directoryId === "root"
+              ? null
+              : directoryId,
+        search,
+        labelFilteredIds,
+        access,
+        limit,
+        offset,
+      });
+
+      const fileIds = items.map((file) => file.id);
+      const [knowledgeBases, audiences, creators, labelsByFile] =
+        await Promise.all([
+          findAccessibleKnowledgeBasesForFiles({
+            fileIds,
+            organizationId: request.organizationId,
+            userId: request.user.id,
+          }),
+          KbFileModel.findGrantedAudiences({
+            organizationId: request.organizationId,
+            fileIds,
+          }),
+          CreatedByModel.resolve(
+            items.map((file) => CreatedByModel.id(file, file.uploadedBy)),
+          ),
+          KbFileLabelModel.getLabelsForMany(fileIds),
+        ]);
+
+      return {
+        data: items.map(
+          ({
+            data: _data,
+            objectKey: _objectKey,
+            storageProvider: _provider,
+            uploadedBy,
+            ...file
+          }) => ({
+            ...file,
+            createdBy: lookupCreator(
+              creators,
+              CreatedByModel.id(file, uploadedBy),
+            ),
+            knowledgeBases: knowledgeBases.get(file.id) ?? [],
+            // Who can read the file, from its grants.
+            visibility: audiences.get(file.id)?.visibility ?? "private",
+            teamIds: audiences.get(file.id)?.teamIds ?? [],
+            labels: labelsByFile.get(file.id) ?? [],
+          }),
+        ),
+        pagination: calculatePaginationMeta(total, { limit, offset }),
+      };
+    },
+  );
+
+  fastify.post(
+    "/api/knowledge-files",
+    {
+      schema: {
+        operationId: RouteId.UploadKnowledgeFile,
+        description: "Upload a document into the knowledge file repository",
+        tags: ["Knowledge Files"],
+        // Who can read the new file is `initialGrants` alone. The retired
+        // `visibility` and `teamIds` fields are refused (strict), not dropped.
+        body: z
+          .object({
+            filename: z.string().trim().min(1).max(512),
+            mimeType: z.string().trim().min(1).max(255),
+            /** Base64, matching how chat attachments already arrive. */
+            content: z.string().min(1),
+            directoryId: z.string().uuid().nullable().default(null),
+            labels: z.array(LabelWithDetailsSchema).default([]),
+            initialGrants: z
+              .array(ResourcePermissionGrantSchema)
+              .max(200)
+              .optional(),
+          })
+          .strict(),
+        response: constructResponseSchema(KbFileSchema),
+      },
+    },
+    async ({ body, organizationId, user }) => {
+      // Checked on the encoded string BEFORE decoding: base64 inflates by ~4/3,
+      // so validating only the decoded size still lets an oversized payload be
+      // materialized in memory first.
+      const maxBytes = config.knowledgeFiles.maxUploadBytes;
+      if (
+        Buffer.byteLength(body.content, "utf-8") > Math.ceil(maxBytes * 1.4)
+      ) {
+        throw new ApiError(
+          413,
+          `"${body.filename}" is larger than the ${Math.floor(maxBytes / 1_000_000)}MB upload limit.`,
+        );
+      }
+
+      const buffer = Buffer.from(body.content, "base64");
+      if (buffer.byteLength > maxBytes) {
+        throw new ApiError(
+          413,
+          `"${body.filename}" is larger than the ${Math.floor(maxBytes / 1_000_000)}MB upload limit.`,
+        );
+      }
+
+      // Parse before storing: a file we cannot read must never reach the
+      // repository, where it would look uploaded but retrieve nothing. A
+      // scanned PDF is the exception when the organization has OCR
+      // configured — indexing transcribes it, so storing it is honest.
+      await extractText({
+        buffer,
+        filename: body.filename,
+        acceptTextlessPdf: await organizationHasOcr(organizationId),
+      });
+
+      await assertDirectoryInOrg({
+        directoryId: body.directoryId,
+        organizationId,
+      });
+
+      if (body.initialGrants?.length) {
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        await ResourcePermissions.validateInitialGrants({
+          organizationId,
+          userId: user.id,
+          resource: "knowledgeFile",
+          grants: body.initialGrants,
+          target: {
+            id: randomUUID(),
+            name: body.filename,
+            authorId: user.id,
+          },
+        });
+        // SPDX-SnippetEnd
+      }
+
+      let file: Awaited<ReturnType<typeof KbFileModel.create>>;
+      try {
+        file = await KbFileModel.create({
+          organizationId,
+          directoryId: body.directoryId,
+          filename: body.filename,
+          mimeType: body.mimeType,
+          sizeBytes: buffer.byteLength,
+          contentHash: hashFileContent(buffer),
+          data: buffer,
+          uploadedBy: user.id,
+          // SPDX-SnippetBegin
+          // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+          // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+          initialPermissionGrants: body.initialGrants ?? [],
+          // SPDX-SnippetEnd
+        });
+      } catch (error) {
+        // A repeated filename in one place is an ordinary mistake with an
+        // obvious fix; letting the raw constraint violation surface as a 500
+        // tells the user nothing about what to do.
+        if (isUniqueConstraintError(error)) {
+          throw new ApiError(
+            409,
+            `"${body.filename}" already exists ${
+              body.directoryId ? "in that directory" : "at the top level"
+            }.`,
+          );
+        }
+        throw error;
+      }
+
+      if (body.labels.length > 0) {
+        await KbFileLabelModel.syncLabels(file.id, body.labels);
+      }
+
+      const {
+        data: _data,
+        objectKey: _objectKey,
+        storageProvider: _provider,
+        uploadedBy,
+        ...rest
+      } = file;
+      return {
+        ...rest,
+        createdBy: await CreatedByModel.resolveOne(
+          CreatedByModel.id(file, uploadedBy),
+        ),
+        knowledgeBases: [],
+        ...(await grantedAudience({ organizationId, fileId: file.id })),
+        labels: await KbFileLabelModel.getLabelsFor(file.id),
+      };
+    },
+  );
+
+  fastify.put(
+    "/api/knowledge-files/:fileId/content",
+    {
+      schema: {
+        operationId: RouteId.UpsertKnowledgeFile,
+        description:
+          "Create or replace a document using a stable client-generated UUID and index it into a knowledge base. Only the uploader may replace it. Existing audiences and labels are preserved. Re-indexes all knowledge bases already linked to the file; the caller must have access to each.",
+        tags: ["Knowledge Files"],
+        params: FileParamsSchema,
+        body: z.object({
+          filename: z.string().trim().min(1).max(512),
+          mimeType: z.string().trim().min(1).max(255),
+          content: z.base64().min(1).describe("Base64-encoded file bytes"),
+          knowledgeBaseId: z.string().uuid(),
+        }),
+        response: constructResponseSchema(
+          z.object({
+            id: z.string().uuid(),
+            results: z.array(
+              z.object({
+                knowledgeBaseId: z.string().uuid(),
+                indexed: z.number(),
+                failures: z.array(
+                  z.object({ fileId: z.string(), error: z.string() }),
+                ),
+              }),
+            ),
+          }),
+        ),
+      },
+    },
+    async (request) => {
+      const result = await upsertKnowledgeFile({
+        ...request.body,
+        id: request.params.fileId,
+        organizationId: request.organizationId,
+        userId: request.user.id,
+      });
+      request.auditAfter = {
+        ...(await KbFileModel.findByIdForAudit(
+          result.id,
+          request.organizationId,
+        )),
+        results: result.results,
+      };
+      return result;
+    },
+  );
+
+  fastify.post(
+    "/api/knowledge-files/from-attachment",
+    {
+      schema: {
+        operationId: RouteId.PromoteAttachmentToKnowledgeFile,
+        description:
+          "Copy a file attached to a chat into the knowledge file repository",
+        tags: ["Knowledge Files"],
+        // Who can read the new file is `initialGrants` alone (strict body).
+        body: z
+          .object({
+            attachmentId: z.string().uuid(),
+            initialGrants: z
+              .array(ResourcePermissionGrantSchema)
+              .max(200)
+              .optional(),
+            /** Defaults to the attachment's own name. */
+            filename: z.string().trim().min(1).max(512).optional(),
+            directoryId: z.string().uuid().nullable().default(null),
+            /** Index into this knowledge base straight away, if given. */
+            knowledgeBaseId: z.string().uuid().optional(),
+          })
+          .strict(),
+        response: constructResponseSchema(KbFileSchema),
+      },
+    },
+    async ({ body, organizationId, user }) => {
+      // Metadata first, bytes second: an unauthorized request must not trigger
+      // a large bytea read before its 403 (same order as the byte endpoint).
+      const meta = await ConversationAttachmentModel.findById(
+        body.attachmentId,
+      );
+      if (!meta || meta.organizationId !== organizationId) {
+        throw new ApiError(404, "Attachment not found");
+      }
+
+      // A chat attachment is only as readable as the conversation holding it.
+      // Without this, anyone with knowledgeSource:create could copy any
+      // attachment in the organization into a repository document — and an
+      // org-wide one at that, which would publish it to everyone.
+      const conversation = await ConversationModel.findAccessibleById({
+        id: meta.conversationId,
+        userId: user.id,
+        organizationId,
+        canReadOthersViaProject: () =>
+          ResourcePermissions.allows({
+            userId: user.id,
+            organizationId: organizationId,
+            resource: "conversation",
+            scope: "*",
+            action: "read",
+          }),
+      });
+      if (!conversation) {
+        throw new ApiError(403, "No access to the owning conversation");
+      }
+
+      // An encrypted chat's attachment is sealed under a key only its browser
+      // holds. Copying it into a knowledge repository would write the opened
+      // bytes back out in plaintext, to a document other members can read and
+      // an indexer can quote — undoing the one guarantee the chat makes. The
+      // file stays reachable from the chat's own Files panel.
+      if (conversation.encryptedChat) {
+        throw new ApiError(
+          400,
+          "Files attached to an encrypted chat cannot be added to a knowledge base.",
+        );
+      }
+
+      const attachment = await ConversationAttachmentModel.findByIdWithData(
+        body.attachmentId,
+      );
+      if (!attachment) {
+        // Soft-deleted between the metadata check and the blob fetch.
+        throw new ApiError(404, "Attachment not found");
+      }
+
+      const maxBytes = config.knowledgeFiles.maxUploadBytes;
+      if (attachment.fileData.byteLength > maxBytes) {
+        throw new ApiError(
+          413,
+          `"${attachment.originalName}" is larger than the ${Math.floor(maxBytes / 1_000_000)}MB upload limit.`,
+        );
+      }
+
+      const filename = body.filename ?? attachment.originalName;
+
+      // Parsed before storing, exactly as on upload: chat accepts files the
+      // repository cannot index (an image), and one of those stored here
+      // would look indexed and retrieve nothing. A scanned PDF is storable
+      // when the organization has OCR configured — indexing transcribes it.
+      await extractText({
+        buffer: attachment.fileData,
+        filename,
+        acceptTextlessPdf: await organizationHasOcr(organizationId),
+      });
+
+      await assertDirectoryInOrg({
+        directoryId: body.directoryId,
+        organizationId,
+      });
+
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      if (body.initialGrants?.length) {
+        await ResourcePermissions.validateInitialGrants({
+          organizationId,
+          userId: user.id,
+          resource: "knowledgeFile",
+          grants: body.initialGrants,
+          target: {
+            id: randomUUID(),
+            name: filename,
+            authorId: user.id,
+          },
+        });
+      }
+      // SPDX-SnippetEnd
+
+      let file: Awaited<ReturnType<typeof KbFileModel.create>>;
+      try {
+        file = await KbFileModel.create({
+          organizationId,
+          directoryId: body.directoryId,
+          filename,
+          mimeType: attachment.mimeType,
+          sizeBytes: attachment.fileData.byteLength,
+          contentHash: attachment.contentHash,
+          data: attachment.fileData,
+          // The promoter owns the repository copy, not the original uploader:
+          // they chose its audience, and for a private one they are the only
+          // person its ACL will name.
+          uploadedBy: user.id,
+          // SPDX-SnippetBegin
+          // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+          // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+          initialPermissionGrants: body.initialGrants ?? [],
+          // SPDX-SnippetEnd
+        });
+      } catch (error) {
+        if (isUniqueConstraintError(error)) {
+          throw new ApiError(
+            409,
+            `"${filename}" already exists ${
+              body.directoryId ? "in that directory" : "at the top level"
+            }.`,
+          );
+        }
+        throw error;
+      }
+
+      const knowledgeBases: { id: string; name: string }[] = [];
+      if (body.knowledgeBaseId) {
+        const knowledgeBaseId = await assertKnowledgeBaseInOrg({
+          knowledgeBaseId: body.knowledgeBaseId,
+          userId: user.id,
+          organizationId,
+        });
+        await indexFilesIntoKnowledgeBase({
+          fileIds: [file.id],
+          knowledgeBaseId,
+          organizationId,
+          newConnectorEnvironmentId:
+            await resolveDefaultEnvironmentForNewResource({
+              organizationId,
+              userId: user.id,
+              resource: "knowledgeSource",
+            }),
+        });
+        knowledgeBases.push(
+          ...((
+            await findAccessibleKnowledgeBasesForFiles({
+              fileIds: [file.id],
+              organizationId,
+              userId: user.id,
+            })
+          ).get(file.id) ?? []),
+        );
+      }
+
+      const {
+        data: _data,
+        objectKey: _objectKey,
+        storageProvider: _provider,
+        uploadedBy,
+        ...rest
+      } = file;
+      return {
+        ...rest,
+        createdBy: await CreatedByModel.resolveOne(
+          CreatedByModel.id(file, uploadedBy),
+        ),
+        knowledgeBases,
+        ...(await grantedAudience({ organizationId, fileId: file.id })),
+        labels: [],
+      };
+    },
+  );
+
+  fastify.get(
+    "/api/knowledge-files/:fileId/content",
+    {
+      schema: {
+        operationId: RouteId.GetKnowledgeFileContent,
+        description:
+          "Stream the bytes of a repository document. Safe types render inline (PDF, images, plain text); everything else downloads.",
+        tags: ["Knowledge Files"],
+        params: FileParamsSchema,
+      },
+    },
+    async (request, reply) => {
+      const viewer = await resolveViewer(request);
+      const file = await KbFileModel.findById({
+        id: request.params.fileId,
+        organizationId: request.organizationId,
+        viewer,
+      });
+      // Retrieval ACLs are enforced at chunk-query time and do nothing here, so
+      // this read is authorized per row by `findById`'s visibility filter.
+      if (!file) throw new ApiError(404, "File not found");
+
+      const bytes = await readRowBytes(file);
+
+      // Same doctrine as the chat attachment route: the stored mime came from
+      // the uploader, so script carriers are coerced to octet-stream and only
+      // an allow-list renders inline. Inline is what makes the preview dialog
+      // work — an attachment disposition inside an iframe downloads instead of
+      // rendering.
+      const safeMime = sanitizeAttachmentContentType(file.mimeType);
+      const disposition = isSafeInlineMimeType(safeMime)
+        ? "inline"
+        : "attachment";
+      reply
+        .header("Content-Type", safeMime)
+        .header("X-Content-Type-Options", "nosniff")
+        .header(
+          "Content-Disposition",
+          // RFC 6266: an ASCII fallback plus the UTF-8 form modern clients
+          // prefer, so non-ASCII filenames survive the download intact.
+          `${disposition}; filename="${file.filename.replace(/[^\x20-\x7e]|"/g, "_")}"; filename*=UTF-8''${encodeURIComponent(file.filename)}`,
+        );
+      // `sandbox` would block Chrome's PDF viewer outright, so PDFs get a
+      // narrower policy; everything else keeps the strict one. PDF script runs
+      // inside the viewer plugin, isolated from the page and our origin.
+      if (safeMime === "application/pdf") {
+        reply.header("Content-Security-Policy", "frame-ancestors 'self'");
+      } else {
+        reply.header("Content-Security-Policy", "default-src 'none'; sandbox");
+      }
+      return reply.send(bytes);
+    },
+  );
+
+  fastify.patch(
+    "/api/knowledge-files/:fileId",
+    {
+      schema: {
+        operationId: RouteId.UpdateKnowledgeFile,
+        description:
+          "Rename a document, move it, or change its labels. Who can read it " +
+          "is its permission grants; the retired `visibility` and `teamIds` " +
+          "fields are refused.",
+        tags: ["Knowledge Files"],
+        params: FileParamsSchema,
+        body: z
+          .object({
+            filename: z.string().trim().min(1).max(512).optional(),
+            directoryId: z.string().uuid().nullable().optional(),
+            labels: z
+              .array(LabelWithDetailsSchema)
+              .optional()
+              .describe(
+                "Key/value labels. Omit to leave existing labels untouched; pass [] " +
+                  "to clear them.",
+              ),
+          })
+          .strict(),
+        response: constructResponseSchema(KbFileSchema),
+      },
+    },
+    async ({ params, body, organizationId, user }) => {
+      if (body.directoryId !== undefined) {
+        await assertDirectoryInOrg({
+          directoryId: body.directoryId,
+          organizationId,
+        });
+      }
+      // `labels` lives in its own junction table, so it must not reach the
+      // column update below.
+      const { labels: bodyLabels, ...columns } = body;
+
+      let file: Awaited<ReturnType<typeof KbFileModel.update>>;
+      try {
+        file = await KbFileModel.update({
+          id: params.fileId,
+          organizationId,
+          ...columns,
+        });
+      } catch (error) {
+        if (isUniqueConstraintError(error)) {
+          throw new ApiError(
+            409,
+            `"${body.filename}" already exists in that location.`,
+          );
+        }
+        throw error;
+      }
+      if (!file) throw new ApiError(404, "File not found");
+
+      // Only touch labels when the caller sent them, so an update that omits
+      // the field leaves existing labels alone.
+      if (bodyLabels !== undefined) {
+        await KbFileLabelModel.syncLabels(file.id, bodyLabels);
+      }
+
+      const knowledgeBases = await findAccessibleKnowledgeBasesForFiles({
+        fileIds: [file.id],
+        organizationId,
+        userId: user.id,
+      });
+      const {
+        data: _data,
+        objectKey: _objectKey,
+        storageProvider: _provider,
+        uploadedBy,
+        ...rest
+      } = file;
+      return {
+        ...rest,
+        createdBy: await CreatedByModel.resolveOne(
+          CreatedByModel.id(file, uploadedBy),
+        ),
+        knowledgeBases: knowledgeBases.get(file.id) ?? [],
+        ...(await grantedAudience({ organizationId, fileId: file.id })),
+        labels: await KbFileLabelModel.getLabelsFor(file.id),
+      };
+    },
+  );
+
+  fastify.delete(
+    "/api/knowledge-files/bulk",
+    {
+      schema: {
+        operationId: RouteId.BulkDeleteKnowledgeFiles,
+        description:
+          "Delete several repository documents in one request, along with " +
+          "every document indexed from each. Ids the caller cannot see are " +
+          "reported in `failed` and leave the rest of the batch applied.",
+        tags: ["Knowledge Files"],
+        body: BulkDeleteBodySchema,
+        response: constructResponseSchema(BulkOutcomeSchema),
+      },
+    },
+    async (request, reply) => {
+      const { organizationId } = request;
+      const viewer = await resolveViewer(request);
+
+      const outcome = await runBulk({
+        ids: request.body.ids,
+        logLabel: "knowledge documents bulk delete",
+        notFoundMessage: "File not found",
+        unexpectedMessage: "Could not delete this document",
+        load: async (ids) =>
+          new Map(
+            (
+              await KbFileModel.findManyByIds({ ids, organizationId, viewer })
+            ).map((file) => [file.id, file]),
+          ),
+        describe: (file) => file.filename,
+        applyEach: async (_file, id) => {
+          const deleted = await KbFileModel.delete({ id, organizationId });
+          if (!deleted) throw new ApiError(404, "File not found");
+        },
+        audit: {
+          target: request,
+          snapshot: async (ids) => ({
+            files: await KbFileModel.findVisibilityForBulkAudit({
+              ids,
+              organizationId,
+            }),
+          }),
+        },
+      });
+      await refreshUploadDocumentCounts(organizationId);
+
+      return reply.send(outcome);
+    },
+  );
+
+  fastify.delete(
+    "/api/knowledge-files/:fileId",
+    {
+      schema: {
+        operationId: RouteId.DeleteKnowledgeFile,
+        description:
+          "Delete a repository document and every document indexed from it",
+        tags: ["Knowledge Files"],
+        params: FileParamsSchema,
+        response: constructResponseSchema(z.object({ success: z.boolean() })),
+      },
+    },
+    async ({ params, organizationId }) => {
+      const deleted = await KbFileModel.delete({
+        id: params.fileId,
+        organizationId,
+      });
+      if (!deleted) throw new ApiError(404, "File not found");
+      await refreshUploadDocumentCounts(organizationId);
+      return { success: true };
+    },
+  );
+
+  fastify.post(
+    "/api/knowledge-files/index",
+    {
+      schema: {
+        operationId: RouteId.IndexKnowledgeFiles,
+        description:
+          "Index repository documents into a knowledge base, creating it when a name is given",
+        tags: ["Knowledge Files"],
+        body: z
+          .object({
+            fileIds: z.array(z.string().uuid()).default([]),
+            directoryIds: z.array(z.string().uuid()).default([]),
+            knowledgeBaseId: z.string().uuid().optional(),
+            newKnowledgeBaseName: z.string().trim().min(1).max(256).optional(),
+          })
+          .refine(
+            (body) =>
+              Boolean(body.knowledgeBaseId) !==
+              Boolean(body.newKnowledgeBaseName),
+            "Provide either knowledgeBaseId or newKnowledgeBaseName, not both",
+          ),
+        response: constructResponseSchema(
+          z.object({
+            knowledgeBaseId: z.string(),
+            indexed: z.number(),
+            failures: z.array(
+              z.object({ fileId: z.string(), error: z.string() }),
+            ),
+          }),
+        ),
+      },
+    },
+    async (request) => {
+      const { body, organizationId } = request;
+      const viewer = await resolveViewer(request);
+
+      // Indexing a file into a knowledge base shares its indexed content with
+      // the knowledge base's audience, so the caller must hold permission to
+      // share every file they index.
+      const explicit = await KbFileModel.findManyByIds({
+        ids: body.fileIds,
+        organizationId,
+        viewer,
+      });
+      for (const file of explicit) {
+        await ResourcePermissions.require({
+          organizationId,
+          userId: viewer.userId,
+          resource: "knowledgeFile",
+          scope: file.id,
+          action: "manage-permissions",
+        });
+      }
+
+      // Resolve directories to their files here rather than in the model: the
+      // caller's visibility and sharing filter has to apply to expanded files
+      // too, or selecting a directory would index documents the caller cannot
+      // see or share.
+      const directoryFileIds: string[] = [];
+      for (const directoryId of body.directoryIds) {
+        const { items } = await KbFileModel.findPaginated({
+          organizationId,
+          viewer,
+          directoryId,
+          limit: config.knowledgeFiles.maxFilesPerIndexRequest,
+          offset: 0,
+        });
+        for (const file of items) {
+          if (
+            await ResourcePermissions.allows({
+              organizationId,
+              userId: viewer.userId,
+              resource: "knowledgeFile",
+              scope: file.id,
+              action: "manage-permissions",
+            })
+          ) {
+            directoryFileIds.push(file.id);
+          }
+        }
+      }
+
+      const fileIds = [
+        ...new Set([...explicit.map((file) => file.id), ...directoryFileIds]),
+      ];
+      if (fileIds.length === 0) {
+        throw new ApiError(400, "No readable files were selected");
+      }
+
+      const knowledgeBaseId = body.newKnowledgeBaseName
+        ? (
+            await KnowledgeBaseModel.create({
+              organizationId,
+              createdBy: viewer.userId,
+              name: body.newKnowledgeBaseName,
+            })
+          ).id
+        : await assertKnowledgeBaseInOrg({
+            knowledgeBaseId: body.knowledgeBaseId as string,
+            userId: viewer.userId,
+            organizationId,
+          });
+
+      const result = await indexFilesIntoKnowledgeBase({
+        fileIds,
+        knowledgeBaseId,
+        organizationId,
+        newConnectorEnvironmentId:
+          await resolveDefaultEnvironmentForNewResource({
+            organizationId,
+            userId: viewer.userId,
+            resource: "knowledgeSource",
+          }),
+      });
+
+      // The audit hook cannot derive these itself: the response carries
+      // `knowledgeBaseId` (not `id`), and the outcome spans many files.
+      request.auditResourceId = { value: knowledgeBaseId };
+      request.auditAfter = {
+        knowledgeBaseId,
+        createdKnowledgeBase: Boolean(body.newKnowledgeBaseName),
+        fileIds,
+        indexed: result.indexed,
+        failures: result.failures,
+      };
+
+      return { knowledgeBaseId, ...result };
+    },
+  );
+
+  // ===== Directories =====
+
+  fastify.get(
+    "/api/knowledge-directories",
+    {
+      schema: {
+        operationId: RouteId.GetKnowledgeDirectories,
+        description: "List knowledge file directories",
+        tags: ["Knowledge Files"],
+        response: constructResponseSchema(z.array(KbDirectoryWithTeamsSchema)),
+      },
+    },
+    async ({ organizationId }) => KbDirectoryModel.findAll(organizationId),
+  );
+
+  fastify.post(
+    "/api/knowledge-directories",
+    {
+      schema: {
+        operationId: RouteId.CreateKnowledgeDirectory,
+        description:
+          "Create a knowledge file directory. A directory only organizes " +
+          "documents; the retired `visibility` and `teamIds` fields are refused.",
+        tags: ["Knowledge Files"],
+        body: z.object({ name: z.string().trim().min(1).max(256) }).strict(),
+        response: constructResponseSchema(KbDirectoryWithTeamsSchema),
+      },
+    },
+    async ({ body, organizationId, user }) => {
+      const directory = await KbDirectoryModel.create({
+        organizationId,
+        name: body.name,
+        createdBy: user.id,
+      });
+      return {
+        ...directory,
+        createdBy: await CreatedByModel.resolveOne(
+          CreatedByModel.id(directory, directory.createdBy),
+        ),
+        teamIds: [],
+        fileCount: 0,
+      };
+    },
+  );
+
+  fastify.patch(
+    "/api/knowledge-directories/:directoryId",
+    {
+      schema: {
+        operationId: RouteId.UpdateKnowledgeDirectory,
+        description:
+          "Rename a directory. The retired `visibility` and `teamIds` fields " +
+          "are refused.",
+        tags: ["Knowledge Files"],
+        params: DirectoryParamsSchema,
+        body: z
+          .object({ name: z.string().trim().min(1).max(256).optional() })
+          .strict(),
+        response: constructResponseSchema(KbDirectoryWithTeamsSchema),
+      },
+    },
+    async ({ params, body, organizationId }) => {
+      const directory = await KbDirectoryModel.update({
+        id: params.directoryId,
+        organizationId,
+        ...body,
+      });
+      if (!directory) throw new ApiError(404, "Directory not found");
+
+      const [teamIds, fileCount] = await Promise.all([
+        KbDirectoryModel.findTeamIds(directory.id),
+        KbDirectoryModel.countFiles(directory.id),
+      ]);
+      return {
+        ...directory,
+        createdBy: await CreatedByModel.resolveOne(
+          CreatedByModel.id(directory, directory.createdBy),
+        ),
+        teamIds,
+        fileCount,
+      };
+    },
+  );
+
+  fastify.delete(
+    "/api/knowledge-directories/bulk",
+    {
+      schema: {
+        operationId: RouteId.BulkDeleteKnowledgeDirectories,
+        description:
+          "Delete several directories in one request. As with the single " +
+          "delete, the files inside each move to the repository root rather " +
+          "than being destroyed. Ids that match no directory are reported in " +
+          "`failed` and leave the rest of the batch applied.",
+        tags: ["Knowledge Files"],
+        body: BulkDeleteBodySchema,
+        response: constructResponseSchema(BulkOutcomeSchema),
+      },
+    },
+    async (request, reply) => {
+      const { organizationId } = request;
+
+      const outcome = await runBulk({
+        ids: request.body.ids,
+        logLabel: "knowledge directories bulk delete",
+        notFoundMessage: "Directory not found",
+        unexpectedMessage: "Could not delete this directory",
+        load: async (ids) => {
+          const wanted = new Set(ids);
+          const directories = await KbDirectoryModel.findAll(organizationId);
+          return new Map(
+            directories
+              .filter((directory) => wanted.has(directory.id))
+              .map((directory) => [directory.id, directory]),
+          );
+        },
+        describe: (directory) => directory.name,
+        applyEach: async (_directory, id) => {
+          const deleted = await KbDirectoryModel.delete({ id, organizationId });
+          if (!deleted) throw new ApiError(404, "Directory not found");
+        },
+        audit: {
+          target: request,
+          snapshot: async (ids) => ({
+            directories: await KbDirectoryModel.findVisibilityForBulkAudit({
+              ids,
+              organizationId,
+            }),
+          }),
+        },
+      });
+
+      return reply.send(outcome);
+    },
+  );
+
+  fastify.delete(
+    "/api/knowledge-directories/:directoryId",
+    {
+      schema: {
+        operationId: RouteId.DeleteKnowledgeDirectory,
+        description:
+          "Delete a directory; its files move to the repository root",
+        tags: ["Knowledge Files"],
+        params: DirectoryParamsSchema,
+        response: constructResponseSchema(z.object({ success: z.boolean() })),
+      },
+    },
+    async ({ params, organizationId }) => {
+      const deleted = await KbDirectoryModel.delete({
+        id: params.directoryId,
+        organizationId,
+      });
+      if (!deleted) throw new ApiError(404, "Directory not found");
+      return { success: true };
+    },
+  );
+};
+
+// ===== Internal =====
+
+async function resolveViewer(request: {
+  user: { id: string };
+  organizationId: string;
+}): Promise<KbFileViewer> {
+  const teams = await TeamModel.getUserTeamsForOrganization({
+    userId: request.user.id,
+    organizationId: request.organizationId,
+  });
+  return {
+    userId: request.user.id,
+    teamIds: teams.map((team) => team.id),
+    // Deliberately false: repository listing is scoped by the file's own
+    // audience for everyone, so an admin browsing does not silently widen what
+    // a shared screen shows. Deletion is gated by the route permission instead.
+    canManageAll: false,
+  };
+}
+
+/**
+ * Foreign keys cannot express organization ownership for these references, so
+ * every one is checked explicitly before it is stored.
+ */
+/**
+ * Whether the organization has a Document OCR pair configured. Presence is
+ * the feature's enable switch; resolvability is checked where the spend
+ * happens (indexing), not at the upload gate.
+ */
+async function organizationHasOcr(organizationId: string): Promise<boolean> {
+  const org = await OrganizationModel.getById(organizationId);
+  return !!org?.ocrChatApiKeyId && !!org.ocrModel;
+}
+
+async function assertDirectoryInOrg(params: {
+  directoryId: string | null;
+  organizationId: string;
+}): Promise<void> {
+  if (!params.directoryId) return;
+  const directory = await KbDirectoryModel.findById({
+    id: params.directoryId,
+    organizationId: params.organizationId,
+  });
+  if (!directory) throw new ApiError(404, "Directory not found");
+}
+
+async function assertKnowledgeBaseInOrg(params: {
+  knowledgeBaseId: string;
+  organizationId: string;
+  userId: string;
+}): Promise<string> {
+  return (
+    await findAccessibleKnowledgeBase({ ...params, id: params.knowledgeBaseId })
+  ).id;
+}
+
+/**
+ * A file's documents live in the upload connector of every knowledge base it
+ * was indexed into, so deleting files recounts the organization's upload
+ * connectors.
+ */
+async function refreshUploadDocumentCounts(organizationId: string) {
+  await KbConnectorDocumentCountModel.refreshForOrganization({
+    organizationId,
+    connectorType: "file_upload",
+  });
+}
+
+/** A file's `visibility` and `teamIds` response fields, from its grants. */
+async function grantedAudience(params: {
+  organizationId: string;
+  fileId: string;
+}) {
+  const audience = (
+    await KbFileModel.findGrantedAudiences({
+      organizationId: params.organizationId,
+      fileIds: [params.fileId],
+    })
+  ).get(params.fileId);
+  return {
+    visibility: audience?.visibility ?? ("private" as const),
+    teamIds: audience?.teamIds ?? [],
+  };
+}
+
+export default knowledgeFileRoutes;

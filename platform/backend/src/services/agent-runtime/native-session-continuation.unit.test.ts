@@ -1,0 +1,136 @@
+import { execFile } from "node:child_process";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+import { describe, expect, test } from "vitest";
+import { makeFastImageEntrypoint } from "@/test/subprocess-entrypoint";
+
+const exec = promisify(execFile);
+
+describe.each([
+  {
+    client: "hermes",
+    command: "hermes",
+    protocol: "openai_chat",
+    marker: "hermes-main-session",
+  },
+  {
+    client: "opencode",
+    command: "opencode",
+    protocol: "openai_responses",
+    marker: "opencode-main-session",
+  },
+  {
+    client: "claude-code",
+    command: "claude",
+    protocol: "anthropic",
+    marker: "claude-session-id",
+  },
+  {
+    client: "codex",
+    command: "codex",
+    protocol: "openai_responses",
+    marker: "codex-main-session",
+  },
+])("$client session continuity", ({ client, command, protocol, marker }) => {
+  test.each([
+    "present",
+    "missing",
+    "empty",
+  ])("resumes only the recorded session (%s marker)", async (state) => {
+    const root = await mkdtemp(path.join(tmpdir(), "runtime-continuation-"));
+    try {
+      const bin = path.join(root, "bin");
+      const runtime = path.join(root, "runtime");
+      await mkdir(bin);
+      await mkdir(runtime);
+      const executable = path.join(bin, command);
+      await writeFile(
+        executable,
+        '#!/bin/sh\nif [ "$1" = "debug" ]; then touch "$ARCHESTRA_AGENT_RUNTIME_DIR/catalog-queried"; printf \'{"models":[]}\'; exit 0; fi\nprintf "%s\\n" "$@" > "$ARCHESTRA_AGENT_RUNTIME_DIR/args"\n',
+      );
+      await chmod(executable, 0o755);
+      if (state !== "missing")
+        await writeFile(
+          path.join(runtime, marker),
+          state === "present" ? "session-original\n" : "",
+        );
+      const entrypoint =
+        client === "claude-code"
+          ? await makeFastImageEntrypoint(root, "archestra-claude-code")
+          : path.resolve(
+              import.meta.dirname,
+              `../../../../docker_images/agent/bin/archestra-${client}`,
+            );
+      const execution = exec("bash", [entrypoint], {
+        cwd: root,
+        env: {
+          PATH: `${bin}:${process.env.PATH}`,
+          HOME: root,
+          ARCHESTRA_LLM_PROXY_PROTOCOL: protocol,
+          ARCHESTRA_AGENT_RUNTIME_DIR: runtime,
+          ARCHESTRA_AGENT_RUNTIME_NATIVE_STATE_DIR: runtime,
+          ARCHESTRA_AGENT_RUNTIME_NATIVE_MODEL: "test-model",
+          ARCHESTRA_AGENT_RUNTIME_TASK_ID: "test-task",
+          ARCHESTRA_AGENT_RUNTIME_TASK: "Continue the same work",
+          ARCHESTRA_AGENT_RUNTIME_MODE: "interactive",
+          ARCHESTRA_AGENT_RUNTIME_CLAUDE_AUTH: "subscription",
+          ARCHESTRA_AGENT_RUNTIME_CONTINUE: "1",
+          ARCHESTRA_MCP_GATEWAY_URL: "http://localhost:9000/v1/mcp/test",
+          ARCHESTRA_MCP_GATEWAY_TOKEN: "test-token",
+          ANTHROPIC_AUTH_TOKEN: "test-key",
+          CLAUDE_CODE_OAUTH_TOKEN: "test-subscription-token",
+          ...(client === "claude-code"
+            ? {
+                ANTHROPIC_BASE_URL: "http://localhost:9000/v1/anthropic/test",
+                ANTHROPIC_CUSTOM_HEADERS:
+                  "X-Archestra-Virtual-Key: test-passthrough-key",
+              }
+            : {}),
+          OPENAI_API_KEY: "test-key",
+          OPENAI_BASE_URL: "http://localhost:9000/v1/test",
+        },
+      });
+      if (state === "present") {
+        await execution;
+        const args = (await readFile(path.join(runtime, "args"), "utf8"))
+          .trim()
+          .split("\n");
+        const resume = args.indexOf(
+          command === "codex"
+            ? "resume"
+            : command === "opencode"
+              ? "--session"
+              : "--resume",
+        );
+        expect(resume).toBeGreaterThanOrEqual(0);
+        expect(args[resume + 1]).toBe("session-original");
+        expect(args).not.toContain("--last");
+        expect(args).not.toContain("--continue");
+      } else {
+        await expect(execution).rejects.toMatchObject({
+          code: 78,
+          stderr: expect.stringContaining("no new session was started"),
+        });
+        await expect(
+          readFile(path.join(runtime, "args")),
+        ).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(
+          readFile(path.join(runtime, "catalog-queried")),
+        ).rejects.toMatchObject({ code: "ENOENT" });
+      }
+    } finally {
+      // OpenCode owns read-only config directories; restore fixture cleanup access.
+      await exec("chmod", ["-R", "u+w", root]);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});

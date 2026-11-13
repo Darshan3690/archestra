@@ -1,7 +1,8 @@
 import { randomBytes } from "node:crypto";
-import { ARCHESTRA_TOKEN_PREFIX } from "@shared";
-import { desc, eq } from "drizzle-orm";
+import { ARCHESTRA_TOKEN_PREFIX } from "@archestra/shared";
+import { and, desc, eq, isNull, lt, or } from "drizzle-orm";
 import db, { schema } from "@/database";
+import logger from "@/logging";
 import { secretManager } from "@/secrets-manager";
 import type {
   InsertTeamToken,
@@ -10,12 +11,16 @@ import type {
   UpdateTeamToken,
 } from "@/types";
 
-/**
- * Team tokens always use DB storage (forceDB: true) because:
- * 1. They are seeded on archestra startup
- * 2. They might not work with BYOS Vault (which is read-only from customer's Vault)
- */
 const FORCE_DB = true;
+
+/**
+ * Minimum age of lastUsedAt before validateToken refreshes it. Every request
+ * on a token validates it, so an unconditional write turns the token row into
+ * a lock hot spot — concurrent requests serialize behind the row lock and can
+ * exceed the statement timeout under bursts. The staleness window collapses a
+ * burst into at most one write.
+ */
+const LAST_USED_REFRESH_INTERVAL_MS = 60_000;
 
 /**
  * Get the single organization ID from the database
@@ -142,7 +147,9 @@ class TeamTokenModel {
   /**
    * Find all tokens with team details
    */
-  static async findAllWithTeam(): Promise<TeamTokenWithTeam[]> {
+  static async findAllWithTeam(
+    organizationId?: string,
+  ): Promise<TeamTokenWithTeam[]> {
     const result = await db
       .select({
         token: schema.teamTokensTable,
@@ -155,6 +162,11 @@ class TeamTokenModel {
       .leftJoin(
         schema.teamsTable,
         eq(schema.teamTokensTable.teamId, schema.teamsTable.id),
+      )
+      .where(
+        organizationId
+          ? eq(schema.teamTokensTable.organizationId, organizationId)
+          : undefined,
       )
       .orderBy(
         desc(schema.teamTokensTable.isOrganizationToken),
@@ -210,13 +222,26 @@ class TeamTokenModel {
   }
 
   /**
-   * Update last used timestamp for a token
+   * Update last used timestamp for a token.
+   *
+   * Skips the write when lastUsedAt is already fresh (see
+   * {@link LAST_USED_REFRESH_INTERVAL_MS}); concurrent callers that lose the
+   * race re-check the condition after the winner commits and skip too.
    */
   static async updateLastUsed(id: string): Promise<void> {
+    const cutoff = new Date(Date.now() - LAST_USED_REFRESH_INTERVAL_MS);
     await db
       .update(schema.teamTokensTable)
       .set({ lastUsedAt: new Date() })
-      .where(eq(schema.teamTokensTable.id, id));
+      .where(
+        and(
+          eq(schema.teamTokensTable.id, id),
+          or(
+            isNull(schema.teamTokensTable.lastUsedAt),
+            lt(schema.teamTokensTable.lastUsedAt, cutoff),
+          ),
+        ),
+      );
   }
 
   /**
@@ -297,8 +322,14 @@ class TeamTokenModel {
         secret?.secret &&
         (secret.secret as { token?: string }).token === tokenValue
       ) {
-        // Update last used timestamp
-        await TeamTokenModel.updateLastUsed(token.id);
+        // Update last used timestamp — best-effort bookkeeping that must
+        // never block or fail the authentication path.
+        TeamTokenModel.updateLastUsed(token.id).catch((error) => {
+          logger.warn(
+            { tokenId: token.id, error: String(error) },
+            "Failed to update team token lastUsedAt",
+          );
+        });
         return token;
       }
     }
@@ -366,6 +397,35 @@ class TeamTokenModel {
   }
 
   /**
+   * Backfill missing team tokens during startup without looking up every
+   * existing token separately. Keep the normal ensure path for missing teams
+   * so a token created since this snapshot is reused.
+   */
+  static async ensureTeamTokensForOrganization(
+    organizationId: string,
+  ): Promise<number> {
+    const teamsWithoutTokens = await db
+      .select({ id: schema.teamsTable.id, name: schema.teamsTable.name })
+      .from(schema.teamsTable)
+      .leftJoin(
+        schema.teamTokensTable,
+        eq(schema.teamTokensTable.teamId, schema.teamsTable.id),
+      )
+      .where(
+        and(
+          eq(schema.teamsTable.organizationId, organizationId),
+          isNull(schema.teamTokensTable.id),
+        ),
+      );
+
+    for (const team of teamsWithoutTokens) {
+      await TeamTokenModel.ensureTeamToken(team.id, team.name);
+    }
+
+    return teamsWithoutTokens.length;
+  }
+
+  /**
    * Get token value by ID (for copying to clipboard)
    */
   static async getTokenValue(id: string): Promise<string | null> {
@@ -376,6 +436,35 @@ class TeamTokenModel {
     if (!secret?.secret) return null;
 
     return (secret.secret as { token?: string }).token ?? null;
+  }
+
+  static async findByIdForAudit(
+    id: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [row] = await db
+      .select()
+      .from(schema.teamTokensTable)
+      .where(
+        and(
+          eq(schema.teamTokensTable.id, id),
+          eq(schema.teamTokensTable.organizationId, organizationId),
+        ),
+      )
+      .limit(1);
+
+    if (!row) return null;
+
+    return {
+      id: row.id,
+      organizationId: row.organizationId,
+      teamId: row.teamId ?? null,
+      isOrganizationToken: row.isOrganizationToken,
+      name: row.name,
+      tokenStart: row.tokenStart,
+      createdAt: row.createdAt.toISOString(),
+      lastUsedAt: row.lastUsedAt?.toISOString() ?? null,
+    };
   }
 }
 

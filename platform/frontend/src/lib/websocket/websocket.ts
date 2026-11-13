@@ -1,4 +1,7 @@
-import type { ClientWebSocketMessage, ServerWebSocketMessage } from "@shared";
+import type {
+  ClientWebSocketMessage,
+  ServerWebSocketMessage,
+} from "@archestra/shared";
 import config from "@/lib/config/config";
 
 // Combined message type for handlers that receive both directions
@@ -6,10 +9,13 @@ type WebSocketMessage = ClientWebSocketMessage | ServerWebSocketMessage;
 
 type MessageHandler = (message: WebSocketMessage) => void;
 
+type ConnectionHandler = (isConnected: boolean) => void;
+
 class WebSocketService {
   private ws: WebSocket | null = null;
   private handlers: Map<WebSocketMessage["type"], Set<MessageHandler>> =
     new Map();
+  private connectionHandlers: Set<ConnectionHandler> = new Set();
   private reconnectTimeout: NodeJS.Timeout | null = null;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = Infinity;
@@ -20,6 +26,14 @@ class WebSocketService {
   private pendingMessages: ClientWebSocketMessage[] = [];
 
   async connect(): Promise<void> {
+    // Playwright's MSW stack has HTTP handlers but no WebSocket server. Every
+    // caller must share this guard or subscriptions cause a reconnect loop.
+    if (
+      process.env.NEXT_PUBLIC_API_MOCKING === "enabled" &&
+      process.env.NODE_ENV !== "production"
+    ) {
+      return;
+    }
     if (
       this.ws?.readyState === WebSocket.OPEN ||
       this.ws?.readyState === WebSocket.CONNECTING ||
@@ -39,6 +53,7 @@ class WebSocketService {
         this.reconnectAttempts = 0;
         this.reconnectDelay = 1000;
         this.flushPendingMessages();
+        this.notifyConnectionHandlers(true);
       });
 
       // this.ws.addEventListener("error", (_error) => {});
@@ -52,9 +67,19 @@ class WebSocketService {
         }
       });
 
-      this.ws.addEventListener("close", () => {
+      this.ws.addEventListener("close", (event) => {
         this.ws = null;
         this.isConnecting = false;
+        this.notifyConnectionHandlers(false);
+
+        // The server accepts the upgrade before it authenticates, so a
+        // signed-out socket still fires "open" (resetting the backoff) and is
+        // then closed with 4401. Retrying would loop every second or so for
+        // as long as the sign-in page is open. Stay closed instead: the
+        // signed-in app calls connect() again when it mounts.
+        if (event.code === UNAUTHORIZED_CLOSE_CODE) {
+          return;
+        }
 
         // Attempt to reconnect unless manually disconnected
         if (!this.isManuallyDisconnected) {
@@ -64,6 +89,7 @@ class WebSocketService {
     } catch (error) {
       this.isConnecting = false;
       console.error("[WebSocket] Connection failed:", error);
+      this.notifyConnectionHandlers(false);
       this.scheduleReconnect();
     }
   }
@@ -130,6 +156,20 @@ class WebSocketService {
     };
   }
 
+  /**
+   * Observe the connection itself opening and closing. Callers that hold a
+   * server-side subscription need the open edge: the server forgets every
+   * subscription along with the socket it was made on, so the subscription has
+   * to be re-sent on each new connection. The close edge is what tells them a
+   * connection attempt ended without a live socket.
+   */
+  onConnectionChange(handler: ConnectionHandler): () => void {
+    this.connectionHandlers.add(handler);
+    return () => {
+      this.connectionHandlers.delete(handler);
+    };
+  }
+
   private handleMessage(message: WebSocketMessage): void {
     const handlers = this.handlers.get(message.type);
     if (handlers) {
@@ -189,6 +229,16 @@ class WebSocketService {
 
     this.sendNow(message);
   }
+
+  private notifyConnectionHandlers(isConnected: boolean): void {
+    this.connectionHandlers.forEach((handler) => {
+      try {
+        handler(isConnected);
+      } catch (error) {
+        console.error("[WebSocket] Error in connection handler:", error);
+      }
+    });
+  }
 }
 
 /**
@@ -197,3 +247,6 @@ class WebSocketService {
 const websocketService = new WebSocketService();
 
 export default websocketService;
+
+// Mirrors the close code in the backend's sendUnauthorized().
+const UNAUTHORIZED_CLOSE_CODE = 4401;

@@ -1,0 +1,657 @@
+import type { IncomingHttpHeaders } from "node:http";
+import {
+  codexClientMetadataSessionId,
+  isCodexClientMetadata,
+} from "@archestra/shared";
+import type { AppaSessionIdentity } from "@/openappa/wire";
+import { ApiError } from "@/types";
+import type { CommonToolResult } from "@/types/common-llm-format";
+import { asRecord } from "@/utils/as-record";
+import type {
+  AppaClientAdapter,
+  AppaMatchContext,
+  AppaRelayArrival,
+  AppaRelayMessage,
+  AppaReviewedSession,
+  AppaSpawnPromptField,
+  AskUserArguments,
+  NativeQuestionResult,
+} from "../types";
+import { questionHeader, readHeader } from "../utils";
+import {
+  admitCodexRelayReport,
+  codexRelayArrivals,
+  codexRelayMessage,
+  isCodexRelayReceipt,
+  isCodexRelayTool,
+} from "./codex-relay";
+import { structuredQuestionRuling } from "./native-question-ruling";
+import {
+  bindMintedChildTrajectory,
+  localToolName,
+  namesChildrenFromArguments,
+  nativeId,
+  parseJsonHeader,
+  stringField,
+  stripRecordFields,
+} from "./trajectory";
+
+const SPAWN_TOOLS = new Set(["spawn_agent"]);
+const CHILD_ID_KEYS = ["agent_id", "thread_id", "receiver_thread_id"] as const;
+/** Native fields that place a Codex request under a parent thread. */
+const CODEX_CHILD_CARRIER_FIELDS = [
+  "agent_id",
+  "parent_thread_id",
+  "child_thread_id",
+  "parent_id",
+  "x-codex-parent-thread-id",
+] as const;
+const LAUNCH_AGENT_ID = /^[A-Za-z0-9_.:-]{1,512}$/;
+const LAUNCH_TASK_NAME = /^[A-Za-z0-9_.:@/-]{1,512}$/;
+/** A Codex thread id: one segment of a session id, never a path of them. */
+const THREAD_ID = /^[A-Za-z0-9_.@-]{1,256}$/;
+
+/** Identifies Codex Responses requests and normalizes local tool names. */
+export class AppaCodexAdapter implements AppaClientAdapter {
+  readonly id = "codex" as const;
+  readonly trajectoryPrefix = "codex";
+  // A running Codex session does not pick up a sign-in or a config change.
+  gatewayToolsHint(serverName: string): string {
+    return `Run codex mcp login ${serverName} and finish the sign-in in your browser. If "${serverName}" is not in your Codex config, connect Codex again. Then start a new session.`;
+  }
+  // Codex advertises request_user_input even when Default mode cannot run it.
+  // Keep ask_user on the gateway so Codex shows an MCP elicitation form.
+  readonly nativeQuestion = {
+    toolName: "request_user_input",
+    supportsMultiple: false,
+    isAvailable: (headers: IncomingHttpHeaders) =>
+      readHeader(headers, "x-archestra-native-question") ===
+      "request_user_input",
+    fromAskUser: (args: AskUserArguments) => ({
+      questions: [
+        {
+          id: "archestra_question",
+          header: questionHeader(args.header, 12),
+          question: args.question,
+          options: args.options.map((option) => ({
+            label: option.label,
+            description: option.description ?? option.label,
+          })),
+        },
+      ],
+    }),
+    rulingFromResult: (result: NativeQuestionResult, asked: AskUserArguments) =>
+      structuredQuestionRuling(result, asked.question),
+    formFallback: true,
+  };
+  matches(context: AppaMatchContext): boolean {
+    const userAgent = (
+      readHeader(context.headers, "user-agent") ?? ""
+    ).toLowerCase();
+    const originator = (
+      readHeader(context.headers, "originator") ?? ""
+    ).toLowerCase();
+    return (
+      userAgent.includes("codex") ||
+      originator.includes("codex") ||
+      readHeader(context.headers, "x-codex-turn-metadata") !== undefined ||
+      isCodexClientMetadata(asRecord(context.requestBody)?.client_metadata)
+    );
+  }
+
+  classifyToolName(name: string, namespace?: string): "gateway" | "local" {
+    // Codex declares MCP server tools in `mcp__<server>` namespaces
+    // and invokes them using bare advertised names.
+    return name.startsWith("mcp:") ||
+      name.startsWith("mcp__") ||
+      namespace?.startsWith("mcp__")
+      ? "gateway"
+      : "local";
+  }
+
+  normalizeLocalToolName(name: string): string {
+    // The Archestra adapter derives bare tool names to host/archestra identity.
+    // Removes `functions.` and `builtin:` client prefixes before derivation.
+    const stripped = name.startsWith("functions.")
+      ? name.slice("functions.".length)
+      : name;
+    return stripped.startsWith("builtin:")
+      ? stripped.slice("builtin:".length)
+      : stripped;
+  }
+
+  /**
+   * Extracts Codex trajectory identity from turn metadata across body and header fields.
+   * Uses `thread_id` as the primary root: resumes reopen the thread, forks mint
+   * a new thread, and compactions stay within the same thread.
+   * Contradictory claims are rejected.
+   */
+  extractSessionIdentity(
+    context: AppaMatchContext,
+  ): AppaSessionIdentity | undefined {
+    const { sessionId, threadId } = turnIds(context);
+    // `forked_from_thread_id` marks a client fork.
+    // The runtime only opens a child trajectory for a prepared spawn call.
+    // Replayed history carries parent trajectory stamps that continue the parent root.
+    const root = threadId ?? sessionId;
+    return root
+      ? { sessionId: root, provenance: "codex-turn-metadata" }
+      : undefined;
+  }
+
+  /**
+   * An auto-review assesses the action of the thread that asked for it, the
+   * requester. Codex names the requester as `parent_thread_id`, and the root
+   * thread of the requester's tree as `session_id`. Without a root, the
+   * requester is taken for one.
+   */
+  reviewedSession(context: AppaMatchContext): AppaReviewedSession | undefined {
+    if (!isGuardianReview(context)) return undefined;
+    const { sessionId: root, threadId: review } = turnIds(context);
+    const requester = parentThreadId(context);
+    if (
+      !requester ||
+      requester === review ||
+      !THREAD_ID.test(requester) ||
+      (root !== undefined && (root === review || !THREAD_ID.test(root)))
+    )
+      return undefined;
+    return { rootId: root ?? requester, requesterId: requester };
+  }
+
+  relayMessage(
+    call: { name: string; arguments: unknown; namespace?: string },
+    requestBody?: unknown,
+  ): AppaRelayMessage | undefined {
+    return codexRelayMessage(call, requestBody);
+  }
+
+  isRelayTool(name: string, namespace?: string): boolean {
+    return isCodexRelayTool(name, namespace);
+  }
+
+  isRelayReceipt(content: unknown): boolean {
+    return isCodexRelayReceipt(content);
+  }
+
+  // Codex reports a failed send in text the proxy cannot tell apart from a
+  // report that carries another agent's output.
+  readonly admitsFailedRelayReports = true as const;
+
+  admitRelayReport(
+    content: unknown,
+    records: readonly string[],
+  ): { content: unknown; withheld: boolean } {
+    return admitCodexRelayReport(content, records);
+  }
+
+  relayArrivals(requestBody: unknown): AppaRelayArrival[] {
+    return codexRelayArrivals(requestBody);
+  }
+
+  isSpawnTool(name: string, namespace?: string): boolean {
+    return (
+      isNativeCodexNamespace(namespace) && SPAWN_TOOLS.has(localToolName(name))
+    );
+  }
+
+  classifySpawnResult(
+    result: CommonToolResult,
+  ): "pending" | "failed" | undefined {
+    if (!this.isSpawnTool(result.name, result.namespace)) return undefined;
+    if (result.isError) return "failed";
+    const output =
+      typeof result.content === "string"
+        ? parseJsonObject(result.content)
+        : asRecord(result.content);
+    return stringField(output?.agent_id) || stringField(output?.task_name)
+      ? "pending"
+      : "failed";
+  }
+
+  isChildCompletionResult(result: CommonToolResult): boolean {
+    if (
+      !isNativeCodexNamespace(result.namespace) ||
+      localToolName(result.name) !== "wait_agent" ||
+      result.isError
+    )
+      return false;
+    const output =
+      typeof result.content === "string"
+        ? parseJsonObject(result.content)
+        : asRecord(result.content);
+    // V1 wait returns completed leaves; V2 wait only reports mailbox activity
+    // or new input. Its timed_out:false does not establish child completion.
+    // V2 child output crosses separately through agent_message admission.
+    const status = asRecord(output?.status);
+    return Object.values(status ?? {}).some(
+      (entry) => typeof asRecord(entry)?.completed === "string",
+    );
+  }
+
+  normalizeChildLaunchResult(result: CommonToolResult): string | undefined {
+    if (
+      !this.isSpawnTool(result.name, result.namespace) ||
+      this.classifySpawnResult(result) === "failed"
+    )
+      return undefined;
+    const output =
+      typeof result.content === "string"
+        ? parseJsonObject(result.content)
+        : asRecord(result.content);
+    if (output && Object.hasOwn(output, "agent_id")) {
+      const agentId = output.agent_id;
+      if (typeof agentId !== "string" || !LAUNCH_AGENT_ID.test(agentId)) {
+        throw withheldChildLaunch();
+      }
+      return JSON.stringify({ agent_id: agentId });
+    }
+    const taskName = output?.task_name;
+    if (typeof taskName !== "string" || !LAUNCH_TASK_NAME.test(taskName)) {
+      throw withheldChildLaunch();
+    }
+    return JSON.stringify({ task_name: taskName });
+  }
+
+  unsupportedSpawnFields(params: {
+    requestBody: unknown;
+    name: string;
+    namespace?: string;
+    arguments: unknown;
+  }): string[] | undefined {
+    if (!this.isSpawnTool(params.name, params.namespace)) return undefined;
+    const args = argumentRecord(params.arguments);
+    const properties = closedSpawnProperties(
+      params.requestBody,
+      params.name,
+      params.namespace,
+    );
+    if (!args || !properties) return undefined;
+    const extra = Object.keys(args)
+      .filter((key) => !properties.has(key))
+      .sort();
+    return extra.length > 0 ? extra : undefined;
+  }
+
+  spawnPromptField(
+    name: string,
+    args: Record<string, unknown>,
+  ): AppaSpawnPromptField | undefined {
+    if (!SPAWN_TOOLS.has(localToolName(name))) return undefined;
+    // spawn_agent takes its prompt as a message or as input items, never both.
+    if (typeof args.message === "string" && args.message.trim().length > 0)
+      return { field: "message", kind: "text" };
+    if (Array.isArray(args.items) && args.items.length > 0)
+      return { field: "items", kind: "items" };
+    return undefined;
+  }
+
+  nativeConversationId(context: AppaMatchContext): string | undefined {
+    // The request thread, which child subagents report as parent_thread_id.
+    const turn = parseJsonHeader(context.headers, "x-codex-turn-metadata");
+    const body = asRecord(context.requestBody);
+    const metadata =
+      asRecord(body?.client_metadata) ?? asRecord(body?.metadata);
+    return (
+      this.extractSessionIdentity(context)?.sessionId ??
+      stringField(turn?.thread_id) ??
+      stringField(body?.prompt_cache_key) ??
+      stringField(metadata?.thread_id) ??
+      codexClientMetadataSessionId(body?.client_metadata) ??
+      undefined
+    );
+  }
+
+  nativeSpawnParentId(
+    context: AppaMatchContext,
+    sessionId: string,
+  ): string | undefined {
+    const parent = parentThreadId(context);
+    return parent && parent !== sessionId ? parent : undefined;
+  }
+
+  namesChildren(params: { rootId: string; arguments: unknown }): string[] {
+    return namesChildrenFromArguments({
+      rootId: params.rootId,
+      arguments: params.arguments,
+      pathPatterns: [],
+      idKeys: CHILD_ID_KEYS,
+    });
+  }
+
+  bindChildTrajectory(context: AppaMatchContext) {
+    // Guardian auto-review names the requester thread as parent_thread_id and
+    // its own thread as thread_id. That pair is a side review, not a spawn.
+    // Opening it as a child is refused: no spawn prepared a fork, and the
+    // refusal is classified as an unavailable runtime.
+    if (isGuardianReview(context)) return undefined;
+    const parentNativeId = parentThreadId(context);
+    const childNativeId = childThreadId(context, parentNativeId);
+    return bindMintedChildTrajectory({
+      context,
+      parentNativeId,
+      childNativeId,
+    });
+  }
+
+  stripCarrierMetadata(request: unknown): void {
+    const body = asRecord(request);
+    if (!body) return;
+    for (const metadata of [
+      asRecord(body.client_metadata),
+      asRecord(body.metadata),
+    ]) {
+      if (!metadata) continue;
+      stripRecordFields(metadata, CODEX_CHILD_CARRIER_FIELDS);
+      stripTurnMetadataCarriers(metadata);
+    }
+  }
+}
+
+/**
+ * Codex auto-review is an out-of-band Responses call. It carries the
+ * requester session as parent metadata and a fresh thread id, plus an empty
+ * top-level tools list, additional_tools, and a json_schema verdict. None of
+ * that is a prepared child trajectory.
+ */
+function isGuardianReview(context: AppaMatchContext): boolean {
+  if (readHeader(context.headers, "x-openai-subagent") === "guardian")
+    return true;
+  const body = asRecord(context.requestBody);
+  if (body?.model === "codex-auto-review") return true;
+  const metadata = asRecord(body?.client_metadata) ?? asRecord(body?.metadata);
+  if (stringField(metadata?.["x-openai-subagent"]) === "guardian") return true;
+  const turn =
+    parseJsonHeader(context.headers, "x-codex-turn-metadata") ??
+    turnMetadataRecord(metadata?.["x-codex-turn-metadata"]);
+  return (
+    turn?.turn_trigger === "guardian_review" ||
+    turn?.thread_source === "guardian_review" ||
+    turn?.subagent_kind === "guardian"
+  );
+}
+
+function withheldChildLaunch(): ApiError {
+  return new ApiError(
+    409,
+    "OpenAPPA withheld an invalid child launch acknowledgment",
+  );
+}
+
+function isNativeCodexNamespace(namespace: string | undefined): boolean {
+  return (
+    namespace === undefined ||
+    namespace === "functions" ||
+    namespace === "collaboration" ||
+    namespace === "multi_agent_v1"
+  );
+}
+
+/**
+ * The session and thread ids that a request's turn metadata claims, across
+ * its body and header fields. Contradictory claims are rejected.
+ */
+function turnIds(context: AppaMatchContext): {
+  sessionId?: string;
+  threadId?: string;
+} {
+  const claims: Array<{ sessionId?: string; threadId?: string } | undefined> =
+    [];
+  const clientMetadata = asRecord(context.requestBody)?.client_metadata;
+  if (clientMetadata !== undefined) {
+    const flat = asRecord(clientMetadata);
+    if (flat) claims.push(idClaims(flat, "client_metadata"));
+    claims.push(
+      turnMetadataClaims(asRecord(clientMetadata)?.["x-codex-turn-metadata"]),
+    );
+  }
+  claims.push(
+    turnMetadataClaims(readHeader(context.headers, "x-codex-turn-metadata")),
+  );
+  const headerSessionId = readHeader(context.headers, "session-id")?.trim();
+  if (headerSessionId) claims.push({ sessionId: headerSessionId });
+
+  let sessionId: string | undefined;
+  let threadId: string | undefined;
+  for (const claim of claims) {
+    if (!claim) continue;
+    if (
+      (claim.sessionId && sessionId && claim.sessionId !== sessionId) ||
+      (claim.threadId && threadId && claim.threadId !== threadId)
+    ) {
+      throw new ApiError(
+        400,
+        "OpenAPPA cannot bind contradictory Codex trajectory metadata",
+      );
+    }
+    sessionId ??= claim.sessionId;
+    threadId ??= claim.threadId;
+  }
+  return {
+    ...(sessionId ? { sessionId } : {}),
+    ...(threadId ? { threadId } : {}),
+  };
+}
+
+/**
+ * Reads the identity pair out of one turn-metadata claim. The blob arrives as
+ * a JSON string on the compat header and as an object or JSON string under
+ * `client_metadata`; any other shape is the client's own reserved key misused,
+ * which is refused rather than guessed at.
+ */
+function turnMetadataClaims(
+  value: unknown,
+): { sessionId?: string; threadId?: string } | undefined {
+  if (value === undefined) return undefined;
+  const record =
+    typeof value === "string" ? parseTurnMetadataJson(value) : asRecord(value);
+  if (!record) {
+    throw new ApiError(
+      400,
+      "OpenAPPA cannot read malformed Codex trajectory metadata",
+    );
+  }
+  return idClaims(record, "x-codex-turn-metadata");
+}
+
+function idClaims(
+  record: Record<string, unknown>,
+  source: string,
+): { sessionId?: string; threadId?: string } {
+  const sessionId = idField(record.session_id, source);
+  const threadId = idField(record.thread_id, source);
+  return {
+    ...(sessionId ? { sessionId } : {}),
+    ...(threadId ? { threadId } : {}),
+  };
+}
+
+function idField(value: unknown, source: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") {
+    throw new ApiError(
+      400,
+      `OpenAPPA cannot read malformed Codex trajectory metadata in ${source}`,
+    );
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function parseJsonObject(value: string): Record<string, unknown> | undefined {
+  try {
+    return asRecord(JSON.parse(value));
+  } catch {
+    return undefined;
+  }
+}
+
+function argumentRecord(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value === "string") {
+    try {
+      return asRecord(JSON.parse(value));
+    } catch {
+      return undefined;
+    }
+  }
+  return asRecord(value);
+}
+
+function closedSpawnProperties(
+  body: unknown,
+  name: string,
+  namespace: string | undefined,
+): ReadonlySet<string> | undefined {
+  const wanted = localToolName(name);
+  const matches: Array<ReadonlySet<string>> = [];
+  for (const tool of declaredContainers(body)) {
+    const group = asRecord(tool);
+    const members =
+      group?.type === "namespace" && Array.isArray(group.tools)
+        ? group.tools
+        : [tool];
+    const declaredNamespace =
+      group?.type === "namespace" && typeof group.name === "string"
+        ? group.name
+        : undefined;
+    if (namespace !== declaredNamespace) continue;
+    for (const member of members) {
+      const record = asRecord(member);
+      if (!record || localToolName(String(record.name ?? "")) !== wanted) {
+        continue;
+      }
+      const properties = closedProperties(record);
+      if (properties) matches.push(properties);
+    }
+  }
+  if (matches.length !== 1) return undefined;
+  return matches[0];
+}
+
+function declaredContainers(body: unknown): unknown[] {
+  const record = asRecord(body);
+  if (!record) return [];
+  const tools: unknown[] = [];
+  for (const key of ["tools", "additional_tools"] as const) {
+    if (Array.isArray(record[key])) tools.push(...record[key]);
+  }
+  if (!Array.isArray(record.input)) return tools;
+  for (const item of record.input) {
+    const entry = asRecord(item);
+    if (
+      entry &&
+      (entry.type === "additional_tools" ||
+        entry.type === "tool_search_output") &&
+      Array.isArray(entry.tools)
+    ) {
+      tools.push(...entry.tools);
+    }
+  }
+  return tools;
+}
+
+function closedProperties(
+  member: Record<string, unknown>,
+): ReadonlySet<string> | undefined {
+  const schema =
+    asRecord(member.parameters) ??
+    asRecord(member.input_schema) ??
+    asRecord(asRecord(member.function)?.parameters);
+  if (!schema || schema.additionalProperties !== false) return undefined;
+  const properties = asRecord(schema.properties);
+  if (!properties) return undefined;
+  return new Set(Object.keys(properties));
+}
+
+function parseTurnMetadataJson(value: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    const record = asRecord(parsed);
+    if (record) return record;
+  } catch {
+    // Handled by the refusal below.
+  }
+  throw new ApiError(
+    400,
+    "OpenAPPA cannot read malformed Codex trajectory metadata",
+  );
+}
+
+function parentThreadId(context: AppaMatchContext): string | undefined {
+  const turn = parseJsonHeader(context.headers, "x-codex-turn-metadata");
+  const parent =
+    stringField(turn?.parent_thread_id) ?? stringField(turn?.parent_id);
+  if (parent) return parent;
+  const body = asRecord(context.requestBody);
+  const metadata = asRecord(body?.client_metadata) ?? asRecord(body?.metadata);
+  const nested = turnMetadataRecord(metadata?.["x-codex-turn-metadata"]);
+  return (
+    stringField(metadata?.parent_thread_id) ??
+    stringField(metadata?.parent_id) ??
+    stringField(metadata?.["x-codex-parent-thread-id"]) ??
+    stringField(nested?.parent_thread_id) ??
+    stringField(nested?.parent_id) ??
+    undefined
+  );
+}
+
+function turnMetadataRecord(
+  value: unknown,
+): Record<string, unknown> | undefined {
+  if (typeof value === "string") return parseTurnMetadataJson(value);
+  return asRecord(value);
+}
+
+/**
+ * Removes the child carriers from Codex's turn metadata and keeps the rest of
+ * it: the Codex backend reads other turn state there, such as the user's
+ * decision to continue a chat that its misalignment monitor paused. Metadata
+ * that cannot be read is dropped whole, so no carrier can hide in it.
+ */
+function stripTurnMetadataCarriers(metadata: Record<string, unknown>): void {
+  const value = metadata["x-codex-turn-metadata"];
+  if (value === undefined) return;
+  let turn: Record<string, unknown> | undefined;
+  try {
+    turn = turnMetadataRecord(value);
+  } catch {
+    turn = undefined;
+  }
+  if (!turn) {
+    delete metadata["x-codex-turn-metadata"];
+    return;
+  }
+  stripRecordFields(turn, CODEX_CHILD_CARRIER_FIELDS);
+  metadata["x-codex-turn-metadata"] =
+    typeof value === "string" ? JSON.stringify(turn) : turn;
+}
+
+function childThreadId(
+  context: AppaMatchContext,
+  parentNativeId: string | undefined,
+): string | undefined {
+  const turn = parseJsonHeader(context.headers, "x-codex-turn-metadata");
+  // A thread or session id names the requester's own trajectory: without a
+  // parent thread placing it under a spawn it is the root's id, never a child
+  // identity. Only an explicit agent claim stands alone.
+  const child =
+    stringField(turn?.agent_id) ??
+    (parentNativeId
+      ? (stringField(turn?.thread_id) ?? stringField(turn?.session_id))
+      : undefined);
+  if (child && child !== parentNativeId) return child;
+  const body = asRecord(context.requestBody);
+  const metadata = asRecord(body?.client_metadata) ?? asRecord(body?.metadata);
+  const nested = turnMetadataClaims(metadata?.["x-codex-turn-metadata"]);
+  const fromMetadata =
+    stringField(metadata?.agent_id) ??
+    stringField(metadata?.child_thread_id) ??
+    (parentNativeId
+      ? (stringField(metadata?.thread_id) ?? nested?.threadId)
+      : undefined);
+  // The body metadata fallback is a compat path a client fully controls, so a
+  // present malformed claim is rejected rather than bound as a child id.
+  return fromMetadata && fromMetadata !== parentNativeId
+    ? nativeId(fromMetadata, "Codex child thread id")
+    : undefined;
+}

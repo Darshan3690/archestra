@@ -1,0 +1,39 @@
+{
+  "name": "bucketco__bucket-javascript-sdk__packages__cli-model-context-protocol",
+  "display_name": "cli#model-context-protocol",
+  "description": "JS/TS SDKs for Bucket.co",
+  "author": {
+    "name": "bucketco"
+  },
+  "server": {
+    "command": "npx",
+    "args": ["-y", "@bucketco/cli"],
+    "env": {},
+    "type": "local"
+  },
+  "readme": null,
+  "category": "Development",
+  "programming_language": "TypeScript",
+  "github_info": {
+    "owner": "bucketco",
+    "repo": "bucket-javascript-sdk",
+    "url": "https://github.com/bucketco/bucket-javascript-sdk/tree/main/packages/cli#model-context-protocol",
+    "name": "bucketco__bucket-javascript-sdk__packages__cli#model-context-protocol",
+    "path": "packages/cli#model-context-protocol",
+    "stars": 12,
+    "contributors": 11,
+    "issues": 6,
+    "releases": true,
+    "ci_cd": true,
+    "latest_commit_hash": "c84de685346c3c6fe22cc5369bab8081872a0eaf"
+  },
+  "user_config": {},
+  "archestra_config": {
+    "oauth": {
+      "provider": null,
+      "required": false
+    },
+    "client_config_permutations": null,
+    "works_in_archestra": false
+  }
+}

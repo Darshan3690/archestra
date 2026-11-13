@@ -1,0 +1,2679 @@
+import { createHash } from "node:crypto";
+import { ARCHESTRA_MCP_CATALOG_ID } from "@archestra/shared";
+import { eq } from "drizzle-orm";
+import { vi } from "vitest";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
+import config from "@/config";
+import db, { schema } from "@/database";
+import { enterpriseTier } from "@/enterprise-tier";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import * as embeddingClients from "@/knowledge-base/embedding-clients";
+import GuardrailsPolicyModel from "@/models/guardrails-policy";
+import KbConnectorDocumentCountModel from "@/models/kb-connector-document-count";
+import KbDocumentModel from "@/models/kb-document";
+import KnowledgeBaseConnectorModel from "@/models/knowledge-base-connector";
+import LlmProviderApiKeyModel from "@/models/llm-provider-api-key";
+import LlmProviderApiKeyModelLinkModel from "@/models/llm-provider-api-key-model";
+import McpServerModel from "@/models/mcp-server";
+import ModelModel from "@/models/model";
+import OrganizationModel from "@/models/organization";
+import ToolModel from "@/models/tool";
+import { openappaBatteriesService } from "@/openappa/batteries";
+import { initialPolicy } from "@/services/guardrails-policy";
+import { knowledgeSettingsService } from "@/services/knowledge-settings";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import type { User } from "@/types";
+
+const VALID_PNG_BASE64 =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/58BAwAI/AL+hc2rNAAAAABJRU5ErkJggg==";
+
+describe("organization routes", () => {
+  let app: FastifyInstanceWithZod;
+  let user: User;
+  let organizationId: string;
+
+  beforeEach(async ({ makeOrganization, makeUser, makeMember }) => {
+    user = await makeUser();
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    // The default-role field decides what future accounts are provisioned as,
+    // so the route holds the caller to the roles they could grant themselves.
+    // That reads the caller's role off their member record.
+    await makeMember(user.id, organizationId, { role: "admin" });
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { user: unknown }).user = user;
+      (
+        request as typeof request & {
+          organizationId: string;
+        }
+      ).organizationId = organizationId;
+    });
+
+    const { default: organizationRoutes } = await import("./organization");
+    // The audit hook is part of the route contract here: the OCR settings
+    // tests assert the organization.updated before/after diff.
+    const { registerAuditLogHook } = await import(
+      "@/middleware/audit-log-hook"
+    );
+    registerAuditLogHook(app);
+    await app.register(organizationRoutes);
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    // appearance-settings updates sync the branding singleton; reset it so an
+    // app name never leaks into a later (shuffled) test.
+    archestraMcpBranding.syncFromOrganization(null);
+    await app.close();
+  });
+
+  test("syncs built-in MCP branding when appName changes under full white labeling", async () => {
+    const syncSpy = vi
+      .spyOn(ToolModel, "syncArchestraBuiltInCatalog")
+      .mockResolvedValue([]);
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/appearance-settings",
+      payload: {
+        appName: "Acme Copilot",
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(syncSpy).toHaveBeenCalledWith({
+      organization: expect.objectContaining({
+        appName: "Acme Copilot",
+      }),
+    });
+  });
+
+  test("refuses an appName whose built-in tool prefix an MCP server already gives its tools", async ({
+    makeInternalMcpCatalog,
+  }) => {
+    const wasWhiteLabeled = config.enterpriseFeatures.fullWhiteLabeling;
+    config.enterpriseFeatures.fullWhiteLabeling = true;
+    try {
+      await makeInternalMcpCatalog({ organizationId, name: "acme copilot" });
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { appName: "Acme Copilot" },
+      });
+
+      expect(response.statusCode).toBe(409);
+      expect(
+        (await OrganizationModel.getById(organizationId))?.appName,
+      ).not.toBe("Acme Copilot");
+    } finally {
+      config.enterpriseFeatures.fullWhiteLabeling = wasWhiteLabeled;
+    }
+  });
+
+  test("a saved policy's built-in alias follows an appName change", async () => {
+    const wasWhiteLabeled = config.enterpriseFeatures.fullWhiteLabeling;
+    const wasEnabled = config.openappa.enabled;
+    config.enterpriseFeatures.fullWhiteLabeling = true;
+    config.openappa.enabled = true;
+    try {
+      await ToolModel.seedArchestraTools(ARCHESTRA_MCP_CATALOG_ID);
+      const content = initialPolicy();
+      await GuardrailsPolicyModel.save({
+        organizationId,
+        updatedBy: user.id,
+        content,
+        contentHash: createHash("sha256").update(content).digest("hex"),
+        expectedRevision: 0,
+      });
+      const archestra = async () =>
+        (
+          await openappaBatteriesService.policyDeclarations(organizationId)
+        ).batteries.find((battery) => battery.name === "archestra");
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { appName: "Acme Copilot" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(await archestra()).toMatchObject({
+        status: "active",
+        servers: [
+          { target: "acme_copilot", catalogId: ARCHESTRA_MCP_CATALOG_ID },
+        ],
+      });
+    } finally {
+      config.enterpriseFeatures.fullWhiteLabeling = wasWhiteLabeled;
+      config.openappa.enabled = wasEnabled;
+    }
+  });
+
+  test("re-brands the built-in skill rows when appName changes", async () => {
+    vi.spyOn(ToolModel, "syncArchestraBuiltInCatalog").mockResolvedValue([]);
+    const { syncBuiltInSkillsForOrganization } = await import(
+      "@/services/seed"
+    );
+    const { SkillModel } = await import("@/models");
+    const { getEnabledBuiltInSkills, builtInSkillSourceRef } = await import(
+      "@/skills/built-in-skills"
+    );
+    const [base] = getEnabledBuiltInSkills();
+    const sourceRef = builtInSkillSourceRef(base.builtInSkillId);
+
+    // seed the canonical (un-branded) built-in skill first.
+    await syncBuiltInSkillsForOrganization({
+      id: organizationId,
+      appName: null,
+      iconLogo: null,
+    });
+    const before = await SkillModel.findBuiltIn({ organizationId, sourceRef });
+    expect(before?.name).toBe("Archestra Platform Operations");
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/appearance-settings",
+      payload: { appName: "Acme Copilot" },
+    });
+    expect(response.statusCode).toBe(200);
+
+    // the stored row re-brands immediately — no backend restart needed.
+    const after = await SkillModel.findBuiltIn({ organizationId, sourceRef });
+    expect(after?.name).toBe("Acme Copilot Platform Operations");
+    expect(after?.content).not.toContain("Archestra");
+  });
+
+  describe("PATCH /api/organization/agent-settings - model/key pair", () => {
+    test("rejects a default model with no API key", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: { defaultModelId: crypto.randomUUID() },
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+
+    test("allows clearing both the default model and API key together", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: { defaultModelId: null, defaultLlmApiKeyId: null },
+      });
+
+      expect(response.statusCode).toBe(200);
+    });
+
+    test("accepts a complete linked default model and API key", async ({
+      makeLlmProviderApiKey,
+      makeSecret,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const key = await makeLlmProviderApiKey(organizationId, secret.id, {
+        provider: "openai",
+      });
+      const model = await ModelModel.create({
+        externalId: "openai/organization-default-linked-test",
+        provider: "openai",
+        modelId: "organization-default-linked-test",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        lastSyncedAt: new Date(),
+      });
+      await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(key.id, [
+        model.id,
+      ]);
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: { defaultModelId: model.id, defaultLlmApiKeyId: key.id },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        defaultModelId: model.id,
+        defaultLlmApiKeyId: key.id,
+      });
+    });
+
+    test("rejects a complete but unlinked default model and API key", async ({
+      makeLlmProviderApiKey,
+      makeSecret,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const key = await makeLlmProviderApiKey(organizationId, secret.id, {
+        provider: "openai",
+      });
+      const model = await ModelModel.create({
+        externalId: "openai/organization-default-unlinked-test",
+        provider: "openai",
+        modelId: "organization-default-unlinked-test",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        lastSyncedAt: new Date(),
+      });
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: { defaultModelId: model.id, defaultLlmApiKeyId: key.id },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toContain("must be linked");
+    });
+
+    test("rejects a non-OpenAI default for Codex runtime Agents that inherit it", async ({
+      makeAgent,
+      makeLlmProviderApiKey,
+      makeSecret,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const key = await makeLlmProviderApiKey(organizationId, secret.id, {
+        provider: "gemini",
+      });
+      const model = await ModelModel.create({
+        externalId: "gemini/organization-default-runtime-test",
+        provider: "gemini",
+        modelId: "organization-default-runtime-test",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        lastSyncedAt: new Date(),
+      });
+      await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(key.id, [
+        model.id,
+      ]);
+      await makeAgent({
+        organizationId,
+        authorId: user.id,
+        name: "Inheriting Codex Agent",
+        agentType: "agent",
+        access: "personal",
+        runtime: {
+          image: "example.com/coding-agent:latest",
+          command: ["archestra-codex"],
+          inferenceProtocol: "openai_responses",
+          backend: "kubernetes",
+          steerMode: "pipe",
+          privileged: false,
+          environment: null,
+          credentials: null,
+          ttlHours: null,
+          maxCostUsd: null,
+          idleTimeoutMinutes: null,
+        },
+      });
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: { defaultModelId: model.id, defaultLlmApiKeyId: key.id },
+      });
+
+      expect(response.statusCode).toBe(409);
+      // The admin can unblock themselves only if told which agents block the
+      // default and how to fix them.
+      const message = response.json().error.message;
+      expect(message).toContain('"Inheriting Codex Agent"');
+      expect(message).toContain("Give that agent a model of its own");
+    });
+
+    test.for([
+      ["subscription", 200],
+      ["automatic", 200],
+      ["provider", 409],
+    ] as const)("checks the default model against a Claude Code runtime using %s authentication", async ([
+      authentication,
+      expectedStatus,
+    ], { makeAgent, makeLlmProviderApiKey, makeSecret }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const key = await makeLlmProviderApiKey(organizationId, secret.id, {
+        provider: "openai",
+      });
+      const model = await ModelModel.create({
+        externalId: "openai/gateway-model",
+        provider: "openai",
+        modelId: "gateway-model",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        lastSyncedAt: new Date(),
+      });
+      await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(key.id, [
+        model.id,
+      ]);
+      await makeAgent({
+        organizationId,
+        authorId: user.id,
+        agentType: "agent",
+        access: "personal",
+        runtime: {
+          image: "example.com/claude-code:latest",
+          command: ["archestra-claude-code"],
+          inferenceProtocol: "anthropic",
+          backend: "kubernetes",
+          steerMode: "pipe",
+          privileged: false,
+          environment: null,
+          credentials: null,
+          ttlHours: null,
+          maxCostUsd: null,
+          idleTimeoutMinutes: null,
+          ...(authentication !== "automatic" && {
+            claudeCode: { authentication },
+          }),
+        },
+      });
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: { defaultModelId: model.id, defaultLlmApiKeyId: key.id },
+      });
+
+      expect(response.statusCode).toBe(expectedStatus);
+      if (expectedStatus === 200) {
+        expect(response.json()).toMatchObject({
+          defaultModelId: model.id,
+          defaultLlmApiKeyId: key.id,
+        });
+      }
+    });
+
+    test("does not apply the default compatibility check to explicit runtime overrides", async ({
+      makeAgent,
+      makeLlmProviderApiKey,
+      makeSecret,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const geminiKey = await makeLlmProviderApiKey(organizationId, secret.id, {
+        provider: "gemini",
+      });
+      const geminiModel = await ModelModel.create({
+        externalId: "gemini/organization-default-explicit-test",
+        provider: "gemini",
+        modelId: "organization-default-explicit-test",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        lastSyncedAt: new Date(),
+      });
+      await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(geminiKey.id, [
+        geminiModel.id,
+      ]);
+      const anthropicKey = await makeLlmProviderApiKey(
+        organizationId,
+        secret.id,
+        {
+          provider: "anthropic",
+        },
+      );
+      const anthropicModel = await ModelModel.create({
+        externalId: "anthropic/organization-explicit-runtime-test",
+        provider: "anthropic",
+        modelId: "organization-explicit-runtime-test",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        lastSyncedAt: new Date(),
+      });
+      await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(
+        anthropicKey.id,
+        [anthropicModel.id],
+      );
+      await makeAgent({
+        organizationId,
+        authorId: user.id,
+        agentType: "agent",
+        access: "personal",
+        llmApiKeyId: anthropicKey.id,
+        modelId: anthropicModel.id,
+        runtime: {
+          image: "example.com/coding-agent:latest",
+          command: null,
+          inferenceProtocol: "anthropic",
+          backend: "kubernetes",
+          steerMode: "pipe",
+          privileged: false,
+          environment: null,
+          credentials: null,
+          ttlHours: null,
+          maxCostUsd: null,
+          idleTimeoutMinutes: null,
+        },
+      });
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: {
+          defaultModelId: geminiModel.id,
+          defaultLlmApiKeyId: geminiKey.id,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+    });
+  });
+
+  describe("GET /api/organization/agent-settings/default-model-dependents", () => {
+    test("lists the Agent Runtime agents that run on the default model, including ones whose own pair resolution skips", async ({
+      makeAgent,
+      makeLlmProviderApiKey,
+      makeSecret,
+    }) => {
+      const runtime = {
+        image: "example.com/coding-agent:latest",
+        command: ["archestra-claude-code"],
+        inferenceProtocol: "anthropic" as const,
+        backend: "kubernetes" as const,
+        steerMode: "pipe" as const,
+        privileged: false,
+        environment: null,
+        credentials: null,
+        ttlHours: null,
+        maxCostUsd: null,
+        idleTimeoutMinutes: null,
+      };
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const key = await makeLlmProviderApiKey(organizationId, secret.id, {
+        provider: "anthropic",
+      });
+      const unlinkedKey = await makeLlmProviderApiKey(
+        organizationId,
+        secret.id,
+        { provider: "anthropic" },
+      );
+      const model = await ModelModel.create({
+        externalId: "anthropic/organization-dependents-test",
+        provider: "anthropic",
+        modelId: "organization-dependents-test",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        lastSyncedAt: new Date(),
+      });
+      await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(key.id, [
+        model.id,
+      ]);
+      const agent = (
+        name: string,
+        own: { llmApiKeyId?: string; modelId?: string } = {},
+      ) =>
+        makeAgent({
+          organizationId,
+          authorId: user.id,
+          name,
+          agentType: "agent",
+          access: "personal",
+          runtime,
+          ...own,
+        });
+      const noPair = await agent("No model of its own");
+      const halfPair = await agent("Model without a key", {
+        modelId: model.id,
+      });
+      const unlinkedPair = await agent("Model no longer on its key", {
+        llmApiKeyId: unlinkedKey.id,
+        modelId: model.id,
+      });
+      await agent("Has its own model", {
+        llmApiKeyId: key.id,
+        modelId: model.id,
+      });
+      await makeAgent({
+        organizationId,
+        authorId: user.id,
+        name: "No runtime",
+        agentType: "agent",
+        access: "personal",
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/organization/agent-settings/default-model-dependents",
+      });
+
+      expect(response.statusCode).toBe(200);
+      const dependent = (id: string, name: string) => ({
+        id,
+        name,
+        canUpdate: true,
+        runtimeCommand: ["archestra-claude-code"],
+        inferenceProtocol: "anthropic",
+      });
+      expect(response.json()).toEqual({
+        hiddenBlockingCount: 0,
+        agents: expect.arrayContaining([
+          dependent(noPair.id, "No model of its own"),
+          dependent(halfPair.id, "Model without a key"),
+          dependent(unlinkedPair.id, "Model no longer on its key"),
+        ]),
+      });
+      expect(response.json().agents).toHaveLength(3);
+    });
+
+    test("marks agents the caller can read but not update", async ({
+      makeAgent,
+      makeCustomRole,
+      makeMember,
+      makeUser,
+    }) => {
+      const agent = await makeAgent({
+        organizationId,
+        authorId: user.id,
+        name: "Read-only to this role",
+        agentType: "agent",
+        access: "org",
+        runtime: {
+          image: "example.com/coding-agent:latest",
+          command: ["archestra-claude-code"],
+          inferenceProtocol: "anthropic",
+          backend: "kubernetes",
+          steerMode: "pipe",
+          privileged: false,
+          environment: null,
+          credentials: null,
+          ttlHours: null,
+          maxCostUsd: null,
+          idleTimeoutMinutes: null,
+        },
+      });
+      await makeCustomRole(organizationId, {
+        role: "settings_reader",
+        permission: {
+          organizationSettings: ["read", "update"],
+          agent: ["read"],
+        },
+      });
+      const admin = user;
+      user = await makeUser();
+      await makeMember(user.id, organizationId, { role: "settings_reader" });
+      try {
+        const response = await app.inject({
+          method: "GET",
+          url: "/api/organization/agent-settings/default-model-dependents",
+        });
+        expect(response.json().agents).toEqual([
+          expect.objectContaining({ id: agent.id, canUpdate: false }),
+        ]);
+      } finally {
+        user = admin;
+      }
+    });
+
+    test("names every blocking agent the caller can read, and only counts the ones it can't", async ({
+      makeAgent,
+      makeLlmProviderApiKey,
+      makeMember,
+      makeSecret,
+      makeUser,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const key = await makeLlmProviderApiKey(organizationId, secret.id, {
+        provider: "openai",
+      });
+      const model = await ModelModel.create({
+        externalId: "openai/organization-visibility-test",
+        provider: "openai",
+        modelId: "organization-visibility-test",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        lastSyncedAt: new Date(),
+      });
+      await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(key.id, [
+        model.id,
+      ]);
+      const names = ["Agent A", "Agent B", "Agent C", "Agent D"];
+      for (const name of names) {
+        await makeAgent({
+          organizationId,
+          authorId: user.id,
+          name,
+          agentType: "agent",
+          access: "personal",
+          runtime: {
+            image: "example.com/claude-code:latest",
+            command: ["archestra-claude-code"],
+            inferenceProtocol: "anthropic",
+            backend: "kubernetes",
+            steerMode: "pipe",
+            privileged: false,
+            environment: null,
+            credentials: null,
+            ttlHours: null,
+            maxCostUsd: null,
+            idleTimeoutMinutes: null,
+            claudeCode: { authentication: "provider" },
+          },
+        });
+      }
+      const save = () =>
+        app.inject({
+          method: "PATCH",
+          url: "/api/organization/agent-settings",
+          payload: { defaultModelId: model.id, defaultLlmApiKeyId: key.id },
+        });
+
+      const asAdmin = await save();
+      expect(asAdmin.statusCode).toBe(409);
+      for (const name of names) {
+        expect(asAdmin.json().error.message).toContain(`"${name}"`);
+      }
+
+      // Another member can't read these personal agents: the conflict and
+      // the dependents list count them without naming them.
+      const admin = user;
+      user = await makeUser();
+      await makeMember(user.id, organizationId, { role: "member" });
+      try {
+        const asMember = await save();
+        expect(asMember.statusCode).toBe(409);
+        const message = asMember.json().error.message;
+        expect(message).toContain("4 Agent Runtime agents you can't view");
+        expect(message).toContain("Their runtimes can't use it.");
+        for (const name of names) expect(message).not.toContain(name);
+        // Nothing about their runtimes either.
+        expect(message).not.toMatch(/Claude|Anthropic|protocol|endpoint/i);
+
+        const dependents = await app.inject({
+          method: "GET",
+          url: "/api/organization/agent-settings/default-model-dependents",
+        });
+        // Nothing about agents the caller can't read: not even their runtimes.
+        expect(dependents.json()).toEqual({
+          agents: [],
+          hiddenBlockingCount: 0,
+        });
+        // Only a count, for a candidate default the settings page checks.
+        const forCandidate = await app.inject({
+          method: "GET",
+          url: `/api/organization/agent-settings/default-model-dependents?modelId=${model.id}`,
+        });
+        expect(forCandidate.json()).toEqual({
+          agents: [],
+          hiddenBlockingCount: 4,
+        });
+      } finally {
+        user = admin;
+      }
+    });
+  });
+
+  describe("PATCH /api/organization/agent-settings - default trio", () => {
+    async function setupKey(
+      makeLlmProviderApiKey: (
+        organizationId: string,
+        secretId: null,
+        overrides: { provider: "anthropic" },
+      ) => Promise<{ id: string }>,
+    ) {
+      const key = await makeLlmProviderApiKey(organizationId, null, {
+        provider: "anthropic",
+      });
+      const create = (modelId: string, supportsToolCalling = true) =>
+        ModelModel.create({
+          externalId: `anthropic/${modelId}`,
+          provider: "anthropic",
+          modelId,
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+          supportsToolCalling,
+          lastSyncedAt: new Date(),
+        });
+      const [normal, fast, noTools] = await Promise.all([
+        create("trio-test-normal"),
+        create("trio-test-fast"),
+        create("trio-test-no-tools", false),
+      ]);
+      await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(key.id, [
+        normal.id,
+        fast.id,
+        noTools.id,
+      ]);
+      return { key, normal, fast, noTools };
+    }
+
+    test("saves fast and smart on the default key and records the audit change", async ({
+      makeLlmProviderApiKey,
+    }) => {
+      const { key, normal, fast } = await setupKey(makeLlmProviderApiKey);
+      const trio = {
+        defaultLlmApiKeyId: key.id,
+        defaultModelId: normal.id,
+        defaultFastModelId: fast.id,
+        defaultSmartModelId: normal.id,
+      };
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: trio,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject(trio);
+      await vi.waitFor(async () => {
+        const [audit] = await db
+          .select()
+          .from(schema.auditLogsTable)
+          .where(eq(schema.auditLogsTable.action, "organization.updated"));
+        expect(audit?.before).toMatchObject({ defaultFastModelId: null });
+        expect(audit?.after).toMatchObject({
+          defaultFastModelId: fast.id,
+          defaultSmartModelId: normal.id,
+        });
+      });
+    });
+
+    test("accepts tiers on other providers than the default key's", async ({
+      makeLlmProviderApiKey,
+    }) => {
+      const { key, normal } = await setupKey(makeLlmProviderApiKey);
+      const otherProvider = await ModelModel.create({
+        externalId: "openai/trio-test-fast",
+        provider: "openai",
+        modelId: "trio-test-fast",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        lastSyncedAt: new Date(),
+      });
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: {
+          defaultLlmApiKeyId: key.id,
+          defaultModelId: normal.id,
+          defaultFastModelId: otherProvider.id,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        defaultFastModelId: otherProvider.id,
+      });
+    });
+
+    test("rejects a tier that cannot call tools", async ({
+      makeLlmProviderApiKey,
+    }) => {
+      const { key, normal, noTools } = await setupKey(makeLlmProviderApiKey);
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: {
+          defaultLlmApiKeyId: key.id,
+          defaultModelId: normal.id,
+          defaultSmartModelId: noTools.id,
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+
+    test("accepts tiers without a default key", async ({
+      makeLlmProviderApiKey,
+    }) => {
+      const { fast } = await setupKey(makeLlmProviderApiKey);
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: { defaultFastModelId: fast.id },
+      });
+
+      expect(response.statusCode).toBe(200);
+    });
+
+    test("rejects a tier that does not exist", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: { defaultSmartModelId: crypto.randomUUID() },
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+  });
+
+  describe("PATCH /api/organization/auth-settings - default member role", () => {
+    test("persists multiple default roles and records the audit change", async ({
+      makeCustomRole,
+    }) => {
+      const role = await makeCustomRole(organizationId);
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/auth-settings",
+        payload: { defaultMemberRole: `member,${role.role}` },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().defaultMemberRole).toBe(`member,${role.role}`);
+      expect(await OrganizationModel.getDefaultMemberRole(organizationId)).toBe(
+        `member,${role.role}`,
+      );
+      await vi.waitFor(async () => {
+        const [audit] = await db
+          .select()
+          .from(schema.auditLogsTable)
+          .where(eq(schema.auditLogsTable.action, "organization.updated"));
+        expect(audit?.before).toMatchObject({ defaultMemberRole: null });
+        expect(audit?.after).toMatchObject({
+          defaultMemberRole: `member,${role.role}`,
+        });
+      });
+    });
+
+    test("accepts a predefined role", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/auth-settings",
+        payload: { defaultMemberRole: "admin" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().defaultMemberRole).toBe("admin");
+    });
+
+    test("rejects a role that does not exist in the org", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/auth-settings",
+        payload: { defaultMemberRole: "member,nonexistent-role" },
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+
+    test("rejects a default role more privileged than the caller", async ({
+      makeUser,
+      makeMember,
+      makeCustomRole,
+    }) => {
+      const provisionerRole = await makeCustomRole(organizationId, {
+        role: "member_provisioner",
+        permission: { member: ["create"], organizationSettings: ["update"] },
+      });
+      const editor = await makeUser();
+      await makeMember(editor.id, organizationId, {
+        role: `member,${provisionerRole.role}`,
+      });
+      user = editor;
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/auth-settings",
+        payload: { defaultMemberRole: "member,admin" },
+      });
+
+      expect(response.statusCode).toBe(403);
+      expect(
+        await OrganizationModel.getDefaultMemberRole(organizationId),
+      ).not.toBe("admin");
+    });
+  });
+
+  describe("PATCH /api/organization/mcp-settings - online catalog", () => {
+    test("defaults onlineMcpCatalogEnabled to true for a new organization", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/organization",
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().onlineMcpCatalogEnabled).toBe(true);
+    });
+
+    test("disables the online catalog and persists it", async () => {
+      const disable = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/mcp-settings",
+        payload: { onlineMcpCatalogEnabled: false },
+      });
+
+      expect(disable.statusCode).toBe(200);
+      expect(disable.json().onlineMcpCatalogEnabled).toBe(false);
+
+      const afterDisable = await app.inject({
+        method: "GET",
+        url: "/api/organization",
+      });
+      expect(afterDisable.json().onlineMcpCatalogEnabled).toBe(false);
+    });
+
+    test("re-enables the online catalog", async () => {
+      await app.inject({
+        method: "PATCH",
+        url: "/api/organization/mcp-settings",
+        payload: { onlineMcpCatalogEnabled: false },
+      });
+
+      const enable = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/mcp-settings",
+        payload: { onlineMcpCatalogEnabled: true },
+      });
+
+      expect(enable.statusCode).toBe(200);
+      expect(enable.json().onlineMcpCatalogEnabled).toBe(true);
+    });
+
+    test("captures the catalog toggle in the audit snapshot", async () => {
+      await app.inject({
+        method: "PATCH",
+        url: "/api/organization/mcp-settings",
+        payload: { onlineMcpCatalogEnabled: false },
+      });
+
+      const snapshot = await OrganizationModel.findByIdForAudit(
+        organizationId,
+        organizationId,
+      );
+      expect(snapshot?.onlineMcpCatalogEnabled).toBe(false);
+    });
+
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    describe("idle hibernation", () => {
+      test("defaults to off for a new organization", async () => {
+        // Hibernation trades first-call latency for idle compute. That is a
+        // decision to make deliberately, so it is never on by default.
+        const response = await app.inject({
+          method: "GET",
+          url: "/api/organization",
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(response.json().mcpIdleHibernationEnabled).toBe(false);
+      });
+
+      test("enables idle hibernation and persists it", async () => {
+        enterpriseTier.setUserCountForTesting(0); // small-team tier = licensed
+        const grantIdleWindow = vi.spyOn(
+          McpServerModel,
+          "grantIdleWindowToAll",
+        );
+
+        const enable = await app.inject({
+          method: "PATCH",
+          url: "/api/organization/mcp-settings",
+          payload: { mcpIdleHibernationEnabled: true },
+        });
+
+        expect(enable.statusCode).toBe(200);
+        expect(enable.json().mcpIdleHibernationEnabled).toBe(true);
+        expect(grantIdleWindow).toHaveBeenCalledTimes(1);
+
+        const afterEnable = await app.inject({
+          method: "GET",
+          url: "/api/organization",
+        });
+        expect(afterEnable.json().mcpIdleHibernationEnabled).toBe(true);
+      });
+
+      test("403s without an enterprise licence", async () => {
+        config.enterpriseFeatures.core = false;
+        enterpriseTier.setUserCountForTesting(9999); // over the free threshold
+
+        const response = await app.inject({
+          method: "PATCH",
+          url: "/api/organization/mcp-settings",
+          payload: { mcpIdleHibernationEnabled: true },
+        });
+
+        expect(response.statusCode).toBe(403);
+        expect(response.json().error.message).toContain("sales@archestra.ai");
+        // Refused, not silently dropped: the stored value is untouched.
+        const organization = await OrganizationModel.getById(organizationId);
+        expect(organization?.mcpIdleHibernationEnabled).toBe(false);
+      });
+
+      test("403s on an unlicensed attempt to turn it OFF too", async () => {
+        // Refusing only the "on" direction would let an unlicensed deployment
+        // believe it had disabled a feature it never had.
+        config.enterpriseFeatures.core = false;
+        enterpriseTier.setUserCountForTesting(9999);
+
+        const response = await app.inject({
+          method: "PATCH",
+          url: "/api/organization/mcp-settings",
+          payload: { mcpIdleHibernationEnabled: false },
+        });
+
+        expect(response.statusCode).toBe(403);
+      });
+
+      test("leaves the licensed catalog toggle alone when hibernation is absent", async () => {
+        config.enterpriseFeatures.core = false;
+        enterpriseTier.setUserCountForTesting(9999);
+
+        const response = await app.inject({
+          method: "PATCH",
+          url: "/api/organization/mcp-settings",
+          payload: { onlineMcpCatalogEnabled: false },
+        });
+
+        expect(response.statusCode).toBe(200);
+      });
+
+      test("captures the hibernation toggle in the audit snapshot", async () => {
+        enterpriseTier.setUserCountForTesting(0);
+        await app.inject({
+          method: "PATCH",
+          url: "/api/organization/mcp-settings",
+          payload: { mcpIdleHibernationEnabled: true },
+        });
+
+        const snapshot = await OrganizationModel.findByIdForAudit(
+          organizationId,
+          organizationId,
+        );
+        expect(snapshot?.mcpIdleHibernationEnabled).toBe(true);
+      });
+    });
+    // SPDX-SnippetEnd
+  });
+
+  describe("PATCH /api/organization/skills-settings - online catalog", () => {
+    test("defaults onlineSkillCatalogEnabled to true for a new organization", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/organization",
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().onlineSkillCatalogEnabled).toBe(true);
+    });
+
+    test("disables the online catalog and persists it", async () => {
+      const disable = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/skills-settings",
+        payload: { onlineSkillCatalogEnabled: false },
+      });
+
+      expect(disable.statusCode).toBe(200);
+      expect(disable.json().onlineSkillCatalogEnabled).toBe(false);
+
+      const afterDisable = await app.inject({
+        method: "GET",
+        url: "/api/organization",
+      });
+      expect(afterDisable.json().onlineSkillCatalogEnabled).toBe(false);
+    });
+
+    test("re-enables the online catalog", async () => {
+      await app.inject({
+        method: "PATCH",
+        url: "/api/organization/skills-settings",
+        payload: { onlineSkillCatalogEnabled: false },
+      });
+
+      const enable = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/skills-settings",
+        payload: { onlineSkillCatalogEnabled: true },
+      });
+
+      expect(enable.statusCode).toBe(200);
+      expect(enable.json().onlineSkillCatalogEnabled).toBe(true);
+    });
+
+    test("captures the catalog toggle in the audit snapshot", async () => {
+      await app.inject({
+        method: "PATCH",
+        url: "/api/organization/skills-settings",
+        payload: { onlineSkillCatalogEnabled: false },
+      });
+
+      const snapshot = await OrganizationModel.findByIdForAudit(
+        organizationId,
+        organizationId,
+      );
+      expect(snapshot?.onlineSkillCatalogEnabled).toBe(false);
+    });
+  });
+
+  describe("PATCH /api/organization/connection-settings - default provider keys", () => {
+    test("saves handoff instructions and records their audit diff", async () => {
+      await OrganizationModel.patch(organizationId, {
+        connectionRuntimeHandoffEnabled: false,
+      });
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/connection-settings",
+        payload: {
+          connectionRuntimeHandoffEnabled: true,
+          connectionRuntimeHandoffInstructions: "  Offer overnight work.  ",
+        },
+      });
+      expect(response.statusCode, response.body).toBe(200);
+      expect(await OrganizationModel.getById(organizationId)).toMatchObject({
+        connectionRuntimeHandoffEnabled: true,
+        connectionRuntimeHandoffInstructions: "Offer overnight work.",
+      });
+      const [audit] = await db
+        .select()
+        .from(schema.auditLogsTable)
+        .where(eq(schema.auditLogsTable.action, "organization.updated"));
+      expect(audit?.before).toMatchObject({
+        connectionRuntimeHandoffEnabled: false,
+        connectionRuntimeHandoffInstructions: null,
+      });
+      expect(audit?.after).toMatchObject({
+        connectionRuntimeHandoffEnabled: true,
+        connectionRuntimeHandoffInstructions: "Offer overnight work.",
+      });
+      const reset = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/connection-settings",
+        payload: {
+          connectionRuntimeHandoffEnabled: false,
+          connectionRuntimeHandoffInstructions: null,
+        },
+      });
+      expect(reset.statusCode).toBe(200);
+      expect(reset.json()).toMatchObject({
+        connectionRuntimeHandoffEnabled: false,
+        connectionRuntimeHandoffInstructions: null,
+      });
+    });
+
+    test.each([
+      "   ",
+      "x".repeat(20001),
+      "bad\u0000text",
+    ])("rejects invalid handoff instructions (%#)", async (instructions) => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/connection-settings",
+        payload: { connectionRuntimeHandoffInstructions: instructions },
+      });
+      expect(response.statusCode).toBe(400);
+    });
+
+    test("rejects a per-user provider (GitHub Copilot) as a default key", async () => {
+      const key = await LlmProviderApiKeyModel.create({
+        organizationId,
+        secretId: null,
+        name: "Copilot",
+        provider: "github-copilot",
+        scope: "personal",
+        userId: user.id,
+        teamId: null,
+      });
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/connection-settings",
+        payload: {
+          connectionClientProviderKeys: {
+            cursor: [{ provider: "github-copilot", providerApiKeyId: key.id }],
+          },
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(400);
+      expect(response.json().error.message).toMatch(/per-user/);
+    });
+
+    test("accepts a non-per-user provider default key", async () => {
+      const key = await LlmProviderApiKeyModel.create({
+        organizationId,
+        secretId: null,
+        name: "Anthropic",
+        provider: "anthropic",
+        scope: "org",
+        userId: null,
+        teamId: null,
+      });
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/connection-settings",
+        payload: {
+          connectionClientProviderKeys: {
+            "claude-code": [
+              { provider: "anthropic", providerApiKeyId: key.id },
+            ],
+            cursor: [{ provider: "anthropic", providerApiKeyId: key.id }],
+          },
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(200);
+      expect(response.json().connectionClientProviderKeys).toEqual({
+        "claude-code": [{ provider: "anthropic", providerApiKeyId: key.id }],
+        cursor: [{ provider: "anthropic", providerApiKeyId: key.id }],
+      });
+    });
+
+    test("rejects a key for a provider the client can't route", async () => {
+      const key = await LlmProviderApiKeyModel.create({
+        organizationId,
+        secretId: null,
+        name: "OpenAI",
+        provider: "openai",
+        scope: "org",
+        userId: null,
+        teamId: null,
+      });
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/connection-settings",
+        payload: {
+          connectionClientProviderKeys: {
+            "claude-code": [{ provider: "openai", providerApiKeyId: key.id }],
+          },
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(400);
+      expect(response.json().error.message).toMatch(/Claude Code/);
+    });
+  });
+
+  test("does not resync built-in MCP branding when appName is unchanged", async () => {
+    const syncSpy = vi
+      .spyOn(ToolModel, "syncArchestraBuiltInCatalog")
+      .mockResolvedValue([]);
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/appearance-settings",
+      payload: {},
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(syncSpy).not.toHaveBeenCalled();
+  });
+
+  test("does not resync built-in MCP branding when only logo assets change", async () => {
+    const syncSpy = vi
+      .spyOn(ToolModel, "syncArchestraBuiltInCatalog")
+      .mockResolvedValue([]);
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/appearance-settings",
+      payload: {
+        logo: VALID_PNG_BASE64,
+        logoDark: VALID_PNG_BASE64,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(syncSpy).not.toHaveBeenCalled();
+  });
+
+  test("resyncs built-in MCP branding when iconLogo changes", async () => {
+    const syncSpy = vi
+      .spyOn(ToolModel, "syncArchestraBuiltInCatalog")
+      .mockResolvedValue([]);
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/appearance-settings",
+      payload: {
+        iconLogo: VALID_PNG_BASE64,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(syncSpy).toHaveBeenCalledWith({
+      organization: expect.objectContaining({
+        iconLogo: VALID_PNG_BASE64,
+      }),
+    });
+  });
+
+  describe("PATCH /api/organization/appearance-settings - logo validation", () => {
+    test("rejects invalid Base64 payload", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { logo: "data:image/png;base64,NotAnImageJustText" },
+      });
+
+      expect(response.statusCode).toBe(400);
+      const body = response.json();
+      expect(body.error.message).toContain("Base64");
+    });
+
+    test("rejects valid Base64 with non-PNG content", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { logo: "data:image/png;base64,SGVsbG8gV29ybGQ=" },
+      });
+
+      expect(response.statusCode).toBe(400);
+      const body = response.json();
+      expect(body.error.message).toContain("PNG");
+    });
+
+    test("rejects wrong MIME type prefix", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { logo: "data:image/jpeg;base64,/9j/4AAQSkZJRg==" },
+      });
+
+      expect(response.statusCode).toBe(400);
+      const body = response.json();
+      expect(body.error.message).toContain("PNG");
+    });
+
+    test("accepts valid PNG logo and returns correct response", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { logo: VALID_PNG_BASE64 },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.logo).toBe(VALID_PNG_BASE64);
+      expect(body).toHaveProperty("id");
+      expect(body).toHaveProperty("name");
+    });
+
+    test("accepts null logo for removal and maintains other fields", async () => {
+      // First set a logo
+      await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { logo: VALID_PNG_BASE64 },
+      });
+
+      // Then remove it
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { logo: null },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.logo).toBeNull();
+      expect(body).toHaveProperty("id");
+      expect(body).toHaveProperty("name");
+    });
+  });
+
+  describe("PATCH /api/organization/appearance-settings - fields", () => {
+    test("updates and retrieves appName", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { appName: "My Custom App" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().appName).toBe("My Custom App");
+    });
+
+    test("rejects appName exceeding 100 characters", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { appName: "a".repeat(101) },
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+
+    test("updates and retrieves ogDescription", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { ogDescription: "Custom OG description" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().ogDescription).toBe("Custom OG description");
+    });
+
+    test("updates and retrieves footerText", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { footerText: "© 2026 Custom Footer" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().footerText).toBe("© 2026 Custom Footer");
+    });
+
+    test("rejects footerText exceeding 500 characters", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { footerText: "a".repeat(501) },
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+
+    test("updates and retrieves chatPlaceholders", async () => {
+      const placeholders = ["Ask me anything", "How can I help?"];
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { chatPlaceholders: placeholders },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().chatPlaceholders).toEqual(placeholders);
+    });
+
+    test("rejects chatPlaceholders exceeding 20 entries", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: {
+          chatPlaceholders: Array.from({ length: 21 }, (_, i) => `Item ${i}`),
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+
+    test("rejects chatPlaceholders with entry exceeding 80 chars", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { chatPlaceholders: ["a".repeat(81)] },
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+
+    test("updates slimChatErrorUi toggle", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { slimChatErrorUi: true },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().slimChatErrorUi).toBe(true);
+    });
+
+    test("accepts favicon as valid PNG", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: { favicon: VALID_PNG_BASE64 },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().favicon).toBe(VALID_PNG_BASE64);
+    });
+
+    test("updates multiple fields at once", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: {
+          appName: "Multi-update Test",
+          footerText: "Test Footer",
+          chatPlaceholders: ["Hello", "World"],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.appName).toBe("Multi-update Test");
+      expect(body.footerText).toBe("Test Footer");
+      expect(body.chatPlaceholders).toEqual(["Hello", "World"]);
+    });
+
+    test("persists changes across reads", async () => {
+      await app.inject({
+        method: "PATCH",
+        url: "/api/organization/appearance-settings",
+        payload: {
+          appName: "Persistence Test",
+          footerText: "Persistent Footer",
+        },
+      });
+
+      // GET /appearance-settings returns AppearanceSettingsSchema (subset of fields)
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/organization/appearance-settings",
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.appName).toBe("Persistence Test");
+      expect(body.footerText).toBe("Persistent Footer");
+    });
+  });
+
+  describe("PATCH /api/organization/security-settings", () => {
+    test("updates chat file upload and tool auto-assignment settings", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/security-settings",
+        payload: {
+          allowChatFileUploads: false,
+          allowToolAutoAssignment: false,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        allowChatFileUploads: false,
+        allowToolAutoAssignment: false,
+      });
+    });
+
+    test("ignores the retired recorder preference and audits active settings", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/security-settings",
+        payload: {
+          allowChatFileUploads: false,
+          appsHackathonRecorderEnabled: false,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().allowChatFileUploads).toBe(false);
+      expect(response.json()).not.toHaveProperty(
+        "appsHackathonRecorderEnabled",
+      );
+      const organization = await app.inject({
+        method: "GET",
+        url: "/api/organization",
+      });
+      expect(organization.statusCode).toBe(200);
+      expect(organization.json()).not.toHaveProperty(
+        "appsHackathonRecorderEnabled",
+      );
+
+      const [audit] = await db
+        .select()
+        .from(schema.auditLogsTable)
+        .where(eq(schema.auditLogsTable.action, "organization.updated"));
+      expect(audit?.before).toMatchObject({ allowChatFileUploads: true });
+      expect(audit?.after).toMatchObject({ allowChatFileUploads: false });
+      expect(audit?.after).not.toHaveProperty("appsHackathonRecorderEnabled");
+    });
+
+    test("persists security settings across reads", async () => {
+      await app.inject({
+        method: "PATCH",
+        url: "/api/organization/security-settings",
+        payload: {
+          allowChatFileUploads: true,
+          allowToolAutoAssignment: true,
+        },
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/organization",
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        allowChatFileUploads: true,
+        allowToolAutoAssignment: true,
+      });
+    });
+  });
+
+  describe("PATCH /api/organization/knowledge-settings", () => {
+    beforeEach(() => {
+      // Save-time validation issues a real embedding call; mock the network so
+      // the validation logic runs without a live provider.
+      vi.spyOn(embeddingClients, "callEmbedding").mockResolvedValue({
+        object: "list",
+        data: [{ object: "embedding", embedding: [0.1, 0.2, 0.3], index: 0 }],
+        model: "test",
+        usage: { prompt_tokens: 1, total_tokens: 1 },
+      });
+    });
+
+    test("rejects clearing the embedding model via PATCH once locked (must use Drop)", async ({
+      makeSecret,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const apiKey = await LlmProviderApiKeyModel.create({
+        organizationId,
+        secretId: secret.id,
+        name: "Embedding Key",
+        provider: "gemini",
+        scope: "personal",
+        userId: user.id,
+      });
+      const model = await ModelModel.create({
+        externalId: "gemini/gemini-embedding-001",
+        provider: "gemini",
+        modelId: "gemini-embedding-001",
+        description: "Gemini Embedding 001",
+        contextLength: null,
+        inputModalities: ["text"],
+        outputModalities: [],
+        supportsToolCalling: false,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        embeddingDimensions: 3072,
+        lastSyncedAt: new Date(),
+      });
+
+      await LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
+        apiKey.id,
+        [{ id: model.id, modelId: model.modelId }],
+        "gemini",
+      );
+
+      const setResponse = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: {
+          embeddingChatApiKeyId: apiKey.id,
+          embeddingModel: model.modelId,
+        },
+      });
+
+      expect(setResponse.statusCode).toBe(200);
+
+      // Clearing the model on a locked config would leave a key with no model and
+      // orphan the ingested vectors — it must go through the drop-embedding route.
+      const clearResponse = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: {
+          embeddingModel: null,
+        },
+      });
+
+      expect(clearResponse.statusCode).toBe(400);
+      expect(clearResponse.json().error.internal_code).toBe(
+        "embedding_validation_failed",
+      );
+    });
+
+    test("rejects a half-configured embedding (key with no model)", async ({
+      makeSecret,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const apiKey = await LlmProviderApiKeyModel.create({
+        organizationId,
+        secretId: secret.id,
+        name: "Embedding Key",
+        provider: "gemini",
+        scope: "personal",
+        userId: user.id,
+      });
+
+      // A fresh org: selecting a key but no model must not persist a half-config
+      // (the bug: an "empty" embedding configuration could be saved).
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: { embeddingChatApiKeyId: apiKey.id },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.internal_code).toBe(
+        "embedding_validation_failed",
+      );
+    });
+
+    test("allows a patch that does not touch embedding fields even when embedding is half-configured", async ({
+      makeSecret,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const apiKey = await LlmProviderApiKeyModel.create({
+        organizationId,
+        secretId: secret.id,
+        name: "Embedding Key",
+        provider: "gemini",
+        scope: "personal",
+        userId: user.id,
+      });
+      // Half-configured pre-existing state (key, no model), seeded directly.
+      await OrganizationModel.patch(organizationId, {
+        embeddingChatApiKeyId: apiKey.id,
+      });
+
+      // An empty patch (what a stripped unrelated-field patch reduces to) must
+      // not be blocked by — or fire a live probe for — state it doesn't change.
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: {},
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(embeddingClients.callEmbedding).not.toHaveBeenCalled();
+    });
+
+    test("rejects embedding models that are missing configured dimensions", async ({
+      makeSecret,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const apiKey = await LlmProviderApiKeyModel.create({
+        organizationId,
+        secretId: secret.id,
+        name: "Embedding Key",
+        provider: "gemini",
+        scope: "personal",
+        userId: user.id,
+      });
+      const model = await ModelModel.create({
+        externalId: "gemini/custom-embed-v2",
+        provider: "gemini",
+        modelId: "custom-embed-v2",
+        description: "Custom Embed V2",
+        contextLength: null,
+        inputModalities: ["text"],
+        outputModalities: [],
+        supportsToolCalling: false,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        embeddingDimensions: null,
+        lastSyncedAt: new Date(),
+      });
+
+      await LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
+        apiKey.id,
+        [{ id: model.id, modelId: model.modelId }],
+        "gemini",
+      );
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: {
+          embeddingChatApiKeyId: apiKey.id,
+          embeddingModel: model.modelId,
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toContain("configured dimensions");
+    });
+
+    test("accepts embedding models that are marked with dimensions", async ({
+      makeSecret,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const apiKey = await LlmProviderApiKeyModel.create({
+        organizationId,
+        secretId: secret.id,
+        name: "Embedding Key",
+        provider: "gemini",
+        scope: "personal",
+        userId: user.id,
+      });
+      const model = await ModelModel.create({
+        externalId: "gemini/gemini-embedding-001",
+        provider: "gemini",
+        modelId: "gemini-embedding-001",
+        description: "Gemini Embedding 001",
+        contextLength: null,
+        inputModalities: ["text"],
+        outputModalities: [],
+        supportsToolCalling: false,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        embeddingDimensions: 3072,
+        lastSyncedAt: new Date(),
+      });
+
+      await LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
+        apiKey.id,
+        [{ id: model.id, modelId: model.modelId }],
+        "gemini",
+      );
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: {
+          embeddingChatApiKeyId: apiKey.id,
+          embeddingModel: model.modelId,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().embeddingModel).toBe(model.modelId);
+    });
+
+    test("rejects changing embedding API key once embedding config is locked", async ({
+      makeSecret,
+    }) => {
+      const secret1 = await makeSecret({ secret: { apiKey: "test-key-1" } });
+      const secret2 = await makeSecret({ secret: { apiKey: "test-key-2" } });
+      const apiKey1 = await LlmProviderApiKeyModel.create({
+        organizationId,
+        secretId: secret1.id,
+        name: "Embedding Key 1",
+        provider: "gemini",
+        scope: "personal",
+        userId: user.id,
+      });
+      const apiKey2 = await LlmProviderApiKeyModel.create({
+        organizationId,
+        secretId: secret2.id,
+        name: "Embedding Key 2",
+        provider: "gemini",
+        scope: "personal",
+        userId: user.id,
+      });
+      const model = await ModelModel.create({
+        externalId: "gemini/gemini-embedding-001",
+        provider: "gemini",
+        modelId: "gemini-embedding-001",
+        description: "Gemini Embedding 001",
+        contextLength: null,
+        inputModalities: ["text"],
+        outputModalities: [],
+        supportsToolCalling: false,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        embeddingDimensions: 3072,
+        lastSyncedAt: new Date(),
+      });
+
+      await Promise.all([
+        LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
+          apiKey1.id,
+          [{ id: model.id, modelId: model.modelId }],
+          "gemini",
+        ),
+        LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
+          apiKey2.id,
+          [{ id: model.id, modelId: model.modelId }],
+          "gemini",
+        ),
+      ]);
+
+      const setResponse = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: {
+          embeddingChatApiKeyId: apiKey1.id,
+          embeddingModel: model.modelId,
+        },
+      });
+
+      expect(setResponse.statusCode).toBe(200);
+
+      const changeKeyResponse = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: {
+          embeddingChatApiKeyId: apiKey2.id,
+        },
+      });
+
+      expect(changeKeyResponse.statusCode).toBe(400);
+      expect(changeKeyResponse.json().error.message).toContain(
+        "cannot be changed once set",
+      );
+      expect(changeKeyResponse.json().error.internal_code).toBe(
+        "embedding_validation_failed",
+      );
+    });
+
+    test("blocks save when the embedding validation call fails", async ({
+      makeSecret,
+    }) => {
+      vi.spyOn(embeddingClients, "callEmbedding").mockRejectedValue(
+        new Error("provider down"),
+      );
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const apiKey = await LlmProviderApiKeyModel.create({
+        organizationId,
+        secretId: secret.id,
+        name: "Embedding Key",
+        provider: "gemini",
+        scope: "personal",
+        userId: user.id,
+      });
+      const model = await ModelModel.create({
+        externalId: "gemini/gemini-embedding-001",
+        provider: "gemini",
+        modelId: "gemini-embedding-001",
+        description: "Gemini Embedding 001",
+        contextLength: null,
+        inputModalities: ["text"],
+        outputModalities: [],
+        supportsToolCalling: false,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        embeddingDimensions: 3072,
+        lastSyncedAt: new Date(),
+      });
+      await LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
+        apiKey.id,
+        [{ id: model.id, modelId: model.modelId }],
+        "gemini",
+      );
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: {
+          embeddingChatApiKeyId: apiKey.id,
+          embeddingModel: model.modelId,
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.internal_code).toBe(
+        "embedding_validation_failed",
+      );
+    });
+
+    test("validates the reranker on save and blocks an invalid one", async ({
+      makeSecret,
+    }) => {
+      vi.spyOn(
+        knowledgeSettingsService,
+        "validateRerankerConfig",
+      ).mockResolvedValue({
+        ok: false,
+        error: "Reranker could not be reached.",
+      });
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const rerankerKey = await LlmProviderApiKeyModel.create({
+        organizationId,
+        secretId: secret.id,
+        name: "Reranker Key",
+        provider: "gemini",
+        scope: "personal",
+        userId: user.id,
+      });
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: {
+          rerankerChatApiKeyId: rerankerKey.id,
+          rerankerModel: "gemini-1.5-flash",
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.internal_code).toBe(
+        "reranker_validation_failed",
+      );
+      expect(response.json().error.message).toContain(
+        "Reranker could not be reached.",
+      );
+    });
+
+    test("rejects a half-configured reranker (key without model)", async ({
+      makeSecret,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const rerankerKey = await LlmProviderApiKeyModel.create({
+        organizationId,
+        secretId: secret.id,
+        name: "Reranker Key",
+        provider: "gemini",
+        scope: "personal",
+        userId: user.id,
+      });
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: { rerankerChatApiKeyId: rerankerKey.id },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.internal_code).toBe(
+        "reranker_validation_failed",
+      );
+    });
+
+    test("saves BM25 tuning overrides and clears them back to the deployment default", async () => {
+      // Set both. Fractional values must survive the round trip — an integer
+      // column or parser would silently collapse b=0.75 to 0.
+      const setResponse = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: { kbBm25K1: 1.5, kbBm25B: 0.3 },
+      });
+      expect(setResponse.statusCode).toBe(200);
+      expect(setResponse.json().kbBm25K1).toBe(1.5);
+      expect(setResponse.json().kbBm25B).toBe(0.3);
+
+      const stored = await OrganizationModel.getById(organizationId);
+      expect(stored?.kbBm25K1).toBe(1.5);
+      expect(stored?.kbBm25B).toBe(0.3);
+
+      // A patch that does not mention a field leaves it alone; null clears it
+      // so the organization inherits the deployment default again.
+      const clearResponse = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: { kbBm25B: null },
+      });
+      expect(clearResponse.statusCode).toBe(200);
+      expect(clearResponse.json().kbBm25K1).toBe(1.5);
+      expect(clearResponse.json().kbBm25B).toBeNull();
+    });
+
+    test("rejects BM25 tuning outside the shared bounds", async () => {
+      // b is a mixing weight and only meaningful in [0, 1]; the same bounds
+      // gate the env-var parser and the settings UI.
+      const tooLarge = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: { kbBm25B: 1.5 },
+      });
+      expect(tooLarge.statusCode).toBe(400);
+
+      const negative = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: { kbBm25K1: -1 },
+      });
+      expect(negative.statusCode).toBe(400);
+
+      const untouched = await OrganizationModel.getById(organizationId);
+      expect(untouched?.kbBm25K1).toBeNull();
+      expect(untouched?.kbBm25B).toBeNull();
+    });
+
+    test("saves and audits the contextual retrieval mode", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: { kbContextualRetrievalMode: "chunk" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().kbContextualRetrievalMode).toBe("chunk");
+      expect(
+        (await OrganizationModel.getById(organizationId))
+          ?.kbContextualRetrievalMode,
+      ).toBe("chunk");
+
+      await vi.waitFor(async () => {
+        const [audit] = await db
+          .select()
+          .from(schema.auditLogsTable)
+          .where(eq(schema.auditLogsTable.action, "organization.updated"));
+        expect(audit?.before).toMatchObject({
+          kbContextualRetrievalMode: null,
+        });
+        expect(audit?.after).toMatchObject({
+          kbContextualRetrievalMode: "chunk",
+        });
+      });
+    });
+
+    test("rejects an unknown contextual retrieval mode", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: { kbContextualRetrievalMode: "expensive" },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(
+        (await OrganizationModel.getById(organizationId))
+          ?.kbContextualRetrievalMode,
+      ).toBeNull();
+    });
+  });
+
+  describe("PATCH /api/organization/auth-settings", () => {
+    test("updates the requireTwoFactor toggle (enterprise active)", async () => {
+      enterpriseTier.setUserCountForTesting(0); // small-team tier = licensed
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/auth-settings",
+        payload: { requireTwoFactor: true },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().requireTwoFactor).toBe(true);
+    });
+
+    test("refuses requireTwoFactor and session caps without an enterprise license", async () => {
+      const originalEnvFlag = config.enterpriseFeatures.core;
+      Object.defineProperty(config.enterpriseFeatures, "core", {
+        value: false,
+        writable: true,
+        configurable: true,
+      });
+      enterpriseTier.setUserCountForTesting(9999); // over the free threshold
+      try {
+        const requireResponse = await app.inject({
+          method: "PATCH",
+          url: "/api/organization/auth-settings",
+          payload: { requireTwoFactor: true },
+        });
+        expect(requireResponse.statusCode).toBe(403);
+        expect(requireResponse.json().error.message).toContain("enterprise");
+
+        const capResponse = await app.inject({
+          method: "PATCH",
+          url: "/api/organization/auth-settings",
+          payload: { sessionMaxAgeSeconds: 86_400 },
+        });
+        expect(capResponse.statusCode).toBe(403);
+
+        // Turning the requirement OFF stays possible without a license.
+        const disableResponse = await app.inject({
+          method: "PATCH",
+          url: "/api/organization/auth-settings",
+          payload: { requireTwoFactor: false },
+        });
+        expect(disableResponse.statusCode).toBe(200);
+      } finally {
+        enterpriseTier.setUserCountForTesting(0);
+        Object.defineProperty(config.enterpriseFeatures, "core", {
+          value: originalEnvFlag,
+          writable: true,
+          configurable: true,
+        });
+      }
+    });
+
+    test("refuses to require 2FA when email/password sign-in is disabled", async () => {
+      // Enrollment confirms a password; on an SSO-only deployment the
+      // requirement would be unsatisfiable and lock every member out.
+      enterpriseTier.setUserCountForTesting(0);
+      const original = config.auth.disableBasicAuth;
+      Object.defineProperty(config.auth, "disableBasicAuth", {
+        value: true,
+        writable: true,
+        configurable: true,
+      });
+      try {
+        const response = await app.inject({
+          method: "PATCH",
+          url: "/api/organization/auth-settings",
+          payload: { requireTwoFactor: true },
+        });
+
+        expect(response.statusCode).toBe(400);
+        expect(response.json().error.message).toContain("identity provider");
+      } finally {
+        Object.defineProperty(config.auth, "disableBasicAuth", {
+          value: original,
+          writable: true,
+          configurable: true,
+        });
+      }
+    });
+
+    test("turning requireTwoFactor off revokes nothing", async ({
+      makeUser,
+      makeMember,
+      makeSession,
+    }) => {
+      enterpriseTier.setUserCountForTesting(0);
+      const notEnrolled = await makeUser();
+      await makeMember(notEnrolled.id, organizationId, { role: "member" });
+      const session = await makeSession(notEnrolled.id);
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/auth-settings",
+        payload: { requireTwoFactor: false },
+      });
+      expect(response.statusCode).toBe(200);
+
+      const [row] = await db
+        .select()
+        .from(schema.sessionsTable)
+        .where(eq(schema.sessionsTable.id, session.id));
+      expect(row).toBeDefined();
+    });
+
+    test("rejects out-of-range session lifetimes and accepts null (no cap)", async () => {
+      enterpriseTier.setUserCountForTesting(0);
+      const tooShort = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/auth-settings",
+        payload: { sessionMaxAgeSeconds: 60 },
+      });
+      expect(tooShort.statusCode).toBe(400);
+
+      const ok = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/auth-settings",
+        payload: { sessionMaxAgeSeconds: 86_400 },
+      });
+      expect(ok.statusCode).toBe(200);
+      expect(ok.json().sessionMaxAgeSeconds).toBe(86_400);
+
+      const cleared = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/auth-settings",
+        payload: { sessionMaxAgeSeconds: null },
+      });
+      expect(cleared.statusCode).toBe(200);
+      expect(cleared.json().sessionMaxAgeSeconds).toBeNull();
+    });
+
+    test("turning requireTwoFactor on revokes sessions of non-enrolled members only", async ({
+      makeUser,
+      makeMember,
+      makeSession,
+    }) => {
+      enterpriseTier.setUserCountForTesting(0);
+      const enrolled = await makeUser({ twoFactorEnabled: true });
+      const notEnrolled = await makeUser();
+      await makeMember(enrolled.id, organizationId, { role: "member" });
+      await makeMember(notEnrolled.id, organizationId, { role: "member" });
+      const enrolledSession = await makeSession(enrolled.id);
+      const notEnrolledSession = await makeSession(notEnrolled.id);
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/auth-settings",
+        payload: { requireTwoFactor: true },
+      });
+      expect(response.statusCode).toBe(200);
+
+      const [enrolledRow] = await db
+        .select()
+        .from(schema.sessionsTable)
+        .where(eq(schema.sessionsTable.id, enrolledSession.id));
+      const [notEnrolledRow] = await db
+        .select()
+        .from(schema.sessionsTable)
+        .where(eq(schema.sessionsTable.id, notEnrolledSession.id));
+      expect(enrolledRow).toBeDefined();
+      expect(notEnrolledRow).toBeUndefined();
+    });
+
+    test("updates the OAuth access token lifetime", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/auth-settings",
+        payload: {
+          oauthAccessTokenLifetimeSeconds: 604_800,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().oauthAccessTokenLifetimeSeconds).toBe(604_800);
+    });
+
+    test("rejects values below the minimum lifetime", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/auth-settings",
+        payload: {
+          oauthAccessTokenLifetimeSeconds: 299,
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+
+    test("rejects values above the maximum lifetime", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/auth-settings",
+        payload: {
+          oauthAccessTokenLifetimeSeconds: 31_536_001,
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+  });
+
+  describe("POST /api/organization/knowledge-settings/test-embedding", () => {
+    test("passes configured embedding dimensions to callEmbedding", async ({
+      makeSecret,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const apiKey = await LlmProviderApiKeyModel.create({
+        organizationId,
+        secretId: secret.id,
+        name: "Embedding Key",
+        provider: "gemini",
+        scope: "personal",
+        userId: user.id,
+      });
+      await ModelModel.create({
+        externalId: "gemini/gemini-embedding-001",
+        provider: "gemini",
+        modelId: "gemini-embedding-001",
+        description: "Gemini Embedding 001",
+        contextLength: null,
+        inputModalities: ["text"],
+        outputModalities: [],
+        supportsToolCalling: false,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        embeddingDimensions: 3072,
+        lastSyncedAt: new Date(),
+      });
+
+      const callEmbeddingSpy = vi
+        .spyOn(embeddingClients, "callEmbedding")
+        .mockResolvedValue({
+          object: "list",
+          data: [{ object: "embedding", embedding: [0.1, 0.2], index: 0 }],
+          model: "gemini-embedding-001",
+          usage: { prompt_tokens: 0, total_tokens: 0 },
+        });
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/organization/knowledge-settings/test-embedding",
+        payload: {
+          embeddingChatApiKeyId: apiKey.id,
+          embeddingModel: "gemini-embedding-001",
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ success: true });
+      expect(callEmbeddingSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          provider: "gemini",
+          model: "gemini-embedding-001",
+          dimensions: 3072,
+        }),
+      );
+    });
+  });
+
+  describe("knowledge-settings OCR configuration", () => {
+    async function makeOcrKey(
+      makeSecret: (over: object) => Promise<{ id: string }>,
+    ) {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      return LlmProviderApiKeyModel.create({
+        organizationId,
+        secretId: secret.id,
+        name: "OCR Key",
+        provider: "anthropic",
+        scope: "personal",
+        userId: user.id,
+      });
+    }
+
+    test("saves a validated OCR pair and audits the model name", async ({
+      makeSecret,
+    }) => {
+      const validateSpy = vi
+        .spyOn(knowledgeSettingsService, "validateOcrConfig")
+        .mockResolvedValue({ ok: true });
+      const ocrKey = await makeOcrKey(makeSecret);
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: { ocrChatApiKeyId: ocrKey.id, ocrModel: "claude-sonnet-5" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().ocrModel).toBe("claude-sonnet-5");
+      expect(response.json().ocrChatApiKeyId).toBe(ocrKey.id);
+      expect(validateSpy).toHaveBeenCalledWith({
+        keyId: ocrKey.id,
+        model: "claude-sonnet-5",
+        organizationId,
+      });
+
+      // Audit rows are written fire-and-forget, so poll rather than assert once.
+      await vi.waitFor(async () => {
+        const [audit] = await db
+          .select()
+          .from(schema.auditLogsTable)
+          .where(eq(schema.auditLogsTable.action, "organization.updated"));
+        expect(audit).toBeDefined();
+        expect(audit.before).toMatchObject({ ocrModel: null });
+        expect(audit.after).toMatchObject({ ocrModel: "claude-sonnet-5" });
+      });
+    });
+
+    test("blocks a half-configured OCR pair", async ({ makeSecret }) => {
+      const ocrKey = await makeOcrKey(makeSecret);
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: { ocrChatApiKeyId: ocrKey.id },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.internal_code).toBe("ocr_validation_failed");
+    });
+
+    test("blocks an OCR pair the live validation rejects", async ({
+      makeSecret,
+    }) => {
+      vi.spyOn(knowledgeSettingsService, "validateOcrConfig").mockResolvedValue(
+        { ok: false, error: "The provider cannot send PDF pages." },
+      );
+      const ocrKey = await makeOcrKey(makeSecret);
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: { ocrChatApiKeyId: ocrKey.id, ocrModel: "text-only-model" },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toContain("cannot send PDF pages");
+    });
+
+    test("enabling OCR resets connector checkpoints; a later model swap does not", async ({
+      makeSecret,
+      makeKnowledgeBase,
+      makeKnowledgeBaseConnector,
+    }) => {
+      vi.spyOn(knowledgeSettingsService, "validateOcrConfig").mockResolvedValue(
+        { ok: true },
+      );
+      const ocrKey = await makeOcrKey(makeSecret);
+      const kb = await makeKnowledgeBase(organizationId);
+      const connector = await makeKnowledgeBaseConnector(kb.id, organizationId);
+      const checkpoint = {
+        type: "jira" as const,
+        lastSyncedAt: "2026-03-10T15:30:00.000Z",
+      };
+      await KnowledgeBaseConnectorModel.update(connector.id, { checkpoint });
+
+      const enable = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: { ocrChatApiKeyId: ocrKey.id, ocrModel: "claude-sonnet-5" },
+      });
+      expect(enable.statusCode).toBe(200);
+      expect(
+        (await KnowledgeBaseConnectorModel.findById(connector.id))?.checkpoint,
+      ).toBeNull();
+
+      await KnowledgeBaseConnectorModel.update(connector.id, { checkpoint });
+      const swap = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: { ocrModel: "claude-opus-5" },
+      });
+      expect(swap.statusCode).toBe(200);
+      expect(
+        (await KnowledgeBaseConnectorModel.findById(connector.id))?.checkpoint,
+      ).toEqual(checkpoint);
+    });
+
+    test("clearing both OCR fields disables OCR", async ({ makeSecret }) => {
+      vi.spyOn(knowledgeSettingsService, "validateOcrConfig").mockResolvedValue(
+        { ok: true },
+      );
+      const ocrKey = await makeOcrKey(makeSecret);
+      await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: { ocrChatApiKeyId: ocrKey.id, ocrModel: "claude-sonnet-5" },
+      });
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/knowledge-settings",
+        payload: { ocrChatApiKeyId: null, ocrModel: null },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().ocrModel).toBeNull();
+      expect(response.json().ocrChatApiKeyId).toBeNull();
+    });
+  });
+
+  describe("POST /api/organization/knowledge-settings/test-ocr", () => {
+    test("maps the candidate pair to the validator, scoped to the org", async () => {
+      const validateSpy = vi
+        .spyOn(knowledgeSettingsService, "validateOcrConfig")
+        .mockResolvedValue({ ok: true });
+      const keyId = crypto.randomUUID();
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/organization/knowledge-settings/test-ocr",
+        payload: { ocrChatApiKeyId: keyId, ocrModel: "claude-sonnet-5" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ success: true });
+      expect(validateSpy).toHaveBeenCalledWith({
+        keyId,
+        model: "claude-sonnet-5",
+        organizationId,
+      });
+    });
+
+    test("returns a sanitized failure reason", async () => {
+      vi.spyOn(knowledgeSettingsService, "validateOcrConfig").mockResolvedValue(
+        { ok: false, error: "Failed to verify the OCR model with a PDF page." },
+      );
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/organization/knowledge-settings/test-ocr",
+        payload: {
+          ocrChatApiKeyId: crypto.randomUUID(),
+          ocrModel: "claude-sonnet-5",
+        },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        success: false,
+        error: "Failed to verify the OCR model with a PDF page.",
+      });
+    });
+  });
+
+  describe("POST /api/organization/knowledge-settings/test-reranker", () => {
+    test("returns success and maps the body to the service (scoped to the org)", async () => {
+      const validateSpy = vi
+        .spyOn(knowledgeSettingsService, "validateRerankerConfig")
+        .mockResolvedValue({ ok: true });
+      const keyId = crypto.randomUUID();
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/organization/knowledge-settings/test-reranker",
+        payload: {
+          rerankerChatApiKeyId: keyId,
+          rerankerModel: "claude-haiku",
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ success: true });
+      expect(validateSpy).toHaveBeenCalledWith({
+        keyId,
+        model: "claude-haiku",
+        organizationId,
+      });
+    });
+
+    test("returns the failure reason when the reranker validation fails", async () => {
+      vi.spyOn(
+        knowledgeSettingsService,
+        "validateRerankerConfig",
+      ).mockResolvedValue({
+        ok: false,
+        error: "Reranker could not be reached.",
+      });
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/organization/knowledge-settings/test-reranker",
+        payload: {
+          rerankerChatApiKeyId: crypto.randomUUID(),
+          rerankerModel: "claude-haiku",
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        success: false,
+        error: "Reranker could not be reached.",
+      });
+    });
+  });
+
+  describe("POST /api/organization/knowledge-settings/drop-embedding", () => {
+    test("stores zero documents for every connector it emptied", async ({
+      makeSecret,
+      makeKnowledgeBase,
+      makeKnowledgeBaseConnector,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const apiKey = await LlmProviderApiKeyModel.create({
+        organizationId,
+        secretId: secret.id,
+        name: "Embedding Key",
+        provider: "gemini",
+        scope: "personal",
+        userId: user.id,
+      });
+      await OrganizationModel.patch(organizationId, {
+        embeddingChatApiKeyId: apiKey.id,
+        embeddingModel: "gemini-embedding-001",
+      });
+      const kb = await makeKnowledgeBase(organizationId);
+      const connector = await makeKnowledgeBaseConnector(kb.id, organizationId);
+      await KbDocumentModel.create({
+        organizationId,
+        connectorId: connector.id,
+        sourceId: "dropped",
+        title: "Dropped",
+        content: "dropped",
+        contentHash: "hash-dropped",
+      });
+      await KbConnectorDocumentCountModel.findByConnectorIds([connector.id]);
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/organization/knowledge-settings/drop-embedding",
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(
+        await KbConnectorDocumentCountModel.findByConnectorIds([connector.id]),
+      ).toEqual(new Map([[connector.id, 0]]));
+    });
+  });
+});

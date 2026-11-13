@@ -1,0 +1,315 @@
+/**
+ * Catalog rules for the Gemini provider family (`gemini-*` and `gemma-*`, both
+ * served through the Gemini provider). Pure functions of the model id, shared by
+ * the backend model fetcher (to filter the catalog) and the frontend model
+ * selector (to badge older generations) so both stay in sync.
+ *
+ * `GET /v1beta/models` returns many models that advertise `generateContent` but
+ * need unsupported transports (text-to-speech and audio/live), plus deprecated
+ * and non-Gemini families. Text and image Gemini-family models at or above a
+ * minimum generation and known named image releases are usable in Chat,
+ * alongside first-class embeddings.
+ */
+
+import type { ThinkingEffort } from "./thinking-effort";
+
+/** Families whose transport is not supported by Gemini Chat. */
+const NON_CHAT_GEMINI_PATTERNS = ["tts", "audio", "live"];
+/** Image models can chat, but do not accept text-model thinking settings. */
+const NON_TEXT_GEMINI_PATTERNS = [...NON_CHAT_GEMINI_PATTERNS, "image"];
+
+/** Lowest Gemini-family generation kept in the catalog. */
+const GEMINI_FAMILY_MIN_VERSION: GeminiVersion = [2, 5];
+
+/**
+ * Generations at or below this are labelled "old" in the model selector. Bump
+ * this (and {@link GEMINI_FAMILY_MIN_VERSION} if needed) when a new generation
+ * ships and the previous one becomes legacy.
+ */
+const GEMINI_FAMILY_LEGACY_MAX_VERSION: GeminiVersion = [3, 0];
+
+const GEMINI_EMBEDDING_PREFIX = "gemini-embedding-";
+const RETIRED_GEMINI_EMBEDDING_MODELS = new Set(["gemini-embedding-2-preview"]);
+
+// Named image releases do not encode a Gemini generation. In particular, the
+// "2.1" in Nano Banana's name must not be compared to Gemini's 2.5 minimum.
+// https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/nano-banana-2-1
+const NAMED_GEMINI_IMAGE_MODELS = new Set(["gemini-nano-banana-2.1"]);
+
+/**
+ * Lowest chat generation Vertex AI serves only from its `global` endpoint. The
+ * 2.5 family answers on both global and ordinary regions; from 3.0 on, a
+ * regional host replies 404 ("not found or your project does not have access
+ * to it") and only `locations/global` works. Bumping this is not needed when a
+ * new generation ships — anything above the threshold is already covered.
+ */
+const GEMINI_GLOBAL_ENDPOINT_MIN_VERSION: GeminiVersion = [3, 0];
+
+/**
+ * Lowest `gemini-embedding-N` generation that is global-only. `-001` is served
+ * regionally and is absent from the global catalog; `-2` is the reverse. The
+ * embedding ids carry no dotted version, so they are versioned separately from
+ * {@link GEMINI_GLOBAL_ENDPOINT_MIN_VERSION}.
+ */
+const GEMINI_GLOBAL_ENDPOINT_MIN_EMBEDDING_VERSION = 2;
+
+/**
+ * Lowest generation whose chat models think by default. Deliberately its own
+ * constant: catalog policy ({@link GEMINI_FAMILY_MIN_VERSION}) can move
+ * independently of the thinking capability boundary.
+ */
+const GEMINI_THINKING_MIN_VERSION: GeminiVersion = [2, 5];
+
+/**
+ * Lowest generation whose flash models take a `thinkingLevel` and accept
+ * `"minimal"`. The 2.5 family takes a numeric `thinkingBudget` instead, and
+ * mixing the two in one request is rejected.
+ */
+const GEMINI_THINKING_LEVEL_MIN_VERSION: GeminiVersion = [3, 0];
+
+/**
+ * True when the model should appear in the selectable catalog: first-class
+ * Gemini embeddings, or a text/image `gemini-`/`gemma-` chat model at or above
+ * {@link GEMINI_FAMILY_MIN_VERSION}. Drops TTS/audio/live variants and
+ * unbranded families (learnlm, aqa, *-bison, legacy embedding-001/text-embedding-*).
+ */
+export function isUsableGeminiCatalogModel(modelId: string): boolean {
+  const id = modelId.toLowerCase();
+
+  if (RETIRED_GEMINI_EMBEDDING_MODELS.has(id)) {
+    return false;
+  }
+  if (id.startsWith(GEMINI_EMBEDDING_PREFIX)) {
+    return true;
+  }
+  if (NAMED_GEMINI_IMAGE_MODELS.has(id)) {
+    return true;
+  }
+  if (NON_CHAT_GEMINI_PATTERNS.some((pattern) => id.includes(pattern))) {
+    return false;
+  }
+
+  const version = parseGeminiFamilyVersion(id);
+  return (
+    version !== null && compareVersion(version, GEMINI_FAMILY_MIN_VERSION) >= 0
+  );
+}
+
+/**
+ * True when Vertex AI serves this model only from its `global` endpoint, so a
+ * request pinned to an ordinary region (`us-central1`, …) would 404.
+ *
+ * Location rules follow the serving family:
+ * - `gemma-*` — Model Garden MaaS, regional only, absent from the global
+ *   catalog entirely. Never global, whatever generation number it carries.
+ * - `gemini-embedding-N` — global from
+ *   {@link GEMINI_GLOBAL_ENDPOINT_MIN_EMBEDDING_VERSION} on.
+ * - `gemini-<major>.<minor>` chat models — global from
+ *   {@link GEMINI_GLOBAL_ENDPOINT_MIN_VERSION} on.
+ * - Named Nano Banana image releases — global-only.
+ *
+ * Only meaningful in Vertex AI mode; the Gemini API (API-key mode) has one
+ * global host and no notion of a location.
+ */
+export function requiresGlobalVertexEndpoint(modelId: string): boolean {
+  const id = modelId.toLowerCase();
+
+  if (!id.startsWith("gemini-")) {
+    return false;
+  }
+
+  if (NAMED_GEMINI_IMAGE_MODELS.has(id)) {
+    return true;
+  }
+
+  if (id.startsWith(GEMINI_EMBEDDING_PREFIX)) {
+    const generation = Number.parseInt(
+      id.slice(GEMINI_EMBEDDING_PREFIX.length),
+      10,
+    );
+    return (
+      Number.isFinite(generation) &&
+      generation >= GEMINI_GLOBAL_ENDPOINT_MIN_EMBEDDING_VERSION
+    );
+  }
+
+  const version = parseGeminiFamilyVersion(id);
+  return (
+    version !== null &&
+    compareVersion(version, GEMINI_GLOBAL_ENDPOINT_MIN_VERSION) >= 0
+  );
+}
+
+/**
+ * True when a Gemini-family chat model is an older generation
+ * (≤ {@link GEMINI_FAMILY_LEGACY_MAX_VERSION}) and should carry an "old" badge.
+ * Embeddings are never badged.
+ */
+export function isLegacyGeminiModel(modelId: string): boolean {
+  const id = modelId.toLowerCase();
+
+  if (id.startsWith(GEMINI_EMBEDDING_PREFIX)) {
+    return false;
+  }
+
+  const version = parseGeminiFamilyVersion(id);
+  return (
+    version !== null &&
+    compareVersion(version, GEMINI_FAMILY_LEGACY_MAX_VERSION) <= 0
+  );
+}
+
+/** Image-output models also include named releases without "image" in the id. */
+export function isGeminiImageGenerationModel(modelId: string): boolean {
+  const id = modelId.toLowerCase();
+  return (
+    id.startsWith("gemini-") &&
+    (id.includes("image") || NAMED_GEMINI_IMAGE_MODELS.has(id))
+  );
+}
+
+/**
+ * True when it is safe to request thought summaries
+ * (`thinkingConfig.includeThoughts`) from the model: Gemini chat models at or
+ * above {@link GEMINI_THINKING_MIN_VERSION}, where thinking is on by default.
+ * Excluded because the API rejects `includeThoughts` with a 400 when thinking
+ * is inactive: `flash-lite` variants (thinking off by default), `gemma-*`
+ * (no thinking support), and non-text-output variants.
+ */
+export function supportsGeminiThoughtSummaries(modelId: string): boolean {
+  const id = modelId.toLowerCase();
+
+  if (!id.startsWith("gemini-") || id.includes("flash-lite")) {
+    return false;
+  }
+  if (NON_TEXT_GEMINI_PATTERNS.some((pattern) => id.includes(pattern))) {
+    return false;
+  }
+
+  const version = parseGeminiFamilyVersion(id);
+  return (
+    version !== null &&
+    compareVersion(version, GEMINI_THINKING_MIN_VERSION) >= 0
+  );
+}
+
+/**
+ * The strongest thinking-off `thinkingConfig` a Gemini-family chat model
+ * accepts, for guardrail/utility calls where reasoning is pure latency:
+ * `{thinkingBudget: 0}` is a true disable on the 2.5 flash family; 2.5 pro
+ * cannot disable and floors at its documented 128-token minimum; 3.x+
+ * generations replace budgets with levels and floor at `"low"`. Returns null
+ * when there is nothing to send — `gemma-*` (no thinking support) and
+ * `flash-lite` variants (thinking already off), where any thinkingConfig
+ * risks a 400.
+ */
+export function geminiMinimalThinkingConfig(
+  modelId: string,
+): { thinkingBudget: number } | { thinkingLevel: "low" } | null {
+  const id = modelId.toLowerCase();
+
+  if (!id.startsWith("gemini-") || id.includes("flash-lite")) {
+    return null;
+  }
+  if (NON_TEXT_GEMINI_PATTERNS.some((pattern) => id.includes(pattern))) {
+    return null;
+  }
+
+  const version = parseGeminiFamilyVersion(id);
+  if (
+    version === null ||
+    compareVersion(version, GEMINI_THINKING_MIN_VERSION) < 0
+  ) {
+    return null;
+  }
+  if (compareVersion(version, [3, 0]) >= 0) {
+    return { thinkingLevel: "low" };
+  }
+  return id.includes("pro") ? { thinkingBudget: 128 } : { thinkingBudget: 0 };
+}
+
+/**
+ * True when the model takes a `thinkingLevel` and so can honor a chosen effort:
+ * Gemini chat models at or above {@link GEMINI_THINKING_LEVEL_MIN_VERSION}.
+ * The 2.5 family is excluded — it takes a numeric `thinkingBudget`, and the two
+ * cannot be sent together.
+ */
+export function supportsGeminiThinkingEffort(modelId: string): boolean {
+  const id = modelId.toLowerCase();
+
+  if (!id.startsWith("gemini-")) {
+    return false;
+  }
+  if (NON_TEXT_GEMINI_PATTERNS.some((pattern) => id.includes(pattern))) {
+    return false;
+  }
+
+  const version = parseGeminiFamilyVersion(id);
+  return (
+    version !== null &&
+    compareVersion(version, GEMINI_THINKING_LEVEL_MIN_VERSION) >= 0
+  );
+}
+
+export type GeminiThinkingLevel = "minimal" | "low" | "medium" | "high";
+
+/**
+ * The `thinkingConfig.thinkingLevel` a chosen effort maps to, or null when the
+ * model is outside {@link supportsGeminiThinkingEffort} and should be sent no
+ * thinking level at all.
+ *
+ * `low` resolves per model rather than to a fixed level: flash models accept
+ * `minimal` and can effectively skip reasoning, while Pro floors at `low` and
+ * reasons whatever it is asked. Both are "as little as this model will do".
+ */
+export function geminiThinkingConfigForEffort(
+  modelId: string,
+  effort: ThinkingEffort,
+): { thinkingLevel: GeminiThinkingLevel } | null {
+  if (!supportsGeminiThinkingEffort(modelId)) {
+    return null;
+  }
+  if (effort !== "low") {
+    return { thinkingLevel: effort };
+  }
+  return {
+    thinkingLevel: acceptsGeminiMinimalThinking(modelId) ? "minimal" : "low",
+  };
+}
+
+/**
+ * Pro is the exception: asking it for less than `low` is a hard 400
+ * ("Thinking level MINIMAL is not supported"), not a silently-ignored hint.
+ */
+function acceptsGeminiMinimalThinking(modelId: string): boolean {
+  return modelId.toLowerCase().includes("flash");
+}
+
+// ===========================================================================
+// Internal helpers
+// ===========================================================================
+
+type GeminiVersion = readonly [major: number, minor: number];
+
+const GEMINI_FAMILY_VERSION_RE = /^(?:gemini|gemma)-(\d+)(?:\.(\d+))?/;
+
+/**
+ * Extracts the leading generation from a `gemini-`/`gemma-` id as a
+ * [major, minor] tuple (minor defaults to 0). Returns null for unbranded ids or
+ * ids without a numeric generation (e.g. bare `gemini-pro`, `gemini-exp-1206`).
+ * Tuple form avoids the `parseFloat` pitfall where `gemini-2.10` < `gemini-2.5`.
+ */
+function parseGeminiFamilyVersion(lowerId: string): GeminiVersion | null {
+  const match = GEMINI_FAMILY_VERSION_RE.exec(lowerId);
+  if (!match) {
+    return null;
+  }
+  return [Number(match[1]), match[2] ? Number(match[2]) : 0];
+}
+
+function compareVersion(a: GeminiVersion, b: GeminiVersion): number {
+  if (a[0] !== b[0]) {
+    return a[0] - b[0];
+  }
+  return a[1] - b[1];
+}

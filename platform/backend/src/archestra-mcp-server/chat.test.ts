@@ -2,68 +2,123 @@
 
 import {
   ARCHESTRA_MCP_SERVER_NAME,
+  ASK_USER_OTHER_ANSWER_FIELD,
   MCP_SERVER_TOOL_NAME_SEPARATOR,
-} from "@shared";
+  TOOL_ASK_USER_FULL_NAME,
+} from "@archestra/shared";
 import { vi } from "vitest";
+import { scopedSessionId, sessionCallerId } from "@/openappa/actor";
+import { currentTrajectory } from "@/openappa/current-trajectory";
 import {
-  ChatOpsChannelBindingModel,
-  ChatOpsThreadAgentOverrideModel,
-  ConversationModel,
-  LlmProviderApiKeyModel,
-  OrganizationModel,
-} from "@/models";
+  clearHitlReview,
+  consumeHitlRuling,
+  getHitlAskUserArguments,
+  peekHitlDecision,
+  peekHitlRuling,
+  recordHitlRuling,
+  stageHitlReview,
+} from "@/openappa/hitl-review";
+import type { OpenAppaSession } from "@/openappa/service";
+import { workloadPrincipal } from "@/services/agent-runtime/runtime-identity";
 import { beforeEach, describe, expect, test } from "@/test";
+import { setupTestCacheManager } from "@/test/cache-manager";
+import { makeReturnLabelReview } from "@/test/openappa-return-label-review";
 import type { Agent } from "@/types";
-import { type ArchestraContext, executeArchestraTool } from ".";
+import {
+  type ArchestraContext,
+  executeArchestraTool,
+  getArchestraMcpTools,
+} from ".";
+
+// The real cache, stored in this file's test database.
+setupTestCacheManager();
 
 describe("chat tool execution", () => {
   let testAgent: Agent;
   let mockContext: ArchestraContext;
-  let userId: string;
-  let organizationId: string;
+  // The Chat conversation the ask_user calls below run in, which is also the
+  // OpenAPPA session the proxy stamps on their remedy calls.
+  let sessionId: string;
 
-  beforeEach(
-    async ({
-      makeAgent,
-      makeUser,
-      makeOrganization,
-      makeMember,
-      makeSecret,
-      makeLlmProviderApiKey,
-    }) => {
-      const org = await makeOrganization();
-      const user = await makeUser();
-      await makeMember(user.id, org.id, { role: "admin" });
-      userId = user.id;
-      organizationId = org.id;
-      const secret = await makeSecret();
-      const orgWideApiKey = await makeLlmProviderApiKey(
-        organizationId,
-        secret.id,
-        {
-          provider: "openai",
-        },
-      );
-      vi.spyOn(LlmProviderApiKeyModel, "findById").mockImplementation(
-        async (id) => {
-          if (id === orgWideApiKey.id) {
-            return orgWideApiKey;
-          }
-          return null;
-        },
-      );
-      testAgent = await makeAgent({
-        name: "Test Agent",
-        agentType: "agent",
-        organizationId,
-      });
-      mockContext = {
-        agent: { id: testAgent.id, name: testAgent.name },
-        userId,
-        organizationId,
-      };
-    },
-  );
+  beforeEach(async ({ makeAgent, makeUser, makeOrganization, makeMember }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    testAgent = await makeAgent({
+      name: "Test Agent",
+      agentType: "agent",
+      organizationId: org.id,
+    });
+    sessionId = crypto.randomUUID();
+    mockContext = {
+      agent: { id: testAgent.id, name: testAgent.name },
+      userId: user.id,
+      organizationId: org.id,
+      sessionId,
+    };
+  });
+
+  function trajectory(
+    overrides: { sessionId?: string; parentId?: string } = {},
+  ) {
+    return currentTrajectory({
+      session_id:
+        overrides.sessionId ??
+        scopedSessionId(`user:${mockContext.userId}`, sessionId),
+      ...(overrides.parentId ? { parent_id: overrides.parentId } : {}),
+    });
+  }
+
+  function reviewSession(params: {
+    sessionId: string;
+    parentId?: string;
+    callerId?: string;
+  }): OpenAppaSession {
+    const callerId = params.callerId ?? sessionCallerId(params.sessionId);
+    return {
+      organization_id: mockContext.organizationId as string,
+      session_id: params.sessionId,
+      ...(callerId ? { caller_id: callerId } : {}),
+      ...(params.parentId ? { parent_id: params.parentId } : {}),
+    };
+  }
+
+  test("ask_user advertises offer IDs but not the proxy trajectory", () => {
+    const tool = getArchestraMcpTools().find(
+      (candidate) => candidate.name === TOOL_ASK_USER_FULL_NAME,
+    );
+    const properties = tool?.inputSchema.properties;
+    expect(properties).toHaveProperty("remedy_offer_ids");
+    expect(properties).not.toHaveProperty("remedy_offers");
+    expect(properties).not.toHaveProperty("trajectory");
+    expect(tool?.inputSchema.additionalProperties).not.toBe(false);
+  });
+
+  test("a malformed ask_user call is shown the advertised arguments, not the proxy's", async () => {
+    const result = await executeArchestraTool(
+      TOOL_ASK_USER_FULL_NAME,
+      { options: [{ label: "Approve" }] },
+      mockContext,
+    );
+
+    expect(result.isError).toBe(true);
+    const text = result.content
+      .map((part) => (part.type === "text" ? part.text : ""))
+      .join("\n");
+    expect(text).toContain('"remedy_offer_ids"');
+    expect(text).not.toContain('"remedy_offers"');
+    expect(text).not.toContain('"trajectory"');
+  });
+
+  const acceptingElicitation = {
+    elicit: async () => ({
+      status: "answered" as const,
+      result: {
+        action: "accept" as const,
+        content: { choice: "Accept for this session" },
+      },
+    }),
+  };
 
   test("todo_write returns error when todos is missing", async () => {
     const result = await executeArchestraTool(
@@ -96,718 +151,1345 @@ describe("chat tool execution", () => {
     );
   });
 
-  test("swap_agent returns error when agent_name is missing", async () => {
+  test("ask_user in a headless run tells the model to ask in its reply", async () => {
     const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_agent`,
-      {},
-      mockContext,
-    );
-    expect(result.isError).toBe(true);
-    expect((result.content[0] as any).text).toContain(
-      "Validation error in archestra__swap_agent",
-    );
-    expect((result.content[0] as any).text).toContain("agent_name:");
-  });
-
-  test("swap_agent returns error when conversation context is missing", async () => {
-    const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_agent`,
-      { agent_name: "Some Agent" },
-      mockContext,
-    );
-    expect(result.isError).toBe(true);
-    expect((result.content[0] as any).text).toContain(
-      "requires conversation context",
-    );
-  });
-
-  test("artifact_write returns error when content is missing", async () => {
-    const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}artifact_write`,
-      {},
-      mockContext,
-    );
-    expect(result.isError).toBe(true);
-    expect((result.content[0] as any).text).toContain(
-      "Validation error in archestra__artifact_write",
-    );
-    expect((result.content[0] as any).text).toContain("content:");
-  });
-
-  test("artifact_write returns error when conversation context is missing", async () => {
-    const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}artifact_write`,
-      { content: "# My Artifact" },
-      mockContext,
-    );
-    expect(result.isError).toBe(true);
-    expect((result.content[0] as any).text).toContain(
-      "requires conversation context",
-    );
-  });
-
-  test("artifact_write succeeds with real conversation context", async ({
-    makeConversation,
-  }) => {
-    const conversation = await makeConversation(testAgent.id, {
-      userId: userId,
-      organizationId: organizationId,
-    });
-
-    const contextWithConvo: ArchestraContext = {
-      ...mockContext,
-      conversationId: conversation.id,
-    };
-
-    const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}artifact_write`,
-      { content: "# Test Artifact\n\nSome **markdown** content." },
-      contextWithConvo,
-    );
-    expect(result.isError).toBe(false);
-    expect(result.structuredContent).toEqual({
-      success: true,
-      characterCount: "# Test Artifact\n\nSome **markdown** content.".length,
-    });
-    expect((result.content[0] as any).text).toContain(
-      "Successfully updated artifact",
-    );
-  });
-
-  test("swap_agent succeeds with real conversation and target agent", async ({
-    makeAgent,
-    makeConversation,
-    makeSecret,
-    makeLlmProviderApiKey,
-  }) => {
-    const secret = await makeSecret();
-    const targetApiKey = await makeLlmProviderApiKey(
-      organizationId,
-      secret.id,
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
       {
-        provider: "anthropic",
+        question: "Accept this change for the rest of this session?",
+        options: [
+          { label: "Accept for this session" },
+          { label: "Do not accept" },
+        ],
       },
+      mockContext,
     );
-    vi.spyOn(LlmProviderApiKeyModel, "findById").mockImplementation(
-      async (id) => {
-        if (id === targetApiKey.id) {
-          return targetApiKey;
-        }
-        return null;
-      },
-    );
-
-    const targetAgent = await makeAgent({
-      name: "Swap Target Agent",
-      agentType: "agent",
-      organizationId: organizationId,
-      llmApiKeyId: targetApiKey.id,
-      llmModel: "claude-3-5-sonnet",
-    });
-
-    const conversation = await makeConversation(testAgent.id, {
-      userId: userId,
-      organizationId: organizationId,
-    });
-
-    const contextWithConvo: ArchestraContext = {
-      ...mockContext,
-      conversationId: conversation.id,
-    };
-
-    const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_agent`,
-      { agent_name: "Swap Target Agent" },
-      contextWithConvo,
-    );
-    expect(result.isError).toBe(false);
-    expect(result.structuredContent).toEqual({
-      success: true,
-      agent_id: targetAgent.id,
-      agent_name: "Swap Target Agent",
-    });
-    const parsed = result.structuredContent as {
-      success: boolean;
-      agent_id: string;
-      agent_name: string;
-    };
-    expect(parsed.success).toBe(true);
-    expect(parsed.agent_id).toBe(targetAgent.id);
-    expect(parsed.agent_name).toBe("Swap Target Agent");
-
-    const updatedConversation = await ConversationModel.findById({
-      id: conversation.id,
-      userId,
-      organizationId,
-    });
-    expect(updatedConversation?.agentId).toBe(targetAgent.id);
-    expect(updatedConversation?.selectedModel).toBe("claude-3-5-sonnet");
-    expect(updatedConversation?.selectedProvider).toBe("anthropic");
-    expect(updatedConversation?.chatApiKeyId).toBe(targetApiKey.id);
-  });
-
-  test("swap_agent succeeds with chatops binding context", async ({
-    makeAgent,
-  }) => {
-    const targetAgent = await makeAgent({
-      name: "ChatOps Swap Target",
-      agentType: "agent",
-      organizationId,
-    });
-
-    const binding = await ChatOpsChannelBindingModel.create({
-      organizationId,
-      provider: "slack",
-      channelId: "C-chatops-swap",
-      workspaceId: "W-chatops-swap",
-      agentId: testAgent.id,
-    });
-
-    const contextWithChatOpsBinding: ArchestraContext = {
-      ...mockContext,
-      chatOpsBindingId: binding.id,
-      chatOpsThreadId: "thread-1234",
-    };
-
-    const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_agent`,
-      { agent_name: "ChatOps Swap Target" },
-      contextWithChatOpsBinding,
-    );
-
-    expect(result.isError).toBe(false);
-    expect(result.structuredContent).toEqual({
-      success: true,
-      agent_id: targetAgent.id,
-      agent_name: "ChatOps Swap Target",
-    });
-
-    // Thread override should be created
-    const override = await ChatOpsThreadAgentOverrideModel.findByThread(
-      binding.id,
-      "thread-1234",
-    );
-    expect(override?.agentId).toBe(targetAgent.id);
-
-    // Channel binding should NOT be mutated
-    const updatedBinding = await ChatOpsChannelBindingModel.findById(
-      binding.id,
-    );
-    expect(updatedBinding?.agentId).toBe(testAgent.id);
-  });
-
-  test("swap_agent cannot assign personal agent to shared chatops channel", async ({
-    makeAgent,
-  }) => {
-    const personalAgent = await makeAgent({
-      name: "Personal ChatOps Target",
-      agentType: "agent",
-      organizationId,
-      scope: "personal",
-      authorId: userId,
-    });
-
-    const binding = await ChatOpsChannelBindingModel.create({
-      organizationId,
-      provider: "slack",
-      channelId: "C-chatops-personal-blocked",
-      workspaceId: "W-chatops-personal-blocked",
-      agentId: testAgent.id,
-      isDm: false,
-    });
-
-    const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_agent`,
-      { agent_name: personalAgent.name },
-      {
-        ...mockContext,
-        chatOpsBindingId: binding.id,
-        chatOpsThreadId: "thread-personal-blocked",
-      },
-    );
-
     expect(result.isError).toBe(true);
-    expect((result.content[0] as any).text).toContain(
-      "Personal agents cannot be assigned to channels",
-    );
-
-    const updatedBinding = await ChatOpsChannelBindingModel.findById(
-      binding.id,
-    );
-    expect(updatedBinding?.agentId).toBe(testAgent.id);
+    const text = (result.content[0] as any).text;
+    expect(text).toContain("Ask the question in your reply instead");
+    expect(text).not.toContain("Do not ask this as a plain-text");
   });
 
-  test("swap_agent prefers chatops binding when both contexts are present", async ({
-    makeAgent,
-  }) => {
-    const targetAgent = await makeAgent({
-      name: "ChatOps Preferred Target",
-      agentType: "agent",
-      organizationId,
-    });
-
-    const binding = await ChatOpsChannelBindingModel.create({
-      organizationId,
-      provider: "slack",
-      channelId: "C-chatops-both-contexts",
-      workspaceId: "W-chatops-both-contexts",
-      agentId: testAgent.id,
-    });
-
-    const contextWithBoth: ArchestraContext = {
+  test("ask_user permits native fallback only when allowed and all choices fit", async () => {
+    mockContext = {
       ...mockContext,
-      conversationId: "synthetic-chatops-isolation-key",
-      chatOpsBindingId: binding.id,
-      chatOpsThreadId: "thread-both-contexts",
+      elicitation: { elicit: async () => ({ status: "no_viewer" as const }) },
     };
 
     const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_agent`,
-      { agent_name: "ChatOps Preferred Target" },
-      contextWithBoth,
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "Accept this change for the rest of this session?",
+        options: [
+          { label: "Accept for this session" },
+          { label: "Do not accept" },
+        ],
+      },
+      mockContext,
     );
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as any).text;
+    expect(text).toContain("This client did not answer the choice form");
+    expect(text).toContain(
+      "only if the user permits it and it supports all choices",
+    );
+    expect(text).toContain("Do not repeat this call unchanged");
+    expect(text).toContain("Do not ask this as a plain-text chat question");
+  });
 
+  test.each([
+    2, 5, 12,
+  ])("ask_user returns the last of %i options after elicitation", async (count) => {
+    const options = Array.from({ length: count }, (_, index) => ({
+      label: `Choice ${index + 1}`,
+    }));
+    const selected = `Choice ${count}`;
+    mockContext = {
+      ...mockContext,
+      elicitation: {
+        elicit: async (params) => {
+          expect(params.requestedSchema).toMatchObject({
+            properties: {
+              choice: { enum: options.map((option) => option.label) },
+            },
+          });
+          return {
+            status: "answered" as const,
+            result: {
+              action: "accept" as const,
+              content: { choice: selected },
+            },
+          };
+        },
+      },
+    };
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "Which option do you prefer?",
+        options,
+      },
+      mockContext,
+    );
     expect(result.isError).toBe(false);
     expect(result.structuredContent).toEqual({
-      success: true,
-      agent_id: targetAgent.id,
-      agent_name: "ChatOps Preferred Target",
+      action: "accept",
+      selected: [selected],
     });
-
-    // Thread override should be created (chatops binding path was taken)
-    const override = await ChatOpsThreadAgentOverrideModel.findByThread(
-      binding.id,
-      "thread-both-contexts",
-    );
-    expect(override?.agentId).toBe(targetAgent.id);
-
-    // Channel binding should NOT be mutated
-    const updatedBinding = await ChatOpsChannelBindingModel.findById(
-      binding.id,
-    );
-    expect(updatedBinding?.agentId).toBe(testAgent.id);
   });
 
-  test("swap_agent returns structured state when swapping to same agent", async ({
-    makeConversation,
-  }) => {
-    const conversation = await makeConversation(testAgent.id, {
-      userId: userId,
-      organizationId: organizationId,
-    });
-
-    const contextWithConvo: ArchestraContext = {
+  test("ask_user rejects duplicate option labels", async () => {
+    mockContext = {
       ...mockContext,
-      conversationId: conversation.id,
+      elicitation: {
+        elicit: async () => ({
+          status: "answered" as const,
+          result: { action: "accept" as const, content: { choice: "A" } },
+        }),
+      },
     };
 
     const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_agent`,
-      { agent_name: testAgent.name },
-      contextWithConvo,
-    );
-    expect(result.isError).toBe(false);
-    expect(result.structuredContent).toMatchObject({
-      success: false,
-      code: "already_using_agent",
-      archestraError: {
-        type: "tool_state",
-        code: "already_using_agent",
-        toolName: "swap_agent",
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "Pick one",
+        options: [{ label: "A" }, { label: "A" }],
       },
-    });
-    expect((result.content[0] as any).text).toContain("Already using agent");
-  });
-
-  test("swap_to_default_agent returns error when conversation context is missing", async () => {
-    const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_to_default_agent`,
-      {},
       mockContext,
     );
     expect(result.isError).toBe(true);
     expect((result.content[0] as any).text).toContain(
-      "requires conversation context",
+      "Give each option a different label",
     );
   });
 
-  test("swap_to_default_agent returns structured state when no default agent configured", async ({
-    makeConversation,
-  }) => {
-    const conversation = await makeConversation(testAgent.id, {
-      userId: userId,
-      organizationId: organizationId,
-    });
-
-    const contextWithConvo: ArchestraContext = {
+  test.each([
+    3, 5, 12,
+  ])("ask_user maps the first and last of %i multi-choice options to labels", async (count) => {
+    const options = Array.from({ length: count }, (_, index) => ({
+      label: `Choice ${index + 1}`,
+    }));
+    mockContext = {
       ...mockContext,
-      conversationId: conversation.id,
+      elicitation: {
+        elicit: async (params) => {
+          expect(params.requestedSchema).toMatchObject({
+            properties: {
+              [`option_${count - 1}`]: {
+                type: "boolean",
+                title: `Choice ${count}`,
+              },
+            },
+          });
+          return {
+            status: "answered" as const,
+            result: {
+              action: "accept" as const,
+              content: Object.fromEntries(
+                options.map((_, index) => [
+                  `option_${index}`,
+                  index === 0 || index === count - 1,
+                ]),
+              ),
+            },
+          };
+        },
+      },
     };
 
     const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_to_default_agent`,
-      {},
-      contextWithConvo,
-    );
-    expect(result.isError).toBe(false);
-    expect(result.structuredContent).toMatchObject({
-      success: false,
-      code: "no_default_agent",
-      archestraError: {
-        type: "tool_state",
-        code: "no_default_agent",
-        toolName: "swap_to_default_agent",
-      },
-    });
-    expect((result.content[0] as any).text).toContain(
-      "No default agent is configured",
-    );
-  });
-
-  test("swap_to_default_agent succeeds when on non-default agent", async ({
-    makeAgent,
-    makeConversation,
-    makeSecret,
-    makeLlmProviderApiKey,
-  }) => {
-    const secret = await makeSecret();
-    const defaultApiKey = await makeLlmProviderApiKey(
-      organizationId,
-      secret.id,
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
       {
-        provider: "openai",
+        question: "Pick any",
+        allowMultiple: true,
+        options,
       },
+      mockContext,
     );
-    vi.spyOn(LlmProviderApiKeyModel, "findById").mockImplementation(
-      async (id) => {
-        if (id === defaultApiKey.id) {
-          return defaultApiKey;
-        }
-        return null;
-      },
-    );
-
-    const defaultAgent = await makeAgent({
-      name: "Default Router Agent",
-      agentType: "agent",
-      organizationId: organizationId,
-      llmApiKeyId: defaultApiKey.id,
-      llmModel: "gpt-4o",
-    });
-    await OrganizationModel.patch(organizationId, {
-      defaultAgentId: defaultAgent.id,
-    });
-
-    const specialistAgent = await makeAgent({
-      name: "Specialist Agent",
-      agentType: "agent",
-      organizationId: organizationId,
-    });
-
-    const conversation = await makeConversation(specialistAgent.id, {
-      userId: userId,
-      organizationId: organizationId,
-    });
-
-    const contextWithConvo: ArchestraContext = {
-      ...mockContext,
-      agent: { id: specialistAgent.id, name: specialistAgent.name },
-      conversationId: conversation.id,
-    };
-
-    const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_to_default_agent`,
-      {},
-      contextWithConvo,
-    );
-    expect(result.isError).toBe(false);
-    const parsed = result.structuredContent as {
-      success: boolean;
-      agent_id: string;
-      agent_name: string;
-    };
-    expect(parsed.success).toBe(true);
-    expect(parsed.agent_id).toBe(defaultAgent.id);
-    expect(parsed.agent_name).toBe("Default Router Agent");
-
-    const updatedConversation = await ConversationModel.findById({
-      id: conversation.id,
-      userId,
-      organizationId,
-    });
-    expect(updatedConversation?.agentId).toBe(defaultAgent.id);
-    expect(updatedConversation?.selectedModel).toBe("gpt-4o");
-    expect(updatedConversation?.selectedProvider).toBe("openai");
-    expect(updatedConversation?.chatApiKeyId).toBe(defaultApiKey.id);
-  });
-
-  test("swap_to_default_agent succeeds with chatops binding context", async ({
-    makeAgent,
-  }) => {
-    const defaultAgent = await makeAgent({
-      name: "ChatOps Default Agent",
-      agentType: "agent",
-      organizationId,
-    });
-    await OrganizationModel.patch(organizationId, {
-      defaultAgentId: defaultAgent.id,
-    });
-
-    const binding = await ChatOpsChannelBindingModel.create({
-      organizationId,
-      provider: "ms-teams",
-      channelId: "CH-chatops-default",
-      workspaceId: "WS-chatops-default",
-      agentId: testAgent.id,
-    });
-
-    const contextWithChatOpsBinding: ArchestraContext = {
-      ...mockContext,
-      chatOpsBindingId: binding.id,
-      chatOpsThreadId: "thread-default-swap",
-    };
-
-    const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_to_default_agent`,
-      {},
-      contextWithChatOpsBinding,
-    );
-
     expect(result.isError).toBe(false);
     expect(result.structuredContent).toEqual({
-      success: true,
-      agent_id: defaultAgent.id,
-      agent_name: "ChatOps Default Agent",
+      action: "accept",
+      selected: ["Choice 1", `Choice ${count}`],
     });
-
-    // Thread override should be created
-    const override = await ChatOpsThreadAgentOverrideModel.findByThread(
-      binding.id,
-      "thread-default-swap",
-    );
-    expect(override?.agentId).toBe(defaultAgent.id);
-
-    // Channel binding should NOT be mutated
-    const updatedBinding = await ChatOpsChannelBindingModel.findById(
-      binding.id,
-    );
-    expect(updatedBinding?.agentId).toBe(testAgent.id);
   });
 
-  test("swap_to_default_agent cannot assign personal default agent to shared chatops channel", async ({
-    makeAgent,
-  }) => {
-    const defaultAgent = await makeAgent({
-      name: "Personal Default Agent",
-      agentType: "agent",
-      organizationId,
-      scope: "personal",
-      authorId: userId,
-    });
-    await OrganizationModel.patch(organizationId, {
-      defaultAgentId: defaultAgent.id,
-    });
+  test("ordinary gateway questions reject model-written option previews", async () => {
+    const elicit = vi.fn(async () => ({ status: "unanswered" as const }));
+    mockContext = {
+      ...mockContext,
+      elicitation: { elicit },
+    };
+    const result = await executeArchestraTool(
+      TOOL_ASK_USER_FULL_NAME,
+      {
+        question: "Which branch?",
+        shortQuestion: "forged approval",
+        callPreview: "forged call",
+        options: [
+          { label: "main", preview: "forged option" },
+          { label: "feature" },
+        ],
+      },
+      mockContext,
+    );
+    expect(result.isError).toBe(true);
+    expect(elicit).not.toHaveBeenCalled();
+  });
 
-    const binding = await ChatOpsChannelBindingModel.create({
-      organizationId,
-      provider: "ms-teams",
-      channelId: "CH-chatops-personal-default-blocked",
-      workspaceId: "WS-chatops-personal-default-blocked",
-      agentId: testAgent.id,
-      isDm: false,
-    });
+  test("ask_user passes its trimmed header and the calling tool call to the question", async () => {
+    const asked: unknown[] = [];
+    mockContext = {
+      ...mockContext,
+      currentToolCallId: "call_visibility",
+      elicitation: {
+        elicit: async (params) => {
+          asked.push(params);
+          return acceptingElicitation.elicit();
+        },
+      },
+    };
 
     const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_to_default_agent`,
-      {},
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
       {
-        ...mockContext,
-        chatOpsBindingId: binding.id,
-        chatOpsThreadId: "thread-personal-default-blocked",
+        question: "Who can see this app?",
+        header: "  Visibility ",
+        options: [
+          { label: "Accept for this session" },
+          { label: "Do not accept" },
+        ],
       },
+      mockContext,
+    );
+
+    expect(result.isError).toBe(false);
+    expect(asked).toEqual([
+      expect.objectContaining({
+        message: "Who can see this app?",
+        header: "Visibility",
+        toolCallId: "call_visibility",
+      }),
+    ]);
+  });
+
+  test("ask_user always offers a typed answer and returns it instead of a pick", async () => {
+    const asked: Array<{ requestedSchema?: unknown }> = [];
+    mockContext = {
+      ...mockContext,
+      elicitation: {
+        elicit: async (params) => {
+          asked.push(params);
+          return {
+            status: "answered" as const,
+            result: {
+              action: "accept" as const,
+              content: {
+                choice: "",
+                [ASK_USER_OTHER_ANSWER_FIELD]: "  acme/openappa-policy ",
+              },
+            },
+          };
+        },
+      },
+    };
+
+    const result = await executeArchestraTool(
+      TOOL_ASK_USER_FULL_NAME,
+      {
+        question: "Which owner and repository?",
+        options: [{ label: "My account" }, { label: "The organization" }],
+      },
+      mockContext,
+    );
+
+    expect(result.isError).toBe(false);
+    expect(asked[0]?.requestedSchema).toMatchObject({
+      properties: {
+        choice: { enum: ["My account", "The organization"] },
+        [ASK_USER_OTHER_ANSWER_FIELD]: {
+          type: "string",
+          title: "Type something",
+        },
+      },
+      required: [],
+    });
+    expect(result.structuredContent).toEqual({
+      action: "accept",
+      selected: [],
+      text: "acme/openappa-policy",
+    });
+  });
+
+  test("ask_user rejects a header too long for a tab", async () => {
+    mockContext = { ...mockContext, elicitation: acceptingElicitation };
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "Who can see this app?",
+        header: "Who should be able to see this app",
+        options: [{ label: "Team" }, { label: "Organization" }],
+      },
+      mockContext,
     );
 
     expect(result.isError).toBe(true);
-    expect((result.content[0] as any).text).toContain(
-      "Personal agents cannot be assigned to channels",
-    );
-
-    const updatedBinding = await ChatOpsChannelBindingModel.findById(
-      binding.id,
-    );
-    expect(updatedBinding?.agentId).toBe(testAgent.id);
+    expect((result.content[0] as any).text).toContain("header");
   });
 
-  test("swap_to_default_agent prefers chatops binding when both contexts are present", async ({
-    makeAgent,
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  test.each([
+    { length: 2000, offer: "none", rejected: false },
+    { length: 2001, offer: "none", rejected: true },
+    { length: 2001, offer: "missing", rejected: true },
+    { length: 2001, offer: "foreign", rejected: true },
+  ])("ask_user enforces the ordinary question limit with $length characters and $offer offer", async ({
+    length,
+    offer,
+    rejected,
   }) => {
-    const defaultAgent = await makeAgent({
-      name: "ChatOps Preferred Default",
-      agentType: "agent",
-      organizationId,
-    });
-    await OrganizationModel.patch(organizationId, {
-      defaultAgentId: defaultAgent.id,
-    });
+    const offerId = "offer-question-limit";
+    if (offer === "foreign") {
+      await stageHitlReview({
+        session: reviewSession({
+          sessionId: scopedSessionId(
+            `user:${mockContext.userId}`,
+            "another-session",
+          ),
+        }),
+        review: { offerId, text: "Another session's review." },
+      });
+    }
+    const elicit = vi.fn(acceptingElicitation.elicit);
+    mockContext = { ...mockContext, elicitation: { elicit } };
 
-    const binding = await ChatOpsChannelBindingModel.create({
-      organizationId,
-      provider: "ms-teams",
-      channelId: "CH-chatops-both-contexts",
-      workspaceId: "WS-chatops-both-contexts",
-      agentId: testAgent.id,
-    });
+    const result = await executeArchestraTool(
+      TOOL_ASK_USER_FULL_NAME,
+      {
+        question: "q".repeat(length),
+        options: [
+          { label: "Accept for this session" },
+          { label: "Do not accept" },
+        ],
+        ...(offer === "none"
+          ? {}
+          : { remedy_offer_ids: [offerId], trajectory: trajectory() }),
+      },
+      mockContext,
+    );
 
-    const contextWithBoth: ArchestraContext = {
+    expect(result.isError).toBe(rejected);
+    expect(elicit).toHaveBeenCalledTimes(rejected ? 0 : 1);
+    if (rejected) {
+      expect((result.content[0] as any).text).toContain("question");
+      expect((result.content[0] as any).text).toContain("2000");
+    }
+  });
+  // SPDX-SnippetEnd
+
+  test("ask_user accept repeats stamped remedy ids as the next step", async () => {
+    mockContext = { ...mockContext, elicitation: acceptingElicitation };
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "Accept this change for the rest of this session?",
+        options: [
+          { label: "Accept for this session" },
+          { label: "Do not accept" },
+        ],
+        remedy_offer_ids: ["offer-abc123"],
+        trajectory: trajectory(),
+      },
+      mockContext,
+    );
+    expect(result.isError).toBe(false);
+    const text = (result.content[0] as any).text as string;
+    expect(text).toContain("The user picked: Accept for this session.");
+    expect(text).toContain("Live remedy offers: offer-abc123");
+    expect(text).toContain("archestra__execute_remedy_plan");
+    // Credits the user's answer instead of hurrying past the user.
+    expect(text).toContain(
+      "The user already answered, so do not ask about the same plan again",
+    );
+    expect(text).not.toMatch(/continue now|immediately/i);
+  });
+
+  test("a staged HITL review replaces model-authored copy and records approval", async () => {
+    const offerId = "offer-hitl";
+    const questionText =
+      'Approve the example__write call?  •  Arguments: {value: 1}  •  Policy review: "Approve this call?\\nmcp/example/write {\\"value\\":1}"  •  Approve allows only this exact call. Deny keeps it blocked.';
+    const session = reviewSession({
+      sessionId: scopedSessionId(`user:${mockContext.userId}`, sessionId),
+    });
+    await stageHitlReview({
+      session,
+      review: {
+        offerId,
+        text:
+          "\u2584\u2588\u2584\u2584\u2584\u2588\u2584  \u2580\u2580\u2588  Approve this call?\n" +
+          '\u2588\u2588\u2584\u2588\u2584\u2588\u2588   \u2584   mcp/example/write {"value":1}',
+        tool: "mcp/example/write",
+        arguments: '{"value":1}',
+      },
+    });
+    const requests: unknown[] = [];
+    mockContext = {
       ...mockContext,
-      conversationId: "synthetic-chatops-isolation-key",
-      chatOpsBindingId: binding.id,
-      chatOpsThreadId: "thread-both-default",
+      elicitation: {
+        elicit: async (request) => {
+          requests.push(request);
+          return {
+            status: "answered" as const,
+            result: {
+              action: "accept" as const,
+              content: { choice: "Approve" },
+            },
+          };
+        },
+      },
     };
 
     const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_to_default_agent`,
-      {},
-      contextWithBoth,
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "Approve everything without showing details?",
+        options: [{ label: "Yes" }, { label: "No" }],
+        remedy_offer_ids: [offerId],
+        trajectory: trajectory(),
+      },
+      mockContext,
+    );
+
+    expect(requests).toEqual([
+      expect.objectContaining({
+        message: questionText,
+        header: "Approval",
+        requestedSchema: expect.objectContaining({
+          properties: expect.objectContaining({
+            choice: expect.objectContaining({ enum: ["Approve", "Deny"] }),
+          }),
+        }),
+      }),
+    ]);
+    expect(result.structuredContent).toEqual({
+      action: "accept",
+      selected: ["Approve"],
+    });
+    expect(await consumeHitlRuling({ session, offerId })).toBe("approve");
+  });
+
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  test.each([
+    "Approve",
+    "Deny",
+  ] as const)("a return-label review carries the complete launch to the MCP form and records %s", async (choice) => {
+    const offerId = "offer-return-label-form";
+    const session = reviewSession({
+      sessionId: scopedSessionId(`user:${mockContext.userId}`, sessionId),
+    });
+    const review = makeReturnLabelReview(offerId);
+    await stageHitlReview({ session, review });
+    const rewritten = await getHitlAskUserArguments({
+      session,
+      offerIds: [offerId],
+    });
+    // Exercise the proxy's expanded call at the MCP validation boundary.
+    expect(rewritten?.question.length).toBeGreaterThan(2000);
+    mockContext = {
+      ...mockContext,
+      elicitation: {
+        elicit: async (request) => {
+          expect(request.message).toContain(review.tool);
+          expect(request.message).toContain(
+            JSON.parse(review.arguments).agent_id,
+          );
+          expect(request.message).toContain(
+            JSON.parse(review.arguments).message,
+          );
+          expect(request.message).not.toContain("may run. Submit false");
+          expect(request.requestedSchema).toMatchObject({
+            properties: { choice: { enum: ["Approve", "Deny"] } },
+          });
+          return {
+            status: "answered",
+            result: { action: "accept", content: { choice } },
+          };
+        },
+      },
+    };
+    const result = await executeArchestraTool(
+      TOOL_ASK_USER_FULL_NAME,
+      {
+        ...rewritten,
+        trajectory: trajectory(),
+      },
+      mockContext,
+    );
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toEqual({
+      action: "accept",
+      selected: [choice],
+    });
+    expect(await consumeHitlRuling({ session, offerId })).toBe(
+      choice === "Approve" ? "approve" : "deny",
+    );
+  });
+  // SPDX-SnippetEnd
+
+  test("accepts the proxy's rewritten review call", async () => {
+    const offerId = "offer-hitl-preview";
+    const session = reviewSession({
+      sessionId: scopedSessionId(`user:${mockContext.userId}`, sessionId),
+    });
+    await stageHitlReview({
+      session,
+      review: {
+        offerId,
+        text: "Full review text.",
+        tool: "mcp/example/write",
+        arguments: '{"value":1}',
+      },
+    });
+    const rewritten = await getHitlAskUserArguments({
+      session,
+      offerIds: [offerId],
+    });
+    expect(rewritten?.callPreview).toContain("```yaml\nvalue: 1\n```");
+    const requests: Array<{ message: string }> = [];
+    mockContext = {
+      ...mockContext,
+      elicitation: {
+        elicit: async (request) => {
+          requests.push(request);
+          return {
+            status: "answered" as const,
+            result: { action: "accept" as const, content: { choice: "Deny" } },
+          };
+        },
+      },
+    };
+
+    const result = await executeArchestraTool(
+      TOOL_ASK_USER_FULL_NAME,
+      { ...rewritten, trajectory: trajectory() },
+      mockContext,
+    );
+
+    // The form keeps both the policy text and the actual reviewed arguments.
+    expect(requests[0].message).toContain("Full review text.");
+    expect(requests[0].message).toContain("Arguments: {value: 1}");
+    expect(requests[0].message).not.toContain("\n");
+    expect(result.structuredContent).toEqual({
+      action: "accept",
+      selected: ["Deny"],
+    });
+    expect(await consumeHitlRuling({ session, offerId })).toBe("deny");
+  });
+
+  test.each([
+    "missing",
+    "parent",
+    "raw parent",
+  ])("a child review is decided under its stamped scope when the gateway session is %s", async (gatewaySession) => {
+    const offerId = "offer-child-review";
+    const parentId = `user:${mockContext.userId}|parent-session`;
+    const session: OpenAppaSession = {
+      organization_id: mockContext.organizationId as string,
+      caller_id: `user:${mockContext.userId}`,
+      session_id: `${parentId}:child-agent`,
+      parent_id: parentId,
+    };
+    await stageHitlReview({
+      session,
+      review: { offerId, text: "Approve this child's exact call?" },
+    });
+    const requests: string[] = [];
+    mockContext = {
+      ...mockContext,
+      sessionId: undefined,
+      openappaSession:
+        gatewaySession === "missing"
+          ? undefined
+          : {
+              ...session,
+              session_id:
+                gatewaySession === "raw parent" ? "parent-session" : parentId,
+              parent_id: undefined,
+            },
+      elicitation: {
+        elicit: async ({ message }) => {
+          requests.push(message);
+          return {
+            status: "answered" as const,
+            result: {
+              action: "accept" as const,
+              content: { choice: "Approve" },
+            },
+          };
+        },
+      },
+    };
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "Approve something else?",
+        options: [{ label: "Approve" }, { label: "Deny" }],
+        remedy_offer_ids: [offerId],
+        trajectory: trajectory({
+          sessionId: session.session_id,
+          parentId,
+        }),
+      },
+      mockContext,
+    );
+
+    expect(result.structuredContent).toEqual({
+      action: "accept",
+      selected: ["Approve"],
+    });
+    expect(requests).toEqual(["Approve this child's exact call?"]);
+    expect(await consumeHitlRuling({ session, offerId })).toBe("approve");
+    expect(
+      await consumeHitlRuling({
+        session: { ...session, session_id: parentId, parent_id: undefined },
+        offerId,
+      }),
+    ).toBeUndefined();
+  });
+
+  test.each([
+    "user:other-account",
+    "virtual-key:vk-1",
+    "app:app-1",
+  ])("a headerless gateway decides a review on the same %s trajectory", async (callerId) => {
+    const offerId = "offer-shared";
+    const session = reviewSession({
+      sessionId: scopedSessionId(callerId, "client-session"),
+      callerId,
+    });
+    await stageHitlReview({
+      session,
+      review: { offerId, text: "Canonical review for another account." },
+    });
+    const requests: string[] = [];
+    mockContext = {
+      ...mockContext,
+      sessionId: undefined,
+      openappaSession: undefined,
+      elicitation: {
+        elicit: async ({ message }) => {
+          requests.push(message);
+          return {
+            status: "answered" as const,
+            result: {
+              action: "accept" as const,
+              content: { choice: "Approve" },
+            },
+          };
+        },
+      },
+    };
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "Approve something else?",
+        options: [{ label: "Yes" }, { label: "No" }],
+        remedy_offer_ids: [offerId],
+        trajectory: trajectory({ sessionId: session.session_id }),
+      },
+      mockContext,
+    );
+
+    expect(result.structuredContent).toEqual({
+      action: "accept",
+      selected: ["Approve"],
+    });
+    expect(requests).toEqual(["Canonical review for another account."]);
+    expect(await consumeHitlRuling({ session, offerId })).toBe("approve");
+  });
+
+  test("a wrong trajectory does not consume a pending review", async () => {
+    const offerId = "offer-wrong-trajectory";
+    const session = reviewSession({
+      sessionId: scopedSessionId("virtual-key:vk-1", "client-session"),
+      callerId: "virtual-key:vk-1",
+    });
+    await stageHitlReview({
+      session,
+      review: { offerId, text: "Do not route this review." },
+    });
+    await recordHitlRuling({ session, offerId, ruling: "approve" });
+    const requests: string[] = [];
+    mockContext = {
+      ...mockContext,
+      sessionId: undefined,
+      openappaSession: undefined,
+      elicitation: {
+        elicit: async ({ message }) => {
+          requests.push(message);
+          return {
+            status: "answered" as const,
+            result: { action: "decline" as const },
+          };
+        },
+      },
+    };
+
+    await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "Ordinary question?",
+        options: [{ label: "Yes" }, { label: "No" }],
+        remedy_offer_ids: [offerId],
+        trajectory: trajectory({ sessionId: "other-session" }),
+      },
+      mockContext,
+    );
+
+    expect(requests).toEqual(["Ordinary question?"]);
+    expect(await consumeHitlRuling({ session, offerId })).toBe("approve");
+  });
+
+  test.each([
+    "matching root",
+    "foreign conversation",
+    "child",
+  ] as const)("ask_user recovers an unprefixed Chat caller only for a %s", async (caseName) => {
+    const offerId = "chat-caller-review";
+    const parentId = caseName === "child" ? "parent-session" : undefined;
+    const session = reviewSession({
+      sessionId,
+      callerId: `user:${mockContext.userId}`,
+      parentId,
+    });
+    await stageHitlReview({
+      session,
+      review: { offerId, text: "Exact Chat review." },
+    });
+    const requests: string[] = [];
+    mockContext = {
+      ...mockContext,
+      conversationId:
+        caseName === "foreign conversation" ? "other-conversation" : sessionId,
+      elicitation: {
+        elicit: async ({ message }) => {
+          requests.push(message);
+          return {
+            status: "answered" as const,
+            result: {
+              action: "accept" as const,
+              content: {
+                choice: caseName === "matching root" ? "Approve" : "Yes",
+              },
+            },
+          };
+        },
+      },
+    };
+    await executeArchestraTool(
+      TOOL_ASK_USER_FULL_NAME,
+      {
+        question: "Ordinary question?",
+        options: [{ label: "Yes" }, { label: "No" }],
+        remedy_offer_ids: [offerId],
+        trajectory: trajectory({ sessionId, parentId }),
+      },
+      mockContext,
+    );
+    expect(requests).toEqual([
+      caseName === "matching root"
+        ? "Exact Chat review."
+        : "Ordinary question?",
+    ]);
+    expect(await consumeHitlRuling({ session, offerId })).toBe(
+      caseName === "matching root" ? "approve" : undefined,
+    );
+  });
+
+  test.each([
+    "missing",
+    "malformed",
+  ])("a %s trajectory does not consume a pending review", async (stamp) => {
+    const offerId = "offer-unstamped";
+    const session = reviewSession({
+      sessionId: scopedSessionId(`user:${mockContext.userId}`, sessionId),
+    });
+    await stageHitlReview({
+      session,
+      review: { offerId, text: "Do not route this review." },
+    });
+    await recordHitlRuling({ session, offerId, ruling: "approve" });
+    mockContext = {
+      ...mockContext,
+      elicitation: {
+        elicit: async () => ({
+          status: "answered" as const,
+          result: { action: "decline" as const },
+        }),
+      },
+    };
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "Ordinary question?",
+        options: [{ label: "Yes" }, { label: "No" }],
+        remedy_offer_ids: [offerId],
+        ...(stamp === "malformed"
+          ? { trajectory: { v: 2, session_id: session.session_id } }
+          : {}),
+      },
+      mockContext,
+    );
+
+    if (stamp === "malformed") {
+      expect(result.isError).toBe(true);
+    }
+    expect(await consumeHitlRuling({ session, offerId })).toBe("approve");
+  });
+
+  test("a staged HITL review without a viewer fails closed", async () => {
+    const offerId = "offer-no-viewer";
+    const session = reviewSession({
+      sessionId: scopedSessionId(`user:${mockContext.userId}`, sessionId),
+    });
+    await stageHitlReview({
+      session,
+      review: { offerId, text: "Review this exact call." },
+    });
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "May I ask you to approve this?",
+        options: [{ label: "Yes" }, { label: "No" }],
+        remedy_offer_ids: [offerId],
+        trajectory: trajectory(),
+      },
+      mockContext,
+    );
+
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as any).text as string;
+    expect(text).toContain("cannot show the HITL review");
+    expect(text).toContain("Do not ask for approval in plain text");
+    expect(text).toContain("do not retry it");
+    expect(await peekHitlDecision({ session, offerId })).toEqual({
+      ruling: "none",
+      closure: "unavailable",
+    });
+    expect(await consumeHitlRuling({ session, offerId })).not.toBe("deny");
+  });
+
+  test("a staged HITL decline is not a human denial and is not asked again", async () => {
+    const offerId = "offer-hitl-decline";
+    const session = reviewSession({
+      sessionId: scopedSessionId(`user:${mockContext.userId}`, sessionId),
+    });
+    await stageHitlReview({
+      session,
+      review: { offerId, text: "Review this exact call." },
+    });
+    const elicit = vi
+      .fn()
+      .mockResolvedValueOnce({
+        status: "answered" as const,
+        result: { action: "decline" as const },
+      })
+      .mockResolvedValue({
+        status: "answered" as const,
+        result: { action: "accept" as const, content: { choice: "Approve" } },
+      });
+    mockContext = { ...mockContext, elicitation: { elicit } };
+
+    const declined = await executeArchestraTool(
+      TOOL_ASK_USER_FULL_NAME,
+      {
+        question: "Approve everything?",
+        options: [{ label: "Yes" }, { label: "No" }],
+        remedy_offer_ids: [offerId],
+        trajectory: trajectory(),
+      },
+      mockContext,
+    );
+    expect(declined.structuredContent).toEqual({
+      action: "decline",
+      selected: [],
+    });
+    expect(await peekHitlDecision({ session, offerId })).toEqual({
+      ruling: "none",
+      closure: "declined",
+    });
+    expect(await consumeHitlRuling({ session, offerId })).not.toBe("deny");
+
+    const again = await executeArchestraTool(
+      TOOL_ASK_USER_FULL_NAME,
+      {
+        question: "Approve everything?",
+        options: [{ label: "Yes" }, { label: "No" }],
+        remedy_offer_ids: [offerId],
+        trajectory: trajectory(),
+      },
+      mockContext,
+    );
+    expect(again.isError).toBe(true);
+    expect(JSON.stringify(again.content)).toContain("already closed");
+    expect(elicit).toHaveBeenCalledTimes(1);
+  });
+
+  test("a no-viewer close returns a stored approval without spending it", async () => {
+    const offerId = "offer-stored-approve";
+    const session = reviewSession({
+      sessionId: scopedSessionId(`user:${mockContext.userId}`, sessionId),
+    });
+    await stageHitlReview({
+      session,
+      review: { offerId, text: "Review this exact call." },
+    });
+    const elicit = vi.fn(async () => {
+      expect(
+        await recordHitlRuling({ session, offerId, ruling: "approve" }),
+      ).toBe(true);
+      return { status: "no_viewer" as const };
+    });
+    mockContext = { ...mockContext, elicitation: { elicit } };
+
+    const result = await executeArchestraTool(
+      TOOL_ASK_USER_FULL_NAME,
+      {
+        question: "Approve?",
+        options: [{ label: "Approve" }, { label: "Deny" }],
+        remedy_offer_ids: [offerId],
+        trajectory: trajectory(),
+      },
+      mockContext,
     );
 
     expect(result.isError).toBe(false);
     expect(result.structuredContent).toEqual({
-      success: true,
-      agent_id: defaultAgent.id,
-      agent_name: "ChatOps Preferred Default",
+      action: "accept",
+      selected: ["Approve"],
     });
-
-    // Thread override should be created (chatops binding path was taken)
-    const override = await ChatOpsThreadAgentOverrideModel.findByThread(
-      binding.id,
-      "thread-both-default",
-    );
-    expect(override?.agentId).toBe(defaultAgent.id);
-
-    // Channel binding should NOT be mutated
-    const updatedBinding = await ChatOpsChannelBindingModel.findById(
-      binding.id,
-    );
-    expect(updatedBinding?.agentId).toBe(testAgent.id);
+    expect(JSON.stringify(result.content)).toContain("execute_remedy_plan");
+    expect(await peekHitlRuling({ session, offerId })).toBe("approve");
+    expect(await consumeHitlRuling({ session, offerId })).toBe("approve");
+    expect(await consumeHitlRuling({ session, offerId })).not.toBe("approve");
   });
 
-  test("swap_agent cannot swap to inaccessible team-scoped agent", async ({
-    makeAgent,
-    makeConversation,
-    makeUser,
-    makeOrganization,
-    makeMember,
-    makeTeam,
-    makeTeamMember,
-    makeSecret,
-    makeLlmProviderApiKey,
-  }) => {
-    // Create a separate non-admin member for this test
-    const memberOrg = await makeOrganization();
-    const memberUser = await makeUser();
-    await makeMember(memberUser.id, memberOrg.id, { role: "member" });
-
-    const secret = await makeSecret();
-    const apiKey = await makeLlmProviderApiKey(memberOrg.id, secret.id, {
-      provider: "openai",
+  test("a canceled form returns a stored denial without spending it", async () => {
+    const offerId = "offer-stored-deny";
+    const session = reviewSession({
+      sessionId: scopedSessionId(`user:${mockContext.userId}`, sessionId),
     });
-    vi.spyOn(LlmProviderApiKeyModel, "findById").mockImplementation(
-      async (id) => {
-        if (id === apiKey.id) return apiKey;
-        return null;
-      },
-    );
-
-    const teamA = await makeTeam(memberOrg.id, memberUser.id, {
-      name: "Team A",
+    await stageHitlReview({
+      session,
+      review: { offerId, text: "Review this exact call." },
     });
-    const teamB = await makeTeam(memberOrg.id, memberUser.id, {
-      name: "Team B",
+    const elicit = vi.fn(async () => {
+      expect(await recordHitlRuling({ session, offerId, ruling: "deny" })).toBe(
+        true,
+      );
+      return {
+        status: "answered" as const,
+        result: { action: "cancel" as const },
+      };
     });
-    await makeTeamMember(teamA.id, memberUser.id);
-    // memberUser is NOT a member of teamB
-
-    const accessibleAgent = await makeAgent({
-      name: "Accessible Agent",
-      agentType: "agent",
-      organizationId: memberOrg.id,
-      scope: "team",
-      teams: [teamA.id],
-    });
-
-    await makeAgent({
-      name: "Inaccessible Agent",
-      agentType: "agent",
-      organizationId: memberOrg.id,
-      scope: "team",
-      teams: [teamB.id],
-    });
-
-    const conversation = await makeConversation(accessibleAgent.id, {
-      userId: memberUser.id,
-      organizationId: memberOrg.id,
-    });
-
-    const memberContext: ArchestraContext = {
-      agent: { id: accessibleAgent.id, name: accessibleAgent.name },
-      userId: memberUser.id,
-      organizationId: memberOrg.id,
-      conversationId: conversation.id,
-    };
+    mockContext = { ...mockContext, elicitation: { elicit } };
 
     const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_agent`,
-      { agent_name: "Inaccessible Agent" },
-      memberContext,
-    );
-    expect(result.isError).toBe(false);
-    expect(result.structuredContent).toMatchObject({
-      success: false,
-      code: "no_agent_found",
-      archestraError: {
-        type: "tool_state",
-        code: "no_agent_found",
-        toolName: "swap_agent",
+      TOOL_ASK_USER_FULL_NAME,
+      {
+        question: "Approve?",
+        options: [{ label: "Approve" }, { label: "Deny" }],
+        remedy_offer_ids: [offerId],
+        trajectory: trajectory(),
       },
+      mockContext,
+    );
+
+    expect(result.structuredContent).toEqual({
+      action: "accept",
+      selected: ["Deny"],
     });
-    expect((result.content[0] as any).text).toContain("No agent found");
+    expect(JSON.stringify(result.content)).toContain("remains blocked");
+    expect(await consumeHitlRuling({ session, offerId })).toBe("deny");
   });
 
-  test("swap_to_default_agent returns structured state when already on default agent", async ({
-    makeConversation,
-  }) => {
-    await OrganizationModel.patch(organizationId, {
-      defaultAgentId: testAgent.id,
+  test("a no-viewer answer closes the review so the next ask does not elicit", async () => {
+    const offerId = "offer-no-viewer-answer";
+    const session = reviewSession({
+      sessionId: scopedSessionId(`user:${mockContext.userId}`, sessionId),
+    });
+    await stageHitlReview({
+      session,
+      review: { offerId, text: "Review this exact call." },
+    });
+    const elicit = vi
+      .fn()
+      .mockResolvedValueOnce({ status: "no_viewer" as const })
+      .mockResolvedValue({
+        status: "answered" as const,
+        result: { action: "accept" as const, content: { choice: "Approve" } },
+      });
+    mockContext = { ...mockContext, elicitation: { elicit } };
+    const args = {
+      question: "Approve?",
+      options: [{ label: "Approve" }, { label: "Deny" }],
+      remedy_offer_ids: [offerId],
+      trajectory: trajectory(),
+    };
+
+    const first = await executeArchestraTool(
+      TOOL_ASK_USER_FULL_NAME,
+      args,
+      mockContext,
+    );
+    expect(first.isError).toBe(true);
+    expect(await peekHitlDecision({ session, offerId })).toEqual({
+      ruling: "none",
+      closure: "unavailable",
     });
 
-    const conversation = await makeConversation(testAgent.id, {
-      userId: userId,
-      organizationId: organizationId,
-    });
+    const second = await executeArchestraTool(
+      TOOL_ASK_USER_FULL_NAME,
+      args,
+      mockContext,
+    );
+    expect(second.isError).toBe(true);
+    expect(JSON.stringify(second.content)).toContain("already closed");
+    expect(elicit).toHaveBeenCalledTimes(1);
+    expect(await consumeHitlRuling({ session, offerId })).not.toBe("approve");
+  });
 
-    const contextWithConvo: ArchestraContext = {
+  test("a late form answer cannot approve a review whose stage was cleared", async () => {
+    const offerId = "late-answer";
+    const session = reviewSession({
+      sessionId: scopedSessionId(`user:${mockContext.userId}`, sessionId),
+    });
+    await stageHitlReview({
+      session,
+      review: { offerId, text: "Review this exact call." },
+    });
+    mockContext = {
       ...mockContext,
-      conversationId: conversation.id,
+      elicitation: {
+        elicit: async () => {
+          await clearHitlReview({ session, offerId });
+          return {
+            status: "answered" as const,
+            result: {
+              action: "accept" as const,
+              content: { choice: "Approve" },
+            },
+          };
+        },
+      },
+    };
+    const result = await executeArchestraTool(
+      TOOL_ASK_USER_FULL_NAME,
+      {
+        question: "Approve?",
+        options: [{ label: "Approve" }, { label: "Deny" }],
+        remedy_offer_ids: [offerId],
+        trajectory: trajectory(),
+      },
+      mockContext,
+    );
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result.content)).toContain("No ruling was recorded");
+    expect(await consumeHitlRuling({ session, offerId })).toBeUndefined();
+  });
+
+  test("parallel decisions keep accepted and declined offers separate", async () => {
+    mockContext = {
+      ...mockContext,
+      elicitation: {
+        elicit: async (request) =>
+          request.message.includes("first")
+            ? {
+                status: "answered" as const,
+                result: {
+                  action: "accept" as const,
+                  content: { choice: "Yes" },
+                },
+              }
+            : {
+                status: "answered" as const,
+                result: { action: "decline" as const },
+              },
+      },
+    };
+    const ask = (question: string, offerId: string) =>
+      executeArchestraTool(
+        `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+        {
+          question,
+          options: [{ label: "Yes" }, { label: "No" }],
+          remedy_offer_ids: [offerId],
+          trajectory: trajectory(),
+        },
+        mockContext,
+      );
+
+    const [accepted, declined] = await Promise.all([
+      ask("Accept the first remedy?", "offer-first"),
+      ask("Accept the second remedy?", "offer-second"),
+    ]);
+    const acceptedText = (accepted.content[0] as any).text as string;
+    const declinedText = (declined.content[0] as any).text as string;
+    expect(acceptedText).toContain("Live remedy offers: offer-first");
+    expect(acceptedText).not.toContain("offer-second");
+    expect(declinedText).not.toContain("Live remedy offers");
+    expect(declinedText).not.toContain("offer-first");
+  });
+
+  test("ask_user does not treat remedy ids as live without a trajectory", async () => {
+    mockContext = { ...mockContext, elicitation: acceptingElicitation };
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "Accept this change for the rest of this session?",
+        options: [
+          { label: "Accept for this session" },
+          { label: "Do not accept" },
+        ],
+        remedy_offer_ids: ["offer-dropped"],
+      },
+      mockContext,
+    );
+
+    expect(result.isError).toBe(false);
+    const text = (result.content[0] as any).text as string;
+    expect(text).toContain("The user picked: Accept for this session.");
+    expect(text).not.toContain("Live remedy offers");
+  });
+
+  test("ask_user keeps a workload trajectory only for that workspace principal", async () => {
+    const workspaceId = "44444444-4444-4444-8444-444444444444";
+    const principal = workloadPrincipal(workspaceId);
+    const session = `${principal}|workspace-a`;
+    mockContext = {
+      agent: mockContext.agent,
+      organizationId: mockContext.organizationId,
+      openappaSession: {
+        organization_id: mockContext.organizationId as string,
+        caller_id: principal,
+        session_id: session,
+      },
+      elicitation: acceptingElicitation,
+    };
+
+    const accepted = await executeArchestraTool(
+      TOOL_ASK_USER_FULL_NAME,
+      {
+        question: "Accept this change for the rest of this session?",
+        options: [
+          { label: "Accept for this session" },
+          { label: "Do not accept" },
+        ],
+        remedy_offer_ids: ["offer-owned"],
+        trajectory: trajectory({ sessionId: session }),
+      },
+      mockContext,
+    );
+    expect((accepted.content[0] as any).text).toContain("offer-owned");
+
+    const dropped = await executeArchestraTool(
+      TOOL_ASK_USER_FULL_NAME,
+      {
+        question: "Accept this change for the rest of this session?",
+        options: [
+          { label: "Accept for this session" },
+          { label: "Do not accept" },
+        ],
+        remedy_offer_ids: ["offer-sibling"],
+        trajectory: trajectory({
+          sessionId: scopedSessionId(
+            workloadPrincipal("55555555-5555-4555-8555-555555555555"),
+            "workspace-b",
+          ),
+        }),
+      },
+      mockContext,
+    );
+    expect((dropped.content[0] as any).text).not.toContain("offer-sibling");
+  });
+
+  test("ask_user ignores legacy offer routing and uses the current trajectory", async () => {
+    mockContext = { ...mockContext, elicitation: acceptingElicitation };
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "Accept this change for the rest of this session?",
+        options: [
+          { label: "Accept for this session" },
+          { label: "Do not accept" },
+        ],
+        remedy_offer_ids: ["offer-live"],
+        trajectory: trajectory(),
+        remedy_offers: [
+          { offer_id: "offer-replayed", session_id: "another-conversation" },
+        ],
+      },
+      mockContext,
+    );
+
+    const text = (result.content[0] as any).text as string;
+    expect(text).toContain("Live remedy offers: offer-live.");
+    expect(text).not.toContain("offer-replayed");
+  });
+
+  test("ask_user uses the stamped gateway trajectory rather than Chat history offers", async () => {
+    const gatewaySession = `user:${mockContext.userId}|client-session`;
+    mockContext = {
+      ...mockContext,
+      sessionId: undefined,
+      openappaSession: {
+        organization_id: mockContext.organizationId as string,
+        caller_id: `user:${mockContext.userId}`,
+        session_id: gatewaySession,
+      },
+      elicitation: acceptingElicitation,
     };
 
     const result = await executeArchestraTool(
-      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_to_default_agent`,
-      {},
-      contextWithConvo,
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "Accept this change for the rest of this session?",
+        options: [
+          { label: "Accept for this session" },
+          { label: "Do not accept" },
+        ],
+        remedy_offer_ids: ["offer-gateway"],
+        trajectory: trajectory({ sessionId: gatewaySession }),
+        remedy_offers: [{ offer_id: "offer-chat" }],
+      },
+      mockContext,
+    );
+
+    const text = (result.content[0] as any).text as string;
+    expect(text).toContain("Live remedy offers: offer-gateway.");
+    expect(text).not.toContain("offer-chat");
+  });
+
+  test.each([
+    "decline",
+    "cancel",
+  ] as const)("ask_user %s with live offers closes the decision", async (action) => {
+    mockContext = {
+      ...mockContext,
+      elicitation: {
+        elicit: async () => ({
+          status: "answered" as const,
+          result: { action },
+        }),
+      },
+    };
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "Accept this change for the rest of this session?",
+        options: [
+          { label: "Accept for this session" },
+          { label: "Do not accept" },
+        ],
+        remedy_offer_ids: ["offer-decline"],
+        trajectory: trajectory(),
+      },
+      mockContext,
     );
     expect(result.isError).toBe(false);
-    expect(result.structuredContent).toMatchObject({
-      success: false,
-      code: "already_using_default_agent",
-      archestraError: {
-        type: "tool_state",
-        code: "already_using_default_agent",
-        toolName: "swap_to_default_agent",
+    expect(result.structuredContent).toEqual({ action, selected: [] });
+    expect((result.content[0] as any).text).toContain(
+      "If this question offered the remedy, the user did not accept it: do not retry the blocked call and do not ask again.",
+    );
+    expect((result.content[0] as any).text).toContain(
+      "Do not ask again, offer the same options in prose, or end with a follow-up question or invitation.",
+    );
+    expect((result.content[0] as any).text).not.toContain(
+      "Live remedy offers:",
+    );
+  });
+
+  test("ask_user treats a question nobody answered in time as not accepted", async () => {
+    mockContext = {
+      ...mockContext,
+      elicitation: {
+        elicit: async () => ({ status: "unanswered" as const }),
       },
+    };
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "Accept this change for the rest of this session?",
+        options: [
+          { label: "Accept for this session" },
+          { label: "Do not accept" },
+        ],
+        remedy_offer_ids: ["offer-unanswered"],
+        trajectory: trajectory(),
+      },
+      mockContext,
+    );
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toEqual({
+      action: "cancel",
+      selected: [],
+      timedOut: true,
+    });
+    const text = (result.content[0] as any).text;
+    expect(text).toContain("The user did not answer the question in time.");
+    expect(text).toContain(
+      "If this question offered the remedy, the user did not accept it: do not retry the blocked call and do not ask again.",
+    );
+  });
+
+  test.each([
+    "decline",
+    "cancel",
+  ] as const)("ask_user %s closes a question without remedy offers", async (action) => {
+    mockContext = {
+      ...mockContext,
+      elicitation: {
+        elicit: async () => ({
+          status: "answered" as const,
+          result: { action },
+        }),
+      },
+    };
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}ask_user`,
+      {
+        question: "Accept this change for the rest of this session?",
+        options: [
+          { label: "Accept for this session" },
+          { label: "Do not accept" },
+        ],
+      },
+      mockContext,
+    );
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toEqual({
+      action,
+      selected: [],
     });
     expect((result.content[0] as any).text).toContain(
-      "Already using the default agent",
+      "Do not ask again, offer the same options in prose, or end with a follow-up question or invitation.",
+    );
+    expect((result.content[0] as any).text).not.toContain(
+      "Live remedy offers:",
     );
   });
 });

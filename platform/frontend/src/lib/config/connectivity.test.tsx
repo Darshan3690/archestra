@@ -1,0 +1,206 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, renderHook } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const { mockGetReady } = vi.hoisted(() => ({ mockGetReady: vi.fn() }));
+
+vi.mock("@archestra/shared/api-sdk", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@archestra/shared/api-sdk")>()),
+  getReady: (...args: unknown[]) => mockGetReady(...args),
+}));
+
+vi.mock("sonner");
+
+import { ConnectivityProvider, useConnectivity } from "./connectivity";
+
+const READY_OK = {
+  data: {
+    name: "archestra",
+    status: "ok",
+    version: "1",
+    database: "connected",
+    sandbox: "disabled",
+  },
+};
+const READY_FAIL = { error: new Error("offline") };
+const DATABASE_DOWN = {
+  error: {
+    name: "archestra",
+    status: "degraded",
+    version: "1",
+    database: "disconnected",
+  },
+};
+
+function makeWrapper() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>
+      <ConnectivityProvider>{children}</ConnectivityProvider>
+    </QueryClientProvider>
+  );
+  return { queryClient, wrapper };
+}
+
+// Settle pending fetches/effects. Driving polls explicitly via retry() keeps
+// the test deterministic — TanStack's background refetchInterval is gated on
+// tab focus/visibility, which is unreliable under jsdom + fake timers.
+async function flush() {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1);
+  });
+}
+
+// The first probe waits for the shell's first wave (see useShellReady); with
+// no other request in flight that is its fallback delay. The extra tick puts
+// the next poll on a later timestamp than this one, as real polls are.
+async function firstProbe() {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1_500);
+  });
+  await flush();
+}
+
+describe("ConnectivityProvider", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("waits for the page's first requests before its first probe", async () => {
+    mockGetReady.mockResolvedValue(READY_OK);
+    const { queryClient, wrapper } = makeWrapper();
+    let answerPage: (value: string) => void = () => undefined;
+    void queryClient.fetchQuery({
+      queryKey: ["page-data"],
+      queryFn: () =>
+        new Promise<string>((resolve) => {
+          answerPage = resolve;
+        }),
+    });
+    renderHook(() => useConnectivity(), { wrapper });
+
+    await flush();
+    expect(mockGetReady).not.toHaveBeenCalled();
+
+    await act(async () => answerPage("rows"));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    expect(mockGetReady).toHaveBeenCalledTimes(1);
+  });
+
+  it("needs two consecutive readiness failures before reporting backend-unreachable", async () => {
+    mockGetReady.mockResolvedValue(READY_FAIL);
+    const { result } = renderHook(() => useConnectivity(), {
+      wrapper: makeWrapper().wrapper,
+    });
+
+    // Mount poll = failure #1 — still online under the hysteresis threshold.
+    await firstProbe();
+    expect(result.current.state.kind).toBe("online");
+    expect(mockGetReady).toHaveBeenCalledTimes(1);
+
+    // Next poll = failure #2 — now unreachable.
+    act(() => result.current.retry());
+    await flush();
+    expect(result.current.state.kind).toBe("backend-unreachable");
+    expect(mockGetReady).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports a database outage separately from a backend outage", async () => {
+    mockGetReady.mockResolvedValue(DATABASE_DOWN);
+    const { result } = renderHook(() => useConnectivity(), {
+      wrapper: makeWrapper().wrapper,
+    });
+
+    await firstProbe();
+    expect(result.current.state.kind).toBe("online");
+    act(() => result.current.retry());
+    await flush();
+    expect(result.current.state.kind).toBe("database-unavailable");
+
+    mockGetReady.mockResolvedValue(READY_OK);
+    act(() => result.current.retry());
+    await flush();
+    expect(result.current.state.kind).toBe("online");
+  });
+
+  it("clears unreachable and fires exactly one refetch wave when /ready recovers", async () => {
+    mockGetReady.mockResolvedValue(READY_FAIL);
+    const { queryClient, wrapper } = makeWrapper();
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useConnectivity(), { wrapper });
+
+    await firstProbe();
+    act(() => result.current.retry());
+    await flush();
+    expect(result.current.state.kind).toBe("backend-unreachable");
+
+    mockGetReady.mockResolvedValue(READY_OK);
+    act(() => result.current.retry());
+    await flush();
+    expect(result.current.state.kind).toBe("online");
+
+    const activeInvalidations = invalidateSpy.mock.calls.filter(
+      ([arg]) => (arg as { type?: string } | undefined)?.type === "active",
+    );
+    expect(activeInvalidations).toHaveLength(1);
+  });
+
+  it("reports browser-offline immediately when navigator goes offline, independent of /ready", async () => {
+    mockGetReady.mockResolvedValue(READY_OK);
+    const { result } = renderHook(() => useConnectivity(), {
+      wrapper: makeWrapper().wrapper,
+    });
+
+    await firstProbe();
+    expect(result.current.state.kind).toBe("online");
+
+    const onLineSpy = vi
+      .spyOn(navigator, "onLine", "get")
+      .mockReturnValue(false);
+    await act(async () => {
+      window.dispatchEvent(new Event("offline"));
+    });
+    expect(result.current.state.kind).toBe("browser-offline");
+
+    onLineSpy.mockReturnValue(true);
+    await act(async () => {
+      window.dispatchEvent(new Event("online"));
+    });
+    await flush();
+    expect(result.current.state.kind).toBe("online");
+  });
+
+  it("fires exactly one refetch wave per offline→online transition, not while steady", async () => {
+    mockGetReady.mockResolvedValue(READY_OK);
+    const { queryClient, wrapper } = makeWrapper();
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useConnectivity(), { wrapper });
+    await firstProbe();
+
+    const onLineSpy = vi.spyOn(navigator, "onLine", "get");
+    const countActiveWaves = () =>
+      invalidateSpy.mock.calls.filter(
+        ([arg]) => (arg as { type?: string } | undefined)?.type === "active",
+      ).length;
+
+    for (let cycle = 1; cycle <= 2; cycle++) {
+      onLineSpy.mockReturnValue(false);
+      await act(async () => window.dispatchEvent(new Event("offline")));
+      onLineSpy.mockReturnValue(true);
+      await act(async () => window.dispatchEvent(new Event("online")));
+      await flush();
+      expect(result.current.state.kind).toBe("online");
+      // One wave per recovery, and none from the steady-online renders between.
+      expect(countActiveWaves()).toBe(cycle);
+    }
+  });
+});

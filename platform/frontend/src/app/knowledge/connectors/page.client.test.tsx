@@ -1,0 +1,364 @@
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  useHasPermissions,
+  useMissingPermissions,
+} from "@/lib/auth/auth.query";
+import { useFeature } from "@/lib/config/config.query";
+import { useIsGlobalAdmin, useOrganization } from "@/lib/organization.query";
+import { useTeams } from "@/lib/teams/team.query";
+import ConnectorsPage from "./page.client";
+
+const mockHasLegacySalesforceConnector = vi.fn();
+const mockUseConnectorsPaginated = vi.fn();
+const mockUseAllMatchingConnectors = vi.fn();
+const mockRestoreMutate = vi.fn();
+const mockPurgeMutateAsync = vi.fn();
+
+vi.mock("@/lib/knowledge/connector.query", () => ({
+  useHasLegacySalesforceConnector: () => mockHasLegacySalesforceConnector(),
+  useConnectorsPaginated: (params: unknown) =>
+    mockUseConnectorsPaginated(params),
+  useConnector: () => ({ data: null }),
+  useDeleteConnector: () => ({
+    mutateAsync: vi.fn(),
+    isPending: false,
+  }),
+  useAllMatchingConnectors: (...args: unknown[]) =>
+    mockUseAllMatchingConnectors(...args),
+  useBulkDeleteConnectors: () => ({ mutate: vi.fn(), isPending: false }),
+  useBulkUpdateConnectorVisibility: () => ({
+    mutateAsync: vi.fn(),
+    isPending: false,
+  }),
+  useRestoreConnector: () => ({
+    mutate: mockRestoreMutate,
+    isPending: false,
+  }),
+  usePermanentlyDeleteConnector: () => ({
+    mutateAsync: mockPurgeMutateAsync,
+    isPending: false,
+  }),
+}));
+
+vi.mock("next/navigation");
+vi.mock("@/lib/teams/team.query");
+vi.mock("@/lib/auth/auth.query");
+vi.mock("@/lib/config/config.query");
+vi.mock("@/lib/organization.query");
+
+// The status filter reads permissions and URL state of its own; its behavior
+// is the shared component's contract, not this page's.
+vi.mock("@/components/resource-scope-filter", () => ({
+  ResourceDeletedStatusFilter: () => <div>status filter</div>,
+  useScopeFilterParams: () => ({ hasActiveScopeFilters: false }),
+}));
+
+vi.mock("@/components/resource-access-filter", () => ({
+  ResourceAccessFilter: () => null,
+  RESOURCE_ACCESS_FILTER_PARAMS: ["access", "sharedWith", "owner"],
+}));
+
+vi.mock("@/components/delete-confirm-dialog", () => ({
+  DeleteConfirmDialog: ({ open, title }: { open: boolean; title: string }) =>
+    open ? <div>{title}</div> : null,
+}));
+
+// Heavy child dialogs and the create-gate layout chrome are out of scope.
+vi.mock(
+  "@/app/knowledge/knowledge-bases/_parts/create-connector-dialog",
+  () => ({ CreateConnectorDialog: () => null }),
+);
+vi.mock("@/app/knowledge/knowledge-bases/_parts/edit-connector-dialog", () => ({
+  EditConnectorDialog: () => null,
+}));
+vi.mock("@/app/knowledge/_parts/knowledge-page-layout", () => ({
+  KnowledgePageLayout: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+}));
+
+vi.mock("@/components/ui/tooltip", () => ({
+  Tooltip: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  TooltipTrigger: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  TooltipContent: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  TooltipProvider: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+}));
+vi.mock("@/lib/entity-labels.query");
+
+function makeConnector(overrides: Record<string, unknown>) {
+  return {
+    id: crypto.randomUUID(),
+    name: "Connector",
+    description: null,
+    connectorType: "jira",
+    visibility: "org-wide",
+    teamIds: [],
+    enabled: true,
+    lastSyncStatus: "success",
+    lastSyncAt: "2026-07-13T10:00:00.000Z",
+    schedule: null,
+    labels: [],
+    totalDocsIngested: 0,
+    ...overrides,
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockHasLegacySalesforceConnector.mockReturnValue({ data: false });
+  window.localStorage.clear();
+  mockUseAllMatchingConnectors.mockReturnValue({
+    data: [],
+    isFetching: false,
+  });
+  vi.mocked(usePathname).mockReturnValue("/knowledge/connectors");
+  vi.mocked(useSearchParams).mockReturnValue({
+    get: () => null,
+    toString: () => "",
+  } as unknown as ReturnType<typeof useSearchParams>);
+  vi.mocked(useRouter).mockReturnValue({
+    push: vi.fn(),
+  } as unknown as ReturnType<typeof useRouter>);
+  vi.mocked(useTeams).mockReturnValue({
+    data: [{ id: "team-1", name: "Platform Team" }],
+  } as unknown as ReturnType<typeof useTeams>);
+  vi.mocked(useHasPermissions).mockReturnValue({
+    data: true,
+  } as ReturnType<typeof useHasPermissions>);
+  vi.mocked(useMissingPermissions).mockReturnValue(
+    [] as unknown as ReturnType<typeof useMissingPermissions>,
+  );
+  vi.mocked(useFeature).mockReturnValue(
+    undefined as ReturnType<typeof useFeature>,
+  );
+  vi.mocked(useIsGlobalAdmin).mockReturnValue({
+    isGlobalAdmin: true,
+    isLoading: false,
+  });
+  vi.mocked(useOrganization).mockReturnValue({
+    data: undefined,
+  } as unknown as ReturnType<typeof useOrganization>);
+  mockUseConnectorsPaginated.mockReturnValue({
+    data: {
+      data: [
+        makeConnector({ name: "Org Connector", visibility: "org-wide" }),
+        makeConnector({
+          name: "Team Connector",
+          visibility: "team-scoped",
+          teamIds: ["team-1"],
+        }),
+        makeConnector({
+          name: "Synced Connector",
+          visibility: "auto-sync-permissions",
+        }),
+      ],
+      pagination: { total: 3 },
+    },
+    isPending: false,
+    isError: false,
+  });
+});
+
+describe("ConnectorsPage", () => {
+  it("warns about legacy Salesforce authentication even when the visible page contains other connector types", async () => {
+    mockHasLegacySalesforceConnector.mockReturnValue({ data: true });
+    render(<ConnectorsPage />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Salesforce password login retires in Summer ’27.",
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("Summer ’27");
+    expect(
+      screen.getByRole("link", { name: "Review Salesforce connectors" }),
+    ).toHaveAttribute("href", "/knowledge/connectors?connectorType=salesforce");
+  });
+  it("shows Salesforce as the selected type when following the migration notice", async () => {
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("connectorType=salesforce") as unknown as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+    render(<ConnectorsPage />);
+    expect(
+      await screen.findByRole("combobox", { name: "Filter by connector type" }),
+    ).toHaveTextContent("Salesforce");
+    expect(mockUseConnectorsPaginated).toHaveBeenCalledWith(
+      expect.objectContaining({ connectorType: "salesforce" }),
+    );
+  });
+  it("does not show a migration warning when no accessible legacy Salesforce connectors remain", () => {
+    render(<ConnectorsPage />);
+    expect(
+      screen.queryByText("Salesforce password login retires in Summer ’27."),
+    ).not.toBeInTheDocument();
+  });
+  it("keeps type and labels with the connector name in the compact table", async () => {
+    window.localStorage.setItem("archestra-connectors-view", "table");
+    mockUseConnectorsPaginated.mockReturnValue({
+      data: {
+        data: [
+          makeConnector({
+            name: "Regional Jira",
+            labels: [{ key: "region", value: "north" }],
+          }),
+        ],
+        pagination: { total: 1 },
+      },
+      isPending: false,
+      isFetching: false,
+      isError: false,
+    });
+
+    render(<ConnectorsPage />);
+
+    await screen.findByRole("columnheader", { name: "Connector" });
+    expect(
+      screen.getAllByRole("columnheader").map((header) => header.textContent),
+    ).toEqual(["", "Connector", "Status", "Documents", "Schedule", "Actions"]);
+    expect(screen.getByRole("button", { name: "View 1 label" })).toBeVisible();
+  });
+
+  it("shows each connector's document count on its card", async () => {
+    mockUseConnectorsPaginated.mockReturnValue({
+      data: {
+        data: [
+          makeConnector({ name: "Big Jira", totalDocsIngested: 21_534 }),
+          makeConnector({ name: "One Page", totalDocsIngested: 1 }),
+        ],
+        pagination: { total: 2 },
+      },
+      isPending: false,
+      isFetching: false,
+      isError: false,
+    });
+
+    render(<ConnectorsPage />);
+
+    expect((await screen.findByText("21,534")).parentElement).toHaveTextContent(
+      "21,534documents",
+    );
+    expect(screen.getByText("1").parentElement).toHaveTextContent("1document");
+  });
+
+  it("keeps the bulk bar visible while all matching connectors load", async () => {
+    mockUseConnectorsPaginated.mockReturnValue({
+      data: {
+        data: [
+          makeConnector({ id: "conn-1", name: "First Connector" }),
+          makeConnector({ id: "conn-2", name: "Second Connector" }),
+        ],
+        pagination: { total: 3 },
+      },
+      isPending: false,
+      isFetching: false,
+      isError: false,
+    });
+    mockUseAllMatchingConnectors.mockImplementation(
+      (_filters: unknown, options?: { enabled?: boolean }) => ({
+        data: undefined,
+        isFetching: options?.enabled ?? false,
+      }),
+    );
+
+    render(<ConnectorsPage />);
+    await userEvent.click(
+      screen.getByRole("checkbox", { name: "Select First Connector" }),
+    );
+    await userEvent.click(
+      screen.getByRole("checkbox", { name: "Select Second Connector" }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: /Select all 3 connectors/i }),
+    );
+
+    expect(
+      screen
+        .getAllByText(/All 3 connectors selected/i)
+        .some((element) => element.getAttribute("aria-hidden") === "true"),
+    ).toBe(true);
+  });
+
+  it("clears label filters and keeps select-all matching scoped to them", async () => {
+    const push = vi.fn();
+    vi.mocked(useRouter).mockReturnValue({
+      push,
+    } as unknown as ReturnType<typeof useRouter>);
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("labels=region%3Anorth&page=3") as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+
+    render(<ConnectorsPage />);
+
+    expect(mockUseConnectorsPaginated).toHaveBeenCalledWith(
+      expect.objectContaining({ labels: "region:north" }),
+    );
+    expect(mockUseAllMatchingConnectors).toHaveBeenCalledWith(
+      expect.objectContaining({ labels: "region:north" }),
+      expect.any(Object),
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Clear" }));
+    expect(push).toHaveBeenCalledWith("/knowledge/connectors?page=1", {
+      scroll: false,
+    });
+  });
+
+  it("deleted view: rows show how long they have sat in the trash and collapse to Restore + Delete permanently", async () => {
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("status=deleted") as unknown as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+    const deletedAt = new Date(
+      Date.now() - 5 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    mockUseConnectorsPaginated.mockReturnValue({
+      data: {
+        data: [
+          makeConnector({
+            id: "conn-1",
+            name: "Trashed Connector",
+            deletedAt,
+          }),
+        ],
+        pagination: { total: 1 },
+      },
+      isPending: false,
+      isFetching: false,
+      isLoadingError: false,
+      refetch: vi.fn(),
+    });
+
+    render(<ConnectorsPage />);
+
+    // The list is requested with the deleted slice.
+    expect(mockUseConnectorsPaginated).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "deleted" }),
+    );
+
+    // Trash metadata: how long the row has sat in the trash.
+    expect(screen.getByText(/5 days ago/)).toBeInTheDocument();
+
+    // The active-view actions are gone; the trash pair remains.
+    expect(screen.queryByLabelText(/Edit connector/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByLabelText(/^Restore/));
+    expect(mockRestoreMutate).toHaveBeenCalledWith("conn-1");
+
+    await userEvent.click(screen.getByLabelText(/^Delete permanently/));
+    expect(
+      screen.getByText("Delete connector permanently"),
+    ).toBeInTheDocument();
+  });
+});

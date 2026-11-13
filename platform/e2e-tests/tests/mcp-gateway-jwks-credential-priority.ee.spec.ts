@@ -23,15 +23,17 @@ import {
 import { getKeycloakJwt } from "../utils";
 import {
   callMcpTool,
-  initializeMcpSession,
   makeApiRequest,
+  waitForMcpGatewayJwtReady,
 } from "../utils/mcp-gateway";
 import { expect, test } from "./api-fixtures";
 
 const WIREMOCK_MCP_URL = `${WIREMOCK_INTERNAL_URL}/mcp/jwks-cred-priority-e2e`;
 const STATIC_TOKEN = "static-test-token-for-cred-priority-e2e";
 
-test.describe("MCP Gateway - JWKS Credential Resolution Priority", () => {
+test.describe("MCP Gateway - JWKS Credential Resolution Priority", {
+  tag: "@needs-keycloak",
+}, () => {
   test("should prefer upstream server credentials over JWT propagation", async ({
     request,
     createAgent,
@@ -44,7 +46,7 @@ test.describe("MCP Gateway - JWKS Credential Resolution Priority", () => {
     uninstallMcpServer,
     waitForAgentTool,
   }) => {
-    test.slow();
+    test.setTimeout(300_000);
 
     // STEP 1: Get a JWT from Keycloak
     const jwt = await getKeycloakJwt();
@@ -69,7 +71,6 @@ test.describe("MCP Gateway - JWKS Credential Resolution Priority", () => {
       const agentResponse = await createAgent(
         request,
         `JWKS Cred Priority E2E ${Date.now()}`,
-        "personal",
       );
       const agent = await agentResponse.json();
       profileId = agent.id;
@@ -114,9 +115,11 @@ test.describe("MCP Gateway - JWKS Credential Resolution Priority", () => {
       expect(agentTool).toBeDefined();
 
       // STEP 7: Initialize MCP session with the external JWT
-      await initializeMcpSession(request, {
+      await waitForMcpGatewayJwtReady({
+        request,
         profileId: pid,
         token: jwt,
+        expectedToolName: echoAuthToolName,
       });
 
       // STEP 8: Call echo_auth tool via MCP Gateway
@@ -165,7 +168,7 @@ test.describe("MCP Gateway - JWKS Credential Resolution Priority", () => {
     uninstallMcpServer,
     waitForAgentTool,
   }) => {
-    test.slow();
+    test.setTimeout(300_000);
 
     // STEP 1: Get a JWT from Keycloak
     const jwt = await getKeycloakJwt();
@@ -190,7 +193,6 @@ test.describe("MCP Gateway - JWKS Credential Resolution Priority", () => {
       const agentResponse = await createAgent(
         request,
         `JWKS JWT Fallback E2E ${Date.now()}`,
-        "personal",
       );
       const agent = await agentResponse.json();
       profileId = agent.id;
@@ -235,9 +237,11 @@ test.describe("MCP Gateway - JWKS Credential Resolution Priority", () => {
       expect(agentTool).toBeDefined();
 
       // STEP 7: Initialize MCP session with the external JWT
-      await initializeMcpSession(request, {
+      await waitForMcpGatewayJwtReady({
+        request,
         profileId: pid,
         token: jwt,
+        expectedToolName: echoAuthToolName,
       });
 
       // STEP 8: Call echo_auth tool via MCP Gateway

@@ -1,11 +1,12 @@
-import { ArchestraInternalErrorCode, ZhipuaiErrorTypes } from "@shared";
-import { encode as toonEncode } from "@toon-format/toon";
+import {
+  ArchestraInternalErrorCode,
+  ZhipuaiErrorTypes,
+} from "@archestra/shared";
 import { get } from "lodash-es";
 import config from "@/config";
 import logger from "@/logging";
-import { ModelModel } from "@/models";
 import { metrics } from "@/observability";
-import { getTokenizer } from "@/tokenizers";
+import { zhipuaiUsageTokens } from "@/observability/metrics/llm-usage";
 import type {
   ChunkProcessingResult,
   CommonMcpToolDefinition,
@@ -18,12 +19,16 @@ import type {
   LLMResponseAdapter,
   LLMStreamAdapter,
   StreamAccumulatorState,
-  ToolCompressionStats,
   UsageView,
   Zhipuai,
 } from "@/types";
-import { extractCommonMessageText } from "@/types";
-import { unwrapToolContent } from "../utils/unwrap-tool-content";
+import {
+  extractCommonMessageText,
+  extractCommonToolCallArguments,
+} from "@/types";
+import { fetchWithAbortSignal } from "@/utils/client-disconnect-signal";
+import { toOpenAiStreamUsage } from "./openai-sse-chunk";
+import { upstreamHttpError } from "./upstream-http-error";
 
 // =============================================================================
 // TYPE ALIASES
@@ -69,7 +74,7 @@ class ZhipuaiClient {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
+      const errorText = await response.text().catch(() => "");
       let errorMessage = `Zhipu AI API error: ${response.status} ${response.statusText}`;
 
       try {
@@ -90,7 +95,7 @@ class ZhipuaiClient {
         errorMessage += ` - ${errorText}`;
       }
 
-      throw new Error(errorMessage);
+      throw upstreamHttpError(errorMessage, response.status);
     }
 
     return response.json() as Promise<ZhipuaiResponse>;
@@ -113,7 +118,7 @@ class ZhipuaiClient {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
+      const errorText = await response.text().catch(() => "");
       let errorMessage = `Zhipu AI API error: ${response.status} ${response.statusText}`;
 
       try {
@@ -134,7 +139,7 @@ class ZhipuaiClient {
         errorMessage += ` - ${errorText}`;
       }
 
-      throw new Error(errorMessage);
+      throw upstreamHttpError(errorMessage, response.status);
     }
 
     return this.parseSSEStream(response);
@@ -243,7 +248,7 @@ class ZhipuaiRequestAdapter
 
     for (const message of this.request.messages) {
       if (message.role === "tool") {
-        const toolName = this.findToolNameInMessages(
+        const toolCall = this.findToolCallInMessages(
           this.request.messages,
           message.tool_call_id,
         );
@@ -261,7 +266,8 @@ class ZhipuaiRequestAdapter
 
         results.push({
           id: message.tool_call_id,
-          name: toolName ?? "unknown",
+          name: toolCall?.name ?? "unknown",
+          arguments: toolCall?.arguments,
           content,
           isError: false,
         });
@@ -321,16 +327,6 @@ class ZhipuaiRequestAdapter
     return messages;
   }
 
-  async applyToonCompression(model: string): Promise<ToolCompressionStats> {
-    const { messages: compressedMessages, stats } =
-      await convertToolResultsToToon(this.request.messages, model);
-    this.request = {
-      ...this.request,
-      messages: compressedMessages,
-    };
-    return stats;
-  }
-
   // ---------------------------------------------------------------------------
   // Build Modified Request
   // ---------------------------------------------------------------------------
@@ -353,10 +349,10 @@ class ZhipuaiRequestAdapter
   // Private Helpers
   // ---------------------------------------------------------------------------
 
-  private findToolNameInMessages(
+  private findToolCallInMessages(
     messages: ZhipuaiMessages,
     toolCallId: string,
-  ): string | null {
+  ): { name: string; arguments?: Record<string, unknown> } | null {
     for (let i = messages.length - 1; i >= 0; i--) {
       const message = messages[i];
 
@@ -364,7 +360,12 @@ class ZhipuaiRequestAdapter
         for (const toolCall of message.tool_calls) {
           if (toolCall.id === toolCallId) {
             if (toolCall.type === "function") {
-              return toolCall.function.name;
+              return {
+                name: toolCall.function.name,
+                arguments: extractCommonToolCallArguments(
+                  toolCall.function.arguments,
+                ),
+              };
             }
           }
         }
@@ -388,14 +389,14 @@ class ZhipuaiRequestAdapter
       };
 
       if (message.role === "tool") {
-        const toolName = this.findToolNameInMessages(
+        const toolCall = this.findToolCallInMessages(
           messages,
           message.tool_call_id,
         );
 
-        if (toolName) {
+        if (toolCall) {
           logger.debug(
-            { toolCallId: message.tool_call_id, toolName },
+            { toolCallId: message.tool_call_id, toolName: toolCall.name },
             "[ZhipuaiAdapter] toCommonFormat: found tool message",
           );
           let toolResult: unknown;
@@ -412,7 +413,8 @@ class ZhipuaiRequestAdapter
           commonMessage.toolCalls = [
             {
               id: message.tool_call_id,
-              name: toolName,
+              name: toolCall.name,
+              arguments: toolCall.arguments,
               content: toolResult,
               isError: false,
             },
@@ -447,7 +449,10 @@ class ZhipuaiRequestAdapter
 
     let appliedCount = 0;
     const result = messages.map((message) => {
-      if (message.role === "tool" && updates[message.tool_call_id]) {
+      if (
+        message.role === "tool" &&
+        Object.hasOwn(updates, message.tool_call_id)
+      ) {
         appliedCount++;
         logger.debug(
           { toolCallId: message.tool_call_id },
@@ -532,7 +537,7 @@ class ZhipuaiResponseAdapter implements LLMResponseAdapter<ZhipuaiResponse> {
     if (!this.response.usage) {
       return { inputTokens: 0, outputTokens: 0 };
     }
-    const { input, output } = getUsageTokens(this.response.usage);
+    const { input, output } = zhipuaiUsageTokens(this.response.usage);
     return { inputTokens: input, outputTokens: output };
   }
 
@@ -543,6 +548,36 @@ class ZhipuaiResponseAdapter implements LLMResponseAdapter<ZhipuaiResponse> {
 
   getOriginalResponse(): ZhipuaiResponse {
     return this.response;
+  }
+
+  withRewrittenToolCalls(
+    toolCalls: Array<{
+      id: string;
+      name: string;
+      arguments: string;
+      wireId?: string;
+    }>,
+  ): ZhipuaiResponse {
+    const choice = this.response.choices[0];
+    return {
+      ...this.response,
+      choices: [
+        {
+          ...choice,
+          message: {
+            ...choice.message,
+            tool_calls: toolCalls.map((toolCall) => ({
+              id: toolCall.wireId ?? toolCall.id,
+              type: "function" as const,
+              function: {
+                name: toolCall.name,
+                arguments: toolCall.arguments,
+              },
+            })),
+          },
+        },
+      ],
+    };
   }
 
   toRefusalResponse(
@@ -557,6 +592,22 @@ class ZhipuaiResponseAdapter implements LLMResponseAdapter<ZhipuaiResponse> {
           message: {
             role: "assistant",
             content: contentMessage,
+          },
+          finish_reason: "stop",
+        },
+      ],
+    };
+  }
+
+  withReplacedText(text: string): ZhipuaiResponse {
+    return {
+      ...this.response,
+      choices: [
+        {
+          ...this.response.choices[0],
+          message: {
+            role: "assistant",
+            content: text,
           },
           finish_reason: "stop",
         },
@@ -585,6 +636,39 @@ class ZhipuaiStreamAdapter
   readonly provider = "zhipuai" as const;
   readonly state: StreamAccumulatorState;
   private currentToolCallIndices = new Map<number, number>();
+  // Set to the refusal text when the streamed response was replaced by a policy
+  // refusal, so formatEndSSE finishes as "stop" (not the upstream "tool_calls")
+  // and toProviderResponse persists the refusal rather than the blocked calls.
+  // A refusal does not erase what the model already said: its text streamed
+  // as it arrived and the refusal was appended after it, so the client holds
+  // both. Recording the refusal alone deletes the model's own answer from the
+  // turn, leaving anything that reads it back — conversation history, a
+  // summarizer, a human debugging a run that died — a turn in which the model
+  // never spoke.
+  //
+  // The refusal ships as one more content delta, which clients concatenate onto
+  // what they have accumulated, so the record is that same concatenation.
+  private contentWithAnyRefusal(): string | null {
+    if (this.replacedText === null) {
+      return this.state.text || null;
+    }
+    return `${this.state.text}${this.replacedText}`;
+  }
+
+  /**
+   * The reasoning the model streamed, accumulated.
+   *
+   * GLM thinking mode streams its thinking in `reasoning_content`. It was
+   * forwarded to the client but never accumulated, so the reconstructed turn —
+   * the one persisted as the interaction — recorded a reasoning turn as though
+   * the model had gone straight to its answer.
+   */
+  private reasoningText = "";
+
+  private replacedText: string | null = null;
+  private get responseReplacedWithText(): boolean {
+    return this.replacedText !== null;
+  }
 
   constructor() {
     this.state = {
@@ -614,9 +698,21 @@ class ZhipuaiStreamAdapter
     this.state.responseId = chunk.id;
     this.state.model = chunk.model;
 
-    const choice = chunk.choices[0];
+    // Capture usage BEFORE the `choices` guard below. Zhipu itself rides usage
+    // on the finish chunk, but an OpenAI-compatible upstream answering an
+    // `include_usage` request sends it on a trailing chunk with `choices: []` —
+    // returning early on that chunk would drop the token counts entirely.
+    if (chunk.usage) {
+      this.state.usage = {
+        inputTokens: chunk.usage.prompt_tokens ?? 0,
+        outputTokens: chunk.usage.completion_tokens ?? 0,
+      };
+    }
+
+    // `choices` is optional-chained for the same reason: some OpenAI-compatible
+    // upstreams omit it entirely on usage-only and error chunks.
+    const choice = chunk.choices?.[0];
     if (!choice) {
-      // Empty chunk (shouldn't happen with Zhipu, but handle it)
       return {
         sseData: null,
         isToolCallChunk: false,
@@ -626,22 +722,23 @@ class ZhipuaiStreamAdapter
 
     const delta = choice.delta;
 
-    // Handle text content accumulation
+    // Accumulates text and reasoning independently of tool call policy buffering.
     if (delta.content) {
       this.state.text += delta.content;
     }
+    if (delta.reasoning_content) {
+      this.reasoningText += delta.reasoning_content;
+    }
 
-    // Only forward chunks with meaningful content updates to prevent empty deltas
-    // from causing the frontend to show loading state
-    // Check for any actual content: text, reasoning, tool calls, or role assignment
-    const hasContent =
-      delta.content ||
-      delta.reasoning_content ||
-      delta.tool_calls ||
-      delta.role;
-
-    if (hasContent) {
-      sseData = `data: ${JSON.stringify(chunk)}\n\n`;
+    // Splits chunks containing both content and tool calls.
+    // Forwards text and reasoning immediately while buffering tool calls for policy approval.
+    const hasStreamableContent = Boolean(
+      delta.content || delta.reasoning_content,
+    );
+    if (hasStreamableContent) {
+      sseData = `data: ${JSON.stringify(
+        delta.tool_calls ? withoutToolCallDeltas(chunk) : chunk,
+      )}\n\n`;
     }
 
     if (delta.tool_calls) {
@@ -672,20 +769,15 @@ class ZhipuaiStreamAdapter
         }
       }
 
-      this.state.rawToolCallEvents.push(chunk);
+      this.state.rawToolCallEvents.push(
+        hasStreamableContent ? onlyToolCallDeltas(chunk) : chunk,
+      );
       isToolCallChunk = true;
     }
 
     if (choice.finish_reason) {
       this.state.stopReason = choice.finish_reason;
       isFinal = true;
-    }
-
-    if (chunk.usage) {
-      this.state.usage = {
-        inputTokens: chunk.usage.prompt_tokens ?? 0,
-        outputTokens: chunk.usage.completion_tokens ?? 0,
-      };
     }
 
     return { sseData, isToolCallChunk, isFinal };
@@ -726,6 +818,7 @@ class ZhipuaiStreamAdapter
   }
 
   formatCompleteTextSSE(text: string): string[] {
+    this.replacedText = text;
     const chunk: ZhipuaiStreamChunk = {
       id: this.state.responseId || `chatcmpl-${Date.now()}`,
       object: "chat.completion.chunk",
@@ -745,6 +838,35 @@ class ZhipuaiStreamAdapter
     return [`data: ${JSON.stringify(chunk)}\n\n`];
   }
 
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]): string[] {
+    // Mirrors the OpenAI chat adapter: one chunk carrying every call complete,
+    // which is a valid degenerate case of the concatenated-deltas wire format.
+    const chunk: ZhipuaiStreamChunk = {
+      id: this.state.responseId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: this.state.model,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: toolCalls.map((toolCall, index) => ({
+              index,
+              id: toolCall.wireId ?? toolCall.id,
+              type: "function" as const,
+              function: {
+                name: toolCall.name,
+                arguments: toolCall.arguments,
+              },
+            })),
+          },
+          finish_reason: null,
+        },
+      ],
+    };
+    return [`data: ${JSON.stringify(chunk)}\n\n`];
+  }
+
   formatEndSSE(): string {
     const finalChunk: ZhipuaiStreamChunk = {
       id: this.state.responseId,
@@ -755,25 +877,35 @@ class ZhipuaiStreamAdapter
         {
           index: 0,
           delta: {},
-          finish_reason: this.state.stopReason ?? "stop",
+          finish_reason: this.responseReplacedWithText
+            ? "stop"
+            : (this.state.stopReason ?? "stop"),
         },
       ],
     };
+    // Zhipu reports usage on its finish chunk, which we never forward (it
+    // carries no streamable content), so without this the synthesized final
+    // chunk is the client's last chance to learn the token counts and it
+    // arrives empty. Shape mirrors `toProviderResponse()` below.
+    const usage = toOpenAiStreamUsage(this.state.usage);
+    if (usage) {
+      finalChunk.usage = usage;
+    }
     return `data: ${JSON.stringify(finalChunk)}\n\ndata: [DONE]\n\n`;
   }
 
   toProviderResponse(): ZhipuaiResponse {
     const toolCalls =
-      this.state.toolCalls.length > 0
-        ? this.state.toolCalls.map((tc) => ({
+      this.responseReplacedWithText || this.state.toolCalls.length === 0
+        ? undefined
+        : this.state.toolCalls.map((tc) => ({
             id: tc.id,
             type: "function" as const,
             function: {
               name: tc.name,
               arguments: tc.arguments,
             },
-          }))
-        : undefined;
+          }));
 
     return {
       id: this.state.responseId,
@@ -785,12 +917,18 @@ class ZhipuaiStreamAdapter
           index: 0,
           message: {
             role: "assistant",
-            content: this.state.text || null,
+            content: this.contentWithAnyRefusal(),
+            // The same field GLM emits on the wire, so clients that render
+            // reasoning read it back from here.
+            ...(this.reasoningText
+              ? { reasoning_content: this.reasoningText }
+              : {}),
             tool_calls: toolCalls,
           },
           logprobs: null,
-          finish_reason:
-            (this.state.stopReason as Zhipuai.Types.FinishReason) ?? "stop",
+          finish_reason: this.responseReplacedWithText
+            ? "stop"
+            : ((this.state.stopReason as Zhipuai.Types.FinishReason) ?? "stop"),
         },
       ],
       usage: {
@@ -805,155 +943,8 @@ class ZhipuaiStreamAdapter
 }
 
 // =============================================================================
-// TOON COMPRESSION
-// =============================================================================
-
-async function convertToolResultsToToon(
-  messages: ZhipuaiMessages,
-  model: string,
-): Promise<{
-  messages: ZhipuaiMessages;
-  stats: ToolCompressionStats;
-}> {
-  const tokenizer = getTokenizer("zhipuai");
-  let toolResultCount = 0;
-  let totalTokensBefore = 0;
-  let totalTokensAfter = 0;
-
-  const result = messages.map((message) => {
-    if (message.role === "tool") {
-      logger.info(
-        {
-          toolCallId: message.tool_call_id,
-          contentType: typeof message.content,
-          provider: "zhipuai",
-        },
-        "convertToolResultsToToon: tool message found",
-      );
-
-      if (typeof message.content === "string") {
-        try {
-          const unwrapped = unwrapToolContent(message.content);
-          const parsed = JSON.parse(unwrapped);
-          const noncompressed = unwrapped;
-          const compressed = toonEncode(parsed);
-
-          const tokensBefore = tokenizer.countTokens([
-            { role: "user", content: noncompressed },
-          ]);
-          const tokensAfter = tokenizer.countTokens([
-            { role: "user", content: compressed },
-          ]);
-
-          toolResultCount++;
-
-          // Always count tokens before
-          totalTokensBefore += tokensBefore;
-
-          // Only apply compression if it actually saves tokens
-          if (tokensAfter < tokensBefore) {
-            totalTokensAfter += tokensAfter;
-
-            logger.info(
-              {
-                toolCallId: message.tool_call_id,
-                beforeLength: noncompressed.length,
-                afterLength: compressed.length,
-                tokensBefore,
-                tokensAfter,
-                toonPreview: compressed.substring(0, 150),
-                provider: "zhipuai",
-              },
-              "convertToolResultsToToon: compressed",
-            );
-            logger.trace(
-              {
-                toolCallId: message.tool_call_id,
-                before: noncompressed,
-                after: compressed,
-                provider: "zhipuai",
-                supposedToBeJson: parsed,
-              },
-              "convertToolResultsToToon: before/after",
-            );
-
-            return {
-              ...message,
-              content: compressed,
-            };
-          }
-
-          // Compression not applied - count non-compressed tokens to track total tokens anyway
-          totalTokensAfter += tokensBefore;
-          logger.info(
-            {
-              toolCallId: message.tool_call_id,
-              tokensBefore,
-              tokensAfter,
-              provider: "zhipuai",
-            },
-            "Skipping TOON compression - compressed output has more tokens",
-          );
-        } catch {
-          logger.info(
-            {
-              toolCallId: message.tool_call_id,
-              contentPreview:
-                typeof message.content === "string"
-                  ? message.content.substring(0, 100)
-                  : "non-string",
-            },
-            "Skipping TOON conversion - content is not JSON",
-          );
-          return message;
-        }
-      }
-    }
-
-    return message;
-  });
-
-  logger.info(
-    { messageCount: messages.length, toolResultCount },
-    "convertToolResultsToToon completed",
-  );
-
-  let toonCostSavings = 0;
-  const tokensSaved = totalTokensBefore - totalTokensAfter;
-  if (tokensSaved > 0) {
-    toonCostSavings = await ModelModel.calculateCostSavings(
-      model,
-      tokensSaved,
-      "zhipuai",
-    );
-  }
-
-  return {
-    messages: result,
-    stats: {
-      tokensBefore: totalTokensBefore,
-      tokensAfter: totalTokensAfter,
-      costSavings: toonCostSavings,
-      wasEffective: totalTokensAfter < totalTokensBefore,
-      hadToolResults: toolResultCount > 0,
-    },
-  };
-}
-
-// =============================================================================
 // ADAPTER FACTORY
 // =============================================================================
-
-// =============================================================================
-// USAGE TOKEN HELPERS
-// =============================================================================
-
-export function getUsageTokens(usage: Zhipuai.Types.Usage) {
-  return {
-    input: usage.prompt_tokens,
-    output: usage.completion_tokens,
-  };
-}
 
 export const zhipuaiAdapterFactory: LLMProvider<
   ZhipuaiRequest,
@@ -996,15 +987,14 @@ export const zhipuaiAdapterFactory: LLMProvider<
     options: CreateClientOptions,
   ): ZhipuaiClient {
     const customFetch = options.agent
-      ? metrics.llm.getObservableFetch(
-          "zhipuai",
-          options.agent,
-          options.source,
-          options.externalAgentId,
-        )
+      ? metrics.llm.getObservableFetch("zhipuai", options.agent, options.source)
       : undefined;
 
-    return new ZhipuaiClient(apiKey, options.baseUrl, customFetch);
+    return new ZhipuaiClient(
+      apiKey,
+      options.baseUrl,
+      fetchWithAbortSignal(customFetch, options.abortSignal),
+    );
   },
 
   async execute(
@@ -1048,3 +1038,23 @@ export const zhipuaiAdapterFactory: LLMProvider<
     return "Internal server error";
   },
 };
+
+/** The text and reasoning half of a chunk that carries tool calls. */
+function withoutToolCallDeltas(chunk: ZhipuaiStreamChunk): ZhipuaiStreamChunk {
+  const [choice, ...rest] = chunk.choices;
+  const { tool_calls: _toolCalls, ...delta } = choice.delta;
+  return {
+    ...chunk,
+    choices: [{ ...choice, delta, finish_reason: null }, ...rest],
+  };
+}
+
+/** The policy-buffered half of a chunk that carries text or reasoning. */
+function onlyToolCallDeltas(chunk: ZhipuaiStreamChunk): ZhipuaiStreamChunk {
+  const [choice] = chunk.choices;
+  const { role, tool_calls } = choice.delta;
+  return {
+    ...chunk,
+    choices: [{ ...choice, delta: { ...(role ? { role } : {}), tool_calls } }],
+  };
+}

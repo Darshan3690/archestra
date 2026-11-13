@@ -1,11 +1,11 @@
 import {
   LINKED_IDP_AUTH_COMPLETE_ENDPOINT,
   LINKED_IDP_AUTH_INTENT_ENDPOINT,
-} from "@shared";
+} from "@archestra/shared";
 import { getCookies, parseSetCookieHeader } from "better-auth/cookies";
 import { makeSignature } from "better-auth/crypto";
 import { eq } from "drizzle-orm";
-import { betterAuth } from "@/auth";
+import { auth as betterAuth } from "@/auth/better-auth";
 import config from "@/config";
 import db, { schema } from "@/database";
 import { describe, expect, test } from "@/test";

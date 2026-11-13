@@ -1,0 +1,119 @@
+import { SecretsManagerType } from "@archestra/shared";
+import { HttpResponse, http } from "msw";
+import { vi } from "vitest";
+import config from "@/config";
+import { agentRuntimeManager } from "@/k8s/agent-runtime";
+import ClaudeCodeAccountModel from "@/models/claude-code-account";
+import SecretModel from "@/models/secret";
+import { secretManagerCoordinator } from "@/secrets-manager";
+import { afterEach, beforeEach, expect, test } from "@/test";
+import { useMswServer } from "@/test/msw";
+import type { ResolvedAgentRuntime } from "@/types";
+import { claudeCodeAccountManager as manager } from "./claude-code-account";
+
+// biome-ignore lint/correctness/useHookAtTopLevel: Vitest lifecycle helper.
+const server = useMswServer();
+beforeEach(() => {
+  vi.spyOn(agentRuntimeManager, "isEnabled", "get").mockReturnValue(true);
+  config.enterpriseFeatures.core = true;
+  vi.stubEnv("ARCHESTRA_HASHICORP_VAULT_ADDR", "http://vault.example.test");
+  vi.stubEnv("ARCHESTRA_HASHICORP_VAULT_TOKEN", "example-vault-token");
+  vi.stubEnv("ARCHESTRA_HASHICORP_VAULT_AUTH_METHOD", "TOKEN");
+  vi.stubEnv("ARCHESTRA_HASHICORP_VAULT_KV_VERSION", "2");
+});
+afterEach(async () => {
+  await secretManagerCoordinator.initialize(SecretsManagerType.DB);
+});
+
+test("managed Vault stores the token remotely and deletes it on disconnect", async ({
+  makeOrganization,
+  makeAgent,
+  makeUser,
+}) => {
+  await secretManagerCoordinator.initialize(SecretsManagerType.Vault);
+  const organization = await makeOrganization({
+    defaultEnvironmentNamespace: "account-tests",
+  });
+  const agent = await makeAgent({ organizationId: organization.id });
+  const user = await makeUser();
+  const runtime: ResolvedAgentRuntime = {
+    agentId: agent.id,
+    organizationId: organization.id,
+    secretId: null,
+    environmentId: null,
+    image: "example.test/claude:test",
+    command: ["archestra-claude-code"],
+    inferenceProtocol: "anthropic",
+    backend: "kubernetes",
+    steerMode: "tmux_keys",
+    privileged: false,
+    environment: [],
+    credentials: [],
+    ttlHours: null,
+    idleTimeoutMinutes: null,
+    maxCostUsd: null,
+  };
+  const owner = { runtime, userId: user.id };
+  const token = `sk-ant-oat01-${"example".repeat(8)}`;
+  let stored: unknown;
+  let removed = false;
+  server.use(
+    http.post(
+      "http://vault.example.test/v1/secret/data/archestra/:name",
+      async ({ request }) => {
+        stored = await request.json();
+        return HttpResponse.json({ data: {} });
+      },
+    ),
+    http.get("http://vault.example.test/v1/secret/data/archestra/:name", () =>
+      HttpResponse.json({
+        data: { data: { value: JSON.stringify({ value: token }) } },
+      }),
+    ),
+    http.delete(
+      "http://vault.example.test/v1/secret/metadata/archestra/:name",
+      () => {
+        removed = true;
+        return new HttpResponse(null, { status: 204 });
+      },
+    ),
+  );
+  server.use(
+    http.post("https://platform.claude.com/v1/oauth/token", () =>
+      HttpResponse.json({
+        access_token: token,
+        token_type: "Bearer",
+        expires_in: 3600,
+        scope: "user:inference",
+      }),
+    ),
+  );
+  const pending = await manager.start(owner);
+  await manager.complete({
+    ...owner,
+    flowId: pending.flowId as string,
+    ...(pending.authorizationUrl
+      ? {
+          code: `example-code#${new URL(pending.authorizationUrl).searchParams.get("state")}`,
+        }
+      : {}),
+  });
+  expect(stored).toEqual({ data: { value: JSON.stringify({ value: token }) } });
+  const credential = await ClaudeCodeAccountModel.find({
+    organizationId: organization.id,
+    userId: user.id,
+  });
+  if (!credential) throw new Error("Expected a personal Claude account");
+  expect(await SecretModel.findById(credential.secretId)).toMatchObject({
+    isVault: true,
+    secret: {},
+  });
+  expect(
+    await manager.requireConnection({
+      ...owner,
+      runtimeScope: "account-tests",
+    }),
+  ).toBe(token);
+  await manager.disconnect(owner);
+  expect(removed).toBe(true);
+});

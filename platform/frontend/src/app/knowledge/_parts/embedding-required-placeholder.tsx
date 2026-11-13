@@ -1,6 +1,6 @@
 "use client";
 
-import { DocsPage, getDocsUrl } from "@shared";
+import { DocsPage, getDocsUrl } from "@archestra/shared";
 import { ArrowUpRight, Database, Settings } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
@@ -9,7 +9,7 @@ import { useHasPermissions } from "@/lib/auth/auth.query";
 export function EmbeddingRequiredPlaceholder() {
   const router = useRouter();
   const { data: canAccessSettings } = useHasPermissions({
-    knowledgeSettings: ["read"],
+    organizationSettings: ["read"],
   });
 
   return (
@@ -33,7 +33,10 @@ export function EmbeddingRequiredPlaceholder() {
             </Button>
           )}
           <a
-            href={getDocsUrl(DocsPage.PlatformKnowledgeBases)}
+            href={getDocsUrl(
+              DocsPage.PlatformKnowledgeSettings,
+              "embedding-model",
+            )}
             target="_blank"
             rel="noopener noreferrer"
             className="text-sm inline-flex items-center gap-1 text-muted-foreground hover:text-foreground"

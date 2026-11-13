@@ -1,20 +1,28 @@
+// Binds the ports of the layers below before any other module loads.
+import "@/server/composition";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   ADMIN_ROLE_NAME,
   internalResources,
+  PLATFORM_ADMIN_ROLE_NAME,
   type PredefinedRoleName,
   type Resource,
   resourceLabels,
   roleDescriptions,
-} from "@shared";
+} from "@archestra/shared";
 import {
   allAvailableActions,
   permissionDescriptions,
   predefinedPermissionsMap,
-} from "@shared/access-control";
+} from "@archestra/shared/access-control";
 import logger from "@/logging";
+import { assertPortsBound } from "@/models/ports";
+
+// The composition module, imported first, bound the ports of the layers
+// below; stop here if one is unbound.
+assertPortsBound();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,14 +33,28 @@ function generatePredefinedRolesSections(): string {
 
   for (const role of roles) {
     const permissions = predefinedPermissionsMap[role];
-    const capitalizedName = role.charAt(0).toUpperCase() + role.slice(1);
+    const capitalizedName = role
+      .split("_")
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(" ");
 
     let section = `### ${capitalizedName}\n\n`;
-    section += `${roleDescriptions[role]}\n\n`;
 
     if (role === ADMIN_ROLE_NAME) {
-      section += "The admin role has **all permissions** on every resource.\n";
+      section +=
+        "Admin holds every permission, including user management, roles, " +
+        "and organization settings.\n";
+    } else if (role === PLATFORM_ADMIN_ROLE_NAME) {
+      section +=
+        "Platform Admin holds every permission except `log:admin`, " +
+        "`auditLog:admin`, and `member:impersonate`. It " +
+        "manages users, roles, settings, and resources, but sees only its " +
+        "own logs and audit records and cannot sign in as another member. " +
+        "Because of " +
+        "[No Privilege Escalation](/docs/admin/access-control#no-privilege-escalation), " +
+        "it cannot grant a role that holds the withheld permissions.\n";
     } else {
+      section += `${roleDescriptions[role]}.\n\n`;
       section += "| Resource | Actions |\n";
       section += "|----------|--------|\n";
 
@@ -96,74 +118,20 @@ function generateCustomRolesPermissionsTable(): string {
 
     for (const action of actions) {
       const key = `${resource}:${action}`;
-      table += `| \`${key}\` | ${permissionDescriptions[key]} |\n`;
+      // The span anchors the row, so docs can link to `/docs/reference/permissions#agent:read`.
+      const legacyAnchors =
+        resource === "oauthClient"
+          ? ["mcpOauthClient", "llmOauthClient"]
+              .map((old) => `<span id="${old}:${action}"></span>`)
+              .join("")
+          : resource === "project"
+            ? `<span id="scheduledTask:${action}"></span>`
+            : "";
+      table += `| ${legacyAnchors}<span id="${key}"></span>\`${key}\` | ${permissionDescriptions[key]} |\n`;
     }
   }
 
   return table;
-}
-
-function generateScopedResourcesSection(): string {
-  return `## Scoped Resources
-
-Some resources use a two-step authorization model:
-
-1. RBAC grants a base action such as \`read\`, \`create\`, \`update\`, or \`delete\`
-2. Runtime scope rules further restrict which records a user can see or modify
-
-The most common scopes are:
-
-- \`personal\`: owned by one user
-- \`team\`: shared with one or more teams
-- \`org\`: shared across the organization
-
-The elevated actions \`:admin\` and \`:team-admin\` are not global shortcuts with identical meaning on every resource. Their effect depends on the resource's runtime authorization rules.
-
-### Agents, MCP Gateways, and LLM Proxies
-
-\`agent\`, \`mcpGateway\`, and \`llmProxy\` share the same scope model:
-
-- \`personal\`: the author can manage their own records
-- \`team\`: requires \`<resource>:team-admin\` and membership in at least one assigned team
-- \`org\`: requires \`<resource>:admin\`
-
-Examples:
-
-- \`agent:delete\` alone does **not** allow deleting every agent
-- \`agent:team-admin\` allows managing team-scoped agents only in teams the user belongs to
-- \`agent:admin\` bypasses those scope restrictions
-
-### Visibility-Scoped Credentials
-
-\`llmProviderApiKey\` and \`llmVirtualKey\` also support \`personal\`, \`team\`, and \`org\` scope, but they use different elevated permissions:
-
-- Personal records are limited to their owner
-- Team records require membership in the selected team, with some routes also allowing \`team:admin\`
-- Organization-wide records require the resource-specific admin permission such as \`llmProviderApiKey:admin\` or \`llmVirtualKey:admin\`
-
-These resources do **not** use \`:team-admin\`.
-
-### Chat Access And Optional UI Controls
-
-Chat access is controlled separately from optional chat UI controls:
-
-- \`chat:read\` allows access to chat itself
-- \`agent:read\` is also required because chat is agent-backed and a user must be able to access at least one agent/profile context to start or use chat
-- \`chatAgentPicker:enable\` controls whether the agent picker is visible
-- \`chatProviderSettings:enable\` controls whether model and API key selectors are visible
-
-The selector visibility permissions are UI toggles. They should be treated independently from core chat access and should not be assumed to grant access to provider credentials or model catalogs on their own.
-
-### MCP Registry And Installation Records
-
-Some MCP-related resources also apply runtime scope checks in addition to RBAC, but their rules differ from agents, MCP gateways, and LLM proxies:
-
-- Internal MCP catalog items can be \`personal\`, \`team\`, or \`org\`
-- Organization-wide catalog items require \`mcpServerInstallation:admin\`
-- Team MCP server installations depend on team membership, with broader control for users who have \`team:admin\`
-
-When designing custom roles, treat the permission matrix as the first gate and the resource's scope rules as the second gate.
-`;
 }
 
 /**
@@ -172,10 +140,9 @@ When designing custom roles, treat the permission matrix as the first gate and t
  */
 function generateFrontmatter(lastUpdated: string): string {
   return `---
-title: "Access Control"
-category: Administration
-description: "Role-based access control (RBAC) system for managing user permissions in Archestra"
-order: 1
+title: "Permissions"
+description: "What each built-in role can do, and every permission a custom role can hold"
+order: 2
 lastUpdated: ${lastUpdated}
 ---`;
 }
@@ -186,81 +153,25 @@ lastUpdated: ${lastUpdated}
 function generateMarkdownBody(): string {
   return `
 <!--
-Check ../docs_writer_prompt.md before changing this file.
-
-This document is human-built, shouldn't be updated with AI. Don't change anything here.
+GENERATED FILE — edit codegen-access-control-docs.ts, not this page.
+Run \`pnpm codegen:access-control-docs\` to regenerate.
 -->
 
-Archestra uses a role-based access control (RBAC) system to manage user permissions. This system provides both predefined roles for common use cases and the flexibility to create custom roles with specific permission combinations.
-
-Permissions in Archestra are defined using a \`resource:action\` format, where:
-
-- **Resource**: The type of object or feature being accessed (e.g., \`agent\`, \`mcpGateway\`, \`llmProxy\`)
-- **Action**: The operation being performed (\`create\`, \`read\`, \`update\`, \`delete\`, \`admin\`)
-
-For example, the permission \`agent:create\` allows creating new agents, \`mcpGateway:update\` allows updating MCP gateways, whereas \`llmProxy:read\` would allow reading LLM proxies.
+Every permission is a \`resource:action\` pair, such as \`agent:create\`. A role is a set of these permissions. Docs pages link here by permission name. [Access Control](/docs/admin/access-control) explains how roles and per-item grants work together.
 
 ## Predefined Roles
 
-The following roles are built into Archestra and cannot be modified or deleted:
+Every organization has these four roles. You cannot edit or delete them.
 
 ${generatePredefinedRolesSections()}
 
-## Custom Roles
+<span id="llm-api-permissions"></span>
 
-Users with \`ac:create\` permission can create custom roles by selecting specific permission combinations. Custom roles allow fine-grained access control tailored to your needs. Note that you can only grant permissions that you already possess — this prevents privilege escalation.
+## Available Permissions
 
-### Available Permissions
-
-The following table lists all available permissions that can be assigned to custom roles:
+A [custom role](/docs/admin/access-control#custom-roles) can hold any of these permissions. To grant an action on a single item, such as one agent, see [Granular Access Control](/docs/admin/access-control#granular-access-control).
 
 ${generateCustomRolesPermissionsTable()}
-
-${generateScopedResourcesSection()}
-
-## Best Practices
-
-### Principle of Least Privilege
-
-Grant users only the minimum permissions necessary for their role. Start with the "Member" role and add specific permissions as needed.
-
-### Team-Based Organization
-
-Combine roles with team-based access control for fine-grained resource access:
-
-1. **Create teams** for different groups (e.g., "Data Scientists", "Developers")
-2. **Assign Agents, MCP Gateways, LLM Proxies, and MCP Servers** to specific teams
-3. **Add users to teams** based on their role and responsibilities
-
-#### Default Team
-
-New users are automatically added to the "Default Team" when they accept an invitation. This ensures all users have immediate access to Archestra resources assigned to this team.
-
-#### Team Access Control Rules
-
-**For MCP Gateways, LLM Proxies, and Agents:**
-
-- Users can only see agents assigned to teams they belong to
-- Exception: Users with \`agent:admin\` permission can see all agents
-- Exception: Agents with no team assignment are visible to all users
-
-**For MCP Servers:**
-
-- Users can only access MCP servers assigned to teams they belong to
-- Exception: Users with \`mcpServerInstallation:admin\` permission can access all MCP servers
-- Exception: MCP servers with no team assignment are accessible to all users
-
-**Associated Artifacts:**
-
-Team-based access extends to related resources like interaction logs, policies, and tool assignments. Members can only view these artifacts for agents and MCP servers they have access to.
-
-### Regular Review
-
-Periodically review custom roles and team membership assignments to ensure they align with current needs and security requirements.
-
-### Role Naming
-
-Use clear, descriptive names for custom roles that indicate their purpose (e.g., "Agent-Manager", "Read-Only-Analyst", "Tool-Developer").
 `;
 }
 
@@ -313,7 +224,7 @@ async function main() {
 
   const docsFilePath = path.join(
     __dirname,
-    "../../../../docs/pages/platform-access-control.md",
+    "../../../../docs/pages/reference/permissions.md",
   );
 
   // Ensure directory exists
@@ -331,7 +242,7 @@ async function main() {
   const markdownContent = generateMarkdownContent(existingContent);
 
   // Write the generated content
-  fs.writeFileSync(docsFilePath, markdownContent);
+  fs.writeFileSync(docsFilePath, `${markdownContent.trimEnd()}\n`);
 
   logger.info(`🙉 Documentation generated at: ${docsFilePath}`);
   logger.info("📊 Generated tables for:");

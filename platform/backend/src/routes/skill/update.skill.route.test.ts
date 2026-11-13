@@ -1,0 +1,455 @@
+import { ADMIN_ROLE_NAME, EDITOR_ROLE_NAME } from "@archestra/shared";
+import { EnvironmentModel, SkillModel } from "@/models";
+import MemberModel from "@/models/member";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import { describe, expect, test } from "@/test";
+import skillRoutes from "./skill.routes";
+import {
+  MANIFEST,
+  manifestNamed,
+  seedImportedSkill,
+  useSkillRouteTestApp,
+} from "./skill.test-helpers";
+
+describe("PUT /api/skills/:id", () => {
+  const ctx = useSkillRouteTestApp(skillRoutes);
+
+  test("replaces a skill's environment assignments", async () => {
+    const skill = (
+      await ctx.app.inject({
+        method: "POST",
+        url: "/api/skills",
+        payload: { content: MANIFEST },
+      })
+    ).json();
+    const staging = await EnvironmentModel.create({
+      organizationId: ctx.organizationId,
+      name: "Staging",
+    });
+    const production = await EnvironmentModel.create({
+      organizationId: ctx.organizationId,
+      name: "Production",
+    });
+
+    const response = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${skill.id}`,
+      payload: {
+        content: MANIFEST,
+        environmentIds: [staging.id, production.id],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(
+      response
+        .json()
+        .environments.map((e: { id: string }) => e.id)
+        .sort(),
+    ).toEqual([production.id, staging.id].sort());
+
+    // omitting environmentIds leaves the assignments untouched...
+    const untouched = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${skill.id}`,
+      payload: { content: MANIFEST },
+    });
+    expect(untouched.statusCode).toBe(200);
+    expect(untouched.json().environments).toHaveLength(2);
+
+    // ...and an explicit [] clears them (available in every environment).
+    const cleared = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${skill.id}`,
+      payload: { content: MANIFEST, environmentIds: [] },
+    });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json().environments).toEqual([]);
+  });
+
+  test("updates the manifest and replaces resource files", async () => {
+    const created = (
+      await ctx.app.inject({
+        method: "POST",
+        url: "/api/skills",
+        payload: {
+          content: MANIFEST,
+          files: [{ path: "references/OLD.md", content: "old" }],
+        },
+      })
+    ).json();
+
+    const updatedManifest = MANIFEST.replace(
+      "Extract text from PDF files.",
+      "Extract text and tables from PDF files.",
+    );
+    const response = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${created.id}`,
+      payload: {
+        content: updatedManifest,
+        files: [{ path: "references/NEW.md", content: "new" }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.description).toBe("Extract text and tables from PDF files.");
+    expect(body.files).toHaveLength(1);
+    expect(body.files[0].path).toBe("references/NEW.md");
+  });
+
+  test("baseVersion rejects an edit composed from a superseded head", async () => {
+    const created = (
+      await ctx.app.inject({
+        method: "POST",
+        url: "/api/skills",
+        payload: { content: MANIFEST },
+      })
+    ).json();
+
+    // someone else's edit moves the head past what our caller read
+    const theirs = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${created.id}`,
+      payload: { content: `${MANIFEST}\nTheir edit.` },
+    });
+    expect(theirs.statusCode).toBe(200);
+    expect(theirs.json().latestVersion).toBeGreaterThan(created.latestVersion);
+
+    const stale = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${created.id}`,
+      payload: {
+        content: `${MANIFEST}\nOur edit.`,
+        baseVersion: created.latestVersion,
+      },
+    });
+
+    expect(stale.statusCode).toBe(409);
+    // machine-readable so a client can offer a reload, which it cannot do off
+    // the status alone — this route's other 409s are not reload-able
+    expect(stale.json().error.internal_code).toBe("skill_version_conflict");
+
+    // the rejected edit rolled back: their content survives intact
+    const after = await ctx.app.inject({
+      method: "GET",
+      url: `/api/skills/${created.id}`,
+    });
+    expect(after.json().content).toContain("Their edit.");
+    expect(after.json().content).not.toContain("Our edit.");
+  });
+
+  test("a name-collision 409 carries no version-conflict code", async () => {
+    const created = (
+      await ctx.app.inject({
+        method: "POST",
+        url: "/api/skills",
+        payload: { content: manifestNamed("first-skill") },
+      })
+    ).json();
+    await ctx.app.inject({
+      method: "POST",
+      url: "/api/skills",
+      payload: { content: manifestNamed("second-skill") },
+    });
+
+    const renamed = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${created.id}`,
+      payload: { content: manifestNamed("second-skill") },
+    });
+
+    expect(renamed.statusCode).toBe(409);
+    expect(renamed.json().error.internal_code).toBeUndefined();
+  });
+
+  test("omitting baseVersion keeps last-write-wins", async () => {
+    const created = (
+      await ctx.app.inject({
+        method: "POST",
+        url: "/api/skills",
+        payload: { content: MANIFEST },
+      })
+    ).json();
+
+    await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${created.id}`,
+      payload: { content: `${MANIFEST}\nTheir edit.` },
+    });
+
+    // same stale starting point as above, but unguarded — the write lands
+    const unguarded = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${created.id}`,
+      payload: { content: `${MANIFEST}\nOur edit.` },
+    });
+
+    expect(unguarded.statusCode).toBe(200);
+    expect(unguarded.json().content).toContain("Our edit.");
+  });
+
+  test("explicit allowedTools overrides the frontmatter on update", async () => {
+    const created = (
+      await ctx.app.inject({
+        method: "POST",
+        url: "/api/skills",
+        payload: { content: MANIFEST, allowedTools: ["Read"] },
+      })
+    ).json();
+    expect(created.allowedTools).toBe("Read");
+
+    const response = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${created.id}`,
+      payload: { content: MANIFEST, allowedTools: ["Bash Edit"] },
+    });
+
+    expect(response.statusCode).toBe(200);
+    // space-separated entries are normalized like the frontmatter form
+    expect(response.json().allowedTools).toBe("Bash Edit");
+
+    const cleared = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${created.id}`,
+      payload: { content: MANIFEST },
+    });
+    // omitting the field falls back to the (absent) frontmatter value
+    expect(cleared.json().allowedTools).toBeNull();
+  });
+
+  test("leaves resource files untouched when `files` is omitted", async () => {
+    const created = (
+      await ctx.app.inject({
+        method: "POST",
+        url: "/api/skills",
+        payload: {
+          content: MANIFEST,
+          files: [{ path: "references/KEEP.md", content: "keep" }],
+        },
+      })
+    ).json();
+
+    const response = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${created.id}`,
+      payload: { content: MANIFEST },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.files).toHaveLength(1);
+    expect(body.files[0].path).toBe("references/KEEP.md");
+  });
+
+  test("clears resource files when `files` is an empty array", async () => {
+    const created = (
+      await ctx.app.inject({
+        method: "POST",
+        url: "/api/skills",
+        payload: {
+          content: MANIFEST,
+          files: [{ path: "references/GONE.md", content: "gone" }],
+        },
+      })
+    ).json();
+
+    const response = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${created.id}`,
+      payload: { content: MANIFEST, files: [] },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().files).toEqual([]);
+  });
+
+  test("a content-only edit does not 403 a team-admin who belongs to only one assigned team", async ({
+    makeTeam,
+    makeTeamMember,
+  }) => {
+    // editor holds skill:team-admin — may manage team-scoped skills
+    await MemberModel.updateRole(
+      ctx.user.id,
+      ctx.organizationId,
+      EDITOR_ROLE_NAME,
+    );
+    const teamA = await makeTeam(ctx.organizationId, ctx.user.id);
+    const teamB = await makeTeam(ctx.organizationId, ctx.user.id);
+    await makeTeamMember(teamA.id, ctx.user.id);
+
+    const skill = await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "multi-team-skill",
+      sourceRef: "x/y@main:SKILL.md",
+      access: { teams: [teamA.id, teamB.id] },
+      authorId: ctx.user.id,
+    });
+
+    // a content-only edit that echoes the full team list back must not be
+    // rejected just because the author is not a member of every team.
+    const response = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${skill.id}`,
+      payload: {
+        content: manifestNamed("multi-team-skill"),
+        scope: "team",
+        teamIds: [teamA.id, teamB.id],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect((await teamGrantIds(skill.id)).sort()).toEqual(
+      [teamA.id, teamB.id].sort(),
+    );
+  });
+
+  test("ignores an attempt to clear all teams of a team-shared skill", async ({
+    makeTeam,
+  }) => {
+    await MemberModel.updateRole(
+      ctx.user.id,
+      ctx.organizationId,
+      ADMIN_ROLE_NAME,
+    );
+    const team = await makeTeam(ctx.organizationId, ctx.user.id);
+    const skill = await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "to-be-emptied",
+      sourceRef: "x/y@main:SKILL.md",
+      access: { teams: [team.id] },
+    });
+
+    const response = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${skill.id}`,
+      payload: {
+        content: manifestNamed("to-be-emptied"),
+        scope: "team",
+        teamIds: [],
+      },
+    });
+
+    // `scope`/`teamIds` left the update body, so the retired fields are
+    // dropped and the team's grant is left intact.
+    expect(response.statusCode).toBe(200);
+    expect(await teamGrantIds(skill.id)).toEqual([team.id]);
+  });
+});
+
+describe("PUT /api/skills/:id on a GitHub-synced skill", () => {
+  const ctx = useSkillRouteTestApp(skillRoutes);
+
+  async function seedSynced() {
+    const skill = await SkillModel.createWithFiles({
+      skill: {
+        organizationId: ctx.organizationId,
+        authorId: ctx.user.id,
+        name: "synced-locked",
+        description: "synced-locked description",
+        content: "# body",
+        metadata: {},
+        sourceType: "github",
+        sourceRef: "acme/skills@main:synced-locked",
+        sourceCommit: "abc",
+        githubSyncInterval: "1d",
+      },
+      files: [],
+    });
+    if (!skill) throw new Error("seed failed");
+    return skill;
+  }
+
+  const echoManifest = [
+    "---",
+    "name: synced-locked",
+    "description: synced-locked description",
+    "---",
+    "",
+    "# body",
+  ].join("\n");
+
+  test("rejects a content change with 409", async () => {
+    const skill = await seedSynced();
+    const response = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${skill.id}`,
+      payload: { content: `${echoManifest}\nedited` },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.message).toContain("synced from GitHub");
+  });
+
+  test("rejects a files change with 409", async () => {
+    const skill = await seedSynced();
+    const response = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${skill.id}`,
+      payload: {
+        content: echoManifest,
+        files: [{ path: "references/x.md", content: "# X" }],
+      },
+    });
+    expect(response.statusCode).toBe(409);
+  });
+
+  test("allows a settings-only save that echoes the manifest", async () => {
+    const skill = await seedSynced();
+    const env = await EnvironmentModel.create({
+      organizationId: ctx.organizationId,
+      name: "Sync Staging",
+    });
+    const response = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${skill.id}`,
+      payload: { content: echoManifest, environmentIds: [env.id] },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().environments).toEqual([
+      { id: env.id, name: "Sync Staging" },
+    ]);
+    // still synced, still at version 1 — nothing content-wise changed
+    expect(response.json().githubSyncInterval).toBe("1d");
+    expect(response.json().latestVersion).toBe(1);
+  });
+
+  test("sets and keeps an icon without forking a version", async () => {
+    const skill = await seedSynced();
+    const withIcon = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${skill.id}`,
+      payload: { content: echoManifest, icon: "📘" },
+    });
+    expect(withIcon.statusCode).toBe(200);
+    expect(withIcon.json()).toMatchObject({ icon: "📘", latestVersion: 1 });
+
+    // A save that omits the icon leaves it; null clears it.
+    const untouched = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${skill.id}`,
+      payload: { content: echoManifest },
+    });
+    expect(untouched.json().icon).toBe("📘");
+    const cleared = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/skills/${skill.id}`,
+      payload: { content: echoManifest, icon: null },
+    });
+    expect(cleared.json().icon).toBeNull();
+  });
+});
+
+/** The teams a skill's permission policy grants. */
+async function teamGrantIds(skillId: string): Promise<string[]> {
+  const skill = await SkillModel.findById(skillId);
+  if (!skill) throw new Error("skill not found");
+  const policy = await ResourcePermissionPolicyModel.find({
+    organizationId: skill.organizationId,
+    resource: "skill",
+    scope: skillId,
+  });
+  return (policy?.grants ?? [])
+    .filter((grant) => grant.subject.type === "team")
+    .map((grant) => grant.subject.id);
+}

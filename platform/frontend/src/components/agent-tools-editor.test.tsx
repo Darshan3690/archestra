@@ -1,15 +1,16 @@
-import { render, screen } from "@testing-library/react";
+import { ARCHESTRA_MCP_CATALOG_ID } from "@archestra/shared";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { ToolChecklist, type ToolChecklistProps } from "./agent-tools-editor";
 
 // Mock ResizeObserver which is used by UI components
-global.ResizeObserver = vi.fn().mockImplementation(() => ({
-  observe: vi.fn(),
-  unobserve: vi.fn(),
-  disconnect: vi.fn(),
-}));
+global.ResizeObserver = class {
+  observe = vi.fn();
+  unobserve = vi.fn();
+  disconnect = vi.fn();
+};
 
 // Helper to create mock tools
 function createMockTools(count: number) {
@@ -17,10 +18,8 @@ function createMockTools(count: number) {
     id: `tool-${i + 1}`,
     name: `server__tool_${i + 1}`,
     description: `Description for tool ${i + 1}`,
-    parameters: {},
     createdAt: new Date().toISOString(),
-    assignedAgentCount: 0,
-    assignedAgents: [],
+    group: null,
   }));
 }
 
@@ -33,20 +32,22 @@ function createMockTool(
     id,
     name,
     description,
-    parameters: {},
     createdAt: new Date().toISOString(),
-    assignedAgentCount: 0,
-    assignedAgents: [],
+    group: null,
   };
 }
 
 // Wrapper component to handle state
 function ToolChecklistWrapper({
   tools,
+  catalogId,
   initialSelectedIds = new Set(),
+  defaultToolIds,
 }: {
   tools: ToolChecklistProps["tools"];
+  catalogId?: string;
   initialSelectedIds?: Set<string>;
+  defaultToolIds?: Set<string>;
 }) {
   const [selectedToolIds, setSelectedToolIds] =
     useState<Set<string>>(initialSelectedIds);
@@ -54,13 +55,99 @@ function ToolChecklistWrapper({
   return (
     <ToolChecklist
       tools={tools}
+      catalogId={catalogId}
       selectedToolIds={selectedToolIds}
       onSelectionChange={setSelectedToolIds}
+      defaultToolIds={defaultToolIds}
     />
   );
 }
 
 describe("ToolChecklist", () => {
+  it("keeps recovery tools selected through bulk clear while allowing other tools to be removed", async () => {
+    const user = userEvent.setup();
+    const tools = [
+      createMockTool("notice", "branded__get_remedy_plans", "Notice"),
+      createMockTool("control", "branded__execute_remedy_plan", "Control"),
+      createMockTool("report", "branded__yell", "Report"),
+      createMockTool("other", "branded__whoami", "Identity"),
+    ];
+    render(
+      <ToolChecklistWrapper
+        tools={tools}
+        catalogId={ARCHESTRA_MCP_CATALOG_ID}
+        initialSelectedIds={new Set(tools.map((tool) => tool.id))}
+      />,
+    );
+    expect(
+      screen.getByRole("checkbox", { name: /get_remedy_plans/i }),
+    ).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Deselect All" }));
+    expect(
+      screen.getByRole("checkbox", { name: /get_remedy_plans/i }),
+    ).toBeChecked();
+    expect(
+      screen.getByRole("checkbox", { name: /execute_remedy_plan/i }),
+    ).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: /yell/i })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: /whoami/i })).not.toBeChecked();
+    expect(screen.getByRole("button", { name: "Deselect All" })).toBeDisabled();
+  });
+
+  it("keeps recovery tools selected when resetting to defaults", async () => {
+    const user = userEvent.setup();
+    const tools = [
+      createMockTool("notice", "archestra__get_remedy_plans", "Notice"),
+      createMockTool("other", "archestra__whoami", "Identity"),
+    ];
+    render(
+      <ToolChecklistWrapper
+        tools={tools}
+        catalogId={ARCHESTRA_MCP_CATALOG_ID}
+        initialSelectedIds={new Set(["notice"])}
+        defaultToolIds={new Set(["other"])}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Reset to defaults" }));
+    expect(
+      screen.getByRole("checkbox", { name: /get_remedy_plans/i }),
+    ).toBeChecked();
+    expect(
+      screen.getByRole("button", { name: "Reset to defaults" }),
+    ).toBeDisabled();
+  });
+
+  it("explains why OpenAPPA recovery and reporting tools stay available", async () => {
+    const user = userEvent.setup();
+    render(
+      <ToolChecklistWrapper
+        catalogId={ARCHESTRA_MCP_CATALOG_ID}
+        tools={[
+          createMockTool("remedies", "archestra__get_remedy_plans", "Remedies"),
+          createMockTool("report", "archestra__yell", "Report"),
+        ]}
+      />,
+    );
+
+    const remedies = screen.getByRole("checkbox", {
+      name: /get_remedy_plans/i,
+    });
+    await user.hover(
+      within(remedies.closest("label") as HTMLElement).getByText("Required"),
+    );
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "find remedies for blocked calls",
+    );
+
+    const report = screen.getByRole("checkbox", { name: /yell/i });
+    await user.hover(
+      within(report.closest("label") as HTMLElement).getByText("Required"),
+    );
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "report confusing OpenAPPA decisions",
+    );
+  });
+
   describe("search bar visibility", () => {
     it("should not show search bar when there are 5 or fewer tools", () => {
       const tools = createMockTools(5);
@@ -424,6 +511,219 @@ describe("ToolChecklist", () => {
       for (let i = 1; i < checkboxes.length; i++) {
         expect(checkboxes[i]).not.toBeChecked();
       }
+    });
+  });
+
+  describe("grouped built-in tools", () => {
+    function createArchestraTool(
+      id: string,
+      shortName: string,
+      group: string,
+    ): ToolChecklistProps["tools"][number] {
+      return {
+        id,
+        name: `archestra__${shortName}`,
+        description: `Description for ${shortName}`,
+        createdAt: new Date().toISOString(),
+        group,
+      };
+    }
+
+    const groupedTools = () => [
+      createArchestraTool("t-list-skills", "list_skills", "skills"),
+      createArchestraTool("t-create-skill", "create_skill", "skills"),
+      createArchestraTool("t-scaffold-app", "scaffold_app", "apps"),
+      createArchestraTool("t-edit-app", "edit_app", "apps"),
+      createArchestraTool("t-list-apps", "list_apps", "apps"),
+      createArchestraTool("t-get-servers", "get_mcp_servers", "mcp_servers"),
+    ];
+
+    it("renders a section header per domain group", () => {
+      render(<ToolChecklistWrapper tools={groupedTools()} />);
+
+      expect(screen.getByText("Skills")).toBeInTheDocument();
+      expect(screen.getByText("Apps")).toBeInTheDocument();
+      expect(screen.getByText("MCP Servers")).toBeInTheDocument();
+    });
+
+    it("collapses sections by default so tool rows are hidden", () => {
+      render(<ToolChecklistWrapper tools={groupedTools()} />);
+
+      expect(screen.queryByText("list_skills")).not.toBeInTheDocument();
+      expect(screen.queryByText("scaffold_app")).not.toBeInTheDocument();
+    });
+
+    it("expands a section when its header is clicked", async () => {
+      const user = userEvent.setup();
+      render(<ToolChecklistWrapper tools={groupedTools()} />);
+
+      // The header toggle's accessible name is "Skills0/2" (label + count);
+      // anchor to the start so it doesn't also match the per-group
+      // "Select all Skills tools" / "Clear Skills tools" buttons.
+      await user.click(screen.getByRole("button", { name: /^Skills/ }));
+
+      expect(screen.getByText("list_skills")).toBeInTheDocument();
+      expect(screen.getByText("create_skill")).toBeInTheDocument();
+      // Sibling section stays collapsed.
+      expect(screen.queryByText("scaffold_app")).not.toBeInTheDocument();
+    });
+
+    it("selects only that group's tools via its per-group Select all", async () => {
+      const user = userEvent.setup();
+      render(<ToolChecklistWrapper tools={groupedTools()} />);
+
+      // Skills header before selecting: 0 of 2.
+      expect(screen.getByText("0/2")).toBeInTheDocument();
+
+      const skillsSection = screen
+        .getByText("Skills")
+        .closest("div.rounded-md") as HTMLElement;
+      await user.click(
+        within(skillsSection).getByRole("button", {
+          name: "Select all Skills tools",
+        }),
+      );
+
+      // Only the two skill tools are now selected — global count reflects that,
+      // the Skills header count fills, and Apps stays untouched.
+      expect(screen.getByText("2 of 6 selected")).toBeInTheDocument();
+      expect(within(skillsSection).getByText("2/2")).toBeInTheDocument();
+      expect(screen.getByText("0/3")).toBeInTheDocument();
+    });
+
+    it("keeps sections while searching and hides non-matching groups", async () => {
+      const user = userEvent.setup();
+      render(<ToolChecklistWrapper tools={groupedTools()} />);
+
+      await user.type(screen.getByPlaceholderText("Search tools..."), "skill");
+
+      // Skills section stays and auto-expands to show its match.
+      expect(screen.getByText("Skills")).toBeInTheDocument();
+      expect(screen.getByText("list_skills")).toBeInTheDocument();
+      // Non-matching groups drop out entirely.
+      expect(screen.queryByText("Apps")).not.toBeInTheDocument();
+      expect(screen.queryByText("MCP Servers")).not.toBeInTheDocument();
+    });
+
+    it("falls back to a flat list when no tool carries a group", () => {
+      render(<ToolChecklistWrapper tools={createMockTools(4)} />);
+
+      // Flat list shows rows immediately with no group headers.
+      expect(screen.getByText("tool_1")).toBeInTheDocument();
+      expect(screen.queryByText("Skills")).not.toBeInTheDocument();
+    });
+
+    it("routes an unrecognized group into the Other section (never dropped)", async () => {
+      const user = userEvent.setup();
+      const tools = [
+        createArchestraTool("t-list-skills", "list_skills", "skills"),
+        // A group id this build doesn't know (e.g. server version skew).
+        createArchestraTool("t-future", "future_tool", "brand_new_group"),
+      ];
+      render(<ToolChecklistWrapper tools={tools} />);
+
+      // The unknown-group tool is bucketed under "Other", not silently lost,
+      // and its header count reflects it (body and count keyed identically).
+      const otherSection = screen
+        .getByText("Other")
+        .closest("div.rounded-md") as HTMLElement;
+      expect(within(otherSection).getByText("0/1")).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: /^Other/ }));
+      expect(screen.getByText("future_tool")).toBeInTheDocument();
+    });
+  });
+
+  describe("reset to defaults", () => {
+    const tools = [
+      createMockTool("default-1", "server__default_one", "Default one"),
+      createMockTool("default-2", "server__default_two", "Default two"),
+      createMockTool("extra-1", "server__extra_one", "Extra one"),
+      ...createMockTools(3), // Push past 5 tools so the search bar renders
+    ];
+    const defaultToolIds = new Set(["default-1", "default-2"]);
+
+    it("replaces the selection with exactly the default set", async () => {
+      const user = userEvent.setup();
+      // Starts with one default missing and one non-default extra selected.
+      render(
+        <ToolChecklistWrapper
+          tools={tools}
+          initialSelectedIds={new Set(["default-1", "extra-1"])}
+          defaultToolIds={defaultToolIds}
+        />,
+      );
+
+      await user.click(
+        screen.getByRole("button", { name: "Reset to defaults" }),
+      );
+
+      expect(
+        screen.getByRole("checkbox", { name: /default_one/i }),
+      ).toBeChecked();
+      expect(
+        screen.getByRole("checkbox", { name: /default_two/i }),
+      ).toBeChecked();
+      expect(
+        screen.getByRole("checkbox", { name: /extra_one/i }),
+      ).not.toBeChecked();
+    });
+
+    it("resets the whole selection even while a search filter is active", async () => {
+      const user = userEvent.setup();
+      render(
+        <ToolChecklistWrapper
+          tools={tools}
+          initialSelectedIds={new Set(["extra-1"])}
+          defaultToolIds={defaultToolIds}
+        />,
+      );
+
+      // Filter to a list that contains neither the extra nor default_two;
+      // reset must still fix both — a partial reset is not a reset.
+      await user.type(
+        screen.getByPlaceholderText("Search tools..."),
+        "default_one",
+      );
+      await user.click(
+        screen.getByRole("button", { name: "Reset to defaults" }),
+      );
+      await user.clear(screen.getByPlaceholderText("Search tools..."));
+
+      expect(
+        screen.getByRole("checkbox", { name: /default_two/i }),
+      ).toBeChecked();
+      expect(
+        screen.getByRole("checkbox", { name: /extra_one/i }),
+      ).not.toBeChecked();
+    });
+
+    it("is disabled when the selection already matches the defaults", () => {
+      render(
+        <ToolChecklistWrapper
+          tools={tools}
+          initialSelectedIds={new Set(defaultToolIds)}
+          defaultToolIds={defaultToolIds}
+        />,
+      );
+
+      expect(
+        screen.getByRole("button", { name: "Reset to defaults" }),
+      ).toBeDisabled();
+    });
+
+    it("is absent without a default set, and for an empty one", () => {
+      const { rerender } = render(<ToolChecklistWrapper tools={tools} />);
+      expect(
+        screen.queryByRole("button", { name: "Reset to defaults" }),
+      ).not.toBeInTheDocument();
+
+      // An empty set must hide the action too — never offer a reset to zero.
+      rerender(
+        <ToolChecklistWrapper tools={tools} defaultToolIds={new Set()} />,
+      );
+      expect(
+        screen.queryByRole("button", { name: "Reset to defaults" }),
+      ).not.toBeInTheDocument();
     });
   });
 });

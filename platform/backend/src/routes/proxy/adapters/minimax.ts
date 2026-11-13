@@ -1,9 +1,7 @@
-import { ArchestraInternalErrorCode } from "@shared";
-import { encode as toonEncode } from "@toon-format/toon";
+import { ArchestraInternalErrorCode } from "@archestra/shared";
 import { get } from "lodash-es";
 import config from "@/config";
 import logger from "@/logging";
-import { ModelModel } from "@/models";
 import { metrics } from "@/observability";
 import { getTokenizer } from "@/tokenizers";
 import type {
@@ -20,10 +18,13 @@ import type {
   StreamAccumulatorState,
   UsageView,
 } from "@/types";
-import { extractCommonMessageText } from "@/types";
+import {
+  extractCommonMessageText,
+  extractCommonToolCallArguments,
+} from "@/types";
 import type { Minimax } from "@/types/llm-providers";
-import type { ToolCompressionStats } from "../utils/toon-conversion";
-import { unwrapToolContent } from "../utils/unwrap-tool-content";
+import { fetchWithAbortSignal } from "@/utils/client-disconnect-signal";
+import { upstreamHttpError } from "./upstream-http-error";
 
 // =============================================================================
 // TYPE ALIASES
@@ -74,7 +75,7 @@ class MinimaxClient {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
+      const errorText = await response.text().catch(() => "");
       let errorMessage = `MiniMax API error: ${response.status} ${response.statusText}`;
 
       try {
@@ -88,7 +89,7 @@ class MinimaxClient {
         errorMessage += ` - ${errorText}`;
       }
 
-      throw new Error(errorMessage);
+      throw upstreamHttpError(errorMessage, response.status);
     }
 
     return response.json() as Promise<MinimaxResponse>;
@@ -111,9 +112,10 @@ class MinimaxClient {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(
+      const errorText = await response.text().catch(() => "");
+      throw upstreamHttpError(
         `MiniMax streaming error: ${response.status} - ${errorText}`,
+        response.status,
       );
     }
 
@@ -158,10 +160,12 @@ class MinimaxClient {
               const chunk = JSON.parse(data) as MinimaxStreamChunk;
               yield chunk;
             } catch (error) {
+              // data is raw completion content — log only its size at warn.
               logger.warn(
-                { data, error },
+                { dataLength: data.length, error },
                 "[MinimaxAdapter] Failed to parse SSE chunk",
               );
+              logger.debug({ data }, "[MinimaxAdapter] Unparseable SSE chunk");
             }
           }
         }
@@ -177,8 +181,12 @@ class MinimaxClient {
             yield chunk;
           } catch (error) {
             logger.warn(
-              { data: trimmed, error },
+              { dataLength: trimmed.length, error },
               "[MinimaxAdapter] Failed to parse final SSE chunk",
+            );
+            logger.debug(
+              { data: trimmed },
+              "[MinimaxAdapter] Unparseable final SSE chunk",
             );
           }
         }
@@ -213,12 +221,6 @@ class MinimaxRequestAdapter
 
   constructor(request: MinimaxRequest) {
     this.request = request;
-    // Enable reasoning_split by default for interleaved thinking support
-    if (!this.request.extra_body) {
-      this.request.extra_body = { reasoning_split: true };
-    } else if (this.request.extra_body.reasoning_split === undefined) {
-      this.request.extra_body.reasoning_split = true;
-    }
   }
 
   /**
@@ -249,7 +251,7 @@ class MinimaxRequestAdapter
 
     for (const message of this.request.messages) {
       if (message.role === "tool") {
-        const toolName = this.findToolNameInMessages(
+        const toolCall = this.findToolCallInMessages(
           this.request.messages,
           message.tool_call_id,
         );
@@ -267,7 +269,8 @@ class MinimaxRequestAdapter
 
         results.push({
           id: message.tool_call_id,
-          name: toolName ?? "unknown",
+          name: toolCall?.name ?? "unknown",
+          arguments: toolCall?.arguments,
           content,
           isError: false,
         });
@@ -321,16 +324,6 @@ class MinimaxRequestAdapter
     Object.assign(this.toolResultUpdates, updates);
   }
 
-  async applyToonCompression(model: string): Promise<ToolCompressionStats> {
-    const { messages: compressedMessages, stats } =
-      await convertToolResultsToToon(this.request.messages, model);
-    this.request = {
-      ...this.request,
-      messages: compressedMessages,
-    };
-    return stats;
-  }
-
   /**
    * Convert tool result content to MiniMax format
    * MiniMax doesn't support images in OpenAI API mode, so strip them
@@ -339,7 +332,10 @@ class MinimaxRequestAdapter
     // Apply any pending tool result updates
     if (Object.keys(this.toolResultUpdates).length > 0) {
       messages = messages.map((msg) => {
-        if (msg.role === "tool" && this.toolResultUpdates[msg.tool_call_id]) {
+        if (
+          msg.role === "tool" &&
+          Object.hasOwn(this.toolResultUpdates, msg.tool_call_id)
+        ) {
           return {
             ...msg,
             content: this.toolResultUpdates[msg.tool_call_id],
@@ -357,15 +353,22 @@ class MinimaxRequestAdapter
       this.request.messages,
     );
 
-    return {
-      ...this.request,
-      model: this.getModel(),
-      messages: processedMessages,
-    };
-  }
+    // `extra_body` only exists in MiniMax's Python examples, where the OpenAI
+    // SDK merges its keys into the top level of the request body. Forwarding it
+    // verbatim over HTTP means MiniMax sees one unknown key and ignores the flag
+    // inside it, so unwrap it here. reasoning_split defaults on: without it the
+    // M-series inlines thinking in `content` as `<think>` tags instead of
+    // returning it in `reasoning_details`.
+    const { extra_body, ...request } = this.request;
 
-  estimateRequestCost(model: string): Promise<number> {
-    return estimateRequestCost(model, this.request.messages);
+    return {
+      ...request,
+      ...extra_body,
+      reasoning_split:
+        this.request.reasoning_split ?? extra_body?.reasoning_split ?? true,
+      model: this.getModel(),
+      messages: convertReasoningContentToDetails(processedMessages),
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -386,12 +389,12 @@ class MinimaxRequestAdapter
       };
 
       if (message.role === "tool") {
-        const toolName = this.findToolNameInMessages(
+        const toolCall = this.findToolCallInMessages(
           messages,
           message.tool_call_id,
         );
 
-        if (toolName) {
+        if (toolCall) {
           let toolResult: unknown;
           if (typeof message.content === "string") {
             try {
@@ -406,7 +409,8 @@ class MinimaxRequestAdapter
           commonMessage.toolCalls = [
             {
               id: message.tool_call_id,
-              name: toolName,
+              name: toolCall.name,
+              arguments: toolCall.arguments,
               content: toolResult,
               isError: false,
             },
@@ -421,12 +425,13 @@ class MinimaxRequestAdapter
   }
 
   /**
-   * Find tool name from tool_call_id by looking at previous assistant messages
+   * Find the paired tool call from tool_call_id by looking at previous
+   * assistant messages
    */
-  private findToolNameInMessages(
+  private findToolCallInMessages(
     messages: MinimaxMessages,
     toolCallId: string,
-  ): string | null {
+  ): { name: string; arguments?: Record<string, unknown> } | null {
     // Search backwards through messages
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i];
@@ -435,7 +440,12 @@ class MinimaxRequestAdapter
           (tc) => "id" in tc && tc.id === toolCallId,
         );
         if (toolCall && toolCall.type === "function") {
-          return toolCall.function.name;
+          return {
+            name: toolCall.function.name,
+            arguments: extractCommonToolCallArguments(
+              toolCall.function.arguments,
+            ),
+          };
         }
       }
     }
@@ -460,7 +470,7 @@ class MinimaxResponseAdapter implements LLMResponseAdapter<MinimaxResponse> {
   private response: MinimaxResponse;
 
   constructor(response: MinimaxResponse) {
-    this.response = response;
+    this.response = mirrorReasoningDetailsIntoContent(response);
   }
 
   getId(): string {
@@ -530,6 +540,41 @@ class MinimaxResponseAdapter implements LLMResponseAdapter<MinimaxResponse> {
    * Convert response to refusal format for blocked tool calls
    * MiniMax doesn't have a refusal field, so we use content only
    */
+  withRewrittenToolCalls(
+    toolCalls: Array<{
+      id: string;
+      name: string;
+      arguments: string;
+      wireId?: string;
+    }>,
+  ): MinimaxResponse {
+    // Positional: one rewritten entry per call this response carries, in
+    // order. The id the client correlates by is the provider's unless the
+    // call carries the one it is given instead.
+    const choice = this.response.choices[0];
+    if (!choice?.message.tool_calls) return this.response;
+    const tool_calls = choice.message.tool_calls.map((toolCall, index) => {
+      const rewritten = toolCalls[index];
+      if (!rewritten || toolCall.type !== "function") return toolCall;
+      return {
+        ...toolCall,
+        id: rewritten.wireId ?? toolCall.id,
+        function: {
+          ...toolCall.function,
+          name: rewritten.name,
+          arguments: rewritten.arguments,
+        },
+      };
+    });
+    return {
+      ...this.response,
+      choices: [
+        { ...choice, message: { ...choice.message, tool_calls } },
+        ...this.response.choices.slice(1),
+      ],
+    };
+  }
+
   toRefusalResponse(
     _refusalMessage: string,
     contentMessage: string,
@@ -542,6 +587,22 @@ class MinimaxResponseAdapter implements LLMResponseAdapter<MinimaxResponse> {
           message: {
             role: "assistant",
             content: contentMessage,
+          },
+          finish_reason: "stop",
+        },
+      ],
+    };
+  }
+
+  withReplacedText(text: string): MinimaxResponse {
+    return {
+      ...this.response,
+      choices: [
+        {
+          ...this.response.choices[0],
+          message: {
+            role: "assistant",
+            content: text,
           },
           finish_reason: "stop",
         },
@@ -571,6 +632,23 @@ class MinimaxStreamAdapter
   readonly state: StreamAccumulatorState;
   private currentToolCallIndices = new Map<number, number>();
   private lastReasoningText = ""; // Track full reasoning text seen so far
+  private warnedNonCumulativeReasoning = false;
+  // Set to the refusal text when the streamed response was replaced by a policy
+  // refusal, so toProviderResponse persists the refusal (finish_reason "stop",
+  // no tool calls) instead of the blocked tool calls.
+  // A refusal does not erase what the model already said: its text streamed as
+  // it arrived and the refusal was appended after it as further deltas, which
+  // clients concatenate onto what they have accumulated. Recording the refusal
+  // alone deletes the model's own answer from the turn, leaving anything that
+  // reads it back a turn in which the model never spoke.
+  private contentWithAnyRefusal(): string | null {
+    if (this.replacedText === null) {
+      return this.state.text || null;
+    }
+    return `${this.state.text}${this.replacedText}`;
+  }
+
+  private replacedText: string | null = null;
   private request: MinimaxRequest | undefined; // Store request for token estimation (optional)
 
   constructor(request?: MinimaxRequest) {
@@ -596,7 +674,8 @@ class MinimaxStreamAdapter
       return { sseData: null, isToolCallChunk: false, isFinal: false };
     }
 
-    let sseData: string | null = null;
+    // What streams to the client now: the text and reasoning of this chunk.
+    let forwarded: MinimaxStreamChunk | null = null;
     let isToolCallChunk = false;
     let isFinal = false;
 
@@ -607,22 +686,56 @@ class MinimaxStreamAdapter
     // Handle content delta
     if (delta.content) {
       this.state.text += delta.content;
-      sseData = `data: ${JSON.stringify(chunk)}\n\n`;
+      forwarded = chunk;
     }
 
     // Handle reasoning_details delta (thinking content)
-    // MiniMax sends full accumulated text in each chunk, so we need to extract the delta
+    // MiniMax sends full accumulated text in each chunk, so we need to extract
+    // the delta. OpenAI-compatible clients only parse the DeepSeek-style
+    // `reasoning_content` field and expect incremental deltas, so the new text
+    // is mirrored there on the forwarded chunk; `reasoning_details` is
+    // forwarded untouched for clients that consume MiniMax's native shape.
     if (delta.reasoning_details && delta.reasoning_details.length > 0) {
-      // Get the full reasoning text from the first detail
-      const fullReasoningText = delta.reasoning_details[0]?.text || "";
+      const fullReasoningText = delta.reasoning_details
+        .map((detail) => detail.text || "")
+        .join("");
 
-      // Extract only the new text (delta)
-      if (fullReasoningText.length > this.lastReasoningText.length) {
-        // Note: reasoning is stored but not in StreamAccumulatorState - tracked separately
+      let reasoningDelta = "";
+      if (fullReasoningText.startsWith(this.lastReasoningText)) {
+        reasoningDelta = fullReasoningText.slice(this.lastReasoningText.length);
         this.lastReasoningText = fullReasoningText;
+      } else if (fullReasoningText) {
+        // Text that doesn't extend what we've seen: treat it as an incremental
+        // chunk rather than dropping it. If the stream is actually cumulative
+        // this duplicates text, so leave a trace for diagnosis.
+        reasoningDelta = fullReasoningText;
+        this.lastReasoningText += fullReasoningText;
+        if (!this.warnedNonCumulativeReasoning) {
+          this.warnedNonCumulativeReasoning = true;
+          logger.warn(
+            { model: this.state.model },
+            "MiniMax reasoning_details chunk did not extend the accumulated text; treating the stream as incremental",
+          );
+        }
       }
 
-      sseData = `data: ${JSON.stringify(chunk)}\n\n`;
+      const [firstChoice, ...restChoices] = chunk.choices;
+      const forwardedChunk: MinimaxStreamChunk = reasoningDelta
+        ? {
+            ...chunk,
+            choices: [
+              {
+                ...firstChoice,
+                delta: {
+                  ...firstChoice.delta,
+                  reasoning_content: reasoningDelta,
+                },
+              },
+              ...restChoices,
+            ],
+          }
+        : chunk;
+      forwarded = forwardedChunk;
     }
 
     // Handle tool_calls delta
@@ -656,9 +769,17 @@ class MinimaxStreamAdapter
         }
       }
 
-      this.state.rawToolCallEvents.push(chunk);
+      // A chunk carrying text and a call together is split: the text streams
+      // now, the call is held for the policies. Forwarding the call's fragment
+      // with the text would hand the client part of a call before the policies
+      // ruled on it, and a second copy of it when the proxy re-emits the batch.
+      this.state.rawToolCallEvents.push(
+        forwarded ? onlyToolCallDeltas(chunk) : chunk,
+      );
+      if (forwarded) forwarded = withoutToolCallDeltas(forwarded);
       isToolCallChunk = true;
     }
+    const sseData = forwarded ? `data: ${JSON.stringify(forwarded)}\n\n` : null;
 
     // Handle usage (typically in final chunk)
     if (chunk.usage) {
@@ -713,7 +834,36 @@ class MinimaxStreamAdapter
     });
   }
 
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]): string[] {
+    // OpenAI-chat-shaped wire: one chunk carrying every call complete.
+    const chunk: MinimaxStreamChunk = {
+      id: this.state.responseId || `chatcmpl-${Date.now()}`,
+      model: this.state.model || "minimax",
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: toolCalls.map((toolCall, index) => ({
+              index,
+              id: toolCall.wireId ?? toolCall.id,
+              type: "function" as const,
+              function: {
+                name: toolCall.name,
+                arguments: toolCall.arguments,
+              },
+            })),
+          },
+          finish_reason: null,
+        },
+      ],
+    };
+    return [`data: ${JSON.stringify(chunk)}\n\n`];
+  }
+
   formatCompleteTextSSE(text: string): string[] {
+    this.replacedText = text;
     const events: string[] = [];
 
     // Initial chunk with role
@@ -753,15 +903,18 @@ class MinimaxStreamAdapter
   // ---------------------------------------------------------------------------
 
   toProviderResponse(): MinimaxResponse {
-    // Parse tool call arguments
-    const toolCalls = this.state.toolCalls.map((tc) => ({
-      id: tc.id,
-      type: "function" as const,
-      function: {
-        name: tc.name,
-        arguments: tc.arguments,
-      },
-    }));
+    // Parse tool call arguments (dropped when a refusal replaced the response)
+    const toolCalls =
+      this.replacedText !== null
+        ? []
+        : this.state.toolCalls.map((tc) => ({
+            id: tc.id,
+            type: "function" as const,
+            function: {
+              name: tc.name,
+              arguments: tc.arguments,
+            },
+          }));
 
     // Ensure stopReason is a valid finish_reason
     const validFinishReason:
@@ -769,9 +922,10 @@ class MinimaxStreamAdapter
       | "length"
       | "tool_calls"
       | "content_filter" =
-      this.state.stopReason === "tool_calls" ||
-      this.state.stopReason === "length" ||
-      this.state.stopReason === "content_filter"
+      this.replacedText === null &&
+      (this.state.stopReason === "tool_calls" ||
+        this.state.stopReason === "length" ||
+        this.state.stopReason === "content_filter")
         ? this.state.stopReason
         : "stop";
 
@@ -785,10 +939,17 @@ class MinimaxStreamAdapter
           index: 0,
           message: {
             role: "assistant",
-            content: this.state.text || null,
-            // Convert accumulated reasoning back to reasoning_details format if present
+            content: this.contentWithAnyRefusal(),
+            // Convert accumulated reasoning back to reasoning_details format if
+            // present, mirrored into reasoning_content for OpenAI-compatible
+            // clients. Kept when a refusal replaced the turn too: the model
+            // produced it, and dropping it is the same erasure as dropping the
+            // answer text.
             ...(this.lastReasoningText
-              ? { reasoning_details: [{ text: this.lastReasoningText }] }
+              ? {
+                  reasoning_details: [{ text: this.lastReasoningText }],
+                  reasoning_content: this.lastReasoningText,
+                }
               : {}),
             ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
           },
@@ -869,6 +1030,8 @@ class MinimaxStreamAdapter
     this.state.usage = {
       inputTokens,
       outputTokens,
+      inputTokensEstimated: true,
+      outputTokensEstimated: true,
     };
 
     return {
@@ -883,133 +1046,77 @@ class MinimaxStreamAdapter
 // HELPER FUNCTIONS
 // =============================================================================
 
-/**
- * Convert tool results to TOON format for compression
- * Same logic as OpenAI/Zhipuai
- */
-async function convertToolResultsToToon(
-  messages: MinimaxMessages,
-  model: string,
-): Promise<{ messages: MinimaxMessages; stats: ToolCompressionStats }> {
-  const tokenizer = getTokenizer("minimax");
-  let toolResultCount = 0;
-  let totalTokensBefore = 0;
-  let totalTokensAfter = 0;
-
-  const result = messages.map((message) => {
-    if (message.role === "tool") {
-      logger.info(
-        {
-          toolCallId: message.tool_call_id,
-          contentType: typeof message.content,
-          provider: "minimax",
-        },
-        "convertToolResultsToToon: tool message found",
-      );
-
-      if (typeof message.content === "string") {
-        try {
-          const unwrapped = unwrapToolContent(message.content);
-          const parsed = JSON.parse(unwrapped);
-          const noncompressed = unwrapped;
-          const compressed = toonEncode(parsed);
-
-          const tokensBefore = tokenizer.countTokens([
-            { role: "user", content: noncompressed },
-          ]);
-          const tokensAfter = tokenizer.countTokens([
-            { role: "user", content: compressed },
-          ]);
-
-          totalTokensBefore += tokensBefore;
-          totalTokensAfter += tokensAfter;
-          toolResultCount++;
-
-          logger.info(
-            {
-              toolCallId: message.tool_call_id,
-              tokensBefore,
-              tokensAfter,
-              tokensSaved: tokensBefore - tokensAfter,
-              provider: "minimax",
-            },
-            "convertToolResultsToToon: tool result compressed",
-          );
-
-          return {
-            ...message,
-            content: compressed,
-          };
-        } catch (err) {
-          logger.warn(
-            { err, toolCallId: message.tool_call_id },
-            "Failed to compress tool result",
-          );
-          return message;
-        }
-      }
-    }
-    return message;
-  });
-
-  logger.info(
-    { messageCount: messages.length, toolResultCount },
-    "convertToolResultsToToon completed",
-  );
-
-  let toonCostSavings = 0;
-  if (toolResultCount > 0) {
-    const tokensSaved = totalTokensBefore - totalTokensAfter;
-    if (tokensSaved > 0) {
-      toonCostSavings = await ModelModel.calculateCostSavings(
-        model,
-        tokensSaved,
-        "minimax",
-      );
-    }
-  }
-
+/** The text half of a chunk that carries text and tool calls together. */
+function withoutToolCallDeltas(chunk: MinimaxStreamChunk): MinimaxStreamChunk {
+  const [choice, ...rest] = chunk.choices;
+  const { tool_calls: _toolCalls, ...delta } = choice.delta;
+  // The turn is not over while its calls are held: formatEndSSE finishes it.
   return {
-    messages: result,
-    stats: {
-      tokensBefore: toolResultCount > 0 ? totalTokensBefore : 0,
-      tokensAfter: toolResultCount > 0 ? totalTokensAfter : 0,
-      costSavings: toonCostSavings,
-      wasEffective: totalTokensAfter < totalTokensBefore,
-      hadToolResults: toolResultCount > 0,
-    },
+    ...chunk,
+    choices: [{ ...choice, delta, finish_reason: null }, ...rest],
+  };
+}
+
+/** The tool-call half of such a chunk, which waits for the policies. */
+function onlyToolCallDeltas(chunk: MinimaxStreamChunk): MinimaxStreamChunk {
+  const [choice] = chunk.choices;
+  const { role, tool_calls } = choice.delta;
+  return {
+    ...chunk,
+    choices: [{ ...choice, delta: { ...(role ? { role } : {}), tool_calls } }],
   };
 }
 
 /**
- * Estimate the cost of a request based on message token counts
+ * Mirror the thinking text from MiniMax's native reasoning_details into the
+ * DeepSeek-style reasoning_content field, the only one OpenAI-compatible
+ * clients parse.
  */
-async function estimateRequestCost(
-  model: string,
+function mirrorReasoningDetailsIntoContent(
+  response: MinimaxResponse,
+): MinimaxResponse {
+  const [choice, ...restChoices] = response.choices;
+  const details = choice?.message.reasoning_details;
+  if (!details?.length || choice.message.reasoning_content != null) {
+    return response;
+  }
+  return {
+    ...response,
+    choices: [
+      {
+        ...choice,
+        message: {
+          ...choice.message,
+          reasoning_content: details.map((detail) => detail.text).join(""),
+        },
+      },
+      ...restChoices,
+    ],
+  };
+}
+
+/**
+ * Translate assistant reasoning_content (the DeepSeek-style field clients send
+ * back) into MiniMax's native reasoning_details so interleaved thinking is
+ * preserved across tool-call turns. Messages that already carry
+ * reasoning_details are forwarded as-is; reasoning_content is always stripped
+ * because MiniMax only documents reasoning_details on requests.
+ */
+function convertReasoningContentToDetails(
   messages: MinimaxMessages,
-): Promise<number> {
-  const tokenizer = getTokenizer("minimax");
-
-  // Convert messages to proper format for tokenizer
-  const tokenizableMessages = messages.map((m) => {
-    if (m.role === "system") {
-      return { role: "system" as const, content: m.content || "" };
+): MinimaxMessages {
+  return messages.map((message) => {
+    if (message.role !== "assistant") {
+      return message;
     }
-    if (m.role === "user") {
-      return { role: "user" as const, content: m.content || "" };
+    const { reasoning_content, ...rest } = message;
+    const existingDetails =
+      "reasoning_details" in rest ? rest.reasoning_details : undefined;
+    if (existingDetails?.length || !reasoning_content) {
+      return rest;
     }
-    if (m.role === "tool") {
-      const content =
-        typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-      return { role: "user" as const, content };
-    }
-    // assistant
-    return { role: "assistant" as const, content: m.content || "" };
+    return { ...rest, reasoning_details: [{ text: reasoning_content }] };
   });
-
-  const totalTokens = tokenizer.countTokens(tokenizableMessages);
-
-  return ModelModel.calculateCostSavings(model, totalTokens, "minimax");
 }
 
 // =============================================================================
@@ -1067,16 +1174,15 @@ export const minimaxAdapterFactory: LLMProvider<
     options: CreateClientOptions,
   ): MinimaxClient {
     const customFetch = options.agent
-      ? metrics.llm.getObservableFetch(
-          "minimax",
-          options.agent,
-          options.source,
-          options.externalAgentId,
-        )
+      ? metrics.llm.getObservableFetch("minimax", options.agent, options.source)
       : undefined;
 
     const baseUrl = options.baseUrl || config.llm.minimax.baseUrl;
-    return new MinimaxClient(apiKey, baseUrl, customFetch);
+    return new MinimaxClient(
+      apiKey,
+      baseUrl,
+      fetchWithAbortSignal(customFetch, options.abortSignal),
+    );
   },
 
   async execute(
@@ -1133,10 +1239,3 @@ export const minimaxAdapterFactory: LLMProvider<
     return "Internal server error";
   },
 };
-
-export function getUsageTokens(usage: Minimax.Types.Usage) {
-  return {
-    input: usage.prompt_tokens,
-    output: usage.completion_tokens,
-  };
-}

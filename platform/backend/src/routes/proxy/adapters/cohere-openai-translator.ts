@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { Cohere, OpenAi } from "@/types";
-import { stringifyTextContent } from "./openai-translator-utils";
+import { assertModelRouterCacheControls } from "../model-router-cache-controls";
+import { assertUnstructuredResponseFormat } from "../translated-response-format";
+import {
+  normalizeOpenAiContentParts,
+  stringifyTextContent,
+} from "./openai-translator-utils";
 
 type OpenAiRequest = OpenAi.Types.ChatCompletionsRequest;
 type OpenAiResponse = OpenAi.Types.ChatCompletionsResponse;
@@ -31,6 +36,8 @@ export function openaiToCohere(req: OpenAiRequest): {
   cohereBody: CohereRequest;
   openaiContext: CohereOpenaiContext;
 } {
+  assertUnstructuredResponseFormat(req, "the Cohere translation");
+  assertModelRouterCacheControls("cohere", req);
   const loose = req as OpenAiRequest & {
     frequency_penalty?: number | null;
     presence_penalty?: number | null;
@@ -50,7 +57,7 @@ export function openaiToCohere(req: OpenAiRequest): {
     if (message.role === "user") {
       messages.push({
         role: "user",
-        content: stringifyTextContent(message.content),
+        content: userContentToCohereContent(message.content),
       });
       continue;
     }
@@ -81,8 +88,11 @@ export function openaiToCohere(req: OpenAiRequest): {
     cohereBody.temperature = req.temperature;
   }
 
-  if (req.max_tokens !== undefined && req.max_tokens !== null) {
-    cohereBody.max_tokens = req.max_tokens;
+  // Newer clients send max_completion_tokens and omit max_tokens. Same
+  // precedence as the Gemini translator: the completion cap wins.
+  const maxTokens = req.max_completion_tokens ?? req.max_tokens;
+  if (maxTokens !== undefined && maxTokens !== null) {
+    cohereBody.max_tokens = maxTokens;
   }
 
   if (loose.top_p !== undefined && loose.top_p !== null) {
@@ -143,7 +153,13 @@ export function cohereResponseToOpenai(
 ): OpenAiResponse {
   const text =
     response.message.content
-      ?.filter((block) => block.type === "text")
+      // Explicit guard: the block union has an open fallback variant for
+      // upstream block types we don't model (thinking, citations, ...), so a
+      // bare `block.type === "text"` no longer narrows.
+      ?.filter(
+        (block): block is { type: "text"; text: string } =>
+          block.type === "text" && typeof block.text === "string",
+      )
       .map((block) => block.text)
       .join("") ?? "";
   const promptTokens =
@@ -185,8 +201,34 @@ export function cohereResponseToOpenai(
 export function mapCohereFinishReason(
   reason: CohereResponse["finish_reason"] | string | null | undefined,
 ): "stop" | "length" | "tool_calls" | "content_filter" {
-  if (reason === "MAX_TOKENS") return "length";
+  // TIMEOUT cuts the answer off like MAX_TOKENS does. ERROR_TOXIC comes from
+  // Cohere's older API, outside the v2 enum.
+  if (reason === "MAX_TOKENS" || reason === "TIMEOUT") return "length";
   if (reason === "TOOL_CALL") return "tool_calls";
-  if (reason === "ERROR") return "content_filter";
+  if (reason === "ERROR" || reason === "ERROR_TOXIC") return "content_filter";
   return "stop";
+}
+
+type CohereUserContent = Cohere.Types.UserMessage["content"];
+
+// Converts an OpenAI user-message `content` into Cohere content, forwarding
+// images as `image_url` blocks instead of dropping them. Cohere accepts both
+// base64 data URIs and web URLs, so the url passes through unchanged. Audio and
+// file parts are dropped since Cohere models no such user content block.
+function userContentToCohereContent(content: unknown): CohereUserContent {
+  if (typeof content === "string") return content;
+
+  const blocks: Array<Record<string, unknown>> = [];
+  for (const part of normalizeOpenAiContentParts(content)) {
+    if (part.kind === "text") {
+      blocks.push({ type: "text", text: part.text });
+    } else if (part.kind === "image") {
+      blocks.push({ type: "image_url", image_url: { url: part.url } });
+    }
+  }
+
+  // Cohere requires non-empty content; fall back to text-only when nothing
+  // convertible remained.
+  if (blocks.length === 0) return stringifyTextContent(content);
+  return blocks as unknown as CohereUserContent;
 }

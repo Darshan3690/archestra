@@ -1,0 +1,305 @@
+import {
+  AppWindow,
+  type LucideIcon,
+  Maximize2,
+  Minimize2,
+  RefreshCw,
+  Settings,
+  SquareArrowOutUpRight,
+} from "lucide-react";
+import Link from "next/link";
+import type React from "react";
+import { Button } from "@/components/ui/button";
+import { PermissionButton } from "@/components/ui/permission-button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { appRunUrl } from "@/lib/apps/app-run-url";
+import { cn } from "@/lib/utils/tailwind";
+
+/** Ghost icon + text button shared by the app top bar's labeled actions. */
+export const LABELED_BUTTON_CLASS =
+  "text-muted-foreground hover:text-foreground";
+
+/**
+ * Pure-layout top bar for an {@link McpAppCard}: a fixed-height row with a
+ * left-aligned `left` zone that grows and a right-aligned `right` zone that hugs
+ * the far edge. The fixed height keeps the bar from shrinking when a surface
+ * renders fewer controls.
+ */
+export function McpAppTopBar({
+  left,
+  right,
+}: {
+  left?: React.ReactNode;
+  right?: React.ReactNode;
+}) {
+  return (
+    <div className="relative z-10 flex h-9 shrink-0 items-center gap-2 px-2 shadow-[0_1px_2px_-1px_rgb(0_0_0/0.08)]">
+      <div className="flex min-w-0 flex-1 items-center justify-start gap-0.5">
+        {left}
+      </div>
+      <div className="flex shrink-0 items-center justify-end gap-0.5">
+        {right}
+      </div>
+    </div>
+  );
+}
+
+// Two sizes: "sm" (`icon-xs`) for the frameless-inline hover overlay's compact
+// icons, "bar" (`icon-sm`) for the side-panel header where buttons line up with
+// the panel's collapse button.
+type McpAppButtonSize = "sm" | "bar";
+const iconClasses = (size: McpAppButtonSize) =>
+  size === "bar" ? "h-4 w-4" : "h-3.5 w-3.5";
+
+function McpAppIconButton({
+  icon: Icon,
+  label,
+  title = label,
+  onClick,
+  size = "sm",
+  active = false,
+  ariaBusy = false,
+  iconClassName,
+}: {
+  icon: LucideIcon;
+  label: string;
+  title?: string;
+  onClick: () => void;
+  size?: McpAppButtonSize;
+  active?: boolean;
+  ariaBusy?: boolean;
+  iconClassName?: string;
+}) {
+  return (
+    <Button
+      type="button"
+      onClick={onClick}
+      aria-label={label}
+      aria-busy={ariaBusy || undefined}
+      data-state={active ? "active" : undefined}
+      title={title}
+      variant="ghost"
+      size={size === "bar" ? "icon-sm" : "icon-xs"}
+      className={cn(
+        "text-muted-foreground transition-all duration-150 active:scale-90",
+        active &&
+          "bg-accent text-foreground ring-1 ring-border/80 hover:bg-accent",
+      )}
+    >
+      <Icon className={cn(iconClasses(size), iconClassName)} />
+    </Button>
+  );
+}
+
+export function McpAppRefreshButton({
+  onClick,
+  size = "sm",
+  isReloading = false,
+}: {
+  onClick: () => void;
+  size?: McpAppButtonSize;
+  isReloading?: boolean;
+}) {
+  return (
+    <McpAppIconButton
+      icon={RefreshCw}
+      label="Reload app"
+      title={isReloading ? "Reloading app…" : "Reload app"}
+      onClick={onClick}
+      size={size}
+      active={isReloading}
+      ariaBusy={isReloading}
+      iconClassName={
+        isReloading
+          ? "animate-spin text-foreground [animation-duration:650ms]"
+          : undefined
+      }
+    />
+  );
+}
+
+export function McpAppSettingsButton({
+  onClick,
+  disabledReason,
+}: {
+  onClick: () => void;
+  disabledReason?: string;
+}) {
+  return (
+    <PermissionButton
+      permissions={{}}
+      type="button"
+      onClick={onClick}
+      disabled={!!disabledReason}
+      tooltip={disabledReason}
+      variant="ghost"
+      size="xs"
+      className={LABELED_BUTTON_CLASS}
+    >
+      <Settings className="h-3.5 w-3.5" />
+      Settings
+    </PermissionButton>
+  );
+}
+
+/**
+ * Enter/exit fullscreen, in one control the host offers on every app surface.
+ * Fullscreen used to be reachable only when the guest asked for it through the
+ * ext-apps SDK (`ui/request-display-mode`), which apps shipped by an MCP server
+ * commonly do and apps authored here generally do not — so the same mode was
+ * available for one kind of app and not the other. The host owns the surface, so
+ * it offers the toggle regardless of what the guest asks for.
+ */
+export function McpAppFullscreenButton({
+  isFullscreen,
+  onClick,
+  size = "sm",
+}: {
+  isFullscreen: boolean;
+  onClick: () => void;
+  size?: McpAppButtonSize;
+}) {
+  return (
+    <McpAppIconButton
+      icon={isFullscreen ? Minimize2 : Maximize2}
+      label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+      onClick={onClick}
+      size={size}
+    />
+  );
+}
+
+export function McpAppStandaloneButton({
+  app,
+  disabled = false,
+}: {
+  /** Slug-first when the app is resolved; the id alone still opens the page. */
+  app: { id: string; slug?: string | null };
+  /**
+   * Disabled while a recording is in progress: a new tab loads a fresh,
+   * unrecorded app instance, so opening one mid-recording would silently drop
+   * the user out of the session being captured.
+   */
+  disabled?: boolean;
+}) {
+  if (disabled) {
+    return (
+      <TooltipProvider delayDuration={200}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            {/* Wrap the disabled button so it still receives hover for the
+                tooltip (a disabled control fires no pointer events itself). */}
+            <span className="inline-flex">
+              <Button
+                type="button"
+                aria-label="Open in new tab"
+                variant="ghost"
+                size="xs"
+                className={LABELED_BUTTON_CLASS}
+                disabled
+              >
+                <SquareArrowOutUpRight className="h-3.5 w-3.5" />
+                Open in new tab
+              </Button>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" className="text-xs">
+            Stop the recording to open the app in a new tab.
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    );
+  }
+  return (
+    <Button
+      asChild
+      aria-label="Open in new tab"
+      variant="ghost"
+      size="xs"
+      className={LABELED_BUTTON_CLASS}
+    >
+      <Link href={appRunUrl(app)} target="_blank" rel="noreferrer">
+        <SquareArrowOutUpRight className="h-3.5 w-3.5" />
+        Open in new tab
+      </Link>
+    </Button>
+  );
+}
+
+/**
+ * Interactive app pill in the chat's tool-call row: the app's icon plus its
+ * name, in the same chrome as the Skill pill and the tool-call circles (32px
+ * tall, rounded-full, bordered). Clicking toggles the app's inline render —
+ * like a tool-call circle toggles its detail card. `pressed` means the app is
+ * visible inline (its content is expanded under the pill). It reads unpressed
+ * while the app is hosted in the right panel (you're looking at the panel
+ * copy). `state` drives the status dot exactly like the tool-call circles;
+ * `hasError` overrides it with red for an app runtime error.
+ */
+export function McpAppPill({
+  label,
+  icon,
+  state,
+  pressed = false,
+  hasError = false,
+  onClick,
+}: {
+  /** The app name, shown inline and in the tooltip. */
+  label: string;
+  /** App icon (e.g. an McpCatalogIcon); falls back to the generic app glyph. */
+  icon?: React.ReactNode;
+  /** Tool-call state for the status dot; omitted renders no dot. */
+  state?: "running" | "completed" | "error" | "denied";
+  /** Pressed = the app's inline render is expanded under the pill. */
+  pressed?: boolean;
+  /** Show a red status dot for an app runtime error. */
+  hasError?: boolean;
+  onClick: () => void;
+}) {
+  const dotState = hasError ? "error" : state;
+  return (
+    <TooltipProvider delayDuration={200}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={onClick}
+            aria-label={label}
+            aria-pressed={pressed}
+            className={cn(
+              "relative rounded-full hover:border-accent-foreground/20 hover:text-foreground",
+              pressed &&
+                "border-accent-foreground/20 bg-accent dark:bg-accent text-foreground ring-2 ring-primary/20",
+            )}
+          >
+            {icon ?? <AppWindow className="h-4 w-4 text-muted-foreground" />}
+            <span className="whitespace-nowrap text-xs font-medium">
+              {label}
+            </span>
+            {dotState ? (
+              <span
+                className={cn(
+                  "absolute -right-0.5 -bottom-0.5 size-2.5 rounded-full border-2 border-background",
+                  dotState === "completed" && "bg-green-500",
+                  dotState === "running" && "bg-blue-500 animate-pulse",
+                  dotState === "error" && "bg-destructive",
+                  dotState === "denied" && "bg-orange-500",
+                )}
+              />
+            ) : null}
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="top" className="text-xs">
+          {label}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}

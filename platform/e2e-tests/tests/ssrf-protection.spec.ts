@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
-import { MCP_SERVER_TOOL_NAME_SEPARATOR } from "@shared";
+import { MCP_SERVER_TOOL_NAME_SEPARATOR } from "@archestra/shared";
+import { ORGANIZATION_USE_GRANT } from "../consts";
 import { waitForServerInstallation } from "../utils";
 import {
   callMcpTool,
@@ -136,14 +137,20 @@ test.describe("SSRF Protection - NetworkPolicy for MCP Servers", () => {
       await waitForServerInstallation(request, serverId);
 
       // Create a team-scoped profile so it can use the team-scoped MCP server.
+      // The organization grant lets the organization token call it.
       const profileResponse = await makeApiRequest({
         request,
         method: "post",
         urlSuffix: "/api/agents",
         data: {
           name: `SSRF Test Profile ${uniqueSuffix}`,
-          teams: [defaultTeam.id],
-          scope: "team",
+          initialGrants: [
+            {
+              subject: { type: "team", id: defaultTeam.id },
+              actions: ["read", "use"],
+            },
+            ORGANIZATION_USE_GRANT,
+          ],
         },
       });
       const profile = await profileResponse.json();
@@ -170,9 +177,11 @@ test.describe("SSRF Protection - NetworkPolicy for MCP Servers", () => {
       const allToolsResponse = await makeApiRequest({
         request,
         method: "get",
-        urlSuffix: "/api/tools",
+        urlSuffix: "/api/tools?limit=100",
       });
-      const allTools = await allToolsResponse.json();
+      const { data: allTools } = (await allToolsResponse.json()) as {
+        data: Array<{ id: string; name: string }>;
+      };
       const toolEntity = allTools.find(
         (t: { name: string }) => t.name === ssrfTool.name,
       );

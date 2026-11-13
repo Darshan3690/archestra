@@ -1,0 +1,67 @@
+{
+  "name": "userad__didlogic_mcp",
+  "display_name": "didlogic_mcp",
+  "description": "MCP server from UserAd/didlogic_mcp",
+  "author": {
+    "name": "UserAd"
+  },
+  "server": {
+    "command": "uvx",
+    "args": ["didlogic_mcp"],
+    "env": {
+      "DIDLOGIC_API_KEY": "${user_config.didlogic_api_key}"
+    },
+    "type": "local"
+  },
+  "tools": [],
+  "prompts": [],
+  "keywords": [],
+  "user_config": {
+    "didlogic_api_key": {
+      "type": "string",
+      "title": "Didlogic API Key",
+      "description": "Your API key for accessing Didlogic services.",
+      "sensitive": true,
+      "required": true
+    }
+  },
+  "readme": "# Didlogic MCP Server\n\nA Model Context Protocol (MCP) server implementation for the Didlogic API. This server allows Large Language Models (LLMs) to interact with Didlogic services through a standardized interface.\n\n## Features\n\n- Full access to Didlogic API through MCP tools\n- Specialized prompts for common operations\n- Balance management tools\n- SIP account (sipfriends) management\n- IP restriction management\n- Purchases management\n- Call hisory access\n- Transaction history access\n\n## Installation\n\n### Using uv (recommended)\n\nWhen using [`uv`](https://docs.astral.sh/uv/) no specific installation is needed. We will\nuse [`uvx`](https://docs.astral.sh/uv/guides/tools/) to directly run *didlogic_mcp*.\n\n### Using PIP\n\nAlternatively you can install `didlogic_mcp` via pip:\n\n```bash\npip install didlogic_mcp\n```\n\nAfter installation, you can run it as a script using:\n\n```bash\nDIDLOGIC_API_KEY=YOUR_DIDLOGIC_KEY python -m didlogic_mcp\n```\n\n## Configuration\n\n### Configure for Claude.app\n\nAdd to your Claude settings:\n\n#### Using uvx\n\n```json\n\"mcpServers\": {\n  \"didlogic\": {\n    \"command\": \"uvx\",\n    \"args\": [\"didlogic_mcp\"],\n    \"env\": {\n      \"DIDLOGIC_API_KEY\": \"YOUR_DIDLOGIC_KEY\"\n    }\n  }\n}\n```\n\n#### Using pip installation\n\n```json\n\"mcpServers\": {\n  \"didlogic\": {\n    \"command\": \"python\",\n    \"args\": [\"-m\", \"didlogic_mcp\"],\n    \"env\": {\n      \"DIDLOGIC_API_KEY\": \"YOUR_DIDLOGIC_KEY\"\n    }\n  }\n}\n```\n\n## License\n\nMIT\n",
+  "category": "AI Tools",
+  "archestra_config": {
+    "client_config_permutations": {
+      "didlogic_mcp": {
+        "command": "uvx",
+        "args": ["didlogic_mcp"],
+        "env": {
+          "DIDLOGIC_API_KEY": "YOUR_DIDLOGIC_KEY"
+        }
+      },
+      "didlogic_mcp-python": {
+        "command": "python",
+        "args": ["-m", "didlogic_mcp"],
+        "env": {
+          "DIDLOGIC_API_KEY": "YOUR_DIDLOGIC_KEY"
+        }
+      }
+    },
+    "oauth": {
+      "provider": null,
+      "required": false
+    },
+    "works_in_archestra": false
+  },
+  "github_info": {
+    "owner": "UserAd",
+    "repo": "didlogic_mcp",
+    "url": "https://github.com/UserAd/didlogic_mcp",
+    "name": "userad__didlogic_mcp",
+    "path": null,
+    "stars": 1,
+    "contributors": 1,
+    "issues": 0,
+    "releases": false,
+    "ci_cd": false,
+    "latest_commit_hash": "cef69e78ea1d96fc6aacb9cacaf088e35e4831e5"
+  },
+  "programming_language": "Python"
+}

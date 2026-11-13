@@ -1,0 +1,328 @@
+import { ArchestraInternalErrorCode } from "@archestra/shared";
+import { DrizzleQueryError } from "drizzle-orm/errors";
+import { describe, expect, test } from "vitest";
+import config from "@/config";
+import { ApiError, SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE } from "@/types";
+import { ServerDrainingError } from "@/types/server-draining-error";
+import { classifyErrorForTracking } from "./error-tracking-policy";
+
+/** A generic Error whose `.name` marks it as an MCP-connectivity failure. */
+function namedError(name: string, message = "boom"): Error {
+  const error = new Error(message);
+  error.name = name;
+  return error;
+}
+
+/** A generic Error carrying an HTTP `statusCode` property. */
+function statusError(statusCode: number): Error & { statusCode: number } {
+  return Object.assign(new Error(`status ${statusCode}`), { statusCode });
+}
+
+describe("classifyErrorForTracking", () => {
+  test("drops only the intentional shutdown refusal, preserving unrelated 503s", () => {
+    expect(classifyErrorForTracking(new ServerDrainingError())).toEqual({
+      report: false,
+    });
+    expect(
+      classifyErrorForTracking(new ApiError(503, "Server is shutting down"))
+        .report,
+    ).toBe(true);
+    expect(
+      classifyErrorForTracking(namedError("ServerDrainingError")).report,
+    ).toBe(true);
+  });
+  test("reports a genuine server-side bug (generic 500) without grouping", () => {
+    const decision = classifyErrorForTracking(
+      new Error("undefined is not a function"),
+    );
+    expect(decision.report).toBe(true);
+    expect(decision.fingerprint).toBeUndefined();
+  });
+
+  test("reports our own 5xx ApiErrors (500, 503)", () => {
+    for (const statusCode of [500, 503]) {
+      expect(
+        classifyErrorForTracking(new ApiError(statusCode, "boom")).report,
+      ).toBe(true);
+    }
+  });
+
+  test("drops 4xx ApiErrors as expected client errors", () => {
+    for (const statusCode of [400, 401, 403, 404, 429]) {
+      expect(
+        classifyErrorForTracking(new ApiError(statusCode, "client error"))
+          .report,
+      ).toBe(false);
+    }
+  });
+
+  test("drops 502/504/529 ApiErrors as upstream failures", () => {
+    for (const statusCode of [502, 504, 529]) {
+      expect(
+        classifyErrorForTracking(new ApiError(statusCode, "upstream")).report,
+      ).toBe(false);
+    }
+  });
+
+  test("drops ApiErrors marked as relayed upstream provider failures", () => {
+    for (const statusCode of [500, 503]) {
+      const relay = new ApiError(statusCode, "provider is unavailable");
+      relay.upstream = true;
+      expect(classifyErrorForTracking(relay).report).toBe(false);
+    }
+  });
+
+  test("does not mistake an upstream relay's preserved socket cause for a database outage", () => {
+    const cause = Object.assign(new Error("provider connection closed"), {
+      code: "ECONNRESET",
+    });
+    const relay = new ApiError(503, "Provider unavailable");
+    relay.upstream = true;
+    relay.cause = cause;
+
+    expect(classifyErrorForTracking(relay)).toEqual({ report: false });
+    expect(
+      classifyErrorForTracking(new DrizzleQueryError("select 1", [], cause)),
+    ).toMatchObject({
+      report: true,
+      fingerprint: ["db-transient", "ECONNRESET"],
+    });
+  });
+
+  test("drops the handled upstream-empty-response condition", () => {
+    const error = new ApiError(
+      500,
+      "provider streamed an empty completion",
+      ArchestraInternalErrorCode.UpstreamEmptyResponse,
+    );
+    expect(classifyErrorForTracking(error).report).toBe(false);
+  });
+
+  test("drops the handled provider-overload condition", () => {
+    const error = new ApiError(
+      503,
+      "The server is currently overloaded",
+      ArchestraInternalErrorCode.ProviderOverloaded,
+    );
+    expect(classifyErrorForTracking(error).report).toBe(false);
+  });
+
+  test("drops a generic error carrying a 4xx client status", () => {
+    for (const statusCode of [400, 404, 429]) {
+      expect(classifyErrorForTracking(statusError(statusCode)).report).toBe(
+        false,
+      );
+    }
+  });
+
+  test("keeps a generic error carrying a 5xx status", () => {
+    // Unlike ApiError 502/504 (our upstream-gateway mapping, dropped), a
+    // generic 5xx is a provider's own server error surfaced via the
+    // raw-provider-error path — a diagnostic signal we keep reporting.
+    for (const statusCode of [500, 502, 503, 504]) {
+      expect(classifyErrorForTracking(statusError(statusCode)).report).toBe(
+        true,
+      );
+    }
+  });
+
+  test("drops unmapped outbound connectivity failures", () => {
+    // undici's connect timeout, as surfaced by fetch and the proxy paths.
+    const connectTimeout = Object.assign(new Error("Connect Timeout Error"), {
+      code: "UND_ERR_CONNECT_TIMEOUT",
+    });
+    expect(classifyErrorForTracking(connectTimeout).report).toBe(false);
+
+    // A bare libuv errno that names no endpoint is not a database outage
+    // unless the database client raised it.
+    const refused = Object.assign(new Error("fetch failed"), {
+      cause: Object.assign(new Error("connect ECONNREFUSED"), {
+        code: "ECONNREFUSED",
+      }),
+    });
+    expect(classifyErrorForTracking(refused)).toEqual({ report: false });
+    const clientTimeout = Object.assign(new Error("Request timed out"), {
+      code: "ETIMEDOUT",
+    });
+    expect(classifyErrorForTracking(clientTimeout)).toEqual({ report: false });
+  });
+
+  test("does not group outbound failures to other hosts as database outages", () => {
+    // A tool call whose outbound request was blocked relays the socket error
+    // text; the database is not the host that could not be reached.
+    const relayed = new Error(
+      "MCP error -32603: request to https://api.example.com/v1 failed, reason: getaddrinfo ENOTFOUND api.example.com",
+    );
+    expect(classifyErrorForTracking(relayed)).toEqual({ report: false });
+  });
+
+  test("does not group native HTTP fetch failures as database outages", () => {
+    const cause = new AggregateError([
+      Object.assign(new Error("connection timed out"), { code: "ETIMEDOUT" }),
+    ]);
+    expect(
+      classifyErrorForTracking(new TypeError("fetch failed", { cause })),
+    ).toEqual({ report: false });
+    // The same network failure from a database operation must still report.
+    expect(
+      classifyErrorForTracking(new DrizzleQueryError("select 1", [], cause)),
+    ).toMatchObject({
+      report: true,
+      fingerprint: ["db-transient", "ETIMEDOUT"],
+    });
+  });
+
+  test("drops reply-from upstream failures from the passthrough routes", () => {
+    // @fastify/reply-from's ServiceUnavailableError shape (code + 503),
+    // raised when a provider passthrough cannot reach its upstream.
+    const serviceUnavailable = Object.assign(new Error("Service Unavailable"), {
+      code: "FST_REPLY_FROM_SERVICE_UNAVAILABLE",
+      statusCode: 503,
+    });
+    expect(classifyErrorForTracking(serviceUnavailable).report).toBe(false);
+
+    // A reply-from 500 (arbitrary wrapped error) stays reported.
+    const internal = Object.assign(new Error("boom"), {
+      code: "FST_REPLY_FROM_INTERNAL_SERVER_ERROR",
+      statusCode: 500,
+    });
+    expect(classifyErrorForTracking(internal).report).toBe(true);
+  });
+
+  test("keeps and groups the chat MCP-gateway-unavailable condition", () => {
+    const error = new ApiError(
+      503,
+      "MCP tools unavailable: could not connect to MCP Gateway",
+      "mcp_tools_unavailable",
+    );
+    const decision = classifyErrorForTracking(error);
+    expect(decision.report).toBe(true);
+    expect(decision.fingerprint).toEqual(["mcp_tools_unavailable"]);
+  });
+
+  test("drops MCP-server-unreachable errors by name", () => {
+    for (const name of [
+      "McpServerNotReadyError",
+      "McpServerConnectionTimeoutError",
+      "McpServerUnreachableError",
+      "McpServerDeploymentFailedError",
+      "McpServerReadinessTimeoutError",
+    ]) {
+      expect(classifyErrorForTracking(namedError(name)).report).toBe(false);
+    }
+  });
+
+  test("groups transient DB connectivity failures by root cause", () => {
+    const databasePort = new URL(config.database.url).port || "5432";
+    const dbError = new Error(
+      'Failed query: select "id" from "agents" where "slug" = $1',
+      { cause: new Error(`connect ECONNREFUSED 10.0.0.1:${databasePort}`) },
+    );
+    const decision = classifyErrorForTracking(dbError);
+    expect(decision.report).toBe(true);
+    expect(decision.fingerprint).toEqual(["db-transient", "ECONNREFUSED"]);
+    expect(decision.tags).toMatchObject({
+      error_type: "db_transient",
+      db_error_code: "ECONNREFUSED",
+    });
+  });
+
+  test("groups statement timeouts under one stable fingerprint", () => {
+    // The ORM wraps the cancellation per-query, so without a stable
+    // fingerprint every distinct SQL statement becomes its own issue.
+    const pgError = Object.assign(
+      new Error("canceling statement due to statement timeout"),
+      { code: "57014" },
+    );
+    const dbError = new Error(
+      'Failed query: select "id" from "agents" where "slug" = $1',
+      { cause: pgError },
+    );
+    const decision = classifyErrorForTracking(dbError);
+    expect(decision.report).toBe(true);
+    expect(decision.fingerprint).toEqual(["db-statement-timeout"]);
+    expect(decision.tags).toMatchObject({
+      error_type: "db_statement_timeout",
+      db_error_code: "57014",
+    });
+  });
+
+  test("groups database resource exhaustion by root cause", () => {
+    // One full disk (or exhausted memory/connection slots) fails every
+    // in-flight query; per-statement wrappers must not fragment it.
+    const pgError = Object.assign(
+      new Error("could not write init file: No space left on device"),
+      { code: "53100" },
+    );
+    const dbError = new Error(
+      'Failed query: select "id" from "agents" where "slug" = $1',
+      { cause: pgError },
+    );
+    const decision = classifyErrorForTracking(dbError);
+    expect(decision.report).toBe(true);
+    expect(decision.fingerprint).toEqual([
+      "db-resource-exhaustion",
+      "disk_full",
+    ]);
+    expect(decision.tags).toMatchObject({
+      error_type: "db_resource_exhaustion",
+      db_error_code: "disk_full",
+    });
+  });
+
+  test("groups secrets-backend outages by the root condition", () => {
+    const error = new ApiError(
+      503,
+      "secrets manager unavailable",
+      SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
+    );
+    const decision = classifyErrorForTracking(error);
+    expect(decision.report).toBe(true);
+    expect(decision.fingerprint).toEqual([
+      SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
+    ]);
+  });
+
+  test("surfaces the secrets backend's own error from the chained cause", () => {
+    // The user-facing message is generic by design; the tag is what makes a
+    // captured secrets outage diagnosable without access to server logs.
+    const error = new ApiError(
+      503,
+      "An error occurred while accessing secrets. Please try again later or contact your administrator.",
+      SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
+    );
+    error.cause = {
+      response: { statusCode: 403, body: { errors: ["permission denied"] } },
+    };
+    const decision = classifyErrorForTracking(error);
+    expect(decision.report).toBe(true);
+    expect(decision.tags).toMatchObject({
+      error_type: SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
+      secrets_backend_error: "403: permission denied",
+    });
+  });
+
+  test("truncates unbounded backend error strings in the tag", () => {
+    const error = new ApiError(
+      503,
+      "An error occurred while accessing secrets. Please try again later or contact your administrator.",
+      SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
+    );
+    error.cause = {
+      response: { statusCode: 500, body: { errors: ["x".repeat(1000)] } },
+    };
+    const decision = classifyErrorForTracking(error);
+    expect(decision.tags?.secrets_backend_error).toHaveLength(200);
+    expect(decision.tags?.secrets_backend_error).toMatch(/^500: x+$/);
+  });
+  test("drops a deployment failure whose wrapper lost the error name", () => {
+    // Several report paths persist or re-wrap the runtime's
+    // McpServerDeploymentFailedError as a plain Error, losing the name the
+    // unreachable-server set matches on. The stable message prefix still
+    // identifies the user's container failing, not a crash of ours.
+    const rewrapped = new Error(
+      "Deployment mcp-example-server-abc123 failed: CrashLoopBackOff - back-off 10s restarting failed container",
+    );
+    expect(classifyErrorForTracking(rewrapped)).toEqual({ report: false });
+  });
+});

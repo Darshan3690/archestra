@@ -1,35 +1,73 @@
-import { vi } from "vitest";
-import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import { generateKeyPairSync } from "node:crypto";
+import { MockLanguageModelV3 } from "ai/test";
+import pino from "pino";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { makeTestPdf } from "@/test/pdf";
 import type { ConnectorSyncBatch } from "@/types";
 import { GithubConnector } from "./github-connector";
 
 // Mock @octokit/rest SDK
 const mockGetAuthenticated = vi.fn();
+const mockSearchIssuesAndPullRequests = vi.fn();
+const mockListReposAccessibleToInstallation = vi.fn();
 const mockListForRepo = vi.fn();
 const mockListForOrg = vi.fn();
 const mockListComments = vi.fn();
 const mockGetRef = vi.fn();
 const mockGetTree = vi.fn();
 const mockGetContent = vi.fn();
+const mockGetBlob = vi.fn();
 const mockReposGet = vi.fn();
+const mockListCollaborators = vi.fn();
+const mockReposListTeams = vi.fn();
+const mockTeamsList = vi.fn();
+const mockListMembersInOrg = vi.fn();
+const mockGetByUsername = vi.fn();
+const capturedOctokitOptions: Record<string, unknown>[] = [];
+
+vi.mock("@/cache-manager");
 
 vi.mock("@octokit/rest", () => ({
   Octokit: class MockOctokit {
+    constructor(options: Record<string, unknown>) {
+      capturedOctokitOptions.push(options);
+    }
+
     rest = {
-      users: { getAuthenticated: mockGetAuthenticated },
+      users: {
+        getAuthenticated: mockGetAuthenticated,
+        getByUsername: mockGetByUsername,
+      },
+      apps: {
+        listReposAccessibleToInstallation:
+          mockListReposAccessibleToInstallation,
+      },
       repos: {
         listForOrg: mockListForOrg,
         getContent: mockGetContent,
         get: mockReposGet,
+        listCollaborators: mockListCollaborators,
+        listTeams: mockReposListTeams,
       },
+      search: { issuesAndPullRequests: mockSearchIssuesAndPullRequests },
       issues: {
         listForRepo: mockListForRepo,
         listComments: mockListComments,
       },
-      git: { getRef: mockGetRef, getTree: mockGetTree },
+      teams: {
+        list: mockTeamsList,
+        listMembersInOrg: mockListMembersInOrg,
+      },
+      git: { getRef: mockGetRef, getTree: mockGetTree, getBlob: mockGetBlob },
     };
   },
 }));
+
+const { privateKey: appPrivateKey } = generateKeyPairSync("rsa", {
+  modulusLength: 2048,
+  privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  publicKeyEncoding: { type: "spki", format: "pem" },
+});
 
 describe("GithubConnector", () => {
   let connector: GithubConnector;
@@ -46,7 +84,9 @@ describe("GithubConnector", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    connector = new GithubConnector();
+    capturedOctokitOptions.length = 0;
+    // The sync tests cover pagination and output, not wall-clock throttling.
+    connector = new GithubConnector(0);
     // Default: repos.get returns main as default branch
     mockReposGet.mockResolvedValue({
       data: { default_branch: "main" },
@@ -58,9 +98,80 @@ describe("GithubConnector", () => {
   });
 
   describe("validateConfig", () => {
+    test.each([
+      [{ repository: "" }],
+      [{ repository: "owner/repo/extra" }],
+      [{ repository: "owner/repo" }, { repository: "OWNER/REPO" }],
+      [{ repository: "bare-repo" }],
+    ])("rejects invalid repository overrides %j", async (...filters) => {
+      const result = await connector.validateConfig({
+        ...validConfig,
+        repositoryOverrides: filters,
+      });
+      expect(result.valid).toBe(false);
+    });
+
+    test.each([
+      ".*",
+      "**/*.md",
+      "docs/*.md",
+      "Dockerfile*",
+      "",
+      "?md",
+      "[ab].md",
+    ])("rejects unsupported File Types %s at default and override levels", async (entry) => {
+      for (const settings of [
+        { fileTypes: [entry] },
+        {
+          repositoryOverrides: [
+            { repository: "test-org/my-repo", fileTypes: [entry] },
+          ],
+        },
+      ]) {
+        const result = await connector.validateConfig({
+          ...validConfig,
+          ...settings,
+        });
+        expect(result.valid).toBe(false);
+        expect(result.error).toContain(
+          "Paths and glob patterns are not supported",
+        );
+      }
+    });
+
+    test("accepts the existing extension and exact-name forms", async () => {
+      expect(
+        await connector.validateConfig({
+          ...validConfig,
+          fileTypes: [
+            "md",
+            ".md",
+            "*.md",
+            ".tm.hcl",
+            "Dockerfile",
+            "config.json",
+            "*",
+            "*.*",
+            " .env ",
+          ],
+        }),
+      ).toEqual({ valid: true });
+    });
+
     test("returns valid for correct config", async () => {
       const result = await connector.validateConfig(validConfig);
       expect(result).toEqual({ valid: true });
+    });
+
+    test("rejects ambiguous case-insensitive repository override duplicates", async () => {
+      const result = await connector.validateConfig({
+        ...validConfig,
+        repositoryOverrides: [
+          { repository: "test-org/my-repo", includeIssues: false },
+          { repository: "TEST-ORG/MY-REPO", includePullRequests: false },
+        ],
+      });
+      expect(result.valid).toBe(false);
     });
 
     test("returns invalid when githubUrl is missing", async () => {
@@ -120,6 +231,17 @@ describe("GithubConnector", () => {
       });
       expect(result).toEqual({ valid: true });
     });
+
+    test("requires a config reference when GitHub App auth is selected", async () => {
+      const result = await connector.validateConfig({
+        githubUrl: "https://api.github.com",
+        owner: "test-org",
+        authMethod: "github_app",
+      });
+
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain("githubAppConfigId");
+    });
   });
 
   describe("testConnection", () => {
@@ -159,6 +281,130 @@ describe("GithubConnector", () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toContain("Invalid GitHub configuration");
+    });
+
+    test("uses GitHub App installation token when app auth is configured", async () => {
+      mockListReposAccessibleToInstallation.mockResolvedValueOnce({
+        data: { repositories: [] },
+      });
+      const originalFetch = globalThis.fetch;
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          token: "installation-token",
+          expires_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+        }),
+      });
+      vi.stubGlobal("fetch", mockFetch);
+
+      try {
+        const result = await connector.testConnection({
+          config: {
+            ...validConfig,
+            authMethod: "github_app",
+            githubAppConfigId: "00000000-0000-4000-8000-000000000001",
+          },
+          credentials: {
+            apiToken: appPrivateKey.replaceAll("\n", "\\n"),
+            githubApp: {
+              githubUrl: "https://api.github.com",
+              appId: "12345",
+              installationId: "67890",
+            },
+          },
+        });
+
+        expect(result).toEqual({ success: true });
+        expect(mockFetch).toHaveBeenCalledWith(
+          "https://api.github.com/app/installations/67890/access_tokens",
+          expect.objectContaining({ method: "POST" }),
+        );
+        expect(mockListReposAccessibleToInstallation).toHaveBeenCalledWith({
+          per_page: 1,
+        });
+        expect(mockGetAuthenticated).not.toHaveBeenCalled();
+        expect(capturedOctokitOptions[0]?.auth).toBe("installation-token");
+      } finally {
+        vi.stubGlobal("fetch", originalFetch);
+      }
+    });
+
+    test("includes GitHub App installation token error response message", async () => {
+      const originalFetch = globalThis.fetch;
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 401,
+        statusText: "Unauthorized",
+        text: async () => JSON.stringify({ message: "Bad credentials" }),
+      });
+      vi.stubGlobal("fetch", mockFetch);
+
+      try {
+        const result = await connector.testConnection({
+          config: {
+            ...validConfig,
+            authMethod: "github_app",
+            githubAppConfigId: "00000000-0000-4000-8000-000000000002",
+          },
+          credentials: {
+            apiToken: appPrivateKey.replaceAll("\n", "\\n"),
+            githubApp: {
+              githubUrl: "https://api.github.com",
+              appId: "12345",
+              installationId: "67892",
+            },
+          },
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("Bad credentials");
+      } finally {
+        vi.stubGlobal("fetch", originalFetch);
+      }
+    });
+
+    test("reuses cached GitHub App installation tokens", async () => {
+      mockListReposAccessibleToInstallation
+        .mockResolvedValueOnce({ data: { repositories: [] } })
+        .mockResolvedValueOnce({ data: { repositories: [] } });
+      const originalFetch = globalThis.fetch;
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          token: "cached-installation-token",
+          expires_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+        }),
+      });
+      vi.stubGlobal("fetch", mockFetch);
+
+      const config = {
+        ...validConfig,
+        authMethod: "github_app",
+        githubAppConfigId: "00000000-0000-4000-8000-000000000003",
+      };
+      const appCredentials = {
+        apiToken: appPrivateKey.replaceAll("\n", "\\n"),
+        githubApp: {
+          githubUrl: "https://api.github.com",
+          appId: "12345",
+          installationId: "67891",
+        },
+      };
+
+      try {
+        await connector.testConnection({ config, credentials: appCredentials });
+        await connector.testConnection({ config, credentials: appCredentials });
+
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+        expect(capturedOctokitOptions[0]?.auth).toBe(
+          "cached-installation-token",
+        );
+        expect(capturedOctokitOptions[1]?.auth).toBe(
+          "cached-installation-token",
+        );
+      } finally {
+        vi.stubGlobal("fetch", originalFetch);
+      }
     });
   });
 
@@ -215,6 +461,124 @@ describe("GithubConnector", () => {
       expect(batches[0].documents[0].id).toBe("my-repo#1");
       expect(batches[0].documents[0].title).toContain("First issue");
       expect(batches[0].documents[1].id).toBe("my-repo#2");
+    });
+
+    test("resolves fully-qualified owner/repo slugs against their own owner, not config.owner", async () => {
+      // Regression: repo entries pasted as `owner/repo` slugs (the only way to
+      // span multiple owners) were paired with config.owner, producing
+      // `/repos/{config.owner}/{owner/repo}` — a 404 the sync silently swallowed
+      // as "repo not found", ingesting zero documents.
+      mockListForRepo.mockResolvedValue({ data: [] });
+
+      const batches: ConnectorSyncBatch[] = [];
+      for await (const batch of connector.sync({
+        config: {
+          githubUrl: "https://api.github.com",
+          owner: "config-owner",
+          repos: ["other-org/their-repo"],
+        },
+        credentials,
+        checkpoint: null,
+      })) {
+        batches.push(batch);
+      }
+
+      // Metadata lookup and issue/PR fetches all target the slug's own owner.
+      expect(mockReposGet).toHaveBeenCalledWith({
+        owner: "other-org",
+        repo: "their-repo",
+      });
+      expect(mockListForRepo).toHaveBeenCalledWith(
+        expect.objectContaining({ owner: "other-org", repo: "their-repo" }),
+      );
+      expect(mockListForRepo).not.toHaveBeenCalledWith(
+        expect.objectContaining({ owner: "config-owner" }),
+      );
+    });
+
+    test("treats a bare repo name as belonging to config.owner", async () => {
+      mockListForRepo.mockResolvedValue({ data: [] });
+
+      for await (const _batch of connector.sync({
+        config: {
+          githubUrl: "https://api.github.com",
+          owner: "config-owner",
+          repos: ["bare-repo"],
+        },
+        credentials,
+        checkpoint: null,
+      })) {
+        // drain
+      }
+
+      expect(mockListForRepo).toHaveBeenCalledWith(
+        expect.objectContaining({ owner: "config-owner", repo: "bare-repo" }),
+      );
+    });
+
+    test("discovers repositories from GitHub App installation when repos are omitted", async () => {
+      const originalFetch = globalThis.fetch;
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          token: "installation-token",
+          expires_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+        }),
+      });
+      vi.stubGlobal("fetch", mockFetch);
+
+      mockListReposAccessibleToInstallation.mockResolvedValueOnce({
+        data: {
+          repositories: [
+            {
+              name: "app-repo",
+              html_url: "https://github.com/test-org/app-repo",
+              default_branch: "main",
+              owner: { login: "test-org" },
+            },
+          ],
+        },
+      });
+      mockListForRepo.mockResolvedValueOnce({ data: [] });
+      mockListForRepo.mockResolvedValueOnce({ data: [] });
+
+      try {
+        const batches: ConnectorSyncBatch[] = [];
+        for await (const batch of connector.sync({
+          config: {
+            githubUrl: "https://api.github.com",
+            owner: "test-org",
+            authMethod: "github_app",
+            githubAppConfigId: "00000000-0000-4000-8000-000000000004",
+          },
+          credentials: {
+            apiToken: appPrivateKey.replaceAll("\n", "\\n"),
+            githubApp: {
+              githubUrl: "https://api.github.com",
+              appId: "12345",
+              installationId: "67893",
+            },
+          },
+          checkpoint: null,
+        })) {
+          batches.push(batch);
+        }
+
+        expect(batches).toHaveLength(2);
+        expect(mockListReposAccessibleToInstallation).toHaveBeenCalledWith({
+          per_page: 100,
+          page: 1,
+        });
+        expect(mockListForOrg).not.toHaveBeenCalled();
+        expect(mockListForRepo).toHaveBeenCalledWith(
+          expect.objectContaining({
+            owner: "test-org",
+            repo: "app-repo",
+          }),
+        );
+      } finally {
+        vi.stubGlobal("fetch", originalFetch);
+      }
     });
 
     test("separates issues and pull requests", async () => {
@@ -412,6 +776,209 @@ describe("GithubConnector", () => {
       expect(allDocs.every((d) => d.metadata.kind === "issue")).toBe(true);
       // listForRepo should only be called once (no PR pass)
       expect(mockListForRepo).toHaveBeenCalledTimes(1);
+    });
+
+    test("applies independent issue, PR, label, file type and path overrides", async () => {
+      mockListForRepo.mockResolvedValue({
+        data: [
+          makeIssue(1, "Kept issue"),
+          makeIssue(2, "Labeled issue", { labels: ["skip"] }),
+          makeIssue(3, "Pull request", { isPr: true }),
+        ],
+      });
+      mockListComments.mockResolvedValue({ data: [] });
+      mockGetRef.mockResolvedValue({ data: { object: { sha: "tree" } } });
+      mockGetTree.mockResolvedValue({
+        data: {
+          tree: [
+            "README.md",
+            "README.txt",
+            "docs/public.md",
+            "docs/private/internal.md",
+            "docs/private/internal.txt",
+          ].map((path) => ({ type: "blob", path, sha: path })),
+        },
+      });
+      mockGetContent.mockResolvedValue({
+        data: { content: Buffer.from("fixture content").toString("base64") },
+      });
+      const batches: ConnectorSyncBatch[] = [];
+      for await (const batch of connector.sync({
+        config: {
+          ...validConfig,
+          repos: ["repo-a", "repo-b", "repo-c", "repo-disabled"],
+          includeIssues: false,
+          includePullRequests: false,
+          includeRepositoryFiles: false,
+          labelsToSkip: ["skip"],
+          fileTypes: [".md"],
+          includePaths: ["docs"],
+          excludePaths: ["docs/private"],
+          repositoryOverrides: [
+            {
+              repository: "test-org/repo-a",
+              includeIssues: true,
+              includeRepositoryFiles: true,
+              labelsToSkip: [],
+            },
+            {
+              repository: "test-org/repo-b",
+              includePullRequests: true,
+              includeRepositoryFiles: true,
+              fileTypes: [".txt"],
+              includePaths: [],
+              excludePaths: [],
+            },
+            { repository: "test-org/repo-c", includeRepositoryFiles: true },
+          ],
+        },
+        credentials,
+        checkpoint: null,
+      }))
+        batches.push(batch);
+      expect(
+        batches
+          .flatMap((batch) => batch.documents)
+          .map((doc) => [
+            doc.metadata.repo,
+            doc.metadata.kind,
+            doc.metadata.filePath ?? doc.metadata.number,
+          ]),
+      ).toEqual([
+        ["test-org/repo-a", "issue", 1],
+        ["test-org/repo-a", "issue", 2],
+        ["test-org/repo-a", "repository_file", "docs/public.md"],
+        ["test-org/repo-b", "pr", 3],
+        ["test-org/repo-b", "repository_file", "README.txt"],
+        ["test-org/repo-b", "repository_file", "docs/private/internal.txt"],
+        ["test-org/repo-c", "repository_file", "docs/public.md"],
+      ]);
+      expect(mockListForRepo).toHaveBeenCalledTimes(2);
+      expect(mockGetTree).toHaveBeenCalledTimes(3);
+      expect(batches.slice(0, -1).every((batch) => batch.hasMore)).toBe(true);
+      expect(batches.at(-1)?.hasMore).toBe(false);
+    });
+
+    test("customizing without an include override keeps legacy folder restrictions", async () => {
+      mockGetRef.mockResolvedValue({ data: { object: { sha: "tree" } } });
+      mockGetTree.mockResolvedValue({
+        data: {
+          tree: ["README.md", "docs/public.md"].map((path) => ({
+            type: "blob",
+            path,
+            sha: path,
+          })),
+        },
+      });
+      mockGetContent.mockResolvedValue({
+        data: { content: Buffer.from("fixture").toString("base64") },
+      });
+      const documents = [];
+      for await (const batch of connector.sync({
+        config: {
+          ...validConfig,
+          includeIssues: false,
+          includePullRequests: false,
+          includeRepositoryFiles: true,
+          includePaths: ["docs"],
+          repositoryOverrides: [{ repository: "test-org/my-repo" }],
+        },
+        credentials,
+        checkpoint: null,
+      }))
+        documents.push(...batch.documents);
+      expect(documents.map((doc) => doc.metadata.filePath)).toEqual([
+        "docs/public.md",
+      ]);
+    });
+
+    test("finishes a zero-work selection without advancing its checkpoint", async () => {
+      const checkpoint = {
+        type: "github",
+        lastSyncedAt: "2024-01-10T00:00:00.000Z",
+      };
+      const batches = [];
+      for await (const batch of connector.sync({
+        config: {
+          ...validConfig,
+          includeIssues: false,
+          includePullRequests: false,
+          includeRepositoryFiles: false,
+        },
+        credentials,
+        checkpoint,
+      }))
+        batches.push(batch);
+      expect(batches).toEqual([{ documents: [], checkpoint, hasMore: false }]);
+      expect(mockListForRepo).not.toHaveBeenCalled();
+      expect(mockGetTree).not.toHaveBeenCalled();
+    });
+
+    test("uses canonical overrides for discovered repositories and preserves explicit false", async () => {
+      mockListForOrg.mockResolvedValue({
+        data: [
+          { name: "repo-a", html_url: "https://github.com/test-org/repo-a" },
+          { name: "repo-b", html_url: "https://github.com/test-org/repo-b" },
+        ],
+      });
+      mockListForRepo.mockResolvedValue({
+        data: [makeIssue(1, "Issue"), makeIssue(2, "PR", { isPr: true })],
+      });
+      mockListComments.mockResolvedValue({ data: [] });
+      const documents = [];
+      for await (const batch of connector.sync({
+        config: {
+          ...validConfig,
+          repos: [],
+          repositoryOverrides: [
+            { repository: "test-org/repo-a", includeIssues: false },
+            { repository: "test-org/repo-b", includePullRequests: false },
+          ],
+        },
+        credentials,
+        checkpoint: null,
+      }))
+        documents.push(...batch.documents);
+      expect(
+        documents.map((doc) => [doc.metadata.repo, doc.metadata.kind]),
+      ).toEqual([
+        ["test-org/repo-a", "pr"],
+        ["test-org/repo-b", "issue"],
+      ]);
+      expect(mockListForOrg).toHaveBeenCalledTimes(1);
+    });
+
+    test("empty canonical overrides preserve flat legacy folder and built-in file type defaults", async () => {
+      mockListForRepo.mockResolvedValue({ data: [] });
+      mockGetRef.mockResolvedValue({ data: { object: { sha: "tree" } } });
+      mockGetTree.mockResolvedValue({
+        data: {
+          tree: ["README.md", "docs/public.md", "docs/source.txt"].map(
+            (path) => ({ type: "blob", path, sha: path }),
+          ),
+        },
+      });
+      mockGetContent.mockResolvedValue({
+        data: { content: Buffer.from("fixture").toString("base64") },
+      });
+      const documents = [];
+      for await (const batch of connector.sync({
+        config: {
+          ...validConfig,
+          includeIssues: false,
+          includePullRequests: false,
+          includeRepositoryFiles: true,
+          fileTypes: [],
+          includePaths: ["docs"],
+          repositoryOverrides: [],
+        },
+        credentials,
+        checkpoint: null,
+      }))
+        documents.push(...batch.documents);
+      expect(documents.map((doc) => doc.metadata.filePath)).toEqual([
+        "docs/public.md",
+      ]);
     });
 
     test("builds source URL correctly", async () => {
@@ -659,31 +1226,86 @@ describe("GithubConnector", () => {
     });
   });
 
-  describe("markdown file sync", () => {
-    test("fetches and indexes markdown files when includeMarkdownFiles is true", async () => {
+  describe("repository-aware estimation", () => {
+    test("counts only enabled issue/PR groups even when defaults enable files", async () => {
+      mockSearchIssuesAndPullRequests.mockImplementation(
+        async ({ q }: { q: string }) => ({
+          data: { total_count: q.endsWith("is:issue") ? 5 : 7 },
+        }),
+      );
+      const total = await connector.estimateTotalItems({
+        config: {
+          ...validConfig,
+          repos: ["repo-a", "repo-b"],
+          includeRepositoryFiles: true,
+          repositoryOverrides: [
+            {
+              repository: "test-org/repo-a",
+              includeRepositoryFiles: false,
+              includePullRequests: false,
+            },
+            {
+              repository: "test-org/repo-b",
+              includeRepositoryFiles: false,
+              includeIssues: false,
+            },
+          ],
+        },
+        credentials,
+        checkpoint: null,
+      });
+      expect(total).toBe(12);
+      expect(
+        mockSearchIssuesAndPullRequests.mock.calls.map(([query]) => query.q),
+      ).toEqual([
+        "repo:test-org/repo-a is:issue",
+        "repo:test-org/repo-b is:pr",
+      ]);
+    });
+
+    test("returns unknown if any selected repository enables files", async () => {
+      const total = await connector.estimateTotalItems({
+        config: {
+          ...validConfig,
+          repos: ["repo-a", "repo-b"],
+          repositoryOverrides: [
+            { repository: "test-org/repo-b", includeRepositoryFiles: true },
+          ],
+        },
+        credentials,
+        checkpoint: null,
+      });
+      expect(total).toBeNull();
+      expect(mockSearchIssuesAndPullRequests).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("repository file sync", () => {
+    test("fetches and indexes repository files when includeRepositoryFiles is true", async () => {
       // Issues pass - empty
       mockListForRepo.mockResolvedValueOnce({ data: [] });
       // PR pass - empty
       mockListForRepo.mockResolvedValueOnce({ data: [] });
 
-      // Markdown: resolve default branch
+      // Repository files: resolve default branch
       mockGetRef.mockResolvedValueOnce({
         data: { object: { sha: "abc123" } },
       });
 
-      // Markdown: get tree
+      // Repository files: get tree
       mockGetTree.mockResolvedValueOnce({
         data: {
           tree: [
             { type: "blob", path: "README.md", sha: "sha1" },
             { type: "blob", path: "docs/guide.mdx", sha: "sha2" },
+            { type: "blob", path: "infra/deploy.yaml", sha: "sha5" },
             { type: "blob", path: "src/index.ts", sha: "sha3" },
             { type: "tree", path: "docs", sha: "sha4" },
           ],
         },
       });
 
-      // Markdown: get file contents
+      // Repository files: get file contents
       mockGetContent
         .mockResolvedValueOnce({
           data: {
@@ -696,11 +1318,16 @@ describe("GithubConnector", () => {
               "base64",
             ),
           },
+        })
+        .mockResolvedValueOnce({
+          data: {
+            content: Buffer.from("apiVersion: v1").toString("base64"),
+          },
         });
 
       const batches: ConnectorSyncBatch[] = [];
       for await (const batch of connector.sync({
-        config: { ...validConfig, includeMarkdownFiles: true },
+        config: { ...validConfig, includeRepositoryFiles: true },
         credentials,
         checkpoint: null,
       })) {
@@ -709,20 +1336,400 @@ describe("GithubConnector", () => {
 
       const mdDocs = batches
         .flatMap((b) => b.documents)
-        .filter((d) => d.metadata.kind === "markdown_file");
+        .filter((d) => d.metadata.kind === "repository_file");
 
-      expect(mdDocs).toHaveLength(2);
+      expect(mdDocs).toHaveLength(3);
       expect(mdDocs[0].id).toBe("my-repo#file:README.md");
       expect(mdDocs[0].title).toBe("README.md (test-org/my-repo)");
       expect(mdDocs[0].content).toBe("# README\nHello world");
       expect(mdDocs[0].sourceUrl).toContain("blob/main/README.md");
       expect(mdDocs[0].metadata.filePath).toBe("README.md");
+      expect(mdDocs[0].metadata.kind).toBe("repository_file");
+      expect(mdDocs[0].metadata.fileKind).toBe("repository_file");
 
       expect(mdDocs[1].id).toBe("my-repo#file:docs/guide.mdx");
       expect(mdDocs[1].content).toBe("# Guide\nSome guide content");
+
+      expect(mdDocs[2].id).toBe("my-repo#file:infra/deploy.yaml");
+      expect(mdDocs[2].content).toBe("apiVersion: v1");
     });
 
-    test("does not fetch markdown files when includeMarkdownFiles is not set", async () => {
+    test("indexes only files under the configured folders", async () => {
+      mockListForRepo.mockResolvedValueOnce({ data: [] });
+      mockListForRepo.mockResolvedValueOnce({ data: [] });
+
+      mockGetRef.mockResolvedValueOnce({
+        data: { object: { sha: "abc123" } },
+      });
+
+      mockGetTree.mockResolvedValueOnce({
+        data: {
+          tree: [
+            { type: "blob", path: "README.md", sha: "sha1" },
+            { type: "blob", path: "docs/guide.md", sha: "sha2" },
+            { type: "blob", path: "docs/nested/deep.md", sha: "sha3" },
+            // Shares the "docs" prefix but is a sibling folder, so the
+            // separator boundary has to keep it out.
+            { type: "blob", path: "docs-internal/secret.md", sha: "sha4" },
+            { type: "blob", path: "handbook/policy.md", sha: "sha5" },
+            { type: "blob", path: "src/index.md", sha: "sha6" },
+          ],
+        },
+      });
+
+      mockGetContent
+        .mockResolvedValueOnce({
+          data: { content: Buffer.from("guide").toString("base64") },
+        })
+        .mockResolvedValueOnce({
+          data: { content: Buffer.from("deep").toString("base64") },
+        })
+        .mockResolvedValueOnce({
+          data: { content: Buffer.from("policy").toString("base64") },
+        });
+
+      const batches: ConnectorSyncBatch[] = [];
+      for await (const batch of connector.sync({
+        config: {
+          ...validConfig,
+          includeRepositoryFiles: true,
+          // Deliberately messy: surrounding slashes are user habit, not intent.
+          includePaths: ["docs", "/handbook/"],
+        },
+        credentials,
+        checkpoint: null,
+      })) {
+        batches.push(batch);
+      }
+
+      const fileDocs = batches
+        .flatMap((b) => b.documents)
+        .filter((d) => d.metadata.kind === "repository_file");
+
+      expect(fileDocs.map((d) => d.metadata.filePath)).toEqual([
+        "docs/guide.md",
+        "docs/nested/deep.md",
+        "handbook/policy.md",
+      ]);
+    });
+
+    test.each([
+      {
+        name: "independent includes and exclusions with directory boundaries",
+        filters: [
+          {
+            repository: "TEST-ORG/MY-REPO",
+            includePaths: ["./docs\\"],
+            excludePaths: ["/docs/internal/"],
+          },
+          {
+            repository: "test-org/other-repo",
+            includePaths: ["handbook"],
+            excludePaths: ["handbook/private.md"],
+          },
+        ],
+        expected: [
+          "my-repo:docs/guide.md",
+          "my-repo:docs/internal-extra/guide.md",
+          "other-repo:handbook/guide.md",
+        ],
+      },
+      {
+        name: "empty per-repository includes override legacy defaults with the root",
+        filters: [
+          {
+            repository: "test-org/my-repo",
+            includePaths: [],
+            excludePaths: [],
+          },
+        ],
+        expected: [
+          "my-repo:README.md",
+          "my-repo:docs/guide.md",
+          "my-repo:docs/internal/guide.md",
+          "my-repo:docs/internal-extra/guide.md",
+          "my-repo:docs-internal/guide.md",
+          "my-repo:handbook/guide.md",
+          "my-repo:handbook/private.md",
+          "other-repo:handbook/guide.md",
+          "other-repo:handbook/private.md",
+        ],
+      },
+      {
+        name: "omitted includes inherit legacy folders and exclusions win",
+        filters: [
+          { repository: "test-org/my-repo", excludePaths: ["handbook"] },
+        ],
+        expected: [
+          "other-repo:handbook/guide.md",
+          "other-repo:handbook/private.md",
+        ],
+      },
+      {
+        name: "qualified names match case-insensitively",
+        filters: [
+          { repository: "TEST-ORG/MY-REPO", includePaths: ["README.md"] },
+        ],
+        expected: [
+          "my-repo:README.md",
+          "other-repo:handbook/guide.md",
+          "other-repo:handbook/private.md",
+        ],
+      },
+      {
+        name: "root exclusion excludes every file even with an overlapping include",
+        filters: [
+          {
+            repository: "test-org/my-repo",
+            includePaths: ["docs"],
+            excludePaths: ["./"],
+          },
+        ],
+        expected: [
+          "other-repo:handbook/guide.md",
+          "other-repo:handbook/private.md",
+        ],
+      },
+    ])("applies repository path filters: $name", async ({
+      filters,
+      expected,
+    }) => {
+      mockGetRef.mockResolvedValue({ data: { object: { sha: "tree" } } });
+      mockGetTree.mockResolvedValue({
+        data: {
+          tree: [
+            "README.md",
+            "docs/guide.md",
+            "docs/internal/guide.md",
+            "docs/internal-extra/guide.md",
+            "docs-internal/guide.md",
+            "handbook/guide.md",
+            "handbook/private.md",
+          ].map((path) => ({ type: "blob", path, sha: path })),
+        },
+      });
+      mockGetContent.mockResolvedValue({
+        data: { content: Buffer.from("content").toString("base64") },
+      });
+
+      const documents = [];
+      for await (const batch of connector.sync({
+        config: {
+          ...validConfig,
+          repos: ["my-repo", "test-org/other-repo"],
+          includeIssues: false,
+          includePullRequests: false,
+          includeRepositoryFiles: true,
+          includePaths: ["handbook"],
+          repositoryOverrides: filters,
+        },
+        credentials,
+        checkpoint: null,
+      })) {
+        documents.push(...batch.documents);
+      }
+      expect(
+        documents.map(
+          (document) =>
+            `${document.metadata.repo}:${document.metadata.filePath}`,
+        ),
+      ).toEqual(expected.map((entry) => `test-org/${entry}`));
+      expect(mockGetContent).toHaveBeenCalledTimes(expected.length);
+    });
+
+    test.each([
+      "organization",
+      "installation",
+      "explicit",
+    ])("applies filters to repositories selected by %s", async (selection) => {
+      mockListForOrg.mockResolvedValue({
+        data: [
+          { name: "my-repo", html_url: "https://github.com/test-org/my-repo" },
+        ],
+      });
+      mockListReposAccessibleToInstallation.mockResolvedValue({
+        data: {
+          repositories: [
+            {
+              name: "my-repo",
+              owner: { login: "outside" },
+              html_url: "https://github.com/outside/my-repo",
+            },
+            {
+              name: "my-repo",
+              owner: { login: "test-org" },
+              html_url: "https://github.com/test-org/my-repo",
+            },
+          ],
+        },
+      });
+      if (selection === "installation") {
+        vi.stubGlobal(
+          "fetch",
+          vi.fn().mockResolvedValue({
+            ok: true,
+            json: async () => ({
+              token: "fixture-installation-token",
+              expires_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+            }),
+          }),
+        );
+      }
+      mockGetRef.mockResolvedValue({ data: { object: { sha: "tree" } } });
+      mockGetTree.mockResolvedValue({
+        data: {
+          tree: [
+            { type: "blob", path: "docs/guide.md", sha: "docs" },
+            { type: "blob", path: "handbook/guide.md", sha: "handbook" },
+          ],
+        },
+      });
+      mockGetContent.mockResolvedValue({
+        data: { content: Buffer.from("content").toString("base64") },
+      });
+      const documents = [];
+      for await (const batch of connector.sync({
+        config: {
+          ...validConfig,
+          repos: selection === "explicit" ? ["outside/my-repo", "my-repo"] : [],
+          ...(selection === "installation"
+            ? {
+                authMethod: "github_app",
+                githubAppConfigId: "00000000-0000-4000-8000-000000000005",
+              }
+            : {}),
+          includeIssues: false,
+          includePullRequests: false,
+          includeRepositoryFiles: true,
+          includePaths: ["handbook"],
+          repositoryOverrides: [
+            { repository: "test-org/my-repo", includePaths: ["docs"] },
+          ],
+        },
+        credentials:
+          selection === "installation"
+            ? {
+                apiToken: appPrivateKey,
+                githubApp: {
+                  githubUrl: "https://api.github.com",
+                  appId: "12345",
+                  installationId: "fixture-path-filters",
+                },
+              }
+            : credentials,
+        checkpoint: null,
+      }))
+        documents.push(...batch.documents);
+      expect(
+        documents.map(
+          (document) =>
+            `${document.metadata.repo}:${document.metadata.filePath}`,
+        ),
+      ).toEqual(
+        selection === "organization"
+          ? ["test-org/my-repo:docs/guide.md"]
+          : [
+              "outside/my-repo:handbook/guide.md",
+              "test-org/my-repo:docs/guide.md",
+            ],
+      );
+    });
+
+    test("treats a root-only folder list as the whole repository", async () => {
+      mockListForRepo.mockResolvedValueOnce({ data: [] });
+      mockListForRepo.mockResolvedValueOnce({ data: [] });
+
+      mockGetRef.mockResolvedValueOnce({
+        data: { object: { sha: "abc123" } },
+      });
+
+      mockGetTree.mockResolvedValueOnce({
+        data: {
+          tree: [
+            { type: "blob", path: "README.md", sha: "sha1" },
+            { type: "blob", path: "docs/guide.md", sha: "sha2" },
+          ],
+        },
+      });
+
+      mockGetContent
+        .mockResolvedValueOnce({
+          data: { content: Buffer.from("readme").toString("base64") },
+        })
+        .mockResolvedValueOnce({
+          data: { content: Buffer.from("guide").toString("base64") },
+        });
+
+      const batches: ConnectorSyncBatch[] = [];
+      for await (const batch of connector.sync({
+        config: {
+          ...validConfig,
+          includeRepositoryFiles: true,
+          includePaths: ["/", "", " ", ".", "./"],
+        },
+        credentials,
+        checkpoint: null,
+      })) {
+        batches.push(batch);
+      }
+
+      const fileDocs = batches
+        .flatMap((b) => b.documents)
+        .filter((d) => d.metadata.kind === "repository_file");
+
+      expect(fileDocs.map((d) => d.metadata.filePath)).toEqual([
+        "README.md",
+        "docs/guide.md",
+      ]);
+    });
+
+    test("uses configured file types for repository file indexing", async () => {
+      mockListForRepo.mockResolvedValueOnce({ data: [] });
+      mockListForRepo.mockResolvedValueOnce({ data: [] });
+      mockGetRef.mockResolvedValueOnce({
+        data: { object: { sha: "abc123" } },
+      });
+      mockGetTree.mockResolvedValueOnce({
+        data: {
+          tree: [
+            { type: "blob", path: "src/index.ts", sha: "sha1" },
+            { type: "blob", path: "README.md", sha: "sha2" },
+          ],
+        },
+      });
+      mockGetContent.mockResolvedValueOnce({
+        data: {
+          content: Buffer.from("export const value = 1;").toString("base64"),
+        },
+      });
+
+      const batches: ConnectorSyncBatch[] = [];
+      for await (const batch of connector.sync({
+        config: {
+          ...validConfig,
+          includeRepositoryFiles: true,
+          fileTypes: [".ts"],
+        },
+        credentials,
+        checkpoint: null,
+      })) {
+        batches.push(batch);
+      }
+
+      const repoDocs = batches
+        .flatMap((b) => b.documents)
+        .filter((d) => d.metadata.kind === "repository_file");
+
+      expect(repoDocs).toHaveLength(1);
+      expect(repoDocs[0].id).toBe("my-repo#file:src/index.ts");
+      expect(repoDocs[0].metadata.kind).toBe("repository_file");
+      expect(repoDocs[0].metadata.fileKind).toBe("repository_file");
+      expect(mockGetContent).toHaveBeenCalledWith(
+        expect.objectContaining({ path: "src/index.ts" }),
+      );
+    });
+
+    test("does not fetch repository files when includeRepositoryFiles is not set", async () => {
       mockListForRepo.mockResolvedValueOnce({ data: [] });
       mockListForRepo.mockResolvedValueOnce({ data: [] });
 
@@ -767,7 +1774,7 @@ describe("GithubConnector", () => {
 
       const batches: ConnectorSyncBatch[] = [];
       for await (const batch of connector.sync({
-        config: { ...validConfig, includeMarkdownFiles: true },
+        config: { ...validConfig, includeRepositoryFiles: true },
         credentials,
         checkpoint: null,
       })) {
@@ -782,7 +1789,7 @@ describe("GithubConnector", () => {
 
       const mdDocs = batches
         .flatMap((b) => b.documents)
-        .filter((d) => d.metadata.kind === "markdown_file");
+        .filter((d) => d.metadata.kind === "repository_file");
       expect(mdDocs).toHaveLength(1);
       expect(mdDocs[0].sourceUrl).toContain("/blob/develop/README.md");
     });
@@ -818,7 +1825,7 @@ describe("GithubConnector", () => {
 
       const batches: ConnectorSyncBatch[] = [];
       for await (const batch of connector.sync({
-        config: { ...validConfig, includeMarkdownFiles: true },
+        config: { ...validConfig, includeRepositoryFiles: true },
         credentials,
         checkpoint: null,
       })) {
@@ -841,7 +1848,7 @@ describe("GithubConnector", () => {
 
       const mdDocs = batches
         .flatMap((b) => b.documents)
-        .filter((d) => d.metadata.kind === "markdown_file");
+        .filter((d) => d.metadata.kind === "repository_file");
       expect(mdDocs).toHaveLength(1);
       expect(mdDocs[0].sourceUrl).toContain("/blob/develop/README.md");
     });
@@ -873,7 +1880,7 @@ describe("GithubConnector", () => {
 
       const batches: ConnectorSyncBatch[] = [];
       for await (const batch of connector.sync({
-        config: { ...validConfig, includeMarkdownFiles: true },
+        config: { ...validConfig, includeRepositoryFiles: true },
         credentials,
         checkpoint: null,
       })) {
@@ -881,13 +1888,472 @@ describe("GithubConnector", () => {
       }
 
       const mdBatch = batches.find((b) =>
-        b.documents.some((d) => d.metadata.kind === "markdown_file"),
+        b.documents.some((d) => d.metadata.kind === "repository_file"),
       );
       expect(mdBatch).toBeDefined();
       expect(mdBatch?.documents).toHaveLength(1);
       expect(mdBatch?.documents[0].content).toBe("# B file");
       expect(mdBatch?.failures).toHaveLength(1);
       expect(mdBatch?.failures?.[0].itemId).toBe("a.md");
+    });
+  });
+
+  describe("repository file source URLs", () => {
+    async function syncReadmeSourceUrl(
+      config: Record<string, unknown>,
+    ): Promise<string | undefined> {
+      mockListForRepo.mockResolvedValue({ data: [] });
+      mockGetRef.mockResolvedValueOnce({
+        data: { object: { sha: "abc123" } },
+      });
+      mockGetTree.mockResolvedValueOnce({
+        data: { tree: [{ type: "blob", path: "README.md", sha: "sha1" }] },
+      });
+      mockGetContent.mockResolvedValueOnce({
+        data: { content: Buffer.from("# Hello").toString("base64") },
+      });
+
+      const documents = [];
+      for await (const batch of connector.sync({
+        config: { ...config, includeRepositoryFiles: true },
+        credentials,
+        checkpoint: null,
+      })) {
+        documents.push(...batch.documents);
+      }
+      return documents.find((d) => d.metadata.kind === "repository_file")
+        ?.sourceUrl;
+    }
+
+    test("links to the repository's web page reported by GitHub", async () => {
+      mockReposGet.mockResolvedValue({
+        data: {
+          default_branch: "main",
+          html_url: "https://github.com/test-org/my-repo",
+        },
+      });
+
+      await expect(syncReadmeSourceUrl(validConfig)).resolves.toBe(
+        "https://github.com/test-org/my-repo/blob/main/README.md",
+      );
+    });
+
+    test("links to github.com, not the API host, when repo metadata is unavailable", async () => {
+      mockReposGet.mockReset();
+      mockReposGet.mockRejectedValue(new Error("Not found"));
+
+      await expect(syncReadmeSourceUrl(validConfig)).resolves.toBe(
+        "https://github.com/test-org/my-repo/blob/main/README.md",
+      );
+    });
+
+    test("links to the GitHub Enterprise web host when repo metadata is unavailable", async () => {
+      mockReposGet.mockReset();
+      mockReposGet.mockRejectedValue(new Error("Not found"));
+
+      await expect(
+        syncReadmeSourceUrl({
+          ...validConfig,
+          githubUrl: "https://ghe.example.com/api/v3",
+        }),
+      ).resolves.toBe(
+        "https://ghe.example.com/test-org/my-repo/blob/main/README.md",
+      );
+    });
+  });
+
+  describe("large repository files", () => {
+    async function syncFiles(
+      tree: Array<{ path: string; sha: string; size: number }>,
+    ): Promise<ConnectorSyncBatch[]> {
+      mockListForRepo.mockResolvedValue({ data: [] });
+      mockGetRef.mockResolvedValueOnce({
+        data: { object: { sha: "abc123" } },
+      });
+      mockGetTree.mockResolvedValueOnce({
+        data: { tree: tree.map((file) => ({ type: "blob", ...file })) },
+      });
+
+      const batches: ConnectorSyncBatch[] = [];
+      for await (const batch of connector.sync({
+        config: { ...validConfig, includeRepositoryFiles: true },
+        credentials,
+        checkpoint: null,
+      })) {
+        batches.push(batch);
+      }
+      return batches;
+    }
+
+    test("indexes a file larger than the Contents API's 1 MiB inline limit", async () => {
+      const largeContent = `# Big\n${"x".repeat(2 * 1024 * 1024)}`;
+      // What GitHub returns for a 1-100 MB file: metadata, but no content.
+      mockGetContent.mockResolvedValue({
+        data: { type: "file", encoding: "none", content: "" },
+      });
+      mockGetBlob.mockResolvedValue({
+        data: {
+          encoding: "base64",
+          content: Buffer.from(largeContent).toString("base64"),
+        },
+      });
+
+      const batches = await syncFiles([
+        { path: "docs/big.md", sha: "big-sha", size: largeContent.length },
+      ]);
+
+      const fileDocs = batches
+        .flatMap((b) => b.documents)
+        .filter((d) => d.metadata.kind === "repository_file");
+      expect(fileDocs).toHaveLength(1);
+      expect(fileDocs[0].content).toBe(largeContent);
+      expect(batches.flatMap((b) => b.failures ?? [])).toEqual([]);
+    });
+
+    test("skips a file over the size limit without failing the run", async () => {
+      mockGetContent.mockResolvedValue({
+        data: { content: Buffer.from("# Small").toString("base64") },
+      });
+
+      const batches = await syncFiles([
+        { path: "data/dump.md", sha: "dump-sha", size: 50 * 1024 * 1024 },
+        { path: "README.md", sha: "readme-sha", size: 7 },
+      ]);
+
+      const fileDocs = batches
+        .flatMap((b) => b.documents)
+        .filter((d) => d.metadata.kind === "repository_file");
+      expect(fileDocs.map((d) => d.metadata.filePath)).toEqual(["README.md"]);
+      expect(batches.flatMap((b) => b.failures ?? [])).toEqual([]);
+      expect(batches.flatMap((b) => b.skipped ?? [])).toEqual([
+        expect.objectContaining({
+          itemId: "data/dump.md",
+          sourceId: "my-repo#file:data/dump.md",
+        }),
+      ]);
+      expect(mockGetContent).not.toHaveBeenCalledWith(
+        expect.objectContaining({ path: "data/dump.md" }),
+      );
+      expect(mockGetBlob).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("repository file types", () => {
+    async function syncWithFileTypes(params: {
+      fileTypes: string[];
+      files: Record<string, string>;
+    }): Promise<ConnectorSyncBatch[]> {
+      mockListForRepo.mockResolvedValue({ data: [] });
+      mockGetRef.mockResolvedValueOnce({
+        data: { object: { sha: "abc123" } },
+      });
+      mockGetTree.mockResolvedValueOnce({
+        data: {
+          tree: Object.keys(params.files).map((path, index) => ({
+            type: "blob",
+            path,
+            sha: `sha${index}`,
+          })),
+        },
+      });
+      mockGetContent.mockImplementation(async ({ path }: { path: string }) => ({
+        data: {
+          content: Buffer.from(params.files[path], "binary").toString("base64"),
+        },
+      }));
+
+      const batches: ConnectorSyncBatch[] = [];
+      for await (const batch of connector.sync({
+        config: {
+          ...validConfig,
+          includeRepositoryFiles: true,
+          fileTypes: params.fileTypes,
+        },
+        credentials,
+        checkpoint: null,
+      })) {
+        batches.push(batch);
+      }
+      return batches;
+    }
+
+    function indexedPaths(batches: ConnectorSyncBatch[]): unknown[] {
+      return batches
+        .flatMap((b) => b.documents)
+        .filter((d) => d.metadata.kind === "repository_file")
+        .map((d) => d.metadata.filePath);
+    }
+
+    test("stored unsupported filters still sync but warn only when repository files exist", async () => {
+      const messages: string[] = [];
+      connector.setLogger(
+        pino(
+          { level: "warn" },
+          {
+            write: (line) => {
+              messages.push(JSON.parse(line).msg);
+            },
+          },
+        ),
+      );
+      const batches = await syncWithFileTypes({
+        fileTypes: ["docs/*.md"],
+        files: { "README.md": "# Readme" },
+      });
+      expect(indexedPaths(batches)).toEqual([]);
+      expect(messages).toEqual([
+        expect.stringContaining("none match File Types"),
+      ]);
+      messages.length = 0;
+      await syncWithFileTypes({ fileTypes: [".md"], files: {} });
+      expect(messages).toEqual([]);
+    });
+
+    test("matches exact file names at the root and in nested folders", async () => {
+      const batches = await syncWithFileTypes({
+        fileTypes: ["Dockerfile", "Makefile"],
+        files: {
+          Dockerfile: "FROM node:22",
+          "services/api/Dockerfile": "FROM node:22",
+          Makefile: "build:",
+          "docs/README.md": "# Docs",
+          "docs/Dockerfile-guide.md": "# Guide",
+        },
+      });
+
+      expect(indexedPaths(batches)).toEqual([
+        "Dockerfile",
+        "services/api/Dockerfile",
+        "Makefile",
+      ]);
+    });
+
+    test("matches dotless, compound, and glob-style extensions", async () => {
+      const batches = await syncWithFileTypes({
+        fileTypes: ["md", ".tm.hcl", "*.yaml"],
+        files: {
+          "README.md": "# Readme",
+          "infra/stack.tm.hcl": "stack {}",
+          "infra/main.hcl": "resource {}",
+          "deploy/app.yaml": "kind: Deployment",
+          "src/index.ts": "export {};",
+        },
+      });
+
+      expect(indexedPaths(batches)).toEqual([
+        "README.md",
+        "infra/stack.tm.hcl",
+        "deploy/app.yaml",
+      ]);
+    });
+
+    test("indexes every text file for *, skipping binaries", async () => {
+      const batches = await syncWithFileTypes({
+        fileTypes: ["*"],
+        files: {
+          "README.md": "# Readme",
+          "src/index.ts": "export {};",
+          Dockerfile: "FROM node:22",
+          "assets/logo.png": "\x89PNG\r\n\x1a\n\x00\x00",
+          "docs/manual.pdf": "%PDF-1.4",
+          "bin/tool": "\x7fELF\x02\x01\x01\x00\x00\x00",
+        },
+      });
+
+      expect(indexedPaths(batches)).toEqual([
+        "README.md",
+        "src/index.ts",
+        "Dockerfile",
+      ]);
+      expect(batches.flatMap((b) => b.failures ?? [])).toEqual([]);
+      expect(batches.flatMap((b) => b.skipped ?? [])).toEqual([
+        expect.objectContaining({
+          itemId: "bin/tool",
+          sourceId: "my-repo#file:bin/tool",
+        }),
+      ]);
+      expect(mockGetContent).not.toHaveBeenCalledWith(
+        expect.objectContaining({ path: "assets/logo.png" }),
+      );
+      expect(mockGetContent).not.toHaveBeenCalledWith(
+        expect.objectContaining({ path: "docs/manual.pdf" }),
+      );
+    });
+  });
+
+  describe("repository PDFs", () => {
+    async function syncPdfs(params: {
+      files: Record<string, Buffer>;
+      /** Tree-reported sizes; a file over 1 MiB is read through the Blobs API. */
+      sizes?: Record<string, number>;
+      fileTypes?: string[];
+    }): Promise<ConnectorSyncBatch[]> {
+      mockListForRepo.mockResolvedValue({ data: [] });
+      mockGetRef.mockResolvedValueOnce({
+        data: { object: { sha: "abc123" } },
+      });
+      const paths = Object.keys(params.files);
+      mockGetTree.mockResolvedValueOnce({
+        data: {
+          tree: paths.map((path) => ({
+            type: "blob",
+            path,
+            sha: `sha:${path}`,
+            size: params.sizes?.[path] ?? params.files[path].length,
+          })),
+        },
+      });
+      mockGetContent.mockImplementation(async ({ path }: { path: string }) => ({
+        data: { content: params.files[path].toString("base64") },
+      }));
+      mockGetBlob.mockImplementation(
+        async ({ file_sha }: { file_sha: string }) => ({
+          data: {
+            encoding: "base64",
+            content:
+              params.files[file_sha.slice("sha:".length)].toString("base64"),
+          },
+        }),
+      );
+
+      const batches: ConnectorSyncBatch[] = [];
+      for await (const batch of connector.sync({
+        config: {
+          ...validConfig,
+          includeRepositoryFiles: true,
+          fileTypes: params.fileTypes ?? [".md", ".pdf"],
+        },
+        credentials,
+        checkpoint: null,
+      })) {
+        batches.push(batch);
+      }
+      return batches;
+    }
+
+    function fileDocs(batches: ConnectorSyncBatch[]) {
+      return batches
+        .flatMap((b) => b.documents)
+        .filter((d) => d.metadata.kind === "repository_file");
+    }
+
+    test("indexes the extracted text of a selected PDF, not its raw bytes", async () => {
+      const batches = await syncPdfs({
+        files: {
+          "README.md": Buffer.from("# Readme"),
+          "docs/Runbook.PDF": makeTestPdf([
+            "Rotate the signing key every 90 days.",
+            "Page the on-call engineer for a failed rotation.",
+          ]),
+        },
+      });
+
+      const docs = fileDocs(batches);
+      expect(docs.map((d) => d.metadata.filePath)).toEqual([
+        "README.md",
+        "docs/Runbook.PDF",
+      ]);
+      const pdfDoc = docs[1];
+      expect(pdfDoc.content).toContain("Rotate the signing key every 90 days.");
+      expect(pdfDoc.content).toContain(
+        "Page the on-call engineer for a failed rotation.",
+      );
+      expect(pdfDoc.content).not.toContain("%PDF");
+      expect(pdfDoc.title).toBe("Runbook.PDF (test-org/my-repo)");
+      expect(pdfDoc.sourceUrl).toBe(
+        "https://github.com/test-org/my-repo/blob/main/docs/Runbook.PDF",
+      );
+      expect(batches.flatMap((b) => b.failures ?? [])).toEqual([]);
+      expect(batches.flatMap((b) => b.skipped ?? [])).toEqual([]);
+    });
+
+    test("extracts a PDF read through the Blobs API past the 1 MiB inline limit", async () => {
+      const pdf = makeTestPdf(["Quarterly architecture review notes."]);
+      const batches = await syncPdfs({
+        files: { "reviews/q3.pdf": pdf },
+        sizes: { "reviews/q3.pdf": 2 * 1024 * 1024 },
+      });
+
+      expect(mockGetContent).not.toHaveBeenCalled();
+      expect(mockGetBlob).toHaveBeenCalledWith(
+        expect.objectContaining({ file_sha: "sha:reviews/q3.pdf" }),
+      );
+      const docs = fileDocs(batches);
+      expect(docs).toHaveLength(1);
+      expect(docs[0].content).toContain("Quarterly architecture review notes.");
+      expect(docs[0].content).not.toContain("%PDF");
+    });
+
+    test("skips scanned and unreadable PDFs with the reason, without failing the run", async () => {
+      const batches = await syncPdfs({
+        files: {
+          "scans/contract.pdf": makeTestPdf([null, null]),
+          "broken.pdf": Buffer.from("not a pdf at all"),
+          "README.md": Buffer.from("# Readme"),
+        },
+      });
+
+      expect(fileDocs(batches).map((d) => d.metadata.filePath)).toEqual([
+        "README.md",
+      ]);
+      expect(batches.flatMap((b) => b.failures ?? [])).toEqual([]);
+      expect(batches.flatMap((b) => b.skipped ?? [])).toEqual([
+        expect.objectContaining({
+          itemId: "scans/contract.pdf",
+          sourceId: "my-repo#file:scans/contract.pdf",
+          category: "no_extractable_text",
+          reason: expect.stringContaining(
+            "PDF has 2 page(s) but no extractable text layer",
+          ),
+        }),
+        expect.objectContaining({
+          itemId: "broken.pdf",
+          sourceId: "my-repo#file:broken.pdf",
+          category: "no_extractable_text",
+          reason: expect.stringContaining("PDF could not be parsed"),
+        }),
+      ]);
+    });
+
+    test("transcribes scanned pages when the run has OCR configured", async () => {
+      const model = new MockLanguageModelV3({
+        doGenerate: async () => ({
+          content: [
+            { type: "text" as const, text: "Scanned policy: badge required." },
+          ],
+          finishReason: { unified: "stop" as const, raw: "stop" },
+          usage: {
+            inputTokens: {
+              total: 10,
+              noCache: 10,
+              cacheRead: 0,
+              cacheWrite: 0,
+            },
+            outputTokens: { total: 6, text: 6, reasoning: 0 },
+          },
+          warnings: [],
+        }),
+      });
+      connector.setOcrContext({
+        config: {
+          modelName: "mock-vision",
+          provider: "anthropic",
+          llmModel: model as never,
+          maxOutputTokens: 16_384,
+        },
+        connectorId: null,
+        deadlineAt: Date.now() + 60_000,
+        budget: { remainingPages: 10 },
+      });
+
+      const batches = await syncPdfs({
+        files: { "policies/access.pdf": makeTestPdf([null]) },
+      });
+
+      const docs = fileDocs(batches);
+      expect(docs).toHaveLength(1);
+      expect(docs[0].content).toContain("Scanned policy: badge required.");
+      expect(batches.flatMap((b) => b.skipped ?? [])).toEqual([]);
     });
   });
 
@@ -906,6 +2372,327 @@ describe("GithubConnector", () => {
         owner: "test-org",
       });
       expect(result).toEqual({ valid: true });
+    });
+  });
+
+  describe("permission sync", () => {
+    async function collect<T>(gen: AsyncGenerator<T>): Promise<T[]> {
+      const out: T[] = [];
+      for await (const item of gen) out.push(item);
+      return out;
+    }
+
+    // Pins the metadata-field contract with content-sync: documents are
+    // written with `repo` = `<owner>/<name>` (matching the container key), and
+    // the delta pass's local-adoption scoping depends on exactly that field.
+    test("scopeKeyForDocument maps content-sync document metadata to the repo scope key", () => {
+      expect(
+        connector.scopeKeyForDocument({ repo: "o/r", filePath: "a.md" }),
+      ).toBe("repo:o/r");
+      expect(connector.scopeKeyForDocument({})).toBeNull();
+      expect(connector.scopeKeyForDocument({ repo: "" })).toBeNull();
+    });
+
+    test("syncPermissionSnapshot yields the repo container then every repo doc's assignment", async () => {
+      mockReposGet.mockResolvedValue({
+        data: { default_branch: "main", private: true },
+      });
+      mockListCollaborators.mockResolvedValue({ data: [{ login: "alice" }] });
+      mockReposListTeams.mockResolvedValue({ data: [{ slug: "eng" }] });
+      mockGetByUsername.mockImplementation(
+        async ({ username }: { username: string }) => ({
+          data: { email: `${username}@example.com` },
+        }),
+      );
+
+      const readIngestedDocuments = vi.fn().mockResolvedValue({
+        documents: [
+          { sourceId: "my-repo#1", metadata: { repo: "test-org/my-repo" } },
+          {
+            sourceId: "my-repo#file:README.md",
+            metadata: { repo: "test-org/my-repo" },
+          },
+        ],
+        nextAfterId: null,
+      });
+
+      const yields = await collect(
+        connector.syncPermissionSnapshot?.({
+          config: validConfig,
+          credentials,
+          cursor: null,
+          readIngestedDocuments,
+        }) ?? (async function* () {})(),
+      );
+
+      expect(readIngestedDocuments).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadataFilter: { repo: "test-org/my-repo" },
+        }),
+      );
+      expect(yields).toEqual([
+        {
+          kind: "container",
+          containerKey: "repo:test-org/my-repo",
+          cursor: "repo:test-org/my-repo",
+          permissions: {
+            isPublic: false,
+            users: ["alice@example.com"],
+            groups: ["test-org/eng"],
+          },
+          audienceResolutionFailed: false,
+        },
+        {
+          kind: "document",
+          sourceId: "my-repo#1",
+          containerKey: "repo:test-org/my-repo",
+          cursor: "repo:test-org/my-repo",
+        },
+        {
+          kind: "document",
+          sourceId: "my-repo#file:README.md",
+          containerKey: "repo:test-org/my-repo",
+          cursor: "repo:test-org/my-repo",
+        },
+      ]);
+    });
+
+    test("a mapped collaborator materializes via the injected mapping — even with a private GitHub email", async () => {
+      mockReposGet.mockResolvedValue({
+        data: { default_branch: "main", private: true },
+      });
+      mockListCollaborators.mockResolvedValue({
+        data: [{ login: "hidden" }, { login: "alice" }],
+      });
+      mockReposListTeams.mockResolvedValue({ data: [] });
+      // `hidden` keeps their email private; `alice` is public. The mapping
+      // must take precedence for `hidden` (and only `hidden`).
+      mockGetByUsername.mockImplementation(
+        async ({ username }: { username: string }) => ({
+          data: {
+            email: username === "alice" ? "alice@example.com" : null,
+          },
+        }),
+      );
+
+      const yields = await collect(
+        connector.syncPermissionSnapshot?.({
+          config: validConfig,
+          credentials,
+          cursor: null,
+          readIngestedDocuments: vi
+            .fn()
+            .mockResolvedValue({ documents: [], nextAfterId: null }),
+          resolveMappedEmail: (accountId) =>
+            accountId === "hidden" ? "mapped@example.com" : null,
+        }) ?? (async function* () {})(),
+      );
+
+      expect(yields[0]).toMatchObject({
+        kind: "container",
+        permissions: {
+          isPublic: false,
+          users: ["mapped@example.com", "alice@example.com"],
+        },
+      });
+    });
+
+    test("a mapped collaborator with a public email materializes the upstream email — auto matching wins", async () => {
+      mockReposGet.mockResolvedValue({
+        data: { default_branch: "main", private: true },
+      });
+      mockListCollaborators.mockResolvedValue({ data: [{ login: "alice" }] });
+      mockReposListTeams.mockResolvedValue({ data: [] });
+      mockGetByUsername.mockResolvedValue({
+        data: { email: "alice@example.com" },
+      });
+
+      const yields = await collect(
+        connector.syncPermissionSnapshot?.({
+          config: validConfig,
+          credentials,
+          cursor: null,
+          readIngestedDocuments: vi
+            .fn()
+            .mockResolvedValue({ documents: [], nextAfterId: null }),
+          // A stale admin mapping must NOT displace the source's identity.
+          resolveMappedEmail: () => "someone-else@example.com",
+        }) ?? (async function* () {})(),
+      );
+
+      expect(yields[0]).toMatchObject({
+        kind: "container",
+        permissions: { isPublic: false, users: ["alice@example.com"] },
+      });
+    });
+
+    test("a public repo's container is isPublic and drops collaborators without a public email", async () => {
+      mockReposGet.mockResolvedValue({
+        data: { default_branch: "main", private: false },
+      });
+      mockListCollaborators.mockResolvedValue({ data: [{ login: "carol" }] });
+      mockReposListTeams.mockResolvedValue({ data: [] });
+      mockGetByUsername.mockResolvedValue({ data: { email: null } });
+
+      const readIngestedDocuments = vi.fn().mockResolvedValue({
+        documents: [{ sourceId: "my-repo#1", metadata: {} }],
+        nextAfterId: null,
+      });
+
+      const yields = await collect(
+        connector.syncPermissionSnapshot?.({
+          config: validConfig,
+          credentials,
+          cursor: null,
+          readIngestedDocuments,
+        }) ?? (async function* () {})(),
+      );
+
+      expect(yields).toEqual([
+        {
+          kind: "container",
+          containerKey: "repo:test-org/my-repo",
+          cursor: "repo:test-org/my-repo",
+          permissions: { isPublic: true, users: [], groups: [] },
+          audienceResolutionFailed: false,
+        },
+        {
+          kind: "document",
+          sourceId: "my-repo#1",
+          containerKey: "repo:test-org/my-repo",
+          cursor: "repo:test-org/my-repo",
+        },
+      ]);
+    });
+
+    test("a failing repo metadata fetch fail-closes the repo instead of failing the pass", async () => {
+      // Regression: a transient 429/5xx on repos.get propagated up and failed
+      // the whole snapshot, unlike Jira/Confluence which fail-close the one
+      // container and keep enumerating.
+      mockReposGet.mockRejectedValue(new Error("boom (503)"));
+
+      const readIngestedDocuments = vi.fn().mockResolvedValue({
+        documents: [{ sourceId: "my-repo#1", metadata: {} }],
+        nextAfterId: null,
+      });
+
+      const yields = await collect(
+        connector.syncPermissionSnapshot?.({
+          config: validConfig,
+          credentials,
+          cursor: null,
+          readIngestedDocuments,
+        }) ?? (async function* () {})(),
+      );
+
+      expect(yields).toEqual([
+        {
+          kind: "container",
+          containerKey: "repo:test-org/my-repo",
+          cursor: "repo:test-org/my-repo",
+          permissions: { isPublic: false, users: [], groups: [] },
+          // The empty audience here means "we could not read it", not "nobody
+          // has access" — the pass counts it so the repo going dark is
+          // attributable instead of looking like an ordinary empty audience.
+          audienceResolutionFailed: true,
+        },
+        {
+          kind: "document",
+          sourceId: "my-repo#1",
+          containerKey: "repo:test-org/my-repo",
+          cursor: "repo:test-org/my-repo",
+        },
+      ]);
+    });
+
+    test("syncGroups expands org teams to members (email null when private)", async () => {
+      mockReposGet.mockResolvedValue({
+        data: { default_branch: "main" },
+      });
+      mockTeamsList.mockResolvedValue({ data: [{ slug: "eng" }] });
+      mockListMembersInOrg.mockResolvedValue({
+        data: [{ login: "alice" }, { login: "bob" }],
+      });
+      mockGetByUsername.mockImplementation(
+        async ({ username }: { username: string }) => ({
+          data: {
+            email: username === "alice" ? "alice@example.com" : null,
+          },
+        }),
+      );
+
+      const yields = await collect(
+        connector.syncGroups?.({
+          config: validConfig,
+          credentials,
+          cursor: null,
+          readIngestedDocuments: vi.fn(),
+        }) ?? (async function* () {})(),
+      );
+
+      expect(yields).toEqual([
+        {
+          groupId: "test-org/eng",
+          members: [
+            {
+              accountId: "alice",
+              displayName: null,
+              email: "alice@example.com",
+            },
+            // bob's email is private — recorded fail-closed, not dropped.
+            { accountId: "bob", displayName: null, email: null },
+          ],
+          cursor: "test-org/eng",
+        },
+      ]);
+    });
+
+    test("a full pass bypasses the cached negative and sees a newly public email", async () => {
+      mockReposGet.mockResolvedValue({ data: { default_branch: "main" } });
+      mockTeamsList.mockResolvedValue({ data: [{ slug: "eng" }] });
+      mockListMembersInOrg.mockResolvedValue({ data: [{ login: "bob" }] });
+
+      // Pass 1: bob's email is private — the cross-pass cache stores the
+      // negative.
+      mockGetByUsername.mockResolvedValue({ data: { email: null } });
+      await collect(
+        connector.syncGroups?.({
+          config: validConfig,
+          credentials,
+          cursor: null,
+          readIngestedDocuments: vi.fn(),
+        }) ?? (async function* () {})(),
+      );
+
+      // bob makes the email public upstream.
+      mockGetByUsername.mockResolvedValue({
+        data: { email: "bob@example.com" },
+      });
+
+      // A delta pass serves the cached negative (fresh instance drops the
+      // per-pass cache; the cross-pass one persists).
+      const deltaYields = await collect(
+        new GithubConnector().syncGroups?.({
+          config: validConfig,
+          credentials,
+          cursor: null,
+          readIngestedDocuments: vi.fn(),
+        }) ?? (async function* () {})(),
+      );
+      expect(deltaYields[0].members[0].email).toBeNull();
+
+      // A full pass must re-resolve live — an admin's manual sync has to
+      // observe the change immediately, not after the cache TTL.
+      const fullYields = await collect(
+        new GithubConnector().syncGroups?.({
+          config: validConfig,
+          credentials,
+          cursor: null,
+          readIngestedDocuments: vi.fn(),
+          refreshIdentities: true,
+        }) ?? (async function* () {})(),
+      );
+      expect(fullYields[0].members[0].email).toBe("bob@example.com");
     });
   });
 });

@@ -1,17 +1,47 @@
 import {
+  AgentRuntimeTierSettingsSchema,
+  BM25_B_MAX,
+  BM25_B_MIN,
+  BM25_K1_MAX,
+  BM25_K1_MIN,
+  ContextualRetrievalModeSchema,
   EmbeddingDimensionsSchema,
+  KnowledgeConnectorOverridesSchema,
+  MessagingChannelOverridesSchema,
+  ModelProviderOverridesSchema,
   OAUTH_ACCESS_TOKEN_MAX_LIFETIME_SECONDS,
   OAUTH_ACCESS_TOKEN_MIN_LIFETIME_SECONDS,
   OrganizationCustomFontSchema,
   OrganizationThemeSchema,
+  PopularAgentOverridesSchema,
+  RoleAssignmentSchema,
+  SESSION_MAX_AGE_MAX_SECONDS,
+  SESSION_MAX_AGE_MIN_SECONDS,
+  StoredAgentRuntimeTierSettingsSchema,
+  StoredKnowledgeConnectorOverridesSchema,
+  StoredMessagingChannelOverridesSchema,
+  StoredModelProviderOverridesSchema,
+  StoredPopularAgentOverridesSchema,
   SupportedProvidersSchema,
-} from "@shared";
+} from "@archestra/shared";
 import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 import { z } from "zod";
-import { schema } from "@/database";
+import { schema } from "@/database/schema";
+import { sanitizeSvg } from "@/utils/sanitize-svg";
+import { ConnectionSetupClientIdSchema } from "./connection-setup";
+import {
+  KubernetesNamespaceSchema,
+  NetworkPolicyInputSchema,
+  NetworkPolicySchema,
+  TrustedImageRegistriesSchema,
+  ValidationRegexSchema,
+} from "./environment";
+import { LimitCleanupIntervalSchema } from "./limit";
+import { RetiredSharingUpdateFieldSchema } from "./visibility";
 
 const DATA_URI_PREFIX = "data:image/png;base64,";
 const GIF_DATA_URI_PREFIX = "data:image/gif;base64,";
+const SVG_DATA_URI_PREFIX = "data:image/svg+xml;base64,";
 const MAX_LOGO_SIZE_BYTES = 2 * 1024 * 1024; // 2 MB decoded
 const PNG_MAGIC_BYTES = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 // "GIF87a" or "GIF89a"
@@ -72,6 +102,72 @@ const Base64PngSchema = z
         message: "Logo must contain valid PNG image data",
       });
     }
+  });
+
+/**
+ * Validates a Base64-encoded PNG or SVG data URI. SVGs are sanitized (script
+ * tags, event handlers, foreignObject, and javascript: URLs are stripped) and
+ * re-encoded; the returned value is the cleaned data URI.
+ */
+const Base64LogoSchema = z
+  .string()
+  .nullable()
+  .transform((val, ctx) => {
+    if (val === null) return val;
+
+    const isPng = val.startsWith(DATA_URI_PREFIX);
+    const isSvg = val.startsWith(SVG_DATA_URI_PREFIX);
+    if (!isPng && !isSvg) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Logo must be a PNG or SVG image in data URI format",
+      });
+      return z.NEVER;
+    }
+
+    const prefix = isPng ? DATA_URI_PREFIX : SVG_DATA_URI_PREFIX;
+    const base64Payload = val.slice(prefix.length);
+    const decoded = Buffer.from(base64Payload, "base64");
+    if (decoded.toString("base64") !== base64Payload) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Logo contains invalid Base64 encoding",
+      });
+      return z.NEVER;
+    }
+    if (decoded.length > MAX_LOGO_SIZE_BYTES) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Logo must be less than 2MB",
+      });
+      return z.NEVER;
+    }
+
+    if (isPng) {
+      if (
+        decoded.length < PNG_MAGIC_BYTES.length ||
+        !PNG_MAGIC_BYTES.every((byte, i) => decoded[i] === byte)
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Logo must contain valid PNG image data",
+        });
+        return z.NEVER;
+      }
+      return val;
+    }
+
+    const svgSource = decoded.toString("utf8");
+    const cleaned = sanitizeSvg(svgSource);
+    if (cleaned === null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Logo must contain valid SVG image data",
+      });
+      return z.NEVER;
+    }
+    const cleanedBase64 = Buffer.from(cleaned, "utf8").toString("base64");
+    return `${SVG_DATA_URI_PREFIX}${cleanedBase64}`;
   });
 
 /**
@@ -171,6 +267,33 @@ export const ConnectionBaseUrlSchema = z.object({
   visible: z.boolean().default(true),
 });
 
+/**
+ * Setup client → the provider API keys mapped to the virtual key a setup
+ * command mints for that client, in the shape virtual keys map them: one key
+ * per provider, or several for providers whose keys are separate endpoints. A
+ * client with no keys falls back to the user's own key resolution.
+ */
+export const ConnectionClientFutureProvidersSchema = z.partialRecord(
+  ConnectionSetupClientIdSchema,
+  z.boolean(),
+);
+export type ConnectionClientFutureProviders = z.infer<
+  typeof ConnectionClientFutureProvidersSchema
+>;
+
+export const ConnectionClientProviderKeysSchema = z.partialRecord(
+  ConnectionSetupClientIdSchema,
+  z.array(
+    z.object({
+      provider: SupportedProvidersSchema,
+      providerApiKeyId: z.string().uuid(),
+    }),
+  ),
+);
+export type ConnectionClientProviderKeys = z.infer<
+  typeof ConnectionClientProviderKeysSchema
+>;
+
 export const OnboardingWizardPageSchema = z.object({
   image: Base64ImageSchema.optional(),
   content: z.string(),
@@ -192,26 +315,19 @@ export const AppearanceSettingsSchema = z.object({
   logoDark: z.string().nullable(),
   favicon: z.string().nullable(),
   iconLogo: z.string().nullable(),
+  iconLogoDark: z.string().nullable(),
   appName: z.string().nullable(),
   ogDescription: z.string().nullable(),
   footerText: z.string().nullable(),
   chatLinks: z.array(OrganizationChatLinkSchema).nullable(),
-  onboardingWizard: OnboardingWizardSchema.nullable(),
+  // No onboardingWizard here: this payload is served pre-auth and fetched on
+  // every page load, and wizard configs can embed large images. Its consumers
+  // (chat, the settings editor) read it from the authed /api/organization.
   chatErrorSupportMessage: z.string().nullable(),
   slimChatErrorUi: z.boolean(),
   animateChatPlaceholders: z.boolean(),
 });
 
-export const OrganizationLimitCleanupIntervalSchema = z
-  .enum(["1h", "12h", "24h", "1w", "1m"])
-  .nullable();
-
-export const OrganizationCompressionScopeSchema = z.enum([
-  "organization",
-  "team",
-]);
-
-export const GlobalToolPolicySchema = z.enum(["permissive", "restrictive"]);
 export const OAuthAccessTokenLifetimeSecondsSchema = z
   .number()
   .int()
@@ -221,16 +337,24 @@ export const OAuthAccessTokenLifetimeSecondsSchema = z
 const extendedFields = {
   theme: OrganizationThemeSchema,
   customFont: OrganizationCustomFontSchema,
-  limitCleanupInterval: OrganizationLimitCleanupIntervalSchema,
-  compressionScope: OrganizationCompressionScopeSchema,
-  globalToolPolicy: GlobalToolPolicySchema,
+  analyticsInstanceId: z.string().uuid(),
+  analyticsInstanceStartedAt: z.date().nullable(),
+  analyticsInstanceLastHeartbeatAt: z.date().nullable(),
   embeddingModel: z.string().nullable(),
   embeddingDimensions: EmbeddingDimensionsSchema.nullable(),
+  kbContextualRetrievalMode: ContextualRetrievalModeSchema.nullable(),
   defaultLlmModel: z.string().nullable(),
   defaultLlmProvider: SupportedProvidersSchema.nullable(),
+  defaultUserLimitValue: z.number().int().positive().nullable(),
+  defaultUserLimitModel: z.array(z.string()).nullable(),
+  defaultUserLimitCleanupInterval: LimitCleanupIntervalSchema.exclude([
+    "minute",
+  ]).nullable(),
+  defaultMemberRole: z.string().nullable(),
   defaultAgentId: z.string().uuid().nullable(),
   favicon: z.string().nullable(),
   iconLogo: z.string().nullable(),
+  iconLogoDark: z.string().nullable(),
   appName: z.string().nullable(),
   ogDescription: z.string().nullable(),
   footerText: z.string().nullable(),
@@ -240,27 +364,121 @@ const extendedFields = {
   slimChatErrorUi: z.boolean(),
   chatPlaceholders: z.array(z.string()).nullable(),
   animateChatPlaceholders: z.boolean(),
-  showTwoFactor: z.boolean(),
+  requireTwoFactor: z.boolean(),
+  sessionMaxAgeSeconds: z.number().int().nullable(),
   oauthAccessTokenLifetimeSeconds: OAuthAccessTokenLifetimeSecondsSchema,
   connectionBaseUrls: z.array(ConnectionBaseUrlSchema).nullable(),
+  connectionClientFutureProviders:
+    ConnectionClientFutureProvidersSchema.nullable(),
+  connectionClientProviderKeys: ConnectionClientProviderKeysSchema.nullable(),
+  // The stored (lenient) shapes: a jsonb value written by an older build must
+  // not 500 the organization read.
+  popularAgentOverrides: StoredPopularAgentOverridesSchema.nullable(),
+  modelProviderOverrides: StoredModelProviderOverridesSchema.nullable(),
+  messagingChannelOverrides: StoredMessagingChannelOverridesSchema.nullable(),
+  knowledgeConnectorOverrides:
+    StoredKnowledgeConnectorOverridesSchema.nullable(),
+  defaultNetworkPolicy: NetworkPolicySchema.nullable(),
+  agentRuntimeTiers: StoredAgentRuntimeTierSettingsSchema.nullable(),
+  defaultEnvironmentTrustedImageRegistries:
+    TrustedImageRegistriesSchema.nullable(),
 };
 
-export const SelectOrganizationSchema = createSelectSchema(
+const InternalSelectOrganizationSchema = createSelectSchema(
   schema.organizationsTable,
   extendedFields,
 );
+export const SelectOrganizationSchema = InternalSelectOrganizationSchema.omit({
+  analyticsInstanceStartedAt: true,
+  analyticsInstanceLastHeartbeatAt: true,
+  // Preset feature removed; columns retained in DB (non-destructive) but no
+  // longer exposed via the API.
+  presetEntityName: true,
+  presetEntityNamePlural: true,
+  presetEntityDefaultLabel: true,
+  presetEntityDefaultValidationRegex: true,
+  // Superseded by connectionClientProviderKeys; retained in DB only.
+  connectionDefaultProviderKeys: true,
+  appsHackathonRecorderEnabled: true,
+});
+const OrganizationDefaultModelRefSchema = z.object({
+  id: z.string().uuid(),
+  provider: SupportedProvidersSchema,
+  displayName: z.string(),
+});
+export type OrganizationDefaultModelRef = z.infer<
+  typeof OrganizationDefaultModelRefSchema
+>;
+
+/**
+ * What "Organization default" runs on, and the auto routers that can be
+ * picked as a model. `model` is the default model, or the default router's
+ * normal tier. `autoRouters` lists those that route: auto routing is on and
+ * their tiers are set.
+ */
+export const OrganizationDefaultModelSchema = z.object({
+  model: OrganizationDefaultModelRefSchema.nullable(),
+  /** The router chats and agents on the organization default run on, when it is one. */
+  defaultAutoRouterId: z.string().uuid().nullable(),
+  autoRouters: z.array(
+    z.object({
+      id: z.string().uuid(),
+      name: z.string(),
+      tiers: z.object({
+        fast: OrganizationDefaultModelRefSchema,
+        normal: OrganizationDefaultModelRefSchema,
+        smart: OrganizationDefaultModelRefSchema,
+      }),
+    }),
+  ),
+});
+export type OrganizationDefaultModel = z.infer<
+  typeof OrganizationDefaultModelSchema
+>;
+
 export const InsertOrganizationSchema = createInsertSchema(
   schema.organizationsTable,
   extendedFields,
-);
+).omit({
+  // Preset feature removed; columns retained in DB (non-destructive) but no
+  // longer accepted by the API, mirroring SelectOrganizationSchema.
+  presetEntityName: true,
+  presetEntityNamePlural: true,
+  presetEntityDefaultLabel: true,
+  presetEntityDefaultValidationRegex: true,
+  connectionDefaultProviderKeys: true,
+  appsHackathonRecorderEnabled: true,
+});
+/**
+ * The white-label app name is not only shown in the UI: it is substituted into
+ * the built-in skills' stored name, description, and body, which are later
+ * served through the skill catalog and read as model context. A free-form
+ * string would therefore let the substitution introduce line breaks, markdown
+ * structure, or imperative text into that context, so the name is held to a
+ * single line of ordinary label characters: it must start with a letter or
+ * digit, and may then contain letters, digits, spaces, and the punctuation that
+ * appears in real product names. Newlines, control characters, and markdown
+ * syntax (`#`, `*`, backticks, brackets, angle brackets, pipes) are rejected.
+ * Clearing the name is done with `null`, not an empty string.
+ */
+const AppNameSchema = z
+  .string()
+  .min(1)
+  .max(100)
+  .regex(
+    /^[\p{L}\p{N}][\p{L}\p{N} .,'’\-&()+:!?_/]*$/u,
+    "App name must be a single line starting with a letter or digit, and may only contain letters, digits, spaces, and the punctuation . , ' - & ( ) + : ! ? _ /",
+  );
+
 export const UpdateAppearanceSettingsSchema = z.object({
   theme: OrganizationThemeSchema.optional(),
   customFont: OrganizationCustomFontSchema.optional(),
-  logo: Base64PngSchema.optional(),
-  logoDark: Base64PngSchema.optional(),
+  logo: Base64LogoSchema.optional(),
+  logoDark: Base64LogoSchema.optional(),
   favicon: Base64PngSchema.optional(),
-  iconLogo: Base64PngSchema.optional(),
-  appName: z.string().max(100).nullable().optional(),
+  iconLogo: Base64LogoSchema.optional(),
+  iconLogoDark: Base64LogoSchema.optional(),
+  appName: AppNameSchema.nullable().optional(),
   ogDescription: z.string().max(500).nullable().optional(),
   footerText: z.string().max(500).nullable().optional(),
   chatLinks: z.array(OrganizationChatLinkSchema).max(3).nullable().optional(),
@@ -272,21 +490,51 @@ export const UpdateAppearanceSettingsSchema = z.object({
 });
 
 export const UpdateSecuritySettingsSchema = z.object({
-  globalToolPolicy: GlobalToolPolicySchema.optional(),
+  playwrightMcpEnabled: z.boolean().optional(),
   allowChatFileUploads: z.boolean().optional(),
+  allowUnauthenticatedLlmProxyRequests: z.boolean().optional(),
+  keepMediaInLogs: z.boolean().optional(),
+  newAppsDisabledByDefault: z.boolean().optional(),
+  newAppsLockedByDefault: z.boolean().optional(),
+  /** @deprecated No longer gates anything; accepted for backwards-compat and ignored. */
+  allowToolAutoAssignment: z.boolean().optional(),
 });
 
-export const UpdateLlmSettingsSchema = z.object({
-  convertToolResultsToToon: z.boolean().optional(),
-  compressionScope: OrganizationCompressionScopeSchema.optional(),
-  limitCleanupInterval: OrganizationLimitCleanupIntervalSchema.optional(),
+export const UpdateMcpSettingsSchema = z.object({
+  onlineMcpCatalogEnabled: z.boolean().optional(),
+  defaultPersonalAgentAccessAllTools: z.boolean().optional(),
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  // Enterprise-gated on the route: scaling idle MCP servers to zero replicas.
+  mcpIdleHibernationEnabled: z.boolean().optional(),
+  // SPDX-SnippetEnd
+});
+
+export const UpdateSkillsSettingsSchema = z.object({
+  onlineSkillCatalogEnabled: z.boolean().optional(),
+  skillMarketplaceAnonymousAccess: z.boolean().optional(),
 });
 
 export const UpdateAgentSettingsSchema = z.object({
-  defaultLlmModel: z.string().nullable().optional(),
-  defaultLlmProvider: SupportedProvidersSchema.nullable().optional(),
+  /**
+   * The organization's Agent Runtime tiers: the whole list with the default
+   * tier, as the settings form saves it; null restores the defaults. A tier
+   * saved with `previousName` renames that tier, and the agents that name it
+   * follow. A tier left out is removed, which is refused while an agent or a
+   * template still names it.
+   */
+  agentRuntimeTiers: AgentRuntimeTierSettingsSchema.nullable().optional(),
+  defaultModelId: z.string().uuid().nullable().optional(),
   defaultLlmApiKeyId: z.string().uuid().nullable().optional(),
   defaultAgentId: z.string().uuid().nullable().optional(),
+  defaultFastModelId: z.string().uuid().nullable().optional(),
+  defaultSmartModelId: z.string().uuid().nullable().optional(),
+  /**
+   * Chats and agents on the organization default run on this auto router.
+   * The default model stays what built-in tasks and forked subagents run on.
+   */
+  defaultAutoRouterId: z.string().uuid().nullable().optional(),
 });
 
 export const UpdateKnowledgeSettingsSchema = z.object({
@@ -294,25 +542,124 @@ export const UpdateKnowledgeSettingsSchema = z.object({
   embeddingChatApiKeyId: z.string().uuid().nullable().optional(),
   rerankerChatApiKeyId: z.string().uuid().nullable().optional(),
   rerankerModel: z.string().nullable().optional(),
+  ocrChatApiKeyId: z.string().uuid().nullable().optional(),
+  ocrModel: z.string().nullable().optional(),
+  // BM25 keyword-ranker tuning. `null` clears the override back to the
+  // deployment default; bounds are shared with the env parser and the UI.
+  kbBm25K1: z
+    .number()
+    .finite()
+    .min(BM25_K1_MIN)
+    .max(BM25_K1_MAX)
+    .nullable()
+    .optional(),
+  kbBm25B: z
+    .number()
+    .finite()
+    .min(BM25_B_MIN)
+    .max(BM25_B_MAX)
+    .nullable()
+    .optional(),
+  kbContextualRetrievalMode:
+    ContextualRetrievalModeSchema.nullable().optional(),
 });
+
+/**
+ * Where BM25 keyword ranking stands for an organization — shown under
+ * Keyword ranking in Knowledge settings.
+ *
+ * BM25 scores from corpus statistics that the `kb_bm25_stats_refresh` task
+ * rebuilds on a schedule; until a language's statistics exist, keyword search
+ * ranks it with PostgreSQL's built-in `ts_rank`. `status` is that fact for
+ * everything the organization can search; the timestamps say when the
+ * statistics were last rebuilt and when they will be next.
+ */
+export const KeywordRankingStatusSchema = z.object({
+  status: z.enum([
+    // Statistics exist for every language with indexed documents.
+    "ready",
+    // Documents are indexed in a language whose statistics are not built
+    // yet — keyword search ranks it with ts_rank until the next refresh.
+    "pending",
+    // Nothing indexed yet; statistics are built on the first refresh after a
+    // sync indexes documents.
+    "no_documents",
+  ]),
+  lastRefreshedAt: z.string().datetime().nullable(),
+  nextRefreshAt: z.string().datetime().nullable(),
+  refreshing: z.boolean(),
+  // Whether the latest finished rebuild failed; false once a later one
+  // succeeds. Deliberately a flag and not the error text: the rebuild is
+  // deployment-wide, so its message can describe another organization's
+  // corpus, and it is a raw database error. The text stays in the task row
+  // and the logs, where operators look.
+  lastRefreshFailed: z.boolean(),
+});
+
+export type KeywordRankingStatus = z.infer<typeof KeywordRankingStatusSchema>;
 
 export const UpdateAuthSettingsSchema = z.object({
   oauthAccessTokenLifetimeSeconds:
     OAuthAccessTokenLifetimeSecondsSchema.optional(),
-  showTwoFactor: z.boolean().optional(),
+  requireTwoFactor: z.boolean().optional(),
+  // Absolute session lifetime cap in seconds; null = no cap.
+  sessionMaxAgeSeconds: z
+    .number()
+    .int()
+    .min(SESSION_MAX_AGE_MIN_SECONDS)
+    .max(SESSION_MAX_AGE_MAX_SECONDS)
+    .nullable()
+    .optional(),
+  // Role slug (predefined or custom) assigned to new self-signup / ChatOps
+  // members. `null` clears it back to the built-in "member" fallback.
+  defaultMemberRole: RoleAssignmentSchema.nullable().optional(),
 });
 
 export const UpdateConnectionSettingsSchema = z.object({
+  connectionPageHidden: z.boolean().optional(),
   connectionDefaultMcpGatewayId: z.string().uuid().nullable().optional(),
-  connectionDefaultLlmProxyId: z.string().uuid().nullable().optional(),
+  connectionClientFutureProviders:
+    ConnectionClientFutureProvidersSchema.nullable().optional(),
+  connectionClientProviderKeys:
+    ConnectionClientProviderKeysSchema.nullable().optional(),
   connectionDefaultClientId: z.string().max(64).nullable().optional(),
+  connectionClientOrder: z
+    .array(z.string().max(64))
+    .refine((ids) => new Set(ids).size === ids.length, "Duplicate client ID")
+    .nullable()
+    .optional(),
   connectionShownClientIds: z
     .array(z.string().max(64))
     .max(50)
     .nullable()
     .optional(),
+  /**
+   * Retired: the connect page carried its own provider list, which only ever
+   * narrowed what it displayed rather than what could be configured. One
+   * deployment-wide list under LLM settings now answers both.
+   *
+   * Rejected rather than stripped, so a browser tab left open across the
+   * upgrade cannot appear to gate providers and change nothing.
+   */
   connectionShownProviders: z
-    .array(SupportedProvidersSchema)
+    .never({
+      error:
+        "connectionShownProviders was retired. Set provider availability under Settings → LLM → Available model providers.",
+    })
+    .optional(),
+  connectionSkillsEnabled: z.boolean().optional(),
+  connectionLlmProxyEnabled: z.boolean().optional(),
+  connectionPluginsEnabled: z.boolean().optional(),
+  connectionRuntimeHandoffEnabled: z.boolean().optional(),
+  connectionRuntimeHandoffInstructions: z
+    .string()
+    .trim()
+    .min(1)
+    .max(20000)
+    .refine(
+      (value) => !value.includes("\u0000"),
+      "Instructions must not contain NUL characters",
+    )
     .nullable()
     .optional(),
   connectionBaseUrls: z
@@ -343,18 +690,54 @@ export const UpdateConnectionSettingsSchema = z.object({
     }),
 });
 
+/**
+ * Admin customization of the built-in integration catalogs. Each map is keyed
+ * by the catalog entry's id and only needs entries for the ones the admin
+ * actually changed; `null` clears every override for that catalog. Omitted
+ * fields are left untouched, so the three surfaces can be saved independently.
+ */
+export const UpdateIntegrationSettingsSchema = z.object({
+  popularAgentOverrides: PopularAgentOverridesSchema.nullable().optional(),
+  modelProviderOverrides: ModelProviderOverridesSchema.nullable().optional(),
+  messagingChannelOverrides:
+    MessagingChannelOverridesSchema.nullable().optional(),
+  knowledgeConnectorOverrides:
+    KnowledgeConnectorOverridesSchema.nullable().optional(),
+});
+
+/**
+ * Clean API shape for configuring the implicit "default" environment. The
+ * handler maps these to the org columns (`defaultEnvironmentName`,
+ * `defaultEnvironmentNamespace`, `defaultEnvironmentValidationRegex`). Omitting a field leaves it unchanged;
+ * an explicit null clears the nullable ones.
+ */
+export const UpdateDefaultEnvironmentSchema = z.object({
+  name: z.string().trim().min(1).max(50).nullable().optional(),
+  description: z.string().trim().max(500).nullable().optional(),
+  // Becomes the code-managed engine's namespace and part of its kube-pod://
+  // target, which the NAPI boundary validates as an RFC1123 label.
+  namespace: KubernetesNamespaceSchema.nullable().optional(),
+  networkPolicy: NetworkPolicyInputSchema.nullable().optional(),
+  restricted: RetiredSharingUpdateFieldSchema,
+  validationRegex: ValidationRegexSchema.nullable().optional(),
+  trustedImageRegistries: TrustedImageRegistriesSchema.nullable().optional(),
+});
+
+export type UpdateDefaultEnvironment = z.infer<
+  typeof UpdateDefaultEnvironmentSchema
+>;
+
 export const CompleteOnboardingSchema = z.object({
   onboardingComplete: z.literal(true),
 });
-
-export type OrganizationLimitCleanupInterval = z.infer<
-  typeof OrganizationLimitCleanupIntervalSchema
->;
-export type OrganizationCompressionScope = z.infer<
-  typeof OrganizationCompressionScopeSchema
->;
-export type GlobalToolPolicy = z.infer<typeof GlobalToolPolicySchema>;
 export type Organization = z.infer<typeof SelectOrganizationSchema>;
+export type OrganizationAnalyticsState = Pick<
+  z.infer<typeof InternalSelectOrganizationSchema>,
+  | "id"
+  | "analyticsInstanceId"
+  | "analyticsInstanceStartedAt"
+  | "analyticsInstanceLastHeartbeatAt"
+>;
 export type InsertOrganization = z.infer<typeof InsertOrganizationSchema>;
 export type AppearanceSettings = z.infer<typeof AppearanceSettingsSchema>;
 export type OrganizationChatLink = z.infer<typeof OrganizationChatLinkSchema>;
@@ -373,3 +756,48 @@ function isValidHttpUrl(value: string): boolean {
     return false;
   }
 }
+
+/** One Agent Runtime tier in effect, including any explicit memory overrides. */
+export const AgentRuntimeTierSizeSchema = z.object({
+  name: z.string(),
+  cpuRequest: z.number(),
+  cpuLimit: z.number().nullable(),
+  warmSpares: z.number().int(),
+  pooled: z
+    .boolean()
+    .describe("Whether the tier keeps spare containers ready for its runs"),
+  memoryRequestMiB: z.number().int(),
+  memoryLimitMiB: z.number().int(),
+  memoryRequestMiBOverride: z
+    .number()
+    .int()
+    .optional()
+    .describe(
+      "Explicit memory request in MiB; absent when the request follows CPU",
+    ),
+  memoryLimitMiBOverride: z
+    .number()
+    .int()
+    .optional()
+    .describe(
+      "Explicit memory limit in MiB; absent when the limit follows CPU",
+    ),
+  workspaceGiB: z
+    .number()
+    .int()
+    .nullable()
+    .describe(
+      "Size of a run's workspace volume in GiB; null means the deployment's default",
+    ),
+});
+
+/** The organization's Agent Runtime tiers in effect, smallest first. */
+export const AgentRuntimeTiersResponseSchema = z.object({
+  tiers: z.array(AgentRuntimeTierSizeSchema),
+  defaultTier: z.string(),
+  defaultWorkspaceGiB: z
+    .number()
+    .describe(
+      "The deployment's workspace volume size in GiB, which a tier that sets none gives its runs",
+    ),
+});

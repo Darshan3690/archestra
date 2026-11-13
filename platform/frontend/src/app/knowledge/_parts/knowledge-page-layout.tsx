@@ -1,8 +1,10 @@
 "use client";
 
+import type { Permissions } from "@archestra/shared";
 import { Plus } from "lucide-react";
-import { LoadingSpinner, LoadingWrapper } from "@/components/loading";
+import { LoadingWrapper } from "@/components/loading";
 import { PageLayout } from "@/components/page-layout";
+import { SmallTeamTierBanner } from "@/components/small-team-tier-banner";
 import { PermissionButton } from "@/components/ui/permission-button";
 import { useIsKnowledgeBaseConfigured } from "@/lib/knowledge/knowledge-base.query";
 import { EmbeddingRequiredPlaceholder } from "./embedding-required-placeholder";
@@ -12,32 +14,51 @@ export function KnowledgePageLayout({
   description,
   createLabel,
   onCreateClick,
+  createPermissions = { knowledgeSource: ["create"] },
   isPending,
+  extraActions,
+  trailingActions,
   children,
 }: {
   title: string;
   description: string;
   createLabel: string;
   onCreateClick: () => void;
+  createPermissions?: Permissions;
   isPending: boolean;
+  /** Rendered to the left of the create button (e.g. admin page settings). */
+  extraActions?: React.ReactNode;
+  /** Rendered immediately after the primary create action. */
+  trailingActions?: React.ReactNode;
   children: React.ReactNode;
 }) {
   const isKnowledgeBaseConfigured = useIsKnowledgeBaseConfigured();
 
   return (
-    <LoadingWrapper isPending={isPending} loadingFallback={<LoadingSpinner />}>
+    <LoadingWrapper isPending={isPending} loadingFallback={null}>
       <PageLayout
-        title={title}
+        title={
+          <span className="flex items-center gap-2">
+            {title}
+            <SmallTeamTierBanner compact />
+          </span>
+        }
+        documentTitle={title}
         description={description}
         actionButton={
-          <PermissionButton
-            permissions={{ knowledgeSource: ["create"] }}
-            onClick={onCreateClick}
-            disabled={!isKnowledgeBaseConfigured}
-          >
-            <Plus className="h-4 w-4" />
-            {createLabel}
-          </PermissionButton>
+          <div className="flex items-center gap-2">
+            {extraActions}
+            <PermissionButton
+              permissions={createPermissions}
+              size="sm"
+              onClick={onCreateClick}
+              disabled={!isKnowledgeBaseConfigured}
+            >
+              <Plus className="h-4 w-4" />
+              <span>{createLabel}</span>
+            </PermissionButton>
+            {trailingActions}
+          </div>
         }
       >
         {!isKnowledgeBaseConfigured ? (

@@ -1,10 +1,15 @@
 import {
+  ClientFilterSchema,
+  ResourceVisibilityScopeSchema,
+  TOOL_SEARCH_MAX_LENGTH,
+} from "@archestra/shared";
+import {
   createInsertSchema,
   createSelectSchema,
   createUpdateSchema,
 } from "drizzle-zod";
 import { z } from "zod";
-import { schema } from "@/database";
+import { schema } from "@/database/schema";
 import { CredentialResolutionModeSchema } from "@/types/enterprise-managed-credentials";
 
 import { OpenAi } from "./llm-providers";
@@ -46,9 +51,14 @@ export const ExtendedSelectToolSchema = SelectToolSchema.omit({
 
 export const InsertToolSchema = createInsertSchema(schema.toolsTable, {
   parameters: ToolParametersContentSchema,
+}).omit({
+  // Soft-delete bookkeeping, written only by delete/restore, never from input.
+  deletedAt: true,
 });
 export const UpdateToolSchema = createUpdateSchema(schema.toolsTable, {
   parameters: ToolParametersContentSchema.optional(),
+}).omit({
+  deletedAt: true,
 });
 
 export type Tool = z.infer<typeof SelectToolSchema>;
@@ -72,33 +82,63 @@ export const ToolAssignmentSchema = z.object({
   credentialResolutionMode: CredentialResolutionModeSchema,
 });
 
+/**
+ * The agent a delegation tool hands work to.
+ *
+ * A delegation tool is named after its target agent (`agent__<slug>`), so
+ * personal agents — seeded one per member, all called "My Assistant" — mint
+ * tools whose names collide. `scope` and `ownerEmail` are what tell those
+ * apart; without them the listing shows several identical rows.
+ */
+const ToolDelegationTargetSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  scope: ResourceVisibilityScopeSchema,
+  ownerEmail: z.string().nullable(),
+});
+
 // Tool with embedded assignments schema
 export const ToolWithAssignmentsSchema = z.object({
   id: z.string(),
   name: z.string(),
   description: z.string().nullable(),
   parameters: ToolParametersContentSchema,
+  /** MCP tool annotations (readOnlyHint, destructiveHint, …) from discovery. */
+  annotations: z.record(z.string(), z.unknown()).nullable(),
   catalogId: z.string().nullable(),
   createdAt: z.date(),
   updatedAt: z.date(),
-  policiesAutoConfiguredAt: z.date().nullable(),
-  policiesAutoConfiguredReasoning: z.string().nullable(),
-  policiesAutoConfiguredModel: z.string().nullable(),
   assignmentCount: z.number(),
   assignments: z.array(ToolAssignmentSchema),
+  /** Set only for agent delegation tools; null for catalog and observed tools. */
+  delegateToAgent: ToolDelegationTargetSchema.nullable(),
 });
 
 // Filter schema for tools with assignments
 export const ToolFilterSchema = z.object({
-  search: z.string().optional(),
+  search: z.string().max(TOOL_SEARCH_MAX_LENGTH).optional(),
   origin: z
     .string()
     .optional()
-    .describe("Can be 'llm-proxy', 'agent', or a catalogId"),
+    .describe("Can be 'llm-proxy', 'agent', 'app', or a catalogId"),
+  observedByUserId: z
+    .string()
+    .optional()
+    .describe("Only tools observed in this user's LLM proxy traffic"),
+  observedByClient: ClientFilterSchema.optional().describe(
+    "Only tools observed from this client app family (e.g. claude, codex)",
+  ),
   excludeArchestraTools: z.coerce
     .boolean()
     .optional()
+    // white-label-ok: OpenAPI prose; branded per request by enrichOpenApiWithRbac (route schemas register before the branding singleton syncs)
     .describe("Hide built-in Archestra tools"),
+  includeKnowledgeSourcesTool: z.coerce
+    .boolean()
+    .optional()
+    .describe(
+      "Include the built-in query_knowledge_sources tool in global listings (default: hidden)",
+    ),
 });
 
 export const ToolSortBy = [

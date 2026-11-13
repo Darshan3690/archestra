@@ -1,15 +1,21 @@
 "use client";
 
-import { isProviderApiKeyOptional } from "@shared";
+import {
+  isProviderApiKeyOptional,
+  providerRequiresPerUserCredential,
+  SUBSCRIPTION_CREDENTIALS,
+  subscriptionKindForProvider,
+} from "@archestra/shared";
 import { Loader2 } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
+import type { ProfileLabel, ProfileLabelsRef } from "@/components/agent-labels";
+import { ConnectionSignInDialog } from "@/components/connection-sign-in-dialog";
 import { FormDialog } from "@/components/form-dialog";
 import {
   LLM_PROVIDER_API_KEY_PLACEHOLDER,
   LlmProviderApiKeyForm,
   type LlmProviderApiKeyFormValues,
-  PROVIDER_CONFIG,
   serializeExtraHeaders,
 } from "@/components/llm-provider-api-key-form";
 import { Button } from "@/components/ui/button";
@@ -18,12 +24,17 @@ import {
   DialogForm,
   DialogStickyFooter,
 } from "@/components/ui/dialog";
-import { useHasPermissions } from "@/lib/auth/auth.query";
+import { DialogCancelButton } from "@/components/unsaved-changes-guard";
 import { useFeature } from "@/lib/config/config.query";
+import { useModelProviderCatalog } from "@/lib/integration-overrides";
 import {
+  type LlmProviderApiKey,
   useCreateLlmProviderApiKey,
   useLlmProviderApiKeys,
+  useReconnectLlmProviderApiKey,
 } from "@/lib/llm-provider-api-keys.query";
+
+const EMPTY_EXISTING_KEYS: LlmProviderApiKey[] = [];
 
 export type CreateLlmProviderApiKeyDialogProps = {
   open: boolean;
@@ -31,8 +42,19 @@ export type CreateLlmProviderApiKeyDialogProps = {
   title: string;
   description: string;
   defaultValues?: Partial<LlmProviderApiKeyFormValues>;
+  /** Restrict the provider picker to this allowlist (e.g. the providers the
+   * selected connect client can actually route). Omit to allow all providers. */
+  allowedProviders?: LlmProviderApiKeyFormValues["provider"][];
+  /** Selects the focused progressive flow shown by this dialog. */
+  credentialMode?: "api-key" | "subscription";
   showConsoleLink?: boolean;
-  onSuccess?: () => void;
+  onSuccess?: (keyId?: string) => void;
+  /**
+   * Re-authentication mode: rotate this existing key's credential in place
+   * instead of creating a new key. Used to reconnect an expired personal
+   * subscription (ChatGPT/Copilot) without minting a duplicate credential row.
+   */
+  reconnectKeyId?: string;
 };
 
 export function CreateLlmProviderApiKeyDialog({
@@ -41,65 +63,137 @@ export function CreateLlmProviderApiKeyDialog({
   title,
   description,
   defaultValues,
+  allowedProviders,
+  credentialMode = "api-key",
   showConsoleLink = false,
   onSuccess,
+  reconnectKeyId,
 }: CreateLlmProviderApiKeyDialogProps) {
   const createMutation = useCreateLlmProviderApiKey();
-  const { data: existingKeys = [] } = useLlmProviderApiKeys({ enabled: open });
-  const byosEnabled = useFeature("byosEnabled");
+  const reconnectMutation = useReconnectLlmProviderApiKey();
+  const { data: existingKeys } = useLlmProviderApiKeys({ enabled: open });
+
   const azureOpenAiEntraIdEnabled = useFeature("azureOpenAiEntraIdEnabled");
+  const anthropicKeylessAuthEnabled = useFeature("anthropicKeylessAuthEnabled");
   const bedrockIamAuthEnabled = useFeature("bedrockIamAuthEnabled");
   const geminiVertexAiEnabled = useFeature("geminiVertexAiEnabled");
-  const { data: canCreateOrgScopedKey } = useHasPermissions({
-    llmProviderApiKey: ["admin"],
-  });
+  const providerCatalog = useModelProviderCatalog();
+  const [labels, setLabels] = useState<ProfileLabel[]>([]);
+  const labelsRef = useRef<ProfileLabelsRef>(null);
+  const lastResetKeyRef = useRef<string | null>(null);
+  // Providers a person may add a key for: GitHub Copilot also needs its
+  // personal subscriptions on, since a key made here is a personal sign-in.
+  const visibleProviderIdsKey = providerCatalog.visibleIds
+    .filter(providerCatalog.canAddKey)
+    .join(",");
+  const allowedProviderIdsKey = allowedProviders?.join(",") ?? null;
+  const availableProviders = useMemo(() => {
+    const visibleProviders = visibleProviderIdsKey
+      ? (visibleProviderIdsKey.split(
+          ",",
+        ) as LlmProviderApiKeyFormValues["provider"][])
+      : [];
+    const allowedProviderIds = allowedProviderIdsKey
+      ? (allowedProviderIdsKey.split(
+          ",",
+        ) as LlmProviderApiKeyFormValues["provider"][])
+      : visibleProviders;
+    const visibleProviderSet = new Set(visibleProviders);
+    return allowedProviderIds.filter((provider) =>
+      visibleProviderSet.has(provider),
+    );
+  }, [allowedProviderIdsKey, visibleProviderIdsKey]);
+  const onlyAvailableProvider =
+    availableProviders.length === 1 ? availableProviders[0] : undefined;
+  const dialogTitle =
+    title === "Add API Key" && onlyAvailableProvider
+      ? `Add ${providerCatalog.label(onlyAvailableProvider)} API Key`
+      : title;
+  const defaultFormValues = useMemo(
+    () =>
+      availableProviders.length > 0
+        ? getDefaultFormValues({
+            defaultValues,
+            availableProviders,
+            credentialMode,
+          })
+        : null,
+    [availableProviders, defaultValues, credentialMode],
+  );
+  const resetKey = JSON.stringify(defaultFormValues);
 
   const form = useForm<LlmProviderApiKeyFormValues>({
-    defaultValues: getDefaultFormValues({
-      defaultValues,
-      canCreateOrgScopedKey: canCreateOrgScopedKey === true,
-    }),
+    defaultValues: defaultFormValues ?? undefined,
   });
 
   useEffect(() => {
-    if (!open) return;
-    form.reset(
-      getDefaultFormValues({
-        defaultValues,
-        canCreateOrgScopedKey: canCreateOrgScopedKey === true,
-      }),
-    );
-  }, [canCreateOrgScopedKey, defaultValues, form, open]);
+    if (!open) {
+      lastResetKeyRef.current = null;
+      return;
+    }
+    if (!defaultFormValues || lastResetKeyRef.current === resetKey) return;
+
+    lastResetKeyRef.current = resetKey;
+    setLabels([]);
+    form.reset(defaultFormValues);
+  }, [defaultFormValues, form, open, resetKey]);
 
   const formValues = form.watch();
-  const isValid = getIsCreateFormValid({
-    azureOpenAiEntraIdEnabled: azureOpenAiEntraIdEnabled === true,
-    byosEnabled: Boolean(byosEnabled),
-    values: formValues,
-  });
+  const isValid =
+    availableProviders.length > 0 &&
+    getIsCreateFormValid({
+      azureOpenAiEntraIdEnabled: azureOpenAiEntraIdEnabled === true,
+      anthropicKeylessAuthEnabled: anthropicKeylessAuthEnabled === true,
 
-  const handleCreate = form.handleSubmit(async (values) => {
+      values: formValues,
+    });
+
+  const createCredential = async (values: LlmProviderApiKeyFormValues) => {
+    const finalLabels = labelsRef.current?.saveUnsavedLabel() ?? labels;
     const isBedrockSigV4 =
       values.provider === "bedrock" && values.bedrockAuthMethod === "sigv4";
+    // A subscription key defaults to the subscription's own name rather than the
+    // provider's, so an unnamed ChatGPT key isn't just called "OpenAI".
+    const subscriptionKind =
+      values.authMethod === "subscription"
+        ? subscriptionKindForProvider(values.provider)
+        : null;
+    // Subscription credentials are per-user, so the key is always personal.
+    // Resolved here rather than via the form's scope coercion: that coercion is
+    // deferred until a sign-in completes (so switching tabs can't silently
+    // privatize anything), and the sign-in callback reads form values in the
+    // same tick the credential lands — before any effect has run.
+    // Ordinary keys use their grant policy for access. Creation grants the
+    // caller full access; personal account credentials remain owner-only.
+    const shared =
+      !subscriptionKind && !providerRequiresPerUserCredential(values.provider);
     try {
-      await createMutation.mutateAsync({
-        name: values.name?.trim() || PROVIDER_CONFIG[values.provider].name,
+      const createdKey = await createMutation.mutateAsync({
+        name:
+          values.name?.trim() ||
+          (subscriptionKind
+            ? SUBSCRIPTION_CREDENTIALS[subscriptionKind].label
+            : providerCatalog.label(values.provider)),
         provider: values.provider,
         apiKey: isBedrockSigV4 ? undefined : values.apiKey || undefined,
         baseUrl: values.baseUrl || undefined,
+        inferenceBaseUrl: values.inferenceBaseUrl || undefined,
         extraHeaders: serializeExtraHeaders(values.extraHeaders) ?? undefined,
-        scope: values.scope,
-        teamId:
-          values.scope === "team" && values.teamId ? values.teamId : undefined,
+        shared,
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        initialGrants:
+          !shared ||
+          subscriptionKind ||
+          providerRequiresPerUserCredential(values.provider)
+            ? []
+            : (values.initialGrants ?? []).map(
+                ({ name: _name, ...grant }) => grant,
+              ),
+        // SPDX-SnippetEnd
         isPrimary: values.isPrimary,
-        vaultSecretPath:
-          !isBedrockSigV4 && byosEnabled && values.vaultSecretPath
-            ? values.vaultSecretPath
-            : undefined,
-        vaultSecretKey:
-          !isBedrockSigV4 && byosEnabled && values.vaultSecretKey
-            ? values.vaultSecretKey
-            : undefined,
+
         awsAccessKeyId: isBedrockSigV4
           ? values.awsAccessKeyId || undefined
           : undefined,
@@ -109,50 +203,112 @@ export function CreateLlmProviderApiKeyDialog({
         awsSessionToken: isBedrockSigV4
           ? values.awsSessionToken || undefined
           : undefined,
+        labels: finalLabels,
       });
       onOpenChange(false);
-      onSuccess?.();
+      onSuccess?.(createdKey?.id);
+      return true;
     } catch {
       // Error handled by mutation
+      return false;
     }
-  });
+  };
+  const handleCreate = form.handleSubmit(createCredential);
+  const handleSubscriptionCredential = async (credential: string) => {
+    if (reconnectKeyId) {
+      // Re-authentication: rotate the existing key's secret in place — a
+      // second create would leave a duplicate credential row behind, with the
+      // stale one still selected in conversations. Uses the self-service
+      // reconnect endpoint rather than the permission-gated PATCH, so default
+      // members can refresh their own expired sign-in.
+      const reconnectedKey = await reconnectMutation.mutateAsync({
+        id: reconnectKeyId,
+        apiKey: credential,
+      });
+      onOpenChange(false);
+      onSuccess?.(reconnectedKey?.id ?? reconnectKeyId);
+      return;
+    }
+    const values = { ...form.getValues(), apiKey: credential };
+    const created = await createCredential(values);
+    if (!created) {
+      throw new Error("Subscription credential was not saved");
+    }
+  };
+
+  if (availableProviders.length === 0) {
+    return (
+      <FormDialog
+        open={open}
+        onOpenChange={onOpenChange}
+        title={dialogTitle}
+        description={description}
+        size="small"
+        className="sm:max-w-xl"
+      >
+        <DialogBody>
+          <p>No compatible LLM providers are enabled for this agent.</p>
+        </DialogBody>
+        <DialogStickyFooter className="mt-0">
+          <DialogCancelButton>Cancel</DialogCancelButton>
+        </DialogStickyFooter>
+      </FormDialog>
+    );
+  }
+
+  const keyForm = (
+    <LlmProviderApiKeyForm
+      mode="full"
+      showConsoleLink={showConsoleLink}
+      form={form}
+      existingKeys={existingKeys ?? EMPTY_EXISTING_KEYS}
+      isPending={createMutation.isPending}
+      allowedProviders={availableProviders}
+      hideUnavailableProviders
+      credentialMode={credentialMode}
+      progressive
+      allowPersonalSubscriptions={credentialMode === "subscription"}
+      onSubscriptionCredential={handleSubscriptionCredential}
+      bedrockIamAuthEnabled={bedrockIamAuthEnabled}
+      geminiVertexAiEnabled={geminiVertexAiEnabled}
+      labels={reconnectKeyId ? undefined : labels}
+      onLabelsChange={reconnectKeyId ? undefined : setLabels}
+      labelsRef={reconnectKeyId ? undefined : labelsRef}
+      hidePermissions
+    />
+  );
+
+  if (credentialMode === "subscription") {
+    return (
+      <ConnectionSignInDialog
+        open={open}
+        onOpenChange={onOpenChange}
+        title={dialogTitle}
+        description={description}
+        action={keyForm}
+      />
+    );
+  }
 
   return (
     <FormDialog
       open={open}
       onOpenChange={onOpenChange}
-      title={title}
+      title={dialogTitle}
       description={description}
       size="small"
+      className="sm:max-w-xl"
+      isDirty={credentialMode === "api-key" && form.formState.isDirty}
     >
-      <DialogForm
-        onSubmit={handleCreate}
-        className="flex min-h-0 flex-1 flex-col"
-      >
-        <DialogBody>
-          <LlmProviderApiKeyForm
-            mode="full"
-            showConsoleLink={showConsoleLink}
-            form={form}
-            existingKeys={existingKeys}
-            isPending={createMutation.isPending}
-            bedrockIamAuthEnabled={bedrockIamAuthEnabled}
-            geminiVertexAiEnabled={geminiVertexAiEnabled}
-          />
-        </DialogBody>
+      <DialogForm onSubmit={handleCreate} className="flex min-h-0 flex-col">
+        <DialogBody>{keyForm}</DialogBody>
         <DialogStickyFooter className="mt-0">
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => onOpenChange(false)}
-          >
-            Cancel
-          </Button>
+          <DialogCancelButton>Cancel</DialogCancelButton>
           <Button type="submit" disabled={!isValid || createMutation.isPending}>
             {createMutation.isPending && (
               <Loader2 className="h-4 w-4 animate-spin" />
             )}
-            Test & Create
+            <span>Test & Create</span>
           </Button>
         </DialogStickyFooter>
       </DialogForm>
@@ -162,51 +318,66 @@ export function CreateLlmProviderApiKeyDialog({
 
 function getDefaultFormValues(params: {
   defaultValues?: Partial<LlmProviderApiKeyFormValues>;
-  canCreateOrgScopedKey: boolean;
+  /** Providers the organization still allows, in catalog order. */
+  availableProviders: LlmProviderApiKeyFormValues["provider"][];
+  credentialMode: "api-key" | "subscription";
 }): LlmProviderApiKeyFormValues {
-  const { defaultValues, canCreateOrgScopedKey } = params;
+  const { defaultValues, availableProviders, credentialMode } = params;
+  const provider =
+    defaultValues?.provider &&
+    availableProviders.includes(defaultValues.provider)
+      ? defaultValues.provider
+      : availableProviders.includes("anthropic")
+        ? "anthropic"
+        : availableProviders[0];
   return {
     name: "",
-    provider: "anthropic",
     apiKey: null,
     baseUrl: null,
+    inferenceBaseUrl: null,
     extraHeaders: [],
-    scope: canCreateOrgScopedKey ? "org" : "personal",
-    teamId: null,
-    vaultSecretPath: null,
-    vaultSecretKey: null,
+    initialGrants: [],
+
     isPrimary: false,
     bedrockAuthMethod: "api-key",
     awsAccessKeyId: null,
     awsSecretAccessKey: null,
     awsSessionToken: null,
+    authMethod: "api-key",
     ...defaultValues,
+    // Anthropic unless the compatible provider list excludes it.
+    provider,
+    shared:
+      credentialMode !== "subscription" &&
+      defaultValues?.authMethod !== "subscription" &&
+      !providerRequiresPerUserCredential(provider),
   };
 }
 
 function getIsCreateFormValid(params: {
   azureOpenAiEntraIdEnabled: boolean;
-  byosEnabled: boolean;
+  anthropicKeylessAuthEnabled: boolean;
+
   values: LlmProviderApiKeyFormValues;
 }) {
-  const { azureOpenAiEntraIdEnabled, byosEnabled, values } = params;
+  const {
+    azureOpenAiEntraIdEnabled,
+    anthropicKeylessAuthEnabled,
+
+    values,
+  } = params;
 
   if (values.provider === "bedrock" && values.bedrockAuthMethod === "sigv4") {
-    return Boolean(
-      values.awsAccessKeyId &&
-        values.awsSecretAccessKey &&
-        (values.scope !== "team" || values.teamId),
-    );
+    return Boolean(values.awsAccessKeyId && values.awsSecretAccessKey);
   }
 
   return Boolean(
     values.apiKey !== LLM_PROVIDER_API_KEY_PLACEHOLDER &&
-      (values.scope !== "team" || values.teamId) &&
-      (byosEnabled
-        ? values.vaultSecretPath && values.vaultSecretKey
-        : isProviderApiKeyOptional({
-            provider: values.provider,
-            azureEntraIdEnabled: azureOpenAiEntraIdEnabled,
-          }) || values.apiKey),
+      (isProviderApiKeyOptional({
+        provider: values.provider,
+        azureEntraIdEnabled: azureOpenAiEntraIdEnabled,
+        anthropicKeylessAuthEnabled,
+      }) ||
+        values.apiKey),
   );
 }

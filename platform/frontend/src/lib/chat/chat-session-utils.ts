@@ -1,4 +1,5 @@
 import type { UIMessage } from "@ai-sdk/react";
+import { hasRenderableAssistantContent } from "@archestra/shared";
 
 /**
  * Preserves the last renderable assistant content when a live session update
@@ -27,16 +28,33 @@ export function restoreRenderableAssistantParts(params: {
   let changed = false;
 
   const restoredMessages = nextMessages.map((message, index) => {
-    if (message.role !== "assistant" || hasRenderableAssistantParts(message)) {
-      return message;
-    }
-
     const previousMessage = findPreviousRenderableAssistantMessage({
       previousMessages,
       nextMessages,
       nextMessage: message,
       index,
     });
+
+    // Starting a later turn can temporarily project an earlier tool result to
+    // its model-facing text output, dropping rawContent image bytes from the
+    // live UI state. That historical assistant is complete and immutable: keep
+    // its prior rich parts while the new tail streams. Persist/refetch restores
+    // the same payload after finish, so this only prevents the visible blink.
+    if (
+      message.role === "assistant" &&
+      index < nextMessages.length - 1 &&
+      previousMessage?.role === "assistant" &&
+      hasRenderableToolOutputImage(previousMessage) &&
+      !hasRenderableToolOutputImage(message)
+    ) {
+      changed = true;
+      return { ...message, parts: previousMessage.parts };
+    }
+
+    if (message.role !== "assistant" || hasRenderableAssistantParts(message)) {
+      return message;
+    }
+
     if (
       previousMessage?.role !== "assistant" ||
       !hasRenderableAssistantParts(previousMessage)
@@ -51,20 +69,159 @@ export function restoreRenderableAssistantParts(params: {
     };
   });
 
-  return changed ? restoredMessages : nextMessages;
+  if (!changed) {
+    return nextMessages;
+  }
+
+  // While a non-renderable assistant persists (e.g. reconnecting to an in-flight
+  // tool call on reload), this restoration runs on every render and would hand
+  // back a fresh array each time. That churns the caller's stableMessages
+  // identity, which re-fires the session-sync effect → setSessionVersion →
+  // re-render in a storm that crashes the chat view (React #185, "Maximum update
+  // depth"). previousMessages is the prior render's restored output, so when the
+  // rebuild is structurally identical, reuse it to keep the reference stable.
+  if (messagesShallowEqual(restoredMessages, previousMessages)) {
+    return previousMessages;
+  }
+
+  return restoredMessages;
+}
+
+// Compares every field of UIMessage (id, role, metadata, parts) so reusing the
+// previous reference can never silently drop a non-parts update — e.g. an
+// assistant message gaining its metadata.persistedMessageId after streaming,
+// which edit/regeneration relies on to target the right persisted row. parts and
+// metadata are compared by reference: a genuine change produces a new reference,
+// while a stable render reuses them, so this stays both correct and cheap.
+function messagesShallowEqual(a: UIMessage[], b: UIMessage[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  return a.every((message, index) => {
+    const other = b[index];
+    return (
+      !!other &&
+      message.id === other.id &&
+      message.role === other.role &&
+      message.metadata === other.metadata &&
+      message.parts === other.parts
+    );
+  });
 }
 
 /**
- * Returns true when an assistant message still has content the chat UI can
- * actually render. Empty text parts do not count, but any non-text part does.
+ * While a session auto-recovers from a severed stream (auto-retry or
+ * reattaching to the still-running response), the live message list passes
+ * through ugly intermediate states: regenerate() drops the partial assistant
+ * answer, and the replay rebuilds it from scratch a moment later. Rendering
+ * those states blinks the streamed text away and back. Instead, the UI keeps
+ * showing the frozen pre-recovery snapshot until the recovered stream has
+ * renderable assistant content again — the replay delivers its whole backlog
+ * in the first batch, so the swap happens at full length with no visible gap.
  */
-function hasRenderableAssistantParts(message: UIMessage): boolean {
-  return (message.parts ?? []).some((part) => {
-    if (part.type === "text") {
-      return Boolean(part.text);
-    }
+export function shouldFreezeChatMessages(params: {
+  isRecovering: boolean;
+  liveMessages: UIMessage[];
+  frozenMessages: UIMessage[];
+}): boolean {
+  const { isRecovering, liveMessages, frozenMessages } = params;
+  if (!isRecovering || frozenMessages.length === 0) {
+    return false;
+  }
 
-    return true;
+  const lastMessage = liveMessages.at(-1);
+  // Once the recovered stream renders assistant content again, the live list
+  // has caught up with (or passed) the frozen snapshot — stop freezing.
+  return !(
+    lastMessage?.role === "assistant" &&
+    hasRenderableAssistantContent(lastMessage)
+  );
+}
+
+/**
+ * Drops assistant messages that carry no renderable content and can no longer be
+ * the turn in flight.
+ *
+ * The AI SDK opens an assistant message to hold any non-transient data part that
+ * arrives before a stream's `start` chunk, keyed by a client-generated id. When
+ * `start` then names the real message, the SDK renames its streaming state and
+ * pushes a *second* message, abandoning the first — which is left holding only
+ * telemetry parts (context-window estimate/breakdown, compaction events, token
+ * usage). It renders nothing, so the turn still looks right, but it stays in
+ * chat state as a real message: the next request sends it as the trailing
+ * message and a recovery's `regenerate()` anchors on it, so the backend reuses
+ * its id (`getResponseUIMessageId` reuses a trailing assistant's id) and streams
+ * the whole turn into a second message beside the first. Every further attach
+ * adds another, which is how one turn ends up rendered twice over.
+ *
+ * The backend never persists a content-free assistant message, which is why a
+ * reload clears the duplicates; this keeps the live list on that same rule. The
+ * last message is exempt — a turn that is still streaming legitimately has no
+ * renderable content yet.
+ */
+export function pruneStrandedAssistantMessages(
+  messages: UIMessage[],
+): UIMessage[] {
+  const isStranded = (message: UIMessage, index: number) =>
+    index < messages.length - 1 &&
+    message.role === "assistant" &&
+    !hasRenderableAssistantContent(message);
+
+  // Returning the same reference when nothing is stranded keeps the caller's
+  // message identity stable, so this never churns a render on its own.
+  if (!messages.some(isStranded)) {
+    return messages;
+  }
+
+  return messages.filter((message, index) => !isStranded(message, index));
+}
+
+/**
+ * Drops a trailing assistant message left with no renderable content. Mirrors the
+ * backend's persist behavior (an empty last message is not stored), keeping the live
+ * view consistent with what a reload would show — used after stripping dangling tool
+ * parts from a stopped turn, which can leave only `step-start`/telemetry parts behind.
+ */
+export function pruneEmptyTrailingAssistantMessage(
+  messages: UIMessage[],
+): UIMessage[] {
+  const lastMessage = messages.at(-1);
+  if (
+    lastMessage?.role === "assistant" &&
+    !hasRenderableAssistantContent(lastMessage)
+  ) {
+    return messages.slice(0, -1);
+  }
+  return messages;
+}
+
+// shared with the backend persist path so the live view and what a reload shows
+// agree on what counts as renderable.
+function hasRenderableAssistantParts(message: UIMessage): boolean {
+  return hasRenderableAssistantContent(message);
+}
+
+function hasRenderableToolOutputImage(message: UIMessage): boolean {
+  return message.parts.some((part) => {
+    if (!part.type.startsWith("tool-") || !("output" in part)) {
+      return false;
+    }
+    const output = part.output;
+    if (!output || typeof output !== "object" || !("rawContent" in output)) {
+      return false;
+    }
+    const rawContent = (output as { rawContent?: unknown }).rawContent;
+    return (
+      Array.isArray(rawContent) &&
+      rawContent.some(
+        (block) =>
+          !!block &&
+          typeof block === "object" &&
+          (block as { type?: unknown }).type === "image" &&
+          typeof (block as { data?: unknown }).data === "string" &&
+          (block as { data: string }).data.length > 0,
+      )
+    );
   });
 }
 
@@ -108,9 +265,11 @@ function restoreTruncatedAssistantTail(params: {
     return nextMessages;
   }
 
+  const lastPreviousMessage = previousMessages.at(-1);
   if (
     nextMessages.length === 0 &&
-    previousMessages.at(-1)?.role === "assistant"
+    lastPreviousMessage?.role === "assistant" &&
+    hasRenderableAssistantContent(lastPreviousMessage)
   ) {
     return previousMessages;
   }
@@ -122,11 +281,17 @@ function restoreTruncatedAssistantTail(params: {
   const hasStablePrefix = nextMessages.every((message, index) =>
     sameMessageIdentity(message, previousMessages[index]),
   );
+  // only restore a tail that carries content worth keeping — restoring a
+  // non-renderable assistant (e.g. step-start/telemetry after a stopped turn)
+  // would resurrect the empty bubble the persist path just pruned away.
   const truncatedTail = previousMessages.slice(nextMessages.length);
   if (
     hasStablePrefix &&
     truncatedTail.length > 0 &&
-    truncatedTail.every((message) => message.role === "assistant")
+    truncatedTail.every(
+      (message) =>
+        message.role === "assistant" && hasRenderableAssistantContent(message),
+    )
   ) {
     return previousMessages;
   }

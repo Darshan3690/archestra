@@ -4,7 +4,7 @@ import {
   createUpdateSchema,
 } from "drizzle-zod";
 import type { z } from "zod";
-import { schema } from "@/database";
+import { schema } from "@/database/schema";
 import {
   type EmailProviderType,
   EmailProviderTypeSchema,
@@ -102,6 +102,14 @@ export interface EmailAttachment {
 }
 
 /**
+ * A raw internet message header, as returned by the email provider
+ */
+export interface EmailHeader {
+  name: string;
+  value: string;
+}
+
+/**
  * Represents an incoming email that will invoke an agent
  */
 export interface IncomingEmail {
@@ -125,6 +133,8 @@ export interface IncomingEmail {
   metadata?: Record<string, unknown>;
   /** File attachments included in the email */
   attachments?: EmailAttachment[];
+  /** Internet message headers in message order (topmost first) */
+  headers?: EmailHeader[];
 }
 
 /**
@@ -164,7 +174,7 @@ export interface EmailReplyOptions {
  */
 export interface EmailProcessingResult {
   success: boolean;
-  /** The agent execution result (if successful) */
+  /** The agent run result (if successful) */
   agentResponse?: string;
   /** Error message (if failed) */
   error?: string;

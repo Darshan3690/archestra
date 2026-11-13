@@ -4,13 +4,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useInvitationCheck } from "@/lib/auth/invitation.query";
 import { useBackendConnectivity } from "@/lib/config/backend-connectivity";
 import { usePublicConfig } from "@/lib/config/config.query";
+import { useAppName } from "@/lib/hooks/use-app-name";
 import { AuthPageWithInvitationCheck } from "./auth-page-with-invitation-check";
 
 // Mock Next.js navigation
-vi.mock("next/navigation", () => ({
-  useRouter: vi.fn(),
-  useSearchParams: vi.fn(),
-}));
+vi.mock("next/navigation");
 
 // Mock invitation query
 vi.mock("@/lib/auth/invitation.query", () => ({
@@ -22,16 +20,12 @@ vi.mock("@/lib/config/backend-connectivity", () => ({
   useBackendConnectivity: vi.fn(),
 }));
 
-vi.mock("@/lib/config/config.query", () => ({
-  usePublicConfig: vi.fn(),
-}));
+vi.mock("@/lib/config/config.query");
 
-vi.mock("@/lib/hooks/use-app-name", () => ({
-  useAppName: () => "Sparky",
-}));
+vi.mock("@/lib/hooks/use-app-name");
 
 // Mock AuthViewWithErrorHandling
-vi.mock("@/app/auth/_components/auth-view-with-error-handling", () => ({
+vi.mock("@/app/auth/_parts/auth-view-with-error-handling", () => ({
   AuthViewWithErrorHandling: vi.fn(
     ({ path, callbackURL }: { path: string; callbackURL?: string }) => (
       <div data-testid="auth-view">
@@ -54,23 +48,21 @@ vi.mock("@/components/community-links", () => ({
   )),
 }));
 
-// Mock DefaultCredentialsWarning
-vi.mock("@/components/default-credentials-warning", () => ({
-  DefaultCredentialsWarning: vi.fn(() => (
-    <div data-testid="default-credentials-warning">
-      Default Credentials Warning
-    </div>
-  )),
+vi.mock("@/app/auth/_parts/sign-in-notice", () => ({
+  SignInNotice: vi.fn(() => <div data-testid="sign-in-notice" />),
 }));
 
 const mockRouterPush = vi.fn();
+const mockRouterReplace = vi.fn();
 const mockRetry = vi.fn();
 
 describe("AuthPageWithInvitationCheck", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(useAppName).mockReturnValue("Sparky");
     vi.mocked(useRouter).mockReturnValue({
       push: mockRouterPush,
+      replace: mockRouterReplace,
     } as unknown as ReturnType<typeof useRouter>);
     vi.mocked(usePublicConfig).mockReturnValue({
       data: {
@@ -85,6 +77,7 @@ describe("AuthPageWithInvitationCheck", () => {
       attemptCount: 0,
       estimatedTotalAttempts: 7,
       elapsedMs: 0,
+      nextRetryInMs: null,
       retry: mockRetry,
     });
   });
@@ -104,7 +97,7 @@ describe("AuthPageWithInvitationCheck", () => {
       expect(screen.getByTestId("auth-path")).toHaveTextContent("sign-in");
     });
 
-    it("should show default credentials warning on sign-in page without invitation", () => {
+    it("should show the sign-in notice on sign-in page without invitation", () => {
       vi.mocked(useSearchParams).mockReturnValue({
         get: vi.fn().mockReturnValue(null),
       } as unknown as ReturnType<typeof useSearchParams>);
@@ -115,12 +108,10 @@ describe("AuthPageWithInvitationCheck", () => {
 
       render(<AuthPageWithInvitationCheck path="sign-in" />);
 
-      expect(
-        screen.getByTestId("default-credentials-warning"),
-      ).toBeInTheDocument();
+      expect(screen.getByTestId("sign-in-notice")).toBeInTheDocument();
     });
 
-    it("should not show default credentials warning when invitationId is present", () => {
+    it("should not show the sign-in notice when invitationId is present", () => {
       vi.mocked(useSearchParams).mockReturnValue({
         get: vi.fn((key: string) => (key === "invitationId" ? "inv123" : null)),
       } as unknown as ReturnType<typeof useSearchParams>);
@@ -131,12 +122,10 @@ describe("AuthPageWithInvitationCheck", () => {
 
       render(<AuthPageWithInvitationCheck path="sign-in" />);
 
-      expect(
-        screen.queryByTestId("default-credentials-warning"),
-      ).not.toBeInTheDocument();
+      expect(screen.queryByTestId("sign-in-notice")).not.toBeInTheDocument();
     });
 
-    it("should not show default credentials warning when basic auth is disabled", () => {
+    it("should not show the sign-in notice when basic auth is disabled", () => {
       vi.mocked(usePublicConfig).mockReturnValue({
         data: {
           disableBasicAuth: true,
@@ -154,9 +143,7 @@ describe("AuthPageWithInvitationCheck", () => {
 
       render(<AuthPageWithInvitationCheck path="sign-in" />);
 
-      expect(
-        screen.queryByTestId("default-credentials-warning"),
-      ).not.toBeInTheDocument();
+      expect(screen.queryByTestId("sign-in-notice")).not.toBeInTheDocument();
     });
 
     it("should show welcome back message for existing users with invitation", () => {
@@ -195,9 +182,10 @@ describe("AuthPageWithInvitationCheck", () => {
       ).toBeInTheDocument();
     });
 
-    it("should show loading spinner while checking invitation", () => {
+    it("should redirect to the sign-up-with-invitation page when an invitationId is present", () => {
       vi.mocked(useSearchParams).mockReturnValue({
         get: vi.fn((key: string) => (key === "invitationId" ? "inv123" : null)),
+        toString: vi.fn(() => "invitationId=inv123&email=new%40example.com"),
       } as unknown as ReturnType<typeof useSearchParams>);
       vi.mocked(useInvitationCheck).mockReturnValue({
         data: undefined,
@@ -206,41 +194,12 @@ describe("AuthPageWithInvitationCheck", () => {
 
       render(<AuthPageWithInvitationCheck path="sign-up" />);
 
-      // Should not show the invitation required message while loading
-      expect(screen.queryByText("Invitation Required")).not.toBeInTheDocument();
-      // AuthView should not be rendered while loading
-      expect(screen.queryByTestId("auth-view")).not.toBeInTheDocument();
-    });
-
-    it("should redirect existing users from sign-up to sign-in", () => {
-      vi.mocked(useSearchParams).mockReturnValue({
-        get: vi.fn((key: string) => (key === "invitationId" ? "inv123" : null)),
-      } as unknown as ReturnType<typeof useSearchParams>);
-      vi.mocked(useInvitationCheck).mockReturnValue({
-        data: { userExists: true },
-        isLoading: false,
-      } as ReturnType<typeof useInvitationCheck>);
-
-      render(<AuthPageWithInvitationCheck path="sign-up" />);
-
-      expect(mockRouterPush).toHaveBeenCalledWith(
-        "/auth/sign-in?invitationId=inv123",
+      expect(mockRouterReplace).toHaveBeenCalledWith(
+        "/auth/sign-up-with-invitation?invitationId=inv123&email=new%40example.com",
       );
-    });
-
-    it("should render sign-up form for new users with invitation", () => {
-      vi.mocked(useSearchParams).mockReturnValue({
-        get: vi.fn((key: string) => (key === "invitationId" ? "inv123" : null)),
-      } as unknown as ReturnType<typeof useSearchParams>);
-      vi.mocked(useInvitationCheck).mockReturnValue({
-        data: { userExists: false },
-        isLoading: false,
-      } as ReturnType<typeof useInvitationCheck>);
-
-      render(<AuthPageWithInvitationCheck path="sign-up" />);
-
-      expect(screen.getByTestId("auth-view")).toBeInTheDocument();
-      expect(screen.getByTestId("auth-path")).toHaveTextContent("sign-up");
+      // Only a spinner is shown while redirecting
+      expect(screen.queryByText("Invitation Required")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("auth-view")).not.toBeInTheDocument();
     });
   });
 
@@ -258,22 +217,6 @@ describe("AuthPageWithInvitationCheck", () => {
 
       expect(screen.getByTestId("auth-callback")).toHaveTextContent(
         "/auth/sign-in?invitationId=inv123",
-      );
-    });
-
-    it("should pass invitation callback URL for sign-up with invitationId", () => {
-      vi.mocked(useSearchParams).mockReturnValue({
-        get: vi.fn((key: string) => (key === "invitationId" ? "inv123" : null)),
-      } as unknown as ReturnType<typeof useSearchParams>);
-      vi.mocked(useInvitationCheck).mockReturnValue({
-        data: { userExists: false },
-        isLoading: false,
-      } as ReturnType<typeof useInvitationCheck>);
-
-      render(<AuthPageWithInvitationCheck path="sign-up" />);
-
-      expect(screen.getByTestId("auth-callback")).toHaveTextContent(
-        "/auth/sign-up?invitationId=inv123",
       );
     });
 
@@ -399,7 +342,7 @@ describe("AuthPageWithInvitationCheck", () => {
   });
 
   describe("backend connectivity", () => {
-    it("should show connecting message instead of login form when backend is connecting", () => {
+    it("should show when the next automatic retry will run", () => {
       vi.mocked(useSearchParams).mockReturnValue({
         get: vi.fn().mockReturnValue(null),
       } as unknown as ReturnType<typeof useSearchParams>);
@@ -412,16 +355,22 @@ describe("AuthPageWithInvitationCheck", () => {
         attemptCount: 0,
         estimatedTotalAttempts: 7,
         elapsedMs: 0,
+        nextRetryInMs: 8000,
         retry: mockRetry,
       });
 
       render(<AuthPageWithInvitationCheck path="sign-in" />);
 
-      expect(screen.getByText("Connecting...")).toBeInTheDocument();
+      expect(screen.getByRole("status")).toHaveAttribute("aria-busy", "true");
+      expect(
+        screen.getByText("Can't reach the Sparky server."),
+      ).toBeInTheDocument();
+      expect(screen.getByText("Retrying automatically")).toBeInTheDocument();
+      expect(screen.getByText("Next retry in 8s")).toBeInTheDocument();
       expect(screen.queryByTestId("auth-view")).not.toBeInTheDocument();
     });
 
-    it("should show retry information when connection attempts have failed", () => {
+    it("should keep retry counters out of the connecting interface", () => {
       vi.mocked(useSearchParams).mockReturnValue({
         get: vi.fn().mockReturnValue(null),
       } as unknown as ReturnType<typeof useSearchParams>);
@@ -434,14 +383,14 @@ describe("AuthPageWithInvitationCheck", () => {
         attemptCount: 3,
         estimatedTotalAttempts: 7,
         elapsedMs: 5000,
+        nextRetryInMs: 8000,
         retry: mockRetry,
       });
 
       render(<AuthPageWithInvitationCheck path="sign-in" />);
 
-      expect(
-        screen.getByText(/Still trying to connect, attempt 3 \/ 7/),
-      ).toBeInTheDocument();
+      expect(screen.getByText("Retrying automatically")).toBeInTheDocument();
+      expect(screen.queryByText(/Attempt \d/)).not.toBeInTheDocument();
       expect(screen.queryByTestId("auth-view")).not.toBeInTheDocument();
     });
 
@@ -458,13 +407,16 @@ describe("AuthPageWithInvitationCheck", () => {
         attemptCount: 5,
         estimatedTotalAttempts: 7,
         elapsedMs: 60000,
+        nextRetryInMs: null,
         retry: mockRetry,
       });
 
       render(<AuthPageWithInvitationCheck path="sign-in" />);
 
-      expect(screen.getByText("Unable to Connect")).toBeInTheDocument();
-      expect(screen.getByText("Server Unreachable")).toBeInTheDocument();
+      expect(screen.getByRole("alert")).toBeInTheDocument();
+      expect(
+        screen.getByText("Can't reach the Sparky server."),
+      ).toBeInTheDocument();
       expect(screen.queryByTestId("auth-view")).not.toBeInTheDocument();
     });
 
@@ -481,6 +433,7 @@ describe("AuthPageWithInvitationCheck", () => {
         attemptCount: 5,
         estimatedTotalAttempts: 7,
         elapsedMs: 60000,
+        nextRetryInMs: null,
         retry: mockRetry,
       });
 
@@ -505,6 +458,7 @@ describe("AuthPageWithInvitationCheck", () => {
         attemptCount: 0,
         estimatedTotalAttempts: 7,
         elapsedMs: 0,
+        nextRetryInMs: null,
         retry: mockRetry,
       });
 

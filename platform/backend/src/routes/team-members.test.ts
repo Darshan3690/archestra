@@ -1,34 +1,22 @@
 import { vi } from "vitest";
-import type * as originalConfigModule from "@/config";
-import type { FastifyInstanceWithZod } from "@/server";
-import { createFastifyInstance } from "@/server";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { registerAuditLogHook } from "@/middleware/audit-log-hook";
+import { AgentToolModel, TeamModel } from "@/models";
+import AgentTeamModel from "@/models/agent-team";
+import AuditLogModel from "@/models/audit-log";
 import { afterEach, beforeEach, describe, expect, test } from "@/test";
 import type { User } from "@/types";
 
-const { hasPermissionMock } = vi.hoisted(() => ({
-  hasPermissionMock: vi.fn(),
-}));
+vi.mock("@/auth");
 
-vi.mock("@/auth", async () => {
-  const actual = await vi.importActual<typeof import("@/auth")>("@/auth");
-  return {
-    ...actual,
-    hasPermission: hasPermissionMock,
-  };
-});
+import { hasPermission } from "@/auth";
 
-vi.mock("@/config", async (importOriginal) => {
-  const actual = await importOriginal<typeof originalConfigModule>();
-  return {
-    default: {
-      ...actual.default,
-      enterpriseFeatures: {
-        ...actual.default.enterpriseFeatures,
-        core: true,
-      },
-    },
-  };
-});
+vi.mock("@/config", async () =>
+  (await import("@/test/mocks/config")).configModuleMock({
+    enterpriseFeatures: { core: true },
+  }),
+);
 
 describe("team routes", () => {
   let app: FastifyInstanceWithZod;
@@ -37,7 +25,7 @@ describe("team routes", () => {
 
   beforeEach(async ({ makeAdmin, makeMember, makeOrganization }) => {
     vi.clearAllMocks();
-    hasPermissionMock.mockResolvedValue({ success: true });
+    vi.mocked(hasPermission).mockResolvedValue({ success: true, error: null });
 
     adminUser = await makeAdmin();
     const organization = await makeOrganization();
@@ -59,6 +47,8 @@ describe("team routes", () => {
         }
       ).organizationId = organizationId;
     });
+
+    registerAuditLogHook(app);
 
     const { default: teamRoutes } = await import("./team");
     await app.register(teamRoutes);
@@ -128,8 +118,11 @@ describe("team routes", () => {
       const { default: teamRoutes } = await import("./team");
       await memberApp.register(teamRoutes);
 
-      // Member does NOT have team:admin permission
-      hasPermissionMock.mockResolvedValue({ success: false });
+      // Member does not have organization-level team management permission
+      vi.mocked(hasPermission).mockResolvedValue({
+        success: false,
+        error: null,
+      });
 
       const response = await memberApp.inject({
         method: "GET",
@@ -142,6 +135,60 @@ describe("team routes", () => {
       expect(names).toContain("Visible Team");
       expect(names).not.toContain("Hidden Team");
 
+      await memberApp.close();
+    });
+
+    test("a direct team listing includes descendant summaries for inherited resource access", async ({
+      makeMember,
+      makeTeam,
+      makeTeamMember,
+      makeUser,
+    }) => {
+      const memberUser = await makeUser({ email: "hierarchy@test.com" });
+      await makeMember(memberUser.id, organizationId);
+      const parent = await makeTeam(organizationId, adminUser.id, {
+        name: "Product",
+      });
+      const child = await makeTeam(organizationId, adminUser.id, {
+        name: "Platform",
+        parentId: parent.id,
+      });
+      const grandchild = await makeTeam(organizationId, adminUser.id, {
+        name: "Runtime",
+        parentId: child.id,
+      });
+      await makeTeam(organizationId, adminUser.id, { name: "Unrelated" });
+      await makeTeamMember(parent.id, memberUser.id);
+
+      const memberApp = createFastifyInstance();
+      memberApp.addHook("onRequest", async (request) => {
+        (request as typeof request & { user: unknown }).user = memberUser;
+        (
+          request as typeof request & { organizationId: string }
+        ).organizationId = organizationId;
+      });
+      const { default: teamRoutes } = await import("./team");
+      await memberApp.register(teamRoutes);
+      vi.mocked(hasPermission).mockResolvedValue({
+        success: false,
+        error: null,
+      });
+
+      const response = await memberApp.inject({
+        method: "GET",
+        url: "/api/teams?mine=true",
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().data).toEqual([
+        expect.objectContaining({
+          id: parent.id,
+          descendantTeams: expect.arrayContaining([
+            { id: child.id, name: "Platform" },
+            { id: grandchild.id, name: "Runtime" },
+          ]),
+        }),
+      ]);
       await memberApp.close();
     });
 
@@ -172,7 +219,10 @@ describe("team routes", () => {
       const { default: teamRoutes } = await import("./team");
       await memberApp.register(teamRoutes);
 
-      hasPermissionMock.mockResolvedValue({ success: false });
+      vi.mocked(hasPermission).mockResolvedValue({
+        success: false,
+        error: null,
+      });
 
       const response = await memberApp.inject({
         method: "GET",
@@ -182,6 +232,51 @@ describe("team routes", () => {
       expect(response.statusCode).toBe(404);
 
       await memberApp.close();
+    });
+
+    test("hierarchy access does not grant parent team administration", async ({
+      makeMember,
+      makeTeam,
+      makeTeamMember,
+      makeUser,
+    }) => {
+      const childAdmin = await makeUser({ email: "child-admin@test.com" });
+      const newMember = await makeUser({ email: "new-parent-user@test.com" });
+      await makeMember(childAdmin.id, organizationId);
+      await makeMember(newMember.id, organizationId);
+      const parent = await makeTeam(organizationId, adminUser.id);
+      const child = await makeTeam(organizationId, adminUser.id, {
+        parentId: parent.id,
+      });
+      await makeTeamMember(child.id, childAdmin.id, { role: "admin" });
+
+      const childAdminApp = createFastifyInstance();
+      childAdminApp.addHook("onRequest", async (request) => {
+        (request as typeof request & { user: unknown }).user = childAdmin;
+        (
+          request as typeof request & { organizationId: string }
+        ).organizationId = organizationId;
+      });
+      const { default: teamRoutes } = await import("./team");
+      await childAdminApp.register(teamRoutes);
+      vi.mocked(hasPermission).mockResolvedValue({
+        success: false,
+        error: null,
+      });
+
+      const readResponse = await childAdminApp.inject({
+        method: "GET",
+        url: `/api/teams/${parent.id}`,
+      });
+      const addResponse = await childAdminApp.inject({
+        method: "POST",
+        url: `/api/teams/${parent.id}/members`,
+        payload: { userId: newMember.id, role: "member" },
+      });
+
+      expect(readResponse.statusCode).toBe(404);
+      expect(addResponse.statusCode).toBe(403);
+      await childAdminApp.close();
     });
 
     test("admin can get any team in the organization", async ({ makeTeam }) => {
@@ -216,6 +311,225 @@ describe("team routes", () => {
       expect(team.name).toBe("New Team");
       expect(team.description).toBe("A brand new team");
       expect(team.id).toBeDefined();
+    });
+
+    test("creates a child team and returns its parent", async ({
+      makeTeam,
+    }) => {
+      const parent = await makeTeam(organizationId, adminUser.id, {
+        name: "Platform",
+      });
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/teams",
+        payload: { name: "Runtime", parentId: parent.id },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        name: "Runtime",
+        parentId: parent.id,
+      });
+    });
+
+    test("moves a team within the hierarchy and can move it back to the root", async ({
+      makeTeam,
+    }) => {
+      const parent = await makeTeam(organizationId, adminUser.id);
+      const child = await makeTeam(organizationId, adminUser.id);
+
+      const moveResponse = await app.inject({
+        method: "PUT",
+        url: `/api/teams/${child.id}`,
+        payload: { parentId: parent.id },
+      });
+      expect(moveResponse.statusCode).toBe(200);
+      expect(moveResponse.json().parentId).toBe(parent.id);
+
+      const rootResponse = await app.inject({
+        method: "PUT",
+        url: `/api/teams/${child.id}`,
+        payload: { parentId: null },
+      });
+      expect(rootResponse.statusCode).toBe(200);
+      expect(rootResponse.json().parentId).toBeNull();
+    });
+
+    test("records a parent change in the team audit diff", async ({
+      makeTeam,
+    }) => {
+      const parent = await makeTeam(organizationId, adminUser.id);
+      const child = await makeTeam(organizationId, adminUser.id);
+
+      const response = await app.inject({
+        method: "PUT",
+        url: `/api/teams/${child.id}`,
+        payload: { parentId: parent.id },
+      });
+      expect(response.statusCode).toBe(200);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const { data } = await AuditLogModel.findPaginated({
+        organizationId,
+        resourceType: "team",
+        limit: 20,
+        offset: 0,
+      });
+      const row = data.find((entry) => entry.resourceId === child.id);
+      expect(row?.action).toBe("team.updated");
+      expect(row?.before?.parentId).toBeNull();
+      expect(row?.after?.parentId).toBe(parent.id);
+    });
+
+    test("rejects a parent from another organization", async ({
+      makeMember,
+      makeOrganization,
+      makeTeam,
+    }) => {
+      const otherOrganization = await makeOrganization();
+      await makeMember(adminUser.id, otherOrganization.id, { role: "admin" });
+      const otherTeam = await makeTeam(otherOrganization.id, adminUser.id);
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/teams",
+        payload: { name: "Invalid child", parentId: otherTeam.id },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toBe("Parent team not found");
+    });
+
+    test("does not let an ordinary parent member broaden access through a child team", async ({
+      makeTeam,
+      makeTeamMember,
+    }) => {
+      const parent = await makeTeam(organizationId, adminUser.id);
+      await makeTeamMember(parent.id, adminUser.id);
+      vi.mocked(hasPermission).mockResolvedValue({
+        success: false,
+        error: null,
+      });
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/teams",
+        payload: { name: "Unauthorized child", parentId: parent.id },
+      });
+
+      expect(response.statusCode).toBe(403);
+      expect(response.json().error.message).toBe(
+        "You can only create a child under a team you can manage",
+      );
+    });
+
+    test("lets a direct parent-team admin create a child without org-wide team management", async ({
+      makeTeam,
+      makeTeamMember,
+    }) => {
+      const parent = await makeTeam(organizationId, adminUser.id);
+      await makeTeamMember(parent.id, adminUser.id, { role: "admin" });
+      vi.mocked(hasPermission).mockResolvedValue({
+        success: false,
+        error: null,
+      });
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/teams",
+        payload: { name: "Managed child", parentId: parent.id },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().parentId).toBe(parent.id);
+    });
+
+    test("rejects self-parenting", async ({ makeTeam }) => {
+      const team = await makeTeam(organizationId, adminUser.id);
+
+      const response = await app.inject({
+        method: "PUT",
+        url: `/api/teams/${team.id}`,
+        payload: { parentId: team.id },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toBe(
+        "A team cannot be its own parent",
+      );
+    });
+
+    test("rejects a cycle through an arbitrarily deep descendant", async ({
+      makeTeam,
+    }) => {
+      const root = await makeTeam(organizationId, adminUser.id);
+      const child = await makeTeam(organizationId, adminUser.id, {
+        parentId: root.id,
+      });
+      const grandchild = await makeTeam(organizationId, adminUser.id, {
+        parentId: child.id,
+      });
+      const greatGrandchild = await makeTeam(organizationId, adminUser.id, {
+        parentId: grandchild.id,
+      });
+
+      const response = await app.inject({
+        method: "PUT",
+        url: `/api/teams/${root.id}`,
+        payload: { parentId: greatGrandchild.id },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toBe(
+        "A team cannot be moved under one of its descendants",
+      );
+      expect((await TeamModel.findById(root.id))?.parentId).toBeNull();
+    });
+
+    test("moves direct children to the root when their parent is deleted", async ({
+      makeTeam,
+    }) => {
+      const parent = await makeTeam(organizationId, adminUser.id);
+      const child = await makeTeam(organizationId, adminUser.id, {
+        parentId: parent.id,
+      });
+
+      const response = await app.inject({
+        method: "DELETE",
+        url: `/api/teams/${parent.id}`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect((await TeamModel.findById(child.id))?.parentId).toBeNull();
+    });
+
+    test("rejects an oversized team name without persisting it", async () => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/teams",
+        payload: { name: "A".repeat(257) },
+      });
+
+      expect(response.statusCode).toBe(400);
+
+      const list = await app.inject({ method: "GET", url: "/api/teams" });
+      expect(list.json().data).toHaveLength(0);
+    });
+
+    test("rejects an oversized team name on update", async ({ makeTeam }) => {
+      const team = await makeTeam(organizationId, adminUser.id, {
+        name: "Original",
+      });
+
+      const response = await app.inject({
+        method: "PUT",
+        url: `/api/teams/${team.id}`,
+        payload: { name: "A".repeat(257) },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect((await TeamModel.findById(team.id))?.name).toBe("Original");
     });
 
     test("gets a team by id", async ({ makeTeam }) => {
@@ -314,7 +628,7 @@ describe("team routes", () => {
       expect(response.statusCode).toBe(404);
     });
 
-    test("member who is team member can update their team", async ({
+    test("team admin member can update their team details without team:update", async ({
       makeTeam,
       makeUser,
       makeMember,
@@ -326,7 +640,7 @@ describe("team routes", () => {
       const team = await makeTeam(organizationId, adminUser.id, {
         name: "Editable",
       });
-      await makeTeamMember(team.id, memberUser.id);
+      await makeTeamMember(team.id, memberUser.id, { role: "admin" });
 
       const memberApp = createFastifyInstance();
       memberApp.addHook("onRequest", async (request) => {
@@ -343,7 +657,10 @@ describe("team routes", () => {
       const { default: teamRoutes } = await import("./team");
       await memberApp.register(teamRoutes);
 
-      hasPermissionMock.mockResolvedValue({ success: false });
+      vi.mocked(hasPermission).mockResolvedValue({
+        success: false,
+        error: null,
+      });
 
       const response = await memberApp.inject({
         method: "PUT",
@@ -351,16 +668,19 @@ describe("team routes", () => {
         payload: { name: "Edited By Member" },
       });
 
-      expect(response.statusCode).toBe(200);
-      expect(response.json().name).toBe("Edited By Member");
+      expect(response.statusCode, response.body).toBe(200);
+      await expect(TeamModel.findById(team.id)).resolves.toMatchObject({
+        name: "Edited By Member",
+      });
 
       await memberApp.close();
     });
 
-    test("member who is NOT team member cannot update a team", async ({
+    test("regular member cannot update a team", async ({
       makeTeam,
       makeUser,
       makeMember,
+      makeTeamMember,
     }) => {
       const memberUser = await makeUser({ email: "non-member@test.com" });
       await makeMember(memberUser.id, organizationId);
@@ -368,6 +688,7 @@ describe("team routes", () => {
       const team = await makeTeam(organizationId, adminUser.id, {
         name: "Locked",
       });
+      await makeTeamMember(team.id, memberUser.id, { role: "member" });
 
       const memberApp = createFastifyInstance();
       memberApp.addHook("onRequest", async (request) => {
@@ -384,7 +705,10 @@ describe("team routes", () => {
       const { default: teamRoutes } = await import("./team");
       await memberApp.register(teamRoutes);
 
-      hasPermissionMock.mockResolvedValue({ success: false });
+      vi.mocked(hasPermission).mockResolvedValue({
+        success: false,
+        error: null,
+      });
 
       const response = await memberApp.inject({
         method: "PUT",
@@ -403,6 +727,51 @@ describe("team routes", () => {
   // ===================================================================
 
   describe("team member management", () => {
+    test.for([
+      "",
+      "missing-synthetic-user",
+    ])("rejects an unknown target user %j without changing the team", async (userId, {
+      makeTeam,
+    }) => {
+      const team = await makeTeam(organizationId, adminUser.id);
+      const before = await TeamModel.getTeamMembersWithUsers(team.id);
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/teams/${team.id}/members`,
+        payload: { userId, role: "member" },
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json().error.message).toBe(
+        "User not found in this organization",
+      );
+      expect(await TeamModel.getTeamMembersWithUsers(team.id)).toEqual(before);
+    });
+
+    test("rejects a user outside the team's organization", async ({
+      makeTeam,
+      makeUser,
+      makeOrganization,
+      makeMember,
+    }) => {
+      const team = await makeTeam(organizationId, adminUser.id);
+      const outsider = await makeUser();
+      const otherOrg = await makeOrganization();
+      await makeMember(outsider.id, otherOrg.id);
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/teams/${team.id}/members`,
+        payload: { userId: outsider.id, role: "member" },
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json().error.message).toBe(
+        "User not found in this organization",
+      );
+      expect(await TeamModel.isUserInTeam(team.id, outsider.id)).toBe(false);
+    });
+
     test("returns hydrated team members with user details", async ({
       makeTeam,
       makeUser,
@@ -432,9 +801,14 @@ describe("team routes", () => {
       ]);
     });
 
-    test("adds a member to a team", async ({ makeTeam, makeUser }) => {
+    test("adds a member to a team", async ({
+      makeTeam,
+      makeUser,
+      makeMember,
+    }) => {
       const team = await makeTeam(organizationId, adminUser.id);
       const newMember = await makeUser({ email: "newmember@test.com" });
+      await makeMember(newMember.id, organizationId);
 
       const response = await app.inject({
         method: "POST",
@@ -444,6 +818,250 @@ describe("team routes", () => {
 
       expect(response.statusCode).toBe(200);
       expect(response.json().userId).toBe(newMember.id);
+    });
+
+    test("adding a member writes a team.updated audit row with a members diff", async ({
+      makeTeam,
+      makeUser,
+      makeMember,
+    }) => {
+      const team = await makeTeam(organizationId, adminUser.id);
+      const newMember = await makeUser({ email: "audit-add@test.com" });
+      await makeMember(newMember.id, organizationId);
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/teams/${team.id}/members`,
+        payload: { userId: newMember.id, role: "member" },
+      });
+      expect(response.statusCode).toBe(200);
+      await new Promise((r) => setTimeout(r, 50));
+
+      const { data } = await AuditLogModel.findPaginated({
+        organizationId,
+        resourceType: "team",
+        limit: 20,
+        offset: 0,
+      });
+      const row = data.find((r) => r.resourceId === team.id);
+      // Adding a member is an update to the team resource.
+      expect(row?.action).toBe("team.updated");
+      expect(row?.outcome).toBe("success");
+      expect(row?.before).not.toBeNull();
+      expect(row?.after).not.toBeNull();
+      expect(row?.before?.members).not.toEqual(row?.after?.members);
+    });
+
+    test("removing a member writes team.updated (not team.deleted) with after populated", async ({
+      makeTeam,
+      makeUser,
+      makeTeamMember,
+    }) => {
+      const team = await makeTeam(organizationId, adminUser.id);
+      const member = await makeUser({ email: "audit-del@test.com" });
+      await makeTeamMember(team.id, member.id);
+
+      const response = await app.inject({
+        method: "DELETE",
+        url: `/api/teams/${team.id}/members/${member.id}`,
+      });
+      expect(response.statusCode).toBe(200);
+      await new Promise((r) => setTimeout(r, 50));
+
+      const { data } = await AuditLogModel.findPaginated({
+        organizationId,
+        resourceType: "team",
+        limit: 20,
+        offset: 0,
+      });
+      const row = data.find(
+        (r) => r.resourceId === team.id && r.httpMethod === "DELETE",
+      );
+      // The child DELETE must read as an update (team survives), with after
+      // captured — not team.deleted / after=null.
+      expect(row?.action).toBe("team.updated");
+      expect(row?.before).not.toBeNull();
+      expect(row?.after).not.toBeNull();
+    });
+
+    test("rejects duplicate team membership", async ({
+      makeTeam,
+      makeUser,
+      makeMember,
+      makeTeamMember,
+    }) => {
+      const team = await makeTeam(organizationId, adminUser.id);
+      const existingMember = await makeUser({
+        email: "duplicate-member@test.com",
+      });
+      await makeMember(existingMember.id, organizationId);
+      await makeTeamMember(team.id, existingMember.id);
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/teams/${team.id}/members`,
+        payload: { userId: existingMember.id, role: "member" },
+      });
+
+      expect(response.statusCode).toBe(409);
+      expect(response.json().error.message).toContain("already a member");
+    });
+
+    test("team admin member can add a member without organization-level team management", async ({
+      makeTeam,
+      makeUser,
+      makeMember,
+      makeTeamMember,
+    }) => {
+      const teamAdmin = await makeUser({ email: "literal-admin@test.com" });
+      const newMember = await makeUser({ email: "literal-new@test.com" });
+      await makeMember(teamAdmin.id, organizationId);
+      await makeMember(newMember.id, organizationId);
+
+      const team = await makeTeam(organizationId, adminUser.id);
+      await makeTeamMember(team.id, teamAdmin.id, { role: "admin" });
+
+      const teamAdminApp = createFastifyInstance();
+      teamAdminApp.addHook("onRequest", async (request) => {
+        (
+          request as typeof request & { user: unknown; organizationId: string }
+        ).user = teamAdmin;
+        (
+          request as typeof request & {
+            user: { id: string };
+            organizationId: string;
+          }
+        ).organizationId = organizationId;
+      });
+      const { default: teamRoutes } = await import("./team");
+      await teamAdminApp.register(teamRoutes);
+      vi.mocked(hasPermission).mockResolvedValue({
+        success: false,
+        error: null,
+      });
+
+      const response = await teamAdminApp.inject({
+        method: "POST",
+        url: `/api/teams/${team.id}/members`,
+        payload: { userId: newMember.id, role: "member" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().userId).toBe(newMember.id);
+
+      await teamAdminApp.close();
+    });
+
+    test("regular team member cannot add members", async ({
+      makeTeam,
+      makeUser,
+      makeMember,
+      makeTeamMember,
+    }) => {
+      const regularMember = await makeUser({
+        email: "literal-member@test.com",
+      });
+      const newMember = await makeUser({ email: "blocked-new@test.com" });
+      await makeMember(regularMember.id, organizationId);
+      await makeMember(newMember.id, organizationId);
+
+      const team = await makeTeam(organizationId, adminUser.id);
+      await makeTeamMember(team.id, regularMember.id, { role: "member" });
+
+      const memberApp = createFastifyInstance();
+      memberApp.addHook("onRequest", async (request) => {
+        (
+          request as typeof request & { user: unknown; organizationId: string }
+        ).user = regularMember;
+        (
+          request as typeof request & {
+            user: { id: string };
+            organizationId: string;
+          }
+        ).organizationId = organizationId;
+      });
+      const { default: teamRoutes } = await import("./team");
+      await memberApp.register(teamRoutes);
+      vi.mocked(hasPermission).mockResolvedValue({
+        success: false,
+        error: null,
+      });
+
+      const response = await memberApp.inject({
+        method: "POST",
+        url: `/api/teams/${team.id}/members`,
+        payload: { userId: newMember.id, role: "member" },
+      });
+
+      expect(response.statusCode).toBe(403);
+
+      await memberApp.close();
+    });
+
+    test("team admin member can update member roles", async ({
+      makeTeam,
+      makeUser,
+      makeMember,
+      makeTeamMember,
+    }) => {
+      const teamAdmin = await makeUser({ email: "role-admin@test.com" });
+      const regularMember = await makeUser({ email: "promote@test.com" });
+      await makeMember(teamAdmin.id, organizationId);
+      await makeMember(regularMember.id, organizationId);
+
+      const team = await makeTeam(organizationId, adminUser.id);
+      await makeTeamMember(team.id, teamAdmin.id, { role: "admin" });
+      await makeTeamMember(team.id, regularMember.id, { role: "member" });
+
+      const teamAdminApp = createFastifyInstance();
+      teamAdminApp.addHook("onRequest", async (request) => {
+        (
+          request as typeof request & { user: unknown; organizationId: string }
+        ).user = teamAdmin;
+        (
+          request as typeof request & {
+            user: { id: string };
+            organizationId: string;
+          }
+        ).organizationId = organizationId;
+      });
+      const { default: teamRoutes } = await import("./team");
+      await teamAdminApp.register(teamRoutes);
+      vi.mocked(hasPermission).mockResolvedValue({
+        success: false,
+        error: null,
+      });
+
+      const response = await teamAdminApp.inject({
+        method: "PUT",
+        url: `/api/teams/${team.id}/members/${regularMember.id}`,
+        payload: { role: "admin" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().role).toBe("admin");
+
+      await teamAdminApp.close();
+    });
+
+    test("cannot demote the last team admin", async ({
+      makeTeam,
+      makeUser,
+      makeTeamMember,
+    }) => {
+      const team = await makeTeam(organizationId, adminUser.id);
+      const onlyAdmin = await makeUser({ email: "only-admin@test.com" });
+      await makeTeamMember(team.id, onlyAdmin.id, { role: "admin" });
+
+      const response = await app.inject({
+        method: "PUT",
+        url: `/api/teams/${team.id}/members/${onlyAdmin.id}`,
+        payload: { role: "member" },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toContain("last admin");
+      expect(await TeamModel.isUserTeamAdmin(team.id, onlyAdmin.id)).toBe(true);
     });
 
     test("removes a member from a team", async ({
@@ -472,6 +1090,136 @@ describe("team routes", () => {
       expect(
         members.some((m: { userId: string }) => m.userId === member.id),
       ).toBe(false);
+    });
+
+    test("removing a child member clears credential pins for ancestor resources", async ({
+      makeAgentTool,
+      makeInternalAgent,
+      makeMcpServer,
+      makeMember,
+      makeTeam,
+      makeTeamMember,
+      makeTool,
+      makeUser,
+    }) => {
+      const parent = await makeTeam(organizationId, adminUser.id, {
+        name: "Parent",
+      });
+      const child = await makeTeam(organizationId, adminUser.id, {
+        name: "Child",
+        parentId: parent.id,
+      });
+      const member = await makeUser({ email: "nested-member@test.com" });
+      await makeMember(member.id, organizationId);
+      await makeTeamMember(child.id, member.id);
+
+      const connection = await makeMcpServer({
+        ownerId: member.id,
+        scope: "personal",
+      });
+      const tool = await makeTool({ catalogId: connection.catalogId });
+      const agent = await makeInternalAgent({
+        organizationId,
+        authorId: adminUser.id,
+        access: { teams: [parent.id] },
+      });
+      // The cleanup walks the team's agent assignments, not its grants.
+      await AgentTeamModel.assignTeamsToAgent(agent.id, [parent.id]);
+      await makeAgentTool(agent.id, tool.id, {
+        mcpServerId: connection.id,
+        credentialResolutionMode: "static",
+      });
+
+      const deleteResponse = await app.inject({
+        method: "DELETE",
+        url: `/api/teams/${child.id}/members/${member.id}`,
+      });
+
+      expect(deleteResponse.statusCode).toBe(200);
+      await expect(
+        AgentToolModel.findAssignmentsByAgent(agent.id),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          toolId: tool.id,
+          mcpServerId: null,
+        }),
+      ]);
+    });
+
+    test("removing one child membership preserves pins when another child still grants access", async ({
+      makeAgentTool,
+      makeInternalAgent,
+      makeMcpServer,
+      makeMember,
+      makeTeam,
+      makeTeamMember,
+      makeTool,
+      makeUser,
+    }) => {
+      const parent = await makeTeam(organizationId, adminUser.id);
+      const firstChild = await makeTeam(organizationId, adminUser.id, {
+        parentId: parent.id,
+      });
+      const secondChild = await makeTeam(organizationId, adminUser.id, {
+        parentId: parent.id,
+      });
+      const member = await makeUser({ email: "multi-path-member@test.com" });
+      await makeMember(member.id, organizationId);
+      await makeTeamMember(firstChild.id, member.id);
+      await makeTeamMember(secondChild.id, member.id);
+
+      const connection = await makeMcpServer({
+        ownerId: member.id,
+        scope: "personal",
+      });
+      const tool = await makeTool({ catalogId: connection.catalogId });
+      const agent = await makeInternalAgent({
+        organizationId,
+        authorId: adminUser.id,
+        access: { teams: [parent.id] },
+      });
+      // The cleanup walks the team's agent assignments, not its grants.
+      await AgentTeamModel.assignTeamsToAgent(agent.id, [parent.id]);
+      await makeAgentTool(agent.id, tool.id, {
+        mcpServerId: connection.id,
+        credentialResolutionMode: "static",
+      });
+
+      const deleteResponse = await app.inject({
+        method: "DELETE",
+        url: `/api/teams/${firstChild.id}/members/${member.id}`,
+      });
+
+      expect(deleteResponse.statusCode).toBe(200);
+      await expect(
+        AgentToolModel.findAssignmentsByAgent(agent.id),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          toolId: tool.id,
+          mcpServerId: connection.id,
+        }),
+      ]);
+    });
+
+    test("cannot remove the last team admin", async ({
+      makeTeam,
+      makeUser,
+      makeTeamMember,
+    }) => {
+      const team = await makeTeam(organizationId, adminUser.id);
+      const onlyAdmin = await makeUser({
+        email: "only-admin-remove@test.com",
+      });
+      await makeTeamMember(team.id, onlyAdmin.id, { role: "admin" });
+
+      const response = await app.inject({
+        method: "DELETE",
+        url: `/api/teams/${team.id}/members/${onlyAdmin.id}`,
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toContain("last admin");
+      expect(await TeamModel.isUserInTeam(team.id, onlyAdmin.id)).toBe(true);
     });
 
     test("returns 404 when listing members of non-existent team", async () => {
@@ -521,7 +1269,10 @@ describe("team routes", () => {
       const { default: teamRoutes } = await import("./team");
       await memberApp.register(teamRoutes);
 
-      hasPermissionMock.mockResolvedValue({ success: false });
+      vi.mocked(hasPermission).mockResolvedValue({
+        success: false,
+        error: null,
+      });
 
       const response = await memberApp.inject({
         method: "GET",
@@ -535,10 +1286,10 @@ describe("team routes", () => {
   });
 
   // ===================================================================
-  // External Group Mappings (Enterprise Feature)
+  // Team Sync group links (Enterprise Feature)
   // ===================================================================
 
-  describe("external group mappings", () => {
+  describe("Team Sync group links", () => {
     test("lists external groups for a team", async ({ makeTeam }) => {
       const team = await makeTeam(organizationId, adminUser.id);
 
@@ -551,7 +1302,64 @@ describe("team routes", () => {
       expect(response.json()).toEqual([]);
     });
 
-    test("adds an external group mapping", async ({ makeTeam }) => {
+    test("allows identity-provider readers to list external groups without team access", async ({
+      makeTeam,
+    }) => {
+      const team = await makeTeam(organizationId, adminUser.id);
+      // The caller is not a team manager and not a team member — they only
+      // hold identityProvider:read (group sync is IdP configuration).
+      vi.mocked(hasPermission).mockImplementation(async (permissions) =>
+        "identityProvider" in permissions
+          ? { success: true, error: null }
+          : { success: false, error: null },
+      );
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/teams/${team.id}/external-groups`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual([]);
+    });
+
+    test("hides external groups from callers with neither team access nor identity-provider read", async ({
+      makeTeam,
+    }) => {
+      const team = await makeTeam(organizationId, adminUser.id);
+      vi.mocked(hasPermission).mockResolvedValue({
+        success: false,
+        error: null,
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/teams/${team.id}/external-groups`,
+      });
+
+      expect(response.statusCode).toBe(404);
+    });
+
+    test("identity-provider read alone does not allow adding a mapping", async ({
+      makeTeam,
+    }) => {
+      const team = await makeTeam(organizationId, adminUser.id);
+      vi.mocked(hasPermission).mockImplementation(async (permissions) =>
+        "identityProvider" in permissions
+          ? { success: true, error: null }
+          : { success: false, error: null },
+      );
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/teams/${team.id}/external-groups`,
+        payload: { groupIdentifier: "engineering" },
+      });
+
+      expect(response.statusCode).toBe(403);
+    });
+
+    test("adds a Team Sync group link", async ({ makeTeam }) => {
       const team = await makeTeam(organizationId, adminUser.id);
 
       const response = await app.inject({
@@ -566,7 +1374,7 @@ describe("team routes", () => {
       expect(group.id).toBeDefined();
     });
 
-    test("removes an external group mapping", async ({ makeTeam }) => {
+    test("removes a Team Sync group link", async ({ makeTeam }) => {
       const team = await makeTeam(organizationId, adminUser.id);
 
       // Add a group first
@@ -594,7 +1402,7 @@ describe("team routes", () => {
       expect(listResponse.json()).toEqual([]);
     });
 
-    test("prevents duplicate external group mappings", async ({ makeTeam }) => {
+    test("prevents duplicate Team Sync group links", async ({ makeTeam }) => {
       const team = await makeTeam(organizationId, adminUser.id);
 
       await app.inject({
@@ -611,7 +1419,7 @@ describe("team routes", () => {
 
       expect(duplicateResponse.statusCode).toBe(409);
       expect(duplicateResponse.json().error.message).toContain(
-        "already mapped",
+        "already linked",
       );
     });
 
@@ -626,6 +1434,160 @@ describe("team routes", () => {
 
       expect(response.statusCode).toBe(200);
       expect(response.json().groupIdentifier).toBe("engineering-team");
+    });
+
+    test("team admin member can add Team Sync group links", async ({
+      makeTeam,
+      makeUser,
+      makeMember,
+      makeTeamMember,
+    }) => {
+      const teamAdmin = await makeUser({ email: "sync-admin@test.com" });
+      await makeMember(teamAdmin.id, organizationId);
+      const team = await makeTeam(organizationId, adminUser.id);
+      await makeTeamMember(team.id, teamAdmin.id, { role: "admin" });
+
+      const teamAdminApp = createFastifyInstance();
+      teamAdminApp.addHook("onRequest", async (request) => {
+        (
+          request as typeof request & { user: unknown; organizationId: string }
+        ).user = teamAdmin;
+        (
+          request as typeof request & {
+            user: { id: string };
+            organizationId: string;
+          }
+        ).organizationId = organizationId;
+      });
+      const { default: teamRoutes } = await import("./team");
+      await teamAdminApp.register(teamRoutes);
+      vi.mocked(hasPermission).mockResolvedValue({
+        success: false,
+        error: null,
+      });
+
+      const response = await teamAdminApp.inject({
+        method: "POST",
+        url: `/api/teams/${team.id}/external-groups`,
+        payload: { groupIdentifier: "engineering" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().groupIdentifier).toBe("engineering");
+
+      await teamAdminApp.close();
+    });
+
+    test("team admin member can remove Team Sync group links", async ({
+      makeTeam,
+      makeUser,
+      makeMember,
+      makeTeamMember,
+    }) => {
+      const teamAdmin = await makeUser({
+        email: "sync-remove-admin@test.com",
+      });
+      await makeMember(teamAdmin.id, organizationId);
+      const team = await makeTeam(organizationId, adminUser.id);
+      await makeTeamMember(team.id, teamAdmin.id, { role: "admin" });
+
+      const addResponse = await app.inject({
+        method: "POST",
+        url: `/api/teams/${team.id}/external-groups`,
+        payload: { groupIdentifier: "platform-admins" },
+      });
+      const group = addResponse.json();
+
+      const teamAdminApp = createFastifyInstance();
+      teamAdminApp.addHook("onRequest", async (request) => {
+        (
+          request as typeof request & { user: unknown; organizationId: string }
+        ).user = teamAdmin;
+        (
+          request as typeof request & {
+            user: { id: string };
+            organizationId: string;
+          }
+        ).organizationId = organizationId;
+      });
+      const { default: teamRoutes } = await import("./team");
+      await teamAdminApp.register(teamRoutes);
+      vi.mocked(hasPermission).mockResolvedValue({
+        success: false,
+        error: null,
+      });
+
+      const deleteResponse = await teamAdminApp.inject({
+        method: "DELETE",
+        url: `/api/teams/${team.id}/external-groups/${group.id}`,
+      });
+
+      expect(deleteResponse.statusCode).toBe(200);
+      expect(deleteResponse.json().success).toBe(true);
+      expect(await TeamModel.getExternalGroups(team.id)).toEqual([]);
+
+      await teamAdminApp.close();
+    });
+
+    test("legacy team admin action does not grant team management", async ({
+      makeTeam,
+      makeUser,
+      makeMember,
+      makeTeamMember,
+    }) => {
+      const legacyRoleUser = await makeUser({
+        email: "legacy-team-admin@test.com",
+      });
+      await makeMember(legacyRoleUser.id, organizationId);
+      const team = await makeTeam(organizationId, adminUser.id);
+      await makeTeamMember(team.id, legacyRoleUser.id, { role: "member" });
+
+      const legacyRoleApp = createFastifyInstance();
+      legacyRoleApp.addHook("onRequest", async (request) => {
+        (
+          request as typeof request & { user: unknown; organizationId: string }
+        ).user = legacyRoleUser;
+        (
+          request as typeof request & {
+            user: { id: string };
+            organizationId: string;
+          }
+        ).organizationId = organizationId;
+      });
+      const { default: teamRoutes } = await import("./team");
+      await legacyRoleApp.register(teamRoutes);
+      vi.mocked(hasPermission).mockImplementation(async (permissions) => ({
+        success:
+          (permissions?.team as string[] | undefined)?.includes("admin") ??
+          false,
+        error: null,
+      }));
+
+      const response = await legacyRoleApp.inject({
+        method: "POST",
+        url: `/api/teams/${team.id}/external-groups`,
+        payload: { groupIdentifier: "legacy-admins" },
+      });
+
+      expect(response.statusCode).toBe(403);
+      expect(response.json().error.message).toContain("team admin");
+      // Org-wide team management is read off team:update. team:create is only
+      // the right to make a new team, which says nothing about administering
+      // teams the caller does not belong to; team:admin is not a real action.
+      expect(vi.mocked(hasPermission)).toHaveBeenCalledWith(
+        { team: ["update"] },
+        expect.any(Object),
+      );
+      expect(vi.mocked(hasPermission)).not.toHaveBeenCalledWith(
+        { team: ["admin"] },
+        expect.any(Object),
+      );
+      expect(vi.mocked(hasPermission)).not.toHaveBeenCalledWith(
+        { team: ["create"] },
+        expect.any(Object),
+      );
+
+      await legacyRoleApp.close();
     });
 
     test("returns 404 when removing non-existent group mapping", async ({
@@ -648,6 +1610,101 @@ describe("team routes", () => {
       });
 
       expect(response.statusCode).toBe(404);
+    });
+  });
+
+  describe("GET /api/teams ?mine", () => {
+    test("organization-level team manager sees all teams by default but only member teams with ?mine", async ({
+      makeTeam,
+      makeTeamMember,
+    }) => {
+      // hasPermission is mocked to success in beforeEach, so the caller has
+      // organization-level team management (would otherwise see every team).
+      const teamA = await makeTeam(organizationId, adminUser.id, {
+        name: "Team A",
+      });
+      const teamB = await makeTeam(organizationId, adminUser.id, {
+        name: "Team B",
+      });
+      await makeTeamMember(teamA.id, adminUser.id);
+
+      const all = await app.inject({ method: "GET", url: "/api/teams" });
+      expect(all.statusCode).toBe(200);
+      const allIds = (all.json().data as { id: string }[]).map((t) => t.id);
+      expect(allIds).toEqual(expect.arrayContaining([teamA.id, teamB.id]));
+
+      const mine = await app.inject({
+        method: "GET",
+        url: "/api/teams?mine=true",
+      });
+      expect(mine.statusCode).toBe(200);
+      const mineIds = (mine.json().data as { id: string }[]).map((t) => t.id);
+      expect(mineIds).toContain(teamA.id);
+      expect(mineIds).not.toContain(teamB.id);
+    });
+  });
+
+  /**
+   * Creating a team used to leave the creator outside it: `created_by` was set
+   * but no `team_member` row was written, and every team-scoped check reads
+   * membership. A caller without organization-level team management could
+   * therefore create a team and then not read it, manage its members, or see it
+   * under "my teams". These tests hold the creator's own access open, so they
+   * drop `team: ["update"]` — the only remaining route to access is being the
+   * team's admin.
+   */
+  describe("team creator access without organization-level team management", () => {
+    const createTeam = (name: string) =>
+      app.inject({ method: "POST", url: "/api/teams", payload: { name } });
+
+    beforeEach(() => {
+      vi.mocked(hasPermission).mockResolvedValue({
+        success: false,
+        error: null,
+      });
+    });
+
+    test("the creator can read the team they just created", async () => {
+      const created = await createTeam("Engineering");
+      expect(created.statusCode).toBe(200);
+      const teamId = created.json().id as string;
+
+      const read = await app.inject({
+        method: "GET",
+        url: `/api/teams/${teamId}`,
+      });
+      expect(read.statusCode).toBe(200);
+      expect(read.json().id).toBe(teamId);
+    });
+
+    test("the creator can manage members of the team they just created", async ({
+      makeUser,
+      makeMember,
+    }) => {
+      const created = await createTeam("Engineering");
+      const teamId = created.json().id as string;
+      const teammate = await makeUser();
+      await makeMember(teammate.id, organizationId);
+
+      const added = await app.inject({
+        method: "POST",
+        url: `/api/teams/${teamId}/members`,
+        payload: { userId: teammate.id, role: "member" },
+      });
+      expect(added.statusCode).toBe(200);
+    });
+
+    test("the created team appears under the creator's own teams", async () => {
+      const created = await createTeam("Engineering");
+      const teamId = created.json().id as string;
+
+      const mine = await app.inject({
+        method: "GET",
+        url: "/api/teams?mine=true",
+      });
+      expect(mine.statusCode).toBe(200);
+      const mineIds = (mine.json().data as { id: string }[]).map((t) => t.id);
+      expect(mineIds).toContain(teamId);
     });
   });
 });

@@ -1,0 +1,232 @@
+import { describe, expect, test } from "vitest";
+import { encodeOpenAiCodexCredential } from "@/services/openai-codex-credentials";
+import { encodeXaiSubscriptionCredential } from "@/services/xai-subscription-credentials";
+import { anthropicAdapterFactory } from "../adapters/anthropic";
+import { kimiCodeAdapterFactory } from "../adapters/kimi-code";
+import { openaiAdapterFactory } from "../adapters/openai";
+import { openAiResponsesAdapterFactory } from "../adapters/openai-responses";
+import { xaiAdapterFactory } from "../adapters/xai";
+import {
+  refineAnthropicBillingModeFromHeaders,
+  resolveInteractionBillingMode,
+} from "./billing-mode";
+
+describe("resolveInteractionBillingMode", () => {
+  test("subscription credential => subscription", () => {
+    expect(
+      resolveInteractionBillingMode({
+        isSubscriptionCredential: true,
+        autodetectEnabled: true,
+      }),
+    ).toBe("subscription");
+  });
+
+  test("non-subscription credential stays metered", () => {
+    expect(
+      resolveInteractionBillingMode({
+        isSubscriptionCredential: false,
+        autodetectEnabled: true,
+      }),
+    ).toBe("metered");
+  });
+
+  test("autodetect disabled forces metered", () => {
+    expect(
+      resolveInteractionBillingMode({
+        isSubscriptionCredential: true,
+        autodetectEnabled: false,
+      }),
+    ).toBe("metered");
+  });
+});
+
+describe("refineAnthropicBillingModeFromHeaders", () => {
+  test("OAuth request fulfilled from paid overage becomes metered", () => {
+    expect(
+      refineAnthropicBillingModeFromHeaders({
+        billingMode: "subscription",
+        headers: new Headers({
+          "anthropic-ratelimit-unified-status": "rejected",
+          "anthropic-ratelimit-unified-overage-status": "allowed",
+        }),
+      }),
+    ).toBe("metered");
+  });
+
+  test("overage warning is still paid overage", () => {
+    expect(
+      refineAnthropicBillingModeFromHeaders({
+        billingMode: "subscription",
+        headers: new Headers({
+          "anthropic-ratelimit-unified-status": "rejected",
+          "anthropic-ratelimit-unified-overage-status": "allowed_warning",
+        }),
+      }),
+    ).toBe("metered");
+  });
+
+  test("available overage does not reclassify included usage", () => {
+    expect(
+      refineAnthropicBillingModeFromHeaders({
+        billingMode: "subscription",
+        headers: new Headers({
+          "anthropic-ratelimit-unified-status": "allowed",
+          "anthropic-ratelimit-unified-overage-status": "allowed",
+        }),
+      }),
+    ).toBe("subscription");
+  });
+
+  test("missing headers keep the credential-derived classification", () => {
+    expect(
+      refineAnthropicBillingModeFromHeaders({
+        billingMode: "subscription",
+        headers: new Headers(),
+      }),
+    ).toBe("subscription");
+  });
+
+  test("metered credentials cannot be reclassified", () => {
+    expect(
+      refineAnthropicBillingModeFromHeaders({
+        billingMode: "metered",
+        headers: new Headers({
+          "anthropic-ratelimit-unified-status": "rejected",
+          "anthropic-ratelimit-unified-overage-status": "allowed",
+        }),
+      }),
+    ).toBe("metered");
+  });
+});
+
+describe("anthropic isSubscriptionCredential (credential format)", () => {
+  const isSubscription = (credential: string | undefined) =>
+    anthropicAdapterFactory.isSubscriptionCredential?.(credential) ?? false;
+
+  test("forwarded OAuth access token (Claude Code passthrough) => subscription", () => {
+    expect(isSubscription("Bearer:sk-ant-oat01-abc123")).toBe(true);
+  });
+
+  test("stored OAuth access token (no Bearer sentinel) => subscription", () => {
+    expect(isSubscription("sk-ant-oat01-abc123")).toBe(true);
+  });
+
+  test("metered API key via x-api-key stays metered", () => {
+    expect(isSubscription("sk-ant-api03-abc123")).toBe(false);
+  });
+
+  test("forwarded non-OAuth Bearer (e.g. Workload Identity) stays metered", () => {
+    // A Bearer transport alone is not a subscription signal — only the
+    // sk-ant-oat… token format is.
+    expect(isSubscription("Bearer:ya29.some-wif-access-token")).toBe(false);
+  });
+
+  test("forwarded metered API key over Bearer stays metered", () => {
+    expect(isSubscription("Bearer:sk-ant-api03-abc123")).toBe(false);
+  });
+
+  test("undefined credential stays metered", () => {
+    expect(isSubscription(undefined)).toBe(false);
+  });
+});
+
+describe("openai isSubscriptionCredential (Codex credential format)", () => {
+  const codexCredential = encodeOpenAiCodexCredential({
+    refreshToken: "rt_test",
+    accountId: "acct_test",
+  });
+
+  const adapters = [
+    ["chat completions", openaiAdapterFactory],
+    ["responses", openAiResponsesAdapterFactory],
+  ] as const;
+
+  for (const [label, adapter] of adapters) {
+    const isSubscription = (apiKey: string | undefined) =>
+      adapter.isSubscriptionCredential?.(apiKey) ?? false;
+
+    test(`${label}: encoded ChatGPT-subscription credential => subscription`, () => {
+      expect(isSubscription(codexCredential)).toBe(true);
+    });
+
+    test(`${label}: Bearer-prefixed encoded credential => subscription`, () => {
+      // extractApiKey returns the authorization header as-is, so the encoded
+      // credential can arrive with a `Bearer ` transport prefix.
+      expect(isSubscription(`Bearer ${codexCredential}`)).toBe(true);
+    });
+
+    test(`${label}: plain API key stays metered`, () => {
+      expect(isSubscription("sk-proj-abc123")).toBe(false);
+    });
+
+    test(`${label}: Bearer-prefixed API key stays metered`, () => {
+      expect(isSubscription("Bearer sk-proj-abc123")).toBe(false);
+    });
+
+    test(`${label}: undefined credential stays metered`, () => {
+      expect(isSubscription(undefined)).toBe(false);
+    });
+  }
+});
+
+describe("xai isSubscriptionCredential (X Premium credential format)", () => {
+  const subscriptionCredential = encodeXaiSubscriptionCredential({
+    refreshToken: "rt_test",
+    userId: "x-user-123",
+  });
+  const isSubscription = (apiKey: string | undefined) =>
+    xaiAdapterFactory.isSubscriptionCredential?.(apiKey) ?? false;
+
+  test("encoded X Premium credential => subscription", () => {
+    expect(isSubscription(subscriptionCredential)).toBe(true);
+  });
+
+  test("Bearer-prefixed encoded credential => subscription", () => {
+    // extractApiKey returns the authorization header as-is, so the encoded
+    // credential can arrive with a `Bearer ` transport prefix.
+    expect(isSubscription(`Bearer ${subscriptionCredential}`)).toBe(true);
+  });
+
+  test("plain console API key stays metered", () => {
+    expect(isSubscription("xai-abc123")).toBe(false);
+  });
+
+  test("Bearer-prefixed console API key stays metered", () => {
+    expect(isSubscription("Bearer xai-abc123")).toBe(false);
+  });
+
+  test("undefined credential stays metered", () => {
+    expect(isSubscription(undefined)).toBe(false);
+  });
+});
+
+describe("kimi-code isSubscriptionCredential (credential format)", () => {
+  const isSubscription = (credential: string | undefined) =>
+    kimiCodeAdapterFactory.isSubscriptionCredential?.(credential) ?? false;
+
+  test("Kimi Code membership key draws on the plan => subscription", () => {
+    expect(isSubscription("Bearer sk-kimi-abc123")).toBe(true);
+    expect(isSubscription("sk-kimi-abc123")).toBe(true);
+  });
+
+  test("a Kimi Code sign-in token draws on the plan => subscription", () => {
+    // Kimi Code 2.3.3 issues an opaque 21-character token.
+    expect(isSubscription("Bearer Ab3dEf6hIj9kLm2nOp5qR")).toBe(true);
+    expect(isSubscription("Ab3dEf6hIj9kLm2nOp5qR")).toBe(true);
+  });
+
+  test("a Moonshot key stays metered", () => {
+    expect(isSubscription("Bearer sk-abc123")).toBe(false);
+    expect(isSubscription("sk-abc123def456ghi789")).toBe(false);
+  });
+
+  test("a credential that is neither stays metered", () => {
+    // Not a Kimi Code token: a JWT, a short placeholder, a key with spaces.
+    expect(isSubscription("Bearer eyJhbGciOiJIUzI1NiJ9.e30.signature")).toBe(
+      false,
+    );
+    expect(isSubscription("placeholder")).toBe(false);
+    expect(isSubscription("not a key")).toBe(false);
+    expect(isSubscription(undefined)).toBe(false);
+  });
+});

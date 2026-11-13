@@ -9,7 +9,10 @@
  * the most recent ones intact so the LLM can work with current state.
  */
 
-import { isLargeResultBrowserMcpTool, parseFullToolName } from "@shared";
+import {
+  isLargeResultBrowserMcpTool,
+  parseFullToolName,
+} from "@archestra/shared";
 import logger from "@/logging";
 import {
   estimateToolResultContentLength,
@@ -214,7 +217,7 @@ function createPlaceholder(
 export function stripBrowserToolsResults<T extends Message>(
   messages: T[],
 ): T[] {
-  logger.info(
+  logger.debug(
     { messageCount: messages.length },
     "[stripBrowserToolsResults] Starting",
   );
@@ -269,7 +272,7 @@ export function stripBrowserToolsResults<T extends Message>(
     return msg;
   });
 
-  logger.info(
+  logger.debug(
     { strippedCount, toolMessagesCount, totalMessages: messages.length },
     "[stripBrowserToolsResults] Completed",
   );

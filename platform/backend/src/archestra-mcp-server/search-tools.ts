@@ -1,20 +1,94 @@
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import {
+  ARCHESTRA_MCP_CATALOG_ID,
+  isAlwaysExposedArchestraToolShortName,
+  isChatOnlyArchestraToolShortName,
+  isImplicitOpenAppaReadToolShortName,
+  isRequiredOpenAppaToolShortName,
+  isRunControlArchestraToolShortName,
+  isYellToolShortName,
+  type ModelSelection,
   parseFullToolName,
+  TOOL_ASK_USER_SHORT_NAME,
+  TOOL_LIST_PEER_MESSAGES_SHORT_NAME,
+  TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME,
+  TOOL_READ_PEER_MESSAGE_SHORT_NAME,
+  TOOL_RUN_COMMAND_SHORT_NAME,
   TOOL_RUN_TOOL_SHORT_NAME,
   TOOL_SEARCH_TOOLS_SHORT_NAME,
-} from "@shared";
+  TOOL_START_AGENT_RUN_SHORT_NAME,
+} from "@archestra/shared";
+import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import safeRegex from "safe-regex2";
 import { z } from "zod";
-import { InternalMcpCatalogModel, ToolModel } from "@/models";
+import type { TargetInstallCaller } from "@/clients/mcp-client";
+import logger from "@/logging";
+import {
+  AgentModel,
+  ConversationEnabledToolModel,
+  InternalMcpCatalogModel,
+  McpServerModel,
+  ToolSearchTextModel,
+} from "@/models";
+import {
+  isAppaDelegatedRun,
+  openappaEnabled,
+  openappaYellEnabled,
+} from "@/openappa/service";
+import { isAnyAgentRuntimeBackendDriverEnabled } from "@/services/agent-runtime/backends";
+import { isAgentRunGatewayToken } from "@/services/agent-runtime/runtime-contract";
+import {
+  type AgentToolExclusionSets,
+  agentToolExclusionsService,
+  isToolIdentityExcluded,
+} from "@/services/agent-tool-exclusions";
+import {
+  appLaunchToolDescription,
+  sanitizeAppNameForToolMetadata,
+} from "@/services/apps/app-run-link";
+import { filterToolsByCallerCatalogAccess } from "@/services/caller-catalog-access";
+import { getGuardrailsDeployment } from "@/services/guardrails-deployment";
+import { buildKnowledgeSourcesDescription } from "@/services/knowledge-sources-description";
+import { describeToolsForCaller } from "@/services/mcp-install-tool-descriptions";
+import { isSkillSandboxAvailableForAgent } from "@/skills/skill-sandbox-availability";
+import { APP_LAUNCH_TOOL_NAME } from "@/types/app";
 import { archestraMcpBranding } from "./branding";
+import { isToolEnabledForConversation } from "./conversation-tool-filter";
 import { getAgentTools } from "./delegation";
+import { getUnassignedDiscoverableTools } from "./dynamic-tools";
 import {
   defineArchestraTool,
   defineArchestraTools,
   errorResult,
   structuredSuccessResult,
 } from "./helpers";
+import { isOpenappaTool, tools as openappaMcpTools } from "./openappa";
 import { filterToolNamesByPermission } from "./rbac";
+import {
+  type KeywordSearchText,
+  type PreparedSearchQuery,
+  prepareSearchQuery,
+  rankByKeyword,
+} from "./search-ranking";
+import {
+  hashToolDefinition,
+  normalizeSearchText as normalizeText,
+  tokenizeNormalizedText as tokenize,
+  tokenizeSearchText,
+} from "./search-text";
+import pregeneratedSearchTexts from "./search-texts.generated.json";
+import { getSkillDelegationTools } from "./skill-delegation";
+import { tools as runtimeMcpTools } from "./tasks";
+
+// The most tools one search returns. A model that wants the whole catalog
+// often asks for more (limit: 100), so a larger limit is capped instead of
+// failing the call. The schema has no `maximum` for the same reason: a client
+// that checks input against it would refuse the call before it arrives.
+const MAX_SEARCH_LIMIT = 20;
+
+// Room for a regex alternation that names a few dozen tools. The bound only
+// stops runaway input; paging with offset, not a longer query, is how a model
+// sees matches past one page.
+const MAX_QUERY_LENGTH = 1000;
 
 const SearchToolsArgsSchema = z
   .object({
@@ -22,32 +96,104 @@ const SearchToolsArgsSchema = z
       .string()
       .trim()
       .min(1)
-      .max(200)
+      .max(MAX_QUERY_LENGTH)
       .describe(
-        "Natural-language search query describing the capability you need. Searches tool names, descriptions, argument names, and argument descriptions.",
+        "Keywords for the capability you need — combine the action (verb + object) with the server/product name when you know it, e.g. 'github search repositories' or 'slack send message'. Avoid querying with a bare product/server name on its own. Results are keyword-ranked across tool names, descriptions, and argument names/descriptions. If nothing fits, reformulate with different keywords and search again rather than settling for a poor match.",
       ),
     limit: z
       .number()
       .int()
       .positive()
-      .max(20)
+      .overwrite((limit) => Math.min(limit, MAX_SEARCH_LIMIT))
       .optional()
       .default(8)
-      .describe("Maximum number of matching tools to return."),
+      .describe(
+        `Maximum number of matching tools to return, at most ${MAX_SEARCH_LIMIT}. A larger value returns ${MAX_SEARCH_LIMIT}.`,
+      ),
+    offset: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .default(0)
+      .describe(
+        "Number of ranked matches to skip. To see the matches after a truncated result, repeat the same query with offset set to the result's nextOffset.",
+      ),
+    mode: z
+      .enum(["keyword", "regex"])
+      .optional()
+      .default("keyword")
+      .describe(
+        "Search mode. 'keyword' (default) keyword-ranks the query across tool fields. 'regex' treats query as a case-insensitive regular expression matched against tool names, titles, and descriptions — use it when you know a naming pattern, e.g. '^github__' or 'search|find'.",
+      ),
   })
   .strict();
 
+// Internal intermediate only — the model sees the flat `params` string built from
+// these, never the structured form, so a plain recursive type is enough (no Zod,
+// no place in SearchToolsOutputSchema). `properties` carries one further nested
+// level; recursion depth is bounded by MAX_NESTED_DEPTH in summarizeNestedProperties.
+type NestedParameterSummary = {
+  name: string;
+  type: string | null;
+  required: boolean;
+  properties: NestedParameterSummary[] | null;
+};
+
+type InputParameterSummary = {
+  name: string;
+  required: boolean;
+  type: string | null;
+  enum: unknown[] | null;
+  description: string | null;
+  properties: NestedParameterSummary[] | null;
+  // True when the compact summary elides object content — a freeform/extensible
+  // object, or nesting deeper than the levels shown. Rendered as a trailing '…'.
+  hasHiddenDetail: boolean;
+};
+
+// cap on enum values rendered inline in a parameter signature; the full list
+// stays recoverable via run_tool validation feedback.
+const PARAM_ENUM_VALUE_CAP = 20;
+
+// how many nested levels below a top-level param the compact summary expands:
+// the param's children (level 1) and their children (level 2). Object content
+// past this is collapsed behind the hidden-detail marker.
+const MAX_NESTED_DEPTH = 2;
+
 const SearchToolsOutputSchema = z.object({
   total: z.number().int().nonnegative().describe("Number of returned tools."),
+  matchCount: z
+    .number()
+    .int()
+    .nonnegative()
+    .describe(
+      "Total tools matching the query before offset and limit were applied (>= total).",
+    ),
+  truncated: z
+    .boolean()
+    .describe(
+      "True when more matches follow this page (results cut by limit).",
+    ),
+  nextOffset: z
+    .number()
+    .int()
+    .nonnegative()
+    .nullable()
+    .describe(
+      "The offset that returns the next page of matches, or null when no matches follow this page.",
+    ),
+  hint: z
+    .string()
+    .nullable()
+    .describe(
+      "Actionable guidance when results were truncated or empty (a truncated result names the offset of the next page; an empty result also names which query terms matched no tool text).",
+    ),
   tools: z.array(
     z.object({
       toolName: z
         .string()
         .describe(`Exact tool name to pass to ${TOOL_RUN_TOOL_SHORT_NAME}.`),
-      title: z
-        .string()
-        .nullable()
-        .describe("Human-friendly title when available."),
       description: z
         .string()
         .nullable()
@@ -61,20 +207,32 @@ const SearchToolsOutputSchema = z.object({
         .describe(
           "MCP server prefix for third-party MCP tools when available.",
         ),
-      catalogName: z
+      available: z
+        .boolean()
+        .describe(
+          "False when the tool's MCP connection is not installed; it stays " +
+            "discoverable but cannot run until reconnected.",
+        ),
+      unavailableReason: z
         .string()
         .nullable()
-        .describe("Catalog name for installed MCP tools when available."),
-      inputParameters: z.array(
-        z.object({
-          name: z.string().describe("Top-level input parameter name."),
-          required: z.boolean().describe("Whether the parameter is required."),
-          description: z
-            .string()
-            .nullable()
-            .describe("Parameter description, if available."),
-        }),
-      ),
+        .describe(
+          "Compact reason and recovery action when available is false; null otherwise.",
+        ),
+      params: z
+        .string()
+        .describe(
+          "Compact one-line input signature — a summary, not the full schema. Parameters are " +
+            "joined by '; ', each rendered as `name<!|?>:<type>` where `!` marks required and `?` " +
+            "optional. Object parameters are expanded up to two levels as " +
+            "`{child<!|?>:type{grandchild<!|?>:type}, …}`, enums as " +
+            "`enum(<json-values>)`, and a trailing ` — description` is added when available. A " +
+            "trailing `…` on a type marks an object whose content is not fully shown (freeform or " +
+            "more deeply nested) — consult the task instructions or the full schema for its shape. " +
+            "Empty string when the tool takes no input. Pass matching values inside tool_args when " +
+            `calling ${TOOL_RUN_TOOL_SHORT_NAME}; if a call is rejected as invalid, the error describes ` +
+            "the expected input (for third-party tools, the full input schema).",
+        ),
     }),
   ),
 });
@@ -86,31 +244,20 @@ type SearchCandidate = {
   source: "archestra" | "mcp" | "agent_delegation";
   server: string | null;
   catalogName: string | null;
-  inputParameters: Array<{
-    name: string;
-    required: boolean;
-    description: string | null;
-  }>;
-  searchText: {
-    name: string;
-    title: string;
-    description: string;
-    argNames: string;
-    argDescriptions: string;
-    combined: string;
-  };
+  available: boolean;
+  /** Why a tool that is not available cannot run, in words for the model. */
+  unavailableReason: string | null;
+  inputParameters: InputParameterSummary[];
+  // Keys the stored generated text; null when the candidate has none to look up.
+  definitionHash: string | null;
+  searchText: KeywordSearchText;
 };
-
-const EXCLUDED_SHORT_NAMES = new Set([
-  TOOL_SEARCH_TOOLS_SHORT_NAME,
-  TOOL_RUN_TOOL_SHORT_NAME,
-]);
 
 const registry = defineArchestraTools([
   defineArchestraTool({
     shortName: TOOL_SEARCH_TOOLS_SHORT_NAME,
     title: "Search Tools",
-    description: `Search the agent's available tools on demand. Returns exact tool names plus compact input summaries. To execute a returned tool, call ${TOOL_RUN_TOOL_SHORT_NAME} with tool_name set to the returned toolName and put target tool input parameters inside tool_args.`,
+    description: `Search the tools available to this agent and to you on demand. Returns exact tool names plus compact input summaries. To execute a returned tool, call ${TOOL_RUN_TOOL_SHORT_NAME} with tool_name set to the returned toolName and put target tool input parameters inside tool_args.`,
     schema: SearchToolsArgsSchema,
     outputSchema: SearchToolsOutputSchema,
     async handler({ args, context }) {
@@ -120,41 +267,99 @@ const registry = defineArchestraTools([
         );
       }
 
+      const startedAt = Date.now();
       const searchableTools = await getSearchableTools({
         agentId: context.agentId,
         organizationId: context.organizationId,
         userId: context.userId,
+        conversationId: context.conversationId,
+        delegationChain: context.delegationChain,
+        parentLlm: context.parentLlm,
+        tokenAuth: context.tokenAuth,
       });
 
-      const preparedQuery = prepareSearchQuery(args.query);
-      const rankedTools = searchableTools
-        .map((tool) => ({
-          tool,
-          score: scoreCandidate(tool, preparedQuery),
-        }))
-        .filter(({ score }) => score > 0)
-        .sort(
-          (left, right) =>
-            right.score - left.score ||
-            left.tool.toolName.localeCompare(right.tool.toolName),
-        )
-        .slice(0, args.limit)
-        .map(({ tool }) => ({
-          toolName: tool.toolName,
-          title: tool.title,
-          description: tool.description,
-          source: tool.source,
-          server: tool.server,
-          catalogName: tool.catalogName,
-          inputParameters: tool.inputParameters,
-        }));
+      let matches: SearchCandidate[];
+      let unmatchedTerms: string[] = [];
+      if (args.mode === "regex") {
+        const result = rankCandidatesByRegex(searchableTools, args.query);
+        if (!result.ok) {
+          return errorResult(result.error);
+        }
+        matches = result.matches;
+      } else {
+        const preparedQuery = prepareSearchQuery(args.query);
+        const candidates = await withStoredSearchTexts(searchableTools);
+        matches = rankCandidatesByKeyword(candidates, preparedQuery);
+        unmatchedTerms = findUnmatchedQueryTerms(candidates, preparedQuery);
+      }
+
+      const matchCount = matches.length;
+      // Available tools rank ahead of unavailable ones regardless of match
+      // strength, so an unavailable tool never displaces a usable match and is
+      // dropped first on truncation. Stable partition keeps relevance order
+      // within each group.
+      const ranked = [
+        ...matches.filter((candidate) => candidate.available),
+        ...matches.filter((candidate) => !candidate.available),
+      ];
+      // Both rankings break ties by tool name, so the same query pages
+      // through one stable order.
+      const tools = ranked
+        .slice(args.offset, args.offset + args.limit)
+        .map(toSearchResult);
+      const nextOffset =
+        args.offset + tools.length < matchCount
+          ? args.offset + tools.length
+          : null;
+      const truncated = nextOffset !== null;
+      // Only relevant to the zero-match hint, so resolve it lazily to avoid an
+      // extra permission/assignment lookup on every successful search.
+      const sandboxAvailable =
+        matchCount === 0 && context.organizationId != null
+          ? await isSkillSandboxAvailableForAgent({
+              userId: context.userId,
+              organizationId: context.organizationId,
+              agentId: context.agentId,
+            })
+          : false;
+      const hint = buildSearchHint({
+        matchCount,
+        offset: args.offset,
+        returned: tools.length,
+        nextOffset,
+        limit: args.limit,
+        searchableTools,
+        unmatchedTerms,
+        sandboxAvailable,
+      });
+
+      const structured = {
+        total: tools.length,
+        matchCount,
+        truncated,
+        nextOffset,
+        hint,
+        tools,
+      };
+
+      logger.info(
+        {
+          agentId: context.agentId,
+          mode: args.mode,
+          queryLength: args.query.length,
+          offset: args.offset,
+          matchCount,
+          returned: tools.length,
+          zeroResult: matchCount === 0,
+          topResultName: tools[0]?.toolName ?? null,
+          latencyMs: Date.now() - startedAt,
+        },
+        `${TOOL_SEARCH_TOOLS_SHORT_NAME} query`,
+      );
 
       return structuredSuccessResult(
-        {
-          total: rankedTools.length,
-          tools: rankedTools,
-        },
-        JSON.stringify(rankedTools, null, 2),
+        structured,
+        JSON.stringify(structured, null, 2),
       );
     },
   }),
@@ -163,27 +368,163 @@ const registry = defineArchestraTools([
 export const toolEntries = registry.toolEntries;
 export const tools = registry.tools;
 
+/** @public — exported for testability of the ranking logic in isolation */
+export const __test = {
+  prepareSearchQuery,
+  rankCandidatesByKeyword,
+  rankCandidatesByRegex,
+  findUnmatchedQueryTerms,
+  summarizeInputParameters,
+  formatParamsSignature,
+  makeRankingCandidate(input: {
+    toolName: string;
+    title?: string | null;
+    description?: string | null;
+    parameters?: Record<string, unknown>;
+    generatedText?: string;
+  }): SearchCandidate {
+    return {
+      toolName: input.toolName,
+      title: input.title ?? null,
+      description: input.description ?? null,
+      source: "mcp",
+      server: null,
+      catalogName: null,
+      available: true,
+      unavailableReason: null,
+      inputParameters: [],
+      definitionHash: null,
+      searchText: buildSearchText({
+        name: input.toolName,
+        title: input.title ?? "",
+        description: input.description ?? null,
+        schema: input.parameters ?? {},
+        generatedText: input.generatedText ?? null,
+      }),
+    };
+  },
+};
+
 // === Internal helpers ===
+
+async function openappaSearchTools(
+  exclusionSets: AgentToolExclusionSets,
+  options?: { includeImplicitPolicyReads?: boolean },
+): Promise<
+  Array<{
+    name: string;
+    description: string | null;
+    catalogId: string | null;
+    parameters: Record<string, unknown>;
+  }>
+> {
+  if (!openappaEnabled()) return [];
+  const includeImplicitPolicyReads =
+    options?.includeImplicitPolicyReads ?? true;
+  const deployment = await getGuardrailsDeployment();
+  const remediesActive = deployment.active;
+  return openappaMcpTools.flatMap((tool) => {
+    const shortName = archestraMcpBranding.getToolShortName(tool.name);
+    if (
+      !(
+        includeImplicitPolicyReads &&
+        isImplicitOpenAppaReadToolShortName(shortName)
+      ) &&
+      !isRequiredOpenAppaToolShortName(shortName ?? "")
+    )
+      return [];
+    if (
+      (shortName === "get_remedy_plans" ||
+        shortName === "execute_remedy_plan" ||
+        shortName === TOOL_LIST_PEER_MESSAGES_SHORT_NAME ||
+        shortName === TOOL_READ_PEER_MESSAGE_SHORT_NAME) &&
+      !remediesActive
+    ) {
+      return [];
+    }
+    if (isYellToolShortName(shortName) && !openappaYellEnabled()) return [];
+    const name = shortName
+      ? archestraMcpBranding.getToolName(shortName)
+      : tool.name;
+    if (
+      isToolIdentityExcluded(
+        { catalogId: ARCHESTRA_MCP_CATALOG_ID, name },
+        exclusionSets,
+      )
+    )
+      return [];
+    return [
+      {
+        name,
+        description: tool.description ?? null,
+        catalogId: ARCHESTRA_MCP_CATALOG_ID,
+        parameters: (tool.inputSchema ?? {}) as Record<string, unknown>,
+      },
+    ];
+  });
+}
 
 async function getSearchableTools(params: {
   agentId: string;
   organizationId?: string;
   userId?: string;
+  conversationId?: string;
+  delegationChain?: string;
+  parentLlm?: ModelSelection;
+  tokenAuth?: TargetInstallCaller & { oauthClientId?: string };
 }): Promise<SearchCandidate[]> {
-  const { agentId, organizationId, userId } = params;
-  const assignedTools = await ToolModel.getMcpToolsByAgent(agentId);
-  const permittedNames = await filterToolNamesByPermission(
-    assignedTools.map((tool) => tool.name),
+  const { agentId, conversationId, organizationId, userId } = params;
+  const delegatedRun = isAppaDelegatedRun(agentId, params.delegationChain);
+  const agent = await AgentModel.findGatewayAgentById(agentId);
+  // Per-agent exclusions (Auto-tool mode): loaded once per search and applied
+  // to BOTH the assigned contribution and the discoverable widening below.
+  // Empty (no-op) unless the agent's accessAllTools setting is on.
+  const { tools: agentTools, exclusionSets } =
+    await agentToolExclusionsService.getFilteredMcpToolsByAgent(
+      agentId,
+      undefined,
+      agent ?? undefined,
+    );
+  // An assigned tool is searchable only when the user can see its MCP server.
+  const assignedTools = await filterToolsByCallerCatalogAccess(agentTools, {
     userId,
     organizationId,
+  });
+  const assignedNames = new Set(assignedTools.map((tool) => tool.name));
+  // Dynamic tool access: when the agent's "access all tools" setting is on,
+  // discovery also spans third-party tools from every catalog the user can
+  // access, the sandbox built-ins when the feature is on, and
+  // query_knowledge_sources when the user can access a knowledge connector.
+  // run_tool executes such a tool directly without assigning it; the MCP
+  // server's connection policy decides which credential the call uses.
+  const discoverableTools = await getUnassignedDiscoverableTools({
+    assignedToolNames: assignedNames,
+    agentId,
+    userId,
+    oauthClientId: params.tokenAuth?.oauthClientId,
+    organizationId,
+    exclusionSets,
+  });
+  // Describe each third-party tool the way the installation its run_tool call
+  // would use describes it, before ranking reads the descriptions.
+  const describedTools = await describeToolsForCaller({
+    tools: [...assignedTools, ...discoverableTools],
+    agentId,
+    tokenAuth: params.tokenAuth,
+  });
+  // OpenAPPA runtime and policy read tools are reachable on every agent when
+  // the feature is on, except single-agent-scoped Agent Runtime OAuth tokens
+  // with accessAllTools off; policy writes come only from assignment or Auto mode.
+  const includeImplicitPolicyReads =
+    !isAgentRunGatewayToken(params.tokenAuth) || Boolean(agent?.accessAllTools);
+  const injectedOpenappaTools = delegatedRun
+    ? []
+    : await openappaSearchTools(exclusionSets, {
+        includeImplicitPolicyReads,
+      });
+  const injectedOpenappaNames = new Set(
+    injectedOpenappaTools.map((tool) => tool.name),
   );
-  const filteredAssignedTools = assignedTools.filter(
-    (tool) =>
-      permittedNames.has(tool.name) &&
-      !isExcludedArchestraMetaTool(tool.name) &&
-      !tool.name.startsWith("agent__"),
-  );
-
   const delegationTools =
     organizationId != null
       ? await getAgentTools({
@@ -191,29 +532,135 @@ async function getSearchableTools(params: {
           organizationId,
           userId,
           skipAccessCheck: userId === "system",
+          parentLlm: params.parentLlm,
+          delegationChain: params.delegationChain,
         })
       : [];
+  const hasTaskStarter =
+    delegationTools.length > 0 ||
+    assignedTools.some(
+      (tool) =>
+        archestraMcpBranding.getToolShortName(tool.name) ===
+        TOOL_START_AGENT_RUN_SHORT_NAME,
+    );
+  // Match tools/list's implicit run-handle controls, including gateways with
+  // no assigned tools. They are assignment-exempt at dispatch, but still pass
+  // RBAC here and actor/proof checks in their handlers. Internal chat already
+  // has their direct declarations and needs no extra search contribution.
+  const implicitRuntimeControls =
+    agent?.agentType !== "agent" &&
+    (isAnyAgentRuntimeBackendDriverEnabled() || hasTaskStarter)
+      ? runtimeMcpTools.flatMap((tool) => {
+          const shortName = archestraMcpBranding.getToolShortName(tool.name);
+          return shortName && isRunControlArchestraToolShortName(shortName)
+            ? [
+                {
+                  name: archestraMcpBranding.getToolName(shortName),
+                  description: archestraMcpBranding.brandBuiltInText(
+                    tool.description ?? "",
+                  ),
+                  catalogId: ARCHESTRA_MCP_CATALOG_ID,
+                  parameters: tool.inputSchema as Record<string, unknown>,
+                },
+              ]
+            : [];
+        })
+      : [];
+  const searchSpace = [
+    ...injectedOpenappaTools,
+    ...implicitRuntimeControls,
+    ...describedTools.filter((tool) => !injectedOpenappaNames.has(tool.name)),
+  ].filter(
+    (tool) =>
+      !(
+        delegatedRun &&
+        isOpenappaTool(archestraMcpBranding.getToolShortName(tool.name))
+      ),
+  );
+  const permittedNames = await filterToolNamesByPermission(
+    searchSpace.map((tool) => tool.name),
+    userId,
+    organizationId,
+  );
+  const filteredTools = searchSpace.filter(
+    (tool) =>
+      permittedNames.has(tool.name) &&
+      !isExcludedFromSearchResults({
+        toolName: tool.name,
+        assignedNames,
+        keepRuntimeToolsTopLevel: agent?.agentType === "agent",
+      }) &&
+      !tool.name.startsWith("agent__"),
+  );
 
-  const catalogNamesById = await getCatalogNamesById(filteredAssignedTools);
+  // Agent-designated skills are searchable through their skill__<slug>
+  // delegation tools, resolved per calling user like agent delegations.
+  const skillDelegationTools =
+    organizationId != null
+      ? await getSkillDelegationTools({ agentId, organizationId, userId })
+      : [];
+
+  const catalogsById = await getCatalogsById(filteredTools);
+  const catalogsWithInstalls = await getCatalogIdsWithInstalls({
+    tools: filteredTools,
+    catalogsById,
+    userId,
+  });
   const candidates = new Map<string, SearchCandidate>();
-  for (const tool of filteredAssignedTools) {
+  // First occurrence wins on duplicate names: assigned tools come before the
+  // discoverable ones, and the discoverable set is ordered newest-first — the
+  // same row resolveDynamicTool picks, so the description shown by search
+  // matches the row a later run_tool call executes.
+  for (const tool of filteredTools) {
+    if (candidates.has(tool.name)) {
+      continue;
+    }
+    const isKnowledge =
+      archestraMcpBranding.getToolShortName(tool.name) ===
+      TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME;
+    const knowledgeDescription = isKnowledge
+      ? await buildKnowledgeSourcesDescription(
+          agentId,
+          organizationId
+            ? {
+                userId,
+                oauthClientId: params.tokenAuth?.oauthClientId,
+                organizationId,
+              }
+            : undefined,
+        )
+      : null;
+    if (isKnowledge && !knowledgeDescription) continue;
     candidates.set(
       tool.name,
       toAssignedToolCandidate({
-        tool,
-        catalogName:
+        tool: knowledgeDescription
+          ? { ...tool, description: knowledgeDescription }
+          : tool,
+        catalog:
           tool.catalogId != null
-            ? (catalogNamesById.get(tool.catalogId) ?? null)
+            ? (catalogsById.get(tool.catalogId) ?? null)
             : null,
+        catalogsWithInstalls,
       }),
     );
   }
 
-  for (const tool of delegationTools) {
+  for (const tool of [...delegationTools, ...skillDelegationTools]) {
     candidates.set(tool.name, toDelegationToolCandidate(tool));
   }
 
-  return Array.from(candidates.values());
+  // Per-conversation enabled-tool gate: in a chat with a custom tool selection,
+  // a tool the user disabled must not be discoverable here either (mirrors the
+  // visible tool list and the run_tool gate). Archestra built-ins always pass.
+  const enabledNames =
+    conversationId != null
+      ? await ConversationEnabledToolModel.getEnabledToolNameSet(conversationId)
+      : null;
+
+  return Array.from(candidates.values()).filter((candidate) =>
+    isToolEnabledForConversation(candidate.toolName, enabledNames),
+  );
 }
 
 function toAssignedToolCandidate(params: {
@@ -223,32 +670,63 @@ function toAssignedToolCandidate(params: {
     parameters?: Record<string, unknown>;
     catalogId: string | null;
   };
-  catalogName: string | null;
+  catalog: SearchCatalogMeta | null;
+  catalogsWithInstalls: Set<string>;
 }): SearchCandidate {
-  const { catalogName, tool } = params;
+  const { catalog, catalogsWithInstalls, tool } = params;
   const source = archestraMcpBranding.isToolName(tool.name)
     ? "archestra"
     : "mcp";
+  // Built-in Archestra tools and proxy-sniffed tools (no catalog) are always
+  // available; a third-party tool is available only while its catalog still
+  // has an installed connection.
+  const available =
+    source === "archestra" || tool.catalogId == null
+      ? true
+      : catalogsWithInstalls.has(tool.catalogId);
   const parsedToolName =
-    source === "mcp" ? parseFullToolName(tool.name) : { serverName: null };
+    source === "mcp"
+      ? parseFullToolName(tool.name)
+      : { serverName: null, toolName: null };
   const parameters = tool.parameters ?? {};
   const inputParameters = summarizeInputParameters(parameters);
   const title =
     source === "archestra" ? formatArchestraToolTitle(tool.name) : null;
 
+  // An app's launch tool carries the raw, possibly stale/unsafe stored
+  // description; derive it from the (sanitized) backing catalog name instead so
+  // the model never sees an injected name, mirroring the gateway serve path.
+  const description =
+    catalog?.serverType === "app" &&
+    parsedToolName.toolName === APP_LAUNCH_TOOL_NAME
+      ? appLaunchToolDescription(catalog.name)
+      : tool.description;
+
   return {
     toolName: tool.name,
     title,
-    description: tool.description,
+    description,
     source,
     server: parsedToolName.serverName ?? null,
-    catalogName: source === "mcp" ? catalogName : null,
+    catalogName: source === "mcp" ? (catalog?.name ?? null) : null,
+    available,
+    unavailableReason: available
+      ? null
+      : catalog?.serverType === "desktop_mcp"
+        ? `${catalog.name} runs on the user's own computer, and the user has not added it to their computer yet. Ask them to add it from the MCP registry.`
+        : "MCP connection not installed — reconnect the server to use this tool.",
     inputParameters,
+    definitionHash:
+      source === "mcp" && tool.catalogId != null
+        ? hashToolDefinition({ name: tool.name, description, parameters })
+        : null,
     searchText: buildSearchText({
       name: tool.name,
       title: title ?? "",
-      description: tool.description,
+      description,
       schema: parameters,
+      generatedText:
+        source === "archestra" ? pregeneratedText(tool.name) : null,
     }),
   };
 }
@@ -265,19 +743,90 @@ function toDelegationToolCandidate(tool: Tool): SearchCandidate {
     source: "agent_delegation",
     server: null,
     catalogName: null,
+    available: true,
+    unavailableReason: null,
     inputParameters,
+    definitionHash: null,
     searchText: buildSearchText({
       name: tool.name,
       title: tool.title ?? "",
       description: tool.description ?? null,
       schema: tool.inputSchema as Record<string, unknown>,
+      generatedText: null,
     }),
   };
 }
 
-async function getCatalogNamesById(
+function pregeneratedText(toolName: string): string | null {
+  const shortName = archestraMcpBranding.getToolShortName(toolName);
+  const texts: Record<string, { searchText: string } | undefined> =
+    pregeneratedSearchTexts;
+  return (shortName ? texts[shortName]?.searchText : null) ?? null;
+}
+
+// Search never generates: a candidate with no stored text, or a failed lookup,
+// ranks on its source fields alone.
+async function withStoredSearchTexts(
+  candidates: SearchCandidate[],
+): Promise<SearchCandidate[]> {
+  const hashes = new Set(
+    candidates.flatMap(({ definitionHash }) =>
+      definitionHash ? [definitionHash] : [],
+    ),
+  );
+  let texts: Map<string, string>;
+  try {
+    texts = await ToolSearchTextModel.findTextsByHashes([...hashes]);
+  } catch (error) {
+    logger.warn(
+      { err: error },
+      "Tool search text lookup failed; ranking on source fields",
+    );
+    return candidates;
+  }
+  return candidates.map((candidate) => {
+    const text = candidate.definitionHash
+      ? texts.get(candidate.definitionHash)
+      : undefined;
+    return text === undefined
+      ? candidate
+      : {
+          ...candidate,
+          searchText: {
+            ...candidate.searchText,
+            generated: novelGeneratedTokens(text, candidate.searchText),
+          },
+        };
+  });
+}
+
+// Generated terms a tool's own fields already contain only inflate those terms,
+// so the field carries just the new vocabulary, once each.
+function novelGeneratedTokens(
+  text: string,
+  source: {
+    name: string;
+    title: string;
+    description: string;
+    argNames: string;
+    argDescriptions: string;
+  },
+): string {
+  const sourceTokens = new Set(
+    tokenize(
+      `${source.name} ${source.title} ${source.description} ${source.argNames} ${source.argDescriptions}`,
+    ),
+  );
+  return [...new Set(tokenizeSearchText(text))]
+    .filter((token) => !sourceTokens.has(token))
+    .join(" ");
+}
+
+type SearchCatalogMeta = { name: string; serverType: string };
+
+async function getCatalogsById(
   tools: Array<{ catalogId: string | null }>,
-): Promise<Map<string, string>> {
+): Promise<Map<string, SearchCatalogMeta>> {
   const catalogIds = Array.from(
     new Set(
       tools
@@ -287,7 +836,47 @@ async function getCatalogNamesById(
   );
   const catalogs = await InternalMcpCatalogModel.getByIds(catalogIds);
   return new Map(
-    Array.from(catalogs.values()).map((catalog) => [catalog.id, catalog.name]),
+    Array.from(catalogs.values()).map((catalog) => [
+      catalog.id,
+      // Author-controlled name — neutralize control/format/whitespace at this
+      // single source so it is safe wherever it reaches the model (the returned
+      // candidate `catalogName` and the zero-match "Available servers" hint).
+      {
+        name: sanitizeAppNameForToolMetadata(catalog.name),
+        serverType: catalog.serverType,
+      },
+    ]),
+  );
+}
+
+// A tool is runnable only while its catalog still has an installed connection;
+// this resolves, in one query, which of the given tools' catalogs do. A desktop
+// MCP server runs on the caller's own computer, so only the caller's own
+// installation counts for it: a colleague's does not make the tool runnable.
+async function getCatalogIdsWithInstalls(params: {
+  tools: Array<{ catalogId: string | null }>;
+  catalogsById: Map<string, SearchCatalogMeta>;
+  userId?: string;
+}): Promise<Set<string>> {
+  const { tools, catalogsById, userId } = params;
+  const catalogIds = Array.from(
+    new Set(
+      tools
+        .map((tool) => tool.catalogId)
+        .filter((catalogId): catalogId is string => catalogId != null),
+    ),
+  );
+  const installs = await McpServerModel.findByCatalogIds(catalogIds);
+  return new Set(
+    installs
+      .filter(
+        (server) =>
+          catalogsById.get(server.catalogId ?? "")?.serverType !==
+            "desktop_mcp" ||
+          (server.scope === "personal" && server.ownerId === userId),
+      )
+      .map((server) => server.catalogId)
+      .filter((catalogId): catalogId is string => catalogId != null),
   );
 }
 
@@ -296,6 +885,7 @@ function buildSearchText(params: {
   title: string;
   description: string | null;
   schema: Record<string, unknown>;
+  generatedText: string | null;
 }) {
   const flattenedSchema = flattenSchemaText(params.schema);
   const name = normalizeText(params.name);
@@ -303,35 +893,48 @@ function buildSearchText(params: {
   const description = normalizeText(params.description ?? "");
   const argNames = normalizeText(flattenedSchema.names.join(" "));
   const argDescriptions = normalizeText(flattenedSchema.descriptions.join(" "));
+  const source = { name, title, description, argNames, argDescriptions };
 
   return {
-    name,
-    title,
-    description,
-    argNames,
-    argDescriptions,
-    combined: [name, title, description, argNames, argDescriptions]
-      .filter(Boolean)
-      .join(" "),
+    ...source,
+    generated: params.generatedText
+      ? novelGeneratedTokens(params.generatedText, source)
+      : "",
   };
 }
 
-function summarizeInputParameters(schema: Record<string, unknown>) {
-  const properties = asRecord(schema.properties);
-  const required = new Set(asStringArray(schema.required));
+function summarizeInputParameters(
+  schema: Record<string, unknown>,
+): InputParameterSummary[] {
+  return mapObjectProperties(schema, (paramSchema, name, required) => ({
+    name,
+    required,
+    type: extractSchemaType(paramSchema),
+    enum: Array.isArray(paramSchema.enum) ? paramSchema.enum : null,
+    description:
+      typeof paramSchema.description === "string"
+        ? paramSchema.description
+        : null,
+    properties: summarizeNestedProperties(paramSchema, MAX_NESTED_DEPTH),
+    hasHiddenDetail: objectHasHiddenDetail(paramSchema),
+  }));
+}
 
+// Shared property walk: read an object schema's `properties`/`required`, build a
+// summary per entry, and order required-first then alphabetically. The build
+// callback yields the shape; the {name, required} bound lets the sort stay here.
+function mapObjectProperties<T extends { name: string; required: boolean }>(
+  objectSchema: Record<string, unknown>,
+  build: (
+    childSchema: Record<string, unknown>,
+    name: string,
+    required: boolean,
+  ) => T,
+): T[] {
+  const properties = asRecord(objectSchema.properties);
+  const required = new Set(asStringArray(objectSchema.required));
   return Object.entries(properties)
-    .map(([name, value]) => {
-      const paramSchema = asRecord(value);
-      return {
-        name,
-        required: required.has(name),
-        description:
-          typeof paramSchema.description === "string"
-            ? paramSchema.description
-            : null,
-      };
-    })
+    .map(([name, value]) => build(asRecord(value), name, required.has(name)))
     .sort(
       (left, right) =>
         Number(right.required) - Number(left.required) ||
@@ -339,53 +942,403 @@ function summarizeInputParameters(schema: Record<string, unknown>) {
     );
 }
 
-type PreparedSearchQuery = {
-  normalizedQuery: string;
-  tokens: string[];
-};
+// JSON Schema `type` is a string ("object") or, for unions, an array
+// (["string", "null"]). Collapse arrays to "a|b" so the model sees the options.
+function extractSchemaType(
+  paramSchema: Record<string, unknown>,
+): string | null {
+  const type = paramSchema.type;
+  if (typeof type === "string") {
+    return type;
+  }
+  if (Array.isArray(type)) {
+    const parts = type.filter(
+      (part): part is string => typeof part === "string",
+    );
+    return parts.length > 0 ? parts.join("|") : null;
+  }
+  return null;
+}
 
-function prepareSearchQuery(query: string): PreparedSearchQuery {
-  const normalizedQuery = normalizeText(query);
+// Nested summary for object (or array-of-object) parameters, so the model can
+// call run_tool without guessing the nested shape. Recurses up to `depth` levels
+// (MAX_NESTED_DEPTH from the top-level param); each object child carries its own
+// next level. Structure past the budget is left to the actual call's validation
+// feedback and flagged by objectHasHiddenDetail.
+function summarizeNestedProperties(
+  paramSchema: Record<string, unknown>,
+  depth: number,
+): NestedParameterSummary[] | null {
+  const objectSchema = nestedObjectSchema(paramSchema);
+  if (!objectSchema || depth <= 0) {
+    return null;
+  }
+  return mapObjectProperties(objectSchema, (childSchema, name, required) => ({
+    name,
+    type: extractSchemaType(childSchema),
+    required,
+    properties: summarizeNestedProperties(childSchema, depth - 1),
+  }));
+}
+
+function nestedObjectSchema(
+  paramSchema: Record<string, unknown>,
+): Record<string, unknown> | null {
+  if (Object.keys(asRecord(paramSchema.properties)).length > 0) {
+    return paramSchema;
+  }
+  const items = asRecord(paramSchema.items);
+  if (Object.keys(asRecord(items.properties)).length > 0) {
+    return items;
+  }
+  return null;
+}
+
+// The object schema a parameter ultimately describes: the schema itself when it
+// is object-shaped, or its array `items` when those are. Unlike nestedObjectSchema
+// this recognizes object-typed schemas with no listed properties (opaque /
+// freeform), so an array of freeform objects is not mistaken for a leaf.
+function resolveObjectSchema(
+  schema: Record<string, unknown>,
+): Record<string, unknown> | null {
+  if (isObjectSchema(schema)) {
+    return schema;
+  }
+  const items = asRecord(schema.items);
+  return isObjectSchema(items) ? items : null;
+}
+
+function isObjectSchema(schema: Record<string, unknown>): boolean {
+  return (
+    (extractSchemaType(schema)?.includes("object") ?? false) ||
+    Object.keys(asRecord(schema.properties)).length > 0
+  );
+}
+
+// Does the compact one-line rendering hide object content the model would need?
+// Mirrors summarizeNestedProperties' MAX_NESTED_DEPTH budget so the marker fires
+// exactly when content falls past the levels actually shown.
+function objectHasHiddenDetail(paramSchema: Record<string, unknown>): boolean {
+  return schemaHidesDetailBelow(paramSchema, MAX_NESTED_DEPTH);
+}
+
+// `remainingDepth` is how many more nested levels the compact summary still
+// renders below this schema. Detail is hidden when an object's content can't be
+// shown within that budget: a freeform/extensible object (additionalProperties)
+// or an opaque object with no listed properties at any shown level, or an object
+// child whose own object content falls past the budget. Resolves through array
+// items so an array of objects is judged by its element shape. Scalars and
+// objects fully shown within budget return false. Conservative: an object that
+// merely omits `additionalProperties` is not flagged, to avoid marking every
+// object. Always called with remainingDepth >= 1 (the <= 1 branch never recurses
+// further), so an object's own properties are never themselves unshown here.
+function schemaHidesDetailBelow(
+  schema: Record<string, unknown>,
+  remainingDepth: number,
+): boolean {
+  const objectSchema = resolveObjectSchema(schema);
+  if (!objectSchema) {
+    return false;
+  }
+  const additionalProperties = objectSchema.additionalProperties;
+  if (
+    additionalProperties === true ||
+    (additionalProperties != null && typeof additionalProperties === "object")
+  ) {
+    return true;
+  }
+  const properties = asRecord(objectSchema.properties);
+  if (Object.keys(properties).length === 0) {
+    return true;
+  }
+  // Last shown level: this object's children render, but their children do not,
+  // so any object child means unshown content.
+  if (remainingDepth <= 1) {
+    return Object.values(properties).some(
+      (value) => resolveObjectSchema(asRecord(value)) != null,
+    );
+  }
+  return Object.values(properties).some((value) =>
+    schemaHidesDetailBelow(asRecord(value), remainingDepth - 1),
+  );
+}
+
+function toSearchResult(candidate: SearchCandidate) {
   return {
-    normalizedQuery,
-    tokens: normalizedQuery ? tokenize(normalizedQuery) : [],
+    toolName: candidate.toolName,
+    description: candidate.description,
+    source: candidate.source,
+    server: candidate.server,
+    available: candidate.available,
+    unavailableReason: candidate.unavailableReason,
+    params: formatParamsSignature(candidate.inputParameters),
   };
 }
 
-function scoreCandidate(
-  candidate: SearchCandidate,
+// Render the structured per-tool parameter summaries as a single compact line so
+// repeated search_tools calls do not accumulate verbose nested JSON in context.
+// Intentionally bounded (see PARAM_ENUM_VALUE_CAP) — the full schema stays
+// recoverable through run_tool's validation feedback, matching the existing
+// "deeper structure is left to the actual call" design above.
+function formatParamsSignature(params: InputParameterSummary[]): string {
+  return params.map(formatParamSignature).join("; ");
+}
+
+function formatParamSignature(param: InputParameterSummary): string {
+  const requiredMark = param.required ? "!" : "?";
+  const typePart = formatParamType(param);
+  const typeSuffix = typePart ? `:${typePart}` : "";
+  // collapse whitespace so a multiline schema description cannot break the
+  // one-line signature contract.
+  const description = param.description
+    ? param.description.replace(/\s+/g, " ").trim()
+    : "";
+  const descriptionSuffix = description ? ` — ${description}` : "";
+  return `${param.name}${requiredMark}${typeSuffix}${descriptionSuffix}`;
+}
+
+// Additive: a parameter can carry a scalar type, a nested object shape (up to
+// MAX_NESTED_DEPTH levels), and an enum constraint at once, so each present part
+// is appended rather than replacing the others (e.g. `sort?:string enum("asc"|"desc")`).
+function formatParamType(param: InputParameterSummary): string {
+  let type = param.type ?? "";
+  if (param.properties && param.properties.length > 0) {
+    type += formatNestedProperties(param.properties);
+  }
+  if (param.enum && param.enum.length > 0) {
+    const enumClause = formatEnumValues(param.enum);
+    type = type ? `${type} ${enumClause}` : enumClause;
+  }
+  // mark objects whose content the compact summary could not fully show, so the
+  // model knows to consult the full schema (returned on an invalid run_tool call).
+  if (param.hasHiddenDetail) {
+    type += "…";
+  }
+  return type;
+}
+
+function formatNestedProperties(properties: NestedParameterSummary[]): string {
+  return `{${properties.map(formatNestedProperty).join(", ")}}`;
+}
+
+function formatNestedProperty(property: NestedParameterSummary): string {
+  const requiredMark = property.required ? "!" : "?";
+  let type = property.type ?? "";
+  if (property.properties && property.properties.length > 0) {
+    type += formatNestedProperties(property.properties);
+  }
+  const typeSuffix = type ? `:${type}` : "";
+  return `${property.name}${requiredMark}${typeSuffix}`;
+}
+
+// enum values are arbitrary JSON (number/boolean/null/object, or strings that may
+// contain "|"), so JSON-encode each to keep the signature unambiguous.
+function formatEnumValues(values: unknown[]): string {
+  const shown = values
+    .slice(0, PARAM_ENUM_VALUE_CAP)
+    .map((value) => JSON.stringify(value));
+  const overflow = values.length - PARAM_ENUM_VALUE_CAP;
+  const suffix = overflow > 0 ? `|…(+${overflow} more)` : "";
+  return `enum(${shown.join("|")}${suffix})`;
+}
+
+type RegexRankResult =
+  | { ok: true; matches: SearchCandidate[] }
+  | { ok: false; error: string };
+
+// Regex search mode. Mirrors the ReDoS guard used elsewhere in the codebase
+// (knowledge-base/connectors/web-crawler): compile first, then reject patterns
+// safe-regex2 flags as catastrophic-backtracking risks. Matches name/title/
+// description and ranks by the strongest field hit.
+function rankCandidatesByRegex(
+  candidates: SearchCandidate[],
+  pattern: string,
+): RegexRankResult {
+  let regex: RegExp;
+  try {
+    regex = new RegExp(pattern, "i");
+    if (!safeRegex(regex)) {
+      return {
+        ok: false,
+        error:
+          "The regex query is too complex (possible catastrophic backtracking). Simplify the pattern or use keyword mode.",
+      };
+    }
+  } catch {
+    return {
+      ok: false,
+      error: `Invalid regular expression: ${pattern}. Fix the pattern or use keyword mode.`,
+    };
+  }
+
+  return {
+    ok: true,
+    matches: candidates
+      .map((candidate) => ({
+        candidate,
+        rank: regexMatchRank(candidate, regex),
+      }))
+      .filter(({ rank }) => rank > 0)
+      .sort(
+        (left, right) =>
+          right.rank - left.rank ||
+          left.candidate.toolName.localeCompare(right.candidate.toolName),
+      )
+      .map(({ candidate }) => candidate),
+  };
+}
+
+function regexMatchRank(candidate: SearchCandidate, regex: RegExp): number {
+  const { name, title, description } = candidate.searchText;
+  if (regex.test(name)) {
+    return 3;
+  }
+  if (title && regex.test(title)) {
+    return 2;
+  }
+  if (description && regex.test(description)) {
+    return 1;
+  }
+  return 0;
+}
+
+// Actionable next-step guidance (Anthropic recovery-error practice). Null when
+// results came back and no matches follow this page. On a zero-result search the
+// vocabulary-mismatch note rides alongside the empty-result note so the model
+// learns both what happened and which terms matched nothing; a successful search
+// never carries it, since flagging extra terms on a hit only invites a re-search.
+function buildSearchHint(params: {
+  matchCount: number;
+  offset: number;
+  returned: number;
+  nextOffset: number | null;
+  limit: number;
+  searchableTools: SearchCandidate[];
+  unmatchedTerms: string[];
+  sandboxAvailable: boolean;
+}): string | null {
+  const {
+    limit,
+    matchCount,
+    nextOffset,
+    offset,
+    returned,
+    sandboxAvailable,
+    searchableTools,
+    unmatchedTerms,
+  } = params;
+  const parts: string[] = [];
+
+  if (matchCount === 0) {
+    const servers = availableServerNames(searchableTools);
+    const serverHint =
+      servers.length > 0 ? ` Available servers: ${servers.join(", ")}.` : "";
+    const runCommand = archestraMcpBranding.getToolName(
+      TOOL_RUN_COMMAND_SHORT_NAME,
+    );
+    const sandboxHint = sandboxAvailable
+      ? ` If no tool fits, you can fall back to \`${runCommand}\` to do the work with command line tools.`
+      : "";
+    parts.push(
+      `No tools matched. Try broader or different keywords, or switch mode.${serverHint}${sandboxHint}`,
+    );
+  } else if (returned === 0) {
+    parts.push(
+      `This query has ${matchCount} matches, so offset ${offset} returns none. Use an offset below ${matchCount}.`,
+    );
+  } else if (nextOffset !== null) {
+    // Name the offset of the next page. Without it, a model that wants every
+    // match builds a query that excludes the names it already has, which
+    // grows with each page.
+    const shown =
+      offset === 0
+        ? `the top ${returned} of ${matchCount} matches`
+        : `matches ${offset + 1} to ${offset + returned} of ${matchCount}`;
+    // At the cap, "raise limit" would send the model back for a larger limit
+    // that returns the same page.
+    const raiseLimit =
+      limit < MAX_SEARCH_LIMIT
+        ? `raise limit (max ${MAX_SEARCH_LIMIT}) or `
+        : "";
+    parts.push(
+      `Showing ${shown}. For the remaining ${matchCount - nextOffset}, ${raiseLimit}repeat the query with offset ${nextOffset}.`,
+    );
+  }
+
+  // Only surface unmatched query terms when the search found nothing. On a successful search
+  // (matchCount > 0) the model has what it needs; flagging the extra terms it threw in reads as
+  // "your query was partly wrong" and provokes a wasted re-search, so it rides only the zero-result
+  // note where it explains why nothing matched.
+  if (matchCount === 0 && unmatchedTerms.length > 0) {
+    parts.push(
+      `No tool text matches these query terms: ${unmatchedTerms.join(", ")}.`,
+    );
+  }
+
+  return parts.length > 0 ? parts.join(" ") : null;
+}
+
+// Query terms the ranker cannot match against any tool. The ranker has exactly
+// two match surfaces: BM25 over indexed tokens across every field, and the
+// whole-query substring boost over name/title. So a term is unmatched only when
+// it is neither an indexed token (any field) nor a substring of any name/title.
+// Both checks are necessary: the token set alone would falsely report "repo"
+// (which matches github__search_repositories via the name substring boost), and
+// the name/title substring check alone would miss a description-only term.
+// One-sided by design — never names a term that contributed to a result; it may
+// stay silent on a term that only appears inside a name/title as a substring.
+function findUnmatchedQueryTerms(
+  candidates: SearchCandidate[],
   query: PreparedSearchQuery,
-): number {
-  const { normalizedQuery, tokens } = query;
-  if (!normalizedQuery) {
-    return 0;
+): string[] {
+  if (query.tokens.length === 0) {
+    return [];
   }
-
-  const { name, title, description, argNames, argDescriptions, combined } =
-    candidate.searchText;
-
-  let score = 0;
-  if (name === normalizedQuery) score += 200;
-  if (title === normalizedQuery) score += 140;
-  if (name.includes(normalizedQuery)) score += 100;
-  if (title.includes(normalizedQuery)) score += 80;
-  if (description.includes(normalizedQuery)) score += 50;
-  if (argNames.includes(normalizedQuery)) score += 40;
-  if (argDescriptions.includes(normalizedQuery)) score += 20;
-
-  for (const token of tokens) {
-    if (name.includes(token)) score += 24;
-    if (title.includes(token)) score += 18;
-    if (description.includes(token)) score += 10;
-    if (argNames.includes(token)) score += 8;
-    if (argDescriptions.includes(token)) score += 4;
+  const corpusTokens = new Set<string>();
+  let nameTitleText = "";
+  for (const candidate of candidates) {
+    const { name, title, description, argNames, argDescriptions, generated } =
+      candidate.searchText;
+    for (const token of tokenize(
+      `${name} ${title} ${description} ${argNames} ${argDescriptions} ${generated}`,
+    )) {
+      corpusTokens.add(token);
+    }
+    nameTitleText += ` ${name} ${title}`;
   }
+  return query.tokens.filter(
+    (token) => !corpusTokens.has(token) && !nameTitleText.includes(token),
+  );
+}
 
-  if (tokens.every((token) => combined.includes(token))) {
-    score += 12;
+const MAX_HINT_SERVERS = 10;
+
+function availableServerNames(candidates: SearchCandidate[]): string[] {
+  const names = new Set<string>();
+  for (const candidate of candidates) {
+    const name = candidate.catalogName ?? candidate.server;
+    if (name) {
+      names.add(name);
+    }
   }
+  const sorted = Array.from(names).sort();
+  if (sorted.length <= MAX_HINT_SERVERS) {
+    return sorted;
+  }
+  // signal truncation rather than implying the list is exhaustive
+  return [...sorted.slice(0, MAX_HINT_SERVERS), "…"];
+}
 
-  return score;
+function rankCandidatesByKeyword(
+  candidates: SearchCandidate[],
+  query: PreparedSearchQuery,
+): SearchCandidate[] {
+  return rankByKeyword({
+    candidates,
+    query,
+    searchTextOf: (candidate) => candidate.searchText,
+    nameOf: (candidate) => candidate.toolName,
+  });
 }
 
 function flattenSchemaText(schema: Record<string, unknown>): {
@@ -438,9 +1391,41 @@ function visitSchema(
   }
 }
 
-function isExcludedArchestraMetaTool(toolName: string): boolean {
+// Internal chat keeps assigned skill/file/runtime tools top-level; gateways
+// defer them, so their assigned capabilities must remain searchable. Unassigned
+// runtime tools reachable through Auto mode are searchable on either surface.
+// The dispatch pair and the directly available question tool are never useful
+// as search results.
+function isExcludedFromSearchResults(params: {
+  toolName: string;
+  assignedNames: Set<string>;
+  keepRuntimeToolsTopLevel: boolean;
+}): boolean {
+  const { toolName, assignedNames, keepRuntimeToolsTopLevel } = params;
   const shortName = archestraMcpBranding.getToolShortName(toolName);
-  return shortName != null && EXCLUDED_SHORT_NAMES.has(shortName);
+  if (shortName == null) {
+    return false;
+  }
+  if (
+    !keepRuntimeToolsTopLevel &&
+    isChatOnlyArchestraToolShortName(shortName)
+  ) {
+    return true;
+  }
+  if (
+    shortName === TOOL_SEARCH_TOOLS_SHORT_NAME ||
+    shortName === TOOL_RUN_TOOL_SHORT_NAME ||
+    shortName === TOOL_ASK_USER_SHORT_NAME
+  ) {
+    return true;
+  }
+  if (
+    keepRuntimeToolsTopLevel &&
+    isAlwaysExposedArchestraToolShortName(shortName)
+  ) {
+    return assignedNames.has(toolName);
+  }
+  return false;
 }
 
 function formatArchestraToolTitle(toolName: string): string | null {
@@ -466,14 +1451,4 @@ function asStringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string")
     : [];
-}
-
-function normalizeText(value: string): string {
-  return value.trim().toLowerCase();
-}
-
-function tokenize(value: string): string[] {
-  return Array.from(
-    new Set(value.split(/[^a-z0-9_-]+/).filter((token) => token.length > 0)),
-  );
 }

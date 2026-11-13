@@ -1,12 +1,13 @@
-import { SecretsManagerType, TimeInMs } from "@shared";
+import { SecretsManagerType, TimeInMs } from "@archestra/shared";
 import { LRUCacheManager } from "@/cache-manager";
 import SecretModel from "@/models/secret";
-import {
-  ApiError,
-  type ISecretManager,
-  type SecretsConnectivityResult,
-  type SecretValue,
-  type SelectSecret,
+import type {
+  ISecretManager,
+  SecretReadOptions,
+  SecretsConnectivityResult,
+  SecretValue,
+  SecretWriteOptions,
+  SelectSecret,
 } from "@/types";
 
 /**
@@ -18,6 +19,12 @@ export class DbSecretsManager implements ISecretManager {
   private readonly secretsCache = new LRUCacheManager<SelectSecret>({
     maxSize: 2_000,
     defaultTtl: 5 * TimeInMs.Minute,
+  });
+  private readonly pendingReads = new LRUCacheManager<
+    Promise<SelectSecret | null>
+  >({
+    maxSize: 2_000,
+    defaultTtl: 0,
   });
 
   async createSecret(
@@ -36,44 +43,83 @@ export class DbSecretsManager implements ISecretManager {
 
   async deleteSecret(secid: string): Promise<boolean> {
     this.secretsCache.delete(secid);
-    return await SecretModel.delete(secid);
+    this.pendingReads.delete(secid);
+    const deleted = await SecretModel.delete(secid);
+    this.pendingReads.delete(secid);
+    this.secretsCache.delete(secid);
+    return deleted;
   }
 
   async removeSecret(secid: string): Promise<boolean> {
     return await this.deleteSecret(secid);
   }
 
-  async getSecret(secid: string): Promise<SelectSecret | null> {
-    const cachedSecret = this.secretsCache.get(secid);
-    if (cachedSecret) {
-      return cachedSecret;
+  /**
+   * The cache is process-local and refreshed only on the replica that handled
+   * the write, so a rotation elsewhere stays invisible here for up to its TTL.
+   * `skipCache` is for callers that cannot tolerate that window; the fresh row
+   * still populates the cache, so the refresh benefits every later reader.
+   */
+  async getSecret(
+    secid: string,
+    options?: SecretReadOptions,
+  ): Promise<SelectSecret | null> {
+    if (options?.transaction) {
+      // Transactional reads see the row as of their transaction and may lock
+      // it; they neither consult nor populate the shared cache.
+      return options.forUpdate
+        ? SecretModel.findByIdForUpdate(secid, options.transaction)
+        : SecretModel.findById(secid, options.transaction);
+    }
+    if (!options?.skipCache) {
+      const cachedSecret = this.secretsCache.get(secid);
+      if (cachedSecret) {
+        return cachedSecret;
+      }
+      const pending = this.pendingReads.get(secid);
+      if (pending) return pending;
     }
 
-    const secret = await SecretModel.findById(secid);
-    if (secret) {
-      this.secretsCache.set(secid, secret);
+    // Fresh reads always start a new query. Only the newest read may populate
+    // the cache, so an older miss cannot overwrite a rotation or deletion.
+    const read = SecretModel.findById(secid);
+    this.pendingReads.set(secid, read);
+    try {
+      const secret = await read;
+      if (this.pendingReads.get(secid) === read) {
+        if (secret) this.secretsCache.set(secid, secret);
+        else this.secretsCache.delete(secid);
+      }
+      return secret;
+    } finally {
+      if (this.pendingReads.get(secid) === read)
+        this.pendingReads.delete(secid);
     }
-    return secret;
   }
 
   async updateSecret(
     secid: string,
     secretValue: SecretValue,
+    options?: SecretWriteOptions,
   ): Promise<SelectSecret | null> {
-    const secret = await SecretModel.update(secid, { secret: secretValue });
-    if (secret) {
+    const secret = await SecretModel.update(
+      secid,
+      { secret: secretValue },
+      options?.transaction,
+    );
+    this.pendingReads.delete(secid);
+    if (secret && !options?.transaction) {
       this.secretsCache.set(secid, secret);
     } else {
+      // Inside a transaction the row is not committed yet: drop the entry
+      // rather than cache a value that may roll back.
       this.secretsCache.delete(secid);
     }
     return secret;
   }
 
   async checkConnectivity(): Promise<SecretsConnectivityResult> {
-    throw new ApiError(
-      501,
-      "Connectivity check not implemented for database storage",
-    );
+    return { secretCount: await SecretModel.count() };
   }
 
   getUserVisibleDebugInfo() {

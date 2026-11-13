@@ -1,4 +1,4 @@
-import { DocsPage, getDocsUrl } from "@shared";
+import { DocsPage, getDocsUrl } from "@archestra/shared";
 import type { InsertInternalMcpCatalog } from "@/types";
 import { archestraMcpBranding } from "./branding";
 
@@ -12,7 +12,8 @@ export function getArchestraMcpCatalogMetadata(): Pick<
     name: archestraMcpBranding.catalogName,
     description: isWhiteLabeled
       ? "Built-in tools for creating and managing agents, tools, MCP servers, policies, limits, and other platform resources."
-      : "Built-in Archestra tools for creating and managing agents, tools, MCP servers, policies, limits, and other platform resources.",
+      : // white-label-ok: the non-white-labeled branch of an explicit fullWhiteLabeling check
+        "Built-in Archestra tools for creating and managing agents, tools, MCP servers, policies, limits, and other platform resources.",
     docsUrl: isWhiteLabeled
       ? null
       : getDocsUrl(DocsPage.PlatformArchestraMcpServer),

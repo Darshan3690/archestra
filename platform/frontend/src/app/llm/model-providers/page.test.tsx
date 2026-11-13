@@ -1,0 +1,1126 @@
+"use client";
+
+import {
+  E2eTestId,
+  SUBSCRIPTION_CREDENTIAL_KINDS,
+  SUBSCRIPTION_CREDENTIALS,
+} from "@archestra/shared";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mockUseLlmProviderApiKeys = vi.fn();
+const mockUseLlmProviderApiKey = vi.fn();
+const mockLlmProviderApiKeyForm = vi.fn();
+const mockUseAllVirtualApiKeys = vi.fn();
+const mockUseOauthClients = vi.fn();
+const mockDeleteApiKey = vi.fn();
+const { useDataTableQueryParamsMock, updateQueryParamsMock } = vi.hoisted(
+  () => ({
+    useDataTableQueryParamsMock: vi.fn(),
+    updateQueryParamsMock: vi.fn(),
+  }),
+);
+
+vi.mock("@/app/_parts/use-settings-area-access");
+vi.mock("next/image", () => ({
+  default: ({
+    alt,
+    ...props
+  }: React.ImgHTMLAttributes<HTMLImageElement> & { alt: string }) => (
+    <img alt={alt} {...props} />
+  ),
+}));
+
+vi.mock("@/components/page-layout", () => ({
+  PageLayout: ({
+    actionButton,
+    children,
+  }: {
+    actionButton?: React.ReactNode;
+    children: React.ReactNode;
+  }) => (
+    <div>
+      {actionButton}
+      {children}
+    </div>
+  ),
+}));
+
+vi.mock("next/navigation");
+
+vi.mock("@/lib/auth/auth.query");
+
+vi.mock("@/lib/llm-provider-api-keys.query", () => ({
+  useBulkDeleteLlmProviderApiKeys: () => ({
+    mutate: vi.fn(),
+    isPending: false,
+  }),
+  useDeleteLlmProviderApiKey: () => ({
+    mutateAsync: mockDeleteApiKey,
+    isPending: false,
+  }),
+  useLlmProviderApiKey: (...args: unknown[]) =>
+    mockUseLlmProviderApiKey(...args),
+  useLlmProviderApiKeys: (...args: unknown[]) =>
+    mockUseLlmProviderApiKeys(...args),
+  useUpdateLlmProviderApiKey: () => ({
+    mutateAsync: vi.fn(),
+    isPending: false,
+  }),
+}));
+
+vi.mock("./_parts/copilot-organization-connect-dialog", () => ({
+  CopilotOrganizationConnectDialog: ({
+    manage,
+  }: {
+    manage?: { id: string } | null;
+  }) => <div data-testid="copilot-dialog">{manage?.id ?? "connect"}</div>,
+}));
+vi.mock("@/lib/oauth-clients.query", () => ({
+  useOauthClients: (...args: unknown[]) => mockUseOauthClients(...args),
+}));
+
+vi.mock("@/lib/organization.query");
+
+vi.mock("@/lib/virtual-api-keys.query", () => ({
+  useAllVirtualApiKeys: (...args: unknown[]) =>
+    mockUseAllVirtualApiKeys(...args),
+}));
+
+vi.mock("@/lib/config/config.query");
+
+vi.mock("@/lib/docs/docs", () => ({
+  getFrontendDocsUrl: () => "https://example.com/docs",
+}));
+
+vi.mock("@/lib/hooks/use-data-table-query-params", () => ({
+  useDataTableQueryParams: () => useDataTableQueryParamsMock(),
+}));
+
+vi.mock("@/components/create-llm-provider-api-key-dialog", () => ({
+  CreateLlmProviderApiKeyDialog: (props: {
+    open: boolean;
+    title: string;
+    description?: string;
+    defaultValues?: unknown;
+    allowedProviders?: unknown;
+    reconnectKeyId?: string;
+    onOpenChange: (open: boolean) => void;
+  }) =>
+    props.open ? (
+      <div data-testid="create-dialog">
+        {props.title}
+        {props.description}
+        {JSON.stringify(props.defaultValues)}
+        {JSON.stringify(props.allowedProviders)}
+        <span>{props.reconnectKeyId}</span>
+        <button type="button" onClick={() => props.onOpenChange(false)}>
+          Cancel
+        </button>
+      </div>
+    ) : null,
+}));
+
+vi.mock("@/components/delete-confirm-dialog", () => ({
+  DeleteConfirmDialog: ({
+    open,
+    description,
+    onConfirm,
+    confirmDisabled,
+  }: {
+    open: boolean;
+    description?: React.ReactNode;
+    onConfirm: () => void;
+    confirmDisabled?: boolean;
+  }) =>
+    open ? (
+      <div data-testid="delete-dialog">
+        {description}
+        <button type="button" disabled={confirmDisabled} onClick={onConfirm}>
+          Confirm delete
+        </button>
+      </div>
+    ) : null,
+}));
+
+vi.mock("@/components/external-docs-link", () => ({
+  ExternalDocsLink: ({ children }: { children: React.ReactNode }) => (
+    <a href="https://example.com/docs">{children}</a>
+  ),
+}));
+
+vi.mock("@/components/form-dialog", () => ({
+  FormDialog: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+}));
+
+vi.mock("@/components/llm-provider-api-key-form", () => ({
+  LLM_PROVIDER_API_KEY_PLACEHOLDER: "__placeholder__",
+  LlmProviderApiKeyForm: (props: unknown) => {
+    mockLlmProviderApiKeyForm(props);
+    return null;
+  },
+  deserializeExtraHeaders: () => [],
+  PROVIDER_CONFIG: {
+    anthropic: { icon: "/anthropic.svg", name: "Anthropic" },
+    gemini: { icon: "/gemini.svg", name: "Gemini" },
+    "github-copilot": {
+      icon: "/github-copilot.png",
+      name: "GitHub Copilot",
+    },
+    "microsoft-365-copilot": {
+      icon: "/microsoft-365-copilot.png",
+      name: "Microsoft 365 Copilot",
+    },
+    openai: { icon: "/openai.svg", name: "OpenAI" },
+    xai: { icon: "/icons/xai.png", name: "xAI" },
+  },
+}));
+
+vi.mock("@/components/llm-provider-select-items", () => ({
+  LlmProviderSelectItems: () => null,
+}));
+
+vi.mock("@/components/search-input", () => ({
+  SearchInput: () => null,
+}));
+
+vi.mock("@/components/table-row-actions", () => ({
+  TableRowActions: ({
+    actions,
+    itemName,
+  }: {
+    actions: Array<{ label: string; onClick?: () => void }>;
+    itemName?: string;
+  }) => (
+    <>
+      {actions.map((action) => (
+        <button
+          key={action.label}
+          type="button"
+          onClick={action.onClick}
+          aria-label={`${action.label} ${itemName ?? ""}`.trim()}
+        />
+      ))}
+    </>
+  ),
+}));
+
+vi.mock("@/components/ui/data-table", () => ({
+  DataTable: ({
+    isLoading,
+    data,
+    columns,
+  }: {
+    isLoading: boolean;
+    data: Array<{ id: string; name: string }>;
+    columns: Array<{
+      id?: string;
+      accessorKey?: string;
+      cell?: (context: { row: { original: unknown } }) => React.ReactNode;
+    }>;
+  }) => {
+    const select = columns.find((column) => column.id === "select");
+    const actions = columns.find((column) => column.id === "actions");
+    // The Access cell is rendered too: it is the only column besides actions
+    // whose contents are asserted, and dropping it would let a blank
+    // ownership cell pass unnoticed.
+    const access = columns.find((column) => column.accessorKey === "scope");
+    return (
+      <div data-loading={isLoading}>
+        {data.map((row) => (
+          <div key={row.id}>
+            <span>{row.name}</span>
+            {select?.cell?.({
+              row: {
+                id: row.id,
+                original: row,
+                getIsSelected: () => false,
+                toggleSelected: vi.fn(),
+              },
+              table: {},
+            } as never)}
+            {access?.cell?.({ row: { original: row } })}
+            {actions?.cell?.({ row: { original: row } })}
+          </div>
+        ))}
+      </div>
+    );
+  },
+}));
+
+vi.mock("@/components/ui/dialog", () => ({
+  Dialog: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  DialogContent: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  DialogTitle: ({ children }: { children: React.ReactNode }) => (
+    <h2>{children}</h2>
+  ),
+  DialogDescription: ({ children }: { children: React.ReactNode }) => (
+    <p>{children}</p>
+  ),
+  DialogHeader: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  DialogBody: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  DialogForm: ({ children }: { children: React.ReactNode }) => (
+    <form>{children}</form>
+  ),
+  DialogStickyFooter: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+}));
+
+vi.mock("@/components/resource-access-section", () => ({
+  ResourceAccessSection: () => null,
+}));
+
+vi.mock("@/components/ui/permission-button", () => ({
+  // `permissions`/`tooltip` are the component's own; everything else (notably
+  // aria-label, which names an icon-only button) belongs on the button.
+  PermissionButton: ({
+    children,
+    permissions: _permissions,
+    tooltip: _tooltip,
+    noPermissionHandle: _noPermissionHandle,
+    ...props
+  }: React.ButtonHTMLAttributes<HTMLButtonElement> & {
+    permissions?: unknown;
+    tooltip?: string;
+    noPermissionHandle?: string;
+  }) => (
+    <button type="button" {...props}>
+      {children}
+    </button>
+  ),
+}));
+
+vi.mock("@/components/ui/select", () => ({
+  Select: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  SelectContent: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  SelectItem: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  SelectTrigger: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  SelectValue: () => null,
+}));
+vi.mock("@/lib/entity-labels.query");
+
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { useHasPermissions, useSession } from "@/lib/auth/auth.query";
+import { useFeature } from "@/lib/config/config.query";
+import { useOrganization } from "@/lib/organization.query";
+import ApiKeysPage from "./page";
+
+describe("ApiKeysPage", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(useSession).mockReturnValue({
+      data: { user: { id: "viewer" } },
+    } as ReturnType<typeof useSession>);
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams(),
+      updateQueryParams: updateQueryParamsMock,
+    });
+    vi.mocked(usePathname).mockReturnValue("/llm/model-providers");
+    vi.mocked(useRouter).mockReturnValue({
+      replace: vi.fn(),
+    } as unknown as ReturnType<typeof useRouter>);
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams() as unknown as ReturnType<typeof useSearchParams>,
+    );
+    vi.mocked(useOrganization).mockReturnValue({
+      data: null,
+    } as unknown as ReturnType<typeof useOrganization>);
+    vi.mocked(useFeature).mockReturnValue(
+      false as unknown as ReturnType<typeof useFeature>,
+    );
+    mockUseLlmProviderApiKeys.mockReturnValue({
+      data: [],
+      isPending: false,
+    });
+    mockUseLlmProviderApiKey.mockReturnValue({
+      data: null,
+    });
+    mockUseAllVirtualApiKeys.mockReturnValue({
+      data: { data: [], pagination: { total: 0 } },
+      isPending: false,
+    });
+    mockUseOauthClients.mockReturnValue({
+      data: { data: [], pagination: { total: 0 } },
+      isPending: false,
+    });
+  });
+
+  it("opens a subscription sign-in linked from an Agent catalog flow", async () => {
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams("connect=chatgpt"),
+      updateQueryParams: updateQueryParamsMock,
+    });
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+
+    render(<ApiKeysPage />);
+
+    await waitFor(() =>
+      expect(updateQueryParamsMock).toHaveBeenCalledWith({ connect: null }),
+    );
+    expect(await screen.findByTestId("create-dialog")).toHaveTextContent(
+      "Sign in with ChatGPT",
+    );
+  });
+
+  it.each(
+    SUBSCRIPTION_CREDENTIAL_KINDS,
+  )("opens the %s recovery flow for the current user only", async (kind) => {
+    const { provider, displayName } = SUBSCRIPTION_CREDENTIALS[kind];
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as ReturnType<typeof useHasPermissions>);
+    vi.mocked(useSession).mockReturnValue({
+      data: { user: { id: "viewer" } },
+    } as ReturnType<typeof useSession>);
+    mockUseLlmProviderApiKeys.mockReturnValue({
+      data: [
+        {
+          id: "other-key",
+          provider,
+          scope: "personal",
+          userId: "other",
+          subscriptionKind: kind,
+        },
+        {
+          id: "own-key",
+          provider,
+          scope: "personal",
+          userId: "viewer",
+          subscriptionKind: kind,
+        },
+      ],
+      isPending: false,
+    });
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams(`reconnect=${kind}&search=kept`),
+      updateQueryParams: updateQueryParamsMock,
+    });
+    const { rerender } = render(<ApiKeysPage />);
+    expect(await screen.findByTestId("create-dialog")).toHaveTextContent(
+      `Reconnect ${displayName}`,
+    );
+    expect(screen.getByTestId("create-dialog")).toHaveTextContent("own-key");
+    expect(screen.getByTestId("create-dialog")).not.toHaveTextContent(
+      "other-key",
+    );
+    fireEvent.click(
+      within(screen.getByTestId("create-dialog")).getByRole("button", {
+        name: "Cancel",
+      }),
+    );
+    expect(screen.queryByTestId("create-dialog")).not.toBeInTheDocument();
+    expect(vi.mocked(useRouter)().replace).toHaveBeenCalledWith(
+      "/llm/model-providers?search=kept",
+      { scroll: false },
+    );
+    rerender(<ApiKeysPage />);
+    expect(screen.queryByTestId("create-dialog")).not.toBeInTheDocument();
+  });
+
+  it("ignores unknown recovery kinds and opens self-service sign-in without key-read permission", async () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: false,
+      isPending: false,
+    } as ReturnType<typeof useHasPermissions>);
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams("reconnect=unknown"),
+      updateQueryParams: updateQueryParamsMock,
+    });
+    const { rerender } = render(<ApiKeysPage />);
+    expect(screen.queryByTestId("create-dialog")).not.toBeInTheDocument();
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams("reconnect=chatgpt"),
+      updateQueryParams: updateQueryParamsMock,
+    });
+    rerender(<ApiKeysPage />);
+    expect(await screen.findByTestId("create-dialog")).toHaveTextContent(
+      "Sign in with ChatGPT",
+    );
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams(),
+      updateQueryParams: updateQueryParamsMock,
+    });
+    rerender(<ApiKeysPage />);
+    expect(screen.queryByTestId("create-dialog")).not.toBeInTheDocument();
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams("reconnect=chatgpt"),
+      updateQueryParams: updateQueryParamsMock,
+    });
+    rerender(<ApiKeysPage />);
+    expect(await screen.findByTestId("create-dialog")).toHaveTextContent(
+      "Sign in with ChatGPT",
+    );
+  });
+
+  it("opens an organization-wide key for the provider a link names", async () => {
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams("create=jev&access=organization"),
+      updateQueryParams: updateQueryParamsMock,
+    });
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+
+    render(<ApiKeysPage />);
+
+    expect(await screen.findByTestId("create-dialog")).toHaveTextContent(
+      JSON.stringify({
+        provider: "jev",
+        initialGrants: [
+          {
+            subject: { type: "organization", id: "*" },
+            actions: ["read", "use"],
+            name: "Everyone in the organization",
+          },
+        ],
+      }),
+    );
+  });
+
+  it.each([
+    "create=xai",
+    "reconnect=x-premium",
+  ])("does not open a hidden provider from %s", (query) => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as ReturnType<typeof useHasPermissions>);
+    vi.mocked(useOrganization).mockReturnValue({
+      data: { modelProviderOverrides: { xai: { hidden: true } } },
+    } as unknown as ReturnType<typeof useOrganization>);
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams(query),
+      updateQueryParams: updateQueryParamsMock,
+    });
+    render(<ApiKeysPage />);
+    expect(screen.queryByTestId("create-dialog")).not.toBeInTheDocument();
+  });
+
+  it("still offers subscriptions to a member who cannot read keys", () => {
+    // Their key query never runs, so the cards must state the offer rather than
+    // sit in a skeleton waiting on a query that will never resolve.
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: false,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    mockUseLlmProviderApiKeys.mockReturnValue({ data: [], isPending: true });
+
+    render(<ApiKeysPage />);
+
+    expect(personalCards().getAllByText("Connect")).toHaveLength(4);
+  });
+
+  it("clears an active label filter with the other table filters", () => {
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams(
+        "search=claude&provider=anthropic&labels=stage%3Aproduction",
+      ),
+      updateQueryParams: updateQueryParamsMock,
+    });
+
+    render(<ApiKeysPage />);
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+
+    expect(updateQueryParamsMock).toHaveBeenCalledWith({
+      search: null,
+      provider: null,
+      labels: null,
+      access: null,
+      sharedWith: null,
+      owner: null,
+    });
+  });
+
+  it("lets a default member open personal API-key creation", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: false,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+
+    render(<ApiKeysPage />);
+    fireEvent.click(screen.getByTestId("add-chat-api-key-button"));
+
+    expect(screen.getByTestId("create-dialog")).toHaveTextContent(
+      "Add API Key",
+    );
+  });
+
+  it("offers every registry subscription as a card above the table", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+
+    render(<ApiKeysPage />);
+
+    const cards = screen.getByTestId("subscription-provider-cards");
+    expect(cards).toHaveTextContent("ChatGPT");
+    expect(cards).toHaveTextContent("GitHub Copilot");
+    expect(cards).toHaveTextContent("Microsoft 365 Copilot");
+    expect(cards).toHaveTextContent("SuperGrok");
+    expect(personalCards().getAllByText("Connect")).toHaveLength(4);
+    expect(personalCards().getAllByText("Not connected")).toHaveLength(4);
+  });
+
+  it("hides a subscription whose provider the organization turned off", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    vi.mocked(useOrganization).mockReturnValue({
+      data: { modelProviderOverrides: { xai: { hidden: true } } },
+    } as unknown as ReturnType<typeof useOrganization>);
+
+    render(<ApiKeysPage />);
+
+    expect(
+      screen.getByTestId("subscription-provider-cards"),
+    ).not.toHaveTextContent("SuperGrok");
+    expect(personalCards().getAllByText("Connect")).toHaveLength(3);
+  });
+
+  it("offers no enterprise plan when the organization turned GitHub Copilot off", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    vi.mocked(useOrganization).mockReturnValue({
+      data: { modelProviderOverrides: { "github-copilot": { hidden: true } } },
+    } as unknown as ReturnType<typeof useOrganization>);
+
+    render(<ApiKeysPage />);
+
+    expect(screen.queryByText("Enterprise plans")).toBeNull();
+  });
+
+  it("drops only the personal GitHub Copilot card when personal subscriptions are off", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    vi.mocked(useOrganization).mockReturnValue({
+      data: {
+        modelProviderOverrides: {
+          "github-copilot": { plans: { personal: { hidden: true } } },
+        },
+      },
+    } as unknown as ReturnType<typeof useOrganization>);
+
+    render(<ApiKeysPage />);
+
+    expect(personalCards().queryByText("GitHub Copilot")).toBeNull();
+    expect(personalCards().getAllByText("Connect")).toHaveLength(3);
+    expect(screen.getByText("Enterprise plans")).toBeInTheDocument();
+  });
+
+  it("drops only the enterprise plans when they are off, keeping the personal card", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    vi.mocked(useOrganization).mockReturnValue({
+      data: {
+        modelProviderOverrides: {
+          "github-copilot": { plans: { enterprise: { hidden: true } } },
+        },
+      },
+    } as unknown as ReturnType<typeof useOrganization>);
+
+    render(<ApiKeysPage />);
+
+    expect(screen.queryByText("Enterprise plans")).toBeNull();
+    expect(personalCards().getByText("GitHub Copilot")).toBeInTheDocument();
+  });
+
+  it("moves a connected enterprise plan into the table once enterprise plans are off", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    vi.mocked(useOrganization).mockReturnValue({
+      data: {
+        modelProviderOverrides: {
+          "github-copilot": { plans: { enterprise: { hidden: true } } },
+        },
+      },
+    } as unknown as ReturnType<typeof useOrganization>);
+    mockUseLlmProviderApiKeys.mockReturnValue({
+      data: [
+        {
+          id: "copilot-plan-key",
+          name: "Org Copilot plan",
+          provider: "github-copilot",
+          scope: "org",
+          isGithubAppKey: true,
+        },
+      ],
+      isPending: false,
+    });
+
+    render(<ApiKeysPage />);
+
+    // No card stands for it now, so the table keeps it deletable.
+    expect(screen.getByText("Org Copilot plan")).toBeInTheDocument();
+  });
+
+  it("keeps a turned-off provider's connected subscription key in the table", () => {
+    // The card is withdrawn with the provider, so the key it stood for has to
+    // fall back to a table row — otherwise an admin can no longer see or
+    // delete a credential that still exists.
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    vi.mocked(useOrganization).mockReturnValue({
+      data: { modelProviderOverrides: { xai: { hidden: true } } },
+    } as unknown as ReturnType<typeof useOrganization>);
+    mockUseLlmProviderApiKeys.mockReturnValue({
+      data: [
+        {
+          id: "x-premium-key",
+          name: "My SuperGrok",
+          provider: "xai",
+          scope: "personal",
+          subscriptionKind: "x-premium",
+        },
+      ],
+      isPending: false,
+    });
+
+    render(<ApiKeysPage />);
+
+    expect(screen.getByText("My SuperGrok")).toBeInTheDocument();
+  });
+
+  it("keeps system keys out of bulk selection", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    mockUseLlmProviderApiKeys.mockReturnValue({
+      data: [
+        {
+          id: "system-gemini",
+          name: "System Gemini",
+          provider: "gemini",
+          scope: "org",
+          isSystem: true,
+          isPrimary: false,
+        },
+      ],
+      isPending: false,
+    });
+
+    render(<ApiKeysPage />);
+
+    expect(
+      screen.getByRole("checkbox", { name: "Select System Gemini" }),
+    ).toBeDisabled();
+    // Subscriptions are cards now, so they never reach the table's selection.
+    expect(
+      screen.queryByRole("checkbox", { name: "Select ChatGPT" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("represents a connected subscription once and removes its connect action", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    const chatGptCredential = {
+      id: "chatgpt-key",
+      name: "Existing ChatGPT credential",
+      provider: "openai",
+      scope: "personal",
+      subscriptionKind: "chatgpt",
+    };
+    mockUseLlmProviderApiKeys.mockReturnValue({
+      data: [chatGptCredential],
+      isPending: false,
+    });
+
+    render(<ApiKeysPage />);
+
+    expect(screen.getAllByText("ChatGPT")).toHaveLength(1);
+    expect(
+      screen.queryByText("Existing ChatGPT credential"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("Connected")).toBeInTheDocument();
+    expect(personalCards().getAllByText("Connect")).toHaveLength(3);
+    expect(
+      screen.getByRole("button", { name: "Disconnect" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows an organization subscription as a card managed in the connect wizard, with the shared Disconnect dialog", async () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    const appKey = {
+      id: "copilot-app-key",
+      name: "GitHub Copilot (my-org)",
+      provider: "github-copilot",
+      scope: "org",
+      userId: null,
+      secretId: "secret-1",
+      isGithubAppKey: true,
+      githubOrganization: "my-org",
+      requiresReauthentication: false,
+    };
+    mockUseLlmProviderApiKeys.mockReturnValue({
+      data: [appKey],
+      isPending: false,
+    });
+
+    render(<ApiKeysPage />);
+
+    expect(
+      screen.getByText(
+        "Your organization's Copilot plan is linked through a GitHub App. Usage is billed to my-org.",
+      ),
+    ).toBeInTheDocument();
+    // Not a table row, and no extra header action.
+    expect(
+      screen.queryByText("GitHub Copilot (my-org)"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Connect another/ }),
+    ).not.toBeInTheDocument();
+
+    // Manage opens the wizard that connected the plan, on this key, not the
+    // generic key editor.
+    fireEvent.click(screen.getByRole("button", { name: "Manage" }));
+    expect(await screen.findByTestId("copilot-dialog")).toHaveTextContent(
+      "copilot-app-key",
+    );
+    expect(mockLlmProviderApiKeyForm).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        existingKey: expect.objectContaining({ id: "copilot-app-key" }),
+      }),
+    );
+
+    const disconnects = screen.getAllByRole("button", { name: "Disconnect" });
+    fireEvent.click(disconnects[disconnects.length - 1]);
+    expect(await screen.findByTestId("delete-dialog")).toHaveTextContent(
+      "The GitHub App stays installed on my-org. Uninstall it on GitHub if you no longer need it.",
+    );
+  });
+
+  it("does not classify an ordinary key from the mutable X Premium display name", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    mockUseLlmProviderApiKeys.mockReturnValue({
+      data: [
+        {
+          id: "x-premium-key",
+          name: "SuperGrok",
+          provider: "xai",
+          scope: "personal",
+        },
+      ],
+      isPending: false,
+    });
+
+    render(<ApiKeysPage />);
+
+    // The subscription card remains unconnected and the same-named ordinary key
+    // remains its own credential row.
+    expect(screen.getAllByText("SuperGrok")).toHaveLength(2);
+    expect(personalCards().getAllByText("Connect")).toHaveLength(4);
+  });
+
+  it("reopens a SuperGrok key from the edit URL param in subscription mode", async () => {
+    // The reviewer-reported F5 case: ?edit=<id> resolves the key through the
+    // single-key endpoint, which must carry subscriptionKind so the dialog
+    // reopens on the subscription auth mode, not the API-key tab.
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("edit=x-premium-key") as unknown as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+    mockUseLlmProviderApiKey.mockReturnValue({
+      data: {
+        id: "x-premium-key",
+        name: "SuperGrok",
+        provider: "xai",
+        scope: "personal",
+        secretId: "secret-1",
+        subscriptionKind: "x-premium",
+        baseUrl: null,
+        inferenceBaseUrl: null,
+        extraHeaders: null,
+        teamId: null,
+        isPrimary: false,
+      },
+    });
+
+    render(<ApiKeysPage />);
+
+    await waitFor(() => {
+      expect(mockLlmProviderApiKeyForm).toHaveBeenCalled();
+    });
+    const formProps = mockLlmProviderApiKeyForm.mock.lastCall?.[0] as {
+      existingKey: { subscriptionKind?: string | null };
+      form: { getValues: (name: string) => unknown };
+    };
+    expect(formProps.existingKey.subscriptionKind).toBe("x-premium");
+    await waitFor(() => {
+      expect(formProps.form.getValues("authMethod")).toBe("subscription");
+    });
+  });
+
+  it("points both 'View all' links at the credentials of the key being deleted", async () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    mockUseLlmProviderApiKeys.mockReturnValue({
+      data: [
+        {
+          id: "provider-key-1",
+          name: "Shared Anthropic credential",
+          provider: "anthropic",
+          scope: "org",
+        },
+      ],
+      isPending: false,
+    });
+    mockUseAllVirtualApiKeys.mockReturnValue({
+      data: {
+        data: [
+          {
+            id: "vk-1",
+            name: "Payments service",
+            tokenStart: "arch_abc",
+            includeFutureProviders: false,
+            providerApiKeys: [
+              {
+                provider: "anthropic",
+                providerApiKeyId: "provider-key-1",
+                providerApiKeyName: "Shared Anthropic credential",
+              },
+            ],
+          },
+        ],
+        pagination: { total: 1 },
+      },
+      isPending: false,
+    });
+    mockUseOauthClients.mockReturnValue({
+      data: {
+        data: [
+          {
+            id: "oc-1",
+            name: "Nimbus Portal",
+            clientId: "llm_oauth_1",
+            includeFutureProviders: false,
+            providerApiKeys: [
+              {
+                provider: "anthropic",
+                providerApiKeyId: "provider-key-1",
+                providerApiKeyName: "Shared Anthropic credential",
+              },
+            ],
+          },
+          {
+            // Follows current and future providers, so the backend keeps it
+            // and the dialog must not list it.
+            id: "oc-2",
+            name: "Everything Gateway",
+            clientId: "llm_oauth_2",
+            includeFutureProviders: true,
+            providerApiKeys: [
+              {
+                provider: "anthropic",
+                providerApiKeyId: "provider-key-1",
+                providerApiKeyName: "Shared Anthropic credential",
+              },
+            ],
+          },
+        ],
+        pagination: { total: 2 },
+      },
+      isPending: false,
+    });
+
+    render(<ApiKeysPage />);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Delete Shared Anthropic credential",
+      }),
+    );
+
+    // The whole point of these links: land on a table already narrowed to the
+    // credentials that go with this delete, not on the full list.
+    await waitFor(() => {
+      expect(screen.getByTestId("delete-dialog")).toBeInTheDocument();
+    });
+    const links = screen.getAllByRole("link", { name: "View all" });
+    expect(links.map((link) => link.getAttribute("href"))).toEqual([
+      "/llm/proxy/virtual-keys?providerApiKeyId=provider-key-1",
+      "/settings/oauth-clients?type=llm&providerApiKeyId=provider-key-1",
+    ]);
+    const dialog = screen.getByTestId("delete-dialog");
+    expect(dialog).toHaveTextContent(
+      "The virtual key and OAuth client below will be deleted too. This cannot be undone.",
+    );
+    expect(dialog).toHaveTextContent("Payments service");
+    expect(dialog).toHaveTextContent("Nimbus Portal");
+    expect(dialog).not.toHaveTextContent("Everything Gateway");
+    expect(
+      screen.getByRole("button", { name: "Confirm delete" }),
+    ).toBeEnabled();
+  });
+
+  it("lets a key that virtual keys use be deleted after stating the consequence", async () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    mockUseLlmProviderApiKeys.mockReturnValue({
+      data: [
+        {
+          id: "provider-key-1",
+          name: "Shared Anthropic credential",
+          provider: "anthropic",
+          scope: "org",
+        },
+      ],
+      isPending: false,
+    });
+    mockUseAllVirtualApiKeys.mockReturnValue({
+      data: {
+        // Four keys map only this provider key; three also map an OpenAI key.
+        data: Array.from({ length: 7 }, (_, index) => ({
+          id: `vk-${index}`,
+          name: `Service ${index}`,
+          tokenStart: "arch_abc",
+          includeFutureProviders: false,
+          providerApiKeys: [
+            {
+              provider: "anthropic",
+              providerApiKeyId: "provider-key-1",
+              providerApiKeyName: "Shared Anthropic credential",
+            },
+            ...(index < 4
+              ? []
+              : [
+                  {
+                    provider: "openai",
+                    providerApiKeyId: "provider-key-2",
+                    providerApiKeyName: "Backup OpenAI key",
+                  },
+                ]),
+          ],
+        })),
+        pagination: { total: 7 },
+      },
+      isPending: false,
+    });
+    mockDeleteApiKey.mockResolvedValue({ success: true });
+
+    render(<ApiKeysPage />);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Delete Shared Anthropic credential",
+      }),
+    );
+
+    const dialog = await screen.findByTestId("delete-dialog");
+    expect(dialog).toHaveTextContent(
+      "The 4 virtual keys below will be deleted too. This cannot be undone.",
+    );
+    expect(screen.getByText("Service 3")).toBeInTheDocument();
+    expect(screen.queryByText("Service 4")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "View all" }).getAttribute("href"),
+    ).toBe("/llm/proxy/virtual-keys?providerApiKeyId=provider-key-1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
+    await waitFor(() => {
+      expect(screen.queryByTestId("delete-dialog")).not.toBeInTheDocument();
+    });
+    expect(mockDeleteApiKey).toHaveBeenCalledTimes(1);
+    expect(mockDeleteApiKey).toHaveBeenCalledWith({
+      id: "provider-key-1",
+      kind: "key",
+    });
+  });
+
+  it("opens Connect with provider-specific subscription defaults", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    render(<ApiKeysPage />);
+
+    fireEvent.click(screen.getAllByText("Connect")[0]);
+
+    expect(screen.getByTestId("create-dialog")).toHaveTextContent(
+      "Sign in with ChatGPT",
+    );
+    expect(screen.getByTestId("create-dialog")).toHaveTextContent(
+      '"authMethod":"subscription"',
+    );
+    expect(screen.getByTestId("create-dialog")).toHaveTextContent('["openai"]');
+  });
+
+  it("uses the registry's Grok-specific connect copy", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    render(<ApiKeysPage />);
+
+    fireEvent.click(screen.getAllByText("Connect")[3]);
+
+    expect(screen.getByTestId("create-dialog")).toHaveTextContent(
+      "Sign in with Grok",
+    );
+    expect(screen.getByTestId("create-dialog")).toHaveTextContent(
+      "Connect your SuperGrok subscription",
+    );
+  });
+});
+
+/** The personal subscription cards, apart from the organization section. */
+function personalCards() {
+  return within(screen.getByTestId(E2eTestId.SubscriptionProviderCards));
+}

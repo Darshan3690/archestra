@@ -1,0 +1,191 @@
+import { TOOL_ASK_USER_SHORT_NAME } from "@archestra/shared";
+import { beforeEach, vi } from "vitest";
+import { archestraMcpBranding } from "@/archestra-mcp-server";
+import { ConversationEnabledToolModel } from "@/models";
+import { describe, expect, test } from "@/test";
+
+const mockGetChatMcpTools = vi.hoisted(() => vi.fn());
+const mockGetChatMcpToolUiResourceUris = vi.hoisted(() => vi.fn());
+
+vi.mock("@/clients/chat-mcp-client", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/clients/chat-mcp-client")>();
+  return {
+    ...actual,
+    getChatMcpTools: mockGetChatMcpTools,
+    getChatMcpToolUiResourceUris: mockGetChatMcpToolUiResourceUris,
+  };
+});
+
+const { buildChatContext } = await import("./build-chat-context");
+
+describe("buildChatContext", () => {
+  beforeEach(() => {
+    mockGetChatMcpTools.mockReset().mockResolvedValue({});
+    mockGetChatMcpToolUiResourceUris.mockReset().mockResolvedValue({});
+  });
+
+  const run = (params: {
+    conversationId: string;
+    agentId: string;
+    agentName: string;
+    organizationId: string;
+    user: { id: string; email: string; name: string };
+    systemPrompt?: string;
+  }) =>
+    buildChatContext({
+      conversationId: params.conversationId,
+      agentId: params.agentId,
+      agent: {
+        name: params.agentName,
+        systemPrompt: params.systemPrompt ?? null,
+        toolExposureMode: "full",
+      },
+      user: params.user,
+      organizationId: params.organizationId,
+      modelAcceptsImageToolResults: false,
+      parentLlm: undefined,
+      hookSessionContext: undefined,
+      projectInstructions: undefined,
+      openedApp: undefined,
+      projectFileNames: undefined,
+      hookRunCollector: [],
+      kbChunksCollector: [],
+      elicitation: {} as never,
+      subagentToolStream: {} as never,
+      taskBridge: {} as never,
+      abortSignal: new AbortController().signal,
+      suppressContentLogging: false,
+      encryptedChatAudit: null,
+    });
+
+  test("no custom selection fetches tools with enabledToolIds undefined", async ({
+    makeAgent,
+    makeConversation,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const agent = await makeAgent({ organizationId: org.id });
+    const conversation = await makeConversation(agent.id, {
+      organizationId: org.id,
+      userId: user.id,
+    });
+
+    const result = await run({
+      conversationId: conversation.id,
+      agentId: agent.id,
+      agentName: agent.name,
+      organizationId: org.id,
+      user: { id: user.id, email: user.email, name: user.name },
+    });
+
+    // A new conversation has no custom selection, so it must NOT be filtered:
+    // passing undefined (not []) is what keeps all assigned tools enabled.
+    expect(mockGetChatMcpTools).toHaveBeenCalledTimes(1);
+    expect(
+      mockGetChatMcpTools.mock.calls[0]?.[0].enabledToolIds,
+    ).toBeUndefined();
+    expect(
+      mockGetChatMcpTools.mock.calls[0]?.[0].modelAcceptsImageToolResults,
+    ).toBe(false);
+    expect(result.toolSelection).toEqual({
+      hasCustomSelection: false,
+      enabledToolCount: 0,
+    });
+  });
+
+  test("empty custom selection fetches tools with an empty enabledToolIds array", async ({
+    makeAgent,
+    makeConversation,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const agent = await makeAgent({ organizationId: org.id });
+    const conversation = await makeConversation(agent.id, {
+      organizationId: org.id,
+      userId: user.id,
+    });
+    await ConversationEnabledToolModel.setEnabledTools(conversation.id, []);
+
+    const result = await run({
+      conversationId: conversation.id,
+      agentId: agent.id,
+      agentName: agent.name,
+      organizationId: org.id,
+      user: { id: user.id, email: user.email, name: user.name },
+    });
+
+    // An explicit empty selection passes [] (not undefined), and the surfaced
+    // log fields report a custom selection of zero tools.
+    expect(mockGetChatMcpTools.mock.calls[0]?.[0].enabledToolIds).toEqual([]);
+    expect(result.toolSelection).toEqual({
+      hasCustomSelection: true,
+      enabledToolCount: 0,
+    });
+  });
+
+  test("tells the model to offer choices through ask_user, which chat can show", async ({
+    makeAgent,
+    makeConversation,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const agent = await makeAgent({ organizationId: org.id });
+    const conversation = await makeConversation(agent.id, {
+      organizationId: org.id,
+      userId: user.id,
+    });
+    const askUser = archestraMcpBranding.getToolName(TOOL_ASK_USER_SHORT_NAME);
+    mockGetChatMcpTools.mockResolvedValue({ [askUser]: {} });
+
+    const result = await run({
+      conversationId: conversation.id,
+      agentId: agent.id,
+      agentName: agent.name,
+      organizationId: org.id,
+      user: { id: user.id, email: user.email, name: user.name },
+    });
+
+    expect(result.systemPrompt).toContain(
+      `When you need a decision, a clarification, a preference, or an approval from the user, ask with ${askUser}. The user then answers in the client's question interface. Ask multiple-choice questions with ${askUser} too, not in plain text. A link or command the user must open or run goes in your reply text, not in the question.`,
+    );
+  });
+
+  test("uses the policy assistant's configured prompt and tools", async ({
+    makeAgent,
+    makeConversation,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const agent = await makeAgent({ organizationId: org.id });
+    const conversation = await makeConversation(agent.id, {
+      organizationId: org.id,
+      userId: user.id,
+    });
+    const policyTool = archestraMcpBranding.getToolName(
+      "get_guardrails_policy",
+    );
+    const appTool = archestraMcpBranding.getToolName("scaffold_app");
+    mockGetChatMcpTools.mockResolvedValue({ [policyTool]: {}, [appTool]: {} });
+    const result = await run({
+      conversationId: conversation.id,
+      agentId: agent.id,
+      agentName: "Policy assistant",
+      systemPrompt: "Help configure policy and create an app to explain it.",
+      organizationId: org.id,
+      user: { id: user.id, email: user.email, name: user.name },
+    });
+    expect(result.systemPrompt).toContain(
+      "Help configure policy and create an app to explain it.",
+    );
+    expect(Object.keys(result.mcpTools)).toEqual([policyTool, appTool]);
+  });
+});

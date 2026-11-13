@@ -1,11 +1,18 @@
 import type {
+  ContextualRetrievalMode,
+  KnowledgeConnectorOverrides,
+  MessagingChannelOverrides,
+  ModelProviderOverrides,
   OrganizationCustomFont,
   OrganizationTheme,
+  PopularAgentOverrides,
+  StoredAgentRuntimeTierSettings,
   SupportedProvider,
-} from "@shared";
-import { DEFAULT_OAUTH_ACCESS_TOKEN_LIFETIME_SECONDS } from "@shared";
+} from "@archestra/shared";
+import { DEFAULT_OAUTH_ACCESS_TOKEN_LIFETIME_SECONDS } from "@archestra/shared";
 import {
   boolean,
+  doublePrecision,
   integer,
   jsonb,
   pgTable,
@@ -15,51 +22,105 @@ import {
   varchar,
 } from "drizzle-orm/pg-core";
 import type {
+  BudgetCleanupInterval,
   ConnectionBaseUrl,
-  GlobalToolPolicy,
+  ConnectionClientFutureProviders,
+  ConnectionClientProviderKeys,
+  NetworkPolicy,
   OnboardingWizard,
   OrganizationChatLink,
-  OrganizationCompressionScope,
-  OrganizationLimitCleanupInterval,
+  TrustedImageRegistries,
 } from "@/types";
+import modelsTable from "./model";
 
 const organizationsTable = pgTable("organization", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
   slug: text("slug").notNull().unique(),
+  analyticsInstanceId: uuid("analytics_instance_id").notNull().defaultRandom(),
+  analyticsInstanceStartedAt: timestamp("analytics_instance_started_at"),
+  analyticsInstanceLastHeartbeatAt: timestamp(
+    "analytics_instance_last_heartbeat_at",
+  ),
   logo: text("logo"),
   logoDark: text("logo_dark"),
   createdAt: timestamp("created_at").notNull(),
   metadata: text("metadata"),
-  limitCleanupInterval: varchar("limit_cleanup_interval")
-    .$type<OrganizationLimitCleanupInterval>()
-    .default("1h"),
   onboardingComplete: boolean("onboarding_complete").notNull().default(false),
-  theme: text("theme")
-    .$type<OrganizationTheme>()
-    .notNull()
-    .default("cosmic-night"),
+  /**
+   * When the first-login onboarding survey was submitted (the forward to the
+   * website is best-effort). Null = not yet; the survey keeps reappearing for
+   * admins of an empty, unlicensed instance until submitted once.
+   */
+  onboardingSurveyCompletedAt: timestamp("onboarding_survey_completed_at"),
+  theme: text("theme").$type<OrganizationTheme>().notNull().default("caffeine"),
   customFont: text("custom_font")
     .$type<OrganizationCustomFont>()
     .notNull()
     .default("lato"),
-  convertToolResultsToToon: boolean("convert_tool_results_to_toon")
+  onlineMcpCatalogEnabled: boolean("online_mcp_catalog_enabled")
     .notNull()
     .default(true),
-  compressionScope: varchar("compression_scope")
-    .$type<OrganizationCompressionScope>()
+  /** Initial tool mode for automatically provisioned personal agents and gateways. */
+  defaultPersonalAgentAccessAllTools: boolean(
+    "default_personal_agent_access_all_tools",
+  )
     .notNull()
-    .default("organization"),
-  globalToolPolicy: varchar("global_tool_policy")
-    .$type<GlobalToolPolicy>()
+    .default(true),
+  onlineSkillCatalogEnabled: boolean("online_skill_catalog_enabled")
     .notNull()
-    .default("permissive"),
+    .default(true),
   /**
-   * Whether file uploads are allowed in chat.
-   * Defaults to true. Security policies currently only work on text-based content,
-   * so admins may want to disable this until file-based policy support is added.
+   * Whether the static skills marketplace URL serves unauthenticated clones.
+   * Off by default: the marketplace normally identifies the caller by their own
+   * Archestra token and serves the skills that caller may read, while anonymous
+   * access publishes the org-scoped skills to anyone who can reach the
+   * deployment.
+   */
+  skillMarketplaceAnonymousAccess: boolean("skill_marketplace_anonymous_access")
+    .notNull()
+    .default(false),
+  /** Controls only the managed built-in browser MCP runtime. */
+  playwrightMcpEnabled: boolean("playwright_mcp_enabled")
+    .notNull()
+    .default(true),
+
+  /**
+   * Whether users can attach files in chat. Enabled by default.
+   * Uploaded files or extracted content may be sent to the chat's AI provider.
    */
   allowChatFileUploads: boolean("allow_chat_file_uploads")
+    .notNull()
+    .default(true),
+
+  /**
+   * Lets LLM proxy requests run without an Archestra platform credential: a
+   * raw provider key alone is accepted, and catch-all provider routes forward
+   * anonymous requests. Off by default, so every request must present a
+   * platform virtual key, OAuth token, or identity token.
+   */
+  allowUnauthenticatedLlmProxyRequests: boolean(
+    "allow_unauthenticated_llm_proxy_requests",
+  )
+    .notNull()
+    .default(false),
+
+  /**
+   * Whether LLM proxy and MCP gateway logs keep the images, audio, video and
+   * files that requests, responses and tool calls carry, so Logs can show and
+   * play them. Off, the default, each row keeps the media's place and type
+   * but not its bytes.
+   */
+  keepMediaInLogs: boolean("keep_media_in_logs").notNull().default(false),
+
+  /**
+   * @deprecated No longer consulted. Dynamic tool access is now gated solely
+   * by the per-agent `access_all_tools` setting. The column is retained (not
+   * dropped) to avoid a backwards-incompatible migration and to keep the
+   * existing API field; any stored value is ignored. Safe to drop in a future
+   * migration once no deployment reads it.
+   */
+  allowToolAutoAssignment: boolean("allow_tool_auto_assignment")
     .notNull()
     .default(true),
 
@@ -89,17 +150,104 @@ const organizationsTable = pgTable("organization", {
   /** LLM model used for reranking (e.g. "gpt-4o") */
   rerankerModel: text("reranker_model"),
 
-  /** Organization-wide default LLM model ID (e.g. "gpt-4o") */
-  defaultLlmModel: text("default_llm_model"),
+  /**
+   * Chat API key used for OCR transcription of scanned PDF pages at ingest.
+   * FK to chat_api_keys(id) ON DELETE SET NULL — enforced by migration only (same circular issue).
+   */
+  ocrChatApiKeyId: uuid("ocr_chat_api_key_id"),
 
-  /** Provider for the default LLM model (e.g. "openai") */
+  /**
+   * Vision-capable LLM model used for OCR transcription (e.g. "claude-sonnet-5").
+   * OCR is enabled exactly when both this and `ocrChatApiKeyId` are set.
+   */
+  ocrModel: text("ocr_model"),
+
+  /**
+   * BM25 tuning for the knowledge-base keyword ranker, adjustable from the
+   * Knowledge settings tab on a live installation. `null` means "use the
+   * deployment default" from `ARCHESTRA_KNOWLEDGE_BASE_BM25_K1` / `_B`, so an
+   * organization that never touched these follows whatever the operator set.
+   *
+   * `k1` is term-frequency saturation (0 = a term counts the same whether it
+   * appears once or fifty times); `b` is document-length normalization in
+   * [0, 1] (0 = ignore chunk length, which is what `ts_rank` does). Both take
+   * effect on the next query — no restart, no reindex, no statistics rebuild —
+   * because BM25 scores are computed at query time from stored statistics.
+   */
+  kbBm25K1: doublePrecision("kb_bm25_k1"),
+  kbBm25B: doublePrecision("kb_bm25_b"),
+
+  /**
+   * Organization override for contextual retrieval at ingest. Null preserves
+   * the deployment-level default for installations that configured the legacy
+   * `ARCHESTRA_KNOWLEDGE_BASE_CONTEXTUAL_RETRIEVAL_ENABLED` flag.
+   */
+  kbContextualRetrievalMode: varchar(
+    "kb_contextual_retrieval_mode",
+  ).$type<ContextualRetrievalMode>(),
+
+  /** @deprecated Superseded by `defaultModelId` (FK). Retained, no longer read or written. */
+  defaultLlmModel: text("default_llm_model"),
+  /** @deprecated Superseded by `defaultModelId` (FK). Retained, no longer read or written. */
   defaultLlmProvider: text("default_llm_provider").$type<SupportedProvider>(),
+
+  /** Organization-wide default model. FK to models(id) ON DELETE SET NULL. */
+  defaultModelId: uuid("default_model_id").references(() => modelsTable.id, {
+    onDelete: "set null",
+  }),
 
   /**
    * Chat API key used for the default LLM model.
    * FK to chat_api_keys(id) ON DELETE SET NULL — enforced by migration only (same circular issue).
    */
   defaultLlmApiKeyId: uuid("default_llm_api_key_id"),
+
+  /**
+   * The auto router chats and agents on the organization default run on.
+   * `defaultModelId` stays what built-in tasks (titles, compaction) and
+   * forked subagents run on.
+   * FK to auto_routers(id) ON DELETE SET NULL — enforced by migration only (same circular issue).
+   */
+  defaultAutoRouterId: uuid("default_auto_router_id"),
+
+  /** Auto routers route sessions. Off: each runs on its normal tier. */
+  autoRoutingEnabled: boolean("auto_routing_enabled").notNull().default(false),
+
+  /**
+   * Optional `fast` / `smart` tiers of the default trio, on any provider.
+   * With `defaultModelId` as the normal tier, the trio is what forked
+   * subagents pick tiers from.
+   */
+  defaultFastModelId: uuid("default_fast_model_id").references(
+    () => modelsTable.id,
+    { onDelete: "set null" },
+  ),
+  defaultSmartModelId: uuid("default_smart_model_id").references(
+    () => modelsTable.id,
+    { onDelete: "set null" },
+  ),
+
+  /** Default token-cost limit value applied to every organization member. */
+  defaultUserLimitValue: integer("default_user_limit_value"),
+
+  /** Models covered by the default user limit. Null means all models. */
+  defaultUserLimitModel: jsonb("default_user_limit_model").$type<
+    string[] | null
+  >(),
+
+  /** Cleanup interval used by default user limits. Null falls back to weekly. */
+  defaultUserLimitCleanupInterval: varchar(
+    "default_user_limit_cleanup_interval",
+  ).$type<BudgetCleanupInterval>(),
+
+  /**
+   * Default role assigned to newly provisioned members who don't get an
+   * explicit role — email/password self-signup and ChatOps auto-provisioning.
+   * NULL falls back to the built-in "member" role. Org-wide mirror of the
+   * per-IdP SSO `roleMapping.defaultRole`. Stores one or more comma-separated
+   * predefined or custom organization role identifiers, matching member.role.
+   */
+  defaultMemberRole: text("default_member_role"),
 
   /**
    * Organization-wide default agent ID (fallback when member has no personal default).
@@ -134,8 +282,11 @@ const organizationsTable = pgTable("organization", {
     .notNull()
     .default(true),
 
-  /** Square icon logo (28x28px recommended) for collapsed sidebar and chat loading indicator */
+  /** Square icon logo (28x28px recommended) for collapsed sidebar and chat loading indicator. PNG or SVG. */
   iconLogo: text("icon_logo"),
+
+  /** Dark-mode variant of the icon logo. Falls back to `iconLogo` when not set. */
+  iconLogoDark: text("icon_logo_dark"),
 
   /** Support contact message shown in chat error cards */
   chatErrorSupportMessage: text("chat_error_support_message"),
@@ -143,8 +294,20 @@ const organizationsTable = pgTable("organization", {
   /** When enabled, chat shows only support text plus correlation IDs in error cards */
   slimChatErrorUi: boolean("slim_chat_error_ui").notNull().default(false),
 
-  /** Organization-level 2FA visibility toggle */
-  showTwoFactor: boolean("show_two_factor").notNull().default(false),
+  /**
+   * When true, every member must have two-factor authentication enrolled:
+   * non-enrolled members' sessions are revoked when the flag turns on, and
+   * until they enroll, session-authenticated API access is refused (the
+   * enrollment path itself stays reachable). Enterprise-licensed.
+   */
+  requireTwoFactor: boolean("require_two_factor").notNull().default(false),
+
+  /**
+   * Absolute cap on how long a session may live, measured from session
+   * creation — the sliding 7-day refresh otherwise keeps an active user
+   * signed in forever. Null = no cap (current behavior).
+   */
+  sessionMaxAgeSeconds: integer("session_max_age_seconds"),
 
   /**
    * Organization OAuth access token lifetime for user authorization-code flows.
@@ -156,6 +319,11 @@ const organizationsTable = pgTable("organization", {
     .notNull()
     .default(DEFAULT_OAUTH_ACCESS_TOKEN_LIFETIME_SECONDS),
 
+  /** Hide Connect from navigation without disabling existing connections. */
+  connectionPageHidden: boolean("connection_page_hidden")
+    .notNull()
+    .default(false),
+
   /**
    * Admin-selected MCP gateway pre-filled on /connection.
    * FK to agents(id) ON DELETE SET NULL — enforced by migration only
@@ -164,8 +332,10 @@ const organizationsTable = pgTable("organization", {
   connectionDefaultMcpGatewayId: uuid("connection_default_mcp_gateway_id"),
 
   /**
-   * Admin-selected LLM proxy pre-filled on /connection.
-   * FK to agents(id) ON DELETE SET NULL — enforced by migration only.
+   * No longer read or written at runtime — the LLM Proxy needs no selection.
+   * The column stays for the rolling-deploy window (older pods still select
+   * it) and as migration input.
+   * TODO(phase-2): drop the column once no release reads it.
    */
   connectionDefaultLlmProxyId: uuid("connection_default_llm_proxy_id"),
 
@@ -182,6 +352,8 @@ const organizationsTable = pgTable("organization", {
    */
   connectionShownClientIds: text("connection_shown_client_ids").array(),
 
+  connectionClientOrder: text("connection_client_order").array(),
+
   /** Providers shown in the /connection proxy step. Null = show all. */
   connectionShownProviders: text("connection_shown_providers")
     .$type<SupportedProvider[]>()
@@ -195,6 +367,219 @@ const organizationsTable = pgTable("organization", {
   connectionBaseUrls: jsonb("connection_base_urls").$type<
     ConnectionBaseUrl[]
   >(),
+
+  /**
+   * Admin-chosen provider API keys per setup client for the virtual key a
+   * setup command mints (client → provider → llm_provider_api_keys.id). A
+   * client or provider with no entry falls back to the user's own key
+   * resolution.
+   */
+  connectionClientFutureProviders: jsonb(
+    "connection_client_future_providers",
+  ).$type<ConnectionClientFutureProviders>(),
+  connectionClientProviderKeys: jsonb(
+    "connection_client_provider_keys",
+  ).$type<ConnectionClientProviderKeys>(),
+  /**
+   * @deprecated Superseded by `connectionClientProviderKeys`, which a migration
+   * backfilled from it. Retained so app versions still reading it keep working
+   * through a rolling deploy; no longer read or written. Drop in a later
+   * release.
+   */
+  connectionDefaultProviderKeys: jsonb("connection_default_provider_keys"),
+
+  /**
+   * When false, /connection does not offer installing shared skills, and
+   * connection-setup APIs refuse a skills payload. Existing client configs
+   * and the skills product itself are unchanged.
+   */
+  connectionSkillsEnabled: boolean("connection_skills_enabled")
+    .notNull()
+    .default(true),
+
+  /**
+   * When false, /connection does not offer routing through the LLM Proxy,
+   * and connection-setup APIs refuse a provider/proxy payload. Existing
+   * client configs and /llm/proxy stay available.
+   */
+  connectionLlmProxyEnabled: boolean("connection_llm_proxy_enabled")
+    .notNull()
+    .default(true),
+
+  /**
+   * When false, /connection and plugin details do not offer plugin delivery,
+   * and connection-setup APIs refuse explicit plugin selections. Existing
+   * plugin management and installed plugins are unchanged.
+   */
+  connectionPluginsEnabled: boolean("connection_plugins_enabled")
+    .notNull()
+    .default(true),
+
+  connectionRuntimeHandoffEnabled: boolean("connection_runtime_handoff_enabled")
+    .notNull()
+    .default(true),
+  /** Null uses the shipped handoff suggestion instructions. */
+  connectionRuntimeHandoffInstructions: text(
+    "connection_runtime_handoff_instructions",
+  ),
+
+  /**
+   * Admin overrides of the built-in model-provider catalog, keyed by provider
+   * id. A `hidden` entry is switched off everywhere: the provider disappears
+   * from the pickers and the API refuses to create a key for it. The other
+   * fields only change how the provider reads. NULL / a missing key = the
+   * provider ships as-is, so providers added later default to visible.
+   */
+  modelProviderOverrides: jsonb(
+    "model_provider_overrides",
+  ).$type<ModelProviderOverrides>(),
+
+  /** Same, for the messaging channels on /messaging-channels. */
+  messagingChannelOverrides: jsonb(
+    "messaging_channel_overrides",
+  ).$type<MessagingChannelOverrides>(),
+
+  /** Same, for the knowledge connector types. */
+  knowledgeConnectorOverrides: jsonb(
+    "knowledge_connector_overrides",
+  ).$type<KnowledgeConnectorOverrides>(),
+
+  /** Controls template visibility on Create Agent; existing runtimes are unaffected. */
+  popularAgentOverrides: jsonb(
+    "popular_agent_overrides",
+  ).$type<PopularAgentOverrides>(),
+
+  /**
+   * Legacy preset columns (feature removed) — retained inert (non-destructive,
+   * no migration) and no longer read or written. Held admin-chosen singular/
+   * plural labels that the catalog UI used to override "Preset"/"presets" copy.
+   */
+  presetEntityName: text("preset_entity_name"),
+  presetEntityNamePlural: text("preset_entity_name_plural"),
+
+  /**
+   * Legacy preset column (feature removed) — retained inert. Held the custom
+   * display label for the implicit "default" preset row. No longer read or
+   * written.
+   */
+  presetEntityDefaultLabel: text("preset_entity_default_label"),
+
+  /**
+   * Display name of the implicit "default" environment (the deployment target
+   * referenced by internal_mcp_catalog.environment_id = null). NULL falls back
+   * to "Default" in the UI.
+   */
+  defaultEnvironmentName: text("default_environment_name"),
+
+  /**
+   * Kubernetes namespace MCP server pods of the implicit "default" environment
+   * (internal_mcp_catalog.environment_id = null) are deployed into. NULL falls
+   * back to the orchestrator's own namespace. Mirrors `environment.namespace`
+   * for the default scope.
+   */
+  defaultEnvironmentNamespace: text("default_environment_namespace"),
+
+  /**
+   * Optional human-readable description of the implicit "default" environment,
+   * shown in the environment selector. NULL = unset.
+   */
+  defaultEnvironmentDescription: text("default_environment_description"),
+
+  /**
+   * Optional default network egress policy for the implicit "default"
+   * environment. NULL falls back to built-in unrestricted behavior.
+   */
+  defaultNetworkPolicy: jsonb("default_network_policy").$type<NetworkPolicy>(),
+
+  /**
+   * Administrator overrides of the Agent Runtime tiers' CPU, memory and warm
+   * spares, per tier and per field. NULL or an omitted field keeps the code
+   * default (`DEFAULT_AGENT_RUNTIME_TIERS` in @archestra/shared).
+   */
+  agentRuntimeTiers: jsonb(
+    "agent_runtime_tiers",
+  ).$type<StoredAgentRuntimeTierSettings>(),
+
+  /**
+   * ALLOWLIST regex (JS source, no delimiters/flags) for the implicit "default"
+   * environment (internal_mcp_catalog.environment_id = null). User-supplied
+   * config values are allowed only if they MATCH. NULL disables. Mirrors
+   * `environment.validation_regex` for the default scope.
+   */
+  defaultEnvironmentValidationRegex: text(
+    "default_environment_validation_regex",
+  ),
+
+  /**
+   * Trusted image registries for the implicit "default" environment
+   * (internal_mcp_catalog.environment_id = null). Mirrors
+   * `environment.trusted_image_registries` for the default scope. NULL/empty
+   * disables the check.
+   */
+  defaultEnvironmentTrustedImageRegistries: jsonb(
+    "default_environment_trusted_image_registries",
+  ).$type<TrustedImageRegistries>(),
+
+  /**
+   * When true, the Agent Skill tools (`list_skills`, `load_skill`) are assigned
+   * to every agent in the org and added to all new agents. Flipped on
+   * by the "Enable and create a new skill" empty-state button on /skills.
+   */
+  skillToolsEnabled: boolean("skill_tools_enabled").notNull().default(false),
+
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  /**
+   * Whether this organization wants idle MCP servers scaled to zero replicas
+   * (enterprise-licensed; the PATCH route refuses the field without a licence).
+   *
+   * The master switch: with it off nothing hibernates, whatever an individual
+   * install's `mcp_server.hibernation_mode` says. Off by default because
+   * hibernation trades a few seconds of first-call latency for the idle
+   * compute, and that is a decision to make deliberately.
+   *
+   * Deliberately only the on/off half: HOW LONG a server must be idle stays
+   * operator configuration (`ARCHESTRA_ORCHESTRATOR_MCP_IDLE_HIBERNATION_SECONDS`),
+   * because the right window depends on the cluster, not on the tenant.
+   */
+  mcpIdleHibernationEnabled: boolean("mcp_idle_hibernation_enabled")
+    .notNull()
+    .default(false),
+  // SPDX-SnippetEnd
+
+  /** @deprecated Retained for rolling upgrades; no longer read or written. */
+  appsHackathonRecorderEnabled: boolean("apps_hackathon_recorder_enabled")
+    .notNull()
+    .default(true),
+
+  /**
+   * When true, every newly created app starts disabled (author-only, invisible
+   * to chat and every agent surface) until its author enables it in App
+   * settings. Applies at creation time only — flipping it never touches
+   * existing apps.
+   */
+  newAppsDisabledByDefault: boolean("new_apps_disabled_by_default")
+    .notNull()
+    .default(false),
+
+  /**
+   * When true, every newly created app starts locked: immutable to agents (all
+   * chat-driven modification refused) until a user unlocks it. Applies at
+   * creation time only — flipping it never touches existing apps.
+   */
+  newAppsLockedByDefault: boolean("new_apps_locked_by_default")
+    .notNull()
+    .default(false),
+
+  /**
+   * Legacy preset column (feature removed) — retained inert. Held a validation
+   * regex (no delimiters/flags) applied to default-scoped field values at
+   * install time. No longer read or written.
+   */
+  presetEntityDefaultValidationRegex: text(
+    "preset_entity_default_validation_regex",
+  ),
 });
 
 export default organizationsTable;

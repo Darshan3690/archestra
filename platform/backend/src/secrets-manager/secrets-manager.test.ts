@@ -1,8 +1,8 @@
-import { SecretsManagerType } from "@shared";
-import { vi } from "vitest";
+import { SecretsManagerType } from "@archestra/shared";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import config from "@/config";
 import SecretModel from "@/models/secret";
-import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import { SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE } from "@/types";
 import { DbSecretsManager } from "./db";
 import {
   createSecretManager,
@@ -16,6 +16,8 @@ const mockVaultClient = vi.hoisted(() => ({
   write: vi.fn(),
   read: vi.fn(),
   delete: vi.fn(),
+  list: vi.fn(),
+  kubernetesLogin: vi.fn(),
 }));
 
 vi.mock("node-vault", () => {
@@ -29,8 +31,7 @@ describe("SecretsManager", async () => {
   // biome-ignore lint/style/noRestrictedImports: dynamic import
   const VaultSecretManager = (await import("./vault.ee")).default;
   // biome-ignore lint/style/noRestrictedImports: dynamic import
-  const ReadonlyVaultSecretManager = (await import("./readonly-vault.ee"))
-    .default;
+  const { VaultClient } = await import("./vault-client.ee");
 
   describe("getSecretsManagerTypeBasedOnEnvVars", () => {
     const originalEnv = process.env;
@@ -90,13 +91,11 @@ describe("SecretsManager", async () => {
       expect(type).toBe(SecretsManagerType.Vault);
     });
 
-    test("should return DB for unknown values", () => {
-      process.env.ARCHESTRA_SECRETS_MANAGER = "unknown";
+    test("rejects unsupported secrets manager modes", () => {
       config.secretsManager.type = "UNKNOWN";
-
-      const type = getSecretsManagerTypeBasedOnEnvVars();
-
-      expect(type).toBe(SecretsManagerType.DB);
+      expect(() => getSecretsManagerTypeBasedOnEnvVars()).toThrow(
+        "ARCHESTRA_SECRETS_MANAGER must be DB or VAULT",
+      );
     });
   });
 
@@ -923,9 +922,18 @@ describe("SecretsManager", async () => {
           new Error("Vault unavailable"),
         );
 
-        await expect(vaultManager.getSecret(created.id)).rejects.toThrow(
-          "An error occurred while accessing secrets. Please try again later or contact your administrator.",
-        );
+        // A secrets-backend failure is an upstream outage, not an app bug:
+        // it must surface as a retryable 503 tagged with the internal code
+        // that error tracking uses to group one outage into one issue. The
+        // original error must ride along as `cause` — the user-facing message
+        // is generic, so the cause is the only diagnosable detail.
+        await expect(vaultManager.getSecret(created.id)).rejects.toMatchObject({
+          statusCode: 503,
+          internalCode: SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
+          message:
+            "An error occurred while accessing secrets. Please try again later or contact your administrator.",
+          cause: expect.objectContaining({ message: "Vault unavailable" }),
+        });
 
         // Cleanup
         await SecretModel.delete(created.id);
@@ -1033,6 +1041,25 @@ describe("SecretsManager", async () => {
 
         // Cleanup
         await SecretModel.delete(created.id);
+      });
+    });
+
+    describe("checkConnectivity", () => {
+      test("chains the underlying error as cause on failure", async () => {
+        const vaultManager = new VaultSecretManager(vaultConfig);
+
+        mockVaultClient.list.mockRejectedValueOnce({
+          response: { statusCode: 503, body: { errors: ["Vault is sealed"] } },
+        });
+
+        await expect(vaultManager.checkConnectivity()).rejects.toMatchObject({
+          statusCode: 503,
+          internalCode: SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
+          message: "503: Vault is sealed",
+          cause: expect.objectContaining({
+            response: expect.objectContaining({ statusCode: 503 }),
+          }),
+        });
       });
     });
   });
@@ -1157,12 +1184,10 @@ describe("SecretsManager", async () => {
     });
   });
 
-  describe("ReadonlyVaultSecretManager", () => {
-    const vaultConfig = {
+  describe("VaultClient token refresh on 4xx", () => {
+    const baseConfig = {
       address: "http://localhost:8200",
-      authMethod: "token" as const,
       kvVersion: "2" as const,
-      token: "dev-root-token",
       secretPath: "secret/data/archestra",
       k8sTokenPath: "/var/run/secrets/kubernetes.io/serviceaccount/token",
       k8sMountPoint: "kubernetes",
@@ -1170,80 +1195,103 @@ describe("SecretsManager", async () => {
       awsRegion: "us-east-1",
       awsStsEndpoint: "https://sts.amazonaws.com",
     };
+    const vault403 = {
+      response: { statusCode: 403, body: { errors: ["permission denied"] } },
+    };
+
+    const originalEnv = process.env;
 
     beforeEach(() => {
       vi.clearAllMocks();
+      // Static env credentials so AWS IAM login resolves credentials from the
+      // environment without touching network credential providers.
+      process.env = {
+        ...originalEnv,
+        AWS_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE",
+        AWS_SECRET_ACCESS_KEY: "test-secret-key",
+      };
     });
 
-    describe("getSecret - self-healing corrupted isByosVault", () => {
-      test("should fix isByosVault flag when secret values are not vault references", async () => {
-        const byosManager = new ReadonlyVaultSecretManager(vaultConfig);
+    afterEach(() => {
+      process.env = originalEnv;
+    });
 
-        // Create a forceDB secret (isByosVault=false, plain DB values)
-        const created = await byosManager.createSecret(
-          { apiKey: "sk-test-key-123" },
-          "test-oauth-secret",
-          true,
-        );
-        expect(created.isByosVault).toBe(false);
+    test("re-authenticates and retries once on 4xx with AWS IAM auth", async () => {
+      // A 4xx mid-session typically means the login-issued client token
+      // expired; a fresh login must transparently recover the operation.
+      mockVaultClient.write
+        .mockResolvedValueOnce({ auth: { client_token: "token-1" } })
+        .mockResolvedValueOnce({ auth: { client_token: "token-2" } });
+      mockVaultClient.read
+        .mockRejectedValueOnce(vault403)
+        .mockResolvedValueOnce({ data: { data: { value: "s3cret" } } });
 
-        // Simulate the bug: manually set isByosVault to true
-        await SecretModel.update(created.id, {
-          secret: { apiKey: "sk-test-key-123" },
-          isByosVault: true,
-        });
-
-        // getSecret should detect the mismatch and self-heal
-        const result = await byosManager.getSecret(created.id);
-        expect(result).not.toBeNull();
-        expect(result?.isByosVault).toBe(false);
-        expect(result?.secret).toEqual({ apiKey: "sk-test-key-123" });
-
-        // Verify the DB was fixed
-        const dbRecord = await SecretModel.findById(created.id);
-        expect(dbRecord?.isByosVault).toBe(false);
+      const client = new VaultClient({
+        ...baseConfig,
+        authMethod: "aws" as const,
+        awsRole: "archestra-role",
       });
 
-      test("should not modify isByosVault when secret values are valid vault references", async () => {
-        const byosManager = new ReadonlyVaultSecretManager(vaultConfig);
+      const result = await client.getSecretFromPath(
+        "secret/data/archestra/foo",
+      );
 
-        // Create a proper BYOS secret with vault references
-        const created = await byosManager.createSecret(
-          { apiKey: "secret/data/my-keys#api_key" },
-          "test-vault-ref",
-        );
-        expect(created.isByosVault).toBe(true);
+      expect(result).toEqual({ value: "s3cret" });
+      expect(mockVaultClient.read).toHaveBeenCalledTimes(2);
+      expect(mockVaultClient.write).toHaveBeenCalledTimes(2);
+      expect(mockVaultClient.write).toHaveBeenNthCalledWith(
+        2,
+        "auth/aws/login",
+        expect.anything(),
+      );
+    });
 
-        // getSecret should try to resolve vault references (will fail since no real vault)
-        // but should NOT flip isByosVault to false
-        await expect(byosManager.getSecret(created.id)).rejects.toThrow();
+    test("surfaces the Vault detail when Kubernetes login itself fails", async () => {
+      // The login failure crosses two boundaries (loginWithKubernetes →
+      // ensureInitialized → the operation's error handler); none of them may
+      // flatten the Vault response to a generic "Connection failed".
+      mockVaultClient.kubernetesLogin.mockRejectedValueOnce(vault403);
 
-        // Verify the flag was NOT changed
-        const dbRecord = await SecretModel.findById(created.id);
-        expect(dbRecord?.isByosVault).toBe(true);
+      const client = new VaultClient({
+        ...baseConfig,
+        authMethod: "kubernetes" as const,
+        k8sRole: "archestra-role",
+        // The SA token file is really read (fs.readFile runs before the
+        // mocked kubernetesLogin call), so it must exist — its content is
+        // then discarded by the mock. Any readable file works.
+        k8sTokenPath: "./package.json",
+      });
+
+      await expect(
+        client.getSecretFromPath("secret/data/archestra/foo"),
+      ).rejects.toMatchObject({
+        statusCode: 503,
+        internalCode: SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
+        message: "403: permission denied",
       });
     });
 
-    describe("updateSecret - preserves isByosVault", () => {
-      test("should not modify isByosVault flag on update", async () => {
-        const byosManager = new ReadonlyVaultSecretManager(vaultConfig);
+    test("does not retry on 4xx with static token auth", async () => {
+      // A static token cannot be refreshed, so the 4xx must propagate
+      // immediately instead of looping through a pointless retry.
+      mockVaultClient.read.mockRejectedValueOnce(vault403);
 
-        // Create a forceDB secret (like OAuth tokens)
-        const created = await byosManager.createSecret(
-          { access_token: "oauth-token-123", refresh_token: "refresh-456" },
-          "test-oauth",
-          true,
-        );
-        expect(created.isByosVault).toBe(false);
-
-        // Update with new plain values (like token refresh)
-        const updated = await byosManager.updateSecret(created.id, {
-          access_token: "new-oauth-token",
-          refresh_token: "new-refresh",
-        });
-        expect(updated).not.toBeNull();
-        expect(updated?.isByosVault).toBe(false);
+      const client = new VaultClient({
+        ...baseConfig,
+        authMethod: "token" as const,
+        token: "dev-root-token",
       });
+
+      await expect(
+        client.getSecretFromPath("secret/data/archestra/foo"),
+      ).rejects.toMatchObject({
+        statusCode: 503,
+        internalCode: SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
+        message: "403: permission denied",
+      });
+
+      expect(mockVaultClient.read).toHaveBeenCalledTimes(1);
+      expect(mockVaultClient.write).not.toHaveBeenCalled();
     });
   });
 });

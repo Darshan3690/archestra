@@ -1,0 +1,276 @@
+import { createHash, randomBytes } from "node:crypto";
+import { and, eq, gt, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import db, { schema, type Transaction, withDbTransaction } from "@/database";
+import type { ConnectionSetup, InsertConnectionSetup } from "@/types";
+
+/**
+ * Setup tokens are connection-setup specific; deliberately distinct from
+ * team-token and skill-share-link prefixes.
+ * @public — exported for testability
+ */
+export const CONNECTION_SETUP_TOKEN_PREFIX = "archestra_con_";
+
+/** Length of random bytes (24 → 32 url-safe base64 chars without padding). */
+const TOKEN_RANDOM_BYTES = 24;
+
+/** Display prefix length: prefix (14) + 8 random chars for UI distinguishability. */
+const TOKEN_START_LENGTH = 22;
+
+interface CreateConnectionSetupParams
+  extends Omit<InsertConnectionSetup, "tokenHash" | "tokenStart"> {
+  skillIds?: string[];
+  pluginIds?: string[];
+}
+
+class ConnectionSetupModel {
+  static async create(params: CreateConnectionSetupParams): Promise<{
+    setup: ConnectionSetup;
+    rawToken: string;
+  }> {
+    const { skillIds = [], pluginIds = [], ...values } = params;
+
+    const rawToken = generateRawToken();
+    const tokenHash = hashToken(rawToken);
+    const tokenStart = rawToken.slice(0, TOKEN_START_LENGTH);
+
+    const setup = await withDbTransaction(async (tx) => {
+      const [created] = await tx
+        .insert(schema.connectionSetupsTable)
+        .values({ ...values, tokenHash, tokenStart })
+        .returning();
+
+      const uniqueSkillIds = Array.from(new Set(skillIds));
+      if (uniqueSkillIds.length > 0) {
+        await tx.insert(schema.connectionSetupSkillsTable).values(
+          uniqueSkillIds.map((skillId) => ({
+            connectionSetupId: created.id,
+            skillId,
+          })),
+        );
+      }
+
+      const uniquePluginIds = Array.from(new Set(pluginIds));
+      if (uniquePluginIds.length > 0) {
+        await tx.insert(schema.connectionSetupPluginsTable).values(
+          uniquePluginIds.map((pluginId) => ({
+            connectionSetupId: created.id,
+            pluginId,
+          })),
+        );
+      }
+
+      return created;
+    });
+
+    return { setup: setup as ConnectionSetup, rawToken };
+  }
+
+  static async findById(id: string): Promise<ConnectionSetup | null> {
+    const [setup] = await db
+      .select()
+      .from(schema.connectionSetupsTable)
+      .where(eq(schema.connectionSetupsTable.id, id));
+    return setup ?? null;
+  }
+
+  static async hasManagedPrimaryInstallation(params: {
+    organizationId: string;
+    userId: string;
+    virtualApiKeyId: string;
+  }): Promise<boolean> {
+    const table = schema.connectionSetupsTable;
+    const [installation] = await db
+      .select({ id: table.id })
+      .from(table)
+      .innerJoin(
+        schema.membersTable,
+        and(
+          eq(schema.membersTable.organizationId, table.organizationId),
+          eq(schema.membersTable.userId, table.userId),
+        ),
+      )
+      .where(
+        and(
+          eq(table.organizationId, params.organizationId),
+          eq(table.userId, params.userId),
+          eq(table.virtualApiKeyId, params.virtualApiKeyId),
+          inArray(table.clientId, ["opencode", "kilo"]),
+          eq(table.proxyAuth, "primary-providers"),
+          isNotNull(table.llmProxyId),
+          isNotNull(table.consumedAt),
+          isNull(table.revokedAt),
+        ),
+      )
+      .limit(1);
+    return Boolean(installation);
+  }
+
+  /** Transfers an owned, unused render ticket to a browser-approved installer. */
+  static async bindClientConnection(params: {
+    setupId: string;
+    userId: string;
+    organizationId: string;
+    clientId: ConnectionSetup["clientId"];
+    platform: ConnectionSetup["platform"];
+    tokenHash: string;
+    tokenStart: string;
+    expiresAt: Date;
+    /** Machine the installer reported; null for installers that predate it. */
+    deviceName?: string;
+  }): Promise<boolean> {
+    const table = schema.connectionSetupsTable;
+    const [row] = await db
+      .update(table)
+      .set({
+        tokenHash: params.tokenHash,
+        tokenStart: params.tokenStart,
+        expiresAt: params.expiresAt,
+        deviceName: params.deviceName ?? null,
+      })
+      .where(
+        and(
+          eq(table.id, params.setupId),
+          eq(table.userId, params.userId),
+          eq(table.organizationId, params.organizationId),
+          eq(table.clientId, params.clientId),
+          eq(table.platform, params.platform),
+          isNull(table.consumedAt),
+          gt(table.expiresAt, sql`now()`),
+        ),
+      )
+      .returning({ id: table.id });
+    return Boolean(row);
+  }
+
+  /**
+   * Atomically claims an unconsumed, unexpired setup by raw token: sets
+   * `consumedAt` and returns the row, or returns null if the token is
+   * unknown, already consumed, or expired. Concurrent claims serialize on
+   * the row — exactly one caller wins.
+   *
+   * Accepts an optional transaction; with one, a rollback un-consumes the
+   * token. The script endpoint instead claims first (own statement) and
+   * compensates with {@link unclaim} on failure, so its re-validation reads
+   * observe any revocation committed before the claim.
+   */
+  static async claimByToken(params: {
+    rawToken: string;
+    tx?: Transaction;
+  }): Promise<ConnectionSetup | null> {
+    const [claimed] = await (params.tx ?? db)
+      .update(schema.connectionSetupsTable)
+      .set({ consumedAt: new Date() })
+      .where(
+        and(
+          eq(
+            schema.connectionSetupsTable.tokenHash,
+            hashToken(params.rawToken),
+          ),
+          isNull(schema.connectionSetupsTable.consumedAt),
+          gt(schema.connectionSetupsTable.expiresAt, sql`now()`),
+        ),
+      )
+      .returning();
+
+    return (claimed as ConnectionSetup | undefined) ?? null;
+  }
+
+  /**
+   * Compensating action for {@link claimByToken}: restores the token after a
+   * post-claim failure (failed re-validation or render) so a server-side
+   * error doesn't burn the one-time command. Expiry still applies — a later
+   * claim re-checks `expiresAt`.
+   */
+  static async unclaim(id: string): Promise<void> {
+    await db
+      .update(schema.connectionSetupsTable)
+      .set({ consumedAt: null })
+      .where(eq(schema.connectionSetupsTable.id, id));
+  }
+
+  /** Existence probe so the script endpoint can pick 404 vs 410. */
+  static async findByToken(rawToken: string): Promise<ConnectionSetup | null> {
+    const [row] = await db
+      .select()
+      .from(schema.connectionSetupsTable)
+      .where(eq(schema.connectionSetupsTable.tokenHash, hashToken(rawToken)))
+      .limit(1);
+
+    return (row as ConnectionSetup | undefined) ?? null;
+  }
+
+  static async getSkillIds(params: {
+    connectionSetupId: string;
+    tx?: Transaction;
+  }): Promise<string[]> {
+    const executor = params.tx ?? db;
+    const rows = await executor
+      .select({ skillId: schema.connectionSetupSkillsTable.skillId })
+      .from(schema.connectionSetupSkillsTable)
+      .where(
+        eq(
+          schema.connectionSetupSkillsTable.connectionSetupId,
+          params.connectionSetupId,
+        ),
+      );
+
+    return rows.map((row) => row.skillId);
+  }
+
+  static async getPluginIds(params: {
+    connectionSetupId: string;
+    tx?: Transaction;
+  }): Promise<string[]> {
+    const executor = params.tx ?? db;
+    const rows = await executor
+      .select({
+        pluginId: schema.connectionSetupPluginsTable.pluginId,
+      })
+      .from(schema.connectionSetupPluginsTable)
+      .where(
+        eq(
+          schema.connectionSetupPluginsTable.connectionSetupId,
+          params.connectionSetupId,
+        ),
+      );
+    return rows.map((row) => row.pluginId);
+  }
+
+  static async findBySkillShareLinkId(
+    id: string,
+  ): Promise<ConnectionSetup | null> {
+    const [row] = await db
+      .select()
+      .from(schema.connectionSetupsTable)
+      .where(eq(schema.connectionSetupsTable.skillShareLinkId, id))
+      .limit(1);
+    return row ?? null;
+  }
+
+  /** Records the lazily-created share link on the setup row (audit/revocation). */
+  static async attachSkillShareLink(params: {
+    connectionSetupId: string;
+    skillShareLinkId: string;
+    tx: Transaction;
+  }): Promise<void> {
+    await params.tx
+      .update(schema.connectionSetupsTable)
+      .set({ skillShareLinkId: params.skillShareLinkId })
+      .where(eq(schema.connectionSetupsTable.id, params.connectionSetupId));
+  }
+}
+
+export default ConnectionSetupModel;
+
+// ===================================================================
+// Internal helpers
+// ===================================================================
+
+function generateRawToken(): string {
+  const random = randomBytes(TOKEN_RANDOM_BYTES).toString("base64url");
+  return `${CONNECTION_SETUP_TOKEN_PREFIX}${random}`;
+}
+
+function hashToken(rawToken: string): string {
+  return createHash("sha256").update(rawToken).digest("hex");
+}

@@ -2,8 +2,8 @@
  * biome-ignore-all lint/correctness/noEmptyPattern: oddly enough in extend below this is required
  * see https://vitest.dev/guide/test-context.html#extend-test-context
  */
+
 import { type APIRequestContext, test as base } from "@playwright/test";
-import type { SupportedProvider } from "@shared";
 import {
   ADMIN_EMAIL,
   ADMIN_PASSWORD,
@@ -19,6 +19,7 @@ import {
   UI_BASE_URL,
   WIREMOCK_BASE_URL,
 } from "../consts";
+import { skipWithoutDependencies } from "../dependencies";
 
 export {
   LLM_MODELS_ROUTE,
@@ -34,19 +35,17 @@ export {
 export interface TestFixtures {
   makeApiRequest: typeof makeApiRequest;
   createAgent: typeof createAgent;
-  createLlmProxy: typeof createLlmProxy;
+  getLlmProxy: typeof getLlmProxy;
   createMcpGateway: typeof createMcpGateway;
   deleteAgent: typeof deleteAgent;
   createApiKey: typeof createApiKey;
   deleteApiKey: typeof deleteApiKey;
   createIdentityProvider: typeof createIdentityProvider;
   deleteIdentityProvider: typeof deleteIdentityProvider;
-  createToolInvocationPolicy: typeof createToolInvocationPolicy;
-  deleteToolInvocationPolicy: typeof deleteToolInvocationPolicy;
-  createTrustedDataPolicy: typeof createTrustedDataPolicy;
-  deleteTrustedDataPolicy: typeof deleteTrustedDataPolicy;
   createMcpCatalogItem: typeof createMcpCatalogItem;
   deleteMcpCatalogItem: typeof deleteMcpCatalogItem;
+  createEnvironment: typeof createEnvironment;
+  deleteEnvironment: typeof deleteEnvironment;
   installMcpServer: typeof installMcpServer;
   uninstallMcpServer: typeof uninstallMcpServer;
   createRole: typeof createRole;
@@ -59,9 +58,6 @@ export interface TestFixtures {
   addTeamMember: typeof addTeamMember;
   removeTeamMember: typeof removeTeamMember;
   getActiveOrganizationId: typeof getActiveOrganizationId;
-  createOptimizationRule: typeof createOptimizationRule;
-  deleteOptimizationRule: typeof deleteOptimizationRule;
-  updateOptimizationRule: typeof updateOptimizationRule;
   createLimit: typeof createLimit;
   deleteLimit: typeof deleteLimit;
   getLimits: typeof getLimits;
@@ -69,7 +65,6 @@ export interface TestFixtures {
   syncModels: typeof syncModels;
   updateModelPricing: typeof updateModelPricing;
   getOrganization: typeof getOrganization;
-  updateLlmSettings: typeof updateLlmSettings;
   updateSecuritySettings: typeof updateSecuritySettings;
   updateKnowledgeSettings: typeof updateKnowledgeSettings;
   getInteractions: typeof getInteractions;
@@ -85,6 +80,8 @@ export interface TestFixtures {
   editorRequest: APIRequestContext;
   /** API request context authenticated as member */
   memberRequest: APIRequestContext;
+  /** Skips a tagged test whose dependency E2E_UNAVAILABLE names (see dependencies.ts) */
+  skipWithoutDependencies: undefined;
 }
 
 const makeApiRequest = async ({
@@ -173,7 +170,7 @@ async function refreshAdminSession(request: APIRequestContext): Promise<void> {
   if (
     !permissions?.identityProvider?.includes("create") ||
     !permissions?.mcpRegistry?.includes("create") ||
-    !permissions?.toolPolicy?.includes("create")
+    !permissions?.agent?.includes("create")
   ) {
     throw new Error(
       `Refreshed session does not have admin permissions: ${JSON.stringify(permissions)}`,
@@ -205,7 +202,11 @@ function extractPaginatedArray<T>(data: unknown): T[] {
 const createAgent = async (
   request: APIRequestContext,
   name: string,
-  scope: "personal" | "team" | "org",
+  agentType?: "agent" | "mcp_gateway",
+  initialGrants?: ReadonlyArray<{
+    subject: { type: string; id: string };
+    actions: ReadonlyArray<string>;
+  }>,
 ) =>
   makeApiRequest({
     request,
@@ -213,51 +214,33 @@ const createAgent = async (
     urlSuffix: "/api/agents",
     data: {
       name,
-      teams: [],
-      scope,
+      ...(agentType ? { agentType } : {}),
+      ...(initialGrants ? { initialGrants } : {}),
     },
   });
 
 /**
- * Create an LLM Proxy
+ * Get the organization's singleton LLM Proxy (created on first use).
+ * Response shape: { id, identityProviderId }.
  * (authnz is handled by the authenticated session)
  */
-const createLlmProxy = async (
-  request: APIRequestContext,
-  name: string,
-  scope: "personal" | "team" | "org",
-) =>
+const getLlmProxy = async (request: APIRequestContext) =>
   makeApiRequest({
     request,
-    method: "post",
-    urlSuffix: "/api/agents",
-    data: {
-      name,
-      teams: [],
-      agentType: "llm_proxy",
-      scope,
-    },
+    method: "get",
+    urlSuffix: "/api/llm-proxy",
   });
 
 /**
  * Create an MCP Gateway
  * (authnz is handled by the authenticated session)
  */
-const createMcpGateway = async (
-  request: APIRequestContext,
-  name: string,
-  scope: "personal" | "team" | "org",
-) =>
+const createMcpGateway = async (request: APIRequestContext, name: string) =>
   makeApiRequest({
     request,
     method: "post",
     urlSuffix: "/api/agents",
-    data: {
-      name,
-      teams: [],
-      agentType: "mcp_gateway",
-      scope,
-    },
+    data: { name, agentType: "mcp_gateway" },
   });
 
 /**
@@ -306,8 +289,9 @@ const deleteApiKey = async (request: APIRequestContext, keyId: string) =>
 /**
  * Create an identity provider (SSO provider) via the API with OIDC config pointing to Keycloak.
  * Returns the created provider's ID.
+ * (Also exported directly for beforeAll hooks, which cannot use test-scoped fixtures.)
  */
-const createIdentityProvider = async (
+export const createIdentityProvider = async (
   request: APIRequestContext,
   providerId: string,
   options?: {
@@ -327,6 +311,7 @@ const createIdentityProvider = async (
         | "client_secret_basic"
         | "private_key_jwt";
       jwksEndpoint?: string;
+      scopes?: string[];
     };
     enterpriseManagedCredentials?: {
       clientId?: string;
@@ -359,6 +344,7 @@ const createIdentityProvider = async (
       options?.oidcConfig?.tokenEndpointAuthentication,
     jwksEndpoint:
       options?.oidcConfig?.jwksEndpoint ?? KEYCLOAK_OIDC.jwksEndpoint,
+    scopes: options?.oidcConfig?.scopes,
   };
 
   const response = await makeApiRequest({
@@ -387,8 +373,9 @@ const createIdentityProvider = async (
 
 /**
  * Delete an identity provider (SSO provider) via the API.
+ * (Also exported directly for afterAll hooks, which cannot use test-scoped fixtures.)
  */
-const deleteIdentityProvider = async (
+export const deleteIdentityProvider = async (
   request: APIRequestContext,
   id: string,
 ): Promise<void> => {
@@ -399,91 +386,6 @@ const deleteIdentityProvider = async (
     ignoreStatusCheck: true,
   });
 };
-
-/**
- * Create a tool invocation policy
- * (authnz is handled by the authenticated session)
- */
-const createToolInvocationPolicy = async (
-  request: APIRequestContext,
-  policy: {
-    toolId: string;
-    conditions: Array<{ key: string; operator: string; value: string }>;
-    action:
-      | "allow_when_context_is_untrusted"
-      | "block_when_context_is_untrusted"
-      | "block_always";
-    reason?: string;
-  },
-) =>
-  makeApiRequest({
-    request,
-    method: "post",
-    urlSuffix: "/api/autonomy-policies/tool-invocation",
-    data: {
-      toolId: policy.toolId,
-      conditions: policy.conditions,
-      action: policy.action,
-      reason: policy.reason,
-    },
-  });
-
-/**
- * Delete a tool invocation policy
- * (authnz is handled by the authenticated session)
- */
-const deleteToolInvocationPolicy = async (
-  request: APIRequestContext,
-  policyId: string,
-) =>
-  makeApiRequest({
-    request,
-    method: "delete",
-    urlSuffix: `/api/autonomy-policies/tool-invocation/${policyId}`,
-  });
-
-/**
- * Create a trusted data policy
- * (authnz is handled by the authenticated session)
- */
-const createTrustedDataPolicy = async (
-  request: APIRequestContext,
-  policy: {
-    toolId: string;
-    conditions: Array<{ key: string; operator: string; value: string }>;
-    action:
-      | "block_always"
-      | "mark_as_trusted"
-      | "mark_as_untrusted"
-      | "sanitize_with_dual_llm";
-    description?: string;
-  },
-) =>
-  makeApiRequest({
-    request,
-    method: "post",
-    urlSuffix: "/api/trusted-data-policies",
-    data: {
-      toolId: policy.toolId,
-      conditions: policy.conditions,
-      action: policy.action,
-      description: policy.description,
-    },
-  });
-
-/**
- * Delete a trusted data policy
- * (authnz is handled by the authenticated session)
- */
-const deleteTrustedDataPolicy = async (
-  request: APIRequestContext,
-  policyId: string,
-) =>
-  makeApiRequest({
-    request,
-    method: "delete",
-    urlSuffix: `/api/trusted-data-policies/${policyId}`,
-  });
 
 /**
  * Create an MCP catalog item
@@ -499,6 +401,9 @@ const createMcpCatalogItem = async (
     serverUrl?: string;
     authFields?: unknown;
     labels?: Array<{ key: string; value: string }>;
+    // Bind the catalog item to an environment so its deployed pod inherits that
+    // environment's egress policy (e.g. a restricted allowlist).
+    environmentId?: string;
   },
 ) =>
   makeApiRequest({
@@ -520,6 +425,44 @@ const deleteMcpCatalogItem = async (
     request,
     method: "delete",
     urlSuffix: `/api/internal_mcp_catalog/${catalogId}`,
+  });
+
+/**
+ * Create an environment (with an optional egress network policy).
+ * (authnz is handled by the authenticated session)
+ */
+const createEnvironment = async (
+  request: APIRequestContext,
+  data: {
+    name: string;
+    namespace?: string | null;
+    networkPolicy?: {
+      egressMode?: "off" | "restricted" | "unrestricted";
+      domainPreset?: "none" | "common_dependencies" | "package_managers";
+      allowedDomains?: string[];
+      allowedCidrs?: string[];
+    } | null;
+  },
+) =>
+  makeApiRequest({
+    request,
+    method: "post",
+    urlSuffix: "/api/environments",
+    data,
+  });
+
+/**
+ * Delete an environment
+ * (authnz is handled by the authenticated session)
+ */
+const deleteEnvironment = async (
+  request: APIRequestContext,
+  environmentId: string,
+) =>
+  makeApiRequest({
+    request,
+    method: "delete",
+    urlSuffix: `/api/environments/${environmentId}`,
   });
 
 /**
@@ -806,70 +749,6 @@ const getActiveOrganizationId = async (
 };
 
 /**
- * Optimization rule condition types
- */
-type OptimizationRuleCondition = { maxLength: number } | { hasTools: boolean };
-
-/**
- * Create an optimization rule
- * (authnz is handled by the authenticated session)
- */
-const createOptimizationRule = async (
-  request: APIRequestContext,
-  rule: {
-    entityType: "organization" | "team" | "agent";
-    entityId: string;
-    provider: SupportedProvider;
-    conditions: OptimizationRuleCondition[];
-    targetModel: string;
-    enabled?: boolean;
-  },
-) =>
-  makeApiRequest({
-    request,
-    method: "post",
-    urlSuffix: "/api/optimization-rules",
-    data: {
-      ...rule,
-      enabled: rule.enabled ?? true,
-    },
-  });
-
-/**
- * Update an optimization rule
- * (authnz is handled by the authenticated session)
- */
-const updateOptimizationRule = async (
-  request: APIRequestContext,
-  ruleId: string,
-  updates: {
-    conditions?: OptimizationRuleCondition[];
-    targetModel?: string;
-    enabled?: boolean;
-  },
-) =>
-  makeApiRequest({
-    request,
-    method: "put",
-    urlSuffix: `/api/optimization-rules/${ruleId}`,
-    data: updates,
-  });
-
-/**
- * Delete an optimization rule
- * (authnz is handled by the authenticated session)
- */
-const deleteOptimizationRule = async (
-  request: APIRequestContext,
-  ruleId: string,
-) =>
-  makeApiRequest({
-    request,
-    method: "delete",
-    urlSuffix: `/api/optimization-rules/${ruleId}`,
-  });
-
-/**
  * Create a limit (token cost, mcp_server_calls, or tool_calls)
  * (authnz is handled by the authenticated session)
  */
@@ -979,33 +858,14 @@ const getOrganization = async (request: APIRequestContext) =>
   });
 
 /**
- * Update LLM settings (compression, cleanup interval)
- * (authnz is handled by the authenticated session)
- */
-const updateLlmSettings = async (
-  request: APIRequestContext,
-  updates: {
-    convertToolResultsToToon?: boolean;
-    compressionScope?: "organization" | "team";
-    limitCleanupInterval?: "1h" | "12h" | "24h" | "1w" | "1m";
-  },
-) =>
-  makeApiRequest({
-    request,
-    method: "patch",
-    urlSuffix: "/api/organization/llm-settings",
-    data: updates,
-  });
-
-/**
- * Update security settings (global tool policy, chat file uploads)
+ * Update security settings (chat file uploads)
  * (authnz is handled by the authenticated session)
  */
 const updateSecuritySettings = async (
   request: APIRequestContext,
   updates: {
-    globalToolPolicy?: "permissive" | "restrictive";
     allowChatFileUploads?: boolean;
+    allowToolAutoAssignment?: boolean;
   },
 ) =>
   makeApiRequest({
@@ -1236,14 +1096,15 @@ const deleteConnector = async (
 
 export * from "@playwright/test";
 export const test = base.extend<TestFixtures>({
+  skipWithoutDependencies: [skipWithoutDependencies, { auto: true }],
   makeApiRequest: async ({}, use) => {
     await use(makeApiRequest);
   },
   createAgent: async ({}, use) => {
     await use(createAgent);
   },
-  createLlmProxy: async ({}, use) => {
-    await use(createLlmProxy);
+  getLlmProxy: async ({}, use) => {
+    await use(getLlmProxy);
   },
   createMcpGateway: async ({}, use) => {
     await use(createMcpGateway);
@@ -1263,23 +1124,17 @@ export const test = base.extend<TestFixtures>({
   deleteIdentityProvider: async ({}, use) => {
     await use(deleteIdentityProvider);
   },
-  createToolInvocationPolicy: async ({}, use) => {
-    await use(createToolInvocationPolicy);
-  },
-  deleteToolInvocationPolicy: async ({}, use) => {
-    await use(deleteToolInvocationPolicy);
-  },
-  createTrustedDataPolicy: async ({}, use) => {
-    await use(createTrustedDataPolicy);
-  },
-  deleteTrustedDataPolicy: async ({}, use) => {
-    await use(deleteTrustedDataPolicy);
-  },
   createMcpCatalogItem: async ({}, use) => {
     await use(createMcpCatalogItem);
   },
   deleteMcpCatalogItem: async ({}, use) => {
     await use(deleteMcpCatalogItem);
+  },
+  createEnvironment: async ({}, use) => {
+    await use(createEnvironment);
+  },
+  deleteEnvironment: async ({}, use) => {
+    await use(deleteEnvironment);
   },
   installMcpServer: async ({}, use) => {
     await use(installMcpServer);
@@ -1317,15 +1172,6 @@ export const test = base.extend<TestFixtures>({
   getActiveOrganizationId: async ({}, use) => {
     await use(getActiveOrganizationId);
   },
-  createOptimizationRule: async ({}, use) => {
-    await use(createOptimizationRule);
-  },
-  deleteOptimizationRule: async ({}, use) => {
-    await use(deleteOptimizationRule);
-  },
-  updateOptimizationRule: async ({}, use) => {
-    await use(updateOptimizationRule);
-  },
   createLimit: async ({}, use) => {
     await use(createLimit);
   },
@@ -1346,9 +1192,6 @@ export const test = base.extend<TestFixtures>({
   },
   getOrganization: async ({}, use) => {
     await use(getOrganization);
-  },
-  updateLlmSettings: async ({}, use) => {
-    await use(updateLlmSettings);
   },
   updateSecuritySettings: async ({}, use) => {
     await use(updateSecuritySettings);

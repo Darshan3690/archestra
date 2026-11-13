@@ -1,0 +1,367 @@
+import { archestraApiClient } from "@archestra/shared";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { HttpResponse, http } from "msw";
+import { setupServer } from "msw/node";
+import { useState } from "react";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+import { ClaudeCodeAccount } from "./claude-code-account";
+import { ClaudeCodeInferenceSettings } from "./claude-code-inference-settings";
+
+vi.mock("sonner");
+
+const origin = "http://localhost:9000";
+const accountUrl = `${origin}/api/agents/agent-1/runtime/claude-code/account`;
+const modelsUrl = `${origin}/api/agents/agent-1/runtime/claude-code/models`;
+const server = setupServer();
+let connected = false;
+let signInStarted = false;
+const pendingSignIn = {
+  state: "awaiting_code",
+  flowId: "00000000-0000-4000-8000-000000000001",
+  authorizationUrl: "https://claude.ai/oauth/authorize?state=test",
+};
+let modelRequests = 0;
+let client: QueryClient;
+
+beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
+beforeEach(() => {
+  // JSDOM has no scrolling implementation; the real command menu calls it.
+  Element.prototype.scrollIntoView = vi.fn();
+  archestraApiClient.setConfig({ baseUrl: origin });
+  connected = false;
+  signInStarted = false;
+  modelRequests = 0;
+  client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  server.use(
+    http.get(`${origin}/api/auth/get-session`, () => HttpResponse.json(null)),
+    http.get(accountUrl, () =>
+      HttpResponse.json(
+        connected
+          ? { state: "connected" }
+          : signInStarted
+            ? pendingSignIn
+            : { state: "disconnected" },
+      ),
+    ),
+    http.get(modelsUrl, () => {
+      modelRequests++;
+      return HttpResponse.json({
+        models: [
+          {
+            value: "opus",
+            displayName: "Opus",
+            description: "Runtime default",
+          },
+          {
+            value: "runtime-choice",
+            displayName: "Runtime model",
+            description: "Discovered from this CLI",
+          },
+        ],
+      });
+    }),
+    http.post(accountUrl, () => {
+      signInStarted = true;
+      return HttpResponse.json(pendingSignIn);
+    }),
+    http.post(`${accountUrl}/complete`, async ({ request }) => {
+      expect(await request.json()).toEqual({
+        flowId: "00000000-0000-4000-8000-000000000001",
+        code: "native-authorization-code",
+      });
+      connected = true;
+      signInStarted = false;
+      return HttpResponse.json({ state: "connected" });
+    }),
+    http.delete(accountUrl, () => {
+      connected = false;
+      signInStarted = false;
+      return HttpResponse.json({ state: "disconnected" });
+    }),
+  );
+});
+afterEach(() => {
+  server.resetHandlers();
+  client.clear();
+});
+afterAll(() => {
+  server.close();
+  archestraApiClient.setConfig({ baseUrl: "" });
+});
+
+describe("Claude Code authentication", () => {
+  it("discovers models only after native authentication and removes them on disconnect", async () => {
+    // A cached provider catalog must never populate the native account picker.
+    client.setQueryData(
+      ["llm-models", null],
+      [
+        {
+          id: "unrelated-api-model",
+          provider: "anthropic",
+          displayName: "API catalog model",
+        },
+      ],
+    );
+    render(
+      <QueryClientProvider client={client}>
+        <Account />
+      </QueryClientProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Sign in" })).toBeEnabled(),
+    );
+    expect(modelRequests).toBe(0);
+    expect(screen.queryByText("API catalog model")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Provider key" }),
+    ).not.toBeInTheDocument();
+    // Sign in starts Claude's flow at once; there is no second button.
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await screen.findByLabelText("Authorization code");
+    expect(modelRequests).toBe(0);
+    fireEvent.change(screen.getByLabelText("Authorization code"), {
+      target: { value: "native-authorization-code" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Complete sign-in" }));
+    await screen.findByText("Signed in for you");
+    await waitFor(() => expect(modelRequests).toBe(1));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Opus/i }));
+    fireEvent.click(
+      await screen.findByRole("option", { name: /Runtime model/ }),
+    );
+    expect(screen.getByRole("button", { name: /Runtime model/ })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Manage" }));
+    fireEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+    await screen.findByRole("button", { name: "Sign in with Claude" });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(
+      screen.queryByRole("button", { name: /Runtime model/ }),
+    ).not.toBeInTheDocument();
+    expect(modelRequests).toBe(1);
+  });
+
+  it("finishes an asynchronous token flow without resubmitting the authorization code", async () => {
+    let polls = 0;
+    server.use(
+      http.get(accountUrl, () =>
+        HttpResponse.json(
+          connected
+            ? { state: "connected" }
+            : { state: "connecting", flowId: pendingSignIn.flowId },
+        ),
+      ),
+      http.post(`${accountUrl}/complete`, async ({ request }) => {
+        expect(await request.json()).toEqual({ flowId: pendingSignIn.flowId });
+        polls++;
+        connected = true;
+        return HttpResponse.json({ state: "connected" });
+      }),
+    );
+    render(
+      <QueryClientProvider client={client}>
+        <Account />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("Sign in to use this agent.");
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await screen.findByText("Signed in for you", {}, { timeout: 5000 });
+    expect(polls).toBe(1);
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("switches to provider billing without treating Vertex configuration as a personal sign-in", async () => {
+    render(
+      <QueryClientProvider client={client}>
+        <Settings vertexEnabled />
+      </QueryClientProvider>,
+    );
+    // Signing in belongs to the setup banner; the settings stay quiet.
+    await waitFor(() =>
+      expect(
+        screen.getByRole("radio", {
+          name: /Each person's Claude subscription/,
+        }),
+      ).toBeChecked(),
+    );
+    expect(
+      screen.queryByRole("button", { name: "Sign in" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("radio", { name: /A company API key/ }));
+    expect(screen.getByRole("button", { name: "Provider key" })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Provider model" }),
+    ).toBeVisible();
+    expect(
+      screen.getByText(/Billed through Google Cloud \(Vertex AI\)/),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Sign in" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("radio", { name: /Each person's Claude subscription/ }),
+    );
+    expect(
+      screen.queryByRole("button", { name: "Provider key" }),
+    ).not.toBeInTheDocument();
+    expect(modelRequests).toBe(0);
+  });
+
+  it("keeps the model picker hidden when account discovery fails", async () => {
+    server.use(
+      http.get(accountUrl, () =>
+        HttpResponse.json(
+          { error: { message: "Runtime unavailable" } },
+          { status: 503 },
+        ),
+      ),
+    );
+    render(
+      <QueryClientProvider client={client}>
+        <Account />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("Could not check connection");
+    expect(modelRequests).toBe(0);
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await screen.findByText("Could not check Claude Code");
+    expect(
+      screen.queryByRole("button", { name: "Sign in with Claude" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("enables personal subscription when runtimeCommand is archestra-claude-code-runtime", () => {
+    render(
+      <QueryClientProvider client={client}>
+        <ClaudeCodeInferenceSettings
+          agentId=""
+          authentication="subscription"
+          onAuthenticationChange={vi.fn()}
+          model="opus"
+          onModelChange={vi.fn()}
+          provider="anthropic"
+          vertexEnabled={false}
+          runtimeCommand="archestra-claude-code-runtime"
+          apiKeySelector={<button type="button">Provider key</button>}
+          modelSelector={<button type="button">Provider model</button>}
+        />
+      </QueryClientProvider>,
+    );
+
+    const subscriptionRadio = screen.getByRole("radio", {
+      name: /Each person's Claude subscription/,
+    });
+    expect(subscriptionRadio).not.toBeDisabled();
+    expect(subscriptionRadio).toBeChecked();
+  });
+
+  it("disables personal subscription and explains how to restore the command when runtimeCommand is a custom non-Claude entrypoint", () => {
+    render(
+      <QueryClientProvider client={client}>
+        <ClaudeCodeInferenceSettings
+          agentId="agent-1"
+          authentication="subscription"
+          onAuthenticationChange={vi.fn()}
+          model="opus"
+          onModelChange={vi.fn()}
+          provider="anthropic"
+          vertexEnabled={false}
+          runtimeCommand="custom-claude-entrypoint"
+          apiKeySelector={<button type="button">Provider key</button>}
+          modelSelector={<button type="button">Provider model</button>}
+        />
+      </QueryClientProvider>,
+    );
+
+    const subscriptionRadio = screen.getByRole("radio", {
+      name: /Each person's Claude subscription/,
+    });
+    const providerRadio = screen.getByRole("radio", {
+      name: /A company API key/,
+    });
+    expect(subscriptionRadio).toBeDisabled();
+    expect(subscriptionRadio).not.toBeChecked();
+    expect(providerRadio).toBeChecked();
+    expect(
+      screen.getByText(
+        "To use personal Claude subscriptions, change Dedicated runtime → Container → Command to archestra-claude-code. Any custom logic in the current custom-claude-entrypoint entrypoint will be lost.",
+      ),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Provider key" })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Provider model" }),
+    ).toBeVisible();
+  });
+
+  it("treats a command with surrounding whitespace as not matching archestra-claude-code", () => {
+    render(
+      <QueryClientProvider client={client}>
+        <ClaudeCodeInferenceSettings
+          agentId="agent-1"
+          authentication="subscription"
+          onAuthenticationChange={vi.fn()}
+          model="opus"
+          onModelChange={vi.fn()}
+          provider="anthropic"
+          vertexEnabled={false}
+          runtimeCommand=" archestra-claude-code "
+          apiKeySelector={<button type="button">Provider key</button>}
+          modelSelector={<button type="button">Provider model</button>}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(
+      screen.getByRole("radio", {
+        name: /Each person's Claude subscription/,
+      }),
+    ).toBeDisabled();
+  });
+});
+
+/** The account control the agent's setup banner shows until sign-in. */
+function Account() {
+  const [model, setModel] = useState<string>();
+  return (
+    <ClaudeCodeAccount
+      agentId="agent-1"
+      variant="compact"
+      model={model}
+      onModelChange={setModel}
+    />
+  );
+}
+
+function Settings({ vertexEnabled = false }: { vertexEnabled?: boolean }) {
+  const [authentication, setAuthentication] = useState<
+    "provider" | "subscription"
+  >("subscription");
+  const [model, setModel] = useState<string>();
+  return (
+    <ClaudeCodeInferenceSettings
+      agentId="agent-1"
+      authentication={authentication}
+      onAuthenticationChange={setAuthentication}
+      model={model}
+      onModelChange={setModel}
+      provider="anthropic"
+      vertexEnabled={vertexEnabled}
+      apiKeySelector={<button type="button">Provider key</button>}
+      modelSelector={<button type="button">Provider model</button>}
+    />
+  );
+}

@@ -1,0 +1,131 @@
+/**
+ * Shared encoder for the OpenAI chat-completions streaming wire shape.
+ *
+ * Several adapters translate a non-OpenAI provider into this shape
+ * (anthropic-openai, cohere-openai, gemini-openai) and each carried a private,
+ * byte-identical copy of the envelope. The copies drifted: none of them ever
+ * emitted `usage`, so a client streaming through those surfaces never learned
+ * its token counts even though the accumulator had them. One definition keeps
+ * that from happening again.
+ */
+import type { UsageView } from "@/types";
+
+/** Token counts in the OpenAI chat-completions wire shape. */
+export interface OpenAiStreamUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  completion_tokens_details?: { reasoning_tokens: number };
+  /**
+   * OpenAI reports prompt-cache hits as a subset of `prompt_tokens`. Providers
+   * that count cache reads separately (Anthropic, Bedrock, Gemini) must publish
+   * them here, or the gross `prompt_tokens` above is indistinguishable from an
+   * uncached prompt of the same size — and a consumer that recovers the split
+   * the way this codebase does (`prompt_tokens - cached_tokens`, see
+   * `openAIUsageTokens`) attributes the whole prompt to full-price input.
+   */
+  prompt_tokens_details?: {
+    cached_tokens: number;
+    cache_write_tokens?: number;
+    cache_write_1h_tokens?: number;
+  };
+}
+
+/**
+ * Map the internal accumulator's usage onto the OpenAI wire fields, or
+ * `undefined` when the provider never reported any.
+ *
+ * Valid only where `UsageView.inputTokens` already equals the provider's gross
+ * prompt count. It is NOT universal, and the exceptions are the rule for every
+ * cache-aware provider: `inputTokens` is normalized to *uncached* input, so an
+ * adapter whose provider reports cache tokens outside its input count
+ * (openai, anthropic, bedrock, gemini) must use `toOpenAiStreamUsageWithCache`
+ * instead — otherwise a heavily cached turn reports only the handful of
+ * tokens that missed the cache as its entire prompt.
+ */
+export function toOpenAiStreamUsage(
+  usage: UsageView | null | undefined,
+): OpenAiStreamUsage | undefined {
+  if (!usage) {
+    return undefined;
+  }
+  return {
+    prompt_tokens: usage.inputTokens,
+    completion_tokens: usage.outputTokens,
+    total_tokens: usage.inputTokens + usage.outputTokens,
+  };
+}
+
+/**
+ * Map a cache-aware `UsageView` onto the OpenAI wire fields.
+ *
+ * `UsageView.inputTokens` is normalized to the *uncached* remainder (see
+ * `toOpenAiStreamUsage`'s doc comment), so this recombines cache reads and
+ * writes back into a gross `prompt_tokens` and publishes the cache-read
+ * subset via `prompt_tokens_details.cached_tokens` — the shape
+ * `@ai-sdk/openai` (and any OpenAI-compatible client) reads cache hits from.
+ * Providers that report cache writes retain the disjoint write count too.
+ */
+export function toOpenAiStreamUsageWithCache(
+  usage: UsageView | null | undefined,
+): OpenAiStreamUsage | undefined {
+  if (!usage) {
+    return undefined;
+  }
+  const cacheReadTokens = usage.cacheReadTokens ?? 0;
+  const cacheWriteTokens = usage.cacheWriteTokens ?? 0;
+  const promptTokens = usage.inputTokens + cacheReadTokens + cacheWriteTokens;
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: usage.outputTokens,
+    total_tokens: promptTokens + usage.outputTokens,
+    // Omitted rather than zeroed when nothing was cached, so the field's
+    // presence still means "this provider reported cache usage".
+    ...(cacheReadTokens > 0 || cacheWriteTokens > 0
+      ? {
+          prompt_tokens_details: {
+            cached_tokens: cacheReadTokens,
+            ...(cacheWriteTokens > 0
+              ? { cache_write_tokens: cacheWriteTokens }
+              : {}),
+            ...(usage.cacheWrite1hTokens !== undefined
+              ? { cache_write_1h_tokens: usage.cacheWrite1hTokens }
+              : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+/**
+ * Format one `chat.completion.chunk` SSE event.
+ *
+ * `usage` is already mapped to the wire shape (via `toOpenAiStreamUsage`, or by
+ * the caller when its provider needs different arithmetic) and is omitted
+ * unless supplied, because it belongs only on the final chunk — a delta chunk
+ * carrying usage would be a protocol error.
+ */
+export function formatOpenAiChunkSse(params: {
+  id: string;
+  created: number;
+  model: string;
+  delta: Record<string, unknown>;
+  finishReason: string | null;
+  usage?: OpenAiStreamUsage;
+}): string {
+  return `data: ${JSON.stringify({
+    id: params.id,
+    object: "chat.completion.chunk",
+    created: params.created,
+    model: params.model,
+    choices: [
+      {
+        index: 0,
+        delta: params.delta,
+        finish_reason: params.finishReason,
+        logprobs: null,
+      },
+    ],
+    ...(params.usage ? { usage: params.usage } : {}),
+  })}\n\n`;
+}

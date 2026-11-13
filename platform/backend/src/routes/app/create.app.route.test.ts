@@ -1,0 +1,701 @@
+import { ADMIN_ROLE_NAME } from "@archestra/shared";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import {
+  AgentModel,
+  AppModel,
+  ConversationModel,
+  InternalMcpCatalogModel,
+  McpServerModel,
+  MemberModel,
+  OrganizationModel,
+} from "@/models";
+import EnvironmentModel from "@/models/environment";
+import EnvironmentResourceDefaultModel from "@/models/environment-resource-default";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mustExist,
+  test,
+} from "@/test";
+import {
+  createRestrictedEnvironment,
+  grantEnvironmentUse,
+} from "@/test/environments";
+import type { User } from "@/types";
+
+describe("POST /api/apps", () => {
+  let app: FastifyInstanceWithZod;
+  let organizationId: string;
+  let user: User;
+
+  beforeEach(async ({ makeOrganization, makeUser, makeMember }) => {
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    user = await makeUser();
+    await makeMember(user.id, organizationId, { role: ADMIN_ROLE_NAME });
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (
+        request as typeof request & {
+          organizationId: string;
+          user: User;
+        }
+      ).organizationId = organizationId;
+      (request as typeof request & { user: User }).user = user;
+    });
+
+    const { default: appRoutes } = await import("./app.routes");
+    await app.register(appRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  test("creates an org-scoped app at version 1 for an admin", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: {
+        name: "Dashboard",
+        description: "A shared dashboard",
+        html: "<html><head></head><body><h1>ok</h1></body></html>",
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      name: "Dashboard",
+      description: "A shared dashboard",
+      latestVersion: 1,
+    });
+  });
+
+  test("stores a supplied icon on the new app's backing catalog", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Iconned", icon: "🚀" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().icon).toBe("🚀");
+
+    // The app row has no icon column; the value has to reach the backing
+    // catalog, which is what the MCP registry renders for the same entity.
+    const created = mustExist(await AppModel.findById(response.json().id));
+    const server = mustExist(
+      await McpServerModel.findById(mustExist(created.mcpServerId)),
+    );
+    expect(
+      (await InternalMcpCatalogModel.findById(server.catalogId))?.icon,
+    ).toBe("🚀");
+  });
+
+  test("seeds the default template server-side with the app name when html is omitted", async () => {
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Seeded" },
+    });
+    expect(created.statusCode).toBe(200);
+
+    const versions = await app.inject({
+      method: "GET",
+      url: `/api/apps/${created.json().id}/versions`,
+    });
+    const { html } = versions.json()[0];
+    expect(html).toContain("<title>Seeded</title>");
+    expect(html).toContain("<h1>Seeded</h1>");
+    expect(html).not.toContain("{{APP_NAME}}");
+  });
+
+  test("rejects SDK self-bootstrap html and surfaces soft warnings", async () => {
+    const bootstrap = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: {
+        name: "Bootstrapper",
+        html: "<html><head><script>import(window.__ARCHESTRA_APP_SDK_URL__);</script></head><body/></html>",
+      },
+    });
+    expect(bootstrap.statusCode).toBe(400);
+    expect(bootstrap.json().error.message).toContain("window.archestra");
+
+    // A fragment saves fine but the response carries a structural warning.
+    const fragment = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Fragment", html: "<h1>just a heading</h1>" },
+    });
+    expect(fragment.statusCode).toBe(200);
+    expect(fragment.json().warnings).toHaveLength(1);
+    expect(fragment.json().warnings[0]).toContain("no <head> or <html>");
+
+    // A complete document carries no warnings field at all.
+    const clean = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: {
+        name: "Clean",
+        html: "<html><head></head><body><h1>ok</h1></body></html>",
+      },
+    });
+    expect(clean.statusCode).toBe(200);
+    expect(clean.json().warnings).toBeUndefined();
+  });
+
+  test("a creator may grant organization access to a new app", async ({
+    makeUser,
+    makeMember,
+  }) => {
+    const member = await makeUser();
+    await makeMember(member.id, organizationId, { role: "member" });
+    user = member;
+
+    const personal = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Mine", html: "<p/>" },
+    });
+    expect(personal.statusCode).toBe(200);
+    expect(personal.json().scope).toBe("personal");
+
+    const orgApp = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Shared", html: "<p/>" },
+    });
+    expect(orgApp.statusCode).toBe(200);
+  });
+
+  test("refuses a stray uiCsp body key (apps carry no author CSP)", async () => {
+    // uiCsp is not an authoring field: the strict body schema refuses it, and
+    // the serve path pins the platform CSP.
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: {
+        name: "BadCsp",
+        html: "<p/>",
+        uiCsp: { connectDomains: ["https://evil.example.com"] },
+      },
+    });
+    expect(response.statusCode).toBe(400);
+  });
+
+  test("refuses the retired scope and teamIds fields (400)", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Teamless", html: "<p/>", scope: "team", teamIds: [] },
+    });
+    expect(response.statusCode).toBe(400);
+  });
+
+  test("creates a team-scoped app with a valid team", async ({ makeTeam }) => {
+    const team = await makeTeam(organizationId, user.id, { name: "Squad" });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: {
+        name: "Team App",
+        html: "<p/>",
+        initialGrants: [
+          { subject: { type: "team", id: team.id }, actions: ["read", "use"] },
+        ],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    const policy = await ResourcePermissionPolicyModel.find({
+      organizationId,
+      resource: "app",
+      scope: response.json().id,
+    });
+    expect(
+      policy?.grants.some(
+        (grant) =>
+          grant.subject.type === "team" && grant.subject.id === team.id,
+      ),
+    ).toBe(true);
+  });
+
+  test("rejects a team id from another organization with 400", async ({
+    makeOrganization,
+    makeTeam,
+  }) => {
+    const otherOrg = await makeOrganization();
+    const foreignTeam = await makeTeam(otherOrg.id, user.id, {
+      name: "Foreign",
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: {
+        name: "Team App",
+        html: "<p/>",
+        initialGrants: [
+          {
+            subject: { type: "team", id: foreignTeam.id },
+            actions: ["read", "use"],
+          },
+        ],
+      },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toContain(
+      "permission recipient does not exist",
+    );
+  });
+
+  test("binds a new app to an environment", async () => {
+    const prod = await EnvironmentModel.create({
+      organizationId,
+      name: "production",
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Bound", environmentId: prod.id },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().environmentId).toBe(prod.id);
+  });
+
+  test("defaults environmentId to null when omitted", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Default Env" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().environmentId).toBeNull();
+  });
+
+  test("an omitted environmentId lands in the org's configured default for apps", async () => {
+    const launch = await EnvironmentModel.create({
+      organizationId,
+      name: "launch",
+    });
+    await EnvironmentResourceDefaultModel.setForResource({
+      organizationId,
+      resource: "app",
+      environmentId: launch.id,
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Configured Env" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().environmentId).toBe(launch.id);
+  });
+
+  test("an explicit null overrides the configured default for apps", async () => {
+    const launch = await EnvironmentModel.create({
+      organizationId,
+      name: "launch",
+    });
+    await EnvironmentResourceDefaultModel.setForResource({
+      organizationId,
+      resource: "app",
+      environmentId: launch.id,
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Explicit Default", environmentId: null },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().environmentId).toBeNull();
+  });
+
+  test("rejects an environmentId from another organization (404)", async ({
+    makeOrganization,
+  }) => {
+    const otherOrg = await makeOrganization();
+    const foreignEnv = await EnvironmentModel.create({
+      organizationId: otherOrg.id,
+      name: "foreign",
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "X", environmentId: foreignEnv.id },
+    });
+    expect(response.statusCode).toBe(404);
+  });
+
+  test("an admin may bind to a restricted environment", async () => {
+    // An admin's full access at `*` reaches an environment with no
+    // organization or role grant of its own.
+    const restricted = await createRestrictedEnvironment({
+      organizationId,
+      data: { name: "restricted-prod" },
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "R", environmentId: restricted.id },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().environmentId).toBe(restricted.id);
+  });
+
+  test("a member without a use grant cannot bind to a restricted environment (403)", async ({
+    makeUser,
+    makeMember,
+  }) => {
+    const restricted = await createRestrictedEnvironment({
+      organizationId,
+      data: { name: "restricted-prod" },
+    });
+    const member = await makeUser();
+    await makeMember(member.id, organizationId, { role: "member" });
+    user = member;
+
+    // Sanity: the member can create a personal app at the default environment,
+    // so the 403 below is the restricted-env gate, not a general denial.
+    const baseline = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Baseline" },
+    });
+    expect(baseline.statusCode).toBe(200);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Restricted", environmentId: restricted.id },
+    });
+    expect(response.statusCode).toBe(403);
+  });
+
+  test("a member granted use on a restricted environment may bind to it", async ({
+    makeUser,
+    makeMember,
+  }) => {
+    const restricted = await createRestrictedEnvironment({
+      organizationId,
+      data: { name: "restricted-prod" },
+    });
+    // A `use` grant on the one environment is what unlocks the bind.
+    const deployer = await makeUser();
+    await makeMember(deployer.id, organizationId, { role: "member" });
+    await grantEnvironmentUse({
+      organizationId,
+      environmentId: restricted.id,
+      userId: deployer.id,
+    });
+    user = deployer;
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Restricted OK", environmentId: restricted.id },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().environmentId).toBe(restricted.id);
+  });
+});
+
+// The Apps page creates a blank app and hands it straight to a chat agent to
+// build (`openInChat`). The app has to land in that agent's environment, or the
+// agent discovers tools it cannot then assign to the app it is building — the
+// same binding `scaffold_app` makes for an app created from chat.
+describe("POST /api/apps — the environment of the agent that builds it", () => {
+  let app: FastifyInstanceWithZod;
+  let organizationId: string;
+  let user: User;
+  let launch: Awaited<ReturnType<typeof EnvironmentModel.create>>;
+  let builderAgentId: string;
+
+  beforeEach(async ({ makeOrganization, makeUser, makeMember, makeAgent }) => {
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    user = await makeUser();
+    await makeMember(user.id, organizationId, { role: ADMIN_ROLE_NAME });
+
+    launch = await EnvironmentModel.create({ organizationId, name: "launch" });
+    // An `openInChat` create binds the conversation to the caller's default
+    // chat agent — the agent that will build the app.
+    const agent = await makeAgent({
+      organizationId,
+      agentType: "agent",
+      environmentId: launch.id,
+    });
+    builderAgentId = agent.id;
+    await MemberModel.setDefaultAgent(user.id, organizationId, agent.id);
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (
+        request as typeof request & { organizationId: string; user: User }
+      ).organizationId = organizationId;
+      (request as typeof request & { user: User }).user = user;
+    });
+
+    const { default: appRoutes } = await import("./app.routes");
+    await app.register(appRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  test("an openInChat create lands in the building agent's environment", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Built In Chat", openInChat: true },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().environmentId).toBe(launch.id);
+  });
+
+  test("the app and the conversation that builds it agree on the agent", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Same Agent", openInChat: true },
+    });
+
+    const { environmentId, conversationId } = response.json();
+    expect(conversationId).toBeTruthy();
+    const conversation = await ConversationModel.findById({
+      id: conversationId,
+      userId: user.id,
+      organizationId,
+    });
+    expect(conversation?.agentId).toBe(builderAgentId);
+    expect(environmentId).toBe(
+      await AgentModel.findEnvironmentId(builderAgentId),
+    );
+  });
+
+  test("the building agent's environment outranks the org's configured default for apps", async () => {
+    const explore = await EnvironmentModel.create({
+      organizationId,
+      name: "explore",
+    });
+    await EnvironmentResourceDefaultModel.setForResource({
+      organizationId,
+      resource: "app",
+      environmentId: explore.id,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Configured Loses", openInChat: true },
+    });
+
+    expect(response.json().environmentId).toBe(launch.id);
+  });
+
+  test("an explicit environmentId still wins over the building agent's", async () => {
+    const explore = await EnvironmentModel.create({
+      organizationId,
+      name: "explore",
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: {
+        name: "Explicit",
+        openInChat: true,
+        environmentId: explore.id,
+      },
+    });
+
+    expect(response.json().environmentId).toBe(explore.id);
+  });
+
+  test("an explicit null still means the Default environment", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: {
+        name: "Explicit Default",
+        openInChat: true,
+        environmentId: null,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().environmentId).toBeNull();
+  });
+
+  test("a create that does not open in chat has no building agent to follow", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "No Chat" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().environmentId).toBeNull();
+  });
+
+  test("a restricted agent environment the caller may not deploy to falls back instead of failing", async ({
+    makeUser,
+    makeMember,
+    makeAgent,
+  }) => {
+    const restricted = await createRestrictedEnvironment({
+      organizationId,
+      data: { name: "restricted-launch" },
+    });
+    const member = await makeUser();
+    await makeMember(member.id, organizationId, { role: "member" });
+    const agent = await makeAgent({
+      organizationId,
+      agentType: "agent",
+      environmentId: restricted.id,
+    });
+    await MemberModel.setDefaultAgent(member.id, organizationId, agent.id);
+    user = member;
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Restricted Builder", openInChat: true },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().environmentId).toBeNull();
+  });
+});
+
+describe("POST /api/apps — slug", () => {
+  let app: FastifyInstanceWithZod;
+  let organizationId: string;
+  let user: User;
+
+  beforeEach(async ({ makeOrganization, makeUser, makeMember }) => {
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    user = await makeUser();
+    await makeMember(user.id, organizationId, { role: ADMIN_ROLE_NAME });
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (
+        request as typeof request & { organizationId: string; user: User }
+      ).organizationId = organizationId;
+      (request as typeof request & { user: User }).user = user;
+    });
+
+    const { default: appRoutes } = await import("./app.routes");
+    await app.register(appRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  test("derives a slug from the name when none is given", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Sales Dashboard" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().slug).toBe("sales-dashboard");
+  });
+
+  test("honours an explicitly requested slug", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Sales Dashboard", slug: "revenue" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().slug).toBe("revenue");
+  });
+
+  test("reports a duplicate slug as a URL conflict, not a name conflict", async () => {
+    await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "First", slug: "shared-url" },
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Second", slug: "shared-url" },
+    });
+
+    expect(response.statusCode).toBe(409);
+    // The name is free — only the URL collided, and the message must say so.
+    expect(response.json().error.message).not.toContain("app named");
+    expect(response.json().error.message).toContain("URL");
+  });
+
+  test("still reports a duplicate name as a name conflict", async () => {
+    await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Twice", slug: "first-url" },
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Twice", slug: "second-url" },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.message).toContain('app named "Twice"');
+  });
+
+  test("rejects a slug the shape rules refuse, before creating anything", async () => {
+    // AppSlugSchema owns which shapes are legal (types/app.test.ts); this only
+    // pins that the create route runs it rather than passing the value through.
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Bad", slug: "Not A Slug" },
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  test("honors the org's new-app defaults (disabled/locked) at creation", async () => {
+    await OrganizationModel.patch(organizationId, {
+      newAppsDisabledByDefault: true,
+      newAppsLockedByDefault: true,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Governed" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ enabled: false, locked: true });
+  });
+
+  test("without the org defaults, a new app starts enabled and unlocked", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/apps",
+      payload: { name: "Ungoverned" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ enabled: true, locked: false });
+  });
+});

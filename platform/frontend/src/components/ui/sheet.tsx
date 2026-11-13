@@ -2,9 +2,10 @@
 
 import * as SheetPrimitive from "@radix-ui/react-dialog";
 import { XIcon } from "lucide-react";
-import type * as React from "react";
+import * as React from "react";
 
-import { cn } from "@/lib/utils";
+import { DialogContentContext } from "@/components/ui/dialog-content-context";
+import { cn } from "@/lib/utils/tailwind";
 
 function Sheet({ ...props }: React.ComponentProps<typeof SheetPrimitive.Root>) {
   return <SheetPrimitive.Root data-slot="sheet" {...props} />;
@@ -48,15 +49,37 @@ function SheetContent({
   className,
   children,
   side = "right",
+  onOpenAutoFocus,
+  onCloseAutoFocus,
   ...props
 }: React.ComponentProps<typeof SheetPrimitive.Content> & {
   side?: "top" | "right" | "bottom" | "left";
 }) {
+  // Sheets are controlled without a SheetTrigger, so Radix has no trigger ref
+  // to restore focus to on close. Capture the opener and restore it ourselves
+  // (WCAG 2.4.3) — same rationale as DialogContent in dialog.tsx.
+  const returnFocusRef = React.useRef<HTMLElement | null>(null);
   return (
     <SheetPortal>
       <SheetOverlay />
       <SheetPrimitive.Content
         data-slot="sheet-content"
+        onOpenAutoFocus={(event) => {
+          returnFocusRef.current =
+            document.activeElement instanceof HTMLElement
+              ? document.activeElement
+              : null;
+          onOpenAutoFocus?.(event);
+        }}
+        onCloseAutoFocus={(event) => {
+          onCloseAutoFocus?.(event);
+          if (event.defaultPrevented) return;
+          event.preventDefault();
+          const opener = returnFocusRef.current;
+          if (opener?.isConnected) {
+            opener.focus();
+          }
+        }}
         className={cn(
           "bg-background data-[state=open]:animate-in data-[state=closed]:animate-out fixed z-50 flex flex-col gap-4 shadow-lg transition ease-in-out data-[state=closed]:duration-300 data-[state=open]:duration-500",
           side === "right" &&
@@ -71,7 +94,9 @@ function SheetContent({
         )}
         {...props}
       >
-        {children}
+        <DialogContentContext.Provider value={true}>
+          {children}
+        </DialogContentContext.Provider>
         <SheetPrimitive.Close className="ring-offset-background focus:ring-ring data-[state=open]:bg-secondary absolute top-4 right-4 rounded-xs opacity-70 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-offset-2 focus:outline-hidden disabled:pointer-events-none">
           <XIcon className="size-4" />
           <span className="sr-only">Close</span>

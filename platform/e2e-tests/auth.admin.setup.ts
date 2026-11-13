@@ -16,15 +16,10 @@ setup("authenticate as admin", async ({ page }) => {
   // Navigate to trigger cookie storage
   await page.goto(`${UI_BASE_URL}/chat`, { waitUntil: "domcontentloaded" });
 
-  // Mark onboarding as complete and set restrictive policy via API
-  // Setting globalToolPolicy to "restrictive" prevents the permissive policy overlay from blocking UI interactions
+  // Mark onboarding as complete via API.
   await page.request.post(
     `${UI_BASE_URL}/api/organization/complete-onboarding`,
     { data: { onboardingComplete: true } },
-  );
-  await page.request.patch(
-    `${UI_BASE_URL}/api/organization/security-settings`,
-    { data: { globalToolPolicy: "restrictive" } },
   );
 
   // Reload page to dismiss onboarding dialog (on fresh env it renders before API call)

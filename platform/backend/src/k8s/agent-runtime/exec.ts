@@ -1,0 +1,267 @@
+import { PassThrough, type Readable } from "node:stream";
+import type { Exec } from "@kubernetes/client-node";
+import type WebSocket from "ws";
+
+/** A transport failure does not establish whether the command completed. */
+export class AgentRuntimeCommandTransportError extends Error {}
+/** The pod ran the command and it ended in failure, as opposed to a connection the API server lost. */
+export class AgentRuntimeCommandFailedError extends Error {}
+/**
+ * The exec connection was refused before the command ran: denied access, an
+ * invalid connection, or a container that is no longer running.
+ */
+export class AgentRuntimeExecConnectionError extends Error {
+  constructor(
+    message: string,
+    /** The HTTP status the handshake was refused with, when it was one. */
+    readonly httpStatus?: number,
+  ) {
+    super(message);
+  }
+}
+
+/** Stream a command's output instead of collecting it.
+ *
+ * File transfers are unbounded in size, so their bytes must never accumulate in
+ * memory or in a tool payload. The caller consumes stdout as it arrives and
+ * awaits completed for the exit status. timeoutMs is required: a transfer's
+ * duration follows the file, so no shared default can be correct.
+ *
+ * Destroying the returned stream terminates the connection, so a client that
+ * disconnects mid-download does not leave the exec session running.
+ */
+export function streamAgentRuntimeCommand(params: {
+  exec: Pick<Exec, "exec">;
+  namespace: string;
+  podName: string;
+  container: string;
+  command: string[];
+  stdin?: Readable;
+  timeoutMs: number;
+}): { stdout: Readable; completed: Promise<void> } {
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  let settled = false;
+  let socket: WebSocket | undefined;
+  let finish: (error?: Error) => void = () => {};
+  const completed = new Promise<void>((resolve, reject) => {
+    finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket?.terminate();
+      params.stdin?.destroy();
+      stderr.destroy();
+      if (error) {
+        stdout.destroy(error);
+        reject(error);
+      } else {
+        stdout.end();
+        resolve();
+      }
+    };
+  });
+  const timer = setTimeout(
+    () =>
+      finish(
+        new AgentRuntimeCommandTransportError(
+          "Agent Runtime command timed out",
+        ),
+      ),
+    params.timeoutMs,
+  );
+  // Do not include arbitrary runtime stderr in API errors: it can contain
+  // credentials, file contents, or unbounded custom-image diagnostics.
+  stderr.resume();
+  stderr.on("error", () => {});
+  // A consumer that stops reading, such as a disconnected download, closes the
+  // stream. Settling is idempotent, so a normal end does not report a failure.
+  stdout.on("close", () =>
+    finish(
+      new AgentRuntimeCommandTransportError(
+        "Agent Runtime command disconnected before completion",
+      ),
+    ),
+  );
+  params.exec
+    .exec(
+      params.namespace,
+      params.podName,
+      params.container,
+      params.command,
+      stdout,
+      stderr,
+      params.stdin ?? null,
+      false,
+      (status) =>
+        finish(
+          status.status === "Success"
+            ? undefined
+            : new AgentRuntimeCommandFailedError(
+                "Command in Agent Runtime pod failed",
+              ),
+        ),
+    )
+    .then((connected) => {
+      socket = connected;
+      if (settled) {
+        connected.terminate();
+        return;
+      }
+      connected.on("error", finish);
+      connected.on("close", () =>
+        finish(
+          new AgentRuntimeCommandTransportError(
+            "Agent Runtime command disconnected before completion",
+          ),
+        ),
+      );
+    })
+    .catch((error: unknown) => finish(normalizeConnectionError(error)));
+  return { stdout, completed };
+}
+
+/** Bound control-plane commands, including when a custom runtime never exits.
+ * The 30-second default covers bounded file transfers and status reads, not
+ * agent execution or Pod readiness. Callers that run a longer control-plane
+ * operation must set timeoutMs explicitly; never leave custom commands unbounded.
+ */
+export function execAgentRuntimeCommand(params: {
+  exec: Pick<Exec, "exec">;
+  namespace: string;
+  podName: string;
+  container: string;
+  command: string[];
+  stdin?: Readable;
+  timeoutMs?: number;
+  maxOutputBytes?: number;
+}): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const chunks: Buffer[] = [];
+    let outputBytes = 0;
+    let settled = false;
+    let socket: WebSocket | undefined;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket?.terminate();
+      params.stdin?.destroy();
+      stdout.destroy();
+      stderr.destroy();
+      if (error) reject(error);
+      else resolve(Buffer.concat(chunks).toString("utf8"));
+    };
+    const timer = setTimeout(
+      () =>
+        finish(
+          new AgentRuntimeCommandTransportError(
+            "Agent Runtime command timed out",
+          ),
+        ),
+      params.timeoutMs ?? 30_000,
+    );
+    const consume = (chunk: Buffer, retain: boolean) => {
+      if (settled) return;
+      outputBytes += chunk.length;
+      if (outputBytes > (params.maxOutputBytes ?? 6 * 1024 * 1024)) {
+        finish(new Error("Agent Runtime command exceeded its output limit"));
+      } else if (retain) chunks.push(Buffer.from(chunk));
+    };
+    stdout.on("data", (chunk: Buffer) => consume(chunk, true));
+    stderr.on("data", (chunk: Buffer) => consume(chunk, false));
+    stdout.on("error", finish);
+    stderr.on("error", finish);
+    // Do not include arbitrary runtime stderr in API errors: it can contain
+    // credentials, file contents, or unbounded custom-image diagnostics.
+    params.exec
+      .exec(
+        params.namespace,
+        params.podName,
+        params.container,
+        params.command,
+        stdout,
+        stderr,
+        params.stdin ?? null,
+        false,
+        (status) =>
+          finish(
+            status.status === "Success"
+              ? undefined
+              : new AgentRuntimeCommandFailedError(
+                  "Command in Agent Runtime pod failed",
+                ),
+          ),
+      )
+      .then((connected) => {
+        socket = connected;
+        if (settled) {
+          connected.terminate();
+          return;
+        }
+        connected.on("error", finish);
+        connected.on("close", () =>
+          finish(
+            new AgentRuntimeCommandTransportError(
+              "Agent Runtime command disconnected before completion",
+            ),
+          ),
+        );
+      })
+      .catch((error: unknown) => finish(normalizeConnectionError(error)));
+  });
+}
+
+// The Kubernetes WebSocket client rejects failed handshakes with ErrorEvent,
+// whose fields disappear in JSON and whose string representation is unhelpful.
+// Keep only bounded protocol diagnostics: the event target, cause, arbitrary
+// message and response may contain credentials or private runtime output.
+// This is deliberately not a transport-retry classification: an unsuccessful
+// handshake can also mean denied access or invalid connection configuration.
+function normalizeConnectionError(error: unknown): Error {
+  if (error instanceof Error) return error;
+  let detail: string | undefined;
+  let httpStatus: number | undefined;
+  if (error && typeof error === "object") {
+    if ("message" in error && typeof error.message === "string") {
+      const status = /^Unexpected server response: ([1-5]\d{2})$/.exec(
+        error.message,
+      )?.[1];
+      if (status) {
+        detail = `HTTP ${status}`;
+        httpStatus = Number(status);
+      }
+    }
+    if (!detail && "error" in error) {
+      const cause = error.error;
+      if (
+        cause &&
+        typeof cause === "object" &&
+        "code" in cause &&
+        typeof cause.code === "string" &&
+        [
+          "ECONNRESET",
+          "ECONNREFUSED",
+          "ETIMEDOUT",
+          "EPIPE",
+          "EAI_AGAIN",
+          "ENOTFOUND",
+          "ENETUNREACH",
+          "EHOSTUNREACH",
+          "CERT_HAS_EXPIRED",
+          "DEPTH_ZERO_SELF_SIGNED_CERT",
+          "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+          "ERR_TLS_CERT_ALTNAME_INVALID",
+        ].includes(cause.code)
+      ) {
+        detail = cause.code;
+      }
+    }
+  }
+  return new AgentRuntimeExecConnectionError(
+    `Agent Runtime exec connection failed${detail ? ` (${detail})` : ""}`,
+    httpStatus,
+  );
+}

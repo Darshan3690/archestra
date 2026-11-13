@@ -1,34 +1,35 @@
 "use client";
 
-import type { archestraApiTypes } from "@shared";
-import { AlertTriangle, Info, ShieldCheck, User } from "lucide-react";
-import { lazy, Suspense, useEffect, useState } from "react";
+import type { archestraApiTypes } from "@archestra/shared";
+import { AlertTriangle, Info, KeyRound, ShieldCheck, User } from "lucide-react";
+import { useState } from "react";
 import { StandardFormDialog } from "@/components/standard-dialog";
-import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  InlineNotice,
+  InlineNoticeBody,
+  InlineNoticeText,
+} from "@/components/ui/inline-notice";
+import { InlineNoticeDetails } from "@/components/ui/inline-notice-details";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { LinkifiedText } from "@/components/ui/linkified-text";
+import { SecretInput } from "@/components/ui/secret-input";
+import { useEnvironments } from "@/lib/environment.query";
+import { MCP_CONFIG_AUTOCOMPLETE } from "@/lib/mcp/mcp-form-autocomplete";
+import { useDefaultEnvironment } from "@/lib/organization.query";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { useFeature } from "@/lib/config/config.query";
-import { useTeamsWithVaultFolders } from "@/lib/teams/team.query";
+  compileValidationRegex,
+  toFieldValueType,
+  validateFieldAgainstRegex,
+} from "./environment-validation-helpers";
+import { InlineCredentialFormShell } from "./inline-credential-form-shell";
 import {
   type McpServerInstallScope,
   SelectMcpServerCredentialTypeAndTeams,
 } from "./select-mcp-server-credential-type-and-teams";
-
-const InlineVaultSecretSelector = lazy(
-  // biome-ignore lint/style/noRestrictedImports: lazy loading
-  () => import("@/components/inline-vault-secret-selector.ee"),
-);
 
 type CatalogItem =
   archestraApiTypes.GetInternalMcpCatalogResponses["200"][number];
@@ -50,13 +51,13 @@ type UserConfigType = Record<
 >;
 
 export interface RemoteServerInstallResult {
+  /** Catalog id to install from. */
+  catalogId: string;
   metadata: Record<string, unknown>;
   /** Installation scope (personal, team, org) */
   scope: McpServerInstallScope;
   /** Team ID to assign the MCP server to (only when scope is "team") */
   teamId?: string | null;
-  /** Whether metadata contains BYOS vault references in path#key format */
-  isByosVault?: boolean;
 }
 
 interface RemoteServerInstallDialogProps {
@@ -65,17 +66,28 @@ interface RemoteServerInstallDialogProps {
   onConfirm: (
     catalogItem: CatalogItem,
     result: RemoteServerInstallResult,
-  ) => Promise<void>;
+  ) => Promise<string | undefined> | Promise<void>;
   catalogItem: CatalogItem | null;
   isInstalling: boolean;
   /** When true, shows re-authentication mode (info banner, different title) */
   isReauth?: boolean;
+  /**
+   * Reinstall mode — same form layout as reauth but submits to the reinstall
+   * route. Used when a catalog edit added new required userConfig fields and
+   * the existing install needs values for them.
+   */
+  isReinstall?: boolean;
+  /** Scope of the install being reinstalled (locks the scope picker). */
+  existingScope?: McpServerInstallScope;
+  /** Team of the install being reinstalled (null for personal/org). */
+  existingTeamId?: string | null;
   /** Pre-select a specific team in the credential type selector */
   preselectedTeamId?: string | null;
   /** When true, only personal installation is allowed */
   personalOnly?: boolean;
   /** When true, only organization-wide installation is allowed */
   orgOnly?: boolean;
+  presentation?: "dialog" | "inline";
 }
 
 export function RemoteServerInstallDialog({
@@ -85,11 +97,16 @@ export function RemoteServerInstallDialog({
   catalogItem,
   isInstalling,
   isReauth = false,
+  isReinstall = false,
+  existingScope,
+  existingTeamId,
   preselectedTeamId,
   personalOnly = false,
   orgOnly = false,
+  presentation = "dialog",
 }: RemoteServerInstallDialogProps) {
   const [configValues, setConfigValues] = useState<Record<string, string>>({});
+  const [installError, setInstallError] = useState<string | null>(null);
 
   // Team selection state
   const [selectedTeamId, setSelectedTeamId] = useState<string | null>(null);
@@ -98,57 +115,12 @@ export function RemoteServerInstallDialog({
   );
   const [canInstall, setCanInstall] = useState(true);
 
-  // Vault team selection (separate from install team for personal + BYOS)
-  const [vaultTeamId, setVaultTeamId] = useState<string | null>(null);
-
-  // BYOS (Bring Your Own Secrets) state - per-field vault references
-  const [vaultSecrets, setVaultSecrets] = useState<
-    Record<string, { path: string | null; key: string | null }>
-  >({});
-
-  const byosEnabled = useFeature("byosEnabled");
-  const { data: teamsWithVault } = useTeamsWithVaultFolders();
-  const vaultTeams = teamsWithVault?.filter((t) => t.vaultPath);
+  const { data: environmentList } = useEnvironments();
+  const defaultEnvironment = useDefaultEnvironment();
   const userConfig =
     (catalogItem?.userConfig as UserConfigType | null | undefined) || {};
-  const hasPromptSensitiveFields = Object.values(userConfig).some(
-    (config) => config.sensitive && config.promptOnInstallation !== false,
-  );
-
-  // Helper to update vault secret for a specific field
-  const updateVaultSecret = (
-    fieldName: string,
-    prop: "path" | "key",
-    value: string | null,
-  ) => {
-    setVaultSecrets((prev) => ({
-      ...prev,
-      [fieldName]: {
-        ...prev[fieldName],
-        [prop]: value,
-        // Reset key when path changes
-        ...(prop === "path" ? { key: null } : {}),
-      },
-    }));
-  };
 
   // Sync vaultTeamId from selectedTeamId when in team mode, reset otherwise
-  useEffect(() => {
-    if (scope === "team") {
-      setVaultTeamId(selectedTeamId);
-    } else {
-      setVaultTeamId(null);
-    }
-    setVaultSecrets({});
-  }, [scope, selectedTeamId]);
-
-  const handleVaultTeamChange = (teamId: string) => {
-    setVaultTeamId(teamId);
-    setVaultSecrets({});
-  };
-
-  // Show vault selector only when BYOS is enabled and sensitive fields exist.
-  const useVaultSecrets = byosEnabled && hasPromptSensitiveFields;
 
   const handleConfirm = async () => {
     if (!catalogItem) {
@@ -163,50 +135,46 @@ export function RemoteServerInstallDialog({
           continue;
         }
 
-        // For BYOS mode, sensitive fields use vault references
-        if (useVaultSecrets && fieldConfig.sensitive) {
-          const vaultRef = vaultSecrets[fieldName];
-          if (vaultRef?.path && vaultRef?.key) {
-            // Store as path#key format for BYOS vault resolution
-            metadata[fieldName] = `${vaultRef.path}#${vaultRef.key}`;
-          }
-        } else {
-          // Non-sensitive fields or non-BYOS mode: use manual value
-          const value = configValues[fieldName];
-          if (value !== undefined && value !== "") {
-            switch (fieldConfig.type) {
-              case "number":
-                metadata[fieldName] = Number(value);
-                break;
-              case "boolean":
-                metadata[fieldName] = value === "true";
-                break;
-              default:
-                metadata[fieldName] = value;
-            }
+        const value = configValues[fieldName];
+        if (value !== undefined && value !== "") {
+          switch (fieldConfig.type) {
+            case "number":
+              metadata[fieldName] = Number(value);
+              break;
+            case "boolean":
+              metadata[fieldName] = value === "true";
+              break;
+            default:
+              metadata[fieldName] = value;
           }
         }
       }
 
-      await onConfirm(catalogItem, {
+      setInstallError(null);
+      const errorMessage = await onConfirm(catalogItem, {
+        catalogId: catalogItem.id,
         metadata,
         scope,
         teamId: selectedTeamId,
-        isByosVault: useVaultSecrets,
       });
+      if (errorMessage) {
+        setInstallError(errorMessage);
+        return;
+      }
       resetForm();
       onClose();
-    } catch (_error) {
-      // Error handling is done in the parent component
+    } catch (error) {
+      setInstallError(
+        error instanceof Error ? error.message : "Connection failed",
+      );
     }
   };
 
   const resetForm = () => {
+    setInstallError(null);
     setConfigValues({});
     setSelectedTeamId(null);
     setScope(orgOnly ? "org" : "personal");
-    setVaultTeamId(null);
-    setVaultSecrets({});
   };
 
   const handleClose = () => {
@@ -242,21 +210,45 @@ export function RemoteServerInstallDialog({
   );
 
   // Check if sensitive required fields are valid:
-  // - BYOS mode: vault path AND key must be selected for each
   // - Normal mode: manual values must be filled
-  const isSensitiveValid = useVaultSecrets
-    ? sensitiveRequiredFields.every(
-        ([fieldName]) =>
-          vaultSecrets[fieldName]?.path && vaultSecrets[fieldName]?.key,
-      )
-    : sensitiveRequiredFields.every(([fieldName]) =>
-        configValues[fieldName]?.trim(),
-      );
+  const isSensitiveValid = sensitiveRequiredFields.every(([fieldName]) =>
+    configValues[fieldName]?.trim(),
+  );
 
   const isValid = !hasConfig || (isNonSensitiveValid && isSensitiveValid);
 
+  // Resolve the governing environment's allowlist regex (the env the catalog
+  // item is bound to, or the org default when unbound) and compile it once.
+  const boundEnvironment = catalogItem.environmentId
+    ? environmentList?.environments.find(
+        (e) => e.id === catalogItem.environmentId,
+      )
+    : null;
+  const environmentName = boundEnvironment?.name ?? defaultEnvironment.name;
+  const validationRegex = compileValidationRegex(
+    boundEnvironment
+      ? boundEnvironment.validationRegex
+      : defaultEnvironment.validationRegex,
+  );
+  const configRegexError = (
+    fieldName: string,
+    type: string | undefined,
+  ): string | null =>
+    validateFieldAgainstRegex({
+      value: configValues[fieldName] ?? "",
+      regex: validationRegex,
+      valueType: toFieldValueType(type),
+      environmentName,
+    });
+  const hasRegexErrors = Object.entries(promptableUserConfig).some(
+    ([fieldName, cfg]) =>
+      !cfg.sensitive && configRegexError(fieldName, cfg.type) !== null,
+  );
+  const FormShell =
+    presentation === "inline" ? InlineCredentialFormShell : StandardFormDialog;
+
   return (
-    <StandardFormDialog
+    <FormShell
       open={isOpen}
       onOpenChange={handleClose}
       title={
@@ -264,7 +256,11 @@ export function RemoteServerInstallDialog({
           <div className="flex items-end gap-2">
             <User className="h-5 w-5" />
             <span>
-              {isReauth ? "Re-authenticate" : "Install Server"}
+              {isReauth
+                ? "Re-authenticate"
+                : isReinstall
+                  ? "Reinstall Server"
+                  : "Install Server"}
               <span className="text-muted-foreground ml-2 font-normal">
                 {catalogItem.name}
               </span>
@@ -292,28 +288,62 @@ export function RemoteServerInstallDialog({
             >
               Cancel
             </Button>
-            <Button type="submit" disabled={!isValid || isInstalling}>
+            <Button
+              type="submit"
+              disabled={!isValid || hasRegexErrors || isInstalling}
+            >
               {isInstalling
                 ? isReauth
                   ? "Updating..."
-                  : "Installing..."
+                  : isReinstall
+                    ? "Reinstalling..."
+                    : "Installing..."
                 : isReauth
                   ? "Update Credentials"
-                  : "Install"}
+                  : isReinstall
+                    ? "Reinstall"
+                    : "Install"}
             </Button>
           </>
         ) : null
       }
     >
+      {installError && (
+        <InlineNotice variant="error">
+          <AlertTriangle aria-hidden />
+          <InlineNoticeBody>
+            <span className="font-medium">Connection failed</span>
+            <InlineNoticeText>
+              Check the server credentials and provider configuration, then try
+              again.
+            </InlineNoticeText>
+          </InlineNoticeBody>
+          <InlineNoticeDetails label="diagnostics">
+            {installError}
+          </InlineNoticeDetails>
+        </InlineNotice>
+      )}
+
       {isReauth && (
-        <Alert className="border-amber-500/50 bg-amber-500/10">
-          <AlertTriangle className="h-4 w-4 text-amber-500" />
-          <AlertDescription>
-            Your existing credentials are expired or invalid. Submitting new
-            credentials here will replace them while preserving your tool
-            assignments.
-          </AlertDescription>
-        </Alert>
+        <InlineNotice variant="neutral">
+          <KeyRound />
+          <InlineNoticeText>
+            Replace credentials for this existing connection only. Tool
+            assignments and policies stay unchanged. Use Manage credentials to
+            add or remove connections.
+          </InlineNoticeText>
+        </InlineNotice>
+      )}
+
+      {isReinstall && (
+        <InlineNotice>
+          <AlertTriangle />
+          <InlineNoticeText>
+            This server's catalog now requires values that weren't asked for at
+            install time. Provide them below to finish the reinstall; existing
+            tool assignments are preserved.
+          </InlineNoticeText>
+        </InlineNotice>
       )}
 
       <SelectMcpServerCredentialTypeAndTeams
@@ -321,54 +351,34 @@ export function RemoteServerInstallDialog({
         catalogId={catalogItem?.id}
         onScopeChange={setScope}
         onCanInstallChange={setCanInstall}
+        isReinstall={isReinstall}
+        isReauth={isReauth}
+        existingScope={existingScope}
+        existingTeamId={existingTeamId}
         preselectedTeamId={preselectedTeamId}
         personalOnly={personalOnly}
         orgOnly={orgOnly}
       />
 
-      {useVaultSecrets && scope !== "team" && (
-        <div className="space-y-2">
-          <Label>Pull Vault secrets from:</Label>
-          <p className="text-xs text-muted-foreground">
-            Only folders associated with your teams are shown.
-          </p>
-          <Select
-            value={vaultTeamId ?? ""}
-            onValueChange={handleVaultTeamChange}
-          >
-            <SelectTrigger>
-              <SelectValue placeholder="-- Select Vault folder --" />
-            </SelectTrigger>
-            <SelectContent>
-              {vaultTeams?.map((team) => (
-                <SelectItem key={team.id} value={team.id}>
-                  {team.vaultPath}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-      )}
-
       {canInstall && hasOAuth && usesBrowserOAuth && (
-        <Alert>
-          <Info className="h-4 w-4" />
-          <AlertDescription>
+        <InlineNotice variant="info">
+          <Info />
+          <InlineNoticeText>
             This server requires OAuth authentication. You'll be redirected to
             complete the authentication flow after clicking Install.
-          </AlertDescription>
-        </Alert>
+          </InlineNoticeText>
+        </InlineNotice>
       )}
 
       {canInstall && hasOAuth && !usesBrowserOAuth && (
-        <Alert>
-          <Info className="h-4 w-4" />
-          <AlertDescription>
+        <InlineNotice variant="info">
+          <Info />
+          <InlineNoticeText>
             This server uses shared OAuth client credentials. The values below
             are stored with the installation, and {catalogItem.name} will fetch
             short-lived bearer tokens automatically when tools run.
-          </AlertDescription>
-        </Alert>
+          </InlineNoticeText>
+        </InlineNotice>
       )}
 
       {/* Config fields - always show when config exists */}
@@ -410,44 +420,26 @@ export function RemoteServerInstallDialog({
                   </p>
                 )}
 
-                {/* BYOS mode: vault selector for sensitive fields */}
                 {fieldConfig.type ===
-                "boolean" ? null : fieldConfig.sensitive && useVaultSecrets ? (
-                  <Suspense
-                    fallback={
-                      <div className="text-sm text-muted-foreground">
-                        Loading...
-                      </div>
+                "boolean" ? null : fieldConfig.sensitive ? (
+                  <SecretInput
+                    id={fieldName}
+                    placeholder={
+                      fieldConfig.default?.toString() || fieldConfig.description
                     }
-                  >
-                    <InlineVaultSecretSelector
-                      teamId={vaultTeamId}
-                      selectedSecretPath={vaultSecrets[fieldName]?.path ?? null}
-                      selectedSecretKey={vaultSecrets[fieldName]?.key ?? null}
-                      onSecretPathChange={(path) =>
-                        updateVaultSecret(fieldName, "path", path)
-                      }
-                      onSecretKeyChange={(key) =>
-                        updateVaultSecret(fieldName, "key", key)
-                      }
-                      disabled={isInstalling}
-                      noTeamMessage={
-                        scope !== "team"
-                          ? "Select a vault folder to pull secrets from"
-                          : undefined
-                      }
-                    />
-                  </Suspense>
+                    value={configValues[fieldName] || ""}
+                    onChange={(e) =>
+                      setConfigValues((prev) => ({
+                        ...prev,
+                        [fieldName]: e.target.value,
+                      }))
+                    }
+                  />
                 ) : (
                   <Input
                     id={fieldName}
-                    type={
-                      fieldConfig.sensitive
-                        ? "password"
-                        : fieldConfig.type === "number"
-                          ? "number"
-                          : "text"
-                    }
+                    type={fieldConfig.type === "number" ? "number" : "text"}
+                    autoComplete={MCP_CONFIG_AUTOCOMPLETE}
                     placeholder={
                       fieldConfig.default?.toString() || fieldConfig.description
                     }
@@ -460,8 +452,19 @@ export function RemoteServerInstallDialog({
                     }
                     min={fieldConfig.min}
                     max={fieldConfig.max}
+                    aria-invalid={
+                      configRegexError(fieldName, fieldConfig.type)
+                        ? true
+                        : undefined
+                    }
                   />
                 )}
+                {!fieldConfig.sensitive &&
+                  configRegexError(fieldName, fieldConfig.type) && (
+                    <p className="text-xs text-destructive">
+                      {configRegexError(fieldName, fieldConfig.type)}
+                    </p>
+                  )}
               </div>
             ),
           )}
@@ -469,28 +472,27 @@ export function RemoteServerInstallDialog({
       )}
 
       {canInstall && catalogItem.serverUrl && (
-        <div className="rounded-md bg-muted p-4">
-          <h4 className="text-sm font-medium mb-2">Server Details:</h4>
-          <div className="space-y-1">
-            <p className="text-sm text-muted-foreground">
-              <span className="font-medium">URL:</span> {catalogItem.serverUrl}
+        <div className="space-y-1 border-t pt-4 text-xs text-muted-foreground">
+          <p className="flex min-w-0 gap-2">
+            <span className="shrink-0">Server</span>
+            <span className="truncate font-mono" title={catalogItem.serverUrl}>
+              {catalogItem.serverUrl}
+            </span>
+          </p>
+          {catalogItem.docsUrl && (
+            <p>
+              <a
+                href={catalogItem.docsUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline underline-offset-2 hover:text-foreground"
+              >
+                Documentation
+              </a>
             </p>
-            {catalogItem.docsUrl && (
-              <p className="text-sm text-muted-foreground">
-                <span className="font-medium">Documentation:</span>{" "}
-                <a
-                  href={catalogItem.docsUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-primary hover:underline"
-                >
-                  {catalogItem.docsUrl}
-                </a>
-              </p>
-            )}
-          </div>
+          )}
         </div>
       )}
-    </StandardFormDialog>
+    </FormShell>
   );
 }

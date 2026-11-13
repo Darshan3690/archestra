@@ -1,0 +1,397 @@
+import { createHash } from "node:crypto";
+import {
+  APP_AUTHORING_CONTRACT,
+  APP_BUILD_LOOP_GUIDANCE,
+} from "@/archestra-mcp-server/app-authoring-guidance";
+import { enterpriseTier } from "@/enterprise-tier";
+import type { SkillFileKind } from "@/types/skill";
+import { APPA_GUIDE_SKILL } from "./appa-guide";
+import { applyBuiltInSkillBranding } from "./built-in-skill-branding";
+import { RUNTIME_HANDOFF_SKILL } from "./runtime-handoff";
+
+/**
+ * Default Agent Skills shipped with Archestra.
+ *
+ * These are reconciled into every organization on startup (see
+ * `syncBuiltInSkills` in `services/seed.ts`). Unlike imported skills they have
+ * no author and live at `org` scope so everyone can activate them. They are
+ * editable — administrators may tailor the copy — but each carries a content
+ * version so an untouched copy auto-upgrades when we ship a new revision, while
+ * an edited copy is left alone until the user resets it.
+ *
+ * Identity is the stable `builtInSkillId`, surfaced in `source_ref` as
+ * `builtin:<id>`, so a rename never detaches a skill from its definition.
+ *
+ * @see https://agentskills.io/specification
+ */
+
+// ============================================================================
+// Public interface
+// ============================================================================
+
+interface BuiltInSkillFile {
+  /** Path relative to the skill root, e.g. `references/mcp-and-tools.md`. */
+  path: string;
+  kind: SkillFileKind;
+  content: string;
+}
+
+export interface BuiltInSkill {
+  feature?: "appa";
+  /** Stable identifier; never changes once shipped. */
+  builtInSkillId: string;
+  name: string;
+  description: string;
+  /** SKILL.md body. */
+  content: string;
+  files: BuiltInSkillFile[];
+}
+
+/**
+ * Removes a frontmatter block from the start of a built-in skill body. One
+ * built-in once shipped its body with its own frontmatter, so its SKILL.md
+ * showed two; copies an admin has since edited keep their edits but lose
+ * that block when the built-ins are synced.
+ */
+export function stripBuiltInBodyFrontmatter(content: string): string {
+  return content.replace(/^---\n[\s\S]*?\n---\n+/, "");
+}
+
+/** `source_ref` value for a built-in skill. */
+export function builtInSkillSourceRef(builtInSkillId: string): string {
+  return `${BUILT_IN_SKILL_SOURCE_REF_PREFIX}${builtInSkillId}`;
+}
+
+/**
+ * Whether a `source_ref` is a built-in identity token rather than an imported
+ * GitHub source. True even for an id we no longer ship, so a stale row is still
+ * recognized as built-in.
+ */
+export function isBuiltInSkillSourceRef(sourceRef: string): boolean {
+  return sourceRef.startsWith(BUILT_IN_SKILL_SOURCE_REF_PREFIX);
+}
+
+/** Resolve the shipped definition behind a `builtin:<id>` source ref, if any. */
+export function findBuiltInSkillBySourceRef(
+  sourceRef: string,
+): BuiltInSkill | null {
+  if (!sourceRef.startsWith(BUILT_IN_SKILL_SOURCE_REF_PREFIX)) return null;
+  const id = sourceRef.slice(BUILT_IN_SKILL_SOURCE_REF_PREFIX.length);
+  return (
+    getEnabledBuiltInSkills().find((skill) => skill.builtInSkillId === id) ??
+    null
+  );
+}
+
+/** Definitions that this deployment can seed and reset. */
+export function getEnabledBuiltInSkills(): BuiltInSkill[] {
+  return BUILT_IN_SKILLS.filter(isEnabled);
+}
+
+/** Hide persisted copies too when their feature is disabled. */
+export function getDisabledBuiltInSkillSourceRefs(): string[] {
+  return BUILT_IN_SKILLS.filter((skill) => !isEnabled(skill)).map((skill) =>
+    builtInSkillSourceRef(skill.builtInSkillId),
+  );
+}
+
+function isEnabled(skill: BuiltInSkill): boolean {
+  return !skill.feature || enterpriseTier.isOpenappaActive();
+}
+
+/**
+ * Content version for a built-in skill, hashed over the SKILL.md body and the
+ * full set of bundled files. Stored in `source_commit`; a copy whose live
+ * content still hashes to its stored version is "pristine" and safe to
+ * auto-upgrade, anything else is treated as user-edited.
+ */
+export function builtInSkillVersion(params: {
+  content: string;
+  files: { path: string; content: string }[];
+}): string {
+  const canonical = JSON.stringify({
+    content: params.content,
+    files: [...params.files]
+      .sort((a, b) => a.path.localeCompare(b.path))
+      .map((file) => ({ path: file.path, content: file.content })),
+  });
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
+/**
+ * Skill row fields and resource files for writing a shipped definition to the
+ * database, shared by startup sync and reset-to-default so the two can never
+ * drift on what a pristine copy looks like.
+ *
+ * The shipped definitions hardcode the "Archestra" brand and `archestra__` tool
+ * prefix; both are rewritten to the target org's white-label app name and tool
+ * prefix here (a no-op unless full white-labeling is active, just like built-in
+ * MCP tool names). Callers MUST have synced `archestraMcpBranding` to the target
+ * organization first. `sourceCommit` is hashed over the *branded* body and files
+ * so a pristine copy's live hash matches — and a later app-name change yields a
+ * new `sourceCommit`, so `syncBuiltInSkills` re-brands the pristine copy on the
+ * next run (an edited copy stays preserved).
+ */
+export function builtInSkillShippedWrite(definition: BuiltInSkill): {
+  skill: {
+    name: string;
+    description: string;
+    content: string;
+    sourceCommit: string;
+  };
+  files: { path: string; content: string; kind: SkillFileKind }[];
+} {
+  const content = applyBuiltInSkillBranding(definition.content);
+  const files = definition.files.map((file) => ({
+    path: file.path,
+    content: applyBuiltInSkillBranding(file.content),
+    kind: file.kind,
+  }));
+  return {
+    skill: {
+      name: applyBuiltInSkillBranding(definition.name),
+      description: applyBuiltInSkillBranding(definition.description),
+      content,
+      sourceCommit: builtInSkillVersion({ content, files }),
+    },
+    files,
+  };
+}
+
+const BUILT_IN_SKILL_SOURCE_REF_PREFIX = "builtin:";
+
+// `BUILT_IN_SKILLS` is declared at the bottom of the file because it references
+// the content constants below (unlike functions, `const`s are not hoisted).
+
+// ============================================================================
+// Skill content
+// ============================================================================
+// SKILL.md bodies live here as constants (bundler-safe, mirrors
+// `shared/built-in-agents.ts`). Keep them in sync with the real
+// `archestra__*` tool names in `archestra-mcp-server/`.
+
+const ARCHESTRA_PLATFORM_OPERATIONS_SKILL = `# Archestra Platform Operations
+
+Use this skill when the user asks you to administer Archestra itself — for
+example "add the GitHub MCP server and let the support agent use it", "give the
+research agent web-search tools", "scope the billing tools to the finance team",
+or "require approval before the delete tool runs".
+
+Archestra is an MCP gateway: it centralizes MCP servers, checks tool calls
+against the organization's guardrails policy, and assigns tools to agents and
+gateways. You drive all of this with Archestra's built-in tools (their names are
+prefixed \`archestra__\`). The caller's RBAC permissions are enforced on every
+one of them — if a call fails with a permission error, tell the user which
+permission is missing instead of retrying.
+
+## Core workflows
+
+### Register an MCP server and assign its tools to an agent
+1. Find or create the server in the private registry:
+   - \`search_private_mcp_registry\` or \`get_mcp_servers\` to find an existing
+     catalog entry, or
+   - \`create_mcp_server\` to register a new one — remote (\`serverUrl\`) or local
+     (\`command\`/\`arguments\`/\`dockerImage\`).
+2. \`deploy_mcp_server\` (\`catalogId\`, \`scope\`, optional \`teamId\`/\`agentIds\`)
+   to create a running instance.
+3. \`get_mcp_server_tools\` (\`mcpServerId\`) to list the tool IDs it exposes.
+4. \`bulk_assign_tools_to_agents\` (or \`bulk_assign_tools_to_mcp_gateways\`) with
+   the tool IDs and target agent ID(s). Set \`resolveAtCallTime: true\` to bind
+   every current and future tool of the server.
+
+Parameter details and the local-vs-remote server fields are in
+\`references/mcp-and-tools.md\`.
+
+### Scope who can use what
+- Set a resource's \`scope\` to \`personal\`, \`team\`, or \`org\`, and pass \`teams\`
+  when creating or editing agents, gateways, or servers.
+- Custom RBAC roles and team membership have **no MCP tool** — they are managed
+  in the UI (Settings → Roles / Members) or the REST API. If the user asks to
+  create a role or add a member, point them there rather than inventing a tool.
+
+### Guardrails
+Guardrails are defined by the organization's OpenAPPA policy. When the user asks
+to block a tool, require approval before it runs, or control how its results are
+handled, load the \`appa-guide\` skill and follow its policy workflow. Read
+\`references/guardrails.md\` for the tools involved.
+
+## Operating principles
+- Read before you write: inspect current state (\`list_agents\`,
+  \`get_mcp_servers\`, \`get_guardrails_policy\`) before creating or editing.
+- Prefer the bulk assignment tools over many single calls.
+- Confirm broad or destructive changes (policy changes, org-wide scope,
+  org-wide deploys) with the user before making them.
+- After a change, verify it with the matching read tool and report exactly what
+  you did, including the IDs and names involved.
+`;
+
+const MCP_AND_TOOLS_REFERENCE = `# MCP servers and tool assignment
+
+## Registering a server: \`create_mcp_server\`
+Two shapes, selected by \`serverType\`:
+
+- **Remote** — set \`serverUrl\` to an HTTP MCP endpoint. Use \`requiresAuth\`,
+  \`authDescription\`, \`authFields\`, or \`oauthConfig\` when the endpoint needs
+  credentials.
+- **Local** — runs in a Kubernetes pod. Provide either a \`command\` +
+  \`arguments\` (+ \`environment\`) or a \`dockerImage\`. \`transportType\` is
+  \`stdio\` (default) or \`streamable-http\` (set \`httpPort\`/\`httpPath\` for the
+  latter).
+
+Shared metadata: \`name\`, \`description\`, \`icon\`, \`docsUrl\`, \`repository\`,
+\`version\`, \`instructions\`, \`scope\`, \`labels\`, \`teams\`.
+
+Registering a server only adds a catalog entry. It is not running yet.
+
+## Deploying: \`deploy_mcp_server\`
+\`catalogId\` is the catalog entry's ID. \`scope\` is \`personal\`, \`team\`, or
+\`org\`; pass \`teamId\` for team scope. \`agentIds\` optionally assigns the
+server's tools to those agents as part of the deploy.
+
+Inspect deployments with \`list_mcp_server_deployments\`; for a misbehaving local
+server read \`get_mcp_server_logs\` (\`serverId\`, optional \`lines\`).
+
+## Listing tools: \`get_mcp_server_tools\`
+Takes \`mcpServerId\` (the catalog ID) and returns the tools with their IDs. You
+need these IDs for assignment.
+
+## Assigning tools
+Both bulk tools take an \`assignments\` array:
+
+- \`bulk_assign_tools_to_agents\`: \`{ toolId, agentId, resolveAtCallTime,
+  mcpServerId? }\`
+- \`bulk_assign_tools_to_mcp_gateways\`: \`{ toolId, mcpGatewayId,
+  resolveAtCallTime, mcpServerId? }\`
+
+\`resolveAtCallTime: true\` assigns the whole server (current and future tools)
+rather than a single pinned tool — prefer it when the user wants "all of this
+server's tools". Pass \`mcpServerId\` alongside it so the binding resolves
+against the right server.
+
+You can also assign tools at creation time via \`create_agent\`'s
+\`toolAssignments\` field, which has the same per-assignment shape.
+`;
+
+const GUARDRAILS_REFERENCE = `# Guardrails
+
+Archestra checks tool calls against the organization's OpenAPPA guardrails
+policy. The policy is TOML text with a revision number. Change it only through
+the policy tools, and only in the ways the user asked for.
+
+## Reading the policy
+- \`get_guardrails_policy\` returns the policy text, its revision, the batteries
+  it includes, and the effective policy the runtime enforces.
+- \`inspect_guardrails_server\` shows an MCP server's tools and which rules
+  judge each one.
+- \`list_guardrails_battery_fits\` lists batteries that fit the visible MCP
+  servers and are not yet included.
+
+## Changing the policy
+1. Read the current policy and keep its revision.
+2. \`preview_guardrails_policy_change\` with \`expectedRevision\` and the
+   smallest set of \`edits\`. It returns a diff and saves nothing.
+3. Explain the diff and any warnings to the user.
+4. \`update_guardrails_policy\` with the same edits and revision. When GitHub
+   sync is configured this opens a pull request; check it with
+   \`get_guardrails_policy_change_status\`. Otherwise it saves a new revision.
+
+Never say a change is active until the policy tool confirms it.
+
+## Why a call can be blocked at runtime
+A blocked call carries a ruling. \`get_remedy_plans\` reads the ruling and any
+remedy plans the policy offers; \`execute_remedy_plan\` applies one. When no
+plan fits, explain the ruling to the user — do not loop retrying the same call.
+
+## Archestra's own tools
+The \`archestra__*\` tools enforce the caller's RBAC permissions. A permission
+error means the caller's role lacks the required \`{resource, action}\`; an
+admin fixes that in Settings → Roles. Retrying does not help.
+`;
+
+// The build-app playbook keeps SKILL.md focused on the build flow and how to
+// talk to the user; the SDK/CSP/storage contract and build-loop guidance are
+// bundled as a reference file (embedded verbatim from the authoring tools'
+// shared source, so the skill package is the single place those conventions
+// live and the tool descriptions stay short).
+const BUILD_APP_SKILL = `# Building Archestra Apps
+
+You build interactive single-file HTML/JS apps for users from chat — dashboards, forms, trackers, games, any custom UI. An app runs in a sandboxed iframe and talks to the platform through the Archestra Apps SDK, injected at render time. Build it up through the staged flow below — each tool's result tells you the next step — never write a whole app in one shot, and never paste app HTML into the chat reply or hand it back as a chat artifact. The app exists only as the versioned HTML these app tools manage; change it with \`archestra__edit_app\`, or restore an existing historical version with \`archestra__restore_app_version\` — the \`run_command\` code sandbox is a separate scratch filesystem and cannot alter the app itself. For every rollback to an existing version, call \`archestra__restore_app_version\` directly; never read and reproduce historical HTML through \`archestra__edit_app\`. When a new document already exists as a file you can reach — a chat attachment, or something you assembled and saved — pass that file's id to \`archestra__edit_app\` as \`replacementHtmlSource\` instead of reproducing its bytes in a tool call: that is the only way to build an app from content too large to retype in one turn.
+
+## Work silently — this rule comes first
+
+While building an app, every response you produce MUST begin directly with a tool call and contain no prose at all. Your habit is to write a sentence before each tool call — "Let me read the reference…", "Now I'll search for the tool…", "That didn't surface it, let me try…" — and here that habit is a bug: every such sentence is shown to the user as a chat message, and a build that narrates itself reads as broken. Do the step instead of announcing it — the user watches the app itself take shape as it renders inline. During a build, exactly three responses may contain prose:
+
+1. **Refining** — asking the (up to 3) clarifying questions via \`archestra__refine_app\`.
+2. **Blocked** — the build cannot continue without something only the user can provide or decide.
+3. **Delivery** — the app passed validation (and any requested publish is done) and you are handing it over.
+
+Everything you do say is in the user's terms. Never surface build internals in chat: tool names (\`set_app_tools\`, \`preview_app_tool\`), SDK identifiers (\`window.archestra\`, \`archestra.tools.call()\`), tool ids, version numbers, assignment/validation mechanics, or accounts of searches and checks you ran along the way ("the search only surfaced…", "I checked which servers…"). When you need to name the platform's app layer at all, call it the Archestra Apps SDK. Describe a gap or blocker by the action the user can take — one sentence naming the action, not an explanation of the platform's plumbing: "Connect Jira to enable submitting tickets from the app", never "the jira__create_issue tool could not be assigned".
+
+## The SDK reference
+
+The full Archestra Apps SDK contract (the injected surface, storage, file tools, the CSP/CDN allowlist, theming) and the tool-calling build loop live in this skill's \`references/apps-sdk.md\` — read it (load this skill again, passing that path) before your first \`archestra__edit_app\`, and code against it rather than from memory.
+
+## Flow
+1. \`archestra__scaffold_app\` — **only when the request is for a brand-new app that does not exist yet.** This is the sole app-creating tool: every call writes a new app entity to the DB, so call it at most once per app and never for a change to an app that already exists. First decide whether the app is already there: if you are holding an app id from earlier in this conversation, or the user is asking to change, extend, fix, restyle, or add to an app you already built, that app exists — skip scaffolding and make the change with \`archestra__edit_app\` on its id (read_app first if its current HTML is not already in context). If you are unsure whether a matching app already exists, call \`archestra__list_apps\`. Reuse an existing app ONLY when the user is clearly referring to it — same purpose, or they named it as theirs to change. Never rework an app that serves a different purpose just because its name or theme is close: apps can be built from other conversations, and overwriting one destroys work the user still relies on. When in doubt — including on a name collision from scaffold_app — ask the user whether to modify the existing app or create a new one under a different name; only if nothing matches is it a new app. Only when it is genuinely a new app, create it from the single starter template (a minimal scaffold is fine). Pass the tools it needs via the tools param if you already know them (this is the initial assignment set; replace it at any time afterward with \`archestra__set_app_tools\`, never edit_app/refine_app). Returns the new app's id and the seeded HTML — carry that id through every later step and any follow-up request for the same app; do not scaffold it again (each later change is an edit_app on that id).
+2. \`archestra__refine_app\` — clarify what the app should be. Ask the user up to 3 questions (features and style only, never the implementation stack), then persist a consolidated spec. It returns the user's real assignable MCP tools and the SDK surface — design the app around those tools, never invent one.
+3. \`archestra__edit_app\` — build the app up with str_replace edits over the scaffold. For an attached image, use imageReplacements with short surrounding anchors; it uses the newest attachment server-side, so no attachment id, filename, or base64 belongs in your context or tool arguments. For a full rewrite, pass the new document as replacementHtml instead of edits, or — when it already exists as a file — that file's id as replacementHtmlSource. Before writing code that parses an assigned tool's result, call \`archestra__preview_app_tool\` to see its real output shape. For a rollback, skip this build flow and use \`archestra__restore_app_version\`; it copies the selected immutable version forward without putting its HTML in the model context or tool call.
+4. \`archestra__validate_app\` — run static structural checks plus the live render diagnostics (\`archestra__get_app_diagnostics\` reads those render diagnostics on their own). Fix any errors with \`archestra__edit_app\` and re-validate until it passes.
+5. \`archestra__publish_app\` — only if the user wants others to run the app: promote it to a team or the whole organization (publishing is for sharing, not a required build step).
+
+Once the app passes validation (and any requested publish is done), the build is complete: stop calling app tools — do not re-read, re-validate, or re-check an app you have not changed — and close the loop with the user: name the app and link to its standalone page by reproducing, verbatim, the markdown link the scaffold_app/edit_app result returned (it is already labeled with the app's name) — never rebuild the link from the id or surface the raw /a/<id> path as the link text, say in plain product terms what it does, and carry out whatever completion the user's request asked for. Describe the app the way its user thinks about it, not how it is wired — per "Working in chat" above, build-time mechanics stay out of the summary, and anything the user must act on is named as their action in product terms (e.g. "Connect the GitHub server to enable search"). Be honest about what actually works — if a tool could not be assigned or a feature is not wired up, say so plainly in those same user terms instead of implying it works. Do not tack on a menu of extra features you could build next.
+`;
+
+// The SDK contract and build loop, bundled as the build-app skill's reference
+// file. Embedded verbatim from the authoring tools' shared source
+// (app-authoring-guidance.ts) so the reference can never drift from what the
+// tools enforce; SKILL.md points the model here before its first edit_app.
+const BUILD_APP_SDK_REFERENCE = `# Archestra Apps SDK and authoring conventions
+
+${APP_AUTHORING_CONTRACT}
+
+## Build loop
+
+${APP_BUILD_LOOP_GUIDANCE}
+`;
+
+// ============================================================================
+// Catalog (declared last so it can reference the content constants above)
+// ============================================================================
+
+const BUILT_IN_SKILLS: BuiltInSkill[] = [
+  {
+    builtInSkillId: "archestra-platform-operations",
+    name: "Archestra Platform Operations",
+    description:
+      "Operate the Archestra platform through its built-in tools: register and deploy MCP servers, assign their tools to agents and gateways, scope access to teams, and manage the guardrails policy.",
+    content: ARCHESTRA_PLATFORM_OPERATIONS_SKILL,
+    files: [
+      {
+        path: "references/mcp-and-tools.md",
+        kind: "reference",
+        content: MCP_AND_TOOLS_REFERENCE,
+      },
+      {
+        path: "references/guardrails.md",
+        kind: "reference",
+        content: GUARDRAILS_REFERENCE,
+      },
+    ],
+  },
+  {
+    builtInSkillId: "build-app",
+    name: "Build App",
+    description:
+      "Build an interactive app for a user (dashboard, form, tracker, game, or custom UI): the staged scaffold → refine → edit → validate → publish flow, the window.archestra SDK, storage, tools, and CSP conventions, and the silent-build chat conduct. Use whenever the user asks to make, build, or create an app or interactive UI, authoring it through that flow.",
+    content: BUILD_APP_SKILL,
+    files: [
+      {
+        path: "references/apps-sdk.md",
+        kind: "reference",
+        content: BUILD_APP_SDK_REFERENCE,
+      },
+    ],
+  },
+  APPA_GUIDE_SKILL,
+  RUNTIME_HANDOFF_SKILL,
+];

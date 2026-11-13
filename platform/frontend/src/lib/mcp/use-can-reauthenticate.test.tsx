@@ -1,0 +1,162 @@
+import { ADMIN_ROLE_NAME } from "@archestra/shared";
+import { renderHook } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/lib/auth/auth.query");
+vi.mock("@/lib/teams/team.query");
+
+import { useHasPermissions, useSession } from "@/lib/auth/auth.query";
+import { useMyTeams } from "@/lib/teams/team.query";
+import {
+  useCanReauthenticate,
+  useCanReauthenticateInputsReady,
+} from "./use-can-reauthenticate";
+
+const CURRENT_USER = "user-self";
+const TEAM_ID = "team-1";
+
+function setup({
+  create,
+  update,
+  admin,
+  teams,
+}: {
+  create: boolean;
+  update: boolean;
+  admin: boolean;
+  teams?: Array<{
+    id: string;
+    myRole?: string;
+  }>;
+}) {
+  vi.mocked(useSession).mockReturnValue({
+    data: { user: { id: CURRENT_USER } },
+  } as ReturnType<typeof useSession>);
+  vi.mocked(useMyTeams).mockReturnValue({
+    data: teams ?? [],
+  } as unknown as ReturnType<typeof useMyTeams>);
+  vi.mocked(useHasPermissions).mockImplementation(((perm: {
+    mcpServerInstallation?: string[];
+    mcpRegistry?: string[];
+  }) => {
+    // Installation admin is `update` on every registry entry (a grant at `*`).
+    if (perm.mcpRegistry?.includes("update")) return { data: admin };
+    const actions = perm.mcpServerInstallation ?? [];
+    if (actions.includes("create")) return { data: create };
+    if (actions.includes("update")) return { data: update };
+    return { data: false };
+  }) as unknown as typeof useHasPermissions);
+  return renderHook(() => useCanReauthenticate()).result.current;
+}
+
+describe("useCanReauthenticate", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("denies a non-admin without mcpServerInstallation:create", () => {
+    const canReauth = setup({ create: false, update: true, admin: false });
+    expect(canReauth({ scope: "personal", ownerId: CURRENT_USER })).toBe(false);
+    expect(canReauth({ scope: "org" })).toBe(false);
+  });
+
+  it("permits a personal connection only for its owner", () => {
+    const canReauth = setup({ create: true, update: true, admin: false });
+    expect(canReauth({ scope: "personal", ownerId: CURRENT_USER })).toBe(true);
+    expect(canReauth({ scope: "personal", ownerId: "someone-else" })).toBe(
+      false,
+    );
+  });
+
+  it("keeps another user's personal connection from an installation admin", () => {
+    // Re-authenticating signs in with the caller's account, which would
+    // replace the owner's sign-in with the admin's.
+    const canReauth = setup({ create: true, update: true, admin: true });
+    expect(canReauth({ scope: "personal", ownerId: "someone-else" })).toBe(
+      false,
+    );
+    expect(canReauth({ scope: "personal", ownerId: CURRENT_USER })).toBe(true);
+  });
+
+  it("permits an installation admin across team and org connections", () => {
+    const canReauth = setup({ create: false, update: false, admin: true });
+    expect(canReauth({ scope: "team", teamId: "another-team" })).toBe(true);
+    expect(canReauth({ scope: "org" })).toBe(true);
+  });
+
+  it("permits an org connection only to an installation admin", () => {
+    expect(
+      setup({ create: true, update: true, admin: false })({ scope: "org" }),
+    ).toBe(false);
+    expect(
+      setup({ create: true, update: false, admin: true })({ scope: "org" }),
+    ).toBe(true);
+  });
+
+  it("team administration alone does not permit connection reauthentication", () => {
+    const canReauth = setup({
+      create: true,
+      update: false,
+      admin: false,
+      teams: [
+        {
+          id: TEAM_ID,
+          myRole: ADMIN_ROLE_NAME,
+        },
+      ],
+    });
+    expect(canReauth({ scope: "team", teamId: TEAM_ID })).toBe(false);
+  });
+
+  it("permits a team connection for a member with update, denies without it", () => {
+    const teams = [{ id: TEAM_ID, myRole: "member" }];
+    expect(
+      setup({ create: true, update: true, admin: false, teams })({
+        scope: "team",
+        teamId: TEAM_ID,
+      }),
+    ).toBe(true);
+    expect(
+      setup({ create: true, update: false, admin: false, teams })({
+        scope: "team",
+        teamId: TEAM_ID,
+      }),
+    ).toBe(false);
+  });
+
+  it("infers team scope from teamId when scope is absent", () => {
+    const canReauth = setup({
+      create: true,
+      update: true,
+      admin: false,
+      teams: [{ id: TEAM_ID, myRole: "member" }],
+    });
+    expect(canReauth({ scope: null, teamId: TEAM_ID })).toBe(true);
+  });
+});
+
+describe("useCanReauthenticateInputsReady", () => {
+  function ready(teams: { isPending: boolean; isError: boolean }) {
+    vi.mocked(useSession).mockReturnValue({
+      data: { user: { id: CURRENT_USER } },
+      isPending: false,
+    } as ReturnType<typeof useSession>);
+    vi.mocked(useMyTeams).mockReturnValue({
+      data: undefined,
+      ...teams,
+    } as unknown as ReturnType<typeof useMyTeams>);
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    return renderHook(() => useCanReauthenticateInputsReady()).result.current;
+  }
+
+  it("is ready once the teams load, and not while they load or after they fail", () => {
+    expect(ready({ isPending: false, isError: false })).toBe(true);
+    expect(ready({ isPending: true, isError: false })).toBe(false);
+    // Without teams every team connection reads as "not a member": a rule
+    // built on that must not override the server's ranking.
+    expect(ready({ isPending: false, isError: true })).toBe(false);
+  });
+});

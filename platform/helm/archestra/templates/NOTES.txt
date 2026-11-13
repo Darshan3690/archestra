@@ -23,12 +23,41 @@ Background worker:
 Background worker: running in-process (worker Deployment disabled)
 {{- end }}
 
-{{- if .Values.postgresql.external_database_url }}
+{{- $iamAuth := (.Values.archestra.database).iamAuth | default dict }}
+{{- if or .Values.postgresql.external_database_url (not .Values.postgresql.enabled) }}
 
-Using external PostgreSQL database: {{ .Values.postgresql.external_database_url }}
+Using external PostgreSQL database{{- if $iamAuth.enabled }} (RDS IAM authentication enabled){{- end }}
 {{- else }}
 
 Using internal PostgreSQL database:
   Database: {{ .Values.postgresql.auth.database }}
   Username: {{ .Values.postgresql.auth.username }}
+{{- end }}
+
+{{- if not .Values.archestra.authSecret.existingSecretName }}
+
+Authentication and encryption keys:
+  The chart generated them in Secret {{ include "archestra-platform.authSecretName" . }}. Back it up with your database.
+  Tools that render this chart with `helm template`, such as Argo CD, cannot read that
+  Secret and would replace the keys on every sync, leaving stored credentials unreadable.
+  With such a tool, create the Secret yourself and set archestra.authSecret.existingSecretName.
+{{- end }}
+
+{{- $legacyOverrides := list }}
+{{- range $name := list "ARCHESTRA_AGENT_RUNTIME_IMAGE_REGISTRY" "ARCHESTRA_ORCHESTRATOR_MCP_SERVER_BASE_IMAGE" "ARCHESTRA_KNOWLEDGE_BASE_PERFORCE_SHIM_IMAGE" }}
+{{- $value := index $.Values.archestra.env $name | default "" }}
+{{- if and (kindIs "string" $value) (or (eq $value "europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public") (hasPrefix "europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/" $value)) }}
+{{- $legacyOverrides = append $legacyOverrides (printf "archestra.env.%s" $name) }}
+{{- end }}
+{{- end }}
+{{- if $legacyOverrides }}
+
+Registry migration notice:
+  These overrides still point to Archestra's previous companion image registry:
+{{- range $legacyOverrides }}
+  - {{ . }}
+{{- end }}
+  New companion images are published at ghcr.io/archestra-ai.
+  Update these overrides to use this release's images, or your internal mirror.
+  Existing versions remain available at their original addresses.
 {{- end }}

@@ -1,8 +1,11 @@
+import { randomBytes } from "node:crypto";
 import { describe, expect, test } from "vitest";
 import config from "@/config";
 import {
   _resetCachedKey,
+  decryptBytesWithKey,
   decryptSecretValue,
+  encryptBytesWithKey,
   encryptSecretValue,
   isEncryptedSecret,
 } from "./crypto";
@@ -107,18 +110,18 @@ describe("isEncryptedSecret", () => {
 });
 
 describe("key management", () => {
-  test("throws when auth secret is not set", () => {
+  test("throws when the encryption secret is not set", () => {
     _resetCachedKey();
 
-    const original = config.auth.secret;
-    config.auth.secret = undefined;
+    const original = config.secretsManager.encryptionSecret;
+    config.secretsManager.encryptionSecret = undefined;
 
     try {
       expect(() => encryptSecretValue({ key: "value" })).toThrow(
-        "ARCHESTRA_AUTH_SECRET is required",
+        "ARCHESTRA_SECRETS_ENCRYPTION_SECRET",
       );
     } finally {
-      config.auth.secret = original;
+      config.secretsManager.encryptionSecret = original;
       _resetCachedKey();
     }
   });
@@ -128,14 +131,78 @@ describe("key management", () => {
 
     // Change the secret to simulate key rotation without re-encryption
     _resetCachedKey();
-    const original = config.auth.secret;
-    config.auth.secret = "a-completely-different-secret-key-value-here";
+    const original = config.secretsManager.encryptionSecret;
+    config.secretsManager.encryptionSecret =
+      "a-completely-different-secret-key-value-here";
 
     try {
-      expect(() => decryptSecretValue(encrypted)).toThrow();
+      // The raw Node crypto error is opaque; the wrapper must point at the
+      // encryption-secret mismatch so operators can diagnose it.
+      expect(() => decryptSecretValue(encrypted)).toThrow(
+        "different key than the one derived from the current ARCHESTRA_SECRETS_ENCRYPTION_SECRET",
+      );
     } finally {
-      config.auth.secret = original;
+      config.secretsManager.encryptionSecret = original;
       _resetCachedKey();
     }
+  });
+});
+
+describe("encryptBytesWithKey / decryptBytesWithKey", () => {
+  const key = randomBytes(32);
+  const aad = "conversation_attachments.file_data|incognito:conv-1";
+
+  test("round-trips arbitrary binary content", () => {
+    // Deliberately not text: the whole point of this pair is carrying file
+    // bytes, including NULs and every high byte, without a text encoding.
+    const plaintext = Buffer.concat([
+      Buffer.from([0x00, 0xff, 0x01, 0x00]),
+      randomBytes(4096),
+    ]);
+    const envelope = encryptBytesWithKey(plaintext, key, aad);
+
+    expect(envelope.equals(plaintext)).toBe(false);
+    expect(decryptBytesWithKey(envelope, key, aad).equals(plaintext)).toBe(
+      true,
+    );
+  });
+
+  test("round-trips an empty payload", () => {
+    const envelope = encryptBytesWithKey(Buffer.alloc(0), key, aad);
+    expect(decryptBytesWithKey(envelope, key, aad).byteLength).toBe(0);
+  });
+
+  test("refuses a different key, a different AAD, or tampered bytes", () => {
+    const plaintext = randomBytes(64);
+    const envelope = encryptBytesWithKey(plaintext, key, aad);
+
+    expect(() => decryptBytesWithKey(envelope, randomBytes(32), aad)).toThrow();
+    // The AAD binds ciphertext to one column of one conversation, so a blob
+    // moved between either must not open — this is what stops a database-level
+    // writer transplanting one attachment's bytes onto another row.
+    expect(() =>
+      decryptBytesWithKey(
+        envelope,
+        key,
+        "conversation_attachments.file_data|incognito:conv-2",
+      ),
+    ).toThrow();
+    expect(() =>
+      decryptBytesWithKey(
+        envelope,
+        key,
+        "conversation_attachments.text_preview|incognito:conv-1",
+      ),
+    ).toThrow();
+
+    const tampered = Buffer.from(envelope);
+    tampered[tampered.length - 1] ^= 0xff;
+    expect(() => decryptBytesWithKey(tampered, key, aad)).toThrow();
+  });
+
+  test("rejects a buffer too short to be an envelope", () => {
+    expect(() => decryptBytesWithKey(Buffer.alloc(8), key, aad)).toThrow(
+      /Invalid encrypted bytes format/,
+    );
   });
 });

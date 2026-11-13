@@ -5,7 +5,34 @@ node_modules
 # Build outputs
 dist
 .next
+**/.next
+**/.next-pw
 .turbo
+**/.turbo
+target
+**/target
+**/*.node
+archestra-rs/sandbox-rs/index.js
+**/playwright-report
+**/*.tsbuildinfo
+# Declarations and build state of the TypeScript project builds
+**/.tsbuild
+
+# Local dotnet build outputs of the M-Files VAF Add On — the image build
+# compiles the add-on from source in its own stage and must never pick up a
+# stale locally-built package.
+backend/src/knowledge-base/connectors/mfiles/vaf-add-on/bin
+backend/src/knowledge-base/connectors/mfiles/vaf-add-on/obj
+
+# The archestra program (archestra-cli) is not compiled in the image: a stage
+# of the Dockerfile downloads its released binaries, which the lock file pins.
+# Only the lock file enters the build context, so a change to the program's
+# sources changes neither the context nor the E2E image hash. Keep these two
+# lines exactly as they are and in this order (the later line wins in Docker):
+# .github/scripts/e2e-image-input-hash.sh understands this one negation only,
+# and any other `!` line turns off its exclusions.
+archestra-cli/*
+!archestra-cli/release.lock.json
 
 # Development
 .tilt
@@ -14,6 +41,10 @@ dist
 
 # Tests
 coverage
+# E2E suites and the docs screenshot capture run from the checkout and are never
+# copied into the runtime image.
+e2e-tests
+tools/docs-screenshots
 **/*.test.ts
 **/*.test.tsx
 

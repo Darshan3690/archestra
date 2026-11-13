@@ -1,10 +1,12 @@
 import {
   parseFullToolName,
   TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME,
-} from "@shared";
+} from "@archestra/shared";
 import { and, eq, inArray } from "drizzle-orm";
 import db, { schema } from "@/database";
-import type { Agent } from "@/types";
+import { notDeleted } from "@/database/schemas/soft-deletable-table";
+import { AgentActivationSkillRuleModel, AgentModel } from "@/models";
+import { type Agent, ApiError } from "@/types";
 import type { AgentExportPayload } from "@/types/agent-export";
 
 /**
@@ -20,6 +22,15 @@ import type { AgentExportPayload } from "@/types/agent-export";
 export async function serializeAgentForExport(
   agent: Agent,
 ): Promise<AgentExportPayload> {
+  const activationSkillRules = await AgentActivationSkillRuleModel.findByAgent(
+    agent.id,
+  );
+  if (agent.activationSkillMode !== "all" || activationSkillRules.length > 0) {
+    throw new ApiError(
+      422,
+      "Agents with a customized skill activation policy cannot be exported by the version 1 format",
+    );
+  }
   const [
     toolReferences,
     delegationReferences,
@@ -47,10 +58,9 @@ export async function serializeAgentForExport(
       systemPrompt: agent.systemPrompt,
       icon: agent.icon,
       scope: agent.scope,
-      considerContextUntrusted: agent.considerContextUntrusted,
-      toolAssignmentMode: agent.toolAssignmentMode,
       toolExposureMode: agent.toolExposureMode,
-      llmModel: agent.llmModel,
+      missingCredentialBehavior: agent.missingCredentialBehavior,
+      accessAllTools: agent.accessAllTools,
       incomingEmailEnabled: agent.incomingEmailEnabled,
       incomingEmailSecurityMode: agent.incomingEmailSecurityMode,
       incomingEmailAllowedDomain: agent.incomingEmailAllowedDomain,
@@ -88,6 +98,7 @@ async function resolveToolReferences(
   const nonDelegationTools = agent.tools.filter(
     (t) =>
       !t.delegateToAgentId &&
+      !t.delegateToA2aConnectionId &&
       (hasKnowledgeSources || !isQueryKnowledgeSourcesTool(t.name)),
   );
   if (nonDelegationTools.length === 0) return [];
@@ -101,35 +112,37 @@ async function resolveToolReferences(
     ),
   ];
 
-  const catalogNameMap = new Map<string, string>();
-  if (catalogIds.length > 0) {
-    const catalogRows = await db
-      .select({
-        id: schema.internalMcpCatalogTable.id,
-        name: schema.internalMcpCatalogTable.name,
-      })
-      .from(schema.internalMcpCatalogTable)
-      .where(inArray(schema.internalMcpCatalogTable.id, catalogIds));
-
-    for (const row of catalogRows) {
-      catalogNameMap.set(row.id, row.name);
-    }
-  }
-
   // Batch-fetch credential resolution modes from agent_tools junction table
   const toolIds = nonDelegationTools.map((t) => t.id);
-  const junctionRows = await db
-    .select({
-      toolId: schema.agentToolsTable.toolId,
-      credentialResolutionMode: schema.agentToolsTable.credentialResolutionMode,
-    })
-    .from(schema.agentToolsTable)
-    .where(
-      and(
-        eq(schema.agentToolsTable.agentId, agent.id),
-        inArray(schema.agentToolsTable.toolId, toolIds),
+  const [catalogRows, junctionRows] = await Promise.all([
+    catalogIds.length > 0
+      ? db
+          .select({
+            id: schema.internalMcpCatalogTable.id,
+            name: schema.internalMcpCatalogTable.name,
+          })
+          .from(schema.internalMcpCatalogTable)
+          .where(inArray(schema.internalMcpCatalogTable.id, catalogIds))
+      : [],
+    db
+      .select({
+        toolId: schema.agentToolsTable.toolId,
+        credentialResolutionMode:
+          schema.agentToolsTable.credentialResolutionMode,
+      })
+      .from(schema.agentToolsTable)
+      .where(
+        and(
+          eq(schema.agentToolsTable.agentId, agent.id),
+          inArray(schema.agentToolsTable.toolId, toolIds),
+        ),
       ),
-    );
+  ]);
+
+  const catalogNameMap = new Map<string, string>();
+  for (const row of catalogRows) {
+    catalogNameMap.set(row.id, row.name);
+  }
 
   const credentialModeMap = new Map<string, string>();
   for (const row of junctionRows) {
@@ -171,18 +184,10 @@ async function resolveDelegationReferences(
 
   if (targetAgentIds.length === 0) return [];
 
-  const agents = await db
-    .select({
-      id: schema.agentsTable.id,
-      name: schema.agentsTable.name,
-    })
-    .from(schema.agentsTable)
-    .where(
-      and(
-        inArray(schema.agentsTable.id, targetAgentIds),
-        eq(schema.agentsTable.organizationId, agent.organizationId),
-      ),
-    );
+  const agents = await AgentModel.findBasicByOrganizationIdAndIds({
+    organizationId: agent.organizationId,
+    agentIds: targetAgentIds,
+  });
 
   const nameMap = new Map(agents.map((a) => [a.id, a.name]));
 
@@ -216,6 +221,8 @@ async function resolveKnowledgeBaseReferences(
     .where(
       and(
         inArray(schema.knowledgeBasesTable.id, knowledgeBaseIds),
+        // An export snapshot shouldn't carry KBs the user has deleted.
+        notDeleted(schema.knowledgeBasesTable),
         ...(organizationId
           ? [eq(schema.knowledgeBasesTable.organizationId, organizationId)]
           : []),
@@ -244,6 +251,8 @@ async function resolveConnectorReferences(
     .where(
       and(
         inArray(schema.knowledgeBaseConnectorsTable.id, connectorIds),
+        // An export snapshot shouldn't carry connectors the user has deleted.
+        notDeleted(schema.knowledgeBaseConnectorsTable),
         ...(organizationId
           ? [
               eq(

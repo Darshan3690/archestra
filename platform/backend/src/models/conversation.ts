@@ -1,28 +1,73 @@
+import { hasPersistableAssistantContent } from "@archestra/shared";
 import {
   and,
+  count,
   desc,
   eq,
   getTableColumns,
   ilike,
+  inArray,
   isNotNull,
+  isNull,
   or,
+  type SQL,
   sql,
 } from "drizzle-orm";
-import db, { schema } from "@/database";
+import { alias, union } from "drizzle-orm/pg-core";
+import { type GatedCaller, hiddenAgentsAmong } from "@/auth/permission-gated";
+// biome-ignore lint/style/noRestrictedImports: dual-licensed; no-ops when the feature is off
+import { isContentEncryptionEnabled } from "@/content-encryption/index.ee";
+// biome-ignore lint/style/noRestrictedImports: dual-licensed; no-ops when the feature is off
+import { decryptMessageRow } from "@/content-encryption/rows.ee";
+import db, { schema, type Transaction } from "@/database";
+import { notDeletedConversation } from "@/database/schemas/conversation";
+import { hardDelete, restore, softDelete } from "@/database/soft-delete";
 import type {
   Conversation,
+  ConversationOrigin,
   InsertConversation,
+  MessageFeedback,
+  ToolExposureMode,
   UpdateConversation,
 } from "@/types";
+import { escapeLikePattern } from "@/utils/sql-search";
 import ConversationChatErrorModel from "./conversation-chat-error";
-import ConversationShareModel from "./conversation-share";
+import ConversationCompactionModel from "./conversation-compaction";
+import InteractionModel from "./interaction";
+import ProjectModel from "./project";
+import ProjectAccessModel from "./project-access";
+import ResourcePermissionAccessModel from "./resource-permission-access";
+import ResourcePermissionPolicyModel from "./resource-permission-policy";
 
 class ConversationModel {
-  static async create(data: InsertConversation): Promise<Conversation> {
-    const [conversation] = await db
-      .insert(schema.conversationsTable)
-      .values(data)
-      .returning();
+  /**
+   * `id` may be supplied by the caller when row fields must be derived from
+   * it before insert (encrypted-chat key fingerprints are bound to the id).
+   */
+  static async create(
+    data: InsertConversation & { id?: string },
+  ): Promise<Conversation> {
+    // A chat is governed by its policy from the moment it exists: the owner's
+    // grant is what lets them open the share editor and share it.
+    const conversation = await db.transaction(async (tx) => {
+      const [created] = await tx
+        .insert(schema.conversationsTable)
+        .values(data)
+        .returning();
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      await ResourcePermissionPolicyModel.createInitial({
+        tx,
+        organizationId: created.organizationId,
+        resource: "conversation",
+        scope: created.id,
+        authorId: created.userId,
+        grants: [],
+      });
+      // SPDX-SnippetEnd
+      return created;
+    });
 
     // All tools assigned to the agent are enabled by default.
     // Users can customize enabled tools per-conversation after creation.
@@ -37,18 +82,18 @@ class ConversationModel {
   }
 
   /**
-   * Escape special characters in LIKE patterns.
-   * % and _ have special meaning in SQL LIKE patterns and need to be escaped.
-   */
-  private static escapeLikePattern(value: string): string {
-    return value.replace(/[%_\\]/g, "\\$&");
-  }
-
-  /**
    * Maximum number of conversations to return in search results.
    * Prevents unbounded result sets for common search terms.
    */
   private static readonly SEARCH_RESULT_LIMIT = 50;
+
+  /**
+   * Maximum number of conversations the non-search listing returns. The
+   * sidebar refetches this list on every focus/navigation, and without a
+   * bound it re-downloads a heavy chat user's entire lifetime history each
+   * time. Older conversations stay reachable through search and direct links.
+   */
+  private static readonly LIST_RESULT_LIMIT = 250;
 
   /**
    * Maximum number of messages to load per conversation for preview snippets.
@@ -73,23 +118,52 @@ class ConversationModel {
     userId: string,
     organizationId: string,
     searchQuery?: string,
+    options: {
+      /** Non-search rows to return, newest first; pinned chats are always added. */
+      limit?: number;
+      /** False returns null `artifact` and `todoList` without reading them. */
+      includeArtifacts?: boolean;
+    } = {},
   ): Promise<Conversation[]> {
     const trimmedSearch = searchQuery?.trim();
+    const conversationColumns = listConversationColumns(
+      options.includeArtifacts ?? true,
+    );
 
     // Build WHERE conditions
     const conditions = [
+      notDeletedConversation,
       eq(schema.conversationsTable.userId, userId),
       eq(schema.conversationsTable.organizationId, organizationId),
+      // App-opened chats are drafts until the user writes: opening an app
+      // seeds a conversation (services/apps/app-chat-conversation.ts), and
+      // clicking through apps must not pile unused chats into the sidebar. A
+      // user-role message is the "keep it" signal — until then the chat is
+      // reachable at /chat/<id> but never listed. Derived, not a flag flip,
+      // so it needs no hook in the message write path.
+      sql`(${schema.conversationsTable.origin} != 'app_open' OR EXISTS (
+        SELECT 1 FROM ${schema.messagesTable}
+        WHERE ${schema.messagesTable.conversationId} = ${schema.conversationsTable.id}
+        AND ${schema.messagesTable.role} = 'user'
+      ))`,
     ];
 
     // Add search filter if provided
     if (trimmedSearch) {
       // Escape LIKE special characters (%, _, \) to prevent unexpected pattern matching
-      const escapedSearch = ConversationModel.escapeLikePattern(trimmedSearch);
+      const escapedSearch = escapeLikePattern(trimmedSearch);
       const searchPattern = `%${escapedSearch}%`;
 
       // 1. Conversation title (text column) - uses conversations_title_trgm_idx
       // 2. Message content (JSONB cast to text) - uses messages_content_trgm_idx
+      //
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      // Under content encryption message bodies are ciphertext, so search
+      // degrades to titles only (documented on the secrets-management page).
+      const searchMessageContent = !isContentEncryptionEnabled();
+      // SPDX-SnippetEnd
       const searchConditions = or(
         // Search in title (handles null titles gracefully)
         and(
@@ -98,11 +172,13 @@ class ConversationModel {
         ),
         // Search through messages JSONB content
         // Uses EXISTS for early termination
-        sql`EXISTS (
+        searchMessageContent
+          ? sql`EXISTS (
           SELECT 1 FROM ${schema.messagesTable}
           WHERE ${schema.messagesTable.conversationId} = ${schema.conversationsTable.id}
           AND ${schema.messagesTable.content}::text ILIKE ${searchPattern}
-        )`,
+        )`
+          : sql`false`,
       );
 
       if (searchConditions) {
@@ -113,25 +189,57 @@ class ConversationModel {
     // Include messages only during search for preview snippets
     if (trimmedSearch) {
       // Escape search pattern for message subquery
-      const escapedSearch = ConversationModel.escapeLikePattern(trimmedSearch);
+      const escapedSearch = escapeLikePattern(trimmedSearch);
       const searchPattern = `%${escapedSearch}%`;
 
-      // Use a lateral join to limit messages per conversation for preview
-      // This prevents loading hundreds of messages for conversations with long histories
+      // Preview messages per conversation: the ones matching the search (for
+      // relevance) plus the first few (for context). A LATERAL picks them per
+      // conversation, so a long history is never joined in full and the
+      // first-few probe runs once per conversation rather than per message.
+      const previewSource = alias(schema.messagesTable, "preview_source");
+      const firstMessages = db
+        .select({ id: previewSource.id })
+        .from(previewSource)
+        .where(eq(previewSource.conversationId, schema.conversationsTable.id))
+        .orderBy(previewSource.createdAt)
+        .limit(ConversationModel.MESSAGES_PER_CONVERSATION_LIMIT);
+      const previewMessages = (
+        isContentEncryptionEnabled()
+          ? firstMessages
+          : union(
+              db
+                .select({ id: previewSource.id })
+                .from(previewSource)
+                .where(
+                  and(
+                    eq(
+                      previewSource.conversationId,
+                      schema.conversationsTable.id,
+                    ),
+                    sql`${previewSource.content}::text ILIKE ${searchPattern}`,
+                  ),
+                ),
+              firstMessages,
+            )
+      ).as("preview_message");
+
       const rows = await db
         .select({
-          conversation: getTableColumns(schema.conversationsTable),
+          conversation: conversationColumns,
           message: getTableColumns(schema.messagesTable),
-          share: {
-            id: schema.conversationSharesTable.id,
-            visibility: schema.conversationSharesTable.visibility,
-          },
+          shareVisibility: conversationShareVisibility(),
+          projectName: schema.projectsTable.name,
+          projectIcon: schema.projectsTable.icon,
+          // No systemPrompt here: list rows only need identity/config refs,
+          // and a roster of custom agents can carry very large prompts.
+          // findById selects it for the flows that need it (e.g. compaction).
           agent: {
             id: schema.agentsTable.id,
             name: schema.agentsTable.name,
-            systemPrompt: schema.agentsTable.systemPrompt,
             agentType: schema.agentsTable.agentType,
+            toolExposureMode: schema.agentsTable.toolExposureMode,
             llmApiKeyId: schema.agentsTable.llmApiKeyId,
+            deletedAt: schema.agentsTable.deletedAt,
           },
         })
         .from(schema.conversationsTable)
@@ -139,43 +247,30 @@ class ConversationModel {
           schema.agentsTable,
           eq(schema.conversationsTable.agentId, schema.agentsTable.id),
         )
+        .leftJoinLateral(previewMessages, sql`true`)
         .leftJoin(
           schema.messagesTable,
-          and(
-            eq(
-              schema.conversationsTable.id,
-              schema.messagesTable.conversationId,
-            ),
-            // Only include messages that match the search pattern (for relevance)
-            // or the first few messages (for context)
-            sql`(
-              ${schema.messagesTable.content}::text ILIKE ${searchPattern}
-              OR ${schema.messagesTable.id} IN (
-                SELECT m.id FROM ${schema.messagesTable} m
-                WHERE m.conversation_id = ${schema.conversationsTable.id}
-                ORDER BY m.created_at
-                LIMIT ${ConversationModel.MESSAGES_PER_CONVERSATION_LIMIT}
-              )
-            )`,
-          ),
+          eq(schema.messagesTable.id, previewMessages.id),
         )
         .leftJoin(
-          schema.conversationSharesTable,
-          eq(
-            schema.conversationsTable.id,
-            schema.conversationSharesTable.conversationId,
-          ),
+          schema.projectsTable,
+          eq(schema.conversationsTable.projectId, schema.projectsTable.id),
         )
         .where(and(...conditions))
         .orderBy(
-          desc(schema.conversationsTable.updatedAt),
+          desc(schema.conversationsTable.lastMessageAt),
           schema.messagesTable.createdAt,
+          schema.messagesTable.id,
         )
         .limit(
           ConversationModel.SEARCH_RESULT_LIMIT *
             ConversationModel.MESSAGES_PER_CONVERSATION_LIMIT,
         );
 
+      const hidden = await hiddenAgentsAmong(
+        rows.map((row) => row.agent?.id),
+        { kind: "caller", userId, organizationId },
+      );
       // Group messages by conversation
       const conversationMap = new Map<string, Conversation>();
 
@@ -188,16 +283,33 @@ class ConversationModel {
             continue;
           }
           conversationMap.set(conversationId, {
-            ...row.conversation,
-            agent: row.agent,
-            share: row.share?.id ? row.share : null,
+            ...withVisibleAgent(row.conversation, row.agent, hidden),
+            share: shareSummary(row.shareVisibility),
+            projectName: row.projectName ?? null,
+            projectIcon: listProjectIcon(row.projectIcon),
+            unread: isConversationUnread(row.conversation),
             messages: [],
             chatErrors: [],
+            compactions: [],
           });
         }
 
         const conversation = conversationMap.get(conversationId);
-        if (conversation && row?.message?.content) {
+        // EncryptedChat rows are encrypted under a browser-held key the server
+        // does not have: skip them entirely so the list carries no message
+        // content (not even ciphertext) and the server-key decrypt is never
+        // attempted (it would throw on the foreign envelope).
+        if (row.conversation.encryptedChat) {
+          continue;
+        }
+        if (row?.message) {
+          decryptMessageRow(row.message);
+        }
+        if (
+          conversation &&
+          row?.message?.content &&
+          shouldReturnPersistedMessageRow(row.message)
+        ) {
           // Limit messages per conversation for preview
           if (
             conversation.messages.length <
@@ -215,217 +327,425 @@ class ConversationModel {
       return Array.from(conversationMap.values());
     } else {
       // Non-search case: exclude messages for performance
-      const rows = await db
-        .select({
-          conversation: getTableColumns(schema.conversationsTable),
-          share: {
-            id: schema.conversationSharesTable.id,
-            visibility: schema.conversationSharesTable.visibility,
-          },
-          agent: {
-            id: schema.agentsTable.id,
-            name: schema.agentsTable.name,
-            systemPrompt: schema.agentsTable.systemPrompt,
-            agentType: schema.agentsTable.agentType,
-            llmApiKeyId: schema.agentsTable.llmApiKeyId,
-          },
-        })
-        .from(schema.conversationsTable)
-        .leftJoin(
-          schema.agentsTable,
-          eq(schema.conversationsTable.agentId, schema.agentsTable.id),
-        )
-        .leftJoin(
-          schema.conversationSharesTable,
-          eq(
-            schema.conversationsTable.id,
-            schema.conversationSharesTable.conversationId,
-          ),
-        )
-        .where(and(...conditions))
-        .orderBy(desc(schema.conversationsTable.updatedAt));
+      const limit = Math.min(
+        options.limit ?? ConversationModel.LIST_RESULT_LIMIT,
+        ConversationModel.LIST_RESULT_LIMIT,
+      );
+      const listQuery = (where: SQL | undefined, rowLimit?: number) => {
+        const query = db
+          .select({
+            conversation: conversationColumns,
+            shareVisibility: conversationShareVisibility(),
+            projectName: schema.projectsTable.name,
+            projectIcon: schema.projectsTable.icon,
+            // No systemPrompt here: list rows only need identity/config refs,
+            // and a roster of custom agents can carry very large prompts.
+            // findById selects it for the flows that need it (e.g. compaction).
+            agent: {
+              id: schema.agentsTable.id,
+              name: schema.agentsTable.name,
+              agentType: schema.agentsTable.agentType,
+              toolExposureMode: schema.agentsTable.toolExposureMode,
+              llmApiKeyId: schema.agentsTable.llmApiKeyId,
+              deletedAt: schema.agentsTable.deletedAt,
+            },
+          })
+          .from(schema.conversationsTable)
+          .leftJoin(
+            schema.agentsTable,
+            eq(schema.conversationsTable.agentId, schema.agentsTable.id),
+          )
+          .leftJoin(
+            schema.projectsTable,
+            eq(schema.conversationsTable.projectId, schema.projectsTable.id),
+          )
+          .where(where)
+          .orderBy(desc(schema.conversationsTable.lastMessageAt));
+        return rowLimit === undefined ? query : query.limit(rowLimit);
+      };
+      // Pinned chats show in the sidebar however old they are, so they are
+      // read on their own rather than cut off by the recent-chats limit, up
+      // to the list's own cap.
+      const [recentRows, pinnedRows] = await Promise.all([
+        listQuery(and(...conditions), limit),
+        listQuery(
+          and(...conditions, isNotNull(schema.conversationsTable.pinnedAt)),
+          ConversationModel.LIST_RESULT_LIMIT,
+        ),
+      ]);
+      const recentIds = new Set(recentRows.map((row) => row.conversation.id));
+      const rows = [
+        ...recentRows,
+        ...pinnedRows.filter((row) => !recentIds.has(row.conversation.id)),
+      ].sort(
+        (a, b) =>
+          b.conversation.lastMessageAt.getTime() -
+          a.conversation.lastMessageAt.getTime(),
+      );
 
+      const hidden = await hiddenAgentsAmong(
+        rows.map((row) => row.agent?.id),
+        { kind: "caller", userId, organizationId },
+      );
       return rows.map((row) => ({
-        ...row.conversation,
-        agent: row.agent,
-        share: row.share?.id ? row.share : null,
+        ...withVisibleAgent(row.conversation, row.agent, hidden),
+        share: shareSummary(row.shareVisibility),
+        projectName: row.projectName ?? null,
+        projectIcon: listProjectIcon(row.projectIcon),
+        unread: isConversationUnread(row.conversation),
         messages: [], // Messages fetched separately via findById
         chatErrors: [],
+        compactions: [],
       }));
     }
+  }
+
+  /**
+   * List a user's soft-deleted conversations (owner + org scoped), newest
+   * deletion first — the read backing a future "Trash" view. Same sidebar-row
+   * shape as the active list (no messages loaded), but selects rows where
+   * `deleted_at IS NOT NULL`.
+   *
+   * The active-list partial index (`conversations_active_owner_last_message_idx`,
+   * `WHERE deleted_at IS NULL`) does not cover these rows, so this is an
+   * owner-filtered scan — acceptable while the soft-deleted set stays small; a
+   * retention job (and, if needed, a trash index) will bound it.
+   */
+  static async findAllDeleted(
+    userId: string,
+    organizationId: string,
+  ): Promise<Conversation[]> {
+    return ConversationModel.selectListRows({
+      viewer: { kind: "caller", userId, organizationId },
+      conditions: [
+        isNotNull(schema.conversationsTable.deletedAt),
+        eq(schema.conversationsTable.userId, userId),
+        eq(schema.conversationsTable.organizationId, organizationId),
+        // Same app-open draft filter as the active list: a chat seeded by
+        // opening an app stays a draft until the user writes into it, so a
+        // never-written draft must not surface in trash either.
+        sql`(${schema.conversationsTable.origin} != 'app_open' OR EXISTS (
+          SELECT 1 FROM ${schema.messagesTable}
+          WHERE ${schema.messagesTable.conversationId} = ${schema.conversationsTable.id}
+          AND ${schema.messagesTable.role} = 'user'
+        ))`,
+      ],
+      orderBy: desc(schema.conversationsTable.deletedAt),
+    });
   }
 
   static async findById({
     id,
     userId,
     organizationId,
+    tail,
   }: {
     id: string;
     userId: string;
     organizationId: string;
+    /** Only the last `tail` messages, with the count of the older ones. */
+    tail?: number;
   }): Promise<Conversation | null> {
-    const rows = await db
+    return ConversationModel.loadWithMessages({
+      id,
+      tail,
+      viewer: { kind: "caller", userId, organizationId },
+      where: and(
+        notDeletedConversation,
+        eq(schema.conversationsTable.id, id),
+        eq(schema.conversationsTable.userId, userId),
+        eq(schema.conversationsTable.organizationId, organizationId),
+      ),
+    });
+  }
+
+  /**
+   * EncryptedChat key bookkeeping for a conversation the caller has already
+   * authorized: the flag plus the stored key fingerprint (the fingerprint is
+   * deliberately absent from API response shapes).
+   *
+   * `hasEscrow` gates whether this conversation's audit trail may be encrypted
+   * rather than redacted. It is exact: the wrapped key lives on the row.
+   */
+  static async getEncryptedChatKeyInfo(id: string): Promise<{
+    id: string;
+    encryptedChat: boolean;
+    encryptedChatDekFingerprint: string | null;
+    hasEscrow: boolean;
+  } | null> {
+    const [row] = await db
       .select({
-        conversation: getTableColumns(schema.conversationsTable),
-        message: getTableColumns(schema.messagesTable),
-        share: {
-          id: schema.conversationSharesTable.id,
-          visibility: schema.conversationSharesTable.visibility,
-        },
-        agent: {
-          id: schema.agentsTable.id,
-          name: schema.agentsTable.name,
-          systemPrompt: schema.agentsTable.systemPrompt,
-          agentType: schema.agentsTable.agentType,
-          llmApiKeyId: schema.agentsTable.llmApiKeyId,
-        },
+        id: schema.conversationsTable.id,
+        encryptedChat: schema.conversationsTable.encryptedChat,
+        encryptedChatDekFingerprint:
+          schema.conversationsTable.encryptedChatDekFingerprint,
+        encryptedChatEscrow: schema.conversationsTable.encryptedChatEscrow,
       })
       .from(schema.conversationsTable)
-      .leftJoin(
-        schema.agentsTable,
-        eq(schema.conversationsTable.agentId, schema.agentsTable.id),
-      )
-      .leftJoin(
-        schema.messagesTable,
-        eq(schema.conversationsTable.id, schema.messagesTable.conversationId),
-      )
-      .leftJoin(
-        schema.conversationSharesTable,
-        eq(
-          schema.conversationsTable.id,
-          schema.conversationSharesTable.conversationId,
-        ),
-      )
+      .where(and(notDeletedConversation, eq(schema.conversationsTable.id, id)));
+    if (!row) return null;
+    return {
+      id: row.id,
+      encryptedChat: row.encryptedChat,
+      encryptedChatDekFingerprint: row.encryptedChatDekFingerprint,
+      hasEscrow: row.encryptedChatEscrow !== null,
+    };
+  }
+
+  /**
+   * EncryptedChat bookkeeping for a conversation, scoped to its owner. Used by the
+   * LLM proxy to decide how a chat-loopback session's audit content must be
+   * stored; the owner check keeps a spoofed session id from suppressing (or
+   * re-keying) someone else's audit trail.
+   *
+   * Returns null when `id` is not a non-deleted conversation owned by
+   * `userId`. `hasEscrow` is exact: the wrapped key lives on the row, so its
+   * presence is read directly rather than inferred.
+   */
+  static async getEncryptedChatAuditInfoOwnedBy(params: {
+    id: string;
+    userId: string;
+  }): Promise<{
+    encryptedChat: boolean;
+    encryptedChatDekFingerprint: string | null;
+    hasEscrow: boolean;
+  } | null> {
+    const [row] = await db
+      .select({
+        encryptedChat: schema.conversationsTable.encryptedChat,
+        encryptedChatDekFingerprint:
+          schema.conversationsTable.encryptedChatDekFingerprint,
+        encryptedChatEscrow: schema.conversationsTable.encryptedChatEscrow,
+      })
+      .from(schema.conversationsTable)
       .where(
         and(
-          eq(schema.conversationsTable.id, id),
-          eq(schema.conversationsTable.userId, userId),
-          eq(schema.conversationsTable.organizationId, organizationId),
+          notDeletedConversation,
+          eq(schema.conversationsTable.id, params.id),
+          eq(schema.conversationsTable.userId, params.userId),
         ),
       )
-      .orderBy(schema.messagesTable.createdAt);
-
-    if (rows.length === 0) {
-      return null;
-    }
-
-    const firstRow = rows[0];
-    const chatErrors = await ConversationChatErrorModel.findByConversation(id);
-    const messages = [];
-
-    for (const row of rows) {
-      if (row.message?.content) {
-        // Merge database UUID into message content (overrides AI SDK's temporary ID)
-        messages.push(addMessagePersistenceMetadata(row.message));
-      }
-    }
-
+      .limit(1);
+    if (!row) return null;
     return {
-      ...firstRow.conversation,
-      agent: firstRow.agent,
-      share: firstRow.share?.id ? firstRow.share : null,
-      messages,
-      chatErrors,
+      encryptedChat: row.encryptedChat,
+      encryptedChatDekFingerprint: row.encryptedChatDekFingerprint,
+      hasEscrow: row.encryptedChatEscrow !== null,
     };
+  }
+
+  /**
+   * Cheap ownership check for mutating-route gates (e.g. deleting a chat's
+   * attachment): true only when `userId` owns the conversation in this org.
+   * Unlike `findById` it joins nothing and loads no messages.
+   */
+  static async isOwnedBy(params: {
+    id: string;
+    userId: string;
+    organizationId: string;
+  }): Promise<boolean> {
+    const [row] = await db
+      .select({ id: schema.conversationsTable.id })
+      .from(schema.conversationsTable)
+      .where(
+        and(
+          notDeletedConversation,
+          eq(schema.conversationsTable.id, params.id),
+          eq(schema.conversationsTable.userId, params.userId),
+          eq(schema.conversationsTable.organizationId, params.organizationId),
+        ),
+      )
+      .limit(1);
+    return row !== undefined;
+  }
+
+  /**
+   * Owner-scoped metadata for eligibility checks (e.g. turning a chat into a
+   * project) without loading the conversation's messages, errors, or
+   * compactions like {@link findById} does. Null when the chat does not exist
+   * or is not owned by the caller.
+   */
+  static async getOwnedMeta(params: {
+    id: string;
+    userId: string;
+    organizationId: string;
+  }): Promise<{
+    id: string;
+    title: string | null;
+    origin: ConversationOrigin;
+    projectId: string | null;
+    encryptedChat: boolean;
+  } | null> {
+    const [row] = await db
+      .select({
+        id: schema.conversationsTable.id,
+        title: schema.conversationsTable.title,
+        origin: schema.conversationsTable.origin,
+        projectId: schema.conversationsTable.projectId,
+        encryptedChat: schema.conversationsTable.encryptedChat,
+      })
+      .from(schema.conversationsTable)
+      .where(
+        and(
+          notDeletedConversation,
+          eq(schema.conversationsTable.id, params.id),
+          eq(schema.conversationsTable.userId, params.userId),
+          eq(schema.conversationsTable.organizationId, params.organizationId),
+        ),
+      )
+      .limit(1);
+    return row ?? null;
   }
 
   static async findAccessibleById(params: {
     id: string;
     userId: string;
     organizationId: string;
+    /**
+     * Resolves whether the caller may read chats they did not author that are
+     * reachable only through project membership (i.e. holds `read` on every
+     * chat — the grant at `*` that the retired `project:read-all` became).
+     * Injected by the route layer so this model needs no `@/auth` dependency,
+     * and invoked lazily — only when access would otherwise be granted via the
+     * project-membership branch below. Owned chats and explicit conversation
+     * shares are intentional grants and bypass it.
+     */
+    canReadOthersViaProject: () => Promise<boolean>;
+    /** Only the last `tail` messages, with the count of the older ones. */
+    tail?: number;
   }): Promise<Conversation | null> {
-    const ownedConversation = await ConversationModel.findById(params);
-
-    if (ownedConversation) {
-      return ownedConversation;
-    }
-
-    const accessibleShare =
-      await ConversationShareModel.findAccessibleByConversationId({
-        conversationId: params.id,
-        organizationId: params.organizationId,
-        userId: params.userId,
-      });
-
-    if (!accessibleShare) {
-      return null;
-    }
-
-    // Shared conversations intentionally return another user's conversation
-    // once share access has been validated for this org/user pair.
-    return ConversationModel.findByIdInOrganization({
-      id: params.id,
-      organizationId: params.organizationId,
+    return ConversationModel.findForRead({
+      ...params,
+      loadOwned: () => ConversationModel.findById(params),
+      loadShared: () =>
+        ConversationModel.findByIdInOrganization({
+          ...params,
+          viewer: { kind: "caller", ...params },
+        }),
     });
+  }
+
+  /** The same read authorization as a transcript, without loading its history. */
+  static async findAccessibleMetadataById(
+    params: Parameters<typeof ConversationModel.findAccessibleById>[0],
+  ) {
+    return ConversationModel.findForRead({
+      ...params,
+      loadOwned: () => ConversationModel.getReadAccessMetadata(params),
+      loadShared: () =>
+        ConversationModel.getReadAccessMetadata({
+          id: params.id,
+          organizationId: params.organizationId,
+        }),
+    });
+  }
+
+  /**
+   * Metadata for an already-authorized reader, fenced to the organization and
+   * optionally the owner. No messages, errors, compactions, or agent prompts.
+   */
+  static async getReadAccessMetadata(params: {
+    id: string;
+    organizationId: string;
+    userId?: string;
+  }) {
+    const [row] = await db
+      .select({
+        id: schema.conversationsTable.id,
+        encryptedChat: schema.conversationsTable.encryptedChat,
+        encryptedChatDekFingerprint:
+          schema.conversationsTable.encryptedChatDekFingerprint,
+      })
+      .from(schema.conversationsTable)
+      .where(
+        and(
+          notDeletedConversation,
+          eq(schema.conversationsTable.id, params.id),
+          eq(schema.conversationsTable.organizationId, params.organizationId),
+          params.userId !== undefined
+            ? eq(schema.conversationsTable.userId, params.userId)
+            : undefined,
+        ),
+      )
+      .limit(1);
+    return row ?? null;
   }
 
   static async findByIdInOrganization(params: {
     id: string;
     organizationId: string;
+    tail?: number;
+    viewer: GatedCaller;
   }): Promise<Conversation | null> {
-    const rows = await db
-      .select({
-        conversation: getTableColumns(schema.conversationsTable),
-        message: getTableColumns(schema.messagesTable),
-        share: {
-          id: schema.conversationSharesTable.id,
-          visibility: schema.conversationSharesTable.visibility,
-        },
-        agent: {
-          id: schema.agentsTable.id,
-          name: schema.agentsTable.name,
-          systemPrompt: schema.agentsTable.systemPrompt,
-          agentType: schema.agentsTable.agentType,
-          llmApiKeyId: schema.agentsTable.llmApiKeyId,
-        },
-      })
-      .from(schema.conversationsTable)
-      .leftJoin(
-        schema.agentsTable,
-        eq(schema.conversationsTable.agentId, schema.agentsTable.id),
-      )
-      .leftJoin(
-        schema.messagesTable,
-        eq(schema.conversationsTable.id, schema.messagesTable.conversationId),
-      )
-      .leftJoin(
-        schema.conversationSharesTable,
-        eq(
-          schema.conversationsTable.id,
-          schema.conversationSharesTable.conversationId,
-        ),
-      )
+    return ConversationModel.loadWithMessages({
+      id: params.id,
+      tail: params.tail,
+      viewer: params.viewer,
+      where: and(
+        notDeletedConversation,
+        eq(schema.conversationsTable.id, params.id),
+        eq(schema.conversationsTable.organizationId, params.organizationId),
+      ),
+    });
+  }
+
+  /**
+   * Write a generated title only while the conversation still looks the way it
+   * did before generation started. Generation awaits a slow LLM call, and a
+   * rename landing in that window has to win — the user typed that name, the
+   * model only guessed one. Returns null when the row moved on.
+   *
+   * The placeholder flag is part of the guard, not just the text: the sidebar
+   * rename box prefills the current title, so saving it unchanged claims the
+   * name (clearing the flag) while leaving the text identical. Matching on text
+   * alone would overwrite that. `updatedAt` would be too broad a version to
+   * guard on — marking the conversation read also touches the row.
+   */
+  static async updateTitleIfUnchanged(params: {
+    id: string;
+    userId: string;
+    organizationId: string;
+    expectedTitle: string | null;
+    expectedTitleIsPlaceholder: boolean;
+    title: string;
+  }): Promise<Conversation | null> {
+    const {
+      id,
+      userId,
+      organizationId,
+      expectedTitle,
+      expectedTitleIsPlaceholder,
+      title,
+    } = params;
+
+    const [updated] = await db
+      .update(schema.conversationsTable)
+      .set({ title, titleIsPlaceholder: false })
       .where(
         and(
-          eq(schema.conversationsTable.id, params.id),
-          eq(schema.conversationsTable.organizationId, params.organizationId),
+          eq(schema.conversationsTable.id, id),
+          eq(schema.conversationsTable.userId, userId),
+          eq(schema.conversationsTable.organizationId, organizationId),
+          eq(
+            schema.conversationsTable.titleIsPlaceholder,
+            expectedTitleIsPlaceholder,
+          ),
+          expectedTitle === null
+            ? isNull(schema.conversationsTable.title)
+            : eq(schema.conversationsTable.title, expectedTitle),
         ),
       )
-      .orderBy(schema.messagesTable.createdAt);
+      .returning();
 
-    if (rows.length === 0) {
+    if (!updated) {
       return null;
     }
 
-    const firstRow = rows[0];
-    const chatErrors = await ConversationChatErrorModel.findByConversation(
-      params.id,
-    );
-    const messages = [];
-
-    for (const row of rows) {
-      if (row.message?.content) {
-        messages.push(addMessagePersistenceMetadata(row.message));
-      }
-    }
-
-    return {
-      ...firstRow.conversation,
-      agent: firstRow.agent,
-      share: firstRow.share?.id ? firstRow.share : null,
-      messages,
-      chatErrors,
-    };
+    return (await ConversationModel.findById({
+      id: updated.id,
+      userId,
+      organizationId,
+    })) as Conversation;
   }
 
   static async update(
@@ -434,11 +754,18 @@ class ConversationModel {
     organizationId: string,
     data: UpdateConversation,
   ): Promise<Conversation | null> {
+    // An explicit title write — generated or hand-typed — makes the title real,
+    // so the seeded app-name placeholder is gone. Centralized here so no title
+    // path can forget and leave a chat open to being retitled from under the user.
+    const patch: Partial<typeof schema.conversationsTable.$inferInsert> =
+      data.title !== undefined ? { ...data, titleIsPlaceholder: false } : data;
+
     const [updated] = await db
       .update(schema.conversationsTable)
-      .set(data)
+      .set(patch)
       .where(
         and(
+          notDeletedConversation,
           eq(schema.conversationsTable.id, id),
           eq(schema.conversationsTable.userId, userId),
           eq(schema.conversationsTable.organizationId, organizationId),
@@ -459,31 +786,250 @@ class ConversationModel {
     return updatedWithAgent;
   }
 
+  /**
+   * Toggle per-conversation hook debug mode. Kept off the generic
+   * {@link UpdateConversation} path on purpose: that schema backs the
+   * member-accessible update route, whereas this flag is admin-gated at the
+   * route layer. Scoped by user + org. Returns the new value, or null if no
+   * conversation matched.
+   */
+  static async setHooksDebugEnabled(params: {
+    id: string;
+    userId: string;
+    organizationId: string;
+    enabled: boolean;
+  }): Promise<boolean | null> {
+    const [updated] = await db
+      .update(schema.conversationsTable)
+      .set({ hooksDebugEnabled: params.enabled })
+      .where(
+        and(
+          notDeletedConversation,
+          eq(schema.conversationsTable.id, params.id),
+          eq(schema.conversationsTable.userId, params.userId),
+          eq(schema.conversationsTable.organizationId, params.organizationId),
+        ),
+      )
+      .returning({
+        hooksDebugEnabled: schema.conversationsTable.hooksDebugEnabled,
+      });
+    return updated ? updated.hooksDebugEnabled : null;
+  }
+
+  /**
+   * Mark a conversation read by its owner (clears the sidebar new-messages
+   * indicator). Owner-scoped: a shared/project viewer never matches, so they
+   * cannot move the owner's read marker. Returns whether a row matched.
+   */
+  static async markRead(params: {
+    id: string;
+    userId: string;
+    organizationId: string;
+  }): Promise<boolean> {
+    const [updated] = await db
+      .update(schema.conversationsTable)
+      // GREATEST: the newest message visible at read time is covered even
+      // when it landed in the same millisecond (or marginally ahead of the
+      // reader's clock) — unread is a strict lastMessageAt > lastReadAt
+      // comparison, so a read must never leave lastReadAt behind
+      // lastMessageAt.
+      .set({
+        // now() (DB clock), not a JS Date param: node-postgres serializes
+        // Dates in host-local time and the ::timestamp cast drops the offset,
+        // shifting the stamp by the host's UTC offset on non-UTC hosts.
+        lastReadAt: sql`GREATEST(now()::timestamp, ${schema.conversationsTable.lastMessageAt})`,
+      })
+      .where(
+        and(
+          notDeletedConversation,
+          eq(schema.conversationsTable.id, params.id),
+          eq(schema.conversationsTable.userId, params.userId),
+          eq(schema.conversationsTable.organizationId, params.organizationId),
+        ),
+      )
+      .returning({ id: schema.conversationsTable.id });
+    return !!updated;
+  }
+
+  /** The owner's user + org, or null if the conversation does not exist. */
+  static async getOwner(
+    id: string,
+  ): Promise<{ userId: string; organizationId: string } | null> {
+    const [row] = await db
+      .select({
+        userId: schema.conversationsTable.userId,
+        organizationId: schema.conversationsTable.organizationId,
+      })
+      .from(schema.conversationsTable)
+      .where(and(notDeletedConversation, eq(schema.conversationsTable.id, id)))
+      .limit(1);
+    return row ?? null;
+  }
+
+  /**
+   * Soft-delete a conversation (owner + org scoped): stamps `deleted_at` so it
+   * vanishes from every read path while its rows (messages, files, runs) stay
+   * intact. Idempotent — returns the number of rows that transitioned from
+   * active to deleted, so the caller can distinguish a first delete (1) from an
+   * already-deleted conversation (0) and answer 404 on the latter.
+   */
   static async delete(
     id: string,
     userId: string,
     organizationId: string,
-  ): Promise<void> {
-    await db
-      .delete(schema.conversationsTable)
-      .where(
-        and(
-          eq(schema.conversationsTable.id, id),
-          eq(schema.conversationsTable.userId, userId),
-          eq(schema.conversationsTable.organizationId, organizationId),
-        ),
-      );
+  ): Promise<number> {
+    return softDelete(
+      db,
+      schema.conversationsTable,
+      and(
+        eq(schema.conversationsTable.id, id),
+        eq(schema.conversationsTable.userId, userId),
+        eq(schema.conversationsTable.organizationId, organizationId),
+      ),
+    );
   }
 
   /**
+   * Physically remove a conversation (owner + org scoped). Reserved for rows
+   * that were never real user data and must leave no trace — e.g. an orphan
+   * conversation created then abandoned when a scheduled-run race is lost.
+   * Ordinary user deletes must use `delete` (soft) so the data stays
+   * recoverable. Returns the number of rows removed.
+   */
+  static async hardDelete(
+    id: string,
+    userId: string,
+    organizationId: string,
+  ): Promise<number> {
+    return hardDelete(
+      db,
+      schema.conversationsTable,
+      and(
+        eq(schema.conversationsTable.id, id),
+        eq(schema.conversationsTable.userId, userId),
+        eq(schema.conversationsTable.organizationId, organizationId),
+      ),
+    );
+  }
+
+  /**
+   * Restore a soft-deleted conversation (owner + org scoped): clears
+   * `deleted_at` so it reappears in every read path with its messages, files,
+   * and runs intact. Idempotent — returns the number of rows that transitioned
+   * from deleted to active, so 0 means the conversation was already active,
+   * never existed, or is not owned by the caller. That count is also what the
+   * route gates its one-shot side effects on (finalizing the stopped run,
+   * revoking the share), since a non-zero count proves both the transition and
+   * the caller's ownership.
+   *
+   * Restore intentionally does NOT resurrect a live stream: the delete path
+   * leaves the run row and stamps `stopRequestedAt`, and a restored
+   * conversation keeps that finished run — the user starts a fresh one.
+   */
+  static async restore(
+    id: string,
+    userId: string,
+    organizationId: string,
+  ): Promise<number> {
+    return restore(
+      db,
+      schema.conversationsTable,
+      and(
+        eq(schema.conversationsTable.id, id),
+        eq(schema.conversationsTable.userId, userId),
+        eq(schema.conversationsTable.organizationId, organizationId),
+      ),
+    );
+  }
+
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  /**
+   * Enterprise data-retention: conversations whose last message activity is
+   * older than the retention window, oldest first. Cross-org by design — the
+   * sweep is an instance-level operator policy, not a user action — and
+   * deliberately includes soft-deleted (trashed) conversations: retention is
+   * the hard floor beneath the trash, so sitting in the trash never extends a
+   * conversation's lifetime. SQL-side cutoff because `last_message_at` is
+   * timestamp-without-time-zone.
+   */
+  static async findExpired(params: {
+    retentionDays: number;
+    limit: number;
+  }): Promise<Array<{ id: string; organizationId: string }>> {
+    const result = await db.execute<{ id: string; organization_id: string }>(
+      sql`
+        SELECT id, organization_id
+        FROM ${schema.conversationsTable}
+        WHERE last_message_at < now()::timestamp - make_interval(days => ${params.retentionDays})
+        ORDER BY last_message_at ASC
+        LIMIT ${params.limit}
+      `,
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      organizationId: row.organization_id,
+    }));
+  }
+
+  /**
+   * Lock a retention candidate and re-check expiry under the lock. Returns
+   * null when the conversation vanished or received activity since selection.
+   * While the returned row lock is held, a concurrent message insert blocks on
+   * its FK check, so the caller can purge and delete without a lost-update
+   * window.
+   */
+  static async lockIfExpired(
+    tx: Transaction,
+    params: { id: string; retentionDays: number },
+  ): Promise<{ id: string; organizationId: string } | null> {
+    const result = await tx.execute<{ id: string; organization_id: string }>(
+      sql`
+        SELECT id, organization_id
+        FROM ${schema.conversationsTable}
+        WHERE id = ${params.id}
+          AND last_message_at < now()::timestamp - make_interval(days => ${params.retentionDays})
+        FOR UPDATE
+      `,
+    );
+    const row = result.rows[0];
+    return row ? { id: row.id, organizationId: row.organization_id } : null;
+  }
+
+  /**
+   * System-level delete by id, no user/org scoping — retention-sweep only.
+   * Runs on the caller's transaction so it composes with the row lock and the
+   * file-row purge taken in the same transaction.
+   */
+  static async deleteExpiredLocked(tx: Transaction, id: string): Promise<void> {
+    await tx
+      .delete(schema.conversationsTable)
+      .where(eq(schema.conversationsTable.id, id));
+    await ResourcePermissionPolicyModel.deleteForTarget({
+      tx,
+      resources: ["conversation"],
+      scope: id,
+    });
+  }
+  // SPDX-SnippetEnd
+
+  /**
    * Get the agentId for a conversation (without user context checks)
-   * Used by internal services that need to look up conversation -> agent mapping
+   * Used by internal services that need to look up conversation -> agent mapping.
+   * Excludes soft-deleted conversations, so late/in-flight callers resolve null
+   * (and degrade to a clean not-found) once a conversation is deleted.
    */
   static async getAgentId(conversationId: string): Promise<string | null> {
     const result = await db
       .select({ agentId: schema.conversationsTable.agentId })
       .from(schema.conversationsTable)
-      .where(eq(schema.conversationsTable.id, conversationId))
+      .where(
+        and(
+          notDeletedConversation,
+          eq(schema.conversationsTable.id, conversationId),
+        ),
+      )
       .limit(1);
 
     return result[0]?.agentId ?? null;
@@ -503,6 +1049,7 @@ class ConversationModel {
       .from(schema.conversationsTable)
       .where(
         and(
+          notDeletedConversation,
           eq(schema.conversationsTable.id, conversationId),
           eq(schema.conversationsTable.userId, userId),
           eq(schema.conversationsTable.organizationId, organizationId),
@@ -512,13 +1059,318 @@ class ConversationModel {
 
     return result[0]?.agentId ?? null;
   }
+
+  /**
+   * The conversation row (with its agent and share state) read once, and its
+   * messages read on their own: a join repeated the whole conversation row
+   * and the agent's prompt on every message row. With `tail`, only the last
+   * `tail` messages are read; their ids are chosen first on narrow columns, so
+   * the older messages' content is never loaded.
+   */
+  private static async loadWithMessages(params: {
+    id: string;
+    where: SQL | undefined;
+    tail?: number;
+    viewer: GatedCaller;
+  }): Promise<Conversation | null> {
+    const [row] = await db
+      .select({
+        conversation: getTableColumns(schema.conversationsTable),
+        shareVisibility: conversationShareVisibility(),
+        agent: {
+          id: schema.agentsTable.id,
+          name: schema.agentsTable.name,
+          systemPrompt: schema.agentsTable.systemPrompt,
+          agentType: schema.agentsTable.agentType,
+          toolExposureMode: schema.agentsTable.toolExposureMode,
+          llmApiKeyId: schema.agentsTable.llmApiKeyId,
+          deletedAt: schema.agentsTable.deletedAt,
+        },
+      })
+      .from(schema.conversationsTable)
+      .leftJoin(
+        schema.agentsTable,
+        eq(schema.conversationsTable.agentId, schema.agentsTable.id),
+      )
+      .where(params.where)
+      .limit(1);
+
+    if (!row) {
+      return null;
+    }
+
+    const [storedMessages, chatErrors, compactions, contextUsage] =
+      await Promise.all([
+        loadConversationMessages({ id: params.id, tail: params.tail }),
+        ConversationChatErrorModel.findByConversation(params.id),
+        ConversationCompactionModel.findByConversation(params.id),
+        InteractionModel.findLatestChatContextUsage(params.id),
+      ]);
+    const messages = [];
+
+    // EncryptedChat rows are ciphertext under a browser-held key: the route
+    // layer decrypts them (or returns the locked shape) — never attempt the
+    // server-key decrypt here.
+    if (!row.conversation.encryptedChat) {
+      for (const message of storedMessages.rows) {
+        decryptMessageRow(message);
+        if (message.content && shouldReturnPersistedMessageRow(message)) {
+          // Merge database UUID into message content (overrides AI SDK's temporary ID)
+          messages.push(addMessagePersistenceMetadata(message));
+        }
+      }
+    }
+
+    return {
+      ...withVisibleAgent(
+        row.conversation,
+        row.agent,
+        await hiddenAgentsAmong([row.agent?.id], params.viewer),
+      ),
+      share: shareSummary(row.shareVisibility),
+      messages,
+      ...(storedMessages.olderMessageCount === undefined
+        ? {}
+        : { olderMessageCount: storedMessages.olderMessageCount }),
+      chatErrors,
+      compactions,
+      contextTokensUsed: latestContextTokens(compactions, contextUsage),
+    };
+  }
+
+  /** Keep transcript and metadata reads on exactly the same authorization path. */
+  private static async findForRead<T>(
+    params: Parameters<typeof ConversationModel.findAccessibleById>[0] & {
+      loadOwned: () => Promise<T | null>;
+      loadShared: () => Promise<T | null>;
+    },
+  ): Promise<T | null> {
+    const ownedConversation = await params.loadOwned();
+
+    if (ownedConversation) {
+      return ownedConversation;
+    }
+
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // A chat is shared through its permission policy. Returning another
+    // user's conversation is intentional once that policy grants read. A grant
+    // on every chat is left out: it reaches only chats inside a project the
+    // caller can open, which the branch below decides.
+    const sharedWithCaller = await ResourcePermissionAccessModel.canRead({
+      organizationId: params.organizationId,
+      userId: params.userId,
+      resource: "conversation",
+      scope: params.id,
+      includeWildcard: false,
+    });
+    if (sharedWithCaller) {
+      return params.loadShared();
+    }
+    // SPDX-SnippetEnd
+
+    // Project membership grants a read-only view of chats in the project
+    // (writing stays author-only — every mutating route resolves the
+    // conversation by owner). Reading a chat the caller did NOT author is
+    // additionally gated by `read` on every chat, uniformly — including when the
+    // caller owns the project.
+    const [bare] = await db
+      .select({
+        projectId: schema.conversationsTable.projectId,
+        organizationId: schema.conversationsTable.organizationId,
+      })
+      .from(schema.conversationsTable)
+      .where(
+        and(
+          notDeletedConversation,
+          eq(schema.conversationsTable.id, params.id),
+        ),
+      );
+    if (
+      !bare ||
+      !bare.projectId ||
+      bare.organizationId !== params.organizationId
+    ) {
+      return null;
+    }
+    const project = await ProjectModel.findById(bare.projectId);
+    if (
+      !project ||
+      !(await ProjectAccessModel.userCanAccessProject({
+        sessionAccess: true,
+        project,
+        userId: params.userId,
+        organizationId: params.organizationId,
+      })) ||
+      !(await params.canReadOthersViaProject())
+    ) {
+      return null;
+    }
+    return params.loadShared();
+  }
+
+  /**
+   * SELECT for conversation "list rows" — the sidebar-row shape (agent/share/
+   * project columns joined, no messages/errors/compactions loaded) backing
+   * {@link findAllDeleted}. The hot active-list path ({@link findAll}) keeps
+   * its own inline copy of this query on purpose, so this helper is not on
+   * that path. Callers own the WHERE conditions and the ordering.
+   */
+  private static async selectListRows(params: {
+    conditions: SQL[];
+    orderBy: SQL;
+    viewer: GatedCaller;
+  }): Promise<Conversation[]> {
+    const rows = await db
+      .select({
+        conversation: getTableColumns(schema.conversationsTable),
+        shareVisibility: conversationShareVisibility(),
+        projectName: schema.projectsTable.name,
+        projectIcon: schema.projectsTable.icon,
+        agent: {
+          id: schema.agentsTable.id,
+          name: schema.agentsTable.name,
+          systemPrompt: schema.agentsTable.systemPrompt,
+          agentType: schema.agentsTable.agentType,
+          toolExposureMode: schema.agentsTable.toolExposureMode,
+          llmApiKeyId: schema.agentsTable.llmApiKeyId,
+          deletedAt: schema.agentsTable.deletedAt,
+        },
+      })
+      .from(schema.conversationsTable)
+      .leftJoin(
+        schema.agentsTable,
+        eq(schema.conversationsTable.agentId, schema.agentsTable.id),
+      )
+      .leftJoin(
+        schema.projectsTable,
+        eq(schema.conversationsTable.projectId, schema.projectsTable.id),
+      )
+      .where(and(...params.conditions))
+      .orderBy(params.orderBy);
+
+    const hidden = await hiddenAgentsAmong(
+      rows.map((row) => row.agent?.id),
+      params.viewer,
+    );
+    return rows.map((row) => ({
+      ...withVisibleAgent(row.conversation, row.agent, hidden),
+      share: shareSummary(row.shareVisibility),
+      projectName: row.projectName ?? null,
+      projectIcon: listProjectIcon(row.projectIcon),
+      unread: isConversationUnread(row.conversation),
+      messages: [],
+      chatErrors: [],
+      compactions: [],
+    }));
+  }
 }
 
 export default ConversationModel;
 
+// Read-side guard for assistant rows that were persisted before the strict
+// persist normalization (or by an older client) and would otherwise reload as
+// an empty bubble. The DB `role` column is authoritative — a `content: ""` row
+// has no role inside its content. Read-only: bad rows are hidden, never deleted.
+// A conversation is unread when a message has landed since the owner last
+// viewed it. lastReadAt is null until the first explicit read, so fall back to
+// createdAt. Strict `>` so marking read at the same instant a message persists
+// (e.g. you sent it) does not register as unread.
+function isConversationUnread(conversation: {
+  lastMessageAt: Date;
+  lastReadAt: Date | null;
+  createdAt: Date;
+}): boolean {
+  const lastRead = conversation.lastReadAt ?? conversation.createdAt;
+  return conversation.lastMessageAt.getTime() > lastRead.getTime();
+}
+
+/**
+ * Assemble the API-facing message list from already-decrypted message rows.
+ * Used by the encrypted-chat GET path, which loads and decrypts rows itself (the
+ * model cannot: the key only exists on the request). Applies the same
+ * filtering/metadata rules as the standard conversation reads above.
+ */
+export function toConversationApiMessages(
+  rows: Array<{
+    id: string;
+    role: string;
+    content: unknown;
+    feedback: MessageFeedback | null;
+    createdAt: Date;
+  }>,
+): unknown[] {
+  const messages: unknown[] = [];
+  for (const row of rows) {
+    if (row.content && shouldReturnPersistedMessageRow(row)) {
+      messages.push(addMessagePersistenceMetadata(row));
+    }
+  }
+  return messages;
+}
+
+function shouldReturnPersistedMessageRow(message: {
+  role: string;
+  content: unknown;
+}): boolean {
+  if (message.role !== "assistant") {
+    return true;
+  }
+  if (typeof message.content !== "object" || message.content === null) {
+    return false;
+  }
+  return hasPersistableAssistantContent(
+    message.content as { parts?: ReadonlyArray<{ type: string }> },
+  );
+}
+
+/**
+ * A conversation's stored messages in order, or only the last `tail` of them
+ * with the count of the older ones.
+ */
+async function loadConversationMessages(params: { id: string; tail?: number }) {
+  const table = schema.messagesTable;
+  if (params.tail === undefined) {
+    const rows = await db
+      .select()
+      .from(table)
+      .where(eq(table.conversationId, params.id))
+      .orderBy(table.createdAt, table.id);
+    return { rows, olderMessageCount: undefined };
+  }
+  const [lastIds, [{ total }]] = await Promise.all([
+    db
+      .select({ id: table.id })
+      .from(table)
+      .where(eq(table.conversationId, params.id))
+      .orderBy(desc(table.createdAt), desc(table.id))
+      .limit(params.tail),
+    db
+      .select({ total: count() })
+      .from(table)
+      .where(eq(table.conversationId, params.id)),
+  ]);
+  const rows =
+    lastIds.length === 0
+      ? []
+      : await db
+          .select()
+          .from(table)
+          .where(
+            inArray(
+              table.id,
+              lastIds.map(({ id }) => id),
+            ),
+          )
+          .orderBy(table.createdAt, table.id);
+  return { rows, olderMessageCount: total - rows.length };
+}
+
 function addMessagePersistenceMetadata(message: {
   id: string;
   content: unknown;
+  feedback: MessageFeedback | null;
   createdAt: Date;
 }) {
   const content =
@@ -538,6 +1390,122 @@ function addMessagePersistenceMetadata(message: {
     metadata: {
       ...metadata,
       createdAt: message.createdAt.toISOString(),
+      // The column is authoritative: content JSON may carry a stale copied
+      // value (e.g. a forked conversation), so always override it here.
+      feedback: message.feedback ?? undefined,
     },
   };
+}
+
+type JoinedConversationAgent = {
+  id: string | null;
+  name: string | null;
+  /** Absent on list reads; only detail reads select the prompt. */
+  systemPrompt?: string | null;
+  agentType: "profile" | "mcp_gateway" | "llm_proxy" | "agent" | null;
+  toolExposureMode: ToolExposureMode | null;
+  llmApiKeyId: string | null;
+  deletedAt: Date | null;
+} | null;
+
+/**
+ * Project icon for a conversation-list row. Only emoji icons are passed through;
+ * base64 image data URLs are dropped (the pill falls back to the folder glyph)
+ * so a large icon isn't duplicated across every conversation in the list.
+ */
+function listProjectIcon(icon: string | null | undefined): string | null {
+  if (!icon || icon.startsWith("data:")) return null;
+  return icon;
+}
+
+/**
+/**
+ * Conversation columns for a list read: never the encrypted-chat escrow
+ * bookkeeping, which no list response carries. Without artifacts, the
+ * document and todo list come back as null and are not read; each can be
+ * hundreds of KB.
+ */
+function listConversationColumns(includeArtifacts: boolean) {
+  const {
+    encryptedChatEscrow: _encryptedChatEscrow,
+    encryptedChatDekFingerprint: _encryptedChatDekFingerprint,
+    ...columns
+  } = getTableColumns(schema.conversationsTable);
+  if (includeArtifacts) return columns;
+  return {
+    ...columns,
+    artifact: sql<ConversationRow["artifact"]>`null`,
+    todoList: sql<ConversationRow["todoList"]>`null`,
+  };
+}
+
+type ConversationRow = typeof schema.conversationsTable.$inferSelect;
+
+function withVisibleAgent<
+  T extends Pick<typeof schema.conversationsTable.$inferSelect, "agentId">,
+>(
+  conversation: T,
+  agent: JoinedConversationAgent,
+  hidden: ReadonlySet<string>,
+): T & {
+  agent: Conversation["agent"];
+} {
+  if (!agent?.id || agent.deletedAt !== null || hidden.has(agent.id)) {
+    return {
+      ...conversation,
+      agentId: null,
+      agent: null,
+    };
+  }
+
+  return {
+    ...conversation,
+    agent: {
+      id: agent.id,
+      name: agent.name ?? "",
+      // Only present when the read selected it (detail reads); list reads
+      // deliberately leave the prompt out of the payload.
+      ...(agent.systemPrompt !== undefined && {
+        systemPrompt: agent.systemPrompt,
+      }),
+      agentType: agent.agentType ?? "agent",
+      toolExposureMode: agent.toolExposureMode ?? "full",
+      llmApiKeyId: agent.llmApiKeyId,
+    },
+  };
+}
+
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+/** Who the chat is shared with, read from its permission policy. */
+function conversationShareVisibility() {
+  return ResourcePermissionPolicyModel.sharedAudience({
+    organizationId: schema.conversationsTable.organizationId,
+    resource: "conversation",
+    scopeColumn: schema.conversationsTable.id,
+    ownerColumn: schema.conversationsTable.userId,
+  });
+}
+// SPDX-SnippetEnd
+
+function shareSummary(
+  visibility: "organization" | "team" | "user" | null,
+): Conversation["share"] {
+  return visibility ? { visibility } : null;
+}
+
+/**
+ * Whichever is newer: the latest turn's prompt size, or the estimate a later
+ * compaction left behind.
+ */
+function latestContextTokens(
+  compactions: { createdAt: Date; compactedTokenEstimate: number }[],
+  usage: { tokens: number; createdAt: Date } | null,
+): number | null {
+  const compaction = compactions.at(-1);
+  if (compaction && (!usage || compaction.createdAt > usage.createdAt)) {
+    return compaction.compactedTokenEstimate;
+  }
+  return usage?.tokens ?? null;
 }

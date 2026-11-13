@@ -18,9 +18,14 @@ interface SchedulePickerProps {
   // biome-ignore lint/suspicious/noExplicitAny: form type is generic across different form schemas
   form: UseFormReturn<any>;
   name: string;
+  connectorTypeLabel: string;
 }
 
-export function SchedulePicker({ form, name }: SchedulePickerProps) {
+export function SchedulePicker({
+  form,
+  name,
+  connectorTypeLabel,
+}: SchedulePickerProps) {
   return (
     <FormField
       control={form.control}
@@ -28,7 +33,11 @@ export function SchedulePicker({ form, name }: SchedulePickerProps) {
       rules={{ required: "Schedule is required" }}
       render={({ field }) => (
         <FormItem>
-          <FormLabel>Schedule</FormLabel>
+          <FormLabel>Documents Sync Schedule</FormLabel>
+          <FormDescription>
+            Pick how often to sync documents with your {connectorTypeLabel}{" "}
+            instance
+          </FormDescription>
           <FormControl>
             <div className="space-y-2">
               <CronExpressionPicker
@@ -36,12 +45,10 @@ export function SchedulePicker({ form, name }: SchedulePickerProps) {
                 onChange={field.onChange}
                 presets={DEFAULT_CRON_PRESET_OPTIONS}
                 descriptionFallback="Cron expression for sync schedule."
+                className="w-full"
               />
             </div>
           </FormControl>
-          <FormDescription>
-            Pick a preset or switch to a custom 5-field cron expression.
-          </FormDescription>
           <FormMessage />
         </FormItem>
       )}

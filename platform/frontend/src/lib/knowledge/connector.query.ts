@@ -1,22 +1,40 @@
-import { archestraApiSdk, type archestraApiTypes } from "@shared";
+import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { handleApiError } from "@/lib/utils";
+import { clipErrorMessage, trackEvent } from "@/lib/analytics";
+import { toBulkOutcome } from "@/lib/bulk-action";
+import { useAllMatching } from "@/lib/hooks/use-all-matching";
+import { fetchInIdChunks } from "@/lib/knowledge/fetch-in-id-chunks";
+import {
+  getApiErrorMessage,
+  handleApiError,
+  throwOnApiError,
+} from "@/lib/utils/api";
 
 const {
+  bulkDeleteConnectors,
   getConnectors,
   getConnector,
   createConnector,
   updateConnector,
   deleteConnector,
+  restoreConnector,
+  permanentlyDeleteConnector,
   syncConnector,
+  cancelConnectorRun,
   forceResyncConnector,
   testConnectorConnection,
   getConnectorRuns,
   getConnectorRun,
+  getConnectorUserGroups,
+  upsertConnectorMemberOverride,
+  deleteConnectorMemberOverride,
+  triggerPermissionSync,
+  getPermissionSyncCoverage,
   assignConnectorToKnowledgeBases,
   unassignConnectorFromKnowledgeBase,
-  getConnectorKnowledgeBases,
+  startGoogleDriveConnectorOAuth,
+  getMfilesVafAddOnDistribution,
 } = archestraApiSdk;
 
 type ConnectorsQuery = NonNullable<
@@ -30,8 +48,23 @@ type ConnectorsListParams = Pick<
 };
 type ConnectorsPaginatedParams = Pick<
   ConnectorsQuery,
-  "limit" | "offset" | "search" | "connectorType"
->;
+  | "limit"
+  | "offset"
+  | "search"
+  | "connectorType"
+  | "status"
+  | "access"
+  | "sharedWith"
+  | "owner"
+> & {
+  /** Serialized `?labels=` filter; resolved server-side. */
+  labels?: string;
+};
+
+/** One synced upstream group, as `useConnectorUserGroups` returns it. */
+export type ConnectorUserGroup =
+  archestraApiTypes.GetConnectorUserGroupsResponses["200"]["groups"][number];
+export type ConnectorUserGroupMember = ConnectorUserGroup["members"][number];
 
 // ===== Query hooks =====
 
@@ -51,12 +84,11 @@ export function useConnectors(params?: string | Partial<ConnectorsListParams>) {
           knowledgeBaseId,
           limit: limit ?? 100,
           offset: offset ?? 0,
+          // No caller shows the agents a connector is assigned to.
+          includeAssignedAgents: false,
         },
       });
-      if (error) {
-        handleApiError(error);
-        return null;
-      }
+      throwOnApiError(error);
       return data?.data ?? [];
     },
     enabled,
@@ -69,53 +101,158 @@ export function useConnectors(params?: string | Partial<ConnectorsListParams>) {
   });
 }
 
+/**
+ * Exactly these connectors. With `pollWhileSyncing`, refetches every 3 s while
+ * any of them is syncing.
+ */
+export function useConnectorsByIds(
+  ids: readonly string[],
+  options?: { enabled?: boolean; pollWhileSyncing?: boolean },
+) {
+  const sortedIds = [...new Set(ids)].sort();
+  return useQuery({
+    queryKey: ["connectors", "by-ids", sortedIds],
+    enabled: (options?.enabled ?? true) && sortedIds.length > 0,
+    queryFn: () =>
+      fetchInIdChunks(sortedIds, async (chunk) => {
+        const { data, error } = await getConnectors({
+          query: { ids: chunk, includeAssignedAgents: false },
+        });
+        throwOnApiError(error);
+        return data?.data ?? [];
+      }),
+    placeholderData: (previousData) => previousData,
+    refetchInterval: (query) =>
+      options?.pollWhileSyncing &&
+      query.state.data?.some((c) => c.lastSyncStatus === "running")
+        ? 3000
+        : false,
+  });
+}
+
 export function useConnectorsPaginated(params: ConnectorsPaginatedParams) {
   return useQuery({
     queryKey: ["connectors", "paginated", params],
     placeholderData: (previousData) => previousData,
     queryFn: async () => {
-      const { data, error } = await getConnectors({ query: params });
-      if (error) {
-        handleApiError(error);
-        return null;
-      }
+      const { data, error } = await getConnectors({
+        query: { ...params, includeAssignedAgents: false },
+      });
+      throwOnApiError(error, { toastOnError: false });
       return data;
     },
   });
 }
 
-export function useConnector(id: string) {
+/** Every connector matching the table's filters, not just the page in view. */
+export function useAllMatchingConnectors(
+  params: Omit<ConnectorsPaginatedParams, "limit" | "offset">,
+  options?: { enabled?: boolean },
+) {
+  return useAllMatching({
+    queryKey: ["connectors", "all-matching", params],
+    enabled: options?.enabled,
+    fetchPage: async ({ limit, offset }) => {
+      const { data, error } = await getConnectors({
+        query: { ...params, limit, offset, includeAssignedAgents: false },
+      });
+      throwOnApiError(error, { toastOnError: false });
+      return data?.data ?? [];
+    },
+  });
+}
+
+/** Independent of the list filters/page; stops as soon as an affected connector is found. */
+export function useHasLegacySalesforceConnector() {
+  return useQuery({
+    queryKey: ["connectors", "legacy-salesforce-auth"],
+    queryFn: async () => {
+      const limit = 100;
+      for (let offset = 0; ; offset += limit) {
+        const { data, error } = await getConnectors({
+          query: {
+            connectorType: "salesforce",
+            limit,
+            offset,
+            includeAssignedAgents: false,
+          },
+        });
+        throwOnApiError(error, { toastOnError: false });
+        const connectors = data?.data ?? [];
+        if (
+          connectors.some(
+            (connector) =>
+              connector.config.type === "salesforce" &&
+              connector.config.authMethod !== "oauth_client_credentials",
+          )
+        )
+          return true;
+        // The API can omit malformed persisted rows after pagination. A short
+        // response is not necessarily the last database page.
+        const total = data?.pagination.total;
+        if (
+          total !== undefined
+            ? offset + limit >= total
+            : connectors.length < limit
+        )
+          return false;
+      }
+    },
+  });
+}
+
+/** Deletes a selection of connectors in one request. */
+export function useBulkDeleteConnectors() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (connectors: readonly { id: string }[]) =>
+      bulkDeleteConnectors({
+        body: { ids: connectors.map((connector) => connector.id) },
+      }).then(({ data, error }) => {
+        throwOnApiError(error, { toastOnError: false });
+        return toBulkOutcome(data ?? { succeeded: [], failed: [] });
+      }),
+    onSettled: () =>
+      queryClient.invalidateQueries({ queryKey: ["connectors"] }),
+  });
+}
+
+/**
+ * Sets one audience across a selection of connectors, in one request.
+ *
+ * `auto-sync-permissions` is not offered: the route refuses it, because
+ * switching a connector to it fail-closes its corpus and depends on the
+ * connector's own type.
+ */
+
+export function useConnector(id: string | undefined) {
   return useQuery({
     queryKey: ["connectors", id],
     queryFn: async () => {
+      if (!id) return null;
       const { data, error } = await getConnector({ path: { id } });
-      if (error) {
-        handleApiError(error);
-        return null;
-      }
-      return data;
+      throwOnApiError(error, { allowNotFound: true });
+      return data ?? null;
     },
     enabled: !!id,
     refetchInterval: (query) => {
-      return query.state.data?.lastSyncStatus === "running" ? 3000 : false;
-    },
-  });
-}
-
-export function useConnectorKnowledgeBases(connectorId: string) {
-  return useQuery({
-    queryKey: ["connectors", connectorId, "knowledge-bases"],
-    queryFn: async () => {
-      const { data, error } = await getConnectorKnowledgeBases({
-        path: { id: connectorId },
-      });
-      if (error) {
-        handleApiError(error);
-        return null;
+      const connector = query.state.data;
+      if (
+        connector?.lastSyncStatus === "running" ||
+        connector?.lastPermissionSyncStatus === "running"
+      ) {
+        return 3000;
       }
-      return data;
+      // Chained-run grace: a completed documents sync spawns a permission
+      // pass seconds LATER, after the poll that observed the terminal status
+      // — stopping immediately strands the new run until a manual reload.
+      return withinRunChainGrace(
+        connector?.lastSyncAt,
+        connector?.lastPermissionSyncAt,
+      )
+        ? RUN_CHAIN_GRACE_POLL_MS
+        : false;
     },
-    enabled: !!connectorId,
   });
 }
 
@@ -125,6 +262,11 @@ export function useCreateConnector() {
     mutationFn: async (body: archestraApiTypes.CreateConnectorData["body"]) => {
       const { data, error } = await createConnector({ body });
       if (error) {
+        trackEvent("knowledge_base_connector_installation_failed", {
+          connectorType: body.connectorType,
+          stage: "create",
+          errorMessage: clipErrorMessage(getApiErrorMessage(error)),
+        });
         handleApiError(error);
         return null;
       }
@@ -190,6 +332,59 @@ export function useDeleteConnector() {
   });
 }
 
+/**
+ * Restore a soft-deleted connector from the trash view (admins). The stored
+ * credential was destroyed at delete, so the connector comes back disabled —
+ * the toast tells the admin the follow-up steps.
+ */
+export function useRestoreConnector() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const { data, error } = await restoreConnector({ path: { id } });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (data) => {
+      if (!data) return;
+      queryClient.invalidateQueries({ queryKey: ["connectors"] });
+      queryClient.invalidateQueries({ queryKey: ["knowledge-bases"] });
+      toast.success(
+        "Connector restored as disabled — re-authenticate it, then enable it to resume syncing",
+      );
+    },
+  });
+}
+
+/** Permanently delete a soft-deleted connector (admin-only trash action). */
+export function usePermanentlyDeleteConnector() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const { data, error } = await permanentlyDeleteConnector({
+        path: { id },
+      });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (data, id) => {
+      if (!data) return;
+      queryClient.invalidateQueries({ queryKey: ["connectors"] });
+      queryClient.invalidateQueries({ queryKey: ["knowledge-bases"] });
+      // Drop the detail and document queries for an id that no longer
+      // resolves, rather than letting a stale URL remount them into a 404.
+      queryClient.removeQueries({ queryKey: ["connectors", id] });
+      toast.success("Connector permanently deleted");
+    },
+  });
+}
+
 export function useSyncConnector() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -212,6 +407,35 @@ export function useSyncConnector() {
         queryKey: ["connectors", connectorId, "runs"],
       });
       toast.success("Sync started successfully");
+    },
+  });
+}
+
+export function useCancelConnectorRun() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: { connectorId: string; runId: string }) => {
+      const { data, error } = await cancelConnectorRun({
+        path: { id: params.connectorId, runId: params.runId },
+      });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (data, { connectorId, runId }) => {
+      if (!data) return;
+      queryClient.invalidateQueries({
+        queryKey: ["connectors", connectorId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["connectors", connectorId, "runs"],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["connectors", connectorId, "runs", runId],
+      });
+      toast.success("Sync cancelled");
     },
   });
 }
@@ -243,6 +467,7 @@ export function useForceResyncConnector() {
 }
 
 export function useTestConnectorConnection() {
+  const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (connectorId: string) => {
       const { data, error } = await testConnectorConnection({
@@ -254,13 +479,187 @@ export function useTestConnectorConnection() {
       }
       return data;
     },
-    onSuccess: (data) => {
+    onSuccess: (data, connectorId) => {
       if (!data) return;
       if (data.success) {
         toast.success("Connection test successful");
       } else {
+        const connector = queryClient.getQueryData<
+          archestraApiTypes.GetConnectorResponses["200"]
+        >(["connectors", connectorId]);
+        trackEvent("knowledge_base_connector_installation_failed", {
+          connectorType: connector?.connectorType,
+          stage: "connection_test",
+          errorMessage: clipErrorMessage(data.error),
+        });
         toast.error(data.error || "Connection test failed");
       }
+    },
+  });
+}
+
+/**
+ * Send the browser to Google to authorize a Drive connector.
+ *
+ * A full-page redirect rather than a popup: the flow ends on a backend
+ * callback that stores the refresh token and redirects back here, so no token
+ * is handed between windows and the browser returns to the page it left with
+ * the connector already connected.
+ */
+export function useStartGoogleDriveOAuth() {
+  return useMutation({
+    mutationFn: async (params: { connectorId: string; returnTo?: string }) => {
+      const { data, error } = await startGoogleDriveConnectorOAuth({
+        path: { id: params.connectorId },
+        body: {
+          returnTo:
+            params.returnTo ??
+            (typeof window === "undefined" ? undefined : window.location.href),
+        },
+      });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (data) => {
+      if (data?.authorizationUrl) {
+        window.location.href = data.authorizationUrl;
+      }
+    },
+  });
+}
+
+export function useTriggerPermissionSync() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (connectorId: string) => {
+      const { data, error } = await triggerPermissionSync({
+        path: { id: connectorId },
+      });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (data, connectorId) => {
+      if (!data) return;
+      queryClient.invalidateQueries({
+        queryKey: ["connectors", connectorId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["connectors", connectorId, "runs"],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["connectors", connectorId, "permission-coverage"],
+      });
+      toast.success("Permission sync started");
+    },
+  });
+}
+
+/**
+ * Live ACL coverage for an auto-sync-permissions connector: how many ingested
+ * documents are tagged vs still fail-closed. Polls while a pass is running or
+ * documents are still awaiting one, so the header stat converges on its own.
+ */
+export function useConnectorPermissionCoverage(params: {
+  connectorId: string;
+  enabled: boolean;
+}) {
+  const { connectorId, enabled } = params;
+  return useQuery({
+    queryKey: ["connectors", connectorId, "permission-coverage"],
+    queryFn: async () => {
+      const { data, error } = await getPermissionSyncCoverage({
+        path: { id: connectorId },
+      });
+      throwOnApiError(error, { allowNotFound: true, toastOnError: false });
+      return data ?? null;
+    },
+    enabled: enabled && !!connectorId,
+    refetchInterval: (query) => {
+      const coverage = query.state.data;
+      return coverage?.permissionSyncRunning ||
+        (coverage?.failClosedDocuments ?? 0) > 0
+        ? 5000
+        : false;
+    },
+  });
+}
+
+/**
+ * Synced external user groups for an auto-sync-permissions connector: member
+ * emails, the org users they resolve to, and per-group document grant counts.
+ */
+export function useConnectorUserGroups(params: {
+  connectorId: string;
+  enabled: boolean;
+}) {
+  const { connectorId, enabled } = params;
+  return useQuery({
+    queryKey: ["connectors", connectorId, "user-groups"],
+    queryFn: async () => {
+      const { data, error } = await getConnectorUserGroups({
+        path: { id: connectorId },
+      });
+      throwOnApiError(error, { allowNotFound: true, toastOnError: false });
+      return data ?? null;
+    },
+    enabled: enabled && !!connectorId,
+  });
+}
+
+/**
+ * Manually map an upstream member account to an org user (the admin escape
+ * hatch for members whose email the upstream hides from every credential).
+ */
+export function useUpsertConnectorMemberOverride(connectorId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (body: { externalAccountId: string; userId: string }) => {
+      const { data, error } = await upsertConnectorMemberOverride({
+        path: { id: connectorId },
+        body,
+      });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (data) => {
+      if (!data) return;
+      queryClient.invalidateQueries({
+        queryKey: ["connectors", connectorId, "user-groups"],
+      });
+      toast.success("Member mapped — access applies on the next query");
+    },
+  });
+}
+
+/** Remove a manual member mapping; resolution falls back to the email match. */
+export function useDeleteConnectorMemberOverride(connectorId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (externalAccountId: string) => {
+      const { data, error } = await deleteConnectorMemberOverride({
+        path: { id: connectorId, externalAccountId },
+      });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (data) => {
+      if (!data) return;
+      queryClient.invalidateQueries({
+        queryKey: ["connectors", connectorId, "user-groups"],
+      });
+      toast.success("Member mapping removed");
     },
   });
 }
@@ -269,21 +668,47 @@ export function useConnectorRuns(params: {
   connectorId: string;
   limit?: number;
   offset?: number;
+  /** Scope to one job family: "content" (Sync Runs) or "permission" (Permission Sync Runs). */
+  runType?: "content" | "permission";
+  status?: NonNullable<
+    archestraApiTypes.GetConnectorRunsData["query"]
+  >["status"];
+  result?: NonNullable<
+    archestraApiTypes.GetConnectorRunsData["query"]
+  >["result"];
 }) {
   const queryClient = useQueryClient();
-  const { connectorId, limit = 10, offset = 0 } = params;
+  const {
+    connectorId,
+    limit = 10,
+    offset = 0,
+    runType,
+    status,
+    result,
+  } = params;
   return useQuery({
-    queryKey: ["connectors", connectorId, "runs", { limit, offset }],
+    queryKey: [
+      "connectors",
+      connectorId,
+      "runs",
+      { limit, offset, runType, status, result },
+    ],
     queryFn: async () => {
       const { data, error } = await getConnectorRuns({
         path: { id: connectorId },
-        query: { limit, offset },
+        query: {
+          limit,
+          offset,
+          ...(runType ? { runType } : {}),
+          ...(status ? { status } : {}),
+          ...(result ? { result } : {}),
+        },
       });
-      if (error) {
-        handleApiError(error);
-        return null;
-      }
-      return data;
+      // A deleted/missing connector 404s here; degrade to a null result rather
+      // than an error. Return null (not bare data) so react-query doesn't throw
+      // its own "data is undefined" when the 404 path skips the throw.
+      throwOnApiError(error, { allowNotFound: true });
+      return data ?? null;
     },
     enabled: !!connectorId,
     refetchInterval: (query) => {
@@ -293,8 +718,35 @@ export function useConnectorRuns(params: {
       const connector = queryClient.getQueryData<
         archestraApiTypes.GetConnectorResponses["200"]
       >(["connectors", connectorId]);
-      const connectorIsRunning = connector?.lastSyncStatus === "running";
-      return hasRunning || connectorIsRunning ? 3000 : false;
+      // A just-triggered sync flips the connector status (to "queued", then
+      // "running" once a worker claims it) before the run row exists — poll
+      // off the status AND the task-derived queued flags so the queued row
+      // and then the new run show up without a reload. Scope to the tab's
+      // run family.
+      const queued = query.state.data?.queued;
+      const contentRunning =
+        connector?.lastSyncStatus === "running" ||
+        connector?.lastSyncStatus === "queued" ||
+        !!queued?.content;
+      const permissionRunning =
+        connector?.lastPermissionSyncStatus === "running" ||
+        connector?.lastPermissionSyncStatus === "queued" ||
+        !!queued?.permission;
+      const connectorIsRunning =
+        runType === "permission"
+          ? permissionRunning
+          : runType === "content"
+            ? contentRunning
+            : contentRunning || permissionRunning;
+      if (hasRunning || connectorIsRunning) return 3000;
+      // Chained-run grace: a completed documents sync spawns a permission
+      // pass seconds LATER, after the poll that observed the terminal status
+      // — stopping immediately strands the new run until a manual reload.
+      return withinRunChainGrace(
+        ...(query.state.data?.data?.map((r) => r.completedAt) ?? []),
+      )
+        ? RUN_CHAIN_GRACE_POLL_MS
+        : false;
     },
   });
 }
@@ -311,11 +763,8 @@ export function useConnectorRun(params: {
       const { data, error } = await getConnectorRun({
         path: { id: connectorId, runId },
       });
-      if (error) {
-        handleApiError(error);
-        return null;
-      }
-      return data;
+      throwOnApiError(error, { allowNotFound: true });
+      return data ?? null;
     },
     enabled: !!connectorId && !!runId,
     refetchInterval: (query) => {
@@ -377,5 +826,48 @@ export function useUnassignConnectorFromKnowledgeBase() {
       queryClient.invalidateQueries({ queryKey: ["knowledge-bases"] });
       toast.success("Connector unassigned successfully");
     },
+  });
+}
+
+// === Internal helpers ===
+
+/**
+ * How long after a run finishes the run/connector queries keep a slow poll
+ * alive, so runs CHAINED onto a completion (a documents sync enqueues a
+ * permission pass; a reaped run enqueues its continuation) appear without a
+ * manual reload. Covers the task-queue dequeue latency with wide margin.
+ */
+const RUN_CHAIN_GRACE_MS = 60_000;
+const RUN_CHAIN_GRACE_POLL_MS = 5000;
+
+function withinRunChainGrace(
+  ...timestamps: (string | Date | null | undefined)[]
+): boolean {
+  const now = Date.now();
+  return timestamps.some((ts) => {
+    if (!ts) return false;
+    const time = new Date(ts).getTime();
+    return Number.isFinite(time) && now - time < RUN_CHAIN_GRACE_MS;
+  });
+}
+
+/**
+ * How the Archestra VAF Add On is distributed to this installation — probed
+ * once per connector form open (the server verifies each candidate against
+ * GitHub and caches). `packageDownloadUrl` null means no pre-built package
+ * exists and the install command compiles from source; the form then simply
+ * offers no download link. Errors resolve to null for the same graceful
+ * degradation — the link is a convenience, never a blocker.
+ */
+export function useMfilesVafAddOnDistribution() {
+  return useQuery({
+    queryKey: ["mfiles-vaf-add-on-distribution"],
+    queryFn: async () => {
+      const { data, error } = await getMfilesVafAddOnDistribution();
+      if (error || !data) return { packageDownloadUrl: null };
+      return data;
+    },
+    staleTime: 5 * 60 * 1000,
+    retry: false,
   });
 }

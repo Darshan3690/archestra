@@ -1,9 +1,16 @@
 "use client";
 
-import { ARCHESTRA_MCP_CATALOG_ID, parseFullToolName } from "@shared";
+import {
+  ARCHESTRA_MCP_CATALOG_ID,
+  extractMcpExecutedAs,
+  parseFullToolName,
+  TOOL_GET_REMEDY_PLANS_SHORT_NAME,
+  TOOL_LOAD_SKILL_SHORT_NAME,
+  TOOL_REQUEST_BATTERY_CREDENTIALS_SHORT_NAME,
+} from "@archestra/shared";
 import type { DynamicToolUIPart, ToolUIPart } from "ai";
-import { BotIcon, CheckCircleIcon, ClockIcon } from "lucide-react";
-import { useState } from "react";
+import { BotIcon, CheckCircleIcon, ClockIcon, WebhookIcon } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import {
   Tool,
   ToolContent,
@@ -12,6 +19,7 @@ import {
   ToolInput,
   ToolOutput,
 } from "@/components/ai-elements/tool";
+import { ExecutedAsBadge } from "@/components/executed-as-badge";
 import { McpCatalogIcon } from "@/components/mcp-catalog-icon";
 import {
   Tooltip,
@@ -19,48 +27,179 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { UnstyledButton } from "@/components/ui/unstyled-button";
+import { useSession } from "@/lib/auth/auth.query";
 import {
   getCompactToolState,
+  getHumanRulingDisplay,
+  getToolErrorText,
   getToolHeaderState,
+  withParsedArguments,
 } from "@/lib/chat/chat-tools-display.utils";
 import { useArchestraMcpIdentity } from "@/lib/mcp/archestra-mcp-server";
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/utils/tailwind";
+import { useApps } from "./apps-context";
+import {
+  BatteryCredentialsTool,
+  parseBatteryCredentialRequest,
+} from "./battery-credentials-tool";
+import {
+  type AppEntryRender,
+  getToolCardTitle,
+  resolveAppEntryRender,
+  resolveRunToolTargetName,
+} from "./chat-messages.utils";
+import { HookRunChip, type HookRunChipData } from "./hook-run-chip";
+import { McpAppEntryContent, McpAppEntryPill } from "./mcp-app-container";
+import { useMcpTaskFor } from "./mcp-task-context";
+import {
+  formatElapsed,
+  McpTaskStatusRow,
+  useElapsedSince,
+} from "./mcp-task-status";
+import {
+  getOpenAppaSaveResult,
+  isOpenAppaPolicyChange,
+  OpenAppaPolicyChange,
+  OpenAppaPolicyCompletion,
+  OpenAppaValidationCompletion,
+} from "./openappa-policy-change";
+import {
+  RemedyChainCard,
+  RemedyGuardrailsSteps,
+} from "./openappa-remedy-chain-card";
+import {
+  getRemedyChainStatus,
+  type RemedyChain,
+} from "./openappa-remedy-chains";
+import { withoutProxyTransportArguments } from "./proxy-transport-arguments";
+import { RuntimeCredentialSetupTool } from "./runtime-credential-setup-tool";
+import { getSkillPillDisplay, SkillPill } from "./skill-pill";
 import { ToolErrorLogsButton } from "./tool-error-logs-button";
+import type { ToolIconMap } from "./tool-icon-map";
 import { ToolStatusRow } from "./tool-status-row";
 
 type CompactToolEntry = {
+  kind: "tool";
   key: string;
   toolName: string;
   part: ToolUIPart | DynamicToolUIPart;
   toolResultPart: ToolUIPart | DynamicToolUIPart | null;
   errorText: string | undefined;
+  /** A delegation call's surfaced subagent tool calls, rendered between its
+   * Request and Result once the circle is expanded. */
+  nestedToolCalls?: React.ReactNode;
+  /** The whole guarded call this circle stands for. */
+  remedyChain?: RemedyChain;
+};
+
+type CompactAppEntry = {
+  /** An MCP-App-rendering call: app pill in the row, app content below it. */
+  kind: "app";
+  key: string;
+  toolName: string;
+  part: ToolUIPart | DynamicToolUIPart;
+  toolResultPart: ToolUIPart | DynamicToolUIPart | null;
+  errorText: string | undefined;
+  /** Never set for app entries; present so ExpandedToolCard can take either. */
+  nestedToolCalls?: React.ReactNode;
+  /** Set when the app call is the released attempt of a guarded call. */
+  remedyChain?: RemedyChain;
+};
+
+type CompactHookEntry = {
+  kind: "hook";
+  key: string;
+  data: HookRunChipData;
+};
+
+type CompactEntry = CompactToolEntry | CompactAppEntry | CompactHookEntry;
+
+/**
+ * Conversation-level context an app entry needs to mount its runtime. Absent
+ * (e.g. in subagent rows), app entries degrade to plain tool circles.
+ */
+type CompactAppContext = {
+  agentId?: string;
+  earlyToolUiStarts?: Record<
+    string,
+    {
+      uiResourceUri: string;
+      html?: string;
+      csp?: { connectDomains?: string[]; resourceDomains?: string[] };
+      permissions?: {
+        camera?: boolean;
+        microphone?: boolean;
+        geolocation?: boolean;
+        clipboardWrite?: boolean;
+      };
+      toolName?: string;
+    }
+  >;
+  onSendMessage?: (text: string) => void;
 };
 
 function CompactCircle({
   toolName,
+  toolCallId,
   state,
+  stateLabel,
   isExpanded,
   isExpandable = true,
   onClick,
   icon,
   catalogId,
+  title,
 }: {
   toolName: string;
-  state: "running" | "completed" | "error";
+  /** Replaces the tool's own name in the label. */
+  title?: string;
+  toolCallId?: string;
+  state: "running" | "completed" | "error" | "denied";
+  /** Displays specific status text, such as a user review decision. */
+  stateLabel?: string;
   isExpanded: boolean;
   isExpandable?: boolean;
   onClick: () => void;
   icon?: string | null;
   catalogId?: string;
 }) {
+  // A call that detached into a background task reads as running, but is worth
+  // distinguishing: it is no longer bounded by the usual wait, and it can be
+  // cancelled from the expanded card.
+  const { task } = useMcpTaskFor(toolCallId);
+  const isBackground = task?.status === "working" && state === "running";
+  // A cancelled task still reports a tool result, so the underlying state
+  // reads as completed. It wasn't — the user stopped it.
+  const isCancelled = task?.status === "cancelled";
+  const elapsed = useElapsedSince(task?.startedAt ?? 0, Boolean(isBackground));
+  const stateSuffix = isBackground
+    ? " (running in the background)"
+    : stateLabel
+      ? ` (${stateLabel.toLowerCase()})`
+      : state === "running"
+        ? " (running)"
+        : state === "error"
+          ? " (error)"
+          : state === "denied"
+            ? " (denied)"
+            : "";
+  const label =
+    title ??
+    getToolCardTitle(toolName) ??
+    parseFullToolName(toolName).toolName.replace(/_/g, " ");
+  const accessibleName = `${label}${stateSuffix}`;
+
   return (
     <TooltipProvider delayDuration={200}>
       <Tooltip>
         <TooltipTrigger asChild>
-          <button
+          <UnstyledButton
             type="button"
             onClick={onClick}
             disabled={!isExpandable}
+            aria-label={accessibleName}
+            aria-expanded={isExpandable ? isExpanded : undefined}
             className={cn(
               "relative inline-flex items-center justify-center size-8 rounded-full border transition-all",
               isExpandable &&
@@ -79,38 +218,177 @@ function CompactCircle({
             <span
               className={cn(
                 "absolute -bottom-0.5 -right-0.5 size-2.5 rounded-full border-2 border-background",
-                state === "completed" && "bg-green-500",
-                state === "running" && "bg-blue-500 animate-pulse",
+                isCancelled && "bg-muted-foreground",
+                !isCancelled && state === "completed" && "bg-green-500",
+                !isCancelled &&
+                  state === "running" &&
+                  (isBackground
+                    ? "bg-amber-500 animate-pulse"
+                    : "bg-blue-500 animate-pulse"),
                 state === "error" && "bg-destructive",
+                state === "denied" && "bg-orange-500",
               )}
             />
-          </button>
+          </UnstyledButton>
         </TooltipTrigger>
         <TooltipContent side="top" className="text-xs">
-          {parseFullToolName(toolName).toolName.replace(/_/g, " ")}
-          {state === "running"
-            ? " (running)"
-            : state === "error"
-              ? " (error)"
-              : ""}
+          <span>{label}</span>
+          {isCancelled ? (
+            <span>{" (cancelled)"}</span>
+          ) : isBackground ? (
+            <span>{` (running in the background · ${formatElapsed(elapsed)})`}</span>
+          ) : stateLabel ? (
+            <span>{` (${stateLabel.toLowerCase()})`}</span>
+          ) : state === "running" ? (
+            <span>{" (running)"}</span>
+          ) : state === "error" ? (
+            <span>{" (error)"}</span>
+          ) : state === "denied" ? (
+            <span>{" (denied)"}</span>
+          ) : null}
         </TooltipContent>
       </Tooltip>
     </TooltipProvider>
   );
 }
 
-export type ToolIconMap = Map<
-  string,
-  { icon?: string | null; catalogId?: string }
->;
+/**
+ * Quiet inline marker for `archestra__load_skill` activation calls (no path).
+ * External MCP qualifiers are collapsed to a human Skill name; the source is
+ * retained in the tooltip. File reads remain normal tool circles (#6184).
+ */
+function ToolCallSkillPill({
+  toolName,
+  skillName,
+  state,
+}: {
+  toolName: string;
+  skillName: string | null;
+  state: "running" | "completed" | "error" | "denied";
+}) {
+  const display = getSkillPillDisplay(skillName);
+  const tooltipLabel = (() => {
+    if (!display.name) return "Loading skill";
+    const target = display.source
+      ? `${display.name} from ${display.source}`
+      : display.name;
+    if (state === "running") return `Loading ${target}`;
+    if (state === "error") return `Failed to load ${target}`;
+    if (state === "denied") return `Access denied for ${target}`;
+    return target;
+  })();
+
+  const pill = (
+    <SkillPill
+      skillName={skillName}
+      data-tool-name={toolName}
+      role="status"
+      aria-label={tooltipLabel}
+      tabIndex={display.source ? 0 : undefined}
+      showNativeTitle={false}
+    >
+      {state === "running" || state === "error" ? (
+        <span
+          className={cn(
+            "absolute -bottom-0.5 -right-0.5 size-2.5 rounded-full border-2 border-background",
+            state === "running" && "bg-blue-500 animate-pulse",
+            state === "error" && "bg-destructive",
+          )}
+        />
+      ) : null}
+    </SkillPill>
+  );
+  // The pill already shows the name; a tooltip only helps when it says more.
+  if (tooltipLabel === display.name) return pill;
+  return (
+    <TooltipProvider delayDuration={200}>
+      <Tooltip>
+        <TooltipTrigger asChild>{pill}</TooltipTrigger>
+        <TooltipContent side="top" className="text-xs">
+          {tooltipLabel}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
+/**
+ * Compact circle for a hook run, visually matching CompactCircle: webhook icon
+ * in a bordered circle with an outcome dot (green proceeded, orange blocked,
+ * red error / timeout). Clicking expands the full HookRunChip card below the
+ * row, exactly like a tool circle expands its tool card.
+ */
+function HookCircle({
+  data,
+  isExpanded,
+  isExpandable = true,
+  onClick,
+}: {
+  data: HookRunChipData;
+  isExpanded: boolean;
+  isExpandable?: boolean;
+  onClick: () => void;
+}) {
+  const outcome = data.outcome ?? "";
+  const tooltip = [
+    data.hookEventName,
+    data.fileName,
+    outcome ? `(${outcome})` : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return (
+    <TooltipProvider delayDuration={200}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <UnstyledButton
+            type="button"
+            onClick={onClick}
+            disabled={!isExpandable}
+            className={cn(
+              "relative inline-flex items-center justify-center size-8 rounded-full border transition-all",
+              isExpandable &&
+                "hover:bg-accent hover:border-accent-foreground/20",
+              !isExpandable && "cursor-default",
+              isExpanded
+                ? "bg-accent border-accent-foreground/20 ring-2 ring-primary/20"
+                : "bg-background",
+            )}
+            aria-label="Show hook run details"
+            aria-expanded={isExpandable ? isExpanded : undefined}
+          >
+            <WebhookIcon className="size-3.5 text-muted-foreground" />
+            <span
+              className={cn(
+                "absolute -bottom-0.5 -right-0.5 size-2.5 rounded-full border-2 border-background",
+                outcome === "proceeded" && "bg-green-500",
+                outcome === "blocked" && "bg-orange-500",
+                (outcome === "error" || outcome === "timeout") &&
+                  "bg-destructive",
+              )}
+            />
+          </UnstyledButton>
+        </TooltipTrigger>
+        <TooltipContent side="top" className="text-xs">
+          {tooltip}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
 
 export function CompactToolGroup({
   tools,
   toolIconMap,
   canExpandToolCalls = true,
   onToolApprovalResponse,
+  appContext,
+  turnActive = false,
 }: {
-  tools: CompactToolEntry[];
+  tools: CompactEntry[];
+  /** The row's turn is still running, so guarded calls read as running. */
+  turnActive?: boolean;
   toolIconMap?: ToolIconMap;
   canExpandToolCalls?: boolean;
   onToolApprovalResponse?: (params: {
@@ -118,51 +396,424 @@ export function CompactToolGroup({
     approved: boolean;
     reason?: string;
   }) => void;
+  appContext?: CompactAppContext;
 }) {
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
-  const { isToolName } = useArchestraMcpIdentity();
+  const { isToolName, getToolShortName } = useArchestraMcpIdentity();
+  const { isAppOpen, toggleAppOpen, portalTarget } = useApps();
+  // A saved guardrails change opens its circle once, so its result shows
+  // without a click; a circle the user picked is left alone.
+  const userToggledRef = useRef(false);
+  const autoOpenedRef = useRef(new Set<string>());
+  const savedChangeKey = canExpandToolCalls
+    ? tools.findLast((entry) => {
+        if (entry.kind === "hook") return false;
+        const call = releasedCall(entry);
+        return (
+          call !== null &&
+          !call.errorText &&
+          !autoOpenedRef.current.has(entry.key) &&
+          getOpenAppaSaveResult({
+            shortName: getToolShortName(
+              resolveRunToolTargetName(call.part, call.toolName, {
+                getToolShortName,
+              }),
+            ),
+            output: call.toolResultPart?.output ?? call.part.output,
+          }) !== null
+        );
+      })?.key
+    : undefined;
+  useEffect(() => {
+    if (!savedChangeKey) return;
+    autoOpenedRef.current.add(savedChangeKey);
+    if (!userToggledRef.current) setExpandedKey(savedChangeKey);
+  }, [savedChangeKey]);
 
   const handleToggle = (key: string) => {
     if (!canExpandToolCalls) return;
+    userToggledRef.current = true;
+    // Expanding a tool card collapses any inline app open in this row — the
+    // mirror of an app pill collapsing an expanded tool card, so only one
+    // thing unfolds under the row at a time. Panel-hosted apps are untouched
+    // (nothing is expanded inline while the panel hosts).
+    if (expandedKey !== key && !portalTarget) {
+      for (const entry of tools) {
+        if (
+          entry.kind === "app" &&
+          entry.part.toolCallId &&
+          isAppOpen(entry.part.toolCallId)
+        ) {
+          toggleAppOpen(entry.part.toolCallId);
+        }
+      }
+    }
     setExpandedKey((prev) => (prev === key ? null : key));
   };
 
-  const expandedTool = tools.find((t) => t.key === expandedKey);
+  const expandedEntry = tools.find((t) => t.key === expandedKey);
+
+  // Resolve each app entry's render once: the pill needs the app identity, the
+  // content below the row needs the full mount props. A `null` render (e.g. a
+  // still-streaming scaffold/edit call) degrades to a plain tool circle.
+  const appRenders = new Map<string, AppEntryRender>();
+  if (appContext?.agentId) {
+    for (const entry of tools) {
+      if (entry.kind !== "app") continue;
+      const render = resolveAppEntryRender({
+        part: entry.part,
+        toolResultPart: entry.toolResultPart,
+        early: entry.part.toolCallId
+          ? appContext.earlyToolUiStarts?.[entry.part.toolCallId]
+          : undefined,
+        getToolShortName,
+      });
+      if (render) appRenders.set(entry.key, render);
+    }
+  }
+
+  const circleIconProps = (displayToolName: string) => {
+    const iconInfo = toolIconMap?.get(displayToolName);
+    return {
+      icon: iconInfo?.icon,
+      catalogId:
+        iconInfo?.catalogId ??
+        (isToolName(displayToolName) ? ARCHESTRA_MCP_CATALOG_ID : undefined),
+    };
+  };
 
   return (
-    <div className="mb-1">
+    <div className="mb-4">
       <div className="flex flex-wrap gap-1.5 items-center">
-        {tools.map((tool) => {
-          const iconInfo = toolIconMap?.get(tool.toolName);
+        {tools.map((entry) => {
+          if (entry.kind === "hook") {
+            return (
+              <HookCircle
+                key={entry.key}
+                data={entry.data}
+                isExpanded={expandedKey === entry.key}
+                isExpandable={canExpandToolCalls}
+                onClick={() => handleToggle(entry.key)}
+              />
+            );
+          }
+          // A guarded call reads as one call of its target tool; the
+          // Guardrails negotiation shows only once it is expanded.
+          if (
+            entry.remedyChain &&
+            !(entry.kind === "app" && appRenders.has(entry.key))
+          ) {
+            const status = getRemedyChainStatus(entry.remedyChain, {
+              turnActive,
+            });
+            return (
+              <CompactCircle
+                key={entry.key}
+                toolName={entry.remedyChain.targetToolName}
+                toolCallId={entry.remedyChain.finalAttempt?.part.toolCallId}
+                state={status.state}
+                stateLabel={status.label}
+                isExpanded={expandedKey === entry.key}
+                isExpandable={canExpandToolCalls}
+                onClick={() => handleToggle(entry.key)}
+                {...circleIconProps(entry.remedyChain.targetToolName)}
+              />
+            );
+          }
+          const state = getCompactToolState({
+            part: entry.part,
+            toolResultPart: entry.toolResultPart,
+          });
+          if (entry.kind === "app") {
+            const render = appRenders.get(entry.key);
+            if (!render) {
+              // No render to mount (still streaming, or no agent context):
+              // a regular circle that expands the tool details.
+              const displayToolName = resolveRunToolTargetName(
+                entry.part,
+                entry.toolName,
+                { getToolShortName },
+              );
+              const iconProps = circleIconProps(displayToolName);
+              return (
+                <CompactCircle
+                  key={entry.key}
+                  toolName={displayToolName}
+                  toolCallId={entry.part.toolCallId}
+                  state={state}
+                  isExpanded={expandedKey === entry.key}
+                  isExpandable={canExpandToolCalls}
+                  onClick={() => handleToggle(entry.key)}
+                  {...iconProps}
+                />
+              );
+            }
+            // The pill resolves its own icon from the app it names — this row
+            // deliberately passes none, because the app pill identifies the
+            // APP, not the serving MCP catalog.
+            return (
+              <McpAppEntryPill
+                key={entry.key}
+                appId={render.appId}
+                appName={render.appName}
+                toolName={render.mcpAppToolName}
+                toolCallId={entry.part.toolCallId}
+                state={state}
+                // Opening an app collapses an expanded tool-call card so only
+                // one thing unfolds under the row at a time.
+                onClick={() => setExpandedKey(null)}
+              />
+            );
+          }
+          if (getToolShortName(entry.toolName) === TOOL_LOAD_SKILL_SHORT_NAME) {
+            const input = (entry.part.input ?? {}) as {
+              name?: unknown;
+              path?: unknown;
+            };
+            // A `load_skill` call with a `path` reads a bundled file from an
+            // already-loaded skill — a sub-action, not a new skill trigger.
+            // Only activation calls (no path) get the "Skill:" pill; file reads
+            // fall through to the normal tool circle below (#6184).
+            const skillPath =
+              typeof input.path === "string" && input.path.length > 0
+                ? input.path
+                : null;
+            if (!skillPath) {
+              const skillName =
+                typeof input.name === "string" && input.name.length > 0
+                  ? input.name
+                  : null;
+              return (
+                <ToolCallSkillPill
+                  key={entry.key}
+                  toolName={entry.toolName}
+                  skillName={skillName}
+                  state={state}
+                />
+              );
+            }
+          }
+          // A run_tool dispatch belongs visually to its *target* tool: unwrap
+          // so the circle shows the underlying MCP server's icon (and tooltip
+          // name) instead of the generic Archestra built-in icon.
+          const displayToolName = resolveRunToolTargetName(
+            entry.part,
+            entry.toolName,
+            { getToolShortName },
+          );
+          const iconInfo = toolIconMap?.get(displayToolName);
           const fallbackCatalogId =
             iconInfo?.catalogId ??
-            (isToolName(tool.toolName) ? ARCHESTRA_MCP_CATALOG_ID : undefined);
+            (isToolName(displayToolName)
+              ? ARCHESTRA_MCP_CATALOG_ID
+              : undefined);
           return (
             <CompactCircle
-              key={tool.key}
-              toolName={tool.toolName}
-              state={getCompactToolState({
-                part: tool.part,
-                toolResultPart: tool.toolResultPart,
-              })}
-              isExpanded={expandedKey === tool.key}
+              key={entry.key}
+              toolName={displayToolName}
+              title={getToolCardTitle(
+                displayToolName,
+                getToolShortName(displayToolName),
+              )}
+              toolCallId={entry.part.toolCallId}
+              state={state}
+              stateLabel={
+                getHumanRulingDisplay({
+                  part: entry.part,
+                  toolResultPart: entry.toolResultPart,
+                })?.label
+              }
+              isExpanded={expandedKey === entry.key}
               isExpandable={canExpandToolCalls}
-              onClick={() => handleToggle(tool.key)}
+              onClick={() => handleToggle(entry.key)}
               icon={iconInfo?.icon}
               catalogId={fallbackCatalogId}
             />
           );
         })}
       </div>
-      {expandedTool && (
-        <div className="mt-2">
-          <ExpandedToolCard
-            tool={expandedTool}
-            onToolApprovalResponse={onToolApprovalResponse}
+      {tools.map((entry) => {
+        if (entry.kind === "hook") return null;
+        const call = releasedCall(entry);
+        if (!call || call.errorText) return null;
+        const name = resolveRunToolTargetName(call.part, call.toolName, {
+          getToolShortName,
+        });
+        if (
+          getToolShortName(name) !== "request_runtime_credential_setup" ||
+          (call.part.state !== "output-available" && !call.toolResultPart)
+        )
+          return null;
+        return (
+          <RuntimeCredentialSetupTool
+            key={entry.key}
+            ready
+            toolCallId={call.part.toolCallId}
+            onSendMessage={appContext?.onSendMessage}
           />
+        );
+      })}
+      {tools.map((entry) => {
+        if (entry.kind === "hook") return null;
+        const call = releasedCall(entry);
+        if (!call || call.errorText) return null;
+        const name = resolveRunToolTargetName(call.part, call.toolName, {
+          getToolShortName,
+        });
+        const request =
+          getToolShortName(name) === TOOL_REQUEST_BATTERY_CREDENTIALS_SHORT_NAME
+            ? parseBatteryCredentialRequest(
+                call.toolResultPart?.output ?? call.part.output,
+              )
+            : null;
+        if (!request) return null;
+        return (
+          <BatteryCredentialsTool
+            key={entry.key}
+            request={request}
+            toolCallId={call.part.toolCallId}
+            onSendMessage={appContext?.onSendMessage}
+          />
+        );
+      })}
+      {expandedEntry && (
+        <div className="mt-2">
+          {expandedEntry.kind === "hook" ? (
+            <HookRunChip data={expandedEntry.data} defaultOpen />
+          ) : (
+            <EntryToolCard
+              entry={expandedEntry}
+              turnActive={turnActive}
+              onToolApprovalResponse={onToolApprovalResponse}
+            />
+          )}
         </div>
       )}
+      {appContext?.agentId
+        ? tools.map((entry) => {
+            if (entry.kind !== "app") return null;
+            const render = appRenders.get(entry.key);
+            if (!render) return null;
+            const early = entry.part.toolCallId
+              ? appContext.earlyToolUiStarts?.[entry.part.toolCallId]
+              : undefined;
+            return (
+              <McpAppEntryContent
+                key={entry.key}
+                uiResourceUri={render.uiResourceUri}
+                appId={render.appId}
+                mcpServerId={render.mcpServerId}
+                appName={render.appName}
+                appVersion={render.appVersion}
+                agentId={appContext.agentId as string}
+                toolName={render.mcpAppToolName}
+                toolCallId={entry.part.toolCallId}
+                toolInput={render.toolInput}
+                rawOutput={render.rawOutput}
+                preloadedResource={
+                  early?.html
+                    ? {
+                        html: early.html,
+                        csp: early.csp,
+                        permissions: early.permissions,
+                      }
+                    : undefined
+                }
+                // Surfaced only when the app renders nothing to display, so the
+                // call stays inspectable instead of the section going blank.
+                toolDetails={
+                  <EntryToolCard
+                    entry={entry}
+                    turnActive={turnActive}
+                    onToolApprovalResponse={onToolApprovalResponse}
+                  />
+                }
+                onSendMessage={appContext.onSendMessage}
+              />
+            );
+          })
+        : null}
     </div>
+  );
+}
+
+/**
+ * The call a tool entry stands for: the entry itself, or for a guarded call
+ * its released attempt (null until the model released it).
+ */
+function releasedCall(
+  entry: CompactToolEntry | CompactAppEntry,
+): Pick<
+  CompactToolEntry,
+  "toolName" | "part" | "toolResultPart" | "errorText"
+> | null {
+  if (!entry.remedyChain) return entry;
+  const { finalAttempt } = entry.remedyChain;
+  if (!finalAttempt) return null;
+  return {
+    toolName: finalAttempt.toolName,
+    part: finalAttempt.part,
+    toolResultPart: finalAttempt.toolResultPart,
+    errorText: getToolErrorText(finalAttempt),
+  };
+}
+
+/**
+ * The expanded card for a tool entry. A released guarded call is its
+ * attempt's own card, with the Guardrails negotiation (and the attempt's
+ * subagent calls) between Request and Result; an unreleased one is the
+ * chain card.
+ */
+function EntryToolCard({
+  entry,
+  turnActive,
+  onToolApprovalResponse,
+}: {
+  entry: CompactToolEntry | CompactAppEntry;
+  turnActive: boolean;
+  onToolApprovalResponse?: (params: {
+    id: string;
+    approved: boolean;
+    reason?: string;
+  }) => void;
+}) {
+  const chain = entry.remedyChain;
+  const call = releasedCall(entry);
+  if (!chain) {
+    return (
+      <ExpandedToolCard
+        tool={entry}
+        onToolApprovalResponse={onToolApprovalResponse}
+      />
+    );
+  }
+  if (!call) {
+    return (
+      <RemedyChainCard
+        chain={chain}
+        turnActive={turnActive}
+        onToolApprovalResponse={onToolApprovalResponse}
+      />
+    );
+  }
+  return (
+    <ExpandedToolCard
+      tool={{
+        kind: "tool",
+        key: entry.key,
+        ...call,
+        nestedToolCalls: (
+          <>
+            <RemedyGuardrailsSteps
+              steps={chain.steps}
+              onToolApprovalResponse={onToolApprovalResponse}
+            />
+            {entry.nestedToolCalls}
+          </>
+        ),
+      }}
+      onToolApprovalResponse={onToolApprovalResponse}
+    />
   );
 }
 
@@ -170,43 +821,109 @@ function ExpandedToolCard({
   tool,
   onToolApprovalResponse,
 }: {
-  tool: CompactToolEntry;
+  tool: CompactToolEntry | CompactAppEntry;
   onToolApprovalResponse?: (params: {
     id: string;
     approved: boolean;
     reason?: string;
   }) => void;
 }) {
-  const { part, toolResultPart, toolName, errorText } = tool;
+  const { part, toolResultPart, toolName, errorText, nestedToolCalls } = tool;
+  const { data: session } = useSession();
+  const { getToolShortName } = useArchestraMcpIdentity();
+  const {
+    task,
+    cancel: cancelTask,
+    isCancelling: isCancellingTask,
+  } = useMcpTaskFor(part.toolCallId);
   const hasInput = part.input && Object.keys(part.input).length > 0;
+  const toolShortName = getToolShortName(toolName);
+  const policyOutput = toolResultPart?.output ?? part.output;
+  const resolvedPolicyToolName = resolveRunToolTargetName(part, toolName, {
+    getToolShortName,
+  });
+  const policyToolName = parseFullToolName(resolvedPolicyToolName).toolName;
+  const validationChange = [
+    "preview_guardrails_validation_change",
+    "update_guardrails_validation",
+  ].includes(getToolShortName(resolvedPolicyToolName) ?? "");
+  // A save reports its result in one line, not the diff it saved.
+  const saveResult = errorText
+    ? null
+    : getOpenAppaSaveResult({
+        shortName: getToolShortName(resolvedPolicyToolName),
+        output: policyOutput,
+      });
+  const policyChange =
+    !saveResult &&
+    (validationChange ||
+      ["preview_guardrails_policy_change", "update_guardrails_policy"].includes(
+        policyToolName,
+      )) &&
+    !errorText &&
+    isOpenAppaPolicyChange(policyOutput, validationChange);
+  const input = withoutProxyTransportArguments({
+    toolName,
+    shortName: toolShortName,
+    input:
+      toolShortName === TOOL_GET_REMEDY_PLANS_SHORT_NAME
+        ? withParsedArguments(part.input)
+        : part.input,
+  });
   const isApprovalRequested = part.state === "approval-requested";
-  const hasContent = Boolean(
-    hasInput ||
-      errorText ||
-      isApprovalRequested ||
-      (toolResultPart && Boolean(toolResultPart.output)) ||
-      (!toolResultPart && Boolean(part.output)),
+  // Whose credential the gateway used against the upstream server.
+  const executedAs = extractMcpExecutedAs(
+    toolResultPart ? toolResultPart.output : part.output,
   );
 
   const logsButton = errorText ? (
     <ToolErrorLogsButton toolName={toolName} />
   ) : null;
-  const headerState = getToolHeaderState({
-    state: part.state || "input-available",
-    toolResultPart,
-    errorText,
-  });
+  const humanRuling = getHumanRulingDisplay({ part, toolResultPart });
+  const headerState =
+    task?.status === "cancelled"
+      ? ("output-cancelled" as const)
+      : humanRuling?.ruling === "deny"
+        ? ("output-denied" as const)
+        : getToolHeaderState({
+            state: part.state || "input-available",
+            toolResultPart,
+            errorText,
+          });
 
   return (
-    <Tool defaultOpen={true}>
+    <Tool open>
       <ToolHeader
         type={`tool-${toolName}`}
+        title={getToolCardTitle(toolName, toolShortName)}
         state={headerState}
-        isCollapsible={hasContent}
+        statusLabel={humanRuling?.label}
+        isCollapsible={false}
         actionButton={logsButton}
+        identityBadge={
+          executedAs ? (
+            <span className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+              Called as
+              <ExecutedAsBadge
+                executedAs={executedAs}
+                meUserId={session?.user?.id}
+              />
+            </span>
+          ) : undefined
+        }
       />
       <ToolContent>
-        {hasInput ? <ToolInput input={part.input} /> : null}
+        {task ? (
+          <McpTaskStatusRow
+            task={task}
+            onCancel={cancelTask}
+            isCancelling={isCancellingTask}
+          />
+        ) : null}
+        {hasInput && !policyChange && !saveResult ? (
+          <ToolInput input={input} defaultOpen />
+        ) : null}
+        {nestedToolCalls}
         {isApprovalRequested &&
           onToolApprovalResponse &&
           "approval" in part &&
@@ -242,20 +959,34 @@ function ExpandedToolCard({
             />
           )}
         {errorText ? <ToolErrorDetails errorText={errorText} /> : null}
-        {toolResultPart && (
+        {policyChange && (
+          <OpenAppaPolicyChange
+            output={policyOutput}
+            validationChange={validationChange}
+          />
+        )}
+        {saveResult === "validation" ? (
+          <OpenAppaValidationCompletion output={policyOutput} />
+        ) : saveResult === "policy" ? (
+          <OpenAppaPolicyCompletion output={policyOutput} />
+        ) : null}
+        {toolResultPart && !policyChange && !saveResult && (
           <ToolOutput
             label={errorText ? "Error" : "Result"}
             output={toolResultPart.output}
             errorText={errorText}
           />
         )}
-        {!toolResultPart && Boolean(part.output) && (
-          <ToolOutput
-            label={errorText ? "Error" : "Result"}
-            output={part.output}
-            errorText={errorText}
-          />
-        )}
+        {!toolResultPart &&
+          !policyChange &&
+          !saveResult &&
+          Boolean(part.output) && (
+            <ToolOutput
+              label={errorText ? "Error" : "Result"}
+              output={part.output}
+              errorText={errorText}
+            />
+          )}
       </ToolContent>
     </Tool>
   );

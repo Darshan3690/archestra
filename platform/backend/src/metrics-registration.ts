@@ -1,0 +1,98 @@
+import metricsPlugin from "fastify-metrics";
+import config from "@/config";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { collectOpenappaEngineMetrics } from "@/observability/metrics/openappa";
+import { HEALTH_PATH, READY_PATH } from "@/routes/route-paths";
+
+const { observability } = config;
+
+/**
+ * Register the metrics plugin on a Fastify instance. Default and route metrics
+ * must only be registered once across the main and dedicated listeners.
+ */
+export const registerMetricsPlugin = async (
+  fastify: FastifyInstanceWithZod,
+  endpointEnabled: boolean,
+): Promise<void> => {
+  const metricsEnabled = !endpointEnabled;
+
+  await fastify.register(metricsPlugin, {
+    endpoint: endpointEnabled ? observability.metrics.endpoint : null,
+    defaultMetrics: { enabled: metricsEnabled },
+    routeMetrics: {
+      enabled: metricsEnabled,
+      methodBlacklist: ["OPTIONS", "HEAD"],
+      routeBlacklist: [HEALTH_PATH, READY_PATH],
+    },
+  });
+};
+
+export const registerStandaloneMetricsEndpoint = async (params: {
+  fastify: FastifyInstanceWithZod;
+  enableDefaultMetrics: boolean;
+}): Promise<void> => {
+  const { fastify, enableDefaultMetrics } = params;
+  addMetricsAuthenticationHook(fastify);
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  fastify.addHook("onSend", async (request, reply, payload) => {
+    if (
+      request.url.split("?", 1)[0] !== observability.metrics.endpoint ||
+      reply.statusCode !== 200 ||
+      typeof payload !== "string"
+    ) {
+      return payload;
+    }
+    const engine = collectOpenappaEngineMetrics();
+    if (!engine) return payload;
+    // Preserve the OpenMetrics end marker if the registry enables that format.
+    const hasEndMarker = /# EOF\s*$/.test(payload);
+    // OpenMetrics counter metadata uses the base name; samples retain _total.
+    const engineText = hasEndMarker
+      ? engine.replace(/^# (HELP|TYPE) (appa_[a-z_]+)_total(?= )/gm, "# $1 $2")
+      : engine;
+    return `${payload.replace(/# EOF\s*$/, "").trimEnd()}\n${engineText.trimEnd()}\n${hasEndMarker ? "# EOF\n" : ""}`;
+  });
+
+  // SPDX-SnippetEnd
+
+  await fastify.register(metricsPlugin, {
+    endpoint: observability.metrics.endpoint,
+    defaultMetrics: { enabled: enableDefaultMetrics },
+    routeMetrics: { enabled: false },
+  });
+};
+
+export const addMetricsAuthenticationHook = (
+  fastify: FastifyInstanceWithZod,
+): void => {
+  const { secret: metricsSecret } = observability.metrics;
+
+  if (!metricsSecret) {
+    return;
+  }
+
+  const metricsPath = observability.metrics.endpoint;
+
+  fastify.addHook("preHandler", async (request, reply) => {
+    if (
+      request.url !== metricsPath &&
+      !request.url.startsWith(`${metricsPath}?`)
+    ) {
+      return;
+    }
+
+    const authHeader = request.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      reply.code(401).send({ error: "Unauthorized: Bearer token required" });
+      return;
+    }
+
+    const token = authHeader.slice(7);
+    if (token !== metricsSecret) {
+      reply.code(401).send({ error: "Unauthorized: Invalid token" });
+      return;
+    }
+  });
+};

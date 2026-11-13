@@ -14,14 +14,22 @@ import {
   PopoverAnchor,
   PopoverContent,
 } from "@/components/ui/popover";
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/utils/tailwind";
 
 export interface MultiSelectOption {
   value: string;
   label: string;
+  /** Optional leading icon (provider/client logo, …). */
+  icon?: React.ReactNode;
+  /** Secondary line under the label, for options that need explaining. */
+  description?: React.ReactNode;
+  /** Offered but not selectable — say why in `description`. */
+  disabled?: boolean;
 }
 
 interface MultiSelectComboboxProps {
+  id?: string;
+  ariaLabel?: string;
   options: MultiSelectOption[];
   value: string[];
   onChange: (value: string[]) => void;
@@ -32,6 +40,8 @@ interface MultiSelectComboboxProps {
 }
 
 export function MultiSelectCombobox({
+  id,
+  ariaLabel,
   options,
   value,
   onChange,
@@ -44,6 +54,23 @@ export function MultiSelectCombobox({
   const [search, setSearch] = React.useState("");
   const inputRef = React.useRef<HTMLInputElement>(null);
   const containerRef = React.useRef<HTMLDivElement>(null);
+  const contentRef = React.useRef<HTMLDivElement>(null);
+  const listRef = React.useRef<HTMLDivElement>(null);
+
+  // The search input lives in the popover anchor, outside the Command, so
+  // CommandList's own show-from-the-top-on-query-change reset never fires
+  // here (cmdk's search state stays empty). Same rule, applied by hand: a
+  // new query must not keep the old scroll offset.
+  const lastSearch = React.useRef(search);
+  React.useEffect(() => {
+    if (lastSearch.current === search) {
+      return;
+    }
+    lastSearch.current = search;
+    if (listRef.current) {
+      listRef.current.scrollTop = 0;
+    }
+  }, [search]);
 
   const selectedOptions = options.filter((opt) => value.includes(opt.value));
 
@@ -72,12 +99,16 @@ export function MultiSelectCombobox({
     }
   };
 
-  // Close popover when clicking outside
+  // Close popover when clicking outside. The dropdown content is portaled, so
+  // it lives outside containerRef — exclude it too, otherwise selecting an
+  // option counts as an outside click and closes the menu mid-multi-select.
   React.useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as Node;
       if (
         containerRef.current &&
-        !containerRef.current.contains(e.target as Node)
+        !containerRef.current.contains(target) &&
+        !contentRef.current?.contains(target)
       ) {
         setOpen(false);
       }
@@ -95,7 +126,9 @@ export function MultiSelectCombobox({
       <PopoverAnchor asChild>
         <div
           ref={containerRef}
+          id={id}
           role="combobox"
+          aria-label={ariaLabel}
           aria-expanded={open}
           aria-disabled={disabled}
           tabIndex={disabled ? undefined : -1}
@@ -120,11 +153,18 @@ export function MultiSelectCombobox({
           {selectedOptions.map((option) => (
             <span
               key={option.value}
-              className="inline-flex items-center gap-1 rounded-md border bg-muted px-2 py-0.5 text-sm"
+              className="inline-flex items-center gap-1.5 rounded-md border bg-muted px-2 py-0.5 text-sm"
             >
+              {option.icon && (
+                <span className="flex shrink-0 items-center">
+                  {option.icon}
+                </span>
+              )}
               {option.label}
               <button
                 type="button"
+                aria-label="Remove selected option"
+                disabled={disabled}
                 onClick={(e) => handleRemove(option.value, e)}
                 className="hover:bg-muted-foreground/20 rounded-sm"
               >
@@ -134,6 +174,7 @@ export function MultiSelectCombobox({
           ))}
           <input
             ref={inputRef}
+            aria-label="Search options"
             value={search}
             disabled={disabled}
             onChange={(e) => {
@@ -148,13 +189,15 @@ export function MultiSelectCombobox({
         </div>
       </PopoverAnchor>
       <PopoverContent
-        className="w-[--radix-popover-trigger-width] p-0"
+        ref={contentRef}
+        className="p-0"
+        style={{ width: "var(--radix-popper-anchor-width)" }}
         align="start"
         onOpenAutoFocus={(e) => e.preventDefault()}
         onInteractOutside={(e) => e.preventDefault()}
       >
         <Command shouldFilter={false}>
-          <CommandList>
+          <CommandList ref={listRef}>
             <CommandEmpty>{emptyMessage}</CommandEmpty>
             <CommandGroup>
               {options
@@ -167,11 +210,29 @@ export function MultiSelectCombobox({
                     <CommandItem
                       key={option.value}
                       value={option.value}
-                      onSelect={() => handleSelect(option.value)}
+                      disabled={option.disabled}
+                      onSelect={() => {
+                        if (option.disabled) return;
+                        handleSelect(option.value);
+                      }}
                       onMouseDown={(e) => e.preventDefault()}
-                      className="justify-between"
+                      className="justify-between gap-2"
                     >
-                      {option.label}
+                      <span className="flex min-w-0 items-center gap-2">
+                        {option.icon && (
+                          <span className="flex shrink-0 items-center">
+                            {option.icon}
+                          </span>
+                        )}
+                        <span className="block min-w-0">
+                          <span className="block truncate">{option.label}</span>
+                          {option.description && (
+                            <span className="block whitespace-normal break-words text-xs text-muted-foreground">
+                              {option.description}
+                            </span>
+                          )}
+                        </span>
+                      </span>
                       <Check
                         className={cn(
                           "h-4 w-4",

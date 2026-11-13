@@ -3,10 +3,11 @@
   "include": [
     "*.ts",
     "tests/**/*.ts",
-    "utils/**/*.ts"
+    "utils/**/*.ts",
+    "utils/**/*.mts"
   ],
-  "exclude": ["test-mcp-servers/**/*"],
   "compilerOptions": {
+    "target": "ES2022",
     "types": ["node"]
   }
 }

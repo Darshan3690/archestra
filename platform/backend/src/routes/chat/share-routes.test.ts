@@ -1,12 +1,20 @@
+import {
+  BUILT_IN_AGENT_IDS,
+  type ResourcePermissionGrant,
+} from "@archestra/shared";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
 import ConversationModel from "@/models/conversation";
-import ConversationShareModel from "@/models/conversation-share";
 import MessageModel from "@/models/message";
-import type { FastifyInstanceWithZod } from "@/server";
-import { createFastifyInstance } from "@/server";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import { projectService } from "@/services/project";
+import { ResourcePermissions } from "@/services/resource-permissions";
 import { afterEach, beforeEach, describe, expect, test } from "@/test";
 import type { User } from "@/types";
 
-describe("chat share routes", () => {
+// A chat is shared through its permission policy. These pin what a recipient
+// can do with one: read it, and fork it into a chat of their own.
+describe("shared chats", () => {
   let app: FastifyInstanceWithZod;
   let currentUser: User;
   let organizationId: string;
@@ -32,78 +40,71 @@ describe("chat share routes", () => {
     await app.close();
   });
 
-  test("shares a conversation with selected teams", async ({
-    makeAgent,
-    makeMember,
-    makeTeam,
-  }) => {
-    await makeMember(currentUser.id, organizationId);
-    const agent = await makeAgent({
+  async function grant(params: {
+    resource: "conversation" | "project";
+    scope: string;
+    grants: ResourcePermissionGrant[];
+  }) {
+    const key = {
       organizationId,
-      teams: [],
+      resource: params.resource,
+      scope: params.scope,
+    };
+    const policy = await ResourcePermissionPolicyModel.find(key);
+    await ResourcePermissionPolicyModel.replace({
+      ...key,
+      revision: policy?.revision ?? 0,
+      grants: [...(policy?.grants ?? []), ...params.grants],
     });
-    const team = await makeTeam(organizationId, currentUser.id, {
-      name: "Engineering",
-    });
-    const conversation = await ConversationModel.create({
-      userId: currentUser.id,
-      organizationId,
-      agentId: agent.id,
-      selectedModel: "gpt-4o",
-    });
+  }
 
-    const response = await app.inject({
-      method: "POST",
-      url: `/api/chat/conversations/${conversation.id}/share`,
-      payload: {
-        visibility: "team",
-        teamIds: [team.id],
-      },
-    });
+  const everyone: ResourcePermissionGrant = {
+    subject: { type: "organization", id: "*" },
+    actions: ["read"],
+  };
 
-    expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({
-      conversationId: conversation.id,
-      visibility: "team",
-      teamIds: [team.id],
-      userIds: [],
-    });
-  });
-
-  test("rejects users outside the organization", async ({
+  test("shares a policy assistant chat through the normal permission policy", async ({
     makeAgent,
     makeMember,
     makeUser,
   }) => {
     await makeMember(currentUser.id, organizationId);
-    const outsider = await makeUser();
+    const reader = await makeUser();
+    await makeMember(reader.id, organizationId);
     const agent = await makeAgent({
       organizationId,
-      teams: [],
+      name: "Policy assistant",
+      agentType: "agent",
+      builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG },
+      systemPrompt: "Help configure OpenAPPA policy.",
     });
     const conversation = await ConversationModel.create({
       userId: currentUser.id,
       organizationId,
       agentId: agent.id,
-      selectedModel: "gpt-4o",
     });
-
+    const key = {
+      userId: currentUser.id,
+      organizationId,
+      resource: "conversation" as const,
+      scope: conversation.id,
+    };
+    const policy = await ResourcePermissionPolicyModel.find(key);
+    await ResourcePermissions.updatePolicy({
+      ...key,
+      revision: policy?.revision ?? 0,
+      grants: [...(policy?.grants ?? []), everyone],
+    });
+    currentUser = reader;
     const response = await app.inject({
-      method: "POST",
-      url: `/api/chat/conversations/${conversation.id}/share`,
-      payload: {
-        visibility: "user",
-        userIds: [outsider.id],
-      },
+      method: "GET",
+      url: `/api/chat/conversations/${conversation.id}`,
     });
-
-    expect(response.statusCode).toBe(400);
-    expect(response.json().error.message).toBe(
-      "One or more selected users are invalid",
-    );
+    expect(response.statusCode).toBe(200);
+    expect(response.json().share).toEqual({ visibility: "organization" });
   });
 
-  test("blocks users who are outside the share scope", async ({
+  test("a chat shared with named people stays hidden from everyone else", async ({
     makeAgent,
     makeMember,
     makeUser,
@@ -111,40 +112,38 @@ describe("chat share routes", () => {
     const owner = currentUser;
     const invitedUser = await makeUser();
     const outsider = await makeUser();
-
     await makeMember(owner.id, organizationId);
     await makeMember(invitedUser.id, organizationId);
     await makeMember(outsider.id, organizationId);
 
-    const agent = await makeAgent({
-      organizationId,
-      teams: [],
-    });
+    const agent = await makeAgent({ organizationId });
     const conversation = await ConversationModel.create({
       userId: owner.id,
       organizationId,
       agentId: agent.id,
-      selectedModel: "gpt-4o",
     });
-
-    const share = await ConversationShareModel.upsert({
-      conversationId: conversation.id,
-      organizationId,
-      createdByUserId: owner.id,
-      visibility: "user",
-      teamIds: [],
-      userIds: [invitedUser.id],
+    await grant({
+      resource: "conversation",
+      scope: conversation.id,
+      grants: [
+        { subject: { type: "user", id: invitedUser.id }, actions: ["read"] },
+      ],
     });
 
     currentUser = outsider;
-
-    const response = await app.inject({
+    const hidden = await app.inject({
       method: "GET",
-      url: `/api/chat/shared/${share.id}`,
+      url: `/api/chat/conversations/${conversation.id}`,
     });
+    expect(hidden.statusCode).toBe(404);
 
-    expect(response.statusCode).toBe(404);
-    expect(response.json().error.message).toBe("Shared conversation not found");
+    currentUser = invitedUser;
+    const shown = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+    expect(shown.statusCode).toBe(200);
+    expect(shown.json().share).toEqual({ visibility: "user" });
   });
 
   test("forks a shared conversation with the original accessible agent", async ({
@@ -154,19 +153,14 @@ describe("chat share routes", () => {
   }) => {
     const owner = currentUser;
     const viewer = await makeUser();
-
     await makeMember(owner.id, organizationId);
     await makeMember(viewer.id, organizationId);
 
-    const sharedAgent = await makeAgent({
-      organizationId,
-      teams: [],
-    });
+    const sharedAgent = await makeAgent({ organizationId });
     const conversation = await ConversationModel.create({
       userId: owner.id,
       organizationId,
       agentId: sharedAgent.id,
-      selectedModel: "gpt-4o",
     });
     await MessageModel.create({
       conversationId: conversation.id,
@@ -177,29 +171,22 @@ describe("chat share routes", () => {
         parts: [{ type: "text", text: "Shared conversation result" }],
       },
     });
-    const share = await ConversationShareModel.upsert({
-      conversationId: conversation.id,
-      organizationId,
-      createdByUserId: owner.id,
-      visibility: "organization",
-      teamIds: [],
-      userIds: [],
+    await grant({
+      resource: "conversation",
+      scope: conversation.id,
+      grants: [everyone],
     });
 
     currentUser = viewer;
-
     const response = await app.inject({
       method: "POST",
-      url: `/api/chat/shared/${share.id}/fork`,
-      payload: {
-        agentId: sharedAgent.id,
-      },
+      url: `/api/chat/conversations/${conversation.id}/fork`,
+      payload: { agentId: sharedAgent.id },
     });
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
       agentId: sharedAgent.id,
-      selectedModel: "gpt-4o",
       userId: viewer.id,
       messages: [
         expect.objectContaining({
@@ -210,6 +197,97 @@ describe("chat share routes", () => {
     });
   });
 
+  test("keeps the project link when forking a shared conversation in a project the forker can access", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    const owner = currentUser;
+    const viewer = await makeUser();
+    await makeMember(owner.id, organizationId);
+    await makeMember(viewer.id, organizationId);
+
+    const sharedAgent = await makeAgent({ organizationId });
+    const project = await projectService.create({
+      organizationId,
+      userId: owner.id,
+      name: "shared-project",
+      description: null,
+    });
+    // Share the project org-wide so the viewer can access it (and so a chat
+    // started from the shared chat belongs in the project).
+    await grant({
+      resource: "project",
+      scope: project.id,
+      grants: [{ ...everyone, actions: ["read", "use"] }],
+    });
+
+    const conversation = await ConversationModel.create({
+      userId: owner.id,
+      organizationId,
+      agentId: sharedAgent.id,
+      projectId: project.id,
+    });
+    await grant({
+      resource: "conversation",
+      scope: conversation.id,
+      grants: [everyone],
+    });
+
+    currentUser = viewer;
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${conversation.id}/fork`,
+      payload: { agentId: sharedAgent.id },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().projectId).toBe(project.id);
+  });
+
+  test("drops the project link when the forker cannot access the source's project", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    const owner = currentUser;
+    const viewer = await makeUser();
+    await makeMember(owner.id, organizationId);
+    await makeMember(viewer.id, organizationId);
+
+    const sharedAgent = await makeAgent({ organizationId });
+    // Owner-only project: the conversation is shared, but the project is not,
+    // so the fork must not attach to a project the viewer cannot see (which
+    // would be invisible and unmanageable to them).
+    const project = await projectService.create({
+      organizationId,
+      userId: owner.id,
+      name: "private-project",
+      description: null,
+    });
+    const conversation = await ConversationModel.create({
+      userId: owner.id,
+      organizationId,
+      agentId: sharedAgent.id,
+      projectId: project.id,
+    });
+    await grant({
+      resource: "conversation",
+      scope: conversation.id,
+      grants: [everyone],
+    });
+
+    currentUser = viewer;
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${conversation.id}/fork`,
+      payload: { agentId: sharedAgent.id },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().projectId).toBeNull();
+  });
+
   test("does not fork a shared conversation with an inaccessible agent", async ({
     makeAgent,
     makeMember,
@@ -218,45 +296,33 @@ describe("chat share routes", () => {
   }) => {
     const owner = currentUser;
     const viewer = await makeUser();
-
     await makeMember(owner.id, organizationId);
     await makeMember(viewer.id, organizationId);
 
     const ownerOnlyTeam = await makeTeam(organizationId, owner.id, {
       name: "Owner Only",
     });
-    const sharedAgent = await makeAgent({
-      organizationId,
-      teams: [],
-    });
+    const sharedAgent = await makeAgent({ organizationId });
     const restrictedAgent = await makeAgent({
       organizationId,
-      scope: "team",
-      teams: [ownerOnlyTeam.id],
+      access: { teams: [ownerOnlyTeam.id] },
     });
     const conversation = await ConversationModel.create({
       userId: owner.id,
       organizationId,
       agentId: sharedAgent.id,
-      selectedModel: "gpt-4o",
     });
-    const share = await ConversationShareModel.upsert({
-      conversationId: conversation.id,
-      organizationId,
-      createdByUserId: owner.id,
-      visibility: "organization",
-      teamIds: [],
-      userIds: [],
+    await grant({
+      resource: "conversation",
+      scope: conversation.id,
+      grants: [everyone],
     });
 
     currentUser = viewer;
-
     const response = await app.inject({
       method: "POST",
-      url: `/api/chat/shared/${share.id}/fork`,
-      payload: {
-        agentId: restrictedAgent.id,
-      },
+      url: `/api/chat/conversations/${conversation.id}/fork`,
+      payload: { agentId: restrictedAgent.id },
     });
 
     expect(response.statusCode).toBe(404);

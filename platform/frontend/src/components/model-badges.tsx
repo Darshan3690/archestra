@@ -1,5 +1,80 @@
-import { Fingerprint, Star, Zap } from "lucide-react";
+import {
+  Clock,
+  Fingerprint,
+  Github,
+  Layers,
+  Sparkles,
+  Star,
+  User,
+} from "lucide-react";
 import { InlineTag } from "@/components/ui/inline-tag";
+
+/**
+ * Marks a model from a per-user provider (e.g. GitHub Copilot): the same model
+ * is available to everyone, but each member runs it on their own connected
+ * account, so there's no single shared key behind it.
+ */
+export function PerUserModelBadge() {
+  return (
+    <InlineTag icon={<User />} className="text-muted-foreground bg-muted">
+      per-user
+    </InlineTag>
+  );
+}
+
+/**
+ * Shown on a per-user provider model (e.g. GitHub Copilot) the viewer hasn't
+ * connected yet: the model is selectable, but using it prompts them to link
+ * their own account first.
+ */
+export function ConnectAccountBadge() {
+  return (
+    <InlineTag
+      icon={<Github />}
+      className="text-amber-700 dark:text-amber-400 bg-amber-100 dark:bg-amber-950"
+    >
+      connect your account
+    </InlineTag>
+  );
+}
+
+export function FreeModelBadge() {
+  return (
+    <InlineTag
+      icon={<Sparkles />}
+      className="text-green-700 dark:text-green-400 bg-green-100 dark:bg-green-950"
+    >
+      free
+    </InlineTag>
+  );
+}
+
+/** Marks a model a model pool serves, so requests for it fail over. */
+export function PooledModelBadge() {
+  return (
+    <InlineTag icon={<Layers />} className="text-muted-foreground bg-muted">
+      pooled
+    </InlineTag>
+  );
+}
+
+export function LatestModelBadge() {
+  return (
+    <InlineTag className="text-muted-foreground bg-muted">latest</InlineTag>
+  );
+}
+
+/**
+ * Marks an older-generation model that is still selectable but superseded by a
+ * newer generation from the same provider.
+ */
+export function OldModelBadge() {
+  return (
+    <InlineTag icon={<Clock />} className="text-muted-foreground bg-muted">
+      old
+    </InlineTag>
+  );
+}
 
 export function UnknownCapabilitiesBadge() {
   return (
@@ -9,13 +84,34 @@ export function UnknownCapabilitiesBadge() {
   );
 }
 
-export function FastestModelBadge() {
+/**
+ * Marks a model recorded as not supporting tool calling (an explicit false,
+ * not merely unknown): agents' tools never fire on it, which the picker
+ * should say up front rather than leaving the row unmarked. Worded as the
+ * negation of the capability icon's "Supports tool calling" tooltip.
+ */
+export function NoToolsBadge() {
   return (
-    <InlineTag
-      icon={<Zap />}
-      className="text-amber-700 dark:text-amber-400 bg-amber-100 dark:bg-amber-950"
-    >
-      fastest
+    <InlineTag className="text-muted-foreground bg-muted">
+      Tool calling not supported
+    </InlineTag>
+  );
+}
+
+/**
+ * Marks a model the sync judged a poor fit for agent work. Phrased as advice
+ * rather than a verdict on the model: the only evidence today is parameter
+ * count, which is a weak predictor of agentic skill, so the copy stops short of
+ * calling the model bad. Muted rather than amber for the same reason — this is
+ * a suggestion to pick something else, not an error.
+ *
+ * There is deliberately no positive counterpart: `recommendedForAgents` is
+ * `true` by default, so it cannot distinguish "known good" from "no evidence".
+ */
+export function NotRecommendedForAgentsBadge() {
+  return (
+    <InlineTag className="text-muted-foreground bg-muted">
+      Limited for complex tasks
     </InlineTag>
   );
 }

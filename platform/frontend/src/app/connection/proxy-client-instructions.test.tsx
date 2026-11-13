@@ -1,0 +1,277 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { useSearchParams } from "next/navigation";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useHasPermissions } from "@/lib/auth/auth.query";
+import { useAppName } from "@/lib/hooks/use-app-name";
+import { useOrganization } from "@/lib/organization.query";
+import { CONNECT_CLIENTS } from "./clients";
+import { ProxyClientInstructions } from "./proxy-client-instructions";
+
+const { provisionMock, passthroughProvisionMock, availableKeysMock } =
+  vi.hoisted(() => ({
+    provisionMock: vi.fn(),
+    passthroughProvisionMock: vi.fn(),
+    availableKeysMock: vi.fn(),
+  }));
+
+vi.mock("@/lib/connection-setup.query", () => ({
+  useCreateConnectionVirtualKey: () => ({
+    mutateAsync: provisionMock,
+    isPending: false,
+  }),
+  useCreateConnectionPassthroughKey: () => ({
+    mutateAsync: passthroughProvisionMock,
+    isPending: false,
+  }),
+}));
+
+vi.mock("@/lib/auth/auth.query");
+
+vi.mock("@/lib/llm-provider-api-keys.query", () => ({
+  useAvailableLlmProviderApiKeys: () => availableKeysMock(),
+}));
+
+vi.mock("@/components/create-llm-provider-api-key-dialog", () => ({
+  CreateLlmProviderApiKeyDialog: ({ open }: { open: boolean }) =>
+    open ? <div data-testid="add-provider-key-dialog" /> : null,
+}));
+
+// The component reads the selected provider from the URL and writes selections
+// back; initialize matching history for the selection assertions.
+vi.mock("next/navigation");
+// The panel brands its copy with the deployment's app name, which otherwise
+// reaches for the appearance-settings query and needs a QueryClientProvider.
+vi.mock("@/lib/hooks/use-app-name");
+
+beforeEach(() => {
+  Element.prototype.scrollIntoView = vi.fn();
+  window.history.replaceState(
+    null,
+    "",
+    "/connection?clientId=generic&providerId=anthropic",
+  );
+  vi.mocked(useAppName).mockReturnValue("Archestra");
+  vi.mocked(useSearchParams).mockReturnValue(
+    new URLSearchParams("providerId=anthropic") as unknown as ReturnType<
+      typeof useSearchParams
+    >,
+  );
+});
+
+function genericClient() {
+  const client = CONNECT_CLIENTS.find((c) => c.id === "generic");
+  if (!client) throw new Error("Missing generic client fixture");
+  return client;
+}
+
+function renderInstructions() {
+  return render(
+    <ProxyClientInstructions
+      client={genericClient()}
+      profileId="profile-123"
+      baseUrl="http://localhost:9000/v1"
+    />,
+  );
+}
+
+vi.mock("@/lib/organization.query");
+
+// The components under test resolve provider labels through
+// useModelProviderCatalog() -> useOrganization(); no organization data means
+// "no admin overrides", i.e. every provider visible under its built-in name.
+beforeEach(() => {
+  vi.mocked(useOrganization).mockReturnValue({
+    data: undefined,
+  } as unknown as ReturnType<typeof useOrganization>);
+});
+
+describe("ProxyClientInstructions — Any Client step 4", () => {
+  beforeEach(() => {
+    provisionMock.mockReset();
+    vi.mocked(useHasPermissions).mockReset();
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+    } as ReturnType<typeof useHasPermissions>);
+    availableKeysMock.mockReset();
+    // the user has an anthropic provider key by default
+    availableKeysMock.mockReturnValue({ data: [{ provider: "anthropic" }] });
+  });
+
+  it("switches from a provider endpoint to Unified Model API through the provider dropdown", async () => {
+    const user = userEvent.setup();
+    renderInstructions();
+
+    // A selected provider keeps its per-provider URL (id-less)…
+    expect(
+      screen.getByText("http://localhost:9000/v1/anthropic"),
+    ).toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByRole("combobox", { name: "Provider" }), {
+      key: "ArrowDown",
+    });
+    await user.click(screen.getByRole("option", { name: "Unified Model API" }));
+    expect(
+      Object.fromEntries(new URLSearchParams(window.location.search)),
+    ).toEqual({ clientId: "generic", providerId: "model-router" });
+  });
+
+  it("selecting the Unified Model API tab shows the canonical endpoint", async () => {
+    const user = userEvent.setup();
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("providerId=model-router") as unknown as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+    provisionMock.mockResolvedValue({ value: "arch_secret", name: "My Key" });
+    renderInstructions();
+
+    // The unified endpoint replaces the per-provider URL.
+    expect(
+      screen.getByText("http://localhost:9000/v1/unified-model"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("http://localhost:9000/v1/anthropic"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("https://api.openai.com/v1/")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /The previous \/v1\/model-router endpoint is still supported/,
+      ),
+    ).toBeInTheDocument();
+
+    // Virtual keys wrap one provider key — the router flow provisions against
+    // the (only) configured provider.
+    await user.click(screen.getByRole("tab", { name: "Virtual key" }));
+    await waitFor(() =>
+      expect(provisionMock).toHaveBeenCalledWith({ provider: "anthropic" }),
+    );
+  });
+
+  it("auto-provisions a virtual key on tab select (no extra click)", async () => {
+    const user = userEvent.setup();
+    provisionMock.mockResolvedValue({ value: "arch_secret", name: "My Key" });
+    renderInstructions();
+
+    // selecting the tab provisions automatically — there is no generate button
+    await user.click(screen.getByRole("tab", { name: "Virtual key" }));
+
+    await waitFor(() =>
+      expect(provisionMock).toHaveBeenCalledWith({ provider: "anthropic" }),
+    );
+    expect(
+      screen.queryByRole("button", { name: /Generate virtual key/i }),
+    ).not.toBeInTheDocument();
+    expect(await screen.findByText("arch_secret")).toBeInTheDocument();
+  });
+
+  it("disables the virtual-key option without llmVirtualKey:create", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: false,
+    } as ReturnType<typeof useHasPermissions>);
+    renderInstructions();
+
+    expect(screen.getByRole("tab", { name: "Virtual key" })).toBeDisabled();
+  });
+
+  it("disables the virtual-key option when the provider has no configured key", () => {
+    // permission is fine, but there's no anthropic provider key to wrap
+    availableKeysMock.mockReturnValue({ data: [] });
+    renderInstructions();
+
+    expect(screen.getByRole("tab", { name: "Virtual key" })).toBeDisabled();
+    expect(provisionMock).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(/needs a configured Anthropic provider key first/i),
+    ).toBeInTheDocument();
+  });
+
+  it("opens an inline add-provider-key dialog from the no-key helper text", async () => {
+    // permission to create a provider key (hasPermissionsMock defaults to true)
+    // and no key configured for the selected provider.
+    availableKeysMock.mockReturnValue({ data: [] });
+    const user = userEvent.setup();
+    renderInstructions();
+
+    await user.click(screen.getByRole("button", { name: /add one/i }));
+
+    expect(screen.getByTestId("add-provider-key-dialog")).toBeInTheDocument();
+  });
+});
+
+describe("ProxyClientInstructions — Claude Desktop attribution header", () => {
+  function renderClaudeDesktop() {
+    const client = CONNECT_CLIENTS.find((c) => c.id === "claude-desktop");
+    if (!client) throw new Error("Missing claude-desktop client fixture");
+    return render(
+      <ProxyClientInstructions
+        client={client}
+        profileId="profile-123"
+        baseUrl="http://localhost:9000/v1"
+      />,
+    );
+  }
+
+  beforeEach(() => {
+    passthroughProvisionMock.mockReset();
+    vi.mocked(useHasPermissions).mockReset();
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+    } as ReturnType<typeof useHasPermissions>);
+    availableKeysMock.mockReset();
+    availableKeysMock.mockReturnValue({ data: [] });
+  });
+
+  it("reveals the header name but never the secret key in plaintext", async () => {
+    passthroughProvisionMock.mockResolvedValue({
+      value: "arch_passthroughtoken",
+      name: "Connection passthrough — me@example.com",
+    });
+    renderClaudeDesktop();
+
+    expect(
+      screen.getByText("Add your personal auth key header"),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(passthroughProvisionMock).toHaveBeenCalledWith({
+        llmProxyId: "profile-123",
+      }),
+    );
+    // the header name is shown (it isn't secret)
+    expect(
+      (await screen.findAllByText("X-Archestra-Virtual-Key")).length,
+    ).toBeGreaterThan(0);
+    // the key is a secret — it must never be rendered in plaintext…
+    expect(screen.queryByText(/arch_passthroughtoken/)).not.toBeInTheDocument();
+    // …but it stays copyable
+    expect(
+      screen.getAllByRole("button", { name: /copy to clipboard/i }).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("points to the LLM Proxy page when the user can't mint a key", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: false,
+    } as ReturnType<typeof useHasPermissions>);
+    renderClaudeDesktop();
+
+    expect(passthroughProvisionMock).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("link", { name: /LLM Proxy/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a retry instead of spinning forever when provisioning fails", async () => {
+    // handleApiError swallows the failure and the mutation resolves null.
+    passthroughProvisionMock.mockResolvedValue(null);
+    renderClaudeDesktop();
+
+    await waitFor(() => expect(passthroughProvisionMock).toHaveBeenCalled());
+    expect(
+      await screen.findByRole("button", { name: /Retry/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Creating your passthrough key/i),
+    ).not.toBeInTheDocument();
+  });
+});

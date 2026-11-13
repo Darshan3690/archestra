@@ -15,13 +15,53 @@ import {
  * body → the chat-error mapper, which uses it as a uniform cross-provider
  * signal.
  *
- * Providers differ in how they surface categories like "context too long":
- * some return a structured `error.code`, others only a message. Classifying
- * in the adapter and emitting a normalized code keeps the mapper a simple
- * lookup and lets each provider's idiosyncrasies stay local to its adapter.
+ * Adapters classify a category like "context too long" from the provider's
+ * structured `error.code` and emit a normalized code, which keeps the mapper a
+ * simple lookup and lets each provider's idiosyncrasies stay local to its
+ * adapter.
  */
 export const ArchestraInternalErrorCode = {
   ContextLengthExceeded: "context_length_exceeded",
+  /**
+   * The provider rejected the request because the key's remaining usage balance
+   * is too low — out of credit or over a usage/spend limit (e.g. Anthropic 402
+   * `billing_error`, or a 400 usage-limit message). Retrying won't help until
+   * the balance is topped up or the limit resets.
+   */
+  ProviderInsufficientBalance: "provider_insufficient_balance",
+  /**
+   * The upstream provider finished a completion without producing any content
+   * or tool calls (e.g. OpenRouter occasionally streams an empty turn). A
+   * transient provider-side condition: the proxy returns it as a retryable 503
+   * and the chat mapper surfaces it as the retryable EmptyResponse card.
+   */
+  UpstreamEmptyResponse: "upstream_empty_response",
+  /**
+   * An upstream provider began a response but stopped making progress until
+   * Archestra's inactivity deadline elapsed. Transient and safe to retry.
+   */
+  UpstreamTimeout: "upstream_timeout",
+  /**
+   * The upstream provider declared a transient overload (HTTP 503/529).
+   */
+  ProviderOverloaded: "provider_overloaded",
+  /**
+   * The provider rejected the request because its token count — the prompt plus
+   * the reserved output budget — exceeds the credential's *entire* per-minute
+   * token allowance (e.g. Groq's 413 `api_payload_too_large_error` naming a
+   * tokens-per-minute limit). Distinct from an ordinary rate limit: the request
+   * is bigger than the whole bucket, so waiting for the window to refill never
+   * admits it and the same request fails identically in a brand-new chat.
+   */
+  RequestExceedsRateLimit: "request_exceeds_rate_limit",
+  /**
+   * A per-user credential is required and unusable: either none is linked, or
+   * the linked subscription sign-in is no longer valid upstream (an expired or
+   * revoked ChatGPT/Codex refresh token). NOT retryable — the user must
+   * (re)connect their account. Mirrors ChatErrorCode.ProviderAuthRequired so
+   * the chat UI renders the connect card instead of a generic key error.
+   */
+  ProviderAuthRequired: "provider_auth_required",
 } as const;
 
 export type ArchestraInternalErrorCode =
@@ -66,6 +106,7 @@ export const AnthropicErrorTypes = {
   RATE_LIMIT: "rate_limit_error",
   API_ERROR: "api_error",
   OVERLOADED: "overloaded_error",
+  BILLING: "billing_error",
 } as const;
 
 /**
@@ -243,6 +284,32 @@ export const MinimaxErrorTypes = {
   CONTEXT_LENGTH_EXCEEDED: "context_length_exceeded",
 } as const;
 
+/**
+ * Groq API error codes (from the response body `error.code` field).
+ * Groq is OpenAI-compatible, so most codes match {@link OpenAIErrorTypes};
+ * these are the ones it adds.
+ * @see https://console.groq.com/docs/errors
+ */
+export const GroqErrorCodes = {
+  /**
+   * Token-bucket rejection, carried with `error.type: "tokens"`. Groq charges a
+   * request's prompt *plus* its `max_tokens` reservation against the bucket, so
+   * a large reservation alone can exhaust the allowance on a short
+   * conversation.
+   *
+   * The HTTP status is what separates the two cases, since both bodies are
+   * identical otherwise:
+   * - **429** — the bucket is momentarily empty. Transient and retryable.
+   * - **413** — this single request is bigger than the whole bucket ("Request
+   *   too large … Limit 6000, Requested 6719"). Waiting never admits it.
+   */
+  RATE_LIMIT_EXCEEDED: "rate_limit_exceeded",
+} as const;
+
+/** HTTP status Groq pairs with {@link GroqErrorCodes.RATE_LIMIT_EXCEEDED} when a
+ * single request exceeds the entire token bucket. */
+export const GROQ_REQUEST_EXCEEDS_BUCKET_STATUS = 413;
+
 // =============================================================================
 // Normalized Chat Error Codes
 // =============================================================================
@@ -254,25 +321,96 @@ export const MinimaxErrorTypes = {
 export enum ChatErrorCode {
   /** Rate/quota exceeded - retryable after delay */
   RateLimit = "rate_limit",
+  /**
+   * An Archestra-configured cost/usage limit blocked the request. Distinct from
+   * RateLimit: this is Archestra enforcing a budget, not the provider throttling
+   * traffic, so it is NOT retryable — retrying re-hits the same cap. Pairs with
+   * the `usageLimitExceeded`/`usageLimitEntityType` fields below.
+   */
+  UsageLimitExceeded = "usage_limit_exceeded",
   /** Invalid or missing API key */
   Authentication = "authentication",
   /** API key lacks permissions for the requested resource */
   PermissionDenied = "permission_denied",
   /** Malformed or invalid request */
   InvalidRequest = "invalid_request",
+  /**
+   * The provider key's remaining usage balance is too low (out of credit or over
+   * a usage/spend limit). NOT retryable — retrying re-hits the same wall until
+   * the balance is topped up or the limit resets.
+   */
+  ProviderInsufficientBalance = "provider_insufficient_balance",
   /** Model or resource not found */
   NotFound = "not_found",
   /** Input exceeds the model's context window */
   ContextTooLong = "context_too_long",
+  /** Request payload (e.g. a large inline attachment) exceeds the provider's size limit */
+  RequestTooLarge = "request_too_large",
+  /**
+   * A single request's token count exceeds the provider plan's per-minute token
+   * allowance, so the provider rejects it before generating anything. NOT
+   * retryable: the bucket never refills to more than its own size, and starting
+   * a new chat does not help — the reserved output budget is charged against
+   * the same allowance regardless of how short the conversation is.
+   */
+  RequestExceedsRateLimit = "request_exceeds_rate_limit",
   /** Content blocked by safety filters */
   ContentFiltered = "content_filtered",
   /** Provider server error - retryable */
   ServerError = "server_error",
   /** Network/connection issues - retryable */
   NetworkError = "network_error",
+  /** Provider finished cleanly but produced no content - retryable */
+  EmptyResponse = "empty_response",
+  /**
+   * The model started a tool call but never completed it, so the turn produced
+   * no reply and executed nothing - retryable. Distinct from EmptyResponse: the
+   * model did begin output, it just abandoned it mid tool-call.
+   */
+  IncompleteToolCall = "incomplete_tool_call",
+  /**
+   * A tool call was truncated because the model hit its output-token limit while
+   * writing it (finishReason "length") — the tool input was too large to finish
+   * in one turn. Deterministic in the payload size, so NOT retryable: retrying
+   * re-truncates. Distinct from IncompleteToolCall (a transient mid-stream drop).
+   */
+  ToolCallOutputTruncated = "tool_call_output_truncated",
+  /**
+   * The model stream went silent mid-turn (no parsed chunk within the idle
+   * deadline — SSE comments and keep-alives do not count), so the turn was
+   * ended. Retryable: a stalled upstream is a transient condition.
+   */
+  UpstreamStalled = "upstream_stalled",
+  /**
+   * The model stopped before completing a reply. Usually a non-fatal notice
+   * alongside partial content; also used when the output limit leaves no reply.
+   */
+  IncompleteResponse = "incomplete_response",
+  /**
+   * The provider needs a per-user credential the acting user hasn't linked yet
+   * (e.g. GitHub Copilot). Carries an `authAction` so the UI can prompt the user
+   * to link their account rather than showing a generic key error.
+   */
+  ProviderAuthRequired = "provider_auth_required",
+  /**
+   * The request declared tools but the model can't take them (e.g. Microsoft
+   * 365 Copilot). NOT retryable — the same agent/model pairing re-hits the
+   * same rejection until the tools or the model change.
+   */
+  ToolsUnsupported = "tools_unsupported",
+  /**
+   * The run was cancelled through its caller's AbortSignal — a user stop, a
+   * muted chatops thread, or a superseding follow-up message. Not a provider
+   * failure, and NOT retryable: the caller asked for the run to end.
+   */
+  Aborted = "aborted",
   /** Catch-all for unrecognized errors */
   Unknown = "unknown",
 }
+
+/** Curated guidance for an empty turn that exhausted its output budget. */
+export const OUTPUT_LIMIT_REACHED_MESSAGE =
+  "The model reached its output limit before producing a reply. Try a smaller task, lower the reasoning effort, or ask an administrator to increase the output-token limit.";
 
 /**
  * User-friendly error messages for each error code
@@ -280,21 +418,52 @@ export enum ChatErrorCode {
 export const ChatErrorMessages: Record<ChatErrorCode, string> = {
   [ChatErrorCode.RateLimit]:
     "Too many requests. Please wait a moment and try again.",
+  [ChatErrorCode.UsageLimitExceeded]:
+    // white-label-ok: shipped default text; branded by brandBuiltInText where it is seeded
+    "Archestra blocked this request because a configured usage limit has been reached. Contact your administrator to raise the limit or wait for it to reset.",
   [ChatErrorCode.Authentication]:
     "Invalid API key. Please check your Chat Settings.",
   [ChatErrorCode.PermissionDenied]:
     "Your API key doesn't have permission for this model.",
   [ChatErrorCode.InvalidRequest]:
     "There was an issue with your request. Please try again.",
+  // Provider-neutral: this code is emitted for any provider whose key runs out
+  // of balance or trips a usage/spend limit. Provider-specific phrasing (e.g. the
+  // Anthropic connection-page copy) is surfaced by the adapter's
+  // `extractErrorMessage`, not baked into this cross-provider table.
+  [ChatErrorCode.ProviderInsufficientBalance]:
+    "Your API key's remaining usage balance is too low. Please contact your administrator or try again later.",
   [ChatErrorCode.NotFound]:
     "The selected model is not available. Please choose a different model.",
   [ChatErrorCode.ContextTooLong]:
     "Your conversation is too long. Please start a new chat or remove some messages.",
+  [ChatErrorCode.RequestTooLarge]:
+    "This request is too large for the selected model. Compress or split large attachments — or remove some — and try again.",
+  // Deliberately does NOT suggest starting a new chat: the reserved output
+  // budget is charged against the per-minute allowance on its own, so an empty
+  // conversation hits the same wall.
+  [ChatErrorCode.RequestExceedsRateLimit]:
+    "This request needs more tokens per minute than your provider plan allows, so waiting won't help. Lower the output-token limit, shorten the conversation, or upgrade your provider tier.",
   [ChatErrorCode.ContentFiltered]:
     "Your message was blocked by content filters. Please rephrase your request.",
   [ChatErrorCode.ServerError]: "The AI provider is experiencing issues.",
   [ChatErrorCode.NetworkError]:
     "Connection error. Please check your network and try again.",
+  [ChatErrorCode.EmptyResponse]:
+    "The model ended its turn without a reply. Rephrasing your message may help.",
+  [ChatErrorCode.IncompleteToolCall]:
+    "The model started a tool call but didn't finish it, so the turn ended without a reply. Retrying may help.",
+  [ChatErrorCode.ToolCallOutputTruncated]:
+    "The model ran out of output space while writing a tool call, so it couldn't finish — the tool input was too large for one turn. Break the change into smaller steps and try again.",
+  [ChatErrorCode.UpstreamStalled]:
+    "The model stopped sending its reply and timed out. Retrying may help.",
+  [ChatErrorCode.IncompleteResponse]:
+    "The model stopped before completing a reply.",
+  [ChatErrorCode.ProviderAuthRequired]:
+    "Connect your account to use this model.",
+  [ChatErrorCode.ToolsUnsupported]:
+    "This model doesn't support tools, but the request included some. Remove the agent's tools or switch to a model that supports tool calling.",
+  [ChatErrorCode.Aborted]: "The request was cancelled.",
   [ChatErrorCode.Unknown]: "An unexpected error occurred. Please try again.",
 };
 
@@ -305,6 +474,9 @@ export const RetryableErrorCodes: Set<ChatErrorCode> = new Set([
   ChatErrorCode.RateLimit,
   ChatErrorCode.ServerError,
   ChatErrorCode.NetworkError,
+  ChatErrorCode.EmptyResponse,
+  ChatErrorCode.IncompleteToolCall,
+  ChatErrorCode.UpstreamStalled,
 ]);
 
 /**
@@ -324,6 +496,19 @@ export interface ChatErrorResponse {
   traceId?: string;
   /** OpenTelemetry span ID for correlating with backend logs */
   spanId?: string;
+  /** True when the request was blocked by a configured usage-limit budget */
+  usageLimitExceeded?: boolean;
+  /** The usage-limit entity that blocked the request, when known */
+  usageLimitEntityType?: string;
+  /**
+   * Present with code `ProviderAuthRequired`: tells the UI which per-user
+   * provider the acting user must link, so it can render a "Connect <provider>"
+   * prompt (and, where supported, open the link flow) instead of a key error.
+   */
+  authAction?: {
+    provider: SupportedProvider;
+    providerLabel: string;
+  };
   /** Original error details for debugging (provider-specific) */
   originalError?: {
     /** Provider name (anthropic, openai, gemini) */
@@ -346,6 +531,14 @@ export const ChatErrorResponseSchema: z.ZodType<ChatErrorResponse> = z.object({
   sessionId: z.string().optional(),
   traceId: z.string().optional(),
   spanId: z.string().optional(),
+  usageLimitExceeded: z.boolean().optional(),
+  usageLimitEntityType: z.string().optional(),
+  authAction: z
+    .object({
+      provider: SupportedProvidersSchema,
+      providerLabel: z.string(),
+    })
+    .optional(),
   originalError: z
     .object({
       provider: SupportedProvidersSchema.optional(),

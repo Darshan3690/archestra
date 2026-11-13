@@ -1,0 +1,42 @@
+{
+  "name": "wanaku-ai__wanaku",
+  "display_name": "wanaku",
+  "description": "Wanaku MCP Router",
+  "author": {
+    "name": "wanaku-ai"
+  },
+  "server": {
+    "command": "npx",
+    "args": ["-y", "wanaku"],
+    "env": {},
+    "type": "local"
+  },
+  "tools": [],
+  "prompts": [],
+  "keywords": [],
+  "user_config": {},
+  "readme": "# Wanaku - A MCP Router that connects everything\n\nThe Wanaku MCP Router is a router for AI-enabled applications powered by the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).\n\nThis protocol is an open protocol that standardizes how applications provide context to LLMs. \n\nThe project name comes from the origins of the word [Guanaco](https://en.wikipedia.org/wiki/Guanaco), a camelid native to\nSouth America.\n\n[![Getting Started With Wanaku](https://img.youtube.com/vi/-fuNAo2j4SA/0.jpg)](https://www.youtube.com/watch?v=-fuNAo2j4SA)\n\n\n## Usage Guide\n\nPlease follow the [usage guide](docs/usage.md) to learn how to use Wanaku.\n\n## Building Wanaku MCP Router\n\nIf you want to build to the project, then read [building](docs/building.md) guide.\n\n## Contributing \n\nIf you want to contribute to the project, then read the [contributing](docs/contributing.md) guide.\n",
+  "category": "AI Tools",
+  "archestra_config": {
+    "client_config_permutations": null,
+    "oauth": {
+      "provider": null,
+      "required": false
+    },
+    "works_in_archestra": false
+  },
+  "github_info": {
+    "owner": "wanaku-ai",
+    "repo": "wanaku",
+    "url": "https://github.com/wanaku-ai/wanaku",
+    "name": "wanaku",
+    "path": null,
+    "stars": 79,
+    "contributors": 13,
+    "issues": 47,
+    "releases": true,
+    "ci_cd": true,
+    "latest_commit_hash": "d130f28056239000023ea0925e81efef5458dcba"
+  },
+  "programming_language": "Java"
+}

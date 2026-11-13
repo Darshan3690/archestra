@@ -1,0 +1,319 @@
+import { BUILT_IN_AGENT_IDS } from "@archestra/shared";
+import config from "@/config";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import { beforeEach, describe, expect, test } from "@/test";
+import { useRouteTestApp } from "@/test/route-test-app";
+import agentRoutes from "./agent";
+import chatRoutes from "./chat/routes";
+
+describe("system chat agent visibility", () => {
+  beforeEach(() => {
+    config.openappa.enabled = true;
+  });
+  const ctx = useRouteTestApp(async (app) => {
+    await app.register(agentRoutes);
+    await app.register(chatRoutes);
+  });
+
+  const chatRosterUrl = "/api/agents?agentType=agent&view=chat";
+
+  test("the system policy assistant uses the built-in management category and the normal chat roster", async ({
+    makeMember,
+    makeAgent,
+  }) => {
+    await makeMember(ctx.user.id, ctx.organizationId, { role: "admin" });
+    const policy = await makeAgent({
+      organizationId: ctx.organizationId,
+      agentType: "agent",
+      builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG },
+    });
+    const ordinary = await makeAgent({
+      organizationId: ctx.organizationId,
+      agentType: "agent",
+    });
+    const compaction = await makeAgent({
+      organizationId: ctx.organizationId,
+      agentType: "agent",
+      builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.CONTEXT_COMPACTION },
+    });
+    const listed = await ctx.app.inject({
+      method: "GET",
+      url: "/api/agents?agentType=agent",
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(
+      listed.json().data.map((agent: { id: string }) => agent.id),
+    ).not.toContain(policy.id);
+    const builtIns = await ctx.app.inject({
+      method: "GET",
+      url: "/api/agents?agentType=agent&scope=built_in",
+    });
+    expect(
+      builtIns.json().data.map((agent: { id: string }) => agent.id),
+    ).toEqual(expect.arrayContaining([policy.id, compaction.id]));
+    const included = await ctx.app.inject({
+      method: "GET",
+      url: "/api/agents?agentType=agent&includeBuiltIn=true",
+    });
+    expect(included.statusCode).toBe(200);
+    expect(
+      included.json().data.map((agent: { id: string }) => agent.id),
+    ).toEqual(expect.arrayContaining([policy.id, compaction.id, ordinary.id]));
+    const slim = await ctx.app.inject({
+      method: "GET",
+      url: "/api/agents/chat-roster",
+    });
+    const roster = await ctx.app.inject({ method: "GET", url: chatRosterUrl });
+    expect(slim.statusCode).toBe(200);
+    expect(
+      slim
+        .json()
+        .map((row: { id: string }) => row.id)
+        .sort(),
+    ).toEqual([policy.id, ordinary.id].sort());
+    expect(roster.statusCode).toBe(200);
+    expect(
+      roster
+        .json()
+        .data.map((agent: { id: string }) => agent.id)
+        .sort(),
+    ).toEqual([policy.id, ordinary.id].sort());
+    for (const sortBy of ["chat", "name", "createdAt"]) {
+      const page = await ctx.app.inject({
+        method: "GET",
+        url: `/api/agents/chat-roster/page?search=${encodeURIComponent(policy.name)}&sortBy=${sortBy}`,
+      });
+      expect(page.statusCode).toBe(200);
+      expect(page.json().data.map((agent: { id: string }) => agent.id)).toEqual(
+        [policy.id],
+      );
+    }
+  });
+
+  test("a member can select and pin the granted system assistant without seeing other platform agents", async ({
+    makeMember,
+    makeAgent,
+  }) => {
+    await makeMember(ctx.user.id, ctx.organizationId);
+    const policy = await makeAgent({
+      organizationId: ctx.organizationId,
+      agentType: "agent",
+      builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG },
+    });
+    await makeAgent({
+      organizationId: ctx.organizationId,
+      agentType: "agent",
+      builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.CONTEXT_COMPACTION },
+    });
+    const slim = await ctx.app.inject({
+      method: "GET",
+      url: "/api/agents/chat-roster",
+    });
+    const roster = await ctx.app.inject({ method: "GET", url: chatRosterUrl });
+    expect(slim.statusCode).toBe(200);
+    expect(
+      slim
+        .json()
+        .map((row: { id: string }) => row.id)
+        .sort(),
+    ).toEqual([policy.id]);
+    expect(roster.statusCode).toBe(200);
+    expect(roster.json().data).toEqual([
+      expect.objectContaining({
+        id: policy.id,
+        builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG },
+      }),
+    ]);
+    const pin = await ctx.app.inject({
+      method: "PUT",
+      url: "/api/members/default-agent",
+      payload: { defaultAgentId: policy.id },
+    });
+    expect(pin.statusCode).toBe(200);
+    const current = await ctx.app.inject({
+      method: "GET",
+      url: "/api/members/default-agent",
+    });
+    expect(current.json().defaultAgentId).toBe(policy.id);
+    const created = await ctx.app.inject({
+      method: "POST",
+      url: "/api/chat/conversations",
+      payload: { agentId: policy.id, title: "Policy review" },
+    });
+    expect(created.statusCode).toBe(200);
+    expect(created.json()).toMatchObject({
+      agentId: policy.id,
+      origin: "user",
+      title: "Policy review",
+    });
+  });
+
+  test("a system assistant granted only to a named user appears in every searched sort", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    await makeMember(ctx.user.id, ctx.organizationId);
+    const owner = await makeUser();
+    await makeMember(owner.id, ctx.organizationId);
+    const policy = await makeAgent({
+      organizationId: ctx.organizationId,
+      agentType: "agent",
+      authorId: owner.id,
+      access: "personal",
+      name: "Named Policy Assistant",
+      builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG },
+    });
+    const key = {
+      organizationId: ctx.organizationId,
+      resource: "agent" as const,
+      scope: policy.id,
+    };
+    const existing = await ResourcePermissionPolicyModel.find(key);
+    await ResourcePermissionPolicyModel.replace({
+      ...key,
+      revision: existing?.revision ?? 0,
+      grants: [
+        { subject: { type: "user", id: ctx.user.id }, actions: ["read"] },
+      ],
+    });
+
+    for (const sortBy of ["chat", "name", "createdAt"]) {
+      const page = await ctx.app.inject({
+        method: "GET",
+        url: `/api/agents/chat-roster/page?search=Named%20Policy%20Assistant&sortBy=${sortBy}`,
+      });
+      expect(page.statusCode, page.body).toBe(200);
+      expect(page.json().data.map((agent: { id: string }) => agent.id)).toEqual(
+        [policy.id],
+      );
+    }
+  });
+  test("a member's built-in scope in chat view lists only the system assistant", async ({
+    makeMember,
+    makeAgent,
+  }) => {
+    await makeMember(ctx.user.id, ctx.organizationId);
+    const policy = await makeAgent({
+      organizationId: ctx.organizationId,
+      agentType: "agent",
+      builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG },
+    });
+    await makeAgent({
+      organizationId: ctx.organizationId,
+      agentType: "agent",
+      builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.CONTEXT_COMPACTION },
+    });
+
+    const builtIns = await ctx.app.inject({
+      method: "GET",
+      url: `${chatRosterUrl}&scope=built_in`,
+    });
+
+    expect(builtIns.statusCode).toBe(200);
+    expect(
+      builtIns.json().data.map((agent: { id: string }) => agent.id),
+    ).toEqual([policy.id]);
+  });
+
+  test("disabling OpenAPPA hides an existing assistant without discarding its saved preference", async ({
+    makeMember,
+    makeAgent,
+  }) => {
+    await makeMember(ctx.user.id, ctx.organizationId);
+    const policy = await makeAgent({
+      organizationId: ctx.organizationId,
+      agentType: "agent",
+      builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG },
+    });
+    expect(
+      (
+        await ctx.app.inject({
+          method: "PUT",
+          url: "/api/members/default-agent",
+          payload: { defaultAgentId: policy.id },
+        })
+      ).statusCode,
+    ).toBe(200);
+    config.openappa.enabled = false;
+    const slim = await ctx.app.inject({
+      method: "GET",
+      url: "/api/agents/chat-roster",
+    });
+    const roster = await ctx.app.inject({ method: "GET", url: chatRosterUrl });
+    expect(slim.statusCode).toBe(200);
+    expect(
+      slim
+        .json()
+        .map((row: { id: string }) => row.id)
+        .sort(),
+    ).toEqual([]);
+    expect(roster.statusCode).toBe(200);
+    expect(roster.json().data).toEqual([]);
+    expect(
+      (
+        await ctx.app.inject({
+          method: "PUT",
+          url: "/api/members/default-agent",
+          payload: { defaultAgentId: policy.id },
+        })
+      ).statusCode,
+    ).toBe(404);
+    const current = await ctx.app.inject({
+      method: "GET",
+      url: "/api/members/default-agent",
+    });
+    expect(current.json().defaultAgentId).toBe(policy.id);
+    config.openappa.enabled = true;
+    const restored = await ctx.app.inject({
+      method: "GET",
+      url: chatRosterUrl,
+    });
+    expect(restored.json().data).toEqual([
+      expect.objectContaining({ id: policy.id }),
+    ]);
+  });
+
+  test("the chat roster and default selection still reject an ungranted system assistant", async ({
+    makeMember,
+    makeAgent,
+    makeUser,
+  }) => {
+    await makeMember(ctx.user.id, ctx.organizationId);
+    const stranger = await makeUser();
+    await makeMember(stranger.id, ctx.organizationId);
+    const restricted = await makeAgent({
+      organizationId: ctx.organizationId,
+      agentType: "agent",
+      authorId: stranger.id,
+      access: "personal",
+      builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG },
+    });
+    const slim = await ctx.app.inject({
+      method: "GET",
+      url: "/api/agents/chat-roster",
+    });
+    const roster = await ctx.app.inject({ method: "GET", url: chatRosterUrl });
+    expect(slim.statusCode).toBe(200);
+    expect(
+      slim
+        .json()
+        .map((row: { id: string }) => row.id)
+        .sort(),
+    ).toEqual([]);
+    expect(roster.statusCode).toBe(200);
+    expect(roster.json().data).toEqual([]);
+    const denied = await ctx.app.inject({
+      method: "PUT",
+      url: "/api/members/default-agent",
+      payload: { defaultAgentId: restricted.id },
+    });
+    expect(denied.statusCode).toBe(404);
+    const deniedChat = await ctx.app.inject({
+      method: "POST",
+      url: "/api/chat/conversations",
+      payload: { agentId: restricted.id },
+    });
+    expect(deniedChat.statusCode).toBe(404);
+  });
+});

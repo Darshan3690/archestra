@@ -1,19 +1,42 @@
+import { anthropicVertexClient } from "@/clients/anthropic-vertex";
+import { anthropicWorkloadIdentity } from "@/clients/anthropic-workload-identity";
 import {
   getAzureAiFoundryBearerTokenProvider,
   isAnthropicAzureFoundryEntraIdEnabled,
 } from "@/clients/azure-openai-credentials";
+import {
+  buildAzureFoundryDeploymentsUrl,
+  isAzureAiFoundryBaseUrl,
+} from "@/clients/azure-url";
 import config from "@/config";
 import logger from "@/logging";
+import { ANTHROPIC_SUBSCRIPTION_UPSTREAM } from "@/routes/proxy/common";
 import type { Anthropic } from "@/types";
-import type { ModelInfo } from "./types";
+import { joinBaseUrl } from "@/utils/base-url";
+import { type ModelInfo, modelFetchError } from "./types";
 
 export async function fetchAnthropicModels(
   apiKey: string,
   baseUrlOverride?: string | null,
   extraHeaders?: Record<string, string> | null,
 ): Promise<ModelInfo[]> {
-  const baseUrl = baseUrlOverride || config.llm.anthropic.baseUrl;
-  const url = `${baseUrl}/v1/models?limit=100`;
+  if (!apiKey && anthropicVertexClient.isEnabled()) {
+    return fetchAnthropicModelsViaVertexAi();
+  }
+
+  const isClaudeSubscriptionToken =
+    apiKey.startsWith("sk-ant-oat") || apiKey.startsWith("Bearer:sk-ant-oat");
+  const baseUrl = isClaudeSubscriptionToken
+    ? ANTHROPIC_SUBSCRIPTION_UPSTREAM
+    : baseUrlOverride || config.llm.anthropic.baseUrl;
+  if (isAzureAiFoundryBaseUrl(baseUrl)) {
+    return fetchAnthropicFoundryDeployments({ apiKey, baseUrl, extraHeaders });
+  }
+  const url = joinBaseUrl(baseUrl, "/v1/models?limit=100");
+
+  if (!apiKey && anthropicWorkloadIdentity.isEnabled()) {
+    anthropicWorkloadIdentity.assertTrustedEndpoint(url);
+  }
 
   const response = await fetch(url, {
     headers: {
@@ -29,7 +52,7 @@ export async function fetchAnthropicModels(
       { status: response.status, error: errorText },
       "Failed to fetch Anthropic models",
     );
-    throw new Error(`Failed to fetch Anthropic models: ${response.status}`);
+    throw modelFetchError("Anthropic models", response.status);
   }
 
   const data = (await response.json()) as {
@@ -38,23 +61,175 @@ export async function fetchAnthropicModels(
 
   return data.data.map((model) => ({
     id: model.id,
-    displayName: model.display_name,
+    // Fall back to the id: with a base-URL override the upstream may be an
+    // OpenAI-compatible or otherwise non-Anthropic-shaped server whose model
+    // rows carry no display_name — leaving it undefined made the proxy's
+    // /v1/models response fail its own schema (a 500 for every listing).
+    displayName: model.display_name ?? model.id,
     provider: "anthropic",
     createdAt: model.created_at,
   }));
 }
 
-async function getAnthropicAuthHeaders(
+export async function fetchAnthropicModelsViaVertexAi(): Promise<ModelInfo[]> {
+  const models: ModelInfo[] = [];
+  let pageToken: string | undefined;
+
+  do {
+    const url = new URL(
+      "https://aiplatform.googleapis.com/v1beta1/publishers/anthropic/models",
+    );
+    url.searchParams.set("pageSize", "100");
+    if (pageToken) {
+      url.searchParams.set("pageToken", pageToken);
+    }
+
+    const response = await fetch(url, {
+      headers: await anthropicVertexClient.getRequestHeaders(),
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      logger.error(
+        { status: response.status, error: errorText },
+        "Failed to fetch Anthropic Vertex AI models",
+      );
+      throw modelFetchError("Anthropic Vertex AI models", response.status);
+    }
+
+    const data = (await response.json()) as VertexPublisherModelsResponse;
+    models.push(
+      ...(data.publisherModels ?? [])
+        .map(toAnthropicVertexModelInfo)
+        .filter((model): model is ModelInfo => model !== null),
+    );
+    pageToken = data.nextPageToken || undefined;
+  } while (pageToken);
+
+  return models;
+}
+
+/**
+ * Build the auth headers for a direct Anthropic HTTP call: `x-api-key` for a
+ * real key, bearer with the OAuth beta for subscription access tokens, else
+ * the Azure-Foundry-Entra or Workload-Identity bearer when those keyless modes
+ * are enabled. Shared with the credit-probe helper.
+ */
+export async function getAnthropicAuthHeaders(
   apiKey: string | undefined,
 ): Promise<Record<string, string>> {
-  if (apiKey) {
-    return { "x-api-key": apiKey };
+  const rawKey = apiKey?.startsWith("Bearer:") ? apiKey.slice(7) : apiKey;
+  if (rawKey?.startsWith("sk-ant-oat")) {
+    return {
+      Authorization: `Bearer ${rawKey}`,
+      "anthropic-beta": "oauth-2025-04-20",
+    };
   }
 
-  if (!isAnthropicAzureFoundryEntraIdEnabled()) {
-    return { "x-api-key": "" };
+  if (rawKey) {
+    return { "x-api-key": rawKey };
   }
 
-  const tokenProvider = getAzureAiFoundryBearerTokenProvider();
-  return { Authorization: `Bearer ${await tokenProvider()}` };
+  if (isAnthropicAzureFoundryEntraIdEnabled()) {
+    const tokenProvider = getAzureAiFoundryBearerTokenProvider();
+    return { Authorization: `Bearer ${await tokenProvider()}` };
+  }
+
+  if (anthropicWorkloadIdentity.isEnabled()) {
+    return {
+      Authorization: `Bearer ${await anthropicWorkloadIdentity.getAccessToken()}`,
+    };
+  }
+
+  return { "x-api-key": "" };
+}
+
+/**
+ * Claude on Microsoft Foundry answers `/anthropic/v1/models` with
+ * `api_not_supported`, so list the resource's deployments instead and keep the
+ * Claude ones. Requests then name the deployment in `model`, as Foundry
+ * expects. The listing takes the key in `api-key` (it rejects `x-api-key`) or
+ * the same Entra ID bearer the Messages API takes.
+ */
+async function fetchAnthropicFoundryDeployments(params: {
+  apiKey: string;
+  baseUrl: string;
+  extraHeaders?: Record<string, string> | null;
+}): Promise<ModelInfo[]> {
+  const url = buildAzureFoundryDeploymentsUrl(params.baseUrl);
+  if (!url) {
+    return [];
+  }
+
+  const response = await fetch(url, {
+    headers: {
+      ...(params.extraHeaders ?? {}),
+      ...(params.apiKey
+        ? { "api-key": params.apiKey }
+        : await getAnthropicAuthHeaders(params.apiKey)),
+    },
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    logger.error(
+      { status: response.status, error: errorText },
+      "Failed to fetch Anthropic deployments from Microsoft Foundry",
+    );
+    throw modelFetchError("Anthropic models", response.status);
+  }
+
+  const data = (await response.json()) as {
+    data?: { id: string; model?: string; status?: string }[];
+  };
+
+  return (data.data ?? [])
+    .filter(
+      (deployment) =>
+        deployment.status !== "failed" &&
+        (deployment.model ?? deployment.id).toLowerCase().startsWith("claude"),
+    )
+    .map((deployment) => ({
+      id: deployment.id,
+      displayName: deployment.id,
+      provider: "anthropic" as const,
+      // The deployment name is free-form; the backing model drives pricing.
+      ...(deployment.model ? { underlyingModelName: deployment.model } : {}),
+    }));
+}
+
+interface VertexPublisherModelsResponse {
+  publisherModels?: Array<{
+    name?: string;
+    versionId?: string;
+  }>;
+  nextPageToken?: string;
+}
+
+function toAnthropicVertexModelInfo(
+  model: NonNullable<VertexPublisherModelsResponse["publisherModels"]>[number],
+): ModelInfo | null {
+  const modelId = model.name?.replace("publishers/anthropic/models/", "");
+  if (!modelId?.startsWith("claude-")) {
+    return null;
+  }
+
+  const versionId = model.versionId?.trim();
+  const versionedModelId =
+    versionId && versionId !== "default" && !modelId.includes("@")
+      ? `${modelId}@${versionId}`
+      : modelId;
+
+  return {
+    id: versionedModelId,
+    displayName: formatAnthropicVertexModelName(modelId),
+    provider: "anthropic",
+  };
+}
+
+function formatAnthropicVertexModelName(modelId: string): string {
+  return modelId
+    .replace(/-(\d+)-(\d+)(?=-|$)/g, "-$1.$2")
+    .split("-")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
 }

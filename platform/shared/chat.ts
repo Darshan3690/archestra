@@ -1,4 +1,11 @@
 import { z } from "zod";
+import type { SupportedProvider } from "./model-constants";
+import {
+  collapseWhitespace,
+  exceedsCharLimit,
+  stripWrappingQuotes,
+  truncateCharsWithEllipsis,
+} from "./utils";
 
 // ============================================================================
 // Token Usage Types
@@ -12,6 +19,209 @@ export interface TokenUsage {
   inputTokens: number | undefined;
   outputTokens: number | undefined;
   totalTokens: number | undefined;
+  /** Input tokens served from the provider's prompt cache, a subset of inputTokens. */
+  cacheReadTokens?: number;
+}
+
+/**
+ * Estimated context-window occupancy streamed at the start of a turn, on the
+ * same token yardstick that drives auto-compaction. Seeds the context
+ * indicator before the model responds; per-step `TokenUsage` then refines it
+ * with the provider's actual prompt size.
+ */
+export interface ContextWindowEstimate {
+  estimatedTokens: number;
+}
+
+/**
+ * Stream event name for the per-category context window breakdown payload.
+ * Used by both the backend emitter and frontend consumer — never use the raw
+ * string literal in either place.
+ */
+export const CONTEXT_WINDOW_BREAKDOWN_EVENT =
+  "data-context-window-breakdown" as const;
+
+/**
+ * Share of the model's context window at which auto-compaction fires.
+ *
+ * Owned here rather than in the backend because the chat UI quotes it: the
+ * context indicator tells the user how much headroom is left *before*
+ * auto-compaction, not before the window is full, so both sides must gate on
+ * exactly the same number.
+ */
+export const CONTEXT_COMPACTION_AUTO_THRESHOLD = 0.8;
+
+/**
+ * Canonical display order of context window categories, matching the
+ * top-to-bottom stack in the assembled request:
+ *   system_prompt → tools → messages → tool_results → files
+ *
+ * The visualizer renders segments in this order; the estimator must produce
+ * segments in this order so the stacked bar reads correctly.
+ */
+export const CONTEXT_WINDOW_CATEGORIES = [
+  "system_prompt",
+  "tools",
+  "messages",
+  "tool_results",
+  "files",
+] as const;
+
+export type ContextWindowCategory = (typeof CONTEXT_WINDOW_CATEGORIES)[number];
+
+/**
+ * A single named contributor within a category (one tool definition, one
+ * conversation turn, one tool-result block, one attached file).
+ * Powers the drill-down list inside each gauge.
+ */
+export const ContextWindowItemSchema = z.object({
+  /** Human-readable name of the contributor (tool name, file name, etc.). */
+  label: z.string(),
+  /** Estimated token count for this contributor. Always ≥ 0. */
+  tokens: z.number().int().nonnegative(),
+});
+
+export type ContextWindowItem = z.infer<typeof ContextWindowItemSchema>;
+
+/**
+ * One category's share of the assembled request.
+ * Only non-empty categories are included in `ContextWindowBreakdown.segments`.
+ */
+export const ContextWindowSegmentSchema = z.object({
+  /** Which part of the request this segment represents. */
+  category: z.enum(CONTEXT_WINDOW_CATEGORIES),
+  /** Estimated tokens this category contributes to the request. Always ≥ 0. */
+  tokens: z.number().int().nonnegative(),
+  /**
+   * Largest individual contributors in this category, sorted descending by
+   * token count. Omitted when no per-item breakdown is available.
+   */
+  items: z.array(ContextWindowItemSchema).optional(),
+});
+
+export type ContextWindowSegment = z.infer<typeof ContextWindowSegmentSchema>;
+
+/**
+ * Per-category breakdown of the request about to be sent, streamed once per
+ * turn at assembly time (event: `CONTEXT_WINDOW_BREAKDOWN_EVENT`).
+ *
+ * Token counts are estimates on the same yardstick that drives auto-compaction
+ * (chars/token, PDF bytes/token). The provider's exact prompt size arrives
+ * afterward via `TokenUsage` and supersedes `usedTokens` for the indicator.
+ *
+ * Invariant: `usedTokens === sum(segments[*].tokens)`.
+ */
+export const ContextWindowBreakdownSchema = z.object({
+  /** LLM provider identifier (e.g. `"anthropic"`, `"openai"`). */
+  provider: z.string(),
+  /** Model ID as sent to the provider (e.g. `"claude-sonnet-4-6"`). */
+  model: z.string(),
+  /**
+   * Provider's advertised maximum context length in tokens, or `null` when the
+   * model's context length is not known. When `null`, `freeTokens` and
+   * `usedPercent` are also `null` and the bar renders relative proportions only.
+   */
+  contextLength: z.number().int().positive().nullable(),
+  /**
+   * Sum of all segment token estimates. Always ≥ 0.
+   * Must equal `sum(segments[*].tokens)`.
+   */
+  usedTokens: z.number().int().nonnegative(),
+  /**
+   * `contextLength - usedTokens`, or `null` when `contextLength` is `null`.
+   * May be negative when the assembled request exceeds the model's limit.
+   */
+  freeTokens: z.number().int().nullable(),
+  /**
+   * Percentage of the context window occupied (0–100, inclusive), or `null`
+   * when `contextLength` is `null`. Clamped to [0, 100] — values > 100 mean
+   * the request is over-limit but are displayed as 100 to avoid breaking the
+   * progress bar.
+   */
+  usedPercent: z.number().min(0).max(100).nullable(),
+  /**
+   * Estimated USD cost of sending this context once (input tokens only), or
+   * `null` when no input price is configured for the model. The cost row in the
+   * UI is hidden when this is `null`.
+   */
+  estimatedInputCostUsd: z.number().nonnegative().nullable(),
+  /**
+   * Non-empty segments in canonical stack order (`CONTEXT_WINDOW_CATEGORIES`).
+   * Categories with zero tokens are omitted.
+   */
+  segments: z.array(ContextWindowSegmentSchema),
+});
+
+export type ContextWindowBreakdown = z.infer<
+  typeof ContextWindowBreakdownSchema
+>;
+
+// ============================================================================
+// Conversation Titles
+// ============================================================================
+
+/**
+ * Longest title generation may return. A response longer than this is a model
+ * answering the conversation rather than naming it, so it is discarded instead
+ * of truncated and the conversation falls back to a placeholder.
+ */
+const CONVERSATION_TITLE_MAX_CHARS = 80;
+
+/** Longest placeholder title, before the ellipsis that marks the cut. */
+const PLACEHOLDER_TITLE_MAX_CHARS = 30;
+
+/**
+ * Shape a user's opening prompt into something title-like: a single line,
+ * capped. A new conversation is created with this as its title until the server
+ * generates a real one, and the server settles on it when the model declines to
+ * name the conversation.
+ *
+ * Shared deliberately: the client decides whether a stored title is still a
+ * placeholder by comparing against this exact string, so a second
+ * implementation that shaped even one character differently would leave those
+ * conversations asking to be retitled forever.
+ */
+export function toPlaceholderTitle(raw: string): string {
+  return truncateCharsWithEllipsis(
+    collapseWhitespace(raw),
+    PLACEHOLDER_TITLE_MAX_CHARS,
+  );
+}
+
+/** Why a title generation response could not be used as a title. */
+export type TitleRejectionReason = "empty_response" | "not_a_title";
+
+export type ConversationTitleResult =
+  | { title: string; reason?: never }
+  | { title: null; reason: TitleRejectionReason };
+
+/**
+ * Read a title generation response as a conversation title, or say why it is
+ * not one.
+ *
+ * A model that followed the 3-6 word instruction returns one short line, which
+ * some wrap in quotes. Anything else is not a title: no visible text (a
+ * reasoning model that spent its whole output ceiling thinking) or a paragraph
+ * (a model that answered the conversation instead of naming it). Those are
+ * rejected rather than truncated, so the caller can settle on a placeholder
+ * taken from the user's own opening prompt — a better sidebar entry than half
+ * an answer. The reason is carried out so the caller can log which happened.
+ *
+ * Lives here next to {@link toPlaceholderTitle} because the two together define
+ * what a conversation title may be; the cap is meaningless apart from them.
+ */
+export function toConversationTitle(raw: string): ConversationTitleResult {
+  const candidate = stripWrappingQuotes(collapseWhitespace(raw));
+
+  if (!candidate) {
+    return { title: null, reason: "empty_response" };
+  }
+
+  if (exceedsCharLimit(candidate, CONVERSATION_TITLE_MAX_CHARS)) {
+    return { title: null, reason: "not_a_title" };
+  }
+
+  return { title: candidate };
 }
 
 // ============================================================================
@@ -37,7 +247,403 @@ export type ChatMessage = {
   id?: string;
   role: "system" | "user" | "assistant" | "tool";
   parts?: ChatMessagePart[];
+  metadata?: unknown;
 };
+
+/**
+ * Type of the inline hook-run debug part. A `data-*` part: persisted and
+ * rendered in the chat thread, but dropped from the model conversion
+ * (`convertToModelMessages`), so the LLM never sees it — same class as
+ * `data-tool-ui-start`. Shared so the backend (emit) and frontend (render)
+ * agree on the wire string.
+ */
+export const HOOK_RUN_PART_TYPE = "data-hook-run";
+
+/**
+ * Type of the non-fatal turn notice part: a `data-*` part carrying a
+ * `ChatErrorResponse` (e.g. `IncompleteResponse`) that is persisted with the
+ * assistant reply and rendered after it, but dropped from the model conversion.
+ */
+export const TURN_NOTICE_PART_TYPE = "data-turn-notice" as const;
+
+/**
+ * Type of the inline subagent-tool-call part. A `data-*` part: persisted and
+ * rendered in the chat thread (nested under the delegation call that spawned
+ * it), but dropped from the model conversion (`convertToModelMessages`), so the
+ * parent model never sees its subagent's internal tool calls — same class as
+ * `data-hook-run`. Shared so the backend (emit) and frontend (render) agree on
+ * the wire string.
+ */
+export const SUBAGENT_TOOL_CALL_PART_TYPE = "data-subagent-tool-call";
+
+/**
+ * The `data` payload of a {@link SUBAGENT_TOOL_CALL_PART_TYPE} part: one tool
+ * call a delegated child agent made during its run. `parentToolCallId` links it
+ * to the delegation tool call (`agent__<slug>`) that spawned the child; for a
+ * deeper descendant it is the delegation call one level up, so the client
+ * rebuilds an arbitrary-depth tree purely by `toolCallId`→`parentToolCallId`
+ * linkage. `input`/`output` are capped before persistence so a large child
+ * result can't bloat the parent message row.
+ */
+export interface SubagentToolCallPartData {
+  /** The delegation tool call id (`agent__<slug>`) this child call hangs under. */
+  parentToolCallId: string;
+  /** The child tool call's own id (unique — generated per child run). */
+  toolCallId: string;
+  /** The tool the child invoked (e.g. `web_search`, or `agent__<slug>` for a nested delegation). */
+  toolName: string;
+  /** Request arguments, capped. */
+  input?: unknown;
+  /** Tool state: `input-available` while running, then `output-available` / `output-error`. */
+  state?: string;
+  /** Result, capped. Absent on error. */
+  output?: unknown;
+  /** Error text when the child call failed. */
+  errorText?: string;
+}
+
+/**
+ * Type of the inline MCP-task part. A `data-*` part: persisted and rendered in
+ * the chat thread, but dropped from the model conversion
+ * (`convertToModelMessages`), so the LLM never sees it — same class as
+ * `data-subagent-tool-call`. The model still receives the tool's real result
+ * when the task settles; this part exists purely so the user can watch a
+ * long-running call and cancel it. Shared so the backend (emit) and frontend
+ * (render) agree on the wire string.
+ */
+export const MCP_TASK_PART_TYPE = "data-mcp-task";
+
+/** Lifecycle of a gateway-minted MCP task, as the chat UI sees it. */
+export type McpTaskStatus = "working" | "completed" | "failed" | "cancelled";
+
+/**
+ * The `data` payload of a {@link MCP_TASK_PART_TYPE} part: one tool call that
+ * outlived the synchronous threshold and detached into a durable task.
+ *
+ * `toolCallId` links the card to the tool call it belongs to, so the UI can
+ * render it against that call rather than floating loose. `startedAt` is the
+ * absolute epoch the call began — carried explicitly so a card that mounts
+ * late (a reload part-way through a long task) still shows a correct elapsed
+ * time instead of counting from mount.
+ */
+export interface McpTaskPartData {
+  /** Gateway task id — the handle `tasks/get` and cancellation are keyed on. */
+  taskId: string;
+  /** The tool call this task backs. */
+  toolCallId: string;
+  toolName: string;
+  status: McpTaskStatus;
+  /** Epoch milliseconds when the underlying call started. */
+  startedAt: number;
+  /** Why the task ended, when it did not complete cleanly. */
+  errorText?: string;
+}
+
+// Control/telemetry parts the chat UI skips and providers never see. An
+// assistant turn left with only these (e.g. a `step-start` after a dangling
+// tool call is stripped) renders nothing, so it must not count as content.
+// `data-tool-ui-start` is deliberately absent — the UI renders it as an MCP app.
+const NON_RENDERABLE_ASSISTANT_PART_TYPES: ReadonlySet<string> = new Set([
+  "step-start",
+  "data-token-usage",
+  "data-heartbeat",
+  "data-context-window-estimate",
+  "data-context-window-breakdown",
+  "data-context-compaction-start",
+  "data-context-compaction-finish",
+]);
+
+/**
+ * True when an assistant message still carries something the chat UI can
+ * render: a non-empty text part, or any non-text part that is not a known
+ * non-renderable control/telemetry marker (so completed tool results,
+ * reasoning, files, MCP-app parts all count). An assistant turn left with no
+ * parts — or only empty text / control parts — after normalization is not
+ * renderable and must not be persisted or shown. Fails safe toward keeping:
+ * an unrecognized part type counts as content. Structurally typed so both
+ * backend `ChatMessagePart`s and the frontend's AI SDK `UIMessage` parts
+ * satisfy it.
+ */
+export function hasRenderableAssistantContent(message: {
+  parts?: ReadonlyArray<{ type: string; text?: unknown }>;
+}): boolean {
+  return (message.parts ?? []).some((part) => {
+    if (part.type === "text") {
+      return Boolean(part.text);
+    }
+
+    return !NON_RENDERABLE_ASSISTANT_PART_TYPES.has(part.type);
+  });
+}
+
+// Tool states that survive normalization and render durably: a result, an
+// error, a denial, or an approval prompt/answer. A tool part in any of these
+// is real assistant content. Excludes `input-streaming`/`input-available` and
+// bare `tool-call` parts — those are pending/dangling and get stripped before
+// persistence.
+const TERMINAL_TOOL_PART_STATES: ReadonlySet<string> = new Set([
+  "output-available",
+  "output-error",
+  "output-denied",
+  "approval-requested",
+  "approval-responded",
+]);
+
+type AssistantContentPart = {
+  type: string;
+  text?: unknown;
+  state?: unknown;
+  toolCallId?: unknown;
+  data?: unknown;
+};
+
+/**
+ * Strict counterpart to {@link hasRenderableAssistantContent} for the persist
+ * and read paths. Unlike the UI predicate (which keeps any unknown non-text
+ * part so live streaming never blanks out), this fails safe toward *dropping*:
+ * an assistant message is persistable only when it carries content that still
+ * renders after a reload — non-empty text, reasoning, a file/image/source, a terminal
+ * tool part, or a `data-tool-ui-start` MCP-app marker paired with a terminal
+ * tool part in the same message. Everything else (no parts, `parts: []`,
+ * `content: ""`, whitespace-only text, only `step-start`/telemetry `data-*`, or
+ * an unpaired marker) is an empty bubble and must not be stored or shown.
+ * Structurally typed so backend `ChatMessagePart`s and the frontend's AI SDK
+ * `UIMessage` parts both satisfy it.
+ */
+export function hasPersistableAssistantContent(message: {
+  parts?: ReadonlyArray<AssistantContentPart>;
+}): boolean {
+  const parts = message.parts;
+  // read-path callers pass historical JSON that is only cast, so reject any
+  // shape that is not an array of `type`-tagged parts before inspecting it.
+  if (!Array.isArray(parts) || parts.length === 0) {
+    return false;
+  }
+
+  const terminalToolCallIds = new Set<string>();
+  for (const part of parts) {
+    if (isTerminalToolPart(part) && typeof part.toolCallId === "string") {
+      terminalToolCallIds.add(part.toolCallId);
+    }
+  }
+
+  return parts.some((part) => {
+    if (typeof part?.type !== "string") {
+      return false;
+    }
+
+    if (part.type === "text" || part.type === "reasoning") {
+      return typeof part.text === "string" && part.text.trim().length > 0;
+    }
+
+    // `image` covers model-generated images (e.g. Gemini image generation),
+    // which the image-stripping normalizer deliberately preserves on assistant
+    // turns for multi-turn image editing.
+    if (
+      part.type === "file" ||
+      part.type === "image" ||
+      part.type.startsWith("source")
+    ) {
+      return true;
+    }
+
+    // a hook-run debug chip is standalone renderable content; unlike a
+    // `data-tool-ui-start` marker it needs no pairing, so a turn carrying only
+    // hook entries is still persistable rather than dropped as an empty bubble.
+    if (part.type === HOOK_RUN_PART_TYPE) {
+      return true;
+    }
+
+    // a subagent tool-call chip is standalone renderable content (rendered
+    // nested under its delegation call); like a hook-run entry it needs no
+    // pairing, so a turn carrying only subagent calls is still persistable.
+    if (part.type === SUBAGENT_TOOL_CALL_PART_TYPE) {
+      return true;
+    }
+
+    if (isTerminalToolPart(part)) {
+      return true;
+    }
+
+    // an MCP-app marker only counts when its tool call actually resolved —
+    // an orphaned marker reloads as a perpetually running tool, i.e. an empty
+    // bubble.
+    if (part.type.startsWith("data-tool-ui-start")) {
+      const toolCallId =
+        typeof part.data === "object" &&
+        part.data !== null &&
+        "toolCallId" in part.data
+          ? (part.data as { toolCallId?: unknown }).toolCallId
+          : undefined;
+      return (
+        typeof toolCallId === "string" && terminalToolCallIds.has(toolCallId)
+      );
+    }
+
+    return false;
+  });
+}
+
+function isTerminalToolPart(part: AssistantContentPart): boolean {
+  if (typeof part?.type !== "string") {
+    return false;
+  }
+  if (part.type === "tool-result") {
+    return true;
+  }
+  const isToolPart =
+    part.type.startsWith("tool-") || part.type === "dynamic-tool";
+  return (
+    isToolPart &&
+    typeof part.state === "string" &&
+    TERMINAL_TOOL_PART_STATES.has(part.state)
+  );
+}
+
+/**
+ * The skill a user explicitly invoked via slash command, carried on the user
+ * message's metadata. The backend uses it to inject the skill's activation
+ * block; the chat UI uses it to badge the message.
+ */
+export const ChatSkillMetadataSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+});
+
+export type ChatSkillMetadata = z.infer<typeof ChatSkillMetadataSchema>;
+
+/**
+ * An external MCP Skill explicitly attached to a chat turn. Identity fields
+ * are untrusted hints: the backend re-resolves installation access and the
+ * catalog URI before fetching live source bytes. displayName is UI-only.
+ */
+export const ChatExternalMcpSkillMetadataSchema = z.object({
+  id: z.string().uuid(),
+  mcpServerId: z.string().uuid(),
+  uri: z.string().min(1).max(4096),
+  name: z.string().min(1).max(200),
+  serverName: z.string().min(1).max(200),
+  commandValue: z
+    .string()
+    .regex(/^\/[a-z0-9][a-z0-9-]*$/)
+    .max(500),
+  displayName: z.string().min(1).max(500),
+});
+
+export type ChatExternalMcpSkillMetadata = z.infer<
+  typeof ChatExternalMcpSkillMetadataSchema
+>;
+
+export const ChatPluginSkillMetadataSchema = z.object({
+  pluginId: z.string().uuid(),
+  skillPath: z.string().max(500),
+  name: z.string().min(1).max(200),
+  pluginName: z.string().min(1).max(200),
+  commandValue: z
+    .string()
+    .regex(/^\/[a-z0-9][a-z0-9-]*$/)
+    .max(500),
+  displayName: z.string().min(1).max(1000),
+});
+
+export type ChatPluginSkillMetadata = z.infer<
+  typeof ChatPluginSkillMetadataSchema
+>;
+
+/**
+ * Render-loop diagnostics from owned MCP App renders, attached once by the
+ * chat UI to the next outgoing user message. Collected inside an untrusted
+ * sandboxed iframe — the backend re-validates and frames them as data, never
+ * as instructions, when injecting into the prompt.
+ */
+export const ChatAppDiagnosticsMetadataSchema = z
+  .array(
+    z.object({
+      appId: z.string().uuid(),
+      version: z.number().nullable(),
+      entries: z
+        .array(
+          z.object({
+            type: z.string().max(32),
+            message: z.string().max(1000),
+          }),
+        )
+        .max(50),
+    }),
+  )
+  .max(10);
+
+export type ChatAppDiagnosticsMetadata = z.infer<
+  typeof ChatAppDiagnosticsMetadataSchema
+>;
+
+/**
+ * The app the chat UI reports as currently open, attached to each outgoing user
+ * message so the backend can restate its context in that turn's system prompt.
+ * Exactly one family: an owned Archestra app (`appId`) or an external MCP-server
+ * app (`appMcpServerId`). An untrusted hint — the backend re-resolves the id
+ * through the caller's own access check before injecting anything, so a forged
+ * id can only ever surface an app the caller could already see.
+ */
+export const ChatOpenedAppMetadataSchema = z.union([
+  z.object({
+    appId: z.string().uuid(),
+    /**
+     * State the running app last reported for the model via the MCP-Apps
+     * `ui/update-model-context` request (e.g. which file it is displaying).
+     * App-authored free text — untrusted; the backend sanitizes and quotes it
+     * as data before it reaches the prompt.
+     */
+    modelContext: z.string().max(2000).optional(),
+  }),
+  z.object({ appMcpServerId: z.string().uuid() }),
+]);
+
+export type ChatOpenedAppMetadata = z.infer<typeof ChatOpenedAppMetadataSchema>;
+
+export const ChatMessageFeedbackSchema = z.enum(["up", "down"]);
+export type ChatMessageFeedback = z.infer<typeof ChatMessageFeedbackSchema>;
+
+/** Chat message metadata. Permissive — only the keys we own are typed. */
+export const ChatMessageMetadataSchema = z
+  .object({
+    skill: ChatSkillMetadataSchema.optional(),
+    externalMcpSkill: ChatExternalMcpSkillMetadataSchema.optional(),
+    pluginSkill: ChatPluginSkillMetadataSchema.optional(),
+    appDiagnostics: ChatAppDiagnosticsMetadataSchema.optional(),
+    openedApp: ChatOpenedAppMetadataSchema.optional(),
+    /**
+     * Owner's thumbs verdict on an assistant message. Projected from the
+     * `messages.feedback` column on read — the column is authoritative, any
+     * value embedded in persisted content JSON is overridden.
+     */
+    feedback: ChatMessageFeedbackSchema.optional(),
+    /**
+     * Marks a `!`-prefixed user message the composer submitted for direct
+     * sandbox execution (no LLM turn). A marker only — the command is always
+     * re-derived server-side from the message text via `parseSandboxCommand`,
+     * so a forged marker can never execute anything other than what the
+     * transcript shows.
+     */
+    sandboxCommand: z.literal(true).optional(),
+  })
+  .passthrough();
+
+/**
+ * Parse a `!`-prefixed chat message into the shell command it requests
+ * (Claude Code's `!` convention). Returns null for anything else, including a
+ * bare `!` — those submit as ordinary messages. Used by the composer to decide
+ * whether to mark a message and by the chat route to derive the command to
+ * execute; both sides must agree, which is why it lives in shared.
+ */
+export function parseSandboxCommand(text: string): { command: string } | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("!")) {
+    return null;
+  }
+  const command = trimmed.slice(1).trim();
+  return command.length > 0 ? { command } : null;
+}
 
 // ============================================================================
 // Zod Schemas for Model Modalities
@@ -76,9 +682,15 @@ export type SupportedChatUploadMimeType =
   | "application/json"
   | "application/octet-stream"
   | "application/pdf"
+  | "application/toml"
   | "application/vnd.ms-excel"
+  | "application/x-yaml"
+  | "application/yaml"
   | "application/xml"
+  | "audio/aac"
   | "audio/flac"
+  | "audio/m4a"
+  | "audio/mp4"
   | "audio/mpeg"
   | "audio/mp3"
   | "audio/ogg"
@@ -94,6 +706,10 @@ export type SupportedChatUploadMimeType =
   | "text/csv"
   | "text/markdown"
   | "text/plain"
+  | "text/tab-separated-values"
+  | "text/x-toml"
+  | "text/xml"
+  | "text/yaml"
   | "video/avi"
   | "video/mp4"
   | "video/quicktime"
@@ -102,6 +718,140 @@ export type SupportedChatUploadMimeType =
 // ============================================================================
 // File Type Utilities
 // ============================================================================
+
+/**
+ * Source of truth for inlineable text document MIME types. A text file of one of
+ * these types that is small enough (see {@link INLINE_TEXT_MAX_BYTES}) is embedded
+ * directly into the prompt as decoded text. The same list gates which non-image
+ * uploads the composer accepts and which file parts the provider-prep path inlines,
+ * so it must stay the single definition shared across frontend and backend.
+ */
+const INLINEABLE_TEXT_MIME_TYPES = [
+  "text/plain",
+  "text/markdown",
+  "text/csv",
+  "text/tab-separated-values",
+  "application/json",
+  "text/xml",
+  "application/xml",
+  "application/x-yaml",
+  "application/yaml",
+  "text/yaml",
+  "application/toml",
+  "text/x-toml",
+  // Legacy CSV aliases some browsers and operating systems report.
+  "application/csv",
+  "application/vnd.ms-excel",
+] as const satisfies readonly SupportedChatUploadMimeType[];
+
+const INLINEABLE_TEXT_MIME_TYPE_SET: ReadonlySet<string> = new Set(
+  INLINEABLE_TEXT_MIME_TYPES,
+);
+
+/**
+ * Whether a MIME type is an inlineable text document — embeddable in the prompt as
+ * decoded text on any provider, rather than handed off as a binary attachment.
+ */
+export function isInlineableTextMimeType(mimeType: string): boolean {
+  return INLINEABLE_TEXT_MIME_TYPE_SET.has(mimeType);
+}
+
+/**
+ * Upper size bound for embedding a text document directly into the prompt. Larger
+ * text files are routed to the sandbox when available, otherwise rejected at ingest.
+ */
+export const INLINE_TEXT_MAX_BYTES = 256 * 1024;
+
+/**
+ * Default cap on what a single chat upload may store as a conversation
+ * attachment. Deliberately independent of the sandbox artifact limit: a file
+ * too big for the sandbox still has the Files panel to land in, so the sandbox
+ * is bypassed rather than made the gatekeeper. Shared so the backend default
+ * and the frontend's pre-`/api/config` fallback can never drift.
+ */
+export const DEFAULT_CHAT_ATTACHMENT_STORAGE_BYTES = 50 * 1024 * 1024;
+
+/**
+ * Default ceiling on what a single attachment may contribute to a provider
+ * request. Storing a file and sending it to a model are separate questions:
+ * anything heavier than this stays in the Files panel (and the sandbox, when it
+ * fits) rather than being embedded in the prompt, so a large upload can never
+ * inflate a request past what the provider accepts.
+ */
+export const DEFAULT_CHAT_ATTACHMENT_INLINE_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Why an upload is not acceptable, or `null` when it is. Single source of truth
+ * for the attachment policy shared by the backend ingest gate (authoritative)
+ * and the frontend composer (mirrors it for UX). A file is acceptable when the
+ * model can ingest its type, OR it is a small inlineable text document, OR a
+ * sandbox is available to stage it within the sandbox artifact size limit, OR
+ * (with `fileStorageByteLimit`) it is stored as a conversation file the user can
+ * reach from the chat Files panel.
+ */
+export type ChatUploadRejectionReason =
+  | "text_too_large"
+  | "too_large_for_sandbox"
+  | "too_large_to_store"
+  | "unsupported_type";
+
+export function chatUploadRejectionReason(params: {
+  mimeType: string;
+  byteLength: number;
+  ingestibleMimeTypes: Set<string>;
+  sandboxAvailable: boolean;
+  sandboxByteLimit: number;
+  /**
+   * Cap on what may be stored as a conversation attachment surfaced in the chat
+   * Files panel, enabling that fallback for files the model can't read and the
+   * sandbox can't take. The chat upload path has that surface, so it passes its
+   * configured cap; A2A has no per-conversation Files panel for its callers, so
+   * it omits this and keeps rejecting.
+   */
+  fileStorageByteLimit?: number;
+}): ChatUploadRejectionReason | null {
+  const {
+    mimeType,
+    byteLength,
+    ingestibleMimeTypes,
+    sandboxAvailable,
+    sandboxByteLimit,
+    fileStorageByteLimit,
+  } = params;
+
+  // Every accepted upload is persisted as a conversation attachment — the Files
+  // panel and sandbox staging both read that one row — so when the fallback is
+  // active its cap bounds the turn, including types the model reads natively.
+  const fileStorageFallback = fileStorageByteLimit != null;
+  if (fileStorageFallback && byteLength > fileStorageByteLimit) {
+    return "too_large_to_store";
+  }
+
+  // Under the storage cap, the sandbox limit only decides whether the file can
+  // additionally be staged for the model — never whether it is accepted.
+  const fitsSandbox = sandboxAvailable && byteLength <= sandboxByteLimit;
+
+  // Inlineable text is size-gated even though a text-capable model lists these
+  // MIMEs as readable: a large text file would otherwise blow the context
+  // window. Checked before the generic ingestible short-circuit for that reason.
+  if (isInlineableTextMimeType(mimeType)) {
+    if (
+      byteLength <= INLINE_TEXT_MAX_BYTES ||
+      fitsSandbox ||
+      fileStorageFallback
+    ) {
+      return null;
+    }
+    return sandboxAvailable ? "too_large_for_sandbox" : "text_too_large";
+  }
+
+  // Non-text types the model can ingest natively (images, PDFs, …) carry no
+  // inline-text budget; only the storage cap above bounds them.
+  if (ingestibleMimeTypes.has(mimeType)) return null;
+
+  if (fitsSandbox || fileStorageFallback) return null;
+  return sandboxAvailable ? "too_large_for_sandbox" : "unsupported_type";
+}
 
 /**
  * Mapping from input modalities to accepted MIME type patterns.
@@ -113,14 +863,8 @@ const MODALITY_TO_MIME_TYPES: Record<
   ModelInputModality,
   SupportedChatUploadMimeType[] | null
 > = {
-  // Text-capable models can accept plain text and CSV documents.
-  text: [
-    "text/plain",
-    "text/markdown",
-    "text/csv",
-    "application/csv",
-    "application/vnd.ms-excel",
-  ],
+  // Text-capable models accept the inlineable text document types.
+  text: [...INLINEABLE_TEXT_MIME_TYPES],
   // Image formats commonly supported by vision models
   image: [
     "image/jpeg",
@@ -142,14 +886,6 @@ const MODALITY_TO_MIME_TYPES: Record<
   video: ["video/mp4", "video/webm", "video/quicktime", "video/avi"],
   // PDF documents for document understanding models
   pdf: ["application/pdf"],
-};
-
-const MODALITY_TO_FILE_TYPE_DESCRIPTION: Record<ModelInputModality, string> = {
-  text: "chat prompts, .txt, .csv, and .md uploads",
-  image: "images",
-  audio: "audio",
-  video: "video",
-  pdf: "PDFs",
 };
 
 type FileLikeWithMediaType = {
@@ -238,16 +974,23 @@ export function getMediaType(file: FileLikeWithMediaType): string {
     svg: "image/svg+xml",
     bmp: "image/bmp",
     ico: "image/x-icon",
+    m4a: "audio/mp4",
+    aac: "audio/aac",
     mp4: "video/mp4",
     webm: "video/webm",
     mov: "video/quicktime",
     avi: "video/avi",
     pdf: "application/pdf",
     csv: "text/csv",
+    tsv: "text/tab-separated-values",
     md: "text/markdown",
+    markdown: "text/markdown",
     txt: "text/plain",
     json: "application/json",
     xml: "application/xml",
+    yaml: "application/x-yaml",
+    yml: "application/x-yaml",
+    toml: "application/toml",
   };
 
   return ext
@@ -256,37 +999,26 @@ export function getMediaType(file: FileLikeWithMediaType): string {
 }
 
 /**
- * Converts an array of input modalities to a comma-separated string of MIME types
- * suitable for use with the HTML input accept attribute.
- *
- * @param modalities - Array of input modalities from model capabilities
- * @returns Comma-separated MIME types string, or undefined if no file uploads are supported
- *
- * @example
- * // Model that supports images and PDFs
- * getAcceptedFileTypes(["text", "image", "pdf"])
- * // Returns: "image/jpeg,image/png,image/gif,image/webp,image/svg+xml,application/pdf"
- *
- * @example
- * // Model that only supports text
- * getAcceptedFileTypes(["text"])
- * // Returns: "text/plain,text/csv"
- *
- * @example
- * // Model with full multimodal support
- * getAcceptedFileTypes(["text", "image", "audio", "video", "pdf"])
- * // Returns all supported MIME types
+ * The MIME types a model can ingest directly, derived from its input
+ * modalities. Returns a Set for membership checks on the provider-prep path: a
+ * file part whose mediaType is absent is not sent as a document the provider
+ * would reject — it is referenced as a sandbox file instead. Pass
+ * `undefined`/`null` modalities to fall back to a safe readable default
+ * (text + images + PDF). `provider` adds the formats only that provider's
+ * request conversion accepts (see {@link PROVIDER_EXTRA_AUDIO_MIME_TYPES}).
  */
-export function getAcceptedFileTypes(
+export function getModelReadableMimeTypes(
   modalities: ModelInputModality[] | null | undefined,
-): string | undefined {
-  if (!modalities || modalities.length === 0) {
-    return undefined;
-  }
-
-  const mimeTypes = new Set<SupportedChatUploadMimeType>();
-
-  for (const modality of modalities) {
+  provider?: SupportedProvider | null,
+): Set<string> {
+  // Treat an empty array the same as null — "capabilities unknown" — rather
+  // than "reads nothing".
+  const source =
+    modalities && modalities.length > 0
+      ? modalities
+      : DEFAULT_READABLE_MODALITIES;
+  const mimeTypes = new Set<string>();
+  for (const modality of source) {
     const types = MODALITY_TO_MIME_TYPES[modality];
     if (types) {
       for (const type of types) {
@@ -294,58 +1026,31 @@ export function getAcceptedFileTypes(
       }
     }
   }
-
-  // If no MIME types were collected, return undefined.
-  if (mimeTypes.size === 0) {
-    return undefined;
+  const extraAudio = provider && PROVIDER_EXTRA_AUDIO_MIME_TYPES[provider];
+  if (extraAudio && source.includes("audio")) {
+    for (const type of extraAudio) {
+      mimeTypes.add(type);
+    }
   }
-
-  return [...mimeTypes].join(",");
+  return mimeTypes;
 }
+
+const DEFAULT_READABLE_MODALITIES: ModelInputModality[] = [
+  "text",
+  "image",
+  "pdf",
+];
 
 /**
- * Checks if a model supports any file uploads based on its input modalities.
- *
- * @param modalities - Array of input modalities from model capabilities
- * @returns true if the model supports at least one file type, false otherwise
+ * Audio formats readable only on some providers, on top of the shared `audio`
+ * list. Gemini passes any audio media type through as inline data and accepts
+ * AAC/M4A (the format of Slack voice clips, reported as `audio/mp4`). They are
+ * kept out of the shared list because OpenAI's chat conversion throws on any
+ * audio type other than WAV/MP3, which would fail the turn instead of staging
+ * the file into the sandbox.
  */
-export function supportsFileUploads(
-  modalities: ModelInputModality[] | null | undefined,
-): boolean {
-  if (!modalities || modalities.length === 0) {
-    return false;
-  }
-
-  // Check if any modality enables file uploads
-  return modalities.some((modality) => {
-    const types = MODALITY_TO_MIME_TYPES[modality];
-    return types !== null && types.length > 0;
-  });
-}
-
-/**
- * Gets a human-readable description of supported file types for display.
- *
- * @param modalities - Array of input modalities from model capabilities
- * @returns Description string or null if no file types are supported
- */
-export function getSupportedFileTypesDescription(
-  modalities: ModelInputModality[] | null | undefined,
-): string | null {
-  if (!modalities || modalities.length === 0) {
-    return null;
-  }
-
-  const supportedTypes = modalities
-    .filter((modality) => {
-      const types = MODALITY_TO_MIME_TYPES[modality];
-      return types !== null && types.length > 0;
-    })
-    .map((modality) => MODALITY_TO_FILE_TYPE_DESCRIPTION[modality]);
-
-  if (supportedTypes.length === 0) {
-    return null;
-  }
-
-  return supportedTypes.join(", ");
-}
+const PROVIDER_EXTRA_AUDIO_MIME_TYPES: Partial<
+  Record<SupportedProvider, readonly SupportedChatUploadMimeType[]>
+> = {
+  gemini: ["audio/mp4", "audio/m4a", "audio/aac"],
+};

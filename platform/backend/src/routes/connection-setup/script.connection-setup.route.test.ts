@@ -1,0 +1,1710 @@
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import {
+  CLAUDE_CODE_CLIENT_ID,
+  COPILOT_CLI_CLIENT_ID,
+  defaultRuntimeHandoffInstructions,
+  EXTERNAL_AGENT_ID_HEADER,
+  PERSONAL_MCP_GATEWAY_NAME,
+  VIRTUAL_KEY_HEADER,
+} from "@archestra/shared";
+import { eq } from "drizzle-orm";
+import JSZip from "jszip";
+import { parse } from "smol-toml";
+import { vi } from "vitest";
+import db, { schema } from "@/database";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import {
+  ConnectionSetupModel,
+  MemberModel,
+  OrganizationModel,
+  PluginModel,
+  SkillMarketplaceRepoModel,
+  SkillModel,
+  SkillShareLinkModel,
+  VirtualApiKeyModel,
+} from "@/models";
+import LlmProviderApiKeyModelLinkModel from "@/models/llm-provider-api-key-model";
+import ModelModel from "@/models/model";
+import { getAvailableLlmModels } from "@/routes/llm-provider-models";
+import { anthropicAdapterFactory } from "@/routes/proxy/adapters/anthropic";
+import { openaiAdapterFactory } from "@/routes/proxy/adapters/openai";
+import { xaiAdapterFactory } from "@/routes/proxy/adapters/xai";
+import { readVirtualKeyValue } from "@/services/connection-setup";
+import { deriveMarketplaceName } from "@/skills/marketplace/marketplace-name";
+import { resolveMarketplaceViewer } from "@/skills/marketplace/static-marketplace";
+import {
+  accessGrants,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  test,
+} from "@/test";
+import type { User } from "@/types";
+
+vi.mock("@/auth");
+
+function embeddedRuntimeParams(script: string): Array<Record<string, unknown>> {
+  const marker = "const params = ";
+  const found: Array<Record<string, unknown>> = [];
+  let from = 0;
+  while (from < script.length) {
+    const at = script.indexOf(marker, from);
+    if (at === -1) break;
+    const start = at + marker.length;
+    if (script[start] !== "{") {
+      from = start;
+      continue;
+    }
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let end = -1;
+    for (let i = start; i < script.length; i++) {
+      const char = script[i];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') inString = false;
+        continue;
+      }
+      if (char === '"') inString = true;
+      else if (char === "{") depth++;
+      else if (char === "}") {
+        depth--;
+        if (depth === 0) {
+          end = i + 1;
+          break;
+        }
+      }
+    }
+    if (end === -1) break;
+    found.push(JSON.parse(script.slice(start, end)) as Record<string, unknown>);
+    from = end;
+  }
+  return found;
+}
+
+// cacheManager needs a live PostgreSQL connection that PGlite tests don't
+// have; back it with the canonical Map-backed fake from
+// src/__mocks__/cache-manager.ts so the rate limiter runs for real against an
+// in-memory store (reset before every test).
+vi.mock("@/cache-manager");
+
+import { userHasPermission } from "@/auth";
+import config, { parseOpenAppaConfig } from "@/config";
+import GuardrailsDeploymentModel from "@/models/guardrails-deployment";
+import { clientConnectionService } from "@/services/client-connection";
+import {
+  connectionSetupReference,
+  readVerifiedConnectionProxySetup,
+} from "@/services/connection-proxy-setup-context";
+import { grantEverywhere } from "@/test/wildcard-grants";
+
+const mockUserHasPermission = vi.mocked(userHasPermission);
+
+// The client-app attribution header is always injected for Claude clients,
+// independent of the passthrough virtual key.
+const AGENT_ID_HEADER_LINE = `${EXTERNAL_AGENT_ID_HEADER}: ${CLAUDE_CODE_CLIENT_ID}`;
+
+let remoteAddressCounter = 0;
+/** Unique IP per request batch so the per-IP rate limit never bleeds between tests. */
+function nextRemoteAddress(): string {
+  remoteAddressCounter += 1;
+  return `10.1.${Math.floor(remoteAddressCounter / 250)}.${(remoteAddressCounter % 250) + 1}`;
+}
+
+describe("GET /api/connection-setups/script/:token", () => {
+  let app: FastifyInstanceWithZod;
+  let organizationId: string;
+  let user: User;
+
+  beforeEach(async ({ makeOrganization, makeUser, makeMember }) => {
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    user = await makeUser();
+    await makeMember(user.id, organizationId);
+    mockUserHasPermission.mockReset();
+    mockUserHasPermission.mockResolvedValue(true);
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (
+        request as typeof request & { organizationId: string; user: User }
+      ).organizationId = organizationId;
+      (request as typeof request & { user: User }).user = user;
+    });
+
+    const { default: connectionSetupRoutes } = await import(
+      "./connection-setup.routes"
+    );
+    await app.register(connectionSetupRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  async function createSetup(payload: Record<string, unknown>) {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/connection-setups",
+      payload,
+    });
+    expect(response.statusCode).toBe(200);
+    const command: string = response.json().command;
+    const rawToken = command.match(/script\/([^']+)'/)?.[1] as string;
+    expect(rawToken).toBeTruthy();
+    return { rawToken, command };
+  }
+
+  function fetchScript(rawToken: string) {
+    return app.inject({
+      method: "GET",
+      url: `/api/connection-setups/script/${rawToken}`,
+      remoteAddress: nextRemoteAddress(),
+    });
+  }
+
+  test("Grok binds an approved setup to the gateway and proxy, and consumes its one-time ticket", async ({
+    makeAgent,
+  }) => {
+    const gateway = await makeAgent({
+      organizationId,
+      agentType: "mcp_gateway",
+    });
+    const { rawToken } = await createSetup({
+      clientId: "grok-build",
+      baseUrl: "http://localhost:9000/v1",
+      mcpGatewayId: gateway.id,
+      provider: "xai",
+      proxyAuth: "provider-key",
+      model: "synthetic-model",
+    });
+    const setup = await ConnectionSetupModel.findByToken(rawToken);
+    expect(setup).toMatchObject({
+      clientId: "grok-build",
+      mcpGatewayId: gateway.id,
+      provider: "xai",
+      includeSkills: false,
+    });
+    const script = await fetchScript(rawToken);
+    expect(script.statusCode, script.body).toBe(200);
+    expect(script.body).toContain("BEGIN ARCHESTRA GROK CONNECTION");
+    expect(script.body).toContain("grok-build");
+    expect(script.body).toContain("{{session_id}}");
+    expect(script.body).toContain("XAI_API_KEY");
+    expect(script.body).not.toContain("--always-approve");
+    expect((await fetchScript(rawToken)).statusCode).toBe(410);
+  });
+
+  for (const provider of ["xai", "openai", "anthropic"] as const) {
+    for (const proxyAuth of ["virtual-key", "provider-key"] as const) {
+      test(`Grok ${provider} ${proxyAuth} carries the catalog's upstream model through the generated TOML to the selected provider request`, async ({
+        makeSecret,
+        makeLlmProviderApiKey,
+      }) => {
+        const key = await makeLlmProviderApiKey(
+          organizationId,
+          (await makeSecret()).id,
+          { provider },
+        );
+        const upstreamModel = `${provider}/synthetic-model:revision`;
+        const model = await ModelModel.create({
+          provider,
+          modelId: upstreamModel,
+          externalId: `catalog/${upstreamModel}`,
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+          supportsToolCalling: true,
+        });
+        await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(key.id, [
+          model.id,
+        ]);
+        const catalog = await getAvailableLlmModels({
+          query: { provider, apiKeyId: key.id },
+          userId: user.id,
+          organizationId,
+        });
+        const selected = catalog.find((entry) => entry.dbId === model.id);
+        expect(selected).toMatchObject({ id: upstreamModel, dbId: model.id });
+        if (!selected) throw new Error("Expected selected model in catalog");
+        const { rawToken } = await createSetup({
+          clientId: "grok-build",
+          baseUrl: "http://localhost:9000/v1",
+          provider,
+          proxyAuth,
+          model: selected.id,
+        });
+        const response = await fetchScript(rawToken);
+        expect(response.statusCode, response.body).toBe(200);
+        if (proxyAuth === "provider-key") {
+          const setup = await ConnectionSetupModel.findByToken(rawToken);
+          expect(setup?.virtualApiKeyId).toBeTruthy();
+        }
+        const source = response.body.match(
+          /node - <<'ARCHESTRA_NODE_SETUP'\n([\s\S]*?)\nARCHESTRA_NODE_SETUP/,
+        )?.[1];
+        expect(source).toBeTruthy();
+        const home = mkdtempSync(path.join(tmpdir(), "grok-model-contract-"));
+        try {
+          const installed = spawnSync(process.execPath, ["-"], {
+            input: source,
+            encoding: "utf8",
+            env: {
+              ...process.env,
+              HOME: home,
+              GROK_HOME: path.join(home, "grok"),
+            },
+          });
+          expect(installed.status, installed.stderr).toBe(0);
+          const parsed = parse(
+            readFileSync(
+              path.join(home, ".archestra/grok/native/config.toml"),
+              "utf8",
+            ),
+          ) as {
+            model: {
+              archestra: {
+                model: string;
+                base_url: string;
+                api_backend: string;
+              };
+            };
+          };
+          const connection = parsed.model.archestra;
+          expect(new URL(connection.base_url).pathname).toMatch(
+            new RegExp(`/v1/(?:connection-setup/[^/]+/)?${provider}$`),
+          );
+          expect(connection.api_backend).toBe(
+            provider === "anthropic" ? "messages" : "chat_completions",
+          );
+          const body = {
+            model: connection.model,
+            messages: [{ role: "user" as const, content: "Synthetic request" }],
+            max_tokens: 16,
+          };
+          const requestAdapter =
+            provider === "anthropic"
+              ? anthropicAdapterFactory.createRequestAdapter(body)
+              : provider === "xai"
+                ? xaiAdapterFactory.createRequestAdapter(body)
+                : openaiAdapterFactory.createRequestAdapter(body);
+          expect(requestAdapter.getModel()).toBe(upstreamModel);
+          expect(requestAdapter.toProviderRequest()).toMatchObject({
+            model: upstreamModel,
+          });
+          expect(connection.model).not.toBe(model.id);
+          expect(connection.model).not.toBe(`${provider}:${upstreamModel}`);
+        } finally {
+          rmSync(home, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+
+  test("cursor installer points Cursor at the Model Router with its virtual key", async ({
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    await makeLlmProviderApiKey(organizationId, (await makeSecret()).id, {
+      provider: "anthropic",
+      isPrimary: true,
+    });
+    const { rawToken } = await createSetup({
+      clientId: "cursor",
+      baseUrl: "http://localhost:9000/v1",
+      proxyAuth: "primary-providers",
+    });
+    const setup = await ConnectionSetupModel.findByToken(rawToken);
+    const virtualKey = await readVirtualKeyValue(
+      setup?.virtualApiKeyId as string,
+    );
+
+    const response = await fetchScript(rawToken);
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.body).toContain(
+      "ARCHESTRA_CURSOR_BASE_URL='http://localhost:9000/v1/unified-model'",
+    );
+    expect(response.body).toContain(`ARCHESTRA_CURSOR_API_KEY='${virtualKey}'`);
+    expect(response.body).not.toContain("/connection-setup/");
+  });
+
+  for (const clientId of ["opencode", "kilo"] as const) {
+    test(`${clientId} primary-providers installer routes the user's own sign-ins through the proxy with a passthrough key`, async ({
+      makeSecret,
+      makeLlmProviderApiKey,
+    }) => {
+      const providerKey = await makeLlmProviderApiKey(
+        organizationId,
+        (await makeSecret()).id,
+        { provider: "anthropic", isPrimary: true },
+      );
+      const model = await ModelModel.create({
+        provider: "anthropic",
+        modelId: "claude-test",
+        externalId: "anthropic/claude-test",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+      });
+      await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(providerKey.id, [
+        model.id,
+      ]);
+      // An admin turned Gemini off for the organization.
+      await OrganizationModel.patch(organizationId, {
+        modelProviderOverrides: { gemini: { hidden: true } },
+      });
+      const { rawToken } = await createSetup({
+        clientId,
+        baseUrl: "http://localhost:9000/v1",
+        proxyAuth: "primary-providers",
+      });
+
+      const response = await fetchScript(rawToken);
+      expect(response.statusCode, response.body).toBe(200);
+      const passthroughKey = await VirtualApiKeyModel.findByAuthorScopeName({
+        organizationId,
+        authorId: user.id,
+        scope: "personal",
+        name: `Connection passthrough — ${user.email}`,
+      });
+      expect(passthroughKey?.keyType).toBe("passthrough");
+      const passthroughValue = await readVirtualKeyValue(
+        passthroughKey?.id as string,
+      );
+      // Managed bootstraps load routes from the installer-written params file.
+      const plugins = [
+        ...response.body.matchAll(/ARCHESTRA_OC_PLUGIN_CONTENT='([^']+)'/g),
+      ].map((match) => Buffer.from(match[1], "base64").toString("utf8"));
+      expect(plugins.length).toBeGreaterThan(0);
+      for (const plugin of plugins) {
+        expect(plugin).not.toContain(passthroughValue);
+        expect(plugin).toContain("runtime.params.routes");
+      }
+      const payloads = embeddedRuntimeParams(response.body);
+      expect(payloads.length).toBeGreaterThan(0);
+      for (const payload of payloads) {
+        const routes = payload.routes as Record<string, string>;
+        const routeHeaders = payload.routeHeaders as Record<
+          string,
+          Record<string, string>
+        >;
+        // The organization's Anthropic key and the user's own Anthropic
+        // sign-in share the client's provider and its route.
+        expect(
+          Object.keys(routes).some((id) => id.startsWith("archestra-")),
+        ).toBe(false);
+        expect(routes.anthropic).toMatch(
+          /^http:\/\/localhost:9000\/v1\/connection-setup\/[^/]+\/anthropic\/v1$/,
+        );
+        expect(routes.openai).toContain("http://localhost:9000/v1/");
+        expect(routes).not.toHaveProperty("google");
+        expect(routeHeaders.anthropic).toEqual({
+          [VIRTUAL_KEY_HEADER]: passthroughValue,
+        });
+      }
+    });
+  }
+
+  test("cursor installer lists the Model Router's chat models and the organization default", async ({
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const providerKey = await makeLlmProviderApiKey(
+      organizationId,
+      (await makeSecret()).id,
+      { provider: "anthropic", isPrimary: true },
+    );
+    const createModel = (modelId: string, embeddingDimensions?: 1024) =>
+      ModelModel.create({
+        provider: "anthropic",
+        modelId,
+        externalId: `anthropic/${modelId}`,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        embeddingDimensions,
+      });
+    const sonnet = await createModel("claude-sonnet-test");
+    const haiku = await createModel("claude-haiku-test");
+    const embedding = await createModel("embed-test", 1024);
+    await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(providerKey.id, [
+      sonnet.id,
+      haiku.id,
+      embedding.id,
+    ]);
+    await OrganizationModel.patch(organizationId, {
+      defaultModelId: sonnet.id,
+    });
+
+    const { rawToken } = await createSetup({
+      clientId: "cursor",
+      baseUrl: "http://localhost:9000/v1",
+      proxyAuth: "primary-providers",
+    });
+    const response = await fetchScript(rawToken);
+
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.body).toContain(
+      `ARCHESTRA_CURSOR_MODELS='${JSON.stringify({
+        ids: ["anthropic:claude-haiku-test", "anthropic:claude-sonnet-test"],
+        defaultId: "anthropic:claude-sonnet-test",
+      })}'`,
+    );
+  });
+
+  // Cursor has no single-provider proxy setup; its Model Router setup is
+  // covered on its own below.
+  for (const clientId of [
+    "claude-code",
+    "claude-desktop",
+    "codex",
+    "copilot-cli",
+    "opencode",
+  ] as const) {
+    for (const proxyAuth of ["virtual-key", "provider-key"] as const) {
+      test(`${clientId} ${proxyAuth} installer binds setup scope to its actual authentication`, async ({
+        makeAgent,
+        makeSecret,
+        makeLlmProviderApiKey,
+      }) => {
+        const proxy = await makeAgent({
+          organizationId,
+          agentType: "llm_proxy",
+          name: "Main Proxy",
+        });
+        const provider =
+          clientId === "codex"
+            ? "openai"
+            : clientId === "copilot-cli" && proxyAuth === "provider-key"
+              ? "github-copilot"
+              : clientId === "copilot-cli"
+                ? "openai"
+                : "anthropic";
+        const providerKey = await makeLlmProviderApiKey(
+          organizationId,
+          (await makeSecret()).id,
+          { provider },
+        );
+        if (clientId === "opencode") {
+          // OpenCode setups only publish providers that have a usable model.
+          const model = await ModelModel.create({
+            provider,
+            modelId: "claude-test",
+            externalId: "claude-test",
+            inputModalities: ["text"],
+            outputModalities: ["text"],
+          });
+          await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(
+            providerKey.id,
+            [model.id],
+          );
+        }
+        const { rawToken } = await createSetup({
+          clientId,
+          baseUrl: "http://localhost:9000/v1",
+          llmProxyId: proxy.id,
+          provider,
+          proxyAuth,
+          ...(clientId === "copilot-cli" ? { model: "gpt-4.1" } : {}),
+        });
+        const setup = await ConnectionSetupModel.findByToken(rawToken);
+        const response = await app.inject({
+          method: "GET",
+          url: `/api/connection-setups/script/${rawToken}`,
+          ...(clientId === "claude-desktop"
+            ? {
+                headers: {
+                  accept: "application/vnd.archestra.desktop-setup+json",
+                },
+              }
+            : {}),
+        });
+        expect(response.statusCode, response.body).toBe(200);
+        const token =
+          clientId === "claude-desktop"
+            ? response.json().proxy.baseUrl.split("/connection-setup/")[1]
+            : response.body.match(
+                /\/v1\/connection-setup\/(cps1_[A-Za-z0-9_.-]+)\//,
+              )?.[1];
+        if (!setup?.virtualApiKeyId) {
+          expect(token).toBeUndefined();
+          expect(response.body).toContain(
+            `http://localhost:9000/v1/${provider}`,
+          );
+          return;
+        }
+        expect(token).toBeTruthy();
+        expect(response.body).toContain(
+          `/connection-setup/${token}/${provider}`,
+        );
+        expect(
+          readVerifiedConnectionProxySetup({
+            token,
+            organizationId,
+            virtualApiKeyId: setup.virtualApiKeyId,
+            proxyAgentId: setup.llmProxyId ?? "",
+            secret: config.auth.secret,
+          }),
+        ).toBeDefined();
+        expect(
+          readVerifiedConnectionProxySetup({
+            token,
+            organizationId,
+            virtualApiKeyId: setup.virtualApiKeyId,
+            proxyAgentId: "another-proxy",
+            secret: config.auth.secret,
+          }),
+        ).toBeUndefined();
+        if (clientId !== "claude-desktop") {
+          // The installer prints the reference the proxy looks for in the
+          // conversation that ran it, as plain text in its ending.
+          expect(response.body).toContain(
+            `Setup reference   ${connectionSetupReference({
+              setupId: setup.id,
+              secret: config.auth.secret,
+            })}`,
+          );
+        }
+      });
+    }
+  }
+
+  for (const platform of ["linux", "windows"] as const) {
+    test(`MCP-only Claude ${platform} setup pre-approves only exact recovery helpers`, async ({
+      makeAgent,
+    }) => {
+      const gateway = await makeAgent({
+        organizationId,
+        agentType: "mcp_gateway",
+        name: "QA Gateway",
+      });
+      const { rawToken } = await createSetup({
+        clientId: "claude-code",
+        platform,
+        baseUrl: "http://localhost:9000/v1",
+        mcpGatewayId: gateway.id,
+      });
+      const response = await fetchScript(rawToken);
+      expect(response.statusCode, response.body).toBe(200);
+      for (const name of [
+        "get_remedy_plans",
+        "execute_remedy_plan",
+        "yell",
+        "ask_user",
+      ]) {
+        expect(response.body).toContain(`mcp__qa_gateway__archestra__${name}`);
+      }
+      expect(response.body).not.toContain("mcp__qa_gateway__*");
+      expect(response.body).not.toContain(
+        "mcp__qa_gateway__archestra__update_guardrails_policy",
+      );
+    });
+  }
+
+  for (const { clientId, enabled, instructions, expected } of [
+    {
+      clientId: "claude-code",
+      enabled: undefined,
+      instructions: null,
+      expected: defaultRuntimeHandoffInstructions("Archestra"),
+    },
+    {
+      clientId: "claude-code",
+      enabled: true,
+      instructions: null,
+      expected: defaultRuntimeHandoffInstructions("Archestra"),
+    },
+    {
+      clientId: "claude-code",
+      enabled: true,
+      instructions: "Offer remote research.",
+      expected: "Offer remote research.",
+    },
+    {
+      clientId: "claude-code",
+      enabled: false,
+      instructions: "Disabled instructions.",
+      expected: null,
+    },
+    {
+      clientId: "codex",
+      enabled: true,
+      instructions: "Offer Codex handoff.",
+      expected: "Offer Codex handoff.",
+    },
+    {
+      clientId: "copilot-cli",
+      enabled: true,
+      instructions: "Offer Copilot handoff.",
+      expected: "Offer Copilot handoff.",
+    },
+    {
+      clientId: "cursor",
+      enabled: true,
+      instructions: "Offer Cursor handoff.",
+      expected: "Offer Cursor handoff.",
+    },
+  ]) {
+    test(`renders current handoff settings for ${clientId} (enabled=${enabled}, instructions=${instructions})`, async ({
+      makeAgent,
+    }) => {
+      const gateway = await makeAgent({
+        organizationId,
+        agentType: "mcp_gateway",
+      });
+      const { rawToken } = await createSetup({
+        clientId,
+        platform: "linux",
+        baseUrl: "http://localhost:9000/v1",
+        mcpGatewayId: gateway.id,
+      });
+      await OrganizationModel.patch(organizationId, {
+        connectionRuntimeHandoffEnabled: enabled,
+        connectionRuntimeHandoffInstructions: instructions,
+      });
+      const response = await fetchScript(rawToken);
+      expect(response.statusCode, response.body).toBe(200);
+      if (expected) {
+        expect(response.body).toContain(expected.replaceAll("'", "'\\''"));
+        expect(response.body).toContain(
+          clientId === "codex"
+            ? "developer_instructions="
+            : clientId === "copilot-cli"
+              ? "COPILOT_CUSTOM_INSTRUCTIONS_DIRS"
+              : clientId === "cursor"
+                ? "Customize > Rules > User Rules"
+                : "set -- --append-system-prompt-file",
+        );
+      } else {
+        expect(response.body).not.toContain(instructions);
+        // Even initially disabled connections install the refresh path so admins can enable instructions later.
+        expect(response.body).toContain("instructions-refresh.py");
+      }
+    });
+  }
+
+  for (const platform of ["macos", "windows", "linux"] as const) {
+    test(`serves and consumes the Desktop ${platform} installer`, async ({
+      makeAgent,
+    }) => {
+      const proxy = await makeAgent({ organizationId, agentType: "llm_proxy" });
+      const { rawToken, command } = await createSetup({
+        clientId: "claude-desktop",
+        platform,
+        baseUrl: "http://localhost:9000/v1",
+        llmProxyId: proxy.id,
+        provider: "anthropic",
+        proxyAuth: "provider-key",
+      });
+      const download = await app.inject({
+        method: "GET",
+        url: `/api/connection-setups/script/${rawToken}?download=desktop`,
+        remoteAddress: nextRemoteAddress(),
+      });
+      expect(download.statusCode).toBe(200);
+      expect(download.headers["content-disposition"]).toContain(".mcpb");
+      const bundle = await JSZip.loadAsync(download.rawPayload);
+      const setupFile = bundle.file("setup.json");
+      if (!setupFile) throw new Error("Missing bundled setup ticket");
+      expect(JSON.parse(await setupFile.async("string"))).toEqual({
+        origin: "http://localhost:9000",
+        rawToken,
+        platform,
+      });
+      expect(
+        (await ConnectionSetupModel.findByToken(rawToken))?.consumedAt,
+      ).toBeNull();
+      const response = await fetchScript(rawToken);
+      expect(response.statusCode).toBe(200);
+      expect(command).toContain(platform === "windows" ? "| iex" : "| bash");
+      const usedDownload = await app.inject({
+        method: "GET",
+        url: `/api/connection-setups/script/${rawToken}?download=desktop`,
+        remoteAddress: nextRemoteAddress(),
+      });
+      expect(usedDownload.statusCode).toBe(410);
+      expect(response.body).toContain(
+        platform === "windows"
+          ? "$installer = @'"
+          : "python3 <<'ARCHESTRA_DESKTOP_PY'",
+      );
+      expect((await fetchScript(rawToken)).statusCode).toBe(410);
+    });
+  }
+
+  test("redeems the Desktop ticket as runtime configuration without packaging subscription credentials", async ({
+    makeAgent,
+  }) => {
+    const proxy = await makeAgent({ organizationId, agentType: "llm_proxy" });
+    const skill = await seedSkill({ organizationId, name: "desktop-skill" });
+    const { rawToken } = await createSetup({
+      clientId: "claude-desktop",
+      platform: "macos",
+      baseUrl: "http://localhost:9000/v1",
+      llmProxyId: proxy.id,
+      provider: "anthropic",
+      proxyAuth: "provider-key",
+      skills: { skillIds: [skill.id], ttlDays: 30 },
+    });
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/connection-setups/script/${rawToken}`,
+      headers: { accept: "application/vnd.archestra.desktop-setup+json" },
+      remoteAddress: nextRemoteAddress(),
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-type"]).toContain("application/json");
+    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(response.json()).toMatchObject({
+      clientId: "claude-desktop",
+      platform: "macos",
+      proxy: {
+        authMode: "provider-key",
+        provider: "anthropic",
+        virtualKey: null,
+      },
+    });
+    const marketplaceUrl = new URL(response.json().skills.cloneUrl);
+    expect(marketplaceUrl.username).toBe("");
+    expect(marketplaceUrl.pathname).toMatch(
+      /^\/skills\/m\/archestra_skl_.+\/repo\.git$/,
+    );
+    const links = await SkillShareLinkModel.listByOrganization({
+      organizationId,
+    });
+    expect(links).toHaveLength(1);
+    expect(links[0].skills.map((item) => item.id)).toEqual([skill.id]);
+    expect(response.body).not.toContain("sk-ant-");
+    expect((await fetchScript(rawToken)).statusCode).toBe(410);
+  });
+
+  test.for([
+    "one",
+    "all",
+    "none",
+  ] as const)("Pi delivers exactly the selected shared skills: %s", async (selection, {
+    makeAgent,
+  }) => {
+    const gateway = await makeAgent({
+      organizationId,
+      agentType: "mcp_gateway",
+    });
+    const first = await seedSkill({ organizationId, name: "native-checks" });
+    const second = await seedSkill({ organizationId, name: "native-format" });
+    const ids =
+      selection === "all"
+        ? [first.id, second.id]
+        : selection === "one"
+          ? [first.id]
+          : [];
+    const { rawToken } = await createSetup({
+      clientId: "pi",
+      baseUrl: "http://localhost:9000/v1",
+      mcpGatewayId: gateway.id,
+      provider: "openai",
+      proxyAuth: "provider-key",
+      attributePassthrough: true,
+      model: "openai:gpt-6.1-sol",
+      ...(ids.length ? { skills: { skillIds: ids, ttlDays: 30 } } : {}),
+    });
+    const response = await fetchScript(rawToken);
+    expect(response.statusCode, response.body).toBe(200);
+    const links = await SkillShareLinkModel.listByOrganization({
+      organizationId,
+    });
+    expect(links).toHaveLength(ids.length ? 1 : 0);
+    if (ids.length) {
+      expect(links[0].skills.map((item) => item.id).sort()).toEqual(
+        [...ids].sort(),
+      );
+      expect(response.body).toContain("archestra_skl_");
+    } else {
+      expect(response.body).not.toMatch(/archestra_skl_[A-Za-z0-9_-]{32}/);
+    }
+    // Pi uses a share link, so it must not create a shared-marketplace repo
+    // row with a name the client never registers.
+    expect(
+      await SkillMarketplaceRepoModel.findForViewer({
+        organizationId,
+        userId: user.id,
+      }),
+    ).toBeNull();
+    expect((await fetchScript(rawToken)).statusCode).toBe(410);
+  });
+
+  for (const [platform, withSkills] of [
+    ["linux", false],
+    ["linux", true],
+    ["windows", false],
+    ["windows", true],
+  ] as const) {
+    test(`ChatGPT combines routing, gateway and native plugin installation on ${platform}, with shared skills: ${withSkills}`, async ({
+      makeAgent,
+    }) => {
+      const gateway = await makeAgent({
+        organizationId,
+        agentType: "mcp_gateway",
+        name: "Desktop Gateway",
+      });
+      const proxy = await makeAgent({
+        organizationId,
+        agentType: "llm_proxy",
+        name: "Desktop Proxy",
+      });
+      const skill = withSkills
+        ? await seedSkill({ organizationId, name: "desktop-guide" })
+        : null;
+      const { rawToken } = await createSetup({
+        clientId: "chatgpt",
+        platform,
+        baseUrl: "http://localhost:9000/v1",
+        mcpGatewayId: gateway.id,
+        llmProxyId: proxy.id,
+        provider: "openai",
+        proxyAuth: "provider-key",
+        ...(skill ? { skills: { skillIds: [skill.id], ttlDays: null } } : {}),
+      });
+      const response = await fetchScript(rawToken);
+      expect(response.statusCode, response.body).toBe(200);
+      const repo = await SkillMarketplaceRepoModel.findForViewer({
+        organizationId,
+        userId: user.id,
+      });
+      expect(repo).toBeNull();
+      const links = await SkillShareLinkModel.listByOrganization({
+        organizationId,
+      });
+      expect(links).toHaveLength(1);
+      const marketplace = links[0].marketplaceName;
+      expect(response.body).toContain(
+        `codex plugin add '${marketplace}@${marketplace}'`,
+      );
+      expect(response.body).toContain("archestra_skl_");
+      expect(response.body).not.toContain("codex mcp add");
+      expect(response.body).not.toContain("[mcp_servers.desktop_gateway]");
+      expect(response.body).toContain(
+        `[plugins."${marketplace}@${marketplace}".mcp_servers."desktop_gateway"`,
+      );
+      expect(response.body).toContain("codex mcp get 'desktop_gateway' --json");
+      expect(response.body).toMatch(/\[model_providers\.[a-z_]+\]/);
+      expect(response.body).toContain('wire_api = "responses"');
+      expect(response.body).toContain("Restart ChatGPT");
+      expect(response.body).toContain("Plugin installation failed");
+      expect((await fetchScript(rawToken)).statusCode).toBe(410);
+    });
+  }
+
+  test("404s an unknown token", async () => {
+    const response = await fetchScript("archestra_con_does-not-exist-at-all");
+    expect(response.statusCode).toBe(404);
+  });
+
+  test("renders the script once, with secrets injected, then 410s", async ({
+    makeAgent,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const gateway = await makeAgent({
+      organizationId,
+      agentType: "mcp_gateway",
+      name: "Prod Gateway",
+    });
+    const proxy = await makeAgent({
+      organizationId,
+      agentType: "llm_proxy",
+      name: "Main Proxy",
+    });
+    await makeLlmProviderApiKey(organizationId, (await makeSecret()).id, {
+      provider: "anthropic",
+    });
+    const skill = await seedSkill({ organizationId, name: "alpha" });
+
+    const { rawToken } = await createSetup({
+      clientId: "claude-code",
+      baseUrl: "http://localhost:9000/v1",
+      mcpGatewayId: gateway.id,
+      llmProxyId: proxy.id,
+      provider: "anthropic",
+      proxyAuth: "virtual-key",
+      skills: { skillIds: [skill.id], ttlDays: 30 },
+    });
+
+    const response = await fetchScript(rawToken);
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-type"]).toContain("text/plain");
+    expect(response.headers["cache-control"]).toBe("no-store");
+
+    const script = response.body;
+    expect(script).toContain("set -euo pipefail");
+    expect(script).toContain(
+      "claude mcp add --scope user --transport http 'prod_gateway'",
+    );
+    expect(script).toContain(`/v1/mcp/${gateway.slug ?? gateway.id}`);
+    expect(script).toMatch(
+      /\/v1\/connection-setup\/cps1_[A-Za-z0-9_.-]+\/anthropic/,
+    );
+    // the real virtual key value is injected, no placeholders
+    expect(script).toMatch(/arch_[0-9a-f]{64}/);
+    expect(script).not.toMatch(/<your-[a-z-]+>/);
+    // A skills-only setup registers the shared marketplace URL with a
+    // credential minted for this user — no snapshot link, so the install stays
+    // current and a member gets the same one command an admin does.
+    expect(script).toContain("/skills/marketplace.git");
+    expect(script).toContain("archestra_mkt_");
+    expect(script).not.toContain("/skills/m/archestra_skl_");
+    // The credential remembers its setup, so syncs can be told apart by agent.
+    const [credential] = await db
+      .select({ clientId: schema.connectionSetupsTable.clientId })
+      .from(schema.skillMarketplaceCredentialsTable)
+      .innerJoin(
+        schema.connectionSetupsTable,
+        eq(
+          schema.connectionSetupsTable.id,
+          schema.skillMarketplaceCredentialsTable.connectionSetupId,
+        ),
+      );
+    expect(credential?.clientId).toBe("claude-code");
+    const links = await SkillShareLinkModel.listByOrganization({
+      organizationId,
+    });
+    expect(links).toHaveLength(0);
+
+    // one-time: the second fetch is refused
+    const second = await fetchScript(rawToken);
+    expect(second.statusCode).toBe(410);
+  });
+
+  test("a member who cannot administer skills still gets a working one-command install", async ({
+    makeAgent,
+  }) => {
+    // The headline of the shared marketplace URL: reading skills is enough to
+    // install them. Before, the script refused (410) for anyone without
+    // skill:admin, leaving members no path to shared skills at all. That
+    // action is retired; the member holds every role action and no grant on
+    // every skill.
+    mockUserHasPermission.mockResolvedValue(true);
+
+    const gateway = await makeAgent({
+      organizationId,
+      agentType: "mcp_gateway",
+      name: "Prod Gateway",
+    });
+    const skill = await seedSkill({ organizationId, name: "alpha" });
+
+    const { rawToken } = await createSetup({
+      clientId: "claude-code",
+      baseUrl: "http://localhost:9000/v1",
+      mcpGatewayId: gateway.id,
+      skills: { skillIds: [skill.id], ttlDays: null },
+    });
+
+    const response = await fetchScript(rawToken);
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("/skills/marketplace.git");
+    expect(response.body).toContain("archestra_mkt_");
+    // no snapshot published on their behalf — that stays admin-only
+    expect(
+      await SkillShareLinkModel.listByOrganization({ organizationId }),
+    ).toHaveLength(0);
+  });
+
+  test("a skills-only setup names the marketplace after the repo the user already cloned", async ({
+    makeUser,
+    makeMember,
+  }) => {
+    // Codex registers the marketplace under the served manifest's name, which
+    // the user's repo row freezes. After an app rename the setup must still
+    // remove and guard that name, or the add collides with it.
+    const skill = await seedSkill({ organizationId, name: "alpha" });
+    await OrganizationModel.patch(organizationId, { appName: "Acme Staging" });
+    const derived = await deriveMarketplaceName(organizationId, "skills");
+    expect(derived).toMatch(/^acme-staging-/);
+
+    const otherUser = await makeUser();
+    await makeMember(otherUser.id, organizationId);
+    await SkillMarketplaceRepoModel.ensureForViewer({
+      organizationId,
+      userId: user.id,
+      marketplaceName: "archestra-old-skills",
+    });
+
+    const renderCodex = async (platform: "linux" | "windows" = "linux") => {
+      const { rawToken } = await createSetup({
+        clientId: "codex",
+        platform,
+        baseUrl: "http://localhost:9000/v1",
+        ...(skill ? { skills: { skillIds: [skill.id], ttlDays: null } } : {}),
+      });
+      const response = await fetchScript(rawToken);
+      expect(response.statusCode).toBe(200);
+      return response.body;
+    };
+
+    const script = await renderCodex();
+    expect(script).toContain(
+      "cli codex plugin marketplace remove 'archestra-old-skills'",
+    );
+    expect(script).toContain("SKILLS_MARKETPLACE_NAME='archestra-old-skills'");
+    expect(script).not.toContain(derived);
+
+    const windowsScript = await renderCodex("windows");
+    expect(windowsScript).toContain(
+      "codex plugin marketplace remove 'archestra-old-skills'",
+    );
+    expect(windowsScript).toContain(
+      "$SkillsMarketplaceName = 'archestra-old-skills'",
+    );
+    expect(windowsScript).not.toContain(derived);
+
+    // Someone who never cloned gets the derived name, frozen when the script
+    // renders, so a rename before their first clone cannot split the names.
+    // The request hook reads `user`, so the setups below belong to otherUser.
+    user = otherUser;
+    const fresh = await renderCodex();
+    expect(fresh).toContain(`cli codex plugin marketplace remove '${derived}'`);
+    expect(fresh).toContain(`SKILLS_MARKETPLACE_NAME='${derived}'`);
+
+    await OrganizationModel.patch(organizationId, {
+      appName: "Acme Production",
+    });
+    const afterRename = await renderCodex();
+    expect(afterRename).toContain(
+      `cli codex plugin marketplace remove '${derived}'`,
+    );
+    expect(afterRename).toContain(`SKILLS_MARKETPLACE_NAME='${derived}'`);
+  });
+
+  test("the shared marketplace URL carries the token as its password", async ({
+    makeAgent,
+  }) => {
+    // Some git versions lose a token sent as a username with no password.
+    const gateway = await makeAgent({
+      organizationId,
+      agentType: "mcp_gateway",
+      name: "Prod Gateway",
+    });
+    const skill = await seedSkill({ organizationId, name: "alpha" });
+    const { rawToken } = await createSetup({
+      clientId: "codex",
+      baseUrl: "http://localhost:9000/v1",
+      mcpGatewayId: gateway.id,
+      skills: { skillIds: [skill.id], ttlDays: null },
+    });
+
+    const response = await fetchScript(rawToken);
+    expect(response.statusCode).toBe(200);
+    const [cloneUrl] =
+      response.body.match(/https?:\/\/[^\s'"]+\/skills\/marketplace\.git/) ??
+      [];
+    expect(cloneUrl).toBeDefined();
+    const url = new URL(cloneUrl as string);
+    expect(url.username).toBe("token");
+    const marketplaceToken = decodeURIComponent(url.password);
+    expect(marketplaceToken).toMatch(/^archestra_mkt_/);
+
+    // What git sends from that URL resolves to the user who ran the setup.
+    const result = await resolveMarketplaceViewer({
+      authorization: `Basic ${Buffer.from(`${url.username}:${marketplaceToken}`).toString("base64")}`,
+    });
+    expect(result).toMatchObject({
+      status: "ok",
+      viewer: { organizationId, userId: user.id },
+    });
+  });
+
+  test("a caller who cannot read skills at all is refused up front", async ({
+    makeAgent,
+  }) => {
+    mockUserHasPermission.mockImplementation(
+      async (_userId, _orgId, resource) => resource !== "skill",
+    );
+
+    const gateway = await makeAgent({
+      organizationId,
+      agentType: "mcp_gateway",
+      name: "Prod Gateway",
+    });
+    const skill = await seedSkill({ organizationId, name: "alpha" });
+
+    // Refused when the setup is created, rather than 410ing later at fetch
+    // time: the caller finds out while they are still on the page.
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/connection-setups",
+      payload: {
+        clientId: "claude-code",
+        baseUrl: "http://localhost:9000/v1",
+        mcpGatewayId: gateway.id,
+        skills: { skillIds: [skill.id], ttlDays: null },
+      },
+    });
+    expect(response.statusCode).toBe(403);
+  });
+
+  test("windows platform yields an irm|iex command and a PowerShell script", async ({
+    makeAgent,
+  }) => {
+    const gateway = await makeAgent({
+      organizationId,
+      agentType: "mcp_gateway",
+      name: "Prod Gateway",
+    });
+
+    const { rawToken, command } = await createSetup({
+      clientId: "claude-code",
+      platform: "windows",
+      baseUrl: "http://localhost:9000/v1",
+      mcpGatewayId: gateway.id,
+    });
+    expect(command).toContain("irm '");
+    expect(command).toContain("| iex");
+    expect(command).not.toContain("curl");
+
+    const response = await fetchScript(rawToken);
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-type"]).toContain("text/plain");
+    const script = response.body;
+    expect(script).toContain("$ErrorActionPreference = 'Stop'");
+    expect(script).not.toContain("set -euo pipefail");
+    expect(script).toContain(
+      "claude mcp add --scope user --transport http 'prod_gateway'",
+    );
+  });
+
+  test("registers the seeded personal gateway under the app name, and drops its old entry", async ({
+    makeAgent,
+  }) => {
+    // Every member's gateway is seeded as "My Gateway". Registering that name
+    // verbatim put `my_gateway` in the client's server list, which says
+    // nothing about which platform serves it.
+    const gateway = await makeAgent({
+      organizationId,
+      agentType: "mcp_gateway",
+      name: PERSONAL_MCP_GATEWAY_NAME,
+      isPersonalGateway: true,
+    });
+
+    const { rawToken } = await createSetup({
+      clientId: "claude-code",
+      baseUrl: "http://localhost:9000/v1",
+      mcpGatewayId: gateway.id,
+    });
+
+    const script = (await fetchScript(rawToken)).body;
+    expect(script).toContain(
+      "claude mcp add --scope user --transport http 'archestra'",
+    );
+    expect(script).toContain(
+      "claude mcp remove --scope user 'my_gateway' >/dev/null 2>&1 || true",
+    );
+    expect(script).not.toContain("mcp add --scope user --transport http 'my_");
+  });
+
+  test("keeps the name of a personal gateway its owner renamed", async ({
+    makeAgent,
+  }) => {
+    const gateway = await makeAgent({
+      organizationId,
+      agentType: "mcp_gateway",
+      name: "Prod Gateway",
+      isPersonalGateway: true,
+    });
+
+    const { rawToken } = await createSetup({
+      clientId: "claude-code",
+      baseUrl: "http://localhost:9000/v1",
+      mcpGatewayId: gateway.id,
+    });
+
+    const script = (await fetchScript(rawToken)).body;
+    expect(script).toContain(
+      "claude mcp add --scope user --transport http 'prod_gateway'",
+    );
+    expect(script).not.toContain("'archestra'");
+  });
+
+  test("default platform (omitted) renders bash", async ({ makeAgent }) => {
+    const gateway = await makeAgent({
+      organizationId,
+      agentType: "mcp_gateway",
+      name: "Prod Gateway",
+    });
+    const { rawToken, command } = await createSetup({
+      clientId: "claude-code",
+      baseUrl: "http://localhost:9000/v1",
+      mcpGatewayId: gateway.id,
+    });
+    expect(command).toContain("curl -fsSL");
+    const response = await fetchScript(rawToken);
+    expect(response.body).toContain("set -euo pipefail");
+  });
+
+  test("provider-key (passthrough) script rewires the base URL without any virtual key, still carrying the client-app agent-id header", async ({
+    makeAgent,
+  }) => {
+    const proxy = await makeAgent({
+      organizationId,
+      agentType: "llm_proxy",
+      name: "Main Proxy",
+    });
+
+    const { rawToken } = await createSetup({
+      clientId: "claude-code",
+      baseUrl: "http://localhost:9000/v1",
+      llmProxyId: proxy.id,
+      provider: "anthropic",
+      attributePassthrough: false,
+    });
+
+    const response = await fetchScript(rawToken);
+    expect(response.statusCode).toBe(200);
+    const script = response.body;
+    expect(script).toContain("/v1/anthropic");
+    expect(script).not.toContain("/v1/connection-setup/");
+    expect(script).toContain("ANTHROPIC_BASE_URL");
+    // passthrough, attribution off: no injected virtual key, no auth token — but
+    // the client-app agent-id header always rides along, so the header block is
+    // still emitted (carrying only the agent id).
+    expect(script).not.toMatch(/arch_[0-9a-f]{64}/);
+    // no auth token injected into the settings merge (the key name itself
+    // still appears in the startup guard's disconnect strip list)
+    expect(script).not.toContain("ARCHESTRA_SET_ENV_ANTHROPIC_AUTH_TOKEN");
+    expect(script).toContain(
+      "export ARCHESTRA_APPEND_ANTHROPIC_CUSTOM_HEADERS",
+    );
+    expect(script).toContain(AGENT_ID_HEADER_LINE);
+    expect(script).toContain("credentials keep working");
+  });
+
+  test("claude-code anthropic passthrough injects the X-Archestra-Virtual-Key header by default", async ({
+    makeAgent,
+  }) => {
+    const proxy = await makeAgent({
+      organizationId,
+      agentType: "llm_proxy",
+      name: "Main Proxy",
+    });
+
+    const { rawToken } = await createSetup({
+      clientId: "claude-code",
+      baseUrl: "http://localhost:9000/v1",
+      llmProxyId: proxy.id,
+      provider: "anthropic",
+    });
+
+    const response = await fetchScript(rawToken);
+    expect(response.statusCode).toBe(200);
+    const script = response.body;
+    expect(script).toContain("ANTHROPIC_BASE_URL");
+    // the provisioned passthrough key rides in the attribution header, but the
+    // subscription still passes through (no auth token override)
+    expect(script).toContain(
+      "export ARCHESTRA_APPEND_ANTHROPIC_CUSTOM_HEADERS",
+    );
+    expect(script).toMatch(/X-Archestra-Virtual-Key: arch_[0-9a-f]{64}/);
+    expect(script).not.toContain("ARCHESTRA_SET_ENV_ANTHROPIC_AUTH_TOKEN");
+  });
+
+  test("codex openai passthrough writes the X-Archestra-Virtual-Key header into config.toml by default", async ({
+    makeAgent,
+  }) => {
+    const proxy = await makeAgent({
+      organizationId,
+      agentType: "llm_proxy",
+      name: "Main Proxy",
+    });
+
+    const { rawToken } = await createSetup({
+      clientId: "codex",
+      baseUrl: "http://localhost:9000/v1",
+      llmProxyId: proxy.id,
+      provider: "openai",
+    });
+
+    const response = await fetchScript(rawToken);
+    expect(response.statusCode).toBe(200);
+    const script = response.body;
+    // Codex keeps its existing ChatGPT or OpenAI API-key login.
+    expect(script).toContain(
+      "Codex uses your existing ChatGPT or OpenAI API-key login.",
+    );
+    expect(script).not.toContain(
+      `printf '%s' "$ARCHESTRA_VIRTUAL_KEY" | codex login --with-api-key`,
+    );
+    // ...and the provisioned passthrough key rides in config.toml's http_headers
+    // to attribute the request to the user, exactly like Claude Code passthrough.
+    expect(script).toContain("[model_providers.");
+    expect(script).toMatch(/"X-Archestra-Virtual-Key" = "arch_[0-9a-f]{64}"/);
+  });
+
+  test("claude-code bedrock passthrough injects the X-Archestra-Virtual-Key header by default", async ({
+    makeAgent,
+  }) => {
+    const proxy = await makeAgent({
+      organizationId,
+      agentType: "llm_proxy",
+      name: "Main Proxy",
+    });
+
+    const { rawToken } = await createSetup({
+      clientId: "claude-code",
+      baseUrl: "http://localhost:9000/v1",
+      llmProxyId: proxy.id,
+      provider: "bedrock",
+    });
+
+    const response = await fetchScript(rawToken);
+    expect(response.statusCode).toBe(200);
+    const script = response.body;
+    expect(script).toContain("CLAUDE_CODE_USE_BEDROCK");
+    expect(script).toMatch(
+      /\/v1\/connection-setup\/cps1_[A-Za-z0-9_.-]+\/bedrock/,
+    );
+    // The provisioned passthrough key rides in the attribution header alongside
+    // the agent-id line, exactly like the Anthropic passthrough; the user's own
+    // AWS credentials keep passing through (no bearer token is printed).
+    expect(script).toContain(
+      "export ARCHESTRA_APPEND_ANTHROPIC_CUSTOM_HEADERS",
+    );
+    expect(script).toContain(AGENT_ID_HEADER_LINE);
+    expect(script).toMatch(/X-Archestra-Virtual-Key: arch_[0-9a-f]{64}/);
+    // no bearer token export printed (the guard's disconnect note may still
+    // mention the variable name)
+    expect(script).not.toContain("export AWS_BEARER_TOKEN_BEDROCK");
+  });
+
+  test("a revoked attribution key degrades gracefully: script drops the virtual-key header but keeps the agent-id, no 410", async ({
+    makeAgent,
+  }) => {
+    const proxy = await makeAgent({
+      organizationId,
+      agentType: "llm_proxy",
+      name: "Main Proxy",
+    });
+
+    const { rawToken } = await createSetup({
+      clientId: "claude-code",
+      baseUrl: "http://localhost:9000/v1",
+      llmProxyId: proxy.id,
+      provider: "anthropic",
+    });
+
+    // Revoke the provisioned passthrough key between POST and GET.
+    const setup = await ConnectionSetupModel.findByToken(rawToken);
+    expect(setup?.virtualApiKeyId).toBeTruthy();
+    await VirtualApiKeyModel.delete(setup?.virtualApiKeyId as string);
+
+    const response = await fetchScript(rawToken);
+    // Best-effort: the subscription still passes through, so we render (200),
+    // just without the revoked passthrough virtual-key header — never a 410. The
+    // client-app agent-id header is independent of the key, so it stays.
+    expect(response.statusCode).toBe(200);
+    const script = response.body;
+    expect(script).toContain("ANTHROPIC_BASE_URL");
+    expect(script).toContain(
+      "export ARCHESTRA_APPEND_ANTHROPIC_CUSTOM_HEADERS",
+    );
+    expect(script).toContain(AGENT_ID_HEADER_LINE);
+    expect(script).not.toMatch(/X-Archestra-Virtual-Key: arch_[0-9a-f]{64}/);
+  });
+
+  test("github-copilot passthrough script embeds the in-script GitHub device flow", async ({
+    makeAgent,
+  }) => {
+    const proxy = await makeAgent({
+      organizationId,
+      agentType: "llm_proxy",
+      name: "Main Proxy",
+    });
+
+    const { rawToken } = await createSetup({
+      clientId: "copilot-cli",
+      baseUrl: "http://localhost:9000/v1",
+      llmProxyId: proxy.id,
+      provider: "github-copilot",
+    });
+
+    const response = await fetchScript(rawToken);
+    expect(response.statusCode).toBe(200);
+    const script = response.body;
+    expect(script).toMatch(
+      /\/v1\/connection-setup\/cps1_[A-Za-z0-9_.-]+\/github-copilot/,
+    );
+    // device-flow endpoints come from backend config
+    expect(script).toContain("/login/device/code");
+    expect(script).toContain("copilot_internal/v2/token");
+    // token obtained at runtime, not injected server-side
+    expect(script).toContain("ARCHESTRA_GHCP_TOKEN");
+    // The provider JSON includes both the client id and the provisioned
+    // passthrough key that ties each request back to this user.
+    expect(script).toContain(
+      `"${EXTERNAL_AGENT_ID_HEADER}":"${COPILOT_CLI_CLIENT_ID}"`,
+    );
+    expect(script).toMatch(
+      new RegExp(`"${VIRTUAL_KEY_HEADER}":"arch_[0-9a-f]{64}"`),
+    );
+  });
+
+  test("github-copilot is rejected for clients that do not support it", async ({
+    makeAgent,
+  }) => {
+    const proxy = await makeAgent({
+      organizationId,
+      agentType: "llm_proxy",
+      name: "Main Proxy",
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/connection-setups",
+      payload: {
+        clientId: "claude-code",
+        baseUrl: "http://localhost:9000/v1",
+        llmProxyId: proxy.id,
+        provider: "github-copilot",
+      },
+    });
+    expect(response.statusCode).toBe(400);
+  });
+
+  test("410s without burning the token when re-validation fails, then succeeds after access is restored", async ({
+    makeAgent,
+  }) => {
+    const gateway = await makeAgent({
+      organizationId,
+      agentType: "mcp_gateway",
+      name: "Gate",
+    });
+    const { rawToken } = await createSetup({
+      clientId: "codex",
+      baseUrl: "http://localhost:9000/v1",
+      mcpGatewayId: gateway.id,
+    });
+
+    // access revoked between POST and GET
+    mockUserHasPermission.mockResolvedValue(false);
+    const denied = await fetchScript(rawToken);
+    expect(denied.statusCode).toBe(410);
+
+    // rollback preserved the one-time token: restoring access lets it render
+    mockUserHasPermission.mockResolvedValue(true);
+    const allowed = await fetchScript(rawToken);
+    expect(allowed.statusCode).toBe(200);
+    expect(allowed.body).toContain("codex mcp add 'gate'");
+  });
+
+  test.each([
+    "claude-code",
+    "grok-build",
+  ] as const)("%s excludes unsupported plugins or re-validates plugin:admin before rendering executable hooks", async (clientId) => {
+    const originalFeatureState = config.beta;
+    config.beta = false;
+    const plugin = await PluginModel.create({
+      organizationId,
+      userId: user.id,
+      input: {
+        displayName: "Revalidated plugin",
+        description: "Permission revalidation test",
+        clientType: "claude-code",
+        files: [
+          {
+            path: "hooks/hooks.json",
+            content: "{}\n",
+            encoding: "utf8",
+            mode: "100644",
+          },
+        ],
+      },
+    });
+    if (!plugin) throw new Error("failed to seed plugin");
+    const { rawToken } = await ConnectionSetupModel.create({
+      organizationId,
+      userId: user.id,
+      clientId,
+      platform: "macos",
+      baseUrl: "http://localhost:9000/v1",
+      mcpGatewayId: null,
+      llmProxyId: null,
+      provider: null,
+      proxyAuth: "provider-key",
+      model: null,
+      virtualApiKeyId: null,
+      includeSkills: false,
+      skillLinkTtlDays: null,
+      pluginIds: [plugin.id],
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+
+    grantEverywhere(["plugin"], async () =>
+      Boolean(
+        await mockUserHasPermission.getMockImplementation()?.(
+          "",
+          "",
+          "plugin",
+          "admin" as never,
+        ),
+      ),
+    );
+    try {
+      mockUserHasPermission.mockResolvedValue(false);
+      if (clientId === "grok-build") {
+        const response = await fetchScript(rawToken);
+        expect(response.statusCode, response.body).toBe(200);
+        expect(response.body).not.toContain(plugin.pluginSlug);
+        return;
+      }
+      expect((await fetchScript(rawToken)).statusCode).toBe(410);
+
+      mockUserHasPermission.mockResolvedValue(true);
+      const { OrganizationModel } = await import("@/models");
+      await OrganizationModel.patch(organizationId, {
+        connectionPluginsEnabled: false,
+      });
+      expect((await fetchScript(rawToken)).statusCode).toBe(410);
+
+      await OrganizationModel.patch(organizationId, {
+        connectionPluginsEnabled: true,
+      });
+      const allowed = await fetchScript(rawToken);
+      expect(allowed.statusCode).toBe(200);
+      expect(allowed.body).toContain(plugin.pluginSlug);
+    } finally {
+      config.beta = originalFeatureState;
+    }
+  });
+
+  test("410s when the creator's org membership is gone", async ({
+    makeAgent,
+  }) => {
+    const gateway = await makeAgent({
+      organizationId,
+      agentType: "mcp_gateway",
+    });
+    const { rawToken } = await createSetup({
+      clientId: "cursor",
+      baseUrl: "http://localhost:9000/v1",
+      mcpGatewayId: gateway.id,
+    });
+
+    await MemberModel.deleteAllByUserId(user.id);
+
+    const response = await fetchScript(rawToken);
+    expect(response.statusCode).toBe(410);
+  });
+
+  test("an approved installer redemption renders the same gateway URL as a direct setup", async ({
+    makeAgent,
+  }) => {
+    const prior = config.openappa;
+    const prompt =
+      "Read http://localhost:9000/connect.md?client=claude-code and connect Claude Code.";
+    const gateway = await makeAgent({
+      organizationId,
+      agentType: "mcp_gateway",
+      name: "Prod Gateway",
+    });
+    await OrganizationModel.patch(organizationId, {
+      connectionRuntimeHandoffEnabled: true,
+      connectionRuntimeHandoffInstructions: prompt,
+    });
+
+    try {
+      config.openappa = {
+        ...parseOpenAppaConfig(),
+        offerSigningSecret: "test-offer-signing-secret-32chars",
+      };
+      await GuardrailsDeploymentModel.setEnabled(true);
+
+      const { rawToken: directToken } = await createSetup({
+        clientId: "claude-code",
+        platform: "linux",
+        baseUrl: "http://localhost:9000/v1",
+        mcpGatewayId: gateway.id,
+      });
+      const direct = await fetchScript(directToken);
+      expect(direct.statusCode, direct.body).toBe(200);
+      expect(direct.body).toContain(prompt);
+
+      const pending = await clientConnectionService.start({
+        clientId: "claude-code",
+        platform: "linux",
+      });
+      const { rawToken } = await createSetup({
+        clientId: "claude-code",
+        platform: "linux",
+        baseUrl: "http://localhost:9000/v1",
+        mcpGatewayId: gateway.id,
+      });
+      const setup = await ConnectionSetupModel.findByToken(rawToken);
+      if (!setup) throw new Error("setup ticket missing");
+      const installerToken = `archestra_con_${pending.deviceCode}`;
+
+      const beforeApproval = await fetchScript(installerToken);
+      expect(beforeApproval.statusCode).toBe(404);
+
+      expect(
+        (
+          await clientConnectionService.decide({
+            id: pending.id,
+            setupId: setup.id,
+            userId: user.id,
+            organizationId,
+          })
+        ).status,
+      ).toBe("approved");
+      const approved = await fetchScript(installerToken);
+      expect(approved.statusCode, approved.body).toBe(200);
+      // Each installation has its own instruction-refresh credential.
+      const withoutCredential = (body: string) =>
+        body.replace(
+          /cmi1_[0-9a-f-]+\.[A-Za-z0-9_-]+/g,
+          "installation-credential",
+        );
+      expect(withoutCredential(approved.body)).toBe(
+        withoutCredential(direct.body),
+      );
+    } finally {
+      config.openappa = prior;
+    }
+  });
+
+  test("rate limits repeated probes from one IP", async () => {
+    const ip = nextRemoteAddress();
+    let limited = false;
+    for (let i = 0; i < 11; i++) {
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/connection-setups/script/archestra_con_probe-attempt",
+        remoteAddress: ip,
+      });
+      if (response.statusCode === 429) {
+        limited = true;
+        break;
+      }
+      expect(response.statusCode).toBe(404);
+    }
+    expect(limited).toBe(true);
+  });
+});
+
+async function seedSkill(params: { organizationId: string; name: string }) {
+  const skill = await SkillModel.createWithFiles({
+    skill: {
+      organizationId: params.organizationId,
+      authorId: null,
+      name: params.name,
+      description: `${params.name} description`,
+      content: `# ${params.name}`,
+      metadata: {},
+      sourceType: "manual",
+    },
+    files: [],
+    ...accessGrants("org"),
+  });
+  if (!skill) throw new Error("failed to seed skill");
+  return skill;
+}

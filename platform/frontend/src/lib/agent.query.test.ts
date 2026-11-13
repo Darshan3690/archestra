@@ -1,0 +1,432 @@
+import { archestraApiSdk } from "@archestra/shared";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { createElement, type ReactNode } from "react";
+import { toast } from "sonner";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  useChatAgentBootstrap,
+  useCreateProfile,
+  usePinAgent,
+  usePinnedAgentIds,
+  useProfile,
+  useProfilesPaginated,
+  useUpdateProfile,
+} from "@/lib/agent.query";
+import { useChatProfileMcpTools } from "@/lib/chat/chat.query";
+import {
+  clearPersistedQueryCache,
+  PERSISTED_QUERY_META,
+  restorePersistedQueryCache,
+  syncPersistedQueryCacheScope,
+} from "@/lib/query-persistence";
+import { isReportedApiError } from "@/lib/utils/api";
+
+// Partial: `@/consts` (pulled in by agent.query.ts) reads real exports of this
+// module at import time, so only the two SDK calls under test are replaced.
+vi.mock("@archestra/shared/api-sdk", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@archestra/shared/api-sdk")>()),
+  createAgent: vi.fn(),
+  getAgents: vi.fn(),
+  getChatAgentRoster: vi.fn(),
+  getAgent: vi.fn(),
+  getChatAgentMcpTools: vi.fn(),
+  getMemberDefaultAgent: vi.fn(),
+  getOrganization: vi.fn(),
+  pinAgent: vi.fn(),
+  unpinAgent: vi.fn(),
+  updateAgent: vi.fn(),
+}));
+
+vi.mock("sonner");
+
+const sdk = vi.mocked(archestraApiSdk);
+
+function setup<T>(
+  hook: () => T,
+  queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  }),
+) {
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client: queryClient }, children);
+  return { ...renderHook(hook, { wrapper }), queryClient };
+}
+
+const refused = {
+  data: undefined,
+  error: {
+    error: {
+      message: "Environment is restricted",
+      type: "api_authorization_error",
+    },
+  },
+};
+
+describe("agent write mutations", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // Resolving `undefined` on a refused write made a failure look like a save
+  // that returned nothing: the form went on to toast success, fire `onCreated`,
+  // and run its follow-up writes against an agent that was never created.
+  it("rejects when the create is refused", async () => {
+    sdk.createAgent.mockResolvedValue(refused as never);
+
+    const { result } = setup(() => useCreateProfile());
+
+    await expect(
+      result.current.mutateAsync({ name: "New", agentType: "agent" } as never),
+    ).rejects.toThrow(/environment is restricted/i);
+  });
+
+  it("rejects when the update is refused", async () => {
+    sdk.updateAgent.mockResolvedValue(refused as never);
+
+    const { result } = setup(() => useUpdateProfile());
+
+    await expect(
+      result.current.mutateAsync({ id: "agent-1", data: { name: "New" } }),
+    ).rejects.toThrow(/environment is restricted/i);
+  });
+
+  // The mutation toasts the refusal on its way out. A caller that also toasts
+  // its own orchestration failures needs to tell the two apart, or the user
+  // reads one refusal twice.
+  it("marks the refusal as one the user has already been shown", async () => {
+    sdk.updateAgent.mockResolvedValue(refused as never);
+
+    const { result } = setup(() => useUpdateProfile());
+
+    const error = await result.current
+      .mutateAsync({ id: "agent-1", data: { name: "New" } })
+      .catch((thrown: unknown) => thrown);
+
+    expect(isReportedApiError(error)).toBe(true);
+    expect(isReportedApiError(new Error("Environment is restricted"))).toBe(
+      false,
+    );
+  });
+
+  it("still resolves the created agent on success", async () => {
+    sdk.createAgent.mockResolvedValue({
+      data: { id: "agent-1", name: "New" },
+      error: undefined,
+    } as never);
+
+    const { result } = setup(() => useCreateProfile());
+
+    await expect(
+      result.current.mutateAsync({ name: "New", agentType: "agent" } as never),
+    ).resolves.toMatchObject({ id: "agent-1" });
+  });
+
+  it("shows a caller-specific message after an update succeeds", async () => {
+    sdk.updateAgent.mockResolvedValue({
+      data: { id: "agent-1", systemPrompt: "New prompt" },
+      error: undefined,
+    } as never);
+
+    const { result } = setup(() =>
+      useUpdateProfile({ successMessage: "System prompt saved" }),
+    );
+
+    await result.current.mutateAsync({
+      id: "agent-1",
+      data: { systemPrompt: "New prompt" },
+    });
+
+    expect(toast.success).toHaveBeenCalledWith("System prompt saved");
+  });
+
+  it("does not revive an inactive gateway list when reloaded immediately after saving", async () => {
+    clearPersistedQueryCache();
+    const oldGateway = {
+      id: "gateway-1",
+      name: "Before",
+      toolExposureMode: "full",
+    };
+    const savedGateway = {
+      ...oldGateway,
+      name: "After",
+      toolExposureMode: "search_and_run_only",
+    };
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    await client.fetchQuery({
+      queryKey: ["agents", { agentTypes: ["mcp_gateway"] }],
+      queryFn: async () => ({ data: [oldGateway] }),
+      meta: PERSISTED_QUERY_META,
+    });
+    syncPersistedQueryCacheScope(client, "user-1:org-1");
+    sdk.updateAgent.mockResolvedValue({ data: savedGateway } as never);
+    sdk.getAgent.mockResolvedValue({ data: savedGateway } as never);
+    const mutation = setup(() => useUpdateProfile(), client);
+
+    try {
+      await act(() =>
+        mutation.result.current.mutateAsync({
+          id: oldGateway.id,
+          data: {
+            name: savedGateway.name,
+            toolExposureMode: "search_and_run_only",
+          },
+        }),
+      );
+      const reloadedClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      restorePersistedQueryCache(reloadedClient);
+      const detail = setup(() => useProfile(oldGateway.id), reloadedClient);
+      try {
+        await waitFor(() =>
+          expect(detail.result.current.data?.name).toBe("After"),
+        );
+      } finally {
+        detail.unmount();
+        reloadedClient.clear();
+      }
+    } finally {
+      mutation.unmount();
+      client.clear();
+      clearPersistedQueryCache();
+    }
+  });
+
+  it("refreshes an active gateway list and its tool estimate after saving", async () => {
+    const savedGateway = {
+      id: "gateway-1",
+      name: "Gateway",
+      toolExposureMode: "search_and_run_only",
+    };
+    const oldGateway = { ...savedGateway, toolExposureMode: "full" };
+    sdk.updateAgent.mockResolvedValue({ data: savedGateway } as never);
+    sdk.getAgents
+      .mockResolvedValueOnce({ data: { data: [oldGateway] } } as never)
+      .mockResolvedValue({ data: { data: [savedGateway] } } as never);
+    sdk.getChatAgentMcpTools
+      .mockResolvedValueOnce({
+        data: [{ name: "tools", tokens: 13000 }],
+      } as never)
+      .mockResolvedValue({ data: [{ name: "tools", tokens: 5763 }] } as never);
+    const hook = setup(() => ({
+      update: useUpdateProfile(),
+      list: useProfilesPaginated({ agentTypes: ["mcp_gateway"] }),
+      tools: useChatProfileMcpTools(savedGateway.id),
+    }));
+    try {
+      await waitFor(() =>
+        expect(hook.result.current.tools.data?.[0].tokens).toBe(13000),
+      );
+      await act(() =>
+        hook.result.current.update.mutateAsync({
+          id: savedGateway.id,
+          data: { toolExposureMode: "search_and_run_only" },
+        }),
+      );
+      await waitFor(() =>
+        expect(hook.result.current.list.data?.data[0].toolExposureMode).toBe(
+          "search_and_run_only",
+        ),
+      );
+      await waitFor(() =>
+        expect(hook.result.current.tools.data?.[0].tokens).toBe(5763),
+      );
+    } finally {
+      hook.unmount();
+      hook.queryClient.clear();
+    }
+  });
+});
+
+describe("chat agent roster", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("requests the compact chat view without tool payloads", async () => {
+    sdk.getChatAgentRoster.mockResolvedValue({
+      data: [{ id: "agent-1", name: "Agent" }],
+      error: undefined,
+    } as never);
+
+    const { result } = setup(() => useChatAgentBootstrap());
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(sdk.getChatAgentRoster).toHaveBeenCalledOnce();
+  });
+
+  // A transient roster failure must self-heal: the app-wide default is
+  // `retry: false`, so without the query's own retry a single blip left the
+  // new-chat composer stranded on "Select agent" with no default (T-1317).
+  it("recovers the roster after a transient fetch failure", async () => {
+    sdk.getChatAgentRoster
+      .mockResolvedValueOnce({
+        data: undefined,
+        error: {
+          error: { message: "boom", type: "api_internal_server_error" },
+        },
+      } as never)
+      .mockResolvedValueOnce({
+        data: [{ id: "agent-1", name: "Agent" }],
+        error: undefined,
+      } as never);
+
+    // retryDelay: 0 keeps the retry instant; the query's own retry still
+    // overrides the client-wide `retry: false`.
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useChatAgentBootstrap(), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual([{ id: "agent-1", name: "Agent" }]);
+    expect(sdk.getChatAgentRoster).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("agent detail", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const partialRows = [{ id: "agent-1", name: "Only a name" }];
+  it.each([
+    {
+      kind: "selector options",
+      queryKey: ["agents", "options", {}],
+      data: partialRows,
+    },
+    {
+      kind: "chat roster",
+      queryKey: ["agents", "chat-roster", "bootstrap", "v3"],
+      data: partialRows,
+    },
+    {
+      kind: "tool-free paginated list",
+      queryKey: ["agents", { limit: 20, includeTools: false }],
+      data: { data: partialRows },
+    },
+    {
+      kind: "tool-free catalog",
+      queryKey: ["agents", "catalog", { includeTools: false }],
+      data: { data: partialRows },
+    },
+    {
+      // Tool rows, not agents: one carries the agent's id, so the scan must
+      // skip this cache rather than just miss it.
+      kind: "gateway's tool rows",
+      queryKey: [
+        "agents",
+        "gateway-tool-rows",
+        "agent-1",
+        { agentTypes: ["mcp_gateway"] },
+      ],
+      data: [{ id: "agent-1", name: "lookup", delegateToAgentId: null }],
+    },
+  ])("never seeds an editing form from a $kind", async ({ queryKey, data }) => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    queryClient.setQueryData(queryKey, data);
+    let finish: ((value: never) => void) | undefined;
+    sdk.getAgent.mockImplementation(
+      () =>
+        new Promise<never>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const { result } = setup(() => useProfile("agent-1"), queryClient);
+    expect(result.current.data).toBeUndefined();
+    await act(async () => {
+      finish?.({
+        data: {
+          id: "agent-1",
+          name: "Full Agent",
+          systemPrompt: "Configured prompt",
+          tools: [{ id: "tool-1" }],
+        },
+      } as never);
+    });
+    await waitFor(() =>
+      expect(result.current.data?.systemPrompt).toBe("Configured prompt"),
+    );
+    expect(result.current.data?.tools).toEqual([{ id: "tool-1" }]);
+  });
+
+  it("still seeds an editing form from a fresh paginated list", () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const agent = {
+      id: "agent-1",
+      name: "Full agent",
+      systemPrompt: "Configured prompt",
+      tools: [{ id: "tool-1" }],
+    };
+    queryClient.setQueryData(["agents", { limit: 20 }], { data: [agent] });
+    const { result } = setup(() => useProfile("agent-1"), queryClient);
+    expect(result.current.data).toEqual(agent);
+    expect(sdk.getAgent).not.toHaveBeenCalled();
+  });
+});
+
+describe("pinned agent ids", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("reads the pinned agents without their tools, since it keeps only their ids", async () => {
+    sdk.getAgents.mockResolvedValue({
+      data: { data: [{ id: "pinned-1" }] },
+      error: undefined,
+    } as never);
+    sdk.getMemberDefaultAgent.mockResolvedValue({
+      data: { defaultAgentId: null, personalChatAgentId: null },
+      error: undefined,
+    } as never);
+    sdk.getOrganization.mockResolvedValue({
+      data: { defaultAgentId: null },
+      error: undefined,
+    } as never);
+
+    const { result } = setup(() => usePinnedAgentIds());
+
+    await waitFor(() => expect(result.current.data).toEqual(["pinned-1"]));
+    expect(sdk.getAgents).toHaveBeenCalledWith({
+      query: expect.objectContaining({ pinned: true, includeTools: false }),
+    });
+  });
+});
+
+describe("agent pin mutation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("pins and unpins through the matching API endpoints, then refreshes both list sections", async () => {
+    sdk.pinAgent.mockResolvedValue({
+      data: { ok: true },
+      error: undefined,
+    } as never);
+    sdk.unpinAgent.mockResolvedValue({
+      data: { ok: true },
+      error: undefined,
+    } as never);
+
+    const { result, queryClient } = setup(() => usePinAgent());
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+
+    await result.current.mutateAsync({ id: "agent-1", pinned: true });
+    await result.current.mutateAsync({ id: "agent-1", pinned: false });
+
+    expect(sdk.pinAgent).toHaveBeenCalledWith({ path: { id: "agent-1" } });
+    expect(sdk.unpinAgent).toHaveBeenCalledWith({ path: { id: "agent-1" } });
+    expect(invalidate).toHaveBeenCalledTimes(2);
+    expect(invalidate).toHaveBeenNthCalledWith(1, { queryKey: ["agents"] });
+  });
+});

@@ -1,0 +1,1397 @@
+import { createHash } from "node:crypto";
+import { stripChildTrajectoryReceipts } from "@/openappa/child-trajectory-receipt";
+import { parseTrajectoryStamp } from "@/openappa/trajectory-stamp";
+import { ApiError } from "@/types";
+import { stripChildTrajectoryReferences } from "./child-trajectory-reference-format";
+import { grokChildOutputs } from "./grok-child-return";
+import { parseGrokDurableHistory } from "./grok-durable-history";
+
+export type AppaChildReturnCompletion = {
+  value: string;
+  childNativeId?: string;
+  spawnCallId?: string;
+  envelopeId?: string;
+  assistantOrigin: boolean;
+  /**
+   * Client coordinates of a report that can occur in several read results.
+   * These are constraints on replay, never proof that a return crossed.
+   */
+  replayIdentity?: { childId: string; turn: number };
+};
+
+export type CollectedChildReturns = {
+  /** Every structured completed leaf. */
+  completions: AppaChildReturnCompletion[];
+};
+
+/**
+ * Mints the visual marker that announces a crossed child return. The marker is
+ * display only: the durable ChildEnd the runtime retained is the authority the
+ * parent side verifies the returned bytes against, so nothing the client
+ * carries proves a return.
+ */
+export function mintChildReturnMarker(params: {
+  organizationId: string;
+  callerId: string | undefined;
+  parentId: string;
+  childId: string;
+  childNativeId?: string;
+  spawnCallId?: string;
+  value: string;
+  format?: "full" | "inline";
+}): string {
+  const valueHash = hashValue(params.value);
+  const claims: ChildReturnClaims = [
+    PROOF_VERSION,
+    params.organizationId,
+    params.callerId ?? null,
+    params.parentId,
+    params.childId,
+    params.childNativeId ?? null,
+    params.spawnCallId ?? null,
+    valueHash,
+  ];
+  const payload = encodeClaims(claims);
+  const displayCode = encodeCrockford35(first35Bits(displayDigest(payload)));
+  return formatMarker({ displayCode, format: params.format });
+}
+
+/**
+ * Extracts and removes child-return markers before provider dispatch.
+ * Records each structured completion leaf separately; every leaf is then
+ * verified against the child returns the runtime durably crossed, so one
+ * genuine return cannot cover a sibling return.
+ *
+ * A return this cannot read is withheld with a 409. With `onRefusal`, that
+ * refusal goes there instead, the return stays as the client sent it, and the
+ * rest of the body is still stripped. A malformed marker or envelope is a 400
+ * and is thrown in both cases.
+ */
+export function collectAndStripChildReturns(
+  body: unknown,
+  options: {
+    openCodeBackgroundReturns?: boolean;
+    codexMailboxReturns?: boolean;
+    /** Copilot CLI reads a finished background agent with `read_agent`. */
+    copilotAgentReports?: boolean;
+    grokSubagentReturns?: boolean;
+    /** Internal recursion guard for the native memory extractor's transcript. */
+    grokDurableHistory?: false;
+    onRefusal?: RefusalSink;
+  } = {},
+): CollectedChildReturns {
+  const collected: CollectedChildReturns = {
+    completions: [],
+  };
+  const nativeResultCallIds = collectNativeResultCallIds(
+    body,
+    options.grokSubagentReturns
+      ? GROK_COMPLETION_TOOLS
+      : options.copilotAgentReports
+        ? COPILOT_REPORT_TOOLS
+        : undefined,
+  );
+  const copilotReadAgentIds = options.copilotAgentReports
+    ? collectCopilotReadAgentIds(body)
+    : new Map<string, string>();
+  if (options.codexMailboxReturns) {
+    collectCodexMailboxReturns(body, collected, options.onRefusal);
+  }
+
+  const walk = (
+    value: unknown,
+    context: WalkContext = DEFAULT_CONTEXT,
+  ): unknown =>
+    readOrReport(options.onRefusal, value, () => rewrite(value, context));
+  const rewrite = (value: unknown, context: WalkContext): unknown => {
+    if (typeof value === "string") {
+      if (options.grokSubagentReturns && !context.assistantOrigin) {
+        const history = parseGrokDurableHistory(value);
+        if (history) {
+          if (options.grokDurableHistory === false)
+            throw new ApiError(
+              409,
+              "OpenAPPA withheld a nested Grok memory transcript.",
+            );
+          // Decode before scanning: escaped examples are not live envelopes,
+          // while actual child outputs still require the retained crossing.
+          const nested = collectAndStripChildReturns(
+            { messages: history.messages },
+            { ...options, grokDurableHistory: false },
+          );
+          collected.completions.push(...nested.completions);
+          return history.serialize();
+        }
+      }
+      if (options.grokSubagentReturns && !context.assistantOrigin) {
+        const convert = (text: string): string | undefined => {
+          const outputs = grokChildOutputs(text);
+          if (!outputs) return undefined;
+          return JSON.stringify({
+            status: Object.fromEntries(
+              outputs.map((output) => {
+                if (output.status !== "completed")
+                  return [output.id, { state: output.status }];
+                const nested = { ...context, childNativeId: output.id };
+                const parsed = stripMarker(output.value ?? "", nested, true);
+                recordCompletion(parsed, nested, collected);
+                return [output.id, { completed: parsed.value }];
+              }),
+            ),
+          });
+        };
+        if (context.nativeResultSite) {
+          const converted = convert(value);
+          if (converted !== undefined) return converted;
+        }
+        // Native completions can also arrive beside an unrelated tool result,
+        // or in an idle auto-wake prompt. Check those bytes at the same boundary.
+        const rewritten = value.replace(
+          /<system-reminder>\n?([\s\S]*?)<\/system-reminder>/g,
+          (block, inside: string) => {
+            if (
+              !/^(?:Background subagent |While you were idle, \d+ background subagents? completed:)/.test(
+                inside,
+              )
+            )
+              return block;
+            const start = inside.search(/=== (?:Task |Multi-wait \()/);
+            if (start < 0)
+              throw new ApiError(
+                409,
+                "OpenAPPA withheld an incomplete Grok child notification.",
+              );
+            const converted = convert(inside.slice(start).trimEnd());
+            if (!converted)
+              throw new ApiError(
+                409,
+                "OpenAPPA withheld an invalid Grok child notification.",
+              );
+            return `<system-reminder>\n${converted}\n</system-reminder>`;
+          },
+        );
+        if (
+          (context.toolResultEnvelope || value.includes("<system-reminder>")) &&
+          (rewritten.includes("<subagent_result>") ||
+            rewritten.includes("<subagent_meta>"))
+        )
+          throw new ApiError(
+            409,
+            "OpenAPPA withheld an unrecognized Grok child notification.",
+          );
+        if (rewritten !== value) return rewritten;
+      }
+      // OpenCode and Kilo Code acknowledge a background launch in the task's
+      // own framing, and Kilo Code wraps the notice in <task_result>. The
+      // acknowledgement returns nothing, so it stays as the client sent it
+      // and its state still says so. One that carries a return marker is
+      // read as a return.
+      if (
+        options.openCodeBackgroundReturns &&
+        context.nativeResultSite &&
+        isOpenCodeBackgroundLaunch(value) &&
+        !hasMarker(value)
+      ) {
+        return value;
+      }
+      if (
+        context.nativeResultSite &&
+        isOpenCodeBackgroundCompletion(value) &&
+        !isCompleteTaskResultFraming(value)
+      ) {
+        throw new ApiError(
+          409,
+          "OpenAPPA withheld a malformed child completion",
+        );
+      }
+      const parsedJson = context.nativeResultSite
+        ? jsonContainer(value)
+        : undefined;
+      if (parsedJson !== undefined) {
+        const record = asRecord(parsedJson);
+        const status = asRecord(record?.status);
+        const canonical = status
+          ? canonicalizeStatus(status, context, collected)
+          : undefined;
+        if (canonical) {
+          return JSON.stringify({ status: canonical });
+        }
+      }
+
+      let rewritten = value;
+      if (
+        isStandaloneEnvelope(value, TASK_NOTIFICATION) ||
+        (context.nativeResultSite &&
+          startsWithEnvelope(value, TASK_NOTIFICATION))
+      ) {
+        rewritten = replaceTaskNotifications(value, context, collected);
+      } else if (
+        isStandaloneEnvelope(value, SUBAGENT_NOTIFICATION) ||
+        (context.nativeResultSite &&
+          startsWithEnvelope(value, SUBAGENT_NOTIFICATION))
+      ) {
+        rewritten = replaceSubagentNotifications(value, context, collected);
+      } else if (
+        options.copilotAgentReports &&
+        context.nativeResultSite &&
+        COPILOT_AGENT_REPORT.test(value)
+      ) {
+        rewritten = replaceCopilotAgentReport(value, context, collected);
+      } else if (
+        context.nativeResultSite &&
+        isCompleteTaskResultFraming(value)
+      ) {
+        rewritten = replaceTaskResults(value, context, collected);
+      } else if (context.nativeResultSite && isKimiCodeAgentResult(value)) {
+        rewritten = replaceKimiCodeAgentResult(value, context, collected);
+      } else if (context.nativeResultSite) {
+        rewritten = replaceAgentReport(value, context, collected);
+      }
+      if (rewritten !== value) return rewritten;
+      if (!context.nativeResultSite && !context.assistantOrigin) return value;
+      const parsed = stripMarker(value, context);
+      if (!parsed.marker) return value;
+      // An assistant-authored marker echoes this session's own return; it is
+      // recorded so the verifier can check it against the retained crossing.
+      recordCompletion(parsed, context, collected);
+      return parsed.value;
+    }
+    if (Array.isArray(value)) {
+      return value.map((entry) => walk(entry, { ...context, topLevel: false }));
+    }
+    const record = asRecord(value);
+    if (!record) return value;
+
+    const assistantOrigin =
+      context.assistantOrigin || record.role === "assistant";
+    const currentIsToolResultEnvelope = isToolResultEnvelope(record);
+    const toolResultEnvelope =
+      context.toolResultEnvelope || currentIsToolResultEnvelope;
+    const envelopeId =
+      stringField(record.tool_use_id) ??
+      stringField(record.tool_call_id) ??
+      stringField(record.call_id) ??
+      stringField(record.id) ??
+      context.envelopeId;
+    const nativeResultSite =
+      context.nativeResultSite ||
+      (toolResultEnvelope === true &&
+        envelopeId !== undefined &&
+        nativeResultCallIds.has(normalizeCallId(envelopeId) ?? envelopeId));
+    const childNativeId =
+      stringField(record["task-id"]) ??
+      taskIdIn(record) ??
+      context.childNativeId;
+    const copilotReadAgentId = envelopeId
+      ? copilotReadAgentIds.get(normalizeCallId(envelopeId) ?? envelopeId)
+      : undefined;
+    const nested: WalkContext = {
+      ...context,
+      topLevel: false,
+      assistantOrigin,
+      toolResultEnvelope,
+      nativeResultSite,
+      ...(envelopeId ? { envelopeId } : {}),
+      ...(childNativeId ? { childNativeId } : {}),
+      ...(copilotReadAgentId ? { copilotReadAgentId } : {}),
+    };
+
+    const status =
+      nativeResultSite &&
+      !context.syntheticUserReturn &&
+      !isToolResultEnvelope(record)
+        ? asRecord(record.status)
+        : undefined;
+    const canonicalStatus = status
+      ? canonicalizeStatus(status, nested, collected)
+      : undefined;
+    if (canonicalStatus) {
+      for (const key of Object.keys(record)) delete record[key];
+      record.status = canonicalStatus;
+      return record;
+    }
+
+    for (const [key, entry] of Object.entries(record)) {
+      if (key === "__proto__" || key === "constructor" || key === "prototype") {
+        continue;
+      }
+      const entryContext: WalkContext = {
+        ...nested,
+        nativeResultSite:
+          nativeResultSite &&
+          (!currentIsToolResultEnvelope ||
+            key === "content" ||
+            key === "output"),
+        // Responses API `output` holds assistant-authored history even though
+        // its message objects do not always repeat a role.
+        assistantOrigin:
+          assistantOrigin || (context.topLevel === true && key === "output"),
+      };
+      if (
+        key === "content" &&
+        record.role === "user" &&
+        options.openCodeBackgroundReturns
+      ) {
+        const visitPart = (part: unknown) =>
+          walk(part, {
+            ...entryContext,
+            nativeResultSite: isOpenCodeBackgroundCompletion(
+              typeof part === "string" ? part : asRecord(part)?.text,
+            ),
+            syntheticUserReturn: true,
+          });
+        record[key] = Array.isArray(entry)
+          ? entry.map(visitPart)
+          : visitPart(entry);
+      } else {
+        record[key] = walk(entry, entryContext);
+      }
+    }
+    return value;
+  };
+
+  walk(body);
+  return {
+    completions: collected.completions,
+  };
+}
+
+/**
+ * The text without the display marker that follows a crossed child return.
+ * The marker carries no authority, so text that is not a well-formed carrier
+ * comes back unchanged.
+ */
+export function withoutChildReturnMarker(value: string): string {
+  try {
+    return stripMarker(value, DEFAULT_CONTEXT).value;
+  } catch {
+    return value;
+  }
+}
+
+// === Marker parsing ===
+
+type WalkContext = {
+  childNativeId?: string;
+  spawnCallId?: string;
+  envelopeId?: string;
+  assistantOrigin: boolean;
+  toolResultEnvelope: boolean;
+  nativeResultSite: boolean;
+  syntheticUserReturn?: boolean;
+  topLevel?: boolean;
+  copilotReadAgentId?: string;
+  replayIdentity?: AppaChildReturnCompletion["replayIdentity"];
+};
+
+type ParsedMarkerValue = {
+  value: string;
+  marker?: {
+    displayCode: string;
+    childNativeId?: string;
+  };
+};
+
+type NativeEnvelope = { open: string; close: string };
+
+const DEFAULT_CONTEXT: WalkContext = {
+  assistantOrigin: false,
+  toolResultEnvelope: false,
+  nativeResultSite: false,
+  topLevel: true,
+};
+const TASK_NOTIFICATION: NativeEnvelope = {
+  open: "<task-notification>",
+  close: "</task-notification>",
+};
+const SUBAGENT_NOTIFICATION: NativeEnvelope = {
+  open: "<subagent_notification>",
+  close: "</subagent_notification>",
+};
+const MARK_TOP = "▄█▄▄▄█▄";
+const MARK_BOTTOM = "██▄█▄██";
+const PROOF_VERSION = 1;
+const MAX_CLAIMS_BYTES = 16 * 1024;
+const MARKER_CODE = "[0-9A-HJKMNP-TV-Z]{3}-[0-9A-HJKMNP-TV-Z]{4}";
+const MARKER_PHRASE =
+  "(?:finished subagent|finished protected subagent|protected subagent session|protected subagent return|protected delegated return)";
+// Inspects indentation only at line starts to keep text scanning linear.
+const MARKER = new RegExp(
+  `(?:^|(?<=\\n))[\\t ]*(?:${MARK_TOP}(?:(?:\\r?\\n|[\\t ]{1,8})${MARK_BOTTOM})?[\\t ]{1,8})?${MARKER_PHRASE}[\\t ]+(?:([A-Za-z0-9_:-]{1,512})[\\t ]+)?(${MARKER_CODE})(?![0-9A-HJKMNP-TV-Z])[\\t ]*(?=\\r?\\n|$)`,
+  "gm",
+);
+const MAX_SCAN_BYTES = 8 * 1024 * 1024;
+const GROK_COMPLETION_TOOLS = new Set([
+  "spawn_subagent",
+  "get_command_or_subagent_output",
+]);
+
+function stripMarker(
+  value: string,
+  context: WalkContext,
+  completionCarrier = false,
+): ParsedMarkerValue {
+  if (Buffer.byteLength(value, "utf8") > MAX_SCAN_BYTES) {
+    if (!hasMarker(value)) return { value };
+    throw new ApiError(400, "OpenAPPA child-return carrier exceeds its limit");
+  }
+
+  // A complete child reply can carry its trajectory proof before the return
+  // marker. That proof is transport metadata. It is not part of the admitted
+  // value and is not lineage evidence for the parent.
+  const returnValue = stripChildTrajectoryReferences(
+    stripChildTrajectoryReceipts(value).text,
+  ).text;
+  const pattern = new RegExp(MARKER.source, "g");
+  const matches = [...returnValue.matchAll(pattern)];
+  if (matches.length === 0) {
+    if (completionCarrier && hasMarker(returnValue)) {
+      throw new ApiError(
+        400,
+        "OpenAPPA received a malformed child-return marker",
+      );
+    }
+    return { value: returnValue };
+  }
+  if (matches.length !== 1) {
+    throw new ApiError(400, "OpenAPPA child-return carrier is ambiguous");
+  }
+
+  const match = matches[0];
+  const displayCode = match[2];
+  if (!displayCode) {
+    throw new ApiError(
+      400,
+      "OpenAPPA received a malformed child-return marker",
+    );
+  }
+  const matchStart = match.index ?? 0;
+  const markerStart = markerSeparatorStart(returnValue, matchStart);
+  const markerEnd = matchStart + match[0].length;
+  const stripped = `${returnValue.slice(0, markerStart)}${returnValue.slice(markerEnd)}`;
+  return {
+    value: stripped,
+    marker: {
+      displayCode,
+      ...(match[1] || context.childNativeId
+        ? { childNativeId: match[1] ?? context.childNativeId }
+        : {}),
+    },
+  };
+}
+
+function replaceTaskNotifications(
+  value: string,
+  context: WalkContext,
+  collected: CollectedChildReturns,
+): string {
+  const { open, close } = TASK_NOTIFICATION;
+  let cursor = 0;
+  const canonical: string[] = [];
+  while (true) {
+    const start = value.indexOf(open, cursor);
+    if (start === -1) break;
+    const end = value.indexOf(close, start + open.length);
+    if (end === -1) {
+      throw new ApiError(
+        400,
+        "OpenAPPA received a malformed task notification",
+      );
+    }
+    const after = end + close.length;
+    const block = value.slice(start, after);
+    if (block.includes("<status>completed</status>")) {
+      const resultOpen = "<result>";
+      const resultClose = "</result>";
+      const resultStart = block.indexOf(resultOpen);
+      const resultEnd = block.indexOf(
+        resultClose,
+        resultStart + resultOpen.length,
+      );
+      const duplicate = block.indexOf(
+        resultOpen,
+        resultStart + resultOpen.length,
+      );
+      if (resultStart === -1 || resultEnd === -1 || duplicate !== -1) {
+        throw new ApiError(
+          400,
+          "OpenAPPA received a malformed task notification",
+        );
+      }
+      const taskId = tagValue(block, "task-id");
+      const toolUseId = tagValue(block, "tool-use-id");
+      if (
+        !isBoundedNativeMetadata(taskId) ||
+        (toolUseId !== undefined && !isBoundedNativeMetadata(toolUseId))
+      ) {
+        throw new ApiError(
+          400,
+          "OpenAPPA received invalid task notification metadata",
+        );
+      }
+      const taskContext: WalkContext = {
+        ...context,
+        childNativeId: taskId,
+        spawnCallId: toolUseId ?? context.spawnCallId,
+        envelopeId: context.envelopeId ?? toolUseId,
+      };
+      const result = block.slice(resultStart + resultOpen.length, resultEnd);
+      const parsed = stripMarker(result, taskContext, true);
+      recordCompletion(parsed, taskContext, collected);
+      canonical.push(
+        [
+          open,
+          `<task-id>${taskId}</task-id>`,
+          ...(toolUseId ? [`<tool-use-id>${toolUseId}</tool-use-id>`] : []),
+          "<status>completed</status>",
+          `<result>${parsed.value}</result>`,
+          close,
+        ].join("\n"),
+      );
+    }
+    cursor = after;
+  }
+  if (cursor === 0 || canonical.length === 0) return value;
+  return canonical.join("\n");
+}
+
+function replaceTaskResults(
+  value: string,
+  context: WalkContext,
+  collected: CollectedChildReturns,
+): string {
+  const open = "<task_result>";
+  const close = "</task_result>";
+  let cursor = 0;
+  const canonical: string[] = [];
+  while (true) {
+    const start = value.indexOf(open, cursor);
+    if (start === -1) break;
+    const end = value.indexOf(close, start + open.length);
+    if (end === -1) {
+      throw new ApiError(400, "OpenAPPA received a malformed task result");
+    }
+    const taskId = taskElementId(value.slice(cursor, start));
+    if (taskId !== undefined && !isBoundedNativeMetadata(taskId)) {
+      throw new ApiError(400, "OpenAPPA received invalid task result metadata");
+    }
+    const taskContext: WalkContext = {
+      ...context,
+      childNativeId: taskId ?? context.childNativeId,
+    };
+    // OpenCode adds one newline on either side of the child's actual text.
+    const framed = /^<task\b[^>]*>/.test(value.slice(0, start).trim());
+    const result = framed
+      ? value
+          .slice(start + open.length, end)
+          .replace(/^\r?\n/, "")
+          .replace(/\r?\n$/, "")
+      : value.slice(start + open.length, end);
+    const parsed = stripMarker(result, taskContext, true);
+    recordCompletion(parsed, taskContext, collected);
+    canonical.push(`${open}${parsed.value}${close}`);
+    cursor = end + close.length;
+  }
+  if (cursor === 0) return value;
+  return canonical.join("\n");
+}
+
+function replaceSubagentNotifications(
+  value: string,
+  context: WalkContext,
+  collected: CollectedChildReturns,
+): string {
+  const { open, close } = SUBAGENT_NOTIFICATION;
+  let cursor = 0;
+  const canonical: string[] = [];
+  while (true) {
+    const start = value.indexOf(open, cursor);
+    if (start === -1) break;
+    const end = value.indexOf(close, start + open.length);
+    if (end === -1) {
+      throw new ApiError(
+        400,
+        "OpenAPPA received a malformed subagent notification",
+      );
+    }
+    const inside = value.slice(start + open.length, end);
+    const parsedJson = tryParseJson(inside.trim());
+    const object = asRecord(parsedJson);
+    const status = asRecord(object?.status);
+    const completed =
+      status && typeof status.completed === "string"
+        ? status.completed
+        : undefined;
+    if (object && status && completed !== undefined) {
+      const agentPath = optionalBoundedMetadata(object.agent_path);
+      const agentId = optionalBoundedMetadata(object.agent_id);
+      const toolUseId = optionalBoundedMetadata(
+        object.tool_use_id ?? object["tool-use-id"] ?? object.call_id,
+      );
+      if (
+        hasInvalidMetadata(object.agent_path, agentPath) ||
+        hasInvalidMetadata(object.agent_id, agentId) ||
+        hasInvalidMetadata(
+          object.tool_use_id ?? object["tool-use-id"] ?? object.call_id,
+          toolUseId,
+        )
+      ) {
+        throw new ApiError(
+          400,
+          "OpenAPPA received invalid subagent notification metadata",
+        );
+      }
+      const childContext: WalkContext = {
+        ...context,
+        childNativeId: agentPath ?? agentId ?? context.childNativeId,
+        spawnCallId: toolUseId ?? context.spawnCallId,
+        envelopeId: context.envelopeId ?? toolUseId,
+      };
+      const parsed = stripMarker(completed, childContext, true);
+      recordCompletion(parsed, childContext, collected);
+      const admitted: Record<string, unknown> = {};
+      if (agentPath) admitted.agent_path = agentPath;
+      else if (agentId) admitted.agent_id = agentId;
+      if (toolUseId) admitted.tool_use_id = toolUseId;
+      admitted.status = { completed: parsed.value };
+      canonical.push(`${open}\n${JSON.stringify(admitted)}\n${close}`);
+    } else if (hasMarker(inside)) {
+      throw new ApiError(
+        400,
+        "OpenAPPA received a malformed subagent notification",
+      );
+    }
+    cursor = end + close.length;
+  }
+  if (cursor === 0 || canonical.length === 0) return value;
+  return canonical.join("\n");
+}
+
+/**
+ * Copilot CLI's report of a finished background agent, as its `read_agent`
+ * returns it: a status line, then each turn the agent finished, as
+ * `[Turn <n>]` and the text that turn returned. A turn that crossed through
+ * this proxy ends with the return marker; each is read as its own return,
+ * and the status line stays as it came. Copilot's subagents report no id of
+ * their own, so the agent id in the status line names nothing the runtime
+ * knows and is not read as the child's id.
+ */
+function replaceCopilotAgentReport(
+  value: string,
+  context: WalkContext,
+  collected: CollectedChildReturns,
+): string {
+  if (!hasMarker(value)) return value;
+  const turns = [...value.matchAll(COPILOT_REPORT_TURN)];
+  if (turns.length === 0) {
+    throw new ApiError(400, "OpenAPPA received a malformed agent report");
+  }
+  // A read's arguments and its report must name the same child. Copilot's
+  // child requests carry no native id, so this is only a replay coordinate;
+  // the verifier still resolves it against a unique retained crossing.
+  const childId = context.copilotReadAgentId;
+  const reportChildId = value
+    .slice(0, turns[0].index)
+    .match(/\bagent_id: ([^,\s]+)(?:,|$)/)?.[1];
+  if (childId && reportChildId !== childId) {
+    throw new ApiError(
+      400,
+      "OpenAPPA received a Copilot agent report for a different child",
+    );
+  }
+  const seenTurns = new Set<number>();
+  const parts = [value.slice(0, turns[0].index)];
+  turns.forEach((turn, index) => {
+    const turnNumber = Number(turn[1]);
+    if (!Number.isSafeInteger(turnNumber) || seenTurns.has(turnNumber)) {
+      throw new ApiError(400, "OpenAPPA received a malformed agent report");
+    }
+    seenTurns.add(turnNumber);
+    const start = (turn.index ?? 0) + turn[0].length;
+    const end = turns[index + 1]?.index ?? value.length;
+    const turnContext = {
+      ...context,
+      ...(childId ? { replayIdentity: { childId, turn: turnNumber } } : {}),
+    };
+    const parsed = stripMarker(value.slice(start, end), turnContext, true);
+    if (parsed.marker) recordCompletion(parsed, turnContext, collected);
+    parts.push(turn[0], parsed.value);
+  });
+  return parts.join("");
+}
+
+/**
+ * Kimi Code's result of a foreground Agent call: an optional `Wall time` line,
+ * the subagent's id, type and stop, then the subagent's last message under
+ * `[summary]`, then a resume hint and an optional next step.
+ */
+function isKimiCodeAgentResult(value: string): boolean {
+  return KIMI_CODE_AGENT_RESULT.test(value) && value.includes(KIMI_SUMMARY);
+}
+
+/**
+ * Reads the returned message out of Kimi Code's Agent result. The parent
+ * receives only the admitted message; Kimi Code's framing names a subagent the
+ * parent cannot resume under Guardrails.
+ */
+function replaceKimiCodeAgentResult(
+  value: string,
+  context: WalkContext,
+  collected: CollectedChildReturns,
+): string {
+  if (!hasMarker(value)) return value;
+  // Stripping the child's trajectory receipt can take the line break after
+  // the heading with it.
+  let start = value.indexOf(KIMI_SUMMARY) + KIMI_SUMMARY.length;
+  if (value[start] === "\n") start += 1;
+  const end = value.lastIndexOf(KIMI_RESUME_HINT);
+  const report = value.slice(start, end > start ? end : value.length);
+  const parsed = stripMarker(report, context, true);
+  recordCompletion(parsed, context, collected);
+  return parsed.value;
+}
+
+function replaceAgentReport(
+  value: string,
+  context: WalkContext,
+  collected: CollectedChildReturns,
+): string {
+  if (!hasMarker(value)) return value;
+  const marker = value.includes("The report follows:\r\n")
+    ? "The report follows:\r\n"
+    : value.includes("The report follows:\n")
+      ? "The report follows:\n"
+      : undefined;
+  if (!marker) return value;
+  const markerAt = value.indexOf(marker);
+  const contentAt = markerAt + marker.length;
+  const agentMessageEnd = value.indexOf("</agent-message>", contentAt);
+  const contentEnd = agentMessageEnd === -1 ? value.length : agentMessageEnd;
+  const content = value.slice(contentAt, contentEnd);
+  const lines = content.split("\n");
+  const metadataAt = lines.findIndex(
+    (line) =>
+      /^\s*agentId:\s*[a-zA-Z0-9_:-]+/.test(line) || line.startsWith("<usage>"),
+  );
+  const reportLines = metadataAt === -1 ? lines : lines.slice(0, metadataAt);
+  const report = reportLines
+    .map((line) => (line.startsWith("  ") ? line.slice(2) : line))
+    .join("\n");
+  const childNativeId =
+    agentMessageSender(value) ??
+    value.match(/agentId:\s*([a-zA-Z0-9_:-]+)/)?.[1] ??
+    context.childNativeId;
+  if (childNativeId && !isBoundedNativeMetadata(childNativeId)) {
+    throw new ApiError(400, "OpenAPPA received invalid agent report metadata");
+  }
+  const childContext: WalkContext = {
+    ...context,
+    ...(childNativeId ? { childNativeId } : {}),
+  };
+  const parsed = stripMarker(report, childContext, true);
+  recordCompletion(parsed, childContext, collected);
+  return parsed.value;
+}
+
+function canonicalizeStatus(
+  status: Record<string, unknown>,
+  context: WalkContext,
+  collected: CollectedChildReturns,
+): Record<string, unknown> | undefined {
+  if (typeof status.completed === "string") {
+    const parsed = stripMarker(status.completed, context, true);
+    recordCompletion(parsed, context, collected);
+    return { completed: parsed.value };
+  }
+
+  const canonical: Record<string, unknown> = {};
+  for (const [childNativeId, entry] of Object.entries(status)) {
+    const child = asRecord(entry);
+    if (!child || typeof child.completed !== "string") continue;
+    if (!isBoundedNativeMetadata(childNativeId)) {
+      throw new ApiError(
+        400,
+        "OpenAPPA received invalid completed child metadata",
+      );
+    }
+    const childContext = { ...context, childNativeId };
+    const parsed = stripMarker(child.completed, childContext, true);
+    recordCompletion(parsed, childContext, collected);
+    canonical[childNativeId] = { completed: parsed.value };
+  }
+  return Object.keys(canonical).length > 0 ? canonical : undefined;
+}
+
+function recordCompletion(
+  parsed: ParsedMarkerValue,
+  context: WalkContext,
+  collected: CollectedChildReturns,
+): void {
+  collected.completions.push({
+    value: parsed.value,
+    ...((parsed.marker?.childNativeId ?? context.childNativeId)
+      ? { childNativeId: parsed.marker?.childNativeId ?? context.childNativeId }
+      : {}),
+    ...(context.spawnCallId ? { spawnCallId: context.spawnCallId } : {}),
+    ...(context.envelopeId ? { envelopeId: context.envelopeId } : {}),
+    assistantOrigin: context.assistantOrigin,
+    ...(context.replayIdentity
+      ? { replayIdentity: context.replayIdentity }
+      : {}),
+  });
+}
+
+function markerSeparatorStart(value: string, matchStart: number): number {
+  let start = matchStart;
+  while (start > 0 && isHorizontalWhitespace(value[start - 1])) start -= 1;
+  for (let count = 0; count < 2; count += 1) {
+    if (start === 0 || value[start - 1] !== "\n") break;
+    start -= 1;
+    if (start > 0 && value[start - 1] === "\r") start -= 1;
+  }
+  return start;
+}
+
+function hasMarker(value: string): boolean {
+  if (value.includes(MARK_TOP) || value.includes(MARK_BOTTOM)) {
+    return true;
+  }
+  const intro = new RegExp(
+    `(?:^|\\r?\\n)[\\t ]*${MARKER_PHRASE}(?:[\\t ]|$)`,
+    "m",
+  );
+  return intro.test(value);
+}
+
+function isHorizontalWhitespace(value: string | undefined): boolean {
+  return value === " " || value === "\t";
+}
+
+function jsonContainer(value: string): unknown | undefined {
+  const first = value.trimStart()[0];
+  return first === "{" || first === "[" ? tryParseJson(value) : undefined;
+}
+
+function normalizeCallId(value: string | null | undefined): string | undefined {
+  if (!value) return undefined;
+  return parseTrajectoryStamp(value)?.callId ?? value;
+}
+
+// === Display code derivation ===
+
+const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const DISPLAY_DOMAIN = "archestra.appa.child-return-display.v1";
+const HEX_SHA256 = /^[0-9a-f]{64}$/;
+
+type ChildReturnClaims = [
+  1,
+  string,
+  string | null,
+  string,
+  string,
+  string | null,
+  string | null,
+  string,
+];
+
+function encodeClaims(claims: ChildReturnClaims): string {
+  if (!isChildReturnClaims(claims)) {
+    throw new ApiError(400, "OpenAPPA child-return claims are invalid");
+  }
+  const encoded = Buffer.from(JSON.stringify(claims), "utf8");
+  if (encoded.length > MAX_CLAIMS_BYTES) {
+    throw new ApiError(400, "OpenAPPA child-return claims exceed their limit");
+  }
+  return encoded.toString("base64url");
+}
+
+function displayDigest(payload: string): Buffer {
+  return createHash("sha256")
+    .update(DISPLAY_DOMAIN)
+    .update("\0")
+    .update(payload)
+    .digest();
+}
+
+function isChildReturnClaims(value: unknown): value is ChildReturnClaims {
+  if (!Array.isArray(value) || value.length !== 8 || value[0] !== PROOF_VERSION)
+    return false;
+  return (
+    isBoundedClaim(value[1]) &&
+    (value[2] === null || isBoundedClaim(value[2])) &&
+    isBoundedClaim(value[3]) &&
+    isBoundedClaim(value[4]) &&
+    (value[5] === null || isBoundedClaim(value[5])) &&
+    (value[6] === null || isBoundedClaim(value[6])) &&
+    typeof value[7] === "string" &&
+    HEX_SHA256.test(value[7])
+  );
+}
+
+function isBoundedClaim(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    Buffer.byteLength(value, "utf8") <= MAX_CLAIMS_BYTES
+  );
+}
+
+function formatMarker(params: {
+  displayCode: string;
+  format: "full" | "inline" | undefined;
+}): string {
+  return params.format === "inline"
+    ? `finished subagent ${params.displayCode}`
+    : `${MARK_TOP}  finished subagent ${params.displayCode}`;
+}
+
+function hashValue(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function first35Bits(digest: Buffer): bigint {
+  let value = 0n;
+  for (let index = 0; index < 5; index += 1) {
+    value = (value << 8n) | BigInt(digest[index] ?? 0);
+  }
+  return value >> 5n;
+}
+
+function encodeCrockford35(value: bigint): string {
+  let bits = value;
+  const chars: string[] = [];
+  for (let index = 0; index < 7; index += 1) {
+    chars.push(CROCKFORD[Number(bits & 31n)] ?? "0");
+    bits >>= 5n;
+  }
+  const code = chars.reverse().join("");
+  return `${code.slice(0, 3)}-${code.slice(3)}`;
+}
+
+/** Takes a withheld return's refusal in place of a throw. */
+type RefusalSink = (refusal: ApiError) => void;
+
+/**
+ * Reads one return. With a sink, the 409 of a withheld return goes to the
+ * sink and `unchanged` comes back. Every other error is thrown, and so is
+ * the 409 when there is no sink.
+ */
+function readOrReport<T>(
+  onRefusal: RefusalSink | undefined,
+  unchanged: T,
+  read: () => T,
+): T {
+  try {
+    return read();
+  } catch (error) {
+    if (!onRefusal || !(error instanceof ApiError) || error.statusCode !== 409)
+      throw error;
+    onRefusal(error);
+    return unchanged;
+  }
+}
+
+// === Shape helpers ===
+
+function collectCodexMailboxReturns(
+  body: unknown,
+  collected: CollectedChildReturns,
+  onRefusal: RefusalSink | undefined,
+): void {
+  const input = asRecord(body)?.input;
+  if (!Array.isArray(input)) return;
+  const spawnIds = new Set<string>();
+  for (const value of input) {
+    const item = asRecord(value);
+    const id = normalizeCallId(stringField(item?.call_id));
+    if (
+      item?.type === "function_call" &&
+      item.name === "spawn_agent" &&
+      item.namespace === "collaboration" &&
+      id
+    )
+      spawnIds.add(id);
+  }
+  const taskCalls = new Map<string, string | null>();
+  for (const value of input) {
+    const item = asRecord(value);
+    const id = normalizeCallId(stringField(item?.call_id));
+    if (item?.type !== "function_call_output" || !id || !spawnIds.has(id))
+      continue;
+    const output =
+      typeof item.output === "string"
+        ? asRecord(tryParseJson(item.output))
+        : asRecord(item.output);
+    const task = output?.task_name;
+    if (!isBoundedNativeMetadata(task)) continue;
+    taskCalls.set(
+      task,
+      taskCalls.has(task) && taskCalls.get(task) !== id ? null : id,
+    );
+  }
+  for (const value of input) {
+    const item = asRecord(value);
+    if (item?.type !== "agent_message") continue;
+    readOrReport(onRefusal, undefined, () =>
+      collectCodexMailboxMessage(item, taskCalls, collected),
+    );
+  }
+}
+
+/** Reads one mailbox message. A message it refuses is not changed. */
+function collectCodexMailboxMessage(
+  item: Record<string, unknown>,
+  taskCalls: Map<string, string | null>,
+  collected: CollectedChildReturns,
+): void {
+  const { author, recipient } = item;
+  const parts = Array.isArray(item.content) ? item.content : [];
+  const first = asRecord(parts[0]);
+  const text =
+    first?.type === "input_text" ? stringField(first.text) : undefined;
+  const kind = text?.match(/^Message Type: ([A-Z_]+)\r?\n/)?.[1];
+  // A message between agents is not a return. In a governed session the
+  // proxy admits it against the runtime's record of its sender's send, and
+  // hides it when there is none; elsewhere it is not read.
+  if (kind === "MESSAGE") return;
+  if (
+    !text ||
+    !isBoundedNativeMetadata(author) ||
+    !isBoundedNativeMetadata(recipient) ||
+    (kind !== "NEW_TASK" && kind !== "FINAL_ANSWER")
+  ) {
+    throw new ApiError(
+      409,
+      "OpenAPPA withheld an unsupported Codex mailbox message",
+    );
+  }
+  const header = ["\n", "\r\n"]
+    .map((newline) =>
+      [
+        `Message Type: ${kind}`,
+        `Task name: ${recipient}`,
+        `Sender: ${author}`,
+        "Payload:",
+        "",
+      ].join(newline),
+    )
+    .find((prefix) => text.startsWith(prefix));
+  if (!header)
+    throw new ApiError(
+      409,
+      "OpenAPPA withheld a malformed Codex mailbox message",
+    );
+  // NEW_TASK input is governed by the prepared fork and its delegation marker.
+  if (kind === "NEW_TASK") {
+    const payload = asRecord(parts[1]);
+    if (
+      text !== header ||
+      parts.length !== 2 ||
+      payload?.type !== "encrypted_content" ||
+      typeof payload.encrypted_content !== "string" ||
+      !payload.encrypted_content
+    ) {
+      throw new ApiError(
+        409,
+        "OpenAPPA withheld an unsupported Codex task payload",
+      );
+    }
+    return;
+  }
+  if (
+    parts.some(
+      (part) =>
+        asRecord(part)?.type !== "input_text" ||
+        typeof asRecord(part)?.text !== "string",
+    )
+  ) {
+    throw new ApiError(
+      409,
+      "OpenAPPA withheld an unsupported child completion payload",
+    );
+  }
+  const spawnCallId = taskCalls.get(author);
+  if (spawnCallId === null)
+    throw new ApiError(409, "OpenAPPA withheld an ambiguous child completion");
+  const id = stringField(item.id);
+  if (id && !isBoundedNativeMetadata(id))
+    throw new ApiError(
+      409,
+      "OpenAPPA withheld a malformed child completion id",
+    );
+  const context: WalkContext = {
+    ...DEFAULT_CONTEXT,
+    nativeResultSite: true,
+    ...(spawnCallId ? { spawnCallId } : {}),
+    ...(id ? { envelopeId: id } : {}),
+  };
+  const payload = parts
+    .map((part) => String(asRecord(part)?.text))
+    .join("")
+    .slice(header.length);
+  const parsed = stripMarker(payload, context, true);
+  recordCompletion(parsed, context, collected);
+  // Paths are display/correlation hints, not child IDs or return authority.
+  // The plugin must match these exact bytes against a retained ChildEnd.
+  for (const key of Object.keys(item)) delete item[key];
+  Object.assign(item, {
+    type: "agent_message",
+    ...(id ? { id } : {}),
+    author,
+    recipient,
+    content: [{ type: "input_text", text: header + parsed.value }],
+  });
+}
+
+const KIMI_CODE_AGENT_RESULT =
+  /^(?:Wall time: \d+(?:\.\d+)? seconds\n)?agent_id: agent-[A-Za-z0-9_-]{1,64}\nactual_subagent_type: [^\n]{1,128}\nstatus: completed\nstop_reason: [a-z_]{1,64}\n/;
+const KIMI_SUMMARY = "\n\n[summary]";
+const KIMI_RESUME_HINT = "\n\nresume_hint: ";
+const NATIVE_COMPLETION_TOOLS = new Set([
+  "Agent",
+  "Task",
+  "task",
+  "wait_agent",
+]);
+const NATIVE_METADATA = /^[A-Za-z0-9_.:@/-]{1,512}$/;
+/** Copilot CLI's tool that reads what a background agent returned. */
+const COPILOT_REPORT_TOOLS: ReadonlySet<string> = new Set(["read_agent"]);
+/**
+ * `read_agent`'s report of an agent that finished: idle, or completed. A
+ * `running` or `cancelled` report carries no return. The Copilot CLI adapter
+ * reads its results by the same pattern.
+ */
+export const COPILOT_AGENT_REPORT =
+  /^Agent (?:is idle|completed|has completed)\b/;
+const COPILOT_REPORT_TURN = /(?:^|\r?\n\r?\n)\[Turn (\d+)\]\r?\n/g;
+
+/** Reads only native Responses read_agent calls, the wire Copilot supports. */
+function collectCopilotReadAgentIds(body: unknown): Map<string, string> {
+  const ids = new Map<string, string>();
+  const input = asRecord(body)?.input;
+  for (const value of Array.isArray(input) ? input : []) {
+    const call = asRecord(value);
+    if (
+      call?.type !== "function_call" ||
+      call.namespace !== undefined ||
+      call.name !== "read_agent"
+    )
+      continue;
+    const id = normalizeCallId(stringField(call.call_id));
+    const args =
+      typeof call.arguments === "string"
+        ? asRecord(tryParseJson(call.arguments))
+        : asRecord(call.arguments);
+    const childId = args?.agent_id;
+    if (!id || !isBoundedNativeMetadata(childId)) continue;
+    if (ids.has(id) && ids.get(id) !== childId) {
+      throw new ApiError(
+        400,
+        "OpenAPPA received conflicting Copilot agent reads",
+      );
+    }
+    ids.set(id, childId);
+  }
+  return ids;
+}
+
+function collectNativeResultCallIds(
+  body: unknown,
+  moreTools?: ReadonlySet<string>,
+): Set<string> {
+  const ids = new Set<string>();
+  const root = asRecord(body);
+  for (const message of Array.isArray(root?.messages) ? root.messages : []) {
+    const record = asRecord(message);
+    if (record?.role !== "assistant") continue;
+    for (const call of Array.isArray(record.tool_calls)
+      ? record.tool_calls
+      : []) {
+      const toolCall = asRecord(call);
+      const fn = asRecord(toolCall?.function);
+      addNativeResultCallId(
+        ids,
+        stringField(toolCall?.id),
+        stringField(fn?.name) ?? stringField(toolCall?.name),
+        stringField(fn?.namespace) ?? stringField(toolCall?.namespace),
+        moreTools,
+      );
+    }
+    for (const block of Array.isArray(record.content) ? record.content : []) {
+      const toolUse = asRecord(block);
+      if (toolUse?.type !== "tool_use") continue;
+      addNativeResultCallId(
+        ids,
+        stringField(toolUse.id),
+        stringField(toolUse.name),
+        stringField(toolUse.namespace),
+        moreTools,
+      );
+    }
+  }
+  for (const key of ["input", "output"] as const) {
+    for (const item of Array.isArray(root?.[key]) ? root[key] : []) {
+      const call = asRecord(item);
+      if (call?.type !== "function_call" && call?.type !== "custom_tool_call") {
+        continue;
+      }
+      addNativeResultCallId(
+        ids,
+        stringField(call.call_id) ?? stringField(call.id),
+        stringField(call.name),
+        stringField(call.namespace),
+        moreTools,
+      );
+    }
+  }
+  return ids;
+}
+
+function addNativeResultCallId(
+  ids: Set<string>,
+  callId: string | undefined,
+  name: string | undefined,
+  namespace: string | undefined,
+  moreTools?: ReadonlySet<string>,
+): void {
+  if (!callId || !name || !isNativeToolNamespace(namespace)) return;
+  const local = localNativeToolName(name);
+  if (!NATIVE_COMPLETION_TOOLS.has(local) && moreTools?.has(local) !== true)
+    return;
+  ids.add(normalizeCallId(callId) ?? callId);
+}
+
+function isNativeToolNamespace(namespace: string | undefined): boolean {
+  return (
+    namespace === undefined ||
+    namespace === "functions" ||
+    namespace === "multi_agent_v1"
+  );
+}
+
+function localNativeToolName(name: string): string {
+  const withoutFunctions = name.startsWith("functions.")
+    ? name.slice("functions.".length)
+    : name;
+  for (const prefix of [
+    "host/claude-code/",
+    "host/archestra/",
+    "builtin:",
+    "host/",
+  ]) {
+    if (withoutFunctions.startsWith(prefix)) {
+      return withoutFunctions.slice(prefix.length);
+    }
+  }
+  return withoutFunctions;
+}
+
+function isStandaloneEnvelope(
+  value: string,
+  envelope: NativeEnvelope,
+): boolean {
+  const trimmed = value.trim();
+  return trimmed.startsWith(envelope.open) && trimmed.endsWith(envelope.close);
+}
+
+function startsWithEnvelope(value: string, envelope: NativeEnvelope): boolean {
+  return value.trimStart().startsWith(envelope.open);
+}
+
+function isCompleteTaskResultFraming(value: string): boolean {
+  const open = "<task_result>";
+  const close = "</task_result>";
+  const start = value.indexOf(open);
+  const end = value.lastIndexOf(close);
+  if (start === -1 || end < start) return false;
+  const prefix = value.slice(0, start).trim();
+  const suffix = value.slice(end + close.length).trim();
+  const validPrefix =
+    prefix === "" ||
+    /^<task\b[^>]*>(?:\s*<summary>[\s\S]*?<\/summary>)?$/.test(prefix);
+  return validPrefix && (suffix === "" || suffix === "</task>");
+}
+
+function isOpenCodeBackgroundLaunch(value: string): boolean {
+  return /^\s*<task\b[^>]*\bstate\s*=\s*(["'])(?:running|pending|queued)\1[^>]*>/.test(
+    value,
+  );
+}
+
+function isOpenCodeBackgroundCompletion(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^\s*<task\b[^>]*\bstate\s*=\s*(["'])completed\1[^>]*>/.test(value)
+  );
+}
+
+function isBoundedNativeMetadata(value: unknown): value is string {
+  return typeof value === "string" && NATIVE_METADATA.test(value);
+}
+
+function optionalBoundedMetadata(value: unknown): string | undefined {
+  return isBoundedNativeMetadata(value) ? value : undefined;
+}
+
+function hasInvalidMetadata(
+  original: unknown,
+  bounded: string | undefined,
+): boolean {
+  return original !== undefined && original !== null && bounded === undefined;
+}
+
+function stringField(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function taskIdIn(record: Record<string, unknown>): string | undefined {
+  return stringField(record.task_id) ?? stringField(record.taskId);
+}
+
+function isToolResultEnvelope(record: Record<string, unknown>): boolean {
+  return (
+    record.role === "tool" ||
+    record.type === "tool_result" ||
+    record.type === "function_call_output" ||
+    record.type === "custom_tool_call_output"
+  );
+}
+
+function tagValue(value: string, tag: string): string | undefined {
+  const open = `<${tag}>`;
+  const close = `</${tag}>`;
+  const start = value.indexOf(open);
+  if (start === -1) return undefined;
+  const end = value.indexOf(close, start + open.length);
+  return end === -1 ? undefined : value.slice(start + open.length, end);
+}
+
+function taskElementId(value: string): string | undefined {
+  const task = value.lastIndexOf("<task");
+  if (task === -1) return undefined;
+  const end = value.indexOf(">", task);
+  if (end === -1) return undefined;
+  return value.slice(task, end + 1).match(/\bid="([^"]+)"/)?.[1];
+}
+
+function agentMessageSender(value: string): string | undefined {
+  const start = value.indexOf("<agent-message");
+  if (start === -1) return undefined;
+  const end = value.indexOf(">", start);
+  if (end === -1) return undefined;
+  return value.slice(start, end + 1).match(/\bfrom="([^"]+)"/)?.[1];
+}
+
+function tryParseJson(value: string): unknown | undefined {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+}

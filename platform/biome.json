@@ -1,5 +1,10 @@
 {
-  "$schema": "https://biomejs.dev/schemas/2.3.7/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.4.6/schema.json",
+  "plugins": [
+    "./tools/biome-plugins/icon-button-aria-label.grit",
+    "./tools/biome-plugins/no-conditional-bare-jsx-text.grit",
+    "./tools/biome-plugins/design-arena.grit"
+  ],
   "vcs": {
     "enabled": true,
     "clientKind": "git",
@@ -11,14 +16,24 @@
       "**/*.tsx",
       "**/*.ts",
       "e2e-tests/**/*.ts",
+      "e2e-tests/**/*.mts",
       "shared/**/*.ts",
-      "standalone-scripts/**/*.ts",
-      "!node_modules",
-      "!.next",
-      "!**/dist",
-      "!build",
+      "scripts/**/*.ts",
+      "benchmarks/**/*.mjs",
+      "!!**/node_modules",
+      "!!**/.next",
+      "!!**/.next-*",
+      "!!**/.turbo",
+      "!!**/target",
+      "!!**/dist",
+      "!!**/build",
       "!helm/**/*",
-      "!**/*.gen.ts"
+      "!**/*.gen.ts",
+      "!**/*.generated.ts",
+      "!**/sandbox-rs/index.d.ts",
+      "!**/app-runtime-rs/index.d.ts",
+      "!**/openappa-rs/index.d.ts",
+      "!**/router-rs/index.d.ts"
     ]
   },
   "formatter": {
@@ -55,6 +70,81 @@
   "overrides": [
     {
       "includes": [
+        "frontend/src/**/*.ts",
+        "frontend/src/**/*.tsx",
+        "!frontend/src/components/ui/**",
+        "!frontend/src/static/**"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "useFilenamingConvention": {
+              "level": "error",
+              "options": {
+                "strictCase": true,
+                "requireAscii": true,
+                "filenameCases": ["kebab-case"],
+                "match": "([-a-z0-9]+)[.]((?:(?:query|keys|utils|types|constants|context|server|client|ee|test-data|d)[.])*tsx?)"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "frontend/src/**/*.test.ts",
+        "frontend/src/**/*.test.tsx",
+        "!frontend/src/components/ui/**",
+        "!frontend/src/static/**"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "useFilenamingConvention": {
+              "level": "error",
+              "options": {
+                "strictCase": true,
+                "requireAscii": true,
+                "filenameCases": ["kebab-case"],
+                "match": "([-a-z0-9]+)[.]((?:[-a-z0-9]+[.])*test[.]tsx?)"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "frontend/src/app/**/_*/**",
+        "!frontend/src/app/**/_parts/**",
+        "!**/__mocks__/**"
+      ],
+      "plugins": ["./tools/biome-plugins/route-private-folder.grit"]
+    },
+    {
+      "includes": [
+        "frontend/src/**/*.hook.ts",
+        "frontend/src/**/*.hook.tsx",
+        "frontend/src/**/*.hook.test.ts",
+        "frontend/src/**/*.hook.test.tsx"
+      ],
+      "plugins": ["./tools/biome-plugins/hook-file-name.grit"]
+    },
+    {
+      "includes": ["frontend/**/*.ts", "frontend/**/*.tsx"],
+      "plugins": ["./tools/biome-plugins/integration-labels-via-catalog.grit"]
+    },
+    {
+      "includes": [
+        "frontend/src/**/*.tsx",
+        "!frontend/src/components/ui/**",
+        "!**/*.test.tsx"
+      ],
+      "plugins": ["./tools/biome-plugins/no-raw-button.grit"]
+    },
+    {
+      "includes": [
         "**/*.ts",
         "**/*.tsx",
         "!**/*.ee.ts",
@@ -62,6 +152,102 @@
         "!**/*.ee.test.ts",
         "!**/*.ee.test.tsx",
         "!**/*.ee.spec.ts"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "paths": {
+                  "./__arena__": "design-arena: do not commit",
+                  "@/app/_parts/__arena__": "design-arena: do not commit",
+                  "@/lib/utils": "Import from the focused @/lib/utils module instead of the barrel, which eagerly loads date-fns and other unrelated code.",
+                  "@/lib/utils/index": "Import from the focused @/lib/utils module instead of the barrel, which eagerly loads date-fns and other unrelated code.",
+                  "googleapis": "Import one API module, such as googleapis/build/src/apis/drive/v3.js, and auth classes from google-auth-library: the package root loads every Google API, about 100 MB in the server and 150 MB of declarations in each type check."
+                },
+                "patterns": [
+                  {
+                    "group": ["**/*.ee", "**/*.ee.ts", "**/*.ee.tsx"],
+                    "message": "Cannot import .ee.ts files from non-.ee.ts files. Enterprise Edition files should only be imported by other .ee.ts files. Use runtime conditional logic with config.enterpriseFeatures.core instead to avoid bundling enterprise code into OSS builds."
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "frontend/**/*.ts",
+        "frontend/**/*.tsx",
+        "!**/*.ee.ts",
+        "!**/*.ee.tsx",
+        "!**/*.ee.test.ts",
+        "!**/*.ee.test.tsx",
+        "!**/*.ee.spec.ts"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "paths": {
+                  "./__arena__": "design-arena: do not commit",
+                  "@/app/_parts/__arena__": "design-arena: do not commit",
+                  "@/lib/utils": "Import from the focused @/lib/utils module instead of the barrel, which eagerly loads date-fns and other unrelated code.",
+                  "@/lib/utils/index": "Import from the focused @/lib/utils module instead of the barrel, which eagerly loads date-fns and other unrelated code.",
+                  "date-fns": "Import each function from its own module, for example `import { format } from \"date-fns/format\"`: the package root loads all of date-fns, about 0.6 s in every frontend test file.",
+                  "lodash-es": "Import each function from its own module, for example `import isEqual from \"lodash-es/isEqual\"`: the package root loads all of lodash.",
+                  "googleapis": "Import one API module, such as googleapis/build/src/apis/drive/v3.js, and auth classes from google-auth-library: the package root loads every Google API, about 100 MB in the server and 150 MB of declarations in each type check."
+                },
+                "patterns": [
+                  {
+                    "group": ["**/*.ee", "**/*.ee.ts", "**/*.ee.tsx"],
+                    "message": "Cannot import .ee.ts files from non-.ee.ts files. Enterprise Edition files should only be imported by other .ee.ts files. Use runtime conditional logic with config.enterpriseFeatures.core instead to avoid bundling enterprise code into OSS builds."
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "frontend/**/*.ee.ts",
+        "frontend/**/*.ee.tsx",
+        "frontend/**/*.ee.test.ts",
+        "frontend/**/*.ee.test.tsx",
+        "frontend/**/*.ee.spec.ts"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "paths": {
+                  "./__arena__": "design-arena: do not commit",
+                  "@/app/_parts/__arena__": "design-arena: do not commit",
+                  "@/lib/utils": "Import from the focused @/lib/utils module instead of the barrel, which eagerly loads date-fns and other unrelated code.",
+                  "@/lib/utils/index": "Import from the focused @/lib/utils module instead of the barrel, which eagerly loads date-fns and other unrelated code.",
+                  "date-fns": "Import each function from its own module, for example `import { format } from \"date-fns/format\"`: the package root loads all of date-fns, about 0.6 s in every frontend test file.",
+                  "lodash-es": "Import each function from its own module, for example `import isEqual from \"lodash-es/isEqual\"`: the package root loads all of lodash."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "frontend/src/app/consults/logs/_parts/consult-detail-sheet.tsx",
+        "frontend/src/app/consults/logs/_parts/consults-table.tsx",
+        "frontend/src/lib/openappa/external-consults.query.ts"
       ],
       "linter": {
         "rules": {
@@ -82,7 +268,7 @@
       }
     },
     {
-      "includes": ["standalone-scripts/**/*.ts"],
+      "includes": ["scripts/**/*.ts"],
       "linter": {
         "rules": {
           "suspicious": {

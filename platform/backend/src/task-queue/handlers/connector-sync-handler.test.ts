@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { vi } from "vitest";
-import { beforeEach, describe, expect, test } from "@/test";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 
 const mockExecuteSync = vi.hoisted(() => vi.fn());
 vi.mock("@/knowledge-base", () => ({
@@ -10,6 +9,11 @@ vi.mock("@/knowledge-base", () => ({
 const mockEnqueue = vi.hoisted(() => vi.fn().mockResolvedValue("task-id"));
 vi.mock("@/task-queue", () => ({
   taskQueueService: { enqueue: mockEnqueue },
+}));
+
+const mockWithinResumeBudget = vi.hoisted(() => vi.fn());
+vi.mock("./connector-resume-budget", () => ({
+  withinResumeBudget: mockWithinResumeBudget,
 }));
 
 vi.mock("@/entrypoints/_shared/log-capture", () => ({
@@ -34,6 +38,7 @@ describe("handleConnectorSync", () => {
   beforeEach(() => {
     connectorId = randomUUID();
     vi.clearAllMocks();
+    mockWithinResumeBudget.mockResolvedValue(true);
   });
 
   test("calls executeSync with the connector ID", async () => {
@@ -50,24 +55,27 @@ describe("handleConnectorSync", () => {
     );
   });
 
-  test("enqueues continuation with incremented count on partial result", async () => {
+  test("enqueues a continuation on a partial result when within the run budget", async () => {
     mockExecuteSync.mockResolvedValue({ status: "partial" });
+    mockWithinResumeBudget.mockResolvedValue(true);
 
-    await handleConnectorSync({ connectorId, continuationCount: 3 });
+    await handleConnectorSync({ connectorId });
 
+    expect(mockWithinResumeBudget).toHaveBeenCalledWith({
+      connectorId,
+      runType: "content",
+    });
     expect(mockEnqueue).toHaveBeenCalledWith({
       taskType: "connector_sync",
-      payload: {
-        connectorId,
-        continuationCount: 4,
-      },
+      payload: { connectorId },
     });
   });
 
-  test("does not enqueue when continuation count >= 50", async () => {
+  test("does not enqueue a continuation when the connector is over its run budget", async () => {
     mockExecuteSync.mockResolvedValue({ status: "partial" });
+    mockWithinResumeBudget.mockResolvedValue(false);
 
-    await handleConnectorSync({ connectorId, continuationCount: 50 });
+    await handleConnectorSync({ connectorId });
 
     expect(mockEnqueue).not.toHaveBeenCalled();
   });

@@ -1,131 +1,315 @@
 "use client";
 
-import { DocsPage, getSystemPromptTemplateExpressions } from "@shared";
-import { Maximize2, Minimize2 } from "lucide-react";
-import { useState } from "react";
+import {
+  DocsPage,
+  getSystemPromptTemplateExpressions,
+  SYSTEM_PROMPT_HELPER_EXPRESSIONS,
+  SYSTEM_PROMPT_HELPER_NAMES,
+} from "@archestra/shared";
+import type { EditorProps } from "@monaco-editor/react";
+import { TriangleAlert } from "lucide-react";
+import { useRef, useState } from "react";
 
 import { Editor } from "@/components/editor";
 import { ExternalDocsLink } from "@/components/external-docs-link";
+import { StandardDialog } from "@/components/standard-dialog";
 import { Button } from "@/components/ui/button";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import { getFrontendDocsUrl } from "@/lib/docs/docs";
 import {
   computeHandlebarsReplaceOffsets,
   shouldShowHandlebarsCompletions,
 } from "@/lib/utils/handlebars-completion";
+import { useUnparseableExpressions } from "@/lib/utils/handlebars-validation";
 
 export function SystemPromptEditor({
+  title = "Instruction",
+  description,
+  templating = true,
   value,
   onChange,
   readOnly,
-  height = "200px",
-  expandedHeight = "420px",
+  minHeight = 200,
+  maxHeight = 560,
   variant = "default",
+  showTitle = true,
   headerExtra,
-  builtInAgentId,
 }: {
+  title?: string;
+  description?: string;
+  /** Disable for instruction fields that are sent as literal text. */
+  templating?: boolean;
   value: string;
   onChange: (value: string) => void;
   readOnly?: boolean;
-  height?: string;
-  expandedHeight?: string;
-  /** "section" uses bold h3 (matching section headings), "default" uses lighter text */
-  variant?: "default" | "section";
-  /** Extra element rendered in the header next to the expand button */
+  /** Floor for the auto-grown box, in px, and where a drag bottoms out. */
+  minHeight?: number;
+  /**
+   * Ceiling for the auto growth, in px — past it the editor scrolls rather
+   * than pushing the rest of the form off the screen. A drag is the reader
+   * saying they want more than this, so it is not clamped by it.
+   */
+  maxHeight?: number;
+  /** Heading treatment for standalone fields, form sections, and detail cards. */
+  variant?: "default" | "section" | "detail-card";
+  /**
+   * Off where the host already names the editor. `title` still labels the
+   * editor for assistive technology — it is only the visible duplicate that
+   * goes.
+   */
+  showTitle?: boolean;
+  /** Extra element rendered in the header, beside the title. */
   headerExtra?: React.ReactNode;
-  /** Optional built-in agent id to expose built-in-agent-specific template variables */
-  builtInAgentId?: string | null;
 }) {
   const docsUrl = getFrontendDocsUrl(
     DocsPage.PlatformAgents,
-    "system-prompt-templating",
+    "prompt-templates",
   );
-  const [isExpanded, setIsExpanded] = useState(false);
-  const editorHeight = isExpanded ? expandedHeight : height;
-  const templateExpressions = getSystemPromptTemplateExpressions({
-    builtInAgentId,
-  });
+  // What the text wants, and what the reader has asked for by dragging. A
+  // drag raises the floor rather than freezing the box, so the editor still
+  // grows under the next line typed into it; dragging it past the ceiling
+  // raises that too, since asking for a bigger box is the one case where the
+  // ceiling is not what the reader wants.
+  const [contentHeight, setContentHeight] = useState(minHeight);
+  const [draggedHeight, setDraggedHeight] = useState<number | null>(null);
+  const dragRef = useRef<{ startY: number; startHeight: number } | null>(null);
+  const floor = draggedHeight ?? minHeight;
+  const editorHeight = Math.min(
+    Math.max(contentHeight, floor),
+    Math.max(maxHeight, floor),
+  );
+  const unparseableExpressions = useUnparseableExpressions(
+    templating ? value : "",
+  );
+  const templateExpressions = getSystemPromptTemplateExpressions();
+  const [templatingInfoOpen, setTemplatingInfoOpen] = useState(false);
 
   return (
     <div className="space-y-2">
       <div className="flex items-start justify-between gap-3">
         <div>
-          {variant === "section" ? (
-            <h3 className="text-sm font-semibold">Instruction</h3>
-          ) : (
-            <p className="text-sm font-medium">Instruction</p>
-          )}
-          <p className="text-xs text-muted-foreground">
-            System prompt used by the agent. Supports{" "}
-            <a
-              href="https://handlebarsjs.com/"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="underline hover:text-foreground"
+          {showTitle &&
+            (variant !== "default" ? (
+              <h3
+                className={
+                  variant === "detail-card"
+                    ? "text-sm font-semibold"
+                    : "text-base font-semibold"
+                }
+              >
+                {title}
+              </h3>
+            ) : (
+              <p className="text-sm font-medium">{title}</p>
+            ))}
+          {(description || templating) && (
+            <p
+              className={
+                variant === "detail-card"
+                  ? "text-sm text-muted-foreground"
+                  : "text-xs text-muted-foreground"
+              }
             >
-              Handlebars
-            </a>{" "}
-            templating
-            {docsUrl ? (
-              <>
-                {" "}
-                — see{" "}
-                <ExternalDocsLink
-                  href={docsUrl}
-                  className="underline hover:text-foreground"
-                  showIcon={false}
-                >
-                  docs
-                </ExternalDocsLink>{" "}
-                for available variables.
-              </>
-            ) : (
-              "."
-            )}
-          </p>
+              {/* The description and the templating note read as one
+                  sentence run, so they share a line instead of stacking. */}
+              {description && <span>{description}</span>}{" "}
+              {templating && (
+                <>
+                  <span>Supports Handlebars templating.</span>{" "}
+                  <Button
+                    type="button"
+                    variant="link"
+                    className="h-auto p-0 text-xs"
+                    aria-haspopup="dialog"
+                    onClick={() => setTemplatingInfoOpen(true)}
+                  >
+                    More info
+                  </Button>
+                </>
+              )}
+            </p>
+          )}
         </div>
-        <div className="flex items-center gap-2 shrink-0">
-          {headerExtra}
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => setIsExpanded((current) => !current)}
+        {headerExtra && (
+          <div className="flex shrink-0 items-center gap-2">{headerExtra}</div>
+        )}
+      </div>
+      <div className="relative overflow-hidden rounded-md border">
+        <div style={{ height: editorHeight }}>
+          <Editor
+            height="100%"
+            language={templating ? "handlebars" : "plaintext"}
+            value={value}
+            onChange={(v) => onChange(v || "")}
+            beforeMount={(monaco) => {
+              if (templating)
+                registerSystemPromptCompletions(monaco, templateExpressions);
+            }}
+            onMount={(editor) => {
+              // Monaco reports the height its content wants; the box follows
+              // it until the ceiling, after which the editor scrolls.
+              const sync = () => setContentHeight(editor.getContentHeight());
+              sync();
+              editor.onDidContentSizeChange(sync);
+            }}
+            options={{ ...SHARED_EDITOR_OPTIONS, readOnly, ariaLabel: title }}
+          />
+        </div>
+        {/* The corner grip a textarea has, in the same place, so the two
+            fields of this form resize the same way. The arrow keys move it
+            too, so it is not a mouse-only control. */}
+        {/* biome-ignore lint/a11y/useSemanticElements: a resize grip between
+            two regions is what `separator` names; <hr> is not focusable and
+            carries no orientation. */}
+        <div
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label={`Resize ${title.toLowerCase()}`}
+          // A focusable separator is a window splitter, and states where it
+          // currently sits.
+          aria-valuenow={editorHeight}
+          aria-valuemin={minHeight}
+          tabIndex={0}
+          className="absolute bottom-0 right-0 flex size-4 cursor-ns-resize items-end justify-end p-0.5 text-muted-foreground/60 outline-none hover:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          onPointerDown={(event) => {
+            event.preventDefault();
+            event.currentTarget.setPointerCapture(event.pointerId);
+            dragRef.current = {
+              startY: event.clientY,
+              startHeight: editorHeight,
+            };
+          }}
+          onPointerMove={(event) => {
+            const drag = dragRef.current;
+            if (!drag) return;
+            setDraggedHeight(
+              Math.max(
+                minHeight,
+                drag.startHeight + (event.clientY - drag.startY),
+              ),
+            );
+          }}
+          onPointerUp={(event) => {
+            dragRef.current = null;
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          }}
+          onKeyDown={(event) => {
+            if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+            event.preventDefault();
+            const step = event.key === "ArrowDown" ? RESIZE_STEP : -RESIZE_STEP;
+            setDraggedHeight(Math.max(minHeight, editorHeight + step));
+          }}
+        >
+          {/* The same two diagonal ticks the native textarea grip draws. */}
+          <svg
+            viewBox="0 0 10 10"
+            className="size-2.5"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.25"
+            strokeLinecap="round"
+            aria-hidden="true"
           >
-            {isExpanded ? (
-              <Minimize2 className="size-4" />
-            ) : (
-              <Maximize2 className="size-4" />
-            )}
-            <span>{isExpanded ? "Collapse" : "Expand"}</span>
-          </Button>
+            <title>Resize</title>
+            <path d="M9 1 1 9M9 5.5 5.5 9" />
+          </svg>
         </div>
       </div>
-      <div className="border rounded-md overflow-hidden">
-        <Editor
-          height={editorHeight}
-          defaultLanguage="handlebars"
-          value={value}
-          onChange={(v) => onChange(v || "")}
-          beforeMount={(monaco) => {
-            registerSystemPromptCompletions(monaco, templateExpressions);
-          }}
-          options={{
-            minimap: { enabled: false },
-            fontSize: 13,
-            lineNumbers: "on",
-            scrollBeyondLastLine: false,
-            scrollbar: { alwaysConsumeMouseWheel: false },
-            wordWrap: "on",
-            automaticLayout: true,
-            readOnly,
-            placeholder: "Enter instruction for the LLM",
-            quickSuggestions: false,
-            wordBasedSuggestions: "off",
-            // Disable EditContext API — it doesn't work inside Radix Dialog portals
-            editContext: false,
-          }}
-        />
-      </div>
+      <UnparseableExpressionsWarning expressions={unparseableExpressions} />
+      {templating && usesPerTurnHelper(value) && <PerTurnHelperWarning />}
+      {templating && (
+        <StandardDialog
+          open={templatingInfoOpen}
+          onOpenChange={setTemplatingInfoOpen}
+          title="Templating Cheat Sheet"
+          description={
+            <>
+              <span>Instructions use </span>
+              <ExternalDocsLink
+                href="https://handlebarsjs.com/"
+                showIcon={false}
+              >
+                Handlebars
+              </ExternalDocsLink>
+              <span> to fill in variables when the agent runs.</span>
+            </>
+          }
+          size="medium"
+        >
+          <div className="space-y-6 text-sm">
+            <section className="space-y-3" aria-label="Available variables">
+              <h3 className="font-medium">Available variables</h3>
+              <div className="overflow-hidden rounded-md border">
+                <Table aria-label="Template variables and helpers">
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-[45%] sm:w-44">
+                        Expression
+                      </TableHead>
+                      <TableHead>Value</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {templateExpressions.map(({ expression, description }) => (
+                      <TableRow key={expression}>
+                        <TableCell className="align-top">
+                          <code className="break-all text-xs">
+                            {expression}
+                          </code>
+                        </TableCell>
+                        <TableCell className="text-muted-foreground">
+                          {description}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            </section>
+            <section className="space-y-3" aria-label="Examples">
+              <h3 className="font-medium">Examples</h3>
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <p className="text-xs text-muted-foreground">
+                    Personalize a response
+                  </p>
+                  <pre className="whitespace-pre-wrap break-words rounded-md bg-muted/50 p-3 text-xs leading-relaxed">
+                    <code>
+                      {
+                        "You are helping {{user.name}}. Today is {{currentDate}}."
+                      }
+                    </code>
+                  </pre>
+                </div>
+                <div className="space-y-2">
+                  <p className="text-xs text-muted-foreground">
+                    Tailor instructions to a team
+                  </p>
+                  <pre className="whitespace-pre-wrap break-words rounded-md bg-muted/50 p-3 text-xs leading-relaxed">
+                    <code>
+                      {
+                        '{{#includes user.teams "Engineering"}}\nUse technical detail and code examples.\n{{/includes}}'
+                      }
+                    </code>
+                  </pre>
+                </div>
+              </div>
+            </section>
+            {docsUrl && (
+              <ExternalDocsLink href={docsUrl}>
+                Templating documentation
+              </ExternalDocsLink>
+            )}
+          </div>
+        </StandardDialog>
+      )}
     </div>
   );
 }
@@ -134,22 +318,103 @@ export function SystemPromptEditor({
 // Internal helpers
 // ===
 
-let completionsProviderRegistered = false;
-let currentTemplateExpressions: ReadonlyArray<{
+/**
+ * Names the expressions Handlebars cannot parse. They are rendered as the
+ * literal text the author typed rather than dropped, so this is a warning and
+ * not an error — but an author who meant to interpolate a value has no other
+ * way to find out before a model reads the braces back to a user.
+ */
+function UnparseableExpressionsWarning({
+  expressions,
+}: {
+  expressions: string[];
+}) {
+  if (expressions.length === 0) return null;
+
+  const shown = [...new Set(expressions)].slice(0, UNPARSEABLE_SHOWN_MAX);
+
+  return (
+    <p className="text-xs text-amber-600 dark:text-amber-500">
+      <TriangleAlert className="mr-1 inline size-3.5 align-[-2px]" />
+      {shown.length === 1
+        ? "This expression isn't valid Handlebars and will appear literally in the prompt: "
+        : "These expressions aren't valid Handlebars and will appear literally in the prompt: "}
+      {shown.map((expression, index) => (
+        <span key={expression}>
+          {index > 0 && <span>, </span>}
+          <code className="font-mono">{expression}</code>
+        </span>
+      ))}
+      {expressions.length > shown.length && <span>, …</span>}
+      {". Prefix one with a backslash to keep it as literal text on purpose."}
+    </p>
+  );
+}
+
+/**
+ * `{{currentTime}}` renders differently on every turn, so the instruction it
+ * sits in never matches the previous turn's: the provider's prompt cache misses
+ * and the earlier turns' thinking has to be dropped.
+ */
+function PerTurnHelperWarning() {
+  return (
+    <output
+      aria-label="Per-turn template helper"
+      className="block text-xs text-amber-600 dark:text-amber-500"
+    >
+      <TriangleAlert className="mr-1 inline size-3.5 align-[-2px]" />
+      <code className="font-mono">
+        {SYSTEM_PROMPT_HELPER_EXPRESSIONS.currentTime}
+      </code>{" "}
+      changes the instruction on every turn, which disables prompt caching and
+      makes conversations cost more. Leave it out unless the agent needs the
+      exact time.
+    </output>
+  );
+}
+
+function usesPerTurnHelper(value: string): boolean {
+  return PER_TURN_HELPER_PATTERN.test(value);
+}
+
+const PER_TURN_HELPER_PATTERN = new RegExp(
+  `(?<!\\\\)\\{\\{~?\\s*${SYSTEM_PROMPT_HELPER_NAMES.currentTime}\\s*~?\\}\\}`,
+);
+
+/** Enough to act on without turning the warning into a second prompt. */
+const UNPARSEABLE_SHOWN_MAX = 5;
+
+/** How far one arrow-key press moves the resize grip. */
+const RESIZE_STEP = 24;
+
+const SHARED_EDITOR_OPTIONS = {
+  minimap: { enabled: false },
+  fontSize: 13,
+  lineNumbers: "on",
+  scrollBeyondLastLine: false,
+  scrollbar: { alwaysConsumeMouseWheel: false },
+  wordWrap: "on",
+  automaticLayout: true,
+  placeholder: "Enter instruction for the LLM",
+  quickSuggestions: false,
+  wordBasedSuggestions: "off",
+  // Disable EditContext API — it doesn't work inside Radix Dialog portals
+  editContext: false,
+} as const satisfies NonNullable<EditorProps["options"]>;
+
+type TemplateExpressions = ReadonlyArray<{
   expression: string;
   description: string;
-}> = [];
+}>;
 
-type Monaco = Parameters<
-  NonNullable<import("@monaco-editor/react").EditorProps["beforeMount"]>
->[0];
+let completionsProviderRegistered = false;
+let currentTemplateExpressions: TemplateExpressions = [];
+
+type Monaco = Parameters<NonNullable<EditorProps["beforeMount"]>>[0];
 
 function registerSystemPromptCompletions(
   monaco: Monaco,
-  templateExpressions: ReadonlyArray<{
-    expression: string;
-    description: string;
-  }>,
+  templateExpressions: TemplateExpressions,
 ) {
   currentTemplateExpressions = templateExpressions;
 

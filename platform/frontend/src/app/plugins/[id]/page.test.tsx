@@ -1,0 +1,359 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("next/navigation");
+vi.mock("@/lib/config/config.query");
+vi.mock("@/lib/plugins/plugin.query");
+vi.mock("@/lib/git-credentials.query");
+vi.mock("@/lib/auth/auth.query");
+vi.mock("@/lib/organization.query");
+vi.mock("@/components/editor");
+vi.mock("@/components/resource-access-section", () => ({
+  ResourceAccessSection: ({
+    resource,
+    id,
+  }: {
+    resource: string;
+    id?: string;
+  }) => (
+    <div
+      data-testid="plugin-permissions"
+      data-resource={resource}
+      data-id={id}
+    />
+  ),
+}));
+
+import { useRouter, useSearchParams } from "next/navigation";
+import { useHasPermissions, useSession } from "@/lib/auth/auth.query";
+import { useFeature } from "@/lib/config/config.query";
+import { useGitCredentials } from "@/lib/git-credentials.query";
+import { useAppearanceSettings } from "@/lib/organization.query";
+import {
+  type PluginDetail,
+  useApplyGithubPluginUpdate,
+  useDeletePlugin,
+  usePlugin,
+  usePreviewGithubPluginUpdate,
+  useTriggerPluginGithubSync,
+  useUpdatePlugin,
+  useUpdatePluginGithubSync,
+} from "@/lib/plugins/plugin.query";
+import PluginDetailPage from "./page.client";
+
+const BASE_PLUGIN = {
+  id: "plugin-1",
+  organizationId: "org-1",
+  displayName: "Session guard",
+  description: "Blocks risky commands.",
+  pluginSlug: "session-guard",
+  clientType: "claude-code",
+  supportedPlatforms: ["posix"],
+  scope: "org",
+  teams: [],
+  users: [],
+  authorId: "user-1",
+  enabled: true,
+  files: [
+    {
+      path: "hooks/hooks.json",
+      content: "{}",
+      encoding: "utf8",
+      mode: "100644",
+    },
+    {
+      path: "statusline.ps1",
+      content: "Write-Output 'ready'",
+      encoding: "utf8",
+      mode: "100644",
+    },
+  ],
+  sourceKind: "manual",
+  sourceId: null,
+  sourceRepo: null,
+  sourceRef: null,
+  sourceSha: null,
+  sourceSubdir: null,
+  sourceMarketplaceRepo: null,
+  sourceMarketplacePluginName: null,
+  githubSyncInterval: null,
+  githubSyncRef: null,
+  githubPatId: null,
+  githubAppConfigId: null,
+  gitlabTokenId: null,
+  sourceProvider: null,
+  lastSyncedAt: null,
+  lastSyncError: null,
+  pendingSourceSha: null,
+  pendingContentHash: null,
+  pendingDetectedAt: null,
+  contentHash: "abc123",
+  approvedContentHash: "abc123",
+  approvedAt: null,
+  approvedBy: null,
+  createdAt: "2026-08-01T00:00:00.000Z",
+  updatedAt: "2026-08-01T00:00:00.000Z",
+} as unknown as PluginDetail;
+
+function renderPage(plugin: PluginDetail) {
+  vi.mocked(usePlugin).mockReturnValue({
+    data: plugin,
+    isPending: false,
+  } as unknown as ReturnType<typeof usePlugin>);
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <PluginDetailPage id={plugin.id} />
+    </QueryClientProvider>,
+  );
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  );
+  vi.mocked(useRouter).mockReturnValue({
+    push: vi.fn(),
+  } as unknown as ReturnType<typeof useRouter>);
+  vi.mocked(useSearchParams).mockReturnValue(
+    new URLSearchParams() as ReturnType<typeof useSearchParams>,
+  );
+  vi.mocked(useFeature).mockReturnValue(true);
+  vi.mocked(useSession).mockReturnValue({
+    data: { user: { id: "user-1" } },
+  } as unknown as ReturnType<typeof useSession>);
+  vi.mocked(useHasPermissions).mockReturnValue({
+    data: true,
+  } as unknown as ReturnType<typeof useHasPermissions>);
+  vi.mocked(useAppearanceSettings).mockReturnValue({
+    data: undefined,
+  } as unknown as ReturnType<typeof useAppearanceSettings>);
+  vi.mocked(useGitCredentials).mockReturnValue({
+    data: [],
+  } as unknown as ReturnType<typeof useGitCredentials>);
+  const mutationStub = {
+    mutateAsync: vi.fn(),
+    mutate: vi.fn(),
+    reset: vi.fn(),
+    isPending: false,
+    data: undefined,
+  };
+  vi.mocked(useDeletePlugin).mockReturnValue(
+    mutationStub as unknown as ReturnType<typeof useDeletePlugin>,
+  );
+  vi.mocked(useApplyGithubPluginUpdate).mockReturnValue(
+    mutationStub as unknown as ReturnType<typeof useApplyGithubPluginUpdate>,
+  );
+  vi.mocked(usePreviewGithubPluginUpdate).mockReturnValue(
+    mutationStub as unknown as ReturnType<typeof usePreviewGithubPluginUpdate>,
+  );
+  vi.mocked(useTriggerPluginGithubSync).mockReturnValue(
+    mutationStub as unknown as ReturnType<typeof useTriggerPluginGithubSync>,
+  );
+  vi.mocked(useUpdatePluginGithubSync).mockReturnValue(
+    mutationStub as unknown as ReturnType<typeof useUpdatePluginGithubSync>,
+  );
+  updateMutateAsync.mockResolvedValue({ id: "plugin-1" });
+  vi.mocked(useUpdatePlugin).mockReturnValue({
+    mutateAsync: updateMutateAsync,
+    isPending: false,
+  } as unknown as ReturnType<typeof useUpdatePlugin>);
+});
+
+const updateMutateAsync = vi.fn();
+
+describe("PluginDetailPage", () => {
+  it("is the plugin's settings rather than a read-only view of them", async () => {
+    const user = userEvent.setup();
+    renderPage(BASE_PLUGIN);
+
+    // Metadata is fields, not facts, and the payload is editable beneath them.
+    expect(screen.getByLabelText("Display name")).toHaveValue("Session guard");
+    expect(screen.getByLabelText("Description")).toHaveValue(
+      "Blocks risky commands.",
+    );
+    expect(screen.getByText("hooks/hooks.json")).toBeVisible();
+    const file = screen.getByRole("textbox", { name: "File contents" });
+    expect(file).toHaveValue("{}");
+    expect(file).not.toHaveAttribute("readonly");
+
+    // The canonical page-header links select configuration and permissions.
+    expect(screen.queryByTestId("plugin-permissions")).not.toBeInTheDocument();
+    expect(
+      screen.getAllByRole("link", { name: "Permissions" })[0],
+    ).toHaveAttribute("href", "/plugins/plugin-1?tab=permissions");
+    expect(screen.getByLabelText("Display name")).toBeVisible();
+    expect(
+      screen.queryByText("Who can discover this plugin"),
+    ).not.toBeInTheDocument();
+
+    // Nothing sends the reader anywhere to edit: this is where editing happens.
+    expect(
+      screen.queryByRole("link", { name: "Edit" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: /Configuration/ }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Install" })).toBeVisible();
+    // A manual plugin has no source to point at, so no such panel.
+    expect(screen.queryByText("GitHub source")).not.toBeInTheDocument();
+
+    // Clean: there is nothing to write yet.
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    await user.clear(screen.getByLabelText("Display name"));
+    await user.type(screen.getByLabelText("Display name"), "Session sentry");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    expect(updateMutateAsync.mock.calls[0][0]).not.toHaveProperty("scope");
+    expect(updateMutateAsync.mock.calls[0][0]).not.toHaveProperty("teamIds");
+    expect(updateMutateAsync.mock.calls[0][0]).not.toHaveProperty("userIds");
+    expect(updateMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({ displayName: "Session sentry" }),
+    );
+  });
+
+  it("shows permissions from the page-header URL", () => {
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("tab=permissions") as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+    renderPage(BASE_PLUGIN);
+    expect(screen.getByTestId("plugin-permissions")).toBeVisible();
+    expect(screen.queryByLabelText("Display name")).not.toBeInTheDocument();
+    expect(
+      screen.getAllByRole("link", { name: "Permissions" })[0],
+    ).toHaveAttribute("aria-current", "page");
+  });
+
+  it("locks a repository-owned plugin and edits its source in a dialog", async () => {
+    const user = userEvent.setup();
+    renderPage({
+      ...BASE_PLUGIN,
+      sourceKind: "github",
+      sourceRepo: "acme/hooks",
+      githubSyncInterval: "1d",
+    });
+
+    // The repository owns the files: they are locked, not fields that ignore typing.
+    expect(
+      screen.getByRole("textbox", { name: "File contents" }),
+    ).toHaveAttribute("readonly");
+    expect(screen.getByLabelText("Display name")).toBeDisabled();
+    expect(screen.getByLabelText("Description")).toBeDisabled();
+    // The source is a summary, not inline fields.
+    expect(screen.getByRole("link", { name: /acme\/hooks/ })).toBeVisible();
+    expect(screen.queryByLabelText("Repository")).not.toBeInTheDocument();
+
+    // The same steps that set it up, opened on the repository it reads.
+    await user.click(screen.getByRole("button", { name: "Edit source" }));
+    const dialog = screen.getByRole("dialog", { name: "Edit source" });
+    expect(within(dialog).getByText("Public repository")).toBeVisible();
+    expect(within(dialog).getByLabelText("Repository")).toHaveValue(
+      "https://github.com/acme/hooks",
+    );
+    await user.click(within(dialog).getByRole("button", { name: /Advanced/ }));
+    await user.type(within(dialog).getByLabelText("Branch"), "release");
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
+    // The dialog saves the source alone; the page draft is untouched.
+    expect(updateMutateAsync).toHaveBeenCalledWith({
+      githubSource: {
+        repoUrl: "https://github.com/acme/hooks",
+        ref: "release",
+        syncInterval: "1d",
+      },
+    });
+  });
+
+  it("shows the immutable plugin identity as a hint on the name, not a field", async () => {
+    const user = userEvent.setup();
+    renderPage({ ...BASE_PLUGIN, pluginSlug: "session-attribution-1a2b3c4d" });
+
+    expect(screen.queryByLabelText("Plugin identity")).not.toBeInTheDocument();
+    await user.hover(
+      screen.getByRole("button", {
+        name: "Plugin identity: session-attribution-1a2b3c4d",
+      }),
+    );
+    expect(
+      (await screen.findAllByText("session-attribution-1a2b3c4d")).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("offers no save row to someone who may not change this plugin", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    renderPage(BASE_PLUGIN);
+
+    expect(
+      screen.queryByRole("button", { name: "Save" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/view this plugin's configuration but not change it/i),
+    ).toBeVisible();
+  });
+
+  it("reviews a pending update from the source card", async () => {
+    const user = userEvent.setup();
+    renderPage({
+      ...BASE_PLUGIN,
+      sourceKind: "github",
+      sourceRepo: "acme/hooks",
+      sourceSha: "a".repeat(40),
+      githubSyncInterval: "1d",
+      pendingSourceSha: "b".repeat(40),
+      pendingDetectedAt: "2026-08-20T00:00:00.000Z",
+    });
+
+    expect(screen.getByText("Update ready for review")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Review" }));
+    expect(
+      screen.getByRole("dialog", { name: "Source updates" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByText("Update candidate ready for review"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("uses PowerShell syntax highlighting for ps1 payload files", async () => {
+    const user = userEvent.setup();
+    renderPage(BASE_PLUGIN);
+
+    await user.click(screen.getByRole("button", { name: "statusline.ps1" }));
+
+    expect(
+      screen.getByRole("textbox", { name: "File contents" }),
+    ).toHaveAttribute("data-language", "powershell");
+  });
+
+  it("shows GitHub provenance for a marketplace import without a vendor byline", async () => {
+    const user = userEvent.setup();
+    renderPage({
+      ...BASE_PLUGIN,
+      sourceKind: "github",
+      sourceRepo: "acme/policy-plugins",
+      sourceMarketplaceRepo: "acme/policy-plugins",
+      sourceMarketplacePath: ".claude-plugin/marketplace.json",
+      sourceMarketplacePluginName: "policy-runtime",
+    });
+
+    // Provenance is the source card's repository, not a header badge.
+    expect(
+      screen.getByRole("link", { name: /acme\/policy-plugins/ }),
+    ).toBeVisible();
+    expect(screen.queryByText("Imported from GitHub")).not.toBeInTheDocument();
+    expect(screen.queryByText("Archestra")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "More actions" }));
+    expect(screen.getByRole("menuitem", { name: "Updates" })).toBeVisible();
+  });
+});

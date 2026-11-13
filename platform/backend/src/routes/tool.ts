@@ -2,9 +2,8 @@ import {
   createPaginatedResponseSchema,
   PaginationQuerySchema,
   RouteId,
-} from "@shared";
+} from "@archestra/shared";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
-import { z } from "zod";
 import { hasAnyAgentTypeAdminPermission } from "@/auth";
 import { ToolModel } from "@/models";
 import {
@@ -22,18 +21,28 @@ const toolRoutes: FastifyPluginAsyncZod = async (fastify) => {
     {
       schema: {
         operationId: RouteId.GetTools,
-        description: "Get all tools",
+        description: "Get a paginated list of tools",
         tags: ["Tools"],
-        response: constructResponseSchema(z.array(ExtendedSelectToolSchema)),
+        querystring: PaginationQuerySchema,
+        response: constructResponseSchema(
+          createPaginatedResponseSchema(ExtendedSelectToolSchema),
+        ),
       },
     },
-    async ({ user, organizationId }, reply) => {
+    async ({ query, user, organizationId }, reply) => {
       const isAgentAdmin = await hasAnyAgentTypeAdminPermission({
         userId: user.id,
         organizationId,
       });
 
-      return reply.send(await ToolModel.findAll(user.id, isAgentAdmin));
+      return reply.send(
+        await ToolModel.findAll({
+          userId: user.id,
+          organizationId,
+          isAgentAdmin,
+          pagination: query,
+        }),
+      );
     },
   );
 
@@ -62,7 +71,10 @@ const toolRoutes: FastifyPluginAsyncZod = async (fastify) => {
           sortDirection,
           search,
           origin,
+          observedByUserId,
+          observedByClient,
           excludeArchestraTools,
+          includeKnowledgeSourcesTool,
         },
         user,
         organizationId,
@@ -80,41 +92,17 @@ const toolRoutes: FastifyPluginAsyncZod = async (fastify) => {
         filters: {
           search,
           origin,
+          observedByUserId,
+          observedByClient,
           excludeArchestraTools,
+          includeKnowledgeSourcesTool,
         },
         userId: user.id,
+        organizationId,
         isAgentAdmin,
       });
 
       return reply.send(result);
-    },
-  );
-
-  fastify.delete(
-    "/api/tools/:id",
-    {
-      schema: {
-        operationId: RouteId.DeleteTool,
-        description:
-          "Delete an auto-discovered tool (tools without an MCP server)",
-        tags: ["Tools"],
-        params: z.object({
-          id: z.string().uuid(),
-        }),
-        response: constructResponseSchema(z.object({ success: z.boolean() })),
-      },
-    },
-    async ({ params: { id } }, reply) => {
-      const success = await ToolModel.delete(id);
-      if (!success) {
-        return reply.status(404).send({
-          error: {
-            message: "Tool not found or cannot be deleted",
-            type: "api_not_found_error",
-          },
-        });
-      }
-      return reply.send({ success: true });
     },
   );
 };

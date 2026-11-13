@@ -2,9 +2,10 @@
 
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { XIcon } from "lucide-react";
-import type * as React from "react";
+import * as React from "react";
 
-import { cn } from "@/lib/utils";
+import { DialogContentContext } from "@/components/ui/dialog-content-context";
+import { cn } from "@/lib/utils/tailwind";
 
 /**
  * Low-level dialog primitives.
@@ -67,27 +68,79 @@ function DialogContent({
   className,
   children,
   showCloseButton = true,
+  overlayClassName,
+  onOpenAutoFocus,
+  onCloseAutoFocus,
+  onScroll,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean;
+  /** Override the backdrop, e.g. a heavier dim for immersive surfaces. */
+  overlayClassName?: string;
 }) {
+  // Almost every dialog in the app is controlled via `open`/`onOpenChange`
+  // without a `DialogTrigger`, so Radix has no trigger ref to restore focus to
+  // on close (it suppresses its own fallback), and keyboard focus drops to
+  // <body>. Capture the opener ourselves and restore it (WCAG 2.4.3).
+  const returnFocusRef = React.useRef<HTMLElement | null>(null);
+  // `overflow-hidden` below makes this element a scrollport on purpose, and a
+  // scrollport with no scrollbar can still be scrolled *programmatically*:
+  // `scrollIntoView()` on anything in the body — a field the browser focuses,
+  // validation jumping to the first error, an in-page anchor — walks every
+  // scrollable ancestor and drags this one along too. That slides the header
+  // out of view and strands the sticky footer mid-dialog above a band of dead
+  // space, and with no scrollbar nothing can put it back. The body has its own
+  // scroll container; that is the one that should move, so pin this at the
+  // origin.
+  const pinToOrigin = (event: React.UIEvent<HTMLDivElement>) => {
+    const el = event.currentTarget;
+    if (el.scrollTop !== 0) el.scrollTop = 0;
+    if (el.scrollLeft !== 0) el.scrollLeft = 0;
+    onScroll?.(event);
+  };
   return (
     <DialogPortal data-slot="dialog-portal">
-      <DialogOverlay />
+      <DialogOverlay className={overlayClassName} />
       <DialogPrimitive.Content
         data-slot="dialog-content"
+        onOpenAutoFocus={(event) => {
+          // Fires before Radix moves focus into the dialog, so the active
+          // element is still the control that opened it.
+          returnFocusRef.current =
+            document.activeElement instanceof HTMLElement
+              ? document.activeElement
+              : null;
+          onOpenAutoFocus?.(event);
+        }}
+        onCloseAutoFocus={(event) => {
+          onCloseAutoFocus?.(event);
+          if (event.defaultPrevented) return;
+          event.preventDefault();
+          const opener = returnFocusRef.current;
+          if (opener?.isConnected) {
+            opener.focus();
+          }
+        }}
+        onScroll={pinToOrigin}
         className={cn(
           // Please keep this class when updating dialog component
-          "bg-background data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 fixed top-[50%] left-[50%] z-50 flex w-full translate-x-[-50%] translate-y-[-50%] flex-col rounded-lg border pt-4 shadow-lg duration-200 max-w-4xl max-h-[90dvh]",
+          // `overflow-hidden` is load-bearing: it makes DialogContent the
+          // scrollport for DialogStickyFooter's `sticky bottom-0`. Without it
+          // the sticky offset resolves against the document viewport in
+          // untransformed layout coordinates, and the `translate-y-[-50%]`
+          // centering then renders the footer mid-dialog.
+          "bg-background data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 fixed top-[50%] left-[50%] z-50 flex w-full translate-x-[-50%] translate-y-[-50%] flex-col overflow-hidden rounded-lg border pt-4 shadow-lg duration-200 max-w-4xl max-h-[90dvh]",
           className,
         )}
         {...props}
       >
-        {children}
+        <DialogContentContext.Provider value={true}>
+          {children}
+        </DialogContentContext.Provider>
         {showCloseButton && (
           <DialogPrimitive.Close
             data-slot="dialog-close"
-            className="ring-offset-background focus:ring-ring data-[state=open]:bg-accent data-[state=open]:text-muted-foreground absolute top-4 right-4 rounded-xs opacity-70 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-offset-2 focus:outline-hidden disabled:pointer-events-none [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4"
+            className="ring-offset-background focus:ring-ring data-[state=open]:bg-accent data-[state=open]:text-muted-foreground absolute top-3 right-3 rounded-xs p-1 opacity-70 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-offset-2 focus:outline-hidden disabled:pointer-events-none [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4"
           >
             <XIcon />
             <span className="sr-only">Close</span>
@@ -135,7 +188,10 @@ function DialogTitle({
   return (
     <DialogPrimitive.Title
       data-slot="dialog-title"
-      className={cn("text-lg leading-none font-semibold", className)}
+      className={cn(
+        "text-lg leading-none font-semibold wrap-anywhere",
+        className,
+      )}
       {...props}
     />
   );
@@ -148,7 +204,7 @@ function DialogDescription({
   return (
     <DialogPrimitive.Description
       data-slot="dialog-description"
-      className={cn("text-muted-foreground text-sm", className)}
+      className={cn("text-muted-foreground text-sm wrap-anywhere", className)}
       {...props}
     />
   );
@@ -163,8 +219,35 @@ function DialogStickyFooter({
       data-slot="dialog-footer"
       className={cn(
         // Counteract DialogContent padding and keep the footer's inner spacing
-        // consistent on all sides. The pseudo-element masks the scrollbar gutter.
-        "relative mt-4 sticky bottom-0 z-10 rounded-b-lg border-t bg-background px-4 py-3 shadow-[0_-1px_0_0_hsl(var(--border)),0_-12px_24px_-24px_hsl(var(--foreground)/0.3)] [&>*]:relative [&>*]:z-10 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end",
+        // consistent on all sides.
+        "sticky bottom-0 z-10 mt-4 rounded-b-lg border-t px-4 py-3 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end",
+        // Two stacked layers under the content, because a sticky footer has to
+        // stay opaque over whatever scrolls beneath it:
+        //
+        //  ::before  the opaque backdrop. It lives here rather than on the
+        //            element's own `bg-*` because `cn()` is tailwind-merge — a
+        //            caller passing any plain `bg-…` (a warning tint, say)
+        //            drops `bg-background` from the merged result, and the bar
+        //            then renders semi-transparent with the content behind it
+        //            reading straight through its own text. `before:bg-…` is
+        //            its own merge group, so no caller class can strip it.
+        //  ::after   an empty tint slot above that backdrop. Callers colour it
+        //            with `after:bg-…` and cannot replace the backdrop by
+        //            accident; left alone it is transparent and inert.
+        //
+        // Children clear both via the `relative z-10` below, so they stay
+        // legible and clickable through the overlays.
+        "before:absolute before:inset-0 before:rounded-b-lg before:bg-background before:content-['']",
+        "after:absolute after:inset-0 after:rounded-b-lg after:content-['']",
+        "[&>*]:relative [&>*]:z-10",
+        // Soft lift separating the bar from whatever scrolls under it. The
+        // hairline above it is `border-t`, not a shadow layer. The colour must
+        // be a fixed dark shadow, not `foreground`: `foreground` inverts to
+        // near-white in dark themes, turning the lift into a glowing halo above
+        // the footer. A real drop shadow is dark in both themes — matching the
+        // black-based `--shadow-*` tokens — and just fades to near-invisible
+        // over dark backgrounds, where the `border-t` carries the separation.
+        "shadow-[0_-12px_24px_-24px] shadow-black/20",
         className,
       )}
       {...props}
@@ -199,6 +282,7 @@ function DialogStickyFooter({
 function DialogForm({
   className,
   onSubmit,
+  autoComplete = "off",
   ...props
 }: React.ComponentProps<"form"> & {
   onSubmit: (e: React.FormEvent<HTMLFormElement>) => void;
@@ -207,8 +291,12 @@ function DialogForm({
     <form
       data-slot="dialog-form"
       className={cn("contents", className)}
+      autoComplete={autoComplete}
       onSubmit={(e) => {
         e.preventDefault();
+        // Portaled dialog events still bubble through the React tree. Keep a
+        // dialog opened from another form from submitting that ancestor too.
+        e.stopPropagation();
         onSubmit(e);
       }}
       {...props}

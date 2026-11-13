@@ -1,59 +1,395 @@
+import type { CreatedBy } from "@archestra/shared";
 import {
-  type AgentToolAssignmentMode,
+  AGENT_CATALOG_IDS,
+  type AgentCatalogId,
+  type ArchestraToolShortName,
+  BUILT_IN_AGENT_IDS,
+  type CursorQuery,
   DEFAULT_LLM_PROXY_NAME,
+  getCreationDefaultArchestraToolShortNames,
+  MCP_SERVER_TOOL_NAME_SEPARATOR,
   type PaginationQuery,
+  PERSONAL_MCP_GATEWAY_NAME,
+  type PermissionSubject,
   PLAYWRIGHT_MCP_CATALOG_ID,
+  PROJECTS_FILE_ARCHESTRA_TOOL_SHORT_NAMES,
   parseFullToolName,
+  providerRequiresPerUserCredential,
+  RESOURCE_ACCESS_RELATIONS,
+  type ResourcePermissionGrant,
+  SKILL_ARCHESTRA_TOOL_SHORT_NAMES,
+  SubagentLoadBalancingConfigSchema,
+  type SupportedProvider,
+  TimeInMs,
   TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME,
   urlSlugify,
-} from "@shared";
+} from "@archestra/shared";
 import {
   and,
   asc,
   count,
   desc,
   eq,
+  exists,
+  getTableColumns,
+  gte,
   ilike,
   inArray,
+  isNotNull,
   isNull,
-  min,
+  max,
   ne,
+  not,
+  notExists,
   notInArray,
   or,
   type SQL,
   sql,
 } from "drizzle-orm";
-import { clearChatMcpClient } from "@/clients/chat-mcp-client";
-import db, { schema } from "@/database";
+import { type AnyPgColumn, alias, unionAll } from "drizzle-orm/pg-core";
+import { z } from "zod";
 import {
+  canUseAgent,
+  dropHiddenAgents,
+  dropHiddenTools,
+  gatedAgentsFence,
+  isPermissionGatedAgent,
+} from "@/auth/permission-gated";
+import { LRUCacheManager } from "@/cache-manager";
+import config from "@/config";
+import db, { schema, type Transaction, withDbTransaction } from "@/database";
+import { PreparedQuery } from "@/database/prepared-query";
+import { notDeleted } from "@/database/schemas/soft-deletable-table";
+import { hardDelete, restore, softDelete } from "@/database/soft-delete";
+import {
+  createCursorPaginatedResult,
   createPaginatedResult,
+  decodeCursor,
   type PaginatedResult,
 } from "@/database/utils/pagination";
+import { qualified } from "@/database/utils/qualified-column";
+import { enterpriseTier } from "@/enterprise-tier";
 import logger from "@/logging";
-import type {
-  Agent,
-  AgentScope,
-  AgentScopeFilter,
-  AgentType,
-  InsertAgent,
-  SortingQuery,
-  UpdateAgent,
+import { registerProcessLocalCache } from "@/process-local-cache-registry";
+import { readConfig } from "@/services/config-cache";
+import {
+  type Agent,
+  type AgentAccessContext,
+  type AgentActivationSkillMode,
+  AgentActivationSkillModeSchema,
+  type AgentListItem,
+  type AgentOption,
+  type AgentScope,
+  type AgentScopeFilter,
+  type AgentToolRef,
+  type AgentType,
+  type ChatAgentRoster,
+  GATEWAY_CAPABLE_AGENT_TYPES,
+  type GatewayAgent,
+  type InsertAgent,
+  type McpServerAgentUsage,
+  type NetworkPolicy,
+  NetworkPolicyInputSchema,
+  type ReadinessAgent,
+  type SortingQuery,
+  type UpdateAgent,
 } from "@/types";
+import type { AgentOptionFilters } from "@/types/agent";
+import type { SuggestedPromptInput } from "@/types/agent-suggested-prompt";
+import type { LabelWithDetails } from "@/types/label";
 import { isUniqueConstraintError } from "@/utils/db";
+import { escapeLikePattern } from "@/utils/sql-search";
+import { isUuid } from "@/utils/uuid";
+import A2aRemoteAgentModel from "./a2a-remote-agent";
+import AgentActivationSkillRuleModel from "./agent-activation-skill-rule";
 import AgentConnectorAssignmentModel from "./agent-connector-assignment";
+import AgentExcludedConnectorModel from "./agent-excluded-connector";
+import AgentExcludedSkillModel from "./agent-excluded-skill";
+import AgentExcludedSubagentModel from "./agent-excluded-subagent";
+import AgentExcludedToolModel from "./agent-excluded-tool";
 import AgentKnowledgeBaseModel from "./agent-knowledge-base";
 import AgentLabelModel from "./agent-label";
+import AgentSkillModel from "./agent-skill";
 import AgentSuggestedPromptModel from "./agent-suggested-prompt";
 import AgentTeamModel from "./agent-team";
 import AgentToolModel from "./agent-tool";
-import MemberModel from "./member";
+import { agentToolSurfaceChanged } from "./agent-tool-surface";
+import AgentUserModel from "./agent-user";
+import AgentVersionModel from "./agent-version";
+import CreatedByModel from "./created-by";
+import { gatewayAgentSelection } from "./gateway-agent-selection";
+import { idArrayCondition } from "./id-array-condition";
+import InteractionUserActivityModel from "./interaction-user-activity";
+import OrganizationModel from "./organization";
+import { port } from "./ports";
+import ResourcePermissionPolicyModel, {
+  type ObjectPolicy,
+} from "./resource-permission-policy";
+import ResourcePermissionSubjectModel, {
+  type GrantPrincipal,
+  type PrincipalSource,
+  type ResourceAccessSelection,
+} from "./resource-permission-subject";
 import ToolModel from "./tool";
 
+type AgentRosterOptions = {
+  agentType?: AgentType;
+  authorization?: {
+    organizationId: string;
+    baseReadTypes: AgentType[];
+    /**
+     * Types the caller reads through a `*` grant in this organization, so
+     * every live row of theirs is readable without a per-row probe.
+     */
+    wildcardReadTypes?: AgentType[];
+  };
+  agentTypes?: AgentType[];
+  excludeBuiltIn?: boolean;
+  scope?: AgentScope;
+  excludeOtherPersonalAgents?: boolean;
+  status?: AgentRecordStatus;
+  /**
+   * Keep only agents that enforce a missing-credential behavior. The
+   * readiness pre-flight has nothing to say about the rest, and this keeps
+   * it from loading an organization's whole agent roster to discard it.
+   */
+  onlyEnforcingMissingCredentials?: boolean;
+  /**
+   * Attach each agent's assigned tools. Defaults to true. The refs carry
+   * every tool's name and description, so on an organization of any size
+   * they are the great majority of the result's size — callers that only
+   * need the roster (which agents exist, what they are called, which model
+   * they run) should turn this off and get `tools: []`, which here means
+   * "not requested" rather than "none assigned".
+   */
+  includeTools?: boolean;
+  /**
+   * Return the compact roster used to initialize chat. The response keeps
+   * the full Agent wire shape for compatibility, but fields the chat does
+   * not consume are empty and oversized embedded icons are omitted.
+   */
+  view?: "chat" | "options";
+  ids?: string[];
+};
+
+type AgentListFilters = {
+  organizationId?: string;
+  authorization?: { organizationId: string; baseReadTypes: AgentType[] };
+  ids?: string[];
+  /** Rows the list shows elsewhere, such as the viewer's automatic pins. */
+  excludeIds?: string[];
+  name?: string;
+  agentType?: AgentType;
+  agentTypes?: AgentType[];
+  scope?: AgentScopeFilter;
+  teamIds?: string[];
+  authorIds?: string[];
+  excludeAuthorIds?: string[];
+  excludeOtherPersonalAgents?: boolean;
+  /**
+   * The list's "Show", "Shared with", and "Owner" filters; see
+   * {@link ResourceAccessSelection}.
+   */
+  access?: ResourceAccessSelection;
+  /**
+   * Add the built-in agents to the list. The `access` filter does not apply to
+   * them: they have no author and are listed only to agent admins.
+   */
+  includeBuiltIn?: boolean;
+  /** `chat` keeps the system chat assistant in the list for chat selection. */
+  view?: "chat";
+  labels?: Record<string, string[]>;
+  status?: AgentRecordStatus;
+  providerApiKeyId?: string;
+  runtime?: AgentCatalogId | "chat" | "custom";
+  /** Caller-relative pin filter for the paginated Agents surface. */
+  pinned?: boolean;
+  /** False skips the count; `total` is then a lower bound. */
+  includeTotal?: boolean;
+  /**
+   * Attach each agent's assigned tools. Defaults to true; off, agents come
+   * back with `tools: []`, meaning "not requested" rather than "none
+   * assigned".
+   */
+  includeTools?: boolean;
+};
+
+type AgentCatalogRowRef = {
+  type: "agent" | "external";
+  id: string;
+};
+
+type AgentCatalogCandidatePage = {
+  rows: AgentCatalogRowRef[];
+  total: number;
+  agentTotal: number;
+  externalAgentTotal: number;
+};
+
 class AgentModel {
+  /** SRE is built-in for ownership and grants but remains a user-facing agent. */
+  private static isRegularOrSreAgent(): SQL {
+    return or(
+      eq(schema.agentsTable.builtIn, false),
+      sql`${schema.agentsTable.builtInAgentConfig}->>'name' = ${BUILT_IN_AGENT_IDS.SRE}`,
+    ) as SQL;
+  }
+
+  /**
+   * Process-local cache for {@link AgentModel.resolveIdFromIdOrSlug}. The
+   * lookup runs on every MCP-gateway request before auth, so under load it is
+   * both a meaningful share of pool traffic and the first query to surface
+   * pool starvation. id/slug → id mappings change rarely; the short TTL bounds
+   * staleness after a slug change or deletion (requests for a just-deleted
+   * agent still fail downstream where the agent row is actually loaded).
+   */
+  private static readonly resolveIdCache = registerProcessLocalCache(
+    new LRUCacheManager<string>({
+      maxSize: 10_000,
+      defaultTtl: TimeInMs.Minute,
+    }),
+  );
+
+  /**
+   * Reset the resolve cache. The shared test setup clears it between tests
+   * via the process-local cache registry; tests that exercise post-deletion
+   * staleness clear it explicitly through this hook.
+   */
+  static clearResolveIdCache(): void {
+    AgentModel.resolveIdCache.clear();
+  }
+
+  /**
+   * The agents a bulk route was asked to act on, fenced to one organization
+   * and read in two queries rather than one per id.
+   *
+   * The organization fence is load-bearing rather than tidy: ids arrive
+   * straight from a request body and `requireAgentModifyPermission`
+   * short-circuits for an admin — an admin of the CALLER's organization — so
+   * an unfenced read would let a foreign id sail past the scope checks.
+   * Dropping such an id here makes it indistinguishable from one that never
+   * existed, which is what the single-agent routes answer too.
+   *
+   * Only the fields a bulk route authorizes or reports on are selected, so
+   * this stays cheap for a 500-id batch. Soft-deleted rows are excluded, as
+   * `findById` excludes them.
+   */
+  static async findForBulk(params: {
+    organizationId: string;
+    agentIds: string[];
+  }): Promise<
+    Array<
+      Pick<
+        Agent,
+        | "id"
+        | "name"
+        | "agentType"
+        | "scope"
+        | "authorId"
+        | "isPersonalGateway"
+        | "networkPolicy"
+      > & { isBuiltIn: boolean; teamIds: string[] }
+    >
+  > {
+    const { organizationId, agentIds } = params;
+    if (agentIds.length === 0) {
+      return [];
+    }
+
+    const rows = await db
+      .select({
+        id: schema.agentsTable.id,
+        name: schema.agentsTable.name,
+        agentType: schema.agentsTable.agentType,
+        scope: schema.agentsTable.scope,
+        authorId: schema.agentsTable.authorId,
+        createdByServiceAccountId: schema.agentsTable.createdByServiceAccountId,
+        isPersonalGateway: schema.agentsTable.isPersonalGateway,
+        isBuiltIn: schema.agentsTable.builtIn,
+        networkPolicy: schema.agentsTable.networkPolicy,
+      })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.organizationId, organizationId),
+          inArray(schema.agentsTable.id, agentIds),
+          notDeleted(schema.agentsTable),
+        ),
+      );
+
+    const teamsByAgent = await AgentTeamModel.getTeamDetailsForAgents(
+      rows.map((row) => row.id),
+    );
+
+    return rows.map(({ isBuiltIn, ...row }) => ({
+      ...row,
+      // `built_in` is a generated column, so drizzle types it nullable even
+      // though the expression it computes never is.
+      isBuiltIn: isBuiltIn === true,
+      teamIds: (teamsByAgent.get(row.id) ?? []).map((team) => team.id),
+    }));
+  }
+
+  /**
+   * Visibility snapshot for a bulk route's audit record, used for both the
+   * before and after side. Ids, names, scope and team assignment only: enough
+   * to see what the batch moved, with nothing secret in it.
+   *
+   * Soft-deleted rows are included so a bulk delete's "after" side still names
+   * what it removed rather than going empty.
+   */
+  static async findVisibilityForBulkAudit(params: {
+    organizationId: string;
+    agentIds: string[];
+  }): Promise<
+    Array<{
+      id: string;
+      name: string;
+      scope: AgentScope;
+      deleted: boolean;
+      teamIds: string[];
+    }>
+  > {
+    const { organizationId, agentIds } = params;
+    if (agentIds.length === 0) {
+      return [];
+    }
+
+    const rows = await db
+      .select({
+        id: schema.agentsTable.id,
+        name: schema.agentsTable.name,
+        scope: schema.agentsTable.scope,
+        deletedAt: schema.agentsTable.deletedAt,
+      })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.organizationId, organizationId),
+          inArray(schema.agentsTable.id, agentIds),
+        ),
+      )
+      // Sorted so two reads of an unchanged batch produce an identical
+      // snapshot and the audit diff stays empty; row order is unspecified.
+      .orderBy(schema.agentsTable.id);
+
+    const teamsByAgent = await AgentTeamModel.getTeamDetailsForAgents(
+      rows.map((row) => row.id),
+    );
+
+    return rows.map(({ deletedAt, ...row }) => ({
+      ...row,
+      deleted: deletedAt !== null,
+      teamIds: (teamsByAgent.get(row.id) ?? []).map((team) => team.id).sort(),
+    }));
+  }
+
   static async findBasicByOrganizationIdAndIds(params: {
     organizationId: string;
     agentIds: string[];
-  }): Promise<Array<Pick<Agent, "id" | "name" | "agentType">>> {
+  }): Promise<
+    Array<Pick<Agent, "id" | "name" | "agentType" | "environmentId">>
+  > {
     const { organizationId, agentIds } = params;
 
     if (agentIds.length === 0) {
@@ -65,38 +401,227 @@ class AgentModel {
         id: schema.agentsTable.id,
         name: schema.agentsTable.name,
         agentType: schema.agentsTable.agentType,
+        environmentId: schema.agentsTable.environmentId,
       })
       .from(schema.agentsTable)
       .where(
         and(
           eq(schema.agentsTable.organizationId, organizationId),
           inArray(schema.agentsTable.id, agentIds),
+          notDeleted(schema.agentsTable),
         ),
       )
-      .orderBy(desc(schema.agentsTable.createdAt));
+      .orderBy(desc(schema.agentsTable.createdAt), desc(schema.agentsTable.id));
   }
 
   /**
-   * Populate authorName on agents by looking up user names from the user table.
+   * Auto-mode agents (accessAllTools = true) grouped by organization. These
+   * agents have implicit access to every tool, so they can reach every MCP
+   * server without an explicit tool assignment. They are therefore surfaced
+   * separately from `assignedAgents` (e.g. below a divider in the server card
+   * "Used by N agents" tooltip). Batched by organization to avoid an N+1 when
+   * decorating a list of servers.
    */
-  private static async populateAuthorNames(agents: Agent[]): Promise<void> {
-    const authorIds = [
-      ...new Set(
-        agents.map((a) => a.authorId).filter((id): id is string => id !== null),
-      ),
+  static async getAutoModeAgentDetailsByOrganizations(
+    organizationIds: string[],
+  ): Promise<Map<string, McpServerAgentUsage[]>> {
+    const agentsByOrg = new Map<string, McpServerAgentUsage[]>();
+    for (const organizationId of organizationIds) {
+      agentsByOrg.set(organizationId, []);
+    }
+    if (organizationIds.length === 0) {
+      return agentsByOrg;
+    }
+
+    const rows = await db
+      .select({
+        organizationId: schema.agentsTable.organizationId,
+        id: schema.agentsTable.id,
+        name: schema.agentsTable.name,
+        agentType: schema.agentsTable.agentType,
+        scope: schema.agentsTable.scope,
+        ownerId: schema.agentsTable.authorId,
+        ownerEmail: schema.usersTable.email,
+      })
+      .from(schema.agentsTable)
+      // Personal agents share a name across members, so the owner is what
+      // tells them apart in the UI. LEFT JOIN: `author_id` is nullable and
+      // nulls out when the author is deleted.
+      .leftJoin(
+        schema.usersTable,
+        eq(schema.agentsTable.authorId, schema.usersTable.id),
+      )
+      .where(
+        and(
+          inArray(schema.agentsTable.organizationId, organizationIds),
+          eq(schema.agentsTable.accessAllTools, true),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .orderBy(asc(schema.agentsTable.name), asc(schema.agentsTable.id));
+
+    for (const { organizationId, ...agent } of rows) {
+      agentsByOrg.get(organizationId)?.push(agent);
+    }
+
+    return agentsByOrg;
+  }
+
+  static async activeNameExistsInOrganization(params: {
+    name: string;
+    organizationId: string;
+  }): Promise<boolean> {
+    const [row] = await db
+      .select({ id: schema.agentsTable.id })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.name, params.name),
+          eq(schema.agentsTable.organizationId, params.organizationId),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .limit(1);
+
+    return row !== undefined;
+  }
+
+  static async findActiveIdByNameInOrganization(params: {
+    name: string;
+    organizationId: string;
+    agentType?: AgentType;
+  }): Promise<string | null> {
+    const conditions: SQL[] = [
+      eq(schema.agentsTable.name, params.name),
+      eq(schema.agentsTable.organizationId, params.organizationId),
+      notDeleted(schema.agentsTable),
     ];
-    if (authorIds.length === 0) return;
 
-    const users = await db
-      .select({ id: schema.usersTable.id, name: schema.usersTable.name })
-      .from(schema.usersTable)
-      .where(inArray(schema.usersTable.id, authorIds));
+    if (params.agentType) {
+      conditions.push(eq(schema.agentsTable.agentType, params.agentType));
+    }
 
-    const nameMap = new Map(users.map((u) => [u.id, u.name]));
+    const [row] = await db
+      .select({ id: schema.agentsTable.id })
+      .from(schema.agentsTable)
+      .where(and(...conditions))
+      .limit(1);
+
+    return row?.id ?? null;
+  }
+
+  /**
+   * Set each agent's `scope` from its grants instead of the retired column,
+   * which every new agent stores as `personal`: `org` when they reach the
+   * organization or a role, `team` when they reach a team, `personal`
+   * otherwise. An LLM proxy has no grants and keeps its column.
+   */
+  /**
+   * An agent that is not someone else's personal one: it reaches more than
+   * its author by grants, or `userId` wrote it, or holds a grant on it. An
+   * overseer who can read every agent still does not list others' private
+   * ones.
+   */
+  static notOthersPersonalCondition(params: {
+    userId: string;
+    principals: GrantPrincipal[];
+  }): SQL {
+    return or(
+      not(agentAudienceIs("personal")),
+      eq(schema.agentsTable.authorId, params.userId),
+      explicitAgentReadCondition(params.principals),
+    ) as SQL;
+  }
+
+  static async populateGrantedScope(
+    agents: Pick<Agent, "id" | "organizationId" | "agentType" | "scope">[],
+    policies?: ObjectPolicy[],
+  ): Promise<void> {
+    const byKey = new Map<string, string[]>();
     for (const agent of agents) {
-      agent.authorName = agent.authorId
-        ? (nameMap.get(agent.authorId) ?? null)
-        : null;
+      if (agent.agentType === "llm_proxy") continue;
+      const resource =
+        agent.agentType === "mcp_gateway" ? "mcpGateway" : "agent";
+      const key = `${agent.organizationId}\u0000${resource}`;
+      const scopes = byKey.get(key);
+      if (scopes) scopes.push(agent.id);
+      else byKey.set(key, [agent.id]);
+    }
+    const audiences = new Map<string, AgentScope>();
+    for (const [key, scopes] of byKey) {
+      const [organizationId, resource] = key.split("\u0000") as [
+        string,
+        "agent" | "mcpGateway",
+      ];
+      const found = await ResourcePermissionPolicyModel.findAudiences({
+        organizationId,
+        resource,
+        scopes,
+        policies,
+      });
+      for (const [id, { audience }] of found) audiences.set(id, audience);
+    }
+    for (const agent of agents) {
+      const audience = audiences.get(agent.id);
+      if (audience) agent.scope = audience;
+    }
+  }
+
+  /**
+   * Populate author identity on agents by looking up users in one batch.
+   */
+  /**
+   * The fields tool resolution reads repeatedly during one call, read together
+   * once per request scope. Outside a memoizing request this is a fresh read,
+   * so a changed setting applies to the next call.
+   */
+  private static findToolAccessFields(id: string): Promise<{
+    environmentId: string | null;
+    accessAllTools: boolean;
+    keepMediaInLogs: boolean | null;
+  } | null> {
+    return readConfig(`agent-tool-access\0${id}`, async () => {
+      // The organization's media setting rides along so each log write learns
+      // it from the read it already makes; an organization change drops the
+      // cached entry like an agent change does.
+      const [result] = await db
+        .select({
+          environmentId: schema.agentsTable.environmentId,
+          accessAllTools: schema.agentsTable.accessAllTools,
+          keepMediaInLogs: schema.organizationsTable.keepMediaInLogs,
+        })
+        .from(schema.agentsTable)
+        .leftJoin(
+          schema.organizationsTable,
+          eq(schema.organizationsTable.id, schema.agentsTable.organizationId),
+        )
+        .where(
+          and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)),
+        )
+        .limit(1);
+      return result ?? null;
+    });
+  }
+
+  private static async populateAuthorNames(
+    agents: Pick<
+      Agent,
+      | "authorId"
+      | "createdByServiceAccountId"
+      | "authorName"
+      | "authorEmail"
+      | "createdBy"
+    >[],
+  ): Promise<void> {
+    const creators = await CreatedByModel.resolve(
+      agents.map((agent) => CreatedByModel.id(agent, agent.authorId)),
+    );
+    for (const agent of agents) {
+      const id = CreatedByModel.id(agent, agent.authorId);
+      const author = id ? creators.get(id) : null;
+      agent.authorName = author?.name ?? null;
+      agent.authorEmail = author?.email ?? null;
+      agent.createdBy = author ?? null;
     }
   }
 
@@ -132,6 +657,107 @@ class AgentModel {
   }
 
   /**
+   * Resolve each agent's configured LLM provider server-side so every viewer
+   * sees the agent's true provider — even one who can't access the owner's
+   * per-user key. Provider comes from the attached key, falling back to the
+   * pinned model's provider when only a model is set.
+   */
+  private static async populateResolvedLlm(agents: Agent[]): Promise<void> {
+    if (agents.length === 0) return;
+
+    const apiKeyIds = [
+      ...new Set(
+        agents
+          .map((a) => a.llmApiKeyId)
+          .filter((id): id is string => id !== null),
+      ),
+    ];
+    const modelIds = [
+      ...new Set(
+        agents.map((a) => a.modelId).filter((id): id is string => id !== null),
+      ),
+    ];
+
+    const [keyRows, modelRows] = await Promise.all([
+      apiKeyIds.length > 0
+        ? db
+            .select({
+              id: schema.llmProviderApiKeysTable.id,
+              name: schema.llmProviderApiKeysTable.name,
+              provider: schema.llmProviderApiKeysTable.provider,
+            })
+            .from(schema.llmProviderApiKeysTable)
+            .where(inArray(schema.llmProviderApiKeysTable.id, apiKeyIds))
+        : Promise.resolve([]),
+      modelIds.length > 0
+        ? db
+            .select({
+              id: schema.modelsTable.id,
+              provider: schema.modelsTable.provider,
+              // The human-facing model identifier (e.g. "gpt-4"), distinct from
+              // the row's UUID `id`.
+              modelName: schema.modelsTable.modelId,
+            })
+            .from(schema.modelsTable)
+            .where(inArray(schema.modelsTable.id, modelIds))
+        : Promise.resolve([]),
+    ]);
+
+    const keyProviderMap = new Map(keyRows.map((r) => [r.id, r.provider]));
+    const keyNameMap = new Map(keyRows.map((r) => [r.id, r.name]));
+    const modelProviderMap = new Map(modelRows.map((r) => [r.id, r.provider]));
+    const modelNameMap = new Map(modelRows.map((r) => [r.id, r.modelName]));
+
+    for (const agent of agents) {
+      const provider: SupportedProvider | null =
+        (agent.llmApiKeyId ? keyProviderMap.get(agent.llmApiKeyId) : null) ??
+        (agent.modelId ? modelProviderMap.get(agent.modelId) : null) ??
+        null;
+      agent.resolvedLlmProvider = provider;
+      agent.resolvedLlmProviderKeyName = agent.llmApiKeyId
+        ? (keyNameMap.get(agent.llmApiKeyId) ?? null)
+        : null;
+      agent.llmProviderRequiresPerUserCredential = provider
+        ? providerRequiresPerUserCredential(provider)
+        : false;
+      // The model's human name, so a viewer who can't access the configured
+      // key still sees "gpt-4" rather than the model row's UUID.
+      agent.resolvedLlmModelName = agent.modelId
+        ? (modelNameMap.get(agent.modelId) ?? null)
+        : null;
+    }
+  }
+
+  /**
+   * Populate `sandboxAvailable` per agent for the requesting user. No-op without
+   * a userId (system/background callers): the field stays absent and clients
+   * treat that as unavailable. `isSkillSandboxAvailableForAgent` short-circuits
+   * cheaply when the sandbox feature is off, so this is near-free in the common
+   * case; the per-agent permission/tool lookups only run when it is enabled.
+   */
+  private static async populateSandboxAvailability(
+    agents: Agent[],
+    userId: string | undefined,
+  ): Promise<void> {
+    if (agents.length === 0 || !userId) return;
+
+    // Through a port: the availability check sits above the models and loads
+    // on first use.
+    const { isSkillSandboxAvailableForAgent } = await port(
+      "skillSandboxAvailability",
+    );
+    await Promise.all(
+      agents.map(async (agent) => {
+        agent.sandboxAvailable = await isSkillSandboxAvailableForAgent({
+          userId,
+          organizationId: agent.organizationId,
+          agentId: agent.id,
+        });
+      }),
+    );
+  }
+
+  /**
    * Populate connectorIds on agents via batch lookup from the junction table.
    */
   private static async populateConnectorIds(agents: Agent[]): Promise<void> {
@@ -148,13 +774,54 @@ class AgentModel {
   static async create(
     {
       teams,
+      users,
       labels,
       knowledgeBaseIds,
       connectorIds,
       suggestedPrompts,
+      activationSkillPolicy,
       ...agent
-    }: InsertAgent & { isPersonalGateway?: boolean; slug?: string },
+    }: Omit<InsertAgent, "scope"> & {
+      /**
+       * The retired visibility column; it defaults to "personal" and nothing
+       * reads it. The grants decide who reaches the agent.
+       */
+      scope?: InsertAgent["scope"];
+      activationSkillMode?: AgentActivationSkillMode;
+      isPersonalGateway?: boolean;
+      // Server-owned like isPersonalGateway: omitted from the request schemas
+      // (the skill-assignment routes are the only client-facing write path)
+      // but a real column create() honours for internal callers and fixtures.
+      accessAllSkills?: boolean;
+      slug?: string;
+      /** A fixed id for a system-seeded agent; random otherwise. */
+      id?: string;
+    },
     authorId?: string,
+    options?: {
+      /**
+       * Skip the All-tools exclusion pre-fill. Used by agent import, which
+       * assigns the payload's tools AFTER create and then runs the pre-fill
+       * itself so those assignments are not pre-excluded.
+       */
+      skipExclusionPrefill?: boolean;
+      initialPermissionGrants?: ResourcePermissionGrant[];
+      /** A system-seeded agent can retain its author without an individual grant. */
+      grantAuthor?: boolean;
+      /** Publish to the whole organization; for system callers only. */
+      publishToOrganization?: boolean;
+      /**
+       * Skip auto-assigning the creation-default built-in tool set. Used by
+       * clone and import, which set their own authoritative assignment set
+       * right after create (a verbatim copy of the source agent, or the import
+       * payload's tools). Without this, the additive default assignment would
+       * force built-ins the source/payload deliberately lacked (e.g. todo_write)
+       * onto the new agent.
+       */
+      skipCreationDefaultTools?: boolean;
+      /** Caller will fork version 1 after completing a staged create policy. */
+      deferInitialVersionFork?: boolean;
+    },
   ): Promise<Agent> {
     // Auto-assign organizationId if not provided
     let organizationId = agent.organizationId;
@@ -166,42 +833,67 @@ class AgentModel {
       organizationId = firstOrg?.id || "";
     }
 
+    // Dynamic tool access only works through the search/run dispatch surface, so
+    // an all-tools agent must use progressive loading. Coerce here so every
+    // create path (UI, MCP tools, REST, import, clone) keeps the invariant.
+    if (agent.accessAllTools === true) {
+      agent.toolExposureMode = "search_and_run_only";
+    }
+
+    // All-tools agents are inserted with the toggle OFF and flipped on at the
+    // end, in one transaction with the exclusion pre-fill (see below), so a
+    // committed agent can never sit in Auto mode without its pre-filled
+    // exclusions — a failure between insert and flip leaves it in Custom mode
+    // (fail-closed) instead of fail-open.
+    const enableAccessAllTools = agent.accessAllTools === true;
+
     const slug =
       agent.agentType === "mcp_gateway"
         ? agent.slug || (await AgentModel.generateUniqueSlug(agent.name))
         : undefined;
 
-    const [createdAgent] = await AgentModel.insertWithSlugRetry({
-      ...agent,
-      organizationId,
-      ...(slug && { slug }),
-      ...(authorId && { authorId }),
-    });
+    const [createdAgent] = await AgentModel.insertWithSlugRetry(
+      {
+        ...agent,
+        // A staged policy is always inserted fail-closed. The policy service
+        // installs its exact rules and flips to the requested mode before the
+        // create route returns.
+        ...(activationSkillPolicy && {
+          activationSkillMode: "manual" as const,
+        }),
+        ...(enableAccessAllTools && { accessAllTools: false }),
+        // The insert type carries the input shape; store the normalized policy.
+        networkPolicy: agent.networkPolicy
+          ? NetworkPolicyInputSchema.parse(agent.networkPolicy)
+          : agent.networkPolicy,
+        subagentLoadBalancing: agent.subagentLoadBalancing
+          ? SubagentLoadBalancingConfigSchema.parse(agent.subagentLoadBalancing)
+          : agent.subagentLoadBalancing,
+        organizationId,
+        ...(slug && { slug }),
+        ...(authorId && { authorId }),
+      },
+      {
+        grants: options?.initialPermissionGrants,
+        grantAuthor: options?.grantAuthor,
+        publishToOrganization: options?.publishToOrganization,
+      },
+    );
 
     // Assign teams to the agent if provided
     if (teams && teams.length > 0) {
       await AgentTeamModel.assignTeamsToAgent(createdAgent.id, teams);
     }
 
+    // Share with named individuals if provided. Additive to the scope, so a
+    // personal agent can reach a colleague without being published wider.
+    if (users && users.length > 0) {
+      await AgentUserModel.syncAgentUsers(createdAgent.id, users);
+    }
+
     // Assign labels to the agent if provided
     if (labels && labels.length > 0) {
       await AgentLabelModel.syncAgentLabels(createdAgent.id, labels);
-    }
-
-    // Assign tools for agents and MCP gateways when tool assignment mode is automatic
-    const hasLabels = labels && labels.length > 0;
-    const supportsAutomaticToolAssignment = isAutomaticToolAssignmentSupported(
-      createdAgent.agentType,
-    );
-    const isAutomaticToolAssignment =
-      createdAgent.toolAssignmentMode === "automatic";
-
-    if (
-      hasLabels &&
-      supportsAutomaticToolAssignment &&
-      isAutomaticToolAssignment
-    ) {
-      await AgentToolModel.syncAgentToolsFromLabels(createdAgent.id);
     }
 
     // Assign knowledge bases if provided
@@ -222,10 +914,10 @@ class AgentModel {
 
     // Sync suggested prompts if provided
     if (suggestedPrompts && suggestedPrompts.length > 0) {
-      await AgentSuggestedPromptModel.syncForAgent(
-        createdAgent.id,
-        suggestedPrompts,
-      );
+      await AgentSuggestedPromptModel.syncForAgent({
+        agentId: createdAgent.id,
+        prompts: suggestedPrompts,
+      });
     }
 
     // For internal agents, create a delegation tool so other agents can delegate to this one
@@ -233,13 +925,95 @@ class AgentModel {
       await ToolModel.findOrCreateDelegationTool(createdAgent.id);
     }
 
+    // Auto-assign the creation-default built-in tool set. Which groups apply
+    // is composed by the shared getCreationDefaultArchestraToolShortNames from
+    // the same flags the frontend create form reads, so the pre-selected set
+    // in the form and the server-side assignment cannot drift. Skipped by
+    // clone/import, which install their own authoritative assignment set.
+    if (!options?.skipCreationDefaultTools) {
+      const organization = await OrganizationModel.getById(organizationId);
+      const creationDefaultShortNames = new Set<ArchestraToolShortName>(
+        getCreationDefaultArchestraToolShortNames({
+          skillsEnabled: organization?.skillToolsEnabled === true,
+          sandboxEnabled: config.skillsSandbox.enabled,
+          openappaEnabled: enterpriseTier.isOpenappaActive(),
+        }),
+      );
+      const composesGroup = (group: readonly ArchestraToolShortName[]) =>
+        group.every((shortName) => creationDefaultShortNames.has(shortName));
+
+      // Always-on defaults (todo_write, query_knowledge_sources).
+      await ToolModel.assignDefaultArchestraToolsToAgent(createdAgent.id);
+
+      // Agent Skill tools — org opted in via the "Enable and create a new
+      // skill" empty-state action.
+      if (composesGroup(SKILL_ARCHESTRA_TOOL_SHORT_NAMES)) {
+        await ToolModel.assignSkillToolsToAgent(
+          createdAgent.id,
+          organizationId,
+        );
+      }
+
+      // MCP App management tools — always on, so new agents can build and use
+      // apps without per-agent setup.
+      await ToolModel.assignAppToolsToAgent(createdAgent.id, organizationId);
+
+      // Persistent-files tools, plus the code runtime tools when the runtime
+      // is on — the same composition as the create form.
+      if (composesGroup(PROJECTS_FILE_ARCHESTRA_TOOL_SHORT_NAMES)) {
+        await ToolModel.assignSandboxToolsToAgent(
+          createdAgent.id,
+          organizationId,
+        );
+      }
+    }
+
+    // Flip All-tools mode on last, atomically with the exclusion pre-fill.
+    // Running after the auto-assignments above means the pre-fill sees the
+    // final assignment state (assigned tools are never pre-excluded), and a
+    // pre-fill failure rolls the flip back rather than committing an All-mode
+    // agent without its exclusion baseline.
+    if (enableAccessAllTools) {
+      const [flipped] = await withDbTransaction(async (tx) => {
+        if (!options?.skipExclusionPrefill) {
+          await AgentExcludedToolModel.prefillForAllToolsMode(
+            createdAgent.id,
+            tx,
+          );
+        }
+        return tx
+          .update(schema.agentsTable)
+          .set({
+            accessAllTools: true,
+            toolExposureMode: "search_and_run_only",
+          })
+          .where(eq(schema.agentsTable.id, createdAgent.id))
+          .returning();
+      });
+      if (flipped) {
+        Object.assign(createdAgent, flipped);
+      }
+    }
+
+    // Fork version 1 once the full config of this create (row, junctions,
+    // auto-assigned tools, exclusion pre-fill) is in place. A caller that
+    // defers this fork must capture version 1 after it finishes its remaining
+    // initialization. Best-effort: a versioning failure must never fail the
+    // create itself.
+    if (!options?.deferInitialVersionFork) {
+      const fork = await AgentVersionModel.forkIfChangedBestEffort(
+        createdAgent.id,
+      );
+      if (fork) {
+        createdAgent.latestVersion = fork.version;
+      }
+    }
+
     // Get team details and tools for the created agent
     const [teamDetails, assignedTools] = await Promise.all([
-      teams && teams.length > 0
-        ? AgentTeamModel.getTeamDetailsForAgent(createdAgent.id)
-        : Promise.resolve([]),
+      AgentTeamModel.getTeamDetailsForAgent(createdAgent.id),
       db
-        .select({ tool: schema.toolsTable })
+        .select({ tool: agentToolRefColumns })
         .from(schema.agentToolsTable)
         .innerJoin(
           schema.toolsTable,
@@ -252,148 +1026,331 @@ class AgentModel {
       ...createdAgent,
       tools: assignedTools.map((row) => row.tool),
       teams: teamDetails,
+      users: [],
       labels: await AgentLabelModel.getLabelsForAgent(createdAgent.id),
       knowledgeBaseIds: knowledgeBaseIds ?? [],
       connectorIds: connectorIds ?? [],
       suggestedPrompts: suggestedPrompts ?? [],
     };
+    await AgentModel.populateGrantedScope([result]);
     AgentModel.filterUnavailableKnowledgeTools([result]);
 
     return result;
   }
 
-  /**
-   * Find all agents with optional filtering by agentType or agentTypes
-   */
+  /** The authorized chat roster without editing or selected-agent hydration. */
+  static async findChatRoster(params: {
+    userId: string;
+    isAgentAdmin: boolean;
+    options: AgentRosterOptions;
+  }): Promise<ChatAgentRoster[]> {
+    const where = await AgentModel.buildRosterWhere(params);
+    return AgentModel.findChatRosterRows({ where, userId: params.userId });
+  }
+
+  /** Bounded fallback identities; explicit URL references use findChatRoster IDs. */
+  static async findChatRosterBootstrap(params: {
+    userId: string;
+    isAgentAdmin: boolean;
+    options: AgentRosterOptions;
+  }): Promise<ChatAgentRoster[]> {
+    const table = schema.agentsTable;
+    const where = await AgentModel.buildRosterWhere(params);
+    const fallbackBase = await AgentModel.buildRosterWhere({
+      ...params,
+      options: { ...params.options, excludeOtherPersonalAgents: true },
+    });
+    const fallbackWhere = and(
+      fallbackBase,
+      or(not(agentAudienceIs("personal")), eq(table.authorId, params.userId)),
+    );
+    const first = (condition: SQL | undefined) =>
+      db
+        .select({ id: table.id })
+        .from(table)
+        .where(condition)
+        .orderBy(desc(table.createdAt), desc(table.id))
+        .limit(1);
+    const [fallback, system] = await Promise.all([
+      (async () => {
+        const personal = await first(
+          and(
+            fallbackWhere,
+            eq(table.builtIn, false),
+            eq(table.authorId, params.userId),
+            agentAudienceIs("personal"),
+          ),
+        );
+        return personal.length > 0
+          ? personal
+          : first(and(fallbackWhere, eq(table.builtIn, false)));
+      })(),
+      first(
+        and(
+          where,
+          eq(table.builtIn, true),
+          sql`${table.builtInAgentConfig}->>'name' = ${BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG}`,
+        ),
+      ),
+    ]);
+    const ids = [...new Set([...fallback, ...system].map((row) => row.id))];
+    const rows = await AgentModel.findChatRosterRows({
+      where: and(where, idArrayCondition(table.id, ids)),
+      userId: params.userId,
+    });
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    return ids.flatMap((id) => {
+      const row = byId.get(id);
+      return row ? [row] : [];
+    });
+  }
+
+  /** Search all permitted chat choices in one statement, without materializing the full roster. */
+  static async findChatRosterPage(params: {
+    userId: string;
+    isAgentAdmin: boolean;
+    options: AgentRosterOptions;
+    filters: Pick<AgentOptionFilters, "search"> & {
+      sortBy?: "createdAt" | "name" | "chat";
+    };
+    pagination: CursorQuery;
+  }) {
+    const table = schema.agentsTable;
+    const base = await AgentModel.buildRosterWhere({
+      ...params,
+      options: { ...params.options, excludeOtherPersonalAgents: false },
+    });
+    const pattern = params.filters.search
+      ? `%${escapeLikePattern(params.filters.search)}%`
+      : undefined;
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Only object-local read grants determine scope. Classify their scopes as
+    // one set instead of probing each agent's policy to discard other authors'
+    // personal agents; the base query still enforces all read permissions.
+    const nonPersonalReaders = ["organization", "role", "team"].map(
+      (type) =>
+        sql`${JSON.stringify([{ subject: { type }, actions: ["read"] }])}`,
+    );
+    const nonPersonalAudience = sql<boolean>`(${table.organizationId}, ${table.id}::text) IN (
+      SELECT chat_policy.organization_id, chat_policy.scope
+      FROM resource_permission_policies chat_policy
+      WHERE chat_policy.resource = 'agent' AND chat_policy.scope <> '*'
+        ${params.options.authorization ? sql`AND chat_policy.organization_id = ${params.options.authorization.organizationId}` : sql``}
+        AND chat_policy.grants @> ANY(ARRAY[${sql.join(nonPersonalReaders, sql`, `)}]::jsonb[])
+    )`;
+    // SPDX-SnippetEnd
+    const where = and(
+      base,
+      or(
+        eq(table.authorId, params.userId),
+        nonPersonalAudience,
+        namedChatReader(params.userId),
+        eq(table.builtIn, true),
+      ),
+      pattern
+        ? or(ilike(table.name, pattern), ilike(table.description, pattern))
+        : undefined,
+    );
+    const sortBy = params.filters.sortBy ?? "chat";
+    if (sortBy === "chat" && params.options.authorization) {
+      // Each phase of the chat order implies the author-or-shared condition.
+      return AgentModel.findChatOrderedRosterPage({
+        where: and(
+          base,
+          pattern
+            ? or(ilike(table.name, pattern), ilike(table.description, pattern))
+            : undefined,
+        ),
+        organizationId: params.options.authorization.organizationId,
+        userId: params.userId,
+        pagination: params.pagination,
+      });
+    }
+    const page = AgentModel.rosterPage({
+      where,
+      sortBy,
+      pagination: params.pagination,
+    });
+    const rows = await AgentModel.findChatRosterRows({
+      where,
+      page,
+      userId: params.userId,
+    });
+    return createCursorPaginatedResult(rows, params.pagination, page.position);
+  }
+
+  /** Authorize, page and present selector rows in one statement. */
+  static async findOptionsPage(params: {
+    userId: string;
+    isAgentAdmin: boolean;
+    options: AgentRosterOptions;
+    filters: AgentOptionFilters;
+    pagination: CursorQuery;
+  }) {
+    const { where } = await AgentModel.buildOptionWhere(params);
+    const page = AgentModel.rosterPage({
+      where,
+      sortBy: params.filters.sortBy,
+      pagination: params.pagination,
+    });
+    const rows = await AgentModel.findOptionRows(where, page);
+    return createCursorPaginatedResult(rows, params.pagination, page.position);
+  }
+
+  /** Complete IDs for an explicit select-all action, without hydrating metadata. */
+  static async findOptionIds(params: {
+    userId: string;
+    isAgentAdmin: boolean;
+    options: AgentRosterOptions;
+    filters: AgentOptionFilters;
+  }): Promise<string[]> {
+    const { where } = await AgentModel.buildOptionWhere(params);
+    const table = schema.agentsTable;
+    const rows = await db
+      .select({ id: table.id })
+      .from(table)
+      .where(where)
+      .orderBy(desc(table.createdAt), desc(table.id));
+    return rows.map((row) => row.id);
+  }
+
+  /** Find all agents with optional filtering by agent type. */
   static async findAll(
     userId?: string,
     isAgentAdmin?: boolean,
-    options?: {
-      agentType?: AgentType;
-      agentTypes?: AgentType[];
-      excludeBuiltIn?: boolean;
-      scope?: AgentScope;
-      excludeOtherPersonalAgents?: boolean;
-    },
-  ): Promise<Agent[]> {
-    let query = db
-      .select()
-      .from(schema.agentsTable)
-      .leftJoin(
-        schema.agentToolsTable,
-        eq(schema.agentsTable.id, schema.agentToolsTable.agentId),
-      )
-      .leftJoin(
-        schema.toolsTable,
-        eq(schema.agentToolsTable.toolId, schema.toolsTable.id),
-      )
-      .$dynamic();
+    options?: AgentRosterOptions & { view?: "chat" },
+  ): Promise<Agent[]>;
+  static async findAll(
+    userId: string | undefined,
+    isAgentAdmin: boolean | undefined,
+    options: AgentRosterOptions & { view: "options" },
+  ): Promise<AgentOption[]>;
+  static async findAll(
+    userId?: string,
+    isAgentAdmin?: boolean,
+    options?: AgentRosterOptions,
+  ): Promise<Agent[] | AgentOption[]>;
+  static async findAll(
+    userId?: string,
+    isAgentAdmin?: boolean,
+    options?: AgentRosterOptions,
+  ): Promise<Agent[] | AgentOption[]> {
+    // Tools are attached afterwards as slim refs via one batched query:
+    // joining them here multiplied every agent row (system prompt included)
+    // by that agent's tool count.
+    const where = await AgentModel.buildRosterWhere({
+      userId,
+      isAgentAdmin,
+      options,
+    });
+    const isChatView = options?.view === "chat";
+    const isOptionsView = options?.view === "options";
+    const isCompactView = isChatView || isOptionsView;
+    if (isOptionsView) return AgentModel.findUnpagedOptionRows(where);
+    const rows = isCompactView
+      ? await db
+          .select(CHAT_AGENT_ROW_COLUMNS)
+          .from(schema.agentsTable)
+          .where(where)
+      : await db.select().from(schema.agentsTable).where(where);
 
-    // Build where conditions
-    const whereConditions: SQL[] = [];
-
-    // Filter by agentTypes if specified (array of types)
-    if (options?.agentTypes && options.agentTypes.length > 0) {
-      whereConditions.push(
-        inArray(schema.agentsTable.agentType, options.agentTypes),
-      );
-    }
-    // Filter by agentType if specified (single type, backwards compatible)
-    else if (options?.agentType !== undefined) {
-      whereConditions.push(eq(schema.agentsTable.agentType, options.agentType));
-    }
-
-    // Exclude built-in agents when explicitly requested or when user is not an admin
-    if (options?.excludeBuiltIn || !isAgentAdmin) {
-      whereConditions.push(eq(schema.agentsTable.builtIn, false));
-    }
-
-    // Filter by scope if specified
-    if (options?.scope) {
-      whereConditions.push(eq(schema.agentsTable.scope, options.scope));
-    }
-
-    // Exclude other users' personal agents (show non-personal + own personal)
-    if (options?.excludeOtherPersonalAgents && userId) {
-      const condition = or(
-        ne(schema.agentsTable.scope, "personal"),
-        eq(schema.agentsTable.authorId, userId),
-      );
-      if (condition) {
-        whereConditions.push(condition);
-      }
-    }
-
-    // Apply access control filtering for non-agent admins
-    if (userId && !isAgentAdmin) {
-      const accessibleAgentIds = await AgentTeamModel.getUserAccessibleAgentIds(
-        userId,
-        false,
-      );
-
-      if (accessibleAgentIds.length === 0) {
-        return [];
-      }
-
-      whereConditions.push(inArray(schema.agentsTable.id, accessibleAgentIds));
-    }
-
-    // Apply all where conditions if any exist
-    if (whereConditions.length > 0) {
-      query = query.where(and(...whereConditions));
-    }
-
-    const rows = await query;
-
-    // Group the flat join results by agent
-    const agentsMap = new Map<string, Agent>();
-
-    for (const row of rows) {
-      const agent = row.agents;
-      const tool = row.tools;
-
-      if (!agentsMap.has(agent.id)) {
-        agentsMap.set(agent.id, {
-          ...agent,
-          tools: [],
-          teams: [] as Array<{ id: string; name: string }>,
-          labels: [],
-          knowledgeBaseIds: [],
-          connectorIds: [],
-          suggestedPrompts: [],
-        });
-      }
-
-      // Add tool if it exists (leftJoin returns null for agents with no tools)
-      if (tool) {
-        agentsMap.get(agent.id)?.tools.push(tool);
-      }
-    }
-
-    const agents = Array.from(agentsMap.values());
+    const agents: Agent[] = rows.map((agent) => ({
+      ...agent,
+      tools: [],
+      teams: [] as Array<{ id: string; name: string }>,
+      users: [] as Array<{ id: string; name: string; email: string }>,
+      labels: [],
+      knowledgeBaseIds: [],
+      connectorIds: [],
+      suggestedPrompts: [],
+    }));
     const agentIds = agents.map((agent) => agent.id);
 
-    // Populate teams and labels for all agents with bulk queries to avoid N+1
-    const [teamsMap, labelsMap] = await Promise.all([
-      AgentTeamModel.getTeamDetailsForAgents(agentIds),
-      AgentLabelModel.getLabelsForAgents(agentIds),
+    // Populate tools, teams, and labels for all agents with bulk queries to
+    // avoid N+1. Chat starts from scalar configuration plus a few small
+    // relation lists; editing fetches the individual full agent on demand.
+    const [toolRows, teamsMap, usersMap, labelsMap] = await Promise.all([
+      agentIds.length > 0 && options?.includeTools !== false && !isCompactView
+        ? db
+            .select({
+              agentId: schema.agentToolsTable.agentId,
+              tool: agentToolRefColumns,
+            })
+            .from(schema.agentToolsTable)
+            .innerJoin(
+              schema.toolsTable,
+              eq(schema.agentToolsTable.toolId, schema.toolsTable.id),
+            )
+            .where(idArrayCondition(schema.agentToolsTable.agentId, agentIds))
+        : Promise.resolve([]),
+      isChatView
+        ? Promise.resolve(new Map())
+        : AgentTeamModel.getTeamDetailsForAgents(agentIds),
+      isChatView
+        ? Promise.resolve(new Map())
+        : AgentUserModel.getUserDetailsForAgents(agentIds),
+      isCompactView
+        ? Promise.resolve(new Map())
+        : AgentLabelModel.getLabelsForAgents(agentIds),
     ]);
 
-    // Assign teams and labels to each agent
+    const agentsById = new Map(agents.map((agent) => [agent.id, agent]));
+    for (const row of toolRows) {
+      agentsById.get(row.agentId)?.tools.push(row.tool);
+    }
+
+    // Assign teams, grantees, and labels to each agent
     for (const agent of agents) {
       agent.teams = teamsMap.get(agent.id) || [];
+      agent.users = usersMap.get(agent.id) || [];
       agent.labels = labelsMap.get(agent.id) || [];
     }
 
     await Promise.all([
-      AgentModel.populateAuthorNames(agents),
-      AgentModel.populateKnowledgeBaseIds(agents),
-      AgentModel.populateConnectorIds(agents),
-      AgentModel.populateSuggestedPrompts(agents),
+      AgentModel.populateGrantedScope(agents),
+      isChatView ? Promise.resolve() : AgentModel.populateAuthorNames(agents),
+      isOptionsView
+        ? Promise.resolve()
+        : AgentModel.populateKnowledgeBaseIds(agents),
+      isOptionsView
+        ? Promise.resolve()
+        : AgentModel.populateConnectorIds(agents),
+      isOptionsView
+        ? Promise.resolve()
+        : AgentModel.populateSuggestedPrompts(agents),
+      isOptionsView
+        ? Promise.resolve()
+        : AgentModel.populateResolvedLlm(agents),
     ]);
     AgentModel.filterUnavailableKnowledgeTools(agents);
 
     return agents;
+  }
+
+  /** The delegation canvas needs nodes, not editable agents or their assigned tools. */
+  static async findDelegationGraphNodes(
+    organizationId: string,
+    userId: string,
+  ) {
+    const table = schema.agentsTable;
+    const fence = await gatedAgentsFence({
+      userId,
+      organizationIds: [organizationId],
+    });
+    return db
+      .select({ id: table.id, name: table.name, agentType: table.agentType })
+      .from(table)
+      .where(
+        and(
+          eq(table.organizationId, organizationId),
+          eq(table.agentType, "agent"),
+          notDeleted(table),
+          fence,
+        ),
+      )
+      .orderBy(desc(table.createdAt), desc(table.id));
   }
 
   /**
@@ -405,6 +1362,7 @@ class AgentModel {
   ): Promise<Agent[]> {
     const whereConditions: SQL[] = [
       eq(schema.agentsTable.organizationId, organizationId),
+      notDeleted(schema.agentsTable),
     ];
 
     if (options?.agentType !== undefined) {
@@ -415,7 +1373,7 @@ class AgentModel {
       .select()
       .from(schema.agentsTable)
       .where(and(...whereConditions))
-      .orderBy(desc(schema.agentsTable.createdAt));
+      .orderBy(desc(schema.agentsTable.createdAt), desc(schema.agentsTable.id));
 
     // Get tools, teams, and labels for all agents
     const agentIds = agents.map((a) => a.id);
@@ -426,6 +1384,7 @@ class AgentModel {
 
     const [
       teamsMap,
+      usersMap,
       labelsMap,
       kbMap,
       connectorMap,
@@ -433,6 +1392,7 @@ class AgentModel {
       toolsResult,
     ] = await Promise.all([
       AgentTeamModel.getTeamDetailsForAgents(agentIds),
+      AgentUserModel.getUserDetailsForAgents(agentIds),
       AgentLabelModel.getLabelsForAgents(agentIds),
       AgentKnowledgeBaseModel.getKnowledgeBaseIdsForAgents(agentIds),
       AgentConnectorAssignmentModel.getConnectorIdsForAgents(agentIds),
@@ -440,21 +1400,18 @@ class AgentModel {
       db
         .select({
           agentId: schema.agentToolsTable.agentId,
-          tool: schema.toolsTable,
+          tool: agentToolRefColumns,
         })
         .from(schema.agentToolsTable)
         .innerJoin(
           schema.toolsTable,
           eq(schema.agentToolsTable.toolId, schema.toolsTable.id),
         )
-        .where(inArray(schema.agentToolsTable.agentId, agentIds)),
+        .where(idArrayCondition(schema.agentToolsTable.agentId, agentIds)),
     ]);
 
     // Group tools by agent
-    const toolsByAgent = new Map<
-      string,
-      (typeof schema.toolsTable.$inferSelect)[]
-    >();
+    const toolsByAgent = new Map<string, AgentToolRef[]>();
     for (const row of toolsResult) {
       const existing = toolsByAgent.get(row.agentId) || [];
       existing.push(row.tool);
@@ -465,14 +1422,250 @@ class AgentModel {
       ...agent,
       tools: toolsByAgent.get(agent.id) || [],
       teams: teamsMap.get(agent.id) || [],
+      users: usersMap.get(agent.id) || [],
       labels: labelsMap.get(agent.id) || [],
       knowledgeBaseIds: kbMap.get(agent.id) || [],
       connectorIds: connectorMap.get(agent.id) || [],
       suggestedPrompts: suggestedPromptsMap.get(agent.id) || [],
     }));
+    await AgentModel.populateGrantedScope(results);
+    await AgentModel.populateResolvedLlm(results);
     AgentModel.filterUnavailableKnowledgeTools(results);
 
     return results;
+  }
+
+  /**
+   * Runtime Agents run since `since`, most recently run first. The warm pool
+   * reconciler takes distinct configurations from the top, so its limited
+   * pools follow the Agents people actually use.
+   */
+  static async listWarmPoolCandidates(params: { since: Date }) {
+    const recentRuns = db
+      .select({
+        agentId: schema.agentRunsTable.agentId,
+        lastRunAt: max(schema.agentRunsTable.startedAt).as("last_run_at"),
+      })
+      .from(schema.agentRunsTable)
+      .where(gte(schema.agentRunsTable.startedAt, params.since))
+      .groupBy(schema.agentRunsTable.agentId)
+      .as("recent_runs");
+    return db
+      .select({
+        id: schema.agentsTable.id,
+        organizationId: schema.agentsTable.organizationId,
+        environmentId: schema.agentsTable.environmentId,
+        runtime: schema.agentsTable.runtime,
+        namespace: schema.environmentsTable.namespace,
+        defaultNamespace: schema.organizationsTable.defaultEnvironmentNamespace,
+        agentPolicy: schema.agentsTable.networkPolicy,
+        environmentPolicy: schema.environmentsTable.networkPolicy,
+        defaultPolicy: schema.organizationsTable.defaultNetworkPolicy,
+        agentRuntimeTiers: schema.organizationsTable.agentRuntimeTiers,
+      })
+      .from(schema.agentsTable)
+      .innerJoin(recentRuns, eq(recentRuns.agentId, schema.agentsTable.id))
+      .innerJoin(
+        schema.organizationsTable,
+        eq(schema.organizationsTable.id, schema.agentsTable.organizationId),
+      )
+      .leftJoin(
+        schema.environmentsTable,
+        and(
+          eq(schema.environmentsTable.id, schema.agentsTable.environmentId),
+          eq(
+            schema.environmentsTable.organizationId,
+            schema.agentsTable.organizationId,
+          ),
+        ),
+      )
+      .where(
+        and(
+          isNotNull(schema.agentsTable.runtime),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .orderBy(desc(recentRuns.lastRunAt), schema.agentsTable.id);
+  }
+
+  /**
+   * Agents with their own egress policy, each with the namespace its Code
+   * Sandbox engine runs in: the bound environment's namespace, or the
+   * organization's default namespace when unbound. Optionally narrowed to one
+   * organization, one environment, or one agent.
+   */
+  static async listNetworkPolicyEngineTargets(
+    filter: {
+      organizationId?: string;
+      environmentId?: string;
+      agentId?: string;
+    } = {},
+  ): Promise<
+    {
+      id: string;
+      organizationId: string;
+      environmentId: string | null;
+      networkPolicy: NetworkPolicy;
+      namespace: string | null;
+    }[]
+  > {
+    const rows = await db
+      .select({
+        id: schema.agentsTable.id,
+        organizationId: schema.agentsTable.organizationId,
+        environmentId: schema.agentsTable.environmentId,
+        networkPolicy: schema.agentsTable.networkPolicy,
+        environmentNamespace: schema.environmentsTable.namespace,
+        defaultNamespace: schema.organizationsTable.defaultEnvironmentNamespace,
+      })
+      .from(schema.agentsTable)
+      .innerJoin(
+        schema.organizationsTable,
+        eq(schema.organizationsTable.id, schema.agentsTable.organizationId),
+      )
+      .leftJoin(
+        schema.environmentsTable,
+        and(
+          eq(schema.environmentsTable.id, schema.agentsTable.environmentId),
+          eq(
+            schema.environmentsTable.organizationId,
+            schema.agentsTable.organizationId,
+          ),
+        ),
+      )
+      .where(
+        and(
+          isNotNull(schema.agentsTable.networkPolicy),
+          notDeleted(schema.agentsTable),
+          filter.organizationId
+            ? eq(schema.agentsTable.organizationId, filter.organizationId)
+            : undefined,
+          filter.environmentId
+            ? eq(schema.agentsTable.environmentId, filter.environmentId)
+            : undefined,
+          filter.agentId
+            ? eq(schema.agentsTable.id, filter.agentId)
+            : undefined,
+        ),
+      );
+    return rows.flatMap((row) =>
+      row.networkPolicy
+        ? [
+            {
+              id: row.id,
+              organizationId: row.organizationId,
+              environmentId: row.environmentId,
+              networkPolicy: row.networkPolicy,
+              namespace: row.environmentId
+                ? row.environmentNamespace
+                : row.defaultNamespace,
+            },
+          ]
+        : [],
+    );
+  }
+
+  /**
+   * Runtime Agents that run on the organization's default model: those with
+   * no model/key pair of their own, or a pair that resolution skips (half of
+   * it missing, or the model no longer linked to the key). This narrow query
+   * supports validating a proposed default without loading relations.
+   */
+  static async findRuntimeAgentsInheritingOrganizationDefault(
+    organizationId: string,
+  ): Promise<Array<Pick<Agent, "id" | "name" | "runtime" | "agentType">>> {
+    const agents = schema.agentsTable;
+    const links = schema.llmProviderApiKeyModelsTable;
+    return db
+      .select({
+        id: agents.id,
+        name: agents.name,
+        runtime: agents.runtime,
+        agentType: agents.agentType,
+      })
+      .from(agents)
+      .where(
+        and(
+          eq(agents.organizationId, organizationId),
+          isNotNull(agents.runtime),
+          notDeleted(agents),
+          or(
+            isNull(agents.llmApiKeyId),
+            isNull(agents.modelId),
+            notExists(
+              db
+                .select({ id: links.id })
+                .from(links)
+                .where(
+                  and(
+                    eq(links.apiKeyId, agents.llmApiKeyId),
+                    eq(links.modelId, agents.modelId),
+                  ),
+                ),
+            ),
+          ),
+        ),
+      );
+  }
+
+  /** How many agents are set to each auto router themselves (not through the organization default), by router id. */
+  static async countOnAutoRouters(
+    organizationId: string,
+  ): Promise<Map<string, number>> {
+    const rows = await db
+      .select({
+        routerId: schema.agentsTable.autoRouterId,
+        total: count(),
+      })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.organizationId, organizationId),
+          isNotNull(schema.agentsTable.autoRouterId),
+          isNull(schema.agentsTable.runtime),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .groupBy(schema.agentsTable.autoRouterId);
+    return new Map(
+      rows.flatMap((row) =>
+        row.routerId ? [[row.routerId, row.total] as const] : [],
+      ),
+    );
+  }
+
+  static async findRuntimeTargets(organizationId: string) {
+    return db
+      .select({
+        id: schema.agentsTable.id,
+        name: schema.agentsTable.name,
+      })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.organizationId, organizationId),
+          or(
+            isNotNull(schema.agentsTable.runtime),
+            sql`(${schema.agentsTable.subagentLoadBalancing}->>'enabled')::boolean IS TRUE`,
+          ),
+          notDeleted(schema.agentsTable),
+        ),
+      );
+  }
+
+  /** Agents a delegation call starts as an OpenAPPA child: the organization's own, built-ins excluded. */
+  static async findSpawnTargets(organizationId: string) {
+    return db
+      .select({ id: schema.agentsTable.id, name: schema.agentsTable.name })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.organizationId, organizationId),
+          eq(schema.agentsTable.agentType, "agent"),
+          AgentModel.isRegularOrSreAgent(),
+          notDeleted(schema.agentsTable),
+        ),
+      );
   }
 
   /**
@@ -491,6 +1684,7 @@ class AgentModel {
     const whereConditions: SQL[] = [
       eq(schema.agentsTable.organizationId, organizationId),
       inArray(schema.agentsTable.id, accessibleAgentIds),
+      notDeleted(schema.agentsTable),
     ];
 
     if (options?.agentType !== undefined) {
@@ -501,7 +1695,7 @@ class AgentModel {
       .select()
       .from(schema.agentsTable)
       .where(and(...whereConditions))
-      .orderBy(desc(schema.agentsTable.createdAt));
+      .orderBy(desc(schema.agentsTable.createdAt), desc(schema.agentsTable.id));
 
     const agentIds = agents.map((a) => a.id);
 
@@ -511,6 +1705,7 @@ class AgentModel {
 
     const [
       teamsMap,
+      usersMap,
       labelsMap,
       kbMap,
       connectorMap,
@@ -518,6 +1713,7 @@ class AgentModel {
       toolsResult,
     ] = await Promise.all([
       AgentTeamModel.getTeamDetailsForAgents(agentIds),
+      AgentUserModel.getUserDetailsForAgents(agentIds),
       AgentLabelModel.getLabelsForAgents(agentIds),
       AgentKnowledgeBaseModel.getKnowledgeBaseIdsForAgents(agentIds),
       AgentConnectorAssignmentModel.getConnectorIdsForAgents(agentIds),
@@ -525,21 +1721,18 @@ class AgentModel {
       db
         .select({
           agentId: schema.agentToolsTable.agentId,
-          tool: schema.toolsTable,
+          tool: agentToolRefColumns,
         })
         .from(schema.agentToolsTable)
         .innerJoin(
           schema.toolsTable,
           eq(schema.agentToolsTable.toolId, schema.toolsTable.id),
         )
-        .where(inArray(schema.agentToolsTable.agentId, agentIds)),
+        .where(idArrayCondition(schema.agentToolsTable.agentId, agentIds)),
     ]);
 
     // Group tools by agent
-    const toolsByAgent = new Map<
-      string,
-      (typeof schema.toolsTable.$inferSelect)[]
-    >();
+    const toolsByAgent = new Map<string, AgentToolRef[]>();
     for (const row of toolsResult) {
       const existing = toolsByAgent.get(row.agentId) || [];
       existing.push(row.tool);
@@ -550,60 +1743,107 @@ class AgentModel {
       ...agent,
       tools: toolsByAgent.get(agent.id) || [],
       teams: teamsMap.get(agent.id) || [],
+      users: usersMap.get(agent.id) || [],
       labels: labelsMap.get(agent.id) || [],
       knowledgeBaseIds: kbMap.get(agent.id) || [],
       connectorIds: connectorMap.get(agent.id) || [],
       suggestedPrompts: suggestedPromptsMap.get(agent.id) || [],
     }));
+    await AgentModel.populateGrantedScope(results);
+    await AgentModel.populateResolvedLlm(results);
     AgentModel.filterUnavailableKnowledgeTools(results);
 
     return results;
   }
 
-  static async findByLabels(
-    pairs: { keyId: string; valueId: string }[],
+  /**
+   * Candidates for the A2A registry: every internal agent in the organization
+   * that could have an Agent Card, with only the fields a card needs.
+   *
+   * This is deliberately *not* an authorization query. It answers "which
+   * agents belong in the catalog", and the caller then runs the ordinary
+   * per-agent gateway check against each one. Keeping the two apart means the
+   * registry cannot disagree with what a direct card fetch would allow.
+   *
+   * Built-in agents are left out: title generation and context compaction are
+   * machinery this platform runs on, not collaborators
+   * anyone would address over A2A. Personal agents stay in — one belongs to
+   * somebody, and the per-agent check decides whether that is the caller.
+   */
+  static async findA2ARegistryCandidates(
+    organizationId: string,
   ): Promise<
-    {
-      id: string;
-      name: string;
-      agentType: AgentType;
-      toolAssignmentMode: AgentToolAssignmentMode;
-    }[]
+    Pick<Agent, "id" | "name" | "description" | "systemPrompt" | "updatedAt">[]
   > {
-    if (pairs.length === 0) return [];
-
-    const rows = await db
-      .selectDistinct({
+    return db
+      .select({
         id: schema.agentsTable.id,
         name: schema.agentsTable.name,
-        agentType: schema.agentsTable.agentType,
-        toolAssignmentMode: schema.agentsTable.toolAssignmentMode,
+        description: schema.agentsTable.description,
+        systemPrompt: schema.agentsTable.systemPrompt,
+        updatedAt: schema.agentsTable.updatedAt,
       })
-      .from(schema.agentLabelsTable)
-      .innerJoin(
-        schema.agentsTable,
-        eq(schema.agentLabelsTable.agentId, schema.agentsTable.id),
-      )
+      .from(schema.agentsTable)
       .where(
-        or(
-          ...pairs.map((pair) =>
-            and(
-              eq(schema.agentLabelsTable.keyId, pair.keyId),
-              eq(schema.agentLabelsTable.valueId, pair.valueId),
-            ),
-          ),
+        and(
+          eq(schema.agentsTable.organizationId, organizationId),
+          eq(schema.agentsTable.agentType, "agent"),
+          eq(schema.agentsTable.builtIn, false),
+          notDeleted(schema.agentsTable),
         ),
-      );
-
-    return rows;
+      )
+      .orderBy(asc(schema.agentsTable.name));
   }
 
   /**
-   * Find all non-personal internal agents (excluding built-in agents).
-   * Used to populate the agent selection dropdown in Teams/Slack/etc channels.
-   * Personal agents are excluded because channels are shared — only org/team
-   * scoped agents make sense for channel assignment.
+   * Internal agents and the SRE agent the user can use, for the agent picker in
+   * Teams/Slack/etc. A channel is shared, so it leaves personal agents out. A
+   * direct message is the user's own, so it keeps them.
    */
+  static async findUsableChatopsAgents(params: {
+    organizationId: string;
+    userId: string;
+    includePersonal: boolean;
+  }) {
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    const principal =
+      await ResourcePermissionSubjectModel.resolvePrincipal(params);
+    return db
+      .select({ id: schema.agentsTable.id, name: schema.agentsTable.name })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.organizationId, params.organizationId),
+          eq(schema.agentsTable.agentType, "agent"),
+          AgentModel.isRegularOrSreAgent(),
+          notDeleted(schema.agentsTable),
+          ResourcePermissionPolicyModel.grantCondition({
+            ...principal,
+            resource: "agent",
+            scopeColumn: schema.agentsTable.id,
+            action: "use",
+          }),
+          // Like the agents page without admin access: an admin can use
+          // every agent, but pickers offer only theirs and those shared
+          // with them or the organization.
+          ResourcePermissionPolicyModel.accessRelationCondition({
+            organizationId: schema.agentsTable.organizationId,
+            resource: "agent",
+            scopeColumn: schema.agentsTable.id,
+            ownerColumn: schema.agentsTable.authorId,
+            userId: params.userId,
+            subjects: principal.subjects,
+            relations: ["mine", "shared", "org"],
+          }),
+          params.includePersonal ? undefined : not(agentAudienceIs("personal")),
+        ),
+      )
+      .orderBy(asc(schema.agentsTable.name));
+    // SPDX-SnippetEnd
+  }
+
   static async findAllInternalAgents(): Promise<
     Pick<Agent, "id" | "name" | "scope" | "authorId">[]
   > {
@@ -613,13 +1853,15 @@ class AgentModel {
         name: schema.agentsTable.name,
         scope: schema.agentsTable.scope,
         authorId: schema.agentsTable.authorId,
+        createdByServiceAccountId: schema.agentsTable.createdByServiceAccountId,
       })
       .from(schema.agentsTable)
       .where(
         and(
           eq(schema.agentsTable.agentType, "agent"),
-          eq(schema.agentsTable.builtIn, false),
-          ne(schema.agentsTable.scope, "personal"),
+          AgentModel.isRegularOrSreAgent(),
+          not(agentAudienceIs("personal")),
+          notDeleted(schema.agentsTable),
         ),
       )
       .orderBy(asc(schema.agentsTable.name));
@@ -640,19 +1882,18 @@ class AgentModel {
         name: schema.agentsTable.name,
         scope: schema.agentsTable.scope,
         authorId: schema.agentsTable.authorId,
+        createdByServiceAccountId: schema.agentsTable.createdByServiceAccountId,
       })
       .from(schema.agentsTable)
       .where(
         and(
           eq(schema.agentsTable.agentType, "agent"),
-          eq(schema.agentsTable.builtIn, false),
+          AgentModel.isRegularOrSreAgent(),
           or(
-            ne(schema.agentsTable.scope, "personal"),
-            and(
-              eq(schema.agentsTable.scope, "personal"),
-              eq(schema.agentsTable.authorId, userId),
-            ),
+            not(agentAudienceIs("personal")),
+            eq(schema.agentsTable.authorId, userId),
           ),
+          notDeleted(schema.agentsTable),
         ),
       )
       .orderBy(asc(schema.agentsTable.name));
@@ -661,160 +1902,313 @@ class AgentModel {
   }
 
   /**
+   * Return globally sorted references for the dedicated Agents-page catalog.
+   * Full rows are hydrated only after pagination chooses the winning ids.
+   */
+  static async findCatalogCandidates(params: {
+    pagination: PaginationQuery;
+    sorting?: SortingQuery;
+    filters?: AgentListFilters;
+    userId: string;
+    isAgentAdmin: boolean;
+    /**
+     * The grant an external agent row needs. A bulk selection asks for
+     * `delete`, the only bulk action, so it lists only rows it can act on.
+     */
+    externalAgentAction?: "read" | "delete";
+    excludeOtherPersonalExternalAgents?: boolean;
+  }): Promise<AgentCatalogCandidatePage> {
+    const regularWhereClause = await AgentModel.buildListWhereClause({
+      filters: {
+        ...params.filters,
+        agentTypes: ["agent"],
+      },
+      userId: params.userId,
+      isAgentAdmin: params.isAgentAdmin,
+    });
+    // The Show filter's internal prefilter and external branch share one
+    // resolution of the caller's subjects.
+    const accessSubjects = params.filters?.access
+      ? (
+          await ResourcePermissionSubjectModel.resolvePrincipals({
+            userId: params.userId,
+            organizationId: params.filters.organizationId,
+          })
+        ).flatMap((principal) => principal.subjects)
+      : [];
+    const regularAccessCandidates = catalogAccessCandidateIds({
+      organizationId: params.filters?.organizationId,
+      userId: params.userId,
+      subjects: accessSubjects,
+      selection: params.filters?.access,
+      includeBuiltIn:
+        params.filters?.includeBuiltIn === true &&
+        params.isAgentAdmin &&
+        !params.filters?.scope,
+    });
+    const includeExternalAgents =
+      (params.filters?.status ?? "active") === "active" &&
+      !params.filters?.labels &&
+      !params.filters?.providerApiKeyId &&
+      !params.filters?.runtime &&
+      params.filters?.pinned !== true &&
+      params.filters?.scope !== "built_in";
+    const externalWhereConditions: SQL[] = [
+      includeExternalAgents
+        ? eq(
+            schema.a2aRemoteAgentsTable.organizationId,
+            params.filters?.organizationId ?? "",
+          )
+        : sql<boolean>`false`,
+    ];
+
+    if (params.filters?.name) {
+      externalWhereConditions.push(
+        ilike(
+          schema.a2aRemoteAgentsTable.name,
+          `%${escapeLikePattern(params.filters.name)}%`,
+        ),
+      );
+    }
+    if (
+      params.filters?.scope === "personal" ||
+      params.filters?.scope === "team" ||
+      params.filters?.scope === "org"
+    ) {
+      externalWhereConditions.push(
+        externalAgentAudienceIs(params.filters.scope),
+      );
+    }
+    if (params.filters?.teamIds?.length) {
+      externalWhereConditions.push(
+        ResourcePermissionPolicyModel.grantsReadToAnyTeam({
+          organizationId: schema.a2aRemoteAgentsTable.organizationId,
+          resource: "externalAgent",
+          scopeColumn: schema.a2aRemoteAgentsTable.id,
+          teamIds: params.filters.teamIds,
+        }),
+      );
+    }
+    if (params.filters?.authorIds?.length) {
+      externalWhereConditions.push(
+        inArray(schema.a2aRemoteAgentsTable.authorId, params.filters.authorIds),
+      );
+    }
+    if (params.filters?.ids) {
+      externalWhereConditions.push(
+        params.filters.ids.length > 0
+          ? inArray(schema.a2aRemoteAgentsTable.id, params.filters.ids)
+          : sql<boolean>`false`,
+      );
+    }
+    if (params.filters?.excludeIds?.length) {
+      externalWhereConditions.push(
+        notInArray(schema.a2aRemoteAgentsTable.id, params.filters.excludeIds),
+      );
+    }
+    if (params.filters?.excludeAuthorIds?.length) {
+      const excludeAuthorsCondition = or(
+        isNull(schema.a2aRemoteAgentsTable.authorId),
+        notInArray(
+          schema.a2aRemoteAgentsTable.authorId,
+          params.filters.excludeAuthorIds,
+        ),
+      );
+      if (excludeAuthorsCondition) {
+        externalWhereConditions.push(excludeAuthorsCondition);
+      }
+    }
+    if (params.filters?.access) {
+      const externalAccessCondition = externalAgentAccessCondition({
+        userId: params.userId,
+        subjects: accessSubjects,
+        selection: params.filters.access,
+      });
+      if (externalAccessCondition)
+        externalWhereConditions.push(externalAccessCondition);
+    }
+    if (params.excludeOtherPersonalExternalAgents) {
+      const ownPersonalOnlyCondition = or(
+        not(externalAgentAudienceIs("personal")),
+        eq(schema.a2aRemoteAgentsTable.authorId, params.userId),
+      );
+      if (ownPersonalOnlyCondition) {
+        externalWhereConditions.push(ownPersonalOnlyCondition);
+      }
+    }
+    externalWhereConditions.push(
+      await A2aRemoteAgentModel.accessCondition({
+        organizationId: params.filters?.organizationId ?? "",
+        userId: params.userId,
+        action: params.externalAgentAction ?? "read",
+      }),
+    );
+    externalWhereConditions.push(
+      exists(
+        db
+          .select({ value: sql`1` })
+          .from(schema.a2aConnectionsTable)
+          .innerJoin(
+            schema.toolsTable,
+            eq(
+              schema.toolsTable.delegateToA2aConnectionId,
+              schema.a2aConnectionsTable.id,
+            ),
+          )
+          .where(
+            eq(
+              schema.a2aConnectionsTable.remoteAgentId,
+              schema.a2aRemoteAgentsTable.id,
+            ),
+          ),
+      ),
+    );
+
+    const { regular: regularSortValue, external: externalSortValue } =
+      catalogSortValue(params.sorting?.sortBy);
+    const regularCandidates = db
+      .select({
+        resourceType: sql<"agent" | "external">`'agent'`.as("resource_type"),
+        sortValue: regularSortValue.as("sort_value"),
+        id: schema.agentsTable.id,
+        name: schema.agentsTable.name,
+        createdAt: schema.agentsTable.createdAt,
+        teamName: sql<string>`COALESCE(${agentFirstGrantedTeamName()}, '')`.as(
+          "team_name",
+        ),
+        // The author test is cheap and rejects nearly every row, so it runs
+        // before the policy probe.
+        personalPriority: sql<number>`CASE
+          WHEN ${schema.agentsTable.authorId} = ${params.userId}
+            AND ${agentAudienceIs("personal")}
+          THEN 0 ELSE 1 END`.as("personal_priority"),
+        pinnedAt: sql<Date | null>`(
+          SELECT ${schema.agentPinsTable.pinnedAt}
+          FROM ${schema.agentPinsTable}
+          WHERE ${schema.agentPinsTable.userId} = ${params.userId}
+            AND ${schema.agentPinsTable.agentId} = ${schema.agentsTable.id}
+        )`.as("pinned_at"),
+      })
+      .from(schema.agentsTable)
+      .where(and(regularWhereClause, regularAccessCandidates));
+    const externalCandidates = db
+      .select({
+        resourceType: sql<"agent" | "external">`'external'`.as("resource_type"),
+        sortValue: externalSortValue.as("sort_value"),
+        id: schema.a2aRemoteAgentsTable.id,
+        name: schema.a2aRemoteAgentsTable.name,
+        createdAt: schema.a2aRemoteAgentsTable.createdAt,
+        teamName:
+          sql<string>`COALESCE(${externalAgentFirstGrantedTeamName()}, '')`.as(
+            "team_name",
+          ),
+        personalPriority: sql<number>`CASE
+          WHEN ${schema.a2aRemoteAgentsTable.authorId} = ${params.userId}
+            AND ${externalAgentAudienceIs("personal")}
+          THEN 0 ELSE 1 END`.as("personal_priority"),
+        pinnedAt: sql<Date | null>`NULL::timestamp`.as("pinned_at"),
+      })
+      .from(schema.a2aRemoteAgentsTable)
+      .where(and(...externalWhereConditions));
+    const candidates = unionAll(regularCandidates, externalCandidates).as(
+      "agent_catalog_candidates",
+    );
+    const direction = params.sorting?.sortDirection === "asc" ? asc : desc;
+    const sortColumn =
+      params.sorting?.sortBy === "name"
+        ? candidates.name
+        : params.sorting?.sortBy === "team"
+          ? candidates.teamName
+          : params.sorting?.sortBy &&
+              CATALOG_COMPUTED_SORTS.has(params.sorting.sortBy)
+            ? candidates.sortValue
+            : candidates.createdAt;
+
+    // The caller's own personal agents lead the default order. A column the
+    // caller sorts by orders the whole list, or "Last used" would show the
+    // most recent agent below every one of theirs.
+    const isDefaultOrder =
+      params.sorting?.sortBy === undefined ||
+      params.sorting.sortBy === "createdAt";
+    const candidateOrder =
+      params.filters?.pinned === true
+        ? [desc(candidates.pinnedAt), asc(candidates.name), asc(candidates.id)]
+        : [
+            ...(isDefaultOrder ? [asc(candidates.personalPriority)] : []),
+            direction(sortColumn),
+            asc(candidates.name),
+            asc(candidates.resourceType),
+            asc(candidates.id),
+          ];
+
+    // The totals ride on the page as window counts, so the candidate set,
+    // with its per-row authorization, is built once per request.
+    const page = await db
+      .select({
+        type: candidates.resourceType,
+        id: candidates.id,
+        total: sql<number>`COUNT(*) OVER ()`,
+        agentTotal: sql<number>`COUNT(*) FILTER (WHERE ${candidates.resourceType} = 'agent') OVER ()`,
+        externalAgentTotal: sql<number>`COUNT(*) FILTER (WHERE ${candidates.resourceType} = 'external') OVER ()`,
+      })
+      .from(candidates)
+      .orderBy(...candidateOrder)
+      .limit(params.pagination.limit)
+      .offset(params.pagination.offset);
+    // A page past the end has no row to carry the totals.
+    const [totals] =
+      page.length > 0 || params.pagination.offset === 0
+        ? page
+        : await db
+            .select({
+              total: count(),
+              agentTotal: sql<number>`COUNT(*) FILTER (WHERE ${candidates.resourceType} = 'agent')`,
+              externalAgentTotal: sql<number>`COUNT(*) FILTER (WHERE ${candidates.resourceType} = 'external')`,
+            })
+            .from(candidates);
+
+    return {
+      rows: page.map(({ type, id }) => ({ type, id })),
+      total: Number(totals?.total ?? 0),
+      agentTotal: Number(totals?.agentTotal ?? 0),
+      externalAgentTotal: Number(totals?.externalAgentTotal ?? 0),
+    };
+  }
+
+  /**
    * Find all agents with pagination, sorting, and filtering support
    */
   static async findAllPaginated(
     pagination: PaginationQuery,
     sorting?: SortingQuery,
-    filters?: {
-      name?: string;
-      agentType?: AgentType;
-      agentTypes?: AgentType[];
-      scope?: AgentScopeFilter;
-      teamIds?: string[];
-      authorIds?: string[];
-      excludeAuthorIds?: string[];
-      excludeOtherPersonalAgents?: boolean;
-      labels?: Record<string, string[]>;
-    },
+    filters?: AgentListFilters,
     userId?: string,
     isAgentAdmin?: boolean,
-  ): Promise<PaginatedResult<Agent>> {
+  ): Promise<PaginatedResult<AgentListItem>> {
     // Determine the ORDER BY clause based on sorting params
     const orderByClause = AgentModel.getOrderByClause(sorting);
     const personalAgentPriorityOrderClauses =
       AgentModel.getPersonalAgentPriorityOrderClauses(userId);
-
-    // Build where clause for filters and access control
-    const whereConditions: SQL[] = [];
-
-    // Add name filter if provided
-    if (filters?.name) {
-      whereConditions.push(ilike(schema.agentsTable.name, `%${filters.name}%`));
+    if (filters?.pinned !== undefined && !userId) {
+      return createPaginatedResult([], 0, pagination);
     }
+    const pinnedAgentOrderClauses =
+      filters?.pinned === true && userId
+        ? [
+            desc(sql`(
+              SELECT ${schema.agentPinsTable.pinnedAt}
+              FROM ${schema.agentPinsTable}
+              WHERE ${schema.agentPinsTable.userId} = ${userId}
+                AND ${schema.agentPinsTable.agentId} = ${schema.agentsTable.id}
+            )`),
+          ]
+        : [];
 
-    // Add agentTypes filter if provided (array of types)
-    if (filters?.agentTypes && filters.agentTypes.length > 0) {
-      whereConditions.push(
-        inArray(schema.agentsTable.agentType, filters.agentTypes),
-      );
-    }
-    // Add agentType filter if provided (single type, backwards compatible)
-    else if (filters?.agentType !== undefined) {
-      whereConditions.push(eq(schema.agentsTable.agentType, filters.agentType));
-    }
-
-    // Add scope filter if provided
-    if (filters?.scope === "built_in") {
-      whereConditions.push(eq(schema.agentsTable.builtIn, true));
-    } else if (filters?.scope === "personal") {
-      whereConditions.push(eq(schema.agentsTable.scope, "personal"));
-      whereConditions.push(eq(schema.agentsTable.builtIn, false));
-    } else if (filters?.scope === "team") {
-      whereConditions.push(eq(schema.agentsTable.scope, "team"));
-      whereConditions.push(eq(schema.agentsTable.builtIn, false));
-    } else if (filters?.scope === "org") {
-      whereConditions.push(eq(schema.agentsTable.scope, "org"));
-      whereConditions.push(eq(schema.agentsTable.builtIn, false));
-    } else {
-      // No scope filter: exclude built-in agents by default.
-      // Built-in agents are only shown when explicitly filtered via scope=built_in.
-      whereConditions.push(eq(schema.agentsTable.builtIn, false));
-    }
-
-    // Hide built-in agents from non-admin users
-    if (!isAgentAdmin) {
-      whereConditions.push(eq(schema.agentsTable.builtIn, false));
-    }
-
-    // Add teamIds filter if provided (filter team-scoped agents by specific teams)
-    if (filters?.teamIds && filters.teamIds.length > 0) {
-      const agentIdsInTeams = await db
-        .selectDistinct({ agentId: schema.agentTeamsTable.agentId })
-        .from(schema.agentTeamsTable)
-        .where(inArray(schema.agentTeamsTable.teamId, filters.teamIds));
-
-      const ids = agentIdsInTeams.map((r) => r.agentId);
-      if (ids.length === 0) {
-        return createPaginatedResult([], 0, pagination);
-      }
-      whereConditions.push(inArray(schema.agentsTable.id, ids));
-    }
-
-    // Add authorIds filter if provided (filter personal agents by owner)
-    if (filters?.authorIds && filters.authorIds.length > 0) {
-      whereConditions.push(
-        inArray(schema.agentsTable.authorId, filters.authorIds),
-      );
-    }
-
-    // Exclude specific authors if provided
-    if (filters?.excludeAuthorIds && filters.excludeAuthorIds.length > 0) {
-      const condition = or(
-        isNull(schema.agentsTable.authorId),
-        notInArray(schema.agentsTable.authorId, filters.excludeAuthorIds),
-      );
-      if (condition) {
-        whereConditions.push(condition);
-      }
-    }
-
-    // Exclude other users' personal agents (show non-personal + own personal)
-    if (filters?.excludeOtherPersonalAgents && userId) {
-      const condition = or(
-        ne(schema.agentsTable.scope, "personal"),
-        eq(schema.agentsTable.authorId, userId),
-      );
-      if (condition) {
-        whereConditions.push(condition);
-      }
-    }
-
-    // Add label filters if provided (AND across keys, OR within values)
-    if (filters?.labels) {
-      for (const [key, values] of Object.entries(filters.labels)) {
-        const agentIdsWithLabel = await db
-          .selectDistinct({ agentId: schema.agentLabelsTable.agentId })
-          .from(schema.agentLabelsTable)
-          .innerJoin(
-            schema.labelKeysTable,
-            eq(schema.agentLabelsTable.keyId, schema.labelKeysTable.id),
-          )
-          .innerJoin(
-            schema.labelValuesTable,
-            eq(schema.agentLabelsTable.valueId, schema.labelValuesTable.id),
-          )
-          .where(
-            and(
-              eq(schema.labelKeysTable.key, key),
-              inArray(schema.labelValuesTable.value, values),
-            ),
-          );
-
-        const ids = agentIdsWithLabel.map((r) => r.agentId);
-        if (ids.length === 0) {
-          return createPaginatedResult([], 0, pagination);
-        }
-        whereConditions.push(inArray(schema.agentsTable.id, ids));
-      }
-    }
-
-    // Apply access control filtering for non-agent admins
-    if (userId && !isAgentAdmin) {
-      const accessibleAgentIds = await AgentTeamModel.getUserAccessibleAgentIds(
-        userId,
-        false,
-      );
-
-      if (accessibleAgentIds.length === 0) {
-        return createPaginatedResult([], 0, pagination);
-      }
-
-      whereConditions.push(inArray(schema.agentsTable.id, accessibleAgentIds));
-    }
-
-    const whereClause =
-      whereConditions.length > 0 ? and(...whereConditions) : undefined;
+    const whereClause = await AgentModel.buildListWhereClause({
+      filters,
+      userId,
+      isAgentAdmin,
+    });
 
     // Step 1: Get paginated agent IDs with proper sorting
     // This ensures LIMIT/OFFSET applies to agents, not to joined rows with tools
@@ -850,27 +2244,95 @@ class AgentModel {
           eq(schema.agentsTable.id, subagentsCountSubquery.agentId),
         )
         .orderBy(
+          ...pinnedAgentOrderClauses,
           ...personalAgentPriorityOrderClauses,
           direction(sql`COALESCE(${subagentsCountSubquery.subagentsCount}, 0)`),
         );
     } else if (sorting?.sortBy === "toolsCount") {
-      const toolsCountSubquery = db
+      // Ordered by the count the Tools column shows (see countListTools and
+      // the toolCounts subselect in findListEnrichment):
+      // all assignments, minus subagent delegations, minus the knowledge
+      // search tool when the agent has no knowledge sources. Only the few
+      // special tools are joined; the plain count needs no join.
+      const delegate = schema.toolsTable.delegateToAgentId;
+      const isSpecialTool = or(
+        isNotNull(delegate),
+        isKnowledgeSearchToolName(schema.toolsTable.name),
+      );
+      const assignmentCounts = db
         .select({
           agentId: schema.agentToolsTable.agentId,
-          toolsCount: count(schema.agentToolsTable.toolId).as("toolsCount"),
+          assignments: count().as("assignments"),
         })
         .from(schema.agentToolsTable)
         .groupBy(schema.agentToolsTable.agentId)
-        .as("toolsCounts");
+        .as("assignmentCounts");
+      // Assignments without an MCP server reach the special tools through the
+      // (tool_id, agent_id) index; assignments tied to a server, which that
+      // index leaves out, are read in one pass.
+      const specialRow = {
+        agentId: schema.agentToolsTable.agentId,
+        delegation: sql<boolean>`${delegate} is not null`.as("delegation"),
+      };
+      const specialAssignments = unionAll(
+        db
+          .select(specialRow)
+          .from(schema.toolsTable)
+          .innerJoin(
+            schema.agentToolsTable,
+            and(
+              eq(schema.agentToolsTable.toolId, schema.toolsTable.id),
+              isNull(schema.agentToolsTable.mcpServerId),
+            ),
+          )
+          .where(isSpecialTool),
+        db
+          .select(specialRow)
+          .from(schema.agentToolsTable)
+          .innerJoin(
+            schema.toolsTable,
+            eq(schema.toolsTable.id, schema.agentToolsTable.toolId),
+          )
+          .where(
+            and(isNotNull(schema.agentToolsTable.mcpServerId), isSpecialTool),
+          ),
+      ).as("specialAssignments");
+      const specialCounts = db
+        .select({
+          agentId: specialAssignments.agentId,
+          delegations:
+            sql<number>`count(*) filter (where ${specialAssignments.delegation})`.as(
+              "delegations",
+            ),
+          knowledgeTools:
+            sql<number>`count(*) filter (where not ${specialAssignments.delegation})`.as(
+              "knowledgeTools",
+            ),
+        })
+        .from(specialAssignments)
+        .groupBy(specialAssignments.agentId)
+        .as("specialCounts");
 
       query = query
         .leftJoin(
-          toolsCountSubquery,
-          eq(schema.agentsTable.id, toolsCountSubquery.agentId),
+          assignmentCounts,
+          eq(schema.agentsTable.id, assignmentCounts.agentId),
+        )
+        .leftJoin(
+          specialCounts,
+          eq(schema.agentsTable.id, specialCounts.agentId),
         )
         .orderBy(
+          ...pinnedAgentOrderClauses,
           ...personalAgentPriorityOrderClauses,
-          direction(sql`COALESCE(${toolsCountSubquery.toolsCount}, 0)`),
+          direction(sql`COALESCE(${assignmentCounts.assignments}, 0)
+            - COALESCE(${specialCounts.delegations}, 0)
+            - CASE
+              WHEN ${specialCounts.knowledgeTools} > 0
+                AND ${hasNoKnowledgeSources()}
+              THEN ${specialCounts.knowledgeTools}
+              ELSE 0
+            END`),
         );
     } else if (sorting?.sortBy === "knowledgeSourcesCount") {
       const knowledgeSourcesCountSubquery = db
@@ -890,153 +2352,688 @@ class AgentModel {
           eq(schema.agentsTable.id, knowledgeSourcesCountSubquery.agentId),
         )
         .orderBy(
+          ...pinnedAgentOrderClauses,
           ...personalAgentPriorityOrderClauses,
           direction(
             sql`COALESCE(${knowledgeSourcesCountSubquery.knowledgeSourcesCount}, 0)`,
           ),
         );
     } else if (sorting?.sortBy === "team") {
-      const teamNameSubquery = db
-        .select({
-          agentId: schema.agentTeamsTable.agentId,
-          teamName: min(schema.teamsTable.name).as("teamName"),
-        })
-        .from(schema.agentTeamsTable)
-        .leftJoin(
-          schema.teamsTable,
-          eq(schema.agentTeamsTable.teamId, schema.teamsTable.id),
-        )
-        .groupBy(schema.agentTeamsTable.agentId)
-        .as("teamNames");
-
-      query = query
-        .leftJoin(
-          teamNameSubquery,
-          eq(schema.agentsTable.id, teamNameSubquery.agentId),
-        )
-        .orderBy(
-          ...personalAgentPriorityOrderClauses,
-          direction(sql`COALESCE(${teamNameSubquery.teamName}, '')`),
-        );
+      query = query.orderBy(
+        ...pinnedAgentOrderClauses,
+        ...personalAgentPriorityOrderClauses,
+        direction(sql`COALESCE(${agentFirstGrantedTeamName()}, '')`),
+      );
     } else {
       query = query.orderBy(
+        ...pinnedAgentOrderClauses,
         ...personalAgentPriorityOrderClauses,
         orderByClause,
       );
     }
 
-    const sortedAgents = await query
-      .limit(pagination.limit)
-      .offset(pagination.offset);
+    // The count does not depend on the page, so it runs alongside it on
+    // another connection instead of after it. Without a count, one extra row
+    // tells whether another page follows.
+    const countTotal = filters?.includeTotal !== false;
+    const totalQuery = countTotal
+      ? db
+          .select({ total: count() })
+          .from(schema.agentsTable)
+          .where(whereClause)
+          .then(([row]) => Number(row?.total ?? 0))
+      : Promise.resolve(null);
+    const pageSize = pagination.limit + (countTotal ? 0 : 1);
+    // Sorting by a plain column with the caller's personal agents first:
+    // read those agents on their own, then the rest in column order. The
+    // second read walks an index and stops at the page, without ranking every
+    // visible agent.
+    const twoPhase =
+      !!userId &&
+      pinnedAgentOrderClauses.length === 0 &&
+      (sorting?.sortBy === undefined ||
+        sorting.sortBy === "name" ||
+        sorting.sortBy === "createdAt");
+    const [fetchedAgents, countedTotal] = await Promise.all([
+      twoPhase
+        ? AgentModel.findPersonalFirstPage({
+            whereClause,
+            orderByClause,
+            userId,
+            pagination: { limit: pageSize, offset: pagination.offset },
+          })
+        : query.limit(pageSize).offset(pagination.offset),
+      totalQuery,
+    ]);
+    const sortedAgents = fetchedAgents.slice(0, pagination.limit);
+    const total = countedTotal ?? pagination.offset + fetchedAgents.length;
 
     const sortedAgentIds = sortedAgents.map((a) => a.id);
 
     // If no agents match, return early
     if (sortedAgentIds.length === 0) {
-      const [{ total }] = await db
-        .select({ total: count() })
-        .from(schema.agentsTable)
-        .where(whereClause);
-      return createPaginatedResult([], Number(total), pagination);
+      return createPaginatedResult([], total, pagination);
     }
 
-    // Step 2: Get full agent data with tools for the paginated agent IDs
-    const [agentsData, [{ total: totalResult }]] = await Promise.all([
-      db
-        .select()
-        .from(schema.agentsTable)
-        .leftJoin(
-          schema.agentToolsTable,
-          eq(schema.agentsTable.id, schema.agentToolsTable.agentId),
-        )
-        .leftJoin(
-          schema.toolsTable,
-          eq(schema.agentToolsTable.toolId, schema.toolsTable.id),
-        )
-        .where(inArray(schema.agentsTable.id, sortedAgentIds)),
-      db.select({ total: count() }).from(schema.agentsTable).where(whereClause),
-    ]);
-
-    // Sort in memory to maintain the order from the sorted query
+    // Step 2: everything the list shows for these agents, in two statements
+    // run together (see findEnrichedAgents), kept in the sorted query's order.
+    const agents = await AgentModel.findEnrichedAgents({
+      agentIds: sortedAgentIds,
+      includeTools: filters?.includeTools !== false,
+      userId,
+    });
     const orderMap = new Map(sortedAgentIds.map((id, index) => [id, index]));
-    agentsData.sort(
-      (a, b) =>
-        (orderMap.get(a.agents.id) ?? 0) - (orderMap.get(b.agents.id) ?? 0),
+    agents.sort(
+      (a, b) => (orderMap.get(a.id) ?? 0) - (orderMap.get(b.id) ?? 0),
     );
 
-    // Group the flat join results by agent
-    const agentsMap = new Map<string, Agent>();
-
-    for (const row of agentsData) {
-      const agent = row.agents;
-      const tool = row.tools;
-
-      if (!agentsMap.has(agent.id)) {
-        agentsMap.set(agent.id, {
-          ...agent,
-          tools: [],
-          teams: [] as Array<{ id: string; name: string }>,
-          labels: [],
-          knowledgeBaseIds: [],
-          connectorIds: [],
-          suggestedPrompts: [],
-        });
-      }
-
-      // Add tool if it exists (leftJoin returns null for agents with no tools)
-      if (tool) {
-        agentsMap.get(agent.id)?.tools.push(tool);
-      }
-    }
-
-    const agents = Array.from(agentsMap.values());
-    const agentIds = agents.map((agent) => agent.id);
-
-    // Populate teams and labels for all agents with bulk queries to avoid N+1
-    const [teamsMap, labelsMap] = await Promise.all([
-      AgentTeamModel.getTeamDetailsForAgents(agentIds),
-      AgentLabelModel.getLabelsForAgents(agentIds),
-    ]);
-
-    // Assign teams and labels to each agent
-    for (const agent of agents) {
-      agent.teams = teamsMap.get(agent.id) || [];
-      agent.labels = labelsMap.get(agent.id) || [];
-    }
-
-    await Promise.all([
-      AgentModel.populateAuthorNames(agents),
-      AgentModel.populateKnowledgeBaseIds(agents),
-      AgentModel.populateConnectorIds(agents),
-      AgentModel.populateSuggestedPrompts(agents),
-    ]);
-    AgentModel.filterUnavailableKnowledgeTools(agents);
-
-    return createPaginatedResult(agents, Number(totalResult), pagination);
+    return createPaginatedResult(agents, total, pagination);
   }
 
   /**
-   * Helper to get the appropriate ORDER BY clause based on sorting params
+   * Build the regular-agent list predicate shared by the standard endpoint and
+   * the Agents-page catalog candidate query.
    */
+  private static async buildListWhereClause(params: {
+    filters?: AgentListFilters;
+    userId?: string;
+    isAgentAdmin?: boolean;
+  }): Promise<SQL | undefined> {
+    const { filters, userId, isAgentAdmin } = params;
+    const principals = userId
+      ? await ResourcePermissionSubjectModel.resolvePrincipals({
+          userId,
+          organizationId:
+            filters?.authorization?.organizationId ?? filters?.organizationId,
+        })
+      : [];
+    // The default active All view remains restricted to rows the caller can
+    // reach, even for admins. Explicit scopes and the deleted view retain the
+    // existing oversight behavior.
+    const isDefaultActiveAllView =
+      filters?.scope === undefined &&
+      (filters?.status ?? "active") !== "deleted";
+    const restrictToAccessible = !isAgentAdmin || isDefaultActiveAllView;
+    // With the authorization below and the accessible restriction both
+    // applying, the fence, the authorization and the restriction together
+    // mean "not deleted and readable through a grant": a role's base read
+    // never covers LLM proxies, so the organization's proxy the restriction
+    // lets through is dropped by the authorization anyway. One grant
+    // predicate then stands for all three, which the planner plans once.
+    // That holds only while the base-read types exclude `llm_proxy`; a list
+    // that may show the proxy keeps the full predicate.
+    const readThroughGrant =
+      !!userId &&
+      restrictToAccessible &&
+      !!filters?.authorization &&
+      filters.status !== "deleted" &&
+      !filters.authorization.baseReadTypes.includes("llm_proxy");
+    const whereConditions: SQL[] = [
+      getAgentStatusCondition(filters?.status ?? "active"),
+      ...(userId && !readThroughGrant ? [agentListFence(principals)] : []),
+    ];
+    if (userId) {
+      const fence = await callerAgentsFence(userId, principals);
+      if (fence) whereConditions.push(fence);
+    }
+
+    if (filters?.organizationId) {
+      whereConditions.push(
+        eq(schema.agentsTable.organizationId, filters.organizationId),
+      );
+    }
+    if (filters?.authorization) {
+      const { organizationId, baseReadTypes } = filters.authorization;
+      whereConditions.push(
+        eq(schema.agentsTable.organizationId, organizationId),
+      );
+      if (!userId) whereConditions.push(sql<boolean>`false`);
+      else if (readThroughGrant)
+        whereConditions.push(
+          and(
+            notDeleted(schema.agentsTable),
+            explicitAgentReadCondition(principals),
+          ) as SQL,
+        );
+      else if (filters.status !== "deleted")
+        whereConditions.push(
+          or(
+            inArray(schema.agentsTable.agentType, baseReadTypes),
+            explicitAgentReadCondition(principals),
+          ) as SQL,
+        );
+    }
+    if (filters?.ids) {
+      whereConditions.push(
+        filters.ids.length > 0
+          ? inArray(schema.agentsTable.id, filters.ids)
+          : sql<boolean>`false`,
+      );
+    }
+    if (filters?.name) {
+      whereConditions.push(
+        ilike(schema.agentsTable.name, `%${escapeLikePattern(filters.name)}%`),
+      );
+    }
+    if (filters?.runtime) {
+      // Match resolveAgentCatalogId: the launcher identifies the runtime,
+      // independently of the saved image registry or tag.
+      const command = sql<string>`coalesce(${schema.agentsTable.runtime}->'command'->>0, '')`;
+      if (filters.runtime === "chat") {
+        whereConditions.push(isNull(schema.agentsTable.runtime));
+      } else if (filters.runtime === "custom") {
+        whereConditions.push(
+          isNotNull(schema.agentsTable.runtime),
+          notInArray(
+            command,
+            AGENT_CATALOG_IDS.map((id) => `archestra-${id}`),
+          ),
+        );
+      } else {
+        whereConditions.push(eq(command, `archestra-${filters.runtime}`));
+      }
+    }
+    if (filters?.providerApiKeyId === "organization-default") {
+      whereConditions.push(
+        isNull(schema.agentsTable.llmApiKeyId),
+        isNull(schema.agentsTable.modelId),
+      );
+    } else if (filters?.providerApiKeyId) {
+      whereConditions.push(
+        eq(schema.agentsTable.llmApiKeyId, filters.providerApiKeyId),
+      );
+    }
+    if (filters?.agentTypes?.length) {
+      whereConditions.push(
+        inArray(schema.agentsTable.agentType, filters.agentTypes),
+      );
+    } else if (filters?.agentType !== undefined) {
+      whereConditions.push(eq(schema.agentsTable.agentType, filters.agentType));
+    }
+
+    const includeBuiltIn =
+      filters?.includeBuiltIn === true && isAgentAdmin && !filters?.scope;
+    const chatAssistant =
+      filters?.view === "chat" && enterpriseTier.isOpenappaActive();
+    if (filters?.scope === "built_in") {
+      whereConditions.push(eq(schema.agentsTable.builtIn, true));
+    } else if (
+      filters?.scope === "personal" ||
+      filters?.scope === "team" ||
+      filters?.scope === "org"
+    ) {
+      whereConditions.push(
+        agentAudienceIs(filters.scope),
+        AgentModel.isRegularOrSreAgent(),
+      );
+    }
+    // SRE stays in the user-facing catalog wherever its grants permit it.
+    // Chat selection also includes the system assistant when enabled; the
+    // platform's other built-in agents stay hidden.
+    if (!isAgentAdmin || (!includeBuiltIn && !filters?.scope)) {
+      whereConditions.push(
+        or(
+          AgentModel.isRegularOrSreAgent(),
+          chatAssistant
+            ? eq(
+                sql<string>`coalesce(${schema.agentsTable.builtInAgentConfig}->>'name', '')`,
+                BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG,
+              )
+            : undefined,
+        ) as SQL,
+      );
+    }
+    if (filters?.teamIds?.length) {
+      whereConditions.push(agentGrantsReadToAnyTeam(filters.teamIds));
+    }
+    if (filters?.authorIds?.length) {
+      whereConditions.push(
+        inArray(schema.agentsTable.authorId, filters.authorIds),
+      );
+    }
+    if (filters?.excludeAuthorIds?.length) {
+      const condition = or(
+        isNull(schema.agentsTable.authorId),
+        notInArray(schema.agentsTable.authorId, filters.excludeAuthorIds),
+      );
+      if (condition) whereConditions.push(condition);
+    }
+    if (filters?.excludeIds?.length) {
+      whereConditions.push(
+        notInArray(schema.agentsTable.id, filters.excludeIds),
+      );
+    }
+    if (filters?.excludeOtherPersonalAgents && userId) {
+      whereConditions.push(
+        AgentModel.notOthersPersonalCondition({ userId, principals }),
+      );
+    }
+    if (filters?.access && userId) {
+      const accessCondition = agentAccessCondition({
+        userId,
+        principals,
+        selection: filters.access,
+      });
+      if (accessCondition)
+        whereConditions.push(
+          includeBuiltIn
+            ? (or(eq(schema.agentsTable.builtIn, true), accessCondition) as SQL)
+            : accessCondition,
+        );
+    }
+    if (filters?.labels) {
+      for (const [key, values] of Object.entries(filters.labels)) {
+        const agentIdsWithLabel = await db
+          .selectDistinct({ agentId: schema.agentLabelsTable.agentId })
+          .from(schema.agentLabelsTable)
+          .innerJoin(
+            schema.labelKeysTable,
+            eq(schema.agentLabelsTable.keyId, schema.labelKeysTable.id),
+          )
+          .innerJoin(
+            schema.labelValuesTable,
+            eq(schema.agentLabelsTable.valueId, schema.labelValuesTable.id),
+          )
+          .where(
+            and(
+              eq(schema.labelKeysTable.key, key),
+              inArray(schema.labelValuesTable.value, values),
+            ),
+          );
+        const ids = agentIdsWithLabel.map((row) => row.agentId);
+        whereConditions.push(
+          ids.length > 0
+            ? inArray(schema.agentsTable.id, ids)
+            : sql<boolean>`false`,
+        );
+      }
+    }
+    if (filters?.pinned !== undefined) {
+      if (!userId) {
+        whereConditions.push(sql<boolean>`false`);
+      } else {
+        const pinExists = exists(
+          db
+            .select({ value: sql`1` })
+            .from(schema.agentPinsTable)
+            .where(
+              and(
+                eq(schema.agentPinsTable.userId, userId),
+                eq(schema.agentPinsTable.agentId, schema.agentsTable.id),
+              ),
+            ),
+        );
+        whereConditions.push(
+          filters.pinned ? pinExists : sql`NOT ${pinExists}`,
+        );
+      }
+    }
+
+    if (userId && restrictToAccessible && !readThroughGrant) {
+      whereConditions.push(
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        // Apply the accessible-ID predicate directly to avoid a roster self-join.
+        and(
+          notDeleted(schema.agentsTable),
+          or(
+            explicitAgentReadCondition(principals),
+            organizationLlmProxyCondition(userId),
+          ),
+        ) as SQL,
+        // SPDX-SnippetEnd
+      );
+    }
+
+    return whereConditions.length > 0 ? and(...whereConditions) : undefined;
+  }
+
+  /** Get the appropriate ORDER BY clause for the standard agent list. */
   private static getOrderByClause(sorting?: SortingQuery) {
     const direction = sorting?.sortDirection === "asc" ? asc : desc;
 
+    // The id breaks ties (bulk-created agents share a creation time), so a
+    // page boundary never repeats or skips an agent.
+    const withTieBreak = (sort: SQL) =>
+      sql`${sort}, ${direction(schema.agentsTable.id)}`;
     switch (sorting?.sortBy) {
       case "name":
-        return direction(schema.agentsTable.name);
+        return withTieBreak(direction(schema.agentsTable.name));
       case "createdAt":
-        return direction(schema.agentsTable.createdAt);
+        return withTieBreak(direction(schema.agentsTable.createdAt));
+      case "lastUsedAt":
+        // Never-used agents sort as oldest (asc first / desc last).
+        return withTieBreak(
+          direction(
+            sql`COALESCE(${schema.agentsTable.lastUsedAt}, '-infinity'::timestamp)`,
+          ),
+        );
       case "toolsCount":
       case "subagentsCount":
       case "knowledgeSourcesCount":
       case "team":
-        // toolsCount, subagentsCount, knowledgeSourcesCount, and team sorting use a separate query path.
-        // This fallback should never be reached for these sort types.
+        // These sort keys use a separate query path with a dedicated subquery join.
+        // This fallback should never be reached for them.
         return direction(schema.agentsTable.createdAt); // Fallback
       default:
         // Default: newest first
-        return desc(schema.agentsTable.createdAt);
+        return sql`${desc(schema.agentsTable.createdAt)}, ${desc(schema.agentsTable.id)}`;
     }
+  }
+
+  /**
+   * One list page ordered as `getPersonalAgentPriorityOrderClauses` then
+   * `orderByClause`: the caller's own personal agents first, then every other
+   * agent. Same ids in the same order as the single ranked query.
+   */
+  private static async findPersonalFirstPage(params: {
+    whereClause: SQL | undefined;
+    orderByClause: SQL;
+    userId: string;
+    pagination: PaginationQuery;
+  }): Promise<Array<{ id: string }>> {
+    const { limit, offset } = params.pagination;
+    // The author test comes first so the audience lookup runs only for the
+    // caller's own agents.
+    const ownPersonal = and(
+      eq(schema.agentsTable.authorId, params.userId),
+      agentAudienceIs("personal"),
+    );
+    // Read no further than the page's end: when the caller's own agents reach
+    // it, the page is all theirs; otherwise this read holds every one of them,
+    // so its length is where the others start.
+    const own = await db
+      .select({ id: schema.agentsTable.id })
+      .from(schema.agentsTable)
+      .where(and(params.whereClause, ownPersonal))
+      .orderBy(params.orderByClause)
+      .limit(offset + limit);
+    const ownPage = own.slice(offset, offset + limit);
+    const remaining = limit - ownPage.length;
+    if (remaining <= 0) return ownPage;
+    const rest = await db
+      .select({ id: schema.agentsTable.id })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          params.whereClause,
+          or(
+            sql`${schema.agentsTable.authorId} IS DISTINCT FROM ${params.userId}`,
+            not(agentAudienceIs("personal")),
+          ),
+        ),
+      )
+      .orderBy(params.orderByClause)
+      .limit(remaining)
+      .offset(Math.max(0, offset - own.length));
+    return [...ownPage, ...rest];
+  }
+
+  /**
+   * The given agents as the Agents list shows them, in no particular order:
+   * findListEnrichment and findListTools run together, and the sharing and
+   * audience come from the policies the enrichment read, without another
+   * statement. No tools statement when `includeTools` is false; the counts
+   * are present either way.
+   */
+  private static async findEnrichedAgents(params: {
+    agentIds: string[];
+    includeTools: boolean;
+    userId?: string;
+  }): Promise<AgentListItem[]> {
+    const [enriched, toolsByAgent] = await Promise.all([
+      AgentModel.findListEnrichment(params),
+      AgentModel.findListTools(params),
+    ]);
+    for (const entry of enriched) {
+      entry.tools = toolsByAgent.get(entry.row.id) ?? [];
+      entry.toolCounts ??= countListTools(entry.tools);
+    }
+
+    const policies = enriched.flatMap((entry) => entry.policies);
+    const recipients = await ResourcePermissionPolicyModel.findReadRecipients({
+      resources: ["agent", "mcpGateway"],
+      scopes: params.agentIds,
+      policies,
+    });
+    const agents: Agent[] = enriched.map((entry) => {
+      const recipient = recipients.get(entry.row.id);
+      const teamNames = new Map(
+        entry.teams.map((team) => [team.id, team.name]),
+      );
+      const userById = new Map(entry.users.map((user) => [user.id, user]));
+      const provider: SupportedProvider | null =
+        entry.llmKey?.provider ?? entry.model?.provider ?? null;
+      return {
+        ...entry.row,
+        tools: entry.tools,
+        teams: (recipient?.teamIds ?? []).flatMap((id) => {
+          const name = teamNames.get(id);
+          return name === undefined ? [] : [{ id, name }];
+        }),
+        users: (recipient?.userIds ?? []).flatMap((id) => {
+          const user = id === entry.row.authorId ? undefined : userById.get(id);
+          return user ? [user] : [];
+        }),
+        labels: entry.labels,
+        knowledgeBaseIds: entry.knowledgeBaseIds,
+        connectorIds: entry.connectorIds,
+        suggestedPrompts: entry.suggestedPrompts,
+        authorName: entry.creator?.name ?? null,
+        authorEmail: entry.creator?.email ?? null,
+        createdBy: entry.creator ?? null,
+        resolvedLlmProvider: provider,
+        resolvedLlmProviderKeyName: entry.row.llmApiKeyId
+          ? (entry.llmKey?.name ?? null)
+          : null,
+        llmProviderRequiresPerUserCredential: provider
+          ? providerRequiresPerUserCredential(provider)
+          : false,
+        resolvedLlmModelName: entry.row.modelId
+          ? (entry.model?.modelName ?? null)
+          : null,
+      } as Agent;
+    });
+    await AgentModel.populateGrantedScope(agents, policies);
+    const pinnedAtByAgent = new Map(
+      enriched.flatMap((entry) =>
+        entry.pinnedAtMs === null
+          ? []
+          : [[entry.row.id, new Date(entry.pinnedAtMs)] as const],
+      ),
+    );
+    // Subagents are delegation tools, and the knowledge search tool counts
+    // only for an agent with knowledge sources, as in
+    // filterUnavailableKnowledgeTools.
+    const toolCounts = new Map(
+      agents.map((agent, index) => {
+        const counts = enriched[index]?.toolCounts;
+        return [
+          agent.id,
+          {
+            toolsCount:
+              (counts?.tools ?? 0) -
+              (hasKnowledgeSources(agent) ? 0 : (counts?.knowledgeTools ?? 0)),
+            subagentsCount: counts?.subagents ?? 0,
+          },
+        ];
+      }),
+    );
+    AgentModel.filterUnavailableKnowledgeTools(agents);
+
+    return agents.map((agent) => ({
+      ...agent,
+      pinnedAt: pinnedAtByAgent.get(agent.id) ?? null,
+      toolsCount: toolCounts.get(agent.id)?.toolsCount ?? 0,
+      subagentsCount: toolCounts.get(agent.id)?.subagentsCount ?? 0,
+    }));
+  }
+
+  /**
+   * The page's heaviest aspect, each agent's tools, read set-based in a
+   * statement of its own so it runs beside findListEnrichment instead of
+   * after it. No statement when the list does not show tools.
+   */
+  private static async findListTools(params: {
+    agentIds: string[];
+    includeTools: boolean;
+  }): Promise<Map<string, ToolRef[]>> {
+    if (params.agentIds.length === 0 || !params.includeTools) return new Map();
+    // The ToolRef fields are listed by hand in json_build_object below; a
+    // field added to ToolRef must be added there too.
+    const result = await db.execute<{ agent_id: string; tools: ToolRef[] }>(sql`
+      SELECT at.agent_id, json_agg(json_build_object(
+        'id', t.id, 'agentId', t.agent_id, 'catalogId', t.catalog_id,
+        'delegateToAgentId', t.delegate_to_agent_id,
+        'delegateToA2aConnectionId', t.delegate_to_a2a_connection_id,
+        'name', t.name, 'rawName', t.raw_name, 'description', t.description
+      )) AS tools
+      FROM ${schema.agentToolsTable} at INNER JOIN ${schema.toolsTable} t ON t.id = at.tool_id
+      WHERE at.agent_id = ANY(ARRAY[${sql.join(
+        params.agentIds.map((id) => sql`${id}`),
+        sql`, `,
+      )}]::uuid[])
+      GROUP BY at.agent_id`);
+    return new Map(result.rows.map((row) => [row.agent_id, row.tools]));
+  }
+
+  /**
+   * One statement for everything an agent list row shows besides its order
+   * and its tools. It reads the agent rows plus one correlated subselect per
+   * aspect: the agent's policy and the teams and users it grants to, labels,
+   * knowledge bases, connectors, suggested prompts, the caller's pin,
+   * creator, LLM key, model, and tool counts for a list without tools. The
+   * pin time comes back as epoch milliseconds.
+   *
+   * Every subselect runs once per row, which suits a list page: callers pass
+   * at most 100 ids (PaginationQuerySchema caps `limit`).
+   */
+  private static async findListEnrichment(params: {
+    agentIds: string[];
+    includeTools: boolean;
+    userId?: string;
+  }): Promise<ListEnrichment[]> {
+    if (params.agentIds.length === 0) return [];
+    const agentId = qualified(schema.agentsTable.id);
+    const agentScope = sql`${agentId}::text`;
+    // organization_id leads the policies' primary key: with it each row is
+    // one index probe, without it a skip scan.
+    const policyOfAgent = sql`p.organization_id = ${qualified(schema.agentsTable.organizationId)}
+      AND p.resource IN ('agent', 'mcpGateway') AND p.scope = ${agentScope}`;
+    const epochMs = (value: SQL) =>
+      sql`floor(extract(epoch from ${value}) * 1000)::float8`;
+    const rows = await db
+      .select({
+        row: getTableColumns(schema.agentsTable),
+        // One probe of the agent's policies yields them and the names of the
+        // teams and users their grants name.
+        access: sql<{
+          policies: ObjectPolicy[];
+          teams: Array<{ id: string; name: string }>;
+          users: Array<{ id: string; name: string; email: string }>;
+        }>`(
+          SELECT json_build_object(
+            'policies', pol.policies,
+            'teams', (
+              SELECT coalesce(json_agg(DISTINCT jsonb_build_object('id', t.id, 'name', t.name)), '[]'::json)
+              FROM jsonb_array_elements(pol.grant_sets) gs,
+                jsonb_array_elements(gs) g
+                INNER JOIN ${schema.teamsTable} t ON t.id = g->'subject'->>'id'
+              WHERE g->'subject'->>'type' = 'team'),
+            'users', (
+              SELECT coalesce(json_agg(DISTINCT jsonb_build_object('id', u.id, 'name', u.name, 'email', u.email)), '[]'::json)
+              FROM jsonb_array_elements(pol.grant_sets) gs,
+                jsonb_array_elements(gs) g
+                INNER JOIN ${schema.usersTable} u ON u.id = g->'subject'->>'id'
+              WHERE g->'subject'->>'type' = 'user'))
+          FROM (
+            SELECT
+              coalesce(json_agg(json_build_object(
+                'organizationId', p.organization_id, 'resource', p.resource,
+                'scope', p.scope, 'grants', p.grants
+              )), '[]'::json) AS policies,
+              coalesce(jsonb_agg(p.grants), '[]'::jsonb) AS grant_sets
+            FROM ${schema.resourcePermissionPoliciesTable} p WHERE ${policyOfAgent}) pol)`,
+        labels: sql<LabelWithDetails[]>`(
+          SELECT coalesce(json_agg(json_build_object(
+            'keyId', al.key_id, 'valueId', al.value_id,
+            'key', coalesce(lk.key, ''), 'value', coalesce(lv.value, '')
+          ) ORDER BY lk.key), '[]'::json)
+          FROM ${schema.agentLabelsTable} al
+            LEFT JOIN ${schema.labelKeysTable} lk ON lk.id = al.key_id
+            LEFT JOIN ${schema.labelValuesTable} lv ON lv.id = al.value_id
+          WHERE al.agent_id = ${agentId})`,
+        // Ids in assignment order, here and in connectorIds.
+        knowledgeBaseIds: sql<string[]>`(
+          SELECT coalesce(json_agg(akb.knowledge_base_id
+            ORDER BY akb.created_at, akb.knowledge_base_id), '[]'::json)
+          FROM ${schema.agentKnowledgeBasesTable} akb
+            INNER JOIN ${schema.knowledgeBasesTable} kb ON kb.id = akb.knowledge_base_id
+          WHERE akb.agent_id = ${agentId} AND kb.deleted_at IS NULL)`,
+        connectorIds: sql<string[]>`(
+          SELECT coalesce(json_agg(aca.connector_id
+            ORDER BY aca.created_at, aca.connector_id), '[]'::json)
+          FROM ${schema.agentConnectorAssignmentsTable} aca
+            INNER JOIN ${schema.knowledgeBaseConnectorsTable} kc ON kc.id = aca.connector_id
+          WHERE aca.agent_id = ${agentId} AND kc.deleted_at IS NULL)`,
+        suggestedPrompts: sql<SuggestedPromptInput[]>`(
+          SELECT coalesce(json_agg(json_build_object(
+            'summaryTitle', sp.summary_title, 'prompt', sp.prompt
+          ) ORDER BY sp.sort_order), '[]'::json)
+          FROM ${schema.agentSuggestedPromptsTable} sp WHERE sp.agent_id = ${agentId})`,
+        pinnedAtMs: params.userId
+          ? sql<number | null>`(
+              SELECT ${epochMs(sql`ap.pinned_at`)} FROM ${schema.agentPinsTable} ap
+              WHERE ap.user_id = ${params.userId} AND ap.agent_id = ${agentId})`
+          : sql<number | null>`NULL::float8`,
+        creatorUser: sql<{ id: string; name: string; email: string } | null>`(
+          SELECT json_build_object('id', u.id, 'name', u.name, 'email', u.email)
+          FROM ${schema.usersTable} u WHERE u.id = ${qualified(schema.agentsTable.authorId)})`,
+        creatorServiceAccount: sql<{ id: string; name: string } | null>`(
+          SELECT json_build_object('id', sa.id, 'name', sa.name)
+          FROM ${schema.serviceAccountsTable} sa
+          WHERE sa.id = ${qualified(schema.agentsTable.createdByServiceAccountId)})`,
+        llmKey: sql<{ name: string; provider: SupportedProvider } | null>`(
+          SELECT json_build_object('name', k.name, 'provider', k.provider)
+          FROM ${schema.llmProviderApiKeysTable} k WHERE k.id = ${qualified(schema.agentsTable.llmApiKeyId)})`,
+        // With the tools at hand the caller counts them (countListTools);
+        // only a list without tools counts in SQL.
+        toolCounts: params.includeTools
+          ? sql<ListToolCounts | null>`NULL::json`
+          : sql<ListToolCounts | null>`(
+          SELECT json_build_object(
+            'tools', count(*) filter (where tc.delegate_to_agent_id is null),
+            'subagents', count(*) filter (where tc.delegate_to_agent_id is not null),
+            'knowledgeTools', count(*) filter (
+              where tc.delegate_to_agent_id is null
+                and ${isKnowledgeSearchToolName(sql.raw("tc.name"))}
+            )
+          )
+          FROM ${schema.agentToolsTable} atc INNER JOIN ${schema.toolsTable} tc ON tc.id = atc.tool_id
+          WHERE atc.agent_id = ${agentId})`,
+        model: sql<{ provider: SupportedProvider; modelName: string } | null>`(
+          SELECT json_build_object('provider', m.provider, 'modelName', m.model_id)
+          FROM ${schema.modelsTable} m WHERE m.id = ${qualified(schema.agentsTable.modelId)})`,
+      })
+      .from(schema.agentsTable)
+      .where(inArray(schema.agentsTable.id, params.agentIds));
+    return rows.map(
+      ({ creatorUser, creatorServiceAccount, access, ...entry }) => ({
+        ...entry,
+        ...access,
+        // Filled in by the caller from findListTools.
+        tools: [],
+        // A service account that created the agent wins, as in CreatedByModel.id.
+        creator: entry.row.createdByServiceAccountId
+          ? creatorServiceAccount
+            ? CreatedByModel.fromServiceAccount(creatorServiceAccount)
+            : null
+          : creatorUser
+            ? CreatedByModel.fromUser(creatorUser)
+            : null,
+      }),
+    );
   }
 
   private static getPersonalAgentPriorityOrderClauses(userId?: string) {
@@ -1047,8 +3044,8 @@ class AgentModel {
     return [
       asc(sql`
         CASE
-          WHEN ${schema.agentsTable.scope} = 'personal'
-            AND ${schema.agentsTable.authorId} = ${userId}
+          WHEN ${schema.agentsTable.authorId} = ${userId}
+            AND ${agentAudienceIs("personal")}
           THEN 0
           ELSE 1
         END
@@ -1058,10 +3055,7 @@ class AgentModel {
 
   private static filterUnavailableKnowledgeTools(agents: Agent[]): void {
     for (const agent of agents) {
-      const hasKnowledgeSources =
-        agent.knowledgeBaseIds.length > 0 || agent.connectorIds.length > 0;
-
-      if (hasKnowledgeSources) {
+      if (hasKnowledgeSources(agent)) {
         continue;
       }
 
@@ -1079,18 +3073,705 @@ class AgentModel {
     const [result] = await db
       .select({ id: schema.agentsTable.id })
       .from(schema.agentsTable)
-      .where(eq(schema.agentsTable.id, id))
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
       .limit(1);
 
     return result !== undefined;
+  }
+
+  static async existsInOrganization(params: {
+    id: string;
+    organizationId: string;
+  }): Promise<boolean> {
+    const [result] = await db
+      .select({ id: schema.agentsTable.id })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.id, params.id),
+          eq(schema.agentsTable.organizationId, params.organizationId),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .limit(1);
+
+    return result !== undefined;
+  }
+
+  static async findOrganizationId(id: string): Promise<string | null> {
+    const [result] = await db
+      .select({ organizationId: schema.agentsTable.organizationId })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    return result?.organizationId ?? null;
+  }
+
+  /**
+   * Toggle Auto skill mode for the gateway's `skill://` surface.
+   *
+   * Narrow on purpose: the general `update` carries side effects irrelevant to
+   * this flag (delegation-tool sync, exclusion pre-fill) and cannot join a
+   * caller's transaction, which this needs so the mode and the assignment set
+   * change together.
+   */
+  static async setAccessAllSkills(
+    id: string,
+    accessAllSkills: boolean,
+    tx?: Transaction,
+  ): Promise<void> {
+    await (tx ?? db)
+      .update(schema.agentsTable)
+      .set({ accessAllSkills })
+      .where(
+        and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)),
+      );
+  }
+
+  static async setActivationSkillPolicyState(params: {
+    id: string;
+    mode: AgentActivationSkillMode;
+    revision: number;
+    tx?: Transaction;
+  }): Promise<void> {
+    await (params.tx ?? db)
+      .update(schema.agentsTable)
+      .set({
+        activationSkillMode: params.mode,
+        activationSkillPolicyRevision: params.revision,
+      })
+      .where(
+        and(
+          eq(schema.agentsTable.id, params.id),
+          notDeleted(schema.agentsTable),
+        ),
+      );
+  }
+
+  static async findActivationSkillPolicyState(
+    id: string,
+    tx?: Transaction,
+  ): Promise<{
+    mode: AgentActivationSkillMode;
+    revision: number;
+  } | null> {
+    const [row] = await (tx ?? db)
+      .select({
+        mode: schema.agentsTable.activationSkillMode,
+        revision: schema.agentsTable.activationSkillPolicyRevision,
+      })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+    return row ?? null;
+  }
+
+  static async findEnvironmentId(id: string): Promise<string | null> {
+    return (await AgentModel.findToolAccessFields(id))?.environmentId ?? null;
+  }
+
+  /**
+   * What a log row written for this agent needs: its environment, and whether
+   * its organization keeps media in logs (null when the agent is not found).
+   */
+  static async findLogSettings(id: string): Promise<{
+    environmentId: string | null;
+    keepMediaInLogs: boolean | null;
+  }> {
+    const fields = await AgentModel.findToolAccessFields(id);
+    return {
+      environmentId: fields?.environmentId ?? null,
+      keepMediaInLogs: fields?.keepMediaInLogs ?? null,
+    };
+  }
+
+  /**
+   * The two fields that decide whether a caller missing an MCP connection is
+   * warned, blocked, or left alone. Kept narrow so the chat turn's pre-flight
+   * check costs one indexed row read.
+   */
+  static async findMissingCredentialEnforcement(
+    id: string,
+  ): Promise<ReadinessAgent | null> {
+    const [result] = await db
+      .select({
+        id: schema.agentsTable.id,
+        missingCredentialBehavior: schema.agentsTable.missingCredentialBehavior,
+        accessAllTools: schema.agentsTable.accessAllTools,
+      })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    return result ?? null;
+  }
+
+  /** The Microsoft Entra agent identity the agent acts as, if it is bound to one. */
+  static async findEntraAgentIdentityId(id: string): Promise<string | null> {
+    const [result] = await db
+      .select({ entraAgentIdentityId: schema.agentsTable.entraAgentIdentityId })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    return result?.entraAgentIdentityId ?? null;
+  }
+
+  /** The agent bound to a Microsoft Entra agent identity, if any. */
+  static async findIdByEntraAgentIdentityId(params: {
+    organizationId: string;
+    entraAgentIdentityId: string;
+  }): Promise<string | null> {
+    const [result] = await db
+      .select({ id: schema.agentsTable.id })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.organizationId, params.organizationId),
+          sql`lower(${schema.agentsTable.entraAgentIdentityId}) = ${params.entraAgentIdentityId.toLowerCase()}`,
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .limit(1);
+
+    return result?.id ?? null;
+  }
+
+  static async findIdentityProviderId(id: string): Promise<string | null> {
+    const [result] = await db
+      .select({ identityProviderId: schema.agentsTable.identityProviderId })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    return result?.identityProviderId ?? null;
+  }
+
+  /**
+   * Whether the agent's "access all tools" toggle is on — the per-agent opt-in
+   * for dynamic tool access via search_tools/run_tool. Lean read on the tool
+   * dispatch path; never cached across requests, so toggling the setting
+   * affects the next discovery/dispatch call. Defaults to false when the agent
+   * is missing or deleted.
+   */
+  static async getAccessAllTools(id: string): Promise<boolean> {
+    return (await AgentModel.findToolAccessFields(id))?.accessAllTools ?? false;
+  }
+
+  /**
+   * Single-column lookup for the Auto-subagent-mode gate on the delegation
+   * dispatch path; intentionally not cached so toggling the setting affects the
+   * next delegation call. Defaults to false when the agent is missing/deleted.
+   */
+  static async getAccessAllSubagents(id: string): Promise<boolean> {
+    const [result] = await db
+      .select({ accessAllSubagents: schema.agentsTable.accessAllSubagents })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    return result?.accessAllSubagents ?? false;
+  }
+
+  /**
+   * Single-column agentType lookup for per-call dispatch gates, avoiding
+   * findById's multi-table join. Null when the agent is missing or deleted.
+   */
+  static async getAgentType(id: string): Promise<AgentType | null> {
+    const [result] = await db
+      .select({ agentType: schema.agentsTable.agentType })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    return result?.agentType ?? null;
+  }
+
+  /** Lock active participants in UUID order for shared-target and callable-name checks. */
+  static async lockDelegationParticipants(params: {
+    ids: string[];
+    organizationId: string;
+    tx: Transaction;
+  }) {
+    return params.tx
+      .select({
+        id: schema.agentsTable.id,
+        agentType: schema.agentsTable.agentType,
+      })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          inArray(schema.agentsTable.id, params.ids),
+          eq(schema.agentsTable.organizationId, params.organizationId),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .orderBy(asc(schema.agentsTable.id))
+      .for("update");
+  }
+
+  /**
+   * Lock the agent row (SELECT ... FOR UPDATE) inside a transaction,
+   * serializing writers that maintain the agent's child tables (e.g. the
+   * tool-exclusions full replace) so concurrent replaces cannot interleave
+   * their delete+insert phases into a merged state.
+   */
+  static async lockRowForUpdate(id: string, tx: Transaction): Promise<void> {
+    await tx
+      .select({ id: schema.agentsTable.id })
+      .from(schema.agentsTable)
+      .where(eq(schema.agentsTable.id, id))
+      .for("update");
+  }
+
+  /**
+   * Every live agent that can serve as an MCP gateway in this organization, by
+   * name. External clients register gateways under a server name derived from
+   * these (see `resolveMcpClientServerName`), so the LLM proxy uses them to
+   * recognize client-decorated gateway tool names. `isPersonalGateway` comes
+   * along because a seeded personal gateway registers under the app name
+   * rather than its own.
+   */
+  static async findGatewayNamesByOrganizationId(
+    organizationId: string,
+  ): Promise<{ name: string; isPersonalGateway: boolean }[]> {
+    return db
+      .select({
+        name: schema.agentsTable.name,
+        isPersonalGateway: schema.agentsTable.isPersonalGateway,
+      })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.organizationId, organizationId),
+          notDeleted(schema.agentsTable),
+          inArray(schema.agentsTable.agentType, [
+            ...GATEWAY_CAPABLE_AGENT_TYPES,
+          ]),
+        ),
+      );
+  }
+
+  static async findIdsByOrganizationId(
+    organizationId: string,
+  ): Promise<string[]> {
+    const agents = await db
+      .select({ id: schema.agentsTable.id })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.organizationId, organizationId),
+          notDeleted(schema.agentsTable),
+        ),
+      );
+
+    return agents.map((agent) => agent.id);
+  }
+
+  static async findAllIds(): Promise<string[]> {
+    const agents = await db
+      .select({ id: schema.agentsTable.id })
+      .from(schema.agentsTable)
+      .where(notDeleted(schema.agentsTable));
+
+    return agents.map((agent) => agent.id);
+  }
+
+  /**
+   * Ids of the org's non-deleted agents that go through the create-time
+   * default tool hooks — i.e. excluding built-in system agents, which are
+   * seeded via raw insert and deliberately bypass them.
+   */
+  static async findNonBuiltInIdsByOrganizationId(
+    organizationId: string,
+  ): Promise<string[]> {
+    const agents = await db
+      .select({ id: schema.agentsTable.id })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.organizationId, organizationId),
+          notDeleted(schema.agentsTable),
+          isNull(schema.agentsTable.builtInAgentConfig),
+        ),
+      );
+
+    return agents.map((agent) => agent.id);
+  }
+
+  /** Existing agents that still need at least one of the supplied tool assignments. */
+  static async findNonBuiltInIdsMissingToolAssignments(params: {
+    organizationId: string;
+    toolIds: string[];
+  }): Promise<string[]> {
+    if (params.toolIds.length === 0) return [];
+    const agents = await db
+      .select({ id: schema.agentsTable.id })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.organizationId, params.organizationId),
+          notDeleted(schema.agentsTable),
+          isNull(schema.agentsTable.builtInAgentConfig),
+          exists(
+            db
+              .select({ id: schema.toolsTable.id })
+              .from(schema.toolsTable)
+              .where(
+                and(
+                  inArray(schema.toolsTable.id, params.toolIds),
+                  notExists(
+                    db
+                      .select({ id: schema.agentToolsTable.id })
+                      .from(schema.agentToolsTable)
+                      .where(
+                        and(
+                          eq(
+                            schema.agentToolsTable.agentId,
+                            schema.agentsTable.id,
+                          ),
+                          eq(
+                            schema.agentToolsTable.toolId,
+                            schema.toolsTable.id,
+                          ),
+                        ),
+                      ),
+                  ),
+                ),
+              ),
+          ),
+        ),
+      );
+    return agents.map((agent) => agent.id);
+  }
+
+  /**
+   * Whether `agentId` is its organization's LLM Proxy and `userId` a member of
+   * that organization. See {@link organizationLlmProxyCondition}.
+   */
+  static async isOrganizationLlmProxyFor(params: {
+    agentId: string;
+    userId: string;
+  }): Promise<boolean> {
+    const [row] = await db
+      .select({ id: schema.agentsTable.id })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.id, params.agentId),
+          notDeleted(schema.agentsTable),
+          organizationLlmProxyCondition(params.userId),
+        ),
+      )
+      .limit(1);
+    return row !== undefined;
+  }
+
+  static async findAccessibleIdsForUser(
+    userId: string,
+    isAgentAdmin = false,
+    principals?: GrantPrincipal[],
+    options?: {
+      /** Only check these agents, rather than list every one the user reaches. */
+      among?: string[];
+    },
+  ): Promise<string[]> {
+    if (options?.among?.length === 0) return [];
+    const readers =
+      principals ??
+      (await ResourcePermissionSubjectModel.resolvePrincipals({ userId }));
+    const rows = await db
+      .select({
+        id: schema.agentsTable.id,
+        organizationId: schema.agentsTable.organizationId,
+      })
+      .from(schema.agentsTable)
+      .where(
+        accessibleAgentsCondition({
+          userId,
+          isAgentAdmin,
+          principals: readers,
+          among: options?.among,
+        }),
+      );
+
+    return (await dropHiddenAgents(rows, userId)).map((row) => row.id);
+  }
+
+  /**
+   * Internal agents eligible as Auto-mode delegation targets for a caller:
+   * agentType "agent", not soft-deleted, that the caller holds a use grant on,
+   * minus the caller agent itself. This is the delegation analog of
+   * {@link ToolModel.getMcpToolsAccessibleToUser} — the dynamic surface for
+   * `agents.access_all_subagents`. Admins see every internal agent.
+   *
+   * Built-in platform agents are excluded except for the user-facing SRE agent.
+   */
+  static async findAccessibleDelegationTargets(params: {
+    userId: string;
+    isAdmin: boolean;
+    organizationId: string;
+    excludeAgentId: string;
+    /**
+     * The calling agent's environment: delegation never crosses environment
+     * boundaries (null is the Default environment), mirroring tool isolation.
+     */
+    environmentId: string | null;
+    lookups?: PrincipalSource;
+    includeDetails?: boolean;
+  }): Promise<
+    (Pick<Agent, "id" | "name" | "description" | "builtInAgentConfig"> & {
+      hasRuntime: boolean;
+    })[]
+  > {
+    const { userId, isAdmin, organizationId, excludeAgentId, environmentId } =
+      params;
+
+    const baseConditions = [
+      eq(schema.agentsTable.organizationId, organizationId),
+      eq(schema.agentsTable.agentType, "agent"),
+      AgentModel.isRegularOrSreAgent(),
+      ne(schema.agentsTable.id, excludeAgentId),
+      environmentId === null
+        ? isNull(schema.agentsTable.environmentId)
+        : eq(schema.agentsTable.environmentId, environmentId),
+      notDeleted(schema.agentsTable),
+    ];
+
+    if (isAdmin) {
+      const rows = await db
+        .select({
+          id: schema.agentsTable.id,
+          organizationId: schema.agentsTable.organizationId,
+          name: schema.agentsTable.name,
+          description:
+            params.includeDetails === false
+              ? sql<string | null>`NULL`
+              : schema.agentsTable.description,
+          builtInAgentConfig:
+            params.includeDetails === false
+              ? sql<Agent["builtInAgentConfig"]>`NULL`
+              : schema.agentsTable.builtInAgentConfig,
+          hasRuntime: sql<boolean>`${schema.agentsTable.runtime} IS NOT NULL`,
+        })
+        .from(schema.agentsTable)
+        .where(and(...baseConditions))
+        .orderBy(asc(schema.agentsTable.name));
+      return withoutOrganization(await dropHiddenAgents(rows, userId));
+    }
+
+    const principal = await ResourcePermissionSubjectModel.resolvePrincipalFrom(
+      params.lookups,
+      { organizationId, userId },
+    );
+    const rows = await db
+      .select({
+        id: schema.agentsTable.id,
+        organizationId: schema.agentsTable.organizationId,
+        name: schema.agentsTable.name,
+        description:
+          params.includeDetails === false
+            ? sql<string | null>`NULL`
+            : schema.agentsTable.description,
+        builtInAgentConfig:
+          params.includeDetails === false
+            ? sql<Agent["builtInAgentConfig"]>`NULL`
+            : schema.agentsTable.builtInAgentConfig,
+        hasRuntime: sql<boolean>`${schema.agentsTable.runtime} IS NOT NULL`,
+      })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          ...baseConditions,
+          // SPDX-SnippetBegin
+          // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+          // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+          ResourcePermissionPolicyModel.grantCondition({
+            ...principal,
+            resource: "agent",
+            scopeColumn: schema.agentsTable.id,
+            action: "use",
+          }),
+          // SPDX-SnippetEnd
+        ),
+      )
+      .orderBy(asc(schema.agentsTable.name));
+    return withoutOrganization(await dropHiddenAgents(rows, userId));
+  }
+
+  static async findDelegationTarget(
+    id: string,
+    tx?: Transaction,
+  ): Promise<Pick<
+    Agent,
+    "id" | "name" | "agentType" | "llmApiKeyId" | "modelId"
+  > | null> {
+    const [targetAgent] = await (tx ?? db)
+      .select({
+        id: schema.agentsTable.id,
+        name: schema.agentsTable.name,
+        agentType: schema.agentsTable.agentType,
+        llmApiKeyId: schema.agentsTable.llmApiKeyId,
+        modelId: schema.agentsTable.modelId,
+      })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    return targetAgent ?? null;
+  }
+
+  static async findAccessContextById(
+    id: string,
+  ): Promise<AgentAccessContext | null> {
+    return readConfig(`agent-access-context\0${id}`, () =>
+      AgentModel.loadAccessContext(id),
+    );
+  }
+
+  /**
+   * The one row a read authorization needs — type (for the type-specific RBAC
+   * check), name, and the access-context columns
+   * {@link AgentTeamModel.userHasAgentAccess} takes — of an agent the viewer may
+   * see, without the tool join and hydration {@link findById} does. For routes
+   * that only authorize the agent before reading something else about it.
+   */
+  static async findByIdForAccess(
+    id: string,
+    viewerId: string,
+  ): Promise<
+    | (AgentAccessContext &
+        Pick<
+          Agent,
+          "agentType" | "name" | "createdByServiceAccountId" | "environmentId"
+        >)
+    | null
+  > {
+    const [agent] = await db
+      .select({
+        id: schema.agentsTable.id,
+        environmentId: schema.agentsTable.environmentId,
+        organizationId: schema.agentsTable.organizationId,
+        scope: schema.agentsTable.scope,
+        authorId: schema.agentsTable.authorId,
+        createdByServiceAccountId: schema.agentsTable.createdByServiceAccountId,
+        agentType: schema.agentsTable.agentType,
+        name: schema.agentsTable.name,
+      })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    return agent &&
+      (await canUseAgent(agent.id, {
+        userId: viewerId,
+        organizationId: agent.organizationId,
+      }))
+      ? agent
+      : null;
+  }
+
+  /**
+   * A live gateway's access context and its GitHub Actions setting, for the
+   * GitHub Actions token exchange.
+   */
+  static async findGitHubActionsGateway(
+    id: string,
+  ): Promise<
+    (AgentAccessContext & Pick<Agent, "name" | "githubActionsAccess">) | null
+  > {
+    const [agent] = await db
+      .select({
+        id: schema.agentsTable.id,
+        organizationId: schema.agentsTable.organizationId,
+        scope: schema.agentsTable.scope,
+        authorId: schema.agentsTable.authorId,
+        createdByServiceAccountId: schema.agentsTable.createdByServiceAccountId,
+        agentType: schema.agentsTable.agentType,
+        name: schema.agentsTable.name,
+        githubActionsAccess: schema.agentsTable.githubActionsAccess,
+      })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    return agent ?? null;
+  }
+
+  /**
+   * IDs of live runtime-backed subagents explicitly assigned to this agent
+   * (`agent_tools` -> `tools.delegate_to_agent_id`), in assignment order.
+   */
+  static async findAssignedRuntimeSubagentIds(
+    agentId: string,
+    environmentId: string | null = null,
+  ): Promise<string[]> {
+    const rows = await db
+      .select({
+        targetAgentId: schema.agentsTable.id,
+      })
+      .from(schema.agentToolsTable)
+      .innerJoin(
+        schema.toolsTable,
+        eq(schema.agentToolsTable.toolId, schema.toolsTable.id),
+      )
+      .innerJoin(
+        schema.agentsTable,
+        eq(schema.toolsTable.delegateToAgentId, schema.agentsTable.id),
+      )
+      .where(
+        and(
+          eq(schema.agentToolsTable.agentId, agentId),
+          isNotNull(schema.toolsTable.delegateToAgentId),
+          isNotNull(schema.agentsTable.runtime),
+          environmentId === null
+            ? isNull(schema.agentsTable.environmentId)
+            : eq(schema.agentsTable.environmentId, environmentId),
+          notExists(
+            db
+              .select({ one: sql`1` })
+              .from(schema.agentExcludedSubagentsTable)
+              .where(
+                and(
+                  eq(schema.agentExcludedSubagentsTable.agentId, agentId),
+                  eq(
+                    schema.agentExcludedSubagentsTable.targetAgentId,
+                    schema.agentsTable.id,
+                  ),
+                ),
+              ),
+          ),
+          notDeleted(schema.toolsTable),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .orderBy(
+        asc(schema.agentToolsTable.createdAt),
+        asc(schema.agentToolsTable.id),
+      );
+
+    return [...new Set(rows.map((row) => row.targetAgentId))];
   }
 
   /**
    * Batch fetch minimal agent data needed for permission checks.
    * Returns a Map of agentId -> { agentType, scope, authorId, teamIds }.
    * Much lighter than findById (no tool/label/knowledgeBase/connector joins).
+   *
+   * Includes `environmentId` so callers can apply the environment fence beside
+   * the permission checks, without a second round-trip per target.
+   *
+   * `organizationId` is an OPTIONAL tenant fence. The scope checks downstream
+   * cannot supply one: an admin check reads the caller's role in the caller's
+   * OWN org, so nothing ever compares the target's tenant. Callers that accept agent ids
+   * straight from a request body should pass it, which drops foreign-org agents
+   * from the map and makes them indistinguishable from ids that do not exist.
    */
-  static async findByIdsForPermissionCheck(ids: string[]): Promise<
+  static async findByIdsForPermissionCheck(
+    ids: string[],
+    organizationId?: string,
+  ): Promise<
     Map<
       string,
       {
@@ -1098,6 +3779,7 @@ class AgentModel {
         scope: AgentScope;
         authorId: string | null;
         teamIds: string[];
+        environmentId: string | null;
       }
     >
   > {
@@ -1105,18 +3787,31 @@ class AgentModel {
       return new Map();
     }
 
-    const [agents, teamsMap] = await Promise.all([
-      db
-        .select({
-          id: schema.agentsTable.id,
-          agentType: schema.agentsTable.agentType,
-          scope: schema.agentsTable.scope,
-          authorId: schema.agentsTable.authorId,
-        })
-        .from(schema.agentsTable)
-        .where(inArray(schema.agentsTable.id, ids)),
-      AgentTeamModel.getTeamDetailsForAgents(ids),
-    ]);
+    // The audience and teams come from each agent's own grants, not the
+    // retired scope and team rows, so assignability follows permission edits.
+    const agents = await db
+      .select({
+        id: schema.agentsTable.id,
+        agentType: schema.agentsTable.agentType,
+        scope: sql<AgentScope>`CASE
+          WHEN ${agentAudienceIs("org")} THEN 'org'
+          WHEN ${agentAudienceIs("team")} THEN 'team'
+          ELSE 'personal' END`,
+        authorId: schema.agentsTable.authorId,
+        teamIds: agentGrantedTeamIds(),
+        createdByServiceAccountId: schema.agentsTable.createdByServiceAccountId,
+        environmentId: schema.agentsTable.environmentId,
+      })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          inArray(schema.agentsTable.id, ids),
+          notDeleted(schema.agentsTable),
+          organizationId
+            ? eq(schema.agentsTable.organizationId, organizationId)
+            : undefined,
+        ),
+      );
 
     const result = new Map<
       string,
@@ -1125,15 +3820,16 @@ class AgentModel {
         scope: AgentScope;
         authorId: string | null;
         teamIds: string[];
+        environmentId: string | null;
       }
     >();
     for (const agent of agents) {
-      const teams = teamsMap.get(agent.id) ?? [];
       result.set(agent.id, {
         agentType: agent.agentType,
         scope: agent.scope,
         authorId: agent.authorId,
-        teamIds: teams.map((t) => t.id),
+        teamIds: agent.teamIds,
+        environmentId: agent.environmentId,
       });
     }
 
@@ -1152,9 +3848,52 @@ class AgentModel {
     const results = await db
       .select({ id: schema.agentsTable.id })
       .from(schema.agentsTable)
-      .where(inArray(schema.agentsTable.id, ids));
+      .where(
+        and(
+          inArray(schema.agentsTable.id, ids),
+          notDeleted(schema.agentsTable),
+        ),
+      );
 
     return new Set(results.map((r) => r.id));
+  }
+
+  static async getRuntimePorts(params: {
+    id: string;
+    organizationId: string;
+  }): Promise<number[]> {
+    const [agent] = await db
+      .select({ runtime: schema.agentsTable.runtime })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.id, params.id),
+          eq(schema.agentsTable.organizationId, params.organizationId),
+        ),
+      )
+      .limit(1);
+    return agent?.runtime?.ports ?? [];
+  }
+
+  /** A caller-scoped read's access check; no caller is an internal lookup. */
+  private static async callerCanAccess(
+    id: string,
+    userId?: string,
+    isAgentAdmin?: boolean,
+  ): Promise<boolean> {
+    if (!userId) return true;
+    if (!isAgentAdmin)
+      return AgentTeamModel.userHasAgentAccess({
+        userId,
+        agentId: id,
+        isAgentAdmin: false,
+      });
+    if (!isPermissionGatedAgent(id)) return true;
+    const agent = await AgentModel.findAccessContextById(id);
+    return (
+      !!agent &&
+      canUseAgent(id, { userId, organizationId: agent.organizationId })
+    );
   }
 
   static async findById(
@@ -1162,16 +3901,8 @@ class AgentModel {
     userId?: string,
     isAgentAdmin?: boolean,
   ): Promise<Agent | null> {
-    // Check access control for non-agent admins
-    if (userId && !isAgentAdmin) {
-      const hasAccess = await AgentTeamModel.userHasAgentAccess(
-        userId,
-        id,
-        false,
-      );
-      if (!hasAccess) {
-        return null;
-      }
+    if (!(await AgentModel.callerCanAccess(id, userId, isAgentAdmin))) {
+      return null;
     }
 
     const rows = await db
@@ -1185,7 +3916,270 @@ class AgentModel {
         schema.toolsTable,
         eq(schema.agentToolsTable.toolId, schema.toolsTable.id),
       )
-      .where(eq(schema.agentsTable.id, id));
+      .where(
+        and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)),
+      );
+
+    if (rows.length === 0) {
+      return null;
+    }
+
+    const agent = rows[0].agents;
+    const assignedTools = rows
+      .map((row) => row.tools)
+      .filter((tool): tool is NonNullable<typeof tool> => tool !== null);
+    const tools = userId
+      ? await dropHiddenTools(assignedTools, {
+          userId,
+          organizationId: agent.organizationId,
+        })
+      : assignedTools;
+
+    const [teams, labels, knowledgeBaseIds, connectorIds] = await Promise.all([
+      AgentTeamModel.getTeamDetailsForAgent(id),
+      AgentLabelModel.getLabelsForAgent(id),
+      AgentKnowledgeBaseModel.getKnowledgeBaseIds(id),
+      AgentConnectorAssignmentModel.getConnectorIds(id),
+    ]);
+
+    const result: Agent = {
+      ...agent,
+      tools,
+      teams,
+      users: await AgentUserModel.getUserDetailsForAgents([agent.id]).then(
+        (map) => map.get(agent.id) ?? [],
+      ),
+      labels,
+      knowledgeBaseIds,
+      connectorIds,
+      suggestedPrompts: [],
+    };
+
+    await Promise.all([
+      AgentModel.populateGrantedScope([result]),
+      AgentModel.populateAuthorNames([result]),
+      AgentModel.populateSuggestedPrompts([result]),
+      AgentModel.populateResolvedLlm([result]),
+      AgentModel.populateSandboxAvailability([result], userId),
+    ]);
+    AgentModel.filterUnavailableKnowledgeTools([result]);
+
+    return result;
+  }
+
+  /**
+   * Hot-path agent lookup for the MCP gateway: the raw agents row plus labels,
+   * skipping the tools join and the team/knowledge/connector/author/prompt/
+   * resolved-LLM hydration {@link findById} performs. The gateway loads the
+   * agent on every JSON-RPC request only for scalar config (agent type, tool
+   * exposure, passthrough headers, identity provider) and trace-span labels,
+   * so configuration and labels are loaded together in one statement.
+   */
+  static async findGatewayAgentById(id: string): Promise<GatewayAgent | null> {
+    return readConfig(`gateway-agent\0${id}`, async () => {
+      const [agent] = await AgentModel.gatewayById.get().execute({ id });
+      return agent ?? null;
+    });
+  }
+
+  /**
+   * The organization's LLM Proxy — the single `llm_proxy` row every proxy
+   * request in the organization resolves to. Lean shape for the proxy hot
+   * path (raw row plus labels, like {@link findGatewayAgentById}). Creates
+   * the row on first use; creation is race-safe via the partial unique index
+   * `agents_org_default_llm_proxy_idx`.
+   */
+  static async getOrgLlmProxy(organizationId: string): Promise<GatewayAgent> {
+    const existing = await AgentModel.findOrgLlmProxyRow(organizationId);
+    if (existing) {
+      return existing;
+    }
+
+    await db
+      .insert(schema.agentsTable)
+      .values(
+        await CreatedByModel.forInsert({
+          data: {
+            organizationId,
+            name: DEFAULT_LLM_PROXY_NAME,
+            agentType: "llm_proxy",
+            isDefault: true,
+            scope: "org",
+          },
+          userIdField: "authorId",
+        }),
+      )
+      .onConflictDoNothing({
+        target: [schema.agentsTable.organizationId],
+        where: sql`${schema.agentsTable.agentType} = 'llm_proxy' AND ${schema.agentsTable.isDefault} = true AND ${schema.agentsTable.deletedAt} IS NULL`,
+      });
+
+    const row = await AgentModel.findOrgLlmProxyRow(organizationId);
+    if (!row) {
+      throw new Error(
+        `Failed to ensure the LLM Proxy for organization ${organizationId}`,
+      );
+    }
+    return row;
+  }
+
+  /**
+   * Each organization's elected LLM Proxy, keyed by organization id.
+   *
+   * Read-only, unlike {@link getOrgLlmProxy}: reporting paths look at history
+   * for organizations they do not otherwise touch, and must not mint a proxy
+   * row as a side effect of being read. Organizations without one are simply
+   * absent from the map.
+   */
+  static async findOrgLlmProxies(
+    organizationIds: string[],
+  ): Promise<Map<string, { id: string; name: string }>> {
+    if (organizationIds.length === 0) {
+      return new Map();
+    }
+
+    const rows = await db
+      .select({
+        organizationId: schema.agentsTable.organizationId,
+        id: schema.agentsTable.id,
+        name: schema.agentsTable.name,
+      })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          inArray(schema.agentsTable.organizationId, organizationIds),
+          eq(schema.agentsTable.agentType, "llm_proxy"),
+          eq(schema.agentsTable.isDefault, true),
+          notDeleted(schema.agentsTable),
+        ),
+      );
+
+    return new Map(
+      rows.map((row) => [row.organizationId, { id: row.id, name: row.name }]),
+    );
+  }
+
+  private static async findOrgLlmProxyRow(organizationId: string) {
+    const [row] = await AgentModel.organizationProxy
+      .get()
+      .execute({ organizationId });
+    return row ?? null;
+  }
+
+  /**
+   * The deployment's LLM Proxy for proxy requests that carry no organization
+   * context (an id-less proxy URL): the first organization's proxy. Null only
+   * when no organization exists yet.
+   */
+  static async getDeploymentLlmProxy(): Promise<GatewayAgent | null> {
+    const [existing] = await AgentModel.deploymentProxy.get().execute();
+    if (existing) return existing;
+
+    const [firstOrg] = await AgentModel.firstOrganization.get().execute();
+    if (!firstOrg) {
+      return null;
+    }
+    return AgentModel.getOrgLlmProxy(firstOrg.id);
+  }
+
+  /** Ensures every organization has its LLM Proxy row. Runs at startup. */
+  static async ensureLlmProxiesForAllOrganizations(): Promise<void> {
+    const orgs = await db
+      .select({ id: schema.organizationsTable.id })
+      .from(schema.organizationsTable);
+    for (const org of orgs) {
+      await AgentModel.getOrgLlmProxy(org.id);
+    }
+  }
+
+  /**
+   * Updates the LLM Proxy's identity provider (JWT/JWKS authentication for
+   * proxy requests). Returns the updated proxy.
+   */
+  static async setOrgLlmProxyIdentityProvider(params: {
+    organizationId: string;
+    identityProviderId: string | null;
+  }): Promise<GatewayAgent> {
+    const proxy = await AgentModel.getOrgLlmProxy(params.organizationId);
+    await db
+      .update(schema.agentsTable)
+      .set({ identityProviderId: params.identityProviderId })
+      .where(eq(schema.agentsTable.id, proxy.id));
+    return { ...proxy, identityProviderId: params.identityProviderId };
+  }
+
+  /**
+   * Audit snapshot of the LLM Proxy. Keyed by organization: the audit
+   * registry resolves the `/api/llm-proxy` route through organization
+   * context, not a route param.
+   */
+  static async findOrgLlmProxyForAudit(
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const row = await AgentModel.findOrgLlmProxyRow(organizationId);
+    if (!row) return null;
+    return { id: row.id, identityProviderId: row.identityProviderId };
+  }
+
+  /**
+   * Minimal agent lookup for opening a conversation: the SAME access gate as
+   * {@link findById}, but selecting only the LLM-selection fields that path uses
+   * (`llmApiKeyId`, `modelId`). Skips the tool join and the
+   * team/label/knowledge/connector/author/prompt/resolved-LLM hydration that
+   * dominate `findById`'s cost and are unused when creating a conversation.
+   */
+  static async findLlmSelectionFieldsById(
+    id: string,
+    userId?: string,
+    isAgentAdmin?: boolean,
+  ): Promise<{
+    llmApiKeyId: string | null;
+    modelId: string | null;
+    modelPoolId: string | null;
+    autoRouterId: string | null;
+    runtime: Agent["runtime"];
+  } | null> {
+    if (!(await AgentModel.callerCanAccess(id, userId, isAgentAdmin))) {
+      return null;
+    }
+
+    const rows = await db
+      .select({
+        llmApiKeyId: schema.agentsTable.llmApiKeyId,
+        modelId: schema.agentsTable.modelId,
+        modelPoolId: schema.agentsTable.modelPoolId,
+        autoRouterId: schema.agentsTable.autoRouterId,
+        runtime: schema.agentsTable.runtime,
+      })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    return rows[0] ?? null;
+  }
+
+  static async findDeletedByIdForOrganization(
+    id: string,
+    organizationId: string,
+  ): Promise<Agent | null> {
+    const rows = await db
+      .select()
+      .from(schema.agentsTable)
+      .leftJoin(
+        schema.agentToolsTable,
+        eq(schema.agentsTable.id, schema.agentToolsTable.agentId),
+      )
+      .leftJoin(
+        schema.toolsTable,
+        eq(schema.agentToolsTable.toolId, schema.toolsTable.id),
+      )
+      .where(
+        and(
+          eq(schema.agentsTable.id, id),
+          eq(schema.agentsTable.organizationId, organizationId),
+          isNotNull(schema.agentsTable.deletedAt),
+        ),
+      );
 
     if (rows.length === 0) {
       return null;
@@ -1207,6 +4201,9 @@ class AgentModel {
       ...agent,
       tools,
       teams,
+      users: await AgentUserModel.getUserDetailsForAgents([agent.id]).then(
+        (map) => map.get(agent.id) ?? [],
+      ),
       labels,
       knowledgeBaseIds,
       connectorIds,
@@ -1214,153 +4211,219 @@ class AgentModel {
     };
 
     await Promise.all([
+      AgentModel.populateGrantedScope([result]),
       AgentModel.populateAuthorNames([result]),
       AgentModel.populateSuggestedPrompts([result]),
+      AgentModel.populateResolvedLlm([result]),
     ]);
-    AgentModel.filterUnavailableKnowledgeTools([result]);
 
     return result;
-  }
-
-  static async getLLMProxyOrCreateDefault(
-    organizationId?: string,
-  ): Promise<Agent> {
-    return AgentModel.getOrCreateDefaultByType(
-      "llm_proxy",
-      DEFAULT_LLM_PROXY_NAME,
-      organizationId,
-    );
   }
 
   /**
-   * Get the default profile (agentType: "profile" with isDefault: true).
-   * Returns null if no default profile exists.
-   * It's needed for backward compatibility with default profile which allowed llm proxy on without a uuid specified in the url.
+   * The org's default agent of a given type (`isDefault = true`), if one exists.
+   * Used as the implicit fallback when a caller cannot pick an agent — e.g. a
+   * user without `agent:read` creating a scheduled task. Returns id-level
+   * metadata only; null when the org has no default of that type.
    */
-  static async getDefaultProfile(): Promise<Agent | null> {
-    const rows = await db
-      .select()
+  static async findDefaultByType(params: {
+    organizationId: string;
+    agentType: AgentType;
+  }): Promise<{ id: string; agentType: AgentType } | null> {
+    const [row] = await db
+      .select({
+        id: schema.agentsTable.id,
+        agentType: schema.agentsTable.agentType,
+      })
       .from(schema.agentsTable)
-      .leftJoin(
-        schema.agentToolsTable,
-        eq(schema.agentsTable.id, schema.agentToolsTable.agentId),
-      )
-      .leftJoin(
-        schema.toolsTable,
-        eq(schema.agentToolsTable.toolId, schema.toolsTable.id),
-      )
       .where(
         and(
+          eq(schema.agentsTable.organizationId, params.organizationId),
+          eq(schema.agentsTable.agentType, params.agentType),
           eq(schema.agentsTable.isDefault, true),
-          eq(schema.agentsTable.agentType, "profile"),
+          notDeleted(schema.agentsTable),
         ),
-      );
-
-    if (rows.length === 0) {
-      return null;
-    }
-
-    const agent = rows[0].agents;
-    const tools = rows
-      .map((row) => row.tools)
-      .filter((tool): tool is NonNullable<typeof tool> => tool !== null);
-
-    const result: Agent = {
-      ...agent,
-      tools,
-      teams: await AgentTeamModel.getTeamDetailsForAgent(agent.id),
-      labels: await AgentLabelModel.getLabelsForAgent(agent.id),
-      knowledgeBaseIds: await AgentKnowledgeBaseModel.getKnowledgeBaseIds(
-        agent.id,
-      ),
-      connectorIds: await AgentConnectorAssignmentModel.getConnectorIds(
-        agent.id,
-      ),
-      suggestedPrompts: [],
-    };
-    AgentModel.filterUnavailableKnowledgeTools([result]);
-
-    return result;
+      )
+      .limit(1);
+    return row ?? null;
   }
 
-  private static async getOrCreateDefaultByType(
-    agentType: "llm_proxy",
-    defaultName: string,
-    organizationId?: string,
-  ): Promise<Agent> {
-    // First, try to find an agent with isDefault=true and matching agentType
-    const rows = await db
-      .select()
+  /**
+   * A project's `default_agent_id` as a candidate: a live, non-built-in chat
+   * agent in the given organization, with the `scope` its caller needs to judge
+   * whether the project's audience can reach it (`projectService`).
+   *
+   * Callers run this on read as well as write — agents soft-delete, so the FK's
+   * SET NULL never fires and a pin outlives its target.
+   */
+  static async findPinnableProjectDefault(params: {
+    id: string;
+    organizationId: string;
+  }): Promise<{ id: string; name: string; scope: AgentScope } | null> {
+    const [row] = await db
+      .select({
+        id: schema.agentsTable.id,
+        name: schema.agentsTable.name,
+        scope: schema.agentsTable.scope,
+      })
       .from(schema.agentsTable)
-      .leftJoin(
-        schema.agentToolsTable,
-        eq(schema.agentsTable.id, schema.agentToolsTable.agentId),
-      )
-      .leftJoin(
-        schema.toolsTable,
-        eq(schema.agentToolsTable.toolId, schema.toolsTable.id),
-      )
       .where(
         and(
-          eq(schema.agentsTable.isDefault, true),
-          eq(schema.agentsTable.agentType, agentType),
+          eq(schema.agentsTable.id, params.id),
+          eq(schema.agentsTable.organizationId, params.organizationId),
+          eq(schema.agentsTable.agentType, "agent"),
+          AgentModel.isRegularOrSreAgent(),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .limit(1);
+    return row ?? null;
+  }
+
+  /**
+   * Update the server-managed secret bag behind Agent Runtime.
+   * Credential values never travel through the generic Agent update body.
+   */
+  static async setAgentRuntimeSecretId(params: {
+    id: string;
+    secretId: string | null;
+  }): Promise<boolean> {
+    const updated = await db
+      .update(schema.agentsTable)
+      .set({
+        runtimeSecretId: params.secretId,
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.agentsTable.id, params.id))
+      .returning({ id: schema.agentsTable.id });
+    return updated.length > 0;
+  }
+
+  /** Change only ownership, and refuse a stale authorization snapshot. */
+  static async transferOwnership(params: {
+    id: string;
+    organizationId: string;
+    previousOwnerId: string | null;
+    updatedAt: Date;
+    ownerId: string;
+  }): Promise<boolean> {
+    const rows = await db
+      .update(schema.agentsTable)
+      .set({
+        authorId: params.ownerId,
+        createdByServiceAccountId: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(schema.agentsTable.id, params.id),
+          eq(schema.agentsTable.organizationId, params.organizationId),
+          params.previousOwnerId === null
+            ? isNull(schema.agentsTable.authorId)
+            : eq(schema.agentsTable.authorId, params.previousOwnerId),
+          // PostgreSQL defaults can carry sub-millisecond precision; JS Date cannot.
+          sql`date_trunc('milliseconds', ${schema.agentsTable.updatedAt}) = ${params.updatedAt.toISOString()}::timestamp`,
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .returning({ id: schema.agentsTable.id });
+    return rows.length === 1;
+  }
+
+  /** How many of the organization's agents name `name` as their default or scaleup tier. */
+  static async countRuntimeTierReferences(params: {
+    organizationId: string;
+    name: string;
+  }): Promise<number> {
+    const table = schema.agentsTable;
+    const [row] = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(table)
+      .where(
+        and(
+          eq(table.organizationId, params.organizationId),
+          sql`(lower(${table.runtime}->>'tier') = lower(${params.name}) or lower(${table.runtime}->>'maxTier') = lower(${params.name}))`,
         ),
       );
+    return row?.count ?? 0;
+  }
 
-    if (rows.length > 0) {
-      // Default agent exists, return it
-      const agent = rows[0].agents;
-      const tools = rows
-        .map((row) => row.tools)
-        .filter((tool): tool is NonNullable<typeof tool> => tool !== null);
-
-      return {
-        ...agent,
-        tools,
-        teams: await AgentTeamModel.getTeamDetailsForAgent(agent.id),
-        labels: await AgentLabelModel.getLabelsForAgent(agent.id),
-        knowledgeBaseIds: await AgentKnowledgeBaseModel.getKnowledgeBaseIds(
-          agent.id,
+  /**
+   * Follow tier renames on every agent of the organization that names one of
+   * them. The whole mapping applies to each stored name once, so a save that
+   * renames S to M and M to Medium leaves the former S agents on M.
+   */
+  static async renameRuntimeTiers(params: {
+    organizationId: string;
+    renames: readonly { from: string; to: string }[];
+    tx?: Transaction;
+  }): Promise<void> {
+    if (params.renames.length === 0) return;
+    const table = schema.agentsTable;
+    const from = params.renames.map((rename) => rename.from.toLowerCase());
+    for (const field of ["tier", "maxTier"] as const) {
+      const stored = sql`lower(${table.runtime}->>${field})`;
+      const mapped = sql.join(
+        params.renames.map(
+          (rename) => sql`when ${rename.from.toLowerCase()} then ${rename.to}`,
         ),
-        connectorIds: await AgentConnectorAssignmentModel.getConnectorIds(
-          agent.id,
-        ),
-        suggestedPrompts: [],
-      };
+        sql` `,
+      );
+      await (params.tx ?? db)
+        .update(table)
+        .set({
+          runtime: sql`jsonb_set(${table.runtime}, ${sql.raw(`'{${field}}'`)}, to_jsonb(coalesce((case ${stored} ${mapped} end), ${table.runtime}->>${field})::text))`,
+        })
+        .where(
+          and(
+            eq(table.organizationId, params.organizationId),
+            sql`${stored} in (${sql.join(
+              from.map((name) => sql`${name}`),
+              sql`, `,
+            )})`,
+          ),
+        );
     }
-
-    // No default agent exists, create one
-    // If organizationId not provided, use first organization
-    let orgId = organizationId;
-    if (!orgId) {
-      const [firstOrg] = await db
-        .select({ id: schema.organizationsTable.id })
-        .from(schema.organizationsTable)
-        .limit(1);
-      orgId = firstOrg?.id;
-    }
-
-    return AgentModel.create({
-      name: defaultName,
-      agentType,
-      isDefault: true,
-      organizationId: orgId || "",
-      scope: "org",
-      teams: [],
-      labels: [],
-    });
   }
 
   static async update(
     id: string,
     {
       teams,
+      users,
       labels,
       knowledgeBaseIds,
       connectorIds,
       suggestedPrompts,
       ...agent
-    }: Partial<UpdateAgent>,
+    }: Partial<UpdateAgent> & {
+      /**
+       * Retired sharing columns. No longer reachable from a request body —
+       * access lives in the resource permission policy — but still written by
+       * the bulk visibility route and by seeding/migration callers.
+       */
+      scope?: AgentScope;
+      teams?: string[];
+      users?: string[];
+    },
+    options?: {
+      /**
+       * Skip the off→on All-tools exclusion pre-fill. Used by clone, which
+       * copies the source's exclusion rows verbatim and must not have the
+       * additive pre-fill re-add built-ins the source had un-excluded.
+       */
+      skipExclusionPrefill?: boolean;
+      /**
+       * Skip this update's config version fork. Set by callers that replay
+       * several writes as one user action and fork once at the end (see
+       * `restoreAgentVersion`) — one action should produce one version.
+       *
+       * The returned agent's `latestVersion` is then whatever the head was
+       * BEFORE the caller's own closing fork, so a caller that surfaces it
+       * must re-read the agent afterwards.
+       */
+      deferVersionFork?: boolean;
+    },
   ): Promise<Agent | null> {
     let updatedAgent:
       | Omit<
@@ -1378,10 +4441,27 @@ class AgentModel {
     const [existingAgent] = await db
       .select()
       .from(schema.agentsTable)
-      .where(eq(schema.agentsTable.id, id));
+      .where(
+        and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)),
+      );
 
     if (!existingAgent) {
       return null;
+    }
+
+    // Keep the all-tools ⇒ progressive-loading invariant on every update path:
+    // if the agent's effective accessAllTools is on, force search_and_run_only.
+    // Only mutate when there is an actual inconsistency to fix, so unrelated
+    // updates don't spuriously rewrite the exposure mode.
+    const effectiveAccessAllTools =
+      agent.accessAllTools ?? existingAgent.accessAllTools;
+    const effectiveToolExposureMode =
+      agent.toolExposureMode ?? existingAgent.toolExposureMode;
+    if (
+      effectiveAccessAllTools &&
+      effectiveToolExposureMode !== "search_and_run_only"
+    ) {
+      agent.toolExposureMode = "search_and_run_only";
     }
 
     // If setting isDefault to true, unset isDefault for other agents of the same type
@@ -1393,17 +4473,46 @@ class AgentModel {
           and(
             eq(schema.agentsTable.isDefault, true),
             eq(schema.agentsTable.agentType, existingAgent.agentType),
+            notDeleted(schema.agentsTable),
           ),
         );
     }
 
+    // Switching accessAllTools off→on pre-fills the agent's exclusion list
+    // with every unassigned built-in tool outside the exempt set. Flip and
+    // pre-fill commit in ONE transaction (serialized by the same row lock the
+    // exclusions full-replace takes) so the agent can never sit in Auto mode
+    // without its pre-fill; every off→on switch re-runs it (additively).
+    // on→on or →off updates never touch the exclusion rows.
+    const prefillsExclusions =
+      agent.accessAllTools === true &&
+      !existingAgent.accessAllTools &&
+      !options?.skipExclusionPrefill;
+
     // Only update agent table if there are fields to update
     if (Object.keys(agent).length > 0) {
-      const [row] = await db
-        .update(schema.agentsTable)
-        .set(agent)
-        .where(eq(schema.agentsTable.id, id))
-        .returning();
+      const updateWhere = and(
+        eq(schema.agentsTable.id, id),
+        notDeleted(schema.agentsTable),
+      );
+      const [row] = prefillsExclusions
+        ? await withDbTransaction(async (tx) => {
+            await AgentModel.lockRowForUpdate(id, tx);
+            const rows = await tx
+              .update(schema.agentsTable)
+              .set(agent)
+              .where(updateWhere)
+              .returning();
+            if (rows.length > 0) {
+              await AgentExcludedToolModel.prefillForAllToolsMode(id, tx);
+            }
+            return rows;
+          })
+        : await db
+            .update(schema.agentsTable)
+            .set(agent)
+            .where(updateWhere)
+            .returning();
 
       if (!row) {
         return null;
@@ -1417,8 +4526,21 @@ class AgentModel {
         // Invalidate tool cache for all parent agents so they pick up the new tool name
         const parentAgentIds = await ToolModel.getParentAgentIds(id);
         for (const parentAgentId of parentAgentIds) {
-          clearChatMcpClient(parentAgentId);
+          agentToolSurfaceChanged(parentAgentId);
         }
+      }
+
+      // The advertised tool surface depends on toolExposureMode (full vs the
+      // search_tools/run_tool dispatch surface) and accessAllTools. A cached
+      // chat MCP client freezes that surface at connection-build time, so a
+      // change here must evict the client — otherwise switching an agent to
+      // "all tools" / search_and_run_only doesn't expose run_tool/search_tools
+      // until the connection is rebuilt for some unrelated reason.
+      if (
+        updatedAgent.toolExposureMode !== existingAgent.toolExposureMode ||
+        updatedAgent.accessAllTools !== existingAgent.accessAllTools
+      ) {
+        agentToolSurfaceChanged(id);
       }
     } else {
       updatedAgent = existingAgent;
@@ -1429,30 +4551,14 @@ class AgentModel {
       await AgentTeamModel.syncAgentTeams(id, teams);
     }
 
+    // Sync individual grants; `[]` revokes them all, omitted leaves them alone.
+    if (users !== undefined) {
+      await AgentUserModel.syncAgentUsers(id, users);
+    }
+
     // Sync label assignments if labels is provided
     if (labels !== undefined) {
       await AgentLabelModel.syncAgentLabels(id, labels);
-    }
-
-    // Assign or unassign tools according to toolAssignmentMode changes for agents and MCP gateways
-    const supportsAutomaticToolAssignment = isAutomaticToolAssignmentSupported(
-      updatedAgent.agentType,
-    );
-    const labelsChanged = labels !== undefined;
-    const isCurrentlyAutomatic =
-      updatedAgent.toolAssignmentMode === "automatic";
-    const isPreviouslyAutomatic =
-      existingAgent.toolAssignmentMode === "automatic";
-    const isSwitchingToAutomatic =
-      isCurrentlyAutomatic && !isPreviouslyAutomatic;
-    const isSwitchingToManual = !isCurrentlyAutomatic && isPreviouslyAutomatic;
-
-    if (supportsAutomaticToolAssignment) {
-      if ((isCurrentlyAutomatic && labelsChanged) || isSwitchingToAutomatic) {
-        await AgentToolModel.syncAgentToolsFromLabels(id);
-      } else if (isSwitchingToManual) {
-        await AgentToolModel.deleteCatalogToolsForAgent(id);
-      }
     }
 
     // Sync knowledge base assignments if knowledgeBaseIds is provided
@@ -1467,7 +4573,22 @@ class AgentModel {
 
     // Sync suggested prompts if provided
     if (suggestedPrompts !== undefined) {
-      await AgentSuggestedPromptModel.syncForAgent(id, suggestedPrompts);
+      await AgentSuggestedPromptModel.syncForAgent({
+        agentId: id,
+        prompts: suggestedPrompts,
+      });
+    }
+
+    // Any write above may have changed the canonical config — fork a version
+    // if so. Deliberately after the junction syncs (the snapshot must capture
+    // this mutation's final state), and unconditionally: a relational-only
+    // update skips the agents-row write yet still changes config. Best-effort:
+    // a versioning failure must never fail the update itself.
+    if (!options?.deferVersionFork) {
+      const fork = await AgentVersionModel.forkIfChangedBestEffort(id);
+      if (fork && updatedAgent) {
+        updatedAgent.latestVersion = fork.version;
+      }
     }
 
     const [
@@ -1488,7 +4609,7 @@ class AgentModel {
 
     if (!updatedAgent) return null;
 
-    return {
+    const result = {
       ...updatedAgent,
       tools: toolRows,
       teams: currentTeams,
@@ -1497,6 +4618,8 @@ class AgentModel {
       connectorIds: currentConnectorIds,
       suggestedPrompts: currentSuggestedPrompts.get(id) ?? [],
     };
+    await AgentModel.populateGrantedScope([result]);
+    return result;
   }
 
   /**
@@ -1510,6 +4633,7 @@ class AgentModel {
   ): Promise<Agent | null> {
     const conditions: SQL[] = [
       sql`${schema.agentsTable.builtInAgentConfig}->>'name' = ${builtInName}`,
+      notDeleted(schema.agentsTable),
     ];
     if (organizationId) {
       conditions.push(eq(schema.agentsTable.organizationId, organizationId));
@@ -1529,7 +4653,7 @@ class AgentModel {
     ]);
 
     const toolRows = await db
-      .select({ tool: schema.toolsTable })
+      .select({ tool: agentToolRefColumns })
       .from(schema.agentToolsTable)
       .innerJoin(
         schema.toolsTable,
@@ -1550,12 +4674,188 @@ class AgentModel {
     };
   }
 
-  static async delete(id: string): Promise<boolean> {
-    const rows = await db
-      .delete(schema.agentsTable)
-      .where(eq(schema.agentsTable.id, id))
-      .returning({ id: schema.agentsTable.id });
-    return rows.length > 0;
+  static async delete(id: string, tx?: Transaction): Promise<boolean> {
+    const count = await softDelete(
+      tx ?? db,
+      schema.agentsTable,
+      eq(schema.agentsTable.id, id),
+    );
+    return count > 0;
+  }
+
+  static async restore(id: string, tx?: Transaction): Promise<boolean> {
+    const count = await restore(
+      tx ?? db,
+      schema.agentsTable,
+      eq(schema.agentsTable.id, id),
+    );
+    return count > 0;
+  }
+
+  static async getRestoreConflictMessage(agent: Agent): Promise<string | null> {
+    if (agent.slug) {
+      const [slugConflict] = await db
+        .select({ id: schema.agentsTable.id })
+        .from(schema.agentsTable)
+        .where(
+          and(
+            eq(schema.agentsTable.slug, agent.slug),
+            ne(schema.agentsTable.id, agent.id),
+            notDeleted(schema.agentsTable),
+          ),
+        )
+        .limit(1);
+
+      if (slugConflict) {
+        return `Cannot restore because another active ${getAgentTypeLabel(agent.agentType)} is already using this name.`;
+      }
+    }
+
+    if (
+      agent.agentType === "mcp_gateway" &&
+      agent.isPersonalGateway &&
+      agent.authorId
+    ) {
+      const [personalGatewayConflict] = await db
+        .select({ id: schema.agentsTable.id })
+        .from(schema.agentsTable)
+        .where(
+          and(
+            eq(schema.agentsTable.organizationId, agent.organizationId),
+            eq(schema.agentsTable.authorId, agent.authorId),
+            eq(schema.agentsTable.agentType, "mcp_gateway"),
+            eq(schema.agentsTable.isPersonalGateway, true),
+            ne(schema.agentsTable.id, agent.id),
+            notDeleted(schema.agentsTable),
+          ),
+        )
+        .limit(1);
+
+      if (personalGatewayConflict) {
+        return "Cannot restore because this user already has an active personal MCP gateway.";
+      }
+    }
+
+    if (agent.isDefault) {
+      const [defaultConflict] = await db
+        .select({ id: schema.agentsTable.id })
+        .from(schema.agentsTable)
+        .where(
+          and(
+            eq(schema.agentsTable.organizationId, agent.organizationId),
+            eq(schema.agentsTable.agentType, agent.agentType),
+            eq(schema.agentsTable.isDefault, true),
+            ne(schema.agentsTable.id, agent.id),
+            notDeleted(schema.agentsTable),
+          ),
+        )
+        .limit(1);
+
+      if (defaultConflict) {
+        return `Cannot restore because another active default ${getAgentTypeLabel(agent.agentType)} already exists.`;
+      }
+    }
+
+    return null;
+  }
+
+  static async hardDelete(id: string, tx?: Transaction): Promise<boolean> {
+    const run = async (transaction: Transaction) => {
+      await InteractionUserActivityModel.lifecycleFence(transaction);
+      const count = await hardDelete(
+        transaction,
+        schema.agentsTable,
+        eq(schema.agentsTable.id, id),
+      );
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      if (count > 0)
+        await ResourcePermissionPolicyModel.deleteForTarget({
+          tx: transaction,
+          resources: ["agent", "mcpGateway"],
+          scope: id,
+        });
+      // SPDX-SnippetEnd
+      return count > 0;
+    };
+    return tx ? run(tx) : withDbTransaction(run);
+  }
+
+  /**
+   * Permanently destroy a soft-deleted agent. Irreversible.
+   *
+   * Everything the agent owns goes by cascade: versions, tool assignments and
+   * exclusions, team/user grants, labels, knowledge bases, connector
+   * assignments, suggested prompts, hook files, scheduled triggers and their
+   * runs, chatops bindings, connection setups, and gateway tasks. Its history
+   * SURVIVES, detached: conversations, interactions, MCP tool calls, and A2A
+   * tasks all have `ON DELETE SET NULL` on their agent column. The org, member,
+   * and /connection defaults clear themselves the same way — those foreign keys
+   * exist in the database even though Drizzle cannot declare them (they would
+   * make organization → agent → organization circular).
+   *
+   * ## Why the statement timeout is raised, and why only to five minutes
+   *
+   * `interactions.profile_id` is one of those `SET NULL` columns, and a busy
+   * LLM proxy owns millions of rows there. Postgres performs that rewrite
+   * INSIDE the DELETE statement, so the pool-wide 30s `statement_timeout`
+   * applies to the whole cascade and would abort — identically on every retry,
+   * making a large proxy permanently un-purgeable. `SET LOCAL` scopes the
+   * change to this transaction and reverts on commit, so no other query loses
+   * its safety net.
+   *
+   * There is also a floor cost independent of the agent's size:
+   * `conversations.agent_id` and `tools.agent_id` carry no index, so each
+   * constraint is enforced with a sequential scan of its table. Indexing them
+   * to speed up a rare admin action would tax every insert into those tables
+   * forever, which is not a trade worth making.
+   *
+   * Five minutes rather than no limit at all. The transaction is long by
+   * design: it blocks no proxy traffic — interactions are insert-only, and this
+   * touches existing rows — but it holds back vacuum cleanup database-wide
+   * while it runs and pins a pool connection, so it needs an end. Postgres
+   * counts lock waits toward `statement_timeout`, so this bounds a purge stuck
+   * behind someone else's lock too, and no separate `lock_timeout` is needed. A
+   * purge that genuinely needs longer fails with SQLSTATE 57014 and leaves the
+   * agent in the trash, unharmed — the whole thing is one transaction, so an
+   * interruption discards all of its progress rather than half-purging. That
+   * revives the un-purgeable-proxy problem above for the very largest agents;
+   * raise this deliberately if one ever shows up, rather than removing it.
+   *
+   * Returns false when there was no soft-deleted row to take, which is how a
+   * restore that won the race reports itself.
+   */
+  static async purge(id: string, organizationId: string): Promise<boolean> {
+    return withDbTransaction(async (tx) => {
+      await InteractionUserActivityModel.lifecycleFence(tx);
+      // `sql.raw`, not an interpolated value: SET is a utility command and
+      // takes no bind parameters, so `= $1` is a syntax error. The value is a
+      // module constant, never caller input.
+      await tx.execute(
+        sql.raw(`SET LOCAL statement_timeout = ${PURGE_STATEMENT_TIMEOUT_MS}`),
+      );
+
+      // The row lock is the race guard: a concurrent restore either commits
+      // first (leaving no soft-deleted row here) or blocks until this
+      // transaction commits and then finds no row at all. Restore wins, and
+      // never against a half-purged agent.
+      const [locked] = await tx
+        .select({ id: schema.agentsTable.id })
+        .from(schema.agentsTable)
+        .where(
+          and(
+            eq(schema.agentsTable.id, id),
+            eq(schema.agentsTable.organizationId, organizationId),
+            isNotNull(schema.agentsTable.deletedAt),
+          ),
+        )
+        .for("update")
+        .limit(1);
+      if (!locked) return false;
+
+      return AgentModel.hardDelete(id, tx);
+    });
   }
 
   /** Check if an agent has any Playwright tools assigned via agent_tools. */
@@ -1577,22 +4877,70 @@ class AgentModel {
     return rows.length > 0;
   }
 
+  /** Startup candidates only: existing live personal agents need no repair. */
+  static async findMembersMissingPersonalChatAgents() {
+    return db
+      .select({
+        userId: schema.membersTable.userId,
+        organizationId: schema.membersTable.organizationId,
+      })
+      .from(schema.membersTable)
+      .where(
+        and(
+          isNull(schema.membersTable.defaultAgentId),
+          not(
+            exists(
+              db
+                .select({ id: schema.agentsTable.id })
+                .from(schema.agentsTable)
+                .where(
+                  and(
+                    ...personalChatAgentConditions({
+                      userId: schema.membersTable.userId,
+                      organizationId: schema.membersTable.organizationId,
+                    }),
+                    notDeleted(schema.agentsTable),
+                  ),
+                ),
+            ),
+          ),
+        ),
+      );
+  }
+
   /**
-   * Ensure a personal default chat agent exists for a member.
-   * Idempotent: skips if member already has a defaultAgentId set.
+   * Ensure a personal chat agent exists for a member, and return the one they
+   * should chat with — their oldest live personal chat agent.
+   *
+   * Idempotent, and deliberately keyed on authorship alone: having *ever*
+   * authored a personal chat agent in this organization is the durable marker
+   * (soft-deleted rows count), so deleting the seeded assistant does not bring
+   * it straight back on the next login, app chat, or backend start. It must not
+   * key on `members.default_agent_id`, which now records only a deliberate
+   * choice and is null for almost everyone — reading it here would re-seed an
+   * assistant per login for every member who never picked one.
+   *
+   * Returns null only for a member who authored personal chat agents and then
+   * deleted them all: seeding is skipped by design, and they have none live.
    */
   static async ensurePersonalChatAgent(params: {
     userId: string;
     organizationId: string;
-  }): Promise<void> {
+  }): Promise<string | null> {
     const { userId, organizationId } = params;
 
-    const existingDefault = await MemberModel.getDefaultAgentId(
-      userId,
-      organizationId,
-    );
-    if (existingDefault !== null) return;
+    // Live agents first: this is the common path (every login and app chat),
+    // and it answers in one indexed query.
+    const [existing] = await AgentModel.findOwnPersonalChatAgentIds(params);
+    if (existing) return existing;
+    // None live. Seed only for a member who never had one — soft-deleted rows
+    // are the durable marker that they did and chose to delete it.
+    if (await AgentModel.hasEverAuthoredPersonalChatAgent(params)) return null;
 
+    const accessAllTools =
+      await OrganizationModel.getDefaultPersonalAgentAccessAllTools(
+        organizationId,
+      );
     const agent = await AgentModel.create(
       {
         organizationId,
@@ -1600,29 +4948,88 @@ class AgentModel {
         agentType: "agent",
         scope: "personal",
         description: "Your personal chat assistant",
+        // Apply the organization default only on creation. Existing assistants
+        // returned above keep their saved mode and assignments.
+        accessAllTools,
       },
       userId,
     );
 
-    await ToolModel.assignDefaultArchestraToolsToAgent(agent.id);
-    await MemberModel.setDefaultAgent(userId, organizationId, agent.id);
+    // The default built-in tools (artifact_write, todo_write,
+    // query_knowledge_sources) are assigned inside AgentModel.create along
+    // with the rest of the creation-default set.
 
-    logger.info(
+    logger.debug(
       { userId, organizationId, agentId: agent.id },
-      "Created personal default chat agent",
+      "Created personal chat agent",
     );
+
+    return agent.id;
+  }
+
+  /**
+   * The member's personal chat agent (their oldest live one), without seeding
+   * one. Null when they have none.
+   */
+  static async findPersonalChatAgentId(params: {
+    userId: string;
+    organizationId: string;
+  }): Promise<string | null> {
+    const [id] = await AgentModel.findOwnPersonalChatAgentIds(params);
+    return id ?? null;
+  }
+
+  /**
+   * Live personal chat agents this member authored in the organization,
+   * oldest first, excluding `excludeId`.
+   */
+  private static async findOwnPersonalChatAgentIds(params: {
+    userId: string;
+    organizationId: string;
+    excludeId?: string;
+  }): Promise<string[]> {
+    const rows = await db
+      .select({ id: schema.agentsTable.id })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          ...personalChatAgentConditions(params),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      // `id` breaks a createdAt tie so "the member's own personal chat agent"
+      // is one stable answer — the same order migration 0426 used to recognise
+      // the implicitly adopted defaults it cleared.
+      .orderBy(asc(schema.agentsTable.createdAt), asc(schema.agentsTable.id));
+    return rows.map((row) => row.id);
+  }
+
+  private static async hasEverAuthoredPersonalChatAgent(params: {
+    userId: string;
+    organizationId: string;
+  }): Promise<boolean> {
+    const [row] = await db
+      .select({ id: schema.agentsTable.id })
+      .from(schema.agentsTable)
+      .where(and(...personalChatAgentConditions(params)))
+      .limit(1);
+    return row !== undefined;
   }
 
   /**
    * Returns the user's personal MCP gateway for the given organization, or null
-   * if none exists.
+   * if none exists. Read as the Agents list reads a row, so it carries the tool
+   * counts: one statement to find it, then the list's enrichment beside its
+   * tools. `includeTools: false` skips the tools statement and the sandbox
+   * check, leaving `tools` empty (not requested) and `sandboxAvailable` absent.
    */
   static async getPersonalMcpGateway(
     userId: string,
     organizationId: string,
-  ): Promise<Agent | null> {
+    options?: { includeTools?: boolean },
+  ): Promise<AgentListItem | null> {
     const [row] = await db
-      .select()
+      .select({ id: schema.agentsTable.id })
       .from(schema.agentsTable)
       .where(
         and(
@@ -1630,12 +5037,42 @@ class AgentModel {
           eq(schema.agentsTable.authorId, userId),
           eq(schema.agentsTable.agentType, "mcp_gateway"),
           eq(schema.agentsTable.isPersonalGateway, true),
+          notDeleted(schema.agentsTable),
         ),
       )
       .limit(1);
 
     if (!row) return null;
-    return (await AgentModel.findById(row.id, userId, true)) ?? null;
+    const includeTools = options?.includeTools !== false;
+    const [gateway] = await AgentModel.findEnrichedAgents({
+      agentIds: [row.id],
+      includeTools,
+      userId,
+    });
+    if (!gateway) return null;
+    if (includeTools) {
+      await AgentModel.populateSandboxAvailability([gateway], userId);
+    }
+    return gateway;
+  }
+
+  /** The author of a personal MCP gateway, or undefined if `id` is not one. */
+  static async findPersonalMcpGatewayAuthor(params: {
+    id: string;
+    organizationId: string;
+  }): Promise<{ authorId: string | null } | undefined> {
+    const [row] = await db
+      .select({ authorId: schema.agentsTable.authorId })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.id, params.id),
+          eq(schema.agentsTable.organizationId, params.organizationId),
+          eq(schema.agentsTable.isPersonalGateway, true),
+        ),
+      )
+      .limit(1);
+    return row;
   }
 
   /**
@@ -1647,15 +5084,23 @@ class AgentModel {
   static async ensurePersonalMcpGateway(params: {
     userId: string;
     organizationId: string;
-  }): Promise<Agent> {
+    /** See {@link AgentModel.getPersonalMcpGateway}. */
+    includeTools?: boolean;
+  }): Promise<AgentListItem> {
     const { userId, organizationId } = params;
+    const readOptions = { includeTools: params.includeTools };
 
     const existing = await AgentModel.getPersonalMcpGateway(
       userId,
       organizationId,
+      readOptions,
     );
     if (existing) return existing;
 
+    const accessAllTools =
+      await OrganizationModel.getDefaultPersonalAgentAccessAllTools(
+        organizationId,
+      );
     const [userRow] = await db
       .select({ name: schema.usersTable.name })
       .from(schema.usersTable)
@@ -1664,6 +5109,7 @@ class AgentModel {
     const userPart = (userRow && urlSlugify(userRow.name)) || userId;
     const slug = `my-gateway-${userPart}-${crypto.randomUUID().slice(0, 6)}`;
 
+    let lostRace: unknown;
     try {
       const gateway = await AgentModel.create(
         {
@@ -1674,16 +5120,15 @@ class AgentModel {
           scope: "personal",
           description: PERSONAL_MCP_GATEWAY_DESCRIPTION,
           isPersonalGateway: true,
+          accessAllTools,
         },
         userId,
       );
 
-      logger.info(
+      logger.debug(
         { userId, organizationId, agentId: gateway.id },
         "Created personal MCP gateway",
       );
-
-      return gateway;
     } catch (error) {
       // Lost a race against a concurrent caller — re-fetch the row that won.
       // Drizzle wraps the pg error, so use the cause-walking helper rather than
@@ -1694,14 +5139,23 @@ class AgentModel {
       ) {
         throw error;
       }
-
-      const winner = await AgentModel.getPersonalMcpGateway(
-        userId,
-        organizationId,
-      );
-      if (!winner) throw error;
-      return winner;
+      lostRace = error;
     }
+
+    // Created here or by the caller that won the race: read it the same way
+    // as an existing one.
+    const gateway = await AgentModel.getPersonalMcpGateway(
+      userId,
+      organizationId,
+      readOptions,
+    );
+    if (!gateway) {
+      throw (
+        lostRace ??
+        new Error(`Failed to read the personal MCP gateway for user ${userId}`)
+      );
+    }
+    return gateway;
   }
 
   /**
@@ -1717,11 +5171,17 @@ class AgentModel {
         userId: schema.membersTable.userId,
         organizationId: schema.membersTable.organizationId,
         userName: schema.usersTable.name,
+        accessAllTools:
+          schema.organizationsTable.defaultPersonalAgentAccessAllTools,
       })
       .from(schema.membersTable)
       .innerJoin(
         schema.usersTable,
         eq(schema.usersTable.id, schema.membersTable.userId),
+      )
+      .innerJoin(
+        schema.organizationsTable,
+        eq(schema.organizationsTable.id, schema.membersTable.organizationId),
       )
       .leftJoin(
         schema.agentsTable,
@@ -1749,21 +5209,38 @@ class AgentModel {
         agentType: "mcp_gateway" as const,
         scope: "personal" as const,
         isPersonalGateway: true,
+        // This path also creates new objects; never rewrite an existing gateway.
+        accessAllTools: m.accessAllTools,
+        toolExposureMode: "search_and_run_only" as const,
         slug: `my-gateway-${userPart}-${crypto.randomUUID().slice(0, 6)}`,
       };
     });
 
-    const inserted = await db
-      .insert(schema.agentsTable)
-      .values(rows)
-      .onConflictDoNothing({
-        target: [
-          schema.agentsTable.organizationId,
-          schema.agentsTable.authorId,
-        ],
-        where: sql`${schema.agentsTable.agentType} = 'mcp_gateway' AND ${schema.agentsTable.isPersonalGateway} = true`,
-      })
-      .returning({ id: schema.agentsTable.id });
+    const inserted = await withDbTransaction(async (tx) => {
+      const insertedRows = await tx
+        .insert(schema.agentsTable)
+        .values(rows)
+        .onConflictDoNothing({
+          target: [
+            schema.agentsTable.organizationId,
+            schema.agentsTable.authorId,
+          ],
+          where: sql`${schema.agentsTable.agentType} = 'mcp_gateway' AND ${schema.agentsTable.isPersonalGateway} = true AND ${schema.agentsTable.deletedAt} IS NULL`,
+        })
+        .returning({
+          id: schema.agentsTable.id,
+          accessAllTools: schema.agentsTable.accessAllTools,
+        });
+
+      // Only All-mode gateways need the exclusion pre-fill. Keep it atomic
+      // with their insert, as in the ordinary create path.
+      await AgentExcludedToolModel.prefillManyForAllToolsMode(
+        insertedRows.filter((row) => row.accessAllTools).map((row) => row.id),
+        tx,
+      );
+
+      return insertedRows;
+    });
 
     if (inserted.length < missing.length) {
       logger.warn(
@@ -1783,16 +5260,73 @@ class AgentModel {
    * without this the personal gateway row would orphan with author_id = NULL
    * and become permanently undeletable through the API guard.
    */
-  static async deletePersonalMcpGatewaysForUser(userId: string): Promise<void> {
-    await db
-      .delete(schema.agentsTable)
-      .where(
-        and(
-          eq(schema.agentsTable.authorId, userId),
-          eq(schema.agentsTable.agentType, "mcp_gateway"),
-          eq(schema.agentsTable.isPersonalGateway, true),
+  static async deletePersonalMcpGatewaysForUser(
+    userId: string,
+    tx?: Transaction,
+  ): Promise<void> {
+    await softDelete(
+      tx ?? db,
+      schema.agentsTable,
+      and(
+        eq(schema.agentsTable.authorId, userId),
+        eq(schema.agentsTable.agentType, "mcp_gateway"),
+        eq(schema.agentsTable.isPersonalGateway, true),
+      ),
+    );
+  }
+
+  /**
+   * Soft-delete an author's private chat agents and MCP gateways when their
+   * membership ends. Left behind, `agents.author_id` is `set null` and the row
+   * shows as "Owner unavailable" with no one to use it.
+   */
+  static async deletePersonalAgentsForUser(params: {
+    userId: string;
+    organizationId?: string;
+    tx?: Transaction;
+  }): Promise<number> {
+    const table = schema.agentsTable;
+    return await softDelete(
+      params.tx ?? db,
+      table,
+      and(
+        eq(table.authorId, params.userId),
+        params.organizationId
+          ? eq(table.organizationId, params.organizationId)
+          : undefined,
+        or(
+          and(
+            eq(table.agentType, "agent"),
+            // SPDX-SnippetBegin
+            // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+            // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+            ResourcePermissionPolicyModel.reachesOnlyOwner({
+              organizationId: table.organizationId,
+              resource: "agent",
+              scopeColumn: table.id,
+              ownerColumn: table.authorId,
+            }),
+            // SPDX-SnippetEnd
+          ),
+          and(
+            eq(table.agentType, "mcp_gateway"),
+            // The auto-created personal gateway has its own lifecycle:
+            // deletePersonalMcpGatewaysForUser.
+            eq(table.isPersonalGateway, false),
+            // SPDX-SnippetBegin
+            // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+            // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+            ResourcePermissionPolicyModel.reachesOnlyOwner({
+              organizationId: table.organizationId,
+              resource: "mcpGateway",
+              scopeColumn: table.id,
+              ownerColumn: table.authorId,
+            }),
+            // SPDX-SnippetEnd
+          ),
         ),
-      );
+      ),
+    );
   }
 
   /**
@@ -1800,18 +5334,72 @@ class AgentModel {
    * Checks both the id and slug columns in a single query.
    */
   static async resolveIdFromIdOrSlug(idOrSlug: string): Promise<string | null> {
+    const cached = AgentModel.resolveIdCache.get(idOrSlug);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    // `agents.id` is a uuid column. Casting it to text (`id::text = $1`) so it
+    // can be compared against a possibly-non-uuid slug defeats the primary-key
+    // index and forces a sequential scan. Instead, only compare against `id`
+    // when the input is itself a valid uuid (letting Postgres use the PK index),
+    // and otherwise rely solely on the indexed `slug` lookup.
+    const matchesIdOrSlug = isUuid(idOrSlug)
+      ? or(
+          eq(schema.agentsTable.id, idOrSlug),
+          eq(schema.agentsTable.slug, idOrSlug),
+        )
+      : eq(schema.agentsTable.slug, idOrSlug);
+
+    const [row] = await db
+      .select({ id: schema.agentsTable.id })
+      .from(schema.agentsTable)
+      .where(and(matchesIdOrSlug, notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    // Only positive results are cached: a missing mapping must become visible
+    // as soon as the agent is created, while a cached hit for a just-deleted
+    // agent fails downstream anyway.
+    if (row) {
+      AgentModel.resolveIdCache.set(idOrSlug, row.id);
+    }
+
+    return row?.id ?? null;
+  }
+
+  /**
+   * Authoritative existence check for the public connection-health endpoint:
+   * a fresh, uncached query — a just-deleted gateway must read as missing
+   * immediately, so the {@link AgentModel.resolveIdFromIdOrSlug} positive
+   * cache (whose staleness its callers tolerate by re-loading the row
+   * downstream) is deliberately not used here. Type-scoped so a proxy ref
+   * can never pass as a gateway or vice versa.
+   */
+  static async existsByIdOrSlugAndType(params: {
+    idOrSlug: string;
+    agentType: AgentType;
+  }): Promise<boolean> {
+    const { idOrSlug, agentType } = params;
+    const matchesIdOrSlug = isUuid(idOrSlug)
+      ? or(
+          eq(schema.agentsTable.id, idOrSlug),
+          eq(schema.agentsTable.slug, idOrSlug),
+        )
+      : eq(schema.agentsTable.slug, idOrSlug);
+
     const [row] = await db
       .select({ id: schema.agentsTable.id })
       .from(schema.agentsTable)
       .where(
-        or(
-          sql`${schema.agentsTable.id}::text = ${idOrSlug}`,
-          eq(schema.agentsTable.slug, idOrSlug),
+        and(
+          matchesIdOrSlug,
+          eq(schema.agentsTable.agentType, agentType),
+          notDeleted(schema.agentsTable),
         ),
       )
       .limit(1);
 
-    return row?.id ?? null;
+    return row !== undefined;
   }
 
   /**
@@ -1819,8 +5407,13 @@ class AgentModel {
    * Returns the newly created agent.
    */
   static async cloneAgent(params: {
+    initialGrants?: ResourcePermissionGrant[];
     sourceId: string;
     userId: string;
+    /** Visibility for the clone; defaults to copying the source's scope. */
+    scope?: AgentScope;
+    /** Teams for a team-scoped clone; defaults to the source's teams. */
+    teams?: string[];
   }): Promise<Agent> {
     const { sourceId, userId } = params;
 
@@ -1829,9 +5422,12 @@ class AgentModel {
       throw new Error("Source agent not found");
     }
 
+    const cloneScope = params.scope ?? sourceAgent.scope;
     // Omit teams if scope is not 'team' — scope takes precedence
     const cloneTeams =
-      sourceAgent.scope === "team" ? sourceAgent.teams.map((t) => t.id) : [];
+      cloneScope === "team"
+        ? (params.teams ?? sourceAgent.teams.map((t) => t.id))
+        : [];
 
     let created: Agent | null = null;
     try {
@@ -1839,7 +5435,7 @@ class AgentModel {
         {
           organizationId: sourceAgent.organizationId,
           agentType: sourceAgent.agentType,
-          scope: sourceAgent.scope,
+          scope: cloneScope,
           teams: cloneTeams,
           labels: sourceAgent.labels,
           knowledgeBaseIds: sourceAgent.knowledgeBaseIds ?? [],
@@ -1850,23 +5446,101 @@ class AgentModel {
           description: sourceAgent.description,
           icon: sourceAgent.icon,
           toolExposureMode: sourceAgent.toolExposureMode,
-          toolAssignmentMode: sourceAgent.toolAssignmentMode,
-          considerContextUntrusted: sourceAgent.considerContextUntrusted,
+          // Clone in Custom mode first and flip below, so a crash before the
+          // exclusions are copied can only leave a fail-closed (assigned-tools-
+          // only) clone, never one wide open in Auto mode with no exclusions.
+          accessAllTools: false,
+          // Keep subagents closed until their exclusions have been copied.
+          accessAllSubagents: false,
+          // Skill policy rules are copied below. Start closed so a partial
+          // clone can never transiently widen a Manual source to All.
+          activationSkillMode: "manual",
           incomingEmailEnabled: sourceAgent.incomingEmailEnabled,
           incomingEmailSecurityMode: sourceAgent.incomingEmailSecurityMode,
           incomingEmailAllowedDomain: sourceAgent.incomingEmailAllowedDomain,
           llmApiKeyId: null,
-          llmModel: sourceAgent.llmModel,
+          modelId: sourceAgent.modelId,
           identityProviderId: null,
           passthroughHeaders: null,
         },
-        sourceAgent.scope === "personal" ? userId : undefined,
+        cloneScope === "personal" ? userId : undefined,
+        // Copy the source's assignments verbatim below; don't let create's
+        // default assignment force built-ins the source lacked onto the clone.
+        {
+          skipCreationDefaultTools: true,
+          initialPermissionGrants: params.initialGrants,
+        },
       );
 
       await AgentToolModel.cloneAssignments({
         fromAgentId: sourceAgent.id,
         toAgentId: created.id,
       });
+
+      // Copy Auto-tool-mode exclusions. Clones are same-org, so tool ids stay
+      // valid; like assignments, exclusions travel with the agent.
+      const excludedToolIds = await AgentExcludedToolModel.findToolIdsByAgent(
+        sourceAgent.id,
+      );
+      await AgentExcludedToolModel.replaceForAgent(created.id, excludedToolIds);
+
+      // Same for Auto-mode knowledge-source exclusions: the clone copies the
+      // source's knowledge assignments verbatim above, so a source that had
+      // turned a knowledge source off would otherwise hand its copy a wider
+      // search surface than the original.
+      const excludedConnectorIds =
+        await AgentExcludedConnectorModel.findConnectorIdsByAgent(
+          sourceAgent.id,
+        );
+      await AgentExcludedConnectorModel.replaceForAgent(
+        created.id,
+        excludedConnectorIds,
+      );
+
+      const excludedSubagentIds =
+        await AgentExcludedSubagentModel.findTargetAgentIdsByAgent(
+          sourceAgent.id,
+        );
+      await AgentExcludedSubagentModel.replaceForAgent(
+        created.id,
+        excludedSubagentIds,
+      );
+
+      const activationSkillRules =
+        await AgentActivationSkillRuleModel.findByAgent(sourceAgent.id);
+      await AgentActivationSkillRuleModel.addRules({
+        agentId: created.id,
+        rules: activationSkillRules,
+      });
+      await AgentModel.setActivationSkillPolicyState({
+        id: created.id,
+        mode: AgentActivationSkillModeSchema.parse(
+          sourceAgent.activationSkillMode,
+        ),
+        revision: activationSkillRules.length > 0 ? 1 : 0,
+      });
+
+      // Restore both Auto modes together after copying exclusions, so version
+      // history never records an intermediate tools-only Auto policy.
+      // The copied tool exclusions are authoritative; skip additive pre-fill.
+      if (sourceAgent.accessAllTools || sourceAgent.accessAllSubagents) {
+        await AgentModel.update(
+          created.id,
+          {
+            accessAllTools: sourceAgent.accessAllTools,
+            accessAllSubagents: sourceAgent.accessAllSubagents,
+          },
+          { skipExclusionPrefill: true },
+        );
+      }
+
+      // Fork last, once the copied assignments and exclusions are in place.
+      // create() already forked a version 1 that predates them, and neither
+      // cloneAssignments nor replaceForAgent forks; without this a clone of a
+      // Custom-mode agent (which skips the update above) would leave version 1
+      // — a snapshot with no tools — as the permanent head of a fully
+      // configured agent.
+      await AgentVersionModel.forkIfChangedBestEffort(created.id);
 
       const clonedAgent = await AgentModel.findById(created.id, userId, true);
       if (!clonedAgent) {
@@ -1877,7 +5551,7 @@ class AgentModel {
     } catch (error) {
       if (created) {
         try {
-          await AgentModel.delete(created.id);
+          await AgentModel.hardDelete(created.id);
         } catch {
           // ignore cleanup errors
         }
@@ -1892,7 +5566,12 @@ class AgentModel {
     const [existing] = await db
       .select({ id: schema.agentsTable.id })
       .from(schema.agentsTable)
-      .where(eq(schema.agentsTable.slug, baseSlug))
+      .where(
+        and(
+          eq(schema.agentsTable.slug, baseSlug),
+          notDeleted(schema.agentsTable),
+        ),
+      )
       .limit(1);
 
     if (existing) {
@@ -1904,11 +5583,54 @@ class AgentModel {
 
   private static async insertWithSlugRetry(
     values: typeof schema.agentsTable.$inferInsert,
+    permissions: {
+      grants?: ResourcePermissionGrant[];
+      grantAuthor?: boolean;
+      publishToOrganization?: boolean;
+    },
   ) {
     const maxRetries = 3;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
-        return await db.insert(schema.agentsTable).values(values).returning();
+        if (values.agentType === "llm_proxy")
+          return await db
+            .insert(schema.agentsTable)
+            .values(
+              await CreatedByModel.forInsert({
+                data: { ...values, scope: values.scope ?? "personal" },
+                userIdField: "authorId",
+              }),
+            )
+            .returning();
+        return await withDbTransaction(async (tx) => {
+          const rows = await tx
+            .insert(schema.agentsTable)
+            .values(
+              await CreatedByModel.forInsert({
+                data: { ...values, scope: values.scope ?? "personal" },
+                userIdField: "authorId",
+                transaction: tx,
+              }),
+            )
+            .returning();
+          const row = rows[0];
+          // An agent outside any organization has nobody to grant access to.
+          if (!row.organizationId) return rows;
+          // SPDX-SnippetBegin
+          // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+          // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+          await ResourcePermissionPolicyModel.createInitial({
+            tx,
+            organizationId: row.organizationId,
+            resource: row.agentType === "mcp_gateway" ? "mcpGateway" : "agent",
+            scope: row.id,
+            grants: permissions.grants,
+            authorId: permissions.grantAuthor === false ? null : row.authorId,
+            publishToOrganization: permissions.publishToOrganization,
+          });
+          // SPDX-SnippetEnd
+          return rows;
+        });
       } catch (error: unknown) {
         const isSlugConflict =
           error instanceof Error && error.message.includes("agents_slug_idx");
@@ -1924,11 +5646,1052 @@ class AgentModel {
     }
     throw new Error("Unreachable");
   }
+  /**
+   * Identity of an agent for the audit trail, and nothing else — id, name, and
+   * type. The permanent-delete route uses this instead of
+   * {@link findByIdForAudit} because a purge is audited by identity only: the
+   * point of the action is to destroy the config, so an audit row that
+   * preserved a full snapshot of it would defeat the request.
+   *
+   * Does not filter soft-deleted rows — the purge target is by definition in
+   * the trash, so the filtered read paths cannot serve this.
+   */
+  static async findIdentityForAudit(
+    id: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [row] = await db
+      .select({
+        id: schema.agentsTable.id,
+        name: schema.agentsTable.name,
+        agentType: schema.agentsTable.agentType,
+      })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.id, id),
+          eq(schema.agentsTable.organizationId, organizationId),
+        ),
+      )
+      .limit(1);
+    return row ?? null;
+  }
+
+  static async findByIdForAudit(
+    id: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [row] = await db
+      .select()
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.id, id),
+          eq(schema.agentsTable.organizationId, organizationId),
+        ),
+      )
+      .limit(1);
+
+    if (!row) return null;
+
+    // Fetch relational data so audit diffs capture tool/KB/team changes —
+    // not just main-table columns.  Each sub-query is lightweight (index
+    // lookup by agent_id) and the parallel fetch keeps latency low.
+    const [
+      tools,
+      teams,
+      labels,
+      knowledgeBaseIds,
+      connectorIds,
+      excludedConnectorIds,
+      delegations,
+      excludedSubagentIds,
+      skillIds,
+      excludedSkillIds,
+      activationSkillRules,
+      excludedToolIds,
+      hookRows,
+      suggestedPrompts,
+      modelRows,
+      keyRows,
+    ] = await Promise.all([
+      AgentToolModel.getToolsForAgent(id),
+      AgentTeamModel.getTeamDetailsForAgent(id),
+      AgentLabelModel.getLabelsForAgent(id),
+      AgentKnowledgeBaseModel.getKnowledgeBaseIds(id),
+      AgentConnectorAssignmentModel.getConnectorIds(id),
+      AgentExcludedConnectorModel.findConnectorIdsByAgent(id),
+      AgentToolModel.getDelegationTargets(id),
+      AgentExcludedSubagentModel.findTargetAgentIdsByAgent(id),
+      // The skill-publication routes audit through this snapshot too, so the
+      // published set and its Auto-mode exclusions must diff like any other
+      // relational field — publishing a skill to a gateway's token holders is
+      // exactly the change the log exists to show.
+      AgentSkillModel.findSkillIdsByAgent(id),
+      AgentExcludedSkillModel.findSkillIdsByAgent(id),
+      AgentActivationSkillRuleModel.findByAgent(id),
+      AgentExcludedToolModel.findToolIdsByAgent(id),
+      // Hook IDENTITY only, never `content`: a hook edit must produce a
+      // non-empty diff, but script bodies would ride along on every unrelated
+      // agent audit record.
+      db
+        .select({
+          event: schema.hookFilesTable.event,
+          fileName: schema.hookFilesTable.fileName,
+          enabled: schema.hookFilesTable.enabled,
+        })
+        .from(schema.hookFilesTable)
+        .where(eq(schema.hookFilesTable.agentId, id)),
+      AgentSuggestedPromptModel.getForAgent(id),
+      // Resolve the live modelId FK to its human-readable identity so a model
+      // change surfaces as a real diff — the legacy llmModel text column is
+      // deprecated (never written) and would always read null.
+      row.modelId
+        ? db
+            .select({ externalId: schema.modelsTable.externalId })
+            .from(schema.modelsTable)
+            .where(eq(schema.modelsTable.id, row.modelId))
+            .limit(1)
+        : Promise.resolve([]),
+      // The model and its API key are set as a pair; capture a redacted key
+      // identity (id/name/scope + provider) so an LLM-config change is legible
+      // and a swap between two same-provider keys still diffs — without ever
+      // touching key material (secretId is excluded).
+      row.llmApiKeyId
+        ? db
+            .select({
+              id: schema.llmProviderApiKeysTable.id,
+              name: schema.llmProviderApiKeysTable.name,
+              scope: schema.llmProviderApiKeysTable.scope,
+              provider: schema.llmProviderApiKeysTable.provider,
+            })
+            .from(schema.llmProviderApiKeysTable)
+            .where(eq(schema.llmProviderApiKeysTable.id, row.llmApiKeyId))
+            .limit(1)
+        : Promise.resolve([]),
+    ]);
+
+    const delegationTargets = [...delegations]
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .map((d) => ({ id: d.id, name: d.name }));
+
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    return {
+      resourcePermissions:
+        (
+          await ResourcePermissionPolicyModel.find({
+            organizationId,
+            resource: row.agentType === "mcp_gateway" ? "mcpGateway" : "agent",
+            scope: row.id,
+          })
+        )?.grants ?? [],
+      id: row.id,
+      name: row.name,
+      organizationId: row.organizationId,
+      agentType: row.agentType,
+      authorId: row.authorId,
+      createdByServiceAccountId: row.createdByServiceAccountId,
+      scope: row.scope,
+      description: row.description ?? null,
+      systemPrompt: row.systemPrompt ?? null,
+      slug: row.slug ?? null,
+      isDefault: row.isDefault,
+      model: modelRows[0]?.externalId ?? null,
+      llmProvider: keyRows[0]?.provider ?? null,
+      llmApiKey: keyRows[0]
+        ? {
+            id: keyRows[0].id,
+            name: keyRows[0].name,
+            scope: keyRows[0].scope,
+          }
+        : null,
+      icon: row.icon ?? null,
+      toolExposureMode: row.toolExposureMode,
+      accessAllTools: row.accessAllTools,
+      accessAllSubagents: row.accessAllSubagents,
+      accessAllSkills: row.accessAllSkills,
+      activationSkillMode: row.activationSkillMode,
+      activationSkillPolicyRevision: row.activationSkillPolicyRevision,
+      // Audit readers may not have access to every skill named by a saved
+      // policy. Counts make the policy change visible without disclosing an
+      // unavailable native id, external URI, or plugin path.
+      activationSkillRuleCounts: {
+        allowed: activationSkillRules.filter(
+          (rule) => rule.disposition === "allow",
+        ).length,
+        excluded: activationSkillRules.filter(
+          (rule) => rule.disposition === "exclude",
+        ).length,
+      },
+      // passthrough_headers is a text[] of header NAMES (no values), so it is
+      // safe to capture verbatim.
+      passthroughHeaders: [...(row.passthroughHeaders ?? [])].sort(),
+      identityProviderId: row.identityProviderId ?? null,
+      // Names only: the App's key, repositories and workflow refs.
+      githubActionsAccess: row.githubActionsAccess ?? null,
+      entraAgentIdentityId: row.entraAgentIdentityId ?? null,
+      subagentLoadBalancing: row.subagentLoadBalancing ?? null,
+      environmentId: row.environmentId ?? null,
+      incomingEmailEnabled: row.incomingEmailEnabled,
+      incomingEmailSecurityMode: row.incomingEmailSecurityMode,
+      incomingEmailAllowedDomain: row.incomingEmailAllowedDomain ?? null,
+      builtInAgentConfig: row.builtInAgentConfig ?? null,
+      runtime: row.runtime
+        ? {
+            image: row.runtime.image,
+            command: row.runtime.command,
+            backend: row.runtime.backend,
+            steerMode: row.runtime.steerMode,
+            privileged: row.runtime.privileged,
+            tier: row.runtime.tier ?? null,
+            maxTier: row.runtime.maxTier ?? null,
+            environmentKeys: (row.runtime.environment ?? [])
+              .map((entry) => entry.key)
+              .sort(),
+            credentials: (row.runtime.credentials ?? [])
+              .map(({ key, credentialId, scope, label, required }) => ({
+                key,
+                credentialId: credentialId ?? null,
+                scope,
+                label,
+                required,
+              }))
+              .sort((a, b) => a.key.localeCompare(b.key)),
+            ttlHours: row.runtime.ttlHours,
+            maxCostUsd: row.runtime.maxCostUsd ?? null,
+            idleTimeoutMinutes: row.runtime.idleTimeoutMinutes,
+          }
+        : null,
+      // A reference id is safe to audit and changes on every shared-secret
+      // rotation, producing a non-empty diff without recording secret values.
+      runtimeCredentialRevision: row.runtimeSecretId ?? null,
+      tools: tools.map((t) => t.name).sort(),
+      knowledgeBaseIds: [...knowledgeBaseIds].sort(),
+      connectorIds: [...connectorIds].sort(),
+      excludedConnectorIds: [...excludedConnectorIds].sort(),
+      teams: teams.map((t) => t.name).sort(),
+      labels: labels.sort(),
+      delegationTargets,
+      excludedSubagentIds: [...excludedSubagentIds].sort(),
+      skillIds: [...skillIds].sort(),
+      excludedSkillIds: [...excludedSkillIds].sort(),
+      excludedToolIds: [...excludedToolIds].sort(),
+      hooks: hookRows
+        .map((h) => `${h.event}/${h.fileName}${h.enabled ? "" : " (disabled)"}`)
+        .sort(),
+      suggestedPrompts,
+      deletedAt: row.deletedAt?.toISOString() ?? null,
+      createdAt: row.createdAt.toISOString(),
+    };
+    // SPDX-SnippetEnd
+  }
+
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  private static async buildRosterWhere(params: {
+    userId?: string;
+    isAgentAdmin?: boolean;
+    options?: AgentRosterOptions;
+  }) {
+    const { userId, options } = params;
+    const principals = userId
+      ? await ResourcePermissionSubjectModel.resolvePrincipals({
+          userId,
+          organizationId: options?.authorization?.organizationId,
+        })
+      : [];
+    return and(
+      await AgentModel.buildUnfencedRosterWhere({ ...params, principals }),
+      userId ? await callerAgentsFence(userId, principals) : undefined,
+    );
+  }
+
+  private static async buildUnfencedRosterWhere(params: {
+    userId?: string;
+    isAgentAdmin?: boolean;
+    options?: AgentRosterOptions;
+    principals: GrantPrincipal[];
+  }) {
+    const { userId, isAgentAdmin, options, principals } = params;
+    // An authorized read of live rows needs its read grant once. The fence,
+    // the base-type read, the oversight filter and the non-admin semi-join
+    // each restate that grant (base read types never include LLM proxies),
+    // and every restatement is a probe PostgreSQL plans again.
+    if (userId && options?.authorization && options.status !== "deleted") {
+      return AgentModel.buildAuthorizedLiveRosterWhere({
+        isAgentAdmin,
+        options: { ...options, authorization: options.authorization },
+        principals,
+      });
+    }
+    // Build where conditions
+    const whereConditions: SQL[] = [
+      getAgentStatusCondition(options?.status ?? "active"),
+      ...(userId ? [agentListFence(principals)] : []),
+    ];
+    if (options?.authorization) {
+      if (!userId) return sql`false`;
+      const { organizationId, baseReadTypes } = options.authorization;
+      whereConditions.push(
+        eq(schema.agentsTable.organizationId, organizationId),
+      );
+      if (options.status !== "deleted") {
+        whereConditions.push(
+          or(
+            inArray(schema.agentsTable.agentType, baseReadTypes),
+            explicitAgentReadCondition(principals),
+          ) as SQL,
+        );
+      }
+    }
+
+    // Filter by agentTypes if specified (array of types)
+    if (options?.agentTypes && options.agentTypes.length > 0) {
+      whereConditions.push(
+        inArray(schema.agentsTable.agentType, options.agentTypes),
+      );
+    }
+    // Filter by agentType if specified (single type, backwards compatible)
+    else if (options?.agentType !== undefined) {
+      whereConditions.push(eq(schema.agentsTable.agentType, options.agentType));
+    }
+
+    if (options?.onlyEnforcingMissingCredentials) {
+      whereConditions.push(
+        ne(schema.agentsTable.missingCredentialBehavior, "allow"),
+      );
+    }
+
+    const isChatView = options?.view === "chat";
+    const builtInName = sql<string>`coalesce(${schema.agentsTable.builtInAgentConfig}->>'name', '')`;
+    // Chat exposes its system assistant through the same authorized roster;
+    // platform subagents remain excluded from ordinary chat selection.
+    if (options?.excludeBuiltIn || !isAgentAdmin || isChatView) {
+      const visibleAgents = [eq(schema.agentsTable.builtIn, false)];
+      if (isChatView) {
+        visibleAgents.push(eq(builtInName, BUILT_IN_AGENT_IDS.SRE));
+      }
+      if (isChatView && enterpriseTier.isOpenappaActive()) {
+        visibleAgents.push(eq(builtInName, BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG));
+      }
+      whereConditions.push(or(...visibleAgents) as SQL);
+    }
+
+    // Filter by scope if specified
+    if (options?.scope) {
+      whereConditions.push(agentAudienceIs(options.scope));
+    }
+
+    // Keep oversight-only personal agents hidden, while honoring explicit shares.
+    if (options?.excludeOtherPersonalAgents && userId) {
+      whereConditions.push(
+        AgentModel.notOthersPersonalCondition({ userId, principals }),
+      );
+    }
+
+    // Apply access control filtering for non-agent admins
+    if (userId && !isAgentAdmin) {
+      whereConditions.push(
+        inArray(
+          schema.agentsTable.id,
+          accessibleAgentIdsQuery({ userId, isAgentAdmin: false, principals }),
+        ),
+      );
+    }
+
+    if (options?.ids !== undefined) {
+      whereConditions.push(
+        idArrayCondition(schema.agentsTable.id, options.ids),
+      );
+    }
+
+    return and(...whereConditions);
+  }
+  /**
+   * {@link buildRosterWhere} for an authorized read of live rows, with one
+   * read-grant condition. Rows of types the caller reads at `*` need no
+   * probe at all.
+   */
+  private static buildAuthorizedLiveRosterWhere(params: {
+    isAgentAdmin?: boolean;
+    options: AgentRosterOptions & {
+      authorization: NonNullable<AgentRosterOptions["authorization"]>;
+    };
+    principals: GrantPrincipal[];
+  }): SQL | undefined {
+    const { isAgentAdmin, options, principals } = params;
+    const table = schema.agentsTable;
+    const { organizationId, wildcardReadTypes = [] } = options.authorization;
+    const probedTypes = GRANTED_AGENT_TYPES.filter(
+      (type) => !wildcardReadTypes.includes(type),
+    );
+    const readable =
+      probedTypes.length === 0
+        ? inArray(table.agentType, GRANTED_AGENT_TYPES)
+        : or(
+            wildcardReadTypes.length > 0
+              ? inArray(table.agentType, wildcardReadTypes)
+              : undefined,
+            grantedAgentIdsCondition({
+              principals,
+              organizationId,
+              types: probedTypes,
+            }),
+          );
+    const conditions: (SQL | undefined)[] = [
+      notDeleted(table),
+      eq(table.organizationId, organizationId),
+      readable,
+    ];
+    if (options.agentTypes && options.agentTypes.length > 0) {
+      conditions.push(inArray(table.agentType, options.agentTypes));
+    } else if (options.agentType !== undefined) {
+      conditions.push(eq(table.agentType, options.agentType));
+    }
+    if (options.onlyEnforcingMissingCredentials) {
+      conditions.push(ne(table.missingCredentialBehavior, "allow"));
+    }
+    const isChatView = options.view === "chat";
+    if (options.excludeBuiltIn || !isAgentAdmin || isChatView) {
+      const builtInName = sql<string>`coalesce(${table.builtInAgentConfig}->>'name', '')`;
+      const visibleAgents = [eq(table.builtIn, false)];
+      if (isChatView) {
+        visibleAgents.push(eq(builtInName, BUILT_IN_AGENT_IDS.SRE));
+      }
+      if (isChatView && enterpriseTier.isOpenappaActive()) {
+        visibleAgents.push(eq(builtInName, BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG));
+      }
+      conditions.push(or(...visibleAgents));
+    }
+    if (options.scope) conditions.push(agentAudienceIs(options.scope));
+    // excludeOtherPersonalAgents keeps rows the caller reads by grant, and
+    // every row here is one, so it narrows nothing; nor does the non-admin
+    // semi-join, whose condition each row already meets.
+    if (options.ids !== undefined) {
+      conditions.push(idArrayCondition(table.id, options.ids));
+    }
+    return and(...conditions);
+  }
+  // SPDX-SnippetEnd
+
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  /**
+   * The chat order (the caller's own, then team-shared, then
+   * organization-shared agents, each by name) as one statement of three
+   * phases. Each phase returns at most limit + 1 rows, but its plan can sort
+   * authorized candidates before applying that limit. The final merge sorts
+   * only the bounded phase outputs. Same rows and cursors as
+   * {@link rosterPage}'s chat order.
+   */
+  private static async findChatOrderedRosterPage(params: {
+    where: SQL | undefined;
+    organizationId: string;
+    userId: string;
+    pagination: CursorQuery;
+  }) {
+    const table = schema.agentsTable;
+    const cursor = decodeCursor(params.pagination.cursor);
+    let position: { rank: number; name: string; id: string } | undefined;
+    if (
+      cursor &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        cursor.id,
+      )
+    ) {
+      try {
+        const parsed = ChatRosterCursorPositionSchema.safeParse(
+          JSON.parse(cursor.value),
+        );
+        if (parsed.success) position = { ...parsed.data, id: cursor.id };
+      } catch {
+        /* An invalid cursor restarts the page. */
+      }
+    }
+    // The rank sharedAudience gives an agent's own policy: 2 when it grants
+    // read to the organization or a role, 1 to a team, 0 otherwise. The
+    // shared agents are read once, from the policies, and every phase reads
+    // that set. Only a canonical uuid scope can equal an id's text, so the
+    // set holds ids that drive the agents primary key.
+    const readers = (types: string[]) =>
+      sql`ARRAY[${sql.join(
+        types.map(
+          (type) =>
+            sql`${JSON.stringify([{ subject: { type }, actions: ["read"] }])}`,
+        ),
+        sql`, `,
+      )}]::jsonb[]`;
+    const policy = alias(
+      schema.resourcePermissionPoliciesTable,
+      "chat_shared_policy",
+    );
+    const shared = db.$with("chat_shared").as(
+      db
+        .select({
+          id: sql<string>`${policy.scope}::uuid`.as("id"),
+          organizationShared:
+            sql<boolean>`${policy.grants} @> ANY(${readers(["organization", "role"])})`.as(
+              "organization_shared",
+            ),
+        })
+        .from(policy)
+        .where(
+          and(
+            eq(policy.organizationId, params.organizationId),
+            eq(policy.resource, "agent"),
+            sql`${policy.scope} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'`,
+            sql`${policy.grants} @> ANY(${readers(["organization", "role", "team"])})`,
+          ),
+        ),
+    );
+    // A personal agent shared with the caller by name ranks with the caller's
+    // own: its audience is still personal.
+    const ranks = [
+      and(
+        or(
+          eq(table.authorId, params.userId),
+          eq(table.builtIn, true),
+          namedChatReader(params.userId),
+        ),
+        sql`NOT (${table.id} = ANY(ARRAY(SELECT id FROM chat_shared)))`,
+      ),
+      sql`${table.id} = ANY(ARRAY(SELECT id FROM chat_shared WHERE NOT organization_shared))`,
+      sql`${table.id} = ANY(ARRAY(SELECT id FROM chat_shared WHERE organization_shared))`,
+    ];
+    const limit = params.pagination.limit + 1;
+    const phases = ranks.flatMap((membership, rank) => {
+      if (position && rank < position.rank) return [];
+      const boundary =
+        position && rank === position.rank
+          ? sql`(${table.name} COLLATE "C", ${table.id}) > (${position.name} COLLATE "C", ${position.id}::uuid)`
+          : undefined;
+      return [
+        db
+          .select({
+            ...CHAT_ROSTER_PHASE_COLUMNS,
+            policies: objectPoliciesColumn().as("policies"),
+            chatRank: sql<number>`${rank}::int`.as("chat_rank"),
+            cursorValue: sql<string>`${table.createdAt}::text`.as(
+              "cursor_value",
+            ),
+          })
+          .from(table)
+          .where(and(params.where, membership, boundary))
+          .orderBy(asc(sql`${table.name} COLLATE "C"`), asc(table.id))
+          .limit(limit),
+      ];
+    });
+    if (phases.length === 0) {
+      return createCursorPaginatedResult([], params.pagination, () => ({
+        id: "",
+        value: "",
+      }));
+    }
+    const [first, ...rest] = phases;
+    const merged = (
+      rest.length > 0 ? unionAll(first, ...(rest as [typeof first])) : first
+    ).as("chat_page");
+    const rows = await db
+      .with(shared)
+      .select()
+      .from(merged)
+      .orderBy(
+        asc(merged.chatRank),
+        asc(sql`${merged.name} COLLATE "C"`),
+        asc(merged.id),
+      )
+      .limit(limit);
+    const agents = rows.map(({ policies, ...agent }) => ({
+      ...agent,
+      sharedByName: isSharedByName({ agent, policies, userId: params.userId }),
+    }));
+    await AgentModel.populateGrantedScope(
+      agents,
+      rows.flatMap((row) => row.policies),
+    );
+    return createCursorPaginatedResult(agents, params.pagination, (row) => ({
+      id: row.id,
+      value: JSON.stringify({ rank: row.chatRank, name: row.name }),
+    }));
+  }
+  // SPDX-SnippetEnd
+
+  /** Chat roster rows and their object policies in one statement. */
+  private static async findChatRosterRows(params: {
+    where: SQL | undefined;
+    page?: RosterPage;
+    userId: string;
+  }): Promise<ChatAgentRoster[]> {
+    const rows = await AgentModel.selectRosterRows({
+      columns: { ...CHAT_ROSTER_COLUMNS, policies: objectPoliciesColumn() },
+      where: params.where,
+      page: params.page,
+    });
+    const agents = rows.map(({ policies, ...agent }) => ({
+      ...agent,
+      sharedByName: isSharedByName({ agent, policies, userId: params.userId }),
+    }));
+    await AgentModel.populateGrantedScope(
+      agents,
+      rows.flatMap((row) => row.policies),
+    );
+    return agents;
+  }
+
+  /**
+   * One cursor page's bound, order and limit. The page is read by the same
+   * statement that projects and enriches its rows, so each row is authorized
+   * once and an empty page costs nothing more.
+   */
+  private static rosterPage(params: {
+    where: SQL | undefined;
+    sortBy?: "name" | "createdAt" | "chat";
+    pagination: CursorQuery;
+  }): RosterPage {
+    const table = schema.agentsTable;
+    const cursor = decodeCursor(params.pagination.cursor);
+    const nameOrder = params.sortBy === "name";
+    const chatOrder = params.sortBy === "chat";
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    const chatRank = chatOrder
+      ? sql<number>`CASE ${ResourcePermissionPolicyModel.sharedAudience({ organizationId: table.organizationId, resource: "agent", scopeColumn: table.id, ownerColumn: table.authorId })} WHEN 'organization' THEN 2 WHEN 'team' THEN 1 ELSE 0 END`
+      : sql<number>`0`;
+    // SPDX-SnippetEnd
+    let chatPosition: { rank: number; name: string } | undefined;
+    if (chatOrder && cursor) {
+      try {
+        const parsed = ChatRosterCursorPositionSchema.safeParse(
+          JSON.parse(cursor.value),
+        );
+        if (parsed.success) chatPosition = parsed.data;
+      } catch {
+        /* An invalid cursor restarts the page. */
+      }
+    }
+    const validCursor =
+      cursor &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        cursor.id,
+      ) &&
+      (chatOrder
+        ? chatPosition !== undefined
+        : nameOrder || !Number.isNaN(Date.parse(cursor.value)))
+        ? cursor
+        : null;
+    const boundary = validCursor
+      ? chatOrder && chatPosition
+        ? sql`(${chatRank}, ${table.name} COLLATE "C", ${table.id}) > (${chatPosition.rank}, ${chatPosition.name} COLLATE "C", ${validCursor.id}::uuid)`
+        : nameOrder
+          ? sql`(${table.name} COLLATE "C", ${table.id}) > (${validCursor.value} COLLATE "C", ${validCursor.id}::uuid)`
+          : sql`(${table.createdAt}, ${table.id}) < (${validCursor.value}::timestamp, ${validCursor.id}::uuid)`
+      : undefined;
+    return {
+      boundary,
+      cursorColumns: {
+        cursorValue: sql<string>`${table.createdAt}::text`,
+        chatRank,
+      },
+      orderBy: chatOrder
+        ? [asc(chatRank), asc(sql`${table.name} COLLATE "C"`), asc(table.id)]
+        : nameOrder
+          ? [asc(sql`${table.name} COLLATE "C"`), asc(table.id)]
+          : [desc(table.createdAt), desc(table.id)],
+      projectedOrderBy: chatOrder
+        ? [
+            asc(sql`option_page."chatRank"`),
+            asc(sql`option_page.name COLLATE "C"`),
+            asc(sql`option_page.id`),
+          ]
+        : nameOrder
+          ? [asc(sql`option_page.name COLLATE "C"`), asc(sql`option_page.id`)]
+          : [
+              desc(sql`option_page."cursorValue"::timestamp`),
+              desc(sql`option_page.id`),
+            ],
+      limit: params.pagination.limit + 1,
+      position: (row) => ({
+        id: row.id,
+        value: chatOrder
+          ? JSON.stringify({ rank: row.chatRank, name: row.name })
+          : nameOrder
+            ? row.name
+            : (row.cursorValue ?? ""),
+      }),
+    };
+  }
+
+  /** Rows of `columns`, bounded and ordered by `page` when one is given. */
+  private static async selectRosterRows<
+    T extends Record<string, AnyPgColumn | SQL>,
+  >(params: { columns: T; where: SQL | undefined; page?: RosterPage }) {
+    const table = schema.agentsTable;
+    const { page } = params;
+    if (!page) {
+      return db.select(params.columns).from(table).where(params.where);
+    }
+    return db
+      .select({ ...params.columns, ...page.cursorColumns })
+      .from(table)
+      .where(and(params.where, page.boundary))
+      .orderBy(...page.orderBy)
+      .limit(page.limit);
+  }
+
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  private static async buildOptionWhere(params: {
+    userId: string;
+    isAgentAdmin: boolean;
+    options: AgentRosterOptions;
+    filters: AgentOptionFilters;
+  }) {
+    const table = schema.agentsTable;
+    const rosterWhere = await AgentModel.buildRosterWhere(params);
+    const filters: (SQL | undefined)[] = [rosterWhere];
+    const query = params.filters;
+    if (query.onlyOwnPersonalAgents)
+      filters.push(
+        or(
+          not(optionScopeCondition("personal")),
+          eq(table.authorId, params.userId),
+        ),
+      );
+    if (query.excludeIds?.length)
+      filters.push(not(idArrayCondition(table.id, query.excludeIds)));
+    if (query.runtimeCommand !== undefined)
+      filters.push(
+        sql`${table.runtime}->'command'->>0 = ${query.runtimeCommand}`,
+      );
+    if (query.exactName !== undefined)
+      filters.push(eq(table.name, query.exactName));
+    if (query.authorId !== undefined)
+      filters.push(eq(table.authorId, query.authorId));
+    if (query.excludePersonalGateways)
+      filters.push(eq(table.isPersonalGateway, false));
+    if (query.search) filters.push(optionSearchCondition(query));
+    if (query.audienceVisibility !== undefined) {
+      const org = optionScopeCondition("org");
+      switch (query.audienceVisibility) {
+        case "organization":
+          filters.push(org);
+          break;
+        case "team":
+          filters.push(
+            or(
+              org,
+              and(
+                optionScopeCondition("team"),
+                (query.audienceTeamIds?.length ?? 0) > 0
+                  ? optionRecipientCondition(
+                      "team",
+                      query.audienceTeamIds ?? [],
+                    )
+                  : sql`false`,
+              ),
+            ),
+          );
+          break;
+        case "user":
+          filters.push(
+            or(
+              org,
+              and(
+                optionScopeCondition("personal"),
+                optionRecipientCondition("user", query.audienceUserIds ?? []),
+              ),
+            ),
+          );
+          break;
+        case "none":
+          if (!query.audienceEditorIsOwner) filters.push(org);
+          break;
+      }
+    }
+    return { where: and(...filters) };
+  }
+  // SPDX-SnippetEnd
+
+  private static async findUnpagedOptionRows(
+    where: SQL | undefined,
+  ): Promise<AgentOption[]> {
+    const rows = await db
+      .select(OPTION_ROW_COLUMNS)
+      .from(schema.agentsTable)
+      .where(where);
+    const agents = rows.map((row) => ({
+      ...row,
+      teams: [] as { id: string; name: string }[],
+      users: [] as AgentOption["users"],
+      authorName: null as string | null,
+      authorEmail: null as string | null,
+      createdBy: null as Agent["createdBy"],
+    }));
+    const ids = agents.map((agent) => agent.id);
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    const policies = await ResourcePermissionPolicyModel.findObjectPolicies({
+      resources: ["agent", "mcpGateway"],
+      scopes: ids,
+    });
+    const [recipients] = await Promise.all([
+      ResourcePermissionPolicyModel.findReadRecipientDetails({
+        resources: ["agent", "mcpGateway"],
+        scopes: ids,
+        policies,
+        excludeUserIds: new Map(
+          agents.map((agent) => [agent.id, agent.authorId]),
+        ),
+      }),
+      AgentModel.populateGrantedScope(agents, policies),
+      AgentModel.populateAuthorNames(agents),
+    ]);
+    for (const agent of agents) {
+      const details = recipients.get(agent.id);
+      agent.teams = (details?.teams ?? []).map(({ id, name }) => ({
+        id,
+        name,
+      }));
+      agent.users = (details?.users ?? []).map(({ id }) => ({ id }));
+    }
+    // SPDX-SnippetEnd
+    return agents;
+  }
+
+  /** One bounded page, with policies and unique creators/recipients read set-wise. */
+  private static async findOptionRows(
+    where: SQL | undefined,
+    page: RosterPage,
+  ): Promise<Array<AgentOption & RosterCursorFields>> {
+    const table = schema.agentsTable;
+    const columns = {
+      ...OPTION_ROW_COLUMNS,
+      ...page.cursorColumns,
+    };
+    const selection = db.select(columns).from(table);
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    const result = await db.execute<{
+      rows: Awaited<typeof selection>;
+      policies: ObjectPolicy[];
+      users: Array<{ id: string; name: string; email: string }>;
+      teams: Array<{ id: string; name: string }>;
+      accounts: Array<{ id: string; name: string }>;
+    }>(sql`
+      WITH option_page AS MATERIALIZED (
+        SELECT ${sql.join(
+          Object.entries(columns).map(
+            ([name, column]) => sql`${column} AS ${sql.identifier(name)}`,
+          ),
+          sql`, `,
+        )}
+        FROM ${table}
+        WHERE ${and(where, page.boundary) ?? sql`true`}
+        ORDER BY ${sql.join(page.orderBy, sql`, `)} LIMIT ${page.limit}
+      ), page_policies AS MATERIALIZED (
+        SELECT row_policy.organization_id AS "organizationId",
+          row_policy.resource, row_policy.scope, row_policy.grants
+        FROM option_page
+        JOIN resource_permission_policies row_policy
+          ON row_policy.organization_id = option_page."organizationId"
+          AND row_policy.resource IN ('agent', 'mcpGateway')
+          AND row_policy.scope = option_page.id::text
+      ), recipient_ids AS MATERIALIZED (
+        SELECT DISTINCT entry->'subject'->>'type' AS type,
+          entry->'subject'->>'id' AS id
+        FROM page_policies, jsonb_array_elements(grants) entry
+        WHERE (entry->'actions') ? 'read'
+          AND entry->'subject'->>'type' IN ('team', 'user')
+      )
+      SELECT
+        coalesce((SELECT json_agg(option_page ORDER BY ${sql.join(page.projectedOrderBy, sql`, `)}) FROM option_page), '[]'::json) AS rows,
+        coalesce((SELECT json_agg(page_policies) FROM page_policies), '[]'::json) AS policies,
+        coalesce((SELECT json_agg(option_user) FROM (
+          SELECT id, name, email FROM "user"
+          WHERE id = ANY(ARRAY(
+            SELECT "authorId" FROM option_page WHERE "createdByServiceAccountId" IS NULL
+            UNION SELECT id FROM recipient_ids WHERE type = 'user'
+          ))
+        ) option_user), '[]'::json) AS users,
+        coalesce((SELECT json_agg(option_team) FROM (
+          SELECT id, name FROM team
+          WHERE id = ANY(ARRAY(SELECT id FROM recipient_ids WHERE type = 'team'))
+        ) option_team), '[]'::json) AS teams,
+        coalesce((SELECT json_agg(option_account) FROM (
+          SELECT id, name FROM service_accounts
+          WHERE id = ANY(ARRAY(SELECT DISTINCT "createdByServiceAccountId" FROM option_page))
+        ) option_account), '[]'::json) AS accounts
+    `);
+    const { rows, policies, users, teams, accounts } = result.rows[0];
+    const userById = new Map(users.map((user) => [user.id, user]));
+    const accountById = new Map(
+      accounts.map((account) => [account.id, account]),
+    );
+    const agents = rows.map((row) => {
+      const creatorAccount = row.createdByServiceAccountId
+        ? accountById.get(row.createdByServiceAccountId)
+        : undefined;
+      const creatorUser =
+        !row.createdByServiceAccountId && row.authorId
+          ? userById.get(row.authorId)
+          : undefined;
+      const createdBy = creatorAccount
+        ? CreatedByModel.fromServiceAccount(creatorAccount)
+        : creatorUser
+          ? CreatedByModel.fromUser(creatorUser)
+          : null;
+      return {
+        ...row,
+        teams: [] as { id: string; name: string }[],
+        users: [] as AgentOption["users"],
+        authorName: createdBy?.name ?? null,
+        authorEmail: createdBy?.email ?? null,
+        createdBy,
+      };
+    });
+    const [recipients] = await Promise.all([
+      ResourcePermissionPolicyModel.findReadRecipientDetails({
+        resources: ["agent", "mcpGateway"],
+        scopes: agents.map((agent) => agent.id),
+        policies,
+        recipients: {
+          teams,
+          users,
+        },
+        excludeUserIds: new Map(
+          agents.map((agent) => [agent.id, agent.authorId]),
+        ),
+      }),
+      AgentModel.populateGrantedScope(agents, policies),
+    ]);
+    for (const agent of agents) {
+      const details = recipients.get(agent.id);
+      agent.teams = (details?.teams ?? []).map(({ id, name }) => ({
+        id,
+        name,
+      }));
+      agent.users = (details?.users ?? []).map(({ id }) => ({ id }));
+    }
+    // SPDX-SnippetEnd
+    return agents;
+  }
+
+  private static readonly gatewayById = new PreparedQuery((database) =>
+    database
+      .select(gatewayAgentSelection())
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.id, sql.placeholder("id")),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .limit(1)
+      .prepare("archestra_gateway_agent_by_id"),
+  );
+
+  private static readonly organizationProxy = new PreparedQuery((database) =>
+    database
+      .select(gatewayAgentSelection())
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(
+            schema.agentsTable.organizationId,
+            sql.placeholder("organizationId"),
+          ),
+          eq(schema.agentsTable.agentType, "llm_proxy"),
+          eq(schema.agentsTable.isDefault, true),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .limit(1)
+      .prepare("archestra_organization_llm_proxy"),
+  );
+
+  private static readonly deploymentProxy = new PreparedQuery((database) =>
+    database
+      .select(gatewayAgentSelection())
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(
+            schema.agentsTable.organizationId,
+            database
+              .select({ id: schema.organizationsTable.id })
+              .from(schema.organizationsTable)
+              .orderBy(asc(schema.organizationsTable.createdAt))
+              .limit(1),
+          ),
+          eq(schema.agentsTable.agentType, "llm_proxy"),
+          eq(schema.agentsTable.isDefault, true),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .limit(1)
+      .prepare("archestra_deployment_llm_proxy"),
+  );
+
+  private static readonly firstOrganization = new PreparedQuery((database) =>
+    database
+      .select({ id: schema.organizationsTable.id })
+      .from(schema.organizationsTable)
+      .orderBy(asc(schema.organizationsTable.createdAt))
+      .limit(1)
+      .prepare("archestra_first_organization"),
+  );
+
+  private static async loadAccessContext(
+    id: string,
+  ): Promise<AgentAccessContext | null> {
+    const [agent] = await db
+      .select({
+        id: schema.agentsTable.id,
+        organizationId: schema.agentsTable.organizationId,
+        scope: schema.agentsTable.scope,
+        authorId: schema.agentsTable.authorId,
+        agentType: schema.agentsTable.agentType,
+        createdByServiceAccountId: schema.agentsTable.createdByServiceAccountId,
+      })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    return agent ?? null;
+  }
 }
 
-const PERSONAL_MCP_GATEWAY_NAME = "My Gateway";
 const PERSONAL_MCP_GATEWAY_DESCRIPTION =
   "All MCP servers you install are automatically connected to this gateway.";
+
+type AgentRecordStatus = "active" | "deleted";
+
+function getAgentStatusCondition(status: AgentRecordStatus): SQL {
+  return status === "deleted"
+    ? isNotNull(schema.agentsTable.deletedAt)
+    : notDeleted(schema.agentsTable);
+}
+
+function getAgentTypeLabel(agentType: AgentType): string {
+  switch (agentType) {
+    case "mcp_gateway":
+      return "MCP gateway";
+    case "llm_proxy":
+      return "LLM proxy";
+    case "agent":
+      return "agent";
+    case "profile":
+      return "profile";
+  }
+}
 
 function errorMentions(error: unknown, needle: string): boolean {
   if (!(error instanceof Error)) return false;
@@ -1943,8 +6706,887 @@ function isQueryKnowledgeSourcesTool(toolName: string): boolean {
   );
 }
 
+function hasKnowledgeSources(
+  agent: Pick<Agent, "knowledgeBaseIds" | "connectorIds">,
+): boolean {
+  return agent.knowledgeBaseIds.length > 0 || agent.connectorIds.length > 0;
+}
+
+/**
+ * The list's tool counts from an agent's tools, by the rule the `toolCounts`
+ * SQL applies: delegations are subagents, and the knowledge search tool is
+ * counted apart (isQueryKnowledgeSourcesTool, the JS twin of
+ * isKnowledgeSearchToolName).
+ */
+function countListTools(
+  tools: Array<Pick<ToolRef, "delegateToAgentId" | "name">>,
+): ListToolCounts {
+  const counts = { tools: 0, subagents: 0, knowledgeTools: 0 };
+  for (const tool of tools) {
+    if (tool.delegateToAgentId !== null) {
+      counts.subagents++;
+      continue;
+    }
+    counts.tools++;
+    if (isQueryKnowledgeSourcesTool(tool.name)) counts.knowledgeTools++;
+  }
+  return counts;
+}
+
+/**
+ * Whether a tool is the knowledge search tool: its bare name, or the name
+ * after a server prefix. Only the leading `_%` is a wildcard. Shared by the
+ * list's Tools count and its sort so the two agree.
+ */
+function isKnowledgeSearchToolName(name: AnyPgColumn | SQL): SQL {
+  const prefixed = `_%${escapeLikePattern(
+    `${MCP_SERVER_TOOL_NAME_SEPARATOR}${TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME}`,
+  )}`;
+  return sql`(${name} = ${TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME} or ${name} like ${prefixed})`;
+}
+
+/**
+ * Whether the agent in the enclosing `agents` row has no knowledge base and no
+ * connector. Its knowledge search tool then does not count as a tool.
+ */
+function hasNoKnowledgeSources(): SQL {
+  const agentId = qualified(schema.agentsTable.id);
+  return sql`NOT EXISTS (
+      SELECT 1 FROM ${schema.agentKnowledgeBasesTable}
+      WHERE ${qualified(schema.agentKnowledgeBasesTable.agentId)} = ${agentId}
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM ${schema.agentConnectorAssignmentsTable}
+      WHERE ${qualified(schema.agentConnectorAssignmentsTable.agentId)} = ${agentId}
+    )`;
+}
+
+/**
+ * Ceiling for {@link AgentModel.purge}'s transaction, ten times the pool-wide
+ * default. See that method for why the default is too low and why this is a
+ * finite number rather than no limit at all.
+ */
+const PURGE_STATEMENT_TIMEOUT_MS = 300_000;
+
+/**
+ * Column set for the slim {@link AgentToolRef} embedded in agent payloads.
+ * Deliberately excludes `parameters` and the other wide tool columns so agent
+ * list queries don't drag every assigned tool's JSON schema out of the
+ * database once per assignment; the dedicated per-agent tools endpoints serve
+ * full tool definitions.
+ */
+const agentToolRefColumns = {
+  id: schema.toolsTable.id,
+  agentId: schema.toolsTable.agentId,
+  catalogId: schema.toolsTable.catalogId,
+  delegateToAgentId: schema.toolsTable.delegateToAgentId,
+  delegateToA2aConnectionId: schema.toolsTable.delegateToA2aConnectionId,
+  name: schema.toolsTable.name,
+  rawName: schema.toolsTable.rawName,
+  description: schema.toolsTable.description,
+};
+
 export default AgentModel;
 
-function isAutomaticToolAssignmentSupported(agentType: string): boolean {
-  return agentType === "agent" || agentType === "mcp_gateway";
+// The chat roster appears before the picker opens. Emoji and short URL icons
+// are cheap enough to keep inline; base64 image data is fetched only for the
+// selected agent through the existing detail endpoint.
+const MAX_INLINE_CHAT_AGENT_ICON_CHARS = 1_024;
+const CHAT_AGENT_ROW_COLUMNS = {
+  ...getTableColumns(schema.agentsTable),
+  systemPrompt: sql<string | null>`null`,
+  icon: sql<string | null>`case
+    when length(${schema.agentsTable.icon}) <= ${MAX_INLINE_CHAT_AGENT_ICON_CHARS}
+      then ${schema.agentsTable.icon}
+    else null
+  end`,
+};
+
+const OPTION_ROW_COLUMNS = {
+  id: schema.agentsTable.id,
+  name: schema.agentsTable.name,
+  slug: schema.agentsTable.slug,
+  agentType: schema.agentsTable.agentType,
+  icon: CHAT_AGENT_ROW_COLUMNS.icon,
+  scope: schema.agentsTable.scope,
+  authorId: schema.agentsTable.authorId,
+  isPersonalGateway: schema.agentsTable.isPersonalGateway,
+  runtime: schema.agentsTable.runtime,
+  description: schema.agentsTable.description,
+  organizationId: schema.agentsTable.organizationId,
+  createdByServiceAccountId: schema.agentsTable.createdByServiceAccountId,
+};
+
+const CHAT_ROSTER_COLUMNS = {
+  id: schema.agentsTable.id,
+  organizationId: schema.agentsTable.organizationId,
+  name: schema.agentsTable.name,
+  description: schema.agentsTable.description,
+  icon: CHAT_AGENT_ROW_COLUMNS.icon,
+  scope: schema.agentsTable.scope,
+  authorId: schema.agentsTable.authorId,
+  agentType: schema.agentsTable.agentType,
+  builtIn: schema.agentsTable.builtIn,
+  builtInAgentConfig: schema.agentsTable.builtInAgentConfig,
+  runtime: schema.agentsTable.runtime,
+  modelId: schema.agentsTable.modelId,
+  llmApiKeyId: schema.agentsTable.llmApiKeyId,
+  modelPoolId: schema.agentsTable.modelPoolId,
+  autoRouterId: schema.agentsTable.autoRouterId,
+};
+
+type RosterCursorFields = { cursorValue?: string; chatRank?: number };
+
+type RosterPage = {
+  boundary: SQL | undefined;
+  cursorColumns: { cursorValue: SQL<string>; chatRank: SQL<number> };
+  orderBy: SQL[];
+  // These expressions use findOptionRows' option_page alias.
+  projectedOrderBy: SQL[];
+  limit: number;
+  position: (row: {
+    id: string;
+    name: string;
+    cursorValue?: string;
+    chatRank?: number;
+  }) => { id: string; value: string };
+};
+
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+/**
+ * The row's own object policies, the input of populateGrantedScope and
+ * findReadRecipients. Object ids are unique across resources, so both agent
+ * resources are read and each id finds its own policy. An agent's policy
+ * lives in the agent's organization, which makes each read a primary-key
+ * probe.
+ */
+function objectPoliciesColumn() {
+  return sql<ObjectPolicy[]>`(
+    SELECT coalesce(json_agg(json_build_object(
+      'organizationId', row_policy.organization_id,
+      'resource', row_policy.resource,
+      'scope', row_policy.scope,
+      'grants', row_policy.grants)), '[]'::json)
+    FROM resource_permission_policies row_policy
+    WHERE row_policy.organization_id = ${qualified(schema.agentsTable.organizationId)}
+      AND row_policy.resource IN ('agent', 'mcpGateway')
+      AND row_policy.scope = ${qualified(schema.agentsTable.id)}::text
+  )`;
 }
+
+// SPDX-SnippetEnd
+
+/** The agent types that have a grant namespace: everything but LLM proxies. */
+const GRANTED_AGENT_TYPES: AgentType[] = ["agent", "profile", "mcp_gateway"];
+
+/** {@link CHAT_ROSTER_COLUMNS} with the computed icon named, for a subquery. */
+const CHAT_ROSTER_PHASE_COLUMNS = {
+  ...CHAT_ROSTER_COLUMNS,
+  icon: CHAT_AGENT_ROW_COLUMNS.icon.as("icon"),
+};
+
+function explicitAgentReadCondition(principals: GrantPrincipal[]) {
+  const table = schema.agentsTable;
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  return or(
+    and(
+      inArray(table.agentType, ["agent", "profile"]),
+      ResourcePermissionPolicyModel.grantConditionForAny({
+        principals,
+        organizationColumn: table.organizationId,
+        resource: "agent",
+        scopeColumn: table.id,
+        action: "read",
+      }),
+    ),
+    and(
+      eq(table.agentType, "mcp_gateway"),
+      ResourcePermissionPolicyModel.grantConditionForAny({
+        principals,
+        organizationColumn: table.organizationId,
+        resource: "mcpGateway",
+        scopeColumn: table.id,
+        action: "read",
+      }),
+    ),
+  );
+  // SPDX-SnippetEnd
+}
+
+/**
+ * {@link explicitAgentReadCondition} for rows of one organization whose types
+ * the caller reads at `*` in none of `types` (the permission checker answered
+ * that from the same grants, so the `*` probe is false here). The objects
+ * granted to the caller are read once by their grants and joined by primary
+ * key, instead of probing a policy for every row of the organization. Only a
+ * canonical uuid scope can equal an id's text.
+ */
+function grantedAgentIdsCondition(params: {
+  principals: GrantPrincipal[];
+  organizationId: string;
+  types: AgentType[];
+}): SQL {
+  const table = schema.agentsTable;
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  const subjects = params.principals
+    .filter((principal) => principal.organizationId === params.organizationId)
+    .flatMap((principal) => principal.subjects);
+  if (subjects.length === 0 || params.types.length === 0) return sql`false`;
+  const resources = [
+    ...new Set(
+      params.types.map((type) =>
+        type === "mcp_gateway" ? "mcpGateway" : "agent",
+      ),
+    ),
+  ];
+  const candidates = sql`ARRAY[${sql.join(
+    subjects.map(
+      (subject) => sql`${JSON.stringify([{ subject, actions: ["read"] }])}`,
+    ),
+    sql`, `,
+  )}]::jsonb[]`;
+  // Read the allowed IDs once so the query can find agents by ID. This set
+  // can include both agent and gateway policies. The check below must still
+  // match each row's resource: a policy for another resource with the same
+  // ID must not give access.
+  return and(
+    inArray(table.agentType, params.types),
+    sql`${table.id} = ANY(ARRAY(
+      SELECT granted_policy.scope::uuid
+      FROM resource_permission_policies granted_policy
+      WHERE granted_policy.organization_id = ${params.organizationId}
+        AND granted_policy.resource IN (${sql.join(
+          resources.map((resource) => sql`${resource}`),
+          sql`, `,
+        )})
+        AND granted_policy.scope ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        AND granted_policy.grants @> ANY(${candidates})
+    ))`,
+    sql`EXISTS (
+      SELECT 1 FROM resource_permission_policies row_grant
+      WHERE row_grant.organization_id = ${params.organizationId}
+        AND row_grant.resource = CASE WHEN ${table.agentType} = 'mcp_gateway' THEN 'mcpGateway' ELSE 'agent' END
+        AND row_grant.scope = ${table.id}::text
+        AND row_grant.grants @> ANY(${candidates})
+    )`,
+  ) as SQL;
+  // SPDX-SnippetEnd
+}
+
+function withoutOrganization<T extends { organizationId: string }>(
+  rows: T[],
+): Omit<T, "organizationId">[] {
+  return rows.map(({ organizationId: _, ...row }) => row);
+}
+
+/** {@link gatedAgentsFence} over the organizations the caller's principals span. */
+function callerAgentsFence(
+  userId: string,
+  principals: GrantPrincipal[],
+): Promise<SQL | undefined> {
+  return gatedAgentsFence({
+    userId,
+    organizationIds: principals.map(({ organizationId }) => organizationId),
+  });
+}
+
+/**
+ * The list fence for every agent kind: agents and MCP gateways by their read
+ * grants, and LLM proxies unfenced here because they have no grant namespace
+ * of their own — the caller's own conditions decide those.
+ */
+function agentListFence(principals: GrantPrincipal[]): SQL {
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  return or(
+    eq(schema.agentsTable.agentType, "llm_proxy"),
+    explicitAgentReadCondition(principals),
+  ) as SQL;
+  // SPDX-SnippetEnd
+}
+
+/**
+ * Shared accessible-ID query. List filters embed this exact authorization set
+ * instead of fetching the whole roster and sending its IDs back as parameters,
+ * so selective filters such as pins can narrow the work in the database.
+ */
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+function accessibleAgentIdsQuery(params: AccessibleAgentsParams) {
+  return db
+    .select({ id: schema.agentsTable.id })
+    .from(schema.agentsTable)
+    .where(accessibleAgentsCondition(params));
+}
+
+function accessibleAgentsCondition(params: AccessibleAgentsParams) {
+  return and(
+    notDeleted(schema.agentsTable),
+    params.among ? inArray(schema.agentsTable.id, params.among) : undefined,
+    or(
+      explicitAgentReadCondition(params.principals),
+      params.isAgentAdmin ? sql`true` : undefined,
+      organizationLlmProxyCondition(params.userId),
+    ),
+  );
+}
+
+interface AccessibleAgentsParams {
+  userId: string;
+  isAgentAdmin: boolean;
+  principals: GrantPrincipal[];
+  among?: string[];
+}
+// SPDX-SnippetEnd
+
+/**
+ * The organization's LLM Proxy, for a member of that organization. A proxy has
+ * no grant namespace of its own: the one row every proxy request resolves to
+ * serves the whole organization, and the retired per-user proxy rows it
+ * replaced are reached by nobody but an administrator.
+ */
+function organizationLlmProxyCondition(userId: string): SQL {
+  const table = schema.agentsTable;
+  return and(
+    eq(table.agentType, "llm_proxy"),
+    eq(table.isDefault, true),
+    sql`EXISTS (SELECT 1 FROM member proxy_member WHERE proxy_member.organization_id = ${table.organizationId} AND proxy_member.user_id = ${userId})`,
+  ) as SQL;
+}
+
+/**
+ * The agent's own policy grants read to this user by name. Every personal
+ * agent's policy names its author, so this matches only shares with the
+ * caller; it never widens what the roster's base query lets the caller read.
+ */
+function namedChatReader(userId: string): SQL {
+  const table = schema.agentsTable;
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  const grant = JSON.stringify([
+    { subject: { type: "user", id: userId }, actions: ["read"] },
+  ]);
+  return sql`(${table.organizationId}, ${table.id}::text) IN (
+    SELECT named_policy.organization_id, named_policy.scope
+    FROM resource_permission_policies named_policy
+    WHERE named_policy.resource = 'agent' AND named_policy.scope <> '*'
+      AND named_policy.grants @> ${grant}::jsonb
+  )`;
+  // SPDX-SnippetEnd
+}
+
+/**
+ * Whether another user's agent grants this user read by name on its own
+ * policy: the share {@link namedChatReader} admits to the chat roster. An
+ * agent read only through admin oversight is not shared by name.
+ */
+function isSharedByName(params: {
+  agent: Pick<Agent, "id" | "organizationId" | "agentType" | "authorId">;
+  policies: ObjectPolicy[];
+  userId: string;
+}): boolean {
+  const { agent, policies, userId } = params;
+  if (agent.authorId === userId || agent.agentType === "llm_proxy")
+    return false;
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  const resource = agent.agentType === "mcp_gateway" ? "mcpGateway" : "agent";
+  return policies.some(
+    (policy) =>
+      policy.organizationId === agent.organizationId &&
+      policy.resource === resource &&
+      policy.scope === agent.id &&
+      policy.grants.some(
+        (grant) =>
+          grant.subject.type === "user" &&
+          grant.subject.id === userId &&
+          grant.actions.includes("read"),
+      ),
+  );
+  // SPDX-SnippetEnd
+}
+
+/**
+ * {@link ResourcePermissionPolicyModel.audienceIs} for every agent kind. The
+ * organization's LLM proxy has no grant namespace and serves the whole
+ * organization, so it always reads as `org`.
+ */
+function agentAudienceIs(audience: "personal" | "team" | "org"): SQL {
+  const table = schema.agentsTable;
+  const byResource = (resource: "agent" | "mcpGateway") =>
+    ResourcePermissionPolicyModel.audienceIs({
+      organizationId: table.organizationId,
+      resource,
+      scopeColumn: table.id,
+      ownerColumn: table.authorId,
+      audience,
+    });
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  return or(
+    and(inArray(table.agentType, ["agent", "profile"]), byResource("agent")),
+    and(eq(table.agentType, "mcp_gateway"), byResource("mcpGateway")),
+    and(
+      eq(table.agentType, "llm_proxy"),
+      audience === "org" ? sql`true` : sql`false`,
+    ),
+  ) as SQL;
+  // SPDX-SnippetEnd
+}
+
+/**
+ * {@link ResourcePermissionPolicyModel.accessRelationCondition} for every
+ * agent kind. The organization's LLM proxy has no grant namespace and serves
+ * the whole organization, so it is always `org`, counts as shared with the
+ * organization, and has no owner.
+ */
+function agentAccessCondition(params: {
+  userId: string;
+  principals: GrantPrincipal[];
+  selection: ResourceAccessSelection;
+}): SQL | undefined {
+  const { relations, sharedWith, ownerIds } = params.selection;
+  const table = schema.agentsTable;
+  const subjects = params.principals.flatMap((principal) => principal.subjects);
+  const byResource = (resource: "agent" | "mcpGateway") =>
+    ResourcePermissionPolicyModel.accessRelationCondition({
+      organizationId: table.organizationId,
+      resource,
+      scopeColumn: table.id,
+      ownerColumn: table.authorId,
+      userId: params.userId,
+      subjects,
+      ...params.selection,
+    });
+  const agentCondition = byResource("agent");
+  if (!agentCondition) return undefined;
+  const llmProxyMatches =
+    (!relations?.length || relations.includes("org")) &&
+    (!sharedWith?.length ||
+      sharedWith.some((subject) => subject.type === "organization")) &&
+    !ownerIds?.length;
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  return or(
+    and(inArray(table.agentType, ["agent", "profile"]), agentCondition),
+    and(eq(table.agentType, "mcp_gateway"), byResource("mcpGateway")),
+    and(
+      eq(table.agentType, "llm_proxy"),
+      llmProxyMatches ? sql`true` : sql`false`,
+    ),
+  ) as SQL;
+  // SPDX-SnippetEnd
+}
+
+/**
+ * The "Show" filter for external A2A agents, read from their own policies like
+ * internal agents.
+ */
+function externalAgentAccessCondition(params: {
+  userId: string;
+  /** The caller's subjects, e.g. from `resolvePrincipals`. */
+  subjects: PermissionSubject[];
+  selection: ResourceAccessSelection;
+}): SQL | undefined {
+  const table = schema.a2aRemoteAgentsTable;
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  return ResourcePermissionPolicyModel.accessRelationCondition({
+    organizationId: table.organizationId,
+    resource: "externalAgent",
+    scopeColumn: table.id,
+    ownerColumn: table.authorId,
+    userId: params.userId,
+    subjects: params.subjects,
+    ...params.selection,
+  });
+  // SPDX-SnippetEnd
+}
+
+/** An external agent's audience, read from its own policy. */
+function externalAgentAudienceIs(audience: "personal" | "team" | "org"): SQL {
+  const table = schema.a2aRemoteAgentsTable;
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  return ResourcePermissionPolicyModel.audienceIs({
+    organizationId: table.organizationId,
+    resource: "externalAgent",
+    scopeColumn: table.id,
+    ownerColumn: table.authorId,
+    audience,
+  });
+  // SPDX-SnippetEnd
+}
+
+/** The alphabetically first team an external agent's policy grants read to. */
+function externalAgentFirstGrantedTeamName() {
+  const table = schema.a2aRemoteAgentsTable;
+  return sql<string | null>`(
+    SELECT min(granted_team.name)
+    FROM resource_permission_policies team_policy,
+      jsonb_array_elements(team_policy.grants) team_entry,
+      team granted_team
+    WHERE team_policy.organization_id = ${table.organizationId}
+      AND team_policy.resource = 'externalAgent'
+      AND team_policy.scope = ${table.id}::text
+      AND (team_entry->'actions') ? 'read'
+      AND team_entry->'subject'->>'type' = 'team'
+      AND granted_team.id = team_entry->'subject'->>'id'
+  )`;
+}
+
+/** Agents whose own policy grants read to any of `teamIds`. */
+function agentGrantsReadToAnyTeam(teamIds: string[]): SQL {
+  const table = schema.agentsTable;
+  const byResource = (resource: "agent" | "mcpGateway") =>
+    ResourcePermissionPolicyModel.grantsReadToAnyTeam({
+      organizationId: table.organizationId,
+      resource,
+      scopeColumn: table.id,
+      teamIds,
+    });
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  return or(
+    and(inArray(table.agentType, ["agent", "profile"]), byResource("agent")),
+    and(eq(table.agentType, "mcp_gateway"), byResource("mcpGateway")),
+  ) as SQL;
+  // SPDX-SnippetEnd
+}
+
+/** The first (by name) team an agent's own policy grants read to. */
+function agentFirstGrantedTeamName() {
+  return sql<string | null>`(
+    SELECT min(granted_team_name.name) FROM team granted_team_name
+    WHERE granted_team_name.id = ANY(${agentGrantedTeamIds()})
+  )`;
+}
+
+/** The teams an agent's own policy grants read to, as a SQL text array. */
+function agentGrantedTeamIds() {
+  const table = schema.agentsTable;
+  return sql<string[]>`coalesce(array(
+    SELECT DISTINCT granted_team.subject_id FROM (
+      SELECT team_entry->'subject'->>'id' AS subject_id
+      FROM resource_permission_policies team_policy,
+        jsonb_array_elements(team_policy.grants) team_entry
+      WHERE team_policy.organization_id = ${table.organizationId}
+        AND team_policy.resource = CASE WHEN ${table.agentType} = 'mcp_gateway' THEN 'mcpGateway' ELSE 'agent' END
+        AND team_policy.scope = ${table.id}::text
+        AND (team_entry->'actions') ? 'read'
+        AND team_entry->'subject'->>'type' = 'team'
+    ) granted_team
+  ), array[]::text[])`;
+}
+
+// ===
+// Agent catalog access prefilter
+// ===
+
+/**
+ * The agents the catalog's "Show" filter can keep, as one id set the database
+ * builds once, so the plan starts from those rows instead of testing the
+ * relation filter on every agent. An administrator reads every agent through
+ * the `*` grant, so that test otherwise ran against every other member's
+ * personal agent.
+ *
+ * The set is a superset of what the relations keep: `mine` needs the caller
+ * as author; `shared` needs a read grant to one of the caller's teams or own
+ * ids; `org` needs a read grant to the organization or a role. The set holds
+ * exactly the authored agents and the agents whose policy has such a grant,
+ * and the exact relation filter stays ANDed on top, so the prefilter can only
+ * remove rows that filter removes too. It is undefined where no such set
+ * exists: a selection with `others` (rows nobody is granted), or with no or
+ * every relation (no relation filter at all). The catalog's regular branch
+ * lists only `agent` rows, so only `agent` policies are read.
+ */
+function catalogAccessCandidateIds(params: {
+  organizationId: string | undefined;
+  userId: string;
+  /** The caller's subjects, e.g. from `resolvePrincipals`. */
+  subjects: PermissionSubject[];
+  selection: ResourceAccessSelection | undefined;
+  includeBuiltIn: boolean;
+}): SQL | undefined {
+  const selected = new Set(
+    params.selection?.relations ?? RESOURCE_ACCESS_RELATIONS,
+  );
+  if (
+    !params.organizationId ||
+    selected.size === 0 ||
+    selected.has("others") ||
+    RESOURCE_ACCESS_RELATIONS.every((relation) => selected.has(relation))
+  )
+    return undefined;
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  const grantedSubjects: Array<{ type: string; id?: string }> = [];
+  if (selected.has("shared")) {
+    for (const subject of params.subjects) {
+      if (subject.type === "team") grantedSubjects.push(subject);
+      // The relation matches the caller's own ids under either self type.
+      if (subject.type === "user" || subject.type === "serviceAccount")
+        grantedSubjects.push(
+          { type: "user", id: subject.id },
+          { type: "serviceAccount", id: subject.id },
+        );
+    }
+  }
+  // Any organization or role grant makes the audience `org`.
+  if (selected.has("org"))
+    grantedSubjects.push({ type: "organization" }, { type: "role" });
+
+  const table = schema.agentsTable;
+  const sources: SQL[] = [];
+  if (selected.has("mine"))
+    sources.push(
+      sql`SELECT own_agent.id FROM ${table} own_agent WHERE own_agent.author_id = ${params.userId}`,
+    );
+  if (grantedSubjects.length > 0) {
+    const patterns = grantedSubjects.map(
+      (subject) => sql`${JSON.stringify([{ subject, actions: ["read"] }])}`,
+    );
+    // Policy scopes are object ids or `*`; only object ids name an agent.
+    sources.push(sql`SELECT CASE WHEN access_policy.scope ~* ${UUID_PATTERN}
+        THEN access_policy.scope::uuid END
+      FROM resource_permission_policies access_policy
+      WHERE access_policy.organization_id = ${params.organizationId}
+        AND access_policy.resource = 'agent'
+        AND access_policy.scope <> '*'
+        AND access_policy.grants @> ANY(ARRAY[${sql.join(patterns, sql`, `)}]::jsonb[])`);
+  }
+  if (params.includeBuiltIn)
+    sources.push(
+      sql`SELECT built_in_agent.id FROM ${table} built_in_agent WHERE built_in_agent.organization_id = ${params.organizationId} AND built_in_agent.built_in`,
+    );
+  if (sources.length === 0) return sql<boolean>`false`;
+  return sql<boolean>`${table.id} IN (${sql.join(sources, sql` UNION ALL `)})`;
+  // SPDX-SnippetEnd
+}
+
+const UUID_PATTERN =
+  "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
+
+// ===
+// Agent catalog sorting
+// ===
+
+const CATALOG_COMPUTED_SORTS = new Set<string>([
+  "toolsCount",
+  "subagentsCount",
+  "lastUsedAt",
+]);
+
+/**
+ * The value a catalog row sorts on for the columns the list computes, as each
+ * cell shows it: "All" ranks above any count, and an external agent, which
+ * has neither tools nor a last use here, sorts below every internal agent.
+ * Other sorts read a plain column, so this is a constant for them and costs
+ * nothing per row.
+ */
+function catalogSortValue(sortBy: string | undefined): {
+  regular: SQL;
+  external: SQL;
+} {
+  const assigned = (delegation: "IS NULL" | "IS NOT NULL") => sql`(
+    SELECT count(*)
+    FROM ${schema.agentToolsTable}
+    INNER JOIN ${schema.toolsTable}
+      ON ${qualified(schema.toolsTable.id)} = ${qualified(schema.agentToolsTable.toolId)}
+    WHERE ${qualified(schema.agentToolsTable.agentId)} = ${qualified(schema.agentsTable.id)}
+      AND ${qualified(schema.toolsTable.delegateToAgentId)} ${sql.raw(delegation)}
+  )`;
+  switch (sortBy) {
+    case "toolsCount":
+      return {
+        regular: sql`CASE WHEN ${qualified(schema.agentsTable.accessAllTools)}
+          THEN ${ALL_SORTS_ABOVE_ANY_COUNT}::bigint
+          ELSE ${assigned("IS NULL")} END`,
+        external: sql`-1::bigint`,
+      };
+    case "subagentsCount":
+      return {
+        regular: sql`CASE WHEN ${qualified(schema.agentsTable.accessAllSubagents)}
+          THEN ${ALL_SORTS_ABOVE_ANY_COUNT}::bigint
+          ELSE ${assigned("IS NOT NULL")} END`,
+        external: sql`-1::bigint`,
+      };
+    case "lastUsedAt":
+      return {
+        regular: sql`COALESCE(${qualified(schema.agentsTable.lastUsedAt)}, '-infinity'::timestamp)`,
+        external: sql`'-infinity'::timestamp`,
+      };
+    default:
+      return { regular: sql`0`, external: sql`0` };
+  }
+}
+
+const ALL_SORTS_ABOVE_ANY_COUNT = 2147483647;
+
+/** Shared by the startup preflight and the per-member creation guard. */
+function personalChatAgentConditions(params: {
+  userId: string | AnyPgColumn;
+  organizationId: string | AnyPgColumn;
+  excludeId?: string;
+}) {
+  return [
+    eq(schema.agentsTable.organizationId, params.organizationId),
+    eq(schema.agentsTable.authorId, params.userId),
+    eq(schema.agentsTable.agentType, "agent"),
+    agentAudienceIs("personal"),
+    eq(schema.agentsTable.builtIn, false),
+    params.excludeId ? ne(schema.agentsTable.id, params.excludeId) : undefined,
+  ];
+}
+
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+/** Match the scope actually returned by selector hydration, including proxy rows. */
+function optionScopeCondition(scope: AgentScope): SQL {
+  const table = schema.agentsTable;
+  return or(
+    and(eq(table.agentType, "llm_proxy"), eq(table.scope, scope)),
+    and(ne(table.agentType, "llm_proxy"), agentAudienceIs(scope)),
+  ) as SQL;
+}
+
+/** Same direct read recipients and existing-row filter as findReadRecipientDetails. */
+function optionRecipientCondition(
+  subject: "team" | "user",
+  ids: string[],
+): SQL {
+  if (ids.length === 0) return sql`true`;
+  const recipientTable = subject === "team" ? sql`team` : sql`"user"`;
+  const grant =
+    subject === "team"
+      ? ResourcePermissionPolicyModel.teamReadGrantCondition(
+          sql`recipient_entry`,
+        )
+      : sql`(recipient_entry->'actions') ? 'read' AND recipient_entry->'subject'->>'type' = 'user'`;
+  return sql`NOT EXISTS (
+    SELECT 1 FROM unnest(${sql.param(ids)}::text[]) desired(id)
+    WHERE NOT (${subject === "user" ? sql`coalesce(${schema.agentsTable.authorId} = desired.id, false) OR` : sql``} EXISTS (
+      SELECT 1 FROM resource_permission_policies recipient_policy
+      CROSS JOIN LATERAL jsonb_array_elements(recipient_policy.grants) recipient_entry
+      JOIN ${recipientTable} existing_recipient ON existing_recipient.id = recipient_entry->'subject'->>'id'
+      WHERE recipient_policy.scope = ${schema.agentsTable.id}::text
+        AND recipient_policy.resource IN ('agent', 'mcpGateway')
+        AND ${grant} AND existing_recipient.id = desired.id
+    ))
+  )`;
+}
+
+/** Search the existing picker text in SQL; relation names are grouped set-wise. */
+function optionSearchCondition(filters: AgentOptionFilters): SQL {
+  const pattern = `%${escapeLikePattern(filters.search ?? "")}%`;
+  const table = schema.agentsTable;
+  if (filters.searchMode === "name") return ilike(table.name, pattern);
+  if (filters.searchMode === "name_or_description")
+    return or(
+      ilike(table.name, pattern),
+      ilike(table.description, pattern),
+    ) as SQL;
+  // The searched text joins the fields with single spaces, so a term without
+  // a space matches it exactly when it matches one field. Each field is then
+  // its own condition: the name per row, and the people, accounts and teams
+  // whose names match as sets read once, instead of joining and grouping
+  // every agent's text before filtering.
+  if (!(filters.search ?? "").includes(" ")) {
+    return or(
+      ilike(table.name, pattern),
+      and(
+        isNull(table.createdByServiceAccountId),
+        sql`${table.authorId} IN (
+          SELECT search_owner.id FROM "user" search_owner
+          WHERE search_owner.email ILIKE ${pattern} OR search_owner.name ILIKE ${pattern}
+        )`,
+      ),
+      sql`${table.createdByServiceAccountId} IN (
+        SELECT search_account.id FROM service_accounts search_account
+        WHERE search_account.name ILIKE ${pattern}
+      )`,
+      sql`${table.id}::text IN (
+        SELECT search_policy.scope FROM resource_permission_policies search_policy
+        WHERE search_policy.resource IN ('agent', 'mcpGateway')
+          AND search_policy.grants @> ANY(ARRAY(
+            SELECT jsonb_build_array(jsonb_build_object(
+              'subject', jsonb_build_object('type', 'team', 'id', search_team.id),
+              'actions', jsonb_build_array('read')))
+            FROM team search_team WHERE search_team.name ILIKE ${pattern}
+          ))
+      )`,
+    ) as SQL;
+  }
+  const teamGrant =
+    ResourcePermissionPolicyModel.teamReadGrantCondition(sql`search_entry`);
+  return sql`${table.id} IN (
+    SELECT search_agent.id FROM agents search_agent
+    LEFT JOIN "user" search_owner ON search_owner.id = search_agent.author_id AND search_agent.created_by_service_account_id IS NULL
+    LEFT JOIN service_accounts search_account ON search_account.id = search_agent.created_by_service_account_id
+    LEFT JOIN (
+      SELECT scope, string_agg(name, ' ' ORDER BY first_position) names
+      FROM (
+        SELECT search_policy.scope, search_team.id, search_team.name,
+          min(search_policy.organization_id || ':' || search_policy.resource || ':' || lpad(search_position::text, 20, '0')) first_position
+        FROM resource_permission_policies search_policy
+        CROSS JOIN LATERAL jsonb_array_elements(search_policy.grants) WITH ORDINALITY AS entries(search_entry, search_position)
+        JOIN team search_team ON search_team.id = search_entry->'subject'->>'id'
+        WHERE search_policy.resource IN ('agent', 'mcpGateway') AND ${teamGrant}
+        GROUP BY search_policy.scope, search_team.id, search_team.name
+      ) search_distinct_teams GROUP BY scope
+    ) search_teams ON search_teams.scope = search_agent.id::text
+    WHERE concat_ws(' ', search_agent.name,
+      nullif(search_owner.email, ''),
+      nullif(CASE WHEN search_agent.created_by_service_account_id IS NOT NULL THEN search_account.name ELSE search_owner.name END, ''),
+      nullif(search_teams.names, '')) ILIKE ${pattern}
+  )`;
+}
+// SPDX-SnippetEnd
+
+const ChatRosterCursorPositionSchema = z.object({
+  rank: z.number().int().min(0).max(3),
+  name: z.string(),
+});
+
+type ToolRef = Agent["tools"][number];
+
+type ListEnrichment = {
+  row: typeof schema.agentsTable.$inferSelect;
+  tools: ToolRef[];
+  policies: ObjectPolicy[];
+  teams: Array<{ id: string; name: string }>;
+  users: Array<{ id: string; name: string; email: string }>;
+  labels: LabelWithDetails[];
+  knowledgeBaseIds: string[];
+  connectorIds: string[];
+  suggestedPrompts: SuggestedPromptInput[];
+  pinnedAtMs: number | null;
+  creator: CreatedBy | null;
+  llmKey: { name: string; provider: SupportedProvider } | null;
+  model: { provider: SupportedProvider; modelName: string } | null;
+  /** Null when the list shows tools: the caller counts them. */
+  toolCounts: ListToolCounts | null;
+};
+
+type ListToolCounts = {
+  tools: number;
+  subagents: number;
+  knowledgeTools: number;
+};

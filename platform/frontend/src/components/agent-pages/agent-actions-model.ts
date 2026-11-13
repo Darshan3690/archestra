@@ -1,0 +1,130 @@
+import {
+  type AgentType,
+  BUILT_IN_AGENT_IDS,
+  getResourceForAgentType,
+  type Permissions,
+} from "@archestra/shared";
+import { ACTION_LABEL } from "@/lib/design/resource-lexicon";
+import {
+  type AgentPageKind,
+  agentConfigureHref,
+  agentDetailHref,
+} from "./agent-page-config";
+
+export type AgentActionId =
+  | "connect"
+  | "chat"
+  | "edit"
+  | "clone"
+  | "export"
+  | "history"
+  | "delete";
+
+export interface AgentActionDefinition {
+  id: AgentActionId;
+  label: string;
+  visible: boolean;
+  permissions?: Permissions;
+  href?: string;
+  /** Chat only: sending in the composer starts a run in the agent's dedicated runtime, so renderers swap the glyph. */
+  startsRun?: boolean;
+}
+
+/**
+ * Canonical actions shared by agent-family list rows and detail headers.
+ * Renderers choose buttons versus menu items, but labels, order, routes,
+ * visibility, and the stored record's permission resource live here.
+ */
+export function getAgentActionModel({
+  kind,
+  agent,
+  agentRuntimeEnabled = false,
+}: {
+  kind: AgentPageKind;
+  agent: {
+    id: string;
+    agentType: AgentType;
+    builtIn?: boolean | null;
+    builtInAgentConfig?: { name: string } | null;
+    runtime?: unknown | null;
+  };
+  /** The deployment's `agentRuntime` feature; a stored runtime only changes Chat while it is on, matching the composer's gate. */
+  agentRuntimeEnabled?: boolean;
+}): AgentActionDefinition[] {
+  const builtIn = !!agent.builtIn;
+  const chatCapable =
+    !builtIn || agent.builtInAgentConfig?.name === BUILT_IN_AGENT_IDS.SRE;
+  const resource = getResourceForAgentType(agent.agentType);
+  const startsRun =
+    agentRuntimeEnabled && kind === "agent" && agent.runtime != null;
+
+  return [
+    {
+      id: "connect",
+      label: ACTION_LABEL.connect,
+      visible: !builtIn,
+      permissions: permission(resource, "read"),
+      href: agentDetailHref(kind, agent.id, "connect"),
+    },
+    {
+      id: "chat",
+      label: startsRun ? ACTION_LABEL.startRun : ACTION_LABEL.chat,
+      visible: kind === "agent" && chatCapable,
+      href: `/chat/new?agent_id=${agent.id}`,
+      startsRun,
+    },
+    {
+      id: "edit",
+      label: ACTION_LABEL.edit,
+      visible: true,
+      permissions: permission(resource, "update"),
+      href: agentConfigureHref(kind, agent.id),
+    },
+    {
+      id: "clone",
+      label: ACTION_LABEL.clone,
+      visible: true,
+      permissions: permission(resource, "create"),
+    },
+    {
+      id: "export",
+      label: "Export",
+      visible: kind === "agent",
+      permissions: permission(resource, "read"),
+    },
+    {
+      id: "history",
+      label: ACTION_LABEL.versionHistory,
+      visible: true,
+      permissions: permission(resource, "read"),
+    },
+    {
+      id: "delete",
+      label: ACTION_LABEL.delete,
+      visible: true,
+      permissions: permission(resource, "delete"),
+    },
+  ];
+}
+
+export function agentAction(model: AgentActionDefinition[], id: AgentActionId) {
+  const definition = model.find((candidate) => candidate.id === id);
+  if (!definition) throw new Error(`Missing agent action definition: ${id}`);
+  return definition;
+}
+
+export function agentActionHref(definition: AgentActionDefinition): string {
+  if (!definition.href) {
+    throw new Error(`Agent action has no destination: ${definition.id}`);
+  }
+  return definition.href;
+}
+
+function permission(
+  resource: ReturnType<typeof getResourceForAgentType>,
+  action: "create" | "read" | "update" | "delete",
+): Permissions {
+  return {
+    [resource]: Array.isArray(action) ? action : [action],
+  } as Permissions;
+}

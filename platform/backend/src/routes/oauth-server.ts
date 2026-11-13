@@ -1,10 +1,15 @@
-import { OAUTH_ENDPOINTS, OAUTH_GRANT_TYPE, OAUTH_SCOPES } from "@shared";
+import {
+  OAUTH_ENDPOINTS,
+  OAUTH_GRANT_TYPE,
+  OAUTH_SCOPES,
+} from "@archestra/shared";
 import { eq } from "drizzle-orm";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
 import config from "@/config";
 import db, { schema as dbSchema } from "@/database";
 import { AgentModel } from "@/models";
+import { APP_CONNECTOR_PATH_PREFIX } from "@/services/apps/app-connector-resource";
 import { getPublicRequestOrigin } from "./request-origin";
 
 /**
@@ -43,13 +48,15 @@ const oauthServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
       const baseUrl = getPublicRequestOrigin(request);
 
       // Extract the resource path (everything after /.well-known/oauth-protected-resource)
-      const resourcePath = request.url.replace(
+      const resourcePath = new URL(request.url, baseUrl).pathname.replace(
         "/.well-known/oauth-protected-resource",
         "",
       );
 
       // Check if the profile has an external IdP configured
-      const authorizationServers = [baseUrl];
+      // Discovery identifies the issuer, not an interchangeable API hostname.
+      // Strict MCP clients reject metadata whose issuer differs from this URL.
+      const authorizationServers = [config.frontendBaseUrl];
       const profileId = await extractProfileIdFromResourcePath(resourcePath);
       if (profileId) {
         const externalIssuer = await getExternalIdpIssuerForProfile(profileId);
@@ -63,7 +70,7 @@ const oauthServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
       return {
         resource: `${baseUrl}${resourcePath}`,
         authorization_servers: authorizationServers,
-        scopes_supported: ["mcp"],
+        scopes_supported: [resourcePath.includes("/a2a/") ? "a2a" : "mcp"],
         bearer_methods_supported: ["header"],
       };
     },
@@ -85,7 +92,8 @@ const oauthServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
             issuer: z.string(),
             authorization_endpoint: z.string(),
             token_endpoint: z.string(),
-            registration_endpoint: z.string(),
+            // Omitted when dynamic client registration is disabled.
+            registration_endpoint: z.string().optional(),
             jwks_uri: z.string(),
             response_types_supported: z.array(z.string()),
             grant_types_supported: z.array(z.string()),
@@ -106,20 +114,28 @@ const oauthServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
       // request Host so Docker containers can reach them directly.
       const browserBaseUrl = config.frontendBaseUrl;
 
-      // The issuer MUST match the JWT "iss" claim exactly. Pydantic's AnyHttpUrl
-      // (used by MCP clients like Open WebUI) normalizes URLs by appending a
-      // trailing slash when the path is empty. We include the trailing slash so
-      // the JWT iss claim, the well-known issuer, and the normalized URL all match.
-      const issuer = browserBaseUrl.endsWith("/")
-        ? browserBaseUrl
-        : `${browserBaseUrl}/`;
+      // The issuer identifier MUST byte-match both the JWT "iss" claim and the
+      // RFC 9207 `iss` authorization-response parameter, which better-auth
+      // derives from the JWT plugin issuer with any trailing slash stripped —
+      // strict clients (Claude Code, MCP TS SDK) abort authorization on any
+      // mismatch. RFC 8414 §3.3 likewise requires this value to be identical
+      // to the (slash-free) URL clients built the well-known URL from, and
+      // /.well-known/oauth-protected-resource advertises the same slash-free
+      // origin in authorization_servers. frontendBaseUrl is normalized
+      // slash-free in config, so it is used verbatim.
+      const issuer = browserBaseUrl;
 
       reply.type("application/json");
       return {
         issuer,
         authorization_endpoint: `${browserBaseUrl}${OAUTH_ENDPOINTS.authorize}`,
         token_endpoint: `${baseUrl}${OAUTH_ENDPOINTS.token}`,
-        registration_endpoint: `${baseUrl}${OAUTH_ENDPOINTS.register}`,
+        // Only advertise DCR when it is enabled.
+        ...(config.auth.dynamicClientRegistrationEnabled
+          ? {
+              registration_endpoint: `${baseUrl}${OAUTH_ENDPOINTS.register}`,
+            }
+          : {}),
         jwks_uri: `${baseUrl}${OAUTH_ENDPOINTS.jwks}`,
         response_types_supported: ["code"],
         grant_types_supported: [
@@ -135,7 +151,9 @@ const oauthServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
         ],
         code_challenge_methods_supported: ["S256"],
         scopes_supported: [...OAUTH_SCOPES],
-        client_id_metadata_document_supported: true,
+        // CIMD auto-registration is gated behind the same DCR toggle.
+        client_id_metadata_document_supported:
+          config.auth.dynamicClientRegistrationEnabled,
       };
     },
   );
@@ -153,6 +171,12 @@ export default oauthServerRoutes;
 async function extractProfileIdFromResourcePath(
   resourcePath: string,
 ): Promise<string | null> {
+  // A shareable-App connector resolves only against Archestra's own
+  // authorization server, never a profile's external IdP — so its app id is not
+  // an agent id to look up.
+  if (resourcePath.startsWith(APP_CONNECTOR_PATH_PREFIX)) {
+    return null;
+  }
   const segments = resourcePath.split("/").filter(Boolean);
   const lastSegment = segments.at(-1);
   if (!lastSegment) return null;
@@ -166,17 +190,13 @@ async function extractProfileIdFromResourcePath(
 async function getExternalIdpIssuerForProfile(
   profileId: string,
 ): Promise<string | null> {
-  const [agent] = await db
-    .select({ identityProviderId: dbSchema.agentsTable.identityProviderId })
-    .from(dbSchema.agentsTable)
-    .where(eq(dbSchema.agentsTable.id, profileId));
-
-  if (!agent?.identityProviderId) return null;
+  const identityProviderId = await AgentModel.findIdentityProviderId(profileId);
+  if (!identityProviderId) return null;
 
   const [provider] = await db
     .select({ issuer: dbSchema.identityProvidersTable.issuer })
     .from(dbSchema.identityProvidersTable)
-    .where(eq(dbSchema.identityProvidersTable.id, agent.identityProviderId));
+    .where(eq(dbSchema.identityProvidersTable.id, identityProviderId));
 
   return provider?.issuer ?? null;
 }

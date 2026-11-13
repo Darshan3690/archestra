@@ -1,7 +1,53 @@
+import {
+  ADMIN_ROLE_NAME,
+  TOOL_GET_AGENT_RUN_FULL_NAME,
+  TOOL_LOAD_SKILL_SHORT_NAME,
+  TOOL_RUN_TOOL_SHORT_NAME,
+  TOOL_SEARCH_TOOLS_SHORT_NAME,
+  TOOL_START_AGENT_RUN_FULL_NAME,
+  TOOL_START_AGENT_RUN_SHORT_NAME,
+} from "@archestra/shared";
+import { NoSuchToolError } from "ai";
 import { vi } from "vitest";
-import type { FastifyInstanceWithZod } from "@/server";
-import { createFastifyInstance } from "@/server";
-import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import {
+  PROJECT_FILES_PREFIX,
+  PROJECT_INSTRUCTIONS_PREFIX,
+} from "@/agents/agent-system-prompt";
+import { archestraMcpBranding } from "@/archestra-mcp-server";
+import { buildMcpGatewayTool } from "@/clients/chat-tool-builder";
+import {
+  REPEAT_CALL_TERMINATION_CEILING,
+  ToolCallRepeatTracker,
+} from "@/clients/tool-call-repeat-tracker";
+import config from "@/config";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import {
+  A2AContextModel,
+  A2ATaskModel,
+  AgentRunModel,
+  AgentWorkspaceModel,
+  FileModel,
+  McpToolCallModel,
+  MemberModel,
+  MessageModel,
+  ModelModel,
+  ProjectModel,
+  SkillModel,
+} from "@/models";
+import ActiveChatRunModel from "@/models/chat-active-run";
+import ConversationModel from "@/models/conversation";
+import ConversationAttachmentModel from "@/models/conversation-attachment";
+import { activeChatRunService } from "@/services/active-chat-run";
+import { projectService } from "@/services/project";
+import {
+  accessGrants,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  test,
+} from "@/test";
 import type { User } from "@/types";
 
 const TEST_TRACE_CONTEXT = {
@@ -16,8 +62,15 @@ const mockStreamText = vi.hoisted(() => vi.fn());
 const mockCreateLLMModelForAgent = vi.hoisted(() => vi.fn());
 const mockGetChatMcpTools = vi.hoisted(() => vi.fn());
 const mockGetChatMcpToolUiResourceUris = vi.hoisted(() => vi.fn());
-const mockExtractAndIngestDocuments = vi.hoisted(() => vi.fn());
+const mockFetchToolUiResource = vi.hoisted(() => vi.fn());
 const mockStartActiveChatSpan = vi.hoisted(() => vi.fn());
+const mockCompactMessagesForChat = vi.hoisted(() => vi.fn());
+// Unset (→ awaited falsy) by default so turns request reasoning summaries;
+// the negative-cache test flips it. Mocked because the real check reads the
+// distributed cacheManager, which is not started in unit tests.
+const mockIsOpenAiReasoningSummaryMarkedUnsupported = vi.hoisted(() => vi.fn());
+// Observed by the verification-400 wiring test; mocked for the same reason.
+const mockMarkOpenAiReasoningSummaryUnsupported = vi.hoisted(() => vi.fn());
 
 vi.mock("ai", async (importOriginal) => {
   const actual = await importOriginal<typeof import("ai")>();
@@ -38,6 +91,18 @@ vi.mock("@/clients/llm-client", async (importOriginal) => {
   };
 });
 
+vi.mock("@/agents/openai-reasoning-summary", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/agents/openai-reasoning-summary")>();
+  return {
+    ...actual,
+    isOpenAiReasoningSummaryMarkedUnsupported:
+      mockIsOpenAiReasoningSummaryMarkedUnsupported,
+    markOpenAiReasoningSummaryUnsupported:
+      mockMarkOpenAiReasoningSummaryUnsupported,
+  };
+});
+
 vi.mock("@/clients/chat-mcp-client", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("@/clients/chat-mcp-client")>();
@@ -45,6 +110,7 @@ vi.mock("@/clients/chat-mcp-client", async (importOriginal) => {
     ...actual,
     getChatMcpTools: mockGetChatMcpTools,
     getChatMcpToolUiResourceUris: mockGetChatMcpToolUiResourceUris,
+    fetchToolUiResource: mockFetchToolUiResource,
   };
 });
 
@@ -52,7 +118,6 @@ vi.mock("@/knowledge-base", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/knowledge-base")>();
   return {
     ...actual,
-    extractAndIngestDocuments: mockExtractAndIngestDocuments,
   };
 });
 
@@ -62,6 +127,15 @@ vi.mock("@/observability/tracing", async (importOriginal) => {
   return {
     ...actual,
     startActiveChatSpan: mockStartActiveChatSpan,
+  };
+});
+
+vi.mock("./compaction/compact-messages", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("./compaction/compact-messages")>();
+  return {
+    ...actual,
+    compactMessagesForChat: mockCompactMessagesForChat,
   };
 });
 
@@ -80,10 +154,17 @@ describe("POST /api/chat slim error payload", () => {
   let conversationId: string;
 
   beforeEach(
-    async ({ makeAgent, makeConversation, makeOrganization, makeUser }) => {
+    async ({
+      makeAgent,
+      makeConversation,
+      makeOrganization,
+      makeUser,
+      makeMember,
+    }) => {
       user = await makeUser();
       const organization = await makeOrganization({ name: "Test Org" });
       organizationId = organization.id;
+      await makeMember(user.id, organizationId);
 
       const agent = await makeAgent({
         organizationId,
@@ -93,28 +174,50 @@ describe("POST /api/chat slim error payload", () => {
       const conversation = await makeConversation(agent.id, {
         userId: user.id,
         organizationId,
-        selectedModel: "gpt-4o",
       });
       conversationId = conversation.id;
 
       mockCreateLLMModelForAgent.mockResolvedValue({ model: "mock-model" });
       mockGetChatMcpTools.mockResolvedValue({});
       mockGetChatMcpToolUiResourceUris.mockResolvedValue({});
-      mockExtractAndIngestDocuments.mockResolvedValue(undefined);
+      mockCompactMessagesForChat.mockImplementation(
+        async ({ messages }: { messages: unknown[] }) => ({
+          messages,
+          status: "skipped",
+          compaction: null,
+          reason: "below_threshold",
+        }),
+      );
       mockStartActiveChatSpan.mockImplementation(
         async ({ callback }: { callback: () => Promise<Response> }) =>
           callback(),
       );
       mockCreateUIMessageStream.mockImplementation(
-        ({ onError }: { onError: (error: Error) => string }) =>
-          onError(new Error("Failed to fetch")),
+        ({ onError }: { onError: (error: Error) => string }) => {
+          const errorPayload = onError(new Error("Failed to fetch"));
+          return new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: "error", errorText: errorPayload });
+              controller.close();
+            },
+          });
+        },
       );
       mockCreateUIMessageStreamResponse.mockImplementation(
-        ({ stream }: { stream: string }) =>
-          new Response(stream, {
-            status: 200,
-            headers: { "content-type": "text/plain" },
-          }),
+        ({ stream }: { stream: ReadableStream<{ errorText: string }> }) =>
+          new Response(
+            stream.pipeThrough(
+              new TransformStream({
+                transform(chunk, controller) {
+                  controller.enqueue(chunk.errorText);
+                },
+              }),
+            ),
+            {
+              status: 200,
+              headers: { "content-type": "text/plain" },
+            },
+          ),
       );
 
       app = createFastifyInstance();
@@ -172,43 +275,186 @@ describe("POST /api/chat slim error payload", () => {
   });
 });
 
+describe("POST /api/chat missing MCP connection enforcement", () => {
+  let app: FastifyInstanceWithZod;
+  let user: User;
+  let organizationId: string;
+
+  const startTurn = (conversationId: string) =>
+    app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+  beforeEach(async ({ makeOrganization, makeUser, makeMember }) => {
+    user = await makeUser();
+    const organization = await makeOrganization({ name: "Test Org" });
+    organizationId = organization.id;
+    await makeMember(user.id, organizationId);
+
+    mockCreateLLMModelForAgent.mockResolvedValue({ model: "mock-model" });
+    mockGetChatMcpTools.mockResolvedValue({});
+    mockGetChatMcpToolUiResourceUris.mockResolvedValue({});
+    mockCompactMessagesForChat.mockImplementation(
+      async ({ messages }: { messages: unknown[] }) => ({
+        messages,
+        status: "skipped",
+        compaction: null,
+        reason: "below_threshold",
+      }),
+    );
+    mockStartActiveChatSpan.mockImplementation(
+      async ({ callback }: { callback: () => Promise<Response> }) => callback(),
+    );
+    mockCreateUIMessageStream.mockImplementation(
+      () =>
+        new ReadableStream({
+          start(controller) {
+            controller.close();
+          },
+        }),
+    );
+    mockCreateUIMessageStreamResponse.mockImplementation(
+      () => new Response("", { status: 200 }),
+    );
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { user: User }).user = user;
+      (request as typeof request & { organizationId: string }).organizationId =
+        organizationId;
+    });
+
+    const { default: chatRoutes } = await import("./routes");
+    await app.register(chatRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  test("refuses the turn and names the server for a blocking agent", async ({
+    makeAgent,
+    makeAgentTool,
+    makeConversation,
+    makeInternalMcpCatalog,
+    makeTool,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({ name: "Acme Docs" });
+    const agent = await makeAgent({
+      organizationId,
+      name: "Release Reporter",
+      systemPrompt: "",
+      missingCredentialBehavior: "block",
+      accessAllTools: false,
+    });
+    const tool = await makeTool({ catalogId: catalog.id });
+    await makeAgentTool(agent.id, tool.id, {
+      credentialResolutionMode: "dynamic",
+    });
+    const conversation = await makeConversation(agent.id, {
+      userId: user.id,
+      organizationId,
+    });
+
+    const response = await startTurn(conversation.id);
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json().error.message).toContain("Acme Docs");
+  });
+
+  test("lets an agent on the default behavior through untouched", async ({
+    makeAgent,
+    makeAgentTool,
+    makeConversation,
+    makeInternalMcpCatalog,
+    makeTool,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({ name: "Acme Docs" });
+    const agent = await makeAgent({
+      organizationId,
+      name: "Release Reporter",
+      systemPrompt: "",
+      accessAllTools: false,
+    });
+    const tool = await makeTool({ catalogId: catalog.id });
+    await makeAgentTool(agent.id, tool.id, {
+      credentialResolutionMode: "dynamic",
+    });
+    const conversation = await makeConversation(agent.id, {
+      userId: user.id,
+      organizationId,
+    });
+
+    const response = await startTurn(conversation.id);
+
+    expect(response.statusCode).toBe(200);
+  });
+});
+
 describe("POST /api/chat toUIMessageStream onError deduplication", () => {
   let app: FastifyInstanceWithZod;
   let user: User;
   let organizationId: string;
+  let agentId: string;
   let conversationId: string;
   let capturedInnerOnError: ((err: unknown) => string) | undefined;
   let capturedInnerOnFinish:
     | ((args: { messages: unknown[] }) => Promise<void> | void)
     | undefined;
   let executionPromise: Promise<void> | undefined;
+  let writerWrites: unknown[];
+  let originalExplicitOutputLimit: boolean;
 
   beforeEach(
-    async ({ makeAgent, makeConversation, makeOrganization, makeUser }) => {
+    async ({
+      makeAgent,
+      makeConversation,
+      makeOrganization,
+      makeUser,
+      makeMember,
+    }) => {
       capturedInnerOnError = undefined;
       capturedInnerOnFinish = undefined;
       executionPromise = undefined;
+      writerWrites = [];
+      originalExplicitOutputLimit =
+        config.chat.maxOutputTokensExplicitlyConfigured;
 
       user = await makeUser();
       const organization = await makeOrganization({ name: "Test Org" });
       organizationId = organization.id;
+      await makeMember(user.id, organizationId);
 
       const agent = await makeAgent({
         organizationId,
         name: "Router Agent",
         systemPrompt: "",
       });
+      agentId = agent.id;
       const conversation = await makeConversation(agent.id, {
         userId: user.id,
         organizationId,
-        selectedModel: "gpt-4o",
       });
       conversationId = conversation.id;
 
       mockCreateLLMModelForAgent.mockResolvedValue({ model: "mock-model" });
       mockGetChatMcpTools.mockResolvedValue({});
       mockGetChatMcpToolUiResourceUris.mockResolvedValue({});
-      mockExtractAndIngestDocuments.mockResolvedValue(undefined);
+      mockCompactMessagesForChat.mockImplementation(
+        async ({ messages }: { messages: unknown[] }) => ({
+          messages,
+          status: "skipped",
+          compaction: null,
+          reason: "below_threshold",
+        }),
+      );
       mockStartActiveChatSpan.mockImplementation(
         async ({ callback }: { callback: () => Promise<Response> }) =>
           callback(),
@@ -232,6 +478,24 @@ describe("POST /api/chat toUIMessageStream onError deduplication", () => {
             next: async () => ({ done: true, value: undefined }),
           }),
         },
+        // the route probes fullStream for the first renderable event before
+        // merging; yield one so the probe proceeds to the merge these tests
+        // capture (errors are then injected via capturedInnerOnError).
+        fullStream: {
+          [Symbol.asyncIterator]: () => {
+            const events = [
+              { type: "text-delta", text: "" },
+              { type: "finish", finishReason: "stop" },
+            ];
+            let index = 0;
+            return {
+              next: async () =>
+                index < events.length
+                  ? { done: false, value: events[index++] }
+                  : { done: true, value: undefined },
+            };
+          },
+        },
         usage: Promise.resolve(null),
       }));
 
@@ -247,16 +511,20 @@ describe("POST /api/chat toUIMessageStream onError deduplication", () => {
           }) => Promise<void>;
         }) => {
           const writer = {
-            write: vi.fn(),
+            write: vi.fn((data: unknown) => writerWrites.push(data)),
             merge: vi.fn(),
           };
           executionPromise = execute({ writer }).catch(() => undefined);
-          return "mock-stream";
+          return new ReadableStream({
+            start(controller) {
+              controller.close();
+            },
+          });
         },
       );
 
       mockCreateUIMessageStreamResponse.mockImplementation(
-        ({ stream }: { stream: string }) =>
+        ({ stream }: { stream: ReadableStream }) =>
           new Response(stream, {
             status: 200,
             headers: { "content-type": "text/plain" },
@@ -279,7 +547,80 @@ describe("POST /api/chat toUIMessageStream onError deduplication", () => {
   );
 
   afterEach(async () => {
+    archestraMcpBranding.syncFromOrganization(null);
+    config.chat.maxOutputTokensExplicitlyConfigured =
+      originalExplicitOutputLimit;
     await app.close();
+  });
+
+  test.for([
+    true,
+    false,
+  ])("an Auto selection follows changed normal tiers on the next turn (%s)", async (onAutoRouter, {
+    makeLlmProviderApiKey,
+    makeSecret,
+  }) => {
+    const {
+      autoRouterId,
+      configureAutoRouting,
+      setAutoRoutingEnabled,
+      setAutoRoutingTiers,
+    } = await import("@/test/auto-routing");
+    const { default: AutoRouterModel } = await import("@/models/auto-router");
+    config.autoRouting.enabled = true;
+    const tiers = await configureAutoRouting(organizationId);
+    const routerId = await autoRouterId(organizationId);
+    const old = await AutoRouterModel.find(routerId);
+    await ConversationModel.update(conversationId, user.id, organizationId, {
+      autoRouterId: onAutoRouter ? routerId : null,
+      modelId: tiers[1].id,
+      chatApiKeyId: old?.normalApiKeyId,
+    });
+    await setAutoRoutingTiers(organizationId, { normal: tiers[2] }, routerId);
+    const replacementKey = await makeLlmProviderApiKey(
+      organizationId,
+      (await makeSecret({ secret: { apiKey: "synthetic-current-normal" } })).id,
+      { provider: "openai", access: "org" },
+    );
+    const current = await AutoRouterModel.find(routerId);
+    if (!current?.fastApiKeyId || !current.smartApiKeyId)
+      throw new Error("missing tier keys");
+    await setAutoRoutingEnabled(organizationId, false);
+    await AutoRouterModel.update(routerId, {
+      tiers: {
+        fast: { modelId: tiers[0].id, providerApiKeyId: current.fastApiKeyId },
+        normal: { modelId: tiers[2].id, providerApiKeyId: replacementKey.id },
+        smart: {
+          modelId: tiers[2].id,
+          providerApiKeyId: current.smartApiKeyId,
+        },
+      },
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "auto-turn",
+            role: "user",
+            parts: [{ type: "text", text: "hello" }],
+          },
+        ],
+      },
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    await executionPromise;
+    expect(mockCreateLLMModelForAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: tiers[onAutoRouter ? 2 : 1].modelId,
+        provider: "openai",
+        providerKeySelection: onAutoRouter
+          ? { providerApiKeyId: replacementKey.id }
+          : undefined,
+      }),
+    );
   });
 
   test("double onError yields deterministic payload and fires side effects once", async ({
@@ -307,6 +648,10 @@ describe("POST /api/chat toUIMessageStream onError deduplication", () => {
     expect(response.statusCode).toBe(200);
     await executionPromise;
     expect(capturedInnerOnError).toBeDefined();
+    const innerOnError = capturedInnerOnError;
+    if (!innerOnError) {
+      throw new Error("Expected inner onError to be captured");
+    }
 
     const stage1Error = new Error("Upstream provider error");
     const payload1 = capturedInnerOnError?.(stage1Error);
@@ -329,5 +674,3740 @@ describe("POST /api/chat toUIMessageStream onError deduplication", () => {
     const errorsAfterFinish =
       await ConversationChatErrorModel.findByConversation(conversationId);
     expect(errorsAfterFinish).toHaveLength(1);
+  });
+
+  test("formats unavailable tool calls as tool-level errors without persisting chat errors", async ({
+    expect,
+  }) => {
+    const { default: ConversationChatErrorModel } = await import(
+      "@/models/conversation-chat-error"
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "hello" }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+    expect(capturedInnerOnError).toBeDefined();
+
+    const unavailableToolError = new NoSuchToolError({
+      toolName: "missing_tool",
+      availableTools: ["known_tool"],
+    });
+    const payload1 = capturedInnerOnError?.(unavailableToolError);
+    // the SDK emits a duplicate tool-error part for the same invalid call and
+    // stringifies its error in runToolsTransformation, so the second onError
+    // invocation receives the raw message string — no NoSuchToolError identity
+    const payload2 = capturedInnerOnError?.(unavailableToolError.message);
+    // stream-level error chunks can also re-fire onError with the previous
+    // return value wrapped in `new Error(errorText)` — replay, don't reprocess
+    const payload3 = capturedInnerOnError?.(new Error(payload1));
+
+    expect(payload2).toBe(payload1);
+    expect(payload3).toBe(payload1);
+    expect(payload1).toContain(
+      "The requested tool is not available in this chat.",
+    );
+    expect(payload1).toContain('"requestedToolName": "missing_tool"');
+    expect(payload1).toContain('"availableToolNames"');
+    expect(payload1).toContain("known_tool");
+    expect(payload1).toContain("Model tried to call unavailable tool");
+
+    await new Promise((resolve) => setImmediate(resolve));
+    const persistedErrors =
+      await ConversationChatErrorModel.findByConversation(conversationId);
+    expect(persistedErrors).toHaveLength(0);
+  });
+
+  test("recovers when only the stringified unavailable-tool message reaches onError", async ({
+    expect,
+  }) => {
+    const { default: ConversationChatErrorModel } = await import(
+      "@/models/conversation-chat-error"
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "hello" }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+    expect(capturedInnerOnError).toBeDefined();
+
+    // regression: this exact shape used to fall through to mapProviderError,
+    // marking the run failed and persisting a fatal chat error
+    const payload = capturedInnerOnError?.(
+      "Model tried to call unavailable tool 'missing_tool'. Available tools: known_tool.",
+    );
+
+    expect(payload).toContain(
+      "The requested tool is not available in this chat.",
+    );
+    expect(payload).toContain('"requestedToolName": "missing_tool"');
+    expect(payload).toContain("known_tool");
+
+    await new Promise((resolve) => setImmediate(resolve));
+    const persistedErrors =
+      await ConversationChatErrorModel.findByConversation(conversationId);
+    expect(persistedErrors).toHaveLength(0);
+  });
+
+  test("formats each distinct unavailable tool error independently within one stream", async ({
+    expect,
+  }) => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "hello" }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+    expect(capturedInnerOnError).toBeDefined();
+
+    const firstToolError = new NoSuchToolError({
+      toolName: "first_missing_tool",
+      availableTools: ["known_tool"],
+    });
+    const secondToolError = new NoSuchToolError({
+      toolName: "second_missing_tool",
+      availableTools: ["known_tool"],
+    });
+
+    const firstPayload = capturedInnerOnError?.(firstToolError);
+    const secondPayload = capturedInnerOnError?.(secondToolError);
+
+    expect(firstPayload).toContain('"requestedToolName": "first_missing_tool"');
+    expect(secondPayload).toContain(
+      '"requestedToolName": "second_missing_tool"',
+    );
+    expect(secondPayload).not.toBe(firstPayload);
+
+    // each payload is replayed (not reprocessed) on the downstream
+    // re-invocation the AI SDK fires as `new Error(errorText)`.
+    expect(capturedInnerOnError?.(new Error(firstPayload))).toBe(firstPayload);
+    expect(capturedInnerOnError?.(new Error(secondPayload))).toBe(
+      secondPayload,
+    );
+  });
+
+  test("persists user message with new DB id on provider error and allows subsequent PATCH", async ({
+    expect,
+  }) => {
+    const { default: MessageModel } = await import("@/models/message");
+
+    const clientTempId = "client-temp-msg-1";
+    const messageText = "hello from provider-error test";
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: clientTempId,
+            role: "user",
+            parts: [{ type: "text", text: messageText }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+    expect(capturedInnerOnError).toBeDefined();
+
+    capturedInnerOnError?.(new Error("Upstream provider error"));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const persisted = await MessageModel.findByConversation(conversationId);
+    const userMessage = persisted.find((m) => m.role === "user");
+    expect(userMessage).toBeDefined();
+    // The persistence layer assigns a DB id distinct from the client tempId,
+    // which is what makes PATCH /api/chat/messages/:id possible later.
+    expect(userMessage?.id).not.toBe(clientTempId);
+
+    const patchResponse = await app.inject({
+      method: "PATCH",
+      url: `/api/chat/messages/${userMessage?.id}`,
+      payload: {
+        conversationId,
+        partIndex: 0,
+        text: "Edited after provider error",
+      },
+    });
+    expect(patchResponse.statusCode).toBe(200);
+  });
+
+  test("passes compacted messages to streamText", async () => {
+    for (const value of Object.values(config.chat)) {
+      if (value && typeof value === "object" && "apiKey" in value)
+        value.apiKey = "";
+    }
+
+    const compactedMessages = [
+      {
+        role: "user",
+        parts: [
+          {
+            type: "text",
+            text: "Context summary from earlier in this conversation.",
+          },
+        ],
+      },
+      {
+        id: "recent-user-message",
+        role: "user",
+        parts: [{ type: "text", text: "continue from here" }],
+      },
+    ];
+    mockCompactMessagesForChat.mockResolvedValue({
+      messages: compactedMessages,
+      status: "created",
+      compaction: {
+        id: "compaction-1",
+        trigger: "auto",
+        originalTokenEstimate: 120_000,
+        compactedTokenEstimate: 2_000,
+      },
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "hello" }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    // applyPromptCacheBreakpoints marks the first and last message (the stable
+    // prefix + rolling tail) with Anthropic cache_control before streamText, so
+    // the compacted messages reach the model carrying that breakpoint. The
+    // default chat model is a Claude 4.5+ model, which uses the 1h cache TTL.
+    const cacheBreakpoint = {
+      providerOptions: {
+        anthropic: { cacheControl: { type: "ephemeral", ttl: "1h" } },
+      },
+    };
+    expect(mockStreamText.mock.calls[0]?.[0].messages).toEqual([
+      { ...compactedMessages[0], ...cacheBreakpoint },
+      { ...compactedMessages[1], ...cacheBreakpoint },
+    ]);
+  });
+
+  test("stops the run once the model repeatedly calls a tool outside the tool list", async () => {
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    const streamConfig = mockStreamText.mock.calls[0]?.[0];
+    const stopWhen = streamConfig.stopWhen as ((arg: unknown) => boolean)[];
+    const noSteps = { steps: [] };
+    const runIsStopped = () => stopWhen.some((cond) => cond(noSteps));
+
+    // A tool the model asks for but which is not in its tool list never reaches
+    // an execute wrapper, so nothing on the normal path counts it. Distinct
+    // arguments each step, since that is what the real loop did.
+    const unavailableStep = (attempt: number) => ({
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      finishReason: "tool-calls",
+      toolCalls: [
+        {
+          type: "tool-call",
+          toolCallId: `call-${attempt}`,
+          toolName: "archestra__edit_app",
+          input: { attempt },
+          dynamic: true,
+          invalid: true,
+          error: new NoSuchToolError({
+            toolName: "archestra__edit_app",
+            availableTools: ["archestra__search_tools", "archestra__run_tool"],
+          }),
+        },
+      ],
+    });
+
+    // Drives the route's own onStepFinish and its own stopWhen, so this fails
+    // if they are ever handed different tracker instances — which would leave
+    // the ceiling silently inert no matter how correct the recorder is.
+    for (let i = 1; i < REPEAT_CALL_TERMINATION_CEILING; i++) {
+      await streamConfig.onStepFinish(unavailableStep(i));
+      expect(runIsStopped()).toBe(false);
+    }
+
+    await streamConfig.onStepFinish(unavailableStep(99));
+    expect(runIsStopped()).toBe(true);
+  });
+
+  test("forwards a provided temperature to streamText", async () => {
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+        temperature: 0,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    expect(mockStreamText.mock.calls[0]?.[0].temperature).toBe(0);
+  });
+
+  test("caps output tokens at the unknown-model budget when the model is unsynced", async () => {
+    for (const value of Object.values(config.chat)) {
+      if (value && typeof value === "object" && "apiKey" in value)
+        value.apiKey = "";
+    }
+
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    // No models row is seeded, so the model's real cap is unknown and the turn
+    // falls back to the unknown-model budget (still clamped by the ceiling).
+    expect(mockStreamText.mock.calls[0]?.[0].maxOutputTokens).toBe(8192);
+  });
+
+  test("omits temperature from streamText when none is provided", async () => {
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    expect(mockStreamText.mock.calls[0]?.[0].temperature).toBeUndefined();
+  });
+
+  test("injects a project's instructions into the system prompt for a project chat", async () => {
+    const project = await ProjectModel.create({
+      organizationId,
+      userId: user.id,
+      name: "Instr Project",
+      description: null,
+    });
+    await projectService.setInstructions({
+      id: project.id,
+      organizationId,
+      userId: user.id,
+      content: "STREAM-INSTRUCTIONS-MARKER",
+    });
+    const projectConversation = await ConversationModel.create({
+      userId: user.id,
+      organizationId,
+      agentId,
+      projectId: project.id,
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: projectConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    const systemPrompt = mockStreamText.mock.calls[0]?.[0].system;
+    expect(systemPrompt).toContain(PROJECT_INSTRUCTIONS_PREFIX);
+    expect(systemPrompt).toContain("STREAM-INSTRUCTIONS-MARKER");
+  });
+
+  test("lists the project's shared files in the system prompt for a project chat", async () => {
+    const project = await ProjectModel.create({
+      organizationId,
+      userId: user.id,
+      name: "Files Project",
+      description: null,
+    });
+    // A project file, attached to the project (not to any message) by another
+    // conversation — exactly the file the model previously never heard about.
+    await FileModel.insertRow({
+      organizationId,
+      userId: user.id,
+      projectId: project.id,
+      conversationId: null,
+      filename: "index.html",
+      mimeType: "text/html",
+      sizeBytes: 6,
+      storageProvider: "db",
+      data: Buffer.from("<html>"),
+      objectKey: null,
+    });
+    const projectConversation = await ConversationModel.create({
+      userId: user.id,
+      organizationId,
+      agentId,
+      projectId: project.id,
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: projectConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    const systemPrompt = mockStreamText.mock.calls[0]?.[0].system;
+    expect(systemPrompt).toContain(PROJECT_FILES_PREFIX);
+    // Filenames are chosen by whoever uploaded the file, so the manifest
+    // renders them as quoted data rather than inline code.
+    expect(systemPrompt).toContain('"index.html"');
+  });
+
+  test("lists no project files for a project chat whose project has none", async () => {
+    const project = await ProjectModel.create({
+      organizationId,
+      userId: user.id,
+      name: "No Files Project",
+      description: null,
+    });
+    const projectConversation = await ConversationModel.create({
+      userId: user.id,
+      organizationId,
+      agentId,
+      projectId: project.id,
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: projectConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    const systemPrompt = mockStreamText.mock.calls[0]?.[0].system;
+    expect(systemPrompt ?? "").not.toContain(PROJECT_FILES_PREFIX);
+  });
+
+  test("injects nothing for a project chat whose instructions are empty", async () => {
+    const project = await ProjectModel.create({
+      organizationId,
+      userId: user.id,
+      name: "Empty Instr Project",
+      description: null,
+    });
+    // A whitespace-only file is a real, kept file that injects nothing.
+    await projectService.setInstructions({
+      id: project.id,
+      organizationId,
+      userId: user.id,
+      content: "   ",
+    });
+    const projectConversation = await ConversationModel.create({
+      userId: user.id,
+      organizationId,
+      agentId,
+      projectId: project.id,
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: projectConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    const systemPrompt = mockStreamText.mock.calls[0]?.[0].system;
+    expect(systemPrompt ?? "").not.toContain(PROJECT_INSTRUCTIONS_PREFIX);
+  });
+
+  test("prepends load-tools guidance when the agent loads tools when needed", async () => {
+    const { AgentModel } = await import("@/models");
+    await AgentModel.update(agentId, {
+      toolExposureMode: "search_and_run_only",
+      systemPrompt: "You are a careful analyst.",
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "hello" }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    const systemPrompt = mockStreamText.mock.calls[0]?.[0].system;
+    expect(systemPrompt).toContain(
+      "Some available tools are not listed upfront",
+    );
+    expect(systemPrompt).toContain(
+      `call \`${archestraMcpBranding.getToolName(TOOL_SEARCH_TOOLS_SHORT_NAME)}\` to find relevant tools`,
+    );
+    expect(systemPrompt).toContain(
+      `then call \`${archestraMcpBranding.getToolName(TOOL_RUN_TOOL_SHORT_NAME)}\``,
+    );
+    expect(systemPrompt).toContain("You are a careful analyst.");
+    expect(systemPrompt?.indexOf("Some available tools")).toBeLessThan(
+      systemPrompt?.indexOf("You are a careful analyst.") ?? -1,
+    );
+    // states the tool_name/tool_args contract and points at the invalid-call
+    // error as the place that describes the expected input
+    expect(systemPrompt).toContain("takes exactly two arguments");
+    expect(systemPrompt).toContain("the error describes the expected input");
+  });
+
+  test("passes the search/run tools it tells the model to call to streamText", async () => {
+    const { AgentModel } = await import("@/models");
+    await AgentModel.update(agentId, {
+      toolExposureMode: "search_and_run_only",
+      systemPrompt: "You are a careful analyst.",
+    });
+    const searchToolsName = archestraMcpBranding.getToolName(
+      TOOL_SEARCH_TOOLS_SHORT_NAME,
+    );
+    const runToolName = archestraMcpBranding.getToolName(
+      TOOL_RUN_TOOL_SHORT_NAME,
+    );
+    mockStreamText.mockClear();
+    mockGetChatMcpTools.mockResolvedValueOnce({
+      [searchToolsName]: { description: "Search tools" },
+      [runToolName]: { description: "Run tool" },
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "hello" }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    const call = mockStreamText.mock.calls[0]?.[0];
+    // The system prompt instructs the model to call these tools; they must also
+    // be present in the request, or the model is told to call tools it cannot
+    // invoke (the search_and_run_only zero-tools failure).
+    expect(call.system).toContain(
+      `call \`${searchToolsName}\` to find relevant tools`,
+    );
+    expect(Object.keys(call.tools ?? {})).toEqual(
+      expect.arrayContaining([searchToolsName, runToolName]),
+    );
+    expect(mockCompactMessagesForChat).toHaveBeenCalledTimes(1);
+    expect(
+      Object.keys(mockCompactMessagesForChat.mock.calls[0]?.[0].tools),
+    ).toEqual(expect.arrayContaining([searchToolsName, runToolName]));
+  });
+
+  test("omits tools from streamText when the conversation model doesn't support tool calling", async ({
+    makeConversation,
+  }) => {
+    // Mirrors Microsoft 365 Copilot: its model row is synced with
+    // supportsToolCalling=false, so the turn must run tool-less instead of
+    // letting the provider reject the declared tools.
+    const noToolsModel = await ModelModel.create({
+      externalId: "microsoft-365-copilot/microsoft-365-copilot",
+      provider: "microsoft-365-copilot",
+      modelId: "microsoft-365-copilot",
+      description: "Microsoft 365 Copilot",
+      contextLength: null,
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      supportsToolCalling: false,
+      promptPricePerToken: null,
+      completionPricePerToken: null,
+      ignored: false,
+      lastSyncedAt: new Date(),
+    });
+    const noToolsConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: noToolsModel.id,
+    });
+    mockStreamText.mockClear();
+    mockGetChatMcpTools.mockResolvedValueOnce({
+      some_tool: { description: "A tool the model can't take" },
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: noToolsConversation.id,
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "hello" }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    expect(mockStreamText.mock.calls[0]?.[0].tools).toBeUndefined();
+  });
+
+  // Seeds a synced Gemini model row so resolveConversationModel dereferences
+  // the conversation to that model id + the gemini provider.
+  const makeGeminiModelRow = (geminiModelId: string) =>
+    ModelModel.create({
+      externalId: `gemini/${geminiModelId}`,
+      provider: "gemini",
+      modelId: geminiModelId,
+      description: geminiModelId,
+      contextLength: null,
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      supportsToolCalling: true,
+      promptPricePerToken: null,
+      completionPricePerToken: null,
+      ignored: false,
+      lastSyncedAt: new Date(),
+    });
+
+  test("requests Gemini thought summaries for a default-thinking model", async ({
+    makeConversation,
+  }) => {
+    const model = await makeGeminiModelRow("gemini-2.5-pro");
+    const geminiConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: geminiConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    expect(mockStreamText.mock.calls[0]?.[0].providerOptions?.google).toEqual({
+      thinkingConfig: { includeThoughts: true },
+    });
+  });
+
+  test("omits thinkingConfig for a Gemini model with thinking off by default", async ({
+    makeConversation,
+  }) => {
+    // flash-lite does not think unless asked; a bare includeThoughts on it is
+    // rejected by the API with a 400, so the turn must not carry it.
+    const model = await makeGeminiModelRow("gemini-2.5-flash-lite");
+    const geminiConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: geminiConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    expect(
+      mockStreamText.mock.calls[0]?.[0].providerOptions?.google,
+    ).toBeUndefined();
+  });
+
+  test("sends the conversation's flash effort as a minimal thinking level", async ({
+    makeConversation,
+  }) => {
+    const model = await makeGeminiModelRow("gemini-3.6-flash");
+    const geminiConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+      thinkingEffort: "low",
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: geminiConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    expect(mockStreamText.mock.calls[0]?.[0].providerOptions?.google).toEqual({
+      thinkingConfig: { thinkingLevel: "minimal" },
+    });
+  });
+
+  test("sends the conversation's thinking effort as a high level with summaries", async ({
+    makeConversation,
+  }) => {
+    const model = await makeGeminiModelRow("gemini-3.6-flash");
+    const geminiConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+      thinkingEffort: "high",
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: geminiConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    expect(mockStreamText.mock.calls[0]?.[0].providerOptions?.google).toEqual({
+      thinkingConfig: { thinkingLevel: "high", includeThoughts: true },
+    });
+  });
+
+  test("prefers the effort sent with the turn over the stored one", async ({
+    makeConversation,
+  }) => {
+    // The row is written by a separate request the send can overtake, so the
+    // depth the composer showed has to win for this turn.
+    const model = await makeGeminiModelRow("gemini-3.6-flash");
+    const geminiConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+      thinkingEffort: "low",
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: geminiConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+        thinkingEffort: "high",
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText.mock.calls[0]?.[0].providerOptions?.google).toEqual({
+      thinkingConfig: { thinkingLevel: "high", includeThoughts: true },
+    });
+  });
+
+  test("falls back to the stored effort when the turn sends none", async ({
+    makeConversation,
+  }) => {
+    const model = await makeGeminiModelRow("gemini-3.6-flash");
+    const geminiConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+      thinkingEffort: "high",
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: geminiConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText.mock.calls[0]?.[0].providerOptions?.google).toEqual({
+      thinkingConfig: { thinkingLevel: "high", includeThoughts: true },
+    });
+  });
+
+  test("never sends a thinking level to a model that cannot honor one", async ({
+    makeConversation,
+  }) => {
+    // The 2.5 family takes a numeric budget; a level cannot be paired with it,
+    // so a stored effort must stay dormant rather than reach the provider.
+    const model = await makeGeminiModelRow("gemini-2.5-pro");
+    const geminiConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+      thinkingEffort: "high",
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: geminiConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    expect(mockStreamText.mock.calls[0]?.[0].providerOptions?.google).toEqual({
+      thinkingConfig: { includeThoughts: true },
+    });
+  });
+
+  test("asks Pro for the shallowest level it accepts, not the shallowest there is", async ({
+    makeConversation,
+  }) => {
+    // Pro rejects "minimal" outright, so "low" has to resolve to its own floor.
+    const model = await makeGeminiModelRow("gemini-3.1-pro-preview");
+    const geminiConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+      thinkingEffort: "low",
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: geminiConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText.mock.calls[0]?.[0].providerOptions?.google).toEqual({
+      // Reasoning happens at this level, so its summary is worth showing.
+      thinkingConfig: { thinkingLevel: "low", includeThoughts: true },
+    });
+  });
+
+  for (const modelId of ["gemini-2.5-flash-image", "gemini-nano-banana-2.1"]) {
+    test(`enables image output without text thinking settings for ${modelId}`, async ({
+      makeConversation,
+    }) => {
+      const model = await makeGeminiModelRow(modelId);
+      const geminiConversation = await makeConversation(agentId, {
+        userId: user.id,
+        organizationId,
+        modelId: model.id,
+      });
+      mockStreamText.mockClear();
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/chat",
+        payload: {
+          id: geminiConversation.id,
+          messages: [
+            {
+              id: "msg-1",
+              role: "user",
+              parts: [{ type: "text", text: "hi" }],
+            },
+          ],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      await executionPromise;
+
+      expect(mockStreamText).toHaveBeenCalledTimes(1);
+      expect(mockStreamText.mock.calls[0]?.[0].providerOptions?.google).toEqual(
+        {
+          responseModalities: ["TEXT", "IMAGE"],
+        },
+      );
+    });
+  }
+
+  // Seeds a synced OpenAI model row so resolveConversationModel dereferences
+  // the conversation to that model id + the openai provider.
+  const makeOpenAiModelRow = (openAiModelId: string) =>
+    ModelModel.create({
+      externalId: `openai/${openAiModelId}`,
+      provider: "openai",
+      modelId: openAiModelId,
+      description: openAiModelId,
+      contextLength: null,
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      supportsToolCalling: true,
+      promptPricePerToken: null,
+      completionPricePerToken: null,
+      ignored: false,
+      lastSyncedAt: new Date(),
+    });
+
+  test("requests OpenAI reasoning summaries for a Responses-routed model", async ({
+    makeConversation,
+  }) => {
+    const model = await makeOpenAiModelRow("gpt-5.6");
+    const openAiConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: openAiConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    expect(mockStreamText.mock.calls[0]?.[0].providerOptions?.openai).toEqual({
+      store: false,
+      reasoningSummary: "auto",
+    });
+  });
+
+  test("omits reasoningSummary for a chat-completions-routed OpenAI model", async ({
+    makeConversation,
+  }) => {
+    // Chat completions never returns reasoning content, and the summary
+    // option only exists on the Responses transport — the turn must carry
+    // neither it nor store:false, only the max_completion_tokens budget.
+    const model = await makeOpenAiModelRow("gpt-5-mini");
+    const openAiConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: openAiConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    expect(mockStreamText.mock.calls[0]?.[0].providerOptions?.openai).toEqual({
+      maxCompletionTokens: expect.any(Number),
+    });
+  });
+
+  test("adds a chosen depth to the Responses options without displacing them", async ({
+    makeConversation,
+  }) => {
+    // The two OpenAI blocks each build a fresh `openai` object, so a depth
+    // written as a third assignment would drop store/reasoningSummary instead
+    // of joining them.
+    const model = await makeOpenAiModelRow("gpt-5.6");
+    const openAiConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+      thinkingEffort: "high",
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: openAiConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText.mock.calls[0]?.[0].providerOptions?.openai).toEqual({
+      store: false,
+      reasoningSummary: "auto",
+      reasoningEffort: "high",
+    });
+  });
+
+  test("leaves a non-reasoning OpenAI model without a depth", async ({
+    makeConversation,
+  }) => {
+    // gpt-4o rejects reasoning_effort outright, and the chat transport emits
+    // whatever it is handed — so the field must never be built for it.
+    const model = await makeOpenAiModelRow("gpt-4o");
+    const openAiConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+      thinkingEffort: "high",
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: openAiConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    expect(
+      mockStreamText.mock.calls[0]?.[0].providerOptions?.openai,
+    ).not.toHaveProperty("reasoningEffort");
+  });
+
+  test("lets a turn's own depth outrank the conversation's stored one", async ({
+    makeConversation,
+  }) => {
+    // A pick made mid-conversation rides with the message it was made for,
+    // rather than racing the row write.
+    const model = await makeOpenAiModelRow("gpt-5-mini");
+    const openAiConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+      thinkingEffort: "low",
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: openAiConversation.id,
+        thinkingEffort: "high",
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    expect(
+      mockStreamText.mock.calls[0]?.[0].providerOptions?.openai,
+    ).toMatchObject({ reasoningEffort: "high" });
+  });
+
+  test("uses stored Bedrock depth and honors per-turn default overrides", async ({
+    makeConversation,
+  }) => {
+    const model = await ModelModel.create({
+      externalId: "bedrock/us.amazon.nova-2-lite-v1:0",
+      provider: "bedrock",
+      modelId: "us.amazon.nova-2-lite-v1:0",
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      outputLength: 32768,
+    });
+    config.chat.maxOutputTokensExplicitlyConfigured = false;
+    for (const thinkingEffort of ["low", "medium", "high", null] as const) {
+      const conversation = await makeConversation(agentId, {
+        userId: user.id,
+        organizationId,
+        modelId: model.id,
+        thinkingEffort: thinkingEffort ?? "high",
+      });
+      mockStreamText.mockClear();
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/chat",
+        payload: {
+          id: conversation.id,
+          ...(thinkingEffort === null ? { thinkingEffort: null } : {}),
+          messages: [
+            {
+              id: "msg-1",
+              role: "user",
+              parts: [{ type: "text", text: "hi" }],
+            },
+          ],
+        },
+      });
+      expect(response.statusCode).toBe(200);
+      await executionPromise;
+      expect(mockStreamText).toHaveBeenCalledTimes(1);
+      const turn = mockStreamText.mock.calls[0]?.[0];
+      expect(turn.providerOptions?.bedrock).toEqual(
+        thinkingEffort === null
+          ? undefined
+          : {
+              reasoningConfig: {
+                type: "enabled",
+                maxReasoningEffort: thinkingEffort,
+              },
+            },
+      );
+      expect(turn.maxOutputTokens).toBe(
+        thinkingEffort === "high" ? undefined : 32768,
+      );
+    }
+  });
+
+  test.for([
+    "environment",
+    "model",
+    "temperature",
+  ] as const)("shows actionable Nova High guidance for an explicit %s limit without calling the provider", async (conflict, {
+    makeConversation,
+  }) => {
+    const model = await ModelModel.create({
+      externalId: "bedrock/us.amazon.nova-2-lite-v1:0",
+      provider: "bedrock",
+      modelId: "us.amazon.nova-2-lite-v1:0",
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      outputLength: 32768,
+      customOutputLength: conflict === "model" ? 16000 : null,
+    });
+    config.chat.maxOutputTokensExplicitlyConfigured =
+      conflict === "environment";
+    const conversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+      thinkingEffort: "high",
+    });
+    let errorPayload: string | undefined;
+    mockCreateUIMessageStream.mockImplementation(({ execute, onError }) => {
+      executionPromise = execute({
+        writer: { write: vi.fn(), merge: vi.fn() },
+      }).catch((error: unknown) => {
+        errorPayload = onError(error);
+      });
+      return new ReadableStream({
+        start(controller) {
+          controller.close();
+        },
+      });
+    });
+    mockStreamText.mockClear();
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversation.id,
+        ...(conflict === "temperature" ? { temperature: 0 } : {}),
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "hi" }],
+          },
+        ],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+    expect(mockStreamText).not.toHaveBeenCalled();
+    expect(JSON.parse(errorPayload ?? "{}")).toMatchObject({
+      code: "invalid_request",
+      isRetryable: false,
+      message: expect.stringContaining("Low or Medium"),
+    });
+    expect(JSON.parse(errorPayload ?? "{}").message).toContain(
+      conflict === "temperature"
+        ? "temperature override"
+        : "configured output-token limit",
+    );
+  });
+
+  // Seeds a synced Anthropic model row.
+  const makeAnthropicModelRow = (anthropicModelId: string) =>
+    ModelModel.create({
+      externalId: `anthropic/${anthropicModelId}`,
+      provider: "anthropic",
+      modelId: anthropicModelId,
+      description: anthropicModelId,
+      contextLength: null,
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      supportsToolCalling: true,
+      promptPricePerToken: null,
+      completionPricePerToken: null,
+      ignored: false,
+      lastSyncedAt: new Date(),
+    });
+
+  test("sends each chosen depth to Anthropic unchanged", async ({
+    makeConversation,
+  }) => {
+    const model = await makeAnthropicModelRow("claude-opus-5");
+    const cases = ["low", "medium", "high"] as const;
+
+    for (const thinkingEffort of cases) {
+      const conversation = await makeConversation(agentId, {
+        userId: user.id,
+        organizationId,
+        modelId: model.id,
+        thinkingEffort,
+      });
+      mockStreamText.mockClear();
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/chat",
+        payload: {
+          id: conversation.id,
+          messages: [
+            {
+              id: "msg-1",
+              role: "user",
+              parts: [{ type: "text", text: "hi" }],
+            },
+          ],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      await executionPromise;
+
+      expect(
+        mockStreamText.mock.calls[0]?.[0].providerOptions?.anthropic,
+      ).toEqual({ effort: thinkingEffort });
+    }
+  });
+
+  test("never writes `thinking`, which the display wrapper would then skip", async ({
+    makeConversation,
+  }) => {
+    // Visible reasoning comes from the fetch wrapper in clients/llm-client.ts
+    // adding `display: "summarized"`, and that wrapper bails on a body that
+    // already declares `thinking`.
+    const model = await makeAnthropicModelRow("claude-sonnet-5");
+    const conversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+      thinkingEffort: "high",
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(
+      mockStreamText.mock.calls[0]?.[0].providerOptions?.anthropic,
+    ).not.toHaveProperty("thinking");
+  });
+
+  test("leaves Anthropic models without a selectable depth untouched", async ({
+    makeConversation,
+  }) => {
+    const anthropicModelIds = [
+      // Accepts output_config.effort but keeps thinking off, so a depth would
+      // move token spend without producing any reasoning.
+      "claude-opus-4-8",
+      // Rejects the field outright.
+      "claude-haiku-4-5",
+    ];
+
+    for (const anthropicModelId of anthropicModelIds) {
+      const model = await makeAnthropicModelRow(anthropicModelId);
+      const conversation = await makeConversation(agentId, {
+        userId: user.id,
+        organizationId,
+        modelId: model.id,
+        thinkingEffort: "high",
+      });
+      mockStreamText.mockClear();
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/chat",
+        payload: {
+          id: conversation.id,
+          messages: [
+            {
+              id: "msg-1",
+              role: "user",
+              parts: [{ type: "text", text: "hi" }],
+            },
+          ],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      await executionPromise;
+
+      expect(
+        mockStreamText.mock.calls[0]?.[0].providerOptions?.anthropic,
+      ).toBeUndefined();
+    }
+  });
+
+  // Seeds a synced Perplexity model row; the provider serves two transports
+  // discriminated by the model id's vendor prefix.
+  const makePerplexityModelRow = (perplexityModelId: string) =>
+    ModelModel.create({
+      externalId: `perplexity/${perplexityModelId}`,
+      provider: "perplexity",
+      modelId: perplexityModelId,
+      description: perplexityModelId,
+      contextLength: null,
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      supportsToolCalling: true,
+      promptPricePerToken: null,
+      completionPricePerToken: null,
+      ignored: false,
+      lastSyncedAt: new Date(),
+    });
+
+  test("configures the Responses transport for a Perplexity Agent API model", async ({
+    makeConversation,
+  }) => {
+    // The Agent API stores nothing (store:false keeps the SDK from sending
+    // item references it cannot resolve), and the SDK's reasoning request
+    // path is gated on OpenAI's model-name heuristic, which no
+    // vendor-prefixed Perplexity id matches — without forceReasoning the
+    // request carries no `reasoning` block and thinking never streams.
+    const model = await makePerplexityModelRow("anthropic/claude-sonnet-5");
+    const conversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    expect(mockStreamText.mock.calls[0]?.[0].providerOptions?.openai).toEqual({
+      store: false,
+      forceReasoning: true,
+      reasoningSummary: "auto",
+      systemMessageMode: "system",
+    });
+  });
+
+  test("keeps chat-completions Perplexity models off the Responses options", async ({
+    makeConversation,
+  }) => {
+    // A bare `sonar*` id is served over chat completions, where none of the
+    // Responses options exist — the turn must not carry the openai namespace
+    // at all.
+    const model = await makePerplexityModelRow("sonar-pro");
+    const conversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    expect(
+      mockStreamText.mock.calls[0]?.[0].providerOptions?.openai,
+    ).toBeUndefined();
+  });
+
+  // T-959: a GitHub Copilot conversation pins a models.id UUID; the turn must
+  // dereference it to the catalogued provider model name before dispatch —
+  // Copilot 400s ("The requested model is not supported") on anything else.
+  test("dereferences a GitHub Copilot conversation's model FK to the provider model name", async ({
+    makeConversation,
+  }) => {
+    const model = await ModelModel.create({
+      externalId: "github-copilot/gpt-4o",
+      provider: "github-copilot",
+      modelId: "gpt-4o",
+      description: "gpt-4o",
+      contextLength: null,
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      supportsToolCalling: true,
+      promptPricePerToken: null,
+      completionPricePerToken: null,
+      ignored: false,
+      lastSyncedAt: new Date(),
+    });
+    const copilotConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+    });
+    mockCreateLLMModelForAgent.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: copilotConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockCreateLLMModelForAgent).toHaveBeenCalledTimes(1);
+    const dispatch = mockCreateLLMModelForAgent.mock.calls[0]?.[0];
+    expect(dispatch.provider).toBe("github-copilot");
+    // The provider model name — never the models.id UUID the conversation stores.
+    expect(dispatch.model).toBe("gpt-4o");
+    expect(dispatch.model).not.toBe(model.id);
+  });
+
+  test("omits reasoningSummary while the credential is negative-cached as unsupported", async ({
+    makeConversation,
+  }) => {
+    const model = await makeOpenAiModelRow("gpt-5.6");
+    const openAiConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+    });
+    mockIsOpenAiReasoningSummaryMarkedUnsupported.mockResolvedValueOnce(true);
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: openAiConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    expect(mockStreamText.mock.calls[0]?.[0].providerOptions?.openai).toEqual({
+      store: false,
+    });
+  });
+
+  test("retries without summaries and negative-caches the resolved credential on the verification 400", async ({
+    makeConversation,
+  }) => {
+    const model = await makeOpenAiModelRow("gpt-5.6");
+    const openAiConversation = await makeConversation(agentId, {
+      userId: user.id,
+      organizationId,
+      modelId: model.id,
+    });
+    // the turn runs on a resolved stored credential, not the agent's own key
+    mockCreateLLMModelForAgent.mockResolvedValueOnce({
+      model: "mock-model",
+      chatApiKeyId: "00000000-0000-4000-8000-000000000123",
+    });
+    mockStreamText.mockClear();
+    mockMarkOpenAiReasoningSummaryUnsupported.mockClear();
+    // First attempt: the stream carries only the unverified-org rejection.
+    // The beforeEach default implementation then serves the retry.
+    mockStreamText.mockImplementationOnce(() => ({
+      fullStream: {
+        [Symbol.asyncIterator]: () => {
+          const events = [
+            {
+              type: "error",
+              error: new Error(
+                "Your organization must be verified to generate reasoning summaries.",
+              ),
+            },
+          ];
+          let index = 0;
+          return {
+            next: async () =>
+              index < events.length
+                ? { done: false, value: events[index++] }
+                : { done: true, value: undefined },
+          };
+        },
+      },
+    }));
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: openAiConversation.id,
+        messages: [
+          { id: "msg-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(2);
+    expect(mockStreamText.mock.calls[0]?.[0].providerOptions?.openai).toEqual({
+      store: false,
+      reasoningSummary: "auto",
+    });
+    // the retry dropped only the summary option; store:false must survive
+    expect(mockStreamText.mock.calls[1]?.[0].providerOptions?.openai).toEqual({
+      store: false,
+    });
+    // the verdict is keyed by the credential the turn ran on
+    expect(mockMarkOpenAiReasoningSummaryUnsupported).toHaveBeenCalledTimes(1);
+    expect(mockMarkOpenAiReasoningSummaryUnsupported).toHaveBeenCalledWith(
+      `openai-reasoning-summary-unsupported-${organizationId}:00000000-0000-4000-8000-000000000123`,
+    );
+  });
+
+  test("adds load-tools guidance when the agent has no authored prompt", async () => {
+    const { AgentModel } = await import("@/models");
+    await AgentModel.update(agentId, {
+      toolExposureMode: "search_and_run_only",
+      systemPrompt: null,
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "hello" }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    const systemPrompt = mockStreamText.mock.calls[0]?.[0].system;
+    expect(systemPrompt).toContain(
+      "Some available tools are not listed upfront",
+    );
+    expect(systemPrompt).toContain(
+      `call \`${archestraMcpBranding.getToolName(TOOL_SEARCH_TOOLS_SHORT_NAME)}\` to find relevant tools`,
+    );
+    expect(systemPrompt).toContain(
+      `then call \`${archestraMcpBranding.getToolName(TOOL_RUN_TOOL_SHORT_NAME)}\``,
+    );
+  });
+
+  test("uses branded full tool names in load-tools guidance", async () => {
+    archestraMcpBranding.syncFromOrganization({
+      appName: "Custom Ops",
+      iconLogo: null,
+    });
+    const { AgentModel } = await import("@/models");
+    await AgentModel.update(agentId, {
+      toolExposureMode: "search_and_run_only",
+      systemPrompt: null,
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "hello" }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    const systemPrompt = mockStreamText.mock.calls[0]?.[0].system;
+    expect(systemPrompt).toContain(
+      "call `custom_ops__search_tools` to find relevant tools",
+    );
+    expect(systemPrompt).toContain("then call `custom_ops__run_tool`");
+    expect(systemPrompt).not.toContain("call `search_tools`");
+    expect(systemPrompt).not.toContain("then call `run_tool`");
+  });
+
+  test("does not add load-tools guidance for fully exposed tools", async () => {
+    const { AgentModel } = await import("@/models");
+    await AgentModel.update(agentId, {
+      toolExposureMode: "full",
+      systemPrompt: "Use the normal tools.",
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "hello" }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    const systemPrompt = mockStreamText.mock.calls[0]?.[0].system;
+    expect(systemPrompt).toContain("Use the normal tools.");
+    expect(systemPrompt).not.toContain(
+      "Some available tools are not listed upfront",
+    );
+  });
+
+  test("lists the agent's skills in the system prompt when it can activate them", async () => {
+    await MemberModel.updateRole(user.id, organizationId, ADMIN_ROLE_NAME);
+    await SkillModel.createWithFiles({
+      skill: {
+        organizationId,
+        name: "pdf-processing",
+        description: "Extract text from PDF files.",
+        content: "# PDF Processing\nUse pdftotext.",
+        metadata: {},
+        sourceType: "manual",
+      },
+      files: [],
+      ...accessGrants("org"),
+    });
+    const { AgentModel } = await import("@/models");
+    await AgentModel.update(agentId, { systemPrompt: "You are helpful." });
+    mockGetChatMcpTools.mockResolvedValue({
+      [archestraMcpBranding.getToolName(TOOL_LOAD_SKILL_SHORT_NAME)]: {
+        description: "Load a skill",
+        inputSchema: { jsonSchema: { type: "object", properties: {} } },
+      },
+    });
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "hello" }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    const systemPrompt = mockStreamText.mock.calls[0]?.[0].system;
+    expect(systemPrompt).toContain("<available_skills>");
+    expect(systemPrompt).toContain("pdf-processing");
+    expect(systemPrompt).toContain("You are helpful.");
+  });
+
+  test("omits the skill catalog when the agent has no skill tools", async () => {
+    await MemberModel.updateRole(user.id, organizationId, ADMIN_ROLE_NAME);
+    await SkillModel.createWithFiles({
+      skill: {
+        organizationId,
+        name: "pdf-processing",
+        description: "Extract text from PDF files.",
+        content: "# PDF Processing",
+        metadata: {},
+        sourceType: "manual",
+      },
+      files: [],
+      ...accessGrants("org"),
+    });
+    // beforeEach resets getChatMcpTools to {}, so no load_skill is exposed
+    mockStreamText.mockClear();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "hello" }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    const systemPrompt = mockStreamText.mock.calls[0]?.[0].system;
+    expect(systemPrompt ?? "").not.toContain("<available_skills>");
+  });
+
+  test("strips dangling tool parts when persisting a stopped turn", async () => {
+    const { default: MessageModel } = await import("@/models/message");
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-user-1",
+            role: "user",
+            parts: [{ type: "text", text: "search the web" }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+    expect(capturedInnerOnFinish).toBeDefined();
+
+    // Simulate the AI SDK finalizing a stopped turn: the assistant message
+    // carries a tool call that never produced output (interrupted mid-stream).
+    await capturedInnerOnFinish?.({
+      messages: [
+        {
+          id: "msg-user-1",
+          role: "user",
+          parts: [{ type: "text", text: "search the web" }],
+        },
+        {
+          id: "msg-assistant-1",
+          role: "assistant",
+          parts: [
+            { type: "text", text: "Let me search for that." },
+            {
+              type: "tool-web__search",
+              toolCallId: "call_interrupted",
+              state: "input-streaming",
+              input: { q: "weat" },
+            },
+          ],
+        },
+      ],
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const persisted = await MessageModel.findByConversation(conversationId);
+    const assistantMessage = persisted.find((m) => m.role === "assistant");
+    expect(assistantMessage).toBeDefined();
+
+    const parts =
+      (assistantMessage?.content as { parts?: Array<Record<string, unknown>> })
+        ?.parts ?? [];
+    // the dangling tool call is gone, the streamed text is kept
+    expect(parts.some((p) => p.toolCallId === "call_interrupted")).toBe(false);
+    expect(parts.some((p) => p.type === "text")).toBe(true);
+  });
+
+  test("stop endpoint reports stopped:false when no stream is active", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${conversationId}/stop`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body)).toEqual({ stopped: false });
+  });
+
+  test("emits compaction finish when compaction starts but is not beneficial", async () => {
+    mockCompactMessagesForChat.mockImplementation(
+      async ({ messages, onCompactionStart }) => {
+        onCompactionStart?.();
+        return {
+          messages,
+          status: "skipped",
+          compaction: null,
+          reason: "not_beneficial",
+        };
+      },
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "hello" }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    // Transient: these fire before the model stream's `start` chunk, and a
+    // non-transient pre-start data part makes the client mint a phantom
+    // assistant message per attach (see prepare-model-messages.ts).
+    expect(writerWrites).toContainEqual({
+      type: "data-context-compaction-start",
+      data: { trigger: "auto" },
+      transient: true,
+    });
+    expect(writerWrites).toContainEqual({
+      type: "data-context-compaction-finish",
+      data: { status: "skipped", reason: "not_beneficial" },
+      transient: true,
+    });
+  });
+
+  test("creates a running active run that replay clients can attach to", async () => {
+    const streamedChunk = {
+      type: "text-delta",
+      id: "text-active-run",
+      delta: "still streaming",
+    } as const;
+    let streamController!: ReadableStreamDefaultController<unknown>;
+
+    mockCreateUIMessageStreamResponse.mockImplementation(
+      ({ stream }: { stream: ReadableStream<unknown> }) =>
+        new Response(toSseStream(stream), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+    );
+
+    mockCreateUIMessageStream.mockImplementationOnce(() => {
+      const stream = new ReadableStream<unknown>({
+        start(controller) {
+          streamController = controller;
+        },
+      });
+
+      return stream;
+    });
+
+    const postResponsePromise = app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-active-run-user",
+            role: "user",
+            parts: [{ type: "text", text: "hello active run" }],
+          },
+        ],
+      },
+    });
+
+    const activeRun = await waitForRunningActiveRun(conversationId);
+    const duplicateResponse = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-active-run-duplicate-user",
+            role: "user",
+            parts: [{ type: "text", text: "duplicate active run" }],
+          },
+        ],
+      },
+    });
+    expect(duplicateResponse.statusCode).toBe(409);
+    expect(duplicateResponse.json().error.message).toContain("active response");
+
+    await ActiveChatRunModel.appendEvents({
+      runId: activeRun.id,
+      seq: 1,
+      payloads: [{ type: "start" }, streamedChunk],
+    });
+
+    const replayResponsePromise = app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversationId}/active-run`,
+    });
+
+    await expect(
+      Promise.race([
+        replayResponsePromise.then(() => "closed"),
+        delay(50).then(() => "still-open"),
+      ]),
+    ).resolves.toBe("still-open");
+
+    await ActiveChatRunModel.markTerminal({
+      runId: activeRun.id,
+      status: "completed",
+    });
+    streamController.close();
+
+    const [postResponse, replayResponse] = await Promise.all([
+      postResponsePromise,
+      replayResponsePromise,
+    ]);
+
+    expect(postResponse.statusCode).toBe(200);
+    expect(replayResponse.statusCode).toBe(200);
+    expect(readSsePayloads(replayResponse.body)).toContainEqual(streamedChunk);
+    const persistedMessages =
+      await MessageModel.findByConversation(conversationId);
+    expect(persistedMessages).toHaveLength(1);
+    expect(persistedMessages[0]?.role).toBe("user");
+    expect(persistedMessages[0]?.content).toMatchObject({
+      parts: [{ text: "hello active run" }],
+    });
+    await expect(
+      ActiveChatRunModel.findById(activeRun.id),
+    ).resolves.toMatchObject({ status: "completed" });
+  });
+});
+
+async function waitForRunningActiveRun(conversationId: string) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const run =
+      await ActiveChatRunModel.findRunningByConversation(conversationId);
+    if (run) {
+      return run;
+    }
+    await delay(10);
+  }
+
+  throw new Error("Active run was not created");
+}
+
+function readSsePayloads(body: string): unknown[] {
+  return body
+    .split("\n\n")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.startsWith("data: "))
+    .map((entry) => entry.slice("data: ".length))
+    .filter((entry) => entry !== "[DONE]")
+    .map((entry) => JSON.parse(entry));
+}
+
+function toSseStream(stream: ReadableStream<unknown>): ReadableStream<string> {
+  return stream.pipeThrough(
+    new TransformStream<unknown, string>({
+      transform(chunk, controller) {
+        controller.enqueue(`data: ${JSON.stringify(chunk)}\n\n`);
+      },
+      flush(controller) {
+        controller.enqueue("data: [DONE]\n\n");
+      },
+    }),
+  );
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// streamText result whose fullStream yields the given events. Used to drive the
+// route's empty-response probe/retry loop without a live provider. `state`
+// records whether the probe ever cancelled the iterator via return().
+function fakeStreamResult(
+  events: Array<Record<string, unknown>>,
+  options?: { uiChunks?: Array<Record<string, unknown>> },
+) {
+  const state = { returnCalled: false };
+  return {
+    state,
+    fullStream: {
+      [Symbol.asyncIterator]: () => {
+        let index = 0;
+        return {
+          next: async () =>
+            index < events.length
+              ? { done: false, value: events[index++] }
+              : { done: true, value: undefined },
+          return: async () => {
+            state.returnCalled = true;
+            return { done: true as const, value: undefined };
+          },
+        };
+      },
+    },
+    toUIMessageStream: () =>
+      new ReadableStream({
+        start(controller) {
+          for (const chunk of options?.uiChunks ?? []) {
+            controller.enqueue(chunk);
+          }
+          controller.close();
+        },
+      }),
+    usage: Promise.resolve(null),
+  };
+}
+
+async function readAll(stream: ReadableStream<unknown>): Promise<unknown[]> {
+  const chunks: unknown[] = [];
+  const reader = stream.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  return chunks;
+}
+
+// streamText result whose fullStream throws a context-length error on first read,
+// matching parseContextLengthError. Used to exercise the bounded context-trim retry.
+function fakeContextLengthErrorResult() {
+  return {
+    fullStream: {
+      [Symbol.asyncIterator]: () => ({
+        next: async () => {
+          throw new Error("maximum input length of 100 tokens");
+        },
+      }),
+    },
+    toUIMessageStream: () =>
+      new ReadableStream({
+        start(controller) {
+          controller.close();
+        },
+      }),
+    usage: Promise.resolve(null),
+  };
+}
+
+const EMPTY_STREAM_EVENTS = [
+  { type: "start" },
+  { type: "finish", finishReason: "stop" },
+];
+// Gemini MALFORMED_FUNCTION_CALL shape: a clean finish with unified "error",
+// the raw provider reason, and no content or error parts.
+const MALFORMED_FUNCTION_CALL_STREAM_EVENTS = [
+  { type: "start" },
+  {
+    type: "finish",
+    finishReason: "error",
+    rawFinishReason: "MALFORMED_FUNCTION_CALL",
+  },
+];
+const RENDERABLE_STREAM_EVENTS = [
+  { type: "text-delta", text: "hi" },
+  { type: "finish", finishReason: "stop" },
+];
+// model began streaming a tool call but the stream ended before a completed
+// tool-call — an abortive (truncated) turn.
+const ABORTIVE_TOOL_CALL_STREAM_EVENTS = [
+  { type: "start" },
+  { type: "start-step" },
+  { type: "tool-input-start" },
+  { type: "tool-input-delta" },
+  { type: "finish-step", finishReason: "tool-calls" },
+  { type: "finish", finishReason: "tool-calls" },
+];
+// Like ABORTIVE_TOOL_CALL_STREAM_EVENTS but truncated by the output-token cap
+// (finishReason "length") — deterministic, so it is surfaced without a retry.
+const ABORTIVE_LENGTH_TOOL_CALL_STREAM_EVENTS = [
+  { type: "start" },
+  { type: "start-step" },
+  { type: "tool-input-start" },
+  { type: "tool-input-delta" },
+  { type: "finish-step", finishReason: "length" },
+  { type: "finish", finishReason: "length" },
+];
+
+// Like fakeStreamResult, but fires the config's onStepFinish as the step
+// finishes during probe consumption — mimicking how real streamText invokes the
+// callback, so the route's usage-suppression guard can be exercised. The probe
+// drains a discarded attempt before any result is committed, so onStepFinish
+// here runs while hasCommittedResult is still false.
+function fakeStreamResultFiringStepFinish(
+  config: { onStepFinish?: (args: unknown) => void },
+  events: Array<Record<string, unknown>>,
+) {
+  const result = fakeStreamResult(events);
+  const baseIterator = result.fullStream[Symbol.asyncIterator];
+  result.fullStream[Symbol.asyncIterator] = () => {
+    const it = baseIterator();
+    return {
+      next: async () => {
+        const r = await it.next();
+        if (!r.done && (r.value as { type?: string })?.type === "finish") {
+          config.onStepFinish?.({
+            usage: {
+              inputTokens: 5,
+              outputTokens: 1,
+              totalTokens: 6,
+              cachedInputTokens: 0,
+            },
+            finishReason: "tool-calls",
+          });
+        }
+        return r;
+      },
+      return: it.return,
+    };
+  };
+  return result;
+}
+
+// Composition tests: the ordering and wiring between the (individually
+// unit-tested) helpers — injection-before-normalization, compaction event
+// emission, pre-merge persistence, probe iterator handling, tool-UI chunk
+// placement, and the empty-response/context-trim retry loop.
+describe("POST /api/chat handler composition", () => {
+  let app: FastifyInstanceWithZod;
+  let user: User;
+  let organizationId: string;
+  let conversationId: string;
+  let executionPromise: Promise<void> | undefined;
+  let capturedOuterErrorPayload: string | undefined;
+  let writerEvents: Array<{ kind: "write" | "merge"; value: unknown }>;
+  let mergedStreams: ReadableStream<unknown>[];
+  let runExecute = true;
+
+  beforeEach(
+    async ({
+      makeAgent,
+      makeConversation,
+      makeOrganization,
+      makeUser,
+      makeMember,
+    }) => {
+      executionPromise = undefined;
+      capturedOuterErrorPayload = undefined;
+      writerEvents = [];
+      mergedStreams = [];
+      runExecute = true;
+
+      user = await makeUser();
+      const organization = await makeOrganization({ name: "Test Org" });
+      organizationId = organization.id;
+      await makeMember(user.id, organizationId);
+      const agent = await makeAgent({
+        organizationId,
+        name: "Router Agent",
+        systemPrompt: "",
+      });
+      const conversation = await makeConversation(agent.id, {
+        userId: user.id,
+        organizationId,
+      });
+      conversationId = conversation.id;
+
+      mockCreateLLMModelForAgent.mockResolvedValue({ model: "mock-model" });
+      mockGetChatMcpTools.mockResolvedValue({});
+      mockGetChatMcpToolUiResourceUris.mockResolvedValue({});
+      mockFetchToolUiResource.mockResolvedValue(null);
+      mockCompactMessagesForChat.mockImplementation(
+        async ({ messages }: { messages: unknown[] }) => ({
+          messages,
+          status: "skipped",
+          compaction: null,
+          reason: "below_threshold",
+        }),
+      );
+      mockStartActiveChatSpan.mockImplementation(
+        async ({ callback }: { callback: () => Promise<Response> }) =>
+          callback(),
+      );
+      mockStreamText.mockImplementation(() =>
+        fakeStreamResult(RENDERABLE_STREAM_EVENTS),
+      );
+      mockCreateUIMessageStream.mockImplementation(
+        ({
+          execute,
+          onError,
+        }: {
+          execute: (args: {
+            writer: {
+              write: (x: unknown) => void;
+              merge: (s: ReadableStream<unknown>) => void;
+            };
+          }) => Promise<void>;
+          onError: (error: unknown) => string;
+        }) => {
+          if (runExecute) {
+            const writer = {
+              write: (chunk: unknown) =>
+                writerEvents.push({ kind: "write", value: chunk }),
+              merge: (stream: ReadableStream<unknown>) => {
+                writerEvents.push({ kind: "merge", value: stream });
+                mergedStreams.push(stream);
+              },
+            };
+            // route the pre-merge throw (exhausted empty response) to onError,
+            // mirroring how createUIMessageStream surfaces an execute() rejection.
+            executionPromise = execute({ writer }).catch((error) => {
+              capturedOuterErrorPayload = onError(error);
+            });
+          }
+          return new ReadableStream({
+            start(controller) {
+              controller.close();
+            },
+          });
+        },
+      );
+      mockCreateUIMessageStreamResponse.mockImplementation(
+        ({ stream }: { stream: ReadableStream }) =>
+          new Response(stream, {
+            status: 200,
+            headers: { "content-type": "text/plain" },
+          }),
+      );
+
+      app = createFastifyInstance();
+      app.addHook("onRequest", async (request) => {
+        (request as typeof request & { user: User }).user = user;
+        (
+          request as typeof request & { organizationId: string }
+        ).organizationId = organizationId;
+      });
+      const { default: chatRoutes } = await import("./routes");
+      await app.register(chatRoutes);
+    },
+  );
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  async function postMessage(messages: unknown[] = plainUserMessage("hi")) {
+    return app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: { id: conversationId, messages },
+    });
+  }
+
+  const plainUserMessage = (text: string) => [
+    { id: "msg-1", role: "user", parts: [{ type: "text", text }] },
+  ];
+
+  test("retries a clean-but-empty response, then streams the renderable one", async ({
+    expect,
+  }) => {
+    mockStreamText
+      .mockImplementationOnce(() => fakeStreamResult(EMPTY_STREAM_EVENTS))
+      .mockImplementationOnce(() => fakeStreamResult(RENDERABLE_STREAM_EVENTS));
+
+    const response = await postMessage();
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(2);
+    expect(capturedOuterErrorPayload).toBeUndefined();
+  });
+
+  test("retries an empty error finish (malformed tool call), then streams the renderable one", async ({
+    expect,
+  }) => {
+    mockStreamText
+      .mockImplementationOnce(() =>
+        fakeStreamResult(MALFORMED_FUNCTION_CALL_STREAM_EVENTS),
+      )
+      .mockImplementationOnce(() => fakeStreamResult(RENDERABLE_STREAM_EVENTS));
+
+    const response = await postMessage();
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(2);
+    expect(capturedOuterErrorPayload).toBeUndefined();
+  });
+
+  test("surfaces an EmptyResponse stream error after exhausting retries on error finishes", async ({
+    expect,
+  }) => {
+    mockStreamText.mockImplementation(() =>
+      fakeStreamResult(MALFORMED_FUNCTION_CALL_STREAM_EVENTS),
+    );
+
+    const response = await postMessage();
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(3);
+    expect(capturedOuterErrorPayload).toBeDefined();
+    const payload = JSON.parse(capturedOuterErrorPayload ?? "{}");
+    expect(payload.code).toBe("empty_response");
+  });
+
+  test("surfaces an EmptyResponse stream error after exhausting retries and persists the user message", async ({
+    expect,
+  }) => {
+    mockStreamText.mockImplementation(() =>
+      fakeStreamResult(EMPTY_STREAM_EVENTS),
+    );
+
+    const response = await postMessage(plainUserMessage("hello empty"));
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(3);
+    expect(capturedOuterErrorPayload).toBeDefined();
+    const payload = JSON.parse(capturedOuterErrorPayload ?? "{}");
+    expect(payload.code).toBe("empty_response");
+
+    // the throw happens before any merge, so the stream onError/onFinish never
+    // ran — the route must have persisted the user message itself.
+    expect(writerEvents.filter((e) => e.kind === "merge")).toHaveLength(0);
+    const persisted = await MessageModel.findByConversation(conversationId);
+    const persistedUser = persisted.find((m) => m.role === "user");
+    expect(persistedUser).toBeDefined();
+    expect(JSON.stringify(persistedUser?.content)).toContain("hello empty");
+  });
+
+  test("surfaces an output-limit error without retrying and persists the user message", async ({
+    expect,
+  }) => {
+    mockStreamText.mockImplementation(() =>
+      fakeStreamResult([
+        { type: "start" },
+        {
+          type: "finish",
+          finishReason: "length",
+          rawFinishReason: "max_tokens",
+        },
+      ]),
+    );
+
+    const response = await postMessage(plainUserMessage("convert one section"));
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    const payload = JSON.parse(capturedOuterErrorPayload ?? "{}");
+    expect(payload.code).toBe("incomplete_response");
+    expect(payload.isRetryable).toBe(false);
+    expect(payload.message).toContain("output limit before producing a reply");
+    expect(writerEvents.filter((e) => e.kind === "merge")).toHaveLength(0);
+    const persisted = await MessageModel.findByConversation(conversationId);
+    expect(persisted.some((m) => m.role === "user")).toBe(true);
+  });
+
+  test("reuses the trimmed payload when a trimmed attempt then returns empty", async ({
+    expect,
+  }) => {
+    // messages large enough that trimMessagesToTokenLimit (400-char budget for the
+    // mocked 100-token limit) actually drops content, so the trimmed payload is
+    // observably different from the original.
+    const longContent = "x".repeat(300);
+    mockCompactMessagesForChat.mockImplementation(async () => ({
+      messages: [
+        { role: "user", content: longContent },
+        { role: "assistant", content: longContent },
+        { role: "user", content: longContent },
+      ],
+      status: "skipped",
+      compaction: null,
+      reason: "below_threshold",
+    }));
+    mockStreamText
+      .mockImplementationOnce(() => fakeContextLengthErrorResult())
+      .mockImplementationOnce(() => fakeStreamResult(EMPTY_STREAM_EVENTS))
+      .mockImplementationOnce(() => fakeStreamResult(RENDERABLE_STREAM_EVENTS));
+
+    const response = await postMessage();
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(3);
+    const originalMessages = mockStreamText.mock.calls[0][0].messages;
+    const trimmedMessages = mockStreamText.mock.calls[1][0].messages;
+    const emptyRetryMessages = mockStreamText.mock.calls[2][0].messages;
+    // the trim must have actually changed the payload, otherwise this test proves
+    // nothing about which payload the empty-retry resends.
+    expect(trimmedMessages).not.toEqual(originalMessages);
+    // the empty-response retry resends the trimmed payload, not the original.
+    expect(emptyRetryMessages).toEqual(trimmedMessages);
+  });
+
+  test("bounds context-trim retries instead of looping on a repeated context-length error", async ({
+    expect,
+  }) => {
+    // content-shaped model messages so trimMessagesToTokenLimit runs cleanly and
+    // the cap (not a crash) is what bounds the loop.
+    mockCompactMessagesForChat.mockImplementation(async () => ({
+      messages: [{ role: "user", content: "hi" }],
+      status: "skipped",
+      compaction: null,
+      reason: "below_threshold",
+    }));
+    // every attempt rejects with the same max-token error; trimming is
+    // deterministic, so without a cap this would retry forever.
+    mockStreamText.mockImplementation(() => fakeContextLengthErrorResult());
+
+    const response = await postMessage();
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    // initial attempt + exactly one trim retry, then fall through to the merge.
+    expect(mockStreamText).toHaveBeenCalledTimes(2);
+  });
+
+  test("retries an abortive tool call, then streams the renderable one", async ({
+    expect,
+  }) => {
+    mockStreamText
+      .mockImplementationOnce(() =>
+        fakeStreamResult(ABORTIVE_TOOL_CALL_STREAM_EVENTS),
+      )
+      .mockImplementationOnce(() => fakeStreamResult(RENDERABLE_STREAM_EVENTS));
+
+    const response = await postMessage();
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(2);
+    expect(capturedOuterErrorPayload).toBeUndefined();
+  });
+
+  test("bounds abortive tool-call retries and commits the result (tracker surfaces the incomplete call)", async ({
+    expect,
+  }) => {
+    // the merged UI stream replays the unresolved tool call so the abortive-turn
+    // tracker (piped onto the merge) can append its error chunk.
+    mockStreamText.mockImplementation(() =>
+      fakeStreamResult(ABORTIVE_TOOL_CALL_STREAM_EVENTS, {
+        uiChunks: [
+          { type: "tool-input-start", toolCallId: "t1", toolName: "x" },
+        ],
+      }),
+    );
+
+    const response = await postMessage();
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    // initial attempt + exactly one retry, then commit (the abortive-turn
+    // tracker emits IncompleteToolCall inline rather than throwing).
+    expect(mockStreamText).toHaveBeenCalledTimes(2);
+    expect(capturedOuterErrorPayload).toBeUndefined();
+
+    const merged = mergedStreams.at(-1);
+    expect(merged).toBeDefined();
+    const chunks = (await readAll(merged as ReadableStream<unknown>)) as Array<{
+      type?: string;
+      errorText?: string;
+    }>;
+    const errorChunk = chunks.find((c) => c.type === "error");
+    expect(errorChunk?.errorText).toContain("incomplete_tool_call");
+  });
+
+  test("surfaces a non-retryable ToolCallOutputTruncated for a length-truncated tool call", async ({
+    expect,
+  }) => {
+    mockStreamText.mockImplementation(() =>
+      fakeStreamResult(ABORTIVE_LENGTH_TOOL_CALL_STREAM_EVENTS, {
+        uiChunks: [
+          { type: "tool-input-start", toolCallId: "t1", toolName: "x" },
+        ],
+      }),
+    );
+
+    const response = await postMessage();
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    // Deterministic truncation: surfaced on the first attempt, never retried.
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    const merged = mergedStreams.at(-1);
+    const chunks = (await readAll(merged as ReadableStream<unknown>)) as Array<{
+      type?: string;
+      errorText?: string;
+    }>;
+    const errorChunk = chunks.find((c) => c.type === "error");
+    const payload = JSON.parse(errorChunk?.errorText ?? "{}");
+    expect(payload.code).toBe("tool_call_output_truncated");
+    expect(payload.isRetryable).toBe(false);
+  });
+
+  test("does not emit token-usage from a discarded abortive retry attempt", async ({
+    expect,
+  }) => {
+    mockStreamText
+      .mockImplementationOnce(
+        (config: { onStepFinish?: (a: unknown) => void }) =>
+          fakeStreamResultFiringStepFinish(
+            config,
+            ABORTIVE_TOOL_CALL_STREAM_EVENTS,
+          ),
+      )
+      .mockImplementationOnce(() => fakeStreamResult(RENDERABLE_STREAM_EVENTS));
+
+    const response = await postMessage();
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockStreamText).toHaveBeenCalledTimes(2);
+    const usageWrites = writerEvents.filter(
+      (e) =>
+        e.kind === "write" &&
+        (e.value as { type?: string })?.type === "data-token-usage",
+    );
+    expect(usageWrites).toHaveLength(0);
+  });
+
+  test("injects slash-command skill activation into the model-bound messages but not the persisted ones", async () => {
+    await MemberModel.updateRole(user.id, organizationId, ADMIN_ROLE_NAME);
+    const { default: OrganizationModel } = await import(
+      "@/models/organization"
+    );
+    await OrganizationModel.patch(organizationId, {
+      skillToolsEnabled: true,
+    });
+    const skill = await SkillModel.createWithFiles({
+      skill: {
+        organizationId,
+        name: "pdf-processing",
+        description: "Extract text from PDF files.",
+        content: "# PDF Processing\nUse pdftotext.",
+        metadata: {},
+        sourceType: "manual",
+      },
+      files: [],
+      ...accessGrants("org"),
+    });
+    if (!skill) {
+      throw new Error("Failed to create test skill");
+    }
+
+    const response = await postMessage([
+      {
+        id: "msg-1",
+        role: "user",
+        parts: [{ type: "text", text: "extract the attached pdf" }],
+        metadata: { skill: { id: skill.id, name: skill.name } },
+      },
+    ]);
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    // The injected activation block must survive the rest of the message
+    // preparation (normalization and the compaction pass-through; conversion
+    // is identity-mocked here) and reach streamText prepended to the user's
+    // text.
+    expect(mockStreamText).toHaveBeenCalledTimes(1);
+    const sentMessages = mockStreamText.mock.calls[0]?.[0].messages as Array<{
+      role: string;
+      parts?: Array<{ type: string; text?: string }>;
+    }>;
+    const sentUserText = sentMessages
+      .filter((m) => m.role === "user")
+      .flatMap((m) => m.parts ?? [])
+      .filter((p) => p.type === "text")
+      .map((p) => p.text)
+      .join("\n");
+    expect(sentUserText).toContain("# PDF Processing");
+    expect(sentUserText).toContain("extract the attached pdf");
+
+    // The persisted user message stays clean: injection works on a copy.
+    const persisted = await MessageModel.findByConversation(conversationId);
+    const persistedUser = persisted.find((m) => m.role === "user");
+    expect(persistedUser).toBeDefined();
+    expect(JSON.stringify(persistedUser?.content)).not.toContain(
+      "# PDF Processing",
+    );
+  });
+
+  test("marks every context-window data part transient, including the per-step re-emit", async ({
+    expect,
+  }) => {
+    const response = await postMessage();
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    // Both tool-call steps and the final response step re-emit the breakdown
+    // with the provider's real input count. onStepFinish only emits once a
+    // result is committed, which the awaited execution above has done.
+    const streamConfig = mockStreamText.mock.calls.at(-1)?.[0] as {
+      onStepFinish?: (step: unknown) => Promise<void> | void;
+    };
+    await streamConfig.onStepFinish?.({
+      usage: { inputTokens: 1200, outputTokens: 10, totalTokens: 1210 },
+      finishReason: "tool-calls",
+      toolCalls: [],
+    });
+    await streamConfig.onStepFinish?.({
+      usage: { inputTokens: 2400, outputTokens: 25, totalTokens: 2425 },
+      finishReason: "stop",
+      toolCalls: [],
+    });
+
+    const breakdownWrites = writerEvents.filter(
+      (event) =>
+        event.kind === "write" &&
+        (event.value as { type?: string })?.type ===
+          "data-context-window-breakdown",
+    );
+    // Pre-stream breakdown + post-tool-step + post-final-step re-emits.
+    expect(breakdownWrites.length).toBeGreaterThanOrEqual(3);
+    expect(
+      (breakdownWrites.at(-1)?.value as { data?: { usedTokens?: number } })
+        ?.data?.usedTokens,
+    ).toBe(2400);
+
+    // Every one of these carries UI state the client reads via onData. A
+    // non-transient copy lands in the assistant message instead, where it is
+    // persisted, re-appended on each replay, and — when it arrives before the
+    // stream's `start` chunk — makes the AI SDK open a message of its own to
+    // hold it, which renders the turn twice.
+    const uiStateWrites = writerEvents.filter(
+      (event) =>
+        event.kind === "write" &&
+        /^data-context-(window|compaction)/.test(
+          (event.value as { type?: string })?.type ?? "",
+        ),
+    );
+    for (const write of uiStateWrites) {
+      expect(write.value).toMatchObject({ transient: true });
+    }
+  });
+
+  test("emits compaction start/finish and context-window-estimate events in order, before the stream merge", async () => {
+    mockCompactMessagesForChat.mockImplementation(
+      async ({
+        messages,
+        onCompactionStart,
+      }: {
+        messages: unknown[];
+        onCompactionStart: () => void;
+      }) => {
+        onCompactionStart();
+        return {
+          messages,
+          status: "created",
+          compaction: {
+            id: "compaction-1",
+            trigger: "auto",
+            originalTokenEstimate: 120_000,
+            compactedTokenEstimate: 2_000,
+          },
+          inputTokenEstimate: 2_000,
+        };
+      },
+    );
+
+    const response = await postMessage();
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    const eventOrder = writerEvents.map((event) =>
+      event.kind === "merge" ? "merge" : (event.value as { type: string }).type,
+    );
+    const startIndex = eventOrder.indexOf("data-context-compaction-start");
+    const finishIndex = eventOrder.indexOf("data-context-compaction-finish");
+    const estimateIndex = eventOrder.indexOf("data-context-window-estimate");
+    const mergeIndex = eventOrder.indexOf("merge");
+    expect(startIndex).toBeGreaterThanOrEqual(0);
+    expect(finishIndex).toBeGreaterThan(startIndex);
+    expect(estimateIndex).toBeGreaterThan(finishIndex);
+    expect(mergeIndex).toBeGreaterThan(estimateIndex);
+
+    const finishEvent = writerEvents[finishIndex]?.value as {
+      data: { status: string };
+    };
+    expect(finishEvent.data).toMatchObject({ status: "created" });
+    const estimateEvent = writerEvents[estimateIndex]?.value as {
+      data: { estimatedTokens: number };
+    };
+    expect(estimateEvent.data.estimatedTokens).toBe(2_000);
+  });
+
+  test("probes the stream without cancelling its iterator, then merges the same result", async () => {
+    const result = fakeStreamResult(RENDERABLE_STREAM_EVENTS);
+    mockStreamText.mockImplementation(() => result);
+
+    const response = await postMessage();
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    // The probe peeks the fullStream iterator; cancelling it (e.g. via a
+    // for-await rewrite) would drop the SDK result's internal tee and break
+    // the merge that follows.
+    expect(result.state.returnCalled).toBe(false);
+    expect(writerEvents.filter((e) => e.kind === "merge")).toHaveLength(1);
+  });
+
+  test("emits data-tool-ui-start inside the merged stream right after tool-input-start, never via writer.write", async () => {
+    mockGetChatMcpToolUiResourceUris.mockResolvedValue({
+      my_app_tool: "ui://my-app/main",
+    });
+    mockFetchToolUiResource.mockResolvedValue({ html: "<div>app</div>" });
+    mockStreamText.mockImplementation(() =>
+      fakeStreamResult(RENDERABLE_STREAM_EVENTS, {
+        uiChunks: [
+          { type: "start" },
+          {
+            type: "tool-input-start",
+            toolCallId: "call-1",
+            toolName: "my_app_tool",
+          },
+          { type: "tool-input-delta", toolCallId: "call-1", delta: "{}" },
+          { type: "finish" },
+        ],
+      }),
+    );
+
+    const response = await postMessage(plainUserMessage("open the app"));
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mergedStreams).toHaveLength(1);
+    const mergedChunks = (await readAll(mergedStreams[0])) as Array<{
+      type: string;
+    }>;
+    const toolStartIndex = mergedChunks.findIndex(
+      (chunk) => chunk.type === "tool-input-start",
+    );
+    expect(toolStartIndex).toBeGreaterThanOrEqual(0);
+    expect(mergedChunks[toolStartIndex + 1]).toMatchObject({
+      type: "data-tool-ui-start",
+      data: {
+        toolCallId: "call-1",
+        toolName: "my_app_tool",
+        uiResourceUri: "ui://my-app/main",
+        html: "<div>app</div>",
+      },
+    });
+
+    // Placement is the contract: the UI-start chunk rides the merged stream
+    // (after the probe), not the writer, so the probe can never emit it early.
+    const directWrites = writerEvents
+      .filter((e) => e.kind === "write")
+      .map((e) => (e.value as { type: string }).type);
+    expect(directWrites).not.toContain("data-tool-ui-start");
+  });
+
+  test("appends a retryable IncompleteToolCall error when a tool call never completes", async () => {
+    const { default: ConversationChatErrorModel } = await import(
+      "@/models/conversation-chat-error"
+    );
+    // Renderable first event so the probe commits the turn; the UI stream opens
+    // with reasoning text then a tool call that never reaches tool-input-available.
+    mockStreamText.mockImplementation(() =>
+      fakeStreamResult(RENDERABLE_STREAM_EVENTS, {
+        uiChunks: [
+          { type: "start" },
+          { type: "text-start", id: "t0" },
+          { type: "text-delta", id: "t0", delta: "<think>call whoami</think>" },
+          { type: "text-end", id: "t0" },
+          {
+            type: "tool-input-start",
+            toolCallId: "call-1",
+            toolName: "whoami",
+          },
+          {
+            type: "tool-input-delta",
+            toolCallId: "call-1",
+            inputTextDelta: "{",
+          },
+          { type: "finish" },
+        ],
+      }),
+    );
+
+    const response = await postMessage(plainUserMessage("show me my tasks"));
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mergedStreams).toHaveLength(1);
+    const mergedChunks = (await readAll(mergedStreams[0])) as Array<{
+      type: string;
+      errorText?: string;
+    }>;
+    const errorChunk = mergedChunks.find((chunk) => chunk.type === "error");
+    expect(errorChunk).toBeDefined();
+    expect(mergedChunks.at(-1)).toBe(errorChunk); // trailing, after model content
+    const payload = JSON.parse(errorChunk?.errorText ?? "{}");
+    expect(payload.code).toBe("incomplete_tool_call");
+    expect(payload.isRetryable).toBe(true);
+
+    await new Promise((resolve) => setImmediate(resolve));
+    const persistedErrors =
+      await ConversationChatErrorModel.findByConversation(conversationId);
+    expect(persistedErrors).toHaveLength(1);
+    expect(persistedErrors[0]?.error.code).toBe("incomplete_tool_call");
+  });
+
+  test("does not flag a completed tool call", async () => {
+    const { default: ConversationChatErrorModel } = await import(
+      "@/models/conversation-chat-error"
+    );
+    mockStreamText.mockImplementation(() =>
+      fakeStreamResult(RENDERABLE_STREAM_EVENTS, {
+        uiChunks: [
+          { type: "start" },
+          {
+            type: "tool-input-start",
+            toolCallId: "call-1",
+            toolName: "whoami",
+          },
+          {
+            type: "tool-input-available",
+            toolCallId: "call-1",
+            toolName: "whoami",
+            input: {},
+          },
+          { type: "tool-output-available", toolCallId: "call-1", output: "ok" },
+          { type: "finish" },
+        ],
+      }),
+    );
+
+    const response = await postMessage(plainUserMessage("who am i"));
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    const mergedChunks = (await readAll(mergedStreams[0])) as Array<{
+      type: string;
+    }>;
+    expect(mergedChunks.some((chunk) => chunk.type === "error")).toBe(false);
+
+    await new Promise((resolve) => setImmediate(resolve));
+    const persistedErrors =
+      await ConversationChatErrorModel.findByConversation(conversationId);
+    expect(persistedErrors).toHaveLength(0);
+  });
+
+  test("does not flag a tool call paused for approval (input completed first)", async () => {
+    const { default: ConversationChatErrorModel } = await import(
+      "@/models/conversation-chat-error"
+    );
+    mockStreamText.mockImplementation(() =>
+      fakeStreamResult(RENDERABLE_STREAM_EVENTS, {
+        uiChunks: [
+          { type: "start" },
+          {
+            type: "tool-input-start",
+            toolCallId: "call-1",
+            toolName: "whoami",
+          },
+          {
+            type: "tool-input-available",
+            toolCallId: "call-1",
+            toolName: "whoami",
+            input: {},
+          },
+          { type: "tool-approval-request", toolCallId: "call-1" },
+          { type: "finish" },
+        ],
+      }),
+    );
+
+    const response = await postMessage(plainUserMessage("who am i"));
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    const mergedChunks = (await readAll(mergedStreams[0])) as Array<{
+      type: string;
+    }>;
+    expect(mergedChunks.some((chunk) => chunk.type === "error")).toBe(false);
+
+    await new Promise((resolve) => setImmediate(resolve));
+    const persistedErrors =
+      await ConversationChatErrorModel.findByConversation(conversationId);
+    expect(persistedErrors).toHaveLength(0);
+  });
+
+  test("does not flag a tool call whose input errored (tool-input-error)", async () => {
+    const { default: ConversationChatErrorModel } = await import(
+      "@/models/conversation-chat-error"
+    );
+    mockStreamText.mockImplementation(() =>
+      fakeStreamResult(RENDERABLE_STREAM_EVENTS, {
+        uiChunks: [
+          { type: "start" },
+          {
+            type: "tool-input-start",
+            toolCallId: "call-1",
+            toolName: "whoami",
+          },
+          {
+            type: "tool-input-delta",
+            toolCallId: "call-1",
+            inputTextDelta: "{",
+          },
+          {
+            type: "tool-input-error",
+            toolCallId: "call-1",
+            toolName: "whoami",
+            input: {},
+            errorText: "malformed tool call",
+          },
+          { type: "finish" },
+        ],
+      }),
+    );
+
+    const response = await postMessage(plainUserMessage("who am i"));
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    const mergedChunks = (await readAll(mergedStreams[0])) as Array<{
+      type: string;
+    }>;
+    expect(mergedChunks.some((chunk) => chunk.type === "error")).toBe(false);
+
+    await new Promise((resolve) => setImmediate(resolve));
+    const persistedErrors =
+      await ConversationChatErrorModel.findByConversation(conversationId);
+    expect(persistedErrors).toHaveLength(0);
+  });
+
+  test("persists the user message before the stream executes", async () => {
+    runExecute = false;
+
+    const response = await postMessage(plainUserMessage("persist me early"));
+    expect(response.statusCode).toBe(200);
+
+    // execute() never ran, so the only persistence opportunity was the early
+    // pre-stream persist. A reload during streaming depends on this.
+    const persisted = await MessageModel.findByConversation(conversationId);
+    const persistedUser = persisted.find((m) => m.role === "user");
+    expect(persistedUser).toBeDefined();
+    expect(JSON.stringify(persistedUser?.content)).toContain(
+      "persist me early",
+    );
+  });
+
+  test("does not extract inline attachments when the conversation already has an active run", async () => {
+    const blockingRun = await activeChatRunService.createRun({
+      conversationId,
+      userId: user.id,
+      organizationId,
+    });
+    expect(blockingRun).not.toBeNull();
+
+    const dataUrl = `data:text/plain;base64,${Buffer.from("attachment-bytes").toString("base64")}`;
+    const response = await postMessage([
+      {
+        id: "msg-1",
+        role: "user",
+        parts: [
+          { type: "text", text: "with attachment" },
+          { type: "file", url: dataUrl, filename: "a.txt" },
+        ],
+      },
+    ]);
+
+    expect(response.statusCode).toBe(409);
+    const attachments =
+      await ConversationAttachmentModel.findByConversationIdWithoutData(
+        conversationId,
+      );
+    expect(attachments).toHaveLength(0);
+  });
+
+  test("accepts an unsupported attachment with no sandbox and stores it as a conversation attachment", async () => {
+    const dataUrl = `data:application/zip;base64,${Buffer.from("PK zip bytes").toString("base64")}`;
+    const response = await postMessage([
+      {
+        id: "msg-1",
+        role: "user",
+        parts: [
+          { type: "text", text: "process this" },
+          {
+            type: "file",
+            url: dataUrl,
+            mediaType: "application/zip",
+            filename: "archive.zip",
+          },
+        ],
+      },
+    ]);
+
+    // A file the model can't read is no longer rejected: it lands as a
+    // conversation attachment surfaced in the chat Files panel, and the model
+    // is told about it via a notice at materialize time.
+    expect(response.statusCode).toBe(200);
+    const attachments =
+      await ConversationAttachmentModel.findByConversationIdWithoutData(
+        conversationId,
+      );
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0].originalName).toBe("archive.zip");
+    expect(attachments[0].mimeType).toBe("application/zip");
+  });
+
+  test("accepts an attachment over the sandbox limit and stores it", async () => {
+    // Too big to stage into the sandbox, but well under the storage cap: the
+    // sandbox is bypassed and the file still lands in the Files panel. The
+    // staging limit defaults to the storage cap, so it is lowered here to
+    // keep that band non-empty (and the buffer small).
+    const original = config.skillsSandbox.artifactBytesLimit;
+    (
+      config.skillsSandbox as { artifactBytesLimit: number }
+    ).artifactBytesLimit = 1024;
+    try {
+      const overSandbox = Buffer.alloc(
+        config.skillsSandbox.artifactBytesLimit + 1,
+        0x61,
+      );
+      const dataUrl = `data:application/zip;base64,${overSandbox.toString("base64")}`;
+      const response = await postMessage([
+        {
+          id: "msg-1",
+          role: "user",
+          parts: [
+            { type: "text", text: "process this" },
+            {
+              type: "file",
+              url: dataUrl,
+              mediaType: "application/zip",
+              filename: "big.zip",
+            },
+          ],
+        },
+      ]);
+
+      expect(response.statusCode).toBe(200);
+      const attachments =
+        await ConversationAttachmentModel.findByConversationIdWithoutData(
+          conversationId,
+        );
+      expect(attachments).toHaveLength(1);
+      expect(attachments[0].originalName).toBe("big.zip");
+      expect(attachments[0].fileSize).toBe(overSandbox.byteLength);
+    } finally {
+      (
+        config.skillsSandbox as { artifactBytesLimit: number }
+      ).artifactBytesLimit = original;
+    }
+  });
+
+  test("rejects an attachment over the attachment storage cap and persists nothing", async () => {
+    // Past the one remaining gate — no surface can hold it, so the request is
+    // refused before any bytes persist.
+    const oversized = Buffer.alloc(
+      config.chat.attachmentStorageBytesLimit + 1,
+      0x61,
+    );
+    const dataUrl = `data:application/zip;base64,${oversized.toString("base64")}`;
+    const response = await postMessage([
+      {
+        id: "msg-1",
+        role: "user",
+        parts: [
+          { type: "text", text: "process this" },
+          {
+            type: "file",
+            url: dataUrl,
+            mediaType: "application/zip",
+            filename: "huge.zip",
+          },
+        ],
+      },
+    ]);
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toContain("is too large to attach");
+    const attachments =
+      await ConversationAttachmentModel.findByConversationIdWithoutData(
+        conversationId,
+      );
+    expect(attachments).toHaveLength(0);
+  });
+
+  test("web chat turn without X-Archestra-Run-Id resolves active runtime task and refuses fixed-tier scaleup", async ({
+    makeAgent,
+    makeConversation,
+    seedAndAssignArchestraTools,
+  }) => {
+    const fixedAgent = await makeAgent({
+      organizationId,
+      name: "Fixed Tier Agent",
+      agentType: "agent",
+      runtime: {
+        image: "example.com/coding-agent:latest",
+        command: null,
+        inferenceProtocol: "openai_responses",
+        backend: "kubernetes",
+        steerMode: "pipe",
+        privileged: false,
+        tier: "M",
+        maxTier: "M",
+        environment: null,
+        credentials: [],
+        ttlHours: 12,
+        maxCostUsd: null,
+        idleTimeoutMinutes: null,
+      },
+    });
+    await seedAndAssignArchestraTools(fixedAgent.id);
+
+    const fixedConversation = await makeConversation(fixedAgent.id, {
+      userId: user.id,
+      organizationId,
+    });
+
+    const a2aContext = await A2AContextModel.create({
+      actorKind: "user",
+      actorId: user.id,
+    });
+    expect(a2aContext.id).not.toBe(fixedConversation.id);
+    const task = await A2ATaskModel.create({
+      contextId: a2aContext.id,
+      agentId: fixedAgent.id,
+      state: "TASK_STATE_WORKING",
+    });
+
+    await McpToolCallModel.create({
+      agentId: fixedAgent.id,
+      mcpServerName: archestraMcpBranding.serverName,
+      method: "tools/call",
+      durationMs: 12,
+      toolCall: {
+        id: "call-launch-s",
+        name: TOOL_START_AGENT_RUN_FULL_NAME,
+        arguments: { agent_id: fixedAgent.id, limits: { tier: "S" } },
+      },
+      toolResult: {
+        structuredContent: { run: { run_id: task.id } },
+      },
+      userId: user.id,
+      runId: task.id,
+      sessionId: fixedConversation.id,
+      llmToolCallId: "call-launch-s",
+      authMethod: null,
+      oauthClientId: null,
+      source: "chat",
+    });
+
+    const workloadName = `agent-run-${task.id}`;
+    await AgentRunModel.create({
+      organizationId,
+      taskId: task.id,
+      agentId: fixedAgent.id,
+      actorKind: "user",
+      actorId: user.id,
+      actorUserId: user.id,
+      workloadName,
+      backend: "kubernetes",
+      runtimeScope: "default",
+      virtualApiKeyId: null,
+      runtimeLimits: {
+        tier: "S",
+        idleTimeoutMinutes: 60,
+        maxDurationHours: 1,
+        maxCostUsd: null,
+      },
+    });
+
+    await AgentWorkspaceModel.create({
+      id: task.id,
+      organizationId,
+      agentId: fixedAgent.id,
+      actorKind: "user",
+      actorId: user.id,
+      backend: "kubernetes",
+      runtimeScope: "default",
+      workloadName,
+      state: "active",
+      activeTaskId: task.id,
+      lastTaskId: task.id,
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+
+    // Provide start_agent_run via mockGetChatMcpTools to verify the callerRunId
+    // wiring into tool context without X-Archestra-Run-Id header:
+    mockGetChatMcpTools.mockImplementationOnce(async (params) => {
+      expect(params.runId).toBe(task.id);
+      return {
+        [archestraMcpBranding.getToolName(TOOL_START_AGENT_RUN_SHORT_NAME)]:
+          buildMcpGatewayTool({
+            mcpTool: {
+              name: TOOL_START_AGENT_RUN_FULL_NAME,
+              inputSchema: { type: "object" },
+            },
+            ctx: {
+              agentId: fixedAgent.id,
+              agentName: fixedAgent.name,
+              userId: user.id,
+              organizationId,
+              runId: params.runId,
+              modelAcceptsImageToolResults: false,
+              mcpGwToken: {
+                tokenValue: null,
+                tokenId: user.id,
+                teamId: null,
+                isOrganizationToken: false,
+                isUserToken: true,
+              },
+              repeatTracker: params.repeatTracker,
+            },
+          }),
+      };
+    });
+
+    let capturedTools:
+      | Record<string, { execute?: (...args: unknown[]) => Promise<unknown> }>
+      | undefined;
+    mockStreamText.mockImplementationOnce(
+      (config: {
+        tools?: Record<
+          string,
+          { execute?: (...args: unknown[]) => Promise<unknown> }
+        >;
+      }) => {
+        capturedTools = config.tools;
+        return fakeStreamResult(RENDERABLE_STREAM_EVENTS);
+      },
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      // Explicitly NO X-Archestra-Run-Id header!
+      payload: {
+        id: fixedConversation.id,
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "scale up" }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockGetChatMcpTools).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: fixedConversation.id,
+        runId: task.id,
+      }),
+    );
+
+    const startTool =
+      capturedTools?.[
+        archestraMcpBranding.getToolName(TOOL_START_AGENT_RUN_SHORT_NAME)
+      ];
+    expect(startTool?.execute).toBeDefined();
+
+    const scaleupResult = await startTool?.execute?.(
+      {
+        agent_id: fixedAgent.id,
+        message: "Attempt scale up from S to M",
+        limits: { tier: "M" },
+      },
+      { toolCallId: "call-fixed-1", messages: [] },
+    );
+    const scaleupOutput =
+      typeof scaleupResult === "string"
+        ? scaleupResult
+        : ((scaleupResult as { content?: string })?.content ?? "");
+    expect(scaleupOutput).toContain(
+      "Cannot scale up this agent runtime instance: scaling up is disabled and the runtime tier is fixed to S (2 CPU, 4 GiB (8 GiB limit), 20 GiB workspace). This call is not retriable; calling it again will fail.",
+    );
+  });
+
+  test("web chat turn without X-Archestra-Run-Id leaves runId unset and keeps agent default ceiling when another active run exists", async ({
+    makeAgent,
+    makeConversation,
+    seedAndAssignArchestraTools,
+  }) => {
+    const fixedAgent = await makeAgent({
+      organizationId,
+      name: "Fixed Tier Agent Distinct Run",
+      agentType: "agent",
+      runtime: {
+        image: "example.com/coding-agent:latest",
+        command: null,
+        inferenceProtocol: "openai_responses",
+        backend: "kubernetes",
+        steerMode: "pipe",
+        privileged: false,
+        tier: "M",
+        maxTier: "M",
+        environment: null,
+        credentials: [],
+        ttlHours: 12,
+        maxCostUsd: null,
+        idleTimeoutMinutes: null,
+      },
+    });
+    await seedAndAssignArchestraTools(fixedAgent.id);
+
+    const webConversation = await makeConversation(fixedAgent.id, {
+      userId: user.id,
+      organizationId,
+    });
+
+    // Create another active run of the same user and agent with a distinct A2A context ID:
+    const otherContext = await A2AContextModel.create({
+      actorKind: "user",
+      actorId: user.id,
+    });
+    expect(otherContext.id).not.toBe(webConversation.id);
+
+    const otherTask = await A2ATaskModel.create({
+      contextId: otherContext.id,
+      agentId: fixedAgent.id,
+      state: "TASK_STATE_WORKING",
+    });
+
+    const otherWorkload = `agent-run-${otherTask.id}`;
+    await AgentRunModel.create({
+      organizationId,
+      taskId: otherTask.id,
+      agentId: fixedAgent.id,
+      actorKind: "user",
+      actorId: user.id,
+      actorUserId: user.id,
+      workloadName: otherWorkload,
+      backend: "kubernetes",
+      runtimeScope: "default",
+      virtualApiKeyId: null,
+      runtimeLimits: {
+        tier: "S",
+        idleTimeoutMinutes: 60,
+        maxDurationHours: 1,
+        maxCostUsd: null,
+      },
+    });
+
+    await AgentWorkspaceModel.create({
+      id: otherTask.id,
+      organizationId,
+      agentId: fixedAgent.id,
+      actorKind: "user",
+      actorId: user.id,
+      backend: "kubernetes",
+      runtimeScope: "default",
+      workloadName: otherWorkload,
+      state: "active",
+      activeTaskId: otherTask.id,
+      lastTaskId: otherTask.id,
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+
+    // Pasting another run's UUID into conversation messages must NOT claim it:
+    await MessageModel.create({
+      conversationId: webConversation.id,
+      role: "assistant",
+      content: {
+        role: "assistant",
+        parts: [
+          {
+            type: "text",
+            text: `Copied foreign run id: ${otherTask.id}`,
+          },
+        ],
+      },
+    });
+
+    // A finished run previously started by this conversation must also be ignored:
+    const finishedTask = await A2ATaskModel.create({
+      contextId: otherContext.id,
+      agentId: fixedAgent.id,
+      state: "TASK_STATE_COMPLETED",
+    });
+    const finishedRun = await AgentRunModel.create({
+      organizationId,
+      taskId: finishedTask.id,
+      agentId: fixedAgent.id,
+      actorKind: "user",
+      actorId: user.id,
+      actorUserId: user.id,
+      workloadName: `agent-run-${finishedTask.id}`,
+      backend: "kubernetes",
+      runtimeScope: "default",
+      virtualApiKeyId: null,
+      runtimeLimits: {
+        tier: "S",
+        idleTimeoutMinutes: 60,
+        maxDurationHours: 1,
+        maxCostUsd: null,
+      },
+    });
+    await AgentRunModel.close({ id: finishedRun.id });
+    await McpToolCallModel.create({
+      agentId: fixedAgent.id,
+      mcpServerName: archestraMcpBranding.serverName,
+      method: "tools/call",
+      durationMs: 10,
+      toolCall: {
+        id: "call-finished",
+        name: TOOL_START_AGENT_RUN_FULL_NAME,
+        arguments: { agent_id: fixedAgent.id, limits: { tier: "S" } },
+      },
+      toolResult: {
+        structuredContent: { run: { run_id: finishedTask.id } },
+      },
+      userId: user.id,
+      runId: finishedTask.id,
+      sessionId: webConversation.id,
+      llmToolCallId: "call-finished",
+      authMethod: null,
+      oauthClientId: null,
+      source: "chat",
+    });
+
+    // Reading another run's status via get_agent_run must NOT store it as this conversation's run:
+    const getRunTool = buildMcpGatewayTool({
+      mcpTool: {
+        name: TOOL_GET_AGENT_RUN_FULL_NAME,
+        inputSchema: { type: "object" },
+      },
+      ctx: {
+        agentId: fixedAgent.id,
+        agentName: fixedAgent.name,
+        userId: user.id,
+        organizationId,
+        conversationId: webConversation.id,
+        sessionId: webConversation.id,
+        modelAcceptsImageToolResults: false,
+        mcpGwToken: {
+          tokenValue: null,
+          tokenId: user.id,
+          teamId: null,
+          isOrganizationToken: false,
+          isUserToken: true,
+        },
+        repeatTracker: new ToolCallRepeatTracker(),
+      },
+    });
+    await getRunTool.execute?.(
+      { run_id: otherTask.id },
+      { toolCallId: "call-get-other", messages: [] },
+    );
+
+    mockGetChatMcpTools.mockImplementationOnce(async (params) => {
+      // The web chat conversation does not own otherTask, so runId must be undefined
+      expect(params.runId).toBeUndefined();
+      return {
+        [archestraMcpBranding.getToolName(TOOL_START_AGENT_RUN_SHORT_NAME)]:
+          buildMcpGatewayTool({
+            mcpTool: {
+              name: TOOL_START_AGENT_RUN_FULL_NAME,
+              inputSchema: { type: "object" },
+            },
+            ctx: {
+              agentId: fixedAgent.id,
+              agentName: fixedAgent.name,
+              userId: user.id,
+              organizationId,
+              runId: params.runId,
+              modelAcceptsImageToolResults: false,
+              mcpGwToken: {
+                tokenValue: null,
+                tokenId: user.id,
+                teamId: null,
+                isOrganizationToken: false,
+                isUserToken: true,
+              },
+              repeatTracker: params.repeatTracker,
+            },
+          }),
+      };
+    });
+
+    let capturedTools:
+      | Record<string, { execute?: (...args: unknown[]) => Promise<unknown> }>
+      | undefined;
+    mockStreamText.mockImplementationOnce(
+      (config: {
+        tools?: Record<
+          string,
+          { execute?: (...args: unknown[]) => Promise<unknown> }
+        >;
+      }) => {
+        capturedTools = config.tools;
+        return fakeStreamResult(RENDERABLE_STREAM_EVENTS);
+      },
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      // Explicitly NO X-Archestra-Run-Id header
+      payload: {
+        id: webConversation.id,
+        messages: [
+          {
+            id: "msg-2",
+            role: "user",
+            parts: [{ type: "text", text: `start run (not ${otherTask.id})` }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    await executionPromise;
+
+    expect(mockGetChatMcpTools).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: webConversation.id,
+        runId: undefined,
+      }),
+    );
+
+    const startTool =
+      capturedTools?.[
+        archestraMcpBranding.getToolName(TOOL_START_AGENT_RUN_SHORT_NAME)
+      ];
+    expect(startTool?.execute).toBeDefined();
+
+    // Requesting L (above M) gets refused at M (the agent default ceiling), not S.
+    // The chat turn is not a run, so it hears the tiers it may use:
+    const scaleupAboveCeilingResult = await startTool?.execute?.(
+      {
+        agent_id: fixedAgent.id,
+        message: "Attempt scale up from M to L",
+        limits: { tier: "L" },
+      },
+      { toolCallId: "call-fixed-2", messages: [] },
+    );
+    const scaleupAboveCeilingOutput =
+      typeof scaleupAboveCeilingResult === "string"
+        ? scaleupAboveCeilingResult
+        : ((scaleupAboveCeilingResult as { content?: string })?.content ?? "");
+    expect(scaleupAboveCeilingOutput).toContain(
+      "Tier L (8 CPU, 16 GiB (32 GiB limit), 20 GiB workspace) is above this Agent's scaleup tier M. Tiers this Agent's runs may use: S (2 CPU, 4 GiB (8 GiB limit), 20 GiB workspace), M (4 CPU, 8 GiB (16 GiB limit), 20 GiB workspace).",
+    );
+    expect(scaleupAboveCeilingOutput).not.toContain("not retriable");
   });
 });

@@ -1,26 +1,75 @@
-import * as Sentry from "@sentry/node";
-import { type RouteId, SupportedProviders } from "@shared";
-import { requiredEndpointPermissionsMap } from "@shared/access-control";
-import type { FastifyReply, FastifyRequest } from "fastify";
-import { betterAuth, hasPermission } from "@/auth";
-import config from "@/config";
-import logger from "@/logging";
-import { UserModel } from "@/models";
-import { MODEL_ROUTER_PREFIX } from "@/routes/proxy/common";
+import { RouteId } from "@archestra/shared";
 import {
+  buildForbiddenErrorMessage,
+  requiredEndpointPermissionsMap,
+} from "@archestra/shared/access-control";
+import * as Sentry from "@sentry/node";
+import type { FastifyReply, FastifyRequest } from "fastify";
+import { hasPermission } from "@/auth";
+import { auth as betterAuth } from "@/auth/better-auth";
+import { requestScope } from "@/auth/request-scope";
+import config from "@/config";
+import { enterpriseTier } from "@/enterprise-tier";
+import logger from "@/logging";
+import {
+  OrganizationModel,
+  ServiceAccountModel,
+  SessionModel,
+  UserModel,
+} from "@/models";
+import { getPublicRequestOrigin } from "@/routes/request-origin";
+import {
+  AGENT_WORKSPACE_TRANSFER_PREFIX,
+  ARCHESTRA_CATALOG_PROXY_PREFIX,
+  ARCHESTRA_CLI_DOWNLOAD_PREFIX,
+  AUTH_STATE_PATH,
+  CONNECTION_HEALTH_PATH,
+  CONNECTION_INSTRUCTIONS_PATH,
+  CONNECTION_RUNTIME_PATH,
+  CONNECTION_SETUP_SCRIPT_PREFIX,
+  CONNECTION_STARTUP_GUARD_PATH,
+  DESKTOP_DEVICE_SIGN_IN_PATH,
+  DESKTOP_TUNNEL_PREFIX,
+  GITHUB_ACTIONS_TOKEN_PATH,
+  GUARDRAILS_NOOP_ANNOTATOR_PATH,
   HEALTH_PATH,
   INCOMING_EMAIL_WEBHOOK_PREFIX,
+  isLlmProxyPath,
   METRICS_PATH,
+  MFILES_VAF_ADD_ON_PACKAGE_PATH,
+  MFILES_VAF_ADD_ON_SCRIPT_PATH,
+  OPENAPPA_ARCHESTRA_ANNOTATOR_PATH,
+  OPENAPPA_HELPERS_PREFIX,
   ORGANIZATION_APPEARANCE_SETTINGS_PATH,
   PUBLIC_CONFIG_PATH,
   READY_PATH,
+  SKILL_MARKETPLACE_PREFIX,
+  SKILL_MARKETPLACE_STATIC_PATH,
   WELL_KNOWN_ACME_PREFIX,
   WELL_KNOWN_OAUTH_PREFIX,
+  WORKLOAD_IDENTITY_TOKEN_PATH,
 } from "@/routes/route-paths";
+import {
+  appIdFromConnectorPath,
+  connectorWwwAuthenticate,
+} from "@/services/apps/app-connector-resource";
 import { ApiError } from "@/types";
 
+/**
+ * Routes a session without 2FA may still reach while the organization
+ * requires enrollment: just enough for the account page's enrollment card to
+ * render (public/branding config, the caller's own permissions and org
+ * context). Everything else waits until 2FA is set up.
+ */
+const TWO_FACTOR_SETUP_EXEMPT_ROUTES = new Set<RouteId>([
+  RouteId.GetConfig,
+  RouteId.GetUserPermissions,
+  RouteId.GetOrganization,
+  RouteId.GetAppearanceSettings,
+]);
+
 export class Authnz {
-  public handle = async (request: FastifyRequest, _reply: FastifyReply) => {
+  public handle = async (request: FastifyRequest, reply: FastifyReply) => {
     const requestId = request.id;
 
     // custom logic to skip auth check
@@ -34,6 +83,10 @@ export class Authnz {
         { requestId, url: request.url },
         "[Authnz] Authentication failed",
       );
+      // A credential-less request to an MCP App connector gets the RFC 9728
+      // challenge here (it has no Bearer header, so it was not skipped above and
+      // never reaches the route); an invalid Bearer token is challenged in-route.
+      this.maybeSetConnectorChallenge(request, reply);
       throw new ApiError(401, "Unauthenticated");
     }
 
@@ -43,7 +96,7 @@ export class Authnz {
     );
 
     // Populate request.user and request.organizationId after successful authentication
-    await this.populateUserInfo(request);
+    await this.populateUserInfo(request, reply);
 
     // Guard: if populateUserInfo silently failed, user info is missing
     if (!request.user || !request.organizationId) {
@@ -55,7 +108,7 @@ export class Authnz {
     }
 
     // Set Sentry user context after successful authentication
-    this.setSentryUserContext(request.user, request);
+    this.setSentryUserContext(request.user);
 
     logger.trace(
       {
@@ -66,7 +119,18 @@ export class Authnz {
       "[Authnz] User info populated, checking authorization",
     );
 
-    const { success } = await this.isAuthorized(request);
+    // Org auth policies (session max age, mandatory 2FA) apply to human
+    // sessions only — API keys and service-account tokens have their own
+    // lifecycles and no TOTP.
+    await this.enforceOrganizationAuthPolicies(request);
+
+    // No route matched: let the not-found handler answer 404. Denying by
+    // default here would report a missing route as an unregistered one.
+    if (request.routeOptions.url === undefined) {
+      return;
+    }
+
+    const { success, error } = await this.isAuthorized(request);
     if (success) {
       logger.trace(
         { requestId, userId: request.user?.id },
@@ -75,7 +139,7 @@ export class Authnz {
       return;
     }
 
-    // return 403 if unauthorized
+    // return 403 if unauthorized, saying what was blocked and why
     logger.trace(
       {
         requestId,
@@ -84,40 +148,75 @@ export class Authnz {
       },
       "[Authnz] Authorization failed",
     );
-    throw new ApiError(403, "Forbidden");
+    throw new ApiError(403, error?.message || buildForbiddenErrorMessage({}));
   };
 
   private shouldSkipAuthCheck = async ({
     url,
     method,
+    headers,
   }: FastifyRequest): Promise<boolean> => {
-    // Skip CORS preflight and HEAD requests globally
-    if (method === "OPTIONS" || method === "HEAD") {
+    // Skip CORS preflight. Fastify can route HEAD to a GET handler, so HEAD
+    // must pass through the same authentication and authorization checks.
+    if (method === "OPTIONS") {
+      // marketplace and connection-setup URLs embed a raw token — omit from
+      // trace to avoid leaking it
+      const safeUrl =
+        url.startsWith(`${SKILL_MARKETPLACE_PREFIX}/`) ||
+        url.startsWith(`${CONNECTION_SETUP_SCRIPT_PREFIX}/`)
+          ? undefined
+          : url;
       logger.trace(
-        { url, method },
-        "[Authnz] Skipping auth for preflight/HEAD request",
+        { url: safeUrl, method },
+        "[Authnz] Skipping auth for preflight request",
       );
       return true;
     }
-    // Check if URL matches any LLM proxy route (e.g., /v1/openai, /v1/anthropic, /v1/vllm)
-    const isLlmProxyRoute = SupportedProviders.some((provider) =>
-      url.startsWith(`/v1/${provider}`),
-    );
-    // Prefer route consts here instead of hardcoding paths; these checks must
-    // stay in sync with route registration.
-    const isModelRouterRoute = url.startsWith(MODEL_ROUTER_PREFIX);
-
+    const isGetOrHead = method === "GET" || method === "HEAD";
     if (
       url.startsWith("/api/auth") ||
       url.startsWith("/api/invitation/") || // Allow invitation check without auth
-      isLlmProxyRoute ||
-      isModelRouterRoute ||
+      isLlmProxyPath(url) ||
       url === "/openapi.json" ||
       url === HEALTH_PATH ||
       url === READY_PATH ||
       url === METRICS_PATH ||
       url === "/test" ||
       url.startsWith(config.mcpGateway.endpoint) ||
+      // MCP App connector: a Bearer request (a personal token or the native
+      // OAuth flow's audience-bound token) is validated in-route, so it stands
+      // down here. A session request carries no Bearer and falls through to the
+      // normal session auth below (unchanged); a credential-less request also
+      // falls through and is answered with the RFC 9728 challenge in handle().
+      (appIdFromConnectorPath(url) !== null &&
+        typeof headers.authorization === "string" &&
+        /^Bearer\s+/i.test(headers.authorization)) ||
+      // Public skill marketplace git endpoint: token in URL, no session
+      url === config.skillMarketplace.endpoint ||
+      url.startsWith(`${config.skillMarketplace.endpoint}/`) ||
+      // Static skill marketplace git endpoint: the caller's own credential is
+      // validated in-route (HTTP Basic), or the org publishes it anonymously
+      url === SKILL_MARKETPLACE_STATIC_PATH ||
+      url.startsWith(`${SKILL_MARKETPLACE_STATIC_PATH}/`) ||
+      // Public bootstrap endpoints have their own rate limits and polling proof.
+      (isGetOrHead && url === "/api/client-connections/installer") ||
+      (method === "POST" &&
+        (url === "/api/client-connections" ||
+          url === "/api/client-connections/poll")) ||
+      // Tunnel client of a desktop device: the tunnel endpoints check the
+      // device key in-route, and sign-in start and poll carry a polling proof.
+      url.startsWith(`${DESKTOP_TUNNEL_PREFIX}/`) ||
+      (method === "POST" &&
+        (url === DESKTOP_DEVICE_SIGN_IN_PATH ||
+          url === `${DESKTOP_DEVICE_SIGN_IN_PATH}/poll`)) ||
+      // The download of the `archestra` program is not secret.
+      (isGetOrHead && url.startsWith(`${ARCHESTRA_CLI_DOWNLOAD_PREFIX}/`)) ||
+      // Public connection-setup script endpoint: one-time token in URL, no session
+      (isGetOrHead && url.startsWith(`${CONNECTION_SETUP_SCRIPT_PREFIX}/`)) ||
+      // Public Archestra VAF Add On install bootstrap and package proxy:
+      // parameterless, credential-free, fetched by irm without a session
+      (isGetOrHead && url === MFILES_VAF_ADD_ON_SCRIPT_PATH) ||
+      (isGetOrHead && url === MFILES_VAF_ADD_ON_PACKAGE_PATH) ||
       // A2A routes use token auth handled in route, similar to MCP Gateway
       url.startsWith(config.a2aGateway.endpoint) ||
       url.startsWith(config.a2aV2Gateway.endpoint) ||
@@ -131,22 +230,73 @@ export class Authnz {
       // cookies because the iframe has an opaque origin and won't send them.
       url.startsWith("/_sandbox/") ||
       // Allow fetching public SSO providers list for login page (minimal info, no secrets)
-      (method === "GET" && url === "/api/identity-providers/public") ||
+      (isGetOrHead && url === "/api/identity-providers/public") ||
+      // The APPA runtime has no browser session. This exact endpoint only
+      // returns a constant empty annotation; it reads and writes no user data.
+      (method === "POST" && url === GUARDRAILS_NOOP_ANNOTATOR_PATH) ||
+      // Battery helper bridge: the runtime presents the per-process bridge
+      // bearer over loopback; the route checks both before doing anything.
+      (method === "POST" && url.startsWith(`${OPENAPPA_HELPERS_PREFIX}/`)) ||
+      // The runtime's archestra annotator: same bearer, same loopback check.
+      (method === "POST" && url === OPENAPPA_ARCHESTRA_ANNOTATOR_PATH) ||
       // Allow fetching public config for login and invitation UI
-      (method === "GET" && url === PUBLIC_CONFIG_PATH) ||
+      (isGetOrHead && url === PUBLIC_CONFIG_PATH) ||
+      // Explicit even though the /api/auth prefix check below already covers
+      // this path — the exemption is intentional here and must survive a
+      // rename of either path.
+      (isGetOrHead && url === AUTH_STATE_PATH) ||
+      // Managed instructions authenticate their installation credential in the handler.
+      (isGetOrHead && url === CONNECTION_INSTRUCTIONS_PATH) ||
+      // Executable updates have a distinct installation capability and live access checks.
+      (isGetOrHead && url === CONNECTION_RUNTIME_PATH) ||
+      // Pure public code rendering: accepts no credential and grants no access.
+      (method === "POST" && url === CONNECTION_STARTUP_GUARD_PATH) ||
+      // GitHub Actions token exchange: the OIDC token in the body is the
+      // proof, verified in-route against the gateway's GitHub Actions setting.
+      (method === "POST" && url === GITHUB_ACTIONS_TOKEN_PATH) ||
+      // Workload identity token exchange: the OIDC token in the body is the
+      // proof, verified in-route against the account's federated credentials.
+      (method === "POST" && url === WORKLOAD_IDENTITY_TOKEN_PATH) ||
+      // Public existence check for connected remotes (Claude Code startup
+      // guard) — the querystring rides along on request.url
+      (isGetOrHead &&
+        (url === CONNECTION_HEALTH_PATH ||
+          url.startsWith(`${CONNECTION_HEALTH_PATH}?`))) ||
       // Allow fetching public appearance settings for login page (theme, logo, font)
-      (method === "GET" && url === ORGANIZATION_APPEARANCE_SETTINGS_PATH) ||
+      (isGetOrHead && url === ORGANIZATION_APPEARANCE_SETTINGS_PATH) ||
       // Incoming email webhooks - Microsoft Graph calls these directly
       // Only allow the exact webhook path (with optional query params), not sub-paths like /setup
       url === INCOMING_EMAIL_WEBHOOK_PREFIX ||
       url.startsWith(`${INCOMING_EMAIL_WEBHOOK_PREFIX}?`) ||
+      // Public reverse proxy to the Archestra MCP catalog (upstream is public)
+      url.startsWith(`${ARCHESTRA_CATALOG_PROXY_PREFIX}/`) ||
       // ChatOps webhooks - Bot Framework calls these directly
       // JWT validation is handled by the Bot Framework adapter
-      url.startsWith("/api/webhooks/chatops/")
+      url.startsWith("/api/webhooks/chatops/") ||
+      // Workspace transfer bodies are moved by a plain HTTP client that holds
+      // no session. The ticket on the request is the proof, and the route
+      // re-runs the owner-only workspace gate before any byte moves. The
+      // trailing slash keeps this exemption to the transfer endpoints, so a
+      // later sibling path cannot inherit it by name alone.
+      url.startsWith(`${AGENT_WORKSPACE_TRANSFER_PREFIX}/`)
     ) {
       return true;
     }
     return false;
+  };
+
+  private maybeSetConnectorChallenge = (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): void => {
+    const appId = appIdFromConnectorPath(request.url);
+    if (!appId) {
+      return;
+    }
+    reply.header(
+      "WWW-Authenticate",
+      connectorWwwAuthenticate(getPublicRequestOrigin(request), appId),
+    );
   };
 
   private isAuthenticated = async (request: FastifyRequest) => {
@@ -154,10 +304,9 @@ export class Authnz {
 
     try {
       logger.trace("[Authnz] Attempting session-based authentication");
-      const session = await betterAuth.api.getSession({
-        headers,
-        query: { disableCookieCache: true },
-      });
+      // Reads the short-lived cookie cache when present (see session.cookieCache
+      // in better-auth config), falling back to the session table on a miss.
+      const { response: session } = await this.getSession(request);
 
       if (session) {
         logger.trace(
@@ -168,33 +317,103 @@ export class Authnz {
       }
       logger.trace("[Authnz] No session found");
     } catch (error) {
-      /**
-       * If getSession fails (e.g., "No active organization"), try API key verification
-       */
       logger.trace(
         { error: error instanceof Error ? error.message : "unknown" },
         "[Authnz] Session authentication failed, trying API key",
       );
-      const authHeader = headers.get("authorization");
-      if (authHeader) {
-        try {
-          logger.trace("[Authnz] Attempting API key authentication");
-          const { valid } = await betterAuth.api.verifyApiKey({
-            body: { key: authHeader },
-          });
+    }
 
-          logger.trace({ valid }, "[Authnz] API key verification result");
-          return valid;
-        } catch (_apiKeyError) {
-          // API key verification failed, return unauthenticated
-          logger.trace("[Authnz] API key verification failed");
-          return false;
-        }
+    const authHeader = headers.get("authorization");
+    if (authHeader) {
+      // Service-account tokens go first. Both token kinds carry the platform
+      // prefix, but a service-account token is one indexed lookup by hash,
+      // while Better Auth's API-key check reads the apikey table by key and
+      // logs an error on every miss. Checking API keys first charged every
+      // service-account request that miss twice: here and again in
+      // populateUserInfo.
+      if (await this.verifyServiceAccountToken(request, authHeader)) {
+        logger.trace("[Authnz] Service account token verification succeeded");
+        return true;
+      }
+
+      const apiKey = await this.verifyApiKey(request, authHeader);
+      if (apiKey?.valid) {
+        logger.trace("[Authnz] API key verification succeeded");
+        return true;
       }
     }
 
     logger.trace("[Authnz] No valid authentication method found");
     return false;
+  };
+
+  /**
+   * Enforce per-organization session policies on session-authenticated
+   * requests:
+   *
+   * - `sessionMaxAgeSeconds`: an ABSOLUTE cap measured from session creation.
+   *   better-auth's sliding refresh keeps active users signed in forever, so
+   *   expiry is enforced here (and the session revoked so every replica
+   *   agrees within the 60s cookie-cache TTL).
+   * - `requireTwoFactor`: members who have not enrolled may only reach the
+   *   handful of routes the enrollment surface needs; everything else is
+   *   refused until they set 2FA up. Enrollment itself happens on better-auth
+   *   routes, which bypass this middleware entirely.
+   */
+  private enforceOrganizationAuthPolicies = async (
+    request: FastifyRequest,
+  ): Promise<void> => {
+    if (request.authMethod !== "session" || !request.organizationId) {
+      return;
+    }
+
+    // Both policies are enterprise features. If the license lapses while
+    // they are configured, they stop being enforced rather than locking
+    // everyone out (enrollment itself is refused without a license, so
+    // enforcing require-2FA then would strand non-enrolled members).
+    if (!enterpriseTier.isCoreActive()) {
+      return;
+    }
+
+    const policies = await OrganizationModel.getAuthEnforcementSettings(
+      request.organizationId,
+    );
+
+    if (policies.sessionMaxAgeSeconds && request.sessionInfo) {
+      // With better-auth's cookie cache the session arrives JSON-deserialized,
+      // so createdAt may be an ISO string rather than a Date.
+      const createdAtMs = new Date(request.sessionInfo.createdAt).getTime();
+      const ageSeconds = (Date.now() - createdAtMs) / 1000;
+      if (ageSeconds > policies.sessionMaxAgeSeconds) {
+        await SessionModel.deleteById(request.sessionInfo.id);
+        logger.info(
+          { userId: request.user?.id, ageSeconds },
+          "[Authnz] Session exceeded the organization's maximum age — revoked",
+        );
+        throw new ApiError(401, "Session expired. Please sign in again.");
+      }
+    }
+
+    // A deployment that turned email/password sign-in off after the
+    // requirement was set would otherwise strand every member: enrollment
+    // needs a password to confirm. Such deployments enforce MFA at the IdP.
+    if (
+      policies.requireTwoFactor &&
+      !config.auth.disableBasicAuth &&
+      !(request.user?.twoFactorEnabled ?? false)
+    ) {
+      const routeId = request.routeOptions.schema?.operationId as
+        | RouteId
+        | undefined;
+      if (!routeId || !TWO_FACTOR_SETUP_EXEMPT_ROUTES.has(routeId)) {
+        throw new ApiError(
+          403,
+          "This organization requires two-factor authentication. Set it up " +
+            "to continue.",
+          "two_factor_setup_required",
+        );
+      }
+    }
   };
 
   private isAuthorized = async (
@@ -204,44 +423,44 @@ export class Authnz {
       | RouteId
       | undefined;
 
-    logger.info({ routeId }, "[Authnz] Checking authorization for route");
+    logger.trace({ routeId }, "[Authnz] Checking authorization for route");
 
     const requiredPermissions = routeId
       ? requiredEndpointPermissionsMap[routeId]
       : undefined;
 
-    logger.info(
+    logger.trace(
       {
         routeId,
         requiredPermissions,
         hasPermissions: requiredPermissions !== undefined,
       },
-      "[Authnz] DEBUG: permissions lookup result",
+      "[Authnz] Permissions lookup result",
     );
 
     if (requiredPermissions === undefined) {
-      logger.info(
+      logger.trace(
         { routeId },
         "[Authnz] Route not configured in permissions map, denying by default",
       );
       return {
         success: false,
         error: new Error(
-          "Forbidden, the route is not configured in auth middleware and is protected by default",
+          "Access denied: this endpoint is not registered for access control, so it is protected by default. This is a server configuration issue — please report it.",
         ),
       };
     }
 
     // If no specific permissions are required (empty object), allow any authenticated user
     if (Object.keys(requiredPermissions).length === 0) {
-      logger.info(
+      logger.trace(
         { routeId },
         "[Authnz] No specific permissions required, allowing access",
       );
       return { success: true, error: null };
     }
 
-    logger.info(
+    logger.trace(
       {
         routeId,
         requiredPermissions,
@@ -249,22 +468,131 @@ export class Authnz {
       },
       "[Authnz] Checking required permissions",
     );
-    const result = await hasPermission(requiredPermissions, request.headers);
-    logger.info({ routeId, result }, "[Authnz] DEBUG: hasPermission result");
+    // Pass the DB-fresh identity populateUserInfo already resolved so the
+    // permission check never consults the (possibly stale) session cookie.
+    const result = await hasPermission(
+      requiredPermissions,
+      request.headers,
+      request.serviceAccount,
+      request.user && request.organizationId
+        ? { userId: request.user.id, organizationId: request.organizationId }
+        : undefined,
+    );
+    logger.trace({ routeId, result }, "[Authnz] hasPermission result");
+    if (result.success) {
+      return result;
+    }
+    // Rebuild the message with the route context ("upload project files")
+    // and the permissions that are actually missing — falling back to the
+    // route's full requirement set when the check failed before it could
+    // determine the specific gap (e.g. an invalid API key).
+    return {
+      success: false,
+      error: new Error(
+        buildForbiddenErrorMessage({
+          routeId,
+          missingPermissions: result.missingPermissions ?? requiredPermissions,
+        }),
+      ),
+    };
+  };
+
+  private getSession = (request: FastifyRequest) =>
+    requestScope.memo("session", () =>
+      betterAuth.api.getSession({
+        headers: new Headers(request.headers as HeadersInit),
+        returnHeaders: true,
+      }),
+    );
+
+  /**
+   * Better Auth's API-key verification, once per request. The promise is kept
+   * on the request so populateUserInfo reuses what isAuthenticated found
+   * instead of repeating the lookup and, on a miss, its error log.
+   */
+  private apiKeyResults = new WeakMap<
+    FastifyRequest,
+    Promise<Awaited<ReturnType<typeof betterAuth.api.verifyApiKey>> | null>
+  >();
+
+  private verifyApiKey = (request: FastifyRequest, authHeader: string) => {
+    const cached = this.apiKeyResults.get(request);
+    if (cached) return cached;
+    logger.trace("[Authnz] Attempting API key authentication");
+    const result = betterAuth.api
+      .verifyApiKey({ body: { key: authHeader } })
+      .catch((error: unknown) => {
+        // Reached only by real API keys and unknown tokens now, so a miss is
+        // worth a debug line when someone's key stops working.
+        logger.debug(
+          { error: error instanceof Error ? error.message : "unknown" },
+          "[Authnz] API key verification failed",
+        );
+        return null;
+      });
+    this.apiKeyResults.set(request, result);
     return result;
   };
 
-  private populateUserInfo = async (request: FastifyRequest): Promise<void> => {
+  /**
+   * Service-account token verification, once per request: the result stays on
+   * the request for populateUserInfo and the route handlers.
+   */
+  private verifyServiceAccountToken = async (
+    request: FastifyRequest,
+    authHeader: string,
+  ) => {
+    if (request.serviceAccountAuthResult) {
+      return request.serviceAccountAuthResult;
+    }
+    try {
+      // RFC 6750 clients send `Bearer <token>`; the API has always taken the
+      // bare token. Both name the same service-account token.
+      const result = await ServiceAccountModel.verifyToken(
+        authHeader.replace(/^Bearer\s+/i, ""),
+      );
+      if (result) {
+        request.serviceAccountAuthResult = result;
+      }
+      return result;
+    } catch (error) {
+      logger.warn(
+        { error: error instanceof Error ? error.message : "unknown" },
+        "[Authnz] Service account token verification errored, treating as unauthenticated",
+      );
+      return null;
+    }
+  };
+
+  private populateUserInfo = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<void> => {
     try {
       const headers = new Headers(request.headers as HeadersInit);
+
+      // A service-account token verified by isAuthenticated needs no session
+      // or API-key lookup here: both would miss, and Better Auth logs the
+      // API-key miss as an error.
+      if (request.serviceAccountAuthResult) {
+        this.populateServiceAccountUserInfo(
+          request,
+          request.serviceAccountAuthResult,
+        );
+        return;
+      }
 
       // Try session-based authentication first
       try {
         logger.trace("[Authnz] populateUserInfo: trying session-based lookup");
-        const session = await betterAuth.api.getSession({
-          headers,
-          query: { disableCookieCache: true },
-        });
+        // returnHeaders so we can forward better-auth's refreshed cookie-cache
+        // Set-Cookie back to the client. Without this the cache would only be
+        // rewritten by the dedicated /api/auth/get-session endpoint, so the
+        // short TTL would lapse between those calls and most API requests would
+        // still hit the session table.
+        const { response: session, headers: authHeaders } =
+          await this.getSession(request);
+        this.forwardSessionCookies(reply, authHeaders);
 
         if (session?.user?.id) {
           logger.trace(
@@ -279,6 +607,19 @@ export class Authnz {
           // Populate the request decorators
           request.user = user;
           request.organizationId = organizationId;
+          request.authMethod = "session";
+          request.sessionInfo = {
+            id: session.session.id,
+            createdAt: new Date(session.session.createdAt),
+          };
+          // Impersonated sessions act as the target user; keep the real
+          // human's id on the request so audit rows can attribute them.
+          const impersonatedBy = (
+            session.session as { impersonatedBy?: string | null }
+          ).impersonatedBy;
+          if (impersonatedBy) {
+            request.impersonatedBy = impersonatedBy;
+          }
           logger.trace(
             { userId: user.id, organizationId },
             "[Authnz] populateUserInfo: populated from session",
@@ -301,9 +642,7 @@ export class Authnz {
       if (authHeader) {
         try {
           logger.trace("[Authnz] populateUserInfo: trying API key lookup");
-          const apiKeyResult = await betterAuth.api.verifyApiKey({
-            body: { key: authHeader },
-          });
+          const apiKeyResult = await this.verifyApiKey(request, authHeader);
 
           if (apiKeyResult?.valid && apiKeyResult.key?.referenceId) {
             logger.trace(
@@ -317,6 +656,7 @@ export class Authnz {
             // Populate the request decorators
             request.user = user;
             request.organizationId = organizationId;
+            request.authMethod = "api_key";
             logger.trace(
               { userId: user.id, organizationId },
               "[Authnz] populateUserInfo: populated from API key",
@@ -324,10 +664,18 @@ export class Authnz {
             return;
           }
         } catch (_apiKeyError) {
-          // API key verification failed
           logger.trace(
-            "[Authnz] populateUserInfo: API key verification failed",
+            "[Authnz] populateUserInfo: API key verification failed, trying service account token",
           );
+        }
+
+        const serviceAccountResult = await this.verifyServiceAccountToken(
+          request,
+          authHeader,
+        );
+        if (serviceAccountResult) {
+          this.populateServiceAccountUserInfo(request, serviceAccountResult);
+          return;
         }
       }
     } catch (error) {
@@ -341,28 +689,64 @@ export class Authnz {
   };
 
   /**
-   * Sets the Sentry user context for better error tracking and attribution
+   * Forward any Set-Cookie headers better-auth produced (the refreshed
+   * cookie-cache cookie) onto the Fastify reply, so the next request can
+   * validate the session from the cookie instead of the database. Only
+   * Set-Cookie is copied to avoid clobbering other response headers.
    */
-  public setSentryUserContext = (
-    user: { id: string; email?: string; name?: string },
-    request: FastifyRequest,
+  private forwardSessionCookies = (
+    reply: FastifyReply,
+    authHeaders: Headers,
   ): void => {
-    try {
-      // Extract IP address from request headers
-      const ipAddress =
-        (request.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
-        (request.headers["x-real-ip"] as string) ||
-        request.ip;
+    const setCookies = authHeaders.getSetCookie();
+    if (setCookies.length > 0) {
+      reply.header("set-cookie", setCookies);
+    }
+  };
 
-      Sentry.setUser({
-        id: user.id,
-        email: user.email,
-        username: user.name || user.email,
-        ip_address: ipAddress,
-      });
+  /**
+   * Attribute error reports to the signed-in user by opaque id only. Error
+   * reports can leave the deployment, so no email, name or IP goes with them.
+   */
+  public setSentryUserContext = (user: { id: string }): void => {
+    try {
+      Sentry.setUser({ id: user.id });
     } catch (_error) {
       // Silently fail if Sentry is not configured or there's an error
       // We don't want authentication to fail due to Sentry issues
     }
+  };
+
+  private populateServiceAccountUserInfo = (
+    request: FastifyRequest,
+    serviceAccountResult: NonNullable<
+      FastifyRequest["serviceAccountAuthResult"]
+    >,
+  ): void => {
+    const serviceAccount = serviceAccountResult.serviceAccount;
+    request.user = {
+      id: `service-account:${serviceAccount.id}`,
+      name: serviceAccount.name,
+      email: `${serviceAccount.id}@service-account.local`,
+      emailVerified: true,
+      image: null,
+      createdAt: serviceAccount.createdAt,
+      updatedAt: serviceAccount.updatedAt,
+      role: null,
+      banned: false,
+      banReason: null,
+      banExpires: null,
+      twoFactorEnabled: false,
+    };
+    request.organizationId = serviceAccount.organizationId;
+    request.serviceAccount = serviceAccount;
+    request.authMethod = "service_account";
+    logger.trace(
+      {
+        serviceAccountId: serviceAccount.id,
+        organizationId: serviceAccount.organizationId,
+      },
+      "[Authnz] populateUserInfo: populated from service account token",
+    );
   };
 }

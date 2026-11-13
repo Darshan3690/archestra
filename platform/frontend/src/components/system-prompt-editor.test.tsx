@@ -1,15 +1,11 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockGetFrontendDocsUrl = vi.fn();
 const mockGetVisibleDocsUrl = vi.fn();
 
-vi.mock("@/components/editor", () => ({
-  Editor: (props: { height?: string }) => (
-    <div data-testid="editor" data-height={props.height} />
-  ),
-}));
+vi.mock("@/components/editor");
 
 vi.mock("@/lib/docs/docs", () => ({
   getFrontendDocsUrl: (...args: unknown[]) => mockGetFrontendDocsUrl(...args),
@@ -18,61 +14,218 @@ vi.mock("@/lib/docs/docs", () => ({
 
 import { SystemPromptEditor } from "./system-prompt-editor";
 
+/** The sized box around the editor, which is what grows and is dragged. */
+const editorBox = () => screen.getByTestId("editor").parentElement;
+
 describe("SystemPromptEditor", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockGetVisibleDocsUrl.mockImplementation((href) => href);
   });
 
-  it("shows the Archestra docs link when available", () => {
-    mockGetFrontendDocsUrl.mockReturnValue(
-      "https://archestra.ai/docs/platform-agents#system-prompt-templating",
+  it.each([
+    true,
+    false,
+  ])("opens templating help without submitting or losing instructions (docs visible: %s)", async (docsVisible) => {
+    const docsUrl = "https://archestra.ai/docs/agents#prompt-templates";
+    mockGetFrontendDocsUrl.mockReturnValue(docsVisible ? docsUrl : null);
+    const user = userEvent.setup();
+    const onSubmit = vi.fn((event) => event.preventDefault());
+    const onChange = vi.fn();
+    render(
+      <form onSubmit={onSubmit}>
+        <SystemPromptEditor
+          value="Help with release notes."
+          onChange={onChange}
+        />
+      </form>,
     );
 
-    render(<SystemPromptEditor value="" onChange={vi.fn()} />);
-
-    expect(screen.getByText("Handlebars")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "docs" })).toHaveAttribute(
-      "href",
-      "https://archestra.ai/docs/platform-agents#system-prompt-templating",
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "More info" }));
+    const dialog = screen.getByRole("dialog", {
+      name: "Templating Cheat Sheet",
+    });
+    expect(
+      within(dialog).getByRole("table", {
+        name: "Template variables and helpers",
+      }),
+    ).toBeVisible();
+    expect(
+      within(dialog).getByRole("row", { name: /\{\{user.teams\}\}/ }),
+    ).toHaveTextContent("Team names the user belongs to (array)");
+    expect(
+      within(dialog).getByRole("row", { name: /\{\{currentTime\}\}/ }),
+    ).toHaveTextContent("HH:MM:SS UTC");
+    expect(
+      within(dialog).getByRole("link", { name: /Handlebars/ }),
+    ).toHaveAttribute("href", "https://handlebarsjs.com/");
+    const docsLink = within(dialog).queryByRole("link", {
+      name: /Templating documentation/,
+    });
+    if (docsVisible) {
+      expect(docsLink).toHaveAttribute("href", docsUrl);
+    } else {
+      expect(docsLink).not.toBeInTheDocument();
+    }
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("editor")).toHaveValue(
+      "Help with release notes.",
     );
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(onChange).not.toHaveBeenCalled();
   });
 
-  it("hides the Archestra docs link under white-labeling", () => {
+  it("lists the template variables and examples available to agents", async () => {
+    const user = userEvent.setup();
+    render(<SystemPromptEditor value="" onChange={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "More info" }));
+    const table = screen.getByRole("table", {
+      name: "Template variables and helpers",
+    });
+    expect(within(table).getByText("{{user.name}}")).toBeVisible();
+    expect(within(table).queryByText("{{tool.name}}")).not.toBeInTheDocument();
+    const examples = screen.getByRole("region", { name: "Examples" });
+    expect(examples).toHaveTextContent("{{user.name}}");
+    expect(examples).toHaveTextContent("user.teams");
+  });
+
+  it("keeps literal instructions editable without advertising or validating templates", async () => {
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <SystemPromptEditor
+        value="Use {{user.*}} literally."
+        onChange={onChange}
+        templating={false}
+      />,
+    );
+    expect(
+      screen.queryByRole("button", { name: "More info" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/Supports Handlebars/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/isn't valid Handlebars/),
+    ).not.toBeInTheDocument();
+    await user.type(screen.getByTestId("editor"), "!");
+    expect(onChange).toHaveBeenLastCalledWith("Use {{user.*}} literally.!");
+  });
+
+  it.each([
+    ["Now is {{currentTime}}.", true],
+    ["Now is {{~ currentTime ~}}.", true],
+    ["Today is {{currentDate}}.", false],
+    ["Keep \\{{currentTime}} literal.", false],
+  ])("warns about per-turn helpers in %s: %s", (value, warns) => {
+    render(<SystemPromptEditor value={value} onChange={vi.fn()} />);
+    const warning = screen.queryByRole("status", {
+      name: "Per-turn template helper",
+    });
+    if (warns) {
+      expect(warning).toBeInTheDocument();
+    } else {
+      expect(warning).not.toBeInTheDocument();
+    }
+  });
+
+  it("grows the box to fit the text, between its floor and its ceiling", () => {
+    // The mock editor reports 20px a line plus 16px of padding, so the floor
+    // holds for a short prompt and the text drives the height past it.
     mockGetFrontendDocsUrl.mockReturnValue(null);
 
-    render(<SystemPromptEditor value="" onChange={vi.fn()} />);
+    const { rerender } = render(
+      <SystemPromptEditor
+        value="one line"
+        onChange={vi.fn()}
+        minHeight={120}
+      />,
+    );
+    expect(editorBox()).toHaveStyle({ height: "120px" });
 
-    expect(screen.getByText("Handlebars")).toBeInTheDocument();
-    expect(
-      screen.queryByRole("link", { name: "docs" }),
-    ).not.toBeInTheDocument();
-    expect(screen.getByText(/templating\./)).toBeInTheDocument();
+    rerender(
+      <SystemPromptEditor
+        value={Array.from({ length: 10 }, (_, i) => `line ${i}`).join("\n")}
+        onChange={vi.fn()}
+        minHeight={120}
+      />,
+    );
+    expect(editorBox()).toHaveStyle({ height: "216px" });
+
+    // Past the ceiling the editor scrolls rather than pushing the form down.
+    rerender(
+      <SystemPromptEditor
+        value={Array.from({ length: 100 }, (_, i) => `line ${i}`).join("\n")}
+        onChange={vi.fn()}
+        minHeight={120}
+        maxHeight={400}
+      />,
+    );
+    expect(editorBox()).toHaveStyle({ height: "400px" });
   });
 
-  it("expands and collapses the shared editor height", async () => {
+  it("offers a resize grip instead of a full-screen dialog", async () => {
     mockGetFrontendDocsUrl.mockReturnValue(null);
     const user = userEvent.setup();
 
-    render(<SystemPromptEditor value="" onChange={vi.fn()} height="120px" />);
+    render(<SystemPromptEditor value="" onChange={vi.fn()} minHeight={120} />);
 
-    expect(screen.getByTestId("editor")).toHaveAttribute(
-      "data-height",
-      "120px",
+    expect(screen.queryByRole("button", { name: /full screen/i })).toBeNull();
+
+    // Sizing it by hand is not mouse-only: the grip takes the arrow keys.
+    const grip = screen.getByRole("separator", { name: /resize instruction/i });
+    grip.focus();
+    await user.keyboard("{ArrowDown}");
+    expect(editorBox()).toHaveStyle({ height: "144px" });
+
+    // And a dragged box stops following the text.
+    await user.keyboard("{ArrowUp}{ArrowUp}{ArrowUp}{ArrowUp}");
+    expect(editorBox()).toHaveStyle({ height: "120px" });
+  });
+
+  it("warns about expressions Handlebars cannot parse", async () => {
+    mockGetFrontendDocsUrl.mockReturnValue(null);
+
+    render(
+      <SystemPromptEditor
+        value="Hi {{user.name}}, see {{user.*}} for the rest."
+        onChange={vi.fn()}
+      />,
     );
 
-    await user.click(screen.getByRole("button", { name: /Expand/i }));
+    // The parser is loaded lazily, so the warning arrives after a tick.
+    await waitFor(() =>
+      expect(screen.getByText("{{user.*}}")).toBeInTheDocument(),
+    );
+    // The valid expression is not flagged.
+    expect(screen.queryByText("{{user.name}}")).toBeNull();
+  });
 
-    expect(screen.getByTestId("editor")).toHaveAttribute(
-      "data-height",
-      "420px",
+  it("clears the warning once the expression parses", async () => {
+    mockGetFrontendDocsUrl.mockReturnValue(null);
+
+    const { rerender } = render(
+      <SystemPromptEditor value="Hi {{user.*}}" onChange={vi.fn()} />,
+    );
+    await waitFor(() =>
+      expect(screen.getByText("{{user.*}}")).toBeInTheDocument(),
     );
 
-    await user.click(screen.getByRole("button", { name: /Collapse/i }));
-
-    expect(screen.getByTestId("editor")).toHaveAttribute(
-      "data-height",
-      "120px",
+    // A valid template — block helpers included — leaves nothing flagged.
+    rerender(
+      <SystemPromptEditor
+        value={'Hi {{user.name}}. {{#includes user.teams "A"}}a{{/includes}}'}
+        onChange={vi.fn()}
+      />,
     );
+    await waitFor(() => expect(screen.queryByText("{{user.*}}")).toBeNull());
+  });
+
+  it("keeps the editor read-only when the form is", () => {
+    mockGetFrontendDocsUrl.mockReturnValue(null);
+
+    render(<SystemPromptEditor value="x" onChange={vi.fn()} readOnly />);
+
+    expect(screen.getByTestId("editor")).toHaveAttribute("readonly");
   });
 });

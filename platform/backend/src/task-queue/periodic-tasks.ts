@@ -1,3 +1,4 @@
+import config from "@/config";
 import type { TaskType } from "@/types";
 
 type PeriodicTaskDefinition = {
@@ -7,10 +8,161 @@ type PeriodicTaskDefinition = {
 };
 
 const PERIODIC_TASK_DEFINITIONS: PeriodicTaskDefinition[] = [
-  { taskType: "check_due_connectors", intervalSeconds: 60, payload: {} },
+  { taskType: "jira_chatops_poll", intervalSeconds: 60, payload: {} },
+  {
+    taskType: "interaction_user_activity_rebuild",
+    intervalSeconds: 30,
+    payload: {},
+  },
+  // Keeps the hourly LLM usage rollup current and walks its history backfill.
+  // Cost statistics read raw rows for hours not rolled yet, so a late tick
+  // costs speed, never correctness.
+  { taskType: "llm_usage_rollup", intervalSeconds: 60, payload: {} },
+  // Writes completed hourly/daily cost periods of each enabled cost export to
+  // its blob provider. A missed tick only delays a file: each export keeps a
+  // watermark and catches up on the next run.
+  { taskType: "cost_export", intervalSeconds: 300, payload: {} },
+  // Runs every 30s (not 60): besides enqueuing due syncs, this task drives
+  // connector-run recovery — reaping expired leases, reconciling statuses, and
+  // sweeping stalled embeddings — so its cadence is the quantization on how fast
+  // a crashed or stalled sync is picked back up.
+  { taskType: "check_due_connectors", intervalSeconds: 30, payload: {} },
+  // Drives the runtime-isolated permission-sync family: enqueues due
+  // permission_sync tasks per the global schedule and reaps expired permission
+  // runs. Kept separate from check_due_connectors so content-run recovery is
+  // never overloaded with permission concerns.
+  {
+    taskType: "check_due_permission_syncs",
+    intervalSeconds: 30,
+    payload: {},
+  },
   {
     taskType: "check_due_schedule_triggers",
     intervalSeconds: 60,
+    payload: {},
+  },
+  {
+    taskType: "check_due_openappa_github_syncs",
+    intervalSeconds: 60,
+    payload: {},
+  },
+  // Enqueues skill_github_sync for GitHub-synced skills whose per-skill
+  // interval (15m/1h/1d) has elapsed. 60s tick keeps the finest interval
+  // within a minute of schedule.
+  {
+    taskType: "check_due_skill_github_syncs",
+    intervalSeconds: 60,
+    payload: {},
+  },
+  {
+    taskType: "check_due_plugin_github_syncs",
+    intervalSeconds: 60,
+    payload: {},
+  },
+  // Converges the Perforce permission-sync shims on the connectors that want
+  // one. Every surface that changes that answer already reconciles inside its
+  // own request, so this is the backstop for the calls those lose to a crash
+  // or a network partition — not the mechanism. Hence 5 minutes: a pod nobody
+  // claims is worth removing promptly, not urgently, and the work is one list
+  // call plus a couple per Perforce connector.
+  { taskType: "p4_shim_reconcile", intervalSeconds: 300, payload: {} },
+  // Re-syncs provider models for API keys whose TTL has passed (5 minutes for
+  // Ollama and vLLM, so a freshly pulled model shows up within about that) and
+  // refreshes models.dev metadata once a day. The model listing routes only
+  // read, so this tick is what keeps the catalog current.
+  { taskType: "llm_model_sync", intervalSeconds: 60, payload: {} },
+  { taskType: "audit_log_cleanup", intervalSeconds: 86400, payload: {} },
+  // Hourly so a busy deployment's backlog drains within the per-tick batch cap.
+  { taskType: "headless_sandbox_cleanup", intervalSeconds: 3600, payload: {} },
+  // Enqueues an auto-routing plan fit per organization whose settings changed
+  // since its last fit, or whose last fit is a day old, and purges routing
+  // history past retention once a day. The minute tick bounds how long a
+  // settings change or a lost publication race waits for its re-plan.
+  { taskType: "auto_routing_dispatch", intervalSeconds: 60, payload: {} },
+  // Rebuilds the portable BM25 corpus statistics (document frequency, chunk
+  // count, mean chunk length) the keyword ranker scores from. A read-only
+  // scan of kb_chunks, and a long interval is safe: stale statistics shift
+  // scores slightly rather than making them wrong. Until the first rebuild
+  // (or for a language first indexed since the last one) keyword search
+  // ranks with ts_rank; Knowledge settings shows where this stands.
+  {
+    taskType: "kb_bm25_stats_refresh",
+    intervalSeconds: config.kb.bm25StatsRefreshIntervalSeconds,
+    payload: {},
+  },
+  // Enterprise data-retention sweep over interactions, mcp_tool_calls, and
+  // conversations. A fast no-op while every retention window is disabled.
+  {
+    taskType: "content_retention_cleanup",
+    intervalSeconds: 86400,
+    payload: {},
+  },
+  // Recomposes every organization's effective guardrails policy from its root
+  // and installed batteries. Every edit already recomposes inline; this is the
+  // backstop for a recompose lost to a crash after the edit committed. A no-op
+  // while OpenAPPA is disabled.
+  {
+    taskType: "openappa_effective_policy_recompile",
+    intervalSeconds: 3600,
+    payload: {},
+  },
+  // Deletes the records of what ran while Guardrails enforcement was off once
+  // they are older than their retention window. Only the proxy writes them,
+  // and only while enforcement is off.
+  {
+    taskType: "openappa_unenforced_cleanup",
+    intervalSeconds: 86400,
+    payload: {},
+  },
+  // Enterprise content-encryption backfill/rotation sweep. O(1) no-op once
+  // complete (and when the feature is disabled); a 10-minute tick keeps a
+  // large backlog progressing without a long-lived task.
+  {
+    taskType: "content_encryption_backfill",
+    intervalSeconds: 600,
+    payload: {},
+  },
+  // Digests skills and skill files written before migration 0407 so the MCP
+  // gateway can publish them — it withholds an undigested row rather than
+  // serving it unverifiable, and the listing query filters those rows out
+  // entirely, so an undigested row is invisible until this repairs it. A tick
+  // rather than a boot-only run: a failed pass must not leave the catalog
+  // withheld until someone restarts the worker. O(1) no-op once complete.
+  {
+    taskType: "skill_publication_backfill",
+    intervalSeconds: 600,
+    payload: {},
+  },
+  // Fills session_preview on interactions written before migration 0562, so
+  // the session list stops rebuilding full requests to show a preview. Runs
+  // are time-bounded, and a short interval keeps a long history moving. Once
+  // every row is done, a run is one empty partial-index read.
+  {
+    taskType: "interaction_session_preview_backfill",
+    intervalSeconds: 60,
+    payload: {},
+  },
+  // Resumes model cost backfills (recomputing recorded costs after a price
+  // change) whose run ran out of time or whose worker died. One read of a
+  // tiny table when none are active.
+  {
+    taskType: "check_due_model_cost_backfills",
+    intervalSeconds: 30,
+    payload: {},
+  },
+  // Records each MCP installation's own tool descriptions for installations
+  // that predate them (or never synced since), so callers stop being served
+  // another installation's text. A tick rather than a boot-only run, so an
+  // installation that was unreachable or asleep is retried later. One empty
+  // read once complete.
+  {
+    taskType: "mcp_tool_description_backfill",
+    intervalSeconds: 1800,
+    payload: {},
+  },
+  {
+    taskType: "tool_search_text_reconcile",
+    intervalSeconds: 600,
     payload: {},
   },
 ];

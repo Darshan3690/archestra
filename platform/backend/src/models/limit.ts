@@ -1,21 +1,71 @@
-import { and, eq, inArray, isNull, lt, or, type SQL, sql } from "drizzle-orm";
-import db, { schema } from "@/database";
+import { ApiError } from "@archestra/shared/types";
+import {
+  and,
+  eq,
+  getTableColumns,
+  inArray,
+  isNotNull,
+  isNull,
+  lt,
+  or,
+  type SQL,
+  sql,
+} from "drizzle-orm";
+import { type AnyPgColumn, alias } from "drizzle-orm/pg-core";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
+import db, { schema, type Transaction, withDbTransaction } from "@/database";
+import { PreparedQuery } from "@/database/prepared-query";
+import { notDeleted } from "@/database/schemas/soft-deletable-table";
 import logger from "@/logging";
+import {
+  observeLimitCheck,
+  reportLimitStorageError,
+} from "@/observability/metrics/limit";
 import type {
   CreateLimit,
+  CredentialSpendCap,
+  CredentialSpendCapInput,
+  EnvironmentDefaultUserLimit,
+  LabelWithDetails,
   Limit,
+  LimitCleanupInterval,
   LimitEntityType,
   LimitType,
-  OrganizationLimitCleanupInterval,
+  Model,
   UpdateLimit,
 } from "@/types";
-import AgentTeamModel from "./agent-team";
+import { BudgetCleanupIntervalSchema, CreateLimitSchema } from "@/types";
+import type {
+  BillingAttribution,
+  PricedBillingUsage,
+} from "@/utils/billable-usage";
+import {
+  hasEstimatedPrice,
+  PRICE_ISSUES,
+  priceTokens,
+  sumMoney,
+} from "@/utils/billable-usage";
+import { retryOnceOnDeadlock } from "@/utils/deadlock";
+import AgentModel from "./agent";
+import AgentTeamModel, { type AgentTeamSource } from "./agent-team";
+import CacheEntryModel from "./cache-entry";
+import { LimitLabelModel } from "./entity-labels";
+import EnvironmentDefaultUserLimitModel from "./environment-default-user-limit";
+import {
+  limitEntitiesCondition,
+  limitEntityParameters,
+} from "./limit-entity-scope";
+import LlmThroughputModel from "./llm-throughput";
 import ModelModel from "./model";
+import type { ProxyRequestState } from "./proxy-request-context";
+import TeamModel from "./team";
 
 type LimitsCleanupOptionsEntities = {
-  [K in Exclude<LimitEntityType, "team">]?: string;
+  [K in Exclude<LimitEntityType, "team" | "virtual_key">]?: string;
 } & {
   [K in Extract<LimitEntityType, "team">]?: string[];
+} & {
+  virtual_key?: string | string[];
 };
 
 type LimitsCleanupOptions = {
@@ -32,11 +82,79 @@ type LimitsCleanupIntervalSqlLiteral =
   | "24 hours"
   | "1 week"
   | "1 month";
+type RollingLimitCleanupInterval = Extract<
+  LimitCleanupInterval,
+  "1h" | "12h" | "24h" | "1w" | "1m"
+>;
+
+type LimitModelUsageRecord = typeof schema.limitModelUsageTable.$inferSelect & {
+  coveredTokensIn: number | null;
+  coveredTokensOut: number | null;
+  settledCost: string | null;
+  incomplete: number | null;
+};
+const usageSelection = {
+  ...getTableColumns(schema.limitModelUsageTable),
+  coveredTokensIn: schema.limitBillingUsageTable.coveredTokensIn,
+  coveredTokensOut: schema.limitBillingUsageTable.coveredTokensOut,
+  settledCost: schema.limitBillingUsageTable.cost,
+  incomplete: schema.limitBillingUsageTable.incomplete,
+};
+const billingJoin = and(
+  eq(
+    schema.limitModelUsageTable.limitId,
+    schema.limitBillingUsageTable.limitId,
+  ),
+  eq(schema.limitModelUsageTable.model, schema.limitBillingUsageTable.model),
+);
+/** The price findings as a SQL text array, for queries over receipts. */
+const PRICE_ISSUES_SQL = sql.raw(
+  `array[${[...PRICE_ISSUES].map((issue) => `'${issue}'`).join(", ")}]`,
+);
+/** A budget's spend in its window; `estimated` when it includes estimated charges. */
+type LimitSpend = { cost: number; estimated: boolean };
+type ModelUsageBreakdown = {
+  model: string;
+  tokensIn: number;
+  tokensOut: number;
+  cost: number;
+};
+
+// Data batch-loaded once per request and shared across the priority-ordered
+// entity checks, so token_cost limit evaluation issues no per-entity queries.
+type LimitPrefetch = {
+  limitsByEntity: Map<string, Limit[]>;
+  usageByLimitId: Map<string, LimitModelUsageRecord[]>;
+  pricingByModelId: Map<string, Model>;
+} & LimitModelApplicability;
+type LimitModelApplicability = {
+  /** Normalized selected model; omitted when the operation has no model. */
+  model?: string;
+  /** Aliases verified by the selected provider endpoint for this request. */
+  modelAliases?: string[];
+  /** Routing is pending; check aggregate caps now and scoped caps after selection. */
+  deferModelScopedLimits?: boolean;
+};
+export type LimitViolationResponse = [
+  refusalMessage: string,
+  contentMessage: string,
+  metadata?: {
+    entityType: LimitEntityType;
+    limitType: "token_cost";
+    entityName?: string;
+    source: "explicit" | "default_user";
+  },
+];
+
+const DEFAULT_LIMIT_CLEANUP_INTERVAL: LimitCleanupInterval = "calendar_month";
+
+/** A limit row with its labels attached, as the listing endpoint returns it. */
+type LimitWithLabels = Limit & { labels: LabelWithDetails[] };
 
 class LimitModel {
-  // limitsCleanupIntervalSqlLiterals exists basically to compile-time check set of literals
-  static readonly limitsCleanupIntervalSqlLiterals: Record<
-    Exclude<OrganizationLimitCleanupInterval, null>,
+  // rollingCleanupIntervalSqlLiterals exists to compile-time check rolling literals.
+  static readonly rollingCleanupIntervalSqlLiterals: Record<
+    RollingLimitCleanupInterval,
     LimitsCleanupIntervalSqlLiteral
   > = {
     "1h": "1 hour",
@@ -48,10 +166,31 @@ class LimitModel {
   /**
    * Create a new limit
    */
-  static async create(data: CreateLimit): Promise<Limit> {
+  static async create(
+    data: CreateLimit & { teamManaged?: boolean },
+  ): Promise<LimitWithLabels> {
+    if (
+      data.limitType === "requests_per_minute" ||
+      data.limitType === "tokens_per_minute" ||
+      data.limitType === "requests" ||
+      data.limitType === "tokens" ||
+      data.limitType === "token_cost" ||
+      data.cleanupInterval === "minute" ||
+      data.behavior === "soft"
+    ) {
+      // Parsing validates the request fields; the server-set flag is not one.
+      data = {
+        ...CreateLimitSchema.parse(data),
+        teamManaged: data.teamManaged,
+      };
+    }
+    const { labels, ...columns } = data;
     const [limit] = await db
       .insert(schema.limitsTable)
-      .values(data)
+      .values({
+        ...columns,
+        cleanupInterval: data.cleanupInterval ?? DEFAULT_LIMIT_CLEANUP_INTERVAL,
+      })
       .returning();
 
     // For token_cost limits, initialize model usage records
@@ -63,7 +202,11 @@ class LimitModel {
       await LimitModel.initializeModelUsageRecords(limit.id, limit.model);
     }
 
-    return limit;
+    if (labels?.length) {
+      await LimitLabelModel.syncLabels(limit.id, labels);
+    }
+
+    return { ...limit, labels: await LimitLabelModel.getLabelsFor(limit.id) };
   }
 
   /**
@@ -100,8 +243,28 @@ class LimitModel {
     entityId?: string,
     limitType?: LimitType,
     organizationId?: string,
-  ): Promise<Limit[]> {
+    labels?: Record<string, string[]>,
+    teamIds?: string[],
+  ): Promise<LimitWithLabels[]> {
+    const labelFilteredIds = labels
+      ? await LimitLabelModel.getIdsMatchingLabels(labels)
+      : null;
+    if (labelFilteredIds?.length === 0) {
+      return [];
+    }
+
     const whereConditions: SQL[] = [];
+    if (teamIds) {
+      if (!teamIds.length) return [];
+      whereConditions.push(
+        eq(schema.limitsTable.entityType, "team"),
+        inArray(schema.limitsTable.entityId, teamIds),
+      );
+    }
+
+    if (labelFilteredIds) {
+      whereConditions.push(inArray(schema.limitsTable.id, labelFilteredIds));
+    }
 
     if (organizationId) {
       whereConditions.push(
@@ -129,50 +292,273 @@ class LimitModel {
       .from(schema.limitsTable)
       .where(whereClause);
 
-    return limits;
+    const labelsById = await LimitLabelModel.getLabelsForMany(
+      limits.map((limit) => limit.id),
+    );
+
+    return limits.map((limit) => ({
+      ...limit,
+      labels: labelsById.get(limit.id) ?? [],
+    }));
   }
 
   /**
-   * Get per-model usage breakdown for a token_cost limit
-   * Returns the cost for each model in the limit
+   * Per-model usage of several token_cost limits, keyed by limit id. One usage
+   * read and one price lookup for any number of limits.
    */
-  static async getModelUsageBreakdown(
-    limitId: string,
-  ): Promise<
-    Array<{ model: string; tokensIn: number; tokensOut: number; cost: number }>
-  > {
-    // Get the model usage records
-    const modelUsages = await db
-      .select()
-      .from(schema.limitModelUsageTable)
-      .where(eq(schema.limitModelUsageTable.limitId, limitId));
-
-    // Calculate cost for each model
-    const breakdown = await Promise.all(
-      modelUsages.map(async (usage) => {
-        // Look up model by modelId only — limit usage records don't store provider
-        const modelEntry = await ModelModel.findByModelIdOnly(usage.model);
-        const pricing = ModelModel.getEffectivePricing(modelEntry, usage.model);
-
-        const inputCost =
-          (usage.currentUsageTokensIn *
-            parseFloat(pricing.pricePerMillionInput)) /
-          1_000_000;
-        const outputCost =
-          (usage.currentUsageTokensOut *
-            parseFloat(pricing.pricePerMillionOutput)) /
-          1_000_000;
-
-        return {
-          model: usage.model,
-          tokensIn: usage.currentUsageTokensIn,
-          tokensOut: usage.currentUsageTokensOut,
-          cost: inputCost + outputCost,
-        };
-      }),
+  static async getModelUsageBreakdowns(
+    limitIds: string[],
+  ): Promise<Map<string, ModelUsageBreakdown[]>> {
+    const usage = await LimitModel.getSpendUsage(limitIds);
+    return new Map(
+      [...usage].map(([id, { modelUsage }]) => [id, modelUsage] as const),
     );
+  }
 
-    return breakdown;
+  /** Each spend limit's per-model breakdown and whether it includes estimates. */
+  static async getSpendUsage(
+    limitIds: string[],
+  ): Promise<
+    Map<string, { modelUsage: ModelUsageBreakdown[]; estimatedUsage: boolean }>
+  > {
+    const spend = await readLimitSpend(limitIds);
+    return new Map(
+      [...spend].map(([id, { modelUsage, estimated }]) => [
+        id,
+        { modelUsage, estimatedUsage: estimated },
+      ]),
+    );
+  }
+
+  /**
+   * Current cost of several token_cost limits, keyed by limit id. `estimated`
+   * marks a limit whose spend includes estimated charges.
+   */
+  static async getTokenCostTotals(
+    limitIds: string[],
+  ): Promise<Map<string, LimitSpend>> {
+    const spend = await readLimitSpend(limitIds);
+    return new Map(
+      [...spend].map(([id, { cost, estimated }]) => [id, { cost, estimated }]),
+    );
+  }
+
+  /**
+   * How many users spent in each environment inside the window, keyed by
+   * environment id. Same counting rules as `getDefaultUserLimitUsageByUser`.
+   */
+  static async countUsersWithSpendByEnvironment(params: {
+    organizationId: string;
+    cleanupInterval: LimitCleanupInterval;
+  }): Promise<Map<string, number>> {
+    const interactions = schema.interactionsTable;
+    const rows = await db
+      .select({
+        environmentId: sql<string>`${interactions.environmentId}`,
+        users: sql<number>`count(distinct ${interactions.userId})::integer`,
+      })
+      .from(interactions)
+      .innerJoin(
+        schema.environmentsTable,
+        eq(interactions.environmentId, schema.environmentsTable.id),
+      )
+      .where(
+        and(
+          eq(schema.environmentsTable.organizationId, params.organizationId),
+          isNotNull(interactions.userId),
+          eq(interactions.billingMode, "metered"),
+          isNull(interactions.billingTeamId),
+          buildUsagePeriodStartCondition(params.cleanupInterval),
+        ),
+      )
+      .groupBy(interactions.environmentId);
+    return new Map(rows.map((row) => [row.environmentId, row.users]));
+  }
+
+  /**
+   * Spend counted toward a default user limit, for every user at once, keyed
+   * by user id. Same rules as the per-request check (metered, not team-billed,
+   * inside the window, after the user's last reset, within `models`), but
+   * aggregated in SQL so an organization-wide read stays one round trip.
+   * Users without spend are absent from the map.
+   */
+  static async getDefaultUserLimitUsageByUser(params: {
+    organizationId: string;
+    models: string[] | null;
+    cleanupInterval: LimitCleanupInterval;
+    /** Count only this environment's spend; omit for the whole organization. */
+    environmentId?: string | null;
+  }): Promise<Map<string, LimitSpend>> {
+    const interactions = schema.interactionsTable;
+    // Rows whose media cost is unavailable, found through the partial
+    // interactions_media_cost_unavailable_idx instead of reading every row's
+    // response: detoasting the window's payloads dominated this read.
+    const flagged = alias(interactions, "media_cost_flagged");
+    const mediaCostUnavailable = db
+      .select({ id: flagged.id })
+      .from(flagged)
+      .where(
+        and(
+          sql`${flagged.response}->'__mediaUsage'->>'costAvailable' = 'false'`,
+          buildUsagePeriodStartCondition(
+            params.cleanupInterval,
+            flagged.createdAt,
+          ),
+        ),
+      )
+      .as("media_cost_unavailable");
+    const costUnavailable = sql`(${mediaCostUnavailable.id} IS NOT NULL)`;
+    const conditions: SQL[] = [
+      isNotNull(interactions.userId),
+      eq(interactions.billingMode, "metered"),
+      isNull(interactions.billingTeamId),
+      buildUsagePeriodStartCondition(params.cleanupInterval),
+      buildAfterUsageResetCondition({
+        organizationId: params.organizationId,
+        userId: interactions.userId,
+        createdAt: interactions.createdAt,
+      }),
+      sql`NOT EXISTS (SELECT 1 FROM ${schema.interactionBillingTable} WHERE ${schema.interactionBillingTable.interactionId} = ${interactions.id} AND ${schema.interactionBillingTable.usage}->>'mode' = 'enforce')`,
+    ];
+    if (params.models && params.models.length > 0) {
+      conditions.push(inArray(interactions.model, params.models) as SQL);
+    }
+
+    const selection = {
+      userId: sql<string>`${interactions.userId}`,
+      model: interactions.model,
+      knownCost: sql<string>`coalesce(sum(${interactions.cost}) FILTER (WHERE ${interactions.cost} IS NOT NULL AND NOT ${costUnavailable}), 0)::text`,
+      unpricedTokensIn: sql<number>`coalesce(sum(${interactions.inputTokens}) FILTER (WHERE ${interactions.cost} IS NULL AND NOT ${costUnavailable}), 0)::bigint`,
+      unpricedTokensOut: sql<number>`coalesce(sum(${interactions.outputTokens}) FILTER (WHERE ${interactions.cost} IS NULL AND NOT ${costUnavailable}), 0)::bigint`,
+    };
+    // Mirrors getDefaultUserLimitUsage: an environment filter uses the
+    // environment snapshotted on the interaction; the organization-wide sum
+    // goes through the (not deleted) agent's organization.
+    const groups = params.environmentId
+      ? await db
+          .select(selection)
+          .from(interactions)
+          .leftJoin(
+            mediaCostUnavailable,
+            eq(mediaCostUnavailable.id, interactions.id),
+          )
+          .where(
+            and(
+              ...conditions,
+              eq(interactions.environmentId, params.environmentId),
+            ),
+          )
+          .groupBy(interactions.userId, interactions.model)
+      : await db
+          .select(selection)
+          .from(interactions)
+          .innerJoin(
+            schema.agentsTable,
+            eq(interactions.profileId, schema.agentsTable.id),
+          )
+          .leftJoin(
+            mediaCostUnavailable,
+            eq(mediaCostUnavailable.id, interactions.id),
+          )
+          .where(
+            and(
+              ...conditions,
+              eq(schema.agentsTable.organizationId, params.organizationId),
+              notDeleted(schema.agentsTable),
+            ),
+          )
+          .groupBy(interactions.userId, interactions.model);
+
+    const pricing = await ModelModel.findByModelIdsOnly([
+      ...new Set(
+        groups
+          .filter(
+            (group) =>
+              group.model !== null &&
+              (Number(group.unpricedTokensIn) > 0 ||
+                Number(group.unpricedTokensOut) > 0),
+          )
+          .map((group) => group.model as string),
+      ),
+    ]);
+
+    const costs = new Map<string, string>();
+    const estimated = new Set<string>();
+    for (const group of groups) {
+      let groupCost = group.knownCost;
+      if (group.model) {
+        const modelPricing = ModelModel.getEffectivePricing(
+          pricing.get(group.model) ?? null,
+          group.model,
+        );
+        const legacy = priceLegacyTokens(
+          Number(group.unpricedTokensIn),
+          Number(group.unpricedTokensOut),
+          modelPricing,
+        );
+        if (legacy.estimated) estimated.add(group.userId);
+        groupCost = sumMoney([groupCost, legacy.cost]);
+      }
+      costs.set(
+        group.userId,
+        sumMoney([costs.get(group.userId) ?? "0", groupCost]),
+      );
+    }
+
+    const receipt = schema.interactionBillingTable;
+    const componentMatches = params.models?.length
+      ? or(
+          inArray(sql`component->>'model'`, params.models),
+          sql`jsonb_exists_any(component->'modelAliases', ARRAY[${sql.join(
+            params.models.map((model) => sql`${model}`),
+            sql`, `,
+          )}]::text[])`,
+        )
+      : sql`true`;
+    const settled = await db
+      .select({
+        userId: sql<string>`${receipt.userId}`,
+        cost: sql<string>`COALESCE(sum((component->>'cost')::numeric) FILTER (WHERE ${componentMatches}), 0)::text`,
+        estimated: sql<number>`count(*) FILTER (WHERE jsonb_exists_any(${receipt.usage}->'issues', ${PRICE_ISSUES_SQL}))::integer`,
+      })
+      .from(receipt)
+      .leftJoin(
+        sql`LATERAL jsonb_array_elements(${receipt.usage}->'components') AS component`,
+        sql`true`,
+      )
+      .where(
+        and(
+          eq(receipt.organizationId, params.organizationId),
+          isNotNull(receipt.userId),
+          eq(receipt.billingMode, "metered"),
+          isNull(receipt.billingTeamId),
+          sql`${receipt.usage}->>'mode' = 'enforce'`,
+          buildUsagePeriodStartCondition(
+            params.cleanupInterval,
+            receipt.createdAt,
+          ),
+          buildAfterUsageResetCondition({
+            organizationId: params.organizationId,
+            userId: receipt.userId,
+            createdAt: receipt.createdAt,
+          }),
+          params.environmentId
+            ? eq(receipt.environmentId, params.environmentId)
+            : undefined,
+        ),
+      )
+      .groupBy(receipt.userId);
+    for (const row of settled) {
+      if (row.estimated > 0) estimated.add(row.userId);
+      costs.set(row.userId, sumMoney([costs.get(row.userId) ?? "0", row.cost]));
+    }
+
+    return new Map(
+      [...costs].map(([userId, cost]) => [
+        userId,
+        { cost: Number(cost), estimated: estimated.has(userId) },
+      ]),
+    );
   }
 
   /**
@@ -188,8 +574,9 @@ class LimitModel {
   > {
     logger.debug({ limitId }, "LimitModel.getRawModelUsage: fetching records");
     const records = await db
-      .select()
+      .select(usageSelection)
       .from(schema.limitModelUsageTable)
+      .leftJoin(schema.limitBillingUsageTable, billingJoin)
       .where(eq(schema.limitModelUsageTable.limitId, limitId));
 
     logger.debug(
@@ -212,14 +599,37 @@ class LimitModel {
   }
 
   /**
+   * Loads requested limits only when their owning entity belongs to the
+   * organization. Limits do not carry an organization id directly, so this
+   * reuses the same entity-based scope predicate as every org-scoped limit read.
+   */
+  static async findByIdsInOrganization(
+    ids: string[],
+    organizationId: string,
+  ): Promise<Limit[]> {
+    if (ids.length === 0) return [];
+
+    return db
+      .select()
+      .from(schema.limitsTable)
+      .where(
+        and(
+          inArray(schema.limitsTable.id, ids),
+          buildOrganizationLimitScopeCondition(organizationId),
+        ),
+      );
+  }
+
+  /**
    * Patch a limit
    */
   static async patch(
     id: string,
     data: Partial<UpdateLimit>,
-  ): Promise<Limit | null> {
+  ): Promise<LimitWithLabels | null> {
+    const { labels, ...columns } = data;
     // Normalize empty model array to null for consistent "all models" behavior
-    const patchData = { ...data };
+    const patchData = { ...columns };
     if (
       patchData.model !== undefined &&
       (!patchData.model ||
@@ -228,28 +638,292 @@ class LimitModel {
       patchData.model = null;
     }
 
-    const [limit] = await db
-      .update(schema.limitsTable)
-      .set(patchData)
-      .where(eq(schema.limitsTable.id, id))
-      .returning();
+    const [limit] = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`SELECT pg_advisory_xact_lock(hashtextextended(${`cache-entry:llm-throughput:${id}`}, 0))`,
+      );
+      const [existingLimit] = await tx
+        .select()
+        .from(schema.limitsTable)
+        .where(eq(schema.limitsTable.id, id))
+        .limit(1);
 
-    return limit || null;
+      if (!existingLimit) {
+        return [];
+      }
+
+      if (
+        [existingLimit.limitType, patchData.limitType].some(
+          (type) =>
+            type === "requests_per_minute" ||
+            type === "tokens_per_minute" ||
+            type === "requests" ||
+            type === "tokens",
+        ) ||
+        patchData.cleanupInterval === "minute" ||
+        existingLimit.cleanupInterval === "minute" ||
+        existingLimit.limitType === "token_cost" ||
+        patchData.behavior !== undefined
+      ) {
+        const validated = CreateLimitSchema.safeParse({
+          ...existingLimit,
+          ...patchData,
+        });
+        if (!validated.success)
+          throw new ApiError(400, "Invalid limit configuration");
+      }
+      if (
+        patchData.limitType &&
+        patchData.limitType !== existingLimit.limitType &&
+        patchData.limitType !==
+          existingLimit.limitType.replace("_per_minute", "")
+      ) {
+        throw new ApiError(
+          400,
+          "Create a separate limit to change its throughput dimension",
+        );
+      }
+      if (
+        (patchData.entityType &&
+          patchData.entityType !== existingLimit.entityType) ||
+        (patchData.entityId && patchData.entityId !== existingLimit.entityId)
+      )
+        throw new ApiError(400, "Create a separate limit to change its scope");
+
+      const shouldResetUsage =
+        patchData.cleanupInterval !== undefined &&
+        patchData.cleanupInterval !== existingLimit.cleanupInterval;
+      const limitPatchData = shouldResetUsage
+        ? {
+            ...patchData,
+            // JS dates retain milliseconds. Keep interval epochs distinct even
+            // for rapid edits or a database clock moving backwards.
+            lastCleanup: sql`greatest(clock_timestamp(), ${schema.limitsTable.lastCleanup} + interval '1 millisecond')`,
+          }
+        : patchData;
+
+      // A labels-only edit changes no column.
+      const updatedLimits =
+        Object.keys(limitPatchData).length === 0
+          ? [existingLimit]
+          : await tx
+              .update(schema.limitsTable)
+              .set(limitPatchData)
+              .where(eq(schema.limitsTable.id, id))
+              .returning();
+
+      if (updatedLimits[0]) {
+        await LlmThroughputModel.reconfigure({
+          entries: new CacheEntryModel(tx),
+          limit: updatedLimits[0],
+        });
+      }
+
+      if (shouldResetUsage) {
+        await tx
+          .delete(schema.limitBillingUsageTable)
+          .where(eq(schema.limitBillingUsageTable.limitId, id));
+        await tx
+          .update(schema.limitModelUsageTable)
+          .set({
+            currentUsageTokensIn: 0,
+            currentUsageTokensOut: 0,
+          })
+          .where(eq(schema.limitModelUsageTable.limitId, id));
+      }
+
+      return updatedLimits;
+    });
+
+    if (!limit) {
+      return null;
+    }
+
+    // Only touch labels when the caller sent them, so a patch that omits the
+    // field leaves existing labels alone.
+    if (labels !== undefined) {
+      await LimitLabelModel.syncLabels(id, labels);
+    }
+
+    return { ...limit, labels: await LimitLabelModel.getLabelsFor(id) };
   }
 
   /**
    * Delete a limit
    */
   static async delete(id: string): Promise<boolean> {
-    // First check if the limit exists
-    const existing = await LimitModel.findById(id);
-    if (!existing) {
-      return false;
+    return (await LimitModel.deleteMany([id])).length > 0;
+  }
+
+  /** Deletes an already organization-fenced batch in one statement. */
+  static async deleteMany(ids: string[]): Promise<string[]> {
+    if (ids.length === 0) return [];
+
+    return CacheEntryModel.withLocks(
+      ids.map((id) => `llm-throughput:${id}`),
+      async (entries, tx) => {
+        const deleted = await tx
+          .delete(schema.limitsTable)
+          .where(inArray(schema.limitsTable.id, ids))
+          .returning();
+        await LlmThroughputModel.deleteCounters(entries, deleted);
+        return deleted.map(({ id }) => id);
+      },
+    );
+  }
+
+  /**
+   * The spend cap of each credential: its oldest all-models `token_cost`
+   * limit, with the billed spend of the current window. Other limits on the
+   * same credential (model-scoped ones made on the limits page) are left to
+   * that page.
+   */
+  static async findSpendCaps(params: {
+    entityType: Extract<LimitEntityType, "virtual_key" | "llm_oauth_client">;
+    entityIds: string[];
+  }): Promise<Map<string, CredentialSpendCap>> {
+    if (params.entityIds.length === 0) return new Map();
+    const rows = await db
+      .select()
+      .from(schema.limitsTable)
+      .where(
+        and(
+          eq(schema.limitsTable.entityType, params.entityType),
+          inArray(schema.limitsTable.entityId, params.entityIds),
+          eq(schema.limitsTable.limitType, "token_cost"),
+          sql`${schema.limitsTable.cleanupInterval} <> 'minute'`,
+          isNull(schema.limitsTable.model),
+        ),
+      )
+      .orderBy(schema.limitsTable.createdAt, schema.limitsTable.id);
+    const capRows = new Map<string, Limit>();
+    for (const row of rows) {
+      if (!capRows.has(row.entityId)) capRows.set(row.entityId, row as Limit);
     }
+    if (capRows.size === 0) return new Map();
 
-    await db.delete(schema.limitsTable).where(eq(schema.limitsTable.id, id));
+    const usages = await db
+      .select(usageSelection)
+      .from(schema.limitModelUsageTable)
+      .leftJoin(schema.limitBillingUsageTable, billingJoin)
+      .where(
+        inArray(
+          schema.limitModelUsageTable.limitId,
+          [...capRows.values()].map((row) => row.id),
+        ),
+      );
+    const usagesByLimitId = new Map<string, LimitModelUsageRecord[]>();
+    for (const usage of usages) {
+      const list = usagesByLimitId.get(usage.limitId) ?? [];
+      list.push(usage);
+      usagesByLimitId.set(usage.limitId, list);
+    }
+    const pricing = await ModelModel.findByModelIdsOnly([
+      ...new Set(usages.map((usage) => usage.model)),
+    ]);
 
-    return true;
+    const caps = new Map<string, CredentialSpendCap>();
+    for (const [entityId, row] of capRows) {
+      const { cost, estimated } = computeModelUsageCosts(
+        usagesByLimitId.get(row.id) ?? [],
+        pricing,
+      );
+      caps.set(entityId, {
+        limitId: row.id,
+        limitValue: row.limitValue,
+        cleanupInterval: BudgetCleanupIntervalSchema.parse(
+          row.cleanupInterval ?? DEFAULT_LIMIT_CLEANUP_INTERVAL,
+        ),
+        currentUsage: cost,
+        estimatedUsage: estimated,
+      });
+    }
+    return caps;
+  }
+
+  /**
+   * Create, change, or remove a credential's spend cap (see
+   * {@link LimitModel.findSpendCaps}). `null` removes it.
+   */
+  static async setSpendCap(params: {
+    entityType: Extract<LimitEntityType, "virtual_key" | "llm_oauth_client">;
+    entityId: string;
+    cap: CredentialSpendCapInput | null;
+  }): Promise<void> {
+    const existing = (
+      await LimitModel.findSpendCaps({
+        entityType: params.entityType,
+        entityIds: [params.entityId],
+      })
+    ).get(params.entityId);
+
+    if (!params.cap) {
+      if (existing) await LimitModel.delete(existing.limitId);
+      return;
+    }
+    if (!existing) {
+      await LimitModel.create({
+        entityType: params.entityType,
+        entityId: params.entityId,
+        limitType: "token_cost",
+        limitValue: params.cap.limitValue,
+        cleanupInterval: params.cap.cleanupInterval,
+        model: null,
+      });
+      return;
+    }
+    if (
+      existing.limitValue !== params.cap.limitValue ||
+      existing.cleanupInterval !== params.cap.cleanupInterval
+    ) {
+      await LimitModel.patch(existing.limitId, params.cap);
+    }
+  }
+
+  /** Remove every limit set on one entity, e.g. a deleted credential. */
+  static async deleteForEntity(params: {
+    entityType: LimitEntityType;
+    entityId: string;
+  }): Promise<void> {
+    const limits = await db
+      .select({ id: schema.limitsTable.id })
+      .from(schema.limitsTable)
+      .where(
+        and(
+          eq(schema.limitsTable.entityType, params.entityType),
+          eq(schema.limitsTable.entityId, params.entityId),
+        ),
+      );
+    await LimitModel.deleteMany(limits.map(({ id }) => id));
+  }
+
+  /**
+   * Exact-string swaps of the name-keyed limit columns after an MCP catalog
+   * rename, so limits keyed to `mcpServerName` / `toolName` keep matching
+   * the renamed server and tools instead of silently going stale.
+   */
+  static async renameNameKeys(
+    params: {
+      serverNamePairs: Array<{ oldName: string; newName: string }>;
+      toolNamePairs: Array<{ oldName: string; newName: string }>;
+    },
+    tx?: Transaction,
+  ): Promise<void> {
+    const executor = tx ?? db;
+    for (const { oldName, newName } of params.serverNamePairs) {
+      if (oldName === newName) continue;
+      await executor
+        .update(schema.limitsTable)
+        .set({ mcpServerName: newName })
+        .where(eq(schema.limitsTable.mcpServerName, oldName));
+    }
+    for (const { oldName, newName } of params.toolNamePairs) {
+      if (oldName === newName) continue;
+      await executor
+        .update(schema.limitsTable)
+        .set({ toolName: newName })
+        .where(eq(schema.limitsTable.toolName, oldName));
+    }
   }
 
   /**
@@ -297,55 +971,12 @@ class LimitModel {
       "[LimitModel] Update token limit usage",
     );
     try {
-      // Find all token_cost limits for this entity that include this model
-      const limits = await db
-        .select({ id: schema.limitsTable.id })
-        .from(schema.limitsTable)
-        .where(
-          and(
-            eq(schema.limitsTable.entityType, entityType),
-            eq(schema.limitsTable.entityId, entityId),
-            eq(schema.limitsTable.limitType, "token_cost"),
-            or(
-              sql`${schema.limitsTable.model} ? ${model}`,
-              sql`${schema.limitsTable.model} IS NULL`,
-            ),
-          ),
-        );
-
-      if (limits.length === 0) {
-        logger.debug(
-          `[LimitModel] No limits found for ${entityType} ${entityId} with model ${model}`,
-        );
-        return;
-      }
-
-      // Update model usage for each limit
-      for (const limit of limits) {
-        await db
-          .insert(schema.limitModelUsageTable)
-          .values({
-            limitId: limit.id,
-            model,
-            currentUsageTokensIn: inputTokens,
-            currentUsageTokensOut: outputTokens,
-          })
-          .onConflictDoUpdate({
-            target: [
-              schema.limitModelUsageTable.limitId,
-              schema.limitModelUsageTable.model,
-            ],
-            set: {
-              currentUsageTokensIn: sql`${schema.limitModelUsageTable.currentUsageTokensIn} + ${inputTokens}`,
-              currentUsageTokensOut: sql`${schema.limitModelUsageTable.currentUsageTokensOut} + ${outputTokens}`,
-              updatedAt: new Date(),
-            },
-          });
-
-        logger.debug(
-          `[LimitModel] Updated model usage for limit ${limit.id}, model ${model}: +${inputTokens} in, +${outputTokens} out`,
-        );
-      }
+      await LimitModel.addTokenUsage({
+        entityRefs: sql`VALUES (${entityType}, ${entityId})`,
+        model,
+        inputTokens,
+        outputTokens,
+      });
     } catch (error) {
       logger.error(
         `Error updating ${entityType} token limit for ${entityId}, model ${model}: ${error}`,
@@ -354,21 +985,150 @@ class LimitModel {
     }
   }
 
+  /**
+   * Add one interaction's tokens to every token_cost limit it reaches, in a
+   * single statement. Besides the agent and `entities`, the interaction reaches
+   * each of `teamIds` and one organization: a team's when the agent has teams,
+   * otherwise the agent's own.
+   */
+  static async recordInteractionTokenUsage(params: {
+    agentId: string;
+    teamIds: string[];
+    entities: Array<{ entityType: LimitEntityType; entityId: string }>;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+  }): Promise<void> {
+    const { agentId, teamIds, entities, ...usage } = params;
+    const team = schema.teamsTable;
+    const agent = schema.agentsTable;
+    const literalRefs = sql.join(
+      [
+        sql`(${"agent"}, ${agentId})`,
+        ...entities.map(
+          ({ entityType, entityId }) => sql`(${entityType}, ${entityId})`,
+        ),
+      ],
+      sql`, `,
+    );
+    const derivedRefs =
+      teamIds.length === 0
+        ? sql`SELECT ${"organization"}, ${agent.organizationId} FROM ${agent}
+            WHERE ${agent.id} = ${agentId} AND ${notDeleted(agent)}`
+        : sql`SELECT ${"team"}, ${team.id} FROM ${team}
+            WHERE ${inArray(team.id, teamIds)}
+            UNION ALL
+            (SELECT ${"organization"}, ${team.organizationId} FROM ${team}
+              WHERE ${inArray(team.id, teamIds)} LIMIT 1)`;
+
+    await LimitModel.addTokenUsage({
+      entityRefs: sql`VALUES ${literalRefs} UNION ALL ${derivedRefs}`,
+      ...usage,
+    });
+  }
+
+  /** All amounts and price snapshots were resolved before entering the transaction. */
+  static async settleBillableUsage(params: {
+    tx: Transaction;
+    attribution: BillingAttribution;
+    usage: PricedBillingUsage;
+  }): Promise<void> {
+    const { tx, attribution, usage } = params;
+    if (!attribution.entities.length) return;
+    const conditions = attribution.entities.map(({ entityType, entityId }) =>
+      and(
+        eq(schema.limitsTable.entityType, entityType),
+        eq(schema.limitsTable.entityId, entityId),
+      ),
+    );
+    // A parent lock serializes settlement with resets, even for cache-only rows
+    // whose legacy input/output counters are zero. Always lock in id order.
+    const limits = await tx
+      .select()
+      .from(schema.limitsTable)
+      .where(
+        and(
+          eq(schema.limitsTable.limitType, "token_cost"),
+          sql`${schema.limitsTable.cleanupInterval} <> 'minute'`,
+          or(...conditions),
+        ),
+      )
+      .orderBy(schema.limitsTable.id)
+      .for("no key update");
+    const models = [
+      ...new Set(usage.components.map((item) => item.model)),
+    ].sort();
+    const legacyRows: (typeof schema.limitModelUsageTable.$inferInsert)[] = [];
+    const settledRows: (typeof schema.limitBillingUsageTable.$inferInsert)[] =
+      [];
+    const grouped = new Map(
+      models.map((model) => [
+        model,
+        usage.components.filter((item) => item.model === model),
+      ]),
+    );
+    for (const limit of limits) {
+      for (const [model, components] of grouped) {
+        const matched = components.filter((component) =>
+          limitAppliesToModel({ ...component, models: limit.model }),
+        );
+        if (!matched.length) continue;
+        const total = {
+          input: matched.reduce((sum, item) => sum + item.inputTokens, 0),
+          output: matched.reduce((sum, item) => sum + item.outputTokens, 0),
+          cost: sumMoney(matched.map((item) => item.cost)),
+        };
+        legacyRows.push({
+          limitId: limit.id,
+          model,
+          currentUsageTokensIn: total.input,
+          currentUsageTokensOut: total.output,
+        });
+        settledRows.push({
+          limitId: limit.id,
+          model,
+          coveredTokensIn: total.input,
+          coveredTokensOut: total.output,
+          cost: total.cost,
+          incomplete: hasEstimatedPrice(usage) ? 1 : 0,
+        });
+      }
+    }
+    if (!legacyRows.length) return;
+    const legacy = schema.limitModelUsageTable;
+    await tx
+      .insert(legacy)
+      .values(legacyRows)
+      .onConflictDoUpdate({
+        target: [legacy.limitId, legacy.model],
+        set: {
+          currentUsageTokensIn: sql`${legacy.currentUsageTokensIn} + excluded.current_usage_tokens_in`,
+          currentUsageTokensOut: sql`${legacy.currentUsageTokensOut} + excluded.current_usage_tokens_out`,
+          updatedAt: new Date(),
+        },
+      });
+    const settled = schema.limitBillingUsageTable;
+    await tx
+      .insert(settled)
+      .values(settledRows)
+      .onConflictDoUpdate({
+        target: [settled.limitId, settled.model],
+        set: {
+          coveredTokensIn: sql`${settled.coveredTokensIn} + excluded.covered_tokens_in`,
+          coveredTokensOut: sql`${settled.coveredTokensOut} + excluded.covered_tokens_out`,
+          cost: sql`${settled.cost} + excluded.cost`,
+          incomplete: sql`${settled.incomplete} + excluded.incomplete`,
+        },
+      });
+  }
+
   static async cleanupLimitsIfNeeded(
     options: LimitsCleanupOptions,
   ): Promise<void> {
     try {
-      logger.info({ options }, `[LimitsCleanup] Starting cleanup check`);
+      logger.debug({ options }, `[LimitsCleanup] Starting cleanup check`);
 
-      const organizationId =
-        options.entities?.organization ?? options.allForOrganizationId;
-      const limitsResetInterval =
-        await LimitModel.resolveLimitsCleanupIntervalSqlLiteral(organizationId);
-
-      const limitIdsToReset = await LimitModel.findLimitIdsToReset(
-        limitsResetInterval,
-        options,
-      );
+      const limitIdsToReset = await LimitModel.findLimitIdsToReset(options);
       await LimitModel.resetLimitsUsage(limitIdsToReset);
 
       if (limitIdsToReset.length > 0) {
@@ -377,7 +1137,7 @@ class LimitModel {
           `[LimitsCleanup] Completed cleanup of ${limitIdsToReset.length} limits`,
         );
       } else {
-        logger.info({ options }, `[LimitsCleanup] No limits need cleanup`);
+        logger.debug({ options }, `[LimitsCleanup] No limits need cleanup`);
       }
     } catch (error) {
       logger.error(
@@ -388,54 +1148,21 @@ class LimitModel {
     }
   }
 
-  static async resolveLimitsCleanupIntervalSqlLiteral(
-    organizationId?: string,
-  ): Promise<LimitsCleanupIntervalSqlLiteral> {
-    // Use default cleanup interval if not set
-    let cleanupInterval: LimitsCleanupIntervalSqlLiteral = "1 hour";
-
-    if (!organizationId) {
-      logger.warn(
-        `[LimitsCleanup] No organization ID provided: using default interval: ${cleanupInterval}`,
-      );
-      return cleanupInterval;
-    }
-
-    // Get the organization's cleanup interval
-    const [organization] = await db
-      .select()
-      .from(schema.organizationsTable)
-      .where(eq(schema.organizationsTable.id, organizationId));
-
-    if (!organization) {
-      logger.warn(
-        `[LimitsCleanup] Organization not found: ${organizationId}, using default interval: ${cleanupInterval}`,
-      );
-      return cleanupInterval;
-    }
-
-    if (!organization.limitCleanupInterval) {
-      logger.info(
-        `[LimitsCleanup] No cleanup interval set for organization: ${organizationId}, using default: ${cleanupInterval}`,
-      );
-      return cleanupInterval;
-    }
-
-    cleanupInterval =
-      LimitModel.limitsCleanupIntervalSqlLiterals[
-        organization.limitCleanupInterval
-      ];
-    logger.info(
-      `[LimitsCleanup] Using cleanup interval: ${cleanupInterval} for organization: ${organizationId}`,
-    );
-
-    return cleanupInterval;
-  }
-
   static async findLimitIdsToReset(
-    limitsResetInterval: LimitsCleanupIntervalSqlLiteral,
     options: LimitsCleanupOptions,
   ): Promise<string[]> {
+    if (
+      options.entities !== undefined &&
+      options.entityType === undefined &&
+      options.entityId === undefined &&
+      options.limitType === undefined &&
+      options.allForOrganizationId === undefined
+    ) {
+      const parameters = limitEntityParameters(options.entities);
+      if (!Object.values(parameters).some((ids) => ids.length > 0)) return [];
+      const rows = await LimitModel.dueByEntities.get().execute(parameters);
+      return rows.map((row) => row.id);
+    }
     const filterConditions: SQL[] = [];
     if (options.entityType !== undefined) {
       filterConditions.push(
@@ -497,17 +1224,17 @@ class LimitModel {
       return [];
     }
 
-    const cutoffIntervalSqlExpr = sql`now() - interval ${sql.raw(`'${limitsResetInterval}'`)}`;
-
     const limitsToReset = await db
       .select({ id: schema.limitsTable.id })
       .from(schema.limitsTable)
       .where(
         and(
           ...scopeConditions,
+          sql`${schema.limitsTable.limitType} NOT IN ('requests', 'tokens', 'requests_per_minute', 'tokens_per_minute')`,
+          sql`${schema.limitsTable.cleanupInterval} <> 'minute'`,
           or(
-            isNull(schema.limitsTable.lastCleanup),
-            lt(schema.limitsTable.lastCleanup, cutoffIntervalSqlExpr),
+            sql`${schema.limitsTable.lastCleanup} IS NULL`,
+            buildCleanupDueCondition(),
           ),
         ),
       );
@@ -521,42 +1248,74 @@ class LimitModel {
    * Important to run in transaction to mitigate partial reset of token_cost limits usage
    * Partial reset would block requests at least until the next scheduled reset attempt
    */
-  static async resetLimitsUsage(
-    limitIds: string[],
-    now = new Date(),
-  ): Promise<void> {
+  static async resetLimitsUsage(limitIds: string[], now?: Date): Promise<void> {
     if (limitIds.length === 0) {
       return;
     }
 
-    await db.transaction(async (tx) => {
-      const limits = await tx
-        .update(schema.limitsTable)
-        .set({ lastCleanup: now, updatedAt: now })
-        .where(inArray(schema.limitsTable.id, limitIds))
-        .returning({
-          id: schema.limitsTable.id,
-          limitType: schema.limitsTable.limitType,
-        });
+    // A usage row inserted after the locks below can still close a cycle
+    // with a usage write, so a deadlocked reset reruns once from scratch.
+    await retryOnceOnDeadlock(() =>
+      withDbTransaction(async (tx) => {
+        // Lock in the accumulator's order (limit id, then model) so a reset and
+        // a concurrent usage write cannot deadlock.
+        await tx
+          .select({ id: schema.limitsTable.id })
+          .from(schema.limitsTable)
+          .where(inArray(schema.limitsTable.id, limitIds))
+          .orderBy(schema.limitsTable.id)
+          .for("no key update");
+        const limits = await tx
+          .update(schema.limitsTable)
+          // Receipts are stamped by the database clock; a window that starts
+          // on it keeps every earlier charge out of the new window.
+          .set({
+            lastCleanup: now ?? sql`clock_timestamp()`,
+            updatedAt: now ?? sql`clock_timestamp()`,
+          })
+          .where(inArray(schema.limitsTable.id, limitIds))
+          .returning({
+            id: schema.limitsTable.id,
+            limitType: schema.limitsTable.limitType,
+          });
 
-      const tokenCostLimitIds = limits
-        .filter((l) => l.limitType === "token_cost")
-        .map((l) => l.id);
+        const tokenCostLimitIds = limits
+          .filter((l) => l.limitType === "token_cost")
+          .map((l) => l.id);
 
-      if (tokenCostLimitIds.length === 0) {
-        return;
-      }
+        if (tokenCostLimitIds.length === 0) {
+          return;
+        }
 
-      // Reset model usage records for token_cost limits
-      await tx
-        .update(schema.limitModelUsageTable)
-        .set({
-          currentUsageTokensIn: 0,
-          currentUsageTokensOut: 0,
-          updatedAt: now,
-        })
-        .where(inArray(schema.limitModelUsageTable.limitId, tokenCostLimitIds));
-    });
+        await tx
+          .select({ id: schema.limitModelUsageTable.id })
+          .from(schema.limitModelUsageTable)
+          .where(
+            inArray(schema.limitModelUsageTable.limitId, tokenCostLimitIds),
+          )
+          .orderBy(
+            schema.limitModelUsageTable.limitId,
+            schema.limitModelUsageTable.model,
+          )
+          .for("update");
+        await tx
+          .delete(schema.limitBillingUsageTable)
+          .where(
+            inArray(schema.limitBillingUsageTable.limitId, tokenCostLimitIds),
+          );
+        // Reset model usage records for token_cost limits
+        await tx
+          .update(schema.limitModelUsageTable)
+          .set({
+            currentUsageTokensIn: 0,
+            currentUsageTokensOut: 0,
+            updatedAt: now ?? sql`clock_timestamp()`,
+          })
+          .where(
+            inArray(schema.limitModelUsageTable.limitId, tokenCostLimitIds),
+          );
+      }),
+    );
   }
 
   /**
@@ -581,62 +1340,465 @@ class LimitModel {
 
     return limits;
   }
+
+  /**
+   * Batched variant of {@link findLimitsForValidation}: fetch the limits for
+   * many (entityType, entityId) pairs in a single query. Used by the LLM-proxy
+   * pre-request check, which inspects limits across several entity levels
+   * (virtual key, user, agent, environment, teams, organization) on every
+   * request — issuing one query per level produced an N+1.
+   */
+  static async findLimitsForValidationForEntities(
+    entities: { entityType: LimitEntityType; entityId: string }[],
+    limitType: LimitType = "token_cost",
+  ): Promise<Limit[]> {
+    if (entities.length === 0) return [];
+    const parameters = limitEntityParameters({});
+    for (const { entityType, entityId } of entities)
+      parameters[entityType].push(entityId);
+    return LimitModel.validationByEntities
+      .get()
+      .execute({ ...parameters, limitType });
+  }
+
+  /** Read current budgets and any scoped counters needing cleanup together. */
+  static async findProxyLimitState(
+    entities: LimitsCleanupOptionsEntities,
+    defaults: { organizationId: string | null; environmentId: string | null },
+  ) {
+    const rows = await LimitModel.proxyLimitState.get().execute({
+      ...limitEntityParameters(entities),
+      ...defaults,
+    });
+    return {
+      limits: rows.flatMap(({ limit }) => (limit ? [limit] : [])),
+      defaultUserLimit: rows[0]?.defaultUserLimit ?? null,
+    };
+  }
+
+  // Org-scoped audit snapshot via the entity FK.  limitsTable has no
+  // organizationId column of its own, so tenancy is resolved through the
+  // entity that owns the limit (organization/team/agent/user/virtual_key).
+  //
+  // The route handler for PATCH/DELETE /api/limits/:id does not enforce this
+  // predicate today, but the audit fetcher must — the preHandler runs before
+  // route authz, so an unscoped fetch would write another tenant's limit row
+  // into the caller's audit_logs even when the route ultimately rejects the
+  // request.  Returns null whenever the limit does not belong to the caller's
+  // organization.
+  static async findByIdForAudit(
+    id: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [row] = await db
+      .select()
+      .from(schema.limitsTable)
+      .where(eq(schema.limitsTable.id, id))
+      .limit(1);
+
+    if (!row) return null;
+
+    const inOrg = await LimitModel.isEntityInOrganization(
+      row.entityType,
+      row.entityId,
+      organizationId,
+    );
+    if (!inOrg) return null;
+
+    return {
+      id: row.id,
+      entityType: row.entityType,
+      entityId: row.entityId,
+      limitType: row.limitType,
+      limitValue: row.limitValue,
+      behavior: row.behavior,
+      mcpServerName: row.mcpServerName ?? null,
+      toolName: row.toolName ?? null,
+      model: row.model ?? null,
+      cleanupInterval: row.cleanupInterval ?? null,
+      lastCleanup: row.lastCleanup?.toISOString() ?? null,
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+    };
+  }
+
+  // Org-scoped fetch for PATCH/DELETE authorization.  limitsTable has no
+  // organizationId column, so tenancy is resolved through the entity that owns
+  // the limit.  Returns null when the limit does not belong to the caller's
+  // organization (treated as 404 by routes).
+  static async findByIdInOrganization(
+    id: string,
+    organizationId: string,
+  ): Promise<LimitWithLabels | null> {
+    const limit = await LimitModel.findById(id);
+    if (!limit) return null;
+
+    const inOrg = await LimitModel.isEntityInOrganization(
+      limit.entityType,
+      limit.entityId,
+      organizationId,
+    );
+    if (!inOrg) return null;
+
+    return { ...limit, labels: await LimitLabelModel.getLabelsFor(id) };
+  }
+
+  /**
+   * Verify that a limit's entity (the row identified by `entityType` and
+   * `entityId`) belongs to `organizationId`.  Each entity type lives in a
+   * different table, so the FK path differs per branch.  Used by the
+   * snapshot-before-authz scope predicate in `findByIdForAudit`, by the
+   * org-scoping guards on create/update/delete routes, and by
+   * `findByIdInOrganization`.
+   */
+  static async isEntityInOrganization(
+    entityType: LimitEntityType,
+    entityId: string,
+    organizationId: string,
+  ): Promise<boolean> {
+    switch (entityType) {
+      case "organization":
+        return entityId === organizationId;
+      case "team": {
+        const [hit] = await db
+          .select({ id: schema.teamsTable.id })
+          .from(schema.teamsTable)
+          .where(
+            and(
+              eq(schema.teamsTable.id, entityId),
+              eq(schema.teamsTable.organizationId, organizationId),
+            ),
+          )
+          .limit(1);
+        return Boolean(hit);
+      }
+      case "agent": {
+        return AgentModel.existsInOrganization({
+          id: entityId,
+          organizationId,
+        });
+      }
+      case "user": {
+        const [hit] = await db
+          .select({ id: schema.membersTable.id })
+          .from(schema.membersTable)
+          .where(
+            and(
+              eq(schema.membersTable.userId, entityId),
+              eq(schema.membersTable.organizationId, organizationId),
+            ),
+          )
+          .limit(1);
+        return Boolean(hit);
+      }
+      case "virtual_key": {
+        const [hit] = await db
+          .select({ id: schema.virtualApiKeysTable.id })
+          .from(schema.virtualApiKeysTable)
+          .where(
+            and(
+              eq(schema.virtualApiKeysTable.id, entityId),
+              eq(schema.virtualApiKeysTable.organizationId, organizationId),
+            ),
+          )
+          .limit(1);
+        return Boolean(hit);
+      }
+      case "environment": {
+        const [hit] = await db
+          .select({ id: schema.environmentsTable.id })
+          .from(schema.environmentsTable)
+          .where(
+            and(
+              eq(schema.environmentsTable.id, entityId),
+              eq(schema.environmentsTable.organizationId, organizationId),
+            ),
+          )
+          .limit(1);
+        return Boolean(hit);
+      }
+      case "llm_oauth_client": {
+        const [hit] = await db
+          .select({ id: schema.oauthClientsTable.id })
+          .from(schema.oauthClientsTable)
+          .where(
+            and(
+              eq(schema.oauthClientsTable.id, entityId),
+              llmOauthClientInOrganization(organizationId),
+            ),
+          )
+          .limit(1);
+        return Boolean(hit);
+      }
+    }
+  }
+
+  /** Whether missing user identity could evade any member's hard LLM limit. */
+  static async hasHardUserLimits(organizationId: string): Promise<boolean> {
+    const [row] = await db
+      .select({ id: schema.limitsTable.id })
+      .from(schema.limitsTable)
+      .innerJoin(
+        schema.membersTable,
+        eq(schema.membersTable.userId, schema.limitsTable.entityId),
+      )
+      .where(
+        and(
+          eq(schema.limitsTable.entityType, "user"),
+          eq(schema.limitsTable.limitType, "token_cost"),
+          eq(schema.limitsTable.behavior, "hard"),
+          eq(schema.membersTable.organizationId, organizationId),
+        ),
+      )
+      .limit(1);
+    return !!row;
+  }
+
+  /**
+   * A limit reached through several entity refs accrues once per ref. Rows are
+   * written in limit id order so concurrent statements lock them in the same
+   * order as {@link resetLimitsUsage}. A deadlock aborts the statement before
+   * any row is written, so it is retried once.
+   */
+  private static async addTokenUsage(params: {
+    entityRefs: SQL;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    tx?: Transaction;
+  }): Promise<void> {
+    const { entityRefs, model, inputTokens, outputTokens, tx } = params;
+    const limits = schema.limitsTable;
+    const usage = schema.limitModelUsageTable;
+    const statement = sql`
+      WITH entity_refs (entity_type, entity_id) AS (${entityRefs}),
+      matched AS (
+        SELECT ${limits.id} AS limit_id, count(*)::integer AS refs
+        FROM ${limits}
+        JOIN entity_refs
+          ON ${limits.entityType} = entity_refs.entity_type
+          AND ${limits.entityId} = entity_refs.entity_id
+        WHERE ${limits.limitType} = ${"token_cost"}
+          AND ${limits.cleanupInterval} <> 'minute'
+          AND (${limits.model} ? ${model} OR ${limits.model} IS NULL)
+        GROUP BY ${limits.id}
+      )
+      INSERT INTO ${usage} (limit_id, model, current_usage_tokens_in, current_usage_tokens_out)
+      SELECT limit_id, ${model}, refs * ${inputTokens}::bigint, refs * ${outputTokens}::bigint
+      FROM matched
+      ORDER BY limit_id
+      ON CONFLICT (limit_id, model) DO UPDATE SET
+        current_usage_tokens_in = ${usage}.current_usage_tokens_in + EXCLUDED.current_usage_tokens_in,
+        current_usage_tokens_out = ${usage}.current_usage_tokens_out + EXCLUDED.current_usage_tokens_out,
+        updated_at = ${sql.param(new Date(), usage.updatedAt)}
+    `;
+    if (tx) await tx.execute(statement);
+    else await retryOnceOnDeadlock(() => db.execute(statement));
+  }
+  private static readonly dueByEntities = new PreparedQuery((database) =>
+    database
+      .select({ id: schema.limitsTable.id })
+      .from(schema.limitsTable)
+      .where(and(limitEntitiesCondition(), scopedCleanupDueCondition()))
+      .prepare("archestra_due_limits_by_entities"),
+  );
+
+  private static readonly proxyLimitState = new PreparedQuery((database) => {
+    const defaults = schema.environmentDefaultUserLimitsTable;
+    // At most one environment override, otherwise the organization's global
+    // default. A left join keeps the result even when no entity limit exists.
+    const defaultUserLimit = database
+      .select()
+      .from(defaults)
+      .where(
+        and(
+          eq(defaults.organizationId, sql.placeholder("organizationId")),
+          or(
+            eq(defaults.environmentId, sql.placeholder("environmentId")),
+            isNull(defaults.environmentId),
+          ),
+        ),
+      )
+      .orderBy(sql`${defaults.environmentId} NULLS LAST`)
+      .limit(1)
+      .as("proxy_default_user_limit");
+    return database
+      .select({
+        limit: {
+          ...getTableColumns(schema.limitsTable),
+          cleanupDue: scopedCleanupDueCondition(),
+        },
+        defaultUserLimit: {
+          id: defaultUserLimit.id,
+          organizationId: defaultUserLimit.organizationId,
+          environmentId: defaultUserLimit.environmentId,
+          limitValue: defaultUserLimit.limitValue,
+          model: defaultUserLimit.model,
+          cleanupInterval: defaultUserLimit.cleanupInterval,
+          createdAt: defaultUserLimit.createdAt,
+          updatedAt: defaultUserLimit.updatedAt,
+        },
+      })
+      .from(sql`(VALUES (1)) AS proxy_limit_context(present)`)
+      .leftJoin(
+        schema.limitsTable,
+        and(
+          limitEntitiesCondition(),
+          or(
+            eq(schema.limitsTable.limitType, "token_cost"),
+            scopedCleanupDueCondition(),
+          ),
+        ),
+      )
+      .leftJoin(defaultUserLimit, sql`true`)
+      .prepare("archestra_proxy_limit_state");
+  });
+  private static readonly validationByEntities = new PreparedQuery((database) =>
+    database
+      .select()
+      .from(schema.limitsTable)
+      .where(
+        and(
+          eq(schema.limitsTable.limitType, sql.placeholder("limitType")),
+          limitEntitiesCondition(),
+        ),
+      )
+      .prepare("archestra_validation_limits_by_entities"),
+  );
 }
 
 /**
- * Service for validating if current usage has exceeded limits
- * Similar to tool invocation policies but for token cost limits
+ * Service for validating if current usage has exceeded token cost limits
  */
 export class LimitValidationService {
   /**
    * Check if current usage has already exceeded any token cost limits
-   * Returns null if allowed, or [refusalMessage, contentMessage] if blocked
+   * Returns null if allowed, or a refusal tuple if blocked.
    */
   static async checkLimitsBeforeRequest(params: {
+    model?: string;
+    modelAliases?: string[];
+    deferModelScopedLimits?: boolean;
+    /** Refuse applicable budgets when this media model cannot be priced. */
+    unpricedMediaModel?: string;
+    /** Refuse applicable hard budgets when token prices are unknown. */
+    unpricedModel?: string;
+    /**
+     * The operation names no model and reports no cost to settle, so every
+     * hard budget applies to it, whatever models the budget lists.
+     */
+    unmeteredOperation?: boolean;
+    /** Only proof-authenticated platform calls or verified service accounts. */
+    allowUnattributed?: boolean;
     agentId: string;
     userId?: string;
     virtualKeyId?: string;
-  }): Promise<null | [string, string]> {
-    const { agentId, userId, virtualKeyId } = params;
+    passthroughVirtualKeyId?: string;
+    /** The agent row this request already read. */
+    agent?: { environmentId: string | null; organizationId?: string };
+    teamSource?: AgentTeamSource;
+    /** Fresh rows from this request's scoped metadata query. */
+    snapshot?: Pick<ProxyRequestState, "scope" | "limitTeamIds" | "limitState">;
+    /**
+     * Authenticated caller whose team memberships attribute the call to the
+     * agent's teams. Defaults to `userId`; null when no credential proves a
+     * user, so only a billing team's limits apply.
+     */
+    teamMemberUserId?: string | null;
+    /** LLM OAuth client the request authenticated as, for its spend cap. */
+    llmOauthClientId?: string;
+    /**
+     * Team the calling credential is billed to. It replaces the agent's teams
+     * for team limits, and the caller's personal and default user limits do
+     * not apply: the team pays.
+     */
+    billingTeamId?: string;
+  }): Promise<null | LimitViolationResponse> {
+    const { agentId, virtualKeyId, passthroughVirtualKeyId, llmOauthClientId } =
+      params;
+    const userId = params.billingTeamId ? undefined : params.userId;
+    const teamMemberUserId =
+      params.teamMemberUserId === undefined
+        ? (params.userId ?? null)
+        : params.teamMemberUserId;
 
     try {
-      logger.info(
+      logger.debug(
         `[LimitValidation] Starting limit check for agent: ${agentId}`,
       );
 
-      // Get agent's teams to cleanup and check team and organization limits
-      const agentTeamIds = await AgentTeamModel.getTeamsForAgent(agentId);
-      logger.info(
+      const scope = params.snapshot?.scope;
+      const snapshot =
+        scope &&
+        params.agent?.organizationId === scope.organizationId &&
+        params.agent?.environmentId === scope.environmentId &&
+        scope.agentId === agentId &&
+        scope.userId === params.userId &&
+        scope.billingTeamId === params.billingTeamId &&
+        scope.virtualKeyId === virtualKeyId &&
+        scope.passthroughVirtualKeyId === passthroughVirtualKeyId &&
+        scope.llmOauthClientId === llmOauthClientId &&
+        scope.teamMemberUserId === teamMemberUserId
+          ? params.snapshot
+          : undefined;
+
+      // Get the teams to cleanup and check team and organization limits: the
+      // credential's billing team when it has one, otherwise the agent's teams
+      // the caller belongs to.
+      const agentTeamIds = params.billingTeamId
+        ? (snapshot?.limitTeamIds ??
+          (await TeamModel.getBillingAncestorIds(params.billingTeamId)))
+        : (snapshot?.limitTeamIds ??
+          (await AgentTeamModel.getCallerTeamsForAgent({
+            agentId,
+            userId: teamMemberUserId,
+            teamSource: params.teamSource,
+          })));
+      logger.debug(
         `[LimitValidation] Agent ${agentId} belongs to teams: ${agentTeamIds.join(", ")}`,
       );
 
-      // Get organization ID to cleanup and check organization limits (either from teams or fallback)
-      let organizationId: string | null = null;
-      if (agentTeamIds.length > 0) {
-        const teams = await db
+      // The proxy already resolved this agent and its team IDs. Reuse that
+      // request-local attribution rather than hydrating the same teams again.
+      let organizationId: string | null = params.agent?.organizationId ?? null;
+      let agentTeams: { id: string; organizationId: string }[] = [];
+      if (organizationId) {
+        const resolvedOrganizationId = organizationId;
+        agentTeams = agentTeamIds.map((id) => ({
+          id,
+          organizationId: resolvedOrganizationId,
+        }));
+      } else if (agentTeamIds.length > 0) {
+        agentTeams = await db
           .select()
           .from(schema.teamsTable)
           .where(inArray(schema.teamsTable.id, agentTeamIds));
-        if (teams.length > 0 && teams[0].organizationId) {
-          organizationId = teams[0].organizationId;
+        if (agentTeams.length > 0 && agentTeams[0].organizationId) {
+          organizationId = agentTeams[0].organizationId;
         }
       } else {
-        // If agent has no teams, check if there are any organization limits to apply
-        const existingOrgLimits = await db
-          .select({ entityId: schema.limitsTable.entityId })
-          .from(schema.limitsTable)
-          .where(sql`${schema.limitsTable.entityType} = 'organization'`)
-          .limit(1);
-        if (existingOrgLimits.length > 0) {
-          organizationId = existingOrgLimits[0].entityId;
-        }
+        organizationId =
+          params.agent?.organizationId ??
+          (await AgentModel.findOrganizationId(agentId));
       }
+
+      // Resolve the agent's environment (nullable). Used for environment-scoped
+      // limits and per-environment default-user limits.
+      const environmentId = params.agent
+        ? params.agent.environmentId
+        : await AgentModel.findEnvironmentId(agentId);
 
       const entities: LimitsCleanupOptionsEntities = {
         agent: agentId,
       };
-      if (virtualKeyId) {
-        entities.virtual_key = virtualKeyId;
+      const virtualKeyIds = [virtualKeyId, passthroughVirtualKeyId].filter(
+        (id): id is string => Boolean(id),
+      );
+      if (virtualKeyIds.length > 0) {
+        entities.virtual_key = virtualKeyIds;
+      }
+      if (llmOauthClientId) {
+        entities.llm_oauth_client = llmOauthClientId;
       }
       if (userId) {
         entities.user = userId;
@@ -647,110 +1809,336 @@ export class LimitValidationService {
       if (organizationId) {
         entities.organization = organizationId;
       }
+      if (environmentId) {
+        entities.environment = environmentId;
+      }
 
-      logger.info({ entities }, `[LimitValidation] Running limits cleanup`);
-      await LimitModel.cleanupLimitsIfNeeded({ entities });
+      // Prefetch every limit, per-model usage row, and model price the priority
+      // checks below may need, in a fixed set of batched queries. Each entity
+      // level used to issue its own limit_model_usage + models lookups, which
+      // showed up as an N+1 on LLM-proxy requests. Built AFTER cleanup so the
+      // usage rows reflect any windows that were just reset.
+      const entitiesToCheck: {
+        entityType: LimitEntityType;
+        entityId: string;
+      }[] = [];
+      if (passthroughVirtualKeyId) {
+        entitiesToCheck.push({
+          entityType: "virtual_key",
+          entityId: passthroughVirtualKeyId,
+        });
+      }
+      if (virtualKeyId) {
+        entitiesToCheck.push({
+          entityType: "virtual_key",
+          entityId: virtualKeyId,
+        });
+      }
+      if (llmOauthClientId) {
+        entitiesToCheck.push({
+          entityType: "llm_oauth_client",
+          entityId: llmOauthClientId,
+        });
+      }
+      if (userId) {
+        entitiesToCheck.push({ entityType: "user", entityId: userId });
+      }
+      entitiesToCheck.push({ entityType: "agent", entityId: agentId });
+      if (environmentId) {
+        entitiesToCheck.push({
+          entityType: "environment",
+          entityId: environmentId,
+        });
+      }
+      for (const team of agentTeams) {
+        entitiesToCheck.push({ entityType: "team", entityId: team.id });
+      }
+      if (organizationId) {
+        entitiesToCheck.push({
+          entityType: "organization",
+          entityId: organizationId,
+        });
+      }
+      let { limits: scopedLimits, defaultUserLimit } =
+        snapshot?.limitState ??
+        (await LimitModel.findProxyLimitState(entities, {
+          organizationId,
+          environmentId,
+        }));
+      // An unidentified caller cannot safely select a member's cap. Require
+      // identity whenever hard user limits exist, including model-scoped caps:
+      // routing or changing models must not provide an anonymous escape hatch.
+      // Team-billed credentials have a server-selected payer of their own.
+      if (
+        !userId &&
+        !params.billingTeamId &&
+        !params.allowUnattributed &&
+        organizationId &&
+        (defaultUserLimit ||
+          (await LimitModel.hasHardUserLimits(organizationId)))
+      ) {
+        throw new ApiError(
+          401,
+          "A user credential is required because user limits are configured. Use a personal virtual key, user OAuth, or a passthrough virtual key; identity headers cannot authenticate a user.",
+        );
+      }
+      if (scopedLimits.some((limit) => limit.cleanupDue)) {
+        await LimitModel.cleanupLimitsIfNeeded({ entities });
+        // Cleanup changes usage: validation must read its committed result.
+        ({ limits: scopedLimits, defaultUserLimit } =
+          await LimitModel.findProxyLimitState(entities, {
+            organizationId,
+            environmentId,
+          }));
+      }
+      const checkedEntities = new Set(
+        entitiesToCheck.map(
+          ({ entityType, entityId }) => `${entityType}:${entityId}`,
+        ),
+      );
+      const limits = scopedLimits
+        .filter(
+          (limit) =>
+            limit.limitType === "token_cost" &&
+            checkedEntities.has(`${limit.entityType}:${limit.entityId}`),
+        )
+        .map(({ cleanupDue: _cleanupDue, ...limit }) => limit);
+      const prefetch = await LimitValidationService.prefetchEntityLimits(
+        entitiesToCheck,
+        limits,
+      );
+      prefetch.model = params.model;
+      prefetch.modelAliases = params.modelAliases;
+      prefetch.deferModelScopedLimits = params.deferModelScopedLimits;
+
+      if (
+        params.unpricedMediaModel ||
+        params.unpricedModel ||
+        params.unmeteredOperation
+      ) {
+        const applies = (models?: string[] | null) =>
+          params.unmeteredOperation ||
+          !models?.length ||
+          models.includes(
+            params.unpricedMediaModel ?? params.unpricedModel ?? "",
+          );
+        // Minute budgets are enforced by throughput, but still require a known
+        // token price. The spend evaluator's prefetch excludes those budgets.
+        const budgetLimits = params.unpricedModel
+          ? limits
+          : [...prefetch.limitsByEntity.values()].flat();
+        let budgeted = budgetLimits.some(
+          (limit) => limit.behavior !== "soft" && applies(limit.model),
+        );
+        const customUserLimits = userId
+          ? prefetch.limitsByEntity.get(`user:${userId}`)
+          : undefined;
+        if (
+          userId &&
+          organizationId &&
+          !customUserLimits?.some((limit) => limit.behavior !== "soft")
+        ) {
+          const defaultLimit = defaultUserLimit;
+          budgeted ||= !!defaultLimit && applies(defaultLimit.model);
+        }
+        if (budgeted)
+          throw new ApiError(
+            422,
+            params.unmeteredOperation
+              ? "This pass-through operation reports no cost the gateway can count, so it cannot run while a budget applies."
+              : params.unpricedModel
+                ? "This vLLM model has unknown token prices and cannot run while a spend budget applies. Configure input and output token prices (including explicit zero for a free model) in Costs & Limits."
+                : "This media operation cannot satisfy the configured budget because authoritative cost is unavailable",
+          );
+      }
+
+      // The passthrough key is the user-bound cost-bearing identity, so its
+      // per-key limit is checked first and takes precedence over the standard
+      // virtual key when both are present on the request.
+      if (passthroughVirtualKeyId) {
+        const passthroughLimitViolation =
+          await LimitValidationService.evaluateEntityLimits(
+            "virtual_key",
+            passthroughVirtualKeyId,
+            prefetch,
+          );
+        if (passthroughLimitViolation) {
+          logger.info(
+            `[LimitValidation] BLOCKED by passthrough virtual-key-level limit for: ${passthroughVirtualKeyId}`,
+          );
+          return passthroughLimitViolation;
+        }
+      }
 
       if (virtualKeyId) {
-        logger.info(
+        logger.debug(
           `[LimitValidation] Checking virtual-key-level limits for: ${virtualKeyId}`,
         );
-        const vkLimitViolation = await LimitValidationService.checkEntityLimits(
-          "virtual_key",
-          virtualKeyId,
-        );
+        const vkLimitViolation =
+          await LimitValidationService.evaluateEntityLimits(
+            "virtual_key",
+            virtualKeyId,
+            prefetch,
+          );
         if (vkLimitViolation) {
           logger.info(
             `[LimitValidation] BLOCKED by virtual-key-level limit for: ${virtualKeyId}`,
           );
           return vkLimitViolation;
         }
-        logger.info(
+        logger.debug(
           `[LimitValidation] Virtual-key-level limits OK for: ${virtualKeyId}`,
         );
       }
 
+      if (llmOauthClientId) {
+        const clientLimitViolation =
+          await LimitValidationService.evaluateEntityLimits(
+            "llm_oauth_client",
+            llmOauthClientId,
+            prefetch,
+          );
+        if (clientLimitViolation) {
+          logger.info(
+            `[LimitValidation] BLOCKED by OAuth-client-level limit for: ${llmOauthClientId}`,
+          );
+          return clientLimitViolation;
+        }
+      }
+
       if (userId) {
-        logger.info(
+        logger.debug(
           `[LimitValidation] Checking user-level limits for: ${userId}`,
         );
         const userLimitViolation =
-          await LimitValidationService.checkEntityLimits("user", userId);
+          await LimitValidationService.evaluateEntityLimits(
+            "user",
+            userId,
+            prefetch,
+          );
         if (userLimitViolation) {
           logger.info(
             `[LimitValidation] BLOCKED by user-level limit for: ${userId}`,
           );
           return userLimitViolation;
         }
-        logger.info(`[LimitValidation] User-level limits OK for: ${userId}`);
+        if (organizationId) {
+          const defaultUserLimitViolation =
+            await LimitValidationService.checkDefaultUserLimit({
+              organizationId,
+              userId,
+              environmentId,
+              customUserLimits:
+                prefetch.limitsByEntity.get(`user:${userId}`) ?? [],
+              defaultLimit: defaultUserLimit,
+              model: params.model,
+              modelAliases: params.modelAliases,
+              deferModelScopedLimits: params.deferModelScopedLimits,
+            });
+          if (defaultUserLimitViolation) {
+            logger.info(
+              `[LimitValidation] BLOCKED by default user limit for: ${userId}`,
+            );
+            return defaultUserLimitViolation;
+          }
+        }
+        logger.debug(`[LimitValidation] User-level limits OK for: ${userId}`);
       }
 
-      logger.info(
+      logger.debug(
         `[LimitValidation] Checking agent-level limits for: ${agentId}`,
       );
       const agentLimitViolation =
-        await LimitValidationService.checkEntityLimits("agent", agentId);
+        await LimitValidationService.evaluateEntityLimits(
+          "agent",
+          agentId,
+          prefetch,
+        );
       if (agentLimitViolation) {
         logger.info(
           `[LimitValidation] BLOCKED by agent-level limit for: ${agentId}`,
         );
         return agentLimitViolation;
       }
-      logger.info(`[LimitValidation] Agent-level limits OK for: ${agentId}`);
+      logger.debug(`[LimitValidation] Agent-level limits OK for: ${agentId}`);
+
+      // Check environment-level limits (total usage across all users in the
+      // agent's environment).
+      if (environmentId) {
+        logger.debug(
+          `[LimitValidation] Checking environment-level limits for: ${environmentId}`,
+        );
+        const environmentLimitViolation =
+          await LimitValidationService.evaluateEntityLimits(
+            "environment",
+            environmentId,
+            prefetch,
+          );
+        if (environmentLimitViolation) {
+          logger.info(
+            `[LimitValidation] BLOCKED by environment-level limit for: ${environmentId}`,
+          );
+          return environmentLimitViolation;
+        }
+        logger.debug(
+          `[LimitValidation] Environment-level limits OK for: ${environmentId}`,
+        );
+      }
 
       // Check team-level limits
       if (agentTeamIds.length > 0) {
-        logger.info(
+        logger.debug(
           `[LimitValidation] Checking team-level limits for agent: ${agentId}`,
         );
-        const teams = await db
-          .select()
-          .from(schema.teamsTable)
-          .where(inArray(schema.teamsTable.id, agentTeamIds));
-        logger.info(
-          `[LimitValidation] Found ${teams.length} teams for agent ${agentId}: ${teams.map((t) => `${t.id}(org:${t.organizationId})`).join(", ")}`,
+        logger.debug(
+          `[LimitValidation] Found ${agentTeams.length} teams for agent ${agentId}: ${agentTeams.map((t) => `${t.id}(org:${t.organizationId})`).join(", ")}`,
         );
 
-        for (const team of teams) {
-          logger.info(
+        for (const team of agentTeams) {
+          logger.debug(
             `[LimitValidation] Checking team limit for team: ${team.id}`,
           );
           const teamLimitViolation =
-            await LimitValidationService.checkEntityLimits("team", team.id);
+            await LimitValidationService.evaluateEntityLimits(
+              "team",
+              team.id,
+              prefetch,
+            );
           if (teamLimitViolation) {
             logger.info(
               `[LimitValidation] BLOCKED by team-level limit for team: ${team.id}`,
             );
             return teamLimitViolation;
           }
-          logger.info(
+          logger.debug(
             `[LimitValidation] Team-level limits OK for team: ${team.id}`,
-          );
-        }
-
-        // Check organization-level limits
-        if (organizationId) {
-          logger.info(
-            `[LimitValidation] Checking organization-level limits for org: ${organizationId}`,
-          );
-          const orgLimitViolation =
-            await LimitValidationService.checkEntityLimits(
-              "organization",
-              organizationId,
-            );
-          if (orgLimitViolation) {
-            logger.info(
-              `[LimitValidation] BLOCKED by organization-level limit for org: ${organizationId}`,
-            );
-            return orgLimitViolation;
-          }
-          logger.info(
-            `[LimitValidation] Organization-level limits OK for org: ${organizationId}`,
           );
         }
       }
 
-      logger.info(
+      // Check organization-level limits for any agent with a resolvable org.
+      if (organizationId) {
+        logger.debug(
+          `[LimitValidation] Checking organization-level limits for org: ${organizationId}`,
+        );
+        const orgLimitViolation =
+          await LimitValidationService.evaluateEntityLimits(
+            "organization",
+            organizationId,
+            prefetch,
+          );
+        if (orgLimitViolation) {
+          logger.info(
+            `[LimitValidation] BLOCKED by organization-level limit for org: ${organizationId}`,
+          );
+          return orgLimitViolation;
+        }
+        logger.debug(
+          `[LimitValidation] Organization-level limits OK for org: ${organizationId}`,
+        );
+      }
+
+      logger.debug(
         `[LimitValidation] All limits OK for agent: ${agentId} - ALLOWING request`,
       );
       return null; // No limits exceeded
@@ -758,176 +2146,272 @@ export class LimitValidationService {
       logger.error(
         `[LimitValidation] Error checking limits before request: ${error}`,
       );
-      // In case of error, allow the request to proceed
-      return null;
+      reportLimitStorageError("validation");
+      // Budgets fail closed: a request whose budgets cannot be read could
+      // spend past them unseen.
+      throw error;
     }
   }
 
   /**
-   * Check if current token cost usage has exceeded limits for a specific entity
+   * Batch-load the limits, per-model usage rows, and model prices needed to
+   * evaluate token_cost limits for a set of entities. Collapses what used to be
+   * a per-entity/per-limit set of queries into three queries total.
    */
-  private static async checkEntityLimits(
+  private static async prefetchEntityLimits(
+    entities: { entityType: LimitEntityType; entityId: string }[],
+    currentLimits?: Limit[],
+  ): Promise<LimitPrefetch> {
+    const limits =
+      currentLimits ??
+      (await LimitModel.findLimitsForValidationForEntities(
+        entities,
+        "token_cost",
+      ));
+
+    const limitsByEntity = new Map<string, Limit[]>();
+    for (const limit of limits) {
+      // Minute spend is actual-cost accounting in the shared continuous bucket.
+      if (limit.cleanupInterval === "minute") continue;
+      const key = `${limit.entityType}:${limit.entityId}`;
+      const existing = limitsByEntity.get(key);
+      if (existing) existing.push(limit);
+      else limitsByEntity.set(key, [limit]);
+    }
+
+    const usageByLimitId = new Map<string, LimitModelUsageRecord[]>();
+    if (limits.length > 0) {
+      const usageRows = await db
+        .select(usageSelection)
+        .from(schema.limitModelUsageTable)
+        .leftJoin(schema.limitBillingUsageTable, billingJoin)
+        .where(
+          inArray(
+            schema.limitModelUsageTable.limitId,
+            limits.map((limit) => limit.id),
+          ),
+        );
+      for (const row of usageRows) {
+        const existing = usageByLimitId.get(row.limitId);
+        if (existing) existing.push(row);
+        else usageByLimitId.set(row.limitId, [row]);
+      }
+    }
+
+    const modelIds = new Set<string>();
+    for (const rows of usageByLimitId.values()) {
+      for (const row of rows) modelIds.add(row.model);
+    }
+    const pricingByModelId = await ModelModel.findByModelIdsOnly(
+      Array.from(modelIds),
+    );
+
+    return { limitsByEntity, usageByLimitId, pricingByModelId };
+  }
+
+  /**
+   * Check if current token cost usage has exceeded limits for a specific entity,
+   * using data already loaded by {@link prefetchEntityLimits}. On a violation,
+   * a best-effort query resolves the target's display name for the response.
+   */
+  private static async evaluateEntityLimits(
     entityType: LimitEntityType,
     entityId: string,
-  ): Promise<null | [string, string]> {
-    try {
-      logger.info(
-        `[LimitValidation] Querying limits for ${entityType} ${entityId}`,
+    prefetch: LimitPrefetch,
+  ): Promise<null | LimitViolationResponse> {
+    const limits =
+      prefetch.limitsByEntity.get(`${entityType}:${entityId}`) ?? [];
+
+    if (limits.length === 0) {
+      logger.debug(
+        `[LimitValidation] No token_cost limits found for ${entityType} ${entityId} - allowing`,
       );
-      const limits = await LimitModel.findLimitsForValidation(
-        entityType,
-        entityId,
-        "token_cost",
+      return null;
+    }
+
+    for (const limit of limits) {
+      if (!limitAppliesToModel({ ...prefetch, models: limit.model })) continue;
+      logger.debug(
+        `[LimitValidation] Checking limit ${limit.id} for ${entityType} ${entityId}`,
       );
 
-      logger.info(
-        `[LimitValidation] Found ${limits.length} token_cost limits for ${entityType} ${entityId}`,
-      );
+      // For token_cost limits, convert tokens to actual cost using token prices
+      let comparisonValue = 0;
+      let limitDescription: "tokens" | "cost_dollars" = "tokens";
+      let totalTokensIn = 0;
+      let totalTokensOut = 0;
 
-      if (limits.length === 0) {
+      if (limit.limitType === "token_cost") {
+        const modelUsages = prefetch.usageByLimitId.get(limit.id) ?? [];
+
+        if (modelUsages.length === 0) {
+          logger.warn(
+            `[LimitValidation] No model usage records found for limit ${limit.id}`,
+          );
+        } else {
+          const usageCosts = computeModelUsageCosts(
+            modelUsages,
+            prefetch.pricingByModelId,
+          );
+
+          totalTokensIn = usageCosts.tokensIn;
+          totalTokensOut = usageCosts.tokensOut;
+          // Estimated charges count like any other: an estimate never blocks
+          // a budget on its own.
+          comparisonValue = usageCosts.cost;
+          limitDescription = "cost_dollars";
+
+          logger.debug(
+            `[LimitValidation] Total cost for limit ${limit.id}: $${usageCosts.cost.toFixed(2)} across ${modelUsages.length} models`,
+          );
+        }
+      }
+
+      const exceeded = comparisonValue >= limit.limitValue;
+      if (observeLimitCheck(limit, exceeded, false, comparisonValue)) {
         logger.info(
-          `[LimitValidation] No token_cost limits found for ${entityType} ${entityId} - allowing`,
+          `[LimitValidation] LIMIT EXCEEDED for ${entityType} ${entityId}: ${comparisonValue} ${limitDescription} >= ${limit.limitValue}`,
+        );
+
+        return buildLimitViolationResponse({
+          source: "explicit",
+          entityType,
+          entityId,
+          entityName: await resolveLimitEntityName(entityType, entityId),
+          limitValue: limit.limitValue,
+          comparisonValue,
+          limitDescription,
+          totalTokensIn,
+          totalTokensOut,
+          cleanupInterval: limit.cleanupInterval,
+          models: limit.model,
+        });
+      }
+
+      logger.debug(
+        `[LimitValidation] Limit OK for ${entityType} ${entityId}: ${comparisonValue} < ${limit.limitValue}`,
+      );
+    }
+
+    logger.debug(
+      `[LimitValidation] All ${limits.length} limits OK for ${entityType} ${entityId}`,
+    );
+    return null; // No limits exceeded for this entity
+  }
+
+  private static async checkDefaultUserLimit(params: {
+    model?: string;
+    modelAliases?: string[];
+    deferModelScopedLimits?: boolean;
+    organizationId: string;
+    userId: string;
+    environmentId?: string | null;
+    customUserLimits?: Limit[];
+    /** Fresh default read with this request's entity limits; null means none. */
+    defaultLimit?: EnvironmentDefaultUserLimit | null;
+  }): Promise<null | LimitViolationResponse> {
+    try {
+      // Only an enforcing custom budget replaces the default allowance.
+      // Observe-only budgets must not remove the user's hard spend cap.
+      const customUserLimits =
+        params.customUserLimits ??
+        (await LimitModel.findLimitsForValidation(
+          "user",
+          params.userId,
+          "token_cost",
+        ));
+      if (customUserLimits.some((limit) => limit.behavior !== "soft")) {
+        logger.debug(
+          `[LimitValidation] Skipping default user limit for ${params.userId}: custom hard user limit exists`,
         );
         return null;
       }
 
-      for (const limit of limits) {
-        logger.info(
-          `[LimitValidation] Checking limit ${limit.id} for ${entityType} ${entityId}`,
-        );
-
-        // For token_cost limits, convert tokens to actual cost using token prices
-        let comparisonValue = 0;
-        let limitDescription = "tokens";
-        let totalTokensIn = 0;
-        let totalTokensOut = 0;
-
-        if (limit.limitType === "token_cost") {
-          try {
-            // Get per-model usage from limit_model_usage table
-            const modelUsages = await db
-              .select()
-              .from(schema.limitModelUsageTable)
-              .where(eq(schema.limitModelUsageTable.limitId, limit.id));
-
-            if (modelUsages.length === 0) {
-              logger.warn(
-                `[LimitValidation] No model usage records found for limit ${limit.id}`,
-              );
-              comparisonValue = 0;
-            } else {
-              let totalCost = 0;
-
-              for (const usage of modelUsages) {
-                // Track total tokens for metadata
-                totalTokensIn += usage.currentUsageTokensIn;
-                totalTokensOut += usage.currentUsageTokensOut;
-
-                // Look up model by modelId only — limit usage records don't store provider
-                const modelEntry = await ModelModel.findByModelIdOnly(
-                  usage.model,
-                );
-                const pricing = ModelModel.getEffectivePricing(
-                  modelEntry,
-                  usage.model,
-                );
-
-                const inputCost =
-                  (usage.currentUsageTokensIn *
-                    parseFloat(pricing.pricePerMillionInput)) /
-                  1000000;
-                const outputCost =
-                  (usage.currentUsageTokensOut *
-                    parseFloat(pricing.pricePerMillionOutput)) /
-                  1000000;
-                const modelCost = inputCost + outputCost;
-
-                totalCost += modelCost;
-
-                logger.debug(
-                  `[LimitValidation] Model ${usage.model}: ${usage.currentUsageTokensIn} in + ${usage.currentUsageTokensOut} out = $${modelCost.toFixed(2)}`,
-                );
-              }
-
-              comparisonValue = totalCost;
-              limitDescription = "cost_dollars";
-
-              logger.debug(
-                `[LimitValidation] Total cost for limit ${limit.id}: $${totalCost.toFixed(2)} across ${modelUsages.length} models`,
-              );
-            }
-          } catch (error) {
-            logger.error(
-              `[LimitValidation] Error calculating cost for limit ${limit.id}: ${error}`,
-            );
-          }
-        }
-
-        if (comparisonValue >= limit.limitValue) {
-          logger.info(
-            `[LimitValidation] LIMIT EXCEEDED for ${entityType} ${entityId}: ${comparisonValue} ${limitDescription} >= ${limit.limitValue}`,
-          );
-
-          // Calculate remaining based on the comparison type (tokens vs dollars)
-          const remaining = Math.max(0, limit.limitValue - comparisonValue);
-          const totalTokens = totalTokensIn + totalTokensOut;
-
-          // For metadata, use token counts for programmatic access
-          const archestraMetadata = `
-<archestra-limit-type>token_cost</archestra-limit-type>
-<archestra-limit-entity-type>${entityType}</archestra-limit-entity-type>
-<archestra-limit-entity-id>${entityId}</archestra-limit-entity-id>
-<archestra-limit-current-usage>${totalTokens}</archestra-limit-current-usage>
-<archestra-limit-value>${limit.limitValue}</archestra-limit-value>
-<archestra-limit-remaining>${Math.max(0, limit.limitValue - totalTokens)}</archestra-limit-remaining>`;
-
-          // For user message, use appropriate units based on limit type
-          let contentMessage: string;
-          if (limitDescription === "cost_dollars") {
-            contentMessage = `
-I cannot process this request because the ${entityType}-level token cost limit has been exceeded.
-
-Current usage: $${comparisonValue.toFixed(2)}
-Limit: $${limit.limitValue.toFixed(2)}
-Remaining: $${remaining.toFixed(2)}
-
-Please contact your administrator to increase the limit or wait for the usage to reset.`;
-          } else {
-            contentMessage = `
-I cannot process this request because the ${entityType}-level token cost limit has been exceeded.
-
-Current usage: ${totalTokens.toLocaleString()} tokens
-Limit: ${limit.limitValue.toLocaleString()} tokens
-Remaining: ${Math.max(0, limit.limitValue - totalTokens).toLocaleString()} tokens
-
-Please contact your administrator to increase the limit or wait for the usage to reset.`;
-          }
-
-          const refusalMessage = `${archestraMetadata}
-${contentMessage}`;
-
-          return [refusalMessage, contentMessage];
-        } else {
-          logger.info(
-            `[LimitValidation] Limit OK for ${entityType} ${entityId}: ${comparisonValue} < ${limit.limitValue}`,
-          );
-        }
-      }
-
-      logger.info(
-        `[LimitValidation] All ${limits.length} limits OK for ${entityType} ${entityId}`,
-      );
-      return null; // No limits exceeded for this entity
+      const defaultLimit =
+        params.defaultLimit !== undefined
+          ? params.defaultLimit
+          : ((params.environmentId
+              ? await EnvironmentDefaultUserLimitModel.findByEnvironmentId(
+                  params.environmentId,
+                )
+              : null) ??
+            (await EnvironmentDefaultUserLimitModel.findGlobal(
+              params.organizationId,
+            )));
+      if (!defaultLimit) return null;
+      if (!limitAppliesToModel({ ...params, models: defaultLimit.model }))
+        return null;
+      // An override counts only this environment; the global fallback counts
+      // the user's whole organization, preserving custom-user precedence.
+      const environmentId = defaultLimit.environmentId;
+      const usage = await getDefaultUserLimitUsage({
+        organizationId: params.organizationId,
+        userId: params.userId,
+        ...(environmentId ? { environmentId } : {}),
+        models: normalizeLimitModels(defaultLimit.model),
+        cleanupInterval: defaultLimit.cleanupInterval,
+      });
+      if (
+        !observeLimitCheck(
+          {
+            id: defaultLimit.id,
+            entityType: "user",
+            entityId: params.userId,
+            limitType: "token_cost",
+            limitValue: defaultLimit.limitValue,
+            cleanupInterval: defaultLimit.cleanupInterval,
+            source: "default_user",
+          },
+          usage.cost >= defaultLimit.limitValue,
+          false,
+          usage.cost,
+        )
+      )
+        return null;
+      return buildLimitViolationResponse({
+        source: "default_user",
+        entityType: environmentId ? "environment" : "user",
+        entityId: environmentId ?? params.userId,
+        entityName: await resolveLimitEntityName(
+          environmentId ? "environment" : "user",
+          environmentId ?? params.userId,
+        ),
+        limitValue: defaultLimit.limitValue,
+        comparisonValue: usage.cost,
+        limitDescription: "cost_dollars",
+        totalTokensIn: usage.tokensIn,
+        totalTokensOut: usage.tokensOut,
+        cleanupInterval: defaultLimit.cleanupInterval,
+        models: defaultLimit.model,
+      });
     } catch (error) {
       logger.error(
-        `[LimitValidation] Error checking ${entityType} limits for ${entityId}: ${error}`,
+        { error, params },
+        "[LimitValidation] Error checking default user limit",
       );
-      return null; // Allow request on error
+      throw error;
     }
   }
 }
 
-function buildOrganizationLimitScopeCondition(organizationId: string): SQL {
+const calendarCleanupIntervals = [
+  "calendar_day",
+  "calendar_week_sunday",
+  "calendar_week_monday",
+  "calendar_month",
+] as const satisfies readonly LimitCleanupInterval[];
+
+type CalendarLimitCleanupInterval = (typeof calendarCleanupIntervals)[number];
+
+/**
+ * Rows visible to an organization. `limits` has no organization column: a limit
+ * is scoped by the entity it targets, so membership is proven per entity type.
+ *
+ * @public — also used by the limit label model to scope its label vocabulary.
+ */
+export function buildOrganizationLimitScopeCondition(
+  organizationId: string,
+): SQL {
   return or(
     and(
       eq(schema.limitsTable.entityType, "organization"),
@@ -947,6 +2431,7 @@ function buildOrganizationLimitScopeCondition(organizationId: string): SQL {
         SELECT 1 FROM ${schema.agentsTable}
         WHERE ${schema.agentsTable.id}::text = ${schema.limitsTable.entityId}
           AND ${schema.agentsTable.organizationId} = ${organizationId}
+          AND ${schema.agentsTable.deletedAt} IS NULL
       )`,
     ),
     and(
@@ -965,7 +2450,642 @@ function buildOrganizationLimitScopeCondition(organizationId: string): SQL {
           AND ${schema.virtualApiKeysTable.organizationId} = ${organizationId}
       )`,
     ),
+    and(
+      eq(schema.limitsTable.entityType, "environment"),
+      sql`EXISTS (
+        SELECT 1 FROM ${schema.environmentsTable}
+        WHERE ${schema.environmentsTable.id}::text = ${schema.limitsTable.entityId}
+          AND ${schema.environmentsTable.organizationId} = ${organizationId}
+      )`,
+    ),
+    and(
+      eq(schema.limitsTable.entityType, "llm_oauth_client"),
+      sql`EXISTS (
+        SELECT 1 FROM ${schema.oauthClientsTable}
+        WHERE ${schema.oauthClientsTable.id} = ${schema.limitsTable.entityId}
+          AND ${llmOauthClientInOrganization(organizationId)}
+      )`,
+    ),
   ) as SQL;
+}
+
+/** LLM OAuth clients live in the shared `oauth_client` table, scoped by metadata. */
+function llmOauthClientInOrganization(organizationId: string): SQL {
+  return sql`(${schema.oauthClientsTable.metadata}->>'type' IN ('llm_oauth_client', 'managed_oauth_client')
+    AND ${schema.oauthClientsTable.metadata}->>'organizationId' = ${organizationId})`;
+}
+
+export function scopedCleanupDueCondition(): SQL<boolean> {
+  return and(
+    sql`${schema.limitsTable.limitType} NOT IN ('requests', 'tokens', 'requests_per_minute', 'tokens_per_minute')`,
+    sql`${schema.limitsTable.cleanupInterval} <> 'minute'`,
+    or(isNull(schema.limitsTable.lastCleanup), buildCleanupDueCondition()),
+  ) as SQL<boolean>;
+}
+
+function buildCleanupDueCondition(): SQL {
+  const intervalConditions = Object.entries(
+    LimitModel.rollingCleanupIntervalSqlLiterals,
+  ).map(([cleanupInterval, sqlLiteral]) =>
+    and(
+      eq(
+        schema.limitsTable.cleanupInterval,
+        cleanupInterval as LimitCleanupInterval,
+      ),
+      lt(schema.limitsTable.lastCleanup, sql`now() - ${sqlLiteral}::interval`),
+    ),
+  );
+
+  intervalConditions.push(
+    ...calendarCleanupIntervals.map((cleanupInterval) =>
+      and(
+        eq(schema.limitsTable.cleanupInterval, cleanupInterval),
+        lt(
+          schema.limitsTable.lastCleanup,
+          getCalendarPeriodStartSql(cleanupInterval),
+        ),
+      ),
+    ),
+  );
+
+  return or(...intervalConditions) as SQL;
+}
+
+function buildUsagePeriodStartCondition(
+  cleanupInterval: LimitCleanupInterval,
+  createdAt: AnyPgColumn = schema.interactionsTable.createdAt,
+): SQL {
+  const rollingInterval =
+    LimitModel.rollingCleanupIntervalSqlLiterals[
+      cleanupInterval as RollingLimitCleanupInterval
+    ];
+  if (rollingInterval) {
+    return sql`${createdAt} >= now() - ${rollingInterval}::interval`;
+  }
+
+  if (isCalendarCleanupInterval(cleanupInterval)) {
+    return sql`${createdAt} >= ${getCalendarPeriodStartSql(cleanupInterval)}`;
+  }
+
+  throw new Error(`Unsupported cleanup interval: ${cleanupInterval}`);
+}
+
+function getCalendarPeriodStartSql(
+  cleanupInterval: CalendarLimitCleanupInterval,
+): SQL {
+  switch (cleanupInterval) {
+    case "calendar_day":
+      return sql`date_trunc('day', now())`;
+    case "calendar_week_sunday":
+      return sql`date_trunc('day', now()) - (extract(dow from now()) * interval '1 day')`;
+    case "calendar_week_monday":
+      return sql`date_trunc('week', now())`;
+    case "calendar_month":
+      return sql`date_trunc('month', now())`;
+  }
+}
+
+function isCalendarCleanupInterval(
+  cleanupInterval: LimitCleanupInterval,
+): cleanupInterval is CalendarLimitCleanupInterval {
+  return calendarCleanupIntervals.includes(
+    cleanupInterval as CalendarLimitCleanupInterval,
+  );
+}
+
+// Pure cost computation from already-loaded pricing, so callers can share one
+// batched price lookup across many limits.
+/** Per-model usage and total spend of token_cost limits, in one read. */
+async function readLimitSpend(
+  limitIds: string[],
+): Promise<Map<string, LimitSpend & { modelUsage: ModelUsageBreakdown[] }>> {
+  const spend = new Map<
+    string,
+    LimitSpend & { modelUsage: ModelUsageBreakdown[] }
+  >(limitIds.map((id) => [id, { cost: 0, estimated: false, modelUsage: [] }]));
+  if (limitIds.length === 0) return spend;
+
+  const modelUsages = await db
+    .select(usageSelection)
+    .from(schema.limitModelUsageTable)
+    .leftJoin(schema.limitBillingUsageTable, billingJoin)
+    .where(inArray(schema.limitModelUsageTable.limitId, limitIds));
+  const pricing = await ModelModel.findByModelIdsOnly([
+    ...new Set(modelUsages.map((usage) => usage.model)),
+  ]);
+  const usagesByLimitId = new Map<string, LimitModelUsageRecord[]>();
+  for (const usage of modelUsages) {
+    const list = usagesByLimitId.get(usage.limitId) ?? [];
+    list.push(usage);
+    usagesByLimitId.set(usage.limitId, list);
+  }
+  for (const [limitId, usages] of usagesByLimitId) {
+    const { breakdown, cost, estimated } = computeModelUsageCosts(
+      usages,
+      pricing,
+    );
+    spend.set(limitId, { cost, estimated, modelUsage: breakdown });
+  }
+  return spend;
+}
+
+/** Older token rows have no receipt. Preserve known charges and flag missing
+ * rates as estimates without making historical usage block priced requests.
+ * This fallback is only for historical accounting, never request admission.
+ */
+function priceLegacyTokens(
+  inputTokens: number,
+  outputTokens: number,
+  pricing: ReturnType<typeof ModelModel.getEffectivePricing>,
+) {
+  return {
+    estimated:
+      (inputTokens > 0 && pricing.pricePerMillionInput === null) ||
+      (outputTokens > 0 && pricing.pricePerMillionOutput === null),
+    cost: priceTokens(
+      {
+        inputTokens,
+        outputTokens,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        cacheWrite1hTokens: 0,
+      },
+      {
+        input: pricing.pricePerMillionInput ?? "0",
+        output: pricing.pricePerMillionOutput ?? "0",
+        cacheRead: null,
+        cacheWrite: null,
+        cacheWrite1h: null,
+        source: pricing.source,
+      },
+    ),
+  };
+}
+
+function computeModelUsageCosts(
+  modelUsages: LimitModelUsageRecord[],
+  modelEntriesByModelId: Map<string, Model>,
+) {
+  let cost = "0.0000000000";
+  let tokensIn = 0;
+  let tokensOut = 0;
+  let estimated = false;
+  const breakdown = modelUsages.map((usage) => {
+    tokensIn += usage.currentUsageTokensIn;
+    tokensOut += usage.currentUsageTokensOut;
+    // Each settled request with an estimated charge adds one.
+    estimated ||= (usage.incomplete ?? 0) > 0;
+    const pricing = ModelModel.getEffectivePricing(
+      modelEntriesByModelId.get(usage.model) ?? null,
+      usage.model,
+    );
+    const legacy = priceLegacyTokens(
+      Math.max(0, usage.currentUsageTokensIn - (usage.coveredTokensIn ?? 0)),
+      Math.max(0, usage.currentUsageTokensOut - (usage.coveredTokensOut ?? 0)),
+      pricing,
+    );
+    estimated ||= legacy.estimated;
+    const modelCost = sumMoney([legacy.cost, usage.settledCost ?? "0"]);
+    cost = sumMoney([cost, modelCost]);
+    return {
+      model: usage.model,
+      tokensIn: usage.currentUsageTokensIn,
+      tokensOut: usage.currentUsageTokensOut,
+      cost: Number(modelCost),
+    };
+  });
+  return {
+    // Older releases recorded an unpriced request under a placeholder model
+    // with no cost; it only carries the estimated flag.
+    breakdown: breakdown.filter(
+      (item) => item.model !== RETIRED_INCOMPLETE_MARKER_MODEL,
+    ),
+    cost: Number(cost),
+    tokensIn,
+    tokensOut,
+    estimated,
+  };
+}
+
+const RETIRED_INCOMPLETE_MARKER_MODEL =
+  "urn:archestra:billing:incomplete:5707b463-67d0-4e54-a8f4-2c3897e186ba";
+
+async function getDefaultUserLimitUsage(params: {
+  organizationId: string;
+  userId: string;
+  models: string[] | null;
+  cleanupInterval: LimitCleanupInterval;
+  environmentId?: string | null;
+}) {
+  const conditions: SQL[] = [
+    eq(schema.interactionsTable.userId, params.userId),
+    // Subscription-billed traffic (e.g. Claude Pro/Max, ChatGPT Codex) costs
+    // the organization $0 and must not burn down default user limits — the
+    // same rule updateUsageAfterInteraction applies to explicit limits.
+    eq(schema.interactionsTable.billingMode, "metered"),
+    // Team-billed traffic is charged to the team, not to the caller.
+    isNull(schema.interactionsTable.billingTeamId),
+    buildUsagePeriodStartCondition(params.cleanupInterval),
+    buildAfterUsageResetCondition({
+      organizationId: params.organizationId,
+      userId: sql`${params.userId}`,
+      createdAt: schema.interactionsTable.createdAt,
+    }),
+    sql`NOT EXISTS (SELECT 1 FROM ${schema.interactionBillingTable} WHERE ${schema.interactionBillingTable.interactionId} = ${schema.interactionsTable.id} AND ${schema.interactionBillingTable.usage}->>'mode' = 'enforce')`,
+  ];
+
+  if (params.models && params.models.length > 0) {
+    conditions.push(
+      inArray(schema.interactionsTable.model, params.models) as SQL,
+    );
+  }
+
+  const selection = {
+    model: schema.interactionsTable.model,
+    costUnavailable: sql<boolean>`${schema.interactionsTable.response}->'__mediaUsage'->>'costAvailable' = 'false'`,
+    cost: schema.interactionsTable.cost,
+    inputTokens: schema.interactionsTable.inputTokens,
+    outputTokens: schema.interactionsTable.outputTokens,
+  };
+
+  // Environment-scoped usage filters on the environment snapshotted on the
+  // interaction at request time. An environment belongs to exactly one org, so
+  // this already scopes to the org without joining the agent — and, like the
+  // incremental environment counter, it must count usage even after the
+  // originating agent is deleted (no `notDeleted(agent)` join).
+  const interactions = params.environmentId
+    ? await db
+        .select(selection)
+        .from(schema.interactionsTable)
+        .where(
+          and(
+            ...conditions,
+            eq(schema.interactionsTable.environmentId, params.environmentId),
+          ),
+        )
+    : await db
+        .select(selection)
+        .from(schema.interactionsTable)
+        .innerJoin(
+          schema.agentsTable,
+          eq(schema.interactionsTable.profileId, schema.agentsTable.id),
+        )
+        .where(
+          and(
+            ...conditions,
+            eq(schema.agentsTable.organizationId, params.organizationId),
+            notDeleted(schema.agentsTable),
+          ),
+        );
+
+  const modelsMissingCost = Array.from(
+    new Set(
+      interactions
+        .filter(
+          (interaction) =>
+            interaction.cost === null &&
+            interaction.model !== null &&
+            !interaction.costUnavailable,
+        )
+        .map((interaction) => interaction.model as string),
+    ),
+  );
+  const modelEntriesByModelId =
+    await ModelModel.findByModelIdsOnly(modelsMissingCost);
+
+  const receipt = schema.interactionBillingTable;
+  const componentMatches = params.models?.length
+    ? or(
+        inArray(sql`component->>'model'`, params.models),
+        sql`jsonb_exists_any(component->'modelAliases', ARRAY[${sql.join(
+          params.models.map((model) => sql`${model}`),
+          sql`, `,
+        )}]::text[])`,
+      )
+    : sql`true`;
+  const [settled] = await db
+    .select({
+      cost: sql<string>`COALESCE(sum((component->>'cost')::numeric) FILTER (WHERE ${componentMatches}), 0)::text`,
+      tokensIn: sql<number>`COALESCE(sum((component->>'inputTokens')::bigint) FILTER (WHERE ${componentMatches}), 0)::bigint`,
+      tokensOut: sql<number>`COALESCE(sum((component->>'outputTokens')::bigint) FILTER (WHERE ${componentMatches}), 0)::bigint`,
+      estimated: sql<number>`count(*) FILTER (WHERE jsonb_exists_any(${receipt.usage}->'issues', ${PRICE_ISSUES_SQL}))::integer`,
+    })
+    .from(receipt)
+    .leftJoin(
+      sql`LATERAL jsonb_array_elements(${receipt.usage}->'components') AS component`,
+      sql`true`,
+    )
+    .where(
+      and(
+        eq(receipt.organizationId, params.organizationId),
+        eq(receipt.userId, params.userId),
+        eq(receipt.billingMode, "metered"),
+        isNull(receipt.billingTeamId),
+        sql`${receipt.usage}->>'mode' = 'enforce'`,
+        buildUsagePeriodStartCondition(
+          params.cleanupInterval,
+          receipt.createdAt,
+        ),
+        buildAfterUsageResetCondition({
+          organizationId: params.organizationId,
+          userId: sql`${params.userId}`,
+          createdAt: receipt.createdAt,
+        }),
+        params.environmentId
+          ? eq(receipt.environmentId, params.environmentId)
+          : undefined,
+      ),
+    );
+  let cost = "0.0000000000";
+  let estimated = Boolean(settled?.estimated);
+  let tokensIn = 0;
+  let tokensOut = 0;
+  for (const interaction of interactions) {
+    // Media with no cost is not counted, and no price would change that, so
+    // it is not an estimate either.
+    if (interaction.costUnavailable) continue;
+    const inputTokens = interaction.inputTokens ?? 0;
+    const outputTokens = interaction.outputTokens ?? 0;
+    tokensIn += inputTokens;
+    tokensOut += outputTokens;
+
+    if (interaction.cost !== null) {
+      cost = sumMoney([cost, interaction.cost]);
+      continue;
+    }
+
+    if (!interaction.model) {
+      continue;
+    }
+
+    const modelEntry = modelEntriesByModelId.get(interaction.model) ?? null;
+    const pricing = ModelModel.getEffectivePricing(
+      modelEntry,
+      interaction.model,
+    );
+    const legacy = priceLegacyTokens(inputTokens, outputTokens, pricing);
+    estimated ||= legacy.estimated;
+    cost = sumMoney([cost, legacy.cost]);
+  }
+  tokensIn += Number(settled?.tokensIn ?? 0);
+  tokensOut += Number(settled?.tokensOut ?? 0);
+  cost = sumMoney([cost, settled?.cost ?? "0"]);
+  return {
+    cost: Number(cost),
+    estimated,
+    tokensIn,
+    tokensOut,
+  };
+}
+
+/**
+ * Only spend after the user's last admin reset counts toward a default user
+ * limit. A user who was never reset has no marker, so nothing is excluded.
+ */
+function buildAfterUsageResetCondition(params: {
+  organizationId: string;
+  userId:
+    | SQL
+    | typeof schema.interactionsTable.userId
+    | typeof schema.interactionBillingTable.userId;
+  createdAt:
+    | typeof schema.interactionsTable.createdAt
+    | typeof schema.interactionBillingTable.createdAt;
+}): SQL {
+  const resets = schema.userLimitUsageResetsTable;
+  return sql`NOT EXISTS (SELECT 1 FROM ${resets} WHERE ${resets.organizationId} = ${params.organizationId} AND ${resets.userId} = ${params.userId} AND ${resets.resetAt} > ${params.createdAt})`;
+}
+
+// This query runs only after a budget rejection. A readable target is more
+// useful to the caller than a database ID, especially for team budgets.
+async function resolveLimitEntityName(
+  entityType: LimitEntityType,
+  entityId: string,
+): Promise<string | undefined> {
+  try {
+    return await readLimitEntityName(entityType, entityId);
+  } catch (error) {
+    logger.warn(
+      { error, entityType, entityId },
+      "Could not resolve the name of a limit target",
+    );
+    return undefined;
+  }
+}
+
+async function readLimitEntityName(
+  entityType: LimitEntityType,
+  entityId: string,
+): Promise<string | undefined> {
+  switch (entityType) {
+    case "team":
+      return (
+        await db
+          .select({ name: schema.teamsTable.name })
+          .from(schema.teamsTable)
+          .where(eq(schema.teamsTable.id, entityId))
+          .limit(1)
+      )[0]?.name;
+    case "virtual_key":
+      return (
+        await db
+          .select({ name: schema.virtualApiKeysTable.name })
+          .from(schema.virtualApiKeysTable)
+          .where(eq(schema.virtualApiKeysTable.id, entityId))
+          .limit(1)
+      )[0]?.name;
+    case "llm_oauth_client":
+      return (
+        (
+          await db
+            .select({ name: schema.oauthClientsTable.name })
+            .from(schema.oauthClientsTable)
+            .where(eq(schema.oauthClientsTable.id, entityId))
+            .limit(1)
+        )[0]?.name ?? undefined
+      );
+    case "user":
+      return (
+        await db
+          .select({ email: schema.usersTable.email })
+          .from(schema.usersTable)
+          .where(eq(schema.usersTable.id, entityId))
+          .limit(1)
+      )[0]?.email;
+    case "agent":
+      return (
+        await db
+          .select({ name: schema.agentsTable.name })
+          .from(schema.agentsTable)
+          .where(eq(schema.agentsTable.id, entityId))
+          .limit(1)
+      )[0]?.name;
+    case "environment":
+      return (
+        await db
+          .select({ name: schema.environmentsTable.name })
+          .from(schema.environmentsTable)
+          .where(eq(schema.environmentsTable.id, entityId))
+          .limit(1)
+      )[0]?.name;
+    case "organization":
+      return (
+        await db
+          .select({ name: schema.organizationsTable.name })
+          .from(schema.organizationsTable)
+          .where(eq(schema.organizationsTable.id, entityId))
+          .limit(1)
+      )[0]?.name;
+  }
+}
+
+function buildLimitViolationResponse(params: {
+  source: "explicit" | "default_user";
+  entityType: LimitEntityType;
+  entityId: string;
+  entityName?: string;
+  limitValue: number;
+  comparisonValue: number;
+  limitDescription: "tokens" | "cost_dollars";
+  totalTokensIn: number;
+  totalTokensOut: number;
+  cleanupInterval?: LimitCleanupInterval | null;
+  models?: string[] | null;
+}): LimitViolationResponse {
+  const entityLabel = params.entityType.replace(/_/g, " ");
+  const identityLine = params.entityName
+    ? `Affected ${entityLabel}: ${JSON.stringify(params.entityName)}.`
+    : `Affected scope: ${entityLabel}.`;
+  const scopeLabel =
+    params.source === "default_user"
+      ? "default user"
+      : formatLimitEntityType(params.entityType);
+  const modelScope = describeLimitModelScope(params.models);
+  const resetWindow = describeLimitResetWindow(params.cleanupInterval);
+  const ruleLine = `Rule: ${scopeLabel} cost limit ($${params.limitValue.toFixed(2)}), applied to ${modelScope}${
+    resetWindow ? `, resets ${resetWindow}` : ""
+  }.`;
+  const totalTokens = params.totalTokensIn + params.totalTokensOut;
+  const remaining = Math.max(0, params.limitValue - params.comparisonValue);
+  // Human-readable description of the exact rule that fired, so both the LLM
+  // (via the metadata block) and the end user (via the content message) can
+  // tell *which* Archestra limit blocked them rather than guessing.
+  // Keep the existing machine-readable target in the LLM metadata; the
+  // end-user content below identifies the target by its readable name.
+  const archestraMetadata = `
+<archestra-limit-type>token_cost</archestra-limit-type>
+<archestra-limit-entity-type>${params.entityType}</archestra-limit-entity-type>
+<archestra-limit-entity-id>${params.entityId}</archestra-limit-entity-id>
+<archestra-limit-source>${params.source}</archestra-limit-source>
+<archestra-limit-model-scope>${modelScope}</archestra-limit-model-scope>
+<archestra-limit-reset-window>${resetWindow ?? "n/a"}</archestra-limit-reset-window>
+<archestra-limit-current-usage>${totalTokens}</archestra-limit-current-usage>
+<archestra-limit-value>${params.limitValue}</archestra-limit-value>
+<archestra-limit-remaining>${remaining}</archestra-limit-remaining>`;
+
+  // Lead with explicit platform attribution: clients were framing this as a
+  // provider rate limit ("not your usage limit"), so the first line must make
+  // clear that this platform enforced it — under the deployment's own brand,
+  // since this string is returned straight to the end user.
+  const header = `This request was blocked by ${archestraMcpBranding.appName} (not the AI provider): the ${scopeLabel} cost limit has been reached.`;
+  const footer = resetWindow
+    ? `Contact your administrator to raise the limit, or wait for the usage to reset (${resetWindow}).`
+    : "Contact your administrator to raise the limit, or wait for the usage to reset.";
+
+  const usageBlock =
+    params.limitDescription === "cost_dollars"
+      ? `Current usage: $${params.comparisonValue.toFixed(2)}
+Limit: $${params.limitValue.toFixed(2)}
+Remaining: $${remaining.toFixed(2)}`
+      : `Current usage: ${totalTokens.toLocaleString()} tokens
+Limit: ${params.limitValue.toLocaleString()} tokens
+Remaining: ${Math.max(0, params.limitValue - totalTokens).toLocaleString()} tokens`;
+
+  const contentMessage = `
+${header}
+
+${ruleLine}
+${identityLine}
+
+${usageBlock}
+
+${footer}`;
+
+  return [
+    `${archestraMetadata}\n${contentMessage}`,
+    contentMessage,
+    {
+      entityType: params.entityType,
+      limitType: "token_cost",
+      entityName: params.entityName,
+      source: params.source,
+    },
+  ];
+}
+
+/** Render a limit's entity type for human display, e.g. "virtual_key" -> "virtual key-level". */
+function formatLimitEntityType(entityType: LimitEntityType): string {
+  if (entityType === "llm_oauth_client") return "OAuth client-level";
+  return `${entityType.replace(/_/g, " ")}-level`;
+}
+
+/** Describe which models a limit covers, e.g. "all models" or "models gpt-4o, claude-3-5-sonnet". */
+function describeLimitModelScope(models?: string[] | null): string {
+  const normalized = normalizeLimitModels(models);
+  if (!normalized) {
+    return "all models";
+  }
+  return normalized.length === 1
+    ? `model ${normalized[0]}`
+    : `models ${normalized.join(", ")}`;
+}
+
+/** Turn a cleanup interval into a human reset cadence, e.g. "every 24 hours", "monthly (calendar month)". */
+function describeLimitResetWindow(
+  interval?: LimitCleanupInterval | null,
+): string | null {
+  switch (interval) {
+    case "1h":
+      return "every hour";
+    case "12h":
+      return "every 12 hours";
+    case "24h":
+      return "every 24 hours";
+    case "1w":
+      return "every week";
+    case "1m":
+      return "every month";
+    case "calendar_day":
+      return "daily (calendar day)";
+    case "calendar_week_sunday":
+      return "weekly (calendar week, Sunday start)";
+    case "calendar_week_monday":
+      return "weekly (calendar week, Monday start)";
+    case "calendar_month":
+      return "monthly (calendar month)";
+    default:
+      return null;
+  }
+}
+
+function limitAppliesToModel(
+  params: LimitModelApplicability & { models?: string[] | null },
+): boolean {
+  if (!params.models?.length) return true;
+  if (params.model)
+    return (
+      params.models.includes(params.model) ||
+      !!params.modelAliases?.some((alias) => params.models?.includes(alias))
+    );
+  return !params.deferModelScopedLimits;
+}
+
+function normalizeLimitModels(models: string[] | null | undefined) {
+  if (!models || models.length === 0) {
+    return null;
+  }
+
+  return models;
 }
 
 export default LimitModel;

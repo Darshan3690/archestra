@@ -1,0 +1,48 @@
+{
+  "name": "janswist__mcp-dexscreener",
+  "display_name": "mcp-dexscreener",
+  "description": "Dexscreener API's MCP server - let your AI agent check any on-chain price using Dexscreener's free and open API",
+  "author": {
+    "name": "janswist"
+  },
+  "server": {
+    "command": "node",
+    "args": ["${__dirname}/index.js"],
+    "env": {},
+    "type": "local"
+  },
+  "tools": [],
+  "prompts": [],
+  "keywords": [],
+  "user_config": {},
+  "readme": "# Dexscreener MCP server\n\nBasic MCP server for Dexscreener API based on their documentation (as of April 4th 2025): https://docs.dexscreener.com/api/reference\n\n## Project setup\n\nInstall all the dependencies\n```\nnpm run install\n```\n\nIf you are using Claude Desktop, after pulling the code open the config file `claude_desktop_config.json` in VSCode:\n- on MacOS:\n\n  ```code ~/Library/Application\\ Support/Claude/claude_desktop_config.json```\n\n- on Windows:\n\n  ```code $env:AppData\\Claude\\claude_desktop_config.json```\n- more info: https://modelcontextprotocol.io/quickstart/server\n\nIn `claude_desktop_config.json` put `dexscreener` object:\n```json\n{\n  \"mcpServers\": {\n    \"dexscreener\": {\n      \"command\": \"node\",\n      \"args\": [\n        \"/ABSOLUTE/PATH/TO/PARENT/FOLDER/index.js\"\n      ]\n    }\n  }\n}\n\n```\n\n## Running the app\n\nYou can use [Inspector](https://modelcontextprotocol.io/docs/tools/inspector) to test the MCP server without using Claude Desktop - both for SDTIO version (default) and SSE version `index-sse.js` (server-sent events - can be hosted on remote server).",
+  "category": "Aggregators",
+  "archestra_config": {
+    "client_config_permutations": {
+      "dexscreener-configured": {
+        "command": "node",
+        "args": ["/ABSOLUTE/PATH/TO/PARENT/FOLDER/index.js"],
+        "env": {}
+      }
+    },
+    "oauth": {
+      "provider": null,
+      "required": false
+    },
+    "works_in_archestra": false
+  },
+  "github_info": {
+    "owner": "janswist",
+    "repo": "mcp-dexscreener",
+    "url": "https://github.com/janswist/mcp-dexscreener",
+    "name": "mcp-dexscreener",
+    "path": null,
+    "stars": 9,
+    "contributors": 1,
+    "issues": 0,
+    "releases": false,
+    "ci_cd": false,
+    "latest_commit_hash": "e19f0327dbb3bdf8c22e291684bccbc0c0f4475c"
+  },
+  "programming_language": "JavaScript"
+}

@@ -1,0 +1,30 @@
+import { createSelectSchema } from "drizzle-zod";
+import type { z } from "zod";
+import { schema } from "@/database/schema";
+import { SkillSandboxFileStorageProviderSchema } from "./skill-sandbox";
+
+export const SelectPersistedFileSchema = createSelectSchema(schema.filesTable, {
+  storageProvider: SkillSandboxFileStorageProviderSchema,
+});
+
+/**
+ * One persistent My Files row (the `files` table), with its author as one
+ * principal id: a person's user id, or `service-account:<id>`.
+ */
+export type PersistedFile = Omit<
+  z.infer<typeof SelectPersistedFileSchema>,
+  "userId" | "serviceAccountId"
+> & { userId: string };
+
+/**
+ * Minimal row shape the sandbox byte-storage router needs to read or delete a
+ * stored blob. `files` rows carry `storageProvider`/`objectKey`; upload rows
+ * (`skill_sandbox_files`, always Postgres bytes) omit them — a missing
+ * provider is treated as `db`.
+ */
+export type StoredBlobRow = {
+  id: string;
+  data: Buffer | null;
+  storageProvider?: z.infer<typeof SkillSandboxFileStorageProviderSchema>;
+  objectKey?: string | null;
+};

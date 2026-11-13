@@ -1,10 +1,11 @@
 {
-  "extends": "./tsconfig.json",
+  "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "paths": {
       "@/*": ["./src/*"],
-      "@shared": ["../shared/index.ts"],
-      "@shared/*": ["../shared/*"]
+      "@drizzle-migration-linter": ["../tools/drizzle-migration-linter/src/index.ts"],
+      "@archestra/shared": ["../shared/index.ts"],
+      "@archestra/shared/*": ["../shared/*"]
     }
   },
   "include": ["src/**/*"],

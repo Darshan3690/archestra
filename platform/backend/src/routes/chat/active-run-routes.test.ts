@@ -1,0 +1,603 @@
+import { eq } from "drizzle-orm";
+import { vi } from "vitest";
+import db, { schema } from "@/database";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { ConversationModel, MessageModel } from "@/models";
+import ActiveChatRunModel from "@/models/chat-active-run";
+import { activeChatRunService } from "@/services/active-chat-run";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import { shareForTest } from "@/test/sharing";
+import type { User } from "@/types";
+
+describe("chat active-run routes", () => {
+  let app: FastifyInstanceWithZod;
+  let user: User;
+  let organizationId: string;
+  let conversationId: string;
+
+  beforeEach(
+    async ({
+      makeAgent,
+      makeConversation,
+      makeOrganization,
+      makeUser,
+      makeMember,
+    }) => {
+      user = await makeUser();
+      const organization = await makeOrganization();
+      organizationId = organization.id;
+      await makeMember(user.id, organizationId);
+      const agent = await makeAgent({ organizationId });
+      const conversation = await makeConversation(agent.id, {
+        userId: user.id,
+        organizationId,
+      });
+      conversationId = conversation.id;
+
+      app = createFastifyInstance();
+      app.addHook("onRequest", async (request) => {
+        (request as typeof request & { user: User }).user = user;
+        (
+          request as typeof request & {
+            organizationId: string;
+          }
+        ).organizationId = organizationId;
+      });
+
+      const { default: chatRoutes } = await import("./routes");
+      await app.register(chatRoutes);
+    },
+  );
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    await app.close();
+  });
+
+  test("returns 204 when no active run exists", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversationId}/active-run`,
+    });
+
+    expect(response.statusCode).toBe(204);
+  });
+
+  test("authorizes a reconnect without loading the transcript, and refuses another user's chat", async ({
+    makeUser,
+    makeMember,
+  }) => {
+    // findAccessibleById reads every message; reconnecting only needs access.
+    const transcriptRead = vi.spyOn(ConversationModel, "findAccessibleById");
+    const own = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversationId}/active-run`,
+    });
+    expect(own.statusCode).toBe(204);
+    expect(transcriptRead).not.toHaveBeenCalled();
+
+    const owner = user;
+    user = await makeUser();
+    await makeMember(user.id, organizationId);
+    const other = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversationId}/active-run`,
+    });
+    user = owner;
+    expect(other.statusCode).toBe(404);
+  });
+
+  test("duplicate submit returns 409 when the conversation already has a running active run", async () => {
+    await ActiveChatRunModel.create({
+      conversationId,
+      userId: user.id,
+      organizationId,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "hello" }],
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.message).toContain("active response");
+    await expect(
+      MessageModel.findByConversation(conversationId),
+    ).resolves.toHaveLength(0);
+  });
+
+  test("stop waits for the accessible running run to become terminal", async () => {
+    const run = await ActiveChatRunModel.create({
+      conversationId,
+      userId: user.id,
+      organizationId,
+    });
+
+    let responseSettled = false;
+    const responsePromise = app
+      .inject({
+        method: "POST",
+        url: `/api/chat/conversations/${conversationId}/stop`,
+      })
+      .then((response) => {
+        responseSettled = true;
+        return response;
+      });
+
+    await waitForStopRequest(run?.id ?? "");
+    expect(responseSettled).toBe(false);
+
+    await activeChatRunService.markTerminal({
+      runId: run?.id ?? "",
+      status: "cancelled",
+    });
+
+    const response = await responsePromise;
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ stopped: true });
+    expect((await ActiveChatRunModel.findById(run?.id ?? ""))?.status).toBe(
+      "cancelled",
+    );
+  });
+
+  test("stop on a run whose owner died resolves, fails the run, and unblocks the next message", async () => {
+    const run = await ActiveChatRunModel.create({
+      conversationId,
+      userId: user.id,
+      organizationId,
+    });
+    const runId = run?.id ?? "";
+    await ActiveChatRunModel.appendEvents({
+      runId,
+      seq: 1,
+      payloads: [{ type: "start-step" }, { type: "reasoning-start", id: "r1" }],
+    });
+    // The owning process was killed: its liveness touches stopped minutes ago.
+    await db
+      .update(schema.chatActiveRunsTable)
+      .set({ updatedAt: new Date(Date.now() - 5 * 60 * 1000) })
+      .where(eq(schema.chatActiveRunsTable.id, runId));
+
+    const stop = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${conversationId}/stop`,
+    });
+
+    expect(stop.statusCode).toBe(200);
+    expect(stop.json()).toEqual({ stopped: true });
+    expect((await ActiveChatRunModel.findById(runId))?.status).toBe("failed");
+
+    const replay = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversationId}/active-run`,
+    });
+    expect(replay.statusCode).toBe(200);
+    expect(readSsePayloads(replay.body)).toEqual([
+      { type: "start-step" },
+      { type: "reasoning-start", id: "r1" },
+    ]);
+
+    const next = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: {
+        id: conversationId,
+        messages: [
+          {
+            id: "msg-1",
+            role: "user",
+            parts: [{ type: "text", text: "hello" }],
+          },
+        ],
+      },
+    });
+    // Past the one-running-run guard: the new turn got its own run row.
+    expect(next.statusCode).not.toBe(409);
+    const runs = await db
+      .select({ id: schema.chatActiveRunsTable.id })
+      .from(schema.chatActiveRunsTable)
+      .where(eq(schema.chatActiveRunsTable.conversationId, conversationId));
+    expect(runs).toHaveLength(2);
+  });
+
+  test("stop returns 404 for an inaccessible conversation and does not mutate a running run", async ({
+    makeAgent,
+    makeConversation,
+    makeUser,
+  }) => {
+    const otherUser = await makeUser();
+    const agent = await makeAgent({ organizationId });
+    const inaccessibleConversation = await makeConversation(agent.id, {
+      userId: otherUser.id,
+      organizationId,
+    });
+    await ActiveChatRunModel.create({
+      conversationId: inaccessibleConversation.id,
+      userId: otherUser.id,
+      organizationId,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${inaccessibleConversation.id}/stop`,
+    });
+
+    expect(response.statusCode).toBe(404);
+    const run = await ActiveChatRunModel.findRunningByConversation(
+      inaccessibleConversation.id,
+    );
+    expect(run?.stopRequestedAt).toBeNull();
+  });
+
+  test("stop returns 404 when a share-only user tries to stop the owner's stream", async ({
+    makeMember,
+    makeUser,
+  }) => {
+    const owner = user;
+    await makeMember(owner.id, organizationId);
+    const sharee = await makeUser();
+    await makeMember(sharee.id, organizationId);
+
+    await shareForTest({
+      resource: "conversation",
+      scope: conversationId,
+      organizationId,
+      visibility: "user",
+      teamIds: [],
+      userIds: [sharee.id],
+    });
+    await ActiveChatRunModel.create({
+      conversationId,
+      userId: owner.id,
+      organizationId,
+    });
+
+    // Guard against a silent test-setup regression: if the share stops granting
+    // read access, the assertion below would pass for the wrong reason.
+    const accessibleAsSharee = await ConversationModel.findAccessibleById({
+      id: conversationId,
+      userId: sharee.id,
+      organizationId,
+      // Access here is via the conversation share, which is not gated by
+      // project:read-all; the predicate is never reached.
+      canReadOthersViaProject: () => Promise.resolve(true),
+    });
+    expect(accessibleAsSharee).not.toBeNull();
+
+    user = sharee;
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${conversationId}/stop`,
+    });
+
+    expect(response.statusCode).toBe(404);
+    const run =
+      await ActiveChatRunModel.findRunningByConversation(conversationId);
+    expect(run?.stopRequestedAt).toBeNull();
+  });
+
+  test("stop returns 404 for a cross-organization conversation and does not mutate a running run", async ({
+    makeAgent,
+    makeConversation,
+    makeOrganization,
+  }) => {
+    const otherOrganization = await makeOrganization();
+    const agent = await makeAgent({ organizationId: otherOrganization.id });
+    const crossOrganizationConversation = await makeConversation(agent.id, {
+      userId: user.id,
+      organizationId: otherOrganization.id,
+    });
+    await ActiveChatRunModel.create({
+      conversationId: crossOrganizationConversation.id,
+      userId: user.id,
+      organizationId: otherOrganization.id,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${crossOrganizationConversation.id}/stop`,
+    });
+
+    expect(response.statusCode).toBe(404);
+    const run = await ActiveChatRunModel.findRunningByConversation(
+      crossOrganizationConversation.id,
+    );
+    expect(run?.stopRequestedAt).toBeNull();
+  });
+
+  test("active-run replays existing events and closes after terminal status", async () => {
+    const run = await ActiveChatRunModel.create({
+      conversationId,
+      userId: user.id,
+      organizationId,
+    });
+    await ActiveChatRunModel.appendEvents({
+      runId: run?.id ?? "",
+      seq: 1,
+      payloads: [
+        { type: "start" },
+        { type: "text-start", id: "text-1" },
+        { type: "text-delta", id: "text-1", delta: "hello" },
+      ],
+    });
+    await ActiveChatRunModel.markTerminal({
+      runId: run?.id ?? "",
+      status: "completed",
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversationId}/active-run`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(readSsePayloads(response.body)).toContainEqual({ type: "start" });
+    expect(readSsePayloads(response.body)).toContainEqual({
+      type: "text-delta",
+      id: "text-1",
+      delta: "hello",
+    });
+  });
+
+  test("active-run does not replay a recently cancelled run (returns 204)", async () => {
+    const run = await ActiveChatRunModel.create({
+      conversationId,
+      userId: user.id,
+      organizationId,
+    });
+    // A cancelled run mid-tool-call leaves a dangling tool part; replaying it
+    // would resume the client into a stream with no result. The user stopped
+    // it, so there is nothing to deliver — the conversation refetch owns the
+    // outcome. Even within the grace window it must not be replayable.
+    await ActiveChatRunModel.appendEvents({
+      runId: run?.id ?? "",
+      seq: 1,
+      payloads: [
+        { type: "start" },
+        {
+          type: "tool-input-available",
+          toolCallId: "call-1",
+          toolName: "slow_operation",
+          input: {},
+        },
+      ],
+    });
+    await ActiveChatRunModel.markTerminal({
+      runId: run?.id ?? "",
+      status: "cancelled",
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversationId}/active-run`,
+    });
+
+    expect(response.statusCode).toBe(204);
+  });
+
+  test("active-run does not fall through to an older completed run when the latest run was cancelled (returns 204)", async () => {
+    // Turn 1 completed normally; both runs are within the grace window. Only the
+    // latest run is reconnectable, so a cancelled turn 2 must not be stood in
+    // for by turn 1's still-in-grace completed run.
+    const completedRun = await ActiveChatRunModel.create({
+      conversationId,
+      userId: user.id,
+      organizationId,
+    });
+    await ActiveChatRunModel.appendEvents({
+      runId: completedRun?.id ?? "",
+      seq: 1,
+      payloads: [
+        { type: "start" },
+        { type: "text-start", id: "text-1" },
+        { type: "text-delta", id: "text-1", delta: "hello" },
+      ],
+    });
+    await ActiveChatRunModel.markTerminal({
+      runId: completedRun?.id ?? "",
+      status: "completed",
+    });
+
+    const cancelledRun = await ActiveChatRunModel.create({
+      conversationId,
+      userId: user.id,
+      organizationId,
+    });
+    await ActiveChatRunModel.markTerminal({
+      runId: cancelledRun?.id ?? "",
+      status: "cancelled",
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversationId}/active-run`,
+    });
+
+    expect(response.statusCode).toBe(204);
+  });
+
+  test("active-run emits transport heartbeats while a quiet run waits, without persisting them", async () => {
+    const run = await ActiveChatRunModel.create({
+      conversationId,
+      userId: user.id,
+      organizationId,
+    });
+    const runId = run?.id ?? "";
+    await app.ready();
+    // Only the heartbeat clock is virtual; database polling remains real.
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const responsePromise = app
+      .inject({
+        method: "GET",
+        url: `/api/chat/conversations/${conversationId}/active-run`,
+      })
+      .then((response) => response);
+
+    try {
+      await vi.waitFor(() => expect(vi.getTimerCount()).toBe(1));
+      await vi.advanceTimersByTimeAsync(45000);
+      await ActiveChatRunModel.appendEvents({
+        runId,
+        seq: 1,
+        payloads: [{ type: "start" }, { type: "finish", finishReason: "stop" }],
+      });
+    } finally {
+      await activeChatRunService.markTerminal({ runId, status: "completed" });
+    }
+    const response = await responsePromise;
+    const payloads = readSsePayloads(response.body);
+    expect(response.statusCode).toBe(200);
+    expect(
+      payloads.filter(
+        (payload) => (payload as { type: string }).type === "data-heartbeat",
+      ),
+    ).toHaveLength(9);
+    expect(payloads.slice(-2)).toEqual([
+      { type: "start" },
+      { type: "finish", finishReason: "stop" },
+    ]);
+    expect(
+      (
+        await ActiveChatRunModel.readStatusAndEventsAfter({ runId, seq: 0 })
+      )?.events.flatMap((event) => event.payloads),
+    ).toEqual([{ type: "start" }, { type: "finish", finishReason: "stop" }]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test("active-run streams later database events before closing", async () => {
+    const run = await ActiveChatRunModel.create({
+      conversationId,
+      userId: user.id,
+      organizationId,
+    });
+
+    const responsePromise = app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversationId}/active-run`,
+    });
+
+    setTimeout(() => {
+      void (async () => {
+        await ActiveChatRunModel.appendEvents({
+          runId: run?.id ?? "",
+          seq: 1,
+          payloads: [{ type: "start" }],
+        });
+        await ActiveChatRunModel.markTerminal({
+          runId: run?.id ?? "",
+          status: "completed",
+        });
+      })();
+    }, 20);
+
+    const response = await responsePromise;
+
+    expect(response.statusCode).toBe(200);
+    expect(readSsePayloads(response.body)).toContainEqual({ type: "start" });
+  });
+
+  test("DELETE hides a conversation with a running active run and asks that run to stop", async () => {
+    const run = await ActiveChatRunModel.create({
+      conversationId,
+      userId: user.id,
+      organizationId,
+    });
+
+    const response = await app.inject({
+      method: "DELETE",
+      url: `/api/chat/conversations/${conversationId}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ success: true });
+    expect(
+      await ConversationModel.findById({
+        id: conversationId,
+        userId: user.id,
+        organizationId,
+      }),
+    ).toBeNull();
+
+    // The run row survives the soft delete — nothing cascades it away — so the
+    // delete asks it to stop instead, and the stream aborts on stopRequestedAt.
+    // Its events stay on disk, which is what makes the delete reversible.
+    const afterDelete = await ActiveChatRunModel.findById(run?.id ?? "");
+    expect(afterDelete).not.toBeNull();
+    expect(afterDelete?.status).toBe("running");
+    expect(afterDelete?.stopRequestedAt).not.toBeNull();
+  });
+
+  test("DELETE of an inaccessible conversation does not delete or stop another user's running run", async ({
+    makeAgent,
+    makeConversation,
+    makeUser,
+  }) => {
+    const otherUser = await makeUser();
+    const agent = await makeAgent({ organizationId });
+    const inaccessibleConversation = await makeConversation(agent.id, {
+      userId: otherUser.id,
+      organizationId,
+    });
+    const otherRun = await ActiveChatRunModel.create({
+      conversationId: inaccessibleConversation.id,
+      userId: otherUser.id,
+      organizationId,
+    });
+
+    const response = await app.inject({
+      method: "DELETE",
+      url: `/api/chat/conversations/${inaccessibleConversation.id}`,
+    });
+
+    // The owner-scoped delete is a no-op for a conversation this user does not
+    // own, and capturing the run to wake is gated on that same lookup, so the
+    // other user's conversation and running run are left fully intact. The 200
+    // reflects DELETE's existing idempotent contract (unchanged by this fix).
+    expect(response.statusCode).toBe(200);
+    expect(
+      await ConversationModel.findById({
+        id: inaccessibleConversation.id,
+        userId: otherUser.id,
+        organizationId,
+      }),
+    ).not.toBeNull();
+    const run = await ActiveChatRunModel.findRunningByConversation(
+      inaccessibleConversation.id,
+    );
+    expect(run?.id).toBe(otherRun?.id);
+    expect(run?.stopRequestedAt).toBeNull();
+  });
+});
+
+function readSsePayloads(body: string): unknown[] {
+  return body
+    .split("\n\n")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.startsWith("data: "))
+    .map((entry) => entry.slice("data: ".length))
+    .filter((entry) => entry !== "[DONE]")
+    .map((entry) => JSON.parse(entry));
+}
+
+async function waitForStopRequest(runId: string): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const run = await ActiveChatRunModel.findById(runId);
+    if (run?.stopRequestedAt) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  throw new Error("Active chat run did not record the Stop request");
+}

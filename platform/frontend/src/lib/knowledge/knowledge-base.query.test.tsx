@@ -1,26 +1,13 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useOrganization } from "@/lib/organization.query";
 
 let mockOrganization: Record<string, unknown> | null = null;
 
-vi.mock("@/lib/organization.query", () => ({
-  useOrganization: () => ({
-    data: mockOrganization,
-    isPending: false,
-  }),
-}));
+vi.mock("@/lib/organization.query");
 
-vi.mock("@/lib/clients/auth/auth-client", () => ({
-  authClient: {
-    useSession: vi.fn().mockReturnValue({
-      data: {
-        user: { id: "test-user", email: "test@example.com" },
-        session: { id: "test-session" },
-      },
-    }),
-  },
-}));
+vi.mock("@/lib/clients/auth/auth-client");
 
 import {
   useIsKnowledgeBaseConfigured,
@@ -39,6 +26,13 @@ const createWrapper = () => {
 beforeEach(() => {
   vi.clearAllMocks();
   mockOrganization = null;
+  vi.mocked(useOrganization).mockImplementation(
+    () =>
+      ({
+        data: mockOrganization,
+        isPending: false,
+      }) as unknown as ReturnType<typeof useOrganization>,
+  );
 });
 
 describe("useIsKnowledgeBaseConfigured", () => {
@@ -63,7 +57,9 @@ describe("useIsKnowledgeBaseConfigured", () => {
     expect(result.current).toBe(false);
   });
 
-  it("returns false when reranker API key is missing", () => {
+  it("returns true without a reranker — reranking is optional", () => {
+    // The backend query path skips reranking when unconfigured, so a missing
+    // reranker must not lock users out of knowledge bases.
     mockOrganization = {
       embeddingChatApiKeyId: "key-1",
       embeddingModel: "text-embedding-3-small",
@@ -73,7 +69,7 @@ describe("useIsKnowledgeBaseConfigured", () => {
     const { result } = renderHook(() => useIsKnowledgeBaseConfigured(), {
       wrapper: createWrapper(),
     });
-    expect(result.current).toBe(false);
+    expect(result.current).toBe(true);
   });
 
   it("returns false when both embedding and reranker are missing", () => {

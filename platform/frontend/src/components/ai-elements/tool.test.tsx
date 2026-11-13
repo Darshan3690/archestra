@@ -28,9 +28,6 @@ describe("Tool copy actions", () => {
 
     render(<ToolInput input={{ city: "Toronto", limit: 5 }} />);
 
-    // Expand the collapsible to reveal the copy button
-    await user.click(screen.getByText("Parameters"));
-
     await user.click(screen.getByRole("button", { name: "Copy to clipboard" }));
 
     expect(writeText).toHaveBeenCalledWith(
@@ -53,6 +50,33 @@ describe("Tool copy actions", () => {
     );
   });
 
+  it("renders a multi-line string parameter as its own block with the raw value", async () => {
+    mockUseTheme.mockReturnValue({ resolvedTheme: "light" });
+    const user = userEvent.setup();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    mockClipboard(writeText);
+
+    render(<ToolInput input={{ command: "echo hi\necho bye", cwd: "/tmp" }} />);
+
+    // The raw multiline value is present immediately, even before the lazy
+    // highlighter loads and splits the text into separate line elements.
+    const command = screen.getAllByRole("region", {
+      name: "Code sample, text",
+    })[0];
+    expect(command.querySelector("code")?.textContent).toBe(
+      "echo hi\necho bye",
+    );
+    expect(screen.queryByText(/\\n/)).not.toBeInTheDocument();
+
+    // the field copy button copies the raw string, not JSON
+    const copyButtons = screen.getAllByRole("button", {
+      name: "Copy to clipboard",
+    });
+    await user.click(copyButtons[0]);
+
+    expect(writeText).toHaveBeenCalledWith("echo hi\necho bye");
+  });
+
   it("renders MCP tool output using content instead of dumping rawContent metadata", async () => {
     mockUseTheme.mockReturnValue({ resolvedTheme: "light" });
     const user = userEvent.setup();
@@ -63,12 +87,6 @@ describe("Tool copy actions", () => {
       <ToolOutput
         output={{
           content: "ARCH_TEST = asdfasdfadsf",
-          unsafeContextBoundary: {
-            kind: "tool_result",
-            reason: "tool_result_marked_untrusted",
-            toolCallId: "call-1",
-            toolName: "test_tool",
-          },
           rawContent: [{ type: "text", text: "ARCH_TEST = asdfasdfadsf" }],
           _meta: {
             ignored: true,

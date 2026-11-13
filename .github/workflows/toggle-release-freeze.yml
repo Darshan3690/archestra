@@ -21,17 +21,21 @@ concurrency:
 jobs:
   toggle-release-freeze:
     name: Toggle Release Freeze
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
+    # The release-freeze app key lives only in this environment (main).
+    environment:
+      name: release-freeze
+      deployment: false # A secrets and branch gate; nothing is deployed.
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1
 
       - name: Generate a token
         id: generate-token
-        uses: ./.github/actions/generate-release-token
+        uses: archestra-ai/.github/actions/github-app-token@c3001f82a468e05482bd7c8cd08ff97f94e80d2e # v1.14.0
         with:
           app-id: ${{ secrets.ARCHESTRA_RELEASE_FREEZE_CHECKER_GITHUB_APP_ID }}
           private-key: ${{ secrets.ARCHESTRA_RELEASE_FREEZE_CHECKER_GITHUB_APP_PRIVATE_KEY }}
@@ -43,16 +47,8 @@ jobs:
         run: |
           echo "Setting RELEASE_FREEZE to: $RELEASE_FREEZE_VALUE"
 
-          # Check if variable exists
-          if gh variable list | grep -q "^RELEASE_FREEZE"; then
-            # Update existing variable
-            gh variable set RELEASE_FREEZE --body "$RELEASE_FREEZE_VALUE"
-            echo "✅ Updated RELEASE_FREEZE variable to: $RELEASE_FREEZE_VALUE"
-          else
-            # Create new variable
-            gh variable set RELEASE_FREEZE --body "$RELEASE_FREEZE_VALUE"
-            echo "✅ Created RELEASE_FREEZE variable with value: $RELEASE_FREEZE_VALUE"
-          fi
+          gh variable set RELEASE_FREEZE --body "$RELEASE_FREEZE_VALUE"
+          echo "✅ RELEASE_FREEZE variable set to: $RELEASE_FREEZE_VALUE"
 
           if [ "$RELEASE_FREEZE_VALUE" = "true" ]; then
             echo ""
@@ -64,17 +60,17 @@ jobs:
             echo "Release-please PRs can now be merged normally"
           fi
 
-      - name: Block open release-please PR
+      - name: Block open release-please PRs
         if: inputs.release_freeze == 'true'
-        uses: ./.github/actions/release-freeze-review
+        uses: $/.github/actions/release-freeze-review
         with:
           action: freeze
           app-id: ${{ secrets.ARCHESTRA_RELEASE_FREEZE_CHECKER_GITHUB_APP_ID }}
           private-key: ${{ secrets.ARCHESTRA_RELEASE_FREEZE_CHECKER_GITHUB_APP_PRIVATE_KEY }}
 
-      - name: Unblock open release-please PR
+      - name: Unblock open release-please PRs
         if: inputs.release_freeze == 'false'
-        uses: ./.github/actions/release-freeze-review
+        uses: $/.github/actions/release-freeze-review
         with:
           action: unfreeze
           app-id: ${{ secrets.ARCHESTRA_RELEASE_FREEZE_CHECKER_GITHUB_APP_ID }}

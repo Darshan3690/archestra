@@ -1,0 +1,340 @@
+import { describe, expect, it, test } from "vitest";
+import { calculateCostSavings, DynamicInteraction } from "./interaction.utils";
+import type { Interaction } from "./llmProviders/common";
+
+describe("DynamicInteraction with a failed-interaction error response", () => {
+  // A failed upstream call is persisted with the provider `type` but an
+  // `{ error }` response instead of a provider response.
+  const errorInteraction = {
+    id: "interaction-1",
+    type: "anthropic:messages",
+    model: "claude-3-5-sonnet-20241022",
+    request: {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 64,
+      messages: [{ role: "user", content: "Hello" }],
+    },
+    response: { error: "Upstream provider returned an error response" },
+  } as unknown as Interaction;
+
+  it("surfaces the error text as the last assistant response", () => {
+    const interaction = new DynamicInteraction(errorInteraction);
+    expect(interaction.getLastAssistantResponse()).toBe(
+      "Upstream provider returned an error response",
+    );
+  });
+
+  it("reports the failure via hasErrorResponse", () => {
+    expect(new DynamicInteraction(errorInteraction).hasErrorResponse()).toBe(
+      true,
+    );
+  });
+
+  it("renders the error as an assistant message instead of throwing", () => {
+    const interaction = new DynamicInteraction(errorInteraction);
+    const messages = interaction.mapToUiMessages();
+    const last = messages[messages.length - 1];
+    expect(last.role).toBe("assistant");
+    expect(last.parts).toContainEqual({
+      type: "text",
+      text: "Upstream provider returned an error response",
+    });
+  });
+
+  it("reports no tools for a failed interaction without reading the response", () => {
+    // openai mappers iterate `response.choices`, which throws on an `{ error }`
+    // response — so this exercises the guard (anthropic would no-op regardless).
+    const openAiErrorInteraction = {
+      id: "interaction-2",
+      type: "openai:chatCompletions",
+      model: "gpt-4o-mini",
+      request: {
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: "Hello" }],
+      },
+      response: { error: "Upstream provider returned an error response" },
+    } as unknown as Interaction;
+
+    const interaction = new DynamicInteraction(openAiErrorInteraction);
+    expect(interaction.getToolNamesUsed()).toEqual([]);
+    expect(interaction.getToolNamesRequested()).toEqual([]);
+  });
+});
+
+describe("DynamicInteraction with a normal provider response", () => {
+  // A successful call delegates every accessor to the provider mapper; the
+  // failed-interaction guard must not suppress real response data.
+  const okInteraction = {
+    id: "ok-1",
+    type: "openai:chatCompletions",
+    model: "gpt-4o-mini",
+    request: {
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "user", content: "weather?" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "u1",
+              type: "function",
+              function: { name: "search", arguments: "{}" },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "u1", content: "sunny" },
+        { role: "user", content: "thanks" },
+      ],
+    },
+    response: {
+      id: "r1",
+      object: "chat.completion",
+      created: 1,
+      model: "gpt-4o-mini",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: "Hello back",
+            refusal: null,
+            tool_calls: [
+              {
+                id: "c1",
+                type: "function",
+                function: { name: "get_weather", arguments: "{}" },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+          logprobs: null,
+        },
+      ],
+    },
+  } as unknown as Interaction;
+
+  it("delegates getLastAssistantResponse to the provider mapper", () => {
+    expect(
+      new DynamicInteraction(okInteraction).getLastAssistantResponse(),
+    ).toBe("Hello back");
+  });
+
+  it("delegates tool extraction instead of returning the failed-interaction defaults", () => {
+    const interaction = new DynamicInteraction(okInteraction);
+    expect(interaction.getToolNamesUsed()).toEqual(["search"]);
+    expect(interaction.getToolNamesRequested()).toEqual(["get_weather"]);
+  });
+
+  it("renders no conversation for an encrypted-chat interaction instead of throwing", () => {
+    // Provider mappers read request.messages.length unguarded, so a locked
+    // payload has to stop before delegation — otherwise the whole session
+    // detail page crashes on one encrypted-chat row.
+    for (const sentinel of [
+      { __encryptedChatSealed: "11111111-1111-4111-8111-111111111111" },
+      { __redacted: "encrypted_chat" },
+    ]) {
+      const locked = {
+        ...okInteraction,
+        request: sentinel,
+        response: sentinel,
+      } as unknown as typeof okInteraction;
+      const interaction = new DynamicInteraction(locked);
+      // Every payload-derived accessor must answer neutrally rather than
+      // dereference the sentinel — the session detail page calls several of
+      // them per row, so one unguarded accessor crashes the whole page.
+      expect(interaction.mapToUiMessages()).toEqual([]);
+      expect(interaction.getLastUserMessage()).toBe("");
+      expect(interaction.getLastAssistantResponse()).toBe("");
+      expect(interaction.getToolNamesRequested()).toEqual([]);
+      expect(interaction.getToolNamesUsed()).toEqual([]);
+      expect(interaction.isLastMessageToolCall()).toBe(false);
+      expect(interaction.getLastToolCallId()).toBeNull();
+    }
+  });
+
+  it("delegates mapToUiMessages to the provider mapper", () => {
+    const messages = new DynamicInteraction(okInteraction).mapToUiMessages();
+    const hasAssistantText = messages.some(
+      (m) =>
+        m.role === "assistant" &&
+        m.parts.some((p) => p.type === "text" && p.text === "Hello back"),
+    );
+    expect(hasAssistantText).toBe(true);
+  });
+});
+
+describe("DynamicInteraction dispatch and guard edges", () => {
+  it("recovers when the provider mapper throws on an { error } response", () => {
+    // openai's mapToUiMessages reads response.choices, which throws on an
+    // `{ error }` body — the guard must catch it and still append the error turn.
+    const openAiErrorInteraction = {
+      id: "err-openai",
+      type: "openai:chatCompletions",
+      model: "gpt-4o-mini",
+      request: {
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: "Hello" }],
+      },
+      response: { error: "boom" },
+    } as unknown as Interaction;
+
+    const messages = new DynamicInteraction(
+      openAiErrorInteraction,
+    ).mapToUiMessages();
+    const last = messages[messages.length - 1];
+    expect(last.role).toBe("assistant");
+    expect(last.parts).toContainEqual({ type: "text", text: "boom" });
+  });
+
+  it("treats a non-string error field as a normal response, not a failure", () => {
+    // getToolNamesUsed reads only the request, so it delegates without throwing;
+    // a delegated result proves `{ error: 123 }` is not read as a failed call.
+    const nonStringErrorInteraction = {
+      id: "err-nonstring",
+      type: "openai:chatCompletions",
+      model: "gpt-4o-mini",
+      request: {
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "u1",
+                type: "function",
+                function: { name: "search", arguments: "{}" },
+              },
+            ],
+          },
+        ],
+      },
+      response: { error: 123 },
+    } as unknown as Interaction;
+
+    expect(
+      new DynamicInteraction(nonStringErrorInteraction).getToolNamesUsed(),
+    ).toEqual(["search"]);
+  });
+
+  it("constructs a gemini:embeddings interaction via the OpenAI-compatible factory", () => {
+    const embeddingInteraction = {
+      id: "emb-1",
+      type: "gemini:embeddings",
+      model: "text-embedding-004",
+      request: { model: "text-embedding-004", input: ["hello"] },
+      response: {
+        object: "list",
+        data: [{ object: "embedding", embedding: [0.1, 0.2], index: 0 }],
+        model: "text-embedding-004",
+        usage: { prompt_tokens: 1, total_tokens: 1 },
+      },
+    } as unknown as Interaction;
+
+    expect(() => new DynamicInteraction(embeddingInteraction)).not.toThrow();
+    expect(
+      new DynamicInteraction(embeddingInteraction).getToolNamesRequested(),
+    ).toEqual([]);
+  });
+
+  it("throws for an unsupported interaction type", () => {
+    const unsupported = {
+      id: "bogus-1",
+      type: "bogus:type",
+      model: "x",
+      request: {},
+      response: {},
+    } as unknown as Interaction;
+
+    expect(() => new DynamicInteraction(unsupported)).toThrow(
+      /Unsupported interaction type/,
+    );
+  });
+});
+
+describe("calculateCostSavings", () => {
+  test("preserves actual spend when historical model savings exceed the cost", () => {
+    const result = calculateCostSavings({
+      cost: "0.05",
+      baselineCost: "0.3926",
+    });
+
+    // Actual cost is exactly the stored spend — never negative.
+    expect(result.actualCost).toBeCloseTo(0.05, 10);
+    // Model optimization savings = baselineCost - cost.
+    expect(result.modelSwapSavings).toBeCloseTo(0.3426, 10);
+    expect(result.totalSavings).toBeCloseTo(0.3426, 10);
+    // Estimated cost sits exactly totalSavings above the actual spend.
+    expect(result.estimatedCost).toBeCloseTo(0.05 + 0.3426, 10);
+    // Percentage is bounded to 0–100 for non-negative savings.
+    expect(result.savingsPercent).toBeGreaterThan(0);
+    expect(result.savingsPercent).toBeLessThan(100);
+    expect(result.hasSavings).toBe(true);
+  });
+
+  test("reports no savings when there is no model savings", () => {
+    const result = calculateCostSavings({
+      cost: "0.25",
+      baselineCost: "0.25",
+    });
+
+    expect(result.actualCost).toBeCloseTo(0.25, 10);
+    expect(result.estimatedCost).toBeCloseTo(0.25, 10);
+    expect(result.totalSavings).toBeCloseTo(0, 10);
+    expect(result.savingsPercent).toBe(0);
+    expect(result.hasSavings).toBe(false);
+  });
+
+  test("calculates historical model savings", () => {
+    const result = calculateCostSavings({
+      cost: "0.10",
+      baselineCost: "0.40",
+    });
+
+    expect(result.actualCost).toBeCloseTo(0.1, 10);
+    expect(result.modelSwapSavings).toBeCloseTo(0.3, 10);
+    expect(result.totalSavings).toBeCloseTo(0.3, 10);
+    expect(result.estimatedCost).toBeCloseTo(0.4, 10);
+    // 0.3 / 0.4 = 75%
+    expect(result.savingsPercent).toBeCloseTo(75, 10);
+  });
+
+  test("guards against a zero estimated cost", () => {
+    const result = calculateCostSavings({
+      cost: null,
+      baselineCost: null,
+    });
+
+    expect(result.actualCost).toBe(0);
+    expect(result.estimatedCost).toBe(0);
+    expect(result.savingsPercent).toBe(0);
+  });
+});
+
+describe.each([
+  "azure:images",
+  "openai:images",
+])("%s image audit rendering", (type) => {
+  it("shows the image as an image, never as text or a tool call", () => {
+    const interaction = new DynamicInteraction({
+      id: "image-audit",
+      type,
+      model: "image-alias",
+      request: { model: "image-alias", prompt: "Draw a blue circle." },
+      response: { created: 1, data: [{ b64_json: "aW1hZ2UtYnl0ZXM=" }] },
+    } as unknown as Interaction);
+    expect(interaction.getLastUserMessage()).toBe("Draw a blue circle.");
+    expect(interaction.getLastAssistantResponse()).toBe("1 image");
+    expect(interaction.getToolNamesUsed()).toEqual([]);
+    const reply = interaction.mapToUiMessages().at(-1);
+    expect(reply?.parts).toEqual([
+      {
+        type: "file",
+        mediaType: "image/png",
+        url: "data:image/png;base64,aW1hZ2UtYnl0ZXM=",
+        filename: "PNG",
+      },
+    ]);
+  });
+});

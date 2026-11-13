@@ -124,6 +124,52 @@ const ToolResultContentBlockSchema = z.object({
   }),
 });
 
+// Cache point block — a prompt-caching breakpoint. Bedrock Converse caches the
+// content rendered before this block. Emitted by @ai-sdk/amazon-bedrock from
+// `providerOptions.bedrock.cachePoint` and inserted into the message content
+// array, so the proxy schema must accept it on every message role. `ttl` is
+// kept so a pass-through request's cache duration ("5m"/"1h") survives instead
+// of being silently dropped; `type` stays a string since AWS validates it.
+const CachePointContentBlockSchema = z.object({
+  cachePoint: z.object({
+    type: z.string(),
+    ttl: z.string().optional(),
+  }),
+});
+
+// Reasoning content block — Claude extended-thinking output. On a multi-turn
+// request @ai-sdk/amazon-bedrock echoes the prior assistant reasoning back as a
+// `{ reasoningContent: ... }` block in the assistant message content, so the
+// proxy must accept it or the whole request 400s with
+// "body/messages/N/content/M Invalid input" (the same failure class as the
+// system cachePoint block). Two variants per the Bedrock Converse API: plain
+// reasoning text with a signature, or redacted reasoning bytes. `signature` is
+// optional so a text variant without one still validates and passes through.
+//
+// The redacted variant has two spellings on the wire. `redactedContent` is the
+// Converse API's own (`ReasoningContentBlock`) and what the pinned
+// @ai-sdk/amazon-bedrock echoes back; `redactedReasoning.data` is what it sent
+// before 4.0.158 and what other clients may still send. Both are accepted and
+// forwarded as received — Bedrock is the one that decides.
+const ReasoningContentBlockSchema = z.object({
+  reasoningContent: z.union([
+    z.object({
+      reasoningText: z.object({
+        text: z.string(),
+        signature: z.string().optional(),
+      }),
+    }),
+    z.object({
+      redactedContent: z.string(),
+    }),
+    z.object({
+      redactedReasoning: z.object({
+        data: z.string(),
+      }),
+    }),
+  ]),
+});
+
 // =============================================================================
 // EXPORTED CONTENT BLOCK UNIONS
 // =============================================================================
@@ -135,12 +181,15 @@ export const UserContentBlockSchema = z.union([
   DocumentContentBlockSchema,
   GuardContentBlockSchema,
   ToolResultContentBlockSchema,
+  CachePointContentBlockSchema,
 ]);
 
 // Content block union for assistant messages
 export const AssistantContentBlockSchema = z.union([
   TextContentBlockSchema,
   ToolUseContentBlockSchema,
+  CachePointContentBlockSchema,
+  ReasoningContentBlockSchema,
 ]);
 
 // Content block union for all messages
@@ -151,6 +200,8 @@ export const ContentBlockSchema = z.union([
   GuardContentBlockSchema,
   ToolUseContentBlockSchema,
   ToolResultContentBlockSchema,
+  CachePointContentBlockSchema,
+  ReasoningContentBlockSchema,
 ]);
 
 // =============================================================================
@@ -169,12 +220,23 @@ export const MessageSchema = z.object({
 // System content block (text or guard content)
 // Also accepts Anthropic-style { type: "text", text: string } blocks (e.g. from @ai-sdk/amazon-bedrock)
 // and normalizes them to Bedrock format { text: string }
+//
+// Forward-compat fallback: Bedrock periodically introduces new system block
+// shapes and @ai-sdk/amazon-bedrock forwards whatever the caller configures
+// (the `cachePoint` block was one such addition — before it was modeled here,
+// a Claude request with prompt caching failed with "body/system/1 Invalid
+// input"). As a pass-through proxy we must not 400 a request just because a
+// block isn't in our allowlist; AWS is the authoritative validator. Any object
+// we don't explicitly model is accepted and forwarded to Bedrock unchanged.
+// The known shapes stay first so their normalization/typing still applies.
 const SystemContentBlockSchema = z.union([
   z
     .object({ type: z.literal("text"), text: z.string() })
     .transform(({ text }) => ({ text })),
   z.object({ text: z.string() }),
   GuardContentBlockSchema,
+  CachePointContentBlockSchema,
+  z.record(z.string(), z.unknown()),
 ]);
 
 export const SystemSchema = z.array(SystemContentBlockSchema);
@@ -195,7 +257,13 @@ const ResponseToolUseBlockSchema = z.object({
   }),
 });
 
+// Extended-thinking output comes back as a `reasoningContent` block alongside
+// the answer, in exactly the shape a later request echoes back, so the same
+// schema serves both directions. Without it the proxy rejects its own upstream
+// response and a non-streaming Converse call to a thinking model never reaches
+// the client.
 export const ResponseContentBlockSchema = z.union([
   ResponseTextBlockSchema,
   ResponseToolUseBlockSchema,
+  ReasoningContentBlockSchema,
 ]);

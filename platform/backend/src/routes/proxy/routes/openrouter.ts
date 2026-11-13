@@ -3,15 +3,18 @@
  *
  * OpenRouter uses an OpenAI-compatible API at https://openrouter.ai/api/v1
  */
+
+import { RouteId } from "@archestra/shared";
 import fastifyHttpProxy from "@fastify/http-proxy";
-import { RouteId } from "@shared";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
+import { openRouterAttributionHeaders } from "@/clients/openrouter-attribution";
 import config from "@/config";
 import logger from "@/logging";
 import { constructResponseSchema, Openrouter, UuidIdSchema } from "@/types";
 import { openrouterAdapterFactory } from "../adapters";
 import { PROXY_API_PREFIX, PROXY_BODY_LIMIT } from "../common";
+import { createPassthroughAuthenticator } from "../llm-proxy-auth";
 import { handleLLMProxy } from "../llm-proxy-handler";
 import { createProxyPreHandler } from "./proxy-prehandler";
 
@@ -19,17 +22,22 @@ const openrouterProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
   const API_PREFIX = `${PROXY_API_PREFIX}/openrouter`;
   const CHAT_COMPLETIONS_SUFFIX = "/chat/completions";
 
-  logger.info("[UnifiedProxy] Registering unified OpenRouter routes");
+  logger.debug("[UnifiedProxy] Registering unified OpenRouter routes");
 
   await fastify.register(fastifyHttpProxy, {
     upstream: config.llm.openrouter.baseUrl,
     prefix: API_PREFIX,
     rewritePrefix: "",
+    replyOptions: {
+      rewriteRequestHeaders: (_request, headers) =>
+        openRouterAttributionHeaders(headers),
+    },
     preHandler: createProxyPreHandler({
       apiPrefix: API_PREFIX,
       endpointSuffix: CHAT_COMPLETIONS_SUFFIX,
       upstream: config.llm.openrouter.baseUrl,
       providerName: "OpenRouter",
+      authenticate: createPassthroughAuthenticator("openrouter"),
     }),
   });
 

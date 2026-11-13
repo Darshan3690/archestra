@@ -1,0 +1,276 @@
+import {
+  createPaginatedResponseSchema,
+  PaginationQuerySchema,
+  ResourceVisibilityScopeSchema,
+} from "@archestra/shared";
+import { z } from "zod";
+import { SortDirectionSchema } from "@/types/api";
+import {
+  BatteryInstallStatusSchema,
+  BatteryMatchEvidenceSchema,
+} from "@/types/openappa-batteries";
+
+/**
+ * What kind of rule governs a tool, from its delta and requirements: a rule
+ * that requires an attention mark is `approval`, one that requires anything
+ * else is `write`, one that only narrows the labels (or defers to an
+ * annotator) is `read`, one that does neither is `neutral`. A tool using a noop catch-all
+ * or lacking a matching rule is `unlisted`.
+ */
+export const CoverageKindSchema = z.enum([
+  "read",
+  "write",
+  "approval",
+  "neutral",
+  "unlisted",
+]);
+export type CoverageKind = z.infer<typeof CoverageKindSchema>;
+
+/** The kind facet: `write` includes the rules that also need approval. */
+export const CoverageKindFilterSchema = z.enum(["read", "write", "approval"]);
+export type CoverageKindFilter = z.infer<typeof CoverageKindFilterSchema>;
+
+/**
+ * A battery's status as the enforced composition holds it. `pending`: an
+ * earlier composition is enforced, and it did not hold this battery.
+ */
+export const CoverageBatteryStatusSchema = z.union([
+  BatteryInstallStatusSchema,
+  z.literal("pending"),
+]);
+export type CoverageBatteryStatus = z.infer<typeof CoverageBatteryStatusSchema>;
+
+/** One `[[policy.tool]]` entry as the coverage parse read it. */
+export const CoverageRuleSchema = z.object({
+  source: z.enum(["root", "battery", "catchall"]),
+  /** The battery that declares the rule; null for a root rule. */
+  battery: z.string().nullable(),
+  /** The exact include entry that supplies a battery rule; null for a root rule. */
+  batteryEntry: z.string().nullable(),
+  /** That battery's status in the enforced composition; null for a root rule. */
+  batteryStatus: CoverageBatteryStatusSchema.nullable(),
+  /** The rule's header line in its source TOML, when it can be located. */
+  line: z.number().int().nullable(),
+  /** The tool name as the rule spells it, without its selector. */
+  name: z.string(),
+  /** The argument selector between the parentheses, or null. */
+  selector: z.string().nullable(),
+  /** How the result narrows the session's labels. An object form's `contains` list is flattened. */
+  delta: z.object({
+    trust: z.string().optional(),
+    audience: z.array(z.string()).optional(),
+  }),
+  /** How the content a call sends beyond its arguments is labeled for its requirements. */
+  forwards: z.object({
+    trust: z.string().optional(),
+    audience: z.array(z.string()).optional(),
+  }),
+  /** What a call needs before it runs. An object form's `contains` list is flattened. */
+  requires: z.object({
+    trust: z.string().optional(),
+    audience: z.array(z.string()).optional(),
+    attention: z.array(z.string()).optional(),
+  }),
+  annotator: z.string().nullable(),
+  /** Whether the runtime judges calls by this rule: a composition is enforced and, for a battery rule, it composed the battery. */
+  enforced: z.boolean(),
+});
+export type CoverageRule = z.infer<typeof CoverageRuleSchema>;
+
+/**
+ * One row of the tools table. A tool is one row judged by its first matching
+ * rule without a selector (or by the catch-all when none matches), plus one
+ * row per selector rule that names it, so a root override sits beside the
+ * battery rule it overrides.
+ */
+export const CoverageToolSchema = z.object({
+  toolId: z.string(),
+  catalogId: z.string(),
+  catalogName: z.string(),
+  catalogIcon: z.string().nullable(),
+  prefix: z.string(),
+  /** The tool's own name, after the prefix. */
+  name: z.string(),
+  /** `<prefix>__<name>`, as a root rule spells it. */
+  fullName: z.string(),
+  /** The MCP `readOnlyHint` annotation; null when the server gave none. */
+  readOnly: z.boolean().nullable(),
+  kind: CoverageKindSchema,
+  /** A specific rule, a non-noop catch-all, or no coverage. */
+  policySource: z.enum(["root", "battery", "catchall", "not_covered"]),
+  /** The matching rule, including a noop catch-all; null when no rule matches. */
+  rule: CoverageRuleSchema.nullable(),
+  /** The root catch-all header line, when this tool uses one. */
+  fallbackLine: z.number().int().nullable(),
+  unlisted: z.boolean(),
+  enforced: z.boolean(),
+});
+export type CoverageTool = z.infer<typeof CoverageToolSchema>;
+
+/**
+ * Tools counted by what judges them without a selector: an enforced root or
+ * battery rule, a non-noop catch-all, a rule the runtime does not apply,
+ * or no coverage (noop catch-all or no matching rule). Each tool is counted once.
+ */
+export const CoverageRuleCountsSchema = z.object({
+  root: z.number().int(),
+  battery: z.number().int(),
+  notEnforced: z.number().int(),
+  catchAll: z.number().int(),
+  notCovered: z.number().int(),
+});
+export type CoverageRuleCounts = z.infer<typeof CoverageRuleCountsSchema>;
+
+/** A visible MCP registry server with tool coverage. */
+export const CoverageEntitySchema = z.object({
+  id: z.uuid(),
+  name: z.string(),
+  type: z.enum(["mcp_server"]),
+  scope: ResourceVisibilityScopeSchema,
+  icon: z.string().nullable(),
+  /** The server's synced tools. */
+  toolCount: z.number().int(),
+  /** Tools with an active specific or non-noop catch-all rule, including selectors. */
+  governedCount: z.number().int(),
+  /** Tools without an unconditional specific rule, so calls may use the catch-all. */
+  fallbackCount: z.number().int(),
+  /** The same tools split by what judges them; the buckets sum to toolCount. */
+  rules: CoverageRuleCountsSchema,
+});
+export type CoverageEntity = z.infer<typeof CoverageEntitySchema>;
+
+const SearchSchema = z.string().trim().max(200).optional();
+
+export const CoverageToolsQuerySchema = PaginationQuerySchema.extend({
+  /** Matches the tool name, its selector, the server name or its prefix. */
+  search: SearchSchema,
+  catalogId: z.uuid().optional(),
+  governedBy: z.enum(["battery", "root", "catchall", "not_covered"]).optional(),
+  /** Narrow battery rules to one included battery. */
+  battery: z.string().trim().min(1).max(100).optional(),
+  kind: CoverageKindFilterSchema.optional(),
+});
+export type CoverageToolsQuery = z.infer<typeof CoverageToolsQuerySchema>;
+
+export const CoverageEntitiesQuerySchema = PaginationQuerySchema.extend({
+  search: SearchSchema,
+  type: CoverageEntitySchema.shape.type.optional(),
+  /** Resolve one visible target by its stable row ID. */
+  entityId: z.uuid().optional(),
+  /** Only the server this tool belongs to. */
+  toolId: z.uuid().optional(),
+  /** By name when unset. `tools` is the tool count; ties by name. */
+  sortBy: z.enum(["name", "tools"]).optional(),
+  /** Ascending when unset. */
+  sortDirection: SortDirectionSchema.optional(),
+});
+export type CoverageEntitiesQuery = z.infer<typeof CoverageEntitiesQuerySchema>;
+
+export const CoverageToolsPageSchema = createPaginatedResponseSchema(
+  CoverageToolSchema,
+).extend({
+  /** Servers with tools in the visible inventory. */
+  servers: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      icon: z.string().nullable(),
+    }),
+  ),
+  /** Batteries represented by the selected server, before source filtering. */
+  batteries: z.array(z.string()),
+});
+export type CoverageToolsPage = z.infer<typeof CoverageToolsPageSchema>;
+export const CoverageEntitiesPageSchema =
+  createPaginatedResponseSchema(CoverageEntitySchema);
+export type CoverageEntitiesPage = z.infer<typeof CoverageEntitiesPageSchema>;
+
+/** The whole visible inventory in aggregate, one count per tool. */
+export const CoverageSummarySchema = z.object({
+  totals: CoverageRuleCountsSchema.extend({ tools: z.number().int() }),
+  batteries: z.object({
+    /** Included batteries whose rules are enforced, most tools first. */
+    active: z.array(
+      z.object({
+        name: z.string(),
+        /** Visible tools a rule of this battery judges. */
+        tools: z.number().int(),
+      }),
+    ),
+    /** Included batteries whose rules are not enforced, most tools first. */
+    broken: z.array(
+      z.object({
+        name: z.string(),
+        status: z.union([
+          BatteryInstallStatusSchema.exclude(["active"]),
+          z.literal("pending"),
+        ]),
+        /** Visible tools a rule of this battery names but does not enforce. */
+        tools: z.number().int(),
+      }),
+    ),
+    /**
+     * Batteries not installed on visible servers they fit, that would give
+     * some of those servers' uncovered tools a rule, most tools first.
+     */
+    available: z.array(
+      z.object({
+        name: z.string(),
+        /** The names of the servers it fits. */
+        servers: z.array(z.string()),
+        /** Uncovered tools it would judge once installed. */
+        tools: z.number().int(),
+      }),
+    ),
+  }),
+  /** Which composition the counts describe; see `CompositionView`. */
+  composition: z.object({
+    kind: z.enum(["current", "previous", "root_only"]),
+    servedRootRevision: z.number().int().nullable(),
+    refusedRootRevision: z.number().int().nullable(),
+    /** An earlier composition of another or an unknown revision is enforced, so its rules may differ from the rows. */
+    rulesMayDiffer: z.boolean(),
+  }),
+});
+export type CoverageSummary = z.infer<typeof CoverageSummarySchema>;
+
+/**
+ * A battery that fits a registry server and is not declared yet: how to
+ * declare it, and what each of its rules would do to the server's tools.
+ */
+export const CoverageBatteryFitSchema = z.object({
+  mcpServerId: z.string(),
+  mcpServerName: z.string(),
+  /** The server's tool prefixes, which `aliases.mcp` points the battery's namespaces at. */
+  toolPrefixes: z.array(z.string()),
+  battery: z.string(),
+  description: z.string(),
+  /** How the server was matched: its URL host, its container image, or its name. */
+  evidence: BatteryMatchEvidenceSchema,
+  /** The `include` entry that declares the battery. */
+  include: z.string(),
+  namespaces: z.array(z.string()),
+  /** Credential variables that need a runtime credential key bound before calls it routes run. */
+  credentials: z.array(z.string()),
+  /** One line on what the battery's helpers ask the provider and what that buys. */
+  benefit: z.string().nullable(),
+  /** The steps that set up the battery's credentials, one line each. */
+  setup: z.array(z.string()),
+  /** The server's uncovered tools that the battery would judge. */
+  newlyCovered: z.number().int(),
+  /** Every battery rule that names one of the server's tools. */
+  rules: z.array(
+    z.object({
+      /** The full tool name, `<prefix>__<name>`. */
+      tool: z.string(),
+      selector: z.string().nullable(),
+      kind: CoverageKindSchema.exclude(["unlisted"]),
+      delta: CoverageRuleSchema.shape.delta,
+      requires: CoverageRuleSchema.shape.requires,
+      annotator: z.string().nullable(),
+      /** What covers the tool today; null for noop or no matching rule. A root rule keeps priority over the battery's. */
+      currentRule: z.enum(["root", "battery", "catchall"]).nullable(),
+    }),
+  ),
+});
+export type CoverageBatteryFit = z.infer<typeof CoverageBatteryFitSchema>;

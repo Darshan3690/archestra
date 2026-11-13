@@ -1,0 +1,410 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { useEffect } from "react";
+import { toast } from "sonner";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// A stable, mutable stand-in for the router's search params so a test can flip
+// them (e.g. simulate the deep-link param being stripped) between renders.
+const nav = vi.hoisted(() => ({ search: new URLSearchParams() }));
+
+vi.mock("next/navigation", () => ({
+  useSearchParams: () => nav.search,
+  useRouter: () => ({ replace: vi.fn(), push: vi.fn() }),
+  usePathname: () => "/mcp/registry",
+}));
+
+vi.mock("@/lib/mcp/mcp-server.query");
+
+// The registry state the hook reads: the issue index (names, install
+// statuses) and, when a flow opens an item, its full configuration by id.
+const registry = vi.hoisted(() => ({
+  items: [] as Array<{ id: string; name: string; multitenant?: boolean }>,
+  servers: [] as unknown[],
+}));
+vi.mock("@/lib/mcp/mcp-registry.query", () => ({
+  useMcpRegistryIssueIndex: () => ({
+    data: { catalogItems: registry.items, servers: registry.servers },
+  }),
+  fetchInternalMcpCatalogItem: async (_queryClient: unknown, id: string) =>
+    registry.items.find((item) => item.id === id) ?? null,
+}));
+vi.mock("@/lib/auth/oauth.query");
+vi.mock("@/lib/mcp/enterprise-managed-install-auth", () => ({
+  useEnterpriseManagedInstallConnectUrl: () => async () => null,
+  getPendingEnterpriseManagedInstall: () => null,
+  setPendingEnterpriseManagedInstall: vi.fn(),
+  clearPendingEnterpriseManagedInstall: vi.fn(),
+}));
+vi.mock("@/lib/websocket/websocket", () => ({ default: { send: vi.fn() } }));
+vi.mock("sonner", () => ({
+  toast: { success: vi.fn(), error: vi.fn() },
+}));
+
+// dialog alive (it carries the credential-storage warning), so tests flip it.
+const features = vi.hoisted(() => ({}) as Record<string, boolean>);
+vi.mock("@/lib/config/config.query", () => ({
+  useFeature: (key: string) => features[key] ?? false,
+}));
+
+// The install dialogs are stubbed to a single testid so the test asserts the
+// hook's open/re-open/clear behavior, not each dialog's internals. Every
+// variant collapses to the same "install-dialog" marker plus a dismiss button
+// wired to the close/cancel handler.
+type StubDialogProps = {
+  open?: boolean;
+  isOpen?: boolean;
+  onClose?: () => void;
+  onCancel?: () => void;
+  onOpenChange?: (open: boolean) => void;
+  onConfirm?: (result: {
+    catalogId: string;
+    environmentValues: Record<string, string>;
+    scope: "personal";
+  }) => Promise<void>;
+  catalogItem?: CatalogItem;
+};
+function StubDialog({
+  open,
+  isOpen,
+  onClose,
+  onCancel,
+  onOpenChange,
+  onConfirm,
+  catalogItem,
+}: StubDialogProps) {
+  if (!(open || isOpen)) return null;
+  const dismiss = onCancel ?? onClose ?? (() => onOpenChange?.(false));
+  return (
+    <div data-testid="install-dialog">
+      <button
+        type="button"
+        data-testid="install-dialog-dismiss"
+        onClick={dismiss}
+      >
+        dismiss
+      </button>
+      {onConfirm && catalogItem && (
+        <button
+          type="button"
+          data-testid="install-dialog-confirm"
+          onClick={() =>
+            onConfirm({
+              catalogId: catalogItem.id,
+              environmentValues: {},
+              scope: "personal",
+            })
+          }
+        >
+          confirm
+        </button>
+      )}
+    </div>
+  );
+}
+vi.mock("@/components/oauth-confirmation-dialog", () => ({
+  OAuthConfirmationDialog: (props: StubDialogProps) => (
+    <StubDialog {...props} />
+  ),
+}));
+vi.mock("./remote-server-install-dialog", () => ({
+  RemoteServerInstallDialog: (props: StubDialogProps) => (
+    <StubDialog {...props} />
+  ),
+}));
+vi.mock("./no-auth-install-dialog", () => ({
+  NoAuthInstallDialog: (props: StubDialogProps) => <StubDialog {...props} />,
+}));
+vi.mock("./local-server-install-dialog", () => ({
+  LocalServerInstallDialog: (props: StubDialogProps) => (
+    <StubDialog {...props} />
+  ),
+}));
+
+import { useInitiateOAuth } from "@/lib/auth/oauth.query";
+import { useInstallMcpServer } from "@/lib/mcp/mcp-server.query";
+import {
+  clearPendingInstall,
+  setPendingInstall,
+} from "@/lib/mcp/pending-install";
+import type { CatalogItem } from "./mcp-server-card";
+import { useCatalogInstall } from "./use-catalog-install";
+
+const CATALOG_ID = "cat-oauth-1";
+
+// A remote server with an OAuth config and no user config — installRemote takes
+// the OAuth-dialog branch, so the deep link opens a dialog we can observe.
+const remoteConnectItem = {
+  id: CATALOG_ID,
+  name: "deeplink-server",
+  serverType: "remote",
+  oauthConfig: { name: "deeplink-server" },
+  userConfig: {},
+} as unknown as CatalogItem;
+
+const localItem = {
+  id: "cat-local-1",
+  name: "Playwright Browser",
+  serverType: "local",
+  localConfig: { command: "playwright" },
+  userConfig: {},
+} as unknown as CatalogItem;
+
+// Mirrors how InternalMCPCatalog drives the deep link: fire the consume-params
+// handler on mount. The durable re-open lives inside the hook itself.
+function Harness() {
+  const install = useCatalogInstall();
+  // biome-ignore lint/correctness/useExhaustiveDependencies: fire once on mount, like the registry effect
+  useEffect(() => {
+    install.installFromSearchParams();
+  }, []);
+  return <>{install.dialogs}</>;
+}
+
+function renderHarness() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <Harness />
+    </QueryClientProvider>,
+  );
+}
+
+function LocalInstallHarness() {
+  const install = useCatalogInstall();
+  // biome-ignore lint/correctness/useExhaustiveDependencies: open once on mount like the registry action
+  useEffect(() => {
+    install.addPersonalConnection(localItem);
+  }, []);
+  return <>{install.dialogs}</>;
+}
+
+describe("useCatalogInstall — deep-link install", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    nav.search = new URLSearchParams();
+    registry.items = [remoteConnectItem];
+    registry.servers = [];
+    vi.mocked(useInstallMcpServer).mockReturnValue({
+      mutateAsync: vi.fn(),
+      isPending: false,
+    } as unknown as ReturnType<typeof useInstallMcpServer>);
+    vi.mocked(useInitiateOAuth).mockReturnValue({
+      mutateAsync: vi.fn(),
+    } as unknown as ReturnType<typeof useInitiateOAuth>);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("opens the install dialog when ?install={catalogId} is present", async () => {
+    nav.search = new URLSearchParams(`install=${CATALOG_ID}`);
+
+    renderHarness();
+
+    expect(await screen.findByTestId("install-dialog")).toBeInTheDocument();
+  });
+
+  // The regression guard: the deep link opened the dialog and the param was
+  // stripped, then the dialog was torn down (a route re-render remounting the
+  // registry, an OAuth/enterprise redirect return, etc.). A fresh mount — with
+  // the param already gone — must re-open the dialog from the stashed intent
+  // rather than strand the user on the bare registry.
+  it("re-opens the dialog after a teardown while the connection is still missing", async () => {
+    nav.search = new URLSearchParams(`install=${CATALOG_ID}`);
+    const view = renderHarness();
+    await screen.findByTestId("install-dialog");
+
+    // The param is stripped after the deep link is consumed; simulate that plus
+    // the teardown that lost the dialog in the bug.
+    nav.search = new URLSearchParams();
+    view.unmount();
+    expect(screen.queryByTestId("install-dialog")).not.toBeInTheDocument();
+
+    // Fresh mount: local dialog state is reset and the URL no longer carries the
+    // param, so only the durable intent can bring the dialog back.
+    renderHarness();
+    expect(await screen.findByTestId("install-dialog")).toBeInTheDocument();
+  });
+
+  it("does not re-open after the user dismisses the dialog", async () => {
+    const user = userEvent.setup();
+    nav.search = new URLSearchParams(`install=${CATALOG_ID}`);
+    const view = renderHarness();
+
+    await user.click(await screen.findByTestId("install-dialog-dismiss"));
+
+    // Dismiss dropped the intent; a later teardown/remount must not resurrect it.
+    nav.search = new URLSearchParams();
+    view.unmount();
+    renderHarness();
+    await Promise.resolve();
+    expect(screen.queryByTestId("install-dialog")).not.toBeInTheDocument();
+  });
+
+  it("does not re-open when the caller already has a connection", async () => {
+    // The deep link ran earlier (intent stashed), but a connection now exists.
+    setPendingInstall({ catalogId: CATALOG_ID });
+    registry.servers = [{ catalogId: CATALOG_ID }];
+    nav.search = new URLSearchParams();
+
+    renderHarness();
+    await Promise.resolve();
+
+    expect(screen.queryByTestId("install-dialog")).not.toBeInTheDocument();
+    clearPendingInstall();
+  });
+});
+
+describe("useCatalogInstall — local install completion", () => {
+  beforeEach(() => {
+    nav.search = new URLSearchParams();
+    registry.items = [localItem];
+    registry.servers = [
+      {
+        id: "installed-local-1",
+        name: "Playwright Browser-internal-owner-suffix",
+        catalogId: localItem.id,
+        localInstallationStatus: "success",
+      },
+    ];
+    vi.mocked(useInstallMcpServer).mockReturnValue({
+      mutateAsync: vi.fn().mockResolvedValue({
+        installedServer: { id: "installed-local-1" },
+      }),
+      isPending: false,
+    } as unknown as ReturnType<typeof useInstallMcpServer>);
+    vi.mocked(useInitiateOAuth).mockReturnValue({
+      mutateAsync: vi.fn(),
+    } as unknown as ReturnType<typeof useInitiateOAuth>);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("uses the catalog display name in the success toast", async () => {
+    const user = userEvent.setup();
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <LocalInstallHarness />
+      </QueryClientProvider>,
+    );
+
+    await user.click(await screen.findByTestId("install-dialog-confirm"));
+
+    await waitFor(() => {
+      expect(toast.success).toHaveBeenCalledWith(
+        "Successfully installed Playwright Browser",
+      );
+    });
+  });
+});
+
+// A local OAuth server whose env vars are prompted at install time: the
+// local-install dialog collects them (plus the install target), after which
+// OAuth starts.
+const localItemWithPromptedEnv = {
+  id: "cat-local-oauth-1",
+  name: "local-oauth-server",
+  serverType: "local",
+  oauthConfig: { name: "local-oauth-server" },
+  localConfig: {
+    command: "serve",
+    environment: [{ key: "API_HOST", promptOnInstallation: true }],
+  },
+  userConfig: {},
+} as unknown as CatalogItem;
+
+function AddPersonalConnectionHarness({ item }: { item: CatalogItem }) {
+  const install = useCatalogInstall();
+  // biome-ignore lint/correctness/useExhaustiveDependencies: fire once on mount, like the "Connect my account" click
+  useEffect(() => {
+    install.addPersonalConnection(item);
+  }, []);
+  return <>{install.dialogs}</>;
+}
+
+// "Connect my account" (and the other fixed-target entry points) pre-select
+// the install scope, so the OAuth confirmation dialog would render an empty
+// body with nothing to choose — the flow must start immediately instead.
+describe("useCatalogInstall — fixed-target OAuth skips the confirmation dialog", () => {
+  const originalLocation = window.location;
+  const AUTHORIZATION_URL = "https://provider.example/oauth/authorize";
+  let initiateOAuth: ReturnType<typeof vi.fn>;
+
+  function renderAddPersonal(item: CatalogItem) {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    return render(
+      <QueryClientProvider client={client}>
+        <AddPersonalConnectionHarness item={item} />
+      </QueryClientProvider>,
+    );
+  }
+
+  beforeEach(() => {
+    sessionStorage.clear();
+    nav.search = new URLSearchParams();
+    Object.defineProperty(window, "location", {
+      value: { href: "http://localhost/mcp/registry" },
+      writable: true,
+    });
+    registry.items = [remoteConnectItem, localItemWithPromptedEnv];
+    registry.servers = [];
+    vi.mocked(useInstallMcpServer).mockReturnValue({
+      mutateAsync: vi.fn(),
+      isPending: false,
+    } as unknown as ReturnType<typeof useInstallMcpServer>);
+    initiateOAuth = vi.fn().mockResolvedValue({
+      authorizationUrl: AUTHORIZATION_URL,
+      state: "oauth-state-1",
+    });
+    vi.mocked(useInitiateOAuth).mockReturnValue({
+      mutateAsync: initiateOAuth,
+    } as unknown as ReturnType<typeof useInitiateOAuth>);
+  });
+
+  afterEach(() => {
+    Object.defineProperty(window, "location", {
+      value: originalLocation,
+      writable: true,
+    });
+    vi.clearAllMocks();
+  });
+
+  it("starts OAuth immediately for a remote server (no empty dialog)", async () => {
+    renderAddPersonal(remoteConnectItem);
+
+    await waitFor(() => {
+      expect(initiateOAuth).toHaveBeenCalledWith({ catalogId: CATALOG_ID });
+      expect(window.location.href).toBe(AUTHORIZATION_URL);
+    });
+    expect(screen.queryByTestId("install-dialog")).not.toBeInTheDocument();
+  });
+
+  it("starts OAuth right after the local-install dialog collected env vars", async () => {
+    const user = userEvent.setup();
+    renderAddPersonal(localItemWithPromptedEnv);
+
+    // The env-var dialog still shows (it has real content to collect)…
+    await user.click(await screen.findByTestId("install-dialog-confirm"));
+
+    // …but the follow-up OAuth confirmation is skipped.
+    await waitFor(() => {
+      expect(initiateOAuth).toHaveBeenCalledWith({
+        catalogId: localItemWithPromptedEnv.id,
+      });
+      expect(window.location.href).toBe(AUTHORIZATION_URL);
+    });
+    expect(screen.queryByTestId("install-dialog")).not.toBeInTheDocument();
+  });
+});

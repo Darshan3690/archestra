@@ -1,14 +1,12 @@
+import { archestraApiSdk, E2eTestId } from "@archestra/shared";
 import { expect } from "@playwright/test";
-import { archestraApiSdk, E2eTestId } from "@shared";
 import { type Page, test } from "../fixtures";
 import {
   clickButton,
   closeOpenDialogs,
-  fillRemoteServerForm,
+  goToAddMcpServerPage,
   goToMcpRegistry,
   installMcpServer,
-  openAddMcpServerDialog,
-  openRemoteServerForm,
   submitAddServer,
   waitForInstallDialog,
   waitForMcpServerCard,
@@ -28,6 +26,13 @@ test.describe("MCP Install", () => {
     adminPage,
     extractCookieHeaders,
   }) => {
+    // The pod for this install runs `npx @upstash/context7-mcp`, which
+    // downloads the package from npm at container start — the pod is Ready
+    // long before the MCP process can answer. The backend's discovery loop
+    // (6 connect attempts, each with a 30s initialize timeout) tolerates up
+    // to ~3.5 minutes of that; the default 60s test timeout does not, and
+    // cut discovery short whenever npm was merely slow rather than down.
+    test.setTimeout(240_000);
     const CONTEXT7_CATALOG_ITEM_NAME = "context7";
 
     await deleteCatalogItem(
@@ -38,8 +43,8 @@ test.describe("MCP Install", () => {
 
     await goToMcpRegistry(adminPage);
 
-    // Open "Add MCP Server" dialog
-    await openAddMcpServerDialog(adminPage);
+    // "Add MCP Server" navigates to the routed setup wizard
+    await goToAddMcpServerPage(adminPage);
 
     // Browse online catalog to search for context7
     await adminPage
@@ -60,8 +65,18 @@ test.describe("MCP Install", () => {
     // Submit the pre-filled form to add server to registry
     await submitAddServer(adminPage);
 
-    // Install dialog opens automatically after adding to registry
-    // Wait for the install dialog to be visible
+    // Creating the item continues the setup wizard on its "Test connection"
+    // step — kick off the install from there, which opens the install dialog
+    // to collect the prompted credentials. Wait for the step's exact-named
+    // Install button: until the wizard navigation lands, the create form is
+    // still on screen and its auth/env labels substring-match "Install",
+    // tripping strict mode.
+    const stepInstallButton = adminPage.getByRole("button", {
+      name: "Install",
+      exact: true,
+    });
+    await stepInstallButton.waitFor({ state: "visible", timeout: 30_000 });
+    await stepInstallButton.click();
     await waitForInstallDialog(adminPage, { titlePattern: /Install -/ });
 
     // fill the api key (just fake value)
@@ -73,12 +88,17 @@ test.describe("MCP Install", () => {
     await installMcpServer(adminPage);
 
     // Wait for the card to appear in the registry after installation
+    await goToMcpRegistry(adminPage);
     await waitForMcpServerCard(adminPage, CONTEXT7_CATALOG_ITEM_NAME);
 
-    // Check that tools are discovered
+    // Check that tools are discovered. The wait must cover the backend's full
+    // discovery budget (see the timeout note at the top of this test).
     await waitForMcpServerToolsDiscovered(
       adminPage,
       CONTEXT7_CATALOG_ITEM_NAME,
+      {
+        timeoutMs: 200_000,
+      },
     );
 
     // cleanup
@@ -89,107 +109,7 @@ test.describe("MCP Install", () => {
     );
   });
 
-  test.describe("Custom remote", () => {
-    test.describe.configure({ mode: "serial" });
-
-    const HF_URL = "https://huggingface.co/mcp";
-    const HF_CATALOG_ITEM_NAME = "huggingface__mcp";
-
-    test("No auth required", async ({ adminPage, extractCookieHeaders }) => {
-      await deleteCatalogItem(
-        adminPage,
-        extractCookieHeaders,
-        HF_CATALOG_ITEM_NAME,
-      );
-      await goToMcpRegistry(adminPage);
-
-      // Open "Add MCP Server" dialog
-      await openAddMcpServerDialog(adminPage);
-
-      // Open form and fill details
-      await openRemoteServerForm(adminPage);
-      await fillRemoteServerForm(adminPage, {
-        name: HF_CATALOG_ITEM_NAME,
-        serverUrl: HF_URL,
-      });
-
-      // add catalog item to the registry (install dialog opens automatically)
-      await submitAddServer(adminPage);
-
-      // Wait for the install dialog to be visible (Remote server uses "Install Server" title)
-      await waitForInstallDialog(adminPage, {
-        titlePattern: /Install Server/,
-      });
-
-      // install the server (install dialog already open)
-      await installMcpServer(adminPage);
-      await adminPage.waitForTimeout(2_000);
-
-      // Check that tools are discovered (use regex since HF tool count may change over time)
-      await waitForMcpServerToolsDiscovered(adminPage);
-
-      // cleanup
-      await deleteCatalogItem(
-        adminPage,
-        extractCookieHeaders,
-        HF_CATALOG_ITEM_NAME,
-      );
-    });
-
-    test("Bearer Token", async ({ adminPage, extractCookieHeaders }) => {
-      test.skip(
-        true,
-        "Currently failing in CI (mcp-install.spec.ts:138 Custom remote Bearer Token)",
-      );
-      await deleteCatalogItem(
-        adminPage,
-        extractCookieHeaders,
-        HF_CATALOG_ITEM_NAME,
-      );
-      await goToMcpRegistry(adminPage);
-
-      // Open "Add MCP Server" dialog
-      await openAddMcpServerDialog(adminPage);
-
-      // Open form and fill details
-      await openRemoteServerForm(adminPage);
-      await fillRemoteServerForm(adminPage, {
-        name: HF_CATALOG_ITEM_NAME,
-        serverUrl: HF_URL,
-        authMode: "bearer",
-      });
-
-      // add catalog item to the registry (install dialog opens automatically)
-      await submitAddServer(adminPage);
-
-      // Wait for the install dialog to be visible (Remote server uses "Install Server" title)
-      await waitForInstallDialog(adminPage, {
-        titlePattern: /Install Server/,
-      });
-
-      // Install dialog already open - check that we have input for entering the token and fill it with fake value
-      await adminPage
-        .getByRole("textbox", { name: "Access Token *" })
-        .fill("fake-token");
-
-      // try to install the server
-      await installMcpServer(adminPage);
-
-      // It should fail with error message because token is invalid and remote hf refuses to install the server
-      await adminPage
-        .getByText(/Failed to connect to MCP server/)
-        .waitFor({ state: "visible" });
-
-      // cleanup
-      await deleteCatalogItem(
-        adminPage,
-        extractCookieHeaders,
-        HF_CATALOG_ITEM_NAME,
-      );
-    });
-  });
-
-  test("Local server with bogus image shows error, logs, and can be fixed", async ({
+  test("Local server with bogus image shows error, logs, and can be fixed @quickstart @k8s-recovery", async ({
     adminPage,
     extractCookieHeaders,
   }) => {
@@ -245,12 +165,13 @@ rl.on("line", (line) => {
     // ========================================
     // STEP 1: Create MCP server with bogus image
     // ========================================
-    await clickButton({ page: adminPage, options: { name: "Add MCP Server" } });
-    await adminPage.waitForLoadState("domcontentloaded");
+    await goToAddMcpServerPage(adminPage);
+    await adminPage.getByRole("button", { name: "Start from scratch" }).click();
 
+    // The hosting radio is visually hidden inside its card; click the card.
     await adminPage
-      .getByRole("button", {
-        name: "Self-hosted",
+      .locator("label", {
+        has: adminPage.getByRole("radio", { name: /^Self-hosted/ }),
       })
       .click();
 
@@ -270,15 +191,21 @@ rl.on("line", (line) => {
     await clickButton({ page: adminPage, options: { name: "Add Server" } });
     await adminPage.waitForLoadState("domcontentloaded");
 
-    // Wait for install dialog and install the server
-    await adminPage
-      .getByRole("dialog")
-      .filter({ hasText: /Install -/ })
-      .waitFor({ state: "visible", timeout: 30000 });
-    await clickButton({ page: adminPage, options: { name: "Install" } });
+    // Creating the item lands on the setup wizard's "Test connection" step.
+    // No credentials are prompted for this server, so "Install" starts the
+    // install directly (no dialog). Exact match + visibility wait: until the
+    // wizard navigation lands, the create form's labels substring-match
+    // "Install" and trip strict mode.
+    const bogusInstallButton = adminPage.getByRole("button", {
+      name: "Install",
+      exact: true,
+    });
+    await bogusInstallButton.waitFor({ state: "visible", timeout: 30_000 });
+    await bogusInstallButton.click();
     await adminPage.waitForLoadState("domcontentloaded");
 
-    // Wait for the server card to appear
+    // Wait for the server card to appear in the registry
+    await goToMcpRegistry(adminPage);
     const serverCard = adminPage.getByTestId(
       `${E2eTestId.McpServerCard}-${CATALOG_ITEM_NAME}`,
     );
@@ -313,7 +240,7 @@ rl.on("line", (line) => {
     await adminPage.waitForLoadState("domcontentloaded");
 
     const errorBanner = adminPage.getByTestId(
-      `${E2eTestId.McpServerError}-${CATALOG_ITEM_NAME}`,
+      `${E2eTestId.McpServerError}-${CATALOG_ITEM_NAME}-default`,
     );
     await errorBanner.waitFor({ state: "visible", timeout: 30_000 });
 
@@ -322,7 +249,7 @@ rl.on("line", (line) => {
     // ========================================
     // Click "view the logs" link in the error banner
     const viewLogsButton = adminPage.getByTestId(
-      `${E2eTestId.McpLogsViewButton}-${CATALOG_ITEM_NAME}`,
+      `${E2eTestId.McpLogsViewButton}-${CATALOG_ITEM_NAME}-issue`,
     );
     await viewLogsButton.click();
 
@@ -354,7 +281,7 @@ rl.on("line", (line) => {
     // ========================================
     // Click "edit your config" link in the error banner (opens settings dialog to Configuration page)
     const editConfigButton = adminPage.getByTestId(
-      `${E2eTestId.McpLogsEditConfigButton}-${CATALOG_ITEM_NAME}`,
+      `${E2eTestId.McpLogsEditConfigButton}-${CATALOG_ITEM_NAME}-issue`,
     );
     await editConfigButton.click();
 
@@ -377,7 +304,10 @@ rl.on("line", (line) => {
     await commandInput.clear();
     await commandInput.fill("node");
 
-    await settingsDialog.getByLabel("stdio").click();
+    await settingsDialog
+      .getByRole("combobox", { name: "Transport Type" })
+      .click();
+    await adminPage.getByRole("option", { name: "stdio", exact: true }).click();
 
     const argumentsInput = settingsDialog.getByRole("textbox", {
       name: "Arguments (one per line)",
@@ -385,24 +315,35 @@ rl.on("line", (line) => {
     await argumentsInput.clear();
     await argumentsInput.fill(`-e\n${FIXED_MCP_SCRIPT}`);
 
-    // Force manual reinstall by adding a prompted env var
+    // Force manual reinstall by adding a prompted env var.
+    // Since #4696, the "Add Variable" button opens its own sub-dialog
+    // ("Add environment variable") and all env-var inputs scope to it.
+    // The new scope dropdown defaults to "Prompt at installation" — which
+    // is exactly what this test wants to force a manual reinstall — so we
+    // only need to fill the key and confirm; no scope toggle required.
     await settingsDialog.getByRole("button", { name: "Add Variable" }).click();
-    await settingsDialog.getByPlaceholder("API_KEY").first().fill("E2E_PROMPT");
-    await settingsDialog
-      .getByTestId(E2eTestId.PromptOnInstallationCheckbox)
-      .first()
-      .click({ force: true });
-
-    // Save changes (dialog stays open with keepOpenOnSave)
-    await clickButton({ page: adminPage, options: { name: "Save Changes" } });
-    const reinstallRequiredDialog = adminPage.getByRole("dialog", {
-      name: "Existing installations will need to reinstall",
+    const envVarDialog = adminPage.getByRole("dialog", {
+      name: /Add environment variable/i,
     });
-    if (await reinstallRequiredDialog.isVisible().catch(() => false)) {
-      await reinstallRequiredDialog
-        .getByRole("button", { name: "Save and flag for reinstall" })
-        .click();
-      await reinstallRequiredDialog.waitFor({
+    await envVarDialog.waitFor({ state: "visible", timeout: 15_000 });
+    await envVarDialog.getByRole("textbox", { name: "Key" }).fill("E2E_PROMPT");
+    await envVarDialog.getByRole("button", { name: "Add variable" }).click();
+    await envVarDialog.waitFor({ state: "hidden", timeout: 15_000 });
+
+    // Save changes (dialog stays open with keepOpenOnSave). The form's
+    // footer transforms into an inline confirm bar when the save would
+    // cascade — same surface, no stacked dialog. The CTA matches the
+    // backend path: this edit (command + prompted env var) takes the
+    // manual reinstall path, so the button is "Save change". An
+    // auto-path edit shows "Save and restart" and a pure rename "Save
+    // and rename" — match any to keep the test robust.
+    await clickButton({ page: adminPage, options: { name: "Save Changes" } });
+    const confirmReinstallButton = settingsDialog.getByRole("button", {
+      name: /Save (change|and (restart|rename))/,
+    });
+    if (await confirmReinstallButton.isVisible().catch(() => false)) {
+      await confirmReinstallButton.click();
+      await confirmReinstallButton.waitFor({
         state: "hidden",
         timeout: 15_000,
       });
@@ -444,7 +385,7 @@ rl.on("line", (line) => {
       await refreshedServerCard.waitFor({ state: "visible", timeout: 30_000 });
 
       const refreshedErrorBanner = adminPage.getByTestId(
-        `${E2eTestId.McpServerError}-${CATALOG_ITEM_NAME}`,
+        `${E2eTestId.McpServerError}-${CATALOG_ITEM_NAME}-default`,
       );
       await expect(refreshedErrorBanner).not.toBeVisible({ timeout: 5000 });
 

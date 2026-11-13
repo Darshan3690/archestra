@@ -1,32 +1,160 @@
-import { RouteId, SupportedProvidersSchema } from "@shared";
+import { randomUUID } from "node:crypto";
+import {
+  createPaginatedResponseSchema,
+  credentialRequiresPerUserScope,
+  PaginationQuerySchema,
+  parseLabelsParam,
+  perUserCredentialLabel,
+  providerRequiresPerUserCredential,
+  ResourceAccessQuerySchema,
+  ResourceOwnerQuerySchema,
+  ResourcePermissionGrantSchema,
+  ResourceSharedWithQuerySchema,
+  RouteId,
+  SupportedProvidersSchema,
+} from "@archestra/shared";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
+import { requireOauthClientAccess } from "@/auth/oauth-client-permissions";
 import {
-  AgentModel,
   LlmOauthClientModel,
   LlmProviderApiKeyModel,
+  OauthClientLabelModel,
 } from "@/models";
+import ResourcePermissionSubjectModel from "@/models/resource-permission-subject";
+import { getSecretValueForLlmProviderApiKey } from "@/secrets-manager";
+import { credentialBilling } from "@/services/credential-billing";
+import { validateOauthServiceAccountBinding } from "@/services/oauth-service-account";
+import { ResourcePermissions } from "@/services/resource-permissions";
 import {
   ApiError,
+  CredentialSpendCapInputSchema,
   constructResponseSchema,
+  LabelWithDetailsSchema,
+  LlmOauthClientGrantTypeSchema,
   LlmOauthClientSchema,
   LlmOauthClientWithSecretSchema,
 } from "@/types";
+import { assertValidProviderKeyMappings } from "@/utils/provider-key-mappings";
+import { BulkDeleteBodySchema, BulkOutcomeSchema, runBulk } from "./bulk-route";
+import { registerEntityLabelRoutes } from "./entity-labels";
 
 const LlmOauthClientProviderKeyBodySchema = z.object({
   provider: SupportedProvidersSchema,
   providerApiKeyId: z.string().uuid(),
 });
 
-const CreateLlmOauthClientBodySchema = z.object({
-  name: z.string().min(1).max(256),
-  allowedLlmProxyIds: z.array(z.string().uuid()).min(1),
-  providerApiKeys: z.array(LlmOauthClientProviderKeyBodySchema).min(1),
-});
+/**
+ * Both grant types share one body shape. `grantType` defaults to
+ * `client_credentials` so existing callers keep working unchanged.
+ * - client_credentials: a shared application credential scoped to the
+ *   organization; requires `providerApiKeys`. `redirectUris` is ignored.
+ * - authorization_code: requires `redirectUris`; its tokens are user-bound, so
+ *   the proxy resolves the acting user's own provider keys, cost limits, and
+ *   policies. `providerApiKeys` never apply — the acting user's own keys
+ *   resolve at call time.
+ *
+ * Who can see and manage the client is its grants, edited on its Permissions
+ * tab; they never change what its tokens can reach.
+ */
+const LlmOauthClientFields = z
+  .object({
+    name: z.string().min(1).max(256),
+    serviceAccountId: z.string().uuid().nullable().optional(),
+    grantType: LlmOauthClientGrantTypeSchema.default("client_credentials"),
+    providerApiKeys: z.array(LlmOauthClientProviderKeyBodySchema).optional(),
+    redirectUris: z.array(z.string().url()).optional(),
+    labels: z
+      .array(LabelWithDetailsSchema)
+      .optional()
+      .describe(
+        "Key/value labels. Omit to leave existing labels untouched; pass [] " +
+          "to clear them.",
+      ),
+    billingTeamId: z
+      .string()
+      .nullable()
+      .optional()
+      .describe(
+        "Team a client_credentials client's spend is charged to. Omit to " +
+          "keep it; null stops billing a team. Signed-in users of an " +
+          "authorization_code client pay for themselves.",
+      ),
+    spendCap: CredentialSpendCapInputSchema.nullable()
+      .optional()
+      .describe(
+        "Spend cap for the whole client, stored as a token_cost limit on it. " +
+          "Omit to keep it; null removes it.",
+      ),
+  })
+  .strict();
 
-const UpdateLlmOauthClientBodySchema = CreateLlmOauthClientBodySchema;
+const validateLlmOauthClientBody = (
+  value: z.infer<typeof LlmOauthClientFields>,
+  ctx: z.RefinementCtx,
+) => {
+  if (value.grantType === "authorization_code") {
+    if (value.serviceAccountId)
+      ctx.addIssue({
+        code: "custom",
+        path: ["serviceAccountId"],
+        message: "Only client_credentials clients can act as a service account",
+      });
+    if (!value.redirectUris || value.redirectUris.length === 0) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["redirectUris"],
+        message:
+          "At least one redirect URI is required for authorization_code clients",
+      });
+    }
+    if (value.billingTeamId) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["billingTeamId"],
+        message:
+          "authorization_code clients cannot bill a team: each signed-in user pays for their own usage",
+      });
+    }
+    return;
+  }
+  if (!value.providerApiKeys || value.providerApiKeys.length === 0) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["providerApiKeys"],
+      message:
+        "At least one provider API key is required for client_credentials clients",
+    });
+  }
+};
+
+const CreateLlmOauthClientBodySchema = LlmOauthClientFields.extend({
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  initialGrants: z
+    .array(ResourcePermissionGrantSchema)
+    .max(200)
+    .optional()
+    .describe(
+      "Who else starts with access, beside the creator who always gets full access.",
+    ),
+  // SPDX-SnippetEnd
+}).superRefine(validateLlmOauthClientBody);
+const UpdateLlmOauthClientBodySchema = LlmOauthClientFields.superRefine(
+  validateLlmOauthClientBody,
+);
 
 const llmOauthClientsRoutes: FastifyPluginAsyncZod = async (fastify) => {
+  registerEntityLabelRoutes(fastify, {
+    basePath: "/api/llm-oauth-clients",
+    tag: "LLM OAuth Clients",
+    entityNamePlural: "LLM OAuth clients",
+    model: OauthClientLabelModel,
+    keysOperationId: RouteId.GetLlmOauthClientLabelKeys,
+    valuesOperationId: RouteId.GetLlmOauthClientLabelValues,
+  });
+
   fastify.get(
     "/api/llm-oauth-clients",
     {
@@ -34,13 +162,43 @@ const llmOauthClientsRoutes: FastifyPluginAsyncZod = async (fastify) => {
         operationId: RouteId.GetLlmOauthClients,
         description: "List LLM OAuth clients that can access LLM proxies",
         tags: ["LLM OAuth Clients"],
-        response: constructResponseSchema(z.array(LlmOauthClientSchema)),
+        querystring: PaginationQuerySchema.extend({
+          search: z.string().trim().min(1).optional(),
+          providerApiKeyId: z.string().uuid().optional(),
+          grantType: LlmOauthClientGrantTypeSchema.optional(),
+          labels: z
+            .string()
+            .optional()
+            .describe(
+              "Filter by labels. Format: key1:val1|val2;key2:val3. AND across keys, OR within values.",
+            ),
+          access: ResourceAccessQuerySchema,
+          sharedWith: ResourceSharedWithQuerySchema,
+          owner: ResourceOwnerQuerySchema,
+        }),
+        response: constructResponseSchema(
+          createPaginatedResponseSchema(LlmOauthClientSchema),
+        ),
       },
     },
-    async ({ organizationId }, reply) => {
-      const oauthClients =
-        await LlmOauthClientModel.findAllByOrganization(organizationId);
-      return reply.send(oauthClients);
+    async ({ user, organizationId, query }, reply) => {
+      const result = await LlmOauthClientModel.findPageByOrganization({
+        organizationId,
+        pagination: { limit: query.limit, offset: query.offset },
+        search: query.search,
+        providerApiKeyId: query.providerApiKeyId,
+        grantType: query.grantType,
+        labels: parseLabelsParam(query.labels),
+        viewer: { userId: user.id },
+        access: await ResourcePermissionSubjectModel.resolveAccessFilter({
+          userId: user.id,
+          organizationId,
+          relations: query.access,
+          sharedWith: query.sharedWith,
+          ownerIds: query.owner,
+        }),
+      });
+      return reply.send(result);
     },
   );
 
@@ -56,15 +214,74 @@ const llmOauthClientsRoutes: FastifyPluginAsyncZod = async (fastify) => {
         response: constructResponseSchema(LlmOauthClientWithSecretSchema),
       },
     },
-    async ({ body, organizationId }, reply) => {
-      await validateLlmOauthClientConfig({ ...body, organizationId });
-      const { oauthClient, clientSecret } = await LlmOauthClientModel.create({
+    async ({ body, user, organizationId }, reply) => {
+      if (body.initialGrants?.length) {
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        await ResourcePermissions.validateInitialGrants({
+          organizationId,
+          userId: user.id,
+          resource: "oauthClient",
+          grants: body.initialGrants,
+          target: {
+            id: randomUUID(),
+            name: body.name,
+            authorId: user.id,
+          },
+        });
+        // SPDX-SnippetEnd
+      }
+
+      await validateLlmOauthClientConfig({
+        organizationId,
+        // provider keys only apply to client_credentials clients.
+        providerApiKeys:
+          body.grantType === "client_credentials"
+            ? (body.providerApiKeys ?? [])
+            : [],
+      });
+      await credentialBilling.assertCanSetBillingTeam({
+        organizationId,
+        userId: user.id,
+        teamId: body.billingTeamId,
+      });
+      const serviceAccountId = await validateOauthServiceAccountBinding({
+        ...body,
+        organizationId,
+        userId: user.id,
+        creating: true,
+      });
+      const created = await LlmOauthClientModel.create({
         organizationId,
         name: body.name,
-        allowedLlmProxyIds: body.allowedLlmProxyIds,
+        grantType: body.grantType,
+        serviceAccountId,
         providerApiKeys: body.providerApiKeys,
+        redirectUris: body.redirectUris,
+        authorId: user.id,
+        initialGrants: body.initialGrants,
+        billingTeamId: body.billingTeamId,
       });
-      return reply.send({ ...oauthClient, clientSecret });
+      if (body.labels?.length) {
+        await OauthClientLabelModel.syncLabels(
+          created.oauthClient.id,
+          body.labels,
+        );
+      }
+      await credentialBilling.applySpendCap({
+        entityType: "llm_oauth_client",
+        entityId: created.oauthClient.id,
+        cap: body.spendCap,
+      });
+      const oauthClient = await LlmOauthClientModel.findById({
+        id: created.oauthClient.id,
+        organizationId,
+      });
+      if (!oauthClient) {
+        throw new ApiError(500, "LLM OAuth client disappeared after creation");
+      }
+      return reply.send({ ...oauthClient, clientSecret: created.clientSecret });
     },
   );
 
@@ -80,17 +297,80 @@ const llmOauthClientsRoutes: FastifyPluginAsyncZod = async (fastify) => {
         response: constructResponseSchema(LlmOauthClientSchema),
       },
     },
-    async ({ params, body, organizationId }, reply) => {
-      await validateLlmOauthClientConfig({ ...body, organizationId });
-      const oauthClient = await LlmOauthClientModel.update({
+    async ({ params, body, user, organizationId }, reply) => {
+      await requireOauthClientAccess({
+        organizationId,
+        userId: user.id,
+        resource: "oauthClient",
+        id: params.id,
+        action: "update",
+      });
+
+      await validateLlmOauthClientConfig({
+        organizationId,
+        // provider keys only apply to client_credentials clients.
+        providerApiKeys:
+          body.grantType === "client_credentials"
+            ? (body.providerApiKeys ?? [])
+            : [],
+      });
+      const existing = await LlmOauthClientModel.findById({
+        id: params.id,
+        organizationId,
+      });
+      if (!existing) {
+        throw new ApiError(404, "LLM OAuth client not found");
+      }
+      await credentialBilling.assertCanSetBillingTeam({
+        organizationId,
+        userId: user.id,
+        teamId: body.billingTeamId,
+        currentTeamId: existing.billingTeamId,
+      });
+      await credentialBilling.assertCanSetSpendCap({
+        organizationId,
+        userId: user.id,
+        cap: body.spendCap,
+        current: existing.spendCap,
+      });
+      const serviceAccountId = await validateOauthServiceAccountBinding({
+        serviceAccountId: body.serviceAccountId,
+        grantType: existing.grantType,
+        organizationId,
+        userId: user.id,
+      });
+      const updated = await LlmOauthClientModel.update({
         id: params.id,
         organizationId,
         name: body.name,
-        allowedLlmProxyIds: body.allowedLlmProxyIds,
+        serviceAccountId,
         providerApiKeys: body.providerApiKeys,
+        redirectUris: body.redirectUris,
+        billingTeamId: body.billingTeamId,
       });
-      if (!oauthClient) {
+      if (!updated) {
         throw new ApiError(404, "LLM OAuth client not found");
+      }
+      await credentialBilling.applySpendCap({
+        entityType: "llm_oauth_client",
+        entityId: params.id,
+        cap: body.spendCap,
+      });
+      const oauthClient =
+        body.spendCap === undefined
+          ? updated
+          : ((await LlmOauthClientModel.findById({
+              id: params.id,
+              organizationId,
+            })) ?? updated);
+      // Only touch labels when the caller sent them, so an update that omits
+      // the field leaves existing labels alone.
+      if (body.labels !== undefined) {
+        await OauthClientLabelModel.syncLabels(params.id, body.labels);
+        return reply.send({
+          ...oauthClient,
+          labels: await OauthClientLabelModel.getLabelsFor(params.id),
+        });
       }
       return reply.send(oauthClient);
     },
@@ -107,7 +387,14 @@ const llmOauthClientsRoutes: FastifyPluginAsyncZod = async (fastify) => {
         response: constructResponseSchema(LlmOauthClientWithSecretSchema),
       },
     },
-    async ({ params, organizationId }, reply) => {
+    async ({ params, user, organizationId }, reply) => {
+      await requireOauthClientAccess({
+        organizationId,
+        userId: user.id,
+        resource: "oauthClient",
+        id: params.id,
+        action: "update",
+      });
       const result = await LlmOauthClientModel.rotateSecret({
         id: params.id,
         organizationId,
@@ -133,7 +420,14 @@ const llmOauthClientsRoutes: FastifyPluginAsyncZod = async (fastify) => {
         response: constructResponseSchema(z.object({ success: z.boolean() })),
       },
     },
-    async ({ params, organizationId }, reply) => {
+    async ({ params, user, organizationId }, reply) => {
+      await requireOauthClientAccess({
+        organizationId,
+        userId: user.id,
+        resource: "oauthClient",
+        id: params.id,
+        action: "delete",
+      });
       const success = await LlmOauthClientModel.delete({
         id: params.id,
         organizationId,
@@ -144,39 +438,89 @@ const llmOauthClientsRoutes: FastifyPluginAsyncZod = async (fastify) => {
       return reply.send({ success });
     },
   );
+
+  fastify.delete(
+    "/api/llm-oauth-clients/bulk",
+    {
+      schema: {
+        operationId: RouteId.BulkDeleteLlmOauthClients,
+        description:
+          "Delete several LLM OAuth clients in one request. Each id is " +
+          "authorized exactly as the single-client delete authorizes its " +
+          "own, so a client the caller cannot see or manage is reported in " +
+          "`failed` while the rest of the batch still applies.",
+        tags: ["LLM OAuth Clients"],
+        body: BulkDeleteBodySchema,
+        response: constructResponseSchema(BulkOutcomeSchema),
+      },
+    },
+    async (request, reply) => {
+      const { organizationId, user, body } = request;
+
+      const snapshot = async (ids: string[]) => {
+        const clients = await LlmOauthClientModel.findByIds({
+          ids,
+          organizationId,
+        });
+        return {
+          llmOauthClients: clients
+            .map(({ id, name }) => ({ id, name }))
+            .sort((a, b) => a.id.localeCompare(b.id)),
+        };
+      };
+
+      const outcome = await runBulk({
+        ids: body.ids,
+        logLabel: "LLM OAuth clients bulk delete",
+        notFoundMessage: "LLM OAuth client not found",
+        unexpectedMessage: "Could not delete this LLM OAuth client",
+        load: async (ids) =>
+          new Map(
+            (
+              await LlmOauthClientModel.findByIds({
+                ids,
+                organizationId,
+                viewer: { userId: user.id },
+              })
+            ).map((client) => [client.id, client]),
+          ),
+        describe: (client) => client.name,
+        authorize: async (client) => {
+          await requireOauthClientAccess({
+            organizationId,
+            userId: user.id,
+            resource: "oauthClient",
+            id: client.id,
+            action: "delete",
+          });
+        },
+        applyEach: async (_client, id) => {
+          const deleted = await LlmOauthClientModel.delete({
+            id,
+            organizationId,
+          });
+          if (!deleted) {
+            throw new ApiError(404, "LLM OAuth client not found");
+          }
+        },
+        audit: { target: request, snapshot },
+      });
+
+      return reply.send(outcome);
+    },
+  );
 };
 
 export default llmOauthClientsRoutes;
 
 async function validateLlmOauthClientConfig(params: {
   organizationId: string;
-  allowedLlmProxyIds: string[];
   providerApiKeys: Array<{
     provider: z.infer<typeof SupportedProvidersSchema>;
     providerApiKeyId: string;
   }>;
 }) {
-  const seenProviders = new Set<string>();
-  for (const mapping of params.providerApiKeys) {
-    if (seenProviders.has(mapping.provider)) {
-      throw new ApiError(
-        400,
-        `Only one provider API key can be mapped for provider "${mapping.provider}"`,
-      );
-    }
-    seenProviders.add(mapping.provider);
-  }
-
-  for (const proxyId of params.allowedLlmProxyIds) {
-    const agent = await AgentModel.findById(proxyId);
-    if (
-      !agent ||
-      agent.organizationId !== params.organizationId ||
-      agent.agentType !== "llm_proxy"
-    ) {
-      throw new ApiError(404, "LLM proxy not found");
-    }
-  }
+  assertValidProviderKeyMappings(params.providerApiKeys);
 
   for (const mapping of params.providerApiKeys) {
     const apiKey = await LlmProviderApiKeyModel.findById(
@@ -189,6 +533,26 @@ async function validateLlmOauthClientConfig(params: {
       throw new ApiError(
         400,
         `Provider API key "${apiKey.name}" is for ${apiKey.provider}, not ${mapping.provider}`,
+      );
+    }
+    // OAuth client credentials are a shared service credential with no acting
+    // user. Resolve credential-level markers as well as provider-level cases:
+    // OpenAI/xAI may contain either a normal API key or one person's subscription.
+    const secret =
+      apiKey.secretId && !providerRequiresPerUserCredential(mapping.provider)
+        ? ((await getSecretValueForLlmProviderApiKey(apiKey.secretId)) as
+            | string
+            | undefined)
+        : undefined;
+    if (
+      credentialRequiresPerUserScope({
+        provider: mapping.provider,
+        apiKey: secret,
+      })
+    ) {
+      throw new ApiError(
+        400,
+        `${perUserCredentialLabel({ provider: mapping.provider, apiKey: secret })} is per-user and cannot be mapped to an OAuth client; each user connects their own account.`,
       );
     }
   }

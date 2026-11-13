@@ -14,18 +14,266 @@
  *   directly through reply.raw.write().
  */
 
+import { Readable } from "node:stream";
+import {
+  CLAUDE_CLIENT_ID,
+  CLAUDE_CODE_CLIENT_ID,
+  CLAUDE_METADATA_SESSION_SOURCE,
+  resolveAgentRuntimeTiers,
+} from "@archestra/shared";
 import Fastify, { type FastifyInstance } from "fastify";
 import {
   serializerCompiler,
   validatorCompiler,
   type ZodTypeProvider,
 } from "fastify-type-provider-zod";
+import { Agent as UndiciAgent } from "undici";
 import { vi } from "vitest";
-import { ModelModel, VirtualApiKeyModel } from "@/models";
+import { attestToolDescription } from "@/archestra-mcp-server/tool-attestation";
+import { internalCallHeader } from "@/clients/internal-call";
+import config from "@/config";
+import { agentRuntimeManager } from "@/k8s/agent-runtime";
+import logger from "@/logging";
+import {
+  A2AContextModel,
+  A2ATaskModel,
+  AgentRunModel,
+  AgentWorkspaceModel,
+  ModelModel,
+  OrganizationModel,
+  VirtualApiKeyModel,
+} from "@/models";
+import ClaudeCodeAccountModel from "@/models/claude-code-account";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import { mintChildTrajectoryReceipt } from "@/openappa/child-trajectory-receipt";
+import { buildNoticeArguments, type RemedyExecution } from "@/openappa/notice";
+import {
+  formatSessionReceipt,
+  mintReceiptCode,
+} from "@/openappa/session-token";
+import { stampToolCallId } from "@/openappa/trajectory-stamp";
+import { secretManager } from "@/secrets-manager";
+import { handleServerError } from "@/server/error-handler";
+import { buildAgentRunLaunchSpec } from "@/services/agent-runtime/launch-spec";
+import { resolveAgentRunLimits } from "@/services/agent-runtime/runtime-tiers";
+import { getObservedClaudeCodeToolTokenCount } from "@/services/claude-code-tool-token-count";
+import { llmToolCallSessions } from "@/services/llm-tool-call-sessions";
+import { buildClaudeMcpToolDefinitions } from "@/services/mcp-tool-token-estimate";
 import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import { setupTestCacheManager } from "@/test/cache-manager";
 import { createAnthropicTestClient } from "@/test/llm-provider-stubs";
+import { makePassthroughCredential } from "@/test/llm-proxy-credentials";
+import { spyOnLogger } from "@/test/logging";
+import { drainBackgroundWork } from "@/utils/background-work";
 import { anthropicAdapterFactory } from "../adapters";
 import anthropicProxyRoutes from "./anthropic";
+
+spyOnLogger();
+
+beforeEach(async () => {
+  for (const modelId of [
+    "claude-opus-4-20250514",
+    "claude-3-5-sonnet-20241022",
+    "kimi-k2",
+  ]) {
+    await ModelModel.create({
+      externalId: `anthropic/${modelId}`,
+      provider: "anthropic",
+      modelId,
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+    });
+  }
+});
+
+function findAnthropicRequestLog(message: string) {
+  return vi
+    .mocked(logger.info)
+    .mock.calls.find((call) => call[1] === message)?.[0] as
+    | {
+        headers?: Record<string, unknown>;
+      }
+    | undefined;
+}
+
+describe("Anthropic request logging", () => {
+  beforeEach(() => {
+    vi.spyOn(anthropicAdapterFactory, "createClient").mockImplementation(
+      () => createAnthropicTestClient() as never,
+    );
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test("summarizes default-agent headers without logging secret values", async () => {
+    const app = Fastify().withTypeProvider<ZodTypeProvider>();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+
+    try {
+      await app.register(anthropicProxyRoutes);
+      vi.mocked(logger.info).mockClear();
+
+      await app.inject({
+        method: "POST",
+        url: "/v1/anthropic/v1/messages",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer leaked-authorization-token",
+          "anthropic-version": "2023-06-01",
+          "x-api-key": "leaked-x-api-key",
+        },
+        payload: {
+          model: "claude-opus-4-20250514",
+          messages: [{ role: "user", content: "Hello!" }],
+          max_tokens: 128,
+        },
+      });
+
+      const requestLog = findAnthropicRequestLog(
+        "[UnifiedProxy] Handling Anthropic request (default agent)",
+      );
+
+      expect(requestLog).toBeDefined();
+      expect(JSON.stringify(requestLog)).not.toContain(
+        "leaked-authorization-token",
+      );
+      expect(JSON.stringify(requestLog)).not.toContain("leaked-x-api-key");
+      expect(requestLog?.headers).toEqual(
+        expect.objectContaining({
+          contentType: "application/json",
+          anthropicVersion: "2023-06-01",
+          hasAuthorization: true,
+          hasXApiKey: true,
+        }),
+      );
+    } finally {
+      await app.close();
+    }
+  });
+
+  test("summarizes agent headers without logging secret values", async ({
+    makeAgent,
+  }) => {
+    const app = Fastify().withTypeProvider<ZodTypeProvider>();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+
+    try {
+      await app.register(anthropicProxyRoutes);
+      vi.mocked(logger.info).mockClear();
+
+      const agent = await makeAgent({ name: "Request Logging Agent" });
+
+      await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${agent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer leaked-agent-authorization-token",
+          "anthropic-version": "2023-06-01",
+          "x-api-key": "leaked-agent-x-api-key",
+        },
+        payload: {
+          model: "claude-opus-4-20250514",
+          messages: [{ role: "user", content: "Hello!" }],
+          max_tokens: 128,
+        },
+      });
+
+      const requestLog = findAnthropicRequestLog(
+        "[UnifiedProxy] Handling Anthropic request (with agent)",
+      );
+
+      expect(requestLog).toBeDefined();
+      expect(JSON.stringify(requestLog)).not.toContain(
+        "leaked-agent-authorization-token",
+      );
+      expect(JSON.stringify(requestLog)).not.toContain(
+        "leaked-agent-x-api-key",
+      );
+      expect(requestLog?.headers).toEqual(
+        expect.objectContaining({
+          contentType: "application/json",
+          anthropicVersion: "2023-06-01",
+          hasAuthorization: true,
+          hasXApiKey: true,
+        }),
+      );
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe("Anthropic anthropic-beta forwarding", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // Drive a real /messages request and return the headers the handler actually
+  // hands the upstream client (the strip/forward decision's observable effect).
+  async function forwardedHeaders(agentId: string, model: string) {
+    let captured: Record<string, string> | undefined;
+    vi.spyOn(anthropicAdapterFactory, "createClient").mockImplementation(((
+      _apiKey: string | undefined,
+      options: unknown,
+    ) => {
+      captured = (options as { defaultHeaders?: Record<string, string> })
+        ?.defaultHeaders;
+      return createAnthropicTestClient() as never;
+    }) as never);
+
+    const app = Fastify().withTypeProvider<ZodTypeProvider>();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    app.setErrorHandler(handleServerError);
+    await app.register(anthropicProxyRoutes);
+    try {
+      await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${agentId}/v1/messages`,
+        remoteAddress: "127.0.0.1",
+        headers: {
+          ...internalCallHeader(),
+          "content-type": "application/json",
+          authorization: "Bearer test-key",
+          "anthropic-version": "2023-06-01",
+          "anthropic-beta": "pdfs-2024-09-25",
+          "x-api-key": "test-anthropic-key",
+          // Loopback-only override that marks the upstream as a custom base URL.
+          "x-archestra-provider-base-url": "http://localhost:9/v1",
+        },
+        payload: {
+          model,
+          messages: [{ role: "user", content: "Hello!" }],
+          max_tokens: 128,
+        },
+      });
+    } finally {
+      await app.close();
+    }
+    return captured;
+  }
+
+  test("strips anthropic-beta for a non-Claude model on a custom base URL", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "Beta Strip Agent" });
+    const headers = await forwardedHeaders(agent.id, "kimi-k2");
+    expect(headers?.["anthropic-beta"]).toBeUndefined();
+  });
+
+  test("forwards anthropic-beta for a Claude model on a custom base URL", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "Beta Forward Agent" });
+    const headers = await forwardedHeaders(agent.id, "claude-opus-4-20250514");
+    expect(headers?.["anthropic-beta"]).toBe("pdfs-2024-09-25");
+  });
+});
 
 describe("Anthropic cost tracking", () => {
   beforeEach(() => {
@@ -38,7 +286,11 @@ describe("Anthropic cost tracking", () => {
     vi.restoreAllMocks();
   });
 
-  test("stores cost and baselineCost in interaction", async ({ makeAgent }) => {
+  test("stores cost and baselineCost in interaction", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
     const app = Fastify().withTypeProvider<ZodTypeProvider>();
     app.setValidatorCompiler(validatorCompiler);
     app.setSerializerCompiler(serializerCompiler);
@@ -57,6 +309,12 @@ describe("Anthropic cost tracking", () => {
     });
 
     const agent = await makeAgent({ name: "Test Cost Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const platformCredential = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
 
     const response = await app.inject({
       method: "POST",
@@ -64,6 +322,7 @@ describe("Anthropic cost tracking", () => {
       headers: {
         "content-type": "application/json",
         authorization: "Bearer test-key",
+        "x-archestra-virtual-key": platformCredential,
         "user-agent": "test-client",
         "anthropic-version": "2023-06-01",
         "x-api-key": "test-anthropic-key",
@@ -110,6 +369,8 @@ describe("Anthropic streaming mode", () => {
 
   test("streaming mode completes normally and records interaction", async ({
     makeAgent,
+    makeMember,
+    makeUser,
   }) => {
     const app = Fastify().withTypeProvider<ZodTypeProvider>();
     app.setValidatorCompiler(validatorCompiler);
@@ -129,6 +390,12 @@ describe("Anthropic streaming mode", () => {
     });
 
     const agent = await makeAgent({ name: "Test Streaming Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const platformCredential = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
 
     const { InteractionModel } = await import("@/models");
 
@@ -142,6 +409,7 @@ describe("Anthropic streaming mode", () => {
       headers: {
         "content-type": "application/json",
         authorization: "Bearer test-key",
+        "x-archestra-virtual-key": platformCredential,
         "user-agent": "test-client",
         "anthropic-version": "2023-06-01",
         "x-api-key": "test-anthropic-key",
@@ -182,7 +450,7 @@ describe("Anthropic streaming mode", () => {
 
   test("streaming mode interrupted still records interaction", {
     timeout: 10000,
-  }, async ({ makeAgent }) => {
+  }, async ({ makeAgent, makeMember, makeUser }) => {
     const app = Fastify().withTypeProvider<ZodTypeProvider>();
     app.setValidatorCompiler(validatorCompiler);
     app.setSerializerCompiler(serializerCompiler);
@@ -206,6 +474,12 @@ describe("Anthropic streaming mode", () => {
     const agent = await makeAgent({
       name: "Test Interrupted Streaming Agent",
     });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const platformCredential = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
 
     const { InteractionModel } = await import("@/models");
 
@@ -219,6 +493,7 @@ describe("Anthropic streaming mode", () => {
       headers: {
         "content-type": "application/json",
         authorization: "Bearer test-key",
+        "x-archestra-virtual-key": platformCredential,
         "user-agent": "test-client",
         "anthropic-version": "2023-06-01",
         "x-api-key": "test-anthropic-key",
@@ -332,6 +607,204 @@ describe("Anthropic virtual key auth", () => {
   });
 });
 
+describe("Anthropic Claude Code requests", () => {
+  let platformCredential: string;
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // Captures what the proxy forwards upstream so tests can assert messages
+  // survive validation unchanged.
+  function captureUpstreamParams() {
+    const stub = createAnthropicTestClient();
+    const captured: { params?: { messages?: unknown[]; thinking?: unknown } } =
+      {};
+    vi.spyOn(anthropicAdapterFactory, "createClient").mockImplementation(
+      () =>
+        ({
+          messages: {
+            create: async (params: never) => {
+              captured.params = params;
+              return stub.messages.create(params);
+            },
+          },
+        }) as never,
+    );
+    return captured;
+  }
+
+  async function buildApp() {
+    const app = Fastify().withTypeProvider<ZodTypeProvider>();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    app.setErrorHandler(handleServerError);
+    await app.register(anthropicProxyRoutes);
+    return app;
+  }
+
+  function injectMessages(
+    app: FastifyInstance,
+    agentId: string,
+    body: { messages: unknown[]; thinking?: unknown },
+  ) {
+    return app.inject({
+      method: "POST",
+      url: `/v1/anthropic/${agentId}/v1/messages`,
+      headers: {
+        "content-type": "application/json",
+        "user-agent": "claude-cli/2.1.173 (external, sdk-cli)",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta":
+          "claude-code-20250219,mid-conversation-system-2026-04-07,interleaved-thinking-2025-05-14",
+        "x-api-key": "test-anthropic-key",
+        "x-archestra-virtual-key": platformCredential,
+      },
+      payload: {
+        model: "claude-opus-4-20250514",
+        max_tokens: 1024,
+        ...body,
+      },
+    });
+  }
+
+  // Claude Code (anthropic-beta: mid-conversation-system-2026-04-07) injects
+  // `role: "system"` messages into `messages` for hook output. The proxy must
+  // accept them and forward them upstream unchanged.
+  test("accepts and forwards mid-conversation system messages", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    const captured = captureUpstreamParams();
+    const app = await buildApp();
+
+    try {
+      const agent = await makeAgent({ name: "System Role Agent" });
+      const owner = await makeUser();
+      await makeMember(owner.id, agent.organizationId);
+      platformCredential = await makePassthroughCredential({
+        organizationId: agent.organizationId,
+        ownerId: owner.id,
+      });
+      const systemMessage = {
+        role: "system",
+        content: "SessionStart:startup hook success: OK",
+      };
+
+      const response = await injectMessages(app, agent.id, {
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "hi" },
+              {
+                type: "text",
+                text: "<system-reminder>context</system-reminder>",
+                cache_control: { type: "ephemeral" },
+              },
+            ],
+          },
+          systemMessage,
+        ],
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(captured.params?.messages?.[1]).toEqual(systemMessage);
+    } finally {
+      await app.close();
+    }
+  });
+
+  // Interleaved thinking puts thinking/redacted_thinking blocks in assistant
+  // history; server tools and future betas add more block types. All must
+  // pass validation and reach the upstream with every field intact (the
+  // thinking signature in particular is required on replay).
+  test("accepts and forwards thinking, server-tool and unknown content blocks", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    const captured = captureUpstreamParams();
+    const app = await buildApp();
+
+    try {
+      const agent = await makeAgent({ name: "Thinking Blocks Agent" });
+      const owner = await makeUser();
+      await makeMember(owner.id, agent.organizationId);
+      platformCredential = await makePassthroughCredential({
+        organizationId: agent.organizationId,
+        ownerId: owner.id,
+      });
+      const assistantMessage = {
+        role: "assistant",
+        content: [
+          {
+            type: "thinking",
+            thinking: "Let me think...",
+            signature: "sig-abc",
+          },
+          { type: "redacted_thinking", data: "opaque-bytes" },
+          {
+            type: "server_tool_use",
+            id: "srvtoolu_1",
+            name: "web_search",
+            input: { query: "archestra" },
+            caller: { type: "direct" },
+          },
+          {
+            type: "block_type_from_a_future_beta",
+            payload: { anything: true },
+          },
+          { type: "text", text: "Done." },
+        ],
+      };
+
+      const response = await injectMessages(app, agent.id, {
+        messages: [{ role: "user", content: "hi" }, assistantMessage],
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(captured.params?.messages?.[1]).toEqual(assistantMessage);
+    } finally {
+      await app.close();
+    }
+  });
+
+  // Claude Code sends `display: "updates"` on interactive requests. When the
+  // proxy answers 400, Claude Code sends the request again without `display`
+  // and stops sending it for the rest of the conversation.
+  test("accepts and forwards Claude Code's thinking display mode", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    const captured = captureUpstreamParams();
+    const app = await buildApp();
+
+    try {
+      const agent = await makeAgent({ name: "Thinking Display Agent" });
+      const owner = await makeUser();
+      await makeMember(owner.id, agent.organizationId);
+      platformCredential = await makePassthroughCredential({
+        organizationId: agent.organizationId,
+        ownerId: owner.id,
+      });
+      const thinking = { type: "adaptive", display: "updates" };
+
+      const response = await injectMessages(app, agent.id, {
+        messages: [{ role: "user", content: "hi" }],
+        thinking,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(captured.params?.thinking).toEqual(thinking);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
 describe("Anthropic tool call accumulation", () => {
   let anthropicStubOptions: {
     includeToolUse?: boolean;
@@ -351,6 +824,8 @@ describe("Anthropic tool call accumulation", () => {
 
   test("accumulates tool call input without [object Object] bug", async ({
     makeAgent,
+    makeMember,
+    makeUser,
   }) => {
     const app = Fastify().withTypeProvider<ZodTypeProvider>();
     app.setValidatorCompiler(validatorCompiler);
@@ -372,6 +847,12 @@ describe("Anthropic tool call accumulation", () => {
     });
 
     const agent = await makeAgent({ name: "Test Tool Call Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const platformCredential = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
 
     const response = await app.inject({
       method: "POST",
@@ -379,6 +860,7 @@ describe("Anthropic tool call accumulation", () => {
       headers: {
         "content-type": "application/json",
         authorization: "Bearer test-key",
+        "x-archestra-virtual-key": platformCredential,
         "user-agent": "test-client",
         "anthropic-version": "2023-06-01",
         "x-api-key": "test-anthropic-key",
@@ -411,6 +893,8 @@ describe("Anthropic tool call accumulation", () => {
 
   test("accepts document content blocks in request payloads", async ({
     makeAgent,
+    makeMember,
+    makeUser,
   }) => {
     const app = Fastify().withTypeProvider<ZodTypeProvider>();
     app.setValidatorCompiler(validatorCompiler);
@@ -419,6 +903,12 @@ describe("Anthropic tool call accumulation", () => {
     await app.register(anthropicProxyRoutes);
 
     const agent = await makeAgent({ name: "Test Document Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const platformCredential = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
 
     const response = await app.inject({
       method: "POST",
@@ -426,6 +916,7 @@ describe("Anthropic tool call accumulation", () => {
       headers: {
         "content-type": "application/json",
         authorization: "Bearer test-key",
+        "x-archestra-virtual-key": platformCredential,
         "user-agent": "test-client",
         "anthropic-version": "2023-06-01",
         "anthropic-beta": "pdfs-2024-09-25",
@@ -469,15 +960,14 @@ describe("Anthropic proxy routing", () => {
   beforeEach(async () => {
     mockUpstream = Fastify();
 
-    // Note: Our proxy rewrites /v1/anthropic/v1/models to /v1/v1/models
-    mockUpstream.get("/v1/v1/models", async () => ({
+    mockUpstream.get("/v1/models", async () => ({
       data: [
         { id: "claude-3-5-sonnet-20241022", type: "model" },
         { id: "claude-3-opus-20240229", type: "model" },
       ],
     }));
 
-    mockUpstream.get("/v1/v1/models/:model", async (request) => ({
+    mockUpstream.get("/v1/models/:model", async (request) => ({
       id: (request.params as { model: string }).model,
       type: "model",
     }));
@@ -496,7 +986,7 @@ describe("Anthropic proxy routing", () => {
       await fastify.register(fastifyHttpProxy, {
         upstream: `http://localhost:${upstreamPort}`,
         prefix: API_PREFIX,
-        rewritePrefix: "/v1",
+        rewritePrefix: "",
         preHandler: (request, reply, next) => {
           const urlPath = request.url.split("?")[0];
           if (request.method === "POST" && urlPath.endsWith(MESSAGES_SUFFIX)) {
@@ -608,5 +1098,1366 @@ describe("Anthropic proxy routing", () => {
 
     // Should get 400 because the preHandler blocks proxy forwarding with a clean error response
     expect(response.statusCode).toBe(400);
+  });
+});
+
+describe("Anthropic count_tokens passthrough", () => {
+  const PROXY_ID = "44f56e01-7167-42c1-88ee-64b566fbc34d";
+  let upstream: FastifyInstance;
+  let forwardedBodies: string[];
+  let agentId: string;
+  let passthroughToken: string;
+
+  beforeEach(async ({ makeAgent, makeMember, makeUser }) => {
+    // The catch-all resolves the agent in the URL, so it must exist.
+    const agent = await makeAgent({ name: "count_tokens passthrough" });
+    agentId = agent.id;
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    passthroughToken = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+    forwardedBodies = [];
+    upstream = Fastify();
+    upstream.addContentTypeParser(
+      "application/json",
+      { parseAs: "string" },
+      (_request, body, done) => done(null, body),
+    );
+    upstream.post("/v1/messages/count_tokens", async (request) => {
+      forwardedBodies.push(request.body as string);
+      return { input_tokens: 42 };
+    });
+    await upstream.listen({ port: 0 });
+    const address = upstream.server.address();
+    const port = typeof address === "string" ? 0 : address?.port;
+    // Read when the catch-all proxy registers.
+    config.llm.anthropic.baseUrl = `http://localhost:${port}`;
+  });
+
+  afterEach(async () => {
+    await upstream.close();
+  });
+
+  async function countTokens(payload: string) {
+    const app = Fastify().withTypeProvider<ZodTypeProvider>();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    app.setErrorHandler(handleServerError);
+    await app.register(anthropicProxyRoutes);
+    try {
+      return await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${agentId}/v1/messages/count_tokens`,
+        headers: {
+          "content-type": "application/json",
+          "anthropic-version": "2023-06-01",
+          "x-api-key": "test-anthropic-key",
+          "x-archestra-virtual-key": passthroughToken,
+        },
+        payload,
+      });
+    } finally {
+      await app.close();
+    }
+  }
+
+  test("takes the gateway's markers out of the tool list before it reaches Anthropic", async () => {
+    const attested = (advertisedName: string, description?: string) =>
+      attestToolDescription({
+        organizationId: "org-count-tokens",
+        gatewayId: PROXY_ID,
+        advertisedName,
+        kind: "b",
+        description,
+      });
+    const inputSchema = { type: "object", properties: {} };
+
+    const response = await countTokens(
+      JSON.stringify({
+        model: "claude-opus-4-20250514",
+        messages: [
+          {
+            role: "user",
+            content: `Tools found: ${attested("archestra__whoami")}`,
+          },
+        ],
+        tools: [
+          {
+            name: "mcp__gw__archestra__search_tools",
+            description: attested(
+              "archestra__search_tools",
+              "Search the catalog.",
+            ),
+            input_schema: inputSchema,
+          },
+          {
+            name: "mcp__gw__archestra__whoami",
+            description: attested("archestra__whoami"),
+            input_schema: inputSchema,
+          },
+        ],
+      }),
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ input_tokens: 42 });
+    expect(forwardedBodies).toHaveLength(1);
+    expect(forwardedBodies[0]).not.toContain("[[gwa1.");
+    expect(JSON.parse(forwardedBodies[0])).toEqual({
+      model: "claude-opus-4-20250514",
+      messages: [{ role: "user", content: "Tools found: " }],
+      tools: [
+        {
+          name: "mcp__gw__archestra__search_tools",
+          description: "Search the catalog.",
+          input_schema: inputSchema,
+        },
+        { name: "mcp__gw__archestra__whoami", input_schema: inputSchema },
+      ],
+    });
+  });
+
+  test("takes OpenAPPA's signed offers, receipts and stamps out of a counted history", async () => {
+    const secret = "test-offer-signing-secret-32chars";
+    config.openappa.offerSigningSecret = secret;
+    const stamp = (callId: string) =>
+      stampToolCallId({
+        callId,
+        sessionId: "count-tokens-session",
+        organizationId: "org-count-tokens",
+        callerId: "user:count-tokens",
+        secret,
+      });
+    // Leftover offer material from persisted history. Not minted, and not a route.
+    const offer = {
+      protected: "eyJhbGciOiJIUzI1NiJ9",
+      payload: JSON.stringify({ session_id: "historical-offer-session" }),
+      signature: "historical-offer",
+    };
+    const ruling = "[appa] get_weather is blocked until a plan is approved.";
+    const control = "mcp__gw__archestra__execute_remedy_plan";
+    const remedyArguments = { offer_id: "offer-weather", plan: "approve" };
+    const execution = {
+      v: 1,
+      kind: "appa_remedy",
+      call_id: "toolu_remedy",
+      tool_name: control,
+      original_arguments: JSON.stringify(remedyArguments),
+    } satisfies RemedyExecution;
+    // Declaring tools rules out restoring a control call in the notice pass.
+    // The catch-all has no gateway identity. After the stamp is put back, the
+    // execution receipt names this call, so the legacy offer fields are removed
+    // with it. They are not checked.
+    const tools = [
+      {
+        name: "get_weather",
+        input_schema: {
+          type: "object",
+          properties: { location: { type: "string" } },
+        },
+      },
+      {
+        name: control,
+        input_schema: {
+          type: "object",
+          properties: {
+            offer_id: { type: "string" },
+            plan: { type: "string" },
+          },
+          required: ["offer_id"],
+        },
+      },
+    ];
+
+    const response = await countTokens(
+      JSON.stringify({
+        model: "claude-opus-4-20250514",
+        messages: [
+          { role: "user", content: "What's the weather in SF?" },
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: stamp("toolu_weather"),
+                name: "mcp__gw__archestra__get_remedy_plans",
+                input: {
+                  ...buildNoticeArguments({
+                    id: "toolu_weather",
+                    tool: "get_weather",
+                    arguments: { location: "SF" },
+                    result: ruling,
+                  }),
+                  offers: [offer],
+                },
+              },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: stamp("toolu_weather"),
+                content: "rendered for the user",
+              },
+            ],
+          },
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: stamp("toolu_remedy"),
+                name: control,
+                input: { ...remedyArguments, execution, ...offer },
+              },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: stamp("toolu_remedy"),
+                content: "Plan authorized.",
+              },
+            ],
+          },
+        ],
+        tools,
+      }),
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ input_tokens: 42 });
+    expect(forwardedBodies).toHaveLength(1);
+    expect(forwardedBodies[0]).not.toMatch(
+      /appat1|"signature"|"offers"|"execution"/,
+    );
+    expect(JSON.parse(forwardedBodies[0])).toEqual({
+      model: "claude-opus-4-20250514",
+      messages: [
+        { role: "user", content: "What's the weather in SF?" },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_weather",
+              name: "get_weather",
+              input: { location: "SF" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_weather",
+              content: ruling,
+              is_error: true,
+            },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_remedy",
+              name: control,
+              input: remedyArguments,
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_remedy",
+              content: "Plan authorized.",
+            },
+          ],
+        },
+      ],
+      tools,
+    });
+  });
+
+  test("takes the proxy's receipts out of a counted history", async () => {
+    const secret = "test-offer-signing-secret-32chars";
+    config.openappa.offerSigningSecret = secret;
+    const session = {
+      organization_id: "org-count-tokens",
+      caller_id: "user:count-tokens",
+      session_id: "count-tokens-session",
+    };
+    const sessionReceipt = formatSessionReceipt(mintReceiptCode());
+    const childReceipt = mintChildTrajectoryReceipt({
+      organizationId: session.organization_id,
+      callerId: session.caller_id,
+      parentId: session.session_id,
+      childId: "count-tokens-child",
+      spawnerNativeId: "count-tokens-native",
+    });
+    expect(childReceipt).toBeDefined();
+    const question = {
+      questions: [
+        {
+          question: "Clean the build?",
+          header: "Approval",
+          options: [{ label: "Approve" }, { label: "Deny" }],
+          multiSelect: false,
+        },
+      ],
+    };
+    const history = (ids: { question: string }, texts: string[]) => [
+      { role: "user", content: "Clean the build." },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: texts[0] },
+          {
+            type: "tool_use",
+            id: ids.question,
+            name: "AskUserQuestion",
+            input: question,
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: ids.question,
+            content: "Approve",
+          },
+        ],
+      },
+      { role: "assistant", content: [{ type: "text", text: texts[1] }] },
+      { role: "user", content: "Thanks." },
+    ];
+
+    const response = await countTokens(
+      JSON.stringify({
+        model: "claude-opus-4-20250514",
+        messages: history({ question: "toolu_question" }, [
+          `${sessionReceipt}\n\nI'll ask first.`,
+          `${childReceipt}\n\nA subagent is cleaning it.`,
+        ]),
+      }),
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(forwardedBodies).toHaveLength(1);
+    expect(forwardedBodies[0]).not.toMatch(
+      /appact2-|protected session|started subagent/,
+    );
+    expect(JSON.parse(forwardedBodies[0])).toEqual({
+      model: "claude-opus-4-20250514",
+      messages: history({ question: "toolu_question" }, [
+        "I'll ask first.",
+        "A subagent is cleaning it.",
+      ]),
+    });
+  });
+
+  test("forwards a body without markers or OpenAPPA payloads byte for byte", async () => {
+    // Each of these words passes the byte check that decides whether to parse
+    // the body, but none is a marker, a receipt, a stamp or a remedy call, so
+    // nothing changes. Re-serializing would reformat this and round the
+    // integer.
+    const payload =
+      '{ "model": "claude-opus-4-20250514", "seed": 12345678901234567890,\n' +
+      '  "messages": [{ "role": "user", "content":\n' +
+      '    "gwa1 is not a marker, appat1 is not a stamp, get_remedy_plans is a word, ' +
+      'protected session is a phrase, appact2- is not a receipt" }] }';
+
+    const response = await countTokens(payload);
+
+    expect(response.statusCode).toBe(200);
+    expect(forwardedBodies).toEqual([payload]);
+  });
+});
+
+describe("Anthropic delta encoding (claude_metadata sessions)", () => {
+  beforeEach(() => {
+    vi.spyOn(anthropicAdapterFactory, "createClient").mockImplementation(
+      () => createAnthropicTestClient() as never,
+    );
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test("two sequential requests delta-encode on write and reconstruct on read", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    const app = Fastify().withTypeProvider<ZodTypeProvider>();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    app.setErrorHandler(handleServerError);
+    await app.register(anthropicProxyRoutes);
+
+    await ModelModel.upsert({
+      externalId: "anthropic/claude-opus-4-20250514",
+      provider: "anthropic",
+      modelId: "claude-opus-4-20250514",
+      inputModalities: null,
+      outputModalities: null,
+      customPricePerMillionInput: "15.00",
+      customPricePerMillionOutput: "75.00",
+      lastSyncedAt: new Date(),
+    });
+
+    const agent = await makeAgent({ name: "Test Delta Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const platformCredential = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+    const sessionUuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+    const userId = `user_test_account_1_session_${sessionUuid}`;
+    const headers = {
+      "content-type": "application/json",
+      authorization: "Bearer test-key",
+      "x-archestra-virtual-key": platformCredential,
+      "user-agent": "test-client",
+      "anthropic-version": "2023-06-01",
+      "x-api-key": "test-anthropic-key",
+    };
+
+    const firstMessages = [{ role: "user", content: "kick off the session" }];
+    const secondMessages = [
+      ...firstMessages,
+      { role: "assistant", content: "working on it" },
+      { role: "user", content: "second turn" },
+    ];
+
+    const first = await app.inject({
+      method: "POST",
+      url: `/v1/anthropic/${agent.id}/v1/messages`,
+      headers,
+      payload: {
+        model: "claude-opus-4-20250514",
+        messages: firstMessages,
+        max_tokens: 1024,
+        metadata: { user_id: userId },
+      },
+    });
+    expect(first.statusCode).toBe(200);
+
+    const second = await app.inject({
+      method: "POST",
+      url: `/v1/anthropic/${agent.id}/v1/messages`,
+      headers,
+      payload: {
+        model: "claude-opus-4-20250514",
+        messages: secondMessages,
+        max_tokens: 1024,
+        metadata: { user_id: userId },
+      },
+    });
+    expect(second.statusCode).toBe(200);
+
+    const { InteractionModel } = await import("@/models");
+    const interactions = await InteractionModel.getAllInteractionsForProfile(
+      agent.id,
+    );
+    expect(interactions).toHaveLength(2);
+    // Identify the rows by structure rather than array position: both rows are
+    // inserted back-to-back with `created_at = now()`, so when they share a
+    // millisecond the `ORDER BY created_at ASC` tie-break is non-deterministic.
+    const head = interactions.find((i) => i.parentId === null);
+    const child = interactions.find((i) => i.parentId !== null);
+    expect(head).toBeDefined();
+    expect(child).toBeDefined();
+
+    // Session id came from Claude metadata; with no X-Archestra-Agent-Id header
+    // the client is auto-attributed to the generic Claude id. The second row
+    // chains to the first.
+    expect(head?.sessionSource).toBe(CLAUDE_METADATA_SESSION_SOURCE);
+    expect(head?.externalAgentId).toBe(CLAUDE_CLIENT_ID);
+    expect(head?.sessionId).toBe(sessionUuid);
+    expect(head?.threadId).not.toBeNull();
+    expect(child?.parentId).toBe(head?.id);
+    expect(child?.threadId).toBe(head?.threadId);
+
+    // The read path reconstructs the full request that was originally sent.
+    expect((child?.request as { messages: unknown[] }).messages).toEqual(
+      secondMessages,
+    );
+  });
+});
+
+describe("Anthropic input-token fallback", () => {
+  let platformCredential: string;
+  let stubOptions: {
+    zeroInputTokens?: boolean;
+    zeroOutputTokens?: boolean;
+    cacheReadInputTokens?: number;
+  };
+
+  beforeEach(() => {
+    stubOptions = {};
+    vi.spyOn(anthropicAdapterFactory, "createClient").mockImplementation(
+      () => createAnthropicTestClient(stubOptions) as never,
+    );
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  async function runRequest(
+    agentId: string,
+    extraPayload: Record<string, unknown> = {},
+  ) {
+    const app = Fastify().withTypeProvider<ZodTypeProvider>();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    app.setErrorHandler(handleServerError);
+    await app.register(anthropicProxyRoutes);
+    await ModelModel.upsert({
+      externalId: "anthropic/claude-opus-4-20250514",
+      provider: "anthropic",
+      modelId: "claude-opus-4-20250514",
+      inputModalities: null,
+      outputModalities: null,
+      customPricePerMillionInput: "15.00",
+      customPricePerMillionOutput: "75.00",
+      lastSyncedAt: new Date(),
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/anthropic/${agentId}/v1/messages`,
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-key",
+        "x-archestra-virtual-key": platformCredential,
+        "user-agent": "test-client",
+        "anthropic-version": "2023-06-01",
+        "x-api-key": "test-anthropic-key",
+      },
+      payload: {
+        model: "claude-opus-4-20250514",
+        messages: [{ role: "user", content: "Hello!" }],
+        max_tokens: 1024,
+        ...extraPayload,
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    return app;
+  }
+
+  async function latestInteraction(agentId: string) {
+    const { InteractionModel } = await import("@/models");
+    const interactions =
+      await InteractionModel.getAllInteractionsForProfile(agentId);
+    expect(interactions.length).toBeGreaterThan(0);
+    return interactions[interactions.length - 1];
+  }
+
+  test("non-streaming: zero provider input tokens are replaced by an estimate", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    stubOptions.zeroInputTokens = true;
+    const agent = await makeAgent({ name: "Zero Input NonStreaming" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    platformCredential = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+
+    await runRequest(agent.id);
+
+    const interaction = await latestInteraction(agent.id);
+    expect(interaction.inputTokensEstimated).toBe(true);
+    // A real estimate of the prompt, not the provider's 0 nor the measured 12.
+    expect(interaction.inputTokens).toBeGreaterThan(0);
+    expect(interaction.inputTokens).not.toBe(12);
+    expect(interaction.cost).toBeTruthy();
+  });
+
+  test("streaming: zero provider input tokens are replaced by an estimate", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    stubOptions.zeroInputTokens = true;
+    const agent = await makeAgent({ name: "Zero Input Streaming" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    platformCredential = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+
+    await runRequest(agent.id, { stream: true });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const interaction = await latestInteraction(agent.id);
+    expect(interaction.inputTokensEstimated).toBe(true);
+    expect(interaction.inputTokens).toBeGreaterThan(0);
+    expect(interaction.inputTokens).not.toBe(12);
+    expect(interaction.cost).toBeTruthy();
+  });
+
+  test("provider-reported input tokens are recorded as measured, not estimated", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    const agent = await makeAgent({ name: "Measured Input" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    platformCredential = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+
+    await runRequest(agent.id);
+
+    const interaction = await latestInteraction(agent.id);
+    expect(interaction.inputTokensEstimated).toBe(false);
+    expect(interaction.inputTokens).toBe(12);
+  });
+
+  test("zero input with zero output is not estimated (no output to corroborate)", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    stubOptions.zeroInputTokens = true;
+    stubOptions.zeroOutputTokens = true;
+    const agent = await makeAgent({ name: "Zero Input Zero Output" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    platformCredential = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+
+    await runRequest(agent.id);
+
+    const interaction = await latestInteraction(agent.id);
+    expect(interaction.inputTokensEstimated).toBe(false);
+    expect(interaction.inputTokens).toBe(0);
+  });
+
+  test("zero input with cache-read tokens is not estimated (legitimately cached)", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    stubOptions.zeroInputTokens = true;
+    stubOptions.cacheReadInputTokens = 2000;
+    const agent = await makeAgent({ name: "Zero Input Cached" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    platformCredential = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+
+    await runRequest(agent.id);
+
+    const interaction = await latestInteraction(agent.id);
+    expect(interaction.inputTokensEstimated).toBe(false);
+    expect(interaction.inputTokens).toBe(0);
+    expect(interaction.cacheReadTokens).toBe(2000);
+  });
+});
+
+describe("Claude Code subscription run one-off virtual key resolution", () => {
+  setupTestCacheManager();
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test("resolves the connected subscription token only for a bound agent-run virtual key and rejects it after revocation", async ({
+    makeInternalAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    vi.spyOn(agentRuntimeManager, "isEnabled", "get").mockReturnValue(true);
+    const subscriptionToken = `sk-ant-oat01-${"subscription".repeat(6)}`;
+    const owner = await makeUser();
+    const otherUser = await makeUser();
+    const agent = await makeInternalAgent({
+      name: "Claude Subscription Run Agent",
+      authorId: otherUser.id,
+      access: { users: [owner.id], preset: "use" },
+    });
+    await OrganizationModel.patch(agent.organizationId, {
+      defaultEnvironmentNamespace: "agent-tests",
+    });
+    await makeMember(owner.id, agent.organizationId);
+    await makeMember(otherUser.id, agent.organizationId);
+
+    const secret = await secretManager().createSecret(
+      { value: subscriptionToken },
+      "claude-code:account",
+      true,
+    );
+    const flowId = crypto.randomUUID();
+    const accountOwner = {
+      organizationId: agent.organizationId,
+      userId: owner.id,
+    };
+    await ClaudeCodeAccountModel.startFlow({
+      owner: accountOwner,
+      flow: { flowId },
+    });
+    await ClaudeCodeAccountModel.complete({
+      owner: accountOwner,
+      flowId,
+      secretId: secret.id,
+      metadata: {
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        models: [],
+      },
+    });
+
+    const runtime = {
+      agentId: agent.id,
+      organizationId: agent.organizationId,
+      secretId: null,
+      environmentId: null,
+      image: "example.test/claude-code:test",
+      command: ["archestra-claude-code"],
+      inferenceProtocol: "anthropic" as const,
+      backend: "kubernetes" as const,
+      steerMode: "tmux_keys" as const,
+      privileged: false,
+      environment: [],
+      credentials: [],
+      ttlHours: null,
+      idleTimeoutMinutes: null,
+      maxCostUsd: null,
+      claudeCode: {
+        authentication: "subscription" as const,
+        model: "claude-opus-4-20250514",
+      },
+    };
+    const context = await A2AContextModel.create({
+      actorKind: "user",
+      actorId: owner.id,
+    });
+    const task = await A2ATaskModel.create({
+      contextId: context.id,
+      agentId: agent.id,
+      state: "TASK_STATE_WORKING",
+    });
+    const runId = crypto.randomUUID();
+    const { spec, virtualApiKeyId } = await buildAgentRunLaunchSpec({
+      runtime,
+      limits: resolveAgentRunLimits({
+        runtime,
+        tiers: resolveAgentRuntimeTiers(null, { defaultWarmSpares: 0 }),
+      }),
+      taskId: task.id,
+      runId,
+      agentId: agent.id,
+      actor: {
+        id: owner.id,
+        kind: "user",
+        organizationId: agent.organizationId,
+      },
+      organizationId: agent.organizationId,
+      runtimeScope: "agent-tests",
+      effectiveNetworkPolicy: { source: "built_in", policy: null },
+      appName: "Archestra",
+      runMode: "one_shot",
+    });
+
+    expect(virtualApiKeyId).toBeTruthy();
+    expect(spec.secretEnv.CLAUDE_CODE_OAUTH_TOKEN).toBe(
+      spec.secretEnv.ARCHESTRA_VIRTUAL_KEY,
+    );
+    expect(spec.secretEnv.CLAUDE_CODE_OAUTH_TOKEN).not.toBe(subscriptionToken);
+
+    const run = await AgentRunModel.create({
+      id: runId,
+      organizationId: agent.organizationId,
+      taskId: task.id,
+      agentId: agent.id,
+      actorKind: "user",
+      actorId: owner.id,
+      actorUserId: owner.id,
+      workloadName: `claude-run-${task.id}`,
+      backend: "kubernetes",
+      runtimeScope: "agent-tests",
+      virtualApiKeyId,
+    });
+
+    const capturedClients: Array<{
+      apiKey: string | undefined;
+      baseUrl: string | undefined;
+    }> = [];
+    vi.spyOn(anthropicAdapterFactory, "createClient").mockImplementation(((
+      apiKey: string | undefined,
+      options: unknown,
+    ) => {
+      capturedClients.push({
+        apiKey,
+        baseUrl: (options as { baseUrl?: string })?.baseUrl,
+      });
+      return createAnthropicTestClient() as never;
+    }) as never);
+
+    const originalFetch = globalThis.fetch;
+    const capturedFetches: Array<{ url: string; authHeader: string | null }> =
+      [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input, init): Promise<Response> => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url;
+        if (url.startsWith("https://api.anthropic.com/")) {
+          const headers = new Headers(init?.headers);
+          capturedFetches.push({
+            url,
+            authHeader: headers.get("authorization"),
+          });
+          if (url.includes("/v1/models")) {
+            return new Response(
+              JSON.stringify({
+                data: [
+                  {
+                    type: "model",
+                    id: "claude-opus-4-20250514",
+                    display_name: "Claude Opus 4",
+                  },
+                ],
+                has_more: false,
+              }),
+              {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              },
+            );
+          }
+        }
+        return originalFetch(input, init);
+      },
+    );
+
+    const customUpstreamRequests: Array<{
+      url: string;
+      authorization: string | undefined;
+      xApiKey: string | string[] | undefined;
+    }> = [];
+    const customUpstream = Fastify();
+    customUpstream.post("/anthropic/v1/messages/count_tokens", async (req) => {
+      customUpstreamRequests.push({
+        url: req.url,
+        authorization: req.headers.authorization,
+        xApiKey: req.headers["x-api-key"],
+      });
+      return {
+        input_tokens: customUpstreamRequests.length === 1 ? 799 : 850,
+      };
+    });
+    await customUpstream.listen({ port: 0, host: "127.0.0.1" });
+    const customAddress = customUpstream.server.address();
+    const customPort =
+      typeof customAddress === "string" ? 0 : customAddress?.port;
+
+    const capturedAnthropicPassthroughRequests: Array<{
+      origin: string;
+      path: string;
+      headers: Record<string, string | string[] | undefined>;
+    }> = [];
+    const originalUndiciRequest = UndiciAgent.prototype.request as (
+      this: UndiciAgent,
+      opts: {
+        origin?: string | URL;
+        path: string;
+        headers?: unknown;
+      },
+      callback?: (
+        err: Error | null,
+        data: {
+          statusCode: number;
+          headers: Record<string, string>;
+          body: Readable;
+        },
+      ) => void,
+    ) => unknown;
+    vi.spyOn(UndiciAgent.prototype, "request").mockImplementation(function (
+      this: UndiciAgent,
+      ...args: unknown[]
+    ) {
+      const [opts, callback] = args as Parameters<typeof originalUndiciRequest>;
+      if (String(opts.origin) === "https://api.anthropic.com") {
+        capturedAnthropicPassthroughRequests.push({
+          origin: String(opts.origin),
+          path: opts.path,
+          headers: (opts.headers ?? {}) as Record<
+            string,
+            string | string[] | undefined
+          >,
+        });
+        callback?.(null, {
+          statusCode: 200,
+          headers: { "content-type": "application/json" },
+          body: Readable.from([JSON.stringify({ input_tokens: 642 })]),
+        });
+        return undefined as never;
+      }
+      return originalUndiciRequest.call(this, opts, callback) as never;
+    });
+
+    const previousAnthropicBaseUrl = config.llm.anthropic.baseUrl;
+    config.llm.anthropic.baseUrl = `http://127.0.0.1:${customPort}/anthropic`;
+
+    const app = Fastify().withTypeProvider<ZodTypeProvider>();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    app.setErrorHandler(handleServerError);
+    await app.register(anthropicProxyRoutes);
+
+    try {
+      const podToken = spec.secretEnv.CLAUDE_CODE_OAUTH_TOKEN;
+
+      // 1. Pod sends both X-Archestra-Virtual-Key and Authorization: Bearer <one-off-virtual-key>
+      const messagesWithCustomHeader = await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${agent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${podToken}`,
+          "x-archestra-virtual-key": spec.secretEnv.ARCHESTRA_VIRTUAL_KEY,
+          "anthropic-version": "2023-06-01",
+        },
+        payload: {
+          model: "claude-opus-4-20250514",
+          messages: [{ role: "user", content: "Hello!" }],
+          max_tokens: 128,
+        },
+      });
+      expect(messagesWithCustomHeader.statusCode).toBe(200);
+      expect(capturedClients.at(-1)).toEqual({
+        apiKey: `Bearer:${subscriptionToken}`,
+        baseUrl: "https://api.anthropic.com",
+      });
+
+      // 2. Caller inside the pod sends only Authorization: Bearer <one-off-virtual-key>
+      const messagesBearerOnly = await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${agent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${podToken}`,
+          "anthropic-version": "2023-06-01",
+        },
+        payload: {
+          model: "claude-opus-4-20250514",
+          messages: [{ role: "user", content: "Hello again!" }],
+          max_tokens: 128,
+        },
+      });
+      expect(messagesBearerOnly.statusCode).toBe(200);
+      expect(capturedClients.at(-1)).toEqual({
+        apiKey: `Bearer:${subscriptionToken}`,
+        baseUrl: "https://api.anthropic.com",
+      });
+
+      // 3. GET /v1/models with the run's one-off virtual key
+      const modelsResponse = await app.inject({
+        method: "GET",
+        url: `/v1/anthropic/${agent.id}/v1/models`,
+        headers: {
+          authorization: `Bearer ${podToken}`,
+          "anthropic-version": "2023-06-01",
+        },
+      });
+      expect(modelsResponse.statusCode).toBe(200);
+      expect(capturedFetches.at(-1)).toEqual({
+        url: "https://api.anthropic.com/v1/models?limit=100",
+        authHeader: `Bearer ${subscriptionToken}`,
+      });
+
+      // 4. Default route without :agentId refuses to redeem the run-bound subscription token
+      const modelsWithoutAgent = await app.inject({
+        method: "GET",
+        url: "/v1/anthropic/v1/models",
+        headers: {
+          authorization: `Bearer ${podToken}`,
+          "anthropic-version": "2023-06-01",
+        },
+      });
+      expect(modelsWithoutAgent.statusCode).toBe(400);
+
+      // 5. Real catch-all request routes a redeemed subscription token to https://api.anthropic.com
+      //    even when anthropicProxyRoutes was registered against a custom base URL, while
+      //    non-subscription requests still reach the registered custom upstream and both
+      //    preserve Claude Code count_tokens observation on path-bearing base URLs.
+      const observedToolSurface = {
+        organizationId: agent.organizationId,
+        gatewayId: agent.id,
+        serverName: "gateway",
+        tools: [
+          {
+            name: "documents__read_0",
+            description: attestToolDescription({
+              organizationId: agent.organizationId,
+              gatewayId: agent.id,
+              advertisedName: "documents__read_0",
+              kind: "t",
+              description: "Read document 0.",
+            }),
+            inputSchema: {
+              type: "object",
+              properties: { id: { type: "string" } },
+            } as Record<string, unknown>,
+          },
+        ],
+      };
+      const countTokensPayload = {
+        model: "claude-opus-4-20250514",
+        tools: buildClaudeMcpToolDefinitions(observedToolSurface),
+        messages: [{ role: "user", content: "foo" }],
+      };
+
+      const countTokensWithRunKey = await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${agent.id}/v1/messages/count_tokens`,
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${podToken}`,
+          "x-archestra-virtual-key": spec.secretEnv.ARCHESTRA_VIRTUAL_KEY,
+          "x-archestra-agent-id": CLAUDE_CODE_CLIENT_ID,
+          "anthropic-version": "2023-06-01",
+        },
+        payload: countTokensPayload,
+      });
+      await drainBackgroundWork();
+      expect(countTokensWithRunKey.statusCode).toBe(200);
+      expect(countTokensWithRunKey.json()).toEqual({ input_tokens: 642 });
+      expect(customUpstreamRequests).toHaveLength(0);
+      expect(capturedAnthropicPassthroughRequests.at(-1)).toMatchObject({
+        origin: "https://api.anthropic.com",
+        path: "/v1/messages/count_tokens",
+        headers: {
+          host: "api.anthropic.com",
+          authorization: `Bearer ${subscriptionToken}`,
+          "anthropic-beta": "oauth-2025-04-20",
+        },
+      });
+      expect(
+        await getObservedClaudeCodeToolTokenCount(observedToolSurface),
+      ).toEqual({
+        total: 142,
+        model: "claude-opus-4-20250514",
+        observedAt: expect.any(String),
+      });
+
+      const nonRunCountTokensKey = await makePassthroughCredential({
+        organizationId: agent.organizationId,
+        ownerId: owner.id,
+      });
+      const countTokensWithCustomKey = await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${agent.id}/v1/messages/count_tokens`,
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${nonRunCountTokensKey}`,
+          "x-archestra-virtual-key": nonRunCountTokensKey,
+          "x-archestra-agent-id": CLAUDE_CODE_CLIENT_ID,
+          "x-api-key": "sk-ant-api03-custom",
+          "anthropic-version": "2023-06-01",
+        },
+        payload: countTokensPayload,
+      });
+      await drainBackgroundWork();
+      expect(countTokensWithCustomKey.statusCode).toBe(200);
+      expect(countTokensWithCustomKey.json()).toEqual({ input_tokens: 799 });
+      expect(customUpstreamRequests).toEqual([
+        {
+          url: "/anthropic/v1/messages/count_tokens",
+          authorization: undefined,
+          xApiKey: "sk-ant-api03-custom",
+        },
+      ]);
+      expect(
+        await getObservedClaudeCodeToolTokenCount(observedToolSurface),
+      ).toEqual({
+        total: 299,
+        model: "claude-opus-4-20250514",
+        observedAt: expect.any(String),
+      });
+
+      const countTokensWithoutAgentUuid = await app.inject({
+        method: "POST",
+        url: "/v1/anthropic/v1/messages/count_tokens",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${nonRunCountTokensKey}`,
+          "x-archestra-virtual-key": nonRunCountTokensKey,
+          "x-archestra-agent-id": CLAUDE_CODE_CLIENT_ID,
+          "x-api-key": "sk-ant-api03-custom",
+          "anthropic-version": "2023-06-01",
+        },
+        payload: countTokensPayload,
+      });
+      await drainBackgroundWork();
+      expect(countTokensWithoutAgentUuid.statusCode).toBe(200);
+      expect(countTokensWithoutAgentUuid.json()).toEqual({ input_tokens: 850 });
+      expect(customUpstreamRequests).toHaveLength(2);
+      expect(
+        await getObservedClaudeCodeToolTokenCount(observedToolSurface),
+      ).toEqual({
+        total: 350,
+        model: "claude-opus-4-20250514",
+        observedAt: expect.any(String),
+      });
+
+      // 6. If the owner loses access to the agent, model listing is refused with 403
+      const agentPolicy = await ResourcePermissionPolicyModel.find({
+        organizationId: agent.organizationId,
+        resource: "agent",
+        scope: agent.id,
+      });
+      await ResourcePermissionPolicyModel.replace({
+        organizationId: agent.organizationId,
+        resource: "agent",
+        scope: agent.id,
+        revision: agentPolicy?.revision ?? 0,
+        grants: [],
+      });
+      const restrictedModels = await app.inject({
+        method: "GET",
+        url: `/v1/anthropic/${agent.id}/v1/models`,
+        headers: {
+          authorization: `Bearer ${podToken}`,
+          "anthropic-version": "2023-06-01",
+        },
+      });
+      expect(restrictedModels.statusCode).toBe(403);
+
+      // Restore owner's use grant on the agent for the remaining checks
+      const revokedPolicy = await ResourcePermissionPolicyModel.find({
+        organizationId: agent.organizationId,
+        resource: "agent",
+        scope: agent.id,
+      });
+      await ResourcePermissionPolicyModel.replace({
+        organizationId: agent.organizationId,
+        resource: "agent",
+        scope: agent.id,
+        revision: revokedPolicy?.revision ?? 0,
+        grants: [
+          {
+            subject: { type: "user", id: owner.id },
+            actions: ["read", "use"],
+          },
+        ],
+      });
+
+      // 7. A non-run passthrough virtual key (e.g. /connection key, not bound to agent_runs) cannot resolve the subscription token
+      const nonRunPassthroughKey = await makePassthroughCredential({
+        organizationId: agent.organizationId,
+        ownerId: owner.id,
+      });
+      const nonRunMessages = await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${agent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${nonRunPassthroughKey}`,
+          "x-archestra-virtual-key": nonRunPassthroughKey,
+          "anthropic-version": "2023-06-01",
+        },
+        payload: {
+          model: "claude-opus-4-20250514",
+          messages: [{ role: "user", content: "Should fail" }],
+          max_tokens: 128,
+        },
+      });
+      expect(nonRunMessages.statusCode).toBe(400);
+
+      // 8. A closed run row remains valid while its own retained workspace is idle,
+      //    but is refused once a newer turn claims/releases that workspace (or when no workspace matches).
+      const workspace = await AgentWorkspaceModel.create({
+        id: task.id,
+        organizationId: agent.organizationId,
+        agentId: agent.id,
+        actorKind: "user",
+        actorId: owner.id,
+        workloadName: run.workloadName,
+        backend: "kubernetes",
+        runtimeScope: "agent-tests",
+        state: "active",
+        activeTaskId: task.id,
+        lastTaskId: task.id,
+        expiresAt: new Date(Date.now() + 3_600_000),
+      });
+      await AgentRunModel.close({ id: run.id });
+      await AgentWorkspaceModel.release({
+        workloadName: run.workloadName,
+        taskId: task.id,
+      });
+
+      const retainedIdleModels = await app.inject({
+        method: "GET",
+        url: `/v1/anthropic/${agent.id}/v1/models`,
+        headers: {
+          authorization: `Bearer ${podToken}`,
+          "anthropic-version": "2023-06-01",
+        },
+      });
+      expect(retainedIdleModels.statusCode).toBe(200);
+
+      // Advance the workspace to a newer turn while leaving the old run's virtual key row intact
+      const nextTask = await A2ATaskModel.create({
+        contextId: context.id,
+        agentId: agent.id,
+        state: "TASK_STATE_WORKING",
+      });
+      await AgentWorkspaceModel.claim({
+        id: workspace.id,
+        organizationId: agent.organizationId,
+        actorKind: "user",
+        actorId: owner.id,
+        agentId: agent.id,
+        taskId: nextTask.id,
+      });
+      await AgentWorkspaceModel.release({
+        workloadName: run.workloadName,
+        taskId: nextTask.id,
+      });
+
+      const afterSupersededTurn = await app.inject({
+        method: "GET",
+        url: `/v1/anthropic/${agent.id}/v1/models`,
+        headers: {
+          authorization: `Bearer ${podToken}`,
+          "anthropic-version": "2023-06-01",
+        },
+      });
+      expect(afterSupersededTurn.statusCode).toBe(400);
+
+      // 9. Revoking the run's one-off virtual key immediately invalidates it with 401
+      if (virtualApiKeyId) {
+        await VirtualApiKeyModel.delete(virtualApiKeyId);
+      }
+      await AgentRunModel.clearVirtualApiKey(run.id);
+
+      const afterRevoke = await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${agent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${podToken}`,
+          "x-archestra-virtual-key": spec.secretEnv.ARCHESTRA_VIRTUAL_KEY,
+          "anthropic-version": "2023-06-01",
+        },
+        payload: {
+          model: "claude-opus-4-20250514",
+          messages: [{ role: "user", content: "After run end" }],
+          max_tokens: 128,
+        },
+      });
+      expect(afterRevoke.statusCode).toBe(401);
+    } finally {
+      config.llm.anthropic.baseUrl = previousAnthropicBaseUrl;
+      await app.close();
+      await customUpstream.close();
+    }
+  });
+});
+
+describe("Anthropic tool call sessions for the MCP gateway", () => {
+  setupTestCacheManager();
+
+  let anthropicStubOptions: Parameters<typeof createAnthropicTestClient>[0];
+
+  beforeEach(() => {
+    anthropicStubOptions = {};
+    vi.spyOn(anthropicAdapterFactory, "createClient").mockImplementation(
+      () => createAnthropicTestClient(anthropicStubOptions) as never,
+    );
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test.for([
+    { stream: true },
+    { stream: false },
+  ])("records the Claude Code session of an MCP tool call it hands the client (stream: $stream)", async ({
+    stream,
+  }, { makeAgent, makeMember, makeUser }) => {
+    const app = Fastify().withTypeProvider<ZodTypeProvider>();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    await app.register(anthropicProxyRoutes);
+
+    const agent = await makeAgent({ name: "Tool Call Session Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const platformCredential = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+    const send = async (call: { id: string; name: string }) => {
+      const toolUse = { ...call, input: {} };
+      anthropicStubOptions = stream
+        ? { includeToolUse: true, streamingToolUse: toolUse }
+        : { nonStreamingToolUse: toolUse };
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${agent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          "x-archestra-virtual-key": platformCredential,
+          "x-claude-code-session-id": "claude-session",
+          "anthropic-version": "2023-06-01",
+          "x-api-key": "test-anthropic-key",
+        },
+        payload: {
+          model: "claude-opus-4-20250514",
+          messages: [{ role: "user", content: "Who am I?" }],
+          max_tokens: 1024,
+          stream,
+        },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain(call.id);
+    };
+    const sessionOf = (toolCallId: string) =>
+      llmToolCallSessions.resolve({
+        organizationId: agent.organizationId,
+        userId: owner.id,
+        toolCallId,
+      });
+
+    await send({ id: "toolu_gateway", name: "mcp__archestra__whoami" });
+    await send({ id: "toolu_builtin", name: "get_weather" });
+
+    expect(await sessionOf("toolu_gateway")).toBe("claude-session");
+    // A client's own tool never reaches the gateway, so it leaves nothing.
+    expect(await sessionOf("toolu_builtin")).toBeUndefined();
   });
 });

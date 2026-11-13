@@ -1,0 +1,234 @@
+import { vi } from "vitest";
+import { hasPermission, userHasPermission } from "@/auth/utils";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { OrganizationModel } from "@/models";
+import McpServerModel from "@/models/mcp-server";
+import { secretManager } from "@/secrets-manager";
+import { beforeEach, describe, expect, test } from "@/test";
+import type { User } from "@/types";
+
+const { invalidateConnectionsForServerMock, k8sRestartServerMock } = vi.hoisted(
+  () => ({
+    invalidateConnectionsForServerMock: vi.fn(),
+    k8sRestartServerMock: vi.fn(),
+  }),
+);
+
+vi.mock("@/clients/mcp-client", () => ({
+  McpServerNotReadyError: class extends Error {},
+  McpServerConnectionTimeoutError: class extends Error {},
+  default: {
+    invalidateConnectionsForServer: invalidateConnectionsForServerMock,
+  },
+}));
+
+vi.mock("@/auth/utils");
+
+vi.mock("@/k8s/mcp-server-runtime", () => ({
+  McpServerRuntimeManager: {
+    isEnabled: true,
+    restartServer: k8sRestartServerMock,
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    ensureAwake: vi.fn(),
+    isDeploymentDormant: vi.fn(() => false),
+    registerHibernationListener: vi.fn(),
+    // SPDX-SnippetEnd
+  },
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  McpServerWakeError: class McpServerWakeError extends Error {},
+  // SPDX-SnippetEnd
+}));
+
+const hasPermissionMock = vi.mocked(hasPermission);
+const userHasPermissionMock = vi.mocked(userHasPermission);
+
+describe("PATCH /api/mcp_server/:id/reauthenticate", () => {
+  let app: FastifyInstanceWithZod;
+  let user: User;
+  let organizationId: string;
+
+  beforeEach(async ({ makeUser, makeOrganization, makeMember }) => {
+    user = await makeUser();
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    await makeMember(user.id, organization.id);
+
+    hasPermissionMock.mockResolvedValue({ success: true, error: null });
+    userHasPermissionMock.mockResolvedValue(true);
+    invalidateConnectionsForServerMock.mockResolvedValue(undefined);
+    k8sRestartServerMock.mockResolvedValue(undefined);
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { user: User }).user = user;
+      (request as typeof request & { organizationId: string }).organizationId =
+        organization.id;
+    });
+
+    const { default: mcpServerRoutes } = await import("./mcp-server");
+    await app.register(mcpServerRoutes);
+  });
+
+  test("clears the needs-reauthentication trio on successful re-authentication", async ({
+    makeInternalMcpCatalog,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      name: "reauth-clears-server",
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com/mcp",
+      oauthConfig: {
+        name: "reauth-clears-server",
+        server_url: "https://mcp.example.com/mcp",
+        client_id: "test-client-id",
+        redirect_uris: ["http://localhost:3000/callback"],
+        scopes: [],
+        default_scopes: [],
+        supports_resource_metadata: false,
+      },
+    });
+
+    const oldSecret = await secretManager().createSecret(
+      { access_token: "stale", refresh_token: "stale-refresh" },
+      "reauth-old-secret",
+    );
+    const server = await McpServerModel.create({
+      name: "reauth-clears-server",
+      catalogId: catalog.id,
+      secretId: oldSecret.id,
+      serverType: "remote",
+      ownerId: user.id,
+    });
+
+    await McpServerModel.update(server.id, {
+      oauthRefreshError: "refresh_failed",
+      oauthRefreshErrorMessage: "invalid_grant",
+      oauthRefreshErrorDescription: "The refresh token is invalid",
+      oauthRefreshFailedAt: new Date(Date.now() - 60_000),
+    });
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: `/api/mcp_server/${server.id}/reauthenticate`,
+      payload: { accessToken: "fresh" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const row = await McpServerModel.findById(server.id);
+    expect(row?.secretId).toBeTruthy();
+    expect(
+      (await secretManager().getSecret(row?.secretId ?? ""))?.secret,
+    ).toMatchObject({ access_token: "fresh" });
+    expect(row?.oauthRefreshError).toBeNull();
+    expect(row?.oauthRefreshErrorMessage).toBeNull();
+    expect(row?.oauthRefreshErrorDescription).toBeNull();
+    expect(row?.oauthRefreshFailedAt).toBeNull();
+  });
+
+  test("rotating a connection preserves a secret still used by another connection", async ({
+    makeInternalMcpCatalog,
+    makeUser,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      serverType: "remote",
+      serverUrl: "http://127.0.0.1:30082/mcp",
+    });
+    const otherUser = await makeUser({ email: "other-owner@example.com" });
+    const sharedSecret = await secretManager().createSecret(
+      { access_token: "fake-shared-token" },
+      "shared-connection-secret",
+    );
+    const otherServer = await McpServerModel.create({
+      name: "other-connection",
+      catalogId: catalog.id,
+      secretId: sharedSecret.id,
+      serverType: "remote",
+      scope: "org",
+      ownerId: otherUser.id,
+    });
+    const ownServer = await McpServerModel.create({
+      name: "own-connection",
+      catalogId: catalog.id,
+      secretId: sharedSecret.id,
+      serverType: "remote",
+      scope: "personal",
+      ownerId: user.id,
+    });
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: `/api/mcp_server/${ownServer.id}/reauthenticate`,
+      payload: { accessToken: "fake-replacement-token" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect((await McpServerModel.findById(otherServer.id))?.secretId).toBe(
+      sharedSecret.id,
+    );
+    expect((await secretManager().getSecret(sharedSecret.id))?.secret).toEqual({
+      access_token: "fake-shared-token",
+    });
+  });
+
+  test("team administration does not authorize changing a connection's credentials", async ({
+    makeTeam,
+    makeTeamMember,
+    makeMcpServer,
+  }) => {
+    const team = await makeTeam(organizationId, user.id);
+    await makeTeamMember(team.id, user.id, { role: "admin" });
+    const server = await makeMcpServer({ scope: "team", teamId: team.id });
+    userHasPermissionMock.mockResolvedValue(false);
+    hasPermissionMock.mockImplementation(async (permissions) => ({
+      success: permissions.mcpServerInstallation?.includes("create") ?? false,
+      error: null,
+    }));
+    const response = await app.inject({
+      method: "PATCH",
+      url: `/api/mcp_server/${server.id}/reauthenticate`,
+      payload: { accessToken: "replacement" },
+    });
+    expect(response.statusCode, response.body).toBe(403);
+    expect((await McpServerModel.findById(server.id))?.secretId).toBe(
+      server.secretId,
+    );
+  });
+
+  test("rejects re-auth before swapping the secret when the image is untrusted", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    await OrganizationModel.patch(organizationId, {
+      defaultEnvironmentTrustedImageRegistries: ["ghcr.io/acme"],
+    });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      access: "personal",
+      serverType: "local",
+      localConfig: { dockerImage: "ghcr.io/evil/x:1" },
+    });
+    const server = await makeMcpServer({
+      catalogId: catalog.id,
+      scope: "personal",
+      ownerId: user.id,
+    });
+    const secretIdBefore = server.secretId;
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: `/api/mcp_server/${server.id}/reauthenticate`,
+      payload: { accessToken: "new" },
+    });
+
+    // Blocked before any mutation: no secret swap, no pod restart, no false 200.
+    expect(response.statusCode).toBe(403);
+    const row = await McpServerModel.findById(server.id);
+    expect(row?.secretId).toBe(secretIdBefore);
+    expect(k8sRestartServerMock).not.toHaveBeenCalled();
+  });
+});

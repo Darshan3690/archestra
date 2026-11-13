@@ -1,0 +1,254 @@
+import {
+  AGENT_CATALOG_IDS,
+  calculatePaginationMeta,
+  PaginationQuerySchema,
+  parseLabelsParam,
+  ResourceAccessQuerySchema,
+  ResourceOwnerQuerySchema,
+  ResourceSharedWithQuerySchema,
+  RouteId,
+} from "@archestra/shared";
+import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
+import { z } from "zod";
+import { getAgentTypePermissionChecker } from "@/auth";
+import { AgentModel } from "@/models";
+import { resourceAccessSelection } from "@/models/resource-permission-subject";
+import { listA2aRemoteAgents } from "@/services/a2a-outbound-registry";
+import { populateAgentListActivationSkillCounts } from "@/services/agent-list";
+import {
+  AgentCatalogResponseSchema,
+  type AgentCatalogRow,
+  AgentScopeFilterSchema,
+  constructResponseSchema,
+  createSortingQuerySchema,
+} from "@/types";
+
+const agentCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
+  fastify.get(
+    "/api/agent-catalog",
+    {
+      schema: {
+        operationId: RouteId.GetAgentCatalog,
+        description:
+          "List internal and external A2A agents for the Agents page.",
+        tags: ["Agents"],
+        querystring: z
+          .object({
+            name: z.string().optional(),
+            scope: AgentScopeFilterSchema.optional(),
+            includeBuiltIn: z
+              .preprocess(
+                (value) =>
+                  typeof value === "string" ? value === "true" : value,
+                z.boolean(),
+              )
+              .optional()
+              .describe(
+                "Also list the built-in agents. Applies to agent admins only, and the access filter does not apply to these agents.",
+              ),
+            teamIds: z
+              .preprocess(
+                (value) =>
+                  typeof value === "string" ? value.split(",") : value,
+                z.array(z.string()),
+              )
+              .optional(),
+            authorIds: z
+              .preprocess(
+                (value) =>
+                  typeof value === "string" ? value.split(",") : value,
+                z.array(z.string()),
+              )
+              .optional(),
+            excludeAuthorIds: z
+              .preprocess(
+                (value) =>
+                  typeof value === "string" ? value.split(",") : value,
+                z.array(z.string()),
+              )
+              .optional(),
+            excludeOtherPersonalAgents: z
+              .preprocess(
+                (value) =>
+                  typeof value === "string" ? value === "true" : value,
+                z.boolean(),
+              )
+              .optional(),
+            ids: z
+              .preprocess(
+                (value) =>
+                  typeof value === "string" ? value.split(",") : value,
+                z.array(z.string().uuid()).max(20),
+              )
+              .optional()
+              .describe(
+                "Only these agents (comma-separated IDs), such as the viewer's automatic pins.",
+              ),
+            excludeIds: z
+              .preprocess(
+                (value) =>
+                  typeof value === "string" ? value.split(",") : value,
+                z.array(z.string().uuid()).max(20),
+              )
+              .optional()
+              .describe(
+                "Leave these agents out (comma-separated IDs), such as the ones the list already shows as automatic pins.",
+              ),
+            access: ResourceAccessQuerySchema,
+            sharedWith: ResourceSharedWithQuerySchema,
+            owner: ResourceOwnerQuerySchema,
+            selectableOnly: z
+              .preprocess(
+                (value) =>
+                  typeof value === "string" ? value === "true" : value,
+                z.boolean(),
+              )
+              .describe(
+                "When true, omit external A2A agents unless the caller can manage external-agent settings. Used to enumerate rows for bulk selection on the Agents page.",
+              )
+              .optional(),
+            labels: z.string().optional(),
+            status: z.enum(["active", "deleted"]).optional(),
+            runtime: z
+              .enum(["chat", "custom", ...AGENT_CATALOG_IDS])
+              .optional(),
+            providerApiKeyId: z
+              .union([z.string().uuid(), z.literal("organization-default")])
+              .optional(),
+            pinned: z
+              .preprocess(
+                (value) =>
+                  typeof value === "string" ? value === "true" : value,
+                z.boolean(),
+              )
+              .optional()
+              .describe(
+                "Filter internal agents by the current user's pins. Pinned results exclude external A2A agents and are ordered by newest pin first.",
+              ),
+            includeTools: z
+              .preprocess(
+                (value) => value !== "false" && value !== false,
+                z.boolean(),
+              )
+              .optional()
+              .describe(
+                "Include each internal agent's assigned tools (default: true). Set `includeTools=false` for a smaller response when you only need agents or their counts. `toolsCount` and `subagentsCount` remain available; an empty `tools` array then means tools were omitted, not that none are assigned.",
+              ),
+          })
+          .merge(PaginationQuerySchema)
+          .merge(
+            createSortingQuerySchema([
+              "name",
+              "createdAt",
+              "team",
+              "toolsCount",
+              "subagentsCount",
+              "lastUsedAt",
+            ] as const),
+          ),
+        response: constructResponseSchema(AgentCatalogResponseSchema),
+      },
+    },
+    async ({ organizationId, user, query }, reply) => {
+      const checker = await getAgentTypePermissionChecker({
+        userId: user.id,
+        organizationId,
+      });
+      checker.require("agent", query.status === "deleted" ? "delete" : "read");
+      const isAgentAdmin = checker.isAdmin("agent");
+      const filters = {
+        organizationId,
+        name: query.name,
+        scope: query.scope,
+        includeBuiltIn: query.includeBuiltIn,
+        teamIds: query.teamIds,
+        authorIds: isAgentAdmin ? query.authorIds : undefined,
+        excludeAuthorIds: isAgentAdmin ? query.excludeAuthorIds : undefined,
+        ids: query.ids,
+        excludeIds: query.excludeIds,
+        excludeOtherPersonalAgents: isAgentAdmin
+          ? query.excludeOtherPersonalAgents
+          : undefined,
+        access: resourceAccessSelection(query),
+        labels: parseLabelsParam(query.labels),
+        status: query.status,
+        providerApiKeyId: query.providerApiKeyId,
+        runtime: query.runtime,
+        pinned: query.pinned,
+      };
+      const sorting = {
+        sortBy: query.sortBy,
+        sortDirection: query.sortDirection,
+      };
+      const candidates = await AgentModel.findCatalogCandidates({
+        pagination: { limit: query.limit, offset: query.offset },
+        sorting,
+        filters,
+        userId: user.id,
+        isAgentAdmin,
+        externalAgentAction: query.selectableOnly ? "delete" : "read",
+        excludeOtherPersonalExternalAgents: query.excludeOtherPersonalAgents,
+      });
+      const agentIds = candidates.rows.flatMap((row) =>
+        row.type === "agent" ? [row.id] : [],
+      );
+      const externalAgentIds = candidates.rows.flatMap((row) =>
+        row.type === "external" ? [row.id] : [],
+      );
+      const [agents, externalAgents] = await Promise.all([
+        agentIds.length > 0
+          ? AgentModel.findAllPaginated(
+              { limit: agentIds.length, offset: 0 },
+              sorting,
+              {
+                ...filters,
+                ids: agentIds,
+                agentTypes: ["agent"],
+                includeTools: query.includeTools,
+              },
+              user.id,
+              isAgentAdmin,
+            ).then((result) => result.data)
+          : Promise.resolve([]),
+        listA2aRemoteAgents({
+          organizationId,
+          userId: user.id,
+          ids: externalAgentIds,
+        }),
+      ]);
+      await populateAgentListActivationSkillCounts({
+        agents,
+        organizationId,
+        userId: user.id,
+      });
+      const agentsById = new Map(agents.map((agent) => [agent.id, agent]));
+      const externalAgentsById = new Map(
+        externalAgents.map((agent) => [agent.id, agent]),
+      );
+      const data: AgentCatalogRow[] = [];
+      for (const row of candidates.rows) {
+        if (row.type === "agent") {
+          const agent = agentsById.get(row.id);
+          if (agent) data.push({ type: "agent", value: agent });
+          continue;
+        }
+        const agent = externalAgentsById.get(row.id);
+        if (agent) data.push({ type: "external", value: agent });
+      }
+
+      return reply.send({
+        data,
+        pagination: calculatePaginationMeta(candidates.total, {
+          limit: query.limit,
+          offset: query.offset,
+        }),
+        totals: {
+          agents: candidates.agentTotal,
+          externalAgents: candidates.externalAgentTotal,
+        },
+      });
+    },
+  );
+};
+
+export default agentCatalogRoutes;

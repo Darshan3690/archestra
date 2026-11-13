@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import {
   extractCitations,
@@ -15,6 +16,36 @@ describe("hasKnowledgeBaseToolCall", () => {
   it("returns true for legacy tool parts with type ending in query_knowledge_sources", () => {
     const parts = [{ type: "tool-archestra__query_knowledge_sources" }];
     expect(hasKnowledgeBaseToolCall(parts)).toBe(true);
+  });
+
+  it("returns true when the KB query is dispatched through run_tool (Auto tool mode)", () => {
+    const parts = [
+      {
+        type: "tool-archestra__run_tool",
+        state: "output-available",
+        input: {
+          tool_name: "archestra__query_knowledge_sources",
+          tool_args: { query: "rate limit" },
+        },
+      },
+    ];
+    expect(hasKnowledgeBaseToolCall(parts)).toBe(true);
+  });
+
+  it("returns false when run_tool dispatched a different tool", () => {
+    const parts = [
+      {
+        type: "tool-archestra__run_tool",
+        state: "output-available",
+        input: { tool_name: "archestra__list_projects", tool_args: {} },
+      },
+    ];
+    expect(hasKnowledgeBaseToolCall(parts)).toBe(false);
+  });
+
+  it("returns false for a run_tool part with no input", () => {
+    const parts = [{ type: "tool-archestra__run_tool" }];
+    expect(hasKnowledgeBaseToolCall(parts)).toBe(false);
   });
 
   it("returns false when no knowledge base tool call exists", () => {
@@ -98,12 +129,14 @@ describe("extractCitations", () => {
       sourceUrl: "https://example.com/doc",
       connectorType: "confluence",
       documentId: "doc-1",
+      sourceId: null,
     });
     expect(citations[1]).toEqual({
       title: "Another Doc",
       sourceUrl: null,
       connectorType: null,
       documentId: "doc-2",
+      sourceId: null,
     });
   });
 
@@ -131,6 +164,53 @@ describe("extractCitations", () => {
     const citations = extractCitations([makeKbPart(output)]);
     expect(citations).toHaveLength(1);
     expect(citations[0].documentId).toBe("doc-dup");
+  });
+
+  it("extracts citations from a run_tool-wrapped KB query (Auto tool mode)", () => {
+    // Shape observed from a persisted Auto-mode conversation: the part is
+    // named after the dispatcher, the real tool is in input.tool_name, and
+    // the output carries the KB payload as a JSON string under `content`.
+    const part = {
+      type: "tool-archestra__run_tool",
+      state: "output-available" as const,
+      input: {
+        tool_name: "archestra__query_knowledge_sources",
+        tool_args: { query: "rate limit" },
+      },
+      output: {
+        content: JSON.stringify({
+          results: [
+            {
+              citation: {
+                title: "Zephyr Billing API Reference",
+                sourceUrl: "http://example.com/zephyr",
+                connectorType: "web_crawler",
+                documentId: "doc-run-tool",
+              },
+            },
+          ],
+        }),
+      },
+    };
+    const citations = extractCitations([part]);
+    expect(citations).toHaveLength(1);
+    expect(citations[0]).toEqual({
+      title: "Zephyr Billing API Reference",
+      sourceUrl: "http://example.com/zephyr",
+      connectorType: "web_crawler",
+      documentId: "doc-run-tool",
+      sourceId: null,
+    });
+  });
+
+  it("does not extract citations from a run_tool part that dispatched another tool", () => {
+    const part = {
+      type: "tool-archestra__run_tool",
+      state: "output-available" as const,
+      input: { tool_name: "archestra__list_projects", tool_args: {} },
+      output: { content: JSON.stringify({ results: [] }) },
+    };
+    expect(extractCitations([part])).toEqual([]);
   });
 
   it("returns empty array when no KB parts exist", () => {
@@ -265,6 +345,7 @@ describe("extractCitations", () => {
       sourceUrl: "https://example.com/wrapped",
       connectorType: "jira",
       documentId: "doc-wrapped",
+      sourceId: null,
     });
   });
 

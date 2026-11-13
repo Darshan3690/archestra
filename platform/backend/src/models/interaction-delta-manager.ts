@@ -1,0 +1,1002 @@
+import { createHash } from "node:crypto";
+import { getHeapStatistics } from "node:v8";
+import { isClaudeSessionSource, TimeInMs } from "@archestra/shared";
+import { and, desc, eq, lt, sql } from "drizzle-orm";
+import { LRUCacheManager } from "@/cache-manager";
+import { readInteractionRow } from "@/content-encryption/audit-rows";
+import db, { schema } from "@/database";
+import type { InsertInteraction } from "@/types";
+
+/**
+ * Delta-encoding for Claude Code / Claude Desktop LLM-proxy interactions.
+ *
+ * Every agentic request re-sends the whole conversation, so storing the full
+ * `request`/`processedRequest` on every row is Θ(N²) per session. This manager
+ * stores only the suffix of `messages` that is new versus the row's parent and
+ * rebuilds the full request on read by walking the parent chain — Θ(N).
+ *
+ * It is the single source of truth for the delta format and is used on BOTH the
+ * write path (`encodeOnWrite` from `InteractionModel.create`) and the read path
+ * (`reconstructRow` / `reconstructMany`). A per-pod LRU is the fast path; the DB
+ * (recursive CTE up `parent_id`) is the source of truth, so results are identical
+ * with a cold cache or across pods.
+ *
+ * Non-Claude / non-Anthropic interactions are returned untouched (full storage),
+ * preserving existing behavior.
+ */
+
+/** Minimal view of an Anthropic-style messages request. */
+interface MessagesRequest {
+  messages?: unknown[];
+  [key: string]: unknown;
+}
+
+interface FullRequest {
+  request: unknown;
+  processedRequest: unknown;
+}
+
+/** Cached tip of a (sessionId, threadId) branch — the most recent row. */
+interface CachedTip {
+  id: string;
+  requestLastMessageIdx: number;
+  requestLastMessageHash: string;
+}
+
+/** Cache entry returned by encodeOnWrite to commit once the new row id is known. */
+interface DeltaTipUpdate {
+  key: string;
+  requestLastMessageIdx: number;
+  requestLastMessageHash: string;
+  fullRequest: unknown;
+  fullProcessed: unknown;
+}
+
+/**
+ * Top-level request/processedRequest fields that are large and near-constant
+ * across a session (the tool-schema array and the system prompt). On a child
+ * row they are dropped when byte-identical to the parent's reconstructed value
+ * and re-inherited on read — the same prefix-delta idea applied to whole fields
+ * instead of a message suffix.
+ *
+ * Inheritance is "carry the parent's value forward when the field is absent",
+ * so a field going present -> absent mid-chain cannot be represented as a
+ * delta (the dropped field would reappear on cold reads). Claude CLI settings
+ * and tools can legitimately change on resume, so `encodeOnWrite` detects the
+ * disappearance — independently for request and processedRequest — and stores
+ * a full new head row instead; the next request chains to that head.
+ */
+const INHERITABLE_ENVELOPE_FIELDS = ["tools", "system"] as const;
+
+interface EncodedInteraction {
+  values: InsertInteraction;
+  tip: DeltaTipUpdate | null;
+}
+
+/** Row shape loaded for reconstruction (camelCase mapping of the chain CTE). */
+interface ChainRow {
+  id: string;
+  parentId: string | null;
+  threadId: string | null;
+  requestSharedPrefix: number | null;
+  processedRequestSharedPrefix: number | null;
+  request: unknown;
+  processedRequest: unknown;
+}
+
+/** Subset of an interaction row the read path passes to reconstructMany. */
+interface ReconstructableRow {
+  id: string;
+  threadId: string | null;
+  request: unknown;
+  processedRequest?: unknown;
+}
+
+/**
+ * A stored, already-decrypted row as a {@link ThreadFolder} takes it: a
+ * {@link ChainRow} whose processed side may be left out when the caller only
+ * needs the request.
+ */
+type LoadedChainRow = Omit<
+  ChainRow,
+  "processedRequestSharedPrefix" | "processedRequest"
+> &
+  Partial<Pick<ChainRow, "processedRequestSharedPrefix" | "processedRequest">>;
+
+/**
+ * One row's fold: its full request and the message arrays the next row's
+ * fold slices, kept apart from the envelope the way {@link foldFor} keeps
+ * them.
+ */
+interface FoldState {
+  full: FullRequest;
+  requestMessages: unknown[];
+  processedMessages: unknown[] | null;
+}
+
+/** The fold of one thread's rows, fed one row at a time; see `threadFolder`. */
+interface ThreadFolder {
+  /**
+   * Fold one row from its parent's fold and return its full request. Null
+   * when the parent belongs to the thread but has not been fed yet.
+   */
+  fold(row: LoadedChainRow): unknown | null;
+  /**
+   * Pass a row the caller will not fold (it could not be read, or its parent
+   * could not be folded), so its parent's fold is not held for it.
+   */
+  skip(row: { id: string; parentId: string | null }): void;
+}
+
+const CACHE_MAX_SIZE = 5000;
+
+/**
+ * Entry ceiling for the reconstruct cache.
+ *
+ * Deliberately far below CACHE_MAX_SIZE. A tipCache entry is a few scalars, but
+ * a reconstruct entry is a whole reconstructed request, which for a Claude Code
+ * session runs to megabytes. RECONSTRUCT_CACHE_MAX_BYTES is the real bound; this
+ * is the backstop, kept small so the byte sweep stays cheap.
+ */
+const RECONSTRUCT_CACHE_MAX_ENTRIES = 512;
+
+/**
+ * Share of the V8 heap the reconstruct cache may retain.
+ *
+ * Derived from the heap limit rather than hardcoded so the budget tracks the
+ * container: the production launcher sizes --max-old-space-size from the pod's
+ * memory limit, so a larger pod gets a proportionally larger cache without a
+ * second knob to keep in sync.
+ */
+const RECONSTRUCT_CACHE_HEAP_FRACTION = 0.1;
+
+const RECONSTRUCT_CACHE_MAX_BYTES = Math.floor(
+  getHeapStatistics().heap_size_limit * RECONSTRUCT_CACHE_HEAP_FRACTION,
+);
+
+/**
+ * Approximate retained size of a reconstructed request.
+ *
+ * `.length` counts UTF-16 code units rather than bytes, which understates
+ * multi-byte text. That is fine for a budget whose job is to stop a cache from
+ * consuming the heap, and it avoids a second full pass over the payload.
+ */
+function approximateRetainedBytes(value: FullRequest): number {
+  try {
+    return JSON.stringify(value)?.length ?? 0;
+  } catch {
+    // Unexpected for these payloads, but a sizing helper must never be the
+    // reason a request fails. Counting it as free is safe — the entry ceiling
+    // still bounds it.
+    return 0;
+  }
+}
+
+class InteractionDeltaManager {
+  /** Branch tip per (sessionId, threadId) — write-path parent fast path. */
+  private static tipCache = new LRUCacheManager<CachedTip>({
+    maxSize: CACHE_MAX_SIZE,
+    defaultTtl: TimeInMs.Hour,
+  });
+
+  /**
+   * Reconstructed full request/processedRequest per interaction id — read-path
+   * memo and write-path parent source.
+   *
+   * Bounded by bytes, not entry count. Entries here are whole reconstructed
+   * requests whose size spans orders of magnitude, so a count is not a memory
+   * bound: at Claude Code payload sizes the heap is exhausted by a few hundred
+   * entries, a few percent of a nominal 5000-entry capacity.
+   */
+  private static reconstructCache = new LRUCacheManager<FullRequest>({
+    maxSize: RECONSTRUCT_CACHE_MAX_ENTRIES,
+    maxBytes: RECONSTRUCT_CACHE_MAX_BYTES,
+    sizeOf: approximateRetainedBytes,
+    defaultTtl: TimeInMs.Hour,
+  });
+
+  /**
+   * Delta-encode an interaction before insert. Returns the row to persist and a
+   * tip update to commit (via `commitTip`) once the inserted id is known.
+   * Returns the row unchanged (tip null) when not delta-eligible.
+   */
+  static async encodeOnWrite(
+    data: InsertInteraction,
+  ): Promise<EncodedInteraction> {
+    if (!InteractionDeltaManager.isEligible(data)) {
+      return { values: data, tip: null };
+    }
+
+    const request = data.request as MessagesRequest;
+    const messages = request.messages as unknown[];
+    const threadId = hashMessage(messages[0]);
+    const lastIdx = messages.length - 1;
+    const lastHash = hashMessage(messages[lastIdx]);
+    const key = tipKey(data.sessionId as string, threadId);
+
+    let parent = await InteractionDeltaManager.resolveParent(key, {
+      sessionId: data.sessionId as string,
+      threadId,
+      messages,
+    });
+
+    // An inheritable envelope field (`tools`/`system`) that disappears —
+    // present on the parent, absent now — cannot be delta-encoded against
+    // that parent: reconstruction re-inherits absent fields, so the dropped
+    // field would reappear on cold reads. request and processedRequest are
+    // checked independently against their own parent envelopes; either one
+    // dropping a field turns this into a full head row, and the next request
+    // chains to it.
+    if (
+      parent &&
+      (dropsInheritableField(request, parent.fullRequest) ||
+        (getMessages(data.processedRequest) !== null &&
+          dropsInheritableField(
+            data.processedRequest,
+            parent.fullProcessedRequest,
+          )))
+    ) {
+      parent = null;
+    }
+
+    let requestSharedPrefix: number;
+    let parentId: string | null;
+    let deltaMessages: unknown[];
+    if (parent) {
+      // Parent CHOICE used the normalized hash (a cache_control breakpoint
+      // moving off a message, or the equivalent string/block content shape,
+      // must still resolve the same parent). The STORED prefix must be exact:
+      // the normalized hash treats byte-different messages as equal, so a
+      // prefix defined by it would persist the parent's version of a message
+      // the client rewrote (moved breakpoint, edited history) and a cold
+      // reconstruction would return bytes this request never contained.
+      const parentMessages = getMessages(parent.fullRequest);
+      requestSharedPrefix = parentMessages
+        ? longestExactPrefixLen(parentMessages, messages)
+        : 0;
+      parentId = parent.id;
+      deltaMessages = messages.slice(requestSharedPrefix);
+    } else {
+      // No parent (first request / sub-agent / post-compaction / aged-out branch):
+      // persist a complete-request "head" row. Still delta-format (threadId + last
+      // message metadata set) so the next request resolves it as parent.
+      requestSharedPrefix = 0;
+      parentId = null;
+      deltaMessages = messages;
+    }
+
+    // Drop `tools`/`system` from the stored request when byte-identical to the
+    // parent's — reconstruction re-inherits them. Head rows (no parent) keep the
+    // full envelope, so every thread retains one complete copy.
+    const requestToStore = omitInheritedFields(
+      { ...request, messages: deltaMessages },
+      parent?.fullRequest,
+    );
+
+    // processedRequest is delta-encoded independently against the parent's
+    // reconstructed processedRequest (its message array can differ from request).
+    const processedRequest = data.processedRequest as MessagesRequest | null;
+    const processedMessages = getMessages(processedRequest);
+    let processedRequestSharedPrefix: number | null;
+    let processedToStore: unknown;
+    if (processedMessages) {
+      const parentProcessed = parent
+        ? getMessages(parent.fullProcessedRequest)
+        : null;
+      const prefix = parentProcessed
+        ? longestExactPrefixLen(parentProcessed, processedMessages)
+        : 0;
+      processedRequestSharedPrefix = prefix;
+      processedToStore = omitInheritedFields(
+        {
+          ...(processedRequest as MessagesRequest),
+          messages: processedMessages.slice(prefix),
+        },
+        parent?.fullProcessedRequest,
+      );
+    } else {
+      // processedRequest null or non-message-shaped — store as-is, no reconstruction.
+      processedRequestSharedPrefix = null;
+      processedToStore = data.processedRequest;
+    }
+
+    const values: InsertInteraction = {
+      ...data,
+      request: requestToStore as InsertInteraction["request"],
+      processedRequest:
+        processedToStore as InsertInteraction["processedRequest"],
+      threadId,
+      parentId,
+      requestSharedPrefix,
+      processedRequestSharedPrefix,
+      requestLastMessageIdx: lastIdx,
+      requestLastMessageHash: lastHash,
+    };
+
+    const tip: DeltaTipUpdate = {
+      key,
+      requestLastMessageIdx: lastIdx,
+      requestLastMessageHash: lastHash,
+      // Tip carries the FULL (un-omitted) request so it seeds this row's
+      // reconstruction cache and is the inheritance source for the next request.
+      fullRequest: { ...request, messages },
+      fullProcessed: processedMessages
+        ? {
+            ...(processedRequest as MessagesRequest),
+            messages: processedMessages,
+          }
+        : null,
+    };
+
+    return { values, tip };
+  }
+
+  /**
+   * Populate the caches after the row is inserted and its id is known. Makes the
+   * next request on the branch O(1) and an immediate read of this row a cache hit.
+   */
+  static commitTip(id: string, tip: DeltaTipUpdate): void {
+    InteractionDeltaManager.tipCache.set(tip.key, {
+      id,
+      requestLastMessageIdx: tip.requestLastMessageIdx,
+      requestLastMessageHash: tip.requestLastMessageHash,
+    });
+    InteractionDeltaManager.reconstructCache.set(id, {
+      request: tip.fullRequest,
+      processedRequest: tip.fullProcessed,
+    });
+  }
+
+  /** Reconstruct the full request/processedRequest for a single interaction row. */
+  static async reconstructRow(row: ReconstructableRow): Promise<FullRequest> {
+    if (row.threadId === null) {
+      // Legacy / non-delta row stores full request already.
+      return { request: row.request, processedRequest: row.processedRequest };
+    }
+    const cached = InteractionDeltaManager.reconstructCache.get(row.id);
+    if (cached) {
+      return cached;
+    }
+    const map = await InteractionDeltaManager.loadChain([row.id]);
+    return (
+      InteractionDeltaManager.foldFor(row.id, map) ?? {
+        request: row.request,
+        processedRequest: row.processedRequest,
+      }
+    );
+  }
+
+  /**
+   * Batch-reconstruct many rows (e.g. a paginated page). Loads every needed
+   * ancestor in one recursive CTE; legacy rows and cache hits issue no DB work.
+   */
+  static async reconstructMany(
+    rows: ReconstructableRow[],
+  ): Promise<Map<string, FullRequest>> {
+    const result = new Map<string, FullRequest>();
+    const needLoad: string[] = [];
+
+    for (const row of rows) {
+      if (row.threadId === null) {
+        result.set(row.id, {
+          request: row.request,
+          processedRequest: row.processedRequest,
+        });
+        continue;
+      }
+      const cached = InteractionDeltaManager.reconstructCache.get(row.id);
+      if (cached) {
+        result.set(row.id, cached);
+        continue;
+      }
+      needLoad.push(row.id);
+    }
+
+    if (needLoad.length > 0) {
+      const map = await InteractionDeltaManager.loadChain(needLoad);
+      for (const id of needLoad) {
+        const folded = InteractionDeltaManager.foldFor(id, map);
+        if (folded) {
+          result.set(id, folded);
+        }
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Fold a thread's rows one at a time, parents before children, given the
+   * skeleton of the rows to come (each row's id and parent id).
+   *
+   * For the session-preview backfill, which rebuilds a thread of any size
+   * with bounded memory: it loads the rows in small batches, feeds each one
+   * here and keeps only the preview. Going through {@link reconstructMany}
+   * instead would load the chain of every row again, size (stringify) one
+   * whole conversation per row to cache it, and hold one conversation per
+   * row until the batch was done; on a Claude Code session of hundreds of
+   * turns that exhausted the worker's heap. The folder keeps a row's fold
+   * only while a child of it is still to come and drops it with the last
+   * child, so a thread holds one conversation at a time however many rows,
+   * and however many full head rows, it has.
+   *
+   * The reconstruct cache is left alone, though an ancestor cached by an
+   * earlier read is reused. A row whose parent is not in the skeleton is
+   * folded as its own head, as {@link reconstructMany} treats a chain cut by
+   * retention.
+   */
+  static threadFolder(
+    skeleton: ReadonlyArray<{ id: string; parentId: string | null }>,
+  ): ThreadFolder {
+    const members = new Set(skeleton.map((row) => row.id));
+    const unfoldedChildren = new Map<string, number>();
+    for (const row of skeleton) {
+      if (row.parentId !== null && members.has(row.parentId)) {
+        unfoldedChildren.set(
+          row.parentId,
+          (unfoldedChildren.get(row.parentId) ?? 0) + 1,
+        );
+      }
+    }
+    const states = new Map<string, FoldState>();
+    const threadParent = (row: { parentId: string | null }) =>
+      row.parentId !== null && members.has(row.parentId) ? row.parentId : null;
+    // One child fewer to come for `parentId`; its fold goes with the last.
+    const release = (parentId: string | null) => {
+      if (parentId === null) return;
+      const left = (unfoldedChildren.get(parentId) ?? 1) - 1;
+      unfoldedChildren.set(parentId, left);
+      if (left <= 0) states.delete(parentId);
+    };
+    return {
+      fold(row) {
+        const parentId = threadParent(row);
+        let parent: FoldState | null = null;
+        if (parentId !== null) {
+          const known = states.get(parentId);
+          if (known) {
+            parent = known;
+          } else {
+            const cached =
+              InteractionDeltaManager.reconstructCache.get(parentId);
+            if (!cached) return null;
+            parent = stateFromFull(cached);
+          }
+        }
+        const state = InteractionDeltaManager.foldChild(
+          {
+            processedRequestSharedPrefix: null,
+            processedRequest: null,
+            ...row,
+          },
+          parent,
+        );
+        if ((unfoldedChildren.get(row.id) ?? 0) > 0) states.set(row.id, state);
+        release(parentId);
+        return state.full.request;
+      },
+      skip(row) {
+        release(threadParent(row));
+      },
+    };
+  }
+
+  /** Clear both caches. Intended for tests that exercise the cold-cache DB path. */
+  static reset(): void {
+    InteractionDeltaManager.tipCache.clear();
+    InteractionDeltaManager.reconstructCache.clear();
+  }
+
+  private static isEligible(data: InsertInteraction): boolean {
+    if (data.sessionId == null) return false;
+    if (!isClaudeSessionSource(data.sessionSource ?? null)) {
+      return false;
+    }
+    // bedrock:invoke shares the Anthropic Messages request shape (it is what
+    // Claude Code sends when routed through Bedrock), so delta storage applies
+    // to both.
+    if (data.type !== "anthropic:messages" && data.type !== "bedrock:invoke") {
+      return false;
+    }
+    const messages = getMessages(data.request);
+    return messages !== null && messages.length >= 1;
+  }
+
+  private static async resolveParent(
+    key: string,
+    params: { sessionId: string; threadId: string; messages: unknown[] },
+  ): Promise<{
+    id: string;
+    requestLastMessageIdx: number;
+    fullRequest: unknown;
+    fullProcessedRequest: unknown;
+  } | null> {
+    const { sessionId, threadId, messages } = params;
+
+    const cached = InteractionDeltaManager.tipCache.get(key);
+    if (cached && InteractionDeltaManager.isValidParent(cached, messages)) {
+      return InteractionDeltaManager.parentRef(
+        cached.id,
+        cached.requestLastMessageIdx,
+      );
+    }
+
+    // DB fallback. Fetch a small candidate set (NOT limit 1): under forking,
+    // concurrent branches share the threadId and reach the same message index, so
+    // the most recent candidate can belong to a different branch. We require a
+    // strict prefix (`request_last_message_idx < length - 1`) and then pick the
+    // most recent candidate whose stored last-message hash matches the incoming
+    // request at that index. Matching on the always-plaintext hash column (not on
+    // `request -> 'messages' -> -1`) keeps parent resolution working when content
+    // encryption at rest has replaced `request` with ciphertext.
+    const candidates = await db
+      .select({
+        id: schema.interactionsTable.id,
+        requestLastMessageIdx: schema.interactionsTable.requestLastMessageIdx,
+        requestLastMessageHash: schema.interactionsTable.requestLastMessageHash,
+      })
+      .from(schema.interactionsTable)
+      .where(
+        and(
+          eq(schema.interactionsTable.sessionId, sessionId),
+          eq(schema.interactionsTable.threadId, threadId),
+          lt(
+            schema.interactionsTable.requestLastMessageIdx,
+            messages.length - 1,
+          ),
+        ),
+      )
+      // desc(id) tiebreak: same-instant interactions are common under load,
+      // and new ids are monotonic UUIDv7 — so "most recent candidate" stays
+      // deterministic (and, for fresh rows, truly means insertion order)
+      // instead of flapping between ties across queries.
+      .orderBy(
+        desc(schema.interactionsTable.createdAt),
+        desc(schema.interactionsTable.id),
+      )
+      .limit(16);
+
+    const chosen = candidates.find(
+      (c) =>
+        c.requestLastMessageIdx !== null &&
+        c.requestLastMessageHash !== null &&
+        c.requestLastMessageHash ===
+          hashMessage(messages[c.requestLastMessageIdx]),
+    );
+    if (!chosen || chosen.requestLastMessageIdx === null) {
+      return null;
+    }
+
+    return InteractionDeltaManager.parentRef(
+      chosen.id,
+      chosen.requestLastMessageIdx,
+    );
+  }
+
+  /**
+   * Resolve a chosen parent id into the reference encodeOnWrite needs: its last
+   * message index plus its fully reconstructed request/processedRequest (the
+   * source for message-prefix and tools/system inheritance). Reconstruction is a
+   * cache hit on the warm write path; cold only after eviction.
+   */
+  private static async parentRef(
+    id: string,
+    requestLastMessageIdx: number,
+  ): Promise<{
+    id: string;
+    requestLastMessageIdx: number;
+    fullRequest: unknown;
+    fullProcessedRequest: unknown;
+  }> {
+    const full = await InteractionDeltaManager.reconstructById(id);
+    return {
+      id,
+      requestLastMessageIdx,
+      fullRequest: full?.request ?? null,
+      fullProcessedRequest: full?.processedRequest ?? null,
+    };
+  }
+
+  private static isValidParent(
+    cached: CachedTip,
+    messages: unknown[],
+  ): boolean {
+    return (
+      cached.requestLastMessageIdx < messages.length - 1 &&
+      hashMessage(messages[cached.requestLastMessageIdx]) ===
+        cached.requestLastMessageHash
+    );
+  }
+
+  private static async reconstructById(
+    id: string,
+  ): Promise<FullRequest | null> {
+    const cached = InteractionDeltaManager.reconstructCache.get(id);
+    if (cached) return cached;
+    const map = await InteractionDeltaManager.loadChain([id]);
+    return InteractionDeltaManager.foldFor(id, map);
+  }
+
+  /** Load each seed row plus all of its ancestors (deduped) in one query. */
+  private static async loadChain(
+    seedIds: string[],
+  ): Promise<Map<string, ChainRow>> {
+    const seedList = sql.join(
+      seedIds.map((id) => sql`${id}::uuid`),
+      sql`, `,
+    );
+    const rows = await db.execute<{
+      id: string;
+      parent_id: string | null;
+      thread_id: string | null;
+      request_shared_prefix: number | null;
+      processed_request_shared_prefix: number | null;
+      request: unknown;
+      processed_request: unknown;
+    }>(sql`
+      WITH RECURSIVE chain AS (
+        SELECT id, parent_id, thread_id, request_shared_prefix,
+               processed_request_shared_prefix, request, processed_request,
+               encrypted_chat_conversation_id
+        FROM interactions
+        WHERE id IN (${seedList})
+        UNION
+        SELECT i.id, i.parent_id, i.thread_id, i.request_shared_prefix,
+               i.processed_request_shared_prefix, i.request, i.processed_request,
+               i.encrypted_chat_conversation_id
+        FROM interactions i
+        JOIN chain c ON i.id = c.parent_id
+      )
+      SELECT id, parent_id, thread_id, request_shared_prefix,
+             processed_request_shared_prefix, request, processed_request,
+             encrypted_chat_conversation_id
+      FROM chain
+    `);
+
+    const map = new Map<string, ChainRow>();
+    for (const row of rows.rows) {
+      // A chain may mix plaintext delta rows with rows the backfill has
+      // already encrypted — resolve each row independently before folding.
+      // An encrypted-chat row cannot appear here (they are written
+      // delta-ineligible, so nothing links to them), but going through the
+      // locked-safe reader keeps that a property of this code rather than an
+      // assumption about a different file.
+      readInteractionRow(row);
+      map.set(row.id, {
+        id: row.id,
+        parentId: row.parent_id,
+        threadId: row.thread_id,
+        requestSharedPrefix: row.request_shared_prefix,
+        processedRequestSharedPrefix: row.processed_request_shared_prefix,
+        request: row.request,
+        processedRequest: row.processed_request,
+      });
+    }
+    return map;
+  }
+
+  /** Fold a row's parent chain, reusing cached ancestors and caching the target. */
+  private static foldFor(
+    id: string,
+    map: Map<string, ChainRow>,
+  ): FullRequest | null {
+    const target = map.get(id);
+    if (!target) return null;
+
+    if (target.threadId === null) {
+      const full = {
+        request: target.request,
+        processedRequest: target.processedRequest,
+      };
+      InteractionDeltaManager.reconstructCache.set(id, full);
+      return full;
+    }
+
+    // Walk head -> target.
+    const chain: ChainRow[] = [];
+    let cursor: ChainRow | undefined = target;
+    while (cursor) {
+      chain.push(cursor);
+      if (cursor.parentId === null) break;
+      cursor = map.get(cursor.parentId);
+    }
+    chain.reverse();
+
+    // The fold result, held locally rather than read back out of the cache. The
+    // cache is byte-bounded, so writing an entry does not guarantee it is still
+    // there a moment later: a request larger than the whole budget is evicted
+    // immediately. Reading it back would turn that into a spurious null and send
+    // the caller down the "no delta" path with a partial request.
+    let state: FoldState | null = null;
+    for (const row of chain) {
+      const cached = InteractionDeltaManager.reconstructCache.get(row.id);
+      state = cached
+        ? stateFromFull(cached)
+        : InteractionDeltaManager.foldChild(row, state);
+    }
+    const foldedTarget = state?.full ?? null;
+
+    // Intermediate conversations grow with every turn. Sizing and retaining
+    // each prefix repeats work over the same messages and churns the byte
+    // budget; only the requested target needs a new cache entry.
+    if (foldedTarget) {
+      InteractionDeltaManager.reconstructCache.set(id, foldedTarget);
+    }
+
+    return foldedTarget;
+  }
+
+  /**
+   * Fold one row onto its parent's fold. A head row (no parent fold) stores
+   * its full messages; a delta row keeps the parent's first
+   * `requestSharedPrefix` messages and appends its own. The parent's full
+   * request is also the source of any `tools`/`system` the row omitted.
+   */
+  private static foldChild(row: ChainRow, parent: FoldState | null): FoldState {
+    let requestMessages: unknown[];
+    let processedMessages: unknown[] | null;
+    if (parent === null) {
+      requestMessages = [...(getMessages(row.request) ?? [])];
+      processedMessages = getMessages(row.processedRequest);
+    } else {
+      requestMessages = parent.requestMessages
+        .slice(0, row.requestSharedPrefix ?? 0)
+        .concat(getMessages(row.request) ?? []);
+      if (row.processedRequestSharedPrefix === null) {
+        processedMessages = getMessages(row.processedRequest);
+      } else {
+        processedMessages = (parent.processedMessages ?? [])
+          .slice(0, row.processedRequestSharedPrefix)
+          .concat(getMessages(row.processedRequest) ?? []);
+      }
+    }
+    const full = buildFull(
+      row,
+      requestMessages,
+      processedMessages,
+      parent?.full ?? null,
+    );
+    return { full, requestMessages, processedMessages };
+  }
+}
+
+/** The fold state a cached full request stands in for. */
+function stateFromFull(full: FullRequest): FoldState {
+  return {
+    full,
+    requestMessages: getMessages(full.request) ?? [],
+    processedMessages: getMessages(full.processedRequest),
+  };
+}
+
+function tipKey(sessionId: string, threadId: string): string {
+  return `${sessionId}::${threadId}`;
+}
+
+function getMessages(request: unknown): unknown[] | null {
+  if (request && typeof request === "object") {
+    const messages = (request as MessagesRequest).messages;
+    if (Array.isArray(messages)) return messages;
+  }
+  return null;
+}
+
+function buildFull(
+  row: ChainRow,
+  requestMessages: unknown[],
+  processedMessages: unknown[] | null,
+  parentFull: FullRequest | null,
+): FullRequest {
+  const request = reconstructEnvelope(
+    row.request,
+    parentFull?.request,
+    requestMessages,
+  );
+  const rawProcessed = row.processedRequest;
+  let processedRequest: unknown;
+  if (rawProcessed == null) {
+    processedRequest = null;
+  } else if (Array.isArray((rawProcessed as MessagesRequest).messages)) {
+    processedRequest = reconstructEnvelope(
+      rawProcessed,
+      parentFull?.processedRequest,
+      processedMessages ?? [],
+    );
+  } else {
+    processedRequest = rawProcessed;
+  }
+  return { request, processedRequest };
+}
+
+/**
+ * Rebuild a request/processedRequest envelope: the stored (delta) object with
+ * its folded `messages`, plus any inheritable field (`tools`/`system`) that the
+ * stored object dropped re-filled from the parent's reconstructed envelope.
+ */
+function reconstructEnvelope(
+  stored: unknown,
+  parent: unknown,
+  messages: unknown[],
+): unknown {
+  const out = { ...(stored as Record<string, unknown>) };
+  if (parent && typeof parent === "object" && !Array.isArray(parent)) {
+    const parentObj = parent as Record<string, unknown>;
+    for (const field of INHERITABLE_ENVELOPE_FIELDS) {
+      if (!(field in out) && field in parentObj) {
+        out[field] = parentObj[field];
+      }
+    }
+  }
+  out.messages = messages;
+  return out;
+}
+
+/**
+ * Drop each inheritable field that is byte-identical (key-order-insensitive) to
+ * the parent's, so reconstruction re-inherits it. No parent / no match keeps the
+ * field, so a head row or a genuinely-changed field is always stored in full.
+ */
+function omitInheritedFields(
+  stored: Record<string, unknown>,
+  parentEnvelope: unknown,
+): Record<string, unknown> {
+  if (
+    !parentEnvelope ||
+    typeof parentEnvelope !== "object" ||
+    Array.isArray(parentEnvelope)
+  ) {
+    return stored;
+  }
+  const parentObj = parentEnvelope as Record<string, unknown>;
+  const out = { ...stored };
+  for (const field of INHERITABLE_ENVELOPE_FIELDS) {
+    if (
+      field in out &&
+      field in parentObj &&
+      stableStringify(out[field]) === stableStringify(parentObj[field])
+    ) {
+      delete out[field];
+    }
+  }
+  return out;
+}
+
+/**
+ * True when an inheritable field (`tools`/`system`) is present on the parent
+ * envelope but absent on the child's — a drop the delta format cannot
+ * represent, because reconstruction re-inherits absent fields from the parent.
+ */
+function dropsInheritableField(
+  child: unknown,
+  parentEnvelope: unknown,
+): boolean {
+  if (!child || typeof child !== "object" || Array.isArray(child)) {
+    return false;
+  }
+  if (
+    !parentEnvelope ||
+    typeof parentEnvelope !== "object" ||
+    Array.isArray(parentEnvelope)
+  ) {
+    return false;
+  }
+  const childObj = child as Record<string, unknown>;
+  const parentObj = parentEnvelope as Record<string, unknown>;
+  return INHERITABLE_ENVELOPE_FIELDS.some(
+    (field) => field in parentObj && !(field in childObj),
+  );
+}
+
+/**
+ * Length of the leading run of JSON-semantically-equal messages (key order
+ * ignored, values exact). Unlike `hashMessage` this performs NO normalization,
+ * so a stored delta prefix defined by it is lossless: every message the child
+ * omits is exactly the message the parent's chain already stores.
+ */
+function longestExactPrefixLen(a: unknown[], b: unknown[]): number {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  for (; i < n; i++) {
+    if (stableStringify(a[i]) !== stableStringify(b[i])) break;
+  }
+  return i;
+}
+
+/** Stable (key-sorted) sha256 so equal messages hash equal regardless of key order. */
+export function hashMessage(message: unknown): string {
+  return createHash("sha256")
+    .update(stableStringify(normalizeMessageForHash(message)))
+    .digest("hex");
+}
+
+/**
+ * Canonicalize a message before hashing so the *same logical message* hashes
+ * equal across requests, even though Anthropic prompt caching rewrites it.
+ *
+ * Claude Code marks the most recent message(s) with the moving cache breakpoint
+ * `cache_control: { type: "ephemeral" }`, and attaching that marker also wraps a
+ * plain-string `content` into a single text block. One turn later the same
+ * message is no longer the breakpoint, so the marker is gone and `content` is a
+ * bare string again. Hashing the raw bytes therefore made every prefix/parent
+ * match fail — so `resolveParent` returned null, `parent_id` was always NULL,
+ * and every row stored the full conversation instead of a delta.
+ *
+ * Normalization is hash-only and feeds ONLY thread identity and parent choice
+ * (`threadId`, `requestLastMessageHash`, candidate matching). It must never
+ * define a stored prefix: two messages that hash equal here can still differ
+ * in bytes, so the stored `requestSharedPrefix`/`processedRequestSharedPrefix`
+ * are computed with exact comparison (`longestExactPrefixLen`) and stored
+ * request bytes are left untouched — reconstruction returns each request's
+ * persisted content verbatim.
+ */
+function normalizeMessageForHash(message: unknown): unknown {
+  const stripped = stripEphemeral(message);
+  if (stripped && typeof stripped === "object" && !Array.isArray(stripped)) {
+    const msg = stripped as Record<string, unknown>;
+    const content = msg.content;
+    // A single `{ type: "text", text }` block is equivalent to a bare string
+    // `content`; collapse it so the breakpoint and non-breakpoint forms match.
+    if (Array.isArray(content) && content.length === 1) {
+      const block = content[0];
+      if (
+        block &&
+        typeof block === "object" &&
+        !Array.isArray(block) &&
+        (block as Record<string, unknown>).type === "text" &&
+        typeof (block as Record<string, unknown>).text === "string" &&
+        Object.keys(block as Record<string, unknown>).length === 2
+      ) {
+        return { ...msg, content: (block as { text: string }).text };
+      }
+    }
+  }
+  return stripped;
+}
+
+/**
+ * Recursively drop any child object that carries `type: "ephemeral"` (the moving
+ * cache breakpoint, e.g. `cache_control: { type: "ephemeral", ttl: "1h" }`),
+ * keyed on the marker shape rather than the `cache_control` key name.
+ */
+function stripEphemeral(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripEphemeral);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
+      if (isEphemeralObject(v)) continue;
+      out[key] = stripEphemeral(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** True for a plain object whose `type` is `"ephemeral"`. */
+function isEphemeralObject(value: unknown): boolean {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (value as Record<string, unknown>).type === "ephemeral"
+  );
+}
+
+function stableStringify(value: unknown): string {
+  return JSON.stringify(sortKeys(value));
+}
+
+function sortKeys(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortKeys);
+  }
+  if (value && typeof value === "object") {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      sorted[key] = sortKeys((value as Record<string, unknown>)[key]);
+    }
+    return sorted;
+  }
+  return value;
+}
+
+export default InteractionDeltaManager;

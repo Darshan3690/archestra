@@ -1,6 +1,4 @@
-import { vi } from "vitest";
-import type * as originalConfigModule from "@/config";
-import { describe, expect, test } from "@/test";
+import { describe, expect, test, vi } from "vitest";
 
 vi.mock("@kubernetes/client-node", () => {
   class MockKubeConfig {
@@ -12,7 +10,15 @@ vi.mock("@kubernetes/client-node", () => {
     loadFromFile() {}
     loadFromString() {}
     makeApiClient() {
-      return {};
+      return {
+        api: {
+          configuration: {
+            httpApi: {
+              send: vi.fn((request: unknown) => ({ request })),
+            },
+          },
+        },
+      };
     }
   }
   return {
@@ -20,28 +26,55 @@ vi.mock("@kubernetes/client-node", () => {
     CoreV1Api: vi.fn(),
     AppsV1Api: vi.fn(),
     BatchV1Api: vi.fn(),
+    AuthorizationV1Api: vi.fn(),
+    RbacAuthorizationV1Api: vi.fn(),
+    NetworkingV1Api: vi.fn(),
+    CustomObjectsApi: vi.fn(),
     Attach: vi.fn(),
+    Exec: vi.fn(),
     Log: vi.fn(),
   };
 });
 
-vi.mock("@/config", async (importOriginal) => {
-  const actual = await importOriginal<typeof originalConfigModule>();
-  return {
-    default: {
-      ...actual.default,
-      orchestrator: {
-        kubernetes: {
-          namespace: "",
-          kubeconfig: undefined,
-          loadKubeconfigFromCurrentCluster: false,
-        },
+vi.mock("@/config", async () =>
+  (await import("@/test/mocks/config")).configModuleMock({
+    orchestrator: {
+      kubernetes: {
+        namespace: "",
+        kubeconfig: undefined,
+        loadKubeconfigFromCurrentCluster: false,
       },
     },
-  };
-});
+  }),
+);
 
 describe("shared K8s utilities", () => {
+  test("generated API clients bound requests with an abort signal", async () => {
+    const { KubeConfig } = await import("@kubernetes/client-node");
+    const { createK8sClients } = await import("./shared");
+    const clients = createK8sClients(new KubeConfig(), "test-namespace");
+    const httpApi = (
+      clients.coreApi as unknown as {
+        api: {
+          configuration: {
+            httpApi: { send: (request: unknown) => unknown };
+          };
+        };
+      }
+    ).api.configuration.httpApi;
+    let signal: AbortSignal | undefined;
+
+    httpApi.send({
+      getSignal: () => undefined,
+      setSignal: (value: AbortSignal) => {
+        signal = value;
+      },
+    });
+
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(signal?.aborted).toBe(false);
+  });
+
   describe("sanitizeLabelValue", () => {
     async function getSanitizeLabelValue() {
       const { sanitizeLabelValue } = await import("./shared");
@@ -165,11 +198,33 @@ describe("shared K8s utilities", () => {
     });
   });
 
+  describe("isK8sConflictError", () => {
+    async function getIsK8sConflictError() {
+      const { isK8sConflictError } = await import("./shared");
+      return isK8sConflictError;
+    }
+
+    test("returns true for statusCode, code, and response.statusCode 409", async () => {
+      const isK8sConflictError = await getIsK8sConflictError();
+      expect(isK8sConflictError({ statusCode: 409 })).toBe(true);
+      expect(isK8sConflictError({ code: 409 })).toBe(true);
+      expect(isK8sConflictError({ response: { statusCode: 409 } })).toBe(true);
+    });
+
+    test("returns false for non-409 errors and nullish input", async () => {
+      const isK8sConflictError = await getIsK8sConflictError();
+      expect(isK8sConflictError({ statusCode: 404 })).toBe(false);
+      expect(isK8sConflictError({ response: { statusCode: 500 } })).toBe(false);
+      expect(isK8sConflictError(null)).toBe(false);
+      expect(isK8sConflictError(undefined)).toBe(false);
+    });
+  });
+
   describe("isK8sConfigured", () => {
     test("returns false when no K8s env vars are set", async () => {
       vi.resetModules();
       vi.doMock("@/config", async (importOriginal) => {
-        const actual = await importOriginal<typeof originalConfigModule>();
+        const actual = await importOriginal<typeof import("@/config")>();
         return {
           default: {
             ...actual.default,
@@ -190,7 +245,7 @@ describe("shared K8s utilities", () => {
     test("returns true when kubeconfig is set", async () => {
       vi.resetModules();
       vi.doMock("@/config", async (importOriginal) => {
-        const actual = await importOriginal<typeof originalConfigModule>();
+        const actual = await importOriginal<typeof import("@/config")>();
         return {
           default: {
             ...actual.default,
@@ -211,7 +266,7 @@ describe("shared K8s utilities", () => {
     test("returns true when loadKubeconfigFromCurrentCluster is true", async () => {
       vi.resetModules();
       vi.doMock("@/config", async (importOriginal) => {
-        const actual = await importOriginal<typeof originalConfigModule>();
+        const actual = await importOriginal<typeof import("@/config")>();
         return {
           default: {
             ...actual.default,
@@ -232,7 +287,7 @@ describe("shared K8s utilities", () => {
     test("returns false when kubeconfig is empty string", async () => {
       vi.resetModules();
       vi.doMock("@/config", async (importOriginal) => {
-        const actual = await importOriginal<typeof originalConfigModule>();
+        const actual = await importOriginal<typeof import("@/config")>();
         return {
           default: {
             ...actual.default,
@@ -255,7 +310,7 @@ describe("shared K8s utilities", () => {
     test("returns configured namespace when set", async () => {
       vi.resetModules();
       vi.doMock("@/config", async (importOriginal) => {
-        const actual = await importOriginal<typeof originalConfigModule>();
+        const actual = await importOriginal<typeof import("@/config")>();
         return {
           default: {
             ...actual.default,
@@ -276,7 +331,7 @@ describe("shared K8s utilities", () => {
     test("returns 'default' when namespace is not set", async () => {
       vi.resetModules();
       vi.doMock("@/config", async (importOriginal) => {
-        const actual = await importOriginal<typeof originalConfigModule>();
+        const actual = await importOriginal<typeof import("@/config")>();
         return {
           default: {
             ...actual.default,
@@ -309,27 +364,6 @@ describe("shared K8s utilities", () => {
     });
   });
 
-  describe("ensureStringIsRfc1123Compliant", () => {
-    async function getEnsureStringIsRfc1123Compliant() {
-      const { ensureStringIsRfc1123Compliant } = await import("./shared");
-      return ensureStringIsRfc1123Compliant;
-    }
-
-    test.each([
-      ["My Server", "my-server"],
-      ["TEST-VALUE", "test-value"],
-      ["hello_world", "helloworld"],
-      ["a..b", "a.b"],
-      ["a--b", "a-b"],
-      ["-leading", "leading"],
-      ["trailing-", "trailing"],
-      ["UPPER CASE", "upper-case"],
-    ])("converts '%s' to '%s'", async (input, expected) => {
-      const fn = await getEnsureStringIsRfc1123Compliant();
-      expect(fn(input)).toBe(expected);
-    });
-  });
-
   describe("sanitizeMetadataLabels", () => {
     test("sanitizes both keys and values", async () => {
       const { sanitizeMetadataLabels } = await import("./shared");
@@ -350,5 +384,186 @@ describe("shared K8s utilities", () => {
       });
       expect(result.key.length).toBeLessThanOrEqual(63);
     });
+  });
+
+  describe("checkNamespaceDeployAccess", () => {
+    test("returns ok and checks the namespaced create-deployments permission", async () => {
+      const { checkNamespaceDeployAccess } = await import("./shared");
+      const createReview = vi
+        .fn()
+        .mockResolvedValue({ status: { allowed: true } });
+      const authApi = { createSelfSubjectAccessReview: createReview };
+
+      const result = await checkNamespaceDeployAccess(
+        "prod-ns",
+        authApi as unknown as Parameters<typeof checkNamespaceDeployAccess>[1],
+      );
+
+      expect(result).toEqual({ ok: true });
+      // It must probe create-deployments in the namespace — NOT read the
+      // namespace object (which would need cluster-scoped `get namespaces`).
+      expect(createReview).toHaveBeenCalledWith({
+        body: {
+          spec: {
+            resourceAttributes: {
+              namespace: "prod-ns",
+              verb: "create",
+              group: "apps",
+              resource: "deployments",
+            },
+          },
+        },
+      });
+    });
+
+    test("returns forbidden when the review denies access", async () => {
+      const { checkNamespaceDeployAccess } = await import("./shared");
+      const authApi = {
+        createSelfSubjectAccessReview: vi
+          .fn()
+          .mockResolvedValue({ status: { allowed: false } }),
+      };
+
+      const result = await checkNamespaceDeployAccess(
+        "prod-ns",
+        authApi as unknown as Parameters<typeof checkNamespaceDeployAccess>[1],
+      );
+
+      expect(result).toEqual({ ok: false, reason: "forbidden" });
+    });
+
+    test("returns unavailable when the review call throws", async () => {
+      const { checkNamespaceDeployAccess } = await import("./shared");
+      const authApi = {
+        createSelfSubjectAccessReview: vi
+          .fn()
+          .mockRejectedValue(new Error("network down")),
+      };
+
+      const result = await checkNamespaceDeployAccess(
+        "prod-ns",
+        authApi as unknown as Parameters<typeof checkNamespaceDeployAccess>[1],
+      );
+
+      expect(result).toEqual({ ok: false, reason: "unavailable" });
+    });
+  });
+
+  describe("namespaceAccessMessage", () => {
+    test("forbidden message names the namespace and points at the Helm value", async () => {
+      const { namespaceAccessMessage } = await import("./shared");
+      const msg = namespaceAccessMessage("prod-ns", "forbidden");
+      expect(msg).toContain("prod-ns");
+      expect(msg).toContain("environmentNamespaces");
+    });
+
+    test("unavailable message is generic", async () => {
+      const { namespaceAccessMessage } = await import("./shared");
+      expect(namespaceAccessMessage("prod-ns", "unavailable")).toBe(
+        "Could not reach the Kubernetes cluster.",
+      );
+    });
+  });
+});
+
+describe("isTransientK8sApiError", () => {
+  test("throttling and API-server unavailability are transient", async () => {
+    const { isTransientK8sApiError } = await import("./shared");
+    expect(isTransientK8sApiError({ code: 429 })).toBe(true);
+    expect(isTransientK8sApiError({ statusCode: 429 })).toBe(true);
+    expect(isTransientK8sApiError({ response: { statusCode: 503 } })).toBe(
+      true,
+    );
+    expect(isTransientK8sApiError({ code: 500 })).toBe(true);
+    expect(isTransientK8sApiError({ code: 502 })).toBe(true);
+    expect(isTransientK8sApiError({ code: 504 })).toBe(true);
+  });
+
+  test("caller errors and unknown shapes are not transient", async () => {
+    const { isTransientK8sApiError } = await import("./shared");
+    expect(isTransientK8sApiError({ code: 404 })).toBe(false);
+    expect(isTransientK8sApiError({ code: 403 })).toBe(false);
+    expect(isTransientK8sApiError({ code: 409 })).toBe(false);
+    expect(isTransientK8sApiError(new Error("boom"))).toBe(false);
+    expect(isTransientK8sApiError(undefined)).toBe(false);
+    expect(isTransientK8sApiError("429")).toBe(false);
+  });
+});
+
+describe("withK8sApiRetry", () => {
+  test("retries a 429 honoring retry-after and returns the eventual result", async () => {
+    const { withK8sApiRetry } = await import("./shared");
+    const throttled = {
+      code: 429,
+      message: "Too many requests, please try again later.",
+      headers: { "retry-after": "0.001" },
+    };
+    const fn = vi
+      .fn()
+      .mockRejectedValueOnce(throttled)
+      .mockRejectedValueOnce(throttled)
+      .mockResolvedValue("ok");
+
+    await expect(withK8sApiRetry(fn)).resolves.toBe("ok");
+    expect(fn).toHaveBeenCalledTimes(3);
+  });
+
+  test("throws the last error once attempts are exhausted", async () => {
+    const { withK8sApiRetry } = await import("./shared");
+    const throttled = {
+      code: 429,
+      message: "Too many requests, please try again later.",
+      headers: { "retry-after": "0.001" },
+    };
+    const fn = vi.fn().mockRejectedValue(throttled);
+
+    await expect(withK8sApiRetry(fn, { attempts: 2 })).rejects.toEqual(
+      throttled,
+    );
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  test("does not retry non-transient errors", async () => {
+    const { withK8sApiRetry } = await import("./shared");
+    const notFound = { code: 404, message: "not found" };
+    const fn = vi.fn().mockRejectedValue(notFound);
+
+    await expect(withK8sApiRetry(fn)).rejects.toEqual(notFound);
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("describeK8sApiError", () => {
+  test("summarizes the status and the API server's reason without headers", async () => {
+    const { describeK8sApiError } = await import("./shared");
+    const headers = { "audit-id": "e803b90b", "content-type": "text/plain" };
+    expect(
+      describeK8sApiError({ code: 404, body: "404 page not found\n", headers }),
+    ).toBe("Kubernetes API returned 404: 404 page not found");
+    expect(
+      describeK8sApiError({
+        code: 403,
+        body: JSON.stringify({
+          kind: "Status",
+          message:
+            'sandboxes.agents.x-k8s.io is forbidden: User "x" cannot create',
+        }),
+        headers,
+      }),
+    ).toBe(
+      'Kubernetes API returned 403: sandboxes.agents.x-k8s.io is forbidden: User "x" cannot create',
+    );
+    expect(describeK8sApiError({ code: 500, body: "", headers })).toBe(
+      "Kubernetes API returned 500",
+    );
+  });
+
+  test("leaves errors that are not Kubernetes API errors alone", async () => {
+    const { describeK8sApiError } = await import("./shared");
+    const { ApiError } = await import("@/types");
+    expect(
+      describeK8sApiError(new ApiError(503, "Install it")),
+    ).toBeUndefined();
+    expect(describeK8sApiError(new Error("boom"))).toBeUndefined();
   });
 });

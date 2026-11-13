@@ -1,0 +1,176 @@
+import { once } from "node:events";
+import http from "node:http";
+import { setTimeout as sleep } from "node:timers/promises";
+import { pathToFileURL } from "node:url";
+import { benchmarkPorts } from "./ports.mjs";
+
+export const MOCK_CONTENT = "archestra-benchmark-ok";
+export const MOCK_MCP_TOOL = "benchmark_lookup";
+
+export function createMockServer({ chunks = 20, intervalMs = 10 } = {}) {
+  return http.createServer(async (req, res) => {
+    if (req.url === "/health") {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ benchmarkMock: 1, chunks, intervalMs }));
+      return;
+    }
+    if (req.method === "POST" && req.url === "/mcp") {
+      await answerMcp(req, res);
+      return;
+    }
+    if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
+      res.writeHead(404).end();
+      return;
+    }
+    try {
+      const parts = [];
+      let size = 0;
+      for await (const part of req) {
+        size += part.length;
+        if (size > 2 * 1024 * 1024) {
+          res.writeHead(413).end();
+          return;
+        }
+        parts.push(part);
+      }
+      const request = JSON.parse(Buffer.concat(parts).toString());
+      const base = {
+        id: "chatcmpl-benchmark",
+        created: 0,
+        model: request.model,
+      };
+      // Synthetic usage; this fixture never calls an inference provider.
+      const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+      if (!request.stream) {
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            ...base,
+            object: "chat.completion",
+            choices: [
+              {
+                index: 0,
+                message: { role: "assistant", content: MOCK_CONTENT },
+                finish_reason: "stop",
+              },
+            ],
+            usage,
+          }),
+        );
+        return;
+      }
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+      });
+      const abort = new AbortController();
+      res.once("close", () => abort.abort());
+      const write = async (event) => {
+        if (res.destroyed) throw new Error("Client disconnected");
+        if (!res.write(`data: ${JSON.stringify(event)}\n\n`)) {
+          await once(res, "drain", { signal: abort.signal });
+        }
+      };
+      for (let i = 0; i < chunks; i++) {
+        if (intervalMs)
+          await sleep(intervalMs, undefined, { signal: abort.signal });
+        await write({
+          ...base,
+          object: "chat.completion.chunk",
+          choices: [
+            {
+              index: 0,
+              delta: { content: i === 0 ? MOCK_CONTENT : "." },
+              finish_reason: null,
+            },
+          ],
+        });
+      }
+      await write({
+        ...base,
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      });
+      await write({
+        ...base,
+        object: "chat.completion.chunk",
+        choices: [],
+        usage,
+      });
+      res.end("data: [DONE]\n\n");
+    } catch (error) {
+      if (res.destroyed) return;
+      if (res.headersSent) res.destroy();
+      else res.writeHead(400).end(JSON.stringify({ error: error.message }));
+    }
+  });
+}
+
+/** A stateless streamable-HTTP MCP server with one deterministic tool. */
+async function answerMcp(req, res) {
+  const parts = [];
+  for await (const part of req) parts.push(part);
+  let message;
+  try {
+    message = JSON.parse(Buffer.concat(parts).toString() || "{}");
+  } catch {
+    res.writeHead(400).end();
+    return;
+  }
+  if (message.id === undefined) {
+    // Notifications, such as notifications/initialized, get no response.
+    res.writeHead(202).end();
+    return;
+  }
+  const results = {
+    initialize: () => ({
+      protocolVersion: "2025-11-25",
+      capabilities: { tools: {} },
+      serverInfo: { name: "benchmark-mock", version: "1" },
+    }),
+    ping: () => ({}),
+    "tools/list": () => ({
+      tools: [
+        {
+          name: MOCK_MCP_TOOL,
+          description: "Look up a fictional item.",
+          inputSchema: {
+            type: "object",
+            properties: { name: { type: "string" } },
+            required: ["name"],
+          },
+        },
+      ],
+    }),
+    "tools/call": ({ name } = {}) =>
+      name === MOCK_MCP_TOOL
+        ? { content: [{ type: "text", text: MOCK_CONTENT }], isError: false }
+        : null,
+  };
+  const result = results[message.method]?.(message.params);
+  res.setHeader("content-type", "application/json");
+  res.end(
+    JSON.stringify(
+      result
+        ? { jsonrpc: "2.0", id: message.id, result }
+        : {
+            jsonrpc: "2.0",
+            id: message.id,
+            error: { code: -32601, message: "Method not found" },
+          },
+    ),
+  );
+}
+
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
+  const server = createMockServer();
+  const { mock } = benchmarkPorts(process.argv[2]);
+  server.listen(mock, "127.0.0.1", () =>
+    console.info(`Benchmark mock: http://127.0.0.1:${mock}`),
+  );
+  for (const signal of ["SIGINT", "SIGTERM"])
+    process.once(signal, () => server.close());
+}

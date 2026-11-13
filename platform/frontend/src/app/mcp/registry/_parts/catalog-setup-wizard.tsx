@@ -1,0 +1,779 @@
+"use client";
+
+import {
+  MCP_CATALOG_INSTALL_QUERY_PARAM,
+  type McpDeploymentStatusEntry,
+  parseFullToolName,
+} from "@archestra/shared";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  CheckCircle2,
+  ChevronRight,
+  CircleAlert,
+  Laptop,
+  Loader2,
+  PlugZap,
+  RefreshCw,
+  RotateCcw,
+  Wrench,
+} from "lucide-react";
+import Link from "next/link";
+import { useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
+import {
+  OAuthConfirmationDialog,
+  type OAuthInstallResult,
+} from "@/components/oauth-confirmation-dialog";
+import { SearchInput } from "@/components/search-input";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+} from "@/components/ui/empty";
+import {
+  InlineNotice,
+  InlineNoticeBody,
+  InlineNoticeText,
+} from "@/components/ui/inline-notice";
+import { InlineNoticeDetails } from "@/components/ui/inline-notice-details";
+import { PermissionButton } from "@/components/ui/permission-button";
+import { Skeleton } from "@/components/ui/skeleton";
+import { WizardStepper } from "@/components/wizard-stepper";
+import { useSession } from "@/lib/auth/auth.query";
+import { useInitiateOAuth } from "@/lib/auth/oauth.query";
+import {
+  setOAuthCatalogId,
+  setOAuthReturnUrl,
+  setOAuthScope,
+  setOAuthServerType,
+  setOAuthState,
+  setOAuthTeamId,
+} from "@/lib/auth/oauth-session";
+import { useDesktopDevices } from "@/lib/desktop-device.query";
+import { useAppName } from "@/lib/hooks/use-app-name";
+import { addDesktopMcpServer, DESKTOP_MCP_COPY } from "@/lib/mcp/desktop-mcp";
+import {
+  useInstallMcpServer,
+  useMcpDeploymentStatuses,
+  useMcpInstallationStatusCacheSync,
+  useMcpServers,
+  useReloadMcpServerTools,
+} from "@/lib/mcp/mcp-server.query";
+import { buildRemoteInstallCredentialPayload } from "@/lib/mcp/remote-install-payload";
+import { batteryMatchesQueryKey } from "@/lib/openappa-batteries.query";
+import {
+  type ToolWithAssignmentsData,
+  useToolsWithAssignments,
+} from "@/lib/tools/tool.query";
+import {
+  desktopConnectActionLabel,
+  desktopMcpAddCase,
+} from "./desktop-mcp-install";
+import { DesktopMcpInstallDialog } from "./desktop-mcp-install-dialog";
+import { InstallationProgress } from "./installation-progress";
+import {
+  LocalServerInstallDialog,
+  type LocalServerInstallResult,
+} from "./local-server-install-dialog";
+import type { CatalogItem } from "./mcp-server-card";
+import {
+  RemoteServerInstallDialog,
+  type RemoteServerInstallResult,
+} from "./remote-server-install-dialog";
+import { TestConnectionLogs } from "./test-connection-logs";
+
+export type SetupStepId = "configuration" | "test" | "tools";
+
+export const SETUP_STEPS: Array<{ id: SetupStepId; title: string }> = [
+  { id: "configuration", title: "Configuration" },
+  { id: "test", title: "Test Connection" },
+  { id: "tools", title: "Tools & Guardrails" },
+];
+
+/**
+ * The header stepper, drawn the way the Agents create/edit pages draw theirs.
+ * An edit page passes `allReached`: every step already has its values.
+ */
+export function SetupStepper({
+  activeStep,
+  onStepClick,
+  allReached = false,
+}: {
+  activeStep: SetupStepId;
+  onStepClick?: (step: SetupStepId) => void;
+  allReached?: boolean;
+}) {
+  return (
+    <WizardStepper
+      variant="progress"
+      steps={SETUP_STEPS}
+      activeStep={activeStep}
+      onStepClick={onStepClick}
+      allReached={allReached}
+    />
+  );
+}
+
+/**
+ * Resolves the install the Test Connection step reports on — the current
+ * user's personal connection when present, else the newest install. Shared
+ * with the wizard host so it can gate the step's Next button on a connection
+ * actually existing.
+ */
+export function useTestConnectionTarget(item: CatalogItem) {
+  const { data: session } = useSession();
+  const currentUserId = session?.user?.id;
+  // Only this item's installs, narrowed on the server.
+  const { data: allMcpServers } = useMcpServers({
+    includeAssignedAgents: false,
+    catalogId: item.id,
+  });
+
+  const servers = (allMcpServers ?? []).filter((s) => s.catalogId === item.id);
+  const target =
+    servers.find((s) => s.ownerId === currentUserId && !s.teamId) ??
+    servers
+      .slice()
+      .sort(
+        (a, b) =>
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+      )[0];
+  return { target, status: target?.localInstallationStatus ?? null };
+}
+
+/**
+ * Installs a personal connection (collecting credentials when the catalog
+ * item prompts for them) and reports the connection status live.
+ */
+export function TestConnectionStep({ item }: { item: CatalogItem }) {
+  const { statuses: deploymentStatuses } = useMcpDeploymentStatuses();
+  useMcpInstallationStatusCacheSync();
+  const installMutation = useInstallMcpServer();
+  const initiateOAuthMutation = useInitiateOAuth();
+  const queryClient = useQueryClient();
+
+  const { target, status } = useTestConnectionTarget(item);
+
+  // Refresh tool lists once the connection succeeds so the next steps show
+  // freshly discovered tools.
+  const prevStatusRef = useRef(status);
+  useEffect(() => {
+    if (prevStatusRef.current !== "success" && status === "success") {
+      queryClient.invalidateQueries({
+        queryKey: ["mcp-catalog", item.id, "tools"],
+      });
+      queryClient.invalidateQueries({ queryKey: ["tools-with-assignments"] });
+    }
+    prevStatusRef.current = status;
+  }, [status, item.id, queryClient]);
+
+  const [openDialog, setOpenDialog] = useState<
+    "local" | "remote" | "oauth" | "desktop" | null
+  >(null);
+  // The desktop dialog follows the user's earlier installation instead of
+  // adding one.
+  const [followDesktopInstall, setFollowDesktopInstall] = useState(false);
+
+  const promptedEnvVars =
+    item.localConfig?.environment?.filter(
+      (env) => env.promptOnInstallation === true,
+    ) ?? [];
+  const promptableUserConfig = Object.values(item.userConfig ?? {}).filter(
+    (field) => field.promptOnInstallation !== false,
+  );
+  const hasPromptedFields =
+    promptedEnvVars.length > 0 || promptableUserConfig.length > 0;
+  // OAuth chained after env collection is a registry-page flow; the wizard
+  // hands off via the install deep link for that combination.
+  const needsRegistryHandoff = !!item.oauthConfig && hasPromptedFields;
+
+  const directInstall = () =>
+    installMutation.mutateAsync({
+      name: item.name,
+      catalogId: item.id,
+      scope: "personal",
+      dontShowToast: true,
+    });
+
+  const appName = useAppName();
+  const isDesktopMcp = item.serverType === "desktop_mcp";
+  // Whether the user has the MCP bridge: it names the button of a desktop
+  // MCP server.
+  const desktopAddCase = desktopMcpAddCase(
+    useDesktopDevices({ enabled: isDesktopMcp, live: false }),
+  );
+  const startInstall = () => {
+    if (isDesktopMcp) {
+      setFollowDesktopInstall(false);
+      setOpenDialog("desktop");
+      return;
+    }
+    if (item.oauthConfig) {
+      setOpenDialog("oauth");
+      return;
+    }
+    if (item.serverType === "local") {
+      if (hasPromptedFields) {
+        setOpenDialog("local");
+        return;
+      }
+      void directInstall();
+      return;
+    }
+    const hasUserConfig =
+      item.userConfig && Object.keys(item.userConfig).length > 0;
+    if (hasUserConfig) {
+      setOpenDialog("remote");
+      return;
+    }
+    void directInstall();
+  };
+
+  const handleLocalConfirm = async (result: LocalServerInstallResult) => {
+    setOpenDialog(null);
+    await installMutation.mutateAsync({
+      name: item.name,
+      catalogId: result.catalogId,
+      environmentValues: result.environmentValues,
+      userConfigValues: result.userConfigValues,
+
+      scope: result.scope,
+      teamId:
+        result.scope === "team" ? (result.teamId ?? undefined) : undefined,
+      dontShowToast: true,
+    });
+  };
+
+  const handleRemoteConfirm = async (
+    catalogItem: CatalogItem,
+    result: RemoteServerInstallResult,
+  ) => {
+    const installResult = await installMutation.mutateAsync({
+      name: catalogItem.name,
+      catalogId: result.catalogId,
+      ...buildRemoteInstallCredentialPayload(result),
+      scope: result.scope,
+      teamId:
+        result.scope === "team" ? (result.teamId ?? undefined) : undefined,
+      dontShowToast: true,
+    });
+    if (installResult.errorMessage) return installResult.errorMessage;
+    setOpenDialog(null);
+  };
+
+  const handleOAuthConfirm = async (result: OAuthInstallResult) => {
+    try {
+      const { authorizationUrl, state } =
+        await initiateOAuthMutation.mutateAsync({ catalogId: item.id });
+      setOAuthState(state);
+      setOAuthCatalogId(item.id);
+      setOAuthTeamId(result.scope === "team" ? (result.teamId ?? null) : null);
+      setOAuthScope(result.scope);
+      if (item.serverType === "local") {
+        setOAuthServerType("local");
+      }
+      // Remember where the install started so the callback returns here
+      setOAuthReturnUrl(window.location.href);
+      window.location.href = authorizationUrl;
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Failed to initiate OAuth flow",
+      );
+    }
+  };
+
+  // The failed connection's own pod logs, shown inline. Only a local server
+  // runs in a pod; a remote server's failure reason is the error itself.
+  const showFailureLogs = item.serverType === "local" && !!target;
+  const targetStatus = target ? deploymentStatuses[target.id] : undefined;
+
+  const isInstalling =
+    installMutation.isPending ||
+    status === "pending" ||
+    status === "discovering-tools";
+  // A desktop MCP server added earlier that no device runs: no device is
+  // linked (any more, whatever an earlier device read). It shows the same
+  // empty state as before Connect, and its button picks the installation up.
+  const desktopNoDevice =
+    isDesktopMcp &&
+    Boolean(target) &&
+    !installMutation.isPending &&
+    desktopAddCase.kind === "no-bridge" &&
+    (status === "pending" || status === "success");
+
+  return (
+    <div className="space-y-4">
+      {(!target && !isInstalling) || desktopNoDevice ? (
+        // A desktop MCP server is added to the user's own computer: the tools
+        // are read once the MCP bridge there runs the server.
+        <Empty className="border py-12">
+          <EmptyHeader>
+            <EmptyMedia variant="icon">
+              {isDesktopMcp ? <Laptop /> : <PlugZap />}
+            </EmptyMedia>
+            <EmptyDescription>
+              {isDesktopMcp
+                ? `${item.name} is a desktop MCP running on your device.${
+                    desktopAddCase.kind === "no-bridge"
+                      ? ` ${appName} needs an MCP bridge on your device to use it.`
+                      : ""
+                  }`
+                : "Create a connection to verify the server is reachable and discover its tools."}
+            </EmptyDescription>
+          </EmptyHeader>
+          <EmptyContent className="flex-row justify-center">
+            {needsRegistryHandoff && !isDesktopMcp ? (
+              <Button size="sm" asChild>
+                <Link
+                  href={`/mcp/registry?${MCP_CATALOG_INSTALL_QUERY_PARAM}=${item.id}`}
+                >
+                  Install
+                </Link>
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                onClick={() => {
+                  if (desktopNoDevice) {
+                    setFollowDesktopInstall(true);
+                    setOpenDialog("desktop");
+                    return;
+                  }
+                  startInstall();
+                }}
+                disabled={
+                  isInstalling ||
+                  (isDesktopMcp && desktopAddCase.kind === "loading")
+                }
+              >
+                <span>
+                  {isDesktopMcp
+                    ? desktopConnectActionLabel(desktopAddCase)
+                    : "Install"}
+                </span>
+              </Button>
+            )}
+          </EmptyContent>
+        </Empty>
+      ) : isDesktopMcp &&
+        target &&
+        !installMutation.isPending &&
+        desktopAddCase.kind === "loading" ? (
+        <Skeleton className="h-[58px] w-full rounded-lg" />
+      ) : isDesktopMcp &&
+        target &&
+        !installMutation.isPending &&
+        status === "pending" ? (
+        // Added, and the linked device has not run it yet.
+        <Empty className="border py-12">
+          <EmptyHeader>
+            <EmptyMedia variant="icon">
+              <Laptop />
+            </EmptyMedia>
+            <EmptyDescription>{DESKTOP_MCP_COPY.waiting}</EmptyDescription>
+          </EmptyHeader>
+          <EmptyContent className="flex-row justify-center">
+            <Button
+              size="sm"
+              onClick={() => {
+                setFollowDesktopInstall(true);
+                setOpenDialog("desktop");
+              }}
+            >
+              <span>Show progress</span>
+            </Button>
+          </EmptyContent>
+        </Empty>
+      ) : status === "success" ? (
+        <div className="flex items-start gap-3 rounded-lg border border-green-600/30 bg-green-500/5 p-4">
+          <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-green-600" />
+          <div className="text-sm">
+            <p className="font-medium">
+              {isDesktopMcp ? DESKTOP_MCP_COPY.added : "Connected"}
+            </p>
+            <p className="text-muted-foreground">
+              {isDesktopMcp
+                ? `${item.name} is ready and its tools were read. Continue to review them.`
+                : "The server responded and its tools were discovered. Continue to review them."}
+            </p>
+          </div>
+        </div>
+      ) : status === "error" ? (
+        <div className="flex flex-col gap-3">
+          <InlineNotice variant="error">
+            <CircleAlert />
+            <InlineNoticeBody>
+              <span className="font-medium">Connection failed</span>
+              <InlineNoticeText>
+                {failureSummary({
+                  hasLogs: showFailureLogs,
+                  status: targetStatus,
+                })}
+              </InlineNoticeText>
+            </InlineNoticeBody>
+            <InlineNoticeDetails label="error">
+              {target?.localInstallationError ?? "Installation failed"}
+            </InlineNoticeDetails>
+            <Button
+              data-slot="inline-notice-action"
+              variant="outline"
+              size="sm"
+              className="ml-auto"
+              onClick={startInstall}
+            >
+              <RotateCcw />
+              Retry
+            </Button>
+          </InlineNotice>
+          {showFailureLogs && target && (
+            <TestConnectionLogs
+              serverId={target.id}
+              serverName={target.name}
+              status={targetStatus}
+            />
+          )}
+        </div>
+      ) : (
+        <div className="rounded-lg border p-4">
+          <InstallationProgress
+            status={isInstalling && !status ? "pending" : (status ?? null)}
+            serverId={target?.id}
+            deploymentStatuses={deploymentStatuses}
+            serverType={item.serverType}
+          />
+        </div>
+      )}
+
+      {openDialog === "local" && (
+        <LocalServerInstallDialog
+          isOpen
+          onClose={() => setOpenDialog(null)}
+          onConfirm={handleLocalConfirm}
+          catalogItem={item}
+          isInstalling={installMutation.isPending}
+        />
+      )}
+
+      {openDialog === "desktop" && (
+        <DesktopMcpInstallDialog
+          isOpen
+          onClose={() => setOpenDialog(null)}
+          // The dialog stays open and follows the add until the tools are
+          // read.
+          onAdd={(catalogItem) =>
+            addDesktopMcpServer({
+              install: installMutation.mutateAsync,
+              catalogItem,
+            })
+          }
+          catalogItem={item}
+          isAdding={installMutation.isPending}
+          startAtOnce
+          followServerId={
+            followDesktopInstall && target ? target.id : undefined
+          }
+        />
+      )}
+
+      <RemoteServerInstallDialog
+        isOpen={openDialog === "remote"}
+        onClose={() => setOpenDialog(null)}
+        onConfirm={handleRemoteConfirm}
+        catalogItem={openDialog === "remote" ? item : null}
+        isInstalling={installMutation.isPending}
+      />
+
+      <OAuthConfirmationDialog
+        open={openDialog === "oauth"}
+        onOpenChange={(open) => {
+          if (!open) setOpenDialog(null);
+        }}
+        serverName={item.name}
+        onConfirm={handleOAuthConfirm}
+        onCancel={() => setOpenDialog(null)}
+        catalogId={item.id}
+      />
+    </div>
+  );
+}
+
+/**
+ * Combined review step: every discovered tool with its description, schema,
+ * annotations, and raw definition, plus the OpenAPPA batteries that govern
+ * this server's tools.
+ */
+export function ToolsAndGuardrailsStep({ item }: { item: CatalogItem }) {
+  const queryClient = useQueryClient();
+  const [search, setSearch] = useState("");
+
+  const { data: toolsData, isPending } = useToolsWithAssignments({
+    pagination: { limit: TOOLS_REVIEW_LIMIT, offset: 0 },
+    sorting: { sortBy: "name", sortDirection: "asc" },
+    filters: { origin: item.id, excludeArchestraTools: true },
+  });
+  // Same install the Test Connection step reports on — the reload endpoint
+  // needs a concrete server install, not the catalog item.
+  const { target: reloadTarget } = useTestConnectionTarget(item);
+  const reloadTools = useReloadMcpServerTools();
+
+  if (isPending) {
+    return (
+      <div className="space-y-2">
+        <Skeleton className="h-24 w-full" />
+        <Skeleton className="h-24 w-full" />
+        <Skeleton className="h-24 w-full" />
+      </div>
+    );
+  }
+
+  const tools = toolsData?.data ?? [];
+  const total = toolsData?.pagination.total ?? tools.length;
+
+  const refreshToolsButton = (
+    <PermissionButton
+      permissions={{ mcpServerInstallation: ["create"] }}
+      variant="outline"
+      size="sm"
+      disabled={reloadTools.isPending || !reloadTarget}
+      onClick={() =>
+        reloadTarget &&
+        reloadTools.mutate(
+          { id: reloadTarget.id, name: item.name, catalogId: item.id },
+          {
+            // A sync attaches the batteries the server stands for.
+            onSuccess: () =>
+              queryClient.invalidateQueries({
+                queryKey: batteryMatchesQueryKey(item.id),
+              }),
+          },
+        )
+      }
+      tooltip={
+        reloadTarget
+          ? "Re-sync the registry's tool catalog from the live server so this list shows its current tools"
+          : "Connect this server first — refreshing tools needs a live connection"
+      }
+    >
+      {reloadTools.isPending ? (
+        <Loader2 className="h-4 w-4 animate-spin" />
+      ) : (
+        <RefreshCw className="h-4 w-4" />
+      )}
+      <span>Refresh Tools</span>
+    </PermissionButton>
+  );
+
+  if (tools.length === 0) {
+    return (
+      <Empty className="border py-12">
+        <EmptyHeader>
+          <EmptyMedia variant="icon">
+            <Wrench />
+          </EmptyMedia>
+          <EmptyDescription>
+            No tools discovered yet. Complete the connection test first — tools
+            appear once the server is reachable.
+          </EmptyDescription>
+        </EmptyHeader>
+        <EmptyContent>{refreshToolsButton}</EmptyContent>
+      </Empty>
+    );
+  }
+
+  const normalizedSearch = search.trim().toLowerCase();
+  const visibleTools = normalizedSearch
+    ? tools.filter((tool) => tool.name.toLowerCase().includes(normalizedSearch))
+    : tools;
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-sm text-muted-foreground">
+          {tools.length} {tools.length === 1 ? "tool" : "tools"} discovered.
+        </p>
+        {refreshToolsButton}
+      </div>
+      {tools.length > 5 && (
+        <SearchInput
+          placeholder="Filter tools by name"
+          className="max-w-xs"
+          value={search}
+          onSearchChange={setSearch}
+          syncQueryParams={false}
+          debounceMs={0}
+        />
+      )}
+      {total > tools.length && (
+        <p className="text-sm text-muted-foreground">
+          Showing the first {tools.length} of {total} tools.
+        </p>
+      )}
+
+      {visibleTools.map((tool) => (
+        <ToolReviewCard key={tool.id} tool={tool} />
+      ))}
+    </div>
+  );
+}
+
+// =============================================================================
+// Internal helpers for the Tools & Guardrails review step
+// =============================================================================
+
+const TOOLS_REVIEW_LIMIT = 100;
+
+/** MCP ToolAnnotations boolean hints surfaced as badges when true. */
+const ANNOTATION_BADGES: Array<{
+  key: string;
+  label: string;
+  destructive?: boolean;
+}> = [
+  { key: "readOnlyHint", label: "Read-only" },
+  { key: "destructiveHint", label: "Destructive", destructive: true },
+  { key: "idempotentHint", label: "Idempotent" },
+  { key: "openWorldHint", label: "Open world" },
+];
+
+function ToolReviewCard({ tool }: { tool: ToolWithAssignmentsData }) {
+  // MCP tool names are slugified with the server name; show the short name.
+  const displayName = tool.catalogId
+    ? parseFullToolName(tool.name).toolName || tool.name
+    : tool.name;
+
+  const schema = (tool.parameters ?? {}) as {
+    properties?: Record<string, { type?: unknown; description?: unknown }>;
+    required?: unknown;
+  };
+  const paramEntries = Object.entries(schema.properties ?? {});
+  const required = Array.isArray(schema.required)
+    ? (schema.required as string[])
+    : [];
+
+  const annotations = tool.annotations ?? null;
+  const annotationBadges = ANNOTATION_BADGES.filter(
+    (badge) => annotations?.[badge.key] === true,
+  );
+
+  return (
+    <div className="rounded-lg border">
+      <div className="min-w-0 space-y-1 p-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <code className="text-sm font-semibold">{displayName}</code>
+          {annotationBadges.map(({ key, label, destructive }) => (
+            <Badge
+              key={key}
+              variant={destructive ? "destructive" : "outline"}
+              className="font-normal"
+            >
+              {label}
+            </Badge>
+          ))}
+        </div>
+        {tool.description && (
+          <p className="text-sm text-muted-foreground">{tool.description}</p>
+        )}
+      </div>
+
+      <div className="divide-y border-t">
+        <ToolReviewSection title={`Parameters (${paramEntries.length})`}>
+          {paramEntries.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              This tool takes no parameters.
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {paramEntries.map(([name, def]) => (
+                <div
+                  key={name}
+                  className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-sm"
+                >
+                  <code className="font-medium">{name}</code>
+                  {typeof def?.type === "string" && (
+                    <span className="text-xs text-muted-foreground">
+                      {def.type}
+                    </span>
+                  )}
+                  {required.includes(name) && (
+                    <span className="text-xs font-medium text-primary">
+                      required
+                    </span>
+                  )}
+                  {typeof def?.description === "string" && (
+                    <span className="w-full text-xs text-muted-foreground">
+                      {def.description}
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </ToolReviewSection>
+
+        <ToolReviewSection title="Raw JSON">
+          <pre className="max-h-72 overflow-auto rounded-md bg-muted p-3 text-xs">
+            {JSON.stringify(
+              {
+                name: tool.name,
+                description: tool.description,
+                inputSchema: tool.parameters,
+                annotations,
+              },
+              null,
+              2,
+            )}
+          </pre>
+        </ToolReviewSection>
+      </div>
+    </div>
+  );
+}
+
+function ToolReviewSection({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Collapsible>
+      <CollapsibleTrigger className="group flex w-full items-center gap-1.5 px-4 py-2.5 text-sm font-medium hover:bg-muted/40">
+        <ChevronRight className="h-3.5 w-3.5 text-muted-foreground transition-transform group-data-[state=open]:rotate-90" />
+        {title}
+      </CollapsibleTrigger>
+      <CollapsibleContent className="px-4 pb-4">{children}</CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+/**
+ * One line under "Connection failed": what the pod is doing, when known, and
+ * where to look next. The raw error stays behind the notice's details toggle.
+ */
+function failureSummary({
+  hasLogs,
+  status,
+}: {
+  hasLogs: boolean;
+  status: McpDeploymentStatusEntry | undefined;
+}) {
+  if (!hasLogs) return "Check the server URL and credentials, then retry.";
+  if (status?.state === "failed" && status.message) {
+    const restarts = status.restartCount
+      ? ` after ${status.restartCount} ${status.restartCount === 1 ? "restart" : "restarts"}`
+      : "";
+    return `Pod is in ${status.message}${restarts}. Its logs are below.`;
+  }
+  return "The server's logs are below.";
+}

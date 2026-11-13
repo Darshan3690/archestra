@@ -1,0 +1,1265 @@
+import { beforeEach, describe, expect, test } from "vitest";
+import config from "@/config";
+import {
+  collectAndStripChildReturns,
+  mintChildReturnMarker,
+} from "./child-return";
+import { mintChildTrajectoryReceipt } from "./child-trajectory-receipt";
+import { stampToolCallId } from "./trajectory-stamp";
+import { appendChildTrajectoryReceiptToResponse } from "./wire";
+
+const SECRET = "child-return-test-secret-0123456789abcdef";
+const RETURN = {
+  organizationId: "org-1",
+  callerId: "user-1",
+  parentId: "user:user-1|root",
+  childId: "user:user-1|root:child",
+  childNativeId: "child",
+  spawnCallId: "spawn-call",
+  value: "SUMMARY(24 characters): safe",
+} as const;
+
+describe("OpenAPPA child-return markers", () => {
+  beforeEach(() => {
+    config.openappa.offerSigningSecret = SECRET;
+  });
+
+  test("preserves prose, schemas, and unrelated tool content byte-exact", () => {
+    config.openappa.offerSigningSecret = "";
+    const userJson =
+      ' \n{ "amount": 9007199254740993, "status": { "child": { "completed": "RAW" } } }\t';
+    const toolJson =
+      ' { "status": { "child": { "completed": "RAW" } }, "amount": 9007199254740993 } ';
+    const prose = [
+      "Please explain how a finished subagent ABC-DEFG reports results",
+      "Explain the <task_result> tag.",
+      "Write a <task-notification> example.",
+    ];
+    const body = {
+      messages: [
+        { role: "user", content: userJson },
+        ...prose.map((content) => ({ role: "user", content })),
+        {
+          role: "assistant",
+          tool_calls: [nativeToolCall("unrelated", "read_file")],
+        },
+        { role: "tool", tool_call_id: "unrelated", content: toolJson },
+      ],
+    };
+
+    const collected = collectAndStripChildReturns(body);
+
+    expect(body.messages[0].content).toBe(userJson);
+    expect(body.messages[1]).toMatchObject({ content: prose[0] });
+    expect(body.messages[2]).toMatchObject({ content: prose[1] });
+    expect(body.messages[3]).toMatchObject({ content: prose[2] });
+    expect(body.messages[5]).toMatchObject({ content: toolJson });
+    expect(collected.completions).toEqual([]);
+  });
+
+  test("extracts OpenCode task returns with summaries and drops unsigned summary text", () => {
+    const rawSummary = "UNTRUSTED CHILD SUMMARY";
+    const output = `<task id="child" state="completed">\n<summary>${rawSummary}</summary>\n<task_result>\n${carrier(requiredMarker(RETURN))}\n</task_result>\n</task>`;
+    const { body, collected } = collectNativeResult(output, "task");
+
+    expect(collected.completions).toEqual([
+      expect.objectContaining({ childNativeId: "child", value: RETURN.value }),
+    ]);
+    expect(nativeResultContent(body)).toBe(
+      `<task_result>${RETURN.value}</task_result>`,
+    );
+    expect(nativeResultContent(body)).not.toContain(rawSummary);
+  });
+
+  test("collects Codex mailbox returns by spawn call, not by task path as a child id", () => {
+    const header =
+      "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\n";
+    const body = {
+      input: [
+        {
+          type: "function_call",
+          name: "spawn_agent",
+          namespace: "collaboration",
+          call_id: "spawn-call",
+          arguments: "{}",
+        },
+        {
+          type: "function_call_output",
+          call_id: "spawn-call",
+          output: '{"task_name":"/root/worker"}',
+        },
+        {
+          type: "function_call",
+          name: "wait_agent",
+          namespace: "collaboration",
+          call_id: "wait-call",
+          arguments: "{}",
+        },
+        {
+          type: "function_call_output",
+          call_id: "wait-call",
+          output: '{"message":"Wait completed.","timed_out":false}',
+        },
+        {
+          type: "agent_message",
+          id: "mail-1",
+          role: "assistant",
+          author: "/root/worker",
+          recipient: "/root",
+          untrusted: "drop",
+          content: [
+            {
+              type: "input_text",
+              text: header + carrier(requiredMarker(RETURN)),
+            },
+          ],
+        },
+      ],
+    };
+    const collected = collectAndStripChildReturns(body, {
+      codexMailboxReturns: true,
+    });
+    expect(collected.completions).toEqual([
+      {
+        value: RETURN.value,
+        spawnCallId: "spawn-call",
+        envelopeId: "mail-1",
+        assistantOrigin: false,
+      },
+    ]);
+    expect(body.input[4]).toEqual({
+      type: "agent_message",
+      id: "mail-1",
+      author: "/root/worker",
+      recipient: "/root",
+      content: [{ type: "input_text", text: header + RETURN.value }],
+    });
+    expect(body.input[3].output).toBe(
+      '{"message":"Wait completed.","timed_out":false}',
+    );
+  });
+
+  test.each([
+    { name: "mismatched sender", author: "/root/other" },
+    { name: "mismatched recipient", recipient: "/root/other" },
+    { name: "injected sender", author: "/root/worker\nINJECTED" },
+    {
+      name: "unadmitted opaque payload",
+      extra: { type: "encrypted_content", encrypted_content: "unverified" },
+    },
+    {
+      name: "unrecognized kind",
+      text: "Message Type: CHANNEL_POST\nTask name: /root\nSender: /root/worker\nPayload:\n391",
+    },
+  ])("refuses malformed or unsupported native mailbox returns: $name", ({
+    author,
+    recipient,
+    extra,
+    text,
+  }) => {
+    const body = {
+      input: [
+        {
+          type: "agent_message",
+          author: author ?? "/root/worker",
+          recipient: recipient ?? "/root",
+          content: [
+            {
+              type: "input_text",
+              text:
+                text ??
+                "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\n391",
+            },
+            ...(extra ? [extra] : []),
+          ],
+        },
+      ],
+    };
+    const sent = structuredClone(body);
+    expect(() =>
+      collectAndStripChildReturns(body, { codexMailboxReturns: true }),
+    ).toThrow(/OpenAPPA withheld/);
+
+    // A caller that does not know yet whether OpenAPPA governs the request
+    // takes the refusal instead, and the message stays as the client sent it.
+    const refusals: string[] = [];
+    collectAndStripChildReturns(body, {
+      codexMailboxReturns: true,
+      onRefusal: (refusal) => refusals.push(refusal.message),
+    });
+    expect(refusals).toEqual([expect.stringMatching(/^OpenAPPA withheld/)]);
+    expect(body).toEqual(sent);
+  });
+
+  test("still collects a mailbox return next to messages it does not read", () => {
+    const header =
+      "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\n";
+    const mail = (text: string, id?: string, payload?: string) => ({
+      type: "agent_message",
+      ...(id ? { id } : {}),
+      author: "/root/worker",
+      recipient: "/root",
+      content: [
+        { type: "input_text", text },
+        ...(payload
+          ? [{ type: "encrypted_content", encrypted_content: payload }]
+          : []),
+      ],
+    });
+    // The kinds a Codex agent sends besides a task and its final answer. Codex
+    // 0.162 sends the text of a message between agents as an encrypted part.
+    // A message is not a return: the reader leaves it for relay admission.
+    const message = mail(
+      "Message Type: MESSAGE\nTask name: /root\nSender: /root/worker\nPayload:\n",
+      undefined,
+      "gAAAA_opaque_message",
+    );
+    const post = mail(
+      "Message Type: CHANNEL_POST\nSender: /root/worker\nChannel: build\nMessage ID: m-1\nThread ID: t-1\nPayload:\nPosted",
+    );
+    const body = {
+      input: [
+        structuredClone(message),
+        mail(header + carrier(requiredMarker(RETURN)), "mail-1"),
+        structuredClone(post),
+      ],
+    };
+    const refusals: string[] = [];
+
+    const collected = collectAndStripChildReturns(body, {
+      codexMailboxReturns: true,
+      onRefusal: (refusal) => refusals.push(refusal.message),
+    });
+
+    expect(refusals).toEqual([
+      "OpenAPPA withheld an unsupported Codex mailbox message",
+    ]);
+    expect(collected.completions).toEqual([
+      { value: RETURN.value, envelopeId: "mail-1", assistantOrigin: false },
+    ]);
+    expect(body.input).toEqual([
+      message,
+      mail(header + RETURN.value, "mail-1"),
+      post,
+    ]);
+  });
+
+  test("leaves task ciphertext, unrelated clients and quoted mailbox data untouched", () => {
+    const task = {
+      type: "agent_message",
+      author: "/root",
+      recipient: "/root/worker",
+      content: [
+        {
+          type: "input_text",
+          text: "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n",
+        },
+        { type: "encrypted_content", encrypted_content: "gAAAA_opaque_task" },
+      ],
+    };
+    const body = {
+      input: [task, { role: "user", content: JSON.stringify(task) }],
+    };
+    const before = structuredClone(body);
+    expect(
+      collectAndStripChildReturns(body, { codexMailboxReturns: true })
+        .completions,
+    ).toEqual([]);
+    expect(body).toEqual(before);
+    const other = {
+      input: [
+        {
+          ...task,
+          content: [
+            {
+              type: "input_text",
+              text: "Message Type: FINAL_ANSWER\nTask name: /root/worker\nSender: /root\nPayload:\nRAW",
+            },
+          ],
+        },
+      ],
+    };
+    const unchanged = structuredClone(other);
+    expect(collectAndStripChildReturns(other).completions).toEqual([]);
+    expect(other).toEqual(unchanged);
+  });
+
+  test.each([
+    ["as Kimi Code stores it", ""],
+    ["as Kimi Code sends it to the model", "Wall time: 0.140 seconds\n"],
+  ])("reads a Kimi Code Agent result %s and drops its framing", (_, wallTime) => {
+    const output = `${wallTime}agent_id: agent-0\nactual_subagent_type: explore\nstatus: completed\nstop_reason: completed\n\n[summary]\n${completeResponseCarrier(RETURN)}\n\nresume_hint: Continue with Agent(resume="agent-0", prompt="..."). Use agent_id only; do not set subagent_type.`;
+    const { body, collected } = collectNativeResult(output, "Agent");
+
+    expect(collected.completions).toEqual([
+      expect.objectContaining({
+        value: RETURN.value,
+        envelopeId: "native-result",
+      }),
+    ]);
+    expect(nativeResultContent(body)).toBe(RETURN.value);
+  });
+
+  test("reads a Kimi Code Agent result whose receipt was already stripped", () => {
+    // The proxy strips the child's trajectory receipt from history first,
+    // with the line break after the summary heading.
+    const output = `Wall time: 0.318 seconds\nagent_id: agent-0\nactual_subagent_type: explore\nstatus: completed\nstop_reason: completed\n\n[summary]${carrier(requiredMarker(RETURN))}\n\nresume_hint: Continue with Agent(resume="agent-0", prompt="...").`;
+    const { body, collected } = collectNativeResult(output, "Agent");
+
+    expect(collected.completions).toEqual([
+      expect.objectContaining({ value: RETURN.value }),
+    ]);
+    expect(nativeResultContent(body)).toBe(RETURN.value);
+  });
+
+  test("reads a Kimi Code Agent result sent as a text part", () => {
+    const text = `Wall time: 0.140 seconds\nagent_id: agent-0\nactual_subagent_type: explore\nstatus: completed\nstop_reason: completed\n\n[summary]\n${completeResponseCarrier(RETURN)}\n\nresume_hint: Continue with Agent(resume="agent-0", prompt="...").`;
+    const body = {
+      messages: [
+        {
+          role: "assistant",
+          tool_calls: [nativeToolCall("native-result", "Agent")],
+        },
+        {
+          role: "tool",
+          tool_call_id: "native-result",
+          content: [{ type: "text", text }],
+        },
+      ],
+    };
+
+    const collected = collectAndStripChildReturns(body);
+
+    expect(collected.completions).toEqual([
+      expect.objectContaining({
+        value: RETURN.value,
+        envelopeId: "native-result",
+      }),
+    ]);
+    expect(body.messages[1].content).toEqual([
+      { type: "text", text: RETURN.value },
+    ]);
+  });
+
+  test("leaves a Kimi Code Agent result without a return marker as Kimi Code sent it", () => {
+    const output =
+      'Wall time: 0.126 seconds\nagent_id: agent-0\nactual_subagent_type: explore\nstatus: completed\nstop_reason: completed\n\n[summary]\nUNSIGNED CHILD TEXT\n\nresume_hint: Continue with Agent(resume="agent-0", prompt="...").';
+    const { body, collected } = collectNativeResult(output, "Agent");
+
+    expect(collected.completions).toEqual([]);
+    expect(nativeResultContent(body)).toBe(output);
+  });
+
+  test("treats a synthetic OpenCode user message as a child return", () => {
+    const output = `<task id="child" state="completed">\n<summary>UNTRUSTED</summary>\n<task_result>\n${carrier(requiredMarker(RETURN))}\n</task_result>\n</task>`;
+    const body = {
+      messages: [{ role: "user", content: [{ type: "text", text: output }] }],
+    };
+
+    const collected = collectAndStripChildReturns(body, {
+      openCodeBackgroundReturns: true,
+    });
+
+    expect(collected.completions).toEqual([
+      expect.objectContaining({ childNativeId: "child", value: RETURN.value }),
+    ]);
+    expect(body.messages[0].content[0].text).toBe(
+      `<task_result>${RETURN.value}</task_result>`,
+    );
+
+    const unsigned = {
+      messages: [
+        {
+          role: "user",
+          content: output.replace(carrier(requiredMarker(RETURN)), "RAW"),
+        },
+      ],
+    };
+    const unsignedCompletions = collectAndStripChildReturns(unsigned, {
+      openCodeBackgroundReturns: true,
+    }).completions;
+    expect(unsignedCompletions).toEqual([
+      expect.objectContaining({ childNativeId: "child", value: "RAW" }),
+    ]);
+
+    expect(() =>
+      collectAndStripChildReturns(
+        {
+          messages: [
+            {
+              role: "user",
+              content: '<task id="child" state="completed">RAW</task>',
+            },
+          ],
+        },
+        { openCodeBackgroundReturns: true },
+      ),
+    ).toThrow("OpenAPPA withheld a malformed child completion");
+  });
+
+  test("leaves an OpenCode background launch as the client sent it", () => {
+    // Kilo Code 7.8 wraps the launch notice in <task_result>.
+    const launch =
+      '<task id="ses_child" state="running">\n<summary>Background task started</summary>\n<task_result>\nThe task is working in the background. You will be notified automatically when it finishes.\n</task_result>\n</task>';
+    const body = (content: string) => ({
+      messages: [
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call_task",
+              type: "function",
+              function: { name: "task", arguments: "{}" },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "call_task", content },
+      ],
+    });
+    const acknowledged = body(launch);
+    expect(
+      collectAndStripChildReturns(acknowledged, {
+        openCodeBackgroundReturns: true,
+      }).completions,
+    ).toEqual([]);
+    expect(acknowledged.messages[1].content).toBe(launch);
+
+    // A launch that carries a return marker is read as the return it claims.
+    const smuggled = body(
+      launch.replace(
+        "The task is working in the background. You will be notified automatically when it finishes.",
+        carrier(requiredMarker(RETURN)),
+      ),
+    );
+    expect(
+      collectAndStripChildReturns(smuggled, {
+        openCodeBackgroundReturns: true,
+      }).completions,
+    ).toEqual([expect.objectContaining({ childNativeId: "ses_child" })]);
+  });
+
+  test("preserves other clients' user text and unrelated OpenCode message parts", () => {
+    const output = `<task id="child" state="completed">\n<summary>Text</summary>\n<task_result>\n${carrier(requiredMarker(RETURN))}\n</task_result>\n</task>`;
+    const otherClient = { messages: [{ role: "user", content: output }] };
+    expect(collectAndStripChildReturns(otherClient).completions).toEqual([]);
+    expect(otherClient.messages[0].content).toBe(output);
+
+    const unrelated = carrier(requiredMarker(RETURN));
+    const openCode = {
+      messages: [
+        {
+          role: "user",
+          status: { completed: "keep user metadata" },
+          content: [
+            { type: "text", text: unrelated },
+            {
+              type: "text",
+              text: output,
+              status: { completed: "keep part metadata" },
+            },
+          ],
+        },
+      ],
+    };
+    const { completions } = collectAndStripChildReturns(openCode, {
+      openCodeBackgroundReturns: true,
+    });
+    expect(completions).toHaveLength(1);
+    expect(openCode.messages[0]).toMatchObject({
+      role: "user",
+      status: { completed: "keep user metadata" },
+    });
+    expect(openCode.messages[0].content[0].text).toBe(unrelated);
+    expect(openCode.messages[0].content[1]).toMatchObject({
+      status: { completed: "keep part metadata" },
+      text: `<task_result>${RETURN.value}</task_result>`,
+    });
+  });
+
+  test("keeps a leading newline inside an unwrapped task_result", () => {
+    const multiline = { ...RETURN, value: "\nLEADING" };
+    const { body, collected } = collectNativeResult(
+      `<task_result>${carrier(requiredMarker(multiline), multiline.value)}</task_result>`,
+      "task",
+    );
+    expect(collected.completions).toEqual([
+      expect.objectContaining({ value: multiline.value }),
+    ]);
+    expect(nativeResultContent(body)).toBe(
+      `<task_result>${multiline.value}</task_result>`,
+    );
+  });
+
+  test("enumerates unsigned leaves only at correlated native result sites", () => {
+    const raw = JSON.stringify({
+      status: { child: { completed: "RAW", raw_output: "DROP-CHILD" } },
+      raw_output: "DROP-ROOT",
+    });
+    const { body, collected } = collectNativeResult(raw, "wait_agent");
+
+    expect(collected.completions).toEqual([
+      expect.objectContaining({ childNativeId: "child", value: "RAW" }),
+    ]);
+    expect(nativeResultContent(body)).toBe(
+      JSON.stringify({ status: { child: { completed: "RAW" } } }),
+    );
+  });
+
+  test("leaves foreign namespaced wait payloads byte-exact", () => {
+    config.openappa.offerSigningSecret = "";
+    const output =
+      ' { "status": { "job": { "completed": "FOREIGN" } }, "total": 1 } ';
+    const body = {
+      input: [
+        {
+          type: "function_call",
+          call_id: "foreign-wait",
+          name: "wait_agent",
+          namespace: "mcp__foreign",
+          arguments: "{}",
+        },
+        {
+          type: "function_call_output",
+          call_id: "foreign-wait",
+          output,
+        },
+      ],
+    };
+    const before = structuredClone(body);
+
+    const collected = collectAndStripChildReturns(body);
+
+    expect(body).toEqual(before);
+    expect(body.input[1].output).toBe(output);
+    expect(collected).toEqual({ completions: [] });
+  });
+
+  test("keeps flat and native Codex namespaces eligible for completion", () => {
+    for (const namespace of [undefined, "functions", "multi_agent_v1"]) {
+      const body = {
+        input: [
+          {
+            type: "function_call",
+            call_id: `native-${namespace ?? "flat"}`,
+            name: "wait_agent",
+            ...(namespace ? { namespace } : {}),
+            arguments: "{}",
+          },
+          {
+            type: "function_call_output",
+            call_id: `native-${namespace ?? "flat"}`,
+            output: JSON.stringify({
+              status: { child: { completed: "RAW" } },
+              total: 1,
+            }),
+          },
+        ],
+      };
+
+      const collected = collectAndStripChildReturns(body);
+
+      expect(collected.completions).toEqual([
+        expect.objectContaining({ childNativeId: "child", value: "RAW" }),
+      ]);
+      expect(body.input[1].output).toBe(
+        JSON.stringify({ status: { child: { completed: "RAW" } } }),
+      );
+    }
+  });
+
+  test("mints a display-only marker without any machine line", () => {
+    const marker = requiredMarker(RETURN);
+
+    expect(marker).toMatch(
+      /^▄█▄▄▄█▄ {2}finished subagent [0-9A-HJKMNP-TV-Z]{3}-[0-9A-HJKMNP-TV-Z]{4}$/,
+    );
+    expect(requiredMarker({ ...RETURN, format: "inline" })).toMatch(
+      /^finished subagent [0-9A-HJKMNP-TV-Z]{3}-[0-9A-HJKMNP-TV-Z]{4}$/,
+    );
+    expect(marker).not.toContain("[appa]");
+  });
+
+  test("strips legacy two-line and space-collapsed child return markers", () => {
+    const marker = requiredMarker(RETURN);
+    const legacyTwoLine = marker.replace(/^▄█▄▄▄█▄/, "▄█▄▄▄█▄\n██▄█▄██");
+    const legacyCollapsed = marker.replace(/^▄█▄▄▄█▄/, "▄█▄▄▄█▄ ██▄█▄██");
+
+    for (const candidate of [legacyTwoLine, legacyCollapsed]) {
+      const body = {
+        messages: [
+          {
+            role: "assistant",
+            tool_calls: [nativeToolCall("direct", "Task")],
+          },
+          { role: "tool", tool_call_id: "direct", content: carrier(candidate) },
+        ],
+      };
+      const collected = collectAndStripChildReturns(body);
+      expect(collected.completions).toHaveLength(1);
+      expect(collected.completions[0]?.value).toBe(RETURN.value);
+      expect(body.messages[1].content).toBe(RETURN.value);
+    }
+  });
+
+  test("strips direct, JSON, and Claude notification carriers", () => {
+    const marker = requiredMarker(RETURN);
+    const body = {
+      messages: [
+        {
+          role: "assistant",
+          tool_calls: [
+            nativeToolCall("direct", "Task"),
+            nativeToolCall("wait", "wait_agent"),
+          ],
+        },
+        { role: "tool", tool_call_id: "direct", content: carrier(marker) },
+        {
+          role: "tool",
+          tool_call_id: "wait",
+          content: JSON.stringify({
+            status: { child: { completed: carrier(marker) } },
+          }),
+        },
+        {
+          role: "user",
+          content: `<task-notification>\n<task-id>child</task-id>\n<tool-use-id>spawn-call</tool-use-id>\n<status>completed</status>\n<result>${carrier(marker)}</result>\n</task-notification>`,
+        },
+      ],
+    };
+
+    const collected = collectAndStripChildReturns(body);
+
+    expect(collected.completions).toHaveLength(3);
+    expect(collected.completions.map((item) => item.envelopeId)).toEqual([
+      "direct",
+      "wait",
+      "spawn-call",
+    ]);
+    expect(
+      collected.completions.every((item) => item.value === RETURN.value),
+    ).toBe(true);
+    expect(body.messages[1].content).toBe(RETURN.value);
+    const waitContent = body.messages[2]?.content;
+    if (typeof waitContent !== "string")
+      throw new Error("expected wait output");
+    expect(JSON.parse(waitContent)).toEqual({
+      status: { child: { completed: RETURN.value } },
+    });
+    expect(body.messages[3].content).toContain(
+      `<result>${RETURN.value}</result>`,
+    );
+    expect(JSON.stringify(body)).not.toContain("finished subagent");
+  });
+
+  test("correlates Responses function-call outputs by native call site", () => {
+    const marker = requiredMarker(RETURN);
+    const body = {
+      input: [
+        {
+          type: "function_call",
+          call_id: "wait-response",
+          name: "functions.wait_agent",
+          arguments: "{}",
+        },
+        {
+          type: "function_call_output",
+          call_id: "wait-response",
+          output: JSON.stringify({
+            status: {
+              child: {
+                completed: carrier(marker),
+                raw_output: "DROP-ME",
+              },
+            },
+            raw_output: "DROP-ROOT",
+          }),
+        },
+      ],
+    };
+
+    const collected = collectAndStripChildReturns(body);
+
+    expect(body.input[1].output).toBe(
+      JSON.stringify({ status: { child: { completed: RETURN.value } } }),
+    );
+    expect(collected.completions).toEqual([
+      expect.objectContaining({
+        childNativeId: "child",
+        envelopeId: "wait-response",
+        value: RETURN.value,
+      }),
+    ]);
+  });
+
+  describe("Copilot CLI agent reports", () => {
+    // Copilot reads a finished background agent with a read_agent call it
+    // makes itself, and answers with a status line and each finished turn.
+    const COPILOT_RETURN = { ...RETURN, childNativeId: undefined } as const;
+    const report = (turns: string[]) =>
+      [
+        "Agent is idle (waiting for messages). agent_id: 5ef9a71d-f2c6-47f4-abe6-3d0adb3141ef, agent_type: task, status: idle, description: Run pwd in background, elapsed: 3s, total_turns: 1",
+        ...turns.map((turn, index) => `[Turn ${index}]\n${turn}`),
+      ].join("\n\n");
+    const readAgent = (output: string) => ({
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content:
+            '<system_notification>\nAgent "pwd-runner" (task) has finished processing and is now idle.\n</system_notification>',
+        },
+        {
+          type: "function_call",
+          call_id: "d2a07213-03ad-49a9-a289-6acec57aba87",
+          name: "read_agent",
+          arguments:
+            '{"agent_id":"5ef9a71d-f2c6-47f4-abe6-3d0adb3141ef","since_turn":0}',
+        },
+        {
+          type: "function_call_output",
+          call_id: "d2a07213-03ad-49a9-a289-6acec57aba87",
+          output,
+        },
+      ],
+    });
+
+    test("reads each finished turn as its own return and keeps the status line", () => {
+      const first = requiredMarker(COPILOT_RETURN);
+      const second = requiredMarker({
+        ...COPILOT_RETURN,
+        value: "second turn",
+      });
+      const body = readAgent(
+        report([carrier(first), carrier(second, "second turn")]),
+      );
+
+      const collected = collectAndStripChildReturns(body, {
+        copilotAgentReports: true,
+      });
+
+      expect(body.input[2].output).toBe(report([RETURN.value, "second turn"]));
+      expect(collected.completions).toEqual([
+        {
+          value: RETURN.value,
+          envelopeId: "d2a07213-03ad-49a9-a289-6acec57aba87",
+          assistantOrigin: false,
+          replayIdentity: {
+            childId: "5ef9a71d-f2c6-47f4-abe6-3d0adb3141ef",
+            turn: 0,
+          },
+        },
+        {
+          value: "second turn",
+          envelopeId: "d2a07213-03ad-49a9-a289-6acec57aba87",
+          assistantOrigin: false,
+          replayIdentity: {
+            childId: "5ef9a71d-f2c6-47f4-abe6-3d0adb3141ef",
+            turn: 1,
+          },
+        },
+      ]);
+    });
+
+    test("records only the turns that crossed, and leaves other clients' reports alone", () => {
+      const marker = requiredMarker(COPILOT_RETURN);
+      const unmarked = readAgent(report(["did not cross", carrier(marker)]));
+      expect(
+        collectAndStripChildReturns(unmarked, { copilotAgentReports: true })
+          .completions,
+      ).toEqual([expect.objectContaining({ value: RETURN.value })]);
+
+      const other = readAgent(report([carrier(marker)]));
+      const before = other.input[2].output;
+      expect(collectAndStripChildReturns(other).completions).toEqual([]);
+      expect(other.input[2].output).toBe(before);
+    });
+
+    test("refuses a marked report whose turns it cannot find", () => {
+      const marker = requiredMarker(COPILOT_RETURN);
+      const body = readAgent(
+        `Agent completed. agent_id: a, status: completed\n${carrier(marker)}`,
+      );
+      expect(() =>
+        collectAndStripChildReturns(body, { copilotAgentReports: true }),
+      ).toThrow("malformed agent report");
+    });
+
+    test("keeps the replay coordinate stable across incremental reads and stamped call ids", () => {
+      const marker = requiredMarker(COPILOT_RETURN);
+      const body = readAgent(
+        report([carrier(marker)]).replace("[Turn 0]", "[Turn 12]"),
+      );
+      const id = stampToolCallId({
+        callId: "read-again",
+        organizationId: RETURN.organizationId,
+        sessionId: RETURN.parentId,
+        callerId: RETURN.callerId,
+        secret: SECRET,
+      });
+      body.input[1].call_id = id;
+      body.input[2].call_id = id;
+      const { completions } = collectAndStripChildReturns(body, {
+        copilotAgentReports: true,
+      });
+      expect(completions).toEqual([
+        expect.objectContaining({
+          value: RETURN.value,
+          replayIdentity: {
+            childId: "5ef9a71d-f2c6-47f4-abe6-3d0adb3141ef",
+            turn: 12,
+          },
+        }),
+      ]);
+    });
+
+    test("refuses a report whose child differs from the read's argument", () => {
+      const body = readAgent(report([carrier(requiredMarker(COPILOT_RETURN))]));
+      body.input[1].arguments = '{"agent_id":"another-child"}';
+      expect(() =>
+        collectAndStripChildReturns(body, { copilotAgentReports: true }),
+      ).toThrow("different child");
+    });
+
+    test.each([
+      "[Turn 0]",
+      "[Turn 9007199254740992]",
+    ])("refuses duplicated or unsafe turn coordinates (%s)", (heading) => {
+      const body = readAgent(
+        report([
+          carrier(requiredMarker(COPILOT_RETURN)),
+          carrier(requiredMarker(COPILOT_RETURN)),
+        ]).replace("[Turn 1]", heading),
+      );
+      expect(() =>
+        collectAndStripChildReturns(body, { copilotAgentReports: true }),
+      ).toThrow("malformed agent report");
+    });
+
+    test("refuses conflicting children for the same native call id", () => {
+      const body = readAgent(report([carrier(requiredMarker(COPILOT_RETURN))]));
+      body.input.push({
+        type: "function_call",
+        name: "read_agent",
+        call_id: "d2a07213-03ad-49a9-a289-6acec57aba87",
+        arguments: '{"agent_id":"another-child"}',
+      });
+      expect(() =>
+        collectAndStripChildReturns(body, { copilotAgentReports: true }),
+      ).toThrow("conflicting Copilot agent reads");
+    });
+
+    test("does not infer replay coordinates from an unbound report header", () => {
+      const body = readAgent(report([carrier(requiredMarker(COPILOT_RETURN))]));
+      body.input[1].arguments = "{}";
+      const { completions } = collectAndStripChildReturns(body, {
+        copilotAgentReports: true,
+      });
+      expect(completions).toHaveLength(1);
+      expect(completions[0].replayIdentity).toBeUndefined();
+    });
+  });
+
+  test("reconstructs XML task notifications from the completion value only", () => {
+    const marker = requiredMarker(RETURN);
+    const body = {
+      role: "user",
+      content: `<task-notification>\n<task-id>child</task-id>\n<tool-use-id>spawn-call</tool-use-id>\n<status>completed</status>\n<raw-output>UNSIGNED-RAW</raw-output>\n<result>${carrier(marker)}</result>\n<unsigned>DROP-ME</unsigned>\n</task-notification>`,
+    };
+
+    const collected = collectAndStripChildReturns(body);
+
+    expect(body.content).toBe(
+      `<task-notification>\n<task-id>child</task-id>\n<tool-use-id>spawn-call</tool-use-id>\n<status>completed</status>\n<result>${RETURN.value}</result>\n</task-notification>`,
+    );
+    expect(body.content).not.toContain("UNSIGNED-RAW");
+    expect(body.content).not.toContain("DROP-ME");
+    expect(collected.completions).toEqual([
+      expect.objectContaining({
+        childNativeId: RETURN.childNativeId,
+        spawnCallId: RETURN.spawnCallId,
+        value: RETURN.value,
+      }),
+    ]);
+  });
+
+  test("reconstructs JSON subagent notifications without raw sidecars", () => {
+    const marker = requiredMarker(RETURN);
+    const notification = {
+      agent_id: "child",
+      tool_use_id: "spawn-call",
+      status: {
+        completed: carrier(marker),
+        raw_output: "UNSIGNED-IN-STATUS",
+      },
+      raw_output: "UNSIGNED-ROOT",
+      other: { nested: "DROP-ME" },
+    };
+    const body = {
+      role: "user",
+      content: `<subagent_notification>\n${JSON.stringify(notification)}\n</subagent_notification>`,
+    };
+
+    const collected = collectAndStripChildReturns(body);
+
+    expect(body.content).toBe(
+      `<subagent_notification>\n${JSON.stringify({ agent_id: "child", tool_use_id: "spawn-call", status: { completed: RETURN.value } })}\n</subagent_notification>`,
+    );
+    expect(body.content).not.toContain("UNSIGNED");
+    expect(body.content).not.toContain("DROP-ME");
+    expect(collected.completions).toEqual([
+      expect.objectContaining({
+        childNativeId: RETURN.childNativeId,
+        spawnCallId: RETURN.spawnCallId,
+        value: RETURN.value,
+      }),
+    ]);
+  });
+
+  test("canonicalizes subagent notifications with an empty completed value", () => {
+    const notification = {
+      agent_id: "child",
+      tool_use_id: "spawn-call",
+      status: { completed: "" },
+      raw_output: "UNSIGNED-ROOT",
+    };
+    const body = {
+      role: "user",
+      content: `<subagent_notification>\n${JSON.stringify(notification)}\n</subagent_notification>`,
+    };
+
+    const collected = collectAndStripChildReturns(body);
+
+    expect(body.content).toBe(
+      `<subagent_notification>\n${JSON.stringify({ agent_id: "child", tool_use_id: "spawn-call", status: { completed: "" } })}\n</subagent_notification>`,
+    );
+    expect(body.content).not.toContain("UNSIGNED-ROOT");
+    expect(collected.completions).toEqual([
+      expect.objectContaining({ childNativeId: "child", value: "" }),
+    ]);
+  });
+
+  test("preserves exact bytes around the marker, suffix included", () => {
+    const exact = "  admitted bytes  \n\n";
+    const returned = { ...RETURN, value: exact };
+    const marker = requiredMarker(returned);
+    const exactResult = collectNativeResult(`${exact}\n\n${marker}`, "Task");
+
+    expect(nativeResultContent(exactResult.body)).toBe(exact);
+    expect(exactResult.collected.completions).toEqual([
+      expect.objectContaining({ value: exact }),
+    ]);
+
+    // A suffix beside the marker stays part of the completion value, so the
+    // durable crossing check downstream rejects what the child never returned.
+    const suffixResult = collectNativeResult(
+      `${exact}\n\n${marker}\nUNSIGNED-SUFFIX`,
+      "Task",
+    );
+    expect(nativeResultContent(suffixResult.body)).toBe(
+      `${exact}\nUNSIGNED-SUFFIX`,
+    );
+    expect(suffixResult.collected.completions).toEqual([
+      expect.objectContaining({ value: `${exact}\nUNSIGNED-SUFFIX` }),
+    ]);
+  });
+
+  test("strips a nested trajectory proof from a complete direct return", () => {
+    const fullCarrier = completeResponseCarrier(RETURN);
+    const result = collectNativeResult(fullCarrier, "Task");
+
+    expect(nativeResultContent(result.body)).toBe(RETURN.value);
+    expect(nativeResultContent(result.body)).not.toContain("appact2-");
+    expect(result.collected.completions).toEqual([
+      expect.objectContaining({ value: RETURN.value }),
+    ]);
+  });
+
+  test("treats the display code as display-only", () => {
+    const marker = requiredMarker(RETURN);
+    const prettyTampered = marker.replace(
+      /finished subagent [0-9A-HJKMNP-TV-Z]{3}-[0-9A-HJKMNP-TV-Z]{4}/,
+      "finished subagent ZZZ-ZZZZ",
+    );
+    const result = collectNativeResult(carrier(prettyTampered), "Task");
+
+    // Any well-formed code strips; authority is the retained crossing, so a
+    // painted code cannot weaken or strengthen a completion.
+    expect(result.collected.completions).toEqual([
+      expect.objectContaining({ value: RETURN.value }),
+    ]);
+    expect(nativeResultContent(result.body)).toBe(RETURN.value);
+  });
+
+  test("records an assistant echo separately from an arrived grandchild", () => {
+    const currentSession = RETURN.childId;
+    const ownMarker = requiredMarker(RETURN);
+    const grandchild = {
+      ...RETURN,
+      parentId: currentSession,
+      childId: `${currentSession}:grandchild`,
+      childNativeId: "grandchild",
+      spawnCallId: "spawn-grandchild",
+      value: "SUMMARY(12 characters): grandchild",
+    };
+    const body = {
+      messages: [
+        { role: "assistant", content: carrier(ownMarker) },
+        {
+          role: "user",
+          content: `<task-notification>\n<task-id>grandchild</task-id>\n<tool-use-id>spawn-grandchild</tool-use-id>\n<status>completed</status>\n<result>${carrier(requiredMarker(grandchild), grandchild.value)}</result>\n</task-notification>`,
+        },
+      ],
+    };
+
+    const collected = collectAndStripChildReturns(body);
+
+    expect(collected.completions).toEqual([
+      expect.objectContaining({
+        assistantOrigin: true,
+        value: RETURN.value,
+      }),
+      expect.objectContaining({
+        assistantOrigin: false,
+        childNativeId: "grandchild",
+        spawnCallId: "spawn-grandchild",
+        value: grandchild.value,
+      }),
+    ]);
+    expect(body.messages[0].content).toBe(RETURN.value);
+    expect(body.messages[1].content).toContain(
+      `<result>${grandchild.value}</result>`,
+    );
+  });
+
+  test("records spawn hints from notification metadata verbatim", () => {
+    const marker = requiredMarker(RETURN);
+    const notification = (spawnCallId: string) => ({
+      content: `<task-notification>\n<task-id>child</task-id>\n<tool-use-id>${spawnCallId}</tool-use-id>\n<status>completed</status>\n<result>${carrier(marker)}</result>\n</task-notification>`,
+    });
+    const [other] = collectAndStripChildReturns(
+      notification("another-spawn-call"),
+    ).completions;
+    expect(other).toMatchObject({ spawnCallId: "another-spawn-call" });
+
+    const stampedSpawnCallId = stampToolCallId({
+      callId: RETURN.spawnCallId,
+      sessionId: "root",
+      organizationId: RETURN.organizationId,
+      callerId: RETURN.callerId,
+      secret: SECRET,
+    });
+    const [stamped] = collectAndStripChildReturns(
+      notification(stampedSpawnCallId),
+    ).completions;
+    expect(stamped).toMatchObject({ spawnCallId: stampedSpawnCallId });
+  });
+
+  test("records the notification's native child identity", () => {
+    const returned = { ...RETURN, childNativeId: undefined };
+    const marker = requiredMarker(returned);
+    const body = {
+      content: `<task-notification>\n<task-id>observed-later</task-id>\n<tool-use-id>spawn-call</tool-use-id>\n<status>completed</status>\n<result>${carrier(marker)}</result>\n</task-notification>`,
+    };
+
+    const collected = collectAndStripChildReturns(body);
+
+    expect(collected.completions).toEqual([
+      expect.objectContaining({
+        childNativeId: "observed-later",
+        spawnCallId: RETURN.spawnCallId,
+        value: RETURN.value,
+      }),
+    ]);
+  });
+
+  test("enumerates every Codex completion whether or not a marker is present", () => {
+    const marker = requiredMarker(RETURN);
+    const body = {
+      messages: [
+        {
+          role: "assistant",
+          tool_calls: [nativeToolCall("wait-call", "wait_agent")],
+        },
+        {
+          role: "tool",
+          tool_call_id: "wait-call",
+          content: JSON.stringify({
+            status: {
+              child: { completed: carrier(marker) },
+              unsignedChild: { completed: "RAW-UNSIGNED-CHILD-RETURN" },
+            },
+          }),
+        },
+      ],
+    };
+
+    const collected = collectAndStripChildReturns(body);
+
+    expect(collected.completions).toEqual([
+      expect.objectContaining({
+        childNativeId: "child",
+        envelopeId: "wait-call",
+        value: RETURN.value,
+      }),
+      {
+        assistantOrigin: false,
+        childNativeId: "unsignedChild",
+        envelopeId: "wait-call",
+        value: "RAW-UNSIGNED-CHILD-RETURN",
+      },
+    ]);
+    expect(body.messages[1].content).toContain("RAW-UNSIGNED-CHILD-RETURN");
+    expect(body.messages[1].content).not.toContain("raw_output");
+  });
+
+  test("rejects malformed marker carriers in genuine completed leaves", () => {
+    const body = {
+      messages: [
+        {
+          role: "assistant",
+          tool_calls: [nativeToolCall("wait", "wait_agent")],
+        },
+        {
+          role: "tool",
+          tool_call_id: "wait",
+          content: JSON.stringify({
+            status: {
+              child: {
+                completed: `${RETURN.value}\n\nfinished subagent`,
+              },
+            },
+          }),
+        },
+      ],
+    };
+
+    expect(() => collectAndStripChildReturns(body)).toThrow(
+      "OpenAPPA received a malformed child-return marker",
+    );
+    // Only a withheld return waits for the caller. A malformed marker is
+    // rejected whether or not the caller takes refusals.
+    expect(() =>
+      collectAndStripChildReturns(body, { onRefusal: () => {} }),
+    ).toThrow("OpenAPPA received a malformed child-return marker");
+  });
+
+  test("reports a return the body walk cannot read and leaves it as the client sent it", () => {
+    // The walk reads the returns of every other client. This one is an
+    // OpenCode background completion without its result framing.
+    const body = {
+      messages: [
+        {
+          role: "user",
+          content: '<task id="child" state="completed">RAW</task>',
+        },
+        { role: "user", content: "Carry on" },
+      ],
+    };
+    const sent = structuredClone(body);
+    const refusals: string[] = [];
+
+    const collected = collectAndStripChildReturns(body, {
+      openCodeBackgroundReturns: true,
+      onRefusal: (refusal) => refusals.push(refusal.message),
+    });
+
+    expect(refusals).toEqual([
+      "OpenAPPA withheld a malformed child completion",
+    ]);
+    expect(collected.completions).toEqual([]);
+    expect(body).toEqual(sent);
+  });
+
+  test("bounds marker scanning and scans large indentation linearly", () => {
+    const marker = requiredMarker(RETURN);
+    const result = collectNativeResult(
+      `${RETURN.value}\n\n${" ".repeat(512 * 1024)}${marker}`,
+      "Task",
+    );
+
+    expect(nativeResultContent(result.body)).toBe(RETURN.value);
+    expect(result.collected.completions).toEqual([
+      expect.objectContaining({ value: RETURN.value }),
+    ]);
+  }, 30_000);
+
+  test("mints and strips a display marker without a signing key", () => {
+    config.openappa.offerSigningSecret = "";
+
+    const marker = mintChildReturnMarker(RETURN);
+    expect(marker).toBe(mintChildReturnMarker(RETURN));
+    expect(
+      mintChildReturnMarker({ ...RETURN, value: "other summary" }),
+    ).not.toBe(marker);
+    const { body, collected } = collectNativeResult(
+      `${RETURN.value}\n\n${marker}`,
+      "Task",
+    );
+    expect(nativeResultContent(body)).toBe(RETURN.value);
+    expect(collected.completions).toEqual([
+      expect.objectContaining({ value: RETURN.value }),
+    ]);
+  });
+});
+
+function requiredMarker(
+  returned: Parameters<typeof mintChildReturnMarker>[0],
+): string {
+  return mintChildReturnMarker(returned);
+}
+
+function carrier(marker: string, value: string = RETURN.value): string {
+  return `${value}\n\n${marker}`;
+}
+
+function completeResponseCarrier(
+  returned: Parameters<typeof mintChildReturnMarker>[0],
+): string {
+  const trajectory = mintChildTrajectoryReceipt({
+    organizationId: returned.organizationId,
+    callerId: returned.callerId,
+    parentId: returned.parentId,
+    childId: returned.childId,
+    childNativeId: returned.childNativeId,
+    spawnerNativeId: "root-native",
+    spawnCallId: returned.spawnCallId,
+  });
+  if (!trajectory) throw new Error("expected a child-trajectory marker");
+  const response = { content: [{ type: "text", text: returned.value }] };
+  if (
+    !appendChildTrajectoryReceiptToResponse({
+      family: "anthropic:messages",
+      response,
+      footer: trajectory,
+    })
+  ) {
+    throw new Error("expected a complete child response carrier");
+  }
+  return `${response.content[0].text}\n\n${requiredMarker(returned)}`;
+}
+
+function nativeToolCall(id: string, name: string) {
+  return { id, type: "function", function: { name, arguments: "{}" } };
+}
+
+function collectNativeResult(content: string, toolName: string) {
+  const body = {
+    messages: [
+      {
+        role: "assistant",
+        tool_calls: [nativeToolCall("native-result", toolName)],
+      },
+      { role: "tool", tool_call_id: "native-result", content },
+    ],
+  };
+  return { body, collected: collectAndStripChildReturns(body) };
+}
+
+function nativeResultContent(
+  body: ReturnType<typeof collectNativeResult>["body"],
+): string {
+  const content = body.messages[1]?.content;
+  if (typeof content !== "string") throw new Error("expected tool content");
+  return content;
+}

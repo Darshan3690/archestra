@@ -1,0 +1,569 @@
+import type { ModelMessage } from "ai";
+import { describe, expect, it } from "vitest";
+import {
+  applyPromptCacheBreakpoints,
+  applyStepPromptCacheBreakpoint,
+} from "./apply-prompt-cache";
+
+const EPHEMERAL = { type: "ephemeral" };
+
+// A Bedrock model that supports prompt caching but not the 1h TTL, so these
+// tests exercise breakpoint placement without also opting into a longer TTL.
+const BEDROCK_CACHEABLE_MODEL = "us.anthropic.claude-opus-4-6-v1:0";
+
+function userMessage(text: string): ModelMessage {
+  return { role: "user", content: [{ type: "text", text }] };
+}
+
+function anthropicCacheControl(message: ModelMessage) {
+  return (
+    message.providerOptions as
+      | { anthropic?: { cacheControl?: unknown } }
+      | undefined
+  )?.anthropic?.cacheControl;
+}
+
+function bedrockCachePoint(message: ModelMessage) {
+  return (
+    message.providerOptions as
+      | { bedrock?: { cachePoint?: unknown } }
+      | undefined
+  )?.bedrock?.cachePoint;
+}
+
+// A message whose content part already carries an Anthropic cache_control
+// marker, as `materializeAttachments` produces for file/document parts.
+function messageWithMarkedPart(text: string): ModelMessage {
+  return {
+    role: "user",
+    content: [
+      {
+        type: "text",
+        text,
+        providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+      },
+    ],
+  };
+}
+
+// A user message carrying a text part plus a file part of the given media type,
+// as `materializeAttachments` produces for an attachment.
+function messageWithFile(text: string, mediaType: string): ModelMessage {
+  return {
+    role: "user",
+    content: [
+      { type: "text", text },
+      { type: "file", mediaType, data: "data:..." },
+    ],
+  };
+}
+
+describe("applyPromptCacheBreakpoints", () => {
+  it("marks the first and last message for Anthropic", () => {
+    const result = applyPromptCacheBreakpoints({
+      provider: "anthropic",
+      messages: [userMessage("a"), userMessage("b"), userMessage("c")],
+    });
+
+    expect(anthropicCacheControl(result[0])).toEqual(EPHEMERAL);
+    expect(anthropicCacheControl(result[1])).toBeUndefined();
+    expect(anthropicCacheControl(result[2])).toEqual(EPHEMERAL);
+  });
+
+  it("marks a single message exactly once (no first/last collision)", () => {
+    const result = applyPromptCacheBreakpoints({
+      provider: "anthropic",
+      messages: [userMessage("only")],
+    });
+
+    expect(result).toHaveLength(1);
+    expect(anthropicCacheControl(result[0])).toEqual(EPHEMERAL);
+  });
+
+  it("does not annotate messages for auto-caching providers", () => {
+    const messages = [userMessage("a"), userMessage("b")];
+
+    for (const provider of ["openai", "gemini", "deepseek"]) {
+      const result = applyPromptCacheBreakpoints({ provider, messages });
+      expect(result).toBe(messages);
+      expect(anthropicCacheControl(result[0])).toBeUndefined();
+      expect(bedrockCachePoint(result[0])).toBeUndefined();
+    }
+  });
+
+  it("returns the empty list unchanged for Anthropic", () => {
+    const messages: ModelMessage[] = [];
+    expect(
+      applyPromptCacheBreakpoints({ provider: "anthropic", messages }),
+    ).toBe(messages);
+  });
+
+  it("skips breakpoints for an Anthropic-compatible (non-native) endpoint", () => {
+    const messages = [userMessage("a"), userMessage("b")];
+    const result = applyPromptCacheBreakpoints({
+      provider: "anthropic",
+      messages,
+      anthropicNativeEndpoint: false,
+    });
+    expect(result).toBe(messages);
+    expect(anthropicCacheControl(result[0])).toBeUndefined();
+    expect(anthropicCacheControl(result[1])).toBeUndefined();
+  });
+
+  it("still marks breakpoints for native Anthropic (flag true / default)", () => {
+    const messages = [userMessage("a"), userMessage("b")];
+    const marked = applyPromptCacheBreakpoints({
+      provider: "anthropic",
+      messages,
+      anthropicNativeEndpoint: true,
+    });
+    expect(anthropicCacheControl(marked[0])).toEqual(EPHEMERAL);
+    expect(anthropicCacheControl(marked[marked.length - 1])).toEqual(EPHEMERAL);
+  });
+
+  it("preserves existing providerOptions while adding cacheControl", () => {
+    const message: ModelMessage = {
+      role: "user",
+      content: [{ type: "text", text: "a" }],
+      providerOptions: {
+        anthropic: { existingFlag: true },
+        openai: { foo: "bar" },
+      },
+    };
+
+    const [result] = applyPromptCacheBreakpoints({
+      provider: "anthropic",
+      messages: [message],
+    });
+
+    const providerOptions = result.providerOptions as {
+      anthropic: { existingFlag: boolean; cacheControl: unknown };
+      openai: { foo: string };
+    };
+    expect(providerOptions.anthropic.cacheControl).toEqual(EPHEMERAL);
+    expect(providerOptions.anthropic.existingFlag).toBe(true);
+    expect(providerOptions.openai).toEqual({ foo: "bar" });
+  });
+
+  it("does not mutate the input messages", () => {
+    const message = userMessage("a");
+    applyPromptCacheBreakpoints({ provider: "anthropic", messages: [message] });
+    expect(message.providerOptions).toBeUndefined();
+  });
+
+  it("adds nothing when existing breakpoints already saturate the budget", () => {
+    // 4 attachment-marked parts == Anthropic's max of 4 breakpoints.
+    const messages = [
+      messageWithMarkedPart("a"),
+      messageWithMarkedPart("b"),
+      messageWithMarkedPart("c"),
+      messageWithMarkedPart("d"),
+      userMessage("e"),
+    ];
+
+    const result = applyPromptCacheBreakpoints({
+      provider: "anthropic",
+      messages,
+    });
+
+    expect(result).toBe(messages);
+    // The unmarked first/last messages stay unmarked — no message-level marker.
+    expect(anthropicCacheControl(result[4])).toBeUndefined();
+  });
+
+  it("spends the remaining budget on the last message before the first", () => {
+    // 3 existing breakpoints → budget of 1 → only the last gets a marker.
+    const messages = [
+      userMessage("first"),
+      messageWithMarkedPart("b"),
+      messageWithMarkedPart("c"),
+      messageWithMarkedPart("d"),
+      userMessage("last"),
+    ];
+
+    const result = applyPromptCacheBreakpoints({
+      provider: "anthropic",
+      messages,
+    });
+
+    expect(anthropicCacheControl(result[4])).toEqual(EPHEMERAL);
+    expect(anthropicCacheControl(result[0])).toBeUndefined();
+  });
+
+  it("skips a candidate that already carries a breakpoint and uses the budget elsewhere", () => {
+    // Last message is already marked (attachment) → first message gets the marker.
+    const messages = [userMessage("first"), messageWithMarkedPart("last")];
+
+    const result = applyPromptCacheBreakpoints({
+      provider: "anthropic",
+      messages,
+    });
+
+    expect(anthropicCacheControl(result[0])).toEqual(EPHEMERAL);
+    // The already-marked message keeps only its part-level marker.
+    expect(anthropicCacheControl(result[1])).toBeUndefined();
+  });
+
+  it("marks the first and last message for Bedrock with cachePoint", () => {
+    const result = applyPromptCacheBreakpoints({
+      provider: "bedrock",
+      model: BEDROCK_CACHEABLE_MODEL,
+      messages: [userMessage("a"), userMessage("b"), userMessage("c")],
+    });
+
+    expect(bedrockCachePoint(result[0])).toEqual({ type: "default" });
+    expect(bedrockCachePoint(result[1])).toBeUndefined();
+    expect(bedrockCachePoint(result[2])).toEqual({ type: "default" });
+    // Bedrock uses cachePoint, not Anthropic's cacheControl.
+    expect(anthropicCacheControl(result[0])).toBeUndefined();
+  });
+
+  it("skips the Bedrock cachePoint on a message containing a document", () => {
+    // A trailing standalone cachePoint after a document block makes Bedrock
+    // reject the request, so a document-bearing last message must not be marked.
+    const result = applyPromptCacheBreakpoints({
+      provider: "bedrock",
+      model: BEDROCK_CACHEABLE_MODEL,
+      messages: [
+        userMessage("first"),
+        messageWithFile("here is a file", "application/pdf"),
+      ],
+    });
+
+    expect(bedrockCachePoint(result[1])).toBeUndefined();
+    // Budget is spent on the document-free first message instead.
+    expect(bedrockCachePoint(result[0])).toEqual({ type: "default" });
+  });
+
+  it("does not mark either message when both carry a document for Bedrock", () => {
+    const messages = [
+      messageWithFile("doc a", "application/pdf"),
+      messageWithFile("doc b", "text/plain"),
+    ];
+
+    const result = applyPromptCacheBreakpoints({
+      provider: "bedrock",
+      model: BEDROCK_CACHEABLE_MODEL,
+      messages,
+    });
+
+    expect(result).toBe(messages);
+    expect(bedrockCachePoint(result[0])).toBeUndefined();
+    expect(bedrockCachePoint(result[1])).toBeUndefined();
+  });
+
+  it("still marks a Bedrock message that carries an image (not a document)", () => {
+    const result = applyPromptCacheBreakpoints({
+      provider: "bedrock",
+      model: BEDROCK_CACHEABLE_MODEL,
+      messages: [
+        userMessage("first"),
+        messageWithFile("here is an image", "image/png"),
+      ],
+    });
+
+    // A cachePoint after an image block is accepted by Bedrock, so the
+    // image-bearing last message keeps its breakpoint.
+    expect(bedrockCachePoint(result[1])).toEqual({ type: "default" });
+  });
+
+  it("does not skip document messages for Anthropic", () => {
+    // Anthropic merges the breakpoint into providerOptions (no standalone
+    // block), so a document-bearing message is still marked.
+    const result = applyPromptCacheBreakpoints({
+      provider: "anthropic",
+      messages: [
+        userMessage("first"),
+        messageWithFile("here is a file", "application/pdf"),
+      ],
+    });
+
+    expect(anthropicCacheControl(result[1])).toEqual(EPHEMERAL);
+  });
+
+  it("ignores Anthropic markers when budgeting Bedrock cachePoints", () => {
+    // 4 parts carry an Anthropic cacheControl marker, but those do not count as
+    // Bedrock cache points, so Bedrock still has its full budget of 4.
+    const messages = [
+      messageWithMarkedPart("a"),
+      messageWithMarkedPart("b"),
+      messageWithMarkedPart("c"),
+      messageWithMarkedPart("d"),
+      userMessage("e"),
+    ];
+
+    const result = applyPromptCacheBreakpoints({
+      provider: "bedrock",
+      model: BEDROCK_CACHEABLE_MODEL,
+      messages,
+    });
+
+    expect(bedrockCachePoint(result[0])).toEqual({ type: "default" });
+    expect(bedrockCachePoint(result[4])).toEqual({ type: "default" });
+  });
+
+  it("uses a 1h TTL for Anthropic models that support it", () => {
+    const [result] = applyPromptCacheBreakpoints({
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+      messages: [userMessage("a")],
+    });
+    expect(anthropicCacheControl(result)).toEqual({
+      type: "ephemeral",
+      ttl: "1h",
+    });
+  });
+
+  it("uses a 1h TTL for Bedrock Claude 4.5 inference profiles", () => {
+    const [result] = applyPromptCacheBreakpoints({
+      provider: "bedrock",
+      model: "us.anthropic.claude-opus-4-5-20251101-v1:0",
+      messages: [userMessage("a")],
+    });
+    expect(bedrockCachePoint(result)).toEqual({ type: "default", ttl: "1h" });
+  });
+
+  it("keeps the 5m default for Bedrock Claude 4.6 inference profiles", () => {
+    const [opus46] = applyPromptCacheBreakpoints({
+      provider: "bedrock",
+      model: "us.anthropic.claude-opus-4-6-v1:0",
+      messages: [userMessage("a")],
+    });
+    expect(bedrockCachePoint(opus46)).toEqual({ type: "default" });
+
+    const [sonnet46] = applyPromptCacheBreakpoints({
+      provider: "bedrock",
+      model: "global.anthropic.claude-sonnet-4-6-v1:0",
+      messages: [userMessage("a")],
+    });
+    expect(bedrockCachePoint(sonnet46)).toEqual({ type: "default" });
+  });
+
+  it("uses a 1h TTL for Anthropic Claude 4.6 models", () => {
+    const [result] = applyPromptCacheBreakpoints({
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+      messages: [userMessage("a")],
+    });
+    expect(anthropicCacheControl(result)).toEqual({
+      type: "ephemeral",
+      ttl: "1h",
+    });
+  });
+
+  it.each([
+    "claude-sonnet-5-5",
+    "claude-opus-5",
+    "claude-fable-5-1",
+  ])("uses a 1h TTL for Anthropic Claude 5 model %s", (model) => {
+    const [result] = applyPromptCacheBreakpoints({
+      provider: "anthropic",
+      model,
+      messages: [userMessage("a")],
+    });
+    expect(anthropicCacheControl(result)).toEqual({
+      type: "ephemeral",
+      ttl: "1h",
+    });
+  });
+
+  it("keeps the 5m default for older models and when model is absent", () => {
+    const [sonnet4] = applyPromptCacheBreakpoints({
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+      messages: [userMessage("a")],
+    });
+    expect(anthropicCacheControl(sonnet4)).toEqual({ type: "ephemeral" });
+
+    const [noModel] = applyPromptCacheBreakpoints({
+      provider: "anthropic",
+      messages: [userMessage("a")],
+    });
+    expect(anthropicCacheControl(noModel)).toEqual({ type: "ephemeral" });
+  });
+
+  it("stays 5m for a 1h-capable model when an attachment breakpoint already exists", () => {
+    // A 5m attachment marker placed before a 1h marker would violate the
+    // provider's "longer TTL must precede shorter" rule, so the request that
+    // already carries any breakpoint stays uniformly 5m.
+    const result = applyPromptCacheBreakpoints({
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+      messages: [userMessage("first"), messageWithMarkedPart("withFile")],
+    });
+
+    // The unmarked first message gets a marker (last already has its own), 5m.
+    expect(anthropicCacheControl(result[0])).toEqual({ type: "ephemeral" });
+  });
+
+  describe("Bedrock families that cannot cache", () => {
+    // Bedrock answers a cachePoint on an uncacheable model with a 403 that fails
+    // the whole turn, so these models must be left unmarked rather than cached.
+    it.each([
+      ["openai.gpt-oss-120b-1:0", "GPT-OSS"],
+      ["meta.llama3-70b-instruct-v1:0", "Llama"],
+      ["mistral.mistral-large-2407-v1:0", "Mistral"],
+      ["deepseek.r1-v1:0", "DeepSeek"],
+      ["amazon.nova-premier-v1:0", "Nova Premier v1"],
+    ])("adds no cachePoint for %s (%s)", (model) => {
+      const messages = [userMessage("a"), userMessage("b")];
+
+      const result = applyPromptCacheBreakpoints({
+        provider: "bedrock",
+        model,
+        messages,
+      });
+
+      expect(result).toBe(messages);
+      expect(bedrockCachePoint(result[0])).toBeUndefined();
+      expect(bedrockCachePoint(result[1])).toBeUndefined();
+    });
+
+    it.each([
+      ["us.anthropic.claude-opus-4-6-v1:0", "Claude via inference profile"],
+      ["amazon.nova-micro-v1:0", "Nova Micro v1"],
+      ["amazon.nova-lite-v1:0", "Nova Lite v1"],
+      ["us.amazon.nova-pro-v1:0", "Nova Pro v1 inference profile"],
+      ["amazon.nova-2-lite-v1:0", "Nova 2 Lite"],
+      ["global.amazon.nova-2-lite-v1:0", "Nova 2 Lite inference profile"],
+    ])("still adds a cachePoint for %s (%s)", (model) => {
+      const result = applyPromptCacheBreakpoints({
+        provider: "bedrock",
+        model,
+        messages: [userMessage("a"), userMessage("b")],
+      });
+
+      expect(bedrockCachePoint(result[0])).toEqual({ type: "default" });
+      expect(bedrockCachePoint(result[1])).toEqual({ type: "default" });
+    });
+
+    it("adds no cachePoint when the model is unknown", () => {
+      // Fails closed: forfeiting a cache hit costs money, sending an
+      // unsupported breakpoint costs the whole request.
+      const messages = [userMessage("a"), userMessage("b")];
+
+      const result = applyPromptCacheBreakpoints({
+        provider: "bedrock",
+        messages,
+      });
+
+      expect(result).toBe(messages);
+    });
+
+    it("leaves Anthropic-direct models unrestricted", () => {
+      // The gate is Bedrock-specific; Anthropic's own API caches every model it
+      // serves, so a model id it doesn't recognize must still be marked.
+      const result = applyPromptCacheBreakpoints({
+        provider: "anthropic",
+        model: "some-future-model",
+        messages: [userMessage("a"), userMessage("b")],
+      });
+
+      expect(anthropicCacheControl(result[0])).toEqual(EPHEMERAL);
+      expect(anthropicCacheControl(result[1])).toEqual(EPHEMERAL);
+    });
+  });
+});
+
+describe("applyStepPromptCacheBreakpoint", () => {
+  const ONE_HOUR = { type: "ephemeral", ttl: "1h" };
+  const MODEL = "claude-haiku-4-5";
+
+  // The initial request of a run, marked by the run-start policy (1h TTL).
+  function markedTurn(text: string): ModelMessage {
+    const [marked] = applyPromptCacheBreakpoints({
+      provider: "anthropic",
+      model: MODEL,
+      messages: [userMessage(text)],
+    });
+    return marked;
+  }
+
+  function toolStep(id: string): ModelMessage[] {
+    return [
+      {
+        role: "assistant",
+        content: [
+          { type: "tool-call", toolCallId: id, toolName: "inspect", input: {} },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: id,
+            toolName: "inspect",
+            output: { type: "text", value: `result ${id}` },
+          },
+        ],
+      },
+    ];
+  }
+
+  it("marks only the newest message, with the 5m TTL", () => {
+    // No other marker, as after compaction: the run-start policy would also
+    // mark the first message, and with the 1h TTL, which writes every step at
+    // 2x the input price instead of 1.25x.
+    const messages: ModelMessage[] = [
+      userMessage("Summary of the earlier steps."),
+      ...toolStep("t1"),
+      ...toolStep("t2"),
+    ];
+
+    const result = applyStepPromptCacheBreakpoint({
+      provider: "anthropic",
+      model: MODEL,
+      messages,
+    });
+
+    expect(anthropicCacheControl(result[4])).toEqual(EPHEMERAL);
+    expect(result.slice(0, 4)).toEqual(messages.slice(0, 4));
+  });
+
+  it("never puts a marker before a retained 1-hour marker", () => {
+    // A context-trim retry prepends an unmarked system note. The run-start
+    // policy would mark it with the 5m TTL, ahead of the 1h marker.
+    const messages: ModelMessage[] = [
+      { role: "system", content: "[Earlier context was trimmed.]" },
+      markedTurn("task"),
+      ...toolStep("t1"),
+    ];
+
+    const result = applyStepPromptCacheBreakpoint({
+      provider: "anthropic",
+      model: MODEL,
+      messages,
+    });
+
+    expect(anthropicCacheControl(result[0])).toBeUndefined();
+    expect(anthropicCacheControl(result[1])).toEqual(ONE_HOUR);
+    expect(anthropicCacheControl(result[3])).toEqual(EPHEMERAL);
+  });
+
+  it("returns the input when the newest message already has a marker", () => {
+    // The first step sends the initial messages, which the run start marked.
+    const messages = [markedTurn("task")];
+
+    expect(
+      applyStepPromptCacheBreakpoint({
+        provider: "anthropic",
+        model: MODEL,
+        messages,
+      }),
+    ).toBe(messages);
+  });
+
+  it("adds nothing for an Anthropic-compatible endpoint", () => {
+    const messages = [userMessage("task"), ...toolStep("t1")];
+
+    expect(
+      applyStepPromptCacheBreakpoint({
+        provider: "anthropic",
+        model: MODEL,
+        anthropicNativeEndpoint: false,
+        messages,
+      }),
+    ).toBe(messages);
+  });
+});

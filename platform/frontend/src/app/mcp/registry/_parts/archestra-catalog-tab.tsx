@@ -1,18 +1,27 @@
 "use client";
 
-import {
-  type archestraApiTypes,
-  type archestraCatalogTypes,
-  E2eTestId,
-} from "@shared";
+import { type archestraCatalogTypes, E2eTestId } from "@archestra/shared";
 
-import { BookOpen, Github, Info, Loader2, Search } from "lucide-react";
+import {
+  BookOpen,
+  Check,
+  Github,
+  Loader2,
+  Plus,
+  Server as ServerIcon,
+} from "lucide-react";
 import { useMemo, useState } from "react";
-import { DebouncedInput } from "@/components/debounced-input";
+import {
+  CollectionFilters,
+  FilterBar,
+  filterControlClass,
+  filterSearchClass,
+} from "@/components/filter-bar";
+import { SearchInput } from "@/components/search-input";
 import { TruncatedText } from "@/components/truncated-text";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import {
   Select,
   SelectContent,
@@ -26,28 +35,32 @@ import {
   useMcpRegistryServersInfinite,
   useMcpServerCategories,
 } from "@/lib/mcp/external-mcp-catalog.query";
-import { useInternalMcpCatalog } from "@/lib/mcp/internal-mcp-catalog.query";
-import type { SelectedCategory } from "./CatalogFilters";
-import { DetailsDialog } from "./details-dialog";
+import { useMcpRegistryIssueIndex } from "@/lib/mcp/mcp-registry.query";
+import type { SelectedCategory } from "./catalog-filters";
 import type { McpCatalogFormValues } from "./mcp-catalog-form.types";
 import { transformExternalCatalogToFormValues } from "./mcp-catalog-form.utils";
-import { RequestInstallationDialog } from "./request-installation-dialog";
-import { TransportBadges } from "./transport-badges";
 
-type ServerType = "all" | "remote" | "local";
+// "mcp-apps-demo" is a pseudo-type: demo servers are marked with the
+// MCP_APPS_DEMO_CATEGORY catalog category, hidden from every other type view,
+// and revealed only by picking this type explicitly.
+type ServerType = "all" | "remote" | "local" | "mcp-apps-demo";
+
+// Catalog category reserved for servers that only exist to exercise the MCP
+// Apps feature. Surfaced in the UI as the "MCP Apps Demo" type, not as a
+// selectable category.
+const MCP_APPS_DEMO_CATEGORY = "MCP Apps Demo";
+
+// Typed to accept a plain string so it composes with both the generated
+// category union and the server manifest's nullable category without casts.
+const isDemoCategory = (category: string | null | undefined) =>
+  category === MCP_APPS_DEMO_CATEGORY;
 
 export function ArchestraCatalogTab({
-  catalogItems: initialCatalogItems,
   onSelectServer,
 }: {
-  catalogItems?: archestraApiTypes.GetInternalMcpCatalogResponses["200"];
   onSelectServer: (formValues: McpCatalogFormValues) => void;
 }) {
   const [searchQuery, setSearchQuery] = useState("");
-  const [readmeServer, setReadmeServer] =
-    useState<archestraCatalogTypes.ArchestraMcpServerManifest | null>(null);
-  const [requestServer, setRequestServer] =
-    useState<archestraCatalogTypes.ArchestraMcpServerManifest | null>(null);
   const [filters, setFilters] = useState<{
     type: ServerType;
     category: SelectedCategory;
@@ -56,19 +69,25 @@ export function ArchestraCatalogTab({
     category: "all",
   });
 
-  // Get catalog items for filtering (with live updates)
-  const { data: catalogItems } = useInternalMcpCatalog({
-    initialData: initialCatalogItems,
-  });
+  // The names already in the private registry, from its slim index (with
+  // live updates) rather than the full catalog list.
+  const { data: issueIndex } = useMcpRegistryIssueIndex();
+  const catalogItems = issueIndex?.catalogItems;
 
   // Fetch available categories
   const { data: availableCategories = [] } = useMcpServerCategories();
 
-  const { data: userIsMcpServerAdmin = false } = useHasPermissions({
-    mcpServerInstallation: ["admin"],
+  const { data: userAllowedToCreateCatalogItem = false } = useHasPermissions({
+    mcpRegistry: ["create"],
   });
 
-  // Use server-side search and category filtering
+  // Use server-side search and category filtering. The demo pseudo-type maps
+  // onto its backend category so filtering happens server-side — a client-only
+  // filter would miss demo servers beyond the first page.
+  const effectiveCategory: SelectedCategory =
+    filters.type === "mcp-apps-demo"
+      ? MCP_APPS_DEMO_CATEGORY
+      : filters.category;
   const {
     data,
     isLoading,
@@ -76,7 +95,7 @@ export function ArchestraCatalogTab({
     fetchNextPage,
     hasNextPage,
     isFetchingNextPage,
-  } = useMcpRegistryServersInfinite(searchQuery, filters.category);
+  } = useMcpRegistryServersInfinite(searchQuery, effectiveCategory);
 
   const handleSelectServer = (
     server: archestraCatalogTypes.ArchestraMcpServerManifest,
@@ -85,24 +104,21 @@ export function ArchestraCatalogTab({
     onSelectServer(formValues);
   };
 
-  const handleRequestInstallation = async (
-    server: archestraCatalogTypes.ArchestraMcpServerManifest,
-  ) => {
-    // Just open the request dialog with the server data
-    setRequestServer(server);
-  };
-
   // Flatten all pages into a single array of servers
   const servers = useMemo(() => {
     if (!data) return [];
     return data.pages.flatMap((page) => page.servers);
   }, [data]);
 
-  // Apply client-side type filter only (categories are filtered backend-side)
+  // Apply client-side type filter (categories are filtered backend-side).
   const filteredServers = useMemo(() => {
-    let filtered = servers;
+    // The demo pseudo-type shows only MCP Apps demo servers.
+    if (filters.type === "mcp-apps-demo") {
+      return servers.filter((server) => isDemoCategory(server.category));
+    }
 
-    // Filter by type (client-side since API doesn't support this)
+    // Demo servers are hidden from every other type view, including "all".
+    let filtered = servers.filter((server) => !isDemoCategory(server.category));
     if (filters.type !== "all") {
       filtered = filtered.filter(
         (server) => server.server.type === filters.type,
@@ -112,6 +128,12 @@ export function ArchestraCatalogTab({
     return filtered;
   }, [servers, filters.type]);
 
+  // The demo marker is surfaced as a type, so keep it out of the category list.
+  const visibleCategories = useMemo(
+    () => availableCategories.filter((category) => !isDemoCategory(category)),
+    [availableCategories],
+  );
+
   // Create a Set of catalog item names for efficient lookup
   const catalogServerNames = useMemo(
     () => new Set(catalogItems?.map((item) => item.name) || []),
@@ -119,63 +141,79 @@ export function ArchestraCatalogTab({
   );
 
   return (
-    <div className="w-full space-y-2">
-      <div className="ml-1 grid grid-cols-1 items-end gap-4 lg:grid-cols-[minmax(0,1.5fr)_minmax(0,0.5fr)_minmax(0,0.5fr)]">
-        <div className="min-w-0">
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-            <DebouncedInput
+    <div className="w-full">
+      <CollectionFilters>
+        <FilterBar
+          className="ml-1"
+          onClearFilters={
+            searchQuery || filters.type !== "all" || filters.category !== "all"
+              ? () => {
+                  setSearchQuery("");
+                  setFilters({ type: "all", category: "all" });
+                }
+              : undefined
+          }
+          search={
+            <SearchInput
               placeholder="Search servers by name..."
-              initialValue={searchQuery}
-              onChange={setSearchQuery}
-              className="pl-9"
-              autoFocus
+              value={searchQuery}
+              onSearchChange={setSearchQuery}
+              syncQueryParams={false}
+              className={filterSearchClass}
             />
-          </div>
-        </div>
-
-        <div className="min-w-0">
+          }
+        >
           <Select
             value={filters.type}
             onValueChange={(value) =>
               setFilters({ ...filters, type: value as ServerType })
             }
           >
-            <SelectTrigger className="w-full">
+            <SelectTrigger
+              size="sm"
+              aria-label="Filter by server type"
+              className={filterControlClass({
+                active: filters.type !== "all",
+              })}
+            >
               <SelectValue placeholder="All types" />
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All types</SelectItem>
               <SelectItem value="remote">Remote</SelectItem>
               <SelectItem value="local">Local</SelectItem>
+              <SelectItem value="mcp-apps-demo">MCP Apps Demo</SelectItem>
             </SelectContent>
           </Select>
-        </div>
-
-        <div className="min-w-0">
           <Select
             value={filters.category}
             onValueChange={(value) =>
               setFilters({ ...filters, category: value as SelectedCategory })
             }
           >
-            <SelectTrigger className="w-full">
+            <SelectTrigger
+              size="sm"
+              aria-label="Filter by category"
+              className={filterControlClass({
+                active: filters.category !== "all",
+              })}
+            >
               <SelectValue placeholder="All categories" />
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All categories</SelectItem>
-              {availableCategories.map((category) => (
+              {visibleCategories.map((category) => (
                 <SelectItem key={category} value={category}>
                   {category}
                 </SelectItem>
               ))}
             </SelectContent>
           </Select>
-        </div>
-      </div>
+        </FilterBar>
+      </CollectionFilters>
 
       {isLoading && (
-        <div className="grid gap-4 md:grid-cols-2">
+        <div className="grid gap-4 md:grid-cols-3">
           {Array.from(
             { length: 4 },
             (_, i) => `skeleton-${i}-${Date.now()}`,
@@ -222,16 +260,16 @@ export function ArchestraCatalogTab({
             </div>
           ) : (
             <>
-              <div className="grid gap-4 md:grid-cols-2 overflow-y-auto">
+              <div className="grid gap-4 md:grid-cols-3 overflow-y-auto">
                 {filteredServers.map((server) => (
                   <ServerCard
                     key={server.name}
                     server={server}
                     onSelectServer={handleSelectServer}
-                    onRequestInstallation={handleRequestInstallation}
-                    onOpenReadme={setReadmeServer}
                     isInCatalog={catalogServerNames.has(server.name)}
-                    userIsMcpServerAdmin={userIsMcpServerAdmin}
+                    userAllowedToCreateCatalogItem={
+                      userAllowedToCreateCatalogItem
+                    }
                   />
                 ))}
               </div>
@@ -247,10 +285,10 @@ export function ArchestraCatalogTab({
                     {isFetchingNextPage ? (
                       <>
                         <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                        Loading more...
+                        <span>Loading more...</span>
                       </>
                     ) : (
-                      "Load more"
+                      <span>Load more</span>
                     )}
                   </Button>
                 </div>
@@ -259,16 +297,6 @@ export function ArchestraCatalogTab({
           )}
         </>
       )}
-
-      <DetailsDialog
-        server={readmeServer}
-        onClose={() => setReadmeServer(null)}
-      />
-
-      <RequestInstallationDialog
-        server={requestServer}
-        onClose={() => setRequestServer(null)}
-      />
     </div>
   );
 }
@@ -277,128 +305,128 @@ export function ArchestraCatalogTab({
 function ServerCard({
   server,
   onSelectServer,
-  onRequestInstallation,
-  onOpenReadme,
   isInCatalog,
-  userIsMcpServerAdmin,
+  userAllowedToCreateCatalogItem,
 }: {
   server: archestraCatalogTypes.ArchestraMcpServerManifest;
   onSelectServer: (
     server: archestraCatalogTypes.ArchestraMcpServerManifest,
   ) => void;
-  onRequestInstallation: (
-    server: archestraCatalogTypes.ArchestraMcpServerManifest,
-  ) => void;
-  onOpenReadme: (
-    server: archestraCatalogTypes.ArchestraMcpServerManifest,
-  ) => void;
   isInCatalog: boolean;
-  userIsMcpServerAdmin: boolean;
+  userAllowedToCreateCatalogItem: boolean;
 }) {
-  return (
-    <Card className="flex flex-col">
-      <CardHeader>
-        <div className="flex items-start">
-          <div className="flex items-start gap-2 flex-1 min-w-0">
-            {server.icon && (
-              <img
-                src={server.icon}
-                alt={`${server.name} icon`}
-                className="w-8 h-8 rounded flex-shrink-0 mt-0.5"
-              />
-            )}
-            <CardTitle className="text-base">
-              <TruncatedText
-                message={server.display_name || server.name}
-                maxLength={40}
-              />
-            </CardTitle>
-          </div>
-          <div className="flex flex-wrap gap-1 items-center flex-shrink-0 mt-1">
-            {server.category && (
-              <Badge variant="outline" className="text-xs">
-                {server.category}
-              </Badge>
-            )}
-            {!server.oauth_config?.requires_proxy && (
-              <Badge variant="secondary" className="text-xs">
-                OAuth
-              </Badge>
-            )}
-          </div>
-        </div>
-        {server.display_name && server.display_name !== server.name && (
-          <p className="text-xs text-muted-foreground font-mono">
-            {server.name}
-          </p>
-        )}
-        <TransportBadges
-          isRemote={server.server.type === "remote"}
-          className="mt-1"
-        />
-      </CardHeader>
-      <CardContent className="flex-1 flex flex-col space-y-3">
-        {server.description && (
-          <p className="text-sm text-muted-foreground line-clamp-2">
-            {server.description}
-          </p>
-        )}
+  // Where the server comes from: hosted remote endpoint, or a GitHub-sourced
+  // server the org hosts itself. GitHub-sourced servers are community-built
+  // unless they live in the official modelcontextprotocol org.
+  const isOfficialSource = server.github_info?.owner === "modelcontextprotocol";
+  const sourceBadges =
+    server.server.type === "remote"
+      ? ["Remote"]
+      : server.github_info && !isOfficialSource
+        ? ["Self-hosted", "Community"]
+        : ["Self-hosted"];
+  const docsUrl = server.homepage || server.documentation;
 
-        <div className="flex flex-col gap-2 mt-auto pt-3 justify-end">
-          <div className="flex flex-wrap gap-2">
+  return (
+    <Card className="gap-2 rounded-xl p-4">
+      <div className="flex items-center gap-3">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border bg-muted/40">
+          {server.icon ? (
+            <img
+              src={server.icon}
+              alt={`${server.name} icon`}
+              className="h-6 w-6 rounded"
+            />
+          ) : (
+            <ServerIcon className="h-5 w-5 text-muted-foreground" />
+          )}
+        </div>
+        <div className="min-w-0 flex-1">
+          <span className="block truncate font-semibold">
+            <TruncatedText
+              message={server.display_name || server.name}
+              maxLength={40}
+            />
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center">
+          {docsUrl && (
             <Button
-              variant="outline"
-              size="sm"
-              onClick={() => onOpenReadme(server)}
-              className="flex-1"
+              variant="ghost"
+              size="icon-sm"
+              className="text-muted-foreground"
+              asChild
             >
-              <Info className="h-4 w-4 mr-1" />
-              Details
+              <a
+                href={docsUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="Docs"
+                aria-label={`Documentation for ${server.display_name || server.name} (opens in new tab)`}
+              >
+                <BookOpen className="h-4 w-4" />
+              </a>
             </Button>
-            {server.github_info?.url && (
-              <Button variant="outline" size="sm" asChild className="flex-1">
-                <a
-                  href={server.github_info.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <Github className="h-4 w-4 mr-1" />
-                  Code
-                </a>
-              </Button>
-            )}
-            {(server.homepage || server.documentation) && (
-              <Button variant="outline" size="sm" asChild className="flex-1">
-                <a
-                  href={server.homepage || server.documentation}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <BookOpen className="h-4 w-4 mr-1" />
-                  Docs
-                </a>
-              </Button>
-            )}
-          </div>
+          )}
+          {server.github_info?.url && (
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              className="text-muted-foreground"
+              asChild
+            >
+              <a
+                href={server.github_info.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="GitHub"
+                aria-label={`GitHub repository for ${server.display_name || server.name} (opens in new tab)`}
+              >
+                <Github className="h-4 w-4" />
+              </a>
+            </Button>
+          )}
           <Button
-            onClick={() =>
-              userIsMcpServerAdmin
-                ? onSelectServer(server)
-                : onRequestInstallation(server)
+            variant={isInCatalog ? "ghost" : "default"}
+            size="icon-sm"
+            disabled={isInCatalog || !userAllowedToCreateCatalogItem}
+            title={
+              isInCatalog
+                ? "Added"
+                : userAllowedToCreateCatalogItem
+                  ? "Use as template"
+                  : "Ask an administrator to add this server to the registry"
             }
-            disabled={isInCatalog}
-            size="sm"
-            className="w-full"
+            aria-label={
+              isInCatalog
+                ? `${server.display_name || server.name} already added`
+                : userAllowedToCreateCatalogItem
+                  ? `Use ${server.display_name || server.name} as template`
+                  : "Ask an administrator to add this server to the registry"
+            }
+            onClick={() => onSelectServer(server)}
             data-testid={E2eTestId.AddCatalogItemButton}
           >
-            {isInCatalog
-              ? "Added"
-              : userIsMcpServerAdmin
-                ? "Use as Template"
-                : "Request to add to internal registry"}
+            {isInCatalog ? (
+              <Check className="h-4 w-4 text-muted-foreground" />
+            ) : (
+              <Plus className="h-4 w-4" />
+            )}
           </Button>
         </div>
-      </CardContent>
+      </div>
+      <div className="flex flex-wrap gap-1">
+        {sourceBadges.map((badge) => (
+          <Badge key={badge} variant="secondary" className="text-xs">
+            {badge}
+          </Badge>
+        ))}
+      </div>
+      {server.description && (
+        <p className="text-sm text-muted-foreground line-clamp-2">
+          {server.description}
+        </p>
+      )}
     </Card>
   );
 }

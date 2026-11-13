@@ -1,40 +1,124 @@
 {
   "$schema": "https://turbo.build/schema.json",
-  "globalEnv": ["ARCHESTRA_*", "NEXT_PUBLIC_ARCHESTRA_*", "CODEGEN"],
+  "globalEnv": ["ARCHESTRA_*", "NEXT_PUBLIC_ARCHESTRA_*", "CODEGEN", "NODE_OPTIONS"],
+  "globalPassThroughEnv": ["TMPDIR", "GOMEMLIMIT", "GOMAXPROCS", "CARGO_BUILD_JOBS", "RAYON_NUM_THREADS", "CIRCLE_NODE_TOTAL"],
   "globalDependencies": [".env", "pnpm-workspace.yaml"],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
-      "outputs": [".next/**", "!.next/cache/**", "dist/**"]
+      "outputs": [".next/**", "!.next/cache/**", "dist/**", "*.node"],
+      "env": ["VERSION"]
+    },
+    "@archestra/app-runtime-rs#build": {
+      "dependsOn": ["^build"],
+      "cache": false
+    },
+    "@archestra/sandbox-rs#build": {
+      "dependsOn": ["^build"],
+      "cache": false
+    },
+    "@archestra/image-rs#build": {
+      "dependsOn": ["^build"],
+      "cache": false
+    },
+    "@archestra/openappa-rs#build": {
+      "dependsOn": ["^build"],
+      "cache": false
+    },
+    "@archestra/router-rs#build": {
+      "dependsOn": ["^build"],
+      "cache": false
     },
     "dev": {
       "persistent": true,
-      "cache": false
+      "cache": false,
+      "passThroughEnv": ["PORT"]
     },
     "start": {
       "persistent": true,
       "cache": false
     },
     "lint": {
-      "inputs": ["$TURBO_DEFAULT$", "**/*.tsx", "**/*.ts", "./biome.json"]
+      "inputs": ["$TURBO_DEFAULT$", "**/*.tsx", "**/*.ts", "./biome.json", "!**/.tsbuild/**"]
     },
     "lint:fix": {
-      "inputs": ["$TURBO_DEFAULT$", "**/*.tsx", "**/*.ts", "./biome.json"]
+      "inputs": ["$TURBO_DEFAULT$", "**/*.tsx", "**/*.ts", "./biome.json", "!**/.tsbuild/**"]
     },
     "lint:fix:unsafe": {
-      "inputs": ["$TURBO_DEFAULT$", "**/*.tsx", "**/*.ts", "./biome.json"]
+      "inputs": ["$TURBO_DEFAULT$", "**/*.tsx", "**/*.ts", "./biome.json", "!**/.tsbuild/**"]
     },
     "check:ci": {
-      "inputs": ["$TURBO_DEFAULT$", "**/*.tsx", "**/*.ts", "./biome.json", "**/knip.config.ts", "**/package.json"]
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "**/*.tsx",
+        "**/*.ts",
+        "!**/.tsbuild/**",
+        "./biome.json",
+        "**/knip.config.ts",
+        "**/package.json",
+        "src/database/migrations/**",
+        "$TURBO_ROOT$/scripts/check-workspace.mjs",
+        "$TURBO_ROOT$/scripts/check-workspace.ts",
+        "$TURBO_ROOT$/scripts/check-sequence.ts",
+        "$TURBO_ROOT$/scripts/commit-scope.ts",
+        "$TURBO_ROOT$/scripts/type-check.ts",
+        "$TURBO_ROOT$/scripts/type-check-solution.ts",
+        "$TURBO_ROOT$/scripts/backend-types-prebuilt.mjs",
+        "$TURBO_ROOT$/scripts/backend-types-prebuilt.test.mjs",
+        "$TURBO_ROOT$/scripts/heavy-lane.ts",
+        "$TURBO_ROOT$/vitest.resources.ts",
+        "$TURBO_ROOT$/tools/drizzle-migration-linter/src/**",
+        "$TURBO_ROOT$/tools/drizzle-migration-linter/tsconfig*.json",
+        "$TURBO_ROOT$/tools/drizzle-migration-linter/package.json",
+        "$TURBO_ROOT$/archestra-rs/*/index.d.ts"
+      ],
+      "dependsOn": ["^type-check"]
     },
     "check:commit": {
-      "inputs": ["$TURBO_DEFAULT$", "**/*.tsx", "**/*.ts", "./biome.json", "**/knip.config.ts", "**/package.json"]
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "**/*.tsx",
+        "**/*.ts",
+        "!**/.tsbuild/**",
+        "./biome.json",
+        "**/knip.config.ts",
+        "**/package.json",
+        "src/database/migrations/**",
+        "$TURBO_ROOT$/scripts/check-workspace.mjs",
+        "$TURBO_ROOT$/scripts/check-workspace.ts",
+        "$TURBO_ROOT$/scripts/check-sequence.ts",
+        "$TURBO_ROOT$/scripts/commit-scope.ts",
+        "$TURBO_ROOT$/scripts/type-check.ts",
+        "$TURBO_ROOT$/scripts/type-check-solution.ts",
+        "$TURBO_ROOT$/scripts/backend-types-prebuilt.mjs",
+        "$TURBO_ROOT$/scripts/backend-types-prebuilt.test.mjs",
+        "$TURBO_ROOT$/scripts/heavy-lane.ts",
+        "$TURBO_ROOT$/vitest.resources.ts",
+        "$TURBO_ROOT$/tools/drizzle-migration-linter/src/**",
+        "$TURBO_ROOT$/tools/drizzle-migration-linter/tsconfig*.json",
+        "$TURBO_ROOT$/tools/drizzle-migration-linter/package.json",
+        "$TURBO_ROOT$/archestra-rs/*/index.d.ts"
+      ],
+      "dependsOn": ["^type-check"]
     },
     "knip": {
-      "inputs": ["$TURBO_DEFAULT$", "**/*.tsx", "**/*.ts", "**/knip.config.ts", "**/package.json"]
+      "inputs": ["$TURBO_DEFAULT$", "**/*.tsx", "**/*.ts", "**/knip.config.ts", "**/package.json", "!**/.tsbuild/**"]
     },
     "type-check": {
-      "inputs": ["$TURBO_DEFAULT$", "**/*.tsx", "**/*.ts"]
+      "dependsOn": ["^type-check"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "!**/.tsbuild/**",
+        "$TURBO_ROOT$/scripts/type-check.ts",
+        "$TURBO_ROOT$/scripts/type-check-solution.ts",
+        "$TURBO_ROOT$/scripts/backend-types-prebuilt.mjs",
+        "$TURBO_ROOT$/scripts/heavy-lane.ts",
+        "$TURBO_ROOT$/vitest.resources.ts",
+        "$TURBO_ROOT$/tools/drizzle-migration-linter/src/**",
+        "$TURBO_ROOT$/tools/drizzle-migration-linter/tsconfig*.json",
+        "$TURBO_ROOT$/tools/drizzle-migration-linter/package.json",
+        "$TURBO_ROOT$/archestra-rs/*/index.d.ts"
+      ]
     },
     "test": {
       "cache": false
@@ -44,27 +128,55 @@
       "passThroughEnv": [
         "CI",
         "PLAYWRIGHT_BROWSERS_PATH",
+        "PLAYWRIGHT_BLOB_OUTPUT_DIR",
+        "PLAYWRIGHT_BLOB_OUTPUT_NAME",
+        "E2E_CHROMIUM_SHARD",
         "E2E_UI_BASE_URL",
         "E2E_API_BASE_URL",
-        "E2E_WIREMOCK_BASE_URL"
+        "E2E_WIREMOCK_BASE_URL",
+        "E2E_WIREMOCK_INTERNAL_URL",
+        "E2E_KEYCLOAK_BACKEND_URL",
+        "E2E_HIBERNATION_TIMING_PROFILE",
+        "KUBECONFIG"
       ]
     },
     "test:e2e:ui": {
       "cache": false
     },
+    "test:integration": {
+      "cache": false,
+      "passThroughEnv": ["CI", "PLAYWRIGHT_BROWSERS_PATH"]
+    },
+    "test:integration:ui": {
+      "cache": false,
+      "persistent": true
+    },
     "codegen": {
       "cache": false
     },
-    "@shared#codegen": {
+    "@archestra/shared#codegen": {
       "dependsOn": ["@backend#codegen"],
       "cache": false
+    },
+    "@archestra/shared#check:ci": {
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "**/*.tsx",
+        "**/*.ts",
+        "./biome.json",
+        "**/knip.config.ts",
+        "**/package.json",
+        "$TURBO_ROOT$/backend/src/**",
+        "$TURBO_ROOT$/frontend/**"
+      ]
     },
     "db:generate": {
       "cache": false,
       "persistent": true
     },
     "db:migrate": {
-      "inputs": ["backend/src/database/**/*.ts"]
+      "cache": false,
+      "passThroughEnv": ["DATABASE_URL"]
     },
     "db:studio": {
       "persistent": true,

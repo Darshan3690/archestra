@@ -1,0 +1,795 @@
+import { isClaudeCodeRuntimeCommand } from "@archestra/shared";
+import { userHasPermission } from "@/auth";
+import { isServiceAccountUserId } from "@/auth/service-account-user-id";
+import logger from "@/logging";
+import { AgentModel, SecretModel, UserCredentialModel } from "@/models";
+import { secretManager } from "@/secrets-manager";
+import {
+  deleteRuntimeCredentialConnection,
+  setRuntimeCredentialConnection,
+} from "@/services/agent-runtime/runtime-credentials";
+import { CredentialAccess } from "@/services/credential-access";
+import { CredentialResolutionBatch } from "@/services/credentials";
+import type {
+  AgentRuntime,
+  AgentRuntimeCredentialDeclaration,
+  MissingAgentRuntimeCredential,
+  ResolvedAgentRuntime,
+} from "@/types";
+import { AgentRuntimeCredentialDeclarationSchema, ApiError } from "@/types";
+import type { RenewableCredential } from "@/types/renewable-credential";
+
+/**
+ * Outcome of resolving one Agent Runtime run's declared credentials for one user.
+ *
+ * `missing` and `misconfigured` are deliberately separate: the first lists
+ * personal credentials the invoking user can supply themselves (and is what
+ * the "connect your credentials" prompt is built from), the second lists
+ * shared credentials only an administrator can fix. Collapsing them would ask
+ * a user to provide something they have no way to provide.
+ */
+type AgentRuntimeCredentialResolution = {
+  env: Record<string, string>;
+  renewableCredentials: Record<string, RenewableCredential>;
+  missing: MissingAgentRuntimeCredential[];
+  misconfigured: MissingAgentRuntimeCredential[];
+};
+
+/**
+ * Resolve every credential an Agent Runtime run declares into environment variables for a
+ * Agent Runtime run started by `userId`, reporting anything absent instead of injecting a
+ * blank value — an agent handed an empty token fails far from the cause.
+ */
+export async function resolveAgentRuntimeCredentials(params: {
+  runtime: Pick<ResolvedAgentRuntime, "agentId" | "credentials" | "secretId"> &
+    Partial<
+      Pick<
+        ResolvedAgentRuntime,
+        "command" | "allowAgentSuppliedCredentialValues"
+      >
+    >;
+  organizationId: string;
+  userId: string | null;
+  authorizationUserId?: string | null;
+  ephemeralCredentials?: Record<string, string>;
+}): Promise<AgentRuntimeCredentialResolution> {
+  const { shared, perUser } = splitDeclarations(applicableCredentials(params));
+  const effectiveEphemeral =
+    params.runtime.allowAgentSuppliedCredentialValues !== false
+      ? params.ephemeralCredentials
+      : undefined;
+  await requireSharedCredentialAccess({
+    shared,
+    organizationId: params.organizationId,
+    userId:
+      params.authorizationUserId === undefined
+        ? params.userId
+        : params.authorizationUserId,
+  });
+  const batch = await CredentialResolutionBatch.create({
+    organizationId: params.organizationId,
+    credentialIds: [...shared, ...(params.userId ? perUser : [])].flatMap(
+      (entry) => (entry.credentialId ? [entry.credentialId] : []),
+    ),
+  });
+  const env: Record<string, string> = {};
+  const renewableCredentials: Record<string, RenewableCredential> = {};
+  const missing: MissingAgentRuntimeCredential[] = [];
+  const misconfigured: MissingAgentRuntimeCredential[] = [];
+
+  if (shared.length > 0) {
+    const bag = await readSharedBag(params.runtime.secretId);
+    for (const declaration of shared) {
+      const credential = declaration.credentialId
+        ? await batch.resolve({
+            organizationId: params.organizationId,
+            scope: "organization",
+            credentialId: declaration.credentialId,
+            minimumValidityMs: 50 * 60_000,
+          })
+        : null;
+      const value = declaration.credentialId
+        ? credential?.value
+        : bag[declaration.key];
+      if (credential?.expiresAt && declaration.credentialId) {
+        renewableCredentials[declaration.key] = {
+          credentialId: declaration.credentialId,
+          value: credential.value,
+          expiresAt: credential.expiresAt,
+        };
+      }
+      if (typeof value === "string" && value.length > 0) {
+        env[declaration.key] = value;
+      } else if (declaration.required) {
+        misconfigured.push(toMissing(declaration));
+      }
+    }
+  }
+
+  if (perUser.length > 0) {
+    if (!params.userId) {
+      for (const entry of perUser) {
+        const ephemeralValue = effectiveEphemeral?.[entry.key];
+        if (typeof ephemeralValue === "string" && ephemeralValue.length > 0) {
+          env[entry.key] = ephemeralValue;
+        } else if (entry.required) {
+          missing.push(toMissing(entry));
+        }
+      }
+      if (effectiveEphemeral) {
+        const sharedKeys = new Set(shared.map((d) => d.key));
+        for (const [key, value] of Object.entries(effectiveEphemeral)) {
+          if (
+            typeof value === "string" &&
+            value.length > 0 &&
+            !sharedKeys.has(key)
+          ) {
+            env[key] = value;
+          }
+        }
+      }
+      return {
+        env,
+        renewableCredentials,
+        missing,
+        misconfigured,
+      };
+    }
+    const legacyDeclarations = perUser.filter(
+      (declaration) => !declaration.credentialId,
+    );
+    const resolved = await UserCredentialModel.resolveValues({
+      organizationId: params.organizationId,
+      userId: params.userId,
+      agentId: params.runtime.agentId,
+      keys: legacyDeclarations.map((declaration) => declaration.key),
+    });
+    Object.assign(env, resolved.values);
+    for (const declaration of perUser) {
+      const ephemeralValue = effectiveEphemeral?.[declaration.key];
+      if (typeof ephemeralValue === "string" && ephemeralValue.length > 0) {
+        env[declaration.key] = ephemeralValue;
+        continue;
+      }
+      const credential = declaration.credentialId
+        ? await batch.resolve({
+            organizationId: params.organizationId,
+            scope: "personal",
+            userId: params.userId,
+            credentialId: declaration.credentialId,
+            minimumValidityMs: 50 * 60_000,
+          })
+        : null;
+      const value = declaration.credentialId
+        ? credential?.value
+        : resolved.values[declaration.key];
+      if (credential?.expiresAt && declaration.credentialId) {
+        renewableCredentials[declaration.key] = {
+          credentialId: declaration.credentialId,
+          scope: "personal",
+          value: credential.value,
+          expiresAt: credential.expiresAt,
+        };
+      }
+      if (value) {
+        env[declaration.key] = value;
+      } else if (declaration.required) {
+        missing.push(toMissing(declaration));
+      }
+    }
+  }
+
+  if (effectiveEphemeral) {
+    const sharedKeys = new Set(shared.map((d) => d.key));
+    for (const [key, value] of Object.entries(effectiveEphemeral)) {
+      if (
+        typeof value === "string" &&
+        value.length > 0 &&
+        !sharedKeys.has(key)
+      ) {
+        env[key] = value;
+      }
+    }
+  }
+
+  return { env, renewableCredentials, missing, misconfigured };
+}
+
+/**
+ * Check credential availability before launch without returning secret values
+ * to the UI. Saved GitHub Apps also validate the installation-token exchange.
+ */
+export async function preflightAgentRuntimeCredentials(params: {
+  runtime: Pick<ResolvedAgentRuntime, "agentId" | "credentials" | "secretId"> &
+    Partial<
+      Pick<
+        ResolvedAgentRuntime,
+        "command" | "allowAgentSuppliedCredentialValues"
+      >
+    >;
+  organizationId: string;
+  userId: string | null;
+  authorizationUserId?: string | null;
+  ephemeralCredentials?: Record<string, string>;
+  /**
+   * Report organization credentials the caller may not run with as `missing`
+   * entries marked `adminOnly`, instead of refusing the whole check. For the
+   * read-only setup check a person sees; a launch leaves this off and still
+   * refuses.
+   */
+  reportAdminOnlyCredentials?: boolean;
+}): Promise<{
+  configured: string[];
+  missing: MissingAgentRuntimeCredential[];
+  misconfigured: MissingAgentRuntimeCredential[];
+}> {
+  const declarations = splitDeclarations(applicableCredentials(params));
+  const { perUser } = declarations;
+  let { shared } = declarations;
+  const effectiveEphemeral =
+    params.runtime.allowAgentSuppliedCredentialValues !== false
+      ? params.ephemeralCredentials
+      : undefined;
+  const adminOnly: MissingAgentRuntimeCredential[] = [];
+  try {
+    await requireSharedCredentialAccess({
+      shared,
+      organizationId: params.organizationId,
+      userId:
+        params.authorizationUserId === undefined
+          ? params.userId
+          : params.authorizationUserId,
+    });
+  } catch (error) {
+    if (
+      !params.reportAdminOnlyCredentials ||
+      !(error instanceof SharedCredentialAccessDeniedError)
+    ) {
+      throw error;
+    }
+    // Never resolve these for this caller: reading the organization value is
+    // exactly what they may not do. Only saved credentials (with a
+    // credentialId) are gated, as at launch; a shared value without one still
+    // resolves below.
+    for (const declaration of shared) {
+      if (declaration.credentialId) {
+        adminOnly.push({
+          ...toMissing(declaration),
+          canConnect: false,
+          adminOnly: true,
+        });
+      }
+    }
+    shared = shared.filter((declaration) => !declaration.credentialId);
+  }
+  const batch = await CredentialResolutionBatch.create({
+    organizationId: params.organizationId,
+    credentialIds: [...shared, ...(params.userId ? perUser : [])].flatMap(
+      (entry) => (entry.credentialId ? [entry.credentialId] : []),
+    ),
+  });
+  const configured: string[] = [];
+  const missing: MissingAgentRuntimeCredential[] = [];
+  const misconfigured: MissingAgentRuntimeCredential[] = [];
+
+  if (shared.length > 0) {
+    const bag = await readSharedBag(params.runtime.secretId);
+    for (const declaration of shared) {
+      const value = declaration.credentialId
+        ? (
+            await batch.resolve({
+              organizationId: params.organizationId,
+              scope: "organization",
+              credentialId: declaration.credentialId,
+            })
+          )?.value
+        : bag[declaration.key];
+      if (typeof value === "string" && value.length > 0) {
+        configured.push(declaration.key);
+      } else if (declaration.required) {
+        misconfigured.push(toMissing(declaration));
+      }
+    }
+  }
+
+  if (perUser.length > 0) {
+    if (!params.userId) {
+      for (const entry of perUser) {
+        const ephemeralValue = effectiveEphemeral?.[entry.key];
+        if (typeof ephemeralValue === "string" && ephemeralValue.length > 0) {
+          configured.push(entry.key);
+        } else if (entry.required) {
+          missing.push(toMissing(entry));
+        }
+      }
+      return { configured, missing, misconfigured };
+    }
+    const legacyDeclarations = perUser.filter(
+      (declaration) => !declaration.credentialId,
+    );
+    const present = await UserCredentialModel.listPresentKeys({
+      organizationId: params.organizationId,
+      userId: params.userId,
+      agentId: params.runtime.agentId,
+      keys: legacyDeclarations.map((declaration) => declaration.key),
+    });
+    for (const declaration of perUser) {
+      const hasEphemeral =
+        typeof effectiveEphemeral?.[declaration.key] === "string" &&
+        effectiveEphemeral[declaration.key].length > 0;
+      const connected =
+        hasEphemeral ||
+        (declaration.credentialId
+          ? Boolean(
+              (
+                await batch.resolve({
+                  organizationId: params.organizationId,
+                  scope: "personal",
+                  userId: params.userId,
+                  credentialId: declaration.credentialId,
+                })
+              )?.value,
+            )
+          : present.has(declaration.key));
+      if (connected) {
+        configured.push(declaration.key);
+      } else if (declaration.required) {
+        missing.push(toMissing(declaration));
+      }
+    }
+    const usable = await CredentialAccess.usableKeys({
+      organizationId: params.organizationId,
+      userId: params.userId,
+      keys: missing.flatMap((entry) =>
+        entry.credentialId ? [entry.credentialId] : [],
+      ),
+    });
+    for (const entry of missing)
+      if (entry.credentialId) entry.canConnect = usable.has(entry.credentialId);
+  }
+
+  return { configured, missing: [...adminOnly, ...missing], misconfigured };
+}
+
+async function requireSharedCredentialAccess(params: {
+  shared: AgentRuntimeCredentialDeclaration[];
+  organizationId: string;
+  userId: string | null;
+}): Promise<void> {
+  if (
+    !params.userId ||
+    !params.shared.some((declaration) => declaration.credentialId)
+  ) {
+    return;
+  }
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  if (isServiceAccountUserId(params.userId)) {
+    for (const declaration of params.shared) {
+      if (!declaration.credentialId) continue;
+      await CredentialAccess.requireUseOfKey({
+        organizationId: params.organizationId,
+        userId: params.userId,
+        key: declaration.credentialId,
+        message: "Service account cannot use this shared credential.",
+      });
+    }
+    return;
+  }
+  // SPDX-SnippetEnd
+  const permitted = await userHasPermission(
+    params.userId,
+    params.organizationId,
+    "organizationSettings",
+    "update",
+  );
+  if (!permitted) {
+    throw new SharedCredentialAccessDeniedError();
+  }
+}
+
+/** A person without organization settings access tried to run with an organization credential. */
+class SharedCredentialAccessDeniedError extends ApiError {
+  constructor() {
+    super(
+      403,
+      "Only admins can run this agent, because it uses an organization credential. Ask an admin to run it for you.",
+    );
+    this.name = "SharedCredentialAccessDeniedError";
+  }
+}
+
+/**
+ * Store one credential personally for the calling user, declaring it on the Agent
+ * first when the key is new.
+ *
+ * This is the path a connected client uses during a handoff, so it is deliberately
+ * narrower than `setAgentRuntimeCredential`: it never writes an organization value.
+ * A key already declared `shared` is refused rather than silently widened — that
+ * declaration hands the value to every user's runs of the Agent, which is an
+ * administrator's decision to make in Settings, not a side effect of a tool call.
+ */
+export async function transferPersonalRuntimeCredential(params: {
+  runtime: ResolvedAgentRuntime;
+  organizationId: string;
+  userId: string;
+  key: string;
+  value: string;
+  label?: string;
+}): Promise<{ declarationCreated: boolean }> {
+  const { runtime, declarationCreated } =
+    await declarePersonalRuntimeCredential({
+      runtime: params.runtime,
+      key: params.key,
+      label: params.label,
+    });
+
+  await setAgentRuntimeCredential({
+    runtime,
+    organizationId: params.organizationId,
+    userId: params.userId,
+    key: params.key,
+    value: params.value,
+  });
+
+  return { declarationCreated };
+}
+
+/**
+ * Validate that a personal credential value can be supplied ephemerally for an
+ * Agent Runtime run without mutating the Agent's declarations or persisting the
+ * value in `user_credentials`.
+ */
+export async function validateEphemeralRuntimeCredential(params: {
+  runtime: ResolvedAgentRuntime;
+  organizationId: string;
+  userId: string;
+  key: string;
+  label?: string;
+}): Promise<void> {
+  if (params.key === "CLAUDE_CODE_OAUTH_TOKEN") {
+    throw new ApiError(
+      400,
+      "Use the native Claude Code sign-in instead of storing a subscription token.",
+    );
+  }
+  const existing = params.runtime.credentials?.find(
+    (entry) => entry.key === params.key,
+  );
+  if (existing?.scope === "shared") {
+    throw new ApiError(
+      400,
+      `"${params.key}" is declared as a shared credential on this Agent. A shared value applies to every user's runs, so it is set in Settings rather than transferred from a client.`,
+    );
+  }
+  if (!existing) {
+    AgentRuntimeCredentialDeclarationSchema.parse({
+      key: params.key,
+      scope: "per_user",
+      label: params.label?.trim() || params.key,
+      required: false,
+    });
+  } else if (existing.credentialId) {
+    await CredentialAccess.requireOnKey({
+      organizationId: params.organizationId,
+      userId: params.userId,
+      key: existing.credentialId,
+      action: "use",
+      message: `You don't have access to the "${existing.label}" credential. Ask an admin to share it with you.`,
+    });
+  }
+}
+
+/**
+ * Declare one personal credential on an Agent Runtime without storing a value.
+ *
+ * This is the half of `transferPersonalRuntimeCredential` that carries no secret,
+ * so a client can name a credential the Agent needs and leave the value to the
+ * person. The declaration is deliberately `required: false`: a required one
+ * blocks every user's runs until each connects a value, which is too much power
+ * for a caller holding only `credential:create`.
+ *
+ * Returns the runtime including the new declaration, so a caller that goes on to
+ * store a value does not re-read it.
+ */
+export async function declarePersonalRuntimeCredential(params: {
+  runtime: ResolvedAgentRuntime;
+  key: string;
+  label?: string;
+}): Promise<{ runtime: ResolvedAgentRuntime; declarationCreated: boolean }> {
+  const existing = params.runtime.credentials?.find(
+    (entry) => entry.key === params.key,
+  );
+
+  if (existing?.scope === "shared") {
+    throw new ApiError(
+      400,
+      `"${params.key}" is declared as a shared credential on this Agent. A shared value applies to every user's runs, so it is set in Settings rather than transferred from a client.`,
+    );
+  }
+
+  if (existing) {
+    return { runtime: params.runtime, declarationCreated: false };
+  }
+
+  const declaration = AgentRuntimeCredentialDeclarationSchema.parse({
+    key: params.key,
+    scope: "per_user",
+    label: params.label?.trim() || params.key,
+    required: false,
+  });
+  const credentials = [...(params.runtime.credentials ?? []), declaration];
+  // Persist the declaration before the value: `setAgentRuntimeCredential`
+  // refuses an undeclared key, and a stored value under a key the Agent does
+  // not declare would never be injected anyway.
+  await AgentModel.update(params.runtime.agentId, {
+    runtime: {
+      ...stripResolvedFields(params.runtime),
+      credentials,
+    },
+  });
+
+  return {
+    runtime: { ...params.runtime, credentials },
+    declarationCreated: true,
+  };
+}
+
+export async function setAgentRuntimeCredential(params: {
+  runtime: ResolvedAgentRuntime;
+  organizationId: string;
+  userId: string;
+  key: string;
+  value: string;
+}): Promise<{ scope: AgentRuntimeCredentialDeclaration["scope"] }> {
+  if (params.key === "CLAUDE_CODE_OAUTH_TOKEN") {
+    throw new ApiError(
+      400,
+      "Use the native Claude Code sign-in instead of storing a subscription token.",
+    );
+  }
+  const declaration = requireDeclaration(params.runtime, params.key);
+
+  // A value stored here is a value of the saved credential, so it takes the
+  // same grant the Credentials page asks for: `use` to add your own,
+  // `update` to set the organization's.
+  if (declaration.credentialId)
+    await CredentialAccess.requireOnKey({
+      organizationId: params.organizationId,
+      userId: params.userId,
+      key: declaration.credentialId,
+      action: declaration.scope === "per_user" ? "use" : "update",
+      message: `You don't have access to the "${declaration.label}" credential. Ask an admin to share it with you.`,
+    });
+
+  if (declaration.scope === "per_user") {
+    if (declaration.credentialId) {
+      await setRuntimeCredentialConnection({
+        organizationId: params.organizationId,
+        scope: "personal",
+        userId: params.userId,
+        credentialId: declaration.credentialId,
+        value: params.value,
+      });
+    } else {
+      await UserCredentialModel.upsert({
+        organizationId: params.organizationId,
+        userId: params.userId,
+        agentId: params.runtime.agentId,
+        key: declaration.key,
+        value: params.value,
+      });
+    }
+  } else {
+    if (declaration.credentialId) {
+      await setRuntimeCredentialConnection({
+        organizationId: params.organizationId,
+        scope: "organization",
+        userId: params.userId,
+        credentialId: declaration.credentialId,
+        value: params.value,
+      });
+    } else {
+      await replaceSharedBag({
+        runtime: params.runtime,
+        patch: { [declaration.key]: params.value },
+      });
+    }
+  }
+
+  return { scope: declaration.scope };
+}
+
+/** Remove only this Agent Runtime run's value; declarations remain part of its config. */
+export async function deleteAgentRuntimeCredential(params: {
+  runtime: ResolvedAgentRuntime;
+  organizationId: string;
+  userId: string;
+  key: string;
+}): Promise<{
+  deleted: boolean;
+  scope: AgentRuntimeCredentialDeclaration["scope"];
+}> {
+  const declaration = requireDeclaration(params.runtime, params.key);
+  if (declaration.credentialId) {
+    return {
+      scope: declaration.scope,
+      deleted: await deleteRuntimeCredentialConnection({
+        organizationId: params.organizationId,
+        scope: declaration.scope === "per_user" ? "personal" : "organization",
+        userId: params.userId,
+        credentialId: declaration.credentialId,
+      }),
+    };
+  }
+  if (declaration.scope === "per_user") {
+    return {
+      scope: declaration.scope,
+      deleted: await UserCredentialModel.delete({
+        organizationId: params.organizationId,
+        userId: params.userId,
+        agentId: params.runtime.agentId,
+        key: declaration.key,
+      }),
+    };
+  }
+
+  const bag = await readRawSharedBag(params.runtime.secretId);
+  if (!(declaration.key in bag)) {
+    return { scope: declaration.scope, deleted: false };
+  }
+  const { [declaration.key]: _removed, ...remaining } = bag;
+  await replaceSharedBag({ runtime: params.runtime, values: remaining });
+  return { scope: declaration.scope, deleted: true };
+}
+
+// ===================== internals =====================
+
+function splitDeclarations(
+  declarations: AgentRuntimeCredentialDeclaration[] | null | undefined,
+): {
+  shared: AgentRuntimeCredentialDeclaration[];
+  perUser: AgentRuntimeCredentialDeclaration[];
+} {
+  const shared: AgentRuntimeCredentialDeclaration[] = [];
+  const perUser: AgentRuntimeCredentialDeclaration[] = [];
+  for (const declaration of declarations ?? []) {
+    if (declaration.scope === "per_user") {
+      perUser.push(declaration);
+    } else {
+      shared.push(declaration);
+    }
+  }
+  return { shared, perUser };
+}
+
+function requireDeclaration(
+  runtime: Pick<ResolvedAgentRuntime, "credentials">,
+  key: string,
+): AgentRuntimeCredentialDeclaration {
+  const declaration = runtime.credentials?.find((entry) => entry.key === key);
+  if (!declaration) {
+    throw new ApiError(
+      404,
+      "Credential is not declared by this Agent's Agent Runtime configuration",
+    );
+  }
+  return declaration;
+}
+
+async function replaceSharedBag(params: {
+  runtime: ResolvedAgentRuntime;
+  patch?: Record<string, string>;
+  values?: Record<string, unknown>;
+}): Promise<void> {
+  const previousId = params.runtime.secretId;
+  const previous = params.values ?? (await readRawSharedBag(previousId));
+  const next = { ...previous, ...params.patch };
+  if (Object.keys(next).length === 0) {
+    const updated = await AgentModel.setAgentRuntimeSecretId({
+      id: params.runtime.agentId,
+      secretId: null,
+    });
+    if (!updated) {
+      throw new ApiError(
+        500,
+        "Agent disappeared while clearing runtime credentials",
+      );
+    }
+    if (previousId) await deleteSecretQuietly(previousId);
+    return;
+  }
+  const created = await secretManager().createSecret(
+    next,
+    `agent-${params.runtime.agentId}-runtime-credentials`,
+  );
+  try {
+    const updated = await AgentModel.setAgentRuntimeSecretId({
+      id: params.runtime.agentId,
+      secretId: created.id,
+    });
+    if (!updated) {
+      throw new ApiError(
+        500,
+        "Agent disappeared while updating runtime credentials",
+      );
+    }
+  } catch (error) {
+    await deleteSecretQuietly(created.id);
+    throw error;
+  }
+  if (previousId) await deleteSecretQuietly(previousId);
+}
+
+async function readRawSharedBag(
+  secretId: string | null,
+): Promise<Record<string, unknown>> {
+  if (!secretId) return {};
+  const secret = await SecretModel.findById(secretId);
+  return secret?.secret ?? {};
+}
+
+async function readSharedBag(
+  secretId: string | null,
+): Promise<Record<string, unknown>> {
+  if (!secretId) {
+    return {};
+  }
+  const secret = await secretManager().getSecret(secretId);
+  if (!secret) {
+    // The bag was deleted out from under the Agent. Reported per-key as
+    // misconfigured by the callers above rather than thrown here, so the
+    // response can name every credential an administrator has to restore.
+    logger.warn(
+      { secretId },
+      "Agent Runtime credential bag is missing from the secrets manager",
+    );
+    return {};
+  }
+  return secret.secret ?? {};
+}
+
+function toMissing(
+  declaration: AgentRuntimeCredentialDeclaration,
+): MissingAgentRuntimeCredential {
+  return {
+    key: declaration.key,
+    credentialId: declaration.credentialId,
+    label: declaration.label,
+    description: declaration.description,
+  };
+}
+
+async function deleteSecretQuietly(secretId: string): Promise<void> {
+  try {
+    await secretManager().deleteSecret(secretId);
+  } catch (error) {
+    logger.warn(
+      { error, secretId },
+      "Failed to delete replaced Agent Runtime credential secret",
+    );
+  }
+}
+
+/** `ResolvedAgentRuntime` carries server-only associations the column does not. */
+function stripResolvedFields(runtime: ResolvedAgentRuntime): AgentRuntime {
+  const { agentId, organizationId, environmentId, secretId, ...stored } =
+    runtime;
+  return stored;
+}
+
+// Claude Code owns subscription authentication. Legacy pasted tokens must not
+// block native sign-in or override the selected provider's billing.
+function applicableCredentials(params: {
+  runtime: Pick<ResolvedAgentRuntime, "agentId" | "credentials"> &
+    Partial<Pick<ResolvedAgentRuntime, "command">>;
+  organizationId: string;
+  userId: string | null;
+}) {
+  return isClaudeCodeRuntimeCommand(params.runtime.command?.[0])
+    ? params.runtime.credentials?.filter(
+        ({ key }) => key !== "CLAUDE_CODE_OAUTH_TOKEN",
+      )
+    : params.runtime.credentials;
+}

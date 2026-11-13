@@ -1,0 +1,215 @@
+import { vi } from "vitest";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import {
+  EnvironmentResourceDefaultModel,
+  KnowledgeBaseConnectorModel,
+} from "@/models";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import {
+  createRestrictedEnvironment,
+  grantEnvironmentUse,
+} from "@/test/environments";
+import type { User } from "@/types";
+
+// The connector write paths gate environment assignment exactly like the agent
+// and MCP-catalog paths: assigning a *restricted* environment requires
+// knowledgeSource:deploy-to-restricted. The gate computes
+// canDeployToRestricted from `userHasPermission`, so we override only that
+// export (permission-aware) and leave the rest of @/auth/utils intact.
+vi.mock("@/auth/utils");
+
+import { userHasPermission } from "@/auth/utils";
+import { createEnvironment } from "@/services/environments/environment";
+
+const mockUserHasPermission = vi.mocked(userHasPermission);
+
+describe("Knowledge connector - restricted environment assignment guard", () => {
+  let app: FastifyInstanceWithZod;
+  let user: User;
+  let organizationId: string;
+  // Toggles the answer to the knowledgeSource:deploy-to-restricted probe.
+  let canDeployToRestricted: boolean;
+
+  beforeEach(async ({ makeOrganization, makeUser, makeMember }) => {
+    canDeployToRestricted = false;
+    // Only the environment-gate probes vary per test; everything else
+    // (knowledge source access, etc.) is granted so the suite isolates the
+    // environment gate.
+    mockUserHasPermission.mockImplementation(
+      async (
+        _userId: string,
+        _organizationId: string,
+        _resource: string,
+        action: string,
+      ) => (action === "deploy-to-restricted" ? canDeployToRestricted : true),
+    );
+
+    user = await makeUser();
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    await makeMember(user.id, organizationId);
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { user: unknown }).user = user;
+      (request as typeof request & { organizationId: string }).organizationId =
+        organizationId;
+    });
+
+    const { default: routes } = await import("./knowledge-base");
+    await app.register(routes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  function createBody(environmentId: string | null) {
+    return {
+      name: `conn-${crypto.randomUUID().slice(0, 8)}`,
+      connectorType: "web_crawler" as const,
+      config: { type: "web_crawler", startUrl: "https://example.com" },
+      environmentId,
+    };
+  }
+
+  /** A connector this user may edit, so only the environment gate varies. */
+  async function makeConnector(environmentId: string | null) {
+    return KnowledgeBaseConnectorModel.create(
+      {
+        organizationId,
+        name: `conn-${crypto.randomUUID().slice(0, 8)}`,
+        connectorType: "web_crawler",
+        config: { type: "web_crawler", startUrl: "https://example.com" },
+        environmentId,
+      },
+      {
+        initialPermissionGrants: [
+          {
+            subject: { type: "user", id: user.id },
+            actions: ["read", "use", "update"],
+          },
+        ],
+      },
+    );
+  }
+
+  test("creating a connector in a RESTRICTED env without a grant on it is 403", async () => {
+    canDeployToRestricted = false;
+    const restricted = await createRestrictedEnvironment({
+      organizationId,
+      data: { name: "Prod" },
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/connectors",
+      payload: createBody(restricted.id),
+    });
+
+    expect(response.statusCode).toBe(403);
+  });
+
+  test("updating a connector to a RESTRICTED env without a grant on it is 403 and unchanged", async () => {
+    canDeployToRestricted = false;
+    const restricted = await createRestrictedEnvironment({
+      organizationId,
+      data: { name: "Prod" },
+    });
+    const connector = await makeConnector(null);
+
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/connectors/${connector.id}`,
+      payload: { environmentId: restricted.id },
+    });
+
+    expect(response.statusCode).toBe(403);
+    const after = await KnowledgeBaseConnectorModel.findById(connector.id);
+    expect(after?.environmentId ?? null).toBeNull();
+  });
+
+  test("updating a connector to a RESTRICTED env WITH a grant on that environment persists (200)", async () => {
+    const restricted = await createRestrictedEnvironment({
+      organizationId,
+      data: { name: "Prod" },
+    });
+    await grantEnvironmentUse({
+      organizationId,
+      environmentId: restricted.id,
+      userId: user.id,
+    });
+    const connector = await makeConnector(null);
+
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/connectors/${connector.id}`,
+      payload: { environmentId: restricted.id },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().environmentId).toBe(restricted.id);
+  });
+
+  test("updating a connector to an UNRESTRICTED env succeeds (200)", async () => {
+    canDeployToRestricted = false;
+    const open = await createEnvironment({
+      organizationId,
+      data: { name: "Staging" },
+    });
+    const connector = await makeConnector(null);
+
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/connectors/${connector.id}`,
+      payload: { environmentId: open.id },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().environmentId).toBe(open.id);
+  });
+
+  test("a connector created without an environment lands in the configured default", async () => {
+    const explore = await createEnvironment({
+      organizationId,
+      data: { name: "Explore" },
+    });
+    await EnvironmentResourceDefaultModel.setForResource({
+      organizationId,
+      resource: "knowledgeSource",
+      environmentId: explore.id,
+    });
+
+    const { environmentId: _omitted, ...body } = createBody(null);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/connectors",
+      payload: body,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().environmentId).toBe(explore.id);
+  });
+
+  test("a connector created with an explicit null keeps the default environment", async () => {
+    const explore = await createEnvironment({
+      organizationId,
+      data: { name: "Explore" },
+    });
+    await EnvironmentResourceDefaultModel.setForResource({
+      organizationId,
+      resource: "knowledgeSource",
+      environmentId: explore.id,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/connectors",
+      payload: createBody(null),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().environmentId).toBeNull();
+  });
+});

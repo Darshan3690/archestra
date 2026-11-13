@@ -1,9 +1,12 @@
 import crypto from "node:crypto";
+import { OAUTH_SCOPES } from "@archestra/shared";
 import ipaddr from "ipaddr.js";
+import type { Agent as UndiciAgent } from "undici";
 import { LRUCacheManager } from "@/cache-manager";
 import logger from "@/logging";
-import { OAuthClientModel } from "@/models";
+import OAuthClientModel from "@/models/oauth-client";
 import type { CimdMetadata } from "@/types";
+import { createPinnedOutboundDispatcher } from "@/utils/outbound-url";
 
 /**
  * Client ID Metadata Documents (CIMD) support for MCP OAuth 2.1.
@@ -40,9 +43,8 @@ export async function fetchAndValidateCimdDocument(
 ): Promise<CimdMetadata> {
   const url = new URL(clientIdUrl);
 
-  // Warn about HTTP CIMD URLs — HTTPS is recommended but not enforced.
-  // The MCP spec says the AS "SHOULD" reject HTTP (not "MUST"), and
-  // enforcement here breaks internal environments (CI, K8s pod-to-pod).
+  // Warn about HTTP CIMD URLs — HTTPS is recommended but not enforced, since
+  // the MCP spec says the AS "SHOULD" reject HTTP (not "MUST").
   if (url.protocol !== "https:") {
     logger.warn(
       { clientIdUrl },
@@ -50,29 +52,36 @@ export async function fetchAndValidateCimdDocument(
     );
   }
 
-  // SSRF mitigation: block private/loopback IP addresses.
-  // Hostnames that resolve to private IPs are still possible (DNS rebinding),
-  // but blocking obvious cases covers the common attack surface.
+  // SSRF mitigation. The client_id comes from unauthenticated callers, so the
+  // document host must be public in every environment: literal private and
+  // loopback addresses are refused here, and hostnames are resolved below and
+  // refused if any answer is private or loopback (cluster-internal Service
+  // names included).
   if (isPrivateHost(url.hostname)) {
     throw new CimdError(
       `CIMD client_id URL must not point to a private or loopback address: ${url.hostname}`,
     );
   }
 
-  const response = await fetch(clientIdUrl, {
-    headers: { Accept: "application/json" },
-    signal: AbortSignal.timeout(10_000),
-    redirect: "error", // Don't follow redirects (prevents redirect-based SSRF)
+  // The dispatcher pins the dial to the address that passed the check, so the
+  // name cannot be re-resolved to an internal address in between (DNS rebinding).
+  const pinned = await createPinnedOutboundDispatcher({
+    hostname: url.hostname,
+    allowLoopback: false,
   });
-
-  if (!response.ok) {
+  if (!pinned.ok) {
     throw new CimdError(
-      `Failed to fetch CIMD document from ${clientIdUrl}: HTTP ${response.status}`,
+      pinned.reason === "private_or_loopback_host"
+        ? `CIMD client_id URL must not resolve to a private or loopback address: ${url.hostname}`
+        : `CIMD client_id URL host did not resolve: ${url.hostname}`,
     );
   }
 
   // Limit response size to 1 MB to prevent memory exhaustion
-  const body = await response.text();
+  const body = await fetchCimdBody({
+    clientIdUrl,
+    dispatcher: pinned.dispatcher,
+  });
   if (body.length > MAX_CIMD_BODY_SIZE) {
     throw new CimdError(
       `CIMD document exceeds maximum size of ${MAX_CIMD_BODY_SIZE} bytes`,
@@ -108,6 +117,16 @@ export async function ensureCimdClientRegistered(
 
   const metadata = await fetchAndValidateCimdDocument(clientIdUrl);
 
+  // Persist the client's scopes. The OAuth provider validates authorize-time
+  // scopes against the client's *stored* scopes, so leaving this null would let
+  // `ensureOfflineAccessScope` later coalesce it into a partial array that omits
+  // `mcp` (causing `invalid_scope`). Honor the scope declared in the CIMD
+  // document; when absent, default to the full supported set — matching the
+  // provider's own null-scopes fallback.
+  const scopes = metadata.scope
+    ? metadata.scope.split(" ").filter(Boolean)
+    : [...OAUTH_SCOPES];
+
   await OAuthClientModel.upsertFromCimd({
     id: crypto.randomUUID(),
     clientId: clientIdUrl,
@@ -115,6 +134,7 @@ export async function ensureCimdClientRegistered(
     redirectUris: metadata.redirect_uris,
     grantTypes: metadata.grant_types ?? ["authorization_code"],
     responseTypes: metadata.response_types ?? ["code"],
+    scopes,
     tokenEndpointAuthMethod: "none",
     isPublic: true,
     metadata: {
@@ -228,6 +248,34 @@ function asOptionalStringArray(value: unknown): string[] | undefined {
     return value as string[];
   }
   return undefined;
+}
+
+/**
+ * GET the CIMD document. Redirects are refused, and the dispatcher is closed
+ * once the body is read so the pinned socket does not outlive the request.
+ */
+async function fetchCimdBody(params: {
+  clientIdUrl: string;
+  dispatcher: UndiciAgent;
+}): Promise<string> {
+  try {
+    const response = await fetch(params.clientIdUrl, {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(10_000),
+      redirect: "error", // Don't follow redirects (prevents redirect-based SSRF)
+      dispatcher: params.dispatcher,
+    } as RequestInit);
+
+    if (!response.ok) {
+      throw new CimdError(
+        `Failed to fetch CIMD document from ${params.clientIdUrl}: HTTP ${response.status}`,
+      );
+    }
+
+    return await response.text();
+  } finally {
+    await params.dispatcher.close();
+  }
 }
 
 /** Ranges from ipaddr.js that should be blocked for SSRF mitigation. */

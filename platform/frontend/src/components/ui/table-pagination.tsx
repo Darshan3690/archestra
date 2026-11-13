@@ -14,7 +14,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-const PAGE_SIZE_OPTIONS = [10, 20, 30, 40, 50, 100];
+export const PAGE_SIZE_OPTIONS = [10, 20, 30, 40, 50, 100];
 
 interface TablePaginationProps {
   pageIndex: number;
@@ -30,28 +30,35 @@ interface TablePaginationProps {
   compact?: boolean;
 }
 
+interface CursorTablePaginationProps {
+  pageIndex: number;
+  pageSize: number;
+  rowCount: number;
+  hasNext: boolean;
+  canGoNewer: boolean;
+  onPageSizeChange: (pageSize: number) => void;
+  onNewer: () => void;
+  onOlder: () => void;
+  /** Content to render on the left side (e.g., row selection count) */
+  leftContent?: React.ReactNode;
+}
+
 // --- Shared sub-components ---
 
-/** Rows-per-page selector, used by both desktop and mobile layouts */
+/**
+ * Rows-per-page selector, used by both layouts. Below `md` the label turns
+ * small and muted and the trigger narrows, so the whole footer fits one row.
+ */
 function RowsPerPageSelect({
   pageSize,
   onPageSizeChange,
-  compact = false,
 }: {
   pageSize: number;
   onPageSizeChange: (size: number) => void;
-  /** Use smaller sizing for mobile */
-  compact?: boolean;
 }) {
   return (
-    <div className="flex items-center gap-2">
-      <p
-        className={
-          compact
-            ? "text-xs font-medium text-muted-foreground"
-            : "text-sm font-medium"
-        }
-      >
+    <div className="flex shrink-0 items-center gap-2">
+      <p className="text-xs font-medium whitespace-nowrap text-muted-foreground md:text-sm md:text-foreground">
         Rows per page
       </p>
       <Select
@@ -59,7 +66,9 @@ function RowsPerPageSelect({
         onValueChange={(value) => onPageSizeChange(Number(value))}
       >
         <SelectTrigger
-          className={compact ? "h-7 w-[68px] text-xs" : "h-8 w-[90px]"}
+          aria-label="Rows per page"
+          size="sm"
+          className="w-[68px] max-md:text-xs md:w-[90px]"
         >
           <SelectValue placeholder={pageSize} />
         </SelectTrigger>
@@ -82,29 +91,34 @@ function PaginationNavButtons({
   onPrevious,
   onNext,
   className,
+  children,
 }: {
   canGoPrevious: boolean;
   canGoNext: boolean;
   onPrevious: () => void;
   onNext: () => void;
   className?: string;
+  children?: React.ReactNode;
 }) {
   return (
     <>
       <Button
+        type="button"
         variant="outline"
-        size="icon"
-        className={className ?? "size-8"}
+        size="icon-sm"
+        className={className}
         onClick={onPrevious}
         disabled={!canGoPrevious}
       >
         <span className="sr-only">Go to previous page</span>
         <ChevronLeft className="h-4 w-4" />
       </Button>
+      {children}
       <Button
+        type="button"
         variant="outline"
-        size="icon"
-        className={className ?? "size-8"}
+        size="icon-sm"
+        className={className}
         onClick={onNext}
         disabled={!canGoNext}
       >
@@ -166,9 +180,10 @@ export function TablePagination({
               </span>
             )}
             <Button
+              type="button"
               variant="outline"
-              size="icon"
-              className="hidden size-8 lg:flex"
+              size="icon-sm"
+              className="hidden lg:flex"
               onClick={goFirst}
               disabled={!canGoPrevious}
             >
@@ -182,9 +197,10 @@ export function TablePagination({
               onNext={goNext}
             />
             <Button
+              type="button"
               variant="outline"
-              size="icon"
-              className="hidden size-8 lg:flex"
+              size="icon-sm"
+              className="hidden lg:flex"
               onClick={goLast}
               disabled={!canGoNext}
             >
@@ -195,51 +211,93 @@ export function TablePagination({
         </div>
       </div>
 
-      {/* Mobile layout */}
-      <div className="flex flex-col items-center gap-0 md:hidden">
-        {/* Selection info */}
+      {/* Mobile layout: one row — rows per page on the left, the page and
+          its arrows on the right. */}
+      <div className="flex flex-col gap-1.5 md:hidden">
         {leftContent && (
-          <div className="text-[11px] text-muted-foreground/70 mb-1.5">
-            {leftContent}
-          </div>
+          <div className="text-xs text-muted-foreground">{leftContent}</div>
         )}
-
-        {/* Pagination container */}
-        <div className="w-full rounded-lg border bg-muted/30 px-4 py-2.5 flex flex-col items-center gap-2.5">
+        <div className="flex items-center justify-between gap-3">
           <RowsPerPageSelect
             pageSize={pageSize}
             onPageSizeChange={handlePageSizeChange}
-            compact
           />
-
-          {/* Pagination controls */}
-          <div className="flex items-center gap-3">
-            <Button
-              variant="outline"
-              size="icon"
-              className="size-8 disabled:opacity-25"
-              onClick={goPrevious}
-              disabled={!canGoPrevious}
-            >
-              <span className="sr-only">Go to previous page</span>
-              <ChevronLeft className="h-4 w-4" />
-            </Button>
-            <span className="text-sm font-semibold tabular-nums min-w-[44px] text-center">
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-medium text-muted-foreground tabular-nums">
               {currentPage} / {totalPages}
             </span>
-            <Button
-              variant="outline"
-              size="icon"
-              className="size-8 disabled:opacity-25"
-              onClick={goNext}
-              disabled={!canGoNext}
-            >
-              <span className="sr-only">Go to next page</span>
-              <ChevronRight className="h-4 w-4" />
-            </Button>
+            <PaginationNavButtons
+              canGoPrevious={canGoPrevious}
+              canGoNext={canGoNext}
+              onPrevious={goPrevious}
+              onNext={goNext}
+            />
           </div>
         </div>
       </div>
     </>
+  );
+}
+
+export function CursorTablePagination({
+  pageIndex,
+  pageSize,
+  rowCount,
+  hasNext,
+  canGoNewer,
+  onPageSizeChange,
+  onNewer,
+  onOlder,
+  leftContent,
+}: CursorTablePaginationProps) {
+  const firstRow = rowCount === 0 ? 0 : pageIndex * pageSize + 1;
+  const lastRow = rowCount === 0 ? 0 : firstRow + rowCount - 1;
+
+  return (
+    <div className="flex flex-col gap-1.5 md:flex-row md:items-center md:justify-between md:gap-3">
+      {leftContent ? (
+        <div className="text-xs text-muted-foreground md:flex-1 md:text-sm">
+          {leftContent}
+        </div>
+      ) : null}
+      {/* One row on a phone: rows per page on the left, the range and
+          icon-only arrows on the right. */}
+      <div className="flex items-center justify-between gap-3 md:ml-auto md:justify-end md:gap-6">
+        <RowsPerPageSelect
+          pageSize={pageSize}
+          onPageSizeChange={onPageSizeChange}
+        />
+        <div className="flex items-center gap-2 md:gap-6">
+          <span className="text-xs font-medium whitespace-nowrap text-muted-foreground tabular-nums md:min-w-[112px] md:text-center md:text-sm md:text-foreground">
+            <span className="max-md:sr-only">Showing </span>
+            {firstRow}&ndash;{lastRow}
+          </span>
+          <div className="flex items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="max-md:size-8 max-md:px-0"
+              onClick={onNewer}
+              disabled={!canGoNewer}
+            >
+              <ChevronLeft className="size-4" />
+              <span className="max-md:sr-only">Newer</span>
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="max-md:size-8 max-md:px-0"
+              onClick={onOlder}
+              disabled={!hasNext}
+            >
+              <span className="max-md:sr-only">Older</span>
+              <ChevronRight className="size-4" />
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }

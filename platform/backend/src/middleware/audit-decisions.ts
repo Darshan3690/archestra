@@ -1,0 +1,1281 @@
+import config from "@/config";
+import type { schema } from "@/database";
+import A2aRemoteAgentModel from "@/models/a2a-remote-agent";
+import AgentModel from "@/models/agent";
+import AgentToolModel from "@/models/agent-tool";
+import ApiKeyModel from "@/models/api-key";
+import AppModel from "@/models/app";
+import AutoRouterModel from "@/models/auto-router";
+import BlobProviderModel from "@/models/blob-provider";
+import BrowserStorageStateModel from "@/models/browser-storage-state";
+import ChatOpsChannelBindingModel from "@/models/chatops-channel-binding";
+import CostExportModel from "@/models/cost-export";
+import EnvironmentModel from "@/models/environment";
+import EnvironmentDefaultUserLimitModel from "@/models/environment-default-user-limit";
+import EnvironmentResourceDefaultModel from "@/models/environment-resource-default";
+import GuardrailsDeploymentModel from "@/models/guardrails-deployment";
+import GuardrailsPolicyModel from "@/models/guardrails-policy";
+import HookFileModel from "@/models/hook-file";
+import InternalMcpCatalogModel from "@/models/internal-mcp-catalog";
+import KbDirectoryModel from "@/models/kb-directory";
+import KbFileModel from "@/models/kb-file";
+import KnowledgeBaseModel from "@/models/knowledge-base";
+import KnowledgeBaseConnectorModel from "@/models/knowledge-base-connector";
+import LimitModel from "@/models/limit";
+import LlmOauthClientModel from "@/models/llm-oauth-client";
+import LlmProviderApiKeyModel from "@/models/llm-provider-api-key";
+import McpServerModel from "@/models/mcp-server";
+import MemberModel from "@/models/member";
+import ModelModel from "@/models/model";
+import ModelPoolModel from "@/models/model-pool";
+import OpenAppaBatteryInstallModel from "@/models/openappa-battery-install";
+import OpenAppaBatteryPackageModel from "@/models/openappa-battery-package";
+import OpenAppaCredentialBindingModel from "@/models/openappa-credential-binding";
+import OpenAppaGithubSyncModel from "@/models/openappa-github-sync";
+import OpenAppaYellModel from "@/models/openappa-yell";
+import OrganizationModel from "@/models/organization";
+import OrganizationRoleModel from "@/models/organization-role";
+import PluginModel from "@/models/plugin";
+import ProjectModel from "@/models/project";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import RuntimeCredentialDefinitionModel from "@/models/runtime-credential-definition";
+import ScheduleTriggerModel from "@/models/schedule-trigger";
+import ServiceAccountModel from "@/models/service-account";
+import ServiceAccountFederatedCredentialModel from "@/models/service-account-federated-credential";
+import SkillModel from "@/models/skill";
+import SkillShareLinkModel from "@/models/skill-share-link";
+import TeamModel from "@/models/team";
+import UserLimitUsageResetModel from "@/models/user-limit-usage-reset";
+import UserTokenModel from "@/models/user-token";
+import VirtualApiKeyModel from "@/models/virtual-api-key";
+
+/**
+ * The structural contract every audited table's model must satisfy.
+ * The `findByIdForAudit` method is used by the audit hook to capture
+ * before/after snapshots. The model value passed here is the class itself
+ * (static side), not an instance.
+ *
+ * @public
+ */
+export type AuditableModel = {
+  findByIdForAudit(
+    id: string,
+    orgId: string,
+  ): Promise<Record<string, unknown> | null>;
+};
+
+type AuditDecision =
+  | { audited: true; model: AuditableModel }
+  | { audited: false; reason: string };
+
+/**
+ * Compile-time enforcement that every Drizzle table exported from
+ * `database/schemas/index.ts` has an explicit audit decision.
+ *
+ * The `satisfies` clause is load-bearing: when a contributor adds a new
+ * table to the schema, TypeScript fails the build until they add an entry
+ * here. This turns "reviewer noticed the gap" into "TS told me before PR
+ * review".
+ *
+ * Decision rules:
+ * - Resource-shaped tables with admin-facing CRUD via /api/*: `audited: true`.
+ *   The `model` field must implement `findByIdForAudit`.
+ * - Join tables: `audited: false`; the parent resource carries the signal.
+ * - Runtime/execution-state tables: `audited: false`; own log surface or too
+ *   high-volume to belong in the audit log.
+ * - Better-auth machinery (sessions, accounts, etc.): `audited: false`; auth
+ *   events are captured by the better-auth handleAfterHook, not table writes.
+ * - Child documents (skillFiles, kbChunks, etc.): `audited: false`; parent
+ *   carries the signal.
+ * - Enterprise-only tables: default `audited: false`; overridden at startup
+ *   by `initAuditDecisions()` when the EE license is active.
+ *
+ * @public — consumed by audit-log-snapshot.test.ts invariant tests
+ */
+export const AUDIT_DECISIONS = {
+  jiraChatOpsIdentitiesTable: {
+    audited: false,
+    reason:
+      "Observed external human identity pinning; internal ChatOps authorization state without admin mutation routes",
+  },
+  jiraChatOpsEventsTable: {
+    audited: false,
+    reason:
+      "Jira webhook receipt and dispatch state; internal high-volume runtime ledger",
+  },
+  jiraChatOpsDeliveriesTable: {
+    audited: false,
+    reason:
+      "Jira comment delivery and reconciliation state; internal runtime ledger",
+  },
+  guardrailsPolicyRevisionsTable: {
+    audited: true,
+    model: GuardrailsPolicyModel,
+  },
+  // =========================================================================
+  // Audited resources — mutations captured via AUDITABLE_ROUTES
+  // =========================================================================
+  agentsTable: { audited: true, model: AgentModel },
+  agentPinsTable: {
+    audited: false,
+    reason:
+      "per-user pin on an agent; personal preference, not an access change",
+  },
+  a2aRemoteAgentsTable: { audited: true, model: A2aRemoteAgentModel },
+  a2aRemoteAgentTeamsTable: {
+    audited: false,
+    reason:
+      "Retired sharing rows, read once by the permission conversion and never written",
+  },
+  a2aRemoteAgentUsersTable: {
+    audited: false,
+    reason:
+      "Retired sharing rows, read once by the permission conversion and never written",
+  },
+  a2aConnectionsTable: {
+    audited: false,
+    reason:
+      "credential-bearing child configuration audited through its remote agent resource",
+  },
+  a2aOutboundRunsTable: {
+    audited: false,
+    reason: "A2A execution state recorded by the outbound run ledger",
+  },
+  resourcePermissionPoliciesTable: {
+    audited: true,
+    model: ResourcePermissionPolicyModel,
+  },
+  runtimeCredentialDefinitionsTable: {
+    audited: true,
+    model: RuntimeCredentialDefinitionModel,
+  },
+
+  agentToolsTable: { audited: true, model: AgentToolModel },
+  apikeysTable: { audited: true, model: ApiKeyModel },
+  chatopsChannelBindingsTable: {
+    audited: true,
+    model: ChatOpsChannelBindingModel,
+  },
+  pluginsTable: { audited: true, model: PluginModel },
+  environmentsTable: { audited: true, model: EnvironmentModel },
+  environmentDefaultUserLimitsTable: {
+    audited: true,
+    model: EnvironmentDefaultUserLimitModel,
+  },
+  environmentResourceDefaultsTable: {
+    audited: true,
+    model: EnvironmentResourceDefaultModel,
+  },
+  internalMcpCatalogTable: { audited: true, model: InternalMcpCatalogModel },
+  mcpCatalogSkillsTable: {
+    audited: false,
+    reason:
+      "derived MCP discovery metadata refreshed with the parent catalog's tools; not directly admin-mutable",
+  },
+  knowledgeBasesTable: { audited: true, model: KnowledgeBaseModel },
+  knowledgeBaseConnectorsTable: {
+    audited: true,
+    model: KnowledgeBaseConnectorModel,
+  },
+  limitsTable: { audited: true, model: LimitModel },
+  blobProvidersTable: { audited: true, model: BlobProviderModel },
+  costExportsTable: { audited: true, model: CostExportModel },
+  userLimitUsageResetsTable: {
+    audited: true,
+    model: UserLimitUsageResetModel,
+  },
+  llmProviderApiKeysTable: { audited: true, model: LlmProviderApiKeyModel },
+  mcpServersTable: { audited: true, model: McpServerModel },
+  membersTable: { audited: true, model: MemberModel },
+  modelsTable: { audited: true, model: ModelModel },
+  modelPoolsTable: { audited: true, model: ModelPoolModel },
+  autoRoutersTable: { audited: true, model: AutoRouterModel },
+  // oauthClientsTable stores LLM OAuth clients (/api/llm-oauth-clients) and MCP
+  // OAuth clients (/api/mcp-oauth-clients). Admin CRUD for both is audited at the
+  // route level via AUDITABLE_ROUTES; this table-level model is the LLM snapshot.
+  oauthClientsTable: { audited: true, model: LlmOauthClientModel },
+  organizationsTable: { audited: true, model: OrganizationModel },
+  organizationRolesTable: { audited: true, model: OrganizationRoleModel },
+  scheduleTriggersTable: { audited: true, model: ScheduleTriggerModel },
+  skillsTable: { audited: true, model: SkillModel },
+  teamsTable: { audited: true, model: TeamModel },
+  teamTokensTable: {
+    audited: false,
+    reason:
+      "Retired: read only by the startup migration onto service accounts; no route writes it",
+  },
+  toolsTable: {
+    audited: false,
+    reason:
+      "derived from MCP server discovery and catalog sync; no route mutates tools directly, and the install/catalog routes that drive discovery are audited",
+  },
+  toolObservationsTable: {
+    audited: false,
+    reason:
+      "runtime attribution metadata written by the LLM proxy (who observed a tool, via which client); not admin-mutable state",
+  },
+  userTokensTable: { audited: true, model: UserTokenModel },
+  virtualApiKeysTable: { audited: true, model: VirtualApiKeyModel },
+
+  // =========================================================================
+  // Audit log itself
+  // =========================================================================
+  auditLogsTable: {
+    audited: false,
+    reason: "audit table itself; auditing its mutations would recurse",
+  },
+
+  // =========================================================================
+  // Invitation lifecycle — audited via better-auth inline writes
+  // (invitation.created, invitation.deleted); no AUDITABLE_ROUTES entry
+  // =========================================================================
+  invitationsTable: {
+    audited: false,
+    reason:
+      "invitation lifecycle audited via better-auth inline writes (invitation.created, invitation.deleted); see auth/better-auth.ts",
+  },
+
+  // =========================================================================
+  // Enterprise-edition only — override applied at startup by initAuditDecisions()
+  // =========================================================================
+  identityProvidersTable: {
+    audited: false,
+    reason:
+      "enterprise edition only; override applied via initAuditDecisions() at startup when EE license is active",
+  },
+
+  // =========================================================================
+  // Chat surface (dedicated /llm/logs + /mcp/logs)
+  // =========================================================================
+  conversationsTable: {
+    audited: false,
+    reason: "chat conversations; high-volume, surfaced via /llm/logs",
+  },
+  conversationChatErrorsTable: {
+    audited: false,
+    reason: "chat error records; surfaced via /llm/logs",
+  },
+  conversationCompactionsTable: {
+    audited: false,
+    reason: "chat compaction state; runtime artifact",
+  },
+  conversationEnabledToolsTable: {
+    audited: false,
+    reason: "join: conversation × tool; chat surface",
+  },
+  conversationSharesTable: {
+    audited: false,
+    reason:
+      "retired sharing, read only by the permission cutover; sharing is now the resource permission policy, audited as resourcePermissions.updated",
+  },
+  // Soft-deleted rather than removed, and restorable org-wide by a project
+  // admin — so delete and restore are cross-user administrative actions on
+  // someone else's data, not the personal grouping this table started as.
+  projectsTable: { audited: true, model: ProjectModel },
+  projectLabelsTable: {
+    audited: false,
+    reason: "join: project × label; parent (project) audited",
+  },
+  projectSharesTable: {
+    audited: false,
+    reason:
+      "retired sharing, read only by the permission cutover; sharing is now the resource permission policy, audited as resourcePermissions.updated",
+  },
+  projectShareTeamsTable: {
+    audited: false,
+    reason: "join: project share × team; parent (project) audited",
+  },
+  projectPinsTable: {
+    audited: false,
+    reason:
+      "per-user pin on a project; personal preference, not an access change",
+  },
+  projectAppsTable: {
+    audited: false,
+    reason:
+      "join: project × app; audited as project.updated via the project's appIds snapshot",
+  },
+  userOnboardingSeenItemsTable: {
+    audited: false,
+    reason:
+      "per-user onboarding red-dot dismissals; personal preference, not an access change",
+  },
+  conversationShareTeamsTable: {
+    audited: false,
+    reason: "join: conversation share × team",
+  },
+  conversationShareUsersTable: {
+    audited: false,
+    reason: "join: conversation share × user",
+  },
+  messagesTable: {
+    audited: false,
+    reason: "individual chat messages; surfaced via /llm/logs",
+  },
+  interactionsTable: {
+    audited: false,
+    reason: "chat interaction execution state",
+  },
+  conversationAttachmentsTable: {
+    audited: false,
+    reason:
+      "conversation message attachments; high-volume, surfaced via /llm/logs",
+  },
+
+  // =========================================================================
+  // MCP gateway runtime (dedicated /mcp/logs)
+  // =========================================================================
+  mcpToolCallsTable: {
+    audited: false,
+    reason: "MCP tool call log; surfaced via /mcp/logs",
+  },
+  mcpGatewayTasksTable: {
+    audited: false,
+    reason:
+      "Ephemeral task handles for in-flight tool calls; the calls themselves are logged in mcp_tool_calls",
+  },
+  mcpDeploymentLeasesTable: {
+    audited: false,
+    reason:
+      "Ephemeral cross-replica mutual-exclusion rows; the actions they serialize (hard resets) are audited themselves",
+  },
+  mcpHttpSessionsTable: {
+    audited: false,
+    reason: "MCP session-level transport state",
+  },
+  desktopDevicesTable: {
+    audited: false,
+    reason:
+      "A user's own tunnel client registration; the sign-in decision (desktopDeviceSignIn.updated) and removing the device (desktopDevice.deleted) carry the audit signal",
+  },
+  desktopDeviceServersTable: {
+    audited: false,
+    reason:
+      "Which MCP servers a user stopped on their own device, and the states its tunnel client reports; the route audit (desktopDevice.updated) carries Start and Stop",
+  },
+  desktopMcpRequestsTable: {
+    audited: false,
+    reason: "Short-lived queue of MCP messages waiting for a device",
+  },
+  mcpPresetEntriesTable: {
+    audited: false,
+    reason: "preset definitions; static config, audited via catalog",
+  },
+  // =========================================================================
+  // A2A protocol runtime
+  // =========================================================================
+  a2aContextsTable: { audited: false, reason: "A2A protocol runtime context" },
+  a2aContextCompactionsTable: {
+    audited: false,
+    reason: "A2A context history compaction summaries (runtime state)",
+  },
+  a2aMessagesTable: { audited: false, reason: "A2A protocol message log" },
+  a2aTasksTable: { audited: false, reason: "A2A protocol task state" },
+  a2aTaskEventsTable: {
+    audited: false,
+    reason: "A2A protocol task stream-event log (runtime state)",
+  },
+  a2aArtifactsTable: {
+    audited: false,
+    reason: "A2A protocol task artifact output (runtime state)",
+  },
+  a2aPushNotificationConfigsTable: {
+    audited: false,
+    reason: "A2A protocol per-task webhook config (runtime state)",
+  },
+  a2aTaskApprovalRequestsTable: {
+    audited: false,
+    reason: "A2A protocol approval state",
+  },
+
+  // =========================================================================
+  // Better-auth runtime (auth events come from handleAfterHook)
+  // =========================================================================
+  accountsTable: {
+    audited: false,
+    reason:
+      "better-auth account material; auth events captured via handleAfterHook",
+  },
+  sessionsTable: {
+    audited: false,
+    reason:
+      "better-auth session material; auth events captured via handleAfterHook",
+  },
+  twoFactorsTable: {
+    audited: false,
+    reason:
+      "better-auth 2FA material; auth events captured via handleAfterHook",
+  },
+  verificationsTable: {
+    audited: false,
+    reason: "better-auth verification flow state",
+  },
+  jwksTable: { audited: false, reason: "better-auth signing key material" },
+
+  // =========================================================================
+  // OAuth runtime
+  // =========================================================================
+  oauthAccessTokensTable: {
+    audited: false,
+    reason: "OAuth access token runtime state",
+  },
+  oauthConsentsTable: {
+    audited: false,
+    reason: "OAuth consent records; ephemeral",
+  },
+  oauthRefreshTokensTable: {
+    audited: false,
+    reason: "OAuth refresh token runtime state",
+  },
+
+  // =========================================================================
+  // Join / membership / labels (parent resource carries audit signal)
+  // =========================================================================
+  agentConnectorAssignmentsTable: {
+    audited: false,
+    reason: "join: agent × connector; parent (agent) audited",
+  },
+  agentExcludedConnectorsTable: {
+    audited: false,
+    reason: "join: agent × knowledge-source exclusion; parent (agent) audited",
+  },
+  agentExcludedSkillsTable: {
+    audited: false,
+    reason: "join: agent × skill exclusion; parent (agent) audited",
+  },
+  agentActivationSkillRulesTable: {
+    audited: false,
+    reason: "join: agent × activation-skill policy; parent (agent) audited",
+  },
+  agentExcludedSubagentsTable: {
+    audited: false,
+    reason: "join: agent × subagent exclusion; parent (agent) audited",
+  },
+  agentExcludedToolsTable: {
+    audited: false,
+    reason: "join: agent × tool exclusion; parent (agent) audited",
+  },
+  agentKnowledgeBasesTable: {
+    audited: false,
+    reason: "join: agent × knowledge base; parent (agent) audited",
+  },
+  agentSkillsTable: {
+    audited: false,
+    reason: "join: agent × skill assignment; parent (agent) audited",
+  },
+  agentLabelsTable: {
+    audited: false,
+    reason: "join: agent × label; parent (agent) audited",
+  },
+  agentSuggestedPromptsTable: {
+    audited: false,
+    reason: "child of agent; parent audited",
+  },
+  agentTeamsTable: {
+    audited: false,
+    reason: "join: agent × team; parent (agent) audited",
+  },
+  agentVersionsTable: {
+    audited: false,
+    reason: "child of agent; immutable version snapshot, parent audited",
+  },
+  // Apps are a resource-shaped table with admin-facing CRUD via /api/apps.
+  appsTable: { audited: true, model: AppModel },
+  appVersionsTable: {
+    audited: false,
+    reason: "child of app; immutable version snapshot, parent audited",
+  },
+  appToolsTable: {
+    audited: false,
+    reason: "tools attached to an app; parent (app) carries the signal",
+  },
+  appLabelsTable: {
+    audited: false,
+    reason: "join: app × label; parent (app) audited",
+  },
+  appDataTable: {
+    audited: false,
+    reason:
+      "app-scoped runtime data store; written by app HTML, no admin signal",
+  },
+  appPinsTable: {
+    audited: false,
+    reason: "per-user pin on an app; personal preference, not an access change",
+  },
+  appRenderDiagnosticsTable: {
+    audited: false,
+    reason:
+      "ephemeral per-viewer render diagnostics; best-effort, not admin state",
+  },
+  appRenderScreenshotTable: {
+    audited: false,
+    reason:
+      "ephemeral per-viewer render screenshot; best-effort, not admin state",
+  },
+  labelKeysTable: { audited: false, reason: "label taxonomy; low-value churn" },
+  labelValuesTable: {
+    audited: false,
+    reason: "label taxonomy; low-value churn",
+  },
+  knowledgeBaseConnectorAssignmentsTable: {
+    audited: false,
+    reason:
+      "join: knowledge base × connector assignment; parent (knowledgeBaseConnector) audited",
+  },
+  mcpCatalogLabelsTable: {
+    audited: false,
+    reason: "join: catalog × label; parent (catalog) audited",
+  },
+  teamLabelsTable: {
+    audited: false,
+    reason: "join: team × label; parent (team) audited",
+  },
+  environmentLabelsTable: {
+    audited: false,
+    reason: "join: environment × label; parent (environment) audited",
+  },
+  kbFileLabelsTable: {
+    audited: false,
+    reason: "join: knowledge file × label; parent (knowledge file) audited",
+  },
+  knowledgeBaseConnectorLabelsTable: {
+    audited: false,
+    reason:
+      "join: knowledge base connector × label; parent (knowledge base connector) audited",
+  },
+  knowledgeBaseLabelsTable: {
+    audited: false,
+    reason: "join: knowledge base × label; parent (knowledge base) audited",
+  },
+  limitLabelsTable: {
+    audited: false,
+    reason: "join: limit × label; parent (limit) audited",
+  },
+  llmProviderApiKeyLabelsTable: {
+    audited: false,
+    reason:
+      "join: LLM provider API key × label; parent (LLM provider API key) audited",
+  },
+  modelLabelsTable: {
+    audited: false,
+    reason: "join: model × label; parent (model) audited",
+  },
+  oauthClientLabelsTable: {
+    audited: false,
+    reason: "join: OAuth client × label; parent (OAuth client) audited",
+  },
+  pluginLabelsTable: {
+    audited: false,
+    reason: "join: plugin × label; parent (plugin) audited",
+  },
+  serviceAccountLabelsTable: {
+    audited: false,
+    reason: "join: service account × label; parent (service account) audited",
+  },
+  skillLabelsTable: {
+    audited: false,
+    reason: "join: skill × label; parent (skill) audited",
+  },
+  virtualApiKeyLabelsTable: {
+    audited: false,
+    reason: "join: virtual API key × label; parent (virtual API key) audited",
+  },
+  mcpCatalogTeamsTable: {
+    audited: false,
+    reason: "join: catalog × team; parent (catalog) audited",
+  },
+  agentUsersTable: {
+    audited: false,
+    reason: "join: agent × user; parent (agent) audited",
+  },
+  skillUsersTable: {
+    audited: false,
+    reason: "join: skill × user; parent (skill) audited",
+  },
+  modelUsersTable: {
+    audited: false,
+    reason: "join: model × user; parent (model) audited",
+  },
+  projectShareUsersTable: {
+    audited: false,
+    reason: "join: project share × user; parent (project) audited",
+  },
+  mcpCatalogUsersTable: {
+    audited: false,
+    reason: "join: catalog × user; parent (catalog) audited",
+  },
+  modelTeamsTable: {
+    audited: false,
+    reason:
+      "join: model × team; parent (model) audited, snapshot includes restrictedToTeams",
+  },
+  oauthClientTeamsTable: {
+    audited: false,
+    reason: "join: oauth client × team; parent (oauth client) audited",
+  },
+  mcpServerUsersTable: {
+    audited: false,
+    reason: "join: mcp server × user; parent (mcp server) audited",
+  },
+  mcpServerAlertMutesTable: {
+    audited: false,
+    reason: "per-viewer UI state; intentionally excluded from audit logs",
+  },
+  mcpServerToolDescriptionsTable: {
+    audited: false,
+    reason:
+      "derived from each installation's MCP tool discovery, like tools; no route mutates it directly",
+  },
+  teamMembersTable: {
+    audited: false,
+    reason: "join: team × member; member changes audited via member",
+  },
+  teamExternalGroupsTable: {
+    audited: false,
+    reason: "join: team × external group; parent (team) audited",
+  },
+
+  virtualApiKeyProviderApiKeysTable: {
+    audited: false,
+    reason: "join: virtual key × provider key; parent audited",
+  },
+  virtualApiKeyTeamsTable: {
+    audited: false,
+    reason: "join: virtual key × team; parent audited",
+  },
+  virtualApiKeyLlmProxiesTable: {
+    audited: false,
+    // Orphaned table — the passthrough-key "allowed LLM proxies" feature was
+    // removed; no code reads/writes it. Retained only so this release doesn't
+    // drop it under old pods; entry stays until the table is dropped (phase 2).
+    reason: "orphaned/unused; retained for zero-downtime, dropped in phase 2",
+  },
+
+  // =========================================================================
+  // Children of audited parents
+  // =========================================================================
+  hookFilesTable: { audited: true, model: HookFileModel },
+  skillTeamsTable: {
+    audited: false,
+    reason: "join: skill × team; parent (skill) audited",
+  },
+  skillEnvironmentsTable: {
+    audited: false,
+    reason:
+      "join: skill × environment; parent (skill) audited, and the skill audit snapshot includes environmentIds",
+  },
+  skillFilesTable: {
+    audited: false,
+    reason: "child of skill; parent (skill) audited",
+  },
+  pluginFilesTable: {
+    audited: false,
+    reason: "child of plugin; parent (plugin) audited",
+  },
+  pluginTeamsTable: {
+    audited: false,
+    reason: "join: plugin × team; parent (plugin) audited",
+  },
+  pluginUsersTable: {
+    audited: false,
+    reason: "join: plugin × user; parent (plugin) audited",
+  },
+  skillUsageEventsTable: {
+    audited: false,
+    reason:
+      "append-only usage metric written by the system on every activation; not a user-driven state change",
+  },
+  externalMcpSkillUsageEventsTable: {
+    audited: false,
+    reason:
+      "append-only usage metric written by the system on every external MCP Skill activation; not a user-driven state change",
+  },
+  pluginSkillUsageEventsTable: {
+    audited: false,
+    reason:
+      "append-only usage metric written by the system on every plugin Skill activation; not a user-driven state change",
+  },
+  connectionSetupsTable: {
+    audited: false,
+    reason:
+      "15-minute render tickets for /connection setup scripts, kept as the connected-client history; the approval (clientConnection.updated), disconnecting (connectedClient.disconnected) and the durable artifacts (virtual key, skill share link) carry the audit signal",
+  },
+  connectionSetupSkillsTable: {
+    audited: false,
+    reason:
+      "join: connection setup × skill; parent (connectionSetups) ephemeral",
+  },
+  connectionSetupPluginsTable: {
+    audited: false,
+    reason:
+      "join: connection setup × plugin; parent (connectionSetups) ephemeral",
+  },
+  skillShareLinksTable: {
+    audited: true,
+    model: SkillShareLinkModel,
+  },
+  skillShareLinkSkillsTable: {
+    audited: false,
+    reason: "join: share link × skill; parent (skillShareLinks) carries signal",
+  },
+  skillShareLinkPluginsTable: {
+    audited: false,
+    reason:
+      "join: share link × plugin; parent (skillShareLinks) carries signal",
+  },
+  skillShareLinkRevisionsTable: {
+    audited: false,
+    reason:
+      "child of skillShareLinks / skillMarketplaceRepos; revision history",
+  },
+  skillMarketplaceCredentialsTable: {
+    audited: false,
+    reason:
+      "read-only marketplace credential with no CRUD route to snapshot; issued implicitly by the audited connection-setup script route and dropped on membership removal, which writes member.deleted",
+  },
+  skillMarketplaceReposTable: {
+    audited: false,
+    reason:
+      "derived per-viewer marketplace repo; created implicitly on clone, carries no user-authored state",
+  },
+  agentRunAttentionNoticesTable: {
+    audited: false,
+    reason:
+      "internal Slack delivery state; contains only routing, message identity, and attention resolution",
+  },
+  agentRunsTable: {
+    audited: false,
+    reason:
+      "records which pod carries an A2A task; the task's own state machine and event log are the record of the work",
+  },
+  agentWorkspacesTable: {
+    audited: false,
+    reason:
+      "internal workspace lifecycle and compare-and-set ownership; user actions are audited by the runtime routes",
+  },
+  agentRunTranscriptsTable: {
+    audited: false,
+    reason:
+      "task-owned execution output; the Agent run surface is the record of the work",
+  },
+  agentRunTranscriptChunksTable: {
+    audited: false,
+    reason: "storage chunks owned by an Agent run transcript",
+  },
+  agentRunReadableTranscriptsTable: {
+    audited: false,
+    reason:
+      "task-owned readable execution output; the Agent run surface is the record of the work",
+  },
+  agentRunReadableTranscriptChunksTable: {
+    audited: false,
+    reason: "storage chunks owned by a readable Agent run transcript",
+  },
+  agentRunInputsTable: {
+    audited: false,
+    reason:
+      "task-owned runtime inputs; the execution start event records the file count without logging file names or content",
+  },
+  agentRunSharesTable: {
+    audited: false,
+    reason:
+      "retired sharing, read only by the permission cutover; sharing is now the resource permission policy, audited as resourcePermissions.updated",
+  },
+  agentRunShareTeamsTable: {
+    audited: false,
+    reason: "join: agent run share × team",
+  },
+  agentRunShareUsersTable: {
+    audited: false,
+    reason: "join: agent run share × user",
+  },
+  userCredentialsTable: {
+    audited: false,
+    reason:
+      "a person's own credential references, with no administrative CRUD — only the owner can add or remove one, and the value is never stored here",
+  },
+  runtimeCredentialConnectionsTable: {
+    audited: false,
+    reason:
+      "credential references only; secret values are never stored here and mutations are recorded by the runtime credential route",
+  },
+  skillSandboxesTable: {
+    audited: false,
+    reason:
+      "ephemeral execution sandbox state; runtime artifact, no admin signal",
+  },
+  skillSandboxSkillMountsTable: {
+    audited: false,
+    reason: "child of sandbox; ordered skill mount, parent is ephemeral",
+  },
+  skillSandboxCommandsTable: {
+    audited: false,
+    reason: "child of sandbox; append-only command replay log",
+  },
+  skillSandboxFilesTable: {
+    audited: false,
+    reason: "child of sandbox; uploaded input + exported artifact file bytes",
+  },
+  filesTable: {
+    audited: false,
+    reason:
+      "user's own PFS files; download_file/save_file outputs, no admin signal",
+  },
+  proxyProviderFilesTable: {
+    audited: false,
+    reason: "principal-owned SDK provider file metadata ledger; no admin CRUD",
+  },
+  skillSandboxReplayEventsTable: {
+    audited: false,
+    reason: "child of sandbox; append-only ordered replay log",
+  },
+  skillVersionsTable: {
+    audited: false,
+    reason: "child of skill; immutable version snapshot, parent audited",
+  },
+  skillVersionFilesTable: {
+    audited: false,
+    reason: "child of skill version; immutable file snapshot",
+  },
+  kbChunksTable: {
+    audited: false,
+    reason: "child of knowledge base; parent audited",
+  },
+  kbBm25TermStatsTable: {
+    audited: false,
+    reason:
+      "derived BM25 corpus statistics; rebuilt from kb_chunks by a periodic task, never edited by a user",
+  },
+  kbBm25CorpusStatsTable: {
+    audited: false,
+    reason:
+      "derived BM25 corpus statistics; rebuilt from kb_chunks by a periodic task, never edited by a user",
+  },
+  kbConnectorDocumentCountsTable: {
+    audited: false,
+    reason:
+      "derived per-connector document totals; written by sync runs, document deletes and uploads, or the first read, never edited by a user",
+  },
+  kbContainerAclsTable: {
+    audited: false,
+    reason:
+      "permission-sync container-audience snapshot; derived upstream data, not config",
+  },
+  kbDocumentsTable: {
+    audited: false,
+    reason: "child of knowledge base; parent audited",
+  },
+  kbDirectoriesTable: {
+    audited: true,
+    model: KbDirectoryModel,
+  },
+  kbDirectoryTeamsTable: {
+    audited: false,
+    reason: "join table; the directory's audit snapshot carries its team ids",
+  },
+  kbFilesTable: {
+    audited: true,
+    model: KbFileModel,
+  },
+  kbFileTeamsTable: {
+    audited: false,
+    reason: "join table; the file's audit snapshot carries its team ids",
+  },
+  kbFileDocumentsTable: {
+    audited: false,
+    reason:
+      "derived link between a repository file and the documents indexed from it",
+  },
+  kbUploadConnectorsTable: {
+    audited: false,
+    reason: "internal plumbing; one hidden upload connector per knowledge base",
+  },
+  kbExternalGroupsTable: {
+    audited: false,
+    reason:
+      "permission-sync source-group catalog; derived upstream data, not config",
+  },
+  kbExternalUserGroupsTable: {
+    audited: false,
+    reason:
+      "permission-sync group-membership snapshot; derived upstream data, not config",
+  },
+  kbMemberOverridesTable: {
+    audited: false,
+    reason:
+      "admin member mapping mutated only via /api/connectors/:id/member-overrides, audited at the route level as connector.updated; the connector audit snapshot carries the mapping list so upsert/delete diffs",
+  },
+  modelPoolMembersTable: {
+    audited: false,
+    reason: "child: pool × provider key; parent (model pool) audited",
+  },
+  autoRouterVirtualApiKeysTable: {
+    audited: false,
+    reason: "join: auto router × virtual key; parent (virtual key) audited",
+  },
+  modelPoolVirtualApiKeysTable: {
+    audited: false,
+    reason: "join: pool × virtual key; parent (model pool) audited",
+  },
+  llmProviderApiKeyModelsTable: {
+    audited: false,
+    reason: "join: provider key × model; parent audited",
+  },
+  githubAppAccountsTable: {
+    audited: false,
+    reason:
+      "child: a GitHub Copilot plan's GitHub organization, written with its provider key; parent (LLM provider API key) audited",
+  },
+  limitModelUsageTable: {
+    audited: false,
+    reason: "usage metrics; runtime data, not config",
+  },
+
+  // =========================================================================
+  // Execution / runtime state
+  // =========================================================================
+  connectorRunsTable: {
+    audited: false,
+    reason: "connector run execution log",
+  },
+  modelCostBackfillsTable: {
+    audited: false,
+    reason:
+      "background job state; starting a backfill is audited at its route, and the worker's progress writes are not admin actions",
+  },
+  scheduleTriggerRunsTable: {
+    audited: false,
+    reason: "schedule trigger run execution log",
+  },
+  tasksTable: { audited: false, reason: "task queue runtime state" },
+
+  // =========================================================================
+  // ChatOps runtime
+  // =========================================================================
+  chatopsMsTeamsUserConnectionsTable: {
+    audited: false,
+    reason:
+      "a Teams user's own sign-in for reading the files they share with the bot, created and removed only by that user from Teams; tokens live in the secrets manager",
+  },
+  chatopsUserAdmissionsTable: {
+    audited: false,
+    reason: "pending ChatOps execution admission; runtime state",
+  },
+  chatopsProcessedMessagesTable: {
+    audited: false,
+    reason: "ChatOps message dedup; runtime state",
+  },
+  chatopsThreadContextsTable: {
+    audited: false,
+    reason: "ChatOps thread → A2A context mapping; runtime state",
+  },
+
+  // =========================================================================
+  // Email / messaging ingest
+  // =========================================================================
+  incomingEmailSubscriptionsTable: {
+    audited: false,
+    reason: "incoming email subscription config; low-value",
+  },
+  processedEmailsTable: {
+    audited: false,
+    reason: "email dedup ledger; runtime state",
+  },
+
+  // =========================================================================
+  // Secrets (presence audited via parent hasSecret flag)
+  // =========================================================================
+  secretsTable: {
+    audited: false,
+    reason:
+      "secret material; presence audited via parent resource hasSecret flag",
+  },
+  contentEncryptionStateTable: {
+    audited: false,
+    reason: "internal backfill progress bookkeeping, no user-facing state",
+  },
+  encryptionKeyCanariesTable: {
+    audited: false,
+    reason:
+      "internal startup canary for encryption-key verification; no user-facing writes",
+  },
+
+  // =========================================================================
+  // User / token material
+  // =========================================================================
+  usersTable: {
+    audited: false,
+    reason: "user lifecycle audited via auth events + member.*",
+  },
+  serviceAccountsTable: {
+    audited: true,
+    model: ServiceAccountModel,
+  },
+  serviceAccountFederatedCredentialsTable: {
+    audited: true,
+    model: ServiceAccountFederatedCredentialModel,
+  },
+  serviceAccountTokensTable: {
+    audited: false,
+    reason: "credential material; audited through service account token count",
+  },
+
+  // =========================================================================
+  // Misc ephemeral
+  // =========================================================================
+  browserTabStatesTable: {
+    audited: false,
+    reason: "ephemeral browser tab state; per-user UI cache",
+  },
+  browserStorageStatesTable: {
+    audited: true,
+    model: BrowserStorageStateModel,
+  },
+
+  // =========================================================================
+  // Chat active run (streaming execution state)
+  // =========================================================================
+  chatActiveRunsTable: {
+    audited: false,
+    reason: "chat active run execution state; high-volume streaming runtime",
+  },
+  chatActiveRunEventsTable: {
+    audited: false,
+    reason: "chat active run event stream; child of chatActiveRunsTable",
+  },
+
+  // =========================================================================
+  // Site notifications
+  // =========================================================================
+  siteNotificationsTable: {
+    audited: false,
+    reason: "ephemeral in-app notifications; per-user UI state",
+  },
+  guardrailsDeploymentTable: {
+    audited: true,
+    model: GuardrailsDeploymentModel,
+  },
+  openappaGithubSyncTable: { audited: true, model: OpenAppaGithubSyncModel },
+  openappaBatteryInstallsTable: {
+    audited: true,
+    model: OpenAppaBatteryInstallModel,
+  },
+  openappaBatteryPackagesTable: {
+    audited: true,
+    model: OpenAppaBatteryPackageModel,
+  },
+  openappaCredentialBindingsTable: {
+    audited: true,
+    model: OpenAppaCredentialBindingModel,
+  },
+  openappaEffectivePoliciesTable: {
+    audited: false,
+    reason:
+      "derived from the audited root policy and battery installs; recomposed, never edited",
+  },
+  openappaEventsTable: {
+    audited: false,
+    reason: "OpenAPPA owns its immutable policy event history",
+  },
+  openappaPolicyFilesTable: {
+    audited: false,
+    reason: "OpenAPPA owns content-addressed policy history",
+  },
+  openappaDeploymentsTable: {
+    audited: false,
+    reason:
+      "OpenAPPA moves each organization's policy head when it publishes; derived from the audited policy",
+  },
+  openappaPolicyRevisionsTable: {
+    audited: false,
+    reason: "OpenAPPA owns each organization's published policy revisions",
+  },
+  openappaOperationsTable: {
+    audited: false,
+    reason: "native hook idempotency ledger",
+  },
+  openappaHostKeysTable: {
+    audited: false,
+    reason: "native host-event lookup index",
+  },
+  openappaProcessedResultsTable: {
+    audited: false,
+    reason: "approved tool outputs and processing receipts",
+  },
+  openappaDispatchLeasesTable: {
+    audited: false,
+    reason: "native dispatch ownership markers; no user-facing state",
+  },
+  openappaRootsTable: {
+    audited: false,
+    reason: "native lock rows for each trajectory family; no user-facing state",
+  },
+  openappaPeerInboxesTable: {
+    audited: false,
+    reason: "native lock rows for each peer inbox; no user-facing state",
+  },
+  openappaEmbeddedPeerMessagesTable: {
+    audited: false,
+    reason: "runtime-owned peer inbox; admissions belong to OpenAPPA history",
+  },
+  openappaHeldPeerMessagesTable: {
+    audited: false,
+    reason:
+      "runtime-owned held values; bodies are excluded from platform audits",
+  },
+  openappaSessionsTable: {
+    audited: false,
+    reason: "authenticated adapter identity mapping",
+  },
+  openappaUnenforcedSessionsTable: {
+    audited: false,
+    reason:
+      "proxy record of sessions that started while enforcement was off or were superyelled",
+  },
+  openappaThreadStatesTable: {
+    audited: false,
+    reason: "proxy record of what a governed provider thread was ruled on",
+  },
+  openappaUnenforcedCallsTable: {
+    audited: false,
+    reason: "proxy record of tool calls made while enforcement was off",
+  },
+  openappaPolicyTestSuitesTable: {
+    audited: false,
+    reason:
+      "test scenario definitions do not change enforced policy or authorization; exact inputs are retained with run evidence",
+  },
+  openappaPolicyTestRunsTable: {
+    audited: false,
+    reason:
+      "bounded replay result history; evaluation does not mutate enforced policy or authorization",
+  },
+  openappaYellsTable: { audited: true, model: OpenAppaYellModel },
+  openappaExternalConsultsTable: {
+    audited: false,
+    reason: "external consult dataset the native runtime appends",
+  },
+  openappaLabelChangesTable: {
+    audited: false,
+    reason: "label history dataset the native runtime appends",
+  },
+  startupMigrationsTable: {
+    audited: false,
+    reason:
+      "internal completion ledger committed with application data upgrades",
+  },
+  interactionUserActivityTable: {
+    audited: false,
+    reason: "derived log user activity counts",
+  },
+  interactionUserActivityDeltasTable: {
+    audited: false,
+    reason: "transactional rebuild delta balances",
+  },
+  interactionUserActivityStateTable: {
+    audited: false,
+    reason: "internal rebuild readiness and owner revision",
+  },
+  interactionUserActivityUsersTable: {
+    audited: false,
+    reason: "internal per-user rebuild checkpoints",
+  },
+  interactionUserActivityMissingOwnersTable: {
+    audited: false,
+    reason: "internal unresolved owner dependencies",
+  },
+  interactionSessionHeadsTable: {
+    audited: false,
+    reason: "derived newest-interaction index of log sessions",
+  },
+  interactionSessionHeadsBackfillTable: {
+    audited: false,
+    reason: "internal backfill progress marker",
+  },
+  llmUsageHourlyTable: {
+    audited: false,
+    reason: "derived hourly totals of interactions for cost statistics",
+  },
+  llmUsageDailyTable: {
+    audited: false,
+    reason: "derived daily totals of interactions for cost statistics",
+  },
+  llmUsageRollupStateTable: {
+    audited: false,
+    reason: "internal rollup progress marker",
+  },
+  llmUsageRollupDirtyTable: {
+    audited: false,
+    reason: "internal queue of rollup hours to recompute",
+  },
+  interactionBillingTable: {
+    audited: false,
+    reason: "content-free idempotent billing receipts",
+  },
+  limitBillingUsageTable: {
+    audited: false,
+    reason: "transactional settled usage projection",
+  },
+  routingDecisionsTable: {
+    audited: false,
+    reason: "auto-routing execution state written per proxied session",
+  },
+  routingUsageTable: {
+    audited: false,
+    reason: "auto-routing usage written with each interaction",
+  },
+  autoRoutingTiersTable: {
+    audited: false,
+    reason: "child of an auto router; parent audited",
+  },
+  routingPlansTable: {
+    audited: false,
+    reason: "system-written auto-routing fit outcomes",
+  },
+  routingScorerVersionsTable: {
+    audited: false,
+    reason: "system-written immutable scorer specs",
+  },
+  routingBackfillsTable: {
+    audited: false,
+    reason:
+      "background job state; the row records who started it, and the worker's progress writes are not admin actions",
+  },
+  routingHistorySessionsTable: {
+    audited: false,
+    reason: "worker-written scalars of past sessions found by a backfill scan",
+  },
+  routingHistoryUsageTable: {
+    audited: false,
+    reason: "worker-written usage copied from past interactions",
+  },
+  routingHistoryScoresTable: {
+    audited: false,
+    reason: "worker-written scorer readings of past sessions",
+  },
+  toolSearchTextsTable: {
+    audited: false,
+    reason: "worker-written search vocabulary derived from tool definitions",
+  },
+} satisfies Record<keyof typeof schema, AuditDecision>;
+
+/**
+ * Merges enterprise-edition audit decisions into AUDIT_DECISIONS.
+ *
+ * Must be called once at server startup (before requests begin), after
+ * `config` is initialized. Follows the same pattern as `initAuditRegistry()`.
+ *
+ * When the EE license is active, `identityProvidersTable` is upgraded from
+ * its default `audited: false` placeholder to `audited: true` with the
+ * real IdentityProviderModel so the runtime cross-check tests pass.
+ */
+export async function initAuditDecisions(): Promise<void> {
+  if (!config.enterpriseFeatures.core) return;
+  // biome-ignore lint/style/noRestrictedImports: conditional EE import, never runs in OSS builds
+  const idpModule = await import("../models/identity-provider.ee");
+  const IdentityProviderModel = idpModule.default;
+  (AUDIT_DECISIONS as Record<string, AuditDecision>).identityProvidersTable = {
+    audited: true,
+    model: IdentityProviderModel,
+  };
+}

@@ -1,13 +1,19 @@
 import {
+  BillingModeSchema,
+  ENCRYPTED_CHAT_REDACTED_VALUES,
   InteractionSourceSchema,
+  isEncryptedChatUnavailableContent,
+  LogContentNotStoredSchema,
   SupportedProvidersDiscriminatorSchema,
-} from "@shared";
+} from "@archestra/shared";
 import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 import { z } from "zod";
-import { schema } from "@/database";
+import { schema } from "@/database/schema";
+import { AgentTypeSchema } from "./agent";
+import { AttributionLabelsSchema } from "./attribution-label";
+import { AudioAuditRequestSchema, AudioAuditResponseSchema } from "./audio";
 import { SelectConversationChatErrorSchema } from "./conversation-chat-error";
-import { DualLlmAnalysisSchema } from "./dual-llm";
-import { UnsafeContextBoundarySchema } from "./interaction-guardrails";
+import { ToolCallBlockSchema } from "./interaction-guardrails";
 import {
   Anthropic,
   Azure,
@@ -16,10 +22,16 @@ import {
   Cohere,
   DeepSeek,
   Gemini,
+  GithubCopilot,
   Groq,
+  Jev,
+  Kimi,
+  KimiCode,
+  Microsoft365Copilot,
   Minimax,
   Mistral,
   Ollama,
+  OllamaNative,
   OpenAi,
   Openrouter,
   Perplexity,
@@ -27,9 +39,46 @@ import {
   Xai,
   Zhipuai,
 } from "./llm-providers";
-import { ToonSkipReasonSchema } from "./tool-result-compression";
+import {
+  PassthroughRequestSchema,
+  PassthroughResponseSchema,
+} from "./passthrough";
+import {
+  RealtimeInteractionRequestSchema,
+  RealtimeInteractionResponseSchema,
+} from "./realtime";
+import { VirtualApiKeyTypeSchema } from "./virtual-api-key";
+import { ResourceVisibilityScopeSchema } from "./visibility";
 
 export { InteractionSourceSchema };
+
+/** Content-bearing list metadata, protected by the same key as the request. */
+export const InteractionSessionPreviewSchema = z.object({
+  hasContent: z.boolean(),
+  isTitleGeneration: z.boolean(),
+  isPromptSuggestion: z.boolean(),
+  isOpenCodeSideTurn: z.boolean(),
+  contentNotStored: z.boolean(),
+  lastUserMessagePreview: z.string().nullable(),
+  claudeCodeTitle: z.string().nullable(),
+  /**
+   * What the request produced: the tools its response asked for, else the
+   * start of its reply. Rows written before these existed have neither.
+   */
+  responseToolNames: z.array(z.string()).optional(),
+  /**
+   * The tool calls the response asked for, with the provider's ids: ties a
+   * later tool result (a guardrails label change, say) back to this request.
+   * Rows written before it existed, and wires without ids, have none.
+   */
+  responseToolCalls: z
+    .array(z.object({ id: z.string(), name: z.string() }))
+    .optional(),
+  responseTextPreview: z.string().nullable().optional(),
+});
+export type InteractionSessionPreview = z.infer<
+  typeof InteractionSessionPreviewSchema
+>;
 
 export const UserInfoSchema = z.object({
   id: z.string(),
@@ -39,18 +88,116 @@ export const UserInfoSchema = z.object({
 export const InteractionAuthMethodSchema = z.enum([
   "provider_key",
   "virtual_key",
+  "passthrough_virtual_key",
   "jwks",
   "oauth_client_credentials",
   "oauth_user",
+  "personal_token",
   "internal",
   "unknown",
 ]);
+
+/**
+ * Why a session has no user attached. A blank user in the logs is otherwise
+ * indistinguishable from a bug, when in practice it almost always means the
+ * traffic arrived on a credential that identifies no one.
+ *
+ * - `shared_virtual_key` — a team- or org-scoped virtual key. Only *personal*
+ *   virtual keys carry an owner, so a shared key attributes to nobody. The key
+ *   itself is still named, in `SessionSummary.virtualKeys`; devs connecting
+ *   individually is what attributes the traffic to people.
+ * - `provider_key` — the client sent its own upstream provider credential, so
+ *   Archestra never saw an identity to record.
+ * - `client_credentials` — an OAuth client-credentials grant: a machine, not
+ *   a person.
+ * - `internal` — Archestra's own traffic (embeddings, title generation).
+ * - `unknown` — none of the above matched.
+ */
+export const SessionUnattributedReasonSchema = z.enum([
+  "shared_virtual_key",
+  "provider_key",
+  "client_credentials",
+  "internal",
+  "unknown",
+]);
+
+export type SessionUnattributedReason = z.infer<
+  typeof SessionUnattributedReasonSchema
+>;
+
+/**
+ * The virtual API key a logged request authenticated with, resolved to
+ * something a human can act on. Per-user attribution is the whole point of a
+ * virtual key, so the logs have to name the key and say who it belongs to
+ * rather than only reporting `auth_method = virtual_key`.
+ *
+ * Two different questions, deliberately kept apart:
+ *
+ * - **Who does this key attribute traffic to?** `ownerUserId` /
+ *   `ownerUserName`, and only ever a *personal* key's author — that is the
+ *   single place the proxy takes a user identity from a virtual key
+ *   (`llm-proxy-handler.ts`: `virtualKeyIsPersonal`). A shared key
+ *   attributes to nobody, so both stay null on one.
+ * - **Who is this key shared with?** `teams` for a team-scoped key,
+ *   `createdByUserName` for whoever set it up. A shared key is not
+ *   anonymous — it belongs to a team, or to the organization at somebody's
+ *   hand — and answering "which shared key, shared with whom" is most of what
+ *   makes a shared-key session actionable.
+ *
+ * Keeping them separate is what stops the second answer being read as the
+ * first: a key's creator is not the person who made the request.
+ */
+const VirtualKeyTeamSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+});
+
+export const InteractionVirtualKeySchema = z.object({
+  id: z.string().uuid(),
+  name: z.string(),
+  /**
+   * `personal` = owned by one user; `team` = shared with the teams in
+   * `teams`; `org` = shared with the whole organization.
+   */
+  scope: ResourceVisibilityScopeSchema,
+  /**
+   * `standard` supplied the provider credential; `passthrough` carried the
+   * acting user's identity only. One request can use one of each.
+   */
+  keyType: VirtualApiKeyTypeSchema,
+  /** Displayable token prefix (`archestra_xxxx`), never the secret itself. */
+  tokenStart: z.string(),
+  ownerUserId: z.string().nullable(),
+  ownerUserName: z.string().nullable(),
+  /**
+   * Teams a team-scoped key is shared with, by name. Empty for personal and
+   * org-scoped keys, and for a team key whose assignments were all removed.
+   */
+  teams: z.array(VirtualKeyTeamSchema),
+  /**
+   * Who created the key. Present regardless of scope, and never an
+   * attribution: on a shared key this is the person who set it up, not the
+   * person whose request was logged. Null once their account is gone.
+   */
+  createdByUserName: z.string().nullable(),
+});
+
+export type InteractionVirtualKey = z.infer<typeof InteractionVirtualKeySchema>;
+
+/**
+ * A failed upstream call is persisted with the provider `type` but this shape
+ * in place of a provider response (the proxy error path in llm-proxy-handler).
+ * The insert union and every read arm accept it so the row round-trips instead
+ * of poisoning the whole interactions list on read-back.
+ */
+export const InteractionErrorResponseSchema = z.object({ error: z.string() });
 
 /**
  * Request/Response schemas that accept any provider type
  * These are used for the database schema definition
  */
 export const InteractionRequestSchema = z.union([
+  AudioAuditRequestSchema,
   OpenAi.API.ChatCompletionRequestSchema,
   OpenAi.API.EmbeddingRequestSchema,
   Gemini.API.GenerateContentRequestSchema,
@@ -67,17 +214,50 @@ export const InteractionRequestSchema = z.union([
   Cohere.API.ChatRequestSchema,
   Zhipuai.API.ChatCompletionRequestSchema,
   DeepSeek.API.ChatCompletionRequestSchema,
+  GithubCopilot.API.ChatCompletionRequestSchema,
+  Kimi.API.ChatCompletionRequestSchema,
+  KimiCode.API.ChatCompletionRequestSchema,
+  Microsoft365Copilot.API.ChatCompletionRequestSchema,
   Minimax.API.ChatCompletionRequestSchema,
   OpenAi.API.ResponsesRequestSchema,
   Azure.API.ChatCompletionRequestSchema,
   Azure.API.ResponsesRequestSchema,
+  Azure.API.ImageGenerationRequestSchema,
+  Azure.API.RealtimeTurnRequestSchema,
+  Jev.API.DecisionsRequestSchema,
+  PassthroughRequestSchema,
+  RealtimeInteractionRequestSchema,
 ]);
 
+/**
+ * Embedding interactions are logged with a truncated vector preview (see
+ * `buildEmbeddingInteraction`): each vector holds only its first few values plus
+ * `truncatedFrom` = the full length. This interaction-only schema permits that
+ * marker (on both the write and read sides) so it survives read-back
+ * serialization, without polluting the canonical OpenAI embedding response
+ * contract used for live proxy responses.
+ */
+const EmbeddingInteractionResponseSchema =
+  OpenAi.API.EmbeddingResponseSchema.extend({
+    data: z.array(
+      z.object({
+        object: z.literal("embedding"),
+        embedding: z.array(z.number()),
+        // Optional for the same reason as the canonical embedding schema: a
+        // stored interaction from an OpenAI-compatible upstream that omitted
+        // `index` must not fail the whole interaction list on read-back.
+        index: z.number().optional(),
+        truncatedFrom: z.number().optional(),
+      }),
+    ),
+  });
+
 export const InteractionResponseSchema = z.union([
+  AudioAuditResponseSchema,
   OpenAi.API.ChatCompletionResponseSchema,
-  OpenAi.API.EmbeddingResponseSchema,
+  EmbeddingInteractionResponseSchema,
   Gemini.API.GenerateContentResponseSchema,
-  Anthropic.API.MessagesResponseSchema,
+  Anthropic.API.MessagesResponseWireSchema,
   Bedrock.API.ConverseResponseSchema,
   Cerebras.API.ChatCompletionResponseSchema,
   Mistral.API.ChatCompletionResponseSchema,
@@ -90,18 +270,43 @@ export const InteractionResponseSchema = z.union([
   Cohere.API.ChatResponseSchema,
   Zhipuai.API.ChatCompletionResponseSchema,
   DeepSeek.API.ChatCompletionResponseSchema,
+  GithubCopilot.API.ChatCompletionResponseSchema,
+  Kimi.API.ChatCompletionResponseSchema,
+  KimiCode.API.ChatCompletionResponseSchema,
+  Microsoft365Copilot.API.ChatCompletionResponseSchema,
   Minimax.API.ChatCompletionResponseSchema,
   OpenAi.API.ResponsesResponseSchema,
+  // The compact endpoint's native response is logged under `openai:responses`
+  // but is not a ResponsesResponseSchema (`object` is "response.compaction").
+  OpenAi.API.ResponsesCompactedResponseSchema,
   Azure.API.ChatCompletionResponseSchema,
   Azure.API.ResponsesResponseSchema,
+  Azure.API.ImageGenerationResponseSchema,
+  Jev.API.DecisionsResponseSchema,
+  InteractionErrorResponseSchema,
+  PassthroughResponseSchema,
+  RealtimeInteractionResponseSchema,
+]);
+
+/**
+ * The shapes content takes when it is not available to the reader: an encrypted
+ * chat's, encrypted under the browser key (locked) or never stored (redacted),
+ * and content the Log Content mode kept out of storage. Neither resembles a provider payload, so every read arm
+ * has to accept them explicitly — otherwise one encrypted-chat row 500s the whole
+ * interactions list rather than rendering as unavailable.
+ */
+const EncryptedChatUnavailableContentSchema = z.union([
+  // First, so the outcome it carries is not stripped by the generic
+  // `__redacted` arm below, which also admits its value.
+  LogContentNotStoredSchema,
+  z.object({ __encryptedChatSealed: z.string() }),
+  z.object({ __redacted: z.enum(ENCRYPTED_CHAT_REDACTED_VALUES) }),
 ]);
 
 const extendedFields = {
   source: InteractionSourceSchema.nullable().optional(),
   authMethod: InteractionAuthMethodSchema.nullable().optional(),
-  toonSkipReason: ToonSkipReasonSchema.nullable().optional(),
-  dualLlmAnalyses: z.array(DualLlmAnalysisSchema).nullable().optional(),
-  unsafeContextBoundary: UnsafeContextBoundarySchema.nullable().optional(),
+  toolCallBlock: ToolCallBlockSchema.nullable().optional(),
 };
 
 /**
@@ -110,12 +315,120 @@ const extendedFields = {
  */
 const BaseSelectInteractionSchema = createSelectSchema(
   schema.interactionsTable,
-  extendedFields,
+  {
+    ...extendedFields,
+    // Required on read: the column is NOT NULL, so every row carries a concrete
+    // BillingMode. (The default override belongs on the insert schema only.)
+    billingMode: BillingModeSchema,
+    attributionLabels: AttributionLabelsSchema.nullable(),
+  },
 );
 
-const BaseSelectInteractionResponseSchema = BaseSelectInteractionSchema.extend({
-  chatErrors: z.array(SelectConversationChatErrorSchema).optional(),
+const DescribedSelectInteractionSchema = BaseSelectInteractionSchema.extend({
+  inputTokens: BaseSelectInteractionSchema.shape.inputTokens.describe(
+    "Input tokens recorded for this request. Null means unavailable; zero is a recorded zero. The count can be partial if a stream ends early.",
+  ),
+  inputTokensEstimated:
+    BaseSelectInteractionSchema.shape.inputTokensEstimated.describe(
+      "True when the input token count was estimated locally rather than reported by the provider.",
+    ),
+  outputTokens: BaseSelectInteractionSchema.shape.outputTokens.describe(
+    "Output tokens recorded for this request. Null means unavailable; zero is a recorded zero. The count can be partial if a stream ends early.",
+  ),
+  cacheReadTokens: BaseSelectInteractionSchema.shape.cacheReadTokens.describe(
+    "Tokens read from provider cache. Null means unavailable or not applicable; zero is a recorded zero.",
+  ),
+  cacheWriteTokens: BaseSelectInteractionSchema.shape.cacheWriteTokens.describe(
+    "Tokens written to provider cache. Null means unavailable or not applicable; zero is a recorded zero.",
+  ),
+  cacheWrite1hTokens:
+    BaseSelectInteractionSchema.shape.cacheWrite1hTokens.describe(
+      "Tokens written to a one-hour provider cache. Null means unavailable or not applicable; zero is a recorded zero.",
+    ),
 });
+
+/**
+ * Delta-encoding bookkeeping columns. They live on the Drizzle table (and so on
+ * the row the model reads) so the delta manager can walk parent chains, but they
+ * are internal plumbing: the `request` / `processedRequest` returned by the model
+ * is always fully reconstructed, so these must never leak into the public API
+ * surface (OpenAPI spec, generated response types). Omit them from every response
+ * schema. The internal row type stays available via Drizzle's `$inferSelect`.
+ */
+const DELTA_ENCODING_COLUMNS = {
+  threadId: true,
+  parentId: true,
+  requestSharedPrefix: true,
+  processedRequestSharedPrefix: true,
+  requestLastMessageIdx: true,
+  requestLastMessageHash: true,
+} as const;
+
+/**
+ * Server-side plumbing for the same reason as the delta columns: it tells the
+ * read path which key a row's content is under. Clients never need it — a
+ * locked row already announces itself through the sentinel in the content
+ * field, which also carries the conversation id — so it stays out of the
+ * public API surface rather than widening it for nothing.
+ */
+const INTERNAL_ENCRYPTION_COLUMNS = {
+  // Derived list content is internal too, and can carry an encrypted envelope.
+  sessionPreview: true,
+  encryptedChatConversationId: true,
+} as const;
+
+/**
+ * Which GitHub Copilot credential served a request: an organization's
+ * subscription (a GitHub App key, billed to that organization) or a member's
+ * own sign-in.
+ */
+export const CopilotCredentialSourceSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("organization"),
+    /** The GitHub organization's login. */
+    organization: z.string().nullable(),
+    /** The name GitHub shows for it, when known. */
+    organizationName: z.string().nullable().optional(),
+  }),
+  z.object({ kind: z.literal("personal") }),
+]);
+export type CopilotCredentialSource = z.infer<
+  typeof CopilotCredentialSourceSchema
+>;
+
+const BaseSelectInteractionResponseSchema =
+  DescribedSelectInteractionSchema.omit({
+    ...DELTA_ENCODING_COLUMNS,
+    ...INTERNAL_ENCRYPTION_COLUMNS,
+  }).extend({
+    chatErrors: z.array(SelectConversationChatErrorSchema).optional(),
+    /**
+     * Name of `connectorId`'s knowledge base connector, resolved within the
+     * caller's organization. Null once the connector is gone; absent on endpoints
+     * that do not resolve it.
+     */
+    connectorName: z.string().nullable().optional(),
+    /**
+     * For a GitHub Copilot request: the organization subscription or personal
+     * sign-in that served it. Null when unknown; absent on endpoints that do
+     * not resolve it.
+     */
+    copilotCredentialSource:
+      CopilotCredentialSourceSchema.nullable().optional(),
+    /**
+     * `virtualKeyId` resolved to its key and owner, within the caller's
+     * organization. Null when the request used no standard virtual key (or the
+     * key has since been deleted); absent on endpoints that do not resolve it.
+     */
+    virtualKey: InteractionVirtualKeySchema.nullable().optional(),
+    /**
+     * Same for `passthroughVirtualKeyId` — the key that carried the acting
+     * user's identity. Tracked separately because one request can present a
+     * standard key for the provider credential and a passthrough key for the
+     * user.
+     */
+    passthroughVirtualKey: InteractionVirtualKeySchema.nullable().optional(),
+  });
 
 /**
  * Schema for computed request type field
@@ -125,200 +438,572 @@ const BaseSelectInteractionResponseSchema = BaseSelectInteractionSchema.extend({
 export const RequestTypeSchema = z.enum(["main", "subagent"]);
 
 /**
+ * Scalar fields rendered by an interaction-list row. Large request, response,
+ * analysis and guardrail payloads stay behind the individual detail endpoint.
+ */
+export const InteractionSummarySchema = DescribedSelectInteractionSchema.pick({
+  id: true,
+  profileId: true,
+  externalAgentId: true,
+  sessionId: true,
+  model: true,
+  baselineModel: true,
+  billingMode: true,
+  inputTokens: true,
+  inputTokensEstimated: true,
+  outputTokens: true,
+  cacheReadTokens: true,
+  cacheWriteTokens: true,
+  cost: true,
+  baselineCost: true,
+  durationMs: true,
+  createdAt: true,
+  providerApiKeyId: true,
+  modelPoolId: true,
+  attempt: true,
+  attemptOutcome: true,
+  failureReason: true,
+}).extend({
+  attributionLabels: AttributionLabelsSchema.nullish(),
+  type: SupportedProvidersDiscriminatorSchema,
+  externalAgentIdLabel: z.string().nullable(),
+  requestType: RequestTypeSchema,
+  /** Origin of the call (`chat`, `chat:compaction`, …). Used to badge sub-agent rows. */
+  source: InteractionSourceSchema.nullable().optional(),
+  /**
+   * The latest user text this request carried, from its stored preview: names
+   * a turn by the prompt it served. Null when none was captured.
+   */
+  userMessagePreview: z.string().nullable().optional(),
+  /**
+   * What this request produced, from its stored preview: the tools its
+   * response asked for, else the start of its reply. One prompt drives many
+   * requests in an agent loop, so this is what tells them apart.
+   */
+  responseToolNames: z.array(z.string()).nullable().optional(),
+  /** The tool calls its response asked for, with the provider's ids. */
+  responseToolCalls: z
+    .array(z.object({ id: z.string(), name: z.string() }))
+    .nullable()
+    .optional(),
+  responseTextPreview: z.string().nullable().optional(),
+  /**
+   * Whether auto routing chose this request's model: a saved routing decision
+   * covers it. Its details are at `/api/llm-proxy-logs/:id/auto-routing`.
+   */
+  autoRouted: z.boolean(),
+});
+
+/**
+ * Persisted `request` / `processedRequest` payloads are re-validated on
+ * read-back, and the provider schemas inevitably drift from what was actually
+ * persisted (see FinishReasonSchema; delta-reconstructed requests can also be
+ * partial). Without a fallback, one nonconforming row 500s the entire
+ * GET /api/interactions response, so every read arm falls back to serializing
+ * the raw persisted object when it no longer matches the canonical schema.
+ * The canonical schema stays first so conforming rows keep precise OpenAPI
+ * types. Responses have their own guard: normalizeInteractionResponse below.
+ */
+const LoosePersistedPayloadSchema = z.record(z.string(), z.unknown());
+
+const withReadFallback = <T extends z.ZodTypeAny>(schema: T) =>
+  z.union([schema, LoosePersistedPayloadSchema]);
+
+/**
+ * Each arm's read schema accepts either the provider response, a persisted
+ * error response, or unavailable encrypted-chat content, so a failed interaction
+ * (stored with the provider `type`) and an encrypted-chat one both still serialize
+ * on read-back.
+ */
+const withErrorResponse = <T extends z.ZodTypeAny>(schema: T) =>
+  z.union([
+    schema,
+    InteractionErrorResponseSchema,
+    EncryptedChatUnavailableContentSchema,
+  ]);
+
+/**
  * Discriminated union schema for API responses
  * This provides type safety based on the type field
  */
+/**
+ * A Gemini row's request as logged: an image edit's row also names its
+ * reference images, as OpenAI edits do.
+ */
+const GeminiLoggedRequestSchema = Gemini.API.GenerateContentRequestSchema.and(
+  z.object({ input_files: z.record(z.string(), z.unknown()).optional() }),
+);
+
 export const SelectInteractionSchema = z.discriminatedUnion("type", [
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["openai:chatCompletions"]),
-    request: OpenAi.API.ChatCompletionRequestSchema,
-    processedRequest:
-      OpenAi.API.ChatCompletionRequestSchema.nullable().optional(),
-    response: OpenAi.API.ChatCompletionResponseSchema,
+    request: withReadFallback(OpenAi.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(OpenAi.API.ChatCompletionRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(OpenAi.API.ChatCompletionResponseSchema),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["openai:responses"]),
-    request: OpenAi.API.ResponsesRequestSchema,
-    processedRequest: OpenAi.API.ResponsesRequestSchema.nullable().optional(),
-    response: OpenAi.API.ResponsesResponseSchema,
+    request: withReadFallback(OpenAi.API.ResponsesRequestSchema),
+    processedRequest: withReadFallback(OpenAi.API.ResponsesRequestSchema)
+      .nullable()
+      .optional(),
+    // The responses/compact endpoint logs its native compacted response under
+    // this type, so accept it alongside ordinary Responses results — otherwise
+    // normalizeInteractionResponse coerces it to the malformed sentinel.
+    response: withErrorResponse(
+      z.union([
+        OpenAi.API.ResponsesResponseSchema,
+        OpenAi.API.ResponsesCompactedResponseSchema,
+      ]),
+    ),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["openai:embeddings"]),
-    request: OpenAi.API.EmbeddingRequestSchema,
-    processedRequest: OpenAi.API.EmbeddingRequestSchema.nullable().optional(),
-    response: OpenAi.API.EmbeddingResponseSchema,
+    request: withReadFallback(OpenAi.API.EmbeddingRequestSchema),
+    processedRequest: withReadFallback(OpenAi.API.EmbeddingRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(EmbeddingInteractionResponseSchema),
+  }),
+  // Gemini embeddings are persisted through the OpenAI-compatible embedding
+  // client, so they share OpenAI's embedding request/response shape.
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["gemini:embeddings"]),
+    request: withReadFallback(OpenAi.API.EmbeddingRequestSchema),
+    processedRequest: withReadFallback(OpenAi.API.EmbeddingRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(EmbeddingInteractionResponseSchema),
+  }),
+  // Bedrock (Titan) embeddings are normalized to the OpenAI embedding shape.
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["bedrock:embeddings"]),
+    request: withReadFallback(OpenAi.API.EmbeddingRequestSchema),
+    processedRequest: withReadFallback(OpenAi.API.EmbeddingRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(EmbeddingInteractionResponseSchema),
+  }),
+  // Cohere (direct) embeddings are normalized to the OpenAI embedding shape.
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["cohere:embeddings"]),
+    request: withReadFallback(OpenAi.API.EmbeddingRequestSchema),
+    processedRequest: withReadFallback(OpenAi.API.EmbeddingRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(EmbeddingInteractionResponseSchema),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["gemini:generateContent"]),
-    request: Gemini.API.GenerateContentRequestSchema,
-    processedRequest:
-      Gemini.API.GenerateContentRequestSchema.nullable().optional(),
-    response: Gemini.API.GenerateContentResponseSchema,
+    request: withReadFallback(GeminiLoggedRequestSchema),
+    processedRequest: withReadFallback(Gemini.API.GenerateContentRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Gemini.API.GenerateContentResponseSchema),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["anthropic:messages"]),
-    request: Anthropic.API.MessagesRequestSchema,
-    processedRequest: Anthropic.API.MessagesRequestSchema.nullable().optional(),
-    response: Anthropic.API.MessagesResponseSchema,
+    request: withReadFallback(Anthropic.API.MessagesRequestSchema),
+    processedRequest: withReadFallback(Anthropic.API.MessagesRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Anthropic.API.MessagesResponseWireSchema),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["bedrock:converse"]),
-    request: Bedrock.API.ConverseRequestSchema,
-    processedRequest: Bedrock.API.ConverseRequestSchema.nullable().optional(),
-    response: Bedrock.API.ConverseResponseSchema,
+    request: withReadFallback(Bedrock.API.ConverseRequestSchema),
+    processedRequest: withReadFallback(Bedrock.API.ConverseRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Bedrock.API.ConverseResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    /** Resolved prompt name if externalAgentId matches a prompt ID */
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  // Bedrock InvokeModel carries the Anthropic Messages wire format.
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["bedrock:invoke"]),
+    request: withReadFallback(Bedrock.API.InvokeRequestSchema),
+    processedRequest: withReadFallback(Bedrock.API.InvokeRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Bedrock.API.InvokeResponseWireSchema),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["cerebras:chatCompletions"]),
-    request: Cerebras.API.ChatCompletionRequestSchema,
-    processedRequest:
-      Cerebras.API.ChatCompletionRequestSchema.nullable().optional(),
-    response: Cerebras.API.ChatCompletionResponseSchema,
+    request: withReadFallback(Cerebras.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(Cerebras.API.ChatCompletionRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Cerebras.API.ChatCompletionResponseSchema),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["mistral:chatCompletions"]),
-    request: Mistral.API.ChatCompletionRequestSchema,
-    processedRequest:
-      Mistral.API.ChatCompletionRequestSchema.nullable().optional(),
-    response: Mistral.API.ChatCompletionResponseSchema,
+    request: withReadFallback(Mistral.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(Mistral.API.ChatCompletionRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Mistral.API.ChatCompletionResponseSchema),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["perplexity:chatCompletions"]),
-    request: Perplexity.API.ChatCompletionRequestSchema,
-    processedRequest:
-      Perplexity.API.ChatCompletionRequestSchema.nullable().optional(),
-    response: Perplexity.API.ChatCompletionResponseSchema,
+    request: withReadFallback(Perplexity.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(
+      Perplexity.API.ChatCompletionRequestSchema,
+    )
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Perplexity.API.ChatCompletionResponseSchema),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["groq:chatCompletions"]),
-    request: Groq.API.ChatCompletionRequestSchema,
-    processedRequest:
-      Groq.API.ChatCompletionRequestSchema.nullable().optional(),
-    response: Groq.API.ChatCompletionResponseSchema,
+    request: withReadFallback(Groq.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(Groq.API.ChatCompletionRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Groq.API.ChatCompletionResponseSchema),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["xai:chatCompletions"]),
-    request: Xai.API.ChatCompletionRequestSchema,
-    processedRequest: Xai.API.ChatCompletionRequestSchema.nullable().optional(),
-    response: Xai.API.ChatCompletionResponseSchema,
+    request: withReadFallback(Xai.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(Xai.API.ChatCompletionRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Xai.API.ChatCompletionResponseSchema),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["openrouter:chatCompletions"]),
-    request: Openrouter.API.ChatCompletionRequestSchema,
-    processedRequest:
-      Openrouter.API.ChatCompletionRequestSchema.nullable().optional(),
-    response: Openrouter.API.ChatCompletionResponseSchema,
+    request: withReadFallback(Openrouter.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(
+      Openrouter.API.ChatCompletionRequestSchema,
+    )
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Openrouter.API.ChatCompletionResponseSchema),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["vllm:chatCompletions"]),
-    request: Vllm.API.ChatCompletionRequestSchema,
-    processedRequest:
-      Vllm.API.ChatCompletionRequestSchema.nullable().optional(),
-    response: Vllm.API.ChatCompletionResponseSchema,
+    request: withReadFallback(Vllm.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(Vllm.API.ChatCompletionRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Vllm.API.ChatCompletionResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["ollama:chatCompletions"]),
-    request: Ollama.API.ChatCompletionRequestSchema,
-    processedRequest:
-      Ollama.API.ChatCompletionRequestSchema.nullable().optional(),
-    response: Ollama.API.ChatCompletionResponseSchema,
+    request: withReadFallback(Ollama.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(Ollama.API.ChatCompletionRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Ollama.API.ChatCompletionResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["ollama-native:chat"]),
+    request: withReadFallback(OllamaNative.API.ChatRequestSchema),
+    processedRequest: withReadFallback(OllamaNative.API.ChatRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(OllamaNative.API.ChatResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["cohere:chat"]),
-    request: Cohere.API.ChatRequestSchema,
-    processedRequest: Cohere.API.ChatRequestSchema.nullable().optional(),
-    response: Cohere.API.ChatResponseSchema,
+    request: withReadFallback(Cohere.API.ChatRequestSchema),
+    processedRequest: withReadFallback(Cohere.API.ChatRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Cohere.API.ChatResponseSchema),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["zhipuai:chatCompletions"]),
-    request: Zhipuai.API.ChatCompletionRequestSchema,
-    processedRequest:
-      Zhipuai.API.ChatCompletionRequestSchema.nullable().optional(),
-    response: Zhipuai.API.ChatCompletionResponseSchema,
+    request: withReadFallback(Zhipuai.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(Zhipuai.API.ChatCompletionRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Zhipuai.API.ChatCompletionResponseSchema),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["deepseek:chatCompletions"]),
-    request: DeepSeek.API.ChatCompletionRequestSchema,
-    processedRequest:
-      DeepSeek.API.ChatCompletionRequestSchema.nullable().optional(),
-    response: DeepSeek.API.ChatCompletionResponseSchema,
+    request: withReadFallback(DeepSeek.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(DeepSeek.API.ChatCompletionRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(DeepSeek.API.ChatCompletionResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    /** Resolved prompt name if externalAgentId matches a prompt ID */
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["kimi:chatCompletions"]),
+    request: withReadFallback(Kimi.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(Kimi.API.ChatCompletionRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Kimi.API.ChatCompletionResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    /** Resolved prompt name if externalAgentId matches a prompt ID */
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["kimi-code:chatCompletions"]),
+    request: withReadFallback(KimiCode.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(KimiCode.API.ChatCompletionRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(KimiCode.API.ChatCompletionResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    /** Resolved prompt name if externalAgentId matches a prompt ID */
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["github-copilot:chatCompletions"]),
+    request: withReadFallback(GithubCopilot.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(
+      GithubCopilot.API.ChatCompletionRequestSchema,
+    )
+      .nullable()
+      .optional(),
+    response: withErrorResponse(GithubCopilot.API.ChatCompletionResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    /** Resolved prompt name if externalAgentId matches a prompt ID */
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["microsoft-365-copilot:chatCompletions"]),
+    request: withReadFallback(
+      Microsoft365Copilot.API.ChatCompletionRequestSchema,
+    ),
+    processedRequest: withReadFallback(
+      Microsoft365Copilot.API.ChatCompletionRequestSchema,
+    )
+      .nullable()
+      .optional(),
+    response: withErrorResponse(
+      Microsoft365Copilot.API.ChatCompletionResponseSchema,
+    ),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["minimax:chatCompletions"]),
-    request: Minimax.API.ChatCompletionRequestSchema,
-    processedRequest:
-      Minimax.API.ChatCompletionRequestSchema.nullable().optional(),
-    response: Minimax.API.ChatCompletionResponseSchema,
+    request: withReadFallback(Minimax.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(Minimax.API.ChatCompletionRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Minimax.API.ChatCompletionResponseSchema),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["azure:chatCompletions"]),
-    request: Azure.API.ChatCompletionRequestSchema,
-    processedRequest:
-      Azure.API.ChatCompletionRequestSchema.nullable().optional(),
-    response: Azure.API.ChatCompletionResponseSchema,
+    request: withReadFallback(Azure.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(Azure.API.ChatCompletionRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Azure.API.ChatCompletionResponseSchema),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["azure:realtime"]),
+    request: withReadFallback(Azure.API.RealtimeTurnRequestSchema),
+    processedRequest: withReadFallback(Azure.API.RealtimeTurnRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Azure.API.ChatCompletionResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["azure:audio"]),
+    request: withReadFallback(AudioAuditRequestSchema),
+    processedRequest: withReadFallback(AudioAuditRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(AudioAuditResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["openai:audio"]),
+    request: withReadFallback(AudioAuditRequestSchema),
+    processedRequest: withReadFallback(AudioAuditRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(AudioAuditResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["azure:images", "openai:images"]),
+
+    request: withReadFallback(Azure.API.ImageGenerationRequestSchema),
+    processedRequest: withReadFallback(Azure.API.ImageGenerationRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Azure.API.ImageGenerationResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["azure:responses"]),
-    request: Azure.API.ResponsesRequestSchema,
-    processedRequest: Azure.API.ResponsesRequestSchema.nullable().optional(),
-    response: Azure.API.ResponsesResponseSchema,
+    request: withReadFallback(Azure.API.ResponsesRequestSchema),
+    processedRequest: withReadFallback(Azure.API.ResponsesRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Azure.API.ResponsesResponseSchema),
     requestType: RequestTypeSchema.optional(),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["perplexity:responses"]),
+    request: withReadFallback(Perplexity.API.ResponsesRequestSchema),
+    processedRequest: withReadFallback(Perplexity.API.ResponsesRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Perplexity.API.ResponsesResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    /** Resolved prompt name if externalAgentId matches a prompt ID */
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["github-copilot:responses"]),
+    request: withReadFallback(GithubCopilot.API.ResponsesRequestSchema),
+    processedRequest: withReadFallback(GithubCopilot.API.ResponsesRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(GithubCopilot.API.ResponsesResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    /** Resolved prompt name if externalAgentId matches a prompt ID */
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["jev:decisions"]),
+    request: withReadFallback(Jev.API.DecisionsRequestSchema),
+    processedRequest: withReadFallback(Jev.API.DecisionsRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Jev.API.DecisionsResponseSchema),
+    /** Resolved prompt name if externalAgentId matches a prompt ID */
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["openai:realtime"]),
+    request: withReadFallback(RealtimeInteractionRequestSchema),
+    processedRequest: withReadFallback(RealtimeInteractionRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(RealtimeInteractionResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["openai:passthrough", "anthropic:passthrough"]),
+    request: withReadFallback(PassthroughRequestSchema),
+    processedRequest: withReadFallback(PassthroughRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(PassthroughResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
 ]);
+
+/**
+ * Per-`type` read schema for the `response` field, derived from the
+ * discriminated union above so it can never drift from the arms.
+ */
+const responseSchemaByInteractionType = new Map<string, z.ZodTypeAny>(
+  SelectInteractionSchema.options.map((arm) => [
+    arm.shape.type.options[0],
+    arm.shape.response,
+  ]),
+);
+
+/**
+ * Coerce a stored `response` that no longer matches its provider's read schema
+ * (provider-schema drift, partial/aborted-stream bodies, legacy error shapes)
+ * into a serializable sentinel, so a single unparseable row can't 500 the whole
+ * interactions list. Returns the response unchanged when it already conforms.
+ */
+export function normalizeInteractionResponse(
+  type: string,
+  response: unknown,
+): unknown {
+  // An encrypted-chat row's content is deliberately unavailable, not malformed.
+  // Both sentinels would fail the provider schema below, and reporting them as
+  // corrupt would be actively misleading — one means "encrypted, an escrow
+  // holder can recover it", the other "never stored".
+  if (isEncryptedChatUnavailableContent(response)) {
+    return response;
+  }
+  const schema = responseSchemaByInteractionType.get(type);
+  if (!schema) {
+    return response;
+  }
+  return schema.safeParse(response).success
+    ? response
+    : { error: "Malformed stored interaction response" };
+}
 
 export const InsertInteractionSchema = createInsertSchema(
   schema.interactionsTable,
   {
     ...extendedFields,
+    // Optional on write: the column has a DB default ("metered"), so callers may
+    // omit it. The proxy write path sets it explicitly (buildInteractionRecord).
+    billingMode: BillingModeSchema.optional(),
+    attributionLabels: AttributionLabelsSchema.nullish(),
     type: SupportedProvidersDiscriminatorSchema,
     request: InteractionRequestSchema,
     processedRequest: InteractionRequestSchema.nullable().optional(),
@@ -328,56 +1013,201 @@ export const InsertInteractionSchema = createInsertSchema(
   // Override profileId - required for proxy interactions, nullable for system interactions
   // (e.g., knowledge base embeddings/reranking have no associated profile)
   profileId: z.string().uuid().nullable(),
+  /** Accounting metadata is stored separately from encrypted log content. */
+  billingAttribution: z
+    .custom<import("@/utils/billable-usage").BillingAttribution>()
+    .optional(),
+  billingUsage: z
+    .custom<import("@/utils/billable-usage").PricedBillingUsage>()
+    .optional(),
+  /** The auto-routing decision this request was routed by; its usage is recorded with the row. */
+  autoRoutingDecisionId: z.string().uuid().optional(),
 });
 
 export type UserInfo = z.infer<typeof UserInfoSchema>;
 
 export type Interaction = z.infer<typeof SelectInteractionSchema>;
+export type InteractionSummary = z.infer<typeof InteractionSummarySchema>;
 export type InsertInteraction = z.infer<typeof InsertInteractionSchema>;
 export type InteractionAuthMethod = z.infer<typeof InteractionAuthMethodSchema>;
 
 export type InteractionRequest = z.infer<typeof InteractionRequestSchema>;
 export type InteractionResponse = z.infer<typeof InteractionResponseSchema>;
 
-/**
- * TOON skip reason counts for session summaries
- */
-export const ToonSkipReasonCountsSchema = z.object({
-  applied: z.number(),
-  notEnabled: z.number(),
-  notEffective: z.number(),
-  noToolResults: z.number(),
+/** Max length of `lastUserMessagePreview` on session summaries. */
+export const LAST_USER_MESSAGE_PREVIEW_MAX_LENGTH = 200;
+
+/** One Agent Runtime run an LLM session handed work to. */
+const SessionHandoffRunSchema = z.object({
+  runId: z
+    .string()
+    .uuid()
+    .describe("The run's stable id: its first turn's task id."),
+  llmSessionId: z
+    .string()
+    .describe("The run's own LLM session: its workload name."),
+  originLlmSessionId: z
+    .string()
+    .describe("The LLM session that started the run."),
+  agentName: z.string(),
+  title: z.string(),
+  startedAt: z.date(),
 });
+
+/**
+ * The work changing hands between a session and a run: `push` starts the run,
+ * `pull` takes the work back (the run is stopped or its files are downloaded),
+ * `steer` sends it back to the run after a pull.
+ */
+const SessionHandoffMoveSchema = z.object({
+  kind: z.enum(["push", "pull", "steer"]),
+  runId: z.string().uuid(),
+  mcpToolCallId: z.string().uuid(),
+  at: z.date().describe("When the gateway call that made the move ended."),
+});
+
+/**
+ * Where a session's work moved between a client and Agent Runtime. Read from
+ * the run's recorded origin and the origin session's own gateway calls.
+ */
+export const SessionHandoffsSchema = z.object({
+  handedTo: z
+    .array(SessionHandoffRunSchema)
+    .describe("Runs this session started, oldest first."),
+  handedToTruncated: z
+    .boolean()
+    .describe("This session started more runs than `handedTo` lists."),
+  handedFrom: SessionHandoffRunSchema.nullable().describe(
+    "When this is a run's own session: that run, with the session that started it.",
+  ),
+  moves: z
+    .array(SessionHandoffMoveSchema)
+    .describe(
+      "Moves between the origin session and its runs, oldest first. A move to the side that already holds the work is left out.",
+    ),
+});
+export type SessionHandoffs = z.infer<typeof SessionHandoffsSchema>;
 
 /**
  * Session summary schema for the sessions endpoint
  */
+/**
+ * A logged session's fork lineage: the session it forks and the sessions
+ * forked from it. A fork is a new client session that replayed another
+ * session's history, such as a client fork or a summarizer run in a session of
+ * its own; it starts from that session's guardrail state and continues apart.
+ */
+export const SessionLineageSchema = z.object({
+  forkedFrom: z.string().nullable(),
+  forks: z.array(z.string()),
+  forksTruncated: z
+    .boolean()
+    .describe(
+      "True when the session has more forks than the bounded list returned.",
+    ),
+});
+
 export const SessionSummarySchema = z.object({
+  attributionLabels: AttributionLabelsSchema.nullish().describe(
+    "Captured attribution labels of lastInteractionId, the request shown in the row. Other requests in the session may have different labels. Null means no snapshot was captured.",
+  ),
   sessionId: z.string().nullable(),
   sessionSource: z.string().nullable(),
   source: InteractionSourceSchema.nullable(),
+  sources: z.array(InteractionSourceSchema),
   interactionId: z.string().nullable(), // Only set for single interactions (null session)
   requestCount: z.number(),
+  failedOverCount: z
+    .number()
+    .describe(
+      "Requests a model pool retried on another member. Each is also counted in requestCount. Only one cut off by a timeout carries tokens or cost: an estimate of the input it read.",
+    ),
   totalInputTokens: z.number(),
   totalOutputTokens: z.number(),
+  totalCacheReadTokens: z.number(),
+  totalCacheWriteTokens: z.number(),
+  /** Full list-price estimate for the session (all rows, regardless of billing mode). */
   totalCost: z.string().nullable(),
+  /** Billed spend: list-price `cost` of metered rows only (null when none). */
+  totalBilledCost: z.string().nullable(),
+  /** Would-be list-price cost of subscription-covered rows (null when none). */
+  totalSubscriptionCost: z.string().nullable(),
   totalBaselineCost: z.string().nullable(),
-  totalToonCostSavings: z.string().nullable(),
-  toonSkipReasonCounts: ToonSkipReasonCountsSchema,
+  totalCacheSavings: z.string().nullable(),
   firstRequestTime: z.date(),
   lastRequestTime: z.date(),
   models: z.array(z.string()),
   profileId: z.string().nullable(), // null when profile was deleted
   profileName: z.string().nullable(),
+  /** The agent's type, so a session run through the LLM Proxy or a gateway can say so. */
+  profileAgentType: AgentTypeSchema.nullable(),
   externalAgentIds: z.array(z.string()),
   externalAgentIdLabels: z.array(z.string().nullable()), // Resolved prompt names
   authMethods: z.array(InteractionAuthMethodSchema),
   authenticatedAppNames: z.array(z.string()),
   userNames: z.array(z.string()),
-  lastInteractionRequest: z.unknown().nullable(),
+  /**
+   * Ids of the users the session's interactions are attributed to. Prefer
+   * these over `userNames` for correlation: display names are not unique, so
+   * two members sharing one collapse into a single `userNames` entry.
+   *
+   * Empty when no interaction in the session carried a user identity — which
+   * is the normal case for team- and org-scoped virtual keys and raw provider
+   * keys,
+   * neither of which identifies a user. `unattributedReason` says which.
+   */
+  userIds: z.array(z.string()),
+  /**
+   * Why `userIds` is empty, or null when the session is attributed. Lets the
+   * UI distinguish "this key identifies nobody" from "something is broken".
+   */
+  unattributedReason: z.union([SessionUnattributedReasonSchema, z.null()]),
+  /**
+   * Every virtual key the session's requests authenticated with — standard and
+   * passthrough alike, deduplicated and ordered by name. Names the key behind
+   * `authMethods`, which on its own says a virtual key was used but not which
+   * one, and carries the owner so an attributed session shows the link rather
+   * than leaving `userNames` to imply it.
+   *
+   * Empty when no request in the session used a virtual key.
+   */
+  virtualKeys: z.array(InteractionVirtualKeySchema),
+  /** For GitHub Copilot requests: the credentials that served them. */
+  copilotCredentialSources: z.array(CopilotCredentialSourceSchema).optional(),
+  /**
+   * Short preview of the session's last user message, computed server-side
+   * from the reconstructed request. The raw request body is intentionally
+   * never returned by the listing — shipping full bodies OOM-killed the
+   * platform container (T-1015). Fetch bodies per interaction via
+   * GET /api/interactions when needed.
+   */
+  lastUserMessagePreview: z
+    .string()
+    .max(LAST_USER_MESSAGE_PREVIEW_MAX_LENGTH)
+    .nullable()
+    .describe(
+      "Short preview (max 200 chars) of the session's last user message. Raw request bodies are not returned by this listing.",
+    ),
+  /** Interaction backing the preview and latest-conversation detail view. */
+  lastInteractionId: z.string().uuid().nullable(),
   lastInteractionType: z.string().nullable(),
+  /**
+   * The session's latest turn was logged under Metadata only, so it has no
+   * preview to show.
+   */
+  contentNotStored: z
+    .boolean()
+    .describe(
+      "True when the session's latest turn was logged under the Metadata only Log Content mode, so it has no message preview.",
+    ),
   conversationTitle: z.string().nullable(),
   claudeCodeTitle: z.string().nullable(),
+  connectorName: z
+    .string()
+    .nullable()
+    .describe(
+      "Name of the knowledge-base connector a knowledge:* session ran for, when exactly one connector owns it.",
+    ),
 });
 
 export type SessionSummary = z.infer<typeof SessionSummarySchema>;

@@ -1,19 +1,47 @@
 "use client";
 
 import {
+  getChatItemGeneratingIndicatorTestId,
+  getChatItemUnreadIndicatorTestId,
+} from "@archestra/shared";
+import {
+  AppWindow,
+  CalendarClock,
+  ChevronDown,
+  Folder,
+  Loader2,
   MoreHorizontal,
   Pencil,
   Pin,
   PinOff,
+  Search,
   Sparkles,
+  Square,
   Trash2,
   UsersRound,
 } from "lucide-react";
 import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
+import { ChatListSkeleton } from "@/app/_parts/chat-list-skeleton";
+import { ConversationProjectActions } from "@/app/_parts/conversation-project-actions";
+import { groupSidebarTasks } from "@/app/_parts/scheduled-run-sidebar.utils";
+import { ShortcutHint } from "@/app/_parts/shortcut-hint";
+import { AgentIcon } from "@/components/agent-icon";
+import { runActionConfirmCopy } from "@/components/agent-pages/agent-run-actions-copy";
+import { useConversationActions } from "@/components/chat/conversation-actions";
+import { EncryptedChatIcon } from "@/components/chat/encrypted-chat-icon";
+import { RunStateIcon } from "@/components/chat/run-state-icon";
 import { DeleteConfirmDialog } from "@/components/delete-confirm-dialog";
+import { IntentPrefetchLink } from "@/components/intent-prefetch-link";
+import { McpCatalogIcon } from "@/components/mcp-catalog-icon";
+import { ProjectBadgeButton } from "@/components/project-badge-button";
 import { TruncatedText } from "@/components/truncated-text";
 import { Button } from "@/components/ui/button";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -22,7 +50,12 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import {
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarMenu,
   SidebarMenuButton,
+  SidebarMenuItem,
   SidebarMenuSub,
   SidebarMenuSubButton,
   SidebarMenuSubItem,
@@ -35,25 +68,77 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { TypingText } from "@/components/ui/typing-text";
-import { useIsAuthenticated } from "@/lib/auth/auth.hook";
+import { UnstyledButton } from "@/components/ui/unstyled-button";
+import { SHORTCUT_SEARCH } from "@/consts";
+import { ATTENTION_DOT_CLASS } from "@/lib/agent-run-status-marks";
+import {
+  SIDEBAR_PINNED_RUNS,
+  SIDEBAR_RECENT_RUNS,
+} from "@/lib/agent-runs-query-keys";
+import {
+  useCancelAgentRun,
+  useDeleteAgentRun,
+  useMyAgentRun,
+  useMyAgentRuns,
+  useUpdateAgentRun,
+} from "@/lib/agent-runtime.query";
+import {
+  SIDEBAR_PINNED_APPS_QUERY,
+  useApps,
+  useOpenAppInChat,
+  useOpenExternalAppInChat,
+  usePinApp,
+} from "@/lib/app.query";
 import { useHasPermissions } from "@/lib/auth/auth.query";
-import { useRecentlyGeneratedTitles } from "@/lib/chat/chat.hook";
+import { useIsAuthenticated } from "@/lib/auth/use-is-authenticated";
 import {
   useConversations,
-  useDeleteConversation,
   useGenerateConversationTitle,
-  usePinConversation,
   useUpdateConversation,
 } from "@/lib/chat/chat.query";
 import {
   getConversationDisplayTitle,
   getConversationShareTooltip,
 } from "@/lib/chat/chat-utils";
-import { useStableConversations } from "@/lib/hooks/use-stable-conversations";
-import { cn } from "@/lib/utils";
+import { conversationHref } from "@/lib/chat/conversation-href";
+import { isActionAvailableForConversation } from "@/lib/chat/encrypted-chat";
+import { useGlobalChat } from "@/lib/chat/global-chat.context";
+import { groupConversationsByDay } from "@/lib/chat/group-conversations-by-date";
+import { buildPinnedSidebarItems } from "@/lib/chat/pinned-sidebar-items";
+import { useFeature } from "@/lib/config/config.query";
+import type { Once } from "@/lib/hooks/use-once";
+import {
+  SIDEBAR_PINNED_PROJECTS_QUERY,
+  useCreateProject,
+  usePinProject,
+  useProjects,
+} from "@/lib/projects/projects.query";
+import { cn } from "@/lib/utils/tailwind";
 
-const SIDEBAR_CHAT_SLOTS = 3;
+const DEFAULT_SIDEBAR_CHAT_SLOTS = 3;
 const MAX_TITLE_LENGTH = 100;
+// Fades an overflowing title out at the right edge instead of an ellipsis.
+// flex-1 stretches the box across the row, so short titles never reach the
+// faded strip. text-clip! beats SidebarMenuButton's last-span `truncate`.
+const TITLE_FADE_CLASS =
+  "min-w-0 flex-1 overflow-hidden whitespace-nowrap text-clip! [mask-image:linear-gradient(to_right,#000_calc(100%_-_1.5rem),transparent)]";
+
+function ChatListFadeIn({
+  fadeIn,
+  children,
+}: {
+  fadeIn: Once;
+  children: ReactNode;
+}) {
+  // Capture once so regular re-renders don't drop the class mid-animation.
+  const [className] = useState(() =>
+    fadeIn.pending() ? "animate-in fade-in-0 duration-300" : "",
+  );
+
+  useEffect(() => fadeIn.done(), [fadeIn.done]);
+
+  return <div className={className}>{children}</div>;
+}
 
 function AISparkleIcon({ isAnimating = false }: { isAnimating?: boolean }) {
   return (
@@ -64,7 +149,18 @@ function AISparkleIcon({ isAnimating = false }: { isAnimating?: boolean }) {
   );
 }
 
-export function ChatSidebarSection() {
+export function ChatSidebarSection({
+  slots = DEFAULT_SIDEBAR_CHAT_SLOTS,
+  flat = false,
+  fadeIn,
+}: {
+  /** How many chats to show before the "More" affordance. */
+  slots?: number;
+  /** Render without the sub-menu indentation (used by the Chats tab). */
+  flat?: boolean;
+  /** One-shot latch so the list fades in only the first time it's shown this session. */
+  fadeIn: Once;
+}) {
   const router = useRouter();
   const pathname = usePathname();
   const isAuthenticated = useIsAuthenticated();
@@ -74,70 +170,128 @@ export function ChatSidebarSection() {
   const { data: conversations = [], isLoading } = useConversations({
     enabled: isAuthenticated && canReadConversation === true,
   });
+  const runtimeEnabled = useFeature("agentRuntime") === true;
+  const runsEnabled =
+    isAuthenticated && canReadConversation === true && runtimeEnabled;
+  const recentRunsQuery = useMyAgentRuns(runsEnabled, SIDEBAR_RECENT_RUNS);
+  const pinnedRunsQuery = useMyAgentRuns(runsEnabled, SIDEBAR_PINNED_RUNS);
+  const selectedRunId = pathname.startsWith("/chat/runs/")
+    ? (pathname.split("/").at(-1) ?? "")
+    : "";
+  const selectedRunQuery = useMyAgentRun(
+    selectedRunId,
+    runsEnabled && !!selectedRunId,
+  );
+  const runs = [
+    ...new Map(
+      [
+        ...(recentRunsQuery.data ?? []),
+        ...(pinnedRunsQuery.data ?? []),
+        ...(selectedRunQuery.data?.viewerRole === "owner"
+          ? [selectedRunQuery.data]
+          : []),
+      ].map((run) => [run.taskId, run]),
+    ).values(),
+  ];
+  const runsLoading = recentRunsQuery.isLoading;
+  const updateRunMutation = useUpdateAgentRun();
+  const cancelRunMutation = useCancelAgentRun();
+  const deleteRunMutation = useDeleteAgentRun();
   const updateConversationMutation = useUpdateConversation();
-  const deleteConversationMutation = useDeleteConversation();
+  const createProjectMutation = useCreateProject();
   const generateTitleMutation = useGenerateConversationTitle();
-  const pinConversationMutation = usePinConversation();
 
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
-  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const [editingRunId, setEditingRunId] = useState<string | null>(null);
+  const [editingRunTitle, setEditingRunTitle] = useState("");
+  const [stopRunId, setStopRunId] = useState<string | null>(null);
+  const [deleteRunId, setDeleteRunId] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const { data: canUpdateConversation } = useHasPermissions({
-    chat: ["update"],
+  const { data: canCreateProject } = useHasPermissions({
+    project: ["create"],
   });
-  const { data: canDeleteConversation } = useHasPermissions({
-    chat: ["delete"],
+  const { data: canReadProjects } = useHasPermissions({
+    project: ["read"],
   });
 
-  // Track conversations with recently auto-generated titles for animation
-  const { recentlyGeneratedTitles, regeneratingTitles, triggerRegeneration } =
-    useRecentlyGeneratedTitles(conversations);
+  // Conversations whose title should play the typing animation (shared via chat
+  // context); generatingConversationIds drives the live "generating" spinner.
+  const { animatingTitleIds, markTitleAnimating, generatingConversationIds } =
+    useGlobalChat();
 
   const { isMobile, setOpenMobile } = useSidebar();
 
-  const currentConversationId = pathname.startsWith("/chat/")
+  const currentConversationId =
+    conversations.find(
+      (conversation) =>
+        conversationHref(conversation).split("?")[0] === pathname,
+    )?.id ??
+    (pathname.startsWith("/chat/") && !pathname.startsWith("/chat/runs/")
+      ? (pathname.split("/").at(-1) ?? null)
+      : null);
+  const currentRunTaskId = pathname.startsWith("/chat/runs/")
     ? (pathname.split("/").at(-1) ?? null)
     : null;
 
-  // Stabilize conversation order to prevent sidebar "jumping" when React Query
-  // re-fetches after mutations that bump updatedAt. Order resets on page refresh.
-  const stableConversations = useStableConversations(conversations);
+  const sidebarConversations = groupSidebarTasks(conversations);
+  const recentUnpinnedChats = sidebarConversations.filter((c) => !c.pinnedAt);
+  const recentUnpinnedRuns = runs.filter((run) => !run.pinnedAt);
 
-  // Split conversations into pinned and unpinned.
-  // Default view shows exactly SIDEBAR_CHAT_SLOTS items:
-  // pinned chats first, then recent unpinned to fill remaining slots.
-  // No re-sorting here — stable order from useStableConversations is preserved
-  // for both pinned and unpinned groups to prevent jumping.
-  const { pinnedChats, recentUnpinnedChats } = useMemo(() => {
-    const pinned = stableConversations
-      .filter((c) => c.pinnedAt)
-      .slice(0, SIDEBAR_CHAT_SLOTS);
-
-    const pinnedIds = new Set(pinned.map((c) => c.id));
-    const unpinned = stableConversations.filter((c) => !pinnedIds.has(c.id));
-    const remainingSlots = Math.max(0, SIDEBAR_CHAT_SLOTS - pinned.length);
-
-    return {
-      pinnedChats: pinned,
-      recentUnpinnedChats: unpinned.slice(0, remainingSlots),
-    };
-  }, [stableConversations]);
+  // /api/projects requires project:read; skip the fetch for roles without it
+  // so the sidebar doesn't 403 (and toast) on every chat page. Only pinned
+  // projects are asked for: the sidebar shows none of the others.
+  const { data: pinnedProjectsData, isLoading: pinnedProjectsLoading } =
+    useProjects({
+      ...SIDEBAR_PINNED_PROJECTS_QUERY,
+      enabled: canReadProjects === true,
+    });
+  const pinProjectMutation = usePinProject();
+  const pinnedProjects = (pinnedProjectsData?.data ?? []).filter(
+    (p) => p.pinnedAt,
+  );
+  // Pinned apps join the sidebar's Pinned section exactly like pinned projects.
+  // useApps skips the request for roles without app:read. Only pinned apps
+  // are asked for: the full list is far larger and the sidebar shows none of it.
+  const { data: appsData, isLoading: pinnedAppsLoading } = useApps(
+    SIDEBAR_PINNED_APPS_QUERY,
+  );
+  const pinAppMutation = usePinApp();
+  const openAppMutation = useOpenAppInChat();
+  const openExternalAppMutation = useOpenExternalAppInChat();
+  const pinnedApps = (appsData?.data ?? []).filter((a) => a.pinnedAt);
+  const pinnedItems = buildPinnedSidebarItems({
+    chats: sidebarConversations,
+    projects: pinnedProjects,
+    apps: pinnedApps,
+    runs,
+  });
+  // The Pinned list merges four sources and sorts them by pin time, so drawing
+  // it before every source has answered makes rows pop in and reshuffle as the
+  // slower ones land. The list keeps its skeleton until all of them have.
+  const listLoading =
+    isLoading ||
+    runsLoading ||
+    pinnedRunsQuery.isLoading ||
+    pinnedProjectsLoading ||
+    pinnedAppsLoading;
 
   useEffect(() => {
-    if (editingId && inputRef.current) {
+    if ((editingId || editingRunId) && inputRef.current) {
       inputRef.current.focus();
       inputRef.current.select();
     }
-  }, [editingId]);
+  }, [editingId, editingRunId]);
 
-  const handleSelectConversation = (id: string) => {
+  // Rows are links: the browser follows them (new tab included), and a hover
+  // or focus warms the route first. Clicking only has to close the mobile
+  // sidebar.
+  const handleConversationLinkClick = () => {
     if (isMobile) {
       setOpenMobile(false);
     }
-    router.push(`/chat/${id}`);
   };
 
   const handleStartEdit = (id: string, currentTitle: string | null) => {
@@ -170,59 +324,193 @@ export function ChatSidebarSection() {
     setEditingTitle("");
   };
 
-  const handleDeleteConversation = async (id: string) => {
-    // Navigate away before deleting to avoid "conversation not found" flash
-    if (currentConversationId === id) {
-      router.push("/chat");
+  const handleSaveRunTitle = async (taskId: string) => {
+    const title = editingRunTitle.trim();
+    if (!title) {
+      setEditingRunId(null);
+      setEditingRunTitle("");
+      return;
     }
-
     try {
-      await deleteConversationMutation.mutateAsync(id);
+      await updateRunMutation.mutateAsync({ taskId, title });
+      setEditingRunId(null);
+      setEditingRunTitle("");
     } catch {
-      // Error is handled by the mutation's onError callback
+      // Error is handled by the mutation's onError callback.
     }
   };
 
-  const handleRegenerateTitle = async (id: string) => {
-    // Mark as regenerating (shows loading state until new title arrives)
-    triggerRegeneration(id);
+  const handleRegenerateTitle = (id: string) => {
     // Close edit mode
     setEditingId(null);
     setEditingTitle("");
     // Regenerate the title
-    await generateTitleMutation.mutateAsync({ id, regenerate: true });
-  };
-
-  const handleTogglePin = (id: string, isPinned: boolean) => {
-    pinConversationMutation.mutate({ id, pinned: !isPinned });
-  };
-
-  const openConversationSearch = () => {
-    window.dispatchEvent(
-      new CustomEvent("open-conversation-search", {
-        detail: { recentChatsView: true },
-      }),
+    generateTitleMutation.mutate(
+      { id, regenerate: true },
+      {
+        onSuccess: (data) => {
+          if (data) markTitleAnimating(id);
+        },
+      },
     );
   };
 
-  const renderConversationItem = (
-    conv: (typeof conversations)[number],
-    showPinIcon = false,
+  const handleToggleRunPin = (taskId: string, isPinned: boolean) => {
+    updateRunMutation.mutate({
+      taskId,
+      pinnedAt: isPinned ? null : new Date().toISOString(),
+    });
+  };
+
+  const handleChangeRunProject = async (
+    taskId: string,
+    projectId: string | null,
   ) => {
+    try {
+      await updateRunMutation.mutateAsync({ taskId, projectId });
+      setOpenMenuId(null);
+    } catch {
+      // Error is handled by the mutation's onError callback.
+    }
+  };
+
+  const handleSelectProject = (id: string) => {
+    if (isMobile) {
+      setOpenMobile(false);
+    }
+    router.push(`/projects/${id}`);
+  };
+
+  const handleUnpinProject = (id: string) => {
+    pinProjectMutation.mutate({ id, pinned: false });
+  };
+
+  // Opening a pinned app is the card's canonical open action: seed a chat with
+  // the app rendered and navigate to it.
+  const handleSelectApp = async (appItem: (typeof pinnedApps)[number]) => {
+    if (isMobile) {
+      setOpenMobile(false);
+    }
+    const result =
+      appItem.source === "owned"
+        ? await openAppMutation.mutateAsync(appItem.id)
+        : await openExternalAppMutation.mutateAsync({
+            mcpServerId: appItem.mcpServerId,
+            resourceUri: appItem.resourceUri,
+          });
+    if (result?.conversationId) {
+      router.push(`/chat/${result.conversationId}`);
+    }
+  };
+
+  const handleUnpinApp = (appItem: (typeof pinnedApps)[number]) => {
+    pinAppMutation.mutate({
+      pinned: false,
+      target:
+        appItem.source === "owned"
+          ? { source: "owned", appId: appItem.id }
+          : {
+              source: "external",
+              mcpServerId: appItem.mcpServerId,
+              resourceUri: appItem.resourceUri,
+              toolName: appItem.toolName,
+            },
+    });
+  };
+
+  const openConversationSearch = () => {
+    window.dispatchEvent(new CustomEvent("open-conversation-search"));
+  };
+
+  const renderConversationItem = (conv: (typeof conversations)[number]) => {
+    if (conv.scheduledRun) {
+      const activeTriggerId = conversations.find(
+        (c) => c.id === currentConversationId,
+      )?.scheduledRun?.triggerId;
+      return (
+        <SidebarMenuSubItem key={conv.scheduledRun.triggerId}>
+          <div
+            className={cn(
+              "flex items-center justify-between w-full gap-2 rounded-md pr-2 hover:bg-sidebar-accent focus-within:bg-sidebar-accent",
+              activeTriggerId === conv.scheduledRun.triggerId &&
+                "bg-sidebar-accent",
+            )}
+          >
+            <SidebarMenuButton
+              asChild
+              isActive={activeTriggerId === conv.scheduledRun.triggerId}
+              title={conv.scheduledRun.scheduleName}
+              className="cursor-pointer flex-1 min-w-0"
+            >
+              <IntentPrefetchLink
+                href={conversationHref(conv)}
+                onClick={handleConversationLinkClick}
+              >
+                <CalendarClock
+                  className="h-3.5 w-3.5 shrink-0"
+                  aria-label="Scheduled task"
+                />
+                <span className={TITLE_FADE_CLASS}>
+                  {conv.scheduledRun.scheduleName}
+                </span>
+              </IntentPrefetchLink>
+            </SidebarMenuButton>
+            {conv.projectId && conv.projectName && (
+              <ProjectBadgeButton
+                projectId={conv.projectId}
+                projectName={conv.projectName}
+                projectIcon={conv.projectIcon}
+                compact
+                onNavigate={(projectId) => {
+                  if (isMobile) setOpenMobile(false);
+                  router.push(`/projects/${projectId}`);
+                }}
+              />
+            )}
+          </div>
+        </SidebarMenuSubItem>
+      );
+    }
     const isCurrentConversation = currentConversationId === conv.id;
+    const isGenerating = generatingConversationIds.has(conv.id);
+    // `unread` is server-derived (lastMessageAt > lastReadAt). Suppressed on the
+    // chat you're viewing (its read marker is being updated) and while it is
+    // actively generating (the spinner wins).
+    const isUnread =
+      !isGenerating && !isCurrentConversation && conv.unread === true;
     const displayTitle = getConversationDisplayTitle(conv.title, conv.messages);
-    const hasRecentlyGeneratedTitle = recentlyGeneratedTitles.has(conv.id);
-    const isRegenerating = regeneratingTitles.has(conv.id);
+    const hasRecentlyGeneratedTitle = animatingTitleIds.has(conv.id);
+    const isRegenerating =
+      generateTitleMutation.isPending &&
+      generateTitleMutation.variables?.id === conv.id;
     const isMenuOpen = openMenuId === conv.id;
-    const isPinned = !!conv.pinnedAt;
+    const hasIndicator = isGenerating || isUnread;
+    // Export is open to every reader, so the menu always has something.
+    const showChatMenu = editingId !== conv.id;
+    // AI title generation is rejected for encrypted chats (the server would
+    // have to read encrypted messages), so hide both regenerate affordances.
+    const canRegenerateTitle = isActionAvailableForConversation(
+      conv,
+      "generateTitle",
+    );
 
     return (
       <SidebarMenuSubItem key={conv.id}>
-        <div className="flex items-center justify-between w-full gap-1">
+        <div
+          className={cn(
+            "relative flex items-center justify-between w-full gap-2 rounded-md pr-2 hover:bg-sidebar-accent focus-within:bg-sidebar-accent",
+            isCurrentConversation && "bg-sidebar-accent",
+            // The status indicator and the menu trigger share one right-edge
+            // slot; reserve its gutter while either is visible.
+            showChatMenu && "hover:pr-7 focus-within:pr-7",
+            showChatMenu && (hasIndicator || isMenuOpen) && "pr-7",
+          )}
+        >
           {editingId === conv.id ? (
             <div className="flex items-center gap-1 flex-1">
               <Input
                 ref={inputRef}
+                aria-label="Conversation title"
                 value={editingTitle}
                 onChange={(e) => setEditingTitle(e.target.value)}
                 onBlur={() => handleSaveEdit(conv.id)}
@@ -236,216 +524,773 @@ export function ChatSidebarSection() {
                 onClick={(e) => e.stopPropagation()}
                 className="h-7 text-sm flex-1"
               />
-              <TooltipProvider>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      size="icon-sm"
-                      variant="ghost"
-                      onMouseDown={(e) => {
-                        // Prevent input blur from triggering handleSaveEdit
-                        e.preventDefault();
-                      }}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleRegenerateTitle(conv.id);
-                      }}
-                      disabled={generateTitleMutation.isPending}
-                      className="h-7 w-7 shrink-0"
-                    >
-                      <AISparkleIcon
-                        isAnimating={generateTitleMutation.isPending}
-                      />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">
-                    Regenerate title with AI
-                  </TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
+              {canRegenerateTitle && (
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        aria-label="Regenerate title"
+                        size="icon-sm"
+                        variant="ghost"
+                        onMouseDown={(e) => {
+                          // Prevent input blur from triggering handleSaveEdit
+                          e.preventDefault();
+                        }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleRegenerateTitle(conv.id);
+                        }}
+                        disabled={generateTitleMutation.isPending}
+                        className="h-7 w-7 shrink-0"
+                      >
+                        <AISparkleIcon
+                          isAnimating={generateTitleMutation.isPending}
+                        />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent side="top">
+                      Regenerate title with AI
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              )}
             </div>
           ) : (
             <SidebarMenuButton
-              onClick={() => handleSelectConversation(conv.id)}
+              asChild
               isActive={isCurrentConversation}
               className="cursor-pointer flex-1 justify-between"
             >
-              <span className="flex items-center gap-2 min-w-0 flex-1">
-                {showPinIcon && (
-                  <Pin className="h-3 w-3 shrink-0 text-muted-foreground" />
-                )}
-                {conv.share && (
-                  <TooltipProvider>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <UsersRound className="h-3.5 w-3.5 shrink-0 text-primary/80" />
-                      </TooltipTrigger>
-                      <TooltipContent side="top">
-                        {getConversationShareTooltip(conv.share.visibility)}
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                )}
-                {(hasRecentlyGeneratedTitle || isRegenerating) && (
-                  <AISparkleIcon isAnimating />
-                )}
-                {isRegenerating ? (
-                  <span className="text-muted-foreground text-sm truncate">
-                    Generating...
-                  </span>
-                ) : hasRecentlyGeneratedTitle ? (
-                  <span className="truncate">
-                    <TypingText
-                      text={
-                        displayTitle.length > MAX_TITLE_LENGTH
-                          ? `${displayTitle.slice(0, MAX_TITLE_LENGTH)}...`
-                          : displayTitle
-                      }
-                      typingSpeed={35}
-                      showCursor
-                      cursorClassName="bg-primary"
+              <IntentPrefetchLink
+                href={conversationHref(conv)}
+                onClick={handleConversationLinkClick}
+              >
+                <span className="flex items-center gap-2 min-w-0 flex-1">
+                  {conv.encryptedChat && (
+                    <TooltipProvider>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <EncryptedChatIcon className="h-3.5 w-3.5" />
+                        </TooltipTrigger>
+                        <TooltipContent side="top">
+                          Encrypted chat
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  )}
+                  {conv.share && (
+                    <TooltipProvider>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <UsersRound className="h-3.5 w-3.5 shrink-0 text-primary/80" />
+                        </TooltipTrigger>
+                        <TooltipContent side="top">
+                          {getConversationShareTooltip(conv.share.visibility)}
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  )}
+                  {(hasRecentlyGeneratedTitle || isRegenerating) && (
+                    <AISparkleIcon isAnimating />
+                  )}
+                  {isRegenerating ? (
+                    <span
+                      key="regenerating"
+                      className="text-muted-foreground text-sm truncate"
+                    >
+                      Generating...
+                    </span>
+                  ) : hasRecentlyGeneratedTitle ? (
+                    <span key="typing" className={TITLE_FADE_CLASS}>
+                      <TypingText
+                        text={
+                          displayTitle.length > MAX_TITLE_LENGTH
+                            ? `${displayTitle.slice(0, MAX_TITLE_LENGTH)}...`
+                            : displayTitle
+                        }
+                        typingSpeed={35}
+                        showCursor
+                        cursorClassName="bg-primary"
+                      />
+                    </span>
+                  ) : (
+                    <TruncatedText
+                      message={displayTitle}
+                      maxLength={MAX_TITLE_LENGTH}
+                      className={TITLE_FADE_CLASS}
+                      showTooltip={false}
                     />
-                  </span>
-                ) : (
-                  <TruncatedText
-                    message={displayTitle}
-                    maxLength={MAX_TITLE_LENGTH}
-                    className="truncate"
-                    showTooltip={false}
-                  />
-                )}
-              </span>
-              {(canUpdateConversation || canDeleteConversation) && (
-                <DropdownMenu
-                  open={isMenuOpen}
-                  onOpenChange={(open) => setOpenMenuId(open ? conv.id : null)}
-                >
-                  <DropdownMenuTrigger asChild>
-                    <MoreHorizontal
-                      className={cn(
-                        "h-4 w-4 p-0 shrink-0 transition-opacity",
-                        isMenuOpen
-                          ? "opacity-100"
-                          : "opacity-0 group-hover/menu-sub-item:opacity-100",
-                      )}
-                    />
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="start" side="right">
-                    {canUpdateConversation && (
-                      <>
-                        <DropdownMenuItem
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleTogglePin(conv.id, isPinned);
-                          }}
-                        >
-                          {isPinned ? (
-                            <>
-                              <PinOff className="h-4 w-4 mr-2" />
-                              Unpin
-                            </>
-                          ) : (
-                            <>
-                              <Pin className="h-4 w-4 mr-2" />
-                              Pin
-                            </>
-                          )}
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleStartEdit(conv.id, displayTitle);
-                          }}
-                        >
-                          <Pencil className="h-4 w-4 mr-2" />
-                          Rename
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleRegenerateTitle(conv.id);
-                          }}
-                          disabled={generateTitleMutation.isPending}
-                        >
-                          <Sparkles className="h-4 w-4 mr-2" />
-                          Regenerate title
-                        </DropdownMenuItem>
-                      </>
-                    )}
-                    {canDeleteConversation && (
-                      <DropdownMenuItem
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setDeleteConfirmId(conv.id);
-                        }}
-                        className="text-destructive focus:text-destructive"
-                      >
-                        <Trash2 className="h-4 w-4 mr-2" />
-                        Delete
-                      </DropdownMenuItem>
-                    )}
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              )}
+                  )}
+                </span>
+              </IntentPrefetchLink>
             </SidebarMenuButton>
+          )}
+          {editingId !== conv.id && conv.projectId && conv.projectName && (
+            <ProjectBadgeButton
+              projectId={conv.projectId}
+              projectName={conv.projectName}
+              projectIcon={conv.projectIcon}
+              compact
+              onNavigate={(projectId) => {
+                if (isMobile) setOpenMobile(false);
+                router.push(`/projects/${projectId}`);
+              }}
+            />
+          )}
+          {/* Same slot as the menu trigger, so the spinner, the dot and the
+              "more" button all share one column; the trigger replaces the
+              indicator while it is visible. */}
+          {showChatMenu && hasIndicator && (
+            <span
+              className={cn(
+                "pointer-events-none absolute right-1 top-1/2 flex size-4 -translate-y-1/2 items-center justify-center transition-opacity",
+                "group-hover/menu-sub-item:opacity-0 group-has-[[aria-haspopup=menu]:focus-visible]/menu-sub-item:opacity-0",
+                isMenuOpen && "opacity-0",
+              )}
+            >
+              {isGenerating ? (
+                <Loader2
+                  aria-label="Generating"
+                  data-testid={getChatItemGeneratingIndicatorTestId(conv.id)}
+                  className="size-3.5 animate-spin text-muted-foreground"
+                />
+              ) : (
+                <span
+                  role="img"
+                  aria-label="New messages"
+                  data-testid={getChatItemUnreadIndicatorTestId(conv.id)}
+                  className={cn(
+                    "size-2 rounded-full",
+                    ATTENTION_DOT_CLASS.attention,
+                  )}
+                />
+              )}
+            </span>
+          )}
+          {showChatMenu && (
+            <ConversationRowMenu
+              conversation={conv}
+              open={isMenuOpen}
+              onOpenChange={(open) => setOpenMenuId(open ? conv.id : null)}
+              onRename={() => handleStartEdit(conv.id, displayTitle)}
+              triggerClassName={cn(
+                "right-1",
+                isMenuOpen
+                  ? "opacity-100"
+                  : "opacity-0 group-hover/menu-sub-item:opacity-100 focus-visible:opacity-100",
+              )}
+            />
           )}
         </div>
       </SidebarMenuSubItem>
     );
   };
 
-  if (!isLoading && conversations.length === 0) {
+  const renderRunItem = (run: (typeof runs)[number]) => {
+    const active =
+      currentRunTaskId === run.sessionId || currentRunTaskId === run.taskId;
+    const menuKey = `run:${run.taskId}`;
+    const isMenuOpen = openMenuId === menuKey;
+    const isEditing = editingRunId === run.taskId;
+    const live = run.endedAt === null;
+    const isPinned = !!run.pinnedAt;
+    return (
+      <SidebarMenuSubItem key={menuKey}>
+        <div
+          className={cn(
+            "relative flex w-full items-center justify-between gap-1 rounded-md hover:bg-sidebar-accent focus-within:bg-sidebar-accent",
+            active && "bg-sidebar-accent",
+            // The menu trigger sits inside the row highlight; reserve its
+            // gutter only while the trigger is visible.
+            !isEditing && "hover:pr-7 focus-within:pr-7",
+            !isEditing && isMenuOpen && "pr-7",
+          )}
+        >
+          {isEditing ? (
+            <Input
+              ref={inputRef}
+              aria-label="Run title"
+              value={editingRunTitle}
+              onChange={(event) => setEditingRunTitle(event.target.value)}
+              onBlur={() => handleSaveRunTitle(run.taskId)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  handleSaveRunTitle(run.taskId);
+                } else if (event.key === "Escape") {
+                  setEditingRunId(null);
+                  setEditingRunTitle("");
+                }
+              }}
+              className="h-7 flex-1 text-sm"
+            />
+          ) : (
+            <SidebarMenuButton
+              onClick={() => {
+                if (isMobile) setOpenMobile(false);
+                router.push(`/chat/runs/${run.sessionId ?? run.taskId}`);
+              }}
+              isActive={active}
+              className="cursor-pointer flex-1"
+            >
+              <span className="flex min-w-0 flex-1 items-center gap-2">
+                <RunStateIcon
+                  state={run.state}
+                  attentionState={run.attentionState}
+                  startedAt={run.startedAt}
+                  endedAt={run.endedAt}
+                  hardDeadlineAt={run.hardDeadlineAt}
+                  lastModelActivityAt={run.lastModelActivityAt}
+                  className="size-3.5"
+                />
+                <TruncatedText
+                  message={run.title}
+                  maxLength={MAX_TITLE_LENGTH}
+                  className={TITLE_FADE_CLASS}
+                  showTooltip={false}
+                />
+              </span>
+            </SidebarMenuButton>
+          )}
+          {!isEditing && run.projectId && run.projectName && (
+            <ProjectBadgeButton
+              projectId={run.projectId}
+              projectName={run.projectName}
+              projectIcon={run.projectIcon}
+              compact
+              onNavigate={(projectId) => {
+                if (isMobile) setOpenMobile(false);
+                router.push(`/projects/${projectId}`);
+              }}
+            />
+          )}
+          {!isEditing && (
+            <DropdownMenu
+              open={isMenuOpen}
+              onOpenChange={(open) => setOpenMenuId(open ? menuKey : null)}
+            >
+              <DropdownMenuTrigger asChild>
+                <UnstyledButton
+                  type="button"
+                  aria-label="Run actions"
+                  className={cn(
+                    "absolute right-1 top-1/2 -translate-y-1/2 transition-opacity",
+                    isMenuOpen
+                      ? "opacity-100"
+                      : "opacity-0 group-hover/menu-sub-item:opacity-100 focus-visible:opacity-100",
+                  )}
+                >
+                  <MoreHorizontal className="size-4" />
+                </UnstyledButton>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" side="right">
+                <DropdownMenuItem
+                  onClick={() => handleToggleRunPin(run.taskId, isPinned)}
+                >
+                  {isPinned ? (
+                    <>
+                      <PinOff className="mr-2 size-4" />
+                      Unpin
+                    </>
+                  ) : (
+                    <>
+                      <Pin className="mr-2 size-4" />
+                      Pin
+                    </>
+                  )}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => {
+                    setEditingRunId(run.taskId);
+                    setEditingRunTitle(run.title);
+                  }}
+                >
+                  <Pencil className="mr-2 size-4" />
+                  Rename
+                </DropdownMenuItem>
+                {canReadProjects === true && (
+                  <ConversationProjectActions
+                    projectId={run.projectId}
+                    isPending={
+                      updateRunMutation.isPending ||
+                      createProjectMutation.isPending
+                    }
+                    onCreateProject={
+                      canCreateProject === true
+                        ? async (name) => {
+                            const project =
+                              await createProjectMutation.mutateAsync({ name });
+                            if (project)
+                              await handleChangeRunProject(
+                                run.taskId,
+                                project.id,
+                              );
+                          }
+                        : undefined
+                    }
+                    onProjectChange={(projectId) =>
+                      handleChangeRunProject(run.taskId, projectId)
+                    }
+                  />
+                )}
+                {live ? (
+                  <DropdownMenuItem onClick={() => setStopRunId(run.taskId)}>
+                    <Square className="mr-2 size-4" />
+                    Stop
+                  </DropdownMenuItem>
+                ) : (
+                  <DropdownMenuItem
+                    className="text-destructive focus:text-destructive"
+                    onClick={() => setDeleteRunId(run.taskId)}
+                  >
+                    <Trash2 className="mr-2 size-4" />
+                    Delete
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+        </div>
+      </SidebarMenuSubItem>
+    );
+  };
+
+  const renderProjectItem = (project: (typeof pinnedProjects)[number]) => {
+    const isActive = pathname === `/projects/${project.id}`;
+    const menuKey = `project:${project.id}`;
+    const isMenuOpen = openMenuId === menuKey;
+
+    return (
+      <SidebarMenuSubItem key={menuKey}>
+        <div
+          className={cn(
+            "relative flex w-full items-center justify-between gap-1 rounded-md hover:bg-sidebar-accent focus-within:bg-sidebar-accent",
+            isActive && "bg-sidebar-accent",
+            // The menu trigger sits inside the row highlight; reserve its
+            // gutter only while the trigger is visible.
+            "hover:pr-7 focus-within:pr-7",
+            isMenuOpen && "pr-7",
+          )}
+        >
+          <SidebarMenuButton
+            onClick={() => handleSelectProject(project.id)}
+            isActive={isActive}
+            className="cursor-pointer flex-1 justify-between"
+          >
+            <span className="flex items-center gap-2 min-w-0 flex-1">
+              {project.icon ? (
+                <AgentIcon
+                  icon={project.icon}
+                  fallbackType="project"
+                  size={14}
+                />
+              ) : (
+                <Folder className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              )}
+              <TruncatedText
+                message={project.name}
+                maxLength={MAX_TITLE_LENGTH}
+                className={TITLE_FADE_CLASS}
+                showTooltip={false}
+              />
+            </span>
+          </SidebarMenuButton>
+          {/* Sibling of the row button: interactive controls must not nest, and
+              the menu trigger must be a real button rather than a bare svg. */}
+          <DropdownMenu
+            open={isMenuOpen}
+            onOpenChange={(open) => setOpenMenuId(open ? menuKey : null)}
+          >
+            <DropdownMenuTrigger asChild>
+              <UnstyledButton
+                type="button"
+                aria-label="Project actions"
+                className={cn(
+                  "absolute right-1 top-1/2 -translate-y-1/2 transition-opacity",
+                  isMenuOpen
+                    ? "opacity-100"
+                    : "opacity-0 group-hover/menu-sub-item:opacity-100 focus-visible:opacity-100",
+                )}
+              >
+                <MoreHorizontal className="h-4 w-4 p-0" />
+              </UnstyledButton>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" side="right">
+              <DropdownMenuItem
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleUnpinProject(project.id);
+                }}
+              >
+                <PinOff className="h-4 w-4 mr-2" />
+                Unpin
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      </SidebarMenuSubItem>
+    );
+  };
+
+  // Mirrors renderProjectItem: an icon + name row that opens the app, with an
+  // Unpin action in its overflow menu. Apps have no stable route, so no active
+  // state.
+  const renderAppItem = (appItem: (typeof pinnedApps)[number]) => {
+    const menuKey =
+      appItem.source === "owned"
+        ? `app:${appItem.id}`
+        : `app:${appItem.mcpServerId}:${appItem.resourceUri}`;
+    const isMenuOpen = openMenuId === menuKey;
+
+    return (
+      <SidebarMenuSubItem key={menuKey}>
+        <div
+          className={cn(
+            "relative flex w-full items-center justify-between gap-1 rounded-md hover:bg-sidebar-accent focus-within:bg-sidebar-accent",
+            // The menu trigger sits inside the row highlight; reserve its
+            // gutter only while the trigger is visible.
+            "hover:pr-7 focus-within:pr-7",
+            isMenuOpen && "pr-7",
+          )}
+        >
+          <SidebarMenuButton
+            onClick={() => handleSelectApp(appItem)}
+            className="cursor-pointer flex-1 justify-between"
+          >
+            <span className="flex items-center gap-2 min-w-0 flex-1">
+              {/* The app's own icon for an owned app, its backing MCP server's
+                  registry icon for an external one — matching the app's card on
+                  the Apps page, down to the glyph each kind falls back to. */}
+              <McpCatalogIcon
+                icon={appItem.iconUrl ?? appItem.icon}
+                size={14}
+                fallback={appItem.source === "owned" ? AppWindow : undefined}
+              />
+              <TruncatedText
+                message={appItem.name}
+                maxLength={MAX_TITLE_LENGTH}
+                className={TITLE_FADE_CLASS}
+                showTooltip={false}
+              />
+            </span>
+          </SidebarMenuButton>
+          {/* Sibling of the row button: interactive controls must not nest, and
+              the menu trigger must be a real button rather than a bare svg. */}
+          <DropdownMenu
+            open={isMenuOpen}
+            onOpenChange={(open) => setOpenMenuId(open ? menuKey : null)}
+          >
+            <DropdownMenuTrigger asChild>
+              <UnstyledButton
+                type="button"
+                aria-label="App actions"
+                className={cn(
+                  "absolute right-1 top-1/2 -translate-y-1/2 transition-opacity",
+                  isMenuOpen
+                    ? "opacity-100"
+                    : "opacity-0 group-hover/menu-sub-item:opacity-100 focus-visible:opacity-100",
+                )}
+              >
+                <MoreHorizontal className="h-4 w-4 p-0" />
+              </UnstyledButton>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" side="right">
+              <DropdownMenuItem
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleUnpinApp(appItem);
+                }}
+              >
+                <PinOff className="h-4 w-4 mr-2" />
+                Unpin
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      </SidebarMenuSubItem>
+    );
+  };
+
+  if (
+    !listLoading &&
+    conversations.length === 0 &&
+    runs.length === 0 &&
+    pinnedProjects.length === 0 &&
+    pinnedApps.length === 0
+  ) {
     return null;
   }
 
+  const subClass = flat ? "mx-0 border-l-0 px-0" : "mx-0 ml-3.5 px-0 pl-2.5";
+  const recentItems = [
+    ...recentUnpinnedChats.slice(0, slots).map((item) => ({
+      kind: "conversation" as const,
+      item,
+      timestamp: item.lastMessageAt,
+    })),
+    ...recentUnpinnedRuns.map((item) => ({
+      kind: "run" as const,
+      item,
+      timestamp: item.stateChangedAt ?? item.startedAt,
+    })),
+  ].sort(
+    (left, right) =>
+      new Date(right.timestamp).getTime() - new Date(left.timestamp).getTime(),
+  );
+  // Every loaded run remains visible; only conversations consume chat slots.
+  const showMore = recentUnpinnedChats.length > slots;
+
+  // The list arrives sorted by lastMessageAt desc, so grouping the visible
+  // slice by the same timestamp yields contiguous date sections.
+  const recentChatGroups = groupConversationsByDay(
+    recentItems,
+    (entry) => entry.timestamp,
+  );
+
   return (
     <>
-      <SidebarMenuSub className="mx-0 ml-3.5 px-0 pl-2.5">
-        {isLoading ? (
-          <SidebarMenuSubItem>
-            <div className="flex items-center gap-2 px-2 py-1.5">
-              <div className="h-3 w-3 animate-spin rounded-full border border-muted-foreground border-t-transparent" />
-              <span className="text-xs text-muted-foreground">
-                Loading chats...
-              </span>
-            </div>
-          </SidebarMenuSubItem>
-        ) : (
-          <>
-            {pinnedChats.map((conv) => renderConversationItem(conv, true))}
-            {recentUnpinnedChats.map((conv) => renderConversationItem(conv))}
-            {conversations.length >
-              pinnedChats.length + recentUnpinnedChats.length && (
-              <SidebarMenuSubItem>
-                <SidebarMenuSubButton
-                  className="cursor-pointer text-sidebar-foreground/70"
-                  onClick={openConversationSearch}
-                >
-                  <MoreHorizontal />
-                  <span>More</span>
-                </SidebarMenuSubButton>
-              </SidebarMenuSubItem>
-            )}
-          </>
-        )}
-      </SidebarMenuSub>
+      {listLoading ? (
+        <ChatListSkeleton subClass={subClass} />
+      ) : (
+        <ChatListFadeIn fadeIn={fadeIn}>
+          {pinnedItems.length > 0 && (
+            <CollapsibleSidebarGroup
+              label="Pinned"
+              action={<SearchLabelAction />}
+            >
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  <SidebarMenuItem>
+                    <SidebarMenuSub className={subClass}>
+                      {pinnedItems.map((it) =>
+                        it.type === "chat"
+                          ? renderConversationItem(it.item)
+                          : it.type === "project"
+                            ? renderProjectItem(it.item)
+                            : it.type === "app"
+                              ? renderAppItem(it.item)
+                              : renderRunItem(it.item),
+                      )}
+                      {pinnedRunsQuery.hasNextPage && (
+                        <SidebarMenuSubItem>
+                          <SidebarMenuSubButton asChild>
+                            <Button
+                              variant="ghost"
+                              size="xs"
+                              disabled={pinnedRunsQuery.isFetchingNextPage}
+                              onClick={() =>
+                                void pinnedRunsQuery.fetchNextPage()
+                              }
+                            >
+                              More pinned runs
+                            </Button>
+                          </SidebarMenuSubButton>
+                        </SidebarMenuSubItem>
+                      )}
+                    </SidebarMenuSub>
+                  </SidebarMenuItem>
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </CollapsibleSidebarGroup>
+          )}
+
+          {recentChatGroups.map((group, groupIndex) => (
+            <CollapsibleSidebarGroup
+              key={group.label}
+              label={group.label}
+              // Search rides on whichever label comes first.
+              action={
+                pinnedItems.length === 0 && groupIndex === 0 ? (
+                  <SearchLabelAction />
+                ) : undefined
+              }
+            >
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  <SidebarMenuItem>
+                    <SidebarMenuSub className={subClass}>
+                      {group.chats.map((entry) =>
+                        entry.kind === "conversation"
+                          ? renderConversationItem(entry.item)
+                          : renderRunItem(entry.item),
+                      )}
+                      {showMore &&
+                        groupIndex === recentChatGroups.length - 1 && (
+                          <SidebarMenuSubItem>
+                            <SidebarMenuSubButton
+                              className="cursor-pointer text-sidebar-foreground/70"
+                              onClick={openConversationSearch}
+                            >
+                              <MoreHorizontal />
+                              <span>More</span>
+                            </SidebarMenuSubButton>
+                          </SidebarMenuSubItem>
+                        )}
+                      {recentRunsQuery.hasNextPage &&
+                        groupIndex === recentChatGroups.length - 1 && (
+                          <SidebarMenuSubItem>
+                            <SidebarMenuSubButton asChild>
+                              <Button
+                                variant="ghost"
+                                size="xs"
+                                disabled={recentRunsQuery.isFetchingNextPage}
+                                onClick={() =>
+                                  void recentRunsQuery.fetchNextPage()
+                                }
+                              >
+                                More runs
+                              </Button>
+                            </SidebarMenuSubButton>
+                          </SidebarMenuSubItem>
+                        )}
+                    </SidebarMenuSub>
+                  </SidebarMenuItem>
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </CollapsibleSidebarGroup>
+          ))}
+        </ChatListFadeIn>
+      )}
 
       <DeleteConfirmDialog
-        open={deleteConfirmId !== null}
-        onOpenChange={(open) => !open && setDeleteConfirmId(null)}
-        title="Delete conversation?"
-        description="This action cannot be undone. This will permanently delete the conversation and all its messages."
-        isPending={deleteConversationMutation.isPending}
+        open={stopRunId !== null}
+        onOpenChange={(open) => !open && setStopRunId(null)}
+        {...runActionConfirmCopy({ action: "stop", count: 1 })}
+        isPending={cancelRunMutation.isPending}
+        pendingLabel="Stopping…"
         onConfirm={async () => {
-          if (deleteConfirmId) {
-            await handleDeleteConversation(deleteConfirmId);
-            setDeleteConfirmId(null);
-          }
+          if (!stopRunId) return;
+          await cancelRunMutation.mutateAsync(stopRunId);
+          setStopRunId(null);
         }}
-        confirmLabel="Delete"
-        pendingLabel="Deleting..."
       />
+
+      <DeleteConfirmDialog
+        open={deleteRunId !== null}
+        onOpenChange={(open) => !open && setDeleteRunId(null)}
+        {...runActionConfirmCopy({ action: "delete", count: 1 })}
+        isPending={deleteRunMutation.isPending}
+        pendingLabel="Deleting…"
+        onConfirm={async () => {
+          if (!deleteRunId) return;
+          if (currentRunTaskId === deleteRunId) {
+            router.push("/chat");
+          }
+          await deleteRunMutation.mutateAsync(deleteRunId);
+          setDeleteRunId(null);
+        }}
+      />
+    </>
+  );
+}
+
+function CollapsibleSidebarGroup({
+  label,
+  action,
+  children,
+}: {
+  label: string;
+  /** Sits at the label's right end, in the rows' indicator column. */
+  action?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <Collapsible defaultOpen asChild>
+      <SidebarGroup className="pt-0 pb-1">
+        <SidebarGroupLabel role="heading" aria-level={2} className="px-0">
+          <CollapsibleTrigger asChild>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="group/section min-w-0 flex-1 justify-start gap-1 px-2 text-xs font-medium text-sidebar-foreground/70 hover:bg-transparent"
+            >
+              <span>{label}</span>
+              <ChevronDown
+                aria-hidden
+                className="size-3 opacity-0 transition-opacity group-hover/section:opacity-100 group-focus-visible/section:opacity-100 group-data-[state=closed]/section:-rotate-90"
+              />
+            </Button>
+          </CollapsibleTrigger>
+          {action}
+        </SidebarGroupLabel>
+        <CollapsibleContent>{children}</CollapsibleContent>
+      </SidebarGroup>
+    </Collapsible>
+  );
+}
+
+/**
+ * Opens the search palette, which Cmd/Ctrl+K also toggles. Hovering swaps the
+ * magnifier for the shortcut, so the click that would open search teaches the
+ * key instead.
+ */
+function SearchLabelAction() {
+  const { isMobile, setOpenMobile } = useSidebar();
+  return (
+    <UnstyledButton
+      type="button"
+      aria-label="Search"
+      className="group/search mr-1 flex h-5 min-w-4 shrink-0 items-center justify-center rounded-sm text-sidebar-foreground/70 hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring focus-visible:outline-none"
+      onClick={() => {
+        if (isMobile) setOpenMobile(false);
+        window.dispatchEvent(new CustomEvent("open-conversation-search"));
+      }}
+    >
+      <Search
+        aria-hidden
+        className="size-4 group-hover/search:hidden group-focus-visible/search:hidden"
+      />
+      <ShortcutHint
+        modifier="mod"
+        letter={SHORTCUT_SEARCH.label}
+        className="ml-0 hidden group-hover/search:inline group-focus-visible/search:inline"
+      />
+    </UnstyledButton>
+  );
+}
+
+/** The shared chat actions behind a row's "more" button. */
+function ConversationRowMenu({
+  conversation,
+  open,
+  onOpenChange,
+  onRename,
+  triggerClassName,
+}: {
+  conversation: Parameters<typeof useConversationActions>[0]["conversation"];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onRename: () => void;
+  triggerClassName: string;
+}) {
+  const { items, dialogs } = useConversationActions({
+    conversation,
+    onRename,
+  });
+  return (
+    <>
+      {/* Absolute so the trigger never permanently narrows the title. */}
+      <DropdownMenu open={open} onOpenChange={onOpenChange}>
+        <DropdownMenuTrigger asChild>
+          {/* A real button: ARIA menu attributes are not valid on a bare
+              <svg>, and an svg is not keyboard-operable. */}
+          <UnstyledButton
+            type="button"
+            aria-label="Chat actions"
+            className={cn(
+              "absolute top-1/2 -translate-y-1/2 transition-opacity",
+              triggerClassName,
+            )}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <MoreHorizontal className="h-4 w-4 p-0" />
+          </UnstyledButton>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" side="right">
+          {items}
+        </DropdownMenuContent>
+      </DropdownMenu>
+      {dialogs}
     </>
   );
 }

@@ -1,28 +1,30 @@
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 let mockIsKnowledgeBaseConfigured = false;
 
 let mockConfigStatus = { embedding: false, reranker: false };
 
+vi.mock("@/lib/hooks/use-app-name");
+
 vi.mock("@/lib/knowledge/knowledge-base.query", () => ({
   useIsKnowledgeBaseConfigured: () => mockIsKnowledgeBaseConfigured,
   useKnowledgeBaseConfigStatus: () => mockConfigStatus,
 }));
 
-vi.mock("@/lib/auth/auth.query", () => ({
-  useHasPermissions: () => ({ data: true, isPending: false }),
-  useMissingPermissions: () => [],
-}));
+vi.mock("@/lib/auth/auth.query");
 
-vi.mock("next/navigation", () => ({
-  useRouter: () => ({
-    push: vi.fn(),
-  }),
-  usePathname: () => "/knowledge/knowledge-bases",
-  useSearchParams: () => new URLSearchParams(),
-}));
+vi.mock("@/lib/config/config.query");
 
+vi.mock("next/navigation");
+
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import {
+  useHasPermissions,
+  useMissingPermissions,
+} from "@/lib/auth/auth.query";
+import { useSmallTeamTier } from "@/lib/config/config.query";
 import { KnowledgePageLayout } from "./knowledge-page-layout";
 
 function renderLayout(isPending = false) {
@@ -45,6 +47,18 @@ function renderLayout(isPending = false) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(useHasPermissions).mockReturnValue({
+    data: true,
+    isPending: false,
+  } as ReturnType<typeof useHasPermissions>);
+  vi.mocked(useMissingPermissions).mockReturnValue({});
+  vi.mocked(useRouter).mockReturnValue({
+    push: vi.fn(),
+  } as unknown as ReturnType<typeof useRouter>);
+  vi.mocked(usePathname).mockReturnValue("/knowledge/knowledge-bases");
+  vi.mocked(useSearchParams).mockReturnValue(
+    new URLSearchParams() as unknown as ReturnType<typeof useSearchParams>,
+  );
   mockIsKnowledgeBaseConfigured = false;
   mockConfigStatus = { embedding: false, reranker: false };
 });
@@ -121,11 +135,70 @@ describe("KnowledgePageLayout", () => {
     });
   });
 
+  describe("small team tier notice", () => {
+    /**
+     * Knowledge pages are working surfaces, so the licensing notice is an
+     * icon beside the title rather than a block above the content: it stays
+     * reachable without interrupting every visit to a page whose licensing
+     * state has not changed.
+     */
+    it("offers the tier notice as a hover trigger, not a banner above the content", () => {
+      vi.mocked(useSmallTeamTier).mockReturnValue({
+        communicate: true,
+        smallTeam: true,
+        envFlag: false,
+        userCount: 5,
+        threshold: 30,
+      } as ReturnType<typeof useSmallTeamTier>);
+      renderLayout();
+
+      expect(
+        screen.getByRole("button", { name: /licensing for this feature/i }),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByText(/within the free tier for teams under 30 users/),
+      ).not.toBeInTheDocument();
+    });
+
+    /**
+     * The licence gates team-scoped connector visibility and auto-sync
+     * permissions — not Knowledge as a whole. Creating knowledge bases,
+     * indexing and retrieval keep working above the threshold, so the notice
+     * must not tell an operator the feature has been switched off.
+     */
+    it("names the gated capabilities rather than declaring Knowledge disabled", async () => {
+      vi.mocked(useSmallTeamTier).mockReturnValue({
+        communicate: true,
+        smallTeam: false,
+        envFlag: false,
+        userCount: 42,
+        threshold: 30,
+      } as ReturnType<typeof useSmallTeamTier>);
+      renderLayout();
+
+      await userEvent.hover(
+        screen.getByRole("button", { name: /licensing for this feature/i }),
+      );
+
+      expect(
+        await screen.findByText(
+          /Enterprise features \(RBAC, SSO, Knowledge Base with access control\) are disabled until a license is activated\./,
+        ),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByText(/Knowledge is an enterprise feature/),
+      ).not.toBeInTheDocument();
+    });
+  });
+
   describe("loading state", () => {
-    it("shows loading spinner when isPending is true", () => {
+    it("holds the content area empty while isPending is true", () => {
       renderLayout(true);
 
-      // Content and placeholder should not be visible
+      // The sidebar toggle's spinner is the one place the app reports that it
+      // is loading, so this area draws no indicator of its own — it just does
+      // not claim anything until it knows what to show.
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
       expect(screen.queryByTestId("content")).not.toBeInTheDocument();
       expect(
         screen.queryByText("Embedding configuration required"),

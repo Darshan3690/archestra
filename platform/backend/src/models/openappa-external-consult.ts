@@ -1,0 +1,257 @@
+import { and, desc, eq, gte, inArray, lte, type SQL, sql } from "drizzle-orm";
+import db, { schema } from "@/database";
+import {
+  type CursorPaginatedResult,
+  createCursorPaginatedResult,
+  decodeCursor,
+  encodeCursor,
+} from "@/database/utils/pagination";
+import { buildTokenizedSearchFilter } from "@/database/utils/text-search";
+import { openPlainJson } from "@/openappa/plaintext-envelope";
+import type {
+  ExternalConsult,
+  ExternalConsultOutcome,
+  ExternalConsultRole,
+} from "@/types/openappa-external-consults";
+
+const table = schema.openappaExternalConsultsTable;
+
+/**
+ * The external consults the native runtime recorded. Rust writes every row;
+ * this model only reads and expires them.
+ */
+class OpenappaExternalConsultModel {
+  /** Newest first, keyed on `(created_at, id)`. */
+  static async findCursorPaginated(params: {
+    organizationId: string;
+    filters: ExternalConsultFilters;
+    limit: number;
+    cursor?: string;
+  }): Promise<CursorPaginatedResult<ExternalConsult>> {
+    const rows = await OpenappaExternalConsultModel.page({
+      ...params,
+      size: params.limit + 1,
+    });
+    return createCursorPaginatedResult(
+      rows,
+      { limit: params.limit, cursor: params.cursor },
+      cursorPosition,
+    );
+  }
+
+  /** One consult, when it is in the organization and the caller may read it. */
+  static async findById(params: {
+    organizationId: string;
+    id: string;
+    callerId?: string;
+  }): Promise<ExternalConsult | null> {
+    if (!UUID.test(params.id)) return null;
+    const conditions: SQL[] = [
+      eq(table.organizationId, params.organizationId),
+      eq(table.id, params.id),
+    ];
+    if (params.callerId) conditions.push(eq(table.callerId, params.callerId));
+    const [row] = await db
+      .select()
+      .from(table)
+      .where(and(...conditions))
+      .limit(1);
+    return row ? readable(row) : null;
+  }
+
+  /** The cursor that continues right after `row`, for a page cut short. */
+  static cursorAfter(row: ExternalConsult): string {
+    return encodeCursor(cursorPosition(row));
+  }
+
+  /** Up to `max` rows in the same order, read a page at a time. */
+  static async *exportRows(params: {
+    organizationId: string;
+    filters: ExternalConsultFilters;
+    max: number;
+    cursor?: string;
+  }): AsyncGenerator<ExternalConsult> {
+    let cursor = params.cursor;
+    let remaining = params.max;
+    while (remaining > 0) {
+      const page = await OpenappaExternalConsultModel.findCursorPaginated({
+        organizationId: params.organizationId,
+        filters: params.filters,
+        limit: Math.min(EXPORT_PAGE_SIZE, remaining),
+        cursor,
+      });
+      yield* page.data;
+      remaining -= page.data.length;
+      if (!page.pagination.nextCursor) return;
+      cursor = page.pagination.nextCursor;
+    }
+  }
+
+  /** The newest consult of each named external in one role, by name. */
+  static async findLatestByExternalName(params: {
+    organizationId: string;
+    role: ExternalConsultRole;
+    externalNames: string[];
+  }): Promise<Map<string, Pick<ExternalConsult, "outcome" | "createdAt">>> {
+    if (params.externalNames.length === 0) return new Map();
+    const rows = await db
+      .selectDistinctOn([table.externalName], {
+        externalName: table.externalName,
+        outcome: table.outcome,
+        createdAt: table.createdAt,
+      })
+      .from(table)
+      .where(
+        and(
+          eq(table.organizationId, params.organizationId),
+          eq(table.role, params.role),
+          inArray(table.externalName, params.externalNames),
+        ),
+      )
+      .orderBy(table.externalName, desc(table.createdAt), desc(table.id));
+    return new Map(
+      rows.map(({ externalName, ...latest }) => [externalName, latest]),
+    );
+  }
+
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  /** Enterprise data-retention sweep: delete consults older than the window, in batches. */
+  static async deleteExpired(params: {
+    retentionDays: number;
+    batchSize?: number;
+    maxBatches?: number;
+  }): Promise<number> {
+    const batchSize = params.batchSize ?? 1000;
+    const maxBatches = params.maxBatches ?? 500;
+    let totalDeleted = 0;
+
+    for (let batch = 0; batch < maxBatches; batch++) {
+      const result = await db.execute<{ deleted: number }>(sql`
+        WITH fence AS (
+          SELECT id
+          FROM ${table}
+          WHERE created_at < now() - make_interval(days => ${params.retentionDays})
+          LIMIT ${batchSize}
+        ),
+        removed AS (
+          DELETE FROM ${table}
+          WHERE id IN (SELECT id FROM fence)
+          RETURNING 1
+        )
+        SELECT COUNT(*)::int AS deleted FROM removed
+      `);
+      const deleted = Number(result.rows[0]?.deleted ?? 0);
+      totalDeleted += deleted;
+      if (deleted < batchSize) break;
+    }
+
+    return totalDeleted;
+  }
+  // SPDX-SnippetEnd
+
+  private static async page(params: {
+    organizationId: string;
+    filters: ExternalConsultFilters;
+    size: number;
+    cursor?: string;
+  }): Promise<ExternalConsult[]> {
+    const { filters } = params;
+    const conditions: SQL[] = [eq(table.organizationId, params.organizationId)];
+    if (filters.externalName)
+      conditions.push(eq(table.externalName, filters.externalName));
+    if (filters.role) conditions.push(eq(table.role, filters.role));
+    if (filters.outcome) conditions.push(eq(table.outcome, filters.outcome));
+    if (filters.from) conditions.push(gte(table.createdAt, filters.from));
+    if (filters.to) conditions.push(lte(table.createdAt, filters.to));
+    if (filters.root) conditions.push(eq(table.root, filters.root));
+    if (filters.sessionId)
+      conditions.push(eq(table.sessionId, filters.sessionId));
+    if (filters.callerId) conditions.push(eq(table.callerId, filters.callerId));
+    if (filters.llmSessionId) {
+      // The LLM session id is the client's own session id, the part after
+      // the caller scope in OpenAPPA's session id. Matching it to session
+      // families (indexed on that suffix) and then consults by root brings
+      // in every trajectory of the session, sub-agents included.
+      const sessions = schema.openappaSessionsTable;
+      conditions.push(
+        inArray(
+          table.root,
+          db
+            .select({ root: sessions.root })
+            .from(sessions)
+            .where(
+              and(
+                eq(sessions.organizationId, params.organizationId),
+                sql`substr(${sessions.sessionId}, strpos(${sessions.sessionId}, '|') + 1) = ${filters.llmSessionId}`,
+              ),
+            ),
+        ),
+      );
+    }
+    // Neither column is indexed: like the exact filters above, this narrows
+    // the newest-first walk of the (organization, created_at) index row by row.
+    const search = buildTokenizedSearchFilter({
+      query: filters.search,
+      columns: [table.externalName, table.sessionId],
+    });
+    if (search) conditions.push(search);
+
+    // An unreadable cursor is treated as none: the newest page.
+    const position = decodeCursor(params.cursor);
+    if (
+      position &&
+      !Number.isNaN(new Date(position.value).getTime()) &&
+      UUID.test(position.id)
+    ) {
+      conditions.push(
+        sql`(${table.createdAt}, ${table.id}) < (${position.value}::timestamptz, ${position.id}::uuid)`,
+      );
+    }
+
+    const rows = await db
+      .select()
+      .from(table)
+      .where(and(...conditions))
+      .orderBy(desc(table.createdAt), desc(table.id))
+      .limit(params.size);
+    return rows.map(readable);
+  }
+}
+
+export interface ExternalConsultFilters {
+  externalName?: string;
+  role?: ExternalConsultRole;
+  outcome?: ExternalConsultOutcome;
+  from?: Date;
+  to?: Date;
+  root?: string;
+  sessionId?: string;
+  callerId?: string;
+  /** The LLM session (client session id) the consults were raised in. */
+  llmSessionId?: string;
+  /** Case-insensitive substring of the external's name or the session ID. */
+  search?: string;
+}
+
+function cursorPosition(row: ExternalConsult) {
+  return { value: row.createdAt.toISOString(), id: row.id };
+}
+
+/**
+ * A consult as the runtime recorded it: a request or answer holding a NUL
+ * character is stored in the plaintext escape envelope and read through it.
+ */
+function readable(row: ExternalConsult): ExternalConsult {
+  return {
+    ...row,
+    request: openPlainJson(row.request),
+    answer: openPlainJson(row.answer),
+  };
+}
+
+const EXPORT_PAGE_SIZE = 500;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export default OpenappaExternalConsultModel;

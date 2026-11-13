@@ -1,7 +1,10 @@
 import { EventStreamCodec } from "@smithy/eventstream-codec";
 import { fromUtf8, toUtf8 } from "@smithy/util-utf8";
-import { describe, expect, test } from "@/test";
-import type { Bedrock } from "@/types";
+import { Agent } from "undici";
+import { describe, expect, test, vi } from "vitest";
+import type { BedrockClient } from "@/clients/bedrock-client";
+import config from "@/config";
+import { Bedrock } from "@/types";
 import { bedrockAdapterFactory, getCommandInput } from "./bedrock";
 
 const eventStreamCodec = new EventStreamCodec(toUtf8, fromUtf8);
@@ -33,6 +36,115 @@ function decodeEventStreamJson(bytes: Uint8Array): {
 function asStreamChunk<T>(chunk: unknown): T {
   return chunk as T;
 }
+
+describe("Bedrock reasoning", () => {
+  // Reasoning streams through untouched and is deliberately kept out of
+  // state.text (that holds the answer), so nothing captured it and the recorded
+  // turn looked as though the model went straight to its answer. The signature
+  // rides with the text: it is what makes a reasoning block replayable.
+  test("records the reasoning the model streamed, ahead of the answer", () => {
+    const adapter = bedrockAdapterFactory.createStreamAdapter(
+      createConverseRequest(),
+    );
+    type Chunk = Parameters<typeof adapter.processChunk>[0];
+
+    adapter.processChunk(
+      asStreamChunk<Chunk>({
+        contentBlockDelta: {
+          contentBlockIndex: 0,
+          delta: { reasoningContent: { text: "weighing it up" } },
+        },
+      }),
+    );
+    adapter.processChunk(
+      asStreamChunk<Chunk>({
+        contentBlockDelta: {
+          contentBlockIndex: 0,
+          delta: { reasoningContent: { signature: "sig-abc" } },
+        },
+      }),
+    );
+    adapter.processChunk(
+      asStreamChunk<Chunk>({
+        contentBlockDelta: {
+          contentBlockIndex: 1,
+          delta: { text: "the answer" },
+        },
+      }),
+    );
+
+    const content = adapter.toProviderResponse().output?.message?.content ?? [];
+    expect(content).toEqual([
+      {
+        reasoningContent: {
+          reasoningText: { text: "weighing it up", signature: "sig-abc" },
+        },
+      },
+      { text: "the answer" },
+    ]);
+  });
+
+  test("records a redacted reasoning block", () => {
+    const adapter = bedrockAdapterFactory.createStreamAdapter(
+      createConverseRequest(),
+    );
+    type Chunk = Parameters<typeof adapter.processChunk>[0];
+
+    adapter.processChunk(
+      asStreamChunk<Chunk>({
+        contentBlockDelta: {
+          contentBlockIndex: 0,
+          delta: { reasoningContent: { redactedContent: "encrypted-blob" } },
+        },
+      }),
+    );
+
+    const content = adapter.toProviderResponse().output?.message?.content ?? [];
+    expect(content).toEqual([
+      { reasoningContent: { redactedContent: "encrypted-blob" } },
+    ]);
+  });
+});
+
+describe("Bedrock policy refusal", () => {
+  // A refusal appends further content, so the client holds the model's text AND
+  // the refusal. Recording the refusal alone deleted the model's own answer;
+  // the withheld tool call must stay out, or the turn owes a tool result
+  // nothing will ever send.
+  test("keeps the streamed text, drops the withheld call, appends the refusal", () => {
+    const adapter = bedrockAdapterFactory.createStreamAdapter(
+      createConverseRequest(),
+    );
+    type Chunk = Parameters<typeof adapter.processChunk>[0];
+
+    adapter.processChunk(
+      asStreamChunk<Chunk>({
+        contentBlockDelta: {
+          contentBlockIndex: 0,
+          delta: { text: "let me check" },
+        },
+      }),
+    );
+    adapter.processChunk(
+      asStreamChunk<Chunk>({
+        contentBlockStart: {
+          contentBlockIndex: 1,
+          start: { toolUse: { toolUseId: "tooluse_123", name: "read_file" } },
+        },
+      }),
+    );
+
+    adapter.formatCompleteTextSSE("blocked message");
+    const response = adapter.toProviderResponse();
+
+    const content = response.output?.message?.content ?? [];
+    expect(
+      content.map((block) => ("text" in block ? block.text : undefined)),
+    ).toEqual(["let me check", "blocked message"]);
+    expect(content.some((block) => "toolUse" in block)).toBe(false);
+    expect(response.stopReason).toBe("end_turn");
+  });
+});
 
 describe("Bedrock tool name encoding", () => {
   test("shortens provider-facing tool names that exceed the Bedrock limit", () => {
@@ -192,6 +304,177 @@ describe("Bedrock tool name encoding", () => {
     expect(new Set(providerToolNames).size).toBe(2);
     expect(providerToolNames[0]).toBe("server__read_file");
     expect(providerToolNames[1]).toMatch(/^server__read_file_[a-f0-9]{8}$/);
+  });
+
+  // A dynamically-dispatched tool is never declared in toolConfig, so its name
+  // reaches Bedrock only through history and misses the toolConfig-derived
+  // mapping — it has to be encoded via the getProviderToolName fallback.
+  test("sanitizes a history-only tool name absent from toolConfig", () => {
+    const request = createConverseRequest({
+      messages: [
+        { role: "user", content: [{ text: "Continue." }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              toolUse: {
+                toolUseId: "tooluse_123",
+                name: "Project Tracker__show_board",
+                input: {},
+              },
+            },
+          ],
+        },
+      ],
+      toolConfig: {
+        tools: [
+          {
+            toolSpec: {
+              name: "agent__run_tool",
+              inputSchema: { json: { type: "object" } },
+            },
+          },
+        ],
+      },
+    });
+
+    const commandInput = getCommandInput(request);
+    const historyBlock = commandInput.messages?.[1]?.content?.[0];
+    const providerHistoryToolName =
+      historyBlock && "toolUse" in historyBlock
+        ? historyBlock.toolUse.name
+        : "";
+
+    expect(providerHistoryToolName).toBe("Project_Tracker__show_board");
+  });
+
+  test("sanitizes tool name characters Bedrock rejects", () => {
+    const toolName = "weather.get current@v2";
+    const request = createConverseRequest({
+      messages: [
+        { role: "user", content: [{ text: "What is the weather?" }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              toolUse: {
+                toolUseId: "tooluse_123",
+                name: toolName,
+                input: { city: "Berlin" },
+              },
+            },
+          ],
+        },
+      ],
+      toolConfig: {
+        tools: [
+          {
+            toolSpec: {
+              name: toolName,
+              inputSchema: { json: { type: "object" } },
+            },
+          },
+        ],
+        toolChoice: { tool: { name: toolName } },
+      },
+    });
+
+    const commandInput = getCommandInput(request);
+    const toolChoice = commandInput.toolConfig?.toolChoice as
+      | { tool?: { name?: string } }
+      | undefined;
+    const providerHistoryToolName =
+      commandInput.messages?.[1]?.content?.[0] &&
+      "toolUse" in commandInput.messages[1].content[0]
+        ? commandInput.messages[1].content[0].toolUse.name
+        : "";
+
+    expect(commandInput.toolConfig?.tools?.[0]?.toolSpec?.name).toBe(
+      "weather_get_current_v2",
+    );
+    expect(toolChoice?.tool?.name).toBe("weather_get_current_v2");
+    expect(providerHistoryToolName).toBe("weather_get_current_v2");
+  });
+
+  test("keeps sanitized tool names unique when originals collapse", () => {
+    const request = createConverseRequest({
+      toolConfig: {
+        tools: [
+          {
+            toolSpec: {
+              name: "server.read_file",
+              inputSchema: { json: { type: "object" } },
+            },
+          },
+          {
+            toolSpec: {
+              name: "server@read_file",
+              inputSchema: { json: { type: "object" } },
+            },
+          },
+        ],
+      },
+    });
+
+    const commandInput = getCommandInput(request);
+    const providerToolNames =
+      commandInput.toolConfig?.tools?.map((tool) => tool.toolSpec?.name) ?? [];
+
+    expect(providerToolNames).toHaveLength(2);
+    expect(new Set(providerToolNames).size).toBe(2);
+    expect(providerToolNames[0]).toBe("server_read_file");
+    expect(providerToolNames[1]).toMatch(/^server_read_file_[a-f0-9]{8}$/);
+  });
+
+  test("decodes sanitized Bedrock tool call names back to the original name", async () => {
+    const toolName = "weather.get current@v2";
+    const request = createConverseRequest({
+      toolConfig: {
+        tools: [
+          {
+            toolSpec: {
+              name: toolName,
+              inputSchema: { json: { type: "object" } },
+            },
+          },
+        ],
+      },
+    });
+    const commandInput = getCommandInput(request);
+    const providerToolName =
+      commandInput.toolConfig?.tools?.[0]?.toolSpec?.name ?? "";
+    const client = {
+      converse: async () => ({
+        $metadata: { requestId: "req_123" },
+        output: {
+          message: {
+            role: "assistant",
+            content: [
+              {
+                toolUse: {
+                  toolUseId: "tooluse_123",
+                  name: providerToolName,
+                  input: { city: "Berlin" },
+                },
+              },
+            ],
+          },
+        },
+        stopReason: "tool_use",
+        usage: { inputTokens: 10, outputTokens: 5 },
+      }),
+    };
+
+    const response = await bedrockAdapterFactory.execute(client, request);
+    const adapter = bedrockAdapterFactory.createResponseAdapter(response);
+
+    expect(adapter.getToolCalls()).toEqual([
+      {
+        id: "tooluse_123",
+        name: toolName,
+        arguments: { city: "Berlin" },
+      },
+    ]);
   });
 
   test("sanitizes provider-facing document names for Bedrock validation", () => {
@@ -354,7 +637,264 @@ describe("Bedrock tool name encoding", () => {
   });
 });
 
+describe("Bedrock stream reasoning delta forwarding", () => {
+  test("forwards reasoningContent text deltas without folding them into state.text", () => {
+    const adapter = bedrockAdapterFactory.createStreamAdapter(
+      createConverseRequest(),
+    );
+
+    const result = adapter.processChunk(
+      asStreamChunk<Parameters<typeof adapter.processChunk>[0]>({
+        contentBlockDelta: {
+          contentBlockIndex: 0,
+          delta: { reasoningContent: { text: "weighing the options" } },
+        },
+      }),
+    );
+
+    expect(result.isToolCallChunk).toBe(false);
+    expect(result.isFinal).toBe(false);
+    expect(result.sseData).not.toBeNull();
+    const decoded = decodeEventStreamJson(result.sseData as Uint8Array);
+    expect(decoded.headers[":event-type"]?.value).toBe("contentBlockDelta");
+    expect(decoded.body).toMatchObject({
+      contentBlockIndex: 0,
+      delta: { reasoningContent: { text: "weighing the options" } },
+    });
+    expect(adapter.state.text).toBe("");
+  });
+
+  // `redactedContent` is the Converse API's own name for the encrypted-reasoning
+  // delta, and the proxy forwards it under that name unchanged.
+  test("forwards reasoning signature and redacted-content deltas", () => {
+    const adapter = bedrockAdapterFactory.createStreamAdapter(
+      createConverseRequest(),
+    );
+
+    for (const reasoningContent of [
+      { signature: "sig_abc123" },
+      { redactedContent: "cmVkYWN0ZWQ=" },
+    ]) {
+      const result = adapter.processChunk(
+        asStreamChunk<Parameters<typeof adapter.processChunk>[0]>({
+          contentBlockDelta: {
+            contentBlockIndex: 0,
+            delta: { reasoningContent },
+          },
+        }),
+      );
+
+      expect(result.isToolCallChunk).toBe(false);
+      expect(result.sseData).not.toBeNull();
+      const decoded = decodeEventStreamJson(result.sseData as Uint8Array);
+      expect(decoded.body).toMatchObject({
+        contentBlockIndex: 0,
+        delta: { reasoningContent },
+      });
+    }
+  });
+
+  test("passes reasoning deltas through as the original raw bytes when present", () => {
+    const adapter = bedrockAdapterFactory.createStreamAdapter(
+      createConverseRequest(),
+    );
+    const rawBytes = new Uint8Array([1, 2, 3, 4]);
+
+    const result = adapter.processChunk(
+      asStreamChunk<Parameters<typeof adapter.processChunk>[0]>({
+        contentBlockDelta: {
+          contentBlockIndex: 0,
+          delta: { reasoningContent: { text: "thinking" } },
+        },
+        __rawBytes: rawBytes,
+      }),
+    );
+
+    expect(result.sseData).toBe(rawBytes);
+  });
+
+  test("keeps buffering toolUse deltas for policy evaluation", () => {
+    const adapter = bedrockAdapterFactory.createStreamAdapter(
+      createConverseRequest(),
+    );
+
+    adapter.processChunk(
+      asStreamChunk<Parameters<typeof adapter.processChunk>[0]>({
+        contentBlockStart: {
+          contentBlockIndex: 0,
+          start: { toolUse: { toolUseId: "tooluse_1", name: "get_weather" } },
+        },
+      }),
+    );
+    const result = adapter.processChunk(
+      asStreamChunk<Parameters<typeof adapter.processChunk>[0]>({
+        contentBlockDelta: {
+          contentBlockIndex: 0,
+          delta: { toolUse: { input: '{"city":"Berlin"}' } },
+        },
+      }),
+    );
+
+    expect(result.isToolCallChunk).toBe(true);
+    expect(result.sseData).toBeNull();
+    expect(adapter.state.toolCalls[0].arguments).toBe('{"city":"Berlin"}');
+  });
+
+  test("records a tool called with no input as an empty object", () => {
+    const adapter = bedrockAdapterFactory.createStreamAdapter(
+      createConverseRequest(),
+    );
+
+    // Bedrock streams a no-argument call as one empty `input` delta.
+    adapter.processChunk(
+      asStreamChunk<Parameters<typeof adapter.processChunk>[0]>({
+        contentBlockStart: {
+          contentBlockIndex: 0,
+          start: { toolUse: { toolUseId: "tooluse_1", name: "get_tests" } },
+        },
+      }),
+    );
+    adapter.processChunk(
+      asStreamChunk<Parameters<typeof adapter.processChunk>[0]>({
+        contentBlockDelta: {
+          contentBlockIndex: 0,
+          delta: { toolUse: { input: "" } },
+        },
+      }),
+    );
+    adapter.processChunk(
+      asStreamChunk<Parameters<typeof adapter.processChunk>[0]>({
+        contentBlockStop: { contentBlockIndex: 0 },
+      }),
+    );
+
+    expect(adapter.state.toolCalls[0].arguments).toBe("{}");
+  });
+});
+
+describe("Bedrock DeepSeek DSML sentinel filtering", () => {
+  test("strips the DSML marker from streamed text before a structured tool call", () => {
+    const adapter = bedrockAdapterFactory.createStreamAdapter(
+      createConverseRequest({ modelId: "deepseek.v3.2" }),
+    );
+
+    const result = adapter.processChunk(
+      asStreamChunk<Parameters<typeof adapter.processChunk>[0]>({
+        contentBlockDelta: {
+          contentBlockIndex: 0,
+          delta: {
+            text: "Let me check the available tools:\n\n<｜DSML｜function_calls",
+          },
+        },
+        __rawBytes: new Uint8Array([1, 2, 3]),
+      }),
+    );
+
+    expect(result.sseData).not.toBeNull();
+    const decoded = decodeEventStreamJson(result.sseData as Uint8Array);
+    expect(decoded.body).toMatchObject({
+      contentBlockIndex: 0,
+      delta: { text: "Let me check the available tools:" },
+    });
+    expect(adapter.state.text).toBe("Let me check the available tools:");
+  });
+
+  test("strips a DSML marker split across streamed text deltas", () => {
+    const adapter = bedrockAdapterFactory.createStreamAdapter(
+      createConverseRequest({ modelId: "deepseek.v3.2" }),
+    );
+
+    const first = adapter.processChunk(
+      asStreamChunk<Parameters<typeof adapter.processChunk>[0]>({
+        contentBlockDelta: {
+          contentBlockIndex: 0,
+          delta: { text: "Searching now.\n\n<｜DSML｜func" },
+        },
+      }),
+    );
+    const second = adapter.processChunk(
+      asStreamChunk<Parameters<typeof adapter.processChunk>[0]>({
+        contentBlockDelta: {
+          contentBlockIndex: 0,
+          delta: { text: "tion_calls" },
+        },
+      }),
+    );
+
+    expect(
+      decodeEventStreamJson(first.sseData as Uint8Array).body,
+    ).toMatchObject({ delta: { text: "Searching now." } });
+    expect(second.sseData).toBeNull();
+    expect(adapter.state.text).toBe("Searching now.");
+  });
+
+  test("strips the ASCII-spaced DSML marker variant", () => {
+    const adapter = bedrockAdapterFactory.createStreamAdapter(
+      createConverseRequest({ modelId: "deepseek.v3.2" }),
+    );
+
+    const result = adapter.processChunk(
+      asStreamChunk<Parameters<typeof adapter.processChunk>[0]>({
+        contentBlockDelta: {
+          contentBlockIndex: 0,
+          delta: { text: "Calling.\n< | DSML | function_calls >" },
+        },
+      }),
+    );
+
+    expect(
+      decodeEventStreamJson(result.sseData as Uint8Array).body,
+    ).toMatchObject({ delta: { text: "Calling." } });
+  });
+
+  test("strips the DSML marker from non-streaming responses", async () => {
+    const request = createConverseRequest({ modelId: "deepseek.v3.2" });
+    const client = {
+      converse: async () => ({
+        $metadata: { requestId: "req_dsml" },
+        output: {
+          message: {
+            role: "assistant",
+            content: [
+              { text: "Calling now.\n\n<｜DSML｜function_calls" },
+              {
+                toolUse: {
+                  toolUseId: "tooluse_dsml",
+                  name: "test_tool",
+                  input: {},
+                },
+              },
+            ],
+          },
+        },
+        stopReason: "tool_use",
+        usage: { inputTokens: 10, outputTokens: 5 },
+      }),
+    };
+
+    const response = await bedrockAdapterFactory.execute(client, request);
+    const adapter = bedrockAdapterFactory.createResponseAdapter(response);
+
+    expect(adapter.getText()).toBe("Calling now.");
+    expect(adapter.getToolCalls()).toHaveLength(1);
+    expect(JSON.stringify(response)).not.toContain("DSML");
+  });
+});
+
 describe("Bedrock client creation", () => {
+  test("derives the standard regional endpoint when no custom URL is stored", () => {
+    const client = bedrockAdapterFactory.createClient("test-key", {
+      source: "chat",
+    }) as unknown as {
+      config: { baseUrl: string; region: string };
+    };
+
+    expect(client.config).toMatchObject({
+      baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
+      region: "us-east-1",
+    });
+  });
+
   test("uses the custom base URL override", () => {
     const customBaseUrl =
       "https://bedrock-runtime.ap-southeast-1.amazonaws.com/custom-path";
@@ -366,5 +906,382 @@ describe("Bedrock client creation", () => {
     };
 
     expect(client.config.baseUrl).toBe(customBaseUrl);
+  });
+
+  test("applies the configured LLM upstream timeout to Bedrock requests", async () => {
+    config.llmProxy.upstreamTimeoutMs = 5_000;
+    const fetchMock = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ stopReason: "end_turn" })),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = bedrockAdapterFactory.createClient("test-key", {
+      baseUrl: "https://bedrock.example.com",
+      source: "chat",
+    }) as BedrockClient;
+
+    await client.converse("test-model", {});
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({ dispatcher: expect.any(Agent) }),
+    );
+  });
+});
+
+describe("Bedrock getUsage", () => {
+  test("sums the 1h portion from the cacheDetails per-TTL breakdown", () => {
+    const response = {
+      output: { message: { role: "assistant", content: [{ text: "hi" }] } },
+      stopReason: "end_turn",
+      usage: {
+        inputTokens: 5,
+        outputTokens: 10,
+        cacheReadInputTokens: 2000,
+        cacheWriteInputTokens: 1000,
+        cacheDetails: [
+          { ttl: "1h", inputTokens: 400 },
+          { ttl: "5m", inputTokens: 600 },
+        ],
+      },
+    } as unknown as Bedrock.Types.ConverseResponse;
+
+    const adapter = bedrockAdapterFactory.createResponseAdapter(response);
+
+    expect(adapter.getUsage()).toEqual({
+      inputTokens: 5,
+      outputTokens: 10,
+      cacheReadTokens: 2000,
+      cacheWriteTokens: 1000,
+      cacheWrite1hTokens: 400,
+    });
+  });
+
+  test("preserves cache usage through execute() on the non-streaming path", async () => {
+    const client = {
+      converse: async () => ({
+        $metadata: { requestId: "r" },
+        output: { message: { role: "assistant", content: [{ text: "hi" }] } },
+        stopReason: "end_turn",
+        usage: {
+          inputTokens: 5,
+          outputTokens: 10,
+          cacheReadInputTokens: 2000,
+          cacheWriteInputTokens: 1000,
+          cacheDetails: [
+            { ttl: "1h", inputTokens: 400 },
+            { ttl: "5m", inputTokens: 600 },
+          ],
+        },
+      }),
+    };
+
+    const response = await bedrockAdapterFactory.execute(
+      client,
+      createConverseRequest(),
+    );
+    const adapter = bedrockAdapterFactory.createResponseAdapter(response);
+
+    expect(adapter.getUsage()).toEqual({
+      inputTokens: 5,
+      outputTokens: 10,
+      cacheReadTokens: 2000,
+      cacheWriteTokens: 1000,
+      cacheWrite1hTokens: 400,
+    });
+  });
+});
+
+describe("Bedrock system content validation (issue #3406)", () => {
+  // Exact body @ai-sdk/amazon-bedrock emits for a Claude request with prompt
+  // caching (as used by OpenCode): a system cachePoint breakpoint follows the
+  // system text, landing at system[1]. Older Archestra validation rejected this
+  // with "body/system/1 Invalid input"; it must now validate and pass through.
+  test("accepts a cachePoint breakpoint in the system array", () => {
+    const result = Bedrock.API.ConverseRequestSchema.safeParse({
+      modelId: "anthropic.claude-haiku-4-5-20251001-v1:0",
+      system: [
+        { text: "You are a helpful assistant." },
+        { cachePoint: { type: "default" } },
+      ],
+      messages: [{ role: "user", content: [{ text: "hi" }] }],
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  test("forwards the system cachePoint to Bedrock unchanged", () => {
+    const request = createConverseRequest({
+      system: [
+        { text: "You are a helpful assistant." },
+        { cachePoint: { type: "default" } },
+      ],
+    });
+
+    const commandInput = getCommandInput(request);
+
+    expect(commandInput.system).toEqual([
+      { text: "You are a helpful assistant." },
+      { cachePoint: { type: "default" } },
+    ]);
+  });
+
+  test("normalizes Anthropic-style { type: 'text' } system blocks", () => {
+    const request = createConverseRequest({
+      system: [{ type: "text", text: "You are a helpful assistant." }] as never,
+    });
+
+    const commandInput = getCommandInput(request);
+
+    expect(commandInput.system).toEqual([
+      { text: "You are a helpful assistant." },
+    ]);
+  });
+
+  // Forward-compat: an unmodeled but object-shaped Bedrock-native system block
+  // must not 400 the whole request — AWS is the authoritative validator, so we
+  // accept it and forward it untouched instead of rejecting future block types.
+  test("accepts and passes through an unknown system block shape", () => {
+    const futureBlock = { somethingBedrockAddsLater: { foo: "bar" } };
+    const request = createConverseRequest({
+      system: [{ text: "sys" }, futureBlock] as never,
+    });
+
+    const parsed = Bedrock.API.ConverseRequestSchema.safeParse(request);
+    expect(parsed.success).toBe(true);
+
+    const commandInput = getCommandInput(request);
+    expect(commandInput.system).toEqual([{ text: "sys" }, futureBlock]);
+  });
+});
+
+describe("Bedrock reasoningContent message blocks (issue #3406)", () => {
+  // With Claude extended thinking, @ai-sdk/amazon-bedrock echoes the prior
+  // assistant reasoning back on the next turn as a reasoningContent block in the
+  // assistant message content. Older validation had no case for it and 400'd
+  // with "body/messages/N/content/M Invalid input"; it must now validate and
+  // pass through to Bedrock unchanged.
+  const reasoningBlock = {
+    reasoningContent: {
+      reasoningText: { text: "2 + 2 is 4.", signature: "ErUBCk...sig==" },
+    },
+  };
+
+  test("accepts a reasoningText block in an assistant message", () => {
+    const result = Bedrock.API.ConverseRequestSchema.safeParse({
+      modelId: "anthropic.claude-haiku-4-5-20251001-v1:0",
+      messages: [
+        { role: "user", content: [{ text: "What is 2+2?" }] },
+        { role: "assistant", content: [reasoningBlock, { text: "4" }] },
+        { role: "user", content: [{ text: "And 3+3?" }] },
+      ],
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  test("accepts a redactedReasoning block in an assistant message", () => {
+    const result = Bedrock.API.ConverseRequestSchema.safeParse({
+      modelId: "anthropic.claude-haiku-4-5-20251001-v1:0",
+      messages: [
+        { role: "user", content: [{ text: "hi" }] },
+        {
+          role: "assistant",
+          content: [
+            { reasoningContent: { redactedReasoning: { data: "abc123==" } } },
+            { text: "hello" },
+          ],
+        },
+        { role: "user", content: [{ text: "again" }] },
+      ],
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  test("accepts the Converse API's own redactedContent spelling", () => {
+    const result = Bedrock.API.ConverseRequestSchema.safeParse({
+      modelId: "anthropic.claude-haiku-4-5-20251001-v1:0",
+      messages: [
+        { role: "user", content: [{ text: "hi" }] },
+        {
+          role: "assistant",
+          content: [
+            { reasoningContent: { redactedContent: "abc123==" } },
+            { text: "hello" },
+          ],
+        },
+        { role: "user", content: [{ text: "again" }] },
+      ],
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  test("forwards the reasoningContent block to Bedrock unchanged", () => {
+    const request = createConverseRequest({
+      messages: [
+        { role: "user", content: [{ text: "What is 2+2?" }] },
+        {
+          role: "assistant",
+          content: [reasoningBlock, { text: "4" }],
+        } as never,
+        { role: "user", content: [{ text: "And 3+3?" }] },
+      ],
+    });
+
+    const commandInput = getCommandInput(request);
+
+    expect(commandInput.messages?.[1]?.content?.[0]).toEqual(reasoningBlock);
+  });
+});
+
+describe("Bedrock sampling-param fallback", () => {
+  function makeRejectedTemperatureError(messageText: string): Error {
+    const message = JSON.stringify({
+      message: messageText,
+    });
+    const error = new Error(message) as Error & {
+      statusCode: number;
+      responseBody: string;
+    };
+    error.statusCode = 400;
+    error.responseBody = message;
+    return error;
+  }
+
+  const okResponse = {
+    $metadata: { requestId: "req_1" },
+    output: { message: { role: "assistant", content: [{ text: "ok" }] } },
+    stopReason: "end_turn",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  };
+
+  test.each([
+    "The model returned the following errors: `temperature` is deprecated for this model.",
+    "This model doesn't support the temperature field. Remove temperature and try again.",
+  ])("retries without temperature while keeping other params: %s", async (message) => {
+    const request = createConverseRequest({
+      inferenceConfig: { temperature: 0.7, topP: 0.9, maxTokens: 100 },
+    });
+    const seenInferenceConfigs: Array<unknown> = [];
+    const client = {
+      converse: async (_modelId: string, input: Record<string, unknown>) => {
+        seenInferenceConfigs.push(input.inferenceConfig);
+        if (seenInferenceConfigs.length === 1) {
+          throw makeRejectedTemperatureError(message);
+        }
+        return okResponse;
+      },
+    };
+
+    const response = await bedrockAdapterFactory.execute(client, request);
+
+    // Retried exactly once; the first attempt sent temperature, the retry
+    // dropped only temperature and preserved topP + maxTokens.
+    expect(seenInferenceConfigs).toHaveLength(2);
+    expect(seenInferenceConfigs[0]).toEqual({
+      temperature: 0.7,
+      topP: 0.9,
+      maxTokens: 100,
+    });
+    expect(seenInferenceConfigs[1]).toEqual({ topP: 0.9, maxTokens: 100 });
+    expect(response.output?.message?.content?.[0]).toEqual({ text: "ok" });
+  });
+
+  test("streaming retries Bedrock's rejected temperature before yielding events", async () => {
+    const request = createConverseRequest({
+      inferenceConfig: { temperature: 0, maxTokens: 100 },
+    });
+    const events = (async function* () {
+      yield { messageStop: { stopReason: "end_turn" } };
+    })();
+    const converseStream = vi
+      .fn()
+      .mockRejectedValueOnce(
+        makeRejectedTemperatureError(
+          "This model doesn't support the temperature field. Remove temperature and try again.",
+        ),
+      )
+      .mockResolvedValue(events);
+    const stream = await bedrockAdapterFactory.executeStream(
+      { converseStream },
+      request,
+    );
+    expect(stream).toBe(events);
+    expect(converseStream).toHaveBeenCalledTimes(2);
+    expect(converseStream.mock.calls[0][1].inferenceConfig).toEqual({
+      temperature: 0,
+      maxTokens: 100,
+    });
+    expect(converseStream.mock.calls[1][1].inferenceConfig).toEqual({
+      maxTokens: 100,
+    });
+  });
+
+  test("does not retry on unrelated validation errors", async () => {
+    const request = createConverseRequest({
+      inferenceConfig: { temperature: 0.7 },
+    });
+    let calls = 0;
+    const client = {
+      converse: async () => {
+        calls++;
+        const error = new Error(
+          "Input is too long for requested model.",
+        ) as Error & { statusCode: number };
+        error.statusCode = 400;
+        throw error;
+      },
+    };
+
+    await expect(
+      bedrockAdapterFactory.execute(client, request),
+    ).rejects.toThrow("Input is too long for requested model.");
+    expect(calls).toBe(1);
+  });
+});
+
+describe("Bedrock replayed tool-call ids", () => {
+  test("fits a foreign call id after the result update looked it up", () => {
+    const foreignCallId = "call.0:read";
+    const request = createConverseRequest({
+      messages: [
+        { role: "user", content: [{ text: "Read a.txt" }] },
+        {
+          role: "assistant",
+          content: [
+            { toolUse: { toolUseId: foreignCallId, name: "read", input: {} } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              toolResult: {
+                toolUseId: foreignCallId,
+                content: [{ text: "SECRET" }],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const adapter = bedrockAdapterFactory.createRequestAdapter(request);
+    adapter.applyToolResultUpdates({ [foreignCallId]: "sanitized" });
+    const messages = adapter.toProviderRequest().messages ?? [];
+
+    const toolUse = messages[1].content?.[0] as {
+      toolUse: { toolUseId: string };
+    };
+    const toolResult = messages[2].content?.[0] as {
+      toolResult: { toolUseId: string };
+    };
+    expect(toolUse.toolUse.toolUseId).toMatch(/^call_[0-9a-f]{32}$/);
+    expect(toolResult.toolResult.toolUseId).toBe(toolUse.toolUse.toolUseId);
+    expect(JSON.stringify(messages)).toContain("sanitized");
+    expect(JSON.stringify(messages)).not.toContain("SECRET");
   });
 });

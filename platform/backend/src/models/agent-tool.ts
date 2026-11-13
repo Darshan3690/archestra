@@ -1,8 +1,10 @@
 import {
   ARCHESTRA_MCP_CATALOG_ID,
+  isRequiredOpenAppaToolShortName,
   type PaginationQuery,
+  parseFullToolName,
   TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME,
-} from "@shared";
+} from "@archestra/shared";
 import {
   and,
   asc,
@@ -19,8 +21,16 @@ import {
   sql,
 } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
-import { archestraMcpBranding } from "@/archestra-mcp-server";
-import db, { schema } from "@/database";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
+import {
+  dropHiddenAgents,
+  gatedAgentsFence,
+  gatedCatalogToolsFence,
+  gatedDelegationToolsFence,
+  hiddenAgentsAmong,
+} from "@/auth/permission-gated";
+import db, { schema, type Transaction } from "@/database";
+import { notDeleted } from "@/database/schemas/soft-deletable-table";
 import {
   createPaginatedResult,
   type PaginatedResult,
@@ -31,10 +41,15 @@ import type {
   AgentToolSortBy,
   CredentialResolutionMode,
   InsertAgentTool,
+  InternalMcpCatalogServerType,
+  McpServerAssignedAgent,
+  ResourceVisibilityScope,
   SortDirection,
   UpdateAgentTool,
 } from "@/types";
+import { ApiError } from "@/types";
 import AgentTeamModel from "./agent-team";
+import AgentVersionModel from "./agent-version";
 import McpServerUserModel from "./mcp-server-user";
 
 class AgentToolModel {
@@ -83,18 +98,55 @@ class AgentToolModel {
    * Assign a delegation to a target agent.
    * Creates the delegation tool if it doesn't exist, then creates the agent_tool assignment.
    */
-  static async assignDelegation(
-    agentId: string,
-    targetAgentId: string,
-  ): Promise<void> {
+  static async assignDelegation(params: {
+    agentId: string;
+    targetAgentId: string;
+    tx?: Transaction;
+  }): Promise<boolean> {
+    const { agentId, targetAgentId, tx } = params;
+    const dbx = tx ?? db;
     // Dynamically import to avoid circular dependency
     const { default: ToolModel } = await import("./tool");
 
     // Find or create the delegation tool for the target agent
-    const tool = await ToolModel.findOrCreateDelegationTool(targetAgentId);
+    const tool = await ToolModel.findOrCreateDelegationTool(targetAgentId, tx);
+
+    const [collision] = await dbx
+      .select({ id: schema.toolsTable.id })
+      .from(schema.agentToolsTable)
+      .innerJoin(
+        schema.toolsTable,
+        eq(schema.agentToolsTable.toolId, schema.toolsTable.id),
+      )
+      .where(
+        and(
+          eq(schema.agentToolsTable.agentId, agentId),
+          eq(schema.toolsTable.name, tool.name),
+          ne(schema.toolsTable.id, tool.id),
+        ),
+      )
+      .limit(1);
+    if (collision) {
+      throw new ApiError(
+        409,
+        `Delegation tool name "${tool.name}" is already assigned to this agent`,
+      );
+    }
 
     // Assign the tool to the source agent
-    await AgentToolModel.createIfNotExists(agentId, tool.id);
+    const [created] = await dbx
+      .insert(schema.agentToolsTable)
+      .values({ agentId, toolId: tool.id })
+      .onConflictDoNothing({
+        target: [schema.agentToolsTable.agentId, schema.agentToolsTable.toolId],
+      })
+      .returning({ id: schema.agentToolsTable.id });
+
+    // Delegation assignment changes the agent's tool surface — fork a version.
+    if (created && !tx) {
+      await AgentVersionModel.forkIfChangedBestEffort(agentId);
+    }
+    return !!created;
   }
 
   /**
@@ -112,7 +164,7 @@ class AgentToolModel {
       return false;
     }
 
-    return AgentToolModel.delete(agentId, tool.id);
+    return AgentToolModel.delete({ agentId, toolId: tool.id });
   }
 
   /**
@@ -134,6 +186,7 @@ class AgentToolModel {
     const results = await db
       .select({
         id: schema.agentsTable.id,
+        organizationId: schema.agentsTable.organizationId,
         name: schema.agentsTable.name,
         description: schema.agentsTable.description,
         systemPrompt: schema.agentsTable.systemPrompt,
@@ -151,6 +204,7 @@ class AgentToolModel {
         and(
           eq(schema.agentToolsTable.agentId, agentId),
           isNotNull(schema.toolsTable.delegateToAgentId),
+          notDeleted(schema.agentsTable),
         ),
       );
 
@@ -161,7 +215,7 @@ class AgentToolModel {
       return results.filter((r) => userAccessibleAgentIds.includes(r.id));
     }
 
-    return results;
+    return userId ? dropHiddenAgents(results, userId) : results;
   }
 
   /**
@@ -187,7 +241,10 @@ class AgentToolModel {
 
     // Add new delegations
     for (const targetId of toAdd) {
-      await AgentToolModel.assignDelegation(agentId, targetId);
+      await AgentToolModel.assignDelegation({
+        agentId: agentId,
+        targetAgentId: targetId,
+      });
     }
 
     return {
@@ -239,6 +296,8 @@ class AgentToolModel {
         and(
           isNotNull(schema.toolsTable.delegateToAgentId),
           eq(schema.agentsTable.organizationId, organizationId),
+          notDeleted(schema.agentsTable),
+          notDeleted(targetAgentsAlias),
         ),
       )
       .$dynamic();
@@ -260,11 +319,19 @@ class AgentToolModel {
     }
 
     const results = await query;
+    const hidden = userId
+      ? await hiddenAgentsAmong(
+          results.flatMap((r) => [r.sourceAgentId, r.targetAgentId]),
+          { kind: "caller", userId, organizationId },
+        )
+      : new Set();
 
     // Filter out null targetAgentIds (shouldn't happen but TypeScript needs this)
     return results.filter(
       (r): r is typeof r & { targetAgentId: string } =>
-        r.targetAgentId !== null,
+        r.targetAgentId !== null &&
+        !hidden.has(r.targetAgentId) &&
+        !hidden.has(r.sourceAgentId),
     );
   }
 
@@ -289,7 +356,13 @@ class AgentToolModel {
         schema.teamMembersTable,
         eq(schema.mcpServersTable.teamId, schema.teamMembersTable.teamId),
       )
-      .where(eq(schema.teamMembersTable.userId, userId));
+      .where(
+        and(
+          eq(schema.teamMembersTable.userId, userId),
+          // Active installs only — a soft-deleted install grants no access.
+          notDeleted(schema.mcpServersTable),
+        ),
+      );
 
     const teamAccessibleIds = teamAccessibleServers.map((s) => s.mcpServerId);
 
@@ -312,6 +385,8 @@ class AgentToolModel {
             and(
               eq(schema.mcpServersTable.scope, "org"),
               eq(schema.internalMcpCatalogTable.organizationId, organizationId),
+              // Active installs only — a soft-deleted install grants no access.
+              notDeleted(schema.mcpServersTable),
             ),
           )
           .then((rows) => rows.map((s) => s.mcpServerId))
@@ -351,45 +426,101 @@ class AgentToolModel {
   }
 
   /**
-   * Bulk insert multiple agent-tool assignments in a single query.
-   * Checks auto-configure setting once (not per-row) to avoid N+1 queries.
+   * Insert-or-update several agent-tool assignments in a single statement.
+   *
+   * `ON CONFLICT` rather than a plain insert so a caller holding a mix of new
+   * and already-assigned pairs needs no per-row UPDATE. That matters because the
+   * bulk routes run this inside a transaction: a per-row loop would hold write
+   * locks on `agent_tools` for as many round trips as there are rows, so lock
+   * hold time would scale with batch size.
    */
-  static async bulkCreate(
+  static async bulkUpsert(
     values: Array<{
       agentId: string;
       toolId: string;
       mcpServerId?: string | null;
       credentialResolutionMode?: CredentialResolutionMode;
+      resolveAtCallTime?: boolean;
     }>,
     _organizationId?: string,
+    tx?: Transaction,
   ) {
     if (values.length === 0) return [];
+    const dbx = tx ?? db;
 
-    const rows = await db
+    // Row locks are taken in the order this VALUES list names them, so a stable
+    // order keeps two concurrent upserts with overlapping pairs from deadlocking
+    // against each other. It says nothing about a caller that also DELETEs rows
+    // in a separate statement of the same transaction — that order is not
+    // coordinated with this one.
+    //
+    // Byte order, not locale collation: the keys are UUID pairs, so there is no
+    // collation question to answer, and a locale-sensitive comparator would make
+    // the lock order depend on the process's resolved ICU locale.
+    const sortKey = (v: { agentId: string; toolId: string }) =>
+      `${v.agentId}:${v.toolId}`;
+    const ordered = [...values].sort((a, b) => {
+      const keyA = sortKey(a);
+      const keyB = sortKey(b);
+      return keyA < keyB ? -1 : keyA > keyB ? 1 : 0;
+    });
+
+    const rows = await dbx
       .insert(schema.agentToolsTable)
       .values(
-        values.map((value) => ({
+        ordered.map((value) => ({
           agentId: value.agentId,
           toolId: value.toolId,
-          ...(value.mcpServerId ? { mcpServerId: value.mcpServerId } : {}),
+          // Explicit null, never an omitted key. The conflict clause below sets
+          // `excluded.mcp_server_id`, which is whatever this row proposed —
+          // omitting the column would make it default to null on insert but
+          // leave a stale pin in place on update, so the same input would clear
+          // a pin or not depending on whether the row already existed.
+          mcpServerId: value.mcpServerId ?? null,
           credentialResolutionMode: normalizeCredentialResolutionMode(value),
         })),
       )
+      .onConflictDoUpdate({
+        target: [schema.agentToolsTable.agentId, schema.agentToolsTable.toolId],
+        set: {
+          mcpServerId: sql`excluded.mcp_server_id`,
+          credentialResolutionMode: sql`excluded.credential_resolution_mode`,
+          // Set explicitly: this is an INSERT statement, so the column's
+          // `$onUpdate` never fires for the conflict path.
+          updatedAt: new Date(),
+        },
+      })
       .returning();
 
     return rows;
   }
 
-  static async delete(agentId: string, toolId: string): Promise<boolean> {
-    const result = await db
+  static async delete(params: {
+    agentId: string;
+    toolId: string;
+    /** See `AgentToolAssignmentRequest.deferVersionFork`. */
+    deferVersionFork?: boolean;
+  }): Promise<boolean> {
+    const { agentId, toolId } = params;
+    await AgentToolModel.requireRemovableTools([toolId]);
+    // RETURNING (not rowCount) so the deleted flag is reliable — the fork below
+    // and callers key off it, and rowCount is not dependable under PGlite.
+    const rows = await db
       .delete(schema.agentToolsTable)
       .where(
         and(
           eq(schema.agentToolsTable.agentId, agentId),
           eq(schema.agentToolsTable.toolId, toolId),
         ),
-      );
-    return result.rowCount !== null && result.rowCount > 0;
+      )
+      .returning({ toolId: schema.agentToolsTable.toolId });
+    const deleted = rows.length > 0;
+    if (deleted && !params.deferVersionFork) {
+      // Tool surface changed — fork a version. Covers unassign via REST, the
+      // MCP sync tool, and removeDelegation.
+      await AgentVersionModel.forkIfChangedBestEffort(agentId);
+    }
+    return deleted;
   }
 
   static async deleteAllForAgent(agentId: string): Promise<number> {
@@ -402,22 +533,36 @@ class AgentToolModel {
   static async deleteCatalogToolsForAgent(agentId: string): Promise<number> {
     const catalogToolIds =
       await AgentToolModel.findCatalogToolIdsByAgent(agentId);
-    return AgentToolModel.bulkDelete(agentId, catalogToolIds);
+    const deleted = await AgentToolModel.bulkDelete(agentId, catalogToolIds);
+    return deleted.length;
   }
 
-  static async bulkDelete(agentId: string, toolIds: string[]): Promise<number> {
-    if (toolIds.length === 0) return 0;
+  /**
+   * Delete several of one agent's assignments in a single statement, returning
+   * the tool ids that were actually removed. RETURNING (not rowCount) for the
+   * same reason as `delete` above: rowCount is not dependable under PGlite, and
+   * bulk callers distinguish a real removal from a tool that was not assigned.
+   */
+  static async bulkDelete(
+    agentId: string,
+    toolIds: string[],
+    tx?: Transaction,
+  ): Promise<string[]> {
+    if (toolIds.length === 0) return [];
+    await AgentToolModel.requireRemovableTools(toolIds, tx);
+    const dbx = tx ?? db;
 
-    const result = await db
+    const rows = await dbx
       .delete(schema.agentToolsTable)
       .where(
         and(
           eq(schema.agentToolsTable.agentId, agentId),
           inArray(schema.agentToolsTable.toolId, toolIds),
         ),
-      );
+      )
+      .returning({ toolId: schema.agentToolsTable.toolId });
 
-    return result.rowCount || 0;
+    return rows.map((row) => row.toolId);
   }
 
   static async findToolIdsByAgent(agentId: string): Promise<string[]> {
@@ -426,6 +571,118 @@ class AgentToolModel {
       .from(schema.agentToolsTable)
       .where(eq(schema.agentToolsTable.agentId, agentId));
     return results.map((r) => r.toolId);
+  }
+
+  /**
+   * Full assignment identity per tool, not just the tool id. The version
+   * restore compares live assignments against a snapshot's, and the credential
+   * binding is part of what a version records: two rows with the same toolId
+   * but a different server or resolution mode are different configurations, so
+   * an id-only read would report "unchanged" and silently skip restoring them.
+   */
+  static async findAssignmentsByAgent(
+    agentId: string,
+  ): Promise<AgentToolAssignment[]> {
+    return db
+      .select({
+        toolId: schema.agentToolsTable.toolId,
+        mcpServerId: schema.agentToolsTable.mcpServerId,
+        credentialResolutionMode:
+          schema.agentToolsTable.credentialResolutionMode,
+      })
+      .from(schema.agentToolsTable)
+      .where(eq(schema.agentToolsTable.agentId, agentId));
+  }
+
+  /**
+   * The agent's assignments that pin one installed MCP connection — a binding
+   * the runtime follows as written. Returns the tool name plus the connection
+   * identity the assignment rules evaluate (scope/team/owner), so a caller can
+   * re-check pins the agent already holds against a scope or team membership
+   * it does not have yet. Soft-deleted connections are skipped: a pin to one
+   * resolves nothing either way.
+   */
+  static async findStaticPinnedAssignmentsByAgent(agentId: string): Promise<
+    {
+      toolId: string;
+      toolName: string;
+      mcpServer: {
+        id: string;
+        name: string;
+        ownerId: string | null;
+        teamId: string | null;
+        scope: ResourceVisibilityScope;
+        serverType: InternalMcpCatalogServerType;
+      };
+    }[]
+  > {
+    const rows = await db
+      .select({
+        toolId: schema.agentToolsTable.toolId,
+        toolName: schema.toolsTable.name,
+        id: schema.mcpServersTable.id,
+        name: schema.mcpServersTable.name,
+        ownerId: schema.mcpServersTable.ownerId,
+        teamId: schema.mcpServersTable.teamId,
+        scope: schema.mcpServersTable.scope,
+        serverType: schema.mcpServersTable.serverType,
+      })
+      .from(schema.agentToolsTable)
+      .innerJoin(
+        schema.toolsTable,
+        eq(schema.agentToolsTable.toolId, schema.toolsTable.id),
+      )
+      .innerJoin(
+        schema.mcpServersTable,
+        eq(schema.agentToolsTable.mcpServerId, schema.mcpServersTable.id),
+      )
+      .where(
+        and(
+          eq(schema.agentToolsTable.agentId, agentId),
+          // The mode is the whole test: only `dynamic` resolves the connection
+          // per caller at call time, so every other mode leaves `mcpServerId`
+          // as a pin the runtime targets. A null `mcpServerId` needs no
+          // predicate of its own — the join above already drops those rows.
+          ne(schema.agentToolsTable.credentialResolutionMode, "dynamic"),
+          notDeleted(schema.mcpServersTable),
+        ),
+      );
+
+    return rows.map(({ toolId, toolName, ...mcpServer }) => ({
+      toolId,
+      toolName,
+      mcpServer,
+    }));
+  }
+
+  /**
+   * Batched {@link findAssignmentsByAgent}, keyed by agent id. Agents with no
+   * assignments still get an (empty) entry, so a caller snapshotting a set of
+   * agents does not have to distinguish "no rows" from "not queried".
+   */
+  static async findAssignmentsByAgents(
+    agentIds: string[],
+  ): Promise<Map<string, AgentToolAssignment[]>> {
+    const byAgent = new Map<string, AgentToolAssignment[]>(
+      agentIds.map((agentId) => [agentId, []]),
+    );
+    if (agentIds.length === 0) return byAgent;
+
+    const rows = await db
+      .select({
+        agentId: schema.agentToolsTable.agentId,
+        toolId: schema.agentToolsTable.toolId,
+        mcpServerId: schema.agentToolsTable.mcpServerId,
+        credentialResolutionMode:
+          schema.agentToolsTable.credentialResolutionMode,
+      })
+      .from(schema.agentToolsTable)
+      .where(inArray(schema.agentToolsTable.agentId, agentIds));
+
+    for (const { agentId, ...assignment } of rows) {
+      byAgent.get(agentId)?.push(assignment);
+    }
+    return byAgent;
   }
 
   static async findCatalogToolIdsByAgent(agentId: string): Promise<string[]> {
@@ -441,6 +698,8 @@ class AgentToolModel {
           eq(schema.agentToolsTable.agentId, agentId),
           isNotNull(schema.toolsTable.catalogId),
           isNull(schema.toolsTable.delegateToAgentId),
+          // A soft-deleted catalog's tools are not resolvable for the agent.
+          notDeleted(schema.toolsTable),
         ),
       );
     return results.map((r) => r.toolId);
@@ -459,6 +718,105 @@ class AgentToolModel {
       .select({ toolId: schema.agentToolsTable.toolId })
       .from(schema.agentToolsTable);
     return [...new Set(results.map((r) => r.toolId))];
+  }
+
+  /**
+   * Get the distinct agents that have tools explicitly assigned from each of
+   * the given MCP servers, in one query to avoid N+1.
+   *
+   * An assignment counts toward a server when it is statically pinned to that
+   * server (`agent_tools.mcp_server_id`), or when it is unpinned (dynamic
+   * credential resolution) and the tool belongs to the server's catalog — a
+   * dynamic assignment can resolve to any install of the catalog at call time.
+   *
+   * The two rules are two branches of a union rather than one join with an
+   * OR'd condition. An OR across two different columns gives the planner nothing it
+   * can drive an index from, so it paired every server with every assignment
+   * row and filtered afterwards — on a modest organization that is already a
+   * seven-figure intermediate result, and it grows with servers × assignments.
+   * Each rule on its own is an ordinary equi-join, and the union of the two is
+   * the same set.
+   */
+  static async getAssignedAgentDetailsForMcpServers(
+    mcpServerIds: string[],
+  ): Promise<Map<string, McpServerAssignedAgent[]>> {
+    const agentsMap = new Map<string, McpServerAssignedAgent[]>();
+    for (const mcpServerId of mcpServerIds) {
+      agentsMap.set(mcpServerId, []);
+    }
+    if (mcpServerIds.length === 0) {
+      return agentsMap;
+    }
+
+    // One statement. Each rule is its own equi-join (see above). The union
+    // keeps one row per (server, agent), pinned over unpinned. Each server's
+    // agents come back as one JSON array, because mapping and deduplicating
+    // every assignment row in JS blocks the event loop on large installs.
+    const serverIds = sql`ARRAY[${sql.join(
+      mcpServerIds.map((id) => sql`${id}`),
+      sql`, `,
+    )}]::uuid[]`;
+    // The McpServerAssignedAgent fields are listed by hand in
+    // json_build_object below; a new field must be added there too.
+    const result = await db.execute<{
+      mcp_server_id: string;
+      agents: Array<McpServerAssignedAgent>;
+    }>(sql`
+      WITH pinned_assignments AS (
+        SELECT DISTINCT at.mcp_server_id, at.agent_id
+        FROM ${schema.agentToolsTable} at
+        WHERE at.mcp_server_id = ANY(${serverIds})
+      ),
+      dynamic_assignments AS (
+        SELECT DISTINCT ms.id AS mcp_server_id, at.agent_id
+        FROM ${schema.agentToolsTable} at
+        INNER JOIN ${schema.toolsTable} t ON t.id = at.tool_id
+        INNER JOIN ${schema.mcpServersTable} ms ON ms.catalog_id = t.catalog_id
+        WHERE at.mcp_server_id IS NULL
+          AND ms.id = ANY(${serverIds})
+      ),
+      assignments AS (
+        SELECT DISTINCT ON (mcp_server_id, agent_id)
+          mcp_server_id, agent_id, pinned
+        FROM (
+          SELECT mcp_server_id, agent_id, true AS pinned FROM pinned_assignments
+          UNION ALL
+          SELECT mcp_server_id, agent_id, false AS pinned FROM dynamic_assignments
+        ) union_assignments
+        ORDER BY mcp_server_id, agent_id, pinned DESC
+      )
+      SELECT
+        assignments.mcp_server_id,
+        json_agg(json_build_object(
+          'id', a.id,
+          'name', a.name,
+          'agentType', a.agent_type,
+          'accessAllTools', a.access_all_tools,
+          'organizationId', a.organization_id,
+          'scope', a.scope,
+          'ownerId', a.author_id,
+          'ownerEmail', u.email,
+          'pinned', assignments.pinned
+        )) AS agents
+      FROM assignments
+      INNER JOIN ${schema.agentsTable} a ON a.id = assignments.agent_id
+      LEFT JOIN ${schema.usersTable} u ON u.id = a.author_id
+      WHERE a.deleted_at IS NULL
+      GROUP BY assignments.mcp_server_id
+    `);
+
+    for (const row of result.rows) {
+      agentsMap.set(
+        row.mcp_server_id,
+        row.agents.sort(
+          (a, b) =>
+            AGENT_NAME_COLLATOR.compare(a.name, b.name) ||
+            AGENT_NAME_COLLATOR.compare(a.id, b.id),
+        ),
+      );
+    }
+
+    return agentsMap;
   }
 
   static async getToolsForAgent(agentId: string) {
@@ -551,8 +909,10 @@ class AgentToolModel {
     options?: Partial<
       Pick<InsertAgentTool, "mcpServerId" | "credentialResolutionMode">
     >,
+    tx?: Transaction,
   ): Promise<void> {
     if (agentIds.length === 0 || toolIds.length === 0) return;
+    const dbx = tx ?? db;
 
     // Build all possible combinations
     const assignments: Array<{
@@ -576,7 +936,7 @@ class AgentToolModel {
     }
 
     // Check which assignments already exist
-    const existingAssignments = await db
+    const existingAssignments = await dbx
       .select({
         agentId: schema.agentToolsTable.agentId,
         toolId: schema.agentToolsTable.toolId,
@@ -599,7 +959,7 @@ class AgentToolModel {
     );
 
     if (newAssignments.length > 0) {
-      await db
+      await dbx
         .insert(schema.agentToolsTable)
         .values(newAssignments)
         .onConflictDoNothing();
@@ -609,7 +969,7 @@ class AgentToolModel {
       (options?.mcpServerId || options?.credentialResolutionMode) &&
       existingAssignments.length > 0
     ) {
-      await db
+      await dbx
         .update(schema.agentToolsTable)
         .set({
           ...(options.mcpServerId ? { mcpServerId: options.mcpServerId } : {}),
@@ -624,63 +984,6 @@ class AgentToolModel {
             inArray(schema.agentToolsTable.toolId, toolIds),
           ),
         );
-    }
-  }
-
-  static async syncAgentToolsFromLabels(agentId: string): Promise<void> {
-    // Get the agent and verify it's eligible for automatic tool assignment based on labels
-    const { default: AgentModel } = await import("./agent");
-    const agent = await AgentModel.findById(agentId);
-
-    if (!agent) return;
-    if (!isAutomaticToolAssignmentSupported(agent.agentType)) return;
-    if (agent.toolAssignmentMode !== "automatic") return;
-
-    // Fetch the agent's labels and determine which tools should be assigned based on those labels
-    const { default: AgentLabelModel } = await import("./agent-label");
-    const labels = await AgentLabelModel.getLabelsForAgent(agentId);
-
-    // For each label, find catalog items that match the label, then find tools associated with those catalog items, and build a set of desired tool IDs to be assigned to the agent
-    const desiredToolIdsSet = new Set<string>();
-    if (labels.length > 0) {
-      const { default: McpCatalogLabelModel } = await import(
-        "./mcp-catalog-label"
-      );
-      const catalogIds =
-        await McpCatalogLabelModel.getCatalogIdsByLabels(labels);
-
-      if (catalogIds.length > 0) {
-        const { default: ToolModel } = await import("./tool");
-        const toolIds = await ToolModel.getToolIdsByCatalogIds(catalogIds);
-        for (const toolId of toolIds) {
-          desiredToolIdsSet.add(toolId);
-        }
-      }
-    }
-
-    // Fetch the agent's assigned tool IDs and determine which tools to add/remove
-    const currentToolIds =
-      await AgentToolModel.findCatalogToolIdsByAgent(agentId);
-    const currentToolIdsSet = new Set(currentToolIds);
-
-    const desiredToolIds = Array.from(desiredToolIdsSet);
-    const toInsert = desiredToolIds.filter((id) => !currentToolIdsSet.has(id));
-    const toDelete = currentToolIds.filter((id) => !desiredToolIdsSet.has(id));
-
-    // Assign new tools that are not currently assigned to the agent.
-    if (toInsert.length > 0) {
-      const entries = toInsert.map((toolId) => ({
-        agentId,
-        toolId,
-        credentialResolutionMode: "dynamic" as CredentialResolutionMode, // default to dynamic for automatically assigned tools
-      }));
-
-      await AgentToolModel.bulkCreate(entries);
-    }
-
-    // Remove tools that are currently assigned but not in the desired set.
-    if (toDelete.length > 0) {
-      await AgentToolModel.bulkDelete(agentId, toDelete);
     }
   }
 
@@ -749,8 +1052,10 @@ class AgentToolModel {
 
   /**
    * Bulk create-or-update agent-tool assignments.
-   * Fetches all existing assignments in a single query, then batch-inserts new ones
-   * and individually updates those that need credential changes.
+   *
+   * Classifies every pair against one batched read, then writes every pair that
+   * actually changed with a single upsert. The statement count inside a caller's
+   * transaction is therefore fixed rather than proportional to the batch.
    */
   static async bulkCreateOrUpdateCredentials(
     assignments: Array<{
@@ -760,6 +1065,7 @@ class AgentToolModel {
       credentialResolutionMode?: CredentialResolutionMode;
     }>,
     organizationId?: string,
+    tx?: Transaction,
   ): Promise<
     Array<{
       agentId: string;
@@ -768,32 +1074,58 @@ class AgentToolModel {
     }>
   > {
     if (assignments.length === 0) return [];
+    const dbx = tx ?? db;
 
-    // Build OR conditions for all (agentId, toolId) pairs
-    const pairConditions = assignments.map((a) =>
-      and(
-        eq(schema.agentToolsTable.agentId, a.agentId),
-        eq(schema.agentToolsTable.toolId, a.toolId),
-      ),
-    );
+    // Chunked: the predicate is one `OR` group per pair, two bind params each,
+    // and this is the FIRST statement in the function — so an oversized batch
+    // would trip Postgres' 65535-parameter cap here, before any of the work
+    // below, no matter what the callers cap their request bodies at.
+    const existingMap = new Map<
+      string,
+      {
+        mcpServerId: string | null;
+        credentialResolutionMode: CredentialResolutionMode;
+      }
+    >();
+    for (
+      let offset = 0;
+      offset < assignments.length;
+      offset += EXISTING_LOOKUP_CHUNK_SIZE
+    ) {
+      const chunk = assignments.slice(
+        offset,
+        offset + EXISTING_LOOKUP_CHUNK_SIZE,
+      );
+      const existing = await dbx
+        .select({
+          agentId: schema.agentToolsTable.agentId,
+          toolId: schema.agentToolsTable.toolId,
+          mcpServerId: schema.agentToolsTable.mcpServerId,
+          credentialResolutionMode:
+            schema.agentToolsTable.credentialResolutionMode,
+        })
+        .from(schema.agentToolsTable)
+        .where(
+          or(
+            ...chunk.map((a) =>
+              and(
+                eq(schema.agentToolsTable.agentId, a.agentId),
+                eq(schema.agentToolsTable.toolId, a.toolId),
+              ),
+            ),
+          ),
+        );
+      for (const row of existing) {
+        existingMap.set(`${row.agentId}:${row.toolId}`, row);
+      }
+    }
 
-    // Batch fetch all existing assignments in one query
-    const existing = await db
-      .select()
-      .from(schema.agentToolsTable)
-      .where(or(...pairConditions));
-
-    const existingMap = new Map(
-      existing.map((e) => [`${e.agentId}:${e.toolId}`, e]),
-    );
-
-    const toCreate: Array<{
-      agentId: string;
-      toolId: string;
-      mcpServerId?: string | null;
-      resolveAtCallTime?: boolean;
-      credentialResolutionMode?: CredentialResolutionMode;
-    }> = [];
+    // Keyed, not a list: one upsert cannot name the same conflict target twice
+    // ("ON CONFLICT DO UPDATE command cannot affect row a second time"), and a
+    // body repeating a pair is a client mistake, not a reason to fail the save.
+    // Among the occurrences that need a write, the last one wins, mirroring the
+    // sequential writes this replaced.
+    const toUpsert = new Map<string, (typeof assignments)[number]>();
     const results: Array<{
       agentId: string;
       toolId: string;
@@ -805,56 +1137,40 @@ class AgentToolModel {
       const existingRow = existingMap.get(key);
 
       if (!existingRow) {
-        // New assignment - collect for batch insert
-        toCreate.push(assignment);
+        toUpsert.set(key, assignment);
         results.push({
           agentId: assignment.agentId,
           toolId: assignment.toolId,
           status: "created",
         });
-      } else {
-        // Check if credentials need updating
-        const needsUpdate =
-          existingRow.mcpServerId !== (assignment.mcpServerId ?? null) ||
-          existingRow.credentialResolutionMode !==
-            normalizeCredentialResolutionMode(assignment);
+        continue;
+      }
 
-        if (needsUpdate) {
-          const updateData: Partial<
-            Pick<UpdateAgentTool, "mcpServerId" | "credentialResolutionMode">
-          > = {
-            mcpServerId: assignment.mcpServerId ?? null,
-            credentialResolutionMode:
-              normalizeCredentialResolutionMode(assignment),
-          };
-          await AgentToolModel.update(existingRow.id, updateData);
-          results.push({
-            agentId: assignment.agentId,
-            toolId: assignment.toolId,
-            status: "updated",
-          });
-        } else {
-          results.push({
-            agentId: assignment.agentId,
-            toolId: assignment.toolId,
-            status: "unchanged",
-          });
-        }
+      const needsUpdate =
+        existingRow.mcpServerId !== (assignment.mcpServerId ?? null) ||
+        existingRow.credentialResolutionMode !==
+          normalizeCredentialResolutionMode(assignment);
+
+      if (needsUpdate) {
+        // Only changed pairs reach the write. An `unchanged` row included here
+        // would have its `updatedAt` bumped by the conflict clause for a write
+        // that alters nothing else.
+        toUpsert.set(key, assignment);
+        results.push({
+          agentId: assignment.agentId,
+          toolId: assignment.toolId,
+          status: "updated",
+        });
+      } else {
+        results.push({
+          agentId: assignment.agentId,
+          toolId: assignment.toolId,
+          status: "unchanged",
+        });
       }
     }
 
-    // Batch insert all new assignments in a single query
-    if (toCreate.length > 0) {
-      await AgentToolModel.bulkCreate(
-        toCreate.map((a) => ({
-          agentId: a.agentId,
-          toolId: a.toolId,
-          ...(a.mcpServerId ? { mcpServerId: a.mcpServerId } : {}),
-          credentialResolutionMode: normalizeCredentialResolutionMode(a),
-        })),
-        organizationId,
-      );
-    }
+    await AgentToolModel.bulkUpsert([...toUpsert.values()], organizationId, tx);
 
     return results;
   }
@@ -864,8 +1180,9 @@ class AgentToolModel {
     data: Partial<
       Pick<UpdateAgentTool, "mcpServerId" | "credentialResolutionMode">
     >,
+    tx?: Transaction,
   ) {
-    const [agentTool] = await db
+    const [agentTool] = await (tx ?? db)
       .update(schema.agentToolsTable)
       .set({
         ...(data.mcpServerId !== undefined
@@ -911,7 +1228,9 @@ class AgentToolModel {
         schema.toolsTable,
         eq(schema.agentToolsTable.toolId, schema.toolsTable.id),
       )
-      .where(eq(schema.agentToolsTable.id, id))
+      .where(
+        and(eq(schema.agentToolsTable.id, id), notDeleted(schema.agentsTable)),
+      )
       .limit(1);
     return row;
   }
@@ -931,6 +1250,8 @@ class AgentToolModel {
     organizationId?: string;
     isAgentAdmin?: boolean;
     skipPagination?: boolean;
+    /** False returns each tool's `description` as null and `parameters` as {}. */
+    includeToolDetails?: boolean;
   }): Promise<PaginatedResult<AgentTool>> {
     const {
       pagination = { limit: 20, offset: 0 },
@@ -940,9 +1261,21 @@ class AgentToolModel {
       organizationId,
       isAgentAdmin,
       skipPagination = false,
+      includeToolDetails = true,
     } = params;
     // Build WHERE conditions
-    const whereConditions: SQL[] = [];
+    const whereConditions: SQL[] = [notDeleted(schema.agentsTable)];
+    if (userId) {
+      for (const fence of await Promise.all([
+        gatedAgentsFence({
+          userId,
+          organizationIds: organizationId ? [organizationId] : [],
+        }),
+        gatedCatalogToolsFence({ userId, organizationId }),
+        gatedDelegationToolsFence({ userId, organizationId }),
+      ]))
+        if (fence) whereConditions.push(fence);
+    }
 
     // Apply access control filtering for users that are not agent admins
     if (userId && !isAgentAdmin) {
@@ -1083,8 +1416,13 @@ class AgentToolModel {
         tool: {
           id: schema.toolsTable.id,
           name: schema.toolsTable.name,
-          description: schema.toolsTable.description,
-          parameters: schema.toolsTable.parameters,
+          // Not read without details: they hold each tool's JSON schema.
+          description: includeToolDetails
+            ? schema.toolsTable.description
+            : sql<ToolRow["description"]>`null`,
+          parameters: includeToolDetails
+            ? schema.toolsTable.parameters
+            : sql<ToolRow["parameters"]>`'{}'::jsonb`,
           createdAt: schema.toolsTable.createdAt,
           updatedAt: schema.toolsTable.updatedAt,
           catalogId: schema.toolsTable.catalogId,
@@ -1103,14 +1441,19 @@ class AgentToolModel {
       .orderBy(orderByClause)
       .$dynamic();
 
-    // Apply pagination only if not skipped
-    const dataQuery = skipPagination
-      ? baseDataQuery
-      : baseDataQuery.limit(pagination.limit).offset(pagination.offset);
+    // Without pagination the row count is the total; no count query needed.
+    // Use Math.max(1, data.length) to avoid division by zero when data is empty
+    if (skipPagination) {
+      const data = await baseDataQuery;
+      return createPaginatedResult(data, data.length, {
+        limit: Math.max(1, data.length),
+        offset: 0,
+      });
+    }
 
     // Run both queries in parallel
     const [data, [{ total }]] = await Promise.all([
-      dataQuery,
+      baseDataQuery.limit(pagination.limit).offset(pagination.offset),
       db
         .select({ total: count() })
         .from(schema.agentToolsTable)
@@ -1125,61 +1468,31 @@ class AgentToolModel {
         .where(whereClause),
     ]);
 
-    // When skipping pagination, return all data with correct metadata
-    // Use Math.max(1, data.length) to avoid division by zero when data is empty
-    if (skipPagination) {
-      return createPaginatedResult(data, data.length, {
-        limit: Math.max(1, data.length),
-        offset: 0,
-      });
-    }
-
     return createPaginatedResult(data, Number(total), pagination);
-  }
-
-  /**
-   * Delete all static agent-tool assignments that use a specific MCP server.
-   */
-  static async deleteByExecutionSourceMcpServerId(
-    mcpServerId: string,
-  ): Promise<number> {
-    const result = await db
-      .delete(schema.agentToolsTable)
-      .where(eq(schema.agentToolsTable.mcpServerId, mcpServerId));
-    return result.rowCount ?? 0;
-  }
-
-  /**
-   * Delete all static agent-tool assignments that use a specific MCP server.
-   */
-  static async deleteByCredentialSourceMcpServerId(
-    mcpServerId: string,
-  ): Promise<number> {
-    return AgentToolModel.deleteByExecutionSourceMcpServerId(mcpServerId);
   }
 
   /**
    * Clean up invalid static MCP server assignments when a user is removed from a team.
    * Sets mcpServerId to null for agent-tools where:
    * - The assigned MCP server is owned by the removed user
-   * - The user no longer has access to the agent through any team
+   * - The user no longer has access to the agent through any grant
    */
-  static async cleanupInvalidCredentialSourcesForUser(
-    userId: string,
-    teamId: string,
-    isAgentAdmin: boolean,
-  ): Promise<number> {
-    // Get all agents assigned to this team
-    const agentsInTeam = await db
-      .select({ agentId: schema.agentTeamsTable.agentId })
-      .from(schema.agentTeamsTable)
-      .where(eq(schema.agentTeamsTable.teamId, teamId));
+  static async cleanupInvalidCredentialSourcesForUser(params: {
+    userId: string;
+    teamId: string;
+    organizationId: string;
+    isAgentAdmin: boolean;
+  }): Promise<number> {
+    const { userId, isAgentAdmin } = params;
+    // The agents this team reaches: those whose own policy grants it read.
+    const agentIds = await AgentTeamModel.getAgentIdsForTeam({
+      organizationId: params.organizationId,
+      teamId: params.teamId,
+    });
 
-    if (agentsInTeam.length === 0) {
+    if (agentIds.length === 0) {
       return 0;
     }
-
-    const agentIds = agentsInTeam.map((a) => a.agentId);
 
     // Get all MCP servers owned by this user
     const userServers = await db
@@ -1198,11 +1511,12 @@ class AgentToolModel {
 
     for (const agentId of agentIds) {
       // Check if user still has access to this agent through other teams
-      const hasAccess = await AgentTeamModel.userHasAgentAccess(
+      const hasAccess = await AgentTeamModel.userHasAgentAccess({
         userId,
         agentId,
         isAgentAdmin,
-      );
+        action: "use",
+      });
 
       // If user no longer has access, clean up their personal tokens
       if (!hasAccess) {
@@ -1222,13 +1536,165 @@ class AgentToolModel {
 
     return cleanedCount;
   }
+
+  /** Count of agent↔tool links for agents in the organization (audit footprint). */
+  static async countAssignmentsForOrganization(
+    organizationId: string,
+  ): Promise<Record<string, unknown>> {
+    const [row] = await db
+      .select({ c: count() })
+      .from(schema.agentToolsTable)
+      .innerJoin(
+        schema.agentsTable,
+        eq(schema.agentToolsTable.agentId, schema.agentsTable.id),
+      )
+      .where(eq(schema.agentsTable.organizationId, organizationId));
+    return { agentToolAssignmentCount: Number(row?.c ?? 0) };
+  }
+
+  static async findByIdForAudit(
+    assignmentId: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [scoped] = await db
+      .select({
+        assignmentId: schema.agentToolsTable.id,
+        agentId: schema.agentToolsTable.agentId,
+        agentName: schema.agentsTable.name,
+        toolId: schema.toolsTable.id,
+        toolName: schema.toolsTable.name,
+        mcpServerId: schema.agentToolsTable.mcpServerId,
+        credentialResolutionMode:
+          schema.agentToolsTable.credentialResolutionMode,
+        updatedAt: schema.agentToolsTable.updatedAt,
+      })
+      .from(schema.agentToolsTable)
+      .innerJoin(
+        schema.agentsTable,
+        eq(schema.agentToolsTable.agentId, schema.agentsTable.id),
+      )
+      .innerJoin(
+        schema.toolsTable,
+        eq(schema.agentToolsTable.toolId, schema.toolsTable.id),
+      )
+      .where(
+        and(
+          eq(schema.agentToolsTable.id, assignmentId),
+          eq(schema.agentsTable.organizationId, organizationId),
+        ),
+      )
+      .limit(1);
+
+    if (!scoped) return null;
+
+    return AgentToolModel.toAuditSnapshot(scoped);
+  }
+
+  /** Used by `/api/agents/:agentId/tools/:toolId` where `resourceId` is the tool id. */
+  static async findByAgentAndToolForAudit(
+    agentId: string,
+    toolId: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [scoped] = await db
+      .select({
+        assignmentId: schema.agentToolsTable.id,
+        agentId: schema.agentToolsTable.agentId,
+        agentName: schema.agentsTable.name,
+        toolId: schema.toolsTable.id,
+        toolName: schema.toolsTable.name,
+        mcpServerId: schema.agentToolsTable.mcpServerId,
+        credentialResolutionMode:
+          schema.agentToolsTable.credentialResolutionMode,
+        updatedAt: schema.agentToolsTable.updatedAt,
+      })
+      .from(schema.agentToolsTable)
+      .innerJoin(
+        schema.agentsTable,
+        eq(schema.agentToolsTable.agentId, schema.agentsTable.id),
+      )
+      .innerJoin(
+        schema.toolsTable,
+        eq(schema.agentToolsTable.toolId, schema.toolsTable.id),
+      )
+      .where(
+        and(
+          eq(schema.agentToolsTable.agentId, agentId),
+          eq(schema.agentToolsTable.toolId, toolId),
+          eq(schema.agentsTable.organizationId, organizationId),
+        ),
+      )
+      .limit(1);
+
+    if (!scoped) return null;
+
+    return AgentToolModel.toAuditSnapshot(scoped);
+  }
+
+  private static async requireRemovableTools(
+    toolIds: string[],
+    tx?: Transaction,
+  ): Promise<void> {
+    const rows = await (tx ?? db)
+      .select({
+        name: schema.toolsTable.name,
+        catalogId: schema.toolsTable.catalogId,
+      })
+      .from(schema.toolsTable)
+      .where(inArray(schema.toolsTable.id, toolIds));
+    const required = rows.find(
+      (row) =>
+        row.catalogId === ARCHESTRA_MCP_CATALOG_ID &&
+        isRequiredOpenAppaToolShortName(parseFullToolName(row.name).toolName),
+    );
+    if (required) {
+      throw new ApiError(400, "OpenAPPA recovery tools cannot be unassigned");
+    }
+  }
+
+  private static toAuditSnapshot(scoped: {
+    assignmentId: string;
+    agentId: string;
+    agentName: string;
+    toolId: string;
+    toolName: string;
+    mcpServerId: string | null;
+    credentialResolutionMode: string;
+    updatedAt: Date;
+  }): Record<string, unknown> {
+    return {
+      id: scoped.assignmentId,
+      agentId: scoped.agentId,
+      agentName: scoped.agentName,
+      toolId: scoped.toolId,
+      toolName: scoped.toolName,
+      mcpServerId: scoped.mcpServerId ?? null,
+      credentialResolutionMode: scoped.credentialResolutionMode,
+      updatedAt: scoped.updatedAt.toISOString(),
+    };
+  }
 }
 
 export default AgentToolModel;
 
-function isAutomaticToolAssignmentSupported(agentType: string): boolean {
-  return agentType === "agent" || agentType === "mcp_gateway";
-}
+type ToolRow = typeof schema.toolsTable.$inferSelect;
+
+/**
+ * One agent's binding of a tool: the tool plus the credential identity that
+ * makes two rows with the same `toolId` different configurations.
+ */
+type AgentToolAssignment = {
+  toolId: string;
+  mcpServerId: string | null;
+  credentialResolutionMode: CredentialResolutionMode;
+};
+
+/**
+ * Pairs per existing-assignment lookup in `bulkCreateOrUpdateCredentials`. Two
+ * bind params per pair, so this keeps a chunk an order of magnitude below
+ * Postgres' 65535-parameter statement cap.
+ */
+const EXISTING_LOOKUP_CHUNK_SIZE = 2000;
 
 function normalizeCredentialResolutionMode(params: {
   resolveAtCallTime?: boolean;
@@ -1240,3 +1706,6 @@ function normalizeCredentialResolutionMode(params: {
 
   return params.resolveAtCallTime ? "dynamic" : "static";
 }
+
+/** `localeCompare` ordering, without building a collator per comparison. */
+const AGENT_NAME_COLLATOR = new Intl.Collator();

@@ -1,0 +1,416 @@
+import type { EnvironmentTarget } from "@archestra/sandbox-rs";
+import config from "@/config";
+import { daggerEnvironmentRuntimeManager } from "@/k8s/dagger-environment-runtime/manager";
+import { withDeadline } from "@/k8s/mcp-server-runtime";
+import logger from "@/logging";
+import OpenAppaBatteryInstallModel from "@/models/openappa-battery-install";
+import OpenAppaEffectivePolicyModel from "@/models/openappa-effective-policy";
+import OrganizationModel from "@/models/organization";
+import { sandboxRuntimeService } from "@/sandbox-runtime/sandbox-runtime-service";
+import { resolveCredentialValue } from "@/services/credentials";
+import { skillRootPath } from "@/skills-sandbox/runtime-image";
+import { shellQuote } from "@/utils/shell-quote";
+import { archestraAudience } from "./archestra-audience";
+import { deployedFromRow } from "./battery-target";
+import { boundGithubApiUrl } from "./bound-github-api-url";
+import { servedHelperSource } from "./composition-view";
+import { openappaDeclarations } from "./declarations";
+import { draftHelperSource } from "./draft-helper-sources";
+import { HelperSlots } from "./helper-slots";
+
+/**
+ * The last line a helper wrote to stderr, safe as a header value. Untrusted:
+ * passed through to the runtime's consult record, never parsed or acted on.
+ */
+export type HelperDiagnostics = string & {
+  readonly __brand: "HelperDiagnostics";
+};
+
+export type HelperConsultOutcome =
+  | {
+      kind: "answered";
+      answer: Record<string, unknown>;
+      diagnostics?: HelperDiagnostics;
+    }
+  | { kind: "not_found" }
+  | {
+      kind: "failed";
+      reason: string;
+      exitStatus?: number;
+      diagnostics?: HelperDiagnostics;
+    }
+  | { kind: "timed_out"; diagnostics?: HelperDiagnostics }
+  | { kind: "busy" };
+
+/**
+ * Runs a battery's helper script for one consult: the install named in the
+ * URL supplies the organization, the credential bindings and the battery whose
+ * files are mounted read-only into a fresh sandbox. The consult envelope goes in
+ * on stdin, the credential as a Dagger secret, and the helper's stdout comes
+ * back as the answer, with the last line of its stderr as diagnostics. Nothing
+ * about the run is persisted here.
+ */
+class OpenAppaHelperBridge {
+  private readonly slots = new HelperSlots(helperConsultCap);
+
+  async consult(params: {
+    installId: string;
+    externalName: string;
+    request: string;
+  }): Promise<HelperConsultOutcome> {
+    const startedAt = Date.now();
+    const context = {
+      installId: params.installId,
+      externalName: params.externalName,
+    };
+    const work = this.run(params, startedAt + HELPER_DEADLINE_MS);
+    let outcome: HelperConsultOutcome;
+    try {
+      outcome = await withDeadline(
+        work,
+        HELPER_DEADLINE_MS,
+        () => new HelperDeadlineError(),
+      );
+    } catch (error) {
+      if (!(error instanceof HelperDeadlineError)) throw error;
+      work.then(
+        (late) =>
+          logger.info(
+            { ...context, outcome: late.kind },
+            "OpenAPPA battery helper settled after its deadline",
+          ),
+        (late) =>
+          logger.warn(
+            { ...context, error: late },
+            "OpenAPPA battery helper failed after its deadline",
+          ),
+      );
+      outcome = { kind: "timed_out" };
+    }
+    logger.info(
+      {
+        ...context,
+        outcome: outcome.kind,
+        ...(outcome.kind === "failed" && {
+          reason: outcome.reason,
+          exitStatus: outcome.exitStatus,
+        }),
+        durationMs: Date.now() - startedAt,
+      },
+      "OpenAPPA battery helper consulted",
+    );
+    return outcome;
+  }
+
+  private async run(
+    params: {
+      installId: string;
+      externalName: string;
+      request: string;
+    },
+    deadline: number,
+  ): Promise<HelperConsultOutcome> {
+    const install = await this.helperSource(params.installId);
+    if (!install) return { kind: "not_found" };
+    const battery = await openappaDeclarations.resolveInstalled({
+      organizationId: install.organizationId,
+      name: install.batteryName,
+      packageHash: install.packageHash,
+    });
+    // The row records the target the composition deployed, whose helpers it serves.
+    const deployed = battery && deployedFromRow(battery, install.target);
+    const matches =
+      deployed?.externals.filter(
+        (candidate) => candidate.name === params.externalName,
+      ) ?? [];
+    const kind = consultKind(params.request);
+    const external =
+      matches.length === 1
+        ? matches[0]
+        : matches.find((candidate) => candidate.kind === sectionForKind(kind));
+    if (!battery || !deployed || !external) return { kind: "not_found" };
+    if (
+      archestraAudience.serves({
+        batteryName: install.batteryName,
+        packageHash: install.packageHash,
+        externalName: external.name,
+      })
+    )
+      return archestraAudience.consult({
+        organizationId: install.organizationId,
+        request: params.request,
+      });
+
+    const resolved = await Promise.all(
+      deployed.credentials.map((credential) =>
+        this.resolveCredential({ install, credential }),
+      ),
+    );
+    const secretEnv: Array<{ name: string; value: string }> = [];
+    for (const entry of resolved) {
+      if ("failure" in entry)
+        return {
+          kind: "failed",
+          reason: `credential ${entry.credential} ${CREDENTIAL_FAILURES[entry.failure]}`,
+        };
+      secretEnv.push({ name: entry.credential, value: entry.value });
+    }
+
+    const githubApiUrl = await boundGithubApiUrl({
+      organizationId: install.organizationId,
+      credentialKeys: deployed.credentials.flatMap(
+        (credential) => install.credentialBindings[credential] ?? [],
+      ),
+    });
+    const environment = await this.organizationEngine(install.organizationId);
+    const cwd = skillRootPath(battery.name);
+    // Only sandbox execution consumes this share. In-process audience reads,
+    // missing helpers and credential validation do not occupy sandbox workers.
+    // A consult over the cap waits for a slot as long as its execution budget
+    // still ends before the deadline. The wait comes out of the margin kept for
+    // container start-up, which beats turning the consult away outright.
+    const waitUntil = deadline - HELPER_EXEC_TIMEOUT_SECONDS * 1000;
+    if (!(await this.slots.acquire(waitUntil))) return { kind: "busy" };
+    try {
+      let executed: Awaited<
+        ReturnType<typeof sandboxRuntimeService.runCommand>
+      >;
+      try {
+        await sandboxRuntimeService.attach(CONSUMER_ID);
+        executed = await sandboxRuntimeService.runCommand({
+          // Helpers are short-lived; lazy imports (Python 3.15+, ignored before)
+          // skip loading modules a consult never touches. The helper reads its
+          // budget as an OpenAPPA command external reads it from the runtime.
+          command: `${CONSULT_TIMEOUT_VARIABLE}=${HELPER_EXEC_TIMEOUT_SECONDS * 1000} PYTHON_LAZY_IMPORTS=all ${githubApiUrl ? `GITHUB_API_URL=${shellQuote(githubApiUrl)} ` : ""}${external.command.map(shellQuote).join(" ")}`,
+          cwd,
+          timeoutSeconds: HELPER_EXEC_TIMEOUT_SECONDS,
+          replayEntries: [
+            {
+              kind: "skill_mount",
+              skillMount: {
+                skillName: battery.name,
+                files: battery.files.map((file) => ({
+                  skillName: battery.name,
+                  path: file.path,
+                  encoding: "utf8",
+                  content: file.text,
+                })),
+              },
+            },
+          ],
+          secretEnv,
+          environment,
+          stdin: params.request,
+          outputBytesLimit: config.skillsSandbox.outputBytesLimit,
+          fileSizeLimitBytes: config.skillsSandbox.artifactBytesLimit,
+          cpuSeconds: config.skillsSandbox.cpuLimit,
+          memoryBytes: config.skillsSandbox.memoryLimit,
+        });
+      } catch (error) {
+        logger.warn(
+          { installId: install.id, externalName: external.name, error },
+          "OpenAPPA battery helper could not run",
+        );
+        return { kind: "failed", reason: "the helper sandbox is unavailable" };
+      }
+      const diagnostics = helperDiagnostics(executed.stderr);
+      if (executed.timedOut) return { kind: "timed_out", diagnostics };
+      if (executed.exitCode !== 0)
+        return {
+          kind: "failed",
+          reason: `the helper exited with status ${executed.exitCode}`,
+          exitStatus: executed.exitCode,
+          diagnostics,
+        };
+      const answer = parseJsonObject(executed.stdout);
+      return answer
+        ? { kind: "answered", answer, diagnostics }
+        : {
+            kind: "failed",
+            reason: "the helper did not print a JSON object",
+            diagnostics,
+          };
+    } finally {
+      // A timed-out consult still holds its share until the underlying run ends.
+      this.slots.release();
+    }
+  }
+
+  /**
+   * The install a helper URL names, as the composition the runtime enforces
+   * deployed it. While a refusal holds, the install rows already describe
+   * the refused plan, so the enforced composition's record answers: its
+   * package, target and credential keys, even for a row the refused plan
+   * deleted. Otherwise the row answers, and a deleted row takes its helper
+   * endpoint with it. A draft replay's battery has no row; the source it
+   * registered answers while that replay runs.
+   */
+  private async helperSource(installId: string): Promise<{
+    id: string;
+    organizationId: string;
+    batteryName: string;
+    packageHash: string | null;
+    target: "multi-user" | null;
+    credentialBindings: Record<string, string>;
+  } | null> {
+    const draft = draftHelperSource(installId);
+    if (draft) return draft;
+    const row = await OpenAppaBatteryInstallModel.findById(installId);
+    const stored = row
+      ? await OpenAppaEffectivePolicyModel.findServed(row.organizationId)
+      : await OpenAppaEffectivePolicyModel.findServingInstall(installId);
+    const served = stored ? servedHelperSource(stored, installId) : null;
+    if (served) return served;
+    return row
+      ? {
+          id: row.id,
+          organizationId: row.organizationId,
+          batteryName: row.batteryName,
+          packageHash: row.packageHash,
+          target: row.target,
+          credentialBindings: row.credentialBindings,
+        }
+      : null;
+  }
+
+  private async resolveCredential(params: {
+    install: {
+      id: string;
+      organizationId: string;
+      credentialBindings: Record<string, string>;
+    };
+    credential: string;
+  }): Promise<ResolvedCredential> {
+    const { install, credential } = params;
+    const key = install.credentialBindings[credential];
+    if (!key) return { credential, failure: "unbound" };
+    let value: string | null;
+    try {
+      value = await resolveCredentialValue({
+        organizationId: install.organizationId,
+        credentialId: key,
+        scope: "organization",
+      });
+    } catch (error) {
+      logger.warn(
+        { err: error, installId: install.id, credential },
+        "OpenAPPA battery credential could not be resolved",
+      );
+      value = null;
+    }
+    return value === null
+      ? { credential, failure: "no_organization_value" }
+      : { credential, value };
+  }
+
+  /**
+   * The engine the organization's own sandbox runs use, carrying its egress
+   * policy. An operator-supplied runner host serves every run from the
+   * process default instead, as it does for unbound agents.
+   */
+  private async organizationEngine(
+    organizationId: string,
+  ): Promise<EnvironmentTarget | undefined> {
+    if (config.daggerRuntime.runnerHost) return undefined;
+    const organization =
+      await OrganizationModel.getDefaultEngineTarget(organizationId);
+    if (!organization) return undefined;
+    return daggerEnvironmentRuntimeManager.organizationDefaultTarget(
+      organization,
+    );
+  }
+}
+
+export const openappaHelperBridge = new OpenAppaHelperBridge();
+
+type ResolvedCredential =
+  | { credential: string; value: string }
+  | { credential: string; failure: CredentialFailure };
+
+type CredentialFailure = "unbound" | "no_organization_value";
+
+const CREDENTIAL_FAILURES: Record<CredentialFailure, string> = {
+  unbound: "is unbound",
+  no_organization_value: "has no organization value",
+};
+
+const CONSUMER_ID = "openappa-helper-bridge";
+/** The helper's own execution budget inside the container. */
+const HELPER_EXEC_TIMEOUT_SECONDS = 4;
+/** Where an OpenAPPA command external reads the milliseconds it has to answer. */
+const CONSULT_TIMEOUT_VARIABLE = "APPA_CONSULT_TIMEOUT_MS";
+/**
+ * Wall-clock budget for one helper consult, container materialization
+ * included: the execution budget plus a margin, kept under the runtime's own
+ * consult timeout so a slow helper surfaces here as a timeout instead of as a
+ * silent NoAnswer upstream.
+ */
+const HELPER_DEADLINE_MS = HELPER_EXEC_TIMEOUT_SECONDS * 1000 + 500;
+
+function consultKind(request: string): string | undefined {
+  try {
+    const parsed = JSON.parse(request) as { kind?: unknown };
+    return typeof parsed.kind === "string" ? parsed.kind : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sectionForKind(kind: string | undefined): string | undefined {
+  switch (kind) {
+    case "annotation":
+      return "annotators";
+    case "authority":
+      return "authorities";
+    case "sanitizer":
+      return "sanitizers";
+    case "audience":
+      return "audience";
+    case "context":
+      return "context";
+    default:
+      return undefined;
+  }
+}
+
+function helperConsultCap(): number {
+  return Math.max(1, Math.floor(config.daggerRuntime.maxConcurrent / 2));
+}
+
+class HelperDeadlineError extends Error {}
+
+/** The runtime keeps at most 8 KiB of diagnostics. */
+const DIAGNOSTICS_LIMIT = 8 * 1024;
+/** What Node accepts in a header value: tab, printable ASCII, latin1. */
+const HEADER_VALUE = /^[\t\x20-\x7e\x80-\xff]+$/;
+
+/**
+ * The last non-empty line of the helper's stderr tail, or none when that line
+ * is not a valid header value or does not fit whole in the tail.
+ */
+function helperDiagnostics(stderr: string): HelperDiagnostics | undefined {
+  const cut = stderr.length > DIAGNOSTICS_LIMIT;
+  const lines = stderr.slice(-DIAGNOSTICS_LIMIT).split("\n");
+  // A cut tail begins mid-line: its first line may be the end of a longer one.
+  const whole = cut ? lines.slice(1) : lines;
+  const last = whole
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .at(-1);
+  return last !== undefined && HEADER_VALUE.test(last)
+    ? (last as HelperDiagnostics)
+    : undefined;
+}
+
+function parseJsonObject(text: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return typeof parsed === "object" &&
+      parsed !== null &&
+      !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}

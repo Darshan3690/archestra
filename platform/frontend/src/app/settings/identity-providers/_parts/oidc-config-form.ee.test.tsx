@@ -1,15 +1,17 @@
-import { zodResolver } from "@hookform/resolvers/zod";
 import {
   IdentityProviderFormSchema,
   type IdentityProviderFormValues,
-} from "@shared";
+  type IdentityProviderSecretPath,
+} from "@archestra/shared";
+import { zodResolver } from "@hookform/resolvers/zod";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ComponentProps } from "react";
 import { useForm } from "react-hook-form";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Button } from "@/components/ui/button";
 import { Form } from "@/components/ui/form";
+import { useAppName } from "@/lib/hooks/use-app-name";
 import { OidcConfigForm } from "./oidc-config-form.ee";
 
 vi.mock("./role-mapping-form.ee", () => ({
@@ -20,9 +22,7 @@ vi.mock("./team-sync-config-form.ee", () => ({
   TeamSyncConfigForm: () => <div>Team Sync</div>,
 }));
 
-vi.mock("@/lib/hooks/use-app-name", () => ({
-  useAppName: () => "Archestra",
-}));
+vi.mock("@/lib/hooks/use-app-name");
 
 global.ResizeObserver = class ResizeObserver {
   observe() {}
@@ -30,14 +30,22 @@ global.ResizeObserver = class ResizeObserver {
   disconnect() {}
 } as unknown as typeof ResizeObserver;
 
+beforeEach(() => {
+  vi.mocked(useAppName).mockReturnValue("Archestra");
+});
+
 function TestWrapper({
   onSubmit,
   providerId = "test",
   activeSection,
+  configuredSecretPaths,
+  clientSecret = "secret",
 }: {
   onSubmit?: (data: IdentityProviderFormValues) => void;
   providerId?: string;
   activeSection?: ComponentProps<typeof OidcConfigForm>["activeSection"];
+  configuredSecretPaths?: IdentityProviderSecretPath[];
+  clientSecret?: string;
 }) {
   const form = useForm<IdentityProviderFormValues>({
     // biome-ignore lint/suspicious/noExplicitAny: test setup
@@ -53,7 +61,7 @@ function TestWrapper({
         enableRpInitiatedLogout: true,
         hd: "",
         clientId: "test",
-        clientSecret: "secret",
+        clientSecret,
         discoveryEndpoint:
           "https://example.com/.well-known/openid-configuration",
         scopes: ["openid"],
@@ -65,7 +73,11 @@ function TestWrapper({
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit((data) => onSubmit?.(data))}>
-        <OidcConfigForm form={form} activeSection={activeSection} />
+        <OidcConfigForm
+          form={form}
+          activeSection={activeSection}
+          configuredSecretPaths={configuredSecretPaths}
+        />
         <Button type="submit">Save</Button>
       </form>
     </Form>
@@ -97,16 +109,53 @@ describe("OidcConfigForm", () => {
     );
   });
 
-  it("hides allowed email domains for non-Google providers", () => {
-    render(<TestWrapper />);
+  describe("stored secrets", () => {
+    // Reads redact the secret, so an edit dialog opens with a blank Client
+    // Secret box. Without this hint that reads as "the credential was lost".
+    const storedNote =
+      /A value is already stored\. Leave blank to keep it, or enter a new value to replace\./;
 
-    expect(
-      screen.queryByLabelText("Allowed Email Domains"),
-    ).not.toBeInTheDocument();
+    it("says a saved client secret is stored when the field comes back blank", () => {
+      render(
+        <TestWrapper
+          clientSecret=""
+          configuredSecretPaths={["oidcConfig.clientSecret"]}
+        />,
+      );
+
+      expect(screen.getByLabelText("Client Secret")).toHaveValue("");
+      expect(screen.getByText(storedNote)).toBeInTheDocument();
+    });
+
+    it("says nothing about a stored secret when none is saved", () => {
+      render(<TestWrapper clientSecret="" />);
+
+      expect(screen.queryByText(storedNote)).not.toBeInTheDocument();
+    });
+
+    it("marks stored exchange credentials in the enterprise section", () => {
+      render(
+        <TestWrapper
+          activeSection="enterprise-managed-credentials"
+          configuredSecretPaths={[
+            "oidcConfig.enterpriseManagedCredentials.clientSecret",
+            "oidcConfig.enterpriseManagedCredentials.privateKeyPem",
+          ]}
+        />,
+      );
+
+      expect(screen.getAllByText(storedNote)).toHaveLength(2);
+    });
   });
 
-  it("explains that allowed email domains gate Google SSO sign-in", () => {
-    render(<TestWrapper providerId="Google" />);
+  it("shows allowed email domains for non-Google providers", () => {
+    render(<TestWrapper />);
+
+    expect(screen.getByLabelText("Allowed Email Domains")).toBeInTheDocument();
+  });
+
+  it("explains that allowed email domains gate SSO sign-in", () => {
+    render(<TestWrapper />);
 
     expect(screen.getByLabelText("Allowed Email Domains")).toBeInTheDocument();
     expect(
@@ -147,5 +196,8 @@ describe("OidcConfigForm", () => {
     render(<TestWrapper activeSection="attribute-mapping" />);
 
     expect(screen.getByLabelText("User ID Claim")).toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Email Verified Claim (Optional)"),
+    ).toBeInTheDocument();
   });
 });

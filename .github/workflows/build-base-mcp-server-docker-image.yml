@@ -3,6 +3,10 @@ name: Build MCP Server Base Docker Image
 on:
   workflow_call:
     inputs:
+      image_registry:
+        description: "Destination registry prefix"
+        type: string
+        default: ghcr.io/archestra-ai
       push_to_gcr:
         description: "Whether to push the built image to GCR"
         required: true
@@ -11,6 +15,21 @@ on:
         description: "Version tag for the Docker image"
         required: true
         type: string
+      checkout_ref:
+        description: "Optional ref to checkout when building the image"
+        required: false
+        type: string
+        default: ""
+      reuse_from_version:
+        description: "Previous main SHA whose image may be reused when inputs are unchanged"
+        required: false
+        type: string
+        default: ""
+      environment:
+        description: "GitHub Environment whose secrets the publishing jobs read (release-publish for releases); empty for none"
+        required: false
+        type: string
+        default: ""
     secrets:
       GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER:
         required: false
@@ -26,7 +45,7 @@ concurrency:
 jobs:
   python-mcp-lockfile-check:
     name: MCP Python Lockfile Check
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ./platform
@@ -34,22 +53,23 @@ jobs:
       contents: read # Required to checkout the repository and verify the lockfile.
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1
+          ref: ${{ inputs.checkout_ref != '' && inputs.checkout_ref || github.sha }}
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: $/.github/actions/setup-uv
         with:
           version: "0.9.26"
 
       - name: Regenerate lockfile and verify it is committed
         run: |
-          make -C mcp_server_docker_image update-python-lockfile
+          make -C docker_images/mcp_server update-python-lockfile
 
-          if ! git diff --exit-code -- mcp_server_docker_image/requirements.lock; then
-            echo "::error::mcp_server_docker_image/requirements.lock is out of date. Regenerate it with uv pip compile."
+          if ! git diff --exit-code -- docker_images/mcp_server/requirements.lock; then
+            echo "::error::docker_images/mcp_server/requirements.lock is out of date. Regenerate it with uv pip compile."
             exit 1
           fi
 
@@ -59,17 +79,21 @@ jobs:
       - python-mcp-lockfile-check
     permissions:
       contents: read # Required to checkout the repository and build the image.
+      packages: write # Publish CI images with the repository token.
       id-token: write # Required for Workload Identity Federation when pushing images.
-    uses: ./.github/workflows/build-native-multi-arch-image.yml
+    uses: $/.github/workflows/build-native-multi-arch-image.yml
     with:
-      image_directory: ./platform/mcp_server_docker_image
-      dockerfile: ./platform/mcp_server_docker_image/Dockerfile
+      environment: ${{ inputs.environment }}
+      image_directory: ./platform/docker_images/mcp_server
+      dockerfile: ./platform/docker_images/mcp_server/Dockerfile
       image_name: mcp-server-base
-      image_registry: europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public
+      image_registry: ${{ inputs.image_registry }}
       version: ${{ inputs.version }}
       push_image: ${{ inputs.push_to_gcr }}
-      auth_provider: gar
-      include_latest_tag: true
+      auth_provider: ${{ startsWith(inputs.image_registry, 'ghcr.io/') && 'ghcr' || 'gar' }}
+      checkout_ref: ${{ inputs.checkout_ref }}
+      reuse_from_version: ${{ inputs.reuse_from_version }}
+      reuse_paths: '["platform/docker_images/mcp_server", ".github/workflows/build-base-mcp-server-docker-image.yml"]'
     secrets:
       GCP_SERVICE_ACCOUNT_NAME: ${{ secrets.GCP_SERVICE_ACCOUNT_NAME }}
       GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER }}

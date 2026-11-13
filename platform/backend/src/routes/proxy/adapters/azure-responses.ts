@@ -1,4 +1,4 @@
-import { ArchestraInternalErrorCode } from "@shared";
+import { ArchestraInternalErrorCode } from "@archestra/shared";
 import { get } from "lodash-es";
 import OpenAIProvider from "openai";
 import type {
@@ -17,6 +17,7 @@ import {
 } from "@/clients/azure-openai-credentials";
 import {
   buildAzureResponsesBaseUrl,
+  createAzureFetchWithRequestQuery,
   normalizeAzureApiKey,
   shouldUseAzureOpenAiApiVersion,
 } from "@/clients/azure-url";
@@ -34,10 +35,31 @@ import type {
   LLMRequestAdapter,
   LLMResponseAdapter,
   LLMStreamAdapter,
-  ToolCompressionStats,
+  StreamAccumulatorState,
   UsageView,
 } from "@/types";
-import { ApiError, createStreamAccumulatorState } from "@/types";
+import {
+  ApiError,
+  createStreamAccumulatorState,
+  extractCommonToolCallArguments,
+} from "@/types";
+import { isApprovedAsSent } from "../utils/approved-as-sent";
+import { withOpenAiResponsesToolCallIds } from "../utils/tool-call-ids";
+import {
+  carriesResponsesTerminal,
+  formatResponsesStreamErrorFrame,
+} from "./responses-stream-error-frame";
+import {
+  formatResponsesFunctionCallFrames,
+  namespaceOf,
+  namespacesByCallId,
+  prependPrefixToResponse,
+  RESPONSES_STREAM_END,
+  rewriteResponsesOutput,
+  toSse,
+} from "./responses-tool-call-rewrite";
+import { fromResponsesUsage, toResponsesUsage } from "./responses-usage";
+import { PROXY_SDK_MAX_RETRIES } from "./sdk-retry-policy";
 
 type AzureResponsesRequest = Azure.Types.ResponsesRequest;
 type AzureResponsesResponse = Azure.Types.ResponsesResponse;
@@ -61,6 +83,11 @@ export const azureResponsesAdapterFactory: LLMProvider<
 > = {
   provider: "azure",
   interactionType: "azure:responses",
+
+  // The Responses parser drops a chat-completions-shaped error frame as an
+  // unknown chunk, turning an upstream failure into a blank turn.
+  formatStreamErrorFrame: formatResponsesStreamErrorFrame,
+  carriesStreamTerminal: carriesResponsesTerminal,
 
   createRequestAdapter(
     request: AzureResponsesRequest,
@@ -105,17 +132,18 @@ export const azureResponsesAdapterFactory: LLMProvider<
       );
     }
 
-    const customFetch = options.agent
-      ? metrics.llm.getObservableFetch(
-          "azure",
-          options.agent,
-          options.source,
-          options.externalAgentId,
-        )
+    const observableFetch = options.agent
+      ? metrics.llm.getObservableFetch("azure", options.agent, options.source)
       : undefined;
+    const customFetch = createAzureFetchWithRequestQuery({
+      fetch: observableFetch,
+      rawQuery: options.azureRequest?.rawQuery,
+      abortSignal: options.abortSignal,
+    });
 
     if (!apiKey && isAzureOpenAiEntraIdEnabled()) {
       return new OpenAIProvider({
+        maxRetries: PROXY_SDK_MAX_RETRIES,
         apiKey: getAzureOpenAiBearerTokenProvider(options.baseUrl),
         baseURL: resolvedBaseUrl,
         defaultQuery: getAzureResponsesDefaultQuery(options.baseUrl),
@@ -131,6 +159,7 @@ export const azureResponsesAdapterFactory: LLMProvider<
     const normalizedApiKey = normalizeAzureApiKey(apiKey);
 
     return new OpenAIProvider({
+      maxRetries: PROXY_SDK_MAX_RETRIES,
       apiKey: normalizedApiKey,
       baseURL: resolvedBaseUrl,
       defaultQuery: getAzureResponsesDefaultQuery(options.baseUrl),
@@ -218,7 +247,15 @@ class AzureResponsesRequestAdapter
       return [];
     }
 
-    return this.request.input.flatMap((item) => toCommonMessages(item));
+    // Pair function_call_output items with their function_call by call_id so
+    // tool results surface as CommonMessage.toolCalls. Without the pairing,
+    // Responses-routed conversations look tool-free to anything that reads
+    // the common format.
+    const toolCallsByCallId = getToolCallsByCallId(this.request.input);
+
+    return this.request.input.flatMap((item) =>
+      toCommonMessages(item, toolCallsByCallId),
+    );
   }
 
   getToolResults(): CommonToolResult[] {
@@ -226,18 +263,22 @@ class AzureResponsesRequestAdapter
       return [];
     }
 
-    const toolNamesByCallId = getToolNamesByCallId(this.request.input);
+    const toolCallsByCallId = getToolCallsByCallId(this.request.input);
 
     return this.request.input.flatMap((item) => {
       if (!isFunctionCallOutputItem(item)) {
         return [];
       }
 
+      const toolCall = toolCallsByCallId.get(item.call_id);
       return [
         {
           id: item.call_id,
-          name: toolNamesByCallId.get(item.call_id) ?? "unknown",
+          name: toolCall?.name ?? "unknown",
+          ...(toolCall?.namespace ? { namespace: toolCall.namespace } : {}),
+          arguments: toolCall?.arguments,
           content: item.output,
+          structured: typeof item.output !== "string",
           isError: false,
         },
       ];
@@ -288,12 +329,6 @@ class AzureResponsesRequestAdapter
     Object.assign(this.toolResultUpdates, updates);
   }
 
-  async applyToonCompression(_model: string): Promise<ToolCompressionStats> {
-    // Responses tool outputs are already structured as function_call_output items,
-    // so there is no JSON blob to compress with TOON before forwarding upstream.
-    return createEmptyToolCompressionStats();
-  }
-
   convertToolResultContent(input: AzureResponseInput): AzureResponseInput {
     // Azure Responses accepts tool results in their native function_call_output
     // shape, so the proxy should pass them through unchanged.
@@ -311,21 +346,33 @@ class AzureResponsesRequestAdapter
     return {
       ...this.request,
       model: this.getModel(),
-      input: this.request.input.map((item) => {
-        if (!isFunctionCallOutputItem(item)) {
-          return item;
-        }
+      input: this.request.input
+        .map((item) => {
+          if (!isFunctionCallOutputItem(item)) {
+            return item;
+          }
 
-        const updatedOutput = this.toolResultUpdates[item.call_id];
-        if (!updatedOutput) {
-          return item;
-        }
+          // Presence, not truthiness: a sanitizer that reduces sensitive output
+          // to nothing has replaced it, and forwarding the original instead would
+          // hand the model exactly what was withheld.
+          const updatedOutput = this.toolResultUpdates[item.call_id];
+          if (updatedOutput === undefined) {
+            return item;
+          }
+          // Kept as sent: the output's parts (input_image, input_text) stay.
+          if (
+            isApprovedAsSent({ sent: item.output, approved: updatedOutput })
+          ) {
+            return item;
+          }
 
-        return {
-          ...item,
-          output: updatedOutput,
-        };
-      }) as unknown as ResponseInput,
+          return {
+            ...item,
+            output: updatedOutput,
+          };
+        })
+        // After the result updates above, which look up the client's call ids.
+        .map(withOpenAiResponsesToolCallIds) as unknown as ResponseInput,
     };
   }
 }
@@ -381,6 +428,9 @@ class AzureResponsesResponseAdapter
           id: item.call_id,
           name: item.name,
           arguments: tryParseJsonObject(item.arguments),
+          // Codex calls a namespaced tool by its bare name and names the
+          // namespace beside it; the pair is which tool it called.
+          ...namespaceOf(item),
         },
       ];
     });
@@ -391,10 +441,7 @@ class AzureResponsesResponseAdapter
   }
 
   getUsage(): UsageView {
-    return {
-      inputTokens: this.response.usage?.input_tokens ?? 0,
-      outputTokens: this.response.usage?.output_tokens ?? 0,
-    };
+    return fromResponsesUsage(this.response.usage);
   }
 
   getOriginalResponse(): AzureResponsesResponse {
@@ -407,6 +454,15 @@ class AzureResponsesResponseAdapter
     }
 
     return [this.response.status ?? "completed"];
+  }
+
+  withRewrittenToolCalls(
+    toolCalls: Array<{ id: string; name: string; arguments: string }>,
+  ): AzureResponsesResponse {
+    return {
+      ...this.response,
+      output: rewriteResponsesOutput(this.response.output, toolCalls),
+    } as unknown as AzureResponsesResponse;
   }
 
   toRefusalResponse(
@@ -441,6 +497,22 @@ class AzureResponsesResponseAdapter
       usage: this.response.usage,
     } as unknown as AzureResponsesResponse;
   }
+
+  withReplacedText(text: string): AzureResponsesResponse {
+    return {
+      ...this.response,
+      status: "completed",
+      output: [
+        {
+          id: `msg_${Date.now()}`,
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text, annotations: [] }],
+        },
+      ],
+    } as unknown as AzureResponsesResponse;
+  }
 }
 
 class AzureResponsesStreamAdapter
@@ -449,10 +521,29 @@ class AzureResponsesStreamAdapter
   readonly provider = "azure" as const;
   readonly state = createStreamAccumulatorState();
   private completedResponse: AzureResponsesResponse | null = null;
+  private getTextSuffix: ((completedText: string) => string) | null = null;
+  private textPrefixIssued = false;
+  private issuedPrefix = "";
+  private pendingTextTerminalEvents: AzureResponsesStreamChunk[] = [];
+  private lastTextDelta: {
+    itemId: string;
+    outputIndex: number;
+    contentIndex: number;
+  } | null = null;
+  private firstTextDelta: AzureResponsesStreamAdapter["lastTextDelta"] = null;
+  private textByPart = new Map<string, string>();
+  // Set to the refusal text when the streamed response was replaced by a policy
+  // refusal, so toProviderResponse persists the refusal — not the captured
+  // upstream completion or the blocked tool calls.
+  private replacedText: string | null = null;
   private toolCallsByItemId = new Map<
     string,
-    { id: string; name: string; arguments: string }
+    { id: string; name: string; arguments: string; namespace?: string }
   >();
+
+  setTextSuffix(getSuffix: (completedText: string) => string): void {
+    this.getTextSuffix = getSuffix;
+  }
 
   processChunk(chunk: AzureResponsesStreamChunk): ChunkProcessingResult {
     if (this.state.timing.firstChunkTime === null) {
@@ -463,24 +554,66 @@ class AzureResponsesStreamAdapter
       this.state.responseId = chunk.response.id;
       this.state.model = chunk.response.model;
       if (chunk.response.usage) {
-        this.state.usage = {
-          inputTokens: chunk.response.usage.input_tokens ?? 0,
-          outputTokens: chunk.response.usage.output_tokens ?? 0,
-        };
+        this.state.usage = fromResponsesUsage(chunk.response.usage);
       }
     }
 
     if (chunk.type === "response.output_text.delta") {
+      const pending = this.drainPendingTextTerminalEvents();
       this.state.text += chunk.delta;
+      const partKey = this.textPartKey({
+        itemId: chunk.item_id,
+        outputIndex: chunk.output_index,
+        contentIndex: chunk.content_index,
+      });
+      this.textByPart.set(
+        partKey,
+        `${this.textByPart.get(partKey) ?? ""}${chunk.delta}`,
+      );
+      this.lastTextDelta = {
+        itemId: chunk.item_id,
+        outputIndex: chunk.output_index,
+        contentIndex: chunk.content_index,
+      };
+      this.firstTextDelta ??= this.lastTextDelta;
+      let prefixSse = "";
+      let outbound = chunk;
+      if (!this.textPrefixIssued && this.getTextSuffix) {
+        const prefix = this.resolveTextPrefix(chunk.delta);
+        this.textPrefixIssued = true;
+        if (prefix) {
+          this.issuedPrefix = prefix;
+          prefixSse = toSse({ ...chunk, delta: prefix });
+          outbound = { ...chunk, delta: `\n\n${chunk.delta}` };
+        }
+      }
       return {
-        sseData: toSse(chunk),
+        sseData: `${pending}${prefixSse}${toSse(outbound)}`,
         isToolCallChunk: false,
         isFinal: false,
       };
     }
 
+    if (
+      this.getTextSuffix &&
+      this.isTextTerminalEvent(chunk, this.lastTextDelta)
+    ) {
+      this.pendingTextTerminalEvents.push(chunk);
+      return { sseData: null, isToolCallChunk: false, isFinal: false };
+    }
+
     if (isResponsesToolCallChunk(chunk)) {
       this.captureToolCallChunk(chunk);
+      // A turn that opens with tool calls still owes the trajectory banner:
+      // capture the prefix now so the released completion carries it.
+      if (!this.textPrefixIssued && this.getTextSuffix) {
+        const prefix = this.resolveTextPrefix("");
+        this.textPrefixIssued = true;
+        if (prefix) {
+          this.issuedPrefix = prefix;
+          this.state.text = prefix;
+        }
+      }
       this.state.rawToolCallEvents.push(chunk);
       return {
         sseData: null,
@@ -494,9 +627,28 @@ class AzureResponsesStreamAdapter
         chunk.response as unknown as AzureResponsesResponse;
       this.state.stopReason =
         this.state.toolCalls.length > 0 ? "tool_calls" : "stop";
+      const pending = this.drainPendingTextTerminalEvents();
 
+      if (this.state.toolCalls.length > 0) {
+        this.state.rawToolCallEvents.push(chunk);
+        return {
+          sseData: pending || null,
+          isToolCallChunk: true,
+          isFinal: true,
+        };
+      }
+
+      const completed = this.issuedPrefix
+        ? {
+            ...chunk,
+            response: prependPrefixToResponse(
+              chunk.response as unknown as AzureResponsesResponse,
+              this.issuedPrefix,
+            ),
+          }
+        : chunk;
       return {
-        sseData: toSse(chunk),
+        sseData: `${pending}${toSse(completed)}`,
         isToolCallChunk: false,
         isFinal: true,
       };
@@ -508,16 +660,19 @@ class AzureResponsesStreamAdapter
     ) {
       this.state.stopReason = "length";
       return {
-        sseData: toSse(chunk),
+        sseData: `${this.drainPendingTextTerminalEvents()}${toSse(chunk)}`,
         isToolCallChunk: false,
         isFinal: true,
       };
     }
 
     return {
-      sseData: toSse(chunk),
+      sseData: `${this.drainPendingTextTerminalEvents()}${toSse(chunk)}`,
       isToolCallChunk: false,
       isFinal: false,
+      isResponsePreamble:
+        chunk.type === "response.created" ||
+        chunk.type === "response.in_progress",
     };
   }
 
@@ -630,13 +785,9 @@ class AzureResponsesStreamAdapter
               ],
             },
           ],
-          usage: {
-            input_tokens: 0,
-            input_tokens_details: { cached_tokens: 0 },
-            output_tokens: 0,
-            output_tokens_details: { reasoning_tokens: 0 },
-            total_tokens: 0,
-          },
+          // Always numeric, and the tokens actually observed: this is the
+          // client's only usage report for a replaced turn.
+          usage: toResponsesUsage(this.state.usage),
         },
       }),
     ].join("");
@@ -646,22 +797,87 @@ class AzureResponsesStreamAdapter
     return this.state.rawToolCallEvents.map((event) => toSse(event));
   }
 
+  prepareResponseReplacement(): void {
+    // The raw answer was never admitted; the persisted turn must carry only
+    // the replacement.
+    this.state.text = "";
+    this.state.toolCalls = [];
+    this.state.rawToolCallEvents = [];
+    this.toolCallsByItemId.clear();
+    this.completedResponse = null;
+  }
+
   formatCompleteTextSSE(text: string): string[] {
+    this.replacedText = text;
     return [this.formatTextDeltaSSE(text)];
   }
 
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]): string[] {
+    // The upstream `response.completed` envelope has already been streamed and
+    // it names the calls the model made directly. The client keeps the LAST
+    // completed envelope, so the repair ends by re-issuing one that names the
+    // rewritten calls — the same trick the refusal path relies on. That
+    // envelope also becomes the persisted one, so the interaction log matches
+    // what the client reconstructs.
+    const base = this.completedResponse ?? this.toProviderResponse();
+    const upstreamOutput = Array.isArray(base.output) ? base.output : [];
+    const callItems = upstreamOutput.filter(
+      (item) =>
+        item.type === "function_call" || item.type === "custom_tool_call",
+    );
+    const itemIdByCallId = new Map(
+      callItems.flatMap((item) => {
+        const callId = (item as { call_id?: unknown }).call_id;
+        const itemId = (item as { id?: unknown }).id;
+        return typeof callId === "string" && typeof itemId === "string"
+          ? [[callId, itemId] as const]
+          : [];
+      }),
+    );
+    const rewritten = {
+      ...base,
+      output: rewriteResponsesOutput(upstreamOutput, toolCalls),
+      usage: base.usage ?? toResponsesUsage(this.state.usage),
+    } as unknown as AzureResponsesResponse;
+    const completedResponse = this.issuedPrefix
+      ? prependPrefixToResponse(rewritten, this.issuedPrefix)
+      : rewritten;
+    this.completedResponse = completedResponse;
+    const firstOutputIndex = completedResponse.output.filter(
+      (item) =>
+        item.type !== "function_call" && item.type !== "custom_tool_call",
+    ).length;
+    let sequence = Date.now();
+    const frames = formatResponsesFunctionCallFrames({
+      toolCalls,
+      firstOutputIndex,
+      nextSequenceNumber: () => sequence++,
+      itemIdByCallId,
+      // Codex routes a namespaced call by the namespace its item names.
+      namespaceByCallId: namespacesByCallId({
+        items: upstreamOutput,
+        streamed: this.toolCallsByItemId.values(),
+      }),
+    });
+    frames.push(
+      toSse({
+        type: "response.completed",
+        sequence_number: sequence++,
+        response: completedResponse,
+      }),
+    );
+    return frames;
+  }
+
   formatEndSSE(): string {
-    return "data: [DONE]\n\n";
+    return RESPONSES_STREAM_END;
   }
 
   toProviderResponse(): AzureResponsesResponse {
-    if (this.completedResponse) {
-      return this.completedResponse;
-    }
-
     const outputItems: AzureResponsesResponse["output"] = [];
 
-    if (this.state.text) {
+    const messageText = this.replacedText ?? this.state.text;
+    if (messageText) {
       outputItems.push({
         id: `msg_${Date.now()}`,
         type: "message",
@@ -670,23 +886,43 @@ class AzureResponsesStreamAdapter
         content: [
           {
             type: "output_text",
-            text: this.state.text,
+            text: messageText,
             annotations: [],
           },
         ],
       } as AzureResponsesResponse["output"][number]);
     }
 
-    outputItems.push(
-      ...this.state.toolCalls.map((toolCall) => ({
-        id: toolCall.id,
-        call_id: toolCall.id,
-        type: "function_call" as const,
-        name: toolCall.name,
-        arguments: toolCall.arguments,
-        status: "completed" as const,
-      })),
-    );
+    if (this.replacedText === null) {
+      outputItems.push(
+        ...this.state.toolCalls.map((toolCall) => ({
+          id: toolCall.id,
+          call_id: toolCall.id,
+          type: "function_call" as const,
+          name: toolCall.name,
+          arguments: toolCall.arguments,
+          status: "completed" as const,
+        })),
+      );
+    }
+
+    // The upstream `response.completed` envelope is the richest record (it
+    // echoes tools, reasoning config and the real ids), so it wins — but only
+    // when it actually carries the turn. Reasoning turns finish with an empty
+    // `output` even though the text arrived in `response.output_text.delta`
+    // chunks; persisting that verbatim lost the whole assistant side of the
+    // interaction, leaving LLM Logs with nothing to render. Keep the envelope
+    // and restore the items we accumulated.
+    if (this.replacedText === null && this.completedResponse) {
+      const upstreamOutput = this.completedResponse.output;
+      if (
+        (Array.isArray(upstreamOutput) && upstreamOutput.length > 0) ||
+        outputItems.length === 0
+      ) {
+        return this.completedResponse;
+      }
+      return { ...this.completedResponse, output: outputItems };
+    }
 
     return {
       id: this.state.responseId || `resp_${Date.now()}`,
@@ -695,17 +931,66 @@ class AzureResponsesStreamAdapter
       model: this.state.model,
       status: "completed",
       output: outputItems,
-      usage: this.state.usage
-        ? {
-            input_tokens: this.state.usage.inputTokens,
-            input_tokens_details: { cached_tokens: 0 },
-            output_tokens: this.state.usage.outputTokens,
-            output_tokens_details: { reasoning_tokens: 0 },
-            total_tokens:
-              this.state.usage.inputTokens + this.state.usage.outputTokens,
-          }
-        : undefined,
+      usage: this.state.usage ? toResponsesUsage(this.state.usage) : undefined,
     } as unknown as AzureResponsesResponse;
+  }
+
+  private resolveTextPrefix(firstText: string): string {
+    if (!this.getTextSuffix || this.replacedText !== null) {
+      return "";
+    }
+    return this.getTextSuffix(firstText);
+  }
+
+  private textPartKey(params: {
+    itemId: string;
+    outputIndex: number;
+    contentIndex: number;
+  }): string {
+    return `${params.itemId}\u0000${params.outputIndex}\u0000${params.contentIndex}`;
+  }
+
+  private isTextTerminalEvent(
+    chunk: AzureResponsesStreamChunk,
+    textDelta: AzureResponsesStreamAdapter["lastTextDelta"],
+  ): boolean {
+    if (!textDelta) return false;
+    if (chunk.type === "response.output_text.done") {
+      return (
+        chunk.item_id === textDelta.itemId &&
+        chunk.output_index === textDelta.outputIndex &&
+        chunk.content_index === textDelta.contentIndex
+      );
+    }
+    if (chunk.type === "response.content_part.done") {
+      return (
+        chunk.item_id === textDelta.itemId &&
+        chunk.output_index === textDelta.outputIndex &&
+        chunk.content_index === textDelta.contentIndex &&
+        chunk.part.type === "output_text"
+      );
+    }
+    return (
+      chunk.type === "response.output_item.done" &&
+      chunk.output_index === textDelta.outputIndex &&
+      chunk.item.type === "message" &&
+      chunk.item.id === textDelta.itemId &&
+      chunk.item.content[textDelta.contentIndex]?.type === "output_text"
+    );
+  }
+
+  private drainPendingTextTerminalEvents(): string {
+    // Completed snapshots must carry the receipt only where its delta was sent.
+    const events = this.pendingTextTerminalEvents.map((event) =>
+      toSse(
+        this.issuedPrefix &&
+          this.isTextTerminalEvent(event, this.firstTextDelta)
+          ? prependPrefixToAzureTerminalEvent(event, this.issuedPrefix)
+          : event,
+      ),
+    );
+    this.pendingTextTerminalEvents = [];
+    return events.join("");
   }
 
   private captureToolCallChunk(chunk: AzureResponsesStreamChunk): void {
@@ -719,6 +1004,7 @@ class AzureResponsesStreamAdapter
         id: item.call_id,
         name: item.name,
         arguments: item.arguments,
+        ...namespaceOf(item),
       });
       this.state.toolCalls = Array.from(this.toolCallsByItemId.values());
       return;
@@ -763,18 +1049,15 @@ class AzureResponsesStreamAdapter
   }
 }
 
-function createEmptyToolCompressionStats(): ToolCompressionStats {
-  return {
-    tokensBefore: 0,
-    tokensAfter: 0,
-    costSavings: 0,
-    wasEffective: false,
-    hadToolResults: false,
-  };
-}
-
-function toCommonMessages(item: ResponseInputItem): CommonMessage[] {
-  if (item.type === "message") {
+function toCommonMessages(
+  item: ResponseInputItem,
+  toolCallsByCallId: Map<string, HistoryToolCall>,
+): CommonMessage[] {
+  // "easy input message" items carry role/content and omit `type` (it defaults
+  // to "message"); the AI SDK emits this shape. Without handling it here,
+  // getMessages() drops the user's prompt and every common-format reader
+  // silently sees an empty conversation.
+  if ((item.type === "message" || item.type === undefined) && "role" in item) {
     return [
       {
         role: normalizeResponseMessageRole(item.role),
@@ -784,13 +1067,28 @@ function toCommonMessages(item: ResponseInputItem): CommonMessage[] {
   }
 
   if (item.type === "function_call_output") {
+    const toolCall = toolCallsByCallId.get(item.call_id);
+    const content =
+      typeof item.output === "string"
+        ? item.output
+        : JSON.stringify(item.output);
     return [
       {
         role: "tool",
-        content:
-          typeof item.output === "string"
-            ? item.output
-            : JSON.stringify(item.output),
+        content,
+        // An output whose function_call was pruned from the input is still a
+        // tool result — surface it under the "unknown" name rather than drop
+        // it.
+        toolCalls: [
+          {
+            id: item.call_id,
+            name: toolCall?.name ?? "unknown",
+            ...(toolCall?.namespace ? { namespace: toolCall.namespace } : {}),
+            arguments: toolCall?.arguments,
+            content,
+            isError: false,
+          },
+        ],
       },
     ];
   }
@@ -889,18 +1187,36 @@ function isResponsesToolCallChunk(
   );
 }
 
-function toSse(event: unknown): string {
-  return `data: ${JSON.stringify(event)}\n\n`;
-}
+/**
+ * A call in the request history, as its output is paired with it. A Codex call
+ * to a namespaced tool names that namespace, which is part of which tool it
+ * called.
+ */
+type HistoryToolCall = {
+  name: string;
+  namespace?: string;
+  arguments?: Record<string, unknown>;
+};
 
-function getToolNamesByCallId(input: ResponseInputItem[]): Map<string, string> {
+function getToolCallsByCallId(
+  input: ResponseInputItem[],
+): Map<string, HistoryToolCall> {
   return new Map(
-    input.flatMap((item) => {
+    input.flatMap((item): Array<[string, HistoryToolCall]> => {
       if (!isResponseInputFunctionCall(item)) {
         return [];
       }
 
-      return [[item.call_id, item.name] as const];
+      return [
+        [
+          item.call_id,
+          {
+            name: item.name,
+            ...namespaceOf(item),
+            arguments: extractCommonToolCallArguments(item.arguments),
+          },
+        ],
+      ];
     }),
   );
 }
@@ -916,4 +1232,45 @@ function tryParseJsonObject(value: string): Record<string, unknown> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function withLeadingPrefix(text: string, prefix: string): string {
+  return text.startsWith(prefix) ? text : `${prefix}\n\n${text}`;
+}
+
+function prependPrefixToAzureTerminalEvent(
+  event: AzureResponsesStreamChunk,
+  prefix: string,
+): AzureResponsesStreamChunk {
+  if (event.type === "response.output_text.done") {
+    return { ...event, text: withLeadingPrefix(event.text, prefix) };
+  }
+  if (event.type === "response.content_part.done") {
+    const part = event.part as { type: string; text?: string };
+    if (part.type !== "output_text" || part.text === undefined) return event;
+    return {
+      ...event,
+      part: { ...part, text: withLeadingPrefix(part.text, prefix) },
+    } as AzureResponsesStreamChunk;
+  }
+  if (event.type === "response.output_item.done") {
+    const item = event.item as {
+      content?: Array<{ type: string; text?: string }>;
+    };
+    if (!item.content) return event;
+    let applied = false;
+    return {
+      ...event,
+      item: {
+        ...item,
+        content: item.content.map((part) => {
+          if (applied || part.type !== "output_text" || part.text === undefined)
+            return part;
+          applied = true;
+          return { ...part, text: withLeadingPrefix(part.text, prefix) };
+        }),
+      },
+    } as AzureResponsesStreamChunk;
+  }
+  return event;
 }

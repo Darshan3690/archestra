@@ -1,0 +1,233 @@
+import {
+  CursorQuerySchema,
+  createCursorPaginatedResponseSchema,
+  RouteId,
+} from "@archestra/shared";
+import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
+import { z } from "zod";
+import { userHasPermission } from "@/auth";
+import { isServiceAccountUserId } from "@/auth/service-account-user-id";
+import { AuditLogModel } from "@/models";
+import {
+  ApiError,
+  AuditActorTypeSchema,
+  AuditEventNameSchema,
+  AuditLogWithImpersonatorSchema,
+  AuditOutcomeSchema,
+  constructResponseSchema,
+} from "@/types";
+
+const auditLogRoutes: FastifyPluginAsyncZod = async (fastify) => {
+  fastify.get(
+    "/api/audit-logs",
+    {
+      schema: {
+        operationId: RouteId.GetAuditLogs,
+        description:
+          "Get paginated audit log events for the organization. Requires auditLog:read permission (Admin only by default).",
+        tags: ["Audit Log"],
+        querystring: z
+          .object({
+            startDate: z
+              .string()
+              .datetime()
+              .optional()
+              .describe("Filter events on or after this date (ISO 8601)"),
+            endDate: z
+              .string()
+              .datetime()
+              .optional()
+              .describe("Filter events on or before this date (ISO 8601)"),
+            actorId: z.string().optional().describe("Filter by actor ID"),
+            action: AuditEventNameSchema.optional().describe(
+              "Filter by action type (dotted name, e.g. agent.created)",
+            ),
+            outcome: AuditOutcomeSchema.optional().describe(
+              "Filter by outcome (success, failure, or denied)",
+            ),
+            actorType: AuditActorTypeSchema.optional().describe(
+              "Filter by actor type (user, api_key, sso, or system)",
+            ),
+            resourceType: z
+              .string()
+              .optional()
+              .describe("Filter by resource type (e.g. agent, role)"),
+            resourceId: z
+              .string()
+              .optional()
+              .describe("Filter by resource ID (e.g. a specific agent's ID)"),
+          })
+          .merge(CursorQuerySchema),
+        response: constructResponseSchema(
+          createCursorPaginatedResponseSchema(AuditLogWithImpersonatorSchema),
+        ),
+      },
+    },
+    async (
+      {
+        query: {
+          startDate,
+          endDate,
+          actorId,
+          action,
+          outcome,
+          actorType,
+          resourceType,
+          resourceId,
+          limit,
+          cursor,
+        },
+        user,
+        organizationId,
+      },
+      reply,
+    ) => {
+      // auditLog:read scopes the view to the caller's own actions;
+      // auditLog:admin lifts it to the whole organization.
+      const canSeeAllAuditLogs = await userHasPermission(
+        user.id,
+        organizationId,
+        "auditLog",
+        "admin",
+      );
+
+      const result = await AuditLogModel.findCursorPaginated({
+        organizationId,
+        limit,
+        cursor,
+        startDate: startDate ? new Date(startDate) : undefined,
+        endDate: endDate ? new Date(endDate) : undefined,
+        actorId: canSeeAllAuditLogs ? actorId : user.id,
+        action,
+        outcome,
+        actorType,
+        resourceType,
+        resourceId,
+      });
+
+      return reply.send(result);
+    },
+  );
+
+  fastify.get(
+    "/api/audit-logs/resources",
+    {
+      schema: {
+        operationId: RouteId.GetAuditLogResources,
+        description:
+          "Get the resources that have audit events, for the log's resource filter. Covers agents, apps, environments, MCP servers, roles, skills and teams. Each resource has the name from its latest named event. Requires auditLog:read. Without auditLog:admin, only resources from the caller's own events are listed.",
+        tags: ["Audit Log"],
+        querystring: z.object({
+          search: z
+            .string()
+            .trim()
+            .max(200)
+            .optional()
+            .describe("Case-insensitive substring of the resource name"),
+          resourceId: z
+            .string()
+            .optional()
+            .describe(
+              "Return only this resource, e.g. to label a preselected filter",
+            ),
+          limit: z.coerce
+            .number()
+            .int()
+            .min(1)
+            .max(100)
+            .default(50)
+            .describe("Maximum number of resources to return"),
+        }),
+        response: constructResponseSchema(
+          z.object({
+            data: z.array(
+              z.object({
+                resourceType: z.string(),
+                resourceId: z.string(),
+                name: z.string(),
+              }),
+            ),
+          }),
+        ),
+      },
+    },
+    async (
+      { query: { search, resourceId, limit }, user, organizationId },
+      reply,
+    ) => {
+      const canSeeAllAuditLogs = await userHasPermission(
+        user.id,
+        organizationId,
+        "auditLog",
+        "admin",
+      );
+      const data = await AuditLogModel.findResourceOptions({
+        organizationId,
+        resourceTypes: RESOURCE_FILTER_TYPES,
+        actorId: canSeeAllAuditLogs ? undefined : user.id,
+        search: search || undefined,
+        resourceId,
+        limit,
+      });
+      return reply.send({ data });
+    },
+  );
+
+  fastify.get(
+    "/api/audit-logs/:id",
+    {
+      schema: {
+        operationId: RouteId.GetAuditLog,
+        description:
+          "Get a single audit log event by ID. Requires auditLog:read permission (Admin only by default).",
+        tags: ["Audit Log"],
+        params: z.object({
+          id: z.string().uuid(),
+        }),
+        response: constructResponseSchema(AuditLogWithImpersonatorSchema),
+      },
+    },
+    async ({ params: { id }, user, organizationId }, reply) => {
+      const auditLog = await AuditLogModel.findById(id, organizationId);
+
+      // Own-actions view: an event someone else caused does not exist for
+      // this caller — 404, not 403, so existence is not disclosed.
+      if (auditLog) {
+        const canSeeAllAuditLogs = await userHasPermission(
+          user.id,
+          organizationId,
+          "auditLog",
+          "admin",
+        );
+        const belongsToCaller = isServiceAccountUserId(user.id)
+          ? auditLog.actorType === "service_account" &&
+            auditLog.actorEmail === user.email
+          : auditLog.actorId === user.id;
+        if (!canSeeAllAuditLogs && !belongsToCaller) {
+          throw new ApiError(404, "Audit log not found");
+        }
+      }
+
+      if (!auditLog) {
+        throw new ApiError(404, "Audit log event not found");
+      }
+
+      return reply.send(auditLog);
+    },
+  );
+};
+
+export default auditLogRoutes;
+
+// === Internal helpers
+
+/** Resource types that the log's resource filter lists by name. */
+const RESOURCE_FILTER_TYPES = [
+  "agent",
+  "app",
+  "environment",
+  "mcpServer",
+  "role",
+  "skill",
+  "team",
+] as const;

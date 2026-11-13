@@ -1,0 +1,1161 @@
+"use client";
+
+import { useQueryClient } from "@tanstack/react-query";
+import type { ColumnDef } from "@tanstack/react-table";
+import {
+  BatteryCharging,
+  ExternalLink,
+  KeyRound,
+  Loader2,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Unlink,
+} from "lucide-react";
+import Link from "next/link";
+import { type ReactNode, useEffect, useState } from "react";
+import { useSettingsAreaAccess } from "@/app/_parts/use-settings-area-access";
+import { AgentNameCell } from "@/components/agent-name-cell";
+import {
+  openRowOnPlainClick,
+  RowClickShield,
+} from "@/components/agent-pages/row-click-shield";
+import { DeleteConfirmDialog } from "@/components/delete-confirm-dialog";
+import {
+  CollectionFilters,
+  FilterBar,
+  FilterSelect,
+  filterSearchClass,
+} from "@/components/filter-bar";
+import { McpCatalogIcon } from "@/components/mcp-catalog-icon";
+import { QueryLoadError } from "@/components/query-load-error";
+import {
+  RuntimeCredentialIcon,
+  runtimeCredentialIconOf,
+} from "@/components/runtime-credential-icon";
+import { SearchInput } from "@/components/search-input";
+import { StandardDialog } from "@/components/standard-dialog";
+import { TableRowActions } from "@/components/table-row-actions";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { DataTable } from "@/components/ui/data-table";
+import { InlineNotice, InlineNoticeText } from "@/components/ui/inline-notice";
+import { Label } from "@/components/ui/label";
+import { PermissionButton } from "@/components/ui/permission-button";
+import { SearchableSelect } from "@/components/ui/searchable-select";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { DialogCancelButton } from "@/components/unsaved-changes-guard";
+import { DEFAULT_FILTER_ALL } from "@/consts";
+import { useHasPermissions } from "@/lib/auth/auth.query";
+import { useDataTableQueryParams } from "@/lib/hooks/use-data-table-query-params";
+import { useInternalMcpCatalog } from "@/lib/mcp/internal-mcp-catalog.query";
+import { useMcpRegistryIssueIndex } from "@/lib/mcp/mcp-registry.query";
+import {
+  useMcpServers,
+  useReloadMcpServerTools,
+} from "@/lib/mcp/mcp-server.query";
+import {
+  ATTACH_NOTES,
+  type BatterySummary,
+  batteryMatchesQueryKey,
+  type PolicyBattery,
+  useBatteries,
+  useBatteryMatches,
+  useCreateBatteryInstall,
+  useDeleteBatteryInstall,
+  usePolicyDeclarations,
+  useRemoveBatteryInclude,
+  useSetCredentialBinding,
+} from "@/lib/openappa-batteries.query";
+import { useAppaGithubSync } from "@/lib/openappa-github-sync.query";
+import {
+  type RuntimeCredentialDefinition,
+  useCanUseEveryCredential,
+  useRuntimeCredentials,
+} from "@/lib/runtime-credentials.query";
+import { cn } from "@/lib/utils/tailwind";
+import {
+  type BatteryCredential,
+  batteryCredentials,
+} from "./battery-credentials";
+import { BatteryIcon, type CatalogEntry } from "./battery-icon";
+import {
+  BATTERY_STATUS_GROUPS,
+  BATTERY_TABLE_STATUS,
+  type EnforcedStatus,
+} from "./battery-status";
+import { batteryStatusHint, batteryTableStatus } from "./battery-table-status";
+import { enforcedStatus } from "./composition-view";
+import { DialogSection } from "./dialog-section";
+import {
+  GithubManagedPolicyNotice,
+  githubPolicyFileUrl,
+} from "./github-managed-policy-notice";
+import { batteryStatusBadge } from "./policy-decorations";
+
+const STATUS_OPTIONS = [
+  { value: DEFAULT_FILTER_ALL, label: "All statuses" },
+  ...BATTERY_STATUS_GROUPS,
+];
+
+/** A URL value the select offers, else every row: a stale link shows the table. */
+const knownFilter = (
+  options: { value: string }[],
+  value: string | null,
+): string =>
+  options.some((option) => option.value === value)
+    ? (value as string)
+    : DEFAULT_FILTER_ALL;
+
+/**
+ * What the organization's policy text includes, as the text declares it. The
+ * battery list is a read of the document, not of a table: an entry is included
+ * because a line spells it, and every control here edits that line.
+ */
+export function BatteriesPanel() {
+  const declarations = usePolicyDeclarations();
+  const batteries = useBatteries();
+  // Battery matching reads each entry's server URL and image, which only the
+  // full catalog carries.
+  const catalog = useInternalMcpCatalog();
+  // Which entries are installed: every visible install's catalog id is in the
+  // registry's issue index. Without the right to list installs the answer is
+  // unknown (undefined), as it was when the server list was not loaded.
+  const { data: canReadInstallations } = useHasPermissions({
+    mcpServerInstallation: ["read"],
+  });
+  const { data: issueIndex } = useMcpRegistryIssueIndex({
+    enabled: !!canReadInstallations,
+  });
+  const servers = {
+    data: canReadInstallations ? issueIndex?.servers : undefined,
+  };
+  const { data: canManage } = useHasPermissions({
+    guardrailsPolicy: ["update"],
+  });
+  // Binding a credential hands its value to helper code, and an uploaded
+  // package may carry such code, so both take Can use on every credential too.
+  const { data: canUseEveryCredential } = useCanUseEveryCredential();
+  const canBind = canManage === true && canUseEveryCredential === true;
+  // Filters and page live in the URL, so a reload or a shared link keeps them.
+  const {
+    searchParams,
+    pageIndex,
+    pageSize,
+    updateQueryParams,
+    setPagination,
+  } = useDataTableQueryParams();
+  const search = searchParams.get("search") ?? "";
+  const statusFilter = knownFilter(STATUS_OPTIONS, searchParams.get("status"));
+  // `?battery=<name>` opens that battery, so other pages can link to it.
+  const [editing, setEditing] = useState<string | null>(
+    searchParams.get("battery"),
+  );
+  const [removing, setRemoving] = useState<string | null>(null);
+  const setFilter = (name: "status", value: string) =>
+    updateQueryParams({
+      [name]: value === DEFAULT_FILTER_ALL ? null : value,
+      page: "1",
+    });
+  const clearFilters = () =>
+    updateQueryParams({ search: null, status: null, page: "1" });
+  const hasActiveFilters =
+    !!search.trim() || statusFilter !== DEFAULT_FILTER_ALL;
+  if (declarations.isPending || batteries.isPending)
+    return <Skeleton className="h-32 w-full" />;
+  if (!declarations.data || !batteries.data)
+    return (
+      <QueryLoadError
+        title="Could not load OpenAPPA batteries"
+        onRetry={() => {
+          declarations.refetch();
+          batteries.refetch();
+        }}
+      />
+    );
+  const policy = declarations.data;
+  const { managedInGithub } = policy;
+  const included = policy.batteries;
+  const statusOf = (entry: PolicyBattery) => enforcedStatus(policy, entry);
+  // The repository owns the text while it syncs: an edit here would be undone
+  // by the next pull, so the panel only reads it. Bindings live beside the
+  // text, so they stay open.
+  const writable = canManage === true && !managedInGithub;
+  const bindable = canBind === true;
+  // Unknown while the catalog loads; only a loaded catalog can say a server is gone.
+  const catalogName = (catalogId: string) =>
+    catalog.data
+      ? (catalog.data.find((entry) => entry.id === catalogId)?.name ??
+        "Removed server")
+      : "";
+  const installedCatalogIds = servers.data
+    ? new Set(servers.data.map((server) => server.catalogId))
+    : null;
+  // One row per battery that exists. An entry naming no battery is an error in
+  // the policy text, which the Policy page marks on its line.
+  const rows: BatteryTableRow[] = batteries.data.map((summary) => ({
+    name: summary.name,
+    summary,
+    included: included.find((entry) => entry.name === summary.name) ?? null,
+  }));
+  // Read from the rows each render, so the open dialog follows every write.
+  const editingRow = rows.find((row) => row.name === editing) ?? null;
+  const query = search.trim().toLowerCase();
+  const filteredRows = rows.filter((row) => {
+    return (
+      (!query ||
+        [
+          row.name,
+          row.summary?.description ?? "",
+          ...(row.summary?.namespaces ?? []),
+        ].some((value) => value.toLowerCase().includes(query))) &&
+      (statusFilter === DEFAULT_FILTER_ALL ||
+        BATTERY_TABLE_STATUS[batteryTableStatus(row.included)].group ===
+          statusFilter)
+    );
+  });
+  const columns: ColumnDef<BatteryTableRow>[] = [
+    {
+      accessorKey: "name",
+      header: "Battery",
+      size: 370,
+      cell: ({ row }) => (
+        <AgentNameCell
+          name={row.original.name}
+          description={row.original.summary?.description}
+          icon={
+            <RowBatteryIcon row={row.original} catalog={catalog.data ?? []} />
+          }
+        />
+      ),
+    },
+    {
+      id: "status",
+      header: "Status",
+      size: 220,
+      cell: ({ row }) => (
+        <BatteryStatusCell
+          battery={row.original.included}
+          catalogName={catalogName}
+        />
+      ),
+    },
+    // A read-only reader opens a battery by clicking its row: no action is left.
+    ...(writable
+      ? [
+          {
+            id: "actions",
+            header: "Actions",
+            size: 96,
+            cell: ({ row }: { row: { original: BatteryTableRow } }) => (
+              <BatteryRowActions
+                row={row.original}
+                onEdit={() => setEditing(row.original.name)}
+                onRemove={() => setRemoving(row.original.name)}
+              />
+            ),
+          } satisfies ColumnDef<BatteryTableRow>,
+        ]
+      : []),
+  ];
+  return (
+    <section aria-label="OpenAPPA batteries" className="space-y-4">
+      {managedInGithub && <GithubManagedPolicyNotice />}
+      {writable && servers.data?.length === 0 && (
+        <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+          <span>
+            There is no installed MCP server to attach a battery to yet.
+          </span>
+          <Button asChild variant="outline" size="sm">
+            <Link href="/mcp/registry">Browse MCP servers</Link>
+          </Button>
+        </div>
+      )}
+      <CollectionFilters>
+        <FilterBar
+          onClearFilters={hasActiveFilters ? clearFilters : undefined}
+          search={
+            <SearchInput
+              objectNamePlural="batteries"
+              searchFields={["name", "description", "namespace"]}
+              className={filterSearchClass}
+            />
+          }
+        >
+          <FilterSelect
+            value={statusFilter}
+            showSearch={false}
+            onValueChange={(value) => setFilter("status", value)}
+            placeholder="Filter by status"
+            items={STATUS_OPTIONS}
+          />
+        </FilterBar>
+      </CollectionFilters>
+      <DataTable
+        columns={columns}
+        data={filteredRows}
+        getRowId={(row) => row.name}
+        pagination={{ pageIndex, pageSize, total: filteredRows.length }}
+        onPaginationChange={setPagination}
+        hasActiveFilters={hasActiveFilters}
+        onClearFilters={clearFilters}
+        emptyIcon={BatteryCharging}
+        emptyMessage="No batteries available"
+        emptyDescription="Browse MCP servers to find batteries for your policy."
+        emptyAction={
+          <Button asChild variant="outline" size="sm">
+            <Link href="/mcp/registry">Browse MCP servers</Link>
+          </Button>
+        }
+        filteredEmptyMessage="No batteries match your filters"
+        fixedWidthColumnIds={["status", "actions"]}
+        flexibleColumnIds={["name"]}
+        onRowClick={(row, event) =>
+          openRowOnPlainClick(event, () => setEditing(row.name))
+        }
+      />
+      {editingRow && (
+        <BatteryDialog
+          row={editingRow}
+          catalog={catalog.data ?? []}
+          installedCatalogIds={installedCatalogIds}
+          credentials={batteryCredentials({
+            declarations: declarations.data,
+            name: editingRow.name,
+            variables: editingRow.summary?.credentials ?? [],
+          })}
+          catalogName={catalogName}
+          status={editingRow.included ? statusOf(editingRow.included) : null}
+          writable={writable}
+          bindable={bindable}
+          managedInGithub={managedInGithub}
+          onClose={() => {
+            setEditing(null);
+            if (searchParams.has("battery"))
+              updateQueryParams({ battery: null });
+          }}
+        />
+      )}
+      {removing && (
+        <RemoveBatteryDialog
+          name={removing}
+          onClose={() => setRemoving(null)}
+        />
+      )}
+      {declarations.data.unusedAliases.length > 0 && (
+        <div className="space-y-2 border-t pt-3">
+          <h3 className="text-sm font-medium">Unused aliases</h3>
+          {declarations.data.unusedAliases.map((alias) => (
+            <div
+              key={alias.namespace}
+              className="flex flex-wrap items-center gap-2 text-sm"
+            >
+              <span className="font-mono text-xs">{alias.namespace}</span>
+              <span className="text-muted-foreground">→</span>
+              <span className="text-muted-foreground">
+                {alias.servers.join(", ")}
+              </span>
+            </div>
+          ))}
+          <p className="text-xs text-muted-foreground">
+            No included battery declares this namespace.
+          </p>
+        </div>
+      )}
+    </section>
+  );
+}
+
+type BatteryTableRow = {
+  name: string;
+  summary: BatterySummary | null;
+  included: PolicyBattery | null;
+};
+
+/** A row's status badge; a problem status says on hover what it means. */
+function BatteryStatusCell({
+  battery,
+  catalogName,
+}: {
+  battery: PolicyBattery | null;
+  catalogName: (catalogId: string) => string;
+}) {
+  const status = batteryTableStatus(battery);
+  const { label, group } = BATTERY_TABLE_STATUS[status];
+  if (status === "not_configured")
+    return <span className="text-muted-foreground">{label}</span>;
+  const badge = (
+    <Badge variant={group === "attention" ? "destructive" : "secondary"}>
+      {label}
+    </Badge>
+  );
+  const hint = batteryStatusHint({ battery, catalogName });
+  if (!hint) return badge;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{badge}</TooltipTrigger>
+      <TooltipContent className="max-w-72">{hint}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+const UNBOUND = "__unbound__";
+
+/** A row's mark, as the shared battery icon resolves it. */
+function RowBatteryIcon({
+  row,
+  catalog,
+}: {
+  row: BatteryTableRow;
+  catalog: CatalogEntry[];
+}) {
+  return (
+    <BatteryIcon
+      name={row.name}
+      bundled={row.summary?.source === "bundled"}
+      catalogIds={
+        row.summary?.installs.map((install) => install.catalogId) ?? []
+      }
+      catalog={catalog}
+    />
+  );
+}
+
+/**
+ * Everything one battery lets you change, in one place: where it applies and
+ * which keys its helpers read. Each action writes directly to the policy.
+ */
+function BatteryDialog({
+  row,
+  catalog,
+  installedCatalogIds,
+  credentials,
+  catalogName,
+  status,
+  writable,
+  bindable,
+  managedInGithub,
+  onClose,
+}: {
+  row: BatteryTableRow;
+  catalog: CatalogEntry[];
+  installedCatalogIds: Set<string> | null;
+  credentials: BatteryCredential[];
+  catalogName: (catalogId: string) => string;
+  /** How the enforced composition holds it; null when it is not included. */
+  status: EnforcedStatus | null;
+  writable: boolean;
+  bindable: boolean;
+  managedInGithub: boolean;
+  onClose: () => void;
+}) {
+  const { summary, included } = row;
+  const create = useCreateBatteryInstall();
+  const bind = useSetCredentialBinding();
+  const detach = useDeleteBatteryInstall();
+  const remove = useRemoveBatteryInclude();
+  const pending =
+    create.isPending || bind.isPending || detach.isPending || remove.isPending;
+  const organizationWide =
+    (included?.scope ?? summary?.scope) === "organization";
+  const badge = status ? batteryStatusBadge(status) : null;
+  const installs = summary?.installs ?? [];
+  const servers = included?.servers ?? [];
+  const governed = new Set(
+    servers
+      .map((server) => server.catalogId)
+      .filter((id): id is string => id !== null),
+  );
+  return (
+    <StandardDialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+      size="medium"
+      title={
+        <span className="flex items-center gap-2.5">
+          <RowBatteryIcon row={row} catalog={catalog} />
+          <span>{row.name}</span>
+          {badge && (
+            <Badge variant={badge.variant} className="font-normal">
+              {badge.label}
+            </Badge>
+          )}
+        </span>
+      }
+      description={summary?.description}
+      // The title row is left-aligned (icon, name, badge), so the copy under
+      // it is too, at every width.
+      headerClassName="text-left"
+      bodyClassName="space-y-6"
+      footer={<DialogCancelButton>Close</DialogCancelButton>}
+    >
+      {organizationWide ? (
+        <DialogSection title="Scope">
+          <div className="flex items-center justify-between gap-4 rounded-md border px-3 py-3">
+            <div className="space-y-0.5">
+              <Label htmlFor={`battery-include-${row.name}`}>
+                Include in policy
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                Its rules check every tool call in the organization.
+              </p>
+            </div>
+            <Switch
+              id={`battery-include-${row.name}`}
+              checked={included !== null}
+              disabled={!writable || !summary || pending}
+              onCheckedChange={(enabled) =>
+                enabled
+                  ? create.mutate({ batteryName: row.name })
+                  : remove.mutate(row.name)
+              }
+            />
+          </div>
+          {managedInGithub && (
+            <p className="text-xs text-muted-foreground">
+              <span>
+                The policy repository decides which batteries are included. Add
+                it to{" "}
+              </span>
+              <code className="font-mono">include</code>
+              <span> there. </span>
+              <PolicyFileLink />
+            </p>
+          )}
+          {status === "unrouted" && (
+            <p className="text-xs text-muted-foreground">
+              No policy rule routes a tool to its annotators yet. Add one to the
+              policy text, such as{" "}
+              <code className="font-mono">{`annotator = "${summary?.annotators[0] ?? ""}"`}</code>
+              .
+            </p>
+          )}
+        </DialogSection>
+      ) : (
+        <DialogSection
+          title="Servers"
+          description={
+            writable && servers.length === 1
+              ? "Its rules check tool calls on these servers. Detaching the last one also removes the battery from the policy."
+              : "Its rules check tool calls on these servers."
+          }
+        >
+          {servers.length === 0 ? (
+            <p className="rounded-md border border-dashed px-3 py-4 text-center text-sm text-muted-foreground">
+              Not attached to a server yet.
+            </p>
+          ) : (
+            <ul className="divide-y rounded-md border">
+              {servers.map((server) => {
+                const install =
+                  installs.find(
+                    ({ catalogId }) => catalogId === server.catalogId,
+                  ) ?? null;
+                const name =
+                  server.catalogId === null
+                    ? "Removed server"
+                    : catalogName(server.catalogId);
+                return (
+                  <ServerRow
+                    key={server.target}
+                    catalogEntry={
+                      catalog.find((entry) => entry.id === server.catalogId) ??
+                      null
+                    }
+                    name={name}
+                    detail={`${server.target}__*`}
+                    action={
+                      writable && install !== null && server.catalogId ? (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          disabled={pending}
+                          aria-label={`Detach ${row.name} from ${name}`}
+                          onClick={() => detach.mutate(install.id)}
+                        >
+                          <Unlink className="size-4" />
+                          <span>Detach</span>
+                        </Button>
+                      ) : null
+                    }
+                  />
+                );
+              })}
+            </ul>
+          )}
+          {writable && summary && (
+            <AttachServerPicker
+              batteryName={summary.name}
+              catalog={catalog}
+              installedCatalogIds={installedCatalogIds}
+              taken={governed}
+              pending={pending}
+              onAttach={(catalogId, onSuccess) =>
+                create.mutate(
+                  { batteryName: row.name, catalogId },
+                  { onSuccess },
+                )
+              }
+            />
+          )}
+        </DialogSection>
+      )}
+      {credentials.length > 0 && (
+        <CredentialsSection
+          batteryName={row.name}
+          credentials={credentials}
+          onChange={(variable, key) =>
+            bind.mutate({ variable, key: key === UNBOUND ? null : key })
+          }
+          bindable={bindable}
+          managedInGithub={managedInGithub}
+          pending={pending}
+        />
+      )}
+    </StandardDialog>
+  );
+}
+
+/** One server in the battery's list and the tools it governs. */
+function ServerRow({
+  catalogEntry,
+  name,
+  detail,
+  action,
+}: {
+  catalogEntry: CatalogEntry | null;
+  name: string;
+  detail: string;
+  action: ReactNode;
+}) {
+  return (
+    <li className="flex min-h-12 items-center gap-3 px-3 py-2 text-sm">
+      {catalogEntry ? (
+        <McpCatalogIcon
+          icon={catalogEntry.icon}
+          catalogId={catalogEntry.id}
+          size={16}
+        />
+      ) : null}
+      {/* Name over the tool pattern, so neither squeezes the other or the
+          action on a narrow dialog. */}
+      <span className="min-w-0 flex-1">
+        <span className="block truncate font-medium">{name}</span>
+        <span
+          className={cn(
+            "block truncate text-xs text-muted-foreground",
+            detail.endsWith("__*") && "font-mono",
+          )}
+        >
+          {detail}
+        </span>
+      </span>
+      {action && <div className="shrink-0">{action}</div>}
+    </li>
+  );
+}
+
+/** Pick an installed server the battery does not govern yet and add it to the list. */
+function AttachServerPicker({
+  batteryName,
+  catalog,
+  installedCatalogIds,
+  taken,
+  pending,
+  onAttach,
+}: {
+  batteryName: string;
+  catalog: CatalogEntry[];
+  installedCatalogIds: Set<string> | null;
+  taken: Set<string>;
+  pending: boolean;
+  onAttach: (catalogId: string, onSuccess: () => void) => void;
+}) {
+  const [catalogId, setCatalogId] = useState("");
+  const readiness = useBatteryMatches(catalogId, catalogId !== "");
+  const attach = readiness.data?.attach ?? null;
+  const options = catalog.filter(
+    (entry) =>
+      (installedCatalogIds === null || installedCatalogIds.has(entry.id)) &&
+      !taken.has(entry.id),
+  );
+  if (installedCatalogIds?.size === 0)
+    return (
+      <p className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+        <span>No MCP server is installed yet.</span>
+        <Button asChild variant="link" size="sm" className="h-auto p-0">
+          <Link href="/mcp/registry">Browse MCP servers</Link>
+        </Button>
+      </p>
+    );
+  if (options.length === 0)
+    return (
+      <p className="text-sm text-muted-foreground">
+        Every installed server already has this battery.
+      </p>
+    );
+  const id = `battery-server-${batteryName}`;
+  return (
+    <div className="space-y-2">
+      <div className="space-y-0.5">
+        <Label htmlFor={id}>Attach to a server</Label>
+        <p className="text-xs text-muted-foreground">
+          Points the battery's rules at this server's tools. The server itself
+          doesn't change.
+        </p>
+      </div>
+      <div className="flex items-center gap-2">
+        <SearchableSelect
+          id={id}
+          ariaLabel="MCP server"
+          className="min-w-0 flex-1"
+          value={catalogId}
+          onValueChange={setCatalogId}
+          placeholder="Select a server…"
+          items={options.map((entry) => ({
+            value: entry.id,
+            label: entry.name,
+            content: <ServerOption entry={entry} />,
+            selectedContent: <ServerOption entry={entry} />,
+          }))}
+        />
+        <Button
+          type="button"
+          variant="outline"
+          disabled={pending || !catalogId || attach !== "ready"}
+          onClick={() => {
+            onAttach(catalogId, () => setCatalogId(""));
+          }}
+        >
+          {catalogId && readiness.isFetching ? (
+            <Loader2 className="size-4 animate-spin" />
+          ) : (
+            <Plus className="size-4" />
+          )}
+          <span>Attach</span>
+        </Button>
+      </div>
+      {attach !== null && attach !== "ready" && (
+        <p
+          role="note"
+          className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground"
+        >
+          <span>{ATTACH_NOTES[attach]}</span>
+          {attach === "unsynced" && <SyncToolsButton catalogId={catalogId} />}
+        </p>
+      )}
+      {readiness.isError && (
+        <p role="alert" className="text-sm text-destructive">
+          <span>Could not check whether this server can take a battery. </span>
+          <Button
+            type="button"
+            variant="link"
+            size="sm"
+            className="h-auto p-0"
+            onClick={() => readiness.refetch()}
+          >
+            <span>Retry</span>
+          </Button>
+        </p>
+      )}
+    </div>
+  );
+}
+
+function ServerOption({ entry }: { entry: CatalogEntry }) {
+  return (
+    <span className="flex items-center gap-2">
+      <McpCatalogIcon icon={entry.icon} catalogId={entry.id} size={16} />
+      <span>{entry.name}</span>
+    </span>
+  );
+}
+
+/**
+ * The keys a battery's helpers read, each picked from the organization's
+ * credentials. Those are set up on the Credentials settings page, which opens
+ * in a new tab so the dialog's edits survive; the list reloads on return.
+ *
+ * Anyone who can read credentials sees the list, so a bound key reads as what
+ * it is even when this reader cannot change it. While the repository owns the
+ * policy, a pick is a draft: nothing is saved here, and the section shows the
+ * line to change in the repository instead.
+ */
+function CredentialsSection({
+  batteryName,
+  credentials,
+  onChange,
+  bindable,
+  managedInGithub,
+  pending,
+}: {
+  batteryName: string;
+  credentials: BatteryCredential[];
+  onChange: (variable: string, key: string) => void;
+  bindable: boolean;
+  managedInGithub: boolean;
+  pending: boolean;
+}) {
+  const { data: canRead } = useHasPermissions({ credential: ["read"] });
+  const canSeeSettings = useSettingsAreaAccess() === true;
+  const listable = canRead === true;
+  const available = useRuntimeCredentials(listable);
+  const { refetch } = available;
+  useEffect(() => {
+    if (!listable) return;
+    const reload = () => refetch();
+    window.addEventListener("focus", reload);
+    return () => window.removeEventListener("focus", reload);
+  }, [listable, refetch]);
+  const options = available.data ?? [];
+  return (
+    <DialogSection
+      title="Credentials"
+      description={
+        bindable
+          ? credentials.length === 1
+            ? "This battery needs an API token. Choose a saved credential for it."
+            : "This battery needs API tokens. Choose a saved credential for each one."
+          : "Changing a key takes permission to update guardrails and credentials."
+      }
+      action={
+        canSeeSettings ? (
+          <Button asChild variant="link" size="sm" className="h-auto p-0">
+            <Link href="/settings/credentials" target="_blank" rel="noreferrer">
+              <span>Manage credentials</span>
+              <ExternalLink className="size-3.5" />
+            </Link>
+          </Button>
+        ) : null
+      }
+    >
+      {bindable && available.isSuccess && options.length === 0 && (
+        <InlineNotice variant="info">
+          <KeyRound />
+          <span className="font-medium">No credentials yet</span>
+          <InlineNoticeText>
+            Add one in Credentials, then pick it here.
+          </InlineNoticeText>
+        </InlineNotice>
+      )}
+      <div className="space-y-4">
+        {credentials.map((credential) => (
+          <CredentialRow
+            key={credential.variable}
+            batteryName={batteryName}
+            credential={credential}
+            value={credential.key ?? UNBOUND}
+            options={options}
+            listed={available.isSuccess}
+            managedInGithub={managedInGithub}
+            disabled={!bindable || pending || credential.source === "policy"}
+            onChange={(key) => onChange(credential.variable, key)}
+          />
+        ))}
+      </div>
+    </DialogSection>
+  );
+}
+
+function CredentialRow({
+  batteryName,
+  credential,
+  value,
+  options,
+  listed,
+  managedInGithub,
+  disabled,
+  onChange,
+}: {
+  batteryName: string;
+  credential: BatteryCredential;
+  value: string;
+  options: RuntimeCredentialDefinition[];
+  /** The organization's credentials loaded, so a key missing from them is gone. */
+  listed: boolean;
+  managedInGithub: boolean;
+  disabled: boolean;
+  onChange: (key: string) => void;
+}) {
+  const [kept, setKept] = useState(false);
+  const others = credential.readers.filter((reader) => reader !== batteryName);
+  // The policy can name a key the list does not offer — deleted, never
+  // created, or a list this reader cannot load — and the binding still has
+  // to read as what it is. Only a loaded list can say the key is missing.
+  const unlisted =
+    credential.key !== null &&
+    !options.some((entry) => entry.key === credential.key)
+      ? credential.key
+      : null;
+  const id = `${batteryName}-${credential.variable}`;
+  return (
+    <div className="space-y-2">
+      <Label htmlFor={id} className="font-mono text-xs">
+        {credential.variable}
+      </Label>
+      <Select
+        value={value}
+        disabled={disabled}
+        onValueChange={(next) => {
+          // The table is one per organization: letting go of a variable the
+          // other entries read would take the key from them too, so the
+          // unset is refused and the row says why.
+          if (next === UNBOUND && others.length > 0) return setKept(true);
+          setKept(false);
+          onChange(next);
+        }}
+      >
+        <SelectTrigger id={id} className="w-full">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent
+          position="popper"
+          className="w-[var(--radix-select-trigger-width)]"
+        >
+          <SelectItem value={UNBOUND}>Not set</SelectItem>
+          {unlisted !== null && (
+            <SelectItem
+              value={unlisted}
+              disabled
+              description={listed ? "No credential has this key" : undefined}
+            >
+              <CredentialOptionLabel icon={null} name={unlisted} />
+            </SelectItem>
+          )}
+          {options.map((entry) => (
+            <SelectItem
+              key={entry.key}
+              value={entry.key}
+              // The helper runs for the whole organization, so a personal-only
+              // credential cannot be bound; it is listed as such rather than hidden.
+              disabled={!entry.allowOrganization}
+              description={
+                <span className="line-clamp-2 whitespace-normal">
+                  <span>
+                    {!entry.allowOrganization
+                      ? "Personal credential · batteries need an organization credential"
+                      : entry.organizationConfigured
+                        ? "Organization credential"
+                        : "Organization credential · no organization value yet"}
+                  </span>
+                  {entry.description && (
+                    <span>{` · ${entry.description}`}</span>
+                  )}
+                </span>
+              }
+            >
+              <CredentialOptionLabel
+                icon={runtimeCredentialIconOf(entry)}
+                name={entry.name}
+              />
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      {credential.source === "policy" &&
+        (managedInGithub ? (
+          <p className="text-xs text-muted-foreground">
+            <span>
+              Set in the policy repository. Remove its line there to manage it
+              here.
+            </span>
+            <span> </span>
+            <PolicyFileLink />
+          </p>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            Set by a [credentials] line in the policy text. Ask the
+            configuration agent to remove it to manage it here.
+          </p>
+        ))}
+      {others.length > 0 && (
+        <p className="text-xs text-muted-foreground">
+          Also read by: {others.join(", ")}
+        </p>
+      )}
+      {kept && (
+        <InlineNotice variant="neutral">
+          <span className="font-medium">The key stays</span>
+          <InlineNoticeText>
+            {others.join(", ")} still read this variable. Remove those batteries
+            to unbind it.
+          </InlineNoticeText>
+        </InlineNotice>
+      )}
+    </div>
+  );
+}
+
+/** The synced policy file on GitHub, when the sync names one. */
+function PolicyFileLink() {
+  const { data } = useAppaGithubSync();
+  const href = githubPolicyFileUrl(data, "blob");
+  if (!href) return null;
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="inline-flex items-center gap-1 underline underline-offset-2 hover:no-underline"
+    >
+      <span>Open the policy file</span>
+      <ExternalLink className="size-3" aria-hidden />
+      <span className="sr-only">(opens in new tab)</span>
+    </a>
+  );
+}
+
+/** A credential's icon and name, which the select's trigger shows as well. */
+function CredentialOptionLabel({
+  icon,
+  name,
+}: {
+  icon: string | null;
+  name: string;
+}) {
+  // One row of its own: Radix drops ItemText's class, so the open list would
+  // otherwise stack the block-level icon above the name.
+  return (
+    <span className="flex min-w-0 items-center gap-2">
+      <RuntimeCredentialIcon icon={icon} className="size-4" size={16} />
+      <span className="truncate">{name}</span>
+    </span>
+  );
+}
+
+function BatteryRowActions({
+  row,
+  onEdit,
+  onRemove,
+}: {
+  row: BatteryTableRow;
+  onEdit: () => void;
+  onRemove: () => void;
+}) {
+  return (
+    <RowClickShield>
+      <TableRowActions
+        itemName={row.name}
+        actions={[
+          {
+            icon: <Pencil className="size-4" />,
+            label: "Edit",
+            onClick: onEdit,
+          },
+        ]}
+        dropdownActions={
+          row.included
+            ? [
+                {
+                  icon: <Unlink className="size-4" />,
+                  label: "Remove from policy",
+                  onClick: onRemove,
+                  variant: "destructive" as const,
+                },
+              ]
+            : []
+        }
+      />
+    </RowClickShield>
+  );
+}
+
+function RemoveBatteryDialog({
+  name,
+  onClose,
+}: {
+  name: string;
+  onClose: () => void;
+}) {
+  const remove = useRemoveBatteryInclude();
+  return (
+    <DeleteConfirmDialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+      title={`Remove the ${name} battery?`}
+      description="Its include line leaves the policy text and its guardrails stop applying to every server it governed."
+      confirmLabel="Remove"
+      pendingLabel="Removing…"
+      isPending={remove.isPending}
+      onConfirm={async () => {
+        // Whatever failed, the refetch shows what is left and the dialog
+        // never outlives the attempt.
+        try {
+          await remove.mutateAsync(name);
+        } finally {
+          onClose();
+        }
+      }}
+    />
+  );
+}
+
+/**
+ * Re-discover the tools of the picked server, which is what gives an alias a
+ * target. The reload endpoint takes an install, not the catalog entry: the
+ * newest install of the entry stands for it, and without one there is
+ * nothing to sync from.
+ */
+function SyncToolsButton({ catalogId }: { catalogId: string }) {
+  const client = useQueryClient();
+  // Only this entry's installs, without agents.
+  const servers = useMcpServers({ includeAssignedAgents: false, catalogId });
+  const reload = useReloadMcpServerTools();
+  const target = (servers.data ?? [])
+    .filter((server) => server.catalogId === catalogId)
+    .sort(
+      (a, b) =>
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    )[0];
+  return (
+    <PermissionButton
+      permissions={{ mcpServerInstallation: ["create"] }}
+      type="button"
+      variant="outline"
+      size="sm"
+      disabled={reload.isPending || target === undefined}
+      tooltip={
+        target === undefined
+          ? "Connect this server first: syncing tools needs a live connection"
+          : undefined
+      }
+      onClick={() =>
+        target &&
+        reload.mutate(
+          { id: target.id, name: target.name, catalogId },
+          {
+            onSuccess: () =>
+              client.invalidateQueries({
+                queryKey: batteryMatchesQueryKey(catalogId),
+              }),
+          },
+        )
+      }
+    >
+      {reload.isPending ? (
+        <Loader2 className="size-4 animate-spin" />
+      ) : (
+        <RefreshCw className="size-4" />
+      )}
+      <span>Sync tools</span>
+    </PermissionButton>
+  );
+}

@@ -1,0 +1,214 @@
+"use client";
+
+import {
+  DocsPage,
+  E2eTestId,
+  getDocsUrl,
+  getManageCredentialsAddToTeamOptionTestId,
+} from "@archestra/shared";
+import { AlertTriangle } from "lucide-react";
+import { useEffect, useState } from "react";
+import { ExternalDocsLink } from "@/components/external-docs-link";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { InlineNotice, InlineNoticeText } from "@/components/ui/inline-notice";
+import { Label } from "@/components/ui/label";
+import {
+  RadioGroup,
+  RadioGroupItem,
+  radioCardClass,
+} from "@/components/ui/radio-group";
+import { cn } from "@/lib/utils/tailwind";
+
+type ServiceAccountTarget = { type: "team"; teamId: string } | { type: "org" };
+
+const ORG_TARGET_VALUE = "__org__";
+
+interface AddServiceAccountDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  /** Teams that don't yet have a service account for this server. */
+  availableTeams: Array<{ id: string; name: string }>;
+  /** Whether an organization-wide service account can still be added. */
+  canAddOrg: boolean;
+  resourceKind?: "installation" | "service-account";
+  onConfirm: (target: ServiceAccountTarget) => void;
+}
+
+export function AddServiceAccountDialog({
+  open,
+  onOpenChange,
+  availableTeams,
+  canAddOrg,
+  resourceKind = "service-account",
+  onConfirm,
+}: AddServiceAccountDialogProps) {
+  const defaultValue = canAddOrg
+    ? ORG_TARGET_VALUE
+    : (availableTeams[0]?.id ?? null);
+  const [selected, setSelected] = useState<string | null>(defaultValue);
+
+  // Reset the choice whenever the dialog (re)opens or the option set changes,
+  // so a stale selection from a previous open can't be submitted.
+  useEffect(() => {
+    if (open) {
+      setSelected(
+        canAddOrg ? ORG_TARGET_VALUE : (availableTeams[0]?.id ?? null),
+      );
+    }
+  }, [open, canAddOrg, availableTeams]);
+
+  const handleConfirm = () => {
+    if (!selected) return;
+    onConfirm(
+      selected === ORG_TARGET_VALUE
+        ? { type: "org" }
+        : { type: "team", teamId: selected },
+    );
+    onOpenChange(false);
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-lg" aria-describedby={undefined}>
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <AlertTriangle className="h-5 w-5 text-amber-500" />
+            {resourceKind === "installation"
+              ? "Add a shared installation"
+              : "Add a service account"}
+          </DialogTitle>
+        </DialogHeader>
+
+        <DialogBody className="space-y-4">
+          {resourceKind === "service-account" && (
+            <InlineNotice className="flex-col items-start gap-y-2">
+              <span className="font-medium">
+                This connection is shared. Use it with care.
+              </span>
+              <InlineNoticeText>It gets used in two ways:</InlineNoticeText>
+              <InlineNoticeText className="block">
+                <ul className="list-disc space-y-1 pl-4">
+                  <li>
+                    <span className="font-medium">Static key</span> — when it's
+                    pinned as the server's single account, every call uses it no
+                    matter who is chatting.
+                  </li>
+                  <li>
+                    <span className="font-medium">Fallback</span> — during
+                    on-behalf-of, when someone chatting has no connection of
+                    their own.
+                  </li>
+                </ul>
+              </InlineNoticeText>
+              <InlineNoticeText>
+                Treat the credential like a shared secret.{" "}
+                <ExternalDocsLink
+                  href={getDocsUrl(
+                    DocsPage.McpAuthentication,
+                    "resolve-at-call-time",
+                  )}
+                  className="underline"
+                  showIcon={false}
+                >
+                  Learn more
+                </ExternalDocsLink>
+              </InlineNoticeText>
+            </InlineNotice>
+          )}
+
+          {(availableTeams.length > 0 || canAddOrg) && (
+            <div className="space-y-2">
+              <Label>
+                Who should own this{" "}
+                {resourceKind === "installation"
+                  ? "installation"
+                  : "service account"}
+                ?
+              </Label>
+              <RadioGroup
+                value={selected ?? ""}
+                onValueChange={setSelected}
+                className="gap-2"
+              >
+                {canAddOrg && (
+                  <Label
+                    htmlFor="service-account-org"
+                    className={cn(
+                      "flex cursor-pointer items-start gap-2.5 rounded-md p-3 font-normal",
+                      radioCardClass(),
+                    )}
+                    data-testid={E2eTestId.ManageCredentialsAddToOrgButton}
+                  >
+                    <RadioGroupItem
+                      id="service-account-org"
+                      value={ORG_TARGET_VALUE}
+                      className="mt-0.5"
+                    />
+                    <span className="space-y-0.5">
+                      <span className="block text-sm font-medium">
+                        Organization
+                      </span>
+                      <span className="block text-xs text-muted-foreground">
+                        Everyone in the organization can use it.
+                      </span>
+                    </span>
+                  </Label>
+                )}
+                {availableTeams.map((team) => (
+                  <Label
+                    key={team.id}
+                    htmlFor={`service-account-team-${team.id}`}
+                    className={cn(
+                      "flex cursor-pointer items-start gap-2.5 rounded-md p-3 font-normal",
+                      radioCardClass(),
+                    )}
+                    data-testid={getManageCredentialsAddToTeamOptionTestId(
+                      team.name,
+                    )}
+                  >
+                    <RadioGroupItem
+                      id={`service-account-team-${team.id}`}
+                      value={team.id}
+                      className="mt-0.5"
+                    />
+                    <span className="space-y-0.5">
+                      <span className="block text-sm font-medium">
+                        {team.name}
+                      </span>
+                      <span className="block text-xs text-muted-foreground">
+                        Members of this team can use it.
+                      </span>
+                    </span>
+                  </Label>
+                ))}
+              </RadioGroup>
+            </div>
+          )}
+        </DialogBody>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button
+            disabled={!selected}
+            onClick={handleConfirm}
+            data-testid={E2eTestId.AddServiceAccountConfirmButton}
+          >
+            {resourceKind === "installation"
+              ? "Add shared installation"
+              : "Add service account"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}

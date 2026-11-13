@@ -1,0 +1,5203 @@
+import { createHash } from "node:crypto";
+import {
+  ARCHESTRA_MCP_CATALOG_ID,
+  ARCHESTRA_TOKEN_PREFIX,
+  ASK_USER_OTHER_ANSWER_FIELD,
+  LEGACY_ARCHESTRA_TOKEN_PREFIXES,
+  OAUTH_TOKEN_ID_PREFIX,
+  TOOL_ASK_USER_FULL_NAME,
+  TOOL_CANCEL_AGENT_RUN_FULL_NAME,
+  TOOL_COPY_FILE_SHORT_NAME,
+  TOOL_CREATE_SKILL_FULL_NAME,
+  TOOL_DOWNLOAD_FILE_FULL_NAME,
+  TOOL_EXECUTE_REMEDY_PLAN_SHORT_NAME,
+  TOOL_GET_AGENT_RUN_FULL_NAME,
+  TOOL_GET_REMEDY_PLANS_SHORT_NAME,
+  TOOL_LIST_AGENT_RUNS_FULL_NAME,
+  TOOL_LIST_SKILLS_FULL_NAME,
+  TOOL_LOAD_SKILL_FULL_NAME,
+  TOOL_POST_AGENT_RUN_MESSAGE_FULL_NAME,
+  TOOL_RENDER_APP_SHORT_NAME,
+  TOOL_RUN_COMMAND_FULL_NAME,
+  TOOL_RUN_TOOL_FULL_NAME,
+  TOOL_SCAFFOLD_APP_SHORT_NAME,
+  TOOL_SEARCH_TOOLS_FULL_NAME,
+  TOOL_STEER_AGENT_RUN_FULL_NAME,
+  TOOL_TODO_WRITE_FULL_NAME,
+  TOOL_UPDATE_SKILL_FULL_NAME,
+  TOOL_UPLOAD_FILE_FULL_NAME,
+  TOOL_WHOAMI_FULL_NAME,
+} from "@archestra/shared";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import {
+  ErrorCode,
+  type ListToolsResult,
+  McpError,
+} from "@modelcontextprotocol/sdk/types.js";
+import { type MockInstance, onTestFinished, vi } from "vitest";
+import { ZodError } from "zod";
+import {
+  archestraMcpBranding,
+  executeArchestraTool,
+} from "@/archestra-mcp-server";
+import {
+  takeLeadingAttestation,
+  verifyToolAttestation,
+} from "@/archestra-mcp-server/tool-attestation";
+import mcpClient, { McpServerStoppedError } from "@/clients/mcp-client";
+import config from "@/config";
+import { agentSandboxApi } from "@/k8s/agent-runtime/sandbox-api";
+import {
+  AgentTeamModel,
+  McpCatalogLabelModel,
+  McpToolCallModel,
+  ServiceAccountModel,
+  ToolModel,
+  UserTokenModel,
+} from "@/models";
+import GuardrailsDeploymentModel from "@/models/guardrails-deployment";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import {
+  appConnectorAudienceRef,
+  buildConnectorResourceUri,
+} from "@/services/apps/app-connector-resource";
+import { MCP_RESOURCE_REFERENCE_PREFIX } from "@/services/identity-providers/enterprise-managed/authorization";
+import { jwksValidator } from "@/services/jwks-validator";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import { setupTestCacheManager } from "@/test/cache-manager";
+import { ApiError } from "@/types/api";
+import { handleTaskMethod, MCP_TASKS_EXTENSION_ID } from "./tasks";
+import {
+  authenticateMCPGatewayRequest,
+  createAgentServer,
+  ensureRequestSocketDestroySoon,
+  validateExternalIdpToken,
+  validateMCPGatewayToken,
+  validateOAuthToken,
+} from "./utils";
+
+let mockValidateJwt: MockInstance<typeof jwksValidator.validateJwt>;
+let previousOpenappaEnabled: boolean;
+
+beforeEach(() => {
+  previousOpenappaEnabled = config.openappa.enabled;
+  // OpenAPPA cases enable it explicitly; keep unrelated tool-list assertions
+  // independent of the deployment default.
+  config.openappa.enabled = false;
+  config.enterpriseFeatures.core = true;
+  mockValidateJwt = vi
+    .spyOn(jwksValidator, "validateJwt")
+    .mockResolvedValue(null);
+});
+
+afterEach(() => {
+  config.openappa.enabled = previousOpenappaEnabled;
+  mockValidateJwt.mockRestore();
+});
+
+type TestListToolsHandler = (request: unknown) => Promise<ListToolsResult>;
+type TestCallToolHandler = (
+  request: unknown,
+  extra: { sendRequest: ReturnType<typeof vi.fn> },
+) => Promise<{
+  content: Array<{ type: string; text: string }>;
+  isError?: boolean;
+  resultType?: string;
+  task?: { taskId: string };
+  structuredContent?: { items?: unknown[] };
+}>;
+
+describe("ensureRequestSocketDestroySoon", () => {
+  test("adds destroySoon to injected request sockets", () => {
+    const destroy = vi.fn();
+    const request = {
+      socket: {
+        destroy,
+      },
+    };
+
+    ensureRequestSocketDestroySoon(request as never);
+
+    const socket = request.socket as typeof request.socket & {
+      destroySoon: () => void;
+    };
+    expect(socket.destroySoon).toBeTypeOf("function");
+    socket.destroySoon();
+    expect(destroy).toHaveBeenCalledOnce();
+  });
+
+  test("preserves sockets that already have destroySoon", () => {
+    const destroySoon = vi.fn();
+    const request = {
+      socket: {
+        destroySoon,
+      },
+    };
+
+    ensureRequestSocketDestroySoon(request as never);
+
+    expect(request.socket.destroySoon).toBe(destroySoon);
+  });
+
+  test("falls back to end when destroy is unavailable", () => {
+    const end = vi.fn();
+    const request = {
+      socket: {
+        end,
+      },
+    };
+
+    ensureRequestSocketDestroySoon(request as never);
+
+    const socket = request.socket as typeof request.socket & {
+      destroySoon: () => void;
+    };
+    expect(socket.destroySoon).toBeTypeOf("function");
+    socket.destroySoon();
+    expect(end).toHaveBeenCalledOnce();
+  });
+});
+
+describe("validateMCPGatewayToken", () => {
+  describe("invalid token scenarios", () => {
+    test("returns null for invalid token", async () => {
+      const result = await validateMCPGatewayToken(
+        crypto.randomUUID(),
+        `${LEGACY_ARCHESTRA_TOKEN_PREFIXES[0]}invalidtoken1234567890ab`,
+      );
+      expect(result).toBeNull();
+    });
+  });
+
+  describe("service account token validation", () => {
+    test("a member-role account reaches an org-wide-shared gateway as itself, not as a user", async ({
+      makeAgent,
+      makeOrganization,
+      makeServiceAccountToken,
+    }) => {
+      const org = await makeOrganization();
+      const { serviceAccount, tokenId, value } = await makeServiceAccountToken({
+        organizationId: org.id,
+      });
+
+      const profile = await makeAgent({ organizationId: org.id });
+      const result = await validateMCPGatewayToken(profile.id, value);
+
+      expect(result).not.toBeNull();
+      expect(result?.tokenId).toBe(tokenId);
+      expect(result?.serviceAccountId).toBe(serviceAccount.id);
+      expect(result?.userId).toBeUndefined();
+      expect(result?.isOrganizationToken).toBe(false);
+      expect(result?.teamId).toBeNull();
+      expect(result?.organizationId).toBe(org.id);
+    });
+
+    test("an account linked to a team reaches a gateway shared only with that team", async ({
+      makeOrganization,
+      makeUser,
+      makeTeam,
+      makeAgent,
+      makeServiceAccountToken,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      const team = await makeTeam(org.id, user.id, { name: "Dev Team" });
+      const agent = await makeAgent({
+        organizationId: org.id,
+        access: { teams: [team.id] },
+      });
+
+      const { serviceAccount, tokenId, value } = await makeServiceAccountToken({
+        organizationId: org.id,
+        teamId: team.id,
+      });
+
+      const result = await validateMCPGatewayToken(agent.id, value);
+
+      expect(result).not.toBeNull();
+      expect(result?.tokenId).toBe(tokenId);
+      expect(result?.serviceAccountId).toBe(serviceAccount.id);
+      expect(result?.teamId).toBe(team.id);
+    });
+
+    test("an account without the team cannot reach a team-only gateway", async ({
+      makeOrganization,
+      makeUser,
+      makeTeam,
+      makeAgent,
+      makeServiceAccountToken,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      const team1 = await makeTeam(org.id, user.id, { name: "Team 1" });
+      const team2 = await makeTeam(org.id, user.id, { name: "Team 2" });
+      const agent = await makeAgent({
+        organizationId: org.id,
+        access: { teams: [team2.id] },
+      });
+
+      const unlinked = await makeServiceAccountToken({
+        organizationId: org.id,
+      });
+      const otherTeam = await makeServiceAccountToken({
+        organizationId: org.id,
+        teamId: team1.id,
+      });
+
+      expect(
+        await validateMCPGatewayToken(agent.id, unlinked.value),
+      ).toBeNull();
+      expect(
+        await validateMCPGatewayToken(agent.id, otherTeam.value),
+      ).toBeNull();
+    });
+
+    test("refuses a disabled account", async ({
+      makeAgent,
+      makeOrganization,
+      makeServiceAccountToken,
+    }) => {
+      const org = await makeOrganization();
+      const profile = await makeAgent({ organizationId: org.id });
+      const { serviceAccount, value } = await makeServiceAccountToken({
+        organizationId: org.id,
+      });
+      await ServiceAccountModel.update(serviceAccount.id, org.id, {
+        disabled: true,
+      });
+
+      expect(await validateMCPGatewayToken(profile.id, value)).toBeNull();
+    });
+
+    test("refuses a disabled key and an expired key", async ({
+      makeAgent,
+      makeOrganization,
+      makeServiceAccountToken,
+    }) => {
+      const org = await makeOrganization();
+      const profile = await makeAgent({ organizationId: org.id });
+      const disabledKey = await makeServiceAccountToken({
+        organizationId: org.id,
+      });
+      await ServiceAccountModel.updateToken({
+        serviceAccountId: disabledKey.serviceAccount.id,
+        tokenId: disabledKey.tokenId,
+        organizationId: org.id,
+        data: { disabled: true },
+      });
+      const expiredKey = await makeServiceAccountToken({
+        organizationId: org.id,
+      });
+      await ServiceAccountModel.updateToken({
+        serviceAccountId: expiredKey.serviceAccount.id,
+        tokenId: expiredKey.tokenId,
+        organizationId: org.id,
+        data: { expiresAt: new Date(Date.now() - 60_000) },
+      });
+
+      expect(
+        await validateMCPGatewayToken(profile.id, disabledKey.value),
+      ).toBeNull();
+      expect(
+        await validateMCPGatewayToken(profile.id, expiredKey.value),
+      ).toBeNull();
+    });
+
+    test("does not cache negative per-profile auth results", async ({
+      makeOrganization,
+      makeUser,
+      makeTeam,
+      makeAgent,
+      makeServiceAccountToken,
+    }) => {
+      // Regression coverage for the "negative cache treadmill": when a
+      // per-profile auth check returned null, the result used to be cached
+      // for several seconds. A retry inside that window would refresh the
+      // cached null, turning a transient race (e.g. a profile/team binding
+      // created milliseconds after the first call) into a sticky 401.
+      // The contract is now: failures bypass the cache, so each call
+      // re-evaluates against fresh DB state.
+      const org = await makeOrganization();
+      const user = await makeUser();
+      const team1 = await makeTeam(org.id, user.id, { name: "Team 1" });
+      const team2 = await makeTeam(org.id, user.id, { name: "Team 2" });
+      const agent = await makeAgent({
+        organizationId: org.id,
+        access: { teams: [team2.id] },
+      });
+      const { value } = await makeServiceAccountToken({
+        organizationId: org.id,
+        teamId: team1.id,
+      });
+
+      const agentAccessSpy = vi.spyOn(AgentTeamModel, "userHasAgentAccess");
+
+      const firstResult = await validateMCPGatewayToken(agent.id, value);
+      const secondResult = await validateMCPGatewayToken(agent.id, value);
+
+      expect(firstResult).toBeNull();
+      expect(secondResult).toBeNull();
+      // Both calls must re-run the per-profile check; if negative caching
+      // were reintroduced this would drop to 1.
+      expect(agentAccessSpy).toHaveBeenCalledTimes(2);
+
+      agentAccessSpy.mockRestore();
+    });
+  });
+
+  describe("service account team link", () => {
+    async function makeKey(serviceAccountId: string, organizationId: string) {
+      const { token } = await ServiceAccountModel.createToken({
+        serviceAccountId,
+        organizationId,
+        name: "test key",
+      });
+      return token;
+    }
+
+    test("an account linked to a team reaches a gateway shared only with that team", async ({
+      makeOrganization,
+      makeUser,
+      makeTeam,
+      makeAgent,
+      makeServiceAccount,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      const team = await makeTeam(org.id, user.id, { name: "Dev Team" });
+      const agent = await makeAgent({
+        organizationId: org.id,
+        access: { teams: [team.id] },
+      });
+      const account = await makeServiceAccount(org.id, { teamId: team.id });
+
+      const result = await validateMCPGatewayToken(
+        agent.id,
+        await makeKey(account.id, org.id),
+      );
+
+      expect(result?.serviceAccountId).toBe(account.id);
+      // Call-time credentials prefer the team's installs.
+      expect(result?.teamId).toBe(team.id);
+    });
+
+    test("an account without the team cannot reach a team-only gateway", async ({
+      makeOrganization,
+      makeUser,
+      makeTeam,
+      makeAgent,
+      makeServiceAccount,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      const team1 = await makeTeam(org.id, user.id, { name: "Team 1" });
+      const team2 = await makeTeam(org.id, user.id, { name: "Team 2" });
+      const agent = await makeAgent({
+        organizationId: org.id,
+        access: { teams: [team2.id] },
+      });
+      const unlinked = await makeServiceAccount(org.id);
+      const otherTeam = await makeServiceAccount(org.id, { teamId: team1.id });
+
+      expect(
+        await validateMCPGatewayToken(
+          agent.id,
+          await makeKey(unlinked.id, org.id),
+        ),
+      ).toBeNull();
+      expect(
+        await validateMCPGatewayToken(
+          agent.id,
+          await makeKey(otherTeam.id, org.id),
+        ),
+      ).toBeNull();
+    });
+  });
+
+  describe("user token validation", () => {
+    test("a private gateway requires use rather than read and revocation takes effect on the same token", async ({
+      makeOrganization,
+      makeUser,
+      makeMember,
+      makeCustomRole,
+      makeAgent,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      const owner = await makeUser();
+      const role = await makeCustomRole(org.id, { permission: {} });
+      await makeMember(user.id, org.id, { role: role.role });
+      const gateway = await makeAgent({
+        organizationId: org.id,
+        authorId: owner.id,
+        agentType: "mcp_gateway",
+        access: "personal",
+      });
+      const { value } = await UserTokenModel.create(user.id, org.id);
+      const key = {
+        organizationId: org.id,
+        resource: "mcpGateway" as const,
+        scope: gateway.id,
+      };
+      const subject = { type: "user" as const, id: user.id };
+      await ResourcePermissionPolicyModel.replace({
+        ...key,
+        revision: 0,
+        grants: [{ subject, actions: ["read"] }],
+      });
+      expect(await validateMCPGatewayToken(gateway.id, value)).toBeNull();
+      await ResourcePermissionPolicyModel.replace({
+        ...key,
+        revision: 1,
+        grants: [{ subject, actions: ["use"] }],
+      });
+      expect(await validateMCPGatewayToken(gateway.id, value)).toMatchObject({
+        userId: user.id,
+      });
+      await ResourcePermissionPolicyModel.replace({
+        ...key,
+        revision: 2,
+        grants: [],
+      });
+      expect(await validateMCPGatewayToken(gateway.id, value)).toBeNull();
+    });
+    test("validates user token when user has team access to profile", async ({
+      makeOrganization,
+      makeUser,
+      makeMember,
+      makeTeam,
+      makeTeamMember,
+      makeAgent,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "member" });
+
+      const team = await makeTeam(org.id, user.id, { name: "Dev Team" });
+      await makeTeamMember(team.id, user.id);
+      const agent = await makeAgent({
+        organizationId: org.id,
+        access: { teams: [team.id] },
+      });
+
+      const { token, value } = await UserTokenModel.create(
+        user.id,
+        org.id,
+        "Personal Token",
+      );
+
+      const result = await validateMCPGatewayToken(agent.id, value);
+
+      expect(result).not.toBeNull();
+      expect(result?.tokenId).toBe(token.id);
+      expect(result?.isUserToken).toBe(true);
+      expect(result?.userId).toBe(user.id);
+      expect(result?.organizationId).toBe(org.id);
+    });
+
+    test("returns null when user has no team access to profile", async ({
+      makeOrganization,
+      makeUser,
+      makeMember,
+      makeTeam,
+      makeAgent,
+    }) => {
+      const org = await makeOrganization();
+      const user1 = await makeUser();
+      const user2 = await makeUser();
+      await makeMember(user1.id, org.id, { role: "member" });
+      await makeMember(user2.id, org.id, { role: "member" });
+
+      // user1 is in team1
+      await makeTeam(org.id, user1.id, { name: "Team 1" });
+      // user2 is in team2
+      const team2 = await makeTeam(org.id, user2.id, { name: "Team 2" });
+
+      // Agent is only assigned to team2
+      const agent = await makeAgent({
+        organizationId: org.id,
+        access: { teams: [team2.id] },
+      });
+
+      // Create token for user1 (who is NOT in team2)
+      const { value } = await UserTokenModel.create(
+        user1.id,
+        org.id,
+        "User1 Token",
+      );
+
+      const result = await validateMCPGatewayToken(agent.id, value);
+      expect(result).toBeNull();
+    });
+
+    test("admin user can access any profile regardless of team membership", async ({
+      makeOrganization,
+      makeUser,
+      makeMember,
+      makeTeam,
+      makeAgent,
+    }) => {
+      const org = await makeOrganization();
+      const adminUser = await makeUser();
+      const regularUser = await makeUser();
+
+      await makeMember(adminUser.id, org.id, { role: "admin" });
+      await makeMember(regularUser.id, org.id, { role: "member" });
+
+      // Create a team with regular user only (admin is NOT in this team)
+      const team = await makeTeam(org.id, regularUser.id, {
+        name: "Other Team",
+      });
+
+      // Agent assigned to team
+      const agent = await makeAgent({
+        organizationId: org.id,
+        access: { teams: [team.id] },
+      });
+
+      // Create token for admin user
+      const { token, value } = await UserTokenModel.create(
+        adminUser.id,
+        org.id,
+        "Admin Token",
+      );
+
+      const result = await validateMCPGatewayToken(agent.id, value);
+
+      expect(result).not.toBeNull();
+      expect(result?.tokenId).toBe(token.id);
+      expect(result?.isUserToken).toBe(true);
+      expect(result?.userId).toBe(adminUser.id);
+    });
+
+    test("passes preloaded access context into user access checks", async ({
+      makeOrganization,
+      makeUser,
+      makeMember,
+      makeTeam,
+      makeTeamMember,
+      makeAgent,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "member" });
+
+      const team = await makeTeam(org.id, user.id, { name: "Dev Team" });
+      await makeTeamMember(team.id, user.id);
+      const agent = await makeAgent({
+        organizationId: org.id,
+        access: { teams: [team.id] },
+      });
+      const { value } = await UserTokenModel.create(user.id, org.id);
+      const userHasAgentAccessSpy = vi.spyOn(
+        AgentTeamModel,
+        "userHasAgentAccess",
+      );
+
+      const result = await validateMCPGatewayToken(agent.id, value);
+
+      expect(result).not.toBeNull();
+      expect(userHasAgentAccessSpy).toHaveBeenCalledTimes(1);
+      expect(
+        userHasAgentAccessSpy.mock.calls[0]?.[0].agentAccessContext,
+      ).toMatchObject({
+        id: agent.id,
+        organizationId: agent.organizationId,
+        authorId: agent.authorId,
+      });
+
+      userHasAgentAccessSpy.mockRestore();
+    });
+  });
+
+  describe("edge cases", () => {
+    test("profile with no teams - admin user token succeeds", async ({
+      makeOrganization,
+      makeUser,
+      makeMember,
+      makeAgent,
+    }) => {
+      const org = await makeOrganization();
+      const adminUser = await makeUser();
+      await makeMember(adminUser.id, org.id, { role: "admin" });
+
+      // Agent with no teams
+      const agent = await makeAgent({ organizationId: org.id });
+
+      // Create admin user token
+      const { token, value } = await UserTokenModel.create(
+        adminUser.id,
+        org.id,
+        "Admin Token",
+      );
+
+      const result = await validateMCPGatewayToken(agent.id, value);
+
+      expect(result).not.toBeNull();
+      expect(result?.tokenId).toBe(token.id);
+      expect(result?.isUserToken).toBe(true);
+    });
+
+    test("user with no teams can only access profiles if admin", async ({
+      makeOrganization,
+      makeUser,
+      makeMember,
+      makeTeam,
+      makeAgent,
+    }) => {
+      const org = await makeOrganization();
+      const userWithNoTeams = await makeUser();
+      const otherUser = await makeUser();
+
+      await makeMember(userWithNoTeams.id, org.id, { role: "member" });
+      await makeMember(otherUser.id, org.id, { role: "member" });
+
+      // Create team with other user, agent in that team
+      const team = await makeTeam(org.id, otherUser.id, { name: "Other Team" });
+      const agent = await makeAgent({
+        organizationId: org.id,
+        access: { teams: [team.id] },
+      });
+
+      // Token for user with no teams
+      const { value } = await UserTokenModel.create(
+        userWithNoTeams.id,
+        org.id,
+        "No Teams Token",
+      );
+
+      const result = await validateMCPGatewayToken(agent.id, value);
+      expect(result).toBeNull();
+    });
+
+    test("admin user with no teams can still access any profile", async ({
+      makeOrganization,
+      makeUser,
+      makeMember,
+      makeTeam,
+      makeAgent,
+    }) => {
+      const org = await makeOrganization();
+      const adminWithNoTeams = await makeUser();
+      const otherUser = await makeUser();
+
+      await makeMember(adminWithNoTeams.id, org.id, { role: "admin" });
+      await makeMember(otherUser.id, org.id, { role: "member" });
+
+      // Create team with other user, agent in that team
+      const team = await makeTeam(org.id, otherUser.id, { name: "Other Team" });
+      const agent = await makeAgent({
+        organizationId: org.id,
+        access: { teams: [team.id] },
+      });
+
+      // Token for admin with no teams
+      const { token, value } = await UserTokenModel.create(
+        adminWithNoTeams.id,
+        org.id,
+        "Admin No Teams Token",
+      );
+
+      const result = await validateMCPGatewayToken(agent.id, value);
+
+      expect(result).not.toBeNull();
+      expect(result?.tokenId).toBe(token.id);
+      expect(result?.isUserToken).toBe(true);
+      expect(result?.userId).toBe(adminWithNoTeams.id);
+    });
+  });
+
+  describe("OAuth token validation", () => {
+    test("validateOAuthToken returns null for unknown token", async () => {
+      const result = await validateOAuthToken(
+        crypto.randomUUID(),
+        "not-a-valid-oauth-token",
+      );
+      expect(result).toBeNull();
+    });
+
+    test("validateOAuthToken returns null for random token that doesn't match any hash", async () => {
+      const result = await validateOAuthToken(
+        crypto.randomUUID(),
+        "some-random-bearer-token-value-123",
+      );
+      expect(result).toBeNull();
+    });
+
+    test("validateMCPGatewayToken skips OAuth validation for legacy prefixed tokens", async () => {
+      const result = await validateMCPGatewayToken(
+        crypto.randomUUID(),
+        `${LEGACY_ARCHESTRA_TOKEN_PREFIXES[0]}fake_token_that_does_not_exist`,
+      );
+      // Returns null because the legacy token is invalid, but importantly
+      // it should NOT have tried OAuth token validation
+      expect(result).toBeNull();
+    });
+
+    test("validateMCPGatewayToken skips OAuth validation for current prefixed tokens", async () => {
+      const result = await validateMCPGatewayToken(
+        crypto.randomUUID(),
+        `${ARCHESTRA_TOKEN_PREFIX}fake_token_that_does_not_exist`,
+      );
+      expect(result).toBeNull();
+    });
+
+    test("validateMCPGatewayToken tries OAuth validation for non-platform tokens", async () => {
+      // A non-platform token should try OAuth validation path and return null
+      const result = await validateMCPGatewayToken(
+        crypto.randomUUID(),
+        "some-random-bearer-token",
+      );
+      expect(result).toBeNull();
+    });
+
+    test("validateOAuthToken returns null for expired token", async ({
+      makeUser,
+      makeOrganization,
+      makeMember,
+      makeOAuthClient,
+      makeOAuthAccessToken,
+      makeAgent,
+    }) => {
+      const user = await makeUser();
+      const org = await makeOrganization();
+      await makeMember(user.id, org.id, { role: "admin" });
+
+      const client = await makeOAuthClient({ userId: user.id });
+
+      // Create a raw token and pre-compute its SHA-256 base64url hash
+      const rawToken = `test-expired-token-${crypto.randomUUID()}`;
+      const tokenHash = createHash("sha256")
+        .update(rawToken)
+        .digest("base64url");
+
+      await makeOAuthAccessToken(client.clientId, user.id, {
+        token: tokenHash,
+        expiresAt: new Date(Date.now() - 3600000), // expired 1h ago
+      });
+
+      const agent = await makeAgent({ organizationId: org.id });
+      const result = await validateOAuthToken(agent.id, rawToken);
+
+      expect(result).toBeNull();
+    });
+
+    test("validateOAuthToken returns null when refresh token is revoked", async ({
+      makeUser,
+      makeOrganization,
+      makeMember,
+      makeOAuthClient,
+      makeOAuthRefreshToken,
+      makeOAuthAccessToken,
+      makeAgent,
+    }) => {
+      const user = await makeUser();
+      const org = await makeOrganization();
+      await makeMember(user.id, org.id, { role: "admin" });
+
+      const client = await makeOAuthClient({ userId: user.id });
+
+      // Create a revoked refresh token
+      const refreshToken = await makeOAuthRefreshToken(
+        client.clientId,
+        user.id,
+        { revoked: new Date() },
+      );
+
+      // Create an access token linked to the revoked refresh token
+      const rawToken = `test-revoked-refresh-${crypto.randomUUID()}`;
+      const tokenHash = createHash("sha256")
+        .update(rawToken)
+        .digest("base64url");
+
+      await makeOAuthAccessToken(client.clientId, user.id, {
+        token: tokenHash,
+        refreshId: refreshToken.id,
+      });
+
+      const agent = await makeAgent({ organizationId: org.id });
+      const result = await validateOAuthToken(agent.id, rawToken);
+
+      expect(result).toBeNull();
+    });
+
+    test("validateOAuthToken returns valid result for admin user with valid token", async ({
+      makeUser,
+      makeOrganization,
+      makeMember,
+      makeOAuthClient,
+      makeOAuthAccessToken,
+      makeAgent,
+    }) => {
+      const user = await makeUser();
+      const org = await makeOrganization();
+      await makeMember(user.id, org.id, { role: "admin" });
+
+      const client = await makeOAuthClient({ userId: user.id });
+
+      const rawToken = `test-valid-token-${crypto.randomUUID()}`;
+      const tokenHash = createHash("sha256")
+        .update(rawToken)
+        .digest("base64url");
+
+      const accessToken = await makeOAuthAccessToken(client.clientId, user.id, {
+        token: tokenHash,
+      });
+
+      const agent = await makeAgent({ organizationId: org.id });
+      const result = await validateOAuthToken(agent.id, rawToken);
+
+      expect(result).not.toBeNull();
+      expect(result?.tokenId).toBe(`${OAUTH_TOKEN_ID_PREFIX}${accessToken.id}`);
+      expect(result?.userId).toBe(user.id);
+      expect(result?.isUserToken).toBe(true);
+      expect(result?.organizationId).toBe(org.id);
+    });
+
+    test("validateOAuthToken returns null when token is bound to another MCP resource", async ({
+      makeUser,
+      makeOrganization,
+      makeMember,
+      makeOAuthClient,
+      makeOAuthAccessToken,
+      makeAgent,
+    }) => {
+      const user = await makeUser();
+      const org = await makeOrganization();
+      await makeMember(user.id, org.id, { role: "admin" });
+
+      const client = await makeOAuthClient({ userId: user.id });
+      const otherAgent = await makeAgent({ organizationId: org.id });
+      const targetAgent = await makeAgent({ organizationId: org.id });
+
+      const rawToken = `test-bound-resource-token-${crypto.randomUUID()}`;
+      const tokenHash = createHash("sha256")
+        .update(rawToken)
+        .digest("base64url");
+
+      await makeOAuthAccessToken(client.clientId, user.id, {
+        token: tokenHash,
+        referenceId: `${MCP_RESOURCE_REFERENCE_PREFIX}${otherAgent.id}`,
+      });
+
+      const result = await validateOAuthToken(targetAgent.id, rawToken);
+
+      expect(result).toBeNull();
+    });
+
+    test("validateOAuthToken returns null for a token bound to an app connector", async ({
+      makeUser,
+      makeOrganization,
+      makeMember,
+      makeOAuthClient,
+      makeOAuthAccessToken,
+      makeAgent,
+    }) => {
+      const user = await makeUser();
+      const org = await makeOrganization();
+      await makeMember(user.id, org.id, { role: "admin" });
+
+      const client = await makeOAuthClient({ userId: user.id });
+      const targetAgent = await makeAgent({ organizationId: org.id });
+
+      const rawToken = `app-connector-token-${crypto.randomUUID()}`;
+      const tokenHash = createHash("sha256")
+        .update(rawToken)
+        .digest("base64url");
+
+      // A token bound to an App connector must never authenticate the gateway,
+      // even for an admin who would otherwise pass the user-access check.
+      await makeOAuthAccessToken(client.clientId, user.id, {
+        token: tokenHash,
+        referenceId: appConnectorAudienceRef(
+          buildConnectorResourceUri(
+            "https://host",
+            "11111111-1111-1111-1111-111111111111",
+          ) as string,
+        ),
+      });
+
+      const result = await validateOAuthToken(targetAgent.id, rawToken);
+
+      expect(result).toBeNull();
+    });
+
+    test("validateOAuthToken returns valid result when refresh token is not revoked", async ({
+      makeUser,
+      makeOrganization,
+      makeMember,
+      makeOAuthClient,
+      makeOAuthRefreshToken,
+      makeOAuthAccessToken,
+      makeAgent,
+    }) => {
+      const user = await makeUser();
+      const org = await makeOrganization();
+      await makeMember(user.id, org.id, { role: "admin" });
+
+      const client = await makeOAuthClient({ userId: user.id });
+
+      // Create a non-revoked refresh token
+      const refreshToken = await makeOAuthRefreshToken(
+        client.clientId,
+        user.id,
+      );
+
+      const rawToken = `test-valid-refresh-${crypto.randomUUID()}`;
+      const tokenHash = createHash("sha256")
+        .update(rawToken)
+        .digest("base64url");
+
+      const accessToken = await makeOAuthAccessToken(client.clientId, user.id, {
+        token: tokenHash,
+        refreshId: refreshToken.id,
+      });
+
+      const agent = await makeAgent({ organizationId: org.id });
+      const result = await validateOAuthToken(agent.id, rawToken);
+
+      expect(result).not.toBeNull();
+      expect(result?.tokenId).toBe(`${OAUTH_TOKEN_ID_PREFIX}${accessToken.id}`);
+      expect(result?.userId).toBe(user.id);
+    });
+
+    test("validateOAuthToken uses the target agent organization for multi-org users", async ({
+      makeUser,
+      makeOrganization,
+      makeMember,
+      makeOAuthClient,
+      makeOAuthAccessToken,
+      makeAgent,
+    }) => {
+      const user = await makeUser();
+      const firstOrg = await makeOrganization();
+      const targetOrg = await makeOrganization();
+
+      await makeMember(user.id, firstOrg.id, { role: "member" });
+      await makeMember(user.id, targetOrg.id, { role: "admin" });
+
+      const client = await makeOAuthClient({ userId: user.id });
+
+      const rawToken = `test-multi-org-token-${crypto.randomUUID()}`;
+      const tokenHash = createHash("sha256")
+        .update(rawToken)
+        .digest("base64url");
+
+      const accessToken = await makeOAuthAccessToken(client.clientId, user.id, {
+        token: tokenHash,
+      });
+
+      const agent = await makeAgent({ organizationId: targetOrg.id });
+      const result = await validateOAuthToken(agent.id, rawToken);
+
+      expect(result).not.toBeNull();
+      expect(result?.tokenId).toBe(`${OAUTH_TOKEN_ID_PREFIX}${accessToken.id}`);
+      expect(result?.organizationId).toBe(targetOrg.id);
+      expect(result?.userId).toBe(user.id);
+    });
+  });
+});
+
+describe("validateExternalIdpToken", () => {
+  const FAKE_JWT = "eyJhbGciOiJSUzI1NiJ9.fake.jwt";
+
+  test("returns null when profile has no identity provider", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent();
+    const result = await validateExternalIdpToken(agent.id, FAKE_JWT);
+    expect(result).toBeNull();
+  });
+
+  test("returns null when JWT has no email claim", async ({
+    makeOrganization,
+    makeIdentityProvider,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const idp = await makeIdentityProvider(org.id, {
+      oidcConfig: {
+        clientId: "test-client",
+        jwksEndpoint: "https://example.com/.well-known/jwks.json",
+      },
+    });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      identityProviderId: idp.id,
+    });
+
+    mockValidateJwt.mockResolvedValueOnce({
+      sub: "user-123",
+      email: null,
+      name: "Test User",
+      rawClaims: { sub: "user-123" },
+    });
+
+    const result = await validateExternalIdpToken(agent.id, FAKE_JWT);
+    expect(result).toBeNull();
+  });
+
+  test("uses email-shaped subject when JWT has no email claim", async ({
+    makeOrganization,
+    makeIdentityProvider,
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser({ email: "user@example.com" });
+    await makeMember(user.id, org.id, { role: "admin" });
+    const idp = await makeIdentityProvider(org.id, {
+      oidcConfig: {
+        clientId: "test-client",
+        jwksEndpoint: "https://example.com/.well-known/jwks.json",
+      },
+    });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      identityProviderId: idp.id,
+    });
+
+    mockValidateJwt.mockResolvedValueOnce({
+      sub: "user@example.com",
+      email: null,
+      name: "Test User",
+      rawClaims: { sub: "user@example.com" },
+    });
+
+    const result = await validateExternalIdpToken(agent.id, FAKE_JWT);
+    expect(result?.userId).toBe(user.id);
+    expect(result?.isExternalIdp).toBe(true);
+  });
+
+  test("returns null when the identity provider OIDC config has no clientId for audience validation", async ({
+    makeOrganization,
+    makeIdentityProvider,
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    mockValidateJwt.mockClear();
+
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+
+    const idp = await makeIdentityProvider(org.id, {
+      oidcConfig: {
+        jwksEndpoint: "https://example.com/.well-known/jwks.json",
+      },
+    });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      identityProviderId: idp.id,
+    });
+
+    const result = await validateExternalIdpToken(agent.id, FAKE_JWT);
+
+    expect(result).toBeNull();
+    expect(mockValidateJwt).not.toHaveBeenCalled();
+  });
+
+  test("returns null when email does not match any Archestra user", async ({
+    makeOrganization,
+    makeIdentityProvider,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const idp = await makeIdentityProvider(org.id, {
+      oidcConfig: {
+        clientId: "test-client",
+        jwksEndpoint: "https://example.com/.well-known/jwks.json",
+      },
+    });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      identityProviderId: idp.id,
+    });
+
+    mockValidateJwt.mockResolvedValueOnce({
+      sub: "user-123",
+      email: "nonexistent@example.com",
+      name: "Unknown User",
+      rawClaims: { sub: "user-123", email: "nonexistent@example.com" },
+    });
+
+    const result = await validateExternalIdpToken(agent.id, FAKE_JWT);
+    expect(result).toBeNull();
+  });
+
+  test("returns null when user is not a member of the gateway's organization", async ({
+    makeOrganization,
+    makeUser,
+    makeIdentityProvider,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    // user exists but is NOT a member of org
+
+    const idp = await makeIdentityProvider(org.id, {
+      oidcConfig: {
+        clientId: "test-client",
+        jwksEndpoint: "https://example.com/.well-known/jwks.json",
+      },
+    });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      identityProviderId: idp.id,
+    });
+
+    mockValidateJwt.mockResolvedValueOnce({
+      sub: "user-123",
+      email: user.email,
+      name: user.name,
+      rawClaims: { sub: "user-123", email: user.email },
+    });
+
+    const result = await validateExternalIdpToken(agent.id, FAKE_JWT);
+    expect(result).toBeNull();
+  });
+
+  test("returns null when user has no shared teams with profile", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeTeam,
+    makeTeamMember,
+    makeIdentityProvider,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const otherUser = await makeUser();
+    await makeMember(user.id, org.id, { role: "member" });
+    await makeMember(otherUser.id, org.id, { role: "member" });
+
+    // user is in team1
+    const team1 = await makeTeam(org.id, user.id, { name: "Team 1" });
+    await makeTeamMember(team1.id, user.id);
+
+    // agent is in team2 (user is NOT)
+    const team2 = await makeTeam(org.id, otherUser.id, { name: "Team 2" });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      access: { teams: [team2.id] },
+    });
+
+    const idp = await makeIdentityProvider(org.id, {
+      oidcConfig: {
+        clientId: "test-client",
+        jwksEndpoint: "https://example.com/.well-known/jwks.json",
+      },
+    });
+    // Link agent to identity provider
+    const { AgentModel } = await import("@/models");
+    await AgentModel.update(agent.id, { identityProviderId: idp.id });
+
+    mockValidateJwt.mockResolvedValueOnce({
+      sub: "user-123",
+      email: user.email,
+      name: user.name,
+      rawClaims: { sub: "user-123", email: user.email },
+    });
+
+    const result = await validateExternalIdpToken(agent.id, FAKE_JWT);
+    expect(result).toBeNull();
+  });
+
+  test("grants access when user has mcpGateway:admin permission", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeIdentityProvider,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const adminUser = await makeUser();
+    await makeMember(adminUser.id, org.id, { role: "admin" });
+
+    const idp = await makeIdentityProvider(org.id, {
+      oidcConfig: {
+        clientId: "test-client",
+        jwksEndpoint: "https://example.com/.well-known/jwks.json",
+      },
+    });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      identityProviderId: idp.id,
+      // no teams assigned
+    });
+
+    mockValidateJwt.mockResolvedValueOnce({
+      sub: "admin-sub",
+      email: adminUser.email,
+      name: adminUser.name,
+      rawClaims: { sub: "admin-sub", email: adminUser.email },
+    });
+
+    const result = await validateExternalIdpToken(agent.id, FAKE_JWT);
+
+    expect(result).not.toBeNull();
+    expect(result?.isUserToken).toBe(true);
+    expect(result?.userId).toBe(adminUser.id);
+    expect(result?.isExternalIdp).toBe(true);
+    expect(result?.isOrganizationToken).toBe(false);
+    expect(result?.organizationId).toBe(org.id);
+    expect(result?.rawToken).toBe(FAKE_JWT);
+  });
+
+  test("grants access with permissionResource llmProxy for admin user", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeIdentityProvider,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const adminUser = await makeUser();
+    await makeMember(adminUser.id, org.id, { role: "admin" });
+
+    const idp = await makeIdentityProvider(org.id, {
+      oidcConfig: {
+        clientId: "test-client",
+        jwksEndpoint: "https://example.com/.well-known/jwks.json",
+      },
+    });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      identityProviderId: idp.id,
+    });
+
+    mockValidateJwt.mockResolvedValueOnce({
+      sub: "admin-sub",
+      email: adminUser.email,
+      name: adminUser.name,
+      rawClaims: { sub: "admin-sub", email: adminUser.email },
+    });
+
+    const result = await validateExternalIdpToken(
+      agent.id,
+      FAKE_JWT,
+      "llmProxy",
+    );
+
+    expect(result).not.toBeNull();
+    expect(result?.isUserToken).toBe(true);
+    expect(result?.userId).toBe(adminUser.id);
+    expect(result?.isExternalIdp).toBe(true);
+    expect(result?.organizationId).toBe(org.id);
+  });
+
+  test("grants access when user shares a team with the profile", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeTeam,
+    makeTeamMember,
+    makeIdentityProvider,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "member" });
+
+    const team = await makeTeam(org.id, user.id, { name: "Shared Team" });
+    await makeTeamMember(team.id, user.id);
+
+    const idp = await makeIdentityProvider(org.id, {
+      oidcConfig: {
+        clientId: "test-client",
+        jwksEndpoint: "https://example.com/.well-known/jwks.json",
+      },
+    });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      identityProviderId: idp.id,
+      access: { teams: [team.id] },
+    });
+
+    mockValidateJwt.mockResolvedValueOnce({
+      sub: "user-sub",
+      email: user.email,
+      name: user.name,
+      rawClaims: { sub: "user-sub", email: user.email },
+    });
+
+    const result = await validateExternalIdpToken(agent.id, FAKE_JWT);
+
+    expect(result).not.toBeNull();
+    expect(result?.isUserToken).toBe(true);
+    expect(result?.userId).toBe(user.id);
+    expect(result?.isExternalIdp).toBe(true);
+    expect(result?.isOrganizationToken).toBe(false);
+    expect(result?.organizationId).toBe(org.id);
+    expect(result?.teamId).toBeNull();
+  });
+
+  test("passes the identity provider's configured email claim to JWKS validation", async ({
+    makeOrganization,
+    makeIdentityProvider,
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    mockValidateJwt.mockClear();
+
+    const org = await makeOrganization();
+    const user = await makeUser({ email: "user@example.com" });
+    await makeMember(user.id, org.id, { role: "admin" });
+    const idp = await makeIdentityProvider(org.id, {
+      oidcConfig: {
+        clientId: "test-client",
+        jwksEndpoint: "https://example.com/.well-known/jwks.json",
+        mapping: { email: "https://example.com/email" },
+      },
+    });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      identityProviderId: idp.id,
+    });
+
+    mockValidateJwt.mockResolvedValueOnce({
+      sub: "auth-provider|user-1",
+      email: "user@example.com",
+      name: "Test User",
+      rawClaims: { sub: "auth-provider|user-1" },
+    });
+
+    const result = await validateExternalIdpToken(agent.id, FAKE_JWT);
+
+    expect(result?.userId).toBe(user.id);
+    expect(mockValidateJwt).toHaveBeenCalledWith(
+      expect.objectContaining({ emailClaim: "https://example.com/email" }),
+    );
+  });
+
+  test("does not treat a provider-namespaced subject as an email address", async ({
+    makeOrganization,
+    makeIdentityProvider,
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    // `google-apps|user@example.com` satisfies a naive email shape, so it used
+    // to be looked up verbatim — turning a missing email claim into a
+    // misleading "no matching user".
+    const org = await makeOrganization();
+    const user = await makeUser({ email: "user@example.com" });
+    await makeMember(user.id, org.id, { role: "admin" });
+    const idp = await makeIdentityProvider(org.id, {
+      oidcConfig: {
+        clientId: "test-client",
+        jwksEndpoint: "https://example.com/.well-known/jwks.json",
+      },
+    });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      identityProviderId: idp.id,
+    });
+
+    mockValidateJwt.mockResolvedValueOnce({
+      sub: "google-apps|user@example.com",
+      email: null,
+      name: null,
+      rawClaims: { sub: "google-apps|user@example.com" },
+    });
+
+    const outcome = await authenticateMCPGatewayRequest(agent.id, FAKE_JWT);
+
+    expect(outcome.result).toBeNull();
+    expect(outcome.reason).toBe("no_email_claim");
+  });
+
+  // An IdP-authenticated caller reaches a gateway through its grants and
+  // nothing else. A gateway with no teams used to read as organization-wide;
+  // that label is retired, so an empty grant list admits nobody but the
+  // administrators whose grant sits at `*`.
+  test("admits a gateway user through the gateway's use grant, never its retired scope", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeIdentityProvider,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "member" });
+    const idp = await makeIdentityProvider(org.id, {
+      oidcConfig: {
+        clientId: "test-client",
+        jwksEndpoint: "https://example.com/.well-known/jwks.json",
+      },
+    });
+    const gateway = await makeAgent({
+      organizationId: org.id,
+      agentType: "mcp_gateway",
+      identityProviderId: idp.id,
+    });
+    const key = {
+      organizationId: org.id,
+      resource: "mcpGateway" as const,
+      scope: gateway.id,
+    };
+    const policy = await ResourcePermissionPolicyModel.find(key);
+    const emptied = await ResourcePermissionPolicyModel.replace({
+      ...key,
+      revision: policy?.revision ?? 0,
+      grants: [],
+    });
+    const jwt = () =>
+      mockValidateJwt.mockResolvedValueOnce({
+        sub: "member-sub",
+        email: user.email,
+        name: user.name,
+        rawClaims: { sub: "member-sub", email: user.email },
+      });
+
+    jwt();
+    expect(await validateExternalIdpToken(gateway.id, FAKE_JWT)).toBeNull();
+
+    await ResourcePermissionPolicyModel.replace({
+      ...key,
+      revision: emptied?.revision ?? 0,
+      grants: [
+        { subject: { type: "user", id: user.id }, actions: ["read", "use"] },
+      ],
+    });
+    jwt();
+    expect((await validateExternalIdpToken(gateway.id, FAKE_JWT))?.userId).toBe(
+      user.id,
+    );
+  });
+
+  test("admits any member to the organization's LLM proxy and nobody to a retired proxy row", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeIdentityProvider,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const author = await makeUser();
+    const user = await makeUser();
+    await makeMember(author.id, org.id, { role: "member" });
+    await makeMember(user.id, org.id, { role: "member" });
+    const idp = await makeIdentityProvider(org.id, {
+      oidcConfig: {
+        clientId: "test-client",
+        jwksEndpoint: "https://example.com/.well-known/jwks.json",
+      },
+    });
+    // The retired scope says the opposite of the rule in both cases.
+    const proxy = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+      isDefault: true,
+      identityProviderId: idp.id,
+      access: "personal",
+      authorId: author.id,
+    });
+    const retired = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+      isDefault: false,
+      identityProviderId: idp.id,
+    });
+    const jwt = () =>
+      mockValidateJwt.mockResolvedValueOnce({
+        sub: "member-sub",
+        email: user.email,
+        name: user.name,
+        rawClaims: { sub: "member-sub", email: user.email },
+      });
+
+    jwt();
+    expect(
+      (await validateExternalIdpToken(proxy.id, FAKE_JWT, "llmProxy"))?.userId,
+    ).toBe(user.id);
+    jwt();
+    expect(
+      await validateExternalIdpToken(retired.id, FAKE_JWT, "llmProxy"),
+    ).toBeNull();
+  });
+});
+
+describe("authenticateMCPGatewayRequest failure reasons", () => {
+  const FAKE_JWT = "eyJhbGciOiJSUzI1NiJ9.fake.jwt";
+
+  test("reports that no identity provider is linked to the gateway", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent();
+
+    const outcome = await authenticateMCPGatewayRequest(agent.id, FAKE_JWT);
+
+    expect(outcome.reason).toBe("idp_not_linked");
+  });
+
+  test("reports a misconfigured identity provider when the client id is missing", async ({
+    makeOrganization,
+    makeIdentityProvider,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const idp = await makeIdentityProvider(org.id, {
+      oidcConfig: {
+        jwksEndpoint: "https://example.com/.well-known/jwks.json",
+      },
+    });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      identityProviderId: idp.id,
+    });
+
+    const outcome = await authenticateMCPGatewayRequest(agent.id, FAKE_JWT);
+
+    expect(outcome.reason).toBe("idp_misconfigured");
+  });
+
+  test("reports a missing email claim on an otherwise valid token", async ({
+    makeOrganization,
+    makeIdentityProvider,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const idp = await makeIdentityProvider(org.id, {
+      oidcConfig: {
+        clientId: "test-client",
+        jwksEndpoint: "https://example.com/.well-known/jwks.json",
+      },
+    });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      identityProviderId: idp.id,
+    });
+
+    mockValidateJwt.mockResolvedValueOnce({
+      sub: "user-123",
+      email: null,
+      name: null,
+      rawClaims: { sub: "user-123" },
+    });
+
+    const outcome = await authenticateMCPGatewayRequest(agent.id, FAKE_JWT);
+
+    expect(outcome.reason).toBe("no_email_claim");
+  });
+
+  test("reports an unknown user when the token's email matches nobody", async ({
+    makeOrganization,
+    makeIdentityProvider,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const idp = await makeIdentityProvider(org.id, {
+      oidcConfig: {
+        clientId: "test-client",
+        jwksEndpoint: "https://example.com/.well-known/jwks.json",
+      },
+    });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      identityProviderId: idp.id,
+    });
+
+    mockValidateJwt.mockResolvedValueOnce({
+      sub: "user-123",
+      email: "nobody@example.com",
+      name: null,
+      rawClaims: { sub: "user-123" },
+    });
+
+    const outcome = await authenticateMCPGatewayRequest(agent.id, FAKE_JWT);
+
+    expect(outcome.reason).toBe("unknown_user");
+  });
+
+  test("stays generic for a token that was never a JWKS candidate", async ({
+    makeAgent,
+  }) => {
+    // An opaque token most likely meant to be an OAuth token; an IdP-specific
+    // reason would send the caller down the wrong path.
+    const agent = await makeAgent();
+
+    const outcome = await authenticateMCPGatewayRequest(
+      agent.id,
+      "not-a-jwt-at-all",
+    );
+
+    expect(outcome.reason).toBe("invalid_token");
+  });
+});
+
+describe("createAgentServer tools/list", () => {
+  test("returns branded built-in tool names through the MCP tools/list handler", async ({
+    makeAgent,
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const agent = await makeAgent({ organizationId: org.id });
+
+    await ToolModel.syncArchestraBuiltInCatalog({
+      organization: {
+        appName: "Acme Control Plane",
+        iconLogo: null,
+      },
+    });
+    await ToolModel.assignArchestraToolsToAgent(
+      agent.id,
+      "00000000-0000-4000-8000-000000000001",
+    );
+
+    archestraMcpBranding.syncFromOrganization({
+      appName: "Acme Control Plane",
+      iconLogo: null,
+    });
+
+    const { server } = await createAgentServer({ agentId: agent.id });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+
+    expect(listToolsHandler).toBeDefined();
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+
+    expect(
+      response.tools.some((tool) =>
+        tool.name.startsWith("acme_control_plane__"),
+      ),
+    ).toBe(true);
+
+    archestraMcpBranding.syncFromOrganization(null);
+  });
+
+  test("lists an assigned tool only to callers who can access its MCP server", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeMember,
+    makeOrganization,
+    makeTeam,
+    makeTeamMember,
+    makeTool,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const admin = await makeUser();
+    const teamMember = await makeUser();
+    const outsider = await makeUser();
+    await makeMember(admin.id, org.id, { role: "admin" });
+    await makeMember(teamMember.id, org.id, { role: "member" });
+    await makeMember(outsider.id, org.id, { role: "member" });
+    const team = await makeTeam(org.id, admin.id);
+    await makeTeamMember(team.id, teamMember.id);
+
+    const gateway = await makeAgent({
+      organizationId: org.id,
+      agentType: "mcp_gateway",
+      toolExposureMode: "full",
+      access: "org",
+    });
+    const teamCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      authorId: admin.id,
+      access: { teams: [team.id] },
+    });
+    const orgCatalog = await makeInternalMcpCatalog({ organizationId: org.id });
+    const teamTool = await makeTool({
+      name: "team_server__lookup",
+      catalogId: teamCatalog.id,
+    });
+    const orgTool = await makeTool({
+      name: "org_server__lookup",
+      catalogId: orgCatalog.id,
+    });
+    await makeAgentTool(gateway.id, teamTool.id);
+    await makeAgentTool(gateway.id, orgTool.id);
+
+    const listFor = async (userId: string) => {
+      const { server } = await createAgentServer({
+        agentId: gateway.id,
+        tokenAuth: {
+          tokenId: crypto.randomUUID(),
+          teamId: null,
+          isOrganizationToken: false,
+          organizationId: org.id,
+          isUserToken: true,
+          userId,
+        },
+      });
+      const handler = (
+        server.server as unknown as {
+          _requestHandlers: Map<string, TestListToolsHandler>;
+        }
+      )._requestHandlers.get("tools/list");
+      if (!handler) throw new Error("Expected tools/list handler");
+      const response = await handler({ method: "tools/list", params: {} });
+      return response.tools.map((tool) => tool.name);
+    };
+
+    expect(await listFor(teamMember.id)).toEqual(
+      expect.arrayContaining([teamTool.name, orgTool.name]),
+    );
+    const outsiderTools = await listFor(outsider.id);
+    expect(outsiderTools).toContain(orgTool.name);
+    expect(outsiderTools).not.toContain(teamTool.name);
+  });
+
+  test("returns implicit search_tools and run_tool when toolExposureMode is search_and_run_only", async ({
+    makeAgent,
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const agent = await makeAgent({
+      organizationId: org.id,
+      toolExposureMode: "search_and_run_only",
+    });
+
+    const { server } = await createAgentServer({ agentId: agent.id });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+
+    expect(listToolsHandler).toBeDefined();
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+
+    expect(response.tools.map((tool) => tool.name).sort()).toEqual(
+      [
+        TOOL_ASK_USER_FULL_NAME,
+        TOOL_RUN_TOOL_FULL_NAME,
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+      ].sort(),
+    );
+    expect(
+      response.tools.every((tool) => tool.inputSchema?.type === "object"),
+    ).toBe(true);
+    expect(
+      response.tools.some((tool) => tool.name === TOOL_TODO_WRITE_FULL_NAME),
+    ).toBe(false);
+  });
+
+  test.for([
+    "agent",
+    "mcp_gateway",
+  ] as const)("%s keeps APPA session controls directly available", async (agentType, {
+    makeAgent,
+    makeMember,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const previousEnabled = config.openappa.enabled;
+    config.openappa.enabled = true;
+    await GuardrailsDeploymentModel.setEnabled(true);
+    onTestFinished(() => {
+      config.openappa.enabled = previousEnabled;
+    });
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      agentType,
+      toolExposureMode: "search_and_run_only",
+    });
+
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) throw new Error("Expected tools/list handler");
+
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    const names = response.tools.map((tool) => tool.name);
+
+    expect(names).toContain(
+      archestraMcpBranding.getToolName(TOOL_GET_REMEDY_PLANS_SHORT_NAME),
+    );
+    expect(names).toContain(
+      archestraMcpBranding.getToolName(TOOL_EXECUTE_REMEDY_PLAN_SHORT_NAME),
+    );
+    // A client that defers tools to a tool search must still declare
+    // OpenAPPA's session tools from its first request. The policy tools stay
+    // behind the search.
+    const alwaysLoaded = response.tools
+      .filter(
+        (tool) =>
+          (tool as { _meta?: Record<string, unknown> })._meta?.[
+            "anthropic/alwaysLoad"
+          ] === true,
+      )
+      .map((tool) => archestraMcpBranding.getToolShortName(tool.name))
+      .sort();
+    expect(alwaysLoaded).toEqual([
+      "ask_user",
+      "execute_remedy_plan",
+      "get_remedy_plans",
+      "list_peer_messages",
+      "read_peer_message",
+      "yell",
+    ]);
+    for (const inboxTool of [
+      "list_peer_messages",
+      "read_peer_message",
+    ] as const) {
+      expect(names).toContain(archestraMcpBranding.getToolName(inboxTool));
+    }
+    for (const policyTool of [
+      "get_guardrails_policy",
+      "list_guardrails_battery_fits",
+      "validate_guardrails_policy",
+      "preview_guardrails_policy_change",
+      "get_guardrails_policy_change_status",
+    ] as const) {
+      const policy = response.tools.find(
+        (tool) => tool.name === archestraMcpBranding.getToolName(policyTool),
+      );
+      if (agentType === "agent") {
+        expect(policy?.annotations).toMatchObject({ readOnlyHint: true });
+      } else {
+        expect(policy).toBeUndefined();
+      }
+    }
+    expect(names).not.toContain(
+      archestraMcpBranding.getToolName("update_guardrails_policy"),
+    );
+  });
+
+  test("keeps yell when an administrator turns break the glass off", async ({
+    makeAgent,
+    makeMember,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const previousEnabled = config.openappa.enabled;
+    config.openappa.enabled = true;
+    await GuardrailsDeploymentModel.set({
+      enabled: true,
+      breakTheGlassEnabled: false,
+    });
+    onTestFinished(() => {
+      config.openappa.enabled = previousEnabled;
+    });
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      agentType: "agent",
+      toolExposureMode: "search_and_run_only",
+    });
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) throw new Error("Expected tools/list handler");
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    const names = response.tools.map((tool) => tool.name);
+    expect(names).toContain(archestraMcpBranding.getToolName("yell"));
+  });
+
+  test("hides remedy tools while the deployment switch is off and still lists policy tools", async ({
+    makeAgent,
+    makeMember,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const previousEnabled = config.openappa.enabled;
+    config.openappa.enabled = true;
+    await GuardrailsDeploymentModel.setEnabled(false);
+    onTestFinished(() => {
+      config.openappa.enabled = previousEnabled;
+    });
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      agentType: "agent",
+      toolExposureMode: "search_and_run_only",
+    });
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) throw new Error("Expected tools/list handler");
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    const names = response.tools.map((tool) => tool.name);
+    expect(names).not.toContain(
+      archestraMcpBranding.getToolName(TOOL_GET_REMEDY_PLANS_SHORT_NAME),
+    );
+    expect(names).not.toContain(
+      archestraMcpBranding.getToolName(TOOL_EXECUTE_REMEDY_PLAN_SHORT_NAME),
+    );
+    for (const inboxTool of [
+      "list_peer_messages",
+      "read_peer_message",
+    ] as const) {
+      expect(names).not.toContain(archestraMcpBranding.getToolName(inboxTool));
+    }
+    expect(names).toContain(
+      archestraMcpBranding.getToolName("get_guardrails_policy"),
+    );
+
+    await GuardrailsDeploymentModel.setEnabled(true);
+    const { server: enabledServer } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const enabledList = (
+      enabledServer.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!enabledList) throw new Error("Expected tools/list handler");
+    const enabled = await enabledList({ method: "tools/list", params: {} });
+    const enabledNames = enabled.tools.map((tool) => tool.name);
+    expect(enabledNames).toContain(
+      archestraMcpBranding.getToolName(TOOL_GET_REMEDY_PLANS_SHORT_NAME),
+    );
+    expect(enabledNames).toContain(
+      archestraMcpBranding.getToolName(TOOL_EXECUTE_REMEDY_PLAN_SHORT_NAME),
+    );
+    for (const inboxTool of [
+      "list_peer_messages",
+      "read_peer_message",
+    ] as const) {
+      expect(enabledNames).toContain(
+        archestraMcpBranding.getToolName(inboxTool),
+      );
+    }
+  });
+
+  test("refuses remedy and inbox tools when the deployment switch is off", async ({
+    makeAgent,
+    makeOrganization,
+  }) => {
+    const previousEnabled = config.openappa.enabled;
+    config.openappa.enabled = true;
+    await GuardrailsDeploymentModel.setEnabled(false);
+    onTestFinished(() => {
+      config.openappa.enabled = previousEnabled;
+    });
+    const org = await makeOrganization();
+    const agent = await makeAgent({ organizationId: org.id });
+    const { server } = await createAgentServer({ agentId: agent.id });
+    const handler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestCallToolHandler>;
+      }
+    )._requestHandlers.get("tools/call");
+    if (!handler) throw new Error("Expected tools/call handler");
+    for (const name of [
+      archestraMcpBranding.getToolName(TOOL_GET_REMEDY_PLANS_SHORT_NAME),
+      archestraMcpBranding.getToolName(TOOL_EXECUTE_REMEDY_PLAN_SHORT_NAME),
+      archestraMcpBranding.getToolName("list_peer_messages"),
+      archestraMcpBranding.getToolName("read_peer_message"),
+    ]) {
+      await expect(
+        handler(
+          {
+            method: "tools/call",
+            params: {
+              name,
+              arguments: { ruling: "Blocked." },
+            },
+          },
+          { sendRequest: vi.fn() },
+        ),
+      ).rejects.toMatchObject({
+        code: -32601,
+        message: "Guardrails v2 is disabled",
+      });
+    }
+  });
+
+  test("assigned read-only policy tool keeps its annotation without marking writes safe", async ({
+    makeAgent,
+    makeMember,
+    makeOrganization,
+    makeUser,
+    seedAndAssignArchestraTools,
+  }) => {
+    const previousEnabled = config.openappa.enabled;
+    config.openappa.enabled = true;
+    onTestFinished(() => {
+      config.openappa.enabled = previousEnabled;
+    });
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const gateway = await makeAgent({
+      organizationId: org.id,
+      agentType: "mcp_gateway",
+      toolExposureMode: "full",
+    });
+    await seedAndAssignArchestraTools(gateway.id);
+    const { server } = await createAgentServer({
+      agentId: gateway.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const handler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!handler) throw new Error("Expected tools/list handler");
+    const response = await handler({ method: "tools/list", params: {} });
+    expect(
+      response.tools.find(
+        (tool) =>
+          tool.name ===
+          archestraMcpBranding.getToolName("get_guardrails_policy"),
+      )?.annotations,
+    ).toMatchObject({ readOnlyHint: true });
+    expect(
+      response.tools.find(
+        (tool) =>
+          tool.name ===
+          archestraMcpBranding.getToolName("update_guardrails_policy"),
+      )?.annotations?.readOnlyHint,
+    ).not.toBe(true);
+  });
+
+  test.for([
+    null,
+    "Example Workspace",
+  ])("a client discovers branded handoff and existing-session controls (%s)", async (appName, {
+    makeAgent,
+    makeMember,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const sandboxInstalled = vi
+      .spyOn(agentSandboxApi, "isInstalled", "get")
+      .mockReturnValue(true);
+    onTestFinished(() => {
+      sandboxInstalled.mockRestore();
+      archestraMcpBranding.syncFromOrganization(null);
+    });
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      agentType: "mcp_gateway",
+      toolExposureMode: "search_and_run_only",
+    });
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const handlers = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers;
+    archestraMcpBranding.syncFromOrganization({ appName, iconLogo: null });
+    const list = handlers.get("tools/list");
+    if (!list) throw new Error("Missing tool list handler");
+    const response = await list({ method: "tools/list", params: {} });
+    const names = response.tools.map((tool) => tool.name);
+    const controlNames = (
+      [
+        "get_agent_run",
+        "list_agent_runs",
+        "steer_agent_run",
+        "cancel_agent_run",
+      ] as const
+    ).map((name) => archestraMcpBranding.getToolName(name));
+    for (const name of controlNames) expect(names).not.toContain(name);
+    const found = await executeArchestraTool(
+      archestraMcpBranding.getToolName("search_tools"),
+      {
+        query:
+          "(get_agent_run|list_agent_runs|steer_agent_run|cancel_agent_run)$",
+        mode: "regex",
+      },
+      {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      },
+    );
+    expect(found.isError).not.toBe(true);
+    expect(
+      (found.structuredContent as { tools: { toolName: string }[] }).tools
+        .map((tool) => tool.toolName)
+        .sort(),
+    ).toEqual(controlNames.sort());
+    expect(names).not.toContain(
+      archestraMcpBranding.getToolName("start_agent_run"),
+    );
+    const discovery = response.tools.find(
+      (tool) => tool.name === archestraMcpBranding.getToolName("search_tools"),
+    );
+    expect(discovery?.description).toContain(
+      `hand this work over to ${appName ?? archestraMcpBranding.appName}`,
+    );
+    expect(discovery?.description).toContain(
+      `spin this up in ${appName ?? archestraMcpBranding.appName}`,
+    );
+    expect(discovery?.description).toContain("resume locally");
+  });
+
+  test("defers task controls when the gateway can start delegated tasks", async ({
+    makeAgent,
+    makeAgentTool,
+    makeMember,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      toolExposureMode: "search_and_run_only",
+    });
+    const targetAgent = await makeAgent({ organizationId: org.id });
+    const delegationTool = await ToolModel.findOrCreateDelegationTool(
+      targetAgent.id,
+    );
+    await makeAgentTool(agent.id, delegationTool.id);
+
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    const names = new Set(response.tools.map((tool) => tool.name));
+
+    expect(names).toEqual(
+      new Set([
+        TOOL_ASK_USER_FULL_NAME,
+        TOOL_RUN_TOOL_FULL_NAME,
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+      ]),
+    );
+  });
+
+  test.for([
+    "agent",
+    "mcp_gateway",
+  ] as const)("%s keeps its skill and runtime exposure consistent", async (agentType, {
+    makeAgent,
+    makeMember,
+    makeOrganization,
+    makeUser,
+    seedAndAssignArchestraTools,
+  }) => {
+    const org = await makeOrganization();
+    const adminUser = await makeUser();
+    await makeMember(adminUser.id, org.id, { role: "admin" });
+    const config = (await import("@/config")).default;
+    const originalSandboxEnabled = config.skillsSandbox.enabled;
+    (config.skillsSandbox as { enabled: boolean }).enabled = true;
+
+    try {
+      const agent = await makeAgent({
+        organizationId: org.id,
+        agentType,
+        toolExposureMode: "search_and_run_only",
+      });
+      await seedAndAssignArchestraTools(agent.id);
+
+      const { server } = await createAgentServer({
+        agentId: agent.id,
+        tokenAuth: {
+          tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+          teamId: null,
+          isOrganizationToken: false,
+          organizationId: org.id,
+          isUserToken: true,
+          userId: adminUser.id,
+        },
+      });
+      const listToolsHandler = (
+        server.server as unknown as {
+          _requestHandlers: Map<string, TestListToolsHandler>;
+        }
+      )._requestHandlers.get("tools/list");
+
+      expect(listToolsHandler).toBeDefined();
+      if (!listToolsHandler) {
+        throw new Error("Expected tools/list handler to be registered");
+      }
+
+      const response = await listToolsHandler({
+        method: "tools/list",
+        params: {},
+      });
+      const names = new Set(response.tools.map((tool) => tool.name));
+
+      // Session primitives remain directly available on both surfaces.
+      for (const exposed of [
+        TOOL_ASK_USER_FULL_NAME,
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        TOOL_RUN_TOOL_FULL_NAME,
+      ]) {
+        expect(names.has(exposed)).toBe(true);
+      }
+      for (const runtimeTool of [
+        TOOL_LIST_SKILLS_FULL_NAME,
+        TOOL_LOAD_SKILL_FULL_NAME,
+        TOOL_RUN_COMMAND_FULL_NAME,
+        TOOL_DOWNLOAD_FILE_FULL_NAME,
+        TOOL_UPLOAD_FILE_FULL_NAME,
+        TOOL_GET_AGENT_RUN_FULL_NAME,
+        TOOL_LIST_AGENT_RUNS_FULL_NAME,
+        TOOL_STEER_AGENT_RUN_FULL_NAME,
+        TOOL_CANCEL_AGENT_RUN_FULL_NAME,
+        TOOL_POST_AGENT_RUN_MESSAGE_FULL_NAME,
+      ]) {
+        expect(names.has(runtimeTool)).toBe(agentType === "agent");
+      }
+      // authoring + unrelated tools remain hidden behind search_tools/run_tool
+      for (const hidden of [
+        TOOL_CREATE_SKILL_FULL_NAME,
+        TOOL_UPDATE_SKILL_FULL_NAME,
+        TOOL_WHOAMI_FULL_NAME,
+      ]) {
+        expect(names.has(hidden)).toBe(false);
+      }
+    } finally {
+      (config.skillsSandbox as { enabled: boolean }).enabled =
+        originalSandboxEnabled;
+    }
+  });
+
+  test("keeps a UI-providing tool top-level in search_and_run_only, hides a non-UI sibling", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeOrganization,
+    makeTool,
+    makeUser,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      toolExposureMode: "search_and_run_only",
+    });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "bug-tracker",
+    });
+    const uiResourceUri = "ui://archestra-app/bug-tracker";
+    const uiTool = await makeTool({
+      catalogId: catalog.id,
+      name: "bug_tracker__open",
+      parameters: { type: "object", properties: {} },
+      meta: { _meta: { ui: { resourceUri: uiResourceUri } } },
+    });
+    const plainTool = await makeTool({
+      catalogId: catalog.id,
+      name: "bug_tracker__list",
+      parameters: { type: "object", properties: {} },
+    });
+    await makeAgentTool(agent.id, uiTool.id);
+    await makeAgentTool(agent.id, plainTool.id);
+
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+
+    expect(listToolsHandler).toBeDefined();
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    const byName = new Map(response.tools.map((tool) => [tool.name, tool]));
+
+    // The UI tool must stay directly listed so an MCP Apps host can render it,
+    // carrying its ui:// resource; the non-UI sibling stays behind search/run.
+    expect(byName.has("bug_tracker__open")).toBe(true);
+    expect(
+      (
+        byName.get("bug_tracker__open")?._meta as
+          | { ui?: { resourceUri?: string } }
+          | undefined
+      )?.ui?.resourceUri,
+    ).toBe(uiResourceUri);
+    expect(byName.has("bug_tracker__list")).toBe(false);
+  });
+
+  test("chat agent does NOT advertise an assigned UI tool in search_and_run_only", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeOrganization,
+    makeTool,
+    makeUser,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    // The chat counterpart of the gateway test above: a chat agent renders an
+    // app from the tool RESULT (render_app / run_tool), so an assigned UI tool
+    // must NOT be advertised — the list stays meta + always-exposed set.
+    const agent = await makeAgent({
+      organizationId: org.id,
+      agentType: "agent",
+      toolExposureMode: "search_and_run_only",
+    });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "bug-tracker",
+    });
+    const uiTool = await makeTool({
+      catalogId: catalog.id,
+      name: "bug_tracker__open",
+      parameters: { type: "object", properties: {} },
+      meta: {
+        _meta: { ui: { resourceUri: "ui://archestra-app/bug-tracker" } },
+      },
+    });
+    await makeAgentTool(agent.id, uiTool.id);
+
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    const names = new Set(response.tools.map((tool) => tool.name));
+    // The assigned UI tool is reachable via search_tools/run_tool, not advertised.
+    expect(names.has("bug_tracker__open")).toBe(false);
+    // The meta tools stay — the model reaches the UI tool through them.
+    expect(names.has("archestra__search_tools")).toBe(true);
+    expect(names.has("archestra__run_tool")).toBe(true);
+  });
+
+  // The realistic auto-mode matrix, both surfaces, for a DYNAMICALLY-reached
+  // (unassigned, accessAllTools) UI tool in search_and_run_only: NEITHER
+  // surface advertises it. The reachable set in Auto mode is the caller's whole
+  // accessible corpus, so no tool class may widen the list — the model finds
+  // the tool with search_tools and dispatches it with run_tool.
+  for (const surface of [
+    { agentType: "agent" as const, advertised: false },
+    { agentType: "mcp_gateway" as const, advertised: false },
+  ]) {
+    test(`${surface.agentType} does NOT advertise a dynamically-reached UI tool in search_and_run_only`, async ({
+      makeAgent,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+      makeOrganization,
+      makeTool,
+      makeUser,
+      makeMember,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({
+        organizationId: org.id,
+        agentType: surface.agentType,
+        accessAllTools: true,
+        toolExposureMode: "search_and_run_only",
+      });
+      const catalog = await makeInternalMcpCatalog({
+        organizationId: org.id,
+        name: "bug-tracker",
+        serverType: "remote",
+      });
+      await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+      // Not assigned — reached only through accessAllTools dynamic access.
+      await makeTool({
+        catalogId: catalog.id,
+        name: "bug_tracker__open",
+        parameters: { type: "object", properties: {} },
+        meta: {
+          _meta: { ui: { resourceUri: "ui://archestra-app/bug-tracker" } },
+        },
+      });
+
+      const { server } = await createAgentServer({
+        agentId: agent.id,
+        tokenAuth: {
+          tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+          teamId: null,
+          isOrganizationToken: false,
+          organizationId: org.id,
+          isUserToken: true,
+          userId: user.id,
+        },
+      });
+      const listToolsHandler = (
+        server.server as unknown as {
+          _requestHandlers: Map<string, TestListToolsHandler>;
+        }
+      )._requestHandlers.get("tools/list");
+      if (!listToolsHandler) {
+        throw new Error("Expected tools/list handler to be registered");
+      }
+      const response = await listToolsHandler({
+        method: "tools/list",
+        params: {},
+      });
+      const names = new Set(response.tools.map((tool) => tool.name));
+      expect(names.has("bug_tracker__open")).toBe(surface.advertised);
+    });
+  }
+
+  test("derives an assigned app launch tool's description from the catalog name, not the raw stored value", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeOrganization,
+    makeTool,
+    makeUser,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    // Custom tool mode (accessAllTools off): the agent advertises the tools it
+    // assigns, which is where a launch tool's label is model-visible at all.
+    const agent = await makeAgent({
+      organizationId: org.id,
+      agentType: "mcp_gateway",
+    });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "PizzaTracker",
+      serverType: "app",
+    });
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    // A raw (pre-sanitization) stored description must never reach the model:
+    // both the title and the description resolve from the backing catalog name,
+    // sanitized, rather than from the stored value.
+    const launchTool = await makeTool({
+      catalogId: catalog.id,
+      name: "pizzatracker__open",
+      description: "INJECTED_SENTINEL ![x](http://evil/a.png)",
+      parameters: { type: "object", properties: {} },
+      meta: {
+        _meta: { ui: { resourceUri: "ui://archestra-app/pizzatracker" } },
+      },
+    });
+    await makeAgentTool(agent.id, launchTool.id);
+
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    const launch = response.tools.find(
+      (tool) => tool.name === "pizzatracker__open",
+    );
+    expect(launch).toBeDefined();
+    const launchDescription = takeLeadingAttestation(launch?.description ?? "");
+    expect(launchDescription.marker).toBeDefined();
+    expect(launchDescription.rest).toBe(
+      'Open the "PizzaTracker" app and render its UI.',
+    );
+    expect(launch?.description).not.toContain("INJECTED_SENTINEL");
+  });
+
+  // The contract Auto tool mode advertises to the user: "tools are discovered on
+  // demand — the catalog never burns context tokens". A gateway in Auto mode
+  // therefore lists exactly the two Auto tools, no matter how many tools, of
+  // whatever class, the caller can reach. Seeds one of every class that
+  // contributes to the candidate pool, so a new tool source that skips the
+  // exposure filter fails here rather than shipping a hundred-tool listing.
+  test("Auto mode advertises exactly the two Auto tools, whatever classes are reachable", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeOrganization,
+    makeTool,
+    makeUser,
+    makeMember,
+  }) => {
+    const sandboxInstalled = vi
+      .spyOn(agentSandboxApi, "isInstalled", "get")
+      .mockReturnValue(false);
+    onTestFinished(() => sandboxInstalled.mockRestore());
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      accessAllTools: true,
+      agentType: "mcp_gateway",
+    });
+
+    // Class 1: an Archestra App's UI-providing launch tool.
+    const appCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "bug-tracker",
+      serverType: "app",
+    });
+    await makeMcpServer({ catalogId: appCatalog.id, scope: "org" });
+    await makeTool({
+      catalogId: appCatalog.id,
+      name: "bug_tracker__open",
+      parameters: { type: "object", properties: {} },
+      meta: {
+        _meta: { ui: { resourceUri: "ui://archestra-app/bug-tracker" } },
+      },
+    });
+
+    // Class 2: a remote third-party server's UI-providing tool, plus a non-UI
+    // sibling — neither assigned, both reachable through Auto mode.
+    const remoteCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "maps",
+      serverType: "remote",
+    });
+    await makeMcpServer({ catalogId: remoteCatalog.id, scope: "org" });
+    await makeTool({
+      catalogId: remoteCatalog.id,
+      name: "maps__show",
+      parameters: { type: "object", properties: {} },
+      meta: { _meta: { ui: { resourceUri: "ui://maps/show" } } },
+    });
+    await makeTool({
+      catalogId: remoteCatalog.id,
+      name: "maps__geocode",
+      parameters: { type: "object", properties: {} },
+    });
+
+    // Class 3: a plain catalog tool that IS assigned to the agent — a leftover
+    // assignment must not re-open the listing an Auto-mode agent promises to
+    // keep empty.
+    const assignedCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "weather",
+      serverType: "remote",
+    });
+    await makeMcpServer({ catalogId: assignedCatalog.id, scope: "org" });
+    const assignedUiTool = await makeTool({
+      catalogId: assignedCatalog.id,
+      name: "weather__open",
+      parameters: { type: "object", properties: {} },
+      meta: { _meta: { ui: { resourceUri: "ui://weather/open" } } },
+    });
+    await makeAgentTool(agent.id, assignedUiTool.id);
+
+    // Class 4: a reachable UI tool the operator explicitly disabled for this
+    // gateway. Exclusion enforcement itself is covered by the exclusions suite;
+    // here it must simply never appear.
+    const excludedTool = await makeTool({
+      catalogId: appCatalog.id,
+      name: "bug_tracker__open_excluded",
+      parameters: { type: "object", properties: {} },
+      meta: { _meta: { ui: { resourceUri: "ui://archestra-app/excluded" } } },
+    });
+    const { agentToolExclusionsService } = await import(
+      "@/services/agent-tool-exclusions"
+    );
+    await agentToolExclusionsService.replaceExclusions({
+      agentId: agent.id,
+      organizationId: org.id,
+      excludedToolIds: [excludedTool.id],
+    });
+
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    // Exactly the discovery/dispatch pair — asserted as the whole list, so any
+    // extra tool of any class fails regardless of which path contributed it.
+    expect(response.tools.map((tool) => tool.name).sort()).toEqual([
+      "archestra__ask_user",
+      "archestra__run_tool",
+      "archestra__search_tools",
+    ]);
+  });
+
+  test("chat agent does not advertise an owned-app launch tool reached via dynamic access", async ({
+    makeAgent,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeOrganization,
+    makeTool,
+    makeUser,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    // agentType "agent" is the internal chat surface, which opens owned apps
+    // via render_app, so their launch tools must not bloat its list.
+    const agent = await makeAgent({
+      organizationId: org.id,
+      accessAllTools: true,
+      agentType: "agent",
+    });
+    const appCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "get-time",
+      serverType: "app",
+    });
+    await makeMcpServer({ catalogId: appCatalog.id, scope: "org" });
+    // Unassigned owned-app launch tool — reachable only through dynamic access.
+    await makeTool({
+      catalogId: appCatalog.id,
+      name: "get_time__open",
+      parameters: { type: "object", properties: {} },
+      meta: { _meta: { ui: { resourceUri: "ui://archestra-app/get-time" } } },
+    });
+
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    const names = new Set(response.tools.map((tool) => tool.name));
+    // Not advertised — a chat agent opens owned apps via render_app.
+    expect(names.has("get_time__open")).toBe(false);
+  });
+
+  test("external UI-providing tool is dropped in chat but kept on the gateway", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeOrganization,
+    makeTool,
+    makeUser,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    // An external (serverType remote) UI-providing tool, ASSIGNED to the agent:
+    // the surface split applies to the bounded set an operator configured, not
+    // to whatever Auto mode can reach.
+    const extCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "maps",
+      serverType: "remote",
+    });
+    await makeMcpServer({ catalogId: extCatalog.id, scope: "org" });
+    const uiTool = await makeTool({
+      catalogId: extCatalog.id,
+      name: "maps__show",
+      parameters: { type: "object", properties: {} },
+      meta: { _meta: { ui: { resourceUri: "ui://maps/show" } } },
+    });
+
+    const listNames = async (agentType: "agent" | "mcp_gateway") => {
+      const agent = await makeAgent({
+        organizationId: org.id,
+        toolExposureMode: "search_and_run_only",
+        agentType,
+      });
+      await makeAgentTool(agent.id, uiTool.id);
+      const { server } = await createAgentServer({
+        agentId: agent.id,
+        tokenAuth: {
+          tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+          teamId: null,
+          isOrganizationToken: false,
+          organizationId: org.id,
+          isUserToken: true,
+          userId: user.id,
+        },
+      });
+      const handler = (
+        server.server as unknown as {
+          _requestHandlers: Map<string, TestListToolsHandler>;
+        }
+      )._requestHandlers.get("tools/list");
+      if (!handler)
+        throw new Error("Expected tools/list handler to be registered");
+      const response = await handler({ method: "tools/list", params: {} });
+      return new Set(response.tools.map((tool) => tool.name));
+    };
+
+    // Chat resolves any UI tool's ui:// resource from its own catalog when the
+    // model invokes it (run_tool), so it need not advertise the UI tool.
+    expect((await listNames("agent")).has("maps__show")).toBe(false);
+    // An external MCP client on the gateway discovers UI-providing tools only
+    // from tools/list, so the gateway must keep advertising the assigned one.
+    expect((await listNames("mcp_gateway")).has("maps__show")).toBe(true);
+  });
+
+  test("chat agent in search_and_run_only does NOT advertise an assigned owned-app launch tool", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeOrganization,
+    makeTool,
+    makeUser,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    // accessAllTools forces search_and_run_only. Assignment does not change the
+    // chat rule: a UI tool is opened via render_app/run_tool from the result, so
+    // even an explicitly-assigned launch tool is not advertised here.
+    const agent = await makeAgent({
+      organizationId: org.id,
+      accessAllTools: true,
+      agentType: "agent",
+    });
+    const appCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "todo",
+      serverType: "app",
+    });
+    await makeMcpServer({ catalogId: appCatalog.id, scope: "org" });
+    const openTool = await makeTool({
+      catalogId: appCatalog.id,
+      name: "todo__open",
+      parameters: { type: "object", properties: {} },
+      meta: { _meta: { ui: { resourceUri: "ui://archestra-app/todo" } } },
+    });
+    await makeAgentTool(agent.id, openTool.id);
+
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    const names = new Set(response.tools.map((tool) => tool.name));
+    expect(names.has("todo__open")).toBe(false);
+  });
+
+  test("chat agent in full mode DOES advertise an assigned owned-app launch tool", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeOrganization,
+    makeTool,
+    makeUser,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    // The other half of the chat matrix: in full mode (custom tool selection,
+    // accessAllTools off) every assigned tool is advertised, a UI tool included;
+    // the search_and_run_only compaction does not apply here.
+    const agent = await makeAgent({
+      organizationId: org.id,
+      accessAllTools: false,
+      toolExposureMode: "full",
+      agentType: "agent",
+    });
+    const appCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "todo",
+      serverType: "app",
+    });
+    await makeMcpServer({ catalogId: appCatalog.id, scope: "org" });
+    const openTool = await makeTool({
+      catalogId: appCatalog.id,
+      name: "todo__open",
+      parameters: { type: "object", properties: {} },
+      meta: { _meta: { ui: { resourceUri: "ui://archestra-app/todo" } } },
+    });
+    await makeAgentTool(agent.id, openTool.id);
+
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    const names = new Set(response.tools.map((tool) => tool.name));
+    expect(names.has("todo__open")).toBe(true);
+  });
+
+  test("full mode lists a UI-providing tool with its resource", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeOrganization,
+    makeTool,
+    makeUser,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      toolExposureMode: "full",
+      organizationId: org.id,
+    });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "bug-tracker",
+    });
+    const uiResourceUri = "ui://archestra-app/bug-tracker";
+    const uiTool = await makeTool({
+      catalogId: catalog.id,
+      name: "bug_tracker__open",
+      parameters: { type: "object", properties: {} },
+      meta: { _meta: { ui: { resourceUri: uiResourceUri } } },
+    });
+    await makeAgentTool(agent.id, uiTool.id);
+
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    const openTool = response.tools.find(
+      (tool) => tool.name === "bug_tracker__open",
+    );
+    expect(openTool).toBeDefined();
+    expect(
+      (openTool?._meta as { ui?: { resourceUri?: string } } | undefined)?.ui
+        ?.resourceUri,
+    ).toBe(uiResourceUri);
+  });
+
+  test("lists an assigned legacy flat ui/resourceUri tool top-level", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeOrganization,
+    makeTool,
+    makeUser,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      toolExposureMode: "search_and_run_only",
+    });
+    // Exercises the in-memory providesUiResource gate's legacy fallback. Its
+    // SQL counterpart (toolUiResourceUriSql) is covered where that predicate is
+    // still used — resolving tools by resource URI, see models/tool.test.ts and
+    // models/mcp-server.test.ts.
+    const assignedCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "legacy-assigned",
+    });
+    const assignedTool = await makeTool({
+      catalogId: assignedCatalog.id,
+      name: "legacy_assigned__open",
+      parameters: { type: "object", properties: {} },
+      meta: { _meta: { "ui/resourceUri": "ui://legacy/assigned.html" } },
+    });
+    await makeAgentTool(agent.id, assignedTool.id);
+
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    const names = new Set(response.tools.map((tool) => tool.name));
+    expect(names.has("legacy_assigned__open")).toBe(true);
+  });
+
+  test("does not expose a tool whose resourceUri is not ui://, unless a valid legacy key backs it", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeOrganization,
+    makeTool,
+  }) => {
+    const org = await makeOrganization();
+    const agent = await makeAgent({
+      organizationId: org.id,
+      toolExposureMode: "search_and_run_only",
+    });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "bug-tracker",
+    });
+    // Non-ui:// scheme in the canonical key: not an MCP App resource, must
+    // stay behind search/run.
+    const httpsTool = await makeTool({
+      catalogId: catalog.id,
+      name: "bug_tracker__https_only",
+      parameters: { type: "object", properties: {} },
+      meta: {
+        _meta: { ui: { resourceUri: "https://example.com/not-an-app" } },
+      },
+    });
+    // Invalid canonical + valid legacy: the keys are checked independently, so
+    // the bad canonical value must not mask the working legacy one.
+    const maskedLegacyTool = await makeTool({
+      catalogId: catalog.id,
+      name: "bug_tracker__masked_legacy",
+      parameters: { type: "object", properties: {} },
+      meta: {
+        _meta: {
+          ui: { resourceUri: "https://example.com/not-an-app" },
+          "ui/resourceUri": "ui://legacy/real.html",
+        },
+      },
+    });
+    await makeAgentTool(agent.id, httpsTool.id);
+    await makeAgentTool(agent.id, maskedLegacyTool.id);
+
+    const { server } = await createAgentServer({ agentId: agent.id });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    const names = new Set(response.tools.map((tool) => tool.name));
+    expect(names.has("bug_tracker__https_only")).toBe(false);
+    expect(names.has("bug_tracker__masked_legacy")).toBe(true);
+  });
+
+  test("does not widen tools/list for an all-tools agent when the caller has no user context", async ({
+    makeAgent,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeOrganization,
+    makeTool,
+  }) => {
+    const org = await makeOrganization();
+    const agent = await makeAgent({
+      organizationId: org.id,
+      accessAllTools: true,
+    });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "bug-tracker",
+    });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "bug_tracker__open",
+      parameters: { type: "object", properties: {} },
+      meta: {
+        _meta: { ui: { resourceUri: "ui://archestra-app/bug-tracker" } },
+      },
+    });
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+
+    // No tokenAuth: dynamic access is user-scoped, so without a user there is
+    // no accessible-tool set to widen from — the listing must succeed with the
+    // tool absent, not throw.
+    const { server } = await createAgentServer({ agentId: agent.id });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    expect(
+      response.tools.some((tool) => tool.name === "bug_tracker__open"),
+    ).toBe(false);
+  });
+
+  // Pins the security boundary the exposure mode must not cross:
+  // search_and_run_only is used, independent of accessAllTools, to hide an
+  // agent's own assigned tools behind search/run for context-window management.
+  // Such an agent must NOT gain reach to unassigned tools org-wide — dynamic
+  // reach is keyed strictly on accessAllTools, not toolExposureMode.
+  test("does not widen tools/list for a search_and_run_only agent without accessAllTools", async ({
+    makeAgent,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeOrganization,
+    makeTool,
+    makeUser,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      toolExposureMode: "search_and_run_only",
+      accessAllTools: false,
+    });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "bug-tracker",
+    });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "bug_tracker__open",
+      parameters: { type: "object", properties: {} },
+      meta: {
+        _meta: { ui: { resourceUri: "ui://archestra-app/bug-tracker" } },
+      },
+    });
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    expect(
+      response.tools.some((tool) => tool.name === "bug_tracker__open"),
+    ).toBe(false);
+  });
+
+  // A tool the dynamicUiTools widening lists top-level must also be directly
+  // callable, not just discoverable: executeToolCallForOwner only resolves an
+  // unassigned tool via a pre-resolved availableTool, which the gateway's
+  // tools/call handler must supply itself (run_tool's own dispatch does this
+  // already, but a spec-compliant host calls the listed tool directly, never
+  // through run_tool).
+  test("directly calls an unassigned tool discovered by an all-tools agent", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeOrganization,
+    makeTool,
+    makeUser,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      accessAllTools: true,
+    });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "bug-tracker",
+    });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "bug_tracker__open",
+      parameters: { type: "object", properties: {} },
+      meta: {
+        _meta: { ui: { resourceUri: "ui://archestra-app/bug-tracker" } },
+      },
+    });
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    // The agent must have at least one ASSIGNED tool: the invocation-policy
+    // gate's enabled-tools filter only activates when the assigned set is
+    // non-empty (a real gateway agent always has the archestra built-ins
+    // assigned). With an empty set the filter is skipped entirely and this
+    // test cannot catch the gate refusing the dynamic tool as "disabled".
+    const assignedDistractor = await makeTool({
+      catalogId: catalog.id,
+      name: "bug_tracker__assigned_distractor",
+      parameters: { type: "object", properties: {} },
+    });
+    await makeAgentTool(agent.id, assignedDistractor.id);
+
+    const executeToolCallForOwnerSpy = vi
+      .spyOn(mcpClient, "executeToolCallForOwner")
+      .mockResolvedValueOnce({
+        id: "call_123",
+        name: "bug_tracker__open",
+        content: [{ type: "text", text: "Opening Bug Tracker." }],
+        isError: false,
+      });
+
+    try {
+      const { server } = await createAgentServer({
+        agentId: agent.id,
+        tokenAuth: {
+          tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+          teamId: null,
+          isOrganizationToken: false,
+          organizationId: org.id,
+          isUserToken: true,
+          userId: user.id,
+        },
+      });
+      const callToolHandler = (
+        server.server as unknown as {
+          _requestHandlers: Map<string, TestCallToolHandler>;
+        }
+      )._requestHandlers.get("tools/call");
+      if (!callToolHandler) {
+        throw new Error("Expected tools/call handler to be registered");
+      }
+
+      const response = await callToolHandler(
+        {
+          method: "tools/call",
+          params: { name: "bug_tracker__open", arguments: {} },
+        },
+        { sendRequest: vi.fn() },
+      );
+
+      expect(response.isError).not.toBe(true);
+      expect(executeToolCallForOwnerSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "bug_tracker__open" }),
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({
+          availableTool: expect.objectContaining({
+            name: "bug_tracker__open",
+          }),
+        }),
+      );
+    } finally {
+      executeToolCallForOwnerSpy.mockRestore();
+    }
+  });
+
+  // Direct-call availability must equal tools/list exposure: the widening
+  // lists only UI-providing dynamic tools, so a NON-UI unassigned tool — kept
+  // behind search_tools/run_tool by design — must stay refused when named
+  // directly, not become executable as a side effect of the dynamic
+  // resolution. run_tool remains its only path.
+  test("refuses a direct call to a non-UI unassigned tool even for an all-tools agent", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeOrganization,
+    makeTool,
+    makeUser,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      accessAllTools: true,
+    });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "bug-tracker",
+    });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "bug_tracker__list",
+      parameters: { type: "object", properties: {} },
+    });
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    // Non-empty assigned set so the enabled-tools filter is active (the real
+    // gateway shape), same as the positive test above.
+    const assignedDistractor = await makeTool({
+      catalogId: catalog.id,
+      name: "bug_tracker__assigned_distractor2",
+      parameters: { type: "object", properties: {} },
+    });
+    await makeAgentTool(agent.id, assignedDistractor.id);
+
+    const executeToolCallForOwnerSpy = vi.spyOn(
+      mcpClient,
+      "executeToolCallForOwner",
+    );
+
+    try {
+      const { server } = await createAgentServer({
+        agentId: agent.id,
+        tokenAuth: {
+          tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+          teamId: null,
+          isOrganizationToken: false,
+          organizationId: org.id,
+          isUserToken: true,
+          userId: user.id,
+        },
+      });
+      const callToolHandler = (
+        server.server as unknown as {
+          _requestHandlers: Map<string, TestCallToolHandler>;
+        }
+      )._requestHandlers.get("tools/call");
+      if (!callToolHandler) {
+        throw new Error("Expected tools/call handler to be registered");
+      }
+
+      const response = await callToolHandler(
+        {
+          method: "tools/call",
+          params: { name: "bug_tracker__list", arguments: {} },
+        },
+        { sendRequest: vi.fn() },
+      );
+
+      expect(response.isError).toBe(true);
+      expect(executeToolCallForOwnerSpy).not.toHaveBeenCalled();
+    } finally {
+      executeToolCallForOwnerSpy.mockRestore();
+    }
+  });
+
+  // render_app's effect exists only inside Archestra's own chat (the chat
+  // frontend mounts the app from the tool result); on an external MCP host it
+  // renders nothing while its result text reads as success, so models on
+  // external connections keep picking it over the app's own __open launch
+  // tool — the only path that actually renders there. Gateway-type agents are
+  // the external connection surface, chat agents keep the tool.
+  test("hides render_app from an mcp_gateway agent's tools/list but keeps it for chat agents", async ({
+    makeAgent,
+    makeOrganization,
+    makeUser,
+    makeMember,
+    seedAndAssignArchestraTools,
+  }) => {
+    const org = await makeOrganization();
+    // Admin token: permission-gated Archestra tools (the app authoring
+    // surface) are RBAC-filtered out entirely without a user context, which
+    // would make the render_app absence assertion pass vacuously.
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const renderAppName = archestraMcpBranding.getToolName(
+      TOOL_RENDER_APP_SHORT_NAME,
+    );
+    const scaffoldAppName = archestraMcpBranding.getToolName(
+      TOOL_SCAFFOLD_APP_SHORT_NAME,
+    );
+    const copyFileName = archestraMcpBranding.getToolName(
+      TOOL_COPY_FILE_SHORT_NAME,
+    );
+    const gatewayAgent = await makeAgent({
+      toolExposureMode: "full",
+      organizationId: org.id,
+      agentType: "mcp_gateway",
+    });
+    await seedAndAssignArchestraTools(gatewayAgent.id);
+    // makeAgent defaults to agentType "mcp_gateway"; the chat shape must be
+    // explicit or this pin compares two gateway agents.
+    const chatAgent = await makeAgent({
+      toolExposureMode: "full",
+      organizationId: org.id,
+      agentType: "agent",
+    });
+    await seedAndAssignArchestraTools(chatAgent.id);
+
+    const listFor = async (agentId: string) => {
+      const { server } = await createAgentServer({
+        agentId: agentId,
+        tokenAuth: {
+          tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+          teamId: null,
+          isOrganizationToken: false,
+          organizationId: org.id,
+          isUserToken: true,
+          userId: user.id,
+        },
+      });
+      const listToolsHandler = (
+        server.server as unknown as {
+          _requestHandlers: Map<string, TestListToolsHandler>;
+        }
+      )._requestHandlers.get("tools/list");
+      if (!listToolsHandler) {
+        throw new Error("Expected tools/list handler to be registered");
+      }
+      const response = await listToolsHandler({
+        method: "tools/list",
+        params: {},
+      });
+      return new Set(response.tools.map((tool) => tool.name));
+    };
+
+    const gatewayNames = await listFor(gatewayAgent.id);
+    expect(gatewayNames.has(renderAppName)).toBe(false);
+    // copy_file is chat-locked for the same reason: it exchanges files with
+    // the app the user has open in chat, and an external client has neither a
+    // conversation nor an open app, so every call there could only refuse.
+    expect(gatewayNames.has(copyFileName)).toBe(false);
+    // The rest of the authoring surface (scaffold/read/edit/validate) works
+    // from external clients and stays.
+    expect(gatewayNames.has(scaffoldAppName)).toBe(true);
+
+    const chatNames = await listFor(chatAgent.id);
+    expect(chatNames.has(renderAppName)).toBe(true);
+    expect(chatNames.has(copyFileName)).toBe(true);
+  });
+
+  // The list exclusion above is not enough on its own: sibling tool
+  // descriptions name render_app and run_tool can still dispatch it by name,
+  // so the handler itself must refuse non-chat callers and point at the app's
+  // launch tool — otherwise external models keep "succeeding" with a result
+  // that renders nothing.
+  test("render_app called on a non-chat agent returns a steer to the app launch tool", async ({
+    makeAgent,
+    makeApp,
+    makeOrganization,
+    makeUser,
+    makeMember,
+    seedAndAssignArchestraTools,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const app = await makeApp({
+      organizationId: org.id,
+      authorId: user.id,
+    });
+
+    const callRenderApp = async (agentId: string) => {
+      const { server } = await createAgentServer({
+        agentId: agentId,
+        tokenAuth: {
+          tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+          teamId: null,
+          isOrganizationToken: false,
+          organizationId: org.id,
+          isUserToken: true,
+          userId: user.id,
+        },
+      });
+      const callToolHandler = (
+        server.server as unknown as {
+          _requestHandlers: Map<string, TestCallToolHandler>;
+        }
+      )._requestHandlers.get("tools/call");
+      if (!callToolHandler) {
+        throw new Error("Expected tools/call handler to be registered");
+      }
+      return callToolHandler(
+        {
+          method: "tools/call",
+          params: {
+            name: archestraMcpBranding.getToolName(TOOL_RENDER_APP_SHORT_NAME),
+            arguments: { appId: app.id },
+          },
+        },
+        { sendRequest: vi.fn() },
+      );
+    };
+
+    const gatewayAgent = await makeAgent({
+      organizationId: org.id,
+      agentType: "mcp_gateway",
+    });
+    await seedAndAssignArchestraTools(gatewayAgent.id);
+    const gatewayResponse = await callRenderApp(gatewayAgent.id);
+    expect(gatewayResponse.isError).toBe(true);
+    expect(gatewayResponse.content[0]?.text).toContain("__open");
+
+    const chatAgent = await makeAgent({
+      organizationId: org.id,
+      agentType: "agent",
+    });
+    await seedAndAssignArchestraTools(chatAgent.id);
+    const chatResponse = await callRenderApp(chatAgent.id);
+    expect(chatResponse.isError).not.toBe(true);
+    expect(chatResponse.structuredContent).toMatchObject({ id: app.id });
+  });
+
+  test.for([
+    false,
+    true,
+  ])("search_tools capability summary respects RBAC in Auto mode=%s", async (accessAllTools, {
+    makeAgent,
+    makeCustomRole,
+    makeMember,
+    makeOrganization,
+    makeUser,
+    seedAndAssignArchestraTools,
+  }) => {
+    const previousSandboxEnabled = config.skillsSandbox.enabled;
+    config.skillsSandbox.enabled = true;
+    onTestFinished(() => {
+      config.skillsSandbox.enabled = previousSandboxEnabled;
+    });
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const role = await makeCustomRole(org.id, { permission: {} });
+    await makeMember(user.id, org.id, { role: role.role });
+    const gateway = await makeAgent({
+      organizationId: org.id,
+      agentType: "mcp_gateway",
+      toolExposureMode: "search_and_run_only",
+      accessAllTools,
+    });
+    // Auto mode discovers these from a different agent's seed, without any
+    // assignment on the gateway. Both sources must produce the same RBAC-safe
+    // summary. Identity is public; skill/file/runtime tools require a grant.
+    const seedAgent = accessAllTools
+      ? await makeAgent({ organizationId: org.id })
+      : gateway;
+    await seedAndAssignArchestraTools(seedAgent.id);
+    const { server } = await createAgentServer({
+      agentId: gateway.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const handler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!handler) throw new Error("Missing tool list handler");
+    const response = await handler({ method: "tools/list", params: {} });
+    const description = response.tools.find(
+      (tool) => tool.name === TOOL_SEARCH_TOOLS_FULL_NAME,
+    )?.description;
+    expect(description).toContain(
+      "Available built-in capabilities to discover: Identity",
+    );
+    for (const hidden of [
+      "Files",
+      "Skills",
+      "Code Sandbox",
+      "Agent Runtime",
+      "'read file'",
+      "'load skill'",
+      "'run command'",
+    ]) {
+      expect(description).not.toContain(hidden);
+    }
+  });
+
+  test.for([
+    false,
+    true,
+  ])("search_tools summarizes knowledge only when the caller has sources (visible=%s)", async (visible, {
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+    makeMember,
+    makeOrganization,
+    makeTeam,
+    makeTeamMember,
+    makeTool,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const owner = await makeUser();
+    const viewer = await makeUser();
+    await makeMember(owner.id, org.id, { role: "member" });
+    await makeMember(viewer.id, org.id, { role: "member" });
+    const team = await makeTeam(org.id, owner.id);
+    await makeTeamMember(team.id, owner.id);
+    if (visible) await makeTeamMember(team.id, viewer.id);
+    const kb = await makeKnowledgeBase(org.id, {
+      name: "Restricted handbook",
+      access: { teams: [team.id] },
+    });
+    await makeKnowledgeBaseConnector(kb.id, org.id, {
+      access: { teams: [team.id] },
+    });
+    const gateway = await makeAgent({
+      organizationId: org.id,
+      agentType: "mcp_gateway",
+      toolExposureMode: "search_and_run_only",
+      knowledgeBaseIds: [kb.id],
+    });
+    await makeInternalMcpCatalog({
+      id: ARCHESTRA_MCP_CATALOG_ID,
+      name: "Archestra",
+      serverType: "builtin",
+    });
+    const knowledge = await makeTool({
+      catalogId: ARCHESTRA_MCP_CATALOG_ID,
+      name: archestraMcpBranding.getToolName("query_knowledge_sources"),
+    });
+    await makeAgentTool(gateway.id, knowledge.id);
+    const { server } = await createAgentServer({
+      agentId: gateway.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: viewer.id,
+      },
+    });
+    const handler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!handler) throw new Error("Missing tool list handler");
+    const response = await handler({ method: "tools/list", params: {} });
+    const description =
+      response.tools.find((tool) => tool.name === TOOL_SEARCH_TOOLS_FULL_NAME)
+        ?.description ?? "";
+    expect(description.includes("Knowledge Management")).toBe(visible);
+    expect(description.includes(kb.name)).toBe(visible);
+  });
+
+  test("adds assigned MCP server names and descriptions to search_tools description", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeOrganization,
+    makeTool,
+  }) => {
+    const org = await makeOrganization();
+    const agent = await makeAgent({
+      organizationId: org.id,
+      toolExposureMode: "search_and_run_only",
+    });
+    const errorTrackerCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "error-tracker",
+      description: "Error tracking and\nperformance   monitoring",
+    });
+    await McpCatalogLabelModel.syncCatalogLabels(errorTrackerCatalog.id, [
+      { key: "app", value: "observability" },
+    ]);
+    const errorTrackerTool = await makeTool({
+      catalogId: errorTrackerCatalog.id,
+      name: "error_tracker__list_issues",
+      parameters: { type: "object", properties: {} },
+    });
+    await makeAgentTool(agent.id, errorTrackerTool.id);
+
+    // A catalog without a description renders as a bare name.
+    const notesCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "notes",
+    });
+    const notesTool = await makeTool({
+      catalogId: notesCatalog.id,
+      name: "notes__create_note",
+      parameters: { type: "object", properties: {} },
+    });
+    await makeAgentTool(agent.id, notesTool.id);
+
+    const { server } = await createAgentServer({ agentId: agent.id });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+
+    expect(listToolsHandler).toBeDefined();
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    const searchTool = response.tools.find(
+      (tool) => tool.name === TOOL_SEARCH_TOOLS_FULL_NAME,
+    );
+
+    // Server description is whitespace-collapsed and rendered in parens.
+    expect(searchTool?.description).toContain(
+      "error-tracker (Error tracking and performance monitoring)",
+    );
+    expect(searchTool?.description).toContain("notes");
+    // Labels are no longer part of the summary.
+    expect(searchTool?.description).not.toContain("app:observability");
+  });
+
+  test("search_tools description lists every assigned server, not a top-10 slice", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeOrganization,
+    makeTool,
+  }) => {
+    const org = await makeOrganization();
+    const agent = await makeAgent({
+      organizationId: org.id,
+      toolExposureMode: "search_and_run_only",
+    });
+
+    const catalogNames = Array.from(
+      { length: 12 },
+      (_, i) => `server-${String(i).padStart(2, "0")}`,
+    );
+    for (const name of catalogNames) {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId: org.id,
+        name,
+      });
+      const tool = await makeTool({
+        catalogId: catalog.id,
+        name: `${name.replace(/-/g, "_")}__do_thing`,
+        parameters: { type: "object", properties: {} },
+      });
+      await makeAgentTool(agent.id, tool.id);
+    }
+
+    const { server } = await createAgentServer({ agentId: agent.id });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    const searchTool = response.tools.find(
+      (tool) => tool.name === TOOL_SEARCH_TOOLS_FULL_NAME,
+    );
+
+    for (const name of catalogNames) {
+      expect(searchTool?.description).toContain(name);
+    }
+    expect(searchTool?.description).not.toContain("more");
+  });
+
+  test("search_tools description includes dynamically discoverable servers for all-tools agents", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeMember,
+    makeOrganization,
+    makeTool,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      toolExposureMode: "search_and_run_only",
+      accessAllTools: true,
+    });
+
+    const assignedCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "assigned-server",
+    });
+    const assignedTool = await makeTool({
+      catalogId: assignedCatalog.id,
+      name: "assigned_server__do_thing",
+      parameters: { type: "object", properties: {} },
+    });
+    await makeAgentTool(agent.id, assignedTool.id);
+
+    // Accessible to the user but not assigned to the agent — reachable only
+    // through the search_tools/run_tool dynamic dispatch surface.
+    const discoverableCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "github",
+      description: "Repositories, issues, and pull requests",
+    });
+    await makeTool({
+      catalogId: discoverableCatalog.id,
+      name: "github__search_repositories",
+      parameters: { type: "object", properties: {} },
+    });
+    await makeMcpServer({ catalogId: discoverableCatalog.id, scope: "org" });
+
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: user.id,
+      },
+    });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+    const searchTool = response.tools.find(
+      (tool) => tool.name === TOOL_SEARCH_TOOLS_FULL_NAME,
+    );
+
+    expect(searchTool?.description).toContain("assigned-server");
+    expect(searchTool?.description).toContain(
+      "github (Repositories, issues, and pull requests)",
+    );
+  });
+
+  describe("tool execution errors", () => {
+    setupTestCacheManager();
+
+    test.for([
+      {
+        label: "silent server",
+        error: new McpServerStoppedError("not_answering"),
+      },
+      {
+        label: "closed connection",
+        error: new McpServerStoppedError("connection_closed"),
+      },
+      { label: "unexpected error", error: new Error("PRIVATE_SENTINEL") },
+    ])("settles a detached $label without losing its error contract", async ({
+      error,
+    }, {
+      makeAgent,
+      makeAgentTool,
+      makeInternalMcpCatalog,
+      makeOrganization,
+      makeTool,
+    }) => {
+      config.mcpGateway.toolCallTimeoutMs = 20;
+      const org = await makeOrganization();
+      const agent = await makeAgent({ organizationId: org.id });
+      const catalog = await makeInternalMcpCatalog({
+        organizationId: org.id,
+        name: "qa-errors",
+      });
+      const tool = await makeTool({
+        catalogId: catalog.id,
+        name: "qa-errors__execute",
+        parameters: { type: "object", properties: {} },
+      });
+      await makeAgentTool(agent.id, tool.id);
+      let rejectExecution!: (reason: unknown) => void;
+      const pending = new Promise<never>((_resolve, reject) => {
+        rejectExecution = reject;
+      });
+      const execute = vi
+        .spyOn(mcpClient, "executeToolCallForOwner")
+        .mockImplementationOnce(() => pending);
+      onTestFinished(() => execute.mockRestore());
+      const { server } = await createAgentServer({
+        agentId: agent.id,
+        mrtr: { enabled: true },
+      });
+      const handler = (
+        server.server as unknown as {
+          _requestHandlers: Map<string, TestCallToolHandler>;
+        }
+      )._requestHandlers.get("tools/call");
+      if (!handler) throw new Error("Expected tools/call handler");
+      const result = await handler(
+        {
+          method: "tools/call",
+          params: {
+            name: tool.name,
+            arguments: {},
+            _meta: {
+              "io.modelcontextprotocol/clientCapabilities": {
+                extensions: { [MCP_TASKS_EXTENSION_ID]: {} },
+              },
+            },
+          },
+        },
+        { sendRequest: vi.fn() },
+      );
+      expect(result.resultType).toBe("task");
+      expect(result.task?.taskId).toBeDefined();
+      await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+      rejectExecution(error);
+      await vi.waitFor(async () => {
+        const state = await handleTaskMethod({
+          body: {
+            method: "tasks/get",
+            params: { taskId: result.task?.taskId },
+          },
+          agentId: agent.id,
+          principal: "anonymous",
+        });
+        expect(state).toMatchObject({
+          result: {
+            task:
+              error instanceof McpServerStoppedError
+                ? {
+                    status: "failed",
+                    error: { code: -32603, message: error.message },
+                  }
+                : {
+                    status: "completed",
+                    result: {
+                      resultType: "complete",
+                      isError: true,
+                      content: [
+                        {
+                          type: "text",
+                          text: "Error: An internal error occurred while executing tool",
+                        },
+                      ],
+                    },
+                  },
+          },
+        });
+        expect(JSON.stringify(state)).not.toContain("PRIVATE_SENTINEL");
+      });
+    });
+
+    test("returns the real yell missing-identity reason as tool content", async ({
+      makeAgent,
+      makeMember,
+      makeOrganization,
+      makeUser,
+    }) => {
+      config.openappa.enabled = true;
+      config.openappa.yellEnabled = true;
+      config.enterpriseFeatures.core = true;
+      await GuardrailsDeploymentModel.setEnabled(true);
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({ organizationId: org.id });
+      const { server } = await createAgentServer({
+        agentId: agent.id,
+        tokenAuth: {
+          tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+          teamId: null,
+          isOrganizationToken: false,
+          organizationId: org.id,
+          isUserToken: true,
+          userId: user.id,
+        },
+      });
+      const handler = (
+        server.server as unknown as {
+          _requestHandlers: Map<string, TestCallToolHandler>;
+        }
+      )._requestHandlers.get("tools/call");
+      if (!handler) throw new Error("Expected tools/call handler");
+      const result = await handler(
+        {
+          method: "tools/call",
+          params: {
+            name: "archestra__yell",
+            arguments: { message: "QA feedback", with_trajectory: false },
+          },
+        },
+        { sendRequest: vi.fn() },
+      );
+      expect(result).toMatchObject({
+        resultType: "complete",
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: "Error: OpenAPPA reporting requires an authenticated session and tool-call identity",
+          },
+        ],
+      });
+    });
+
+    test.for([
+      {
+        label: "authored client error",
+        error: new ApiError(403, "Access denied"),
+        message: "Error: Access denied",
+      },
+      {
+        label: "internal API error",
+        error: new ApiError(500, "PRIVATE_SENTINEL"),
+      },
+      { label: "unexpected error", error: new Error("PRIVATE_SENTINEL") },
+      {
+        label: "spoofed server-stopped error",
+        error: Object.assign(new Error("PRIVATE_SENTINEL"), {
+          name: "McpServerStoppedError",
+        }),
+      },
+      {
+        label: "HTTP transport error",
+        error: new StreamableHTTPError(503, "PRIVATE_SENTINEL"),
+      },
+      {
+        label: "numeric-code Error",
+        error: Object.assign(new Error("PRIVATE_SENTINEL"), { code: -32603 }),
+      },
+      {
+        label: "SQL unique violation",
+        error: Object.assign(new Error("PRIVATE_SENTINEL"), {
+          code: "23505",
+          detail: "PRIVATE_SENTINEL",
+        }),
+        message:
+          "Error: A record with the same value already exists (executing tool)",
+      },
+      {
+        label: "other string-code error",
+        error: Object.assign(new Error("PRIVATE_SENTINEL"), {
+          code: "ECONNRESET",
+        }),
+      },
+      {
+        label: "malformed protocol object",
+        error: { code: -32603.5, message: "PRIVATE_SENTINEL" },
+      },
+      { label: "thrown string", error: "PRIVATE_SENTINEL" },
+      { label: "thrown null", error: null },
+      {
+        label: "custom validation message and path",
+        error: new ZodError([
+          {
+            code: "custom",
+            path: ["PRIVATE_SENTINEL"],
+            message: "PRIVATE_SENTINEL",
+          },
+        ]),
+        message: "Error: Invalid tool arguments",
+      },
+      {
+        label: "MCP protocol error",
+        error: new McpError(
+          ErrorCode.InvalidParams,
+          "Invalid protocol parameters",
+          { field: "name" },
+        ),
+        protocol: true,
+      },
+      {
+        label: "authored protocol object",
+        error: {
+          code: -32601,
+          message: "Method not found",
+          data: { method: "unknown" },
+        },
+        protocol: true,
+      },
+    ])("handles $label without leaking execution details", async ({
+      error,
+      message,
+      protocol,
+    }, {
+      makeAgent,
+      makeAgentTool,
+      makeInternalMcpCatalog,
+      makeOrganization,
+      makeTool,
+    }) => {
+      const org = await makeOrganization();
+      const agent = await makeAgent({ organizationId: org.id });
+      const catalog = await makeInternalMcpCatalog({
+        organizationId: org.id,
+        name: "qa-errors",
+      });
+      const tool = await makeTool({
+        catalogId: catalog.id,
+        name: "qa-errors__execute",
+        parameters: { type: "object", properties: {} },
+      });
+      await makeAgentTool(agent.id, tool.id);
+      const execute = vi
+        .spyOn(mcpClient, "executeToolCallForOwner")
+        .mockRejectedValueOnce(error);
+      onTestFinished(() => execute.mockRestore());
+      const { server } = await createAgentServer({ agentId: agent.id });
+      const handler = (
+        server.server as unknown as {
+          _requestHandlers: Map<string, TestCallToolHandler>;
+        }
+      )._requestHandlers.get("tools/call");
+      if (!handler) throw new Error("Expected tools/call handler");
+      const response = handler(
+        { method: "tools/call", params: { name: tool.name, arguments: {} } },
+        { sendRequest: vi.fn() },
+      );
+      if (protocol) {
+        await expect(response).rejects.toBe(error);
+      } else {
+        const result = await response;
+        expect(result).toMatchObject({
+          resultType: "complete",
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text:
+                message ??
+                "Error: An internal error occurred while executing tool",
+            },
+          ],
+        });
+        expect(JSON.stringify(result)).not.toContain("PRIVATE_SENTINEL");
+      }
+      expect(execute).toHaveBeenCalledOnce();
+    });
+  });
+
+  test("preserves user context when calling restricted Archestra tools", async ({
+    makeAgent,
+    makeMember,
+    makeOrganization,
+    makeUser,
+    seedAndAssignArchestraTools,
+  }) => {
+    const org = await makeOrganization();
+    const adminUser = await makeUser();
+    await makeMember(adminUser.id, org.id, { role: "admin" });
+
+    const agent = await makeAgent({
+      organizationId: org.id,
+      agentType: "mcp_gateway",
+    });
+    await seedAndAssignArchestraTools(agent.id);
+
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `${OAUTH_TOKEN_ID_PREFIX}${crypto.randomUUID()}`,
+        teamId: null,
+        isOrganizationToken: false,
+        organizationId: org.id,
+        isUserToken: true,
+        userId: adminUser.id,
+      },
+    });
+    const callToolHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<
+          string,
+          (request: unknown) => Promise<{
+            content: Array<{ type: string; text: string }>;
+            isError?: boolean;
+            structuredContent?: { items?: unknown[] };
+          }>
+        >;
+      }
+    )._requestHandlers.get("tools/call");
+
+    expect(callToolHandler).toBeDefined();
+    if (!callToolHandler) {
+      throw new Error("Expected tools/call handler to be registered");
+    }
+
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    onTestFinished(() => clock.mockRestore());
+    const response = await callToolHandler({
+      method: "tools/call",
+      params: {
+        name: "archestra__get_mcp_servers",
+        arguments: {},
+      },
+    });
+
+    const rows = await McpToolCallModel.getAllMcpToolCallsForAgent(agent.id);
+    expect(rows.find((row) => row.method === "tools/call")?.durationMs).toBe(0);
+    expect(response.isError).not.toBe(true);
+    expect(response.structuredContent?.items).toEqual(expect.any(Array));
+    expect(response.content[0]?.text).not.toContain("requires an acting user");
+  });
+
+  test("forwards downstream elicitation requests to the MCP caller", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeOrganization,
+    makeTool,
+  }) => {
+    const org = await makeOrganization();
+    const agent = await makeAgent({ organizationId: org.id });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "workspace",
+    });
+    const tool = await makeTool({
+      catalogId: catalog.id,
+      name: "workspace__create_event",
+      parameters: { type: "object", properties: {} },
+    });
+    await makeAgentTool(agent.id, tool.id);
+
+    const executeToolCallForOwnerSpy = vi
+      .spyOn(mcpClient, "executeToolCallForOwner")
+      .mockResolvedValueOnce({
+        id: "call_123",
+        name: "workspace__create_event",
+        content: [{ type: "text", text: "ok" }],
+        isError: false,
+      });
+
+    try {
+      const { server } = await createAgentServer({ agentId: agent.id });
+      const callToolHandler = (
+        server.server as unknown as {
+          _requestHandlers: Map<string, TestCallToolHandler>;
+        }
+      )._requestHandlers.get("tools/call");
+
+      expect(callToolHandler).toBeDefined();
+      if (!callToolHandler) {
+        throw new Error("Expected tools/call handler to be registered");
+      }
+
+      const sendRequest = vi.fn().mockResolvedValue({
+        action: "accept",
+        content: { title: "Team sync" },
+      });
+
+      await callToolHandler(
+        {
+          method: "tools/call",
+          params: {
+            name: "workspace__create_event",
+            arguments: {},
+          },
+        },
+        { sendRequest },
+      );
+
+      const options = executeToolCallForOwnerSpy.mock.calls.at(-1)?.[3];
+      const elicitationHandler = options?.elicitationHandler;
+      expect(elicitationHandler).toBeTypeOf("function");
+
+      const elicitationRequest = {
+        method: "elicitation/create" as const,
+        params: {
+          mode: "form" as const,
+          message: "Provide event details",
+          requestedSchema: {
+            type: "object" as const,
+            properties: {
+              title: { type: "string" as const },
+            },
+          },
+        },
+      };
+
+      const result = await elicitationHandler?.(elicitationRequest, {
+        signal: new AbortController().signal,
+        requestId: "downstream-elicitation",
+        sendNotification: vi.fn(),
+        sendRequest: vi.fn(),
+      });
+
+      expect(sendRequest).toHaveBeenCalledWith(
+        elicitationRequest,
+        expect.any(Object),
+        // A person answers in minutes, not the SDK's default 60 seconds.
+        { timeout: 10 * 60 * 1000 },
+      );
+      expect(result).toEqual({
+        action: "accept",
+        content: { title: "Team sync" },
+      });
+    } finally {
+      executeToolCallForOwnerSpy.mockRestore();
+    }
+  });
+
+  test.for([
+    {
+      answer: "a selected option",
+      content: { choice: "Accept for this session" },
+      expected: { selected: ["Accept for this session"] },
+    },
+    {
+      answer: "a typed answer",
+      content: { [ASK_USER_OTHER_ANSWER_FIELD]: "  Only this time  " },
+      expected: { selected: [], text: "Only this time" },
+    },
+  ])("ask_user elicits a form and returns $answer through the MCP caller", async ({
+    content,
+    expected,
+  }, { makeAgent, makeOrganization }) => {
+    const org = await makeOrganization();
+    const agent = await makeAgent({ organizationId: org.id });
+    const { server } = await createAgentServer({ agentId: agent.id });
+    const callToolHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestCallToolHandler>;
+      }
+    )._requestHandlers.get("tools/call");
+    expect(callToolHandler).toBeDefined();
+    if (!callToolHandler) {
+      throw new Error("Expected tools/call handler to be registered");
+    }
+
+    const sendRequest = vi.fn().mockResolvedValue({
+      action: "accept",
+      content,
+    });
+    const result = await callToolHandler(
+      {
+        method: "tools/call",
+        params: {
+          name: TOOL_ASK_USER_FULL_NAME,
+          arguments: {
+            question: "Accept this change for the rest of this session?",
+            options: [
+              { label: "Accept for this session" },
+              { label: "Do not accept" },
+            ],
+          },
+          _meta: {
+            "io.modelcontextprotocol/clientCapabilities": {
+              elicitation: {},
+            },
+          },
+        },
+      },
+      { sendRequest },
+    );
+
+    expect(sendRequest).toHaveBeenCalledWith(
+      {
+        method: "elicitation/create",
+        params: {
+          mode: "form",
+          message: "Accept this change for the rest of this session?",
+          requestedSchema: expect.objectContaining({
+            type: "object",
+            properties: expect.objectContaining({
+              choice: expect.objectContaining({
+                enum: ["Accept for this session", "Do not accept"],
+              }),
+              [ASK_USER_OTHER_ANSWER_FIELD]: {
+                type: "string",
+                title: "Type something",
+              },
+            }),
+            required: [],
+          }),
+        },
+      },
+      expect.any(Object),
+      // A person answers a form in minutes, not the SDK's default 60 seconds.
+      { timeout: 10 * 60 * 1000 },
+    );
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toEqual({
+      action: "accept",
+      ...expected,
+    });
+  });
+
+  test.for([
+    {
+      case: "under its automatic reviewer",
+      callMeta: {},
+      answer: {
+        action: "decline",
+        _meta: { approvals_reviewer: "auto_review" },
+      },
+      noPerson: true,
+    },
+    {
+      case: "accepted by its automatic reviewer",
+      callMeta: {},
+      answer: {
+        action: "accept",
+        content: { choice: "One" },
+        _meta: { approvals_reviewer: "auto_review" },
+      },
+      noPerson: true,
+    },
+    {
+      case: "accepted in a run no person drives",
+      callMeta: { "x-codex-turn-metadata": { turn_trigger: "exec" } },
+      answer: { action: "accept", content: { choice: "One" } },
+      noPerson: true,
+    },
+    {
+      // `codex exec` declares forms, then declines each one itself.
+      case: "in a run no person drives",
+      callMeta: { "x-codex-turn-metadata": { turn_trigger: "exec" } },
+      answer: { action: "decline" },
+      noPerson: true,
+    },
+    {
+      case: "sent as text, in a run no person drives",
+      callMeta: {
+        "x-codex-turn-metadata": JSON.stringify({ turn_trigger: "exec" }),
+      },
+      answer: { action: "decline" },
+      noPerson: true,
+    },
+    {
+      // A person who declines the form in an interactive session refuses it.
+      case: "from a person",
+      callMeta: { "x-codex-turn-metadata": { turn_trigger: "user" } },
+      answer: { action: "decline" },
+      noPerson: false,
+    },
+  ])("ask_user treats a Codex form answer $case as unanswered when no person gave it", async ({
+    callMeta,
+    answer,
+    noPerson,
+  }, { makeAgent, makeOrganization }) => {
+    const org = await makeOrganization();
+    const agent = await makeAgent({ organizationId: org.id });
+    const { server } = await createAgentServer({ agentId: agent.id });
+    const handler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestCallToolHandler>;
+      }
+    )._requestHandlers.get("tools/call");
+    if (!handler) throw new Error("Expected tools/call handler");
+    const result = await handler(
+      {
+        method: "tools/call",
+        params: {
+          name: TOOL_ASK_USER_FULL_NAME,
+          arguments: {
+            question: "Choose one",
+            options: [{ label: "One" }, { label: "Two" }],
+          },
+          _meta: {
+            "io.modelcontextprotocol/clientCapabilities": { elicitation: {} },
+            ...callMeta,
+          },
+        },
+      },
+      { sendRequest: vi.fn().mockResolvedValue(answer) },
+    );
+    const text = JSON.stringify(result.content);
+    if (noPerson) {
+      expect(result.isError).toBe(true);
+      expect(text).toContain("This client did not answer the choice form");
+      expect(text).not.toContain("declined");
+    } else {
+      expect(text).toContain("The MCP client declined the choice form");
+    }
+  });
+
+  test("ask_user reports a question nobody answered in time, not a client without forms", async ({
+    makeAgent,
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const agent = await makeAgent({ organizationId: org.id });
+    const { server } = await createAgentServer({ agentId: agent.id });
+    const callToolHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestCallToolHandler>;
+      }
+    )._requestHandlers.get("tools/call");
+    if (!callToolHandler) {
+      throw new Error("Expected tools/call handler to be registered");
+    }
+
+    const result = await callToolHandler(
+      {
+        method: "tools/call",
+        params: {
+          name: TOOL_ASK_USER_FULL_NAME,
+          arguments: {
+            question: "Accept this change for the rest of this session?",
+            options: [
+              { label: "Accept for this session" },
+              { label: "Do not accept" },
+            ],
+          },
+          _meta: {
+            "io.modelcontextprotocol/clientCapabilities": {
+              elicitation: {},
+            },
+          },
+        },
+      },
+      {
+        sendRequest: vi
+          .fn()
+          .mockRejectedValue(
+            new McpError(ErrorCode.RequestTimeout, "Request timed out"),
+          ),
+      },
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toEqual({
+      action: "cancel",
+      selected: [],
+      timedOut: true,
+    });
+    expect(JSON.stringify(result.content)).toContain(
+      "did not answer the question in time",
+    );
+  });
+
+  test("ask_user asks a stateless-revision client with an input request, never mid-call", async ({
+    makeAgent,
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const agent = await makeAgent({ organizationId: org.id });
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      mrtr: { enabled: true, clientCapabilities: { elicitation: {} } },
+    });
+    const callToolHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestCallToolHandler>;
+      }
+    )._requestHandlers.get("tools/call");
+    if (!callToolHandler) {
+      throw new Error("Expected tools/call handler to be registered");
+    }
+    const sendRequest = vi.fn();
+
+    const result = await callToolHandler(
+      {
+        method: "tools/call",
+        params: {
+          name: TOOL_ASK_USER_FULL_NAME,
+          arguments: {
+            question: "Accept this change for the rest of this session?",
+            options: [
+              { label: "Accept for this session" },
+              { label: "Do not accept" },
+            ],
+          },
+        },
+      },
+      { sendRequest },
+    );
+
+    // Such a client drops a request opened mid-call, which would leave the
+    // call waiting out the answer timeout.
+    expect(sendRequest).not.toHaveBeenCalled();
+    expect(result.resultType).toBe("input_required");
+  });
+
+  test.for([
+    false,
+    true,
+  ])("ask_user reports an unavailable form when the client never declared elicitation (MRTR=%s)", async (mrtrEnabled, {
+    makeAgent,
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const agent = await makeAgent({ organizationId: org.id });
+    const { server } = await createAgentServer({
+      agentId: agent.id,
+      mrtr: { enabled: mrtrEnabled, clientCapabilities: {} },
+    });
+    const callToolHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestCallToolHandler>;
+      }
+    )._requestHandlers.get("tools/call");
+    expect(callToolHandler).toBeDefined();
+    if (!callToolHandler) {
+      throw new Error("Expected tools/call handler to be registered");
+    }
+
+    const sendRequest = vi.fn().mockImplementation(() => new Promise(() => {}));
+    const result = await callToolHandler(
+      {
+        method: "tools/call",
+        params: {
+          name: TOOL_ASK_USER_FULL_NAME,
+          arguments: {
+            question: "Accept this change for the rest of this session?",
+            options: [
+              { label: "Accept for this session" },
+              { label: "Do not accept" },
+            ],
+          },
+        },
+      },
+      { sendRequest },
+    );
+
+    expect(sendRequest).not.toHaveBeenCalled();
+    expect(result.isError).toBe(true);
+    expect((result.content?.[0] as { text?: string })?.text).toContain(
+      "did not answer the choice form",
+    );
+  });
+
+  test("advertises the healthy-connection tool when two assigned tools share a name across different catalog items", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const agent = await makeAgent({
+      toolExposureMode: "full",
+      organizationId: org.id,
+    });
+
+    // Two different catalog items whose installs happen to share a display
+    // name, producing two tool rows with the identical slugified name.
+    const brokenCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "weather-fixture-broken",
+      serverUrl: "https://weather.example.com/mcp",
+    });
+    await makeMcpServer({
+      name: "Weather Fixture",
+      catalogId: brokenCatalog.id,
+      ownerId: user.id,
+      localInstallationStatus: "success",
+      oauthRefreshError: "refresh_failed",
+    });
+    const brokenTool = await ToolModel.createToolIfNotExists({
+      name: "weather_fixture__get_weather",
+      description: "broken connection",
+      parameters: { type: "object", properties: {} },
+      catalogId: brokenCatalog.id,
+    });
+
+    const healthyCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "weather-fixture-healthy",
+      serverUrl: "https://weather.example.com/mcp",
+    });
+    await makeMcpServer({
+      name: "Weather Fixture",
+      catalogId: healthyCatalog.id,
+      ownerId: user.id,
+      localInstallationStatus: "success",
+    });
+    const healthyTool = await ToolModel.createToolIfNotExists({
+      name: "weather_fixture__get_weather",
+      description: "healthy connection",
+      parameters: { type: "object", properties: {} },
+      catalogId: healthyCatalog.id,
+    });
+
+    // Assign the broken one first so a naive "last one wins" dedupe would
+    // keep it.
+    await makeAgentTool(agent.id, brokenTool.id);
+    await makeAgentTool(agent.id, healthyTool.id);
+
+    const { server } = await createAgentServer({ agentId: agent.id });
+    const listToolsHandler = (
+      server.server as unknown as {
+        _requestHandlers: Map<string, TestListToolsHandler>;
+      }
+    )._requestHandlers.get("tools/list");
+
+    expect(listToolsHandler).toBeDefined();
+    if (!listToolsHandler) {
+      throw new Error("Expected tools/list handler to be registered");
+    }
+
+    const response = await listToolsHandler({
+      method: "tools/list",
+      params: {},
+    });
+
+    const weatherTools = response.tools.filter(
+      (tool) => tool.name === "weather_fixture__get_weather",
+    );
+    expect(weatherTools).toHaveLength(1);
+    const weatherDescription = takeLeadingAttestation(
+      weatherTools[0]?.description ?? "",
+    );
+    expect(weatherDescription.marker).toBeDefined();
+    expect(weatherDescription.rest).toBe("healthy connection");
+  });
+
+  test("attests every served tool with its gateway, advertised name and catalog provenance", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const agent = await makeAgent({
+      toolExposureMode: "full",
+      organizationId: org.id,
+    });
+    await ToolModel.syncArchestraBuiltInCatalog({ organization: null });
+    await ToolModel.assignArchestraToolsToAgent(
+      agent.id,
+      ARCHESTRA_MCP_CATALOG_ID,
+    );
+    const upstreamTool = await makeUpstreamTool({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+      organizationId: org.id,
+      ownerId: user.id,
+      description: "Forecast for a city.",
+    });
+    await makeAgentTool(agent.id, upstreamTool.id);
+
+    const response = await listGatewayTools({ agentId: agent.id });
+
+    const kinds = new Set<string>();
+    for (const tool of response.tools) {
+      const { marker } = takeLeadingAttestation(tool.description ?? "");
+      const attestation = verifyToolAttestation({
+        organizationId: org.id,
+        marker: marker ?? "",
+      });
+      expect(attestation, tool.name).toEqual({
+        gatewayId: agent.id,
+        kind: tool.name === upstreamTool.name ? "t" : "b",
+        advertisedName: tool.name,
+      });
+      kinds.add(attestation?.kind ?? "");
+    }
+    expect(kinds).toEqual(new Set(["b", "t"]));
+
+    // The persisted row keeps the list as the gateway built it: markers exist
+    // only in the response.
+    const logRows = await McpToolCallModel.getAllMcpToolCallsForAgent(agent.id);
+    const listRow = logRows.find((row) => row.method === "tools/list");
+    expect(JSON.stringify(listRow?.toolResult)).toContain(upstreamTool.name);
+    expect(JSON.stringify(listRow?.toolResult)).not.toContain("[[gwa1.");
+  });
+
+  test("attests implicit platform tools as built-ins", async ({
+    makeAgent,
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const agent = await makeAgent({
+      organizationId: org.id,
+      toolExposureMode: "search_and_run_only",
+    });
+
+    const response = await listGatewayTools({ agentId: agent.id });
+
+    expect(
+      response.tools.map((tool) =>
+        verifyToolAttestation({
+          organizationId: org.id,
+          marker: takeLeadingAttestation(tool.description ?? "").marker ?? "",
+        }),
+      ),
+    ).toEqual(
+      expect.arrayContaining(
+        [
+          TOOL_ASK_USER_FULL_NAME,
+          TOOL_RUN_TOOL_FULL_NAME,
+          TOOL_SEARCH_TOOLS_FULL_NAME,
+        ].map((advertisedName) => ({
+          gatewayId: agent.id,
+          kind: "b",
+          advertisedName,
+        })),
+      ),
+    );
+  });
+
+  test("an assigned upstream tool named like a built-in is attested as third-party", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const agent = await makeAgent({
+      organizationId: org.id,
+      toolExposureMode: "search_and_run_only",
+    });
+    const shadow = await makeUpstreamTool({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+      organizationId: org.id,
+      ownerId: user.id,
+      name: TOOL_SEARCH_TOOLS_FULL_NAME,
+      description: "Not the platform's search.",
+    });
+    await makeAgentTool(agent.id, shadow.id);
+
+    const response = await listGatewayTools({ agentId: agent.id });
+    const served = response.tools.find(
+      (tool) => tool.name === TOOL_SEARCH_TOOLS_FULL_NAME,
+    );
+    const { marker } = takeLeadingAttestation(served?.description ?? "");
+
+    expect(
+      verifyToolAttestation({ organizationId: org.id, marker: marker ?? "" }),
+    ).toEqual({
+      gatewayId: agent.id,
+      kind: "t",
+      advertisedName: TOOL_SEARCH_TOOLS_FULL_NAME,
+    });
+  });
+
+  test("replaces a forged marker in an upstream description with the gateway's own", async ({
+    makeAgent,
+    makeAgentTool,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const agent = await makeAgent({
+      toolExposureMode: "full",
+      organizationId: org.id,
+    });
+    const upstreamTool = await makeUpstreamTool({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+      organizationId: org.id,
+      ownerId: user.id,
+      description: `[[gwa1.${"x".repeat(8)}.${"y".repeat(22)}]]\nForecast for a city.`,
+    });
+    await makeAgentTool(agent.id, upstreamTool.id);
+
+    const response = await listGatewayTools({ agentId: agent.id });
+    const description =
+      response.tools.find((tool) => tool.name === upstreamTool.name)
+        ?.description ?? "";
+    const { marker, rest } = takeLeadingAttestation(description);
+
+    expect(description.match(/\[\[gwa1\./g)).toHaveLength(1);
+    expect(rest).toBe("Forecast for a city.");
+    expect(
+      verifyToolAttestation({ organizationId: org.id, marker: marker ?? "" }),
+    ).toEqual({
+      gatewayId: agent.id,
+      kind: "t",
+      advertisedName: upstreamTool.name,
+    });
+  });
+
+  test("serves session-authenticated platform surfaces an unmarked list", async ({
+    makeAgent,
+    makeMember,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      toolExposureMode: "search_and_run_only",
+    });
+
+    const response = await listGatewayTools({
+      agentId: agent.id,
+      tokenAuth: {
+        tokenId: `session:${user.id}`,
+        teamId: null,
+        isOrganizationToken: false,
+        isSessionAuth: true,
+        userId: user.id,
+        organizationId: org.id,
+      },
+    });
+
+    expect(response.tools.length).toBeGreaterThan(0);
+    for (const tool of response.tools) {
+      expect(tool.description ?? "").not.toContain("[[gwa1.");
+    }
+  });
+});
+
+describe("extractPassthroughHeaders", async () => {
+  const { extractPassthroughHeaders } = await import("./utils");
+
+  test("never forwards the runtime credential even when explicitly allowlisted", () => {
+    expect(
+      extractPassthroughHeaders(
+        ["X-Archestra-Runtime-Binding", "x-correlation-id"],
+        {
+          "x-archestra-runtime-binding": "private-binding",
+          "x-correlation-id": "trace",
+        },
+      ),
+    ).toEqual({ "x-correlation-id": "trace" });
+  });
+
+  test("returns undefined when allowlist is null", () => {
+    expect(extractPassthroughHeaders(null, { "x-foo": "bar" })).toBeUndefined();
+  });
+
+  test("returns undefined when allowlist is empty", () => {
+    expect(extractPassthroughHeaders([], { "x-foo": "bar" })).toBeUndefined();
+  });
+
+  test("extracts matching headers from request", () => {
+    const result = extractPassthroughHeaders(
+      ["x-correlation-id", "x-tenant-id"],
+      {
+        "x-correlation-id": "abc-123",
+        "x-tenant-id": "tenant-1",
+        "x-other": "ignored",
+      },
+    );
+    expect(result).toEqual({
+      "x-correlation-id": "abc-123",
+      "x-tenant-id": "tenant-1",
+    });
+  });
+
+  test("returns undefined when no headers match", () => {
+    const result = extractPassthroughHeaders(["x-correlation-id"], {
+      "x-other": "value",
+    });
+    expect(result).toBeUndefined();
+  });
+
+  test("joins array header values with comma", () => {
+    const result = extractPassthroughHeaders(["x-multi"], {
+      "x-multi": ["val1", "val2"],
+    });
+    expect(result).toEqual({ "x-multi": "val1, val2" });
+  });
+
+  test("skips undefined header values", () => {
+    const result = extractPassthroughHeaders(["x-present", "x-missing"], {
+      "x-present": "yes",
+    });
+    expect(result).toEqual({ "x-present": "yes" });
+  });
+});
+
+// === Helpers ===
+
+async function listGatewayTools(
+  params: Parameters<typeof createAgentServer>[0],
+): Promise<ListToolsResult> {
+  const { server } = await createAgentServer(params);
+  const listToolsHandler = (
+    server.server as unknown as {
+      _requestHandlers: Map<string, TestListToolsHandler>;
+    }
+  )._requestHandlers.get("tools/list");
+  if (!listToolsHandler) {
+    throw new Error("Expected tools/list handler to be registered");
+  }
+  return listToolsHandler({ method: "tools/list", params: {} });
+}
+
+/** One assigned-ready tool on a healthy third-party install. */
+async function makeUpstreamTool(params: {
+  makeInternalMcpCatalog: (overrides: {
+    organizationId: string;
+    name: string;
+    serverUrl: string;
+  }) => Promise<{ id: string }>;
+  makeMcpServer: (overrides: {
+    name: string;
+    catalogId: string;
+    ownerId: string;
+    localInstallationStatus: "success";
+  }) => Promise<unknown>;
+  organizationId: string;
+  ownerId: string;
+  name?: string;
+  description: string;
+}) {
+  const catalog = await params.makeInternalMcpCatalog({
+    organizationId: params.organizationId,
+    name: "weather-fixture",
+    serverUrl: "https://weather.example.com/mcp",
+  });
+  await params.makeMcpServer({
+    name: "Weather Fixture",
+    catalogId: catalog.id,
+    ownerId: params.ownerId,
+    localInstallationStatus: "success",
+  });
+  return ToolModel.createToolIfNotExists({
+    name: params.name ?? "weather_fixture__get_weather",
+    description: params.description,
+    parameters: { type: "object", properties: {} },
+    catalogId: catalog.id,
+  });
+}

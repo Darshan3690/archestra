@@ -1,7 +1,12 @@
+import { parseFullToolName } from "@archestra/shared";
 import { context, type Span, SpanStatusCode, trace } from "@opentelemetry/api";
-import { parseFullToolName } from "@shared";
+import { getRootSpan } from "@sentry/core";
 import config from "@/config";
-import { SESSION_ID_KEY } from "@/observability/request-context";
+import { resolveLogContentMode } from "@/log-content";
+import {
+  getErrorTrackingServerSpan,
+  SESSION_ID_KEY,
+} from "@/observability/request-context";
 import type { AgentType } from "@/types";
 import {
   ATTR_ARCHESTRA_AGENT_TYPE,
@@ -15,19 +20,23 @@ import {
   ATTR_GENAI_TOOL_TYPE,
   ATTR_MCP_BLOCKED,
   ATTR_MCP_BLOCKED_REASON,
+  ATTR_MCP_METHOD_NAME,
   ATTR_MCP_SERVER_NAME,
   ATTR_ROUTE_CATEGORY,
   EVENT_GENAI_CONTENT_INPUT,
   EVENT_GENAI_CONTENT_OUTPUT,
   RouteCategory,
   type SpanAgentInfo,
+  type SpanTeamInfo,
   type SpanUserInfo,
   setAgentAttributes,
   setSessionId,
   setSpanError,
+  setTeamAttributes,
   setUserAttributes,
   truncateContent,
 } from "./attributes";
+import { sessionContext } from "./session";
 
 const { captureContent } = config.observability.otel;
 
@@ -52,77 +61,96 @@ export async function startActiveMcpSpan<T>(params: {
   toolName: string;
   mcpServerName: string;
   agent: SpanAgentInfo;
+  teams?: SpanTeamInfo[];
+  userTeams?: SpanTeamInfo[];
   sessionId?: string | null;
   agentType?: AgentType;
   toolCallId?: string;
   toolArgs?: unknown;
+  /**
+   * Suppress tool argument/result content capture for this span even when
+   * ARCHESTRA_OTEL_CAPTURE_CONTENT is on (encrypted chat sessions). Metadata
+   * attributes (tool name, agent, session) are unaffected. The deployment's
+   * Log Content mode suppresses it too, checked here so no caller can forget
+   * it.
+   */
+  suppressContent?: boolean;
   user?: SpanUserInfo | null;
   callback: (span: Span) => Promise<T>;
 }): Promise<T> {
   const tracer = trace.getTracer("archestra");
+  // Only consulted when content would otherwise be captured.
+  const recordContent =
+    captureContent &&
+    !params.suppressContent &&
+    resolveLogContentMode() === "full";
 
   // Inject session ID into context so it's available to the pino mixin for log correlation
-  let ctx = context.active();
+  let ctx = sessionContext(context.active(), params.sessionId);
   if (params.sessionId) {
     ctx = ctx.setValue(SESSION_ID_KEY, params.sessionId);
   }
 
-  return tracer.startActiveSpan(
-    `execute_tool ${params.toolName}`,
-    {
-      attributes: {
-        [ATTR_ROUTE_CATEGORY]: RouteCategory.MCP_GATEWAY,
-        [ATTR_GENAI_OPERATION_NAME]: "execute_tool",
-        [ATTR_MCP_SERVER_NAME]: params.mcpServerName,
-        [ATTR_GENAI_TOOL_NAME]: params.toolName,
-        [ATTR_GENAI_TOOL_TYPE]: "function",
-        [ATTR_GENAI_AGENT_ID]: params.agent.id,
-        [ATTR_GENAI_AGENT_NAME]: params.agent.name,
+  return context.with(ctx, () =>
+    tracer.startActiveSpan(
+      `execute_tool ${params.toolName}`,
+      {
+        attributes: {
+          [ATTR_ROUTE_CATEGORY]: RouteCategory.MCP_GATEWAY,
+          [ATTR_GENAI_OPERATION_NAME]: "execute_tool",
+          [ATTR_MCP_SERVER_NAME]: params.mcpServerName,
+          [ATTR_GENAI_TOOL_NAME]: params.toolName,
+          [ATTR_GENAI_TOOL_TYPE]: "function",
+          [ATTR_GENAI_AGENT_ID]: params.agent.id,
+          [ATTR_GENAI_AGENT_NAME]: params.agent.name,
+        },
       },
-    },
-    ctx,
-    async (span) => {
-      setAgentAttributes(span, params.agent);
-      setSessionId(span, params.sessionId);
+      ctx,
+      async (span) => {
+        setAgentAttributes(span, params.agent);
+        setTeamAttributes(span, params.teams, "agent");
+        setTeamAttributes(span, params.userTeams, "user");
+        setSessionId(span, params.sessionId);
 
-      if (params.agentType) {
-        span.setAttribute(ATTR_ARCHESTRA_AGENT_TYPE, params.agentType);
-      }
-      if (params.toolCallId) {
-        span.setAttribute(ATTR_GENAI_TOOL_CALL_ID, params.toolCallId);
-      }
+        if (params.agentType) {
+          span.setAttribute(ATTR_ARCHESTRA_AGENT_TYPE, params.agentType);
+        }
+        if (params.toolCallId) {
+          span.setAttribute(ATTR_GENAI_TOOL_CALL_ID, params.toolCallId);
+        }
 
-      setUserAttributes(span, params.user);
+        setUserAttributes(span, params.user);
 
-      if (captureContent && params.toolArgs) {
-        span.addEvent(EVENT_GENAI_CONTENT_INPUT, {
-          [ATTR_GENAI_TOOL_CALL_ARGUMENTS]: truncateContent(params.toolArgs),
-        });
-      }
-
-      try {
-        const result = await params.callback(span);
-        span.setStatus({ code: SpanStatusCode.OK });
-
-        if (captureContent) {
-          span.addEvent(EVENT_GENAI_CONTENT_OUTPUT, {
-            [ATTR_GENAI_TOOL_CALL_RESULT]: truncateContent(result),
+        if (recordContent && params.toolArgs) {
+          span.addEvent(EVENT_GENAI_CONTENT_INPUT, {
+            [ATTR_GENAI_TOOL_CALL_ARGUMENTS]: truncateContent(params.toolArgs),
           });
         }
 
-        return result;
-      } catch (error) {
-        setSpanError(span, error);
-        throw error;
-      } finally {
-        span.end();
-      }
-    },
+        try {
+          const result = await params.callback(span);
+          span.setStatus({ code: SpanStatusCode.OK });
+
+          if (recordContent) {
+            span.addEvent(EVENT_GENAI_CONTENT_OUTPUT, {
+              [ATTR_GENAI_TOOL_CALL_RESULT]: truncateContent(result),
+            });
+          }
+
+          return result;
+        } catch (error) {
+          setSpanError({ span, error });
+          throw error;
+        } finally {
+          span.end();
+        }
+      },
+    ),
   );
 }
 
 /**
- * Records short-lived spans for tool calls that were blocked by tool invocation policies.
+ * Records short-lived spans for tool calls that were blocked by guardrails.
  * Each blocked tool call gets its own span with `mcp.blocked=true` and `mcp.blocked_reason`.
  *
  * These spans have the same attributes as normal MCP tool call spans so they appear alongside
@@ -132,13 +160,15 @@ export function recordBlockedToolSpans(params: {
   toolCallNames: string[];
   blockedReason: string;
   agent: SpanAgentInfo;
+  teams?: SpanTeamInfo[];
+  userTeams?: SpanTeamInfo[];
   sessionId?: string | null;
   agentType?: AgentType;
   user?: SpanUserInfo | null;
 }): void {
   const tracer = trace.getTracer("archestra");
 
-  let ctx = context.active();
+  let ctx = sessionContext(context.active(), params.sessionId);
   if (params.sessionId) {
     ctx = ctx.setValue(SESSION_ID_KEY, params.sessionId);
   }
@@ -146,25 +176,29 @@ export function recordBlockedToolSpans(params: {
   for (const toolName of params.toolCallNames) {
     const mcpServerName = parseFullToolName(toolName).serverName ?? "unknown";
 
-    const span = tracer.startSpan(
-      `execute_tool ${toolName}`,
-      {
-        attributes: {
-          [ATTR_ROUTE_CATEGORY]: RouteCategory.MCP_GATEWAY,
-          [ATTR_GENAI_OPERATION_NAME]: "execute_tool",
-          [ATTR_MCP_SERVER_NAME]: mcpServerName,
-          [ATTR_GENAI_TOOL_NAME]: toolName,
-          [ATTR_GENAI_TOOL_TYPE]: "function",
-          [ATTR_GENAI_AGENT_ID]: params.agent.id,
-          [ATTR_GENAI_AGENT_NAME]: params.agent.name,
-          [ATTR_MCP_BLOCKED]: true,
-          [ATTR_MCP_BLOCKED_REASON]: truncateContent(params.blockedReason),
+    const span = context.with(ctx, () =>
+      tracer.startSpan(
+        `execute_tool ${toolName}`,
+        {
+          attributes: {
+            [ATTR_ROUTE_CATEGORY]: RouteCategory.MCP_GATEWAY,
+            [ATTR_GENAI_OPERATION_NAME]: "execute_tool",
+            [ATTR_MCP_SERVER_NAME]: mcpServerName,
+            [ATTR_GENAI_TOOL_NAME]: toolName,
+            [ATTR_GENAI_TOOL_TYPE]: "function",
+            [ATTR_GENAI_AGENT_ID]: params.agent.id,
+            [ATTR_GENAI_AGENT_NAME]: params.agent.name,
+            [ATTR_MCP_BLOCKED]: true,
+            [ATTR_MCP_BLOCKED_REASON]: truncateContent(params.blockedReason),
+          },
         },
-      },
-      ctx,
+        ctx,
+      ),
     );
 
     setAgentAttributes(span, params.agent);
+    setTeamAttributes(span, params.teams, "agent");
+    setTeamAttributes(span, params.userTeams, "user");
     setSessionId(span, params.sessionId);
 
     if (params.agentType) {
@@ -179,4 +213,28 @@ export function recordBlockedToolSpans(params: {
     });
     span.end();
   }
+}
+
+/**
+ * Records the JSON-RPC method of an MCP gateway request on the request's HTTP
+ * server spans, so request traces can be told apart by method. All gateway
+ * requests share one route, so the route alone does not say what a request
+ * did.
+ *
+ * A request can have two server spans: the root of the active span, and the
+ * span error tracking opens in a trace of its own. Without error tracking, the
+ * root is the active span.
+ */
+export function setMcpMethodOnRequestSpans(
+  request: object,
+  method: string,
+): void {
+  const activeSpan = trace.getActiveSpan();
+  if (activeSpan) {
+    getRootSpan(activeSpan).setAttribute(ATTR_MCP_METHOD_NAME, method);
+  }
+  getErrorTrackingServerSpan(request)?.setAttribute(
+    ATTR_MCP_METHOD_NAME,
+    method,
+  );
 }

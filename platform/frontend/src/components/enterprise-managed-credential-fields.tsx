@@ -1,7 +1,9 @@
 "use client";
 
+import { FieldDescription } from "@/components/ui/field-description";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { SecretInput, SecretTextarea } from "@/components/ui/secret-input";
 import {
   Select,
   SelectContent,
@@ -28,6 +30,10 @@ export type EnterpriseManagedConfigInput = {
     | "body_field";
   headerName?: string;
   responseFieldPath?: string;
+  clientIdOverride?: string;
+  clientSecretOverride?: string;
+  privateKeyPemOverride?: string;
+  privateKeyIdOverride?: string;
 };
 
 interface EnterpriseManagedCredentialFieldsProps {
@@ -106,6 +112,7 @@ export function EnterpriseManagedCredentialFields({
       <div className="space-y-1.5">
         <Label className="text-xs">Managed Resource Identifier</Label>
         <Input
+          aria-label="Managed resource identifier"
           value={config.resourceIdentifier ?? ""}
           onChange={(event) =>
             onChange({
@@ -119,7 +126,13 @@ export function EnterpriseManagedCredentialFields({
 
       <div className="space-y-1.5">
         <Label className="text-xs">External Provider Alias</Label>
+        <FieldDescription>
+          Optional. Use this when the identity provider brokers a token from an
+          external provider, for example a Keycloak identity provider alias such
+          as <code>github</code>.
+        </FieldDescription>
         <Input
+          aria-label="External provider alias"
           value={config.requestedIssuer ?? ""}
           onChange={(event) =>
             onChange({
@@ -129,16 +142,16 @@ export function EnterpriseManagedCredentialFields({
           }
           placeholder="github"
         />
-        <p className="text-[11px] text-muted-foreground">
-          Optional. Use this when the identity provider brokers a token from an
-          external provider, for example a Keycloak identity provider alias such
-          as <code>github</code>.
-        </p>
       </div>
 
       <div className="space-y-1.5">
         <Label className="text-xs">Response Field Path</Label>
+        <FieldDescription>
+          Required when the provider returns a structured secret and {appName}
+          needs to extract one field, for example <code>token</code>.
+        </FieldDescription>
         <Input
+          aria-label="Response field path"
           value={config.responseFieldPath ?? ""}
           onChange={(event) =>
             onChange({
@@ -148,16 +161,15 @@ export function EnterpriseManagedCredentialFields({
           }
           placeholder="token"
         />
-        <p className="text-[11px] text-muted-foreground">
-          Required when the provider returns a structured secret and {appName}
-          needs to extract one field, for example <code>token</code>.
-        </p>
       </div>
+
+      <OverrideClientFields config={config} onChange={onChange} />
 
       {config.tokenInjectionMode === "header" && (
         <div className="space-y-1.5">
           <Label className="text-xs">Header Name</Label>
           <Input
+            aria-label="Header name"
             value={config.headerName ?? ""}
             onChange={(event) =>
               onChange({
@@ -168,6 +180,110 @@ export function EnterpriseManagedCredentialFields({
             placeholder="X-Provider-Token"
           />
         </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The client this server's token exchange runs as. Credentials are write-only:
+ * the API never returns them, so a blank box keeps the stored value.
+ */
+function OverrideClientFields({
+  config,
+  onChange,
+}: {
+  config: EnterpriseManagedConfigInput;
+  onChange: (value: EnterpriseManagedConfigInput) => void;
+}) {
+  const appName = useAppName();
+  const hasOverride = Boolean(config.clientIdOverride);
+  const storedPlaceholder = "Leave blank to keep a stored value";
+
+  return (
+    <div className="space-y-3 border-t pt-3">
+      <div className="space-y-1">
+        <Label className="text-xs">Exchange Client (Optional)</Label>
+        <FieldDescription>
+          Run this server&apos;s token exchange as its own app registration,
+          instead of the identity provider&apos;s client, so the server gets its
+          own consent and appears by name in downstream tokens and logs. Agents
+          bound to an Entra agent identity use that identity instead.
+        </FieldDescription>
+      </div>
+
+      <div className="space-y-1.5">
+        <Label className="text-xs">Client ID</Label>
+        <Input
+          aria-label="Exchange client ID"
+          value={config.clientIdOverride ?? ""}
+          onChange={(event) =>
+            onChange({
+              ...config,
+              clientIdOverride: event.target.value.trim() || undefined,
+            })
+          }
+          placeholder="Application (client) ID"
+        />
+      </div>
+
+      {hasOverride && (
+        <>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Client Secret</Label>
+            <SecretInput
+              aria-label="Exchange client secret"
+              value={config.clientSecretOverride ?? ""}
+              onChange={(event) =>
+                onChange({
+                  ...config,
+                  clientSecretOverride: event.target.value || undefined,
+                })
+              }
+              placeholder={storedPlaceholder}
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className="text-xs">Certificate Thumbprint or Key ID</Label>
+            <FieldDescription>
+              For a certificate credential. For Entra, the SHA-1 thumbprint
+              shown under the app&apos;s certificates.
+            </FieldDescription>
+            <Input
+              aria-label="Exchange client key ID"
+              className="font-mono"
+              value={config.privateKeyIdOverride ?? ""}
+              onChange={(event) =>
+                onChange({
+                  ...config,
+                  privateKeyIdOverride: event.target.value.trim() || undefined,
+                })
+              }
+              placeholder="40 hexadecimal characters"
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className="text-xs">Certificate Private Key</Label>
+            <FieldDescription>
+              PKCS#8 PEM. When set, {appName} signs a client assertion with it
+              instead of sending the client secret.
+            </FieldDescription>
+            <SecretTextarea
+              aria-label="Exchange client private key"
+              className="min-h-24 font-mono text-xs"
+              value={config.privateKeyPemOverride ?? ""}
+              onChange={(event) =>
+                onChange({
+                  ...config,
+                  privateKeyPemOverride: event.target.value || undefined,
+                })
+              }
+              placeholder={storedPlaceholder}
+            />
+          </div>
+        </>
       )}
     </div>
   );

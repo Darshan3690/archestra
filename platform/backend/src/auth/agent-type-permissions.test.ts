@@ -1,7 +1,15 @@
-import { ADMIN_ROLE_NAME, EDITOR_ROLE_NAME, MEMBER_ROLE_NAME } from "@shared";
-import { describe, expect, test } from "@/test";
-import { ApiError } from "@/types";
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
 import {
+  ADMIN_ROLE_NAME,
+  EDITOR_ROLE_NAME,
+  MEMBER_ROLE_NAME,
+} from "@archestra/shared";
+import db, { schema } from "@/database";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import { describe, expect, test } from "@/test";
+import { type AgentType, ApiError } from "@/types";
+import {
+  getAgentTypeListPermissionChecker,
   getAgentTypePermissionChecker,
   hasAnyAgentTypeAdminPermission,
   hasAnyAgentTypeReadPermission,
@@ -18,7 +26,7 @@ describe("requireAgentTypePermission", () => {
     makeCustomRole,
   }) => {
     const user = await makeUser();
-    const org = await makeOrganization();
+    const org = await makeOrganization({ legacyPermissions: true });
     await makeCustomRole(org.id, {
       role: "gw_reader",
       permission: { mcpGateway: ["read"] },
@@ -42,7 +50,7 @@ describe("requireAgentTypePermission", () => {
     makeCustomRole,
   }) => {
     const user = await makeUser();
-    const org = await makeOrganization();
+    const org = await makeOrganization({ legacyPermissions: true });
     await makeCustomRole(org.id, {
       role: "gw_reader",
       permission: { mcpGateway: ["read"] },
@@ -78,7 +86,7 @@ describe("requireAgentTypePermission", () => {
     makeCustomRole,
   }) => {
     const user = await makeUser();
-    const org = await makeOrganization();
+    const org = await makeOrganization({ legacyPermissions: true });
     await makeCustomRole(org.id, {
       role: "proxy_only",
       permission: { llmProxy: ["read", "create"] },
@@ -123,7 +131,7 @@ describe("requireAgentTypePermission", () => {
     makeCustomRole,
   }) => {
     const user = await makeUser();
-    const org = await makeOrganization();
+    const org = await makeOrganization({ legacyPermissions: true });
     await makeCustomRole(org.id, {
       role: "agent_reader",
       permission: { agent: ["read"] },
@@ -152,28 +160,6 @@ describe("requireAgentTypePermission", () => {
 });
 
 describe("isAgentTypeAdmin", () => {
-  test("returns true when user has admin on the agent type resource", async ({
-    makeUser,
-    makeOrganization,
-    makeMember,
-    makeCustomRole,
-  }) => {
-    const user = await makeUser();
-    const org = await makeOrganization();
-    await makeCustomRole(org.id, {
-      role: "gw_admin",
-      permission: { mcpGateway: ["read", "admin"] },
-    });
-    await makeMember(user.id, org.id, { role: "gw_admin" });
-
-    const result = await isAgentTypeAdmin({
-      userId: user.id,
-      organizationId: org.id,
-      agentType: "mcp_gateway",
-    });
-    expect(result).toBe(true);
-  });
-
   test("returns false when user lacks admin on the agent type resource", async ({
     makeUser,
     makeOrganization,
@@ -181,7 +167,7 @@ describe("isAgentTypeAdmin", () => {
     makeCustomRole,
   }) => {
     const user = await makeUser();
-    const org = await makeOrganization();
+    const org = await makeOrganization({ legacyPermissions: true });
     await makeCustomRole(org.id, {
       role: "gw_reader",
       permission: { mcpGateway: ["read", "create"] },
@@ -195,37 +181,6 @@ describe("isAgentTypeAdmin", () => {
     });
     expect(result).toBe(false);
   });
-
-  test("returns false for a different agent type even when admin on another", async ({
-    makeUser,
-    makeOrganization,
-    makeMember,
-    makeCustomRole,
-  }) => {
-    const user = await makeUser();
-    const org = await makeOrganization();
-    await makeCustomRole(org.id, {
-      role: "gw_admin",
-      permission: { mcpGateway: ["admin"] },
-    });
-    await makeMember(user.id, org.id, { role: "gw_admin" });
-
-    expect(
-      await isAgentTypeAdmin({
-        userId: user.id,
-        organizationId: org.id,
-        agentType: "mcp_gateway",
-      }),
-    ).toBe(true);
-
-    expect(
-      await isAgentTypeAdmin({
-        userId: user.id,
-        organizationId: org.id,
-        agentType: "llm_proxy",
-      }),
-    ).toBe(false);
-  });
 });
 
 describe("hasAnyAgentTypeReadPermission", () => {
@@ -236,18 +191,41 @@ describe("hasAnyAgentTypeReadPermission", () => {
     makeCustomRole,
   }) => {
     const user = await makeUser();
-    const org = await makeOrganization();
+    const org = await makeOrganization({ legacyPermissions: true });
     await makeCustomRole(org.id, {
-      role: "proxy_reader",
-      permission: { llmProxy: ["read"] },
+      role: "gw_reader",
+      permission: { mcpGateway: ["read"] },
     });
-    await makeMember(user.id, org.id, { role: "proxy_reader" });
+    await makeMember(user.id, org.id, { role: "gw_reader" });
 
     const result = await hasAnyAgentTypeReadPermission({
       userId: user.id,
       organizationId: org.id,
     });
     expect(result).toBe(true);
+  });
+
+  test("llmProxy read alone does not count as agent-type read", async ({
+    makeUser,
+    makeOrganization,
+    makeMember,
+    makeCustomRole,
+  }) => {
+    const user = await makeUser();
+    const org = await makeOrganization({ legacyPermissions: true });
+    // The LLM Proxy has its own management routes; llmProxy permissions grant
+    // nothing on the generic agent surface.
+    await makeCustomRole(org.id, {
+      role: "llm_only",
+      permission: { llmProxy: ["read"] },
+    });
+    await makeMember(user.id, org.id, { role: "llm_only" });
+
+    const result = await hasAnyAgentTypeReadPermission({
+      userId: user.id,
+      organizationId: org.id,
+    });
+    expect(result).toBe(false);
   });
 
   test("returns false when user has no read on any agent-type resource", async ({
@@ -257,13 +235,13 @@ describe("hasAnyAgentTypeReadPermission", () => {
     makeCustomRole,
   }) => {
     const user = await makeUser();
-    const org = await makeOrganization();
+    const org = await makeOrganization({ legacyPermissions: true });
     // Role with permissions only on non-agent-type resources
     await makeCustomRole(org.id, {
-      role: "tool_only",
-      permission: { toolPolicy: ["read", "create"] },
+      role: "registry_only",
+      permission: { mcpRegistry: ["read", "create"] },
     });
-    await makeMember(user.id, org.id, { role: "tool_only" });
+    await makeMember(user.id, org.id, { role: "registry_only" });
 
     const result = await hasAnyAgentTypeReadPermission({
       userId: user.id,
@@ -278,7 +256,7 @@ describe("hasAnyAgentTypeReadPermission", () => {
     makeMember,
   }) => {
     const user = await makeUser();
-    const org = await makeOrganization();
+    const org = await makeOrganization({ legacyPermissions: true });
     await makeMember(user.id, org.id, { role: ADMIN_ROLE_NAME });
 
     const result = await hasAnyAgentTypeReadPermission({
@@ -290,27 +268,6 @@ describe("hasAnyAgentTypeReadPermission", () => {
 });
 
 describe("hasAnyAgentTypeAdminPermission", () => {
-  test("returns true when user has admin on at least one agent-type resource", async ({
-    makeUser,
-    makeOrganization,
-    makeMember,
-    makeCustomRole,
-  }) => {
-    const user = await makeUser();
-    const org = await makeOrganization();
-    await makeCustomRole(org.id, {
-      role: "agent_admin",
-      permission: { agent: ["read", "admin"] },
-    });
-    await makeMember(user.id, org.id, { role: "agent_admin" });
-
-    const result = await hasAnyAgentTypeAdminPermission({
-      userId: user.id,
-      organizationId: org.id,
-    });
-    expect(result).toBe(true);
-  });
-
   test("returns false when user has read but not admin", async ({
     makeUser,
     makeOrganization,
@@ -318,7 +275,7 @@ describe("hasAnyAgentTypeAdminPermission", () => {
     makeCustomRole,
   }) => {
     const user = await makeUser();
-    const org = await makeOrganization();
+    const org = await makeOrganization({ legacyPermissions: true });
     await makeCustomRole(org.id, {
       role: "all_reader",
       permission: {
@@ -338,6 +295,36 @@ describe("hasAnyAgentTypeAdminPermission", () => {
 });
 
 describe("getAgentTypePermissionChecker", () => {
+  test("keeps scoped update grants for agents and gateways when filtering policy resources", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: MEMBER_ROLE_NAME });
+    for (const agentType of ["agent", "profile", "mcp_gateway"] as const) {
+      const agent = await makeAgent({
+        organizationId: org.id,
+        authorId: user.id,
+        agentType,
+        access: "personal",
+      });
+      const checker = await getAgentTypePermissionChecker({
+        organizationId: org.id,
+        userId: user.id,
+      });
+      expect(checker.isAdmin(agentType)).toBe(false);
+      expect(
+        checker.allowsScoped({
+          agentId: agent.id,
+          agentType,
+          action: "update",
+        }),
+      ).toBe(true);
+    }
+  });
   test("require() does not throw when permission is present", async ({
     makeUser,
     makeOrganization,
@@ -345,7 +332,7 @@ describe("getAgentTypePermissionChecker", () => {
     makeCustomRole,
   }) => {
     const user = await makeUser();
-    const org = await makeOrganization();
+    const org = await makeOrganization({ legacyPermissions: true });
     await makeCustomRole(org.id, {
       role: "mixed",
       permission: {
@@ -375,7 +362,7 @@ describe("getAgentTypePermissionChecker", () => {
     makeCustomRole,
   }) => {
     const user = await makeUser();
-    const org = await makeOrganization();
+    const org = await makeOrganization({ legacyPermissions: true });
     await makeCustomRole(org.id, {
       role: "gw_only",
       permission: { mcpGateway: ["read"] },
@@ -392,35 +379,6 @@ describe("getAgentTypePermissionChecker", () => {
     expect(() => checker.require("mcp_gateway", "create")).toThrow(ApiError);
   });
 
-  test("isAdmin() returns correct values per agent type", async ({
-    makeUser,
-    makeOrganization,
-    makeMember,
-    makeCustomRole,
-  }) => {
-    const user = await makeUser();
-    const org = await makeOrganization();
-    await makeCustomRole(org.id, {
-      role: "partial_admin",
-      permission: {
-        agent: ["read", "admin"],
-        mcpGateway: ["read"],
-        llmProxy: ["read", "admin"],
-      },
-    });
-    await makeMember(user.id, org.id, { role: "partial_admin" });
-
-    const checker = await getAgentTypePermissionChecker({
-      userId: user.id,
-      organizationId: org.id,
-    });
-
-    expect(checker.isAdmin("agent")).toBe(true);
-    expect(checker.isAdmin("profile")).toBe(true); // alias for agent
-    expect(checker.isAdmin("mcp_gateway")).toBe(false);
-    expect(checker.isAdmin("llm_proxy")).toBe(true);
-  });
-
   test("hasAnyReadPermission() returns true when at least one resource has read", async ({
     makeUser,
     makeOrganization,
@@ -428,12 +386,12 @@ describe("getAgentTypePermissionChecker", () => {
     makeCustomRole,
   }) => {
     const user = await makeUser();
-    const org = await makeOrganization();
+    const org = await makeOrganization({ legacyPermissions: true });
     await makeCustomRole(org.id, {
-      role: "proxy_only",
-      permission: { llmProxy: ["read"] },
+      role: "gw_only",
+      permission: { mcpGateway: ["read"] },
     });
-    await makeMember(user.id, org.id, { role: "proxy_only" });
+    await makeMember(user.id, org.id, { role: "gw_only" });
 
     const checker = await getAgentTypePermissionChecker({
       userId: user.id,
@@ -450,12 +408,12 @@ describe("getAgentTypePermissionChecker", () => {
     makeCustomRole,
   }) => {
     const user = await makeUser();
-    const org = await makeOrganization();
+    const org = await makeOrganization({ legacyPermissions: true });
     await makeCustomRole(org.id, {
-      role: "tool_only",
-      permission: { toolPolicy: ["read"] },
+      role: "registry_only",
+      permission: { mcpRegistry: ["read"] },
     });
-    await makeMember(user.id, org.id, { role: "tool_only" });
+    await makeMember(user.id, org.id, { role: "registry_only" });
 
     const checker = await getAgentTypePermissionChecker({
       userId: user.id,
@@ -465,35 +423,13 @@ describe("getAgentTypePermissionChecker", () => {
     expect(checker.hasAnyReadPermission()).toBe(false);
   });
 
-  test("hasAnyAdminPermission() returns correct values", async ({
-    makeUser,
-    makeOrganization,
-    makeMember,
-    makeCustomRole,
-  }) => {
-    const user = await makeUser();
-    const org = await makeOrganization();
-    await makeCustomRole(org.id, {
-      role: "gw_admin",
-      permission: { mcpGateway: ["read", "admin"] },
-    });
-    await makeMember(user.id, org.id, { role: "gw_admin" });
-
-    const checker = await getAgentTypePermissionChecker({
-      userId: user.id,
-      organizationId: org.id,
-    });
-
-    expect(checker.hasAnyAdminPermission()).toBe(true);
-  });
-
   test("makes only a single DB query regardless of check count", async ({
     makeUser,
     makeOrganization,
     makeMember,
   }) => {
     const user = await makeUser();
-    const org = await makeOrganization();
+    const org = await makeOrganization({ legacyPermissions: true });
     await makeMember(user.id, org.id, { role: MEMBER_ROLE_NAME });
 
     // The checker fetches permissions once at creation time.
@@ -509,295 +445,271 @@ describe("getAgentTypePermissionChecker", () => {
     checker.isAdmin("agent");
     checker.isAdmin("mcp_gateway");
     checker.isAdmin("llm_proxy");
-    checker.isTeamAdmin("agent");
     // If this reached here without issues, the synchronous pattern works
-  });
-
-  test("isTeamAdmin() returns correct values per agent type", async ({
-    makeUser,
-    makeOrganization,
-    makeMember,
-    makeCustomRole,
-  }) => {
-    const user = await makeUser();
-    const org = await makeOrganization();
-    await makeCustomRole(org.id, {
-      role: "partial_team_admin",
-      permission: {
-        agent: ["read", "team-admin"],
-        mcpGateway: ["read"],
-        llmProxy: ["read", "team-admin"],
-      },
-    });
-    await makeMember(user.id, org.id, { role: "partial_team_admin" });
-
-    const checker = await getAgentTypePermissionChecker({
-      userId: user.id,
-      organizationId: org.id,
-    });
-
-    expect(checker.isTeamAdmin("agent")).toBe(true);
-    expect(checker.isTeamAdmin("profile")).toBe(true); // alias for agent
-    expect(checker.isTeamAdmin("mcp_gateway")).toBe(false);
-    expect(checker.isTeamAdmin("llm_proxy")).toBe(true);
-  });
-
-  test("editor role has team-admin permission", async ({
-    makeUser,
-    makeOrganization,
-    makeMember,
-  }) => {
-    const user = await makeUser();
-    const org = await makeOrganization();
-    await makeMember(user.id, org.id, { role: EDITOR_ROLE_NAME });
-
-    const checker = await getAgentTypePermissionChecker({
-      userId: user.id,
-      organizationId: org.id,
-    });
-
-    expect(checker.isTeamAdmin("agent")).toBe(true);
-    expect(checker.isTeamAdmin("mcp_gateway")).toBe(true);
-    expect(checker.isTeamAdmin("llm_proxy")).toBe(true);
-    expect(checker.isAdmin("agent")).toBe(false);
-  });
-
-  test("member role does not have team-admin permission", async ({
-    makeUser,
-    makeOrganization,
-    makeMember,
-  }) => {
-    const user = await makeUser();
-    const org = await makeOrganization();
-    await makeMember(user.id, org.id, { role: MEMBER_ROLE_NAME });
-
-    const checker = await getAgentTypePermissionChecker({
-      userId: user.id,
-      organizationId: org.id,
-    });
-
-    expect(checker.isTeamAdmin("agent")).toBe(false);
-    expect(checker.isTeamAdmin("mcp_gateway")).toBe(false);
-    expect(checker.isTeamAdmin("llm_proxy")).toBe(false);
   });
 });
 
 describe("requireAgentModifyPermission", () => {
-  test("admin bypasses all scope checks", async ({
+  // The agent's scope, teams and author, and the role's admin/team-admin
+  // actions, no longer decide anything: only a grant on the agent (or at `*`)
+  // lets a caller modify it.
+  test("authorizes from grants alone", async ({
     makeUser,
     makeOrganization,
     makeMember,
-  }) => {
-    const user = await makeUser();
-    const org = await makeOrganization();
-    await makeMember(user.id, org.id, { role: ADMIN_ROLE_NAME });
-
-    const checker = await getAgentTypePermissionChecker({
-      userId: user.id,
-      organizationId: org.id,
-    });
-
-    // Admin can manage org-scoped agents
-    expect(() =>
-      requireAgentModifyPermission({
-        checker,
-        agentType: "agent",
-        agentScope: "org",
-        agentAuthorId: "other-user-id",
-        agentTeamIds: [],
-        userTeamIds: [],
-        userId: user.id,
-      }),
-    ).not.toThrow();
-
-    // Admin can manage team-scoped agents (even without team membership)
-    expect(() =>
-      requireAgentModifyPermission({
-        checker,
-        agentType: "agent",
-        agentScope: "team",
-        agentAuthorId: "other-user-id",
-        agentTeamIds: ["some-team-id"],
-        userTeamIds: [],
-        userId: user.id,
-      }),
-    ).not.toThrow();
-
-    // Admin can manage personal agents of other users
-    expect(() =>
-      requireAgentModifyPermission({
-        checker,
-        agentType: "agent",
-        agentScope: "personal",
-        agentAuthorId: "other-user-id",
-        agentTeamIds: [],
-        userTeamIds: [],
-        userId: user.id,
-      }),
-    ).not.toThrow();
-  });
-
-  test("team-admin can manage team-scoped agents in their teams but not others", async ({
-    makeUser,
-    makeOrganization,
-    makeMember,
-  }) => {
-    const user = await makeUser();
-    const org = await makeOrganization();
-    await makeMember(user.id, org.id, { role: EDITOR_ROLE_NAME });
-
-    const checker = await getAgentTypePermissionChecker({
-      userId: user.id,
-      organizationId: org.id,
-    });
-
-    const userTeamIds = ["team-a", "team-b"];
-
-    // Editor (team-admin) can manage agents in their teams
-    expect(() =>
-      requireAgentModifyPermission({
-        checker,
-        agentType: "agent",
-        agentScope: "team",
-        agentAuthorId: "other-user-id",
-        agentTeamIds: ["team-a"],
-        userTeamIds,
-        userId: user.id,
-      }),
-    ).not.toThrow();
-
-    // Editor (team-admin) can manage agents sharing at least one team
-    expect(() =>
-      requireAgentModifyPermission({
-        checker,
-        agentType: "agent",
-        agentScope: "team",
-        agentAuthorId: "other-user-id",
-        agentTeamIds: ["team-b", "team-c"],
-        userTeamIds,
-        userId: user.id,
-      }),
-    ).not.toThrow();
-
-    // Editor cannot manage agents in teams they don't belong to
-    expect(() =>
-      requireAgentModifyPermission({
-        checker,
-        agentType: "agent",
-        agentScope: "team",
-        agentAuthorId: "other-user-id",
-        agentTeamIds: ["team-c"],
-        userTeamIds,
-        userId: user.id,
-      }),
-    ).toThrow(ApiError);
-
-    // Editor cannot manage team-scoped agents with no teams (orphaned)
-    expect(() =>
-      requireAgentModifyPermission({
-        checker,
-        agentType: "agent",
-        agentScope: "team",
-        agentAuthorId: "other-user-id",
-        agentTeamIds: [],
-        userTeamIds,
-        userId: user.id,
-      }),
-    ).toThrow(ApiError);
-
-    // Editor cannot manage org-scoped agents
-    expect(() =>
-      requireAgentModifyPermission({
-        checker,
-        agentType: "agent",
-        agentScope: "org",
-        agentAuthorId: "other-user-id",
-        agentTeamIds: [],
-        userTeamIds,
-        userId: user.id,
-      }),
-    ).toThrow(ApiError);
-  });
-
-  test("member cannot manage team-scoped or org-scoped agents", async ({
-    makeUser,
-    makeOrganization,
-    makeMember,
+    makeAgent,
   }) => {
     const user = await makeUser();
     const org = await makeOrganization();
     await makeMember(user.id, org.id, { role: MEMBER_ROLE_NAME });
-
-    const checker = await getAgentTypePermissionChecker({
-      userId: user.id,
+    const agent = await makeAgent({
       organizationId: org.id,
+      agentType: "agent",
+    });
+    const context = { userId: user.id, organizationId: org.id };
+    const modify = async (action: "update" | "delete" | "manage-permissions") =>
+      requireAgentModifyPermission({
+        checker: await getAgentTypePermissionChecker(context),
+        agentType: agent.agentType,
+        agentId: agent.id,
+        action,
+      });
+
+    await expect(modify("update")).rejects.toThrow(ApiError);
+
+    const key = {
+      organizationId: org.id,
+      resource: "agent" as const,
+      scope: agent.id,
+    };
+    const current = await ResourcePermissionPolicyModel.find(key);
+    await ResourcePermissionPolicyModel.replace({
+      ...key,
+      revision: current?.revision ?? 0,
+      grants: [
+        ...(current?.grants ?? []),
+        {
+          subject: { type: "user", id: user.id },
+          actions: ["read", "use", "update"],
+        },
+      ],
     });
 
-    // Member cannot manage team-scoped agents
-    expect(() =>
-      requireAgentModifyPermission({
-        checker,
-        agentType: "agent",
-        agentScope: "team",
-        agentAuthorId: "other-user-id",
-        agentTeamIds: ["team-a"],
-        userTeamIds: ["team-a"],
-        userId: user.id,
-      }),
-    ).toThrow(ApiError);
-
-    // Member cannot manage org-scoped agents
-    expect(() =>
-      requireAgentModifyPermission({
-        checker,
-        agentType: "agent",
-        agentScope: "org",
-        agentAuthorId: "other-user-id",
-        agentTeamIds: [],
-        userTeamIds: [],
-        userId: user.id,
-      }),
-    ).toThrow(ApiError);
+    await expect(modify("update")).resolves.toBeUndefined();
+    await expect(modify("delete")).rejects.toThrow(ApiError);
+    await expect(modify("manage-permissions")).rejects.toThrow(
+      "You do not have permission to manage access to this resource",
+    );
   });
 
-  test("member can manage own personal agent but not others' personal agents", async ({
+  test("a role holding the retired admin actions gains nothing from them", async ({
     makeUser,
     makeOrganization,
     makeMember,
+    makeCustomRole,
+    makeAgent,
   }) => {
     const user = await makeUser();
     const org = await makeOrganization();
-    await makeMember(user.id, org.id, { role: MEMBER_ROLE_NAME });
-
+    const role = await makeCustomRole(org.id, {
+      role: "legacy_agent_admin",
+      permission: { agent: ["read", "update", "team-admin", "admin"] },
+    });
+    await makeMember(user.id, org.id, { role: role.role });
+    const agent = await makeAgent({
+      organizationId: org.id,
+      agentType: "agent",
+    });
     const checker = await getAgentTypePermissionChecker({
       userId: user.id,
       organizationId: org.id,
     });
 
-    // Member can manage own personal agent
+    expect(checker.isAdmin("agent")).toBe(false);
+    expect(checker.hasAnyAdminPermission()).toBe(false);
     expect(() =>
       requireAgentModifyPermission({
         checker,
         agentType: "agent",
-        agentScope: "personal",
-        agentAuthorId: user.id,
-        agentTeamIds: [],
-        userTeamIds: [],
-        userId: user.id,
-      }),
-    ).not.toThrow();
-
-    // Member cannot manage another user's personal agent
-    expect(() =>
-      requireAgentModifyPermission({
-        checker,
-        agentType: "agent",
-        agentScope: "personal",
-        agentAuthorId: "other-user-id",
-        agentTeamIds: [],
-        userTeamIds: [],
-        userId: user.id,
+        agentId: agent.id,
+        action: "update",
       }),
     ).toThrow(ApiError);
   });
 });
+
+describe("scoped agent authority", () => {
+  test("wildcard update authority follows resource type and disappears on revocation", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeCustomRole,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const role = await makeCustomRole(org.id, { permission: {} });
+    await makeMember(user.id, org.id, { role: role.role });
+    const key = {
+      organizationId: org.id,
+      resource: "agent" as const,
+      scope: "*",
+    };
+    const current = await ResourcePermissionPolicyModel.find(key);
+    const saved = await ResourcePermissionPolicyModel.replace({
+      ...key,
+      revision: current?.revision ?? 0,
+      grants: [{ subject: { type: "role", id: role.id }, actions: ["update"] }],
+    });
+    expect(saved).not.toBeNull();
+    const context = { organizationId: org.id, userId: user.id };
+    const checker = await getAgentTypePermissionChecker(context);
+    expect(checker.isAdmin("agent")).toBe(true);
+    expect(checker.isAdmin("profile")).toBe(true);
+    expect(checker.isAdmin("mcp_gateway")).toBe(false);
+    expect(checker.hasAnyAdminPermission()).toBe(true);
+    expect(await isAgentTypeAdmin({ ...context, agentType: "agent" })).toBe(
+      true,
+    );
+    expect(await hasAnyAgentTypeAdminPermission(context)).toBe(true);
+    await ResourcePermissionPolicyModel.replace({
+      ...key,
+      revision: saved?.revision ?? 0,
+      grants: [],
+    });
+    expect(await hasAnyAgentTypeAdminPermission(context)).toBe(false);
+  });
+
+  test("the built-in Editor has no implicit team-wide or wildcard authority", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: EDITOR_ROLE_NAME });
+    const checker = await getAgentTypePermissionChecker({
+      organizationId: org.id,
+      userId: user.id,
+    });
+    expect(checker.isAdmin("agent")).toBe(false);
+    expect(checker.hasAnyAdminPermission()).toBe(false);
+  });
+});
+
+describe("getAgentTypeListPermissionChecker", () => {
+  test("answers every list question as the full checker does, without reading shared agents", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeTeam,
+    makeTeamMember,
+    makeCustomRole,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    await db.transaction((tx) =>
+      ResourcePermissionPolicyModel.initializeOrganization({
+        tx,
+        organizationId: org.id,
+      }),
+    );
+    const admin = await makeUser();
+    await makeMember(admin.id, org.id, { role: ADMIN_ROLE_NAME });
+    const author = await makeUser();
+    await makeMember(author.id, org.id, { role: MEMBER_ROLE_NAME });
+    const teamReader = await makeUser();
+    await makeMember(teamReader.id, org.id, { role: MEMBER_ROLE_NAME });
+    const team = await makeTeam(org.id, teamReader.id);
+    await makeTeamMember(team.id, teamReader.id);
+    const viewer = await makeUser();
+    await makeMember(viewer.id, org.id, { role: MEMBER_ROLE_NAME });
+    const roleReader = await makeUser();
+    const role = await makeCustomRole(org.id, {
+      permission: { mcpGateway: ["read"] },
+    });
+    await makeMember(roleReader.id, org.id, { role: role.role });
+    const outsider = await makeUser();
+    await makeMember(outsider.id, org.id, { role: MEMBER_ROLE_NAME });
+
+    // The author owns a gateway (every action on it), the team reads a
+    // profile, the viewer reads an agent, and the organization reads an
+    // agent: grants of every kind on single agents.
+    await makeAgent({
+      organizationId: org.id,
+      authorId: author.id,
+      agentType: "mcp_gateway",
+      access: "personal",
+    });
+    await makeAgent({
+      organizationId: org.id,
+      agentType: "profile",
+      access: { teams: [team.id], level: "use" },
+    });
+    await makeAgent({
+      organizationId: org.id,
+      agentType: "agent",
+      access: { users: [viewer.id], preset: "view" },
+    });
+    await makeAgent({ organizationId: org.id, agentType: "agent" });
+    // A scope that names no agent and is not `*` grants nothing.
+    await db.insert(schema.resourcePermissionPoliciesTable).values({
+      organizationId: org.id,
+      resource: "mcpGateway",
+      scope: "not-an-agent-id",
+      grants: [
+        {
+          subject: { type: "user", id: outsider.id },
+          actions: ["read", "delete"],
+        },
+      ] as never,
+    });
+
+    const types: AgentType[] = ["agent", "profile", "mcp_gateway"];
+    for (const caller of [
+      admin,
+      author,
+      teamReader,
+      viewer,
+      roleReader,
+      outsider,
+    ]) {
+      const context = { userId: caller.id, organizationId: org.id };
+      const full = await getAgentTypePermissionChecker(context);
+      const list = await getAgentTypeListPermissionChecker({
+        ...context,
+        actions: ["read", "delete"],
+      });
+      const answers = (checker: typeof list) => ({
+        hasAnyAdminPermission: checker.hasAnyAdminPermission(),
+        byType: types.map((type) => ({
+          type,
+          isAdmin: checker.isAdmin(type),
+          requireRead: requires(() => checker.require(type, "read")),
+          requireDelete: requires(() => checker.require(type, "delete")),
+        })),
+        withRead: checker.getAgentTypesWithPermission("read"),
+        withDelete: checker.getAgentTypesWithPermission("delete"),
+        scopedRead: checker.getAgentTypesWithScopedPermission("read"),
+        scopedDelete: checker.getAgentTypesWithScopedPermission("delete"),
+      });
+      expect(answers(list), caller.email).toEqual(
+        answers({
+          ...full,
+          getAgentTypesWithScopedPermission: (action) =>
+            full.getAgentTypesWithScopedPermission?.(action) ?? [],
+        }),
+      );
+    }
+  });
+});
+
+/** Whether a `require` check passes; any other error fails the test. */
+function requires(check: () => void): boolean {
+  try {
+    check();
+    return true;
+  } catch (error) {
+    if (error instanceof ApiError && error.statusCode === 403) return false;
+    throw error;
+  }
+}

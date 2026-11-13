@@ -1,0 +1,1420 @@
+import {
+  MAX_PROJECT_UPLOAD_BYTES,
+  MAX_PROJECT_UPLOAD_MB,
+  PROJECT_INSTRUCTIONS_FILENAME,
+  type ResourcePermissionGrant,
+} from "@archestra/shared";
+import { sql } from "drizzle-orm";
+import { isGlobalAdmin } from "@/auth";
+import { isServiceAccountUserId } from "@/auth/service-account-user-id";
+import { withDbTransaction } from "@/database";
+import logger from "@/logging";
+import {
+  AgentModel,
+  AgentRunModel,
+  AppAccessModel,
+  AppModel,
+  ConversationModel,
+  ConversationNotOwnedError,
+  CreatedByModel,
+  FileNameExistsError,
+  lookupCreator,
+  ProjectAccessModel,
+  ProjectAlreadyAssignedError,
+  ProjectAppModel,
+  ProjectLabelModel,
+  ProjectModel,
+  ProjectPinModel,
+  TeamModel,
+  UserModel,
+} from "@/models";
+import { ProjectNameExistsError } from "@/models/project";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import ResourcePermissionSubjectModel, {
+  type GrantPrincipal,
+  type ResourceAccessSelection,
+} from "@/models/resource-permission-subject";
+import { ResourcePermissions } from "@/services/resource-permissions";
+import { fileStore } from "@/skills-sandbox/file-store";
+import { validateProjectName } from "@/skills-sandbox/project-name";
+import type {
+  AgentScope,
+  GetAgentRunResponse,
+  LabelWithDetails,
+  Project,
+  ProjectAppListItem,
+  ProjectConversationItem,
+  ProjectDetail,
+  ProjectLifecycle,
+  ProjectListItem,
+  ProjectListScope,
+  ProjectViewerRole,
+  ProjectVisibility,
+  SandboxFileListItem,
+} from "@/types";
+import { ApiError } from "@/types";
+import {
+  nextAvailableName,
+  sanitizeUploadFilename,
+} from "@/utils/upload-filename";
+
+/** Who a project reaches, which is what its default agent must cover. */
+type ProjectShareAudience = {
+  visibility: ProjectVisibility | null;
+  teamIds: string[];
+  userIds: string[];
+};
+
+/**
+ * Projects: named collections of chats and run sessions that own a set of result files
+ * (`files.project_id`). Mutations are owner-only; access to the project (and so
+ * its files) is governed by its permission policy (see ProjectAccessModel).
+ */
+class ProjectService {
+  async create(params: {
+    organizationId: string;
+    userId: string;
+    name: string;
+    description: string | null;
+    icon?: string | null;
+    defaultAgentId?: string | null;
+    labels?: LabelWithDetails[];
+    /** Explicit starting audience; validated by the caller before it lands. */
+    initialPermissionGrants?: ResourcePermissionGrant[];
+  }): Promise<Project> {
+    if (isServiceAccountUserId(params.userId)) {
+      throw new ApiError(400, "Projects require a personal user account.");
+    }
+    const name = params.name.trim();
+    const invalid = validateProjectName(name);
+    if (invalid) {
+      throw new ApiError(400, `project name is invalid: ${invalid}`);
+    }
+    if (params.defaultAgentId) {
+      // A project is unshared at creation, so the creator is its whole audience.
+      await this.requirePinnableDefaultAgent({
+        agentId: params.defaultAgentId,
+        organizationId: params.organizationId,
+        ownerUserId: params.userId,
+        share: { visibility: null, teamIds: [], userIds: [] },
+      });
+    }
+    try {
+      const project = await ProjectModel.create(
+        {
+          organizationId: params.organizationId,
+          userId: params.userId,
+          name,
+          description: params.description,
+          icon: params.icon ?? null,
+          defaultAgentId: params.defaultAgentId ?? null,
+        },
+        { initialPermissionGrants: params.initialPermissionGrants },
+      );
+      if (params.labels?.length) {
+        await ProjectLabelModel.syncLabels(project.id, params.labels);
+      }
+      return project;
+    } catch (error) {
+      if (error instanceof ProjectNameExistsError) {
+        throw new ApiError(
+          409,
+          `a project named "${name}" already exists in this organization`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Turn one of the caller's chats into a project: create the project, move the
+   * chat into it, and re-point the chat's files to the project (see
+   * {@link ProjectModel.createFromConversation}). Owner-only; only `user`
+   * chats are eligible (scheduled-run conversations are rejected) and a chat
+   * already in a project can't seed another. `name` defaults to the chat title.
+   */
+  async createProjectFromConversation(params: {
+    organizationId: string;
+    userId: string;
+    conversationId: string;
+    name?: string | null;
+    description?: string | null;
+    icon?: string | null;
+    labels?: LabelWithDetails[];
+  }): Promise<{ project: Project; filesMoved: number }> {
+    const meta = await ConversationModel.getOwnedMeta({
+      id: params.conversationId,
+      userId: params.userId,
+      organizationId: params.organizationId,
+    });
+    if (!meta) {
+      throw new ApiError(404, "Conversation not found");
+    }
+    if (meta.origin !== "user") {
+      throw new ApiError(409, "Only user chats can be turned into a project");
+    }
+    if (meta.projectId) {
+      throw new ApiError(409, "This chat already belongs to a project");
+    }
+    // Same rule as creating or moving a chat into a project (see the chat
+    // routes): this turns the conversation into a project chat, so a locked one
+    // would end up in a shared space listing a conversation nobody there can
+    // open. The UI already hides the action; this is the authoritative check a
+    // custom client also meets.
+    if (meta.encryptedChat) {
+      throw new ApiError(
+        400,
+        "Encrypted chats cannot be turned into a project",
+      );
+    }
+
+    const name =
+      params.name?.trim() || meta.title?.trim() || "Untitled project";
+    const invalid = validateProjectName(name);
+    if (invalid) {
+      throw new ApiError(400, `project name is invalid: ${invalid}`);
+    }
+
+    try {
+      const result = await ProjectModel.createFromConversation({
+        organizationId: params.organizationId,
+        userId: params.userId,
+        conversationId: params.conversationId,
+        name,
+        description: params.description ?? null,
+        icon: params.icon ?? null,
+      });
+      if (params.labels?.length) {
+        await ProjectLabelModel.syncLabels(result.project.id, params.labels);
+      }
+      return result;
+    } catch (error) {
+      if (error instanceof ConversationNotOwnedError) {
+        throw new ApiError(404, "Conversation not found");
+      }
+      if (error instanceof ProjectAlreadyAssignedError) {
+        throw new ApiError(409, "This chat already belongs to a project");
+      }
+      if (error instanceof ProjectNameExistsError) {
+        throw new ApiError(
+          409,
+          `a project named "${name}" already exists in this organization`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Projects for the list view, scoped + searched, mirroring the Agents filter.
+   * `scope` is the project's share visibility (mutually exclusive): `personal`
+   * (private), `team` (shared with teams — narrow with `teamIds`), or `org`
+   * (org-wide); omitted = everything the caller can see. Admins draw from ALL
+   * org projects and can filter `personal` by owner via `authorIds` /
+   * `excludeAuthorIds` (the "My / Other users" sub-filter); everyone else is
+   * limited to their accessible set. `viewerRole` is the caller's real
+   * relationship to each project (owner / shared / admin-oversight).
+   */
+  async list(params: {
+    organizationId: string;
+    userId: string;
+    isProjectAdmin?: boolean;
+    scope?: ProjectListScope;
+    teamIds?: string[];
+    authorIds?: string[];
+    excludeAuthorIds?: string[];
+    search?: string;
+    status?: ProjectLifecycle;
+    labelFilteredIds?: string[];
+    /**
+     * The list's "Show", "Shared with", and "Owner" filters. Without
+     * `relations` the default "All" view applies before the other two narrow.
+     */
+    access?: ResourceAccessSelection;
+    /** `true`: only the caller's pinned projects; `false`: only the others. */
+    pinned?: boolean;
+    /** Page size; omitted returns every match. */
+    limit?: number;
+    offset?: number;
+  }): Promise<{ data: ProjectListItem[]; total: number }> {
+    const { organizationId, userId, scope } = params;
+
+    // The caller's principal and pins are each read once per request: the
+    // principal backs the access check and the "Show" filter, the pins back
+    // the `pinned` filter and the page's `pinnedAt`.
+    const [principal, pins] = await Promise.all([
+      ResourcePermissionSubjectModel.resolvePrincipal({
+        userId,
+        organizationId,
+      }),
+      ProjectPinModel.getPinnedAtForUser(userId),
+    ]);
+
+    // The deleted slice is a separate, oversight path for holders of a grant on every project; the
+    // active browse pipeline below (scope/author/search/team filters, the
+    // "All" branch that drops admin-oversight rows) does not apply to it.
+    if (params.status === "deleted") {
+      return this.listDeleted({ ...params, principal, pins });
+    }
+
+    // What the caller can reach (owner ∪ shared to them), or for a holder of
+    // `update` on every project, the whole org. The "All" view (no scope, no
+    // "Show" filter) shows only what the caller can actually access, which for
+    // an admin drops every oversight row; those stay reachable via Personal →
+    // Other users and Team → pick that team. The "Show" filter replaces that
+    // rule and reaches oversight-only rows through `others`. A pinned-only
+    // listing is cut to the pins, so it never reads the rest.
+    const { rows, total } = await ProjectAccessModel.listPage({
+      userId,
+      organizationId,
+      principal,
+      includeOversight: params.isProjectAdmin,
+      reachableOnly:
+        scope === undefined && params.access?.relations === undefined,
+      scope,
+      teamIds: params.teamIds,
+      // admin "My / Other users" owner sub-filter (honored upstream for admins only).
+      authorIds: params.authorIds,
+      excludeAuthorIds: params.excludeAuthorIds,
+      search: params.search,
+      ids: params.labelFilteredIds,
+      access: params.access,
+      pins:
+        params.pinned === undefined
+          ? undefined
+          : { ids: [...pins.keys()], pinned: params.pinned },
+      ownerFirst: true,
+      limit: params.limit,
+      offset: params.offset,
+    });
+    const page = rows.map((project) => ({
+      project,
+      viewerRole: (project.userId === userId
+        ? "owner"
+        : project.accessible
+          ? "shared"
+          : "admin") as ProjectViewerRole,
+    }));
+
+    const data = await this.toListItems({
+      rows: page,
+      userId,
+      pins,
+      // Team and user recipients go on the badge for the owner and for an
+      // overseer of every project, whose grant makes the project read as
+      // "shared" to them. A plain "shared" recipient (a member of one of the
+      // teams) gets null — the full target list stays the owner's business.
+      showsRecipients: ({ viewerRole }) =>
+        viewerRole === "owner" ||
+        viewerRole === "admin" ||
+        params.isProjectAdmin === true,
+    });
+    return { data, total };
+  }
+
+  /**
+   * Org-wide list of soft-deleted projects for an overseer of every project — the oversight
+   * companion to {@link restore}. Non-admins get nothing. Every row is
+   * `viewerRole: "admin"` (a soft-deleted project is never in anyone's
+   * accessible set) and carries `deletedAt` for the "deleted N ago" label.
+   * `conversationCount` is typically 0: chats detached on delete.
+   */
+  private async listDeleted(params: {
+    organizationId: string;
+    userId: string;
+    isProjectAdmin?: boolean;
+    principal: GrantPrincipal;
+    pins: Map<string, Date>;
+    limit?: number;
+    offset?: number;
+  }): Promise<{ data: ProjectListItem[]; total: number }> {
+    if (!params.isProjectAdmin) return { data: [], total: 0 };
+    const { rows, total } = await ProjectAccessModel.listPage({
+      userId: params.userId,
+      organizationId: params.organizationId,
+      principal: params.principal,
+      includeOversight: true,
+      lifecycle: "deleted",
+      limit: params.limit,
+      offset: params.offset,
+    });
+    const page = rows.map((project) => ({
+      project,
+      viewerRole: "admin" as ProjectViewerRole,
+    }));
+    const data = await this.toListItems({
+      rows: page,
+      userId: params.userId,
+      pins: params.pins,
+      showsRecipients: () => true,
+    });
+    return { data, total };
+  }
+
+  async get(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+    allowAdminOversight?: boolean;
+  }): Promise<ProjectDetail> {
+    const { project, viewerRole } = await this.requireViewable(params);
+    const [audience, counts, pins, ownerNames, creators, defaultAgent, labels] =
+      await Promise.all([
+        ProjectAccessModel.findAudience(project),
+        ProjectModel.countConversations([project.id]),
+        ProjectPinModel.getPinnedAtForProjects({
+          userId: params.userId,
+          projectIds: [project.id],
+        }),
+        UserModel.getNamesByIds([project.userId]),
+        CreatedByModel.resolve([project.userId]),
+        project.defaultAgentId
+          ? AgentModel.findPinnableProjectDefault({
+              id: project.defaultAgentId,
+              organizationId: project.organizationId,
+            })
+          : null,
+        ProjectLabelModel.getLabelsFor(project.id),
+      ]);
+    // Re-checked rather than returned raw: a pin can outlive its eligibility —
+    // the agent soft-deleted, rescoped, or the project shared more widely than
+    // the agent reaches — and reporting a stale one would preselect an agent
+    // the member cannot actually use.
+    const reachableDefaultAgent =
+      defaultAgent &&
+      (await this.agentReachesAudience({
+        agent: defaultAgent,
+        organizationId: project.organizationId,
+        ownerUserId: project.userId,
+        share: audienceForPin(audience),
+      }))
+        ? { id: defaultAgent.id, name: defaultAgent.name }
+        : null;
+    // Share targets are visible to whoever can manage the project (so the edit
+    // dialog can populate sharing): the owner, or a project admin — including on
+    // a project merely shared with them (viewerRole "shared"), so they still get
+    // the team list. requireManageable enforces the same gate on write.
+    const canManage =
+      viewerRole === "owner" ||
+      viewerRole === "admin" ||
+      (await ResourcePermissions.allows({
+        userId: params.userId,
+        organizationId: params.organizationId,
+        resource: "project",
+        scope: "*",
+        action: "update",
+      }));
+    return {
+      id: project.id,
+      name: project.name,
+      description: project.description,
+      icon: project.icon,
+      viewerRole,
+      ownerName: ownerNames.get(project.userId) ?? null,
+      createdBy: lookupCreator(creators, project.userId),
+      labels,
+      conversationCount: counts.get(project.id) ?? 0,
+      visibility: audience.visibility,
+      shareTeamIds: canManage ? audience.teams.map((t) => t.id) : null,
+      shareUserIds: canManage ? audience.users.map((u) => u.id) : null,
+      shareTeamNames:
+        viewerRole === "owner" && audience.visibility === "team"
+          ? audience.teams.map((t) => t.name)
+          : null,
+      shareUserNames:
+        canManage && audience.visibility === "user"
+          ? audience.users.map((u) => u.name)
+          : null,
+      pinnedAt: pins.get(project.id) ?? null,
+      defaultAgent: reachableDefaultAgent,
+      createdAt: project.createdAt,
+      deletedAt: project.deletedAt,
+    };
+  }
+
+  /**
+   * Update name/description/icon/default agent (owner or project admin); only
+   * provided keys change.
+   */
+  async update(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+    name?: string;
+    description?: string | null;
+    icon?: string | null;
+    defaultAgentId?: string | null;
+    labels?: LabelWithDetails[];
+  }): Promise<void> {
+    const project = await this.requireManageable(params);
+    const fields: {
+      name?: string;
+      description?: string | null;
+      icon?: string | null;
+      defaultAgentId?: string | null;
+    } = {};
+    if (params.name !== undefined) {
+      const name = params.name.trim();
+      const invalid = validateProjectName(name);
+      if (invalid) {
+        throw new ApiError(400, `project name is invalid: ${invalid}`);
+      }
+      fields.name = name;
+    }
+    if (params.description !== undefined)
+      fields.description = params.description;
+    if (params.icon !== undefined) fields.icon = params.icon;
+    if (params.defaultAgentId !== undefined) {
+      if (params.defaultAgentId !== null) {
+        await this.requirePinnableDefaultAgent({
+          agentId: params.defaultAgentId,
+          organizationId: params.organizationId,
+          ownerUserId: project.userId,
+          share: await this.loadShareAudience(project),
+        });
+      }
+      fields.defaultAgentId = params.defaultAgentId;
+    } else if (project.defaultAgentId) {
+      // Repair a pin that outlived its eligibility. The read path hides such a
+      // pin, so the editor is shown "no default" and cannot clear what it
+      // cannot see — leaving the row set means re-widening the agent's scope
+      // silently resurrects a pin the user was last told was absent.
+      const stillReachable = await this.agentReachesProjectAudience({
+        agentId: project.defaultAgentId,
+        organizationId: params.organizationId,
+        ownerUserId: project.userId,
+        share: await this.loadShareAudience(project),
+      });
+      if (!stillReachable) fields.defaultAgentId = null;
+    }
+    if (Object.keys(fields).length === 0 && params.labels === undefined) return;
+    try {
+      if (Object.keys(fields).length > 0) {
+        await ProjectModel.update({ id: params.id, fields });
+      }
+      if (params.labels !== undefined) {
+        await ProjectLabelModel.syncLabels(params.id, params.labels);
+      }
+    } catch (error) {
+      if (error instanceof ProjectNameExistsError) {
+        throw new ApiError(
+          409,
+          `a project named "${fields.name}" already exists`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * The project's instructions text ("" when never saved). Readable by anyone
+   * with project access — the instructions steer every chat in the project.
+   */
+  async getInstructions(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+  }): Promise<{ content: string }> {
+    // Instructions are project config (not chats), so a project admin overseeing
+    // a foreign project may read them too — same gate as the project detail/files.
+    const { project } = await this.requireViewable({
+      ...params,
+      allowAdminOversight: true,
+    });
+    const content = await fileStore.readProjectInstructions({
+      organizationId: params.organizationId,
+      projectId: project.id,
+    });
+    return { content: content ?? "" };
+  }
+
+  /**
+   * Whether the caller may manage the project (owner or project admin) — the
+   * gate {@link setInstructions} applies, for callers that write the
+   * instructions file through another path (the agent file tools).
+   */
+  async canManage(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+  }): Promise<boolean> {
+    try {
+      await this.requireManageable(params);
+      return true;
+    } catch (error) {
+      if (error instanceof ApiError && error.statusCode === 404) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Create or replace the project's instructions (owner only). The first save
+   * materializes the real `instructions.md` file; empty content is kept (an
+   * empty file is simply not injected into chats), never deleted.
+   */
+  async setInstructions(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+    content: string;
+  }): Promise<void> {
+    // Writing instructions is project management (like edit/share/delete), so the
+    // owner or a project admin may do it.
+    const project = await this.requireManageable(params);
+    await fileStore.writeProjectInstructions({
+      organizationId: params.organizationId,
+      userId: params.userId,
+      projectId: project.id,
+      content: params.content,
+    });
+  }
+
+  /**
+   * Soft delete via {@link ProjectModel.delete}: the project row is stamped
+   * `deleted_at` and its files + scheduled tasks are RETAINED but hidden, so a
+   * restore recovers them intact. Only chats detach (SET NULL) and survive as
+   * ordinary conversations. Nothing is purged — externally-stored bytes are
+   * kept in place (the object folder is the project's slug, which the retained
+   * row keeps), reclaimed only by a future hard-delete/purge path.
+   */
+  async delete(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+  }): Promise<void> {
+    // Deleting is decided by the project's own grant, like any other object:
+    // whoever holds `delete` on it — its owner, a recipient given that much, or
+    // a holder of `delete` on every project. Anyone else reads it as missing.
+    const project = await ProjectModel.findById(params.id);
+    if (
+      !project ||
+      project.organizationId !== params.organizationId ||
+      !(await this.callerCanDeleteProject({ ...params, projectId: project.id }))
+    ) {
+      throw new ApiError(404, "Project not found");
+    }
+    await ProjectModel.delete(params.id);
+  }
+
+  /**
+   * Restore a soft-deleted project, the inverse of {@link delete}. Its retained
+   * files and scheduled tasks come back with it; chats do NOT (they detached on
+   * delete), so a restored project reports zero chats.
+   *
+   * Decided by the same grant as delete: `delete` on the project, which a
+   * soft-deleted project keeps. Unknown / already-active / wrong-org ids, and
+   * callers without that grant, all read as 404.
+   *
+   * Deleting frees the display name (the `(user_id, name)` index is partial on
+   * `deleted_at IS NULL`), so the owner may hold an active project under that
+   * name by the time anyone restores. `name` is the way out: it renames the
+   * project on the way back, in the same transaction, so the collision is
+   * recoverable without touching whichever project took the name. Restoring
+   * into a name that is still taken — with or without `name` — is a 409 that
+   * says so.
+   */
+  async restore(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+    /** Rename on restore; the remedy when the original name was re-taken. */
+    name?: string;
+  }): Promise<ProjectDetail> {
+    const project = await ProjectModel.findDeletedByIdForOrganization({
+      id: params.id,
+      organizationId: params.organizationId,
+    });
+    if (
+      !project ||
+      !(await this.callerCanDeleteProject({ ...params, projectId: project.id }))
+    ) {
+      throw new ApiError(404, "Project not found");
+    }
+    let newName: string | undefined;
+    if (params.name !== undefined) {
+      newName = params.name.trim();
+      const invalid = validateProjectName(newName);
+      if (invalid) {
+        throw new ApiError(400, `project name is invalid: ${invalid}`);
+      }
+    }
+    let restored: boolean;
+    try {
+      restored = await ProjectModel.restore({
+        id: params.id,
+        organizationId: params.organizationId,
+        name: project.name,
+        newName,
+      });
+    } catch (error) {
+      if (error instanceof ProjectNameExistsError) {
+        throw new ApiError(
+          409,
+          `cannot restore: its owner already has an active project named "${newName ?? project.name}". ` +
+            "Restore it under a different name by passing `name`.",
+        );
+      }
+      throw error;
+    }
+    // Lost a race: another request restored or hard-deleted it first.
+    if (!restored) {
+      throw new ApiError(404, "Project not found");
+    }
+    // Now active again. The caller holds `delete` on it (checked above) but is
+    // not necessarily its owner or a recipient that can read it, so read it
+    // back via admin oversight when that applies.
+    return this.get({ ...params, allowAdminOversight: true });
+  }
+
+  /**
+   * Permanently destroy a soft-deleted project. Irreversible, no grace period:
+   * the row goes, and the cascade takes its files, pins, share configuration,
+   * and scheduled tasks (with their runs). Chats are untouched — they detached
+   * at soft-delete time and survive as ordinary conversations.
+   *
+   * Global admins only, checked before anything is read. Unknown ids, live
+   * projects, other tenants' projects, and callers who are not global admins
+   * all read as the same 404: a distinct error on any of them would confirm
+   * that a trashed project with that id exists.
+   *
+   * A grant on every project deliberately does NOT reach here. It is the
+   * oversight grant — see, restore, tidy up after other members — and a custom
+   * role can carry it. Destroying a project outright is the deployment owner's
+   * call, so the built-in admin roles are the whole gate.
+   *
+   * File BYTES living outside Postgres are removed by row, INSIDE the
+   * transaction and as its last step. Two things follow from that, both
+   * deliberate:
+   *
+   * The conversation equivalent (`fileStore.purgeConversationFileRows`, as used
+   * by the retention job) defers its byte deletion to AFTER commit, and that is
+   * right there — a conversation's object key contains a UUID, which is never
+   * handed out twice. A project's key contains its SLUG, and committing this
+   * delete frees that slug for the next project of the same name
+   * ({@link ProjectModel.generateUniqueSlug} counts only existing rows). Delete
+   * after commit and a project created in that window owns these paths while
+   * they are still being removed. Deleting before commit keeps the row — and so
+   * the slug — held, which closes it.
+   *
+   * Byte deletion goes LAST because an object store cannot roll back. Anything
+   * that fails ahead of it (the lock, the cascade, a deadlock between them)
+   * rolls back for free; only a commit failure, the one step after, can leave a
+   * restored project whose bytes are gone.
+   *
+   * Nothing bounds the object-store round-trips, so the transaction is capped
+   * by `idle_in_transaction_session_timeout` — `statement_timeout` does not
+   * cover time spent between statements. Hitting the cap aborts the purge and
+   * leaves the project in the trash, possibly minus some bytes.
+   *
+   * Objects sitting in the project's folder with no `files` row are NOT
+   * removed; nothing attributes them to a project. See
+   * {@link FileStore.captureProjectFileBytes}.
+   *
+   * An object the store refuses to delete does not fail the purge — the rows
+   * are gone by then, so the only alternative is a project that can never be
+   * purged. It is reported instead: each one warns with its object key and
+   * increments `file_storage_orphaned_objects_total`, and a surviving count
+   * warns once more here. Alert on the counter; a "permanent" delete that left
+   * bytes behind is not something to discover by reading logs.
+   */
+  async purge(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+  }): Promise<void> {
+    if (!(await isGlobalAdmin(params.userId, params.organizationId))) {
+      throw new ApiError(404, "Project not found");
+    }
+
+    const purged = await withDbTransaction(async (tx) => {
+      // `sql.raw`, not an interpolated value: SET is a utility command and
+      // takes no bind parameters. The value is a module constant.
+      await tx.execute(
+        sql.raw(
+          `SET LOCAL idle_in_transaction_session_timeout = ${PURGE_IDLE_TIMEOUT_MS}`,
+        ),
+      );
+
+      // The lock is the race guard: a concurrent restore either wins (no
+      // soft-deleted row here, so we stop) or waits and then finds nothing.
+      const locked = await ProjectModel.lockIfDeleted(tx, {
+        id: params.id,
+        organizationId: params.organizationId,
+      });
+      if (!locked) return false;
+
+      // Captured while the rows still exist — the cascade below removes them.
+      const purgeBytes = await fileStore.captureProjectFileBytes(
+        { organizationId: params.organizationId, projectId: params.id },
+        tx,
+      );
+      await ProjectModel.hardDeleteLocked(tx, params.id);
+      return { orphaned: await purgeBytes() };
+    });
+
+    if (!purged) throw new ApiError(404, "Project not found");
+
+    // A byte delete that fails does NOT fail the purge: the rows are already
+    // gone, so refusing to commit would only trade leftover bytes for a project
+    // that cannot be purged at all. It must not pass silently either — this is
+    // the one line that says a "permanent" delete was not total, and it names a
+    // count so a store-wide outage reads differently from one stubborn object.
+    if (purged.orphaned > 0) {
+      logger.warn(
+        {
+          projectId: params.id,
+          organizationId: params.organizationId,
+          orphaned: purged.orphaned,
+        },
+        "Project permanently deleted, but some stored file contents could not be removed and are now orphaned; see the preceding warnings for their object keys",
+      );
+    }
+  }
+
+  /**
+   * Files owned by the project. Project access (not file ownership) is the
+   * authorization, mirroring the in-chat tool scope.
+   */
+  async listFiles(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+    allowAdminOversight?: boolean;
+  }): Promise<SandboxFileListItem[]> {
+    const { project } = await this.requireViewable(params);
+    // Access is the service gate above (requireViewable); fileStore.search
+    // lists by project scope and does not re-check the caller.
+    return fileStore.search({
+      organizationId: params.organizationId,
+      userId: params.userId,
+      scope: {
+        kind: "project",
+        projectId: project.id,
+        projectName: project.name,
+      },
+    });
+  }
+
+  /**
+   * Upload one file into the project (drag-and-drop on the Files panel).
+   *
+   * Authorized by project membership (owner/share) via `requireReadable` — NOT
+   * `requireViewable`, whose admin oversight is read-only. This is a write, but
+   * project files are member-level state (any member already produces them via
+   * sandbox runs), so it is not owner-gated like the project's own metadata.
+   *
+   * The bytes arrive base64-encoded in the JSON body; the decoded size is capped
+   * at {@link MAX_PROJECT_UPLOAD_BYTES}. On a name collision the file is
+   * auto-renamed (`report.pdf` -> `report (1).pdf`) up to a bounded number of
+   * attempts before giving up — covering both the unique index and the object
+   * store's exclusive write, including concurrent same-name uploads.
+   */
+  async uploadFile(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+    name: string;
+    mimeType: string;
+    dataBase64: string;
+  }): Promise<{ id: string; filename: string; mimeType: string }> {
+    const project = await this.requireReadable(params);
+    const data = decodeUploadBase64(params.dataBase64);
+    if (data.byteLength > MAX_PROJECT_UPLOAD_BYTES) {
+      throw new ApiError(
+        413,
+        `File is too large (max ${MAX_PROJECT_UPLOAD_MB} MB)`,
+      );
+    }
+    const filename = sanitizeUploadFilename(params.name);
+    // The instructions file steers every chat in the project and is owner-only
+    // via setInstructions (with its own length cap); an upload must not be able
+    // to create or replace it, bypassing that gate. Compared case-insensitively
+    // so a case variant can't impersonate it (or collide on a case-insensitive
+    // filesystem store).
+    if (filename.toLowerCase() === PROJECT_INSTRUCTIONS_FILENAME) {
+      throw new ApiError(
+        400,
+        `"${PROJECT_INSTRUCTIONS_FILENAME}" is reserved; edit the project instructions instead`,
+      );
+    }
+    const mimeType = params.mimeType.trim() || "application/octet-stream";
+
+    for (let attempt = 0; attempt <= MAX_UPLOAD_RENAME_ATTEMPTS; attempt++) {
+      const candidate =
+        attempt === 0 ? filename : nextAvailableName(filename, attempt);
+      try {
+        const file = await fileStore.put({
+          organizationId: params.organizationId,
+          userId: params.userId,
+          projectId: project.id,
+          conversationId: null,
+          filename: candidate,
+          mimeType,
+          sizeBytes: data.byteLength,
+          data,
+        });
+        return {
+          id: file.id,
+          filename: file.filename,
+          mimeType: file.mimeType,
+        };
+      } catch (error) {
+        if (error instanceof FileNameExistsError) continue;
+        throw error;
+      }
+    }
+    throw new ApiError(
+      409,
+      `Could not find an available name for "${filename}"`,
+    );
+  }
+
+  /**
+   * Apps linked into the project that the caller can read. A link never grants
+   * app access, so each member sees only the linked apps they could open anyway.
+   */
+  async listApps(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+  }): Promise<ProjectAppListItem[]> {
+    const project = await this.requireReadable(params);
+    const accessibleAppIds = await AppAccessModel.getUserAccessibleAppIds({
+      organizationId: params.organizationId,
+      userId: params.userId,
+    });
+    return ProjectAppModel.listForProject({
+      projectId: project.id,
+      appIds: accessibleAppIds,
+    });
+  }
+
+  /**
+   * Link an app into the project. Anyone who can add files to the project may
+   * link an app, provided they can read the app. "No access" to either side
+   * reads as 404. Idempotent.
+   */
+  async linkApp(params: {
+    id: string;
+    appId: string;
+    organizationId: string;
+    userId: string;
+  }): Promise<void> {
+    const project = await this.requireReadable(params);
+    const app = await AppModel.findByIdInOrg(
+      params.appId,
+      params.organizationId,
+    );
+    if (
+      !app ||
+      !(await AppAccessModel.userHasAppAccess({
+        organizationId: params.organizationId,
+        userId: params.userId,
+        app,
+      }))
+    ) {
+      throw new ApiError(404, "App not found");
+    }
+    await ProjectAppModel.link({
+      projectId: project.id,
+      appId: app.id,
+      linkedBy: params.userId,
+    });
+  }
+
+  /**
+   * Unlink an app from the project (any project member). The app itself is
+   * untouched. 404 when it was not linked.
+   */
+  async unlinkApp(params: {
+    id: string;
+    appId: string;
+    organizationId: string;
+    userId: string;
+  }): Promise<void> {
+    const project = await this.requireReadable(params);
+    const removed = await ProjectAppModel.unlink({
+      projectId: project.id,
+      appId: params.appId,
+    });
+    if (!removed) throw new ApiError(404, "App is not linked to this project");
+  }
+
+  async listConversations(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+  }): Promise<ProjectConversationItem[]> {
+    // Reading another member's chats requires `read` on every chat (a grant at
+    // `*`) — uniformly, including in a project the caller owns. Without it,
+    // callers see only the chats they authored. Project oversight does NOT
+    // grant this (chats are not part of it), so an overseer viewing a foreign
+    // project still cannot list its chats (requireReadable excludes them).
+    const project = await this.requireReadable(params);
+    const canReadAllChats = await this.callerCanReadAllProjectSessions({
+      ...params,
+      project,
+    });
+    // Without that grant, scope the query to the caller's own chats in
+    // SQL rather than fetching every project chat and filtering in memory.
+    const rows = await ProjectModel.listConversations(
+      project.id,
+      canReadAllChats ? undefined : params.userId,
+    );
+    return rows.map((row) => ({
+      ...row,
+      readOnly: row.authorUserId !== params.userId,
+    }));
+  }
+
+  async listExecutions(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+  }): Promise<Omit<GetAgentRunResponse, "terminalRetained">[]> {
+    const project = await this.requireReadable(params);
+    const canReadAll = await this.callerCanReadAllProjectSessions({
+      ...params,
+      project,
+    });
+    const rows = await AgentRunModel.listForProject({
+      projectId: project.id,
+      organizationId: params.organizationId,
+      actorUserId: canReadAll ? undefined : params.userId,
+    });
+    return rows.map((row) => ({
+      ...row,
+      viewerRole: row.actorUserId === params.userId ? "owner" : "shared",
+    }));
+  }
+
+  /** Pin a project to the caller's sidebar (any reader may pin). */
+  async pin(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+  }): Promise<void> {
+    await this.requireReadable(params);
+    await ProjectPinModel.pin({ userId: params.userId, projectId: params.id });
+  }
+
+  /**
+   * Remove the caller's pin. Intentionally does NOT check readability: an owner
+   * can unshare a project after you pinned it, and you must still be able to
+   * clear your own stale pin. Scoped to the caller's own row; idempotent.
+   */
+  async unpin(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+  }): Promise<void> {
+    await ProjectPinModel.unpin({
+      userId: params.userId,
+      projectId: params.id,
+    });
+  }
+
+  /** The response rows for one page: everything the cards show, read for the page alone. */
+  private async toListItems(params: {
+    rows: {
+      project: Awaited<
+        ReturnType<typeof ProjectAccessModel.listPage>
+      >["rows"][number];
+      viewerRole: ProjectViewerRole;
+    }[];
+    userId: string;
+    pins: Map<string, Date>;
+    showsRecipients: (row: { viewerRole: ProjectViewerRole }) => boolean;
+  }): Promise<ProjectListItem[]> {
+    const { rows } = params;
+    if (rows.length === 0) return [];
+    const projectIds = rows.map((r) => r.project.id);
+    const ownerIds = [...new Set(rows.map((r) => r.project.userId))];
+    // Recipient names only matter for team- and user-shared rows the viewer
+    // may see the targets of.
+    const needsAudience = rows
+      .filter(
+        (r) =>
+          (r.project.visibility === "team" ||
+            r.project.visibility === "user") &&
+          params.showsRecipients(r),
+      )
+      .map((r) => r.project);
+    const [counts, ownerNames, creators, labelsByProject, icons, audiences] =
+      await Promise.all([
+        ProjectModel.countConversations(projectIds),
+        UserModel.getNamesByIds(ownerIds),
+        // A project's owner is its creator: `projects.user_id` is NOT NULL and
+        // stamped from the acting user, and ownership does not transfer.
+        CreatedByModel.resolve(ownerIds),
+        ProjectLabelModel.getLabelsForMany(projectIds),
+        ProjectModel.getIcons(projectIds),
+        ProjectAccessModel.getAudiences(needsAudience),
+      ]);
+    return rows.map(({ project, viewerRole }) => {
+      const showsRecipients = params.showsRecipients({ viewerRole });
+      return {
+        id: project.id,
+        name: project.name,
+        description: project.description,
+        icon: icons.get(project.id) ?? null,
+        viewerRole,
+        ownerName: ownerNames.get(project.userId) ?? null,
+        createdBy: lookupCreator(creators, project.userId),
+        labels: labelsByProject.get(project.id) ?? [],
+        conversationCount: counts.get(project.id) ?? 0,
+        visibility: project.visibility,
+        shareTeamNames:
+          showsRecipients && project.visibility === "team"
+            ? (audiences.get(project.id)?.teams ?? []).map((t) => t.name)
+            : null,
+        // Same gate as shareTeamNames: without these a project shared with named
+        // people renders as private, which is the opposite of what happened.
+        shareUserNames:
+          showsRecipients && project.visibility === "user"
+            ? (audiences.get(project.id)?.users ?? []).map((u) => u.name)
+            : null,
+        pinnedAt: params.pins.get(project.id) ?? null,
+        createdAt: project.createdAt,
+        // Null on the active slice; set for rows from listDeleted.
+        deletedAt: project.deletedAt,
+      };
+    });
+  }
+
+  /**
+   * A project's default agent must be one every member of the project can
+   * actually use, however widely the project is shared. Org scope is what
+   * guarantees that, so it is enforced here rather than left to the picker.
+   */
+  private async requirePinnableDefaultAgent(params: {
+    agentId: string;
+    organizationId: string;
+    ownerUserId: string;
+    share: ProjectShareAudience;
+  }): Promise<void> {
+    if (
+      !(await this.agentReachesProjectAudience({
+        agentId: params.agentId,
+        organizationId: params.organizationId,
+        ownerUserId: params.ownerUserId,
+        share: params.share,
+      }))
+    ) {
+      throw new ApiError(
+        400,
+        "A project's default agent must be usable by everyone the project is shared with",
+      );
+    }
+  }
+
+  /**
+   * Whether every person the project reaches can actually run the agent. A pin
+   * nobody but the owner can see would silently drop those members back to the
+   * organization default, so eligibility is a function of the project's sharing
+   * rather than a fixed scope.
+   *
+   * An `org` agent always qualifies. Otherwise the audience decides: a team
+   * share needs a team agent covering every shared team, while a private or
+   * named-user share is small enough to check person by person.
+   */
+  private async agentReachesProjectAudience(params: {
+    agentId: string;
+    organizationId: string;
+    ownerUserId: string;
+    share: ProjectShareAudience;
+  }): Promise<boolean> {
+    const agent = await AgentModel.findPinnableProjectDefault({
+      id: params.agentId,
+      organizationId: params.organizationId,
+    });
+    if (!agent) return false;
+    return this.agentReachesAudience({
+      agent,
+      organizationId: params.organizationId,
+      ownerUserId: params.ownerUserId,
+      share: params.share,
+    });
+  }
+
+  private async agentReachesAudience(params: {
+    agent: { id: string; scope: AgentScope };
+    organizationId: string;
+    ownerUserId: string;
+    share: ProjectShareAudience;
+  }): Promise<boolean> {
+    const { agent } = params;
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    const policies = await ResourcePermissionPolicyModel.findApplicable({
+      organizationId: params.organizationId,
+      resource: "agent",
+      scope: agent.id,
+    });
+    // SPDX-SnippetEnd
+    const grants = policies
+      .filter((policy) => policy.scope === "*" || policy.scope === agent.id)
+      .flatMap((policy) => policy.grants);
+    const covers = (teamIds: Set<string>) =>
+      ["read", "use"].every((action) =>
+        grants.some(
+          (grant) =>
+            (grant.subject.type === "organization" ||
+              (grant.subject.type === "team" &&
+                teamIds.has(grant.subject.id))) &&
+            grant.actions.some((candidate) => candidate === action),
+        ),
+      );
+    if (covers(new Set())) return true;
+    if (params.share.visibility === "organization") return false;
+    // The audience is read from the project's grants, so one project can
+    // reach teams and named people at once: every team and every person
+    // has to be covered.
+    if (params.share.teamIds.length > 0) {
+      const teams = await TeamModel.findByOrganization(params.organizationId);
+      const byId = new Map(teams.map((team) => [team.id, team]));
+      for (const sharedTeam of params.share.teamIds) {
+        const ids = new Set<string>();
+        let id: string | null = sharedTeam;
+        while (id && !ids.has(id)) {
+          ids.add(id);
+          id = byId.get(id)?.parentId ?? null;
+        }
+        if (!covers(ids)) return false;
+      }
+    }
+    const users = [params.ownerUserId, ...params.share.userIds];
+    const checks = await Promise.all(
+      [...new Set(users)].map(async (userId) => {
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        const effective = await ResourcePermissions.getEffective({
+          organizationId: params.organizationId,
+          userId,
+          resource: "agent",
+          scope: agent.id,
+        });
+        // SPDX-SnippetEnd
+        return ["read", "use"].every((action) =>
+          effective.grants.some(
+            (grant) =>
+              grant.action === action &&
+              (grant.scope === "*" || grant.scope === agent.id),
+          ),
+        );
+      }),
+    );
+    return checks.every(Boolean);
+  }
+
+  /** The project's current sharing, as the pin-eligibility rule reads it. */
+  private async loadShareAudience(
+    project: Project,
+  ): Promise<ProjectShareAudience> {
+    return audienceForPin(await ProjectAccessModel.findAudience(project));
+  }
+
+  /** Project the caller may read, by id; "no access" reads as 404. */
+  private async requireReadable(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+  }): Promise<Project> {
+    const project = await ProjectModel.findById(params.id);
+    if (
+      !project ||
+      !(await ProjectAccessModel.userCanAccessProject({
+        project,
+        userId: params.userId,
+        organizationId: params.organizationId,
+      }))
+    ) {
+      throw new ApiError(404, "Project not found");
+    }
+    return project;
+  }
+
+  /**
+   * Project the caller may read, with their relationship to it. Share/owner
+   * access always counts; an overseer of every project also passes when
+   * `allowAdminOversight` is set (read-only oversight of a foreign project).
+   * "no access" reads as 404.
+   */
+  private async requireViewable(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+    allowAdminOversight?: boolean;
+  }): Promise<{ project: Project; viewerRole: ProjectViewerRole }> {
+    const project = await ProjectModel.findById(params.id);
+    if (project && project.organizationId === params.organizationId) {
+      if (project.userId === params.userId) {
+        return { project, viewerRole: "owner" };
+      }
+      if (
+        await ProjectAccessModel.userCanAccessProject({
+          project,
+          userId: params.userId,
+          organizationId: params.organizationId,
+        })
+      ) {
+        return { project, viewerRole: "shared" };
+      }
+      if (
+        params.allowAdminOversight &&
+        (await this.callerIsProjectAdmin(params))
+      ) {
+        return { project, viewerRole: "admin" };
+      }
+    }
+    throw new ApiError(404, "Project not found");
+  }
+
+  /**
+   * Project the caller may manage (edit/share/delete), by id: the owner, or a
+   * holder of `update` on every project. "not allowed" reads as 404.
+   */
+  private async requireManageable(params: {
+    id: string;
+    organizationId: string;
+    userId: string;
+  }): Promise<Project> {
+    const owned = await ProjectModel.findByIdForOwner({
+      id: params.id,
+      userId: params.userId,
+      organizationId: params.organizationId,
+    });
+    if (owned) return owned;
+    const project = await ProjectModel.findById(params.id);
+    if (
+      project &&
+      project.organizationId === params.organizationId &&
+      (await this.callerIsProjectAdmin(params))
+    ) {
+      return project;
+    }
+    throw new ApiError(404, "Project not found");
+  }
+
+  private async callerIsProjectAdmin(params: {
+    organizationId: string;
+    userId: string;
+  }): Promise<boolean> {
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Oversight of every project is `update` on every project — the grant at
+    // `*` that the retired `project:admin` role action became.
+    return ResourcePermissions.allows({
+      userId: params.userId,
+      organizationId: params.organizationId,
+      resource: "project",
+      scope: "*",
+      action: "update",
+    });
+    // SPDX-SnippetEnd
+  }
+
+  private async callerCanDeleteProject(params: {
+    organizationId: string;
+    userId: string;
+    projectId: string;
+  }): Promise<boolean> {
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    return ResourcePermissions.allows({
+      userId: params.userId,
+      organizationId: params.organizationId,
+      resource: "project",
+      scope: params.projectId,
+      action: "delete",
+    });
+    // SPDX-SnippetEnd
+  }
+
+  private async callerCanReadAllProjectSessions(params: {
+    project: Project;
+    organizationId: string;
+    userId: string;
+  }): Promise<boolean> {
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    if (
+      !(await ProjectAccessModel.userCanAccessProject({
+        ...params,
+        sessionAccess: true,
+      }))
+    )
+      return false;
+    // Reading others' sessions in a project is `read` on every chat — the
+    // grant at `*` the retired `project:read-all` role action became. It is
+    // honoured only here, for a project the caller can open; a chat outside
+    // a project is never reachable through it.
+    return ResourcePermissions.allows({
+      userId: params.userId,
+      organizationId: params.organizationId,
+      resource: "conversation",
+      scope: "*",
+      action: "read",
+    });
+    // SPDX-SnippetEnd
+  }
+}
+
+export const projectService = new ProjectService();
+
+// Bounded so a pathological collision (or a hostile client racing the same name)
+// can't spin forever; 50 distinct " (n)" candidates is far beyond any real case.
+const MAX_UPLOAD_RENAME_ATTEMPTS = 50;
+
+/**
+ * Ceiling for {@link ProjectService.purge}'s transaction. Its object-store
+ * deletes run between statements, where `statement_timeout` does not reach, so
+ * without this a slow store could hold the transaction — and a pool connection,
+ * and vacuum — open indefinitely. Generous rather than tight: hitting it aborts
+ * a purge that was already partway through deleting bytes.
+ */
+const PURGE_IDLE_TIMEOUT_MS = 300_000;
+
+/**
+ * Decode an upload's base64 body to bytes. Tolerates an accidental `data:` URL
+ * prefix and rejects a payload that is empty or not valid base64 (Buffer.from is
+ * lenient and would otherwise silently drop garbage), so callers get a clean 400.
+ */
+function decodeUploadBase64(input: string): Buffer {
+  const commaIdx = input.startsWith("data:") ? input.indexOf(",") : -1;
+  const payload = commaIdx >= 0 ? input.slice(commaIdx + 1) : input;
+  const normalized = payload.replace(/\s/g, "");
+  if (normalized.length === 0) {
+    throw new ApiError(400, "File is empty");
+  }
+  // A base64 length of n % 4 === 1 can't encode whole bytes; Buffer.from would
+  // silently drop the dangling char instead of erroring, so reject it here.
+  if (
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(normalized) ||
+    normalized.length % 4 === 1
+  ) {
+    throw new ApiError(400, "File data is not valid base64");
+  }
+  const data = Buffer.from(normalized, "base64");
+  if (data.byteLength === 0) {
+    throw new ApiError(400, "File is empty");
+  }
+  return data;
+}
+
+function audienceForPin(audience: {
+  visibility: ProjectVisibility | null;
+  teams: { id: string }[];
+  users: { id: string }[];
+}): ProjectShareAudience {
+  return {
+    visibility: audience.visibility,
+    teamIds: audience.teams.map((team) => team.id),
+    userIds: audience.users.map((user) => user.id),
+  };
+}

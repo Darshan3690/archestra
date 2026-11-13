@@ -10,6 +10,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  withAccessibleDarkTokens,
+  withAccessibleLightTokens,
+} from "./contrast-safe";
 import { mapThemeFontValue } from "./font-token-map";
 // Import theme configuration
 import { SUPPORTED_THEMES } from "./theme-config";
@@ -89,8 +93,11 @@ function generateThemeCSS(theme: ThemeItem): string {
   const className = `theme-${theme.name}`;
 
   // Light vars for base selector, dark vars for dark mode override.
-  const lightCSS = `html.${className} {\n${generateCSSVars(theme.cssVars.light)}\n}`;
-  const darkCSS = `html.dark.${className} {\n${generateCSSVars(theme.cssVars.dark)}\n}`;
+  // Both palettes get the text-contrast and tinted-fill floors; the light
+  // palette also gets control outlines and focus rings raised to WCAG
+  // minimums and faint decorative borders lifted to a visibility floor.
+  const lightCSS = `html.${className} {\n${generateCSSVars(withAccessibleLightTokens(theme.cssVars.light))}\n}`;
+  const darkCSS = `html.dark.${className} {\n${generateCSSVars(withAccessibleDarkTokens(theme.cssVars.dark))}\n}`;
   return `/* ${theme.title} */\n${lightCSS}\n\n${darkCSS}`;
 }
 
@@ -98,6 +105,7 @@ function generateThemeCSS(theme: ThemeItem): string {
  * Generate complete CSS file
  */
 function generateThemesCSS(): string {
+  // white-label-ok: header of a generated file — dev tooling output, not shipped copy
   const header = `/**
  * Theme definitions for Archestra platform
  * All themes from https://github.com/jnsahaj/tweakcn
@@ -106,6 +114,9 @@ function generateThemesCSS(): string {
  *
  * AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
  * Generated from shared/themes/tweakcn-themes.json
+ * Text and tinted fills (muted, sidebar-accent) are raised to contrast floors
+ * in both modes, and light-mode control outlines, focus rings and decorative
+ * borders to theirs, by shared/themes/contrast-safe.ts.
  * Run: pnpm codegen:theme-css
  */\n`;
 

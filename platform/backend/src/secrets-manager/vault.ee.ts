@@ -1,11 +1,15 @@
-import { SecretsManagerType } from "@shared";
+import { SecretsManagerType } from "@archestra/shared";
+import { type Transaction, withDbTransaction } from "@/database";
 import logger from "@/logging";
 import SecretModel from "@/models/secret";
 import {
   ApiError,
   type ISecretManager,
+  SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
+  type SecretReadOptions,
   type SecretsConnectivityResult,
   type SecretValue,
+  type SecretWriteOptions,
   type SelectSecret,
   type VaultConfig,
 } from "@/types";
@@ -53,19 +57,29 @@ export default class VaultSecretManager
     operationName: string,
     context: Record<string, unknown> = {},
   ): never {
+    const vaultError = extractVaultErrorMessage(error);
+    // The Vault detail goes into the message text (not only the structured
+    // fields) because retained log records keep just the message line —
+    // without it, a forwarded log trail only shows a generic failure.
     logger.error(
-      { error, vaultError: extractVaultErrorMessage(error), ...context },
-      `VaultSecretManager.${operationName}: failed`,
+      { error, vaultError, ...context },
+      `VaultSecretManager.${operationName}: failed (${vaultError})`,
     );
 
     if (error instanceof ApiError) {
       throw error;
     }
 
-    throw new ApiError(
-      500,
+    // The user-facing message stays generic (Vault internals aren't for end
+    // users), but the original error rides along as `cause` so error tracking
+    // can report what the secrets backend actually returned.
+    const apiError = new ApiError(
+      503,
       "An error occurred while accessing secrets. Please try again later or contact your administrator.",
+      SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
     );
+    apiError.cause = error;
+    throw apiError;
   }
 
   async createSecret(
@@ -140,8 +154,21 @@ export default class VaultSecretManager
     return await this.deleteSecret(secid);
   }
 
-  async getSecret(secid: string): Promise<SelectSecret | null> {
-    const dbRecord = await SecretModel.findById(secid);
+  /**
+   * The metadata row is read through the caller's transaction when one is
+   * given (and locked with `forUpdate`), so a caller serialising on that row
+   * holds it across the Vault read and does not need a second pooled
+   * connection. There is no process-local cache here, so `skipCache` is moot.
+   */
+  async getSecret(
+    secid: string,
+    options?: SecretReadOptions,
+  ): Promise<SelectSecret | null> {
+    const dbRecord = options?.transaction
+      ? options.forUpdate
+        ? await SecretModel.findByIdForUpdate(secid, options.transaction)
+        : await SecretModel.findById(secid, options.transaction)
+      : await SecretModel.findById(secid);
     if (!dbRecord) {
       return null;
     }
@@ -169,42 +196,66 @@ export default class VaultSecretManager
     }
   }
 
+  /**
+   * The metadata row is locked for the whole write, in the caller's
+   * transaction or in one of its own, so two writers of the same secret (a
+   * token refresh holding the row, a reconnect replacing the credential) take
+   * turns at the Vault value instead of racing: the later one wins in Vault as
+   * it does in the database. Repeating the Vault write on a retried
+   * transaction stores the same value again.
+   */
   async updateSecret(
     secid: string,
     secretValue: SecretValue,
+    options?: SecretWriteOptions,
   ): Promise<SelectSecret | null> {
-    const dbRecord = await SecretModel.findById(secid);
-    if (!dbRecord) {
-      return null;
-    }
+    const write = async (
+      transaction: Transaction,
+    ): Promise<SelectSecret | null> => {
+      const dbRecord = await SecretModel.findByIdForUpdate(secid, transaction);
+      if (!dbRecord) {
+        return null;
+      }
 
-    if (!dbRecord.isVault) {
-      return await SecretModel.update(secid, { secret: secretValue });
-    }
+      if (!dbRecord.isVault) {
+        return await SecretModel.update(
+          secid,
+          { secret: secretValue },
+          transaction,
+        );
+      }
 
-    const vaultPath = this.getVaultPath(dbRecord.name, secid);
-    try {
-      await this.writeToPath(
-        vaultPath,
-        this.buildWritePayload({ value: JSON.stringify(secretValue) }),
+      const vaultPath = this.getVaultPath(dbRecord.name, secid);
+      try {
+        await this.writeToPath(
+          vaultPath,
+          this.buildWritePayload({ value: JSON.stringify(secretValue) }),
+        );
+        logger.info(
+          { vaultPath, kvVersion: this.config.kvVersion },
+          "VaultSecretManager.updateSecret: secret updated",
+        );
+      } catch (error) {
+        this.handleVaultError(error, "updateSecret", { vaultPath });
+      }
+
+      const updatedRecord = await SecretModel.update(
+        secid,
+        { secret: {} },
+        transaction,
       );
-      logger.info(
-        { vaultPath, kvVersion: this.config.kvVersion },
-        "VaultSecretManager.updateSecret: secret updated",
-      );
-    } catch (error) {
-      this.handleVaultError(error, "updateSecret", { vaultPath });
-    }
+      if (!updatedRecord) {
+        return null;
+      }
 
-    const updatedRecord = await SecretModel.update(secid, { secret: {} });
-    if (!updatedRecord) {
-      return null;
-    }
-
-    return {
-      ...updatedRecord,
-      secret: secretValue,
+      return {
+        ...updatedRecord,
+        secret: secretValue,
+      };
     };
+    return options?.transaction
+      ? await write(options.transaction)
+      : await withDbTransaction(write);
   }
 
   async checkConnectivity(): Promise<SecretsConnectivityResult> {
@@ -218,7 +269,13 @@ export default class VaultSecretManager
         { error, listBasePath, kvVersion: this.config.kvVersion },
         "VaultSecretManager.checkConnectivity: failed to list secrets",
       );
-      throw new ApiError(500, extractVaultErrorMessage(error));
+      const apiError = new ApiError(
+        503,
+        extractVaultErrorMessage(error),
+        SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
+      );
+      apiError.cause = error;
+      throw apiError;
     }
   }
 

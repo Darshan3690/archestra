@@ -1,43 +1,120 @@
-import { randomBytes } from "node:crypto";
+// This file contains Enterprise regions licensed under LICENSE_ENTERPRISE.
 import {
   DEFAULT_ADMIN_EMAIL,
   IDENTITY_PROVIDER_ID,
-  LLM_OAUTH_CLIENT_CREDENTIALS_ACCESS_TOKEN_LIFETIME_SECONDS,
-  LLM_PROXY_OAUTH_SCOPE,
   OAUTH_GRANT_TYPE,
+  OFFLINE_ACCESS_OAUTH_SCOPE,
   RouteId,
-} from "@shared";
-import { verifyPassword } from "better-auth/crypto";
+} from "@archestra/shared";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
+import { RateLimiterRes } from "rate-limiter-flexible";
 import { z } from "zod";
-import { betterAuth } from "@/auth";
+import { auth as betterAuth } from "@/auth/better-auth";
 import { ensureCimdClientRegistered, isCimdClientId } from "@/auth/cimd";
 import config from "@/config";
+import { enterpriseTier } from "@/enterprise-tier";
 import logger from "@/logging";
 import {
   AccountModel,
   AgentModel,
-  LlmOauthClientModel,
+  AppModel,
   MemberModel,
   OAuthAccessTokenModel,
   OAuthClientModel,
+  OAuthRefreshTokenModel,
   OrganizationModel,
   UserModel,
   UserTokenModel,
 } from "@/models";
+import { AUTH_STATE_PATH } from "@/routes/route-paths";
+import {
+  appConnectorAudienceRef,
+  appIdFromConnectorPath,
+  connectorResourceUriFromAudienceRef,
+  isAppConnectorAudienceRef,
+  isConnectorTargetedResource,
+  resolveAppConnectorResource,
+} from "@/services/apps/app-connector-resource";
+import { defaultAdminPasswordCheck } from "@/services/default-admin-password";
 import {
   buildOAuthIssuer,
   exchangeIdentityAssertionForAccessToken,
   MCP_RESOURCE_REFERENCE_PREFIX,
 } from "@/services/identity-providers/enterprise-managed/authorization";
+import { issueManagedOauthClientAccessToken } from "@/services/oauth-client-credentials";
+import { revokeManagedOauthClientAccessToken } from "@/services/oauth-client-revocation";
+import {
+  shieldRefreshTokenGrant,
+  shieldRevocationRequest,
+} from "@/services/oauth-refresh-replay";
+import { oauthRevocationRateLimiter } from "@/services/oauth-revocation-rate-limit";
+import { oauthTokenRateLimiter } from "@/services/oauth-token-rate-limit";
 import { ApiError, constructResponseSchema } from "@/types";
 import {
   isLoopbackRedirectUri,
   loopbackRedirectUriMatchesIgnoringPort,
 } from "@/utils/network";
+import { isPublicOAuthCorsPath } from "./oauth-cors";
 import { getPublicRequestOrigin } from "./request-origin";
 
+/**
+ * better-auth's two-factor plugin marks a pending sign-in challenge with a
+ * signed, httpOnly cookie (TWO_FACTOR_COOKIE_NAME = "two_factor" in
+ * better-auth/dist/plugins/two-factor/constant.mjs — not re-exported from the
+ * package entry, hence the literal). The browser cannot read it, so the auth
+ * pages ask us instead.
+ *
+ * Only the cookie's PRESENCE is reported: the value is never read and the
+ * signature is deliberately not verified, because this is a UX gate for
+ * redirecting away from pages that don't apply. better-auth remains the only
+ * gate that matters on /two-factor/verify-*.
+ */
+function hasTwoFactorChallengeCookie(cookieHeader: string | undefined) {
+  if (!cookieHeader) {
+    return false;
+  }
+  // createCookieGetter builds `${secureCookiePrefix}${prefix}.${name}`, and
+  // the secure prefix appears only on https deployments — accept both.
+  const { cookiePrefix } = config.auth;
+  const candidates = new Set([
+    `${cookiePrefix}.two_factor`,
+    `__Secure-${cookiePrefix}.two_factor`,
+  ]);
+  return cookieHeader.split(";").some((segment) => {
+    const separatorIndex = segment.indexOf("=");
+    // A segment without "=" has no value and so is not our cookie.
+    if (separatorIndex === -1) {
+      return false;
+    }
+    return candidates.has(segment.slice(0, separatorIndex).trim());
+  });
+}
+
 const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
+  /**
+   * Pre-authentication state for the auth pages. Unauthenticated by design:
+   * it is read before any session exists.
+   */
+  fastify.route({
+    method: "GET",
+    url: AUTH_STATE_PATH,
+    schema: {
+      operationId: RouteId.GetAuthState,
+      description:
+        "Report whether a two-factor sign-in challenge is currently pending",
+      tags: ["Auth"],
+      response: {
+        200: z.strictObject({
+          twoFactorPending: z.boolean(),
+        }),
+      },
+    },
+    handler: async (request, reply) =>
+      reply.send({
+        twoFactorPending: hasTwoFactorChallengeCookie(request.headers.cookie),
+      }),
+  });
+
   fastify.route({
     method: "GET",
     url: "/api/auth/default-credentials-status",
@@ -86,8 +163,9 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
           return reply.send({ enabled: false });
         }
 
-        // Compare the stored password hash with the default password
-        const isDefaultPassword = await verifyPassword({
+        // Compare the stored password hash with the default password (once
+        // per hash: the verify is slow and every page asks)
+        const isDefaultPassword = await defaultAdminPasswordCheck.matches({
           password: adminDefaultPassword,
           hash: account.password,
         });
@@ -117,34 +195,31 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
         (body.organizationId as string) || (body.orgId as string);
 
       let userId: string | undefined;
+      let resolvedOrganizationId: string | undefined;
 
-      // Capture userId before better-auth deletes the member
+      // Capture userId before better-auth deletes the member (needed for
+      // token/user cleanup below). Audit is handled in the better-auth afterHook.
       if (memberIdOrEmail) {
-        // First try to find by member ID
         const memberToDelete = await MemberModel.getById(memberIdOrEmail);
 
         if (memberToDelete) {
           userId = memberToDelete.userId;
-        } else {
-          // Maybe it's an email - try finding by userId + orgId
+          resolvedOrganizationId = memberToDelete.organizationId;
+        } else if (organizationId) {
           const memberByUserId = await MemberModel.getByUserId(
             memberIdOrEmail,
             organizationId,
           );
-
           if (memberByUserId) {
             userId = memberByUserId.userId;
+            resolvedOrganizationId = memberByUserId.organizationId;
           }
         }
       }
 
       // Let better-auth handle the member deletion
       const url = new URL(request.url, `http://${request.headers.host}`);
-      const headers = new Headers();
-
-      Object.entries(request.headers).forEach(([key, value]) => {
-        if (value) headers.append(key, value.toString());
-      });
+      const headers = buildBetterAuthForwardedHeaders(request);
 
       const req = new Request(url.toString(), {
         method: request.method,
@@ -155,11 +230,14 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
       const response = await betterAuth.handler(req);
 
       // After successful member removal, delete user's personal token for this org
-      if (response.ok && userId && organizationId) {
+      if (response.ok && userId && resolvedOrganizationId) {
         try {
-          await UserTokenModel.deleteByUserAndOrg(userId, organizationId);
+          await UserTokenModel.deleteByUserAndOrg(
+            userId,
+            resolvedOrganizationId,
+          );
           logger.info(
-            `🔑 Personal token deleted for user ${userId} in org ${organizationId}`,
+            `🔑 Personal token deleted for user ${userId} in org ${resolvedOrganizationId}`,
           );
         } catch (tokenDeleteError) {
           logger.error(
@@ -187,13 +265,11 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
         }
       }
 
-      reply.status(response.status);
-
-      response.headers.forEach((value: string, key: string) => {
-        reply.header(key, value);
+      relayBetterAuthResponse({
+        reply,
+        response,
+        body: await readBetterAuthResponseBody(response),
       });
-
-      reply.send(response.body ? await response.text() : null);
     },
   });
 
@@ -243,7 +319,11 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
         "[auth:oauth2/authorize] Authorization request received",
       );
 
-      if (clientId && isCimdClientId(clientId)) {
+      if (
+        clientId &&
+        isCimdClientId(clientId) &&
+        config.auth.dynamicClientRegistrationEnabled
+      ) {
         try {
           await ensureCimdClientRegistered(clientId);
         } catch (error) {
@@ -282,21 +362,37 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
       // Forward to better-auth
       const url = new URL(request.url, `http://${request.headers.host}`);
 
-      // Per OAuth 2.1, scopes must be declared as supported both during Dynamic Client
-      // Registration (DCR) and at the token exchange. Some clients (e.g. Cursor) omit
-      // offline_access from the authorization request despite registering it during DCR,
-      // which would prevent refresh token issuance. To handle this, we inject offline_access
-      // into the authorization request if the client registered it during DCR.
-      // We only inject it when the client's DCR registration includes offline_access,
-      // because clients that did not advertise it during DCR (e.g. MCP Inspector) will
-      // reject the authorization response containing an unexpected scope.
+      // Per OAuth 2.1, scopes must be declared at Dynamic Client Registration
+      // (DCR) and re-validated at authorize. The OAuth provider checks the
+      // authorize-time scopes against the client's *stored* scopes, so the two
+      // must agree. Two native-client mismatches need reconciling here:
       const currentScopes = url.searchParams.get("scope") ?? "";
-      if (clientId && !currentScopes.split(" ").includes("offline_access")) {
+      if (clientId) {
         const client = await OAuthClientModel.findByClientId(clientId);
-        if (client?.scopes?.includes("offline_access")) {
+        const clientHasOfflineAccess = !!client?.scopes?.includes(
+          OFFLINE_ACCESS_OAUTH_SCOPE,
+        );
+        if (currentScopes.split(" ").includes(OFFLINE_ACCESS_OAUTH_SCOPE)) {
+          // The client requests offline_access but registered only a narrower
+          // scope (e.g. Claude Desktop registers "mcp"). Persist offline_access
+          // onto the refresh-capable client so the provider's scope check
+          // passes — self-heals clients registered before DCR carried it.
+          if (client && !clientHasOfflineAccess) {
+            await OAuthClientModel.ensureOfflineAccessScope(clientId);
+            logger.info(
+              { clientId },
+              "[auth:oauth2/authorize] Persisted offline_access to client's registered scopes",
+            );
+          }
+        } else if (clientHasOfflineAccess) {
+          // Inverse: the client registered offline_access during DCR but omitted
+          // it from this request (e.g. Cursor), which would prevent refresh
+          // token issuance. Inject it back. We only do this when the client
+          // registered it, because clients that did not advertise it during DCR
+          // (e.g. MCP Inspector) reject an unexpected scope in the response.
           const augmentedScopes = currentScopes
-            ? `${currentScopes} offline_access`
-            : "offline_access";
+            ? `${currentScopes} ${OFFLINE_ACCESS_OAUTH_SCOPE}`
+            : OFFLINE_ACCESS_OAUTH_SCOPE;
           url.searchParams.set("scope", augmentedScopes);
           logger.debug(
             { originalScope: currentScopes, augmentedScope: augmentedScopes },
@@ -305,13 +401,10 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
         }
       }
 
-      const headers = new Headers();
-      Object.entries(request.headers).forEach(([key, value]) => {
-        if (!value || shouldSkipForwardedAuthHeader(key)) {
-          return;
-        }
-        headers.append(key, value.toString());
-      });
+      const headers = buildBetterAuthForwardedHeaders(
+        request,
+        shouldSkipForwardedAuthHeader,
+      );
 
       const req = new Request(url.toString(), {
         method: request.method,
@@ -320,11 +413,11 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
 
       const response = await betterAuth.handler(req);
 
-      reply.status(response.status);
-      response.headers.forEach((value: string, key: string) => {
-        reply.header(key, value);
+      relayBetterAuthResponse({
+        reply,
+        response,
+        body: await readBetterAuthResponseBody(response),
       });
-      reply.send(response.body ? await response.text() : null);
     },
   });
 
@@ -345,6 +438,34 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
     schema: {
       tags: ["Auth"],
     },
+    async onRequest(request, reply) {
+      if (config.authRateLimitDisabled) return;
+      // Use Fastify's trustProxy policy, never an unchecked forwarding header.
+      // All grants share an IP budget so rotating client IDs cannot bypass it.
+      try {
+        const limit = await oauthTokenRateLimiter.consume(request.ip);
+        if (limit.allowed) return;
+        return reply
+          .header("Retry-After", limit.retryAfter)
+          .header("Cache-Control", "no-store")
+          .code(429)
+          .send({
+            error: "temporarily_unavailable",
+            error_description:
+              "Too many token requests. Retry after the indicated delay.",
+          });
+      } catch (error) {
+        logger.error(
+          { err: error },
+          "OAuth token rate-limit storage unavailable",
+        );
+        return reply.header("Cache-Control", "no-store").code(503).send({
+          error: "temporarily_unavailable",
+          error_description: "Token issuance is temporarily unavailable.",
+        });
+      }
+    },
+    // codeql[js/missing-rate-limiting] The onRequest hook enforces a distributed, atomic IP budget before this handler; CodeQL only models package-based middleware.
     async handler(request, reply) {
       const body = request.body as Record<string, unknown> | undefined;
       const resource = body?.resource;
@@ -374,7 +495,11 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
 
       // CIMD: auto-register client if client_id is a URL
       const clientId = body?.client_id as string | undefined;
-      if (clientId && isCimdClientId(clientId)) {
+      if (
+        clientId &&
+        isCimdClientId(clientId) &&
+        config.auth.dynamicClientRegistrationEnabled
+      ) {
         try {
           await ensureCimdClientRegistered(clientId);
         } catch (error) {
@@ -412,7 +537,7 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
             authorizationHeader: request.headers.authorization,
             body,
           });
-        const result = await issueLlmOauthClientAccessToken({
+        const result = await issueManagedOauthClientAccessToken({
           clientId: authenticatedClientId,
           clientSecret,
           scope: body.scope as string | undefined,
@@ -431,12 +556,80 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
         delete body.resource;
       }
 
+      // Convert client_secret_basic to client_secret_post for the grants that
+      // forward to better-auth (authorization_code, refresh_token). Confidential
+      // native clients (e.g. Claude Desktop) authenticate with
+      // `Authorization: Basic base64(client_id:client_secret)`, but our
+      // better-auth instance runs the apiKey plugin with apiKeyHeaders:
+      // ["Authorization"] (see config.ts). It intercepts that header, fails to
+      // parse it as an `archestra_` API key, and rejects the request with
+      // {"code":"INVALID_API_KEY"} *before* the OAuth token handler ever
+      // authenticates the client. RFC 6749 Section 2.3.1 lets a client present
+      // its credentials either in the Authorization header or in the body, and
+      // requires the server to support the body form, so lift the Basic
+      // credentials into the body (these MCP OAuth clients are registered as
+      // client_secret_post) and drop the Authorization header so the apiKey
+      // plugin stays out of the OAuth client-authentication path.
+      const authorizationHeader = request.headers.authorization;
+      const usesClientSecretBasic =
+        typeof authorizationHeader === "string" &&
+        authorizationHeader.startsWith("Basic ");
+      if (usesClientSecretBasic && body) {
+        const { clientId: basicClientId, clientSecret: basicClientSecret } =
+          extractOAuthClientCredentials({ authorizationHeader, body });
+        if (basicClientId && body.client_id === undefined) {
+          body.client_id = basicClientId;
+        }
+        if (basicClientSecret && body.client_secret === undefined) {
+          body.client_secret = basicClientSecret;
+        }
+      }
+
       const tokenEndpointOrigin = getPublicRequestOrigin(request);
+
+      // Replay shield: better-auth answers a replayed (already-rotated)
+      // refresh token by deleting EVERY token for the (client_id, user_id)
+      // pair, and CIMD clients share one client_id product-wide — so a benign
+      // rotation race (backend restart mid-exchange, a second process holding
+      // the same stored token) wipes all of a user's MCP grants at once.
+      // Intercept refresh grants so replays never reach that path; everything
+      // else forwards untouched. See services/oauth-refresh-replay.ts.
+      if (body?.grant_type === "refresh_token") {
+        const interception = await shieldRefreshTokenGrant({
+          refreshToken:
+            typeof body.refresh_token === "string"
+              ? body.refresh_token
+              : undefined,
+          clientId:
+            typeof body.client_id === "string" ? body.client_id : undefined,
+        });
+        if (interception.action === "respond") {
+          // A re-issued pair honors the org token-lifetime policy exactly like
+          // a better-auth-issued one.
+          const shieldedBody =
+            interception.statusCode === 200
+              ? await applyOrganizationOAuthTokenLifetimeToResponse({
+                  responseText: JSON.stringify(interception.body),
+                  ok: true,
+                  resource,
+                  tokenEndpointOrigin,
+                })
+              : null;
+          return reply
+            .status(interception.statusCode)
+            .header("cache-control", "no-store")
+            .header("pragma", "no-cache")
+            .send(shieldedBody ? JSON.parse(shieldedBody) : interception.body);
+        }
+      }
+
       const url = new URL(request.url, tokenEndpointOrigin);
-      const headers = new Headers();
-      Object.entries(request.headers).forEach(([key, value]) => {
-        if (value) headers.append(key, value.toString());
-      });
+      const headers = buildBetterAuthForwardedHeaders(
+        request,
+        usesClientSecretBasic
+          ? (name) => name.toLowerCase() === "authorization"
+          : undefined,
+      );
 
       const contentType = request.headers["content-type"] || "";
       const serializedBody = contentType.includes(
@@ -452,8 +645,32 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
       });
 
       const response = await betterAuth.handler(req);
+      const rawResponseBody = await readBetterAuthResponseBody(response);
+
+      // Bind a shareable-App connector token to its canonical resource URI
+      // (RFC 8707) so it is accepted only at its own connector — before deriving
+      // the lifetime below, which follows the bound app's org policy and so needs
+      // the binding settled first. Fail closed if an app-connector resource was
+      // requested but the binding can't be written, rather than hand back a token
+      // that silently 401s.
+      if (response.ok) {
+        const connectorBinding = await bindAppConnectorTokenAudience({
+          resource,
+          responseBody: rawResponseBody,
+          grantType: body?.grant_type,
+          tokenEndpointOrigin,
+        });
+        if (connectorBinding.status === "error") {
+          return reply.status(400).send({
+            error: "invalid_target",
+            error_description: connectorBinding.message,
+          });
+        }
+      }
+
       const responseBody = await applyOrganizationOAuthTokenLifetimeToResponse({
-        response,
+        responseText: rawResponseBody,
+        ok: response.ok,
         resource,
         tokenEndpointOrigin,
       });
@@ -489,14 +706,157 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
         );
       }
 
-      reply.status(response.status);
-      response.headers.forEach((value: string, key: string) => {
-        if (key.toLowerCase() === "content-length") {
-          return;
-        }
-        reply.header(key, value);
+      // better-auth answers bodyless whenever its router cannot dispatch the
+      // request (unknown path, wrong method, path-shape mismatch) or turns an
+      // unhandled error into a 500. RFC 6749 §5.2 requires a JSON object here,
+      // so translate rather than forward the empty body: a client that gets
+      // nothing — or the JSON literal `null` this used to send — can only
+      // report a parse failure against its own token-response schema, naming
+      // neither the status nor the cause.
+      if (responseBody === null) {
+        const tokenError = oauthTokenErrorForBodylessResponse(response.status);
+        logger.error(
+          {
+            grantType: body?.grant_type,
+            clientId: body?.client_id,
+            betterAuthStatus: response.status,
+            status: tokenError.status,
+          },
+          "[auth:oauth2/token] better-auth returned no response body; answering with an OAuth error",
+        );
+        return reply
+          .status(tokenError.status)
+          .header("content-type", "application/json; charset=utf-8")
+          .header("cache-control", "no-store")
+          .header("pragma", "no-cache")
+          .send(tokenError.body);
+      }
+
+      relayBetterAuthResponse({
+        reply,
+        response,
+        body: responseBody,
+        skipContentLength: true,
       });
-      reply.send(responseBody);
+    },
+  });
+
+  // RFC 7009 Token Revocation — shielded against better-auth's family
+  // invalidation (see services/oauth-refresh-replay.ts). Refresh-token
+  // revocations are handled here in full: idempotent 200s per RFC 7009 §2.2,
+  // where better-auth 400s and — for an already-rotated token — deletes the
+  // whole (client, user) token family. Managed application access tokens use
+  // the issuance verifier; user/public-client tokens forward to better-auth.
+  // Without this explicit route the
+  // request reaches better-auth through the /api/auth/* catch-all.
+  fastify.route({
+    method: "POST",
+    url: "/api/auth/oauth2/revoke",
+    schema: {
+      tags: ["Auth"],
+    },
+    onRequest(request, reply, done) {
+      if (config.authRateLimitDisabled) {
+        done();
+        return;
+      }
+      // Use Fastify's trustProxy policy, never an unchecked forwarding header.
+      // All grants share an IP budget so rotating client IDs cannot bypass it.
+      void oauthRevocationRateLimiter.consume(request.ip).then(
+        () => done(),
+        (error: unknown) => {
+          if (error instanceof RateLimiterRes) {
+            return reply
+              .header(
+                "Retry-After",
+                Math.max(1, Math.ceil(error.msBeforeNext / 1000)),
+              )
+              .header("Cache-Control", "no-store")
+              .code(429)
+              .send({
+                error: "temporarily_unavailable",
+                error_description:
+                  "Too many OAuth requests. Retry after the indicated delay.",
+              });
+          }
+          logger.error(
+            { err: error },
+            "OAuth revocation rate-limit storage unavailable",
+          );
+          return reply.header("Cache-Control", "no-store").code(503).send({
+            error: "temporarily_unavailable",
+            error_description: "Token revocation is temporarily unavailable.",
+          });
+        },
+      );
+    },
+    async handler(request, reply) {
+      const body = request.body as Record<string, unknown> | undefined;
+
+      // Same client_secret_basic → client_secret_post lift as the token
+      // endpoint, and for the same reason (the apiKey plugin intercepts the
+      // Authorization header before better-auth's OAuth handlers see it).
+      const authorizationHeader = request.headers.authorization;
+      const usesClientSecretBasic =
+        typeof authorizationHeader === "string" &&
+        authorizationHeader.startsWith("Basic ");
+      if (usesClientSecretBasic && body) {
+        const { clientId: basicClientId, clientSecret: basicClientSecret } =
+          extractOAuthClientCredentials({ authorizationHeader, body });
+        if (basicClientId && body.client_id === undefined) {
+          body.client_id = basicClientId;
+        }
+        if (basicClientSecret && body.client_secret === undefined) {
+          body.client_secret = basicClientSecret;
+        }
+      }
+
+      const interception = await shieldRevocationRequest({
+        token: typeof body?.token === "string" ? body.token : undefined,
+      });
+      if (interception.action === "respond") {
+        return reply.status(interception.statusCode).send(interception.body);
+      }
+
+      const managedRevocation = await revokeManagedOauthClientAccessToken({
+        clientId: body?.client_id,
+        clientSecret: body?.client_secret,
+        token: body?.token,
+        tokenTypeHint: body?.token_type_hint,
+      });
+      if (managedRevocation) {
+        return reply
+          .status(managedRevocation.statusCode)
+          .send(managedRevocation.body);
+      }
+
+      const url = new URL(request.url, getPublicRequestOrigin(request));
+      const headers = buildBetterAuthForwardedHeaders(
+        request,
+        usesClientSecretBasic
+          ? (name) => name.toLowerCase() === "authorization"
+          : undefined,
+      );
+      const contentType = request.headers["content-type"] || "";
+      const serializedBody = contentType.includes(
+        "application/x-www-form-urlencoded",
+      )
+        ? new URLSearchParams(body as Record<string, string>).toString()
+        : JSON.stringify(body);
+
+      const response = await betterAuth.handler(
+        new Request(url.toString(), {
+          method: request.method,
+          headers,
+          body: serializedBody,
+        }),
+      );
+      relayBetterAuthResponse({
+        reply,
+        response,
+        body: await readBetterAuthResponseBody(response),
+        skipContentLength: true,
+      });
     },
   });
 
@@ -526,10 +886,7 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
     },
     async handler(request, reply) {
       const url = new URL(request.url, `http://${request.headers.host}`);
-      const headers = new Headers();
-      Object.entries(request.headers).forEach(([key, value]) => {
-        if (value) headers.append(key, value.toString());
-      });
+      const headers = buildBetterAuthForwardedHeaders(request);
 
       const req = new Request(url.toString(), {
         method: request.method,
@@ -566,11 +923,17 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
       }
 
       if (!response.ok) {
+        const errorBody = response.body ? await response.text() : "";
+        // better-auth signs the consent page query with a short expiry and
+        // rejects it as `invalid_signature` once that passes (or if the query
+        // was altered). Resubmitting the same query can never succeed, so say
+        // so instead of relaying the raw error code.
+        if (isInvalidOAuthQuerySignatureError(errorBody)) {
+          throw new ApiError(400, OAUTH_CONSENT_REQUEST_EXPIRED_MESSAGE);
+        }
         throw new ApiError(
           response.status,
-          response.body
-            ? await response.text()
-            : "OAuth consent request failed",
+          errorBody || "OAuth consent request failed",
         );
       }
 
@@ -600,6 +963,20 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
     async handler(request, reply) {
       const body = request.body;
 
+      // When DCR is disabled, only pre-registered OAuth clients may run OAuth
+      // flows. Reject self-registration with the RFC 7591 error shape.
+      if (!config.auth.dynamicClientRegistrationEnabled) {
+        logger.warn(
+          { clientName: body.client_name },
+          "[auth:oauth2/register] Dynamic client registration is disabled",
+        );
+        return reply.status(403).send({
+          error: "access_denied",
+          error_description:
+            "Dynamic client registration is disabled on this instance",
+        });
+      }
+
       logger.info(
         {
           clientName: body.client_name,
@@ -615,11 +992,36 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
       // Override any client-provided value — see route comment above
       body.token_endpoint_auth_method = "none";
 
+      // Native MCP clients (e.g. Claude Desktop) register the refresh_token
+      // grant but list only "mcp" in their requested scope, then ask for
+      // offline_access at the authorize step to obtain a refresh token. The
+      // OAuth provider validates authorize-time scopes against the client's
+      // *registered* scopes, so a client that never registered offline_access
+      // gets `invalid_scope` at authorize. Register offline_access whenever the
+      // client asks for the refresh_token grant so the later request succeeds
+      // (this is also what the authorize handler's offline_access injection
+      // assumes — that refresh-capable clients carry the scope from DCR).
+      const grantTypes = Array.isArray(body.grant_types)
+        ? body.grant_types
+        : [];
+      if (
+        grantTypes.includes("refresh_token") &&
+        typeof body.scope === "string" &&
+        body.scope.length > 0
+      ) {
+        const scopes = body.scope.split(" ").filter(Boolean);
+        if (!scopes.includes(OFFLINE_ACCESS_OAUTH_SCOPE)) {
+          scopes.push(OFFLINE_ACCESS_OAUTH_SCOPE);
+          body.scope = scopes.join(" ");
+          logger.info(
+            { clientName: body.client_name, scope: body.scope },
+            "[auth:oauth2/register] Added offline_access to refresh_token client's registered scopes",
+          );
+        }
+      }
+
       const url = new URL(request.url, `http://${request.headers.host}`);
-      const headers = new Headers();
-      Object.entries(request.headers).forEach(([key, value]) => {
-        if (value) headers.append(key, value.toString());
-      });
+      const headers = buildBetterAuthForwardedHeaders(request);
 
       const req = new Request(url.toString(), {
         method: request.method,
@@ -654,14 +1056,17 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
         return;
       }
 
-      reply.status(response.status);
-      response.headers.forEach((value: string, key: string) => {
-        reply.header(key, value);
+      relayBetterAuthResponse({
+        reply,
+        response,
+        body: await readBetterAuthResponseBody(response),
       });
-      reply.send(response.body ? await response.text() : null);
     },
   });
 
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
   fastify.route({
     method: "POST",
     url: "/api/auth/sign-in/sso",
@@ -670,11 +1075,7 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
     },
     async handler(request, reply) {
       const url = new URL(request.url, `http://${request.headers.host}`);
-      const headers = new Headers();
-
-      Object.entries(request.headers).forEach(([key, value]) => {
-        if (value) headers.append(key, value.toString());
-      });
+      const headers = buildBetterAuthForwardedHeaders(request);
 
       const req = new Request(url.toString(), {
         method: request.method,
@@ -687,13 +1088,14 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
         requestBody: request.body as Record<string, unknown> | undefined,
       });
 
-      reply.status(response.status);
-      response.headers.forEach((value: string, key: string) => {
-        reply.header(key, value);
+      relayBetterAuthResponse({
+        reply,
+        response,
+        body: await readBetterAuthResponseBody(response),
       });
-      reply.send(response.body ? await response.text() : null);
     },
   });
+  // SPDX-SnippetEnd
 
   // Existing auth handler for all other auth routes
   fastify.route({
@@ -704,11 +1106,22 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
     },
     async handler(request, reply) {
       const url = new URL(request.url, `http://${request.headers.host}`);
-      const headers = new Headers();
-
-      Object.entries(request.headers).forEach(([key, value]) => {
-        if (value) headers.append(key, value.toString());
-      });
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      if (
+        request.method === "POST" &&
+        [
+          "/api/auth/sso/register",
+          "/api/auth/sso/verify-domain",
+          "/api/auth/sso/update-provider",
+          "/api/auth/sso/delete-provider",
+        ].includes(url.pathname)
+      ) {
+        throw new ApiError(404, "Not found");
+      }
+      // SPDX-SnippetEnd
+      const headers = buildBetterAuthForwardedHeaders(request);
 
       // Handle body based on content type
       // SAML callbacks use application/x-www-form-urlencoded
@@ -733,6 +1146,20 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
       });
 
       const response = await betterAuth.handler(req);
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      if (
+        response.status >= 400 &&
+        [
+          "/api/auth/sso/callback/",
+          "/api/auth/sso/saml2/callback/",
+          "/api/auth/sso/saml2/sp/acs/",
+        ].some((prefix) => url.pathname.startsWith(prefix))
+      ) {
+        response.headers.delete("set-cookie");
+      }
+      // SPDX-SnippetEnd
 
       // Check for "Invalid origin" errors and enhance with helpful guidance
       if (response.status === 403 && response.body) {
@@ -767,19 +1194,20 @@ const authRoutes: FastifyPluginAsyncZod = async (fastify) => {
         return reply.send(responseText);
       }
 
-      reply.status(response.status);
-
-      response.headers.forEach((value: string, key: string) => {
-        reply.header(key, value);
+      relayBetterAuthResponse({
+        reply,
+        response,
+        body: await readBetterAuthResponseBody(response),
       });
-
-      reply.send(response.body ? await response.text() : null);
     },
   });
 };
 
 export default authRoutes;
 
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
 async function rewriteGoogleSsoResponseWithHostedDomainHint(params: {
   requestBody?: Record<string, unknown>;
   response: Response;
@@ -832,7 +1260,7 @@ async function rewriteGoogleSsoResponseWithHostedDomainHint(params: {
 }
 
 async function getGoogleHostedDomainHint(): Promise<string | undefined> {
-  if (!config.enterpriseFeatures.core) {
+  if (!enterpriseTier.isCoreActive()) {
     return undefined;
   }
 
@@ -852,6 +1280,7 @@ function appendHostedDomainHint(urlString: string, hostedDomainHint: string) {
   url.searchParams.set("hd", hostedDomainHint);
   return url.toString();
 }
+// SPDX-SnippetEnd
 
 function extractOAuthClientCredentials(params: {
   authorizationHeader: string | string[] | undefined;
@@ -884,69 +1313,120 @@ function extractOAuthClientCredentials(params: {
   };
 }
 
-async function issueLlmOauthClientAccessToken(params: {
-  clientId: string | undefined;
-  clientSecret: string | undefined;
-  scope: string | undefined;
-}): Promise<{
-  ok: boolean;
-  statusCode: number;
-  body: Record<string, unknown>;
-}> {
-  if (!params.clientId || !params.clientSecret) {
-    return {
-      ok: false,
-      statusCode: 401,
-      body: { error: "invalid_client" },
-    };
-  }
+/**
+ * Minimal shape of the Fastify reply used by `relayBetterAuthResponse`, kept
+ * structural so the helper works with every route's zod-typed reply.
+ */
+type BetterAuthRelayReply = {
+  status: (statusCode: number) => unknown;
+  header: (name: string, value: string) => unknown;
+  send: (payload?: string) => unknown;
+};
 
-  const requestedScopes = params.scope?.split(/\s+/).filter(Boolean) ?? [
-    LLM_PROXY_OAUTH_SCOPE,
-  ];
-  if (!requestedScopes.some((scope) => scope === LLM_PROXY_OAUTH_SCOPE)) {
-    return {
-      ok: false,
-      statusCode: 400,
-      body: {
-        error: "invalid_scope",
-        error_description: `${LLM_PROXY_OAUTH_SCOPE} scope is required`,
-      },
-    };
-  }
+/**
+ * Copy a better-auth `Response` onto a Fastify reply.
+ *
+ * better-auth's router (better-call) answers with a *bodyless* `Response`
+ * whenever it cannot dispatch a request — an unknown path, a path that only
+ * exists under a different method, a trailing-slash or double-slash mismatch —
+ * and whenever it turns an unhandled error into a 500.
+ *
+ * That missing body must not be handed to `reply.send(null)`. Fastify does not
+ * read `null` as "no body": it serializes the JSON literal `null`, a four-byte
+ * body sent as `application/json`. It parses as valid JSON but is not an
+ * object, so a client decoding a typed response reports a *type* error against
+ * its own schema instead of the HTTP failure that actually happened. On the
+ * OAuth token endpoint that is the difference between a diagnosable error and
+ * none at all: the Codex CLI aborts the whole MCP gateway login with
+ * `OAuth token exchange failed: invalid type: null, expected struct
+ * StandardTokenResponse at line 1 column 4`, which names neither the status nor
+ * the cause.
+ *
+ * A bodyless upstream response therefore stays bodyless.
+ */
+function relayBetterAuthResponse(params: {
+  reply: BetterAuthRelayReply;
+  response: Response;
+  body: string | null;
+  skipContentLength?: boolean;
+}): void {
+  const { reply, response, body, skipContentLength } = params;
 
-  const oauthClient = await LlmOauthClientModel.findClientForCredentials({
-    clientId: params.clientId,
-    clientSecret: params.clientSecret,
+  reply.status(response.status);
+  response.headers.forEach((value: string, key: string) => {
+    const name = key.toLowerCase();
+    if (skipContentLength && name === "content-length") {
+      return;
+    }
+    // A response with no body must not claim to carry one. better-call builds
+    // its router misses with `new Response(null, …)`, which has no headers at
+    // all — but an `APIError` thrown without a body (better-auth's admin plugin
+    // and authorization middleware both do this) is turned into a bodyless
+    // response that still declares `content-type: application/json`. Forwarding
+    // that pairs an empty body with a JSON content type, so a client that
+    // trusts the header and calls `.json()` gets a parse error — the same class
+    // of failure this whole change exists to remove.
+    if (
+      body === null &&
+      (name === "content-type" || name === "content-length")
+    ) {
+      return;
+    }
+    reply.header(key, value);
   });
-  if (!oauthClient) {
-    return {
-      ok: false,
-      statusCode: 401,
-      body: { error: "invalid_client" },
-    };
-  }
 
-  const accessToken = `llm_at_${randomBytes(32).toString("base64url")}`;
-  const expiresIn = LLM_OAUTH_CLIENT_CREDENTIALS_ACCESS_TOKEN_LIFETIME_SECONDS;
-  await OAuthAccessTokenModel.createClientCredentialsToken({
-    tokenHash: hashOAuthAccessTokenForLookup(accessToken),
-    clientId: oauthClient.clientId,
-    expiresAt: new Date(Date.now() + expiresIn * 1000),
-    scopes: [LLM_PROXY_OAUTH_SCOPE],
-    referenceId: `llm-proxy:${oauthClient.id}`,
-  });
+  reply.send(body ?? undefined);
+}
 
+/**
+ * Read a better-auth response body, preserving the distinction between "empty
+ * body" and "no body at all" — `null` means the response carried no body.
+ */
+async function readBetterAuthResponseBody(
+  response: Response,
+): Promise<string | null> {
+  return response.body ? await response.text() : null;
+}
+
+/**
+ * Status and body for a token-endpoint response that better-auth answered
+ * without one. RFC 6749 §5.2 requires a JSON object carrying an `error`
+ * member, so the bodyless response is translated instead of forwarded.
+ *
+ * A token endpoint must never report success without a token, so anything that
+ * is not an explicit client error is reported as `server_error` with a 5xx.
+ */
+function oauthTokenErrorForBodylessResponse(betterAuthStatus: number): {
+  status: number;
+  body: string;
+} {
+  const isClientError = betterAuthStatus >= 400 && betterAuthStatus < 500;
   return {
-    ok: true,
-    statusCode: 200,
-    body: {
-      access_token: accessToken,
-      token_type: "Bearer",
-      expires_in: expiresIn,
-      scope: LLM_PROXY_OAUTH_SCOPE,
-    },
+    status: isClientError ? betterAuthStatus : 500,
+    body: JSON.stringify(
+      isClientError
+        ? {
+            error: "invalid_request",
+            error_description: `The authorization server rejected the token request (HTTP ${betterAuthStatus}).`,
+          }
+        : {
+            error: "server_error",
+            error_description:
+              "The authorization server did not return a token response.",
+          },
+    ),
   };
+}
+
+const OAUTH_CONSENT_REQUEST_EXPIRED_MESSAGE =
+  "This authorization request has expired. Go back to the application and connect again to start a new request.";
+
+function isInvalidOAuthQuerySignatureError(body: string): boolean {
+  try {
+    return JSON.parse(body)?.error === "invalid_signature";
+  } catch {
+    return false;
+  }
 }
 
 function shouldSkipForwardedAuthHeader(headerName: string): boolean {
@@ -959,17 +1439,74 @@ function shouldSkipForwardedAuthHeader(headerName: string): boolean {
   );
 }
 
+/**
+ * Build the Headers object forwarded into the better-auth Web `Request`.
+ *
+ * - Strips any client-supplied `x-archestra-client-ip` and re-injects Fastify's
+ *   resolved `request.ip` in its place. This is the only IP header
+ *   `resolveAuthClientIp` trusts; without this sanitization any caller could
+ *   forge the IP recorded against their own auth audit rows simply by setting
+ *   the header themselves.
+ * - Skips empty header values.
+ * - Skips headers rejected by the optional `skipHeader` predicate (used by
+ *   `oauth2/authorize` to drop hop-by-hop headers).
+ * - See https://github.com/better-auth/better-auth/issues/6257
+ * - Injects the configured frontend origin when the incoming request carries no
+ *   `Origin` header *and* targets a public OAuth endpoint (see
+ *   `isPublicOAuthCorsPath`). Native MCP clients (e.g. Claude Desktop) call those
+ *   endpoints — dynamic client registration and the token endpoint — directly,
+ *   server-to-server, with no Origin. Better Auth's CSRF check rejects any
+ *   state-changing request that lacks an Origin with `MISSING_OR_NULL_ORIGIN`
+ *   before it ever consults `trustedOrigins`, so without this those flows 403.
+ *   This mirrors what the frontend proxy already does for the browser path
+ *   (`frontend/src/app/api/auth/[...path]/route.ts`, `frontend/src/proxy.ts`).
+ *   Scoped to the same public OAuth paths as the permissive CORS policy so the
+ *   carve-out is visible and symmetric: the credentialed browser routes (sign-in,
+ *   consent, authorize) keep Better Auth's full origin-based CSRF protection.
+ *   Only ever fills in a *missing* Origin, so it can't relax the check for a
+ *   real browser request (those always send Origin on cross-origin POSTs).
+ */
+function buildBetterAuthForwardedHeaders(
+  request: {
+    headers: Record<string, unknown>;
+    ip?: string | null;
+    url: string;
+  },
+  skipHeader?: (headerName: string) => boolean,
+): Headers {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(request.headers)) {
+    if (!value) continue;
+    if (key.toLowerCase() === "x-archestra-client-ip") continue;
+    if (skipHeader?.(key)) continue;
+    headers.append(key, String(value));
+  }
+  if (request.ip) {
+    headers.set("x-archestra-client-ip", request.ip);
+  }
+  // Back-fill a missing Origin only on the public OAuth endpoints (see the
+  // docstring above and `isPublicOAuthCorsPath`). Scoping it to those paths is
+  // what keeps the credentialed browser routes (sign-in, consent, authorize)
+  // on Better Auth's full origin-based CSRF protection — a missing Origin on
+  // those must stay missing rather than be back-filled with the frontend origin.
+  const origin = headers.get("origin");
+  if ((!origin || origin === "null") && isPublicOAuthCorsPath(request.url)) {
+    headers.set("origin", config.frontendBaseUrl);
+  }
+  return headers;
+}
+
 async function applyOrganizationOAuthTokenLifetimeToResponse(params: {
-  response: Response;
+  responseText: string | null;
+  ok: boolean;
   resource: unknown;
   tokenEndpointOrigin: string;
 }): Promise<string | null> {
-  if (!params.response.body) {
+  const { responseText } = params;
+  if (responseText === null) {
     return null;
   }
-
-  const responseText = await params.response.text();
-  if (!params.response.ok) {
+  if (!params.ok) {
     return responseText;
   }
 
@@ -1017,12 +1554,33 @@ async function applyOrganizationOAuthTokenLifetimeToResponse(params: {
   });
 }
 
-async function getOAuthAccessTokenLifetimeSeconds(params: {
+/**
+ * @public — exercised by auth.test.ts (knip --production ignores tests)
+ */
+export async function getOAuthAccessTokenLifetimeSeconds(params: {
   resource: unknown;
   referenceId: string | null | undefined;
   tokenEndpointOrigin: string;
   userId: string;
 }): Promise<number | null> {
+  // A shareable-App connector token is scoped to the app's organization, not the
+  // viewer's first membership — resolve the app's org (via the token's bound
+  // audience ref, or the requested `resource`) so the token can't outlive the
+  // owning org's policy. The token endpoint binds the audience before applying
+  // the lifetime, so on both grants the ref identifies the connector here.
+  const connectorAppId = resolveConnectorAppId({
+    resource: params.resource,
+    referenceId: params.referenceId,
+    tokenEndpointOrigin: params.tokenEndpointOrigin,
+  });
+  if (connectorAppId) {
+    const app = await AppModel.findById(connectorAppId);
+    if (app) {
+      const organization = await OrganizationModel.getById(app.organizationId);
+      return organization?.oauthAccessTokenLifetimeSeconds ?? null;
+    }
+  }
+
   const profileId =
     (await getProfileIdFromResource({
       resource: params.resource,
@@ -1106,6 +1664,243 @@ function getProfileIdFromReferenceId(
   return referenceId.slice(MCP_RESOURCE_REFERENCE_PREFIX.length) || null;
 }
 
+/**
+ * The app id a connector token is bound to, from its audience ref or — as a
+ * fallback — the requested `resource`, else null. The ref is preferred and
+ * authoritative: it is the token's actual audience, and better-auth ignores a
+ * re-sent `resource` on refresh, so the resource must not drive resolution away
+ * from the binding. The ref was written by our own mint and is already trusted;
+ * the client-supplied resource only resolves on a trusted origin.
+ */
+function resolveConnectorAppId(params: {
+  resource: unknown;
+  referenceId: string | null | undefined;
+  tokenEndpointOrigin: string;
+}): string | null {
+  const allowedOrigins = new Set([
+    new URL(buildOAuthIssuer()).origin,
+    params.tokenEndpointOrigin,
+  ]);
+  const canonicalUri =
+    connectorResourceUriFromAudienceRef(params.referenceId) ??
+    resolveAppConnectorResource(params.resource, allowedOrigins);
+  if (!canonicalUri) {
+    return null;
+  }
+  try {
+    return appIdFromConnectorPath(new URL(canonicalUri).pathname);
+  } catch {
+    return null;
+  }
+}
+
 function hashOAuthAccessTokenForLookup(oauthAccessToken: string): string {
   return OAuthAccessTokenModel.hashTokenForLookup(oauthAccessToken);
+}
+
+/**
+ * Bind a freshly minted access token to a shareable-App connector resource
+ * (RFC 8707), so the connector accepts it only at its own canonical URI. The
+ * `resource` parameter is stripped before better-auth (which rejects a dynamic
+ * audience), so the binding is stamped here, after mint. On an authorization_code
+ * grant the audience is the consented `resource`, and a connector-targeted
+ * `resource` that cannot be bound returns `error` (RFC 8707 invalid_target) so
+ * the caller fails the request rather than hand back a token that silently 401s.
+ * On a refresh_token grant the audience is whatever better-auth inherited from
+ * the original grant; the requested `resource` is advisory there and never errors
+ * (see {@link bindRefreshedConnectorToken}).
+ *
+ * @public — exercised by auth.test.ts
+ */
+export async function bindAppConnectorTokenAudience(params: {
+  resource: unknown;
+  responseBody: string | null;
+  grantType: unknown;
+  tokenEndpointOrigin: string;
+}): Promise<{ status: "ok" | "skip" } | { status: "error"; message: string }> {
+  if (!params.responseBody) {
+    return { status: "skip" };
+  }
+  const tokenBody = parseOAuthTokenResponseBody(params.responseBody);
+  const accessToken =
+    typeof tokenBody?.access_token === "string" ? tokenBody.access_token : null;
+  if (!accessToken) {
+    return { status: "skip" };
+  }
+
+  const tokenHash = hashOAuthAccessTokenForLookup(accessToken);
+
+  // On a refresh better-auth ignores the requested `resource` and inherits the
+  // original grant's audience, so the resource-shape checks below must not run
+  // here — erroring on a refresh would strand the token better-auth has already
+  // rotated. The inherited binding is authoritative.
+  if (params.grantType === "refresh_token") {
+    return bindRefreshedConnectorToken({
+      tokenHash,
+      resource: params.resource,
+      tokenEndpointOrigin: params.tokenEndpointOrigin,
+    });
+  }
+
+  // Initial (authorization_code) grant: the requested `resource` determines a
+  // new binding. RFC 8707 permits repeated `resource` parameters, which arrive
+  // as an array; a connector token binds to exactly one audience, so a connector
+  // named among repeated resources cannot be honored and fails closed rather than
+  // fall through to an unbound `mcp` token (which still authenticates the MCP
+  // gateway via the user-access path). A lone connector resource always arrives
+  // as a string.
+  if (Array.isArray(params.resource)) {
+    if (params.resource.some(isConnectorTargetedResource)) {
+      return {
+        status: "error",
+        message: "A connector resource must be requested as the sole audience.",
+      };
+    }
+    return { status: "skip" };
+  }
+
+  const allowedOrigins = new Set([
+    new URL(buildOAuthIssuer()).origin,
+    params.tokenEndpointOrigin,
+  ]);
+  const requestedCanonical = resolveAppConnectorResource(
+    params.resource,
+    allowedOrigins,
+  );
+  const requestedRef = requestedCanonical
+    ? appConnectorAudienceRef(requestedCanonical)
+    : null;
+
+  // A connector-targeted `resource` that did not resolve to a trusted canonical
+  // URI (an untrusted origin like https://evil.example.com/api/mcp/app/<id>, or a
+  // malformed/sub-path connector URL) fails closed with RFC 8707 invalid_target.
+  // Absent or non-connector resources are unaffected (they bind elsewhere or not
+  // at all).
+  if (!requestedRef && isConnectorTargetedResource(params.resource)) {
+    return {
+      status: "error",
+      message:
+        "The requested resource is not a valid connector on this server.",
+    };
+  }
+  if (!requestedRef) {
+    return { status: "skip" };
+  }
+  const bound =
+    await OAuthAccessTokenModel.bindReferenceIdByTokenHashWhenUnbound({
+      tokenHash,
+      referenceId: requestedRef,
+    });
+  if (!bound) {
+    // A prior stamp of the same audience is success (idempotent); any other
+    // unbindable state fails closed.
+    const existing = await OAuthAccessTokenModel.getByTokenHash(tokenHash);
+    if (existing?.referenceId === requestedRef) {
+      return { status: "ok" };
+    }
+    logger.error(
+      { requestedRef },
+      "[auth:oauth2/token] could not bind app connector token to its resource",
+    );
+    return {
+      status: "error",
+      message: "Unable to bind the access token to the requested resource.",
+    };
+  }
+  // Carry the binding onto the refresh token so better-auth inherits it on later
+  // refreshes. Best-effort: if it can't be written, a future refresh that omits
+  // `resource` yields an unbound token the connector rejects (fail-closed).
+  if (bound.refreshId) {
+    const carried = await OAuthRefreshTokenModel.bindReferenceIdByIdWhenUnbound(
+      {
+        id: bound.refreshId,
+        referenceId: requestedRef,
+      },
+    );
+    if (!carried) {
+      logger.warn(
+        { refreshId: bound.refreshId, requestedRef },
+        "[auth:oauth2/token] could not carry the connector audience onto the refresh token",
+      );
+    }
+  }
+  return { status: "ok" };
+}
+
+/**
+ * Bind a refreshed token to the connector audience better-auth inherited from
+ * the original grant (carried via the refresh token's `referenceId`). The
+ * requested `resource` is advisory on refresh: better-auth ignores it and cannot
+ * re-target the audience, so a mismatch is logged, never errored — erroring would
+ * strand the session better-auth has already rotated (the old refresh token is
+ * revoked the moment the new one is minted). Returns `skip` for a non-connector
+ * token.
+ */
+async function bindRefreshedConnectorToken(params: {
+  tokenHash: string;
+  resource: unknown;
+  tokenEndpointOrigin: string;
+}): Promise<{ status: "ok" | "skip" }> {
+  const refreshed = await OAuthAccessTokenModel.getByTokenHash(
+    params.tokenHash,
+  );
+  let inheritedRef = isAppConnectorAudienceRef(refreshed?.referenceId)
+    ? (refreshed?.referenceId ?? null)
+    : null;
+  if (!inheritedRef && refreshed?.refreshId) {
+    const refresh = await OAuthRefreshTokenModel.getById(refreshed.refreshId);
+    inheritedRef = isAppConnectorAudienceRef(refresh?.referenceId)
+      ? (refresh?.referenceId ?? null)
+      : null;
+  }
+  if (!inheritedRef) {
+    return { status: "skip" };
+  }
+
+  // Surface a client that asked to re-target a different connector on refresh: it
+  // gets the inherited binding regardless, but the discrepancy is worth a log.
+  const allowedOrigins = new Set([
+    new URL(buildOAuthIssuer()).origin,
+    params.tokenEndpointOrigin,
+  ]);
+  const requestedCanonical = resolveAppConnectorResource(
+    params.resource,
+    allowedOrigins,
+  );
+  const requestedRef = requestedCanonical
+    ? appConnectorAudienceRef(requestedCanonical)
+    : null;
+  if (requestedRef && requestedRef !== inheritedRef) {
+    logger.warn(
+      { requestedRef, inheritedRef },
+      "[auth:oauth2/token] refresh requested a different connector audience; honoring the inherited binding",
+    );
+  }
+
+  // Stamp the access token only if better-auth did not already inherit it. The
+  // stamp is a one-shot IS NULL write: a no-op when the row already carries the
+  // audience (idempotent success). Unlike the authorization_code path this never
+  // fails the request — better-auth has already rotated the refresh token, so
+  // erroring would strand the session. But if the row ended up unbound or bound
+  // to a different audience (stale/partial write, corruption), the refreshed
+  // token would 401 at its connector, so surface that rather than assume success.
+  if (refreshed?.referenceId !== inheritedRef) {
+    const bound =
+      await OAuthAccessTokenModel.bindReferenceIdByTokenHashWhenUnbound({
+        tokenHash: params.tokenHash,
+        referenceId: inheritedRef,
+      });
+    if (!bound) {
+      const existing = await OAuthAccessTokenModel.getByTokenHash(
+        params.tokenHash,
+      );
+      if (existing?.referenceId !== inheritedRef) {
+        logger.error(
+          { inheritedRef, existingRef: existing?.referenceId ?? null },
+          "[auth:oauth2/token] refreshed token could not inherit its connector audience",
+        );
+      }
+    }
+  }
+  return { status: "ok" };
 }

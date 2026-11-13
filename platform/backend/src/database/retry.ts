@@ -7,13 +7,26 @@
  * @see https://github.com/brianc/node-postgres/issues/434
  * @see https://neon.com/guides/building-resilient-applications-with-postgres
  */
+import { isIP } from "node:net";
+import { DrizzleQueryError } from "drizzle-orm/errors";
+import config from "@/config";
 import logger from "@/logging";
+import { getConnectionFailureTarget } from "@/utils/network-errors";
 
 /**
  * Maximum number of retry attempts for transient database errors.
  * Total attempts = MAX_RETRIES + 1 (initial attempt + retries).
+ * The effective limit is usually {@link RETRY_BUDGET_MS}: retries stop as
+ * soon as the next backoff would overrun the time budget.
  */
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 8;
+
+/**
+ * Wall-clock budget for a single retried operation. Sized to ride out a
+ * short database restart or failover instead of giving up within the first
+ * second, while still bounding how long a request can hang on the pool.
+ */
+const RETRY_BUDGET_MS = 15_000;
 
 /** Base delay in milliseconds for exponential backoff */
 const BASE_DELAY_MS = 100;
@@ -40,21 +53,123 @@ const TRANSIENT_PG_CODES = new Set([
 ]);
 
 /**
- * Error message substrings that indicate transient connection issues.
- * These cover errors from node-postgres (pg) and the TCP/socket layer.
+ * Error message substrings that indicate transient connection issues, each
+ * paired with a stable code used to group occurrences in error tracking.
+ * These cover errors from node-postgres (pg), DNS resolution, and the
+ * TCP/socket layer.
  */
-const TRANSIENT_ERROR_PATTERNS = [
-  "ECONNREFUSED",
-  "ECONNRESET",
-  "EPIPE",
-  "ETIMEDOUT",
-  "Connection terminated",
-  "timeout exceeded when trying to connect",
-  "timeout expired",
+const TRANSIENT_ERROR_PATTERNS: ReadonlyArray<{
+  pattern: string;
+  code: string;
+}> = [
+  { pattern: "ECONNREFUSED", code: "ECONNREFUSED" },
+  { pattern: "ECONNRESET", code: "ECONNRESET" },
+  { pattern: "EPIPE", code: "EPIPE" },
+  { pattern: "ETIMEDOUT", code: "ETIMEDOUT" },
+  // DNS resolution failures (getaddrinfo). EAI_AGAIN is an explicitly
+  // temporary lookup failure; ENOTFOUND is a name that did not resolve,
+  // which is transient when a database host briefly stops resolving during
+  // a restart or failover (common with in-cluster service DNS).
+  { pattern: "EAI_AGAIN", code: "EAI_AGAIN" },
+  { pattern: "ENOTFOUND", code: "ENOTFOUND" },
+  { pattern: "Connection terminated", code: "connection_terminated" },
+  {
+    pattern: "timeout exceeded when trying to connect",
+    code: "pool_connect_timeout",
+  },
+  { pattern: "timeout expired", code: "timeout_expired" },
 ];
+
+/**
+ * Errnos for the connection to the database failing at the syscall, before
+ * PostgreSQL is ever reached (so there is no SQLSTATE to key off).
+ *
+ * In a managed cluster the CNI, a network policy, or a security group can
+ * reject or black-hole egress while nodes, ENIs, or policy rules are being
+ * reprogrammed, and a busy node can momentarily run out of ephemeral source
+ * ports. Each window is short and the next attempt succeeds, which makes these
+ * transient in exactly the way a refused connection is.
+ *
+ * Kept separate from {@link TRANSIENT_ERROR_PATTERNS} because these tokens are
+ * short enough to appear inside unrelated text: the ORM embeds the failing
+ * statement's parameters in the message, so a bare `message.includes("EPERM")`
+ * would let user-supplied data mark a permanent failure as retryable. They are
+ * matched on `error.code`, or on the `<syscall> <ERRNO> <address>` shape Node
+ * uses to render them (see {@link SYSCALL_ERRNO_PATTERN}).
+ */
+const CONNECT_SYSCALL_ERRNOS = [
+  "EPERM",
+  "EACCES",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENETDOWN",
+  "EADDRNOTAVAIL",
+  "EADDRINUSE",
+] as const;
+
+/**
+ * Node renders a failed connection syscall as `connect EPERM 10.0.0.1:5432`.
+ * Anchoring on that shape keeps the errno from matching parameter values the
+ * ORM interpolated into the same message.
+ */
+const SYSCALL_ERRNO_PATTERN = new RegExp(
+  `\\b(?:connect|getaddrinfo|read|write)\\s+(${CONNECT_SYSCALL_ERRNOS.join("|")})\\b`,
+);
+
+/**
+ * Transient network syscall codes, matched against `error.code` directly.
+ * Message matching alone misses Node's multi-address connection failure: when
+ * a database host resolves to several addresses (e.g. IPv6 + IPv4) and all
+ * fail, net.connect throws an AggregateError whose message is EMPTY — the
+ * syscall code lives on `error.code` and the per-address errors in `errors`.
+ */
+const TRANSIENT_NETWORK_CODES = new Set<string>([
+  ...TRANSIENT_ERROR_PATTERNS.filter(
+    ({ pattern, code }) => pattern === code,
+  ).map(({ code }) => code),
+  ...CONNECT_SYSCALL_ERRNOS,
+]);
+
+/** Port PostgreSQL listens on when the connection URL names none. */
+const DEFAULT_POSTGRES_PORT = 5432;
 
 /** Maximum depth for cause-chain traversal to guard against circular references */
 const MAX_CAUSE_DEPTH = 5;
+
+/**
+ * SQLSTATE 57014 (query_canceled): raised when the pool's `statement_timeout`
+ * kills a query that ran too long (see createPool in database/index.ts).
+ */
+const QUERY_CANCELED_PG_CODE = "57014";
+
+/** Message emitted by PostgreSQL when statement_timeout cancels a query. */
+const STATEMENT_TIMEOUT_MESSAGE =
+  "canceling statement due to statement timeout";
+
+/**
+ * SQLSTATE class 53 (insufficient resources): the database server is out of
+ * some capacity — disk, memory, or connection slots — mapped to stable,
+ * low-cardinality names used to fingerprint occurrences in error tracking.
+ *
+ * @see https://www.postgresql.org/docs/current/errcodes-appendix.html
+ */
+const RESOURCE_EXHAUSTION_PG_CODES: ReadonlyMap<string, string> = new Map([
+  ["53000", "insufficient_resources"],
+  ["53100", "disk_full"],
+  ["53200", "out_of_memory"],
+  ["53300", "too_many_connections"],
+  ["53400", "configuration_limit_exceeded"],
+]);
+
+/**
+ * Message suffix PostgreSQL renders (via strerror) when a server-side write
+ * fails on a full disk, e.g. "could not write init file: No space left on
+ * device". Some of these reports reach the client without a SQLSTATE (raised
+ * during connection startup rather than query execution), leaving the message
+ * as the only signal. Long and specific enough that query parameters the ORM
+ * interpolates into the wrapper message cannot plausibly trigger it.
+ */
+const NO_SPACE_LEFT_MESSAGE = "No space left on device";
 
 /**
  * Determine whether a database error is transient (i.e. retrying may succeed).
@@ -63,25 +178,248 @@ const MAX_CAUSE_DEPTH = 5;
  * checks the underlying cause (bounded to {@link MAX_CAUSE_DEPTH} levels).
  * @public — exported for testability
  */
-export function isTransientDbError(error: unknown, depth = 0): boolean {
+export function isTransientDbError(error: unknown): boolean {
+  return getTransientDbErrorCode(error) !== null;
+}
+
+/**
+ * Determine whether a database error is a statement timeout — PostgreSQL
+ * canceling a query that exceeded `statement_timeout`.
+ *
+ * Deliberately NOT part of {@link isTransientDbError}: a query that just
+ * burned the full statement timeout is slow because of query shape or
+ * database load, and retrying it immediately multiplies that load. It is
+ * surfaced here only so error tracking can group all statement timeouts
+ * under one stable fingerprint instead of one issue per SQL statement
+ * (the ORM wraps the cancellation per-query as "Failed query: <sql>").
+ */
+export function isDbStatementTimeoutError(error: unknown, depth = 0): boolean {
   if (!(error instanceof Error)) return false;
   if (depth > MAX_CAUSE_DEPTH) return false;
 
-  // Check PostgreSQL error code (set by node-postgres on query errors)
-  const pgCode = (error as Error & { code?: string }).code;
-  if (pgCode && TRANSIENT_PG_CODES.has(pgCode)) return true;
+  const errorCode = (error as Error & { code?: string }).code;
+  if (errorCode === QUERY_CANCELED_PG_CODE) return true;
+  if (error.message.includes(STATEMENT_TIMEOUT_MESSAGE)) return true;
 
-  // Check error message for known transient patterns
-  const message = error.message;
-  if (TRANSIENT_ERROR_PATTERNS.some((pattern) => message.includes(pattern))) {
-    return true;
+  if (error instanceof AggregateError) {
+    for (const subError of error.errors) {
+      if (isDbStatementTimeoutError(subError, depth + 1)) return true;
+    }
+  }
+
+  const cause = (error as Error & { cause?: unknown }).cause;
+  if (cause) return isDbStatementTimeoutError(cause, depth + 1);
+
+  return false;
+}
+
+/**
+ * Resolve a database error caused by the server running out of a resource
+ * (SQLSTATE class 53: disk full, out of memory, too many connections) to a
+ * stable, low-cardinality code, or null for anything else.
+ *
+ * Deliberately NOT part of {@link isTransientDbError}: a server that is out
+ * of disk or memory will not recover within the retry budget, and retrying
+ * only adds load. Like statement timeouts, these are surfaced solely so error
+ * tracking can group one capacity incident under one stable fingerprint —
+ * the ORM wraps each failure per-query as "Failed query: <sql>", which
+ * otherwise fragments the incident into a new issue per SQL statement.
+ */
+export function getDbResourceExhaustionErrorCode(
+  error: unknown,
+  depth = 0,
+): string | null {
+  if (!(error instanceof Error)) return null;
+  if (depth > MAX_CAUSE_DEPTH) return null;
+
+  const errorCode = (error as Error & { code?: string }).code;
+  const mapped = errorCode
+    ? RESOURCE_EXHAUSTION_PG_CODES.get(errorCode)
+    : undefined;
+  if (mapped) return mapped;
+
+  // Disk-full reports raised outside query execution (connection startup)
+  // carry no SQLSTATE — the strerror suffix is the only signal.
+  if (error.message.includes(NO_SPACE_LEFT_MESSAGE)) return "disk_full";
+
+  if (error instanceof AggregateError) {
+    for (const subError of error.errors) {
+      const code = getDbResourceExhaustionErrorCode(subError, depth + 1);
+      if (code) return code;
+    }
   }
 
   // DrizzleQueryError wraps the underlying pg error as `cause`
   const cause = (error as Error & { cause?: unknown }).cause;
-  if (cause) return isTransientDbError(cause, depth + 1);
+  if (cause) return getDbResourceExhaustionErrorCode(cause, depth + 1);
 
-  return false;
+  return null;
+}
+
+/**
+ * Resolve a transient database error to a stable, low-cardinality code
+ * (e.g. "EAI_AGAIN", "ECONNREFUSED", "pool_connect_timeout", or a SQLSTATE
+ * connection code). Returns null for non-transient errors.
+ *
+ * It does not know which connection failed: to report a failed request as a
+ * database outage, use {@link getDatabaseOutageErrorCode}.
+ * @public — exported for testability
+ */
+export function getTransientDbErrorCode(
+  error: unknown,
+  depth = 0,
+): string | null {
+  if (!(error instanceof Error)) return null;
+  if (depth > MAX_CAUSE_DEPTH) return null;
+
+  // Check PostgreSQL error code (set by node-postgres on query errors) and
+  // Node network syscall codes (the only signal on empty-message errors)
+  const errorCode = (error as Error & { code?: string }).code;
+  if (errorCode && TRANSIENT_PG_CODES.has(errorCode)) return errorCode;
+  if (errorCode && TRANSIENT_NETWORK_CODES.has(errorCode)) return errorCode;
+
+  // Check error message for known transient patterns
+  const message = error.message;
+  const matched = TRANSIENT_ERROR_PATTERNS.find(({ pattern }) =>
+    message.includes(pattern),
+  );
+  if (matched) return matched.code;
+
+  // Connection syscall failures that reached us wrapped (the ORM restates the
+  // cause in its own message), matched on the syscall shape rather than a bare
+  // token so interpolated query parameters cannot trigger them.
+  const syscallErrno = SYSCALL_ERRNO_PATTERN.exec(message)?.[1];
+  if (syscallErrno) return syscallErrno;
+
+  // A multi-address connection failure is an AggregateError holding one error
+  // per attempted address in `errors` (not `cause`) — check each of them.
+  if (error instanceof AggregateError) {
+    for (const subError of error.errors) {
+      const code = getTransientDbErrorCode(subError, depth + 1);
+      if (code) return code;
+    }
+  }
+
+  // DrizzleQueryError wraps the underlying pg error as `cause`
+  const cause = (error as Error & { cause?: unknown }).cause;
+  if (cause) return getTransientDbErrorCode(cause, depth + 1);
+
+  return null;
+}
+
+/**
+ * The code to report a failed request under as a database outage, or null
+ * when the failure is not one.
+ *
+ * {@link getTransientDbErrorCode} answers "would retrying this database call
+ * help?" and matches bare socket errnos (`ETIMEDOUT`, `ECONNRESET`, …) that
+ * any network client raises. Calling a failure a database outage needs more:
+ * the error must come from the database client (see
+ * {@link isDatabaseClientError}). Only a SQLSTATE connection code or the
+ * PostgreSQL client's own wording names the database by itself.
+ */
+export function getDatabaseOutageErrorCode(error: unknown): string | null {
+  const code = getTransientDbErrorCode(error);
+  if (!code) return null;
+  if (!PROVENANCE_REQUIRED_CODES.has(code)) return code;
+  return isDatabaseClientError(error) ? code : null;
+}
+
+/**
+ * Name the endpoint a connection failure was dialing when it is clearly not
+ * the database, e.g. `api.example.com` or `203.0.113.10:443`. Returns null
+ * when the failure names no target or the target may be the database.
+ *
+ * {@link getTransientDbErrorCode} matches socket errnos without knowing which
+ * connection failed, so an outbound call blocked by a network policy would
+ * otherwise read as a database outage. A connect target is compared by port
+ * (its address is already resolved, so it rarely equals the configured host
+ * name), a DNS target by host name.
+ */
+export function getNonDatabaseConnectionTarget(error: unknown): string | null {
+  const target = getConnectionFailureTarget(error);
+  if (!target) return null;
+
+  let databaseUrl: URL;
+  try {
+    databaseUrl = new URL(config.database.url);
+  } catch {
+    return null;
+  }
+  const databaseHost = databaseUrl.hostname
+    .replace(/^\[(.*)\]$/, "$1")
+    .toLowerCase();
+  if (!databaseHost) return null;
+  const host = target.host.toLowerCase();
+
+  if (target.port === null) {
+    return host === databaseHost ? null : target.host;
+  }
+  const databasePort = Number(databaseUrl.port || DEFAULT_POSTGRES_PORT);
+  const label = isIP(target.host) === 6 ? `[${target.host}]` : target.host;
+  if (target.port !== databasePort) return `${label}:${target.port}`;
+  if (isIP(databaseHost) && host !== databaseHost) {
+    return `${label}:${target.port}`;
+  }
+  return null;
+}
+
+/**
+ * Codes that {@link getTransientDbErrorCode} derives from text or errnos any
+ * network client can produce, so they name a database outage only when the
+ * error comes from the database client.
+ */
+const PROVENANCE_REQUIRED_CODES = new Set<string>([
+  ...TRANSIENT_NETWORK_CODES,
+  "timeout_expired",
+]);
+
+/** Errors the database pool rejected with (see {@link wrapPoolWithRetry}). */
+const databaseClientErrors = new WeakSet<object>();
+
+/** How the ORM begins the message of a failed query. */
+const FAILED_QUERY_PREFIX = "Failed query:";
+
+function markRejectionAsDatabaseError<T>(promise: Promise<T>): Promise<T> {
+  return promise.catch((error: unknown) => {
+    if (typeof error === "object" && error !== null) {
+      databaseClientErrors.add(error);
+    }
+    throw error;
+  });
+}
+
+/**
+ * Whether an error comes from the database client: the ORM's failed-query
+ * wrapper, a rejection of the database pool, or a connection failure whose
+ * target is the database. Walks causes and AggregateError members.
+ */
+function isDatabaseClientError(error: unknown): boolean {
+  if (
+    getConnectionFailureTarget(error) &&
+    !getNonDatabaseConnectionTarget(error)
+  ) {
+    return true;
+  }
+  return hasDatabaseClientOrigin(error, 0);
+}
+
+function hasDatabaseClientOrigin(error: unknown, depth: number): boolean {
+  if (!(error instanceof Error) || depth > MAX_CAUSE_DEPTH) return false;
+  if (
+    databaseClientErrors.has(error) ||
+    error instanceof DrizzleQueryError ||
+    error.message.includes(FAILED_QUERY_PREFIX)
+  ) {
+    return true;
+  }
+  if (
+    error instanceof AggregateError &&
+    error.errors.some((member) => hasDatabaseClientOrigin(member, depth + 1))
+  ) {
+    return true;
+  }
+  return hasDatabaseClientOrigin(error.cause, depth + 1);
 }
 
 /**
@@ -104,7 +442,8 @@ function sleep(ms: number): Promise<void> {
  * Execute an async function with automatic retry on transient database errors.
  *
  * Uses exponential backoff with jitter between retries.
- * Only retries errors identified as transient by {@link isTransientDbError}.
+ * Retries errors identified as transient by {@link isTransientDbError}.
+ * Deadlock retries require explicit opt-in for a standalone statement.
  *
  * @example
  * ```ts
@@ -116,16 +455,26 @@ function sleep(ms: number): Promise<void> {
  */
 export async function withDbRetry<T>(
   fn: () => Promise<T>,
-  options?: { maxRetries?: number },
+  options?: {
+    maxRetries?: number;
+    budgetMs?: number;
+    retryDeadlocks?: boolean;
+  },
 ): Promise<T> {
   const maxRetries = options?.maxRetries ?? MAX_RETRIES;
+  const budgetMs = options?.budgetMs ?? RETRY_BUDGET_MS;
+  const startedAt = Date.now();
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await fn();
     } catch (error) {
-      if (isTransientDbError(error) && attempt < maxRetries) {
-        const delay = calculateBackoff(attempt);
+      const delay = calculateBackoff(attempt);
+      const withinBudget = Date.now() - startedAt + delay <= budgetMs;
+      const retryable =
+        isTransientDbError(error) ||
+        (options?.retryDeadlocks === true && isDeadlock(error));
+      if (retryable && attempt < maxRetries && withinBudget) {
         logger.warn(
           {
             err: error,
@@ -146,12 +495,25 @@ export async function withDbRetry<T>(
   throw new Error("withDbRetry: unreachable");
 }
 
+/**
+ * Retry a full database transaction callback on transient connection errors.
+ *
+ * Transaction retries must wrap the whole transaction because checked-out
+ * transaction clients are not covered by the pool.query() wrapper.
+ * @public — exported for testability and standalone Drizzle clients.
+ */
+export async function withTransactionRetry<T>(
+  runTransaction: () => Promise<T>,
+): Promise<T> {
+  return withDbRetry(runTransaction);
+}
+
 /** Symbol marker to prevent double-wrapping the same pool */
 const RETRY_WRAPPED = Symbol("retryWrapped");
 
 /**
  * Wrap a pg.Pool instance so that its `query()` method automatically retries
- * transient connection errors.
+ * transient connection errors and rolled-back standalone deadlock victims.
  *
  * This is safe for non-transaction queries because `pool.query()` internally
  * checks out a client, runs the query, and releases it — each retry gets a
@@ -160,11 +522,15 @@ const RETRY_WRAPPED = Symbol("retryWrapped");
  * Transaction queries (via a checked-out PoolClient) are NOT affected by this
  * wrapper; callers should use {@link withDbRetry} around the entire transaction.
  *
+ * What `query()` and `connect()` reject with is marked as coming from the
+ * database (see {@link getDatabaseOutageErrorCode}).
+ *
  * Calling this function multiple times on the same pool is a no-op (guarded
  * by a Symbol marker to prevent compounding retries).
  */
 export function wrapPoolWithRetry(pool: {
   query: (...args: unknown[]) => unknown;
+  connect?: (...args: unknown[]) => unknown;
 }): void {
   if ((pool as Record<symbol, unknown>)[RETRY_WRAPPED]) return;
 
@@ -178,8 +544,102 @@ export function wrapPoolWithRetry(pool: {
     }
 
     // Promise-style call: wrap with retry logic
-    return withDbRetry(() => originalQuery(...args) as Promise<unknown>);
+    // PostgreSQL rolls back an autocommit statement when it selects it as
+    // a deadlock victim. Repeating that statement cannot duplicate a commit.
+    // Do not enable this for transaction callbacks: they may perform external
+    // work that PostgreSQL cannot roll back.
+    return markRejectionAsDatabaseError(
+      withDbRetry(() => originalQuery(...args) as Promise<unknown>, {
+        retryDeadlocks: isAutocommitStatement(args[0]),
+      }),
+    );
   }) as typeof pool.query;
 
+  // Transactions check out a client with connect(). A connection that cannot
+  // be opened rejects with a bare socket error, so mark where it came from.
+  // pg-pool's own query() calls connect() with a callback: leave that alone.
+  if (typeof pool.connect === "function") {
+    const originalConnect = pool.connect.bind(pool);
+    pool.connect = ((...args: unknown[]) => {
+      if (typeof args[args.length - 1] === "function") {
+        return originalConnect(...args);
+      }
+      return markRejectionAsDatabaseError(
+        originalConnect(...args) as Promise<unknown>,
+      );
+    }) as typeof pool.connect;
+  }
+
   (pool as Record<symbol, unknown>)[RETRY_WRAPPED] = true;
+}
+
+let dbErrorSafetyNetInstalled = false;
+
+/**
+ * Install process-level handlers that swallow transient pg connection errors
+ * instead of letting them crash the backend.
+ *
+ * pg.Pool already emits `error` for idle-client failures, and createPool()
+ * installs a listener for that. Yet in practice errors still escape — observed
+ * during a Postgres OOMKilled restart, where the `BoundPool` emitted an
+ * `error` event that surfaced as an uncaught exception, terminating the
+ * Node process with exit code 1.
+ *
+ * This safety net inspects every `uncaughtException` / `unhandledRejection`
+ * via {@link isTransientDbError}. Transient pg/socket errors are logged and
+ * swallowed — the next pool.query() reconnects naturally. All other errors
+ * fall through to the default behavior (log + exit) so we never mask real
+ * bugs.
+ *
+ * Idempotent — multiple calls are no-ops.
+ */
+export function installDbErrorSafetyNet(): void {
+  if (dbErrorSafetyNetInstalled) return;
+  dbErrorSafetyNetInstalled = true;
+
+  process.on("uncaughtException", (err) => {
+    if (isTransientDbError(err)) {
+      logger.error(
+        { err },
+        "Swallowed transient DB error at process level; pool will reconnect",
+      );
+      return;
+    }
+    logger.fatal({ err }, "Uncaught exception, exiting");
+    process.exit(1);
+  });
+
+  process.on("unhandledRejection", (reason) => {
+    if (isTransientDbError(reason)) {
+      logger.error(
+        { err: reason },
+        "Swallowed transient DB rejection at process level; pool will reconnect",
+      );
+      return;
+    }
+    logger.fatal({ err: reason }, "Unhandled promise rejection, exiting");
+    process.exit(1);
+  });
+}
+
+/** Match the server code only; SQL or parameter text is never a retry signal. */
+function isDeadlock(error: unknown, depth = 0): boolean {
+  if (!(error instanceof Error) || depth > MAX_CAUSE_DEPTH) return false;
+  if ((error as Error & { code?: string }).code === "40P01") return true;
+  return isDeadlock(error.cause, depth + 1);
+}
+
+/** Conservatively exclude batches and explicit transaction-control SQL. */
+function isAutocommitStatement(query: unknown): boolean {
+  const text =
+    typeof query === "string"
+      ? query
+      : query && typeof query === "object" && "text" in query
+        ? query.text
+        : undefined;
+  return (
+    typeof text === "string" &&
+    !text.includes(";") &&
+    /^\s*(?:select|with|insert|update|delete)\b/i.test(text)
+  );
 }

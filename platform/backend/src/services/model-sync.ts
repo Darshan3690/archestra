@@ -1,21 +1,64 @@
 import {
+  ApiError,
+  ArchestraInternalErrorCode,
+  credentialRequiresPerUserScope,
+  isGeminiImageGenerationModel,
+  isSelfHostedProvider,
+  isSmallModel,
+  MODELS_DEV_ENRICHMENT_PROVIDER_MAP,
   MODELS_DEV_PROVIDER_MAP,
+  OPENROUTER_FREE_MODEL_ID,
+  requiresPerplexityAgentApi,
+  SUPPORTED_EMBEDDING_DIMENSIONS,
   type SupportedEmbeddingDimension,
   type SupportedProvider,
-} from "@shared";
+  type SupportedProviderEndpoint,
+} from "@archestra/shared";
 import {
   type ModelsDevApiResponse,
   modelsDevClient,
+  modelsDevCostToPerToken,
+  sanitizeOutputLimit,
 } from "@/clients/models-dev-client";
+import config from "@/config";
+import { findBedrockEmbeddingModel } from "@/knowledge-base/embedding-clients/bedrock-models";
+import { findCohereEmbeddingModel } from "@/knowledge-base/embedding-clients/cohere-models";
+import { findVertexMultimodalEmbeddingModel } from "@/knowledge-base/embedding-clients/vertex-models";
+import { findVoyageEmbeddingModel } from "@/knowledge-base/embedding-clients/voyage-models";
 import logger from "@/logging";
-import { LlmProviderApiKeyModelLinkModel, ModelModel } from "@/models";
+import {
+  LlmProviderApiKeyModel,
+  LlmProviderApiKeyModelLinkModel,
+  ModelModel,
+  OrganizationModel,
+} from "@/models";
 import { modelFetchers } from "@/routes/chat/model-fetchers";
+import type { FetchedModelCapabilities } from "@/routes/chat/model-fetchers/types";
+import {
+  type BedrockAwsPrices,
+  resolveBedrockAwsPrices,
+} from "@/services/bedrock-aws-pricing";
+import {
+  type CrossProviderMetadata,
+  type CrossProviderPrices,
+  registryLookupCandidates,
+  resolveCrossProviderMetadata,
+  resolveCrossProviderPrices,
+  resolveSelfHostedModelMetadata,
+  resolveSelfHostedModelReasoning,
+} from "@/services/cross-provider-pricing";
+import { assertSubscriptionCredentialForProvider } from "@/services/subscription-credential-guard";
+import {
+  resolveVendorPublishedPrices,
+  type VendorPublishedPrices,
+} from "@/services/vendor-published-pricing";
 import type {
   CreateModel,
   ModelInputModality,
   ModelOutputModality,
 } from "@/types";
 import { ModelInputModalitySchema, ModelOutputModalitySchema } from "@/types";
+import { azureCapabilityConfigurationHash } from "@/utils/azure-capability-scope";
 
 /**
  * Service for syncing models from provider APIs to the database.
@@ -61,9 +104,40 @@ class ModelSyncService {
       return 0;
     }
 
+    const credentialRow = await LlmProviderApiKeyModel.findById(apiKeyId);
+    const configurationHash =
+      provider === "azure" && credentialRow
+        ? azureCapabilityConfigurationHash({
+            ...credentialRow,
+            baseUrl: baseUrl || config.llm.azure.baseUrl,
+            extraHeaders: extraHeaders ?? credentialRow.extraHeaders,
+          })
+        : null;
+    const azureConfiguration =
+      provider === "azure" && configurationHash
+        ? { hash: configurationHash, defaultBaseUrl: config.llm.azure.baseUrl }
+        : undefined;
+    const isSubscription = credentialRequiresPerUserScope({
+      provider,
+      apiKey: apiKeyValue,
+    });
     try {
-      // 1. Fetch models from provider API
-      const providerModels = await fetcher(apiKeyValue, baseUrl, extraHeaders);
+      assertSubscriptionCredentialForProvider({
+        apiKey: apiKeyValue,
+        provider,
+      });
+      // 1. Fetch models from provider API. The row id lets subscription
+      // fetchers persist a rotated refresh token back to this key.
+      const providerModels = await fetcher(apiKeyValue, baseUrl, extraHeaders, {
+        providerApiKeyId: apiKeyId,
+      });
+      if (credentialRow?.requiresReauthentication) {
+        await LlmProviderApiKeyModel.setRequiresReauthentication({
+          id: apiKeyId,
+          requiresReauthentication: false,
+          expectedUpdatedAt: credentialRow.updatedAt,
+        });
+      }
 
       if (providerModels.length === 0) {
         logger.info({ provider, apiKeyId }, "No models returned from provider");
@@ -72,6 +146,7 @@ class ModelSyncService {
           apiKeyId,
           [],
           provider,
+          { azureConfiguration },
         );
         return 0;
       }
@@ -96,22 +171,89 @@ class ModelSyncService {
 
       const upsertedModels = forceRefresh
         ? await ModelModel.bulkUpsertFull(modelsToUpsert)
-        : await ModelModel.bulkUpsert(modelsToUpsert);
+        : await ModelModel.bulkUpsert(modelsToUpsert, {
+            fromProviderCatalog: true,
+          });
+      // A normal sync keeps the modalities and tool support a row already has.
+      // For a model the fetcher classified from its id those are rewritten, so
+      // an older build's classification (a realtime model stored as a chat
+      // model) does not survive the upgrade. Only those: an administrator's
+      // custom prices and limits stay until a full refresh resets them.
+      const authoritativeIds = new Set(
+        providerModels
+          .filter((model) => model.capabilities?.authoritative)
+          .map((model) => model.id),
+      );
+      if (!forceRefresh && authoritativeIds.size > 0)
+        await ModelModel.applyAuthoritativeCapabilities(
+          modelsToUpsert.filter((model) => authoritativeIds.has(model.modelId)),
+        );
 
       logger.info(
         { provider, apiKeyId, upsertedCount: upsertedModels.length },
         "Upserted models to database",
       );
 
-      // 4. Link models to the API key with fastest/best detection
-      const modelsWithIds = upsertedModels.map((m) => ({
-        id: m.id,
-        modelId: m.modelId,
-      }));
+      // 4. Link models to the API key with best-model detection. The
+      // agent-suitability verdict rides the link, not the `models` row: the
+      // row is globally unique on (provider, model_id) while the evidence is
+      // endpoint-local (two Ollama keys can serve different builds under the
+      // same tag), so a row-level verdict would let whichever sync finished
+      // last speak for every key.
+      const verdictByProviderModelId = new Map(
+        providerModels.map((model) => [
+          model.id,
+          deriveRecommendedForAgents(model.capabilities),
+        ]),
+      );
+      const pricingByModelId = new Map(
+        providerModels.map((m) => [m.id, m.providerPricing]),
+      );
+      const outputLengthByModelId = new Map(
+        providerModels.map((model) => [
+          model.id,
+          model.capabilities?.outputLength,
+        ]),
+      );
+      const azureByModelId = new Map(
+        providerModels.map((m) => [m.id, m.azureCapabilities]),
+      );
+      const capabilitiesByModelId = new Map(
+        modelsToUpsert.map((m) => [m.modelId, m]),
+      );
+      const modelsWithIds = upsertedModels.map((m) => {
+        const azureEvidence = azureByModelId.get(m.modelId);
+        const capabilities = capabilitiesByModelId.get(m.modelId);
+        return {
+          azureCapabilities:
+            provider === "azure" && configurationHash && azureEvidence
+              ? {
+                  ...azureEvidence,
+                  configurationHash,
+                  inputModalities: capabilities?.inputModalities ?? null,
+                  outputModalities: capabilities?.outputModalities ?? null,
+                  supportsToolCalling:
+                    capabilities?.supportsToolCalling ?? null,
+                }
+              : null,
+          providerPricing: pricingByModelId.get(m.modelId) ?? null,
+          outputLength: outputLengthByModelId.get(m.modelId) ?? null,
+          id: m.id,
+          modelId: m.modelId,
+          recommendedForAgents: verdictByProviderModelId.get(m.modelId) ?? null,
+        };
+      });
       await LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
         apiKeyId,
         modelsWithIds,
         provider,
+        // A tag is mutable (`ollama create` can repoint it), so the full
+        // refresh overwrites the verdict verbatim to self-correct; a normal
+        // sync COALESCEs so a time-boxed /api/show miss can't wipe it.
+        {
+          overwriteRecommendedForAgents: forceRefresh === true,
+          azureConfiguration,
+        },
       );
 
       logger.info(
@@ -121,6 +263,20 @@ class ModelSyncService {
 
       return modelsWithIds.length;
     } catch (error) {
+      if (
+        credentialRow &&
+        isSubscription &&
+        error instanceof ApiError &&
+        (error.internalCode ===
+          ArchestraInternalErrorCode.ProviderAuthRequired ||
+          error.statusCode === 401)
+      ) {
+        await LlmProviderApiKeyModel.setRequiresReauthentication({
+          id: apiKeyId,
+          requiresReauthentication: true,
+          expectedUpdatedAt: credentialRow.updatedAt,
+        });
+      }
       logger.error(
         {
           provider,
@@ -176,6 +332,44 @@ class ModelSyncService {
 
     return results;
   }
+
+  /**
+   * Give a fresh organization a zero-cost default: when an OpenRouter key is
+   * added and no default model is configured, point the org default at
+   * OpenRouter's Free Models Router. Never overrides an explicit user choice.
+   */
+  async maybeAutoSetOrgDefaultModel(params: {
+    organizationId: string;
+    apiKeyId: string;
+    provider: SupportedProvider;
+  }): Promise<void> {
+    const { organizationId, apiKeyId, provider } = params;
+    if (provider !== "openrouter") {
+      return;
+    }
+
+    const org = await OrganizationModel.getById(organizationId);
+    if (!org || org.defaultModelId || org.defaultLlmApiKeyId) {
+      return;
+    }
+
+    const routerModel = await ModelModel.findByProviderAndModelId(
+      "openrouter",
+      OPENROUTER_FREE_MODEL_ID,
+    );
+    if (!routerModel) {
+      return;
+    }
+
+    await OrganizationModel.patch(organizationId, {
+      defaultModelId: routerModel.id,
+      defaultLlmApiKeyId: apiKeyId,
+    });
+    logger.info(
+      { organizationId, apiKeyId, modelId: routerModel.modelId },
+      "Auto-selected OpenRouter Free Models Router as the organization default model",
+    );
+  }
 }
 
 // Export singleton instance
@@ -188,26 +382,127 @@ export const modelSyncService = new ModelSyncService();
 interface ProviderModelCapabilities {
   description: string | null;
   contextLength: number | null;
+  outputLength: number | null;
   inputModalities: ModelInputModality[] | null;
   outputModalities: ModelOutputModality[] | null;
   supportsToolCalling: boolean | null;
+  supportsReasoningEffort: boolean | null;
+  supportedEndpoints: SupportedProviderEndpoint[] | null;
   promptPricePerToken: string | null;
   completionPricePerToken: string | null;
+  cacheReadPricePerToken: string | null;
+  cacheWritePricePerToken: string | null;
 }
 
 export function buildModelsToUpsert(params: {
   provider: SupportedProvider;
-  models: Array<{ id: string }>;
+  models: Array<{
+    id: string;
+    capabilities?: FetchedModelCapabilities;
+    /** Underlying vendor model name, when the fetcher can determine it (Azure, Bedrock, Claude on Microsoft Foundry). */
+    underlyingModelName?: string | null;
+  }>;
   modelsDevData: ModelsDevApiResponse;
 }): CreateModel[] {
   const { provider, models, modelsDevData } = params;
   const capabilitiesMap = buildCapabilitiesMap(modelsDevData, provider);
 
-  return models.map((model) => {
+  // A provider catalog can list the same model id more than once — Azure AI
+  // Foundry returns an entry per model/SKU, so `claude-opus-5` and friends
+  // arrive twice. Two rows sharing (provider, model_id) in one INSERT make
+  // Postgres reject the whole statement ("ON CONFLICT DO UPDATE command
+  // cannot affect row a second time"), and since bulkUpsert runs every batch
+  // in one transaction that rolls the entire sync back to zero models.
+  const uniqueModels = new Map<string, (typeof models)[number]>();
+  for (const model of models) {
+    if (!uniqueModels.has(model.id)) {
+      uniqueModels.set(model.id, model);
+    }
+  }
+
+  const built = [...uniqueModels.values()].map((model) => {
+    // Bedrock/Azure model ids don't match models.dev keys, so derive pricing and
+    // capabilities from the underlying vendor entry.
+    const isReseller = provider === "bedrock" || provider === "azure";
+    const crossProviderArgs = {
+      provider,
+      modelId:
+        provider === "azure" ? (model.underlyingModelName ?? "") : model.id,
+      underlyingModelName: model.underlyingModelName,
+      modelsDevData,
+    };
+    // Fills the tail models.dev omits — retired and non-chat Bedrock models
+    // that would otherwise fall through to the fabricated default estimate.
+    // It sits below the registry because AWS names a model by display name,
+    // so a snapshot lookup can land on a whole family ("Claude Opus 4") and
+    // price a newer member at an older member's rate.
+    const awsPrices = resolveBedrockAwsPrices({
+      provider,
+      modelId: model.id,
+      underlyingModelName: model.underlyingModelName,
+    });
+    // Fills models the registry omits, or lists with an empty cost, from the
+    // rate their own vendor publishes — otherwise they reach the same
+    // fabricated estimate.
+    const publishedPrices = resolveVendorPublishedPrices({
+      provider,
+      modelId: model.id,
+    });
+    const crossProviderPrices = isReseller
+      ? resolveCrossProviderPrices(crossProviderArgs)
+      : null;
+    // A self-hosted server reports an id but no capabilities, and models.dev
+    // has no entry for it to look up. Describe the model from whichever vendor
+    // publishes it; the deployment's own price and window are left to the
+    // fetcher, which is the only thing that can know them.
+    const crossProviderMetadata = isReseller
+      ? resolveCrossProviderMetadata(crossProviderArgs)
+      : provider === "vllm"
+        ? (resolveSelfHostedModelMetadata({
+            modelId: model.id,
+            modelsDevData,
+          }) ?? SELF_HOSTED_TEXT_ONLY)
+        : null;
+
+    // Only the registry can say whether an operator's model reasons, and it
+    // has to be asked for every self-hosted provider rather than just the one
+    // whose metadata is resolved above: Ollama answers for itself only while
+    // its server is new enough to report capabilities.
+    const selfHostedReasoning = isSelfHostedProvider(provider)
+      ? resolveSelfHostedModelReasoning({
+          modelId: model.id,
+          modelsDevData,
+        })
+      : null;
+
     const capabilities = resolveModelCapabilities({
       provider,
       modelId: model.id,
-      capabilities: capabilitiesMap.get(model.id),
+      // A deployment named freely by its operator (Claude on Microsoft
+      // Foundry) has no registry entry of its own; its backing model does.
+      // Resellers already resolve that through the cross-provider tier.
+      capabilities:
+        (provider === "azure"
+          ? model.underlyingModelName
+            ? lookupModelsDevCapabilities(
+                capabilitiesMap,
+                model.underlyingModelName,
+              )
+            : undefined
+          : lookupModelsDevCapabilities(capabilitiesMap, model.id)) ??
+        (!isReseller && model.underlyingModelName
+          ? lookupModelsDevCapabilities(
+              capabilitiesMap,
+              model.underlyingModelName,
+            )
+          : undefined),
+      fetched: model.capabilities,
+      selfHostedReasoning,
+      crossProviderPrices,
+      crossProviderMetadata,
+      awsPrices,
+      publishedPrices,
+      underlyingModelName: model.underlyingModelName,
     });
 
     return {
@@ -216,15 +511,268 @@ export function buildModelsToUpsert(params: {
       modelId: model.id,
       description: capabilities.description,
       contextLength: capabilities.contextLength,
+      outputLength: capabilities.outputLength,
       inputModalities: capabilities.inputModalities,
       outputModalities: capabilities.outputModalities,
       supportsToolCalling: capabilities.supportsToolCalling,
+      supportsReasoningEffort: capabilities.supportsReasoningEffort,
+      supportedEndpoints: capabilities.supportedEndpoints,
       promptPricePerToken: capabilities.promptPricePerToken,
       completionPricePerToken: capabilities.completionPricePerToken,
-      embeddingDimensions: inferEmbeddingDimensions(model.id, provider),
+      cacheReadPricePerToken: capabilities.cacheReadPricePerToken,
+      cacheWritePricePerToken: capabilities.cacheWritePricePerToken,
+      embeddingDimensions: resolveEmbeddingDimensions({
+        modelId:
+          provider === "azure" ? (model.underlyingModelName ?? "") : model.id,
+        provider,
+        fetched: model.capabilities,
+      }),
+      defaultParameters: model.capabilities?.defaultParameters ?? null,
       lastSyncedAt: new Date(),
     };
   });
+
+  return withDistinctDescriptions(built);
+}
+
+/**
+ * Give every model in a picker response a display name of its own, using the
+ * same suffix convention as the sync-time pass below.
+ *
+ * The sync-time pass alone can't guarantee distinct names at read time: it
+ * only sees one API key's catalog per sync, while `models` rows are global.
+ * Two keys of the same provider can serve different subsets — one catalog
+ * lists only `gpt-4.1`, another lists it beside `gpt-4.1-2025-04-14` — so a
+ * sync can refresh one member of a colliding pair without ever seeing the
+ * other, and rows written before the sync-time pass existed keep their
+ * colliding names until their next sync. This pass runs on what a response
+ * actually offers side by side, so the picker never renders two rows a user
+ * can't tell apart, whatever vintage the stored names are.
+ *
+ * Grouped per provider: model ids are only unique within a provider, and the
+ * UI groups the list by provider, so a name shared across providers (openai
+ * and azure both serving "GPT-4o") is not a collision.
+ */
+export function withDistinctDisplayNames<
+  T extends {
+    /** The provider-facing model id (`gpt-4.1-2025-04-14`). */
+    id: string;
+    provider: SupportedProvider;
+    displayName: string;
+  },
+>(models: T[]): T[] {
+  const entriesByProvider = new Map<
+    SupportedProvider,
+    Array<{ modelId: string; name: string }>
+  >();
+  for (const { provider, id, displayName } of models) {
+    const entries = entriesByProvider.get(provider);
+    const entry = { modelId: id, name: displayName };
+    if (entries) {
+      entries.push(entry);
+    } else {
+      entriesByProvider.set(provider, [entry]);
+    }
+  }
+
+  const suffixesByProvider = new Map<SupportedProvider, Map<string, string>>();
+  for (const [provider, entries] of entriesByProvider) {
+    const suffixes = contestedNameSuffixes(entries);
+    if (suffixes.size > 0) {
+      suffixesByProvider.set(provider, suffixes);
+    }
+  }
+  if (suffixesByProvider.size === 0) {
+    return models;
+  }
+
+  return models.map((model) => {
+    const suffix = suffixesByProvider.get(model.provider)?.get(model.id);
+    return suffix
+      ? { ...model, displayName: `${model.displayName} (${suffix})` }
+      : model;
+  });
+}
+
+/**
+ * Give every model in a provider's catalog a display name of its own.
+ *
+ * Two rows arrive sharing a name from two directions. The registry keys a model
+ * family by its undated id, so a provider that lists both the moving alias and
+ * a pinned snapshot — OpenAI serves `gpt-4.1` and `gpt-4.1-2025-04-14` side by
+ * side — has the snapshot borrow the family's name through the date-stripped
+ * fallback in `registryLookupCandidates`. And the registry names distinct ids
+ * alike of its own accord: `gemini-3-pro-image` and `gemini-3-pro-image-preview`
+ * are both "Nano Banana Pro". Either way every model picker renders rows a user
+ * cannot tell apart, and choosing between them is a coin flip.
+ *
+ * A colliding row is suffixed with the part of its id the rest of the group
+ * does not share, reproducing the convention the registry uses for the
+ * snapshots it names itself ("GPT-4o (2024-08-06)"). The row whose id is the
+ * group's shared stem keeps the bare name, and a name nothing else answers to
+ * is left alone — so a provider listing a dated id and no alias for it
+ * (Anthropic publishes only `claude-sonnet-4-5-20250929`) is untouched.
+ *
+ * Scoped to one provider catalog because that is the scope of the confusion:
+ * these are the rows a picker offers side by side. It is also idempotent —
+ * the name is re-derived from the registry on every sync, never from the
+ * previously stored one — so a decoration can never stack up across syncs.
+ */
+function withDistinctDescriptions(models: CreateModel[]): CreateModel[] {
+  const suffixes = contestedNameSuffixes(
+    models.map(({ modelId, description }) => ({
+      modelId,
+      name: description ?? null,
+    })),
+  );
+  if (suffixes.size === 0) {
+    return models;
+  }
+
+  return models.map((model) => {
+    const suffix = suffixes.get(model.modelId);
+    return suffix
+      ? { ...model, description: `${model.description} (${suffix})` }
+      : model;
+  });
+}
+
+/**
+ * The distinguisher each contested row should be suffixed with, keyed by model
+ * id — empty for uncontested rows and for the row whose id is exactly the
+ * group's shared stem (it keeps the bare name). Callers pass one provider's
+ * rows at a time: model ids are only unique within a provider, and models from
+ * different providers are never shown side by side under one name.
+ */
+function contestedNameSuffixes(
+  entries: Array<{ modelId: string; name: string | null }>,
+): Map<string, string> {
+  const modelIdsByName = new Map<string, string[]>();
+  for (const { name, modelId } of entries) {
+    if (!name) {
+      // A nameless row already falls back to its own id for display.
+      continue;
+    }
+    const modelIds = modelIdsByName.get(name);
+    if (modelIds) {
+      modelIds.push(modelId);
+    } else {
+      modelIdsByName.set(name, [modelId]);
+    }
+  }
+
+  const suffixes = new Map<string, string>();
+  for (const modelIds of modelIdsByName.values()) {
+    if (modelIds.length <= 1) {
+      continue;
+    }
+    for (const [modelId, distinguisher] of distinguishModelIds(modelIds)) {
+      if (distinguisher) {
+        suffixes.set(modelId, distinguisher);
+      }
+    }
+  }
+  return suffixes;
+}
+
+/**
+ * What sets each of these model ids apart: everything past the leading tokens
+ * they all share, punctuated the way the id itself is.
+ *
+ * Whole tokens only. `claude-opus-4-thinking:32000` and `…:32768` share
+ * characters up to "32", and labelling them "(000)" and "(768)" would name
+ * something no provider ever published. The id that is exactly the shared stem
+ * gets an empty distinguisher and keeps its bare name.
+ *
+ * Ids that tokenise identically (`a-b` and `a.b`) leave two rows indistinct, so
+ * the whole group falls back to raw ids, which always tell them apart.
+ */
+function distinguishModelIds(modelIds: string[]): Map<string, string> {
+  // Splitting on a capturing group keeps the separators, so a distinguisher is
+  // rebuilt with the punctuation its own id used.
+  const partsByModelId = modelIds.map(
+    (modelId) => [modelId, modelId.split(MODEL_ID_SEPARATOR)] as const,
+  );
+  const sharedTokens = countSharedLeadingTokens(
+    partsByModelId.map(([, parts]) => parts),
+  );
+
+  const distinguishers = new Map(
+    partsByModelId.map(([modelId, parts]) => [
+      modelId,
+      // Tokens sit at even indices, each preceded by its separator at the odd
+      // index below it — so this drops the shared run and its trailing
+      // separator in one cut.
+      parts.slice(sharedTokens * 2).join(""),
+    ]),
+  );
+
+  const distinct = new Set(distinguishers.values());
+  return distinct.size === distinguishers.size
+    ? distinguishers
+    : new Map(modelIds.map((modelId) => [modelId, modelId]));
+}
+
+/** How many leading tokens every one of these split model ids has in common. */
+function countSharedLeadingTokens(partsPerModelId: string[][]): number {
+  const [first, ...rest] = partsPerModelId;
+  let shared = 0;
+  while (shared * 2 < first.length) {
+    const token = first[shared * 2];
+    if (rest.some((parts) => parts[shared * 2] !== token)) {
+      break;
+    }
+    shared++;
+  }
+  return shared;
+}
+
+/**
+ * The punctuation providers build model ids out of — `gpt-4.1-nano`,
+ * `openai.gpt-oss-120b-1:0`, `google/gemini-3-pro-image`.
+ */
+const MODEL_ID_SEPARATOR = /([-._:/])/;
+
+/**
+ * The one place the size threshold is applied. Null (not `true`) when the
+ * provider reported no count, so the link upsert can tell "no evidence this
+ * round" from "evidence says fine" and COALESCE the former away.
+ */
+function deriveRecommendedForAgents(
+  capabilities?: FetchedModelCapabilities,
+): boolean | null {
+  return capabilities?.parameterCount == null
+    ? null
+    : !isSmallModel(capabilities.parameterCount);
+}
+
+/**
+ * Resolve a model's embedding dimension. When the provider reports embedding
+ * capability authoritatively (Ollama `/api/show`), trust it and skip the name
+ * heuristic entirely — including for authoritatively-generative models (avoids
+ * mis-tagging a chat model whose id happens to match an embed name pattern).
+ * An authoritative embedding dimension the KB cannot store (not in
+ * SUPPORTED_EMBEDDING_DIMENSIONS) resolves to null rather than a broken value.
+ */
+function resolveEmbeddingDimensions(params: {
+  modelId: string;
+  provider: SupportedProvider;
+  fetched?: FetchedModelCapabilities;
+}): SupportedEmbeddingDimension | null {
+  const { modelId, provider, fetched } = params;
+  if (fetched?.embeddingDimensions !== undefined) {
+    const dim = fetched.embeddingDimensions;
+    return dim !== null && isSupportedEmbeddingDimension(dim) ? dim : null;
+  }
+  return inferEmbeddingDimensions(modelId, provider);
+}
+
+function isSupportedEmbeddingDimension(
+  dimension: number,
+): dimension is SupportedEmbeddingDimension {
+  return (SUPPORTED_EMBEDDING_DIMENSIONS as readonly number[]).includes(
+    dimension,
+  );
 }
 
 /**
@@ -236,10 +784,16 @@ function inferEmbeddingDimensions(
   provider: SupportedProvider,
 ): SupportedEmbeddingDimension | null {
   const id = modelId.toLowerCase();
-  if (provider === "openai" && id === "text-embedding-3-small") {
+  if (
+    (provider === "openai" || provider === "azure") &&
+    (id === "text-embedding-3-small" || id === "text-embedding-ada-002")
+  ) {
     return 1536;
   }
-  if (provider === "openai" && id === "text-embedding-3-large") {
+  if (
+    (provider === "openai" || provider === "azure") &&
+    id === "text-embedding-3-large"
+  ) {
     // Default to 1536 for backwards compatibility with existing OpenAI KB
     // embeddings; admins can opt into 3072 manually in the model editor.
     return 1536;
@@ -254,11 +808,40 @@ function inferEmbeddingDimensions(
   if (provider === "gemini" && id === "gemini-embedding-001") {
     return 3072;
   }
-  if (provider === "gemini" && id === "gemini-embedding-2-preview") {
+  if (provider === "gemini" && id === "gemini-embedding-2") {
     return 3072;
+  }
+  if (provider === "gemini") {
+    // Vertex AI publisher embedding models (Vertex mode only) — the table is
+    // the only source for their dimension.
+    const vertexEmbedding = findVertexMultimodalEmbeddingModel(id);
+    if (vertexEmbedding) {
+      return vertexEmbedding.dimensions;
+    }
+  }
+  if (provider === "cohere") {
+    return findCohereEmbeddingModel(id)?.dimensions ?? null;
+  }
+  // Voyage is embeddings-only, so every model it offers is an embedding model
+  // and the table is the only source for its dimension.
+  if (provider === "voyage") {
+    return findVoyageEmbeddingModel(id)?.dimensions ?? null;
   }
   if (id === "nomic-embed-text" || id.endsWith("/nomic-embed-text")) {
     return 768;
+  }
+  // Fallback for older Ollama that omits `/api/show` capabilities; the
+  // authoritative path above wins whenever capabilities are reported. Match the
+  // base name so an optional `:tag` suffix is ignored, and gate to Ollama so a
+  // same-named model on another provider isn't mis-tagged.
+  if (provider === "ollama" || provider === "ollama-native") {
+    const base = id.split(":")[0];
+    if (base === "mxbai-embed-large" || base === "bge-m3") {
+      return 1024;
+    }
+    if (base === "all-minilm") {
+      return 384;
+    }
   }
   return null;
 }
@@ -267,32 +850,155 @@ function inferEmbeddingDimensions(
 export function resolveModelCapabilities(params: {
   provider: SupportedProvider;
   modelId: string;
+  /** Capabilities from models.dev enrichment (same-provider match). */
   capabilities?: ProviderModelCapabilities;
+  /** Capabilities read directly from the provider's models endpoint. Highest priority. */
+  fetched?: FetchedModelCapabilities;
+  /** Prices derived from the underlying vendor entry for Bedrock/Azure. */
+  crossProviderPrices?: CrossProviderPrices | null;
+  /** Capabilities derived from the underlying vendor entry for Bedrock/Azure. */
+  crossProviderMetadata?: CrossProviderMetadata | null;
+  /** Registry verdict on whether a self-hosted model's weights reason. */
+  selfHostedReasoning?: boolean | null;
+  /** Prices published by AWS for a Bedrock model. Used where the registry has none. */
+  awsPrices?: BedrockAwsPrices | null;
+  /** Prices from a vendor's own list. Used where the registry has none. */
+  publishedPrices?: VendorPublishedPrices | null;
+  /** Underlying vendor model name, when the fetcher can determine it (Azure). */
+  underlyingModelName?: string | null;
 }): ProviderModelCapabilities {
-  const { provider, modelId, capabilities } = params;
+  const {
+    provider,
+    modelId,
+    capabilities,
+    fetched,
+    crossProviderPrices,
+    crossProviderMetadata,
+    selfHostedReasoning,
+    awsPrices,
+    publishedPrices,
+    underlyingModelName,
+  } = params;
   const inferredCapabilities = inferModelCapabilities({
     provider,
     modelId,
+    fetched,
+    underlyingModelName,
   });
 
+  // Priority per field: fetcher -> models.dev -> hardcoded inference ->
+  // cross-provider (Bedrock/Azure underlying vendor). Inference outranks the
+  // cross-provider tier because it describes the model's shape on *this*
+  // provider, which the resold vendor entry cannot: an Azure embedding
+  // deployment emits no output modality even though the OpenAI entry it
+  // resolves to lists "text".
+  // Price priority: fetcher -> models.dev (same provider) -> cross-provider ->
+  // vendor-published (AWS, then the vendors' own lists) -> null. The published tiers rank last so
+  // they only fill what the registry omits.
   return normalizeKnownModelCapabilities({
     provider,
     modelId,
+    underlyingModelName,
     capabilities: {
-      description: capabilities?.description ?? null,
+      description:
+        capabilities?.description ?? inferredCapabilities.description,
       contextLength:
-        capabilities?.contextLength ?? inferredCapabilities.contextLength,
+        fetched?.contextLength ??
+        capabilities?.contextLength ??
+        inferredCapabilities.contextLength ??
+        crossProviderMetadata?.contextLength ??
+        null,
+      outputLength:
+        capabilities?.outputLength ??
+        inferredCapabilities.outputLength ??
+        crossProviderMetadata?.outputLength ??
+        null,
       inputModalities:
-        capabilities?.inputModalities ?? inferredCapabilities.inputModalities,
+        fetched?.inputModalities ??
+        capabilities?.inputModalities ??
+        inferredCapabilities.inputModalities ??
+        parseModalities(
+          crossProviderMetadata?.inputModalities,
+          ModelInputModalitySchema,
+        ),
       outputModalities:
-        capabilities?.outputModalities ?? inferredCapabilities.outputModalities,
+        fetched?.outputModalities ??
+        capabilities?.outputModalities ??
+        inferredCapabilities.outputModalities ??
+        parseModalities(
+          crossProviderMetadata?.outputModalities,
+          ModelOutputModalitySchema,
+        ),
       supportsToolCalling:
+        fetched?.supportsToolCalling ??
         capabilities?.supportsToolCalling ??
-        inferredCapabilities.supportsToolCalling,
-      promptPricePerToken: capabilities?.promptPricePerToken ?? null,
-      completionPricePerToken: capabilities?.completionPricePerToken ?? null,
+        inferredCapabilities.supportsToolCalling ??
+        crossProviderMetadata?.supportsToolCalling ??
+        null,
+      // The serving backend outranks the registry here for the same reason it
+      // does above, and more sharply: Ollama answers for the model it will
+      // actually run, while a registry entry describes the weights wherever
+      // anyone hosts them.
+      supportsReasoningEffort:
+        fetched?.supportsReasoningEffort ??
+        capabilities?.supportsReasoningEffort ??
+        inferredCapabilities.supportsReasoningEffort ??
+        crossProviderMetadata?.supportsReasoningEffort ??
+        selfHostedReasoning ??
+        null,
+      // Fetcher-only: no other tier knows which wire format a provider serves
+      // a given model over. models.dev describes the model, not the transport
+      // a particular reseller exposes it on.
+      supportedEndpoints: fetched?.supportedEndpoints ?? null,
+      promptPricePerToken:
+        fetched?.promptPricePerToken ??
+        capabilities?.promptPricePerToken ??
+        crossProviderPrices?.promptPricePerToken ??
+        awsPrices?.promptPricePerToken ??
+        publishedPrices?.promptPricePerToken ??
+        null,
+      completionPricePerToken:
+        fetched?.completionPricePerToken ??
+        capabilities?.completionPricePerToken ??
+        crossProviderPrices?.completionPricePerToken ??
+        awsPrices?.completionPricePerToken ??
+        publishedPrices?.completionPricePerToken ??
+        null,
+      cacheReadPricePerToken:
+        fetched?.cacheReadPricePerToken ??
+        capabilities?.cacheReadPricePerToken ??
+        crossProviderPrices?.cacheReadPricePerToken ??
+        publishedPrices?.cacheReadPricePerToken ??
+        null,
+      cacheWritePricePerToken:
+        fetched?.cacheWritePricePerToken ??
+        capabilities?.cacheWritePricePerToken ??
+        crossProviderPrices?.cacheWritePricePerToken ??
+        null,
     },
   });
+}
+
+/**
+ * Look a model up in the models.dev map, falling back to its date-stripped id.
+ *
+ * Providers hand out date-pinned snapshot ids (`gpt-4o-mini-2024-07-18`) that
+ * the registry keys without the date, so an exact-only lookup misses them and
+ * the model falls all the way through to the flat default price. The exact key
+ * still wins, making the fallback purely additive, and the fallback is itself an
+ * exact lookup, so it can only match a key the registry really has.
+ */
+function lookupModelsDevCapabilities(
+  capabilitiesMap: Map<string, ProviderModelCapabilities>,
+  modelId: string,
+): ProviderModelCapabilities | undefined {
+  for (const candidate of registryLookupCandidates(modelId)) {
+    const found = capabilitiesMap.get(candidate);
+    if (found) {
+      return found;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -305,20 +1011,19 @@ function buildCapabilitiesMap(
   const map = new Map<string, ProviderModelCapabilities>();
 
   for (const [providerId, providerData] of Object.entries(modelsDevData)) {
-    const mappedProvider = MODELS_DEV_PROVIDER_MAP[providerId];
+    // Providers mapped to null in MODELS_DEV_PROVIDER_MAP are excluded from
+    // direct models.dev row creation, but some of them still carry the best
+    // per-model metadata for the models their own endpoint reports
+    // (GitHub Copilot, Azure) — the enrichment map re-admits those here.
+    const mappedProvider =
+      MODELS_DEV_PROVIDER_MAP[providerId] ??
+      MODELS_DEV_ENRICHMENT_PROVIDER_MAP[providerId];
     if (mappedProvider !== targetProvider) {
       continue;
     }
 
     for (const [, model] of Object.entries(providerData.models ?? {})) {
-      const promptPrice =
-        model.cost?.input !== undefined
-          ? (model.cost.input / 1_000_000).toString()
-          : null;
-      const completionPrice =
-        model.cost?.output !== undefined
-          ? (model.cost.output / 1_000_000).toString()
-          : null;
+      const prices = modelsDevCostToPerToken(model.cost);
 
       // Validate input modalities using Zod schema
       const inputModalities = parseModalities(
@@ -335,11 +1040,18 @@ function buildCapabilitiesMap(
       map.set(model.id, {
         description: model.name,
         contextLength: model.limit?.context ?? null,
+        outputLength: sanitizeOutputLimit(model.limit?.output),
         inputModalities,
         outputModalities,
         supportsToolCalling: model.tool_call ?? null,
-        promptPricePerToken: promptPrice,
-        completionPricePerToken: completionPrice,
+        supportsReasoningEffort: model.reasoning ?? null,
+        // models.dev describes the model, not which transport a given provider
+        // exposes it on — only a fetcher can know that.
+        supportedEndpoints: null,
+        promptPricePerToken: prices.promptPricePerToken,
+        completionPricePerToken: prices.completionPricePerToken,
+        cacheReadPricePerToken: prices.cacheReadPricePerToken,
+        cacheWritePricePerToken: prices.cacheWritePricePerToken,
       });
     }
   }
@@ -352,7 +1064,7 @@ function buildCapabilitiesMap(
  * Returns null if input is undefined/empty, otherwise returns validated modalities.
  */
 function parseModalities<T>(
-  modalities: string[] | undefined,
+  modalities: string[] | null | undefined,
   schema: { safeParse: (value: unknown) => { success: boolean; data?: T } },
 ): T[] | null {
   if (!modalities || modalities.length === 0) {
@@ -370,17 +1082,161 @@ function parseModalities<T>(
   return validated.length > 0 ? validated : null;
 }
 
+/**
+ * What a self-hosted model is assumed to be when no vendor publishes it: an
+ * operator's own fine-tune or a `--served-model-name` alias, which no registry
+ * can describe.
+ *
+ * Guessing text is not free of consequence, but leaving both lists null is
+ * worse than a wrong guess an admin can correct: the edit dialog requires at
+ * least one input modality, so a null list makes the form invalid the moment it
+ * opens and every save fails validation against a message rendered off-screen.
+ */
+const SELF_HOSTED_TEXT_ONLY: CrossProviderMetadata = {
+  contextLength: null,
+  outputLength: null,
+  inputModalities: ["text"],
+  outputModalities: ["text"],
+  supportsToolCalling: null,
+  supportsReasoningEffort: null,
+};
+
 function inferModelCapabilities(params: {
   provider: SupportedProvider;
   modelId: string;
+  fetched?: FetchedModelCapabilities;
+  underlyingModelName?: string | null;
 }): ProviderModelCapabilities {
-  const { provider, modelId } = params;
+  const { provider, modelId, fetched, underlyingModelName } = params;
+
+  if (provider === "azure") {
+    return inferAzureCapabilities(underlyingModelName);
+  }
 
   if (provider === "gemini") {
     return inferGeminiCapabilities(modelId);
   }
 
+  if (provider === "ollama" || provider === "ollama-native") {
+    return inferOllamaCapabilities(fetched);
+  }
+
+  if (provider === "perplexity") {
+    return inferPerplexityCapabilities(modelId);
+  }
+
+  if (provider === "github-copilot") {
+    // Every catalogued Copilot model is a chat model (the fetcher drops
+    // embeddings and `completion` types), so text-in/text-out is a safe floor
+    // for models the models.dev catalog doesn't cover. Sits below the
+    // models.dev tier in the resolution order, so a registry entry with richer
+    // modalities (image/pdf input) wins whenever one exists. Without the
+    // floor, an uncovered model stores null modalities, which makes the model
+    // edit dialog invalid the moment it opens (see inferOllamaCapabilities).
+    return {
+      ...emptyCapabilities(),
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+    };
+  }
+
   return emptyCapabilities();
+}
+
+/**
+ * Perplexity capabilities are per model because the provider serves two
+ * surfaces with opposite tool behaviour, and nothing upstream states either —
+ * both catalogs are static (no /models endpoint) and models.dev declares no
+ * `tool_call` for any Perplexity entry, so every row would otherwise store
+ * `null`, which reads as "unknown, send tools anyway" everywhere downstream.
+ *
+ * For the `sonar*` chat-completions models that is not harmless: the endpoint
+ * answers `invalid request` when tools are sent (verified against sonar-pro),
+ * so the turn fails outright, and the composer's "no tools" chip stayed hidden
+ * because it only shows on an explicit `false`, leaving the agent's tools
+ * looking available while never firing. They are recorded `false`.
+ *
+ * The vendor-prefixed Agent API models (see requiresPerplexityAgentApi) are the
+ * opposite: accepting `tools` — built-in search/fetch/sandbox/MCP plus custom
+ * `{ type: "function" }` declarations — is that surface's defining feature, so
+ * they are recorded `true`. An explicit value rather than the accidental
+ * correctness of `null` is also what a future capability lookup can override.
+ *
+ * Both branches record text modalities: `null` there makes the model edit
+ * dialog invalid the moment it opens, with every save failing validation
+ * against a message rendered off-screen (see inferOllamaCapabilities).
+ *
+ * Recording all of this as capabilities rather than gating in the chat route
+ * keeps the decision per model: inference sits below both the fetcher and
+ * models.dev in the resolution order, so the day an upstream source declares
+ * tool support it overrides this with no code change.
+ *
+ * @see https://docs.perplexity.ai/docs/agent-api/tools/custom-functions
+ * @see https://docs.perplexity.ai/docs/agent-api/migrate-from-sonar/overview
+ */
+function inferPerplexityCapabilities(
+  modelId: string,
+): ProviderModelCapabilities {
+  if (requiresPerplexityAgentApi(modelId)) {
+    return {
+      ...emptyCapabilities(),
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      supportsToolCalling: true,
+    };
+  }
+
+  return {
+    ...emptyCapabilities(),
+    inputModalities: ["text"],
+    outputModalities: ["text"],
+    supportsToolCalling: false,
+  };
+}
+
+/**
+ * Ollama's endpoints report no modalities, and models.dev only covers the
+ * `ollama/` namespace — so a locally built or fine-tuned model stored `null` for
+ * both. The edit dialog requires at least one input modality, so those rows made
+ * the form invalid on open and every save silently failed validation with the
+ * message rendered off-screen. Local Ollama models are text-in/text-out, apart
+ * from embedding models which produce vectors rather than a modality.
+ */
+function inferOllamaCapabilities(
+  fetched?: FetchedModelCapabilities,
+): ProviderModelCapabilities {
+  const isEmbeddingModel =
+    typeof fetched?.embeddingDimensions === "number" &&
+    fetched.embeddingDimensions > 0;
+
+  return {
+    ...emptyCapabilities(),
+    inputModalities: ["text"],
+    outputModalities: isEmbeddingModel ? [] : ["text"],
+  };
+}
+
+/**
+ * Azure deployment names are chosen by the customer, so the id alone often says
+ * nothing about the model behind it. The underlying model name settles it: an
+ * opaquely-named embedding deployment must still be classified as one, or the
+ * vendor entry it resolves to — which lists a "text" output — would make it look
+ * generative.
+ */
+function inferAzureCapabilities(
+  underlyingModelName?: string | null,
+): ProviderModelCapabilities {
+  const isEmbedding = underlyingModelName?.toLowerCase().includes("embedding");
+  if (!isEmbedding) {
+    return emptyCapabilities();
+  }
+
+  return {
+    ...emptyCapabilities(),
+    inputModalities: ["text"],
+    outputModalities: [],
+    supportsToolCalling: false,
+  };
 }
 
 function inferGeminiCapabilities(modelId: string): ProviderModelCapabilities {
@@ -388,6 +1244,19 @@ function inferGeminiCapabilities(modelId: string): ProviderModelCapabilities {
 
   if (!normalizedModelId.startsWith("gemini-")) {
     return emptyCapabilities();
+  }
+
+  if (normalizedModelId === "gemini-nano-banana-2.1") {
+    return {
+      ...emptyCapabilities(),
+      description: "Nano Banana 2.1",
+      contextLength: 131_072,
+      outputLength: 32_768,
+      inputModalities: ["text", "image", "video", "pdf"],
+      outputModalities: ["text", "image"],
+      supportsToolCalling: false,
+      supportsReasoningEffort: false,
+    };
   }
 
   if (normalizedModelId.includes("embedding")) {
@@ -411,9 +1280,11 @@ function inferGeminiCapabilities(modelId: string): ProviderModelCapabilities {
     };
   }
 
-  if (normalizedModelId.includes("image")) {
+  if (isGeminiImageGenerationModel(modelId)) {
     return {
       ...emptyCapabilities(),
+      description:
+        normalizedModelId === "gemini-2.5-flash-image" ? "Nano Banana" : null,
       inputModalities: ["text", "image"],
       outputModalities: ["image"],
       supportsToolCalling: false,
@@ -430,21 +1301,115 @@ function inferGeminiCapabilities(modelId: string): ProviderModelCapabilities {
 function normalizeKnownModelCapabilities(params: {
   provider: SupportedProvider;
   modelId: string;
+  underlyingModelName?: string | null;
   capabilities: ProviderModelCapabilities;
 }): ProviderModelCapabilities {
-  const { provider, modelId, capabilities } = params;
+  const { provider, modelId, underlyingModelName, capabilities } = params;
   const normalizedModelId = modelId.toLowerCase();
 
-  if (
-    provider === "gemini" &&
-    normalizedModelId === "gemini-embedding-2-preview"
-  ) {
+  // Jev answers decisions, not prompts: no text output, which is what keeps its
+  // models out of every chat picker (`ModelModel.supportsTextChat`).
+  if (provider === "jev") {
+    return {
+      ...capabilities,
+      inputModalities: ["text"],
+      outputModalities: [],
+      supportsToolCalling: false,
+    };
+  }
+
+  if (provider === "gemini" && normalizedModelId === "gemini-embedding-2") {
     return {
       ...capabilities,
       inputModalities: ["text", "image"],
       outputModalities: [],
       supportsToolCalling: false,
     };
+  }
+
+  // KB-supported Vertex multimodal embedding models (served under the Gemini
+  // provider in Vertex AI mode): `inferGeminiCapabilities` leaves their
+  // unbranded ids ("multimodalembedding@001") empty, and the KB's own client
+  // is the only thing that drives them, so its table decides the modalities.
+  if (provider === "gemini") {
+    const vertexEmbedding = findVertexMultimodalEmbeddingModel(modelId);
+    if (vertexEmbedding) {
+      return {
+        ...capabilities,
+        inputModalities: [...vertexEmbedding.inputModalities],
+        outputModalities: [],
+        supportsToolCalling: false,
+      };
+    }
+  }
+
+  // An Azure embedding deployment stays classified as one even when the
+  // models.dev azure entry it can now match (via the enrichment map) lists a
+  // "text" output — the registry records embeddings that way. Mirrors
+  // inferAzureCapabilities, which the registry tier would otherwise outrank.
+  if (provider === "azure") {
+    const isEmbedding = underlyingModelName
+      ?.toLowerCase()
+      .includes("embedding");
+    if (isEmbedding) {
+      return {
+        ...capabilities,
+        inputModalities: ["text"],
+        outputModalities: [],
+        supportsToolCalling: false,
+      };
+    }
+  }
+
+  // KB-supported Cohere (direct) embedding models: same reasoning as Bedrock
+  // below — the KB's Cohere client decides which modalities it drives.
+  if (provider === "cohere") {
+    const embedding = findCohereEmbeddingModel(modelId);
+    if (embedding) {
+      return {
+        ...capabilities,
+        inputModalities: [...embedding.inputModalities],
+        outputModalities: [],
+        supportsToolCalling: false,
+      };
+    }
+  }
+
+  // KB-supported Voyage embedding models: same reasoning — the KB's Voyage
+  // client is the only thing that drives them, so its table decides the
+  // modalities. Voyage has no chat models at all, so there is no non-embedding
+  // branch to fall through to.
+  if (provider === "voyage") {
+    const embedding = findVoyageEmbeddingModel(modelId);
+    if (embedding) {
+      return {
+        ...capabilities,
+        inputModalities: [...embedding.inputModalities],
+        outputModalities: [],
+        supportsToolCalling: false,
+      };
+    }
+  }
+
+  // KB-supported Bedrock embedding models: the KB's own Bedrock client is the
+  // only thing that drives them, so its declared modality support outranks
+  // whatever the models.dev / cross-provider tiers say about the vendor's model
+  // (Cohere Embed direct is driven by the KB's Cohere client, which has its own
+  // table).
+  if (provider === "bedrock") {
+    const embedding =
+      findBedrockEmbeddingModel(modelId) ??
+      (underlyingModelName
+        ? findBedrockEmbeddingModel(underlyingModelName)
+        : undefined);
+    if (embedding) {
+      return {
+        ...capabilities,
+        inputModalities: [...embedding.inputModalities],
+        outputModalities: [],
+        supportsToolCalling: false,
+      };
+    }
   }
 
   return capabilities;
@@ -454,10 +1419,15 @@ function emptyCapabilities(): ProviderModelCapabilities {
   return {
     description: null,
     contextLength: null,
+    outputLength: null,
     inputModalities: null,
     outputModalities: null,
+    supportsReasoningEffort: null,
     supportsToolCalling: null,
+    supportedEndpoints: null,
     promptPricePerToken: null,
     completionPricePerToken: null,
+    cacheReadPricePerToken: null,
+    cacheWritePricePerToken: null,
   };
 }

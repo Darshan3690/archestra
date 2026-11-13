@@ -1,34 +1,17 @@
 import { and, eq } from "drizzle-orm";
 import { vi } from "vitest";
+import { auth as betterAuth } from "@/auth/better-auth";
+import config from "@/config";
 import db, { schema } from "@/database";
+import { enterpriseTier } from "@/enterprise-tier";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
 import OrganizationRoleModel from "@/models/organization-role";
-import type { FastifyInstanceWithZod } from "@/server";
-import { createFastifyInstance } from "@/server";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import TeamModel from "@/models/team";
 import { afterEach, beforeEach, describe, expect, test } from "@/test";
 import type { User } from "@/types";
-
-const {
-  createOrgRoleMock,
-  updateOrgRoleMock,
-  deleteOrgRoleMock,
-  hasPermissionMock,
-} = vi.hoisted(() => ({
-  createOrgRoleMock: vi.fn(),
-  updateOrgRoleMock: vi.fn(),
-  deleteOrgRoleMock: vi.fn(),
-  hasPermissionMock: vi.fn(),
-}));
-
-vi.mock("@/auth", () => ({
-  betterAuth: {
-    api: {
-      createOrgRole: createOrgRoleMock,
-      updateOrgRole: updateOrgRoleMock,
-      deleteOrgRole: deleteOrgRoleMock,
-    },
-  },
-  hasPermission: hasPermissionMock,
-}));
+import resourcePermissionRoutes from "./resource-permission/resource-permission.routes";
 
 describe("custom role routes", () => {
   let app: FastifyInstanceWithZod;
@@ -38,6 +21,12 @@ describe("custom role routes", () => {
 
   beforeEach(async ({ makeAdmin, makeMember, makeOrganization }) => {
     vi.clearAllMocks();
+
+    // Small team => enterprise core active. The shared setup's reset targets
+    // the clean project's module registry; this mocked-project file has to
+    // seed the instance its own route imports.
+    enterpriseTier.setUserCountForTesting(0);
+
     user = await makeAdmin();
     authenticatedUser = user;
     const organization = await makeOrganization();
@@ -60,8 +49,10 @@ describe("custom role routes", () => {
       ).organizationId = organizationId;
     });
 
-    // Default: hasPermission grants admin access
-    hasPermissionMock.mockResolvedValue({ success: true });
+    // Permission checks resolve the authenticated user (an admin by default).
+    vi.spyOn(betterAuth.api, "getSession").mockImplementation(
+      async () => ({ user: { id: authenticatedUser.id } }) as never,
+    );
 
     const { default: organizationRoleRoutes } = await import(
       "./organization-role"
@@ -72,44 +63,107 @@ describe("custom role routes", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await app.close();
   });
 
-  test("gracefully normalizes malformed permission JSON from the auth layer", async () => {
-    createOrgRoleMock.mockResolvedValue({
-      roleData: {
-        id: "role-1",
-        organizationId,
-        role: "ops_admin",
-        name: "Ops Admin",
-        description: "Operations access",
-        permission: "{not-json}",
-        createdAt: new Date("2026-03-15T00:00:00.000Z"),
-        updatedAt: new Date("2026-03-15T00:00:00.000Z"),
-      },
-    });
+  for (const method of ["POST", "PUT"] as const) {
+    for (const scenario of [
+      "admin",
+      "custom",
+      "limited",
+      "foreign",
+      "disabled",
+    ] as const) {
+      test(`${method} resolves ${scenario} service-account grants without permitting escalation`, async ({
+        makeServiceAccount,
+        makeCustomRole,
+        makeOrganization,
+      }) => {
+        const limitedRole = await makeCustomRole(organizationId, {
+          permission: { ac: ["create", "update"], agent: ["read"] },
+        });
+        const account = await makeServiceAccount(
+          scenario === "foreign"
+            ? (await makeOrganization()).id
+            : organizationId,
+          {
+            role:
+              scenario === "limited" || scenario === "custom"
+                ? limitedRole.role
+                : "admin",
+            disabled: scenario === "disabled",
+          },
+        );
+        authenticatedUser = { ...user, id: `service-account:${account.id}` };
+        const target = await makeCustomRole(organizationId, {
+          permission: { agent: ["read"] },
+        });
+        const allowed = scenario === "admin" || scenario === "custom";
+        const payload = {
+          name: "Automation Role",
+          permission: {
+            agent: scenario === "custom" ? ["read"] : ["read", "create"],
+          },
+        };
+        const response = await app.inject({
+          method,
+          url: method === "POST" ? "/api/roles" : `/api/roles/${target.id}`,
+          payload,
+        });
 
+        expect(response.statusCode).toBe(allowed ? 200 : 403);
+        if (allowed) {
+          expect(response.json().permission).toEqual(payload.permission);
+        } else {
+          expect(response.json().error.message).toContain("agent:create");
+          expect(
+            (await OrganizationRoleModel.getById(target.id, organizationId))
+              ?.permission,
+          ).toEqual({ agent: ["read"] });
+          if (method === "POST") {
+            expect(
+              await OrganizationRoleModel.getByIdentifier(
+                "automation_role",
+                organizationId,
+              ),
+            ).toBeNull();
+          }
+        }
+      });
+    }
+  }
+
+  /**
+   * Regression: role creation used to be delegated to better-auth's
+   * `createOrgRole`, which re-checked every `resource:action` pair against
+   * the author's role with rules of its own — no exemption for the UI-only
+   * resources, and no tolerance for the vestigial actions the predefined sets
+   * still carry. Duplicating a role carried those pairs along in the payload
+   * and the write was refused ("You are not allowed to create a role") even
+   * though `/api/roles` had already cleared it. Authorization now lives in
+   * one place: `findUngrantablePermissions`.
+   */
+  test("accepts a vestigial action the predefined editor role still lists", async () => {
+    // `invitation: ["read"]` is not in the permission universe — it grants
+    // nothing, and it rides along whenever the Editor role is duplicated.
     const response = await app.inject({
       method: "POST",
       url: "/api/roles",
       payload: {
-        name: "Ops Admin",
-        description: "Operations access",
-        permission: {},
+        name: "Editor Copy",
+        permission: { invitation: ["read"], agent: ["read"] },
       },
     });
 
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({
-      id: "role-1",
-      name: "Ops Admin",
-      permission: {},
-      predefined: false,
-    });
+    // Stored sanitized: the pair grants nothing, so it does not survive.
+    expect(response.json().permission).toEqual({ agent: ["read"] });
   });
 
   test("rejects creating a role with permissions the user does not have", async ({
     makeCustomRole,
+    makeMember,
     makeUser,
   }) => {
     const limitedUser = await makeUser();
@@ -118,12 +172,8 @@ describe("custom role routes", () => {
       name: "Limited Admin",
       permission: { ac: ["create"] },
     });
-    await db.insert(schema.membersTable).values({
-      id: crypto.randomUUID(),
-      organizationId,
-      userId: limitedUser.id,
+    await makeMember(limitedUser.id, organizationId, {
       role: limitedRole.role,
-      createdAt: new Date(),
     });
     authenticatedUser = limitedUser;
 
@@ -141,7 +191,43 @@ describe("custom role routes", () => {
     });
 
     expect(response.statusCode).toBe(403);
-    expect(createOrgRoleMock).not.toHaveBeenCalled();
+    expect(
+      await OrganizationRoleModel.getByIdentifier(
+        "too_powerful",
+        organizationId,
+      ),
+    ).toBeNull();
+  });
+
+  test("rejects updating a role to grant permissions the user does not have", async ({
+    makeUser,
+    makeCustomRole,
+    makeMember,
+  }) => {
+    const limitedUser = await makeUser();
+    const limitedRole = await makeCustomRole(organizationId, {
+      permission: { ac: ["read", "update"] },
+    });
+    await makeMember(limitedUser.id, organizationId, {
+      role: limitedRole.role,
+    });
+    const targetRole = await makeCustomRole(organizationId, {
+      permission: { ac: ["read"] },
+    });
+
+    authenticatedUser = limitedUser;
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/roles/${targetRole.id}`,
+      payload: { permission: { ac: ["read"], auditLog: ["read"] } },
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json().error.message).toContain("auditLog:read");
+    expect(
+      (await OrganizationRoleModel.getById(targetRole.id, organizationId))
+        ?.permission,
+    ).toEqual({ ac: ["read"] });
   });
 
   test("rejects updates to predefined roles", async () => {
@@ -154,25 +240,9 @@ describe("custom role routes", () => {
     });
 
     expect(response.statusCode).toBe(403);
-    expect(updateOrgRoleMock).not.toHaveBeenCalled();
   });
 
-  test("supports the custom role create, update, and delete lifecycle", async ({
-    makeCustomRole,
-  }) => {
-    createOrgRoleMock.mockResolvedValue({
-      roleData: {
-        id: "role-1",
-        organizationId,
-        role: "ops_admin",
-        name: "Ops Admin",
-        description: "Operations access",
-        permission: { ac: ["read"] },
-        createdAt: new Date("2026-03-15T00:00:00.000Z"),
-        updatedAt: new Date("2026-03-15T00:00:00.000Z"),
-      },
-    });
-
+  test("supports the custom role create, update, and delete lifecycle", async () => {
     const createResponse = await app.inject({
       method: "POST",
       url: "/api/roles",
@@ -185,32 +255,19 @@ describe("custom role routes", () => {
 
     expect(createResponse.statusCode).toBe(200);
     expect(createResponse.json()).toMatchObject({
-      id: "role-1",
       role: "ops_admin",
       name: "Ops Admin",
-    });
-
-    const existingRole = await makeCustomRole(organizationId, {
-      role: "reader",
-      name: "Reader",
+      description: "Operations access",
       permission: { ac: ["read"] },
+      predefined: false,
     });
-
-    updateOrgRoleMock.mockResolvedValue({
-      roleData: {
-        ...existingRole,
-        name: "Reader Plus",
-        description: "Updated description",
-        permission: JSON.stringify({ ac: ["read", "update"] }),
-        updatedAt: new Date("2026-03-16T00:00:00.000Z"),
-      },
-    });
+    const roleId = createResponse.json().id;
 
     const updateResponse = await app.inject({
       method: "PUT",
-      url: `/api/roles/${existingRole.id}`,
+      url: `/api/roles/${roleId}`,
       payload: {
-        name: "Reader Plus",
+        name: "Ops Admin Plus",
         description: "Updated description",
         permission: { ac: ["read", "update"] },
       },
@@ -218,20 +275,83 @@ describe("custom role routes", () => {
 
     expect(updateResponse.statusCode).toBe(200);
     expect(updateResponse.json()).toMatchObject({
-      id: existingRole.id,
-      name: "Reader Plus",
+      id: roleId,
+      // The identifier is immutable; only the display name changes.
+      role: "ops_admin",
+      name: "Ops Admin Plus",
       permission: { ac: ["read", "update"] },
     });
 
-    deleteOrgRoleMock.mockResolvedValue({ success: true });
-
     const deleteResponse = await app.inject({
       method: "DELETE",
-      url: `/api/roles/${existingRole.id}`,
+      url: `/api/roles/${roleId}`,
     });
 
     expect(deleteResponse.statusCode).toBe(200);
     expect(deleteResponse.json()).toEqual({ success: true });
+    expect(
+      await OrganizationRoleModel.getById(roleId, organizationId),
+    ).toBeNull();
+  });
+
+  test.for([
+    "direct",
+    "inherited",
+  ])("permission edits resync %s holders' system-level user.role", async (assignment, {
+    makeCustomRole,
+    makeUser,
+    makeMember,
+  }) => {
+    const role = await makeCustomRole(organizationId, {
+      role: "sec_auditor",
+      name: "Security Auditor",
+      permission: { member: ["read"] },
+    });
+    const holder = await makeUser();
+    await makeMember(holder.id, organizationId, {
+      role: assignment === "direct" ? `member,${role.role}` : "member",
+    });
+    if (assignment === "inherited") {
+      const parent = await TeamModel.create({
+        name: "Security",
+        organizationId,
+        createdBy: user.id,
+        roles: [role.role],
+      });
+      const child = await TeamModel.create({
+        name: "Audit",
+        organizationId,
+        createdBy: user.id,
+        parentId: parent.id,
+      });
+      await TeamModel.addMember(child.id, holder.id);
+    }
+
+    const grantResponse = await app.inject({
+      method: "PUT",
+      url: `/api/roles/${role.id}`,
+      payload: { permission: { member: ["read", "impersonate"] } },
+    });
+    expect(grantResponse.statusCode).toBe(200);
+
+    const [afterGrant] = await db
+      .select({ role: schema.usersTable.role })
+      .from(schema.usersTable)
+      .where(eq(schema.usersTable.id, holder.id));
+    expect(afterGrant.role).toBe("admin");
+
+    const revokeResponse = await app.inject({
+      method: "PUT",
+      url: `/api/roles/${role.id}`,
+      payload: { permission: { member: ["read"] } },
+    });
+    expect(revokeResponse.statusCode).toBe(200);
+
+    const [afterRevoke] = await db
+      .select({ role: schema.usersTable.role })
+      .from(schema.usersTable)
+      .where(eq(schema.usersTable.id, holder.id));
+    expect(afterRevoke.role).toBeNull();
   });
 
   test("update invalidates cached permissions so the latest role data is visible immediately", async ({
@@ -246,34 +366,6 @@ describe("custom role routes", () => {
     await expect(
       OrganizationRoleModel.getPermissions(existingRole.role, organizationId),
     ).resolves.toEqual({ ac: ["read"] });
-
-    updateOrgRoleMock.mockImplementation(async () => {
-      const updatedAt = new Date("2026-03-16T00:00:00.000Z");
-      await db
-        .update(schema.organizationRolesTable)
-        .set({
-          name: "Reader Plus",
-          description: "Updated description",
-          permission: JSON.stringify({ ac: ["read", "update"] }),
-          updatedAt,
-        })
-        .where(
-          and(
-            eq(schema.organizationRolesTable.id, existingRole.id),
-            eq(schema.organizationRolesTable.organizationId, organizationId),
-          ),
-        );
-
-      return {
-        roleData: {
-          ...existingRole,
-          name: "Reader Plus",
-          description: "Updated description",
-          permission: JSON.stringify({ ac: ["read", "update"] }),
-          updatedAt,
-        },
-      };
-    });
 
     const updateResponse = await app.inject({
       method: "PUT",
@@ -310,19 +402,6 @@ describe("custom role routes", () => {
       OrganizationRoleModel.getPermissions(existingRole.role, organizationId),
     ).resolves.toEqual({ ac: ["read"] });
 
-    deleteOrgRoleMock.mockImplementation(async () => {
-      await db
-        .delete(schema.organizationRolesTable)
-        .where(
-          and(
-            eq(schema.organizationRolesTable.id, existingRole.id),
-            eq(schema.organizationRolesTable.organizationId, organizationId),
-          ),
-        );
-
-      return { success: true };
-    });
-
     const deleteResponse = await app.inject({
       method: "DELETE",
       url: `/api/roles/${existingRole.id}`,
@@ -351,9 +430,9 @@ describe("custom role routes", () => {
     expect(Array.isArray(roles)).toBe(true);
     expect(roles.length).toBeGreaterThanOrEqual(3);
 
-    const adminRole = roles.find((r: { name: string }) => r.name === "admin");
-    const editorRole = roles.find((r: { name: string }) => r.name === "editor");
-    const memberRole = roles.find((r: { name: string }) => r.name === "member");
+    const adminRole = roles.find((r: { role: string }) => r.role === "admin");
+    const editorRole = roles.find((r: { role: string }) => r.role === "editor");
+    const memberRole = roles.find((r: { role: string }) => r.role === "member");
 
     expect(adminRole).toBeDefined();
     expect(adminRole.predefined).toBe(true);
@@ -397,7 +476,7 @@ describe("custom role routes", () => {
     expect(response.statusCode).toBe(200);
     const role = response.json();
     expect(role.id).toBe("admin");
-    expect(role.name).toBe("admin");
+    expect(role.name).toBe("Admin");
     expect(role.predefined).toBe(true);
     expect(role.permission).toBeDefined();
   });
@@ -436,7 +515,7 @@ describe("custom role routes", () => {
       .set({
         permission: JSON.stringify({
           log: ["read", "create", "update", "delete"],
-          optimizationRule: ["team-admin"],
+          llmLimit: ["team-admin"],
           unknownResource: ["read"],
         }),
       })
@@ -473,93 +552,79 @@ describe("custom role routes", () => {
   // === POST /api/roles - Create ===
 
   test("POST /api/roles creates a new custom role", async () => {
-    createOrgRoleMock.mockResolvedValue({
-      roleData: {
-        id: "role-new",
-        organizationId,
-        role: "test_role",
-        name: "Test Role",
-        description: null,
-        permission: { agent: ["read"], toolPolicy: ["read", "create"] },
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      },
-    });
-
     const response = await app.inject({
       method: "POST",
       url: "/api/roles",
       payload: {
         name: "Test Role",
-        permission: { agent: ["read"], toolPolicy: ["read", "create"] },
+        permission: { agent: ["read"], mcpRegistry: ["read", "create"] },
       },
     });
 
     expect(response.statusCode).toBe(200);
     const role = response.json();
-    expect(role.id).toBe("role-new");
+    expect(role.role).toBe("test_role");
     expect(role.name).toBe("Test Role");
     expect(role.permission).toEqual({
       agent: ["read"],
-      toolPolicy: ["read", "create"],
+      mcpRegistry: ["read", "create"],
     });
     expect(role.predefined).toBe(false);
+    expect(
+      (await OrganizationRoleModel.getById(role.id, organizationId))?.name,
+    ).toBe("Test Role");
   });
 
-  test("POST /api/roles rejects duplicate name via betterAuth error", async () => {
-    createOrgRoleMock.mockRejectedValue({
-      statusCode: 400,
-      body: { message: "That role name is already taken" },
+  test("POST /api/roles rejects a name whose identifier is already taken", async ({
+    makeCustomRole,
+  }) => {
+    await makeCustomRole(organizationId, {
+      role: "duplicate_role",
+      name: "Duplicate Role",
     });
 
     const response = await app.inject({
       method: "POST",
       url: "/api/roles",
       payload: {
-        name: "Duplicate Role",
+        // Different display name, same derived identifier.
+        name: "Duplicate role",
         permission: { agent: ["read"] },
       },
     });
 
     expect(response.statusCode).toBe(400);
-    const error = response.json();
-    expect(error.error.message).toContain("That role name is already taken");
+    expect(response.json().error.message).toContain("already taken");
   });
 
-  test("POST /api/roles rejects reserved predefined name via betterAuth error", async () => {
-    createOrgRoleMock.mockRejectedValue({
-      statusCode: 400,
-      body: { message: "That role name is already taken" },
-    });
-
+  test("POST /api/roles rejects a reserved predefined name", async () => {
     const response = await app.inject({
       method: "POST",
       url: "/api/roles",
       payload: {
-        name: "admin",
+        name: "Admin",
         permission: { agent: ["read"] },
       },
     });
 
     expect(response.statusCode).toBe(400);
-    const error = response.json();
-    expect(error.error.message).toContain("That role name is already taken");
+    expect(response.json().error.message).toContain("predefined role name");
+  });
+
+  test("POST /api/roles rejects a name with no letters or numbers", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/roles",
+      payload: { name: "***", permission: { agent: ["read"] } },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toContain(
+      "must contain at least one letter or number",
+    );
   });
 
   test("POST /api/roles creates role with empty permissions", async () => {
-    createOrgRoleMock.mockResolvedValue({
-      roleData: {
-        id: "role-empty",
-        organizationId,
-        role: "empty_perms",
-        name: "Empty Perms",
-        description: null,
-        permission: {},
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      },
-    });
-
     const response = await app.inject({
       method: "POST",
       url: "/api/roles",
@@ -570,30 +635,16 @@ describe("custom role routes", () => {
     });
 
     expect(response.statusCode).toBe(200);
-    const role = response.json();
-    expect(role.permission).toEqual({});
+    expect(response.json().permission).toEqual({});
   });
 
   test("POST /api/roles creates role with multiple complex permissions", async () => {
     const complexPermissions = {
-      agent: ["read", "create", "update", "delete"],
-      toolPolicy: ["read", "create", "update", "delete"],
+      agent: ["read", "create", "delete"],
+      llmLimit: ["read", "create", "update", "delete"],
       log: ["read"],
       mcpServerInstallation: ["read", "create", "delete"],
     };
-
-    createOrgRoleMock.mockResolvedValue({
-      roleData: {
-        id: "role-complex",
-        organizationId,
-        role: "complex_role",
-        name: "Complex Role",
-        description: null,
-        permission: complexPermissions,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      },
-    });
 
     const response = await app.inject({
       method: "POST",
@@ -620,15 +671,6 @@ describe("custom role routes", () => {
       permission: { agent: ["read"] },
     });
 
-    updateOrgRoleMock.mockResolvedValue({
-      roleData: {
-        ...existingRole,
-        name: "Updated Name",
-        permission: JSON.stringify({ agent: ["read"] }),
-        updatedAt: new Date(),
-      },
-    });
-
     const response = await app.inject({
       method: "PUT",
       url: `/api/roles/${existingRole.id}`,
@@ -653,16 +695,8 @@ describe("custom role routes", () => {
 
     const newPermissions = {
       agent: ["read", "create"],
-      toolPolicy: ["read"],
+      mcpRegistry: ["read"],
     };
-
-    updateOrgRoleMock.mockResolvedValue({
-      roleData: {
-        ...existingRole,
-        permission: JSON.stringify(newPermissions),
-        updatedAt: new Date(),
-      },
-    });
 
     const response = await app.inject({
       method: "PUT",
@@ -676,6 +710,42 @@ describe("custom role routes", () => {
     expect(role.permission).toEqual(newPermissions);
   });
 
+  test("PUT /api/roles/:roleId accepts pairs the no-escalation rule exempts", async ({
+    makeCustomRole,
+    makeMember,
+    makeUser,
+  }) => {
+    // Same as on create: leaving a vestigial action in place is not
+    // escalation.
+    const author = await makeUser();
+    const authorRole = await makeCustomRole(organizationId, {
+      role: "role_editor",
+      name: "Role Editor",
+      permission: { ac: ["read", "update"], agent: ["read"] },
+    });
+    await makeMember(author.id, organizationId, { role: authorRole.role });
+    const target = await makeCustomRole(organizationId, {
+      role: "target_role",
+      name: "Target Role",
+      permission: { agent: ["read"] },
+    });
+    authenticatedUser = author;
+
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/roles/${target.id}`,
+      payload: {
+        permission: {
+          agent: ["read"],
+          invitation: ["read"],
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().permission).toEqual({ agent: ["read"] });
+  });
+
   test("PUT /api/roles/admin rejects update to predefined role", async () => {
     const response = await app.inject({
       method: "PUT",
@@ -686,39 +756,116 @@ describe("custom role routes", () => {
     expect(response.statusCode).toBe(403);
     const error = response.json();
     expect(error.error.message).toContain("Cannot update predefined roles");
-    expect(updateOrgRoleMock).not.toHaveBeenCalled();
   });
 
   // === DELETE /api/roles/:roleId ===
 
-  test("DELETE /api/roles/:roleId deletes a custom role and verifies 404 after", async ({
-    makeCustomRole,
-  }) => {
-    const existingRole = await makeCustomRole(organizationId, {
-      role: "deletable",
-      name: "Deletable",
-      permission: { agent: ["read"] },
+  for (const mode of ["single", "bulk"] as const) {
+    test(`${mode} role deletion removes direct and inherited recipients and rejects stale saves`, async ({
+      makeCustomRole,
+      makeAgent,
+    }) => {
+      await app.register(resourcePermissionRoutes);
+      const role = await makeCustomRole(organizationId, {
+        role: "deletable",
+        name: "Deletable",
+        permission: {},
+      });
+      const agent = await makeAgent({
+        organizationId,
+        authorId: user.id,
+        agentType: "mcp_gateway",
+        access: "personal",
+      });
+      const roleGrant = {
+        subject: { type: "role" as const, id: role.id },
+        actions: ["read" as const, "use" as const],
+      };
+      const key = {
+        organizationId,
+        resource: "mcpGateway" as const,
+        scope: agent.id,
+      };
+      const direct = await ResourcePermissionPolicyModel.find(key);
+      const wildcardKey = { ...key, scope: "*" };
+      const wildcard = await ResourcePermissionPolicyModel.find(wildcardKey);
+      await ResourcePermissionPolicyModel.replace({
+        ...key,
+        revision: direct?.revision ?? 0,
+        grants: [...(direct?.grants ?? []), roleGrant],
+      });
+      await ResourcePermissionPolicyModel.replace({
+        ...wildcardKey,
+        revision: wildcard?.revision ?? 0,
+        grants: [...(wildcard?.grants ?? []), roleGrant],
+      });
+      const url = `/api/resource-permissions/mcpGateway/${agent.id}`;
+      const before = await app.inject({ method: "GET", url });
+      expect(before.statusCode, before.body).toBe(200);
+      expect(before.json().grants).toContainEqual({
+        ...roleGrant,
+        name: "Deletable",
+      });
+      expect(before.json().inheritedGrants).toContainEqual({
+        ...roleGrant,
+        name: "Deletable",
+        sourceScope: "*",
+      });
+
+      const deleted = await app.inject(
+        mode === "single"
+          ? { method: "DELETE", url: `/api/roles/${role.id}` }
+          : {
+              method: "DELETE",
+              url: "/api/roles/bulk",
+              payload: { ids: [role.id] },
+            },
+      );
+      expect(deleted.statusCode, deleted.body).toBe(200);
+      if (mode === "bulk") expect(deleted.json().failed).toEqual([]);
+      expect(
+        (await app.inject({ method: "GET", url: `/api/roles/${role.id}` }))
+          .statusCode,
+      ).toBe(404);
+      const after = await app.inject({ method: "GET", url });
+      expect(after.statusCode, after.body).toBe(200);
+      expect(after.json().grants).toEqual(
+        before
+          .json()
+          .grants.filter(
+            (grant: { subject: { id: string } }) =>
+              grant.subject.id !== role.id,
+          ),
+      );
+      expect(after.json().inheritedGrants).toEqual(
+        before
+          .json()
+          .inheritedGrants.filter(
+            (grant: { subject: { id: string } }) =>
+              grant.subject.id !== role.id,
+          ),
+      );
+      expect(after.json().revision).toBe(before.json().revision + 1);
+
+      // Even a client with the latest revision cannot reintroduce a deleted role.
+      const saved = await app.inject({
+        method: "PUT",
+        url,
+        payload: { revision: after.json().revision, grants: [roleGrant] },
+      });
+      expect(saved.statusCode, saved.body).toBe(400);
+      expect(saved.json().error.message).toContain("recipient does not exist");
+      const stale = await app.inject({
+        method: "PUT",
+        url,
+        payload: { revision: before.json().revision, grants: [] },
+      });
+      expect(stale.statusCode, stale.body).toBe(409);
+      expect((await app.inject({ method: "GET", url })).json()).toEqual(
+        after.json(),
+      );
     });
-
-    deleteOrgRoleMock.mockResolvedValue({ success: true });
-
-    const deleteResponse = await app.inject({
-      method: "DELETE",
-      url: `/api/roles/${existingRole.id}`,
-    });
-
-    expect(deleteResponse.statusCode).toBe(200);
-    expect(deleteResponse.json()).toEqual({ success: true });
-
-    // Verify role is now 404
-    const _getResponse = await app.inject({
-      method: "GET",
-      url: `/api/roles/${existingRole.id}`,
-    });
-    // The role still exists in DB since deleteOrgRoleMock is a mock,
-    // but in a real scenario it would return 404.
-    // We test the delete route response is correct.
-  });
+  }
 
   test("DELETE /api/roles/:roleId returns 404 for non-existent role", async () => {
     const response = await app.inject({
@@ -727,112 +874,93 @@ describe("custom role routes", () => {
     });
 
     expect(response.statusCode).toBe(404);
-    expect(deleteOrgRoleMock).not.toHaveBeenCalled();
   });
 
-  // === Full lifecycle ===
+  // === Enterprise licence gate ===
 
-  test("complete role lifecycle: create, list, get, update, delete", async ({
-    makeCustomRole,
-  }) => {
-    // 1. Create via betterAuth mock
-    createOrgRoleMock.mockResolvedValue({
-      roleData: {
-        id: "lifecycle-id",
-        organizationId,
-        role: "lifecycle_role",
-        name: "Lifecycle Role",
-        description: null,
+  describe("without an enterprise licence", () => {
+    // Past the small-team threshold with no licence flag: core inactive.
+    beforeEach(() => {
+      config.enterpriseFeatures.core = false;
+      enterpriseTier.setUserCountForTesting(1_000);
+    });
+
+    test("refuses to create a custom role", async () => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/roles",
+        payload: { name: "Ops Admin", permission: { agent: ["read"] } },
+      });
+
+      expect(response.statusCode).toBe(403);
+      expect(response.json().error.message).toContain("enterprise feature");
+      expect(
+        await OrganizationRoleModel.getByIdentifier(
+          "ops_admin",
+          organizationId,
+        ),
+      ).toBeNull();
+    });
+
+    test("refuses to update a custom role", async ({ makeCustomRole }) => {
+      // An editable role is a creatable role by another name: renaming one and
+      // rewriting its permissions would otherwise walk straight around the
+      // create gate.
+      const role = await makeCustomRole(organizationId, {
+        role: "ops_admin",
+        name: "Ops Admin",
         permission: { agent: ["read"] },
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      },
+      });
+
+      const response = await app.inject({
+        method: "PUT",
+        url: `/api/roles/${role.id}`,
+        payload: { name: "Ops Superadmin", permission: { apiKey: ["read"] } },
+      });
+
+      expect(response.statusCode).toBe(403);
+      expect(response.json().error.message).toContain("enterprise feature");
+      expect(
+        (await OrganizationRoleModel.getById(role.id, organizationId))?.name,
+      ).toBe("Ops Admin");
     });
 
-    const createResponse = await app.inject({
-      method: "POST",
-      url: "/api/roles",
-      payload: {
-        name: "Lifecycle Role",
+    test("still deletes a custom role, so an org that outgrew the free tier can unwind", async ({
+      makeCustomRole,
+    }) => {
+      const role = await makeCustomRole(organizationId, {
+        role: "ops_admin",
+        name: "Ops Admin",
         permission: { agent: ["read"] },
-      },
+      });
+      const response = await app.inject({
+        method: "DELETE",
+        url: `/api/roles/${role.id}`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(
+        await OrganizationRoleModel.getById(role.id, organizationId),
+      ).toBeNull();
     });
 
-    expect(createResponse.statusCode).toBe(200);
-    expect(createResponse.json().name).toBe("Lifecycle Role");
+    test("still lists roles, so the page renders its list dimmed rather than empty", async ({
+      makeCustomRole,
+    }) => {
+      await makeCustomRole(organizationId, {
+        role: "ops_admin",
+        name: "Ops Admin",
+        permission: { agent: ["read"] },
+      });
 
-    // 2. List roles includes predefined
-    const listResponse = await app.inject({
-      method: "GET",
-      url: "/api/roles",
-    });
-    expect(listResponse.statusCode).toBe(200);
-    const roles = listResponse.json().data;
-    expect(roles.length).toBeGreaterThanOrEqual(3);
-    const adminRole = roles.find((r: { name: string }) => r.name === "admin");
-    expect(adminRole).toBeDefined();
-    expect(adminRole.predefined).toBe(true);
+      const response = await app.inject({ method: "GET", url: "/api/roles" });
 
-    // 3. Get predefined role by name
-    const getAdminResponse = await app.inject({
-      method: "GET",
-      url: "/api/roles/admin",
+      expect(response.statusCode).toBe(200);
+      expect(
+        (response.json() as { data: { role: string }[] }).data.map(
+          (r) => r.role,
+        ),
+      ).toContain("ops_admin");
     });
-    expect(getAdminResponse.statusCode).toBe(200);
-    expect(getAdminResponse.json().id).toBe("admin");
-    expect(getAdminResponse.json().predefined).toBe(true);
-
-    // 4. Create a real DB role for update/delete testing
-    const dbRole = await makeCustomRole(organizationId, {
-      role: "lifecycle_db",
-      name: "Lifecycle DB",
-      permission: { agent: ["read"] },
-    });
-
-    // 5. Update
-    updateOrgRoleMock.mockResolvedValue({
-      roleData: {
-        ...dbRole,
-        permission: JSON.stringify({ agent: ["read", "create"] }),
-        updatedAt: new Date(),
-      },
-    });
-
-    const updateResponse = await app.inject({
-      method: "PUT",
-      url: `/api/roles/${dbRole.id}`,
-      payload: { permission: { agent: ["read", "create"] } },
-    });
-    expect(updateResponse.statusCode).toBe(200);
-    expect(updateResponse.json().permission).toEqual({
-      agent: ["read", "create"],
-    });
-
-    // 6. Delete
-    deleteOrgRoleMock.mockImplementation(async () => {
-      await db
-        .delete(schema.organizationRolesTable)
-        .where(
-          and(
-            eq(schema.organizationRolesTable.id, dbRole.id),
-            eq(schema.organizationRolesTable.organizationId, organizationId),
-          ),
-        );
-      return { success: true };
-    });
-
-    const deleteResponse = await app.inject({
-      method: "DELETE",
-      url: `/api/roles/${dbRole.id}`,
-    });
-    expect(deleteResponse.statusCode).toBe(200);
-    expect(deleteResponse.json()).toEqual({ success: true });
-
-    // 7. Verify deletion
-    const getDeletedResponse = await app.inject({
-      method: "GET",
-      url: `/api/roles/${dbRole.id}`,
-    });
-    expect(getDeletedResponse.statusCode).toBe(404);
   });
 });

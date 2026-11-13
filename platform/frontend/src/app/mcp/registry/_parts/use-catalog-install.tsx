@@ -1,0 +1,1194 @@
+"use client";
+
+import {
+  MCP_CATALOG_INSTALL_QUERY_PARAM,
+  MCP_CATALOG_INSTALL_SCOPE_QUERY_PARAM,
+  MCP_CATALOG_INSTALL_TEAM_QUERY_PARAM,
+} from "@archestra/shared";
+import { useQueryClient } from "@tanstack/react-query";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { toast } from "sonner";
+import {
+  OAuthConfirmationDialog,
+  type OAuthInstallResult,
+} from "@/components/oauth-confirmation-dialog";
+import { useInitiateOAuth } from "@/lib/auth/oauth.query";
+import {
+  clearInstallationCompleteCatalogId,
+  clearPendingAfterEnvVars,
+  getOAuthInstallationCompleteCatalogId,
+  getOAuthPendingAfterEnvVars,
+  setOAuthCatalogId,
+  setOAuthEnvironmentValues,
+  setOAuthIsFirstInstallation,
+  setOAuthPendingAfterEnvVars,
+  setOAuthReturnUrl,
+  setOAuthScope,
+  setOAuthServerType,
+  setOAuthState,
+  setOAuthTeamId,
+  setOAuthUserConfigValues,
+} from "@/lib/auth/oauth-session";
+import { useDialogs } from "@/lib/hooks/use-dialog";
+import { addDesktopMcpServer } from "@/lib/mcp/desktop-mcp";
+import {
+  clearPendingEnterpriseManagedInstall,
+  type EnterpriseManagedInstallIntent,
+  getPendingEnterpriseManagedInstall,
+  setPendingEnterpriseManagedInstall,
+  useEnterpriseManagedInstallConnectUrl,
+} from "@/lib/mcp/enterprise-managed-install-auth";
+import { isInstallInProgress } from "@/lib/mcp/install-status";
+import {
+  fetchInternalMcpCatalogItem,
+  useMcpRegistryIssueIndex,
+} from "@/lib/mcp/mcp-registry.query";
+import { useInstallMcpServer } from "@/lib/mcp/mcp-server.query";
+import {
+  clearPendingInstall,
+  getPendingInstall,
+  registerPendingInstallReopen,
+  setPendingInstall,
+} from "@/lib/mcp/pending-install";
+import { buildRemoteInstallCredentialPayload } from "@/lib/mcp/remote-install-payload";
+import websocketService from "@/lib/websocket/websocket";
+import { DesktopMcpInstallDialog } from "./desktop-mcp-install-dialog";
+import { selectInstallSuccessToastIds } from "./install-success-toasts";
+import {
+  LocalServerInstallDialog,
+  type LocalServerInstallResult,
+} from "./local-server-install-dialog";
+import type { CatalogItem } from "./mcp-server-card";
+import {
+  NoAuthInstallDialog,
+  type NoAuthInstallResult,
+} from "./no-auth-install-dialog";
+import {
+  RemoteServerInstallDialog,
+  type RemoteServerInstallResult,
+} from "./remote-server-install-dialog";
+import type { McpServerInstallScope } from "./select-mcp-server-credential-type-and-teams";
+
+export interface UseCatalogInstallResult {
+  /** Add a personal connection (skips dialog when no config is needed). */
+  addPersonalConnection: (item: CatalogItem) => void;
+  /** Add a team-shared connection (skips dialog when no config is needed). */
+  addSharedConnection: (item: CatalogItem, teamId: string) => void;
+  /** Add an organization-wide connection (skips dialog when no config). */
+  addOrgConnection: (item: CatalogItem) => void;
+  /** Open the remote (or OAuth) install flow for an item. */
+  installRemote: (item: CatalogItem) => void;
+  /** Open the local install flow for an item. */
+  installLocal: (item: CatalogItem) => void;
+  /** Open the Add dialog of a desktop MCP item: always personal. */
+  installDesktop: (item: CatalogItem) => void;
+  /** Consume the ?install=/&scope=/&team= deep-link params, if present. */
+  installFromSearchParams: () => void;
+  /** Catalog id of the item whose install is currently being submitted. */
+  installingItemId: string | null;
+  /** Installed server ids currently being polled for completion. */
+  installingServerIds: Set<string>;
+  /** Mutate the install polling set (used by reinstall/reauth flows). */
+  setInstallingServerIds: React.Dispatch<React.SetStateAction<Set<string>>>;
+  /** Mutate the "currently submitting" catalog id (reinstall/reauth flows). */
+  setInstallingItemId: React.Dispatch<React.SetStateAction<string | null>>;
+  /** Stop polling a server (passed to the card's cancel action). */
+  cancelInstallation: (serverId: string) => void;
+  /** Install-mode dialogs (remote, OAuth, no-auth, local). */
+  dialogs: ReactNode;
+}
+
+/**
+ * Owns the catalog INSTALL flow (install / add-personal / add-shared /
+ * add-org, remote / local / no-auth, OAuth, enterprise managed-install guard,
+ * the install mutation, query invalidations, success toasts, and the
+ * install-mode dialogs).
+ *
+ * The logic here is moved verbatim from InternalMCPCatalog so OAuth,
+ * sessionStorage, and secret-filtering behavior are preserved exactly.
+ * Reinstall and reauthentication intentionally live outside this hook — they
+ * reuse the polling set / installingItemId exposed from the return value.
+ */
+export function useCatalogInstall(opts?: {
+  onInstalled?: () => void;
+}): UseCatalogInstallResult {
+  const onInstalled = opts?.onInstalled;
+
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const pathname = usePathname();
+
+  // The registry's slim issue index carries every visible install's status
+  // and every item's name, which is all the completion tracking reads. Full
+  // items are loaded by id when a flow actually opens one.
+  const { data: issueIndex } = useMcpRegistryIssueIndex();
+  const catalogItems = issueIndex?.catalogItems;
+  const installedServers = issueIndex?.servers;
+  const installMutation = useInstallMcpServer();
+  const initiateOAuthMutation = useInitiateOAuth();
+  const queryClient = useQueryClient();
+
+  const { isDialogOpened, openDialog, closeDialog } = useDialogs<
+    "remote-install" | "local-install" | "oauth" | "no-auth" | "desktop-install"
+  >();
+
+  const [installingItemId, setInstallingItemId] = useState<string | null>(null);
+  const [installingServerIds, setInstallingServerIds] = useState<Set<string>>(
+    new Set(),
+  );
+  const [restartingServerIds, setRestartingServerIds] = useState<Set<string>>(
+    new Set(),
+  );
+  // Track server IDs that are first-time installations (for auto-opening assignments dialog)
+  const [firstInstallationServerIds, setFirstInstallationServerIds] = useState<
+    Set<string>
+  >(new Set());
+
+  // True once this mount has opened the install dialog straight from the
+  // `?install=` deep link. Lets the durable re-open effect below tell "the deep
+  // link already handled it on this mount" (skip) apart from "the dialog was
+  // torn down and the intent is still pending" (reopen) — on a remount the ref
+  // is fresh, so the re-open effect takes over from the stashed intent.
+  const deepLinkHandledRef = useRef(false);
+  // The `?install=` catalog id whose item is being loaded right now.
+  const deepLinkLoadingRef = useRef<string | null>(null);
+  // Catalog ids with a direct (no-dialog) install request in flight.
+  const directInstallsInFlightRef = useRef(new Set<string>());
+
+  // Pre-selected team ID when adding a shared connection from manage dialog
+  const [preselectedTeamId, setPreselectedTeamId] = useState<string | null>(
+    null,
+  );
+  // When true, install dialog hides the team selector (personal connection only)
+  const [installPersonalOnly, setInstallPersonalOnly] = useState(false);
+  // When true, install dialog forces the organization-wide scope
+  const [installOrgOnly, setInstallOrgOnly] = useState(false);
+
+  const [selectedCatalogItem, setSelectedCatalogItem] =
+    useState<CatalogItem | null>(null);
+  const [noAuthCatalogItem, setNoAuthCatalogItem] =
+    useState<CatalogItem | null>(null);
+  const [localServerCatalogItem, setLocalServerCatalogItem] =
+    useState<CatalogItem | null>(null);
+  const [desktopCatalogItem, setDesktopCatalogItem] =
+    useState<CatalogItem | null>(null);
+  // The item whose Add dialog is open: it shows the completion itself.
+  const desktopDialogCatalogIdRef = useRef<string | null>(null);
+  desktopDialogCatalogIdRef.current = isDialogOpened("desktop-install")
+    ? (desktopCatalogItem?.id ?? null)
+    : null;
+
+  const getEnterpriseManagedInstallConnectUrl =
+    useEnterpriseManagedInstallConnectUrl();
+
+  const ensureEnterpriseManagedInstallAuth = useCallback(
+    async (
+      catalogItem: CatalogItem,
+      intent: EnterpriseManagedInstallIntent,
+    ): Promise<boolean> => {
+      const connectUrl = await getEnterpriseManagedInstallConnectUrl({
+        catalogItem,
+        redirectTo: "/mcp/registry",
+      });
+      if (!connectUrl) {
+        return true;
+      }
+
+      setPendingEnterpriseManagedInstall(intent);
+      window.location.assign(connectUrl);
+      return false;
+    },
+    [getEnterpriseManagedInstallConnectUrl],
+  );
+
+  // Remove servers from installing set when installation completes (success or error)
+  useEffect(() => {
+    if (installedServers && installingServerIds.size > 0) {
+      const completedServerIds = Array.from(installingServerIds).filter(
+        (serverId) => {
+          const server = installedServers.find((s) => s.id === serverId);
+          return (
+            server &&
+            (server.localInstallationStatus === "success" ||
+              server.localInstallationStatus === "error")
+          );
+        },
+      );
+
+      if (completedServerIds.length > 0) {
+        setInstallingServerIds((prev) => {
+          const newSet = new Set(prev);
+          for (const id of completedServerIds) {
+            newSet.delete(id);
+          }
+          return newSet;
+        });
+
+        // Multi-tenant catalogs share one deployment across every install
+        // row, so a single rollout toasts once per catalog, not once per row.
+        const toastServerIds = new Set(
+          selectInstallSuccessToastIds({
+            completedIds: completedServerIds.filter(
+              (id) => !restartingServerIds.has(id),
+            ),
+            servers: installedServers,
+            multitenantCatalogIds: new Set(
+              (catalogItems ?? [])
+                .filter((item) => item.multitenant)
+                .map((item) => item.id),
+            ),
+          }),
+        );
+
+        // Show toasts for completed installations and invalidate tools queries
+        completedServerIds.forEach((serverId) => {
+          const server = installedServers.find((s) => s.id === serverId);
+          if (server) {
+            if (server.localInstallationStatus === "success") {
+              if (toastServerIds.has(serverId)) {
+                const catalogItem = catalogItems?.find(
+                  (item) => item.id === server.catalogId,
+                );
+                const catalogName = catalogItem?.name;
+                if (catalogItem?.serverType !== "desktop_mcp") {
+                  toast.success(
+                    `Successfully installed ${catalogName ?? "MCP server"}`,
+                  );
+                } else if (
+                  // The open Add dialog says it already.
+                  desktopDialogCatalogIdRef.current !== server.catalogId
+                ) {
+                  toast.success(
+                    `${catalogName ?? "The MCP server"} is ready on your device`,
+                  );
+                }
+              }
+              // Force immediate deployment status refresh via WebSocket
+              websocketService.send({
+                type: "subscribe_mcp_deployment_statuses",
+                payload: {},
+              });
+              // Invalidate tools queries to update "Tools assigned" count
+              queryClient.invalidateQueries({
+                queryKey: ["mcp-servers", server.id, "tools"],
+              });
+              queryClient.invalidateQueries({ queryKey: ["tools"] });
+              queryClient.invalidateQueries({
+                queryKey: ["tools", "unassigned"],
+              });
+              // Invalidate catalog tools so the manage-tools dialog shows discovered tools
+              if (server.catalogId) {
+                queryClient.invalidateQueries({
+                  queryKey: ["mcp-catalog", server.catalogId, "tools"],
+                });
+
+                // Remove from first installation tracking
+                if (firstInstallationServerIds.has(serverId)) {
+                  setFirstInstallationServerIds((prev) => {
+                    const newSet = new Set(prev);
+                    newSet.delete(serverId);
+                    return newSet;
+                  });
+                }
+              }
+            }
+            if (
+              restartingServerIds.has(serverId) &&
+              (server.localInstallationStatus === "success" ||
+                server.localInstallationStatus === "error")
+            ) {
+              setRestartingServerIds((prev) => {
+                const newSet = new Set(prev);
+                newSet.delete(serverId);
+                return newSet;
+              });
+            }
+            // Note: No error toast - the error banner on the card provides feedback
+          }
+        });
+      }
+    }
+  }, [
+    installedServers,
+    installingServerIds,
+    restartingServerIds,
+    queryClient,
+    firstInstallationServerIds,
+    catalogItems,
+  ]);
+
+  // Resume polling for installs that were already pending when the page
+  // loaded. Only on the first load: later pending rows come from installs
+  // this hook started (tracked by their handlers) or from a catalog edit's
+  // reinstall cascade, which is not an install and must not toast as one.
+  const resumedPendingRef = useRef(false);
+  useEffect(() => {
+    if (!installedServers || resumedPendingRef.current) return;
+    resumedPendingRef.current = true;
+    // A desktop MCP installation waits for its user's computer, for as long
+    // as that computer is off: it is not an install in progress here.
+    const desktopCatalogIds = new Set(
+      (catalogItems ?? [])
+        .filter((item) => item.serverType === "desktop_mcp")
+        .map((item) => item.id),
+    );
+    const pendingIds = installedServers
+      .filter(
+        (s) =>
+          isInstallInProgress(s.localInstallationStatus) &&
+          !(s.catalogId && desktopCatalogIds.has(s.catalogId)),
+      )
+      .map((s) => s.id);
+    if (pendingIds.length > 0) {
+      setInstallingServerIds((prev) => new Set([...prev, ...pendingIds]));
+    }
+  }, [installedServers, catalogItems]);
+
+  // Clear OAuth installation completion state
+  useEffect(() => {
+    const oauthCatalogId = getOAuthInstallationCompleteCatalogId();
+    if (oauthCatalogId) {
+      clearInstallationCompleteCatalogId();
+    }
+  }, []);
+
+  const installRemote = async (
+    catalogItem: CatalogItem,
+    options?: {
+      preserveInstallTarget?: boolean;
+      scope?: McpServerInstallScope;
+      teamId?: string;
+    },
+  ) => {
+    if (!options?.preserveInstallTarget) {
+      setPreselectedTeamId(null);
+      setInstallPersonalOnly(false);
+      setInstallOrgOnly(false);
+    }
+
+    const scope = options?.scope
+      ? options.scope
+      : installOrgOnly
+        ? "org"
+        : preselectedTeamId
+          ? "team"
+          : installPersonalOnly
+            ? "personal"
+            : undefined;
+    const teamId = options?.teamId ?? preselectedTeamId ?? undefined;
+    if (
+      !(await ensureEnterpriseManagedInstallAuth(catalogItem, {
+        action: "open-remote",
+        catalogId: catalogItem.id,
+        scope,
+        ...(teamId ? { teamId } : {}),
+      }))
+    ) {
+      return;
+    }
+
+    const hasUserConfig =
+      catalogItem.userConfig && Object.keys(catalogItem.userConfig).length > 0;
+
+    // Check if this server requires OAuth authentication if there is no user config
+    if (!hasUserConfig && catalogItem.oauthConfig) {
+      const directTarget = resolveFixedInstallTarget(scope, teamId);
+      if (directTarget) {
+        await startOAuthFlow(catalogItem, directTarget);
+        return;
+      }
+      setSelectedCatalogItem(catalogItem);
+      openDialog("oauth");
+      return;
+    }
+
+    setSelectedCatalogItem(catalogItem);
+    openDialog("remote-install");
+  };
+
+  const installLocal = async (
+    catalogItem: CatalogItem,
+    options?: {
+      preserveInstallTarget?: boolean;
+      scope?: McpServerInstallScope;
+      teamId?: string;
+    },
+  ) => {
+    if (!options?.preserveInstallTarget) {
+      setPreselectedTeamId(null);
+      setInstallPersonalOnly(false);
+      setInstallOrgOnly(false);
+    }
+
+    const scope = options?.scope
+      ? options.scope
+      : installOrgOnly
+        ? "org"
+        : preselectedTeamId
+          ? "team"
+          : installPersonalOnly
+            ? "personal"
+            : undefined;
+    const teamId = options?.teamId ?? preselectedTeamId ?? undefined;
+    if (
+      !(await ensureEnterpriseManagedInstallAuth(catalogItem, {
+        action: "open-local",
+        catalogId: catalogItem.id,
+        scope,
+        ...(teamId ? { teamId } : {}),
+      }))
+    ) {
+      return;
+    }
+
+    // Check if this local server requires OAuth authentication
+    if (catalogItem.oauthConfig) {
+      // Check if there are prompted env vars that need collecting first
+      const promptedEnvVars =
+        catalogItem.localConfig?.environment?.filter(
+          (env) => env.promptOnInstallation === true,
+        ) || [];
+
+      const promptableUserConfig = Object.values(
+        catalogItem.userConfig ?? {},
+      ).filter((field) => field.promptOnInstallation !== false);
+
+      if (promptedEnvVars.length > 0 || promptableUserConfig.length > 0) {
+        // Has prompted env vars or promptable user-config - open local install dialog first to collect them,
+        // then initiate OAuth after dialog confirm
+        setLocalServerCatalogItem(catalogItem);
+        setOAuthPendingAfterEnvVars(true);
+        openDialog("local-install");
+      } else {
+        // No env vars needed - go straight to OAuth flow
+        // Store server type so OAuth callback knows this is a local server
+        setOAuthServerType("local");
+        const directTarget = resolveFixedInstallTarget(scope, teamId);
+        if (directTarget) {
+          await startOAuthFlow(catalogItem, directTarget);
+          return;
+        }
+        setSelectedCatalogItem(catalogItem);
+        openDialog("oauth");
+      }
+      return;
+    }
+
+    setLocalServerCatalogItem(catalogItem);
+    openDialog("local-install");
+  };
+
+  // A desktop MCP server runs on the computer of the user who adds it, so
+  // the installation is always personal, whatever the entry point asked for.
+  const installDesktop = (catalogItem: CatalogItem) => {
+    setDesktopCatalogItem(catalogItem);
+    openDialog("desktop-install");
+  };
+
+  // The dialog stays open and follows the installation until the tools are
+  // read; closed earlier, the completion effect toasts it.
+  const handleDesktopAdd = async (catalogItem: CatalogItem) => {
+    setInstallingItemId(catalogItem.id);
+    try {
+      const server = await addDesktopMcpServer({
+        install: installMutation.mutateAsync,
+        catalogItem,
+      });
+      if (!server) return null;
+      clearPendingInstall();
+      trackPendingInstall(server);
+      onInstalled?.();
+      return server;
+    } finally {
+      setInstallingItemId(null);
+    }
+  };
+
+  // The install mutation skips its own toast for an install that comes back
+  // pending, so track it here and let the completion effect toast it.
+  const trackPendingInstall = (
+    server: { id: string; localInstallationStatus?: string | null } | undefined,
+  ) => {
+    if (!server || !isInstallInProgress(server.localInstallationStatus)) {
+      return;
+    }
+    setInstallingServerIds((prev) => new Set(prev).add(server.id));
+  };
+
+  // Check if a catalog item needs any config dialogs, or can be installed directly
+  const canDirectInstall = (catalogItem: CatalogItem) => {
+    if (catalogItem.oauthConfig) return false;
+    if (catalogItem.serverType === "remote") {
+      const hasUserConfig =
+        catalogItem.userConfig &&
+        Object.keys(catalogItem.userConfig).length > 0;
+      return !hasUserConfig;
+    }
+    // Local server: check for prompted env vars or promptable user-config
+    const promptedEnvVars =
+      catalogItem.localConfig?.environment?.filter(
+        (env) => env.promptOnInstallation === true,
+      ) || [];
+    const promptableUserConfig = Object.values(
+      catalogItem.userConfig ?? {},
+    ).filter((field) => field.promptOnInstallation !== false);
+    return promptedEnvVars.length === 0 && promptableUserConfig.length === 0;
+  };
+
+  // Install directly without opening a dialog (works for personal, team, and org)
+  const handleDirectInstall = async (
+    catalogItem: CatalogItem,
+    target?: {
+      teamId?: string;
+      scope?: McpServerInstallScope;
+    },
+  ) => {
+    // Repeated clicks land before the first request (or the enterprise auth
+    // check ahead of it) returns, so React state can't stop them; a ref can.
+    if (directInstallsInFlightRef.current.has(catalogItem.id)) return;
+    directInstallsInFlightRef.current.add(catalogItem.id);
+    try {
+      const scope: McpServerInstallScope =
+        target?.scope ?? (target?.teamId ? "team" : "personal");
+      if (
+        !(await ensureEnterpriseManagedInstallAuth(catalogItem, {
+          action: "direct",
+          catalogId: catalogItem.id,
+          scope,
+          ...(scope === "team" && target?.teamId
+            ? { teamId: target.teamId }
+            : {}),
+        }))
+      ) {
+        return;
+      }
+
+      setInstallingItemId(catalogItem.id);
+      const result = await installMutation.mutateAsync({
+        name: catalogItem.name,
+        catalogId: catalogItem.id,
+        scope,
+        ...(scope === "team" && target?.teamId
+          ? { teamId: target.teamId }
+          : {}),
+        dontShowToast: true,
+      });
+
+      const installedServerId = result?.installedServer?.id;
+      if (installedServerId) {
+        setInstallingServerIds((prev) => new Set(prev).add(installedServerId));
+        const isFirstInstallation = !installedServers?.some(
+          (s) => s.catalogId === catalogItem.id,
+        );
+        if (isFirstInstallation) {
+          setFirstInstallationServerIds((prev) =>
+            new Set(prev).add(installedServerId),
+          );
+        }
+      }
+      setInstallingItemId(null);
+      onInstalled?.();
+    } finally {
+      directInstallsInFlightRef.current.delete(catalogItem.id);
+    }
+  };
+
+  // Add personal connection: skip dialog if no config needed, otherwise open dialog with personalOnly
+  const addPersonalConnection = (catalogItem: CatalogItem) => {
+    if (catalogItem.serverType === "desktop_mcp") {
+      installDesktop(catalogItem);
+      return;
+    }
+    // Local installs deserve an explicit confirmation even when they have no
+    // prompted config: creating a hosted runtime is a larger action than
+    // saving a credential, and otherwise the button appears to do nothing.
+    if (catalogItem.serverType === "local") {
+      setInstallPersonalOnly(true);
+      installLocal(catalogItem, {
+        preserveInstallTarget: true,
+        scope: "personal",
+      });
+    } else if (canDirectInstall(catalogItem)) {
+      handleDirectInstall(catalogItem);
+    } else {
+      setInstallPersonalOnly(true);
+      installRemote(catalogItem, {
+        preserveInstallTarget: true,
+        scope: "personal",
+      });
+    }
+  };
+
+  // Add shared connection: skip dialog if no config needed, otherwise open dialog with preselected team
+  const addSharedConnection = (catalogItem: CatalogItem, teamId: string) => {
+    if (canDirectInstall(catalogItem)) {
+      handleDirectInstall(catalogItem, {
+        teamId,
+        scope: "team",
+      });
+    } else {
+      setPreselectedTeamId(teamId);
+      if (catalogItem.serverType === "local") {
+        installLocal(catalogItem, {
+          preserveInstallTarget: true,
+          scope: "team",
+          teamId,
+        });
+      } else {
+        installRemote(catalogItem, {
+          preserveInstallTarget: true,
+          scope: "team",
+          teamId,
+        });
+      }
+    }
+  };
+
+  // Add organization connection: skip dialog if no config needed, otherwise
+  // open dialog with scope locked to org.
+  const addOrgConnection = (catalogItem: CatalogItem) => {
+    if (canDirectInstall(catalogItem)) {
+      handleDirectInstall(catalogItem, { scope: "org" });
+    } else {
+      setInstallOrgOnly(true);
+      if (catalogItem.serverType === "local") {
+        installLocal(catalogItem, {
+          preserveInstallTarget: true,
+          scope: "org",
+        });
+      } else {
+        installRemote(catalogItem, {
+          preserveInstallTarget: true,
+          scope: "org",
+        });
+      }
+    }
+  };
+
+  // Open the right install flow for a catalog item, honoring an optional
+  // pre-targeted scope (from the deep link's &scope/&team params). Shared by the
+  // deep-link handler and the durable re-open effect so both open identically.
+  const openInstallForCatalogItem = (
+    catalogItem: CatalogItem,
+    scope?: McpServerInstallScope,
+    teamId?: string,
+  ) => {
+    // Personal only, so a team or organization link opens the same dialog.
+    if (catalogItem.serverType === "desktop_mcp") {
+      installDesktop(catalogItem);
+      return;
+    }
+    if (scope === "personal") {
+      addPersonalConnection(catalogItem);
+      return;
+    }
+    if (scope === "team" && teamId) {
+      addSharedConnection(catalogItem, teamId);
+      return;
+    }
+    if (scope === "org") {
+      addOrgConnection(catalogItem);
+      return;
+    }
+    if (catalogItem.serverType === "local") {
+      installLocal(catalogItem);
+    } else {
+      installRemote(catalogItem);
+    }
+  };
+
+  // Deep-link: auto-open install dialog when ?install={catalogId} is present.
+  // Optional &scope=personal|team|org (and &team={teamId} for team scope)
+  // pre-target the connection — used by the item detail page's add-connection
+  // actions.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: only re-run on searchParams/catalogItems; install handlers are stable within a render
+  const installFromSearchParams = useCallback(async () => {
+    const installCatalogId = searchParams.get(MCP_CATALOG_INSTALL_QUERY_PARAM);
+    if (!installCatalogId) return;
+    // The item loads asynchronously; a second call for the same link while it
+    // does must not open a second dialog.
+    if (deepLinkLoadingRef.current === installCatalogId) return;
+    deepLinkLoadingRef.current = installCatalogId;
+    const catalogItem = await fetchInternalMcpCatalogItem(
+      queryClient,
+      installCatalogId,
+    ).finally(() => {
+      deepLinkLoadingRef.current = null;
+    });
+    if (!catalogItem) return;
+
+    const scopeParam = searchParams.get(
+      MCP_CATALOG_INSTALL_SCOPE_QUERY_PARAM,
+    ) as McpServerInstallScope | null;
+    const teamParam = searchParams.get(MCP_CATALOG_INSTALL_TEAM_QUERY_PARAM);
+
+    // Persist the intent before touching the URL or opening the dialog. The
+    // dialog is local state and the deep-link param is stripped below, so if the
+    // dialog is torn down before the user acts (a route re-render that remounts
+    // the registry, a full-page return from an OAuth/enterprise connect
+    // redirect, etc.) there would otherwise be nothing left to re-open it — the
+    // user would land on the bare registry and have to find the server by hand.
+    setPendingInstall({
+      catalogId: catalogItem.id,
+      ...(scopeParam ? { scope: scopeParam } : {}),
+      ...(scopeParam === "team" && teamParam ? { teamId: teamParam } : {}),
+    });
+    deepLinkHandledRef.current = true;
+
+    // Clear the install params from URL to prevent re-triggering on refresh
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete(MCP_CATALOG_INSTALL_QUERY_PARAM);
+    params.delete(MCP_CATALOG_INSTALL_SCOPE_QUERY_PARAM);
+    params.delete(MCP_CATALOG_INSTALL_TEAM_QUERY_PARAM);
+    const newUrl = params.toString()
+      ? `${pathname}?${params.toString()}`
+      : pathname;
+    router.replace(newUrl, { scroll: false });
+
+    openInstallForCatalogItem(
+      catalogItem,
+      scopeParam ?? undefined,
+      teamParam ?? undefined,
+    );
+  }, [searchParams, pathname, router]);
+
+  // Durable re-open: if the deep-link dialog was lost before the user acted, the
+  // intent survives in sessionStorage. Once catalog + installs are loaded, and
+  // the deep link did NOT just open the dialog on this mount, re-open it — unless
+  // the connection now exists (fulfilled) or a dialog is already up. Capped so a
+  // genuinely un-openable intent or a close-loop cannot re-open forever.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: install handlers are stable within a render; only react to catalog/install data settling
+  useEffect(() => {
+    if (deepLinkHandledRef.current) return;
+    if (!catalogItems || !installedServers) return;
+
+    const pending = getPendingInstall();
+    if (!pending) return;
+
+    if (!catalogItems.some((item) => item.id === pending.catalogId)) {
+      clearPendingInstall();
+      return;
+    }
+
+    // Already fulfilled — the caller has an accessible connection for it now.
+    if (installedServers.some((s) => s.catalogId === pending.catalogId)) {
+      clearPendingInstall();
+      return;
+    }
+
+    // A dialog is already open for it — don't stack another.
+    if (
+      isDialogOpened("remote-install") ||
+      isDialogOpened("local-install") ||
+      isDialogOpened("oauth") ||
+      isDialogOpened("no-auth") ||
+      isDialogOpened("desktop-install")
+    ) {
+      return;
+    }
+
+    if (!registerPendingInstallReopen()) return;
+    deepLinkHandledRef.current = true;
+    void fetchInternalMcpCatalogItem(queryClient, pending.catalogId).then(
+      (catalogItem) => {
+        if (catalogItem) {
+          openInstallForCatalogItem(catalogItem, pending.scope, pending.teamId);
+        }
+      },
+    );
+  }, [catalogItems, installedServers, isDialogOpened]);
+
+  // Resume an enterprise-managed install after linking the configured IdP.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: consume the one-shot sessionStorage intent when catalog data becomes available
+  useEffect(() => {
+    if (!catalogItems) return;
+
+    const intent = getPendingEnterpriseManagedInstall();
+    if (!intent) return;
+    if (!catalogItems.some((item) => item.id === intent.catalogId)) return;
+
+    clearPendingEnterpriseManagedInstall();
+    void resumeEnterpriseManagedInstall(intent);
+  }, [catalogItems]);
+
+  const resumeEnterpriseManagedInstall = async (
+    intent: EnterpriseManagedInstallIntent,
+  ) => {
+    const catalogItem = await fetchInternalMcpCatalogItem(
+      queryClient,
+      intent.catalogId,
+    );
+    if (!catalogItem) return;
+
+    setPreselectedTeamId(
+      intent.scope === "team" ? (intent.teamId ?? null) : null,
+    );
+    setInstallPersonalOnly(intent.scope === "personal");
+    setInstallOrgOnly(intent.scope === "org");
+
+    switch (intent.action) {
+      case "direct":
+        void handleDirectInstall(catalogItem, {
+          scope: intent.scope,
+          teamId: intent.teamId,
+        });
+        return;
+      case "open-local":
+        void installLocal(catalogItem, {
+          preserveInstallTarget: true,
+          scope: intent.scope,
+          teamId: intent.teamId,
+        });
+        return;
+      case "open-remote":
+        void installRemote(catalogItem, {
+          preserveInstallTarget: true,
+          scope: intent.scope,
+          teamId: intent.teamId,
+        });
+        return;
+    }
+  };
+
+  const handleNoAuthConfirm = async (result: NoAuthInstallResult) => {
+    if (!noAuthCatalogItem) return;
+
+    const catalogItem = noAuthCatalogItem;
+    setInstallingItemId(catalogItem.id);
+    const installResult = await installMutation.mutateAsync({
+      name: catalogItem.name,
+      catalogId: result.catalogId,
+      scope: result.scope,
+      teamId:
+        result.scope === "team" ? (result.teamId ?? undefined) : undefined,
+    });
+    trackPendingInstall(installResult?.installedServer);
+    closeDialog("no-auth");
+    setNoAuthCatalogItem(null);
+    setInstallingItemId(null);
+    onInstalled?.();
+  };
+
+  const handleLocalServerInstallConfirm = async (
+    installResult: LocalServerInstallResult,
+  ) => {
+    if (!localServerCatalogItem) return;
+
+    // Check if OAuth is pending after env vars collection
+    if (getOAuthPendingAfterEnvVars() && localServerCatalogItem.oauthConfig) {
+      clearPendingAfterEnvVars();
+      // Store env vars and server type for use after OAuth callback
+      setOAuthServerType("local");
+      if (
+        installResult.environmentValues &&
+        Object.keys(installResult.environmentValues).length > 0
+      ) {
+        // Security: filter out secret-type env vars from sessionStorage.
+        // actual secret values are excluded — they are handled server-side
+        // via secretId or re-prompted on install.
+        const secretKeys = new Set(
+          (localServerCatalogItem.localConfig?.environment ?? [])
+            .filter((e) => e.type === "secret")
+            .map((e) => e.key),
+        );
+        const safeValues = Object.fromEntries(
+          Object.entries(installResult.environmentValues).filter(
+            ([key]) => !secretKeys.has(key),
+          ),
+        );
+        if (Object.keys(safeValues).length > 0) {
+          setOAuthEnvironmentValues(safeValues);
+        }
+      }
+      if (
+        installResult.userConfigValues &&
+        Object.keys(installResult.userConfigValues).length > 0
+      ) {
+        setOAuthUserConfigValues({
+          values: installResult.userConfigValues,
+          userConfig: localServerCatalogItem.userConfig,
+        });
+      }
+      closeDialog("local-install");
+      // The local-install dialog already collected the install target, so the
+      // OAuth confirmation has nothing further to ask — start the flow
+      const directTarget = resolveFixedInstallTarget(
+        installResult.scope,
+        installResult.scope === "team" ? installResult.teamId : undefined,
+      );
+      setLocalServerCatalogItem(null);
+      if (directTarget) {
+        await startOAuthFlow(localServerCatalogItem, directTarget);
+        return;
+      }
+      setSelectedCatalogItem(localServerCatalogItem);
+      openDialog("oauth");
+      return;
+    }
+
+    // New installation flow
+    // Check if this is the first installation for this catalog item
+    const isFirstInstallation = !installedServers?.some(
+      (s) => s.catalogId === localServerCatalogItem.id,
+    );
+
+    setInstallingItemId(localServerCatalogItem.id);
+    const result = await installMutation.mutateAsync({
+      name: localServerCatalogItem.name,
+      catalogId: installResult.catalogId,
+      environmentValues: installResult.environmentValues,
+      userConfigValues: installResult.userConfigValues,
+
+      scope: installResult.scope,
+      teamId:
+        installResult.scope === "team"
+          ? (installResult.teamId ?? undefined)
+          : undefined,
+      dontShowToast: true,
+    });
+
+    // Track the installed server for polling
+    const installedServerId = result?.installedServer?.id;
+    if (installedServerId) {
+      setInstallingServerIds((prev) => new Set(prev).add(installedServerId));
+      // Track if this is first installation for opening assignments dialog later
+      if (isFirstInstallation) {
+        setFirstInstallationServerIds((prev) =>
+          new Set(prev).add(installedServerId),
+        );
+      }
+    }
+
+    closeDialog("local-install");
+    setLocalServerCatalogItem(null);
+    setInstallingItemId(null);
+    onInstalled?.();
+  };
+
+  const handleRemoteServerInstallConfirm = async (
+    catalogItem: CatalogItem,
+    result: RemoteServerInstallResult,
+  ) => {
+    const credentialPayload = buildRemoteInstallCredentialPayload(result);
+
+    setInstallingItemId(catalogItem.id);
+
+    const installResult = await installMutation.mutateAsync({
+      name: catalogItem.name,
+      catalogId: result.catalogId,
+      ...credentialPayload,
+      scope: result.scope,
+      teamId:
+        result.scope === "team" ? (result.teamId ?? undefined) : undefined,
+    });
+    if (installResult.errorMessage) {
+      setInstallingItemId(null);
+      return installResult.errorMessage;
+    }
+    trackPendingInstall(installResult?.installedServer);
+    setInstallingItemId(null);
+    onInstalled?.();
+  };
+
+  // Initiate the OAuth flow for a catalog item and redirect to the provider.
+  // Shared by the OAuth dialog's confirm and the direct (no-dialog) path used
+  // when the install target is already fixed.
+  const startOAuthFlow = async (
+    catalogItem: CatalogItem,
+    target: { scope: McpServerInstallScope; teamId?: string | null },
+  ) => {
+    setInstallingItemId(catalogItem.id);
+    try {
+      // Call backend to initiate OAuth flow
+      const { authorizationUrl, state } =
+        await initiateOAuthMutation.mutateAsync({
+          catalogId: catalogItem.id,
+        });
+
+      // Store state in session storage for the callback
+      setOAuthState(state);
+      setOAuthCatalogId(catalogItem.id);
+      setOAuthTeamId(target.scope === "team" ? (target.teamId ?? null) : null);
+      setOAuthScope(target.scope);
+
+      // Store if this is a first installation (for auto-opening assignments dialog)
+      const isFirstInstallation = !installedServers?.some(
+        (s) => s.catalogId === catalogItem.id,
+      );
+      setOAuthIsFirstInstallation(isFirstInstallation);
+
+      // Remember where the install started so the callback returns here
+      setOAuthReturnUrl(window.location.href);
+
+      // The user has committed to authorizing; the deep-link intent is now
+      // being fulfilled through the OAuth flow (which has its own return
+      // handling), so drop the pending-install intent to avoid the registry
+      // re-opening the install dialog when the OAuth callback returns.
+      clearPendingInstall();
+
+      // Redirect to OAuth provider
+      window.location.href = authorizationUrl;
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Failed to initiate OAuth flow",
+      );
+    } finally {
+      setInstallingItemId(null);
+    }
+  };
+
+  // With a fully-determined install target (personal, org, or team with the
+  // team already chosen), the OAuth confirmation dialog has no choices left to
+  // offer and renders an empty body — so the flow should start immediately
+  // instead of showing it. Returns null when the dialog is still needed:
+  // carries the OAuth-credentials-stored-in-database warning).
+  const resolveFixedInstallTarget = (
+    scope: McpServerInstallScope | undefined,
+    teamId: string | null | undefined,
+  ): { scope: McpServerInstallScope; teamId?: string | null } | null => {
+    if (!scope) return null;
+    if (scope === "team") return teamId ? { scope, teamId } : null;
+    return { scope };
+  };
+
+  const handleOAuthConfirm = async (result: OAuthInstallResult) => {
+    if (!selectedCatalogItem) return;
+    await startOAuthFlow(selectedCatalogItem, result);
+  };
+
+  const cancelInstallation = (serverId: string) => {
+    // Remove server from installing set to stop polling
+    setInstallingServerIds((prev) => {
+      const newSet = new Set(prev);
+      newSet.delete(serverId);
+      return newSet;
+    });
+  };
+
+  const dialogs = (
+    <>
+      <RemoteServerInstallDialog
+        isOpen={isDialogOpened("remote-install")}
+        onClose={() => {
+          // User dismissed the deep-linked install — drop the intent so the
+          // durable re-open below does not bring it back.
+          clearPendingInstall();
+          closeDialog("remote-install");
+          setSelectedCatalogItem(null);
+          setPreselectedTeamId(null);
+          setInstallPersonalOnly(false);
+          setInstallOrgOnly(false);
+        }}
+        onConfirm={handleRemoteServerInstallConfirm}
+        catalogItem={selectedCatalogItem}
+        isInstalling={installMutation.isPending}
+        preselectedTeamId={preselectedTeamId}
+        personalOnly={installPersonalOnly}
+        orgOnly={installOrgOnly}
+      />
+
+      <OAuthConfirmationDialog
+        open={isDialogOpened("oauth")}
+        onOpenChange={(open) => {
+          if (!open) {
+            // Dismissed (Escape / outside click) — drop the intent so the
+            // durable re-open does not bring it back.
+            clearPendingInstall();
+            closeDialog("oauth");
+          }
+        }}
+        serverName={selectedCatalogItem?.name || ""}
+        onConfirm={handleOAuthConfirm}
+        onCancel={() => {
+          clearPendingInstall();
+          closeDialog("oauth");
+          setSelectedCatalogItem(null);
+          setPreselectedTeamId(null);
+          setInstallPersonalOnly(false);
+          setInstallOrgOnly(false);
+        }}
+        catalogId={selectedCatalogItem?.id}
+        preselectedTeamId={preselectedTeamId}
+        personalOnly={installPersonalOnly}
+        orgOnly={installOrgOnly}
+      />
+
+      <NoAuthInstallDialog
+        isOpen={isDialogOpened("no-auth")}
+        onClose={() => {
+          clearPendingInstall();
+          closeDialog("no-auth");
+          setNoAuthCatalogItem(null);
+          setPreselectedTeamId(null);
+          setInstallPersonalOnly(false);
+          setInstallOrgOnly(false);
+        }}
+        onInstall={handleNoAuthConfirm}
+        catalogItem={noAuthCatalogItem}
+        isInstalling={installMutation.isPending}
+        preselectedTeamId={preselectedTeamId}
+        personalOnly={installPersonalOnly}
+        orgOnly={installOrgOnly}
+      />
+
+      {localServerCatalogItem && (
+        <LocalServerInstallDialog
+          isOpen={isDialogOpened("local-install")}
+          onClose={() => {
+            clearPendingInstall();
+            closeDialog("local-install");
+            setLocalServerCatalogItem(null);
+            setPreselectedTeamId(null);
+            setInstallPersonalOnly(false);
+            setInstallOrgOnly(false);
+          }}
+          onConfirm={handleLocalServerInstallConfirm}
+          catalogItem={localServerCatalogItem}
+          isInstalling={installMutation.isPending}
+          preselectedTeamId={preselectedTeamId}
+          personalOnly={installPersonalOnly}
+          orgOnly={installOrgOnly}
+        />
+      )}
+
+      {desktopCatalogItem && (
+        <DesktopMcpInstallDialog
+          isOpen={isDialogOpened("desktop-install")}
+          onClose={() => {
+            clearPendingInstall();
+            closeDialog("desktop-install");
+            setDesktopCatalogItem(null);
+          }}
+          onAdd={handleDesktopAdd}
+          catalogItem={desktopCatalogItem}
+          isAdding={installMutation.isPending}
+        />
+      )}
+    </>
+  );
+
+  return {
+    addPersonalConnection,
+    addSharedConnection,
+    addOrgConnection,
+    installRemote: (item) => void installRemote(item),
+    installLocal: (item) => void installLocal(item),
+    installDesktop,
+    installFromSearchParams,
+    installingItemId,
+    installingServerIds,
+    setInstallingServerIds,
+    setInstallingItemId,
+    cancelInstallation,
+    dialogs,
+  };
+}

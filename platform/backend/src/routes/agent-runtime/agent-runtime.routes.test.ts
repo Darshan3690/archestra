@@ -1,0 +1,3210 @@
+import { createHash } from "node:crypto";
+import { and, eq } from "drizzle-orm";
+import { HttpResponse, http } from "msw";
+import { assert, vi } from "vitest";
+import { A2AProtocolRole } from "@/agents/a2a/a2a-protocol";
+import { settleFailedA2ATask } from "@/agents/a2a/a2a-task-settlement";
+import { serviceAccountUserId } from "@/auth/service-account-user-id";
+import config from "@/config";
+import db, { schema } from "@/database";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { agentRuntimeManager } from "@/k8s/agent-runtime";
+import { agentSandboxApi } from "@/k8s/agent-runtime/sandbox-api";
+import { registerAuditLogHook } from "@/middleware/audit-log-hook";
+import {
+  A2AContextModel,
+  A2AMessageModel,
+  A2ATaskModel,
+  AgentRunModel,
+  AgentWorkspaceModel,
+  InteractionModel,
+  LlmProviderApiKeyModelLinkModel,
+  ModelModel,
+  RuntimeCredentialDefinitionModel,
+} from "@/models";
+import MemberModel from "@/models/member";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import ServiceAccountModel from "@/models/service-account";
+import { claudeCodeAccountManager } from "@/services/agent-runtime/claude-code-account";
+import { resolveAgentRuntimeCredentials } from "@/services/agent-runtime/credentials";
+import { resolveAgentRuntime } from "@/services/agent-runtime/pod-run";
+import { agentRunReconciler } from "@/services/agent-runtime/reconciler";
+import { createRuntimeCredentialDefinition } from "@/services/agent-runtime/runtime-credentials";
+import {
+  cancelDetachedAgentTask,
+  startDetachedAgentTask,
+} from "@/services/agent-runtime/start-task";
+import { projectService } from "@/services/project";
+import { ResourcePermissions } from "@/services/resource-permissions";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import { setupTestCacheManager } from "@/test/cache-manager";
+import { useMswServer } from "@/test/msw";
+import { shareForTest } from "@/test/sharing";
+import { grantRoleEverywhere } from "@/test/wildcard-grants";
+import type { Agent, User } from "@/types";
+
+vi.mock("@/observability");
+vi.mock("@/services/agent-runtime/start-task", () => ({
+  cancelDetachedAgentTask: vi.fn(),
+  startDetachedAgentTask: vi.fn(),
+}));
+
+// biome-ignore lint/correctness/useHookAtTopLevel: Vitest lifecycle helper.
+const oauthServer = useMswServer();
+// Transfer tickets live in the shared cache so any replica can redeem them.
+setupTestCacheManager();
+
+describe("Agent Runtime routes", () => {
+  let app: FastifyInstanceWithZod;
+  let agent: Agent;
+  let user: User;
+  let organizationId: string;
+
+  beforeEach(async ({ makeAgent, makeAdmin, makeMember, makeOrganization }) => {
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    user = await makeAdmin();
+    await makeMember(user.id, organizationId, { role: "admin" });
+    await createRuntimeCredentialDefinition({
+      organizationId,
+      userId: user.id,
+      definition: {
+        key: "github",
+        name: "GitHub PAT",
+        description: "Repository access",
+        icon: "logo:github",
+        allowPersonal: true,
+        allowOrganization: false,
+      },
+    });
+    await createRuntimeCredentialDefinition({
+      organizationId,
+      userId: user.id,
+      definition: {
+        key: "shared-token",
+        name: "Shared token",
+        description: "Organization credential for delegated work",
+        icon: null,
+        allowPersonal: false,
+        allowOrganization: true,
+      },
+    });
+    agent = await makeAgent({
+      organizationId,
+      authorId: user.id,
+      agentType: "agent",
+      runtime: {
+        image: "example.com/coding-agent:latest",
+        command: null,
+        inferenceProtocol: "openai_responses",
+        backend: "kubernetes",
+        steerMode: "pipe",
+        privileged: false,
+        environment: null,
+        credentials: [
+          {
+            key: "SHARED_TOKEN",
+            credentialId: "shared-token",
+            scope: "shared",
+            label: "Shared token",
+            required: true,
+          },
+          {
+            key: "PERSONAL_TOKEN",
+            credentialId: "github",
+            scope: "per_user",
+            label: "Personal token",
+            required: true,
+          },
+        ],
+        ttlHours: null,
+        idleTimeoutMinutes: null,
+      },
+    });
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { user: User }).user = user;
+      (request as typeof request & { organizationId: string }).organizationId =
+        organizationId;
+    });
+    registerAuditLogHook(app);
+    const { default: routes } = await import("./agent-runtime.routes");
+    await app.register(routes);
+    vi.spyOn(agentSandboxApi, "isInstalled", "get").mockReturnValue(true);
+    vi.spyOn(agentRuntimeManager, "getStartupProgress").mockResolvedValue({
+      phase: "scheduling",
+      message: "Waiting for a node with room for this run",
+      detail: "No eligible node is currently available",
+      resourceName: "agent-run-example",
+    });
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await app.close();
+  });
+
+  test("read-only agent access cannot start a runtime or reach credential preflight", async ({
+    makeCustomRole,
+  }) => {
+    const role = await makeCustomRole(organizationId, { permission: {} });
+    await MemberModel.updateRole(user.id, organizationId, role.role);
+    const key = { organizationId, resource: "agent" as const, scope: agent.id };
+    const policy = await ResourcePermissionPolicyModel.find(key);
+    await ResourcePermissionPolicyModel.replace({
+      ...key,
+      revision: policy?.revision ?? 0,
+      grants: [{ subject: { type: "user", id: user.id }, actions: ["read"] }],
+    });
+    vi.mocked(startDetachedAgentTask).mockClear();
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/agents/${agent.id}/runs`,
+      payload: { message: "Start" },
+    });
+    expect(response.statusCode, response.body).toBe(403);
+    expect(startDetachedAgentTask).not.toHaveBeenCalled();
+  });
+
+  test("audits native sign-in without retaining the authorization code and gates an unsigned user's run", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    assert(agent.runtime);
+    agent = await makeAgent({
+      organizationId,
+      authorId: user.id,
+      agentType: "agent",
+      runtime: {
+        ...agent.runtime,
+        command: ["archestra-claude-code"],
+        inferenceProtocol: "anthropic",
+        credentials: [],
+        claudeCode: { authentication: "subscription" },
+      },
+    });
+    oauthServer.use(
+      http.post("https://platform.claude.com/v1/oauth/token", () =>
+        HttpResponse.json({
+          access_token: `sk-ant-oat01-${"example".repeat(8)}`,
+          token_type: "Bearer",
+          expires_in: 3600,
+          scope: "user:inference",
+        }),
+      ),
+    );
+    const url = `/api/agents/${agent.id}/runtime/claude-code/account`;
+    const started = await app.inject({ method: "POST", url });
+    expect(started.statusCode, started.body).toBe(200);
+    const { flowId } = started.json();
+    expect(started.json().state).toBe("awaiting_code");
+    const state = new URL(started.json().authorizationUrl).searchParams.get(
+      "state",
+    );
+    const completed = await app.inject({
+      method: "POST",
+      url: `${url}/complete`,
+      payload: { flowId, code: `never-record-native-code#${state}` },
+    });
+    expect(completed.statusCode, completed.body).toBe(200);
+    expect(completed.json()).toMatchObject({ state: "connected" });
+    expect((await app.inject({ method: "GET", url })).json()).toMatchObject({
+      state: "connected",
+    });
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/agents/${agent.id}/runtime/preflight`,
+        })
+      ).json(),
+    ).toMatchObject({ ready: true, configured: ["CLAUDE_CODE_ACCOUNT"] });
+    assert(agent.runtime);
+    const secondAgent = await makeAgent({
+      organizationId,
+      authorId: user.id,
+      agentType: "agent",
+      runtime: { ...agent.runtime, image: "example.test/custom-claude:v2" },
+    });
+    const secondUrl = `/api/agents/${secondAgent.id}/runtime/claude-code/account`;
+    expect(
+      (await app.inject({ method: "GET", url: secondUrl })).json(),
+    ).toMatchObject({ state: "connected" });
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/agents/${secondAgent.id}/runtime/preflight`,
+        })
+      ).json(),
+    ).toMatchObject({ ready: true, configured: ["CLAUDE_CODE_ACCOUNT"] });
+    const owner = user;
+    user = await makeUser();
+    await makeMember(user.id, organizationId);
+    expect((await app.inject({ method: "GET", url })).json()).toMatchObject({
+      state: "disconnected",
+    });
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/agents/${agent.id}/runtime/preflight`,
+        })
+      ).json(),
+    ).toMatchObject({
+      ready: false,
+      missing: [{ key: "CLAUDE_CODE_ACCOUNT" }],
+    });
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/agents/${agent.id}/runs`,
+          payload: { message: "Hello" },
+        })
+      ).statusCode,
+    ).toBe(409);
+    user = owner;
+    expect((await app.inject({ method: "DELETE", url })).statusCode).toBe(200);
+    expect(
+      (await app.inject({ method: "GET", url: secondUrl })).json(),
+    ).toMatchObject({ state: "disconnected" });
+    const audits = await db
+      .select()
+      .from(schema.auditLogsTable)
+      .where(
+        and(
+          eq(schema.auditLogsTable.resourceId, agent.id),
+          eq(schema.auditLogsTable.action, "agent.updated"),
+        ),
+      );
+    expect(audits).toHaveLength(3);
+    for (const audit of audits) {
+      expect(audit.action).toBe("agent.updated");
+      expect(audit.before).not.toEqual(audit.after);
+    }
+    expect(JSON.stringify(audits)).not.toContain("never-record-native-code");
+    expect(JSON.stringify(audits)).not.toContain("sk-ant-oat");
+  });
+
+  test("does not expose another organization or private Agent's native account", async ({
+    makeAgent,
+    makeUser,
+    makeOrganization,
+  }) => {
+    const privateOwner = await makeUser();
+    const privateAgent = await makeAgent({
+      organizationId,
+      authorId: privateOwner.id,
+      agentType: "agent",
+      access: "personal",
+      runtime: agent.runtime,
+    });
+    const otherOrganization = await makeOrganization();
+    const outsideAgent = await makeAgent({
+      organizationId: otherOrganization.id,
+      authorId: privateOwner.id,
+      agentType: "agent",
+      runtime: agent.runtime,
+    });
+    user = await makeUser();
+    const status = vi.spyOn(claudeCodeAccountManager, "status");
+    for (const id of [privateAgent.id, outsideAgent.id]) {
+      expect(
+        (
+          await app.inject({
+            method: "GET",
+            url: `/api/agents/${id}/runtime/claude-code/account`,
+          })
+        ).statusCode,
+      ).toBe(404);
+    }
+    expect(status).not.toHaveBeenCalled();
+  });
+
+  test("lists runs with their initiator and visibility", async ({
+    makeAgent,
+    makeTeam,
+  }) => {
+    const otherAgent = await makeAgent({
+      organizationId,
+      authorId: user.id,
+      agentType: "agent",
+    });
+    const selectedTask = await createTask(agent.id);
+    const otherTask = await createTask(otherAgent.id);
+    await AgentRunModel.create({
+      organizationId,
+      taskId: selectedTask.id,
+      agentId: agent.id,
+      actorKind: "user",
+      actorId: user.id,
+      actorUserId: user.id,
+      workloadName: `agent-run-${selectedTask.id}`,
+      backend: "kubernetes",
+      runtimeScope: "archestra-dev",
+      activeDeadlineSeconds: 3_600,
+      virtualApiKeyId: null,
+    });
+    const visibleTeam = await makeTeam(organizationId, user.id, {
+      name: "Runtime reviewers",
+    });
+    await shareForTest({
+      resource: "agentRun",
+      scope: selectedTask.id,
+      organizationId,
+      visibility: "team",
+      teamIds: [visibleTeam.id],
+      userIds: [],
+    });
+    const latestInteraction = await InteractionModel.create({
+      profileId: agent.id,
+      runId: selectedTask.id,
+      request: {
+        model: "gpt-4",
+        messages: [{ role: "user", content: "Continue the run" }],
+      },
+      response: {
+        id: "test-response",
+        object: "chat.completion",
+        created: Date.now(),
+        model: "gpt-4",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: "Continuing",
+              refusal: null,
+            },
+            finish_reason: "stop",
+            logprobs: null,
+          },
+        ],
+      },
+      type: "openai:chatCompletions",
+    });
+    await A2ATaskModel.transitionStateWithEvent({
+      id: selectedTask.id,
+      to: "TASK_STATE_FAILED",
+      allowedFrom: ["TASK_STATE_SUBMITTED"],
+      statusReason: "The run process exited with status 1",
+      eventPayload: {
+        statusUpdate: {
+          taskId: selectedTask.id,
+          contextId: selectedTask.contextId,
+          status: {
+            state: "TASK_STATE_FAILED",
+            message: {
+              messageId: crypto.randomUUID(),
+              role: A2AProtocolRole.Agent,
+              parts: [{ text: "The run process exited with status 1" }],
+            },
+          },
+          final: true,
+        },
+      },
+    });
+    await AgentRunModel.create({
+      organizationId,
+      taskId: otherTask.id,
+      agentId: otherAgent.id,
+      actorKind: "user",
+      actorId: user.id,
+      actorUserId: user.id,
+      workloadName: `agent-run-${otherTask.id}`,
+      backend: "kubernetes",
+      runtimeScope: "archestra-dev",
+      virtualApiKeyId: null,
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agent.id}/runs`,
+    });
+
+    expect(response.statusCode, response.body).toBe(200);
+    const [listedRun] = response.json();
+    expect(listedRun).toEqual(
+      expect.objectContaining({
+        taskId: selectedTask.id,
+        agentId: agent.id,
+        state: "TASK_STATE_FAILED",
+        statusReason: "The run process exited with status 1",
+        initiatorName: user.name,
+        shareVisibility: "team",
+        shareTeamNames: ["Runtime reviewers"],
+        shareUserNames: [],
+      }),
+    );
+    expect(
+      Date.parse(listedRun.hardDeadlineAt) - Date.parse(listedRun.startedAt),
+    ).toBe(3_600_000);
+    expect(listedRun.lastModelActivityAt).toBe(
+      latestInteraction.createdAt.toISOString(),
+    );
+  });
+
+  test("keeps the initiating user distinct from the Agent creator and follows current sharing", async ({
+    makeAdmin,
+    makeMember,
+  }) => {
+    const creator = user;
+    const owner = await makeAdmin({ name: "Alex Rivera" });
+    await makeMember(owner.id, organizationId, { role: "member" });
+    const recipient = await makeAdmin({ name: "Sam Chen" });
+    await makeMember(recipient.id, organizationId, { role: "member" });
+    const task = await createTask(agent.id);
+    await createRun({ taskId: task.id, actorUserId: owner.id });
+
+    const readRun = async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/agents/${agent.id}/runs`,
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toHaveLength(1);
+      return response.json()[0];
+    };
+    expect(await readRun()).toMatchObject({
+      actorUserId: owner.id,
+      initiatorName: owner.name,
+      shareVisibility: null,
+      shareTeamNames: null,
+      shareUserNames: null,
+    });
+    user = owner;
+    for (const visibility of ["user", "organization"] as const) {
+      await shareForTest({
+        resource: "agentRun",
+        scope: task.id,
+        organizationId,
+        visibility: visibility,
+        userIds: visibility === "user" ? [recipient.id] : [],
+      });
+      expect(await readRun()).toMatchObject({
+        shareUserNames: visibility === "user" ? [recipient.name] : [],
+        shareTeamNames: [],
+      });
+      user = creator;
+      expect(await readRun()).toMatchObject({
+        initiatorName: owner.name,
+        shareVisibility: visibility,
+        shareUserNames: null,
+        shareTeamNames: null,
+      });
+      user = owner;
+    }
+    await shareForTest({
+      resource: "agentRun",
+      scope: task.id,
+      organizationId,
+      visibility: null,
+    });
+    user = creator;
+    expect(await readRun()).toMatchObject({
+      initiatorName: owner.name,
+      shareVisibility: null,
+      shareUserNames: null,
+    });
+  });
+
+  test("preserves Agent history but restricts recipient membership to the run owner", async ({
+    makeAdmin,
+    makeMember,
+    makeTeam,
+    makeTeamMember,
+  }) => {
+    const owner = user;
+    const recipient = await makeAdmin({ name: "Release reviewer" });
+    await makeMember(recipient.id, organizationId, { role: "member" });
+    const outsider = await makeAdmin({ name: "Agent reader" });
+    await makeMember(outsider.id, organizationId, { role: "member" });
+    const administrator = await makeAdmin();
+    await makeMember(administrator.id, organizationId, { role: "admin" });
+    const team = await makeTeam(organizationId, owner.id, {
+      name: "Private reviewers",
+    });
+    await makeTeamMember(team.id, recipient.id);
+    const task = await createTask(agent.id);
+    await createRun({ taskId: task.id, actorUserId: owner.id });
+
+    for (const visibility of ["user", "team"] as const) {
+      await shareForTest({
+        resource: "agentRun",
+        scope: task.id,
+        organizationId,
+        visibility,
+        teamIds: visibility === "team" ? [team.id] : [],
+        userIds: visibility === "user" ? [recipient.id] : [],
+      });
+      for (const viewer of [owner, recipient, outsider, administrator]) {
+        user = viewer;
+        const history = await app.inject({
+          method: "GET",
+          url: `/api/agents/${agent.id}/runs`,
+        });
+        expect(history.statusCode).toBe(200);
+        expect(history.json()).toEqual([
+          expect.objectContaining({
+            taskId: task.id,
+            actorUserId: owner.id,
+            initiatorName: owner.name,
+            shareVisibility: visibility,
+            shareTeamNames:
+              viewer === owner
+                ? visibility === "team"
+                  ? [team.name]
+                  : []
+                : null,
+            shareUserNames:
+              viewer === owner
+                ? visibility === "user"
+                  ? [recipient.name]
+                  : []
+                : null,
+          }),
+        ]);
+        const details = await app.inject({
+          method: "GET",
+          url: `/api/agent-runs/${task.id}`,
+        });
+        expect(details.statusCode).toBe(
+          viewer === owner || viewer === recipient ? 200 : 404,
+        );
+      }
+    }
+  });
+
+  test("keeps every run endpoint unavailable when no run backend is enabled", async () => {
+    vi.spyOn(agentSandboxApi, "isInstalled", "get").mockReturnValue(false);
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agent.id}/runs`,
+    });
+
+    expect(response.statusCode).toBe(404);
+  });
+
+  test("starts a durable run as the signed-in user", async () => {
+    await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/runtime/credentials/SHARED_TOKEN`,
+      payload: { value: "shared-value" },
+    });
+    await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/runtime/credentials/PERSONAL_TOKEN`,
+      payload: { value: "personal-value" },
+    });
+    const task = await createTask(agent.id);
+    const project = await projectService.create({
+      organizationId,
+      userId: user.id,
+      name: "Run project",
+      description: null,
+    });
+    vi.mocked(startDetachedAgentTask).mockResolvedValue(task);
+    // A limit above the Agent's is refused with the maximum named, before
+    // any task exists. The signed-in user is not a run, so the refusal names
+    // the tiers to retry within, not the fixed-tier refusal a run gets.
+    const refused = await app.inject({
+      method: "POST",
+      url: `/api/agents/${agent.id}/runs`,
+      payload: { message: "Start", limits: { tier: "L" } },
+    });
+    expect(refused.statusCode, refused.body).toBe(400);
+    expect(refused.json().error.message).toContain(
+      "Tier L (8 CPU, 16 GiB (32 GiB limit), 20 GiB workspace) is above this Agent's scaleup tier M. Tiers this Agent's runs may use: S (2 CPU, 4 GiB (8 GiB limit), 20 GiB workspace), M (4 CPU, 8 GiB (16 GiB limit), 20 GiB workspace).",
+    );
+    expect(startDetachedAgentTask).not.toHaveBeenCalled();
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/agents/${agent.id}/runs`,
+      payload: {
+        message: "Implement the requested change.",
+        projectId: project.id,
+        limits: { tier: "S", maxDurationHours: 2 },
+        systemParams: expect.objectContaining({
+          source: "chat",
+          runtimeMode: "interactive",
+        }),
+        attachments: [
+          {
+            name: "requirements.txt",
+            contentType: "text/plain",
+            contentBase64: Buffer.from("fastify").toString("base64"),
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      taskId: task.id,
+      agentId: agent.id,
+      agentName: agent.name,
+      prompt: "Implement the requested change.",
+      projectId: project.id,
+      state: "TASK_STATE_SUBMITTED",
+      limits: {
+        tier: "S",
+        idleTimeoutMinutes: config.agentRuntime.defaultIdleTimeoutMinutes,
+        maxDurationHours: 2,
+        maxCostUsd: null,
+      },
+    });
+    expect(startDetachedAgentTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        actor: {
+          id: user.id,
+          kind: "user",
+          organizationId,
+        },
+        agentId: agent.id,
+        message: "Implement the requested change.",
+        systemParams: expect.objectContaining({
+          projectId: project.id,
+          runtimeLimits: expect.objectContaining({
+            tier: "S",
+            maxDurationHours: 2,
+          }),
+        }),
+        attachments: [
+          {
+            name: "requirements.txt",
+            contentType: "text/plain",
+            contentBase64: Buffer.from("fastify").toString("base64"),
+          },
+        ],
+      }),
+    );
+    const [audit] = await db
+      .select({
+        action: schema.auditLogsTable.action,
+        resourceId: schema.auditLogsTable.resourceId,
+        before: schema.auditLogsTable.before,
+        after: schema.auditLogsTable.after,
+      })
+      .from(schema.auditLogsTable)
+      .where(
+        and(
+          eq(schema.auditLogsTable.action, "agentRun.created"),
+          eq(schema.auditLogsTable.resourceId, task.id),
+        ),
+      );
+    expect(audit).toMatchObject({
+      action: "agentRun.created",
+      resourceId: task.id,
+      before: null,
+      after: {
+        taskId: task.id,
+        agentId: agent.id,
+        state: "TASK_STATE_SUBMITTED",
+        attachmentCount: 1,
+        projectId: project.id,
+      },
+    });
+    expect(JSON.stringify(audit)).not.toContain(
+      "Implement the requested change",
+    );
+    expect(JSON.stringify(audit)).not.toContain("requirements.txt");
+  });
+
+  test("exposes a classified failure on run reads and leaves other runs without one", async () => {
+    const failed = await createTask(agent.id);
+    await createRun({ taskId: failed.id, actorUserId: user.id });
+    await settleFailedA2ATask({
+      taskId: failed.id,
+      contextId: failed.contextId,
+      statusReason: "The Agent Runtime pod failed.\nReason: Evicted",
+      failure: { code: "pod.evicted", retriable: true },
+    });
+    // A failure settled before classification existed.
+    const legacy = await createTask(agent.id);
+    await createRun({ taskId: legacy.id, actorUserId: user.id });
+    await settleFailedA2ATask({
+      taskId: legacy.id,
+      contextId: legacy.contextId,
+      statusReason: "The Agent Runtime turn exited with status 1",
+    });
+    const running = await createTask(agent.id);
+    await createRun({ taskId: running.id, actorUserId: user.id });
+
+    const expected = {
+      code: "pod.evicted",
+      retriable: true,
+      message: "The Agent Runtime pod failed.\nReason: Evicted",
+    };
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/agent-runs/${failed.id}`,
+    });
+    expect(detail.statusCode, detail.body).toBe(200);
+    expect(detail.json()).toMatchObject({
+      state: "TASK_STATE_FAILED",
+      statusReason: expected.message,
+      failure: expected,
+    });
+    // The LLM trace is keyed by the frozen run name the runtime sends.
+    expect(detail.json().llmSessionId).toBe(detail.json().workloadName);
+    for (const taskId of [legacy.id, running.id]) {
+      const other = await app.inject({
+        method: "GET",
+        url: `/api/agent-runs/${taskId}`,
+      });
+      expect(other.json().failure).toBeNull();
+    }
+
+    const mine = await app.inject({ method: "GET", url: "/api/agent-runs" });
+    expect(mine.statusCode, mine.body).toBe(200);
+    const agentRuns = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agent.id}/runs`,
+    });
+    expect(agentRuns.statusCode, agentRuns.body).toBe(200);
+    for (const rows of [
+      mine.json().data as Array<{ taskId: string; failure: unknown }>,
+      agentRuns.json() as Array<{ taskId: string; failure: unknown }>,
+    ]) {
+      expect(
+        Object.fromEntries(rows.map((row) => [row.taskId, row.failure])),
+      ).toEqual({
+        [failed.id]: expected,
+        [legacy.id]: null,
+        [running.id]: null,
+      });
+    }
+  });
+
+  test("does not start a run inside a project the caller cannot read", async ({
+    makeUser,
+    makeMember,
+  }) => {
+    const otherUser = await makeUser();
+    await makeMember(otherUser.id, organizationId);
+    await ResourcePermissions.updatePolicy({
+      organizationId,
+      userId: user.id,
+      resource: "project",
+      scope: "*",
+      revision: 1,
+      grants: [
+        {
+          subject: { type: "user", id: otherUser.id },
+          actions: ["read", "use", "update", "delete", "manage-permissions"],
+        },
+      ],
+    });
+    const project = await projectService.create({
+      organizationId,
+      userId: otherUser.id,
+      name: "Private project",
+      description: null,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/agents/${agent.id}/runs`,
+      payload: { message: "Do not start", projectId: project.id },
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(startDetachedAgentTask).not.toHaveBeenCalled();
+  });
+
+  test("lists only the current user's run sessions with their prompt", async ({
+    makeAdmin,
+    makeMember,
+  }) => {
+    const ownTask = await createTask(agent.id);
+    await A2AMessageModel.create({
+      contextId: ownTask.contextId,
+      taskId: ownTask.id,
+      role: A2AProtocolRole.User,
+      parts: [{ text: "Create a compact status page." }],
+      content: {
+        id: crypto.randomUUID(),
+        role: "user",
+        parts: [{ type: "text", text: "Create a compact status page." }],
+      },
+    });
+    await AgentRunModel.create({
+      organizationId,
+      taskId: ownTask.id,
+      agentId: agent.id,
+      actorKind: "user",
+      actorId: user.id,
+      actorUserId: user.id,
+      workloadName: `agent-run-${ownTask.id}`,
+      backend: "kubernetes",
+      runtimeScope: "archestra-dev",
+      virtualApiKeyId: null,
+    });
+
+    const colleague = await makeAdmin();
+    await makeMember(colleague.id, organizationId, { role: "admin" });
+    const colleagueTask = await createTask(agent.id);
+    await AgentRunModel.create({
+      organizationId,
+      taskId: colleagueTask.id,
+      agentId: agent.id,
+      actorKind: "user",
+      actorId: colleague.id,
+      actorUserId: colleague.id,
+      workloadName: `agent-run-${colleagueTask.id}`,
+      backend: "kubernetes",
+      runtimeScope: "archestra-dev",
+      virtualApiKeyId: null,
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/agent-runs",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const [ownRun] = response.json().data;
+    // The LLM trace is keyed by the frozen run name the runtime sends.
+    expect(ownRun.llmSessionId).toBe(ownRun.workloadName);
+    expect(response.json().data).toEqual([
+      expect.objectContaining({
+        taskId: ownTask.id,
+        prompt: "Create a compact status page.",
+        agent: {
+          id: agent.id,
+          name: agent.name,
+          icon: agent.icon,
+        },
+      }),
+    ]);
+  });
+
+  test("paginates run sessions before loading their prompt messages", async () => {
+    const firstTask = await createTask(agent.id);
+    const secondTask = await createTask(agent.id);
+    await createRun({ taskId: firstTask.id, actorUserId: user.id });
+    await createRun({ taskId: secondTask.id, actorUserId: user.id });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/agent-runs?limit=1&offset=0",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      data: [expect.objectContaining({ agentId: agent.id })],
+      pagination: {
+        currentPage: 1,
+        limit: 1,
+        total: 2,
+        totalPages: 2,
+        hasNext: true,
+        hasPrev: false,
+      },
+    });
+  });
+
+  test("keeps legacy ordering and pages sidebar runs by their latest state change", async () => {
+    const oldTask = await createTask(agent.id, new Date("2026-01-03"));
+    const newTask = await createTask(agent.id, new Date("2026-01-02"));
+    await createRun({
+      taskId: oldTask.id,
+      actorUserId: user.id,
+    });
+    await createRun({
+      taskId: newTask.id,
+      actorUserId: user.id,
+    });
+    const legacy = await app.inject({
+      method: "GET",
+      url: "/api/agent-runs?limit=1",
+    });
+    expect(legacy.statusCode).toBe(200);
+    expect(legacy.json().data[0].taskId).toBe(newTask.id);
+    const recent = await app.inject({
+      method: "GET",
+      url: "/api/agent-runs?sort=recent&limit=1",
+    });
+    expect(recent.statusCode).toBe(200);
+    expect(recent.json().data[0].taskId).toBe(oldTask.id);
+    expect(recent.json().pagination.hasNext).toBe(true);
+    const next = await app.inject({
+      method: "GET",
+      url: "/api/agent-runs?sort=recent&limit=1&offset=1",
+    });
+    expect(next.json().data[0].taskId).toBe(newTask.id);
+  });
+
+  test("pages pinned runs by pin time rather than activity time", async () => {
+    const recentlyPinned = await createTask(agent.id, new Date("2020-01-01"));
+    const recentlyActive = await createTask(agent.id, new Date("2026-01-01"));
+    await createRun({
+      taskId: recentlyPinned.id,
+      actorUserId: user.id,
+      pinnedAt: new Date("2026-01-02"),
+    });
+    await createRun({
+      taskId: recentlyActive.id,
+      actorUserId: user.id,
+      pinnedAt: new Date("2020-01-02"),
+    });
+    const first = await app.inject({
+      method: "GET",
+      url: "/api/agent-runs?pinned=true&sort=pinned&limit=1",
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().data[0].taskId).toBe(recentlyPinned.id);
+    expect(first.json().pagination.hasNext).toBe(true);
+    const next = await app.inject({
+      method: "GET",
+      url: "/api/agent-runs?pinned=true&sort=pinned&limit=1&offset=1",
+    });
+    expect(next.json().data[0].taskId).toBe(recentlyActive.id);
+  });
+
+  test("finds older pinned and searched runs without exposing another actor's sessions", async ({
+    makeUser,
+  }) => {
+    const oldTask = await createTask(agent.id);
+    const ordinaryTask = await createTask(agent.id);
+    const foreignTask = await createTask(agent.id);
+    const foreignUser = await makeUser();
+    await createRun({
+      taskId: oldTask.id,
+      actorUserId: user.id,
+      title: "Old 100% report",
+      pinnedAt: new Date("2020-01-02"),
+    });
+    await createRun({
+      taskId: ordinaryTask.id,
+      actorUserId: user.id,
+      title: "Ordinary report",
+    });
+    await createRun({
+      taskId: foreignTask.id,
+      actorUserId: foreignUser.id,
+      title: "Foreign 100% report",
+      pinnedAt: new Date(),
+    });
+    const pinned = await app.inject({
+      method: "GET",
+      url: "/api/agent-runs?pinned=true&sort=recent&limit=1",
+    });
+    expect(pinned.statusCode).toBe(200);
+    expect(
+      pinned.json().data.map((run: { taskId: string }) => run.taskId),
+    ).toEqual([oldTask.id]);
+    expect(pinned.json().pagination.total).toBe(1);
+    const unpinned = await app.inject({
+      method: "GET",
+      url: "/api/agent-runs?pinned=false",
+    });
+    expect(
+      unpinned.json().data.map((run: { taskId: string }) => run.taskId),
+    ).toEqual([ordinaryTask.id]);
+    const searched = await app.inject({
+      method: "GET",
+      url: "/api/agent-runs?search=%25",
+    });
+    expect(searched.statusCode).toBe(200);
+    expect(
+      searched.json().data.map((run: { taskId: string }) => run.taskId),
+    ).toEqual([oldTask.id]);
+    const invalid = await app.inject({
+      method: "GET",
+      url: "/api/agent-runs?pinned=invalid",
+    });
+    expect(invalid.statusCode).toBe(400);
+  });
+
+  test("lets only the initiating user cancel an active run and audits the transition", async ({
+    makeAdmin,
+    makeMember,
+  }) => {
+    const task = await createTask(agent.id);
+    await AgentRunModel.create({
+      organizationId,
+      taskId: task.id,
+      agentId: agent.id,
+      actorKind: "user",
+      actorId: user.id,
+      actorUserId: user.id,
+      workloadName: `agent-run-${task.id}`,
+      backend: "kubernetes",
+      runtimeScope: "archestra-dev",
+      virtualApiKeyId: null,
+    });
+    vi.mocked(cancelDetachedAgentTask).mockResolvedValue({
+      id: task.id,
+      contextId: task.contextId,
+      status: { state: "TASK_STATE_CANCELED" },
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/agent-runs/${task.id}/cancel`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      taskId: task.id,
+      state: "TASK_STATE_CANCELED",
+    });
+    expect(cancelDetachedAgentTask).toHaveBeenCalledWith({
+      actor: { id: user.id, kind: "user", organizationId },
+      agentId: agent.id,
+      taskId: task.id,
+    });
+
+    const [audit] = await db
+      .select({
+        action: schema.auditLogsTable.action,
+        resourceId: schema.auditLogsTable.resourceId,
+        before: schema.auditLogsTable.before,
+        after: schema.auditLogsTable.after,
+      })
+      .from(schema.auditLogsTable)
+      .where(
+        and(
+          eq(schema.auditLogsTable.action, "agentRun.canceled"),
+          eq(schema.auditLogsTable.resourceId, task.id),
+        ),
+      );
+    expect(audit).toEqual({
+      action: "agentRun.canceled",
+      resourceId: task.id,
+      before: {
+        taskId: task.id,
+        agentId: agent.id,
+        state: "TASK_STATE_SUBMITTED",
+      },
+      after: {
+        taskId: task.id,
+        agentId: agent.id,
+        state: "TASK_STATE_CANCELED",
+      },
+    });
+
+    const otherUser = await makeAdmin();
+    await makeMember(otherUser.id, organizationId, { role: "admin" });
+    user = otherUser;
+    const forbidden = await app.inject({
+      method: "POST",
+      url: `/api/agent-runs/${task.id}/cancel`,
+    });
+    expect(forbidden.statusCode).toBe(404);
+  });
+
+  test.each([
+    "TASK_STATE_COMPLETED",
+    "TASK_STATE_FAILED",
+    "TASK_STATE_CANCELED",
+    "TASK_STATE_REJECTED",
+  ] as const)("returns a conflict when canceling a %s run", async (state) => {
+    const context = await A2AContextModel.create({
+      actorKind: "user",
+      actorId: user.id,
+    });
+    const task = await A2ATaskModel.create({
+      contextId: context.id,
+      agentId: agent.id,
+      state,
+    });
+    await createRun({ taskId: task.id, actorUserId: user.id });
+    const actual = await vi.importActual<
+      typeof import("@/services/agent-runtime/start-task")
+    >("@/services/agent-runtime/start-task");
+    vi.mocked(cancelDetachedAgentTask).mockImplementation(
+      actual.cancelDetachedAgentTask,
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/agent-runs/${task.id}/cancel`,
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({
+      error: {
+        message: "Task cannot be canceled",
+        type: "api_conflict_error",
+      },
+    });
+    expect((await A2ATaskModel.findById(task.id))?.state).toBe(state);
+    const audits = await db
+      .select()
+      .from(schema.auditLogsTable)
+      .where(eq(schema.auditLogsTable.resourceId, task.id));
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({
+      action: "agentRun.canceled",
+      outcome: "failure",
+      httpStatus: 409,
+      before: { state },
+      after: null,
+    });
+  });
+
+  test("returns a conflict when the run becomes terminal during cancellation", async () => {
+    const task = await createTask(agent.id);
+    await createRun({ taskId: task.id, actorUserId: user.id });
+    const actual = await vi.importActual<
+      typeof import("@/services/agent-runtime/start-task")
+    >("@/services/agent-runtime/start-task");
+    vi.mocked(cancelDetachedAgentTask).mockImplementation(
+      actual.cancelDetachedAgentTask,
+    );
+
+    const responses = await Promise.all([
+      app.inject({ method: "POST", url: `/api/agent-runs/${task.id}/cancel` }),
+      app.inject({ method: "POST", url: `/api/agent-runs/${task.id}/cancel` }),
+    ]);
+
+    expect(responses.map((response) => response.statusCode).sort()).toEqual([
+      200, 409,
+    ]);
+    expect((await A2ATaskModel.findById(task.id))?.state).toBe(
+      "TASK_STATE_CANCELED",
+    );
+  });
+
+  test("lets the initiating user rename, pin, unpin, and delete a finished run", async () => {
+    const task = await createTask(agent.id);
+    const run = await AgentRunModel.create({
+      organizationId,
+      taskId: task.id,
+      agentId: agent.id,
+      actorKind: "user",
+      actorId: user.id,
+      actorUserId: user.id,
+      title: "Opening request",
+      workloadName: `agent-run-${task.id}`,
+      backend: "kubernetes",
+      runtimeScope: "archestra-dev",
+      virtualApiKeyId: null,
+    });
+
+    const renamed = await app.inject({
+      method: "PATCH",
+      url: `/api/agent-runs/${task.id}`,
+      payload: { title: "Concise session title" },
+    });
+    expect(renamed.statusCode).toBe(200);
+    expect(renamed.json().title).toBe("Concise session title");
+
+    const project = await projectService.create({
+      organizationId,
+      userId: user.id,
+      name: "Moved run",
+      description: null,
+    });
+    const moved = await app.inject({
+      method: "PATCH",
+      url: `/api/agent-runs/${task.id}`,
+      payload: { projectId: project.id },
+    });
+    expect(moved.statusCode).toBe(200);
+    expect(moved.json()).toMatchObject({
+      projectId: project.id,
+      projectName: project.name,
+    });
+
+    const removed = await app.inject({
+      method: "PATCH",
+      url: `/api/agent-runs/${task.id}`,
+      payload: { projectId: null },
+    });
+    expect(removed.statusCode).toBe(200);
+    expect(removed.json()).toMatchObject({
+      projectId: null,
+      projectName: null,
+    });
+
+    const pinnedAt = new Date("2026-08-31T18:00:00.000Z").toISOString();
+    const pinned = await app.inject({
+      method: "PATCH",
+      url: `/api/agent-runs/${task.id}`,
+      payload: { pinnedAt },
+    });
+    expect(pinned.statusCode).toBe(200);
+    expect(pinned.json().pinnedAt).toBe(pinnedAt);
+
+    const listed = await app.inject({
+      method: "GET",
+      url: "/api/agent-runs",
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json().data[0]).toEqual(
+      expect.objectContaining({ taskId: task.id, pinnedAt }),
+    );
+
+    const unpinned = await app.inject({
+      method: "PATCH",
+      url: `/api/agent-runs/${task.id}`,
+      payload: { pinnedAt: null },
+    });
+    expect(unpinned.statusCode).toBe(200);
+    expect(unpinned.json().pinnedAt).toBeNull();
+
+    const activeDelete = await app.inject({
+      method: "DELETE",
+      url: `/api/agent-runs/${task.id}`,
+    });
+    expect(activeDelete.statusCode).toBe(409);
+
+    await AgentRunModel.close({ id: run.id });
+    const deleted = await app.inject({
+      method: "DELETE",
+      url: `/api/agent-runs/${task.id}`,
+    });
+    expect(deleted.statusCode).toBe(200);
+    expect(await A2ATaskModel.findById(task.id)).toBeNull();
+
+    const audits = await db
+      .select({
+        action: schema.auditLogsTable.action,
+        resourceId: schema.auditLogsTable.resourceId,
+        before: schema.auditLogsTable.before,
+        after: schema.auditLogsTable.after,
+      })
+      .from(schema.auditLogsTable)
+      .where(eq(schema.auditLogsTable.resourceId, task.id));
+    expect(audits).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: "agentRun.updated",
+          before: expect.objectContaining({ title: "Opening request" }),
+          after: expect.objectContaining({ title: "Concise session title" }),
+        }),
+        expect.objectContaining({
+          action: "agentRun.updated",
+          before: expect.objectContaining({ pinnedAt: null }),
+          after: expect.objectContaining({ pinnedAt }),
+        }),
+        expect.objectContaining({
+          action: "agentRun.updated",
+          before: expect.objectContaining({ projectId: null }),
+          after: expect.objectContaining({ projectId: project.id }),
+        }),
+        expect.objectContaining({
+          action: "agentRun.updated",
+          before: expect.objectContaining({ projectId: project.id }),
+          after: expect.objectContaining({ projectId: null }),
+        }),
+        expect.objectContaining({
+          action: "agentRun.updated",
+          before: expect.objectContaining({ pinnedAt }),
+          after: expect.objectContaining({ pinnedAt: null }),
+        }),
+        expect.objectContaining({
+          action: "agentRun.deleted",
+          before: expect.objectContaining({
+            title: "Concise session title",
+            workspaceState: null,
+          }),
+          after: { deleted: true, workspaceState: null },
+        }),
+      ]),
+    );
+  });
+
+  test("bulk stop and delete act only on the caller's runs in the right state and audit each batch", async ({
+    makeAdmin,
+    makeMember,
+  }) => {
+    const finished = await createRun({
+      taskId: (await createTask(agent.id)).id,
+      actorUserId: user.id,
+      title: "Finished review",
+    });
+    await AgentRunModel.close({ id: finished.id });
+    const active = await createRun({
+      taskId: (await createTask(agent.id)).id,
+      actorUserId: user.id,
+      title: "Active review",
+    });
+    const colleague = await makeAdmin();
+    await makeMember(colleague.id, organizationId, { role: "admin" });
+    const colleagueRun = await createRun({
+      taskId: (await createTask(agent.id)).id,
+      actorUserId: colleague.id,
+      title: "Colleague review",
+    });
+    await AgentRunModel.close({ id: colleagueRun.id });
+    vi.mocked(cancelDetachedAgentTask).mockImplementation(
+      async ({ taskId }) => {
+        await db
+          .update(schema.a2aTasksTable)
+          .set({ state: "TASK_STATE_CANCELED" })
+          .where(eq(schema.a2aTasksTable.id, taskId));
+        return {
+          id: taskId,
+          contextId: "context",
+          status: { state: "TASK_STATE_CANCELED" },
+        };
+      },
+    );
+
+    const stopped = await app.inject({
+      method: "POST",
+      url: "/api/agent-runs/bulk-cancel",
+      payload: { ids: [active.taskId, finished.taskId] },
+    });
+    expect(stopped.statusCode).toBe(200);
+    expect(stopped.json()).toEqual({
+      succeeded: [{ id: active.taskId, name: "Active review" }],
+      failed: [
+        {
+          id: finished.taskId,
+          name: "Finished review",
+          error: "The run has already ended",
+        },
+      ],
+    });
+    expect(cancelDetachedAgentTask).toHaveBeenCalledTimes(1);
+    expect(cancelDetachedAgentTask).toHaveBeenCalledWith({
+      actor: { id: user.id, kind: "user", organizationId },
+      agentId: agent.id,
+      taskId: active.taskId,
+    });
+
+    const deleted = await app.inject({
+      method: "DELETE",
+      url: "/api/agent-runs/bulk",
+      payload: {
+        ids: [finished.taskId, active.taskId, colleagueRun.taskId, "nope"],
+      },
+    });
+    expect(deleted.statusCode).toBe(200);
+    expect(deleted.json()).toEqual({
+      succeeded: [{ id: finished.taskId, name: "Finished review" }],
+      failed: [
+        {
+          id: active.taskId,
+          name: "Active review",
+          error: "Stop the run before deleting it",
+        },
+        { id: colleagueRun.taskId, name: null, error: "Run not found" },
+        { id: "nope", name: null, error: "Run not found" },
+      ],
+    });
+    expect(await A2ATaskModel.findById(finished.taskId)).toBeNull();
+    expect(await A2ATaskModel.findById(colleagueRun.taskId)).not.toBeNull();
+
+    const audits = await db
+      .select({
+        action: schema.auditLogsTable.action,
+        before: schema.auditLogsTable.before,
+        after: schema.auditLogsTable.after,
+      })
+      .from(schema.auditLogsTable)
+      .where(eq(schema.auditLogsTable.resourceType, "agentRun"));
+    const runEntry = (run: typeof finished, state: string) => ({
+      taskId: run.taskId,
+      agentId: agent.id,
+      title: run.title,
+      state,
+      workspaceState: null,
+    });
+    expect(audits).toEqual(
+      expect.arrayContaining([
+        {
+          action: "agentRun.bulk_canceled",
+          before: {
+            runs: [
+              runEntry(active, "TASK_STATE_SUBMITTED"),
+              runEntry(finished, "TASK_STATE_SUBMITTED"),
+            ].sort((a, b) => a.taskId.localeCompare(b.taskId)),
+          },
+          after: {
+            runs: [
+              runEntry(active, "TASK_STATE_CANCELED"),
+              runEntry(finished, "TASK_STATE_SUBMITTED"),
+            ].sort((a, b) => a.taskId.localeCompare(b.taskId)),
+          },
+        },
+        {
+          action: "agentRun.bulk_deleted",
+          before: {
+            runs: [
+              runEntry(active, "TASK_STATE_CANCELED"),
+              runEntry(finished, "TASK_STATE_SUBMITTED"),
+            ].sort((a, b) => a.taskId.localeCompare(b.taskId)),
+          },
+          after: { runs: [runEntry(active, "TASK_STATE_CANCELED")] },
+        },
+      ]),
+    );
+  });
+
+  test("deleting a finished run frees its saved files, and waits for files that are being suspended", async () => {
+    const remove = vi
+      .spyOn(agentRuntimeManager, "deleteWorkspace")
+      .mockResolvedValue(undefined);
+    vi.spyOn(agentRuntimeManager, "releaseRun").mockResolvedValue(undefined);
+    const idle = await createRun({
+      taskId: (await createTask(agent.id)).id,
+      actorUserId: user.id,
+    });
+    await AgentRunModel.close({ id: idle.id });
+    await createWorkspace({ run: idle, state: "suspended" });
+    const busy = await createRun({
+      taskId: (await createTask(agent.id)).id,
+      actorUserId: user.id,
+    });
+    await AgentRunModel.close({ id: busy.id });
+    await createWorkspace({ run: busy, state: "suspending" });
+
+    const deleted = await app.inject({
+      method: "DELETE",
+      url: `/api/agent-runs/${idle.taskId}`,
+    });
+    expect(deleted.statusCode).toBe(200);
+    expect(await A2ATaskModel.findById(idle.taskId)).toBeNull();
+    expect(
+      (await AgentWorkspaceModel.findByWorkloadName(idle.workloadName))?.state,
+    ).toBe("deleted");
+
+    // Deleting it now would leave its files until their retention deadline.
+    const refused = await app.inject({
+      method: "DELETE",
+      url: `/api/agent-runs/${busy.taskId}`,
+    });
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().error.message).toBe(
+      "This run's saved files are still being put away. Try deleting it again in a minute.",
+    );
+    expect(await A2ATaskModel.findById(busy.taskId)).not.toBeNull();
+    expect(remove).toHaveBeenCalledTimes(1);
+
+    const audits = await db
+      .select({
+        before: schema.auditLogsTable.before,
+        after: schema.auditLogsTable.after,
+      })
+      .from(schema.auditLogsTable)
+      .where(eq(schema.auditLogsTable.action, "agentRun.deleted"));
+    expect(audits).toContainEqual({
+      before: expect.objectContaining({
+        taskId: idle.taskId,
+        workspaceState: "suspended",
+      }),
+      after: { deleted: true, workspaceState: "deleted" },
+    });
+  });
+
+  test("a continued session is one run: listed once, deleted with every turn, acted on once per batch", async () => {
+    const remove = vi
+      .spyOn(agentRuntimeManager, "deleteWorkspace")
+      .mockResolvedValue(undefined);
+    vi.spyOn(agentRuntimeManager, "releaseRun").mockResolvedValue(undefined);
+    const first = await createRun({
+      taskId: (await createTask(agent.id)).id,
+      actorUserId: user.id,
+      title: "Review pull request",
+    });
+    await AgentRunModel.close({ id: first.id });
+    const second = await createRun({
+      taskId: (await createTask(agent.id)).id,
+      actorUserId: user.id,
+      title: "Review pull request",
+      workloadName: first.workloadName,
+    });
+    await AgentRunModel.close({ id: second.id });
+    const workspace = await createWorkspace({
+      run: { ...second, workloadName: first.workloadName },
+      state: "idle",
+    });
+
+    const listed = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agent.id}/runs`,
+    });
+    expect(
+      listed
+        .json()
+        .map((run: { taskId: string; sessionId: string }) => [
+          run.taskId,
+          run.sessionId,
+        ]),
+    ).toEqual([[second.taskId, workspace.id]]);
+
+    const response = await app.inject({
+      method: "DELETE",
+      url: "/api/agent-runs/bulk",
+      payload: { ids: [workspace.id, first.taskId, second.taskId] },
+    });
+    expect(response.json()).toEqual({
+      succeeded: [{ id: workspace.id, name: "Review pull request" }],
+      failed: [
+        { id: first.taskId, name: null, error: "Run not found" },
+        { id: second.taskId, name: null, error: "Run not found" },
+      ],
+    });
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(await A2ATaskModel.findById(first.taskId)).toBeNull();
+    expect(await A2ATaskModel.findById(second.taskId)).toBeNull();
+    expect(
+      (await AgentWorkspaceModel.findByWorkloadName(first.workloadName))?.state,
+    ).toBe("deleted");
+  });
+
+  test("a run whose saved files could not be deleted stays, so deleting it again finishes the job", async () => {
+    const remove = vi
+      .spyOn(agentRuntimeManager, "deleteWorkspace")
+      .mockRejectedValueOnce(new Error("volume API unavailable"))
+      .mockResolvedValue(undefined);
+    vi.spyOn(agentRuntimeManager, "releaseRun").mockResolvedValue(undefined);
+    const run = await createRun({
+      taskId: (await createTask(agent.id)).id,
+      actorUserId: user.id,
+    });
+    await AgentRunModel.close({ id: run.id });
+    await createWorkspace({ run, state: "suspended" });
+
+    const failed = await app.inject({
+      method: "DELETE",
+      url: `/api/agent-runs/${run.taskId}`,
+    });
+    expect(failed.statusCode).toBe(500);
+    expect(failed.json().error.message).toBe(
+      "Couldn't finish deleting this run's saved files. Try deleting it again.",
+    );
+    expect(await A2ATaskModel.findById(run.taskId)).not.toBeNull();
+    expect(
+      (await AgentWorkspaceModel.findByWorkloadName(run.workloadName))?.state,
+    ).toBe("deleting");
+
+    const retried = await app.inject({
+      method: "DELETE",
+      url: `/api/agent-runs/${run.taskId}`,
+    });
+    expect(retried.statusCode).toBe(200);
+    expect(remove).toHaveBeenCalledTimes(2);
+    expect(await A2ATaskModel.findById(run.taskId)).toBeNull();
+    expect(
+      (await AgentWorkspaceModel.findByWorkloadName(run.workloadName))?.state,
+    ).toBe("deleted");
+  });
+
+  test("bulk deletes saved files of the caller's finished runs, keeps their history, and audits the batch", async ({
+    makeAdmin,
+    makeMember,
+  }) => {
+    const remove = vi
+      .spyOn(agentRuntimeManager, "deleteWorkspace")
+      .mockResolvedValue(undefined);
+    vi.spyOn(agentRuntimeManager, "releaseRun").mockResolvedValue(undefined);
+    const saved = await createRun({
+      taskId: (await createTask(agent.id)).id,
+      actorUserId: user.id,
+      title: "Saved review",
+    });
+    await AgentRunModel.close({ id: saved.id, logs: "review transcript" });
+    await createWorkspace({ run: saved, state: "suspended" });
+    const noFiles = await createRun({
+      taskId: (await createTask(agent.id)).id,
+      actorUserId: user.id,
+      title: "Run without files",
+    });
+    await AgentRunModel.close({ id: noFiles.id });
+    const live = await createRun({
+      taskId: (await createTask(agent.id)).id,
+      actorUserId: user.id,
+      title: "Live review",
+    });
+    await createWorkspace({ run: live, state: "active", activeTaskId: true });
+    const gone = await createRun({
+      taskId: (await createTask(agent.id)).id,
+      actorUserId: user.id,
+      title: "Run with deleted files",
+    });
+    await AgentRunModel.close({ id: gone.id });
+    await createWorkspace({ run: gone, state: "deleted" });
+    const colleague = await makeAdmin();
+    await makeMember(colleague.id, organizationId, { role: "admin" });
+    const colleagueRun = await createRun({
+      taskId: (await createTask(agent.id)).id,
+      actorUserId: colleague.id,
+    });
+    await AgentRunModel.close({ id: colleagueRun.id });
+    await createWorkspace({
+      run: colleagueRun,
+      state: "suspended",
+      actorId: colleague.id,
+    });
+
+    const response = await app.inject({
+      method: "DELETE",
+      url: "/api/agent-runs/bulk/workspace",
+      payload: {
+        ids: [
+          saved.taskId,
+          noFiles.taskId,
+          live.taskId,
+          gone.taskId,
+          colleagueRun.taskId,
+        ],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      succeeded: [{ id: saved.taskId, name: "Saved review" }],
+      failed: [
+        {
+          id: noFiles.taskId,
+          name: "Run without files",
+          error: "This run has no saved files",
+        },
+        {
+          id: live.taskId,
+          name: "Live review",
+          error:
+            "Stop the active run and wait for its history to be saved before deleting its files",
+        },
+        {
+          id: gone.taskId,
+          name: "Run with deleted files",
+          error: "This run has no saved files",
+        },
+        { id: colleagueRun.taskId, name: null, error: "Run not found" },
+      ],
+    });
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(
+      (await AgentWorkspaceModel.findByWorkloadName(saved.workloadName))?.state,
+    ).toBe("deleted");
+    expect((await AgentRunModel.findByTaskId(saved.taskId))?.logs).toBe(
+      "review transcript",
+    );
+    expect(
+      (await AgentWorkspaceModel.findByWorkloadName(colleagueRun.workloadName))
+        ?.state,
+    ).toBe("suspended");
+
+    const [audit] = await db
+      .select({
+        before: schema.auditLogsTable.before,
+        after: schema.auditLogsTable.after,
+      })
+      .from(schema.auditLogsTable)
+      .where(eq(schema.auditLogsTable.action, "agentRun.bulk_files_deleted"));
+    const entry = (run: typeof saved, workspaceState: string | null) => ({
+      taskId: run.taskId,
+      title: run.title,
+      workspaceState,
+    });
+    const byTask = (a: { taskId: string }, b: { taskId: string }) =>
+      a.taskId.localeCompare(b.taskId);
+    expect(audit).toEqual({
+      before: {
+        runs: [
+          entry(saved, "suspended"),
+          entry(noFiles, null),
+          entry(live, "active"),
+          entry(gone, "deleted"),
+        ].sort(byTask),
+      },
+      after: {
+        runs: [
+          entry(saved, "deleted"),
+          entry(noFiles, null),
+          entry(live, "active"),
+          entry(gone, "deleted"),
+        ].sort(byTask),
+      },
+    });
+  });
+
+  test("preflight distinguishes missing personal credentials from missing shared configuration", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agent.id}/runtime/preflight`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      ready: false,
+      configured: [],
+      missing: [
+        expect.objectContaining({
+          key: "PERSONAL_TOKEN",
+          label: "Personal token",
+        }),
+      ],
+      misconfigured: [
+        expect.objectContaining({
+          key: "SHARED_TOKEN",
+          label: "Shared token",
+        }),
+      ],
+      incompatible: null,
+    });
+  });
+
+  test("tells a member who may not run with an organization credential, and still refuses the run", async ({
+    makeMember,
+    makeUser,
+  }) => {
+    const configured = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/runtime/credentials/SHARED_TOKEN`,
+      payload: { value: "shared-value" },
+    });
+    expect(configured.statusCode).toBe(200);
+
+    const member = await makeUser();
+    await makeMember(member.id, organizationId, { role: "member" });
+    user = member;
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agent.id}/runtime/preflight`,
+    });
+
+    // The setup check answers instead of failing, so the member's pages can
+    // say what is wrong rather than reporting a load error.
+    expect(response.statusCode).toBe(200);
+    expect(response.body).not.toContain("shared-value");
+    expect(response.json()).toEqual({
+      ready: false,
+      configured: [],
+      missing: [
+        expect.objectContaining({
+          key: "SHARED_TOKEN",
+          label: "Shared token",
+          canConnect: false,
+          adminOnly: true,
+        }),
+        expect.objectContaining({ key: "PERSONAL_TOKEN" }),
+      ],
+      misconfigured: [],
+      incompatible: null,
+    });
+    // Running with it is still refused.
+    const runtime = resolveAgentRuntime(agent);
+    assert(runtime);
+    await expect(
+      resolveAgentRuntimeCredentials({
+        runtime,
+        organizationId,
+        userId: member.id,
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  test("preflight flags an existing Gemini model on the maintained Codex runtime", async ({
+    makeAgent,
+    makeLlmProviderApiKey,
+    makeSecret,
+  }) => {
+    const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+    const providerKey = await makeLlmProviderApiKey(organizationId, secret.id, {
+      provider: "gemini",
+    });
+    const model = await ModelModel.create({
+      externalId: "gemini/runtime-preflight-test",
+      provider: "gemini",
+      modelId: "runtime-preflight-test",
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      supportsToolCalling: true,
+      lastSyncedAt: new Date(),
+    });
+    await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(providerKey.id, [
+      model.id,
+    ]);
+    if (!agent.runtime) throw new Error("Test Agent is missing Agent Runtime");
+    const incompatible = await makeAgent({
+      organizationId,
+      authorId: user.id,
+      agentType: "agent",
+      llmApiKeyId: providerKey.id,
+      modelId: model.id,
+      runtime: { ...agent.runtime, command: ["archestra-codex"] },
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agents/${incompatible.id}/runtime/preflight`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      ready: false,
+      incompatible: expect.stringContaining("Codex runtime requires an OpenAI"),
+    });
+  });
+
+  test("lets a reader manage their personal credential but not use a shared one", async ({
+    makeMember,
+    makeUser,
+  }) => {
+    const member = await makeUser();
+    await makeMember(member.id, organizationId, { role: "member" });
+    user = member;
+
+    const personal = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/runtime/credentials/PERSONAL_TOKEN`,
+      payload: { value: "personal-value" },
+    });
+    const shared = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/runtime/credentials/SHARED_TOKEN`,
+      payload: { value: "shared-value" },
+    });
+
+    expect(personal.statusCode).toBe(200);
+    expect(shared.statusCode).toBe(403);
+    const preflight = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agent.id}/runtime/preflight`,
+    });
+    expect(preflight.statusCode).toBe(200);
+    expect(preflight.json()).toMatchObject({
+      ready: false,
+      configured: ["PERSONAL_TOKEN"],
+      missing: [{ key: "SHARED_TOKEN", adminOnly: true, canConnect: false }],
+    });
+  });
+
+  test("refuses a personal value for a credential the caller may not use", async ({
+    makeMember,
+    makeUser,
+  }) => {
+    // Keep the saved credential behind PERSONAL_TOKEN from members: no
+    // grant on it reaches them, so neither does storing a value of it.
+    const definition = await RuntimeCredentialDefinitionModel.find({
+      organizationId,
+      key: "github",
+    });
+    assert(definition);
+    const scope = {
+      organizationId,
+      resource: "credential" as const,
+      scope: definition.id,
+    };
+    const policy = await ResourcePermissionPolicyModel.find(scope);
+    await ResourcePermissionPolicyModel.replace({
+      ...scope,
+      revision: policy?.revision ?? 0,
+      grants: [],
+    });
+    const member = await makeUser();
+    await makeMember(member.id, organizationId, { role: "member" });
+    user = member;
+
+    const refused = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/runtime/credentials/PERSONAL_TOKEN`,
+      payload: { value: "personal-value" },
+    });
+
+    expect(refused.statusCode).toBe(403);
+    expect(refused.json().error.message).toBe(
+      'You don\'t have access to the "Personal token" credential. Ask an admin to share it with you.',
+    );
+    const rows = await db
+      .select({ userId: schema.runtimeCredentialConnectionsTable.userId })
+      .from(schema.runtimeCredentialConnectionsTable)
+      .where(eq(schema.runtimeCredentialConnectionsTable.userId, member.id));
+    expect(rows).toEqual([]);
+  });
+
+  test("reuses a typed personal connection across Agents without copying its value", async ({
+    makeAgent,
+  }) => {
+    if (!agent.runtime) {
+      throw new Error("Test Agent is missing Agent Runtime");
+    }
+    const otherAgent = await makeAgent({
+      organizationId,
+      authorId: user.id,
+      agentType: "agent",
+      runtime: {
+        ...agent.runtime,
+        credentials: [
+          {
+            key: "GH_TOKEN",
+            credentialId: "github",
+            scope: "per_user",
+            label: "Git hosting connection",
+            required: true,
+          },
+        ],
+      },
+    });
+
+    const connected = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/runtime/credentials/PERSONAL_TOKEN`,
+      payload: { value: "one-personal-value" },
+    });
+    expect(connected.statusCode).toBe(200);
+
+    const otherPreflight = await app.inject({
+      method: "GET",
+      url: `/api/agents/${otherAgent.id}/runtime/preflight`,
+    });
+    expect(otherPreflight.statusCode).toBe(200);
+    expect(otherPreflight.json()).toMatchObject({
+      ready: true,
+      configured: ["GH_TOKEN"],
+      missing: [],
+    });
+
+    const rows = await db
+      .select({
+        credentialId: schema.runtimeCredentialConnectionsTable.credentialId,
+        userId: schema.runtimeCredentialConnectionsTable.userId,
+      })
+      .from(schema.runtimeCredentialConnectionsTable);
+    expect(rows).toEqual([{ credentialId: "github", userId: user.id }]);
+  });
+
+  test("audits shared credential rotation without recording the secret value", async () => {
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/agents/${agent.id}/runtime/credentials/SHARED_TOKEN`,
+      payload: { value: "never-log-this-value" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const [audit] = await db
+      .select({
+        action: schema.auditLogsTable.action,
+        resourceId: schema.auditLogsTable.resourceId,
+        before: schema.auditLogsTable.before,
+        after: schema.auditLogsTable.after,
+      })
+      .from(schema.auditLogsTable)
+      .where(
+        and(
+          eq(schema.auditLogsTable.action, "agent.updated"),
+          eq(schema.auditLogsTable.resourceId, agent.id),
+        ),
+      );
+    expect(audit).toMatchObject({
+      action: "agent.updated",
+      resourceId: agent.id,
+      before: expect.any(Object),
+      after: expect.any(Object),
+    });
+    expect(JSON.stringify(audit)).toContain('"credentialId":"shared-token"');
+    expect(JSON.stringify(audit)).not.toContain("never-log-this-value");
+    expect(audit.before).not.toEqual(audit.after);
+  });
+
+  test("reports the initiating user as the owner viewer of their run", async () => {
+    const task = await createTask(agent.id);
+    await createRun({ taskId: task.id, actorUserId: user.id });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agent-runs/${task.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(
+      expect.objectContaining({
+        taskId: task.id,
+        viewerRole: "owner",
+        startupProgress: {
+          phase: "scheduling",
+          message: "Waiting for a node with room for this run",
+          detail: "No eligible node is currently available",
+          resourceName: "agent-run-example",
+        },
+      }),
+    );
+    expect(agentRuntimeManager.getStartupProgress).toHaveBeenCalledWith(
+      expect.objectContaining({ taskId: task.id }),
+    );
+    expect(response.json().portForwardCommand).toBeNull();
+  });
+
+  test("offers configured ports for the active workspace pod", async ({
+    makeAgent,
+  }) => {
+    assert(agent.runtime);
+    agent = await makeAgent({
+      organizationId,
+      authorId: user.id,
+      agentType: "agent",
+      runtime: { ...agent.runtime, ports: [3000, 3000, 9000] },
+    });
+    const task = await createTask(agent.id);
+    const run = await createRun({ taskId: task.id, actorUserId: user.id });
+    await AgentWorkspaceModel.create({
+      organizationId,
+      agentId: agent.id,
+      actorKind: "user",
+      actorId: user.id,
+      backend: "kubernetes",
+      runtimeScope: run.runtimeScope,
+      workloadName: run.workloadName,
+      state: "active",
+      lastTaskId: task.id,
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+    vi.spyOn(agentRuntimeManager, "getWorkspaceConnection").mockResolvedValue({
+      hostname: "active-pod.archestra-dev",
+      shellCommand: "kubectl exec active-pod",
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agent-runs/${task.id}`,
+    });
+
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json().portForwardCommand).toBe(
+      "kubectl port-forward -n archestra-dev pod/active-pod :3000 :9000",
+    );
+  });
+
+  test("project wildcard access and read-all do not reveal private runs", async ({
+    makeUser,
+    makeMember,
+    makeCustomRole,
+  }) => {
+    const owner = user;
+    const project = await projectService.create({
+      organizationId,
+      userId: owner.id,
+      name: "Private runtime project",
+      description: null,
+    });
+    const task = await createTask(agent.id);
+    await createRun({
+      taskId: task.id,
+      actorUserId: owner.id,
+      projectId: project.id,
+    });
+    const role = await makeCustomRole(organizationId, {
+      permission: { project: ["read"] },
+    });
+    // `read` on every chat, the grant the retired project:read-all became.
+    await grantRoleEverywhere({
+      organizationId: organizationId,
+      resource: "conversation",
+      roleId: role.id,
+      actions: ["read"],
+    });
+    const reader = await makeUser();
+    await makeMember(reader.id, organizationId, { role: role.role });
+    const key = { organizationId, resource: "project" as const, scope: "*" };
+    const wildcard = await ResourcePermissionPolicyModel.find(key);
+    await ResourcePermissionPolicyModel.replace({
+      ...key,
+      revision: wildcard?.revision ?? 0,
+      grants: [{ subject: { type: "user", id: reader.id }, actions: ["read"] }],
+    });
+    user = reader;
+    expect(
+      (await app.inject({ method: "GET", url: `/api/agent-runs/${task.id}` }))
+        .statusCode,
+    ).toBe(404);
+    expect(
+      await projectService.listExecutions({
+        id: project.id,
+        organizationId,
+        userId: reader.id,
+      }),
+    ).toEqual([]);
+    const directKey = { ...key, scope: project.id };
+    const direct = await ResourcePermissionPolicyModel.find(directKey);
+    const shared = await ResourcePermissionPolicyModel.replace({
+      ...directKey,
+      revision: direct?.revision ?? 0,
+      grants: [{ subject: { type: "user", id: reader.id }, actions: ["read"] }],
+    });
+    expect(
+      (await app.inject({ method: "GET", url: `/api/agent-runs/${task.id}` }))
+        .statusCode,
+    ).toBe(200);
+    expect(
+      await projectService.listExecutions({
+        id: project.id,
+        organizationId,
+        userId: reader.id,
+      }),
+    ).toHaveLength(1);
+    await ResourcePermissionPolicyModel.replace({
+      ...directKey,
+      revision: shared?.revision ?? 0,
+      grants: [],
+    });
+    expect(
+      (await app.inject({ method: "GET", url: `/api/agent-runs/${task.id}` }))
+        .statusCode,
+    ).toBe(404);
+    expect(
+      await projectService.listExecutions({
+        id: project.id,
+        organizationId,
+        userId: reader.id,
+      }),
+    ).toEqual([]);
+  });
+
+  test("opens a run read-only through a shared project for a read-all member", async ({
+    makeUser,
+    makeMember,
+    makeCustomRole,
+  }) => {
+    const project = await projectService.create({
+      organizationId,
+      userId: user.id,
+      name: "Shared project run",
+      description: null,
+    });
+    await ResourcePermissions.updatePolicy({
+      organizationId,
+      userId: user.id,
+      resource: "project",
+      scope: project.id,
+      revision: 1,
+      grants: [
+        { subject: { type: "organization", id: "*" }, actions: ["read"] },
+      ],
+    });
+    const task = await createTask(agent.id);
+    await createRun({
+      taskId: task.id,
+      actorUserId: user.id,
+      projectId: project.id,
+    });
+
+    const role = await makeCustomRole(organizationId, {
+      permission: { project: ["read"] },
+    });
+    // `read` on every chat, the grant the retired project:read-all became.
+    await grantRoleEverywhere({
+      organizationId: organizationId,
+      resource: "conversation",
+      roleId: role.id,
+      actions: ["read"],
+    });
+    const reader = await makeUser();
+    await makeMember(reader.id, organizationId, { role: role.role });
+    user = reader;
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/agent-runs/${task.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(
+      expect.objectContaining({
+        taskId: task.id,
+        projectId: project.id,
+        viewerRole: "shared",
+        startupProgress: null,
+      }),
+    );
+    expect(agentRuntimeManager.getStartupProgress).not.toHaveBeenCalled();
+  });
+
+  test("opens an organization-shared run read-only for a colleague and 404s without a share", async ({
+    makeAdmin,
+    makeMember,
+  }) => {
+    const task = await createTask(agent.id);
+    await createRun({ taskId: task.id, actorUserId: user.id });
+    const _owner = user;
+
+    const colleague = await makeAdmin();
+    await makeMember(colleague.id, organizationId, { role: "member" });
+
+    // No share yet: a colleague cannot open someone else's run.
+    user = colleague;
+    const beforeShare = await app.inject({
+      method: "GET",
+      url: `/api/agent-runs/${task.id}`,
+    });
+    expect(beforeShare.statusCode).toBe(404);
+
+    // The owner shares it organization-wide.
+    await shareForTest({
+      resource: "agentRun",
+      scope: task.id,
+      organizationId,
+      visibility: "organization",
+    });
+
+    // The colleague now gets a read-only view flagged as shared.
+    user = colleague;
+    const afterShare = await app.inject({
+      method: "GET",
+      url: `/api/agent-runs/${task.id}`,
+    });
+    expect(afterShare.statusCode).toBe(200);
+    expect(afterShare.json()).toEqual(
+      expect.objectContaining({ taskId: task.id, viewerRole: "shared" }),
+    );
+  });
+
+  test("limits a team share to members of the shared team", async ({
+    makeAdmin,
+    makeMember,
+    makeTeam,
+    makeTeamMember,
+  }) => {
+    const task = await createTask(agent.id);
+    await createRun({ taskId: task.id, actorUserId: user.id });
+    const owner = user;
+
+    const team = await makeTeam(organizationId, owner.id);
+    const teamMember = await makeAdmin();
+    await makeMember(teamMember.id, organizationId, { role: "member" });
+    await makeTeamMember(team.id, teamMember.id);
+    const outsider = await makeAdmin();
+    await makeMember(outsider.id, organizationId, { role: "member" });
+
+    await shareForTest({
+      resource: "agentRun",
+      scope: task.id,
+      organizationId,
+      visibility: "team",
+      teamIds: [team.id],
+    });
+
+    user = teamMember;
+    const memberView = await app.inject({
+      method: "GET",
+      url: `/api/agent-runs/${task.id}`,
+    });
+    expect(memberView.statusCode).toBe(200);
+    expect(memberView.json()).toEqual(
+      expect.objectContaining({ viewerRole: "shared" }),
+    );
+
+    user = outsider;
+    const outsiderView = await app.inject({
+      method: "GET",
+      url: `/api/agent-runs/${task.id}`,
+    });
+    expect(outsiderView.statusCode).toBe(404);
+  });
+
+  test("limits a user share to the named recipients", async ({
+    makeAdmin,
+    makeMember,
+  }) => {
+    const task = await createTask(agent.id);
+    await createRun({ taskId: task.id, actorUserId: user.id });
+
+    const invited = await makeAdmin();
+    await makeMember(invited.id, organizationId, { role: "member" });
+    const uninvited = await makeAdmin();
+    await makeMember(uninvited.id, organizationId, { role: "member" });
+
+    await shareForTest({
+      resource: "agentRun",
+      scope: task.id,
+      organizationId,
+      visibility: "user",
+      userIds: [invited.id],
+    });
+
+    user = invited;
+    const invitedView = await app.inject({
+      method: "GET",
+      url: `/api/agent-runs/${task.id}`,
+    });
+    expect(invitedView.statusCode).toBe(200);
+
+    user = uninvited;
+    const uninvitedView = await app.inject({
+      method: "GET",
+      url: `/api/agent-runs/${task.id}`,
+    });
+    expect(uninvitedView.statusCode).toBe(404);
+  });
+
+  test("session grants unlock output without lending the owner's terminal or continuation", async ({
+    makeUser,
+    makeMember,
+  }) => {
+    const owner = user;
+    const reader = await makeUser();
+    await makeMember(reader.id, organizationId);
+    const task = await createTask(agent.id);
+    await createRun({ taskId: task.id, actorUserId: owner.id });
+    await ResourcePermissions.updatePolicy({
+      organizationId,
+      userId: owner.id,
+      resource: "agentRun",
+      scope: task.id,
+      // Creating the run wrote its owner's policy at revision 1.
+      revision: 1,
+      grants: [
+        {
+          subject: { type: "user", id: owner.id },
+          actions: ["read", "manage-permissions"],
+        },
+        {
+          subject: { type: "user", id: reader.id },
+          actions: ["read", "manage-permissions"],
+        },
+      ],
+    });
+    user = reader;
+    const view = await app.inject({
+      method: "GET",
+      url: `/api/agent-runs/${task.id}`,
+    });
+    expect(view.statusCode, view.body).toBe(200);
+    expect(view.json().viewerRole).toBe("shared");
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/agent-runs/${task.id}/continue`,
+          payload: { message: "continue" },
+        })
+      ).statusCode,
+    ).toBe(404);
+    expect(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: `/api/agent-runs/${task.id}`,
+        })
+      ).statusCode,
+    ).toBe(404);
+    user = owner;
+    await ResourcePermissions.updatePolicy({
+      organizationId,
+      userId: owner.id,
+      resource: "agentRun",
+      scope: task.id,
+      revision: 2,
+      grants: [
+        {
+          subject: { type: "user", id: owner.id },
+          actions: ["read", "manage-permissions"],
+        },
+      ],
+    });
+    user = reader;
+    expect(
+      (await app.inject({ method: "GET", url: `/api/agent-runs/${task.id}` }))
+        .statusCode,
+    ).toBe(404);
+  });
+
+  test("revoking a share takes a colleague's access away again", async ({
+    makeAdmin,
+    makeMember,
+  }) => {
+    const task = await createTask(agent.id);
+    await createRun({ taskId: task.id, actorUserId: user.id });
+    await shareForTest({
+      resource: "agentRun",
+      scope: task.id,
+      organizationId,
+      visibility: "organization",
+    });
+    const colleague = await makeAdmin();
+    await makeMember(colleague.id, organizationId, { role: "member" });
+    user = colleague;
+    const shared = await app.inject({
+      method: "GET",
+      url: `/api/agent-runs/${task.id}`,
+    });
+    expect(shared.statusCode).toBe(200);
+
+    await shareForTest({
+      resource: "agentRun",
+      scope: task.id,
+      organizationId,
+      visibility: null,
+    });
+    const afterRevoke = await app.inject({
+      method: "GET",
+      url: `/api/agent-runs/${task.id}`,
+    });
+    expect(afterRevoke.statusCode).toBe(404);
+  });
+
+  test("continues only an owned retained workspace and audits the new turn", async ({
+    makeAdmin,
+  }) => {
+    const task = await createTask(agent.id);
+    const run = await createRun({ taskId: task.id, actorUserId: user.id });
+    await AgentRunModel.close({ id: run.id });
+    const workspace = await AgentWorkspaceModel.create({
+      organizationId,
+      agentId: agent.id,
+      actorKind: "user",
+      actorId: user.id,
+      backend: "kubernetes",
+      runtimeScope: run.runtimeScope,
+      workloadName: run.workloadName,
+      state: "idle",
+      lastTaskId: task.id,
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+    const next = await createTask(agent.id);
+    vi.mocked(startDetachedAgentTask).mockResolvedValue(next);
+    const attachments = [
+      {
+        name: "follow-up.txt",
+        contentType: "text/plain",
+        contentBase64: Buffer.from("follow-up input").toString("base64"),
+      },
+    ];
+    const invalid = await app.inject({
+      method: "POST",
+      url: `/api/agent-runs/${task.id}/continue`,
+      payload: {
+        message: "Read this",
+        attachments: [{ ...attachments[0], contentBase64: "invalid" }],
+      },
+    });
+    expect(invalid.statusCode).toBe(400);
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/agent-runs/${task.id}/continue`,
+      payload: { message: "Check the saved change", attachments },
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json().taskId).toBe(next.id);
+    expect(startDetachedAgentTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        attachments,
+        systemParams: expect.objectContaining({
+          runtimeMode: "interactive",
+          resumeFromTaskId: task.id,
+        }),
+      }),
+    );
+    const audits = await db
+      .select()
+      .from(schema.auditLogsTable)
+      .where(
+        and(
+          eq(schema.auditLogsTable.resourceId, next.id),
+          eq(schema.auditLogsTable.action, "agentRun.created"),
+        ),
+      );
+    expect(audits[0]).toMatchObject({
+      before: { taskId: task.id },
+      after: { taskId: next.id, previousTaskId: task.id, attachmentCount: 1 },
+    });
+    const resume = await app.inject({
+      method: "POST",
+      url: `/api/agent-runs/${task.id}/continue`,
+      payload: {},
+    });
+    expect(resume.statusCode, resume.body).toBe(200);
+    expect(resume.json().prompt).toBe("");
+    expect(startDetachedAgentTask).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        message: "",
+        systemParams: expect.objectContaining({
+          runtimeMode: "interactive",
+          resumeFromTaskId: task.id,
+        }),
+      }),
+    );
+    await AgentWorkspaceModel.transition({
+      id: workspace.id,
+      from: "idle",
+      to: "deleted",
+    });
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/agent-runs/${task.id}/continue`,
+          payload: { message: "Try again" },
+        })
+      ).statusCode,
+    ).toBe(409);
+    user = await makeAdmin();
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/agent-runs/${task.id}/continue`,
+          payload: { message: "Try again" },
+        })
+      ).statusCode,
+    ).toBe(404);
+  });
+
+  test("workspace files use owner-only access and audit writes without content", async ({
+    makeAdmin,
+  }) => {
+    const task = await createTask(agent.id);
+    const run = await createRun({ taskId: task.id, actorUserId: user.id });
+    await AgentWorkspaceModel.create({
+      organizationId,
+      agentId: agent.id,
+      actorKind: "user",
+      actorId: user.id,
+      backend: "kubernetes",
+      runtimeScope: run.runtimeScope,
+      workloadName: run.workloadName,
+      state: "idle",
+      lastTaskId: task.id,
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+    const fileAccess = vi
+      .spyOn(agentRuntimeManager, "accessWorkspaceFile")
+      .mockResolvedValue({ path: "notes.txt", size: 5, sha256: "test-digest" });
+    const payload = {
+      path: "notes.txt",
+      content_base64: Buffer.from("hello").toString("base64"),
+    };
+    for (const path of ["../outside", "/absolute", "nested/../outside"]) {
+      const read = await app.inject({
+        method: "GET",
+        url: `/api/agent-runs/${task.id}/workspace/files?path=${encodeURIComponent(path)}`,
+      });
+      expect(read.statusCode, read.body).toBe(400);
+      const write = await app.inject({
+        method: "PUT",
+        url: `/api/agent-runs/${task.id}/workspace/files`,
+        payload: { ...payload, path },
+      });
+      expect(write.statusCode, write.body).toBe(400);
+    }
+    expect(fileAccess).not.toHaveBeenCalled();
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/agent-runs/${task.id}/workspace/files`,
+      payload,
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json()).toMatchObject({ path: "notes.txt", size: 5 });
+    const audits = await db
+      .select()
+      .from(schema.auditLogsTable)
+      .where(eq(schema.auditLogsTable.resourceId, task.id));
+    expect(audits).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: "agentRun.updated",
+          before: { workspaceFile: { path: "notes.txt", writeApplied: false } },
+          after: {
+            workspaceFile: {
+              path: "notes.txt",
+              writeApplied: true,
+              size: 5,
+              sha256: "test-digest",
+            },
+          },
+        }),
+      ]),
+    );
+    expect(JSON.stringify(audits)).not.toContain(payload.content_base64);
+    user = await makeAdmin();
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/agent-runs/${task.id}/workspace/files?path=notes.txt`,
+        })
+      ).statusCode,
+    ).toBe(404);
+    expect(
+      (
+        await app.inject({
+          method: "PUT",
+          url: `/api/agent-runs/${task.id}/workspace/files`,
+          payload,
+        })
+      ).statusCode,
+    ).toBe(404);
+    expect(fileAccess).toHaveBeenCalledTimes(1);
+  });
+
+  test("an attachments transfer lands beside the run's inputs, not in its workspace", async () => {
+    const task = await createTask(agent.id);
+    const run = await createRun({ taskId: task.id, actorUserId: user.id });
+    await AgentWorkspaceModel.create({
+      organizationId,
+      agentId: agent.id,
+      actorKind: "user",
+      actorId: user.id,
+      backend: "kubernetes",
+      runtimeScope: run.runtimeScope,
+      workloadName: run.workloadName,
+      state: "idle",
+      lastTaskId: task.id,
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+    const bytes = Buffer.from("png");
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const helper = vi
+      .spyOn(agentRuntimeManager, "runWorkspaceTransferCommand")
+      .mockImplementation(async ({ args, stdin }) => {
+        const [, , command, ...rest] = args;
+        if (command === "stat")
+          return { ok: true, path: rest[0], present: false };
+        if (command === "write-stream") {
+          const received: Buffer[] = [];
+          for await (const chunk of stdin ?? []) received.push(chunk);
+          const stored = Buffer.concat(received);
+          return {
+            ok: true,
+            upload_id: rest[0],
+            size: stored.length,
+            sha256: createHash("sha256").update(stored).digest("hex"),
+          };
+        }
+        if (command === "discard") return { ok: true, discarded: rest[0] };
+        return { ok: true, path: rest[1], size: bytes.length, sha256 };
+      });
+    const mint = (size: number) =>
+      app.inject({
+        method: "POST",
+        url: `/api/agent-runs/${task.id}/workspace/transfers`,
+        payload: {
+          direction: "upload",
+          location: "attachments",
+          path: "screen shot.png",
+          size,
+          sha256,
+        },
+      });
+
+    const started = await mint(bytes.length);
+    expect(started.statusCode, started.body).toBe(200);
+    const { path, token, contentUrl } = started.json();
+    const root = `/var/run/archestra/attachments/${task.id}`;
+    expect(path).toMatch(new RegExp(`^${root}/[0-9a-f]{8}-screen shot\\.png$`));
+
+    const uploaded = await app.inject({
+      method: "PUT",
+      url: contentUrl,
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/octet-stream",
+      },
+      payload: bytes,
+    });
+    expect(uploaded.statusCode, uploaded.body).toBe(200);
+    expect(uploaded.json()).toMatchObject({ path });
+    // Every helper call is confined to the attachments root.
+    expect(helper).toHaveBeenCalledTimes(3);
+    for (const [{ args }] of helper.mock.calls) {
+      expect(args.slice(0, 2)).toEqual(["--root", root]);
+    }
+
+    // Oversized files are refused before the workspace is touched, and a body
+    // larger than its ticket stops at the declared size.
+    expect(
+      (await mint(config.chat.attachmentStorageBytesLimit + 1)).statusCode,
+    ).toBe(413);
+    expect(helper).toHaveBeenCalledTimes(3);
+    const lying = (await mint(bytes.length)).json();
+    const overflow = await app.inject({
+      method: "PUT",
+      url: lying.contentUrl,
+      headers: {
+        authorization: `Bearer ${lying.token}`,
+        "content-type": "application/octet-stream",
+      },
+      payload: Buffer.alloc(64 * 1024, 1),
+    });
+    expect(overflow.statusCode, overflow.body).toBe(413);
+    expect(helper.mock.calls.map(([{ args }]) => args[2])).toEqual([
+      "stat",
+      "write-stream",
+      "finalize",
+      "stat",
+      "write-stream",
+      "discard",
+    ]);
+  });
+
+  test("reports a retained terminal from the reconciler's probe until the CLI exits", async () => {
+    const task = await createTask(agent.id);
+    const run = await createRun({ taskId: task.id, actorUserId: user.id });
+    await AgentRunModel.close({ id: run.id });
+    await AgentWorkspaceModel.create({
+      organizationId,
+      agentId: agent.id,
+      actorKind: "user",
+      actorId: user.id,
+      backend: "kubernetes",
+      runtimeScope: run.runtimeScope,
+      workloadName: run.workloadName,
+      state: "idle",
+      lastTaskId: task.id,
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+    const retained = vi
+      .spyOn(agentRuntimeManager, "hasRetainedTerminal")
+      .mockResolvedValue(true);
+    vi.spyOn(agentRuntimeManager, "refreshCredentials").mockResolvedValue();
+    const listed = async () =>
+      (await app.inject({ method: "GET", url: "/api/agent-runs" }))
+        .json()
+        .data.find((row: { taskId: string }) => row.taskId === task.id)
+        .terminalRetained as boolean;
+    const detail = async () =>
+      (
+        await app.inject({ method: "GET", url: `/api/agent-runs/${task.id}` })
+      ).json().terminalRetained as boolean;
+
+    expect(await listed()).toBe(false);
+    await agentRunReconciler.reconcile();
+    expect(await listed()).toBe(true);
+    expect(await detail()).toBe(true);
+
+    retained.mockResolvedValue(false);
+    expect(await detail()).toBe(false);
+    expect(await listed()).toBe(false);
+  });
+
+  test("workspace deletion is owner-only, retries failures, preserves transcripts, and audits the state change", async ({
+    makeAdmin,
+  }) => {
+    const task = await createTask(agent.id);
+    const run = await createRun({ taskId: task.id, actorUserId: user.id });
+    await AgentRunModel.close({ id: run.id, logs: "retained transcript" });
+    await AgentWorkspaceModel.create({
+      organizationId,
+      agentId: agent.id,
+      actorKind: "user",
+      actorId: user.id,
+      backend: "kubernetes",
+      runtimeScope: run.runtimeScope,
+      workloadName: run.workloadName,
+      state: "suspended",
+      lastTaskId: task.id,
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+    const remove = vi
+      .spyOn(agentRuntimeManager, "deleteWorkspace")
+      .mockRejectedValueOnce(new Error("temporary cluster failure"))
+      .mockResolvedValue(undefined);
+    vi.spyOn(agentRuntimeManager, "releaseRun").mockResolvedValue(undefined);
+    const owner = user;
+    user = await makeAdmin();
+    const url = `/api/agent-runs/${task.id}/workspace`;
+    expect((await app.inject({ method: "DELETE", url })).statusCode).toBe(404);
+    expect(remove).not.toHaveBeenCalled();
+    user = owner;
+    const failedDeletion = await app.inject({ method: "DELETE", url });
+    expect(failedDeletion.statusCode).toBe(500);
+    expect(failedDeletion.json().error.message).toContain(
+      "you can also retry this request",
+    );
+    expect(
+      (await AgentWorkspaceModel.findByWorkloadName(run.workloadName))?.state,
+    ).toBe("deleting");
+    expect((await app.inject({ method: "DELETE", url })).json()).toEqual({
+      state: "deleted",
+    });
+    expect((await AgentRunModel.findByTaskId(task.id))?.logs).toBe(
+      "retained transcript",
+    );
+    expect((await app.inject({ method: "DELETE", url })).statusCode).toBe(200);
+    expect(remove).toHaveBeenCalledTimes(2);
+    const audits = await db
+      .select()
+      .from(schema.auditLogsTable)
+      .where(
+        and(
+          eq(schema.auditLogsTable.resourceId, task.id),
+          eq(schema.auditLogsTable.action, "agentRun.updated"),
+        ),
+      );
+    expect(audits).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          before: { workspaceState: "deleting" },
+          after: { workspaceState: "deleted" },
+        }),
+      ]),
+    );
+  });
+
+  test("an old run cannot delete a workspace claimed by a newer turn", async () => {
+    const task = await createTask(agent.id);
+    const run = await createRun({ taskId: task.id, actorUserId: user.id });
+    await AgentRunModel.close({ id: run.id });
+    const next = await createTask(agent.id);
+    await AgentWorkspaceModel.create({
+      organizationId,
+      agentId: agent.id,
+      actorKind: "user",
+      actorId: user.id,
+      backend: "kubernetes",
+      runtimeScope: run.runtimeScope,
+      workloadName: run.workloadName,
+      state: "active",
+      activeTaskId: next.id,
+      lastTaskId: next.id,
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+    const remove = vi
+      .spyOn(agentRuntimeManager, "deleteWorkspace")
+      .mockResolvedValue(undefined);
+    expect(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: `/api/agent-runs/${task.id}/workspace`,
+        })
+      ).statusCode,
+    ).toBe(409);
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  test("service accounts read, update, cancel and delete only their own run workspace", async ({
+    makeServiceAccount,
+  }) => {
+    const account = await makeServiceAccount(organizationId);
+    const other = await makeServiceAccount(organizationId);
+    const task = await A2ATaskModel.create({
+      contextId: (
+        await A2AContextModel.create({
+          actorKind: "serviceAccount",
+          actorId: account.id,
+        })
+      ).id,
+      agentId: agent.id,
+      state: "TASK_STATE_SUBMITTED",
+    });
+    const run = await AgentRunModel.create({
+      organizationId,
+      taskId: task.id,
+      agentId: agent.id,
+      actorKind: "serviceAccount",
+      actorId: account.id,
+      actorUserId: null,
+      workloadName: `agent-run-${task.id}`,
+      backend: "kubernetes",
+      runtimeScope: "archestra-dev",
+    });
+    const workspace = await AgentWorkspaceModel.create({
+      organizationId,
+      agentId: agent.id,
+      actorKind: "serviceAccount",
+      actorId: account.id,
+      backend: "kubernetes",
+      runtimeScope: run.runtimeScope,
+      workloadName: run.workloadName,
+      state: "suspended",
+      lastTaskId: task.id,
+      expiresAt: new Date(Date.now() + 3600000),
+    });
+    const human = user;
+    user = { ...human, id: serviceAccountUserId(other.id) };
+    for (const [method, suffix, payload] of [
+      ["GET", "", undefined],
+      ["PATCH", "", { title: "forbidden" }],
+      ["POST", "/cancel", undefined],
+      ["DELETE", "/workspace", undefined],
+    ] as const) {
+      const denied = await app.inject({
+        method,
+        url: `/api/agent-runs/${task.id}${suffix}`,
+        payload,
+      });
+      expect(denied.statusCode, denied.body).toBe(404);
+    }
+    user = { ...human, id: serviceAccountUserId(account.id) };
+    const listed = await app.inject({ method: "GET", url: "/api/agent-runs" });
+    expect(listed.statusCode, listed.body).toBe(200);
+    expect(
+      listed.json().data.map((row: { taskId: string }) => row.taskId),
+    ).toContain(task.id);
+    const read = await app.inject({
+      method: "GET",
+      url: `/api/agent-runs/${task.id}`,
+    });
+    expect(read.statusCode, read.body).toBe(200);
+    const renamed = await app.inject({
+      method: "PATCH",
+      url: `/api/agent-runs/${task.id}`,
+      payload: { title: "worker run" },
+    });
+    expect(renamed.statusCode, renamed.body).toBe(200);
+    expect((await AgentRunModel.findByTaskId(task.id))?.title).toBe(
+      "worker run",
+    );
+    vi.mocked(cancelDetachedAgentTask).mockResolvedValue({
+      id: task.id,
+      contextId: task.contextId,
+      status: { state: "TASK_STATE_CANCELED" },
+    });
+    const canceled = await app.inject({
+      method: "POST",
+      url: `/api/agent-runs/${task.id}/cancel`,
+    });
+    expect(canceled.statusCode, canceled.body).toBe(200);
+    expect(cancelDetachedAgentTask).toHaveBeenCalledWith({
+      actor: { kind: "serviceAccount", id: account.id, organizationId },
+      agentId: agent.id,
+      taskId: task.id,
+    });
+    await AgentRunModel.close({ id: run.id, logs: "retained transcript" });
+    vi.spyOn(agentRuntimeManager, "deleteWorkspace").mockResolvedValue(
+      undefined,
+    );
+    vi.spyOn(agentRuntimeManager, "releaseRun").mockResolvedValue(undefined);
+    const removed = await app.inject({
+      method: "DELETE",
+      url: `/api/agent-runs/${task.id}/workspace`,
+    });
+    expect(removed.statusCode, removed.body).toBe(200);
+    expect((await AgentWorkspaceModel.findById(workspace.id))?.state).toBe(
+      "deleted",
+    );
+    expect((await AgentRunModel.findByTaskId(task.id))?.logs).toBe(
+      "retained transcript",
+    );
+  });
+  test("names service-account runs and exposes terminal access only to their account managers", async ({
+    makeServiceAccount,
+    makeCustomRole,
+  }) => {
+    const account = await makeServiceAccount(organizationId, {
+      name: "Build automation",
+    });
+    const task = await A2ATaskModel.create({
+      contextId: (
+        await A2AContextModel.create({
+          actorKind: "serviceAccount",
+          actorId: account.id,
+        })
+      ).id,
+      agentId: agent.id,
+      state: "TASK_STATE_WORKING",
+    });
+    await AgentRunModel.create({
+      organizationId,
+      taskId: task.id,
+      agentId: agent.id,
+      actorKind: "serviceAccount",
+      actorId: account.id,
+      actorUserId: null,
+      workloadName: `agent-run-${task.id}`,
+      backend: "kubernetes",
+      runtimeScope: "archestra-dev",
+    });
+    const role = await makeCustomRole(organizationId, { permission: {} });
+    await MemberModel.updateRole(user.id, organizationId, role.role);
+    const agentKey = {
+      organizationId,
+      resource: "agent" as const,
+      scope: agent.id,
+    };
+    const policy = await ResourcePermissionPolicyModel.find(agentKey);
+    await ResourcePermissionPolicyModel.replace({
+      ...agentKey,
+      revision: policy?.revision ?? 0,
+      grants: [
+        { subject: { type: "user", id: user.id }, actions: ["read", "use"] },
+      ],
+    });
+    const list = () => app.inject({ url: `/api/agents/${agent.id}/runs` });
+    const before = await list();
+    expect(before.statusCode, before.body).toBe(200);
+    expect(before.json()[0]).toMatchObject({
+      initiatorName: "Build automation",
+      canAttach: false,
+    });
+    expect(
+      (await app.inject({ url: `/api/agent-runs/${task.id}` })).statusCode,
+    ).toBe(404);
+    await ResourcePermissionPolicyModel.replace({
+      organizationId,
+      resource: "serviceAccount",
+      scope: account.id,
+      revision: 0,
+      grants: [{ subject: { type: "user", id: user.id }, actions: ["update"] }],
+    });
+    expect((await list()).json()[0]).toMatchObject({ canAttach: true });
+    const detail = await app.inject({ url: `/api/agent-runs/${task.id}` });
+    expect(detail.statusCode, detail.body).toBe(200);
+    expect(detail.json()).toMatchObject({
+      canAttach: true,
+      viewerRole: "shared",
+    });
+    const original = await AgentRunModel.findByTaskId(task.id);
+    assert(original);
+    for (let i = 0; i < 4; i++) {
+      const repeatedTask = await A2ATaskModel.create({
+        contextId: task.contextId,
+        agentId: agent.id,
+        state: "TASK_STATE_WORKING",
+      });
+      await AgentRunModel.create({
+        ...original,
+        id: undefined,
+        taskId: repeatedTask.id,
+        workloadName: `agent-run-${repeatedTask.id}`,
+      });
+    }
+    const endedTask = await A2ATaskModel.create({
+      contextId: task.contextId,
+      agentId: agent.id,
+      state: "TASK_STATE_COMPLETED",
+    });
+    const endedRun = await AgentRunModel.create({
+      ...original,
+      id: undefined,
+      taskId: endedTask.id,
+      workloadName: `agent-run-${endedTask.id}`,
+    });
+    await AgentRunModel.close({ id: endedRun.id, logs: "done" });
+    // Count calls without replacing their implementation: authorization and storage stay real.
+    const accounts = vi.spyOn(ServiceAccountModel, "findAccount");
+    const permissions = vi.spyOn(ResourcePermissions, "allows");
+    const repeated = await list();
+    expect(repeated.statusCode, repeated.body).toBe(200);
+    expect(
+      repeated.json().filter((row: { canAttach: boolean }) => row.canAttach),
+    ).toHaveLength(5);
+    expect(accounts).toHaveBeenCalledTimes(1);
+    expect(
+      permissions.mock.calls.filter(
+        ([request]) => request.resource === "agent" && request.action === "use",
+      ),
+    ).toHaveLength(1);
+    expect(
+      repeated
+        .json()
+        .find((row: { taskId: string }) => row.taskId === endedTask.id)
+        .canAttach,
+    ).toBe(false);
+    const currentTask = await A2ATaskModel.create({
+      contextId: task.contextId,
+      agentId: agent.id,
+      state: "TASK_STATE_WORKING",
+    });
+    await AgentRunModel.create({
+      ...original,
+      id: undefined,
+      taskId: currentTask.id,
+    });
+    await AgentWorkspaceModel.create({
+      organizationId,
+      agentId: agent.id,
+      actorKind: "serviceAccount",
+      actorId: account.id,
+      backend: "kubernetes",
+      runtimeScope: original.runtimeScope,
+      workloadName: original.workloadName,
+      state: "active",
+      activeTaskId: currentTask.id,
+      lastTaskId: currentTask.id,
+      expiresAt: new Date(Date.now() + 3600000),
+    });
+    const currentDetail = await app.inject({
+      url: `/api/agent-runs/${task.id}`,
+    });
+    expect(currentDetail.statusCode, currentDetail.body).toBe(200);
+    expect(currentDetail.json()).toMatchObject({
+      taskId: currentTask.id,
+      canAttach: true,
+      viewerRole: "shared",
+    });
+    // Terminal access does not confer ownership or workspace mutation.
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: `/api/agent-runs/${task.id}`,
+          payload: { title: "changed" },
+        })
+      ).statusCode,
+    ).toBe(404);
+    const accountKey = {
+      organizationId,
+      resource: "serviceAccount" as const,
+      scope: account.id,
+    };
+    const accountPolicy = await ResourcePermissionPolicyModel.find(accountKey);
+    await ResourcePermissionPolicyModel.replace({
+      ...accountKey,
+      revision: accountPolicy?.revision ?? 0,
+      grants: [],
+    });
+    expect(
+      (await list())
+        .json()
+        .some((row: { canAttach: boolean }) => row.canAttach),
+    ).toBe(false);
+    expect(
+      (await app.inject({ url: `/api/agent-runs/${task.id}` })).statusCode,
+    ).toBe(404);
+  });
+
+  async function createTask(agentId: string, stateChangedAt?: Date) {
+    const context = await A2AContextModel.create({
+      actorKind: "user",
+      actorId: user.id,
+    });
+    return await A2ATaskModel.create({
+      contextId: context.id,
+      agentId,
+      state: "TASK_STATE_SUBMITTED",
+      stateChangedAt,
+    });
+  }
+
+  async function createWorkspace(params: {
+    run: { taskId: string; workloadName: string; runtimeScope: string };
+    state: "active" | "idle" | "suspending" | "suspended" | "deleted";
+    activeTaskId?: boolean;
+    actorId?: string;
+  }) {
+    return await AgentWorkspaceModel.create({
+      organizationId,
+      agentId: agent.id,
+      actorKind: "user",
+      actorId: params.actorId ?? user.id,
+      backend: "kubernetes",
+      runtimeScope: params.run.runtimeScope,
+      workloadName: params.run.workloadName,
+      state: params.state,
+      activeTaskId: params.activeTaskId ? params.run.taskId : null,
+      lastTaskId: params.run.taskId,
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+  }
+
+  async function createRun(params: {
+    taskId: string;
+    actorUserId: string;
+    projectId?: string;
+    title?: string;
+    pinnedAt?: Date;
+    workloadName?: string;
+  }) {
+    return await AgentRunModel.create({
+      organizationId,
+      taskId: params.taskId,
+      agentId: agent.id,
+      actorKind: "user",
+      actorId: params.actorUserId,
+      actorUserId: params.actorUserId,
+      projectId: params.projectId,
+      title: params.title,
+      pinnedAt: params.pinnedAt,
+      workloadName: params.workloadName ?? `agent-run-${params.taskId}`,
+      backend: "kubernetes",
+      runtimeScope: "archestra-dev",
+      virtualApiKeyId: null,
+    });
+  }
+});

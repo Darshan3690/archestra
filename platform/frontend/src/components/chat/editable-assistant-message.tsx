@@ -1,20 +1,21 @@
 "use client";
 
-import { Info } from "lucide-react";
 import {
-  type KeyboardEventHandler,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-} from "react";
+  type ChatMessageFeedback,
+  foldCitationSources,
+} from "@archestra/shared";
+import { Info } from "lucide-react";
+import { memo, useMemo } from "react";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { Response } from "@/components/ai-elements/response";
+import { stripAssistantProtocolMarkers } from "@/components/chat/chat-messages.utils";
+import {
+  EditableMessageEditor,
+  useMessageEditor,
+} from "@/components/chat/editable-message-editor";
 import type { KnowledgeGraphCitationsProps } from "@/components/chat/knowledge-graph-citations";
 import { KnowledgeGraphCitations } from "@/components/chat/knowledge-graph-citations";
 import { MessageActions } from "@/components/chat/message-actions";
-import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
 
 interface EditableAssistantMessageProps {
   messageId: string;
@@ -26,16 +27,26 @@ interface EditableAssistantMessageProps {
   citationParts?: KnowledgeGraphCitationsProps["parts"];
   editDisabled?: boolean;
   isStreaming?: boolean;
-  onStartEdit: (partKey: string) => void;
+  /** Omit for a read-only transcript: hides edit. */
+  onStartEdit?: (partKey: string) => void;
   onCancelEdit: () => void;
   onSave: (
     messageId: string,
     partIndex: number,
     newText: string,
   ) => Promise<void>;
+  feedback?: ChatMessageFeedback | null;
+  onFeedbackChange?: (
+    messageId: string,
+    feedback: ChatMessageFeedback | null,
+  ) => void;
+  feedbackDisabled?: boolean;
 }
 
-export function EditableAssistantMessage({
+// Memoized so a streamed chunk, which re-renders the whole transcript, only
+// re-renders the bubble whose text changed. Callers pass stable callbacks
+// (see ChatMessages) so the memo holds.
+export const EditableAssistantMessage = memo(function EditableAssistantMessage({
   messageId,
   partIndex,
   partKey,
@@ -48,142 +59,100 @@ export function EditableAssistantMessage({
   onStartEdit,
   onCancelEdit,
   onSave,
+  feedback = null,
+  onFeedbackChange,
+  feedbackDisabled = false,
 }: EditableAssistantMessageProps) {
-  const [editedText, setEditedText] = useState(text);
-  const [isSaving, setIsSaving] = useState(false);
-  const [isComposing, setIsComposing] = useState(false);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const visibleText = stripAssistantProtocolMarkers(text);
+  const editor = useMessageEditor({
+    text: visibleText,
+    isEditing,
+    onSave: (newText) => onSave(messageId, partIndex, newText),
+    onCancelEdit,
+  });
 
-  // Reset edited text when entering edit mode
-  useEffect(() => {
-    if (isEditing) {
-      setEditedText(text);
-    }
-  }, [isEditing, text]);
-
-  // Auto-focus textarea and move caret to end when entering edit mode
-  useLayoutEffect(() => {
-    if (isEditing && textareaRef.current) {
-      const textarea = textareaRef.current;
-      textarea.focus();
-      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
-      textarea.scrollTop = textarea.scrollHeight;
-    }
-  }, [isEditing]);
+  // The machine-oriented Sources block (verbatim quotes + chunk refs, written
+  // for the quote verifier) folds out of the visible answer once citations
+  // render: markers become superscripts and the quotes move behind the chips.
+  // Copying and editing keep the full original text.
+  const folded = useMemo(
+    () => (citationParts ? foldCitationSources(visibleText) : null),
+    [citationParts, visibleText],
+  );
+  const displayText =
+    folded && folded.entries.length > 0 ? folded.displayText : visibleText;
 
   const handleStartEdit = () => {
-    onStartEdit(partKey);
-  };
-
-  const handleCancelEdit = () => {
-    setEditedText(text);
-    onCancelEdit();
-  };
-
-  const handleSaveEdit = async () => {
-    setIsSaving(true);
-    try {
-      await onSave(messageId, partIndex, editedText);
-      onCancelEdit();
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
-  const handleKeyDown: KeyboardEventHandler<HTMLTextAreaElement> = (e) => {
-    if (e.key === "Enter") {
-      // IME (Input Method Editor) check for international keyboards
-      if (isComposing || e.nativeEvent.isComposing) {
-        return;
-      }
-
-      // Allow Shift+Enter for new line
-      if (e.shiftKey) {
-        return;
-      }
-
-      e.preventDefault();
-
-      // Don't submit if saving or text is empty
-      if (isSaving || editedText.trim() === "") {
-        return;
-      }
-
-      handleSaveEdit();
-    } else if (e.key === "Escape") {
-      handleCancelEdit();
-    }
+    onStartEdit?.(partKey);
   };
 
   if (isEditing) {
     return (
-      <Message from="assistant" className="relative pt-0">
-        <MessageContent
-          aria-label="Message content"
-          className="max-w-[70%] min-w-[50%] px-3 py-0 pt-3 ring-2 !bg-secondary/50 ring-primary/50"
-        >
-          <div>
-            <Textarea
-              ref={textareaRef}
-              value={editedText}
-              onChange={(e) => setEditedText(e.target.value)}
-              onKeyDown={handleKeyDown}
-              onCompositionStart={() => setIsComposing(true)}
-              onCompositionEnd={() => setIsComposing(false)}
-              className="max-h-[240px] resize-none border-0 focus-visible:ring-0 shadow-none text-sm !bg-secondary"
-              disabled={isSaving}
-              placeholder="Edit this response..."
-            />
-            <div className="flex gap-2 py-3 justify-between items-start">
-              <div className="flex gap-2 items-start">
-                <Info className="h-3 w-3 text-muted-foreground shrink-0 mt-0.5" />
-                <span className="text-xs text-muted-foreground">
-                  Edit to correct errors or refine the context. This won't
-                  regenerate the conversation.
-                </span>
-              </div>
-              <div className="flex gap-2 shrink-0">
-                <Button
-                  size="sm"
-                  variant="outline-transparent"
-                  onClick={handleCancelEdit}
-                  disabled={isSaving}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  size="sm"
-                  onClick={handleSaveEdit}
-                  disabled={isSaving || editedText.trim() === ""}
-                >
-                  Save
-                </Button>
-              </div>
-            </div>
+      <EditableMessageEditor
+        from="assistant"
+        editor={editor}
+        outerClassName="relative pt-0"
+        contentClassName="max-w-[70%] min-w-[50%] px-3 py-0 pt-3 ring-2 !bg-secondary/50 ring-primary/50"
+        textareaClassName="max-h-[240px] resize-none border-0 focus-visible:ring-0 shadow-none text-sm !bg-secondary"
+        placeholder="Edit this response..."
+        saveLabel="Save"
+        banner={
+          <div className="flex gap-2 items-start">
+            <Info className="h-3 w-3 text-muted-foreground shrink-0 mt-0.5" />
+            <span className="text-xs text-muted-foreground">
+              Edit to correct errors or refine the context. This won't
+              regenerate the conversation.
+            </span>
           </div>
-        </MessageContent>
-      </Message>
+        }
+      />
     );
   }
 
   return (
     <Message from="assistant" className="group/message">
-      <div className="flex max-w-[80%] items-center justify-start gap-2">
-        <div className="min-w-0 flex-1">
-          <MessageContent className="max-w-none">
-            <Response isStreaming={isStreaming}>{text}</Response>
-            {citationParts && <KnowledgeGraphCitations parts={citationParts} />}
-          </MessageContent>
-        </div>
+      {/* The actions are absolutely positioned outside the flow: mounting
+          them when streaming ends must not steal width from the bubble,
+          which would make the finished text visibly rewrap. When the chat
+          column itself is wide enough they hang off the bubble's right edge;
+          otherwise they overlay just under the bubble. A container query is
+          important here because the right panel can narrow the chat without
+          changing the viewport breakpoint. Reveal is hover on desktop and
+          the tap-synthesized hover on touch; pointer-events gating keeps the
+          hidden panel from swallowing taps meant for the content. The
+          positioning wrapper owns the visual gap as padding, creating a hover
+          bridge between the message and the buttons. */}
+      <div className="relative max-w-[80%]">
+        <MessageContent className="max-w-none">
+          <Response
+            isStreaming={isStreaming}
+            className="group-[.is-assistant]:[&>:first-child]:mt-0 group-[.is-assistant]:[&>:last-child]:mb-0"
+          >
+            {displayText}
+          </Response>
+          {citationParts && (
+            <KnowledgeGraphCitations
+              parts={citationParts}
+              citedQuotes={folded?.entries}
+            />
+          )}
+        </MessageContent>
         {showActions && (
-          <MessageActions
-            textToCopy={text}
-            onEditClick={handleStartEdit}
-            editDisabled={editDisabled}
-            className="shrink-0 opacity-0 group-hover/message:opacity-100 transition-opacity"
-          />
+          <div className="pointer-events-none absolute top-full left-0 z-10 pt-1 opacity-0 transition-opacity group-hover/message:pointer-events-auto group-hover/message:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100 @2xl/chat:top-1/2 @2xl/chat:left-full @2xl/chat:pt-0 @2xl/chat:pl-2 @2xl/chat:-translate-y-1/2">
+            <MessageActions
+              textToCopy={visibleText}
+              onEditClick={onStartEdit && handleStartEdit}
+              editDisabled={editDisabled}
+              feedback={feedback}
+              onFeedbackChange={
+                onFeedbackChange &&
+                ((nextFeedback) => onFeedbackChange(messageId, nextFeedback))
+              }
+              feedbackDisabled={feedbackDisabled}
+            />
+          </div>
         )}
       </div>
     </Message>
   );
-}
+});

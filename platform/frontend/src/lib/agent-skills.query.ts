@@ -1,0 +1,231 @@
+import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { reportApiError, throwOnApiError } from "@/lib/utils/api";
+
+const {
+  getAgentActivationSkills: getAgentActivationSkillsApi,
+  getAgentActivationSkillPolicy,
+  patchAgentActivationSkillPolicy,
+  getAgentSkills,
+  updateAgentSkills,
+  getAgentSkillExclusions,
+  updateAgentSkillExclusions,
+} = archestraApiSdk;
+
+type AgentSkillAssignments = archestraApiTypes.GetAgentSkillsResponses["200"];
+type AgentSkillExclusions =
+  archestraApiTypes.GetAgentSkillExclusionsResponses["200"];
+export type AgentActivationSkills =
+  archestraApiTypes.GetAgentActivationSkillsResponses["200"];
+export type AgentActivationSkill = AgentActivationSkills["data"][number];
+export type AgentActivationSkillPolicy =
+  archestraApiTypes.GetAgentActivationSkillPolicyResponses["200"];
+export type AgentActivationSkillPolicyInput = NonNullable<
+  archestraApiTypes.CreateAgentData["body"]["activationSkillPolicy"]
+>;
+type PatchAgentActivationSkillPolicyInput =
+  archestraApiTypes.PatchAgentActivationSkillPolicyData["body"];
+
+/**
+ * The PUT bodies carry ids only; the GET responses additionally carry the rows
+ * those ids name, because the paginated skill catalog cannot be relied on to
+ * contain them (see `skills` in the response type).
+ */
+type AgentSkillAssignmentsInput = Omit<AgentSkillAssignments, "skills">;
+type AgentSkillExclusionsInput = Omit<AgentSkillExclusions, "skills">;
+
+export function useAgentActivationSkills(params: {
+  agentId?: string;
+  environmentId?: string | null;
+  limit: number;
+  offset: number;
+  search?: string;
+  view?: "effective" | "eligible";
+  enabled?: boolean;
+}) {
+  return useQuery({
+    queryKey: [
+      ...agentActivationSkillsQueryKeyPrefix(params.agentId),
+      params.view ?? "effective",
+      params.environmentId ?? "default",
+      params.limit,
+      params.offset,
+      params.search ?? "",
+    ],
+    enabled: params.enabled ?? true,
+    queryFn: async (): Promise<AgentActivationSkills> => {
+      const query = {
+        ...(params.agentId ? { agentId: params.agentId } : {}),
+        ...((!params.agentId || params.view === "eligible") &&
+        params.environmentId !== undefined
+          ? { environmentId: params.environmentId }
+          : {}),
+        limit: params.limit,
+        offset: params.offset,
+        search: params.search,
+        view: params.view,
+      };
+      const { data, error } = await getAgentActivationSkillsApi({ query });
+      throwOnApiError(error, { toastOnError: false });
+      if (!data) throw new Error("Activation skills response carried no body");
+      return data;
+    },
+    placeholderData: keepPreviousData,
+  });
+}
+
+export function useAgentActivationSkillPolicy(agentId: string | undefined) {
+  return useQuery({
+    queryKey: agentActivationSkillPolicyQueryKey(agentId ?? ""),
+    enabled: !!agentId,
+    queryFn: async (): Promise<AgentActivationSkillPolicy> => {
+      if (!agentId) throw new Error("No agent id to read skill policy for");
+      const { data, error } = await getAgentActivationSkillPolicy({
+        path: { id: agentId },
+      });
+      throwOnApiError(error, { toastOnError: false });
+      if (!data) throw new Error("Agent skill policy response carried no body");
+      return data;
+    },
+  });
+}
+
+export function usePatchAgentActivationSkillPolicy() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: {
+      agentId: string;
+      patch: PatchAgentActivationSkillPolicyInput;
+    }) => {
+      const { data, error } = await patchAgentActivationSkillPolicy({
+        path: { id: params.agentId },
+        body: params.patch,
+      });
+      if (error) throw reportApiError(error);
+      if (!data) throw new Error("Agent skill policy response carried no body");
+      return data;
+    },
+    onSettled: (_data, _error, { agentId }) => {
+      queryClient.invalidateQueries({
+        queryKey: agentActivationSkillPolicyQueryKey(agentId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: agentActivationSkillsQueryKeyPrefix(agentId),
+      });
+    },
+  });
+}
+
+/**
+ * Fails loud on purpose. The caller seeds an editor from this and saves that
+ * editor back as a full replace, so an empty default here is not a harmless
+ * blank screen: it reads as "publishes nothing", and the next save writes that
+ * back over whatever the gateway actually published.
+ */
+export function useAgentSkills(agentId: string | undefined) {
+  return useQuery({
+    queryKey: agentSkillsQueryKey(agentId ?? ""),
+    queryFn: async (): Promise<AgentSkillAssignments> => {
+      // `enabled` keeps this from running without an id; the guard is the type.
+      if (!agentId) throw new Error("No agent id to read published skills for");
+      const { data, error } = await getAgentSkills({ path: { id: agentId } });
+      // No toast: the dialog renders its own error state for this failure, and
+      // an errored query refetches on every window refocus — which turns one
+      // failure into a stream of toasts behind a screen already saying so.
+      throwOnApiError(error, { toastOnError: false });
+      if (!data) throw new Error("Published skills response carried no body");
+      return data;
+    },
+    enabled: !!agentId,
+  });
+}
+
+export function useUpdateAgentSkills() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: {
+      agentId: string;
+      assignments: AgentSkillAssignmentsInput;
+    }) => {
+      const { data, error } = await updateAgentSkills({
+        path: { id: params.agentId },
+        body: params.assignments,
+      });
+      if (error) {
+        throw reportApiError(error);
+      }
+      return data;
+    },
+    onSuccess: (_data, { agentId }) => {
+      queryClient.invalidateQueries({ queryKey: agentSkillsQueryKey(agentId) });
+    },
+  });
+}
+
+/** Fails loud for the same reason as {@link useAgentSkills}. */
+export function useAgentSkillExclusions(agentId: string | undefined) {
+  return useQuery({
+    queryKey: agentSkillExclusionsQueryKey(agentId ?? ""),
+    queryFn: async (): Promise<AgentSkillExclusions> => {
+      // `enabled` keeps this from running without an id; the guard is the type.
+      if (!agentId) throw new Error("No agent id to read skill exclusions for");
+      const { data, error } = await getAgentSkillExclusions({
+        path: { id: agentId },
+      });
+      // No toast: the dialog renders its own error state for this failure, and
+      // an errored query refetches on every window refocus — which turns one
+      // failure into a stream of toasts behind a screen already saying so.
+      throwOnApiError(error, { toastOnError: false });
+      if (!data) throw new Error("Skill exclusions response carried no body");
+      return data;
+    },
+    enabled: !!agentId,
+  });
+}
+
+export function useUpdateAgentSkillExclusions() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: {
+      agentId: string;
+      exclusions: AgentSkillExclusionsInput;
+    }) => {
+      const { data, error } = await updateAgentSkillExclusions({
+        path: { id: params.agentId },
+        body: params.exclusions,
+      });
+      if (error) {
+        throw reportApiError(error);
+      }
+      return data;
+    },
+    onSuccess: (_data, { agentId }) => {
+      queryClient.invalidateQueries({
+        queryKey: agentSkillExclusionsQueryKey(agentId),
+      });
+    },
+  });
+}
+
+// === internal ===
+
+function agentSkillsQueryKey(agentId: string) {
+  return ["skills", "agent-assignments", agentId] as const;
+}
+
+function agentSkillExclusionsQueryKey(agentId: string) {
+  return ["skills", "agent-exclusions", agentId] as const;
+}
+
+function agentActivationSkillPolicyQueryKey(agentId: string) {
+  return ["skills", "agent-activation-policy", agentId] as const;
+}
+
+function agentActivationSkillsQueryKeyPrefix(agentId?: string) {
+  return ["skills", "agent-activation", agentId ?? "draft"] as const;
+}

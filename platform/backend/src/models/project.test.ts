@@ -1,0 +1,588 @@
+import {
+  ConversationModel,
+  ProjectAccessModel,
+  ProjectModel,
+  ProjectPinModel,
+} from "@/models";
+import { ProjectNameExistsError } from "@/models/project";
+import ResourcePermissionSubjectModel from "@/models/resource-permission-subject";
+import { describe, expect, test } from "@/test";
+import { shareForTest } from "@/test/sharing";
+
+/** Every row of the list view for one caller, unpaged (see listPage). */
+async function listCandidates(params: {
+  userId: string;
+  organizationId: string;
+  includeOversight?: boolean;
+  lifecycle?: "active" | "deleted";
+}) {
+  const { rows } = await ProjectAccessModel.listPage({
+    ...params,
+    principal: await ResourcePermissionSubjectModel.resolvePrincipal(params),
+  });
+  return rows;
+}
+
+async function makeProject(params: {
+  organizationId: string;
+  userId: string;
+  name: string;
+}) {
+  return ProjectModel.create(params);
+}
+
+describe("ProjectModel", () => {
+  test("create/find/update/delete round-trip", async ({
+    makeUser,
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const project = await makeProject({
+      organizationId: org.id,
+      userId: user.id,
+      name: "research",
+    });
+    expect(project.name).toBe("research");
+
+    expect(
+      (
+        await ProjectModel.findByIdForOwner({
+          id: project.id,
+          userId: user.id,
+          organizationId: org.id,
+        })
+      )?.id,
+    ).toBe(project.id);
+
+    const stranger = await makeUser({ email: "proj-stranger@test.com" });
+    expect(
+      await ProjectModel.findByIdForOwner({
+        id: project.id,
+        userId: stranger.id,
+        organizationId: org.id,
+      }),
+    ).toBeNull();
+
+    await ProjectModel.update({
+      id: project.id,
+      fields: { description: "all the things", icon: "🔬", name: "research-2" },
+    });
+    const updated = await ProjectModel.findById(project.id);
+    expect(updated?.description).toBe("all the things");
+    expect(updated?.icon).toBe("🔬");
+    expect(updated?.name).toBe("research-2");
+
+    await ProjectModel.delete(project.id);
+    expect(await ProjectModel.findById(project.id)).toBeNull();
+  });
+
+  test("duplicate project name per user throws", async ({
+    makeUser,
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeProject({ organizationId: org.id, userId: user.id, name: "p" });
+    await expect(
+      ProjectModel.create({
+        organizationId: org.id,
+        userId: user.id,
+        name: "p",
+      }),
+    ).rejects.toBeInstanceOf(ProjectNameExistsError);
+  });
+
+  test("generates a url-safe slug, deduped within an org", async ({
+    makeUser,
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const owner = await makeUser();
+    const other = await makeUser({ email: "slug-other@test.com" });
+    const first = await makeProject({
+      organizationId: org.id,
+      userId: owner.id,
+      name: "Quarterly Report",
+    });
+    expect(first.slug).toBe("quarterly-report");
+    // a different member may reuse the display name (names are unique per user),
+    // but the slug — the shared folder — must stay distinct within the org.
+    const second = await makeProject({
+      organizationId: org.id,
+      userId: other.id,
+      name: "Quarterly Report",
+    });
+    expect(second.slug).not.toBe(first.slug);
+    expect(second.slug.startsWith("quarterly-report-")).toBe(true);
+  });
+
+  test("deleting a project detaches its chats and retains the row", async ({
+    makeUser,
+    makeOrganization,
+    makeAgent,
+    makeConversation,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const agent = await makeAgent({ organizationId: org.id });
+    const project = await makeProject({
+      organizationId: org.id,
+      userId: user.id,
+      name: "doomed",
+    });
+    const conv = await makeConversation(agent.id, {
+      userId: user.id,
+      organizationId: org.id,
+    });
+    // attach the conversation to the project directly (creation plumbing is
+    // covered by route tests)
+    const { default: db, schema } = await import("@/database");
+    const { eq } = await import("drizzle-orm");
+    await db
+      .update(schema.conversationsTable)
+      .set({ projectId: project.id })
+      .where(eq(schema.conversationsTable.id, conv.id));
+
+    await ProjectModel.delete(project.id);
+
+    // the chat survives as an ordinary conversation — the soft delete stops the
+    // FK from firing, so the model detaches it by hand to the same effect.
+    const [after] = await db
+      .select()
+      .from(schema.conversationsTable)
+      .where(eq(schema.conversationsTable.id, conv.id));
+    expect(after.projectId).toBeNull();
+
+    // the project is gone from every read path, but the row is retained so an
+    // operator can restore it.
+    expect(await ProjectModel.findById(project.id)).toBeNull();
+    const [raw] = await db
+      .select()
+      .from(schema.projectsTable)
+      .where(eq(schema.projectsTable.id, project.id));
+    expect(raw.deletedAt).not.toBeNull();
+  });
+
+  test("a restored project comes back with its share config and pins", async ({
+    makeUser,
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const project = await makeProject({
+      organizationId: org.id,
+      userId: user.id,
+      name: "recoverable",
+    });
+    await shareForTest({
+      resource: "project",
+      scope: project.id,
+      organizationId: org.id,
+      visibility: "organization",
+      teamIds: [],
+    });
+    await ProjectPinModel.pin({ userId: user.id, projectId: project.id });
+
+    await ProjectModel.delete(project.id);
+    expect(await ProjectModel.findById(project.id)).toBeNull();
+
+    // shares and pins are deliberately NOT removed on delete: every read of
+    // them resolves the project first, so keeping them is invisible — and it is
+    // what makes a restore land on a project configured as it was.
+    const { default: db, schema } = await import("@/database");
+    const { restore } = await import("@/database/soft-delete");
+    const { eq } = await import("drizzle-orm");
+    expect(
+      await restore(
+        db,
+        schema.projectsTable,
+        eq(schema.projectsTable.id, project.id),
+      ),
+    ).toBe(1);
+
+    expect((await ProjectModel.findById(project.id))?.name).toBe("recoverable");
+    expect(
+      (
+        await listCandidates({
+          userId: user.id,
+          organizationId: org.id,
+          includeOversight: true,
+        })
+      )
+        .map((p) => p.id)
+        .includes(project.id),
+    ).toBe(true);
+    expect((await ProjectAccessModel.findAudience(project)).visibility).toBe(
+      "organization",
+    );
+    const pins = await ProjectPinModel.getPinnedAtForProjects({
+      userId: user.id,
+      projectIds: [project.id],
+    });
+    expect(pins.has(project.id)).toBe(true);
+  });
+
+  test("a deleted project frees its name but keeps its slug", async ({
+    makeUser,
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const first = await makeProject({
+      organizationId: org.id,
+      userId: user.id,
+      name: "Quarterly Report",
+    });
+    expect(first.slug).toBe("quarterly-report");
+
+    await ProjectModel.delete(first.id);
+
+    // same owner can immediately reuse the display name; the retained row keeps
+    // "quarterly-report" so a restore lands on its own folder, which means the
+    // new project gets a fresh suffixed slug.
+    const second = await makeProject({
+      organizationId: org.id,
+      userId: user.id,
+      name: "Quarterly Report",
+    });
+    expect(second.slug).not.toBe(first.slug);
+    expect(second.slug.startsWith("quarterly-report-")).toBe(true);
+  });
+
+  test("countConversations and listConversations", async ({
+    makeUser,
+    makeOrganization,
+    makeAgent,
+    makeConversation,
+    makeScheduleTrigger,
+    makeScheduleTriggerRun,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const agent = await makeAgent({ organizationId: org.id });
+    const project = await makeProject({
+      organizationId: org.id,
+      userId: user.id,
+      name: "counted",
+    });
+    const { default: db, schema } = await import("@/database");
+    const { eq } = await import("drizzle-orm");
+    for (const title of ["one", "two"]) {
+      const conv = await makeConversation(agent.id, {
+        userId: user.id,
+        organizationId: org.id,
+        title,
+      });
+      await db
+        .update(schema.conversationsTable)
+        .set({ projectId: project.id })
+        .where(eq(schema.conversationsTable.id, conv.id));
+    }
+
+    const counts = await ProjectModel.countConversations([project.id]);
+    expect(counts.get(project.id)).toBe(2);
+
+    const listed = await ProjectModel.listConversations(project.id);
+    expect(listed).toHaveLength(2);
+    expect(listed[0].authorUserId).toBe(user.id);
+    // User chats carry no schedule context.
+    expect(listed.every((c) => c.scheduleTriggerId === null)).toBe(true);
+
+    // A scheduled-run conversation exposes its trigger + run (so the chat list
+    // can collapse a schedule's runs into one row).
+    const trigger = await makeScheduleTrigger({
+      organizationId: org.id,
+      actorUserId: user.id,
+      agentId: agent.id,
+      projectId: project.id,
+    });
+    const run = await makeScheduleTriggerRun(trigger.id, {
+      organizationId: org.id,
+      runKind: "due",
+    });
+    const scheduledConv = await makeConversation(agent.id, {
+      userId: user.id,
+      organizationId: org.id,
+      title: "scheduled",
+    });
+    await db
+      .update(schema.conversationsTable)
+      .set({ projectId: project.id, origin: "schedule_trigger" })
+      .where(eq(schema.conversationsTable.id, scheduledConv.id));
+    await db
+      .update(schema.scheduleTriggerRunsTable)
+      .set({ chatConversationId: scheduledConv.id })
+      .where(eq(schema.scheduleTriggerRunsTable.id, run.id));
+
+    const withScheduled = await ProjectModel.listConversations(project.id);
+    const scheduledRow = withScheduled.find((c) => c.id === scheduledConv.id);
+    expect(scheduledRow?.scheduleTriggerId).toBe(trigger.id);
+    expect(scheduledRow?.scheduleRunId).toBe(run.id);
+    expect(scheduledRow?.scheduleName).toBe(trigger.name);
+  });
+
+  test("countConversations and listConversations exclude soft-deleted chats", async ({
+    makeUser,
+    makeOrganization,
+    makeAgent,
+    makeConversation,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const agent = await makeAgent({ organizationId: org.id });
+    const project = await makeProject({
+      organizationId: org.id,
+      userId: user.id,
+      name: "hides-deleted",
+    });
+    const { default: db, schema } = await import("@/database");
+    const { eq } = await import("drizzle-orm");
+
+    const ids: string[] = [];
+    for (const title of ["keep", "remove"]) {
+      const conv = await makeConversation(agent.id, {
+        userId: user.id,
+        organizationId: org.id,
+        title,
+      });
+      await db
+        .update(schema.conversationsTable)
+        .set({ projectId: project.id })
+        .where(eq(schema.conversationsTable.id, conv.id));
+      ids.push(conv.id);
+    }
+
+    // Soft-delete the second chat; it must drop out of both the count and list.
+    await ConversationModel.delete(ids[1], user.id, org.id);
+
+    expect(
+      (await ProjectModel.countConversations([project.id])).get(project.id),
+    ).toBe(1);
+    const listed = await ProjectModel.listConversations(project.id);
+    expect(listed.map((c) => c.title)).toEqual(["keep"]);
+  });
+});
+
+describe("ProjectAccessModel", () => {
+  test("access matrix: owner / org share / team share / outsider / cross-org", async ({
+    makeUser,
+    makeOrganization,
+    makeTeam,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const otherOrg = await makeOrganization();
+    const owner = await makeUser();
+    const teammate = await makeUser({ email: "share-teammate@test.com" });
+    const orgMember = await makeUser({ email: "share-orgmember@test.com" });
+    // Access is read from grants, which only ever reach members.
+    await makeMember(owner.id, org.id, {});
+    await makeMember(teammate.id, org.id, {});
+    await makeMember(orgMember.id, org.id, {});
+    const team = await makeTeam(org.id, owner.id, { name: "Sharers" });
+    const { default: TeamModel } = await import("@/models/team");
+    await TeamModel.addMember(team.id, teammate.id);
+
+    const project = await makeProject({
+      organizationId: org.id,
+      userId: owner.id,
+      name: "shared",
+    });
+
+    const can = (userId: string, organizationId = org.id) =>
+      ProjectAccessModel.userCanAccessProject({
+        project,
+        userId,
+        organizationId,
+      });
+
+    // unshared: owner only
+    expect(await can(owner.id)).toBe(true);
+    expect(await can(teammate.id)).toBe(false);
+
+    // team share
+    await shareForTest({
+      resource: "project",
+      scope: project.id,
+      organizationId: org.id,
+      visibility: "team",
+      teamIds: [team.id],
+    });
+    expect(await can(teammate.id)).toBe(true);
+    expect(await can(orgMember.id)).toBe(false);
+
+    // org share (replaces the team grant)
+    await shareForTest({
+      resource: "project",
+      scope: project.id,
+      organizationId: org.id,
+      visibility: "organization",
+      teamIds: [],
+    });
+    expect(await can(orgMember.id)).toBe(true);
+    // cross-org caller never passes
+    expect(await can(orgMember.id, otherOrg.id)).toBe(false);
+
+    // unshare
+    await shareForTest({
+      resource: "project",
+      scope: project.id,
+      organizationId: org.id,
+      visibility: null,
+    });
+    expect(await can(orgMember.id)).toBe(false);
+  });
+
+  test("listPage returns what the caller reaches, flags oversight rows, and splits the lifecycle", async ({
+    makeUser,
+    makeOrganization,
+    makeTeam,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const owner = await makeUser();
+    const viewer = await makeUser({ email: "share-viewer@test.com" });
+    await makeMember(viewer.id, org.id, {});
+    const team = await makeTeam(org.id, owner.id, { name: "Viewers" });
+    const { default: TeamModel } = await import("@/models/team");
+    await TeamModel.addMember(team.id, viewer.id);
+
+    const mine = await makeProject({
+      organizationId: org.id,
+      userId: viewer.id,
+      name: "mine",
+    });
+    const sharedToTeam = await makeProject({
+      organizationId: org.id,
+      userId: owner.id,
+      name: "team-shared",
+    });
+    await shareForTest({
+      resource: "project",
+      scope: sharedToTeam.id,
+      organizationId: org.id,
+      visibility: "team",
+      teamIds: [team.id],
+    });
+    const orgShared = await makeProject({
+      organizationId: org.id,
+      userId: owner.id,
+      name: "org-shared",
+    });
+    await shareForTest({
+      resource: "project",
+      scope: orgShared.id,
+      organizationId: org.id,
+      visibility: "organization",
+      teamIds: [],
+    });
+    const privateOne = await makeProject({
+      organizationId: org.id,
+      userId: owner.id,
+      name: "private",
+    });
+
+    const listed = await listCandidates({
+      userId: viewer.id,
+      organizationId: org.id,
+    });
+    expect(listed.map((p) => p.name).sort()).toEqual([
+      "mine",
+      "org-shared",
+      "team-shared",
+    ]);
+    expect(listed.every((p) => p.accessible)).toBe(true);
+    expect(listed.find((p) => p.id === mine.id)?.visibility).toBeNull();
+    expect(listed.find((p) => p.id === sharedToTeam.id)?.visibility).toBe(
+      "team",
+    );
+    expect(listed.find((p) => p.id === orgShared.id)?.visibility).toBe(
+      "organization",
+    );
+
+    // With oversight every project comes back, and only the unreachable one
+    // is flagged as not accessible.
+    const overseen = await listCandidates({
+      userId: viewer.id,
+      organizationId: org.id,
+      includeOversight: true,
+    });
+    expect(overseen.filter((p) => !p.accessible).map((p) => p.id)).toEqual([
+      privateOne.id,
+    ]);
+
+    // soft-deleted projects vanish from every active list surface, including
+    // the oversight base set, and appear only in the deleted slice.
+    await ProjectModel.delete(orgShared.id);
+    const afterDelete = await listCandidates({
+      userId: viewer.id,
+      organizationId: org.id,
+    });
+    expect(afterDelete.map((p) => p.name).sort()).toEqual([
+      "mine",
+      "team-shared",
+    ]);
+    const allOrg = await listCandidates({
+      userId: viewer.id,
+      organizationId: org.id,
+      includeOversight: true,
+    });
+    expect(allOrg.map((p) => p.id)).not.toContain(orgShared.id);
+    const deleted = await listCandidates({
+      userId: viewer.id,
+      organizationId: org.id,
+      includeOversight: true,
+      lifecycle: "deleted",
+    });
+    expect(deleted.map((p) => p.id)).toEqual([orgShared.id]);
+  });
+  test("a project shared by name reaches exactly the people named, and lists for them", async ({
+    makeUser,
+    makeOrganization,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const owner = await makeUser();
+    const named = await makeUser();
+    const other = await makeUser();
+    for (const user of [owner, named, other])
+      await makeMember(user.id, org.id, {});
+    const project = await makeProject({
+      organizationId: org.id,
+      userId: owner.id,
+      name: "named",
+    });
+    await shareForTest({
+      resource: "project",
+      scope: project.id,
+      organizationId: org.id,
+      visibility: "user",
+      userIds: [named.id],
+    });
+
+    const can = (userId: string) =>
+      ProjectAccessModel.userCanAccessProject({
+        project,
+        userId,
+        organizationId: org.id,
+      });
+    expect(await can(named.id)).toBe(true);
+    expect(await can(other.id)).toBe(false);
+    const listed = await listCandidates({
+      userId: named.id,
+      organizationId: org.id,
+    });
+    expect(listed.find((p) => p.id === project.id)?.visibility).toBe("user");
+    const audience = await ProjectAccessModel.findAudience(project);
+    expect(audience.users.map((user) => user.id)).toEqual([named.id]);
+
+    await shareForTest({
+      resource: "project",
+      scope: project.id,
+      organizationId: org.id,
+      visibility: null,
+    });
+    expect(await can(named.id)).toBe(false);
+  });
+});

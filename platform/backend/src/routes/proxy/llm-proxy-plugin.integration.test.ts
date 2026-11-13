@@ -1,0 +1,1352 @@
+import Fastify, { type FastifyInstance } from "fastify";
+import {
+  serializerCompiler,
+  validatorCompiler,
+  type ZodTypeProvider,
+} from "fastify-type-provider-zod";
+import { vi } from "vitest";
+import { InteractionModel, ModelModel } from "@/models";
+import {
+  getLlmProxyPluginRegistry,
+  registerLlmProxyPlugin,
+} from "@/proxy/plugins/registry";
+import { handleServerError } from "@/server/error-handler";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import {
+  createAnthropicTestClient,
+  createOpenAiTestClient,
+} from "@/test/llm-provider-stubs";
+import { makePassthroughCredential } from "@/test/llm-proxy-credentials";
+import {
+  anthropicAdapterFactory,
+  openAiResponsesAdapterFactory,
+  openaiAdapterFactory,
+} from "./adapters";
+import { makeAnthropicOpenaiAdapterFactory } from "./adapters/anthropic-openai";
+import { makeResponsesFromChatAdapterFactory } from "./adapters/openai-responses-from-chat";
+import { handleLLMProxy } from "./llm-proxy-handler";
+import openAiProxyRoutes from "./routes/openai";
+
+describe("LLM proxy plugin lifecycle", () => {
+  let app: FastifyInstance;
+
+  beforeEach(async () => {
+    app = Fastify({
+      // A failed lifecycle must release the request id so a later request can
+      // reuse it without inheriting stale plugin state.
+      genReqId: () => "plugin-test-request",
+    }).withTypeProvider<ZodTypeProvider>();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    app.setErrorHandler(handleServerError);
+    vi.spyOn(openaiAdapterFactory, "createClient").mockImplementation(
+      () => createOpenAiTestClient({}) as never,
+    );
+    await app.register(openAiProxyRoutes);
+    await ModelModel.upsert({
+      externalId: "openai/gpt-4o",
+      provider: "openai",
+      modelId: "gpt-4o",
+      inputModalities: null,
+      outputModalities: null,
+      customPricePerMillionInput: "2.50",
+      customPricePerMillionOutput: "10.00",
+      lastSyncedAt: new Date(),
+    });
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await app.close();
+  });
+
+  async function assertBaselineProxyResponse(params: {
+    agentId: string;
+    passthroughToken: string;
+    stream: boolean;
+  }) {
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/openai/${params.agentId}/chat/completions`,
+      headers: {
+        authorization: "Bearer test-key",
+        "x-archestra-virtual-key": params.passthroughToken,
+        "content-type": "application/json",
+      },
+      payload: {
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "hello" }],
+        stream: params.stream,
+      },
+    });
+
+    expect(response.statusCode, response.body).toBe(200);
+  }
+
+  test("preserves the non-streaming proxy flow with no configured plugins", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    expect(getLlmProxyPluginRegistry().hasPlugins()).toBe(false);
+    const agent = await makeAgent({
+      agentType: "llm_proxy",
+      isDefault: true,
+    });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const passthroughToken = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+    await assertBaselineProxyResponse({
+      agentId: agent.id,
+      passthroughToken,
+      stream: false,
+    });
+  });
+
+  test("preserves the streaming proxy flow with no configured plugins", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    expect(getLlmProxyPluginRegistry().hasPlugins()).toBe(false);
+    const agent = await makeAgent({
+      agentType: "llm_proxy",
+      isDefault: true,
+    });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const passthroughToken = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+    await assertBaselineProxyResponse({
+      agentId: agent.id,
+      passthroughToken,
+      stream: true,
+    });
+  });
+
+  test("preserves proxy error handling with no configured plugins", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    expect(getLlmProxyPluginRegistry().hasPlugins()).toBe(false);
+    vi.spyOn(openaiAdapterFactory, "createClient").mockImplementation(() => {
+      throw new Error("provider unavailable");
+    });
+    const agent = await makeAgent({ agentType: "llm_proxy", isDefault: true });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const passthroughToken = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/openai/${agent.id}/chat/completions`,
+      headers: {
+        authorization: "Bearer test-key",
+        "x-archestra-virtual-key": passthroughToken,
+        "content-type": "application/json",
+      },
+      payload: {
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "hello" }],
+      },
+    });
+
+    expect(response.statusCode, response.body).toBeGreaterThanOrEqual(400);
+    expect(response.body).toContain("provider unavailable");
+  });
+
+  test.for([
+    false,
+    true,
+  ])("buffers and replaces a routed Anthropic Responses answer in its native adapter domain (stream=%s)", async (stream, {
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    const rawText = "RAW WRAPPED ANSWER";
+    const admittedText = "ADMITTED WRAPPED ANSWER";
+    const observedText: string[] = [];
+    const unregister = registerLlmProxyPlugin({
+      id: `test-buffered-wrapped-response-${crypto.randomUUID()}`,
+      buffersModelResponse: () => true,
+      async onBufferedModelResponse({ responseText }) {
+        observedText.push(responseText);
+        return { decision: "replace", responseText: admittedText };
+      },
+    });
+    vi.spyOn(anthropicAdapterFactory, "createClient").mockImplementation(
+      () => createAnthropicTestClient({ responseText: rawText }) as never,
+    );
+    const provider = makeResponsesFromChatAdapterFactory(
+      makeAnthropicOpenaiAdapterFactory({
+        chatcmplId: "chatcmpl-wrapped",
+        createdUnix: 1,
+        requestedModel: "routed-claude",
+      }),
+      {
+        responseId: "resp-wrapped",
+        createdUnix: 1,
+        requestedModel: "routed-claude",
+      },
+    );
+    app.post("/test/wrapped/:agentId", async (request, reply) =>
+      handleLLMProxy(
+        request.body as Parameters<typeof provider.createRequestAdapter>[0],
+        request,
+        reply,
+        provider,
+      ),
+    );
+    const agent = await makeAgent({ agentType: "llm_proxy" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const passthroughToken = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+    await ModelModel.upsert({
+      externalId: "anthropic/claude-wrapped",
+      provider: "anthropic",
+      modelId: "claude-wrapped",
+      inputModalities: null,
+      outputModalities: null,
+      lastSyncedAt: new Date(),
+    });
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: `/test/wrapped/${agent.id}`,
+        headers: {
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": passthroughToken,
+          "content-type": "application/json",
+        },
+        payload: {
+          model: "claude-wrapped",
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hello" }],
+          stream,
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(200);
+      expect(observedText).toEqual([stream ? `Hello! ${rawText}` : rawText]);
+      expect(response.body).toContain(admittedText);
+      expect(response.body).not.toContain(rawText);
+      expect(response.body).toContain(
+        stream ? '"type":"response.completed"' : '"object":"response"',
+      );
+    } finally {
+      unregister();
+    }
+  });
+
+  test.for([
+    { decision: "replace" as const, leakVisible: false },
+    { decision: "release" as const, leakVisible: true },
+  ])("gates an Anthropic message_start carrying content behind buffered admission ($decision)", async ({
+    decision,
+    leakVisible,
+  }, { makeAgent, makeMember, makeUser }) => {
+    const leakedText = "PREAMBLE LEAK TEXT";
+    const rawText = "RAW ANSWER";
+    const admittedText = "ADMITTED ANSWER";
+    const unregister = registerLlmProxyPlugin({
+      id: `test-anthropic-preamble-content-${crypto.randomUUID()}`,
+      buffersModelResponse: () => true,
+      async onBufferedModelResponse() {
+        return decision === "replace"
+          ? { decision, responseText: admittedText }
+          : { decision };
+      },
+    });
+    vi.spyOn(anthropicAdapterFactory, "createClient").mockImplementation(() => {
+      const base = createAnthropicTestClient({ responseText: rawText });
+      return {
+        messages: {
+          create: async (params: { stream?: boolean }) => {
+            const result = await base.messages.create(params as never);
+            if (!params.stream) return result;
+            const iterator = (
+              result as AsyncIterable<{
+                type: string;
+                message?: { content?: unknown };
+              }>
+            )[Symbol.asyncIterator]();
+            let patched = false;
+            return {
+              [Symbol.asyncIterator]() {
+                return {
+                  async next() {
+                    const item = await iterator.next();
+                    if (
+                      !patched &&
+                      !item.done &&
+                      item.value?.type === "message_start"
+                    ) {
+                      patched = true;
+                      return {
+                        done: false as const,
+                        value: {
+                          ...item.value,
+                          message: {
+                            ...item.value.message,
+                            content: [{ type: "text", text: leakedText }],
+                          },
+                        },
+                      };
+                    }
+                    return item;
+                  },
+                };
+              },
+            };
+          },
+        },
+      } as never;
+    });
+    app.post("/test/anthropic/:agentId", async (request, reply) =>
+      handleLLMProxy(
+        request.body as Parameters<
+          typeof anthropicAdapterFactory.createRequestAdapter
+        >[0],
+        request,
+        reply,
+        anthropicAdapterFactory,
+      ),
+    );
+    const agent = await makeAgent({ agentType: "llm_proxy" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const passthroughToken = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+    await ModelModel.upsert({
+      externalId: "anthropic/claude-wrapped",
+      provider: "anthropic",
+      modelId: "claude-wrapped",
+      inputModalities: null,
+      outputModalities: null,
+      lastSyncedAt: new Date(),
+    });
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: `/test/anthropic/${agent.id}`,
+        headers: {
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": passthroughToken,
+          "content-type": "application/json",
+        },
+        payload: {
+          model: "claude-wrapped",
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hello" }],
+          stream: true,
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(200);
+      if (leakVisible) {
+        // Admitted: the buffered preamble is flushed with the rest of the
+        // turn, so its content arrives — after the admission decision.
+        expect(response.body).toContain(leakedText);
+        expect(response.body).toContain(rawText);
+      } else {
+        expect(response.body).not.toContain(leakedText);
+        expect(response.body).not.toContain(rawText);
+        expect(response.body).toContain(admittedText);
+      }
+    } finally {
+      unregister();
+    }
+  });
+
+  test.for([
+    { decision: "replace" as const, leakVisible: false },
+    { decision: "release" as const, leakVisible: true },
+  ])("gates a Responses response.in_progress carrying output behind buffered admission ($decision)", async ({
+    decision,
+    leakVisible,
+  }, { makeAgent, makeMember, makeUser }) => {
+    const leakedText = "PREAMBLE LEAK TEXT";
+    const rawText = "RAW ANSWER";
+    const admittedText = "ADMITTED ANSWER";
+    const unregister = registerLlmProxyPlugin({
+      id: `test-responses-preamble-content-${crypto.randomUUID()}`,
+      buffersModelResponse: () => true,
+      async onBufferedModelResponse() {
+        return decision === "replace"
+          ? { decision, responseText: admittedText }
+          : { decision };
+      },
+    });
+    const responseEnvelope = {
+      id: "resp-preamble-leak",
+      object: "response",
+      created_at: 1,
+      model: "gpt-4o",
+      status: "in_progress",
+    };
+    const leakedOutputItem = {
+      id: "msg-preamble-leak",
+      type: "message",
+      role: "assistant",
+      status: "in_progress",
+      content: [{ type: "output_text", text: leakedText, annotations: [] }],
+    };
+    const chunks = [
+      {
+        type: "response.created",
+        sequence_number: 0,
+        response: { ...responseEnvelope, output: [] },
+      },
+      {
+        type: "response.in_progress",
+        sequence_number: 1,
+        response: { ...responseEnvelope, output: [leakedOutputItem] },
+      },
+      {
+        type: "response.output_item.added",
+        output_index: 0,
+        sequence_number: 2,
+        item: { ...leakedOutputItem, content: [] },
+      },
+      {
+        type: "response.content_part.added",
+        item_id: "msg-preamble-leak",
+        output_index: 0,
+        content_index: 0,
+        sequence_number: 3,
+        part: { type: "output_text", text: "", annotations: [] },
+      },
+      {
+        type: "response.output_text.delta",
+        item_id: "msg-preamble-leak",
+        output_index: 0,
+        content_index: 0,
+        sequence_number: 4,
+        delta: rawText,
+      },
+      {
+        type: "response.output_item.done",
+        output_index: 0,
+        sequence_number: 5,
+        item: {
+          ...leakedOutputItem,
+          status: "completed",
+          content: [{ type: "output_text", text: rawText, annotations: [] }],
+        },
+      },
+      {
+        type: "response.completed",
+        sequence_number: 6,
+        response: {
+          ...responseEnvelope,
+          status: "completed",
+          output: [
+            {
+              ...leakedOutputItem,
+              status: "completed",
+              content: [
+                { type: "output_text", text: rawText, annotations: [] },
+              ],
+            },
+          ],
+          usage: {
+            input_tokens: 2,
+            input_tokens_details: { cached_tokens: 0 },
+            output_tokens: 1,
+            output_tokens_details: { reasoning_tokens: 0 },
+            total_tokens: 3,
+          },
+        },
+      },
+    ];
+    vi.spyOn(openAiResponsesAdapterFactory, "createClient").mockImplementation(
+      () =>
+        ({
+          responses: {
+            create: async () => ({
+              [Symbol.asyncIterator]() {
+                let index = 0;
+                return {
+                  async next() {
+                    if (index < chunks.length) {
+                      return { done: false, value: chunks[index++] };
+                    }
+                    return { done: true, value: undefined };
+                  },
+                };
+              },
+            }),
+          },
+        }) as never,
+    );
+    app.post("/test/responses/:agentId", async (request, reply) =>
+      handleLLMProxy(
+        request.body as Parameters<
+          typeof openAiResponsesAdapterFactory.createRequestAdapter
+        >[0],
+        request,
+        reply,
+        openAiResponsesAdapterFactory,
+      ),
+    );
+    const agent = await makeAgent({ agentType: "llm_proxy" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const passthroughToken = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: `/test/responses/${agent.id}`,
+        headers: {
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": passthroughToken,
+          "content-type": "application/json",
+        },
+        payload: {
+          model: "gpt-4o",
+          input: "hello",
+          stream: true,
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(200);
+      if (leakVisible) {
+        expect(response.body).toContain(leakedText);
+        expect(response.body).toContain(rawText);
+      } else {
+        expect(response.body).not.toContain(leakedText);
+        expect(response.body).not.toContain(rawText);
+        expect(response.body).toContain(admittedText);
+      }
+    } finally {
+      unregister();
+    }
+  });
+
+  test("runs generic request and response hooks for a non-APPA request", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    const events: string[] = [];
+    const unregister = registerLlmProxyPlugin({
+      id: `test-observer-${crypto.randomUUID()}`,
+      async onPrompt() {
+        events.push("prompt");
+      },
+      async onBeforeModel() {
+        events.push("before-model");
+      },
+      async onModelResponse({ response }) {
+        events.push("response");
+        return {
+          response: {
+            ...(response as Record<string, unknown>),
+            model: "gpt-4o-plugin-rewrite",
+          },
+        };
+      },
+      async onComplete() {
+        events.push("complete");
+      },
+      async onCleanup() {
+        events.push("cleanup");
+      },
+    });
+    const agent = await makeAgent({ agentType: "llm_proxy", isDefault: true });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const passthroughToken = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/openai/${agent.id}/chat/completions`,
+        headers: {
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": passthroughToken,
+          "content-type": "application/json",
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "hello" }],
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(200);
+      expect(response.json()).toMatchObject({
+        model: "gpt-4o-plugin-rewrite",
+      });
+      expect(events).toEqual([
+        "prompt",
+        "before-model",
+        "response",
+        "complete",
+        "cleanup",
+      ]);
+    } finally {
+      unregister();
+    }
+  });
+
+  test("fails closed for invalid plugin response values and releases the request id", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    const invalidResponseCases = [
+      { label: "null", response: null, rawContent: "null" },
+      {
+        label: "a string",
+        response: "plugin-secret-string",
+        rawContent: "plugin-secret-string",
+      },
+      { label: "undefined", response: undefined, rawContent: "undefined" },
+      {
+        label: "an array",
+        response: ["plugin-secret-array"],
+        rawContent: "plugin-secret-array",
+      },
+      { label: "a number", response: 8675309, rawContent: "8675309" },
+    ];
+    const events: string[] = [];
+    let returnInvalidResponse = false;
+    let invalidResponse: unknown;
+    const unregister = registerLlmProxyPlugin({
+      id: `test-invalid-response-${crypto.randomUUID()}`,
+      async onModelResponse({ response }) {
+        events.push("response");
+        if (returnInvalidResponse) {
+          returnInvalidResponse = false;
+          return { response: invalidResponse };
+        }
+        return {
+          response: {
+            ...(response as Record<string, unknown>),
+            model: "gpt-4o-plugin-rewrite",
+          },
+        };
+      },
+      async onError() {
+        events.push("error");
+      },
+      async onComplete() {
+        events.push("complete");
+      },
+      async onCleanup() {
+        events.push("cleanup");
+      },
+    });
+    const agent = await makeAgent({ agentType: "llm_proxy", isDefault: true });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const passthroughToken = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+
+    try {
+      for (const invalidCase of invalidResponseCases) {
+        events.length = 0;
+        invalidResponse = invalidCase.response;
+        returnInvalidResponse = true;
+        const failed = await app.inject({
+          method: "POST",
+          url: `/v1/openai/${agent.id}/chat/completions`,
+          headers: {
+            authorization: "Bearer test-key",
+            "x-archestra-virtual-key": passthroughToken,
+            "content-type": "application/json",
+          },
+          payload: {
+            model: "gpt-4o",
+            messages: [{ role: "user", content: "hello" }],
+          },
+        });
+
+        expect(failed.statusCode, `${invalidCase.label}: ${failed.body}`).toBe(
+          500,
+        );
+        expect(failed.body).toContain(
+          "LLM proxy plugin returned an invalid response",
+        );
+        expect(failed.body).not.toContain(invalidCase.rawContent);
+        expect(events).toEqual(["response", "error", "cleanup"]);
+
+        const retried = await app.inject({
+          method: "POST",
+          url: `/v1/openai/${agent.id}/chat/completions`,
+          headers: {
+            authorization: "Bearer test-key",
+            "x-archestra-virtual-key": passthroughToken,
+            "content-type": "application/json",
+          },
+          payload: {
+            model: "gpt-4o",
+            messages: [{ role: "user", content: "hello" }],
+          },
+        });
+
+        expect(retried.statusCode, retried.body).toBe(200);
+        expect(retried.json()).toMatchObject({
+          model: "gpt-4o-plugin-rewrite",
+        });
+        expect(events).toEqual([
+          "response",
+          "error",
+          "cleanup",
+          "response",
+          "complete",
+          "cleanup",
+        ]);
+      }
+    } finally {
+      unregister();
+    }
+  });
+
+  test("streaming hooks observe the same completed response snapshot", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    const responses: unknown[] = [];
+    const unregister = registerLlmProxyPlugin({
+      id: `test-stream-snapshot-${crypto.randomUUID()}`,
+      async onModelResponse({ response }) {
+        responses.push(response);
+        return { response: { model: "ignored-streaming-replacement" } };
+      },
+      async onComplete({ response }) {
+        responses.push(response);
+      },
+    });
+    const agent = await makeAgent({ agentType: "llm_proxy", isDefault: true });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const passthroughToken = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+
+    try {
+      await assertBaselineProxyResponse({
+        agentId: agent.id,
+        passthroughToken,
+        stream: true,
+      });
+      expect(responses).toHaveLength(2);
+      expect(responses[0]).toMatchObject({ model: "gpt-4o" });
+      expect(responses[1]).toBe(responses[0]);
+    } finally {
+      unregister();
+    }
+  });
+
+  test("fails a streaming request closed and cleans plugins after a hook error", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    const events: string[] = [];
+    const unregister = registerLlmProxyPlugin({
+      id: `test-stream-error-${crypto.randomUUID()}`,
+      async onBeforeModel() {
+        events.push("before-model");
+        throw new Error("plugin stopped the request");
+      },
+      async onError() {
+        events.push("error");
+      },
+      async onCleanup() {
+        events.push("cleanup");
+      },
+    });
+    const agent = await makeAgent({ agentType: "llm_proxy", isDefault: true });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const passthroughToken = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/openai/${agent.id}/chat/completions`,
+        headers: {
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": passthroughToken,
+          "content-type": "application/json",
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "hello" }],
+          stream: true,
+        },
+      });
+
+      expect(response.statusCode, response.body).toBeGreaterThanOrEqual(400);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(events).toEqual(["before-model", "error", "cleanup"]);
+    } finally {
+      unregister();
+    }
+  });
+
+  test("preserves a provider error when plugin error cleanup also fails", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    const events: string[] = [];
+    const unregister = registerLlmProxyPlugin({
+      id: `test-error-cleanup-${crypto.randomUUID()}`,
+      async onSessionInit() {
+        events.push("init");
+      },
+      async onError() {
+        events.push("error");
+        throw new Error("plugin error cleanup failed");
+      },
+      async onCleanup() {
+        events.push("cleanup");
+      },
+    });
+    const agent = await makeAgent({ agentType: "llm_proxy", isDefault: true });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const passthroughToken = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+    const client = createOpenAiTestClient({});
+    client.chat.completions.create = async () => {
+      throw new Error("provider unavailable");
+    };
+    vi.spyOn(openaiAdapterFactory, "createClient").mockImplementation(
+      () => client as never,
+    );
+
+    try {
+      for (const stream of [false, true]) {
+        events.length = 0;
+        const response = await app.inject({
+          method: "POST",
+          url: `/v1/openai/${agent.id}/chat/completions`,
+          headers: {
+            authorization: "Bearer test-key",
+            "x-archestra-virtual-key": passthroughToken,
+            "content-type": "application/json",
+          },
+          payload: {
+            model: "gpt-4o",
+            messages: [{ role: "user", content: "hello" }],
+            stream,
+          },
+        });
+
+        expect(response.statusCode, response.body).toBeGreaterThanOrEqual(400);
+        expect(response.body).toContain("provider unavailable");
+        expect(response.body).not.toContain("plugin error cleanup failed");
+        expect(events).toEqual(["init", "error", "cleanup"]);
+      }
+    } finally {
+      unregister();
+    }
+  });
+
+  test("cleans an initialized tool-result hook failure before invoking the provider", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    const events: string[] = [];
+    let failOnce = true;
+    const unregister = registerLlmProxyPlugin({
+      id: `test-tool-result-error-${crypto.randomUUID()}`,
+      async onSessionInit() {
+        events.push("init");
+      },
+      async onToolResults() {
+        events.push("tool-results");
+        if (failOnce) {
+          failOnce = false;
+          throw new Error("tool results unavailable");
+        }
+      },
+      async onError() {
+        events.push("error");
+      },
+      async onCleanup() {
+        events.push("cleanup");
+      },
+    });
+    const agent = await makeAgent({ agentType: "llm_proxy", isDefault: true });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const passthroughToken = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+
+    try {
+      const failed = await app.inject({
+        method: "POST",
+        url: `/v1/openai/${agent.id}/chat/completions`,
+        headers: {
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": passthroughToken,
+          "content-type": "application/json",
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "hello" }],
+        },
+      });
+
+      expect(failed.statusCode, failed.body).toBeGreaterThanOrEqual(400);
+      expect(openaiAdapterFactory.createClient).not.toHaveBeenCalled();
+      expect(events).toEqual(["init", "tool-results", "error", "cleanup"]);
+
+      const retried = await app.inject({
+        method: "POST",
+        url: `/v1/openai/${agent.id}/chat/completions`,
+        headers: {
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": passthroughToken,
+          "content-type": "application/json",
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "hello" }],
+        },
+      });
+
+      expect(retried.statusCode, retried.body).toBe(200);
+      expect(openaiAdapterFactory.createClient).toHaveBeenCalledTimes(1);
+      expect(events).toEqual([
+        "init",
+        "tool-results",
+        "error",
+        "cleanup",
+        "init",
+        "tool-results",
+        "cleanup",
+      ]);
+    } finally {
+      unregister();
+    }
+  });
+
+  test("uses the final plugin's rich refusal after an earlier rewrite", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    vi.spyOn(openaiAdapterFactory, "createClient").mockImplementation(
+      () =>
+        ({
+          chat: {
+            completions: {
+              create: async () => ({
+                id: "chatcmpl-plugin-test",
+                object: "chat.completion",
+                created: 1,
+                model: "gpt-4o",
+                choices: [
+                  {
+                    index: 0,
+                    message: {
+                      role: "assistant",
+                      content: null,
+                      refusal: null,
+                      tool_calls: [
+                        {
+                          id: "call-1",
+                          type: "function",
+                          function: { name: "read_file", arguments: "{}" },
+                        },
+                      ],
+                    },
+                    finish_reason: "tool_calls",
+                    logprobs: null,
+                  },
+                ],
+                usage: {
+                  prompt_tokens: 1,
+                  completion_tokens: 1,
+                  total_tokens: 2,
+                },
+              }),
+            },
+          },
+        }) as never,
+    );
+    const events: string[] = [];
+    const unregisterFirst = registerLlmProxyPlugin({
+      id: `test-rewrite-${crypto.randomUUID()}`,
+      async onToolCalls({ toolCalls, resources }) {
+        events.push(toolCalls[0]?.name ?? "missing");
+        resources.set("archestra.appa.refusal", {
+          refusalMessage: "STALE PRIVATE REFUSAL",
+          contentMessage: "STALE PRIVATE REFUSAL",
+          reason: "stale",
+          blockedToolName: "stale",
+          toolInput: {},
+          allToolCallNames: ["stale"],
+        });
+        return {
+          decision: "allow",
+          toolCalls: toolCalls.map((toolCall) => ({
+            ...toolCall,
+            name: `reviewed_${toolCall.name}`,
+          })),
+        };
+      },
+    });
+    const unregisterSecond = registerLlmProxyPlugin({
+      id: `test-refusal-${crypto.randomUUID()}`,
+      async onToolCalls({ toolCalls }) {
+        events.push(toolCalls[0]?.name ?? "missing");
+        return {
+          decision: "refuse",
+          refusal: {
+            refusalMessage: "PRIVATE GENERIC REFUSAL",
+            contentMessage: "Plugin refused reviewed call",
+            reason: "generic plugin denied reviewed call",
+            blockedToolName: toolCalls[0]?.name ?? "missing",
+            toolInput: { path: "/private" },
+            allToolCallNames: [toolCalls[0]?.name ?? "missing"],
+          },
+        };
+      },
+    });
+    const agent = await makeAgent({ agentType: "llm_proxy", isDefault: true });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const passthroughToken = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/openai/${agent.id}/chat/completions`,
+        headers: {
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": passthroughToken,
+          "content-type": "application/json",
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "read a file" }],
+          tools: [
+            {
+              type: "function",
+              function: {
+                name: "read_file",
+                parameters: { type: "object", properties: {} },
+              },
+            },
+          ],
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(200);
+      expect(response.body).toContain("Plugin refused reviewed call");
+      expect(response.body).not.toContain("PRIVATE GENERIC REFUSAL");
+      expect(response.body).not.toContain("STALE PRIVATE REFUSAL");
+      expect(response.body).not.toContain("/private");
+      expect(events).toEqual(["read_file", "reviewed_read_file"]);
+      const [interaction] = await InteractionModel.getAllInteractionsForProfile(
+        agent.id,
+      );
+      expect(interaction.toolCallBlock).toEqual({
+        reason: "generic plugin denied reviewed call",
+        blockedToolCallCount: 1,
+      });
+    } finally {
+      unregisterSecond();
+      unregisterFirst();
+    }
+  });
+
+  test.for([
+    { transport: "re-emits", rewrites: true },
+    { transport: "cannot re-emit", rewrites: false },
+  ])("plugins rule on the reparsed built-in arguments the client runs (transport $transport)", async ({
+    rewrites,
+  }, { makeAgent, makeMember, makeUser }) => {
+    const agentId = crypto.randomUUID();
+    const modelCalls = [
+      {
+        id: "call-direct",
+        name: "archestra__list_agent_runs",
+        arguments: JSON.stringify({
+          agent_ids: JSON.stringify([agentId]),
+          // A string parameter keeps JSON-looking text even when it fails its format.
+          failed_since: JSON.stringify(["not-a-date"]),
+        }),
+      },
+      {
+        id: "call-wrapped",
+        name: "archestra__run_tool",
+        arguments: JSON.stringify({
+          tool_name: "list_agent_runs",
+          tool_args: JSON.stringify({ agent_ids: JSON.stringify([agentId]) }),
+        }),
+      },
+      {
+        // run_tool's envelope repair unwraps the array before policy.
+        id: "call-wrapped-envelope",
+        name: "archestra__run_tool",
+        arguments: JSON.stringify({
+          tool_name: "list_agent_runs",
+          tool_args: { agent_ids: { value: [agentId] } },
+        }),
+      },
+      {
+        // A stringified envelope is neither reparsed nor unwrapped.
+        id: "call-wrapped-stringified-envelope",
+        name: "archestra__run_tool",
+        arguments: JSON.stringify({
+          tool_name: "list_agent_runs",
+          tool_args: { agent_ids: JSON.stringify({ value: [agentId] }) },
+        }),
+      },
+      {
+        // An object where an array is expected is not reparsed, so an
+        // enveloped array stays as permissive as before.
+        id: "call-envelope",
+        name: "archestra__list_agent_runs",
+        arguments: JSON.stringify({
+          agent_ids: JSON.stringify({ value: [agentId] }),
+        }),
+      },
+    ];
+    vi.spyOn(openaiAdapterFactory, "createClient").mockImplementation(
+      () =>
+        createOpenAiTestClient({ nonStreamingToolCalls: modelCalls }) as never,
+    );
+    // A transport that cannot re-emit rewritten calls releases them as written.
+    const provider: typeof openaiAdapterFactory = {
+      ...openaiAdapterFactory,
+      createResponseAdapter(response, request) {
+        const adapter = openaiAdapterFactory.createResponseAdapter(
+          response,
+          request,
+        );
+        if (!rewrites)
+          Object.defineProperty(adapter, "withRewrittenToolCalls", {
+            value: undefined,
+          });
+        return adapter;
+      },
+    };
+    app.post("/test/tool-args/:agentId", async (request, reply) =>
+      handleLLMProxy(
+        request.body as Parameters<typeof provider.createRequestAdapter>[0],
+        request,
+        reply,
+        provider,
+      ),
+    );
+    const ruled: Record<string, string> = {};
+    const unregister = registerLlmProxyPlugin({
+      id: `test-policy-${crypto.randomUUID()}`,
+      finalizesToolCalls: true,
+      async onToolCalls({ toolCalls }) {
+        for (const call of toolCalls)
+          ruled[call.id] =
+            typeof call.arguments === "string"
+              ? call.arguments
+              : JSON.stringify(call.arguments);
+        return { decision: "allow", toolCalls };
+      },
+    });
+    const agent = await makeAgent({ agentType: "llm_proxy" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const passthroughToken = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: `/test/tool-args/${agent.id}`,
+        headers: {
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": passthroughToken,
+          "content-type": "application/json",
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "list the runs" }],
+          tools: ["archestra__list_agent_runs", "archestra__run_tool"].map(
+            (name) => ({
+              type: "function",
+              function: {
+                name,
+                parameters: { type: "object", properties: {} },
+              },
+            }),
+          ),
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(200);
+      const released = Object.fromEntries(
+        (
+          response.json().choices[0].message.tool_calls as Array<{
+            id: string;
+            function: { arguments: string };
+          }>
+        ).map((call) => [call.id, call.function.arguments]),
+      );
+      expect(released).toEqual(
+        rewrites
+          ? ruled
+          : Object.fromEntries(
+              modelCalls.map((call) => [call.id, call.arguments]),
+            ),
+      );
+      expect(
+        Object.fromEntries(
+          Object.entries(ruled).map(([id, args]) => [id, JSON.parse(args)]),
+        ),
+      ).toEqual({
+        "call-direct": {
+          agent_ids: [agentId],
+          failed_since: JSON.stringify(["not-a-date"]),
+        },
+        "call-wrapped": {
+          tool_name: "list_agent_runs",
+          tool_args: JSON.stringify({ agent_ids: [agentId] }),
+        },
+        "call-wrapped-envelope": {
+          tool_name: "list_agent_runs",
+          tool_args: { agent_ids: [agentId] },
+        },
+        "call-wrapped-stringified-envelope": JSON.parse(
+          modelCalls[3].arguments,
+        ),
+        "call-envelope": JSON.parse(modelCalls[4].arguments),
+      });
+    } finally {
+      unregister();
+    }
+  });
+
+  test.for([
+    {
+      stream: false,
+      tool: "read_file",
+      client: {
+        nonStreamingToolCalls: [
+          { id: "call-1", name: "read_file", arguments: "{}" },
+        ],
+      },
+    },
+    {
+      // The stream ends before the usage chunk, so the turn is recorded
+      // without usage.
+      stream: true,
+      tool: "get_weather",
+      client: { includeToolCalls: true, interruptAtChunk: 2 },
+    },
+  ])("records calls an allowing plugin replaced with denial notices (stream: $stream)", async ({
+    stream,
+    tool,
+    client,
+  }, { makeAgent, makeMember, makeUser }) => {
+    vi.spyOn(openaiAdapterFactory, "createClient").mockImplementation(
+      () => createOpenAiTestClient(client) as never,
+    );
+    const unregister = registerLlmProxyPlugin({
+      id: `test-notice-${crypto.randomUUID()}`,
+      finalizesToolCalls: true,
+      async onToolCalls({ toolCalls }) {
+        return {
+          decision: "allow",
+          toolCalls,
+          blocked: toolCalls.map((call) => ({
+            id: call.id,
+            name: call.name,
+            reason: "policy denied the call",
+          })),
+        };
+      },
+    });
+    const agent = await makeAgent({ agentType: "llm_proxy", isDefault: true });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const passthroughToken = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/openai/${agent.id}/chat/completions`,
+        headers: {
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": passthroughToken,
+          "content-type": "application/json",
+        },
+        payload: {
+          model: "gpt-4o",
+          stream,
+          messages: [{ role: "user", content: "use the tool" }],
+          tools: [
+            {
+              type: "function",
+              function: {
+                name: tool,
+                parameters: { type: "object", properties: {} },
+              },
+            },
+          ],
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(200);
+      const [interaction] = await InteractionModel.getAllInteractionsForProfile(
+        agent.id,
+      );
+      expect(interaction.toolCallBlock).toEqual({
+        reason: "policy denied the call",
+        blockedToolCallCount: 1,
+      });
+    } finally {
+      unregister();
+    }
+  });
+});

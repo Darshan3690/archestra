@@ -1,0 +1,563 @@
+import { vi } from "vitest";
+import { ProjectModel, ScheduleTriggerModel } from "@/models";
+import { projectService } from "@/services/project";
+import { fileStore } from "@/skills-sandbox/file-store";
+import { describe, expect, test } from "@/test";
+import { shareForTest } from "@/test/sharing";
+import { grantRoleEverywhere } from "@/test/wildcard-grants";
+
+describe("projectService.restore (decided by the project delete grant)", () => {
+  test("a project admin restores a soft-deleted project, un-hiding its retained files", async ({
+    makeOrganization,
+    makeUser,
+    makeCustomRole,
+    makeMember,
+  }) => {
+    const organizationId = (await makeOrganization()).id;
+    const owner = await makeUser();
+    await makeMember(owner.id, organizationId);
+    const role = await makeCustomRole(organizationId, {
+      permission: { project: ["read", "delete"] },
+    });
+    // Oversight of every project is the grant project:admin became.
+    await grantRoleEverywhere({
+      organizationId: organizationId,
+      resource: "project",
+      roleId: role.id,
+      actions: ["read", "use", "update", "delete", "manage-permissions"],
+    });
+    const admin = await makeUser({ email: "restore-admin@test.com" });
+    await makeMember(admin.id, organizationId, { role: role.role });
+
+    const project = await projectService.create({
+      organizationId,
+      userId: owner.id,
+      name: "recoverable",
+      description: null,
+    });
+    const file = await fileStore.put({
+      organizationId,
+      userId: owner.id,
+      projectId: project.id,
+      conversationId: null,
+      filename: "keep.txt",
+      mimeType: "text/plain",
+      sizeBytes: 3,
+      data: Buffer.from("abc"),
+    });
+
+    await projectService.delete({
+      id: project.id,
+      organizationId,
+      userId: owner.id,
+    });
+    // hidden while deleted
+    expect(
+      await fileStore.get({ ref: file.id, organizationId, userId: owner.id }),
+    ).toBeNull();
+
+    const restored = await projectService.restore({
+      id: project.id,
+      organizationId,
+      userId: admin.id,
+    });
+    expect(restored.id).toBe(project.id);
+    // active again from the API's point of view
+    expect(await ProjectModel.findById(project.id)).not.toBeNull();
+    // ...and its retained file is reachable once more
+    expect(
+      await fileStore.get({ ref: file.id, organizationId, userId: owner.id }),
+    ).not.toBeNull();
+  });
+
+  test("restore resumes schedules FORWARD-ONLY — no catch-up fire for the deleted window", async ({
+    makeOrganization,
+    makeUser,
+    makeCustomRole,
+    makeMember,
+    makeScheduleTrigger,
+  }) => {
+    const organizationId = (await makeOrganization()).id;
+    const owner = await makeUser();
+    await makeMember(owner.id, organizationId);
+    const role = await makeCustomRole(organizationId, {
+      permission: { project: ["read", "delete"] },
+    });
+    // Oversight of every project is the grant project:admin became.
+    await grantRoleEverywhere({
+      organizationId: organizationId,
+      resource: "project",
+      roleId: role.id,
+      actions: ["read", "use", "update", "delete", "manage-permissions"],
+    });
+    const admin = await makeUser({ email: "restore-sched-admin@test.com" });
+    await makeMember(admin.id, organizationId, { role: role.role });
+
+    const project = await projectService.create({
+      organizationId,
+      userId: owner.id,
+      name: "scheduled",
+      description: null,
+    });
+    const trigger = await makeScheduleTrigger({
+      organizationId,
+      actorUserId: owner.id,
+      projectId: project.id,
+    });
+    // Keep the restore assertion within one cron minute, even if real time
+    // crosses a minute boundary while the database operations are running.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-01-01T12:34:30.000Z"));
+
+    // A baseline well in the past makes an every-minute trigger overdue: without
+    // the forward-only bump, restore would fire it once to "catch up".
+    await ScheduleTriggerModel.markExecuted(
+      trigger.id,
+      new Date(Date.now() - 10 * 60_000),
+    );
+
+    const isDue = async () =>
+      (await ScheduleTriggerModel.findDueTriggers(new Date())).some(
+        (t) => t.id === trigger.id,
+      );
+
+    // due while live, paused while deleted
+    expect(await isDue()).toBe(true);
+    await projectService.delete({
+      id: project.id,
+      organizationId,
+      userId: owner.id,
+    });
+    expect(await isDue()).toBe(false);
+
+    await projectService.restore({
+      id: project.id,
+      organizationId,
+      userId: admin.id,
+    });
+
+    // live again, but its baseline was bumped to the restore instant, so its
+    // next run is in the future — it does NOT fire immediately to backfill.
+    expect(await isDue()).toBe(false);
+    // the trigger itself is unchanged/retained (still enabled, still its cron).
+    const after = await ScheduleTriggerModel.findById(trigger.id);
+    expect(after?.enabled).toBe(true);
+    // The next ordinary cron slot still fires; only missed slots stay skipped.
+    vi.setSystemTime(new Date("2026-01-01T12:35:00.000Z"));
+    expect(await isDue()).toBe(true);
+  });
+
+  test("restore does NOT re-attach detached chats — the project comes back with zero conversations", async ({
+    makeOrganization,
+    makeUser,
+    makeCustomRole,
+    makeMember,
+    makeInternalAgent,
+    makeConversation,
+  }) => {
+    const organizationId = (await makeOrganization()).id;
+    const owner = await makeUser();
+    await makeMember(owner.id, organizationId);
+    const role = await makeCustomRole(organizationId, {
+      permission: { project: ["read", "delete"] },
+    });
+    // Oversight of every project is the grant project:admin became.
+    await grantRoleEverywhere({
+      organizationId: organizationId,
+      resource: "project",
+      roleId: role.id,
+      actions: ["read", "use", "update", "delete", "manage-permissions"],
+    });
+    const admin = await makeUser({ email: "restore-chat-admin@test.com" });
+    await makeMember(admin.id, organizationId, { role: role.role });
+
+    const agent = await makeInternalAgent({ organizationId });
+    const conversation = await makeConversation(agent.id, {
+      userId: owner.id,
+      organizationId,
+    });
+    const { project } = await projectService.createProjectFromConversation({
+      organizationId,
+      userId: owner.id,
+      conversationId: conversation.id,
+      name: "from-chat",
+    });
+
+    await projectService.delete({
+      id: project.id,
+      organizationId,
+      userId: owner.id,
+    });
+    const restored = await projectService.restore({
+      id: project.id,
+      organizationId,
+      userId: admin.id,
+    });
+
+    // The chat detached on delete and is never re-adopted, so the restored
+    // project reports no chats even though it had one before.
+    expect(restored.conversationCount).toBe(0);
+  });
+
+  // Restore is decided by the project's own `delete` grant, like deleting it,
+  // so its owner can bring it back; a member without that grant cannot.
+  test("the owner restores their own project; a member without a delete grant cannot (404)", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+  }) => {
+    const organizationId = (await makeOrganization()).id;
+    const owner = await makeUser();
+    await makeMember(owner.id, organizationId);
+    const other = await makeUser();
+    await makeMember(other.id, organizationId);
+
+    const project = await projectService.create({
+      organizationId,
+      userId: owner.id,
+      name: "owned",
+      description: null,
+    });
+    await projectService.delete({
+      id: project.id,
+      organizationId,
+      userId: owner.id,
+    });
+
+    await expect(
+      projectService.restore({
+        id: project.id,
+        organizationId,
+        userId: other.id,
+      }),
+    ).rejects.toMatchObject({ statusCode: 404 });
+    expect(await ProjectModel.findById(project.id)).toBeNull();
+
+    const restored = await projectService.restore({
+      id: project.id,
+      organizationId,
+      userId: owner.id,
+    });
+    expect(restored.id).toBe(project.id);
+  });
+
+  test("restoring an already-active project is a 404", async ({
+    makeOrganization,
+    makeUser,
+    makeCustomRole,
+    makeMember,
+  }) => {
+    const organizationId = (await makeOrganization()).id;
+    const owner = await makeUser();
+    await makeMember(owner.id, organizationId);
+    const role = await makeCustomRole(organizationId, {
+      permission: { project: ["read", "delete"] },
+    });
+    // Oversight of every project is the grant project:admin became.
+    await grantRoleEverywhere({
+      organizationId: organizationId,
+      resource: "project",
+      roleId: role.id,
+      actions: ["read", "use", "update", "delete", "manage-permissions"],
+    });
+    const admin = await makeUser({ email: "restore-active-admin@test.com" });
+    await makeMember(admin.id, organizationId, { role: role.role });
+
+    const project = await projectService.create({
+      organizationId,
+      userId: owner.id,
+      name: "still-here",
+      description: null,
+    });
+
+    await expect(
+      projectService.restore({
+        id: project.id,
+        organizationId,
+        userId: admin.id,
+      }),
+    ).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  test("restore collides with a same-named project created while it was deleted (409)", async ({
+    makeOrganization,
+    makeUser,
+    makeCustomRole,
+    makeMember,
+  }) => {
+    const organizationId = (await makeOrganization()).id;
+    const owner = await makeUser();
+    await makeMember(owner.id, organizationId);
+    const role = await makeCustomRole(organizationId, {
+      permission: { project: ["read", "delete"] },
+    });
+    // Oversight of every project is the grant project:admin became.
+    await grantRoleEverywhere({
+      organizationId: organizationId,
+      resource: "project",
+      roleId: role.id,
+      actions: ["read", "use", "update", "delete", "manage-permissions"],
+    });
+    const admin = await makeUser({ email: "restore-conflict-admin@test.com" });
+    await makeMember(admin.id, organizationId, { role: role.role });
+
+    const first = await projectService.create({
+      organizationId,
+      userId: owner.id,
+      name: "dup",
+      description: null,
+    });
+    // Deleting frees the display name (the unique index is partial on
+    // deleted_at IS NULL)...
+    await projectService.delete({
+      id: first.id,
+      organizationId,
+      userId: owner.id,
+    });
+    // ...so the owner can take it again with a fresh project.
+    await projectService.create({
+      organizationId,
+      userId: owner.id,
+      name: "dup",
+      description: null,
+    });
+
+    // Restoring the first would re-enter (owner, "dup") into the partial index,
+    // which now collides — surfaced as a 409, mapped inside the restore tx.
+    await expect(
+      projectService.restore({
+        id: first.id,
+        organizationId,
+        userId: admin.id,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  test("`name` restores past that collision, renaming without disturbing the project that took the name", async ({
+    makeOrganization,
+    makeUser,
+    makeCustomRole,
+    makeMember,
+  }) => {
+    const organizationId = (await makeOrganization()).id;
+    const owner = await makeUser();
+    await makeMember(owner.id, organizationId);
+    const role = await makeCustomRole(organizationId, {
+      permission: { project: ["read", "delete"] },
+    });
+    // Oversight of every project is the grant project:admin became.
+    await grantRoleEverywhere({
+      organizationId: organizationId,
+      resource: "project",
+      roleId: role.id,
+      actions: ["read", "use", "update", "delete", "manage-permissions"],
+    });
+    const admin = await makeUser({ email: "restore-rename-admin@test.com" });
+    await makeMember(admin.id, organizationId, { role: role.role });
+
+    const first = await projectService.create({
+      organizationId,
+      userId: owner.id,
+      name: "dup",
+      description: null,
+    });
+    const originalSlug = (await ProjectModel.findById(first.id))?.slug;
+    await projectService.delete({
+      id: first.id,
+      organizationId,
+      userId: owner.id,
+    });
+    const squatter = await projectService.create({
+      organizationId,
+      userId: owner.id,
+      name: "dup",
+      description: null,
+    });
+
+    const restored = await projectService.restore({
+      id: first.id,
+      organizationId,
+      userId: admin.id,
+      name: "dup (recovered)",
+    });
+
+    expect(restored.id).toBe(first.id);
+    expect(restored.name).toBe("dup (recovered)");
+    // The rename is a display-name change only: a restore must still land on
+    // the project's own folder, so the slug is untouched (as ordinary renames
+    // leave it).
+    expect((await ProjectModel.findById(first.id))?.slug).toBe(originalSlug);
+    // ...and the project that took the name keeps it.
+    expect((await ProjectModel.findById(squatter.id))?.name).toBe("dup");
+  });
+
+  test("a rename into a name that is ALSO taken is still a 409, and leaves the project deleted", async ({
+    makeOrganization,
+    makeUser,
+    makeCustomRole,
+    makeMember,
+  }) => {
+    const organizationId = (await makeOrganization()).id;
+    const owner = await makeUser();
+    await makeMember(owner.id, organizationId);
+    const role = await makeCustomRole(organizationId, {
+      permission: { project: ["read", "delete"] },
+    });
+    // Oversight of every project is the grant project:admin became.
+    await grantRoleEverywhere({
+      organizationId: organizationId,
+      resource: "project",
+      roleId: role.id,
+      actions: ["read", "use", "update", "delete", "manage-permissions"],
+    });
+    const admin = await makeUser({ email: "restore-rename-taken@test.com" });
+    await makeMember(admin.id, organizationId, { role: role.role });
+
+    const first = await projectService.create({
+      organizationId,
+      userId: owner.id,
+      name: "dup",
+      description: null,
+    });
+    await projectService.delete({
+      id: first.id,
+      organizationId,
+      userId: owner.id,
+    });
+    await projectService.create({
+      organizationId,
+      userId: owner.id,
+      name: "dup",
+      description: null,
+    });
+    await projectService.create({
+      organizationId,
+      userId: owner.id,
+      name: "also taken",
+      description: null,
+    });
+
+    await expect(
+      projectService.restore({
+        id: first.id,
+        organizationId,
+        userId: admin.id,
+        name: "also taken",
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    // The rename and the un-delete share a transaction, so a rejected restore
+    // rolls the rename back rather than leaving a renamed, still-deleted row.
+    expect(await ProjectModel.findById(first.id)).toBeNull();
+    const stillDeleted = await ProjectModel.findDeletedByIdForOrganization({
+      id: first.id,
+      organizationId,
+    });
+    expect(stillDeleted?.name).toBe("dup");
+  });
+
+  test("an overseer without the retired project:share-org restores an org-wide project", async ({
+    makeOrganization,
+    makeUser,
+    makeCustomRole,
+    makeMember,
+  }) => {
+    const organizationId = (await makeOrganization()).id;
+    const owner = await makeUser();
+    await makeMember(owner.id, organizationId);
+    const role = await makeCustomRole(organizationId, {
+      permission: { project: ["read", "delete"] },
+    });
+    // Oversight of every project is the grant project:admin became.
+    await grantRoleEverywhere({
+      organizationId: organizationId,
+      resource: "project",
+      roleId: role.id,
+      actions: ["read", "use", "update", "delete", "manage-permissions"],
+    });
+    const admin = await makeUser({ email: "restore-share-org@test.com" });
+    await makeMember(admin.id, organizationId, { role: role.role });
+
+    const project = await projectService.create({
+      organizationId,
+      userId: owner.id,
+      name: "org-wide",
+      description: null,
+    });
+    await shareForTest({
+      resource: "project",
+      scope: project.id,
+      organizationId,
+      visibility: "organization",
+      teamIds: [],
+    });
+    await projectService.delete({
+      id: project.id,
+      organizationId,
+      userId: owner.id,
+    });
+
+    // `project:share-org` is retired: the org-wide audience no longer adds a
+    // gate, and the overseer's `delete` on every project decides.
+    const restored = await projectService.restore({
+      id: project.id,
+      organizationId,
+      userId: admin.id,
+    });
+    expect(restored.id).toBe(project.id);
+  });
+
+  test("a project admin cannot restore another organization's deleted project (404)", async ({
+    makeOrganization,
+    makeUser,
+    makeCustomRole,
+    makeMember,
+  }) => {
+    const victimOrgId = (await makeOrganization()).id;
+    const victimOwner = await makeUser({
+      email: "cross-tenant-owner@test.com",
+    });
+    await makeMember(victimOwner.id, victimOrgId);
+    const project = await projectService.create({
+      organizationId: victimOrgId,
+      userId: victimOwner.id,
+      name: "not yours",
+      description: null,
+    });
+    await projectService.delete({
+      id: project.id,
+      organizationId: victimOrgId,
+      userId: victimOwner.id,
+    });
+
+    // A full project admin — but of a DIFFERENT org.
+    const attackerOrgId = (await makeOrganization()).id;
+    const role = await makeCustomRole(attackerOrgId, {
+      permission: { project: ["read", "delete"] },
+    });
+    // Oversight of every project is the grant project:admin became.
+    await grantRoleEverywhere({
+      organizationId: attackerOrgId,
+      resource: "project",
+      roleId: role.id,
+      actions: ["read", "use", "update", "delete", "manage-permissions"],
+    });
+    const attacker = await makeUser({ email: "cross-tenant-admin@test.com" });
+    await makeMember(attacker.id, attackerOrgId, { role: role.role });
+
+    await expect(
+      projectService.restore({
+        id: project.id,
+        organizationId: attackerOrgId,
+        userId: attacker.id,
+      }),
+    ).rejects.toMatchObject({ statusCode: 404 });
+    // Still deleted in its own org — the lookup is org-scoped, so the id alone
+    // reaches nothing.
+    expect(
+      await ProjectModel.findDeletedByIdForOrganization({
+        id: project.id,
+        organizationId: victimOrgId,
+      }),
+    ).not.toBeNull();
+  });
+});

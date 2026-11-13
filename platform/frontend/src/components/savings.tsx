@@ -1,57 +1,44 @@
-import type { archestraApiTypes } from "@shared";
+import { calculateCostSavings } from "@archestra/shared";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { formatCurrency } from "@/lib/utils/format-currency";
 import { formatCost } from "./cost";
 
 export function Savings({
   cost,
   baselineCost,
-  toonCostSavings,
-  toonTokensSaved,
-  toonSkipReason,
   format = "percent",
   tooltip = "never",
   className,
   variant = "default",
   baselineModel,
   actualModel,
+  precision = "exact",
 }: {
   cost: string;
   baselineCost: string;
-  toonCostSavings?: string | null;
-  toonTokensSaved?: number | null;
-  toonSkipReason?:
-    | archestraApiTypes.GetInteractionResponses["200"]["toonSkipReason"]
-    | null;
   format?: "percent" | "number";
   tooltip?: "never" | "always" | "hover";
   className?: string;
   variant?: "default" | "session" | "interaction";
-  /** The original requested model before cost optimization */
+  /** The model the request asked for */
   baselineModel?: string | null;
-  /** The actual model used after cost optimization */
+  /** The model the request actually ran on */
   actualModel?: string | null;
+  /** `exact` keeps sub-cent digits; `cents` rounds to two decimals. */
+  precision?: "exact" | "cents";
 }) {
-  const costNum = Number.parseFloat(cost);
-  const baselineCostNum = Number.parseFloat(baselineCost);
-  const toonCostSavingsNum = toonCostSavings
-    ? Number.parseFloat(toonCostSavings)
-    : 0;
-
-  // Calculate cost optimization savings (from model selection)
-  const costOptimizationSavings = baselineCostNum - costNum;
-
-  // Calculate total savings (cost optimization + TOON compression)
-  const totalSavings = costOptimizationSavings + toonCostSavingsNum;
-
-  // Calculate actual cost after all savings
-  const actualCost = baselineCostNum - totalSavings;
-
-  const savingsPercentNum =
-    baselineCostNum > 0 ? (totalSavings / baselineCostNum) * 100 : 0;
+  const formatAmount = precision === "cents" ? formatCurrency : formatCost;
+  const {
+    modelSwapSavings,
+    totalSavings,
+    estimatedCost,
+    actualCost,
+    savingsPercent: savingsPercentNum,
+  } = calculateCostSavings({ cost, baselineCost });
   const savingsPercent =
     savingsPercentNum % 1 === 0
       ? savingsPercentNum.toFixed(0)
@@ -68,7 +55,7 @@ export function Savings({
   if (format === "percent") {
     content = totalSavings > 0 ? `-${savingsPercent}%` : `${savingsPercent}%`;
   } else if (format === "number") {
-    content = totalSavings === 0 ? "$0" : formatCost(Math.abs(totalSavings));
+    content = totalSavings === 0 ? "$0" : formatAmount(Math.abs(totalSavings));
   }
 
   if (tooltip !== "never") {
@@ -78,7 +65,7 @@ export function Savings({
       <Tooltip>
         <TooltipTrigger asChild>
           <span className={`${className || ""} cursor-default`}>
-            {formatCost(actualCost)}
+            {formatAmount(actualCost)}
             {savingsPercentNum >= 0.05 && (
               <span className="text-green-600 dark:text-green-400">
                 {" "}
@@ -92,15 +79,15 @@ export function Savings({
             <div className="space-y-0.5">
               {totalSavings > 0 ? (
                 <>
-                  <div>Estimated Cost: {formatCost(baselineCostNum)}</div>
-                  <div>Actual Cost: {formatCost(actualCost)}</div>
+                  <div>Estimated Cost: {formatAmount(estimatedCost)}</div>
+                  <div>Actual Cost: {formatAmount(actualCost)}</div>
                   <div className="font-semibold">
-                    Savings: {formatCost(totalSavings)}
+                    Savings: {formatAmount(totalSavings)}
                     {savingsPercentNum >= 0.05 && ` (-${savingsPercent}%)`}
                   </div>
                 </>
               ) : (
-                <div>Cost: {formatCost(actualCost)}</div>
+                <div>Cost: {formatAmount(actualCost)}</div>
               )}
             </div>
 
@@ -110,34 +97,18 @@ export function Savings({
               </div>
             ) : (
               <div className="border-t border-border pt-1 mt-1 space-y-0.5 text-muted-foreground">
-                {costOptimizationSavings > 0 ? (
+                {/* Only historical interactions can carry a model swap: the
+                    rules that produced one are gone, so the line renders for
+                    that history and is absent otherwise. */}
+                {modelSwapSavings > 0 && (
                   <div>
-                    Model optimization: -{formatCost(costOptimizationSavings)}
+                    Model swap: -{formatAmount(modelSwapSavings)}
                     {baselineModel &&
                     actualModel &&
                     baselineModel !== actualModel
                       ? ` (${baselineModel} \u2192 ${actualModel})`
                       : ""}
                   </div>
-                ) : (
-                  <div>Model optimization: No matching rule</div>
-                )}
-
-                {toonCostSavingsNum > 0 ? (
-                  <div>
-                    Tool result compression: -{formatCost(toonCostSavingsNum)}
-                    {toonTokensSaved
-                      ? ` (${toonTokensSaved.toLocaleString()} tokens saved)`
-                      : ""}
-                  </div>
-                ) : toonSkipReason === "not_enabled" ? (
-                  <div>Tool result compression: Not enabled</div>
-                ) : toonSkipReason === "not_effective" ? (
-                  <div>Tool result compression: Skipped (no token savings)</div>
-                ) : toonSkipReason === "no_tool_results" ? (
-                  <div>Tool result compression: No tool results</div>
-                ) : (
-                  <div>Tool result compression: Not applied</div>
                 )}
               </div>
             )}

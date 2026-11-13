@@ -16,8 +16,6 @@ export type ErrorExtended = {
 export enum SecretsManagerType {
   DB = "DB",
   Vault = "Vault",
-  /** BYOS (Bring Your Own Secrets) - Vault with external team folder support */
-  BYOS_VAULT = "BYOS_VAULT",
 }
 
 export const ApiErrorTypeSchema = z.enum([
@@ -28,6 +26,9 @@ export const ApiErrorTypeSchema = z.enum([
   "api_not_found_error",
   "unknown_api_error",
   "api_conflict_error",
+  "api_payload_too_large_error",
+  "api_rate_limit_error",
+  "api_service_unavailable_error",
 ]);
 
 /**
@@ -37,6 +38,36 @@ export class ApiError extends Error {
   type: z.infer<typeof ApiErrorTypeSchema>;
   statusCode: number;
   internalCode?: string;
+  /**
+   * True when this error relays a failure returned by an upstream provider
+   * (the provider's own HTTP error, not a fault of ours). Error tracking
+   * drops upstream 5xx relays as non-actionable noise.
+   */
+  upstream?: boolean;
+  /**
+   * Seconds the caller should wait before retrying, surfaced as the
+   * `Retry-After` response header by the central error handler.
+   *
+   * Set it on any throttling error whose clear-time is known: without it a
+   * client sees a bare 429 and falls back to its own escalating backoff, which
+   * for the LLM proxy's native clients means minutes of waiting for a limit
+   * that clears in under one window.
+   */
+  retryAfterSeconds?: number;
+  /**
+   * Whether a retry can succeed, surfaced as the `x-should-retry` response
+   * header that the Anthropic and OpenAI SDKs (and so Claude Code) honor ahead
+   * of their status-based retry rules. Set `false` on any failure that repeats
+   * on every request, so clients show it at once instead of retrying it for
+   * minutes. Those SDKs retry 408, 409, 429, and 5xx statuses by default.
+   */
+  shouldRetry?: boolean;
+  /**
+   * Structured context the client can render, surfaced as `details` on the
+   * error response. Its shape is set by `internalCode`, which must be present
+   * whenever this is.
+   */
+  details?: Record<string, unknown>;
 
   constructor(statusCode: number, message: string, internalCode?: string) {
     super(message);
@@ -61,6 +92,17 @@ export class ApiError extends Error {
         break;
       case 409:
         this.type = "api_conflict_error";
+        break;
+      case 413:
+        this.type = "api_payload_too_large_error";
+        break;
+      case 429:
+        this.type = "api_rate_limit_error";
+        break;
+      // Anthropic uses 529 for the same transient condition as 503.
+      case 503:
+      case 529:
+        this.type = "api_service_unavailable_error";
         break;
       default:
         this.type = "unknown_api_error";

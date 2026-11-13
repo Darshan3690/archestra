@@ -1,19 +1,34 @@
 import {
   isSupportedProvider,
+  MODEL_ROUTER_SUPPORTED_PROVIDERS,
   type SupportedProvider,
+  type SupportedProviderEndpoint,
   SupportedProviders,
-} from "@shared";
-import { LlmProviderApiKeyModelLinkModel, ModelModel } from "@/models";
+} from "@archestra/shared";
+import {
+  LlmProviderApiKeyModelLinkModel,
+  ModelModel,
+  ModelTeamModel,
+} from "@/models";
+import { classifyAzureModelCapabilities } from "@/services/azure-model-capabilities";
 import { ApiError, type Model } from "@/types";
 
 export type ModelRouterResolution = {
   provider: SupportedProvider;
   modelId: string;
   requestedModel: string;
+  /**
+   * The wire surfaces the provider published for this model, carried through so
+   * the router can pick between a provider's chat and Responses surfaces the
+   * same way the chat path does. Null for the providers that serve exactly one
+   * surface, which is all of them but GitHub Copilot.
+   */
+  supportedEndpoints: SupportedProviderEndpoint[] | null;
 };
 
 export async function resolveModelRoute(params: {
   requestedModel: string;
+  capability?: "text-chat" | "embeddings" | "media";
   allowedProviders?: Set<SupportedProvider>;
   allowedApiKeyIds?: string[];
 }): Promise<ModelRouterResolution> {
@@ -30,31 +45,32 @@ export async function resolveModelRoute(params: {
     ) {
       throw new ApiError(
         400,
-        `Model "${requestedModel}" is scoped to provider "${explicit.provider}", but the Model Router virtual key is not mapped to that provider.`,
+        `Model "${requestedModel}" is scoped to provider "${explicit.provider}", but the Unified Model API virtual key is not mapped to that provider.`,
       );
     }
 
-    const providerMatches = await ModelModel.findTextChatModelsByModelId({
-      modelId: explicit.modelId,
+    return resolveProviderModel({
       provider: explicit.provider,
+      modelId: explicit.modelId,
+      requestedModel,
+      capability: params.capability,
+      allowedApiKeyIds: params.allowedApiKeyIds,
     });
+  }
 
-    const accessibleMatches = params.allowedApiKeyIds
-      ? await filterModelsByLinkedApiKeys(
-          providerMatches,
-          params.allowedApiKeyIds,
-        )
-      : providerMatches;
-
-    if (accessibleMatches.length === 1) {
-      return toResolution(accessibleMatches[0], requestedModel);
-    }
-    if (accessibleMatches.length > 1) {
-      throw new ApiError(
-        500,
-        `Ambiguous model resolution: "${requestedModel}" matched ${accessibleMatches.length} models.`,
-      );
-    }
+  // Native clients such as Codex and Hermes expect the provider's own model
+  // slug. A virtual key mapped to exactly one provider makes that slug just as
+  // unambiguous as a qualified id while preserving strict routing for general
+  // multi-provider Unified Model API keys.
+  if (params.allowedProviders?.size === 1) {
+    const [provider] = params.allowedProviders;
+    return resolveProviderModel({
+      provider,
+      modelId: requestedModel,
+      requestedModel,
+      capability: params.capability,
+      allowedApiKeyIds: params.allowedApiKeyIds,
+    });
   }
 
   throw new ApiError(
@@ -86,6 +102,85 @@ export function buildRoutableModelId(model: Model): string {
   return `${model.provider}:${model.modelId}`;
 }
 
+export function sortRoutableModels(models: Model[]): Model[] {
+  return [...models].sort((a, b) => {
+    const providerCompare =
+      providerSortIndex(a.provider) - providerSortIndex(b.provider);
+    if (providerCompare !== 0) return providerCompare;
+    return a.modelId.localeCompare(b.modelId);
+  });
+}
+
+/**
+ * The models a Unified Model API caller may invoke through these provider keys, in
+ * the order GET /models lists them. Callers without a user identity (virtual
+ * keys) see only organization-wide `use` grants, as at proxy time.
+ */
+export async function listRoutableModels(params: {
+  organizationId: string;
+  providerApiKeyIds: string[];
+  userId?: string;
+  includeEmbeddings: boolean;
+  includeMedia?: boolean;
+}): Promise<Model[]> {
+  const linkedModels =
+    await LlmProviderApiKeyModelLinkModel.getModelsForApiKeyIds(
+      params.providerApiKeyIds,
+    );
+  const azureRows =
+    await LlmProviderApiKeyModelLinkModel.findCapabilitiesForApiKeyModels(
+      params.providerApiKeyIds,
+    );
+  const azureRoutableIds = new Set(
+    azureRows
+      .filter((row) => {
+        if (row.model.ignored) return false;
+        const evidence = classifyAzureModelCapabilities(row);
+        if (evidence.status !== "known") return false;
+        return evidence.operations.some(
+          (operation) =>
+            operation === "chat" ||
+            operation === "responses" ||
+            (params.includeEmbeddings && operation === "embedding") ||
+            (params.includeMedia &&
+              [
+                "image-generation",
+                "image-edit",
+                "audio-speech",
+                "audio-transcription",
+                "audio-translation",
+              ].includes(operation)),
+        );
+      })
+      .map((row) => row.model.id),
+  );
+  const candidateModels = linkedModels
+    .map(({ model }) => model)
+    .filter(
+      (model) =>
+        modelRouterSupportedProviders.has(model.provider) &&
+        (azureRoutableIds.has(model.id) ||
+          ModelModel.supportsTextChat(model) ||
+          (params.includeEmbeddings && ModelModel.supportsEmbeddings(model)) ||
+          (params.includeMedia &&
+            !model.ignored &&
+            ["openai", "gemini"].includes(model.provider) &&
+            (model.outputModalities?.includes("image") ||
+              (model.provider === "openai" &&
+                (model.inputModalities?.includes("audio") ||
+                  model.outputModalities?.includes("audio")))))),
+    );
+  const allowedModelIds = await ModelTeamModel.filterAllowedModelIds({
+    modelIds: candidateModels.map((model) => model.id),
+    organizationId: params.organizationId,
+    userId: params.userId,
+    action: "use",
+  });
+  return sortRoutableModels(
+    candidateModels.filter((model) => allowedModelIds.has(model.id)),
+  );
+}
+
 function toResolution(
   model: Model,
   requestedModel: string,
@@ -94,7 +189,66 @@ function toResolution(
     provider: model.provider,
     modelId: model.modelId,
     requestedModel,
+    supportedEndpoints: model.supportedEndpoints ?? null,
   };
+}
+
+async function resolveProviderModel(params: {
+  provider: SupportedProvider;
+  modelId: string;
+  requestedModel: string;
+  capability?: "text-chat" | "embeddings" | "media";
+  allowedApiKeyIds?: string[];
+}): Promise<ModelRouterResolution> {
+  const mediaModel =
+    params.capability === "media" ||
+    (params.provider === "azure" && params.allowedApiKeyIds)
+      ? await ModelModel.findByProviderAndModelId(
+          params.provider,
+          params.modelId,
+        )
+      : null;
+  const providerMatches =
+    params.capability === "media" ||
+    (params.provider === "azure" && params.allowedApiKeyIds)
+      ? mediaModel && !mediaModel.ignored
+        ? [mediaModel]
+        : []
+      : params.capability === "embeddings"
+        ? await ModelModel.findEmbeddingModelsByModelId({
+            modelId: params.modelId,
+            provider: params.provider,
+          })
+        : await ModelModel.findTextChatModelsByModelId({
+            modelId: params.modelId,
+            provider: params.provider,
+          });
+
+  const accessibleMatches = params.allowedApiKeyIds
+    ? await filterModelsByLinkedApiKeys(
+        providerMatches,
+        params.allowedApiKeyIds,
+      )
+    : providerMatches;
+
+  if (accessibleMatches.length === 1) {
+    return toResolution(accessibleMatches[0], params.requestedModel);
+  }
+  if (accessibleMatches.length > 1) {
+    throw new ApiError(
+      500,
+      `Ambiguous model resolution: "${params.requestedModel}" matched ${accessibleMatches.length} models.`,
+    );
+  }
+
+  throw modelNotAvailableError(params.requestedModel);
+}
+
+function modelNotAvailableError(requestedModel: string): ApiError {
+  return new ApiError(
+    404,
+    `Model "${requestedModel}" is not available. Use a provider-qualified model id such as "anthropic:claude-opus-4-6-20250918".`,
+  );
 }
 
 function providerSortIndex(provider: SupportedProvider): number {
@@ -106,20 +260,13 @@ async function filterModelsByLinkedApiKeys(
   models: Model[],
   apiKeyIds: string[],
 ): Promise<Model[]> {
-  if (models.length === 0 || apiKeyIds.length === 0) {
-    return [];
-  }
-  const linked =
-    await LlmProviderApiKeyModelLinkModel.getModelsForApiKeyIds(apiKeyIds);
-  const linkedIds = new Set(linked.map(({ model }) => model.id));
+  const linkedIds = await LlmProviderApiKeyModelLinkModel.filterLinkedModelIds({
+    apiKeyIds,
+    modelIds: models.map((model) => model.id),
+  });
   return models.filter((model) => linkedIds.has(model.id));
 }
 
-export function sortRoutableModels(models: Model[]): Model[] {
-  return [...models].sort((a, b) => {
-    const providerCompare =
-      providerSortIndex(a.provider) - providerSortIndex(b.provider);
-    if (providerCompare !== 0) return providerCompare;
-    return a.modelId.localeCompare(b.modelId);
-  });
-}
+const modelRouterSupportedProviders = new Set<SupportedProvider>(
+  MODEL_ROUTER_SUPPORTED_PROVIDERS,
+);

@@ -1,0 +1,970 @@
+"use client";
+
+import {
+  isOpenRouterLatestAlias,
+  providerRequiresPerUserCredential,
+} from "@archestra/shared";
+import type { ColumnDef } from "@tanstack/react-table";
+import {
+  ArrowLeftRight,
+  Boxes,
+  Brain,
+  Eye,
+  EyeOff,
+  Fingerprint,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Server,
+  Trash2,
+  UserRoundCheck,
+  Users,
+} from "lucide-react";
+import Image from "next/image";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { CreateLlmProviderApiKeyDialog } from "@/components/create-llm-provider-api-key-dialog";
+import { DeleteConfirmDialog } from "@/components/delete-confirm-dialog";
+import { EntityLabelFilter } from "@/components/entity-label-filter";
+import {
+  CollectionFilters,
+  FilterBar,
+  FilterSelect,
+  filterControlClass,
+  filterSearchClass,
+} from "@/components/filter-bar";
+import { useSelectedLabels } from "@/components/label-select";
+import { LabelTags } from "@/components/label-tags";
+import { LlmProviderApiKeyDropdown } from "@/components/llm-provider-api-key-dropdown";
+import { PROVIDER_CONFIG } from "@/components/llm-provider-api-key-form";
+import {
+  BestModelBadge,
+  EmbeddingModelBadge,
+  FreeModelBadge,
+  LatestModelBadge,
+  PerUserModelBadge,
+  UnknownCapabilitiesBadge,
+} from "@/components/model-badges";
+import { PageLayout } from "@/components/page-layout";
+import { QueryLoadError } from "@/components/query-load-error";
+import {
+  RESOURCE_ACCESS_FILTER_PARAMS,
+  ResourceAccessFilter,
+} from "@/components/resource-access-filter";
+import { ResourceListActions } from "@/components/resource-list-actions";
+import { useScopeFilterParams } from "@/components/resource-scope-filter";
+import { SearchInput } from "@/components/search-input";
+import { SubscriptionReconnectNotice } from "@/components/subscription-reconnect-notice";
+import { TableRowActions } from "@/components/table-row-actions";
+import { Badge } from "@/components/ui/badge";
+import { BulkActions } from "@/components/ui/bulk-actions-bar";
+import { BulkActionsScope } from "@/components/ui/bulk-actions-context";
+import { createSelectColumn } from "@/components/ui/bulk-select-column";
+import { Button } from "@/components/ui/button";
+import { DataTable } from "@/components/ui/data-table";
+import { InlineNotice, InlineNoticeText } from "@/components/ui/inline-notice";
+import { Label } from "@/components/ui/label";
+import { PermissionButton } from "@/components/ui/permission-button";
+import { Switch } from "@/components/ui/switch";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
+  useHasPermissions,
+  useScopedCapabilities,
+} from "@/lib/auth/auth.query";
+import { reportBulkOutcome } from "@/lib/bulk-action";
+import {
+  useModelLabelKeys,
+  useModelLabelValues,
+} from "@/lib/entity-labels.query";
+import { useBulkSelection } from "@/lib/hooks/use-bulk-selection";
+import { useDataTableQueryParams } from "@/lib/hooks/use-data-table-query-params";
+import { useDialogUrlParam } from "@/lib/hooks/use-dialog-url-param";
+import {
+  type ModelWithApiKeys,
+  useBulkUpdateModelVisibility,
+  useDeleteModel,
+  useModelsWithApiKeys,
+  useSyncLlmModels,
+  useUpdateModel,
+} from "@/lib/llm-models.query";
+import { useLlmProviderApiKeys } from "@/lib/llm-provider-api-keys.query";
+import {
+  formatMediaPricing,
+  formatPricePerMillion,
+} from "@/lib/model-price-format";
+import { formatContextLength } from "@/lib/utils/format-context-length";
+import { EditModelDialog } from "./_parts/edit-model-dialog";
+import {
+  canFilterFreeModelsForApiKey,
+  filterModelsForPage,
+  type ModelsPageModelTypeFilter,
+  OBSERVED_MODEL_SOURCE_DESCRIPTION,
+  OBSERVED_MODEL_SOURCE_LABEL,
+  resolveDisplayContextLength,
+  resolveDisplayOutputLength,
+} from "./models-page-utils";
+
+export default function ModelsPage() {
+  const { searchParams, updateQueryParams } = useDataTableQueryParams();
+  const apiKeyFilter = searchParams.get("apiKey") ?? "all";
+  const { hasActiveScopeFilters, access, sharedWith } = useScopeFilterParams();
+  const {
+    data: models = [],
+    isFetching,
+    isLoadingError: isModelsLoadError,
+    error: modelsError,
+    refetch,
+  } = useModelsWithApiKeys({
+    toastOnError: false,
+    access,
+    sharedWith,
+    apiKeyIds: apiKeyFilter === "all" ? undefined : [apiKeyFilter],
+  });
+  const { data: apiKeys = [], isLoading: isApiKeysLoading } =
+    useLlmProviderApiKeys();
+  const syncModelsMutation = useSyncLlmModels();
+  const updateModel = useUpdateModel();
+  const deleteModel = useDeleteModel();
+  const [deletingModel, setDeletingModel] = useState<ModelWithApiKeys | null>(
+    null,
+  );
+  const [isRefreshingModels, setIsRefreshingModels] = useState(false);
+  const { data: baseCanUpdate } = useHasPermissions({ llmModel: ["update"] });
+  const { data: scopedCapabilities } = useScopedCapabilities();
+  const canUpdateModel = useCallback(
+    (id: string) =>
+      !!baseCanUpdate ||
+      !!scopedCapabilities?.some(
+        (grant) =>
+          grant.resource === "llmModel" &&
+          grant.action === "update" &&
+          (grant.scope === "*" || grant.scope === id),
+      ),
+    [baseCanUpdate, scopedCapabilities],
+  );
+
+  const selectedLabels = useSelectedLabels();
+  const [isCreateApiKeyDialogOpen, setIsCreateApiKeyDialogOpen] =
+    useState(false);
+  const [apiKeyFilterOpen, setApiKeyFilterOpen] = useState(false);
+  // Filters live in the URL so they survive reloads and are shareable, like the
+  // other list pages' table filters.
+  const search = searchParams.get("search") ?? "";
+  const modelTypeParam = searchParams.get("modelType");
+  const modelTypeFilter: ModelsPageModelTypeFilter =
+    modelTypeParam === "chat" || modelTypeParam === "embedding"
+      ? modelTypeParam
+      : "all";
+  const freeOnly = searchParams.get("freeOnly") === "true";
+  const labelsFilter = searchParams.get("labels") ?? "";
+  const editId = searchParams.get("edit");
+  const modelFromUrl = useMemo(
+    () => models.find((model) => model.id === editId) ?? null,
+    [models, editId],
+  );
+  const {
+    entity: editingModel,
+    open: openEditDialog,
+    close: closeEditDialog,
+  } = useDialogUrlParam({ paramName: "edit", entityFromUrl: modelFromUrl });
+
+  const canFilterFreeModels = useMemo(
+    () =>
+      canFilterFreeModelsForApiKey({ availableApiKeys: apiKeys, apiKeyFilter }),
+    [apiKeys, apiKeyFilter],
+  );
+
+  useEffect(() => {
+    // Wait for the provider-key query to settle before clearing: on a cold
+    // cache `apiKeys` starts empty, so acting while it loads would strip a
+    // `?freeOnly=true` deep link before an OpenRouter key had a chance to load.
+    if (!isApiKeysLoading && !canFilterFreeModels && freeOnly) {
+      updateQueryParams({ freeOnly: null });
+    }
+  }, [isApiKeysLoading, canFilterFreeModels, freeOnly, updateQueryParams]);
+
+  const bulkVisibility = useBulkUpdateModelVisibility();
+
+  const filteredModels = useMemo(() => {
+    const byPageFilters = filterModelsForPage({
+      models,
+      search,
+      apiKeyFilter,
+      modelTypeFilter,
+      freeOnly,
+      canFilterFreeModels,
+    });
+    // Labels narrow the selected instance's catalog in the browser.
+    if (!selectedLabels) return byPageFilters;
+    return byPageFilters.filter((model) =>
+      Object.entries(selectedLabels).every(([key, values]) =>
+        model.labels.some(
+          (label) => label.key === key && values.includes(label.value),
+        ),
+      ),
+    );
+  }, [
+    models,
+    search,
+    apiKeyFilter,
+    modelTypeFilter,
+    freeOnly,
+    canFilterFreeModels,
+    selectedLabels,
+  ]);
+
+  const handleRefresh = useCallback(async () => {
+    setIsRefreshingModels(true);
+    try {
+      await syncModelsMutation.mutateAsync();
+      await refetch();
+    } finally {
+      setIsRefreshingModels(false);
+    }
+  }, [syncModelsMutation, refetch]);
+
+  const {
+    rowSelection,
+    setRowSelection,
+    onPageRowIdsChange,
+    clearSelection,
+    selected: selectedModels,
+    selectAllMatching,
+  } = useBulkSelection({
+    rows: filteredModels,
+    getId: (model) => model.id,
+    filterSignature: JSON.stringify({
+      search,
+      apiKeyFilter,
+      modelTypeFilter,
+      freeOnly,
+      labelsFilter,
+      access,
+      sharedWith,
+    }),
+    matchDescription: "match the current filters",
+  });
+
+  const hasActiveFilters = Boolean(
+    search ||
+      apiKeyFilter !== "all" ||
+      modelTypeFilter !== "all" ||
+      (canFilterFreeModels && freeOnly) ||
+      labelsFilter ||
+      hasActiveScopeFilters,
+  );
+  const clearFilters = useCallback(() => {
+    updateQueryParams({
+      search: null,
+      apiKey: null,
+      modelType: null,
+      freeOnly: null,
+      labels: null,
+      ...Object.fromEntries(
+        RESOURCE_ACCESS_FILTER_PARAMS.map((param) => [param, null]),
+      ),
+    });
+  }, [updateQueryParams]);
+
+  // Hiding keeps a model out of the pickers without deleting anything, so the
+  // bar offers both directions rather than a single toggle whose meaning would
+  // depend on a mixed selection.
+  const applyVisibility = (ignored: boolean) =>
+    bulkVisibility.mutate(
+      { models: selectedModels, ignored },
+      {
+        onSuccess: (outcome) => {
+          reportBulkOutcome({
+            outcome,
+            verb: ignored ? "Hid" : "Showed",
+            failureVerb: ignored ? "hide" : "show",
+            noun: "model",
+          });
+          if (outcome.failed.length === 0) clearSelection();
+        },
+      },
+    );
+
+  const refreshModelsButton = (
+    <div className="flex items-center gap-2">
+      <PermissionButton
+        permissions={{ llmModel: ["update"] }}
+        variant="outline"
+        size="sm"
+        onClick={handleRefresh}
+        disabled={isRefreshingModels}
+      >
+        <RefreshCw
+          className={`h-4 w-4 ${isRefreshingModels ? "animate-spin" : ""}`}
+        />
+        {isRefreshingModels ? "Refreshing..." : "Refresh Models"}
+      </PermissionButton>
+      <ResourceListActions resource="llmModel" />
+    </div>
+  );
+
+  const columns: ColumnDef<ModelWithApiKeys>[] = useMemo(
+    () => [
+      createSelectColumn<ModelWithApiKeys>({
+        rowLabel: (model) => `Select ${model.modelId}`,
+        allLabel: "Select all models on this page",
+      }),
+      {
+        accessorKey: "modelId",
+        header: "Model ID",
+        cell: ({ row }) => {
+          const { modelId, provider, isFree, description } = row.original;
+          const isLatestAlias = isOpenRouterLatestAlias(provider, modelId);
+          // The provider icon sits inline before the model ID (as the knowledge
+          // connectors table does) rather than in its own column, saving the
+          // table a fixed slot of horizontal space.
+          const config = PROVIDER_CONFIG[provider];
+          return (
+            <div className="flex min-w-0 items-center gap-3">
+              {config && (
+                <Image
+                  src={config.icon}
+                  alt={config.name}
+                  width={20}
+                  height={20}
+                  className="shrink-0 rounded dark:invert"
+                />
+              )}
+              <div className="min-w-0 space-y-2">
+                <span className="flex items-center gap-2 font-mono text-sm">
+                  <span className="truncate">{modelId}</span>
+                  <LabelTags labels={row.original.labels} />
+                </span>
+                {description && description !== modelId && (
+                  <p className="truncate text-xs text-muted-foreground">
+                    {description}
+                  </p>
+                )}
+                <div className="mt-0.5 flex flex-wrap items-center gap-2">
+                  {isFree && <FreeModelBadge />}
+                  {isLatestAlias && <LatestModelBadge />}
+                  {row.original.isBest && <BestModelBadge />}
+                  {providerRequiresPerUserCredential(provider) &&
+                    // A model linked to a shared key (an organization GitHub
+                    // App key) is not per-user.
+                    !row.original.apiKeys.some(
+                      (key) => key.scope !== "personal",
+                    ) && <PerUserModelBadge />}
+                  {row.original.embeddingDimensions !== null && (
+                    <EmbeddingModelBadge />
+                  )}
+                  {row.original.teams.length > 0 && (
+                    <TooltipProvider>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Badge variant="outline" className="text-xs gap-1">
+                            <Users className="h-3 w-3 shrink-0" />
+                            <span>
+                              {row.original.teams.length === 1
+                                ? "1 team"
+                                : `${row.original.teams.length} teams`}
+                            </span>
+                          </Badge>
+                        </TooltipTrigger>
+                        <TooltipContent className="max-w-xs">
+                          <p>
+                            Limited to:{" "}
+                            {row.original.teams
+                              .map((team) => team.name)
+                              .join(", ")}
+                          </p>
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  )}
+                  {row.original.users.length > 0 && (
+                    <TooltipProvider>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Badge variant="outline" className="text-xs gap-1">
+                            <UserRoundCheck className="h-3 w-3 shrink-0" />
+                            <span>
+                              {row.original.users.length === 1
+                                ? "1 person"
+                                : `${row.original.users.length} people`}
+                            </span>
+                          </Badge>
+                        </TooltipTrigger>
+                        <TooltipContent className="max-w-xs">
+                          <p>
+                            Limited to:{" "}
+                            {row.original.users
+                              .map((user) => user.name)
+                              .join(", ")}
+                          </p>
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        },
+      },
+      {
+        accessorKey: "apiKeys",
+        size: 160,
+        header: "Source",
+        cell: ({ row }) => {
+          const apiKeys = row.original.apiKeys;
+          if (apiKeys.length === 0) {
+            if (row.original.discoveredViaLlmProxy) {
+              return (
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      {/* Bounded like the API-key badges beside it: this
+                          label is the longest thing the column ever renders,
+                          and unbounded it spilled over the next column. */}
+                      <Badge
+                        variant="secondary"
+                        className="text-xs gap-1 max-w-full"
+                      >
+                        <ArrowLeftRight className="h-3 w-3 shrink-0" />
+                        <span className="truncate">
+                          {OBSERVED_MODEL_SOURCE_LABEL}
+                        </span>
+                      </Badge>
+                    </TooltipTrigger>
+                    <TooltipContent className="max-w-xs">
+                      <p>{OBSERVED_MODEL_SOURCE_DESCRIPTION}</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              );
+            }
+            return <span className="text-sm text-muted-foreground">-</span>;
+          }
+          return (
+            <div className="flex flex-wrap gap-1">
+              {apiKeys.map((apiKey) => (
+                <Badge
+                  key={apiKey.id}
+                  variant={apiKey.isSystem ? "secondary" : "outline"}
+                  className="text-xs gap-1 max-w-full"
+                >
+                  {apiKey.isSystem && <Server className="h-3 w-3 shrink-0" />}
+                  <span className="truncate">{apiKey.name}</span>
+                </Badge>
+              ))}
+            </div>
+          );
+        },
+      },
+      {
+        id: "pricingInputOutput",
+        size: 160,
+        // Input and output prices share one column (like Cache R/W) to save
+        // horizontal space, shown "$input / $output" and free to wrap onto two
+        // lines when the column is narrow.
+        header: "$/M In/Out",
+        cell: ({ row }) => {
+          const { pricePerMillionInput, pricePerMillionOutput, mediaPricing } =
+            row.original;
+          if (hasUnknownCapabilities(row.original)) return null;
+          // A media model is charged by its media rates; the per-token price
+          // beside it would be a fallback estimate nothing is billed at.
+          if (mediaPricing) {
+            return (
+              <span className="text-sm font-mono">
+                {formatMediaPricing(mediaPricing)}
+              </span>
+            );
+          }
+          if (!pricePerMillionInput && !pricePerMillionOutput) {
+            return <span className="text-sm text-muted-foreground">-</span>;
+          }
+          const input = pricePerMillionInput
+            ? `$${formatPricePerMillion(pricePerMillionInput)}`
+            : "-";
+          const output = pricePerMillionOutput
+            ? `$${formatPricePerMillion(pricePerMillionOutput)}`
+            : "-";
+          return (
+            <span className="text-sm font-mono">{`${input} / ${output}`}</span>
+          );
+        },
+      },
+      {
+        id: "pricingCache",
+        size: 160,
+        header: "$/M Cache R/W",
+        cell: ({ row }) => {
+          const {
+            pricePerMillionCacheRead,
+            pricePerMillionCacheWrite,
+            mediaPricing,
+          } = row.original;
+          if (hasUnknownCapabilities(row.original)) return null;
+          if (
+            mediaPricing ||
+            (pricePerMillionCacheRead === null &&
+              pricePerMillionCacheWrite === null)
+          ) {
+            return <span className="text-sm text-muted-foreground">-</span>;
+          }
+          return (
+            <span className="text-sm font-mono">
+              {`${pricePerMillionCacheRead === null ? "-" : `$${formatPricePerMillion(pricePerMillionCacheRead)}`} / ${pricePerMillionCacheWrite === null ? "-" : `$${formatPricePerMillion(pricePerMillionCacheWrite)}`}`}
+            </span>
+          );
+        },
+      },
+      {
+        id: "contextLength",
+        // Sorting must follow what the cell shows, not the architectural column.
+        accessorFn: (row) => resolveDisplayContextLength(row).display,
+        size: 88,
+        header: "Context",
+        cell: ({ row }) => {
+          if (hasUnknownCapabilities(row.original)) {
+            return <UnknownCapabilitiesBadge />;
+          }
+          const { display, architectural, isCapped, isCustom } =
+            resolveDisplayContextLength(row.original);
+          if (isCapped) {
+            return (
+              <AnnotatedTokenLimit value={display}>
+                This model supports {formatContextLength(architectural)} tokens,
+                but is capped at {formatContextLength(display)} by its Ollama
+                Modelfile or a configured num_ctx.
+              </AnnotatedTokenLimit>
+            );
+          }
+          if (isCustom) {
+            return (
+              <AnnotatedTokenLimit value={display}>
+                Set manually, overriding whatever the provider reports for this
+                model.
+              </AnnotatedTokenLimit>
+            );
+          }
+          return (
+            <span className="text-sm">{formatContextLength(display)}</span>
+          );
+        },
+      },
+      {
+        id: "outputLength",
+        // Sorting follows the cell, which prefers the admin override.
+        accessorFn: (row) => resolveDisplayOutputLength(row).display,
+        size: 100,
+        header: "Max output",
+        cell: ({ row }) => {
+          if (hasUnknownCapabilities(row.original)) return null;
+          const { display, isCustom } = resolveDisplayOutputLength(
+            row.original,
+          );
+          if (!isCustom) {
+            return (
+              <span className="text-sm">{formatContextLength(display)}</span>
+            );
+          }
+          return (
+            <AnnotatedTokenLimit value={display}>
+              Set manually, overriding whatever the provider reports for this
+              model.
+            </AnnotatedTokenLimit>
+          );
+        },
+      },
+      {
+        id: "actions",
+        header: "Actions",
+        cell: ({ row }) => (
+          <TableRowActions
+            itemName={row.original.modelId}
+            actions={[
+              {
+                icon: row.original.ignored ? (
+                  <Eye className="h-4 w-4" />
+                ) : (
+                  <EyeOff className="h-4 w-4" />
+                ),
+                label: row.original.ignored ? "Show model" : "Hide model",
+                tooltip: row.original.ignored
+                  ? "Enable model selection and requests, subject to its permissions"
+                  : "Hide from selection and block new requests, including direct API calls",
+                onClick: () =>
+                  updateModel.mutate({
+                    id: row.original.id,
+                    ignored: !row.original.ignored,
+                  }),
+                disabled:
+                  updateModel.isPending || !canUpdateModel(row.original.id),
+              },
+              {
+                icon: <Pencil className="h-4 w-4" />,
+                label: "Edit",
+                disabled: !canUpdateModel(row.original.id),
+                onClick: () => openEditDialog(row.original),
+              },
+            ]}
+            dropdownActions={[
+              {
+                icon: <Trash2 className="h-4 w-4" />,
+                label: "Delete",
+                variant: "destructive",
+                disabled: !baseCanUpdate,
+                disabledTooltip:
+                  "Requires organization-wide model management permission",
+                onClick: () => setDeletingModel(row.original),
+              },
+            ]}
+          />
+        ),
+      },
+    ],
+    [updateModel, openEditDialog, canUpdateModel, baseCanUpdate],
+  );
+
+  if (isModelsLoadError) {
+    return (
+      <PageLayout
+        title="Models"
+        description='Models available from your configured providers. Use "Refresh Models" to re-fetch models and capabilities from providers.'
+        actionButton={refreshModelsButton}
+      >
+        <QueryLoadError
+          title="Couldn't load your models"
+          description={modelsError?.message}
+          onRetry={() => refetch()}
+        />
+      </PageLayout>
+    );
+  }
+
+  return (
+    <PageLayout
+      title="Models"
+      description='Models available from your configured providers. Use "Refresh Models" to re-fetch models and capabilities from providers.'
+      actionButton={refreshModelsButton}
+    >
+      {(apiKeys.some((key) => key.requiresReauthentication) ||
+        syncModelsMutation.data?.success === false) && (
+        <div className="mb-4 space-y-2">
+          {apiKeys
+            .filter((key) => key.requiresReauthentication)
+            .map((key) => (
+              <SubscriptionReconnectNotice key={key.id} credential={key} />
+            ))}
+          {syncModelsMutation.data?.success === false && (
+            <InlineNotice>
+              <RefreshCw />
+              <span className="font-medium">
+                Some models could not be refreshed
+              </span>
+              <InlineNoticeText>
+                {syncModelsMutation.data.failures
+                  .map((failure) => failure.name)
+                  .join(", ")}
+                . Existing models are still listed.
+              </InlineNoticeText>
+            </InlineNotice>
+          )}
+        </div>
+      )}
+      <BulkActionsScope>
+        {/* An access filter that matches nothing keeps the bar, so it can
+            be cleared. */}
+        {(models.length > 0 || hasActiveScopeFilters) && (
+          <CollectionFilters>
+            <FilterBar
+              leading
+              onClearFilters={hasActiveFilters ? clearFilters : undefined}
+              search={
+                <SearchInput
+                  objectNamePlural="models"
+                  searchFields={["model ID", "name"]}
+                  paramName="search"
+                  className={filterSearchClass}
+                />
+              }
+            >
+              <ResourceAccessFilter
+                resource="llmModel"
+                noun="models"
+                owned={false}
+              />
+              <LlmProviderApiKeyDropdown
+                availableKeys={apiKeys}
+                selectedApiKeyId={apiKeyFilter === "all" ? null : apiKeyFilter}
+                open={apiKeyFilterOpen}
+                onOpenChange={setApiKeyFilterOpen}
+                onSelectKey={(value) => {
+                  updateQueryParams({ apiKey: value });
+                  setApiKeyFilterOpen(false);
+                }}
+                triggerVariant="select"
+                triggerClassName={filterControlClass({
+                  active: apiKeyFilter !== "all",
+                })}
+                popoverClassName="w-[min(20rem,calc(100vw-2rem))]"
+                allOptionLabel="All provider API keys"
+                allOptionSelected={apiKeyFilter === "all"}
+                onSelectAllOption={() => {
+                  updateQueryParams({ apiKey: null });
+                  setApiKeyFilterOpen(false);
+                }}
+              />
+              <FilterSelect
+                value={modelTypeFilter}
+                onValueChange={(v) =>
+                  updateQueryParams({ modelType: v === "all" ? null : v })
+                }
+                placeholder="Model type"
+                items={[
+                  {
+                    value: "all",
+                    label: "All models",
+                    content: (
+                      <span className="flex items-center gap-2">
+                        <Boxes className="h-4 w-4 text-muted-foreground" />
+                        <span>All models</span>
+                      </span>
+                    ),
+                    selectedContent: (
+                      <span className="flex items-center gap-2">
+                        <Boxes className="h-4 w-4 text-muted-foreground" />
+                        <span>All models</span>
+                      </span>
+                    ),
+                  },
+                  {
+                    value: "chat",
+                    label: "Chat / generation",
+                    content: (
+                      <span className="flex items-center gap-2">
+                        <Brain className="h-4 w-4 text-muted-foreground" />
+                        <span>Chat / generation</span>
+                      </span>
+                    ),
+                    selectedContent: (
+                      <span className="flex items-center gap-2">
+                        <Brain className="h-4 w-4 text-muted-foreground" />
+                        <span>Chat / generation</span>
+                      </span>
+                    ),
+                  },
+                  {
+                    value: "embedding",
+                    label: "Embedding",
+                    content: (
+                      <span className="flex items-center gap-2">
+                        <Fingerprint className="h-4 w-4 text-muted-foreground" />
+                        <span>Embedding</span>
+                      </span>
+                    ),
+                    selectedContent: (
+                      <span className="flex items-center gap-2">
+                        <Fingerprint className="h-4 w-4 text-muted-foreground" />
+                        <span>Embedding</span>
+                      </span>
+                    ),
+                  },
+                ]}
+              />
+              {canFilterFreeModels && (
+                <div className="flex items-center gap-2">
+                  <Switch
+                    id="models-free-only"
+                    checked={freeOnly}
+                    onCheckedChange={(checked) =>
+                      updateQueryParams({ freeOnly: checked ? "true" : null })
+                    }
+                  />
+                  <Label
+                    htmlFor="models-free-only"
+                    className="text-sm text-muted-foreground"
+                  >
+                    Free only
+                  </Label>
+                </div>
+              )}
+              <EntityLabelFilter
+                useLabelKeys={useModelLabelKeys}
+                useLabelValues={useModelLabelValues}
+                className={filterControlClass({
+                  active: Boolean(selectedLabels),
+                })}
+              />
+            </FilterBar>
+          </CollectionFilters>
+        )}
+        <BulkActions
+          count={selectedModels.length}
+          noun="model"
+          onClear={clearSelection}
+          selectAllMatching={selectAllMatching}
+          busy={bulkVisibility.isPending}
+        >
+          <PermissionButton
+            permissions={{ llmModel: ["update"] }}
+            variant="outline"
+            size="sm"
+            onClick={() => applyVisibility(false)}
+          >
+            <Eye className="h-4 w-4" />
+            <span>Show</span>
+          </PermissionButton>
+          <PermissionButton
+            permissions={{ llmModel: ["update"] }}
+            variant="outline"
+            size="sm"
+            onClick={() => applyVisibility(true)}
+          >
+            <EyeOff className="h-4 w-4" />
+            <span>Hide</span>
+          </PermissionButton>
+        </BulkActions>
+
+        <DataTable
+          columns={columns}
+          flexibleColumnIds={["modelId"]}
+          fixedWidthColumnIds={[
+            "apiKeys",
+            "pricingInputOutput",
+            "pricingCache",
+            "contextLength",
+            "outputLength",
+          ]}
+          // Cached pricing and the key a model came from matter least next
+          // to its prices and limits, so a narrow window drops them first.
+          columnDropOrder={["pricingCache", "apiKeys"]}
+          data={filteredModels}
+          getRowId={(row) => row.id}
+          rowSelection={rowSelection}
+          onRowSelectionChange={setRowSelection}
+          onPageRowIdsChange={onPageRowIdsChange}
+          getRowClassName={(row) =>
+            row.ignored ? "opacity-60 [&_td]:text-muted-foreground" : undefined
+          }
+          hideSelectedCount
+          isLoading={isFetching}
+          hasActiveFilters={hasActiveFilters}
+          filteredEmptyMessage="No models match your filters"
+          onClearFilters={clearFilters}
+          emptyIcon={Boxes}
+          emptyMessage={
+            apiKeys.length === 0 ? "No models available" : "No models found"
+          }
+          emptyDescription={
+            apiKeys.length === 0
+              ? "Add an API key to see available models."
+              : undefined
+          }
+          emptyAction={
+            apiKeys.length === 0 ? (
+              <Button onClick={() => setIsCreateApiKeyDialogOpen(true)}>
+                <Plus className="h-4 w-4" />
+                <span>Add API Key</span>
+              </Button>
+            ) : undefined
+          }
+        />
+      </BulkActionsScope>
+
+      <CreateLlmProviderApiKeyDialog
+        open={isCreateApiKeyDialogOpen}
+        onOpenChange={setIsCreateApiKeyDialogOpen}
+        title="Add API Key"
+        description="Add a new LLM provider API key to load its available models."
+      />
+
+      <DeleteConfirmDialog
+        open={!!deletingModel}
+        onOpenChange={(open) => {
+          if (!open && !deleteModel.isPending) setDeletingModel(null);
+        }}
+        title="Delete model"
+        description={`Remove ${deletingModel?.modelId ?? "this entry"} from Models for everyone? Only unconfigured entries observed in requests can be removed. Recorded requests and spend will remain. Another request can add the entry again.`}
+        isPending={deleteModel.isPending}
+        onConfirm={() => {
+          if (deletingModel)
+            deleteModel.mutate(deletingModel.id, {
+              onSuccess: () => setDeletingModel(null),
+            });
+        }}
+      />
+
+      {editingModel && (
+        <EditModelDialog
+          model={editingModel}
+          open={!!editingModel}
+          onOpenChange={(open) => {
+            if (!open) closeEditDialog();
+          }}
+        />
+      )}
+    </PageLayout>
+  );
+}
+
+// --- Internal helpers ---
+
+/**
+ * A token-limit table cell whose number needs a footnote — an Ollama-capped
+ * window, or a value an admin set because the provider reports none. Dotted
+ * underline marks it as explainable rather than just rendering an unexplained
+ * number the provider never published.
+ */
+function AnnotatedTokenLimit({
+  value,
+  children,
+}: {
+  value: number | null;
+  children: React.ReactNode;
+}) {
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="text-sm underline decoration-dotted underline-offset-4">
+            {formatContextLength(value)}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-xs">
+          <p>{children}</p>
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
+function hasUnknownCapabilities(model: ModelWithApiKeys): boolean {
+  const hasInputModalities =
+    model.inputModalities && model.inputModalities.length > 0;
+  const hasOutputModalities =
+    model.outputModalities && model.outputModalities.length > 0;
+  const hasToolCalling = model.supportsToolCalling !== null;
+  // Effective as well as architectural: a freshly pulled Ollama model is absent
+  // from the public catalog (`contextLength` null) but still reports the window
+  // it actually runs with. Keying on the architectural value alone hid that
+  // number behind an "unknown capabilities" badge — the one figure the chat
+  // context ring is enforcing.
+  const hasContextLength =
+    model.contextLength !== null || model.effectiveContextLength !== null;
+  // Including the admin override: setting only the output limit on an
+  // otherwise-blank row left this badge up, hiding the number just entered.
+  const hasOutputLength = resolveDisplayOutputLength(model).display !== null;
+  const hasPricing =
+    model.pricePerMillionInput !== null || model.pricePerMillionOutput !== null;
+  return (
+    !hasInputModalities &&
+    !hasOutputModalities &&
+    !hasToolCalling &&
+    !hasContextLength &&
+    !hasOutputLength &&
+    !hasPricing
+  );
+}

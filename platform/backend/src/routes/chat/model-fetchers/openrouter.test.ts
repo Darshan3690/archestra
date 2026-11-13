@@ -1,9 +1,13 @@
-import { vi } from "vitest";
-import { beforeEach, describe, expect, test } from "@/test";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 import { fetchOpenrouterModels } from "./openrouter";
 
 const mockFetch = vi.fn();
-global.fetch = mockFetch;
+// The shared test setup restores the real fetch after every test, so
+// re-apply the mock before each one.
+vi.stubGlobal("fetch", mockFetch);
+beforeEach(() => {
+  vi.stubGlobal("fetch", mockFetch);
+});
 
 describe("fetchOpenrouterModels", () => {
   beforeEach(() => {
@@ -37,7 +41,11 @@ describe("fetchOpenrouterModels", () => {
     const models = await fetchOpenrouterModels(
       "test-api-key",
       "https://openrouter.example/api/v1",
-      { "HTTP-Referer": "https://app.example" },
+      {
+        "X-Custom-Auth": "keep-me",
+        "HTTP-Referer": "https://caller.example",
+        "X-OpenRouter-Title": "Caller",
+      },
     );
 
     expect(mockFetch).toHaveBeenCalledTimes(2);
@@ -46,7 +54,10 @@ describe("fetchOpenrouterModels", () => {
       "https://openrouter.example/api/v1/models",
       {
         headers: {
-          "HTTP-Referer": "https://app.example",
+          "X-Custom-Auth": "keep-me",
+          "HTTP-Referer": "https://caller.example",
+          "X-OpenRouter-Title": "Caller",
+          "X-OpenRouter-Categories": "general-chat,personal-agent",
           Authorization: "Bearer test-api-key",
         },
       },
@@ -56,7 +67,10 @@ describe("fetchOpenrouterModels", () => {
       "https://openrouter.example/api/v1/embeddings/models",
       {
         headers: {
-          "HTTP-Referer": "https://app.example",
+          "X-Custom-Auth": "keep-me",
+          "HTTP-Referer": "https://caller.example",
+          "X-OpenRouter-Title": "Caller",
+          "X-OpenRouter-Categories": "general-chat,personal-agent",
           Authorization: "Bearer test-api-key",
         },
       },
@@ -119,5 +133,323 @@ describe("fetchOpenrouterModels", () => {
       "Failed to fetch OpenRouter models: 401",
     );
     expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  test("captures pricing, context length and tool calling from /models", async () => {
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            data: [
+              {
+                id: "openai/gpt-4o-mini",
+                name: "GPT-4o mini",
+                context_length: 128000,
+                pricing: {
+                  prompt: "0.00000015",
+                  completion: "0.0000006",
+                  input_cache_read: "0.000000075",
+                  input_cache_write: "0.0000001875",
+                },
+                supported_parameters: ["tools", "tool_choice", "max_tokens"],
+              },
+            ],
+          }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: [] }),
+      });
+
+    const [model] = await fetchOpenrouterModels("test-api-key");
+
+    expect(model.displayName).toBe("GPT-4o mini");
+    expect(model.capabilities).toEqual({
+      contextLength: 128000,
+      supportsToolCalling: true,
+      supportsReasoningEffort: false,
+      inputModalities: null,
+      outputModalities: null,
+      promptPricePerToken: "0.00000015",
+      completionPricePerToken: "0.0000006",
+      cacheReadPricePerToken: "0.000000075",
+      cacheWritePricePerToken: "0.0000001875",
+    });
+  });
+
+  test("captures pricing and context length from /embeddings/models", async () => {
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: [] }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            data: [
+              {
+                id: "openai/text-embedding-3-large",
+                name: "OpenAI: Text Embedding 3 Large",
+                context_length: 8192,
+                architecture: {
+                  input_modalities: ["text"],
+                  output_modalities: ["embeddings"],
+                },
+                pricing: { prompt: "0.00000013", completion: "0" },
+                supported_parameters: [],
+              },
+            ],
+          }),
+      });
+
+    const [model] = await fetchOpenrouterModels("test-api-key");
+
+    expect(model.capabilities).toMatchObject({
+      contextLength: 8192,
+      inputModalities: ["text"],
+      promptPricePerToken: "0.00000013",
+      completionPricePerToken: "0",
+    });
+  });
+
+  test("captures architecture modalities, mapping OpenRouter's `file` to `pdf`", async () => {
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            data: [
+              {
+                id: "google/gemini-2.5-pro",
+                architecture: {
+                  // `video` has no output-side equivalent in our enum and is
+                  // dropped; `file` is our `pdf`.
+                  input_modalities: ["text", "image", "file", "video"],
+                  output_modalities: ["text"],
+                },
+                pricing: { prompt: "0.00000125", completion: "0.00001" },
+              },
+            ],
+          }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: [] }),
+      });
+
+    const [model] = await fetchOpenrouterModels("test-api-key");
+
+    expect(model.capabilities?.inputModalities).toEqual([
+      "text",
+      "image",
+      "pdf",
+      "video",
+    ]);
+    expect(model.capabilities?.outputModalities).toEqual(["text"]);
+  });
+
+  test("reports audio output for zero-priced media models", async () => {
+    // Real shape of `google/lyria-3-pro-preview`: token prices are "0" only
+    // because the model is not billed per token. The output modality is what
+    // keeps it out of the "Free models only" filter downstream.
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            data: [
+              {
+                id: "google/lyria-3-pro-preview",
+                name: "Google: Lyria 3 Pro Preview",
+                context_length: 1048576,
+                architecture: {
+                  input_modalities: ["text", "image"],
+                  output_modalities: ["text", "audio"],
+                },
+                pricing: { prompt: "0", completion: "0" },
+              },
+            ],
+          }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: [] }),
+      });
+
+    const [model] = await fetchOpenrouterModels("test-api-key");
+
+    expect(model.capabilities?.outputModalities).toEqual(["text", "audio"]);
+    expect(model.capabilities?.promptPricePerToken).toBe("0");
+  });
+
+  test("reads reasoning support from `reasoning`, not `reasoning_effort`", async () => {
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            data: [
+              {
+                id: "deepseek/deepseek-r1",
+                // A model whose upstream takes a token budget: OpenRouter
+                // accepts a depth for it and converts one, but never lists
+                // `reasoning_effort`. Gating on that spelling would hide the
+                // control on a large share of the reasoning catalog.
+                supported_parameters: ["reasoning", "include_reasoning"],
+              },
+              {
+                id: "openai/gpt-4o",
+                supported_parameters: ["tools", "max_tokens"],
+              },
+            ],
+          }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: [] }),
+      });
+
+    const [reasoner, plain] = await fetchOpenrouterModels("test-api-key");
+
+    expect(reasoner.capabilities?.supportsReasoningEffort).toBe(true);
+    // Authoritatively false, not null: OpenRouter is the one that decides what
+    // it serves, so the registry must not open the control behind its back.
+    expect(plain.capabilities?.supportsReasoningEffort).toBe(false);
+  });
+
+  test("leaves reasoning support unknown when /models lists no parameters", async () => {
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            data: [{ id: "some/model", context_length: 64000 }],
+          }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: [] }),
+      });
+
+    const [model] = await fetchOpenrouterModels("test-api-key");
+
+    // Null, so a lower tier still gets to decide rather than being overruled
+    // by an absence.
+    expect(model.capabilities?.supportsReasoningEffort).toBeNull();
+  });
+
+  test("returns capabilities for a model that only publishes architecture", async () => {
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            data: [
+              {
+                id: "some/model",
+                architecture: { output_modalities: ["image"] },
+              },
+            ],
+          }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: [] }),
+      });
+
+    const [model] = await fetchOpenrouterModels("test-api-key");
+
+    expect(model.capabilities?.outputModalities).toEqual(["image"]);
+    expect(model.capabilities?.inputModalities).toBeNull();
+  });
+
+  test("marks :free models as zero-priced and detects missing tool calling", async () => {
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            data: [
+              {
+                id: "deepseek/deepseek-chat-v3.1:free",
+                context_length: 64000,
+                pricing: { prompt: "0", completion: "0" },
+                supported_parameters: ["max_tokens"],
+              },
+            ],
+          }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: [] }),
+      });
+
+    const [model] = await fetchOpenrouterModels("test-api-key");
+
+    expect(model.capabilities).toEqual({
+      contextLength: 64000,
+      supportsToolCalling: false,
+      supportsReasoningEffort: false,
+      inputModalities: null,
+      outputModalities: null,
+      promptPricePerToken: "0",
+      completionPricePerToken: "0",
+      cacheReadPricePerToken: null,
+      cacheWritePricePerToken: null,
+    });
+  });
+
+  test("normalizes negative dynamic-router pricing to unknown", async () => {
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            data: [
+              {
+                id: "openrouter/auto",
+                context_length: 2000000,
+                pricing: { prompt: "-1", completion: "-1" },
+                supported_parameters: ["tools"],
+              },
+            ],
+          }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: [] }),
+      });
+
+    const [model] = await fetchOpenrouterModels("test-api-key");
+
+    expect(model.capabilities).toEqual({
+      contextLength: 2000000,
+      supportsToolCalling: true,
+      supportsReasoningEffort: false,
+      inputModalities: null,
+      outputModalities: null,
+      promptPricePerToken: null,
+      completionPricePerToken: null,
+      cacheReadPricePerToken: null,
+      cacheWritePricePerToken: null,
+    });
+  });
+
+  test("leaves capabilities undefined when /models carries no metadata", async () => {
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: [{ id: "openrouter/auto" }] }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: [] }),
+      });
+
+    const [model] = await fetchOpenrouterModels("test-api-key");
+
+    expect(model.capabilities).toBeUndefined();
   });
 });

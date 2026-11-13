@@ -3,13 +3,14 @@
 import { Check, Copy } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
+import { copyToClipboard } from "@/lib/clipboard";
 
 export function CopyButton({
   text,
   className,
   size = 14,
   behavior = "checkmark",
-  buttonSize = "sm",
+  buttonSize = "icon-xs",
   iconClassName,
   copiedIconClassName,
 }: {
@@ -17,7 +18,7 @@ export function CopyButton({
   className?: string;
   size?: number;
   behavior?: "checkmark" | "text";
-  buttonSize?: "default" | "sm" | "lg" | "icon";
+  buttonSize?: "icon" | "icon-sm" | "icon-xs";
   iconClassName?: string;
   copiedIconClassName?: string;
 }) {
@@ -25,54 +26,25 @@ export function CopyButton({
 
   const handleCopy = async () => {
     try {
-      await navigator.clipboard.writeText(text);
+      await copyToClipboard(text);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    } catch (_error) {
-      // Fallback for older browsers
-      const textArea = document.createElement("textarea");
-      textArea.value = text;
-      textArea.style.position = "fixed";
-      textArea.style.left = "-999999px";
-      document.body.appendChild(textArea);
-      textArea.select();
-      try {
-        document.execCommand("copy");
-        setCopied(true);
-        setTimeout(() => setCopied(false), 2000);
-      } catch (err) {
-        console.error("Failed to copy:", err);
-      }
-      document.body.removeChild(textArea);
+    } catch (err) {
+      console.error("Failed to copy:", err);
     }
   };
 
-  if (behavior === "text") {
-    return (
-      <>
-        <Button
-          variant="ghost"
-          size={buttonSize}
-          className={`h-6 w-6 p-0 hover:bg-background/50 ${className ?? ""}`}
-          onClick={handleCopy}
-        >
-          <Copy size={size} className={iconClassName} />
-          <span className="sr-only">Copy to clipboard</span>
-        </Button>
-        {copied && <span className="ml-1 text-xs">Copied!</span>}
-      </>
-    );
-  }
-
-  return (
+  const showCheckmark = behavior === "checkmark" && copied;
+  const button = (
     <Button
+      type="button"
       variant="ghost"
       size={buttonSize}
-      className={`h-6 w-6 p-0 hover:bg-background/50 ${className ?? ""}`}
+      className={`hover:bg-background/50 ${className ?? ""}`}
       onClick={handleCopy}
-      disabled={copied}
+      disabled={behavior === "checkmark" ? copied : undefined}
     >
-      {copied ? (
+      {showCheckmark ? (
         <Check
           size={size}
           className={copiedIconClassName ?? "text-green-500"}
@@ -81,8 +53,19 @@ export function CopyButton({
         <Copy size={size} className={iconClassName} />
       )}
       <span className="sr-only">
-        {copied ? "Copied!" : "Copy to clipboard"}
+        {showCheckmark ? "Copied!" : "Copy to clipboard"}
       </span>
     </Button>
   );
+
+  if (behavior === "text") {
+    return (
+      <>
+        {button}
+        {copied && <span className="ml-1 text-xs">Copied!</span>}
+      </>
+    );
+  }
+
+  return button;
 }

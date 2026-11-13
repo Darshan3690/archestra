@@ -1,6 +1,8 @@
 "use client";
 
+import { type ReactNode, useEffect, useId } from "react";
 import type { UseFormReturn } from "react-hook-form";
+import { SettingsLink } from "@/components/settings-link";
 import {
   FormControl,
   FormDescription,
@@ -10,7 +12,15 @@ import {
   FormMessage,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
-import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { useRuntimeCredentials } from "@/lib/runtime-credentials.query";
+import { GithubRepositorySettings } from "./github-repository-settings";
 
 interface GithubConfigFieldsProps {
   // biome-ignore lint/suspicious/noExplicitAny: form type is generic across different form schemas
@@ -18,6 +28,14 @@ interface GithubConfigFieldsProps {
   prefix?: string;
   hideUrl?: boolean;
   hideOwner?: boolean;
+  hideAuth?: boolean;
+  hideRepositoryOptions?: boolean;
+  /**
+   * Extra line under the GitHub App configuration picker. App credentials are
+   * stored organization-wide instead of on this form, so requirements about
+   * what the App must be granted have no token field to sit under.
+   */
+  appConfigDescription?: ReactNode;
 }
 
 export function GithubConfigFields({
@@ -25,7 +43,38 @@ export function GithubConfigFields({
   prefix = "config",
   hideUrl = false,
   hideOwner = false,
+  hideAuth = false,
+  hideRepositoryOptions = false,
+  appConfigDescription,
 }: GithubConfigFieldsProps) {
+  const credentialSelectId = useId();
+  const githubAppConfigId = form.watch(`${prefix}.githubAppConfigId`) as
+    | string
+    | undefined;
+  const { data: credentials = [] } = useRuntimeCredentials();
+  const credentialId = form.watch(`${prefix}.credentialId`) as
+    | string
+    | undefined;
+  const githubCredentials = credentials.filter(
+    (credential) =>
+      credential.allowOrganization &&
+      ["github_app", "secret"].includes(credential.kind),
+  );
+  const appConfigError = hideAuth
+    ? undefined
+    : getFieldError(form.formState.errors, `${prefix}.githubAppConfigId`);
+
+  useEffect(() => {
+    if (hideAuth) return;
+    form.register(`${prefix}.authMethod`);
+    form.register(`${prefix}.githubAppConfigId`, {
+      validate: (value) =>
+        form.getValues(`${prefix}.authMethod`) !== "github_app" ||
+        Boolean(value) ||
+        "Select a GitHub App configuration",
+    });
+  }, [form, hideAuth, prefix]);
+
   return (
     <div className="space-y-4">
       {!hideUrl && (
@@ -36,13 +85,13 @@ export function GithubConfigFields({
           render={({ field }) => (
             <FormItem>
               <FormLabel>GitHub API URL</FormLabel>
-              <FormControl>
-                <Input placeholder="https://api.github.com" {...field} />
-              </FormControl>
               <FormDescription>
                 Use https://api.github.com for GitHub.com, or
                 https://github.example.com/api/v3 for GitHub Enterprise.
               </FormDescription>
+              <FormControl>
+                <Input placeholder="https://api.github.com" {...field} />
+              </FormControl>
               <FormMessage />
             </FormItem>
           )}
@@ -57,113 +106,97 @@ export function GithubConfigFields({
           render={({ field }) => (
             <FormItem>
               <FormLabel>Owner</FormLabel>
-              <FormControl>
-                <Input placeholder="my-org" {...field} />
-              </FormControl>
               <FormDescription>
                 GitHub organization or username that owns the repositories.
               </FormDescription>
+              <FormControl>
+                <Input placeholder="my-org" {...field} />
+              </FormControl>
               <FormMessage />
             </FormItem>
           )}
         />
       )}
 
-      <FormField
-        control={form.control}
-        name={`${prefix}.repos`}
-        render={({ field }) => (
-          <FormItem>
-            <FormLabel>Repositories (optional)</FormLabel>
-            <FormControl>
-              <Input placeholder="repo-a, repo-b" {...field} />
-            </FormControl>
-            <FormDescription>
-              Comma-separated list of repository names. Leave blank to sync all
-              repositories.
-            </FormDescription>
-            <FormMessage />
-          </FormItem>
-        )}
-      />
+      {!hideAuth && (
+        <FormItem>
+          <FormLabel htmlFor={credentialSelectId}>Credential</FormLabel>
+          <Select
+            value={
+              credentialId ??
+              githubCredentials.find(
+                (credential) => credential.id === githubAppConfigId,
+              )?.key ??
+              "inline"
+            }
+            onValueChange={(value) => {
+              form.setValue(
+                `${prefix}.credentialId`,
+                value === "inline" ? undefined : value,
+                { shouldDirty: true, shouldValidate: true },
+              );
+              form.setValue(
+                `${prefix}.authMethod`,
+                value === "inline" ? "pat" : "credential",
+                { shouldDirty: true, shouldValidate: true },
+              );
+              form.setValue(`${prefix}.githubAppConfigId`, undefined, {
+                shouldDirty: true,
+                shouldValidate: true,
+              });
+            }}
+          >
+            <SelectTrigger id={credentialSelectId} className="w-full">
+              <SelectValue placeholder="Select a credential" />
+            </SelectTrigger>
+            <SelectContent>
+              {githubCredentials.map((credential) => (
+                <SelectItem
+                  key={credential.key}
+                  value={credential.key}
+                  description="Organization credential"
+                >
+                  {credential.name}
+                </SelectItem>
+              ))}
+              <SelectItem value="inline">
+                Enter a token for this connector
+              </SelectItem>
+            </SelectContent>
+          </Select>
+          <FormDescription>
+            Organization credentials support scheduled syncs.{" "}
+            <SettingsLink href="/settings/credentials" className="underline">
+              Manage credentials
+            </SettingsLink>
+            . {appConfigDescription}
+          </FormDescription>
+          {appConfigError && (
+            <p className="text-sm text-destructive">{appConfigError}</p>
+          )}
+        </FormItem>
+      )}
 
-      <FormField
-        control={form.control}
-        name={`${prefix}.includeIssues`}
-        render={({ field }) => (
-          <FormItem className="flex items-center justify-between rounded-lg border p-3">
-            <div className="space-y-0.5">
-              <FormLabel>Include Issues</FormLabel>
-              <FormDescription>Sync issues and their comments.</FormDescription>
-            </div>
-            <FormControl>
-              <Switch
-                checked={field.value ?? true}
-                onCheckedChange={field.onChange}
-              />
-            </FormControl>
-          </FormItem>
-        )}
-      />
-
-      <FormField
-        control={form.control}
-        name={`${prefix}.includePullRequests`}
-        render={({ field }) => (
-          <FormItem className="flex items-center justify-between rounded-lg border p-3">
-            <div className="space-y-0.5">
-              <FormLabel>Include Pull Requests</FormLabel>
-              <FormDescription>
-                Sync pull requests and their comments.
-              </FormDescription>
-            </div>
-            <FormControl>
-              <Switch
-                checked={field.value ?? true}
-                onCheckedChange={field.onChange}
-              />
-            </FormControl>
-          </FormItem>
-        )}
-      />
-
-      <FormField
-        control={form.control}
-        name={`${prefix}.includeMarkdownFiles`}
-        render={({ field }) => (
-          <FormItem className="flex items-center justify-between rounded-lg border p-3">
-            <div className="space-y-0.5">
-              <FormLabel>Include Markdown Files</FormLabel>
-              <FormDescription>
-                Sync .md and .mdx files from repositories.
-              </FormDescription>
-            </div>
-            <FormControl>
-              <Switch
-                checked={field.value ?? false}
-                onCheckedChange={field.onChange}
-              />
-            </FormControl>
-          </FormItem>
-        )}
-      />
-
-      <FormField
-        control={form.control}
-        name={`${prefix}.labelsToSkip`}
-        render={({ field }) => (
-          <FormItem>
-            <FormLabel>Labels to Skip (optional)</FormLabel>
-            <FormControl>
-              <Input placeholder="wontfix, duplicate" {...field} />
-            </FormControl>
-            <FormDescription>
-              Comma-separated list of labels to exclude.
-            </FormDescription>
-            <FormMessage />
-          </FormItem>
-        )}
-      />
+      {!hideRepositoryOptions && (
+        <GithubRepositorySettings form={form} prefix={prefix} />
+      )}
     </div>
   );
+}
+
+function getFieldError(
+  errors: Record<string, unknown> | undefined,
+  path: string,
+): string | undefined {
+  const error = path.split(".").reduce<unknown>((current, part) => {
+    if (!current || typeof current !== "object") return undefined;
+    return (current as Record<string, unknown>)[part];
+  }, errors);
+
+  if (!error || typeof error !== "object" || !("message" in error)) {
+    return undefined;
+  }
+
+  const message = (error as { message?: unknown }).message;
+  return typeof message === "string" ? message : undefined;
 }

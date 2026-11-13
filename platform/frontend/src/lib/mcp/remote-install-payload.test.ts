@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { buildRemoteInstallCredentialPayload } from "./remote-install-payload";
 
@@ -10,7 +11,6 @@ describe("buildRemoteInstallCredentialPayload", () => {
           client_secret: "client-secret",
           audience: "https://api.example.com",
         },
-        isByosVault: false,
       }),
     ).toEqual({
       userConfigValues: {
@@ -18,7 +18,6 @@ describe("buildRemoteInstallCredentialPayload", () => {
         client_secret: "client-secret",
         audience: "https://api.example.com",
       },
-      isByosVault: false,
     });
   });
 
@@ -29,31 +28,9 @@ describe("buildRemoteInstallCredentialPayload", () => {
           access_token: "pat-token",
           client_id: "ignored-client-id",
         },
-        isByosVault: false,
       }),
     ).toEqual({
       accessToken: "pat-token",
-      isByosVault: false,
-    });
-  });
-
-  it("preserves BYOS metadata and stringifies scalar values", () => {
-    expect(
-      buildRemoteInstallCredentialPayload({
-        metadata: {
-          client_secret: "vault/path#secret",
-          retries: 3,
-          enabled: true,
-        },
-        isByosVault: true,
-      }),
-    ).toEqual({
-      userConfigValues: {
-        client_secret: "vault/path#secret",
-        retries: "3",
-        enabled: "true",
-      },
-      isByosVault: true,
     });
   });
 });

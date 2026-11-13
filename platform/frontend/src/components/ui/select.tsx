@@ -4,12 +4,30 @@ import * as SelectPrimitive from "@radix-ui/react-select";
 import { CheckIcon, ChevronDownIcon, ChevronUpIcon } from "lucide-react";
 import type * as React from "react";
 
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/utils/tailwind";
 
 function Select({
+  onValueChange,
   ...props
 }: React.ComponentProps<typeof SelectPrimitive.Root>) {
-  return <SelectPrimitive.Root data-slot="select" {...props} />;
+  return (
+    <SelectPrimitive.Root
+      data-slot="select"
+      // Inside a <form>, Radix mirrors the value into a hidden native <select>.
+      // When a controlled value changes before that element has its options
+      // (e.g. a saved value loaded after mount), the browser resets it to ""
+      // and Radix reports that as a change, clearing the field and marking the
+      // form dirty. Radix forbids "" as an item value, so it is never a real
+      // selection and is safe to drop.
+      onValueChange={
+        onValueChange &&
+        ((value) => {
+          if (value !== "") onValueChange(value);
+        })
+      }
+      {...props}
+    />
+  );
 }
 
 function SelectGroup({
@@ -19,9 +37,27 @@ function SelectGroup({
 }
 
 function SelectValue({
+  placeholder,
   ...props
 }: React.ComponentProps<typeof SelectPrimitive.Value>) {
-  return <SelectPrimitive.Value data-slot="select-value" {...props} />;
+  return (
+    <SelectPrimitive.Value
+      data-slot="select-value"
+      // A string placeholder renders as a bare text child of the value span
+      // and Radix removes it when the first value is selected — which crashes
+      // React once Chrome page-translate has re-parented that text into a
+      // <font> wrapper (facebook/react#11538). Wrapping it keeps the removed
+      // unit an element.
+      placeholder={
+        typeof placeholder === "string" ? (
+          <span>{placeholder}</span>
+        ) : (
+          placeholder
+        )
+      }
+      {...props}
+    />
+  );
 }
 
 function SelectTrigger({
@@ -114,7 +150,7 @@ function SelectItem({
     <SelectPrimitive.Item
       data-slot="select-item"
       className={cn(
-        "focus:bg-accent focus:text-accent-foreground [&_svg:not([class*='text-'])]:text-muted-foreground relative flex w-full cursor-default items-center gap-2 rounded-sm py-1.5 pr-8 pl-2 text-sm outline-hidden select-none data-[disabled]:pointer-events-none data-[disabled]:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 *:[span]:last:flex *:[span]:last:items-center *:[span]:last:gap-2",
+        "focus:bg-accent focus:text-accent-foreground [&_svg:not([class*='text-'])]:text-muted-foreground relative flex w-full cursor-default items-center gap-2 rounded-sm py-1.5 pr-8 pl-2 text-sm outline-hidden select-none data-[disabled]:pointer-events-none data-[disabled]:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className,
       )}
       {...props}
@@ -129,7 +165,19 @@ function SelectItem({
       </span>
       {icon}
       <div className="flex flex-col">
-        <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
+        {/* The span keeps the value Radix portals into SelectValue an element
+            instead of a bare text node. Chrome page-translate re-parents text
+            nodes into injected <font> wrappers, and React crashes unmounting a
+            re-parented text node from its portal container
+            (facebook/react#11538) — with the span, React only ever removes the
+            span itself, which translation never moves. */}
+        {/* `contents` keeps the span out of layout, so an icon + label child
+            pair stays one row in the trigger's flex value instead of the
+            block-level svg breaking onto its own line. ItemText's own flex
+            does the same inside the open list. */}
+        <SelectPrimitive.ItemText className="flex items-center gap-2">
+          <span className="contents">{children}</span>
+        </SelectPrimitive.ItemText>
         {description && (
           <span className="text-xs text-muted-foreground font-normal">
             {description}

@@ -1,7 +1,14 @@
+// Binds the ports of the layers below before any other module loads.
+import "@/server/composition";
 import { pathToFileURL } from "node:url";
-import { ADMIN_ROLE_NAME, EDITOR_ROLE_NAME, MEMBER_ROLE_NAME } from "@shared";
+import {
+  ADMIN_ROLE_NAME,
+  EDITOR_ROLE_NAME,
+  MEMBER_ROLE_NAME,
+} from "@archestra/shared";
+import { getTableName, sql } from "drizzle-orm";
+import type { PgTable } from "drizzle-orm/pg-core";
 import db, { initializeDatabase, schema } from "@/database";
-import { seedDefaultUserAndOrg } from "@/database/seed";
 import logger from "@/logging";
 import {
   AgentLabelModel,
@@ -10,12 +17,25 @@ import {
   OrganizationModel,
   TeamModel,
 } from "@/models";
+import AgentUsageModel from "@/models/agent-usage";
+import { assertPortsBound } from "@/models/ports";
+import {
+  seedArchestraCatalogAndTools,
+  seedDefaultUserAndOrg,
+  syncBuiltInAgents,
+} from "@/services/seed";
+import type { TeamMemberRole } from "@/types/team-role";
+import { isUniqueConstraintError } from "@/utils/db";
 import {
   generateMockAgents,
   generateMockInteractions,
   generateMockTools,
   type MockAgentWithTeams,
 } from "./mocks";
+
+// The composition module, imported first, bound the ports of the layers
+// below; stop here if one is unbound.
+assertPortsBound();
 
 // Set to true to create tools and interactions
 // Don't delete this const for development convenience
@@ -26,11 +46,20 @@ async function seedMockData() {
 
   await initializeDatabase();
 
-  // Step 0: Clean existing mock data (in correct order due to foreign keys)
+  // Step 0: Clean existing data.
+  //
+  // One TRUNCATE ... CASCADE rather than a DELETE per table: the per-table loop
+  // ran in schema-export order, which is not a valid FK order, so it failed as
+  // soon as the database held rows the backend creates on boot (deleting
+  // internal_mcp_catalog while an mcp_server still referenced it violates that
+  // table's NOT NULL). CASCADE makes the order irrelevant.
   logger.info("Cleaning existing data...");
-  for (const table of Object.values(schema)) {
-    await db.delete(table);
-  }
+  const tableNames = Object.values(schema)
+    .map((table) => `"${getTableName(table as PgTable)}"`)
+    .join(", ");
+  await db.execute(
+    sql.raw(`TRUNCATE TABLE ${tableNames} RESTART IDENTITY CASCADE;`),
+  );
   logger.info("✅ Cleaned existing data");
 
   // Step 1: Create users
@@ -95,38 +124,49 @@ async function seedMockData() {
     createdBy: defaultAdmin.id,
   });
 
-  // Add members to teams
-  await TeamModel.addMember(teamA.id, defaultAdmin.id, ADMIN_ROLE_NAME);
-  await TeamModel.addMember(teamA.id, editorUser.id, MEMBER_ROLE_NAME);
-  await TeamModel.addMember(teamB.id, defaultAdmin.id, ADMIN_ROLE_NAME);
-  await TeamModel.addMember(teamB.id, member1User.id, MEMBER_ROLE_NAME);
-  await TeamModel.addMember(
-    managementTeam.id,
-    defaultAdmin.id,
-    ADMIN_ROLE_NAME,
-  );
-  await TeamModel.addMember(managementTeam.id, admin2User.id, ADMIN_ROLE_NAME);
-  await TeamModel.addMember(marketingTeam.id, defaultAdmin.id, ADMIN_ROLE_NAME);
-  await TeamModel.addMember(marketingTeam.id, member1User.id, MEMBER_ROLE_NAME);
-  await TeamModel.addMember(marketingTeam.id, member2User.id, MEMBER_ROLE_NAME);
-  await TeamModel.addMember(
-    engineeringTeam.id,
-    defaultAdmin.id,
-    ADMIN_ROLE_NAME,
-  );
-  await TeamModel.addMember(
-    engineeringTeam.id,
-    editorUser.id,
-    MEMBER_ROLE_NAME,
-  );
+  /**
+   * Add members to teams.
+   *
+   * Creating a team now adds its creator as an admin automatically, so every
+   * explicit add for `defaultAdmin` below is a duplicate and trips the
+   * (team, user) unique index. Seeding must stay re-runnable, so an existing
+   * membership is not an error.
+   */
+  const addMember = async (
+    teamId: string,
+    userId: string,
+    role: TeamMemberRole,
+  ) => {
+    try {
+      await TeamModel.addMember(teamId, userId, role);
+    } catch (error) {
+      if (!isUniqueConstraintError(error)) throw error;
+    }
+  };
+
+  await addMember(teamA.id, defaultAdmin.id, ADMIN_ROLE_NAME);
+  await addMember(teamA.id, editorUser.id, MEMBER_ROLE_NAME);
+  await addMember(teamB.id, defaultAdmin.id, ADMIN_ROLE_NAME);
+  await addMember(teamB.id, member1User.id, MEMBER_ROLE_NAME);
+  await addMember(managementTeam.id, defaultAdmin.id, ADMIN_ROLE_NAME);
+  await addMember(managementTeam.id, admin2User.id, ADMIN_ROLE_NAME);
+  await addMember(marketingTeam.id, defaultAdmin.id, ADMIN_ROLE_NAME);
+  await addMember(marketingTeam.id, member1User.id, MEMBER_ROLE_NAME);
+  await addMember(marketingTeam.id, member2User.id, MEMBER_ROLE_NAME);
+  await addMember(engineeringTeam.id, defaultAdmin.id, ADMIN_ROLE_NAME);
+  await addMember(engineeringTeam.id, editorUser.id, MEMBER_ROLE_NAME);
 
   logger.info("✅ Created 5 teams with members");
 
   // Step 3: Create agents, MCP gateways, and LLM proxies with ownership patterns
   logger.info("\nCreating agents, gateways, and proxies...");
 
-  // Always recreate default agents
-  await AgentModel.getLLMProxyOrCreateDefault();
+  // Always ensure the LLM Proxy exists
+  await AgentModel.ensureLlmProxiesForAllOrganizations();
+  await syncBuiltInAgents();
+  // The TRUNCATE above dropped the built-in catalog; without it every
+  // starter policy is refused until the backend restarts.
+  await seedArchestraCatalogAndTools();
 
   const sharedUsers = [
     { id: editorUser.id, name: "editor" },
@@ -169,33 +209,16 @@ async function seedMockData() {
     orgCount: 35,
   });
 
-  // LLM Proxies: 10 editor-personal, 15 admin-personal, 20 TeamA, 25 TeamB, 30 org
-  const mockProxies = generateMockAgents({
-    organizationId: org.id,
-    agentType: "llm_proxy",
-    namePrefix: "proxy",
-    users: sharedUsers.map((u) => ({
-      ...u,
-      personalCount: u.name === "editor" ? 10 : 15,
-    })),
-    teamConfig: [
-      { ...sharedTeamConfig[0], count: 20 },
-      { ...sharedTeamConfig[1], count: 25 },
-    ],
-    orgCount: 30,
-  });
-
   const allMockEntities: MockAgentWithTeams[] = [
     ...mockAgents,
     ...mockGateways,
-    ...mockProxies,
   ];
 
   // Insert all (without teamIds field which isn't a DB column)
   const allRows = allMockEntities.map(({ teamIds: _, ...row }) => row);
   await db.insert(schema.agentsTable).values(allRows);
   logger.info(
-    `✅ Created ${mockAgents.length} agents, ${mockGateways.length} gateways, ${mockProxies.length} proxies`,
+    `✅ Created ${mockAgents.length} agents and ${mockGateways.length} gateways`,
   );
 
   // Assign teams to team-scoped entries
@@ -313,11 +336,6 @@ async function seedMockData() {
   const agentToolData = toolData.map((tool) => ({
     agentId: tool.agentId,
     toolId: tool.id,
-    allowUsageWhenUntrustedDataIsPresent:
-      tool.allowUsageWhenUntrustedDataIsPresent || false,
-    toolResultTreatment: (tool.dataIsTrustedByDefault
-      ? "trusted"
-      : "untrusted") as "trusted" | "untrusted" | "sanitize_with_dual_llm",
   }));
 
   await db.insert(schema.agentToolsTable).values(agentToolData);
@@ -337,29 +355,28 @@ async function seedMockData() {
     agentIds,
     toolsByAgent,
     200, // number of interactions
-    0.3, // 30% block probability
   );
 
-  // biome-ignore lint/suspicious/noExplicitAny: Mock data generation requires flexible interaction structure
-  await db.insert(schema.interactionsTable).values(interactionData as any);
+  const insertedInteractions = await db
+    .insert(schema.interactionsTable)
+    // biome-ignore lint/suspicious/noExplicitAny: Mock data generation requires flexible interaction structure
+    .values(interactionData as any)
+    .returning({
+      profileId: schema.interactionsTable.profileId,
+      createdAt: schema.interactionsTable.createdAt,
+    });
   logger.info(`✅ Created ${interactionData.length} interactions`);
 
-  // Show statistics
-  const blockedCount = interactionData.filter((i) => {
-    const response = i.response as { choices?: Array<{ message?: unknown }> };
-    if (Array.isArray(response.choices)) {
-      const message = response.choices[0]?.message;
-      return (
-        !!message &&
-        typeof message === "object" &&
-        "refusal" in message &&
-        Boolean(message.refusal)
-      );
-    }
-    return false;
-  }).length;
-  logger.info(`   - ${blockedCount} blocked by policy`);
-  logger.info(`   - ${interactionData.length - blockedCount} allowed`);
+  // Inserted directly, so stamp each agent as InteractionModel.create would.
+  const newestByAgent = new Map<string, Date>();
+  for (const { profileId, createdAt } of insertedInteractions) {
+    if (!profileId) continue;
+    const newest = newestByAgent.get(profileId);
+    if (!newest || createdAt > newest) newestByAgent.set(profileId, createdAt);
+  }
+  for (const [agentId, usedAt] of newestByAgent) {
+    await AgentUsageModel.recordUse({ agentId, usedAt });
+  }
 }
 
 /**

@@ -1,7 +1,7 @@
-import type { Action, Resource } from "@shared";
+import type { Action, Resource } from "@archestra/shared";
 import { Fragment } from "react";
 import { CodeText } from "@/components/code-text";
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/utils/tailwind";
 
 type PermissionRequirement = {
   resource: Resource;
@@ -29,7 +29,7 @@ export function PermissionRequirementHint({
       {message}{" "}
       {permissions.map((permission, index) => (
         <Fragment key={formatPermissionRequirement(permission)}>
-          {index > 0 ? ", " : null}
+          {index > 0 ? <span>, </span> : null}
           <CodeText className="px-1.5 text-[11px] font-mono">
             {formatPermissionRequirement(permission)}
           </CodeText>

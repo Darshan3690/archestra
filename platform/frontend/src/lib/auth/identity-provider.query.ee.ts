@@ -1,8 +1,11 @@
-import { archestraApiSdk, type archestraApiTypes } from "@shared";
+import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import config from "@/lib/config/config";
-import { handleApiError } from "@/lib/utils";
+import {
+  useEnterpriseFeature,
+  usePublicEnterpriseCoreActive,
+} from "@/lib/config/config.query";
+import { handleApiError } from "@/lib/utils/api";
 
 /**
  * Query key factory for identity provider-related queries
@@ -10,6 +13,7 @@ import { handleApiError } from "@/lib/utils";
 export const identityProviderKeys = {
   all: ["identity-provider"] as const,
   public: ["identity-provider", "public"] as const,
+  teamSyncOptions: ["identity-provider", "team-sync-options"] as const,
   details: () => [...identityProviderKeys.all, "details"] as const,
   latestIdTokenClaims: (id: string) =>
     [...identityProviderKeys.all, id, "latest-id-token-claims"] as const,
@@ -21,6 +25,8 @@ export const identityProviderKeys = {
  * Automatically disabled when enterprise license is not activated.
  */
 export function usePublicIdentityProviders() {
+  // Pre-auth surface (login page + sign-in selector), so check the public flag.
+  const enterpriseCoreActive = usePublicEnterpriseCoreActive();
   return useQuery({
     queryKey: identityProviderKeys.public,
     queryFn: async () => {
@@ -29,7 +35,30 @@ export function usePublicIdentityProviders() {
     },
     retry: false, // Don't retry on auth pages to avoid repeated 401 errors
     throwOnError: false, // Don't throw errors to prevent crashes
-    enabled: config.enterpriseFeatures.core,
+    enabled: enterpriseCoreActive === true,
+  });
+}
+
+/**
+ * Get identity providers as minimal team-sync options (id, name, and groups
+ * extraction template — no configuration or secrets). Available with
+ * team:read, so team admins can link external groups without
+ * identityProvider:read. Automatically disabled without an enterprise license.
+ */
+export function useTeamSyncIdentityProviderOptions(params?: {
+  enabled?: boolean;
+}) {
+  const enterpriseCoreActive = useEnterpriseFeature("core");
+  return useQuery({
+    queryKey: identityProviderKeys.teamSyncOptions,
+    queryFn: async () => {
+      const { data } =
+        await archestraApiSdk.getIdentityProviderTeamSyncOptions();
+      return data ?? [];
+    },
+    retry: false,
+    throwOnError: false,
+    enabled: enterpriseCoreActive && (params?.enabled ?? true),
   });
 }
 
@@ -39,6 +68,7 @@ export function usePublicIdentityProviders() {
  * Automatically disabled when enterprise license is not activated.
  */
 export function useIdentityProviders(params?: { enabled?: boolean }) {
+  const enterpriseCoreActive = useEnterpriseFeature("core");
   return useQuery({
     queryKey: identityProviderKeys.all,
     queryFn: async () => {
@@ -47,7 +77,7 @@ export function useIdentityProviders(params?: { enabled?: boolean }) {
     },
     retry: false,
     throwOnError: false,
-    enabled: config.enterpriseFeatures.core && (params?.enabled ?? true),
+    enabled: enterpriseCoreActive && (params?.enabled ?? true),
   });
 }
 
@@ -55,6 +85,7 @@ export function useIdentityProviders(params?: { enabled?: boolean }) {
  * Get single identity provider
  */
 export function useIdentityProvider(id: string) {
+  const enterpriseCoreActive = useEnterpriseFeature("core");
   return useQuery({
     queryKey: [...identityProviderKeys.details(), id],
     queryFn: async () => {
@@ -65,11 +96,12 @@ export function useIdentityProvider(id: string) {
     },
     retry: false,
     throwOnError: false,
-    enabled: config.enterpriseFeatures.core,
+    enabled: enterpriseCoreActive,
   });
 }
 
 export function useIdentityProviderLatestIdTokenClaims(id: string | undefined) {
+  const enterpriseCoreActive = useEnterpriseFeature("core");
   return useQuery({
     queryKey: identityProviderKeys.latestIdTokenClaims(id ?? ""),
     queryFn: async () => {
@@ -86,7 +118,8 @@ export function useIdentityProviderLatestIdTokenClaims(id: string | undefined) {
     },
     retry: false,
     throwOnError: false,
-    enabled: config.enterpriseFeatures.core && !!id,
+    enabled: enterpriseCoreActive && !!id,
+    refetchOnMount: "always",
   });
 }
 

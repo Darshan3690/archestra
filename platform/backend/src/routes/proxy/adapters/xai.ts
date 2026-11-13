@@ -1,3 +1,4 @@
+import { fetchWithAbortSignal } from "@/utils/client-disconnect-signal";
 /**
  * xAI LLM Proxy Adapter - OpenAI-compatible
  *
@@ -5,7 +6,12 @@
  * This adapter delegates request/response/stream parsing to the OpenAI adapters
  * and only overrides provider-specific configuration (baseUrl, api key behavior).
  */
-import { ArchestraInternalErrorCode } from "@shared";
+
+import {
+  ArchestraInternalErrorCode,
+  SUBSCRIPTION_CREDENTIALS,
+  subscriptionKindFromCredential,
+} from "@archestra/shared";
 import { get } from "lodash-es";
 import OpenAIProvider from "openai";
 import type {
@@ -14,19 +20,32 @@ import type {
 } from "openai/resources/chat/completions/completions";
 import config from "@/config";
 import { metrics } from "@/observability";
-import type {
-  CreateClientOptions,
-  LLMProvider,
-  LLMRequestAdapter,
-  LLMResponseAdapter,
-  LLMStreamAdapter,
-  Xai,
+import { withReasoningOutsideCompletion } from "@/observability/metrics/llm-usage";
+import { stripBearerTransportPrefix } from "@/services/subscription-credential-guard";
+import {
+  decodeXaiSubscriptionCredential,
+  isXaiSubscriptionCredential,
+} from "@/services/xai-subscription-credentials";
+import { createXaiSubscriptionFetch } from "@/services/xai-subscription-token";
+import {
+  ApiError,
+  type CreateClientOptions,
+  type LLMProvider,
+  type LLMRequestAdapter,
+  type LLMResponseAdapter,
+  type LLMStreamAdapter,
+  type StreamAccumulatorState,
+  type Xai,
 } from "@/types";
+import { streamChatCompletionChunks } from "./chat-completions-stream";
 import {
   OpenAIRequestAdapter,
   OpenAIResponseAdapter,
   OpenAIStreamAdapter,
 } from "./openai";
+import { withSystemForDeveloperRole } from "./openai-translator-utils";
+import { PROXY_SDK_MAX_RETRIES } from "./sdk-retry-policy";
+import { subscriptionAuthRequiredCode } from "./subscription-auth-error";
 
 // =============================================================================
 // TYPE ALIASES (reuse OpenAI types since xAI is OpenAI-compatible)
@@ -37,6 +56,8 @@ type XaiResponse = Xai.Types.ChatCompletionsResponse;
 type XaiMessages = Xai.Types.ChatCompletionsRequest["messages"];
 type XaiHeaders = Xai.Types.ChatCompletionsHeaders;
 type XaiStreamChunk = Xai.Types.ChatCompletionChunk;
+/** Whose usage dialect the client reads: xAI's own, or OpenAI's. */
+type XaiClientUsage = "xai" | "openai";
 
 // =============================================================================
 // ADAPTER CLASSES (delegate to OpenAI adapters, override provider)
@@ -83,23 +104,24 @@ class XaiRequestAdapter implements LLMRequestAdapter<XaiRequest, XaiMessages> {
   applyToolResultUpdates(updates: Record<string, string>) {
     return this.delegate.applyToolResultUpdates(updates);
   }
-  applyToonCompression(model: string) {
-    return this.delegate.applyToonCompression(model);
-  }
   convertToolResultContent(messages: XaiMessages) {
     return this.delegate.convertToolResultContent(messages);
   }
-  toProviderRequest() {
-    return this.delegate.toProviderRequest();
+  toProviderRequest(options?: { preserveToolCallIds?: boolean }) {
+    return this.delegate.toProviderRequest(options);
   }
 }
 
 class XaiResponseAdapter implements LLMResponseAdapter<XaiResponse> {
   readonly provider = "xai" as const;
   private delegate: OpenAIResponseAdapter;
+  private readonly clientUsage: XaiClientUsage;
 
-  constructor(response: XaiResponse) {
-    this.delegate = new OpenAIResponseAdapter(response);
+  constructor(response: XaiResponse, clientUsage: XaiClientUsage = "xai") {
+    this.delegate = new OpenAIResponseAdapter(response, {
+      reasoningOutsideCompletion: true,
+    });
+    this.clientUsage = clientUsage;
   }
 
   getId() {
@@ -121,13 +143,33 @@ class XaiResponseAdapter implements LLMResponseAdapter<XaiResponse> {
     return this.delegate.getUsage();
   }
   getOriginalResponse() {
-    return this.delegate.getOriginalResponse();
+    return this.forClient(this.delegate.getOriginalResponse());
   }
   getFinishReasons() {
     return this.delegate.getFinishReasons();
   }
   toRefusalResponse(refusalMessage: string, contentMessage: string) {
-    return this.delegate.toRefusalResponse(refusalMessage, contentMessage);
+    return this.forClient(
+      this.delegate.toRefusalResponse(refusalMessage, contentMessage),
+    );
+  }
+  withReplacedText(text: string) {
+    return this.delegate.withReplacedText(text);
+  }
+  withRewrittenToolCalls(
+    toolCalls: Array<{ id: string; name: string; arguments: string }>,
+  ) {
+    return this.forClient(this.delegate.withRewrittenToolCalls(toolCalls));
+  }
+
+  /** The response as the client reads it; getUsage keeps reading xAI's. */
+  private forClient(response: XaiResponse): XaiResponse {
+    return this.clientUsage === "openai" && response.usage
+      ? {
+          ...response,
+          usage: withReasoningOutsideCompletion(response.usage, false),
+        }
+      : response;
   }
 }
 
@@ -137,8 +179,12 @@ class XaiStreamAdapter
   readonly provider = "xai" as const;
   private delegate: OpenAIStreamAdapter;
 
-  constructor() {
-    this.delegate = new OpenAIStreamAdapter();
+  constructor(request?: XaiRequest, clientUsage: XaiClientUsage = "xai") {
+    this.delegate = new OpenAIStreamAdapter({
+      clientRequest: request,
+      reasoningOutsideCompletion: true,
+      clientReasoningOutsideCompletion: clientUsage === "xai",
+    });
   }
 
   get state() {
@@ -154,11 +200,17 @@ class XaiStreamAdapter
   formatTextDeltaSSE(text: string) {
     return this.delegate.formatTextDeltaSSE(text);
   }
+  setTextSuffix(getSuffix: (completedText: string) => string) {
+    this.delegate.setTextSuffix(getSuffix);
+  }
   getRawToolCallEvents() {
     return this.delegate.getRawToolCallEvents();
   }
   formatCompleteTextSSE(text: string) {
     return this.delegate.formatCompleteTextSSE(text);
+  }
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]) {
+    return this.delegate.formatToolCallsSSE(toolCalls);
   }
   formatEndSSE() {
     return this.delegate.formatEndSSE();
@@ -194,13 +246,24 @@ export const xaiAdapterFactory: LLMProvider<
     return new XaiResponseAdapter(response);
   },
 
-  createStreamAdapter(): LLMStreamAdapter<XaiStreamChunk, XaiResponse> {
-    return new XaiStreamAdapter();
+  createStreamAdapter(
+    request?: XaiRequest,
+  ): LLMStreamAdapter<XaiStreamChunk, XaiResponse> {
+    return new XaiStreamAdapter(request);
   },
 
   extractApiKey(headers: XaiHeaders): string | undefined {
     // xAI requires auth.
     return headers.authorization;
+  },
+
+  isSubscriptionCredential(apiKey: string | undefined): boolean {
+    // SuperGrok credentials travel through the proxy as
+    // marker-prefixed encoded strings (`xai-subscription:…`). They are covered
+    // by a flat-rate plan, so they must classify as subscription — the same rule
+    // as ChatGPT/Codex credentials on the openai adapter. Plain console API keys
+    // stay metered.
+    return isXaiSubscriptionCredential(stripBearerTransportPrefix(apiKey));
   },
 
   getBaseUrl(): string | undefined {
@@ -217,16 +280,75 @@ export const xaiAdapterFactory: LLMProvider<
       throw new Error("API key required for xAI");
     }
 
-    const customFetch = options.agent
-      ? metrics.llm.getObservableFetch(
-          "xai",
-          options.agent,
-          options.source,
-          options.externalAgentId,
-        )
+    const observableFetch = options.agent
+      ? metrics.llm.getObservableFetch("xai", options.agent, options.source)
       : undefined;
 
+    const customFetch = fetchWithAbortSignal(
+      observableFetch,
+      options.abortSignal,
+    );
+
+    // "SuperGrok" subscription auth mode: the resolved credential is
+    // an encoded xAI OAuth credential, not a console key. Session traffic uses
+    // xAI's dedicated CLI chat proxy and swaps the bearer in a fetch wrapper
+    // because createClient is synchronous.
+    const strippedApiKey = stripBearerTransportPrefix(apiKey);
+    const subscriptionKind = subscriptionKindFromCredential(strippedApiKey);
+    if (
+      subscriptionKind &&
+      SUBSCRIPTION_CREDENTIALS[subscriptionKind].provider !== "xai"
+    ) {
+      throw new ApiError(
+        401,
+        "The selected xAI key contains a subscription credential for another provider. Reconnect the correct credential.",
+        ArchestraInternalErrorCode.ProviderAuthRequired,
+      );
+    }
+    const subscriptionCredential =
+      decodeXaiSubscriptionCredential(strippedApiKey);
+    // A marker-prefixed value that doesn't decode is a corrupted subscription
+    // credential, never a console key: falling through to the plain-key branch
+    // would send it as a raw bearer to options.baseUrl, which per-key
+    // overrides make user-supplied — the exact leak the subscription fetch's
+    // origin pin fails closed against.
+    if (
+      !subscriptionCredential &&
+      isXaiSubscriptionCredential(strippedApiKey)
+    ) {
+      throw new ApiError(
+        401,
+        "Your xAI SuperGrok sign-in is unreadable. Reconnect your Grok account to keep using your subscription.",
+        ArchestraInternalErrorCode.ProviderAuthRequired,
+      );
+    }
+    if (subscriptionCredential) {
+      if (
+        options.baseUrl &&
+        options.baseUrl.replace(/\/+$/, "") !==
+          config.llm.xai.baseUrl.replace(/\/+$/, "")
+      ) {
+        throw new ApiError(
+          400,
+          "SuperGrok credentials cannot use a per-key base URL override — remove it or use an API key instead.",
+        );
+      }
+      return new OpenAIProvider({
+        maxRetries: PROXY_SDK_MAX_RETRIES,
+        // Placeholder satisfies the SDK; the wrapper sets the real bearer.
+        apiKey: "xai-subscription",
+        baseURL: config.llm.xai.subscription.baseUrl,
+        fetch: createXaiSubscriptionFetch({
+          credential: subscriptionCredential,
+          providerApiKeyId: options.llmProviderApiKeyId,
+          innerFetch: customFetch,
+        }),
+        defaultHeaders: options.defaultHeaders,
+      });
+    }
+
     return new OpenAIProvider({
+      maxRetries: PROXY_SDK_MAX_RETRIES,
       apiKey,
       baseURL: options.baseUrl,
       fetch: customFetch,
@@ -236,8 +358,9 @@ export const xaiAdapterFactory: LLMProvider<
 
   async execute(client: unknown, request: XaiRequest): Promise<XaiResponse> {
     const xaiClient = client as OpenAIProvider;
+    const normalized = withSystemForDeveloperRole(request);
     const xaiRequest = {
-      ...request,
+      ...normalized,
       stream: false,
     } as unknown as ChatCompletionCreateParamsNonStreaming;
 
@@ -251,28 +374,23 @@ export const xaiAdapterFactory: LLMProvider<
     request: XaiRequest,
   ): Promise<AsyncIterable<XaiStreamChunk>> {
     const xaiClient = client as OpenAIProvider;
+    const normalized = withSystemForDeveloperRole(request);
     const xaiRequest = {
-      ...request,
+      ...normalized,
       stream: true,
       stream_options: { include_usage: true },
     } as unknown as ChatCompletionCreateParamsStreaming;
 
-    const stream = await xaiClient.chat.completions.create(xaiRequest);
-
-    return {
-      [Symbol.asyncIterator]: async function* () {
-        for await (const chunk of stream) {
-          yield chunk as XaiStreamChunk;
-        }
-      },
-    };
+    return streamChatCompletionChunks<XaiStreamChunk>(
+      xaiClient.chat.completions.create(xaiRequest),
+    );
   },
 
   extractInternalCode(error: unknown): ArchestraInternalErrorCode | undefined {
     if (get(error, "error.code") === "context_length_exceeded") {
       return ArchestraInternalErrorCode.ContextLengthExceeded;
     }
-    return undefined;
+    return subscriptionAuthRequiredCode(error);
   },
 
   extractErrorMessage(error: unknown): string {
@@ -288,3 +406,24 @@ export const xaiAdapterFactory: LLMProvider<
     return "Internal server error";
   },
 };
+
+/**
+ * xAI's factory for a client that reads OpenAI's usage, with reasoning inside
+ * `completion_tokens`: the model router and the Responses surface. The native
+ * xAI route keeps xAI's own usage. Every other member is read from
+ * `xaiAdapterFactory` when used, so a test's spy on it still applies.
+ */
+export const xaiOpenAiUsageAdapterFactory: typeof xaiAdapterFactory = new Proxy(
+  xaiAdapterFactory,
+  {
+    get(target, property, receiver) {
+      if (property === "createResponseAdapter")
+        return (response: XaiResponse) =>
+          new XaiResponseAdapter(response, "openai");
+      if (property === "createStreamAdapter")
+        return (request?: XaiRequest) =>
+          new XaiStreamAdapter(request, "openai");
+      return Reflect.get(target, property, receiver);
+    },
+  },
+);

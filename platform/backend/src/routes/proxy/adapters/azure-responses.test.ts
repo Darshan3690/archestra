@@ -1,5 +1,5 @@
 import type OpenAIProvider from "openai";
-import { describe, expect, test } from "@/test";
+import { describe, expect, test } from "vitest";
 import { azureResponsesAdapterFactory } from "./azure-responses";
 
 describe("azureResponsesAdapterFactory", () => {
@@ -58,6 +58,29 @@ describe("azureResponsesAdapterFactory", () => {
     expect(client._options?.defaultQuery).toBeUndefined();
   });
 
+  test("reads messages that omit `type` (the AI SDK's easy input message shape)", () => {
+    // The Responses API defaults an input item's `type` to "message", and the AI
+    // SDK relies on that, sending bare `{role, content}`. Dropping those left
+    // getMessages() empty, an empty conversation instead of the user's actual
+    // prompt.
+    const adapter = azureResponsesAdapterFactory.createRequestAdapter({
+      model: "gpt-4.1",
+      input: [
+        { role: "user", content: "what is my account balance?" },
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "checking" }],
+        },
+      ],
+    } as never);
+
+    expect(adapter.getMessages()).toEqual([
+      { role: "user", content: "what is my account balance?" },
+      { role: "assistant", content: "checking" },
+    ]);
+  });
+
   test("maps response tools and tool outputs from the request", () => {
     const adapter = azureResponsesAdapterFactory.createRequestAdapter({
       model: "gpt-4.1",
@@ -97,17 +120,21 @@ describe("azureResponsesAdapterFactory", () => {
       ],
     });
 
+    const result = {
+      id: "call_123",
+      name: "read_file",
+      arguments: { file_path: "/tmp/test" },
+      content: '{"value":1}',
+      isError: false,
+    };
+    // The output is paired with the call behind it: without that the
+    // conversation looks tool-free to common-format readers.
     expect(adapter.getMessages()).toEqual([
       { role: "user", content: "hello from responses" },
-      { role: "tool", content: '{"value":1}' },
+      { role: "tool", content: '{"value":1}', toolCalls: [result] },
     ]);
     expect(adapter.getToolResults()).toEqual([
-      {
-        id: "call_123",
-        name: "read_file",
-        content: '{"value":1}',
-        isError: false,
-      },
+      { ...result, structured: false },
     ]);
     expect(adapter.getTools()).toEqual([
       {
@@ -140,9 +167,89 @@ describe("azureResponsesAdapterFactory", () => {
         id: "call_missing",
         name: "unknown",
         content: '{"value":1}',
+        structured: false,
         isError: false,
       },
     ]);
+    // Still a tool result, surfaced under the "unknown" name.
+    expect(adapter.getMessages()).toEqual([
+      {
+        role: "tool",
+        content: '{"value":1}',
+        toolCalls: [
+          {
+            id: "call_missing",
+            name: "unknown",
+            content: '{"value":1}',
+            isError: false,
+          },
+        ],
+      },
+    ]);
+  });
+
+  // Codex calls a namespaced tool by its bare name and names the namespace
+  // beside it; the pair is the tool's identity, so the plugins must see both.
+  test("carries the namespace a paired history call named", () => {
+    const adapter = azureResponsesAdapterFactory.createRequestAdapter({
+      model: "gpt-4.1",
+      input: [
+        {
+          type: "function_call",
+          call_id: "call_gw",
+          name: "archestra__search_tools",
+          namespace: "mcp__gw",
+          arguments: '{"query":"issues"}',
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_gw",
+          output: "matching tools",
+        },
+      ],
+    } as never);
+    const expected = {
+      id: "call_gw",
+      name: "archestra__search_tools",
+      namespace: "mcp__gw",
+      arguments: { query: "issues" },
+      content: "matching tools",
+      isError: false,
+    };
+
+    expect(adapter.getToolResults()).toEqual([
+      { ...expected, structured: false },
+    ]);
+    expect(adapter.getMessages()).toEqual([
+      { role: "tool", content: "matching tools", toolCalls: [expected] },
+    ]);
+  });
+
+  test("forwards a tool result a sanitizer reduced to nothing", () => {
+    const adapter = azureResponsesAdapterFactory.createRequestAdapter({
+      model: "gpt-4.1",
+      input: [
+        {
+          type: "function_call",
+          call_id: "call_secret",
+          name: "read_file",
+          arguments: "{}",
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_secret",
+          output: "the secret",
+        },
+      ],
+    } as never);
+
+    adapter.applyToolResultUpdates({ call_secret: "" });
+
+    expect(adapter.toProviderRequest().input).toContainEqual({
+      type: "function_call_output",
+      call_id: "call_secret",
+      output: "",
+    });
   });
 
   test("extracts text and tool calls from a responses payload", () => {
@@ -197,8 +304,112 @@ describe("azureResponsesAdapterFactory", () => {
     expect(adapter.getUsage()).toEqual({
       inputTokens: 12,
       outputTokens: 7,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      reasoningTokens: 0,
     });
     expect(adapter.getFinishReasons()).toEqual(["tool_calls"]);
+  });
+
+  test("replaces a non-streaming governed response with admitted text", () => {
+    const adapter = azureResponsesAdapterFactory.createResponseAdapter({
+      id: "resp_replace",
+      object: "response",
+      created_at: 123,
+      model: "gpt-4.1",
+      status: "completed",
+      output: [
+        {
+          id: "msg_raw",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [
+            { type: "output_text", text: "RAW CHILD RETURN", annotations: [] },
+          ],
+        },
+      ],
+    } as never);
+
+    const replaced = adapter.withReplacedText?.("ADMITTED CHILD RETURN");
+
+    expect(replaced).toMatchObject({
+      id: "resp_replace",
+      status: "completed",
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "ADMITTED CHILD RETURN" }],
+        },
+      ],
+    });
+    expect(JSON.stringify(replaced)).not.toContain("RAW CHILD RETURN");
+  });
+
+  test("keeps the namespace a call names", () => {
+    const adapter = azureResponsesAdapterFactory.createResponseAdapter({
+      id: "resp_ns",
+      object: "response",
+      created_at: 123,
+      model: "gpt-4.1",
+      status: "completed",
+      output: [
+        {
+          type: "function_call",
+          id: "fc_1",
+          call_id: "call_gw",
+          name: "archestra__run_tool",
+          namespace: "mcp__gw",
+          arguments: '{"tool_name":"github__issue_write"}',
+          status: "completed",
+        },
+      ],
+    } as never);
+
+    expect(adapter.getToolCalls()).toEqual([
+      {
+        id: "call_gw",
+        name: "archestra__run_tool",
+        namespace: "mcp__gw",
+        arguments: { tool_name: "github__issue_write" },
+      },
+    ]);
+  });
+
+  test("keeps the namespace a streamed call names", () => {
+    const adapter = azureResponsesAdapterFactory.createStreamAdapter();
+
+    adapter.processChunk({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: {
+        id: "fc_1",
+        type: "function_call",
+        call_id: "call_gw",
+        name: "archestra__run_tool",
+        namespace: "mcp__gw",
+        arguments: "",
+        status: "in_progress",
+      },
+    } as never);
+    adapter.processChunk({
+      type: "response.function_call_arguments.delta",
+      item_id: "fc_1",
+      output_index: 0,
+      delta: '{"tool_name":"github__issue_write"}',
+      sequence_number: 1,
+    } as never);
+
+    expect(adapter.state.toolCalls).toEqual([
+      {
+        id: "call_gw",
+        name: "archestra__run_tool",
+        namespace: "mcp__gw",
+        arguments: '{"tool_name":"github__issue_write"}',
+      },
+    ]);
   });
 
   test("passes through Azure responses streaming events and completes on response.completed", () => {
@@ -251,7 +462,7 @@ describe("azureResponsesAdapterFactory", () => {
       model: "gpt-4.1",
       status: "completed",
     });
-    expect(adapter.formatEndSSE()).toBe("data: [DONE]\n\n");
+    expect(adapter.formatEndSSE()).toBe("");
   });
 
   test("accumulates streamed function call arguments across delta events", () => {
@@ -319,5 +530,101 @@ describe("azureResponsesAdapterFactory", () => {
         name: "read_file",
       }),
     ]);
+  });
+
+  test("keeps accumulated output when the completed envelope carries none", () => {
+    // Reasoning turns finish with an empty `output` even though the text
+    // arrived over `response.output_text.delta`. Persisting the envelope
+    // verbatim dropped the whole assistant side, leaving LLM Logs with
+    // "No message" to render.
+    const adapter = azureResponsesAdapterFactory.createStreamAdapter();
+
+    adapter.processChunk({
+      type: "response.output_text.delta",
+      delta: "the answer",
+    } as never);
+    adapter.processChunk({
+      type: "response.completed",
+      response: {
+        id: "resp_1",
+        object: "response",
+        created_at: 1,
+        model: "gpt-4.1",
+        status: "completed",
+        output: [],
+      },
+    } as never);
+
+    const persisted = adapter.toProviderResponse();
+
+    expect(persisted.id).toBe("resp_1");
+    expect(persisted.output).toHaveLength(1);
+    expect(JSON.stringify(persisted.output)).toContain("the answer");
+  });
+
+  test("adds the stream prefix when the completed response has no text block", () => {
+    const adapter = azureResponsesAdapterFactory.createStreamAdapter();
+    const prefix = "started subagent ABC-1234";
+    adapter.setTextSuffix?.(() => prefix);
+    adapter.processChunk({
+      type: "response.output_text.delta",
+      item_id: "msg_1",
+      output_index: 0,
+      content_index: 0,
+      sequence_number: 1,
+      delta: "answer",
+    } as never);
+
+    const completed = adapter.processChunk({
+      type: "response.completed",
+      sequence_number: 2,
+      response: {
+        id: "resp_1",
+        object: "response",
+        created_at: 1,
+        model: "gpt-4.1",
+        status: "completed",
+        output: [
+          {
+            id: "msg_1",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [],
+          },
+        ],
+      },
+    } as never);
+    const completion = JSON.parse(
+      String(completed.sseData).replace(/^(?:event: .*\n)?data: /, ""),
+    ) as { response: { output: unknown[] } };
+
+    expect(JSON.stringify(completion.response.output)).toContain(prefix);
+    expect(completion.response.output).toHaveLength(2);
+  });
+});
+
+describe("Azure Responses replayed tool-call ids", () => {
+  test("fits a Gemini call id on the upstream request", () => {
+    const geminiCallId = `gemsig-${"s".repeat(450)}.gemini-call-read-1`;
+    const adapter = azureResponsesAdapterFactory.createRequestAdapter({
+      model: "gpt-5.2-chat",
+      input: [
+        {
+          type: "function_call",
+          call_id: geminiCallId,
+          name: "read",
+          arguments: "{}",
+        },
+        { type: "function_call_output", call_id: geminiCallId, output: "a" },
+      ],
+    } as never);
+
+    const [call, output] = adapter.toProviderRequest().input as Array<{
+      call_id: string;
+    }>;
+
+    expect(call.call_id).toMatch(/^call_[0-9a-f]{32}$/);
+    expect(output.call_id).toBe(call.call_id);
   });
 });

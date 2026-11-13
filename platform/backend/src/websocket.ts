@@ -1,26 +1,94 @@
 import type { IncomingMessage, Server } from "node:http";
-import { PassThrough } from "node:stream";
+import { type Duplex, PassThrough } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
 import {
   type ClientWebSocketMessage,
   ClientWebSocketMessageSchema,
   type ClientWebSocketMessageType,
+  LOCAL_MCP_INSTALLATION_STATES,
   type LocalMcpInstallationState,
   MCP_DEFAULT_LOG_LINES,
   type McpDeploymentStatusEntry,
+  type OpenAppaValidationProgressMessage,
   type ServerWebSocketMessage,
-} from "@shared";
+} from "@archestra/shared";
+import type * as k8s from "@kubernetes/client-node";
 import type { WebSocket, WebSocketServer } from "ws";
 import { WebSocket as WS, WebSocketServer as WSS } from "ws";
-import { betterAuth, hasPermission } from "@/auth";
+import { z } from "zod";
+import { userHasPermission } from "@/auth";
+import { auth as betterAuth } from "@/auth/better-auth";
+import { isMcpInstallationAdmin } from "@/auth/mcp-catalog-permissions";
+import { serviceAccountUserId } from "@/auth/service-account-user-id";
 import config from "@/config";
 import { BrowserStreamSocketClientContext } from "@/features/browser-stream/websocket/browser-stream.websocket";
 import McpServerRuntimeManager from "@/k8s/mcp-server-runtime/manager";
 import logger from "@/logging";
-import { McpServerModel, UserModel } from "@/models";
+import {
+  AgentRunModel,
+  AgentRunTranscriptModel,
+  McpServerModel,
+  ProjectAccessModel,
+  ProjectModel,
+  UserModel,
+} from "@/models";
+import ResourcePermissionAccessModel from "@/models/resource-permission-access";
 import { reportMcpDeploymentStatuses } from "@/observability/metrics/mcp";
+import { resolveAgentRuntimeBackendDriver } from "@/services/agent-runtime/backends";
+import {
+  AgentRuntimeOutputCapture,
+  RETAINED_LOG_BYTES,
+} from "@/services/agent-runtime/output-capture";
+import { mayAttachAgentRun } from "@/services/agent-runtime/run-access";
+import {
+  auditTerminal,
+  countInterrupts,
+  INTERRUPT_AUDIT_WINDOW_MS,
+  type TerminalAttachment,
+} from "@/services/agent-runtime/terminal-audit";
+import { agentRunTranscriptStore } from "@/services/agent-runtime/transcript-store";
+import { isPredefinedAdmin } from "@/services/agent-tool-assignment";
+import { projectMcpDeploymentStatuses } from "@/services/mcp-deployment-statuses";
+import {
+  createPollingNotifyHub,
+  createPostgresNotifyHub,
+  type FanoutChannel,
+  type PgNotifyHub,
+} from "@/services/pg-notify-hub";
+import { ResourcePermissions } from "@/services/resource-permissions";
+import type { AgentRunRecord } from "@/types";
+
+/** `/v1/unified-model/realtime`, the legacy `/v1/model-router/realtime`, and `/v1/openai/realtime`, with or without an agent id. */
+const REALTIME_UPGRADE_PATH =
+  /^\/v1\/(?:unified-model|model-router|openai)(?:\/[0-9a-f-]{36})?\/realtime$/i;
 
 interface McpLogsSubscription {
   serverId: string;
+  stream: PassThrough;
+  abortController: AbortController;
+}
+
+interface AgentRunAttachSubscription {
+  runId: string;
+  stdin: PassThrough;
+  stdout: PassThrough;
+  stderr: PassThrough;
+  inputPaused: boolean;
+  socket: {
+    readyState: number;
+    close: () => void;
+    send: (data: Buffer) => void;
+  } | null;
+  /** Set once the terminal is live; the audit trail's subject. */
+  attachment: TerminalAttachment | null;
+}
+
+type PausableWebSocket = WebSocket & {
+  _socket?: { pause: () => void; resume: () => void };
+};
+
+interface AgentRunLogsSubscription {
+  runId: string;
   stream: PassThrough;
   abortController: AbortController;
 }
@@ -39,8 +107,12 @@ interface McpExecSubscription {
 }
 
 interface McpDeploymentStatusSubscription {
-  interval: NodeJS.Timeout;
-  lastStatuses: Record<string, McpDeploymentStatusEntry>;
+  /** Projects the shared runtime summary onto this subscriber's accessible servers. */
+  buildStatuses: (
+    summary: typeof McpServerRuntimeManager.statusSummary,
+  ) => Record<string, McpDeploymentStatusEntry>;
+  /** Serialized last-sent statuses, for change detection. */
+  lastStatusesJson: string;
 }
 
 interface WebSocketClientContext {
@@ -55,10 +127,31 @@ type MessageHandler = (
   clientContext: WebSocketClientContext,
 ) => Promise<void> | void;
 
-class WebSocketService {
+/** @public — exported for testability (one instance per simulated replica) */
+export class WebSocketService {
   private wss: WebSocketServer | null = null;
+  private httpServer: Server | null = null;
+  private upgradeListener:
+    | ((request: IncomingMessage, socket: Duplex, head: Buffer) => void)
+    | null = null;
+  /**
+   * Relays MCP status events to every replica. A browser holds its socket on
+   * whichever pod the load balancer picked, which is rarely the pod doing the
+   * install, so a local-only broadcast leaves it waiting for a refetch.
+   */
+  private crossReplica: {
+    hub: PgNotifyHub;
+    channel: FanoutChannel;
+    unsubscribe: () => void;
+  } | null = null;
   private mcpLogsSubscriptions: Map<WebSocket, McpLogsSubscription> = new Map();
   private mcpExecSubscriptions: Map<WebSocket, McpExecSubscription> = new Map();
+  private agentRunAttachSubscriptions: Map<
+    WebSocket,
+    AgentRunAttachSubscription
+  > = new Map();
+  private agentRunLogsSubscriptions: Map<WebSocket, AgentRunLogsSubscription> =
+    new Map();
   private mcpDeploymentStatusSubscriptions: Map<
     WebSocket,
     McpDeploymentStatusSubscription
@@ -66,6 +159,23 @@ class WebSocketService {
   private clientContexts: Map<WebSocket, WebSocketClientContext> = new Map();
   private browserStreamContext: BrowserStreamSocketClientContext | null = null;
   private deploymentMetricsInterval: NodeJS.Timeout | null = null;
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  // Event-driven metrics: short-lived states (a deployment waking from
+  // hibernation lives for a couple of seconds) would never survive until the
+  // next interval tick, so the gauge is also rewritten on every state refresh.
+  private deploymentMetricsRefreshUnsubscribe: (() => void) | null = null;
+  // SPDX-SnippetEnd
+  // One poller shared by all deployment-status subscribers; runs while the
+  // subscription map is non-empty.
+  private mcpDeploymentStatusPollInterval: NodeJS.Timeout | null = null;
+  private mcpDeploymentStatusRefreshInFlight = false;
+  // Event-driven push: the runtime manager notifies us after a K8s
+  // watch-triggered state refresh; we fan the fresh statuses out
+  // immediately instead of waiting for the next poll tick.
+  private mcpDeploymentStatusRefreshUnsubscribe: (() => void) | null = null;
+  private lastMcpDeploymentRefreshAt = 0;
 
   /**
    * Proxy object for browser subscriptions - exposes Map-like interface for testing.
@@ -137,6 +247,81 @@ class WebSocketService {
         message.payload.rows,
       );
     },
+    subscribe_agent_run_attach: (ws, message, clientContext) => {
+      if (message.type !== "subscribe_agent_run_attach") return;
+      return this.handleSubscribeAgentRunAttach(
+        ws,
+        message.payload.runId,
+        clientContext,
+      );
+    },
+    unsubscribe_agent_run_attach: (ws) => {
+      this.unsubscribeAgentRunAttach(ws);
+    },
+    agent_run_attach_input: (ws, message) => {
+      if (message.type !== "agent_run_attach_input") return;
+      const subscription = this.agentRunAttachSubscriptions.get(ws);
+      if (subscription?.runId !== message.payload.runId || !subscription.socket)
+        return;
+      const { attachment } = subscription;
+      const interrupts = attachment ? countInterrupts(message.payload.data) : 0;
+      if (attachment && interrupts > 0) {
+        // Ctrl+C reaches the agent's own input loop, where it stops the
+        // running turn. Record it once per burst so a held key is one event;
+        // the detach row carries the full count.
+        attachment.interruptCount += interrupts;
+        const now = Date.now();
+        if (
+          attachment.lastInterruptAt === null ||
+          now - attachment.lastInterruptAt >= INTERRUPT_AUDIT_WINDOW_MS
+        ) {
+          attachment.lastInterruptAt = now;
+          auditTerminal("agentRun.terminal_interrupted", attachment);
+        }
+      }
+      const accepted = subscription.stdin.write(message.payload.data);
+      if (!accepted && !subscription.inputPaused) {
+        subscription.inputPaused = true;
+        const transport = (ws as PausableWebSocket)._socket;
+        transport?.pause();
+        subscription.stdin.once("drain", () => {
+          subscription.inputPaused = false;
+          transport?.resume();
+        });
+      }
+    },
+    agent_run_attach_resize: (ws, message) => {
+      if (message.type !== "agent_run_attach_resize") return;
+      const subscription = this.agentRunAttachSubscriptions.get(ws);
+      if (subscription?.runId !== message.payload.runId || !subscription.socket)
+        return;
+      // SPDY channel 4 carries terminal dimensions; without it tmux keeps the
+      // default 80x24 and redraws the pane to a size nobody is looking at.
+      const resize = JSON.stringify({
+        Width: message.payload.cols,
+        Height: message.payload.rows,
+      });
+      const frame = Buffer.alloc(resize.length + 1);
+      frame[0] = 4;
+      frame.write(resize, 1);
+      if (subscription.socket.readyState <= 1) {
+        subscription.socket.send(frame);
+      }
+    },
+    subscribe_agent_run_logs: (ws, message, clientContext) => {
+      if (message.type !== "subscribe_agent_run_logs") return;
+      return this.handleSubscribeAgentRunLogs(
+        ws,
+        message.payload.runId,
+        message.payload.lines ?? MCP_DEFAULT_LOG_LINES,
+        clientContext,
+        message.payload.includeSessionHistory ?? false,
+        message.payload.tailBytes,
+      );
+    },
+    unsubscribe_agent_run_logs: (ws) => {
+      this.unsubscribeAgentRunLogs(ws);
+    },
     subscribe_mcp_deployment_statuses: (ws, _message, clientContext) => {
       return this.handleSubscribeMcpDeploymentStatuses(ws, clientContext);
     },
@@ -148,10 +333,38 @@ class WebSocketService {
   start(httpServer: Server) {
     const { path } = config.websocket;
 
-    this.wss = new WSS({
-      server: httpServer,
-      path,
-    });
+    // One listener dispatches upgrades by path: this server's own path and the
+    // LLM proxy's realtime sessions. Bound to the HTTP server with `path`, ws
+    // would answer every other path with 400 itself.
+    const wss = new WSS({ noServer: true });
+    this.wss = wss;
+    this.httpServer = httpServer;
+    this.upgradeListener = (request, socket, head) => {
+      const pathname = (request.url ?? "").split("?")[0];
+      if (pathname === path) {
+        wss.handleUpgrade(request, socket, head, (ws) =>
+          wss.emit("connection", ws, request),
+        );
+        return;
+      }
+      if (REALTIME_UPGRADE_PATH.test(pathname)) {
+        // Loaded on first use: the proxy routes import this service.
+        import("@/routes/proxy/realtime/openai-realtime-proxy").then(
+          ({ handleRealtimeUpgrade }) =>
+            handleRealtimeUpgrade(request, socket, head),
+          (error) => {
+            logger.error({ error }, "Realtime proxy failed to load");
+            socket.destroy();
+          },
+        );
+        return;
+      }
+      socket.write(
+        "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+      );
+      socket.destroy();
+    };
+    httpServer.on("upgrade", this.upgradeListener);
     if (BrowserStreamSocketClientContext.isBrowserStreamEnabled()) {
       this.browserStreamContext = new BrowserStreamSocketClientContext({
         wss: this.wss,
@@ -162,7 +375,9 @@ class WebSocketService {
       this.browserStreamContext = null;
     }
 
-    logger.info(`WebSocket server started on path ${path}`);
+    logger.debug(`WebSocket server started on path ${path}`);
+
+    this.enableCrossReplicaDelivery(createCrossReplicaNotifyHub());
 
     this.startDeploymentMetricsPolling();
 
@@ -172,7 +387,7 @@ class WebSocketService {
         const clientContext = await this.authenticateConnection(request);
 
         if (!clientContext) {
-          logger.warn(
+          logger.debug(
             {
               clientAddress:
                 request.socket.remoteAddress ?? "unknown_websocket_client",
@@ -184,6 +399,7 @@ class WebSocketService {
         }
 
         this.clientContexts.set(ws, clientContext);
+        this.sendToClient(ws, { type: "websocket_ready", payload: {} });
 
         logger.trace(
           {
@@ -215,6 +431,7 @@ class WebSocketService {
         ws.on("close", () => {
           this.unsubscribeMcpLogs(ws);
           this.unsubscribeMcpExec(ws);
+          this.cleanupAgentRunSubscriptions(ws);
           this.unsubscribeMcpDeploymentStatuses(ws);
           logger.trace(
             `WebSocket client disconnected. Remaining connections: ${this.wss?.clients.size}`,
@@ -226,6 +443,7 @@ class WebSocketService {
           logger.error({ error }, "WebSocket error");
           this.unsubscribeMcpLogs(ws);
           this.unsubscribeMcpExec(ws);
+          this.cleanupAgentRunSubscriptions(ws);
           this.unsubscribeMcpDeploymentStatuses(ws);
           this.clientContexts.delete(ws);
         });
@@ -411,6 +629,722 @@ class WebSocketService {
     }
   }
 
+  /**
+   * Attach the browser to an Agent run's live session.
+   *
+   * Authorization is narrower than being able to see the agent run: attaching
+   * lands inside a shell running under the creator's own credentials, so only
+   * that creator or a manager of the owning service account may do it.
+   * Administrative Agent access must not become access to another person's
+   * live credentials.
+   */
+  private async handleSubscribeAgentRunAttach(
+    ws: WebSocket,
+    runId: string,
+    clientContext: WebSocketClientContext,
+  ): Promise<void> {
+    this.unsubscribeAgentRunAttach(ws);
+    const subscription: AgentRunAttachSubscription = {
+      runId,
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      inputPaused: false,
+      socket: null,
+      attachment: null,
+    };
+    // Claim ownership before awaiting lookup or attachment so unsubscribe and
+    // a newer subscribe also invalidate work that is still connecting.
+    this.agentRunAttachSubscriptions.set(ws, subscription);
+    const isCurrent = () =>
+      this.agentRunAttachSubscriptions.get(ws) === subscription;
+
+    try {
+      // The URL may identify the retained workspace's original task while its
+      // live terminal belongs to a newer turn. Resolve that stable session alias
+      // with the same owner-scoped lookup as the HTTP detail route before
+      // falling back to the raw task for the denial response.
+      const ownedSession = await AgentRunModel.findCurrentSessionForActor({
+        taskId: runId,
+        actorUserId: clientContext.userId,
+        organizationId: clientContext.organizationId,
+      });
+      if (!isCurrent()) return;
+      let session = await AgentRunModel.findByTaskId(
+        ownedSession?.taskId ?? runId,
+      );
+      // Managers follow the same current-turn alias as the owning account.
+      if (
+        session?.actorKind === "serviceAccount" &&
+        (await mayAttachAgentRun(session, clientContext))
+      ) {
+        const current = await AgentRunModel.findCurrentSessionForActor({
+          taskId: runId,
+          actorUserId: serviceAccountUserId(session.actorId),
+          organizationId: clientContext.organizationId,
+        });
+        if (current) session = await AgentRunModel.findByTaskId(current.taskId);
+      }
+      if (!isCurrent()) return;
+      if (!session || session.organizationId !== clientContext.organizationId) {
+        throw new Error("Session not found");
+      }
+      const canAttach = await mayAttachAgentRun(session, clientContext);
+      if (!isCurrent()) return;
+      if (!canAttach) {
+        throw new Error(
+          session.actorKind === "serviceAccount"
+            ? "Only the owning service account or its managers with Agent use access can attach to this run"
+            : "Only the person who started this run can attach to it",
+        );
+      }
+
+      const { stdin, stdout, stderr } = subscription;
+      const { resourceName, command, socket } =
+        await resolveAgentRuntimeBackendDriver(session.backend).attach({
+          session,
+          stdin,
+          stdout,
+          stderr,
+          // Attaching waits on scheduling, the image pull and the agent's own
+          // session — minutes, on a cold node. Relay each wait as it is entered
+          // so the terminal can name what it is waiting for instead of showing
+          // an unqualified "Connecting…" for the whole of it.
+          onProgress: (progress) => {
+            if (!isCurrent() || ws.readyState !== WS.OPEN) return;
+            this.sendToClient(ws, {
+              type: "agent_run_attach_progress",
+              payload: {
+                runId,
+                phase: progress.phase,
+                message: progress.message,
+                detail: progress.detail ?? null,
+                resourceName: progress.resourceName ?? null,
+              },
+            });
+          },
+          onStatus: (status) => {
+            if (!isCurrent()) return;
+            if (status.outcome === "failure") {
+              this.sendToClient(ws, {
+                type: "agent_run_attach_closed",
+                payload: { runId, reason: status.message ?? undefined },
+              });
+            }
+          },
+        });
+
+      if (!isCurrent()) {
+        if (socket.readyState <= 1) socket.close();
+        return;
+      }
+      subscription.socket =
+        socket as unknown as AgentRunAttachSubscription["socket"];
+      subscription.attachment = {
+        session,
+        requestedRunId: runId,
+        actorUserId: clientContext.userId,
+        podName: resourceName,
+        attachedAt: Date.now(),
+        lastInterruptAt: null,
+        interruptCount: 0,
+      };
+      auditTerminal("agentRun.terminal_attached", subscription.attachment);
+
+      for (const stream of [stdout, stderr]) {
+        stream.on("data", (chunk: Buffer) => {
+          if (!isCurrent()) return;
+          this.sendToClient(ws, {
+            type: "agent_run_attach_output",
+            payload: { runId, data: chunk.toString() },
+          });
+        });
+      }
+
+      socket.on("close", () => {
+        if (!isCurrent()) return;
+        this.sendToClient(ws, {
+          type: "agent_run_attach_closed",
+          payload: { runId },
+        });
+        this.unsubscribeAgentRunAttach(ws);
+      });
+
+      this.sendToClient(ws, {
+        type: "agent_run_attach_started",
+        payload: { runId, command, resourceName },
+      });
+    } catch (error) {
+      if (!isCurrent()) return;
+      this.sendToClient(ws, {
+        type: "agent_run_attach_error",
+        payload: {
+          runId,
+          error: error instanceof Error ? error.message : "Could not attach",
+        },
+      });
+      this.unsubscribeAgentRunAttach(ws);
+    }
+  }
+
+  private unsubscribeAgentRunAttach(ws: WebSocket): void {
+    const subscription = this.agentRunAttachSubscriptions.get(ws);
+    if (!subscription) return;
+    this.agentRunAttachSubscriptions.delete(ws);
+    if (subscription.attachment) {
+      auditTerminal("agentRun.terminal_detached", subscription.attachment, {
+        durationSeconds: Math.round(
+          (Date.now() - subscription.attachment.attachedAt) / 1000,
+        ),
+        interruptCount: subscription.attachment.interruptCount,
+      });
+      subscription.attachment = null;
+    }
+    subscription.stdin.destroy();
+    subscription.stdout.destroy();
+    subscription.stderr.destroy();
+    // Close the exec transport without stopping the underlying tmux session.
+    if (subscription.socket && subscription.socket.readyState <= 1) {
+      subscription.socket.close();
+    }
+  }
+
+  private async handleSubscribeAgentRunLogs(
+    ws: WebSocket,
+    runId: string,
+    lines: number,
+    clientContext: WebSocketClientContext,
+    includeSessionHistory = false,
+    tailBytes?: number,
+  ): Promise<void> {
+    this.unsubscribeAgentRunLogs(ws);
+    const abortController = new AbortController();
+    const stream = new PassThrough();
+    this.agentRunLogsSubscriptions.set(ws, { runId, stream, abortController });
+
+    const owned = includeSessionHistory
+      ? await AgentRunModel.findCurrentSessionForActor({
+          taskId: runId,
+          actorUserId: clientContext.userId,
+          organizationId: clientContext.organizationId,
+        })
+      : null;
+    const resolvedTaskId = includeSessionHistory ? owned?.taskId : runId;
+    const session = resolvedTaskId
+      ? await AgentRunModel.findByTaskId(resolvedTaskId)
+      : null;
+    if (abortController.signal.aborted) return;
+    if (!session || session.organizationId !== clientContext.organizationId) {
+      this.sendToClient(ws, {
+        type: "agent_run_logs_error",
+        payload: { runId, error: "Session not found" },
+      });
+      this.unsubscribeAgentRunLogs(ws);
+      return;
+    }
+    const mayView = await this.mayViewSessionLogs(session, clientContext);
+    if (abortController.signal.aborted) return;
+    if (!mayView) {
+      this.sendToClient(ws, {
+        type: "agent_run_logs_error",
+        payload: {
+          runId,
+          error: "You do not have access to this run's output",
+        },
+      });
+      this.unsubscribeAgentRunLogs(ws);
+      return;
+    }
+
+    // An ended run's recording can open on its end: the start of its last
+    // turn and any earlier turns are left out and counted, for the viewer to
+    // load on request. Without a complete stored recording, the full path
+    // below sends what was retained.
+    if (session.endedAt && tailBytes) {
+      await this.refreshRetainedTranscript({ session, runId });
+      if (abortController.signal.aborted) return;
+      const sent = await this.streamAgentRunTail({
+        ws,
+        runId,
+        session,
+        tailBytes,
+        includeSessionHistory,
+        signal: abortController.signal,
+      });
+      if (sent || abortController.signal.aborted) return;
+    }
+
+    let history = { complete: true, bytes: 0 };
+    try {
+      if (includeSessionHistory) {
+        history = await this.streamAgentSessionHistory({
+          ws,
+          runId,
+          session,
+          signal: abortController.signal,
+        });
+      }
+    } catch (error) {
+      if (abortController.signal.aborted) return;
+      logger.error(
+        { error, taskId: session.taskId },
+        "Could not read session history",
+      );
+      this.sendToClient(ws, {
+        type: "agent_run_logs_error",
+        payload: { runId, error: "Could not read session history" },
+      });
+      this.unsubscribeAgentRunLogs(ws);
+      return;
+    }
+    if (abortController.signal.aborted) return;
+
+    if (session.endedAt) {
+      if (!tailBytes) await this.refreshRetainedTranscript({ session, runId });
+      const decoder = new StringDecoder("utf8");
+      const transcript = await agentRunTranscriptStore
+        .stream({
+          runId: session.id,
+          onChunk: (chunk) => {
+            const logs = decoder.write(chunk);
+            if (logs && !abortController.signal.aborted) {
+              this.sendToClient(ws, {
+                type: "agent_run_logs",
+                payload: { runId, logs },
+              });
+            }
+          },
+        })
+        .catch((error) => {
+          logger.warn(
+            { error, sessionId: session.id, taskId: session.taskId },
+            "Could not read the complete Agent run transcript",
+          );
+          return null;
+        });
+      if (abortController.signal.aborted) return;
+      if (transcript?.isComplete) {
+        const finalLogs = decoder.end();
+        if (finalLogs) {
+          this.sendToClient(ws, {
+            type: "agent_run_logs",
+            payload: { runId, logs: finalLogs },
+          });
+        }
+        const readable = await this.streamReadableAgentRunTranscript({
+          ws,
+          runId,
+          sessionId: session.id,
+          taskId: session.taskId,
+          signal: abortController.signal,
+        });
+        if (abortController.signal.aborted) return;
+        this.sendToClient(ws, {
+          type: "agent_run_logs_ended",
+          payload: {
+            runId,
+            source: "full",
+            truncated: !history.complete,
+            totalBytes: transcript.uncompressedBytes + history.bytes,
+            ...(readable ? { readable } : {}),
+          },
+        });
+        this.unsubscribeAgentRunLogs(ws);
+        return;
+      }
+
+      if (session.logs) {
+        this.sendToClient(ws, {
+          type: "agent_run_logs",
+          payload: { runId, logs: session.logs },
+        });
+      }
+      const readable = await this.streamReadableAgentRunTranscript({
+        ws,
+        runId,
+        sessionId: session.id,
+        taskId: session.taskId,
+        signal: abortController.signal,
+      });
+      if (abortController.signal.aborted) return;
+      this.sendToClient(ws, {
+        type: "agent_run_logs_ended",
+        payload: {
+          runId,
+          source: "tail",
+          truncated:
+            !history.complete ||
+            transcript?.isComplete === false ||
+            Buffer.byteLength(session.logs ?? "", "utf8") >= RETAINED_LOG_BYTES,
+          totalBytes: transcript?.uncompressedBytes,
+          ...(readable ? { readable } : {}),
+        },
+      });
+      this.unsubscribeAgentRunLogs(ws);
+      return;
+    }
+
+    stream.on("data", (chunk: Buffer) => {
+      this.sendToClient(ws, {
+        type: "agent_run_logs",
+        payload: { runId, logs: chunk.toString() },
+      });
+    });
+    stream.on("end", () => {
+      this.sendToClient(ws, {
+        type: "agent_run_logs_ended",
+        payload: { runId },
+      });
+      this.unsubscribeAgentRunLogs(ws);
+    });
+
+    try {
+      const output = new AgentRuntimeOutputCapture({
+        backend: resolveAgentRuntimeBackendDriver(session.backend),
+        session,
+        maxTranscriptBytes: RETAINED_LOG_BYTES,
+        throwOnStreamError: true,
+        onTextDelta: (chunk) => stream.write(chunk),
+      });
+      await output.follow(abortController.signal, lines);
+      stream.end();
+    } catch (error) {
+      this.sendToClient(ws, {
+        type: "agent_run_logs_error",
+        payload: {
+          runId,
+          error: error instanceof Error ? error.message : "Could not read logs",
+        },
+      });
+      this.unsubscribeAgentRunLogs(ws);
+    }
+  }
+
+  /**
+   * Re-read a run's output from its workspace and store it, for a run whose
+   * terminal stays attachable (it keeps its key) and may have written more
+   * since it ended.
+   */
+  private async refreshRetainedTranscript(params: {
+    session: AgentRunRecord;
+    runId: string;
+  }): Promise<void> {
+    const { session, runId } = params;
+    if (!session.virtualApiKeyId) return;
+    const backend = resolveAgentRuntimeBackendDriver(session.backend);
+    const output = new AgentRuntimeOutputCapture({ backend, session });
+    try {
+      await output.recoverSnapshot(AbortSignal.timeout(30_000));
+      if (output.observedTranscriptBytes > 0) {
+        await agentRunTranscriptStore.persist({
+          runId: session.id,
+          transcript: output.completeTranscript,
+          observedBytes: output.observedTranscriptBytes,
+          readableTranscript: output.readableTranscript,
+        });
+      }
+    } catch (error) {
+      logger.warn(
+        { error, runId },
+        "Could not refresh retained terminal output",
+      );
+    }
+  }
+
+  /**
+   * Send the end of an ended run's complete recording and close the stream.
+   * False, having sent nothing, when no complete recording is stored.
+   */
+  private async streamAgentRunTail(params: {
+    ws: WebSocket;
+    runId: string;
+    session: AgentRunRecord;
+    tailBytes: number;
+    includeSessionHistory: boolean;
+    signal: AbortSignal;
+  }): Promise<boolean> {
+    const { ws, runId, session, signal } = params;
+    const decoder = new StringDecoder("utf8");
+    let sentOutput = false;
+    const send = (logs: string) => {
+      if (!logs || signal.aborted) return;
+      sentOutput = true;
+      this.sendToClient(ws, {
+        type: "agent_run_logs",
+        payload: { runId, logs },
+      });
+    };
+    const fail = (error: unknown, message: string) => {
+      logger.warn(
+        { error, sessionId: session.id, taskId: session.taskId },
+        message,
+      );
+      if (signal.aborted) return;
+      this.sendToClient(ws, {
+        type: "agent_run_logs_error",
+        payload: { runId, error: message },
+      });
+      this.unsubscribeAgentRunLogs(ws);
+    };
+    let tail: Awaited<ReturnType<typeof agentRunTranscriptStore.streamTail>>;
+    try {
+      tail = await agentRunTranscriptStore.streamTail({
+        runId: session.id,
+        maxBytes: params.tailBytes,
+        onChunk: (chunk) => send(decoder.write(chunk)),
+      });
+    } catch (error) {
+      // Once part of the tail is out, the full recording cannot follow it:
+      // the viewer would see the end of the run spliced in front of the run.
+      if (!sentOutput) {
+        logger.warn(
+          { error, sessionId: session.id, taskId: session.taskId },
+          "Could not read the end of the Agent run transcript",
+        );
+        return false;
+      }
+      fail(error, "Could not read the end of the recording");
+      return true;
+    }
+    if (!tail || signal.aborted) return Boolean(tail);
+    send(decoder.end());
+    let historyBytes = 0;
+    if (params.includeSessionHistory) {
+      try {
+        historyBytes = await this.sessionHistoryBytes(session);
+      } catch (error) {
+        fail(error, "Could not read session history");
+        return true;
+      }
+    }
+    if (signal.aborted) return true;
+    const readable = await this.streamReadableAgentRunTranscript({
+      ws,
+      runId,
+      sessionId: session.id,
+      taskId: session.taskId,
+      signal,
+    });
+    if (signal.aborted) return true;
+    // A session's earlier turns are left out of a tail entirely, so they
+    // count as omitted: a full subscription with the session's history
+    // streams them along with the rest of this turn's recording.
+    this.sendToClient(ws, {
+      type: "agent_run_logs_ended",
+      payload: {
+        runId,
+        source: "full",
+        truncated: false,
+        totalBytes: tail.uncompressedBytes + historyBytes,
+        omittedBytes: tail.omittedBytes + historyBytes,
+        ...(readable ? { readable } : {}),
+      },
+    });
+    this.unsubscribeAgentRunLogs(ws);
+    return true;
+  }
+
+  /** A session's earlier turns, a page at a time, oldest first. */
+  private async *previousTurnPages(
+    session: AgentRunRecord,
+    signal?: AbortSignal,
+  ): AsyncGenerator<AgentRunRecord[]> {
+    let afterId: string | undefined;
+    while (!signal?.aborted) {
+      const turns = await AgentRunModel.listPreviousTurns({
+        run: session,
+        afterId,
+      });
+      if (!turns.length) return;
+      yield turns;
+      afterId = turns.at(-1)?.id;
+    }
+  }
+
+  /**
+   * The stored size of a session's earlier turns: what
+   * `streamAgentSessionHistory` counts, without sending them.
+   */
+  private async sessionHistoryBytes(session: AgentRunRecord): Promise<number> {
+    let bytes = 0;
+    for await (const turns of this.previousTurnPages(session)) {
+      const sizes = await AgentRunTranscriptModel.findSizesByRunIds(
+        turns.map((turn) => turn.id),
+      );
+      for (const turn of turns) {
+        bytes += turnOutputBytes(turn, sizes.get(turn.id));
+      }
+    }
+    return bytes;
+  }
+
+  private async streamAgentSessionHistory(params: {
+    ws: WebSocket;
+    runId: string;
+    session: AgentRunRecord;
+    signal: AbortSignal;
+  }): Promise<{ complete: boolean; bytes: number }> {
+    let complete = true;
+    let bytes = 0;
+    for await (const turns of this.previousTurnPages(
+      params.session,
+      params.signal,
+    )) {
+      for (const turn of turns) {
+        if (params.signal.aborted) return { complete, bytes };
+        const decoder = new StringDecoder("utf8");
+        const send = (logs: string) => {
+          if (logs && !params.signal.aborted)
+            this.sendToClient(params.ws, {
+              type: "agent_run_logs",
+              payload: { runId: params.runId, logs },
+            });
+        };
+        const transcript = await agentRunTranscriptStore.stream({
+          runId: turn.id,
+          onChunk: (chunk) => send(decoder.write(chunk)),
+        });
+        send(decoder.end());
+        if (!transcript?.isComplete) {
+          complete = false;
+          send(turn.logs ?? "");
+        }
+        bytes += turnOutputBytes(turn, transcript?.uncompressedBytes);
+        send("\r\n\u001b[0m");
+      }
+    }
+    return { complete, bytes };
+  }
+
+  private async streamReadableAgentRunTranscript(params: {
+    ws: WebSocket;
+    runId: string;
+    sessionId: string;
+    taskId: string;
+    signal: AbortSignal;
+  }): Promise<
+    { provider: string; version: number; totalBytes: number } | undefined
+  > {
+    const decoder = new StringDecoder("utf8");
+    try {
+      const transcript = await agentRunTranscriptStore.streamReadable({
+        runId: params.sessionId,
+        onChunk: (chunk) => {
+          const logs = decoder.write(chunk);
+          if (!logs || params.signal.aborted) return;
+          this.sendToClient(params.ws, {
+            type: "agent_run_logs",
+            payload: {
+              runId: params.runId,
+              logs,
+              channel: "readable",
+            },
+          });
+        },
+      });
+      if (!transcript || params.signal.aborted) return undefined;
+      const finalLogs = decoder.end();
+      if (finalLogs) {
+        this.sendToClient(params.ws, {
+          type: "agent_run_logs",
+          payload: {
+            runId: params.runId,
+            logs: finalLogs,
+            channel: "readable",
+          },
+        });
+      }
+      return {
+        provider: transcript.provider,
+        version: transcript.version,
+        totalBytes: transcript.uncompressedBytes,
+      };
+    } catch (error) {
+      logger.warn(
+        {
+          error,
+          sessionId: params.sessionId,
+          taskId: params.taskId,
+        },
+        "Could not read the Agent run's readable transcript",
+      );
+      return undefined;
+    }
+  }
+
+  private unsubscribeAgentRunLogs(ws: WebSocket): void {
+    const subscription = this.agentRunLogsSubscriptions.get(ws);
+    if (!subscription) return;
+    this.agentRunLogsSubscriptions.delete(ws);
+    subscription.abortController.abort();
+    subscription.stream.destroy();
+  }
+
+  private cleanupAgentRunSubscriptions(ws: WebSocket): void {
+    this.unsubscribeAgentRunAttach(ws);
+    this.unsubscribeAgentRunLogs(ws);
+  }
+
+  /** The person a session acts as, or an Agent administrator. */
+  private async mayControlSession(
+    session: { actorUserId: string | null },
+    clientContext: WebSocketClientContext,
+  ): Promise<boolean> {
+    if (session.actorUserId === clientContext.userId) return true;
+    return ResourcePermissions.allows({
+      userId: clientContext.userId,
+      organizationId: clientContext.organizationId,
+      resource: "agent",
+      scope: "*",
+      action: "update",
+    });
+  }
+
+  /**
+   * Output is readable by anyone who may attach (see mayAttachAgentRun),
+   * anyone who may control the run, and its share or project recipients.
+   * A share grants a view of the output, not the actor's live credentials.
+   */
+  private async mayViewSessionLogs(
+    session: AgentRunRecord,
+    clientContext: WebSocketClientContext,
+  ): Promise<boolean> {
+    if (await mayAttachAgentRun(session, clientContext)) return true;
+    if (await this.mayControlSession(session, clientContext)) return true;
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    const shared = await ResourcePermissionAccessModel.canRead({
+      organizationId: clientContext.organizationId,
+      userId: clientContext.userId,
+      resource: "agentRun",
+      scope: session.taskId,
+    });
+    // SPDX-SnippetEnd
+    if (shared) return true;
+    if (!session.projectId) return false;
+
+    const project = await ProjectModel.findById(session.projectId);
+    if (
+      !project ||
+      !(await ProjectAccessModel.userCanAccessProject({
+        sessionAccess: true,
+        project,
+        userId: clientContext.userId,
+        organizationId: clientContext.organizationId,
+      }))
+    ) {
+      return false;
+    }
+    return ResourcePermissions.allows({
+      userId: clientContext.userId,
+      organizationId: clientContext.organizationId,
+      resource: "conversation",
+      scope: "*",
+      action: "read",
+    });
+  }
+
   private async handleSubscribeMcpExec(
     ws: WebSocket,
     serverId: string,
@@ -432,6 +1366,28 @@ class WebSocketService {
       return;
     }
 
+    // A shell runs commands inside the server's container in the cluster, so
+    // it takes the right to manage installations, not just to see one: a
+    // member's own installation does not open a shell.
+    const mayOpenShell =
+      clientContext.userIsMcpServerAdmin ||
+      (await userHasPermission(
+        clientContext.userId,
+        clientContext.organizationId,
+        "mcpServerInstallation",
+        "update",
+      ));
+    if (!mayOpenShell) {
+      this.sendToClient(ws, {
+        type: "mcp_exec_error",
+        payload: {
+          serverId,
+          error: "Opening a shell needs permission to manage MCP servers.",
+        },
+      });
+      return;
+    }
+
     logger.info(
       { serverId, userId: clientContext.userId },
       "Exec session starting",
@@ -441,6 +1397,21 @@ class WebSocketService {
     const stdout = new PassThrough();
     const stderr = new PassThrough();
 
+    // Why a session ended (e.g. `/bin/sh` missing on a distroless image) can
+    // arrive on two different K8s exec channels depending on the container
+    // runtime: the status channel (a V1Status) and/or the output stream (the
+    // OCI runtime's stderr). Capture both so the close event can tell the user
+    // the real reason instead of a bare "Session terminated".
+    let execStatus: k8s.V1Status | undefined;
+    let capturedOutput = "";
+    const captureExecOutput = (chunk: string) => {
+      if (capturedOutput.length >= EXEC_OUTPUT_CAPTURE_LIMIT) return;
+      capturedOutput += chunk.slice(
+        0,
+        EXEC_OUTPUT_CAPTURE_LIMIT - capturedOutput.length,
+      );
+    };
+
     try {
       const { k8sWs, podName } =
         await McpServerRuntimeManager.execIntoMcpServer(
@@ -448,6 +1419,9 @@ class WebSocketService {
           stdin,
           stdout,
           stderr,
+          (status) => {
+            execStatus = status;
+          },
         );
 
       this.mcpExecSubscriptions.set(ws, {
@@ -466,30 +1440,35 @@ class WebSocketService {
 
       // Bridge K8s stdout/stderr -> client
       stdout.on("data", (chunk: Buffer) => {
+        const data = chunk.toString();
+        captureExecOutput(data);
         if (ws.readyState === WS.OPEN) {
           this.sendToClient(ws, {
             type: "mcp_exec_output",
-            payload: { serverId, data: chunk.toString() },
+            payload: { serverId, data },
           });
         }
       });
 
       stderr.on("data", (chunk: Buffer) => {
+        const data = chunk.toString();
+        captureExecOutput(data);
         if (ws.readyState === WS.OPEN) {
           this.sendToClient(ws, {
             type: "mcp_exec_output",
-            payload: { serverId, data: chunk.toString() },
+            payload: { serverId, data },
           });
         }
       });
 
       // K8s WS close -> notify client
       k8sWs.on("close", () => {
-        logger.info({ serverId }, "K8s exec WebSocket closed");
+        const reason = describeExecFailure(execStatus, capturedOutput);
+        logger.info({ serverId, reason }, "K8s exec WebSocket closed");
         if (ws.readyState === WS.OPEN) {
           this.sendToClient(ws, {
             type: "mcp_exec_closed",
-            payload: { serverId },
+            payload: { serverId, reason },
           });
         }
         this.unsubscribeMcpExec(ws);
@@ -600,8 +1579,21 @@ class WebSocketService {
       }
     };
 
-    // Report immediately, then every 30 seconds
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Report immediately, on every manager state refresh (so states shorter
+    // than the interval — waking, a brief pending — reach the gauge the moment
+    // they happen), and every 30 seconds as a reconciler for servers that
+    // appear or vanish without a refresh event.
+    // SPDX-SnippetEnd
     reportMetrics();
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    this.deploymentMetricsRefreshUnsubscribe =
+      McpServerRuntimeManager.onDeploymentStatesRefreshed(reportMetrics);
+    // SPDX-SnippetEnd
     this.deploymentMetricsInterval = setInterval(reportMetrics, 30_000);
   }
 
@@ -615,106 +1607,213 @@ class WebSocketService {
     // Get accessible servers for this user.
     // NOTE: This list is captured once at subscription time. If servers are added/removed
     // after subscribing, the client won't see them until they re-subscribe (e.g. page refresh).
-    const allServers = await McpServerModel.findAll(
-      clientContext.userId,
-      clientContext.userIsMcpServerAdmin,
-    );
-
-    // Filter to local servers only (remote servers don't have K8s deployments)
-    const localServers = allServers.filter((s) => s.serverType === "local");
-    const localServerIds = localServers.map((s) => s.id);
+    const userIsPredefinedAdmin = await isPredefinedAdmin({
+      userId: clientContext.userId,
+      organizationId: clientContext.organizationId,
+    });
+    const localServerIds = await McpServerModel.findVisibleLocalIds({
+      userId: clientContext.userId,
+      isMcpServerAdmin: clientContext.userIsMcpServerAdmin,
+      organizationId: clientContext.organizationId,
+      isPredefinedAdmin: userIsPredefinedAdmin,
+    });
 
     // Build statuses from the runtime manager for this client
     const buildStatuses = (
       summary: typeof McpServerRuntimeManager.statusSummary,
-    ): Record<string, McpDeploymentStatusEntry> => {
-      const result: Record<string, McpDeploymentStatusEntry> = {};
+    ): Record<string, McpDeploymentStatusEntry> =>
+      projectMcpDeploymentStatuses(summary, localServerIds);
 
-      for (const serverId of localServerIds) {
-        const deploymentStatus = summary.mcpServers[serverId];
-        if (deploymentStatus) {
-          result[serverId] = {
-            state: deploymentStatus.state,
-            message: deploymentStatus.message,
-            error: deploymentStatus.error,
-            restartCount: deploymentStatus.restartCount,
-            podAge: deploymentStatus.podAge,
-            podName: deploymentStatus.podName,
-          };
-        } else {
-          result[serverId] = {
-            state: "not_created",
-            message: "Deployment not created",
-            error: null,
-          };
-        }
-      }
-
-      return result;
-    };
-
-    // Refresh and build initial statuses from the runtime manager
-    await McpServerRuntimeManager.refreshAllStates();
-    const runtimeSummary = McpServerRuntimeManager.statusSummary;
-    const statuses = buildStatuses(runtimeSummary);
-
-    // Send initial statuses
-    this.sendToClient(ws, {
-      type: "mcp_deployment_statuses",
-      payload: { statuses },
-    });
-
-    // Store subscription with initial statuses for change detection
-    const lastStatuses = { ...statuses };
-
-    // Start polling interval (10s)
-    const interval = setInterval(async () => {
-      if (ws.readyState !== WS.OPEN) {
-        this.unsubscribeMcpDeploymentStatuses(ws);
-        return;
-      }
-
-      try {
-        // Refresh deployment states from K8s before reading cached summaries
-        await McpServerRuntimeManager.refreshAllStates();
-
-        const currentSummary = McpServerRuntimeManager.statusSummary;
-        const currentStatuses = buildStatuses(currentSummary);
-
-        // Only send if statuses changed
-        const sub = this.mcpDeploymentStatusSubscriptions.get(ws);
-        if (!sub) return;
-
-        const changed =
-          JSON.stringify(currentStatuses) !== JSON.stringify(sub.lastStatuses);
-
-        if (changed) {
-          sub.lastStatuses = { ...currentStatuses };
-          this.sendToClient(ws, {
-            type: "mcp_deployment_statuses",
-            payload: { statuses: currentStatuses },
-          });
-        }
-      } catch (error) {
-        logger.error({ error }, "Failed to poll MCP deployment statuses");
-      }
-    }, 10_000);
+    // Clients subscribe on every full page load and navigation, at the same
+    // moment as the page's own API requests, and a full refresh is heavy work
+    // on this event loop. Answer from the summary an earlier refresh filled,
+    // and refresh only when it may be out of date — after this handler, never
+    // inside it. Before any refresh there is nothing true to answer with, so
+    // the first statuses follow that refresh.
+    // The awaits above may outlive the socket: revalidate before registering,
+    // or we would start polling for a dead client.
+    if (ws.readyState !== WS.OPEN) {
+      return;
+    }
+    let sentStatusesJson: string | null = null;
+    if (this.lastMcpDeploymentRefreshAt > 0) {
+      const statuses = buildStatuses(McpServerRuntimeManager.statusSummary);
+      sentStatusesJson = JSON.stringify(statuses);
+      this.sendToClient(ws, {
+        type: "mcp_deployment_statuses",
+        payload: { statuses },
+      });
+    }
 
     this.mcpDeploymentStatusSubscriptions.set(ws, {
-      interval,
-      lastStatuses,
+      buildStatuses,
+      // Unsent: the push after the refresh below sends whatever it finds.
+      lastStatusesJson: sentStatusesJson ?? "",
     });
+    this.startMcpDeploymentStatusPollingIfNeeded();
+
+    if (!this.mcpDeploymentSummaryIsCurrent()) {
+      setImmediate(() => {
+        void this.refreshMcpDeploymentStates()
+          .then(() => this.pushMcpDeploymentStatusesToSubscribers())
+          .catch((error) => {
+            logger.error(
+              { error },
+              "Failed to refresh MCP deployment statuses for a new subscriber",
+            );
+          });
+      });
+    }
 
     logger.info("MCP deployment status client subscribed");
   }
 
   private unsubscribeMcpDeploymentStatuses(ws: WebSocket): void {
-    const subscription = this.mcpDeploymentStatusSubscriptions.get(ws);
-    if (subscription) {
-      clearInterval(subscription.interval);
-      this.mcpDeploymentStatusSubscriptions.delete(ws);
+    if (this.mcpDeploymentStatusSubscriptions.delete(ws)) {
       logger.info("MCP deployment status client unsubscribed");
     }
+    if (this.mcpDeploymentStatusSubscriptions.size === 0) {
+      if (this.mcpDeploymentStatusPollInterval) {
+        clearInterval(this.mcpDeploymentStatusPollInterval);
+        this.mcpDeploymentStatusPollInterval = null;
+      }
+      this.mcpDeploymentStatusRefreshUnsubscribe?.();
+      this.mcpDeploymentStatusRefreshUnsubscribe = null;
+    }
+  }
+
+  private startMcpDeploymentStatusPollingIfNeeded(): void {
+    if (!this.mcpDeploymentStatusRefreshUnsubscribe) {
+      // Event-driven path: the runtime manager refreshes states on K8s watch
+      // events and notifies us — push the fresh statuses right away instead
+      // of leaving subscribers to wait out the poll interval.
+      this.mcpDeploymentStatusRefreshUnsubscribe =
+        McpServerRuntimeManager.onDeploymentStatesRefreshed(() => {
+          this.lastMcpDeploymentRefreshAt = Date.now();
+          this.pushMcpDeploymentStatusesToSubscribers();
+        });
+    }
+    if (this.mcpDeploymentStatusPollInterval) {
+      return;
+    }
+    this.mcpDeploymentStatusPollInterval = setInterval(() => {
+      void this.pollMcpDeploymentStatuses();
+    }, 10_000);
+  }
+
+  /**
+   * One shared tick for all subscribers: a single runtime refresh, then each
+   * subscriber gets their own projection of the summary (subscribers may see
+   * different servers, so payloads are per-subscriber and never broadcast).
+   */
+  private async pollMcpDeploymentStatuses(): Promise<void> {
+    // A previous tick (or a subscribe-time refresh) is still running; skip.
+    if (this.mcpDeploymentStatusRefreshInFlight) {
+      return;
+    }
+
+    // With healthy K8s watch streams the runtime manager refreshes on
+    // cluster events and notifies us to push — the poll is only a slow
+    // resync safety net against missed events. Without watchers (missing
+    // `watch` RBAC, streams down) it stays the primary refresh path.
+    if (this.mcpDeploymentSummaryIsCurrent()) {
+      return;
+    }
+
+    try {
+      await this.refreshMcpDeploymentStates();
+    } catch (error) {
+      logger.error({ error }, "Failed to poll MCP deployment statuses");
+      return;
+    }
+
+    this.pushMcpDeploymentStatusesToSubscribers();
+  }
+
+  /**
+   * Diff-push the manager's current statusSummary to every subscriber. Safe
+   * to call spuriously: per-subscriber JSON dedupe means an unchanged
+   * summary sends nothing.
+   */
+  private pushMcpDeploymentStatusesToSubscribers(): void {
+    const summary = McpServerRuntimeManager.statusSummary;
+    for (const [ws, sub] of this.mcpDeploymentStatusSubscriptions) {
+      // Isolate subscribers: one failing send must not stop the others
+      try {
+        if (ws.readyState !== WS.OPEN) {
+          this.unsubscribeMcpDeploymentStatuses(ws);
+          continue;
+        }
+
+        const statuses = sub.buildStatuses(summary);
+        const statusesJson = JSON.stringify(statuses);
+        if (statusesJson !== sub.lastStatusesJson) {
+          this.sendToClient(ws, {
+            type: "mcp_deployment_statuses",
+            payload: { statuses },
+          });
+          // Mark delivered only after a successful send, so a throwing send
+          // is retried on the next tick
+          sub.lastStatusesJson = statusesJson;
+        }
+      } catch (error) {
+        logger.error(
+          { error },
+          "Failed to send MCP deployment statuses to subscriber",
+        );
+      }
+    }
+  }
+
+  /**
+   * refreshAllStates mutates per-deployment state and is not concurrency-safe,
+   * so overlapping invocations are skipped; a skipping caller reads the summary
+   * left by the previous refresh. The awaited refresh is bounded: a K8s call
+   * that never settles must not hold the guard forever and freeze polling for
+   * every subscriber.
+   */
+  private async refreshMcpDeploymentStates(): Promise<void> {
+    if (this.mcpDeploymentStatusRefreshInFlight) {
+      return;
+    }
+    this.mcpDeploymentStatusRefreshInFlight = true;
+    let timeoutTimer: NodeJS.Timeout | undefined;
+    try {
+      const result = await Promise.race([
+        McpServerRuntimeManager.refreshAllStates(),
+        new Promise<"timeout">((resolve) => {
+          timeoutTimer = setTimeout(
+            () => resolve("timeout"),
+            MCP_DEPLOYMENT_STATUS_REFRESH_TIMEOUT_MS,
+          );
+        }),
+      ]);
+      if (result === "timeout") {
+        logger.warn(
+          { timeoutMs: MCP_DEPLOYMENT_STATUS_REFRESH_TIMEOUT_MS },
+          "MCP deployment state refresh timed out; releasing poll guard",
+        );
+      } else {
+        this.lastMcpDeploymentRefreshAt = Date.now();
+      }
+    } finally {
+      clearTimeout(timeoutTimer);
+      this.mcpDeploymentStatusRefreshInFlight = false;
+    }
+  }
+
+  /**
+   * Whether the runtime summary can be trusted without a refresh: the K8s
+   * watch streams keep it current on cluster events, and the last full
+   * refresh is inside the resync window that guards against missed events.
+   */
+  private mcpDeploymentSummaryIsCurrent(): boolean {
+    return (
+      McpServerRuntimeManager.deploymentStateWatchersActive &&
+      this.lastMcpDeploymentRefreshAt > 0 &&
+      Date.now() - this.lastMcpDeploymentRefreshAt <
+        MCP_DEPLOYMENT_STATUS_WATCH_RESYNC_MS
+    );
   }
 
   private sendToClient(ws: WebSocket, message: ServerWebSocketMessage): void {
@@ -777,7 +1876,31 @@ class WebSocketService {
     );
   }
 
+  /**
+   * Route MCP status broadcasts through `hub` so clients on every replica
+   * receive them. Without it (tests, a process that never started the server)
+   * broadcasts reach this process's clients only.
+   */
+  enableCrossReplicaDelivery(hub: PgNotifyHub): void {
+    this.disableCrossReplicaDelivery();
+    const channel = hub.fanout(CROSS_REPLICA_CHANNEL);
+    const unsubscribe = channel.subscribe((message) =>
+      this.deliverCrossReplicaEvent(message),
+    );
+    this.crossReplica = { hub, channel, unsubscribe };
+  }
+
   stop() {
+    this.disableCrossReplicaDelivery();
+    this.mcpDeploymentStatusRefreshUnsubscribe?.();
+    this.mcpDeploymentStatusRefreshUnsubscribe = null;
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    this.deploymentMetricsRefreshUnsubscribe?.();
+    this.deploymentMetricsRefreshUnsubscribe = null;
+    // SPDX-SnippetEnd
+
     if (this.deploymentMetricsInterval) {
       clearInterval(this.deploymentMetricsInterval);
       this.deploymentMetricsInterval = null;
@@ -791,7 +1914,18 @@ class WebSocketService {
     for (const [ws] of this.mcpDeploymentStatusSubscriptions) {
       this.unsubscribeMcpDeploymentStatuses(ws);
     }
+    // End live terminals here, not from each socket's later close event, so
+    // their detach audit rows are tracked before shutdown drains and closes
+    // the database.
+    for (const [ws] of this.agentRunAttachSubscriptions) {
+      this.unsubscribeAgentRunAttach(ws);
+    }
     this.clientContexts.clear();
+
+    if (this.httpServer && this.upgradeListener)
+      this.httpServer.off("upgrade", this.upgradeListener);
+    this.httpServer = null;
+    this.upgradeListener = null;
 
     if (this.wss) {
       this.wss.clients.forEach((client) => {
@@ -812,10 +1946,6 @@ class WebSocketService {
   private async authenticateConnection(
     request: IncomingMessage,
   ): Promise<WebSocketClientContext | null> {
-    const { success: userIsMcpServerAdmin } = await hasPermission(
-      { mcpServerInstallation: ["admin"] },
-      request.headers,
-    );
     const headers = new Headers(request.headers as HeadersInit);
 
     try {
@@ -831,7 +1961,10 @@ class WebSocketService {
         return {
           userId: user.id,
           organizationId,
-          userIsMcpServerAdmin,
+          userIsMcpServerAdmin: await isMcpInstallationAdmin({
+            userId: user.id,
+            organizationId,
+          }),
         };
       }
     } catch (_sessionError) {
@@ -852,7 +1985,10 @@ class WebSocketService {
           return {
             userId: user.id,
             organizationId,
-            userIsMcpServerAdmin,
+            userIsMcpServerAdmin: await isMcpInstallationAdmin({
+              userId: user.id,
+              organizationId,
+            }),
           };
         }
       } catch (_apiKeyError) {
@@ -886,18 +2022,165 @@ class WebSocketService {
     status: LocalMcpInstallationState,
     error: string | null,
   ): void {
-    if (!this.wss) return;
-    this.broadcast({
-      type: "mcp_installation_status",
-      payload: { serverId, status, error },
+    this.relayToAllReplicas({
+      kind: "mcp_installation_status",
+      serverId,
+      status,
+      // Bounded so the event always fits a NOTIFY payload.
+      error: error === null ? null : error.slice(0, MAX_RELAYED_ERROR_LENGTH),
     });
+  }
+
+  broadcastMcpServersChanged(params: {
+    organizationId: string | null;
+    serverIds?: string[];
+    catalogIds?: string[];
+  }): void {
+    const serverIds = [...new Set(params.serverIds ?? [])];
+    const catalogIds = [...new Set(params.catalogIds ?? [])];
+    if (serverIds.length === 0 && catalogIds.length === 0) return;
+
+    // A bulk uninstall can name more ids than one NOTIFY payload holds; split
+    // it, since clients evict each id independently.
+    for (let start = 0; ; start += MAX_RELAYED_IDS_PER_EVENT) {
+      const serverChunk = serverIds.slice(
+        start,
+        start + MAX_RELAYED_IDS_PER_EVENT,
+      );
+      const catalogChunk = catalogIds.slice(
+        start,
+        start + MAX_RELAYED_IDS_PER_EVENT,
+      );
+      if (serverChunk.length === 0 && catalogChunk.length === 0) break;
+      this.relayToAllReplicas({
+        kind: "mcp_servers_changed",
+        organizationId: params.organizationId,
+        serverIds: serverChunk,
+        catalogIds: catalogChunk,
+      });
+    }
+  }
+
+  broadcastConversationUpdated(
+    ownerUserId: string,
+    organizationId: string,
+    conversationId: string,
+  ): void {
+    if (!this.wss) return;
+    this.sendToClients(
+      { type: "conversation_updated", payload: { conversationId } },
+      (client) => {
+        const ctx = this.clientContexts.get(client);
+        // Scope to the owner's org too: a user with sockets in multiple orgs
+        // must not receive a conversation event for an org they aren't on.
+        return (
+          ctx?.userId === ownerUserId && ctx.organizationId === organizationId
+        );
+      },
+    );
+  }
+
+  /**
+   * Push one validation run's progress to the user who started it, on every
+   * replica: the run's request and that user's socket rarely share a pod.
+   * Fire-and-forget; a file's steps are trimmed to fit one relay message.
+   */
+  sendOpenAppaValidationProgress(params: {
+    userId: string;
+    organizationId: string;
+    payload: OpenAppaValidationProgressMessage["payload"];
+  }): void {
+    this.relayToAllReplicas(fitValidationProgressEvent(params));
+  }
+
+  private relayToAllReplicas(event: CrossReplicaEvent): void {
+    if (!this.crossReplica) {
+      this.deliverToLocalClients(event);
+      return;
+    }
+    // Publishing delivers to this replica's subscriber synchronously, then
+    // fans out to the others; the hub drops its own echo.
+    void this.crossReplica.channel.publish(JSON.stringify(event));
+  }
+
+  private deliverCrossReplicaEvent(message: string): void {
+    let event: CrossReplicaEvent;
+    try {
+      event = CrossReplicaEventSchema.parse(JSON.parse(message));
+    } catch (error) {
+      logger.warn({ error }, "Ignoring a malformed cross-replica MCP event");
+      return;
+    }
+    this.deliverToLocalClients(event);
+  }
+
+  private deliverToLocalClients(event: CrossReplicaEvent): void {
+    if (!this.wss) return;
+
+    if (event.kind === "mcp_installation_status") {
+      // Clients classify runtime alerts from both feeds together. A reinstall
+      // reports "success" only after the installing replica has seen the new
+      // pod ready, but the deployment feed is pushed on watch events and can
+      // still carry the restart gap ("not_created"), which reads as "Not
+      // running" until the next push. Send this replica's current deployment
+      // states first so a client never pairs a fresh installation status with
+      // a stale runtime state.
+      this.pushMcpDeploymentStatusesToSubscribers();
+      this.broadcast({
+        type: "mcp_installation_status",
+        payload: {
+          serverId: event.serverId,
+          status: event.status,
+          error: event.error,
+        },
+      });
+      return;
+    }
+
+    if (event.kind === "openappa_validation_progress") {
+      const { userId, organizationId, payload } = event;
+      this.sendToClients(
+        { type: "openappa_validation_progress", payload },
+        (client) => {
+          const context = this.clientContexts.get(client);
+          return (
+            context?.userId === userId &&
+            context.organizationId === organizationId
+          );
+        },
+      );
+      return;
+    }
+
+    const { organizationId, serverIds, catalogIds } = event;
+    this.sendToClients(
+      {
+        type: "mcp_servers_changed",
+        payload: { change: "uninstalled", serverIds, catalogIds },
+      },
+      (client) => {
+        const context = this.clientContexts.get(client);
+        return (
+          context !== undefined &&
+          (organizationId === null || context.organizationId === organizationId)
+        );
+      },
+    );
+  }
+
+  private disableCrossReplicaDelivery(): void {
+    if (!this.crossReplica) return;
+    const { hub, unsubscribe } = this.crossReplica;
+    this.crossReplica = null;
+    unsubscribe();
+    void hub.close();
   }
 }
 
 const websocketService = new WebSocketService();
 
 /**
- * Push an install-status update to all connected clients. Call this from
+ * Push an install-status update to connected clients on every replica. Call this from
  * any code path that writes mcp_server.local_installation_status so the UI
  * doesn't depend on the 2s React Query poll catching the change.
  */
@@ -909,4 +2192,261 @@ export function broadcastMcpInstallationStatus(
   websocketService.broadcastMcpInstallationStatus(serverId, status, error);
 }
 
+/**
+ * Push MCP removals to every open client in the affected organization, on
+ * every replica.
+ */
+export function broadcastMcpServersChanged(params: {
+  organizationId: string | null;
+  serverIds?: string[];
+  catalogIds?: string[];
+}): void {
+  websocketService.broadcastMcpServersChanged(params);
+}
+
+/**
+ * Notify a conversation's owner that a message landed, so the sidebar
+ * new-messages indicator refreshes even when the owner's client missed the
+ * stream completion. Scoped to the owner's (user, org) — other users' and
+ * other-org connections are untouched.
+ */
+export function broadcastConversationUpdated(
+  ownerUserId: string,
+  organizationId: string,
+  conversationId: string,
+): void {
+  websocketService.broadcastConversationUpdated(
+    ownerUserId,
+    organizationId,
+    conversationId,
+  );
+}
+
 export default websocketService;
+
+// Upper bound on one shared deployment-status refresh: releases the poll
+// guard even if a K8s call never settles.
+const MCP_DEPLOYMENT_STATUS_REFRESH_TIMEOUT_MS = 60_000;
+/**
+ * Minimum age of the last state refresh before a poll tick re-polls K8s
+ * while the runtime's watch streams are healthy. Watch events drive
+ * refreshes; this only bounds staleness if an event is missed.
+ */
+const MCP_DEPLOYMENT_STATUS_WATCH_RESYNC_MS = 60_000;
+
+// How much exec output we keep to diagnose why a session ended. The OCI
+// start-failure error is short and arrives first, so a small head is plenty.
+const EXEC_OUTPUT_CAPTURE_LIMIT = 4096;
+
+// Markers the container runtime emits when it can't start the exec'd binary
+// (i.e. the shell itself is missing). Deliberately specific — these are
+// runtime-generated and won't appear from a normal shell command's output, so
+// matching them won't misfire on e.g. `cat /missing` inside a working shell.
+const SHELL_START_FAILURE =
+  /OCI runtime exec failed|unable to start container process|exec:\s+".*?":.*?(?:no such file|not found)|executable file not found|exec format error/i;
+
+/**
+ * Translate a K8s exec session's end into a human-readable reason. Returns
+ * undefined for a clean exit so the UI keeps its generic "Session terminated".
+ *
+ * The cause can land on either of two exec channels depending on the runtime:
+ * the status channel (`status.message`) or the output stream (the OCI error
+ * written to stderr). The most important case — a distroless MCP image with no
+ * `/bin/sh` — shows up as a "no such file"/"failed to start container process"
+ * error, which we turn into an actionable hint regardless of which channel
+ * carried it.
+ */
+function describeExecFailure(
+  status: k8s.V1Status | undefined,
+  output: string,
+): string | undefined {
+  if (SHELL_START_FAILURE.test(`${status?.message ?? ""}\n${output}`)) {
+    return "No shell found in this container image — it looks like a distroless/minimal image without /bin/sh. Use the Logs or Inspector tabs, or attach a debug container to inspect it.";
+  }
+
+  if (status?.status === "Failure") {
+    return (
+      status.message || status.reason || "Session ended with a failure status."
+    );
+  }
+
+  return undefined;
+}
+
+// =============================================================================
+// Internal
+// =============================================================================
+
+const CROSS_REPLICA_CHANNEL = "websocket_mcp_events";
+const MAX_RELAYED_ERROR_LENGTH = 4_000;
+const MAX_RELAYED_IDS_PER_EVENT = 50;
+/** Room left for a relayed event under the hub's 7,900-byte NOTIFY envelope. */
+const MAX_RELAYED_EVENT_BYTES = 7_600;
+const MAX_PROGRESS_ERROR_LENGTH = 2_000;
+const MAX_PROGRESS_STEP_ERROR_LENGTH = 500;
+
+const ValidationStatusSchema = z.enum(["passed", "failed", "cannot_run"]);
+const ValidationProgressPayloadSchema = z.discriminatedUnion("phase", [
+  z.object({
+    token: z.string(),
+    phase: z.literal("started"),
+    paths: z.array(z.string()),
+  }),
+  z.object({
+    token: z.string(),
+    phase: z.literal("file_started"),
+    path: z.string(),
+  }),
+  z.object({
+    token: z.string(),
+    phase: z.literal("file_finished"),
+    path: z.string(),
+    status: ValidationStatusSchema,
+    assertionCount: z.number(),
+    durationMs: z.number(),
+    error: z.string().nullable().optional(),
+    steps: z.array(
+      z.object({
+        line: z.number(),
+        tool: z.string(),
+        expected: z.string(),
+        actual: z.string().nullable(),
+        status: ValidationStatusSchema,
+        error: z.string().nullable().optional(),
+      }),
+    ),
+  }),
+  z.object({
+    token: z.string(),
+    phase: z.literal("finished"),
+    runId: z.string().nullable(),
+    error: z.string().optional(),
+  }),
+]);
+
+const CrossReplicaEventSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("mcp_installation_status"),
+    serverId: z.string(),
+    status: z.enum(LOCAL_MCP_INSTALLATION_STATES),
+    error: z.string().nullable(),
+  }),
+  z.object({
+    kind: z.literal("mcp_servers_changed"),
+    organizationId: z.string().nullable(),
+    serverIds: z.array(z.string()),
+    catalogIds: z.array(z.string()),
+  }),
+  z.object({
+    kind: z.literal("openappa_validation_progress"),
+    userId: z.string(),
+    organizationId: z.string(),
+    payload: ValidationProgressPayloadSchema,
+  }),
+]);
+
+type CrossReplicaEvent = z.infer<typeof CrossReplicaEventSchema>;
+type ValidationProgressEvent = Extract<
+  CrossReplicaEvent,
+  { kind: "openappa_validation_progress" }
+>;
+
+/**
+ * Bounds a progress event so it always fits one NOTIFY payload, measured as
+ * the hub sends it: JSON-encoded again inside its envelope. Error text is cut
+ * first; then a file's steps are dropped, passed ones before the failing or
+ * unrunnable ones the reader needs. The recorded run keeps every step.
+ */
+function fitValidationProgressEvent(params: {
+  userId: string;
+  organizationId: string;
+  payload: OpenAppaValidationProgressMessage["payload"];
+}): ValidationProgressEvent {
+  const event = { kind: "openappa_validation_progress" as const, ...params };
+  const { payload } = params;
+  switch (payload.phase) {
+    // Paths are short in practice. An event over the NOTIFY limit still
+    // reaches this replica's clients; the hub logs the miss.
+    case "started":
+    case "file_started":
+      return event;
+    case "finished":
+      return payload.error === undefined
+        ? event
+        : {
+            ...event,
+            payload: {
+              ...payload,
+              error: truncate(payload.error, MAX_PROGRESS_ERROR_LENGTH),
+            },
+          };
+  }
+  const fitted = {
+    ...payload,
+    error:
+      payload.error == null
+        ? payload.error
+        : truncate(payload.error, MAX_PROGRESS_ERROR_LENGTH),
+    steps: [] as typeof payload.steps,
+  };
+  let size = relayedSize({ ...event, payload: fitted });
+  const ranked = payload.steps
+    .map((step, index) => ({
+      index,
+      step: {
+        ...step,
+        error:
+          step.error == null
+            ? step.error
+            : truncate(step.error, MAX_PROGRESS_STEP_ERROR_LENGTH),
+      },
+    }))
+    .sort(
+      (a, b) =>
+        Number(a.step.status === "passed") -
+          Number(b.step.status === "passed") || a.index - b.index,
+    );
+  const kept: typeof ranked = [];
+  for (const entry of ranked) {
+    // Inside the envelope a step adds its escaped encoding and a comma.
+    const added = relayedSize(entry.step) - 1;
+    if (size + added > MAX_RELAYED_EVENT_BYTES) continue;
+    size += added;
+    kept.push(entry);
+  }
+  fitted.steps = kept.sort((a, b) => a.index - b.index).map(({ step }) => step);
+  return { ...event, payload: fitted };
+}
+
+/** Bytes `value` takes once encoded as a string inside a fan-out envelope. */
+function relayedSize(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(JSON.stringify(value)));
+}
+
+function truncate(text: string, length: number): string {
+  return text.length > length ? `${text.slice(0, length - 1)}…` : text;
+}
+
+/**
+ * Same endpoint choice as the chat and A2A notifiers: polling compatibility
+ * describes the database endpoint (a transaction pooler cannot hold a
+ * LISTEN), so it applies here too and degrades to same-replica delivery.
+ */
+function createCrossReplicaNotifyHub(): PgNotifyHub {
+  return config.chat.activeRun.pollingCompatibilityEnabled
+    ? createPollingNotifyHub()
+    : createPostgresNotifyHub(
+        config.chat.activeRun.notifyDatabaseUrl || config.database.url,
+      );
+}
+
+/**
+ * What a turn's output counts for: its stored recording's size, or its
+ * retained log's when nothing is stored.
+ */
+function turnOutputBytes(
+  turn: Pick<AgentRunRecord, "logs">,
+  storedBytes: number | undefined,
+): number {
+  return storedBytes ?? Buffer.byteLength(turn.logs ?? "", "utf8");
+}

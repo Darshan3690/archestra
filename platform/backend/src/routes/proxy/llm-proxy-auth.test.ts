@@ -1,16 +1,36 @@
 import {
   ARCHESTRA_TOKEN_PREFIX,
   LEGACY_ARCHESTRA_TOKEN_PREFIXES,
-} from "@shared";
+} from "@archestra/shared";
+import { eq, sql } from "drizzle-orm";
 import type { FastifyRequest } from "fastify";
 import { vi } from "vitest";
-import { VirtualApiKeyModel } from "@/models";
-import { describe, expect, test } from "@/test";
+import { type AllowedCacheKey, CacheKey, cacheManager } from "@/cache-manager";
+import db, { schema } from "@/database";
 import {
-  assertAuthenticatedForKeylessProvider,
+  AgentLabelModel,
+  AgentModel,
+  LlmProviderApiKeyModelLinkModel,
+  MemberModel,
+  ModelModel,
+  OAuthAccessTokenModel,
+  VirtualApiKeyModel,
+} from "@/models";
+import { encodeXaiSubscriptionCredential } from "@/services/xai-subscription-credentials";
+import { accessGrants, afterEach, describe, expect, test } from "@/test";
+import { setupTestCacheManager } from "@/test/cache-manager";
+import { recordQueries } from "@/test/query-counter";
+import { ApiError } from "@/types";
+import { drainBackgroundWork } from "@/utils/background-work";
+import {
+  assertConsistentUserCredentials,
+  assertPlatformAuthenticated,
   attemptJwksAuth,
+  readPassthroughAuthenticationSnapshot,
   resolveAgent,
   VirtualKeyRateLimiter,
+  validateLlmOAuthAccessToken,
+  validatePassthroughVirtualKey,
   validateVirtualApiKey,
 } from "./llm-proxy-auth";
 
@@ -19,8 +39,10 @@ import {
 // =========================================================================
 
 describe("resolveAgent", () => {
-  test("returns agent when found by ID", async ({ makeAgent }) => {
-    const agent = await makeAgent({ name: "test-agent" });
+  test("returns a non-proxy agent unchanged (chat/app attribution)", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "test-agent", agentType: "agent" });
 
     const result = await resolveAgent(agent.id);
     expect(result.id).toBe(agent.id);
@@ -34,27 +56,63 @@ describe("resolveAgent", () => {
     );
   });
 
-  test("falls back to default profile when no agentId provided", async ({
+  test("collapses an llm_proxy id to the organization's LLM Proxy", async ({
     makeOrganization,
     makeAgent,
   }) => {
     const org = await makeOrganization();
-    await makeAgent({
+    const proxy = await AgentModel.getOrgLlmProxy(org.id);
+    const legacy = await makeAgent({
       organizationId: org.id,
-      name: "default-profile",
+      agentType: "llm_proxy",
+      name: "old-proxy",
+    });
+
+    const result = await resolveAgent(legacy.id);
+    expect(result.id).toBe(proxy.id);
+    expect(result.agentType).toBe("llm_proxy");
+  });
+
+  test("collapses a legacy profile id to the organization's LLM Proxy", async ({
+    makeOrganization,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const profile = await makeAgent({
+      organizationId: org.id,
       agentType: "profile",
       isDefault: true,
     });
 
-    const result = await resolveAgent(undefined);
-    expect(result.name).toBe("default-profile");
+    const result = await resolveAgent(profile.id);
+    expect(result.agentType).toBe("llm_proxy");
+    expect(result.organizationId).toBe(org.id);
     expect(result.isDefault).toBe(true);
   });
 
-  test("throws 400 when no agentId and no default profile", async () => {
-    await expect(resolveAgent(undefined)).rejects.toThrow(
-      "Please specify an LLMProxy ID in the URL path.",
-    );
+  test("no agent id resolves THE LLM Proxy, creating it on demand", async ({
+    makeOrganization,
+  }) => {
+    await makeOrganization();
+
+    const result = await resolveAgent(undefined);
+    expect(result.agentType).toBe("llm_proxy");
+    expect(result.isDefault).toBe(true);
+    expect(result.name).toBe("LLM Proxy");
+  });
+
+  // The proxy resolves a lean GatewayAgent (agents row + labels): labels feed
+  // metric/span label values, so they must survive the lean lookup.
+  test("resolved agent carries its labels", async ({ makeAgent }) => {
+    const agent = await makeAgent();
+    await AgentLabelModel.syncAgentLabels(agent.id, [
+      { key: "environment", value: "production", keyId: "", valueId: "" },
+    ]);
+
+    const result = await resolveAgent(agent.id);
+    expect(result.labels).toEqual([
+      expect.objectContaining({ key: "environment", value: "production" }),
+    ]);
   });
 });
 
@@ -65,11 +123,36 @@ describe("resolveAgent", () => {
 describe("validateVirtualApiKey", () => {
   test("throws 401 for invalid/non-existent token", async () => {
     await expect(
-      validateVirtualApiKey(
-        `${LEGACY_ARCHESTRA_TOKEN_PREFIXES[0]}nonexistent`,
-        "openai",
-      ),
+      validateVirtualApiKey({
+        tokenValue: `${LEGACY_ARCHESTRA_TOKEN_PREFIXES[0]}nonexistent`,
+        expectedProvider: "openai",
+        expectedOrganizationId: null,
+      }),
     ).rejects.toThrow("Invalid virtual API key");
+  });
+
+  test("throws 400 when a passthrough key is used in the Authorization header", async ({
+    makeOrganization,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const owner = await makeUser();
+    const { value } = await VirtualApiKeyModel.create({
+      organizationId: org.id,
+      name: "pt",
+      keyType: "passthrough",
+      authorId: owner.id,
+    });
+
+    await expect(
+      validateVirtualApiKey({
+        tokenValue: value,
+        expectedProvider: "openai",
+        expectedOrganizationId: null,
+      }),
+    ).rejects.toMatchObject({
+      statusCode: 400,
+    });
   });
 
   test("throws 401 for expired key", async ({
@@ -91,11 +174,16 @@ describe("validateVirtualApiKey", () => {
       ],
       name: "expired-key",
       expiresAt: new Date("2020-01-01"),
+      ...accessGrants("org"),
     });
 
-    await expect(validateVirtualApiKey(value, "openai")).rejects.toThrow(
-      "Virtual API key expired",
-    );
+    await expect(
+      validateVirtualApiKey({
+        tokenValue: value,
+        expectedProvider: "openai",
+        expectedOrganizationId: null,
+      }),
+    ).rejects.toThrow("Virtual API key expired");
   });
 
   test("throws 400 for provider mismatch", async ({
@@ -116,11 +204,115 @@ describe("validateVirtualApiKey", () => {
         { provider: chatApiKey.provider, providerApiKeyId: chatApiKey.id },
       ],
       name: "openai-key",
+      ...accessGrants("org"),
     });
 
-    await expect(validateVirtualApiKey(value, "anthropic")).rejects.toThrow(
-      'Virtual API key is not mapped to provider "anthropic".',
-    );
+    await expect(
+      validateVirtualApiKey({
+        tokenValue: value,
+        expectedProvider: "anthropic",
+        expectedOrganizationId: null,
+      }),
+    ).rejects.toThrow('Virtual API key is not mapped to provider "anthropic".');
+  });
+
+  test("rejects a foreign subscription marker immediately after virtual-key resolution", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const secret = await makeSecret({
+      secret: {
+        apiKey: encodeXaiSubscriptionCredential({
+          refreshToken: "rt-never-forward",
+          userId: "x-user",
+        }),
+      },
+    });
+    const openaiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openai",
+    });
+    const { value } = await VirtualApiKeyModel.create({
+      providerApiKeys: [{ provider: "openai", providerApiKeyId: openaiKey.id }],
+      name: "out-of-band-swapped-marker",
+      ...accessGrants("org"),
+    });
+
+    await expect(
+      validateVirtualApiKey({
+        tokenValue: value,
+        expectedProvider: "openai",
+        expectedOrganizationId: null,
+      }),
+    ).rejects.toMatchObject({
+      statusCode: 401,
+    });
+  });
+
+  test("rejects a Bearer-wrapped subscription in a legacy shared virtual key", async ({
+    makeOrganization,
+    makeUser,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const owner = await makeUser();
+    const secret = await makeSecret({
+      secret: {
+        apiKey: `bEaReR ${encodeXaiSubscriptionCredential({
+          refreshToken: "rt-never-share",
+          userId: "x-user",
+        })}`,
+      },
+    });
+    const xaiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "xai",
+      userId: owner.id,
+    });
+    const { value } = await VirtualApiKeyModel.create({
+      organizationId: org.id,
+      providerApiKeys: [{ provider: "xai", providerApiKeyId: xaiKey.id }],
+      name: "legacy-shared-x-premium",
+      authorId: owner.id,
+      ...accessGrants("org"),
+    });
+
+    await expect(
+      validateVirtualApiKey({
+        tokenValue: value,
+        expectedProvider: "xai",
+        expectedOrganizationId: null,
+      }),
+    ).rejects.toMatchObject({
+      statusCode: 403,
+    });
+  });
+
+  test("an automatic virtual key routes a provider added after issuance", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const { value } = await VirtualApiKeyModel.create({
+      name: "Automatic providers",
+      organizationId: org.id,
+      ...accessGrants("org"),
+      includeFutureProviders: true,
+      providerApiKeys: [],
+    });
+    const secret = await makeSecret({ secret: { apiKey: "sk-added-later" } });
+    await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openai",
+      isPrimary: true,
+    });
+    const result = await validateVirtualApiKey({
+      tokenValue: value,
+      expectedProvider: "openai",
+      expectedOrganizationId: org.id,
+    });
+    expect(result.apiKey).toBe("sk-added-later");
   });
 
   test("returns resolved API key and baseUrl on success", async ({
@@ -141,11 +333,82 @@ describe("validateVirtualApiKey", () => {
         { provider: chatApiKey.provider, providerApiKeyId: chatApiKey.id },
       ],
       name: "valid-key",
+      ...accessGrants("org"),
     });
 
-    const result = await validateVirtualApiKey(value, "openai");
+    const result = await validateVirtualApiKey({
+      tokenValue: value,
+      expectedProvider: "openai",
+      expectedOrganizationId: null,
+    });
     expect(result.apiKey).toBe("sk-real-provider-key");
     expect(result.baseUrl).toBeUndefined();
+  });
+
+  test("per-user provider: allows a personal virtual key self-mapped to the owner's own key", async ({
+    makeOrganization,
+    makeUser,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const secret = await makeSecret({ secret: { apiKey: "gho_owner" } });
+    const copilotKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "github-copilot",
+      userId: user.id,
+    });
+
+    const { value } = await VirtualApiKeyModel.create({
+      organizationId: org.id,
+      name: "my-copilot-vk",
+      authorId: user.id,
+      providerApiKeys: [
+        { provider: "github-copilot", providerApiKeyId: copilotKey.id },
+      ],
+    });
+
+    const result = await validateVirtualApiKey({
+      tokenValue: value,
+      expectedProvider: "github-copilot",
+      expectedOrganizationId: null,
+    });
+    expect(result.apiKey).toBe("gho_owner");
+  });
+
+  test("per-user provider: rejects an org-scoped (legacy/shared) virtual key at runtime", async ({
+    makeOrganization,
+    makeUser,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const secret = await makeSecret({ secret: { apiKey: "gho_owner" } });
+    const copilotKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "github-copilot",
+      userId: user.id,
+    });
+
+    // Simulate a virtual key created before enforcement: org scope wrapping a
+    // per-user key. The runtime guard must refuse to hand out the token.
+    const { value } = await VirtualApiKeyModel.create({
+      organizationId: org.id,
+      name: "legacy-shared-copilot-vk",
+      authorId: user.id,
+      providerApiKeys: [
+        { provider: "github-copilot", providerApiKeyId: copilotKey.id },
+      ],
+      ...accessGrants("org"),
+    });
+
+    await expect(
+      validateVirtualApiKey({
+        tokenValue: value,
+        expectedProvider: "github-copilot",
+        expectedOrganizationId: null,
+      }),
+    ).rejects.toThrow(/per-user/);
   });
 
   test("returns baseUrl when chat API key has one configured", async ({
@@ -172,9 +435,14 @@ describe("validateVirtualApiKey", () => {
         { provider: chatApiKey.provider, providerApiKeyId: chatApiKey.id },
       ],
       name: "key-with-base-url",
+      ...accessGrants("org"),
     });
 
-    const result = await validateVirtualApiKey(value, "openai");
+    const result = await validateVirtualApiKey({
+      tokenValue: value,
+      expectedProvider: "openai",
+      expectedOrganizationId: null,
+    });
     expect(result.apiKey).toBe("sk-real-key");
     expect(result.baseUrl).toBe("https://custom-openai.example.com/v1");
   });
@@ -194,9 +462,14 @@ describe("validateVirtualApiKey", () => {
         { provider: systemKey.provider, providerApiKeyId: systemKey.id },
       ],
       name: "virtual-for-system-openai-key",
+      ...accessGrants("org"),
     });
 
-    const result = await validateVirtualApiKey(value, "openai");
+    const result = await validateVirtualApiKey({
+      tokenValue: value,
+      expectedProvider: "openai",
+      expectedOrganizationId: null,
+    });
     expect(result.apiKey).toBeUndefined();
     expect(result.baseUrl).toBeUndefined();
   });
@@ -218,11 +491,116 @@ describe("validateVirtualApiKey", () => {
         { provider: systemKey.provider, providerApiKeyId: systemKey.id },
       ],
       name: "virtual-for-system-key",
+      ...accessGrants("org"),
     });
 
-    const result = await validateVirtualApiKey(value, "gemini");
+    const result = await validateVirtualApiKey({
+      tokenValue: value,
+      expectedProvider: "gemini",
+      expectedOrganizationId: null,
+    });
     expect(result.apiKey).toBeUndefined();
     expect(result.baseUrl).toBeUndefined();
+  });
+
+  test("throws 403 when the key belongs to another organization", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const keyOrg = await makeOrganization();
+    const otherOrg = await makeOrganization();
+    const secret = await makeSecret({ secret: { apiKey: "sk-org-guard" } });
+    const chatApiKey = await makeLlmProviderApiKey(keyOrg.id, secret.id, {
+      provider: "openai",
+    });
+    const { value } = await VirtualApiKeyModel.create({
+      organizationId: keyOrg.id,
+      name: "org-guard-vk",
+      providerApiKeys: [
+        { provider: chatApiKey.provider, providerApiKeyId: chatApiKey.id },
+      ],
+      ...accessGrants("org"),
+    });
+
+    await expect(
+      validateVirtualApiKey({
+        tokenValue: value,
+        expectedProvider: "openai",
+        expectedOrganizationId: otherOrg.id,
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  test("picks the mapped endpoint that serves the requested model", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const endpoints = [];
+    // Sequential: the fallback below is the oldest key, so creation order
+    // matters.
+    for (const { modelId, apiKey, baseUrl } of [
+      { modelId: "glm-5.3", apiKey: "sk-glm", baseUrl: "https://glm.test" },
+      {
+        modelId: "deepseek-v4.1-flash",
+        apiKey: "sk-deepseek",
+        baseUrl: "https://deepseek.test",
+      },
+    ]) {
+      const model = await ModelModel.upsert({
+        externalId: `vllm/${modelId}`,
+        provider: "vllm",
+        modelId,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+      const secret = await makeSecret({ secret: { apiKey } });
+      const key = await makeLlmProviderApiKey(org.id, secret.id, {
+        provider: "vllm",
+        baseUrl,
+      });
+      await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(key.id, [
+        model.id,
+      ]);
+      endpoints.push(key);
+    }
+    const { value } = await VirtualApiKeyModel.create({
+      organizationId: org.id,
+      name: "two-endpoint-vk",
+      providerApiKeys: endpoints.map((key) => ({
+        provider: "vllm" as const,
+        providerApiKeyId: key.id,
+      })),
+      ...accessGrants("org"),
+    });
+    const validate = (requestedModel: string | null) =>
+      validateVirtualApiKey({
+        tokenValue: value,
+        expectedProvider: "vllm",
+        expectedOrganizationId: org.id,
+        requestedModel,
+      });
+
+    expect(await validate("deepseek-v4.1-flash")).toMatchObject({
+      apiKey: "sk-deepseek",
+      baseUrl: "https://deepseek.test",
+      chatApiKeyId: endpoints[1].id,
+    });
+    expect(await validate("glm-5.3")).toMatchObject({
+      apiKey: "sk-glm",
+      baseUrl: "https://glm.test",
+      chatApiKeyId: endpoints[0].id,
+    });
+    // No model to go by (model listing) or a model no mapped endpoint is
+    // known to serve: the first mapping answers, deterministically.
+    for (const requestedModel of [null, "never-synced-model"]) {
+      expect((await validate(requestedModel)).chatApiKeyId).toBe(
+        endpoints[0].id,
+      );
+    }
   });
 });
 
@@ -331,7 +709,7 @@ describe("attemptJwksAuth", () => {
       identityProviderId: idp.id,
     });
 
-    const gatewayUtils = await import("@/routes/mcp-gateway.utils");
+    const gatewayUtils = await import("@/routes/mcp-gateway/utils");
     const spy = vi.spyOn(gatewayUtils, "validateExternalIdpToken");
 
     const result = await attemptJwksAuth(
@@ -359,7 +737,7 @@ describe("attemptJwksAuth", () => {
     });
 
     // Mock validateExternalIdpToken to throw an error
-    const gatewayUtils = await import("@/routes/mcp-gateway.utils");
+    const gatewayUtils = await import("@/routes/mcp-gateway/utils");
     const spy = vi
       .spyOn(gatewayUtils, "validateExternalIdpToken")
       .mockRejectedValue(new Error("OIDC discovery failed"));
@@ -389,7 +767,7 @@ describe("attemptJwksAuth", () => {
       identityProviderId: idp.id,
     });
 
-    const gatewayUtils = await import("@/routes/mcp-gateway.utils");
+    const gatewayUtils = await import("@/routes/mcp-gateway/utils");
     const spy = vi
       .spyOn(gatewayUtils, "validateExternalIdpToken")
       .mockResolvedValue(null);
@@ -432,7 +810,7 @@ describe("attemptJwksAuth", () => {
     await makeLlmProviderApiKey(org.id, secret.id, { provider: "openai" });
 
     // Mock successful JWKS validation
-    const gatewayUtils = await import("@/routes/mcp-gateway.utils");
+    const gatewayUtils = await import("@/routes/mcp-gateway/utils");
     const spy = vi
       .spyOn(gatewayUtils, "validateExternalIdpToken")
       .mockResolvedValue({
@@ -473,7 +851,7 @@ describe("attemptJwksAuth", () => {
       identityProviderId: idp.id,
     });
 
-    const gatewayUtils = await import("@/routes/mcp-gateway.utils");
+    const gatewayUtils = await import("@/routes/mcp-gateway/utils");
     const spy = vi
       .spyOn(gatewayUtils, "validateExternalIdpToken")
       .mockResolvedValue({
@@ -501,76 +879,155 @@ describe("attemptJwksAuth", () => {
 });
 
 // =========================================================================
-// assertAuthenticatedForKeylessProvider
+// assertPlatformAuthenticated
 // =========================================================================
 
-describe("assertAuthenticatedForKeylessProvider", () => {
-  test("allows request when apiKey is present", () => {
-    expect(() =>
-      assertAuthenticatedForKeylessProvider(
-        "sk-real-key",
-        false,
-        false,
-        "1.2.3.4",
-      ),
-    ).not.toThrow();
+describe("assertPlatformAuthenticated", () => {
+  const noCredential = {
+    apiKey: undefined,
+    hasPlatformCredential: false,
+    wasPassthroughKeyValidated: false,
+    wasJwksAuthenticated: false,
+    isInternalCall: false,
+  };
+  const orgAllows = (allowed: boolean) => vi.fn(async () => allowed);
+
+  // A provider key alone proves nothing about the caller: the platform
+  // credential (X-Archestra-Virtual-Key or a virtual key) is what identifies
+  // them, so a provider key without one must not reach the upstream.
+  test("rejects a provider key alone by default", async () => {
+    await expect(
+      assertPlatformAuthenticated({
+        ...noCredential,
+        apiKey: "sk-real-key",
+        allowsUnauthenticated: orgAllows(false),
+      }),
+    ).rejects.toThrow("X-Archestra-Virtual-Key");
   });
 
-  test("allows request when virtual key was resolved", () => {
-    expect(() =>
-      assertAuthenticatedForKeylessProvider(undefined, true, false, "1.2.3.4"),
-    ).not.toThrow();
+  test("allows a provider key alone when the organization allows unauthenticated requests", async () => {
+    await expect(
+      assertPlatformAuthenticated({
+        ...noCredential,
+        apiKey: "sk-real-key",
+        allowsUnauthenticated: orgAllows(true),
+      }),
+    ).resolves.toBeUndefined();
   });
 
-  test("allows request when JWKS authenticated", () => {
-    expect(() =>
-      assertAuthenticatedForKeylessProvider(undefined, false, true, "1.2.3.4"),
-    ).not.toThrow();
+  test("still rejects a request with no credential at all when the organization allows unauthenticated requests", async () => {
+    await expect(
+      assertPlatformAuthenticated({
+        ...noCredential,
+        allowsUnauthenticated: orgAllows(true),
+      }),
+    ).rejects.toThrow("Authentication required");
   });
 
-  test("allows localhost IPv4 without any auth", () => {
-    expect(() =>
-      assertAuthenticatedForKeylessProvider(
-        undefined,
-        false,
-        false,
-        "127.0.0.1",
-      ),
-    ).not.toThrow();
+  test("accepts a passthrough key together with the caller's provider key", async () => {
+    await expect(
+      assertPlatformAuthenticated({
+        ...noCredential,
+        apiKey: "sk-real-key",
+        wasPassthroughKeyValidated: true,
+        allowsUnauthenticated: orgAllows(false),
+      }),
+    ).resolves.toBeUndefined();
   });
 
-  test("allows localhost IPv6 without any auth", () => {
-    expect(() =>
-      assertAuthenticatedForKeylessProvider(undefined, false, false, "::1"),
-    ).not.toThrow();
+  // A passthrough key carries no provider credential. Without the caller's own
+  // key the upstream call would run on whatever the server supplies (IAM,
+  // workload identity), which a passthrough key must never unlock.
+  test("rejects a passthrough key without a provider key", async () => {
+    await expect(
+      assertPlatformAuthenticated({
+        ...noCredential,
+        wasPassthroughKeyValidated: true,
+        allowsUnauthenticated: orgAllows(true),
+      }),
+    ).rejects.toThrow("together with your provider API key");
   });
 
-  test("allows localhost IPv4-mapped IPv6 without any auth", () => {
-    expect(() =>
-      assertAuthenticatedForKeylessProvider(
-        undefined,
-        false,
-        false,
-        "::ffff:127.0.0.1",
-      ),
-    ).not.toThrow();
+  test("rejects a passthrough key when the server supplies the credential", async () => {
+    await expect(
+      assertPlatformAuthenticated({
+        ...noCredential,
+        apiKey: "sk-ignored",
+        wasPassthroughKeyValidated: true,
+        providerSuppliesServerCredential: true,
+        allowsUnauthenticated: orgAllows(true),
+      }),
+    ).rejects.toThrow("server's own credentials");
   });
 
-  test("rejects external request without any auth", () => {
-    expect(() =>
-      assertAuthenticatedForKeylessProvider(undefined, false, false, "1.2.3.4"),
-    ).toThrow("Authentication required");
+  test("accepts a platform credential without reading the organization setting", async () => {
+    const allowsUnauthenticated = orgAllows(false);
+    await assertPlatformAuthenticated({
+      ...noCredential,
+      apiKey: "sk-real-key",
+      hasPlatformCredential: true,
+      allowsUnauthenticated,
+    });
+    await assertPlatformAuthenticated({
+      ...noCredential,
+      apiKey: "sk-real-key",
+      wasPassthroughKeyValidated: true,
+      allowsUnauthenticated,
+    });
+    expect(allowsUnauthenticated).not.toHaveBeenCalled();
   });
 
-  test("rejects external request with empty apiKey", () => {
-    expect(() =>
-      assertAuthenticatedForKeylessProvider(
-        undefined,
-        false,
-        false,
-        "10.0.0.5",
-      ),
-    ).toThrow("Authentication required");
+  test("allows request when JWKS authenticated", async () => {
+    await expect(
+      assertPlatformAuthenticated({
+        ...noCredential,
+        wasJwksAuthenticated: true,
+        allowsUnauthenticated: orgAllows(false),
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  test("allows an internal-proof caller without any auth", async () => {
+    await expect(
+      assertPlatformAuthenticated({
+        ...noCredential,
+        isInternalCall: true,
+        allowsUnauthenticated: orgAllows(false),
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  // When the backend authenticates upstream with its own credentials (Gemini on
+  // Vertex AI), the caller's Authorization value is discarded before it reaches
+  // the provider. Nothing ever validates it, so it cannot authenticate anyone,
+  // and the organization opt-in does not open the server's credentials either.
+  test("rejects an arbitrary bearer value when the server supplies the credential, even when the organization allows unauthenticated requests", async () => {
+    await expect(
+      assertPlatformAuthenticated({
+        ...noCredential,
+        apiKey: "Bearer anything",
+        providerSuppliesServerCredential: true,
+        allowsUnauthenticated: orgAllows(true),
+      }),
+    ).rejects.toThrow("server's own credentials");
+  });
+
+  test("still allows a platform credential, JWKS or an internal call when the server supplies the credential", async () => {
+    for (const credential of [
+      { hasPlatformCredential: true },
+      { wasJwksAuthenticated: true },
+      { isInternalCall: true },
+    ]) {
+      await expect(
+        assertPlatformAuthenticated({
+          ...noCredential,
+          ...credential,
+          apiKey: "Bearer anything",
+          providerSuppliesServerCredential: true,
+          allowsUnauthenticated: orgAllows(false),
+        }),
+      ).resolves.toBeUndefined();
+    }
   });
 });
 
@@ -578,94 +1035,872 @@ describe("assertAuthenticatedForKeylessProvider", () => {
 // VirtualKeyRateLimiter
 // =========================================================================
 
-/** Create a VirtualKeyRateLimiter backed by a simple in-memory Map (no DB needed). */
-function createTestLimiter() {
-  const store = new Map<string, unknown>();
-  const mockCache = {
-    get: vi.fn(async <T>(key: string) => store.get(key) as T | undefined),
-    set: vi.fn(async <T>(key: string, value: T, _ttl?: number) => {
-      store.set(key, value);
-      return value;
-    }),
-  };
-  return {
-    // biome-ignore lint/suspicious/noExplicitAny: test mock doesn't need strict AllowedCacheKey typing
-    limiter: new VirtualKeyRateLimiter(mockCache as any),
-    store,
-    mockCache,
-  };
-}
+const KEY_A = "arch_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const KEY_B = "arch_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 describe("VirtualKeyRateLimiter", () => {
+  setupTestCacheManager();
+  const limiter = new VirtualKeyRateLimiter(cacheManager);
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   test("allows requests under the failure threshold", async () => {
-    const { limiter } = createTestLimiter();
     for (let i = 0; i < 9; i++) {
-      await limiter.recordFailure("1.2.3.4");
+      await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
     }
-    await expect(limiter.check("1.2.3.4")).resolves.toBeUndefined();
+    await expect(
+      limiter.check({ ip: "1.2.3.4", credential: KEY_A }),
+    ).resolves.toBeUndefined();
   });
 
   test("blocks requests at the failure threshold", async () => {
-    const { limiter } = createTestLimiter();
     for (let i = 0; i < 10; i++) {
-      await limiter.recordFailure("1.2.3.4");
+      await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
     }
-    await expect(limiter.check("1.2.3.4")).rejects.toThrow(
+    await expect(
+      limiter.check({ ip: "1.2.3.4", credential: KEY_A }),
+    ).rejects.toThrow("Too many failed virtual API key attempts");
+  });
+
+  test("does not block unrelated IPs", async () => {
+    for (let i = 0; i < 10; i++) {
+      await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
+    }
+    await expect(
+      limiter.check({ ip: "5.6.7.8", credential: KEY_A }),
+    ).resolves.toBeUndefined();
+  });
+
+  // The collateral-lockout fix: clients sharing an origin (a load balancer, or
+  // loopback for frontend-rewritten requests) must not lock each other out.
+  test("does not block a different credential from the same IP", async () => {
+    for (let i = 0; i < 20; i++) {
+      await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
+    }
+    await expect(
+      limiter.check({ ip: "1.2.3.4", credential: KEY_A }),
+    ).rejects.toThrow("Too many failed virtual API key attempts");
+    await expect(
+      limiter.check({ ip: "1.2.3.4", credential: KEY_B }),
+    ).resolves.toBeUndefined();
+  });
+
+  // ...but per-credential scoping must not hand an enumerator a fresh bucket
+  // per guess, so the IP-wide backstop still closes.
+  test("blocks an IP that cycles through many distinct credentials", async () => {
+    for (let i = 0; i < 100; i++) {
+      await limiter.recordFailure({
+        ip: "1.2.3.4",
+        credential: `arch_guess_${i}`,
+      });
+    }
+    await expect(
+      limiter.check({ ip: "1.2.3.4", credential: "arch_guess_fresh" }),
+    ).rejects.toThrow("Too many failed virtual API key attempts");
+  });
+
+  test("never writes the credential into the cache key", async () => {
+    await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
+    const keys = (await storedEntries()).map((entry) => entry.key);
+    expect(keys.length).toBeGreaterThan(0);
+    for (const key of keys) {
+      expect(key).not.toContain(KEY_A);
+    }
+  });
+
+  test("counts requests that present no credential in a shared bucket", async () => {
+    for (let i = 0; i < 10; i++) {
+      await limiter.recordFailure({ ip: "1.2.3.4" });
+    }
+    await expect(limiter.check({ ip: "1.2.3.4" })).rejects.toThrow(
       "Too many failed virtual API key attempts",
     );
   });
 
-  test("does not block unrelated IPs", async () => {
-    const { limiter } = createTestLimiter();
-    for (let i = 0; i < 10; i++) {
-      await limiter.recordFailure("1.2.3.4");
-    }
-    await expect(limiter.check("5.6.7.8")).resolves.toBeUndefined();
-  });
-
   test("increments failure count correctly", async () => {
-    const { limiter, mockCache } = createTestLimiter();
-    await limiter.recordFailure("1.2.3.4");
-    await limiter.recordFailure("1.2.3.4");
-    await limiter.recordFailure("1.2.3.4");
-
-    // Verify cache.set was called with incrementing counts
-    const setCalls = mockCache.set.mock.calls;
-    const counts = setCalls.map((call) => (call[1] as { count: number }).count);
+    const counts: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
+      counts.push((await credentialBucket()).count);
+    }
     expect(counts).toEqual([1, 2, 3]);
+    // The IP-wide bucket counts the same failures.
+    expect((await ipBucket("1.2.3.4")).count).toBe(3);
   });
 
-  test("passes TTL to cache set", async () => {
-    const { limiter, mockCache } = createTestLimiter();
-    await limiter.recordFailure("1.2.3.4");
+  test("opens a window of the full length that expires with it", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(1_000_000);
+    await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
 
-    // Verify TTL (60_000 ms) is passed
-    expect(mockCache.set).toHaveBeenCalledWith(
-      expect.any(String),
-      { count: 1 },
+    const stored = await storedEntries();
+    expect(stored).toHaveLength(2);
+    for (const entry of stored) {
+      expect(entry.value).toEqual({
+        value: { count: 1, windowEndsAt: 1_060_000 },
+        expires: 1_060_000,
+      });
+    }
+  });
+
+  test("allows requests once the window has ended", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(1_000_000);
+    for (let i = 0; i < 10; i++) {
+      await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
+    }
+    vi.setSystemTime(1_060_000);
+    await expect(
+      limiter.check({ ip: "1.2.3.4", credential: KEY_A }),
+    ).resolves.toBeUndefined();
+  });
+
+  test("resets counter when the window has ended and a new failure is recorded", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(1_000_000);
+    for (let i = 0; i < 10; i++) {
+      await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
+    }
+    vi.setSystemTime(1_060_000);
+    await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
+    expect(await credentialBucket()).toEqual({
+      count: 1,
+      windowEndsAt: 1_120_000,
+    });
+    await expect(
+      limiter.check({ ip: "1.2.3.4", credential: KEY_A }),
+    ).resolves.toBeUndefined();
+  });
+
+  // The window is FIXED, not "60s since the last failure". Under the old
+  // refresh-on-write TTL these 15 failures blocked, even though no 60s stretch
+  // held more than 5 — the count simply never reset while failures kept
+  // arriving, which is what made a busy origin lock itself out.
+  test("does not accumulate failures across separate windows", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(1_000_000);
+    for (let burst = 0; burst < 3; burst++) {
+      for (let i = 0; i < 5; i++) {
+        await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
+      }
+      vi.setSystemTime(Date.now() + 40_000);
+    }
+    await expect(
+      limiter.check({ ip: "1.2.3.4", credential: KEY_A }),
+    ).resolves.toBeUndefined();
+  });
+
+  test("a failure inside an open window does not push the window's end out", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(1_000_000);
+    await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
+    vi.setSystemTime(1_025_000);
+    await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
+
+    for (const entry of await storedEntries()) {
+      expect(entry.value).toEqual({
+        value: { count: 2, windowEndsAt: 1_060_000 },
+        expires: 1_060_000,
+      });
+    }
+  });
+
+  // Concurrent failures on several replicas must all count: a read-then-write
+  // increment let them overwrite each other.
+  test("counts concurrent failures without losing any", async () => {
+    await Promise.all(
+      Array.from({ length: 25 }, () =>
+        limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A }),
+      ),
+    );
+    expect((await credentialBucket()).count).toBe(25);
+    expect((await ipBucket("1.2.3.4")).count).toBe(25);
+    await expect(
+      limiter.check({ ip: "1.2.3.4", credential: KEY_A }),
+    ).rejects.toThrow("Too many failed virtual API key attempts");
+  });
+
+  // Rolling deploys read entries written before windowEndsAt existed. Forgiving
+  // them (rather than treating them as an open window of unknown length) is the
+  // direction that cannot strand a caller.
+  test("treats a legacy entry with no window end as expired", async () => {
+    await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
+    const key = (await storedEntries()).find(
+      (entry) => !entry.key.includes("-ip-"),
+    )?.key;
+    if (!key) throw new Error("expected a credential bucket");
+    await cacheManager.set(
+      key.slice("keyv:".length) as AllowedCacheKey,
+      { count: 999 },
       60_000,
     );
+
+    await expect(
+      limiter.check({ ip: "1.2.3.4", credential: KEY_A }),
+    ).resolves.toBeUndefined();
+    // ...and the next failure opens a fresh window instead of adding to it.
+    await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
+    expect((await credentialBucket()).count).toBe(1);
   });
 
-  test("allows requests when cache returns undefined (entry expired)", async () => {
-    const { limiter, store } = createTestLimiter();
+  test("reports how long to wait, bounded by the window", async () => {
     for (let i = 0; i < 10; i++) {
-      await limiter.recordFailure("1.2.3.4");
+      await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
     }
-    // Simulate TTL expiration by clearing the store
-    store.clear();
-    await expect(limiter.check("1.2.3.4")).resolves.toBeUndefined();
+    const error = await limiter
+      .check({ ip: "1.2.3.4", credential: KEY_A })
+      .catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ApiError);
+    const apiError = error as ApiError;
+    expect(apiError.statusCode).toBe(429);
+    expect(apiError.retryAfterSeconds).toBeGreaterThan(0);
+    expect(apiError.retryAfterSeconds).toBeLessThanOrEqual(60);
+    expect(apiError.message).toMatch(/retry in \d+ seconds/);
   });
 
-  test("resets counter when cache entry expires and new failure recorded", async () => {
-    const { limiter, store } = createTestLimiter();
-    for (let i = 0; i < 10; i++) {
-      await limiter.recordFailure("1.2.3.4");
+  // The collateral-lockout fix for shared origins: behind an ingress every
+  // caller shares one `ip`, so the anti-enumeration backstop must not throttle
+  // a credential that is demonstrably working.
+  test("exempts a recently validated credential from the IP-wide backstop", async () => {
+    for (let i = 0; i < 100; i++) {
+      await limiter.recordFailure({
+        ip: "1.2.3.4",
+        credential: `arch_guess_${i}`,
+      });
     }
-    // Simulate TTL expiration
-    store.clear();
-    // New failure starts fresh
-    await limiter.recordFailure("1.2.3.4");
-    await expect(limiter.check("1.2.3.4")).resolves.toBeUndefined();
+    await limiter.recordSuccess({ credential: KEY_A });
+
+    await expect(
+      limiter.check({ ip: "1.2.3.4", credential: KEY_A }),
+    ).resolves.toBeUndefined();
+    // ...while a credential that has not proven itself stays throttled.
+    await expect(
+      limiter.check({ ip: "1.2.3.4", credential: KEY_B }),
+    ).rejects.toThrow("Too many failed virtual API key attempts");
+  });
+
+  test("the exemption lapses with its mark", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(1_000_000);
+    await limiter.recordSuccess({ credential: KEY_A });
+    vi.setSystemTime(1_300_001);
+    for (let i = 0; i < 100; i++) {
+      await limiter.recordFailure({
+        ip: "1.2.3.4",
+        credential: `arch_guess_${i}`,
+      });
+    }
+    await expect(
+      limiter.check({ ip: "1.2.3.4", credential: KEY_A }),
+    ).rejects.toThrow("Too many failed virtual API key attempts");
+  });
+
+  // The exemption is scoped to the IP backstop only: a credential of its own
+  // failing repeatedly must still be throttled even if it once worked.
+  test("does not exempt a validated credential from its own bucket", async () => {
+    await limiter.recordSuccess({ credential: KEY_A });
+    for (let i = 0; i < 10; i++) {
+      await limiter.recordFailure({ ip: "1.2.3.4", credential: KEY_A });
+    }
+    await expect(
+      limiter.check({ ip: "1.2.3.4", credential: KEY_A }),
+    ).rejects.toThrow("Too many failed virtual API key attempts");
+  });
+
+  test("skips the shared bucket read for a credential this process just validated", async () => {
+    const reads = vi.spyOn(cacheManager, "getMany");
+    await limiter.recordSuccess({ credential: KEY_A });
+
+    await limiter.check({ ip: "1.2.3.4", credential: KEY_A });
+    expect(reads).not.toHaveBeenCalled();
+    // A credential that has not validated here still reads the buckets.
+    await limiter.check({ ip: "1.2.3.4", credential: KEY_B });
+    expect(reads).toHaveBeenCalledTimes(1);
+  });
+
+  test("a failure ends the skip, so a revoked credential is throttled again", async () => {
+    await limiter.recordSuccess({ credential: KEY_A });
+    for (let i = 0; i < 10; i++) {
+      await limiter.recordFailure({ ip: "5.6.7.8", credential: KEY_A });
+    }
+    await expect(
+      limiter.check({ ip: "5.6.7.8", credential: KEY_A }),
+    ).rejects.toThrow("Too many failed virtual API key attempts");
+  });
+
+  test("never writes the credential into the recently-validated cache key", async () => {
+    await limiter.recordSuccess({ credential: KEY_A });
+    const keys = (await storedEntries()).map((entry) => entry.key);
+    expect(keys.length).toBeGreaterThan(0);
+    for (const key of keys) {
+      expect(key).not.toContain(KEY_A);
+    }
+  });
+
+  test("a failed exemption write does not fail the request", async () => {
+    vi.spyOn(cacheManager, "set").mockRejectedValueOnce(
+      new Error("cache down"),
+    );
+    await expect(
+      limiter.recordSuccess({ credential: KEY_A }),
+    ).resolves.toBeUndefined();
+  });
+
+  test("coalesces successful bursts, refreshes the shared mark, and retries failures", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(1_000_000);
+    const burstLimiter = new VirtualKeyRateLimiter(cacheManager);
+    const writes = vi.spyOn(cacheManager, "set");
+    await Promise.all(
+      Array.from({ length: 50 }, () =>
+        burstLimiter.recordSuccess({ credential: KEY_A }),
+      ),
+    );
+    await burstLimiter.recordSuccess({ credential: KEY_A });
+    expect(writes).toHaveBeenCalledTimes(1);
+    const [first] = await storedEntries();
+    expect(first.value.expires).toBe(1_300_000);
+
+    vi.setSystemTime(1_001_001);
+    writes.mockRejectedValueOnce(new Error("cache unavailable"));
+    await burstLimiter.recordSuccess({ credential: KEY_A });
+    await burstLimiter.recordSuccess({ credential: KEY_A });
+    expect(writes).toHaveBeenCalledTimes(3);
+    const [refreshed] = await storedEntries();
+    expect(refreshed.value.expires).toBe(1_301_001);
+  });
+});
+
+async function storedEntries(): Promise<
+  Array<{
+    key: string;
+    value: { value: unknown; expires: number };
+  }>
+> {
+  const result = await db.execute<{ key: string; value: string }>(
+    sql`SELECT key, value FROM keyv_cache ORDER BY key`,
+  );
+  return result.rows.map((row) => ({
+    key: row.key,
+    value: JSON.parse(row.value),
+  }));
+}
+
+/** The (IP, credential) bucket of the only credential that failed, read through the cache API. */
+async function credentialBucket(): Promise<{
+  count: number;
+  windowEndsAt: number;
+}> {
+  const key = (await storedEntries()).find(
+    (entry) => !entry.key.includes("-ip-") && !entry.key.includes("-ok-"),
+  )?.key;
+  if (!key) throw new Error("expected a credential bucket");
+  return mustRead(key);
+}
+
+async function ipBucket(
+  ip: string,
+): Promise<{ count: number; windowEndsAt: number }> {
+  return mustRead(`keyv:${CacheKey.VirtualKeyRateLimit}-ip-${ip}`);
+}
+
+async function mustRead(
+  key: string,
+): Promise<{ count: number; windowEndsAt: number }> {
+  const value = await cacheManager.get<{ count: number; windowEndsAt: number }>(
+    key.slice("keyv:".length) as AllowedCacheKey,
+  );
+  if (!value) throw new Error(`expected a cached bucket at ${key}`);
+  return value;
+}
+
+// =========================================================================
+// validatePassthroughVirtualKey
+// =========================================================================
+
+describe("validatePassthroughVirtualKey", () => {
+  test("combined authentication reads preserve gateway data and see membership and key revocation", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const owner = await makeUser();
+    const member = await makeMember(owner.id, org.id);
+    await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+      isDefault: true,
+    });
+    const { value, virtualKey } = await VirtualApiKeyModel.create({
+      organizationId: org.id,
+      name: "Synthetic combined lookup",
+      keyType: "passthrough",
+      authorId: owner.id,
+    });
+    const agent = await resolveAgent(undefined);
+    const expected = await validatePassthroughVirtualKey({
+      tokenValue: value,
+      agent,
+    });
+    await drainBackgroundWork();
+    const combined = await recordQueries(() =>
+      readPassthroughAuthenticationSnapshot({ tokenValue: value }),
+    );
+    expect(combined.statements).toHaveLength(1);
+    const snapshot = combined.result;
+    expect(snapshot).toBeDefined();
+    if (!snapshot) throw new Error("Expected the deployment proxy lookup");
+    expect(snapshot.agent).toEqual(agent);
+    expect(snapshot.agent.createdAt).toBeInstanceOf(Date);
+    const validation = await recordQueries(() =>
+      validatePassthroughVirtualKey({
+        tokenValue: value,
+        agent: snapshot.agent,
+        authenticationSnapshot: snapshot,
+      }),
+    );
+    expect(validation.result).toEqual(expected);
+    expect(validation.statements).toHaveLength(0);
+
+    await db
+      .delete(schema.membersTable)
+      .where(eq(schema.membersTable.id, member.id));
+    const afterRemoval = await readPassthroughAuthenticationSnapshot({
+      tokenValue: value,
+    });
+    await expect(
+      validatePassthroughVirtualKey({
+        tokenValue: value,
+        agent,
+        authenticationSnapshot: afterRemoval,
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await VirtualApiKeyModel.delete(virtualKey.id);
+    expect(
+      await readPassthroughAuthenticationSnapshot({ tokenValue: value }),
+    ).toBeUndefined();
+    await expect(
+      validatePassthroughVirtualKey({ tokenValue: value, agent }),
+    ).rejects.toMatchObject({ statusCode: 401 });
+  });
+
+  test("combined authentication snapshots still verify token bytes, scope and expiry", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const owner = await makeUser();
+    await makeMember(owner.id, org.id);
+    await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+      isDefault: true,
+    });
+    const { value, virtualKey } = await VirtualApiKeyModel.create({
+      organizationId: org.id,
+      name: "Synthetic scoped lookup",
+      keyType: "passthrough",
+      authorId: owner.id,
+    });
+    const snapshot = await readPassthroughAuthenticationSnapshot({
+      tokenValue: value,
+      oauthTokenCandidate: "provider-one",
+    });
+    if (!snapshot) throw new Error("Expected the deployment proxy lookup");
+    const agent = snapshot.agent;
+    const parameters = {
+      tokenValue: value,
+      agent,
+      oauthTokenCandidate: "provider-one",
+      authenticationSnapshot: snapshot,
+    };
+    await validatePassthroughVirtualKey(parameters);
+    await drainBackgroundWork();
+    const wrongToken = value.slice(0, -1) + (value.endsWith("a") ? "b" : "a");
+    await expect(
+      validatePassthroughVirtualKey({ ...parameters, tokenValue: wrongToken }),
+    ).rejects.toMatchObject({ statusCode: 401 });
+    const otherBearer = await recordQueries(() =>
+      validatePassthroughVirtualKey({
+        ...parameters,
+        oauthTokenCandidate: "provider-two",
+      }),
+    );
+    expect(otherBearer.statements).toHaveLength(1);
+    expect(otherBearer.result.nonOAuthTokenHash).toBe(
+      OAuthAccessTokenModel.hashTokenForLookup("provider-two"),
+    );
+    const foreign = await makeOrganization();
+    const foreignAgent = await makeAgent({
+      organizationId: foreign.id,
+      agentType: "llm_proxy",
+      isDefault: true,
+    });
+    await expect(
+      validatePassthroughVirtualKey({ ...parameters, agent: foreignAgent }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    await db
+      .update(schema.virtualApiKeysTable)
+      .set({ expiresAt: new Date(Date.now() - 1000) })
+      .where(eq(schema.virtualApiKeysTable.id, virtualKey.id));
+    const expired = await readPassthroughAuthenticationSnapshot({
+      tokenValue: value,
+    });
+    await expect(
+      validatePassthroughVirtualKey({
+        tokenValue: value,
+        agent,
+        authenticationSnapshot: expired,
+      }),
+    ).rejects.toMatchObject({ statusCode: 401 });
+  });
+
+  test("negative OAuth lookups apply only to that token and are refreshed on the next request", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeAgent,
+    makeOAuthClient,
+    makeOAuthAccessToken,
+  }) => {
+    const org = await makeOrganization();
+    const owner = await makeUser();
+    await makeMember(owner.id, org.id);
+    const proxy = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+      isDefault: true,
+    });
+    const { value } = await VirtualApiKeyModel.create({
+      organizationId: org.id,
+      name: "Synthetic passthrough",
+      keyType: "passthrough",
+      authorId: owner.id,
+    });
+    const token = "synthetic-provider-token";
+    const validate = () =>
+      validatePassthroughVirtualKey({
+        tokenValue: value,
+        agent: proxy,
+        oauthTokenCandidate: token,
+      });
+    const first = await validate();
+    expect(first.nonOAuthTokenHash).toBe(
+      OAuthAccessTokenModel.hashTokenForLookup(token),
+    );
+    const negative = await recordQueries(() =>
+      validateLlmOAuthAccessToken({
+        tokenValue: token,
+        expectedProvider: "openai",
+        agent: proxy,
+        nonOAuthTokenHash: first.nonOAuthTokenHash,
+      }),
+    );
+    expect(negative.result).toBeNull();
+    expect(negative.statements).toHaveLength(0);
+    const other = await recordQueries(() =>
+      validateLlmOAuthAccessToken({
+        tokenValue: "another-provider-token",
+        expectedProvider: "openai",
+        agent: proxy,
+        nonOAuthTokenHash: first.nonOAuthTokenHash,
+      }),
+    );
+    expect(other.result).toBeNull();
+    expect(other.statements).toHaveLength(1);
+
+    const client = await makeOAuthClient({ userId: owner.id });
+    await makeOAuthAccessToken(client.clientId, owner.id, {
+      token: OAuthAccessTokenModel.hashTokenForLookup(token),
+      scopes: [],
+    });
+    const next = await validate();
+    expect(next.nonOAuthTokenHash).toBeUndefined();
+    await expect(
+      validateLlmOAuthAccessToken({
+        tokenValue: token,
+        expectedProvider: "openai",
+        agent: proxy,
+        nonOAuthTokenHash: next.nonOAuthTokenHash,
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    // A negative result for another bearer cannot bypass a present token.
+    await expect(
+      validateLlmOAuthAccessToken({
+        tokenValue: token,
+        expectedProvider: "openai",
+        agent: proxy,
+        nonOAuthTokenHash: OAuthAccessTokenModel.hashTokenForLookup(
+          "another-provider-token",
+        ),
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  test("present OAuth tokens retain expiry, refresh revocation and scope checks", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeAgent,
+    makeOAuthClient,
+    makeOAuthAccessToken,
+    makeOAuthRefreshToken,
+  }) => {
+    const org = await makeOrganization();
+    const owner = await makeUser();
+    await makeMember(owner.id, org.id);
+    const proxy = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+      isDefault: true,
+    });
+    const { value } = await VirtualApiKeyModel.create({
+      organizationId: org.id,
+      name: "Synthetic passthrough",
+      keyType: "passthrough",
+      authorId: owner.id,
+    });
+    const client = await makeOAuthClient({ userId: owner.id });
+    const refresh = await makeOAuthRefreshToken(client.clientId, owner.id, {
+      revoked: new Date(),
+    });
+    for (const [token, overrides, statusCode] of [
+      [
+        "expired-synthetic-token",
+        { expiresAt: new Date(Date.now() - 60_000), scopes: [] },
+        401,
+      ],
+      ["revoked-synthetic-token", { refreshId: refresh.id, scopes: [] }, 401],
+      ["unscoped-synthetic-token", { scopes: [] }, 403],
+    ] as const) {
+      await makeOAuthAccessToken(client.clientId, owner.id, {
+        ...overrides,
+        scopes: [],
+        token: OAuthAccessTokenModel.hashTokenForLookup(token),
+      });
+      const identity = await validatePassthroughVirtualKey({
+        tokenValue: value,
+        agent: proxy,
+        oauthTokenCandidate: token,
+      });
+      expect(identity.nonOAuthTokenHash).toBeUndefined();
+      await expect(
+        validateLlmOAuthAccessToken({
+          tokenValue: token,
+          expectedProvider: "openai",
+          agent: proxy,
+          nonOAuthTokenHash: identity.nonOAuthTokenHash,
+        }),
+      ).rejects.toMatchObject({ statusCode });
+    }
+  });
+
+  test("default proxy access observes membership removal and key deletion on the next request", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const owner = await makeUser();
+    await makeMember(owner.id, org.id, { role: "member" });
+    const proxy = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+      isDefault: true,
+    });
+    const { value, virtualKey } = await VirtualApiKeyModel.create({
+      organizationId: org.id,
+      name: "revocable proxy credential",
+      keyType: "passthrough",
+      authorId: owner.id,
+    });
+    const validate = () =>
+      validatePassthroughVirtualKey({ tokenValue: value, agent: proxy });
+    await expect(validate()).resolves.toMatchObject({ userId: owner.id });
+    await MemberModel.deleteAllByUserId(owner.id);
+    await expect(validate()).rejects.toMatchObject({ statusCode: 403 });
+    await makeMember(owner.id, org.id, { role: "member" });
+    await expect(validate()).resolves.toMatchObject({ userId: owner.id });
+    await VirtualApiKeyModel.delete(virtualKey.id);
+    await expect(validate()).rejects.toMatchObject({ statusCode: 401 });
+  });
+
+  test("a default proxy rejects a valid key issued by another organization", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const other = await makeOrganization();
+    const owner = await makeUser();
+    await makeMember(owner.id, org.id);
+    await makeMember(owner.id, other.id);
+    const proxy = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+      isDefault: true,
+    });
+    const { value } = await VirtualApiKeyModel.create({
+      organizationId: other.id,
+      name: "foreign proxy credential",
+      keyType: "passthrough",
+      authorId: owner.id,
+    });
+    await expect(
+      validatePassthroughVirtualKey({ tokenValue: value, agent: proxy }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+  test("returns owner + key id when the owner can access the proxy", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const owner = await makeUser();
+    await makeMember(owner.id, org.id, { role: "member" });
+    // The organization's proxy, which every member reaches.
+    const proxy = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+      isDefault: true,
+    });
+    const { value } = await VirtualApiKeyModel.create({
+      organizationId: org.id,
+      name: "pt",
+      keyType: "passthrough",
+      authorId: owner.id,
+    });
+
+    const result = await validatePassthroughVirtualKey({
+      tokenValue: value,
+      agent: proxy,
+    });
+    expect(result.userId).toBe(owner.id);
+    expect(result.user).toEqual({
+      id: owner.id,
+      email: owner.email,
+      name: owner.name,
+    });
+  });
+
+  test("403 when the owner cannot access the proxy", async ({
+    makeOrganization,
+    makeUser,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const owner = await makeUser();
+    const otherUser = await makeUser();
+    const personalProxy = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+      access: "personal",
+      authorId: otherUser.id,
+    });
+    const { value } = await VirtualApiKeyModel.create({
+      organizationId: org.id,
+      name: "pt",
+      keyType: "passthrough",
+      authorId: owner.id,
+    });
+
+    await expect(
+      validatePassthroughVirtualKey({
+        tokenValue: value,
+        agent: personalProxy,
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  test("401 for an expired key", async ({
+    makeOrganization,
+    makeUser,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const owner = await makeUser();
+    const proxy = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+    });
+    const { value } = await VirtualApiKeyModel.create({
+      organizationId: org.id,
+      name: "pt",
+      keyType: "passthrough",
+      authorId: owner.id,
+      expiresAt: new Date(Date.now() - 1000),
+    });
+
+    await expect(
+      validatePassthroughVirtualKey({ tokenValue: value, agent: proxy }),
+    ).rejects.toMatchObject({ statusCode: 401 });
+  });
+
+  test("400 when a standard key is sent as a passthrough key", async ({
+    makeOrganization,
+    makeUser,
+    makeAgent,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const owner = await makeUser();
+    const proxy = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+    });
+    const secret = await makeSecret({ secret: { apiKey: "sk-real" } });
+    const parentKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openai",
+    });
+    const { value } = await VirtualApiKeyModel.create({
+      organizationId: org.id,
+      name: "std",
+      keyType: "standard",
+      authorId: owner.id,
+      providerApiKeys: [
+        { provider: parentKey.provider, providerApiKeyId: parentKey.id },
+      ],
+    });
+
+    await expect(
+      validatePassthroughVirtualKey({ tokenValue: value, agent: proxy }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+  });
+});
+
+// =========================================================================
+// assertConsistentUserCredentials
+// =========================================================================
+
+describe("assertConsistentUserCredentials", () => {
+  test("passes for a single user, repeats, and empties", () => {
+    expect(() => assertConsistentUserCredentials([])).not.toThrow();
+    expect(() =>
+      assertConsistentUserCredentials([undefined, null, "user-a"]),
+    ).not.toThrow();
+    expect(() =>
+      assertConsistentUserCredentials(["user-a", "user-a", undefined]),
+    ).not.toThrow();
+  });
+
+  test("throws 401 when two credentials identify different users", () => {
+    try {
+      assertConsistentUserCredentials(["user-a", "user-b"]);
+      throw new Error("expected a conflict error");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ApiError);
+      expect((error as ApiError).statusCode).toBe(401);
+    }
   });
 });

@@ -1,8 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import {
+  agentNotRecommendedForModel,
+  agentRequiresPerUserConnect,
+  agentToolsUnavailableForModel,
   CHAT_STORAGE_KEYS,
+  deriveModelSource,
+  getAgentSubscriptionConnection,
   getSavedAgent,
   resolveAutoSelectedModel,
+  resolveConversationKeyForModel,
   resolveInitialModel,
   resolveModelForAgent,
   saveAgent,
@@ -31,348 +37,825 @@ describe("agent persistence", () => {
 });
 
 describe("resolveInitialModel", () => {
+  // Model identifiers are models.id UUIDs.
   const baseModels = {
-    openai: [{ id: "gpt-4o" }, { id: "gpt-4o-mini" }],
-    anthropic: [{ id: "claude-3-5-sonnet" }],
+    openai: [{ id: "uuid-gpt-4o" }, { id: "uuid-gpt-4o-mini", isBest: true }],
+    anthropic: [{ id: "uuid-sonnet" }],
   };
-
   const baseChatApiKeys = [
     { id: "key-openai", provider: "openai" },
     { id: "key-anthropic", provider: "anthropic" },
   ];
 
   test("returns null when no models available", () => {
-    const result = resolveInitialModel({
-      modelsByProvider: {},
-      agent: null,
-      chatApiKeys: [],
-      organization: null,
-    });
-    expect(result).toBeNull();
+    expect(
+      resolveInitialModel({
+        modelsByProvider: {},
+        agent: null,
+        chatApiKeys: [],
+        organization: null,
+      }),
+    ).toBeNull();
   });
 
-  test("prefers agent model over org default", () => {
+  test("prefers the agent model over the org default", () => {
     const result = resolveInitialModel({
       modelsByProvider: baseModels,
-      agent: { llmModel: "claude-3-5-sonnet", llmApiKeyId: "agent-key" },
+      agent: { modelId: "uuid-sonnet", llmApiKeyId: "key-anthropic" },
       chatApiKeys: baseChatApiKeys,
       organization: {
-        defaultLlmModel: "gpt-4o",
+        defaultModelId: "uuid-gpt-4o",
         defaultLlmApiKeyId: "key-openai",
       },
     });
     expect(result).toEqual({
-      modelId: "claude-3-5-sonnet",
-      apiKeyId: "agent-key",
-      source: "agent",
+      modelId: "uuid-sonnet",
+      apiKeyId: "key-anthropic",
     });
   });
 
-  test("uses org default when agent has no model configured", () => {
+  test("uses the org default when the agent has no model", () => {
     const result = resolveInitialModel({
       modelsByProvider: baseModels,
-      agent: { llmModel: null, llmApiKeyId: null },
+      agent: { modelId: null, llmApiKeyId: null },
       chatApiKeys: baseChatApiKeys,
       organization: {
-        defaultLlmModel: "gpt-4o",
+        defaultModelId: "uuid-gpt-4o",
         defaultLlmApiKeyId: "key-openai",
       },
     });
-    expect(result).toEqual({
-      modelId: "gpt-4o",
-      apiKeyId: "key-openai",
-      source: "organization",
-    });
+    expect(result).toEqual({ modelId: "uuid-gpt-4o", apiKeyId: "key-openai" });
   });
 
-  test("uses agent model with agent API key", () => {
-    const result = resolveInitialModel({
-      modelsByProvider: baseModels,
-      agent: { llmModel: "claude-3-5-sonnet", llmApiKeyId: "agent-key" },
-      chatApiKeys: baseChatApiKeys,
-      organization: null,
-    });
-    expect(result).toEqual({
-      modelId: "claude-3-5-sonnet",
-      apiKeyId: "agent-key",
-      source: "agent",
-    });
-  });
-
-  test("skips agent model when model is not in available models", () => {
-    const result = resolveInitialModel({
-      modelsByProvider: baseModels,
-      agent: { llmModel: "deleted-model", llmApiKeyId: "agent-key" },
-      chatApiKeys: baseChatApiKeys,
-      organization: null,
-    });
-    expect(result?.source).toBe("fallback");
-  });
-
-  test("falls back to first available model", () => {
+  test("falls back to the best available model when nothing is configured", () => {
     const result = resolveInitialModel({
       modelsByProvider: baseModels,
       agent: null,
       chatApiKeys: baseChatApiKeys,
       organization: null,
     });
-    expect(result).toEqual({
-      modelId: "gpt-4o",
-      apiKeyId: "key-openai",
-      source: "fallback",
-    });
+    // uuid-gpt-4o-mini is marked best.
+    expect(result?.modelId).toBe("uuid-gpt-4o-mini");
   });
 
-  test("returns null apiKeyId when no matching key for provider", () => {
-    const result = resolveInitialModel({
-      modelsByProvider: baseModels,
-      agent: null,
-      chatApiKeys: [], // No keys at all
-      organization: null,
-    });
-    expect(result?.modelId).toBe("gpt-4o");
-    expect(result?.apiKeyId).toBeNull();
-  });
+  // A per-user provider (GitHub Copilot) is catalogued org-wide but its key is
+  // the viewer's own, resolved at send time. A member viewing an org/agent
+  // default that points at a Copilot model holds no key for it, so the model
+  // must still be selected (by model alone) with the key dropped.
+  const copilotModels = {
+    ...baseModels,
+    "github-copilot": [{ id: "uuid-copilot-sonnet", isBest: true }],
+  };
 
-  test("org default falls back to provider key when org API key is not available", () => {
+  test("resolves an org default pointing at a per-user model, dropping the key", () => {
     const result = resolveInitialModel({
-      modelsByProvider: baseModels,
-      agent: null,
+      modelsByProvider: copilotModels,
+      agent: { modelId: null, llmApiKeyId: null },
+      // The member has no GitHub Copilot key — only openai/anthropic.
       chatApiKeys: baseChatApiKeys,
       organization: {
-        defaultLlmModel: "gpt-4o",
-        defaultLlmApiKeyId: "deleted-key",
+        defaultModelId: "uuid-copilot-sonnet",
+        // The admin's personal Copilot key — not visible/usable by the member.
+        defaultLlmApiKeyId: "key-admin-copilot",
       },
     });
+    expect(result).toEqual({ modelId: "uuid-copilot-sonnet", apiKeyId: null });
+  });
+
+  test("resolves an agent default pointing at a per-user model, dropping the key", () => {
+    const result = resolveInitialModel({
+      modelsByProvider: copilotModels,
+      agent: {
+        modelId: "uuid-copilot-sonnet",
+        llmApiKeyId: "key-owner-copilot",
+      },
+      chatApiKeys: baseChatApiKeys,
+      organization: null,
+    });
+    expect(result).toEqual({ modelId: "uuid-copilot-sonnet", apiKeyId: null });
+  });
+});
+
+describe("resolveInitialModel with defaults naming a key the viewer cannot use", () => {
+  // The viewer may use "key-usable" only. "key-org-admin" is the admin's key
+  // behind the org default and "key-read-only" is shared with the viewer to
+  // see, not to use: sending either is refused.
+  const modelsByProvider = {
+    openai: [{ id: "uuid-gpt-4o" }, { id: "uuid-gpt-4o-mini", isBest: true }],
+    anthropic: [{ id: "uuid-sonnet" }],
+  };
+  const usableKeys = [{ id: "key-usable", provider: "openai" }];
+
+  test("keeps the org default model but runs it through a key the viewer can use", () => {
+    const result = resolveInitialModel({
+      modelsByProvider,
+      agent: { modelId: null, llmApiKeyId: null },
+      chatApiKeys: usableKeys,
+      organization: {
+        defaultModelId: "uuid-gpt-4o",
+        defaultLlmApiKeyId: "key-org-admin",
+      },
+    });
+    expect(result).toEqual({ modelId: "uuid-gpt-4o", apiKeyId: "key-usable" });
+  });
+
+  test("skips a default whose provider the viewer has no usable key for", () => {
+    const result = resolveInitialModel({
+      modelsByProvider,
+      agent: { modelId: null, llmApiKeyId: null },
+      chatApiKeys: usableKeys,
+      organization: {
+        defaultModelId: "uuid-sonnet",
+        defaultLlmApiKeyId: "key-org-admin",
+      },
+    });
+    // Falls through to the best model the viewer can actually run.
     expect(result).toEqual({
-      modelId: "gpt-4o",
-      apiKeyId: "key-openai",
-      source: "organization",
+      modelId: "uuid-gpt-4o-mini",
+      apiKeyId: "key-usable",
     });
   });
 
-  test("org default with no API key configured uses provider key", () => {
+  test("keeps the agent's own key, which works through the agent", () => {
     const result = resolveInitialModel({
-      modelsByProvider: baseModels,
-      agent: null,
-      chatApiKeys: baseChatApiKeys,
-      organization: {
-        defaultLlmModel: "gpt-4o",
-        defaultLlmApiKeyId: null,
-      },
+      modelsByProvider,
+      agent: { modelId: "uuid-sonnet", llmApiKeyId: "key-agent" },
+      chatApiKeys: usableKeys,
+      organization: null,
     });
-    expect(result).toEqual({
-      modelId: "gpt-4o",
-      apiKeyId: "key-openai",
-      source: "organization",
-    });
+    expect(result).toEqual({ modelId: "uuid-sonnet", apiKeyId: "key-agent" });
+  });
+});
+
+describe("resolveConversationKeyForModel", () => {
+  const usableKeys = [
+    { id: "key-openai-usable", provider: "openai" },
+    { id: "key-anthropic-usable", provider: "anthropic" },
+  ];
+
+  test("keeps the agent's own key when the picked model is on its provider", () => {
+    expect(
+      resolveConversationKeyForModel({
+        currentKeyId: "key-agent",
+        currentModelProvider: "openai",
+        agentApiKeyId: "key-agent",
+        modelProvider: "openai",
+        usableKeys,
+      }),
+    ).toBe("key-agent");
   });
 
-  test("skips org default when model is not in available models", () => {
-    const result = resolveInitialModel({
-      modelsByProvider: baseModels,
-      agent: null,
-      chatApiKeys: baseChatApiKeys,
-      organization: {
-        defaultLlmModel: "deleted-model",
-        defaultLlmApiKeyId: "key-openai",
+  test("replaces a current key the viewer cannot use with a usable one", () => {
+    // e.g. a stored org-default key that is not the agent's.
+    expect(
+      resolveConversationKeyForModel({
+        currentKeyId: "key-org-admin",
+        currentModelProvider: "openai",
+        agentApiKeyId: "key-agent",
+        modelProvider: "openai",
+        usableKeys,
+      }),
+    ).toBe("key-openai-usable");
+  });
+
+  test("switches to a usable key of the new provider", () => {
+    expect(
+      resolveConversationKeyForModel({
+        currentKeyId: "key-agent",
+        currentModelProvider: "openai",
+        agentApiKeyId: "key-agent",
+        modelProvider: "anthropic",
+        usableKeys,
+      }),
+    ).toBe("key-anthropic-usable");
+  });
+
+  test("returns null when the viewer has no usable key for the provider", () => {
+    expect(
+      resolveConversationKeyForModel({
+        currentKeyId: "key-openai-usable",
+        currentModelProvider: "openai",
+        agentApiKeyId: null,
+        modelProvider: "gemini",
+        usableKeys,
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("resolveModelForAgent", () => {
+  test("delegates to the agent + org + best chain", () => {
+    const result = resolveModelForAgent({
+      agent: { modelId: null, llmApiKeyId: null },
+      context: {
+        modelsByProvider: { openai: [{ id: "uuid-gpt-4o" }] },
+        chatApiKeys: [{ id: "key-openai", provider: "openai" }],
+        organization: {
+          defaultModelId: "uuid-gpt-4o",
+          defaultLlmApiKeyId: "key-openai",
+        },
       },
     });
-    expect(result?.source).toBe("fallback");
-    expect(result?.modelId).toBe("gpt-4o");
+    expect(result).toEqual({ modelId: "uuid-gpt-4o", apiKeyId: "key-openai" });
   });
 });
 
 describe("resolveAutoSelectedModel", () => {
-  const models = [
-    { id: "gpt-4o", isBest: true },
-    { id: "gpt-4o-mini" },
-    { id: "claude-3-5-sonnet" },
-  ];
+  const models = [{ id: "uuid-a", isBest: true }, { id: "uuid-b" }];
 
   test("returns null while loading", () => {
     expect(
       resolveAutoSelectedModel({
-        selectedModel: "nonexistent",
+        selectedModel: "uuid-x",
         availableModels: models,
         isLoading: true,
       }),
     ).toBeNull();
   });
 
-  test("returns null when no models available", () => {
+  test("returns null when the selected model is available", () => {
     expect(
       resolveAutoSelectedModel({
-        selectedModel: "gpt-4o",
-        availableModels: [],
-        isLoading: false,
-      }),
-    ).toBeNull();
-  });
-
-  test("returns null when selectedModel is empty (parent still initializing)", () => {
-    expect(
-      resolveAutoSelectedModel({
-        selectedModel: "",
+        selectedModel: "uuid-b",
         availableModels: models,
         isLoading: false,
       }),
     ).toBeNull();
   });
 
-  test("returns null when selected model is available (no change needed)", () => {
+  test("selects the best model when the selected model is unavailable", () => {
     expect(
       resolveAutoSelectedModel({
-        selectedModel: "gpt-4o",
+        selectedModel: "uuid-deleted",
         availableModels: models,
         isLoading: false,
       }),
-    ).toBeNull();
+    ).toBe("uuid-a");
   });
 
-  test("selects best model when selected model is unavailable", () => {
+  test("prefers a keyed model over an unconnected per-user 'best' model", () => {
     expect(
       resolveAutoSelectedModel({
-        selectedModel: "deleted-model",
-        availableModels: models,
+        selectedModel: "uuid-deleted",
+        availableModels: [
+          {
+            id: "uuid-copilot",
+            isBest: true,
+            requiresUserConnection: true,
+            isConnected: false,
+          },
+          { id: "uuid-kimi" },
+        ],
         isLoading: false,
       }),
-    ).toBe("gpt-4o"); // isBest: true
+    ).toBe("uuid-kimi");
   });
 
-  test("selects first model when no best model and selected is unavailable", () => {
-    const noBestModels = [{ id: "model-a" }, { id: "model-b" }];
+  test("falls back to an unconnected per-user model when nothing else is available", () => {
     expect(
       resolveAutoSelectedModel({
-        selectedModel: "deleted-model",
-        availableModels: noBestModels,
+        selectedModel: "uuid-deleted",
+        availableModels: [
+          {
+            id: "uuid-copilot",
+            isBest: true,
+            requiresUserConnection: true,
+            isConnected: false,
+          },
+        ],
         isLoading: false,
       }),
-    ).toBe("model-a");
+    ).toBe("uuid-copilot");
   });
 
-  test("does NOT auto-select when model is available (race condition regression)", () => {
-    // This is the key regression test: during initialization, the API key
-    // transitions from null → "key1". The old code treated this as an
-    // "apiKey change" and force-selected the best model, overwriting
-    // the user's saved choice. The fix ensures we only auto-select
-    // when the model is genuinely unavailable.
+  test("a connected per-user 'best' model stays eligible", () => {
     expect(
       resolveAutoSelectedModel({
-        selectedModel: "claude-3-5-sonnet", // user's saved model
-        availableModels: models, // model IS in the list
+        selectedModel: "uuid-deleted",
+        availableModels: [
+          {
+            id: "uuid-copilot",
+            isBest: true,
+            requiresUserConnection: true,
+            isConnected: true,
+          },
+          { id: "uuid-kimi" },
+        ],
         isLoading: false,
       }),
-    ).toBeNull(); // should NOT switch to gpt-4o
+    ).toBe("uuid-copilot");
   });
 });
 
-describe("resolveModelForAgent", () => {
-  const baseModels = {
-    openai: [{ id: "gpt-4o" }, { id: "gpt-4o-mini" }],
-    anthropic: [{ id: "claude-3-5-sonnet" }],
+describe("agentRequiresPerUserConnect", () => {
+  const perUserAgent = {
+    modelId: "uuid-copilot",
+    llmProviderRequiresPerUserCredential: true,
   };
 
-  const baseChatApiKeys = [
-    { id: "key-openai", provider: "openai" },
-    { id: "key-anthropic", provider: "anthropic" },
+  test("true when the selected per-user agent model is catalogued but not connected", () => {
+    expect(
+      agentRequiresPerUserConnect({
+        agent: perUserAgent,
+        selectedModelId: "uuid-copilot",
+        selectedModel: {
+          dbId: "uuid-copilot",
+          requiresUserConnection: true,
+          isConnected: false,
+        },
+      }),
+    ).toBe(true);
+  });
+
+  test("a pool defers credential choice to the server, but leaving it restores the direct connect gate", () => {
+    const selection = {
+      agent: perUserAgent,
+      selectedModelId: "uuid-copilot",
+      selectedModel: undefined,
+      requiresPerUserCredential: true,
+      isCredentialConnected: false,
+    };
+    expect(
+      agentRequiresPerUserConnect({ ...selection, modelPoolSelected: true }),
+    ).toBe(false);
+    expect(
+      agentRequiresPerUserConnect({ ...selection, modelPoolSelected: false }),
+    ).toBe(true);
+  });
+
+  test("false when the viewer can use the model (connected)", () => {
+    expect(
+      agentRequiresPerUserConnect({
+        agent: perUserAgent,
+        selectedModelId: "uuid-copilot",
+        selectedModel: {
+          dbId: "uuid-copilot",
+          requiresUserConnection: true,
+          isConnected: true,
+        },
+      }),
+    ).toBe(false);
+  });
+
+  test("supports a credential-level subscription on a shared provider", () => {
+    expect(
+      agentRequiresPerUserConnect({
+        agent: {
+          modelId: "uuid-chatgpt",
+          llmProviderRequiresPerUserCredential: false,
+        },
+        selectedModelId: "uuid-chatgpt",
+        selectedModel: undefined,
+        requiresPerUserCredential: true,
+        isCredentialConnected: false,
+      }),
+    ).toBe(true);
+  });
+
+  test("false when the selection is not the agent's pinned model (user override)", () => {
+    expect(
+      agentRequiresPerUserConnect({
+        agent: perUserAgent,
+        selectedModelId: "uuid-other",
+        selectedModel: undefined,
+      }),
+    ).toBe(false);
+  });
+
+  test("false for a non-per-user provider agent", () => {
+    expect(
+      agentRequiresPerUserConnect({
+        agent: {
+          modelId: "uuid-anthropic",
+          llmProviderRequiresPerUserCredential: false,
+        },
+        selectedModelId: "uuid-anthropic",
+        selectedModel: undefined,
+      }),
+    ).toBe(false);
+  });
+
+  test("false when no agent is selected", () => {
+    expect(
+      agentRequiresPerUserConnect({
+        agent: undefined,
+        selectedModelId: "uuid-copilot",
+        selectedModel: undefined,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("getAgentSubscriptionConnection", () => {
+  const xPremiumAgent = {
+    llmApiKeyId: "owner-x-premium",
+    resolvedLlmProvider: "xai" as const,
+    llmProviderRequiresPerUserCredential: false,
+  };
+  // The owner's pinned SuperGrok key, as the included agent key (`isAgentKey`)
+  // path returns it to a viewer who can't list it: metadata only, another
+  // user's row.
+  const pinnedXPremiumKey = {
+    id: "owner-x-premium",
+    provider: "xai" as const,
+    name: "SuperGrok",
+    userId: "owner",
+    subscriptionKind: "x-premium" as const,
+  };
+
+  test("gates a SuperGrok shared agent for a viewer with no credentials", () => {
+    expect(
+      getAgentSubscriptionConnection({
+        agent: xPremiumAgent,
+        credentials: [pinnedXPremiumKey],
+        userId: "viewer",
+      }),
+    ).toEqual({ requiresConnection: true, isConnected: false });
+  });
+
+  test("a plain personal xAI console key does not count as connected (kind-matched, like the send path)", () => {
+    expect(
+      getAgentSubscriptionConnection({
+        agent: xPremiumAgent,
+        credentials: [
+          pinnedXPremiumKey,
+          {
+            id: "viewer-xai-console",
+            provider: "xai",
+            name: "My xAI Key",
+            userId: "viewer",
+            subscriptionKind: null,
+          },
+        ],
+        userId: "viewer",
+      }),
+    ).toEqual({ requiresConnection: true, isConnected: false });
+  });
+
+  test("the viewer's own SuperGrok key connects the agent", () => {
+    expect(
+      getAgentSubscriptionConnection({
+        agent: xPremiumAgent,
+        credentials: [
+          pinnedXPremiumKey,
+          {
+            id: "viewer-x-premium",
+            provider: "xai",
+            name: "SuperGrok",
+            userId: "viewer",
+            subscriptionKind: "x-premium",
+          },
+        ],
+        userId: "viewer",
+      }),
+    ).toEqual({ requiresConnection: true, isConnected: true });
+  });
+
+  test("a ChatGPT display name without authoritative metadata does not gate", () => {
+    const agent = {
+      llmApiKeyId: "owner-chatgpt",
+      resolvedLlmProvider: "openai" as const,
+      llmProviderRequiresPerUserCredential: false,
+    };
+    const pinnedLegacyChatgpt = {
+      id: "owner-chatgpt",
+      provider: "openai" as const,
+      name: "ChatGPT Subscription",
+      userId: "owner",
+    };
+    expect(
+      getAgentSubscriptionConnection({
+        agent,
+        credentials: [pinnedLegacyChatgpt],
+        userId: "viewer",
+      }),
+    ).toEqual({ requiresConnection: false, isConnected: undefined });
+  });
+
+  test("a SuperGrok display name without authoritative metadata does not gate", () => {
+    const agent = {
+      llmApiKeyId: "owner-x-premium-nokind",
+      resolvedLlmProvider: "xai" as const,
+      llmProviderRequiresPerUserCredential: false,
+    };
+    const pinnedNameOnly = {
+      id: "owner-x-premium-nokind",
+      provider: "xai" as const,
+      name: "SuperGrok",
+      userId: "owner",
+    };
+    expect(
+      getAgentSubscriptionConnection({
+        agent,
+        credentials: [pinnedNameOnly],
+        userId: "viewer",
+      }),
+    ).toEqual({ requiresConnection: false, isConnected: undefined });
+  });
+
+  test("an ordinary shared key requires no connection", () => {
+    expect(
+      getAgentSubscriptionConnection({
+        agent: {
+          llmApiKeyId: "org-openai",
+          resolvedLlmProvider: "openai" as const,
+          llmProviderRequiresPerUserCredential: false,
+        },
+        credentials: [
+          {
+            id: "org-openai",
+            provider: "openai",
+            name: "OpenAI Key",
+            userId: null,
+            subscriptionKind: null,
+          },
+        ],
+        userId: "viewer",
+      }),
+    ).toEqual({ requiresConnection: false, isConnected: undefined });
+  });
+
+  test("a provider-level subscription (Copilot) accepts any personal key of the provider", () => {
+    expect(
+      getAgentSubscriptionConnection({
+        agent: {
+          llmApiKeyId: "owner-copilot",
+          resolvedLlmProvider: "github-copilot" as const,
+          llmProviderRequiresPerUserCredential: true,
+        },
+        credentials: [
+          {
+            id: "viewer-copilot",
+            provider: "github-copilot",
+            name: "GitHub Copilot",
+            userId: "viewer",
+          },
+        ],
+        userId: "viewer",
+      }),
+    ).toEqual({ requiresConnection: true, isConnected: true });
+  });
+});
+
+describe("agentToolsUnavailableForModel", () => {
+  const noToolsModel = {
+    dbId: "uuid-m365",
+    capabilities: { supportsToolCalling: false },
+  };
+  const toolCallingModel = {
+    dbId: "uuid-anthropic",
+    capabilities: { supportsToolCalling: true },
+  };
+  const unknownCapabilityModel = { dbId: "uuid-unknown" };
+  const models = [noToolsModel, toolCallingModel, unknownCapabilityModel];
+
+  test("true for a tooled agent on a no-tools model", () => {
+    expect(
+      agentToolsUnavailableForModel({
+        agent: { accessAllTools: false, tools: [{}] },
+        selectedModelId: "uuid-m365",
+        models,
+      }),
+    ).toBe(true);
+  });
+
+  test("true for an Auto-mode agent (no assignments) on a no-tools model", () => {
+    expect(
+      agentToolsUnavailableForModel({
+        agent: { accessAllTools: true, tools: [] },
+        selectedModelId: "uuid-m365",
+        models,
+      }),
+    ).toBe(true);
+  });
+
+  test("false for a tool-less Custom agent on a no-tools model", () => {
+    expect(
+      agentToolsUnavailableForModel({
+        agent: { accessAllTools: false, tools: [] },
+        selectedModelId: "uuid-m365",
+        models,
+      }),
+    ).toBe(false);
+  });
+
+  test("false when the model supports tool calling", () => {
+    expect(
+      agentToolsUnavailableForModel({
+        agent: { accessAllTools: true, tools: [{}] },
+        selectedModelId: "uuid-anthropic",
+        models,
+      }),
+    ).toBe(false);
+  });
+
+  test("false when the model's capability is unknown", () => {
+    expect(
+      agentToolsUnavailableForModel({
+        agent: { accessAllTools: true, tools: [{}] },
+        selectedModelId: "uuid-unknown",
+        models,
+      }),
+    ).toBe(false);
+  });
+
+  test("false without an agent or a selection", () => {
+    expect(
+      agentToolsUnavailableForModel({
+        agent: undefined,
+        selectedModelId: "uuid-m365",
+        models,
+      }),
+    ).toBe(false);
+    expect(
+      agentToolsUnavailableForModel({
+        agent: { accessAllTools: true, tools: [] },
+        selectedModelId: null,
+        models,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("deriveModelSource", () => {
+  test("'agent' when the model matches the agent default", () => {
+    expect(
+      deriveModelSource({
+        selectedModelId: "uuid-a",
+        agentModelId: "uuid-a",
+        orgModelId: "uuid-o",
+      }),
+    ).toBe("agent");
+  });
+
+  test("null when nothing is configured", () => {
+    expect(
+      deriveModelSource({
+        selectedModelId: "uuid-a",
+        agentModelId: null,
+        orgModelId: null,
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("agentNotRecommendedForModel", () => {
+  const flaggedModel = {
+    dbId: "uuid-qwen-4b",
+    capabilities: { recommendedForAgents: false, supportsToolCalling: true },
+  };
+  const recommendedModel = {
+    dbId: "uuid-llama-70b",
+    capabilities: { recommendedForAgents: true, supportsToolCalling: true },
+  };
+  // Nothing evaluated this model, so the sync left the verdict null.
+  const unjudgedModel = {
+    dbId: "uuid-anthropic",
+    capabilities: { supportsToolCalling: true },
+  };
+  const flaggedAndToolless = {
+    dbId: "uuid-tiny-no-tools",
+    capabilities: { recommendedForAgents: false, supportsToolCalling: false },
+  };
+  const models = [
+    flaggedModel,
+    recommendedModel,
+    unjudgedModel,
+    flaggedAndToolless,
   ];
 
-  const orgDefaults = {
-    defaultLlmModel: "gpt-4o",
-    defaultLlmApiKeyId: "key-openai",
-  };
+  test("true for a tooled agent on a flagged model", () => {
+    expect(
+      agentNotRecommendedForModel({
+        agent: { accessAllTools: false, tools: [{}] },
+        selectedModelId: "uuid-qwen-4b",
+        models,
+      }),
+    ).toBe(true);
+  });
 
-  const baseContext = {
-    modelsByProvider: baseModels,
-    chatApiKeys: baseChatApiKeys,
-    organization: orgDefaults,
-  };
+  test("true for an Auto-mode agent (no assignments) on a flagged model", () => {
+    expect(
+      agentNotRecommendedForModel({
+        agent: { accessAllTools: true, tools: [] },
+        selectedModelId: "uuid-qwen-4b",
+        models,
+      }),
+    ).toBe(true);
+  });
 
-  test("uses agent's direct model/key when configured", () => {
-    const result = resolveModelForAgent({
-      agent: {
-        llmModel: "claude-3-5-sonnet",
-        llmApiKeyId: "key-anthropic",
+  // A flagged model doing plain chat is fine; the verdict only matters for
+  // agentic use.
+  test("false for a tool-less Custom agent on a flagged model", () => {
+    expect(
+      agentNotRecommendedForModel({
+        agent: { accessAllTools: false, tools: [] },
+        selectedModelId: "uuid-qwen-4b",
+        models,
+      }),
+    ).toBe(false);
+  });
+
+  test("false for a recommended model", () => {
+    expect(
+      agentNotRecommendedForModel({
+        agent: { accessAllTools: true, tools: [{}] },
+        selectedModelId: "uuid-llama-70b",
+        models,
+      }),
+    ).toBe(false);
+  });
+
+  test("false when no verdict was recorded", () => {
+    expect(
+      agentNotRecommendedForModel({
+        agent: { accessAllTools: true, tools: [{}] },
+        selectedModelId: "uuid-anthropic",
+        models,
+      }),
+    ).toBe(false);
+  });
+
+  // "No tools" is the stronger, more actionable statement, and two chips side
+  // by side in the composer is noise.
+  test("defers to the no-tools notice when the flagged model takes no tools", () => {
+    expect(
+      agentNotRecommendedForModel({
+        agent: { accessAllTools: true, tools: [{}] },
+        selectedModelId: "uuid-tiny-no-tools",
+        models,
+      }),
+    ).toBe(false);
+    expect(
+      agentToolsUnavailableForModel({
+        agent: { accessAllTools: true, tools: [{}] },
+        selectedModelId: "uuid-tiny-no-tools",
+        models,
+      }),
+    ).toBe(true);
+  });
+
+  test("false without an agent or a selection", () => {
+    expect(
+      agentNotRecommendedForModel({
+        agent: undefined,
+        selectedModelId: "uuid-qwen-4b",
+        models,
+      }),
+    ).toBe(false);
+    expect(
+      agentNotRecommendedForModel({
+        agent: { accessAllTools: true, tools: [] },
+        selectedModelId: null,
+        models,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("resolveInitialModel with a GitHub App key on Copilot", () => {
+  test("pairs a Copilot default with the shared App key, not the per-user placeholder", () => {
+    const result = resolveInitialModel({
+      modelsByProvider: { "github-copilot": [{ id: "uuid-gpt-4o-copilot" }] },
+      agent: null,
+      chatApiKeys: [
+        {
+          id: "key-copilot-app",
+          provider: "github-copilot",
+          isGithubAppKey: true,
+        },
+      ],
+      organization: {
+        defaultModelId: "uuid-gpt-4o-copilot",
+        defaultLlmApiKeyId: "key-copilot-app",
       },
-      context: baseContext,
     });
+
     expect(result).toEqual({
-      modelId: "claude-3-5-sonnet",
-      apiKeyId: "key-anthropic",
-      source: "agent",
+      modelId: "uuid-gpt-4o-copilot",
+      apiKeyId: "key-copilot-app",
     });
   });
+});
 
-  test("falls back to org default when agent has no model configured", () => {
-    const result = resolveModelForAgent({
-      agent: { llmModel: null, llmApiKeyId: null },
-      context: baseContext,
+describe("resolveInitialModel keeps a personal Copilot default per-user next to an App key", () => {
+  test("a default naming no App key stays per-user (placeholder dropped)", () => {
+    const result = resolveInitialModel({
+      modelsByProvider: { "github-copilot": [{ id: "uuid-copilot" }] },
+      agent: null,
+      chatApiKeys: [
+        {
+          id: "key-copilot-app",
+          provider: "github-copilot",
+          isGithubAppKey: true,
+        },
+      ],
+      organization: {
+        defaultModelId: "uuid-copilot",
+        defaultLlmApiKeyId: "someone-elses-personal-key",
+      },
     });
-    expect(result).toEqual({
-      modelId: "gpt-4o",
-      apiKeyId: "key-openai",
-      source: "organization",
-    });
-  });
 
-  test("switching from agent with direct config to agent with org default resolves correctly", () => {
-    const agentWithConfig = {
-      llmModel: "claude-3-5-sonnet",
-      llmApiKeyId: "key-anthropic",
-    };
-    const agentWithoutConfig = {
-      llmModel: null,
-      llmApiKeyId: null,
-    };
-
-    // First agent resolves to its own config
-    const first = resolveModelForAgent({
-      agent: agentWithConfig,
-      context: baseContext,
-    });
-    expect(first?.modelId).toBe("claude-3-5-sonnet");
-    expect(first?.apiKeyId).toBe("key-anthropic");
-    expect(first?.source).toBe("agent");
-
-    // Switching to second agent should resolve to org default, NOT keep the first agent's values
-    const second = resolveModelForAgent({
-      agent: agentWithoutConfig,
-      context: baseContext,
-    });
-    expect(second?.modelId).toBe("gpt-4o");
-    expect(second?.apiKeyId).toBe("key-openai");
-    expect(second?.source).toBe("organization");
-  });
-
-  test("handles agent with non-string llmModel gracefully", () => {
-    const result = resolveModelForAgent({
-      agent: { llmModel: undefined, llmApiKeyId: undefined },
-      context: baseContext,
-    });
-    expect(result?.source).toBe("organization");
-  });
-
-  test("switching between two agents with different direct configs", () => {
-    const agentA = {
-      llmModel: "gpt-4o",
-      llmApiKeyId: "key-openai",
-    };
-    const agentB = {
-      llmModel: "claude-3-5-sonnet",
-      llmApiKeyId: "key-anthropic",
-    };
-
-    const resultA = resolveModelForAgent({
-      agent: agentA,
-      context: baseContext,
-    });
-    expect(resultA?.modelId).toBe("gpt-4o");
-
-    const resultB = resolveModelForAgent({
-      agent: agentB,
-      context: baseContext,
-    });
-    expect(resultB?.modelId).toBe("claude-3-5-sonnet");
+    expect(result).toEqual({ modelId: "uuid-copilot", apiKeyId: null });
   });
 });

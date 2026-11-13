@@ -1,19 +1,46 @@
+import { getEventListeners } from "node:events";
 import { PassThrough } from "node:stream";
+import type { LocalConfigSchema } from "@archestra/shared";
 import type * as k8s from "@kubernetes/client-node";
 import type { Attach, Exec, Log } from "@kubernetes/client-node";
-import type { LocalConfigSchema } from "@shared";
-import { vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { z } from "zod";
 import config from "@/config";
-import { describe, expect, test } from "@/test";
-import type { McpServer } from "@/types";
+import {
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  MCP_FOREIGN_REPLICA_OWNER_ANNOTATION,
+  MCP_HIBERNATED_ANNOTATION,
+  MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION,
+  // SPDX-SnippetEnd
+} from "@/k8s/shared";
+import type { ClusterLeaseGuard } from "@/models/mcp-deployment-lease";
+import type {
+  EffectiveNetworkPolicy,
+  InternalMcpCatalog,
+  K8sNetworkPolicyCapabilities,
+  McpServer,
+} from "@/types";
+import { getMcpImagePullPolicy } from "./image-pull-policy";
 import K8sDeployment, {
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  classifySchedulingFailure,
+  // SPDX-SnippetEnd
   fetchPlatformPodNodeSelector,
   fetchPlatformPodTolerations,
   getCachedPlatformNodeSelector,
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  McpServerUnschedulableError,
+  // SPDX-SnippetEnd
   resetPlatformNodeSelectorCache,
   resetPlatformTolerationsCache,
 } from "./k8s-deployment";
+import { buildEgressBaselineNetworkPolicy } from "./network-policy";
 
 // Helper function to create a K8sDeployment instance with mocked dependencies
 function createK8sDeploymentInstance(
@@ -37,6 +64,7 @@ function createK8sDeploymentInstance(
   // Create mock K8s API objects
   const mockK8sApi = {} as k8s.CoreV1Api;
   const mockK8sAppsApi = {} as k8s.AppsV1Api;
+  const mockK8sNetworkingApi = {} as k8s.NetworkingV1Api;
   const mockK8sAttach = {} as Attach;
   const mockK8sLog = {} as Log;
 
@@ -54,6 +82,7 @@ function createK8sDeploymentInstance(
     mcpServer: mockMcpServer,
     k8sApi: mockK8sApi,
     k8sAppsApi: mockK8sAppsApi,
+    k8sNetworkingApi: mockK8sNetworkingApi,
     k8sAttach: mockK8sAttach,
     k8sLog: mockK8sLog,
     k8sExec: {} as Exec,
@@ -63,6 +92,55 @@ function createK8sDeploymentInstance(
     environmentValues: stringEnvironmentValues,
   });
 }
+
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+describe("classifySchedulingFailure", () => {
+  // Verbatim kube-scheduler / quota-admission wordings: the classifier is only
+  // as good as the strings it is fed, so paraphrasing them would prove nothing.
+  const capacityMessages = [
+    "Pod scheduling failed: 0/3 nodes are available: 3 Insufficient cpu. preemption: 0/3 nodes are available: 3 No preemption victims found for incoming pod.",
+    "0/5 nodes are available: 5 Insufficient memory.",
+    "0/2 nodes are available: 2 Insufficient ephemeral-storage.",
+    "0/1 nodes are available: 1 Insufficient nvidia.com/gpu.",
+    "0/4 nodes are available: 4 Too many pods.",
+    'Resource quota exceeded: pods "mcp-test-server-7d9f" is forbidden: exceeded quota: compute-resources, requested: requests.cpu=1, used: requests.cpu=10, limited: requests.cpu=10',
+    // Some nodes are merely full, so a scale-up still places this pod.
+    "0/6 nodes are available: 2 Insufficient cpu, 4 node(s) had untolerated taint {dedicated: gpu}.",
+  ];
+
+  test.each(capacityMessages)("waits out %s", (message) => {
+    expect(classifySchedulingFailure(message)).toBe("capacity");
+  });
+
+  // Nothing here is cleared by adding a node, so a wake that waited on it
+  // would retry until its deadline and then retry again forever.
+  const terminalMessages = [
+    "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector.",
+    "0/3 nodes are available: 3 node(s) had untolerated taint {node-role.kubernetes.io/control-plane: }.",
+    "0/2 nodes are available: 2 pod has unbound immediate PersistentVolumeClaims.",
+    "0/1 nodes are available: 1 node(s) didn't find available persistent volumes to bind.",
+    "0/3 nodes are available: 3 node(s) had volume node affinity conflict.",
+    "0/4 nodes are available: 4 node(s) didn't satisfy existing pods anti-affinity rules.",
+    "0/3 nodes are available: 3 node(s) were unschedulable.",
+    "Invalid ServiceAccount: error looking up service account default/missing-sa",
+  ];
+
+  test.each(terminalMessages)("fails fast on %s", (message) => {
+    expect(classifySchedulingFailure(message)).toBe("terminal");
+  });
+
+  // Guessing "capacity" for an unknown string buys an unbounded retry loop;
+  // guessing "terminal" only reproduces the behavior that shipped before.
+  test.each([
+    "",
+    "Pod scheduling failed: something nobody has seen before",
+  ])("treats unrecognized wording as terminal: %s", (message) => {
+    expect(classifySchedulingFailure(message)).toBe("terminal");
+  });
+});
+// SPDX-SnippetEnd
 
 describe("K8sDeployment.createContainerEnvFromConfig", () => {
   test.each([
@@ -451,6 +529,74 @@ describe("K8sDeployment.constructDeploymentName", () => {
     expect(result1).toBe(result2);
     expect(result1).toBe("mcp-firecrawl-joey");
   });
+
+  // Frozen deployment identity: the stored name always wins over the
+  // name-derived recompute, so renames never re-derive the deployment.
+  test("returns the stored frozen deploymentName over the name recompute", () => {
+    const mockServer = {
+      name: "renamed display name",
+      id: "123e4567-e89b-12d3-a456-426614174000",
+      deploymentName: "mcp-original-1a2b3c4d",
+      // biome-ignore lint/suspicious/noExplicitAny: Minimal mock for testing
+    } as any;
+
+    expect(K8sDeployment.constructDeploymentName(mockServer)).toBe(
+      "mcp-original-1a2b3c4d",
+    );
+  });
+
+  test("falls back to the legacy recompute when deploymentName is NULL", () => {
+    const mockServer = {
+      name: "Not Yet Frozen",
+      id: "123e4567-e89b-12d3-a456-426614174000",
+      deploymentName: null,
+      // biome-ignore lint/suspicious/noExplicitAny: Minimal mock for testing
+    } as any;
+
+    expect(K8sDeployment.constructDeploymentName(mockServer)).toBe(
+      "mcp-not-yet-frozen",
+    );
+  });
+
+  test("multitenant reads the frozen name from the CATALOG row, ignoring the install's", () => {
+    const mockServer = {
+      name: "install name",
+      id: "123e4567-e89b-12d3-a456-426614174000",
+      catalogId: "aaaabbbb-e89b-12d3-a456-426614174000",
+      deploymentName: "mcp-install-frozen",
+      // biome-ignore lint/suspicious/noExplicitAny: Minimal mock for testing
+    } as any;
+    const mockCatalog = {
+      multitenant: true,
+      name: "renamed catalog",
+      deploymentName: "mcp-mt-aaaabbbb-original",
+      // biome-ignore lint/suspicious/noExplicitAny: Minimal mock for testing
+    } as any;
+
+    expect(K8sDeployment.constructDeploymentName(mockServer, mockCatalog)).toBe(
+      "mcp-mt-aaaabbbb-original",
+    );
+  });
+
+  test("multitenant falls back to the legacy mt recompute when the catalog is not frozen", () => {
+    const mockServer = {
+      name: "install name",
+      id: "123e4567-e89b-12d3-a456-426614174000",
+      catalogId: "aaaabbbb-e89b-12d3-a456-426614174000",
+      deploymentName: null,
+      // biome-ignore lint/suspicious/noExplicitAny: Minimal mock for testing
+    } as any;
+    const mockCatalog = {
+      multitenant: true,
+      name: "Shared Catalog",
+      deploymentName: null,
+      // biome-ignore lint/suspicious/noExplicitAny: Minimal mock for testing
+    } as any;
+
+    expect(K8sDeployment.constructDeploymentName(mockServer, mockCatalog)).toBe(
+      "mcp-mt-aaaabbbb-shared-catalog",
+    );
+  });
 });
 
 describe("K8sDeployment.generateDeploymentSpec", () => {
@@ -513,12 +659,13 @@ describe("K8sDeployment.generateDeploymentSpec", () => {
       "mcp-server-name": "test-server",
     });
 
-    // Verify deployment spec
+    // Verify deployment spec. The selector must NOT carry the mutable
+    // mcp-server-name label: selectors are immutable, so pod identity keys
+    // on `app` + the stable id only (renames stay pure DB operations).
     expect(deploymentSpec.spec?.replicas).toBe(1);
     expect(deploymentSpec.spec?.selector.matchLabels).toEqual({
       app: "mcp-server",
       "mcp-server-id": "test-server-id",
-      "mcp-server-name": "test-server",
     });
 
     // Verify pod template spec
@@ -527,11 +674,15 @@ describe("K8sDeployment.generateDeploymentSpec", () => {
     const container = templateSpec?.containers[0];
     expect(container?.name).toBe("mcp-server");
     expect(container?.image).toBe(dockerImage);
+    expect(container?.imagePullPolicy).toBe("Never");
     expect(container?.command).toEqual(["node"]);
     expect(container?.args).toEqual(["server.js"]);
     expect(container?.stdin).toBe(true);
     expect(container?.tty).toBe(false);
     expect(container?.ports).toBeUndefined();
+    expect(container?.startupProbe).toBeUndefined();
+    expect(container?.readinessProbe).toBeUndefined();
+    expect(container?.livenessProbe).toBeUndefined();
     expect(templateSpec?.enableServiceLinks).toBe(false);
     expect(templateSpec?.restartPolicy).toBe("Always");
   });
@@ -570,6 +721,25 @@ describe("K8sDeployment.generateDeploymentSpec", () => {
         protocol: "TCP",
       },
     ]);
+    expect(container?.startupProbe).toEqual({
+      tcpSocket: { port: 3000 },
+      periodSeconds: 2,
+      timeoutSeconds: 1,
+      failureThreshold: 60,
+    });
+    expect(container?.readinessProbe).toEqual({
+      tcpSocket: { port: 3000 },
+      periodSeconds: 2,
+      timeoutSeconds: 1,
+      failureThreshold: 2,
+      successThreshold: 1,
+    });
+    expect(container?.livenessProbe).toEqual({
+      tcpSocket: { port: 3000 },
+      periodSeconds: 30,
+      timeoutSeconds: 1,
+      failureThreshold: 3,
+    });
   });
 
   test("generates deploymentSpec without command when no command is provided", () => {
@@ -742,6 +912,114 @@ describe("K8sDeployment.generateDeploymentSpec", () => {
 
     const container = deploymentSpec.spec?.template.spec?.containers[0];
     expect(container?.image).toBe("ghcr.io/my-org/custom-mcp-server:v2.1.0");
+    expect(container?.imagePullPolicy).toBe("IfNotPresent");
+  });
+
+  describe("container image availability", () => {
+    const registryImage = "ghcr.io/my-org/custom-mcp-server:v2.1.0";
+
+    function pullPolicyOf(deployment: K8sDeployment, image: string) {
+      return deployment.generateDeploymentSpec(
+        image,
+        { command: "node" },
+        false,
+        8080,
+      ).spec?.template.spec?.containers[0]?.imagePullPolicy;
+    }
+
+    function makeDeployment(): K8sDeployment {
+      return createMockK8sDeployment({
+        id: "image-availability-id",
+        name: "image-availability-server",
+        catalogId: null,
+        // biome-ignore lint/suspicious/noExplicitAny: Mock data for testing
+      } as any);
+    }
+
+    test("a fresh-pull request applies to exactly one generated spec", () => {
+      const k8sDeployment = makeDeployment();
+
+      expect(pullPolicyOf(k8sDeployment, registryImage)).toBe("IfNotPresent");
+
+      k8sDeployment.requestFreshImagePull();
+      expect(pullPolicyOf(k8sDeployment, registryImage)).toBe("Always");
+
+      // A refresh must not permanently re-arm the registry dependency: the
+      // next ordinary regeneration is back to the cache-tolerant policy, so a
+      // later wake can still start from the image already on the node.
+      expect(pullPolicyOf(k8sDeployment, registryImage)).toBe("IfNotPresent");
+    });
+
+    test("a fresh-pull request never makes a bare local image pullable", () => {
+      const k8sDeployment = makeDeployment();
+
+      k8sDeployment.requestFreshImagePull();
+      expect(pullPolicyOf(k8sDeployment, "locally-built-image:latest")).toBe(
+        "Never",
+      );
+    });
+
+    // `:latest` moves, so a restart must ask the registry what it points at
+    // now instead of reusing the node's copy.
+    test("a :latest registry image pulls on every rollout", () => {
+      const k8sDeployment = makeDeployment();
+
+      expect(
+        pullPolicyOf(k8sDeployment, "ghcr.io/my-org/custom-mcp-server:latest"),
+      ).toBe("Always");
+    });
+
+    test("the catalog's pull policy setting overrides the image default", () => {
+      const k8sDeployment = makeDeployment();
+
+      const policy = k8sDeployment.generateDeploymentSpec(
+        "ghcr.io/my-org/custom-mcp-server:latest",
+        { command: "node", imagePullPolicy: "IfNotPresent" },
+        false,
+        8080,
+      ).spec?.template.spec?.containers[0]?.imagePullPolicy;
+
+      expect(policy).toBe("IfNotPresent");
+    });
+  });
+
+  test("generates deploymentSpec with resource governance (memory limit + ephemeral-storage request/limit)", () => {
+    const mcpServer: McpServer = {
+      id: "resources-id",
+      name: "resources-server",
+      catalogId: "catalog-resources",
+      // biome-ignore lint/suspicious/noExplicitAny: Mock data for testing
+    } as any;
+
+    const k8sDeployment = createMockK8sDeployment(mcpServer);
+
+    const deploymentSpec = k8sDeployment.generateDeploymentSpec(
+      "test:latest",
+      { command: "node" },
+      false,
+      8080,
+    );
+
+    // Without ephemeral-storage requests the scheduler is blind to disk and
+    // over-packs nodes until DiskPressure eviction cascades; without limits a
+    // single runaway server can take down the whole node.
+    const resources =
+      deploymentSpec.spec?.template.spec?.containers[0]?.resources;
+    expect(resources?.requests).toEqual({
+      memory: config.orchestrator.mcpServerResources.requests.memory,
+      cpu: config.orchestrator.mcpServerResources.requests.cpu,
+      "ephemeral-storage":
+        config.orchestrator.mcpServerResources.requests.ephemeralStorage,
+    });
+    expect(resources?.limits).toEqual({
+      memory: config.orchestrator.mcpServerResources.limits.memory,
+      "ephemeral-storage":
+        config.orchestrator.mcpServerResources.limits.ephemeralStorage,
+    });
+    // Defaults are non-empty valid quantities
+    expect(resources?.requests?.["ephemeral-storage"]).toBe("256Mi");
+    expect(resources?.limits?.memory).toBe("512Mi");
+    expect(resources?.limits?.["ephemeral-storage"]).toBe("1Gi");
   });
 
   test("generates deploymentSpec with empty arguments array when not provided", () => {
@@ -2444,6 +2722,43 @@ spec:
     });
   }
 
+  test("fills missing TCP probes for custom HTTP YAML and preserves explicit probes", () => {
+    const deployment = createK8sDeploymentWithYaml(`
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: mcp-server
+          image: test:latest
+          readinessProbe:
+            tcpSocket:
+              port: 9191
+            periodSeconds: 7
+`);
+
+    const spec = deployment.generateDeploymentSpec(
+      "test:latest",
+      {
+        command: "node",
+        arguments: ["server.js"],
+        transportType: "streamable-http",
+        httpPort: 9191,
+      },
+      true,
+      9191,
+    );
+    const container = spec.spec?.template.spec?.containers[0];
+
+    expect(container?.readinessProbe).toEqual({
+      tcpSocket: { port: 9191 },
+      periodSeconds: 7,
+    });
+    expect(container?.startupProbe?.tcpSocket).toEqual({ port: 9191 });
+    expect(container?.livenessProbe?.tcpSocket).toEqual({ port: 9191 });
+  });
+
   test("applies platform nodeSelector when YAML has none", () => {
     const k8sDeployment = createK8sDeploymentWithYaml(minimalYaml);
 
@@ -2464,6 +2779,98 @@ spec:
       "karpenter.sh/nodepool": "general-purpose",
     });
   });
+
+  test("falls back to an isolated generated pod when custom YAML requests restricted fields", () => {
+    const deployment = createK8sDeploymentWithYaml(`
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/component: platform
+spec:
+  template:
+    spec:
+      serviceAccountName: platform-control-plane
+      hostPID: true
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+      containers:
+        - name: mcp-server
+          image: test:latest
+          securityContext:
+            privileged: true
+`);
+
+    const spec = deployment.generateDeploymentSpec(
+      "test:latest",
+      { command: "node", arguments: ["server.js"] },
+      false,
+      8080,
+    );
+    const podSpec = spec.spec?.template.spec;
+
+    expect(podSpec?.serviceAccountName).toBeUndefined();
+    expect(podSpec?.hostPID).toBeUndefined();
+    expect(podSpec?.volumes).toBeUndefined();
+    expect(podSpec?.containers[0]?.securityContext).toBeUndefined();
+    expect(spec.metadata?.labels).not.toHaveProperty(
+      "app.kubernetes.io/component",
+    );
+  });
+
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  test("strips reserved hibernation annotations from custom YAML", () => {
+    const deployment = createK8sDeploymentWithYaml(`
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    archestra.io/hibernated: "true"
+    archestra.io/pre-hibernation-replicas: "9"
+    archestra.io/foreign-replica-owner: "true"
+    example.com/keep: "yes"
+spec:
+  template:
+    metadata:
+      annotations:
+        archestra.io/hibernated: "true"
+        archestra.io/pre-hibernation-replicas: "9"
+        archestra.io/foreign-replica-owner: "true"
+        example.com/keep: "yes"
+    spec:
+      containers:
+        - name: mcp-server
+          image: test:latest
+`);
+
+    const spec = deployment.generateDeploymentSpec(
+      "test:latest",
+      { command: "node", arguments: ["server.js"] },
+      false,
+      8080,
+      null,
+      null,
+    );
+
+    for (const annotations of [
+      spec.metadata?.annotations,
+      spec.spec?.template.metadata?.annotations,
+    ]) {
+      expect(annotations?.[MCP_HIBERNATED_ANNOTATION]).toBeUndefined();
+      expect(
+        annotations?.[MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION],
+      ).toBeUndefined();
+      expect(
+        annotations?.[MCP_FOREIGN_REPLICA_OWNER_ANNOTATION],
+      ).toBeUndefined();
+      expect(annotations?.["example.com/keep"]).toBe("yes");
+    }
+  });
+  // SPDX-SnippetEnd
 
   test("merges platform nodeSelector with YAML nodeSelector (platform wins on conflict)", () => {
     const k8sDeployment = createK8sDeploymentWithYaml(minimalYaml, {
@@ -2800,6 +3207,83 @@ spec:
       { secretRef: { name: "existing-yaml-secret" } },
       { secretRef: { name: "from-local-config" } },
     ]);
+  });
+
+  describe("imagePullPolicy", () => {
+    const registryImage = "ghcr.io/my-org/custom-mcp-server:v2.1.0";
+
+    function yamlWith(imagePullPolicy?: string) {
+      return `
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: mcp-server
+          image: ${registryImage}
+${imagePullPolicy ? `          imagePullPolicy: ${imagePullPolicy}\n` : ""}          command: ["node"]
+          args: ["server.js"]
+`;
+    }
+
+    function pullPolicyOf(deployment: K8sDeployment) {
+      return deployment.generateDeploymentSpec(
+        registryImage,
+        { command: "node", arguments: ["server.js"] },
+        false,
+        8080,
+      ).spec?.template.spec?.containers[0]?.imagePullPolicy;
+    }
+
+    // Advanced YAML is the escape hatch for a pod spec the platform would not
+    // generate, so silently rewriting a field the operator wrote would make
+    // the escape hatch untrustworthy.
+    test.each([
+      "Always",
+      "IfNotPresent",
+      "Never",
+    ])("keeps the value the YAML author wrote (%s)", (yamlPolicy) => {
+      const deployment = createK8sDeploymentWithYaml(yamlWith(yamlPolicy));
+
+      expect(pullPolicyOf(deployment)).toBe(yamlPolicy);
+    });
+
+    test("fills in the steady-state policy when the YAML omits it", () => {
+      const deployment = createK8sDeploymentWithYaml(yamlWith(undefined));
+
+      expect(pullPolicyOf(deployment)).toBe("IfNotPresent");
+    });
+
+    // Advanced YAML is copied once from the generated template and then
+    // frozen, so without this an admin whose copy says `IfNotPresent` has no
+    // way back to a fresh image.
+    test("honours a refresh-image request for exactly one generated spec, then defers again", () => {
+      const deployment = createK8sDeploymentWithYaml(yamlWith("IfNotPresent"));
+
+      deployment.requestFreshImagePull();
+      expect(pullPolicyOf(deployment)).toBe("Always");
+      expect(pullPolicyOf(deployment)).toBe("IfNotPresent");
+    });
+
+    // A saved YAML always spells out a policy because it starts from the
+    // generated template; the catalog setting is the deliberate choice.
+    test("the catalog's pull policy setting wins over the YAML", () => {
+      const deployment = createK8sDeploymentWithYaml(yamlWith("IfNotPresent"));
+
+      const policy = deployment.generateDeploymentSpec(
+        registryImage,
+        {
+          command: "node",
+          arguments: ["server.js"],
+          imagePullPolicy: "Always",
+        },
+        false,
+        8080,
+      ).spec?.template.spec?.containers[0]?.imagePullPolicy;
+
+      expect(policy).toBe("Always");
+    });
   });
 });
 
@@ -3388,6 +3872,166 @@ describe("K8sDeployment.deleteK8sService", () => {
   });
 });
 
+describe("K8sDeployment.createServiceForHttpServer (selector reconciliation)", () => {
+  function createK8sDeploymentWithMockedApi(
+    mockK8sApi: Partial<k8s.CoreV1Api>,
+  ): K8sDeployment {
+    const mockMcpServer = {
+      id: "new-server-id",
+      name: "test-server",
+      catalogId: "test-catalog-id",
+      secretId: null,
+      ownerId: null,
+      reinstallRequired: false,
+      localInstallationStatus: "idle",
+      localInstallationError: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as McpServer;
+
+    return new K8sDeployment({
+      mcpServer: mockMcpServer,
+      k8sApi: mockK8sApi as k8s.CoreV1Api,
+      k8sAppsApi: {} as k8s.AppsV1Api,
+      k8sAttach: {} as Attach,
+      k8sLog: {} as Log,
+      k8sExec: {} as Exec,
+      namespace: "default",
+      catalogItem: null,
+    });
+  }
+
+  type PrivateCreateService = {
+    createServiceForHttpServer: (
+      httpPort: number,
+      nodePort?: number,
+    ) => Promise<void>;
+  };
+
+  // Regression: a service whose selector still targets a stale mcp-server-id
+  // (left over after the server record was recreated with a new id) selects
+  // zero pods and gets no endpoints, so every read/connect fails. An existing
+  // service must be reconciled to the current id, not skipped.
+  test("reconciles an existing service's selector to the current mcp-server-id", async () => {
+    const mockRead = vi.fn().mockResolvedValue({}); // service already exists
+    const mockPatch = vi.fn().mockResolvedValue({});
+    const mockCreate = vi.fn().mockResolvedValue({});
+    const mockK8sApi = {
+      readNamespacedService: mockRead,
+      patchNamespacedService: mockPatch,
+      createNamespacedService: mockCreate,
+    };
+
+    const k8sDeployment = createK8sDeploymentWithMockedApi(mockK8sApi);
+    await (
+      k8sDeployment as unknown as PrivateCreateService
+    ).createServiceForHttpServer(8080);
+
+    expect(mockCreate).not.toHaveBeenCalled();
+    expect(mockPatch).toHaveBeenCalledTimes(1);
+    const patchArg = mockPatch.mock.calls[0][0] as {
+      name: string;
+      namespace: string;
+      body: {
+        metadata: { labels: Record<string, string> };
+        spec: { selector: Record<string, string> };
+      };
+    };
+    expect(patchArg.name).toBe("mcp-test-server-service");
+    expect(patchArg.namespace).toBe("default");
+    expect(patchArg.body.spec.selector["mcp-server-id"]).toBe("new-server-id");
+    expect(patchArg.body.metadata.labels["mcp-server-id"]).toBe(
+      "new-server-id",
+    );
+  });
+
+  test("creates the service when it does not yet exist", async () => {
+    const notFound = { statusCode: 404, message: "Service not found" };
+    const mockRead = vi.fn().mockRejectedValue(notFound);
+    const mockPatch = vi.fn().mockResolvedValue({});
+    const mockCreate = vi.fn().mockResolvedValue({});
+    const mockK8sApi = {
+      readNamespacedService: mockRead,
+      patchNamespacedService: mockPatch,
+      createNamespacedService: mockCreate,
+    };
+
+    const k8sDeployment = createK8sDeploymentWithMockedApi(mockK8sApi);
+    await (
+      k8sDeployment as unknown as PrivateCreateService
+    ).createServiceForHttpServer(8080);
+
+    expect(mockPatch).not.toHaveBeenCalled();
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+    const createArg = mockCreate.mock.calls[0][0] as {
+      body: { spec: { selector: Record<string, string> } };
+    };
+    expect(createArg.body.spec.selector["mcp-server-id"]).toBe("new-server-id");
+  });
+});
+
+describe("K8sDeployment multitenant selector stability", () => {
+  function make(
+    // biome-ignore lint/suspicious/noExplicitAny: minimal catalog mock for tests
+    catalogItem: any,
+  ): K8sDeployment {
+    const mcpServer = {
+      id: "install-abc-123",
+      name: "archestra-pm",
+      catalogId: "cat9999-0000-0000-0000-000000000000",
+      // biome-ignore lint/suspicious/noExplicitAny: mock server for tests
+    } as any as McpServer;
+    return new K8sDeployment({
+      mcpServer,
+      k8sApi: {} as k8s.CoreV1Api,
+      k8sAppsApi: {} as k8s.AppsV1Api,
+      k8sAttach: {} as Attach,
+      k8sLog: {} as Log,
+      k8sExec: {} as Exec,
+      namespace: "default",
+      catalogItem,
+    });
+  }
+  const localConfig: z.infer<typeof LocalConfigSchema> = {
+    command: "node",
+    arguments: ["server.js"],
+  };
+
+  // Multitenant catalogs share ONE catalog-named Deployment + Service across all
+  // installs. If the selector used the per-install id, two installs would fight
+  // over the shared resource and leave the Service with zero endpoints. The
+  // selector must be catalog-stable so every install reconciles to the same one.
+  test("multitenant: deployment selector + pod labels use the catalog id (not the per-install id)", () => {
+    const catalogItem = { multitenant: true, name: "Archestra PM" };
+    const spec = make(catalogItem).generateDeploymentSpec(
+      "img:latest",
+      localConfig,
+      true,
+      8080,
+    );
+    expect(spec.spec?.selector.matchLabels?.["mcp-server-id"]).toBe(
+      "cat9999-0000-0000-0000-000000000000",
+    );
+    expect(spec.spec?.template.metadata?.labels?.["mcp-server-id"]).toBe(
+      "cat9999-0000-0000-0000-000000000000",
+    );
+    // The name is catalog-derived too, so name and selector stay in lockstep.
+    expect(spec.metadata?.name).toContain("mcp-mt-cat9999-");
+  });
+
+  test("single-tenant (no catalog item): selector keeps the per-install id", () => {
+    const spec = make(null).generateDeploymentSpec(
+      "img:latest",
+      localConfig,
+      true,
+      8080,
+    );
+    expect(spec.spec?.selector.matchLabels?.["mcp-server-id"]).toBe(
+      "install-abc-123",
+    );
+  });
+});
+
 describe("K8sDeployment.constructHttpServiceName", () => {
   function createK8sDeploymentForServiceName(
     serverName: string,
@@ -3522,6 +4166,9 @@ describe("K8sDeployment.stopDeployment", () => {
   function createK8sDeploymentWithMockedApis(
     mockK8sApi: Partial<k8s.CoreV1Api>,
     mockK8sAppsApi: Partial<k8s.AppsV1Api>,
+    mockK8sNetworkingApi: Partial<k8s.NetworkingV1Api> = {
+      deleteNamespacedNetworkPolicy: vi.fn().mockResolvedValue({}),
+    },
   ): K8sDeployment {
     const mockMcpServer = {
       id: "test-server-id",
@@ -3540,6 +4187,7 @@ describe("K8sDeployment.stopDeployment", () => {
       mcpServer: mockMcpServer,
       k8sApi: mockK8sApi as k8s.CoreV1Api,
       k8sAppsApi: mockK8sAppsApi as k8s.AppsV1Api,
+      k8sNetworkingApi: mockK8sNetworkingApi as k8s.NetworkingV1Api,
       k8sAttach: {} as Attach,
       k8sLog: {} as Log,
       k8sExec: {} as Exec,
@@ -3561,6 +4209,110 @@ describe("K8sDeployment.stopDeployment", () => {
       name: "mcp-test-server",
       namespace: "default",
     });
+  });
+
+  test("renewal waits for foreground deletion before admitting a replacement", async () => {
+    let deleted = false;
+    let release: (() => void) | undefined;
+    const gone = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const api = {
+      readNamespacedDeployment: vi.fn(async () => {
+        if (!deleted) return { metadata: { uid: "previous-process" } };
+        await gone;
+        throw { statusCode: 404 };
+      }),
+      deleteNamespacedDeployment: vi.fn(async () => {
+        deleted = true;
+        return {};
+      }),
+    };
+    const deployment = createK8sDeploymentWithMockedApis({}, api);
+    let insideMutation = false;
+    let completed = false;
+    const stopping = deployment
+      .stopDeployment({
+        uidPrecondition: true,
+        awaitDeletion: true,
+        assertOwned: async () => {
+          expect(insideMutation).toBe(false);
+        },
+        runFencedMutation: async (mutation) => {
+          insideMutation = true;
+          try {
+            return await mutation();
+          } finally {
+            insideMutation = false;
+          }
+        },
+      })
+      .then(() => {
+        completed = true;
+      });
+    await vi.waitFor(() => expect(deleted).toBe(true));
+    expect(completed).toBe(false);
+    expect(api.deleteNamespacedDeployment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: {
+          preconditions: { uid: "previous-process" },
+          propagationPolicy: "Foreground",
+        },
+      }),
+    );
+    release?.();
+    await stopping;
+    expect(completed).toBe(true);
+  });
+
+  test("UID-preconditioned stop cannot delete a replacement deployment", async () => {
+    const assertOwned = vi.fn().mockResolvedValue(undefined);
+    const mockDeleteDeployment = vi.fn().mockResolvedValue({});
+    const mockK8sAppsApi = {
+      readNamespacedDeployment: vi.fn().mockResolvedValue({
+        metadata: { uid: "original-deployment-uid" },
+      }),
+      deleteNamespacedDeployment: mockDeleteDeployment,
+    };
+    const k8sDeployment = createK8sDeploymentWithMockedApis({}, mockK8sAppsApi);
+
+    await k8sDeployment.stopDeployment({
+      assertOwned,
+      uidPrecondition: true,
+    });
+
+    expect(assertOwned).toHaveBeenCalledTimes(2);
+    expect(mockDeleteDeployment).toHaveBeenCalledWith({
+      name: "mcp-test-server",
+      namespace: "default",
+      body: { preconditions: { uid: "original-deployment-uid" } },
+    });
+  });
+
+  test("UID-preconditioned stop rechecks lease ownership after reading", async () => {
+    const lost = new Error("lease lost");
+    const assertOwned = vi
+      .fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(lost);
+    const mockDeleteDeployment = vi.fn();
+    const k8sDeployment = createK8sDeploymentWithMockedApis(
+      {},
+      {
+        readNamespacedDeployment: vi.fn().mockResolvedValue({
+          metadata: { uid: "stale-deployment-uid" },
+        }),
+        deleteNamespacedDeployment: mockDeleteDeployment,
+      },
+    );
+
+    await expect(
+      k8sDeployment.stopDeployment({
+        assertOwned,
+        uidPrecondition: true,
+      }),
+    ).rejects.toBe(lost);
+    expect(mockDeleteDeployment).not.toHaveBeenCalled();
   });
 
   test("handles 404 error gracefully when deployment does not exist (statusCode)", async () => {
@@ -3602,10 +4354,1445 @@ describe("K8sDeployment.stopDeployment", () => {
   });
 });
 
+describe("K8sDeployment.applyK8sNetworkPolicy", () => {
+  type CustomPolicyObject = {
+    metadata?: {
+      name?: string;
+      resourceVersion?: string;
+      labels?: Record<string, string>;
+      annotations?: Record<string, string>;
+      finalizers?: string[];
+    };
+    spec?: Record<string, unknown>;
+  };
+
+  function makeNetworkPolicyTestServer(): McpServer {
+    return {
+      id: "test-server-id",
+      name: "mcp-test-server",
+      catalogId: "test-catalog-id",
+      secretId: null,
+      ownerId: null,
+      reinstallRequired: false,
+      localInstallationStatus: "idle",
+      localInstallationError: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as McpServer;
+  }
+
+  function makeNetworkPolicy(
+    overrides: Partial<NonNullable<EffectiveNetworkPolicy["policy"]>> = {},
+  ): EffectiveNetworkPolicy {
+    return {
+      source: "environment",
+      policy: {
+        egressMode: "restricted",
+        domainPreset: "none",
+        allowedDomains: [],
+        allowedCidrs: [],
+        ...overrides,
+      },
+    };
+  }
+
+  function makeNetworkPolicyDeployment(params: {
+    networkingApi?: Partial<k8s.NetworkingV1Api>;
+    customObjectsApi?: Partial<k8s.CustomObjectsApi>;
+    coreApi?: Partial<k8s.CoreV1Api>;
+    effectiveNetworkPolicy: EffectiveNetworkPolicy;
+    networkPolicyCapabilities: K8sNetworkPolicyCapabilities;
+    multitenant?: boolean;
+  }): K8sDeployment {
+    return new K8sDeployment({
+      mcpServer: makeNetworkPolicyTestServer(),
+      k8sApi: (params.coreApi ?? {}) as k8s.CoreV1Api,
+      k8sAppsApi: {} as k8s.AppsV1Api,
+      k8sNetworkingApi: params.networkingApi as k8s.NetworkingV1Api,
+      k8sCustomObjectsApi: params.customObjectsApi as k8s.CustomObjectsApi,
+      k8sAttach: {} as Attach,
+      k8sLog: {} as Log,
+      k8sExec: {} as Exec,
+      namespace: "default",
+      catalogItem: params.multitenant
+        ? ({
+            multitenant: true,
+            name: "test-catalog",
+          } as unknown as import("@/types").InternalMcpCatalog)
+        : null,
+      effectiveNetworkPolicy: params.effectiveNetworkPolicy,
+      networkPolicyCapabilities: params.networkPolicyCapabilities,
+    });
+  }
+
+  function makeStatefulNetworkingApi(
+    initialPolicies: k8s.V1NetworkPolicy[] = [],
+  ): {
+    api: Partial<k8s.NetworkingV1Api>;
+    policies: Map<string, k8s.V1NetworkPolicy>;
+  } {
+    const policies = new Map(
+      initialPolicies.map((policy) => [policy.metadata?.name ?? "", policy]),
+    );
+
+    const api = {
+      createNamespacedNetworkPolicy: vi.fn(
+        async ({ body }: { body: k8s.V1NetworkPolicy }) => {
+          const name = body.metadata?.name;
+          if (!name) throw new Error("NetworkPolicy name is required");
+          if (policies.has(name)) throw { statusCode: 409 };
+          policies.set(name, structuredClone(body));
+          return {};
+        },
+      ),
+      replaceNamespacedNetworkPolicy: vi.fn(
+        async ({ name, body }: { name: string; body: k8s.V1NetworkPolicy }) => {
+          if (!policies.has(name)) throw { statusCode: 404 };
+          policies.set(name, structuredClone(body));
+          return {};
+        },
+      ),
+      listNamespacedNetworkPolicy: vi.fn(
+        async ({ labelSelector }: { labelSelector?: string }) => ({
+          items: [...policies.values()].filter((policy) =>
+            hasLabels(policy.metadata?.labels, labelSelector),
+          ),
+        }),
+      ),
+      deleteNamespacedNetworkPolicy: vi.fn(
+        async ({ name }: { name: string }) => {
+          if (!policies.delete(name)) throw { statusCode: 404 };
+          return {};
+        },
+      ),
+    };
+
+    return { api, policies };
+  }
+
+  function makeStatefulCustomObjectsApi(params: {
+    resource: {
+      group: string;
+      version: string;
+      plural: string;
+    };
+    initialPolicies?: CustomPolicyObject[];
+  }): {
+    api: Partial<k8s.CustomObjectsApi>;
+    policies: Map<string, CustomPolicyObject>;
+  } {
+    const policies = new Map(
+      (params.initialPolicies ?? []).map((policy) => [
+        policy.metadata?.name ?? "",
+        policy,
+      ]),
+    );
+
+    const api = {
+      createNamespacedCustomObject: vi.fn(
+        async ({ body }: { body: CustomPolicyObject }) => {
+          const name = body.metadata?.name;
+          if (!name) throw new Error("Custom policy name is required");
+          if (policies.has(name)) throw { statusCode: 409 };
+          policies.set(name, structuredClone(body));
+          return {};
+        },
+      ),
+      patchNamespacedCustomObject: vi.fn(
+        async ({ name, body }: { name: string; body: CustomPolicyObject }) => {
+          const existing = policies.get(name);
+          if (!existing) throw { statusCode: 404 };
+          policies.set(
+            name,
+            applyJsonMergePatch(existing, body) as CustomPolicyObject,
+          );
+          return {};
+        },
+      ),
+      getNamespacedCustomObject: vi.fn(async ({ name }: { name: string }) => {
+        const existing = policies.get(name);
+        if (!existing) throw { statusCode: 404 };
+        return structuredClone(existing);
+      }),
+      replaceNamespacedCustomObject: vi.fn(
+        async ({ name, body }: { name: string; body: CustomPolicyObject }) => {
+          if (!policies.has(name)) throw { statusCode: 404 };
+          // Full replace: store the body wholesale, so keys absent from it
+          // (a stale selector label) are dropped — unlike merge-patch.
+          policies.set(name, structuredClone(body));
+          return {};
+        },
+      ),
+      listNamespacedCustomObject: vi.fn(
+        async ({
+          group,
+          version,
+          plural,
+          labelSelector,
+        }: {
+          group: string;
+          version: string;
+          plural: string;
+          labelSelector?: string;
+        }) => {
+          if (
+            group !== params.resource.group ||
+            version !== params.resource.version ||
+            plural !== params.resource.plural
+          ) {
+            return { items: [] };
+          }
+
+          return {
+            items: [...policies.values()].filter((policy) =>
+              hasLabels(policy.metadata?.labels, labelSelector),
+            ),
+          };
+        },
+      ),
+      deleteNamespacedCustomObject: vi.fn(
+        async ({
+          group,
+          version,
+          plural,
+          name,
+        }: {
+          group: string;
+          version: string;
+          plural: string;
+          name: string;
+        }) => {
+          if (
+            group !== params.resource.group ||
+            version !== params.resource.version ||
+            plural !== params.resource.plural
+          ) {
+            throw { statusCode: 404 };
+          }
+          if (!policies.delete(name)) throw { statusCode: 404 };
+          return {};
+        },
+      ),
+    };
+
+    return { api, policies };
+  }
+
+  /** RFC 7386 JSON merge patch: objects merge recursively, everything else replaces. */
+  function applyJsonMergePatch(target: unknown, patch: unknown): unknown {
+    if (
+      patch === null ||
+      typeof patch !== "object" ||
+      Array.isArray(patch) ||
+      target === null ||
+      typeof target !== "object" ||
+      Array.isArray(target)
+    ) {
+      return structuredClone(patch);
+    }
+    const result: Record<string, unknown> = {
+      ...(target as Record<string, unknown>),
+    };
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === null) {
+        delete result[key];
+      } else {
+        result[key] = applyJsonMergePatch(result[key], value);
+      }
+    }
+    return result;
+  }
+
+  function hasLabels(
+    labels: Record<string, string> | undefined,
+    selector: string | undefined,
+  ): boolean {
+    if (!selector) return true;
+    if (!labels) return false;
+    return selector.split(",").every((part) => {
+      const [key, value] = part.split("=");
+      return labels[key] === value;
+    });
+  }
+
+  test("creates CiliumNetworkPolicy and removes Kubernetes NetworkPolicy when FQDN rules are available", async () => {
+    const createNamespacedCustomObject = vi.fn().mockResolvedValue({});
+    const deleteNamespacedCustomObject = vi
+      .fn()
+      .mockRejectedValue({ statusCode: 404 });
+    const createNamespacedNetworkPolicy = vi.fn().mockResolvedValue({});
+    const deleteNamespacedNetworkPolicy = vi.fn().mockResolvedValue({});
+
+    const deployment = new K8sDeployment({
+      mcpServer: makeNetworkPolicyTestServer(),
+      k8sApi: {} as k8s.CoreV1Api,
+      k8sAppsApi: {} as k8s.AppsV1Api,
+      k8sNetworkingApi: {
+        createNamespacedNetworkPolicy,
+        deleteNamespacedNetworkPolicy,
+      } as unknown as k8s.NetworkingV1Api,
+      k8sCustomObjectsApi: {
+        createNamespacedCustomObject,
+        deleteNamespacedCustomObject,
+      } as unknown as k8s.CustomObjectsApi,
+      k8sAttach: {} as Attach,
+      k8sLog: {} as Log,
+      k8sExec: {} as Exec,
+      namespace: "default",
+      catalogItem: null,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedDomains: ["api.example.com"],
+      }),
+      networkPolicyCapabilities: {
+        kubernetesNetworkPolicy: true,
+        ciliumNetworkPolicy: true,
+        gkeFqdnNetworkPolicy: false,
+        awsApplicationNetworkPolicy: false,
+        provider: "cilium",
+        supportsFqdn: true,
+        supportsHttpMethods: false,
+        message: null,
+        enforcementSource: "api-discovery",
+        enforcementStatus: "unknown",
+        probe: "absent",
+        probedAt: null,
+      },
+    });
+
+    await deployment.applyK8sNetworkPolicy();
+
+    expect(createNamespacedCustomObject).toHaveBeenCalledWith(
+      expect.objectContaining({
+        group: "cilium.io",
+        version: "v2",
+        namespace: "default",
+        plural: "ciliumnetworkpolicies",
+      }),
+    );
+    expect(createNamespacedNetworkPolicy).not.toHaveBeenCalled();
+    expect(deleteNamespacedNetworkPolicy).toHaveBeenCalledWith({
+      name: "mcp-egress-mcp-mcp-test-server",
+      namespace: "default",
+    });
+  });
+
+  test("creates Kubernetes NetworkPolicy for CIDR-only restricted policies", async () => {
+    const createNamespacedCustomObject = vi.fn().mockResolvedValue({});
+    const deleteNamespacedCustomObject = vi
+      .fn()
+      .mockRejectedValue({ statusCode: 404 });
+    const createNamespacedNetworkPolicy = vi.fn().mockResolvedValue({});
+
+    const deployment = new K8sDeployment({
+      mcpServer: makeNetworkPolicyTestServer(),
+      k8sApi: {} as k8s.CoreV1Api,
+      k8sAppsApi: {} as k8s.AppsV1Api,
+      k8sNetworkingApi: {
+        createNamespacedNetworkPolicy,
+        deleteNamespacedNetworkPolicy: vi.fn().mockRejectedValue({
+          statusCode: 404,
+        }),
+      } as unknown as k8s.NetworkingV1Api,
+      k8sCustomObjectsApi: {
+        createNamespacedCustomObject,
+        deleteNamespacedCustomObject,
+      } as unknown as k8s.CustomObjectsApi,
+      k8sAttach: {} as Attach,
+      k8sLog: {} as Log,
+      k8sExec: {} as Exec,
+      namespace: "default",
+      catalogItem: null,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedCidrs: ["203.0.113.0/24"],
+      }),
+      networkPolicyCapabilities: {
+        kubernetesNetworkPolicy: true,
+        ciliumNetworkPolicy: false,
+        gkeFqdnNetworkPolicy: false,
+        awsApplicationNetworkPolicy: false,
+        provider: "kubernetes",
+        supportsFqdn: false,
+        supportsHttpMethods: false,
+        message: null,
+        enforcementSource: "api-discovery",
+        enforcementStatus: "unknown",
+        probe: "absent",
+        probedAt: null,
+      },
+    });
+
+    await deployment.applyK8sNetworkPolicy();
+
+    expect(createNamespacedNetworkPolicy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        namespace: "default",
+        body: expect.objectContaining({
+          kind: "NetworkPolicy",
+        }),
+      }),
+    );
+    expect(createNamespacedCustomObject).not.toHaveBeenCalled();
+  });
+
+  test("throws a clear error when applying without the K8s networking API", async () => {
+    const deployment = new K8sDeployment({
+      mcpServer: makeNetworkPolicyTestServer(),
+      k8sApi: {} as k8s.CoreV1Api,
+      k8sAppsApi: {} as k8s.AppsV1Api,
+      k8sAttach: {} as Attach,
+      k8sLog: {} as Log,
+      k8sExec: {} as Exec,
+      namespace: "default",
+      catalogItem: null,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedCidrs: ["203.0.113.0/24"],
+      }),
+      networkPolicyCapabilities: {
+        kubernetesNetworkPolicy: true,
+        ciliumNetworkPolicy: false,
+        gkeFqdnNetworkPolicy: false,
+        awsApplicationNetworkPolicy: false,
+        provider: "kubernetes",
+        supportsFqdn: false,
+        supportsHttpMethods: false,
+        message: null,
+        enforcementSource: "api-discovery",
+        enforcementStatus: "unknown",
+        probe: "absent",
+        probedAt: null,
+      },
+    });
+
+    await expect(deployment.applyK8sNetworkPolicy()).rejects.toThrow(
+      "Cannot apply network policy: K8s networking API not available",
+    );
+  });
+
+  test("throws a clear error when applying FQDN policy without the K8s custom objects API", async () => {
+    const deployment = new K8sDeployment({
+      mcpServer: makeNetworkPolicyTestServer(),
+      k8sApi: {} as k8s.CoreV1Api,
+      k8sAppsApi: {} as k8s.AppsV1Api,
+      k8sNetworkingApi: {
+        createNamespacedNetworkPolicy: vi.fn().mockResolvedValue({}),
+        deleteNamespacedNetworkPolicy: vi.fn().mockRejectedValue({
+          statusCode: 404,
+        }),
+      } as unknown as k8s.NetworkingV1Api,
+      k8sAttach: {} as Attach,
+      k8sLog: {} as Log,
+      k8sExec: {} as Exec,
+      namespace: "default",
+      catalogItem: null,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedDomains: ["api.example.com"],
+      }),
+      networkPolicyCapabilities: {
+        kubernetesNetworkPolicy: true,
+        ciliumNetworkPolicy: true,
+        gkeFqdnNetworkPolicy: false,
+        awsApplicationNetworkPolicy: false,
+        provider: "cilium",
+        supportsFqdn: true,
+        supportsHttpMethods: false,
+        message: null,
+        enforcementSource: "api-discovery",
+        enforcementStatus: "unknown",
+        probe: "absent",
+        probedAt: null,
+      },
+    });
+
+    await expect(deployment.applyK8sNetworkPolicy()).rejects.toThrow(
+      "Cannot apply network policy: K8s custom objects API not available",
+    );
+  });
+
+  test("creates GKE FQDNNetworkPolicy alongside Kubernetes NetworkPolicy when GKE FQDN rules are available", async () => {
+    const createNamespacedCustomObject = vi.fn().mockResolvedValue({});
+    const deleteNamespacedCustomObject = vi
+      .fn()
+      .mockRejectedValue({ statusCode: 404 });
+    const createNamespacedNetworkPolicy = vi.fn().mockResolvedValue({});
+
+    const deployment = new K8sDeployment({
+      mcpServer: makeNetworkPolicyTestServer(),
+      k8sApi: {} as k8s.CoreV1Api,
+      k8sAppsApi: {} as k8s.AppsV1Api,
+      k8sNetworkingApi: {
+        createNamespacedNetworkPolicy,
+        deleteNamespacedNetworkPolicy: vi.fn().mockRejectedValue({
+          statusCode: 404,
+        }),
+      } as unknown as k8s.NetworkingV1Api,
+      k8sCustomObjectsApi: {
+        createNamespacedCustomObject,
+        deleteNamespacedCustomObject,
+      } as unknown as k8s.CustomObjectsApi,
+      k8sAttach: {} as Attach,
+      k8sLog: {} as Log,
+      k8sExec: {} as Exec,
+      namespace: "default",
+      catalogItem: null,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedDomains: ["api.example.com"],
+      }),
+      networkPolicyCapabilities: {
+        kubernetesNetworkPolicy: true,
+        ciliumNetworkPolicy: false,
+        gkeFqdnNetworkPolicy: true,
+        awsApplicationNetworkPolicy: false,
+        provider: "gke-fqdn",
+        supportsFqdn: true,
+        supportsHttpMethods: false,
+        message: null,
+        enforcementSource: "api-discovery",
+        enforcementStatus: "unknown",
+        probe: "absent",
+        probedAt: null,
+      },
+    });
+
+    await deployment.applyK8sNetworkPolicy();
+
+    expect(createNamespacedNetworkPolicy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        namespace: "default",
+        body: expect.objectContaining({
+          kind: "NetworkPolicy",
+        }),
+      }),
+    );
+    expect(createNamespacedCustomObject).toHaveBeenCalledWith(
+      expect.objectContaining({
+        group: "networking.gke.io",
+        version: "v1alpha1",
+        namespace: "default",
+        plural: "fqdnnetworkpolicies",
+      }),
+    );
+  });
+
+  test("creates AWS ApplicationNetworkPolicy and removes Kubernetes NetworkPolicy when EKS Auto Mode FQDN rules are available", async () => {
+    const createNamespacedCustomObject = vi.fn().mockResolvedValue({});
+    const deleteNamespacedCustomObject = vi
+      .fn()
+      .mockRejectedValue({ statusCode: 404 });
+    const createNamespacedNetworkPolicy = vi.fn().mockResolvedValue({});
+    const deleteNamespacedNetworkPolicy = vi.fn().mockResolvedValue({});
+
+    const deployment = new K8sDeployment({
+      mcpServer: makeNetworkPolicyTestServer(),
+      k8sApi: {} as k8s.CoreV1Api,
+      k8sAppsApi: {} as k8s.AppsV1Api,
+      k8sNetworkingApi: {
+        createNamespacedNetworkPolicy,
+        deleteNamespacedNetworkPolicy,
+      } as unknown as k8s.NetworkingV1Api,
+      k8sCustomObjectsApi: {
+        createNamespacedCustomObject,
+        deleteNamespacedCustomObject,
+      } as unknown as k8s.CustomObjectsApi,
+      k8sAttach: {} as Attach,
+      k8sLog: {} as Log,
+      k8sExec: {} as Exec,
+      namespace: "default",
+      catalogItem: null,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedDomains: ["api.example.com"],
+      }),
+      networkPolicyCapabilities: {
+        kubernetesNetworkPolicy: true,
+        ciliumNetworkPolicy: false,
+        gkeFqdnNetworkPolicy: false,
+        awsApplicationNetworkPolicy: true,
+        provider: "aws-application-network-policy",
+        supportsFqdn: true,
+        supportsHttpMethods: false,
+        message: null,
+        enforcementSource: "api-discovery",
+        enforcementStatus: "unknown",
+        probe: "absent",
+        probedAt: null,
+      },
+    });
+
+    await deployment.applyK8sNetworkPolicy();
+
+    expect(createNamespacedCustomObject).toHaveBeenCalledWith(
+      expect.objectContaining({
+        group: "networking.k8s.aws",
+        version: "v1alpha1",
+        namespace: "default",
+        plural: "applicationnetworkpolicies",
+        body: expect.objectContaining({
+          kind: "ApplicationNetworkPolicy",
+        }),
+      }),
+    );
+    expect(createNamespacedNetworkPolicy).not.toHaveBeenCalled();
+    expect(deleteNamespacedNetworkPolicy).toHaveBeenCalledWith({
+      name: "mcp-egress-mcp-mcp-test-server",
+      namespace: "default",
+    });
+  });
+
+  test("updates an existing Kubernetes NetworkPolicy and cleans up stale duplicate managed policies", async () => {
+    const policyName = "mcp-egress-mcp-mcp-test-server";
+    const { api, policies } = makeStatefulNetworkingApi();
+    const capabilities: K8sNetworkPolicyCapabilities = {
+      kubernetesNetworkPolicy: true,
+      ciliumNetworkPolicy: false,
+      gkeFqdnNetworkPolicy: false,
+      awsApplicationNetworkPolicy: false,
+      provider: "kubernetes" as const,
+      supportsFqdn: false,
+      supportsHttpMethods: false,
+      message: null,
+      enforcementSource: "api-discovery",
+      enforcementStatus: "unknown",
+      probe: "absent",
+      probedAt: null,
+    };
+
+    await makeNetworkPolicyDeployment({
+      networkingApi: api,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedCidrs: ["203.0.113.0/24"],
+      }),
+      networkPolicyCapabilities: capabilities,
+    }).applyK8sNetworkPolicy();
+
+    const stalePolicy = structuredClone(policies.get(policyName));
+    expect(stalePolicy).toBeDefined();
+    if (!stalePolicy?.metadata) throw new Error("expected policy metadata");
+    stalePolicy.metadata.name = "mcp-egress-generated-stale";
+    policies.set(stalePolicy.metadata.name, stalePolicy);
+
+    await makeNetworkPolicyDeployment({
+      networkingApi: api,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedCidrs: ["198.51.100.0/24"],
+      }),
+      networkPolicyCapabilities: capabilities,
+    }).applyK8sNetworkPolicy();
+
+    expect([...policies.keys()]).toEqual([policyName]);
+    expect(api.replaceNamespacedNetworkPolicy).toHaveBeenCalledTimes(1);
+    expect(api.deleteNamespacedNetworkPolicy).toHaveBeenCalledWith({
+      name: "mcp-egress-generated-stale",
+      namespace: "default",
+    });
+    expect(
+      policies.get(policyName)?.metadata?.annotations?.[
+        "archestra.io/network-policy-allowed-cidrs"
+      ],
+    ).toBe("198.51.100.0/24");
+  });
+
+  test("updates an existing AWS ApplicationNetworkPolicy in place and cleans up stale duplicate managed policies", async () => {
+    const policyName = "mcp-egress-mcp-mcp-test-server";
+    const { api: networkingApi } = makeStatefulNetworkingApi();
+    const { api: customObjectsApi, policies } = makeStatefulCustomObjectsApi({
+      resource: {
+        group: "networking.k8s.aws",
+        version: "v1alpha1",
+        plural: "applicationnetworkpolicies",
+      },
+    });
+    const coreApi = {
+      readNamespacedService: vi.fn(async () => ({
+        spec: { clusterIP: "172.20.0.10", clusterIPs: ["172.20.0.10"] },
+      })),
+    };
+    const capabilities: K8sNetworkPolicyCapabilities = {
+      kubernetesNetworkPolicy: true,
+      ciliumNetworkPolicy: false,
+      gkeFqdnNetworkPolicy: false,
+      awsApplicationNetworkPolicy: true,
+      provider: "aws-application-network-policy" as const,
+      supportsFqdn: true,
+      supportsHttpMethods: false,
+      message: null,
+      enforcementSource: "api-discovery",
+      enforcementStatus: "unknown",
+      probe: "absent",
+      probedAt: null,
+    };
+
+    await makeNetworkPolicyDeployment({
+      networkingApi,
+      customObjectsApi,
+      coreApi: coreApi as unknown as Partial<k8s.CoreV1Api>,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedDomains: ["api.example.com"],
+      }),
+      networkPolicyCapabilities: capabilities,
+    }).applyK8sNetworkPolicy();
+
+    // Simulate a policy generated by an older release (no DNS bootstrap rule,
+    // one domainNames entry per rule, plus a controller-owned finalizer).
+    const existingPolicy = policies.get(policyName);
+    expect(existingPolicy).toBeDefined();
+    if (!existingPolicy?.metadata) throw new Error("expected policy metadata");
+    existingPolicy.metadata.finalizers = ["networking.k8s.aws/anp-resources"];
+    (existingPolicy as { spec?: Record<string, unknown> }).spec = {
+      podSelector: existingPolicy.spec?.podSelector,
+      policyTypes: ["Egress"],
+      egress: [{ to: [{ domainNames: ["api.example.com"] }] }],
+    };
+
+    const stalePolicy = structuredClone(policies.get(policyName));
+    expect(stalePolicy).toBeDefined();
+    if (!stalePolicy?.metadata) throw new Error("expected policy metadata");
+    stalePolicy.metadata.name = "mcp-egress-generated-stale";
+    policies.set(stalePolicy.metadata.name, stalePolicy);
+
+    await makeNetworkPolicyDeployment({
+      networkingApi,
+      customObjectsApi,
+      coreApi: coreApi as unknown as Partial<k8s.CoreV1Api>,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedDomains: ["api.example.com", "cdn.example.com"],
+      }),
+      networkPolicyCapabilities: capabilities,
+    }).applyK8sNetworkPolicy();
+
+    expect([...policies.keys()]).toEqual([policyName]);
+    expect(
+      customObjectsApi.replaceNamespacedCustomObject,
+    ).toHaveBeenCalledTimes(1);
+    expect(customObjectsApi.patchNamespacedCustomObject).not.toHaveBeenCalled();
+    expect(customObjectsApi.deleteNamespacedCustomObject).toHaveBeenCalledWith({
+      group: "networking.k8s.aws",
+      version: "v1alpha1",
+      namespace: "default",
+      plural: "applicationnetworkpolicies",
+      name: "mcp-egress-generated-stale",
+    });
+
+    const updatedPolicy = policies.get(policyName);
+    expect(updatedPolicy?.metadata?.annotations).toMatchObject({
+      "archestra.io/network-policy-allowed-domains":
+        "api.example.com,cdn.example.com",
+      "archestra.io/network-policy-cluster-dns": "172.20.0.10",
+    });
+    // The improper egress rules are rewritten with the DNS bootstrap rule and
+    // a single consolidated domainNames list, without touching the finalizer.
+    expect(
+      (updatedPolicy as { spec?: { egress?: unknown } }).spec?.egress,
+    ).toEqual([
+      {
+        to: [{ ipBlock: { cidr: "172.20.0.10/32" } }],
+        ports: [
+          { protocol: "UDP", port: 53 },
+          { protocol: "TCP", port: 53 },
+        ],
+      },
+      { to: [{ domainNames: ["api.example.com", "cdn.example.com"] }] },
+    ]);
+    expect(updatedPolicy?.metadata?.finalizers).toEqual([
+      "networking.k8s.aws/anp-resources",
+    ]);
+  });
+
+  test("updates an existing CiliumNetworkPolicy and cleans up stale duplicate managed policies", async () => {
+    const policyName = "mcp-egress-mcp-mcp-test-server";
+    const { api: networkingApi } = makeStatefulNetworkingApi();
+    const { api: customObjectsApi, policies } = makeStatefulCustomObjectsApi({
+      resource: {
+        group: "cilium.io",
+        version: "v2",
+        plural: "ciliumnetworkpolicies",
+      },
+    });
+    const capabilities: K8sNetworkPolicyCapabilities = {
+      kubernetesNetworkPolicy: true,
+      ciliumNetworkPolicy: true,
+      gkeFqdnNetworkPolicy: false,
+      awsApplicationNetworkPolicy: false,
+      provider: "cilium" as const,
+      supportsFqdn: true,
+      supportsHttpMethods: false,
+      message: null,
+      enforcementSource: "api-discovery",
+      enforcementStatus: "unknown",
+      probe: "absent",
+      probedAt: null,
+    };
+
+    await makeNetworkPolicyDeployment({
+      networkingApi,
+      customObjectsApi,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedDomains: ["api.example.com"],
+      }),
+      networkPolicyCapabilities: capabilities,
+    }).applyK8sNetworkPolicy();
+
+    const stalePolicy = structuredClone(policies.get(policyName));
+    expect(stalePolicy).toBeDefined();
+    if (!stalePolicy?.metadata) throw new Error("expected policy metadata");
+    stalePolicy.metadata.name = "mcp-egress-generated-stale";
+    policies.set(stalePolicy.metadata.name, stalePolicy);
+
+    await makeNetworkPolicyDeployment({
+      networkingApi,
+      customObjectsApi,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedDomains: ["api.example.com", "*.example.org"],
+      }),
+      networkPolicyCapabilities: capabilities,
+    }).applyK8sNetworkPolicy();
+
+    expect([...policies.keys()]).toEqual([policyName]);
+    expect(
+      customObjectsApi.replaceNamespacedCustomObject,
+    ).toHaveBeenCalledTimes(1);
+    expect(customObjectsApi.patchNamespacedCustomObject).not.toHaveBeenCalled();
+    expect(customObjectsApi.deleteNamespacedCustomObject).toHaveBeenCalledWith({
+      group: "cilium.io",
+      version: "v2",
+      namespace: "default",
+      plural: "ciliumnetworkpolicies",
+      name: "mcp-egress-generated-stale",
+    });
+    expect(
+      policies.get(policyName)?.metadata?.annotations?.[
+        "archestra.io/network-policy-allowed-domains"
+      ],
+    ).toBe("api.example.com,*.example.org");
+  });
+
+  test("updates GKE FQDNNetworkPolicy while keeping the desired Kubernetes NetworkPolicy and cleaning stale duplicates", async () => {
+    const policyName = "mcp-egress-mcp-mcp-test-server";
+    const { api: networkingApi, policies: kubernetesPolicies } =
+      makeStatefulNetworkingApi();
+    const { api: customObjectsApi, policies: gkePolicies } =
+      makeStatefulCustomObjectsApi({
+        resource: {
+          group: "networking.gke.io",
+          version: "v1alpha1",
+          plural: "fqdnnetworkpolicies",
+        },
+      });
+    const capabilities: K8sNetworkPolicyCapabilities = {
+      kubernetesNetworkPolicy: true,
+      ciliumNetworkPolicy: false,
+      gkeFqdnNetworkPolicy: true,
+      awsApplicationNetworkPolicy: false,
+      provider: "gke-fqdn" as const,
+      supportsFqdn: true,
+      supportsHttpMethods: false,
+      message: null,
+      enforcementSource: "api-discovery",
+      enforcementStatus: "unknown",
+      probe: "absent",
+      probedAt: null,
+    };
+
+    await makeNetworkPolicyDeployment({
+      networkingApi,
+      customObjectsApi,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedDomains: ["api.example.com"],
+        allowedCidrs: ["203.0.113.0/24"],
+      }),
+      networkPolicyCapabilities: capabilities,
+    }).applyK8sNetworkPolicy();
+
+    const staleKubernetesPolicy = structuredClone(
+      kubernetesPolicies.get(policyName),
+    );
+    expect(staleKubernetesPolicy).toBeDefined();
+    if (!staleKubernetesPolicy?.metadata) {
+      throw new Error("expected Kubernetes policy metadata");
+    }
+    staleKubernetesPolicy.metadata.name = "mcp-egress-generated-stale-k8s";
+    kubernetesPolicies.set(
+      staleKubernetesPolicy.metadata.name,
+      staleKubernetesPolicy,
+    );
+
+    const staleGkePolicy = structuredClone(gkePolicies.get(policyName));
+    expect(staleGkePolicy).toBeDefined();
+    if (!staleGkePolicy?.metadata) {
+      throw new Error("expected GKE policy metadata");
+    }
+    staleGkePolicy.metadata.name = "mcp-egress-generated-stale-gke";
+    gkePolicies.set(staleGkePolicy.metadata.name, staleGkePolicy);
+
+    await makeNetworkPolicyDeployment({
+      networkingApi,
+      customObjectsApi,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedDomains: ["api.example.com", "cdn.example.com"],
+        allowedCidrs: ["198.51.100.0/24"],
+      }),
+      networkPolicyCapabilities: capabilities,
+    }).applyK8sNetworkPolicy();
+
+    expect([...kubernetesPolicies.keys()]).toEqual([policyName]);
+    expect([...gkePolicies.keys()]).toEqual([policyName]);
+    expect(networkingApi.replaceNamespacedNetworkPolicy).toHaveBeenCalledTimes(
+      1,
+    );
+    expect(
+      customObjectsApi.replaceNamespacedCustomObject,
+    ).toHaveBeenCalledTimes(1);
+    expect(customObjectsApi.patchNamespacedCustomObject).not.toHaveBeenCalled();
+    expect(networkingApi.deleteNamespacedNetworkPolicy).toHaveBeenCalledWith({
+      name: "mcp-egress-generated-stale-k8s",
+      namespace: "default",
+    });
+    expect(customObjectsApi.deleteNamespacedCustomObject).toHaveBeenCalledWith({
+      group: "networking.gke.io",
+      version: "v1alpha1",
+      namespace: "default",
+      plural: "fqdnnetworkpolicies",
+      name: "mcp-egress-generated-stale-gke",
+    });
+    expect(
+      gkePolicies.get(policyName)?.metadata?.annotations?.[
+        "archestra.io/network-policy-allowed-domains"
+      ],
+    ).toBe("api.example.com,cdn.example.com");
+  });
+
+  test("deleting managed network policy also cleans up stale duplicate managed policies", async () => {
+    const policyName = "mcp-egress-mcp-mcp-test-server";
+    const { api: networkingApi, policies } = makeStatefulNetworkingApi();
+    const capabilities: K8sNetworkPolicyCapabilities = {
+      kubernetesNetworkPolicy: true,
+      ciliumNetworkPolicy: false,
+      gkeFqdnNetworkPolicy: false,
+      awsApplicationNetworkPolicy: false,
+      provider: "kubernetes" as const,
+      supportsFqdn: false,
+      supportsHttpMethods: false,
+      message: null,
+      enforcementSource: "api-discovery",
+      enforcementStatus: "unknown",
+      probe: "absent",
+      probedAt: null,
+    };
+
+    const deployment = makeNetworkPolicyDeployment({
+      networkingApi,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedCidrs: ["203.0.113.0/24"],
+      }),
+      networkPolicyCapabilities: capabilities,
+    });
+    await deployment.applyK8sNetworkPolicy();
+
+    const stalePolicy = structuredClone(policies.get(policyName));
+    expect(stalePolicy).toBeDefined();
+    if (!stalePolicy?.metadata) throw new Error("expected policy metadata");
+    stalePolicy.metadata.name = "mcp-egress-generated-stale";
+    policies.set(stalePolicy.metadata.name, stalePolicy);
+
+    await deployment.deleteK8sNetworkPolicy();
+
+    expect([...policies.keys()]).toEqual([]);
+    expect(networkingApi.deleteNamespacedNetworkPolicy).toHaveBeenCalledWith({
+      name: policyName,
+      namespace: "default",
+    });
+    expect(networkingApi.deleteNamespacedNetworkPolicy).toHaveBeenCalledWith({
+      name: "mcp-egress-generated-stale",
+      namespace: "default",
+    });
+  });
+
+  const PLAIN_CAPS: K8sNetworkPolicyCapabilities = {
+    kubernetesNetworkPolicy: true,
+    ciliumNetworkPolicy: false,
+    gkeFqdnNetworkPolicy: false,
+    awsApplicationNetworkPolicy: false,
+    provider: "kubernetes" as const,
+    supportsFqdn: false,
+    supportsHttpMethods: false,
+    message: null,
+    enforcementSource: "api-discovery",
+    enforcementStatus: "unknown",
+    probe: "absent",
+    probedAt: null,
+  };
+  const AWS_CAPS: K8sNetworkPolicyCapabilities = {
+    kubernetesNetworkPolicy: true,
+    ciliumNetworkPolicy: false,
+    gkeFqdnNetworkPolicy: false,
+    awsApplicationNetworkPolicy: true,
+    provider: "aws-application-network-policy" as const,
+    supportsFqdn: true,
+    supportsHttpMethods: false,
+    message: null,
+    enforcementSource: "api-discovery",
+    enforcementStatus: "unknown",
+    probe: "absent",
+    probedAt: null,
+  };
+  const CILIUM_CAPS: K8sNetworkPolicyCapabilities = {
+    kubernetesNetworkPolicy: true,
+    ciliumNetworkPolicy: true,
+    gkeFqdnNetworkPolicy: false,
+    awsApplicationNetworkPolicy: false,
+    provider: "cilium" as const,
+    supportsFqdn: true,
+    supportsHttpMethods: false,
+    message: null,
+    enforcementSource: "api-discovery",
+    enforcementStatus: "unknown",
+    probe: "absent",
+    probedAt: null,
+  };
+  const POLICY_NAME = "mcp-egress-mcp-mcp-test-server";
+  const DNS_PORTS = [
+    { protocol: "UDP", port: 53 },
+    { protocol: "TCP", port: 53 },
+  ];
+  const FLOOR_PUBLIC_EGRESS = [
+    {
+      to: [
+        {
+          ipBlock: {
+            cidr: "0.0.0.0/0",
+            except: [
+              "10.0.0.0/8",
+              "172.16.0.0/12",
+              "192.168.0.0/16",
+              "169.254.0.0/16",
+              "100.64.0.0/10",
+              "127.0.0.0/8",
+              "0.0.0.0/8",
+              "168.63.129.16/32",
+            ],
+          },
+        },
+      ],
+    },
+    {
+      to: [
+        {
+          ipBlock: {
+            cidr: "::/0",
+            except: ["::1/128", "fc00::/7", "fe80::/10", "64:ff9b::/96"],
+          },
+        },
+      ],
+    },
+  ];
+  // Plain NetworkPolicy floor: DNS to the kube-dns pods by label (DNAT-proof),
+  // not the resolver ClusterIP.
+  const PLAIN_FLOOR_EGRESS = [
+    {
+      to: [
+        {
+          namespaceSelector: {
+            matchLabels: { "kubernetes.io/metadata.name": "kube-system" },
+          },
+          podSelector: { matchLabels: { "k8s-app": "kube-dns" } },
+        },
+      ],
+      ports: DNS_PORTS,
+    },
+    ...FLOOR_PUBLIC_EGRESS,
+  ];
+  // Without a known resolver, AWS keeps the public floor without adding DNS
+  // access to private destinations.
+  const AWS_FLOOR_EGRESS = FLOOR_PUBLIC_EGRESS;
+
+  test("applies the SSRF floor as a plain NetworkPolicy for an unrestricted policy", async () => {
+    const { api, policies } = makeStatefulNetworkingApi();
+    await makeNetworkPolicyDeployment({
+      networkingApi: api,
+      effectiveNetworkPolicy: makeNetworkPolicy({ egressMode: "unrestricted" }),
+      networkPolicyCapabilities: PLAIN_CAPS,
+    }).applyK8sNetworkPolicy();
+
+    const policy = policies.get(POLICY_NAME);
+    expect(policy?.spec?.policyTypes).toEqual(["Egress"]);
+    expect(policy?.spec?.egress).toEqual(PLAIN_FLOOR_EGRESS);
+  });
+
+  test("applies explicit CIDR exceptions on top of the unrestricted floor", async () => {
+    const { api, policies } = makeStatefulNetworkingApi();
+    await makeNetworkPolicyDeployment({
+      networkingApi: api,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        egressMode: "unrestricted",
+        allowedCidrs: ["10.20.0.0/16"],
+      }),
+      networkPolicyCapabilities: PLAIN_CAPS,
+    }).applyK8sNetworkPolicy();
+
+    const egress = policies.get(POLICY_NAME)?.spec?.egress ?? [];
+    const publicRule = egress.find(
+      (rule) => rule.to?.[0]?.ipBlock?.cidr === "0.0.0.0/0",
+    );
+    expect(publicRule?.to?.[0]?.ipBlock?.except).toContain("10.0.0.0/8");
+    expect(egress).toContainEqual({
+      to: [{ ipBlock: { cidr: "10.20.0.0/16" } }],
+    });
+  });
+
+  test("per-pod policy selector keys on app + mcp-server-id only, never the per-install name", async () => {
+    const { api, policies } = makeStatefulNetworkingApi();
+    await makeNetworkPolicyDeployment({
+      networkingApi: api,
+      effectiveNetworkPolicy: makeNetworkPolicy({ egressMode: "unrestricted" }),
+      networkPolicyCapabilities: PLAIN_CAPS,
+    }).applyK8sNetworkPolicy();
+
+    const selector = policies.get(POLICY_NAME)?.spec?.podSelector?.matchLabels;
+    expect(selector).toEqual({
+      app: "mcp-server",
+      "mcp-server-id": "test-server-id",
+    });
+    // mcp-server-name is per-install; including it in the AND-semantics selector
+    // makes a multitenant policy select zero pods.
+    expect(selector).not.toHaveProperty("mcp-server-name");
+  });
+
+  test("multitenant per-pod policy selects on the catalog-stable id, matching the shared pod", async () => {
+    const { api, policies } = makeStatefulNetworkingApi();
+    await makeNetworkPolicyDeployment({
+      networkingApi: api,
+      effectiveNetworkPolicy: makeNetworkPolicy({ egressMode: "unrestricted" }),
+      networkPolicyCapabilities: PLAIN_CAPS,
+      multitenant: true,
+    }).applyK8sNetworkPolicy();
+
+    const selector = [...policies.values()][0]?.spec?.podSelector?.matchLabels;
+    expect(selector).toEqual({
+      app: "mcp-server",
+      "mcp-server-id": "test-catalog-id",
+    });
+    expect(selector).not.toHaveProperty("mcp-server-name");
+  });
+
+  test("applies the SSRF floor for a built-in (null) policy — the case the union bug silently opened", async () => {
+    const { api, policies } = makeStatefulNetworkingApi();
+    await makeNetworkPolicyDeployment({
+      networkingApi: api,
+      effectiveNetworkPolicy: { source: "built_in", policy: null },
+      networkPolicyCapabilities: PLAIN_CAPS,
+    }).applyK8sNetworkPolicy();
+
+    expect(policies.get(POLICY_NAME)?.spec?.egress).toEqual(PLAIN_FLOOR_EGRESS);
+  });
+
+  test("emits the floor as an ApplicationNetworkPolicy on AWS and removes the plain NetworkPolicy", async () => {
+    const { api: networkingApi, policies: kubernetesPolicies } =
+      makeStatefulNetworkingApi();
+    const { api: customObjectsApi, policies: anpPolicies } =
+      makeStatefulCustomObjectsApi({
+        resource: {
+          group: "networking.k8s.aws",
+          version: "v1alpha1",
+          plural: "applicationnetworkpolicies",
+        },
+      });
+
+    await makeNetworkPolicyDeployment({
+      networkingApi,
+      customObjectsApi,
+      effectiveNetworkPolicy: makeNetworkPolicy({ egressMode: "unrestricted" }),
+      networkPolicyCapabilities: AWS_CAPS,
+    }).applyK8sNetworkPolicy();
+
+    const anp = anpPolicies.get(POLICY_NAME);
+    expect((anp as { kind?: string })?.kind).toBe("ApplicationNetworkPolicy");
+    expect(anp?.spec?.egress).toEqual(AWS_FLOOR_EGRESS);
+    expect(networkingApi.deleteNamespacedNetworkPolicy).toHaveBeenCalledWith({
+      name: POLICY_NAME,
+      namespace: "default",
+    });
+    expect([...kubernetesPolicies.keys()]).not.toContain(POLICY_NAME);
+  });
+
+  test("full-replaces a custom policy on conflict, stripping a stale selector label a merge-patch would keep", async () => {
+    const staleAnp: CustomPolicyObject = {
+      metadata: {
+        name: POLICY_NAME,
+        resourceVersion: "42",
+        finalizers: ["some-controller/finalizer"],
+      },
+      spec: {
+        podSelector: {
+          matchLabels: {
+            app: "mcp-server",
+            "mcp-server-id": "test-server-id",
+            // A stale per-install label the full replace must strip.
+            "mcp-server-name": "stale-name",
+          },
+        },
+        policyTypes: ["Egress"],
+        egress: [],
+      },
+    };
+    const { api: networkingApi } = makeStatefulNetworkingApi();
+    const { api: customObjectsApi, policies } = makeStatefulCustomObjectsApi({
+      resource: {
+        group: "networking.k8s.aws",
+        version: "v1alpha1",
+        plural: "applicationnetworkpolicies",
+      },
+      initialPolicies: [staleAnp],
+    });
+
+    await makeNetworkPolicyDeployment({
+      networkingApi,
+      customObjectsApi,
+      effectiveNetworkPolicy: makeNetworkPolicy({ egressMode: "unrestricted" }),
+      networkPolicyCapabilities: AWS_CAPS,
+    }).applyK8sNetworkPolicy();
+
+    const selector = (
+      policies.get(POLICY_NAME)?.spec as
+        | { podSelector?: { matchLabels?: Record<string, string> } }
+        | undefined
+    )?.podSelector?.matchLabels;
+    // The full replace dropped the stale mcp-server-name a merge-patch would keep.
+    expect(selector).toEqual({
+      app: "mcp-server",
+      "mcp-server-id": "test-server-id",
+    });
+    expect(customObjectsApi.patchNamespacedCustomObject).not.toHaveBeenCalled();
+    // The replace carried the live resourceVersion + finalizers.
+    expect(customObjectsApi.replaceNamespacedCustomObject).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          metadata: expect.objectContaining({
+            resourceVersion: "42",
+            finalizers: ["some-controller/finalizer"],
+          }),
+        }),
+      }),
+    );
+  });
+
+  test("retries the custom-policy replace on a resourceVersion conflict (409) between GET and PUT", async () => {
+    const existingAnp: CustomPolicyObject = {
+      metadata: { name: POLICY_NAME, resourceVersion: "1" },
+      spec: {
+        podSelector: {
+          matchLabels: { app: "mcp-server", "mcp-server-id": "test-server-id" },
+        },
+        policyTypes: ["Egress"],
+        egress: [],
+      },
+    };
+    const { api: networkingApi } = makeStatefulNetworkingApi();
+    const { api: customObjectsApi, policies } = makeStatefulCustomObjectsApi({
+      resource: {
+        group: "networking.k8s.aws",
+        version: "v1alpha1",
+        plural: "applicationnetworkpolicies",
+      },
+      initialPolicies: [existingAnp],
+    });
+    // First PUT loses the resourceVersion race (a controller bumped it); the
+    // retry re-reads and succeeds.
+    (
+      customObjectsApi.replaceNamespacedCustomObject as ReturnType<typeof vi.fn>
+    ).mockRejectedValueOnce({ statusCode: 409 });
+
+    await makeNetworkPolicyDeployment({
+      networkingApi,
+      customObjectsApi,
+      effectiveNetworkPolicy: makeNetworkPolicy({ egressMode: "unrestricted" }),
+      networkPolicyCapabilities: AWS_CAPS,
+    }).applyK8sNetworkPolicy();
+
+    // Re-read then re-PUT on the conflict — 2 GETs, 2 replaces, no throw.
+    expect(customObjectsApi.getNamespacedCustomObject).toHaveBeenCalledTimes(2);
+    expect(
+      customObjectsApi.replaceNamespacedCustomObject,
+    ).toHaveBeenCalledTimes(2);
+    expect(policies.get(POLICY_NAME)?.spec).toBeDefined();
+  });
+
+  test("emits a restricted CIDR-only allow-list as an ApplicationNetworkPolicy on AWS", async () => {
+    const { api: networkingApi } = makeStatefulNetworkingApi();
+    const { api: customObjectsApi, policies: anpPolicies } =
+      makeStatefulCustomObjectsApi({
+        resource: {
+          group: "networking.k8s.aws",
+          version: "v1alpha1",
+          plural: "applicationnetworkpolicies",
+        },
+      });
+
+    await makeNetworkPolicyDeployment({
+      networkingApi,
+      customObjectsApi,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedCidrs: ["203.0.113.0/24"],
+      }),
+      networkPolicyCapabilities: AWS_CAPS,
+    }).applyK8sNetworkPolicy();
+
+    const anp = anpPolicies.get(POLICY_NAME);
+    expect((anp as { kind?: string })?.kind).toBe("ApplicationNetworkPolicy");
+    const egress = (anp?.spec?.egress ?? []) as Array<{
+      to?: Array<{ ipBlock?: { cidr?: string } }>;
+    }>;
+    expect(
+      egress.some((rule) =>
+        rule.to?.some((peer) => peer.ipBlock?.cidr === "203.0.113.0/24"),
+      ),
+    ).toBe(true);
+  });
+
+  test("emits off as a deny-all ApplicationNetworkPolicy on AWS, not an unenforced plain NetworkPolicy", async () => {
+    const { api: networkingApi } = makeStatefulNetworkingApi();
+    const { api: customObjectsApi, policies: anpPolicies } =
+      makeStatefulCustomObjectsApi({
+        resource: {
+          group: "networking.k8s.aws",
+          version: "v1alpha1",
+          plural: "applicationnetworkpolicies",
+        },
+      });
+
+    await makeNetworkPolicyDeployment({
+      networkingApi,
+      customObjectsApi,
+      effectiveNetworkPolicy: makeNetworkPolicy({ egressMode: "off" }),
+      networkPolicyCapabilities: AWS_CAPS,
+    }).applyK8sNetworkPolicy();
+
+    const anp = anpPolicies.get(POLICY_NAME);
+    expect((anp as { kind?: string })?.kind).toBe("ApplicationNetworkPolicy");
+    expect(anp?.spec?.egress).toEqual([]);
+    expect(networkingApi.deleteNamespacedNetworkPolicy).toHaveBeenCalledWith({
+      name: POLICY_NAME,
+      namespace: "default",
+    });
+  });
+
+  test("emits the unrestricted floor as a plain NetworkPolicy on Cilium, not a CiliumNetworkPolicy", async () => {
+    const { api: networkingApi, policies } = makeStatefulNetworkingApi();
+    const { api: customObjectsApi, policies: ciliumPolicies } =
+      makeStatefulCustomObjectsApi({
+        resource: {
+          group: "cilium.io",
+          version: "v2",
+          plural: "ciliumnetworkpolicies",
+        },
+      });
+
+    await makeNetworkPolicyDeployment({
+      networkingApi,
+      customObjectsApi,
+      effectiveNetworkPolicy: makeNetworkPolicy({ egressMode: "unrestricted" }),
+      networkPolicyCapabilities: CILIUM_CAPS,
+    }).applyK8sNetworkPolicy();
+
+    expect(policies.get(POLICY_NAME)?.spec?.egress).toEqual(PLAIN_FLOOR_EGRESS);
+    expect(ciliumPolicies.has(POLICY_NAME)).toBe(false);
+  });
+
+  test("emits the floor as an ApplicationNetworkPolicy for a built-in (null) policy on AWS", async () => {
+    const { api: networkingApi } = makeStatefulNetworkingApi();
+    const { api: customObjectsApi, policies: anpPolicies } =
+      makeStatefulCustomObjectsApi({
+        resource: {
+          group: "networking.k8s.aws",
+          version: "v1alpha1",
+          plural: "applicationnetworkpolicies",
+        },
+      });
+
+    await makeNetworkPolicyDeployment({
+      networkingApi,
+      customObjectsApi,
+      effectiveNetworkPolicy: { source: "built_in", policy: null },
+      networkPolicyCapabilities: AWS_CAPS,
+    }).applyK8sNetworkPolicy();
+
+    const anp = anpPolicies.get(POLICY_NAME);
+    expect((anp as { kind?: string })?.kind).toBe("ApplicationNetworkPolicy");
+    expect(anp?.spec?.egress).toEqual(AWS_FLOOR_EGRESS);
+  });
+
+  test("reconciles in place when relaxing from a restricted policy to the unrestricted floor", async () => {
+    const { api, policies } = makeStatefulNetworkingApi();
+    await makeNetworkPolicyDeployment({
+      networkingApi: api,
+      effectiveNetworkPolicy: makeNetworkPolicy({
+        allowedCidrs: ["203.0.113.0/24"],
+      }),
+      networkPolicyCapabilities: PLAIN_CAPS,
+    }).applyK8sNetworkPolicy();
+    expect(policies.get(POLICY_NAME)?.spec?.egress).not.toEqual(
+      PLAIN_FLOOR_EGRESS,
+    );
+
+    await makeNetworkPolicyDeployment({
+      networkingApi: api,
+      effectiveNetworkPolicy: makeNetworkPolicy({ egressMode: "unrestricted" }),
+      networkPolicyCapabilities: PLAIN_CAPS,
+    }).applyK8sNetworkPolicy();
+
+    expect([...policies.keys()]).toEqual([POLICY_NAME]);
+    expect(policies.get(POLICY_NAME)?.spec?.egress).toEqual(PLAIN_FLOOR_EGRESS);
+  });
+
+  test("reconciles in place when tightening from the unrestricted floor to off (deny-all)", async () => {
+    const { api, policies } = makeStatefulNetworkingApi();
+    await makeNetworkPolicyDeployment({
+      networkingApi: api,
+      effectiveNetworkPolicy: makeNetworkPolicy({ egressMode: "unrestricted" }),
+      networkPolicyCapabilities: PLAIN_CAPS,
+    }).applyK8sNetworkPolicy();
+    expect(policies.get(POLICY_NAME)?.spec?.egress).toEqual(PLAIN_FLOOR_EGRESS);
+
+    await makeNetworkPolicyDeployment({
+      networkingApi: api,
+      effectiveNetworkPolicy: makeNetworkPolicy({ egressMode: "off" }),
+      networkPolicyCapabilities: PLAIN_CAPS,
+    }).applyK8sNetworkPolicy();
+
+    expect([...policies.keys()]).toEqual([POLICY_NAME]);
+    expect(policies.get(POLICY_NAME)?.spec?.egress).toEqual([]);
+  });
+
+  test("the namespace default-deny baseline survives per-pod policy cleanup", async () => {
+    const baseline = buildEgressBaselineNetworkPolicy({
+      name: "mcp-server-egress-baseline",
+      labels: {
+        "app.kubernetes.io/managed-by": "archestra",
+        "archestra.io/resource": "mcp-egress-baseline",
+      },
+    });
+    const { api, policies } = makeStatefulNetworkingApi([baseline]);
+
+    // Applying a per-pod floor runs cleanupStaleManagedNetworkPolicies over the
+    // namespace; the baseline's distinct resource label and broad app-only
+    // selector must keep it out of that sweep.
+    await makeNetworkPolicyDeployment({
+      networkingApi: api,
+      effectiveNetworkPolicy: makeNetworkPolicy({ egressMode: "unrestricted" }),
+      networkPolicyCapabilities: PLAIN_CAPS,
+    }).applyK8sNetworkPolicy();
+
+    expect(policies.get("mcp-server-egress-baseline")).toBeDefined();
+    expect(api.deleteNamespacedNetworkPolicy).not.toHaveBeenCalledWith(
+      expect.objectContaining({ name: "mcp-server-egress-baseline" }),
+    );
+  });
+});
+
 describe("K8sDeployment.removeDeployment", () => {
   function createK8sDeploymentWithMockedApis(
     mockK8sApi: Partial<k8s.CoreV1Api>,
     mockK8sAppsApi: Partial<k8s.AppsV1Api>,
+    mockK8sNetworkingApi: Partial<k8s.NetworkingV1Api> = {
+      deleteNamespacedNetworkPolicy: vi.fn().mockResolvedValue({}),
+    },
   ): K8sDeployment {
     const mockMcpServer = {
       id: "test-server-id",
@@ -3624,6 +5811,7 @@ describe("K8sDeployment.removeDeployment", () => {
       mcpServer: mockMcpServer,
       k8sApi: mockK8sApi as k8s.CoreV1Api,
       k8sAppsApi: mockK8sAppsApi as k8s.AppsV1Api,
+      k8sNetworkingApi: mockK8sNetworkingApi as k8s.NetworkingV1Api,
       k8sAttach: {} as Attach,
       k8sLog: {} as Log,
       k8sExec: {} as Exec,
@@ -3730,15 +5918,6 @@ describe("K8sDeployment.statusSummary", () => {
     expect(summary.message).toBe("Deployment not created");
     expect(summary.error).toBeNull();
     expect(summary.serverName).toBe("test-server");
-    expect(summary.deploymentName).toBe("mcp-test-server");
-    expect(summary.namespace).toBe("test-namespace");
-  });
-
-  test("returns correct deployment name and namespace", () => {
-    const k8sDeployment = createK8sDeploymentInstance();
-
-    const summary = k8sDeployment.statusSummary;
-
     expect(summary.deploymentName).toBe("mcp-test-server");
     expect(summary.namespace).toBe("test-namespace");
   });
@@ -5042,4 +7221,2958 @@ describe("K8sDeployment.streamLogs", () => {
 
     expect(k8sLogMock).not.toHaveBeenCalled();
   });
+
+  test("ready-poll does not accumulate abort listeners on the signal across iterations", async () => {
+    const deployment = createK8sDeploymentInstance();
+    const ac = new AbortController();
+
+    // Pod never becomes Ready, so every 2s iteration takes the timeout path.
+    vi.spyOn(
+      deployment as unknown as {
+        findAnyPodForDeployment: () => Promise<k8s.V1Pod | undefined>;
+      },
+      "findAnyPodForDeployment",
+    ).mockResolvedValue(makePendingPod());
+
+    const out = new PassThrough();
+
+    vi.useFakeTimers();
+    try {
+      const done = (
+        deployment as unknown as {
+          pollAndStreamLogsWhenReady(
+            stream: NodeJS.WritableStream,
+            lines: number,
+            abortSignal?: AbortSignal,
+          ): Promise<void>;
+        }
+      ).pollAndStreamLogsWhenReady(out, 100, ac.signal);
+
+      const listenerCounts: number[] = [];
+      for (let i = 0; i < 5; i++) {
+        await vi.advanceTimersByTimeAsync(2000);
+        listenerCounts.push(getEventListeners(ac.signal, "abort").length);
+      }
+      // Only the in-flight iteration may hold a listener; finished
+      // iterations must have removed theirs.
+      expect(Math.max(...listenerCounts)).toBeLessThanOrEqual(1);
+
+      ac.abort();
+      await vi.advanceTimersByTimeAsync(2000);
+      await done;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(getEventListeners(ac.signal, "abort")).toHaveLength(0);
+  });
+});
+
+describe("K8sDeployment pod lookup fallbacks", () => {
+  test("findPodForDeployment fallback lists only app=mcp-server pods", async () => {
+    const deployment = createK8sDeploymentInstance();
+    const deploymentName = (deployment as unknown as { deploymentName: string })
+      .deploymentName;
+
+    const listNamespacedPod = vi
+      .fn()
+      // lookup by mcp-server-id label finds no running pod
+      .mockResolvedValueOnce({ items: [] })
+      // multi-tenant fallback list
+      .mockResolvedValueOnce({
+        items: [
+          {
+            metadata: { name: `${deploymentName}-abc12` },
+            status: { phase: "Running" },
+          },
+        ],
+      });
+    (deployment as unknown as { k8sApi: k8s.CoreV1Api }).k8sApi = {
+      listNamespacedPod,
+    } as unknown as k8s.CoreV1Api;
+
+    await expect(deployment.hasRunningPod()).resolves.toBe(true);
+
+    expect(listNamespacedPod).toHaveBeenNthCalledWith(2, {
+      namespace: "default",
+      labelSelector: "app=mcp-server",
+    });
+  });
+
+  test("findAnyPodForDeployment fallback lists only app=mcp-server pods", async () => {
+    const deployment = createK8sDeploymentInstance();
+    const deploymentName = (deployment as unknown as { deploymentName: string })
+      .deploymentName;
+
+    const ownPod = {
+      metadata: { name: `${deploymentName}-xyz99` },
+      status: { phase: "Pending" },
+    };
+    const listNamespacedPod = vi
+      .fn()
+      .mockResolvedValueOnce({ items: [] })
+      .mockResolvedValueOnce({ items: [ownPod] });
+    (deployment as unknown as { k8sApi: k8s.CoreV1Api }).k8sApi = {
+      listNamespacedPod,
+    } as unknown as k8s.CoreV1Api;
+
+    const pod = await (
+      deployment as unknown as {
+        findAnyPodForDeployment(): Promise<k8s.V1Pod | undefined>;
+      }
+    ).findAnyPodForDeployment();
+
+    expect(pod?.metadata?.name).toBe(`${deploymentName}-xyz99`);
+    expect(listNamespacedPod).toHaveBeenNthCalledWith(2, {
+      namespace: "default",
+      labelSelector: "app=mcp-server",
+    });
+  });
+});
+
+describe("K8sDeployment image pull failure handling", () => {
+  function makeDeploymentWithMockedApis(params: {
+    listNamespacedPod: ReturnType<typeof vi.fn>;
+    readNamespacedDeployment?: ReturnType<typeof vi.fn>;
+  }): K8sDeployment {
+    const mockMcpServer = {
+      id: "test-server-id",
+      name: "test-server",
+      // null catalogId so getCatalogItem() short-circuits without a DB lookup
+      catalogId: null,
+    } as unknown as McpServer;
+
+    return new K8sDeployment({
+      mcpServer: mockMcpServer,
+      k8sApi: {
+        listNamespacedPod: params.listNamespacedPod,
+      } as unknown as k8s.CoreV1Api,
+      k8sAppsApi: {
+        readNamespacedDeployment: params.readNamespacedDeployment ?? vi.fn(),
+      } as unknown as k8s.AppsV1Api,
+      k8sNetworkingApi: {} as k8s.NetworkingV1Api,
+      k8sAttach: {} as Attach,
+      k8sLog: {} as Log,
+      k8sExec: {} as Exec,
+      namespace: "default",
+      catalogItem: null,
+    });
+  }
+
+  function makeWaitingPod(reason: string, message: string): k8s.V1Pod {
+    return {
+      metadata: {
+        name: "test-server-abc123",
+        creationTimestamp: new Date(),
+      },
+      status: {
+        phase: "Pending",
+        containerStatuses: [
+          {
+            name: "mcp-server",
+            ready: false,
+            restartCount: 0,
+            state: { waiting: { reason, message } },
+          },
+        ],
+      },
+    } as k8s.V1Pod;
+  }
+
+  const runningPod = {
+    metadata: {
+      name: "test-server-abc123",
+      creationTimestamp: new Date(),
+    },
+    status: {
+      phase: "Running",
+      conditions: [{ type: "Ready", status: "True" }],
+      containerStatuses: [
+        {
+          name: "mcp-server",
+          ready: true,
+          restartCount: 0,
+          state: { running: {} },
+        },
+      ],
+    },
+  } as k8s.V1Pod;
+
+  const imagePullPod = makeWaitingPod(
+    "ImagePullBackOff",
+    'Back-off pulling image "ghcr.io/example/mcp:latest"',
+  );
+
+  describe("refreshState", () => {
+    test("keeps state pending on transient image pull errors", async () => {
+      const listNamespacedPod = vi
+        .fn()
+        .mockResolvedValue({ items: [imagePullPod] });
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue({ status: { availableReplicas: 0 } });
+
+      const deployment = makeDeploymentWithMockedApis({
+        listNamespacedPod,
+        readNamespacedDeployment,
+      });
+      // @ts-expect-error - accessing private property for testing
+      deployment.state = "pending";
+
+      await deployment.refreshState();
+
+      expect(deployment.statusSummary.state).toBe("pending");
+      expect(deployment.statusSummary.error).toContain(
+        "Back-off pulling image",
+      );
+    });
+
+    test("recovers to running once the kubelet pull succeeds", async () => {
+      const listNamespacedPod = vi
+        .fn()
+        // first refresh: findAnyPodForDeployment + failure check see the pull error
+        .mockResolvedValueOnce({ items: [imagePullPod] })
+        .mockResolvedValueOnce({ items: [imagePullPod] })
+        // second refresh: pod is running
+        .mockResolvedValue({ items: [runningPod] });
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValueOnce({ status: { availableReplicas: 0 } })
+        .mockResolvedValue({ status: { availableReplicas: 1 } });
+
+      const deployment = makeDeploymentWithMockedApis({
+        listNamespacedPod,
+        readNamespacedDeployment,
+      });
+      // @ts-expect-error - accessing private property for testing
+      deployment.state = "pending";
+
+      await deployment.refreshState();
+      expect(deployment.statusSummary.state).toBe("pending");
+
+      await deployment.refreshState();
+      expect(deployment.statusSummary.state).toBe("running");
+      expect(deployment.statusSummary.error).toBeNull();
+    });
+
+    test("still marks terminal container failures as failed", async () => {
+      const crashLoopPod = makeWaitingPod(
+        "CrashLoopBackOff",
+        "back-off 5m0s restarting failed container",
+      );
+      const listNamespacedPod = vi
+        .fn()
+        .mockResolvedValue({ items: [crashLoopPod] });
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue({ status: { availableReplicas: 0 } });
+
+      const deployment = makeDeploymentWithMockedApis({
+        listNamespacedPod,
+        readNamespacedDeployment,
+      });
+      // @ts-expect-error - accessing private property for testing
+      deployment.state = "running";
+
+      await deployment.refreshState();
+
+      expect(deployment.statusSummary.state).toBe("failed");
+      expect(deployment.statusSummary.error).toContain(
+        "restarting failed container",
+      );
+    });
+  });
+
+  describe("waitForDeploymentReady", () => {
+    test("keeps waiting through image pull errors and succeeds once the pull completes", async () => {
+      const listNamespacedPod = vi
+        .fn()
+        // attempt 1: failure scan sees the pull error (must not fail fast)
+        .mockResolvedValueOnce({ items: [imagePullPod] })
+        // attempt 2: pod is running
+        .mockResolvedValue({ items: [runningPod] });
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValueOnce({ status: { availableReplicas: 0 } })
+        .mockResolvedValue({ status: { availableReplicas: 1 } });
+
+      const deployment = makeDeploymentWithMockedApis({
+        listNamespacedPod,
+        readNamespacedDeployment,
+      });
+
+      await expect(
+        deployment.waitForDeploymentReady(5, 1),
+      ).resolves.toBeUndefined();
+      expect(deployment.statusSummary.state).toBe("running");
+      expect(deployment.statusSummary.error).toBeNull();
+    });
+
+    test("waits for the Kubernetes Pod Ready condition, not only Running phase", async () => {
+      const runningButUnready = {
+        ...runningPod,
+        status: {
+          ...runningPod.status,
+          conditions: [{ type: "Ready", status: "False" }],
+        },
+      } as k8s.V1Pod;
+      const listNamespacedPod = vi
+        .fn()
+        .mockResolvedValueOnce({ items: [runningButUnready] })
+        .mockResolvedValue({ items: [runningPod] });
+      const deployment = makeDeploymentWithMockedApis({
+        listNamespacedPod,
+        readNamespacedDeployment: vi.fn(),
+      });
+
+      await expect(
+        deployment.waitForDeploymentReady(3, 1),
+      ).resolves.toBeUndefined();
+      expect(listNamespacedPod).toHaveBeenCalledTimes(2);
+    });
+
+    test("fails fast on terminal container states", async () => {
+      const crashLoopPod = makeWaitingPod(
+        "CrashLoopBackOff",
+        "back-off 5m0s restarting failed container",
+      );
+      const listNamespacedPod = vi
+        .fn()
+        .mockResolvedValue({ items: [crashLoopPod] });
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue({ status: { availableReplicas: 0 } });
+
+      const deployment = makeDeploymentWithMockedApis({
+        listNamespacedPod,
+        readNamespacedDeployment,
+      });
+
+      await expect(deployment.waitForDeploymentReady(5, 1)).rejects.toThrow(
+        /CrashLoopBackOff/,
+      );
+      expect(deployment.statusSummary.state).toBe("failed");
+    });
+
+    test("includes the last image pull error when timing out", async () => {
+      const listNamespacedPod = vi
+        .fn()
+        .mockResolvedValue({ items: [imagePullPod] });
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue({ status: { availableReplicas: 0 } });
+
+      const deployment = makeDeploymentWithMockedApis({
+        listNamespacedPod,
+        readNamespacedDeployment,
+      });
+
+      await expect(deployment.waitForDeploymentReady(2, 1)).rejects.toThrow(
+        /did not become ready after 2 attempts.*ImagePullBackOff/,
+      );
+    });
+  });
+});
+
+describe("K8sDeployment selector self-heal (multitenant drift)", () => {
+  const notFound = { statusCode: 404, message: "not found" };
+
+  function makeDeployment(params: {
+    readNamespacedPod?: ReturnType<typeof vi.fn>;
+    readNamespacedRole?: ReturnType<typeof vi.fn>;
+    readNamespacedDeployment: ReturnType<typeof vi.fn>;
+    deleteNamespacedDeployment?: ReturnType<typeof vi.fn>;
+    createNamespacedDeployment?: ReturnType<typeof vi.fn>;
+  }): K8sDeployment {
+    const mockMcpServer = {
+      id: "current-install-id",
+      name: "test-server",
+      // null catalogId so getCatalogItem() short-circuits without a DB lookup;
+      // the recreate path then fails fast on missing local config, which is all
+      // we need — the assertion is that the drifted deployment was deleted first.
+      catalogId: null,
+    } as unknown as McpServer;
+
+    return new K8sDeployment({
+      mcpServer: mockMcpServer,
+      k8sApi: {
+        readNamespacedPod: params.readNamespacedPod ?? vi.fn(),
+      } as unknown as k8s.CoreV1Api,
+      k8sRbacApi: {
+        readNamespacedRole:
+          params.readNamespacedRole ?? vi.fn().mockRejectedValue(notFound),
+      } as unknown as k8s.RbacAuthorizationV1Api,
+      k8sAppsApi: {
+        readNamespacedDeployment: params.readNamespacedDeployment,
+        deleteNamespacedDeployment:
+          params.deleteNamespacedDeployment ?? vi.fn().mockResolvedValue({}),
+        createNamespacedDeployment:
+          params.createNamespacedDeployment ?? vi.fn().mockResolvedValue({}),
+      } as unknown as k8s.AppsV1Api,
+      k8sNetworkingApi: {} as k8s.NetworkingV1Api,
+      k8sAttach: {} as Attach,
+      k8sLog: {} as Log,
+      k8sExec: {} as Exec,
+      namespace: "default",
+      catalogItem: null,
+    });
+  }
+
+  // Regression: a Deployment created before the catalog-stable selector fix
+  // (#6340) keeps its old per-install `mcp-server-id` pod label while the shared
+  // Service's selector is reconciled to the catalog-stable id. The two diverge,
+  // the Service selects zero pods, and every connect/read fails ("fetch failed").
+  // A Deployment selector is immutable, so the only fix is delete + recreate.
+  test("recreates a deployment whose mcp-server-id selector drifted from the target", async () => {
+    const readNamespacedPod = vi.fn().mockRejectedValue(notFound); // no legacy bare pod
+    // 1st read: the deployment exists with a STALE selector (a different
+    // install's id). After deletion every read returns 404, which drains
+    // waitForDeploymentAbsent and sends the recreate down the create path.
+    const readNamespacedDeployment = vi
+      .fn()
+      .mockResolvedValueOnce({
+        metadata: { uid: "stale-deployment-uid" },
+        spec: {
+          selector: { matchLabels: { "mcp-server-id": "stale-install-id" } },
+        },
+        status: { availableReplicas: 1 },
+      })
+      .mockRejectedValue(notFound);
+    const deleteNamespacedDeployment = vi.fn().mockResolvedValue({});
+
+    const deployment = makeDeployment({
+      readNamespacedPod,
+      readNamespacedDeployment,
+      deleteNamespacedDeployment,
+    });
+
+    // The recreate fails fast in this mock (no catalog/local config) — expected.
+    await expect(deployment.startOrCreateDeployment()).rejects.toThrow();
+
+    expect(deleteNamespacedDeployment).toHaveBeenCalledTimes(1);
+    expect(deleteNamespacedDeployment).toHaveBeenCalledWith(
+      expect.objectContaining({ name: deployment.k8sDeploymentName }),
+    );
+  });
+
+  // Regression: the pod's egress policy MUST be applied before the deployment is
+  // created. A pod that starts before its per-pod policy lands is selected only
+  // by the namespace deny-all baseline (no DNS, no egress) and crashloops on
+  // startup connectivity.
+  test("applies the per-pod egress policy before creating the deployment", async () => {
+    const createNamespacedDeployment = vi.fn().mockResolvedValue({});
+    const deployment = makeDeployment({
+      readNamespacedPod: vi.fn().mockRejectedValue(notFound), // no legacy bare pod
+      readNamespacedDeployment: vi.fn().mockRejectedValue(notFound), // 404 → create path
+      createNamespacedDeployment,
+    });
+
+    // Stub everything the create path touches except the two calls we're ordering.
+    vi.spyOn(
+      deployment as unknown as { getCatalogItem: () => unknown },
+      "getCatalogItem",
+    ).mockResolvedValue({ localConfig: { dockerImage: "img" } });
+    vi.spyOn(
+      deployment as unknown as { needsHttpPort: () => unknown },
+      "needsHttpPort",
+    ).mockResolvedValue(false);
+    vi.spyOn(
+      deployment as unknown as { generateDeploymentSpec: () => unknown },
+      "generateDeploymentSpec",
+    ).mockReturnValue({});
+    vi.spyOn(
+      deployment as unknown as { ensureHttpServerConfigured: () => unknown },
+      "ensureHttpServerConfigured",
+    ).mockResolvedValue(undefined);
+    const applySpy = vi
+      .spyOn(deployment, "applyK8sNetworkPolicy")
+      .mockResolvedValue(undefined);
+
+    await deployment.startOrCreateDeployment();
+
+    expect(applySpy).toHaveBeenCalled();
+    expect(createNamespacedDeployment).toHaveBeenCalled();
+    expect(applySpy.mock.invocationCallOrder[0]).toBeLessThan(
+      createNamespacedDeployment.mock.invocationCallOrder[0],
+    );
+  });
+
+  test("attaches the Helm manager Role to a created deployment", async () => {
+    const previousOwner = config.orchestrator.kubernetes.runtimeOwnerRoleName;
+    config.orchestrator.kubernetes.runtimeOwnerRoleName = "runtime-owner";
+    const createNamespacedDeployment = vi.fn().mockResolvedValue({});
+    const deployment = makeDeployment({
+      readNamespacedPod: vi.fn().mockRejectedValue(notFound),
+      readNamespacedRole: vi.fn().mockResolvedValue({
+        metadata: { name: "runtime-owner", uid: "owner-uid" },
+      }),
+      readNamespacedDeployment: vi.fn().mockRejectedValue(notFound),
+      createNamespacedDeployment,
+    });
+    vi.spyOn(
+      deployment as unknown as { getCatalogItem: () => unknown },
+      "getCatalogItem",
+    ).mockResolvedValue({ localConfig: { dockerImage: "img" } });
+    vi.spyOn(
+      deployment as unknown as { needsHttpPort: () => unknown },
+      "needsHttpPort",
+    ).mockResolvedValue(false);
+    vi.spyOn(deployment, "generateDeploymentSpec").mockReturnValue({
+      metadata: { name: "mcp-test-server" },
+    } as k8s.V1Deployment);
+    vi.spyOn(deployment, "applyK8sNetworkPolicy").mockResolvedValue(undefined);
+    vi.spyOn(
+      deployment as unknown as { ensureHttpServerConfigured: () => unknown },
+      "ensureHttpServerConfigured",
+    ).mockResolvedValue(undefined);
+
+    try {
+      await deployment.startOrCreateDeployment();
+    } finally {
+      config.orchestrator.kubernetes.runtimeOwnerRoleName = previousOwner;
+    }
+
+    expect(createNamespacedDeployment).toHaveBeenCalledWith({
+      namespace: "default",
+      body: expect.objectContaining({
+        metadata: expect.objectContaining({
+          ownerReferences: [
+            expect.objectContaining({
+              apiVersion: "rbac.authorization.k8s.io/v1",
+              kind: "Role",
+              name: "runtime-owner",
+              uid: "owner-uid",
+            }),
+          ],
+        }),
+      }),
+    });
+  });
+
+  // A concurrent reconcile (another orchestrator replica) can create the Deployment
+  // between our 404 read and our create call. The resulting 409 must re-enter the
+  // reconcile (re-read + validate the now-existing deployment), not blindly assume
+  // success — a stale-selector deployment left by an older replica must still be
+  // self-healed, and a healthy one must not be marked failed.
+  test("on a 409 (concurrent create), re-reconciles the now-existing deployment", async () => {
+    const conflict = { statusCode: 409, message: "already exists" };
+    // Initial read: absent (→ create path). Create conflicts (409). The re-entry
+    // then reads the now-present deployment and reconciles it (here: not-ready).
+    const readNamespacedDeployment = vi
+      .fn()
+      .mockRejectedValueOnce(notFound)
+      .mockResolvedValue({ status: {} });
+    const createNamespacedDeployment = vi.fn().mockRejectedValue(conflict);
+    const deployment = makeDeployment({
+      readNamespacedPod: vi.fn().mockRejectedValue(notFound), // no legacy bare pod
+      readNamespacedDeployment,
+      createNamespacedDeployment,
+    });
+    vi.spyOn(
+      deployment as unknown as { getCatalogItem: () => unknown },
+      "getCatalogItem",
+    ).mockResolvedValue({ localConfig: { dockerImage: "img" } });
+    vi.spyOn(
+      deployment as unknown as { needsHttpPort: () => unknown },
+      "needsHttpPort",
+    ).mockResolvedValue(false);
+    vi.spyOn(
+      deployment as unknown as { generateDeploymentSpec: () => unknown },
+      "generateDeploymentSpec",
+    ).mockReturnValue({});
+    vi.spyOn(
+      deployment as unknown as {
+        checkPodContainerStatusesForFailure: () => unknown;
+      },
+      "checkPodContainerStatusesForFailure",
+    ).mockResolvedValue({ hasFailed: false, isTransientImagePull: false });
+    vi.spyOn(
+      deployment as unknown as { ensureHttpServerConfigured: () => unknown },
+      "ensureHttpServerConfigured",
+    ).mockResolvedValue(undefined);
+    const applySpy = vi
+      .spyOn(deployment, "applyK8sNetworkPolicy")
+      .mockResolvedValue(undefined);
+
+    await expect(deployment.startOrCreateDeployment()).resolves.toBeUndefined();
+    // Re-read on conflict (not a blind "continue"), and no create-retry loop.
+    expect(readNamespacedDeployment.mock.calls.length).toBeGreaterThanOrEqual(
+      2,
+    );
+    expect(createNamespacedDeployment).toHaveBeenCalledTimes(1);
+    expect(applySpy).toHaveBeenCalled();
+  });
+
+  // Regression: the reconcile path for an existing-but-not-ready deployment must
+  // also (re)apply the egress policy before HTTP config, so a slow or failing
+  // Service setup can't leave an already-created pod on the deny-all baseline.
+  test("reapplies the egress policy before HTTP config on a not-ready deployment, even when HTTP config fails", async () => {
+    const deployment = makeDeployment({
+      readNamespacedPod: vi.fn().mockRejectedValue(notFound), // no legacy bare pod
+      readNamespacedDeployment: vi.fn().mockResolvedValue({ status: {} }), // exists, not ready
+    });
+    vi.spyOn(
+      deployment as unknown as {
+        checkPodContainerStatusesForFailure: () => unknown;
+      },
+      "checkPodContainerStatusesForFailure",
+    ).mockResolvedValue({ hasFailed: false, isTransientImagePull: false });
+    const applySpy = vi
+      .spyOn(deployment, "applyK8sNetworkPolicy")
+      .mockResolvedValue(undefined);
+    const httpSpy = vi
+      .spyOn(
+        deployment as unknown as { ensureHttpServerConfigured: () => unknown },
+        "ensureHttpServerConfigured",
+      )
+      .mockRejectedValue(new Error("Service setup failed"));
+
+    await expect(deployment.startOrCreateDeployment()).rejects.toThrow(
+      "Service setup failed",
+    );
+
+    // The policy was (re)applied before — and independently of — the HTTP failure.
+    expect(applySpy).toHaveBeenCalled();
+    expect(applySpy.mock.invocationCallOrder[0]).toBeLessThan(
+      httpSpy.mock.invocationCallOrder[0],
+    );
+  });
+
+  describe("waitForDeploymentAbsent", () => {
+    test("resolves once the deployment returns 404", async () => {
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValueOnce({}) // still present
+        .mockRejectedValue(notFound); // then gone
+      const deployment = makeDeployment({ readNamespacedDeployment });
+
+      await expect(
+        // @ts-expect-error - exercising a private method directly
+        deployment.waitForDeploymentAbsent(5, 1),
+      ).resolves.toBeUndefined();
+    });
+
+    test("throws if the deployment never disappears", async () => {
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({});
+      const deployment = makeDeployment({ readNamespacedDeployment });
+
+      await expect(
+        // @ts-expect-error - exercising a private method directly
+        deployment.waitForDeploymentAbsent(2, 1),
+      ).rejects.toThrow(/was not deleted after 2 attempts/);
+    });
+  });
+});
+
+describe("K8sDeployment transient API-server errors (429/5xx)", () => {
+  function createDeployment(
+    mockK8sApi: Partial<k8s.CoreV1Api>,
+    mockK8sAppsApi: Partial<k8s.AppsV1Api>,
+  ): K8sDeployment {
+    const mockMcpServer = {
+      id: "test-server-id",
+      name: "test-server",
+      // No catalogId: startOrCreateDeployment must not depend on a catalog
+      // row existing for these state-machine tests.
+      catalogId: null,
+      secretId: null,
+      ownerId: null,
+      reinstallRequired: false,
+      localInstallationStatus: "idle",
+      localInstallationError: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as unknown as McpServer;
+
+    return new K8sDeployment({
+      mcpServer: mockMcpServer,
+      k8sApi: mockK8sApi as k8s.CoreV1Api,
+      k8sAppsApi: mockK8sAppsApi as k8s.AppsV1Api,
+      k8sNetworkingApi: {} as k8s.NetworkingV1Api,
+      k8sAttach: {} as Attach,
+      k8sLog: {} as Log,
+      k8sExec: {} as Exec,
+      namespace: "default",
+      catalogItem: null,
+    });
+  }
+
+  // Shaped like the client's ApiException: an Error carrying `code` and the
+  // API server's Priority & Fairness response headers.
+  const throttledError = Object.assign(
+    new Error(
+      'HTTP-Code: 429 Message: Unknown API Status Code! Body: "Too many requests, please try again later.\\n"',
+    ),
+    { code: 429, headers: { "retry-after": "0.001" } },
+  );
+
+  test("a throttled reconcile leaves state pending (retryable), not failed", async () => {
+    const readDeployment = vi.fn().mockRejectedValue(throttledError);
+    const deployment = createDeployment(
+      { readNamespacedPod: vi.fn().mockRejectedValue({ statusCode: 404 }) },
+      { readNamespacedDeployment: readDeployment },
+    );
+
+    await expect(deployment.startOrCreateDeployment()).rejects.toEqual(
+      throttledError,
+    );
+
+    // The initial read is retried before giving up...
+    expect(readDeployment).toHaveBeenCalledTimes(3);
+    // ...and a still-throttled reconcile must not latch a terminal "failed":
+    // the pod may be perfectly healthy — status polling re-reads the truth.
+    expect(deployment.statusSummary.state).toBe("pending");
+    expect(deployment.statusSummary.error).toContain("Too many requests");
+  });
+
+  test("a non-transient reconcile error still fails the deployment", async () => {
+    const forbidden = { code: 403, message: "forbidden" };
+    const deployment = createDeployment(
+      { readNamespacedPod: vi.fn().mockRejectedValue({ statusCode: 404 }) },
+      { readNamespacedDeployment: vi.fn().mockRejectedValue(forbidden) },
+    );
+
+    await expect(deployment.startOrCreateDeployment()).rejects.toEqual(
+      forbidden,
+    );
+    expect(deployment.statusSummary.state).toBe("failed");
+  });
+});
+
+describe("K8sDeployment.refreshState failed-state recovery", () => {
+  const crashLoopPod: k8s.V1Pod = {
+    metadata: {
+      name: "mcp-test-server-abc12",
+      creationTimestamp: new Date(),
+    },
+    status: {
+      phase: "Running",
+      containerStatuses: [
+        {
+          name: "mcp-server",
+          restartCount: 3,
+          state: {
+            waiting: {
+              reason: "CrashLoopBackOff",
+              message: "back-off 5m0s restarting failed container",
+            },
+          },
+        } as k8s.V1ContainerStatus,
+      ],
+    },
+  };
+
+  const healthyPod: k8s.V1Pod = {
+    metadata: {
+      name: "mcp-test-server-abc12",
+      creationTimestamp: new Date(),
+    },
+    status: {
+      phase: "Running",
+      containerStatuses: [
+        {
+          name: "mcp-server",
+          restartCount: 3,
+          state: { running: { startedAt: new Date() } },
+        } as k8s.V1ContainerStatus,
+      ],
+    },
+  };
+
+  function createDeployment(scenario: { healthy: boolean }): K8sDeployment {
+    const mockMcpServer = {
+      id: "test-server-id",
+      name: "test-server",
+      catalogId: null,
+      secretId: null,
+      ownerId: null,
+      reinstallRequired: false,
+      localInstallationStatus: "idle",
+      localInstallationError: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as unknown as McpServer;
+
+    const mockK8sApi = {
+      listNamespacedPod: vi.fn().mockImplementation(async () => ({
+        items: [scenario.healthy ? healthyPod : crashLoopPod],
+      })),
+    } as unknown as k8s.CoreV1Api;
+
+    const mockK8sAppsApi = {
+      readNamespacedDeployment: vi.fn().mockImplementation(async () => ({
+        status: { availableReplicas: scenario.healthy ? 1 : 0 },
+      })),
+    } as unknown as k8s.AppsV1Api;
+
+    return new K8sDeployment({
+      mcpServer: mockMcpServer,
+      k8sApi: mockK8sApi,
+      k8sAppsApi: mockK8sAppsApi,
+      k8sNetworkingApi: {} as k8s.NetworkingV1Api,
+      k8sAttach: {} as Attach,
+      k8sLog: {} as Log,
+      k8sExec: {} as Exec,
+      namespace: "default",
+      catalogItem: null,
+    });
+  }
+
+  test("a failed deployment that is verifiably available again flips back to running", async () => {
+    const scenario = { healthy: false };
+    const deployment = createDeployment(scenario);
+
+    // Drive the deployment into "failed" through the public refresh path:
+    // a crashlooping pod with no available replicas.
+    // @ts-expect-error - seeding an active state so refreshState evaluates it
+    deployment.state = "running";
+    await deployment.refreshState();
+    expect(deployment.statusSummary.state).toBe("failed");
+    expect(deployment.statusSummary.error).toContain("back-off");
+
+    // The pod recovers (e.g. the failure was transient); the next poll must
+    // self-heal instead of leaving the server red until a manual restart.
+    scenario.healthy = true;
+    await deployment.refreshState();
+    expect(deployment.statusSummary.state).toBe("running");
+    expect(deployment.statusSummary.error).toBeNull();
+  });
+
+  test("a genuinely broken deployment stays failed across refreshes", async () => {
+    const scenario = { healthy: false };
+    const deployment = createDeployment(scenario);
+
+    // @ts-expect-error - seeding an active state so refreshState evaluates it
+    deployment.state = "running";
+    await deployment.refreshState();
+    expect(deployment.statusSummary.state).toBe("failed");
+
+    await deployment.refreshState();
+    expect(deployment.statusSummary.state).toBe("failed");
+    expect(deployment.statusSummary.error).toContain("back-off");
+  });
+});
+
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+describe("K8sDeployment idle hibernation", () => {
+  const notFound = { statusCode: 404, message: "not found" };
+
+  // Adoption behaves differently when the deployment does not offer the
+  // feature, so pin the ordinary case — beta flag on, operator kill switch
+  // off — and let the tests that need it flip either gate.
+  beforeEach(() => {
+    config.orchestrator.mcpIdleHibernation.betaEnabled = true;
+  });
+  afterEach(() => {
+    config.orchestrator.mcpIdleHibernation.betaEnabled = false;
+    config.orchestrator.mcpIdleHibernation.hardDisabled = false;
+  });
+
+  function makeDeployment(overrides?: {
+    readNamespacedPod?: ReturnType<typeof vi.fn>;
+    listNamespacedPod?: ReturnType<typeof vi.fn>;
+    listNamespacedEvent?: ReturnType<typeof vi.fn>;
+    readNamespacedDeployment?: ReturnType<typeof vi.fn>;
+    patchNamespacedDeployment?: ReturnType<typeof vi.fn>;
+    createNamespacedDeployment?: ReturnType<typeof vi.fn>;
+    deleteNamespacedDeployment?: ReturnType<typeof vi.fn>;
+  }): K8sDeployment {
+    const mockMcpServer = {
+      id: "test-server-id",
+      name: "test-server",
+      // null catalogId so getCatalogItem() short-circuits without a DB lookup
+      catalogId: null,
+    } as unknown as McpServer;
+
+    return new K8sDeployment({
+      mcpServer: mockMcpServer,
+      k8sApi: {
+        readNamespacedPod:
+          overrides?.readNamespacedPod ?? vi.fn().mockRejectedValue(notFound),
+        listNamespacedPod:
+          overrides?.listNamespacedPod ??
+          vi.fn().mockResolvedValue({ items: [] }),
+        listNamespacedEvent:
+          overrides?.listNamespacedEvent ??
+          vi.fn().mockResolvedValue({ items: [] }),
+      } as unknown as k8s.CoreV1Api,
+      k8sAppsApi: {
+        readNamespacedDeployment:
+          overrides?.readNamespacedDeployment ?? vi.fn(),
+        patchNamespacedDeployment:
+          overrides?.patchNamespacedDeployment ?? vi.fn().mockResolvedValue({}),
+        createNamespacedDeployment:
+          overrides?.createNamespacedDeployment ??
+          vi.fn().mockResolvedValue({}),
+        deleteNamespacedDeployment:
+          overrides?.deleteNamespacedDeployment ??
+          vi.fn().mockResolvedValue({}),
+      } as unknown as k8s.AppsV1Api,
+      k8sNetworkingApi: {} as k8s.NetworkingV1Api,
+      k8sAttach: {} as Attach,
+      k8sLog: {} as Log,
+      k8sExec: {} as Exec,
+      namespace: "default",
+      catalogItem: null,
+    });
+  }
+
+  function seedState(
+    deployment: K8sDeployment,
+    state: "pending" | "running" | "failed" | "hibernated" | "waking",
+  ): void {
+    // @ts-expect-error - seeding a private property for testing
+    deployment.state = state;
+  }
+
+  /** A read of a deployment carrying the hibernation annotation. */
+  function annotatedDeploymentRead(replicas: number) {
+    return {
+      metadata: { annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" } },
+      spec: { replicas },
+      status: { availableReplicas: 0 },
+    };
+  }
+
+  /**
+   * Recover the Content-Type header a patch call's options set: the client's
+   * `setHeaderOptions` packs it into a middleware whose `pre` stamps the
+   * header onto the outgoing request, so replay that against a recorder.
+   */
+  function getPatchContentType(options: unknown): string | undefined {
+    let contentType: string | undefined;
+    const fakeRequest = {
+      setHeaderParam: (key: string, value: string) => {
+        if (key === "Content-Type") contentType = value;
+      },
+    };
+    const middleware =
+      (options as { middleware?: Array<{ pre: (req: unknown) => unknown }> })
+        ?.middleware ?? [];
+    for (const m of middleware) m.pre(fakeRequest);
+    return contentType;
+  }
+
+  /**
+   * What a real API server returns from the hibernate patch: the STORED
+   * object, carrying the annotations it just accepted. The lifecycle writes
+   * check their own post-condition against this response — an admission
+   * webhook that strips our ownership marker while honouring the spec would
+   * otherwise leave a deployment at zero replicas that nothing may ever wake —
+   * so a fake that returns `{}` is not a stand-in for the real thing.
+   */
+  const hibernatedResponse = {
+    metadata: {
+      annotations: {
+        [MCP_HIBERNATED_ANNOTATION]: "true",
+        [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "1",
+      },
+    },
+    spec: { replicas: 0 },
+  } as unknown as k8s.V1Deployment;
+  const runningPod = {
+    metadata: { name: "test-server-abc123", creationTimestamp: new Date() },
+    status: {
+      phase: "Running",
+      conditions: [{ type: "Ready", status: "True" }],
+      containerStatuses: [
+        {
+          name: "mcp-server",
+          ready: true,
+          restartCount: 0,
+          state: { running: {} },
+        },
+      ],
+    },
+  } as k8s.V1Pod;
+
+  describe("hibernate", () => {
+    test("sends a single merge patch scaling to 0 with both annotations, and flips state to hibernated", async () => {
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(hibernatedResponse);
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue({ spec: { replicas: 1 } });
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "running");
+
+      await deployment.hibernate();
+
+      expect(patchNamespacedDeployment).toHaveBeenCalledTimes(1);
+      const [request, options] = patchNamespacedDeployment.mock.calls[0];
+      expect(request).toEqual({
+        name: deployment.k8sDeploymentName,
+        namespace: "default",
+        body: {
+          metadata: {
+            annotations: {
+              [MCP_HIBERNATED_ANNOTATION]: "true",
+              [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "1",
+            },
+          },
+          spec: { replicas: 0 },
+        },
+      });
+      expect(getPatchContentType(options)).toBe("application/merge-patch+json");
+      expect(deployment.statusSummary.state).toBe("hibernated");
+      expect(deployment.statusSummary.message).toBe("Hibernated (idle)");
+      expect(deployment.statusSummary.error).toBeNull();
+    });
+
+    test("records the CURRENT replica count in the pre-hibernation annotation", async () => {
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(hibernatedResponse);
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue({ spec: { replicas: 3 } });
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "running");
+
+      await deployment.hibernate();
+
+      const [request] = patchNamespacedDeployment.mock.calls[0];
+      expect(
+        request.body.metadata.annotations[
+          MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION
+        ],
+      ).toBe("3");
+    });
+
+    test("clears cached pod telemetry so statusSummary stops reporting a dead pod", async () => {
+      const runningRead = {
+        metadata: { annotations: {} },
+        spec: { replicas: 1 },
+        status: { availableReplicas: 1 },
+      };
+      const readNamespacedDeployment = vi.fn().mockResolvedValue(runningRead);
+      const listNamespacedPod = vi
+        .fn()
+        .mockResolvedValue({ items: [runningPod] });
+      const deployment = makeDeployment({
+        readNamespacedDeployment,
+        listNamespacedPod,
+        patchNamespacedDeployment: vi
+          .fn()
+          .mockResolvedValue(hibernatedResponse),
+      });
+      seedState(deployment, "running");
+      // Populate the pod telemetry cache through the public refresh path.
+      await deployment.refreshState();
+      expect(deployment.statusSummary.podName).toBe("test-server-abc123");
+
+      await deployment.hibernate();
+
+      expect(deployment.statusSummary.podName).toBeUndefined();
+      expect(deployment.statusSummary.podAge).toBeUndefined();
+      expect(deployment.statusSummary.restartCount).toBe(0);
+    });
+
+    test("propagates k8s errors and refreshes the cached state from cluster truth", async () => {
+      const patchError = { code: 403, message: "forbidden" };
+      const patchNamespacedDeployment = vi.fn().mockRejectedValue(patchError);
+      // The error-path refresh reads the cluster: this deployment is still
+      // untouched (no annotation, replicas 1, available) — so the cached
+      // state converges back to what actually holds: "running".
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: { annotations: {} },
+        spec: { replicas: 1 },
+        status: { availableReplicas: 1 },
+      });
+      const listNamespacedPod = vi
+        .fn()
+        .mockResolvedValue({ items: [runningPod] });
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+        listNamespacedPod,
+      });
+      seedState(deployment, "running");
+
+      await expect(deployment.hibernate()).rejects.toEqual(patchError);
+      expect(deployment.statusSummary.state).toBe("running");
+    });
+
+    test("a patch failure that actually committed converges the cached state to hibernated", async () => {
+      const patchError = { code: 504, message: "gateway timeout" };
+      const patchNamespacedDeployment = vi.fn().mockRejectedValue(patchError);
+      // First read (record replicas): still up. Refresh read (error path):
+      // the patch actually landed — annotation present, replicas 0.
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValueOnce({ spec: { replicas: 1 } })
+        .mockResolvedValue(annotatedDeploymentRead(0));
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "running");
+
+      await expect(deployment.hibernate()).rejects.toEqual(patchError);
+      expect(deployment.statusSummary.state).toBe("hibernated");
+    });
+
+    test("an already-hibernated deployment is a legal no-op, not a second patch", async () => {
+      // Another replica (or an earlier sweep) got there first. Patching again
+      // would record a pre-hibernation count of 0 — and a later wake would
+      // "restore" a deployment that used to run three replicas to one.
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(hibernatedResponse);
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(annotatedDeploymentRead(0));
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "running");
+
+      await expect(deployment.hibernate()).resolves.toEqual({
+        hibernated: false,
+        reason: "already-hibernated",
+      });
+
+      expect(patchNamespacedDeployment).not.toHaveBeenCalled();
+      // Still reported as asleep: that is what the cluster says.
+      expect(deployment.statusSummary.state).toBe("hibernated");
+    });
+
+    test("a zero-replica deployment WITHOUT our annotation is left alone entirely", async () => {
+      // An operator scaled it down. Claiming it would let a later wake undo a
+      // deliberate human decision.
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(hibernatedResponse);
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: { annotations: {} },
+        spec: { replicas: 0 },
+        status: { availableReplicas: 0 },
+      });
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "running");
+
+      await expect(deployment.hibernate()).resolves.toEqual({
+        hibernated: false,
+        reason: "not-ours",
+      });
+
+      expect(patchNamespacedDeployment).not.toHaveBeenCalled();
+      expect(deployment.statusSummary.state).toBe("running");
+    });
+
+    test("the scale-to-zero carries the read's resourceVersion as a compare-and-swap", async () => {
+      const patchNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: {
+          annotations: {
+            [MCP_HIBERNATED_ANNOTATION]: "true",
+            [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "2",
+          },
+        },
+        spec: { replicas: 0 },
+      });
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: { annotations: {}, resourceVersion: "4711" },
+        spec: { replicas: 2 },
+        status: { availableReplicas: 2 },
+      });
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "running");
+
+      await expect(deployment.hibernate()).resolves.toEqual({
+        hibernated: true,
+      });
+
+      // The precondition is what makes this safe across replicas: the API
+      // server rejects the patch outright if anything wrote in between.
+      const [request] = patchNamespacedDeployment.mock.calls[0];
+      expect(request.body.metadata.resourceVersion).toBe("4711");
+    });
+
+    test("refuses to sleep a deployment that is mid-wake, and issues no patch", async () => {
+      // Our own marker with replicas UP is the state the machine calls
+      // "waking". Scaling it down here kills the pod the wake just started,
+      // and tells the caller it may tear down pooled connections for a server
+      // that is coming up to serve. A resourceVersion CAS cannot catch this:
+      // nothing changed between the read and the write, so the CAS PASSES.
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(hibernatedResponse);
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: {
+          annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" },
+          resourceVersion: "7",
+        },
+        spec: { replicas: 1 },
+      });
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "running");
+
+      const result = await deployment.hibernate();
+
+      expect(result).toEqual({ hibernated: false, reason: "waking" });
+      expect(patchNamespacedDeployment).not.toHaveBeenCalled();
+    });
+
+    test("a cluster that strips our ownership marker is not reported as hibernated", async () => {
+      // An admission policy that drops unknown annotations while honouring the
+      // spec leaves the deployment at zero replicas with nothing claiming it —
+      // indistinguishable from an operator's own scale-to-zero, which nothing
+      // is ever allowed to wake. Trusting our own patch would mint that orphan
+      // once per idle window, silently.
+      const strippedResponse = {
+        metadata: { annotations: {} },
+        spec: { replicas: 0 },
+      } as unknown as k8s.V1Deployment;
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(strippedResponse);
+      const readNamespacedDeployment = vi
+        .fn()
+        // the pre-write read, then the confirming re-read
+        .mockResolvedValueOnce({
+          metadata: { annotations: {}, resourceVersion: "3" },
+          spec: { replicas: 1 },
+        })
+        .mockResolvedValue(strippedResponse);
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "running");
+
+      const result = await deployment.hibernate();
+
+      expect(result.hibernated).toBe(false);
+      expect(deployment.statusSummary.state).not.toBe("hibernated");
+      expect(deployment.statusSummary.error).toContain("Archestra-owned");
+    });
+
+    test("an unreadable confirmation is not acceptance: the hibernate fails closed and restores", async () => {
+      // The response shows the marker stripped; the confirming re-read then
+      // fails transiently. Treating that as success would record a hibernate
+      // while the cluster may hold an unannotated zero-replica Deployment —
+      // the orphan the wake path refuses to claim, dead until a human
+      // intervenes. It must fail closed and run the guarded restore.
+      const strippedResponse = {
+        metadata: { annotations: {} },
+        spec: { replicas: 0 },
+      } as unknown as k8s.V1Deployment;
+      const patchNamespacedDeployment = vi
+        .fn()
+        // the hibernate patch: admission stripped the marker
+        .mockResolvedValueOnce(strippedResponse)
+        // the restore patch: replicas put back
+        .mockResolvedValue({
+          metadata: { annotations: {} },
+          spec: { replicas: 1 },
+        });
+      const readNamespacedDeployment = vi
+        .fn()
+        // the pre-write read
+        .mockResolvedValueOnce({
+          metadata: { annotations: {}, resourceVersion: "3" },
+          spec: { replicas: 1 },
+        })
+        // the confirming re-read: unreadable
+        .mockRejectedValueOnce({ statusCode: 500, message: "etcd timeout" })
+        // the restore's own read: the orphan the hibernate may have minted
+        .mockResolvedValue({
+          metadata: { annotations: {}, resourceVersion: "4" },
+          spec: { replicas: 0 },
+          status: { availableReplicas: 0 },
+        });
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "running");
+
+      const result = await deployment.hibernate();
+
+      expect(result).toEqual({ hibernated: false, reason: "conflict" });
+      expect(deployment.statusSummary.state).not.toBe("hibernated");
+      expect(deployment.statusSummary.error).toContain(
+        "could not be confirmed",
+      );
+      // The guarded restore put the replicas back.
+      const restorePatches = patchNamespacedDeployment.mock.calls.filter(
+        ([request]) => request?.body?.spec?.replicas === 1,
+      );
+      expect(restorePatches).toHaveLength(1);
+    });
+
+    test("an attempt superseded by a newer transition never lands its patch", async () => {
+      // withDeadline releases the caller at 120s while the work keeps running.
+      // That abandoned attempt must not still write on top of whatever
+      // happened since, which is exactly what the generation counter is for.
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(hibernatedResponse);
+      let releaseRead!: () => void;
+      const readInFlight = new Promise<void>((resolve) => {
+        releaseRead = resolve;
+      });
+      const readNamespacedDeployment = vi
+        .fn()
+        // the hibernate's read, held open
+        .mockImplementationOnce(async () => {
+          await readInFlight;
+          return {
+            metadata: { annotations: {}, resourceVersion: "3" },
+            spec: { replicas: 1 },
+          };
+        })
+        // everything after it sees a hibernated deployment, so the wake below
+        // is a legal transition and bumps the generation
+        .mockResolvedValue({
+          metadata: {
+            annotations: {
+              [MCP_HIBERNATED_ANNOTATION]: "true",
+              [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "2",
+            },
+            resourceVersion: "4",
+          },
+          spec: { replicas: 0 },
+        });
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "running");
+
+      const hibernating = deployment.hibernate();
+      await deployment.beginWake();
+      releaseRead();
+      const result = await hibernating;
+
+      expect(result.hibernated).toBe(false);
+      // The wake's own scale-up is expected; a scale-to-zero from the
+      // superseded attempt is not.
+      const scaledToZero = patchNamespacedDeployment.mock.calls.filter(
+        ([request]) => request?.body?.spec?.replicas === 0,
+      );
+      expect(scaledToZero).toEqual([]);
+    });
+
+    test("a lost compare-and-swap (409) abandons the hibernate silently", async () => {
+      // Never hibernate on doubt: the replica count we read is now stale, so
+      // there is nothing safe to record. The next sweep re-evaluates.
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockRejectedValue({ statusCode: 409, message: "conflict" });
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: { annotations: {}, resourceVersion: "9" },
+        spec: { replicas: 1 },
+        status: { availableReplicas: 1 },
+      });
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "running");
+
+      await expect(deployment.hibernate()).resolves.toEqual({
+        hibernated: false,
+        reason: "conflict",
+      });
+
+      expect(patchNamespacedDeployment).toHaveBeenCalledTimes(1);
+      expect(deployment.statusSummary.state).toBe("running");
+    });
+  });
+
+  describe("beginWake / completeWake", () => {
+    /**
+     * What a real API server returns from either wake write: the STORED
+     * object. Chosen to satisfy both post-conditions at once — replicas up for
+     * the scale-up, marker gone for the finish — so a fake returning `{}`
+     * cannot pass for a cluster that accepted the write.
+     */
+    const wakeWriteResponse = {
+      metadata: { annotations: {} },
+      spec: { replicas: 3 },
+      status: { availableReplicas: 3, readyReplicas: 3 },
+    } as unknown as k8s.V1Deployment;
+
+    test("beginWake merge-patches replicas only (default 1), leaving the annotations in place", async () => {
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(wakeWriteResponse);
+      // No pre-hibernation-replicas annotation recorded (e.g. hibernated by
+      // an older build) — restore the default of 1.
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(annotatedDeploymentRead(0));
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "hibernated");
+
+      await deployment.beginWake();
+
+      expect(patchNamespacedDeployment).toHaveBeenCalledTimes(1);
+      const [request, options] = patchNamespacedDeployment.mock.calls[0];
+      // Exact body match: replicas only — no metadata/annotations key at all,
+      // so the merge patch cannot touch the hibernation annotations.
+      expect(request).toEqual({
+        name: deployment.k8sDeploymentName,
+        namespace: "default",
+        body: { spec: { replicas: 1 } },
+      });
+      expect(getPatchContentType(options)).toBe("application/merge-patch+json");
+      // Not "pending": a scale-up from idle is its own calm state, so the UI
+      // never shows a bare "0/1" that reads as an outage.
+      expect(deployment.statusSummary.state).toBe("waking");
+      expect(deployment.statusSummary.message).toBe("Waking (from idle)");
+      expect(deployment.statusSummary.error).toBeNull();
+    });
+
+    test("beginWake restores the recorded pre-hibernation replica count", async () => {
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(wakeWriteResponse);
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: {
+          annotations: {
+            [MCP_HIBERNATED_ANNOTATION]: "true",
+            [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "3",
+          },
+        },
+        spec: { replicas: 0 },
+        status: { availableReplicas: 0 },
+      });
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "hibernated");
+
+      await deployment.beginWake();
+
+      const [request] = patchNamespacedDeployment.mock.calls[0];
+      expect(request.body).toEqual({ spec: { replicas: 3 } });
+    });
+
+    test("beginWake clamps a garbage or sub-1 recorded count to 1", async () => {
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(wakeWriteResponse);
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: {
+          annotations: {
+            [MCP_HIBERNATED_ANNOTATION]: "true",
+            [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "0",
+          },
+        },
+        spec: { replicas: 0 },
+        status: { availableReplicas: 0 },
+      });
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "hibernated");
+
+      await deployment.beginWake();
+
+      const [request] = patchNamespacedDeployment.mock.calls[0];
+      expect(request.body).toEqual({ spec: { replicas: 1 } });
+    });
+
+    test("completeWake deletes BOTH annotations via merge-patch nulls and flips state to running", async () => {
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(wakeWriteResponse);
+      // The shape a wake is actually in when completeWake lands: beginWake
+      // scaled it up, the annotations are still on it, the readiness wait
+      // confirmed it. completeWake now REQUIRES that shape — landing this
+      // write on a deployment something re-slept in the meantime is what
+      // erased the ownership marker and orphaned the deployment for good.
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: {
+          annotations: {
+            [MCP_HIBERNATED_ANNOTATION]: "true",
+            [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "1",
+          },
+          resourceVersion: "11",
+        },
+        spec: { replicas: 1 },
+        status: { availableReplicas: 1, readyReplicas: 1 },
+      });
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "waking");
+
+      await deployment.completeWake();
+
+      expect(patchNamespacedDeployment).toHaveBeenCalledTimes(1);
+      const [request, options] = patchNamespacedDeployment.mock.calls[0];
+      expect(request).toEqual({
+        name: deployment.k8sDeploymentName,
+        namespace: "default",
+        body: {
+          metadata: {
+            // The compare-and-swap this write used to go out without.
+            resourceVersion: "11",
+            annotations: {
+              [MCP_HIBERNATED_ANNOTATION]: null,
+              [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: null,
+            },
+          },
+        },
+      });
+      expect(getPatchContentType(options)).toBe("application/merge-patch+json");
+      expect(deployment.statusSummary.state).toBe("running");
+    });
+
+    test("completeWake converges without recursion when availability precedes readiness", async () => {
+      const patchNamespacedDeployment = vi.fn();
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: {
+          annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" },
+          resourceVersion: "12",
+        },
+        spec: { replicas: 1 },
+        status: { availableReplicas: 1, readyReplicas: 0 },
+      });
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "waking");
+
+      await expect(deployment.completeWake()).resolves.toBe("waking");
+      expect(patchNamespacedDeployment).not.toHaveBeenCalled();
+    });
+
+    test("beginWake carries the read's resourceVersion as a compare-and-swap", async () => {
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(wakeWriteResponse);
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: {
+          annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" },
+          resourceVersion: "1234",
+        },
+        spec: { replicas: 0 },
+        status: { availableReplicas: 0 },
+      });
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "hibernated");
+
+      await deployment.beginWake();
+
+      const [request] = patchNamespacedDeployment.mock.calls[0];
+      expect(request.body).toEqual({
+        metadata: { resourceVersion: "1234" },
+        spec: { replicas: 1 },
+      });
+    });
+
+    test("a lost wake race retries once when the deployment is still hibernated", async () => {
+      // Unlike a hibernate, a wake is safe to insist on: the deployment is
+      // still asleep and somebody has to bring it back. Only the stale
+      // precondition needs refreshing.
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockRejectedValueOnce({ statusCode: 409, message: "conflict" })
+        .mockResolvedValue(wakeWriteResponse);
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValueOnce({
+          metadata: {
+            annotations: {
+              [MCP_HIBERNATED_ANNOTATION]: "true",
+              [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "2",
+            },
+            resourceVersion: "1",
+          },
+          spec: { replicas: 0 },
+          status: { availableReplicas: 0 },
+        })
+        .mockResolvedValue({
+          metadata: {
+            annotations: {
+              [MCP_HIBERNATED_ANNOTATION]: "true",
+              [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "2",
+            },
+            resourceVersion: "2",
+          },
+          spec: { replicas: 0 },
+          status: { availableReplicas: 0 },
+        });
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "hibernated");
+
+      await deployment.beginWake();
+
+      expect(patchNamespacedDeployment).toHaveBeenCalledTimes(2);
+      expect(patchNamespacedDeployment.mock.calls[1][0].body).toEqual({
+        metadata: { resourceVersion: "2" },
+        spec: { replicas: 2 },
+      });
+      expect(deployment.statusSummary.state).toBe("waking");
+    });
+
+    test("a lost wake race whose re-read is no longer hibernated converges instead of scaling twice", async () => {
+      // Another replica already woke it. Scaling it a second time would fight
+      // them; the readiness wait the caller runs next rides along with the
+      // wake that is already in progress.
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockRejectedValueOnce({ statusCode: 409, message: "conflict" })
+        .mockResolvedValue({});
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValueOnce({
+          metadata: {
+            annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" },
+            resourceVersion: "1",
+          },
+          spec: { replicas: 0 },
+          status: { availableReplicas: 0 },
+        })
+        .mockResolvedValue({
+          metadata: { annotations: {}, resourceVersion: "3" },
+          spec: { replicas: 1 },
+          status: { availableReplicas: 1 },
+        });
+      const listNamespacedPod = vi
+        .fn()
+        .mockResolvedValue({ items: [runningPod] });
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+        listNamespacedPod,
+      });
+      seedState(deployment, "hibernated");
+
+      await deployment.beginWake();
+
+      expect(patchNamespacedDeployment).toHaveBeenCalledTimes(1);
+      // Converged on cluster truth rather than guessing.
+      expect(deployment.statusSummary.state).toBe("running");
+    });
+
+    test("beginWake and completeWake propagate k8s errors", async () => {
+      const patchError = { code: 500, message: "boom" };
+      const patchNamespacedDeployment = vi.fn().mockRejectedValue(patchError);
+      const asleep = {
+        metadata: {
+          annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" },
+          resourceVersion: "1",
+        },
+        spec: { replicas: 0 },
+      };
+      const readyButAnnotated = {
+        metadata: {
+          annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" },
+          resourceVersion: "2",
+        },
+        spec: { replicas: 1 },
+        status: { availableReplicas: 1, readyReplicas: 1 },
+      };
+      // Each failed patch is followed by a confirming read. Keep that read in
+      // the old shape so an ambiguous error is not mistaken for a committed
+      // transition.
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValueOnce(asleep)
+        .mockResolvedValueOnce(asleep)
+        .mockResolvedValueOnce(readyButAnnotated)
+        .mockResolvedValue(readyButAnnotated);
+      const deployment = makeDeployment({
+        patchNamespacedDeployment,
+        readNamespacedDeployment,
+      });
+      seedState(deployment, "hibernated");
+
+      await expect(deployment.beginWake()).rejects.toEqual(patchError);
+      await expect(deployment.completeWake()).rejects.toEqual(patchError);
+    });
+  });
+
+  describe("refreshState", () => {
+    test("replicas 0 with the annotation refreshes to hibernated, not pending", async () => {
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(annotatedDeploymentRead(0));
+      const deployment = makeDeployment({ readNamespacedDeployment });
+      seedState(deployment, "running");
+
+      await deployment.refreshState();
+
+      expect(deployment.statusSummary.state).toBe("hibernated");
+      expect(deployment.statusSummary.message).toBe("Hibernated (idle)");
+      expect(deployment.statusSummary.error).toBeNull();
+    });
+
+    test("a hibernated deployment is still refreshed (not skipped by the state guard)", async () => {
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(annotatedDeploymentRead(0));
+      const deployment = makeDeployment({ readNamespacedDeployment });
+      seedState(deployment, "hibernated");
+
+      await deployment.refreshState();
+
+      expect(readNamespacedDeployment).toHaveBeenCalled();
+      expect(deployment.statusSummary.state).toBe("hibernated");
+    });
+
+    test("pod telemetry is cleared once the hibernated deployment's pod is gone", async () => {
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(annotatedDeploymentRead(0));
+      // First refresh still finds the Terminating pod (repopulating the
+      // caches hibernate() cleared); the second finds nothing.
+      const listNamespacedPod = vi
+        .fn()
+        .mockResolvedValueOnce({
+          items: [
+            {
+              metadata: {
+                name: "test-server-pod-abc",
+                creationTimestamp: "2026-08-06T10:00:00Z",
+              },
+              status: {
+                phase: "Running",
+                containerStatuses: [{ name: "mcp-server", restartCount: 2 }],
+              },
+            },
+          ],
+        })
+        .mockResolvedValue({ items: [] });
+      const deployment = makeDeployment({
+        readNamespacedDeployment,
+        listNamespacedPod,
+      });
+      seedState(deployment, "hibernated");
+
+      await deployment.refreshState();
+      expect(deployment.statusSummary.podName).toBe("test-server-pod-abc");
+
+      await deployment.refreshState();
+      expect(deployment.statusSummary.state).toBe("hibernated");
+      expect(deployment.statusSummary.podName).toBeUndefined();
+      expect(deployment.statusSummary.podAge).toBeUndefined();
+      expect(deployment.statusSummary.restartCount).toBe(0);
+    });
+
+    test("a FAILED pod lookup leaves the telemetry alone instead of reporting no pod", async () => {
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(annotatedDeploymentRead(0));
+      const listNamespacedPod = vi
+        .fn()
+        .mockResolvedValueOnce({
+          items: [
+            {
+              metadata: {
+                name: "test-server-pod-abc",
+                creationTimestamp: "2026-08-06T10:00:00Z",
+              },
+              status: {
+                phase: "Running",
+                containerStatuses: [{ name: "mcp-server", restartCount: 2 }],
+              },
+            },
+          ],
+        })
+        .mockRejectedValue({ statusCode: 429, message: "too many requests" });
+      const deployment = makeDeployment({
+        readNamespacedDeployment,
+        listNamespacedPod,
+      });
+      seedState(deployment, "hibernated");
+
+      await deployment.refreshState();
+      expect(deployment.statusSummary.podName).toBe("test-server-pod-abc");
+
+      // A throttled API server says nothing about the pod. Clearing here would
+      // erase a live pod's identity, age and restart count on every 429.
+      await deployment.refreshState();
+      expect(deployment.statusSummary.podName).toBe("test-server-pod-abc");
+      expect(deployment.statusSummary.restartCount).toBe(2);
+      // ...and the state evaluation still runs on the deployment read.
+      expect(deployment.statusSummary.state).toBe("hibernated");
+    });
+
+    test("removing the annotation externally releases the deployment instead of pinning it hibernated", async () => {
+      // An operator cleared our annotation but the deployment is still at 0.
+      // Nothing here is ours anymore, and no branch could ever clear the
+      // cached state again — it read "Hibernated" in the UI forever.
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: { annotations: {} },
+        spec: { replicas: 0 },
+        status: { availableReplicas: 0 },
+      });
+      const deployment = makeDeployment({ readNamespacedDeployment });
+      seedState(deployment, "hibernated");
+
+      await deployment.refreshState();
+
+      expect(deployment.statusSummary.state).toBe("pending");
+    });
+
+    test("a refresh in flight when a hibernate lands does not overwrite it", async () => {
+      // The refresh's pod lookup resolves only once the test says so, so the
+      // hibernate lands in the middle of it — the ordering that had a stale
+      // "running" reading overwrite "hibernated", leaving the manager routing
+      // tool calls to a pod that had already been scaled away.
+      let releasePodList!: () => void;
+      const podListInFlight = new Promise<void>((resolve) => {
+        releasePodList = resolve;
+      });
+      const listNamespacedPod = vi
+        .fn()
+        .mockImplementationOnce(async () => {
+          await podListInFlight;
+          return { items: [runningPod] };
+        })
+        .mockResolvedValue({ items: [] });
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: { annotations: {} },
+        spec: { replicas: 1 },
+        status: { availableReplicas: 1 },
+      });
+      const deployment = makeDeployment({
+        readNamespacedDeployment,
+        listNamespacedPod,
+        patchNamespacedDeployment: vi
+          .fn()
+          .mockResolvedValue(hibernatedResponse),
+      });
+      seedState(deployment, "running");
+
+      const refresh = deployment.refreshState();
+      await deployment.hibernate();
+      releasePodList();
+      await refresh;
+
+      expect(deployment.statusSummary.state).toBe("hibernated");
+      // The same stale reading must not resurrect the dead pod's telemetry.
+      expect(deployment.statusSummary.podName).toBeUndefined();
+    });
+
+    test("replicas >= 1 with the annotation but NOT yet available refreshes to waking", async () => {
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: { annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" } },
+        spec: { replicas: 1 },
+        status: { availableReplicas: 0 },
+      });
+      const deployment = makeDeployment({ readNamespacedDeployment });
+      seedState(deployment, "hibernated");
+
+      await deployment.refreshState();
+
+      // The annotation is only removed once the deployment is verifiably up,
+      // so until then the deployment is "waking" — an expected, calm state,
+      // not a half-broken "pending".
+      expect(deployment.statusSummary.state).toBe("waking");
+      expect(deployment.statusSummary.message).toBe("Waking (from idle)");
+      expect(deployment.statusSummary.error).toBeNull();
+    });
+
+    test("a waking deployment is still refreshed (not skipped by the state guard) and converges to running", async () => {
+      // The wake finished: replicas up, available, annotation already removed
+      // by completeWake.
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: { annotations: {} },
+        spec: { replicas: 1 },
+        status: { availableReplicas: 1 },
+      });
+      const listNamespacedPod = vi
+        .fn()
+        .mockResolvedValue({ items: [runningPod] });
+      const deployment = makeDeployment({
+        readNamespacedDeployment,
+        listNamespacedPod,
+      });
+      seedState(deployment, "waking");
+
+      await deployment.refreshState();
+
+      expect(readNamespacedDeployment).toHaveBeenCalled();
+      expect(deployment.statusSummary.state).toBe("running");
+    });
+
+    test("SELF-HEAL: an available deployment still carrying the annotation completes the wake on refresh", async () => {
+      const patchNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: { annotations: {} },
+        spec: { replicas: 1 },
+        status: { availableReplicas: 1, readyReplicas: 1 },
+      });
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: { annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" } },
+        spec: { replicas: 1 },
+        status: { availableReplicas: 1, readyReplicas: 1 },
+      });
+      const listNamespacedPod = vi
+        .fn()
+        .mockResolvedValue({ items: [runningPod] });
+      const deployment = makeDeployment({
+        readNamespacedDeployment,
+        listNamespacedPod,
+        patchNamespacedDeployment,
+      });
+      // A wake whose completeWake patch failed (or whose process crashed)
+      // left annotation + replicas >= 1; the watcher-triggered refresh must
+      // finish the job instead of wedging the state at "pending" forever.
+      seedState(deployment, "pending");
+
+      await deployment.refreshState();
+
+      expect(patchNamespacedDeployment).toHaveBeenCalledTimes(1);
+      const [request] = patchNamespacedDeployment.mock.calls[0];
+      expect(request.body).toEqual({
+        metadata: {
+          annotations: {
+            [MCP_HIBERNATED_ANNOTATION]: null,
+            [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: null,
+          },
+        },
+      });
+      expect(deployment.statusSummary.state).toBe("running");
+    });
+
+    test("SELF-HEAL patch failure stays pending so the next refresh retries", async () => {
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockRejectedValue({ code: 500, message: "boom" });
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: { annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" } },
+        spec: { replicas: 1 },
+        status: { availableReplicas: 1, readyReplicas: 1 },
+      });
+      const deployment = makeDeployment({
+        readNamespacedDeployment,
+        patchNamespacedDeployment,
+      });
+      seedState(deployment, "pending");
+
+      await expect(deployment.refreshState()).resolves.toBeUndefined();
+
+      expect(deployment.statusSummary.state).toBe("pending");
+    });
+
+    test("a demand-path refresh propagates cluster read failures", async () => {
+      const deployment = makeDeployment({
+        readNamespacedDeployment: vi
+          .fn()
+          .mockRejectedValue(new Error("api unavailable")),
+      });
+      seedState(deployment, "running");
+
+      await expect(
+        deployment.refreshState({ throwOnError: true }),
+      ).rejects.toThrow("api unavailable");
+      expect(deployment.statusSummary.state).toBe("running");
+    });
+
+    test("replicas 0 WITHOUT the annotation keeps the existing debounced downgrade behavior", async () => {
+      // Externally scaled to zero — not ours. The pre-hibernation behavior
+      // applies: a running deployment only downgrades to pending after
+      // several consecutive misses (RUNNING_MISS_THRESHOLD = 3).
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        spec: { replicas: 0 },
+        status: { availableReplicas: 0 },
+      });
+      const deployment = makeDeployment({ readNamespacedDeployment });
+      seedState(deployment, "running");
+
+      await deployment.refreshState();
+      expect(deployment.statusSummary.state).toBe("running");
+      await deployment.refreshState();
+      expect(deployment.statusSummary.state).toBe("running");
+      await deployment.refreshState();
+      expect(deployment.statusSummary.state).toBe("pending");
+    });
+  });
+
+  describe("startOrCreateDeployment adoption", () => {
+    test("adopts an existing zero-replica annotated deployment as hibernated without recreating or scaling it", async () => {
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(annotatedDeploymentRead(0));
+      const patchNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: { annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" } },
+        spec: { replicas: 1 },
+      });
+      const createNamespacedDeployment = vi.fn().mockResolvedValue({});
+      const deleteNamespacedDeployment = vi.fn().mockResolvedValue({});
+      const deployment = makeDeployment({
+        readNamespacedDeployment,
+        patchNamespacedDeployment,
+        createNamespacedDeployment,
+        deleteNamespacedDeployment,
+      });
+      const applySpy = vi
+        .spyOn(deployment, "applyK8sNetworkPolicy")
+        .mockResolvedValue(undefined);
+      const httpSpy = vi
+        .spyOn(
+          deployment as unknown as {
+            ensureHttpServerConfigured: () => unknown;
+          },
+          "ensureHttpServerConfigured",
+        )
+        .mockResolvedValue(undefined);
+      const runFencedMutation: ClusterLeaseGuard["runFencedMutation"] = vi.fn(
+        async (fn) => fn({} as never),
+      );
+
+      await expect(
+        deployment.startOrCreateDeployment(undefined, { runFencedMutation }),
+      ).resolves.toBeUndefined();
+
+      expect(deployment.statusSummary.state).toBe("hibernated");
+      // Adopted as-is: not recreated, not deleted, and never scaled up.
+      expect(createNamespacedDeployment).not.toHaveBeenCalled();
+      expect(deleteNamespacedDeployment).not.toHaveBeenCalled();
+      expect(patchNamespacedDeployment).not.toHaveBeenCalled();
+      // The egress policy and HTTP Service stay reconciled while asleep, so a
+      // wake only needs to scale up.
+      expect(applySpy).toHaveBeenCalled();
+      expect(httpSpy).toHaveBeenCalled();
+      expect(runFencedMutation).toHaveBeenCalledTimes(2);
+    });
+
+    test("scales a hibernated deployment back up when idle hibernation has been turned off", async () => {
+      config.orchestrator.mcpIdleHibernation.hardDisabled = true;
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(annotatedDeploymentRead(0));
+      const patchNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: { annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" } },
+        spec: { replicas: 1 },
+      });
+      const deployment = makeDeployment({
+        readNamespacedDeployment,
+        patchNamespacedDeployment,
+      });
+      vi.spyOn(deployment, "applyK8sNetworkPolicy").mockResolvedValue(
+        undefined,
+      );
+      vi.spyOn(
+        deployment as unknown as { ensureHttpServerConfigured: () => unknown },
+        "ensureHttpServerConfigured",
+      ).mockResolvedValue(undefined);
+
+      await deployment.startOrCreateDeployment();
+
+      // Setting the window back to 0 means "always on". Adopting the sleeping
+      // deployment as-is would strand it: no sweeper runs, so only a tool call
+      // would ever bring it back.
+      expect(patchNamespacedDeployment).toHaveBeenCalledTimes(1);
+      expect(patchNamespacedDeployment.mock.calls[0][0].body).toEqual({
+        spec: { replicas: 1 },
+      });
+      expect(deployment.statusSummary.state).toBe("waking");
+    });
+
+    test("scales a hibernated deployment back up on adoption when the beta flag is off", async () => {
+      // Same stranding logic as the kill switch: with the feature not offered,
+      // no sweeper runs, so a sleeping deployment must not stay asleep.
+      config.orchestrator.mcpIdleHibernation.betaEnabled = false;
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(annotatedDeploymentRead(0));
+      const patchNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: { annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" } },
+        spec: { replicas: 1 },
+      });
+      const deployment = makeDeployment({
+        readNamespacedDeployment,
+        patchNamespacedDeployment,
+      });
+      vi.spyOn(deployment, "applyK8sNetworkPolicy").mockResolvedValue(
+        undefined,
+      );
+      vi.spyOn(
+        deployment as unknown as { ensureHttpServerConfigured: () => unknown },
+        "ensureHttpServerConfigured",
+      ).mockResolvedValue(undefined);
+
+      await deployment.startOrCreateDeployment();
+
+      expect(patchNamespacedDeployment).toHaveBeenCalledTimes(1);
+      expect(patchNamespacedDeployment.mock.calls[0][0].body).toEqual({
+        spec: { replicas: 1 },
+      });
+      expect(deployment.statusSummary.state).toBe("waking");
+    });
+
+    test("adopts an annotated deployment already scaled back up as waking, not as a cold pending start", async () => {
+      // A restart mid-wake: replicas are back but the annotation is only
+      // dropped once the deployment is verifiably up.
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(annotatedDeploymentRead(1));
+      const patchNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: { annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" } },
+        spec: { replicas: 1 },
+      });
+      const createNamespacedDeployment = vi.fn().mockResolvedValue({});
+      const deployment = makeDeployment({
+        readNamespacedDeployment,
+        patchNamespacedDeployment,
+        createNamespacedDeployment,
+      });
+      vi.spyOn(deployment, "applyK8sNetworkPolicy").mockResolvedValue(
+        undefined,
+      );
+      vi.spyOn(
+        deployment as unknown as {
+          ensureHttpServerConfigured: () => unknown;
+        },
+        "ensureHttpServerConfigured",
+      ).mockResolvedValue(undefined);
+
+      await expect(
+        deployment.startOrCreateDeployment(),
+      ).resolves.toBeUndefined();
+
+      expect(deployment.statusSummary.state).toBe("waking");
+      expect(createNamespacedDeployment).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("waitForDeploymentReady during a wake", () => {
+    test("a waking deployment (annotation still present) passes readiness once available with a Running pod", async () => {
+      const readNamespacedDeployment = vi.fn().mockResolvedValue({
+        metadata: { annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" } },
+        spec: { replicas: 1 },
+        status: { availableReplicas: 1 },
+      });
+      const listNamespacedPod = vi
+        .fn()
+        .mockResolvedValue({ items: [runningPod] });
+      const deployment = makeDeployment({
+        readNamespacedDeployment,
+        listNamespacedPod,
+      });
+      seedState(deployment, "waking");
+
+      await expect(
+        deployment.waitForDeploymentReady(5, 1),
+      ).resolves.toBeUndefined();
+      // Readiness itself ignores the annotation; the manager removes it via
+      // completeWake after this returns.
+      expect(deployment.statusSummary.state).toBe("running");
+      expect(deployment.statusSummary.error).toBeNull();
+    });
+
+    const notReadyDeploymentRead = () =>
+      vi.fn().mockResolvedValue({
+        metadata: { annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" } },
+        spec: { replicas: 1 },
+        status: { availableReplicas: 0 },
+      });
+
+    /** A pod the scheduler has refused, with the wording it gave. */
+    function unschedulablePod(message: string, ageMs = 60 * 1000): k8s.V1Pod {
+      return {
+        metadata: {
+          name: "test-server-abc123",
+          creationTimestamp: new Date(Date.now() - ageMs),
+        },
+        status: {
+          phase: "Pending",
+          conditions: [
+            { type: "PodScheduled", status: "False", message },
+          ] as k8s.V1PodCondition[],
+        },
+      } as k8s.V1Pod;
+    }
+
+    /** A pod that got a node and is now stuck pulling its image. */
+    const pullingPod = {
+      metadata: { name: "test-server-abc123", creationTimestamp: new Date() },
+      status: {
+        phase: "Pending",
+        conditions: [
+          { type: "PodScheduled", status: "True" },
+        ] as k8s.V1PodCondition[],
+        containerStatuses: [
+          {
+            name: "mcp-server",
+            ready: false,
+            restartCount: 0,
+            state: {
+              waiting: {
+                reason: "ImagePullBackOff",
+                message: 'Back-off pulling image "ghcr.io/example/mcp:latest"',
+              },
+            },
+          },
+        ],
+      },
+    } as k8s.V1Pod;
+
+    function warningEvent(message: string) {
+      return {
+        type: "Warning",
+        message,
+        lastTimestamp: new Date(),
+        involvedObject: { name: "mcp-test-server-7d9f" },
+      };
+    }
+
+    test("rides out resource pressure and ends on a retryable capacity error", async () => {
+      const deployment = makeDeployment({
+        readNamespacedDeployment: notReadyDeploymentRead(),
+        listNamespacedPod: vi.fn().mockResolvedValue({
+          items: [
+            unschedulablePod("0/3 nodes are available: 3 Insufficient cpu."),
+          ],
+        }),
+      });
+      seedState(deployment, "waking");
+
+      await expect(
+        deployment.waitForDeploymentReady(3, 1, {
+          waitOutUnschedulablePods: true,
+        }),
+      ).rejects.toThrow(/cannot schedule.*Insufficient cpu/);
+      // Branding a full-but-healthy cluster "failed" would stop the agent
+      // from retrying at the one moment retrying is exactly right.
+      expect(deployment.statusSummary.state).not.toBe("failed");
+    });
+
+    // Nothing about these clears itself, so waiting them out is an infinite
+    // retry loop rather than patience.
+    test.each([
+      "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector.",
+      "0/3 nodes are available: 3 node(s) had untolerated taint {dedicated: gpu}.",
+      "0/2 nodes are available: 2 pod has unbound immediate PersistentVolumeClaims.",
+    ])("still fails a wake fast on: %s", async (message) => {
+      const deployment = makeDeployment({
+        readNamespacedDeployment: notReadyDeploymentRead(),
+        listNamespacedPod: vi
+          .fn()
+          .mockResolvedValue({ items: [unschedulablePod(message)] }),
+      });
+      seedState(deployment, "waking");
+
+      await expect(
+        deployment.waitForDeploymentReady(3, 1, {
+          waitOutUnschedulablePods: true,
+        }),
+      ).rejects.toThrow(/failed: Pod scheduling failed/);
+      expect(deployment.statusSummary.state).toBe("failed");
+    });
+
+    test("an exhausted namespace quota surfaces as capacity, not as a failed deployment", async () => {
+      const deployment = makeDeployment({
+        readNamespacedDeployment: notReadyDeploymentRead(),
+        listNamespacedEvent: vi.fn().mockResolvedValue({
+          items: [
+            warningEvent(
+              'pods "mcp-test-server-7d9f" is forbidden: exceeded quota: mcp-quota, requested: pods=1, used: pods=10, limited: pods=10',
+            ),
+          ],
+        }),
+      });
+      seedState(deployment, "waking");
+
+      await expect(
+        deployment.waitForDeploymentReady(6, 1, {
+          waitOutUnschedulablePods: true,
+        }),
+      ).rejects.toThrow(/cannot schedule.*exceeded quota/);
+      expect(deployment.statusSummary.state).not.toBe("failed");
+    });
+
+    test("a non-capacity warning event still ends the wake as failed", async () => {
+      const deployment = makeDeployment({
+        readNamespacedDeployment: notReadyDeploymentRead(),
+        listNamespacedEvent: vi.fn().mockResolvedValue({
+          items: [
+            warningEvent(
+              'error looking up service account default/missing-sa: serviceaccount "missing-sa" not found',
+            ),
+          ],
+        }),
+      });
+      seedState(deployment, "waking");
+
+      await expect(
+        deployment.waitForDeploymentReady(6, 1, {
+          waitOutUnschedulablePods: true,
+        }),
+      ).rejects.toThrow(/failed: Invalid ServiceAccount/);
+      expect(deployment.statusSummary.state).toBe("failed");
+    });
+
+    test("a wake that waits for a node and then fails to pull reports the pull error", async () => {
+      const deployment = makeDeployment({
+        readNamespacedDeployment: notReadyDeploymentRead(),
+        listNamespacedPod: vi
+          .fn()
+          .mockResolvedValueOnce({
+            items: [
+              unschedulablePod("0/3 nodes are available: 3 Insufficient cpu."),
+            ],
+          })
+          .mockResolvedValue({ items: [pullingPod] }),
+      });
+      seedState(deployment, "waking");
+
+      // Capacity pressure is over the moment the pod lands on a node; keeping
+      // it latched would hide the pull failure that actually ended the wait.
+      await expect(
+        deployment.waitForDeploymentReady(3, 1, {
+          waitOutUnschedulablePods: true,
+        }),
+      ).rejects.toThrow(/did not become ready.*ImagePullBackOff/);
+    });
+
+    test("a capacity timeout still reports a pull error seen in the same wait", async () => {
+      // A rollout can hold both at once: the outgoing pod is stuck pulling
+      // while its replacement finds no room. Reporting only the capacity half
+      // sends the operator looking for nodes when the image is also broken.
+      const deployment = makeDeployment({
+        readNamespacedDeployment: notReadyDeploymentRead(),
+        listNamespacedPod: vi.fn().mockResolvedValue({
+          items: [
+            pullingPod,
+            unschedulablePod("0/3 nodes are available: 3 Insufficient cpu."),
+          ],
+        }),
+      });
+      seedState(deployment, "waking");
+
+      const error: unknown = await deployment
+        .waitForDeploymentReady(3, 1, { waitOutUnschedulablePods: true })
+        .then(() => null)
+        .catch((thrown: unknown) => thrown);
+
+      expect(error).toBeInstanceOf(McpServerUnschedulableError);
+      const unschedulable = error as McpServerUnschedulableError;
+      expect(unschedulable.message).toMatch(/Insufficient cpu/);
+      expect(unschedulable.message).toMatch(/ImagePullBackOff/);
+      // Callers quote this verbatim as the scheduler's own words, so the pull
+      // error must not leak into it.
+      expect(unschedulable.schedulerMessage).not.toMatch(/ImagePullBackOff/);
+    });
+
+    test("without the wake option, resource pressure keeps failing fast", async () => {
+      const deployment = makeDeployment({
+        readNamespacedDeployment: notReadyDeploymentRead(),
+        listNamespacedPod: vi.fn().mockResolvedValue({
+          items: [
+            unschedulablePod("0/3 nodes are available: 3 Insufficient cpu."),
+          ],
+        }),
+      });
+
+      await expect(
+        deployment.waitForDeploymentReady(3, 1, {
+          waitOutUnschedulablePods: false,
+        }),
+      ).rejects.toThrow(/failed: Pod scheduling failed/);
+      expect(deployment.statusSummary.state).toBe("failed");
+    });
+  });
+
+  describe("assessWakeImageCache", () => {
+    const image = "ghcr.io/my-org/custom-mcp-server:v2.1.0";
+
+    function deploymentRead(container: Partial<k8s.V1Container>) {
+      return {
+        spec: { template: { spec: { containers: [container] } } },
+      };
+    }
+
+    test("reports the image the wake will run and the policy that decides whether the registry is needed", async () => {
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValue(
+          deploymentRead({ image, imagePullPolicy: "Always" }),
+        );
+      const listNamespacedPod = vi.fn().mockResolvedValue({ items: [] });
+      const deployment = makeDeployment({
+        readNamespacedDeployment,
+        listNamespacedPod,
+      });
+
+      await expect(deployment.assessWakeImageCache()).resolves.toEqual({
+        image,
+        pullPolicy: "Always",
+      });
+    });
+
+    // The platform's Role is namespace-scoped, so a cluster-scoped node read
+    // is a 403 on every real install — the assessment must not depend on one.
+    test("reads nothing outside its own namespace", async () => {
+      const listNode = vi.fn();
+      const deployment = makeDeployment({
+        readNamespacedDeployment: vi
+          .fn()
+          .mockResolvedValue(
+            deploymentRead({ image, imagePullPolicy: "IfNotPresent" }),
+          ),
+      });
+      // @ts-expect-error - a node read would have to come through this client
+      deployment.k8sApi.listNode = listNode;
+
+      await expect(deployment.assessWakeImageCache()).resolves.not.toBeNull();
+      expect(listNode).not.toHaveBeenCalled();
+    });
+
+    test("falls back to the cache-tolerant policy when the container omits one", async () => {
+      const deployment = makeDeployment({
+        readNamespacedDeployment: vi
+          .fn()
+          .mockResolvedValue(deploymentRead({ image })),
+      });
+
+      await expect(deployment.assessWakeImageCache()).resolves.toMatchObject({
+        pullPolicy: "IfNotPresent",
+      });
+    });
+
+    test.each([
+      {
+        name: "the deployment does not exist",
+        makeOverrides: () => ({
+          readNamespacedDeployment: vi.fn().mockRejectedValue(notFound),
+        }),
+      },
+      {
+        name: "the deployment read fails",
+        makeOverrides: () => ({
+          readNamespacedDeployment: vi
+            .fn()
+            .mockRejectedValue(new Error("apiserver unavailable")),
+        }),
+      },
+      {
+        name: "the deployment has no container image",
+        makeOverrides: () => ({
+          readNamespacedDeployment: vi
+            .fn()
+            .mockResolvedValue(deploymentRead({ name: "mcp-server" })),
+        }),
+      },
+    ])("returns null instead of throwing when $name", async ({
+      makeOverrides,
+    }) => {
+      const deployment = makeDeployment(makeOverrides());
+
+      await expect(deployment.assessWakeImageCache()).resolves.toBeNull();
+    });
+  });
+});
+// SPDX-SnippetEnd
+
+describe("K8sDeployment default base image follow", () => {
+  const notFound = { statusCode: 404, message: "not found" };
+  const baseImage = config.orchestrator.mcpServerBaseImage;
+  const oldBaseImage = "registry.example.com/mcp-server-base:0.0.1-removed";
+  const dockerImagePlaceholder = ["$", "{archestra.docker_image}"].join("");
+
+  // Verbatim containerd wording (as carried into the back-off message).
+  function missingImageMessage(image: string): string {
+    return `Back-off pulling image "${image}": ErrImagePull: rpc error: code = NotFound desc = failed to pull and unpack image "${image}": failed to resolve reference "${image}": ${image}: not found`;
+  }
+
+  const defaultCatalog = {
+    id: "test-catalog-id",
+    localConfig: {},
+    deploymentSpecYaml: null,
+    multitenant: false,
+  } as unknown as InternalMcpCatalog;
+
+  function makeDeployment(params: {
+    catalogItem: InternalMcpCatalog;
+    readNamespacedDeployment: ReturnType<typeof vi.fn>;
+    patchNamespacedDeployment: ReturnType<typeof vi.fn>;
+    listNamespacedPod?: ReturnType<typeof vi.fn>;
+    createNamespacedDeployment?: ReturnType<typeof vi.fn>;
+  }): K8sDeployment {
+    const deployment = new K8sDeployment({
+      mcpServer: {
+        id: "test-server-id",
+        name: "test-server",
+        catalogId: null,
+      } as unknown as McpServer,
+      k8sApi: {
+        readNamespacedPod: vi.fn().mockRejectedValue(notFound),
+        listNamespacedPod:
+          params.listNamespacedPod ?? vi.fn().mockResolvedValue({ items: [] }),
+        listNamespacedEvent: vi.fn().mockResolvedValue({ items: [] }),
+      } as unknown as k8s.CoreV1Api,
+      k8sAppsApi: {
+        readNamespacedDeployment: params.readNamespacedDeployment,
+        patchNamespacedDeployment: params.patchNamespacedDeployment,
+        createNamespacedDeployment:
+          params.createNamespacedDeployment ?? vi.fn().mockResolvedValue({}),
+        deleteNamespacedDeployment: vi.fn().mockResolvedValue({}),
+      } as unknown as k8s.AppsV1Api,
+      k8sNetworkingApi: {} as k8s.NetworkingV1Api,
+      k8sAttach: {} as Attach,
+      k8sLog: {} as Log,
+      k8sExec: {} as Exec,
+      namespace: "default",
+      catalogItem: params.catalogItem,
+    });
+    vi.spyOn(deployment, "applyK8sNetworkPolicy").mockResolvedValue(undefined);
+    vi.spyOn(
+      deployment as unknown as { ensureHttpServerConfigured: () => unknown },
+      "ensureHttpServerConfigured",
+    ).mockResolvedValue(undefined);
+    return deployment;
+  }
+
+  function deploymentOn(params: {
+    containers: Array<{ name: string; image: string }>;
+    replicas?: number;
+    annotations?: Record<string, string>;
+  }): k8s.V1Deployment {
+    return {
+      metadata: { annotations: params.annotations },
+      spec: {
+        replicas: params.replicas ?? 1,
+        template: {
+          spec: {
+            containers: params.containers.map((container) => ({
+              ...container,
+              imagePullPolicy: "IfNotPresent",
+            })),
+          },
+        },
+      },
+      status: { availableReplicas: 0 },
+    } as k8s.V1Deployment;
+  }
+
+  function podPulling(image: string, message: string): k8s.V1Pod {
+    return {
+      metadata: { name: "test-server-abc123", creationTimestamp: new Date() },
+      spec: { containers: [{ name: "mcp-server", image }] },
+      status: {
+        phase: "Pending",
+        containerStatuses: [
+          {
+            name: "mcp-server",
+            image,
+            ready: false,
+            restartCount: 0,
+            state: { waiting: { reason: "ImagePullBackOff", message } },
+          },
+        ],
+      },
+    } as k8s.V1Pod;
+  }
+
+  function patchContentType(options: unknown): string | undefined {
+    let contentType: string | undefined;
+    const fakeRequest = {
+      setHeaderParam: (key: string, value: string) => {
+        if (key === "Content-Type") contentType = value;
+      },
+    };
+    const middleware =
+      (options as { middleware?: Array<{ pre: (req: unknown) => unknown }> })
+        ?.middleware ?? [];
+    for (const m of middleware) m.pre(fakeRequest);
+    return contentType;
+  }
+
+  function seedState(deployment: K8sDeployment, state: string): void {
+    // @ts-expect-error - seeding a private property for testing
+    deployment.state = state;
+  }
+
+  describe("startOrCreateDeployment adoption", () => {
+    test("moves a default-base-image server off a deleted image and reports it as starting", async () => {
+      const stale = deploymentOn({
+        containers: [{ name: "mcp-server", image: oldBaseImage }],
+      });
+      const patchNamespacedDeployment = vi.fn().mockResolvedValue(
+        deploymentOn({
+          containers: [{ name: "mcp-server", image: baseImage }],
+        }),
+      );
+      const createNamespacedDeployment = vi.fn();
+      const deployment = makeDeployment({
+        catalogItem: defaultCatalog,
+        readNamespacedDeployment: vi.fn().mockResolvedValue(stale),
+        patchNamespacedDeployment,
+        createNamespacedDeployment,
+        // The old ReplicaSet's pod can never pull its image; it is replaced
+        // once the new pod is ready.
+        listNamespacedPod: vi.fn().mockResolvedValue({
+          items: [podPulling(oldBaseImage, missingImageMessage(oldBaseImage))],
+        }),
+      });
+
+      await deployment.startOrCreateDeployment();
+
+      expect(patchNamespacedDeployment).toHaveBeenCalledTimes(1);
+      const [request, options] = patchNamespacedDeployment.mock.calls[0];
+      expect(request.body).toEqual([
+        {
+          op: "test",
+          path: "/spec/template/spec/containers/0/name",
+          value: "mcp-server",
+        },
+        {
+          op: "test",
+          path: "/spec/template/spec/containers/0/image",
+          value: oldBaseImage,
+        },
+        {
+          op: "replace",
+          path: "/spec/template/spec/containers/0/image",
+          value: baseImage,
+        },
+        {
+          op: "add",
+          path: "/spec/template/spec/containers/0/imagePullPolicy",
+          value: getMcpImagePullPolicy(baseImage),
+        },
+      ]);
+      expect(patchContentType(options)).toBe("application/json-patch+json");
+      expect(createNamespacedDeployment).not.toHaveBeenCalled();
+      expect(deployment.statusSummary.state).toBe("pending");
+      expect(deployment.statusSummary.error).toBeNull();
+    });
+
+    test("follows the placeholder container of a custom deployment YAML", async () => {
+      const catalogItem = {
+        ...defaultCatalog,
+        deploymentSpecYaml: [
+          "apiVersion: apps/v1",
+          "kind: Deployment",
+          "spec:",
+          "  template:",
+          "    spec:",
+          "      containers:",
+          "        - name: sidecar",
+          "          image: busybox:1.36",
+          "        - name: server",
+          `          image: "${dockerImagePlaceholder}"`,
+        ].join("\n"),
+      } as InternalMcpCatalog;
+      const patchNamespacedDeployment = vi.fn().mockResolvedValue({});
+      const deployment = makeDeployment({
+        catalogItem,
+        readNamespacedDeployment: vi.fn().mockResolvedValue(
+          deploymentOn({
+            containers: [
+              { name: "sidecar", image: "busybox:1.36" },
+              { name: "server", image: oldBaseImage },
+            ],
+          }),
+        ),
+        patchNamespacedDeployment,
+      });
+
+      await deployment.startOrCreateDeployment();
+
+      expect(patchNamespacedDeployment).toHaveBeenCalledTimes(1);
+      // The YAML's own pull policy stays as its author wrote it.
+      expect(patchNamespacedDeployment.mock.calls[0][0].body).toEqual([
+        {
+          op: "test",
+          path: "/spec/template/spec/containers/1/name",
+          value: "server",
+        },
+        {
+          op: "test",
+          path: "/spec/template/spec/containers/1/image",
+          value: oldBaseImage,
+        },
+        {
+          op: "replace",
+          path: "/spec/template/spec/containers/1/image",
+          value: baseImage,
+        },
+      ]);
+    });
+
+    test("leaves a server already on the current base image alone", async () => {
+      const patchNamespacedDeployment = vi.fn();
+      const deployment = makeDeployment({
+        catalogItem: defaultCatalog,
+        readNamespacedDeployment: vi.fn().mockResolvedValue(
+          deploymentOn({
+            containers: [{ name: "mcp-server", image: baseImage }],
+          }),
+        ),
+        patchNamespacedDeployment,
+      });
+
+      await deployment.startOrCreateDeployment();
+
+      expect(patchNamespacedDeployment).not.toHaveBeenCalled();
+    });
+
+    const customImageCatalogs: Array<[string, InternalMcpCatalog]> = [
+      [
+        "a catalog docker image",
+        {
+          ...defaultCatalog,
+          localConfig: { dockerImage: oldBaseImage },
+        } as InternalMcpCatalog,
+      ],
+      [
+        "a deployment YAML with a literal image",
+        {
+          ...defaultCatalog,
+          deploymentSpecYaml: [
+            "spec:",
+            "  template:",
+            "    spec:",
+            "      containers:",
+            "        - name: mcp-server",
+            `          image: ${oldBaseImage}`,
+          ].join("\n"),
+        } as InternalMcpCatalog,
+      ],
+    ];
+
+    test.each(
+      customImageCatalogs,
+    )("never changes the image of a server configured with %s, and reports its missing image as failed", async (_label, catalogItem) => {
+      const patchNamespacedDeployment = vi.fn();
+      const deployment = makeDeployment({
+        catalogItem,
+        readNamespacedDeployment: vi.fn().mockResolvedValue(
+          deploymentOn({
+            containers: [{ name: "mcp-server", image: oldBaseImage }],
+          }),
+        ),
+        patchNamespacedDeployment,
+        listNamespacedPod: vi.fn().mockResolvedValue({
+          items: [podPulling(oldBaseImage, missingImageMessage(oldBaseImage))],
+        }),
+      });
+
+      await deployment.startOrCreateDeployment();
+
+      expect(patchNamespacedDeployment).not.toHaveBeenCalled();
+      expect(deployment.statusSummary.state).toBe("failed");
+      expect(deployment.statusSummary.error).toContain(
+        "Image not found in its registry",
+      );
+    });
+  });
+
+  describe("refreshState", () => {
+    test("fails a server whose current image no longer exists instead of waiting on it", async () => {
+      const patchNamespacedDeployment = vi.fn();
+      const deployment = makeDeployment({
+        catalogItem: defaultCatalog,
+        readNamespacedDeployment: vi.fn().mockResolvedValue(
+          deploymentOn({
+            containers: [{ name: "mcp-server", image: baseImage }],
+          }),
+        ),
+        patchNamespacedDeployment,
+        listNamespacedPod: vi.fn().mockResolvedValue({
+          items: [
+            podPulling(
+              baseImage,
+              `Failed to pull image "${baseImage}": reading manifest in ${baseImage}: manifest unknown`,
+            ),
+          ],
+        }),
+      });
+      seedState(deployment, "pending");
+
+      await deployment.refreshState();
+
+      // Already on the configured image: there is nothing to move it to.
+      expect(patchNamespacedDeployment).not.toHaveBeenCalled();
+      expect(deployment.statusSummary.state).toBe("failed");
+      expect(deployment.statusSummary.error).toContain("manifest unknown");
+    });
+
+    test("moves a default-base-image server whose image no longer exists to the current base image", async () => {
+      const patchNamespacedDeployment = vi.fn().mockResolvedValue({});
+      const deployment = makeDeployment({
+        catalogItem: defaultCatalog,
+        readNamespacedDeployment: vi.fn().mockResolvedValue(
+          deploymentOn({
+            containers: [{ name: "mcp-server", image: oldBaseImage }],
+          }),
+        ),
+        patchNamespacedDeployment,
+        listNamespacedPod: vi.fn().mockResolvedValue({
+          items: [podPulling(oldBaseImage, missingImageMessage(oldBaseImage))],
+        }),
+      });
+      seedState(deployment, "pending");
+
+      await deployment.refreshState();
+
+      expect(patchNamespacedDeployment).toHaveBeenCalledTimes(1);
+      expect(patchNamespacedDeployment.mock.calls[0][0].body).toContainEqual({
+        op: "replace",
+        path: "/spec/template/spec/containers/0/image",
+        value: baseImage,
+      });
+      expect(deployment.statusSummary.state).toBe("pending");
+    });
+
+    test("stays starting when another replica moved the image first", async () => {
+      const readNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValueOnce(
+          deploymentOn({
+            containers: [{ name: "mcp-server", image: oldBaseImage }],
+          }),
+        )
+        .mockResolvedValue(
+          deploymentOn({
+            containers: [{ name: "mcp-server", image: baseImage }],
+          }),
+        );
+      // The JSON patch's test operation no longer matches.
+      const patchNamespacedDeployment = vi.fn().mockRejectedValue({
+        statusCode: 422,
+        body: { reason: "Invalid" },
+      });
+      const deployment = makeDeployment({
+        catalogItem: defaultCatalog,
+        readNamespacedDeployment,
+        patchNamespacedDeployment,
+        listNamespacedPod: vi.fn().mockResolvedValue({
+          items: [podPulling(oldBaseImage, missingImageMessage(oldBaseImage))],
+        }),
+      });
+      seedState(deployment, "pending");
+
+      await deployment.refreshState();
+
+      expect(deployment.statusSummary.state).toBe("pending");
+    });
+
+    test("ignores a pull failure on a pod the deployment is already replacing", async () => {
+      const deployment = makeDeployment({
+        catalogItem: defaultCatalog,
+        readNamespacedDeployment: vi.fn().mockResolvedValue(
+          deploymentOn({
+            containers: [{ name: "mcp-server", image: baseImage }],
+          }),
+        ),
+        patchNamespacedDeployment: vi.fn(),
+        listNamespacedPod: vi.fn().mockResolvedValue({
+          items: [podPulling(oldBaseImage, missingImageMessage(oldBaseImage))],
+        }),
+      });
+      seedState(deployment, "pending");
+
+      await deployment.refreshState();
+
+      expect(deployment.statusSummary.state).toBe("pending");
+      expect(deployment.statusSummary.error).toBeNull();
+    });
+  });
+
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  describe("idle hibernation", () => {
+    beforeEach(() => {
+      config.orchestrator.mcpIdleHibernation.betaEnabled = true;
+    });
+
+    test("moves a hibernated deployment at zero replicas without waking it", async () => {
+      const patchNamespacedDeployment = vi.fn().mockResolvedValue({});
+      const deployment = makeDeployment({
+        catalogItem: defaultCatalog,
+        readNamespacedDeployment: vi.fn().mockResolvedValue(
+          deploymentOn({
+            containers: [{ name: "mcp-server", image: oldBaseImage }],
+            replicas: 0,
+            annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" },
+          }),
+        ),
+        patchNamespacedDeployment,
+      });
+
+      await deployment.startOrCreateDeployment();
+
+      expect(patchNamespacedDeployment).toHaveBeenCalledTimes(1);
+      expect(patchNamespacedDeployment.mock.calls[0][0].body).toContainEqual({
+        op: "replace",
+        path: "/spec/template/spec/containers/0/image",
+        value: baseImage,
+      });
+      expect(deployment.statusSummary.state).toBe("hibernated");
+    });
+
+    test("beginWake moves the deployment to the current base image before scaling it up", async () => {
+      const asleep = deploymentOn({
+        containers: [{ name: "mcp-server", image: oldBaseImage }],
+        replicas: 0,
+        annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" },
+      });
+      const patchNamespacedDeployment = vi
+        .fn()
+        .mockResolvedValueOnce(asleep)
+        .mockResolvedValue({
+          ...asleep,
+          spec: { ...asleep.spec, replicas: 1 },
+        });
+      const deployment = makeDeployment({
+        catalogItem: defaultCatalog,
+        readNamespacedDeployment: vi.fn().mockResolvedValue(asleep),
+        patchNamespacedDeployment,
+      });
+      seedState(deployment, "hibernated");
+
+      await deployment.beginWake();
+
+      expect(patchNamespacedDeployment).toHaveBeenCalledTimes(2);
+      const [imagePatch, imagePatchOptions] =
+        patchNamespacedDeployment.mock.calls[0];
+      expect(patchContentType(imagePatchOptions)).toBe(
+        "application/json-patch+json",
+      );
+      expect(imagePatch.body).toContainEqual({
+        op: "replace",
+        path: "/spec/template/spec/containers/0/image",
+        value: baseImage,
+      });
+      expect(patchNamespacedDeployment.mock.calls[1][0].body).toEqual({
+        spec: { replicas: 1 },
+      });
+      expect(deployment.statusSummary.state).toBe("waking");
+    });
+  });
+  // SPDX-SnippetEnd
 });

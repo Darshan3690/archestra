@@ -1,5 +1,22 @@
-import { render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  archestraApiSdk,
+  getChatItemGeneratingIndicatorTestId,
+  getChatItemUnreadIndicatorTestId,
+} from "@archestra/shared";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { format } from "date-fns/format";
+import { subDays } from "date-fns/subDays";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+import { preloadConversationActionParts } from "@/components/chat/conversation-actions";
 
 // Mock ResizeObserver used by Radix UI components
 global.ResizeObserver = vi.fn().mockImplementation(() => ({
@@ -9,33 +26,47 @@ global.ResizeObserver = vi.fn().mockImplementation(() => ({
 }));
 
 const mockRouterPush = vi.fn();
-
-vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: mockRouterPush }),
-  usePathname: () => "/chat",
-  useSearchParams: () => ({
-    get: () => null,
-  }),
+const mockRouterPrefetch = vi.fn();
+const { mockUpdateRunMutate, mockUpdateRunMutateAsync } = vi.hoisted(() => ({
+  mockUpdateRunMutate: vi.fn(),
+  mockUpdateRunMutateAsync: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock("@/lib/auth/auth.hook", () => ({
+// Mutable holder so the status-indicator matrix can vary the viewed route, the
+// per-conversation session status, and the unread set per test (object props
+// stay reassignable without tripping the prefer-const lint).
+const mockChatState: {
+  pathname: string;
+  sessionStatusById: Record<string, string>;
+} = {
+  pathname: "/chat",
+  sessionStatusById: {},
+};
+
+vi.mock("next/navigation");
+
+vi.mock("@/lib/auth/use-is-authenticated", () => ({
   useIsAuthenticated: () => true,
 }));
 
-vi.mock("@/lib/auth/auth.query", () => ({
-  useHasPermissions: () => ({ data: true }),
-}));
+vi.mock("@/lib/auth/auth.query");
 
 vi.mock("@/lib/chat/chat-utils", () => ({
   getConversationDisplayTitle: (title: string | null) =>
     title ?? "Untitled chat",
 }));
 
-vi.mock("@/lib/chat/chat.hook", () => ({
-  useRecentlyGeneratedTitles: () => ({
-    recentlyGeneratedTitles: new Set(),
-    regeneratingTitles: new Set(),
-    triggerRegeneration: vi.fn(),
+vi.mock("@/lib/chat/global-chat.context", () => ({
+  useGlobalChat: () => ({
+    animatingTitleIds: new Set(),
+    markTitleAnimating: vi.fn(),
+    generatingConversationIds: new Set(
+      Object.entries(mockChatState.sessionStatusById)
+        .filter(
+          ([, status]) => status === "submitted" || status === "streaming",
+        )
+        .map(([id]) => id),
+    ),
   }),
 }));
 
@@ -47,7 +78,78 @@ let mockConversations: Array<{
   updatedAt: string;
   messages: unknown[];
   agent: { id: string; name: string };
+  projectId?: string | null;
+  projectName?: string | null;
+  projectIcon?: string | null;
+  unread?: boolean;
+  origin?: string;
+  scheduledRun?: {
+    id: string;
+    triggerId: string;
+    createdAt: string;
+    runKind: "due" | "manual";
+    scheduleName: string;
+  };
 }> = [];
+
+const mockUseProjects = vi.fn();
+let mockProjects: Array<{
+  id: string;
+  name: string;
+  icon: string | null;
+  pinnedAt: string | null;
+}> = [];
+
+// Apps-surface items (owned or external) for the sidebar's Pinned section.
+let mockApps: Array<{
+  source: "owned" | "external";
+  id?: string;
+  mcpServerId?: string;
+  resourceUri?: string;
+  name: string;
+  icon?: string | null;
+  pinnedAt: string | null;
+}> = [];
+
+// True while the pinned-apps request is still in flight.
+let mockAppsLoading = false;
+
+let mockRuns: Array<Record<string, unknown>> = [];
+
+let useRealRunsQuery = false;
+vi.mock("@archestra/shared/api-sdk", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@archestra/shared/api-sdk")>()),
+  getMyAgentRuns: vi.fn(),
+  getMyAgentRun: vi.fn(),
+}));
+vi.mock("@/lib/agent-runtime.query", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/lib/agent-runtime.query")>();
+  return {
+    useMyAgentRun: (taskId: string, enabled: boolean) =>
+      useRealRunsQuery
+        ? // biome-ignore lint/correctness/useHookAtTopLevel: Test mode is fixed before mounting.
+          actual.useMyAgentRun(taskId, enabled)
+        : { data: undefined },
+    useMyAgentRuns: (enabled: boolean, options: { pinned?: boolean }) =>
+      useRealRunsQuery
+        ? // biome-ignore lint/correctness/useHookAtTopLevel: Test mode is selected before mounting and never changes during a render.
+          actual.useMyAgentRuns(enabled, options)
+        : { data: mockRuns, isLoading: false },
+    useUpdateAgentRun: () => ({
+      mutate: mockUpdateRunMutate,
+      mutateAsync: mockUpdateRunMutateAsync,
+    }),
+    useCancelAgentRun: () => ({
+      mutateAsync: vi.fn(),
+      isPending: false,
+    }),
+    useDeleteAgentRun: () => ({
+      mutateAsync: vi.fn(),
+      isPending: false,
+    }),
+  };
+});
 
 vi.mock("@/lib/chat/chat.query", () => ({
   useConversations: () => ({
@@ -60,15 +162,113 @@ vi.mock("@/lib/chat/chat.query", () => ({
     isPending: false,
   }),
   useGenerateConversationTitle: () => ({
+    mutate: vi.fn(),
+    isPending: false,
+    variables: undefined,
+  }),
+  usePinConversation: () => ({ mutate: vi.fn() }),
+  fetchConversation: vi.fn(),
+}));
+
+vi.mock("@/lib/config/config.query");
+
+vi.mock("@/lib/projects/projects.query", () => ({
+  SIDEBAR_PINNED_PROJECTS_QUERY: { pinned: true, limit: 100, offset: 0 },
+  // Answers like the endpoint: `pinned` splits the list, results are paged.
+  useProjects: (filters?: { pinned?: boolean; enabled?: boolean }) => {
+    mockUseProjects(filters);
+    const data =
+      filters?.pinned === undefined
+        ? mockProjects
+        : mockProjects.filter((p) => Boolean(p.pinnedAt) === filters.pinned);
+    return { data: { data, pagination: { total: data.length } } };
+  },
+  usePinProject: () => ({ mutate: vi.fn() }),
+  useCreateProject: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useCreateProjectFromConversation: () => ({
     mutateAsync: vi.fn(),
     isPending: false,
   }),
-  usePinConversation: () => ({ mutate: vi.fn() }),
+}));
+
+vi.mock("@/lib/app.query", () => ({
+  SIDEBAR_PINNED_APPS_QUERY: { limit: 100, offset: 0, pinned: true },
+  useApps: () =>
+    mockAppsLoading
+      ? { data: undefined, isLoading: true }
+      : { data: { data: mockApps }, isLoading: false },
+  usePinApp: () => ({ mutate: vi.fn() }),
+  useOpenAppInChat: () => ({ mutateAsync: vi.fn() }),
+  useOpenExternalAppInChat: () => ({ mutateAsync: vi.fn() }),
+}));
+
+vi.mock("@/components/agent-icon", () => ({
+  AgentIcon: ({ icon }: { icon?: string | null }) => (
+    <span data-testid="project-emoji">{icon}</span>
+  ),
+}));
+
+vi.mock("@/app/_parts/conversation-project-actions", () => ({
+  // The real menu fetches and searches its own projects; this stand-in picks
+  // the first fixture project.
+  ConversationProjectActions: ({
+    projectId,
+    onProjectChange,
+  }: {
+    projectId: string | null;
+    onProjectChange: (projectId: string | null) => Promise<void>;
+  }) => (
+    <button
+      type="button"
+      onClick={() =>
+        void onProjectChange(projectId ? null : (mockProjects[0]?.id ?? null))
+      }
+    >
+      {projectId ? "Remove from project" : "Add to project"}
+    </button>
+  ),
+}));
+
+// Pinned apps render their icon through this component: an owned app's own
+// icon, an external one's backing MCP server registry icon. `fallback` is what
+// each row shows when no icon is set, so the mock surfaces it.
+vi.mock("@/components/mcp-catalog-icon", () => ({
+  McpCatalogIcon: ({
+    icon,
+    fallback,
+  }: {
+    icon?: string | null;
+    fallback?: { displayName?: string; name?: string };
+  }) => (
+    <span
+      data-testid="app-catalog-icon"
+      data-fallback={
+        fallback ? (fallback.displayName ?? fallback.name) : "none"
+      }
+    >
+      {icon}
+    </span>
+  ),
 }));
 
 // Minimal sidebar UI mock - render children directly
 vi.mock("@/components/ui/sidebar", () => ({
   useSidebar: () => ({ isMobile: false, setOpenMobile: vi.fn() }),
+  SidebarGroup: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  SidebarGroupLabel: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  SidebarGroupContent: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  SidebarMenu: ({ children }: { children: React.ReactNode }) => (
+    <ul>{children}</ul>
+  ),
+  SidebarMenuItem: ({ children }: { children: React.ReactNode }) => (
+    <li>{children}</li>
+  ),
   SidebarMenuButton: ({
     children,
     onClick,
@@ -94,15 +294,20 @@ vi.mock("@/components/ui/sidebar", () => ({
   SidebarMenuSubButton: ({
     children,
     onClick,
+    asChild,
   }: {
     children: React.ReactNode;
     onClick?: () => void;
     className?: string;
-  }) => (
-    <button type="button" onClick={onClick}>
-      {children}
-    </button>
-  ),
+    asChild?: boolean;
+  }) =>
+    asChild ? (
+      children
+    ) : (
+      <button type="button" onClick={onClick}>
+        {children}
+      </button>
+    ),
 }));
 
 vi.mock("@/components/ui/tooltip", () => ({
@@ -122,9 +327,24 @@ vi.mock("@/components/ui/dropdown-menu", () => ({
   DropdownMenu: ({ children }: { children: React.ReactNode }) => (
     <>{children}</>
   ),
-  DropdownMenuContent: () => null,
-  DropdownMenuItem: () => null,
-  DropdownMenuTrigger: () => null,
+  DropdownMenuContent: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  DropdownMenuItem: ({
+    children,
+    onClick,
+  }: {
+    children: React.ReactNode;
+    onClick?: () => void;
+  }) => (
+    <button type="button" onClick={onClick}>
+      {children}
+    </button>
+  ),
+  DropdownMenuSeparator: () => <hr />,
+  DropdownMenuTrigger: ({ children }: { children: React.ReactNode }) => (
+    <>{children}</>
+  ),
 }));
 
 vi.mock("@/components/ui/input", () => ({
@@ -135,11 +355,21 @@ vi.mock("@/components/ui/button", () => ({
   Button: ({
     children,
     onClick,
+    onPointerDown,
+    ...props
   }: {
     children: React.ReactNode;
-    onClick?: () => void;
+    onClick?: React.MouseEventHandler<HTMLButtonElement>;
+    onPointerDown?: React.PointerEventHandler<HTMLButtonElement>;
+    [key: string]: unknown;
   }) => (
-    <button type="button" onClick={onClick}>
+    <button
+      type="button"
+      onClick={onClick}
+      onPointerDown={onPointerDown}
+      aria-label={props["aria-label"] as string | undefined}
+      aria-expanded={props["aria-expanded"] as boolean | undefined}
+    >
       {children}
     </button>
   ),
@@ -153,38 +383,464 @@ vi.mock("@/components/truncated-text", () => ({
   TruncatedText: ({ message }: { message: string }) => <span>{message}</span>,
 }));
 
-vi.mock("@/lib/utils", () => ({
+vi.mock("@/lib/utils/tailwind", () => ({
   cn: (...args: unknown[]) => args.filter(Boolean).join(" "),
 }));
 
+vi.mock("lucide-react", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("lucide-react")>();
+  return {
+    ...actual,
+    Folder: (props: React.SVGProps<SVGSVGElement>) => (
+      <svg aria-label="projects icon" {...props} />
+    ),
+  };
+});
+
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 // Import after mocks
+import { useHasPermissions, useSession } from "@/lib/auth/auth.query";
+import { useFeature } from "@/lib/config/config.query";
 import { ChatSidebarSection } from "./chat-sidebar-section";
+
+beforeEach(() => {
+  // Pin the clock (midday, local time) so date-bucket labels are deterministic
+  // — no flakes when a run crosses midnight or a DST transition.
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date(2026, 6 /* July */, 16, 12));
+  vi.mocked(useRouter).mockReturnValue({
+    push: mockRouterPush,
+    prefetch: mockRouterPrefetch,
+  } as unknown as ReturnType<typeof useRouter>);
+  vi.mocked(usePathname).mockImplementation(() => mockChatState.pathname);
+  vi.mocked(useSearchParams).mockReturnValue({
+    get: () => null,
+  } as unknown as ReturnType<typeof useSearchParams>);
+  vi.mocked(useHasPermissions).mockReturnValue({
+    data: true,
+  } as ReturnType<typeof useHasPermissions>);
+  vi.mocked(useSession).mockReturnValue({
+    data: { user: { id: "user-1" } },
+  } as ReturnType<typeof useSession>);
+  vi.mocked(useFeature).mockReturnValue(true);
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 function makeConv(
   id: string,
   title: string,
-  opts?: { pinnedAt?: string; updatedAt?: string },
+  opts?: { pinnedAt?: string; updatedAt?: string; lastMessageAt?: string },
 ) {
+  const updatedAt = opts?.updatedAt ?? new Date().toISOString();
   return {
     id,
     title,
+    userId: "user-1",
     pinnedAt: opts?.pinnedAt ?? null,
-    updatedAt: opts?.updatedAt ?? new Date().toISOString(),
+    updatedAt,
+    lastMessageAt: opts?.lastMessageAt ?? updatedAt,
     messages: [],
     agent: { id: "agent-1", name: "Test Agent" },
   };
 }
 
+/** ISO timestamp n calendar days before now (0 = today, 1 = yesterday). */
+function daysAgo(n: number) {
+  return subDays(new Date(), n).toISOString();
+}
+
+// The conversation menu's project picker is a lazy chunk; load it first.
+beforeAll(() => preloadConversationActionParts());
+
 describe("ChatSidebarSection", () => {
+  const fadeIn = {
+    pending: () => true,
+    done: () => {},
+  };
+
   beforeEach(() => {
     vi.clearAllMocks();
     mockConversations = [];
+    mockProjects = [];
+    mockApps = [];
+    mockAppsLoading = false;
+    mockRuns = [];
+    useRealRunsQuery = false;
+    mockChatState.pathname = "/chat";
+    mockChatState.sessionStatusById = {};
+  });
+
+  it("keeps project actions in the picker without a separate create action", () => {
+    mockConversations = [
+      { ...makeConv("chat-1", "Project planning"), origin: "user" },
+    ];
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
+    expect(
+      screen.getByRole("button", { name: "Add to project" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Create project" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows current runs and old pins immediately, then reaches older runs on demand", async () => {
+    useRealRunsQuery = true;
+    const makeRun = (
+      taskId: string,
+      title: string,
+      pinnedAt: string | null = null,
+    ) => ({
+      taskId,
+      title,
+      pinnedAt,
+      startedAt: daysAgo(2),
+      endedAt: daysAgo(1),
+      stateChangedAt: daysAgo(1),
+      state: "TASK_STATE_COMPLETED",
+      agent: { id: "agent-1", name: "Runtime", icon: null },
+    });
+    vi.mocked(archestraApiSdk.getMyAgentRuns).mockImplementation(
+      async ({ query } = {}) =>
+        ({
+          data: {
+            data: query?.pinned
+              ? [makeRun("old-pin", "Old pinned run", daysAgo(200))]
+              : query?.offset
+                ? [makeRun("older", "Older run")]
+                : [makeRun("current", "Current run")],
+            pagination: { hasNext: query?.pinned ? false : !query?.offset },
+          },
+          error: undefined,
+        }) as never,
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ChatSidebarSection fadeIn={fadeIn} />
+      </QueryClientProvider>,
+    );
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByText("Current run")).toBeInTheDocument();
+    expect(screen.getByText("Old pinned run")).toBeInTheDocument();
+    expect(screen.queryByText("Older run")).not.toBeInTheDocument();
+    expect(archestraApiSdk.getMyAgentRuns).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole("button", { name: "More runs" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByText("Older run")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Older run"));
+    expect(mockRouterPush).toHaveBeenCalledWith("/chat/runs/older");
+    queryClient.clear();
+  });
+
+  it("keeps the selected older session reachable and preserves chat unread state", async () => {
+    useRealRunsQuery = true;
+    mockChatState.pathname = "/chat/runs/selected-session";
+    mockConversations = [
+      { ...makeConv("unread-chat", "Unread chat"), unread: true },
+      makeConv("extra-chat-1", "Another recent chat"),
+      makeConv("extra-chat-2", "Third recent chat"),
+    ];
+    vi.mocked(archestraApiSdk.getMyAgentRuns).mockResolvedValue({
+      data: { data: [], pagination: { hasNext: false } },
+      error: undefined,
+    } as never);
+    vi.mocked(archestraApiSdk.getMyAgentRun).mockResolvedValue({
+      data: {
+        taskId: "selected-turn",
+        viewerRole: "owner",
+        sessionId: "selected-session",
+        title: "Selected retained run",
+        pinnedAt: null,
+        startedAt: daysAgo(200),
+        endedAt: daysAgo(200),
+        stateChangedAt: daysAgo(200),
+        state: "TASK_STATE_COMPLETED",
+        workspace: null,
+        agent: { id: "agent-1", name: "Runtime", icon: null },
+      },
+      error: undefined,
+    } as never);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ChatSidebarSection fadeIn={fadeIn} slots={1} />
+      </QueryClientProvider>,
+    );
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByText("Selected retained run")).toBeInTheDocument();
+    expect(
+      screen.getByTestId(getChatItemUnreadIndicatorTestId("unread-chat")),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Selected retained run"));
+    expect(mockRouterPush).toHaveBeenCalledWith("/chat/runs/selected-session");
+    queryClient.clear();
   });
 
   it("does not render when no conversations exist", () => {
     mockConversations = [];
-    const { container } = render(<ChatSidebarSection />);
+    const { container } = render(<ChatSidebarSection fadeIn={fadeIn} />);
     expect(container.innerHTML).toBe("");
+  });
+
+  it("links an OpenAPPA configuration session to its chat, warming the route on hover", () => {
+    mockConversations = [
+      { ...makeConv("policy-session", "Review policy"), origin: "user" },
+    ];
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
+    const row = screen.getByRole("link", { name: /Review policy/ });
+    expect(row).toHaveAttribute("href", "/chat/policy-session");
+    expect(mockRouterPrefetch).not.toHaveBeenCalled();
+    fireEvent.mouseEnter(row);
+    expect(mockRouterPrefetch).toHaveBeenCalledWith("/chat/policy-session");
+  });
+
+  it("collapses pinned and date groups independently and restores their chats", () => {
+    mockConversations = [
+      makeConv("pinned", "Pinned chat", { pinnedAt: new Date().toISOString() }),
+      makeConv("today", "Today's chat"),
+    ];
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
+    const pinned = screen.getByRole("button", { name: "Pinned" });
+    const today = screen.getByRole("button", { name: "Today" });
+    fireEvent.click(pinned);
+    expect(pinned).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("Pinned chat")).not.toBeInTheDocument();
+    expect(screen.getByText("Today's chat")).toBeInTheDocument();
+    fireEvent.click(today);
+    expect(screen.queryByText("Today's chat")).not.toBeInTheDocument();
+    fireEvent.click(pinned);
+    expect(screen.getByText("Pinned chat")).toBeInTheDocument();
+    expect(today).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it.each([
+    { pinned: true, firstLabel: "Pinned" },
+    { pinned: false, firstLabel: "Today" },
+  ])("puts search on the first group label ($firstLabel) and opens the palette from it", ({
+    pinned,
+    firstLabel,
+  }) => {
+    mockConversations = [
+      ...(pinned
+        ? [makeConv("pinned", "Pinned chat", { pinnedAt: daysAgo(0) })]
+        : []),
+      makeConv("today", "Today's chat"),
+      makeConv("older", "Older chat", { lastMessageAt: daysAgo(3) }),
+    ];
+    const onOpen = vi.fn();
+    window.addEventListener("open-conversation-search", onOpen);
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
+
+    const searchButtons = screen.getAllByRole("button", { name: "Search" });
+    expect(searchButtons).toHaveLength(1);
+    // The label button and search share the label row.
+    expect(
+      screen.getByRole("button", { name: firstLabel }).parentElement,
+    ).toContainElement(searchButtons[0]);
+
+    fireEvent.click(searchButtons[0]);
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    window.removeEventListener("open-conversation-search", onOpen);
+  });
+
+  it.each([
+    false,
+    true,
+  ])("shows one task and opens its newest run (pinned: %s)", (pinned) => {
+    mockConversations = [
+      {
+        ...makeConv("older-chat", "Repeated prompt"),
+        origin: "schedule_trigger",
+        scheduledRun: {
+          id: "older-run",
+          triggerId: "trigger-1",
+          createdAt: "2025-01-01T00:00:00Z",
+          runKind: "due",
+          scheduleName: "Daily summary",
+        },
+      },
+      {
+        ...makeConv(
+          "scheduled-chat",
+          "Repeated prompt",
+          pinned ? { pinnedAt: new Date().toISOString() } : undefined,
+        ),
+        origin: "schedule_trigger",
+        projectId: "project-1",
+        projectName: "Reports",
+        scheduledRun: {
+          id: "run-1",
+          triggerId: "trigger-1",
+          createdAt: new Date().toISOString(),
+          runKind: "manual",
+          scheduleName: "Daily summary",
+        },
+      },
+    ];
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
+    expect(screen.getAllByLabelText("Scheduled task")).toHaveLength(1);
+    expect(screen.getByRole("link", { name: /Daily summary/ })).toHaveAttribute(
+      "href",
+      "/chat/scheduled-chat?scheduleTriggerId=trigger-1&scheduleRunId=run-1",
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Open project Reports" }),
+    );
+    expect(mockRouterPush).toHaveBeenCalledExactlyOnceWith(
+      "/projects/project-1",
+    );
+  });
+
+  it("interweaves a durable run with chats and opens its terminal", () => {
+    mockConversations = [
+      makeConv("c1", "Earlier chat", {
+        updatedAt: "2026-07-16T09:00:00Z",
+        lastMessageAt: "2026-07-16T09:00:00Z",
+      }),
+    ];
+    mockRuns = [
+      {
+        id: "run-1",
+        taskId: "task-1",
+        agentId: "agent-1",
+        organizationId: "org-1",
+        actorUserId: "user-1",
+        title: "Add export command",
+        pinnedAt: null,
+        deploymentName: "agent-agent-1-task-1",
+        backend: "kubernetes",
+        runtimeScope: "archestra-dev",
+        virtualApiKeyId: null,
+        startedAt: new Date(Date.now() - 30 * 60_000).toISOString(),
+        endedAt: null,
+        state: "TASK_STATE_WORKING",
+        stateChangedAt: "2026-07-16T10:00:00Z",
+        hardDeadlineAt: new Date(Date.now() + 24 * 60 * 60_000).toISOString(),
+        lastModelActivityAt: new Date(Date.now() - 20 * 60_000).toISOString(),
+        statusReason: null,
+        prompt: "Add the export command",
+        agent: { id: "agent-1", name: "Codex", icon: null },
+      },
+    ];
+
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
+
+    expect(screen.getByText("Add export command")).toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Running · quiet for 20m"),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Run actions")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Add export command"));
+    expect(mockRouterPush).toHaveBeenCalledWith("/chat/runs/task-1");
+  });
+
+  it("requests a durable pin from a run's sidebar menu", () => {
+    mockRuns = [
+      {
+        id: "run-1",
+        taskId: "task-1",
+        title: "Keep this run handy",
+        pinnedAt: null,
+        startedAt: "2026-07-16T10:00:00Z",
+        endedAt: null,
+        state: "TASK_STATE_WORKING",
+        stateChangedAt: "2026-07-16T10:00:00Z",
+      },
+    ];
+
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Pin" }));
+    expect(mockUpdateRunMutate).toHaveBeenCalledWith({
+      taskId: "task-1",
+      pinnedAt: new Date().toISOString(),
+    });
+  });
+
+  it("moves a run into and out of a project from its sidebar menu", () => {
+    mockProjects = [
+      {
+        id: "project-1",
+        name: "Release work",
+        icon: null,
+        pinnedAt: null,
+      },
+    ];
+    mockRuns = [
+      {
+        id: "run-1",
+        taskId: "task-1",
+        title: "Project run",
+        projectId: null,
+        projectName: null,
+        pinnedAt: null,
+        startedAt: "2026-07-16T10:00:00Z",
+        endedAt: null,
+        state: "TASK_STATE_WORKING",
+        stateChangedAt: "2026-07-16T10:00:00Z",
+      },
+    ];
+
+    const { rerender } = render(<ChatSidebarSection fadeIn={fadeIn} />);
+    fireEvent.click(screen.getByRole("button", { name: "Add to project" }));
+    expect(mockUpdateRunMutateAsync).toHaveBeenCalledWith({
+      taskId: "task-1",
+      projectId: "project-1",
+    });
+
+    mockRuns = [
+      {
+        ...mockRuns[0],
+        projectId: "project-1",
+        projectName: "Release work",
+      },
+    ];
+    rerender(<ChatSidebarSection fadeIn={fadeIn} />);
+    expect(screen.getByText("Release work")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Open project Release work" }),
+    );
+    expect(mockRouterPush).toHaveBeenCalledWith("/projects/project-1");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove from project" }),
+    );
+    expect(mockUpdateRunMutateAsync).toHaveBeenLastCalledWith({
+      taskId: "task-1",
+      projectId: null,
+    });
+  });
+
+  it("renders a pinned run outside the recent timeline and can unpin it", () => {
+    mockRuns = [
+      {
+        id: "run-1",
+        taskId: "task-1",
+        title: "Pinned run",
+        pinnedAt: "2026-07-16T11:00:00Z",
+        startedAt: "2026-07-16T10:00:00Z",
+        endedAt: null,
+        state: "TASK_STATE_WORKING",
+        stateChangedAt: "2026-07-16T10:00:00Z",
+      },
+    ];
+
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
+
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+    expect(screen.getByText("Pinned run")).toBeInTheDocument();
+    expect(screen.queryByText("Today")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Unpin" }));
+    expect(mockUpdateRunMutate).toHaveBeenCalledWith({
+      taskId: "task-1",
+      pinnedAt: null,
+    });
   });
 
   it("shows 3 recent chats when no chats are pinned", () => {
@@ -196,7 +852,7 @@ describe("ChatSidebarSection", () => {
       makeConv("c5", "Chat Five", { updatedAt: "2026-01-01T00:00:00Z" }),
     ];
 
-    render(<ChatSidebarSection />);
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
 
     // Should show first 3 recent (conversations come pre-sorted from API)
     expect(screen.getByText("Chat One")).toBeInTheDocument();
@@ -211,7 +867,7 @@ describe("ChatSidebarSection", () => {
     expect(screen.getByText("More")).toBeInTheDocument();
   });
 
-  it("shows only pinned chats when 3 are pinned (no recent unpinned)", () => {
+  it("shows pinned and recents in separate sections", () => {
     mockConversations = [
       makeConv("c1", "Pinned One", {
         pinnedAt: "2026-01-05T00:00:00Z",
@@ -228,21 +884,26 @@ describe("ChatSidebarSection", () => {
       makeConv("c4", "Unpinned One", { updatedAt: "2026-01-02T00:00:00Z" }),
     ];
 
-    render(<ChatSidebarSection />);
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
 
-    // All 3 pinned should show
+    // Section labels: recents render under a date bucket, not "Recents"
+    // (2026-01-02 is long past, so it lands in "Older").
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+    expect(screen.getByText("Older")).toBeInTheDocument();
+
+    // Pinned chats are not capped by the recents budget — all 3 show...
     expect(screen.getByText("Pinned One")).toBeInTheDocument();
     expect(screen.getByText("Pinned Two")).toBeInTheDocument();
     expect(screen.getByText("Pinned Three")).toBeInTheDocument();
 
-    // Unpinned should NOT show (all 3 slots taken by pinned)
-    expect(screen.queryByText("Unpinned One")).not.toBeInTheDocument();
+    // ...and the unpinned chat still shows under Recents.
+    expect(screen.getByText("Unpinned One")).toBeInTheDocument();
 
-    // Should show "More" to open search
-    expect(screen.getByText("More")).toBeInTheDocument();
+    // Only 1 unpinned recent, so no "More".
+    expect(screen.queryByText("More")).not.toBeInTheDocument();
   });
 
-  it("fills remaining slots with recent chats when fewer than 3 are pinned", () => {
+  it("shows all recents when within the slot budget", () => {
     mockConversations = [
       makeConv("c1", "Pinned Chat", {
         pinnedAt: "2026-01-05T00:00:00Z",
@@ -253,21 +914,19 @@ describe("ChatSidebarSection", () => {
       makeConv("c4", "Recent Three", { updatedAt: "2026-01-02T00:00:00Z" }),
     ];
 
-    render(<ChatSidebarSection />);
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
 
-    // 1 pinned + 2 recent = 3 total
+    // Pinned shows in its own section; all 3 recents fit the slot budget.
     expect(screen.getByText("Pinned Chat")).toBeInTheDocument();
     expect(screen.getByText("Recent One")).toBeInTheDocument();
     expect(screen.getByText("Recent Two")).toBeInTheDocument();
+    expect(screen.getByText("Recent Three")).toBeInTheDocument();
 
-    // 3rd recent should NOT show (only 2 remaining slots)
-    expect(screen.queryByText("Recent Three")).not.toBeInTheDocument();
-
-    // Should show "More" to open search
-    expect(screen.getByText("More")).toBeInTheDocument();
+    // 3 unpinned == slots, so no "More".
+    expect(screen.queryByText("More")).not.toBeInTheDocument();
   });
 
-  it("shows 2 pinned + 1 recent when 2 are pinned", () => {
+  it("does not render date sections or 'More' when all chats are pinned", () => {
     mockConversations = [
       makeConv("c1", "Pinned A", {
         pinnedAt: "2026-01-05T00:00:00Z",
@@ -277,19 +936,65 @@ describe("ChatSidebarSection", () => {
         pinnedAt: "2026-01-04T00:00:00Z",
         updatedAt: "2026-01-04T00:00:00Z",
       }),
-      makeConv("c3", "Recent A", { updatedAt: "2026-01-03T00:00:00Z" }),
-      makeConv("c4", "Recent B", { updatedAt: "2026-01-02T00:00:00Z" }),
     ];
 
-    render(<ChatSidebarSection />);
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
 
-    // 2 pinned + 1 recent = 3 total
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
     expect(screen.getByText("Pinned A")).toBeInTheDocument();
     expect(screen.getByText("Pinned B")).toBeInTheDocument();
-    expect(screen.getByText("Recent A")).toBeInTheDocument();
 
-    // 2nd recent should not show
-    expect(screen.queryByText("Recent B")).not.toBeInTheDocument();
+    // No unpinned chats → no date sections and no dangling "More".
+    expect(screen.queryByText("Today")).not.toBeInTheDocument();
+    expect(screen.queryByText("Older")).not.toBeInTheDocument();
+    expect(screen.queryByText("More")).not.toBeInTheDocument();
+  });
+
+  it("groups recents into per-day date sections by lastMessageAt", () => {
+    mockConversations = [
+      makeConv("c1", "Today Chat", { lastMessageAt: daysAgo(0) }),
+      makeConv("c2", "Yesterday Chat", { lastMessageAt: daysAgo(1) }),
+      makeConv("c3", "This Week Chat", { lastMessageAt: daysAgo(3) }),
+      makeConv("c4", "Old Chat", { lastMessageAt: daysAgo(30) }),
+    ];
+
+    render(<ChatSidebarSection slots={4} fadeIn={fadeIn} />);
+
+    expect(screen.getByText("Today")).toBeInTheDocument();
+    expect(screen.getByText("Yesterday")).toBeInTheDocument();
+    // Days 2-6 back get their own "Jul 14"-style section.
+    expect(
+      screen.getByText(format(subDays(new Date(), 3), "MMM d")),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Older")).toBeInTheDocument();
+
+    expect(screen.getByText("Today Chat")).toBeInTheDocument();
+    expect(screen.getByText("Yesterday Chat")).toBeInTheDocument();
+    expect(screen.getByText("This Week Chat")).toBeInTheDocument();
+    expect(screen.getByText("Old Chat")).toBeInTheDocument();
+
+    // All 4 fit the slot budget, so no "More".
+    expect(screen.queryByText("More")).not.toBeInTheDocument();
+  });
+
+  it("only renders date sections for non-empty buckets and keeps 'More' in the last one", () => {
+    mockConversations = [
+      makeConv("c1", "Today One", { lastMessageAt: daysAgo(0) }),
+      makeConv("c2", "Today Two", { lastMessageAt: daysAgo(0) }),
+      makeConv("c3", "Today Three", { lastMessageAt: daysAgo(0) }),
+      makeConv("c4", "Today Four", { lastMessageAt: daysAgo(0) }),
+    ];
+
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
+
+    // Only the "Today" bucket has visible chats (default 3 slots).
+    expect(screen.getByText("Today")).toBeInTheDocument();
+    expect(screen.queryByText("Yesterday")).not.toBeInTheDocument();
+    expect(screen.queryByText("Older")).not.toBeInTheDocument();
+
+    // 4th chat falls behind the slot budget → "More" affordance.
+    expect(screen.queryByText("Today Four")).not.toBeInTheDocument();
+    expect(screen.getByText("More")).toBeInTheDocument();
   });
 
   it("does not show 'More' when total conversations fit in slots", () => {
@@ -297,173 +1002,328 @@ describe("ChatSidebarSection", () => {
       makeConv("c1", "Only Chat", { updatedAt: "2026-01-01T00:00:00Z" }),
     ];
 
-    render(<ChatSidebarSection />);
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
 
     expect(screen.getByText("Only Chat")).toBeInTheDocument();
     expect(screen.queryByText("More")).not.toBeInTheDocument();
   });
 
-  describe("stable order (prevents sidebar jumping)", () => {
-    it("preserves chat order when updatedAt changes cause backend reordering", () => {
-      mockConversations = [
-        makeConv("c1", "Chat One", { updatedAt: "2026-01-05T00:00:00Z" }),
-        makeConv("c2", "Chat Two", { updatedAt: "2026-01-04T00:00:00Z" }),
-        makeConv("c3", "Chat Three", { updatedAt: "2026-01-03T00:00:00Z" }),
-      ];
+  it("asks the server for pinned projects only", () => {
+    mockProjects = [
+      {
+        id: "project-1",
+        name: "Pinned one",
+        icon: null,
+        pinnedAt: "2026-01-05T00:00:00Z",
+      },
+      { id: "project-2", name: "Not pinned", icon: null, pinnedAt: null },
+    ];
 
-      const { rerender } = render(<ChatSidebarSection />);
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
 
-      // Initial order
-      const getOrder = () =>
-        screen.getAllByRole("button").map((btn) => btn.textContent?.trim());
-      const initialOrder = getOrder();
-
-      // Simulate updatedAt bump moving "Chat Three" to front
-      mockConversations = [
-        makeConv("c3", "Chat Three", { updatedAt: "2026-01-06T00:00:00Z" }),
-        makeConv("c1", "Chat One", { updatedAt: "2026-01-05T00:00:00Z" }),
-        makeConv("c2", "Chat Two", { updatedAt: "2026-01-04T00:00:00Z" }),
-      ];
-
-      rerender(<ChatSidebarSection />);
-
-      // Order should remain the same as initial render
-      expect(getOrder()).toEqual(initialOrder);
-    });
-
-    it("prepends newly created conversations at the top", () => {
-      mockConversations = [
-        makeConv("c1", "Chat One", { updatedAt: "2026-01-05T00:00:00Z" }),
-        makeConv("c2", "Chat Two", { updatedAt: "2026-01-04T00:00:00Z" }),
-        makeConv("c3", "Chat Three", { updatedAt: "2026-01-03T00:00:00Z" }),
-        makeConv("c4", "Chat Four", { updatedAt: "2026-01-02T00:00:00Z" }),
-      ];
-
-      const { rerender } = render(<ChatSidebarSection />);
-
-      // Initial: shows c1, c2, c3 (3 slots)
-      expect(screen.getByText("Chat One")).toBeInTheDocument();
-      expect(screen.getByText("Chat Two")).toBeInTheDocument();
-      expect(screen.getByText("Chat Three")).toBeInTheDocument();
-
-      // New conversation created (appears first from backend)
-      mockConversations = [
-        makeConv("c-new", "New Chat", { updatedAt: "2026-01-10T00:00:00Z" }),
-        makeConv("c1", "Chat One", { updatedAt: "2026-01-05T00:00:00Z" }),
-        makeConv("c2", "Chat Two", { updatedAt: "2026-01-04T00:00:00Z" }),
-        makeConv("c3", "Chat Three", { updatedAt: "2026-01-03T00:00:00Z" }),
-        makeConv("c4", "Chat Four", { updatedAt: "2026-01-02T00:00:00Z" }),
-      ];
-
-      rerender(<ChatSidebarSection />);
-
-      // New chat should be at the top
-      expect(screen.getByText("New Chat")).toBeInTheDocument();
-    });
-
-    it("removes deleted conversations from the stable order", () => {
-      mockConversations = [
-        makeConv("c1", "Chat One", { updatedAt: "2026-01-05T00:00:00Z" }),
-        makeConv("c2", "Chat Two", { updatedAt: "2026-01-04T00:00:00Z" }),
-        makeConv("c3", "Chat Three", { updatedAt: "2026-01-03T00:00:00Z" }),
-      ];
-
-      const { rerender } = render(<ChatSidebarSection />);
-
-      expect(screen.getByText("Chat Two")).toBeInTheDocument();
-
-      // "Chat Two" deleted
-      mockConversations = [
-        makeConv("c1", "Chat One", { updatedAt: "2026-01-05T00:00:00Z" }),
-        makeConv("c3", "Chat Three", { updatedAt: "2026-01-03T00:00:00Z" }),
-      ];
-
-      rerender(<ChatSidebarSection />);
-
-      expect(screen.queryByText("Chat Two")).not.toBeInTheDocument();
-      expect(screen.getByText("Chat One")).toBeInTheDocument();
-      expect(screen.getByText("Chat Three")).toBeInTheDocument();
-    });
-
-    it("preserves pinned chat order when updatedAt changes cause backend reordering", () => {
-      // All 3 slots taken by pinned chats
-      mockConversations = [
-        makeConv("p1", "Pinned Alpha", {
-          pinnedAt: "2026-01-01T00:00:00Z",
-          updatedAt: "2026-01-05T00:00:00Z",
-        }),
-        makeConv("p2", "Pinned Beta", {
-          pinnedAt: "2026-01-01T00:00:00Z",
-          updatedAt: "2026-01-04T00:00:00Z",
-        }),
-        makeConv("p3", "Pinned Gamma", {
-          pinnedAt: "2026-01-01T00:00:00Z",
-          updatedAt: "2026-01-03T00:00:00Z",
-        }),
-        makeConv("c4", "Unpinned One", { updatedAt: "2026-01-02T00:00:00Z" }),
-      ];
-
-      const { rerender } = render(<ChatSidebarSection />);
-
-      const getOrder = () =>
-        screen.getAllByRole("button").map((btn) => btn.textContent?.trim());
-      const initialOrder = getOrder();
-
-      // Simulate updatedAt bump on "Pinned Gamma" — backend returns it first now
-      mockConversations = [
-        makeConv("p3", "Pinned Gamma", {
-          pinnedAt: "2026-01-01T00:00:00Z",
-          updatedAt: "2026-01-10T00:00:00Z",
-        }),
-        makeConv("p1", "Pinned Alpha", {
-          pinnedAt: "2026-01-01T00:00:00Z",
-          updatedAt: "2026-01-05T00:00:00Z",
-        }),
-        makeConv("p2", "Pinned Beta", {
-          pinnedAt: "2026-01-01T00:00:00Z",
-          updatedAt: "2026-01-04T00:00:00Z",
-        }),
-        makeConv("c4", "Unpinned One", { updatedAt: "2026-01-02T00:00:00Z" }),
-      ];
-
-      rerender(<ChatSidebarSection />);
-
-      // Pinned order should remain frozen
-      expect(getOrder()).toEqual(initialOrder);
-    });
-
-    it("preserves mixed pinned/unpinned order when updatedAt changes", () => {
-      mockConversations = [
-        makeConv("p1", "Pinned Chat", {
-          pinnedAt: "2026-01-01T00:00:00Z",
-          updatedAt: "2026-01-05T00:00:00Z",
-        }),
-        makeConv("c1", "Recent One", { updatedAt: "2026-01-04T00:00:00Z" }),
-        makeConv("c2", "Recent Two", { updatedAt: "2026-01-03T00:00:00Z" }),
-        makeConv("c3", "Recent Three", { updatedAt: "2026-01-02T00:00:00Z" }),
-      ];
-
-      const { rerender } = render(<ChatSidebarSection />);
-
-      const getOrder = () =>
-        screen.getAllByRole("button").map((btn) => btn.textContent?.trim());
-      const initialOrder = getOrder();
-
-      // "Recent Two" gets updatedAt bumped, backend moves it to front
-      mockConversations = [
-        makeConv("c2", "Recent Two", { updatedAt: "2026-01-10T00:00:00Z" }),
-        makeConv("p1", "Pinned Chat", {
-          pinnedAt: "2026-01-01T00:00:00Z",
-          updatedAt: "2026-01-05T00:00:00Z",
-        }),
-        makeConv("c1", "Recent One", { updatedAt: "2026-01-04T00:00:00Z" }),
-        makeConv("c3", "Recent Three", { updatedAt: "2026-01-02T00:00:00Z" }),
-      ];
-
-      rerender(<ChatSidebarSection />);
-
-      // Order should remain frozen for both pinned and unpinned
-      expect(getOrder()).toEqual(initialOrder);
-    });
+    // The sidebar never asks for the whole list: every chat page renders it.
+    for (const [filters] of mockUseProjects.mock.calls) {
+      expect(filters).toMatchObject({ pinned: true, limit: 100, offset: 0 });
+    }
+    expect(screen.getByText("Pinned one")).toBeInTheDocument();
+    expect(screen.queryByText("Not pinned")).not.toBeInTheDocument();
   });
+
+  it("shows a pinned project's emoji and name when an emoji is present", () => {
+    mockProjects = [
+      {
+        id: "project-1",
+        name: "Generic Project",
+        icon: "📌",
+        pinnedAt: "2026-01-05T00:00:00Z",
+      },
+    ];
+
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
+
+    expect(screen.getByText("Generic Project")).toBeInTheDocument();
+    expect(screen.queryByLabelText("projects icon")).not.toBeInTheDocument();
+    expect(screen.getByTestId("project-emoji")).toHaveTextContent("📌");
+  });
+
+  it("shows the project folder icon and name when no emoji is set", () => {
+    mockProjects = [
+      {
+        id: "project-1",
+        name: "Generic Project",
+        icon: null,
+        pinnedAt: "2026-01-05T00:00:00Z",
+      },
+    ];
+
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
+
+    expect(screen.getByText("Generic Project")).toBeInTheDocument();
+    expect(screen.getByLabelText("projects icon")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-emoji")).not.toBeInTheDocument();
+  });
+
+  it("shows pinned apps (owned and external) in the Pinned section, each with its own icon", () => {
+    mockApps = [
+      {
+        source: "owned",
+        id: "app-1",
+        name: "Sprint Board",
+        icon: "🚀",
+        pinnedAt: "2026-01-05T00:00:00Z",
+      },
+      {
+        source: "external",
+        mcpServerId: "server-1",
+        resourceUri: "ui://pm/board.html",
+        name: "Archestra PM / show_board",
+        icon: "📋",
+        pinnedAt: "2026-01-04T00:00:00Z",
+      },
+      {
+        source: "owned",
+        id: "app-2",
+        name: "Unpinned App",
+        pinnedAt: null,
+      },
+    ];
+
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
+
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+    expect(screen.getByText("Sprint Board")).toBeInTheDocument();
+    expect(screen.getByText("Archestra PM / show_board")).toBeInTheDocument();
+    expect(screen.queryByText("Unpinned App")).not.toBeInTheDocument();
+    // Each pinned row shows its own icon — the owned app's, and the external
+    // app's backing MCP server one.
+    expect(
+      screen.getAllByTestId("app-catalog-icon").map((el) => el.textContent),
+    ).toEqual(["🚀", "📋"]);
+  });
+
+  it("draws the Pinned list once every pinned source has answered, in pin order", () => {
+    mockConversations = [
+      makeConv("chat-1", "Pinned chat", { pinnedAt: "2026-01-04T00:00:00Z" }),
+    ];
+    mockApps = [
+      {
+        source: "owned",
+        id: "app-1",
+        name: "Sprint Board",
+        pinnedAt: "2026-01-05T00:00:00Z",
+      },
+    ];
+    mockAppsLoading = true;
+
+    const { rerender } = render(<ChatSidebarSection fadeIn={fadeIn} />);
+    // Chats are in, apps are not: showing the chat now would push it down a
+    // row as soon as the more recently pinned app lands.
+    expect(screen.queryByText("Pinned")).not.toBeInTheDocument();
+    expect(screen.queryByText("Pinned chat")).not.toBeInTheDocument();
+
+    mockAppsLoading = false;
+    rerender(<ChatSidebarSection fadeIn={fadeIn} />);
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+    const boardRow = screen.getByText("Sprint Board");
+    const chatRow = screen.getByText("Pinned chat");
+    expect(
+      boardRow.compareDocumentPosition(chatRow) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("routes an app without an icon through the fallback for its kind", () => {
+    mockApps = [
+      {
+        source: "owned",
+        id: "app-1",
+        name: "Sprint Board",
+        icon: null,
+        pinnedAt: "2026-01-05T00:00:00Z",
+      },
+      {
+        source: "external",
+        mcpServerId: "server-1",
+        resourceUri: "ui://pm/board.html",
+        name: "Archestra PM / show_board",
+        icon: null,
+        pinnedAt: "2026-01-04T00:00:00Z",
+      },
+    ];
+
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
+
+    // McpCatalogIcon owns the fallback glyph; the sidebar routes a null icon
+    // through it rather than hardcoding one — asking for the app window on an
+    // owned app and leaving the external one on the default server glyph.
+    const icons = screen.getAllByTestId("app-catalog-icon");
+    expect(icons.map((el) => el.textContent)).toEqual(["", ""]);
+    expect(icons.map((el) => el.getAttribute("data-fallback"))).toEqual([
+      "AppWindow",
+      "none",
+    ]);
+  });
+
+  it("shows a chat's project emoji and name when its project has an emoji", () => {
+    mockConversations = [
+      {
+        ...makeConv("c1", "Project Chat"),
+        projectId: "project-1",
+        projectName: "Generic Project",
+        projectIcon: "📌",
+      },
+    ];
+
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
+
+    expect(screen.getByText("Project Chat")).toBeInTheDocument();
+    expect(screen.getByText("Generic Project")).toBeInTheDocument();
+    expect(screen.queryByLabelText("projects icon")).not.toBeInTheDocument();
+    expect(screen.getByTestId("project-emoji")).toHaveTextContent("📌");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Open project Generic Project" }),
+    );
+    expect(mockRouterPush).toHaveBeenCalledWith("/projects/project-1");
+  });
+
+  it("shows a chat's project folder icon and name when the project has no emoji", () => {
+    mockConversations = [
+      {
+        ...makeConv("c1", "Project Chat"),
+        projectId: "project-1",
+        projectName: "Generic Project",
+        projectIcon: null,
+      },
+    ];
+
+    render(<ChatSidebarSection fadeIn={fadeIn} />);
+
+    expect(screen.getByText("Project Chat")).toBeInTheDocument();
+    expect(screen.getByText("Generic Project")).toBeInTheDocument();
+    expect(screen.getByLabelText("projects icon")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-emoji")).not.toBeInTheDocument();
+  });
+});
+
+// Coverage matrix for the sidebar status indicators across every
+// (session status x viewed-or-not x unread) combination. The spinner shows
+// while a chat generates (even one you're viewing); the new-messages dot shows
+// on a backgrounded chat with unseen output, but never while generating (the
+// spinner wins) and never on the chat you're currently viewing.
+describe("ChatSidebarSection status indicators", () => {
+  const fadeIn = { pending: () => true, done: () => {} };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockConversations = [];
+    mockProjects = [];
+    mockApps = [];
+    mockRuns = [];
+    mockChatState.pathname = "/chat";
+    mockChatState.sessionStatusById = {};
+  });
+
+  const cases: Array<{
+    name: string;
+    status?: string;
+    current: boolean;
+    unread: boolean;
+    expectGenerating: boolean;
+    expectUnread: boolean;
+  }> = [
+    {
+      name: "idle, elsewhere, read",
+      current: false,
+      unread: false,
+      expectGenerating: false,
+      expectUnread: false,
+    },
+    {
+      name: "streaming, elsewhere",
+      status: "streaming",
+      current: false,
+      unread: false,
+      expectGenerating: true,
+      expectUnread: false,
+    },
+    {
+      name: "submitted, elsewhere",
+      status: "submitted",
+      current: false,
+      unread: false,
+      expectGenerating: true,
+      expectUnread: false,
+    },
+    {
+      name: "streaming while viewing it",
+      status: "streaming",
+      current: true,
+      unread: false,
+      expectGenerating: true,
+      expectUnread: false,
+    },
+    {
+      name: "ready, elsewhere, unread",
+      status: "ready",
+      current: false,
+      unread: true,
+      expectGenerating: false,
+      expectUnread: true,
+    },
+    {
+      name: "generating wins over unread",
+      status: "streaming",
+      current: false,
+      unread: true,
+      expectGenerating: true,
+      expectUnread: false,
+    },
+    {
+      name: "unread suppressed on the viewed chat",
+      status: "ready",
+      current: true,
+      unread: true,
+      expectGenerating: false,
+      expectUnread: false,
+    },
+  ];
+
+  for (const {
+    name,
+    status,
+    current,
+    unread,
+    expectGenerating,
+    expectUnread,
+  } of cases) {
+    it(`renders the right indicator: ${name}`, () => {
+      // `unread` is a server-derived field on the conversation row.
+      mockConversations = [{ ...makeConv("c1", "Chat One"), unread }];
+      mockChatState.pathname = current ? "/chat/c1" : "/chat";
+      mockChatState.sessionStatusById = status ? { c1: status } : {};
+
+      render(<ChatSidebarSection fadeIn={fadeIn} />);
+
+      // Sanity: the row itself still renders (guards unrelated regressions).
+      expect(screen.getByText("Chat One")).toBeInTheDocument();
+
+      const generating = screen.queryByTestId(
+        getChatItemGeneratingIndicatorTestId("c1"),
+      );
+      const unreadDot = screen.queryByTestId(
+        getChatItemUnreadIndicatorTestId("c1"),
+      );
+
+      if (expectGenerating) {
+        expect(generating).toBeInTheDocument();
+      } else {
+        expect(generating).not.toBeInTheDocument();
+      }
+      if (expectUnread) {
+        expect(unreadDot).toBeInTheDocument();
+      } else {
+        expect(unreadDot).not.toBeInTheDocument();
+      }
+    });
+  }
 });

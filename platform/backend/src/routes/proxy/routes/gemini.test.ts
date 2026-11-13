@@ -15,17 +15,30 @@
  */
 
 import Fastify, { type FastifyInstance } from "fastify";
-import {
-  serializerCompiler,
-  validatorCompiler,
-  type ZodTypeProvider,
-} from "fastify-type-provider-zod";
 import { vi } from "vitest";
+import { attestToolDescription } from "@/archestra-mcp-server/tool-attestation";
+import config from "@/config";
+import { createFastifyInstance } from "@/fastify-instance";
 import { ModelModel } from "@/models";
+import { buildNoticeArguments, type RemedyExecution } from "@/openappa/notice";
 import { afterEach, beforeEach, describe, expect, test } from "@/test";
 import { createGeminiTestClient } from "@/test/llm-provider-stubs";
+import { makePassthroughCredential } from "@/test/llm-proxy-credentials";
 import { geminiAdapterFactory } from "../adapters/gemini";
+import { virtualKeyRateLimiter } from "../llm-proxy-auth";
 import geminiProxyRoutes from "./gemini";
+
+beforeEach(async () => {
+  for (const modelId of ["gemini-2.5-pro", "gemini-3.7-flash"]) {
+    await ModelModel.create({
+      externalId: `gemini/${modelId}`,
+      provider: "gemini",
+      modelId,
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+    });
+  }
+});
 
 describe("Gemini streaming format", () => {
   beforeEach(() => {
@@ -38,14 +51,18 @@ describe("Gemini streaming format", () => {
     vi.restoreAllMocks();
   });
 
-  test("streaming response has correct SSE format", async ({ makeAgent }) => {
-    const app = Fastify().withTypeProvider<ZodTypeProvider>();
-    app.setValidatorCompiler(validatorCompiler);
-    app.setSerializerCompiler(serializerCompiler);
+  test("streaming response has correct SSE format", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const app = createFastifyInstance();
 
     await app.register(geminiProxyRoutes);
 
     const agent = await makeAgent({ name: "Test Streaming Format Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
 
     const response = await app.inject({
       method: "POST",
@@ -53,6 +70,10 @@ describe("Gemini streaming format", () => {
       headers: {
         "content-type": "application/json",
         "x-goog-api-key": "test-key",
+        "x-archestra-virtual-key": await makePassthroughCredential({
+          organizationId: agent.organizationId,
+          ownerId: owner.id,
+        }),
       },
       payload: {
         contents: [
@@ -71,6 +92,429 @@ describe("Gemini streaming format", () => {
     expect(body).toContain("data: ");
     expect(body).toContain("data: [DONE]");
   });
+
+  test("forwards a finish-only terminal chunk before closing the stream", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    stubGeminiStreamClient(() => [
+      {
+        candidates: [
+          {
+            content: { role: "model", parts: [{ text: "Hello" }] },
+            index: 0,
+          },
+        ],
+        modelVersion: "gemini-2.5-pro",
+        responseId: "split-finish-response",
+      },
+      {
+        candidates: [{ finishReason: "STOP", index: 0 }],
+        usageMetadata: {
+          promptTokenCount: 10,
+          candidatesTokenCount: 1,
+          totalTokenCount: 11,
+        },
+        modelVersion: "gemini-2.5-pro",
+        responseId: "split-finish-response",
+      },
+    ]);
+    const app = createFastifyInstance();
+    await app.register(geminiProxyRoutes);
+    const agent = await makeAgent({ name: "Split Finish Stream Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/gemini/${agent.id}/v1beta/models/gemini-2.5-pro:streamGenerateContent`,
+      headers: geminiTestHeaders(
+        await makePassthroughCredential({
+          organizationId: agent.organizationId,
+          ownerId: owner.id,
+        }),
+      ),
+      payload: geminiRequest(),
+    });
+
+    expect(response.statusCode).toBe(200);
+    const payloads = response.body
+      .split("\n")
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => line.slice("data: ".length));
+    expect(payloads.at(-1)).toBe("[DONE]");
+
+    const events = payloads
+      .filter((payload) => payload !== "[DONE]")
+      .map((payload) => JSON.parse(payload));
+    expect(events[0].candidates[0].content.parts).toEqual([{ text: "Hello" }]);
+    expect(events[1]).toMatchObject({
+      candidates: [
+        {
+          content: { role: "model", parts: [] },
+          finishReason: "STOP",
+          index: 0,
+        },
+      ],
+      usageMetadata: {
+        promptTokenCount: 10,
+        candidatesTokenCount: 1,
+        totalTokenCount: 11,
+      },
+    });
+  });
+
+  test("forwards STOP when the terminal chunk has only non-rendered parts", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    stubGeminiStreamClient(() => [
+      {
+        candidates: [
+          {
+            content: { role: "model", parts: [{ text: "Hello" }] },
+            index: 0,
+          },
+        ],
+      },
+      {
+        candidates: [
+          {
+            content: { role: "model", parts: [{ text: "" }] },
+            finishReason: "STOP",
+            index: 0,
+          },
+        ],
+        usageMetadata: { totalTokenCount: 11 },
+      },
+    ]);
+    const app = createFastifyInstance();
+    await app.register(geminiProxyRoutes);
+    const agent = await makeAgent({ name: "Non-rendered Finish Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/gemini/${agent.id}/v1beta/models/gemini-2.5-pro:streamGenerateContent`,
+      headers: geminiTestHeaders(
+        await makePassthroughCredential({
+          organizationId: agent.organizationId,
+          ownerId: owner.id,
+        }),
+      ),
+      payload: geminiRequest(),
+    });
+
+    const events = response.body
+      .split("\n")
+      .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+      .map((line) => JSON.parse(line.slice("data: ".length)));
+    expect(events.at(-1)).toMatchObject({
+      candidates: [{ finishReason: "STOP" }],
+      usageMetadata: { totalTokenCount: 11 },
+    });
+  });
+
+  test("forwards prompt-block metadata without a candidate", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    stubGeminiStreamClient(() => [
+      {
+        promptFeedback: { blockReason: "SAFETY" },
+        usageMetadata: { promptTokenCount: 10, totalTokenCount: 10 },
+      },
+    ]);
+    const app = createFastifyInstance();
+    await app.register(geminiProxyRoutes);
+    const agent = await makeAgent({ name: "Prompt Block Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/gemini/${agent.id}/v1beta/models/gemini-2.5-pro:streamGenerateContent`,
+      headers: geminiTestHeaders(
+        await makePassthroughCredential({
+          organizationId: agent.organizationId,
+          ownerId: owner.id,
+        }),
+      ),
+      payload: geminiRequest(),
+    });
+
+    const events = response.body
+      .split("\n")
+      .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+      .map((line) => JSON.parse(line.slice("data: ".length)));
+    expect(events[0]).toMatchObject({
+      promptFeedback: { blockReason: "SAFETY" },
+      usageMetadata: { promptTokenCount: 10, totalTokenCount: 10 },
+    });
+  });
+});
+
+describe("Gemini OAuth passthrough", () => {
+  let app: FastifyInstance;
+
+  beforeEach(() => {
+    app = createGeminiProxyTestApp();
+    vi.spyOn(geminiAdapterFactory, "createClient").mockImplementation(
+      () => createGeminiTestClient() as never,
+    );
+    vi.spyOn(virtualKeyRateLimiter, "check").mockResolvedValue(undefined);
+    vi.spyOn(virtualKeyRateLimiter, "recordSuccess").mockResolvedValue(
+      undefined,
+    );
+    vi.spyOn(virtualKeyRateLimiter, "recordFailure").mockResolvedValue(
+      undefined,
+    );
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await app.close();
+  });
+
+  test("attributes a bearer request to its passthrough-key owner", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    const agent = await makeAgent({ name: "Gemini OAuth Passthrough Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const { value: passthroughToken, virtualKey } = await (
+      await import("@/models")
+    ).VirtualApiKeyModel.create({
+      organizationId: agent.organizationId,
+      name: "gemini-oauth-passthrough",
+      keyType: "passthrough",
+      scope: "personal",
+      authorId: owner.id,
+    });
+    const createClient = vi.mocked(geminiAdapterFactory.createClient);
+
+    await app.register(geminiProxyRoutes);
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/gemini/${agent.id}/v1beta/models/gemini-2.5-pro:generateContent`,
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer oauth-access-token",
+        "x-goog-api-key": "api-key-that-must-not-win",
+        "x-goog-user-project": "caller-quota-project",
+        "x-archestra-virtual-key": passthroughToken,
+      },
+      payload: geminiRequest(),
+    });
+
+    expect(response.statusCode, response.body).toBe(200);
+    expect(createClient).toHaveBeenCalledWith(
+      "Bearer:oauth-access-token",
+      expect.objectContaining({ googleUserProject: "caller-quota-project" }),
+    );
+
+    const interactions = await (
+      await import("@/models")
+    ).InteractionModel.getAllInteractionsForProfile(agent.id);
+    expect(interactions).toContainEqual(
+      expect.objectContaining({
+        userId: owner.id,
+        passthroughVirtualKeyId: virtualKey.id,
+        authMethod: "passthrough_virtual_key",
+      }),
+    );
+  });
+
+  test("rejects an invalid passthrough key before creating an OAuth client", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "Invalid Gemini OAuth Key Agent" });
+    const createClient = vi.mocked(geminiAdapterFactory.createClient);
+
+    await app.register(geminiProxyRoutes);
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/gemini/${agent.id}/v1beta/models/gemini-2.5-pro:generateContent`,
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer oauth-access-token",
+        "x-archestra-virtual-key": "arch_invalid-passthrough-key",
+      },
+      payload: geminiRequest(),
+    });
+
+    expect(response.statusCode, response.body).toBe(401);
+    expect(createClient).not.toHaveBeenCalled();
+  });
+});
+
+describe("Gemini dispatch rewrite signatures", () => {
+  let app: FastifyInstance;
+
+  beforeEach(() => {
+    app = createGeminiProxyTestApp();
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await app.close();
+  });
+
+  test("keeps a rewritten tool-call signature usable on the next turn", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({ name: "Gemini Dispatch Follow-up Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+    const providerRequests: GeminiSdkRequest[] = [];
+
+    stubGeminiStreamClient((request) => {
+      providerRequests.push(request);
+      return providerRequests.length === 1
+        ? [
+            geminiToolCallChunk([
+              {
+                id: "call_read",
+                name: "inventory__read",
+                args: { itemId: "item-1" },
+                thoughtSignature: "opaque-thought-signature",
+              },
+            ]),
+          ]
+        : [geminiTextChunk("Done")];
+    });
+
+    await app.register(geminiProxyRoutes);
+
+    const firstResponse = await app.inject({
+      method: "POST",
+      url: `/v1/gemini/${agent.id}/v1beta/models/gemini-3.7-flash:streamGenerateContent`,
+      headers: geminiTestHeaders(
+        await makePassthroughCredential({
+          organizationId: agent.organizationId,
+          ownerId: owner.id,
+        }),
+      ),
+      payload: geminiDispatchRequest("Read item 1"),
+    });
+
+    expect(firstResponse.statusCode, firstResponse.body).toBe(200);
+    const rewrittenPart = findStreamedFunctionCallPart(firstResponse.body);
+    expect(rewrittenPart).toMatchObject({
+      functionCall: {
+        id: "call_read",
+        name: "archestra__run_tool",
+        args: {
+          tool_name: "inventory__read",
+          tool_args: { itemId: "item-1" },
+        },
+      },
+      thoughtSignature: "opaque-thought-signature",
+    });
+
+    const secondResponse = await app.inject({
+      method: "POST",
+      url: `/v1/gemini/${agent.id}/v1beta/models/gemini-3.7-flash:streamGenerateContent`,
+      headers: geminiTestHeaders(
+        await makePassthroughCredential({
+          organizationId: agent.organizationId,
+          ownerId: owner.id,
+        }),
+      ),
+      payload: {
+        ...geminiDispatchRequest("Read item 1"),
+        contents: [
+          { role: "user", parts: [{ text: "Read item 1" }] },
+          { role: "model", parts: [rewrittenPart] },
+          {
+            role: "user",
+            parts: [
+              {
+                functionResponse: {
+                  id: "call_read",
+                  name: "archestra__run_tool",
+                  response: { result: "available" },
+                },
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(secondResponse.statusCode, secondResponse.body).toBe(200);
+    expect(secondResponse.body).toContain("Done");
+    expect(providerRequests[1]?.contents[1]?.parts[0]?.thoughtSignature).toBe(
+      "opaque-thought-signature",
+    );
+  });
+
+  test("keeps parallel rewritten signatures paired by position", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({ name: "Gemini Parallel Dispatch Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
+
+    stubGeminiStreamClient(() => [
+      geminiToolCallChunk([
+        {
+          id: "call_read",
+          name: "inventory__read",
+          args: { itemId: "item-1" },
+          thoughtSignature: "signature-read",
+        },
+        {
+          id: "call_write",
+          name: "inventory__write",
+          args: { itemId: "item-2" },
+          thoughtSignature: "signature-write",
+        },
+      ]),
+    ]);
+
+    await app.register(geminiProxyRoutes);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/gemini/${agent.id}/v1beta/models/gemini-3.7-flash:streamGenerateContent`,
+      headers: geminiTestHeaders(
+        await makePassthroughCredential({
+          organizationId: agent.organizationId,
+          ownerId: owner.id,
+        }),
+      ),
+      payload: geminiDispatchRequest("Read one item and update another"),
+    });
+
+    expect(response.statusCode, response.body).toBe(200);
+    const functionCallParts = streamedFunctionCallParts(response.body);
+    expect(
+      functionCallParts.map((part) => ({
+        target: part.functionCall.args.tool_name,
+        thoughtSignature: part.thoughtSignature,
+      })),
+    ).toEqual([
+      {
+        target: "inventory__read",
+        thoughtSignature: "signature-read",
+      },
+      {
+        target: "inventory__write",
+        thoughtSignature: "signature-write",
+      },
+    ]);
+  });
 });
 
 describe("Gemini cost tracking", () => {
@@ -84,10 +528,12 @@ describe("Gemini cost tracking", () => {
     vi.restoreAllMocks();
   });
 
-  test("stores cost and baselineCost in interaction", async ({ makeAgent }) => {
-    const app = Fastify().withTypeProvider<ZodTypeProvider>();
-    app.setValidatorCompiler(validatorCompiler);
-    app.setSerializerCompiler(serializerCompiler);
+  test("stores cost and baselineCost in interaction", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const app = createFastifyInstance();
 
     await app.register(geminiProxyRoutes);
 
@@ -103,6 +549,8 @@ describe("Gemini cost tracking", () => {
     });
 
     const agent = await makeAgent({ name: "Test Cost Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
 
     const response = await app.inject({
       method: "POST",
@@ -110,6 +558,10 @@ describe("Gemini cost tracking", () => {
       headers: {
         "content-type": "application/json",
         "x-goog-api-key": "test-key",
+        "x-archestra-virtual-key": await makePassthroughCredential({
+          organizationId: agent.organizationId,
+          ownerId: owner.id,
+        }),
       },
       payload: {
         contents: [
@@ -153,10 +605,10 @@ describe("Gemini streaming mode", () => {
 
   test("streaming mode completes normally and records interaction", async ({
     makeAgent,
+    makeUser,
+    makeMember,
   }) => {
-    const app = Fastify().withTypeProvider<ZodTypeProvider>();
-    app.setValidatorCompiler(validatorCompiler);
-    app.setSerializerCompiler(serializerCompiler);
+    const app = createFastifyInstance();
 
     await app.register(geminiProxyRoutes);
 
@@ -172,6 +624,8 @@ describe("Gemini streaming mode", () => {
     });
 
     const agent = await makeAgent({ name: "Test Streaming Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
 
     const { InteractionModel } = await import("@/models");
 
@@ -185,6 +639,10 @@ describe("Gemini streaming mode", () => {
       headers: {
         "content-type": "application/json",
         "x-goog-api-key": "test-key",
+        "x-archestra-virtual-key": await makePassthroughCredential({
+          organizationId: agent.organizationId,
+          ownerId: owner.id,
+        }),
       },
       payload: {
         contents: [
@@ -223,10 +681,8 @@ describe("Gemini streaming mode", () => {
 
   test("streaming mode interrupted handles gracefully", {
     timeout: 10000,
-  }, async ({ makeAgent }) => {
-    const app = Fastify().withTypeProvider<ZodTypeProvider>();
-    app.setValidatorCompiler(validatorCompiler);
-    app.setSerializerCompiler(serializerCompiler);
+  }, async ({ makeAgent, makeUser, makeMember }) => {
+    const app = createFastifyInstance();
 
     // Configure stub to interrupt at chunk 2 (before final usage chunk).
     geminiStubOptions.interruptAtChunk = 2;
@@ -247,6 +703,8 @@ describe("Gemini streaming mode", () => {
     const agent = await makeAgent({
       name: "Test Interrupted Streaming Agent",
     });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
 
     const response = await app.inject({
       method: "POST",
@@ -254,6 +712,10 @@ describe("Gemini streaming mode", () => {
       headers: {
         "content-type": "application/json",
         "x-goog-api-key": "test-key",
+        "x-archestra-virtual-key": await makePassthroughCredential({
+          organizationId: agent.organizationId,
+          ownerId: owner.id,
+        }),
       },
       payload: {
         contents: [
@@ -274,10 +736,8 @@ describe("Gemini streaming mode", () => {
 
   test("streaming mode interrupted before usage handles gracefully", {
     timeout: 10000,
-  }, async ({ makeAgent }) => {
-    const app = Fastify().withTypeProvider<ZodTypeProvider>();
-    app.setValidatorCompiler(validatorCompiler);
-    app.setSerializerCompiler(serializerCompiler);
+  }, async ({ makeAgent, makeUser, makeMember }) => {
+    const app = createFastifyInstance();
 
     // Configure stub to interrupt at chunk 1 (before any usage data).
     geminiStubOptions.interruptAtChunk = 1;
@@ -298,6 +758,8 @@ describe("Gemini streaming mode", () => {
     const agent = await makeAgent({
       name: "Test Interrupted Before Usage Agent",
     });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
 
     const response = await app.inject({
       method: "POST",
@@ -305,6 +767,10 @@ describe("Gemini streaming mode", () => {
       headers: {
         "content-type": "application/json",
         "x-goog-api-key": "test-key",
+        "x-archestra-virtual-key": await makePassthroughCredential({
+          organizationId: agent.organizationId,
+          ownerId: owner.id,
+        }),
       },
       payload: {
         contents: [
@@ -328,16 +794,23 @@ describe("Gemini proxy routing", () => {
   let app: FastifyInstance;
   let mockUpstream: FastifyInstance;
   let upstreamPort: number;
+  let upstreamHeaders: Record<string, string | string[] | undefined>;
 
   beforeEach(async () => {
     mockUpstream = Fastify();
 
-    mockUpstream.get("/v1/models", async () => ({
-      models: [
-        { name: "models/gemini-2.5-pro", displayName: "Gemini 2.5 Pro" },
-        { name: "models/gemini-2.5-flash", displayName: "Gemini 2.5 Flash" },
-      ],
-    }));
+    mockUpstream.get("/v1/models", async (request) => {
+      upstreamHeaders = request.headers;
+      return {
+        models: [
+          { name: "models/gemini-2.5-pro", displayName: "Gemini 2.5 Pro" },
+          {
+            name: "models/gemini-2.5-flash",
+            displayName: "Gemini 2.5 Flash",
+          },
+        ],
+      };
+    });
 
     mockUpstream.get("/v1/models/:model", async (request) => ({
       name: `models/${(request.params as { model: string }).model}`,
@@ -396,6 +869,41 @@ describe("Gemini proxy routing", () => {
     expect(body.models).toHaveLength(2);
   });
 
+  test("strips Archestra control headers before proxying upstream", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const passthroughToken = await makeCatchAllPlatformCredential({
+      makeAgent,
+      makeUser,
+      makeMember,
+    });
+    const originalBaseUrl = config.llm.gemini.baseUrl;
+    const realApp = createGeminiProxyTestApp();
+    config.llm.gemini.baseUrl = `http://localhost:${upstreamPort}`;
+    try {
+      await realApp.register(geminiProxyRoutes);
+      const response = await realApp.inject({
+        method: "GET",
+        url: "/v1/gemini/v1beta/models",
+        headers: {
+          "x-archestra-virtual-key": passthroughToken,
+          "x-archestra-user-id": "untrusted-user-id",
+          "x-goog-api-key": "provider-api-key",
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(upstreamHeaders).not.toHaveProperty("x-archestra-virtual-key");
+      expect(upstreamHeaders).not.toHaveProperty("x-archestra-user-id");
+      expect(upstreamHeaders["x-goog-api-key"]).toBe("provider-api-key");
+    } finally {
+      config.llm.gemini.baseUrl = originalBaseUrl;
+      await realApp.close();
+    }
+  });
+
   test("proxies /v1/gemini/v1beta/models/:model", async () => {
     const response = await app.inject({
       method: "GET",
@@ -450,6 +958,321 @@ describe("Gemini proxy routing", () => {
   });
 });
 
+describe("Gemini countTokens passthrough", () => {
+  let upstream: FastifyInstance;
+  let forwardedBodies: string[];
+
+  beforeEach(async () => {
+    forwardedBodies = [];
+    upstream = Fastify();
+    upstream.addContentTypeParser(
+      "application/json",
+      { parseAs: "string" },
+      (_request, body, done) => done(null, body),
+    );
+    upstream.post("/v1/models/*", async (request) => {
+      forwardedBodies.push(request.body as string);
+      return { totalTokens: 42 };
+    });
+    await upstream.listen({ port: 0 });
+    const address = upstream.server.address();
+    const port = typeof address === "string" ? 0 : address?.port;
+    // Read when the catch-all proxy registers.
+    config.llm.gemini.baseUrl = `http://localhost:${port}`;
+  });
+
+  afterEach(async () => {
+    await upstream.close();
+  });
+
+  test("rejects a raw Gemini key without a platform credential before it reaches Gemini", async ({
+    makeAgent,
+  }) => {
+    await makeAgent();
+    const app = createFastifyInstance();
+    await app.register(geminiProxyRoutes);
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/gemini/v1beta/models/gemini-2.5-pro:countTokens",
+        headers: {
+          "content-type": "application/json",
+          "x-goog-api-key": "raw-gemini-key",
+        },
+        payload: {
+          generateContentRequest: {
+            contents: [{ role: "user", parts: [{ text: "Hello!" }] }],
+          },
+        },
+      });
+
+      expect(response.statusCode).toBe(401);
+    } finally {
+      await app.close();
+    }
+    expect(forwardedBodies).toEqual([]);
+  });
+
+  test("takes the gateway's markers out of the tool list before it reaches Gemini", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const passthroughToken = await makeCatchAllPlatformCredential({
+      makeAgent,
+      makeUser,
+      makeMember,
+    });
+    const app = createFastifyInstance();
+    await app.register(geminiProxyRoutes);
+    const description = attestToolDescription({
+      organizationId: "org-count-tokens",
+      gatewayId: "44f56e01-7167-42c1-88ee-64b566fbc34d",
+      advertisedName: "archestra__search_tools",
+      kind: "b",
+      description: "Search the catalog.",
+    });
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/gemini/v1beta/models/gemini-2.5-pro:countTokens",
+        headers: {
+          "content-type": "application/json",
+          "x-archestra-virtual-key": passthroughToken,
+        },
+        payload: {
+          generateContentRequest: {
+            contents: [{ role: "user", parts: [{ text: "Hello!" }] }],
+            tools: [
+              {
+                functionDeclarations: [
+                  { name: "archestra__search_tools", description },
+                ],
+              },
+            ],
+          },
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+    } finally {
+      await app.close();
+    }
+    expect(forwardedBodies).toHaveLength(1);
+    expect(forwardedBodies[0]).not.toContain("[[gwa1.");
+    expect(JSON.parse(forwardedBodies[0]).generateContentRequest.tools).toEqual(
+      [
+        {
+          functionDeclarations: [
+            {
+              name: "archestra__search_tools",
+              description: "Search the catalog.",
+            },
+          ],
+        },
+      ],
+    );
+  });
+
+  test("takes OpenAPPA's call-bound notices, legacy offers and remedy receipts out of a wrapped request", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const passthroughToken = await makeCatchAllPlatformCredential({
+      makeAgent,
+      makeUser,
+      makeMember,
+    });
+    const secret = "test-offer-signing-secret-32chars";
+    config.openappa.offerSigningSecret = secret;
+    // Leftover offer material from persisted history. Not minted, and not a route.
+    const offer = {
+      protected: "eyJhbGciOiJIUzI1NiJ9",
+      payload: JSON.stringify({ session_id: "historical-offer-session" }),
+      signature: "historical-offer",
+    };
+    const notice = (offers?: Array<typeof offer>) => ({
+      ...buildNoticeArguments({
+        id: "call_weather",
+        tool: "get_weather",
+        arguments: { location: "SF" },
+        result: "[appa] get_weather is blocked until a plan is approved.",
+      }),
+      ...(offers ? { offers } : {}),
+    });
+    const remedy = { offer_id: "offer-weather", plan: "approve" };
+    const execution = {
+      v: 1,
+      kind: "appa_remedy",
+      call_id: "call_remedy",
+      tool_name: "archestra__execute_remedy_plan",
+      original_arguments: JSON.stringify(remedy),
+    } satisfies RemedyExecution;
+    // Gemini supports optional call/response IDs. Both transport records name
+    // their own calls; the catch-all has no resolved gateway identity.
+    // Legacy offer fields are removed without verifying or routing them.
+    const contents = (noticeArgs: object, remedyArgs: object) => [
+      { role: "user", parts: [{ text: "What's the weather in SF?" }] },
+      {
+        role: "model",
+        parts: [
+          {
+            functionCall: {
+              id: "call_weather",
+              name: "archestra__get_remedy_plans",
+              args: noticeArgs,
+            },
+          },
+        ],
+      },
+      {
+        role: "user",
+        parts: [
+          {
+            functionResponse: {
+              id: "call_weather",
+              name: "archestra__get_remedy_plans",
+              response: { result: "rendered for the user" },
+            },
+          },
+        ],
+      },
+      {
+        role: "model",
+        parts: [
+          {
+            functionCall: {
+              id: "call_remedy",
+              name: "archestra__execute_remedy_plan",
+              args: remedyArgs,
+            },
+          },
+        ],
+      },
+      {
+        role: "user",
+        parts: [
+          {
+            functionResponse: {
+              id: "call_remedy",
+              name: "archestra__execute_remedy_plan",
+              response: { result: "Plan authorized." },
+            },
+          },
+        ],
+      },
+    ];
+    const app = createFastifyInstance();
+    await app.register(geminiProxyRoutes);
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/gemini/v1beta/models/gemini-2.5-pro:countTokens",
+        headers: {
+          "content-type": "application/json",
+          "x-archestra-virtual-key": passthroughToken,
+        },
+        payload: {
+          generateContentRequest: {
+            contents: contents(notice([offer]), {
+              ...remedy,
+              execution,
+              ...offer,
+            }),
+          },
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+    } finally {
+      await app.close();
+    }
+    expect(forwardedBodies).toHaveLength(1);
+    expect(forwardedBodies[0]).not.toMatch(
+      /"notice"|"offers"|"execution"|"protected"|"payload"|"signature"/,
+    );
+    const { notice: _notice, ...publicNotice } = notice();
+    expect(JSON.parse(forwardedBodies[0])).toEqual({
+      generateContentRequest: { contents: contents(publicNotice, remedy) },
+    });
+  });
+
+  test("preserves an unowned Gemini lookalike's application fields in a wrapped request", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const passthroughToken = await makeCatchAllPlatformCredential({
+      makeAgent,
+      makeUser,
+      makeMember,
+    });
+    const names = [
+      "archestra__get_remedy_plans",
+      "archestra__execute_remedy_plan",
+      "archestra__ask_user",
+    ];
+    const args = {
+      ...buildNoticeArguments({
+        id: "call_application",
+        tool: "get_weather",
+        arguments: { location: "SF" },
+        result: "An application's own ruling.",
+      }),
+      offers: [{ offer_id: "application-offer" }],
+      remedy_offers: [{ offer_id: "application-remedy" }],
+      trajectory: { stage: "application-workflow" },
+      execution: { kind: "application-record" },
+      protected: "application-header",
+      payload: "application-payload",
+      signature: "application-signature",
+    };
+    // Neither unmarked declarations nor same-leaf names and field presence
+    // bind these ID-less application calls to platform transport records.
+    const payload = {
+      generateContentRequest: {
+        tools: [
+          {
+            functionDeclarations: names.map((name) => ({
+              name,
+              description: "An application's own tool.",
+            })),
+          },
+        ],
+        contents: [
+          {
+            role: "model",
+            parts: names.map((name) => ({ functionCall: { name, args } })),
+          },
+        ],
+      },
+    };
+    const app = createFastifyInstance();
+    await app.register(geminiProxyRoutes);
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/gemini/v1beta/models/gemini-2.5-pro:countTokens",
+        headers: {
+          "content-type": "application/json",
+          "x-archestra-virtual-key": passthroughToken,
+        },
+        payload,
+      });
+      expect(response.statusCode).toBe(200);
+    } finally {
+      await app.close();
+    }
+    expect(forwardedBodies).toEqual([JSON.stringify(payload)]);
+    expect(JSON.parse(forwardedBodies[0])).toEqual(payload);
+  });
+});
+
 describe("Gemini non-streaming mode", () => {
   beforeEach(() => {
     vi.spyOn(geminiAdapterFactory, "createClient").mockImplementation(
@@ -463,10 +1286,10 @@ describe("Gemini non-streaming mode", () => {
 
   test("non-streaming mode completes and records interaction", async ({
     makeAgent,
+    makeUser,
+    makeMember,
   }) => {
-    const app = Fastify().withTypeProvider<ZodTypeProvider>();
-    app.setValidatorCompiler(validatorCompiler);
-    app.setSerializerCompiler(serializerCompiler);
+    const app = createFastifyInstance();
 
     await app.register(geminiProxyRoutes);
 
@@ -482,6 +1305,8 @@ describe("Gemini non-streaming mode", () => {
     });
 
     const agent = await makeAgent({ name: "Test Non-Streaming Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId);
 
     const { InteractionModel } = await import("@/models");
 
@@ -495,6 +1320,10 @@ describe("Gemini non-streaming mode", () => {
       headers: {
         "content-type": "application/json",
         "x-goog-api-key": "test-key",
+        "x-archestra-virtual-key": await makePassthroughCredential({
+          organizationId: agent.organizationId,
+          ownerId: owner.id,
+        }),
       },
       payload: {
         contents: [
@@ -522,5 +1351,334 @@ describe("Gemini non-streaming mode", () => {
     // Non-streaming mock returns different token counts
     expect(interaction.inputTokens).toBe(82);
     expect(interaction.outputTokens).toBe(17);
+  });
+});
+
+type StreamedFunctionCallPart = {
+  functionCall: {
+    id: string;
+    name: string;
+    args: Record<string, unknown> & { tool_name: string };
+  };
+  thoughtSignature?: string;
+};
+
+type GeminiSdkRequest = {
+  contents: Array<{
+    role: string;
+    parts: Array<{ thoughtSignature?: string }>;
+  }>;
+};
+
+function createGeminiProxyTestApp() {
+  return createFastifyInstance();
+}
+
+/**
+ * A passthrough key owned by a member of a real agent's organization. Catch-all
+ * routes without an agent in the URL resolve the deployment's organization,
+ * which is this one because it is the only organization the test creates.
+ */
+async function makeCatchAllPlatformCredential(fixtures: {
+  makeAgent: () => Promise<{ id: string; organizationId: string }>;
+  makeUser: () => Promise<{ id: string }>;
+  makeMember: (userId: string, organizationId: string) => Promise<unknown>;
+}): Promise<string> {
+  const agent = await fixtures.makeAgent();
+  const owner = await fixtures.makeUser();
+  await fixtures.makeMember(owner.id, agent.organizationId);
+  return makePassthroughCredential({
+    organizationId: agent.organizationId,
+    ownerId: owner.id,
+  });
+}
+
+function geminiTestHeaders(platformCredential: string) {
+  return {
+    "content-type": "application/json",
+    "x-goog-api-key": "test-key",
+    "x-archestra-virtual-key": platformCredential,
+  };
+}
+
+function geminiDispatchRequest(prompt: string) {
+  return {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    tools: [
+      {
+        functionDeclarations: [
+          {
+            name: "archestra__search_tools",
+            description: "Find tools by capability",
+            parameters: {
+              type: "object",
+              properties: { query: { type: "string" } },
+              required: ["query"],
+            },
+          },
+          {
+            name: "archestra__run_tool",
+            description: "Run a tool by exact name",
+            parameters: {
+              type: "object",
+              properties: {
+                tool_name: { type: "string" },
+                tool_args: { type: "object" },
+              },
+              required: ["tool_name"],
+            },
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function geminiRequest() {
+  return {
+    contents: [{ role: "user", parts: [{ text: "Hello!" }] }],
+  };
+}
+
+function geminiStream(chunks: unknown[]) {
+  return {
+    async *[Symbol.asyncIterator]() {
+      yield* chunks;
+    },
+  };
+}
+
+function stubGeminiStreamClient(
+  getChunks: (request: GeminiSdkRequest) => unknown[],
+) {
+  vi.spyOn(geminiAdapterFactory, "createClient").mockImplementation(
+    () =>
+      ({
+        models: {
+          generateContentStream: async (request: GeminiSdkRequest) =>
+            geminiStream(getChunks(request)),
+        },
+      }) as never,
+  );
+}
+
+function geminiToolCallChunk(
+  calls: Array<{
+    id: string;
+    name: string;
+    args: Record<string, unknown>;
+    thoughtSignature: string;
+  }>,
+) {
+  return {
+    candidates: [
+      {
+        content: {
+          role: "model",
+          parts: calls.map(({ thoughtSignature, ...functionCall }) => ({
+            functionCall,
+            thoughtSignature,
+          })),
+        },
+        finishReason: "STOP",
+        index: 0,
+      },
+    ],
+    usageMetadata: {
+      promptTokenCount: 12,
+      candidatesTokenCount: 10,
+      totalTokenCount: 22,
+    },
+    modelVersion: "gemini-3.7-flash",
+    responseId: "gemini-dispatch-test",
+  };
+}
+
+function geminiTextChunk(text: string) {
+  return {
+    candidates: [
+      {
+        content: { role: "model", parts: [{ text }] },
+        finishReason: "STOP",
+        index: 0,
+      },
+    ],
+    usageMetadata: {
+      promptTokenCount: 24,
+      candidatesTokenCount: 2,
+      totalTokenCount: 26,
+    },
+    modelVersion: "gemini-3.7-flash",
+    responseId: "gemini-follow-up-test",
+  };
+}
+
+function streamedFunctionCallParts(body: string): StreamedFunctionCallPart[] {
+  return body
+    .split("\n")
+    .filter((line) => line.startsWith("data: "))
+    .map((line) => line.slice("data: ".length))
+    .filter((payload) => payload !== "[DONE]")
+    .map((payload) => JSON.parse(payload))
+    .flatMap((event) => event.candidates?.[0]?.content?.parts ?? [])
+    .filter(
+      (part): part is StreamedFunctionCallPart =>
+        part.functionCall !== undefined,
+    );
+}
+
+function findStreamedFunctionCallPart(body: string): StreamedFunctionCallPart {
+  const [part] = streamedFunctionCallParts(body);
+  if (!part) {
+    throw new Error("Expected a streamed Gemini function call");
+  }
+  return part;
+}
+
+describe("native Gemini model execution availability", () => {
+  test.for([
+    "embedContent",
+    "batchEmbedContents",
+    "asyncBatchEmbedContent",
+    "predict",
+    "predictLongRunning",
+    "batchGenerateContent",
+  ] as const)("checks the selected model before forwarding %s", async (method, {
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const upstream = Fastify();
+    const forwarded: string[] = [];
+    upstream.post("/v1/models/*", async (request) => {
+      forwarded.push(request.url);
+      return {
+        embedding: { values: [0.1, 0.2] },
+        embeddings: [{ values: [0.1, 0.2] }],
+        name: "batches/synthetic",
+      };
+    });
+    upstream.get("/v1/models/*", async () => ({
+      name: "models/gemini-embedding-001",
+    }));
+    const address = await upstream.listen({ port: 0, host: "127.0.0.1" });
+    const previous = config.llm.gemini.baseUrl;
+    config.llm.gemini.baseUrl = address;
+    const agent = await makeAgent({ agentType: "llm_proxy" });
+    const owner = await makeUser();
+    await makeMember(owner.id, agent.organizationId, { role: "admin" });
+    const token = await makePassthroughCredential({
+      organizationId: agent.organizationId,
+      ownerId: owner.id,
+    });
+    const modelId =
+      method === "predict"
+        ? "imagen-4.0-generate-001"
+        : method === "predictLongRunning"
+          ? "veo-3.1-generate-preview"
+          : method === "batchGenerateContent"
+            ? "gemini-2.5-flash"
+            : "gemini-embedding-001";
+    const row = await ModelModel.create({
+      provider: "gemini",
+      modelId,
+      externalId: `gemini/${modelId}`,
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      ignored: true,
+    });
+    const app = createFastifyInstance();
+    await app.register(geminiProxyRoutes);
+    const headers = {
+      "x-goog-api-key": "synthetic-provider-key",
+      "x-archestra-virtual-key": token,
+    };
+    const ask = (model = row.modelId, encoded = false) => {
+      const embedRequest = {
+        model: `models/${model}`,
+        content: { parts: [{ text: "fixture" }] },
+      };
+      const resource = `${model}:${method}`;
+      return app.inject({
+        method: "POST",
+        url: `/v1/gemini/${agent.id}/v1beta/models/${encoded ? encodeURIComponent(resource) : resource}`,
+        headers,
+        payload:
+          method === "embedContent"
+            ? { content: embedRequest.content }
+            : method === "batchEmbedContents"
+              ? { requests: [embedRequest] }
+              : method === "predict" || method === "predictLongRunning"
+                ? { instances: [{ prompt: "synthetic image" }] }
+                : method === "batchGenerateContent"
+                  ? {
+                      batch: {
+                        displayName: "synthetic",
+                        inputConfig: {
+                          requests: {
+                            requests: [
+                              {
+                                request: {
+                                  contents: [{ parts: [{ text: "fixture" }] }],
+                                },
+                              },
+                            ],
+                          },
+                        },
+                      },
+                    }
+                  : {
+                      batch: {
+                        displayName: "synthetic",
+                        inputConfig: {
+                          requests: { requests: [{ request: embedRequest }] },
+                        },
+                      },
+                    },
+      });
+    };
+    try {
+      for (const encoded of [false, true]) {
+        const hidden = await ask(row.modelId, encoded);
+        expect(hidden.statusCode, hidden.body).toBe(403);
+      }
+      expect(forwarded).toEqual([]);
+      if (method === "embedContent") {
+        const metadata = await app.inject({
+          method: "GET",
+          url: `/v1/gemini/${agent.id}/v1beta/models/${row.modelId}`,
+          headers,
+        });
+        expect(metadata.statusCode, metadata.body).toBe(200);
+        const count = await app.inject({
+          method: "POST",
+          url: `/v1/gemini/${agent.id}/v1beta/models/${row.modelId}:countTokens`,
+          headers,
+          payload: { contents: [{ parts: [{ text: "fixture" }] }] },
+        });
+        expect(count.statusCode, count.body).toBe(200);
+        forwarded.length = 0;
+      }
+      if (method === "predictLongRunning") {
+        const poll = await app.inject({
+          method: "POST",
+          url: `/v1/gemini/${agent.id}/v1beta/models/${row.modelId}:fetchPredictOperation`,
+          headers,
+          payload: { operationName: "operations/synthetic" },
+        });
+        expect(poll.statusCode, poll.body).toBe(200);
+        forwarded.length = 0;
+      }
+      await ModelModel.update(row.id, { ignored: false });
+      const visible = await ask();
+      expect(visible.statusCode, visible.body).toBe(200);
+      const custom = await ask("uncatalogued-custom-model");
+      expect(custom.statusCode, custom.body).toBe(200);
+      expect(forwarded).toHaveLength(2);
+    } finally {
+      config.llm.gemini.baseUrl = previous;
+      await app.close();
+      await upstream.close();
+    }
   });
 });

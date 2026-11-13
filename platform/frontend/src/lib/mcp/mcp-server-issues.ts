@@ -1,0 +1,26 @@
+// The issue rule lives in the shared package so the server ranks the registry
+// list with the same code the browser uses for the badge, facets and rows.
+export {
+  attentionCatalogIds,
+  attentionKindCounts,
+  attentionRankTiers,
+  attentionSortRank,
+  bucketOf,
+  type CatalogItemForIssues,
+  canFixInstall,
+  canReinstallInstall,
+  computeMcpServerIssues,
+  describeMcpServerIssue,
+  describeOtherConnectionsReauth,
+  facetIssues,
+  getMcpServerIssueKindMeta,
+  type InstalledServerForIssues,
+  type IssueViewer,
+  MCP_SERVER_ISSUE_KINDS,
+  type McpServerAttentionFacet,
+  type McpServerIssue,
+  type McpServerIssueAudience,
+  type McpServerIssueKind,
+  type McpServerIssueKindMeta,
+  tidyMcpServerErrorText,
+} from "@archestra/shared";

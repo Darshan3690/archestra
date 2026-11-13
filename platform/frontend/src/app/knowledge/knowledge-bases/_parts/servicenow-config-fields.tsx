@@ -13,6 +13,14 @@ import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 
+const ROLE_AUDIENCE_TABLES = [
+  { table: "incident", label: "Incidents" },
+  { table: "change_request", label: "Changes" },
+  { table: "change_task", label: "Change Tasks" },
+  { table: "problem", label: "Problems" },
+  { table: "cmdb_ci_business_app", label: "Business Applications" },
+] as const;
+
 interface ServiceNowConfigFieldsProps {
   // biome-ignore lint/suspicious/noExplicitAny: form type is generic across different form schemas
   form: UseFormReturn<any>;
@@ -35,13 +43,13 @@ export function ServiceNowConfigFields({
           render={({ field }) => (
             <FormItem>
               <FormLabel>Instance URL</FormLabel>
+              <FormDescription>Your ServiceNow instance URL.</FormDescription>
               <FormControl>
                 <Input
                   placeholder="https://your-instance.service-now.com"
                   {...field}
                 />
               </FormControl>
-              <FormDescription>Your ServiceNow instance URL.</FormDescription>
               <FormMessage />
             </FormItem>
           )}
@@ -156,18 +164,73 @@ export function ServiceNowConfigFields({
 
       <FormField
         control={form.control}
+        name={`${prefix}.includeKnowledgeArticles`}
+        render={({ field }) => (
+          <FormItem className="flex items-center justify-between rounded-lg border p-3">
+            <div className="space-y-0.5">
+              <FormLabel>Include Knowledge Articles</FormLabel>
+              <FormDescription>
+                Sync published knowledge articles from the kb_knowledge table.
+                States and assignment group filters do not apply to this entity.
+              </FormDescription>
+            </div>
+            <FormControl>
+              <Switch
+                checked={field.value ?? false}
+                onCheckedChange={field.onChange}
+              />
+            </FormControl>
+          </FormItem>
+        )}
+      />
+
+      <div className="space-y-3 rounded-lg border p-3">
+        <div className="space-y-0.5">
+          <FormLabel>Role audiences (auto-sync permissions)</FormLabel>
+          <FormDescription>
+            Only used with auto-sync permissions. Comma-separated ServiceNow
+            role names (e.g. itil) whose holders may read every synced record of
+            that table. Without roles, a record is visible only to its
+            participants: assignment group members, the caller, the opener, and
+            the assignee.
+          </FormDescription>
+        </div>
+        {ROLE_AUDIENCE_TABLES.map(({ table, label }) => (
+          <FormField
+            key={table}
+            control={form.control}
+            name={`${prefix}.roleAudiences.${table}`}
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel className="text-sm font-normal">{label}</FormLabel>
+                <FormControl>
+                  <Input
+                    placeholder="itil"
+                    {...field}
+                    value={field.value ?? ""}
+                  />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        ))}
+      </div>
+
+      <FormField
+        control={form.control}
         name={`${prefix}.states`}
         render={({ field }) => (
           <FormItem>
             <FormLabel>States (optional)</FormLabel>
-            <FormControl>
-              <Input placeholder="1, 2, 3" {...field} />
-            </FormControl>
             <FormDescription>
               Comma-separated list of state values to filter by (e.g. 1 = New, 2
               = In Progress). Applies to incidents, changes, change tasks, and
               problems.
             </FormDescription>
+            <FormControl>
+              <Input placeholder="1, 2, 3" {...field} />
+            </FormControl>
             <FormMessage />
           </FormItem>
         )}
@@ -179,12 +242,12 @@ export function ServiceNowConfigFields({
         render={({ field }) => (
           <FormItem>
             <FormLabel>Assignment Groups (optional)</FormLabel>
-            <FormControl>
-              <Input placeholder="sys_id_1, sys_id_2" {...field} />
-            </FormControl>
             <FormDescription>
               Comma-separated list of assignment group sys_ids to filter by.
             </FormDescription>
+            <FormControl>
+              <Input placeholder="sys_id_1, sys_id_2" {...field} />
+            </FormControl>
             <FormMessage />
           </FormItem>
         )}
@@ -206,6 +269,9 @@ export function ServiceNowConfigFields({
                   <span className="text-muted-foreground text-sm">months</span>
                 </span>
               </div>
+              <FormDescription>
+                Historical data loaded on first sync
+              </FormDescription>
               <FormControl>
                 <Slider
                   min={1}
@@ -219,9 +285,6 @@ export function ServiceNowConfigFields({
                 <span>1 mo</span>
                 <span>12 mo</span>
               </div>
-              <FormDescription>
-                Historical data loaded on first sync
-              </FormDescription>
             </FormItem>
           );
         }}
@@ -233,6 +296,9 @@ export function ServiceNowConfigFields({
         render={({ field }) => (
           <FormItem>
             <FormLabel>Batch Size</FormLabel>
+            <FormDescription>
+              Number of records to process per batch (default: 50).
+            </FormDescription>
             <FormControl>
               <Input
                 type="number"
@@ -241,9 +307,6 @@ export function ServiceNowConfigFields({
                 onChange={(e) => field.onChange(Number(e.target.value) || 50)}
               />
             </FormControl>
-            <FormDescription>
-              Number of records to process per batch (default: 50).
-            </FormDescription>
             <FormMessage />
           </FormItem>
         )}

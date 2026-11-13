@@ -1,5 +1,13 @@
-import { index, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import {
+  index,
+  jsonb,
+  pgTable,
+  text,
+  timestamp,
+  uuid,
+} from "drizzle-orm/pg-core";
 import type {
+  ScheduleRunBlocker,
   ScheduleTriggerRunKind,
   ScheduleTriggerRunStatus,
 } from "@/types/schedule-trigger";
@@ -20,12 +28,14 @@ const scheduleTriggerRunsTable = pgTable(
       .default("running"),
     initiatedByUserId: text("initiated_by_user_id"),
     chatConversationId: uuid("chat_conversation_id"),
+    runtimeTaskId: uuid("runtime_task_id"),
     startedAt: timestamp("started_at", { withTimezone: true, mode: "date" }),
     completedAt: timestamp("completed_at", {
       withTimezone: true,
       mode: "date",
     }),
     error: text("error"),
+    blockedBy: jsonb("blocked_by").$type<ScheduleRunBlocker>(),
     artifact: text("artifact"),
     createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
       .notNull()

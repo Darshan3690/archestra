@@ -4,6 +4,95 @@ import { describe, expect, test } from "@/test";
 import { DbSecretsManager } from "./db";
 
 describe("DbSecretsManager", () => {
+  test("concurrent cache misses share a database read", async ({
+    makeSecret,
+  }) => {
+    const secret = await makeSecret({ secret: { token: "synthetic-token" } });
+    const manager = new DbSecretsManager();
+    const reads = vi.spyOn(SecretModel, "findById");
+    try {
+      const results = await Promise.all(
+        Array.from({ length: 10 }, () => manager.getSecret(secret.id)),
+      );
+      expect(results).toHaveLength(10);
+      expect(
+        results.every((result) => result?.secret.token === "synthetic-token"),
+      ).toBe(true);
+      expect(reads).toHaveBeenCalledTimes(1);
+    } finally {
+      reads.mockRestore();
+    }
+  });
+
+  test("fresh reads bypass in-flight reads and observe a later rotation", async ({
+    makeSecret,
+  }) => {
+    const secret = await makeSecret({ secret: { token: "before" } });
+    const manager = new DbSecretsManager();
+    const reads = vi.spyOn(SecretModel, "findById");
+    try {
+      await Promise.all([
+        manager.getSecret(secret.id, { skipCache: true }),
+        manager.getSecret(secret.id, { skipCache: true }),
+      ]);
+      expect(reads).toHaveBeenCalledTimes(2);
+      await SecretModel.update(secret.id, { secret: { token: "after" } });
+      expect(
+        (await manager.getSecret(secret.id, { skipCache: true }))?.secret,
+      ).toEqual({ token: "after" });
+      expect((await manager.getSecret(secret.id))?.secret).toEqual({
+        token: "after",
+      });
+      expect(reads).toHaveBeenCalledTimes(3);
+    } finally {
+      reads.mockRestore();
+    }
+  });
+
+  test("a fresh read that finishes after a write does not publish the row it read", async ({
+    makeSecret,
+  }) => {
+    const secret = await makeSecret({ secret: { token: "before" } });
+    const manager = new DbSecretsManager();
+    const realFindById = SecretModel.findById.bind(SecretModel);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // The read queries first and returns only after the gate opens, with the
+    // write landing in between: the order a reconnect on this process takes
+    // while another request re-reads the same secret.
+    const reads = vi
+      .spyOn(SecretModel, "findById")
+      .mockImplementationOnce(async (id, tx) => {
+        const row = await realFindById(id, tx);
+        await gate;
+        return row;
+      });
+    try {
+      const inFlight = manager.getSecret(secret.id, { skipCache: true });
+      await manager.updateSecret(secret.id, { token: "after" });
+      release();
+      expect((await inFlight)?.secret).toEqual({ token: "before" });
+      expect((await manager.getSecret(secret.id))?.secret).toEqual({
+        token: "after",
+      });
+      expect(reads).toHaveBeenCalledTimes(1);
+    } finally {
+      reads.mockRestore();
+    }
+  });
+
+  test("connectivity check returns the stored secret count", async () => {
+    const manager = new DbSecretsManager();
+    expect(await manager.checkConnectivity()).toEqual({ secretCount: 0 });
+
+    await SecretModel.create({ name: "first", secret: { value: "one" } });
+    await SecretModel.create({ name: "second", secret: { value: "two" } });
+
+    expect(await manager.checkConnectivity()).toEqual({ secretCount: 2 });
+  });
+
   test("caches secret lookups and invalidates on update", async ({
     makeSecret,
   }) => {
@@ -29,6 +118,33 @@ describe("DbSecretsManager", () => {
     expect(findByIdSpy).toHaveBeenCalledTimes(1);
 
     findByIdSpy.mockRestore();
+  });
+
+  test("skipCache sees a rotation this process never handled", async ({
+    makeSecret,
+  }) => {
+    const createdSecret = await makeSecret({
+      secret: { access_token: "initial-token" },
+    });
+    const manager = new DbSecretsManager();
+    await manager.getSecret(createdSecret.id);
+
+    // The write another replica made: this process's cache knows nothing of
+    // it, and would keep serving the retired value for the rest of the TTL.
+    await SecretModel.update(createdSecret.id, {
+      secret: { access_token: "rotated-elsewhere" },
+    });
+
+    expect((await manager.getSecret(createdSecret.id))?.secret).toEqual({
+      access_token: "initial-token",
+    });
+    expect(
+      (await manager.getSecret(createdSecret.id, { skipCache: true }))?.secret,
+    ).toEqual({ access_token: "rotated-elsewhere" });
+    // The fresh row replaces the stale entry, so later cached readers benefit.
+    expect((await manager.getSecret(createdSecret.id))?.secret).toEqual({
+      access_token: "rotated-elsewhere",
+    });
   });
 
   test("invalidates cached secrets on delete", async ({ makeSecret }) => {

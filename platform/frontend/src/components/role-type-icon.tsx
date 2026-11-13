@@ -6,7 +6,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/utils/tailwind";
 
 type RoleTypeIconProps = {
   predefined: boolean;
@@ -44,7 +44,9 @@ export function RoleTypeIcon({
   return (
     <Tooltip>
       <TooltipTrigger asChild>{icon}</TooltipTrigger>
-      <TooltipContent>{predefined ? "Predefined" : "Custom"}</TooltipContent>
+      <TooltipContent>
+        {predefined ? "Built-in role" : "Custom role"}
+      </TooltipContent>
     </Tooltip>
   );
 }

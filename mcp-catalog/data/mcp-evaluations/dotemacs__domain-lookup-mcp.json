@@ -1,0 +1,48 @@
+{
+  "name": "dotemacs__domain-lookup-mcp",
+  "display_name": "domain-lookup-mcp",
+  "description": "Domain Lookup MCP",
+  "author": {
+    "name": "dotemacs"
+  },
+  "server": {
+    "command": "${__dirname}/domain-lookup-mcp",
+    "args": [],
+    "env": {},
+    "type": "local"
+  },
+  "tools": [],
+  "prompts": [],
+  "keywords": [],
+  "user_config": {},
+  "readme": "# `domain-lookup-mcp`\n\nMCP server to look up domain names via rdap(1) and then whois(1).\n\n## How to use it?\n\n- Checkout the repo\n- build it: `go build ./...`\n- Point your MCP client at the binary:\n\n```javascript\n{\n  \"mcpServers\": {\n    \"domain-lookup-mcp\": {\n      \"command\": \"/path/to/domain-lookup-mcp/domain-lookup-mcp\",\n      \"args\": [],\n      \"env\": {}\n    }\n  }\n}\n```\n",
+  "category": "CLI Tools",
+  "archestra_config": {
+    "client_config_permutations": {
+      "domain-lookup-mcp": {
+        "command": "/path/to/domain-lookup-mcp/domain-lookup-mcp",
+        "args": [],
+        "env": {}
+      }
+    },
+    "oauth": {
+      "provider": null,
+      "required": false
+    },
+    "works_in_archestra": false
+  },
+  "github_info": {
+    "owner": "dotemacs",
+    "repo": "domain-lookup-mcp",
+    "url": "https://github.com/dotemacs/domain-lookup-mcp",
+    "name": "domain-lookup-mcp",
+    "path": null,
+    "stars": 3,
+    "contributors": 1,
+    "issues": 0,
+    "releases": false,
+    "ci_cd": false,
+    "latest_commit_hash": "d4ad6e77e5ab7858b96720025496582cb6f50536"
+  },
+  "programming_language": "Go"
+}

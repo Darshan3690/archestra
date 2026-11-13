@@ -5,11 +5,12 @@ import type { ReactNode } from "react";
 import { useState } from "react";
 import { toast } from "sonner";
 import { FormDialog } from "@/components/form-dialog";
-import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { DialogBody, DialogStickyFooter } from "@/components/ui/dialog";
+import { InlineNotice, InlineNoticeText } from "@/components/ui/inline-notice";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { copyToClipboard } from "@/lib/clipboard";
 import { formatRelativeTimeFromNow } from "@/lib/utils/date-time";
 
 export interface ManagedPlatformToken {
@@ -62,7 +63,7 @@ export function PlatformTokenManagerDialog({
   const handleCopy = async () => {
     if (!displayedValue) return;
 
-    await navigator.clipboard.writeText(displayedValue);
+    await copyToClipboard(displayedValue);
     setCopied(true);
     toast.success("Token copied to clipboard");
     setTimeout(() => setCopied(false), 2000);
@@ -77,7 +78,7 @@ export function PlatformTokenManagerDialog({
     const value = await rotateToken();
     if (!value) return;
 
-    await navigator.clipboard.writeText(value);
+    await copyToClipboard(value);
     toast.success("Token rotated and copied to clipboard");
     setDisplayedValue(value);
     setShowValue(true);
@@ -107,6 +108,7 @@ export function PlatformTokenManagerDialog({
           <Label>Token</Label>
           <div className="flex gap-2">
             <Input
+              aria-label="Token"
               readOnly
               value={
                 showValue && displayedValue
@@ -119,6 +121,8 @@ export function PlatformTokenManagerDialog({
               variant="outline"
               size="icon"
               onClick={handleShowToken}
+              aria-label={showValue ? "Hide token" : "Show token"}
+              aria-pressed={showValue}
               title={showValue ? "Hide token" : "Show token"}
             >
               <Key className="h-4 w-4" />
@@ -128,6 +132,7 @@ export function PlatformTokenManagerDialog({
                 variant="outline"
                 size="icon"
                 onClick={handleCopy}
+                aria-label="Copy token"
                 title="Copy token"
               >
                 {copied ? (
@@ -152,13 +157,13 @@ export function PlatformTokenManagerDialog({
         </div>
 
         {confirmRotate && (
-          <Alert variant="destructive">
-            <AlertDescription>
+          <InlineNotice variant="error">
+            <InlineNoticeText>
               Rotating this token will invalidate the current value. Any
               applications using this token will need to be updated. Click
               Rotate again to confirm.
-            </AlertDescription>
-          </Alert>
+            </InlineNoticeText>
+          </InlineNotice>
         )}
       </DialogBody>
 

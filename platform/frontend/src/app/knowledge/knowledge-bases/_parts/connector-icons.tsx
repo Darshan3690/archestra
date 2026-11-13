@@ -1,6 +1,7 @@
-import type { archestraApiTypes } from "@shared";
-import { Github, Upload } from "lucide-react";
+import type { archestraApiTypes } from "@archestra/shared";
+import { FolderGit2, Github, Globe } from "lucide-react";
 import type { ReactNode } from "react";
+import { cn } from "@/lib/utils/tailwind";
 
 type ConnectorType =
   archestraApiTypes.CreateConnectorData["body"]["connectorType"];
@@ -20,16 +21,24 @@ const CONNECTOR_ICON_MAP: Partial<Record<ConnectorType, ConnectorIcon>> = {
   notion: { kind: "img", src: "/icons/notion.png" },
   sharepoint: { kind: "img", src: "/icons/sharepoint.png" },
   gdrive: { kind: "img", src: "/icons/gdrive.png" },
-  file_upload: {
-    kind: "element",
-    render: (className) => <Upload className={className} />,
-  },
   linear: { kind: "img", src: "/icons/linear.png" },
   dropbox: { kind: "img", src: "/icons/dropbox.png" },
   onedrive: { kind: "img", src: "/icons/onedrive.png" },
   asana: { kind: "img", src: "/icons/asana.png" },
   salesforce: { kind: "img", src: "/icons/salesforce.png" },
   outline: { kind: "img", src: "/icons/getoutline.png" },
+  web_crawler: {
+    kind: "element",
+    render: (className) => <Globe className={className} />,
+  },
+  perforce: {
+    kind: "element",
+    render: (className) => <FolderGit2 className={className} />,
+  },
+  mfiles: {
+    kind: "img",
+    src: "/icons/mfiles.webp",
+  },
 };
 
 export function hasConnectorIcon(type: string): boolean {
@@ -50,5 +59,11 @@ export function ConnectorTypeIcon({
     return <>{icon.render(className)}</>;
   }
 
-  return <img src={icon.src} alt={type} className={className} />;
+  return (
+    <img
+      src={icon.src}
+      alt={type}
+      className={cn("shrink-0 object-contain", className)}
+    />
+  );
 }

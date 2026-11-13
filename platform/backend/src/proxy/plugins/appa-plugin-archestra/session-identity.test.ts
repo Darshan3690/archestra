@@ -1,0 +1,1224 @@
+import { describe, expect, test } from "vitest";
+import {
+  APPA_CLIENT_ADAPTERS,
+  extractAppaSessionIdentity,
+  nativeSpawnParentId,
+} from "./session-identity";
+
+const CLAUDE_SESSION = "74582997-cc91-4cd5-baee-676e581ca028";
+const CLAUDE_FORK_SESSION = "8f3c1e2a-9b4d-4c7e-a1f2-3d4e5f6a7b8c";
+
+const CODEX_SESSION = "d12f967d-6fe1-4f92-a62f-0f6a2092fd2f";
+const CODEX_RESUMED_SESSION = "f5be22fa-3d3a-44ce-8d37-d0073acd5174";
+const CODEX_THREAD = "01a0859b-3029-78f3-a730-0edef60872cb";
+const CODEX_FORK_THREAD = "01a085a0-ca43-7671-9450-8508eddef38d";
+
+const OPENCODE_SESSION = "ses_01J8ZQ3V0R1Y8M0P4K0W3M7P9A";
+const OPENCODE_FORK_SESSION = "ses_01J8ZQ7K2M4N6P8R0T2W4Y6A8C";
+
+const codexHeaders = {
+  "user-agent": "codex_cli_rs/0.153.0 (Linux 6.6; x86_64)",
+  originator: "codex_cli_rs",
+};
+const openCodeHeaders = { "user-agent": "opencode/1.18.29" };
+
+const COPILOT_SESSION = "efeab99e17779df23bb5d2437f3c8f8f";
+const copilotHeaders = {
+  "user-agent": "OpenAI/JS 5.20.1",
+  "x-archestra-agent-id": "github_copilot_cli",
+  "x-initiator": "user",
+  "x-interaction-type": "conversation-user",
+};
+
+const codexTurnMetadata = (
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> => ({
+  session_id: CODEX_SESSION,
+  thread_id: CODEX_THREAD,
+  turn_id: "turn-1",
+  window_id: "win-1",
+  ...overrides,
+});
+
+describe("client trajectory identity", () => {
+  describe("explicit header", () => {
+    test("an explicit X-Appa-Session-ID outranks every client-native signal", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:responses",
+          body: { client_metadata: codexTurnMetadata() },
+          headers: {
+            ...codexHeaders,
+            "x-appa-session-id": "operator-root",
+            "x-appa-parent-id": "parent-root",
+          },
+        }),
+      ).toMatchObject({
+        sessionId: "operator-root",
+        parentId: "parent-root",
+        provenance: "appa-header",
+      });
+    });
+  });
+
+  describe("Claude Code", () => {
+    test("a session resumes and compacts on one root; a fork opens a fresh one", () => {
+      const resume = extractAppaSessionIdentity({
+        family: "anthropic:messages",
+        body: {},
+        headers: { "x-claude-code-session-id": CLAUDE_SESSION },
+      });
+      // A fork mints a new session id client-side; nothing else changes.
+      const fork = extractAppaSessionIdentity({
+        family: "anthropic:messages",
+        body: {},
+        headers: { "x-claude-code-session-id": CLAUDE_FORK_SESSION },
+      });
+
+      expect(resume).toMatchObject({
+        sessionId: CLAUDE_SESSION,
+        provenance: "claude-code-header",
+      });
+      expect(fork.sessionId).toBe(CLAUDE_FORK_SESSION);
+      expect(fork.sessionId).not.toBe(resume.sessionId);
+    });
+
+    test("uses the session header even when metadata.user_id names a different id", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "anthropic:messages",
+          body: {
+            metadata: {
+              user_id: JSON.stringify({
+                device_id: "3d8b2867632db5c0",
+                account_uuid: "",
+                session_id: CLAUDE_SESSION,
+              }),
+            },
+          },
+          headers: {
+            "user-agent": "claude-code/2.1.258",
+            "x-claude-code-session-id": CLAUDE_FORK_SESSION,
+          },
+        }),
+      ).toMatchObject({
+        sessionId: CLAUDE_FORK_SESSION,
+        provenance: "claude-code-header",
+      });
+      expect(
+        extractAppaSessionIdentity({
+          family: "anthropic:messages",
+          body: {
+            metadata: {
+              user_id: JSON.stringify({
+                device_id: "3d8b2867632db5c0",
+                account_uuid: "",
+                session_id: CLAUDE_SESSION,
+              }),
+            },
+          },
+          headers: { "x-claude-code-session-id": CLAUDE_FORK_SESSION },
+        }).parentId,
+      ).toBeUndefined();
+    });
+
+    test("falls back to the metadata.user_id session when the header is absent", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "anthropic:messages",
+          body: {
+            metadata: {
+              user_id: JSON.stringify({
+                device_id: "3d8b2867632db5c0",
+                account_uuid: "",
+                session_id: CLAUDE_SESSION,
+              }),
+            },
+          },
+          headers: { "user-agent": "claude-code/2.1.258" },
+        }),
+      ).toMatchObject({
+        sessionId: CLAUDE_SESSION,
+        provenance: "claude-code-metadata",
+      });
+    });
+
+    test("does not treat non-Claude metadata as a native Claude session", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "anthropic:messages",
+          body: {
+            metadata: {
+              user_id: JSON.stringify({ session_id: CLAUDE_SESSION }),
+            },
+          },
+          headers: { "user-agent": "anthropic-sdk/0.1" },
+        }),
+      ).toMatchObject({
+        sessionId: CLAUDE_SESSION,
+        provenance: "claude-metadata",
+      });
+    });
+
+    test("keeps an X-Appa-Parent-ID alongside the native session", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "anthropic:messages",
+          body: {},
+          headers: {
+            "x-claude-code-session-id": CLAUDE_SESSION,
+            "x-appa-parent-id": "parent-root",
+          },
+        }),
+      ).toMatchObject({
+        sessionId: CLAUDE_SESSION,
+        parentId: "parent-root",
+      });
+    });
+
+    test.each([
+      {
+        carrier: "agent header",
+        headers: {
+          "user-agent": "claude-code/2.1.258",
+          "x-claude-code-session-id": CLAUDE_SESSION,
+          "x-claude-code-agent-id": "child-agent",
+        },
+        body: {},
+      },
+      {
+        carrier: "metadata agent id",
+        headers: { "user-agent": "claude-code/2.1.258" },
+        body: {
+          metadata: {
+            agent_id: "child-agent",
+            user_id: JSON.stringify({ session_id: CLAUDE_SESSION }),
+          },
+        },
+      },
+    ])("recognizes a delegated child from its $carrier", ({
+      headers,
+      body,
+    }) => {
+      expect(
+        nativeSpawnParentId({
+          headers,
+          body,
+          sessionId: CLAUDE_SESSION,
+        }),
+      ).toBe(CLAUDE_SESSION);
+    });
+
+    test("does not classify a root Claude request as a delegated child", () => {
+      expect(
+        nativeSpawnParentId({
+          headers: {
+            "user-agent": "claude-code/2.1.258",
+            "x-claude-code-session-id": CLAUDE_SESSION,
+          },
+          body: {},
+          sessionId: CLAUDE_SESSION,
+        }),
+      ).toBeUndefined();
+    });
+  });
+
+  describe("Claude Desktop", () => {
+    const desktopHeaders = {
+      "user-agent": "claude-cli/2.1.258 (external, cli)",
+      "x-archestra-agent-id": "anthropic_claude_desktop",
+      "x-claude-code-session-id": CLAUDE_SESSION,
+    };
+
+    test("roots on Claude Desktop's session id as its own native client", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "anthropic:messages",
+          body: {},
+          headers: desktopHeaders,
+        }),
+      ).toMatchObject({
+        sessionId: CLAUDE_SESSION,
+        provenance: "claude-desktop-header",
+      });
+    });
+
+    test.each([
+      {
+        label: "cowork billing entrypoint",
+        system: [
+          {
+            type: "text",
+            text: "x-anthropic-billing-header: cc_version=2.1.195; cc_entrypoint=cowork;",
+          },
+        ],
+      },
+      {
+        label: "claude-desktop billing entrypoint",
+        system:
+          "x-anthropic-billing-header: cc_version=2.1.195; cc_entrypoint=claude-desktop;",
+      },
+      {
+        label: "local-agent billing entrypoint",
+        system: [
+          {
+            type: "text",
+            text: "x-anthropic-billing-header: cc_version=2.1.195.887; cc_entrypoint=local-agent; cch=00000;",
+          },
+        ],
+      },
+      {
+        label: "claude-desktop-3p billing entrypoint",
+        system:
+          "x-anthropic-billing-header: cc_version=2.1.195; cc_entrypoint=claude-desktop-3p;",
+      },
+    ])("recognizes Claude Desktop from its $label and metadata.user_id", ({
+      system,
+    }) => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "anthropic:messages",
+          body: {
+            system,
+            metadata: {
+              user_id: JSON.stringify({ session_id: CLAUDE_SESSION }),
+            },
+          },
+          headers: { "user-agent": "claude-cli/2.1.258 (external, cli)" },
+        }),
+      ).toMatchObject({
+        sessionId: CLAUDE_SESSION,
+        provenance: "claude-desktop-metadata",
+      });
+    });
+
+    test("names a delegated child's parent like Claude Code does", () => {
+      expect(
+        nativeSpawnParentId({
+          headers: {
+            ...desktopHeaders,
+            "x-claude-code-agent-id": "child-agent",
+          },
+          body: {},
+          sessionId: CLAUDE_SESSION,
+        }),
+      ).toBe(CLAUDE_SESSION);
+    });
+
+    test("recognizes the advertised ClaudeDesktop/ User-Agent without installer headers", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "anthropic:messages",
+          body: {
+            metadata: {
+              user_id: JSON.stringify({ session_id: CLAUDE_SESSION }),
+            },
+          },
+          headers: { "user-agent": "ClaudeDesktop/1.0.0" },
+        }),
+      ).toMatchObject({
+        sessionId: CLAUDE_SESSION,
+        provenance: "claude-desktop-metadata",
+      });
+    });
+
+    test("requires a client-supplied conversation identifier for headerless Desktop Chat, isolates same-opener conversations, and leaves headerless Chat without an identifier unmatched", () => {
+      const chatOneTurnOne = extractAppaSessionIdentity({
+        family: "anthropic:messages",
+        body: {
+          system: "You are Claude.",
+          metadata: { conversation_id: "desktop-chat-1" },
+          messages: [{ role: "user", content: "Hello" }],
+        },
+        headers: { "user-agent": "ClaudeDesktop/1.0.0" },
+      });
+      const chatOneTurnTwo = extractAppaSessionIdentity({
+        family: "anthropic:messages",
+        body: {
+          system: [
+            {
+              type: "text",
+              text: "You are Claude. Today is Wednesday.",
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+          metadata: { conversation_id: "desktop-chat-1" },
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: "Hello",
+                  cache_control: { type: "ephemeral" },
+                },
+              ],
+            },
+            { role: "assistant", content: "Hi! How can I help?" },
+            { role: "user", content: "Summarize Q1 report" },
+          ],
+        },
+        headers: { "user-agent": "ClaudeDesktop/1.0.0" },
+      });
+      const chatTwoSameOpener = extractAppaSessionIdentity({
+        family: "anthropic:messages",
+        body: {
+          system: "You are Claude.",
+          metadata: { conversation_id: "desktop-chat-2" },
+          messages: [{ role: "user", content: "Hello" }],
+        },
+        headers: { "user-agent": "ClaudeDesktop/1.0.0" },
+      });
+
+      expect(chatOneTurnOne).toMatchObject({
+        sessionId: "desktop-chat-1",
+        provenance: "claude-desktop-metadata",
+      });
+      expect(chatOneTurnTwo).toMatchObject({
+        sessionId: "desktop-chat-1",
+        provenance: "claude-desktop-metadata",
+      });
+      expect(chatTwoSameOpener).toMatchObject({
+        sessionId: "desktop-chat-2",
+        provenance: "claude-desktop-metadata",
+      });
+      expect(chatTwoSameOpener.sessionId).not.toBe(chatOneTurnOne.sessionId);
+
+      // Headerless Desktop Chat without a conversation identifier is not matched
+      // and never derives conversation identity from prompt content.
+      expect(
+        extractAppaSessionIdentity({
+          family: "anthropic:messages",
+          body: {
+            system: "You are Claude.",
+            messages: [{ role: "user", content: "Hello" }],
+          },
+          headers: { "user-agent": "ClaudeDesktop/1.0.0" },
+        }),
+      ).toMatchObject({
+        provenance: "none",
+      });
+      expect(
+        extractAppaSessionIdentity({
+          family: "anthropic:messages",
+          body: {
+            system: "You are Claude.",
+            messages: [{ role: "user", content: "Hello" }],
+          },
+          headers: {
+            "x-archestra-agent-id": "anthropic_claude_desktop",
+          },
+        }),
+      ).toMatchObject({
+        provenance: "none",
+      });
+
+      expect(() =>
+        extractAppaSessionIdentity({
+          family: "anthropic:messages",
+          body: {
+            metadata: {
+              session_id: "desktop-chat-1",
+              conversation_id: "desktop-chat-2",
+            },
+            messages: [{ role: "user", content: "Hello" }],
+          },
+          headers: { "user-agent": "ClaudeDesktop/1.0.0" },
+        }),
+      ).toThrow(
+        "OpenAPPA cannot bind contradictory Claude Desktop conversation metadata",
+      );
+
+      // Tool-free one-shot Desktop requests (connection probe, "." startup check,
+      // session title generation) match the Desktop adapter so block mode does not
+      // reject them, while tool-bearing headerless requests without a conversation
+      // identifier remain unmatched.
+      const desktopAdapter = APPA_CLIENT_ADAPTERS.find(
+        (adapter) => adapter.id === "claude-desktop",
+      );
+      expect(
+        desktopAdapter?.matches({
+          headers: { "x-archestra-agent-id": "anthropic_claude_desktop" },
+          requestBody: {
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 8,
+            messages: [{ role: "user", content: "Reply with exactly OK." }],
+          },
+        }),
+      ).toBe(true);
+      expect(
+        desktopAdapter?.matches({
+          headers: { "x-archestra-agent-id": "anthropic_claude_desktop" },
+          requestBody: {
+            model: "claude-haiku-5-5",
+            max_tokens: 200,
+            system: "You write short session titles.",
+            messages: [{ role: "user", content: "Summarize this session." }],
+          },
+        }),
+      ).toBe(true);
+      expect(
+        desktopAdapter?.matches({
+          headers: { "x-archestra-agent-id": "anthropic_claude_desktop" },
+          requestBody: {
+            model: "claude-sonnet-4-6",
+            messages: [{ role: "user", content: "Hello" }],
+            tools: [{ name: "get_weather", input_schema: { type: "object" } }],
+          },
+        }),
+      ).toBe(false);
+    });
+  });
+
+  describe("Codex", () => {
+    test("roots on the durable thread id, not the per-run session id", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:responses",
+          body: { client_metadata: codexTurnMetadata() },
+          headers: codexHeaders,
+        }),
+      ).toMatchObject({
+        sessionId: CODEX_THREAD,
+        provenance: "codex-turn-metadata",
+      });
+    });
+
+    test("a resume under a fresh session id reopens the thread's root", () => {
+      const firstRun = extractAppaSessionIdentity({
+        family: "openai:responses",
+        body: { client_metadata: codexTurnMetadata() },
+        headers: codexHeaders,
+      });
+      const resumed = extractAppaSessionIdentity({
+        family: "openai:responses",
+        body: {
+          client_metadata: codexTurnMetadata({
+            session_id: CODEX_RESUMED_SESSION,
+          }),
+        },
+        headers: codexHeaders,
+      });
+
+      expect(resumed.sessionId).toBe(firstRun.sessionId);
+    });
+
+    test("a fork opens a fresh root under its new thread id", () => {
+      const parent = extractAppaSessionIdentity({
+        family: "openai:responses",
+        body: { client_metadata: codexTurnMetadata() },
+        headers: codexHeaders,
+      });
+      const fork = extractAppaSessionIdentity({
+        family: "openai:responses",
+        body: {
+          client_metadata: codexTurnMetadata({
+            thread_id: CODEX_FORK_THREAD,
+            forked_from_thread_id: CODEX_THREAD,
+            forked_from_ordinal_exclusive: 12,
+          }),
+        },
+        headers: codexHeaders,
+      });
+
+      expect(fork.sessionId).toBe(CODEX_FORK_THREAD);
+      expect(fork.sessionId).not.toBe(parent.sessionId);
+      // A client fork is not a spawn-prepared child: no parent id is stamped,
+      // or the runtime would refuse the forked session outright.
+      expect(fork.parentId).toBeUndefined();
+      expect(
+        nativeSpawnParentId({
+          headers: codexHeaders,
+          body: {
+            client_metadata: codexTurnMetadata({
+              thread_id: CODEX_FORK_THREAD,
+              forked_from_thread_id: CODEX_THREAD,
+            }),
+          },
+          sessionId: fork.sessionId,
+        }),
+      ).toBeUndefined();
+    });
+
+    test("a spawn child names its parent thread without stamping X-Appa-Parent-ID", () => {
+      const body = {
+        client_metadata: codexTurnMetadata({
+          thread_id: CODEX_FORK_THREAD,
+          parent_thread_id: CODEX_THREAD,
+        }),
+      };
+      const identity = extractAppaSessionIdentity({
+        family: "openai:responses",
+        body,
+        headers: codexHeaders,
+      });
+      expect(identity).toMatchObject({
+        sessionId: CODEX_FORK_THREAD,
+        parentId: undefined,
+      });
+      expect(
+        nativeSpawnParentId({
+          headers: codexHeaders,
+          body,
+          sessionId: identity.sessionId,
+        }),
+      ).toBe(CODEX_THREAD);
+    });
+
+    test("spawn parent detection uses every Codex parent metadata form", () => {
+      const cases = [
+        {
+          headers: {
+            ...codexHeaders,
+            "x-codex-turn-metadata": JSON.stringify({
+              parent_thread_id: CODEX_THREAD,
+            }),
+          },
+          body: {},
+        },
+        {
+          headers: codexHeaders,
+          body: { client_metadata: { parent_thread_id: CODEX_THREAD } },
+        },
+        {
+          headers: codexHeaders,
+          body: {
+            metadata: { "x-codex-parent-thread-id": CODEX_THREAD },
+          },
+        },
+        {
+          headers: codexHeaders,
+          body: {
+            client_metadata: {
+              "x-codex-turn-metadata": {
+                parent_thread_id: CODEX_THREAD,
+              },
+            },
+          },
+        },
+        {
+          headers: codexHeaders,
+          body: {
+            client_metadata: {
+              "x-codex-turn-metadata": JSON.stringify({
+                parent_thread_id: CODEX_THREAD,
+              }),
+            },
+          },
+        },
+      ];
+      for (const { headers, body } of cases) {
+        expect(
+          nativeSpawnParentId({
+            headers,
+            body,
+            sessionId: CODEX_FORK_THREAD,
+          }),
+        ).toBe(CODEX_THREAD);
+      }
+    });
+
+    test("a compaction turn stays on the thread's root", () => {
+      const before = extractAppaSessionIdentity({
+        family: "openai:responses",
+        body: { client_metadata: codexTurnMetadata() },
+        headers: codexHeaders,
+      });
+      const compactionTurn = extractAppaSessionIdentity({
+        family: "openai:responses",
+        body: {
+          client_metadata: codexTurnMetadata({
+            request_kind: "compaction",
+          }),
+        },
+        headers: { ...codexHeaders, "x-openai-subagent": "compact" },
+      });
+
+      expect(compactionTurn.sessionId).toBe(before.sessionId);
+    });
+
+    test("an out-of-band compaction under a new thread id is a fresh root, not a reopen", () => {
+      // A summarizer request that compresses another thread's context must
+      // not reopen that thread's root: mixing the two trajectories would
+      // let a compaction escape the labels the original root accumulated.
+      // Restoration of the carried notices is independent of which root the
+      // request binds (pinned at the wire and route layers).
+      const original = extractAppaSessionIdentity({
+        family: "openai:responses",
+        body: { client_metadata: codexTurnMetadata() },
+        headers: codexHeaders,
+      });
+      const outOfBand = extractAppaSessionIdentity({
+        family: "openai:responses",
+        body: {
+          client_metadata: codexTurnMetadata({
+            thread_id: CODEX_FORK_THREAD,
+            request_kind: "compaction",
+          }),
+        },
+        headers: { ...codexHeaders, "x-openai-subagent": "compact" },
+      });
+
+      expect(outOfBand.sessionId).toBe(CODEX_FORK_THREAD);
+      expect(outOfBand.sessionId).not.toBe(original.sessionId);
+    });
+
+    test("reads the canonical turn-metadata blob under client_metadata", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:responses",
+          body: {
+            client_metadata: {
+              "x-codex-turn-metadata": codexTurnMetadata(),
+            },
+          },
+          headers: codexHeaders,
+        }),
+      ).toMatchObject({
+        sessionId: CODEX_THREAD,
+        provenance: "codex-turn-metadata",
+      });
+    });
+
+    test("accepts matching flat and nested turn metadata", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:responses",
+          body: {
+            client_metadata: {
+              ...codexTurnMetadata(),
+              "x-codex-turn-metadata": codexTurnMetadata(),
+            },
+          },
+          headers: codexHeaders,
+        }),
+      ).toMatchObject({
+        sessionId: CODEX_THREAD,
+        provenance: "codex-turn-metadata",
+      });
+    });
+
+    test("reads the JSON turn-metadata blob from the compat header", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:responses",
+          body: {},
+          headers: {
+            ...codexHeaders,
+            "x-codex-turn-metadata": JSON.stringify(codexTurnMetadata()),
+          },
+        }),
+      ).toMatchObject({
+        sessionId: CODEX_THREAD,
+        provenance: "codex-turn-metadata",
+      });
+    });
+
+    test("detects a Codex request from client_metadata alone", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:responses",
+          body: { client_metadata: codexTurnMetadata() },
+          headers: {},
+        }),
+      ).toMatchObject({
+        sessionId: CODEX_THREAD,
+        provenance: "codex-turn-metadata",
+      });
+    });
+
+    test("falls back to the flat session-id header of an older Codex", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:responses",
+          body: {},
+          headers: { ...codexHeaders, "session-id": CODEX_SESSION },
+        }),
+      ).toMatchObject({
+        sessionId: CODEX_SESSION,
+        provenance: "codex-turn-metadata",
+      });
+    });
+
+    test("refuses contradictory turn metadata across the body and the header", () => {
+      expect(() =>
+        extractAppaSessionIdentity({
+          family: "openai:responses",
+          body: { client_metadata: codexTurnMetadata() },
+          headers: {
+            ...codexHeaders,
+            "x-codex-turn-metadata": JSON.stringify(
+              codexTurnMetadata({ thread_id: CODEX_FORK_THREAD }),
+            ),
+          },
+        }),
+      ).toThrow(/contradictory Codex trajectory metadata/);
+    });
+
+    test("refuses malformed turn metadata on the header", () => {
+      expect(() =>
+        extractAppaSessionIdentity({
+          family: "openai:responses",
+          body: {},
+          headers: { ...codexHeaders, "x-codex-turn-metadata": "{not json" },
+        }),
+      ).toThrow(/malformed Codex trajectory metadata/);
+    });
+
+    test("a Codex request without turn metadata keeps the generic fallbacks", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:responses",
+          body: { prompt_cache_key: "cache-partition-1" },
+          headers: codexHeaders,
+        }),
+      ).toMatchObject({
+        sessionId: "cache-partition-1",
+        provenance: "prompt-cache-key",
+      });
+    });
+  });
+
+  describe("Kilo Code", () => {
+    // The headers Kilo 7.8.8 sends on every provider request.
+    const kiloHeaders = {
+      "user-agent":
+        "kilo/latest/7.8.8/cli ai-sdk/provider-utils/4.0.46 runtime/bun/1.4.2",
+      "x-session-affinity": OPENCODE_SESSION,
+      "x-session-id": OPENCODE_SESSION,
+    };
+
+    test("roots on Kilo's session id as its own native client", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "anthropic:messages",
+          body: {},
+          headers: kiloHeaders,
+        }),
+      ).toMatchObject({
+        sessionId: OPENCODE_SESSION,
+        provenance: "kilo-session-header",
+      });
+    });
+
+    test("recognizes Kilo by the agent id its setup sends", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:chatCompletions",
+          body: {},
+          headers: {
+            "user-agent": "ai-sdk/openai-compatible/1.0.0",
+            "x-archestra-agent-id": "kilo",
+            "x-session-id": OPENCODE_SESSION,
+          },
+        }),
+      ).toMatchObject({ provenance: "kilo-session-header" });
+    });
+
+    test("names a subagent's parent like OpenCode does", () => {
+      expect(
+        nativeSpawnParentId({
+          headers: {
+            ...kiloHeaders,
+            "x-session-id": OPENCODE_FORK_SESSION,
+            "x-session-affinity": OPENCODE_FORK_SESSION,
+            "x-parent-session-id": OPENCODE_SESSION,
+          },
+          body: {},
+          sessionId: OPENCODE_FORK_SESSION,
+        }),
+      ).toBe(OPENCODE_SESSION);
+    });
+
+    test("refuses contradictory session headers under Kilo's name", () => {
+      expect(() =>
+        extractAppaSessionIdentity({
+          family: "anthropic:messages",
+          body: {},
+          headers: { ...kiloHeaders, "x-session-affinity": "ses_other" },
+        }),
+      ).toThrow("OpenAPPA cannot bind contradictory Kilo Code session headers");
+    });
+  });
+
+  describe("OpenCode", () => {
+    test("roots on the session id from X-Session-Id", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:chatCompletions",
+          body: {},
+          headers: { ...openCodeHeaders, "x-session-id": OPENCODE_SESSION },
+        }),
+      ).toMatchObject({
+        sessionId: OPENCODE_SESSION,
+        provenance: "opencode-session-header",
+      });
+    });
+
+    test("x-parent-session-id is not stamped: the runtime refuses unprepared children", () => {
+      const headers = {
+        ...openCodeHeaders,
+        "x-session-id": OPENCODE_FORK_SESSION,
+        "x-parent-session-id": OPENCODE_SESSION,
+      };
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:chatCompletions",
+          body: {},
+          headers,
+        }),
+      ).toMatchObject({
+        sessionId: OPENCODE_FORK_SESSION,
+        parentId: undefined,
+        provenance: "opencode-session-header",
+      });
+      expect(
+        nativeSpawnParentId({
+          headers,
+          body: {},
+          sessionId: OPENCODE_FORK_SESSION,
+        }),
+      ).toBe(OPENCODE_SESSION);
+    });
+
+    test("accepts x-session-affinity repeating the same session id", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:chatCompletions",
+          body: {},
+          headers: {
+            ...openCodeHeaders,
+            "x-session-id": OPENCODE_SESSION,
+            "x-session-affinity": OPENCODE_SESSION,
+          },
+        }),
+      ).toMatchObject({ sessionId: OPENCODE_SESSION });
+    });
+
+    test("uses x-session-affinity only after OpenCode is identified", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:chatCompletions",
+          body: {},
+          headers: {
+            ...openCodeHeaders,
+            "x-session-affinity": OPENCODE_SESSION,
+          },
+        }),
+      ).toMatchObject({
+        sessionId: OPENCODE_SESSION,
+        provenance: "opencode-session-header",
+      });
+    });
+
+    test("a fork opens a fresh root under its new session id", () => {
+      const parent = extractAppaSessionIdentity({
+        family: "openai:chatCompletions",
+        body: {},
+        headers: { ...openCodeHeaders, "x-session-id": OPENCODE_SESSION },
+      });
+      const fork = extractAppaSessionIdentity({
+        family: "openai:chatCompletions",
+        body: {},
+        headers: {
+          ...openCodeHeaders,
+          "x-session-id": OPENCODE_FORK_SESSION,
+        },
+      });
+
+      expect(fork.sessionId).toBe(OPENCODE_FORK_SESSION);
+      expect(fork.sessionId).not.toBe(parent.sessionId);
+    });
+
+    test("a compaction request stays on the session's root", () => {
+      const before = extractAppaSessionIdentity({
+        family: "openai:chatCompletions",
+        body: { messages: [{ role: "user", content: "hi" }] },
+        headers: { ...openCodeHeaders, "x-session-id": OPENCODE_SESSION },
+      });
+      // OpenCode compaction flattens history into a tool-less text request
+      // inside the same session.
+      const compaction = extractAppaSessionIdentity({
+        family: "openai:chatCompletions",
+        body: {
+          messages: [
+            {
+              role: "user",
+              content:
+                "Summarize: user asked about the weather; get_remedy_plans ruling …",
+            },
+          ],
+        },
+        headers: { ...openCodeHeaders, "x-session-id": OPENCODE_SESSION },
+      });
+
+      expect(compaction.sessionId).toBe(before.sessionId);
+    });
+
+    test("an out-of-band compaction under a new session id is a fresh root", () => {
+      const original = extractAppaSessionIdentity({
+        family: "openai:chatCompletions",
+        body: {},
+        headers: { ...openCodeHeaders, "x-session-id": OPENCODE_SESSION },
+      });
+      const outOfBand = extractAppaSessionIdentity({
+        family: "openai:chatCompletions",
+        body: {
+          messages: [
+            {
+              role: "user",
+              content:
+                "Summarize: user asked about the weather; get_remedy_plans ruling …",
+            },
+          ],
+        },
+        headers: {
+          ...openCodeHeaders,
+          "x-session-id": OPENCODE_FORK_SESSION,
+        },
+      });
+
+      expect(outOfBand.sessionId).toBe(OPENCODE_FORK_SESSION);
+      expect(outOfBand.sessionId).not.toBe(original.sessionId);
+    });
+
+    test("reads the hosted-provider session header", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:chatCompletions",
+          body: {},
+          headers: {
+            ...openCodeHeaders,
+            "x-opencode-session": OPENCODE_SESSION,
+          },
+        }),
+      ).toMatchObject({
+        sessionId: OPENCODE_SESSION,
+        provenance: "opencode-hosted-header",
+      });
+    });
+
+    test("refuses contradictory session headers", () => {
+      expect(() =>
+        extractAppaSessionIdentity({
+          family: "openai:chatCompletions",
+          body: {},
+          headers: {
+            ...openCodeHeaders,
+            "x-session-id": OPENCODE_SESSION,
+            "x-session-affinity": OPENCODE_FORK_SESSION,
+          },
+        }),
+      ).toThrow(/contradictory OpenCode session headers/);
+    });
+
+    test("accepts the explicit parent and hosted child header pair", () => {
+      const headers = {
+        ...openCodeHeaders,
+        "x-session-id": OPENCODE_SESSION,
+        "x-opencode-session": OPENCODE_FORK_SESSION,
+      };
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:chatCompletions",
+          body: {},
+          headers,
+        }),
+      ).toMatchObject({
+        sessionId: OPENCODE_FORK_SESSION,
+        provenance: "opencode-hosted-header",
+      });
+      expect(
+        nativeSpawnParentId({
+          headers,
+          body: {},
+          sessionId: OPENCODE_FORK_SESSION,
+        }),
+      ).toBe(OPENCODE_SESSION);
+    });
+
+    test("refuses a hosted child beside a non-parent affinity claim", () => {
+      expect(() =>
+        extractAppaSessionIdentity({
+          family: "openai:chatCompletions",
+          body: {},
+          headers: {
+            ...openCodeHeaders,
+            "x-session-affinity": OPENCODE_SESSION,
+            "x-opencode-session": OPENCODE_FORK_SESSION,
+          },
+        }),
+      ).toThrow(/contradictory OpenCode session headers/);
+    });
+
+    test("roots on the session-id header OpenCode sends on the Responses wire", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:responses",
+          body: { prompt_cache_key: OPENCODE_SESSION },
+          headers: {
+            ...openCodeHeaders,
+            originator: "opencode",
+            "session-id": OPENCODE_SESSION,
+          },
+        }),
+      ).toMatchObject({
+        sessionId: OPENCODE_SESSION,
+        provenance: "opencode-session-header",
+      });
+    });
+
+    test("refuses a session-id header contradicting X-Session-Id", () => {
+      expect(() =>
+        extractAppaSessionIdentity({
+          family: "openai:responses",
+          body: {},
+          headers: {
+            ...openCodeHeaders,
+            "x-session-id": OPENCODE_SESSION,
+            "session-id": OPENCODE_FORK_SESSION,
+          },
+        }),
+      ).toThrow(/contradictory OpenCode session headers/);
+    });
+
+    test.for([
+      "x-session-id",
+      "x-session-affinity",
+      "session-id",
+    ])("a bare %s is never attributed without OpenCode evidence", (header) => {
+      const identity = extractAppaSessionIdentity({
+        family: "openai:chatCompletions",
+        body: {},
+        headers: { [header]: OPENCODE_SESSION },
+      });
+
+      expect(identity.sessionId).toBeUndefined();
+      expect(identity.provenance).toBe("none");
+    });
+  });
+
+  describe("Copilot CLI", () => {
+    test("keeps a subagent's request on the shared key: the runtime binds the child", () => {
+      const headers = {
+        ...copilotHeaders,
+        "x-initiator": "agent",
+        "x-interaction-type": "conversation-subagent",
+      };
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:responses",
+          body: { prompt_cache_key: COPILOT_SESSION },
+          headers,
+        }),
+      ).toMatchObject({
+        sessionId: COPILOT_SESSION,
+        parentId: undefined,
+        provenance: "copilot-cli-prompt-cache-key",
+      });
+      expect(
+        nativeSpawnParentId({
+          headers,
+          body: { prompt_cache_key: COPILOT_SESSION },
+          sessionId: COPILOT_SESSION,
+        }),
+      ).toBeUndefined();
+    });
+
+    test("names no session on the Chat Completions wire", () => {
+      const identity = extractAppaSessionIdentity({
+        family: "openai:chatCompletions",
+        body: { messages: [{ role: "user", content: "hi" }] },
+        headers: copilotHeaders,
+      });
+      expect(identity.sessionId).toBeUndefined();
+      expect(identity.provenance).toBe("none");
+    });
+
+    test("does not read the key for a client that is not the Copilot CLI", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:responses",
+          body: { prompt_cache_key: COPILOT_SESSION },
+          headers: { "user-agent": "OpenAI/JS 5.20.1" },
+        }),
+      ).toMatchObject({
+        sessionId: COPILOT_SESSION,
+        provenance: "prompt-cache-key",
+      });
+    });
+  });
+
+  describe("a wire OpenAPPA does not read", () => {
+    test("reads a client's session from its headers", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: undefined,
+          body: { contents: [] },
+          headers: {
+            "user-agent": "kilo/7.8.12",
+            "x-archestra-agent-id": "kilo",
+            "x-opencode-session": OPENCODE_SESSION,
+          },
+        }),
+      ).toMatchObject({
+        sessionId: OPENCODE_SESSION,
+        provenance: "kilo-hosted-header",
+      });
+      expect(
+        extractAppaSessionIdentity({
+          family: undefined,
+          body: {},
+          headers: { "x-claude-code-session-id": CLAUDE_SESSION },
+        }),
+      ).toMatchObject({ sessionId: CLAUDE_SESSION });
+    });
+
+    test("reads no session from the body", () => {
+      for (const body of [
+        { prompt_cache_key: "cache-key" },
+        { metadata: { session_id: "s-2" } },
+        {
+          metadata: {
+            user_id: JSON.stringify({ session_id: CLAUDE_SESSION }),
+          },
+        },
+      ])
+        expect(
+          extractAppaSessionIdentity({
+            family: undefined,
+            body,
+            headers: { "user-agent": "claude-cli/2.1.0 (external, cli)" },
+          }).sessionId,
+        ).toBeUndefined();
+    });
+  });
+
+  describe("generic clients", () => {
+    test("keeps the wire-family fallbacks when no adapter matches", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "openai:responses",
+          body: { metadata: { session_id: "s-2" } },
+          headers: {},
+        }),
+      ).toMatchObject({
+        sessionId: "s-2",
+        provenance: "metadata-session-id",
+      });
+    });
+
+    test("keeps the Anthropic metadata fallback when Claude Code's header is absent", () => {
+      expect(
+        extractAppaSessionIdentity({
+          family: "anthropic:messages",
+          body: { metadata: { user_id: "tenant-42" } },
+          headers: {},
+        }),
+      ).toMatchObject({
+        sessionId: "tenant-42",
+        provenance: "claude-metadata",
+      });
+    });
+  });
+});

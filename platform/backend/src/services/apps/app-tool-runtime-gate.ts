@@ -1,0 +1,208 @@
+import {
+  APP_FILE_ARCHESTRA_TOOL_SHORT_NAMES,
+  isCodeRuntimeArchestraToolShortName,
+  MCP_SERVER_TOOL_NAME_SEPARATOR,
+  TOOL_APP_DATA_DELETE_SHORT_NAME,
+  TOOL_APP_DATA_GET_SHORT_NAME,
+  TOOL_APP_DATA_LIST_SHORT_NAME,
+  TOOL_APP_DATA_SET_SHORT_NAME,
+  TOOL_APP_LLM_COMPLETE_SHORT_NAME,
+  TOOL_LIST_AGENT_RUNS_SHORT_NAME,
+  TOOL_READ_FILE_RAW_SHORT_NAME,
+  TOOL_READ_FILE_SHORT_NAME,
+} from "@archestra/shared";
+import type { McpUiToolMeta } from "@modelcontextprotocol/ext-apps";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
+import config from "@/config";
+import { AppModel, ToolModel } from "@/models";
+
+/**
+ * The App Data Store tools run in-process keyed by the route-bound appId.
+ * Together with the LLM completion and the file tools they form the built-in
+ * surface an app runtime may dispatch; every other Archestra tool (the
+ * management/chat surface) is rejected by the gate.
+ */
+const APP_DATA_SHORT_NAMES = new Set<string>([
+  TOOL_APP_DATA_GET_SHORT_NAME,
+  TOOL_APP_DATA_SET_SHORT_NAME,
+  TOOL_APP_DATA_LIST_SHORT_NAME,
+  TOOL_APP_DATA_DELETE_SHORT_NAME,
+]);
+
+/** The app file tools, as a set for {@link isAppFileToolShortName}. */
+const APP_FILE_SHORT_NAMES = new Set<string>(
+  APP_FILE_ARCHESTRA_TOOL_SHORT_NAMES,
+);
+
+/** Audit-row stand-in for file bytes an app read. */
+const REDACTED_FILE_CONTENT_TEXT = "[file content not persisted in audit logs]";
+
+/**
+ * Reserved Archestra built-ins an app runtime may dispatch via the SDK. Ask
+ * {@link isAppRuntimeBuiltinAvailable} rather than this set directly — some are
+ * feature-flagged.
+ */
+const APP_RUNTIME_BUILTIN_SHORT_NAMES = new Set<string>([
+  ...APP_DATA_SHORT_NAMES,
+  TOOL_APP_LLM_COMPLETE_SHORT_NAME,
+  TOOL_LIST_AGENT_RUNS_SHORT_NAME,
+  ...APP_FILE_ARCHESTRA_TOOL_SHORT_NAMES,
+]);
+
+/**
+ * Whether an app-runtime built-in is actually dispatchable right now. Set
+ * membership alone is not enough for upload_file/download_file: they move bytes
+ * through the code runtime and are registered only while it is on (see
+ * `getArchestraMcpTools`), so with the flag dark the gate would admit a call
+ * that dispatch then fails to resolve. Every consumer — the gate, the
+ * in-process dispatch branch, `tools/list`, and the SDK bootstrap — asks this
+ * one predicate, so a dark flag removes them coherently while the store-only
+ * file tools stay available.
+ */
+export function isAppRuntimeBuiltinAvailable(shortName: string): boolean {
+  if (!APP_RUNTIME_BUILTIN_SHORT_NAMES.has(shortName)) return false;
+  if (isCodeRuntimeArchestraToolShortName(shortName)) {
+    return config.skillsSandbox.enabled;
+  }
+  return true;
+}
+
+/**
+ * Whether a built-in is one of the app file tools. They are marked app-only in
+ * `tools/list`: an embedding host's model must not roam the viewer's app files,
+ * while the app's own code still calls them.
+ */
+export function isAppFileToolShortName(shortName: string): boolean {
+  return APP_FILE_SHORT_NAMES.has(shortName);
+}
+
+/**
+ * Redact an app-dispatched built-in's result before it is persisted as an audit
+ * row. `read_file` returns the file's contents, and an app read must not create
+ * a second, long-lived database copy of them — the structured metadata
+ * (filename, size, line window) is kept, the content blocks are replaced. Every
+ * other built-in's result passes through unchanged. Audit persistence stays
+ * best-effort; this only shapes WHAT is stored, never whether the call
+ * proceeds.
+ */
+export function redactAppBuiltinAuditResult(
+  toolName: string,
+  response: CallToolResult,
+): CallToolResult {
+  const shortName = archestraMcpBranding.getToolShortName(toolName);
+  if (
+    shortName !== TOOL_READ_FILE_SHORT_NAME &&
+    shortName !== TOOL_READ_FILE_RAW_SHORT_NAME
+  ) {
+    return response;
+  }
+  // Error results carry diagnostics (not-found, size caps), never file bytes —
+  // keep them intact for the audit trail.
+  if (response.isError) return response;
+  // structuredContent mirrors the bytes in `content` (read_file's text window)
+  // or `contentBase64` (read_file_raw) — strip both the same way, keeping the
+  // metadata for the audit trail.
+  const structured =
+    response.structuredContent && typeof response.structuredContent === "object"
+      ? (() => {
+          const {
+            content: _content,
+            contentBase64: _contentBase64,
+            ...meta
+          } = response.structuredContent as Record<string, unknown>;
+          return meta;
+        })()
+      : response.structuredContent;
+  return {
+    ...response,
+    structuredContent: structured,
+    content: [{ type: "text", text: REDACTED_FILE_CONTENT_TEXT }],
+  };
+}
+
+type AppToolGateDecision =
+  | { allowed: true; kind: "app-builtin" }
+  | { allowed: true; kind: "upstream"; resolvedToolName: string }
+  | { allowed: false; code: number; reason: string };
+
+/**
+ * The single fail-closed gate for a tool call made *as an app* — shared by the
+ * app runtime proxy (every rendered-app tools/call) and `preview_app_tool` so
+ * neither can diverge from the other's allowlist.
+ *
+ * It resolves the tool the way dispatch does (App Data Store built-ins;
+ * otherwise the per-app assignment, exact name then the unprefixed-suffix
+ * fallback), the app's environment fence, and `_meta.ui.visibility`.
+ */
+export async function gateAppToolCall(params: {
+  appId: string;
+  toolName: string;
+}): Promise<AppToolGateDecision> {
+  const { appId, toolName } = params;
+
+  // Archestra built-ins: only the reserved app-runtime tools (App Data Store,
+  // the LLM completion, the file tools) are dispatchable from an app; they
+  // RBAC is enforced per call, against the viewer, inside executeArchestraTool.
+  if (archestraMcpBranding.isToolName(toolName)) {
+    const shortName = archestraMcpBranding.getToolShortName(toolName);
+    if (shortName && isAppRuntimeBuiltinAvailable(shortName)) {
+      return { allowed: true, kind: "app-builtin" };
+    }
+    return {
+      allowed: false,
+      code: -32601,
+      reason: `Tool "${toolName}" is not available to apps.`,
+    };
+  }
+
+  // Resolve exactly like dispatch (clients/mcp-client.ts validateAndGetTool):
+  // exact name first, then — for unprefixed names only — the suffix fallback.
+  let [tool] = await ToolModel.getMcpToolsAssignedToApp([toolName], appId);
+  if (!tool && !toolName.includes(MCP_SERVER_TOOL_NAME_SEPARATOR)) {
+    [tool] = await ToolModel.getMcpToolsAssignedToAppBySuffix(toolName, appId);
+  }
+  if (!tool) {
+    return {
+      allowed: false,
+      code: -32601,
+      reason: `Tool "${toolName}" is not assigned to this app.`,
+    };
+  }
+
+  // Environment fence: a tool whose catalog left the app's bound environment is
+  // refused at call time even though its assignment row remains
+  // (re-binding an app does not strip assignments). Reuses the same predicate as
+  // the assignment fence so the two never diverge; Default-environment tools
+  // are the org baseline and pass for any app environment. Only upstream tools
+  // reach here — app-runtime built-ins returned above are environment-less.
+  const app = await AppModel.findById(appId);
+  if (!app) {
+    return {
+      allowed: false,
+      code: -32601,
+      reason: `App "${appId}" not found.`,
+    };
+  }
+  if (
+    !(await ToolModel.isToolInEnvironmentOrDefault(tool.id, app.environmentId))
+  ) {
+    return {
+      allowed: false,
+      code: -32601,
+      reason: `Tool "${toolName}" is not available in the app's environment.`,
+    };
+  }
+
+  const visibility = (tool.meta as { _meta?: { ui?: McpUiToolMeta } } | null)
+    ?._meta?.ui?.visibility;
+  if (visibility && !visibility.includes("app")) {
+    return {
+      allowed: false,
+      code: -32601,
+      reason: `Tool "${toolName}" is not accessible from MCP Apps (visibility: [${visibility.join(", ")}])`,
+    };
+  }
+
+  return { allowed: true, kind: "upstream", resolvedToolName: tool.toolName };
+}

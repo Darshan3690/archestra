@@ -1,23 +1,44 @@
-import { isAgentTool } from "@shared";
-import { getArchestraMcpTools } from "@/archestra-mcp-server";
+import { isAgentTool } from "@archestra/shared";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
 import logger from "@/logging";
-import { ToolModel } from "@/models";
+import { ToolModel, ToolObservationModel } from "@/models";
+import { configCache } from "@/services/config-cache";
 
 /**
  * Persist tools if present in the request
- * Skips tools that are already connected to the agent via MCP servers
- * Also skips Archestra built-in tools and agent delegation tools
+ * Skips tools connected to the agent through MCP servers.
+ * Skips tools served by the platform gateway (including built-ins)
+ * and agent delegation tools.
  *
  * Uses bulk operations to avoid N+1 queries
  */
-export const persistTools = async (
+export const persistTools = async ({
+  tools,
+  agentId,
+  observer,
+}: {
   tools: Array<{
     toolName: string;
     toolParameters?: Record<string, unknown>;
     toolDescription?: string;
-  }>,
-  agentId: string,
-) => {
+    /**
+     * Set to true when verified by gateway attestation.
+     * Omitted when the request contains no attestations, in which case
+     * built-ins are identified by name.
+     */
+    servedByGateway?: boolean;
+  }>;
+  agentId: string;
+  /**
+   * Who is making the request and through which client app, when known.
+   * Recorded as tool observations so the guardrails page can filter observed
+   * tools by user and client.
+   */
+  observer?: {
+    userId?: string;
+    externalAgentId?: string | null;
+  };
+}) => {
   logger.debug(
     { agentId, toolCount: tools.length },
     "[tools] persistTools: starting tool persistence",
@@ -29,8 +50,10 @@ export const persistTools = async (
   }
 
   // Get names of tools that already exist in the database (any type: catalog, proxy, etc.)
-  const existingToolNames = await ToolModel.getExistingToolNames(
-    tools.map((t) => t.toolName),
+  const toolNames = tools.map((t) => t.toolName);
+  const existingToolNames = await configCache.read(
+    `tool-names:${JSON.stringify(toolNames)}`,
+    () => ToolModel.getExistingToolNames(toolNames),
   );
   const existingToolNamesSet = new Set(existingToolNames);
   logger.debug(
@@ -38,23 +61,23 @@ export const persistTools = async (
     "[tools] persistTools: fetched existing tools globally",
   );
 
-  // Get Archestra built-in tool names
-  const archestraTools = getArchestraMcpTools();
-  const archestraToolNamesSet = new Set(
-    archestraTools.map((tool) => tool.name),
-  );
-  logger.debug(
-    { archestraToolCount: archestraTools.length },
-    "[tools] persistTools: fetched Archestra built-in tools",
-  );
-
-  // Filter out tools that already exist in the database, are Archestra built-in tools,
-  // or are agent delegation tools (agent__*). Also deduplicate by tool name to avoid constraint violations
+  // Filter out tools that already exist in the database, were served by this
+  // platform's gateway, or are agent delegation tools (agent__*). Also
+  // deduplicate by tool name to avoid constraint violations.
+  //
+  // Gateway tools arrive under client-specific names. Auto-discovering them
+  // under client names would create duplicate catalog entries.
+  // With verified attestations, `servedByGateway` identifies gateway tools
+  // regardless of client labels. Unattested lookalikes are discovered as
+  // foreign tools.
+  // Without attestations, `archestraMcpBranding.isLikelyToolName` identifies
+  // built-ins across standard prefixes, branded prefixes, and decorated names.
   const seenToolNames = new Set<string>();
-  const toolsToAutoDiscover = tools.filter(({ toolName }) => {
+  const toolsToAutoDiscover = tools.filter((tool) => {
+    const { toolName } = tool;
     if (
       existingToolNamesSet.has(toolName) ||
-      archestraToolNamesSet.has(toolName) ||
+      isServedByGateway(tool) ||
       isAgentTool(toolName) ||
       seenToolNames.has(toolName)
     ) {
@@ -72,9 +95,7 @@ export const persistTools = async (
       skippedExistingTools: tools.filter((t) =>
         existingToolNamesSet.has(t.toolName),
       ).length,
-      skippedArchestraTools: tools.filter((t) =>
-        archestraToolNamesSet.has(t.toolName),
-      ).length,
+      skippedArchestraTools: tools.filter(isServedByGateway).length,
       skippedAgentTools: tools.filter((t) => isAgentTool(t.toolName)).length,
     },
     "[tools] persistTools: filtered tools for auto-discovery",
@@ -85,27 +106,61 @@ export const persistTools = async (
       { agentId },
       "[tools] persistTools: no new tools to auto-discover",
     );
-    return;
+  } else {
+    // Bulk create tools (single query to check existing + single insert for new)
+    logger.debug(
+      { agentId, toolCount: toolsToAutoDiscover.length },
+      "[tools] persistTools: bulk creating tools",
+    );
+    await ToolModel.bulkCreateProxyToolsIfNotExists(
+      toolsToAutoDiscover.map(
+        ({ toolName, toolParameters, toolDescription }) => ({
+          name: toolName,
+          parameters: toolParameters,
+          description: toolDescription,
+        }),
+      ),
+      agentId,
+    );
+
+    logger.debug(
+      { agentId, toolCount: toolsToAutoDiscover.length },
+      "[tools] persistTools: tool persistence complete",
+    );
   }
 
-  // Bulk create tools (single query to check existing + single insert for new)
-  logger.debug(
-    { agentId, toolCount: toolsToAutoDiscover.length },
-    "[tools] persistTools: bulk creating tools",
-  );
-  await ToolModel.bulkCreateProxyToolsIfNotExists(
-    toolsToAutoDiscover.map(
-      ({ toolName, toolParameters, toolDescription }) => ({
-        name: toolName,
-        parameters: toolParameters,
-        description: toolDescription,
-      }),
-    ),
-    agentId,
-  );
-
-  logger.debug(
-    { agentId, toolCount: toolsToAutoDiscover.length },
-    "[tools] persistTools: tool persistence complete",
-  );
+  // Record who observed the request's tools — new and already-known alike — so
+  // the guardrails page can filter observed tools by user and client. Gateway
+  // and delegation tools are excluded, matching the discovery filter above.
+  // Best-effort: attribution must never fail the proxy request.
+  if (observer?.userId) {
+    const observableToolNames = tools
+      .filter((tool) => !isServedByGateway(tool) && !isAgentTool(tool.toolName))
+      .map(({ toolName }) => toolName);
+    if (observableToolNames.length > 0) {
+      try {
+        await ToolObservationModel.recordObservations({
+          toolNames: observableToolNames,
+          userId: observer.userId,
+          externalAgentId: observer.externalAgentId,
+        });
+      } catch (error) {
+        logger.warn(
+          { err: error, agentId },
+          "[tools] persistTools: failed to record tool observations",
+        );
+      }
+    }
+  }
 };
+
+// === Internal helpers ===
+
+function isServedByGateway(tool: {
+  toolName: string;
+  servedByGateway?: boolean;
+}): boolean {
+  return (
+    tool.servedByGateway ?? archestraMcpBranding.isLikelyToolName(tool.toolName)
+  );
+}

@@ -1,11 +1,112 @@
-import { DEFAULT_THEME_ID, type OrganizationCustomFont } from "@shared";
-import { eq } from "drizzle-orm";
-import { CacheKey, cacheManager } from "@/cache-manager";
-import db, { schema } from "@/database";
+import {
+  DEFAULT_APP_NAME,
+  DEFAULT_THEME_ID,
+  type KnowledgeConnectorOverrides,
+  MEMBER_ROLE_NAME,
+  type MessagingChannelOverrides,
+  type ModelProviderOverrides,
+  type OrganizationCustomFont,
+  type SupportedProvider,
+  TimeInMs,
+} from "@archestra/shared";
+import { and, asc, eq, isNull, sql } from "drizzle-orm";
+import { CacheKey, cacheManager, LRUCacheManager } from "@/cache-manager";
+import db, { schema, type Transaction, withDbTransaction } from "@/database";
 import logger from "@/logging";
-import type { AppearanceSettings, Organization } from "@/types";
+import { registerProcessLocalCache } from "@/process-local-cache-registry";
+import type {
+  AppearanceSettings,
+  NetworkPolicy,
+  Organization,
+  OrganizationAnalyticsState,
+} from "@/types";
+import ResourcePermissionPolicyModel from "./resource-permission-policy";
+
+/** @public — the shape {@link OrganizationModel.getIntegrationOverrides} resolves */
+export type IntegrationOverrideColumns = {
+  modelProviderOverrides: ModelProviderOverrides | null;
+  messagingChannelOverrides: MessagingChannelOverrides | null;
+  knowledgeConnectorOverrides: KnowledgeConnectorOverrides | null;
+};
 
 class OrganizationModel {
+  /** Read only when provisioning a new personal assistant or gateway. */
+  static async getDefaultPersonalAgentAccessAllTools(
+    organizationId: string,
+  ): Promise<boolean> {
+    const [row] = await db
+      .select({
+        accessAllTools:
+          schema.organizationsTable.defaultPersonalAgentAccessAllTools,
+      })
+      .from(schema.organizationsTable)
+      .where(eq(schema.organizationsTable.id, organizationId))
+      .limit(1);
+    return row?.accessAllTools ?? true;
+  }
+
+  /**
+   * Process-local cache for {@link getAppearanceSettings}. The appearance
+   * settings back white-labeling on the unauthenticated login page (and every
+   * subsequent page load), so without a cache each page view costs a database
+   * query for a row that only changes when an admin edits appearance. Being
+   * process-local (not the Postgres-backed cacheManager) it also keeps the
+   * hot path off the database connection pool entirely. Writes in this
+   * process clear it immediately; other pods converge within the TTL.
+   */
+  private static readonly appearanceSettingsCache = registerProcessLocalCache(
+    new LRUCacheManager<AppearanceSettings>({
+      maxSize: 1,
+      defaultTtl: TimeInMs.Minute,
+    }),
+  );
+
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  /**
+   * Process-local mirror of {@link getMcpIdleHibernationEnabled}, for the two
+   * callers that cannot await: the MCP demand stamp on the tool-call hot path
+   * and the runtime manager's dormancy check. Both run per request, so even
+   * the shared (Postgres-backed) cache would be too expensive — and neither
+   * can block. Same one-minute convergence as the appearance cache.
+   */
+  private static readonly mcpIdleHibernationCache = registerProcessLocalCache(
+    new LRUCacheManager<boolean>({
+      maxSize: 1,
+      defaultTtl: TimeInMs.Minute,
+    }),
+  );
+
+  /** De-dupes the background hydration a cold sync read kicks off. */
+  private static mcpIdleHibernationHydration: Promise<boolean> | null = null;
+  // SPDX-SnippetEnd
+
+  /**
+   * The organization that publishes its skills marketplace without
+   * authentication, or null when none does.
+   *
+   * A credential-less clone carries no organization to resolve, and unlike
+   * `getFirst` this cannot land on an organization that never opted in. The
+   * ordering only matters if two organizations on one deployment both publish
+   * anonymously; picking the oldest keeps that stable instead of leaving it to
+   * physical row order.
+   */
+  static async findWithAnonymousSkillMarketplace(): Promise<Organization | null> {
+    const [organization] = await db
+      .select()
+      .from(schema.organizationsTable)
+      .where(
+        eq(schema.organizationsTable.skillMarketplaceAnonymousAccess, true),
+      )
+      .orderBy(
+        asc(schema.organizationsTable.createdAt),
+        asc(schema.organizationsTable.id),
+      )
+      .limit(1);
+    return organization ?? null;
+  }
+
   /**
    * Get the first organization in the database (fallback for various operations)
    */
@@ -20,6 +121,45 @@ class OrganizationModel {
       "OrganizationModel.getFirst: completed",
     );
     return organization || null;
+  }
+
+  /**
+   * The deployment's display name for user-facing copy, honoring enterprise
+   * white-labeling. Falls back to "Archestra" when unset.
+   */
+  static async getAppName(): Promise<string> {
+    return (await OrganizationModel.getFirst())?.appName || DEFAULT_APP_NAME;
+  }
+
+  /**
+   * The role slug assigned to newly provisioned members that don't carry an
+   * explicit role (email/password self-signup, ChatOps auto-provisioning, and
+   * first-time SSO logins whose IdP defines no `roleMapping.defaultRole`).
+   * Falls back to the built-in "member" role when unset. A per-IdP SSO
+   * `roleMapping.defaultRole` still takes precedence over this org-wide value.
+   */
+  static async getDefaultMemberRole(organizationId: string): Promise<string> {
+    const [organization] = await db
+      .select({
+        defaultMemberRole: schema.organizationsTable.defaultMemberRole,
+      })
+      .from(schema.organizationsTable)
+      .where(eq(schema.organizationsTable.id, organizationId))
+      .limit(1);
+    return organization?.defaultMemberRole || MEMBER_ROLE_NAME;
+  }
+
+  /**
+   * Serializes writers that check-then-insert per-organization rows (e.g.
+   * built-in provisioning) across replicas until `tx` ends. NO KEY UPDATE
+   * still lets other transactions insert rows referencing the organization.
+   */
+  static async lockRowForUpdate(id: string, tx: Transaction): Promise<void> {
+    await tx
+      .select({ id: schema.organizationsTable.id })
+      .from(schema.organizationsTable)
+      .where(eq(schema.organizationsTable.id, id))
+      .for("no key update");
   }
 
   /**
@@ -42,21 +182,104 @@ class OrganizationModel {
     logger.debug(
       "OrganizationModel.getOrCreateDefaultOrganization: creating default organization",
     );
-    const [createdOrg] = await db
-      .insert(schema.organizationsTable)
-      .values({
-        id: "default-org",
-        name: "Default Organization",
-        slug: "default",
-        createdAt: new Date(),
-      })
-      .returning();
+    const createdOrg = await withDbTransaction(async (tx) => {
+      const [organization] = await tx
+        .insert(schema.organizationsTable)
+        .values({
+          id: "default-org",
+          name: "Default Organization",
+          slug: "default",
+          createdAt: new Date(),
+        })
+        // A concurrently booting replica may have created it first.
+        .onConflictDoNothing()
+        .returning();
+      if (!organization) return null;
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      await ResourcePermissionPolicyModel.initializeOrganization({
+        tx,
+        organizationId: organization.id,
+      });
+      // SPDX-SnippetEnd
+      return organization;
+    });
+    if (!createdOrg) {
+      const winner = await OrganizationModel.getFirst();
+      if (!winner) {
+        throw new Error(
+          "Default organization creation conflicted, but none exists",
+        );
+      }
+      return winner;
+    }
 
     logger.debug(
       { organizationId: createdOrg.id },
       "OrganizationModel.getOrCreateDefaultOrganization: completed",
     );
     return createdOrg;
+  }
+
+  /**
+   * Get persistent analytics identity and event timestamps for this installation.
+   */
+  static async getAnalyticsState(): Promise<OrganizationAnalyticsState> {
+    const organization =
+      await OrganizationModel.getOrCreateDefaultOrganization();
+    const [state] = await db
+      .select({
+        id: schema.organizationsTable.id,
+        analyticsInstanceId: schema.organizationsTable.analyticsInstanceId,
+        analyticsInstanceStartedAt:
+          schema.organizationsTable.analyticsInstanceStartedAt,
+        analyticsInstanceLastHeartbeatAt:
+          schema.organizationsTable.analyticsInstanceLastHeartbeatAt,
+      })
+      .from(schema.organizationsTable)
+      .where(eq(schema.organizationsTable.id, organization.id))
+      .limit(1);
+
+    if (!state) {
+      throw new Error("Organization analytics state not found");
+    }
+    return state;
+  }
+
+  /**
+   * Update installation analytics timestamps after successful event capture.
+   */
+  static async updateAnalyticsState({
+    id,
+    analyticsInstanceStartedAt,
+    analyticsInstanceLastHeartbeatAt,
+  }: {
+    id: string;
+    analyticsInstanceStartedAt?: Date;
+    analyticsInstanceLastHeartbeatAt?: Date;
+  }): Promise<void> {
+    const values: Partial<
+      Pick<
+        OrganizationAnalyticsState,
+        "analyticsInstanceStartedAt" | "analyticsInstanceLastHeartbeatAt"
+      >
+    > = {};
+
+    if (analyticsInstanceStartedAt) {
+      values.analyticsInstanceStartedAt = analyticsInstanceStartedAt;
+    }
+    if (analyticsInstanceLastHeartbeatAt) {
+      values.analyticsInstanceLastHeartbeatAt =
+        analyticsInstanceLastHeartbeatAt;
+    }
+
+    if (Object.keys(values).length === 0) return;
+
+    await db
+      .update(schema.organizationsTable)
+      .set(values)
+      .where(eq(schema.organizationsTable.id, id));
   }
 
   /**
@@ -76,26 +299,247 @@ class OrganizationModel {
       return OrganizationModel.getById(id);
     }
 
-    const [updatedOrganization] = await db
-      .update(schema.organizationsTable)
-      .set(data)
-      .where(eq(schema.organizationsTable.id, id))
-      .returning();
+    const updatedOrganization = await OrganizationModel.patchInTransaction({
+      id,
+      data,
+    });
 
     logger.debug(
       { id, updated: !!updatedOrganization },
       "OrganizationModel.patch: completed",
     );
-    await cacheManager.delete(getOrganizationSettingsCacheKey(id));
+    await OrganizationModel.invalidateSettingsCaches(id);
     return updatedOrganization || null;
+  }
+
+  /** Used by the browser policy's cluster fence; cache invalidation follows commit. */
+  static async patchInTransaction(params: {
+    id: string;
+    data: Partial<Organization>;
+    tx?: Transaction;
+  }): Promise<Organization | null> {
+    const [row] = await (params.tx ?? db)
+      .update(schema.organizationsTable)
+      .set(params.data)
+      .where(eq(schema.organizationsTable.id, params.id))
+      .returning();
+    return row ?? null;
+  }
+
+  static async invalidateSettingsCaches(id: string): Promise<void> {
+    await cacheManager.delete(getOrganizationSettingsCacheKey(id));
+    await cacheManager.delete(getOrganizationAuthEnforcementCacheKey(id));
+    await cacheManager.delete(getOrganizationOnlineSkillCatalogCacheKey(id));
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Suffixed keys are stored (and therefore deleted) exactly, not by prefix
+    // — a new one has to be dropped here explicitly or the sweeper would keep
+    // acting on the toggle's previous value for a full cache TTL.
+    await cacheManager.delete(getOrganizationMcpIdleHibernationCacheKey());
+    // SPDX-SnippetEnd
+    OrganizationModel.appearanceSettingsCache.clear();
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    OrganizationModel.mcpIdleHibernationCache.clear();
+    // SPDX-SnippetEnd
+  }
+
+  /**
+   * Atomically record that the first-login onboarding survey was submitted for
+   * this organization. Returns true only for the call that actually flipped the
+   * flag (it was previously null), so the caller can forward the survey exactly
+   * once even when two admins submit concurrently. Never shown again once set.
+   */
+  static async markOnboardingSurveyCompleted(id: string): Promise<boolean> {
+    const rows = await db
+      .update(schema.organizationsTable)
+      .set({ onboardingSurveyCompletedAt: new Date() })
+      .where(
+        and(
+          eq(schema.organizationsTable.id, id),
+          isNull(schema.organizationsTable.onboardingSurveyCompletedAt),
+        ),
+      )
+      .returning({ id: schema.organizationsTable.id });
+    if (rows.length > 0) {
+      await cacheManager.delete(getOrganizationSettingsCacheKey(id));
+      await cacheManager.delete(getOrganizationAuthEnforcementCacheKey(id));
+      await cacheManager.delete(getOrganizationOnlineSkillCatalogCacheKey(id));
+    }
+    return rows.length > 0;
+  }
+
+  /**
+   * Turn on the Agent Skill tools for every organization that hasn't already
+   * opted in. Run at startup so the model-facing skill tools are on by default
+   * — newly created agents then
+   * inherit them via `ToolModel.assignSkillToolsToAgent`, and the
+   * slash-command toggle unlocks. Pre-existing agents are not retrofitted;
+   * admins add skill tools to them via the agent tools editor if needed.
+   * Idempotent; returns the number of orgs flipped on.
+   */
+  static async enableSkillToolsForAllOrgs(): Promise<number> {
+    const rows = await db
+      .update(schema.organizationsTable)
+      .set({ skillToolsEnabled: true })
+      .where(eq(schema.organizationsTable.skillToolsEnabled, false))
+      .returning({ id: schema.organizationsTable.id });
+    for (const { id } of rows) {
+      await cacheManager.delete(getOrganizationSettingsCacheKey(id));
+      await cacheManager.delete(getOrganizationAuthEnforcementCacheKey(id));
+      await cacheManager.delete(getOrganizationOnlineSkillCatalogCacheKey(id));
+    }
+    return rows.length;
+  }
+
+  /**
+   * List ids of organizations that have opted into the Agent Skill tools
+   * (`skillToolsEnabled`). Used to backfill newly introduced skill tools.
+   */
+  static async findIdsWithSkillToolsEnabled(): Promise<string[]> {
+    const rows = await db
+      .select({ id: schema.organizationsTable.id })
+      .from(schema.organizationsTable)
+      .where(eq(schema.organizationsTable.skillToolsEnabled, true));
+    return rows.map((row) => row.id);
+  }
+
+  /**
+   * List every organization id. Used to backfill built-in tools that every org
+   * gets (e.g. the MCP App tools).
+   */
+  static async findAllIds(): Promise<string[]> {
+    const rows = await db
+      .select({ id: schema.organizationsTable.id })
+      .from(schema.organizationsTable);
+    return rows.map((row) => row.id);
+  }
+
+  /**
+   * Whether any organization's locked knowledge embedding config points at this
+   * provider + model pair. The provider comes from the org's embedding API key,
+   * which is how the knowledge base resolves the model row at embed time.
+   */
+  static async isKnowledgeEmbeddingModel(params: {
+    provider: SupportedProvider;
+    modelId: string;
+  }): Promise<boolean> {
+    const [row] = await db
+      .select({ id: schema.organizationsTable.id })
+      .from(schema.organizationsTable)
+      .innerJoin(
+        schema.llmProviderApiKeysTable,
+        eq(
+          schema.organizationsTable.embeddingChatApiKeyId,
+          schema.llmProviderApiKeysTable.id,
+        ),
+      )
+      .where(
+        and(
+          eq(schema.organizationsTable.embeddingModel, params.modelId),
+          eq(schema.llmProviderApiKeysTable.provider, params.provider),
+        ),
+      )
+      .limit(1);
+    return !!row;
+  }
+
+  /**
+   * The fields the code-managed default Dagger engine needs, for every
+   * organization. Projected rather than selecting whole rows: startup reconciles
+   * every organization, and a row carries base64 logos and favicons the engine
+   * has no use for. The engine's egress policy is read separately, per engine.
+   */
+  static async listDefaultEngineTargets(): Promise<
+    { id: string; defaultEnvironmentNamespace: string | null }[]
+  > {
+    return db
+      .select({
+        id: schema.organizationsTable.id,
+        defaultEnvironmentNamespace:
+          schema.organizationsTable.defaultEnvironmentNamespace,
+      })
+      .from(schema.organizationsTable);
+  }
+
+  /**
+   * The same fields for one organization. Every sandbox run by an agent with no
+   * environment resolves its engine through this, so it reads two columns rather
+   * than a whole row.
+   */
+  static async getDefaultEngineTarget(id: string): Promise<{
+    id: string;
+    defaultEnvironmentNamespace: string | null;
+  } | null> {
+    const [row] = await db
+      .select({
+        id: schema.organizationsTable.id,
+        defaultEnvironmentNamespace:
+          schema.organizationsTable.defaultEnvironmentNamespace,
+      })
+      .from(schema.organizationsTable)
+      .where(eq(schema.organizationsTable.id, id))
+      .limit(1);
+    return row ?? null;
+  }
+
+  /**
+   * The organization's default egress policy for sandbox engines. Engine
+   * reconciliation reads only this column, so it avoids the row's base64 logo
+   * fields.
+   */
+  static async getDefaultNetworkPolicy(
+    id: string,
+  ): Promise<NetworkPolicy | null> {
+    const [row] = await db
+      .select({
+        defaultNetworkPolicy: schema.organizationsTable.defaultNetworkPolicy,
+      })
+      .from(schema.organizationsTable)
+      .where(eq(schema.organizationsTable.id, id))
+      .limit(1);
+    return row?.defaultNetworkPolicy ?? null;
+  }
+
+  /**
+   * The admin's customization of the built-in integration catalogs. Reads only
+   * the three override columns, so callers on the cold configuration paths
+   * don't drag the row's base64 logo fields along. Pass `null` to resolve the
+   * deployment's organization, for callers with no request context (the
+   * ChatOps manager starts before any request).
+   */
+  static async getIntegrationOverrides(
+    id: string | null,
+  ): Promise<IntegrationOverrideColumns> {
+    const columns = {
+      modelProviderOverrides: schema.organizationsTable.modelProviderOverrides,
+      messagingChannelOverrides:
+        schema.organizationsTable.messagingChannelOverrides,
+      knowledgeConnectorOverrides:
+        schema.organizationsTable.knowledgeConnectorOverrides,
+    };
+    const query = db.select(columns).from(schema.organizationsTable);
+    const [row] = await (id === null
+      ? query.limit(1)
+      : query.where(eq(schema.organizationsTable.id, id)).limit(1));
+    return {
+      modelProviderOverrides: row?.modelProviderOverrides ?? null,
+      messagingChannelOverrides: row?.messagingChannelOverrides ?? null,
+      knowledgeConnectorOverrides: row?.knowledgeConnectorOverrides ?? null,
+    };
   }
 
   /**
    * Get an organization by ID
    */
-  static async getById(id: string): Promise<Organization | null> {
+  static async getById(
+    id: string,
+    tx?: Transaction,
+  ): Promise<Organization | null> {
     logger.debug({ id }, "OrganizationModel.getById: fetching organization");
-    const [organization] = await db
+    const [organization] = await (tx ?? db)
       .select()
       .from(schema.organizationsTable)
       .where(eq(schema.organizationsTable.id, id))
@@ -137,10 +581,248 @@ class OrganizationModel {
   }
 
   /**
-   * Get appearance settings
+   * Whether the organization allows discovering and importing skills from the
+   * public online catalog. Read on every online-catalog request (the skill
+   * index search and the GitHub discover/preview/import endpoints), so it goes
+   * through the shared org-settings cache rather than a query per call.
+   *
+   * Defaults to `true` when no row is found, matching the column default. That
+   * is not the frontend's fail-closed stance, and deliberately so: the client
+   * has to decide what to render while the org read is missing or in flight,
+   * whereas here the caller is already authenticated against an organization,
+   * so "no row" means the org was deleted mid-request rather than "an admin
+   * turned this off".
+   */
+  static async getOnlineSkillCatalogEnabled(id: string): Promise<boolean> {
+    const cacheKey = getOrganizationOnlineSkillCatalogCacheKey(id);
+    const cached = await cacheManager.get<boolean>(cacheKey);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const [organization] = await db
+      .select({
+        onlineSkillCatalogEnabled:
+          schema.organizationsTable.onlineSkillCatalogEnabled,
+      })
+      .from(schema.organizationsTable)
+      .where(eq(schema.organizationsTable.id, id))
+      .limit(1);
+
+    const enabled = organization?.onlineSkillCatalogEnabled ?? true;
+    try {
+      // Short TTL by design, unlike the other org-settings reads. This set can
+      // race a concurrent PATCH (select old value -> PATCH updates the row and
+      // deletes the key -> this set lands) and there is no version guard, so a
+      // stale `true` CAN be re-cached after an admin turns the catalog off.
+      // The cache's default hour is far too long a window for a setting that
+      // gates what an org can import; a minute is not.
+      await cacheManager.set(
+        cacheKey,
+        enabled,
+        ONLINE_SKILL_CATALOG_CACHE_TTL_MS,
+      );
+    } catch {
+      // Cache writes are best-effort here; tests and early startup may not
+      // have the distributed cache initialized yet.
+    }
+    return enabled;
+  }
+
+  /**
+   * Whether LLM proxy requests may run without a platform credential. Read
+   * straight from the row: it gates the proxy hot path, so it stays a single
+   * primary-key lookup rather than a cache entry that every patch must evict.
+   */
+  static async allowsUnauthenticatedLlmProxyRequests(
+    id: string,
+  ): Promise<boolean> {
+    const [organization] = await db
+      .select({
+        allowed: schema.organizationsTable.allowUnauthenticatedLlmProxyRequests,
+      })
+      .from(schema.organizationsTable)
+      .where(eq(schema.organizationsTable.id, id))
+      .limit(1);
+    return organization?.allowed ?? false;
+  }
+
+  /**
+   * Whether the organization's logs keep the media their rows carry. Read
+   * straight from the row on each log write, like the proxy's credential
+   * setting, so a change applies to the very next row on every replica. The
+   * organization is found from whichever owner the row names (agent, app,
+   * knowledge connector or environment), in one query. Media is kept only
+   * when that organization turned it on; a row that names none keeps none.
+   */
+  static async keepsMediaInLogs(owner: {
+    organizationId?: string | null;
+    agentId?: string | null;
+    appId?: string | null;
+    connectorId?: string | null;
+    environmentId?: string | null;
+  }): Promise<boolean> {
+    const { agentsTable, appsTable, environmentsTable } = schema;
+    const connectors = schema.knowledgeBaseConnectorsTable;
+    const organizationId = sql`coalesce(
+      ${owner.organizationId ?? null}::text,
+      (select ${agentsTable.organizationId} from ${agentsTable}
+        where ${agentsTable.id} = ${owner.agentId ?? null}::uuid),
+      (select ${appsTable.organizationId} from ${appsTable}
+        where ${appsTable.id} = ${owner.appId ?? null}::uuid),
+      (select ${connectors.organizationId} from ${connectors}
+        where ${connectors.id} = ${owner.connectorId ?? null}::uuid),
+      (select ${environmentsTable.organizationId} from ${environmentsTable}
+        where ${environmentsTable.id} = ${owner.environmentId ?? null}::uuid)
+    )`;
+    const [row] = await db
+      .select({ keep: schema.organizationsTable.keepMediaInLogs })
+      .from(schema.organizationsTable)
+      .where(sql`${schema.organizationsTable.id} = ${organizationId}`)
+      .limit(1);
+    return row?.keep ?? false;
+  }
+
+  /**
+   * Cached per-request read of the org's auth-enforcement policies
+   * (require-2FA, session max age). Same cache key as the other org
+   * settings, so any OrganizationModel.patch invalidates it.
+   */
+  static async getAuthEnforcementSettings(id: string): Promise<{
+    requireTwoFactor: boolean;
+    sessionMaxAgeSeconds: number | null;
+  }> {
+    const cacheKey = getOrganizationAuthEnforcementCacheKey(id);
+    const cached = await cacheManager.get<{
+      requireTwoFactor: boolean;
+      sessionMaxAgeSeconds: number | null;
+    }>(cacheKey);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const [organization] = await db
+      .select({
+        requireTwoFactor: schema.organizationsTable.requireTwoFactor,
+        sessionMaxAgeSeconds: schema.organizationsTable.sessionMaxAgeSeconds,
+      })
+      .from(schema.organizationsTable)
+      .where(eq(schema.organizationsTable.id, id))
+      .limit(1);
+
+    const policies = {
+      requireTwoFactor: organization?.requireTwoFactor ?? false,
+      sessionMaxAgeSeconds: organization?.sessionMaxAgeSeconds ?? null,
+    };
+    try {
+      await cacheManager.set(cacheKey, policies);
+    } catch {
+      // Cache writes are best-effort here; tests and early startup may not
+      // have the distributed cache initialized yet.
+    }
+    return policies;
+  }
+
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  /**
+   * Whether the organization has opted into idle hibernation of MCP servers.
+   * Single-org table, so this is a `limit 1` projected read behind the shared
+   * settings cache — the idle sweeper asks on every tick (a change must take
+   * effect without a restart) and it must not cost a query each time.
+   *
+   * Also refreshes the process-local mirror {@link
+   * getMcpIdleHibernationEnabledSync} serves, so the synchronous hot paths
+   * converge for free whenever the sweeper runs.
+   */
+  static async getMcpIdleHibernationEnabled(): Promise<boolean> {
+    const cacheKey = getOrganizationMcpIdleHibernationCacheKey();
+    const cached = await cacheManager.get<boolean>(cacheKey);
+    if (cached !== undefined) {
+      OrganizationModel.mcpIdleHibernationCache.set(
+        MCP_IDLE_HIBERNATION_CACHE_KEY,
+        cached,
+      );
+      return cached;
+    }
+
+    const [organization] = await db
+      .select({
+        mcpIdleHibernationEnabled:
+          schema.organizationsTable.mcpIdleHibernationEnabled,
+      })
+      .from(schema.organizationsTable)
+      .limit(1);
+
+    const enabled = organization?.mcpIdleHibernationEnabled ?? false;
+    try {
+      // Short TTL by design. This set can race a concurrent PATCH (select old
+      // value → PATCH updates row + deletes key → this set lands) and there is
+      // no version guard, so the stale value CAN be re-cached — the TTL is
+      // what bounds that exposure to about one sweep tick instead of the
+      // cache's default hour. The sweeper re-primes every tick anyway, so the
+      // short lifetime costs one query per interval, not per call.
+      await cacheManager.set(
+        cacheKey,
+        enabled,
+        MCP_IDLE_HIBERNATION_CACHE_TTL_MS,
+      );
+    } catch {
+      // Cache writes are best-effort here; tests and early startup may not
+      // have the distributed cache initialized yet.
+    }
+    OrganizationModel.mcpIdleHibernationCache.set(
+      MCP_IDLE_HIBERNATION_CACHE_KEY,
+      enabled,
+    );
+    return enabled;
+  }
+
+  /**
+   * The same answer without awaiting, for callers on synchronous hot paths.
+   * `undefined` means "not known in this process yet" — a cold read schedules
+   * the hydration itself, so the caller only has to decide what to do while
+   * the answer is missing (both current callers choose the do-nothing branch).
+   */
+  static getMcpIdleHibernationEnabledSync(): boolean | undefined {
+    const cached = OrganizationModel.mcpIdleHibernationCache.get(
+      MCP_IDLE_HIBERNATION_CACHE_KEY,
+    );
+    if (
+      cached === undefined &&
+      !OrganizationModel.mcpIdleHibernationHydration
+    ) {
+      OrganizationModel.mcpIdleHibernationHydration =
+        OrganizationModel.getMcpIdleHibernationEnabled()
+          .catch((error) => {
+            logger.warn(
+              { err: error },
+              "Failed to hydrate the MCP idle-hibernation organization toggle",
+            );
+            return false;
+          })
+          .finally(() => {
+            OrganizationModel.mcpIdleHibernationHydration = null;
+          });
+    }
+    return cached;
+  }
+  // SPDX-SnippetEnd
+
+  /**
+   * Get appearance settings, cached process-locally for the unauthenticated
+   * white-labeling hot path (login page, every page load).
    * Returns default appearance settings if no organization exists.
    */
   static async getAppearanceSettings(): Promise<AppearanceSettings> {
+    const cached = OrganizationModel.appearanceSettingsCache.get(
+      APPEARANCE_SETTINGS_CACHE_KEY,
+    );
+    if (cached) {
+      return cached;
+    }
+
     const [organization] = await db
       .select({
         theme: schema.organizationsTable.theme,
@@ -149,11 +831,11 @@ class OrganizationModel {
         logoDark: schema.organizationsTable.logoDark,
         favicon: schema.organizationsTable.favicon,
         iconLogo: schema.organizationsTable.iconLogo,
+        iconLogoDark: schema.organizationsTable.iconLogoDark,
         appName: schema.organizationsTable.appName,
         ogDescription: schema.organizationsTable.ogDescription,
         footerText: schema.organizationsTable.footerText,
         chatLinks: schema.organizationsTable.chatLinks,
-        onboardingWizard: schema.organizationsTable.onboardingWizard,
         chatErrorSupportMessage:
           schema.organizationsTable.chatErrorSupportMessage,
         slimChatErrorUi: schema.organizationsTable.slimChatErrorUi,
@@ -172,22 +854,175 @@ class OrganizationModel {
         logoDark: null,
         favicon: null,
         iconLogo: null,
+        iconLogoDark: null,
         appName: null,
         ogDescription: null,
         footerText: null,
         chatLinks: null,
-        onboardingWizard: null,
         chatErrorSupportMessage: null,
         slimChatErrorUi: false,
         animateChatPlaceholders: true,
       };
     }
 
+    OrganizationModel.appearanceSettingsCache.set(
+      APPEARANCE_SETTINGS_CACHE_KEY,
+      organization,
+    );
     return organization;
+  }
+
+  /**
+   * Compact org-wide snapshot for audit logs (large/binary branding fields omitted).
+   */
+  // `id` here is always the caller's own organizationId: all registry entries
+  // for this fetcher use resourceIdSource="organizationContext", so id equals
+  // organizationId at call time. The second parameter is unused by design —
+  // the resource being audited IS the organization.
+  static async findByIdForAudit(
+    id: string,
+    _organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const org = await OrganizationModel.getById(id);
+    if (!org) return null;
+
+    const media = (v: string | null | undefined) =>
+      v && v.length > 0 ? "(set)" : null;
+
+    // Resolve the live default-model/key FKs to legible identities — the
+    // defaultLlmModel/defaultLlmProvider text columns are deprecated (never
+    // written), so an org default-model change would otherwise show no diff.
+    const [defaultModelRows, defaultKeyRows] = await Promise.all([
+      org.defaultModelId
+        ? db
+            .select({ externalId: schema.modelsTable.externalId })
+            .from(schema.modelsTable)
+            .where(eq(schema.modelsTable.id, org.defaultModelId))
+            .limit(1)
+        : Promise.resolve([]),
+      org.defaultLlmApiKeyId
+        ? db
+            .select({
+              id: schema.llmProviderApiKeysTable.id,
+              name: schema.llmProviderApiKeysTable.name,
+              scope: schema.llmProviderApiKeysTable.scope,
+              provider: schema.llmProviderApiKeysTable.provider,
+            })
+            .from(schema.llmProviderApiKeysTable)
+            .where(
+              eq(schema.llmProviderApiKeysTable.id, org.defaultLlmApiKeyId),
+            )
+            .limit(1)
+        : Promise.resolve([]),
+    ]);
+
+    return {
+      id: org.id,
+      name: org.name,
+      slug: org.slug,
+      theme: org.theme,
+      customFont: org.customFont,
+      logo: media(org.logo),
+      logoDark: media(org.logoDark),
+      favicon: media(org.favicon),
+      iconLogo: media(org.iconLogo),
+      appName: org.appName ?? null,
+      ogDescription: org.ogDescription ?? null,
+      footerText: org.footerText ?? null,
+      defaultUserLimitCleanupInterval:
+        org.defaultUserLimitCleanupInterval ?? null,
+      defaultMemberRole: org.defaultMemberRole ?? null,
+      onboardingComplete: org.onboardingComplete,
+      onlineMcpCatalogEnabled: org.onlineMcpCatalogEnabled,
+      defaultPersonalAgentAccessAllTools:
+        org.defaultPersonalAgentAccessAllTools,
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      mcpIdleHibernationEnabled: org.mcpIdleHibernationEnabled,
+      // SPDX-SnippetEnd
+      onlineSkillCatalogEnabled: org.onlineSkillCatalogEnabled,
+      playwrightMcpEnabled: org.playwrightMcpEnabled,
+      allowChatFileUploads: org.allowChatFileUploads,
+      allowUnauthenticatedLlmProxyRequests:
+        org.allowUnauthenticatedLlmProxyRequests,
+      keepMediaInLogs: org.keepMediaInLogs,
+      allowToolAutoAssignment: org.allowToolAutoAssignment,
+      agentRuntimeTiers: org.agentRuntimeTiers,
+      embeddingModel: org.embeddingModel ?? null,
+      kbContextualRetrievalMode: org.kbContextualRetrievalMode ?? null,
+      defaultModel: defaultModelRows[0]?.externalId ?? null,
+      defaultLlmApiKey: defaultKeyRows[0]
+        ? {
+            id: defaultKeyRows[0].id,
+            name: defaultKeyRows[0].name,
+            scope: defaultKeyRows[0].scope,
+          }
+        : null,
+      defaultLlmProvider: defaultKeyRows[0]?.provider ?? null,
+      defaultAgentId: org.defaultAgentId ?? null,
+      defaultFastModelId: org.defaultFastModelId ?? null,
+      defaultSmartModelId: org.defaultSmartModelId ?? null,
+      rerankerModel: org.rerankerModel ?? null,
+      ocrModel: org.ocrModel ?? null,
+      requireTwoFactor: org.requireTwoFactor,
+      sessionMaxAgeSeconds: org.sessionMaxAgeSeconds,
+      slimChatErrorUi: org.slimChatErrorUi,
+      oauthAccessTokenLifetimeSeconds: org.oauthAccessTokenLifetimeSeconds,
+      connectionPageHidden: org.connectionPageHidden,
+      connectionDefaultMcpGatewayId: org.connectionDefaultMcpGatewayId ?? null,
+      connectionDefaultLlmProxyId: org.connectionDefaultLlmProxyId ?? null,
+      connectionDefaultClientId: org.connectionDefaultClientId ?? null,
+      connectionSkillsEnabled: org.connectionSkillsEnabled,
+      connectionLlmProxyEnabled: org.connectionLlmProxyEnabled,
+      connectionPluginsEnabled: org.connectionPluginsEnabled,
+      connectionRuntimeHandoffEnabled: org.connectionRuntimeHandoffEnabled,
+      connectionRuntimeHandoffInstructions:
+        org.connectionRuntimeHandoffInstructions ?? null,
+      popularAgentOverrides: org.popularAgentOverrides ?? null,
+      modelProviderOverrides: org.modelProviderOverrides ?? null,
+      messagingChannelOverrides: org.messagingChannelOverrides ?? null,
+      knowledgeConnectorOverrides: org.knowledgeConnectorOverrides ?? null,
+      metadata: org.metadata ?? null,
+      createdAt: org.createdAt.toISOString(),
+    };
   }
 }
 export default OrganizationModel;
 
+/** Single-org table (`limit 1` read), so one fixed key is enough. */
+const APPEARANCE_SETTINGS_CACHE_KEY = "appearance-settings";
+
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+/** Ditto — the toggle is read for the installation, not per organization. */
+const MCP_IDLE_HIBERNATION_CACHE_KEY = "mcp-idle-hibernation";
+/**
+ * One minute — the idle sweeper's fastest tick. See the set() call for why a
+ * stale value can land here at all; this is the bound on how long it lives.
+ */
+const MCP_IDLE_HIBERNATION_CACHE_TTL_MS = 60_000;
+
+function getOrganizationMcpIdleHibernationCacheKey() {
+  return `${CacheKey.OrganizationSettings}-mcp-idle-hibernation` as const;
+}
+// SPDX-SnippetEnd
+
 function getOrganizationSettingsCacheKey(organizationId: string) {
   return `${CacheKey.OrganizationSettings}-${organizationId}` as const;
+}
+
+function getOrganizationAuthEnforcementCacheKey(organizationId: string) {
+  return `${CacheKey.OrganizationSettings}-auth-enforcement-${organizationId}` as const;
+}
+
+/**
+ * One minute. See the set() call in `getOnlineSkillCatalogEnabled` for why a
+ * stale value can land in the cache at all; this bounds how long it lives.
+ */
+const ONLINE_SKILL_CATALOG_CACHE_TTL_MS = 60_000;
+
+function getOrganizationOnlineSkillCatalogCacheKey(organizationId: string) {
+  return `${CacheKey.OrganizationSettings}-online-skill-catalog-${organizationId}` as const;
 }

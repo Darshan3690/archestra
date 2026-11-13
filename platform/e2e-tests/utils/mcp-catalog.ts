@@ -1,7 +1,12 @@
+import { archestraApiSdk } from "@archestra/shared";
+import { testMcpServerCommand } from "@archestra/shared/test-mcp-server";
 import { type APIRequestContext, expect, type Page } from "@playwright/test";
-import { archestraApiSdk } from "@shared";
-import { testMcpServerCommand } from "@shared/test-mcp-server";
-import { E2eTestId, getE2eRequestUrl, UI_BASE_URL } from "../consts";
+import {
+  E2eTestId,
+  getE2eRequestUrl,
+  ORGANIZATION_USE_GRANT,
+  UI_BASE_URL,
+} from "../consts";
 import { goToPage } from "../fixtures";
 
 export async function addCustomSelfHostedCatalogItem({
@@ -9,23 +14,18 @@ export async function addCustomSelfHostedCatalogItem({
   cookieHeaders,
   catalogItemName,
   envVars,
-  scope,
+  shareWithOrganization,
 }: {
   page: Page;
   cookieHeaders: string;
   catalogItemName: string;
+  /** Let every member of the organization find and install the item. */
+  shareWithOrganization?: boolean;
   envVars?: {
     key: string;
     promptOnInstallation: boolean;
     isSecret?: boolean;
-    vaultSecret?: {
-      name: string;
-      key: string;
-      value: string;
-      teamName: string;
-    };
   };
-  scope?: "personal" | "team" | "org";
 }) {
   await goToPage(page, "/mcp/registry");
   await page.waitForLoadState("domcontentloaded");
@@ -33,75 +33,77 @@ export async function addCustomSelfHostedCatalogItem({
   await addButton.waitFor({ state: "visible", timeout: 30_000 });
   await addButton.click();
 
-  const createDialog = page.getByRole("dialog", {
-    name: /Add MCP Server to the Private Registry/i,
-  });
-  await expect(createDialog).toBeVisible({ timeout: 30_000 });
+  // "Add MCP Server" navigates to the routed /mcp/registry/new wizard: pick a
+  // source first, then fill the same catalog form the old dialog hosted.
+  await expect(
+    page.getByRole("heading", {
+      name: /Add MCP Server to the Private Registry/i,
+    }),
+  ).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: "Start from scratch" }).click();
 
-  await createDialog.getByRole("button", { name: "Self-hosted" }).click();
-  await createDialog
+  // The create form renders inline on the page (no dialog wrapper), so
+  // page-level locators are unambiguous here.
+  const createForm = page;
+
+  // The hosting radio is visually hidden inside its card; click the card.
+  await createForm
+    .locator("label", {
+      has: createForm.getByRole("radio", { name: /^Self-hosted/ }),
+    })
+    .click();
+  await createForm
     .getByRole("textbox", { name: "Name *" })
     .fill(catalogItemName);
-  await createDialog.getByLabel("stdio").click();
-  await createDialog.getByRole("textbox", { name: "Command" }).fill("sh");
+  await createForm.getByRole("combobox", { name: "Transport Type" }).click();
+  await page.getByRole("option", { name: "stdio", exact: true }).click();
+  await createForm.getByRole("textbox", { name: "Command" }).fill("sh");
   const singleLineCommand = testMcpServerCommand.replace(/\n/g, " ");
-  await createDialog
+  await createForm
     .getByRole("textbox", { name: "Arguments (one per line)" })
     .fill(`-c\n${singleLineCommand}`);
   if (envVars) {
-    await createDialog.getByRole("button", { name: "Add Variable" }).click();
-    await createDialog
-      .getByRole("textbox", { name: "API_KEY" })
-      .fill(envVars.key);
+    // Since #4696, env-var add/edit lives in its own <StandardDialog>
+    // (`environment-variable-dialog.tsx`) opened by the "Add Variable"
+    // button. All the env-var-specific inputs scope to that sub-dialog
+    // now — not the parent "Add MCP Server" dialog.
+    await createForm.getByRole("button", { name: "Add Variable" }).click();
+    const envVarDialog = page.getByRole("dialog", {
+      name: /Add environment variable/i,
+    });
+    await expect(envVarDialog).toBeVisible({ timeout: 15_000 });
+
+    // The key input's accessible name is now "Key" (the Label) — the old
+    // "API_KEY" was placeholder text on the same input.
+    await envVarDialog.getByRole("textbox", { name: "Key" }).fill(envVars.key);
+
     if (envVars.isSecret) {
-      await createDialog
+      await envVarDialog
         .getByTestId(E2eTestId.SelectEnvironmentVariableType)
         .click();
       await page.getByRole("option", { name: "Secret" }).click();
     }
-    if (envVars.promptOnInstallation) {
-      await createDialog
+
+    // The scope picker defaults to prompting at installation. Select Static
+    // when the catalog supplies the value.
+    const wantsStaticScope = !envVars.promptOnInstallation;
+    if (wantsStaticScope) {
+      await envVarDialog
         .getByTestId(E2eTestId.PromptOnInstallationCheckbox)
-        .click({ force: true });
+        .click();
+      await page.getByRole("option", { name: "Static" }).click();
     }
-    if (envVars.vaultSecret) {
-      await createDialog.getByText("Set Secret").click();
-      const externalSecretDialog = page.getByRole("dialog", {
-        name: /Set external secret/i,
-      });
-      await expect(externalSecretDialog).toBeVisible({ timeout: 15_000 });
-      await externalSecretDialog
-        .getByTestId(E2eTestId.ExternalSecretSelectorTeamTrigger)
-        .click();
-      await page
-        .getByRole("option", { name: envVars.vaultSecret.teamName })
-        .click();
-      await externalSecretDialog
-        .getByTestId(E2eTestId.ExternalSecretSelectorSecretTrigger)
-        .click();
-      await page
-        .getByRole("option", { name: envVars.vaultSecret.name })
-        .click();
-      await externalSecretDialog
-        .getByTestId(E2eTestId.ExternalSecretSelectorSecretTriggerKey)
-        .click();
-      await page.getByRole("option", { name: envVars.vaultSecret.key }).click();
-      await externalSecretDialog
-        .getByRole("button", { name: "Confirm" })
-        .click();
-      await expect(externalSecretDialog).not.toBeVisible({ timeout: 15_000 });
-    }
+
+    // Confirm and close the env-var sub-dialog so the parent "Add MCP
+    // Server" form re-takes focus before we click "Add Server".
+    await envVarDialog.getByRole("button", { name: "Add variable" }).click();
+    await expect(envVarDialog).not.toBeVisible({ timeout: 15_000 });
   }
-  if (scope && scope !== "personal") {
-    await createDialog
-      .getByRole("button", { name: /Only you can access this MCP server/i })
-      .click();
-    const scopeLabel = scope === "org" ? "Organization" : "Teams";
-    await createDialog
-      .getByRole("button", { name: new RegExp(scopeLabel, "i") })
-      .click();
-  }
-  await createDialog.getByRole("button", { name: "Add Server" }).click();
+  // Who can reach the item is its permissions; the create form no longer
+  // carries a personal/team/organization choice. A new item reaches its
+  // author and the roles with registry access at `*`, so `shareWithOrganization`
+  // grants the rest of the organization after creation.
+  await createForm.getByRole("button", { name: "Add Server" }).click();
   await page.waitForLoadState("domcontentloaded");
 
   let newCatalogItem: { id: string; name: string } | null = null;
@@ -138,9 +140,12 @@ export async function addCustomSelfHostedCatalogItem({
   }
 
   const createdCatalogItem = newCatalogItem as { id: string; name: string };
-
-  if (await createDialog.isVisible().catch(() => false)) {
-    await page.keyboard.press("Escape").catch(() => undefined);
+  if (shareWithOrganization) {
+    await grantOrganizationUse({
+      cookieHeaders,
+      resource: "mcpRegistry",
+      scope: createdCatalogItem.id,
+    });
   }
 
   return {
@@ -220,6 +225,72 @@ export async function ensureInternalDevTestServerCatalogItem(
   return { id: created.id, name: created.name };
 }
 
+/**
+ * Fixture server for the app SDK `tools.call` unwrapping contract: its single
+ * tool returns a JSON object serialized into a text content block (no
+ * structuredContent), which the SDK must resolve as the parsed value.
+ */
+export async function ensureAppSdkJsonTestServerCatalogItem(
+  request: APIRequestContext,
+): Promise<{ id: string; name: string }> {
+  const existing = await findCatalogItem(
+    request,
+    APP_SDK_JSON_CATALOG_ITEM_NAME,
+  );
+  if (existing) {
+    return existing;
+  }
+
+  const response = await request.post(
+    getE2eRequestUrl("/api/internal_mcp_catalog"),
+    {
+      headers: {
+        "Content-Type": "application/json",
+        Origin: UI_BASE_URL,
+      },
+      data: {
+        name: APP_SDK_JSON_CATALOG_ITEM_NAME,
+        description:
+          "Test MCP server for e2e tests. Has one tool that returns a JSON task list serialized into a text content block.",
+        serverType: "local",
+        localConfig: {
+          command: "sh",
+          arguments: ["-c", appSdkJsonServerCommand],
+          transportType: "stdio",
+          environment: [],
+        },
+      },
+    },
+  );
+
+  if (!response.ok()) {
+    throw new Error(
+      `Failed to create ${APP_SDK_JSON_CATALOG_ITEM_NAME} catalog item: ${response.status()} ${await response.text()}`,
+    );
+  }
+
+  const created = await response.json();
+  return { id: created.id, name: created.name };
+}
+
+export const APP_SDK_JSON_SERVER_TOOL_NAME = "get_tasks";
+
+const appSdkJsonFixtureTasks = [
+  { id: 1, title: "triage inbox" },
+  { id: 2, title: "review pull request" },
+  { id: 3, title: "publish release" },
+];
+
+export const APP_SDK_JSON_SERVER_TASK_COUNT = appSdkJsonFixtureTasks.length;
+
+const APP_SDK_JSON_CATALOG_ITEM_NAME = "e2e-app-sdk-json-server";
+
+// Single-line script, same shape/escaping as `testMcpServerCommand` in
+// @archestra/shared/test-mcp-server (arguments are newline-separated in the UI).
+const appSdkJsonServerScript = `const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js'); const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js'); const server = new McpServer({ name: '${APP_SDK_JSON_CATALOG_ITEM_NAME}', version: '1.0.0' }); server.tool('${APP_SDK_JSON_SERVER_TOOL_NAME}', 'Returns the fixture task list as JSON serialized into a text content block', {}, async () => ({ content: [{ type: 'text', text: ${JSON.stringify(JSON.stringify({ tasks: appSdkJsonFixtureTasks }))} }] })); const transport = new StdioServerTransport(); server.connect(transport);`;
+
+const appSdkJsonServerCommand = `npm install --silent @modelcontextprotocol/sdk && node -e '${appSdkJsonServerScript.replace(/'/g, "'\"'\"'")}'`;
+
 function extractCatalogItems(
   data: unknown,
 ): Array<{ id: string; name: string }> {
@@ -290,4 +361,46 @@ export async function waitForServerInstallation(
   throw new Error(
     `MCP server installation timed out after ${maxAttempts * 2} seconds`,
   );
+}
+
+/**
+ * Add the organization-wide use grant to an object's own policy, keeping the
+ * grants it already has. The create form has no sharing choice, so specs that
+ * need an object every member can reach share it here after creation.
+ */
+async function grantOrganizationUse(params: {
+  cookieHeaders: string;
+  resource: "mcpRegistry";
+  scope: string;
+}) {
+  const headers = { Cookie: params.cookieHeaders };
+  const path = { resource: params.resource, scope: params.scope };
+  const current = await archestraApiSdk.getResourcePermissions({
+    headers,
+    path,
+  });
+  if (current.error || !current.data) {
+    throw new Error(
+      `Failed to read permissions: ${JSON.stringify(current.error)}`,
+    );
+  }
+  const updated = await archestraApiSdk.updateResourcePermissions({
+    headers,
+    path,
+    body: {
+      revision: current.data.revision,
+      grants: [
+        ...current.data.grants,
+        {
+          subject: { ...ORGANIZATION_USE_GRANT.subject },
+          actions: [...ORGANIZATION_USE_GRANT.actions],
+        },
+      ],
+    },
+  });
+  if (updated.error) {
+    throw new Error(
+      `Failed to share with the organization: ${JSON.stringify(updated.error)}`,
+    );
+  }
 }

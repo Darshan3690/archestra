@@ -1,6 +1,7 @@
 import Fastify from "fastify";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import config from "@/config";
-import { afterEach, beforeEach, describe, expect, it } from "@/test";
+import { enterpriseTier } from "@/enterprise-tier";
 import { ApiError } from "@/types";
 import {
   enterpriseLicenseMiddleware,
@@ -47,6 +48,10 @@ describe.sequential("enterpriseLicenseMiddleware", () => {
       writable: true,
       configurable: true,
     });
+    // Park the user count well above the small-team threshold whenever the env
+    // flag is "off"; otherwise the small-team free tier would keep the gate
+    // open and break the "NOT activated" cases.
+    enterpriseTier.setUserCountForTesting(value ? 0 : 9999);
   };
 
   afterEach(async () => {
@@ -333,6 +338,22 @@ describe("isEnterpriseOnlyRoute", () => {
     expect(
       isEnterpriseOnlyRoute("/api/teams/team-123/external-groups/group-456"),
     ).toBe(true);
+  });
+
+  it("gates workload identity federation but not the rest of service accounts", () => {
+    expect(
+      isEnterpriseOnlyRoute("/api/service-accounts/sa-1/federated-credentials"),
+    ).toBe(true);
+    expect(
+      isEnterpriseOnlyRoute(
+        "/api/service-accounts/sa-1/federated-credentials/cred-1",
+      ),
+    ).toBe(true);
+    expect(isEnterpriseOnlyRoute("/api/workload-identity/token")).toBe(true);
+    expect(isEnterpriseOnlyRoute("/api/service-accounts/sa-1")).toBe(false);
+    expect(isEnterpriseOnlyRoute("/api/service-accounts/sa-1/tokens")).toBe(
+      false,
+    );
   });
 
   it("should return false for regular team routes", () => {

@@ -1,0 +1,194 @@
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("next/navigation");
+vi.mock("@/lib/config/config.query", () => ({ useFeature: () => false }));
+vi.mock("@/lib/hooks/use-app-name", () => ({
+  useAppName: () => "Northstar",
+}));
+vi.mock("@/lib/auth/auth.query", () => ({
+  useSession: () => ({ data: { user: { id: "user-1" } } }),
+  useHasPermissions: () => ({ data: true }),
+  useScopedCapabilities: () => ({ data: [] }),
+  // The Agents-section tab bar at the top of the page asks which of its pages
+  // this reader may open.
+  usePermissionMap: () => ({
+    "/agents": true,
+    "/skills": true,
+    "/plugins": true,
+  }),
+}));
+vi.mock("@/components/resource-scope-filter", () => ({
+  ActiveFilterBadges: () => null,
+  ResourceScopeFilter: () => <button type="button">Visibility filter</button>,
+  useScopeFilterParams: () => ({
+    scope: undefined,
+    teamIds: undefined,
+    authorIds: undefined,
+    excludeAuthorIds: undefined,
+    excludeOtherPersonal: false,
+    hasActiveScopeFilters: false,
+  }),
+}));
+vi.mock("@/components/search-input", () => ({
+  SearchInput: () => <input aria-label="Search plugins" />,
+}));
+vi.mock("./_parts/plugin-install-dialog", () => ({
+  PluginInstallDialog: () => null,
+}));
+vi.mock("@/lib/plugins/plugin.query", () => ({
+  usePlugins: () => ({
+    data: [PLUGIN],
+    isPending: false,
+    isFetching: false,
+    isLoadingError: false,
+    refetch: vi.fn(),
+  }),
+  useBulkDeletePlugins: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useDeletePlugin: () => ({ mutateAsync: vi.fn(), isPending: false }),
+}));
+vi.mock("@/lib/entity-labels.query");
+
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import PluginsPage from "./page.client";
+
+const PLUGIN = vi.hoisted(() => ({
+  id: "plugin-1",
+  organizationId: "org-1",
+  authorId: "user-1",
+  scope: "org",
+  clientType: "claude-code",
+  supportedPlatforms: ["posix", "windows"],
+  pluginSlug: "policy-runtime",
+  displayName: "Policy Runtime",
+  description: "Applies approved policy hooks.",
+  contentHash: "hash-1",
+  sourceKind: "github",
+  sourceRepo: "acme/policy-plugins",
+  sourceRef: "main",
+  sourceSha: "abc123",
+  sourceSubdir: null,
+  sourceExclude: [],
+  sourceMarketplaceRepo: "acme/policy-plugins",
+  sourceMarketplacePath: ".claude-plugin/marketplace.json",
+  sourceMarketplacePluginName: "policy-runtime",
+  githubSyncInterval: "1h",
+  githubSyncRef: "main",
+  lastSyncedAt: "2026-08-23T18:00:00.000Z",
+  pendingSourceSha: null,
+  pendingContentHash: null,
+  pendingDetectedAt: null,
+  sourceId: "default-policy-runtime",
+  approvedContentHash: "hash-1",
+  approvedAt: null,
+  approvedBy: null,
+  enabled: true,
+  createdAt: "2026-08-01T12:00:00.000Z",
+  updatedAt: "2026-08-23T18:00:00.000Z",
+  deletedAt: null,
+  teams: [],
+  users: [],
+  fileCount: 13,
+}));
+
+describe("PluginsPage", () => {
+  beforeEach(() => {
+    localStorage.removeItem("archestra-plugins-view");
+    vi.mocked(useRouter).mockReturnValue({
+      push: vi.fn(),
+    } as unknown as ReturnType<typeof useRouter>);
+    vi.mocked(usePathname).mockReturnValue("/plugins");
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams() as ReturnType<typeof useSearchParams>,
+    );
+  });
+
+  it("groups related facts into a compact table", async () => {
+    render(<PluginsPage />);
+
+    for (const name of ["Plugin", "Details", "Actions"]) {
+      expect(screen.getByRole("columnheader", { name })).toBeInTheDocument();
+    }
+    for (const removed of [
+      "Client",
+      "Platforms",
+      "Compatibility",
+      "Source",
+      "Activity",
+    ]) {
+      expect(
+        screen.queryByRole("columnheader", { name: removed }),
+      ).not.toBeInTheDocument();
+    }
+    const pluginRow = screen.getByText("Policy Runtime").closest("tr");
+    expect(pluginRow).not.toHaveTextContent("13 files");
+    await userEvent.hover(
+      screen.getByRole("button", { name: "GitHub source details" }),
+    );
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("13 files");
+    expect(tooltip).toHaveTextContent(/Last updated: Aug 23, 2026/);
+  });
+
+  it("shows source details in cards without navigating when the icon is clicked", async () => {
+    const user = userEvent.setup();
+    const push = vi.fn();
+    vi.mocked(useRouter).mockReturnValue({
+      push,
+    } as unknown as ReturnType<typeof useRouter>);
+    render(<PluginsPage />);
+
+    await user.click(screen.getByRole("button", { name: "View as cards" }));
+    const source = screen.getByRole("button", {
+      name: "GitHub source details",
+    });
+    await user.hover(source);
+
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Synced every hour from GitHub");
+    expect(tooltip).toHaveTextContent("13 files");
+    expect(tooltip).toHaveTextContent(/Last updated: Aug 23, 2026/);
+
+    await user.click(source);
+    expect(push).not.toHaveBeenCalled();
+  });
+
+  it("keeps secondary filters behind More filters until applied", async () => {
+    const user = userEvent.setup();
+    render(<PluginsPage />);
+
+    expect(
+      screen.queryByRole("combobox", { name: "Filter by platform" }),
+    ).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "More filters" }));
+
+    expect(
+      screen.getByRole("combobox", { name: "Filter by platform" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("combobox", { name: "Filter by source" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("combobox", { name: "Filter by repository" }),
+    ).toBeVisible();
+  });
+
+  it("clears the active label filter", async () => {
+    const push = vi.fn();
+    vi.mocked(useRouter).mockReturnValue({
+      push,
+    } as unknown as ReturnType<typeof useRouter>);
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("labels=region%3Anorth") as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+
+    render(<PluginsPage />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Clear" }));
+    expect(push).toHaveBeenCalledWith("/plugins?", { scroll: false });
+  });
+});

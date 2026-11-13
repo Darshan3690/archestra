@@ -1,0 +1,263 @@
+import { ArchestraInternalErrorCode } from "@archestra/shared";
+import {
+  getDatabaseOutageErrorCode,
+  getDbResourceExhaustionErrorCode,
+  getNonDatabaseConnectionTarget,
+  isDbStatementTimeoutError,
+} from "@/database/retry";
+import { extractVaultErrorMessage } from "@/secrets-manager/utils";
+import { ApiError, SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE } from "@/types";
+import { ServerDrainingError } from "@/types/server-draining-error";
+import { incomingRequestAbortTracker } from "@/utils/incoming-request-abort";
+import {
+  collectErrorCodes,
+  isConnectionErrno,
+  isFetchConnectivityError,
+  isTimeoutErrno,
+} from "@/utils/network-errors";
+
+/**
+ * Policy for what backend errors reach error reporting, applied by the Sentry
+ * `beforeSend` filter to every capture path (request errors, unhandled
+ * rejections, direct captures).
+ *
+ * Two kinds of non-bug failure are handled:
+ *
+ *   - Expected client/upstream errors (4xx, upstream 502/504, a user's MCP
+ *     server that is unreachable or not ready, handled empty-completions) are
+ *     dropped — they reflect the request, the caller's config, or an external
+ *     dependency, not a crash of ours, and would only create noise.
+ *   - Availability incidents (transient DB connectivity, a secrets-backend
+ *     outage) are kept but assigned a stable fingerprint so one outage groups
+ *     into a single issue instead of fragmenting per in-flight query/route.
+ */
+interface ErrorTrackingDecision {
+  /** When false, the error is expected noise and is not reported. */
+  report: boolean;
+  /** Stable grouping key for an availability incident (Sentry fingerprint). */
+  fingerprint?: string[];
+  /** Tags describing the grouping, merged into the report. */
+  tags?: Record<string, string>;
+}
+
+export function classifyErrorForTracking(
+  error: unknown,
+): ErrorTrackingDecision {
+  // Only errors observed on an aborted incoming HTTP request are cancellations.
+  // The same socket errno on a database connection must still be reported.
+  if (incomingRequestAbortTracker.isAbortedError(error)) {
+    return { report: false };
+  }
+  // A proxy relay preserves its cause for diagnostics. Its explicit upstream
+  // origin takes precedence over socket codes shared with database errors.
+  if (error instanceof ApiError && error.upstream) return { report: false };
+  // A native HTTP fetch failure, or a connection failure naming a host other
+  // than the database, has a known upstream origin. Its socket errno can also
+  // occur on database connections, so classify it before DB matching.
+  if (isFetchConnectivityError(error) || getNonDatabaseConnectionTarget(error))
+    return { report: false };
+
+  // Availability incidents: report once, grouped by root cause.
+  //
+  // Transient database connectivity failures (DNS lookup, connection refused
+  // during a restart, pool connect timeouts) get wrapped per-query by the ORM,
+  // which otherwise fragments one incident into an issue per SQL statement.
+  // A bare socket errno counts only when the database client raised it.
+  const transientDbErrorCode = getDatabaseOutageErrorCode(error);
+  if (transientDbErrorCode) {
+    return {
+      report: true,
+      fingerprint: ["db-transient", transientDbErrorCode],
+      tags: { error_type: "db_transient", db_error_code: transientDbErrorCode },
+    };
+  }
+
+  // Statement timeouts (PostgreSQL canceling a query that exceeded
+  // statement_timeout) happen under database load or against a slow query
+  // plan, and the ORM wraps each one per-query as "Failed query: <sql>" —
+  // fragmenting one load incident into an issue per SQL statement. They are
+  // deliberately not retried (see isDbStatementTimeoutError), but they should
+  // group into a single issue the same way transient connectivity does.
+  if (isDbStatementTimeoutError(error)) {
+    return {
+      report: true,
+      fingerprint: ["db-statement-timeout"],
+      tags: { error_type: "db_statement_timeout", db_error_code: "57014" },
+    };
+  }
+
+  // Database resource exhaustion (SQLSTATE class 53: disk full, out of
+  // memory, too many connection slots) fails every in-flight query the same
+  // way, and the ORM's per-query "Failed query: <sql>" wrapper otherwise
+  // fragments one capacity incident into a new issue per SQL statement. Like
+  // statement timeouts these are deliberately not retried, but they should
+  // group into a single issue per root cause.
+  const resourceExhaustionCode = getDbResourceExhaustionErrorCode(error);
+  if (resourceExhaustionCode) {
+    return {
+      report: true,
+      fingerprint: ["db-resource-exhaustion", resourceExhaustionCode],
+      tags: {
+        error_type: "db_resource_exhaustion",
+        db_error_code: resourceExhaustionCode,
+      },
+    };
+  }
+
+  // A secrets-backend (e.g. Vault) outage fails every route that reads secrets,
+  // fragmenting one incident into an issue per endpoint and upstream message.
+  // The user-facing message is deliberately generic, so surface the backend's
+  // actual response (status code + error strings, never secret material) from
+  // the chained cause — otherwise the captured issue is undiagnosable.
+  if (
+    error instanceof ApiError &&
+    error.internalCode === SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE
+  ) {
+    return {
+      report: true,
+      fingerprint: [SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE],
+      tags: {
+        error_type: SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
+        // Truncate explicitly: Vault error strings are unbounded, and
+        // exception sinks silently clip over-long tag values.
+        ...(error.cause !== undefined && {
+          secrets_backend_error: extractVaultErrorMessage(error.cause).slice(
+            0,
+            200,
+          ),
+        }),
+      },
+    };
+  }
+
+  // Chat's own MCP gateway being unreachable (pod churn, a missing gateway
+  // token) fails every conversation the same way — an availability incident
+  // of our deployment, kept but grouped into a single issue. The internal
+  // code is set by McpToolsUnavailableError (clients/chat-mcp-client.ts);
+  // matched by string so this layer doesn't import the client module.
+  if (
+    error instanceof ApiError &&
+    error.internalCode === "mcp_tools_unavailable"
+  ) {
+    return {
+      report: true,
+      fingerprint: ["mcp_tools_unavailable"],
+      tags: { error_type: "mcp_tools_unavailable" },
+    };
+  }
+
+  if (isNonActionableError(error)) {
+    return { report: false };
+  }
+
+  return { report: true };
+}
+
+// === Internal helpers ===
+
+/**
+ * Error `name`s for a user's MCP server being unreachable or not yet running —
+ * an operational/config condition on the caller's side, not a bug of ours.
+ * Matched by name to avoid importing the client error classes into the
+ * observability layer.
+ */
+const MCP_UNREACHABLE_ERROR_NAMES = new Set([
+  "McpServerNotReadyError",
+  "McpServerConnectionTimeoutError",
+  "McpServerUnreachableError",
+  "McpServerDeploymentFailedError",
+  "McpServerReadinessTimeoutError",
+]);
+
+function isNonActionableError(error: unknown): boolean {
+  if (error instanceof ServerDrainingError) return true;
+  if (error instanceof Error && MCP_UNREACHABLE_ERROR_NAMES.has(error.name)) {
+    return true;
+  }
+
+  // The same deployment failures matched by message shape: several report
+  // paths re-wrap the runtime's error (or persist and re-surface its message),
+  // which loses the error name the set above matches on. The message prefix
+  // is stable — every McpServerDeploymentFailedError is built as
+  // "Deployment <name> failed: <reason>" (k8s-deployment.ts) — and describes
+  // the state of the user's container, not a crash of ours.
+  if (error instanceof Error && /^Deployment .+ failed: /.test(error.message)) {
+    return true;
+  }
+
+  // Low-level connectivity failures that reach the handler unmapped: an
+  // undici connect/headers/body timeout or a dropped connection from an
+  // outbound fetch, or @fastify/reply-from's upstream-failure errors
+  // (502/503/504) from the provider passthrough routes. The other end — an
+  // LLM provider, a user-configured server — was unreachable; a network
+  // condition, not a bug of ours. Database connectivity never lands here:
+  // classifyErrorForTracking classifies it first (kept and grouped).
+  if (isUpstreamConnectivityError(error)) {
+    return true;
+  }
+
+  if (error instanceof ApiError) {
+    // 4xx client errors (not found, validation, upstream client errors).
+    if (error.statusCode >= 400 && error.statusCode < 500) return true;
+    // Relayed upstream provider failures (marked at the LLM proxy's error
+    // boundary): the provider's own 5xx, not a crash of ours.
+    if (error.upstream) return true;
+    // Handled transient upstream conditions.
+    if (
+      error.internalCode === ArchestraInternalErrorCode.UpstreamEmptyResponse ||
+      error.internalCode === ArchestraInternalErrorCode.ProviderOverloaded
+    ) {
+      return true;
+    }
+    // Upstream gateway failures and Anthropic overloads.
+    if (
+      error.statusCode === 502 ||
+      error.statusCode === 504 ||
+      error.statusCode === 529
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  // Generic errors carrying a 4xx HTTP status (Fastify typed errors, or an
+  // upstream provider CLIENT error built with an attached statusCode) are
+  // expected client errors. Unlike ApiError, a generic 5xx is left to report:
+  // a provider's own 5xx (surfaced via the raw-provider-error path) is a
+  // diagnostic signal, not one of our upstream-gateway mappings.
+  if (
+    error &&
+    typeof error === "object" &&
+    "statusCode" in error &&
+    typeof (error as { statusCode?: unknown }).statusCode === "number"
+  ) {
+    const statusCode = (error as { statusCode: number }).statusCode;
+    if (statusCode >= 400 && statusCode < 500) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Whether the error (or its cause chain) is a low-level connectivity failure
+ * to an outbound dependency: a libuv/undici network errno, or one of
+ * @fastify/reply-from's upstream-failure errors (`FST_REPLY_FROM_*` with a
+ * 502/503/504 status) raised when a passthrough proxy cannot reach its
+ * upstream.
+ */
+function isUpstreamConnectivityError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+
+  const codes = collectErrorCodes(error);
+  if (codes.some((code) => isConnectionErrno(code) || isTimeoutErrno(code))) {
+    return true;
+  }
+
+  const statusCode = (error as { statusCode?: unknown }).statusCode;
+  return (
+    codes.some((code) => code.startsWith("FST_REPLY_FROM_")) &&
+    typeof statusCode === "number" &&
+    statusCode >= 502 &&
+    statusCode <= 504
+  );
+}

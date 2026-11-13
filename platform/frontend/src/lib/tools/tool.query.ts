@@ -1,7 +1,12 @@
-import { archestraApiSdk, type archestraApiTypes } from "@shared";
+import {
+  archestraApiSdk,
+  type archestraApiTypes,
+  type ClientFilter,
+} from "@archestra/shared";
 import { useQuery } from "@tanstack/react-query";
+import { throwOnApiError } from "@/lib/utils/api";
 
-const { getTools, getToolsWithAssignments } = archestraApiSdk;
+const { getToolsWithAssignments } = archestraApiSdk;
 
 type GetToolsWithAssignmentsQueryParams = NonNullable<
   archestraApiTypes.GetToolsWithAssignmentsData["query"]
@@ -11,24 +16,12 @@ type GetToolsWithAssignmentsQueryParams = NonNullable<
 export type ToolWithAssignmentsData =
   archestraApiTypes.GetToolsWithAssignmentsResponses["200"]["data"][number];
 
-/** Non-suspense version for use in dialogs/portals */
-export function useTools({
-  initialData,
-}: {
-  initialData?: archestraApiTypes.GetToolsResponses["200"];
-}) {
-  return useQuery({
-    queryKey: ["tools"],
-    queryFn: async () => (await getTools()).data ?? null,
-    initialData,
-  });
-}
-
 export function useToolsWithAssignments({
   initialData,
   pagination,
   sorting,
   filters,
+  enabled = true,
 }: {
   initialData?: archestraApiTypes.GetToolsWithAssignmentsResponses["200"];
   pagination?: {
@@ -44,8 +37,12 @@ export function useToolsWithAssignments({
   filters?: {
     search?: string;
     origin?: string;
+    observedByUserId?: string;
+    observedByClient?: ClientFilter;
     excludeArchestraTools?: boolean;
+    includeKnowledgeSourcesTool?: boolean;
   };
+  enabled?: boolean;
 }) {
   return useQuery({
     queryKey: [
@@ -57,7 +54,10 @@ export function useToolsWithAssignments({
         sortDirection: sorting?.sortDirection,
         search: filters?.search,
         origin: filters?.origin,
+        observedByUserId: filters?.observedByUserId,
+        observedByClient: filters?.observedByClient,
         excludeArchestraTools: filters?.excludeArchestraTools,
+        includeKnowledgeSourcesTool: filters?.includeKnowledgeSourcesTool,
       },
     ],
     queryFn: async () => {
@@ -69,9 +69,13 @@ export function useToolsWithAssignments({
           sortDirection: sorting?.sortDirection,
           search: filters?.search,
           origin: filters?.origin,
+          observedByUserId: filters?.observedByUserId,
+          observedByClient: filters?.observedByClient,
           excludeArchestraTools: filters?.excludeArchestraTools,
+          includeKnowledgeSourcesTool: filters?.includeKnowledgeSourcesTool,
         },
       });
+      throwOnApiError(result.error, { toastOnError: false });
       return (
         result.data ?? {
           data: [],
@@ -87,5 +91,6 @@ export function useToolsWithAssignments({
       );
     },
     initialData,
+    enabled,
   });
 }

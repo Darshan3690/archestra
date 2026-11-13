@@ -14,7 +14,7 @@ local_resource(
   serve_env={
     'DANGEROUSLY_OMIT_AUTH': 'true'
   },
-  serve_cmd='npx @modelcontextprotocol/inspector --transport http --server-url http://localhost:9000/v1/mcp',
+  serve_cmd='NODE_OPTIONS=--use-system-ca npx @modelcontextprotocol/inspector --transport http',
   labels=['integrations'],
   trigger_mode=TRIGGER_MODE_MANUAL,
   auto_init=False,
@@ -91,7 +91,9 @@ if os.name != 'nt':
       'frontend',
       'shared',
       'docker-banner.sh',
-      'prev-static-assets',
+      'docker/prev-static-assets',
+      # The Dockerfile's archestra-cli-release stage reads this file.
+      'archestra-cli/release.lock.json',
     ],
     ignore=[
       '**/node_modules',

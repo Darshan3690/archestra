@@ -1,10 +1,26 @@
+import fs from "node:fs";
+import path from "node:path";
+import { BUILT_IN_AGENT_IDS, ChatErrorCode } from "@archestra/shared";
+import { eq, sql } from "drizzle-orm";
+import client from "prom-client";
+import db, { schema } from "@/database";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import ActiveChatRunModel from "@/models/chat-active-run";
 import ConversationModel from "@/models/conversation";
+import ConversationAttachmentModel from "@/models/conversation-attachment";
+import ConversationChatErrorModel from "@/models/conversation-chat-error";
+import LlmProviderApiKeyModelLinkModel from "@/models/llm-provider-api-key-model";
 import MessageModel from "@/models/message";
+import ModelModel from "@/models/model";
 import ScheduleTriggerRunModel from "@/models/schedule-trigger-run";
-import type { FastifyInstanceWithZod } from "@/server";
-import { createFastifyInstance } from "@/server";
+import { initializeChatMetrics } from "@/observability/metrics/chat";
+import { projectService } from "@/services/project";
 import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import { shareForTest } from "@/test/sharing";
+import { grantRoleEverywhere } from "@/test/wildcard-grants";
 import type { User } from "@/types";
+import { uuidv7 } from "@/utils/uuid";
 
 describe("chat conversation and message routes", () => {
   let app: FastifyInstanceWithZod;
@@ -35,13 +51,185 @@ describe("chat conversation and message routes", () => {
     await app.close();
   });
 
+  test("a tail read returns the last messages of the full read and the count of the earlier ones", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ organizationId, authorId: currentUser.id });
+    const conversation = await ConversationModel.create({
+      organizationId,
+      userId: currentUser.id,
+      agentId: agent.id,
+    });
+    // Two messages share a timestamp, so the order also rests on the id.
+    const start = Date.parse("2026-01-01T00:00:00Z");
+    await MessageModel.bulkCreate(
+      Array.from({ length: 12 }, (_, index) => {
+        const id = uuidv7();
+        const role = index % 2 === 0 ? "user" : "assistant";
+        return {
+          id,
+          conversationId: conversation.id,
+          role,
+          content: {
+            id,
+            role,
+            parts: [{ type: "text", text: `turn ${index}` }],
+          },
+          createdAt: new Date(start + Math.min(index, 10) * 1000),
+        };
+      }),
+    );
+
+    const read = async (query = "") => {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/chat/conversations/${conversation.id}${query}`,
+      });
+      expect(response.statusCode).toBe(200);
+      return response.json();
+    };
+    const full = await read();
+    const tail = await read("?tail=5");
+
+    expect(full.messages).toHaveLength(12);
+    expect(full.olderMessageCount).toBeUndefined();
+    expect(tail.messages).toEqual(full.messages.slice(-5));
+    expect(tail.olderMessageCount).toBe(7);
+    const { messages: _full, ...fullRest } = full;
+    const { messages: _tail, olderMessageCount: _count, ...tailRest } = tail;
+    expect(tailRest).toEqual(fullRest);
+    expect((await read("?tail=50")).olderMessageCount).toBe(0);
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/chat/conversations/${conversation.id}?tail=0`,
+        })
+      ).statusCode,
+    ).toBe(400);
+  });
+
+  test("upgrading policy chats keeps ordinary and former policy chats readable", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ organizationId, authorId: currentUser.id });
+    const normal = await ConversationModel.create({
+      organizationId,
+      userId: currentUser.id,
+      agentId: agent.id,
+    });
+    const policy = await ConversationModel.create({
+      organizationId,
+      userId: currentUser.id,
+      agentId: agent.id,
+    });
+    const trashed = await ConversationModel.create({
+      organizationId,
+      userId: currentUser.id,
+      agentId: agent.id,
+    });
+    await db.execute(
+      sql`UPDATE conversations SET origin = 'openappa' WHERE id IN (${policy.id}, ${trashed.id})`,
+    );
+    await db
+      .update(schema.conversationsTable)
+      .set({ deletedAt: new Date() })
+      .where(eq(schema.conversationsTable.id, trashed.id));
+    const migration = fs.readFileSync(
+      path.join(
+        __dirname,
+        "../../database/migrations/0492_normalize-openappa-chat-origin.sql",
+      ),
+      "utf8",
+    );
+    await db.execute(sql.raw(migration));
+    await db.execute(sql.raw(migration));
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/chat/conversations",
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: normal.id, origin: "user" }),
+        expect.objectContaining({ id: policy.id, origin: "user" }),
+      ]),
+    );
+    const [deleted] = await db
+      .select()
+      .from(schema.conversationsTable)
+      .where(eq(schema.conversationsTable.id, trashed.id));
+    expect(deleted.origin).toBe("user");
+    expect(deleted.deletedAt).not.toBeNull();
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${policy.id}`,
+    });
+    expect(detail.statusCode).toBe(200);
+  });
+
+  test("lists scheduled chats with their own run context and leaves normal chats unchanged", async ({
+    makeAgent,
+    makeScheduleTrigger,
+    makeScheduleTriggerRun,
+  }) => {
+    const agent = await makeAgent({ organizationId, authorId: currentUser.id });
+    const trigger = await makeScheduleTrigger({
+      organizationId,
+      actorUserId: currentUser.id,
+      agentId: agent.id,
+    });
+    const normal = await ConversationModel.create({
+      organizationId,
+      userId: currentUser.id,
+      agentId: agent.id,
+    });
+    const expected = [
+      expect.objectContaining({ id: normal.id, scheduledRun: null }),
+    ];
+    for (const runKind of ["manual", "due"] as const) {
+      const run = await makeScheduleTriggerRun(trigger.id, {
+        organizationId,
+        runKind,
+      });
+      const conversation = await ConversationModel.create({
+        organizationId,
+        userId: currentUser.id,
+        agentId: agent.id,
+        origin: "schedule_trigger",
+      });
+      await ScheduleTriggerRunModel.setChatConversationId(
+        run.id,
+        conversation.id,
+      );
+      expected.push(
+        expect.objectContaining({
+          id: conversation.id,
+          scheduledRun: {
+            id: run.id,
+            triggerId: trigger.id,
+            runKind,
+            createdAt: run.createdAt.toISOString(),
+            scheduleName: trigger.name,
+          },
+        }),
+      );
+    }
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/chat/conversations",
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(expect.arrayContaining(expected));
+  });
+
   test("creates a conversation for an accessible agent", async ({
     makeAgent,
   }) => {
     const agent = await makeAgent({
       organizationId,
       authorId: currentUser.id,
-      scope: "personal",
+      access: "personal",
     });
 
     const response = await app.inject({
@@ -49,8 +237,6 @@ describe("chat conversation and message routes", () => {
       url: "/api/chat/conversations",
       payload: {
         agentId: agent.id,
-        selectedModel: "gpt-4o",
-        selectedProvider: "openai",
       },
     });
 
@@ -58,24 +244,271 @@ describe("chat conversation and message routes", () => {
     expect(response.json()).toMatchObject({
       id: expect.any(String),
       agentId: agent.id,
-      selectedModel: "gpt-4o",
-      selectedProvider: "openai",
       pinnedAt: null,
     });
+  });
+
+  test("creates and manages a policy assistant conversation like any other chat", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      agentType: "agent",
+      builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG },
+      name: "Policy assistant",
+      systemPrompt: "Help configure OpenAPPA policy.",
+    });
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/chat/conversations",
+      payload: {
+        agentId: agent.id,
+        title: "Policy review",
+        thinkingEffort: "low",
+      },
+    });
+    expect(created.statusCode).toBe(200);
+    expect(created.json()).toMatchObject({
+      origin: "user",
+      agentId: agent.id,
+      title: "Policy review",
+      thinkingEffort: "low",
+    });
+    const id = created.json().id;
+    const pinnedAt = new Date().toISOString();
+    const updated = await app.inject({
+      method: "PATCH",
+      url: `/api/chat/conversations/${id}`,
+      payload: { title: "Reviewed policy", pinnedAt, thinkingEffort: "high" },
+    });
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json()).toMatchObject({
+      title: "Reviewed policy",
+      pinnedAt,
+      thinkingEffort: "high",
+    });
+    const fork = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${id}/fork`,
+      payload: { agentId: agent.id },
+    });
+    expect(fork.statusCode).toBe(200);
+    expect(fork.json()).toMatchObject({ agentId: agent.id, origin: "user" });
+    expect(fork.json().id).not.toBe(id);
+  });
+
+  test("uses the agent model unless the conversation picks one, for a policy assistant", async ({
+    makeAgent,
+    makeLlmProviderApiKey,
+    makeSecret,
+  }) => {
+    const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+    const key = await makeLlmProviderApiKey(organizationId, secret.id, {
+      provider: "openai",
+    });
+    const models = await Promise.all(
+      ["agent", "explicit"].map((name) =>
+        ModelModel.create({
+          externalId: `openai/policy-chat-${name}`,
+          provider: "openai",
+          modelId: `policy-chat-${name}`,
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+          supportsToolCalling: true,
+          lastSyncedAt: new Date(),
+        }),
+      ),
+    );
+    const [agentModel, explicitModel] = models;
+    await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(
+      key.id,
+      models.map((model) => model.id),
+    );
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      name: "Policy assistant",
+      builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG },
+      modelId: agentModel.id,
+      llmApiKeyId: key.id,
+    });
+    for (const explicit of [false, true]) {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/chat/conversations",
+        payload: {
+          agentId: agent.id,
+          ...(explicit
+            ? { modelId: explicitModel.id, chatApiKeyId: key.id }
+            : {}),
+        },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        agentId: agent.id,
+        modelId: explicit ? explicitModel.id : agentModel.id,
+        chatApiKeyId: key.id,
+      });
+    }
+  });
+
+  test("a light list leaves out the artifact and todo list, which the detail read keeps", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ organizationId, authorId: currentUser.id });
+    const conversation = await ConversationModel.create({
+      organizationId,
+      userId: currentUser.id,
+      agentId: agent.id,
+      title: "Has an artifact",
+    });
+    await ConversationModel.update(
+      conversation.id,
+      currentUser.id,
+      organizationId,
+      {
+        artifact: "# A long artifact".repeat(100),
+      },
+    );
+    await db
+      .update(schema.conversationsTable)
+      .set({ todoList: [{ id: 1, content: "step", status: "pending" }] })
+      .where(eq(schema.conversationsTable.id, conversation.id));
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/chat/conversations?includeArtifacts=false",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const [row] = response.json();
+    expect(row).toMatchObject({
+      id: conversation.id,
+      title: "Has an artifact",
+      artifact: null,
+      todoList: null,
+    });
+
+    // The single-conversation read still carries both.
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+    expect(detail.json().artifact).toContain("# A long artifact");
+    expect(detail.json().todoList).toHaveLength(1);
+  });
+
+  test("limits the list to the newest conversations but always keeps pinned ones", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ organizationId, authorId: currentUser.id });
+    const ids: string[] = [];
+    for (let index = 0; index < 4; index++) {
+      const conversation = await ConversationModel.create({
+        organizationId,
+        userId: currentUser.id,
+        agentId: agent.id,
+        title: `Chat ${index}`,
+      });
+      ids.push(conversation.id);
+      // Spread recency explicitly; creation order alone can tie.
+      await db
+        .update(schema.conversationsTable)
+        .set({ lastMessageAt: new Date(Date.UTC(2026, 0, 1 + index)) })
+        .where(eq(schema.conversationsTable.id, conversation.id));
+    }
+    // The oldest chat is pinned.
+    await db
+      .update(schema.conversationsTable)
+      .set({ pinnedAt: new Date() })
+      .where(eq(schema.conversationsTable.id, ids[0]));
+
+    const limited = await app.inject({
+      method: "GET",
+      url: "/api/chat/conversations?limit=2",
+    });
+    expect(limited.statusCode).toBe(200);
+    expect(limited.json().map((c: { id: string }) => c.id)).toEqual([
+      ids[3],
+      ids[2],
+      ids[0],
+    ]);
+
+    const tooMany = await app.inject({
+      method: "GET",
+      url: "/api/chat/conversations?limit=251",
+    });
+    expect(tooMany.statusCode).toBe(400);
+
+    const byDefault = await app.inject({
+      method: "GET",
+      url: "/api/chat/conversations",
+    });
+    expect(byDefault.json()).toHaveLength(4);
+  });
+
+  test("hides an app-opened chat from the list until the user writes into it", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    // What opening an app seeds (services/apps/app-chat-conversation.ts): an
+    // `app_open` conversation whose only message is the assistant render.
+    const draft = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+      title: "Archestra PM",
+      origin: "app_open",
+    });
+    await MessageModel.create({
+      conversationId: draft.id,
+      role: "assistant",
+      content: { id: uuidv7(), role: "assistant", parts: [] },
+    });
+
+    const listIds = async (search?: string) => {
+      const res = await app.inject({
+        method: "GET",
+        url: search
+          ? `/api/chat/conversations?search=${encodeURIComponent(search)}`
+          : "/api/chat/conversations",
+      });
+      expect(res.statusCode).toBe(200);
+      return (res.json() as Array<{ id: string }>).map((c) => c.id);
+    };
+
+    // Only viewed, never written into → not a saved chat: absent from the
+    // sidebar list and from search (its title would otherwise match).
+    expect(await listIds()).not.toContain(draft.id);
+    expect(await listIds("Archestra PM")).not.toContain(draft.id);
+
+    // The first user-written message is the "keep it" signal.
+    await MessageModel.create({
+      conversationId: draft.id,
+      role: "user",
+      content: {
+        id: uuidv7(),
+        role: "user",
+        parts: [{ type: "text", text: "add a ticket" }],
+      },
+    });
+    expect(await listIds()).toContain(draft.id);
   });
 
   test("pins and unpins a conversation", async ({ makeAgent }) => {
     const agent = await makeAgent({
       organizationId,
       authorId: currentUser.id,
-      scope: "personal",
+      access: "personal",
     });
     const conversation = await ConversationModel.create({
       userId: currentUser.id,
       organizationId,
       agentId: agent.id,
-      selectedModel: "gpt-4o",
-      selectedProvider: "openai",
     });
 
     const pinnedAt = new Date().toISOString();
@@ -106,6 +539,339 @@ describe("chat conversation and message routes", () => {
     expect(unpinResponse.json().pinnedAt).toBeNull();
   });
 
+  test("lists conversations without their artifacts when asked", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+      title: "Budget review",
+    });
+    const todoList = [
+      { id: 1, content: "Check the totals", status: "pending" as const },
+    ];
+    await db
+      .update(schema.conversationsTable)
+      .set({ artifact: "# Budget\n\nNumbers.", todoList })
+      .where(eq(schema.conversationsTable.id, conversation.id));
+    await MessageModel.create({
+      conversationId: conversation.id,
+      role: "user",
+      content: {
+        role: "user",
+        parts: [{ type: "text", text: "Summarize the budget" }],
+      },
+    });
+
+    const list = async (query: string) => {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/chat/conversations${query}`,
+      });
+      expect(response.statusCode).toBe(200);
+      return response
+        .json()
+        .find((c: { id: string }) => c.id === conversation.id);
+    };
+
+    // API clients keep the full rows by default.
+    expect(await list("")).toMatchObject({
+      artifact: "# Budget\n\nNumbers.",
+      todoList,
+    });
+    expect(await list("?includeArtifacts=false")).toMatchObject({
+      title: "Budget review",
+      artifact: null,
+      todoList: null,
+    });
+    const searchRow = await list("?search=budget&includeArtifacts=false");
+    expect(searchRow).toMatchObject({
+      title: "Budget review",
+      artifact: null,
+      todoList: null,
+    });
+    expect(searchRow.messages).toHaveLength(1);
+  });
+
+  test("moves a conversation into a project and removes it again", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+    });
+    const project = await projectService.create({
+      organizationId,
+      userId: currentUser.id,
+      name: "Research workspace",
+      description: null,
+    });
+
+    const moveResponse = await app.inject({
+      method: "PATCH",
+      url: `/api/chat/conversations/${conversation.id}`,
+      payload: { projectId: project.id },
+    });
+
+    expect(moveResponse.statusCode).toBe(200);
+    expect(moveResponse.json().projectId).toBe(project.id);
+    expect(
+      (
+        await ConversationModel.findById({
+          id: conversation.id,
+          userId: currentUser.id,
+          organizationId,
+        })
+      )?.projectId,
+    ).toBe(project.id);
+
+    const removeResponse = await app.inject({
+      method: "PATCH",
+      url: `/api/chat/conversations/${conversation.id}`,
+      payload: { projectId: null },
+    });
+
+    expect(removeResponse.statusCode).toBe(200);
+    expect(removeResponse.json().projectId).toBeNull();
+  });
+
+  test("does not move a conversation into an inaccessible project", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    // The admin role holds Full on every project, so act as a plain member.
+    currentUser = await makeUser();
+    await makeMember(currentUser.id, organizationId, { role: "member" });
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+    });
+    const otherUser = await makeUser();
+    await makeMember(otherUser.id, organizationId, { role: "member" });
+    const otherProject = await projectService.create({
+      organizationId,
+      userId: otherUser.id,
+      name: "Private workspace",
+      description: null,
+    });
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: `/api/chat/conversations/${conversation.id}`,
+      payload: { projectId: otherProject.id },
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json().error.message).toBe("Project not found");
+    expect(
+      (
+        await ConversationModel.findById({
+          id: conversation.id,
+          userId: currentUser.id,
+          organizationId,
+        })
+      )?.projectId,
+    ).toBeNull();
+  });
+
+  test("persists a thinking effort and rejects an unknown one", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+    });
+
+    // The model's own default, so shipping this changes nothing for anyone
+    // who never opens the
+    // control. No level could stand in for it — model defaults disagree, and
+    // some of them are not reasoning levels at all.
+    expect(conversation.thinkingEffort).toBeNull();
+
+    const updateResponse = await app.inject({
+      method: "PATCH",
+      url: `/api/chat/conversations/${conversation.id}`,
+      payload: { thinkingEffort: "high" },
+    });
+
+    expect(updateResponse.statusCode).toBe(200);
+    expect(updateResponse.json().thinkingEffort).toBe("high");
+
+    const getResponse = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+
+    expect(getResponse.statusCode).toBe(200);
+    expect(getResponse.json().thinkingEffort).toBe("high");
+
+    // The retired two-option name must not be accepted either.
+    const invalidResponse = await app.inject({
+      method: "PATCH",
+      url: `/api/chat/conversations/${conversation.id}`,
+      payload: { thinkingEffort: "flash" },
+    });
+
+    expect(invalidResponse.statusCode).toBe(400);
+
+    // A rejected payload must not have moved the stored value.
+    const afterInvalid = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+    expect(afterInvalid.json().thinkingEffort).toBe("high");
+  });
+
+  test("returns a conversation to the model's own default", async ({
+    makeAgent,
+  }) => {
+    // Null has to survive as a value rather than being read as "field omitted",
+    // or a user could set a depth and never get back to the model's own.
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+      thinkingEffort: "high",
+    });
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: `/api/chat/conversations/${conversation.id}`,
+      payload: { thinkingEffort: null },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().thinkingEffort).toBeNull();
+
+    const getResponse = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+    expect(getResponse.json().thinkingEffort).toBeNull();
+  });
+
+  test("a new conversation keeps the thinking effort chosen before it existed", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat/conversations",
+      payload: { agentId: agent.id, thinkingEffort: "high" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().thinkingEffort).toBe("high");
+  });
+
+  test("marking a conversation read clears its unread flag in the list", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+    });
+    await MessageModel.create({
+      conversationId: conversation.id,
+      role: "assistant",
+      content: { role: "assistant", parts: [{ type: "text", text: "hi" }] },
+    });
+
+    const before = await app.inject({
+      method: "GET",
+      url: "/api/chat/conversations",
+    });
+    expect(before.json()[0].unread).toBe(true);
+    // The owner's private read marker must never reach the client (a shared
+    // viewer would otherwise see when the owner last read the chat).
+    expect(before.json()[0]).not.toHaveProperty("lastReadAt");
+
+    const readResponse = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${conversation.id}/read`,
+    });
+    expect(readResponse.statusCode).toBe(200);
+    expect(readResponse.json()).toEqual({ success: true });
+
+    const after = await app.inject({
+      method: "GET",
+      url: "/api/chat/conversations",
+    });
+    expect(after.json()[0].unread).toBe(false);
+  });
+
+  test("marking an unknown conversation read returns 404", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat/conversations/00000000-0000-4000-8000-000000000000/read",
+    });
+    expect(response.statusCode).toBe(404);
+  });
+
+  test("rejects a conversation update that sets a model without an API key", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+    });
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: `/api/chat/conversations/${conversation.id}`,
+      payload: { modelId: crypto.randomUUID() },
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
   test("allows scheduled task admins to view linked run conversations owned by another user", async ({
     makeAgent,
     makeMember,
@@ -118,7 +884,6 @@ describe("chat conversation and message routes", () => {
     const agent = await makeAgent({
       organizationId,
       authorId: owner.id,
-      scope: "org",
     });
     const trigger = await makeScheduleTrigger({
       organizationId,
@@ -133,8 +898,6 @@ describe("chat conversation and message routes", () => {
       userId: owner.id,
       organizationId,
       agentId: agent.id,
-      selectedModel: "gpt-4o",
-      selectedProvider: "openai",
     });
     await MessageModel.create({
       conversationId: conversation.id,
@@ -168,6 +931,38 @@ describe("chat conversation and message routes", () => {
     });
   });
 
+  test("keeps the project link when forking own conversation in a project", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const project = await projectService.create({
+      organizationId,
+      userId: currentUser.id,
+      name: "own-project",
+      description: null,
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+      projectId: project.id,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${conversation.id}/fork`,
+      payload: { agentId: agent.id },
+    });
+
+    expect(response.statusCode).toBe(200);
+    // The owner can always access their own project, so the fork stays in it.
+    expect(response.json().projectId).toBe(project.id);
+  });
+
   test("forks an accessible scheduled run conversation for the current user", async ({
     makeAgent,
     makeMember,
@@ -180,7 +975,6 @@ describe("chat conversation and message routes", () => {
     const agent = await makeAgent({
       organizationId,
       authorId: owner.id,
-      scope: "org",
     });
     const trigger = await makeScheduleTrigger({
       organizationId,
@@ -195,8 +989,6 @@ describe("chat conversation and message routes", () => {
       userId: owner.id,
       organizationId,
       agentId: agent.id,
-      selectedModel: "gpt-4o",
-      selectedProvider: "openai",
     });
     await MessageModel.create({
       conversationId: conversation.id,
@@ -223,8 +1015,6 @@ describe("chat conversation and message routes", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
       agentId: agent.id,
-      selectedModel: "gpt-4o",
-      selectedProvider: "openai",
       userId: currentUser.id,
       messages: [
         expect.objectContaining({
@@ -249,7 +1039,6 @@ describe("chat conversation and message routes", () => {
     const agent = await makeAgent({
       organizationId,
       authorId: owner.id,
-      scope: "org",
     });
     const trigger = await makeScheduleTrigger({
       organizationId,
@@ -264,8 +1053,6 @@ describe("chat conversation and message routes", () => {
       userId: owner.id,
       organizationId,
       agentId: agent.id,
-      selectedModel: "gpt-4o",
-      selectedProvider: "openai",
     });
     await ScheduleTriggerRunModel.setChatConversationId(
       run.id,
@@ -286,13 +1073,191 @@ describe("chat conversation and message routes", () => {
     expect(response.json().error.message).toContain("Conversation not found");
   });
 
+  test("forking a conversation with an attachment clones the row scoped to the fork and rewrites the ref", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const source = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+    });
+    const bytes = Buffer.from("integration-test-bytes", "utf8");
+    const sourceRow = await ConversationAttachmentModel.create({
+      organizationId,
+      conversationId: source.id,
+      uploadedByUserId: currentUser.id,
+      originalName: "doc.pdf",
+      mimeType: "application/pdf",
+      fileSize: bytes.byteLength,
+      contentHash: ConversationAttachmentModel.computeContentHash(bytes),
+      fileData: bytes,
+    });
+    await ConversationAttachmentModel.updateTextPreview(
+      sourceRow.id,
+      "ok",
+      "INTEGRATION_PREVIEW",
+    );
+    await MessageModel.create({
+      conversationId: source.id,
+      role: "user",
+      content: {
+        id: "message-1",
+        role: "user",
+        parts: [
+          { type: "text", text: "look at this" },
+          {
+            type: "file",
+            url: `/api/chat/attachments/${sourceRow.id}/content`,
+            mediaType: "application/pdf",
+            filename: "doc.pdf",
+            fileSize: bytes.byteLength,
+          },
+        ],
+      },
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${source.id}/fork`,
+      payload: { agentId: agent.id },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const forkBody = response.json();
+    expect(forkBody.userId).toBe(currentUser.id);
+    expect(forkBody.id).not.toBe(source.id);
+
+    // Locate the file part on the forked message; assert it points at a NEW
+    // ref id, not the source attachment's id.
+    const forkedFilePart = forkBody.messages[0].parts.find(
+      (p: { type: string }) => p.type === "file",
+    );
+    expect(forkedFilePart).toBeDefined();
+    expect(forkedFilePart.url).not.toBe(
+      `/api/chat/attachments/${sourceRow.id}/content`,
+    );
+    const newIdMatch = (forkedFilePart.url as string).match(
+      /\/api\/chat\/attachments\/([^/]+)\/content/,
+    );
+    expect(newIdMatch).not.toBeNull();
+    const newId = newIdMatch?.[1] as string;
+    expect(newId).not.toBe(sourceRow.id);
+
+    // The cloned row is scoped to the FORK conversation with identical bytes.
+    const clonedRow = await ConversationAttachmentModel.findByIdWithData(newId);
+    expect(clonedRow).not.toBeNull();
+    expect(clonedRow?.conversationId).toBe(forkBody.id);
+    expect(clonedRow?.organizationId).toBe(organizationId);
+    expect(clonedRow?.uploadedByUserId).toBe(currentUser.id);
+    expect(clonedRow?.contentHash).toBe(sourceRow.contentHash);
+    expect(clonedRow?.fileData.equals(bytes)).toBe(true);
+    expect(clonedRow?.textPreview).toBe("INTEGRATION_PREVIEW");
+
+    // Source attachment is untouched — fork is a copy, not a move.
+    const stillSource = await ConversationAttachmentModel.findByIdWithData(
+      sourceRow.id,
+    );
+    expect(stillSource?.conversationId).toBe(source.id);
+  });
+
+  test("forking a conversation with a crafted cross-conv ref does NOT clone the foreign row (IDOR guard)", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const source = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+    });
+    // A different user with a private conversation in the same org.
+    const otherUser = await makeUser();
+    await makeMember(otherUser.id, organizationId, { role: "member" });
+    const foreignAgent = await makeAgent({
+      organizationId,
+      authorId: otherUser.id,
+      access: "personal",
+    });
+    const foreign = await ConversationModel.create({
+      userId: otherUser.id,
+      organizationId,
+      agentId: foreignAgent.id,
+    });
+    const secretBytes = Buffer.from("FOREIGN_SECRET", "utf8");
+    const foreignRow = await ConversationAttachmentModel.create({
+      organizationId,
+      conversationId: foreign.id,
+      uploadedByUserId: otherUser.id,
+      originalName: "secret.bin",
+      mimeType: "application/octet-stream",
+      fileSize: secretBytes.byteLength,
+      contentHash: ConversationAttachmentModel.computeContentHash(secretBytes),
+      fileData: secretBytes,
+    });
+
+    // Attacker persists a crafted ref to the foreign row inside their own
+    // conversation. In production this is reachable: extractInlineAttachments
+    // only rewrites `data:` URLs, leaving other urls intact.
+    await MessageModel.create({
+      conversationId: source.id,
+      role: "user",
+      content: {
+        id: "crafted-1",
+        role: "user",
+        parts: [
+          {
+            type: "file",
+            url: `/api/chat/attachments/${foreignRow.id}/content`,
+            mediaType: "application/octet-stream",
+            filename: "crafted.bin",
+          },
+        ],
+      },
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${source.id}/fork`,
+      payload: { agentId: agent.id },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const forkBody = response.json();
+    const forkedFilePart = forkBody.messages[0].parts.find(
+      (p: { type: string }) => p.type === "file",
+    );
+    // The crafted ref is preserved as-is (not rewritten) — the fork has no
+    // own clone of the foreign bytes, so materialize will silently drop it.
+    expect(forkedFilePart.url).toBe(
+      `/api/chat/attachments/${foreignRow.id}/content`,
+    );
+
+    // No attachment row exists scoped to the fork (the foreign bytes did NOT
+    // get copied across the conversation boundary).
+    const forkAttachments =
+      await ConversationAttachmentModel.findByConversationIdWithoutData(
+        forkBody.id,
+      );
+    expect(forkAttachments.length).toBe(0);
+  });
+
   test("returns 404 when forking a missing conversation", async ({
     makeAgent,
   }) => {
     const agent = await makeAgent({
       organizationId,
       authorId: currentUser.id,
-      scope: "personal",
+      access: "personal",
     });
 
     const response = await app.inject({
@@ -321,7 +1286,6 @@ describe("chat conversation and message routes", () => {
     const agent = await makeAgent({
       organizationId,
       authorId: owner.id,
-      scope: "org",
     });
     const trigger = await makeScheduleTrigger({
       organizationId,
@@ -336,8 +1300,6 @@ describe("chat conversation and message routes", () => {
       userId: owner.id,
       organizationId,
       agentId: agent.id,
-      selectedModel: "gpt-4o",
-      selectedProvider: "openai",
     });
     await ScheduleTriggerRunModel.setChatConversationId(
       run.id,
@@ -365,14 +1327,11 @@ describe("chat conversation and message routes", () => {
     const agent = await makeAgent({
       organizationId,
       authorId: owner.id,
-      scope: "org",
     });
     const conversation = await ConversationModel.create({
       userId: owner.id,
       organizationId,
       agentId: agent.id,
-      selectedModel: "gpt-4o",
-      selectedProvider: "openai",
     });
 
     const response = await app.inject({
@@ -395,11 +1354,23 @@ describe("chat conversation and message routes", () => {
     expect(response.json().error.message).toContain("Conversation not found");
   });
 
-  test("returns 404 when updating a missing message", async () => {
+  test("returns 404 when updating a missing message", async ({ makeAgent }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+    });
+
     const response = await app.inject({
       method: "PATCH",
       url: "/api/chat/messages/1d6934ea-eb0d-452d-abf3-72122d140c49",
       payload: {
+        conversationId: conversation.id,
         partIndex: 0,
         text: "Updated text",
       },
@@ -410,10 +1381,13 @@ describe("chat conversation and message routes", () => {
   });
 
   test("validates chat message patch payload", async () => {
+    const conversationId = "9c1f74a3-19f6-4f81-9c07-371f7a1f8f6e";
+
     const emptyTextResponse = await app.inject({
       method: "PATCH",
       url: "/api/chat/messages/1d6934ea-eb0d-452d-abf3-72122d140c49",
       payload: {
+        conversationId,
         partIndex: 0,
         text: "",
       },
@@ -425,12 +1399,26 @@ describe("chat conversation and message routes", () => {
       method: "PATCH",
       url: "/api/chat/messages/1d6934ea-eb0d-452d-abf3-72122d140c49",
       payload: {
+        conversationId,
         partIndex: -1,
         text: "Updated text",
       },
     });
 
     expect(negativeIndexResponse.statusCode).toBe(400);
+
+    // Message lookups are conversation-scoped: a payload without the owning
+    // conversation is rejected before any lookup happens.
+    const missingConversationResponse = await app.inject({
+      method: "PATCH",
+      url: "/api/chat/messages/1d6934ea-eb0d-452d-abf3-72122d140c49",
+      payload: {
+        partIndex: 0,
+        text: "Updated text",
+      },
+    });
+
+    expect(missingConversationResponse.statusCode).toBe(400);
 
     const missingBodyResponse = await app.inject({
       method: "PATCH",
@@ -447,14 +1435,12 @@ describe("chat conversation and message routes", () => {
     const agent = await makeAgent({
       organizationId,
       authorId: currentUser.id,
-      scope: "personal",
+      access: "personal",
     });
     const conversation = await ConversationModel.create({
       userId: currentUser.id,
       organizationId,
       agentId: agent.id,
-      selectedModel: "gpt-4o",
-      selectedProvider: "openai",
     });
 
     const firstMessage = await MessageModel.create({
@@ -480,6 +1466,7 @@ describe("chat conversation and message routes", () => {
       method: "PATCH",
       url: `/api/chat/messages/${firstMessage.id}`,
       payload: {
+        conversationId: conversation.id,
         partIndex: 0,
         text: "Updated text",
         deleteSubsequentMessages: true,
@@ -492,5 +1479,1114 @@ describe("chat conversation and message routes", () => {
       id: firstMessage.id,
       parts: [{ type: "text", text: "Updated text" }],
     });
+  });
+
+  test("deletes a subsequent message even when createdAt ties exactly", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+    });
+
+    // Force the createdAt tie the old strictly-greater comparison missed:
+    // back-to-back writes can land on the same timestamp, and "subsequent"
+    // must still mean insertion order — the (createdAt, id) tuple, with ids
+    // minted as monotonic UUIDv7 exactly like MessageModel.create does.
+    const tiedAt = new Date();
+    const [firstMessage] = await db
+      .insert(schema.messagesTable)
+      .values({
+        id: uuidv7(),
+        conversationId: conversation.id,
+        role: "user",
+        content: {
+          id: "tied-user-1",
+          role: "user",
+          parts: [{ type: "text", text: "Original text" }],
+        },
+        createdAt: tiedAt,
+      })
+      .returning();
+    await db.insert(schema.messagesTable).values({
+      id: uuidv7(),
+      conversationId: conversation.id,
+      role: "assistant",
+      content: {
+        id: "tied-assistant-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "Follow-up response" }],
+      },
+      createdAt: tiedAt,
+    });
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: `/api/chat/messages/${firstMessage.id}`,
+      payload: {
+        conversationId: conversation.id,
+        partIndex: 0,
+        text: "Updated text",
+        deleteSubsequentMessages: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().messages).toHaveLength(1);
+    expect(response.json().messages[0]).toMatchObject({
+      id: firstMessage.id,
+      parts: [{ type: "text", text: "Updated text" }],
+    });
+  });
+
+  describe("message feedback", () => {
+    const setFeedback = (
+      messageId: string,
+      conversationId: string,
+      feedback: "up" | "down" | null,
+    ) =>
+      app.inject({
+        method: "PATCH",
+        url: `/api/chat/messages/${messageId}/feedback`,
+        payload: { conversationId, feedback },
+      });
+
+    async function makeConversationWithAssistantMessage(agentId: string) {
+      const conversation = await ConversationModel.create({
+        userId: currentUser.id,
+        organizationId,
+        agentId,
+      });
+      const message = await MessageModel.create({
+        conversationId: conversation.id,
+        role: "assistant",
+        content: {
+          id: "temp-assistant-feedback-1",
+          role: "assistant",
+          parts: [{ type: "text", text: "Assistant reply" }],
+        },
+      });
+      return { conversation, message };
+    }
+
+    test("sets, switches, and clears feedback, surfacing it in conversation reads", async ({
+      makeAgent,
+    }) => {
+      const agent = await makeAgent({
+        organizationId,
+        authorId: currentUser.id,
+        access: "personal",
+      });
+      const { conversation, message } =
+        await makeConversationWithAssistantMessage(agent.id);
+
+      const upResponse = await setFeedback(message.id, conversation.id, "up");
+      expect(upResponse.statusCode).toBe(200);
+      expect(upResponse.json()).toEqual({ id: message.id, feedback: "up" });
+
+      const readBack = await app.inject({
+        method: "GET",
+        url: `/api/chat/conversations/${conversation.id}`,
+      });
+      expect(readBack.statusCode).toBe(200);
+      expect(readBack.json().messages[0].metadata.feedback).toBe("up");
+
+      const downResponse = await setFeedback(
+        message.id,
+        conversation.id,
+        "down",
+      );
+      expect(downResponse.statusCode).toBe(200);
+      expect(downResponse.json().feedback).toBe("down");
+
+      const clearResponse = await setFeedback(
+        message.id,
+        conversation.id,
+        null,
+      );
+      expect(clearResponse.statusCode).toBe(200);
+      expect(clearResponse.json().feedback).toBeNull();
+
+      const clearedReadBack = await app.inject({
+        method: "GET",
+        url: `/api/chat/conversations/${conversation.id}`,
+      });
+      expect(
+        clearedReadBack.json().messages[0].metadata.feedback,
+      ).toBeUndefined();
+    });
+
+    test("counts feedback actions in chat_message_feedback_total, skipping failed updates", async ({
+      makeAgent,
+    }) => {
+      initializeChatMetrics();
+      const counterValue = async (feedback: string) => {
+        const metric = client.register.getSingleMetric(
+          "chat_message_feedback_total",
+        );
+        const { values } = await (metric as client.Counter<string>).get();
+        return values.find((v) => v.labels.feedback === feedback)?.value ?? 0;
+      };
+
+      const agent = await makeAgent({
+        organizationId,
+        authorId: currentUser.id,
+        access: "personal",
+      });
+      const { conversation, message } =
+        await makeConversationWithAssistantMessage(agent.id);
+
+      const snapshot = async () => ({
+        up: await counterValue("up"),
+        down: await counterValue("down"),
+        cleared: await counterValue("cleared"),
+      });
+      const before = await snapshot();
+
+      const upResponse = await setFeedback(message.id, conversation.id, "up");
+      expect(upResponse.statusCode).toBe(200);
+      expect(await snapshot()).toEqual({ ...before, up: before.up + 1 });
+
+      const clearResponse = await setFeedback(
+        message.id,
+        conversation.id,
+        null,
+      );
+      expect(clearResponse.statusCode).toBe(200);
+      const afterClear = {
+        ...before,
+        up: before.up + 1,
+        cleared: before.cleared + 1,
+      };
+      expect(await snapshot()).toEqual(afterClear);
+
+      // A rejected update (message not found) must not count anywhere
+      const missing = await setFeedback(uuidv7(), conversation.id, "up");
+      expect(missing.statusCode).toBe(404);
+      expect(await snapshot()).toEqual(afterClear);
+    });
+
+    test("the feedback column overrides stale metadata baked into content JSON", async ({
+      makeAgent,
+    }) => {
+      const agent = await makeAgent({
+        organizationId,
+        authorId: currentUser.id,
+        access: "personal",
+      });
+      const conversation = await ConversationModel.create({
+        userId: currentUser.id,
+        organizationId,
+        agentId: agent.id,
+      });
+      // Simulates a forked message whose copied content JSON carries the
+      // source owner's verdict while this row's column is NULL
+      const message = await MessageModel.create({
+        conversationId: conversation.id,
+        role: "assistant",
+        content: {
+          id: "temp-assistant-stale-feedback",
+          role: "assistant",
+          metadata: { feedback: "down" },
+          parts: [{ type: "text", text: "Copied reply" }],
+        },
+      });
+
+      const staleRead = await app.inject({
+        method: "GET",
+        url: `/api/chat/conversations/${conversation.id}`,
+      });
+      expect(staleRead.json().messages[0].metadata.feedback).toBeUndefined();
+
+      await setFeedback(message.id, conversation.id, "up");
+      const freshRead = await app.inject({
+        method: "GET",
+        url: `/api/chat/conversations/${conversation.id}`,
+      });
+      expect(freshRead.json().messages[0].metadata.feedback).toBe("up");
+    });
+
+    test("resolves the AI SDK content id scoped to the conversation", async ({
+      makeAgent,
+    }) => {
+      const agent = await makeAgent({
+        organizationId,
+        authorId: currentUser.id,
+        access: "personal",
+      });
+      // Two conversations whose assistant messages share the same content id
+      const first = await makeConversationWithAssistantMessage(agent.id);
+      const second = await makeConversationWithAssistantMessage(agent.id);
+
+      const response = await setFeedback(
+        "temp-assistant-feedback-1",
+        first.conversation.id,
+        "up",
+      );
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        id: first.message.id,
+        feedback: "up",
+      });
+
+      const untouched = await MessageModel.findById(second.message.id);
+      expect(untouched?.feedback).toBeNull();
+    });
+
+    test("rejects feedback on non-assistant messages", async ({
+      makeAgent,
+    }) => {
+      const agent = await makeAgent({
+        organizationId,
+        authorId: currentUser.id,
+        access: "personal",
+      });
+      const conversation = await ConversationModel.create({
+        userId: currentUser.id,
+        organizationId,
+        agentId: agent.id,
+      });
+      const userMessage = await MessageModel.create({
+        conversationId: conversation.id,
+        role: "user",
+        content: {
+          id: "temp-user-feedback-1",
+          role: "user",
+          parts: [{ type: "text", text: "A question" }],
+        },
+      });
+
+      const response = await setFeedback(userMessage.id, conversation.id, "up");
+      expect(response.statusCode).toBe(400);
+    });
+
+    test("validates the feedback payload", async ({ makeAgent }) => {
+      const agent = await makeAgent({
+        organizationId,
+        authorId: currentUser.id,
+        access: "personal",
+      });
+      const { conversation, message } =
+        await makeConversationWithAssistantMessage(agent.id);
+
+      const invalidValueResponse = await app.inject({
+        method: "PATCH",
+        url: `/api/chat/messages/${message.id}/feedback`,
+        payload: { conversationId: conversation.id, feedback: "sideways" },
+      });
+      expect(invalidValueResponse.statusCode).toBe(400);
+
+      const missingConversationResponse = await app.inject({
+        method: "PATCH",
+        url: `/api/chat/messages/${message.id}/feedback`,
+        payload: { feedback: "up" },
+      });
+      expect(missingConversationResponse.statusCode).toBe(400);
+    });
+
+    test("returns 404 for an unknown message id", async ({ makeAgent }) => {
+      const agent = await makeAgent({
+        organizationId,
+        authorId: currentUser.id,
+        access: "personal",
+      });
+      const conversation = await ConversationModel.create({
+        userId: currentUser.id,
+        organizationId,
+        agentId: agent.id,
+      });
+
+      const response = await setFeedback(
+        "00000000-0000-4000-8000-000000000000",
+        conversation.id,
+        "up",
+      );
+      expect(response.statusCode).toBe(404);
+    });
+
+    test("returns 404 for another user's conversation", async ({
+      makeAgent,
+      makeUser,
+      makeMember,
+    }) => {
+      const otherUser = await makeUser();
+      await makeMember(otherUser.id, organizationId, { role: "member" });
+      const agent = await makeAgent({
+        organizationId,
+        authorId: otherUser.id,
+      });
+      const conversation = await ConversationModel.create({
+        userId: otherUser.id,
+        organizationId,
+        agentId: agent.id,
+      });
+      const message = await MessageModel.create({
+        conversationId: conversation.id,
+        role: "assistant",
+        content: {
+          id: "temp-assistant-foreign-1",
+          role: "assistant",
+          parts: [{ type: "text", text: "Not yours to rate" }],
+        },
+      });
+
+      const response = await setFeedback(message.id, conversation.id, "up");
+      expect(response.statusCode).toBe(404);
+
+      const untouched = await MessageModel.findById(message.id);
+      expect(untouched?.feedback).toBeNull();
+    });
+  });
+});
+
+describe("chat conversation creation in projects", () => {
+  let app: FastifyInstanceWithZod;
+  let currentUser: User;
+  let organizationId: string;
+
+  beforeEach(async ({ makeOrganization, makeUser, makeMember }) => {
+    currentUser = await makeUser();
+    organizationId = (await makeOrganization()).id;
+    await makeMember(currentUser.id, organizationId, { role: "admin" });
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { user: User }).user = currentUser;
+      (request as typeof request & { organizationId: string }).organizationId =
+        organizationId;
+    });
+    const { default: chatRoutes } = await import("./routes");
+    await app.register(chatRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  test("a chat created with projectId belongs to the project", async ({
+    makeAgent,
+  }) => {
+    const { projectService } = await import("@/services/project");
+    const project = await projectService.create({
+      organizationId,
+      userId: currentUser.id,
+      name: "chat-home",
+      description: null,
+    });
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat/conversations",
+      payload: { agentId: agent.id, projectId: project.id },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ projectId: project.id });
+  });
+
+  test("an inaccessible or unknown project 404s", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    // The admin role holds Full on every project, so act as a plain member.
+    currentUser = await makeUser();
+    await makeMember(currentUser.id, organizationId, { role: "member" });
+    const stranger = await makeUser({ email: "proj-chat-stranger@test.com" });
+    await makeMember(stranger.id, organizationId, { role: "member" });
+    const { projectService } = await import("@/services/project");
+    const theirProject = await projectService.create({
+      organizationId,
+      userId: stranger.id,
+      name: "not-yours",
+      description: null,
+    });
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+
+    const denied = await app.inject({
+      method: "POST",
+      url: "/api/chat/conversations",
+      payload: { agentId: agent.id, projectId: theirProject.id },
+    });
+    expect(denied.statusCode).toBe(404);
+
+    const unknown = await app.inject({
+      method: "POST",
+      url: "/api/chat/conversations",
+      payload: {
+        agentId: agent.id,
+        projectId: "00000000-0000-0000-0000-000000000000",
+      },
+    });
+    expect(unknown.statusCode).toBe(404);
+  });
+});
+
+describe("project chats: read-only access for project members", () => {
+  let app: FastifyInstanceWithZod;
+  let author: User;
+  let actingUser: User;
+  let organizationId: string;
+  let agentId: string;
+
+  beforeEach(async ({ makeOrganization, makeUser, makeMember, makeAgent }) => {
+    author = await makeUser();
+    organizationId = (await makeOrganization()).id;
+    await makeMember(author.id, organizationId, { role: "admin" });
+    actingUser = author;
+    agentId = (
+      await makeAgent({
+        organizationId,
+        authorId: author.id,
+        access: "personal",
+      })
+    ).id;
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { user: User }).user = actingUser;
+      (request as typeof request & { organizationId: string }).organizationId =
+        organizationId;
+    });
+    const { default: chatRoutes } = await import("./routes");
+    await app.register(chatRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  async function seedProjectChat(params: { shared: boolean }) {
+    const { projectService } = await import("@/services/project");
+    const project = await projectService.create({
+      organizationId,
+      userId: author.id,
+      name: `ro-${params.shared ? "shared" : "private"}`,
+      description: null,
+    });
+    if (params.shared) {
+      await shareForTest({
+        resource: "project",
+        scope: project.id,
+        organizationId,
+        visibility: "organization",
+        teamIds: [],
+      });
+    }
+    const conversation = await ConversationModel.create({
+      userId: author.id,
+      organizationId,
+      agentId,
+      projectId: project.id,
+    });
+    return { project, conversation };
+  }
+
+  test("a project:read-all holder can read a shared project's chat but not mutate it", async ({
+    makeUser,
+    makeMember,
+    makeCustomRole,
+  }) => {
+    const { conversation } = await seedProjectChat({ shared: true });
+    // Reading a chat the caller did not author is gated by `project:read-all`,
+    // even inside a shared project — so the reader holds a role that grants it.
+    const readAllRole = await makeCustomRole(organizationId, {
+      permission: {},
+    });
+    // `read` on every chat, the grant the retired project:read-all became.
+    await grantRoleEverywhere({
+      organizationId: organizationId,
+      resource: "conversation",
+      roleId: readAllRole.id,
+      actions: ["read"],
+    });
+    const member = await makeUser({ email: "ro-member@test.com" });
+    await makeMember(member.id, organizationId, { role: readAllRole.role });
+    actingUser = member;
+
+    const read = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+    expect(read.statusCode).toBe(200);
+    expect(read.json()).toMatchObject({ id: conversation.id });
+
+    const rename = await app.inject({
+      method: "PATCH",
+      url: `/api/chat/conversations/${conversation.id}`,
+      payload: { title: "hijacked" },
+    });
+    expect([403, 404]).toContain(rename.statusCode);
+
+    // the delete lookup is owner-scoped, so a reader's DELETE is a no-op that
+    // returns 200 (idempotent delete semantics); the author's chat is intact.
+    const deleteAttempt = await app.inject({
+      method: "DELETE",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+    expect(deleteAttempt.statusCode).toBe(200);
+    const stillThere = await ConversationModel.findById({
+      id: conversation.id,
+      userId: author.id,
+      organizationId,
+    });
+    expect(stillThere).not.toBeNull();
+  });
+
+  test("a shared project's member without project:read-all cannot read another's chat", async ({
+    makeUser,
+    makeMember,
+  }) => {
+    const { conversation } = await seedProjectChat({ shared: true });
+    // A plain member can reach the shared project but lacks `project:read-all`,
+    // so a chat they did not author stays invisible (the route returns 404).
+    const member = await makeUser({ email: "ro-plain-member@test.com" });
+    await makeMember(member.id, organizationId, {});
+    actingUser = member;
+
+    const read = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+    expect(read.statusCode).toBe(404);
+  });
+
+  test("chats in unshared projects stay invisible to others", async ({
+    makeUser,
+    makeMember,
+  }) => {
+    const { conversation } = await seedProjectChat({ shared: false });
+    const outsider = await makeUser({ email: "ro-outsider@test.com" });
+    await makeMember(outsider.id, organizationId, {});
+    actingUser = outsider;
+
+    const read = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+    expect(read.statusCode).toBe(404);
+  });
+});
+
+describe("conversation list projectName", () => {
+  let app: FastifyInstanceWithZod;
+  let currentUser: User;
+  let organizationId: string;
+
+  beforeEach(async ({ makeOrganization, makeUser, makeMember }) => {
+    currentUser = await makeUser();
+    organizationId = (await makeOrganization()).id;
+    await makeMember(currentUser.id, organizationId, { role: "admin" });
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { user: User }).user = currentUser;
+      (request as typeof request & { organizationId: string }).organizationId =
+        organizationId;
+    });
+    const { default: chatRoutes } = await import("./routes");
+    await app.register(chatRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  test("project chats carry projectName; plain chats carry null", async ({
+    makeAgent,
+  }) => {
+    const { projectService } = await import("@/services/project");
+    const project = await projectService.create({
+      organizationId,
+      userId: currentUser.id,
+      name: "chip-source",
+      description: null,
+    });
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+      projectId: project.id,
+      title: "in project",
+    });
+    await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+      title: "plain",
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/chat/conversations",
+    });
+    expect(response.statusCode).toBe(200);
+    const body =
+      response.json<
+        Array<{ title: string | null; projectName: string | null }>
+      >();
+    const byTitle = Object.fromEntries(body.map((c) => [c.title, c]));
+    expect(byTitle["in project"].projectName).toBe("chip-source");
+    expect(byTitle.plain.projectName).toBeNull();
+  });
+
+  test("clears a conversation's recorded chat errors", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+    });
+    await ConversationChatErrorModel.create({
+      conversationId: conversation.id,
+      error: {
+        code: ChatErrorCode.ServerError,
+        message: "boom",
+        isRetryable: true,
+      },
+    });
+
+    const response = await app.inject({
+      method: "DELETE",
+      url: `/api/chat/conversations/${conversation.id}/chat-errors`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ success: true });
+    expect(
+      await ConversationChatErrorModel.findByConversation(conversation.id),
+    ).toHaveLength(0);
+  });
+
+  test("returns 404 when clearing chat errors on another user's conversation", async ({
+    makeUser,
+    makeAgent,
+  }) => {
+    const otherUser = await makeUser();
+    const agent = await makeAgent({
+      organizationId,
+      authorId: otherUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: otherUser.id,
+      organizationId,
+      agentId: agent.id,
+    });
+    await ConversationChatErrorModel.create({
+      conversationId: conversation.id,
+      error: {
+        code: ChatErrorCode.ServerError,
+        message: "boom",
+        isRetryable: true,
+      },
+    });
+
+    const response = await app.inject({
+      method: "DELETE",
+      url: `/api/chat/conversations/${conversation.id}/chat-errors`,
+    });
+
+    // Owner-scoped lookup: the current user doesn't own it, so it's 404 and the
+    // other user's error is left intact.
+    expect(response.statusCode).toBe(404);
+    expect(
+      await ConversationChatErrorModel.findByConversation(conversation.id),
+    ).toHaveLength(1);
+  });
+
+  test("delete soft-deletes the conversation: 200, then GET 404, re-DELETE 200 (idempotent), row kept", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+      title: "delete me",
+    });
+
+    const first = await app.inject({
+      method: "DELETE",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toEqual({ success: true });
+
+    // Gone from every read surface.
+    const afterGet = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+    expect(afterGet.statusCode).toBe(404);
+
+    // A re-delete is an idempotent no-op: there is nothing left for this caller
+    // to delete, so DELETE returns 200 without touching state.
+    const second = await app.inject({
+      method: "DELETE",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+    expect(second.statusCode).toBe(200);
+
+    // The row survives with deletedAt stamped — soft delete keeps the data.
+    const [row] = await db
+      .select()
+      .from(schema.conversationsTable)
+      .where(eq(schema.conversationsTable.id, conversation.id));
+    expect(row).toBeDefined();
+    expect(row.deletedAt).toBeInstanceOf(Date);
+  });
+
+  test("restore brings a soft-deleted conversation back onto every read surface", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+      title: "restore me",
+    });
+
+    await app.inject({
+      method: "DELETE",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+    const whileDeleted = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+    expect(whileDeleted.statusCode).toBe(404);
+
+    const restore = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${conversation.id}/restore`,
+    });
+    expect(restore.statusCode).toBe(200);
+    expect(restore.json()).toMatchObject({
+      id: conversation.id,
+      deletedAt: null,
+    });
+
+    // Reappears in the owner-scoped read and in the active list.
+    const afterGet = await app.inject({
+      method: "GET",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+    expect(afterGet.statusCode).toBe(200);
+    const list = await app.inject({
+      method: "GET",
+      url: "/api/chat/conversations",
+    });
+    expect(list.json().map((c: { id: string }) => c.id)).toContain(
+      conversation.id,
+    );
+  });
+
+  test("the restore response carries the conversation's messages, not an empty shell", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+      title: "has history",
+    });
+    await MessageModel.create({
+      conversationId: conversation.id,
+      role: "user",
+      content: {
+        id: uuidv7(),
+        role: "user",
+        parts: [{ type: "text", text: "hello from before the delete" }],
+      },
+    });
+
+    await app.inject({
+      method: "DELETE",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+    const restore = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${conversation.id}/restore`,
+    });
+
+    // The route declares the full conversation schema, so a caller seeding its
+    // cache from this response has to get the history — a sidebar-row shape
+    // with messages: [] would render the restored chat empty.
+    expect(restore.statusCode).toBe(200);
+    expect(restore.json().messages).toHaveLength(1);
+    expect(restore.json().messages[0].parts).toMatchObject([
+      { type: "text", text: "hello from before the delete" },
+    ]);
+  });
+
+  test("restore is idempotent: restoring an already-active conversation returns it with 200", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+      title: "already active",
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${conversation.id}/restore`,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ id: conversation.id });
+  });
+
+  test("restore returns 404 for a missing conversation", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${uuidv7()}/restore`,
+    });
+    expect(response.statusCode).toBe(404);
+  });
+
+  test("restore returns 404 for another user's conversation and leaves it deleted", async ({
+    makeUser,
+    makeAgent,
+  }) => {
+    const otherUser = await makeUser();
+    const agent = await makeAgent({
+      organizationId,
+      authorId: otherUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: otherUser.id,
+      organizationId,
+      agentId: agent.id,
+      title: "not yours",
+    });
+    await ConversationModel.delete(
+      conversation.id,
+      otherUser.id,
+      organizationId,
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${conversation.id}/restore`,
+    });
+    // Restore is owner-scoped: admin status does not grant it, so 404 and the
+    // row stays soft-deleted.
+    expect(response.statusCode).toBe(404);
+    const [row] = await db
+      .select()
+      .from(schema.conversationsTable)
+      .where(eq(schema.conversationsTable.id, conversation.id));
+    expect(row.deletedAt).toBeInstanceOf(Date);
+  });
+
+  test("restore leaves the chat's sharing as it was before the delete", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+      title: "shared then trashed",
+    });
+    await shareForTest({
+      resource: "conversation",
+      scope: conversation.id,
+      organizationId,
+      visibility: "organization",
+    });
+
+    await app.inject({
+      method: "DELETE",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+
+    const restore = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${conversation.id}/restore`,
+    });
+    expect(restore.statusCode).toBe(200);
+    // DEFECT: restore used to bring a chat back private, because deleting a
+    // shared chat is a plausible way to pull a share back. That rule deleted
+    // the retired share row, which no longer decides access: a chat is shared
+    // through its permission policy, and neither delete nor restore touches
+    // it. So the chat comes back shared exactly as it was. Whether restore
+    // should strip the grants again is an open product decision.
+    expect(restore.json().share).toEqual({ visibility: "organization" });
+  });
+
+  test("restoring an already-active conversation leaves its share and live run alone", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+      title: "never deleted",
+    });
+    await shareForTest({
+      resource: "conversation",
+      scope: conversation.id,
+      organizationId,
+      visibility: "organization",
+      teamIds: [],
+      userIds: [],
+    });
+    const run = await ActiveChatRunModel.create({
+      conversationId: conversation.id,
+      userId: currentUser.id,
+      organizationId,
+    });
+    if (!run) throw new Error("expected the run to be created");
+
+    // The restore transitions nothing, so its side effects must not fire: this
+    // is the call that would otherwise unshare a live chat and kill its stream.
+    const restore = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${conversation.id}/restore`,
+    });
+    expect(restore.statusCode).toBe(200);
+    expect(restore.json().share).toMatchObject({ visibility: "organization" });
+    expect((await ActiveChatRunModel.findById(run.id))?.status).toBe("running");
+  });
+
+  test("a new run can start on a restored conversation (the stopped run does not wedge it)", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+      title: "run then restore",
+    });
+
+    // A run that was live when the conversation was deleted.
+    const run = await ActiveChatRunModel.create({
+      conversationId: conversation.id,
+      userId: currentUser.id,
+      organizationId,
+    });
+    if (!run) throw new Error("expected the initial run to be created");
+
+    // DELETE only requests a stop: it stamps stopRequestedAt and leaves the row
+    // `running`. Nothing finalizes it here on purpose — that models the run
+    // whose stream died with the process, which is exactly the row that would
+    // otherwise sit `running` until the ten-minute stale reaper.
+    await app.inject({
+      method: "DELETE",
+      url: `/api/chat/conversations/${conversation.id}`,
+    });
+    expect((await ActiveChatRunModel.findById(run.id))?.status).toBe("running");
+
+    const restore = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${conversation.id}/restore`,
+    });
+    expect(restore.statusCode).toBe(200);
+
+    // Restore finished the abandoned run, so it no longer blocks a fresh one:
+    // the running-conversation unique index only covers status = 'running'.
+    expect((await ActiveChatRunModel.findById(run.id))?.status).toBe(
+      "cancelled",
+    );
+    const newRun = await ActiveChatRunModel.create({
+      conversationId: conversation.id,
+      userId: currentUser.id,
+      organizationId,
+    });
+    expect(newRun).not.toBeNull();
+  });
+
+  test("the deleted-conversations list returns soft-deleted chats and excludes active ones", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      access: "personal",
+    });
+    const active = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+      title: "active",
+    });
+    const trashed = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+      title: "trashed",
+    });
+    await ConversationModel.delete(trashed.id, currentUser.id, organizationId);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/chat/conversations/deleted",
+    });
+    expect(response.statusCode).toBe(200);
+    const ids = response.json().map((c: { id: string }) => c.id);
+    expect(ids).toContain(trashed.id);
+    expect(ids).not.toContain(active.id);
   });
 });

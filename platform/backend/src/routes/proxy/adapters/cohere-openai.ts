@@ -14,6 +14,7 @@ import {
   cohereResponseToOpenai,
   mapCohereFinishReason,
 } from "./cohere-openai-translator";
+import { formatOpenAiChunkSse, toOpenAiStreamUsage } from "./openai-sse-chunk";
 
 type CohereRequest = Cohere.Types.ChatRequest;
 type CohereResponse = Cohere.Types.ChatResponse;
@@ -28,6 +29,9 @@ class CohereOpenaiResponseAdapter
 {
   readonly provider = "cohere" as const;
   private inner: LLMResponseAdapter<CohereResponse>;
+  // The inner (logged-shape) response after a dispatch-mode repair, so
+  // getLoggedResponse persists the rewritten turn rather than the original.
+  private rewrittenInner: CohereResponse | null = null;
   private ctx: CohereOpenaiContext;
 
   constructor(response: CohereResponse, ctx: CohereOpenaiContext) {
@@ -67,17 +71,50 @@ class CohereOpenaiResponseAdapter
   }
 
   getLoggedResponse(): CohereResponse {
-    return this.inner.getOriginalResponse();
+    return this.rewrittenInner ?? this.inner.getOriginalResponse();
   }
 
   getFinishReasons(): string[] {
     return this.inner.getFinishReasons();
   }
 
+  withRewrittenToolCalls(
+    toolCalls: Array<{ id: string; name: string; arguments: string }>,
+  ): CohereResponse {
+    // Rewrite in the inner wire shape (which is what gets logged), then
+    // translate for the client exactly as getOriginalResponse does. If the
+    // inner adapter cannot rewrite, hand back the untouched translation — the
+    // handler only reaches here when the planner produced a rewrite, and a
+    // silent no-op would strand the client with a call it cannot execute; but
+    // every inner adapter this wraps does implement it.
+    const inner =
+      this.inner.withRewrittenToolCalls?.(toolCalls) ??
+      this.inner.getOriginalResponse();
+    this.rewrittenInner = inner;
+    return cohereResponseToOpenai(inner, this.ctx) as unknown as CohereResponse;
+  }
+
+  withReplacedText(text: string): CohereResponse {
+    // Replaced in the inner wire shape (which is what gets logged), then
+    // translated for the client as getOriginalResponse does.
+    const inner = this.inner.withReplacedText?.(text);
+    if (!inner) {
+      throw new Error("Wrapped response adapter cannot replace response text");
+    }
+    this.rewrittenInner = inner;
+    return cohereResponseToOpenai(inner, this.ctx) as unknown as CohereResponse;
+  }
+
   toRefusalResponse(
-    _refusalMessage: string,
+    refusalMessage: string,
     contentMessage: string,
   ): CohereResponse {
+    // Stores the refusal in the inner Cohere format for interaction logging.
+    // This prevents logging the blocked tool call payload.
+    this.rewrittenInner = this.inner.toRefusalResponse(
+      refusalMessage,
+      contentMessage,
+    );
     const usage = this.inner.getUsage();
     const response: OpenAi.Types.ChatCompletionsResponse = {
       id: this.ctx.chatcmplId,
@@ -108,6 +145,9 @@ class CohereOpenaiStreamAdapter
   readonly provider = "cohere" as const;
   private inner: LLMStreamAdapter<CohereStreamChunk, CohereResponse>;
   private ctx: CohereOpenaiContext;
+  // Set when a policy refusal replaced the response, so formatEndSSE finishes as
+  // "stop" without reconstructing the inner response just to read one field.
+  private responseReplacedWithText = false;
 
   constructor(ctx: CohereOpenaiContext) {
     this.inner = cohereAdapterFactory.createStreamAdapter();
@@ -139,19 +179,51 @@ class CohereOpenaiStreamAdapter
     return [];
   }
 
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]): string[] {
+    // The inner (Cohere-shaped) read is a side effect only — it marks the calls
+    // as handed over so inner.toProviderResponse() names them — while the wire
+    // event below is the OpenAI-shaped one this surface speaks.
+    this.inner.formatToolCallsSSE?.(toolCalls);
+    return [
+      this.formatChunk({
+        delta: {
+          tool_calls: toolCalls.map((toolCall, index) => ({
+            index,
+            id: toolCall.id,
+            type: "function" as const,
+            function: { name: toolCall.name, arguments: toolCall.arguments },
+          })),
+        },
+        finishReason: null,
+      }),
+    ];
+  }
+
   formatCompleteTextSSE(text: string): string[] {
+    // Mark the inner adapter as refusal-replaced (side effect only; its
+    // Cohere-format events are unused here) so it persists the refusal rather
+    // than the blocked calls. The finish reason is emitted once, by formatEndSSE.
+    this.responseReplacedWithText = true;
+    this.inner.formatCompleteTextSSE(text);
     return [
       this.formatChunk({
         delta: { role: "assistant", content: text },
-        finishReason: "stop",
+        finishReason: null,
       }),
     ];
+  }
+
+  getOpenAiFinishReason(): string {
+    return this.responseReplacedWithText
+      ? "stop"
+      : mapCohereFinishReason(this.inner.state.stopReason);
   }
 
   formatEndSSE(): string {
     return `${this.formatChunk({
       delta: {},
-      finishReason: mapCohereFinishReason(this.inner.state.stopReason),
+      finishReason: this.getOpenAiFinishReason(),
+      usage: this.state.usage,
     })}data: [DONE]\n\n`;
   }
 
@@ -183,21 +255,17 @@ class CohereOpenaiStreamAdapter
   private formatChunk(params: {
     delta: Record<string, unknown>;
     finishReason: string | null;
+    /** Only the final chunk passes this; delta chunks must stay usage-free. */
+    usage?: UsageView | null;
   }): string {
-    return `data: ${JSON.stringify({
+    return formatOpenAiChunkSse({
       id: this.ctx.chatcmplId,
-      object: "chat.completion.chunk",
       created: this.ctx.createdUnix,
       model: this.ctx.requestedModel,
-      choices: [
-        {
-          index: 0,
-          delta: params.delta,
-          finish_reason: params.finishReason,
-          logprobs: null,
-        },
-      ],
-    })}\n\n`;
+      delta: params.delta,
+      finishReason: params.finishReason,
+      usage: toOpenAiStreamUsage(params.usage),
+    });
   }
 }
 
@@ -212,6 +280,7 @@ export function makeCohereOpenaiAdapterFactory(
 > {
   return {
     ...cohereAdapterFactory,
+    translatesWireFormat: true,
     extractApiKey(headers) {
       const authorization = (headers as Record<string, unknown>).authorization;
       if (typeof authorization === "string") {

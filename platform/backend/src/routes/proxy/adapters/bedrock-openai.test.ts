@@ -1,5 +1,5 @@
 import type { ConverseStreamOutput } from "@aws-sdk/client-bedrock-runtime";
-import { describe, expect, test } from "@/test";
+import { describe, expect, test } from "vitest";
 import type { Bedrock } from "@/types";
 import { makeBedrockOpenaiAdapterFactory } from "./bedrock-openai";
 import type { OpenaiContext } from "./bedrock-openai-translator";
@@ -139,6 +139,40 @@ describe("BedrockOpenai response adapter", () => {
     );
   });
 
+  test("toRefusalResponse logs the Converse-shaped refusal, not the blocked tool call", () => {
+    const factory = makeBedrockOpenaiAdapterFactory(ctx);
+    const resp = factory.createResponseAdapter({
+      output: {
+        message: {
+          role: "assistant",
+          content: [
+            {
+              toolUse: {
+                toolUseId: "t_1",
+                name: "get_weather",
+                input: { city: "SF" },
+              },
+            },
+          ],
+        },
+      },
+      stopReason: "tool_use",
+      usage: { inputTokens: 5, outputTokens: 3 },
+    } as Bedrock.Types.ConverseResponse);
+
+    resp.toRefusalResponse(
+      "blocked by policy",
+      "Sorry, that tool is disabled.",
+    );
+
+    // biome-ignore lint/suspicious/noExplicitAny: crossing typed boundary
+    const logged = resp.getLoggedResponse?.() as any;
+    expect(logged.output.message.content).toEqual([
+      { text: "Sorry, that tool is disabled." },
+    ]);
+    expect(logged.stopReason).toBe("end_turn");
+  });
+
   test("delegates telemetry reads to inner (Converse-shape tool call names)", () => {
     const factory = makeBedrockOpenaiAdapterFactory(ctx);
     const resp = factory.createResponseAdapter({
@@ -164,7 +198,13 @@ describe("BedrockOpenai response adapter", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].name).toBe("do_thing");
     expect(resp.hasToolCalls()).toBe(true);
-    expect(resp.getUsage()).toEqual({ inputTokens: 1, outputTokens: 1 });
+    expect(resp.getUsage()).toEqual({
+      inputTokens: 1,
+      outputTokens: 1,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      cacheWrite1hTokens: 0,
+    });
     expect(resp.getFinishReasons()).toEqual(["tool_use"]);
   });
 });
@@ -356,7 +396,11 @@ describe("BedrockOpenai stream adapter — wire output", () => {
     expect(resp.output.message.role).toBe("assistant");
     expect(resp.output.message.content).toEqual([{ text: "Hello" }]);
     expect(resp.stopReason).toBe("end_turn");
-    expect(resp.usage).toEqual({ inputTokens: 10, outputTokens: 5 });
+    expect(resp.usage).toEqual({
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15,
+    });
   });
 });
 

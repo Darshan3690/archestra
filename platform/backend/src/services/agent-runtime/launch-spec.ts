@@ -1,0 +1,870 @@
+import { randomBytes } from "node:crypto";
+import {
+  CLAUDE_CODE_CUSTOM_HEADERS_ENV_KEY,
+  isClaudeCodeRuntimeCommand,
+  isCodexRuntimeCommand,
+  isDefaultBrandedAppName,
+  providerDisplayNames,
+  type ResolvedAgentRuntimeTiers,
+  type ResourcePermissionGrant,
+  RUN_ID_HEADER,
+  resolveClaudeContextVariant,
+  SUBSCRIPTION_CREDENTIALS,
+  type SubscriptionCredentialKind,
+  type SupportedProvider,
+  TOOL_LIST_SKILLS_SHORT_NAME,
+  TOOL_LOAD_SKILL_SHORT_NAME,
+} from "@archestra/shared";
+import type { A2AActor } from "@/agents/a2a/a2a-base";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
+import { serviceAccountUserId } from "@/auth/service-account-user-id";
+import { getBedrockRegion } from "@/clients/bedrock-credentials";
+import { selectMCPGatewayToken } from "@/clients/chat-mcp-client";
+import config from "@/config";
+import {
+  AgentModel,
+  AgentWorkspaceModel,
+  LimitModel,
+  LlmProviderApiKeyModel,
+  ModelModel,
+  OAuthAccessTokenModel,
+  OAuthClientModel,
+  VirtualApiKeyModel,
+} from "@/models";
+import ServiceAccountModel from "@/models/service-account";
+import type { OpenAppaSession } from "@/openappa/service";
+import { claudeCodeAccountManager } from "@/services/agent-runtime/claude-code-account";
+import { runtimeOpenAppaSession } from "@/services/agent-runtime/runtime-identity";
+import { archestraMarkWithText } from "@/services/archestra-mark";
+import { isGuardrailsV2Active } from "@/services/guardrails-deployment";
+import { MCP_RESOURCE_REFERENCE_PREFIX } from "@/services/identity-providers/enterprise-managed/authorization";
+import { resolveOauthServiceAccount } from "@/services/oauth-service-account";
+import { buildSkillDiscoveryPreview } from "@/services/skill-discovery-preview";
+import type {
+  AgentRunInput,
+  EffectiveNetworkPolicy,
+  ResolvedAgentRuntime,
+} from "@/types";
+import {
+  type AgentRunLimits,
+  AgentRuntimeCredentialsRequiredError,
+  ApiError,
+} from "@/types";
+import { resolveProviderApiKey } from "@/utils/llm-api-key-resolution";
+import type { AgentRunLaunchSpec } from "./backends";
+import { resolveAgentRuntimeCredentials } from "./credentials";
+import { taskWithAgentRunInputs } from "./input-files";
+import {
+  getClaudeCodeCloudProvider,
+  preflightAgentRuntimeModelCompatibility,
+} from "./model-compatibility";
+import { ensureProviderApiKeySupportsSelectedModel } from "./preflight";
+import { agentRunUrl } from "./run-handle";
+import {
+  AGENT_RUNTIME_CPU_LIMIT_ENV,
+  AGENT_RUNTIME_CPU_REQUEST_ENV,
+  AGENT_RUNTIME_CPUS_ENV,
+  AGENT_RUNTIME_MAX_TIER_ENV,
+  AGENT_RUNTIME_MEMORY_LIMIT_ENV,
+  AGENT_RUNTIME_MEMORY_REQUEST_ENV,
+  AGENT_RUNTIME_OAUTH_CLIENT_ID,
+  AGENT_RUNTIME_SIZED_ENV,
+  AGENT_RUNTIME_STEER_FIFO,
+  AGENT_RUNTIME_SYSTEM_PROMPT_ENV,
+  AGENT_RUNTIME_TIER_ENV,
+  AGENT_RUNTIME_TIERS_ENV,
+  agentRunGatewayTokenId,
+  constructStableRunName,
+} from "./runtime-contract";
+import {
+  agentRuntimeAllowedTiers,
+  agentRuntimeMaxTier,
+  definedEnv,
+  describeScaleupDisabledPrompt,
+  organizationAgentRuntimeTiers,
+  type RuntimeSystemPromptParts,
+  resolveRunResources,
+  resolveRunWorkspaceStorageSize,
+  runtimeSystemPrompt,
+  runtimeTiersEnv,
+  sizedToolchainEnv,
+  tierResourceEnv,
+  tierResources,
+  tierWorkspaceGiB,
+  tierWorkspaceStorageSize,
+  warmTierCandidates,
+} from "./runtime-tiers";
+
+/**
+ * Everything a runtime backend needs to carry one A2A task, resolved for
+ * the person the session acts as.
+ *
+ * A session needs no proxy or gateway configuration of its own: the LLM proxy
+ * URL, a personal-scope virtual key (so spend attributes to the human rather
+ * than a shared organization credential) and that user's MCP gateway bearer
+ * are all derived from the acting identity.
+ */
+export async function buildAgentRunLaunchSpec(params: {
+  runtime: ResolvedAgentRuntime;
+  /** The run's tier and limits, resolved against the Agent's settings. */
+  limits: AgentRunLimits;
+  /**
+   * The organization's tiers, when the caller read them already: the run's
+   * volume and the size it is told then come from the same read.
+   */
+  tiers?: ResolvedAgentRuntimeTiers;
+  /** The A2A task this run carries; its id names the workload. */
+  taskId: string;
+  /**
+   * This turn's run record id. It names the turn's service-account token; the
+   * run's own id (`ARCHESTRA_AGENT_RUNTIME_RUN_ID`) is its workspace id.
+   */
+  runId: string;
+  /** Agent the task belongs to, for the proxy and gateway routes. */
+  agentId: string;
+  actor: A2AActor;
+  organizationId: string;
+  runtimeScope: string;
+  effectiveNetworkPolicy: EffectiveNetworkPolicy;
+  /** White-label product name rendered by the built-in terminal UI. */
+  appName: string;
+  /** The first instruction, when the task started with one. */
+  task?: string | null;
+  /** Whether the Agent owns a live TUI or exits after its first result. */
+  runMode: "interactive" | "one_shot";
+  inputFiles?: AgentRunInput[];
+  imagePullSecrets?: string[];
+  /** Persisted workspace. The mint re-reads this row; it is not a client header. */
+  workspaceId?: string;
+  /** Caller-scoped session for this workspace. parentId is a full session id. */
+  runtimeSession?: Pick<
+    OpenAppaSession,
+    "session_id" | "caller_id" | "parent_id"
+  >;
+  /** Ephemeral per-run credentials redeemed from a one-time `transfer_credential` grant. */
+  ephemeralCredentials?: Record<string, string>;
+}): Promise<{
+  spec: AgentRunLaunchSpec;
+  virtualApiKeyId: string | null;
+  gatewayTokenId: string | null;
+}> {
+  const platformBaseUrl = config.agentRuntime.platformBaseUrl.replace(
+    /\/+$/,
+    "",
+  );
+  if (!platformBaseUrl) {
+    // Refusing beats starting a session that would call providers directly,
+    // outside every policy and cost record the proxy exists to keep.
+    throw new ApiError(
+      500,
+      "Agent Runtime requires ARCHESTRA_AGENT_RUNTIME_PLATFORM_BASE_URL (or ARCHESTRA_INTERNAL_API_BASE_URL) so the run can reach the LLM proxy and MCP gateway",
+    );
+  }
+
+  if (params.actor.kind === "serviceAccount")
+    await resolveOauthServiceAccount({
+      serviceAccountId: params.actor.id,
+      organizationId: params.organizationId,
+    });
+  const actorUserId = params.actor.kind === "user" ? params.actor.id : null;
+  const credentials = await resolveAgentRuntimeCredentials({
+    runtime: params.runtime,
+    organizationId: params.organizationId,
+    userId: actorUserId,
+    authorizationUserId:
+      params.actor.kind === "serviceAccount"
+        ? serviceAccountUserId(params.actor.id)
+        : actorUserId,
+    ephemeralCredentials: params.ephemeralCredentials,
+  });
+  if (credentials.misconfigured.length > 0) {
+    throw new ApiError(
+      409,
+      `This Agent's Agent Runtime is missing shared credentials an administrator must configure: ${credentials.misconfigured
+        .map((entry) => entry.label)
+        .join(", ")}`,
+    );
+  }
+  if (credentials.missing.length > 0) {
+    throw new AgentRuntimeCredentialsRequiredError(
+      params.runtime.agentId,
+      credentials.missing,
+    );
+  }
+
+  const agent = await AgentModel.findById(params.agentId);
+  if (!agent) {
+    throw new ApiError(
+      404,
+      "The Agent for this Agent Runtime run no longer exists",
+    );
+  }
+  const boundWorkspace = params.workspaceId
+    ? await AgentWorkspaceModel.findById(params.workspaceId)
+    : null;
+  if (
+    params.workspaceId &&
+    (!boundWorkspace ||
+      boundWorkspace.organizationId !== params.organizationId ||
+      boundWorkspace.agentId !== params.agentId ||
+      boundWorkspace.actorKind !== params.actor.kind ||
+      boundWorkspace.actorId !== params.actor.id)
+  ) {
+    throw new ApiError(409, "The saved run is not available for this actor");
+  }
+  if (params.runtimeSession && boundWorkspace) {
+    const expected = runtimeOpenAppaSession({
+      organizationId: boundWorkspace.organizationId,
+      workspaceId: boundWorkspace.id,
+      workloadName: boundWorkspace.workloadName,
+      actorKind: boundWorkspace.actorKind,
+      actorId: boundWorkspace.actorId,
+    });
+    if (
+      params.runtimeSession.caller_id !== expected.caller_id ||
+      params.runtimeSession.session_id !== expected.session_id
+    ) {
+      throw new ApiError(
+        409,
+        "The runtime session does not match the saved run",
+      );
+    }
+  }
+  const skillPreview = await buildSkillDiscoveryPreview({
+    agentId: params.agentId,
+    organizationId: params.organizationId,
+    userId:
+      params.actor.kind === "serviceAccount"
+        ? serviceAccountUserId(params.actor.id)
+        : (actorUserId ?? undefined),
+  });
+  const { llm, selectedModel, usesClaudeCodeSubscription } =
+    await preflightAgentRuntimeModelCompatibility({
+      runtime: params.runtime,
+      agent,
+      organizationId: params.organizationId,
+      userId: actorUserId ?? "system",
+    });
+
+  const claudeCodeCloudProvider = getClaudeCodeCloudProvider({
+    runtime: params.runtime,
+    provider: llm.selectedProvider,
+  });
+  const isClaudeCodeBedrock = claudeCodeCloudProvider === "bedrock";
+  const isClaudeCodeRuntime = isClaudeCodeRuntimeCommand(
+    params.runtime.command?.[0],
+  );
+  const isCodexRuntime = isCodexRuntimeCommand(params.runtime.command?.[0]);
+  if (credentials.env.CLAUDE_CODE_OAUTH_TOKEN) {
+    throw new ApiError(
+      409,
+      "A Claude Code subscription token can only be injected into the Claude Code catalog runtime.",
+    );
+  }
+  if (usesClaudeCodeSubscription && !actorUserId) {
+    throw new ApiError(
+      409,
+      "A personal Claude subscription requires a run acting as a signed-in user.",
+    );
+  }
+  if (usesClaudeCodeSubscription && actorUserId) {
+    await claudeCodeAccountManager.requireConnection({
+      runtime: params.runtime,
+      userId: actorUserId,
+      runtimeScope: params.runtimeScope,
+    });
+  }
+  // Claude Code subscription runs receive a one-off per-run passthrough virtual
+  // key in CLAUDE_CODE_OAUTH_TOKEN (and X-Archestra-Virtual-Key); the proxy
+  // swaps it for the user's connected Claude subscription token server-side so
+  // the raw OAuth token never enters the runtime pod.
+  const virtualKey = usesClaudeCodeSubscription
+    ? await VirtualApiKeyModel.create({
+        organizationId: params.organizationId,
+        name: `agent-run-${params.taskId.slice(0, 8)}`,
+        keyType: "passthrough",
+        ...virtualKeyVisibility(params.actor),
+      })
+    : await createProviderBackedVirtualKey({
+        organizationId: params.organizationId,
+        actor: params.actor,
+        taskId: params.taskId,
+        provider: llm.selectedProvider,
+        model: llm.selectedModel,
+        agentLlmApiKeyId: agent.llmApiKeyId,
+        requiredSubscriptionKind: isCodexRuntime ? "chatgpt" : null,
+      });
+  const virtualKeyValue = virtualKey?.value ?? "";
+  if (params.limits.maxCostUsd && virtualKey) {
+    try {
+      await LimitModel.create({
+        entityType: "virtual_key",
+        entityId: virtualKey.virtualKey.id,
+        limitType: "token_cost",
+        limitValue: params.limits.maxCostUsd,
+        model: null,
+        cleanupInterval: "1m",
+      });
+    } catch (error) {
+      await VirtualApiKeyModel.delete(virtualKey.virtualKey.id);
+      throw error;
+    }
+  }
+
+  const modelRouterUrl = `${platformBaseUrl}/v1/unified-model/${params.agentId}`;
+  const anthropicUrl = `${platformBaseUrl}/v1/anthropic/${params.agentId}`;
+  const bedrockUrl = `${platformBaseUrl}/v1/bedrock/${params.agentId}`;
+  const proxyUrl = isClaudeCodeBedrock
+    ? bedrockUrl
+    : params.runtime.inferenceProtocol === "anthropic"
+      ? anthropicUrl
+      : modelRouterUrl;
+  const runtimeModel =
+    params.runtime.inferenceProtocol !== "anthropic"
+      ? `${llm.selectedProvider}:${llm.selectedModel}`
+      : llm.selectedModel;
+  const nativeModel =
+    isClaudeCodeRuntime && !claudeCodeCloudProvider
+      ? resolveClaudeContextVariant({
+          modelId: llm.selectedModel,
+          contextLength: selectedModel
+            ? ModelModel.resolveArchitecturalContextLength(selectedModel)
+            : null,
+        })
+      : llm.selectedModel;
+  const modelContextLength = selectedModel
+    ? ModelModel.resolveEffectiveContextLength(selectedModel)
+    : null;
+  const modelOutputLength = selectedModel
+    ? ModelModel.resolveEffectiveOutputLength(selectedModel)
+    : null;
+  const tiers =
+    params.tiers ??
+    (await organizationAgentRuntimeTiers(params.organizationId));
+  const resources = resolveRunResources(params.limits.tier, tiers);
+  const maxTier = agentRuntimeMaxTier(params.runtime, tiers);
+  const allowedTiers = agentRuntimeAllowedTiers(params.runtime, tiers);
+  const sizeEnv = tierResourceEnv(resources);
+  // The run's stable id: its page, its workspace and the run tools' run_id.
+  const stableRunId = boundWorkspace?.id ?? params.taskId;
+  const nonSecretEnv: Record<string, string> = {
+    // Toolchain thread counts follow the run's size unless the Agent's own
+    // environment, next, sets them.
+    ...sizedToolchainEnv({
+      resources,
+      agentEnvKeys: (params.runtime.environment ?? []).map(({ key }) => key),
+    }),
+    // The Agent Runtime run's own environment goes first: the addresses below must win.
+    // An entry overriding ANTHROPIC_BASE_URL would be exactly the bypass the
+    // platform-URL guard above exists to prevent.
+    ...Object.fromEntries(
+      (params.runtime.environment ?? [])
+        .filter(({ key }) => !RESERVED_RUNTIME_ENV_KEYS.has(key))
+        .map(({ key, value }) => [key, value]),
+    ),
+    ARCHESTRA_AGENT_RUNTIME_AGENT_ID: params.runtime.agentId,
+    ARCHESTRA_AGENT_RUNTIME_AGENT_NAME: agent.name,
+    // The run's id for its page (/chat/runs/:id) and the run tools' run_id:
+    // the first turn's task id, which names its workspace. Every turn keeps it.
+    ARCHESTRA_AGENT_RUNTIME_RUN_ID: stableRunId,
+    // Nothing else in the Pod names the Archestra address a person opens.
+    ARCHESTRA_AGENT_RUNTIME_RUN_URL: agentRunUrl(stableRunId),
+    ARCHESTRA_AGENT_RUNTIME_TASK_ID: params.taskId,
+    ARCHESTRA_AGENT_RUNTIME_MODEL: runtimeModel,
+    // Native CLIs use provider-published model slugs for local metadata and
+    // capability detection. Their single-provider virtual key keeps this
+    // unambiguous at the Unified Model API while the generic Agent Runtime client retains the
+    // qualified model id above.
+    ARCHESTRA_AGENT_RUNTIME_NATIVE_MODEL: nativeModel,
+    ARCHESTRA_AGENT_RUNTIME_MODEL_PROVIDER: llm.selectedProvider,
+    ...(modelContextLength
+      ? {
+          ARCHESTRA_AGENT_RUNTIME_MODEL_CONTEXT_LENGTH:
+            String(modelContextLength),
+        }
+      : {}),
+    ...(modelOutputLength
+      ? {
+          ARCHESTRA_AGENT_RUNTIME_MODEL_OUTPUT_LENGTH:
+            String(modelOutputLength),
+        }
+      : {}),
+    ARCHESTRA_AGENT_RUNTIME_MODE: params.runMode,
+    ARCHESTRA_AGENT_RUNTIME_BANNER: runBanner(params.appName),
+    ARCHESTRA_AGENT_RUNTIME_STEER_FIFO: AGENT_RUNTIME_STEER_FIFO,
+    // The finish contract: a session that has done its work parks this long
+    // for further direction, then exits so the run and task settle.
+    ARCHESTRA_AGENT_RUNTIME_IDLE_TIMEOUT_SECONDS: String(
+      params.limits.idleTimeoutMinutes * 60,
+    ),
+    // The run's size and the sizes it may move to, so the agent can tell by
+    // the numbers when its work needs a larger run of the same Agent.
+    ...(params.limits.tier
+      ? { [AGENT_RUNTIME_TIER_ENV]: params.limits.tier }
+      : {}),
+    [AGENT_RUNTIME_MAX_TIER_ENV]: maxTier,
+    [AGENT_RUNTIME_TIERS_ENV]: runtimeTiersEnv(
+      allowedTiers,
+      params.limits.tier,
+      params.limits.workspaceGiB,
+    ),
+    ...definedEnv(sizeEnv.pod),
+    ARCHESTRA_LLM_PROXY_URL: proxyUrl,
+    ARCHESTRA_LLM_PROXY_PROTOCOL: params.runtime.inferenceProtocol,
+    // Clients that hide tools from the wire (Codex's tool search and code
+    // mode) must declare them inline for OpenAPPA to govern the session. A
+    // continuation relaunches the client, so it re-reads the switch.
+    ...((await isGuardrailsV2Active())
+      ? { ARCHESTRA_AGENT_RUNTIME_OPENAPPA: "1" }
+      : {}),
+    ...(usesClaudeCodeSubscription
+      ? { ARCHESTRA_AGENT_RUNTIME_CLAUDE_AUTH: "subscription" }
+      : { OPENAI_BASE_URL: modelRouterUrl }),
+    ANTHROPIC_BASE_URL: anthropicUrl,
+    ...(isClaudeCodeBedrock
+      ? {
+          CLAUDE_CODE_USE_BEDROCK: "1",
+          ANTHROPIC_BEDROCK_BASE_URL: bedrockUrl,
+          AWS_REGION: getBedrockRegion(),
+        }
+      : {}),
+    ARCHESTRA_MCP_GATEWAY_URL: `${platformBaseUrl}/v1/mcp/${params.agentId}`,
+  };
+
+  const task = taskWithAgentRunInputs({
+    task: params.task,
+    inputs: params.inputFiles ?? [],
+  });
+  const deadline = boundWorkspace
+    ? Math.max(
+        1,
+        Math.ceil((boundWorkspace.expiresAt.getTime() - Date.now()) / 1000),
+      )
+    : params.limits.maxDurationHours * 3600;
+  let accountToken: Awaited<
+    ReturnType<typeof ServiceAccountModel.createToken>
+  > | null = null;
+  let gatewayToken: string;
+  try {
+    accountToken =
+      params.actor.kind === "serviceAccount"
+        ? await ServiceAccountModel.createToken({
+            serviceAccountId: params.actor.id,
+            organizationId: params.organizationId,
+            name: `agent-run-${params.runId}`,
+            expiresIn: deadline,
+          })
+        : null;
+    gatewayToken =
+      accountToken?.token ??
+      (await resolveGatewayToken({
+        actor: params.actor,
+        agentId: params.agentId,
+        organizationId: params.organizationId,
+        runId: params.runId,
+        expiresIn: deadline,
+      }));
+  } catch (error) {
+    if (virtualKey) await VirtualApiKeyModel.delete(virtualKey.virtualKey.id);
+    if (params.actor.kind === "user") {
+      await OAuthAccessTokenModel.deleteById(
+        agentRunGatewayTokenId(params.runId),
+      );
+    }
+    throw error;
+  }
+  // The volume sentence sits between two fixed parts, so a run served from a
+  // larger tier's warm pool can be told its volume without editing any other
+  // text, the Agent's own prompt included.
+  const systemPromptParts = runtimeSystemPromptParts({
+    lead: [
+      agent.systemPrompt,
+      skillPreview,
+      "Skills configured for this Agent are available through its MCP gateway, " +
+        "not necessarily in this client's native skill directories. " +
+        `Use ${archestraMcpBranding.getToolName(TOOL_LIST_SKILLS_SHORT_NAME)} ` +
+        "to discover available skills and " +
+        `${archestraMcpBranding.getToolName(TOOL_LOAD_SKILL_SHORT_NAME)} ` +
+        "to load matching instructions and bundled resources. " +
+        "If these tools are not directly listed, discover them through the gateway's tool search. " +
+        "Save bundled resources with their relative paths before running them locally; " +
+        "decode resources marked base64 with a shell decoder, not a text-file tool. " +
+        "Paths advertised as code-sandbox mounts belong to that separate sandbox, " +
+        "not this runtime's filesystem.",
+      // Static text, so the prompt stays the same for every run of the Agent.
+      "ARCHESTRA_AGENT_RUNTIME_RUN_URL is this run's page, and ARCHESTRA_AGENT_RUNTIME_RUN_ID is its id, " +
+        "which the run tools take as run_id; follow-ups keep both. " +
+        "Read a variable by name (printenv NAME): the environment also holds this run's credentials.",
+    ],
+    runtime: params.runtime,
+    // After the workspace facts: kept as written when the volume sentence
+    // is rebuilt for a served tier.
+    trail: [
+      describeScaleupDisabledPrompt(params.runtime, tiers, params.limits.tier),
+    ],
+  });
+  const secretEnv: Record<string, string> = {
+    ARCHESTRA_MCP_GATEWAY_TOKEN: gatewayToken,
+    ...(usesClaudeCodeSubscription
+      ? { CLAUDE_CODE_OAUTH_TOKEN: virtualKeyValue }
+      : {}),
+    ...(virtualKey ? { ARCHESTRA_VIRTUAL_KEY: virtualKeyValue } : {}),
+    ...(!isClaudeCodeBedrock && !usesClaudeCodeSubscription
+      ? {
+          // Maintained and bring-your-own CLIs read the provider variables,
+          // so the standard virtual key is presented in each native shape.
+          // The upstream provider secret stays server-side.
+          ANTHROPIC_API_KEY: virtualKeyValue,
+          ANTHROPIC_AUTH_TOKEN: virtualKeyValue,
+          OPENAI_API_KEY: virtualKeyValue,
+        }
+      : {}),
+    [AGENT_RUNTIME_SYSTEM_PROMPT_ENV]: runtimeSystemPrompt(
+      systemPromptParts,
+      params.limits.workspaceGiB,
+    ),
+    ...(task ? { ARCHESTRA_AGENT_RUNTIME_TASK: task } : {}),
+    ...withNativeClientCredentialAliases(credentials.env),
+    ...(isClaudeCodeBedrock
+      ? { AWS_BEARER_TOKEN_BEDROCK: virtualKeyValue }
+      : {}),
+    ...(isClaudeCodeRuntime
+      ? {
+          // Claude Code accepts only one custom-header variable. Subscription
+          // requests need the passthrough key as well as run correlation.
+          [CLAUDE_CODE_CUSTOM_HEADERS_ENV_KEY]: claudeCodeCustomHeaders({
+            taskId: params.taskId,
+            passthroughKey: usesClaudeCodeSubscription
+              ? virtualKeyValue
+              : undefined,
+          }),
+        }
+      : {}),
+  };
+
+  return {
+    virtualApiKeyId: virtualKey?.virtualKey.id ?? null,
+    gatewayTokenId: accountToken?.id ?? null,
+    spec: {
+      poolScope: `${params.organizationId}:${params.runtime.environmentId ?? "default"}`,
+      taskId: params.taskId,
+      agentRuntimeId: params.runtime.agentId,
+      frozenName:
+        boundWorkspace?.workloadName ??
+        constructStableRunName(agent.name, params.taskId),
+      runtimeScope: params.runtimeScope,
+      image: params.runtime.image,
+      command: params.runtime.command ?? null,
+      privileged: params.runtime.privileged,
+      resources,
+      tier: params.limits.tier,
+      warmTiers: params.limits.tier
+        ? warmTierCandidates(params.limits.tier, maxTier, tiers).map(
+            (tier) => ({
+              tier: tier.name,
+              resources: tierResources(tier),
+              workspaceStorageSize: tierWorkspaceStorageSize(tier),
+              workspaceGiB: tierWorkspaceGiB(tier),
+            }),
+          )
+        : [],
+      env: nonSecretEnv,
+      secretEnv,
+      systemPromptParts,
+      ...(Object.keys(credentials.renewableCredentials).length
+        ? { renewableCredentials: credentials.renewableCredentials }
+        : {}),
+      activeDeadlineSeconds: params.limits.maxDurationHours * 60 * 60,
+      workspaceStorageSize: resolveRunWorkspaceStorageSize(
+        params.limits.tier,
+        tiers,
+      ),
+      workspaceStorageClass: config.agentRuntime.workspaceStorageClass,
+      nodeSelector: config.agentRuntime.nodeSelector,
+      runtimeClassName: config.agentRuntime.runtimeClassName,
+      imagePullSecrets: params.imagePullSecrets ?? [],
+      effectiveNetworkPolicy: params.effectiveNetworkPolicy,
+      inputFileCount: params.inputFiles?.length ?? 0,
+    },
+  };
+}
+
+function runBanner(appName: string): string {
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  if (config.enterpriseFeatures.fullWhiteLabeling) {
+    return `${appName}\nSecure access to your AI tools`;
+  }
+  // SPDX-SnippetEnd
+
+  return isDefaultBrandedAppName(appName)
+    ? archestraMarkWithText({ appName }).join("\n")
+    : `${appName}\nSecure access to your AI tools`;
+}
+
+const RESERVED_RUNTIME_ENV_KEYS = new Set([
+  AGENT_RUNTIME_TIER_ENV,
+  AGENT_RUNTIME_MAX_TIER_ENV,
+  AGENT_RUNTIME_TIERS_ENV,
+  AGENT_RUNTIME_CPU_REQUEST_ENV,
+  AGENT_RUNTIME_CPU_LIMIT_ENV,
+  AGENT_RUNTIME_MEMORY_REQUEST_ENV,
+  AGENT_RUNTIME_MEMORY_LIMIT_ENV,
+  AGENT_RUNTIME_CPUS_ENV,
+  AGENT_RUNTIME_SIZED_ENV,
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_CUSTOM_HEADERS",
+  "ANTHROPIC_BEDROCK_BASE_URL",
+  "AWS_BEARER_TOKEN_BEDROCK",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "CLAUDE_CONFIG_DIR",
+  "ARCHESTRA_AGENT_RUNTIME_CLAUDE_AUTH",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "ARCHESTRA_AGENT_RUNTIME_AGENT_ID",
+  "ARCHESTRA_AGENT_RUNTIME_AGENT_NAME",
+  "ARCHESTRA_AGENT_RUNTIME_BANNER",
+  "ARCHESTRA_AGENT_RUNTIME_MODE",
+  "ARCHESTRA_AGENT_RUNTIME_MODEL",
+  "ARCHESTRA_AGENT_RUNTIME_MODEL_CONTEXT_LENGTH",
+  "ARCHESTRA_AGENT_RUNTIME_MODEL_OUTPUT_LENGTH",
+  "ARCHESTRA_AGENT_RUNTIME_MODEL_PROVIDER",
+  "ARCHESTRA_AGENT_RUNTIME_NATIVE_MODEL",
+  "ARCHESTRA_AGENT_RUNTIME_OPENAPPA",
+  "ARCHESTRA_AGENT_RUNTIME_RUN_ID",
+  "ARCHESTRA_AGENT_RUNTIME_RUN_URL",
+  "ARCHESTRA_AGENT_RUNTIME_STEER_FIFO",
+  "ARCHESTRA_AGENT_RUNTIME_TASK_ID",
+  "ARCHESTRA_AGENT_RUNTIME_SYSTEM_PROMPT",
+  "ARCHESTRA_LLM_PROXY_PROTOCOL",
+  "ARCHESTRA_LLM_PROXY_URL",
+  "ARCHESTRA_MCP_GATEWAY_TOKEN",
+  "ARCHESTRA_MCP_GATEWAY_URL",
+  "ARCHESTRA_VIRTUAL_KEY",
+  "ARCHESTRA_AGENT_RUNTIME_BINDING",
+]);
+
+function claudeCodeCustomHeaders(params: {
+  taskId: string;
+  passthroughKey?: string;
+}): string {
+  return [
+    // The image adds the session headers: they name the workspace, which
+    // pod-run assigns after this spec is built.
+    `${RUN_ID_HEADER}: ${params.taskId}`,
+    ...(params.passthroughKey
+      ? [`X-Archestra-Virtual-Key: ${params.passthroughKey}`]
+      : []),
+  ].join("\n");
+}
+
+async function createProviderBackedVirtualKey(params: {
+  organizationId: string;
+  actor: A2AActor;
+  taskId: string;
+  provider: SupportedProvider;
+  model: string;
+  agentLlmApiKeyId: string | null;
+  requiredSubscriptionKind: SubscriptionCredentialKind | null;
+}): Promise<Awaited<ReturnType<typeof VirtualApiKeyModel.create>>> {
+  if (params.actor.kind === "serviceAccount")
+    await resolveOauthServiceAccount({
+      serviceAccountId: params.actor.id,
+      organizationId: params.organizationId,
+    });
+  const actorUserId = params.actor.kind === "user" ? params.actor.id : null;
+  const requiredSubscription =
+    params.requiredSubscriptionKind && actorUserId
+      ? await LlmProviderApiKeyModel.findPersonalSubscriptionKey({
+          organizationId: params.organizationId,
+          userId: actorUserId,
+          kind: params.requiredSubscriptionKind,
+        })
+      : null;
+  if (params.requiredSubscriptionKind && !requiredSubscription) {
+    throw new ApiError(
+      409,
+      `Connect your own ${SUBSCRIPTION_CREDENTIALS[params.requiredSubscriptionKind].label} before starting this Agent. The maintained runtime never falls back to usage-based API billing.`,
+    );
+  }
+  const resolvedProviderCredential = requiredSubscription
+    ? {
+        authRequired: undefined,
+        chatApiKeyId: requiredSubscription.apiKey.id,
+      }
+    : await resolveProviderApiKey({
+        organizationId: params.organizationId,
+        userId:
+          params.actor.kind === "serviceAccount"
+            ? serviceAccountUserId(params.actor.id)
+            : (actorUserId ?? undefined),
+        provider: params.provider,
+        agentLlmApiKeyId: params.agentLlmApiKeyId ?? undefined,
+        modelName: params.model,
+      });
+  if (resolvedProviderCredential.authRequired) {
+    throw new ApiError(
+      409,
+      `Connect your own ${resolvedProviderCredential.authRequired.providerLabel} before starting this Agent's Agent Runtime. Subscription credentials are never shared between users.`,
+    );
+  }
+  const providerApiKey = resolvedProviderCredential.chatApiKeyId
+    ? await LlmProviderApiKeyModel.findById(
+        resolvedProviderCredential.chatApiKeyId,
+      )
+    : null;
+  if (!providerApiKey) {
+    throw new ApiError(
+      409,
+      `No ${providerDisplayNames[params.provider]} credential is available for this Agent and user, so the Agent Runtime run cannot use its selected model.`,
+    );
+  }
+
+  await ensureProviderApiKeySupportsSelectedModel({
+    providerApiKey,
+    provider: params.provider,
+    model: params.model,
+    subscriptionCredential:
+      requiredSubscription && params.requiredSubscriptionKind
+        ? {
+            kind: params.requiredSubscriptionKind,
+            apiKeyValue: requiredSubscription.apiKeyValue,
+          }
+        : null,
+  });
+
+  return VirtualApiKeyModel.create({
+    organizationId: params.organizationId,
+    name: `agent-run-${params.taskId.slice(0, 8)}`,
+    // Personal scope is what attributes the session's LLM spend to the human
+    // it acts as rather than to the organization at large.
+    ...virtualKeyVisibility(params.actor),
+    providerApiKeys: [
+      {
+        provider: params.provider,
+        providerApiKeyId: providerApiKey.id,
+      },
+    ],
+  });
+}
+
+async function resolveGatewayToken(params: {
+  actor: A2AActor;
+  agentId: string;
+  organizationId: string;
+  runId: string;
+  expiresIn: number;
+}): Promise<string> {
+  if (params.actor.kind === "user") {
+    await OAuthClientModel.ensurePlatformIssuedClient({
+      id: AGENT_RUNTIME_OAUTH_CLIENT_ID,
+      clientId: AGENT_RUNTIME_OAUTH_CLIENT_ID,
+      name: "Agent Runtime",
+    });
+    const value = randomBytes(32).toString("base64url");
+    const tokenHash = OAuthAccessTokenModel.hashTokenForLookup(value);
+    await OAuthAccessTokenModel.create({
+      id: agentRunGatewayTokenId(params.runId),
+      tokenHash,
+      clientId: AGENT_RUNTIME_OAUTH_CLIENT_ID,
+      userId: params.actor.id,
+      expiresAt: new Date(Date.now() + params.expiresIn * 1000),
+      scopes: ["mcp"],
+      referenceId: `${MCP_RESOURCE_REFERENCE_PREFIX}${params.agentId}`,
+    });
+    return value;
+  }
+  // Team tokens are retired, so a team actor (only left on runs started
+  // before then) has nothing to act with.
+  if (params.actor.kind !== "team") {
+    const selected = await selectMCPGatewayToken(
+      params.agentId,
+      "system",
+      params.organizationId,
+    );
+    if (selected?.tokenValue) return selected.tokenValue;
+  }
+  throw new ApiError(
+    500,
+    "Could not resolve an MCP gateway token for this run actor",
+  );
+}
+
+/**
+ * Who the run's virtual key reaches, as creation grants. A user actor's key
+ * is the user's own (the author gets full access from creation, and nothing
+ * else reaches it), which is what attributes the session's LLM spend to that
+ * person. A team actor's key reaches the team; an organization actor's key is
+ * published to the organization. The retired `scope` column is written to
+ * match, though nothing reads it.
+ */
+function virtualKeyVisibility(actor: A2AActor): {
+  scope: "personal" | "team" | "org";
+  authorId: string | null;
+  initialPermissionGrants?: ResourcePermissionGrant[];
+  publishToOrganization?: boolean;
+} {
+  if (actor.kind === "user") {
+    return { scope: "personal", authorId: actor.id };
+  }
+  if (actor.kind === "serviceAccount")
+    return { scope: "personal", authorId: serviceAccountUserId(actor.id) };
+  if (actor.kind === "team") {
+    return {
+      scope: "team",
+      authorId: null,
+      initialPermissionGrants: [
+        { subject: { type: "team", id: actor.id }, actions: ["read", "use"] },
+      ],
+    };
+  }
+  return { scope: "org", authorId: null, publishToOrganization: true };
+}
+
+/**
+ * The system prompt around its volume sentence: the Agent's prompt and the
+ * platform's notes first, then the workspace facts the platform owns,
+ * whatever the image installs: what survives between turns, how large the
+ * volume is (added by `runtimeSystemPrompt`), and which ports a user can open
+ * from it; then the trailing notes, such as a fixed scaleup. The image
+ * describes its own tools; see `docker_images/agent/environment.md`.
+ */
+function runtimeSystemPromptParts(params: {
+  lead: Array<string | null | undefined>;
+  runtime: Pick<ResolvedAgentRuntime, "ports">;
+  trail: Array<string | null | undefined>;
+}): RuntimeSystemPromptParts {
+  const ports = [...new Set(params.runtime.ports ?? [])];
+  const trail = params.trail.filter(Boolean);
+  return {
+    beforeVolume: [
+      ...params.lead,
+      "Files under /home/node persist across this conversation's turns; " +
+        "other paths reset when the container is replaced.",
+    ]
+      .filter(Boolean)
+      .join("\n\n"),
+    afterVolume:
+      (ports.length > 0
+        ? ` The user can forward ${ports.length === 1 ? "port" : "ports"} ` +
+          `${ports.join(", ")} from this workspace to a browser; serve anything ` +
+          "they should open there."
+        : "") + trail.map((part) => `\n\n${part}`).join(""),
+  };
+}
+
+function withNativeClientCredentialAliases(
+  credentials: Record<string, string>,
+): Record<string, string> {
+  // GitHub accepts GITHUB_TOKEN across its APIs, while the gh CLI's canonical
+  // non-interactive variable is GH_TOKEN. Catalog users declare it once and
+  // git/gh-based clients receive the shape they expect.
+  return credentials.GITHUB_TOKEN && !credentials.GH_TOKEN
+    ? { ...credentials, GH_TOKEN: credentials.GITHUB_TOKEN }
+    : credentials;
+}

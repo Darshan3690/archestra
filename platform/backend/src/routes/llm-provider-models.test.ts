@@ -1,29 +1,35 @@
+import { MAX_CUSTOM_MODEL_TOKEN_LIMIT } from "@archestra/shared";
+import { HttpResponse, http } from "msw";
 import { vi } from "vitest";
-import { isVertexAiEnabled } from "@/clients/gemini-client";
+import { userHasPermission } from "@/auth";
+import { isVertexAiEnabled } from "@/clients/gemini-vertex-ai";
+import { modelsDevClient } from "@/clients/models-dev-client";
+import config from "@/config";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { registerAuditLogHook } from "@/middleware/audit-log-hook";
+import AuditLogModel from "@/models/audit-log";
 import LlmProviderApiKeyModel from "@/models/llm-provider-api-key";
 import LlmProviderApiKeyModelLinkModel from "@/models/llm-provider-api-key-model";
+import MemberModel from "@/models/member";
 import ModelModel from "@/models/model";
+import ModelTeamModel from "@/models/model-team";
+import OrganizationModel from "@/models/organization";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
 import { getSecretValueForLlmProviderApiKey } from "@/secrets-manager";
-import type { FastifyInstanceWithZod } from "@/server";
-import { createFastifyInstance } from "@/server";
 import { modelSyncService } from "@/services/model-sync";
-import { systemKeyManager } from "@/services/system-key-manager";
 import { afterEach, beforeEach, describe, expect, test } from "@/test";
-import type { User } from "@/types";
-import { syncModelsForVisibleApiKeys } from "./llm-provider-models";
+import { useMswServer } from "@/test/msw";
+import type { Model, User } from "@/types";
 
-vi.mock("@/clients/gemini-client", () => ({
+vi.mock("@/auth");
+
+vi.mock("@/clients/gemini-vertex-ai", () => ({
   isVertexAiEnabled: vi.fn(() => false),
 }));
 
 vi.mock("@/clients/bedrock-credentials", () => ({
   isBedrockIamAuthEnabled: vi.fn(() => false),
-}));
-
-vi.mock("@/services/system-key-manager", () => ({
-  systemKeyManager: {
-    syncSystemKeys: vi.fn(),
-  },
 }));
 
 vi.mock("@/clients/models-dev-client", async (importOriginal) => {
@@ -50,21 +56,24 @@ const mockGetSecretValueForLlmProviderApiKey = vi.mocked(
   getSecretValueForLlmProviderApiKey,
 );
 const mockIsVertexAiEnabled = vi.mocked(isVertexAiEnabled);
-const mockSyncSystemKeys = vi.mocked(systemKeyManager.syncSystemKeys);
+const mockUserHasPermission = vi.mocked(userHasPermission);
 
 describe("chat model routes", () => {
+  const server = useMswServer();
   let app: FastifyInstanceWithZod;
   let organizationId: string;
   let user: User;
 
   beforeEach(async ({ makeOrganization, makeUser, makeMember }) => {
+    vi.restoreAllMocks();
     vi.clearAllMocks();
     mockIsVertexAiEnabled.mockReturnValue(false);
+    mockUserHasPermission.mockResolvedValue(true);
 
     const organization = await makeOrganization();
     organizationId = organization.id;
     user = await makeUser();
-    await makeMember(user.id, organizationId);
+    await makeMember(user.id, organizationId, { role: "admin" });
 
     app = createFastifyInstance();
     app.addHook("onRequest", async (request) => {
@@ -77,12 +86,193 @@ describe("chat model routes", () => {
       (request as typeof request & { user: User }).user = user;
     });
 
+    registerAuditLogHook(app);
+
     const { default: llmModelsRoutes } = await import("./llm-provider-models");
     await app.register(llmModelsRoutes);
   });
 
   afterEach(async () => {
     await app.close();
+  });
+
+  test("validates complete custom prices before writing and audits a valid pricing update", async () => {
+    const model = await ModelModel.create({
+      externalId: "openai/test-price-validation",
+      provider: "openai",
+      modelId: "test-price-validation",
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      lastSyncedAt: new Date(),
+    });
+    const url = `/api/llm-models/${model.id}`;
+    const fields = [
+      "customPricePerMillionInput",
+      "customPricePerMillionOutput",
+      "customPricePerMillionCacheRead",
+      "customPricePerMillionCacheWrite",
+    ] as const;
+    for (const field of fields) {
+      for (const invalid of ["0,25", "1usd", "Infinity", "100000000"]) {
+        const response = await app.inject({
+          method: "PATCH",
+          url,
+          payload: {
+            customPricePerMillionInput: "1",
+            customPricePerMillionOutput: "2",
+            customPricePerMillionCacheRead: "0",
+            customPricePerMillionCacheWrite: "0.5",
+            [field]: invalid,
+          },
+        });
+        expect(response.statusCode, `${field}=${invalid}`).toBe(400);
+      }
+    }
+    expect(await ModelModel.findById(model.id)).toMatchObject({
+      customPricePerMillionInput: null,
+      customPricePerMillionOutput: null,
+      customPricePerMillionCacheRead: null,
+      customPricePerMillionCacheWrite: null,
+    });
+
+    const response = await app.inject({
+      method: "PATCH",
+      url,
+      payload: {
+        customPricePerMillionInput: "0.25",
+        customPricePerMillionOutput: "1e1",
+        customPricePerMillionCacheRead: "0",
+        customPricePerMillionCacheWrite: "0.5",
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(await ModelModel.findById(model.id)).toMatchObject({
+      customPricePerMillionInput: "0.25000000",
+      customPricePerMillionOutput: "10.00000000",
+      customPricePerMillionCacheRead: "0.00000000",
+      customPricePerMillionCacheWrite: "0.50000000",
+    });
+    await vi.waitFor(async () => {
+      const { data: rows } = await AuditLogModel.findPaginated({
+        organizationId,
+        resourceType: "llmModel",
+        sortDirection: "asc",
+        limit: 50,
+        offset: 0,
+      });
+      const successful = rows.filter((row) => row.outcome === "success");
+      expect(successful).toHaveLength(1);
+      expect(successful[0].action).toBe("llmModel.updated");
+      expect(successful[0].before).toMatchObject({
+        isCustomPrice: false,
+        priceSource: "default",
+      });
+      expect(successful[0].after).toMatchObject({
+        isCustomPrice: true,
+        pricePerMillionInput: "0.25000000",
+        pricePerMillionOutput: "10.00000000",
+      });
+    });
+  });
+
+  test("refresh reports individual failures, persists rejected subscriptions, and recovers after successful validation", async ({
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const secret = await makeSecret({
+      secret: { apiKey: "github-test-token" },
+    });
+    const key = await makeLlmProviderApiKey(organizationId, secret.id, {
+      name: "Personal subscription",
+      provider: "github-copilot",
+      userId: user.id,
+    });
+    await makeLlmProviderApiKey(organizationId, secret.id, {
+      name: "Unavailable provider",
+      provider: "openai",
+      userId: user.id,
+    });
+    mockGetSecretValueForLlmProviderApiKey.mockResolvedValue(
+      "github-test-token",
+    );
+
+    server.use(
+      http.get(`${config.llm.openai.baseUrl}/models`, () =>
+        HttpResponse.json(
+          { error: { message: "Service unavailable" } },
+          { status: 403 },
+        ),
+      ),
+    );
+    server.use(
+      http.get(config.llm["github-copilot"].tokenExchangeUrl, () =>
+        HttpResponse.json(
+          { error: "temporarily_unavailable" },
+          { status: 503 },
+        ),
+      ),
+    );
+    const unavailable = await app.inject({
+      method: "POST",
+      url: "/api/llm-models/sync",
+    });
+    expect(unavailable.json().success).toBe(false);
+    expect(
+      (await LlmProviderApiKeyModel.findById(key.id))?.requiresReauthentication,
+    ).toBe(false);
+
+    server.use(
+      http.get(config.llm["github-copilot"].tokenExchangeUrl, () =>
+        HttpResponse.json({ error: "invalid_token" }, { status: 401 }),
+      ),
+    );
+    const rejected = await app.inject({
+      method: "POST",
+      url: "/api/llm-models/sync",
+    });
+    expect(rejected.statusCode).toBe(200);
+    expect(rejected.json()).toEqual({
+      success: false,
+      failures: expect.arrayContaining([
+        {
+          apiKeyId: key.id,
+          name: "Personal subscription",
+          provider: "github-copilot",
+          requiresReauthentication: true,
+        },
+        expect.objectContaining({
+          name: "Unavailable provider",
+          requiresReauthentication: false,
+        }),
+      ]),
+    });
+    expect(
+      (await LlmProviderApiKeyModel.findById(key.id))?.requiresReauthentication,
+    ).toBe(true);
+    server.use(
+      http.get(config.llm["github-copilot"].tokenExchangeUrl, () =>
+        HttpResponse.json({
+          token: "copilot-test-bearer",
+          expires_at: Math.floor(Date.now() / 1000) + 3600,
+        }),
+      ),
+      http.get(`${config.llm["github-copilot"].baseUrl}/models`, () =>
+        HttpResponse.json({ data: [] }),
+      ),
+    );
+    const recovered = await app.inject({
+      method: "POST",
+      url: "/api/llm-models/sync",
+    });
+    expect(recovered.json().failures).toEqual([
+      expect.objectContaining({
+        name: "Unavailable provider",
+        requiresReauthentication: false,
+      }),
+    ]);
+    expect(
+      (await LlmProviderApiKeyModel.findById(key.id))?.requiresReauthentication,
+    ).toBe(false);
   });
 
   test("GET /api/chat/models only returns models suitable for chat", async ({
@@ -92,7 +282,6 @@ describe("chat model routes", () => {
     const secret = await makeSecret({ secret: { apiKey: "test-key" } });
     const apiKey = await makeLlmProviderApiKey(organizationId, secret.id, {
       provider: "gemini",
-      scope: "personal",
       userId: user.id,
     });
 
@@ -164,6 +353,138 @@ describe("chat model routes", () => {
     ]);
   });
 
+  test("GET /api/llm-models/available marks a zero-priced audio model as not free", async ({
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+    const apiKey = await makeLlmProviderApiKey(organizationId, secret.id, {
+      provider: "openrouter",
+      userId: user.id,
+    });
+
+    const freeModel = await ModelModel.create({
+      externalId: "openrouter/google/gemma-4-31b-it:free",
+      provider: "openrouter",
+      modelId: "google/gemma-4-31b-it:free",
+      description: "Gemma 4 31B (free)",
+      contextLength: 64_000,
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      supportsToolCalling: false,
+      promptPricePerToken: "0",
+      completionPricePerToken: "0",
+      ignored: false,
+      lastSyncedAt: new Date(),
+    });
+    // OpenRouter publishes `prompt: "0", completion: "0"` for its Lyria music
+    // models because they are billed per second of audio, not per token. They
+    // must not carry the "Free" badge or survive the "Free models only" filter.
+    const audioModel = await ModelModel.create({
+      externalId: "openrouter/google/lyria-3-pro-preview",
+      provider: "openrouter",
+      modelId: "google/lyria-3-pro-preview",
+      description: "Lyria 3 Pro Preview",
+      contextLength: 1_048_576,
+      inputModalities: ["text", "image"],
+      outputModalities: ["text", "audio"],
+      supportsToolCalling: false,
+      promptPricePerToken: "0",
+      completionPricePerToken: "0",
+      ignored: false,
+      lastSyncedAt: new Date(),
+    });
+
+    await LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
+      apiKey.id,
+      [
+        { id: freeModel.id, modelId: freeModel.modelId },
+        { id: audioModel.id, modelId: audioModel.modelId },
+      ],
+      "openrouter",
+    );
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/llm-models/available",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const models: Array<{ id: string; isFree: boolean }> = response.json();
+    const freeById = (id: string) => models.find((m) => m.id === id)?.isFree;
+    expect(freeById("google/gemma-4-31b-it:free")).toBe(true);
+    expect(freeById("google/lyria-3-pro-preview")).toBe(false);
+  });
+
+  test("GET /api/llm-models/available disambiguates stored names that still collide", async ({
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    // Rows written before sync-time name disambiguation existed — or refreshed
+    // by a key whose catalog lists only one member of the pair — still share a
+    // description in the database. The response must tell them apart anyway.
+    const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+    const apiKey = await makeLlmProviderApiKey(organizationId, secret.id, {
+      provider: "openai",
+      userId: user.id,
+    });
+
+    const base = {
+      provider: "openai" as const,
+      contextLength: 128_000,
+      inputModalities: ["text" as const],
+      outputModalities: ["text" as const],
+      supportsToolCalling: true,
+      promptPricePerToken: "0.000001",
+      completionPricePerToken: "0.000002",
+      ignored: false,
+      lastSyncedAt: new Date(),
+    };
+    const models = await Promise.all([
+      ModelModel.create({
+        ...base,
+        externalId: "openai/gpt-4.1",
+        modelId: "gpt-4.1",
+        description: "GPT-4.1",
+      }),
+      ModelModel.create({
+        ...base,
+        externalId: "openai/gpt-4.1-2025-04-14",
+        modelId: "gpt-4.1-2025-04-14",
+        description: "GPT-4.1",
+      }),
+      ModelModel.create({
+        ...base,
+        externalId: "openai/gpt-4.1-mini",
+        modelId: "gpt-4.1-mini",
+        description: "GPT-4.1 mini",
+      }),
+    ]);
+
+    await LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
+      apiKey.id,
+      models.map((model) => ({ id: model.id, modelId: model.modelId })),
+      "openai",
+    );
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/llm-models/available",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const displayNamesById = Object.fromEntries(
+      response
+        .json<Array<{ id: string; displayName: string }>>()
+        .map((model) => [model.id, model.displayName]),
+    );
+    expect(displayNamesById).toEqual({
+      "gpt-4.1": "GPT-4.1",
+      "gpt-4.1-2025-04-14": "GPT-4.1 (2025-04-14)",
+      "gpt-4.1-mini": "GPT-4.1 mini",
+    });
+  });
+
   test("GET /api/llm-models/available?isEmbedding=true only returns embedding models with configured dimensions", async ({
     makeSecret,
     makeLlmProviderApiKey,
@@ -171,7 +492,6 @@ describe("chat model routes", () => {
     const secret = await makeSecret({ secret: { apiKey: "test-key" } });
     const apiKey = await makeLlmProviderApiKey(organizationId, secret.id, {
       provider: "gemini",
-      scope: "personal",
       userId: user.id,
     });
 
@@ -235,105 +555,1260 @@ describe("chat model routes", () => {
     ]);
   });
 
-  test("syncModelsForVisibleApiKeys syncs visible keys and preserves baseUrl", async ({
-    makeSecret,
+  test("GET /api/llm-models/available only reads stored models", async ({
+    makeLlmProviderApiKey,
   }) => {
-    const secret = await makeSecret({ secret: { apiKey: "test-key" } });
-    const openAiKey = await LlmProviderApiKeyModel.create({
-      organizationId,
-      secretId: secret.id,
-      name: "OpenAI Key",
-      provider: "openai",
-      scope: "personal",
-      userId: user.id,
-      baseUrl: "https://proxy.example.com/v1",
-    });
-    const vllmKey = await LlmProviderApiKeyModel.create({
-      organizationId,
-      secretId: null,
-      name: "vLLM Key",
+    // Never synced, so the old lazy path would have fetched it right away.
+    const apiKey = await makeLlmProviderApiKey(organizationId, null, {
       provider: "vllm",
-      scope: "personal",
       userId: user.id,
-      baseUrl: null,
+      baseUrl: "http://vllm.test/v1",
     });
-
-    mockGetSecretValueForLlmProviderApiKey.mockResolvedValue("resolved-secret");
-    const syncSpy = vi
-      .spyOn(modelSyncService, "syncModelsForApiKey")
-      .mockResolvedValue(1);
-
-    await syncModelsForVisibleApiKeys({
-      organizationId,
-      userId: user.id,
-    });
-
-    expect(syncSpy).toHaveBeenNthCalledWith(1, {
-      apiKeyId: vllmKey.id,
-      provider: "vllm",
-      apiKeyValue: "",
-      baseUrl: null,
-      extraHeaders: null,
-    });
-    expect(syncSpy).toHaveBeenNthCalledWith(2, {
-      apiKeyId: openAiKey.id,
-      provider: "openai",
-      apiKeyValue: "resolved-secret",
-      baseUrl: "https://proxy.example.com/v1",
-      extraHeaders: null,
-    });
-  });
-
-  test("syncModelsForVisibleApiKeys skips required providers when the secret cannot be resolved", async ({
-    makeSecret,
-  }) => {
-    const secret = await makeSecret({ secret: { apiKey: "test-key" } });
-    await LlmProviderApiKeyModel.create({
-      organizationId,
-      secretId: secret.id,
-      name: "OpenAI Key",
-      provider: "openai",
-      scope: "personal",
-      userId: user.id,
-    });
-    const availableKeysSpy = vi.spyOn(
-      LlmProviderApiKeyModel,
-      "getAvailableKeysForUser",
+    let providerRequests = 0;
+    server.use(
+      http.get("http://vllm.test/v1/models", () => {
+        providerRequests += 1;
+        return HttpResponse.json({ object: "list", data: [] });
+      }),
     );
-    const syncSpy = vi
-      .spyOn(modelSyncService, "syncModelsForApiKey")
-      .mockResolvedValue(1);
+    const dueKeysSpy = vi.spyOn(LlmProviderApiKeyModel, "findDueForModelSync");
+    const syncSpy = vi.spyOn(modelSyncService, "syncModelsForApiKey");
 
-    mockGetSecretValueForLlmProviderApiKey.mockResolvedValue(undefined);
-
-    await syncModelsForVisibleApiKeys({
-      organizationId,
-      userId: user.id,
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/llm-models/available?apiKeyId=${apiKey.id}`,
     });
+    await new Promise((resolve) => setImmediate(resolve));
 
-    expect(availableKeysSpy).toHaveBeenCalled();
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([]);
+    expect(response.headers["x-archestra-lazy-model-sync"]).toBeUndefined();
+    expect(providerRequests).toBe(0);
     expect(syncSpy).not.toHaveBeenCalled();
+    expect(dueKeysSpy).not.toHaveBeenCalled();
+    expect(modelsDevClient.syncIfNeeded).not.toHaveBeenCalled();
   });
 
-  test("syncModelsForVisibleApiKeys delegates Vertex AI system keys to system key sync", async () => {
-    mockIsVertexAiEnabled.mockReturnValue(true);
+  test("GET /api/llm-models only attaches keys visible to the caller", async ({
+    makeSecret,
+    makeLlmProviderApiKey,
+    makeUser,
+    makeMember,
+    makeOrganization,
+  }) => {
+    // Per-user providers give every member an identically-named personal key
+    // linked to the same global model row — without visibility filtering the
+    // Models page showed them all as indistinguishable duplicates.
+    const model = await ModelModel.create({
+      externalId: "microsoft-365-copilot/microsoft-365-copilot",
+      provider: "microsoft-365-copilot",
+      modelId: "microsoft-365-copilot",
+      description: "Microsoft 365 Copilot",
+      contextLength: null,
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      supportsToolCalling: false,
+      promptPricePerToken: null,
+      completionPricePerToken: null,
+      ignored: false,
+      lastSyncedAt: new Date(),
+    });
 
-    const syncSpy = vi
-      .spyOn(modelSyncService, "syncModelsForApiKey")
-      .mockResolvedValue(1);
+    const ownSecret = await makeSecret({ secret: { apiKey: "own-token" } });
+    const ownKey = await makeLlmProviderApiKey(organizationId, ownSecret.id, {
+      provider: "microsoft-365-copilot",
+      userId: user.id,
+      name: "Microsoft 365 Copilot",
+    });
 
-    await LlmProviderApiKeyModel.createSystemKey({
+    const otherUser = await makeUser();
+    await makeMember(otherUser.id, organizationId);
+    const otherSecret = await makeSecret({ secret: { apiKey: "other-token" } });
+    const otherUsersKey = await makeLlmProviderApiKey(
       organizationId,
-      name: "Vertex AI",
+      otherSecret.id,
+      {
+        provider: "microsoft-365-copilot",
+        userId: otherUser.id,
+        name: "Microsoft 365 Copilot",
+      },
+    );
+
+    const foreignOrg = await makeOrganization();
+    const foreignSecret = await makeSecret({
+      secret: { apiKey: "foreign-token" },
+    });
+    const foreignOrgKey = await makeLlmProviderApiKey(
+      foreignOrg.id,
+      foreignSecret.id,
+      {
+        provider: "microsoft-365-copilot",
+        name: "Microsoft 365 Copilot",
+      },
+    );
+
+    for (const key of [ownKey, otherUsersKey, foreignOrgKey]) {
+      await LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
+        key.id,
+        [{ id: model.id, modelId: model.modelId }],
+        "microsoft-365-copilot",
+      );
+    }
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/llm-models",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const copilotModel = response
+      .json()
+      .find((m: { id: string }) => m.id === model.id);
+    // Only the caller's own personal key — the other member's personal key
+    // and the other organization's key must not leak into the response.
+    expect(copilotModel.apiKeys.map((k: { id: string }) => k.id)).toEqual([
+      ownKey.id,
+    ]);
+  });
+
+  test("GET /api/llm-models narrows by access and sharedWith", async ({
+    makeSecret,
+    makeLlmProviderApiKey,
+    makeTeam,
+  }) => {
+    const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+    const apiKey = await makeLlmProviderApiKey(organizationId, secret.id, {
+      provider: "openai",
+    });
+    const team = await makeTeam(organizationId, user.id);
+    const suffix = crypto.randomUUID().slice(0, 8);
+    const share = async (
+      modelId: string,
+      subject: { type: "team"; id: string } | { type: "organization"; id: "*" },
+    ) => {
+      const model = await ModelModel.create({
+        externalId: `openai/${modelId}-${suffix}`,
+        provider: "openai",
+        modelId: `${modelId}-${suffix}`,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+      const key = {
+        organizationId,
+        resource: "llmModel" as const,
+        scope: model.id,
+      };
+      const policy = await ResourcePermissionPolicyModel.find(key);
+      await ResourcePermissionPolicyModel.replace({
+        ...key,
+        revision: policy?.revision ?? 0,
+        grants: [{ subject, actions: ["read", "use"] }],
+      });
+      return model;
+    };
+    const teamModel = await share("team-model", { type: "team", id: team.id });
+    const orgModel = await share("org-model", {
+      type: "organization",
+      id: "*",
+    });
+    // One sync: it replaces the key's whole model set.
+    await LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
+      apiKey.id,
+      [teamModel, orgModel].map((model) => ({
+        id: model.id,
+        modelId: model.modelId,
+      })),
+      "openai",
+    );
+    const ours = new Set([teamModel.id, orgModel.id]);
+
+    const list = async (params: string) => {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/llm-models?${params}`,
+      });
+      expect(response.statusCode, response.body).toBe(200);
+      return response
+        .json()
+        .filter((model: { id: string }) => ours.has(model.id))
+        .map((model: { id: string }) => model.id);
+    };
+
+    expect((await list("")).sort()).toEqual([...ours].sort());
+    expect(await list(`sharedWith=team:${team.id}`)).toEqual([teamModel.id]);
+    expect(await list("sharedWith=org")).toEqual([orgModel.id]);
+    // Nobody authors a synced model.
+    expect(await list("access=mine")).toEqual([]);
+  });
+
+  describe("GET /api/llm-models — slim reads", () => {
+    const createModel = (modelId: string, extra: Partial<Model> = {}) =>
+      ModelModel.create({
+        externalId: `openai/${modelId}`,
+        provider: "openai",
+        modelId,
+        description: `${modelId} description`,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        promptPricePerToken: "0.000001",
+        completionPricePerToken: "0.000002",
+        lastSyncedAt: new Date(),
+        ...extra,
+      });
+
+    let seeded: {
+      orgKey: { id: string };
+      othersKey: { id: string };
+      chat: Model;
+    };
+
+    beforeEach(
+      async ({ makeSecret, makeLlmProviderApiKey, makeUser, makeMember }) => {
+        const secret = await makeSecret({ secret: { apiKey: "sk-test" } });
+        const orgKey = await makeLlmProviderApiKey(organizationId, secret.id, {
+          provider: "openai",
+          name: "Org key",
+        });
+        const otherUser = await makeUser();
+        await makeMember(otherUser.id, organizationId);
+        const othersKey = await makeLlmProviderApiKey(
+          organizationId,
+          secret.id,
+          {
+            provider: "openai",
+            userId: otherUser.id,
+            name: "Someone else's key",
+          },
+        );
+        const chat = await createModel("gpt-chat");
+        const embedding = await createModel("text-embed", {
+          embeddingDimensions: 1536,
+        });
+        const hidden = await createModel("gpt-hidden", { ignored: true });
+        const othersOnly = await createModel("gpt-others-only");
+        await LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
+          orgKey.id,
+          [chat, embedding, hidden],
+          "openai",
+        );
+        await LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
+          othersKey.id,
+          [chat, othersOnly],
+          "openai",
+        );
+        seeded = { orgKey, othersKey, chat };
+      },
+    );
+
+    const get = async (url: string) => {
+      const response = await app.inject({ method: "GET", url });
+      expect(response.statusCode, response.body).toBe(200);
+      return response.json();
+    };
+
+    test("narrows the full list by key or to embedding models, and can skip assignments", async () => {
+      const { orgKey, othersKey } = seeded;
+      const summary = (
+        models: Array<{
+          modelId: string;
+          apiKeys: Array<{ id: string }>;
+          labels: unknown[];
+        }>,
+      ) => models.map((model) => [model.modelId, model.apiKeys.length]);
+
+      expect(
+        summary(await get(`/api/llm-models?apiKeyIds=${orgKey.id}`)),
+      ).toEqual([
+        ["gpt-chat", 1],
+        ["gpt-hidden", 1],
+        ["text-embed", 1],
+      ]);
+      // Another member's personal key is not the caller's to filter by.
+      expect(await get(`/api/llm-models?apiKeyIds=${othersKey.id}`)).toEqual(
+        [],
+      );
+      // An empty key list asks for no models, not for every model.
+      expect(await get("/api/llm-models?apiKeyIds=")).toEqual([]);
+      expect(summary(await get("/api/llm-models?embedding=true"))).toEqual([
+        ["text-embed", 1],
+      ]);
+
+      const full = await get("/api/llm-models");
+      const slim = await get("/api/llm-models?includeAssignments=false");
+      expect(slim.map((model: { id: string }) => model.id)).toEqual(
+        full.map((model: { id: string }) => model.id),
+      );
+    });
+
+    test("lists each visible key's shown models for the key pickers", async () => {
+      const { orgKey } = seeded;
+
+      expect(await get("/api/llm-models/key-model-ids")).toEqual([
+        { apiKeyId: orgKey.id, modelIds: ["gpt-chat", "text-embed"] },
+      ]);
+    });
+
+    test("offers the full list's models, in order, with picker fields only", async () => {
+      const { chat } = seeded;
+      const full = await get("/api/llm-models");
+
+      const options = await get("/api/llm-models/options");
+
+      expect(options).toEqual(
+        full.map(
+          (model: {
+            id: string;
+            modelId: string;
+            provider: string;
+            description: string | null;
+            pricePerMillionInput: string | null;
+            pricePerMillionOutput: string | null;
+            isFree: boolean;
+            isBest: boolean;
+          }) => ({
+            id: model.id,
+            modelId: model.modelId,
+            provider: model.provider,
+            description: model.description,
+            pricePerMillionInput: model.pricePerMillionInput,
+            pricePerMillionOutput: model.pricePerMillionOutput,
+            isFree: model.isFree,
+            isBest: model.isBest,
+          }),
+        ),
+      );
+      expect(options.find((o: { id: string }) => o.id === chat.id)).toEqual(
+        expect.objectContaining({
+          pricePerMillionInput: "1",
+          pricePerMillionOutput: "2",
+        }),
+      );
+
+      // Without llmModel:read the grants decide, the same as for the list.
+      mockUserHasPermission.mockResolvedValue(false);
+      expect(
+        (await get("/api/llm-models/options")).map((o: { id: string }) => o.id),
+      ).toEqual(
+        (await get("/api/llm-models")).map((m: { id: string }) => m.id),
+      );
+    });
+  });
+
+  describe("GET /api/llm-models — effectiveContextLength", () => {
+    /**
+     * The models table shows the window Ollama will actually enforce, while
+     * `contextLength` stays the architectural ceiling `num_ctx` is validated
+     * against. Both have to travel on the response or the table and the chat
+     * context ring disagree.
+     */
+    async function fetchListedModel(params: {
+      apiKeyId: string;
+      defaultParameters?: Record<string, string | number | string[]> | null;
+      configuredParameters?: Record<string, number> | null;
+    }) {
+      const model = await ModelModel.create({
+        externalId: "ollama/qwen3",
+        provider: "ollama-native",
+        modelId: "qwen3",
+        contextLength: 262144,
+        defaultParameters: params.defaultParameters ?? null,
+        configuredParameters: params.configuredParameters ?? null,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+
+      await LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
+        params.apiKeyId,
+        [{ id: model.id, modelId: model.modelId }],
+        "ollama-native",
+      );
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/llm-models",
+      });
+      expect(response.statusCode).toBe(200);
+      return response.json().find((m: { id: string }) => m.id === model.id) as {
+        contextLength: number | null;
+        effectiveContextLength: number | null;
+      };
+    }
+
+    test("equals the architectural window when nothing caps it", async ({
+      makeSecret,
+      makeLlmProviderApiKey,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "ollama" } });
+      const key = await makeLlmProviderApiKey(organizationId, secret.id, {
+        provider: "ollama-native",
+        name: "Ollama",
+      });
+      const listed = await fetchListedModel({ apiKeyId: key.id });
+
+      expect(listed.contextLength).toBe(262144);
+      expect(listed.effectiveContextLength).toBe(262144);
+    });
+
+    test("reports a Modelfile num_ctx that caps the architectural window", async ({
+      makeSecret,
+      makeLlmProviderApiKey,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "ollama" } });
+      const key = await makeLlmProviderApiKey(organizationId, secret.id, {
+        provider: "ollama-native",
+        name: "Ollama",
+      });
+      const listed = await fetchListedModel({
+        apiKeyId: key.id,
+        defaultParameters: { num_ctx: "8192" },
+      });
+
+      // The architectural value must survive — it is the `num_ctx` ceiling, so
+      // overwriting it would forbid raising the window past the Modelfile.
+      expect(listed.contextLength).toBe(262144);
+      expect(listed.effectiveContextLength).toBe(8192);
+    });
+
+    test("prefers a configured num_ctx over the Modelfile default", async ({
+      makeSecret,
+      makeLlmProviderApiKey,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "ollama" } });
+      const key = await makeLlmProviderApiKey(organizationId, secret.id, {
+        provider: "ollama-native",
+        name: "Ollama",
+      });
+      const listed = await fetchListedModel({
+        apiKeyId: key.id,
+        defaultParameters: { num_ctx: "8192" },
+        configuredParameters: { num_ctx: 32768 },
+      });
+
+      expect(listed.contextLength).toBe(262144);
+      expect(listed.effectiveContextLength).toBe(32768);
+    });
+  });
+
+  test("PATCH /api/llm-models/:id rejects embedding changes for the model backing the knowledge base", async ({
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+    const apiKey = await makeLlmProviderApiKey(organizationId, secret.id, {
       provider: "gemini",
     });
-
-    await syncModelsForVisibleApiKeys({
-      organizationId,
-      userId: user.id,
+    const embeddingModel = await ModelModel.create({
+      externalId: "gemini/gemini-embedding-001",
+      provider: "gemini",
+      modelId: "gemini-embedding-001",
+      description: "Gemini Embedding 001",
+      contextLength: null,
+      inputModalities: ["text"],
+      outputModalities: [],
+      supportsToolCalling: false,
+      promptPricePerToken: null,
+      completionPricePerToken: null,
+      embeddingDimensions: 3072,
+      ignored: false,
+      lastSyncedAt: new Date(),
+    });
+    await OrganizationModel.patch(organizationId, {
+      embeddingChatApiKeyId: apiKey.id,
+      embeddingModel: embeddingModel.modelId,
     });
 
-    expect(mockSyncSystemKeys).toHaveBeenCalledWith(organizationId);
-    expect(syncSpy).not.toHaveBeenCalled();
+    // Changing dimensions would silently corrupt the existing index.
+    const changeDimensionsResponse = await app.inject({
+      method: "PATCH",
+      url: `/api/llm-models/${embeddingModel.id}`,
+      payload: { embeddingDimensions: 768 },
+    });
+    expect(changeDimensionsResponse.statusCode).toBe(400);
+    expect(changeDimensionsResponse.json().error.message).toContain(
+      "knowledge base embedding model",
+    );
+    expect(changeDimensionsResponse.json().error.internal_code).toBe(
+      "embedding_validation_failed",
+    );
+
+    // Clearing dimensions (turning it back into a chat model) is just as bad.
+    const clearDimensionsResponse = await app.inject({
+      method: "PATCH",
+      url: `/api/llm-models/${embeddingModel.id}`,
+      payload: { embeddingDimensions: null },
+    });
+    expect(clearDimensionsResponse.statusCode).toBe(400);
+    expect(clearDimensionsResponse.json().error.internal_code).toBe(
+      "embedding_validation_failed",
+    );
+
+    const clearModalitiesResponse = await app.inject({
+      method: "PATCH",
+      url: `/api/llm-models/${embeddingModel.id}`,
+      payload: { inputModalities: null },
+    });
+    expect(clearModalitiesResponse.statusCode).toBe(400);
+    expect(clearModalitiesResponse.json().error.internal_code).toBe(
+      "embedding_validation_failed",
+    );
+
+    const unchanged = await ModelModel.findById(embeddingModel.id);
+    expect(unchanged?.embeddingDimensions).toBe(3072);
+
+    // Non-embedding updates (and resending the unchanged dimensions, which is
+    // what the edit dialog does) stay allowed while the model is locked.
+    const benignResponse = await app.inject({
+      method: "PATCH",
+      url: `/api/llm-models/${embeddingModel.id}`,
+      payload: {
+        ignored: true,
+        embeddingDimensions: 3072,
+        inputModalities: ["text"],
+      },
+    });
+    expect(benignResponse.statusCode).toBe(200);
+    expect(benignResponse.json().ignored).toBe(true);
+  });
+
+  test("PATCH /api/llm-models/:id rejects marking a text-only embedding model image-capable", async () => {
+    const titanText = await ModelModel.create({
+      externalId: "bedrock/amazon.titan-embed-text-v2:0",
+      provider: "bedrock",
+      modelId: "amazon.titan-embed-text-v2:0",
+      inputModalities: ["text"],
+      outputModalities: [],
+      embeddingDimensions: 1024,
+    });
+
+    // Marking image on a text-only embedding model would make connectors
+    // ingest images the embed call rejects.
+    const markImage = await app.inject({
+      method: "PATCH",
+      url: `/api/llm-models/${titanText.id}`,
+      payload: { inputModalities: ["text", "image"] },
+    });
+    expect(markImage.statusCode).toBe(400);
+    expect(markImage.json().error.internal_code).toBe(
+      "embedding_validation_failed",
+    );
+    expect(markImage.json().error.message).toContain("text-only");
+
+    // The same broken state via the other edge: setting embedding dimensions
+    // on an image-capable model whose embedding client is text-only.
+    const chatModel = await ModelModel.create({
+      externalId: "openai/gpt-4o",
+      provider: "openai",
+      modelId: "gpt-4o",
+      inputModalities: ["text", "image"],
+      outputModalities: ["text"],
+    });
+    const convert = await app.inject({
+      method: "PATCH",
+      url: `/api/llm-models/${chatModel.id}`,
+      payload: { embeddingDimensions: 1024 },
+    });
+    expect(convert.statusCode).toBe(400);
+    expect(convert.json().error.internal_code).toBe(
+      "embedding_validation_failed",
+    );
+
+    // A text-only Gemini embedding model is clamped the same way: the Gemini
+    // client forwards images for any model, but the API rejects them, so image
+    // capability is allowlisted per model.
+    const geminiText = await ModelModel.create({
+      externalId: "google/gemini-embedding-001",
+      provider: "gemini",
+      modelId: "gemini-embedding-001",
+      inputModalities: ["text"],
+      outputModalities: [],
+      embeddingDimensions: 1536,
+    });
+    const markGeminiImage = await app.inject({
+      method: "PATCH",
+      url: `/api/llm-models/${geminiText.id}`,
+      payload: { inputModalities: ["text", "image"] },
+    });
+    expect(markGeminiImage.statusCode).toBe(400);
+    expect(markGeminiImage.json().error.internal_code).toBe(
+      "embedding_validation_failed",
+    );
+
+    // A multimodal Bedrock embedding model takes the image modality fine.
+    const titanImage = await ModelModel.create({
+      externalId: "bedrock/amazon.titan-embed-image-v1",
+      provider: "bedrock",
+      modelId: "amazon.titan-embed-image-v1",
+      inputModalities: ["text"],
+      outputModalities: [],
+      embeddingDimensions: 1024,
+    });
+    const markMultimodal = await app.inject({
+      method: "PATCH",
+      url: `/api/llm-models/${titanImage.id}`,
+      payload: { inputModalities: ["text", "image"] },
+    });
+    expect(markMultimodal.statusCode).toBe(200);
+    expect(markMultimodal.json().inputModalities).toEqual(["text", "image"]);
+
+    // Cohere direct: a table model the KB client drives takes image, a model
+    // outside the table is clamped like any other text-only embedding model.
+    const cohereV4 = await ModelModel.create({
+      externalId: "cohere/embed-v4.0",
+      provider: "cohere",
+      modelId: "embed-v4.0",
+      inputModalities: ["text"],
+      outputModalities: [],
+      embeddingDimensions: 1536,
+    });
+    const markCohereImage = await app.inject({
+      method: "PATCH",
+      url: `/api/llm-models/${cohereV4.id}`,
+      payload: { inputModalities: ["text", "image"] },
+    });
+    expect(markCohereImage.statusCode).toBe(200);
+    expect(markCohereImage.json().inputModalities).toEqual(["text", "image"]);
+
+    const cohereV2 = await ModelModel.create({
+      externalId: "cohere/embed-english-v2.0",
+      provider: "cohere",
+      modelId: "embed-english-v2.0",
+      inputModalities: ["text"],
+      outputModalities: [],
+      embeddingDimensions: 1024,
+    });
+    const markCohereV2Image = await app.inject({
+      method: "PATCH",
+      url: `/api/llm-models/${cohereV2.id}`,
+      payload: { inputModalities: ["text", "image"] },
+    });
+    expect(markCohereV2Image.statusCode).toBe(400);
+    expect(markCohereV2Image.json().error.internal_code).toBe(
+      "embedding_validation_failed",
+    );
+
+    // A chat model (no embedding dimensions) keeps image input freely.
+    const chatImage = await app.inject({
+      method: "PATCH",
+      url: `/api/llm-models/${chatModel.id}`,
+      payload: { inputModalities: ["text", "image"] },
+    });
+    expect(chatImage.statusCode).toBe(200);
+  });
+
+  test("PATCH /api/llm-models/:id embedding lock is scoped to the embedding key's provider and lifts after drop", async ({
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+    const apiKey = await makeLlmProviderApiKey(organizationId, secret.id, {
+      provider: "gemini",
+    });
+    const geminiModel = await ModelModel.create({
+      externalId: "gemini/gemini-embedding-001",
+      provider: "gemini",
+      modelId: "gemini-embedding-001",
+      description: "Gemini Embedding 001",
+      contextLength: null,
+      inputModalities: ["text"],
+      outputModalities: [],
+      supportsToolCalling: false,
+      promptPricePerToken: null,
+      completionPricePerToken: null,
+      embeddingDimensions: 3072,
+      ignored: false,
+      lastSyncedAt: new Date(),
+    });
+    // Same model ID under a different provider — a different model row that the
+    // knowledge base never resolves, so it must remain editable.
+    const openrouterModel = await ModelModel.create({
+      externalId: "openrouter/gemini-embedding-001",
+      provider: "openrouter",
+      modelId: "gemini-embedding-001",
+      description: "Gemini Embedding 001 via OpenRouter",
+      contextLength: null,
+      inputModalities: ["text"],
+      outputModalities: [],
+      supportsToolCalling: false,
+      promptPricePerToken: null,
+      completionPricePerToken: null,
+      embeddingDimensions: 3072,
+      ignored: false,
+      lastSyncedAt: new Date(),
+    });
+    await OrganizationModel.patch(organizationId, {
+      embeddingChatApiKeyId: apiKey.id,
+      embeddingModel: geminiModel.modelId,
+    });
+
+    const otherProviderResponse = await app.inject({
+      method: "PATCH",
+      url: `/api/llm-models/${openrouterModel.id}`,
+      payload: { embeddingDimensions: 768 },
+    });
+    expect(otherProviderResponse.statusCode).toBe(200);
+    expect(otherProviderResponse.json().embeddingDimensions).toBe(768);
+
+    // Dropping the embedding config unlocks the previously locked model.
+    await OrganizationModel.patch(organizationId, {
+      embeddingChatApiKeyId: null,
+      embeddingModel: null,
+    });
+    const afterDropResponse = await app.inject({
+      method: "PATCH",
+      url: `/api/llm-models/${geminiModel.id}`,
+      payload: { embeddingDimensions: null },
+    });
+    expect(afterDropResponse.statusCode).toBe(200);
+    expect(afterDropResponse.json().embeddingDimensions).toBe(null);
+  });
+
+  describe("team-restricted models", () => {
+    async function createLinkedChatModels(params: {
+      apiKeyId: string;
+    }): Promise<{ openModel: Model; frontierModel: Model }> {
+      const openModel = await ModelModel.create({
+        externalId: "gemini/gemini-2.5-flash",
+        provider: "gemini",
+        modelId: "gemini-2.5-flash",
+        description: "Gemini 2.5 Flash",
+        contextLength: 1_000_000,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.000001",
+        completionPricePerToken: "0.000002",
+        ignored: false,
+        lastSyncedAt: new Date(),
+      });
+      const frontierModel = await ModelModel.create({
+        externalId: "gemini/gemini-2.5-pro",
+        provider: "gemini",
+        modelId: "gemini-2.5-pro",
+        description: "Gemini 2.5 Pro",
+        contextLength: 1_000_000,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.00001",
+        completionPricePerToken: "0.00003",
+        ignored: false,
+        lastSyncedAt: new Date(),
+      });
+      await LlmProviderApiKeyModelLinkModel.syncModelsForApiKey(
+        params.apiKeyId,
+        [
+          { id: openModel.id, modelId: openModel.modelId },
+          { id: frontierModel.id, modelId: frontierModel.modelId },
+        ],
+        "gemini",
+      );
+      return { openModel, frontierModel };
+    }
+
+    test("GET /api/llm-models/available hides restricted models from non-members and shows them to team members", async ({
+      makeSecret,
+      makeLlmProviderApiKey,
+      makeTeam,
+      makeTeamMember,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const apiKey = await makeLlmProviderApiKey(organizationId, secret.id, {
+        provider: "gemini",
+      });
+      const { frontierModel } = await createLinkedChatModels({
+        apiKeyId: apiKey.id,
+      });
+
+      const devTeam = await makeTeam(organizationId, user.id);
+      await MemberModel.updateRole(user.id, organizationId, "member");
+      const key = {
+        organizationId,
+        resource: "llmModel" as const,
+        scope: frontierModel.id,
+      };
+      const policy = await ResourcePermissionPolicyModel.find(key);
+      await ResourcePermissionPolicyModel.replace({
+        ...key,
+        revision: policy?.revision ?? 0,
+        grants: [
+          {
+            subject: { type: "team", id: devTeam.id },
+            actions: ["read", "use"],
+          },
+        ],
+      });
+
+      // The caller is a plain member, not a catalog manager — no bypass.
+      mockUserHasPermission.mockImplementation(
+        async (_userId, _organizationId, resource, action) =>
+          !(resource === "llmModel" && action === "update"),
+      );
+
+      const before = await app.inject({
+        method: "GET",
+        url: "/api/llm-models/available",
+      });
+      expect(before.statusCode).toBe(200);
+      expect(before.json().map((m: { id: string }) => m.id)).toEqual([
+        "gemini-2.5-flash",
+      ]);
+
+      await makeTeamMember(devTeam.id, user.id);
+
+      const after = await app.inject({
+        method: "GET",
+        url: "/api/llm-models/available",
+      });
+      expect(after.statusCode).toBe(200);
+      expect(after.json().map((m: { id: string }) => m.id)).toEqual(
+        expect.arrayContaining(["gemini-2.5-flash", "gemini-2.5-pro"]),
+      );
+    });
+
+    test("GET /api/llm-models/available keeps restricted models visible to catalog managers outside the team", async ({
+      makeSecret,
+      makeLlmProviderApiKey,
+      makeTeam,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const apiKey = await makeLlmProviderApiKey(organizationId, secret.id, {
+        provider: "gemini",
+      });
+      const { frontierModel } = await createLinkedChatModels({
+        apiKeyId: apiKey.id,
+      });
+
+      const devTeam = await makeTeam(organizationId, user.id);
+      await ModelTeamModel.syncModelTeams(frontierModel.id, [devTeam.id]);
+
+      // The caller holds llmModel:update (org admins included) but is not a
+      // member of the restriction team — full visibility anyway.
+      mockUserHasPermission.mockResolvedValue(true);
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/llm-models/available",
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().map((m: { id: string }) => m.id)).toEqual(
+        expect.arrayContaining(["gemini-2.5-flash", "gemini-2.5-pro"]),
+      );
+    });
+
+    test("GET /api/llm-models returns each model's team restrictions", async ({
+      makeSecret,
+      makeLlmProviderApiKey,
+      makeTeam,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const apiKey = await makeLlmProviderApiKey(organizationId, secret.id, {
+        provider: "gemini",
+      });
+      const { openModel, frontierModel } = await createLinkedChatModels({
+        apiKeyId: apiKey.id,
+      });
+
+      const devTeam = await makeTeam(organizationId, user.id, {
+        name: "Dev Team",
+      });
+      await ModelTeamModel.syncModelTeams(frontierModel.id, [devTeam.id]);
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/llm-models",
+      });
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      const restricted = body.find(
+        (m: { id: string }) => m.id === frontierModel.id,
+      );
+      const unrestricted = body.find(
+        (m: { id: string }) => m.id === openModel.id,
+      );
+      expect(restricted.teams).toEqual([{ id: devTeam.id, name: "Dev Team" }]);
+      expect(unrestricted.teams).toEqual([]);
+    });
+
+    test("PATCH /api/llm-models/:id refuses retired team restriction writes", async ({
+      makeSecret,
+      makeLlmProviderApiKey,
+      makeTeam,
+    }) => {
+      const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+      const apiKey = await makeLlmProviderApiKey(organizationId, secret.id, {
+        provider: "gemini",
+      });
+      const { frontierModel } = await createLinkedChatModels({
+        apiKeyId: apiKey.id,
+      });
+      const devTeam = await makeTeam(organizationId, user.id);
+      await ModelTeamModel.syncModelTeams(frontierModel.id, [devTeam.id]);
+
+      // The retired field is refused rather than dropped, and the stored
+      // restriction stands.
+      const restrict = await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${frontierModel.id}`,
+        body: { teamIds: [] },
+      });
+      expect(restrict.statusCode).toBe(400);
+      await expect(
+        ModelTeamModel.getTeamIdsForModels([frontierModel.id]).then((teams) =>
+          teams.get(frontierModel.id),
+        ),
+      ).resolves.toEqual([devTeam.id]);
+    });
+  });
+
+  describe("PATCH /api/llm-models/:id — configuredParameters", () => {
+    async function makeNativeModel(contextLength: number | null = 131072) {
+      return ModelModel.create({
+        externalId: "ollama/llama3.2",
+        provider: "ollama-native",
+        modelId: "llama3.2",
+        contextLength,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+    }
+
+    async function settleAuditWrites() {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    test("saves generation parameters and records a non-empty audit diff", async () => {
+      const model = await makeNativeModel();
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${model.id}`,
+        payload: {
+          configuredParameters: { num_predict: 1024, temperature: 0.4 },
+        },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().configuredParameters).toEqual({
+        num_predict: 1024,
+        temperature: 0.4,
+      });
+
+      await settleAuditWrites();
+      const { data: rows } = await AuditLogModel.findPaginated({
+        organizationId,
+        resourceType: "llmModel",
+        sortDirection: "asc",
+        limit: 50,
+        offset: 0,
+      });
+
+      // Without configuredParameters in the audit snapshot this diff is empty —
+      // the only other field the save moves is `updatedAt`, which the hook
+      // strips — so "who set num_predict on a globally shared row" is
+      // unanswerable. platform/CLAUDE.md requires asserting on it here.
+      expect(rows).toHaveLength(1);
+      expect(rows[0].action).toBe("llmModel.updated");
+      expect(rows[0].before).toMatchObject({ configuredParameters: null });
+      expect(rows[0].after).toMatchObject({
+        configuredParameters: { num_predict: 1024, temperature: 0.4 },
+      });
+    });
+
+    test("rejects generation parameters for a non-native provider", async () => {
+      const anthropic = await ModelModel.create({
+        externalId: "anthropic/claude-test",
+        provider: "anthropic",
+        modelId: "claude-test",
+        contextLength: 200000,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+
+      // Schema-valid on its own — the rejection under test is the provider
+      // gate, not the bounds check. Nothing sends these to a paid provider, but
+      // an accepted num_ctx would still redefine the window the step-context
+      // guard compacts against.
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${anthropic.id}`,
+        payload: { configuredParameters: { num_ctx: 8192 } },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toContain("Ollama (Native)");
+      expect(
+        (await ModelModel.findById(anthropic.id))?.configuredParameters,
+      ).toBeNull();
+    });
+
+    test("rejects a num_ctx above the model's context length", async () => {
+      const model = await makeNativeModel(131072);
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${model.id}`,
+        payload: { configuredParameters: { num_ctx: 1310720 } },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toContain("131072");
+    });
+
+    test("accepts a num_ctx at the model's context length", async () => {
+      const model = await makeNativeModel(131072);
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${model.id}`,
+        payload: { configuredParameters: { num_ctx: 131072 } },
+      });
+
+      expect(response.statusCode).toBe(200);
+    });
+
+    test("generation parameters need no permission beyond the route's own", async () => {
+      const model = await makeNativeModel();
+      mockUserHasPermission.mockResolvedValue(false);
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${model.id}`,
+        payload: { configuredParameters: { num_predict: 1 } },
+      });
+
+      // An extra `llmModel:admin` gate used to live here. Model rows are global,
+      // but so are the pricing and `ignored` fields an editor could already
+      // write, so it drew a line the rest of the route does not — while locking
+      // custom roles (frozen permission snapshots) out of every edit on an
+      // ollama-native model. `llmModel:update` is the only gate now.
+      expect(response.statusCode).toBe(200);
+      expect(mockUserHasPermission).not.toHaveBeenCalled();
+    });
+
+    test("a pricing-only update still works", async () => {
+      const model = await makeNativeModel();
+      mockUserHasPermission.mockResolvedValue(false);
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${model.id}`,
+        payload: { ignored: true },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(mockUserHasPermission).not.toHaveBeenCalled();
+    });
+
+    test("rejects an out-of-range parameter at the schema boundary", async () => {
+      const model = await makeNativeModel();
+
+      for (const payload of [
+        { top_p: 2 },
+        { num_ctx: 0 },
+        { num_ctx: 8192.5 },
+        { seed: 1.5 },
+        { num_predict: -3 },
+      ]) {
+        const response = await app.inject({
+          method: "PATCH",
+          url: `/api/llm-models/${model.id}`,
+          payload: { configuredParameters: payload },
+        });
+        expect(response.statusCode).toBe(400);
+      }
+    });
+  });
+
+  describe("PATCH /api/llm-models/:id — custom context/output limits", () => {
+    async function makeUnreportedModel() {
+      // A row created from an observed proxy request: no catalog entry behind
+      // it, so the provider reports neither limit.
+      return ModelModel.create({
+        externalId: "vllm/local-llama",
+        provider: "vllm",
+        modelId: "local-llama",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+    }
+
+    async function makeNativeModel(contextLength: number | null = null) {
+      return ModelModel.create({
+        externalId: "ollama/llama3.2",
+        provider: "ollama-native",
+        modelId: "llama3.2",
+        contextLength,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      });
+    }
+
+    async function settleAuditWrites() {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    test("sets both limits on a model the provider reports nothing for", async () => {
+      const model = await makeUnreportedModel();
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${model.id}`,
+        payload: { customContextLength: 128000, customOutputLength: 8192 },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        customContextLength: 128000,
+        customOutputLength: 8192,
+        // The synced columns stay untouched, which is what makes the override
+        // clearable back to the provider's own figures.
+        contextLength: null,
+        outputLength: null,
+      });
+    });
+
+    test("clears the overrides with null", async () => {
+      const model = await makeUnreportedModel();
+      await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${model.id}`,
+        payload: { customContextLength: 128000, customOutputLength: 8192 },
+      });
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${model.id}`,
+        payload: { customContextLength: null, customOutputLength: null },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        customContextLength: null,
+        customOutputLength: null,
+      });
+    });
+
+    test("records a non-empty audit diff for a max-output-only save", async () => {
+      const model = await makeUnreportedModel();
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${model.id}`,
+        payload: { customOutputLength: 8192 },
+      });
+      expect(response.statusCode).toBe(200);
+
+      await settleAuditWrites();
+      const { data: rows } = await AuditLogModel.findPaginated({
+        organizationId,
+        resourceType: "llmModel",
+        sortDirection: "asc",
+        limit: 50,
+        offset: 0,
+      });
+
+      // The output limit is the only field this save moves besides `updatedAt`,
+      // which the audit hook strips — so without it in the snapshot "who raised
+      // the output ceiling on a globally shared row" is unanswerable.
+      expect(rows).toHaveLength(1);
+      expect(rows[0].action).toBe("llmModel.updated");
+      expect(rows[0].before).toMatchObject({ outputLength: null });
+      expect(rows[0].after).toMatchObject({ outputLength: 8192 });
+    });
+
+    test("rejects a limit that is not a positive whole number of tokens", async () => {
+      const model = await makeUnreportedModel();
+
+      for (const payload of [
+        { customContextLength: 0 },
+        { customContextLength: -1 },
+        { customContextLength: 8192.5 },
+        { customOutputLength: 0 },
+        { customOutputLength: 4096.5 },
+        { customOutputLength: MAX_CUSTOM_MODEL_TOKEN_LIMIT + 1 },
+      ]) {
+        const response = await app.inject({
+          method: "PATCH",
+          url: `/api/llm-models/${model.id}`,
+          payload,
+        });
+        expect(response.statusCode).toBe(400);
+      }
+
+      const unchanged = await ModelModel.findById(model.id);
+      expect(unchanged?.customContextLength).toBeNull();
+      expect(unchanged?.customOutputLength).toBeNull();
+    });
+
+    test("an admin-set window becomes the num_ctx ceiling", async () => {
+      // Nothing capped `num_ctx` on this row before — the schema backstop was
+      // the only bound — so stating the window has to start bounding it.
+      const model = await makeNativeModel();
+      await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${model.id}`,
+        payload: { customContextLength: 8192 },
+      });
+
+      const tooLarge = await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${model.id}`,
+        payload: { configuredParameters: { num_ctx: 16384 } },
+      });
+      expect(tooLarge.statusCode).toBe(400);
+      expect(tooLarge.json().error.message).toContain("8192");
+
+      const withinWindow = await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${model.id}`,
+        payload: { configuredParameters: { num_ctx: 8192 } },
+      });
+      expect(withinWindow.statusCode).toBe(200);
+    });
+
+    test("rejects lowering the window below an already-configured num_ctx", async () => {
+      const model = await makeNativeModel(131072);
+      await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${model.id}`,
+        payload: { configuredParameters: { num_ctx: 65536 } },
+      });
+
+      // The inconsistency the num_ctx check exists to prevent, reached from the
+      // other side: only one of the two fields moves in a given request.
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${model.id}`,
+        payload: { customContextLength: 8192 },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toContain("65536");
+      expect((await ModelModel.findById(model.id))?.customContextLength).toBe(
+        null,
+      );
+    });
+
+    test("accepts raising the window and num_ctx together", async () => {
+      const model = await makeNativeModel(null);
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/llm-models/${model.id}`,
+        payload: {
+          customContextLength: 65536,
+          configuredParameters: { num_ctx: 65536 },
+        },
+      });
+
+      // Validated against the post-patch pair; against the stored row this
+      // would have been rejected for a window that no longer applies.
+      expect(response.statusCode).toBe(200);
+    });
   });
 });

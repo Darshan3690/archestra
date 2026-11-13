@@ -1,5 +1,8 @@
+import { sql } from "drizzle-orm";
 import {
+  boolean,
   index,
+  integer,
   jsonb,
   pgTable,
   text,
@@ -7,8 +10,15 @@ import {
   uuid,
   varchar,
 } from "drizzle-orm/pg-core";
-import type { CommonToolCall, MCPGatewayAuthMethod } from "@/types";
+import type {
+  CommonToolCall,
+  EnterpriseCredentialClientType,
+  MCPGatewayAuthMethod,
+  McpGatewayCallSource,
+  ToolOwnerType,
+} from "@/types";
 import agentsTable from "./agent";
+import appsTable from "./app";
 import usersTable from "./user";
 
 // Note: Additional pg_trgm GIN indexes for search are created in migration 0116_pg_trgm_indexes.sql:
@@ -19,9 +29,19 @@ const mcpToolCallsTable = pgTable(
   "mcp_tool_calls",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    // Nullable to preserve MCP tool calls when agent is deleted
-    // null indicates the agent was deleted
+    // Which owner kind made the call. Defaults to "agent" so existing rows and
+    // unchanged agent call sites stay correct; app calls set it to "app".
+    ownerType: varchar("owner_type", { length: 16 })
+      .$type<ToolOwnerType>()
+      .notNull()
+      .default("agent"),
+    // Nullable to preserve MCP tool calls when the agent is deleted
+    // (null agent_id on an agent-owned row indicates the agent was deleted).
     agentId: uuid("agent_id").references(() => agentsTable.id, {
+      onDelete: "set null",
+    }),
+    // Set for app-owned calls; nullable, and set null if the app is deleted.
+    appId: uuid("app_id").references(() => appsTable.id, {
       onDelete: "set null",
     }),
     mcpServerName: varchar("mcp_server_name", { length: 255 }).notNull(),
@@ -32,17 +52,91 @@ const mcpToolCallsTable = pgTable(
     // - tools/list: { tools: [...] }
     // - initialize: { capabilities, serverInfo }
     toolResult: jsonb("tool_result").$type<unknown>(),
+    /**
+     * Plaintext copies of the call's tool name and outcome, so usage statistics
+     * can group on them in SQL: `tool_call`/`tool_result` may be encrypted, and
+     * name plus status is exactly what the `mcp_tool_calls_total` metric already
+     * exposes. Set only for `tools/call` rows. `tool_name` stays null on
+     * encrypted-chat rows, whose content the server must not read. Null on rows
+     * written before these columns existed; readers fall back to the JSON.
+     */
+    toolName: varchar("tool_name", { length: 255 }),
+    isError: boolean("is_error"),
+    /**
+     * Non-null marks `toolCall`/`toolResult` as encrypted under an encrypted-chat
+     * conversation's browser-held key rather than the server key, and names the
+     * conversation whose escrow record recovers it. Readers MUST consult this
+     * before decrypting: a server-key decrypt of these envelopes throws.
+     *
+     * Deliberately has no FK — these rows outlive the conversation under
+     * retention — and no index: reads test it per row, and the rare offline
+     * break-glass scan is acceptable.
+     */
+    encryptedChatConversationId: uuid("encrypted_chat_conversation_id"),
     userId: text("user_id").references(() => usersTable.id, {
       onDelete: "set null",
     }),
+    /** Agent run or external run that issued this gateway call. */
+    runId: varchar("run_id"),
+    /**
+     * The LLM proxy session (`interactions.session_id`) whose model turn
+     * issued this call. Written only from an exact signal: the chat engine's
+     * own session id, or the session headers a gateway client sends, read the
+     * same way the LLM proxy reads them. Null when there is none; readers may
+     * still resolve it through `run_id` (see McpToolCallModel).
+     */
+    sessionId: varchar("session_id"),
+    /**
+     * The model's own id for the tool call this row executed (the provider's
+     * `tool_use` / `tool_calls[].id`), when the caller passed it. Distinct from
+     * `tool_call.id`, which is minted by the platform.
+     */
+    llmToolCallId: varchar("llm_tool_call_id"),
     authMethod: varchar("auth_method", {
       length: 50,
     }).$type<MCPGatewayAuthMethod>(),
+    /**
+     * OAuth client the caller signed in with (`oauth_client.client_id`), when
+     * `authMethod` is "oauth": which agent made the call. No FK, so the row
+     * keeps it after the client is deleted.
+     */
+    oauthClientId: text("oauth_client_id"),
+    /**
+     * Who sent the call over the HTTP gateway: "api" for any outside agent,
+     * "chat" for the built-in chat's loopback client. Null for calls the
+     * platform made in-process, and for rows from before this was recorded.
+     */
+    source: varchar("source", { length: 20 }).$type<McpGatewayCallSource>(),
+    /**
+     * For a call that used an enterprise-managed credential: the client the
+     * exchanged token was issued to (its `azp`), and which kind of client it
+     * is, such as the calling agent's Entra agent identity. Null otherwise.
+     */
+    credentialClientId: text("credential_client_id"),
+    credentialClientType: varchar("credential_client_type", {
+      length: 32,
+    }).$type<EnterpriseCredentialClientType>(),
+    /** Elapsed request-processing time, excluding audit persistence. */
+    durationMs: integer("duration_ms"),
     createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
   },
   (table) => ({
     agentIdIdx: index("mcp_tool_calls_agent_id_idx").on(table.agentId),
+    // The own-logs (log:read without log:admin) view filters every listing by
+    // attributed user; without this each such query seq-scans the table.
+    userIdIdx: index("mcp_tool_calls_user_id_idx").on(table.userId),
+    appIdIdx: index("mcp_tool_calls_app_id_idx").on(table.appId),
     createdAtIdx: index("mcp_tool_calls_created_at_idx").on(table.createdAt),
+    // A session's calls in time order (the session view's keyset walk).
+    // Partial: most rows carry no session, so the index stays small.
+    sessionCreatedAtIdx: index("mcp_tool_calls_session_created_at_idx")
+      .on(table.sessionId, table.createdAt, table.id)
+      .where(sql`${table.sessionId} IS NOT NULL`),
+    // Resolving a session for rows linked only by run id, and the session
+    // filter's run branch.
+    runIdIdx: index("mcp_tool_calls_run_id_idx")
+      .on(table.runId)
+      .where(sql`${table.runId} IS NOT NULL`),
   }),
 );
 

@@ -1,28 +1,37 @@
+import { createHash } from "node:crypto";
 import {
   ARCHESTRA_MCP_CATALOG_ID,
-  TOOL_ARTIFACT_WRITE_FULL_NAME,
   TOOL_QUERY_KNOWLEDGE_SOURCES_FULL_NAME,
   TOOL_RUN_TOOL_FULL_NAME,
   TOOL_SEARCH_TOOLS_FULL_NAME,
-} from "@shared";
+  TOOL_TODO_WRITE_FULL_NAME,
+} from "@archestra/shared";
 import Fastify, { type FastifyInstance } from "fastify";
 import {
   serializerCompiler,
   validatorCompiler,
   type ZodTypeProvider,
 } from "fastify-type-provider-zod";
-import { type Mock, vi } from "vitest";
-import { hasPermission } from "@/auth";
-import { InternalMcpCatalogModel } from "@/models";
-import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import { vi } from "vitest";
+import { auth as betterAuth } from "@/auth/better-auth";
+import config from "@/config";
+import { EnvironmentModel, InternalMcpCatalogModel, ToolModel } from "@/models";
+import GuardrailsPolicyModel from "@/models/guardrails-policy";
+import OpenAppaGithubSyncModel from "@/models/openappa-github-sync";
+import SecretModel from "@/models/secret";
+import { openappaBatteriesService } from "@/openappa/batteries";
+import { guardrailsPolicyService } from "@/services/guardrails-policy";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  type TestAccess,
+  test,
+} from "@/test";
 import { ApiError, type User } from "@/types";
+import { deriveKeyFromSecret, encryptSecretValueWithKey } from "@/utils/crypto";
 import internalMcpCatalogRoutes from "./internal-mcp-catalog";
-
-vi.mock("@/auth", () => ({
-  hasPermission: vi.fn(),
-}));
-
-const mockHasPermission = hasPermission as Mock;
 
 describe("internal MCP catalog routes", () => {
   let app: FastifyInstance;
@@ -30,11 +39,14 @@ describe("internal MCP catalog routes", () => {
 
   beforeEach(async ({ makeMember, makeOrganization, makeUser }) => {
     vi.clearAllMocks();
-    mockHasPermission.mockResolvedValue({ success: true, error: null });
+    vi.spyOn(betterAuth.api, "getSession").mockImplementation(
+      async () => ({ user: { id: user.id } }) as never,
+    );
 
     const organization = await makeOrganization();
     organizationId = organization.id;
     const user = await makeUser();
+    policyAuthor = user.id;
     await makeMember(user.id, organization.id, { role: "admin" });
 
     app = Fastify().withTypeProvider<ZodTypeProvider>();
@@ -68,7 +80,73 @@ describe("internal MCP catalog routes", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await app.close();
+  });
+
+  test("GET /api/internal_mcp_catalog access filter splits rows by how the caller reaches them, ignoring wildcard grants", async ({
+    makeInternalMcpCatalog,
+    makeMember,
+    makeTeam,
+    makeTeamMember,
+    makeUser,
+  }) => {
+    const callerId = policyAuthor;
+    const suffix = crypto.randomUUID().slice(0, 8);
+    const otherUser = await makeUser();
+    await makeMember(otherUser.id, organizationId, { role: "member" });
+    const myTeam = await makeTeam(organizationId, callerId);
+    await makeTeamMember(myTeam.id, callerId);
+    const otherTeam = await makeTeam(organizationId, otherUser.id);
+
+    const seed = (name: string, access: TestAccess, authorId = otherUser.id) =>
+      makeInternalMcpCatalog({
+        name: `${name}-${suffix}`,
+        organizationId,
+        authorId,
+        access,
+      });
+    await seed("mine", "personal", callerId);
+    await seed("other-personal", "personal");
+    await seed("org", "org");
+    await seed("my-team", { teams: [myTeam.id] });
+    await seed("other-team", { teams: [otherTeam.id] });
+    await seed("shared-with-me", { users: [callerId] });
+
+    const list = async (access?: string) => {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/internal_mcp_catalog${access ? `?access=${access}` : ""}`,
+      });
+      expect(response.statusCode, response.body).toBe(200);
+      return response
+        .json()
+        .map((item: { name: string }) => item.name)
+        .filter((name: string) => name.endsWith(`-${suffix}`))
+        .map((name: string) => name.replace(`-${suffix}`, ""))
+        .sort();
+    };
+
+    // The admin reads every catalog item through a `*` grant, which the
+    // filter must not count as "shared".
+    expect(await list()).toEqual([
+      "mine",
+      "my-team",
+      "org",
+      "other-personal",
+      "other-team",
+      "shared-with-me",
+    ]);
+    expect(await list("mine,shared,org")).toEqual([
+      "mine",
+      "my-team",
+      "org",
+      "shared-with-me",
+    ]);
+    expect(await list("others")).toEqual(["other-personal", "other-team"]);
+    expect(await list("mine")).toEqual(["mine"]);
+    expect(await list("shared")).toEqual(["my-team", "shared-with-me"]);
+    expect(await list("org")).toEqual(["org"]);
   });
 
   test("GET /api/internal_mcp_catalog/:id/tools hides implicit Archestra meta tools", async ({
@@ -90,7 +168,326 @@ describe("internal MCP catalog routes", () => {
     expect(toolNames).not.toContain(TOOL_QUERY_KNOWLEDGE_SOURCES_FULL_NAME);
     expect(toolNames).not.toContain(TOOL_SEARCH_TOOLS_FULL_NAME);
     expect(toolNames).not.toContain(TOOL_RUN_TOOL_FULL_NAME);
-    expect(toolNames).toContain(TOOL_ARTIFACT_WRITE_FULL_NAME);
+    expect(toolNames).toContain(TOOL_TODO_WRITE_FULL_NAME);
+  });
+
+  test("picker metadata preserves visible tools and omits assignment and parameter bodies", async ({
+    makeAgent,
+    seedAndAssignArchestraTools,
+  }) => {
+    const agent = await makeAgent();
+    await seedAndAssignArchestraTools(agent.id);
+    await ToolModel.create({
+      catalogId: ARCHESTRA_MCP_CATALOG_ID,
+      name: "archestra__pending_example",
+      parameters: {},
+      clonedPendingDiscovery: true,
+    });
+
+    const full = await app.inject({
+      method: "GET",
+      url: `/api/internal_mcp_catalog/${ARCHESTRA_MCP_CATALOG_ID}/tools`,
+    });
+    const picker = await app.inject({
+      method: "GET",
+      url: `/api/internal_mcp_catalog/${ARCHESTRA_MCP_CATALOG_ID}/tools?view=picker`,
+    });
+    expect(full.statusCode).toBe(200);
+    expect(picker.statusCode).toBe(200);
+    const legacy = full.json();
+    expect(
+      legacy.some(
+        (tool: { assignedAgentCount: number }) => tool.assignedAgentCount > 0,
+      ),
+    ).toBe(true);
+    expect(picker.json()).toEqual(
+      legacy.map(
+        ({
+          parameters: _parameters,
+          assignedAgents: _assignedAgents,
+          assignedAgentCount: _assignedAgentCount,
+          ...tool
+        }: Record<string, unknown>) => tool,
+      ),
+    );
+    const names = picker.json().map((tool: { name: string }) => tool.name);
+    for (const hidden of [
+      "archestra__pending_example",
+      TOOL_SEARCH_TOOLS_FULL_NAME,
+      TOOL_RUN_TOOL_FULL_NAME,
+      TOOL_QUERY_KNOWLEDGE_SOURCES_FULL_NAME,
+    ]) {
+      expect(names).not.toContain(hidden);
+    }
+  });
+
+  test("picker metadata excludes deleted catalog tools", async ({
+    makeInternalMcpCatalog,
+    makeTool,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      authorId: policyAuthor,
+    });
+    await makeTool({ catalogId: catalog.id });
+    await ToolModel.softDeleteByCatalog(catalog.id, new Date());
+    for (const view of ["full", "picker"]) {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/internal_mcp_catalog/${catalog.id}/tools?view=${view}`,
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual([]);
+    }
+  });
+
+  test("GET /api/internal_mcp_catalog/:id/tools lists stored tools with an unreadable catalog credential", async ({
+    makeInternalMcpCatalog,
+    makeTool,
+  }) => {
+    const secret = await SecretModel.create({
+      name: "synthetic-catalog-credential",
+      secret: { client_secret: "synthetic-value" },
+    });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      authorId: policyAuthor,
+      oauthConfig: {
+        name: "synthetic-oauth",
+        server_url: "https://example.com/mcp",
+        client_id: "synthetic-client",
+        redirect_uris: [],
+        scopes: [],
+        default_scopes: [],
+        supports_resource_metadata: false,
+      },
+    });
+    await InternalMcpCatalogModel.update(catalog.id, {
+      clientSecretId: secret.id,
+    });
+    const tool = await makeTool({
+      catalogId: catalog.id,
+      name: "synthetic__lookup",
+      rawName: "lookup",
+    });
+    await SecretModel.updateRawSecret(
+      secret.id,
+      encryptSecretValueWithKey(
+        { client_secret: "synthetic-value" },
+        deriveKeyFromSecret("synthetic-previous-key"),
+      ),
+    );
+
+    await expect(SecretModel.findById(secret.id)).rejects.toThrow();
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/internal_mcp_catalog/${catalog.id}/tools`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([
+      expect.objectContaining({ id: tool.id, name: "synthetic__lookup" }),
+    ]);
+  });
+
+  test("GET /api/internal_mcp_catalog/:id/tools refuses inaccessible and missing catalogs", async ({
+    makeInternalMcpCatalog,
+    makeOrganization,
+    makeTool,
+  }) => {
+    const otherOrganization = await makeOrganization();
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: otherOrganization.id,
+    });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "private__lookup",
+      rawName: "lookup",
+    });
+
+    for (const [id, suffix] of [catalog.id, crypto.randomUUID()].flatMap(
+      (id) => [
+        [id, ""],
+        [id, "?view=picker"],
+      ],
+    )) {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/internal_mcp_catalog/${id}/tools${suffix}`,
+      });
+      expect(response.statusCode).toBe(404);
+    }
+  });
+
+  test("restoring a deleted catalog returns its tools to the composed guardrails policy", async ({
+    makeInternalMcpCatalog,
+    makeTool,
+  }) => {
+    const wasEnabled = config.openappa.enabled;
+    config.openappa.enabled = true;
+    try {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        name: "Docs",
+        serverUrl: "https://mcp.notion.com/mcp",
+      });
+      await makeTool({
+        catalogId: catalog.id,
+        name: "notion__search",
+        rawName: "search",
+      });
+      await declarePolicy({
+        organizationId,
+        namespace: "notion",
+        targets: ["notion"],
+      });
+      const installed =
+        await openappaBatteriesService.recompile(organizationId);
+      const deleted = await app.inject({
+        method: "DELETE",
+        url: `/api/internal_mcp_catalog/${catalog.id}`,
+      });
+      expect(deleted.statusCode).toBe(200);
+      expect(
+        (await openappaBatteriesService.getEffectivePolicy(organizationId))
+          .installFingerprint,
+      ).not.toBe(installed.installFingerprint);
+      const restored = await app.inject({
+        method: "POST",
+        url: `/api/internal_mcp_catalog/${catalog.id}/restore`,
+      });
+      expect(restored.statusCode).toBe(200);
+      expect(
+        (await openappaBatteriesService.getEffectivePolicy(organizationId))
+          .installFingerprint,
+      ).toBe(installed.installFingerprint);
+    } finally {
+      config.openappa.enabled = wasEnabled;
+    }
+  });
+
+  test("renaming a server moves the alias targets its guardrails policy spells", async ({
+    makeInternalMcpCatalog,
+    makeTool,
+  }) => {
+    const wasEnabled = config.openappa.enabled;
+    config.openappa.enabled = true;
+    try {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        name: "Cloud prod",
+      });
+      await makeTool({
+        catalogId: catalog.id,
+        name: "cloud_prod__list",
+        rawName: "list",
+      });
+      await declarePolicy({
+        organizationId,
+        namespace: "cloudflare",
+        targets: ["cloud_prod"],
+      });
+      expect(await batteryStatus(organizationId, "cloudflare")).toBe("active");
+
+      const renamed = await app.inject({
+        method: "PUT",
+        url: `/api/internal_mcp_catalog/${catalog.id}`,
+        payload: { name: "Cloud staging" },
+      });
+      expect(renamed.statusCode).toBe(200);
+
+      const latest = await guardrailsPolicyService.get(organizationId);
+      const declarations = await import("@/openappa/declarations").then(
+        (module) =>
+          module.openappaDeclarations.resolve({
+            organizationId,
+            content: latest.content,
+          }),
+      );
+      expect(
+        declarations.aliases.find((alias) => alias.namespace === "cloudflare")
+          ?.servers,
+      ).toEqual(["cloud_staging"]);
+      expect(await batteryStatus(organizationId, "cloudflare")).toBe("active");
+    } finally {
+      config.openappa.enabled = wasEnabled;
+    }
+  });
+
+  test("a rename leaves a repository-managed policy alone and its battery without a server", async ({
+    makeInternalMcpCatalog,
+    makeTool,
+  }) => {
+    const wasEnabled = config.openappa.enabled;
+    config.openappa.enabled = true;
+    try {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        name: "Cloud prod",
+      });
+      await makeTool({
+        catalogId: catalog.id,
+        name: "cloud_prod__list",
+        rawName: "list",
+      });
+      await declarePolicy({
+        organizationId,
+        namespace: "cloudflare",
+        targets: ["cloud_prod"],
+      });
+      // The repository owns the text from here on, so nothing may rewrite it.
+      await OpenAppaGithubSyncModel.save(organizationId, {
+        repo: "example/policies",
+        ref: null,
+        path: "appa.toml",
+        interval: "1h",
+        githubPatId: null,
+        githubAppConfigId: null,
+      });
+
+      const renamed = await app.inject({
+        method: "PUT",
+        url: `/api/internal_mcp_catalog/${catalog.id}`,
+        payload: { name: "Cloud staging" },
+      });
+      expect(renamed.statusCode).toBe(200);
+
+      const latest = await guardrailsPolicyService.get(organizationId);
+      expect(latest.content).toContain('cloudflare = ["cloud_prod"]');
+      expect(await batteryStatus(organizationId, "cloudflare")).toBe(
+        "server_missing",
+      );
+    } finally {
+      config.openappa.enabled = wasEnabled;
+    }
+  });
+
+  test("DELETE /api/internal_mcp_catalog refuses an app-backing catalog (managed via the Apps lifecycle)", async ({
+    makeInternalMcpCatalog,
+  }) => {
+    const appCatalog = await makeInternalMcpCatalog({
+      organizationId,
+      serverType: "app",
+      name: "my-app-backing",
+      access: "personal",
+    });
+
+    const byId = await app.inject({
+      method: "DELETE",
+      url: `/api/internal_mcp_catalog/${appCatalog.id}`,
+    });
+    expect(byId.statusCode).toBe(400);
+
+    const byName = await app.inject({
+      method: "DELETE",
+      url: "/api/internal_mcp_catalog/by-name/my-app-backing",
+    });
+    expect(byName.statusCode).toBe(400);
+
+    // The catalog still exists — neither delete path removed it.
+    expect(
+      await InternalMcpCatalogModel.findById(appCatalog.id),
+    ).not.toBeNull();
   });
 
   test("DELETE /api/internal_mcp_catalog/by-name/:name is scoped to the active organization", async ({
@@ -101,7 +498,6 @@ describe("internal MCP catalog routes", () => {
     const catalog = await makeInternalMcpCatalog({
       name: "other-org-catalog",
       organizationId: otherOrganization.id,
-      scope: "org",
     });
 
     const response = await app.inject({
@@ -117,7 +513,6 @@ describe("internal MCP catalog routes", () => {
     await makeInternalMcpCatalog({
       name: "active-org-catalog",
       organizationId,
-      scope: "org",
     });
 
     const activeOrgResponse = await app.inject({
@@ -127,4 +522,533 @@ describe("internal MCP catalog routes", () => {
 
     expect(activeOrgResponse.statusCode).toBe(200);
   });
+
+  test("POST /api/internal_mcp_catalog rejects a clonedFrom in another organization", async ({
+    makeInternalMcpCatalog,
+    makeOrganization,
+  }) => {
+    const otherOrganization = await makeOrganization();
+    const foreignSource = await makeInternalMcpCatalog({
+      name: "foreign-clone-source",
+      organizationId: otherOrganization.id,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/internal_mcp_catalog",
+      payload: {
+        name: "clone-of-foreign",
+        serverType: "remote",
+        serverUrl: "https://example.com/mcp",
+        clonedFrom: foreignSource.id,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  test("POST /api/internal_mcp_catalog refuses a name that gives its tools the built-in tools' prefix", async () => {
+    for (const name of ["archestra", "Archestra"]) {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/internal_mcp_catalog",
+        payload: {
+          name,
+          serverType: "remote",
+          serverUrl: "https://example.com/mcp",
+        },
+      });
+      expect(response.statusCode, name).toBe(409);
+    }
+  });
+
+  test("POST /api/internal_mcp_catalog accepts a clonedFrom in the active organization", async ({
+    makeInternalMcpCatalog,
+  }) => {
+    const source = await makeInternalMcpCatalog({
+      name: "same-org-clone-source",
+      organizationId,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/internal_mcp_catalog",
+      payload: {
+        name: "clone-of-same-org",
+        serverType: "remote",
+        serverUrl: "https://example.com/mcp",
+        clonedFrom: source.id,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().clonedFrom).toBe(source.id);
+  });
+
+  describe("network egress policy enforcement (remote servers)", () => {
+    async function makeRestrictedEnv(allowedDomains: string[]) {
+      return EnvironmentModel.create({
+        organizationId,
+        name: `restricted-${crypto.randomUUID().slice(0, 8)}`,
+        networkPolicy: {
+          egressMode: "restricted",
+          domainPreset: "none",
+          allowedDomains,
+          allowedCidrs: [],
+        },
+      });
+    }
+
+    test("POST blocks a remote server whose URL host is not allowed by its environment", async () => {
+      const env = await makeRestrictedEnv(["allowed.example.com"]);
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/internal_mcp_catalog",
+        payload: {
+          name: "blocked-remote",
+          serverType: "remote",
+          serverUrl: "https://evil.example.com/mcp",
+          environmentId: env.id,
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toContain("not permitted");
+    });
+
+    test("POST allows a remote server whose URL host is in the environment allowlist", async () => {
+      const env = await makeRestrictedEnv(["allowed.example.com"]);
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/internal_mcp_catalog",
+        payload: {
+          name: "allowed-remote",
+          serverType: "remote",
+          serverUrl: "https://allowed.example.com/mcp",
+          environmentId: env.id,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+    });
+
+    test("POST does not apply the egress policy to self-hosted servers", async () => {
+      const env = await makeRestrictedEnv(["allowed.example.com"]);
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/internal_mcp_catalog",
+        payload: {
+          name: "self-hosted-in-restricted-env",
+          serverType: "local",
+          environmentId: env.id,
+          localConfig: { command: "node", arguments: ["server.js"] },
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+    });
+
+    test("POST allows a remote server with no environment (built-in default)", async () => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/internal_mcp_catalog",
+        payload: {
+          name: "no-env-remote",
+          serverType: "remote",
+          serverUrl: "https://anything.example.com/mcp",
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+    });
+
+    test("PUT grandfathers an existing remote server when an unrelated field changes", async ({
+      makeInternalMcpCatalog,
+    }) => {
+      const env = await makeRestrictedEnv(["allowed.example.com"]);
+      // Seeded via the model, bypassing route validation — simulates a server
+      // that predates the policy (or the feature).
+      const item = await makeInternalMcpCatalog({
+        organizationId,
+        environmentId: env.id,
+        serverType: "remote",
+        serverUrl: "https://legacy.example.com/mcp",
+      });
+
+      const response = await app.inject({
+        method: "PUT",
+        url: `/api/internal_mcp_catalog/${item.id}`,
+        payload: { description: "updated description" },
+      });
+
+      expect(response.statusCode).toBe(200);
+    });
+
+    test("PUT re-validates the URL against the policy when the URL changes", async ({
+      makeInternalMcpCatalog,
+    }) => {
+      const env = await makeRestrictedEnv(["allowed.example.com"]);
+      const item = await makeInternalMcpCatalog({
+        organizationId,
+        environmentId: env.id,
+        serverType: "remote",
+        serverUrl: "https://allowed.example.com/mcp",
+      });
+
+      const blocked = await app.inject({
+        method: "PUT",
+        url: `/api/internal_mcp_catalog/${item.id}`,
+        payload: { serverUrl: "https://other.example.com/mcp" },
+      });
+      expect(blocked.statusCode).toBe(400);
+
+      const allowed = await app.inject({
+        method: "PUT",
+        url: `/api/internal_mcp_catalog/${item.id}`,
+        payload: { serverUrl: "https://allowed.example.com/v2/mcp" },
+      });
+      expect(allowed.statusCode).toBe(200);
+    });
+
+    test("PUT re-validates the URL when moving the server into a stricter environment", async ({
+      makeInternalMcpCatalog,
+    }) => {
+      // No environment initially → built-in default allows everything.
+      const item = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "remote",
+        serverUrl: "https://legacy.example.com/mcp",
+      });
+      const env = await makeRestrictedEnv(["allowed.example.com"]);
+
+      const response = await app.inject({
+        method: "PUT",
+        url: `/api/internal_mcp_catalog/${item.id}`,
+        payload: { environmentId: env.id },
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+  });
+
+  test("POST clone carries over the source's local-config secret as an independent copy", async () => {
+    const source = (
+      await app.inject({
+        method: "POST",
+        url: "/api/internal_mcp_catalog",
+        payload: {
+          name: "clone-secret-src-local",
+          serverType: "local",
+          localConfig: {
+            command: "node",
+            arguments: ["server.js"],
+            environment: [
+              {
+                key: "QA_SECRET",
+                type: "secret",
+                value: "src-secret-value",
+                promptOnInstallation: false,
+              },
+            ],
+          },
+        },
+      })
+    ).json();
+    expect(source.localConfigSecretId).toBeTruthy();
+
+    // The clone form is seeded from the list endpoint, which does not expand
+    // secrets, so the clone payload carries the env var key but no value.
+    const clone = (
+      await app.inject({
+        method: "POST",
+        url: "/api/internal_mcp_catalog",
+        payload: {
+          name: "clone-secret-src-local-copy",
+          serverType: "local",
+          clonedFrom: source.id,
+          localConfig: {
+            command: "node",
+            arguments: ["server.js"],
+            environment: [
+              { key: "QA_SECRET", type: "secret", promptOnInstallation: false },
+            ],
+          },
+        },
+      })
+    ).json();
+    expect(clone.localConfigSecretId).toBeTruthy();
+    expect(clone.localConfigSecretId).not.toBe(source.localConfigSecretId);
+
+    // GET expands secrets: the cloned value resolves to the source's.
+    const full = (
+      await app.inject({
+        method: "GET",
+        url: `/api/internal_mcp_catalog/${clone.id}`,
+      })
+    ).json();
+    const envVar = full.localConfig.environment.find(
+      (e: { key: string }) => e.key === "QA_SECRET",
+    );
+    expect(envVar.value).toBe("src-secret-value");
+  });
+
+  test("POST clone keeps a secret value supplied in the clone payload over the source's", async () => {
+    const source = (
+      await app.inject({
+        method: "POST",
+        url: "/api/internal_mcp_catalog",
+        payload: {
+          name: "clone-secret-src-override",
+          serverType: "local",
+          localConfig: {
+            command: "node",
+            arguments: ["server.js"],
+            environment: [
+              {
+                key: "QA_SECRET",
+                type: "secret",
+                value: "src-secret-value",
+                promptOnInstallation: false,
+              },
+            ],
+          },
+        },
+      })
+    ).json();
+
+    const clone = (
+      await app.inject({
+        method: "POST",
+        url: "/api/internal_mcp_catalog",
+        payload: {
+          name: "clone-secret-src-override-copy",
+          serverType: "local",
+          clonedFrom: source.id,
+          localConfig: {
+            command: "node",
+            arguments: ["server.js"],
+            environment: [
+              {
+                key: "QA_SECRET",
+                type: "secret",
+                value: "override-value",
+                promptOnInstallation: false,
+              },
+            ],
+          },
+        },
+      })
+    ).json();
+    expect(clone.localConfigSecretId).toBeTruthy();
+    expect(clone.localConfigSecretId).not.toBe(source.localConfigSecretId);
+
+    const full = (
+      await app.inject({
+        method: "GET",
+        url: `/api/internal_mcp_catalog/${clone.id}`,
+      })
+    ).json();
+    const envVar = full.localConfig.environment.find(
+      (e: { key: string }) => e.key === "QA_SECRET",
+    );
+    expect(envVar.value).toBe("override-value");
+  });
+
+  test("POST clone carries over the source's OAuth client secret as an independent copy", async () => {
+    const oauthConfig = {
+      name: "oauth",
+      server_url: "https://example.com",
+      client_id: "cid",
+      redirect_uris: [],
+      scopes: [],
+      default_scopes: [],
+      supports_resource_metadata: false,
+    };
+
+    const source = (
+      await app.inject({
+        method: "POST",
+        url: "/api/internal_mcp_catalog",
+        payload: {
+          name: "clone-secret-src-oauth",
+          serverType: "remote",
+          serverUrl: "https://example.com/mcp",
+          oauthConfig: { ...oauthConfig, client_secret: "oauth-secret-value" },
+        },
+      })
+    ).json();
+    expect(source.clientSecretId).toBeTruthy();
+
+    // Clone payload omits client_secret (the list endpoint never exposed it).
+    const clone = (
+      await app.inject({
+        method: "POST",
+        url: "/api/internal_mcp_catalog",
+        payload: {
+          name: "clone-secret-src-oauth-copy",
+          serverType: "remote",
+          serverUrl: "https://example.com/mcp",
+          clonedFrom: source.id,
+          oauthConfig,
+        },
+      })
+    ).json();
+    expect(clone.clientSecretId).toBeTruthy();
+    expect(clone.clientSecretId).not.toBe(source.clientSecretId);
+
+    const full = (
+      await app.inject({
+        method: "GET",
+        url: `/api/internal_mcp_catalog/${clone.id}`,
+      })
+    ).json();
+    expect(full.oauthConfig.client_secret).toBe("oauth-secret-value");
+  });
+
+  test("POST clone merges per key: overriding one secret keeps the inherited siblings", async () => {
+    const source = (
+      await app.inject({
+        method: "POST",
+        url: "/api/internal_mcp_catalog",
+        payload: {
+          name: "clone-secret-src-multikey",
+          serverType: "local",
+          localConfig: {
+            command: "node",
+            arguments: ["server.js"],
+            environment: [
+              {
+                key: "KEY_A",
+                type: "secret",
+                value: "src-a",
+                promptOnInstallation: false,
+              },
+              {
+                key: "KEY_B",
+                type: "secret",
+                value: "src-b",
+                promptOnInstallation: false,
+              },
+            ],
+          },
+        },
+      })
+    ).json();
+
+    // Clone overrides only KEY_A; KEY_B is left blank and must still inherit.
+    const clone = (
+      await app.inject({
+        method: "POST",
+        url: "/api/internal_mcp_catalog",
+        payload: {
+          name: "clone-secret-src-multikey-copy",
+          serverType: "local",
+          clonedFrom: source.id,
+          localConfig: {
+            command: "node",
+            arguments: ["server.js"],
+            environment: [
+              {
+                key: "KEY_A",
+                type: "secret",
+                value: "override-a",
+                promptOnInstallation: false,
+              },
+              { key: "KEY_B", type: "secret", promptOnInstallation: false },
+            ],
+          },
+        },
+      })
+    ).json();
+
+    const env = (
+      await app.inject({
+        method: "GET",
+        url: `/api/internal_mcp_catalog/${clone.id}`,
+      })
+    ).json().localConfig.environment;
+    expect(env.find((e: { key: string }) => e.key === "KEY_A").value).toBe(
+      "override-a",
+    );
+    expect(env.find((e: { key: string }) => e.key === "KEY_B").value).toBe(
+      "src-b",
+    );
+  });
+
+  test("POST ignores a client-supplied secret FK in the body", async ({
+    makeSecret,
+  }) => {
+    // A secret the caller does not legitimately own via this request.
+    const foreignSecret = await makeSecret({
+      name: "foreign-secret",
+      secret: { API_KEY: "do-not-touch" },
+    });
+
+    const created = (
+      await app.inject({
+        method: "POST",
+        url: "/api/internal_mcp_catalog",
+        payload: {
+          name: "ignore-inbound-fk",
+          serverType: "local",
+          localConfigSecretId: foreignSecret.id,
+          localConfig: {
+            command: "node",
+            arguments: ["server.js"],
+            environment: [
+              { key: "API_KEY", type: "secret", promptOnInstallation: false },
+            ],
+          },
+        },
+      })
+    ).json();
+
+    // The inbound FK is dropped: no value was supplied, so no secret is linked.
+    expect(created.localConfigSecretId).toBeNull();
+  });
 });
+
+let policyAuthor: string;
+
+/** A policy revision including one bundled battery and pointing it at `targets`. */
+async function declarePolicy(params: {
+  organizationId: string;
+  namespace: string;
+  targets: string[];
+}) {
+  const { organizationId, namespace, targets } = params;
+  const latest = await guardrailsPolicyService.get(organizationId);
+  const native = await import("@archestra/openappa-rs");
+  const edited = await native.editOpenappaPolicy(latest.content, [
+    { kind: "addInclude", entry: `batteries/${namespace}/appa.toml` },
+    { kind: "bindServers", namespace, servers: targets },
+  ]);
+  if (edited.errors.length > 0 || !edited.content)
+    throw new Error(`the policy edit failed: ${JSON.stringify(edited.errors)}`);
+  const content = edited.content;
+  const saved = await GuardrailsPolicyModel.save({
+    organizationId,
+    updatedBy: policyAuthor,
+    content,
+    contentHash: createHash("sha256").update(content).digest("hex"),
+    expectedRevision: latest.revision,
+  });
+  if (!saved) throw new Error("the policy revision was not saved");
+  await openappaBatteriesService.recompile(organizationId);
+}
+
+async function batteryStatus(
+  organizationId: string,
+  name: string,
+): Promise<string> {
+  const declarations =
+    await openappaBatteriesService.policyDeclarations(organizationId);
+  const battery = declarations.batteries.find(
+    (candidate) => candidate.name === name,
+  );
+  if (!battery) throw new Error(`the policy includes no battery ${name}`);
+  return battery.status;
+}

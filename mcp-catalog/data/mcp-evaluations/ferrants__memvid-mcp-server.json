@@ -1,0 +1,65 @@
+{
+  "name": "ferrants__memvid-mcp-server",
+  "display_name": "memvid-mcp-server",
+  "description": "A Streamable HTTP MCP Server for Memvid",
+  "author": {
+    "name": "ferrants"
+  },
+  "server": {
+    "command": "python",
+    "args": ["server.py"],
+    "env": {
+      "PORT": "${user_config.port}"
+    },
+    "type": "local"
+  },
+  "tools": [],
+  "prompts": [],
+  "keywords": [],
+  "user_config": {
+    "port": {
+      "type": "number",
+      "title": "Server Port",
+      "description": "The port the MCP server will listen on.",
+      "default": 3000,
+      "required": false
+    }
+  },
+  "readme": "# memvid-mcp-server\n\n\nA Streamable-HTTP MCP Server that uses [memvid](https://github.com/Olow304/memvid) to encode text data into videos that can be quickly looked up with semantic search.\n\n\nSupported Actions:\n- `add_chunks`: Adds chunks to the memory video. Note: each time you add chunks, it resets the memory.mp4. Unsure if there is a way to incrementally add.\n- `search`: queries for the top-matching chunks. Returns 5 by default, but can be changed with top_k param.\n\n## Running\n\nSet up your environment:\n```bash\npython3.11 -m venv my_env\n. ./my_env/bin/activate\npip install -r requirements.txt\n```\n\nRun the server:\n```bash\npython server.py\n```\n\nWith a custom port:\n\n```bash\nPORT=3002 python server.py\n```\n\n## Connect a Client\n\nYou can connect a client to your MCP Server once it's running. Configure per the client's configuration. There is the [mcp-config.json](/mcp-config.json) that has an example configuration that looks like this:\n```json\n{\n  \"mcpServers\": {\n    \"memvid\": {\n      \"type\": \"streamable-http\",\n      \"url\": \"http://localhost:3000\"\n    }\n  }\n}\n```\n\n### Acknowledgements\n\n- Obviously the modelcontextprotocol and Anthropic teams for the MCP Specification. [https://modelcontextprotocol.io/introduction](https://modelcontextprotocol.io/introduction)\n- [HeyFerrante](https://heyferrante.com?ref=github-memvid-mcp-server) for enabling and sponsoring this project.\n",
+  "category": "AI Tools",
+  "archestra_config": {
+    "client_config_permutations": {
+      "memvid-mcp-server": {
+        "command": "python",
+        "args": ["server.py"],
+        "env": {}
+      },
+      "memvid-mcp-server-configured": {
+        "command": "python",
+        "args": ["server.py"],
+        "env": {
+          "PORT": "3002"
+        }
+      }
+    },
+    "oauth": {
+      "provider": null,
+      "required": false
+    },
+    "works_in_archestra": false
+  },
+  "github_info": {
+    "owner": "ferrants",
+    "repo": "memvid-mcp-server",
+    "url": "https://github.com/ferrants/memvid-mcp-server",
+    "name": "ferrants__memvid-mcp-server",
+    "path": null,
+    "stars": 4,
+    "contributors": 1,
+    "issues": 0,
+    "releases": false,
+    "ci_cd": false,
+    "latest_commit_hash": "ebb5ff48a55d3761f412cb41621d701283cde80f"
+  },
+  "programming_language": "Python"
+}

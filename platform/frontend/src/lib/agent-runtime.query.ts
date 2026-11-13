@@ -1,0 +1,575 @@
+import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import type { FileUIPart } from "ai";
+import { useMemo } from "react";
+import { toast } from "sonner";
+import {
+  hasRecentlyEnded,
+  hasRetainedSessionActivity,
+} from "@/lib/agent-run-activity";
+import {
+  agentRunQueryKey,
+  MY_AGENT_RUNS_PAGE_SIZE,
+  type MyAgentRunsOptions,
+  myAgentRunsPageQuery,
+  myAgentRunsQueryKey,
+} from "@/lib/agent-runs-query-keys";
+import { reportBulkOutcome, toBulkOutcome } from "@/lib/bulk-action";
+import { useFeature } from "@/lib/config/config.query";
+import { validateUploadFile } from "@/lib/files/file-upload";
+import { reportApiError, throwOnApiError } from "@/lib/utils/api";
+
+const {
+  bulkCancelAgentRuns,
+  bulkDeleteAgentRuns,
+  bulkDeleteAgentWorkspaces,
+  cancelAgentRun,
+  continueAgentRun,
+  deleteAgentRun,
+  deleteAgentWorkspace,
+  getAgentRuntimePreflight,
+  getAgentRuns,
+  getMyAgentRun,
+  getMyAgentRuns,
+  setAgentRuntimeCredential,
+  startAgentRun,
+  startAgentWorkspaceTransfer,
+  updateAgentRun,
+  uploadAgentWorkspaceTransfer,
+} = archestraApiSdk;
+
+export type AgentRunListItem =
+  archestraApiTypes.GetAgentRunsResponses["200"][number];
+export type AgentRun = Omit<
+  AgentRunListItem,
+  | "initiatorName"
+  | "shareVisibility"
+  | "shareTeamNames"
+  | "shareUserNames"
+  | "workspace"
+>;
+export type AgentRunSession =
+  archestraApiTypes.GetMyAgentRunsResponses["200"]["data"][number];
+
+export function useAgentRuntimePreflight(agentId: string, enabled = true) {
+  return useQuery({
+    queryKey: ["agents", agentId, "runtime", "preflight"],
+    queryFn: async () => {
+      const { data, error } = await getAgentRuntimePreflight({
+        path: { id: agentId },
+      });
+      throwOnApiError(error, { toastOnError: false });
+      return data;
+    },
+    enabled,
+  });
+}
+
+/** Why a runtime agent's Send is blocked by its preflight, if it is. */
+export function runtimePreflightDisabledReason(preflight: {
+  isPending: boolean;
+  isError?: boolean;
+  data?: {
+    ready: boolean;
+    missing?: Array<{ adminOnly?: boolean }>;
+  } | null;
+}): string | undefined {
+  if (preflight.isPending) return "Checking the agent's credentials…";
+  if (preflight.isError) return "Can't check this agent's setup";
+  if (preflight.data?.ready !== true) {
+    return preflight.data?.missing?.some((entry) => entry.adminOnly)
+      ? "Only admins can run this agent"
+      : "Connect the credentials this agent needs";
+  }
+  return undefined;
+}
+
+export function useAgentRuns(agentId: string, enabled = true) {
+  return useQuery({
+    queryKey: ["agents", agentId, "runs"],
+    queryFn: async () => {
+      const { data, error } = await getAgentRuns({
+        path: { id: agentId },
+      });
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? [];
+    },
+    enabled,
+    refetchInterval: enabled ? 5_000 : false,
+  });
+}
+
+export function useMyAgentRuns(
+  enabled = true,
+  options: MyAgentRunsOptions = {},
+) {
+  const query = useInfiniteQuery({
+    queryKey: myAgentRunsQueryKey(options),
+    initialPageParam: 0,
+    queryFn: async ({ pageParam }) => {
+      const { data, error } = await getMyAgentRuns({
+        query: myAgentRunsPageQuery(options, pageParam),
+      });
+      throwOnApiError(error, { toastOnError: false });
+      return data;
+    },
+    getNextPageParam: (lastPage, pages) =>
+      lastPage?.pagination.hasNext
+        ? pages.length * MY_AGENT_RUNS_PAGE_SIZE
+        : undefined,
+    enabled,
+    refetchInterval: (query) => {
+      if (!enabled) return false;
+      // Only pages explicitly loaded into the visible list are refreshed.
+      const runs =
+        query.state.data?.pages.flatMap((page) => page?.data ?? []) ?? [];
+      const now = Date.now();
+      if (
+        runs.some((run) => !run.endedAt || hasRetainedSessionActivity(run, now))
+      ) {
+        return 3_000;
+      }
+      return runs.some((run) => hasRecentlyEnded(run, now)) ? 10_000 : false;
+    },
+  });
+  const data = useMemo(() => {
+    if (!query.data) return undefined;
+    const runs = new Map<string, AgentRunSession>();
+    for (const page of query.data.pages) {
+      for (const run of page?.data ?? []) {
+        if (!runs.has(run.taskId)) runs.set(run.taskId, run);
+      }
+    }
+    return [...runs.values()];
+  }, [query.data]);
+  return { ...query, data };
+}
+
+export function useMyAgentRun(taskId: string, enabled = true) {
+  const queryClient = useQueryClient();
+  return useQuery({
+    queryKey: agentRunQueryKey(taskId),
+    queryFn: async () => {
+      const { data, error } = await getMyAgentRun({ path: { taskId } });
+      throwOnApiError(error, { toastOnError: false });
+      const previous = queryClient.getQueryData<typeof data>(
+        agentRunQueryKey(taskId),
+      );
+      // Refresh the sidebar lists when a run's state changes. The first read
+      // of a run is not a change: it used to invalidate the lists too, which
+      // cancelled and restarted their in-flight page loads on every run page.
+      if (
+        data &&
+        previous &&
+        (previous.taskId !== data.taskId ||
+          previous.state !== data.state ||
+          previous.endedAt !== data.endedAt)
+      ) {
+        void queryClient.invalidateQueries({
+          queryKey: ["agent-runs", "mine"],
+        });
+      }
+      return data;
+    },
+    enabled: enabled && !!taskId,
+    refetchInterval: (query) => {
+      const run = query.state.data;
+      if (query.state.status === "error") return false;
+      if (!run?.endedAt || hasRetainedSessionActivity(run)) return 2_000;
+      if (!run.workspace || run.workspace.state === "deleted") return false;
+      if (["idle", "suspended"].includes(run.workspace.state)) {
+        return hasRecentlyEnded(run) ? 10_000 : 30_000;
+      }
+      return 2_000;
+    },
+    retry: (failureCount) => failureCount < 8,
+    retryDelay: 500,
+  });
+}
+
+/**
+ * The session a run's task belongs to, for a link that names an earlier turn
+ * of a continued run: lists show only each session's current turn. Null when
+ * the run is gone.
+ */
+export function useAgentRunSessionId(taskId: string | null) {
+  return useQuery({
+    queryKey: [...agentRunQueryKey(taskId ?? undefined), "session"],
+    queryFn: async () => {
+      const { data, error } = await getMyAgentRun({
+        path: { taskId: taskId as string },
+      });
+      throwOnApiError(error, { toastOnError: false, allowNotFound: true });
+      return data?.sessionId ?? null;
+    },
+    enabled: !!taskId,
+    staleTime: Number.POSITIVE_INFINITY,
+    retry: false,
+  });
+}
+
+export function useStartAgentRun() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      agentId,
+      message,
+      files,
+      projectId,
+    }: {
+      agentId: string;
+      message: string;
+      files?: FileUIPart[];
+      projectId?: string;
+    }) => {
+      const attachments = files?.map(runAttachmentFromFile);
+      const { data, error } = await startAgentRun({
+        path: { id: agentId },
+        body: { message, attachments, projectId },
+      });
+      if (error) throw reportApiError(error);
+      return data;
+    },
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["agent-runs"] }),
+        queryClient.invalidateQueries({ queryKey: ["projects"] }),
+      ]);
+    },
+  });
+}
+
+export function useContinueAgentRun() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      taskId,
+      message,
+    }: {
+      taskId: string;
+      message?: string;
+    }) => {
+      const { data, error } = await continueAgentRun({
+        path: { taskId },
+        body: { message },
+      });
+      if (error) throw reportApiError(error);
+      return data;
+    },
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: ["agent-runs"] }),
+  });
+}
+
+export function useCancelAgentRun() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (taskId: string) => {
+      const { data, error } = await cancelAgentRun({ path: { taskId } });
+      if (error) throw reportApiError(error);
+      return { data, taskId };
+    },
+    onSuccess: async ({ taskId }) => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["agents"],
+          predicate: ({ queryKey }) => queryKey[2] === "runs",
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["agent-runs", taskId],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["agent-runs", "mine"],
+        }),
+      ]);
+    },
+  });
+}
+
+export function useDeleteAgentWorkspace() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (taskId: string) => {
+      const { data, error } = await deleteAgentWorkspace({ path: { taskId } });
+      if (error) throw reportApiError(error);
+      return data;
+    },
+    onSuccess: async () => {
+      toast.success("Deleted the run's saved files");
+      await queryClient.invalidateQueries({ queryKey: ["agent-runs"] });
+    },
+  });
+}
+
+/** Upload files dropped on a live run terminal, one request per file, and
+ * resolve with the in-runtime path of each file that landed. */
+export function useUploadAgentRunTerminalFiles(taskId: string) {
+  const maxBytes = useFeature("chatAttachmentStorageBytesLimit");
+  return useMutation({
+    mutationFn: async (files: File[]) => {
+      const paths: string[] = [];
+      for (const file of files) {
+        const validation = validateUploadFile(
+          file,
+          maxBytes ?? Number.POSITIVE_INFINITY,
+        );
+        if (!validation.ok) {
+          toast.error(
+            validation.reason === "empty"
+              ? `${file.name} is empty`
+              : `${file.name} is too large (max ${Math.floor((maxBytes ?? 0) / 1024 / 1024)} MB)`,
+          );
+          continue;
+        }
+        // The same ticketed transfer the transfer_workspace_file tool uses,
+        // aimed at the run's attachments instead of its workspace.
+        const ticket = await startAgentWorkspaceTransfer({
+          path: { taskId },
+          body: {
+            direction: "upload",
+            location: "attachments",
+            path: file.name,
+            size: file.size,
+            sha256: await sha256Hex(file),
+          },
+        });
+        if (ticket.error) {
+          reportApiError(ticket.error);
+          continue;
+        }
+        const { error } = await uploadAgentWorkspaceTransfer({
+          path: { transferId: ticket.data.transferId },
+          headers: {
+            Authorization: `Bearer ${ticket.data.token}`,
+            "Content-Type": "application/octet-stream",
+          },
+          // The route takes raw bytes, which the generated types cannot express.
+          body: file as never,
+          bodySerializer: null,
+        });
+        if (error) {
+          reportApiError(error);
+          continue;
+        }
+        paths.push(ticket.data.path);
+      }
+      return paths;
+    },
+  });
+}
+
+async function sha256Hex(file: File): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    await file.arrayBuffer(),
+  );
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+export function useUpdateAgentRun() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      taskId,
+      ...body
+    }: {
+      taskId: string;
+      title?: string;
+      pinnedAt?: string | null;
+      projectId?: string | null;
+    }) => {
+      const { data, error } = await updateAgentRun({
+        path: { taskId },
+        body,
+      });
+      if (error) throw reportApiError(error);
+      return data;
+    },
+    onSuccess: async (run) => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["agent-runs", run?.taskId],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["agent-runs", "mine"],
+        }),
+        queryClient.invalidateQueries({ queryKey: ["projects"] }),
+      ]);
+    },
+  });
+}
+
+export function useDeleteAgentRun() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (taskId: string) => {
+      const { data, error } = await deleteAgentRun({ path: { taskId } });
+      if (error) throw reportApiError(error);
+      return data;
+    },
+    // Not awaited: the caller leaves the deleted run's page on success, and
+    // holding its dialog open for the list refresh only delays that.
+    onSuccess: (_data, taskId) => {
+      void invalidateRunLists(queryClient, [taskId]);
+    },
+  });
+}
+
+/** Stop several of the viewer's active runs; the toast names any it could not. */
+export function useBulkCancelAgentRuns() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (runIds: string[]) => {
+      const { data, error } = await bulkCancelAgentRuns({
+        body: { ids: runIds },
+      });
+      if (error) throw reportApiError(error);
+      return toBulkOutcome(data ?? { succeeded: [], failed: [] });
+    },
+    onSuccess: (outcome) =>
+      reportBulkOutcome({
+        outcome,
+        verb: "Stopped",
+        failureVerb: "stop",
+        failureParticiple: "stopped",
+        noun: "run",
+      }),
+    onSettled: () => invalidateRunLists(queryClient),
+  });
+}
+
+/** Delete several of the viewer's finished runs; the toast names any it could not. */
+export function useBulkDeleteAgentRuns() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (runIds: string[]) => {
+      const { data, error } = await bulkDeleteAgentRuns({
+        body: { ids: runIds },
+      });
+      if (error) throw reportApiError(error);
+      return toBulkOutcome(data ?? { succeeded: [], failed: [] });
+    },
+    onSuccess: (outcome) =>
+      reportBulkOutcome({
+        outcome,
+        verb: "Deleted",
+        failureVerb: "delete",
+        noun: "run",
+      }),
+    onSettled: (_outcome, _error, runIds) =>
+      invalidateRunLists(queryClient, runIds),
+  });
+}
+
+/** Delete the saved files of several finished runs; their history stays. */
+export function useBulkDeleteAgentWorkspaces() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (runIds: string[]) => {
+      const { data, error } = await bulkDeleteAgentWorkspaces({
+        body: { ids: runIds },
+      });
+      if (error) throw reportApiError(error);
+      return toBulkOutcome(data ?? { succeeded: [], failed: [] });
+    },
+    onSuccess: (outcome) =>
+      reportBulkOutcome({
+        outcome,
+        verb: "Deleted",
+        failureVerb: "delete",
+        noun: "run's saved files",
+        plural: "runs' saved files",
+      }),
+    onSettled: () => invalidateRunLists(queryClient),
+  });
+}
+
+/**
+ * Every list a run appears in: an Agent's Runs tab, the sidebar, projects.
+ * A deleted run's own read is skipped: refetching it only retries a 404.
+ */
+function invalidateRunLists(
+  queryClient: ReturnType<typeof useQueryClient>,
+  deletedTaskIds: readonly string[] = [],
+) {
+  return Promise.all([
+    queryClient.invalidateQueries({
+      queryKey: ["agents"],
+      predicate: ({ queryKey }) => queryKey[2] === "runs",
+    }),
+    queryClient.invalidateQueries({
+      queryKey: ["agent-runs"],
+      predicate: ({ queryKey }) =>
+        !deletedTaskIds.includes(queryKey[1] as string),
+    }),
+    queryClient.invalidateQueries({ queryKey: ["projects"] }),
+  ]);
+}
+
+function runAttachmentFromFile(file: FileUIPart): {
+  name: string;
+  contentType: string;
+  contentBase64: string;
+} {
+  const match = /^data:([^;,]+)?;base64,([\s\S]+)$/.exec(file.url);
+  if (!match) {
+    throw new Error(`Could not prepare "${file.filename}" for upload`);
+  }
+  return {
+    name: file.filename ?? "attachment",
+    contentType: file.mediaType ?? match[1] ?? "application/octet-stream",
+    contentBase64: match[2],
+  };
+}
+
+/** Save independently so a failed connection does not discard successful ones. */
+export function useSetMissingAgentRuntimeCredentials(agentId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (credentials: Array<{ key: string; value: string }>) => {
+      const saved: string[] = [];
+      const failed: string[] = [];
+      // Agent-specific shared secrets update one bag. Concurrent writes could
+      // each read the old bag and overwrite another credential's value.
+      for (const { key, value } of credentials) {
+        try {
+          const { error } = await setAgentRuntimeCredential({
+            path: { id: agentId, key },
+            body: { value },
+          });
+          if (error) throw reportApiError(error);
+          saved.push(key);
+        } catch {
+          failed.push(key);
+        }
+      }
+      return { saved, failed };
+    },
+    onSuccess: async ({ saved, failed }) => {
+      if (failed.length > 0) {
+        toast.error(
+          "Some credentials could not be saved. Retry the remaining fields.",
+        );
+      } else if (saved.length > 0) {
+        toast.success("Credentials saved");
+      }
+      // Reusable connections may also satisfy other Agents' preflights.
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["runtime-credentials"] }),
+        queryClient.invalidateQueries({
+          predicate: (query) =>
+            query.queryKey[0] === "agents" &&
+            query.queryKey[2] === "runtime" &&
+            query.queryKey[3] === "preflight",
+        }),
+      ]);
+    },
+  });
+}

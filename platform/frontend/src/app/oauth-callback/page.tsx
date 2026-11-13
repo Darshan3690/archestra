@@ -1,22 +1,14 @@
 "use client";
 
-import { AlertCircle, Loader2 } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { AuthCallbackLayout } from "@/components/auth-callback-layout";
+import { trackEvent } from "@/lib/analytics";
 import { useHandleOAuthCallback } from "@/lib/auth/oauth.query";
 import {
   clearCallbackProcessing,
   clearInstallContext,
-  clearOAuthReauthChatResume,
+  clearOAuthPendingChatResume,
   clearOAuthReturnUrl,
   clearReauthContext,
   getOAuthEnvironmentValues,
@@ -25,11 +17,13 @@ import {
   getOAuthReturnUrl,
   getOAuthScope,
   getOAuthServerType,
+  getOAuthState,
   getOAuthTeamId,
   getOAuthUserConfigValues,
   isCallbackProcessed,
   markCallbackProcessing,
   setOAuthInstallationCompleteCatalogId,
+  setOAuthInstallChatResume,
   setOAuthReauthChatResume,
 } from "@/lib/auth/oauth-session";
 import {
@@ -38,9 +32,13 @@ import {
 } from "@/lib/mcp/mcp-server.query";
 import { replaceBrowserUrl } from "@/lib/utils/browser-redirect";
 import {
+  buildOAuthCallbackPayload,
+  extractOAuthCallbackParams,
   getOAuthCallbackErrorState,
   type OAuthCallbackErrorState,
+  toInternalReturnPath,
 } from "./oauth-callback.utils";
+import { OAuthCallbackStatus } from "./oauth-callback-status";
 
 function OAuthCallbackContent() {
   const searchParams = useSearchParams();
@@ -50,22 +48,32 @@ function OAuthCallbackContent() {
   const callbackMutation = useHandleOAuthCallback();
   const [callbackError, setCallbackError] =
     useState<OAuthCallbackErrorState | null>(null);
+  const [errorReturnPath, setErrorReturnPath] = useState<string | null>(null);
 
   useEffect(() => {
     const handleOAuthCallback = async () => {
-      const code = searchParams.get("code");
-      const error = searchParams.get("error");
-      const errorDescription = searchParams.get("error_description");
-      const state = searchParams.get("state");
+      const { code, error, errorDescription, state, iss } =
+        extractOAuthCallbackParams(searchParams);
 
       const initialError = getOAuthCallbackErrorState({
         code,
         error,
         errorDescription,
         state,
+        expectedState: getOAuthState(),
       });
 
       if (initialError) {
+        if (error) {
+          // The provider bounced the user back without a code — the user
+          // denied access or the provider refused (e.g. "access_denied").
+          trackEvent("mcp_server_installation_cancelled", { reason: error });
+        }
+        // Remember where the flow started so the error card can send the
+        // user back there instead of always to the registry.
+        setErrorReturnPath(
+          toInternalReturnPath(getOAuthReturnUrl(), window.location.origin),
+        );
         setCallbackError(initialError);
         return;
       }
@@ -83,7 +91,9 @@ function OAuthCallbackContent() {
       try {
         // Exchange authorization code for access token
         const { catalogId, name, secretId } =
-          await callbackMutation.mutateAsync({ code, state });
+          await callbackMutation.mutateAsync(
+            buildOAuthCallbackPayload({ code, state, iss }),
+          );
 
         // Check if this is a re-authentication flow
         const mcpServerId = getOAuthMcpServerId();
@@ -102,11 +112,23 @@ function OAuthCallbackContent() {
           clearReauthContext();
           clearOAuthReturnUrl();
 
-          // Redirect back to where the user was (e.g. chat page)
+          // Redirect back to where the user was. Chat conversations get a
+          // full-page replace so the queued resume message is picked up on
+          // mount; other pages get a client-side replace so the success
+          // toast survives the navigation.
           if (returnUrl) {
-            setOAuthReauthChatResume({ returnUrl, serverName: name });
-            replaceBrowserUrl(returnUrl);
-            return;
+            if (setOAuthReauthChatResume({ returnUrl, serverName: name })) {
+              replaceBrowserUrl(returnUrl);
+              return;
+            }
+            const returnPath = toInternalReturnPath(
+              returnUrl,
+              window.location.origin,
+            );
+            if (returnPath) {
+              router.replace(returnPath);
+              return;
+            }
           }
         } else {
           // New installation flow
@@ -131,25 +153,54 @@ function OAuthCallbackContent() {
           });
 
           const isFirstInstallation = getOAuthIsFirstInstallation();
+          const returnUrl = getOAuthReturnUrl();
 
           clearCallbackProcessing(code, state);
           clearInstallContext();
+          clearOAuthReturnUrl();
 
-          // Store flag to open assignments dialog after redirect (only for first installation)
-          if (isFirstInstallation) {
+          // If the install was started from inside a chat conversation, return
+          // the user there (and queue the conversation to continue). The
+          // full-page replace lets the chat pick up the queued message on
+          // mount.
+          if (
+            returnUrl &&
+            setOAuthInstallChatResume({ returnUrl, serverName: name })
+          ) {
+            replaceBrowserUrl(returnUrl);
+            return;
+          }
+
+          // Otherwise return to the page the install was started from,
+          // falling back to the registry. Only registry pages consume the
+          // assignments-dialog flag, so it is only set when landing there.
+          const returnPath = toInternalReturnPath(
+            returnUrl,
+            window.location.origin,
+          );
+          const destination = returnPath ?? "/mcp/registry";
+          if (isFirstInstallation && destination.startsWith("/mcp/registry")) {
             setOAuthInstallationCompleteCatalogId(catalogId);
           }
+
+          // The mutation's onSuccess handler will show the success toast
+          router.replace(destination);
+          return;
         }
 
-        // Redirect back to MCP catalog immediately
-        // The mutation's onSuccess handler will show the success toast
-        router.push("/mcp/registry");
+        // Re-authentication without a stored return URL: fall back to the registry
+        router.replace("/mcp/registry");
       } catch (error) {
         console.error("OAuth completion error:", error);
-        clearOAuthReauthChatResume();
-        // The mutation's onError handler will show the error toast
-        // Redirect back to catalog
-        router.push("/mcp/registry");
+        clearOAuthPendingChatResume();
+        const errorPath = toInternalReturnPath(
+          getOAuthReturnUrl(),
+          window.location.origin,
+        );
+        clearOAuthReturnUrl();
+        // The mutation's onError handler will show the error toast.
+        // Return to the page the flow started from (fallback: registry).
+        router.replace(errorPath ?? "/mcp/registry");
       }
     };
 
@@ -159,80 +210,38 @@ function OAuthCallbackContent() {
     callbackMutation.mutateAsync,
     installMutation.mutateAsync,
     reauthMutation.mutateAsync,
-    router.push,
+    router.replace,
   ]);
 
   if (callbackError) {
     return (
-      <OAuthCallbackLayout>
-        <Card>
-          <CardHeader>
-            <CardTitle>OAuth Authentication</CardTitle>
-            <CardDescription>
-              Authentication could not be completed.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <Alert variant="destructive">
-              <AlertCircle className="h-4 w-4" />
-              <AlertTitle>{callbackError.title}</AlertTitle>
-              <AlertDescription>{callbackError.description}</AlertDescription>
-            </Alert>
-            <Button onClick={() => router.push("/mcp/registry")}>
-              Return to MCP Registry
-            </Button>
-          </CardContent>
-        </Card>
-      </OAuthCallbackLayout>
+      <AuthCallbackLayout>
+        <OAuthCallbackStatus
+          status="error"
+          errorTitle={callbackError.title}
+          errorDescription={callbackError.description}
+          actionLabel={errorReturnPath ? "Go Back" : "Return to MCP Registry"}
+          onAction={() => {
+            clearOAuthReturnUrl();
+            router.push(errorReturnPath ?? "/mcp/registry");
+          }}
+        />
+      </AuthCallbackLayout>
     );
   }
 
   return (
-    <OAuthCallbackLayout>
-      <Card>
-        <CardHeader>
-          <CardTitle>OAuth Authentication</CardTitle>
-          <CardDescription>Processing authentication...</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="flex flex-col items-center space-y-4">
-            <Loader2 className="h-12 w-12 animate-spin text-blue-600" />
-            <p className="text-center text-muted-foreground">
-              Completing OAuth authentication and installing MCP server...
-            </p>
-          </div>
-        </CardContent>
-      </Card>
-    </OAuthCallbackLayout>
+    <AuthCallbackLayout>
+      <OAuthCallbackStatus status="processing" phase="completing" />
+    </AuthCallbackLayout>
   );
 }
 
 function LoadingFallback() {
   return (
-    <OAuthCallbackLayout>
-      <Card>
-        <CardHeader>
-          <CardTitle>OAuth Authentication</CardTitle>
-          <CardDescription>Initializing OAuth flow...</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="flex flex-col items-center space-y-4">
-            <Loader2 className="h-12 w-12 animate-spin text-blue-600" />
-            <p className="text-center text-muted-foreground">
-              Preparing to complete authentication...
-            </p>
-          </div>
-        </CardContent>
-      </Card>
-    </OAuthCallbackLayout>
-  );
-}
-
-function OAuthCallbackLayout({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="mx-auto flex min-h-[calc(100vh-8rem)] w-full max-w-2xl items-center justify-center p-6">
-      <div className="w-full">{children}</div>
-    </div>
+    <AuthCallbackLayout>
+      <OAuthCallbackStatus status="processing" phase="initializing" />
+    </AuthCallbackLayout>
   );
 }
 

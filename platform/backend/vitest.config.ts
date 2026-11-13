@@ -1,25 +1,158 @@
+import { readdirSync, readFileSync, realpathSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { defineConfig } from "vitest/config";
+import {
+  detectResourceEnvelope,
+  reportMemoryKillsAtExit,
+} from "../vitest.resources";
+import { vitestLogPolicy } from "../vitest.shared";
+import { ensureNativeAddons } from "./src/test/native-addons";
+import { ProjectGroupedSequencer } from "./src/test/project-grouped-sequencer";
+import { calculateVitestResourceLimits } from "./src/test/vitest-resource-limits";
 
 const isCI = process.env.CI === "true";
 
+// On macOS the temp directory is under /var, a symlink to /private/var, and
+// child processes report the resolved path. Workers inherit the resolved one,
+// so a test's temp paths compare equal to what the code under test reports.
+process.env.TMPDIR = realpathSync(tmpdir());
+
+/**
+ * Fork workers each load the backend graph and a PGlite database. CI keeps the
+ * throughput-oriented sizing used by its isolated shards. Local runs reserve
+ * most CPU and memory for the developer's other work instead of treating an
+ * interactive machine like a dedicated runner. Inside a container the sizing
+ * starts from the container's limit, not the machine's memory: see
+ * ../vitest.resources.ts.
+ */
+const { availableParallelism, totalMemoryBytes } = detectResourceEnvelope();
+const { maxWorkers: MAX_WORKERS, maxOldSpaceMb: MAX_OLD_SPACE_MB } =
+  calculateVitestResourceLimits({
+    isCI,
+    availableParallelism,
+    totalMemoryBytes,
+  });
+// A worker the kernel killed for memory shows up only as a worker that exited
+// unexpectedly; a failed run says so when the container's counters moved.
+reportMemoryKillsAtExit({
+  tool: "vitest",
+  subject: "the tests",
+  steps: [
+    `Run fewer test workers: add --maxWorkers=1 (this run allowed ${MAX_WORKERS}), or run one test file or project at a time.`,
+  ],
+});
+
+/**
+ * Node compile data is safe to reuse across local runs: Node validates entries
+ * by content, and every Vitest fork inherits this path when it starts. CI owns
+ * its separately cached path in the workflow.
+ */
+if (!isCI && !process.env.NODE_COMPILE_CACHE) {
+  process.env.NODE_COMPILE_CACHE = path.resolve(
+    __dirname,
+    "node_modules/.cache/node-compile-cache",
+  );
+}
+
+/**
+ * Partition test files by explicit database usage and module isolation needs.
+ *
+ * `vi.mock`/`vi.doMock` registrations live in the worker's shared module/mock
+ * registry, which Vitest does NOT reset between files when `isolate: false`
+ * (see https://vitest.dev/guide/improving-performance and
+ * vitest-dev/vitest#4894, #10145) — so mock-using files must keep isolation.
+ * `vi.resetModules` also needs isolation: it reloads app singletons while
+ * external packages retain theirs (for example, the Prometheus registry).
+ * A later file can then register a gauge twice. Everything else can share
+ * each worker's module cache and skip re-importing the whole backend graph
+ * per file (~6s/file saved).
+ *
+ * Rollback-eligible files join the clean project and select transaction
+ * teardown through their filename in setup hooks, retaining its shared module
+ * cache. Routing is computed from file CONTENT at config-load time, so a new test
+ * that adds `vi.mock` is automatically placed in the isolated project — no
+ * manual list to maintain.
+ */
+function partitionTestFiles(): {
+  mocked: string[];
+  clean: string[];
+  unitMocked: string[];
+  unit: string[];
+  rollback: string[];
+} {
+  const root = path.resolve(__dirname, "./src");
+  const needsModuleIsolation =
+    /\bvi\.(mock|doMock|unmock|doUnmock|hoisted|resetModules)\(/;
+  const mocked: string[] = [];
+  const clean: string[] = [];
+  const unitMocked: string[] = [];
+  const unit: string[] = [];
+  const rollback: string[] = [];
+
+  for (const entry of readdirSync(root, {
+    recursive: true,
+    withFileTypes: true,
+  })) {
+    if (!entry.isFile() || !entry.name.endsWith(".test.ts")) continue;
+    const absolute = path.join(entry.parentPath, entry.name);
+    const relative = `./${path.relative(__dirname, absolute)}`;
+    const databaseFree = entry.name.endsWith(".unit.test.ts");
+    const rollsBack = entry.name.endsWith(".rollback.test.ts");
+    const isolated = needsModuleIsolation.test(readFileSync(absolute, "utf-8"));
+    if (databaseFree) {
+      (isolated ? unitMocked : unit).push(relative);
+    } else if (rollsBack) {
+      if (isolated) {
+        throw new Error(
+          `${relative} cannot use module mocks or resetModules with rollback`,
+        );
+      }
+      rollback.push(relative);
+    } else {
+      (isolated ? mocked : clean).push(relative);
+    }
+  }
+
+  if (mocked.length === 0 || clean.length === 0) {
+    throw new Error(
+      `Test partition looks wrong (mocked=${mocked.length}, clean=${clean.length}); ` +
+        "check partitionTestFiles() in vitest.config.ts",
+    );
+  }
+
+  return { mocked, clean, unitMocked, unit, rollback };
+}
+
+const testFiles = partitionTestFiles();
+
+// The backend loads the NAPI addons (@archestra/*-rs), which a fresh checkout
+// lacks: they are gitignored and pnpm install never builds them. Install the
+// ones CI published for this archestra-rs tree when any is missing or was
+// installed for another tree; never a cargo build. A checkout Tilt, the lite
+// stack or CI prepared already has them, so this reads a few files and stops.
+ensureNativeAddons({
+  backendDir: __dirname,
+  rustDir: path.resolve(__dirname, "../archestra-rs"),
+  installer: path.resolve(__dirname, "../scripts/napi-prebuilt.mjs"),
+});
+
 export default defineConfig({
+  plugins: [rawPythonPlugin()],
   resolve: {
-    alias: {
-      "@": path.resolve(__dirname, "./src"),
-      "@shared/access-control": path.resolve(
-        __dirname,
-        "../shared/access-control.ts",
-      ),
-      "@shared": path.resolve(__dirname, "../shared/index.ts"),
-    },
+    alias: [
+      { find: "@", replacement: path.resolve(__dirname, "./src") },
+      {
+        find: /^@archestra\/shared$/,
+        replacement: path.resolve(__dirname, "../shared/index.ts"),
+      },
+    ],
   },
   test: {
+    ...vitestLogPolicy,
     globals: true,
-    include: ["./src/**/*.test.ts"],
     environment: "node",
-    setupFiles: ["./src/test/setup.ts"],
-
     /**
      * Performance Optimizations
      *
@@ -27,23 +160,60 @@ export default defineConfig({
      * - https://vitest.dev/guide/improving-performance
      * - https://vitest.dev/guide/profiling-test-performance
      *
-     * Note: We keep isolation enabled (default) because our database tests
-     * use module-level state that needs to be reset between test files.
-     * The main performance win comes from the setup.ts optimization:
-     * - beforeAll: creates PGlite + runs migrations ONCE per file
-     * - beforeEach: truncates tables (fast) instead of recreating DB
+     * Isolation is per-project (see `projects` below): files that never touch
+     * the module-mock registry run with `isolate: false`, sharing each
+     * worker's module cache instead of re-importing the whole backend graph
+     * per file — the dominant cost of the suite. Files using vi.mock keep
+     * isolation because Vitest's mock registry is not reset between files in
+     * a shared worker (vitest-dev/vitest#4894).
+     *
+     * DB state stays per-file either way (setup.ts):
+     * - beforeAll: creates PGlite from the migrated snapshot ONCE per file
+     * - beforeEach: truncates after DB access, skipping pure tests
      */
 
-    // Use threads pool - faster than forks for Node.js tests
-    pool: "threads",
+    // Forks (child processes), not threads. PGlite is a WASM module; running
+    // it across worker threads sharing one process-global V8 JIT-page registry
+    // intermittently aborts the whole process with a fatal
+    // "Check failed: jit_page.has_value()" (and its sibling on unregister).
+    // Forks give each worker its own V8, so the registry can't be raced. This
+    // is Vitest's default pool, recommended for native modules that misbehave
+    // across threads (https://vitest.dev/config/pool); pinned explicitly so a
+    // switch back to threads for speed can't silently reintroduce the crash.
+    pool: "forks",
 
-    // Increase concurrency on CI for faster test execution
-    maxConcurrency: isCI ? 12 : 6,
+    // Auto-restore vi.stubGlobal/vi.stubEnv after every test. Without this, a
+    // stub left behind by one test file poisons later files sharing the worker.
+    unstubGlobals: true,
+    unstubEnvs: true,
 
-    // Sequence settings
+    // Projects copy this value and would ignore `--maxWorkers` on the CLI.
+    ...(cliSetsMaxWorkers() ? {} : { maxWorkers: MAX_WORKERS }),
+
+    // Pin each fork's V8 old-space ceiling. CI divides most runner memory over
+    // its workers; local runs cap each heap at 3 GB and their aggregate budget
+    // near one quarter of system memory.
+    //
+    // This is test.execArgv, NOT poolOptions.forks.execArgv: Vitest 4 composes
+    // a worker's arguments from the pool defaults, the resolve conditions and
+    // `project.config.execArgv`, so the poolOptions spelling silently does
+    // nothing here (verified: the flag never reaches the fork's process.execArgv).
+    execArgv: [`--max-old-space-size=${MAX_OLD_SPACE_MB}`],
+
+    // No current backend tests opt into test.concurrent. Keep future local
+    // concurrency conservative while CI retains its dedicated-runner setting.
+    maxConcurrency: isCI ? 12 : 2,
+
+    // Persist transformed modules between local reruns. CI instead uses its
+    // workflow caches, and avoids the experimental cache path entirely.
+    experimental: { fsModuleCache: !isCI },
+
     sequence: {
-      // Shuffle test files to balance load across workers
+      // Shuffle files and tests, to balance load and surface order
+      // dependence, but keep each project's files together so shared
+      // workers survive from one file to the next.
       shuffle: true,
+      sequencer: ProjectGroupedSequencer,
     },
 
     // Increase test timeout for database operations
@@ -51,5 +221,75 @@ export default defineConfig({
 
     // Hook timeout for beforeAll/afterAll (migrations can take time)
     hookTimeout: 60000,
+
+    projects: [
+      {
+        extends: true,
+        test: {
+          // Explicit *.unit.test.ts files are audited to avoid database imports.
+          // No PGlite setup or migrated snapshot is needed for this project.
+          name: "unit",
+          include: testFiles.unit,
+          isolate: false,
+          setupFiles: ["./src/test/worker-globals.ts"],
+          // An accidental runtime config/database import must fail even on CI,
+          // where a database URL is available to the database-backed projects.
+          env: { ARCHESTRA_DATABASE_URL: "", DATABASE_URL: "" },
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "unit-mocked",
+          include: testFiles.unitMocked,
+          isolate: true,
+          env: { ARCHESTRA_DATABASE_URL: "", DATABASE_URL: "" },
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "clean",
+          include: [...testFiles.clean, ...testFiles.rollback],
+          isolate: false,
+          // The setup hooks select rollback for *.rollback.test.ts through
+          // Vitest's current test-file context. Both variants share workers.
+          // All database-backed projects share one migrated snapshot.
+          globalSetup: ["./src/test/global-setup.ts"],
+          setupFiles: ["./src/test/worker-globals.ts", "./src/test/setup.ts"],
+          // Workers are shared in this project, so the test setup restores
+          // shared mutable state (the config object) between tests. The
+          // isolated project skips that — its per-file registries can't leak,
+          // and exotic config mocks (getter-only properties) would break it.
+          env: { ARCHESTRA_TEST_SHARED_WORKERS: "true" },
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "mocked",
+          include: testFiles.mocked,
+          isolate: true,
+          globalSetup: ["./src/test/global-setup.ts"],
+          setupFiles: ["./src/test/setup.ts"],
+        },
+      },
+    ],
   },
 });
+
+function cliSetsMaxWorkers(): boolean {
+  return process.argv.some((arg) => /^--max-?workers(=|$)/i.test(arg));
+}
+
+function rawPythonPlugin() {
+  return {
+    name: "raw-python",
+    enforce: "pre" as const,
+    async load(id: string) {
+      if (!id.endsWith(".py")) return null;
+      const source = await readFile(id, "utf-8");
+      return `export default ${JSON.stringify(source)};`;
+    },
+  };
+}

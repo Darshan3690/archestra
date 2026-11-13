@@ -1,0 +1,672 @@
+import { posix } from "node:path";
+import { APPA_PARENT_HEADER, APPA_SESSION_HEADER } from "@archestra/shared";
+import { childSessionId } from "@/openappa/actor";
+import {
+  type AppaChildTrajectoryReceipt,
+  verifyChildTrajectoryReceipt,
+} from "@/openappa/child-trajectory-receipt";
+import { verifyDelegatedPrompt } from "@/openappa/delegation";
+import { isWellFormedAppaId } from "@/openappa/service";
+import { ApiError } from "@/types";
+import { asRecord } from "@/utils/as-record";
+import type {
+  AppaChildTrajectory,
+  AppaChildTranscriptPath,
+  AppaMatchContext,
+} from "../types";
+import { readHeader, withCallerScope, withoutCallerScope } from "../utils";
+
+/** Validates opaque native IDs before any fallback or minted child binding. */
+export function nativeId(
+  value: unknown,
+  description = "child trajectory id",
+): string | undefined {
+  if (value === undefined) return undefined;
+  if (!isWellFormedAppaId(value)) {
+    throw correlationError(`OpenAPPA requires a well-formed ${description}`);
+  }
+  return value;
+}
+
+/** Recognizes native transcript paths even when their child id is a glob. */
+export function referencesChildTranscriptPath(params: {
+  arguments: unknown;
+  pathPatterns: ReadonlyArray<AppaChildTranscriptPath>;
+}): boolean {
+  const visit = (value: unknown): boolean => {
+    if (typeof value === "string") {
+      // Tokenizes once to prevent quadratic scanning.
+      // Normalizes path separators and relative segments before inspection.
+      return value.split(/\s+/u).some((token) => {
+        const raw = token.replaceAll("\\", "/");
+        const path = posix.normalize(raw);
+        return params.pathPatterns.some(({ prefix, suffix, ownOutputId }) => {
+          const start = path.indexOf(prefix);
+          if (start < 0 || (start > 0 && path.charAt(start - 1) !== "/")) {
+            return false;
+          }
+          const rest = path.slice(start + prefix.length);
+          const file = rest.replace(/["'`;|&)]+$/u, "");
+          // Normalization can drop segments that name a child, so only an
+          // already-normal token is exempt.
+          if (
+            ownOutputId &&
+            path === raw &&
+            file.endsWith(suffix) &&
+            ownOutputId.test(file.slice(0, -suffix.length))
+          ) {
+            return false;
+          }
+          return rest.includes(suffix);
+        });
+      });
+    }
+    if (Array.isArray(value)) return value.some(visit);
+    const record = asRecord(value);
+    return record !== undefined && Object.values(record).some(visit);
+  };
+  return visit(params.arguments);
+}
+
+export function localToolName(name: string): string {
+  const withoutFunctions = name.startsWith("functions.")
+    ? name.slice("functions.".length)
+    : name;
+  for (const prefix of [
+    "host/claude-code/",
+    "host/archestra/",
+    "builtin:",
+    "host/",
+  ]) {
+    if (withoutFunctions.startsWith(prefix)) {
+      return withoutFunctions.slice(prefix.length);
+    }
+  }
+  return withoutFunctions;
+}
+
+export function namesChildrenFromArguments(params: {
+  rootId: string;
+  arguments: unknown;
+  pathPatterns: ReadonlyArray<AppaChildTranscriptPath>;
+  idKeys?: readonly string[];
+}): string[] {
+  const agents: string[] = [];
+  collectNamedChildren(
+    params.arguments,
+    agents,
+    params.pathPatterns,
+    params.idKeys,
+  );
+  const ancestors = new Set(params.rootId.split(":"));
+  const unique = [...new Set(agents)].filter(
+    (agent) => agent !== params.rootId && !ancestors.has(agent),
+  );
+  unique.sort();
+  return unique.map((agent) => childSessionId(params.rootId, agent));
+}
+
+/**
+ * Binds a child under verified trajectory evidence or trusted native metadata.
+ * The signed child ID stays stable when native metadata appears after compaction.
+ * Native metadata may arrive after minting; it is not an expected sealed claim.
+ * If the receipt already seals a native identity, that identity must agree.
+ */
+export function bindMintedChildTrajectory(params: {
+  context: AppaMatchContext;
+  parentNativeId: string | undefined;
+  /** Trusted client metadata, which may be assigned after the receipt's birth. */
+  childNativeId: string | undefined;
+  /**
+   * Keep the server-signed child trajectory ID when a resumed client launches
+   * under a fresh native session ID (e.g., Grok `resume_from`).
+   */
+  preserveRecordedChildId?: boolean;
+}): AppaChildTrajectory | undefined {
+  const claims = claimedIds(params.context);
+  const childNativeId = nativeId(params.childNativeId);
+  const parentNativeId =
+    nativeId(params.parentNativeId) ??
+    recordedNativeParent({ context: params.context, childNativeId });
+
+  if (!parentNativeId) {
+    if (!claims.parentId) return undefined;
+    throw correlationError(
+      "OpenAPPA child trajectory is missing a server-minted parent id",
+    );
+  }
+  if (childNativeId === parentNativeId) {
+    throw correlationError(
+      "OpenAPPA child trajectory cannot reuse the parent id",
+    );
+  }
+
+  const delegated = delegatedParent({
+    context: params.context,
+    parentNativeId,
+    childNativeId,
+  });
+  const recorded = recordedChild({
+    context: params.context,
+    parentNativeId,
+    childNativeId,
+    expectedParentId: delegated?.parentId,
+  });
+  // A client that mints children from the spawn call names no native child
+  // id; the signed spawn call id identifies the child instead.
+  const childIdentity = childNativeId ?? delegated?.spawnCallId;
+  const anchor = workspaceAnchor({
+    context: params.context,
+    claimedSession: claims.sessionId,
+    parentNativeId,
+    childIdentity,
+  });
+  const nested = runtimeNest({
+    context: params.context,
+    claimedSession: claims.sessionId,
+    childNativeId,
+    delegated,
+    recorded,
+    preserveRecordedChildId: params.preserveRecordedChildId,
+  });
+  if (anchor && childIdentity && !nested) {
+    const mintedChild = childSessionId(anchor, childIdentity);
+    if (
+      (delegated && delegated.parentId !== anchor) ||
+      (recorded &&
+        (recorded.parentId !== anchor ||
+          !recordedChildMatchesParent({
+            childId: recorded.childId,
+            parentId: anchor,
+            mintedChild,
+            preserveRecordedChildId: params.preserveRecordedChildId,
+          })))
+    ) {
+      throw correlationError(
+        "OpenAPPA signed child lineage does not match the authenticated session root",
+      );
+    }
+  }
+  const parentId = nested
+    ? nested.parentId
+    : anchor
+      ? anchor
+      : (delegated?.parentId ?? recorded?.parentId ?? parentNativeId);
+  const sessionId = nested
+    ? nested.sessionId
+    : (recorded?.childId ??
+      (childNativeId
+        ? childSessionId(parentId, childNativeId)
+        : delegated?.spawnCallId
+          ? childSessionId(parentId, delegated.spawnCallId)
+          : undefined));
+  if (!sessionId) {
+    if (claims.parentId) {
+      throw correlationError(
+        "OpenAPPA child trajectory is missing a server-minted child id",
+      );
+    }
+    return undefined;
+  }
+  const resolvedChildNativeId = childNativeId ?? recorded?.childNativeId;
+  return {
+    ...bindChildLineage({
+      context: params.context,
+      parentId,
+      sessionId,
+      anchored: anchor !== undefined && !nested,
+      runtimeClaim: nested?.runtimeClaim,
+    }),
+    lineage: {
+      source: recorded ? "receipt" : delegated ? "marker" : "native",
+      nativeParentId: parentNativeId,
+      ...(resolvedChildNativeId
+        ? { childNativeId: resolvedChildNativeId }
+        : {}),
+      ...(delegated?.spawnCallId
+        ? { spawnCallId: delegated.spawnCallId }
+        : recorded?.spawnCallId
+          ? { spawnCallId: recorded.spawnCallId }
+          : {}),
+      ...(delegated?.promptDigest
+        ? { spawnPromptDigest: delegated.promptDigest }
+        : {}),
+    },
+  };
+}
+
+/**
+ * Validates an exact server-minted parent and child binding against claims.
+ */
+function bindChildLineage(params: {
+  context: AppaMatchContext;
+  parentId: string;
+  sessionId: string;
+  anchored?: boolean;
+  runtimeClaim?: string;
+}): { sessionId: string; parentId: string } {
+  const { parentId, sessionId } = params;
+  const claims = claimedIds(params.context);
+  const claimedSession = claims.sessionId;
+  const claimedParent = claims.parentId;
+  const prefix = `${parentId}:`;
+  const childIdentity = sessionId.startsWith(prefix)
+    ? sessionId.slice(prefix.length)
+    : undefined;
+  if (
+    !childIdentity ||
+    `:${parentId}:`.includes(`:${childIdentity}:`) ||
+    sessionId === parentId
+  ) {
+    throw correlationError(
+      "OpenAPPA child trajectory cannot reuse the parent id",
+    );
+  }
+  const session = params.context.trustedContext?.session;
+  if (
+    !isWellFormedAppaId(
+      session ? withCallerScope(session, sessionId) : sessionId,
+    )
+  ) {
+    throw correlationError(
+      "OpenAPPA child trajectory exceeds the session id limit",
+    );
+  }
+  if (claimedParent && claimedParent !== parentId) {
+    throw correlationError(
+      "OpenAPPA parent trajectory is not bound to this server-minted root",
+    );
+  }
+  if (
+    claimedSession &&
+    claimedSession !== sessionId &&
+    !(params.anchored && claimedSession === parentId) &&
+    !(params.runtimeClaim && claimedSession === params.runtimeClaim)
+  ) {
+    throw correlationError(
+      "OpenAPPA child trajectory does not match the server-minted child id",
+    );
+  }
+  if (claimedSession === parentId && !params.anchored) {
+    throw correlationError(
+      "OpenAPPA child trajectory cannot reuse the parent id",
+    );
+  }
+  return { sessionId, parentId };
+}
+
+export function stripRecordFields(
+  value: unknown,
+  keys: readonly string[],
+): void {
+  const record = asRecord(value);
+  if (!record) return;
+  for (const key of keys) {
+    delete record[key];
+  }
+}
+
+export function stringField(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+export function parseJsonHeader(
+  headers: AppaMatchContext["headers"],
+  name: string,
+): Record<string, unknown> | undefined {
+  const raw = readHeader(headers, name);
+  if (!raw) return undefined;
+  try {
+    return asRecord(JSON.parse(raw));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Recovers a client parent only from a verified full receipt. */
+function recordedNativeParent(params: {
+  context: AppaMatchContext;
+  childNativeId: string | undefined;
+}): string | undefined {
+  const trusted = params.context.trustedContext;
+  if (!trusted) return undefined;
+  for (const receipt of trusted.request.childTrajectoryReceipts ?? []) {
+    const spawnerNativeId = nativeId(receipt.spawnerNativeId);
+    if (
+      spawnerNativeId &&
+      verifyChildTrajectoryReceipt({
+        receipt,
+        organizationId: trusted.session.organization_id,
+        callerId: trusted.session.caller_id,
+        spawnerNativeId,
+      })
+    ) {
+      assertReceiptNativeCorrelation(receipt, params.childNativeId);
+      return spawnerNativeId;
+    }
+  }
+  return undefined;
+}
+
+/** Reads a signed child binding preserved across compaction. */
+function recordedChild(params: {
+  context: AppaMatchContext;
+  parentNativeId: string;
+  childNativeId: string | undefined;
+  expectedParentId: string | undefined;
+}):
+  | {
+      parentId: string;
+      childId: string;
+      childNativeId?: string;
+      spawnCallId?: string;
+      runtimeSessionId?: string;
+    }
+  | undefined {
+  const trusted = params.context.trustedContext;
+  if (!trusted) return undefined;
+  for (const receipt of trusted.request.childTrajectoryReceipts ?? []) {
+    if (
+      !verifyChildTrajectoryReceipt({
+        receipt,
+        organizationId: trusted.session.organization_id,
+        callerId: trusted.session.caller_id,
+        spawnerNativeId: params.parentNativeId,
+      })
+    ) {
+      continue;
+    }
+    assertReceiptNativeCorrelation(receipt, params.childNativeId);
+    if (
+      params.expectedParentId &&
+      receipt.parentId !== params.expectedParentId
+    ) {
+      throw correlationError(
+        "OpenAPPA signed child lineage does not match the delegated parent",
+      );
+    }
+    return {
+      parentId: receipt.parentId,
+      childId: receipt.childId,
+      ...(receipt.childNativeId
+        ? { childNativeId: receipt.childNativeId }
+        : {}),
+      ...(receipt.spawnCallId ? { spawnCallId: receipt.spawnCallId } : {}),
+      ...(receipt.runtimeSessionId
+        ? { runtimeSessionId: receipt.runtimeSessionId }
+        : {}),
+    };
+  }
+  return undefined;
+}
+
+/** Called only after verifying receipt ownership, never to waive verification. */
+function assertReceiptNativeCorrelation(
+  receipt: AppaChildTrajectoryReceipt,
+  observedChildNativeId: string | undefined,
+): void {
+  // Birth receipts can precede native ID assignment. Their stable child scope
+  // is signed; late trusted client metadata correlates it, not attests to it.
+  if (
+    receipt.childNativeId !== undefined &&
+    observedChildNativeId !== undefined &&
+    receipt.childNativeId !== observedChildNativeId
+  ) {
+    throw correlationError(
+      "OpenAPPA signed child lineage does not match the native child id",
+    );
+  }
+}
+
+/**
+ * Finds the delegation marker in opening user messages signed for the native parent.
+ * Inspecting only opening messages prevents later reminders or notifications
+ * from altering child lineage.
+ */
+function delegatedParent(params: {
+  context: AppaMatchContext;
+  parentNativeId: string;
+  childNativeId: string | undefined;
+}):
+  | {
+      parentId: string;
+      spawnCallId?: string;
+      promptDigest?: string;
+      runtimeSessionId?: string;
+    }
+  | undefined {
+  const trusted = params.context.trustedContext;
+  if (!trusted) return undefined;
+  for (const marker of trusted.request.delegation?.markers ?? []) {
+    const verified = verifyDelegatedPrompt({
+      marker,
+      organizationId: trusted.session.organization_id,
+      callerId: trusted.session.caller_id,
+      spawnerNativeId: params.parentNativeId,
+    });
+    if (!verified) continue;
+    const childIdentity = params.childNativeId ?? marker.spawnCallId;
+    if (childIdentity && `:${marker.parentId}:`.includes(`:${childIdentity}:`))
+      continue;
+    return {
+      parentId: marker.parentId,
+      ...(marker.spawnCallId ? { spawnCallId: marker.spawnCallId } : {}),
+      ...(marker.runtimeSessionId
+        ? { runtimeSessionId: marker.runtimeSessionId }
+        : {}),
+      ...verified,
+    };
+  }
+  return undefined;
+}
+
+/**
+ * An intermediate parent signed under the server-verified runtime workspace.
+ * A marker or receipt without that field, or signed for another workspace,
+ * is not a nest. Direct children of the workspace stay on the header anchor.
+ */
+function runtimeNest(params: {
+  context: AppaMatchContext;
+  claimedSession: string | undefined;
+  childNativeId: string | undefined;
+  delegated?: {
+    parentId: string;
+    spawnCallId?: string;
+    runtimeSessionId?: string;
+  };
+  recorded?: {
+    parentId: string;
+    childId: string;
+    runtimeSessionId?: string;
+  };
+  preserveRecordedChildId?: boolean;
+}): { parentId: string; sessionId: string; runtimeClaim: string } | undefined {
+  const markerAnchor = params.delegated?.runtimeSessionId;
+  const receiptAnchor = params.recorded?.runtimeSessionId;
+  if (!markerAnchor && !receiptAnchor) {
+    return undefined;
+  }
+  const trusted = params.context.trustedContext;
+  const runtimeRoot = trusted?.runtimeSessionId;
+  const session = trusted?.session;
+  // A client that mints children from the spawn call names no native child
+  // id; the signed spawn call id identifies the child, as it does outside a nest.
+  const childKey = params.childNativeId ?? params.delegated?.spawnCallId;
+  if (
+    !runtimeRoot ||
+    !session ||
+    !childKey ||
+    (markerAnchor && markerAnchor !== runtimeRoot) ||
+    (receiptAnchor && receiptAnchor !== runtimeRoot) ||
+    (params.delegated &&
+      params.recorded &&
+      (params.delegated.parentId !== params.recorded.parentId ||
+        params.delegated.runtimeSessionId !== params.recorded.runtimeSessionId))
+  ) {
+    throw correlationError(
+      "OpenAPPA signed child lineage does not match the authenticated session root",
+    );
+  }
+  const runtimeClaim = withoutCallerScope(session, runtimeRoot);
+  if (
+    !runtimeClaim ||
+    runtimeClaim === runtimeRoot ||
+    params.claimedSession !== runtimeClaim
+  ) {
+    throw correlationError(
+      "OpenAPPA signed child lineage does not match the authenticated session root",
+    );
+  }
+  const parentId = params.delegated?.parentId ?? params.recorded?.parentId;
+  if (!parentId || parentId === runtimeClaim) return undefined;
+  const minted = childSessionId(parentId, childKey);
+  if (
+    params.recorded &&
+    !recordedChildMatchesParent({
+      childId: params.recorded.childId,
+      parentId,
+      mintedChild: minted,
+      preserveRecordedChildId: params.preserveRecordedChildId,
+    })
+  ) {
+    throw correlationError(
+      "OpenAPPA signed child lineage does not match the authenticated session root",
+    );
+  }
+  return {
+    parentId,
+    sessionId: params.recorded?.childId ?? minted,
+    runtimeClaim,
+  };
+}
+
+/**
+ * The already-bound trusted session, when the client header names that same
+ * root and native metadata or a signed spawn call names a child of it. An
+ * explicit child-session claim, a parent header for a different trajectory,
+ * or a child with neither a native id nor a signed spawn call id is not an
+ * anchor.
+ */
+function workspaceAnchor(params: {
+  context: AppaMatchContext;
+  claimedSession: string | undefined;
+  parentNativeId: string;
+  /** The native child id, or the signed spawn call id of a minted child. */
+  childIdentity: string | undefined;
+}): string | undefined {
+  const session = params.context.trustedContext?.session;
+  if (!session || !params.claimedSession || !params.childIdentity) {
+    return undefined;
+  }
+  const root = withoutCallerScope(session, session.session_id);
+  if (
+    !root ||
+    root !== params.claimedSession ||
+    root === params.childIdentity
+  ) {
+    return undefined;
+  }
+  if (root === childSessionId(params.parentNativeId, params.childIdentity)) {
+    return undefined;
+  }
+  const claimedParent = claimedIds(params.context).parentId;
+  if (claimedParent && claimedParent !== root) return undefined;
+  return root;
+}
+
+/** Returns explicit IDs claimed by the client, excluding derived proxy IDs. */
+function claimedIds(context: AppaMatchContext): {
+  sessionId?: string;
+  parentId?: string;
+} {
+  const claims = context.trustedContext?.claims;
+  return {
+    sessionId: nativeId(
+      claims
+        ? claims.sessionId
+        : readHeader(context.headers, APPA_SESSION_HEADER),
+    ),
+    parentId: nativeId(
+      claims
+        ? claims.parentId
+        : readHeader(context.headers, APPA_PARENT_HEADER),
+    ),
+  };
+}
+
+function correlationError(message: string): ApiError {
+  return new ApiError(400, message);
+}
+
+function collectNamedChildren(
+  value: unknown,
+  agents: string[],
+  pathPatterns: ReadonlyArray<AppaChildTranscriptPath>,
+  idKeys: readonly string[] | undefined,
+): void {
+  if (typeof value === "string") {
+    for (const pattern of pathPatterns) {
+      agents.push(...agentFileIds(value, pattern.prefix, pattern.suffix));
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectNamedChildren(item, agents, pathPatterns, idKeys);
+    }
+    return;
+  }
+  const record = asRecord(value);
+  if (!record) return;
+  for (const [key, field] of Object.entries(record)) {
+    if (idKeys?.includes(key)) {
+      const id = stringField(field);
+      if (id) agents.push(id);
+    }
+    collectNamedChildren(field, agents, pathPatterns, idKeys);
+  }
+}
+
+function agentFileIds(text: string, prefix: string, suffix: string): string[] {
+  const isIdChar = (c: string) => /[A-Za-z0-9_-]/.test(c);
+  const isNameChar = (c: string) => isIdChar(c) || c === ".";
+  const ids: string[] = [];
+  let from = 0;
+  while (from < text.length) {
+    const at = text.indexOf(prefix, from);
+    if (at === -1) break;
+    const previous = at === 0 ? undefined : text[at - 1];
+    if (previous && isNameChar(previous)) {
+      from = at + prefix.length;
+      continue;
+    }
+    const rest = text.slice(at + prefix.length);
+    let length = 0;
+    while (length < rest.length && isIdChar(rest.charAt(length))) length += 1;
+    const id = rest.slice(0, length);
+    const tail = rest.slice(length);
+    if (
+      id.length > 0 &&
+      tail.startsWith(suffix) &&
+      !isNameChar(tail.charAt(suffix.length))
+    ) {
+      ids.push(id);
+    }
+    from = at + prefix.length;
+  }
+  return ids;
+}
+
+function recordedChildMatchesParent(params: {
+  childId: string;
+  parentId: string;
+  mintedChild: string;
+  preserveRecordedChildId?: boolean;
+}): boolean {
+  if (params.childId === params.mintedChild) return true;
+  if (!params.preserveRecordedChildId) return false;
+  const prefix = `${params.parentId}:`;
+  if (!params.childId.startsWith(prefix)) return false;
+  const segment = params.childId.slice(prefix.length);
+  return segment.length > 0 && !segment.includes(":");
+}

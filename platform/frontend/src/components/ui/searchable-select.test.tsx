@@ -32,7 +32,7 @@ describe("SearchableSelect", () => {
 
     await user.click(screen.getByRole("combobox"));
 
-    const disabledItem = screen.getByRole("button", {
+    const disabledItem = screen.getByRole("option", {
       name: /Already Added/i,
     });
     expect(disabledItem).toBeDisabled();
@@ -40,8 +40,68 @@ describe("SearchableSelect", () => {
     await user.click(disabledItem);
     expect(onValueChange).not.toHaveBeenCalled();
 
-    await user.click(screen.getByRole("button", { name: /Available User/i }));
+    await user.click(screen.getByRole("option", { name: /Available User/i }));
     expect(onValueChange).toHaveBeenCalledWith("available");
+  });
+
+  it("finds an item whose stored order differs from the typed one", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <SearchableSelect
+        value=""
+        onValueChange={vi.fn()}
+        placeholder="Select a user"
+        items={[
+          {
+            value: "u-ada",
+            label: "Lovelace, Ada M.",
+            searchText: "Lovelace, Ada M. ada@example.com",
+          },
+          {
+            value: "u-charles",
+            label: "Babbage, Charles",
+            searchText: "Babbage, Charles charles@example.com",
+          },
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox"));
+    await user.type(screen.getByPlaceholderText("Search..."), "Ada Lovelace");
+
+    expect(
+      screen.getByRole("option", { name: /Lovelace, Ada M./i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("option", { name: /Babbage, Charles/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("narrows rather than widens when another token is typed", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <SearchableSelect
+        value=""
+        onValueChange={vi.fn()}
+        placeholder="Select a user"
+        items={[
+          { value: "u-ada", label: "Lovelace, Ada M." },
+          { value: "u-charles", label: "Babbage, Charles" },
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox"));
+    await user.type(screen.getByPlaceholderText("Search..."), "Ada Babbage");
+
+    expect(
+      screen.queryByRole("option", { name: /Lovelace, Ada M./i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("option", { name: /Babbage, Charles/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("respects a custom popover side", async () => {
@@ -97,29 +157,38 @@ describe("SearchableSelect", () => {
         .closest("[data-slot='popover-content']"),
     ).toHaveAttribute("data-align", "end");
   });
-
-  it("applies a custom list class", async () => {
+  it("selects the first enabled match with Arrow Down then Enter", async () => {
     const user = userEvent.setup();
+    const onValueChange = vi.fn();
 
     render(
       <SearchableSelect
         value=""
-        onValueChange={vi.fn()}
+        onValueChange={onValueChange}
         placeholder="Select a model"
-        listClassName="max-h-[220px]"
         items={[
           {
-            value: "model-a",
-            label: "Model A",
+            value: "legacy-haiku",
+            label: "Claude Haiku Legacy",
+            disabled: true,
           },
+          { value: "haiku", label: "Claude Haiku" },
         ]}
       />,
     );
 
     await user.click(screen.getByRole("combobox"));
+    await user.type(screen.getByPlaceholderText("Search..."), "haiku");
+    await user.keyboard("{ArrowDown}");
 
-    expect(
-      screen.getByRole("button", { name: /Model A/i }).parentElement,
-    ).toHaveClass("max-h-[220px]");
+    expect(screen.getByPlaceholderText("Search...")).toHaveFocus();
+    expect(screen.getByPlaceholderText("Search...")).toHaveAttribute(
+      "aria-activedescendant",
+      screen.getByRole("option", { name: "Claude Haiku" }).id,
+    );
+
+    await user.keyboard("{Enter}");
+
+    expect(onValueChange).toHaveBeenCalledWith("haiku");
   });
 });

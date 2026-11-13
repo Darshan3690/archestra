@@ -8,14 +8,10 @@ import type {
   HTMLAttributes,
   ReactNode,
 } from "react";
-import { createContext, useContext, useState } from "react";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import {
-  oneDark,
-  oneLight,
-} from "react-syntax-highlighter/dist/esm/styles/prism";
+import { createContext, lazy, Suspense, useContext, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
+import { copyToClipboard } from "@/lib/clipboard";
+import { cn } from "@/lib/utils/tailwind";
 
 type CodeBlockContextType = {
   code: string;
@@ -23,6 +19,11 @@ type CodeBlockContextType = {
 
 const CodeBlockContext = createContext<CodeBlockContextType>({
   code: "",
+});
+
+const CodeBlockHighlighter = lazy(async () => {
+  const module = await import("./code-block-highlighter");
+  return { default: module.CodeBlockHighlighter };
 });
 
 export type CodeBlockProps = HTMLAttributes<HTMLDivElement> & {
@@ -58,42 +59,88 @@ export const CodeBlock = ({
         )}
         {...props}
       >
-        <div className="relative">
-          <SyntaxHighlighter
-            className={cn("overflow-hidden", contentClassName)}
-            codeTagProps={{
-              className: "font-mono text-sm",
-            }}
-            customStyle={{
-              margin: 0,
-              padding: "1rem",
-              fontSize: "0.875rem",
-              background: "hsl(var(--background))",
-              color: "hsl(var(--foreground))",
-              ...contentStyle,
-            }}
-            language={language}
-            lineNumberStyle={{
-              color: "hsl(var(--muted-foreground))",
-              paddingRight: "1rem",
-              minWidth: "2.5rem",
-            }}
-            showLineNumbers={showLineNumbers}
-            style={isDark ? oneDark : oneLight}
-            wrapLongLines={wrapLongLines}
+        {/* biome-ignore-start lint/a11y/noNoninteractiveTabindex: scrollable code regions must be keyboard focusable (WCAG 2.1.1) */}
+        <section
+          className="relative"
+          tabIndex={0}
+          aria-label={`Code sample, ${language}`}
+        >
+          <Suspense
+            fallback={
+              <CodeBlockFallback
+                code={code}
+                language={language}
+                showLineNumbers={showLineNumbers}
+                wrapLongLines={wrapLongLines}
+                contentStyle={contentStyle}
+                className={cn("overflow-hidden", contentClassName)}
+              />
+            }
           >
-            {code}
-          </SyntaxHighlighter>
+            <CodeBlockHighlighter
+              className={cn("overflow-hidden", contentClassName)}
+              code={code}
+              contentStyle={contentStyle}
+              isDark={isDark}
+              language={language}
+              showLineNumbers={showLineNumbers}
+              wrapLongLines={wrapLongLines}
+            />
+          </Suspense>
           {children && (
             <div className="absolute top-2 right-2 flex max-w-[calc(100%-1rem)] items-center gap-2 overflow-hidden">
               {children}
             </div>
           )}
-        </div>
+        </section>
+        {/* biome-ignore-end lint/a11y/noNoninteractiveTabindex: scrollable code regions must be keyboard focusable (WCAG 2.1.1) */}
       </div>
     </CodeBlockContext.Provider>
   );
 };
+
+function CodeBlockFallback({
+  code,
+  showLineNumbers = false,
+  wrapLongLines = false,
+  contentStyle,
+  className,
+}: CodeBlockProps) {
+  const lines = code.split("\n");
+
+  return (
+    <pre
+      className={className}
+      style={{
+        margin: 0,
+        padding: "1rem",
+        fontSize: "0.875rem",
+        background: "hsl(var(--background))",
+        color: "hsl(var(--foreground))",
+        whiteSpace: wrapLongLines ? "pre-wrap" : "pre",
+        overflowWrap: wrapLongLines ? "anywhere" : undefined,
+        ...contentStyle,
+      }}
+    >
+      <code className="font-mono text-sm">
+        {showLineNumbers
+          ? lines.map((line, index) => (
+              // biome-ignore lint/suspicious/noArrayIndexKey: line positions are the line-number identity in this static code snapshot
+              <span className="block" key={`${index}-${line}`}>
+                <span
+                  className="inline-block min-w-10 pr-4 text-muted-foreground"
+                  aria-hidden="true"
+                >
+                  {index + 1}
+                </span>
+                <span>{index < lines.length - 1 ? `${line}\n` : line}</span>
+              </span>
+            ))
+          : code}
+      </code>
+    </pre>
+  );
+}
 
 export type CodeBlockCopyButtonProps = ComponentProps<typeof Button> & {
   onCopy?: () => void;
@@ -112,14 +159,9 @@ export const CodeBlockCopyButton = ({
   const [isCopied, setIsCopied] = useState(false);
   const { code } = useContext(CodeBlockContext);
 
-  const copyToClipboard = async () => {
-    if (typeof window === "undefined" || !navigator.clipboard.writeText) {
-      onError?.(new Error("Clipboard API not available"));
-      return;
-    }
-
+  const handleCopy = async () => {
     try {
-      await navigator.clipboard.writeText(code);
+      await copyToClipboard(code);
       setIsCopied(true);
       onCopy?.();
       setTimeout(() => setIsCopied(false), timeout);
@@ -134,7 +176,7 @@ export const CodeBlockCopyButton = ({
     <Button
       aria-label={isCopied ? "Copied!" : "Copy to clipboard"}
       className={cn("shrink-0", className)}
-      onClick={copyToClipboard}
+      onClick={handleCopy}
       size="icon"
       variant="ghost"
       {...props}

@@ -1,14 +1,61 @@
 archestra:
   replicaCount: 4
 
+  # Requires Cloud SQL max_connections=600 before deploying this budget.
+  # Four web replicas can reach 10 pods during a rollout (50% surge plus
+  # terminating pods); three workers can reach 7 (25% surge plus terminating).
+  # 550 / 17 leaves 20 query connections plus 10 cache and 2 listeners per
+  # pod: 544 total, with 56 slots left for reserved connections and other users.
+  database:
+    connectionBudget: 550
+    # Cloud SQL instance from infra gcp/gke/cloudsql.tf. The pods log in as
+    # the archestra-staging-platform service account; no password exists.
+    cloudSqlProxy:
+      enabled: true
+      instanceConnectionName: friendly-path-465518-r6:us-central1:archestra-staging-pg
+
+  # Staging's measured CPU use is below the chart's production-sized requests.
+  # Keep scheduling room for rolling-update surge pods; no CPU limit prevents
+  # these smaller requests from restricting bursts into spare node capacity.
+  resources:
+    requests:
+      cpu: "500m"
+    # The chart's default 3Gi limit is too tight for this container, which runs
+    # two Node processes under supervisord (backend + the Next.js server). A
+    # freshly-booted web pod already sits at ~2.0Gi of the 3Gi limit (backend
+    # ~1.15Gi RSS, next-server ~0.14Gi, plus slab and page cache), so ordinary
+    # traffic walked it into the limit and the kernel OOM-killed the container
+    # every few minutes. Raising the limit restores real headroom; requests are
+    # unchanged, so scheduling and the node-pool budget are unaffected.
+    #
+    # This also fixes the ordering that made the crash undiagnosable. The Node
+    # launcher derives the V8 old-space ceiling as 60% of the container limit,
+    # so this moves it from 1843 MiB to ~2457 MiB while the container gains a
+    # full extra gigabyte. Projected peak (heap + native/external + the Next.js
+    # server + slab) now lands under 4Gi, so V8 reaches its own heap ceiling
+    # before the cgroup does: the process exits with a JS heap OOM and a
+    # fatal-error report instead of being SIGKILLed with no stack. Note the
+    # ceiling is deliberately left to that formula rather than pinned via
+    # ARCHESTRA_NODE_MAX_OLD_SPACE_SIZE_MIB, because that env var would also
+    # apply to the worker, whose limit is 2Gi.
+    limits:
+      memory: "4Gi"
+
   worker:
     replicaCount: 3
+    # Same reasoning as archestra.resources above; workers idle even lower.
+    resources:
+      requests:
+        cpu: "250m"
 
   # Pod Disruption Budget: ensure at least 3 of 4 pods stay running during
   # voluntary disruptions (node upgrades, autoscaling, maintenance)
   podDisruptionBudget:
     enabled: true
     maxUnavailable: 1
+    # Unready pods must not strand a draining node when the healthy-pod budget
+    # is exhausted. Healthy pods still require the budget above.
+    unhealthyPodEvictionPolicy: AlwaysAllow
 
   # Faster rolling updates: allow 2 pods to be created at once
   deploymentStrategy:
@@ -17,51 +64,138 @@ archestra:
       maxUnavailable: 0
       maxSurge: "50%"
 
-  # Vertex AI Gemini configuration
-  # Uses Application Default Credentials (ADC) via GKE Workload Identity
-  # instead of API keys for authentication
   env:
-    ARCHESTRA_ANALYTICS: disabled
-    ARCHESTRA_AGENTS_ADVANCED_TOOL_FEATURES_ENABLED: "true"
-    ARCHESTRA_ENTERPRISE_LICENSE_ACTIVATED: "true"
-    ARCHESTRA_ENTERPRISE_LICENSE_FULL_WHITE_LABELING: "true"
-    ARCHESTRA_ENTERPRISE_LICENSE_KNOWLEDGE_BASE_ACTIVATED: "true"
+    # Internal UI feedback overlay: comment on page elements, posted to Slack
+    # as a chatops bot. The bot and channel are picked in the UI on first use.
+    ARCHESTRA_DEV_FEEDBACK_ENABLED: "true"
+    # Runtime pods reach this installation through its in-cluster API Service.
+    ARCHESTRA_AGENT_RUNTIME_PLATFORM_BASE_URL: "http://archestra-platform.archestra.svc.cluster.local:9000"
+    # Retention stays OFF here on purpose. This deployment is where the
+    # platform gets stress-tested, and a large `interactions` table is the
+    # point — the volume is the test data, not a problem to sweep up. Storage
+    # autoresizes, so it grows with the table.
     ARCHESTRA_API_BASE_URL: "https://frontend.archestra.dev,https://backend.archestra.dev"
-    ARCHESTRA_GEMINI_VERTEX_AI_ENABLED: "true"
-    ARCHESTRA_GEMINI_VERTEX_AI_PROJECT: "friendly-path-465518-r6"
-    ARCHESTRA_GEMINI_VERTEX_AI_LOCATION: "us-central1"
+    # Dedicated origin for MCP App sandboxes so browser device permissions
+    # (camera/mic/geolocation/clipboard) can be delegated to app iframes. Each
+    # app renders at <hash>.sandbox.archestra.dev (a real cross-origin); without
+    # this, sandboxes fall back to the frontend's opaque origin and browsers
+    # block those features. Wildcard DNS + the cert-manager-issued wildcard TLS
+    # secret come from archestra-ai/infra (gke/dns.tf, gke-apps/cert-manager);
+    # the ingress rule + tls entry below route the sandbox hosts to the frontend.
+    ARCHESTRA_MCP_SANDBOX_DOMAIN: "sandbox.archestra.dev"
     ARCHESTRA_BEDROCK_BASE_URL: "https://bedrock-runtime.eu-north-1.amazonaws.com"
     ARCHESTRA_BEDROCK_INFERENCE_PROFILE_PREFIX: "eu"
     ARCHESTRA_AUTH_COOKIE_DOMAIN: ".archestra.dev"
     ARCHESTRA_FRONTEND_URL: "https://frontend.archestra.dev"
-    ARCHESTRA_TRUST_PROXY: "true"
+    # Provider delivery stays public through the exact-route relay; browser
+    # OAuth and ordinary app/API traffic continue to use the VPN-only origin.
+    ARCHESTRA_CHATOPS_WEBHOOK_BASE_URL: "https://a2a-webhook-wkjbuewj5a-uc.a.run.app/staging"
     ARCHESTRA_SENTRY_ENVIRONMENT: "archestra.dev"
     ARCHESTRA_AGENTS_INCOMING_EMAIL_PROVIDER: "outlook"
     ARCHESTRA_AGENTS_INCOMING_EMAIL_OUTLOOK_MAILBOX_ADDRESS: "agents@archestraai.onmicrosoft.com"
-    ARCHESTRA_AGENTS_INCOMING_EMAIL_OUTLOOK_WEBHOOK_URL: "https://backend.archestra.dev/api/webhooks/incoming-email"
-    ARCHESTRA_CHAT_DEFAULT_PROVIDER: "anthropic"
-    ARCHESTRA_CHAT_DEFAULT_MODEL: "claude-opus-4-5-20251101"
+    ARCHESTRA_AGENTS_INCOMING_EMAIL_OUTLOOK_WEBHOOK_URL: "https://a2a-webhook-wkjbuewj5a-uc.a.run.app/staging/api/webhooks/incoming-email"
+    # Identifiers and endpoints, not credentials.
+    ARCHESTRA_AUTH_ADMIN_EMAIL: "joey@archestra.ai"
+    ARCHESTRA_OTEL_EXPORTER_OTLP_ENDPOINT: "http://grafana-alloy.archestra.svc.cluster.local:4318/v1/traces"
+    # Export audit events as OTLP logs, on their own endpoint and only there,
+    # to the audit collector that writes them to the organization's security
+    # log archive. Alloy does not carry them.
+    # (archestra-ai/infra: gcp/gke/apps/observability/audit-collector.tf).
+    ARCHESTRA_AUDIT_LOG_OTEL_ENABLED: "true"
+    ARCHESTRA_AUDIT_LOG_OTEL_ENDPOINT: "http://audit-collector.observability.svc.cluster.local:4318"
+    # The security archive's alerts name who acted.
+    ARCHESTRA_AUDIT_LOG_OTEL_INCLUDE_ACTOR_IDENTITY: "true"
+    # Labels this installation's records environment=staging in the archive.
+    OTEL_RESOURCE_ATTRIBUTES: "deployment.environment.name=staging"
+    ARCHESTRA_SENTRY_BACKEND_DSN: "https://33391b7f4919317c107830148766998a@o4509825927479296.ingest.de.sentry.io/4510381680689232"
+    ARCHESTRA_SENTRY_FRONTEND_DSN: "https://5ff9bac572fb23e3620c066cbc93ce34@o4509825927479296.ingest.de.sentry.io/4510381678461008"
+    ARCHESTRA_AGENTS_INCOMING_EMAIL_OUTLOOK_TENANT_ID: "e6ec2dea-2205-4e2f-afb6-f83e5f588f40"
+    ARCHESTRA_AGENTS_INCOMING_EMAIL_OUTLOOK_CLIENT_ID: "8d184f86-d6a1-4fd6-8783-b2f4931be17b"
+    ARCHESTRA_MICROSOFT_365_COPILOT_CLIENT_ID: "35f1f67b-6082-458a-be3e-b82a96585ebc"
+    ARCHESTRA_MICROSOFT_365_COPILOT_TENANT_ID: "e6ec2dea-2205-4e2f-afb6-f83e5f588f40"
+
+  # Every credential, including the session, encryption and offer-signing
+  # keys the chart would otherwise generate, comes from the archestra-platform-runtime Secret
+  # that archestra-ai/infra syncs from GCP Secret Manager (gcp/gke/apps/
+  # runtime-secrets, one key per env var). These entries replace the chart's
+  # generated values. Never also set these names under env: an env entry,
+  # even "", would replace the synced value.
+  envFromSecrets:
+    - name: ARCHESTRA_AUTH_SECRET
+      secretName: archestra-platform-runtime
+      secretKey: ARCHESTRA_AUTH_SECRET
+    - name: ARCHESTRA_AUTH_SESSION_SECRET
+      secretName: archestra-platform-runtime
+      secretKey: ARCHESTRA_AUTH_SESSION_SECRET
+    - name: ARCHESTRA_SECRETS_ENCRYPTION_SECRET
+      secretName: archestra-platform-runtime
+      secretKey: ARCHESTRA_SECRETS_ENCRYPTION_SECRET
+    - name: ARCHESTRA_SECRETS_ENCRYPTION_SECRET_PREVIOUS
+      secretName: archestra-platform-runtime
+      secretKey: ARCHESTRA_SECRETS_ENCRYPTION_SECRET_PREVIOUS
+    - name: ARCHESTRA_CONTENT_ENCRYPTION_SECRET
+      secretName: archestra-platform-runtime
+      secretKey: ARCHESTRA_CONTENT_ENCRYPTION_SECRET
+    - name: ARCHESTRA_CONTENT_ENCRYPTION_SECRET_PREVIOUS
+      secretName: archestra-platform-runtime
+      secretKey: ARCHESTRA_CONTENT_ENCRYPTION_SECRET_PREVIOUS
+    - name: ARCHESTRA_OPENAPPA_OFFER_SIGNING_SECRET
+      secretName: archestra-platform-runtime
+      secretKey: ARCHESTRA_OPENAPPA_OFFER_SIGNING_SECRET
+    - name: ARCHESTRA_AUTH_ADMIN_PASSWORD
+      secretName: archestra-platform-runtime
+      secretKey: ARCHESTRA_AUTH_ADMIN_PASSWORD
+    - name: ARCHESTRA_METRICS_SECRET
+      secretName: archestra-platform-runtime
+      secretKey: ARCHESTRA_METRICS_SECRET
+    - name: ARCHESTRA_AGENTS_INCOMING_EMAIL_OUTLOOK_CLIENT_SECRET
+      secretName: archestra-platform-runtime
+      secretKey: ARCHESTRA_AGENTS_INCOMING_EMAIL_OUTLOOK_CLIENT_SECRET
 
   diagnostics:
     enabled: true
     storageClassName: "archestra-diagnostics-rwx"
     accessModes:
       - ReadWriteMany
-    heapSnapshotsNearHeapLimit: 1
+    # Deliberately off (matching the chart default). Writing a heap snapshot as
+    # V8 approaches its limit needs extra memory and stalls the event loop at
+    # exactly the moment memory is tightest, so the container hit its cgroup
+    # limit mid-write: the volume accumulated 783 snapshots and every one was
+    # 0 bytes, i.e. the process was killed before a single byte landed. It also
+    # converted a diagnosable JS heap OOM into an opaque SIGKILL and made the
+    # readiness/liveness probes fail during the stall. Turn this back on only
+    # for a targeted investigation, with headroom to actually write the file.
+    heapSnapshotsNearHeapLimit: 0
+
+  # Pre-installed read-only Kubernetes MCP server and the SRE agent using it.
+  # apiServerCidrs: the private control-plane endpoint of archestra-staging
+  # (`kubectl get endpoints kubernetes -n default`), which the MCP egress
+  # floor blocks otherwise.
+  sre:
+    enabled: true
+    apiServerCidrs:
+      - 10.0.0.2/32
 
   # Orchestrator configuration with Workload Identity for Vertex AI
   orchestrator:
     kubernetes:
-      networkPolicy:
-        # Enable SSRF protection for MCP server pods
-        create: true
-
+      # MCP server pods, Agent Runtime sessions and code-runtime Dagger engines
+      # run here, away from the platform pods and the content-encryption Secret
+      # in `archestra`. archestra-ai/infra (gcp/gke/mcp-namespace.tf) creates
+      # the namespace, its Pod Security labels and the CI deployer's RBAC;
+      # apply that before this deploys, or the chart's RoleBindings there fail.
+      # Objects started in `archestra` before the move are not cleaned up by
+      # the platform; they are cleaned up by hand after the rollout.
+      namespace: archestra-mcp
       serviceAccount:
-        # GKE Workload Identity binding to allow Vertex AI access via ADC
-        # The GCP service account (archestra-vertex-ai@friendly-path-465518-r6.iam.gserviceaccount.com)
-        # is created and bound in the archestra-ai/infra repo (gke/main.tf)
         annotations:
-          iam.gke.io/gcp-service-account: archestra-vertex-ai@friendly-path-465518-r6.iam.gserviceaccount.com
+          iam.gke.io/gcp-service-account: archestra-staging-platform@friendly-path-465518-r6.iam.gserviceaccount.com
+      rbac:
+        # Namespaces backing deployment environments the platform may deploy
+        # MCP servers into. Each entry gets a namespace-scoped Role + RoleBinding
+        # and is surfaced to the app as ARCHESTRA_ORCHESTRATOR_ENVIRONMENT_NAMESPACES.
+        environmentNamespaces:
+          - env-test
 
       # Additional RBAC for MCP K8s operator service account
       # Grants cluster-wide read access and namespace-specific permissions for the Kubernetes MCP server
@@ -80,9 +214,12 @@ archestra:
       # Maps backend port (9000) and frontend port (3000) to their respective BackendConfigs
       # These BackendConfigs are defined in archestra-ai/infra repo (gke/ingress.tf)
       cloud.google.com/backend-config: '{"ports": {"9000":"archestra-platform-backend-config", "3000":"archestra-platform-frontend-config"}}'
+      cloud.google.com/neg: '{"ingress": true}'
 
   ingress:
-    enabled: true
+    # VPN-only ingress is managed by archestra-ai/infra. Do not recreate the
+    # public listener on later application releases.
+    enabled: false
     annotations:
       # GKE Ingress Controller configuration
       kubernetes.io/ingress.class: "gce"
@@ -92,6 +229,8 @@ archestra:
       ingress.gcp.cloud.google.com/ssl-redirect: "true"
 
     hosts:
+      # The chart adds /v1 and /v2 -> 9000 for any host that serves the UI, so
+      # LLM proxy traffic skips the frontend process. Nothing to declare here.
       - host: frontend.archestra.dev
         paths:
           - path: /
@@ -99,10 +238,35 @@ archestra:
             pathType: Prefix
       - host: backend.archestra.dev
         paths:
-          # Block public access to metrics endpoint
-          - path: /metrics
-            port: 1
-            pathType: Exact
           - path: /
             port: 9000
             pathType: Prefix
+      # MCP App sandbox origins (<hash>.sandbox.archestra.dev) go straight to
+      # the backend, which serves /_sandbox/* itself and validates the Host
+      # header (routing via the frontend rewrites the Host header -> 403).
+      - host: "*.sandbox.archestra.dev"
+        paths:
+          - path: /
+            port: 9000
+            pathType: Prefix
+
+    # Wildcard cert for the sandbox hosts, issued and renewed by cert-manager
+    # (archestra-ai/infra, gke-apps/cert-manager). GKE combines spec.tls
+    # secrets with the ManagedCertificate annotation above. The secret must
+    # exist before this deploys, or ingress-gce fails to sync the Ingress.
+    tls:
+      - hosts:
+          - "*.sandbox.archestra.dev"
+        secretName: archestra-sandbox-wildcard-tls
+
+postgresql:
+  # Staging's database is Cloud SQL for PostgreSQL 18 (private IP, no public
+  # endpoint), not the bundled chart, so the database's durability no longer
+  # depends on the GKE node lifecycle — replacing a node used to take the only
+  # database pod down with it, which is what kept staging dying at random.
+  #
+  # The pods reach it through the Cloud SQL Auth Proxy sidecar
+  # (archestra.database.cloudSqlProxy), which encrypts the connection and logs
+  # in with IAM. The URL names the IAM database user and holds no secret.
+  enabled: false
+  external_database_url: "postgresql://archestra-staging-platform%40friendly-path-465518-r6.iam@127.0.0.1:5432/archestra_dev?sslmode=disable"

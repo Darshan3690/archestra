@@ -1,16 +1,15 @@
-import { Writable } from "node:stream";
 import {
   isSpanContextValid,
   context as otelContext,
   trace,
 } from "@opentelemetry/api";
-import {
-  logs,
-  type Logger as OtelLogger,
-  SeverityNumber,
-} from "@opentelemetry/api-logs";
+import { logs } from "@opentelemetry/api-logs";
 import pino from "pino";
-import { LOG_LEVEL } from "@/logging/log-level";
+import pretty from "pino-pretty";
+import { createLogger } from "@/logging/create-logger";
+import { LOG_FORMAT } from "@/logging/log-format";
+import { logRingBuffer } from "@/logging/log-ring-buffer";
+import { createLogObserverStream } from "@/logging/observer-stream";
 import { getActiveSessionId } from "@/observability/request-context";
 
 /**
@@ -31,7 +30,7 @@ import { getActiveSessionId } from "@/observability/request-context";
  *
  *   1. Inject trace context (`trace_id`, `span_id`, `trace_flags`) into every
  *      log record via pino's `mixin` option — visible in console output.
- *   2. Forward log records to the OTEL Logs API via a custom `Writable` stream
+ *   2. Forward log records to the OTEL Logs API via a shared structured stream
  *      combined with `pino.multistream` — sends logs to the OTLP collector.
  *
  * The OTEL Logs SDK automatically captures the active span context when
@@ -41,44 +40,110 @@ import { getActiveSessionId } from "@/observability/request-context";
 
 let _instance: pino.Logger | null = null;
 
-function createLogger(): pino.Logger {
-  // Write raw JSON to stdout via an async, buffered destination so log writes
-  // don't block the event loop when the container log pipe is backpressured.
-  return pino(
-    {
-      level: LOG_LEVEL,
-      // Keep `time` as epoch ms (pino default) so OTEL and log shippers can
-      // read it without parsing. Add a sibling `timeIso` for human readers
-      // looking at raw stdout.
-      mixin: () => ({
-        ...injectTraceContext(),
-        timeIso: new Date().toISOString(),
-      }),
-      // Drop `pid` and `hostname` — they're noise in a containerized
-      // environment where pod metadata already identifies the host.
-      base: undefined,
-    },
-    pino.multistream([
-      {
-        level: "trace",
-        stream: pino.destination({ fd: 1, sync: false, minLength: 4096 }),
-      },
-      { level: "trace", stream: createOtelLogStream() },
-    ]),
-  );
+function getInstance(): pino.Logger {
+  if (!_instance) _instance = createDefaultLogger();
+  return _instance;
 }
 
+function createDefaultLogger(): pino.Logger {
+  // Write raw JSON to stdout via an async, buffered destination so log writes
+  // don't block the event loop when the container log pipe is backpressured.
+  return createLogger({
+    // Keep `time` as epoch ms (pino default) so OTEL and log shippers can
+    // read it without parsing. Add a sibling `timeIso` for human readers
+    // looking at raw stdout.
+    mixin: () => ({
+      ...injectTraceContext(),
+      timeIso: new Date().toISOString(),
+    }),
+    streams: [
+      { level: "trace", stream: createStdoutStream() },
+      {
+        level: "trace",
+        stream: createLogObserverStream({
+          logger: logs.getLogger("pino"),
+          retain: (record) => logRingBuffer.ingest(record),
+        }),
+      },
+    ],
+  });
+}
+
+/**
+ * A property defined on the proxy itself wins over the instance's. That is
+ * what `vi.spyOn(logger, "warn")` creates, so tests can spy on the real
+ * logger (see `spyOnLogger` in `@/test/logging`) instead of mocking the
+ * module, which would make their files run isolated.
+ */
 const logger: pino.Logger = new Proxy({} as pino.Logger, {
-  get(_, prop) {
-    if (!_instance) _instance = createLogger();
-    const value = (_instance as unknown as Record<string | symbol, unknown>)[
-      prop
-    ];
+  get(target, prop) {
+    if (Object.hasOwn(target, prop)) {
+      return (target as unknown as Record<string | symbol, unknown>)[prop];
+    }
+    const value = (
+      getInstance() as unknown as Record<string | symbol, unknown>
+    )[prop];
     return typeof value === "function" ? value.bind(_instance) : value;
+  },
+  getOwnPropertyDescriptor(target, prop) {
+    const own = Reflect.getOwnPropertyDescriptor(target, prop);
+    if (own) return own;
+    const value = (
+      getInstance() as unknown as Record<string | symbol, unknown>
+    )[prop];
+    if (typeof value !== "function") return undefined;
+    return {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: value.bind(_instance),
+    };
   },
 });
 
 export default logger;
+
+// --- Internal helpers (stdout stream) ---
+
+/**
+ * Create the stdout half of the pino multistream. Format is selected by
+ * `ARCHESTRA_LOGGING_FORMAT` (see `log-format.ts`).
+ *
+ * - `json` (default): raw JSON to fd:1 via an async, buffered destination so
+ *   log writes don't block the event loop when the stdout pipe is
+ *   backpressured. The machine-readable format consumed by log shippers.
+ * - `pretty`: human-readable single-line colorized output.
+ *
+ * The OTEL multistream branch always receives the same JSON record from pino
+ * before any stream-level transform, so swapping this branch never changes
+ * what the OTLP exporter sees.
+ */
+function createStdoutStream() {
+  if (LOG_FORMAT === "pretty") {
+    return pretty({
+      colorize: true,
+      translateTime: "HH:MM:ss Z",
+      singleLine: true,
+      // Mixin-added fields are valuable in JSON for OTEL/log shippers but
+      // pure noise in a pretty console line.
+      ignore: "pid,hostname,timeIso,trace_id,span_id,trace_flags,session_id",
+    });
+  }
+  const destination = pino.destination({ fd: 1, sync: false, minLength: 4096 });
+  // The buffer trades write latency for never blocking the event loop, and a
+  // chatty process crosses the threshold many times a second anyway. A
+  // near-silent process is the trap: a record under the threshold sits
+  // buffered INDEFINITELY — the dedicated renderer would boot, run a job,
+  // fail it, and show an empty log the whole time, its report surfacing only
+  // at process exit (if the exit is clean enough to flush at all). The
+  // interval bounds that wait; unref'd, it never holds the process open.
+  setInterval(() => destination.flush(), STDOUT_FLUSH_INTERVAL_MS).unref();
+  return destination;
+}
+
+/** Longest a buffered record may wait for the size threshold before being
+ * flushed anyway — the ceiling on "the log looks empty" during quiet spells. */
+const STDOUT_FLUSH_INTERVAL_MS = 2_000;
 
 // --- Internal helpers (trace context injection) ---
 
@@ -88,93 +153,21 @@ export default logger;
  */
 function injectTraceContext(): Record<string, string> {
   const span = trace.getSpan(otelContext.active());
-  if (!span) return {};
+  const sessionId = getActiveSessionId();
+  const sessionFields: Record<string, string> = sessionId
+    ? { session_id: sessionId }
+    : {};
+  if (!span) return sessionFields;
 
   const spanContext = span.spanContext();
-  if (!isSpanContextValid(spanContext)) return {};
+  if (!isSpanContextValid(spanContext)) return sessionFields;
 
   const result: Record<string, string> = {
+    ...sessionFields,
     trace_id: spanContext.traceId,
     span_id: spanContext.spanId,
     trace_flags: `0${spanContext.traceFlags.toString(16)}`,
   };
 
-  const sessionId = getActiveSessionId();
-  if (sessionId) {
-    result.session_id = sessionId;
-  }
-
   return result;
-}
-
-// --- Internal helpers (OTEL log stream) ---
-
-/** Map pino log levels → OTEL severity numbers */
-const PINO_TO_OTEL_SEVERITY: Record<number, SeverityNumber> = {
-  10: SeverityNumber.TRACE,
-  20: SeverityNumber.DEBUG,
-  30: SeverityNumber.INFO,
-  40: SeverityNumber.WARN,
-  50: SeverityNumber.ERROR,
-  60: SeverityNumber.FATAL,
-};
-
-/** Convert epoch milliseconds to `[seconds, nanoseconds]` HrTime tuple */
-function millisToHrTime(millis: number): [number, number] {
-  return [Math.trunc(millis / 1000), (millis % 1000) * 1_000_000];
-}
-
-/**
- * Create a writable stream that forwards pino log records to the OTEL Logs API.
- *
- * Mirrors `@opentelemetry/instrumentation-pino`'s `OTelPinoStream`:
- * - Parses JSON log records from pino
- * - Strips redundant fields (hostname, pid, trace context injected by mixin)
- * - Maps pino levels to OTEL severity numbers
- * - Emits records via the global OTEL LoggerProvider
- */
-function createOtelLogStream(): Writable {
-  const otelLogger: OtelLogger = logs.getLogger("pino");
-
-  return new Writable({
-    write(
-      chunk: Buffer,
-      _encoding: string,
-      callback: (error?: Error | null) => void,
-    ) {
-      try {
-        const record = JSON.parse(chunk.toString());
-        const {
-          time,
-          msg,
-          level,
-          // Strip fields redundant with OTEL resource attributes
-          hostname: _hostname,
-          pid: _pid,
-          // Strip trace context fields added by mixin (redundant — the OTEL SDK
-          // captures the active span context automatically via `context.active()`)
-          trace_id: _traceId,
-          span_id: _spanId,
-          trace_flags: _traceFlags,
-          ...attributes
-        } = record;
-
-        const timestamp = millisToHrTime(
-          typeof time === "number" ? time : Date.now(),
-        );
-
-        otelLogger.emit({
-          timestamp,
-          observedTimestamp: timestamp,
-          severityNumber: PINO_TO_OTEL_SEVERITY[level] ?? SeverityNumber.INFO,
-          severityText: pino.levels.labels[level] ?? "INFO",
-          body: msg,
-          attributes,
-        });
-      } catch {
-        // Ignore JSON parse errors (shouldn't happen with standard pino output)
-      }
-      callback();
-    },
-  });
 }

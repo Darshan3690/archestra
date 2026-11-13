@@ -1,69 +1,187 @@
-import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import db, { schema } from "@/database";
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+import {
+  ARCHESTRA_MCP_CATALOG_ID,
+  isBuiltInCatalogId,
+  PLAYWRIGHT_MCP_CATALOG_ID,
+  type ResourcePermissionAction,
+} from "@archestra/shared";
+import { and, eq, inArray, isNull, or, type SQL, sql } from "drizzle-orm";
+import { dropHiddenCatalogIds } from "@/auth/permission-gated";
+import db, { schema, type Transaction, withDbTransaction } from "@/database";
 import logger from "@/logging";
+import {
+  type CatalogTeamAccessLevel,
+  type CatalogTeamInput,
+  DEFAULT_CATALOG_TEAM_ACCESS_LEVEL,
+  normalizeCatalogTeamInput,
+} from "@/types/catalog-team-level";
+import ResourcePermissionPolicyModel from "./resource-permission-policy";
+import ResourcePermissionSubjectModel, {
+  type GrantPrincipal,
+  type PrincipalSource,
+} from "./resource-permission-subject";
+
+interface CatalogTeamDetail {
+  id: string;
+  name: string;
+  level: CatalogTeamAccessLevel;
+}
 
 class McpCatalogTeamModel {
   /**
-   * Get all catalog IDs that a user has access to.
-   * Three sources of access:
-   * 1. Org-scoped catalogs (visible to all)
-   * 2. Author's own personal catalogs
-   * 3. Team-scoped catalogs where user is a team member
+   * Catalog IDs a user can see in the registry: every catalog in the
+   * organization for an administrator, otherwise the ones
+   * {@link McpCatalogTeamModel.readCondition} admits.
    */
   static async getUserAccessibleCatalogIds(
     userId: string,
     isAdmin: boolean,
     organizationId: string,
   ): Promise<string[]> {
-    if (isAdmin) {
-      const allCatalogs = await db
-        .select({ id: schema.internalMcpCatalogTable.id })
-        .from(schema.internalMcpCatalogTable)
-        .where(
-          or(
-            eq(schema.internalMcpCatalogTable.organizationId, organizationId),
-            isNull(schema.internalMcpCatalogTable.organizationId),
-          ),
-        );
-      return allCatalogs.map((c) => c.id);
-    }
-
-    // Mirrors the agent (profile) access control approach: org-visible + personal + team-based
-    const result = await db.execute<{ id: string }>(sql`
-      SELECT id FROM internal_mcp_catalog
-        WHERE scope = 'org'
-          AND (organization_id = ${organizationId} OR organization_id IS NULL)
-      UNION
-      SELECT id FROM internal_mcp_catalog
-        WHERE author_id = ${userId}
-          AND scope = 'personal'
-          AND organization_id = ${organizationId}
-      UNION
-      SELECT ct.catalog_id AS id
-        FROM mcp_catalog_team ct
-        INNER JOIN internal_mcp_catalog c ON ct.catalog_id = c.id
-        INNER JOIN team_member tm ON ct.team_id = tm.team_id
-        WHERE tm.user_id = ${userId}
-          AND c.scope = 'team'
-          AND c.organization_id = ${organizationId}
-    `);
-
-    return result.rows.map((r) => r.id);
+    return McpCatalogTeamModel.getAccessibleCatalogIds({
+      userId,
+      isAdmin,
+      organizationId,
+    });
   }
 
   /**
-   * Check if a user has access to a specific catalog item.
+   * {@link McpCatalogTeamModel.getUserAccessibleCatalogIds}, resolving the
+   * caller through a request's memoized principal when one is given.
    */
-  static async userHasCatalogAccess(
-    userId: string,
-    catalogId: string,
-    isAdmin: boolean,
-    organizationId: string,
-  ): Promise<boolean> {
+  static async getAccessibleCatalogIds(params: {
+    userId: string;
+    isAdmin: boolean;
+    organizationId: string;
+    lookups?: PrincipalSource;
+  }): Promise<string[]> {
+    const { userId, isAdmin, organizationId, lookups } = params;
+    const catalog = schema.internalMcpCatalogTable;
+    const principal = isAdmin
+      ? null
+      : await ResourcePermissionSubjectModel.resolvePrincipalFrom(lookups, {
+          organizationId,
+          userId,
+        });
+    const rows = await db
+      .select({ id: catalog.id })
+      .from(catalog)
+      .where(
+        and(
+          or(
+            eq(catalog.organizationId, organizationId),
+            isNull(catalog.organizationId),
+          ),
+          principal ? McpCatalogTeamModel.readCondition(principal) : undefined,
+        ),
+      );
+    return dropHiddenCatalogIds(
+      rows.map((row) => row.id),
+      { userId, organizationId },
+    );
+  }
+
+  /**
+   * Whether a user can see a catalog row in a registry list, as SQL over
+   * `internal_mcp_catalog`. Grants decide, with three kinds of row that have
+   * no policy of their own:
+   *
+   * - The two built-in catalogs ship with the platform. Every member has
+   *   always seen them in the registry, and they carry no per-object policy,
+   *   so they stay visible to any member.
+   * - A hidden runtime variant is part of its parent, so it follows the
+   *   parent's grants.
+   * - An app's backing catalog is the app's own, so it follows the app's
+   *   grants rather than a registry policy it never had. A registry-wide grant
+   *   still reaches it, as it did before.
+   */
+  static readCondition(principal: GrantPrincipal) {
+    const catalog = schema.internalMcpCatalogTable;
+    const { organizationId } = principal;
+    const isMember = principal.subjects.some(
+      (subject) => subject.type === "user",
+    );
+    return or(
+      and(
+        inArray(catalog.id, [
+          ARCHESTRA_MCP_CATALOG_ID,
+          PLAYWRIGHT_MCP_CATALOG_ID,
+        ]),
+        isMember ? sql`true` : sql`false`,
+      ),
+      and(
+        sql`${catalog.serverType} <> 'app'`,
+        ResourcePermissionPolicyModel.grantCondition({
+          ...principal,
+          resource: "mcpRegistry",
+          scopeColumn: sql`coalesce(${catalog.parentCatalogItemId}, ${catalog.id})`,
+          action: "read",
+        }),
+      ),
+      and(
+        eq(catalog.serverType, "app"),
+        or(
+          // Whoever manages the whole registry reaches app backing catalogs
+          // as before; they held that reach through the registry, not the app.
+          ResourcePermissionPolicyModel.grantCondition({
+            ...principal,
+            resource: "mcpRegistry",
+            scopeColumn: catalog.id,
+            action: "read",
+          }),
+          sql`EXISTS (
+          SELECT 1 FROM apps backing_app
+          JOIN mcp_server backing_server ON backing_server.id = backing_app.mcp_server_id
+          WHERE backing_server.catalog_id = ${catalog.id}
+            AND backing_app.organization_id = ${organizationId}
+            AND backing_app.deleted_at IS NULL
+            AND ${ResourcePermissionPolicyModel.grantCondition({
+              ...principal,
+              resource: "app",
+              scopeColumn: sql`backing_app.id`,
+              action: "read",
+            })}
+          )`,
+        ),
+      ),
+    ) as SQL;
+  }
+
+  /**
+   * Whether a catalog item is in front of the whole organization: a built-in
+   * catalog always is, and any other item is when its own grants reach the
+   * organization or a role (a runtime variant answers for its parent). A
+   * shared installation of an item that is not makes the installer's
+   * connection something other members resolve through, which is a write on
+   * the item.
+   */
+  static async isPublishedToOrganization(params: {
+    organizationId: string;
+    catalog: { id: string; parentCatalogItemId?: string | null };
+  }): Promise<boolean> {
+    const { catalog } = params;
+    if (isBuiltInCatalogId(catalog.id)) return true;
+    const { audience } = await ResourcePermissionPolicyModel.findAudience({
+      organizationId: params.organizationId,
+      resource: "mcpRegistry",
+      scope: catalog.parentCatalogItemId ?? catalog.id,
+    });
+    return audience === "org";
+  }
+
+  /**
+   * Check if a user has access to a specific catalog item: a grant on the item
+   * (or at `*`) decides. The action asked for, or `read` alongside it.
+   */
+  static async userHasCatalogAccess(params: {
+    userId: string;
+    catalogId: string;
+    organizationId: string;
+    action?: ResourcePermissionAction;
+  }): Promise<boolean> {
+    const { userId, catalogId, organizationId } = params;
     const [catalog] = await db
       .select({
-        scope: schema.internalMcpCatalogTable.scope,
-        authorId: schema.internalMcpCatalogTable.authorId,
         organizationId: schema.internalMcpCatalogTable.organizationId,
       })
       .from(schema.internalMcpCatalogTable)
@@ -74,127 +192,149 @@ class McpCatalogTeamModel {
     if (catalog.organizationId && catalog.organizationId !== organizationId) {
       return false;
     }
-    if (isAdmin) return true;
-
-    if (catalog.scope === "org") return true;
-
-    if (catalog.scope === "personal") {
-      return catalog.authorId === userId;
-    }
-
-    if (catalog.scope === "team") {
-      const userTeams = await db
-        .select({ teamId: schema.teamMembersTable.teamId })
-        .from(schema.teamMembersTable)
-        .where(eq(schema.teamMembersTable.userId, userId));
-
-      const teamIds = userTeams.map((t) => t.teamId);
-      if (teamIds.length === 0) return false;
-
-      const catalogTeam = await db
-        .select()
-        .from(schema.mcpCatalogTeamsTable)
+    const principal = await ResourcePermissionSubjectModel.resolvePrincipal({
+      organizationId,
+      userId,
+    });
+    // Opening an item follows the same rule as listing it, so a built-in or
+    // an app backing catalog that a list shows also opens.
+    if (!params.action || params.action === "read") {
+      const [readable] = await db
+        .select({ id: schema.internalMcpCatalogTable.id })
+        .from(schema.internalMcpCatalogTable)
         .where(
           and(
-            eq(schema.mcpCatalogTeamsTable.catalogId, catalogId),
-            inArray(schema.mcpCatalogTeamsTable.teamId, teamIds),
+            eq(schema.internalMcpCatalogTable.id, catalogId),
+            McpCatalogTeamModel.readCondition(principal),
           ),
         )
         .limit(1);
-
-      return catalogTeam.length > 0;
+      return readable !== undefined;
     }
-
-    return false;
+    // A runtime variant answers with its parent's grants, as the read rule does.
+    const grantScope = sql`coalesce(${schema.internalMcpCatalogTable.parentCatalogItemId}, ${schema.internalMcpCatalogTable.id})`;
+    const [grant] = await db
+      .select({ id: schema.internalMcpCatalogTable.id })
+      .from(schema.internalMcpCatalogTable)
+      .where(
+        and(
+          eq(schema.internalMcpCatalogTable.id, catalogId),
+          or(
+            eq(schema.internalMcpCatalogTable.organizationId, organizationId),
+            isNull(schema.internalMcpCatalogTable.organizationId),
+          ),
+          or(
+            ResourcePermissionPolicyModel.grantCondition({
+              ...principal,
+              resource: "mcpRegistry",
+              scopeColumn: grantScope,
+              action: params.action,
+            }),
+            // A reader finds the item, so the caller's own check answers 403.
+            ResourcePermissionPolicyModel.grantCondition({
+              ...principal,
+              resource: "mcpRegistry",
+              scopeColumn: grantScope,
+              action: "read",
+            }),
+          ),
+        ),
+      )
+      .limit(1);
+    return grant !== undefined;
   }
 
   /**
-   * Sync team assignments for a catalog item (replaces all existing assignments)
+   * Replace a catalog item's team assignments.
+   *
+   * An entry without a `level` keeps the level already stored for that team, so
+   * an id-only caller (the agent-callable edit tools, a legacy API client)
+   * cannot silently promote a `use` team to `write`. A team assigned for the
+   * first time without a level takes the default, `write`.
    */
   static async syncCatalogTeams(
     catalogId: string,
-    teamIds: string[],
+    teams: CatalogTeamInput[],
+    tx?: Transaction,
   ): Promise<number> {
+    const assignments = normalizeCatalogTeamInput(teams);
     logger.debug(
-      { catalogId, teamCount: teamIds.length },
+      { catalogId, teamCount: assignments.length },
       "McpCatalogTeamModel.syncCatalogTeams: syncing teams",
     );
-    await db.transaction(async (tx) => {
-      await tx
+    const run = async (t: Transaction) => {
+      const existing = await t
+        .select({
+          teamId: schema.mcpCatalogTeamsTable.teamId,
+          level: schema.mcpCatalogTeamsTable.level,
+        })
+        .from(schema.mcpCatalogTeamsTable)
+        .where(eq(schema.mcpCatalogTeamsTable.catalogId, catalogId));
+      const storedLevels = new Map(
+        existing.map((row) => [row.teamId, row.level]),
+      );
+
+      await t
         .delete(schema.mcpCatalogTeamsTable)
         .where(eq(schema.mcpCatalogTeamsTable.catalogId, catalogId));
 
-      if (teamIds.length > 0) {
-        await tx.insert(schema.mcpCatalogTeamsTable).values(
-          teamIds.map((teamId) => ({
+      if (assignments.length > 0) {
+        await t.insert(schema.mcpCatalogTeamsTable).values(
+          assignments.map(({ id, level }) => ({
             catalogId,
-            teamId,
+            teamId: id,
+            level:
+              level ??
+              storedLevels.get(id) ??
+              DEFAULT_CATALOG_TEAM_ACCESS_LEVEL,
           })),
         );
       }
-    });
+    };
+    if (tx) {
+      await run(tx);
+    } else {
+      await withDbTransaction(run);
+    }
 
-    return teamIds.length;
+    return assignments.length;
   }
 
   /**
-   * Get team details (id and name) for a specific catalog item
+   * The teams a catalog item's own policy grants read to. A team that may
+   * also update the item holds the `write` level; any other holds `use`.
    */
   static async getTeamDetailsForCatalog(
     catalogId: string,
-  ): Promise<Array<{ id: string; name: string }>> {
-    const catalogTeams = await db
-      .select({
-        teamId: schema.mcpCatalogTeamsTable.teamId,
-        teamName: schema.teamsTable.name,
-      })
-      .from(schema.mcpCatalogTeamsTable)
-      .innerJoin(
-        schema.teamsTable,
-        eq(schema.mcpCatalogTeamsTable.teamId, schema.teamsTable.id),
-      )
-      .where(eq(schema.mcpCatalogTeamsTable.catalogId, catalogId));
-
-    return catalogTeams.map((ct) => ({
-      id: ct.teamId,
-      name: ct.teamName,
-    }));
+  ): Promise<CatalogTeamDetail[]> {
+    return (
+      (await McpCatalogTeamModel.getTeamDetailsForCatalogs([catalogId])).get(
+        catalogId,
+      ) ?? []
+    );
   }
 
-  /**
-   * Get team details for multiple catalog items in one query to avoid N+1
-   */
+  /** {@link getTeamDetailsForCatalog} for several catalog items at once. */
   static async getTeamDetailsForCatalogs(
     catalogIds: string[],
-  ): Promise<Map<string, Array<{ id: string; name: string }>>> {
-    if (catalogIds.length === 0) return new Map();
-
-    const catalogTeams = await db
-      .select({
-        catalogId: schema.mcpCatalogTeamsTable.catalogId,
-        teamId: schema.mcpCatalogTeamsTable.teamId,
-        teamName: schema.teamsTable.name,
-      })
-      .from(schema.mcpCatalogTeamsTable)
-      .innerJoin(
-        schema.teamsTable,
-        eq(schema.mcpCatalogTeamsTable.teamId, schema.teamsTable.id),
-      )
-      .where(inArray(schema.mcpCatalogTeamsTable.catalogId, catalogIds));
-
-    const teamsMap = new Map<string, Array<{ id: string; name: string }>>();
-
-    for (const catalogId of catalogIds) {
-      teamsMap.set(catalogId, []);
-    }
-
-    for (const { catalogId, teamId, teamName } of catalogTeams) {
-      const teams = teamsMap.get(catalogId) || [];
-      teams.push({ id: teamId, name: teamName });
-      teamsMap.set(catalogId, teams);
-    }
-
-    return teamsMap;
+  ): Promise<Map<string, CatalogTeamDetail[]>> {
+    const details =
+      await ResourcePermissionPolicyModel.findReadRecipientDetails({
+        resources: ["mcpRegistry"],
+        scopes: catalogIds,
+      });
+    return new Map(
+      catalogIds.map((id) => [
+        id,
+        (details.get(id)?.teams ?? []).map((team) => ({
+          id: team.id,
+          name: team.name,
+          level: team.actions.includes("update")
+            ? ("write" as const)
+            : ("use" as const),
+        })),
+      ]),
+    );
   }
 }
 

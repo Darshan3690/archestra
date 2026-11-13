@@ -1,0 +1,335 @@
+# OpenAPPA inside Archestra
+
+This opt-in integration calls the existing OpenAPPA runtime through napi-rs.
+It uses Archestra's native loader, LLM proxy, buffered streaming gate, MCP
+gateway remedy tools, and PostgreSQL migrations. It starts no OpenAPPA
+HTTP server. The paired OpenAPPA change adds an optional PostgreSQL event store
+and an entry point to the existing MCP remedy implementation.
+
+```mermaid
+flowchart LR
+  C[Authenticated Archestra Chat] -->|conversation + user headers| P[Existing LLM proxy]
+  P -->|complete proposed calls / submitted results| N[napi-rs binding]
+  N --> H[Existing OpenAPPA hooks and remedies]
+  H --> E[OpenAPPA event serialization]
+  E --> D[(Archestra PostgreSQL)]
+  N -->|processing receipts and approved outputs| D
+  P -->|approved input / buffered allowed calls| L[LLM provider]
+  C -->|allowed tool execution| M[Existing MCP gateway]
+  M -->|ordinary tool result| C
+  C -->|next model request includes tool result| P
+  M -->|special remedy tool only| N
+```
+
+## Build and run
+
+Cargo fetches the OpenAPPA runtime pinned to commit `05c04872` from its main
+branch. This includes the checked status read from OpenAPPA PR #509 and the
+wildcard fallback fix from PR #515. A sibling checkout is not required. Update
+the manifest revision and lockfile when adopting a newer runtime commit.
+The lockfile also selects `rmcp` 3.4.0, matching the runtime's MCP API. Rebuild the native addon and
+restart the backend after updating; production uses the normal Archestra image build.
+
+From `archestra/platform`:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm --filter @archestra/openappa-rs build:dev
+pnpm --filter @backend db:migrate
+```
+
+Configure the usual Archestra database and auth secret, then turn on the beta
+master switch (OpenAPPA has no flag of its own):
+
+```sh
+ARCHESTRA_BETA=true
+```
+
+With this switch enabled in `platform/.env`, `tilt up` builds and load-checks the
+native addon before starting the development backend. Changes to its Rust
+sources, build configuration, or the workspace Cargo manifest/lockfile rebuild
+the addon and restart the backend after a successful build. Failed builds leave
+the previous backend running and appear as errors in Tilt. With the flag off,
+Tilt skips this build. The build uses the same lockfile-resolved OpenAPPA dependency as
+Docker; it does not use a sibling OpenAPPA checkout.
+
+The feature flag defaults to false and does not inherit `ARCHESTRA_BETA`.
+Enabling it automatically adds `appa` to the effective proxy plugin list.
+An explicit `appa` entry in `ARCHESTRA_LLM_PROXY_PLUGINS` cannot enable APPA
+while the flag is off. With the flag off, the existing Tool
+Guardrails run unchanged: APPA is not loaded, the session header is not read,
+and the remedy tools are neither advertised nor callable. Additive
+schema migrations still run normally.
+
+Enabling without a policy path is a configuration error. The native runtime
+validates the policy and initializes lazily on first use. Failures do not fall
+back to the old evaluator. Restart the backend after changing either setting.
+
+`test-policy.toml` is a narrow verification fixture, not a production policy.
+It treats `archestra__whoami` as suspicious input and requires trusted context
+for `archestra__list_agents`, and admits the read-only `archestra__search_tools`
+discovery step. To reproduce the browser check, assign those two
+read-only tools through Archestra's existing tool settings, use Custom tool
+access (or remove their Auto-mode exclusions), configure an OpenAI provider,
+and select **GPT-5.6 Terra** in Chat. No provider key belongs in source files.
+The remedy tools are implicitly available while the integration is enabled.
+
+In a new conversation, ask Chat to discover and run `whoami`. The fixture first
+returns an acceptance remedy; Chat executes the offered plan on its own and
+retries. After the successful identity read, restart the backend and ask Chat
+to run `list_agents`. The native policy should refuse because the session's
+trust is now suspicious.
+
+The existing platform Dockerfile builds and deploys the fourth native addon
+using the same pinned Cargo dependency. Build it through the normal image path:
+
+```sh
+docker buildx build --target unified-slim .
+```
+
+Cargo fetches the full pinned repository, including the runtime's plugin fingerprint
+inputs. Its checked-in `receiver/appa-yell/salt.txt` is a public protocol constant
+already compiled into every OpenAPPA runtime, not a deployment credential.
+The production `pnpm deploy` includes `index.cjs`, declarations, the native
+binary, and the shared napi loader. Native builds are excluded from Turbo's
+cross-platform cache. The normal Archestra image and release workflows are
+unchanged; no separate addon release or binary download is introduced. The
+plugin list gates execution, so builds still compile/package the addon when
+APPA is not enabled.
+
+## Identity and lifecycle
+
+Chat sends `X-Appa-Session-ID` using the conversation ID. The model constructor
+also supports `X-Appa-Parent-ID`; the initial top-level Chat flow omits it.
+The proxy derives the organization from the resolved agent. Internal agent runs,
+including Chat, Slack and A2A, use the existing local-request trust boundary.
+Caller identity provides audit attribution. For external clients, it scopes the session and binds remedy offers to the authenticated credential. External callers authenticate through existing proxy mechanisms.
+
+The native actor ID hashes the session ID, and a new root ID hashes the organization and session IDs. A session keeps the root its row records. Authorized users share guardrail state within one organization. An organization change is refused.
+
+Chat reads the current trust and audience through an authenticated status endpoint. The native binding resolves the root recorded for the conversation and reads its persisted trajectory without dispatching a hook. The endpoint returns no status for an encrypted chat, even when the browser has its key; it does not read OpenAPPA for that chat.
+
+The proxy scopes external session IDs to the authenticated credential. Another credential cannot join a personal session by repeating its ID. The remedy gateway resolves the recorded owner and ignores caller-supplied session headers. A changed parent is refused.
+
+`SessionStart` restores the existing trajectory. The proxy sends `Prompt` at the start of each user turn, and `TurnEnd` after a terminal model answer. Detached MCP tasks remain disabled while OpenAPPA is enabled.
+
+For Claude Code, Codex, and OpenCode, the proxy can prepend this mark to a protected session's first reply and compaction summaries:
+
+```
+▄█▄▄▄█▄  protected session XK7-Q2M9
+██▄█▄██
+```
+
+The second row appears only in Claude Code's terminal CLI. Markdown webviews (the Claude Code IDE extension, Kilo Code) join or split a two-row sprite, so every other client gets the first row alone.
+
+Claude Code supplies its session header. Codex supplies thread metadata. OpenCode supplies session headers. The mark shows which protected session wrote the reply. The proxy removes the mark before forwarding requests to the provider and before writing logs. Most replies carry no mark. Signed tool-call IDs supply separate lineage evidence.
+
+Only supported text fields carry the mark. Structured outputs, tool data, reasoning fields, and unsupported clients never carry the mark. Compaction summaries retain the mark so lineage survives client-side history rewrites.
+
+Both streaming and non-streaming proxy paths call `ToolCall`; existing streaming
+buffers retain tool deltas until the decision completes. Existing name
+normalization unwraps `run_tool` and client decorations. Chat does not check
+APPA again before execution. Each call uses `call:<provider-tool-call-id>` as its
+host identity, persisted with the dispatch. Several calls can remain open and
+return in any order, including after a backend restart. Hook processing remains
+serialized; tool execution can overlap.
+
+On the next model request, the proxy reads the provider adapter's tool results,
+including explicit protocol error flags. Ordinary results are client-reported
+completion, not independent evidence of execution. It submits them as success
+or explicit failure; structured cancellation retains an unknown outcome. The
+native interface also retains explicitly reported unknown outcomes. No earlier Chat hook is required.
+
+APPA's admitted output or blocking text is applied through the existing
+`toolResultUpdates` mechanism before forwarding to the provider. Repeated history
+uses the persisted answer. Chat keeps its ordinary tool-result storage and UI;
+the proxy filters model input, not data already stored or displayed by Chat.
+
+## Storage and interrupted processing
+
+Migration `0471_openappa_native.sql` creates the event and receipt tables. Migration `0479_perpetual_malcolm_colcord.sql` adds host-key indexes. Migration `0483_openappa_batteries.sql` adds the composed batteries. Migration `0484_openappa_session_fork_receipts.sql` adds fork lineage. The trusted proxy supplies the current trajectory for remedy execution. Session receipt codes are random stored identifiers resolved by lookup.
+
+| Table | Owner / purpose |
+| --- | --- |
+| `openappa_events` | Rust-encoded ordered event batches by root and sequence |
+| `openappa_policy_files` | Original policy bytes addressed by their hash |
+| `openappa_sessions` | Scoped actor/root/parent mapping, start decision, and fork lineage (`forked_from`, `forked_at`) |
+| `openappa_operations` | Call, lifecycle, and remedy receipts |
+| `openappa_processed_results` | Result status, decision, and approved output |
+| `openappa_external_consults` | One row per external consult a dispatch made, written after the engine returns (migration `0487`) |
+| `openappa_dispatch_leases` | One row per family with a dispatch in progress or stopped: its owner, the family's last event sequence when it began, and its lease generation (migration `0530`) |
+
+Rust owns event encoding, decoding, policy validation, replay, ordering, and
+compare-and-swap behavior. TypeScript does not interpret policy events. The
+store keeps a pool of PostgreSQL connections, each on its own thread, sized by
+`ARCHESTRA_OPENAPPA_POSTGRES_MAX_CONNECTIONS`. A dispatch leases one connection
+and runs the advisory lock, the receipt SQL and the runtime's event writes on
+it: the lock and the event writes take the same key, which only one connection
+can hold twice. The pool replaces a connection the server has ended.
+
+Dispatches for different trajectory families run concurrently. An in-process
+lock serializes each family within a backend process, and a PostgreSQL advisory
+lock serializes it across backend processes. Before an operation that might
+consult an external authority, the binding commits a `pending` receipt. Hook
+event writes and the completed receipt/approved output then commit as separate
+short transactions. The runtime keeps no trajectory state in memory between
+events, so a failed dispatch leaves nothing to discard. A durable pending
+receipt is completed or recovered when its operation is resubmitted; it does
+not block the family's other work.
+
+### Dispatch leases
+
+A backend process can stop between a receipt's claim and its completion: a
+rollout, an out-of-memory kill, a lost database connection. The receipt then
+stays pending. Before its first claim, a hook dispatch takes the family's lease
+in `openappa_dispatch_leases`. The lease names the dispatch and records where
+the family's event log ended.
+
+The lease lasts as long as its owner's connection. The owner holds the family's
+advisory lock for the whole dispatch, and PostgreSQL drops that lock when the
+connection ends. A later dispatch that holds the lock and still finds pending
+receipts therefore knows that their owner no longer works on them. No clock is
+compared. Recovery is per operation, at the operation's own resubmission:
+
+- A resubmitted operation that finds its receipt pending is driven again
+  through the runtime. Work the event log never kept runs as a first run, with
+  its external consults. Work the log kept is answered from the committed
+  facts — the same decision, the same offers, the same dispatch binding —
+  without re-execution. Either way the pending receipt completes with exactly
+  the answer the host was owed, and the family goes on.
+- A dispatch that fails while its own log is unchanged kept nothing, so the
+  receipts it claimed are released before it returns, and the host's retry
+  runs them again.
+- A remedy completes two receipts one after the other. One stopped between
+  them is repaired from its own saved decision: the completed operation
+  receipt already holds the answer the pending result receipt takes.
+- An operational refusal, such as an unavailable annotator or an unanswered
+  remedy consult, is an error rather than a completed verdict. Its retry can
+  proceed after the dependency recovers. A genuine policy denial is still saved.
+- A result whose processing stopped before the runtime recorded anything waits
+  for the client to supply the result again; the receipt's bytes exist only in
+  the client's history and are never reconstructed server-side.
+
+A mismatched resubmission still fails closed: a reused call id with different
+bytes, a result that contradicts the committed one, and an input that conflicts
+with a pending receipt are refused, and no receipt is rewritten for them.
+
+A working dispatch reads its lease every five seconds. If the read fails or the
+lease has another owner, the dispatch stops and returns the lost-lease error.
+The host reports that error as retryable. The dispatch that took the family
+answers the retry from its completed receipt.
+
+A tool result is recorded in the event log before its output sanitizer is
+consulted. A process that stops during that consult leaves a checkpoint the
+resubmission resumes: the sanitizer answer is gathered again and the staged
+withholding completes with the same pending offers.
+
+Completed result keys are session ID + tool call ID. Operation keys are session ID + operation ID. Remedy-execution receipts bind the authenticated spender. Submitting different result bytes under a completed result key returns the saved approved output without re-evaluating hooks. Submitting changed arguments under an existing logical call ID is refused.
+
+## Forks
+
+The proxy can create a new session as a fork only before that session opens a
+trajectory. A fork requires a protected-session mark or a tool-call stamp from the same
+caller and organization. A session cannot be both a child and a fork. A
+session that already owns a root cannot move to another history. The fork
+opens an independent root with the parent root's policy revision, current state,
+effects, and denials. Parent and child activities stay separate.
+
+`forked_at` is the database-clock watermark recorded while the process holds the parent root lock.
+A fork inherits only parent decisions completed strictly before that watermark,
+including across a chain of forks. If the parent admits a result after the fork opens,
+the fork withholds that result. If a process stops unexpectedly before writing
+the session row, recovery sets a NULL watermark and inherits no results.
+
+Pending receipts left by a stopped dispatch recover on the operation's
+resubmission, as the dispatch-lease section describes. The event log, not the
+receipt, is the authority for what the guardrail decided; a pending receipt
+never blocks the family's later work, and it is never silently cleared. A
+released operation consults its external authorities again, so this guarantees
+conservative replay behavior, not exactly-once execution of arbitrary external
+services.
+
+## Remedies and current limits
+
+`archestra__execute_remedy_plan` executes remedies through the native gate. The proxy overwrites routing arguments with the adapter's current session and optional parent. The gateway supplies this expected actor to the runtime. The event log validates that the offer belongs to that run and remains executable.
+
+The proxy, client, and user are trusted. Model output and external tool text are not. There is no separate original-account comparison or signed offer envelope. Normal host authentication and permissions remain required. Unknown, wrong-run, and spent offers return terminal feedback without executing.
+
+The embedded API returns typed remedy outcomes, refusal reasons, and offer descriptions.
+
+An offer that requires human review includes a review entry. `loadOfferReview` returns the review text with the reviewed tool name and arguments. The gateway prompts the user, then sends their ruling with the remedy. A denial is final. The runtime retires the offer and informs the model that the reviewer rejected the call. The model must not retry the call in another format. Options that do not require that reviewer appear after the denial.
+
+When the host determines that the reviewed call will fail even if approved, it returns `precheck_refusal` without prompting the user. The binding records this text as the remedy result without invoking the runtime. The offer remains active and no user approval is consumed.
+
+The proxy replaces a denied call with `archestra__get_remedy_plans`. The notice preserves the original call position and provider call ID. It carries the blocked tool, its arguments, and the policy ruling in plain text. Other allowed calls in the same response run normally. On later requests, the proxy restores each notice to the original tool call and injects the ruling as its result.
+
+The runtime withholds results for unreleased call IDs. Unrecognized or expired remedy calls return a terminal message telling the model that nothing was applied.
+
+Encrypted chats are refused while OpenAPPA is enabled. Agent and skill delegation are governed as ordinary tool calls. Known provider-hosted tools are accepted, but their calls execute inside the provider and cannot be gated by the proxy. Unknown typed declarations and client-executed types that the adapter cannot gate are refused instead of being assumed hosted. The exception below governs the result of OpenAI Responses hosted web search; Azure Responses hosted web search is refused because its result cannot be withheld. Other hosted results are not governed as client tool calls. Deferred tools are governed: `tool_search` declarations, Anthropic's provider-run `tool_search_tool_regex_*` and `tool_search_tool_bm25_*` types, and `defer_loading` tools are accepted. Only a tool the request declares is ruled on, so a call to a tool the client has not loaded is refused with the instruction to search for it, and never released. While the remedy tools are not both declared, the remedy and `ask_user` tools are withheld from the model and a denial is refused with the instruction to load them. Unknown `tool_search_tool_*` types are refused as unclassifiable. Notice restoration runs on Anthropic Messages (including Bedrock InvokeModel), OpenAI Responses, and OpenAI Chat Completions. On other protocols, OpenAPPA evaluates client calls and results, but notices stay in history as notice calls.
+
+The provider runs a hosted `web_search` inside the inference call, so the proxy cannot stop the call; it rules on what the call brought in. It withholds the response from the first `web_search_call` item on — the search record, the text the model wrote with the results in view, and any calls after it — and submits that as the result of a `web_search` tool call. An admitted result passes through unchanged. A held one reaches the client as a notice in place of the withheld part, so the model never sees it in a later request unless a remedy releases it. List `web_search` under `confined_results` to have the runtime stage the result: accepting the offer returns it. Any other denial drops it, and the model searches again once the remedy allows the call. The query itself has already reached the provider, which holds the session's context anyway. A search-backed turn loses token streaming after the search starts, since the verdict needs the whole turn.
+
+Start new conversations when enabling this feature. Historical tool results
+from before activation have no native admission receipts and are refused;
+the integration does not invent approvals or silently migrate prototype state.
+
+Throughput tuning, retention/purge workflows, and deployment-specific TLS
+credential options remain follow-up work. PostgreSQL TLS uses the system trust
+store and URL SSL settings.
+
+## Verification
+
+From this package, after Archestra migrations have been applied:
+
+```sh
+pnpm smoke:load
+ARCHESTRA_OPENAPPA_TEST_DATABASE_URL=postgresql://... pnpm test
+```
+
+The native tests use real hooks, a real PostgreSQL database, two Node processes,
+and a local HTTP sanitizer. They cover changed resends, concurrent duplicates,
+session isolation, parallel identical calls, reverse-order results after restart,
+canceled-batch replay, remedy acceptance, human review denials, precheck refusals, restriction persistence without model
+history, one-time sanitizer execution, unknown outcomes, and injected receipt
+commit failure with event rollback. The storage test in the OpenAPPA tree is:
+
+```sh
+OPENAPPA_TEST_DATABASE_URL=postgresql://... cargo test -p appa-eventlog --features postgres -- --ignored
+```
+
+Backend coverage includes flag-off Tool Guardrails, APPA proxy calls and
+results, denial notices and their restoration, explicit protocol errors, replay,
+session identity from headers and from the client's own request, and MCP remedy
+availability. Chat tests verify that ordinary tools
+execute and return their original output without APPA callbacks in either mode.
+
+The resolved OpenAPPA revision includes the companion PostgreSQL and embedded-remedy
+changes.
+Previous demo/browser results do not qualify this proxy-only refactor; validation
+for this change is reported separately in the PR.
+
+Organization policy text is stored in PostgreSQL and edited in OpenAPPA. Copy an existing file policy into the editor when upgrading.
+
+The session-key migration clears old OpenAPPA sessions, events, and processing receipts.
+Saved organization policies and policy files are preserved.
+
+## Agent feedback reporting
+
+Agent feedback reporting defaults to enabled when OpenAPPA and Guardrails v2
+are enabled. Set `ARCHESTRA_OPENAPPA_YELL_ENABLED=false` to disable the reporting tool.
+Archestra stores reports locally. External forwarding requires
+`ARCHESTRA_OPENAPPA_YELL_FORWARDING_ENABLED=true`, independently of
+`ARCHESTRA_ANALYTICS`, and defaults off in every environment. Upgrades must
+explicitly opt in to continue forwarding. Encrypted-chat reports always stay local.
+The `archestra__yell` tool is available to protected sessions; its hook is
+checked as `yell` against the active policy. The receiver destination is set
+by the host, never by tool arguments. The report identifies Archestra and the configured frontend hostname. The host passes the authenticated actor
+to OpenAPPA, which verifies the previously released call belongs to that actor.
+
+Reports use upstream classification, size limits, gzip, signing, and HTTPS
+transport. The receiver has create-only access to a private GCS bucket and
+notifies report maintainers. The public signature is not authentication; incoming reports
+remain untrusted. Raw prompts, tool arguments, outputs, and session identifiers
+are omitted from diagnostics. Policy names and the free-text message are sent;
+messages must not contain secrets or task content. The deployment reporting flag is
+separate from policy editing and cannot be changed through policy TOML.

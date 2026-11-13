@@ -1,0 +1,174 @@
+import { eq } from "drizzle-orm";
+import db, { schema } from "@/database";
+import { softDelete } from "@/database/soft-delete";
+import { ProjectModel } from "@/models";
+import ConversationModel from "@/models/conversation";
+import { expect, test } from "@/test";
+import { shareForTest } from "@/test/sharing";
+import { resolveProjectFileScope } from "./project-file-scope";
+import { SkillSandboxError } from "./types";
+
+test("resolveProjectFileScope returns the project's id and name", async ({
+  makeUser,
+  makeOrganization,
+  makeAgent,
+  makeMember,
+}) => {
+  const org = await makeOrganization();
+  const user = await makeUser();
+  await makeMember(user.id, org.id);
+  const agent = await makeAgent({ organizationId: org.id });
+  const project = await ProjectModel.create({
+    organizationId: org.id,
+    userId: user.id,
+    name: "scoped",
+    description: null,
+  });
+  const conv = await ConversationModel.create({
+    userId: user.id,
+    organizationId: org.id,
+    agentId: agent.id,
+    projectId: project.id,
+  });
+
+  const scope = await resolveProjectFileScope({
+    conversationId: conv.id,
+    userId: user.id,
+    organizationId: org.id,
+  });
+  expect(scope).toEqual({ projectId: project.id, projectName: "scoped" });
+});
+
+test("resolveProjectFileScope is null for a non-project chat", async ({
+  makeUser,
+  makeOrganization,
+  makeAgent,
+}) => {
+  const org = await makeOrganization();
+  const user = await makeUser();
+  const agent = await makeAgent({ organizationId: org.id });
+  const conv = await ConversationModel.create({
+    userId: user.id,
+    organizationId: org.id,
+    agentId: agent.id,
+  });
+  expect(
+    await resolveProjectFileScope({
+      conversationId: conv.id,
+      userId: user.id,
+      organizationId: org.id,
+    }),
+  ).toBeNull();
+});
+
+test("resolveProjectFileScope fails closed for a caller without project access", async ({
+  makeUser,
+  makeOrganization,
+  makeAgent,
+}) => {
+  const org = await makeOrganization();
+  const owner = await makeUser();
+  const agent = await makeAgent({ organizationId: org.id });
+  const project = await ProjectModel.create({
+    organizationId: org.id,
+    userId: owner.id,
+    name: "private-project",
+    description: null,
+  });
+  const conv = await ConversationModel.create({
+    userId: owner.id,
+    organizationId: org.id,
+    agentId: agent.id,
+    projectId: project.id,
+  });
+
+  const stranger = await makeUser({ email: "no-project-access@test.com" });
+  await expect(
+    resolveProjectFileScope({
+      conversationId: conv.id,
+      userId: stranger.id,
+      organizationId: org.id,
+    }),
+  ).rejects.toBeInstanceOf(SkillSandboxError);
+});
+
+test("resolveProjectFileScope resolves for a member of an org-shared project", async ({
+  makeUser,
+  makeMember,
+  makeOrganization,
+  makeAgent,
+}) => {
+  const org = await makeOrganization();
+  const owner = await makeUser();
+  await makeMember(owner.id, org.id);
+  const agent = await makeAgent({ organizationId: org.id });
+  const project = await ProjectModel.create({
+    organizationId: org.id,
+    userId: owner.id,
+    name: "shared-project",
+    description: null,
+  });
+  await shareForTest({
+    resource: "project",
+    scope: project.id,
+    organizationId: org.id,
+    visibility: "organization",
+    teamIds: [],
+  });
+  const conv = await ConversationModel.create({
+    userId: owner.id,
+    organizationId: org.id,
+    agentId: agent.id,
+    projectId: project.id,
+  });
+
+  // Organization sharing reaches the organization's members.
+  const member = await makeUser({ email: "org-share-member@test.com" });
+  await makeMember(member.id, org.id);
+  const scope = await resolveProjectFileScope({
+    conversationId: conv.id,
+    userId: member.id,
+    organizationId: org.id,
+  });
+  expect(scope?.projectId).toBe(project.id);
+});
+
+test("resolveProjectFileScope FAILS CLOSED when the chat's project is soft-deleted", async ({
+  makeUser,
+  makeOrganization,
+  makeAgent,
+}) => {
+  const org = await makeOrganization();
+  const user = await makeUser();
+  const agent = await makeAgent({ organizationId: org.id });
+  const project = await ProjectModel.create({
+    organizationId: org.id,
+    userId: user.id,
+    name: "doomed",
+    description: null,
+  });
+  const conv = await ConversationModel.create({
+    userId: user.id,
+    organizationId: org.id,
+    agentId: agent.id,
+    projectId: project.id,
+  });
+
+  // Soft-delete the row directly rather than through ProjectModel.delete, which
+  // detaches the chats — this pins the defensive branch for a chat that somehow
+  // still points at a hidden project, where degrading to a personal (no-project)
+  // scope would silently hand file tools access outside it.
+  await softDelete(
+    db,
+    schema.projectsTable,
+    eq(schema.projectsTable.id, project.id),
+  );
+
+  await expect(
+    resolveProjectFileScope({
+      conversationId: conv.id,
+      userId: user.id,
+      organizationId: org.id,
+    }),
+  ).rejects.toBeInstanceOf(SkillSandboxError);
+});

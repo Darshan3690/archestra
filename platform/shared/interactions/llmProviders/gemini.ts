@@ -1,10 +1,11 @@
-import {
-  ARCHESTRA_TOOL_NAME_TAG,
-  type archestraApiTypes,
-  parseArchestraToolRefusal,
-} from "../../index";
+import type * as archestraApiTypes from "../../hey-api/clients/api/types.gen";
 import type { PartialUIMessage } from "../types";
-import type { DualLlmAnalysis, Interaction, InteractionUtils } from "./common";
+import type { Interaction, InteractionUtils } from "./common";
+import {
+  type ImageEditUploads,
+  imageEditUploadParts,
+  inlineMediaPart,
+} from "./media";
 
 // Define more precise types for Gemini parts since the generated types use union discrimination
 type GeminiFunctionCallPart = {
@@ -109,7 +110,8 @@ class GeminiGenerateContentInteraction implements InteractionUtils {
       interaction.request as archestraApiTypes.GeminiGenerateContentRequest;
     this.response =
       interaction.response as archestraApiTypes.GeminiGenerateContentResponse;
-    this.modelName = this.response.modelVersion as string;
+    this.modelName =
+      interaction.model ?? (this.response.modelVersion as string) ?? "";
   }
 
   isLastMessageToolCall(): boolean {
@@ -139,7 +141,8 @@ class GeminiGenerateContentInteraction implements InteractionUtils {
     for (let i = messages.length - 1; i >= 0; i--) {
       const message = messages[i];
       if (message.role === "user" && Array.isArray(message.parts)) {
-        for (const part of message.parts) {
+        for (let j = message.parts.length - 1; j >= 0; j--) {
+          const part = message.parts[j];
           if (hasFunctionResponse(part) && part.functionResponse.id) {
             return part.functionResponse.id;
           }
@@ -167,42 +170,6 @@ class GeminiGenerateContentInteraction implements InteractionUtils {
     return Array.from(toolsUsed);
   }
 
-  getToolNamesRefused(): string[] {
-    const toolsRefused = new Set<string>();
-
-    // Check for text blocks containing tool refusal patterns
-    for (const message of this.request.contents) {
-      if (message.role === "model" && Array.isArray(message.parts)) {
-        for (const part of message.parts) {
-          if (hasText(part) && part.text) {
-            const toolName = parseArchestraToolRefusal(part.text).toolName;
-            if (toolName) {
-              toolsRefused.add(toolName);
-            }
-          }
-        }
-      }
-    }
-
-    // Check response candidates
-    if (this.response.candidates) {
-      for (const candidate of this.response.candidates) {
-        if (candidate.content?.parts) {
-          for (const part of candidate.content.parts) {
-            if (hasText(part) && part.text) {
-              const toolName = parseArchestraToolRefusal(part.text).toolName;
-              if (toolName) {
-                toolsRefused.add(toolName);
-              }
-            }
-          }
-        }
-      }
-    }
-
-    return Array.from(toolsRefused);
-  }
-
   getToolNamesRequested(): string[] {
     const toolsRequested = new Set<string>();
 
@@ -220,40 +187,6 @@ class GeminiGenerateContentInteraction implements InteractionUtils {
     }
 
     return Array.from(toolsRequested);
-  }
-
-  getToolRefusedCount(): number {
-    let count = 0;
-
-    // Count refusals in request messages
-    for (const message of this.request.contents) {
-      if (message.role === "model" && Array.isArray(message.parts)) {
-        for (const part of message.parts) {
-          if (hasText(part) && part.text) {
-            if (part.text.includes(`<${ARCHESTRA_TOOL_NAME_TAG}>`)) {
-              count++;
-            }
-          }
-        }
-      }
-    }
-
-    // Count refusals in response
-    if (this.response.candidates) {
-      for (const candidate of this.response.candidates) {
-        if (candidate.content?.parts) {
-          for (const part of candidate.content.parts) {
-            if (hasText(part) && part.text) {
-              if (part.text.includes(`<${ARCHESTRA_TOOL_NAME_TAG}>`)) {
-                count++;
-              }
-            }
-          }
-        }
-      }
-    }
-
-    return count;
   }
 
   getLastUserMessage(): string {
@@ -319,9 +252,12 @@ class GeminiGenerateContentInteraction implements InteractionUtils {
       | archestraApiTypes.GeminiGenerateContentRequest["contents"][number]
       | {
           role: "model";
-          content: archestraApiTypes.GeminiGenerateContentResponse["candidates"][number]["content"];
+          // `candidates` is optional — prompt-blocked replies carry only
+          // `promptFeedback` — so unwrap before indexing.
+          content: NonNullable<
+            archestraApiTypes.GeminiGenerateContentResponse["candidates"]
+          >[number]["content"];
         },
-    _dualLlmAnalyses?: DualLlmAnalysis[],
   ): PartialUIMessage {
     const parts: PartialUIMessage["parts"] = [];
     const { role } = content;
@@ -350,13 +286,13 @@ class GeminiGenerateContentInteraction implements InteractionUtils {
           input: part.functionCall.args || {},
         });
       } else if (hasInlineData(part) && part.inlineData) {
-        // Inline image/file data - convert base64 to data URL
-        const dataUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
-        parts.push({
-          type: "file",
-          mediaType: part.inlineData.mimeType,
-          url: dataUrl,
-        });
+        // Inline image/file data, or a placeholder when the log did not keep it
+        parts.push(
+          inlineMediaPart({
+            mediaType: part.inlineData.mimeType,
+            data: part.inlineData.data,
+          }),
+        );
       } else if (hasFileData(part) && part.fileData) {
         // File reference
         parts.push({
@@ -374,9 +310,7 @@ class GeminiGenerateContentInteraction implements InteractionUtils {
     };
   }
 
-  private mapRequestToUiMessages(
-    dualLlmAnalyses?: DualLlmAnalysis[],
-  ): PartialUIMessage[] {
+  private mapRequestToUiMessages(): PartialUIMessage[] {
     const uiMessages: PartialUIMessage[] = [];
     const messages = this.request.contents;
 
@@ -405,7 +339,7 @@ class GeminiGenerateContentInteraction implements InteractionUtils {
         continue;
       }
 
-      const uiMessage = this.mapToUiMessage(msg, dualLlmAnalyses);
+      const uiMessage = this.mapToUiMessage(msg);
 
       // If this is a model message with functionCall parts, look ahead for function responses
       if (msg.role === "model" && Array.isArray(msg.parts)) {
@@ -466,27 +400,6 @@ class GeminiGenerateContentInteraction implements InteractionUtils {
                     input: {},
                     output,
                   });
-
-                  // Check for dual LLM result
-                  const dualLlmResultForTool = dualLlmAnalyses?.find(
-                    (result) => result.toolCallId === functionCallId,
-                  );
-
-                  if (dualLlmResultForTool) {
-                    toolCallParts.push({
-                      type: "dual-llm-analysis",
-                      toolCallId: dualLlmResultForTool.toolCallId,
-                      safeResult: dualLlmResultForTool.result,
-                      conversations: Array.isArray(
-                        dualLlmResultForTool.conversations,
-                      )
-                        ? (dualLlmResultForTool.conversations as Array<{
-                            role: "user" | "assistant";
-                            content: string | unknown;
-                          }>)
-                        : [],
-                    });
-                  }
                 }
               }
             }
@@ -504,6 +417,18 @@ class GeminiGenerateContentInteraction implements InteractionUtils {
       }
     }
 
+    // An Images edit row logs its reference images as the edit's uploads, as
+    // every other provider's edit row does; they follow the prompt they were
+    // sent with. Older rows carry them as inline parts, mapped above.
+    const uploads = imageEditUploadParts(
+      (this.request as { input_files?: ImageEditUploads }).input_files,
+    );
+    if (uploads.length > 0) {
+      const turn = uiMessages.find((message) => message.role === "user");
+      if (turn) turn.parts.push(...uploads);
+      else uiMessages.unshift({ role: "user", parts: uploads });
+    }
+
     return uiMessages;
   }
 
@@ -518,9 +443,9 @@ class GeminiGenerateContentInteraction implements InteractionUtils {
     );
   }
 
-  mapToUiMessages(dualLlmAnalyses?: DualLlmAnalysis[]): PartialUIMessage[] {
+  mapToUiMessages(): PartialUIMessage[] {
     return [
-      ...this.mapRequestToUiMessages(dualLlmAnalyses),
+      ...this.mapRequestToUiMessages(),
       ...this.mapResponseToUiMessages(),
     ];
   }

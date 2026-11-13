@@ -1,1 +1,480 @@
-./CLAUDE.md
+# Individual Preferences
+
+- Read `CLAUDE_LOCAL.md` in this directory if it exists (untracked individual preferences).
+
+## Working Directory
+
+**ALWAYS run all commands from the `platform/` directory unless specifically instructed otherwise.**
+
+## Important Rules
+
+1. **Use pnpm** for package management
+2. **Use Tilt for development** - `tilt up` to start the full environment
+   - Inside an Agent Runtime the backend dev server runs without its file
+     watcher (`ARCHESTRA_DEV_BACKEND_WATCH` defaults to false there). After
+     changing backend code run `tilt trigger pnpm-dev-backend` to rebuild and
+     restart it (about 20 s). The frontend dev server reloads on its own.
+   - Without Docker or Kubernetes (a lite Agent Runtime image), run the
+     stack as plain processes:
+     `scripts/dev-lite.sh up` (PostgreSQL 18, backend :9000, frontend :3000;
+     `status`, `logs <component>`, `up --e2e` then `e2e` for the Playwright
+     lite projects, `down`). Inside an Agent Runtime both servers run builds,
+     not dev servers: nothing watches files, so after a change and before you
+     run tests against the stack or share a preview, run
+     `scripts/dev-lite.sh reload backend` (about 15 s) or
+     `scripts/dev-lite.sh reload frontend` (a production build, about 45 to
+     80 s). `ARCHESTRA_DEV_LITE_FRONTEND=dev` gives the Next dev server back
+     (about 3.5 GB once pages are open). A pod's bootstrap only runs
+     `scripts/dev-lite.sh prepare` (dependencies, PostgreSQL, migrations):
+     run `up` when you need the servers; it builds the backend and the
+     frontend one after the other, then starts them. On a clean checkout of
+     a main commit it installs the frontend CI built for that commit
+     instead, and a rebuild after edits starts from CI's build cache
+     (`scripts/frontend-prebuilt.mjs`). `pause` and `resume`
+     stop and restart the two servers, keeping PostgreSQL and the builds, to
+     give one memory-heavy command their memory. MCP server installs, nested Agent
+     Runtime, the code runtime, Vault, Keycloak specs and the `api-k8s`,
+     `hibernation` and `vault-k8s` Playwright projects need the Tilt stack.
+4. **Documentation** - The `archestra-docs-writer` skill decides whether a change needs docs and how to write them. Read it before touching `../docs/pages`.
+5. **Add Tests for Behavior** - When a change alters observable behavior, add or update tests that pin that behavior (unit, integration, or e2e under `platform/e2e-tests/tests`). Favor behavior-focused tests over implementation-detail ones — skip tests that only assert wiring, prop plumbing, or incidental markup. Tests exercise real code; mock only true process boundaries (network, clock, subprocesses, externally-owned storage). Skipping tests is a judgment call to state explicitly, not a silent default. Load the `archestra-dev-testing` skill to choose the level and to avoid the "fluff test" anti-pattern
+6. **Enterprise Licensing** — The repo is dual-licensed: AGPL-3.0 by default (`../LICENSE_AGPL`), Enterprise License (`../LICENSE_ENTERPRISE`) for marked code. See the license router at `../LICENSE.md` for the resolution rules. Pricing and scope: the Licensing section of docs/pages/get-started/index.md. When you add or modify code of enterprise features, tag it as Enterprise using mechanism described in LICENSE.md.
+7. **Commit Freely, Push With Approval** - Committing locally as you land reviewable slices is fine. Never push, open, or update a PR without explicit user approval, and never amend commits
+   Before requesting merge-queue entry, run the relevant focused tests, then use `pnpm enqueue <PR-number>` from a clean checkout of the exact PR head. The command runs preflight and queues only that checked revision; do not run preflight separately before it. Run enqueue once on the finished revision, not on every intermediate commit or push. It uses `origin`; pass `--repo [HOST/]OWNER/REPO` for a different target repository. Load `archestra-merge-queue` for the complete enqueue/monitor workflow. Direct GitHub queueing can bypass this local command; it is not a GitHub-enforced admission gate.
+8. **No Database Modifications Without Approval** - NEVER run INSERT, UPDATE, DELETE, or any data-modifying SQL queries without explicit user approval. SELECT queries for reading data are allowed. Always ask before modifying database data directly.
+9. **NEVER MENTION REAL CUSTOMER NAMES OR IDENTIFIERS ANYWHERE IN CODE, COMMENTS, TESTS, DOCS, COMMITS, OR PR TEXT!!!!!!!!!!**
+10.  **Never copy anything from Sentry into code, comments, tests, docs, commits, or PR text — and do not mention Sentry itself.** Sentry is for diagnosing the problem; describe the bug in neutral terms and cite no IDs, environments, URLs, user info, or stack snippets from there.
+11. If you think there is an important bit of information worth remembering between sessions, suggest adding it to AGENTS.md instead of memorizing it yourself. AGENTS.md is the single source of truth for all important information about the platform, its architecture, and its development practices.
+
+## Docs
+
+Docs are stored at `../docs/`.
+Use the `archestra-docs-writer` skill before changing any docs files.
+
+## Project Skills
+
+Shared skills live in `../.agents/skills/`. Read the matching `<skill-name>/SKILL.md`
+before working in its domain if your client has not already loaded it.
+
+Load these project skills when the task matches their domain:
+
+- `archestra-dev-frontend` - use for frontend Next.js/React work, UI components, forms, TanStack Query hooks, generated API clients, white-label copy, and docs links.
+- `archestra-dev-migrations` - use for Drizzle schema changes, generated migrations, data migrations, custom migrations, `drizzle-kit check` failures, or migration conflict resolution via its `resolve-conflicts.md` subpage.
+- `archestra-dev-testing` - use to choose the test level, avoid "fluff tests", and write backend unit tests. Read its `references/backend-tests.md` for backend mocking, fixtures, Vitest projects, and performance rules.
+- `archestra-dev-e2e` - use for Playwright e2e tests, API/UI fixtures, WireMock setup, local/CI e2e behavior, and locator guidance.
+- `archestra-dev-observability` - use for tracing, metrics, OpenTelemetry, Tempo, Grafana, Prometheus, LLM/MCP spans, or observability label changes.
+- `archestra-dev-rust-napi` - use for Rust core code, NAPI bindings, generated TypeScript bindings, Rust telemetry, and Rust checks.
+- `archestra-dev-override-sweep` - use for sweeping pnpm `overrides` and `minimumReleaseAge` exclusions in `pnpm-workspace.yaml` — unwinding matured CVE pins and removing overrides the dependency graph has made redundant.
+- `archestra-dev-resource-cleanup` - use for reclaiming unused local worktrees, branches, development processes, and OrbStack resources while preserving the active Tilt setup.
+- `archestra-docs-writer` - use for writing or editing docs pages under `../docs/pages`: new feature docs, page rewrites, tone/copy fixes, and screenshots.
+
+## Key URLs
+
+- **Frontend**: <http://localhost:3000/>
+- **Backend**: <http://localhost:9000/> (Fastify API server)
+- **Chat**: <http://localhost:3000/chat> (n8n expert chat with MCP tools, conversations in main sidebar)
+- **Tools**: <http://localhost:3000/tools> (Unified tools management with server-side pagination)
+- **Settings**: <http://localhost:3000/settings> (lands on the first permitted tab; tabs: Organization, Service Accounts, Chat, LLM, MCP, Security, Knowledge, Environments, Users, Teams, Roles, GitHub, Identity Providers, Secrets)
+- **Personal Settings**: <http://localhost:3000/account> (personal profile, API keys, gateway token, sessions; opened by clicking your name in the sidebar)
+- **MCP Registry**: <http://localhost:3000/mcp/registry> (Install and manage MCP servers)
+- **LLM Proxy Logs**: <http://localhost:3000/llm/logs> (View LLM proxy request logs)
+- **MCP Gateway Logs**: <http://localhost:3000/mcp/logs> (View MCP tool call logs)
+- **Roles**: <http://localhost:3000/settings/roles> (Admin-only: manage custom RBAC roles)
+- **Cost Statistics**: <http://localhost:3000/llm/cost/statistics> (Usage analytics with time series charts and custom date ranges)
+- **Cost Limits**: <http://localhost:3000/llm/cost/limits> (Token usage limits management with per-profile configuration)
+- **Token Price**: <http://localhost:3000/llm/cost/token-price> (Model pricing configuration)
+- **Tilt UI**: <http://localhost:10350/>
+- **Drizzle Studio**: <https://local.drizzle.studio/> (on demand: `tilt trigger database-gui`)
+- **MCP Gateway**: <http://localhost:9000/v1/mcp/:profileId> (POST for JSON-RPC stateless mode; GET with Accept: text/event-stream opens the legacy HTTP+SSE stream, other GETs return 405; requires Bearer archestra_token auth)
+- **MCP Proxy**: <http://localhost:9000/mcp_proxy/:id> (POST for JSON-RPC requests to K8s pods)
+- **MCP Reinstall**: <http://localhost:9000/api/mcp_server/:id/reinstall> (POST to recreate the server's pod)
+- **Tempo API**: <http://localhost:3200/> (Tempo HTTP API for distributed tracing)
+- **Grafana**: <http://localhost:3002/> (metrics and trace visualization, manual start via Tilt)
+- **Tempo API**: <http://localhost:3200/> (Tempo HTTP API for distributed tracing)
+- **Prometheus**: <http://localhost:9090/> (metrics storage, starts with Grafana)
+- **Backend Metrics**: <http://localhost:9050/metrics> (Prometheus metrics endpoint, separate from main API)
+- **MCP Tool Calls API**: <http://localhost:9000/api/mcp-tool-calls> (GET paginated MCP tool call logs)
+- **Profile Tools API**: <http://localhost:9000/api/profile-tools> (GET paginated profile-tool relationships with filtering/sorting)
+
+## Common Commands
+
+```bash
+# Development
+tilt up                                 # Start full development environment (also installs git hooks)
+pnpm dev                                # Start all workspaces
+pnpm run prepare                        # Install the husky pre-commit hook. `tilt up` does this for you;
+                                        # run it by hand if you skip Tilt. `pnpm install` will NOT do it,
+                                        # because ignoreScripts blocks lifecycle scripts (see below).
+pnpm lint                               # Check lint
+pnpm lint:fix                           # Lint and auto-fix
+pnpm type-check                         # Check TypeScript types. Run it (or `pnpm --dir <pkg> type-check`), not bare
+                                        # `tsc --noEmit`: it sizes the compiler to the memory it has. backend/tsconfig.json
+                                        # is a solution of projects (one per layer or test shard), so bare tsc there
+                                        # checks nothing; type-check builds the projects one at a time, each in its own
+                                        # compiler, and keeps their declarations in .tsbuild/ for the next run.
+pnpm test                               # Run tests
+pnpm test:e2e                           # Run e2e tests with Playwright (chromium, webkit, firefox)
+
+# Dependency Management
+pnpm install                            # Install dependencies (scripts disabled for security)
+pnpm rebuild <package-name>             # Run install scripts for specific package when needed
+pnpm rebuild                            # Run install scripts for all packages (rarely needed)
+
+# Database
+pnpm db:migrate      # Run database migrations
+pnpm db:studio       # Open Drizzle Studio
+pnpm db:generate     # Generate new migrations (CI checks for uncommitted migrations)
+drizzle-kit check    # Check consistency of generated SQL migrations history
+
+# Database Connection
+# PostgreSQL is running in Kubernetes (managed by Tilt)
+# Connect to database:
+kubectl exec -n archestra-dev postgresql-0 -- env PGPASSWORD=archestra_dev_password psql -U archestra -d archestra_dev
+
+# Common queries: \dt (list tables), \d table_name (describe table), SELECT COUNT(*) FROM drizzle.__drizzle_migrations;
+
+# Logs
+tilt logs pnpm-dev-backend           # Get backend logs
+tilt logs pnpm-dev-frontend          # Get frontend logs
+tilt trigger <pnpm-dev-backend|pnpm-dev-frontend|wiremock|etc> # Trigger an update for the specified resource
+```
+
+### Fresh Git Worktree
+
+A new worktree has no dependencies or native bindings. Before tests or type-check:
+
+```bash
+pnpm install --frozen-lockfile                  # from platform/
+```
+
+The backend tests install the NAPI addons CI published for the checkout's `archestra-rs` tree when any is missing or was installed for another tree (`scripts/napi-prebuilt.mjs`: a download of about 20 MB, a few seconds; `ARCHESTRA_DEV_NAPI_PREBUILT=false` skips it). They never compile. A changed `archestra-rs` tree has no published addons: build each crate the tests load with `pnpm --dir archestra-rs/<crate> build:dev`. A missing binding fails as `Unable to load @archestra/<crate> for <platform>`; the crates are the `archestra-rs/*` packages with a `build:dev` script.
+
+## Environment Variables
+
+**Naming Convention**: All env vars MUST follow the pattern `ARCHESTRA_<PRODUCT_AREA>_<THING>` (e.g., `ARCHESTRA_LLM_PROXY_MAX_VIRTUAL_KEYS`, `ARCHESTRA_OTEL_VERBOSE_TRACING`).
+
+**Adding New Env Vars**:
+
+1. **Consume in `backend/src/config.ts`** - Parse and validate the env var here. If a custom parse/validation function is needed, export it and add tests in `backend/src/config.test.ts`
+2. **Add to `platform/.env.example`** - Every new env var MUST be listed here with a short comment, so local setups and deployments discover it
+3. **Document in `../docs/pages/admin/deployment/configuration.md`** - All new env vars MUST be documented there, under the matching section. Use best judgement on whether it warrants a new section
+4. **Frontend access via `/api/config`** - If the frontend needs to reference an env var value, expose it through `backend/src/routes/config.ts` response and consume via the `useFeature()` hook
+
+## Architecture
+
+**Tech Stack**: pnpm monorepo, Fastify backend (port 9000), metrics server (port 9050), Next.js frontend (port 3000), PostgreSQL + Drizzle ORM, Biome linting, Tilt orchestration, Kubernetes for MCP server runtime
+
+**Single-Tenant Organization Model**: Archestra currently provisions exactly one organization per deployment. Better Auth's organization plugin supplies the organization-scoped data model and RBAC primitives, but the product does not support creating or operating multiple organizations in one deployment today. Preserve organization scoping in code for consistency and possible future multi-organization support; do not design current runtime topology or user flows around multiple organizations unless that support is explicitly introduced.
+
+**Key Features**: MCP tool execution, OpenAPPA guardrails policies, MCP response modifiers (Handlebars.js), team-based access control (profiles and MCP servers), K8s-based MCP server runtime with stdio and streamable-http transport support, white-labeling (themes, logos, fonts), profile-based chat with MCP tools, comprehensive built-in Archestra MCP tools, profile chat visibility control
+
+**Workspaces**:
+
+- `backend/` - Fastify API server with security guardrails
+- `frontend/` - Next.js app with tool management UI
+- `experiments/` - CLI testing and proxy prototypes
+- `shared/` - Common utilities and types
+
+## Tool Execution Architecture
+
+**LLM Proxy** returns tool calls to clients for execution (standard OpenAI/Anthropic behavior). Clients implement the agentic loop:
+
+1. Call LLM proxy → receive tool_use/tool_calls
+2. Execute tools via MCP Gateway (`POST /v1/mcp/${profileId}` with `Bearer ${archestraToken}`)
+3. Send tool results back to LLM proxy
+4. Receive final answer
+
+OpenAPPA guardrails policies are still enforced by the proxy.
+
+## Authentication
+
+- **Better-Auth**: Session management with dynamic RBAC
+- **API Key Auth**: `Authorization: ${apiKey}` header (not Bearer)
+- **Custom Roles**: Unlimited custom roles per organization
+- **Middleware**: Fastify plugin at `backend/src/auth/fastify-plugin/`
+- **Route Permissions**: Configure in `shared/access-control.ts`
+- **Request Context**: `request.user` and `request.organizationId`
+- **Schema Files**: Auth schemas in separate files: `account`, `api-key`, `invitation`, `member`, `session`, `two-factor`, `verification`
+- **Dev auto-login (skip the login screen)**: For local development, set `ARCHESTRA_AUTH_DEV_AUTO_AUTHENTICATE_EMAIL` in your `.env` (e.g. `admin@example.com`, the seeded admin) to have the app auto-mint a real session for that user on load instead of showing the sign-in form. Ignored in production (`NODE_ENV=production`/`prod`); RBAC is unchanged (ordinary session for that user). Backed by the `dev-auto-login` Better Auth plugin (`backend/src/auth/dev-auto-login.ts`) exposing `POST /api/auth/dev-auto-login`, gated behind the `devAutoLoginEnabled` public-config flag.
+
+## Dependency Security
+
+**Install Script Protection**: The platform disables automatic execution of install scripts via `ignoreScripts: true` in `pnpm-workspace.yaml` to prevent supply chain attacks. Install scripts (`preinstall`, `postinstall`, `install`) can execute arbitrary code, steal secrets, and compromise the system.
+
+**Minimum Release Age**: Packages must be published for at least 7 days before installation (`minimumReleaseAge: 10080` minutes in `pnpm-workspace.yaml`). This allows time for community detection and removal of malicious releases, which are typically caught within hours.
+
+**Working with Disabled Scripts**: Most packages work without install scripts. When needed, manually rebuild specific packages:
+
+```bash
+pnpm rebuild <package-name>  # Enable scripts for specific package
+```
+
+**Dependency Updates**: Before updating dependencies, review what scripts will run (`npm view <package> scripts`), check release dates, and wait 7 days for new releases of critical packages to allow community security review. Always review `pnpm-lock.yaml` changes in PRs.
+
+## Coding Conventions
+
+**General**:
+
+- **Prefer Classes for Stateful Modules**: When encapsulating functionality that involves state (cached values, intervals, connections, etc.), prefer creating a class over standalone module functions. Export a singleton instance. This improves encapsulation, testability, and makes state management explicit.
+- **Use Shared Cache Utilities**: Do not introduce custom cache implementations with ad hoc `Map`s, manual TTLs, or hand-rolled eviction. Use one of the existing cache primitives in `backend/src/cache-manager.ts` (`cacheManager` or `LRUCacheManager`) unless there is a documented reason not to.
+
+  ```typescript
+  // Good - class with singleton
+  class ChatOpsManager {
+    private provider: Provider | null = null;
+
+    initialize() { ... }
+    cleanup() { ... }
+  }
+  export const chatOpsManager = new ChatOpsManager();
+
+  // Avoid - module-level state with loose functions
+  let provider: Provider | null = null;
+  export function initialize() { ... }
+  export function cleanup() { ... }
+  ```
+
+- **Private Methods at Bottom**: In classes, mark methods as `private` if they are only used within the class. Place all private methods at the bottom of the class, after public methods. This keeps the "public interface" visible at the top.
+
+  ```typescript
+  class MyService {
+    // Public methods first
+    doSomething() {
+      this.helperA();
+    }
+
+    // Private methods at bottom
+    private helperA() { ... }
+    private helperB() { ... }
+  }
+  ```
+
+- **No Premature Exports**: Only export what is actually used outside the module. If a function, constant, or type is only used within the module, do NOT export it. This is critical for maintaining clean module boundaries.
+
+  ```typescript
+  // Good - only export what's needed externally
+  export const myService = new MyService();
+
+  // Bad - exporting internal helpers "just in case"
+  export function internalHelper() { ... }  // Not used outside!
+  export const INTERNAL_CONSTANT = 42;      // Not used outside!
+  ```
+
+- **Module Code Order**: Structure modules so the "public interface" appears at the top. Internal/private functions and constants should be placed at the bottom of the file. This makes it immediately clear what the module exposes.
+
+  ```typescript
+  // 1. Imports
+  import { something } from "somewhere";
+
+  // 2. Exported items (public interface) - at TOP
+  export function publicFunctionA() {
+    return helperB();
+  }
+
+  export const publicConstant = "value";
+
+  // 3. Internal helpers - at BOTTOM
+  function helperB() {
+    return helperC();
+  }
+
+  function helperC() {
+    return INTERNAL_CONFIG.value;
+  }
+
+  const INTERNAL_CONFIG = { value: 42 };
+  ```
+
+- **Function Parameters**: If a function accepts more than 2 parameters, use a single object parameter instead of multiple positional parameters. This improves readability, makes parameters self-documenting, and allows for easier future extension.
+
+  ```typescript
+  // Good
+  async function validateScope(params: {
+    scope: string;
+    teamId: string | null;
+    userId: string;
+  }): Promise<void> { ... }
+
+  // Avoid
+  async function validateScope(
+    scope: string,
+    teamId: string | null,
+    userId: string
+  ): Promise<void> { ... }
+  ```
+
+**Database Architecture Guidelines**:
+
+- **Model-Only Database Access**: All database queries MUST go through `backend/src/models/` - never directly in routes or services
+- **Model Creation**: Create model files for any new database entities you need to interact with
+- **CRUD Centralization**: Models should handle all CRUD operations and complex queries
+- **No Business Logic**: Keep models focused on data access, business logic goes in services
+- **N+1 Query Prevention**: When fetching lists with related data, use batch loading methods (e.g., `getTeamsForAgents()`) instead of individual queries per item
+
+**Frontend**:
+
+- For frontend work, load the `archestra-dev-frontend` skill before editing React/Next.js UI, forms, query hooks, generated API client usage, copy, or docs links.
+
+**Backend**:
+
+- Refer to the `archestra-dev-backend` skill in `../.agents/skills/` for backend architecture guidelines.
+- Use Drizzle ORM for database operations through MODELS ONLY!
+- Table exports: Use plural names with "Table" suffix (e.g., `profileLabelsTable`, `sessionsTable`)
+- **Route permissions (IMPORTANT)**: When adding new API endpoints, you MUST add the route to `requiredEndpointPermissionsMap` in `shared/access-control.ts` or requests will return 403 Forbidden. Match permissions with similar existing routes (e.g., interaction endpoints use `interaction: ["read"]`).
+- **Audit logging**: When you add or change a state-mutating route, ensure it produces a correct audit record — registered with the right action, non-secret, and a non-empty before/after diff — and assert on that record in the route's existing integration test.
+- **MCP Tool Impact (IMPORTANT)**: When updating an API endpoint's request/response schema, also check if there is an associated Archestra MCP tool in `backend/src/archestra-mcp-server/` that exposes the same functionality. If so, update the MCP tool's `inputSchema` and handler to match the new API schema. Ask the user if you're unsure whether an MCP tool is affected.
+- Only export public APIs
+- **knip --production (IMPORTANT)**: Backend `check:ci` runs `pnpm knip` = `knip:dev && knip:production`. The `--production` pass ignores `*.test.ts` and cross-workspace consumers (e.g. the `scripts/` index generator), so an export used only by tests or those scripts fails CI even though plain `knip` passes. Before pushing backend export changes, run `cd backend && pnpm knip` (the full dev+production combo). Tag intentionally-public exports consumed only outside knip's view with a JSDoc `/** @public — reason */` tag (see `config.ts`, `middleware.ts`).
+- **Module Code Order (CRITICAL)**: Always place exports at TOP of file, internal helpers at BOTTOM. Use section comments (`// ===`) to separate. Function declarations are hoisted, so helpers can be called before defined.
+- Use the `logger` instance from `@/logging` for all logging (replaces console.log/error/warn/info)
+- **Backend Testing Best Practices**: Never mock database interfaces in backend tests - use the existing `backend/src/test/setup.ts` PGlite setup for real database testing, and use model methods to create/manipulate test data for integration-focused testing. For module mocking and global stubs, read `archestra-dev-testing/references/backend-tests.md`: mock-free files run in a shared-worker fast path, `@/auth`/`@/logging` mocks go through their `__mocks__` dirs (bare `vi.mock("@/auth")`), `@/config` through `configModuleMock(overrides)`, and `vi.stubGlobal` must be (re-)applied in `beforeEach` because stubs auto-revert after every test
+- **API Response Standardization**: Use `constructResponseSchema` helper for all routes to ensure consistent error responses (400, 401, 403, 404, 500)
+- **Error Handling**: Always use `throw new ApiError(statusCode, message)` for error responses - never use manual `reply.status().send({ error: ... })`. The centralized Fastify error handler formats all errors consistently as `{ error: { message, type } }` and logs appropriately.
+- **Protected Routes & Authentication**: Routes that pass ordinary API authentication have `request.user` and `request.organizationId`. Public, webhook, and callback routes exempted in `backend/src/auth/fastify-plugin/middleware.ts` follow their own authentication contracts; the `/api/` prefix alone is not a guarantee. On ordinarily authenticated routes, do not add redundant null checks like `if (!request.organizationId) throw new ApiError(401, "Unauthorized")` - just use `request.organizationId` directly. The middleware handles authentication; routes handle authorization and business logic.
+- **Type Organization**: Keep database schemas in `database/schemas/`, extract business types to dedicated `types/` files
+- **Pagination**: Use `PaginationQuerySchema` and `createPaginatedResponseSchema` for ordinary bounded tables that need page counts. Use `CursorQuerySchema` and `createCursorPaginatedResponseSchema` for write-hot or unbounded logs; keyset queries must fetch `limit + 1` rows and must not calculate totals.
+- **Sorting**: Use `SortingQuerySchema` or `createSortingQuerySchema` for standardized sorting parameters
+- **Database Types via drizzle-zod**: Never manually define TypeScript interfaces for database entities. Use `drizzle-zod` to generate Zod schemas from Drizzle table definitions, then infer types with `z.infer<>`. This keeps types in sync with the schema automatically:
+
+  ```typescript
+  // In types/<entity>.ts
+  import {
+    createSelectSchema,
+    createInsertSchema,
+    createUpdateSchema,
+  } from "drizzle-zod";
+  // The table definitions only: "@/database" also opens the connection.
+  import { schema } from "@/database/schema";
+
+  export const SelectEntitySchema = createSelectSchema(schema.entityTable);
+  export const InsertEntitySchema = createInsertSchema(schema.entityTable).omit(
+    { id: true, createdAt: true, updatedAt: true },
+  );
+  export const UpdateEntitySchema = createUpdateSchema(schema.entityTable).pick(
+    { fieldToUpdate: true },
+  );
+
+  export type Entity = z.infer<typeof SelectEntitySchema>;
+  export type InsertEntity = z.infer<typeof InsertEntitySchema>;
+  export type UpdateEntity = z.infer<typeof UpdateEntitySchema>;
+  ```
+
+- **Schema `$type<>` reuse**: In `database/schemas/*.ts`, never use inline literal union types for `.$type<>()` (e.g. `$type<"pending" | "completed">()`). Instead, define the type as a `z.enum()` in the corresponding `types/*.ts` file, infer the TS type, and reference it via `import type` in the schema: `.$type<EmbeddingStatus>()`. This keeps the type definition in one place and avoids drift between schema and types.
+
+**Team-based Access Control**:
+
+- Profiles and MCP servers use team-based authorization
+- Teams managed via better-auth organization plugin
+- Junction tables: `profile_team` and `mcp_server_team`
+- Breaking change: `usersWithAccess[]` replaced with `teams[]`
+- Admin-only team CRUD via `/api/teams/*`
+- Members can read teams and access assigned resources
+
+**Custom RBAC Roles**:
+
+- Extends predefined roles (admin, member)
+- 30 resources across 4 categories with CRUD permissions
+- Permission validation: can only grant what you have
+- Predefined roles are immutable
+- API: `/api/roles/*` (GET, POST, PUT, DELETE)
+- Database: `organizationRolesTable`
+- UI: Admin-only roles management at `/settings/roles`
+
+**Profile Labels**:
+
+- Profiles support key-value labels for organization/categorization
+- Database schema: `label_keys`, `label_values`, `profile_labels` tables
+- Keys and values stored separately for consistency and reuse
+- One value per key per profile (updating same key replaces value)
+- Labels returned in alphabetical order by key for consistency
+- API endpoints: GET `/api/profiles/labels/keys`, GET `/api/profiles/labels/values?key=<key>` (key param filters values by key)
+
+**MCP Server Runtime**:
+
+- Local MCP servers run in K8s pods (one pod per server) when K8s is configured
+- Feature flag `orchestratorK8sRuntime` returned by `/api/config` endpoint
+- Feature enabled when EITHER ARCHESTRA_ORCHESTRATOR_KUBECONFIG or ARCHESTRA_ORCHESTRATOR_LOAD_KUBECONFIG_FROM_CURRENT_CLUSTER is configured
+- Frontend disables local MCP server functionality when feature is off (shows tooltip explaining orchestratorK8sRuntime requirement)
+- Automatic pod lifecycle management (start/restart/stop)
+- Two transport types supported:
+  - **stdio** (default): JSON-RPC proxy communication via `/mcp_proxy/:id` using `kubectl attach`
+  - **streamable-http**: Native HTTP/SSE transport using K8s Service (better performance, concurrent requests)
+- Pod logs stream to the server page's Logs tab over the WebSocket; there is no REST logs endpoint
+- K8s configuration: ARCHESTRA_ORCHESTRATOR_K8S_NAMESPACE, ARCHESTRA_ORCHESTRATOR_KUBECONFIG, ARCHESTRA_ORCHESTRATOR_LOAD_KUBECONFIG_FROM_CURRENT_CLUSTER, ARCHESTRA_ORCHESTRATOR_MCP_SERVER_BASE_IMAGE
+- Custom Docker images supported per MCP server (overrides ARCHESTRA_ORCHESTRATOR_MCP_SERVER_BASE_IMAGE)
+- When using Docker image, command is optional (uses image's default CMD if not specified)
+- Runtime manager at `backend/src/k8s/mcp-server-runtime/`
+
+**Configuring Transport Type**:
+
+- Set `transportType: "streamable-http"` in `localConfig` for HTTP transport
+- Optionally specify `httpPort` (defaults to 8080) and `httpPath` (defaults to /mcp)
+- Stdio transport serializes requests (one at a time), HTTP allows concurrent connections
+- HTTP servers get automatic K8s Service creation with ClusterIP DNS name
+- For streamable-http servers: K8s Service uses NodePort in local dev, ClusterIP in production
+
+
+**LLM Cost Billing Mode**:
+
+- Every interaction records a `billing_mode` (`metered` | `subscription`, default `metered`) alongside `cost`. `cost` stays the list-price estimate; **billed spend** = `cost` for metered rows, `0` for subscription rows. Never re-interpret `cost` as billed spend — derive billed spend with a `billing_mode = 'metered'` filter (statistics/session aggregations already do this).
+- Resolved at proxy write time by `resolveInteractionBillingMode` (`routes/proxy/utils/billing-mode.ts`) purely from the credential format via the provider adapter's `isSubscriptionCredential`: Anthropic OAuth access tokens (Claude Pro/Max, what Claude Code forwards) are `sk-ant-oat…` while metered API keys are `sk-ant-api…`; ChatGPT-subscription (Codex) credentials are the `chatgpt-oauth:…` marker-encoded strings on the OpenAI chat + Responses adapters. Applies uniformly to passthrough, virtual-key, and DB-managed keys — there is deliberately NO per-key billing configuration or UI. Gated by `ARCHESTRA_LLM_COST_SUBSCRIPTION_AUTODETECT` (default true). Bearer transport alone is NOT a signal (Workload Identity etc. stay metered).
+- Read sites split billed vs subscription: `statistics.getCostSavingsStatistics` (`totalSubscriptionCost` + per-bucket `subscriptionCost`), `interaction.getSessions` (`totalBilledCost`/`totalSubscriptionCost`). Frontend uses the `<BilledCost>` component. Metric `llm_cost_total` carries a `billing_mode` label. Cost limits are billing-aware too: `InteractionModel.updateUsageAfterInteraction` skips limit accumulation entirely for `billing_mode = 'subscription'` interactions, and default user limits (`getDefaultUserLimitUsage` in `models/limit.ts`, which sums interactions directly) filter to `billing_mode = 'metered'` — so subscription traffic never burns down token-cost limits.
+
+**Cost Statistics Rollup**:
+
+- Cost statistics (`models/statistics.ts`, `UsageStatisticsModel.getLlmUsage`) read `LlmUsageRollupModel.facts(window)`, not `interactions`: hourly totals from `llm_usage_hourly` for rolled, unmarked hours (daily sums from `llm_usage_daily` for whole unmarked days when the window buckets by days or longer) plus the same rows computed from `interactions` for the rest. Aggregate facts with `SUM(requests)`, never `COUNT(*)`; model-split rows carry `requests = 0`.
+- Triggers on `interactions` and `interaction_billing` mark changed hours in `llm_usage_rollup_dirty`; the `llm_usage_rollup` periodic task rolls new hours and recomputes marked ones. A statistic that needs a new `interactions` column must add it to `llm_usage_hourly`, to `usageFactsQuery`, and to the update trigger's column list in a migration.
+
+**Chat Feature**:
+
+- Agent-based conversations: Each conversation is tied to a specific agent
+- MCP tool integration: Chat automatically uses the agent's assigned MCP tools via MCP Gateway
+- LLM Proxy integration: Chat routes through LLM Proxy for security policies + observability
+- Agent authentication: Connects to internal MCP Gateway using `Authorization: Bearer ${archestraToken}` with agent ID in URL path
+- Conversation management: Select, edit (inline rename), delete conversations directly in sidebar sub-navigation
+- Tool execution: Routes through MCP Gateway, includes response modifiers and logging
+- Required env var: `ARCHESTRA_CHAT_ANTHROPIC_API_KEY` (used by LLM Proxy for Anthropic calls)
+
+**Archestra MCP Server**:
+
+- Tools must be explicitly assigned to Agents (not auto-injected)
+- Exception: while OpenAPPA is enabled, the policy read tools in `IMPLICIT_OPENAPPA_READ_TOOL_SHORT_NAMES` (`shared/archestra-mcp-server.ts`) are listed and admitted for every agent and gateway, subject to RBAC, exclusions, the delegated-run gate, and the Agent Runtime OAuth token gate (single-agent runtime tokens with `accessAllTools: false` require explicit assignment); policy writes stay assignment-only
+- Tools prefixed with `archestra__` to avoid conflicts
+- Implementation: `backend/src/archestra-mcp-server/` (modular directory with one file per tool group)
+- Catalog entry: Created automatically on startup with fixed ID `ARCHESTRA_MCP_CATALOG_ID`
+- Security:
+  - **RBAC (user permissions) still enforced**: Every tool is mapped to a `{ resource, action }` permission in `TOOL_PERMISSIONS` (`archestra-mcp-server/rbac.ts`). The `tools/list` endpoint dynamically filters tools so users only see tools they have permission to use. `executeArchestraTool` performs a centralized RBAC check before executing any tool. When adding new tools, add the corresponding entry to `TOOL_PERMISSIONS` (the `Record<ArchestraToolShortName, ...>` type will cause a compile error if a tool is missing).
+
+**Skill Sandbox Runtime** (gated behind the sandbox feature flag):
+
+- DB-backed, Dagger-materialized execution sandbox for Agent Skills. Code lives in `backend/src/skills-sandbox/` (see its README for replay semantics and limits)
+- MCP tools exposed by `archestra-mcp-server/sandbox.ts` (`archestra-mcp-server/rbac.ts`): the execution tools (`run_command`, `upload_file`, `download_file`) and the file tools (`search_files`, `read_file`, `save_file`, `edit_file`, `delete_file`) are all gated by `agent:read`. The execution tools accept a `target?: { fresh: true } | { id }` — omitted resolves a lazy per-conversation default sandbox:
+  - `run_command` — materializes the sandbox in a fresh Dagger container, replays the persisted ordered replay log, executes a command, appends it to the log. Python runs in a uv project at `/home/sandbox` (`python3` is the project venv; install packages with `uv add --project /home/sandbox <pkg>`)
+  - `upload_file` — writes an input file (chat attachment, base64, or text) into the sandbox as an ordered replay event so it materializes on later runs
+  - `download_file` — exports a file from a materialized sandbox into `skill_sandbox_files` (kind `artifact`) and returns a metadata reference (no download link; the file is reached via the chat Files panel, which fetches bytes from the `/api/skill-sandbox/artifacts/:id` route directly)
+- Chat attachments are auto-staged into the conversation's **default** sandbox under `/home/sandbox/attachments/` (idempotent, tracked via `skill_sandbox_files.source_attachment_id`), so the model uses user-attached files without knowing attachment ids. Over-limit attachments are skipped with a model-visible notice. `upload_file` stays the path for inline content, explicit paths, non-default sandboxes, and non-UI gateway clients
+- `load_skill` (and slash-command activation) mounts the skill's pinned version into the conversation's default sandbox when the sandbox is usable, so its scripts are runnable under `/skills/<name>`. This happens for both `load_skill` modes (name only, and name + path), so a file read also mounts the skill. `run_command`/`download_file` re-check that every mounted skill is still readable by the caller before building a container (fail-closed)
+- Source of truth is Postgres (`skill_sandboxes`, `skill_sandbox_skill_mounts`, `skill_sandbox_commands`, `skill_sandbox_files`, `skill_sandbox_replay_events`); skill bytes are versioned immutably in `skill_versions` + `skill_version_files` and mounts pin a `skill_version_id`. Dagger owns ephemeral filesystem state with no retention guarantee. Ordering across commands/uploads/mounts is the `skill_sandbox_replay_events` log, sequenced via `skill_sandboxes.next_replay_sequence`
+- Activation prompt (`skills/skill-activation.ts`) tells the model to inspect files with `load_skill` (passing a path) and use the sandbox tools to execute scripts. Each mounted skill root (`/skills/<name>`) is appended to `PYTHONPATH` (in `archestra-rs/sandbox-core/src/backends/dagger.rs`), so the model imports a skill's modules directly without `sys.path` edits. `run_command`'s cwd defaults to `/home/sandbox`, **not** the skill root, so a bundled script that reads its own files by relative path must be run with `cwd: /skills/<name>`
+
+**Testing**:
+
+- **Backend**: Vitest with PGLite for in-memory PostgreSQL testing - never mock database interfaces, use real database operations via models for comprehensive integration testing. Read `archestra-dev-testing/references/backend-tests.md` for mocking/stub/isolation rules — files without `vi.mock` run in a faster shared-worker vitest project, so prefer boundary mocks over module mocks
+- **Database-free test imports**: `*.unit.test.ts` files must keep their runtime import graph free of database, config, model, server, and fixture modules. Import Vitest APIs from `vitest` and shared values/types from focused `@archestra/shared/*` exports, not the shared root barrel. `pnpm --dir backend check:test-imports` and Biome enforce these boundaries; inspect imports of the code under test before moving a file to the database-free project.
+- **Test What Matters**: Prefer behavior-focused tests over implementation-detail tests. Do not add tests that only assert class names, prop plumbing, or incidental markup unless that detail is itself the contract.
+- **E2E Tests**: Load the `archestra-dev-e2e` skill for Playwright tests, fixtures, WireMock setup, local/CI behavior, and locator guidance.
+- **Backend Test Fixtures**: Import from `@/test` to access Vitest context with fixture functions. Available fixtures: `makeUser`, `makeAdmin`, `makeOrganization`, `makeTeam`, `makeAgent`, `makeTool`, `makeAgentTool`, `makeCustomRole`, `makeMember`, `makeMcpServer`, `makeInternalMcpCatalog`, `makeInvitation`, `seedAndAssignArchestraTools`
+
+**Backend Test Fixtures Usage**:
+
+```typescript
+import { test, expect } from "@/test";
+
+test("example test", async ({ makeUser, makeOrganization, makeTeam }) => {
+  const user = await makeUser({ email: "custom@test.com" });
+  const org = await makeOrganization();
+  const team = await makeTeam(org.id, user.id, { name: "Custom Team" });
+  // test logic...
+});
+```
+
+- never amend commits

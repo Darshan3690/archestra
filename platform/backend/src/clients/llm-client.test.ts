@@ -1,30 +1,85 @@
 import {
-  EXTERNAL_AGENT_ID_HEADER,
+  APP_ID_HEADER,
+  CHAT_API_KEY_ID_HEADER,
+  CHATGPT_SUBSCRIPTION_LABEL,
+  PROVIDER_BASE_URL_HEADER,
   SESSION_ID_HEADER,
-  SOURCE_HEADER,
-  UNTRUSTED_CONTEXT_HEADER,
-  USER_ID_HEADER,
-} from "@shared";
+  type SupportedProviderEndpoint,
+  UNATTENDED_HEADER,
+} from "@archestra/shared";
+import { generateObject, generateText, streamText } from "ai";
 import { vi } from "vitest";
+import { z } from "zod";
+import config from "@/config";
+import {
+  ConversationModel,
+  LlmProviderApiKeyModel,
+  UserTokenModel,
+} from "@/models";
+import { encodeOpenAiCodexCredential } from "@/services/openai-codex-credentials";
 import { describe, expect, it, test } from "@/test";
 
 // Mock the gemini-client module before importing llm-client
 const mockIsVertexAiEnabled = vi.hoisted(() => vi.fn(() => false));
+const mockIsAzureOpenAiEntraIdEnabled = vi.hoisted(() => vi.fn(() => false));
+// Capture the fetch option passed to createAnthropic, so the thinking-display
+// injection can be asserted against the body that actually goes out.
+const capturedCreateAnthropicOptions = vi.hoisted(() => ({
+  fetch: undefined as typeof globalThis.fetch | undefined,
+}));
 const mockCreateAnthropic = vi.hoisted(() =>
-  vi.fn(({ headers }: { headers?: Record<string, string> }) =>
-    vi.fn((modelName: string) => ({
-      provider: "anthropic",
-      modelName,
+  vi.fn(
+    ({
       headers,
-    })),
+      fetch,
+    }: {
+      headers?: Record<string, string>;
+      fetch?: typeof globalThis.fetch;
+    }) => {
+      capturedCreateAnthropicOptions.fetch = fetch;
+      return vi.fn((modelName: string) => ({
+        provider: "anthropic",
+        modelName,
+        headers,
+      }));
+    },
   ),
 );
-vi.mock("@/clients/gemini-client", () => ({
+vi.mock("@/clients/gemini-vertex-ai", () => ({
   isVertexAiEnabled: mockIsVertexAiEnabled,
 }));
+vi.mock("@/clients/azure-openai-credentials", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/clients/azure-openai-credentials")>();
+  return {
+    ...actual,
+    isAzureOpenAiEntraIdEnabled: mockIsAzureOpenAiEntraIdEnabled,
+  };
+});
 vi.mock("@ai-sdk/anthropic", () => ({
   createAnthropic: mockCreateAnthropic,
 }));
+
+const capturedCreateAmazonBedrockOptions = vi.hoisted(() => ({
+  apiKey: undefined as string | undefined,
+  accessKeyId: undefined as string | undefined,
+  baseURL: undefined as string | undefined,
+}));
+vi.mock("@ai-sdk/amazon-bedrock", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@ai-sdk/amazon-bedrock")>();
+  return {
+    ...actual,
+    createAmazonBedrock: (
+      options: Parameters<typeof actual.createAmazonBedrock>[0],
+    ) => {
+      capturedCreateAmazonBedrockOptions.apiKey = options?.apiKey;
+      capturedCreateAmazonBedrockOptions.accessKeyId = options?.accessKeyId;
+      capturedCreateAmazonBedrockOptions.baseURL = options?.baseURL;
+      return actual.createAmazonBedrock(options);
+    },
+  };
+});
 
 // Capture the fetch option passed to createOpenAI for azure fetchWithVersion tests
 const capturedCreateOpenAIOptions = vi.hoisted(() => ({
@@ -51,62 +106,76 @@ vi.mock("@ai-sdk/openai", async (importOriginal) => {
   };
 });
 
+// Capture the options passed to createOpenAICompatible for the azure
+// open-model (reasoning_content) branch tests.
+const capturedCreateOpenAICompatibleOptions = vi.hoisted(() => ({
+  headers: undefined as Record<string, string> | undefined,
+  apiKey: undefined as string | undefined,
+  includeUsage: undefined as boolean | undefined,
+}));
+vi.mock("@ai-sdk/openai-compatible", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@ai-sdk/openai-compatible")>();
+  return {
+    ...actual,
+    createOpenAICompatible: (
+      options: Parameters<typeof actual.createOpenAICompatible>[0],
+    ) => {
+      capturedCreateOpenAICompatibleOptions.headers = (
+        options as { headers?: Record<string, string> }
+      ).headers;
+      capturedCreateOpenAICompatibleOptions.apiKey = (
+        options as { apiKey?: string }
+      ).apiKey;
+      capturedCreateOpenAICompatibleOptions.includeUsage = (
+        options as { includeUsage?: boolean }
+      ).includeUsage;
+      return actual.createOpenAICompatible(options);
+    },
+  };
+});
+
+// Capture the fetch option passed to createOllama, so the native `think`
+// reconciliation can be asserted against the body that actually goes out.
+const capturedCreateOllamaOptions = vi.hoisted(() => ({
+  fetch: undefined as typeof globalThis.fetch | undefined,
+}));
+vi.mock("ollama-ai-provider-v2", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("ollama-ai-provider-v2")>();
+  return {
+    ...actual,
+    createOllama: (options: Parameters<typeof actual.createOllama>[0]) => {
+      capturedCreateOllamaOptions.fetch = (
+        options as { fetch?: typeof globalThis.fetch }
+      ).fetch;
+      return actual.createOllama(options);
+    },
+  };
+});
+
+import { encodeBedrockSigV4Marker } from "@/clients/bedrock-credentials";
+import { buildOllamaNativeProviderOptions } from "@/routes/chat/ollama-native-params";
+import type { ConfiguredParameters } from "@/types/model";
 import {
+  buildProxyBaseUrl,
   createDirectLLMModel,
   createLLMModel,
-  detectProviderFromModel,
+  createLLMModelForAgent,
+  OLLAMA_THINK_EXPLICIT_HEADER,
 } from "./llm-client";
 
-describe("detectProviderFromModel", () => {
-  describe("anthropic models", () => {
-    it("detects claude models as anthropic", () => {
-      expect(detectProviderFromModel("claude-3-haiku-20240307")).toBe(
-        "anthropic",
-      );
-      expect(detectProviderFromModel("claude-3-opus-20240229")).toBe(
-        "anthropic",
-      );
-      expect(detectProviderFromModel("claude-opus-4-1-20250805")).toBe(
-        "anthropic",
-      );
-      expect(detectProviderFromModel("Claude-3-Sonnet")).toBe("anthropic");
-    });
-  });
+describe("buildProxyBaseUrl", () => {
+  // The proxy this URL points at runs in this very process, and the API binds
+  // IPv4 only (config.api.host is "0.0.0.0" outside development). `localhost`
+  // resolves to ::1 first under RFC 6724 precedence, so naming it would send
+  // every chat turn's first proxy connection to an address with no listener —
+  // refused outright without Happy Eyeballs, and a wasted round trip with it.
+  // See issues #4917 / #6933 and LOOPBACK_HOST in shared/consts.ts.
+  it("addresses the loopback interface by IPv4 literal, never by name", () => {
+    const url = new URL(buildProxyBaseUrl("anthropic", "agent-1"));
 
-  describe("gemini models", () => {
-    it("detects gemini models as gemini", () => {
-      expect(detectProviderFromModel("gemini-2.5-pro")).toBe("gemini");
-      expect(detectProviderFromModel("gemini-1.5-flash")).toBe("gemini");
-      expect(detectProviderFromModel("Gemini-Pro")).toBe("gemini");
-    });
-
-    it("detects google models as gemini", () => {
-      expect(detectProviderFromModel("google-palm")).toBe("gemini");
-    });
-  });
-
-  describe("openai models", () => {
-    it("detects gpt models as openai", () => {
-      expect(detectProviderFromModel("gpt-4o")).toBe("openai");
-      expect(detectProviderFromModel("gpt-4-turbo")).toBe("openai");
-      expect(detectProviderFromModel("GPT-4")).toBe("openai");
-    });
-
-    it("detects o1 models as openai", () => {
-      expect(detectProviderFromModel("o1-preview")).toBe("openai");
-      expect(detectProviderFromModel("o1-mini")).toBe("openai");
-    });
-
-    it("detects o3 models as openai", () => {
-      expect(detectProviderFromModel("o3-mini")).toBe("openai");
-    });
-  });
-
-  describe("unknown models", () => {
-    it("defaults to anthropic for unknown models", () => {
-      expect(detectProviderFromModel("some-unknown-model")).toBe("anthropic");
-      expect(detectProviderFromModel("custom-model")).toBe("anthropic");
-    });
+    expect(url.hostname).toBe("127.0.0.1");
+    expect(url.pathname).toBe("/v1/anthropic/agent-1");
   });
 });
 
@@ -141,6 +210,43 @@ describe("createDirectLLMModel", () => {
     expect(model).toBeDefined();
   });
 
+  test("the direct availability fetch preserves Gemini Vertex routing", () => {
+    mockIsVertexAiEnabled.mockReturnValue(true);
+    try {
+      const model = createDirectLLMModel({
+        provider: "gemini",
+        apiKey: undefined,
+        modelName: "gemini-2.5-flash",
+        baseUrl: null,
+      });
+      expect(typeof model === "string" ? model : model.provider).toContain(
+        "vertex",
+      );
+    } finally {
+      mockIsVertexAiEnabled.mockReturnValue(false);
+    }
+  });
+
+  test("decodes Bedrock SigV4 credentials on the direct provider path", () => {
+    const marker = encodeBedrockSigV4Marker({
+      accessKeyId: "test-access-key",
+      secretAccessKey: "test-secret-key",
+      sessionToken: "test-session-token",
+    });
+
+    createDirectLLMModel({
+      provider: "bedrock",
+      apiKey: marker,
+      modelName: "amazon.nova-lite-v1:0",
+      baseUrl: null,
+    });
+
+    expect(capturedCreateAmazonBedrockOptions).toMatchObject({
+      apiKey: undefined,
+      accessKeyId: "test-access-key",
+    });
+  });
+
   it("creates a model for cerebras provider", () => {
     const model = createDirectLLMModel({
       provider: "cerebras",
@@ -161,14 +267,71 @@ describe("createDirectLLMModel", () => {
     expect(model).toBeDefined();
   });
 
-  it("creates a model for vllm provider without API key", () => {
+  it("creates keyless vLLM models on the openai-compatible provider", () => {
     const model = createDirectLLMModel({
       provider: "vllm",
       apiKey: undefined,
-      modelName: "default",
-      baseUrl: null,
+      modelName: "deepseek-ai/DeepSeek-R1",
+      baseUrl: "http://localhost:8000/v1",
     });
-    expect(model).toBeDefined();
+    // vLLM serves DeepSeek-style reasoning models that stream
+    // `reasoning_content` and expect it passed back on tool-call turns; the
+    // strict openai provider ("openai.chat") drops it in both directions,
+    // while the openai-compatible provider round-trips it.
+    expect((model as { provider: string }).provider).toBe("vllm.chat");
+  });
+
+  it("sends the json_schema response_format for vLLM structured outputs", async () => {
+    let sent: Record<string, unknown> | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: unknown, init: RequestInit | undefined) => {
+        sent = JSON.parse(init?.body as string);
+        return new Response("upstream stub", { status: 500 });
+      }),
+    );
+
+    const model = createDirectLLMModel({
+      provider: "vllm",
+      apiKey: undefined,
+      modelName: "qwen3-27b",
+      baseUrl: "http://localhost:8000/v1",
+    });
+
+    await generateObject({
+      model,
+      schema: z.object({ answer: z.number() }),
+      prompt: "2 + 2?",
+      maxRetries: 0,
+    }).catch(() => {});
+
+    if (!sent) {
+      throw new Error("Expected a request to reach the fetch stub");
+    }
+    // vLLM compiles a json_schema response_format into a decoding grammar. A
+    // schema-less `json_object` carries nothing to the model, and generateObject
+    // never puts the schema in the prompt — so the reranker's reasoning models
+    // answered with prose and fenced JSON that no parser accepts.
+    const responseFormat = (
+      sent as {
+        response_format?: { type?: string; json_schema?: { schema?: unknown } };
+      }
+    ).response_format;
+    expect(responseFormat?.type).toBe("json_schema");
+    expect(responseFormat?.json_schema?.schema).toBeDefined();
+  });
+
+  it("rejects vllm models without a base URL", () => {
+    // vLLM has no default base URL; without the guard a missing URL would
+    // silently route the request to api.openai.com.
+    expect(() =>
+      createDirectLLMModel({
+        provider: "vllm",
+        apiKey: undefined,
+        modelName: "default",
+        baseUrl: null,
+      }),
+    ).toThrow("vLLM base URL is required.");
   });
 
   it("creates a model for ollama provider without API key", () => {
@@ -179,6 +342,215 @@ describe("createDirectLLMModel", () => {
       baseUrl: null,
     });
     expect(model).toBeDefined();
+  });
+
+  it("creates DeepSeek models on the openai-compatible provider", () => {
+    const model = createDirectLLMModel({
+      provider: "deepseek",
+      apiKey: "test-key",
+      modelName: "deepseek-reasoner",
+      baseUrl: null,
+    });
+    // DeepSeek thinking mode requires `reasoning_content` passed back on
+    // tool-call turns; the strict openai provider ("openai.chat") drops it in
+    // both directions, while the openai-compatible provider round-trips it.
+    expect((model as { provider: string }).provider).toBe("deepseek.chat");
+  });
+
+  it("creates Archestra models on the openai-compatible provider", () => {
+    const model = createDirectLLMModel({
+      provider: "archestra",
+      apiKey: "arch_test-key",
+      modelName: "deepseek:deepseek-reasoner",
+      baseUrl: "https://other-archestra.test/v1/unified-model/agent-1",
+    });
+    // The upstream Archestra relays thinking as DeepSeek-style
+    // `reasoning_content`; the strict openai provider ("openai.chat") drops
+    // that field in both directions, while the openai-compatible provider
+    // round-trips it.
+    expect((model as { provider: string }).provider).toBe("archestra.chat");
+  });
+
+  it("throws for archestra provider without a base URL", () => {
+    // The upstream endpoint has no default; the old strict client silently
+    // fell back to api.openai.com instead.
+    expect(() =>
+      createDirectLLMModel({
+        provider: "archestra",
+        apiKey: "arch_test-key",
+        modelName: "deepseek:deepseek-reasoner",
+        baseUrl: null,
+      }),
+    ).toThrow("Archestra base URL is required.");
+  });
+
+  it("sends the json_schema response_format for Archestra structured outputs", async () => {
+    let sent: Record<string, unknown> | undefined;
+    const mockFetch = vi.fn(
+      async (_input: unknown, init: RequestInit | undefined) => {
+        sent = JSON.parse(init?.body as string);
+        return new Response("upstream stub", { status: 500 });
+      },
+    );
+    // Must be stubbed BEFORE the model is built: createResponseHealingFetch
+    // captures `globalThis.fetch` at construction time.
+    vi.stubGlobal("fetch", mockFetch);
+
+    const model = createDirectLLMModel({
+      provider: "archestra",
+      apiKey: "arch_test-key",
+      modelName: "deepseek:deepseek-reasoner",
+      baseUrl: "https://other-archestra.test/v1/unified-model/agent-1",
+    });
+
+    // The stubbed upstream fails the call; the request body is captured
+    // before that, which is all this assertion needs.
+    await generateObject({
+      model,
+      schema: z.object({ answer: z.number() }),
+      prompt: "2 + 2?",
+      maxRetries: 0,
+    }).catch(() => {});
+
+    if (!sent) {
+      throw new Error("Expected a request to reach the fetch stub");
+    }
+    // Moving off the strict openai client must not drop the schema:
+    // generateObject flows (KB reranker, built-in subagents) rely on the
+    // provider enforcing it, and the compatible client otherwise downgrades to
+    // a schema-less `json_object`.
+    const responseFormat = (
+      sent as {
+        response_format?: { type?: string; json_schema?: { schema?: unknown } };
+      }
+    ).response_format;
+    expect(responseFormat?.type).toBe("json_schema");
+    expect(responseFormat?.json_schema?.schema).toBeDefined();
+  });
+
+  it("creates Kimi models on the openai-compatible provider", () => {
+    const model = createDirectLLMModel({
+      provider: "kimi",
+      apiKey: "test-key",
+      modelName: "kimi-k3",
+      baseUrl: null,
+    });
+    // Kimi thinking models stream reasoning in `reasoning_content` and expect
+    // it passed back on tool-call turns; the strict openai provider
+    // ("openai.chat") drops it in both directions, while the openai-compatible
+    // provider round-trips it.
+    expect((model as { provider: string }).provider).toBe("kimi.chat");
+  });
+
+  it("creates MiniMax models on the openai-compatible provider", () => {
+    const model = createDirectLLMModel({
+      provider: "minimax",
+      apiKey: "test-key",
+      modelName: "MiniMax-M2.5",
+      baseUrl: null,
+    });
+    // The proxy's minimax adapter surfaces thinking as DeepSeek-style
+    // `reasoning_content`; the strict openai provider ("openai.chat") drops
+    // that field in both directions, while the openai-compatible provider
+    // round-trips it.
+    expect((model as { provider: string }).provider).toBe("minimax.chat");
+  });
+
+  it("creates OpenRouter models on the openai-compatible provider", () => {
+    const model = createDirectLLMModel({
+      provider: "openrouter",
+      apiKey: "test-key",
+      modelName: "deepseek/deepseek-r1",
+      baseUrl: null,
+    });
+    // OpenRouter streams thinking as a `reasoning` delta field; the strict
+    // openai provider ("openai.chat") drops it, while the openai-compatible
+    // provider surfaces it as reasoning parts.
+    expect((model as { provider: string }).provider).toBe("openrouter.chat");
+  });
+
+  it("sends the json_schema response_format for OpenRouter structured outputs", async () => {
+    let sent: Record<string, unknown> | undefined;
+    const mockFetch = vi.fn(
+      async (_input: unknown, init: RequestInit | undefined) => {
+        sent = JSON.parse(init?.body as string);
+        return new Response("upstream stub", { status: 500 });
+      },
+    );
+    // Must be stubbed BEFORE the model is built: createResponseHealingFetch
+    // captures `globalThis.fetch` at construction time.
+    vi.stubGlobal("fetch", mockFetch);
+
+    const model = createDirectLLMModel({
+      provider: "openrouter",
+      apiKey: "test-key",
+      modelName: "deepseek/deepseek-r1",
+      baseUrl: null,
+    });
+
+    // The stubbed upstream fails the call; the request body is captured
+    // before that, which is all this assertion needs.
+    await generateObject({
+      model,
+      schema: z.object({ answer: z.number() }),
+      prompt: "2 + 2?",
+      maxRetries: 0,
+    }).catch(() => {});
+
+    if (!sent) {
+      throw new Error("Expected a request to reach the fetch stub");
+    }
+    // generateObject flows (KB reranker, built-in subagents) rely on the
+    // provider enforcing the schema: without supportsStructuredOutputs the
+    // compatible client downgrades to a schema-less `json_object` response
+    // format, and nothing else carries the schema to the model.
+    const responseFormat = (
+      sent as {
+        response_format?: { type?: string; json_schema?: { schema?: unknown } };
+      }
+    ).response_format;
+    expect(responseFormat?.type).toBe("json_schema");
+    expect(responseFormat?.json_schema?.schema).toBeDefined();
+  });
+
+  it("sends the json_schema response_format for Azure open-model structured outputs", async () => {
+    let sent: Record<string, unknown> | undefined;
+    const mockFetch = vi.fn(
+      async (_input: unknown, init: RequestInit | undefined) => {
+        sent = JSON.parse(init?.body as string);
+        return new Response("upstream stub", { status: 500 });
+      },
+    );
+    vi.stubGlobal("fetch", mockFetch);
+
+    const model = createDirectLLMModel({
+      provider: "azure",
+      apiKey: "test-key",
+      modelName: "DeepSeek-R1",
+      baseUrl: "https://my-resource.services.ai.azure.com/openai/v1",
+    });
+
+    await generateObject({
+      model,
+      schema: z.object({ answer: z.number() }),
+      prompt: "2 + 2?",
+      maxRetries: 0,
+    }).catch(() => {});
+
+    if (!sent) {
+      throw new Error("Expected a request to reach the fetch stub");
+    }
+    // Azure open models moved from the strict openai client, which always sent
+    // json_schema, to the compatible one, which downgrades to a schema-less
+    // `json_object` unless asked — silently breaking every generateObject flow
+    // (KB reranker, built-in subagents) pointed at an Azure deployment.
+    const responseFormat = (
+      sent as {
+        response_format?: { type?: string; json_schema?: { schema?: unknown } };
+      }
+    ).response_format;
+    expect(responseFormat?.type).toBe("json_schema");
+    expect(responseFormat?.json_schema?.schema).toBeDefined();
   });
 
   it("creates a model for zhipuai provider", () => {
@@ -271,9 +643,438 @@ describe("createDirectLLMModel", () => {
     expect(capturedCreateOpenAIOptions.apiKey).toBe("test-key");
   });
 
+  it("uses native Responses for azure OpenAI first-party deployments", () => {
+    const model = createDirectLLMModel({
+      provider: "azure",
+      apiKey: "test-key",
+      modelName: "gpt-5.5",
+      baseUrl: "https://my-resource.services.ai.azure.com/openai/v1",
+    });
+
+    expect((model as { provider: string }).provider).toBe("openai.responses");
+  });
+
+  it("uses the openai-compatible chat model for azure open-model deployments so reasoning_content surfaces", () => {
+    const model = createDirectLLMModel({
+      provider: "azure",
+      apiKey: "Bearer test-key",
+      modelName: "DeepSeek-R1",
+      baseUrl: "https://my-resource.services.ai.azure.com/openai/v1",
+    });
+
+    expect((model as { provider: string }).provider).toBe("azure.chat");
+    expect((model as { modelId: string }).modelId).toBe("DeepSeek-R1");
+    // The azure specifics must survive the SDK switch: api-key header
+    // (Bearer-stripped) and the usage chunk the strict SDK sends by default.
+    expect(capturedCreateOpenAICompatibleOptions.headers).toEqual(
+      expect.objectContaining({
+        "api-key": "test-key",
+      }),
+    );
+    expect(capturedCreateOpenAICompatibleOptions.apiKey).toBe("test-key");
+    expect(capturedCreateOpenAICompatibleOptions.includeUsage).toBe(true);
+  });
+
+  describe("azure direct base URL handling", () => {
+    // Captures the URL the AI SDK actually requests. The stubbed 500 fails the
+    // call; the URL is captured before that, which is all these tests need.
+    const requestedUrlFor = async (params: {
+      modelName: string;
+      baseUrl: string;
+    }) => {
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValue(new Response("upstream stub", { status: 500 }));
+      vi.stubGlobal("fetch", mockFetch);
+
+      const model = createDirectLLMModel({
+        provider: "azure",
+        apiKey: "test-key",
+        modelName: params.modelName,
+        baseUrl: params.baseUrl,
+      });
+      await generateText({
+        model,
+        prompt: "hi",
+        maxRetries: 0,
+      }).catch(() => {});
+
+      const input = mockFetch.mock.calls[0]?.[0];
+      if (!input) {
+        throw new Error("Expected a request to reach the fetch stub");
+      }
+      return new URL(typeof input === "string" ? input : input.url);
+    };
+
+    it("does not append api-version to Foundry v1 endpoints", async () => {
+      // The v1 endpoint rejects date-based api-version values with
+      // "API version not supported", which broke every direct-path call
+      // (KB reranker verification, title generation) against v1 base URLs.
+      const url = await requestedUrlFor({
+        modelName: "gpt-4.1",
+        baseUrl: "https://my-resource.cognitiveservices.azure.com/openai/v1",
+      });
+      expect(url.pathname).toBe("/openai/v1/responses");
+      expect(url.searchParams.has("api-version")).toBe(false);
+    });
+
+    it("does not append api-version for open-model deployments on v1 endpoints", async () => {
+      // Same guard on the openai-compatible branch.
+      const url = await requestedUrlFor({
+        modelName: "DeepSeek-R1",
+        baseUrl: "https://my-resource.cognitiveservices.azure.com/openai/v1",
+      });
+      expect(url.pathname).toBe("/openai/v1/chat/completions");
+      expect(url.searchParams.has("api-version")).toBe(false);
+    });
+
+    it("routes classic Responses requests through the resource with the Responses api-version", async () => {
+      const url = await requestedUrlFor({
+        modelName: "gpt-4.1",
+        baseUrl: "https://my-resource.openai.azure.com/openai",
+      });
+      expect(url.pathname).toBe("/openai/responses");
+      expect(url.searchParams.get("api-version")).toBe(
+        config.llm.azure.responsesApiVersion,
+      );
+    });
+
+    it("normalizes deployment-scoped base URLs for Responses", async () => {
+      const url = await requestedUrlFor({
+        modelName: "gpt-4o",
+        baseUrl:
+          "https://my-resource.openai.azure.com/openai/deployments/gpt-4o",
+      });
+      expect(url.pathname).toBe("/openai/responses");
+      expect(url.searchParams.get("api-version")).toBe(
+        config.llm.azure.responsesApiVersion,
+      );
+    });
+
+    it("keeps classic open-model requests deployment-scoped with the chat api-version", async () => {
+      const url = await requestedUrlFor({
+        modelName: "DeepSeek-R1",
+        baseUrl: "https://my-resource.openai.azure.com/openai",
+      });
+      expect(url.pathname).toBe(
+        "/openai/deployments/DeepSeek-R1/chat/completions",
+      );
+      expect(url.searchParams.get("api-version")).toBe(
+        config.llm.azure.apiVersion,
+      );
+    });
+  });
+
+  it("throws when azure has no base URL instead of falling back to api.openai.com", () => {
+    // Covers the strict-SDK branch too: createOpenAI would otherwise default
+    // to api.openai.com and send the Azure api-key there.
+    expect(() =>
+      createDirectLLMModel({
+        provider: "azure",
+        apiKey: "test-key",
+        modelName: "gpt-5.5",
+        baseUrl: null,
+      }),
+    ).toThrow("Azure AI Foundry base URL is required.");
+  });
+
+  it("routes azure gpt-oss deployments through the openai-compatible chat model", () => {
+    const model = createDirectLLMModel({
+      provider: "azure",
+      apiKey: "test-key",
+      modelName: "gpt-oss-120b",
+      baseUrl: "https://my-resource.services.ai.azure.com/openai/v1",
+    });
+
+    expect((model as { provider: string }).provider).toBe("azure.chat");
+  });
+
+  // Boundary test: drive the REAL @ai-sdk/openai-compatible model against a
+  // stubbed Azure upstream. Pins the reason for the azure SDK gate: DeepSeek-R1
+  // style deployments stream their thinking in `reasoning_content` delta
+  // fields, which the strict @ai-sdk/openai chat parser silently drops — the
+  // thinking must instead surface as reasoning stream parts.
+  it("surfaces azure reasoning_content deltas as reasoning stream parts", async () => {
+    const chunk = (payload: object) =>
+      `data: ${JSON.stringify({
+        id: "cmpl-1",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "DeepSeek-R1",
+        ...payload,
+      })}`;
+    const sseBody = [
+      chunk({
+        choices: [
+          {
+            index: 0,
+            delta: { role: "assistant", reasoning_content: "Let me think." },
+            finish_reason: null,
+          },
+        ],
+      }),
+      chunk({
+        choices: [{ index: 0, delta: { content: "42" }, finish_reason: null }],
+      }),
+      chunk({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
+      chunk({
+        choices: [],
+        usage: { prompt_tokens: 3, completion_tokens: 5 },
+      }),
+      "data: [DONE]",
+    ].join("\n\n");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(`${sseBody}\n\n`, {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          }),
+      ),
+    );
+
+    const model = createDirectLLMModel({
+      provider: "azure",
+      apiKey: "test-key",
+      modelName: "DeepSeek-R1",
+      baseUrl: "https://my-resource.services.ai.azure.com/openai/v1",
+    });
+
+    const result = streamText({
+      model,
+      prompt: "What is 6 * 7?",
+      maxRetries: 0,
+    });
+    let reasoningText = "";
+    let answerText = "";
+    const errors: unknown[] = [];
+    for await (const part of result.fullStream) {
+      if (part.type === "reasoning-delta") reasoningText += part.text;
+      if (part.type === "text-delta") answerText += part.text;
+      if (part.type === "error") errors.push(part.error);
+    }
+
+    expect(errors).toEqual([]);
+    expect(reasoningText).toBe("Let me think.");
+    expect(answerText).toBe("42");
+  });
+
   // createDirectLLMModel doesn't expose a `fetch` parameter — the azure createModel
   // closure always uses `providedFetch ?? globalThis.fetch`. We stub globalThis.fetch
   // to observe the URL that fetchWithVersion passes through.
+  // ollama-ai-provider-v2 emits `think: ollamaOptions?.think ?? false`, turning
+  // "the caller said nothing" into an explicit `think: false` on the wire. That
+  // disables thinking, and a qwen3-class model then returns its chain of thought
+  // as message `content` closed by a bare `</think>` — which renders as the
+  // answer. These pin the reconciliation against the real request body, since
+  // asserting on the provider-options bag alone passed while the wire was wrong.
+  describe("ollama-native think reconciliation", () => {
+    // Boundary test: drive the REAL ollama-ai-provider-v2 and assert on the body
+    // it actually builds. The previous version of these tests hand-wrote the
+    // request body, so it could not see that the package strips unknown keys
+    // from `providerOptions.ollama.options` — the explicit-thinking marker used
+    // to ride there, never survived the parse, and `think` was dropped on every
+    // setting. The marker is a header now precisely because headers bypass that
+    // Zod parse; a hand-written body would once again prove nothing.
+    const wireBodyFor = async (
+      configured: ConfiguredParameters | null,
+    ): Promise<Record<string, unknown>> => {
+      let sent: Record<string, unknown> | undefined;
+      const mockFetch = vi.fn(
+        async (_input: unknown, init: RequestInit | undefined) => {
+          sent = JSON.parse(init?.body as string);
+          return new Response("upstream stub", { status: 500 });
+        },
+      );
+      // Must be stubbed BEFORE the model is built: createOllamaNativeFetch
+      // captures `globalThis.fetch` at construction time.
+      vi.stubGlobal("fetch", mockFetch);
+
+      const turn = buildOllamaNativeProviderOptions({ configured });
+      const model = createDirectLLMModel({
+        provider: "ollama-native",
+        apiKey: undefined,
+        modelName: "qwen3:4b",
+        baseUrl: "http://localhost:11434",
+      });
+
+      // The stubbed upstream fails the call; the request body is captured
+      // before that, which is all these assertions need.
+      await generateText({
+        model,
+        prompt: "hi",
+        maxRetries: 0,
+        ...(turn ? { providerOptions: turn.providerOptions } : {}),
+        ...(turn?.headers ? { headers: turn.headers } : {}),
+      }).catch(() => {});
+
+      if (!sent) {
+        throw new Error("Expected a request to reach the fetch wrapper");
+      }
+      return sent;
+    };
+
+    it("omits think entirely when no thinking choice was configured", async () => {
+      // The package defaults `think` to false, which actively DISABLES thinking
+      // rather than deferring to the model — a qwen3-class model then returns
+      // its chain of thought as message `content` closed by a bare `</think>`.
+      const body = await wireBodyFor({ num_ctx: 4096 });
+      expect(body).not.toHaveProperty("think");
+    });
+
+    it("sends think:false when an admin explicitly turned thinking off", async () => {
+      const body = await wireBodyFor({ reasoning_effort: "none" });
+      expect(body.think).toBe(false);
+    });
+
+    it("sends think:true when an admin explicitly turned thinking on", async () => {
+      const body = await wireBodyFor({ reasoning_effort: "medium" });
+      expect(body.think).toBe(true);
+    });
+
+    it("never leaks the internal marker header upstream", async () => {
+      let sentHeaders: Record<string, string> | undefined;
+      const mockFetch = vi.fn(
+        async (_input: unknown, init: RequestInit | undefined) => {
+          sentHeaders = init?.headers as Record<string, string>;
+          return new Response("upstream stub", { status: 500 });
+        },
+      );
+      vi.stubGlobal("fetch", mockFetch);
+
+      const turn = buildOllamaNativeProviderOptions({
+        configured: { reasoning_effort: "none" },
+      });
+      const model = createDirectLLMModel({
+        provider: "ollama-native",
+        apiKey: undefined,
+        modelName: "qwen3:4b",
+        baseUrl: "http://localhost:11434",
+      });
+      await generateText({
+        model,
+        prompt: "hi",
+        maxRetries: 0,
+        providerOptions: turn?.providerOptions,
+        headers: turn?.headers,
+      }).catch(() => {});
+
+      const keys = Object.keys(sentHeaders ?? {}).map((k) => k.toLowerCase());
+      expect(keys).not.toContain(OLLAMA_THINK_EXPLICIT_HEADER);
+    });
+
+    it("keeps the configured sampling options on the wire", async () => {
+      const body = await wireBodyFor({ num_ctx: 4096, top_k: 40 });
+      expect(body.options).toMatchObject({ num_ctx: 4096, top_k: 40 });
+    });
+
+    it("passes a non-JSON body through untouched", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(new Response("{}"));
+      vi.stubGlobal("fetch", mockFetch);
+
+      createDirectLLMModel({
+        provider: "ollama-native",
+        apiKey: undefined,
+        modelName: "qwen3:4b",
+        baseUrl: "http://localhost:11434",
+      });
+      const wrapped = capturedCreateOllamaOptions.fetch;
+      if (!wrapped) {
+        throw new Error(
+          "Expected ollama-native fetch wrapper to be configured",
+        );
+      }
+
+      await wrapped("http://localhost:11434/api/chat", {
+        method: "POST",
+        body: "not json",
+      });
+
+      expect(mockFetch.mock.calls[0][1].body).toBe("not json");
+    });
+  });
+
+  // Sonnet 5 / Fable 5-class models think — and bill those tokens — on every
+  // request, but `display` defaults to "omitted", so without an injected
+  // `thinking` config the response carries only empty signature blocks and
+  // the chat UI has nothing to render. The installed @ai-sdk/anthropic has no
+  // `display` provider option (its closed Zod schema strips unknown thinking
+  // keys), so the injection happens in a fetch wrapper against the raw
+  // request body — these tests pin that wire-level rewrite.
+  describe("anthropic thinking display injection", () => {
+    const sendBody = async (body: string): Promise<RequestInit> => {
+      const mockFetch = vi.fn().mockResolvedValue(new Response("{}"));
+      // Must be stubbed BEFORE the model is built: the wrapper captures
+      // globalThis.fetch at construction time.
+      vi.stubGlobal("fetch", mockFetch);
+
+      createDirectLLMModel({
+        provider: "anthropic",
+        apiKey: "test-key",
+        modelName: "claude-sonnet-5",
+        baseUrl: null,
+      });
+      const wrapped = capturedCreateAnthropicOptions.fetch;
+      if (!wrapped) {
+        throw new Error("Expected anthropic fetch wrapper to be configured");
+      }
+
+      await wrapped("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        body,
+      });
+
+      return mockFetch.mock.calls[0][1];
+    };
+
+    const wireBodyFor = async (
+      requestBody: Record<string, unknown>,
+    ): Promise<Record<string, unknown>> => {
+      const init = await sendBody(JSON.stringify(requestBody));
+      return JSON.parse(init.body as string);
+    };
+
+    it("requests summarized thinking for models that think by default", async () => {
+      for (const model of [
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-sonnet-5-20250929",
+        "claude-fable-5",
+      ]) {
+        const body = await wireBodyFor({ model, messages: [] });
+        expect(body.thinking).toEqual({
+          type: "adaptive",
+          display: "summarized",
+        });
+      }
+    });
+
+    it("leaves models whose thinking is off by default untouched", async () => {
+      // Injecting thinking here would ENABLE it — new tokens, new cost —
+      // rather than surface what already runs.
+      const body = await wireBodyFor({
+        model: "claude-opus-4-8",
+        messages: [],
+      });
+      expect(body).not.toHaveProperty("thinking");
+    });
+
+    it("respects an explicit thinking configuration", async () => {
+      const body = await wireBodyFor({
+        model: "claude-sonnet-5",
+        messages: [],
+        thinking: { type: "disabled" },
+      });
+      expect(body.thinking).toEqual({ type: "disabled" });
+    });
+
+    it("passes a non-JSON body through untouched", async () => {
+      const init = await sendBody("not json");
+      expect(init.body).toBe("not json");
+    });
+  });
+
   describe("azure fetchWithVersion", () => {
     it("appends api-version to string URL", async () => {
       const mockFetch = vi.fn().mockResolvedValue(new Response("{}"));
@@ -439,28 +1240,366 @@ describe("createDirectLLMModel", () => {
 });
 
 describe("createLLMModel", () => {
-  test("sets the untrusted-context header only when contextIsTrusted is false", () => {
+  test.each([
+    false,
+    true,
+  ])("gates every APPA identity header (enabled=%s)", (enabled) => {
+    config.llmProxy.plugins = enabled ? ["appa"] : [];
+    config.openappa = {
+      ...config.openappa,
+      enabled,
+      yellEnabled: false,
+      yellForwardingEnabled: false,
+      offerSigningSecret: "",
+    };
+    createLLMModel({
+      provider: "openai",
+      apiKey: "test",
+      agentId: "agent",
+      modelName: "gpt-4",
+      baseUrl: null,
+      source: "chat",
+      userId: "user",
+      sessionId: "session",
+      appaParentId: "parent",
+    });
+    const headers = capturedCreateOpenAIOptions.headers;
+    expect(headers?.[SESSION_ID_HEADER]).toBe("session");
+    for (const name of ["X-Appa-Session-ID", "X-Appa-Parent-ID"]) {
+      expect(new Headers(headers).has(name)).toBe(enabled);
+    }
+  });
+
+  test("says when no person answers for the session, as a Scheduled task run does", () => {
+    for (const unattended of [true, false]) {
+      createLLMModel({
+        provider: "openai",
+        apiKey: "test",
+        agentId: "agent",
+        modelName: "gpt-4",
+        baseUrl: null,
+        source: "chat",
+        userId: "user",
+        sessionId: "session",
+        unattended,
+      });
+      expect(
+        new Headers(capturedCreateOpenAIOptions.headers).get(UNATTENDED_HEADER),
+      ).toBe(unattended ? "1" : null);
+    }
+  });
+
+  test("keeps an internal call's session out of OpenAPPA", () => {
+    config.llmProxy.plugins = ["appa"];
+    config.openappa = {
+      ...config.openappa,
+      enabled: true,
+      yellEnabled: false,
+      yellForwardingEnabled: false,
+      offerSigningSecret: "",
+    };
+    createLLMModel({
+      provider: "openai",
+      apiKey: "test",
+      agentId: "agent",
+      modelName: "gpt-4",
+      baseUrl: null,
+      source: "guardrail:annotator",
+      internalCall: true,
+      sessionId: "session",
+    });
+    const headers = new Headers(capturedCreateOpenAIOptions.headers);
+    expect(headers.get(SESSION_ID_HEADER)).toBe("session");
+    expect(headers.has("X-Appa-Session-ID")).toBe(false);
+  });
+
+  test("sends keyless Bedrock chat to the proxy without signing or a placeholder credential", async () => {
+    vi.stubEnv("AWS_ACCESS_KEY_ID", undefined);
+    vi.stubEnv("AWS_SECRET_ACCESS_KEY", undefined);
+    vi.stubEnv("AWS_BEARER_TOKEN_BEDROCK", undefined);
+    const mockFetch = vi.fn().mockResolvedValue(
+      Response.json({
+        output: {
+          message: { role: "assistant", content: [{ text: "Hello" }] },
+        },
+        stopReason: "end_turn",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        metrics: { latencyMs: 1 },
+      }),
+    );
+    vi.stubGlobal("fetch", mockFetch);
+
+    const model = createLLMModel({
+      provider: "bedrock",
+      apiKey: undefined,
+      agentId: "agent-1",
+      modelName: "amazon.nova-lite-v1:0",
+      baseUrl: null,
+      chatApiKeyId: "keyless-bedrock-key",
+    });
+    const result = await generateText({ model, prompt: "Hi", maxRetries: 0 });
+
+    expect(result.text).toBe("Hello");
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(String(url)).toContain("/v1/bedrock/agent-1/model/");
+    const headers = new Headers(init.headers);
+    expect(headers.has("authorization")).toBe(false);
+    expect(headers.has("x-amz-date")).toBe(false);
+    expect(headers.get(CHAT_API_KEY_ID_HEADER)).toBe("keyless-bedrock-key");
+  });
+
+  test("forwards Bedrock SigV4 credentials through the local proxy as a bearer marker", () => {
+    const marker = encodeBedrockSigV4Marker({
+      accessKeyId: "test-access-key",
+      secretAccessKey: "test-secret-key",
+      sessionToken: "test-session-token",
+    });
+
+    createLLMModel({
+      provider: "bedrock",
+      apiKey: marker,
+      agentId: "agent-1",
+      modelName: "amazon.nova-lite-v1:0",
+      baseUrl: null,
+    });
+
+    expect(capturedCreateAmazonBedrockOptions).toMatchObject({
+      apiKey: marker,
+      accessKeyId: undefined,
+      baseURL: expect.stringContaining("/v1/bedrock/agent-1"),
+    });
+  });
+
+  test("current chat key selection overrides a stored key but cannot borrow another user's key", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeSecret,
+    makeAgent,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const other = await makeUser();
+    await makeMember(user.id, org.id);
+    const agent = await makeAgent({ organizationId: org.id });
+    const secret = await makeSecret({ secret: { apiKey: "synthetic-key" } });
+    const oldKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openai",
+      access: "org",
+    });
+    const selectedKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openai",
+      access: "org",
+    });
+    const privateKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openai",
+      userId: other.id,
+      access: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      agentId: agent.id,
+      userId: user.id,
+      organizationId: org.id,
+      title: "Synthetic selection",
+      chatApiKeyId: oldKey.id,
+    });
+    const params = {
+      organizationId: org.id,
+      userId: user.id,
+      agentId: agent.id,
+      model: "gpt-4o",
+      provider: "openai" as const,
+      conversationId: conversation.id,
+    };
+    const selected = await createLLMModelForAgent({
+      ...params,
+      providerKeySelection: { providerApiKeyId: selectedKey.id },
+    });
+    expect(selected.chatApiKeyId).toBe(selectedKey.id);
+    expect(capturedCreateOpenAIOptions.headers).toEqual(
+      expect.objectContaining({ [CHAT_API_KEY_ID_HEADER]: selectedKey.id }),
+    );
+    await expect(
+      createLLMModelForAgent({
+        ...params,
+        providerKeySelection: { providerApiKeyId: privateKey.id },
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  test("uses an explicit keyless Azure conversation key and forwards its inference URL to the proxy", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeSecret,
+    makeAgent,
+    makeLlmProviderApiKey,
+  }) => {
+    mockIsAzureOpenAiEntraIdEnabled.mockReturnValue(true);
+
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id);
+    const agent = await makeAgent({
+      name: "Azure Chat Agent",
+      organizationId: org.id,
+    });
+    const fallbackSecret = await makeSecret({
+      secret: { apiKey: "sk-fallback" },
+    });
+
+    // Both keys are shared with the organization, so the conversation's key
+    // is chosen for being selected, not for being the only one visible.
+    const fallbackKey = await makeLlmProviderApiKey(org.id, fallbackSecret.id, {
+      name: "Fallback Azure Key",
+      provider: "azure",
+      baseUrl: "https://fallback.example.com/openai",
+      inferenceBaseUrl: "https://fallback-runtime.example.com/openai",
+      access: "org",
+    });
+    const selectedKey = await makeLlmProviderApiKey(org.id, null, {
+      name: "Selected Keyless Azure Key",
+      provider: "azure",
+      baseUrl: "https://discovery.example.com/openai",
+      inferenceBaseUrl: "https://runtime.example.com/openai",
+      access: "org",
+    });
+    const conversation = await ConversationModel.create({
+      agentId: agent.id,
+      userId: user.id,
+      organizationId: org.id,
+      title: "Azure Chat Conversation",
+      chatApiKeyId: selectedKey.id,
+    });
+
+    const result = await createLLMModelForAgent({
+      organizationId: org.id,
+      userId: user.id,
+      agentId: agent.id,
+      model: "gpt-4o",
+      provider: "azure",
+      conversationId: conversation.id,
+      source: "chat",
+    });
+
+    expect(result.apiKeySource).toBe("org");
+    // A user's call authenticates with the user's personal platform token; the
+    // provider key stays server-side behind the chat key row.
+    const personalToken = await UserTokenModel.ensureUserToken(user.id, org.id);
+    expect(capturedCreateOpenAIOptions.apiKey).toBe(
+      await UserTokenModel.getTokenValue(personalToken.id),
+    );
+    expect(capturedCreateOpenAIOptions.headers).toEqual(
+      expect.objectContaining({
+        [CHAT_API_KEY_ID_HEADER]: selectedKey.id,
+        [PROVIDER_BASE_URL_HEADER]: "https://runtime.example.com/openai",
+      }),
+    );
+    expect(capturedCreateOpenAIOptions.headers).not.toEqual(
+      expect.objectContaining({
+        [CHAT_API_KEY_ID_HEADER]: fallbackKey.id,
+        [PROVIDER_BASE_URL_HEADER]:
+          "https://fallback-runtime.example.com/openai",
+      }),
+    );
+
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        [
+          'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_test","role":"assistant","content":[]}}',
+          'data: {"type":"response.output_text.delta","item_id":"msg_test","output_index":0,"content_index":0,"delta":"ok"}',
+          'data: {"type":"response.completed","response":{"id":"resp_test","created_at":0,"model":"gpt-4o","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}',
+          "",
+        ].join("\n\n"),
+        {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        },
+      );
+    });
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+
+    try {
+      const streamResult = streamText({
+        model: result.model,
+        prompt: "hello",
+      });
+
+      await expect(streamResult.text).resolves.toBe("ok");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(fetchMock).toHaveBeenCalled();
+    const firstFetchCall = fetchMock.mock.calls[0] as unknown as Parameters<
+      typeof globalThis.fetch
+    >;
+    const [, fetchInit] = firstFetchCall;
+    expect(new Headers(fetchInit?.headers).get("authorization")).toBe(
+      `Bearer ${await UserTokenModel.getTokenValue(personalToken.id)}`,
+    );
+  });
+
+  test("throws the typed connect prompt when the agent's key is another user's ChatGPT subscription", async ({
+    makeOrganization,
+    makeUser,
+    makeSecret,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const owner = await makeUser();
+    const otherUser = await makeUser();
+    const agent = await makeAgent({ name: "Codex Agent" });
+    const secret = await makeSecret({
+      secret: {
+        apiKey: encodeOpenAiCodexCredential({
+          refreshToken: "refresh-token",
+          accountId: "account-id",
+        }),
+      },
+    });
+    const ownerKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      secretId: secret.id,
+      name: CHATGPT_SUBSCRIPTION_LABEL,
+      provider: "openai",
+      scope: "personal",
+      userId: owner.id,
+    });
+
+    await expect(
+      createLLMModelForAgent({
+        organizationId: org.id,
+        userId: otherUser.id,
+        agentId: agent.id,
+        model: "gpt-5-codex",
+        provider: "openai",
+        agentLlmApiKeyId: ownerKey.id,
+        source: "chat",
+      }),
+    ).rejects.toMatchObject({
+      name: "LlmProviderAuthRequiredError",
+      provider: "openai",
+      providerLabel: CHATGPT_SUBSCRIPTION_LABEL,
+    });
+  });
+
+  test("sets the app attribution header only when an app is provided", () => {
     createLLMModel({
       provider: "anthropic",
       apiKey: "test-key",
       agentId: "agent-1",
       modelName: "claude-3-5-haiku-20241022",
-      userId: "user-1",
-      externalAgentId: "external-agent-1",
-      sessionId: "session-1",
-      source: "chat",
       baseUrl: null,
-      contextIsTrusted: false,
+      appId: "11111111-1111-4111-8111-111111111111",
     });
 
     expect(mockCreateAnthropic).toHaveBeenCalledWith(
       expect.objectContaining({
         headers: expect.objectContaining({
-          [EXTERNAL_AGENT_ID_HEADER]: "external-agent-1",
-          [USER_ID_HEADER]: "user-1",
-          [SESSION_ID_HEADER]: "session-1",
-          [SOURCE_HEADER]: "chat",
-          [UNTRUSTED_CONTEXT_HEADER]: "true",
+          [APP_ID_HEADER]: "11111111-1111-4111-8111-111111111111",
         }),
       }),
     );
@@ -472,20 +1611,192 @@ describe("createLLMModel", () => {
       apiKey: "test-key",
       agentId: "agent-1",
       modelName: "claude-3-5-haiku-20241022",
-      userId: "user-1",
-      externalAgentId: "external-agent-1",
-      sessionId: "session-1",
-      source: "chat",
       baseUrl: null,
-      contextIsTrusted: undefined,
+      appId: null,
     });
 
-    expect(mockCreateAnthropic).toHaveBeenCalledWith(
-      expect.objectContaining({
-        headers: expect.not.objectContaining({
-          [UNTRUSTED_CONTEXT_HEADER]: "true",
+    const { headers } = mockCreateAnthropic.mock.calls[0][0] as {
+      headers?: Record<string, string>;
+    };
+    expect(headers?.[APP_ID_HEADER]).toBeUndefined();
+  });
+
+  for (const provider of ["ollama", "ollama-native", "vllm"] as const) {
+    test(`${provider} resolves a chat model with no API key configured anywhere`, async ({
+      makeOrganization,
+      makeUser,
+      makeAgent,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      const agent = await makeAgent({ name: `${provider} agent` });
+
+      // The whole point of the self-hosted providers: no key exists, and
+      // `resolveProviderApiKey` deliberately returns `apiKey: undefined` for
+      // them. A hardcoded provider list in the guard drifts from that set —
+      // which is how keyless `ollama-native` 400'd on every turn, the exact
+      // setup the docs tell users to create.
+      const result = await createLLMModelForAgent({
+        organizationId: org.id,
+        userId: user.id,
+        agentId: agent.id,
+        model: "llama3.2",
+        provider,
+        source: "chat",
+      });
+
+      expect(result.model).toBeDefined();
+    });
+  }
+});
+
+describe("GitHub Copilot surface selection", () => {
+  const baseParams = {
+    provider: "github-copilot" as const,
+    apiKey: "gho_test_token",
+    agentId: "agent-1",
+    modelName: "gpt-5.3-codex",
+    baseUrl: null,
+  };
+
+  test("replays assistant text and tool calls instead of unavailable stored items", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    vi.stubGlobal("fetch", async (_url: unknown, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      bodies.push(body);
+      if (
+        body.input.some(
+          (item: { type?: string }) => item.type === "item_reference",
+        )
+      ) {
+        return Response.json(
+          { error: { message: "Stored item not found", type: "not_found" } },
+          { status: 404 },
+        );
+      }
+      return Response.json({
+        id: "resp_test",
+        created_at: 0,
+        model: baseParams.modelName,
+        output: [
+          {
+            type: "message",
+            id: "msg_test",
+            role: "assistant",
+            content: [
+              {
+                type: "output_text",
+                text: "The marker is TEST_OK.",
+                annotations: [],
+              },
+            ],
+          },
+        ],
+        usage: { input_tokens: 10, output_tokens: 5 },
+      });
+    });
+    const model = createLLMModel({
+      ...baseParams,
+      supportedEndpoints: ["/responses"],
+    });
+    const result = await generateText({
+      model,
+      maxRetries: 0,
+      providerOptions: { openai: { store: true } },
+      messages: [
+        { role: "user", content: "Look up the marker." },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: "Looking it up.",
+              providerOptions: { openai: { itemId: "msg_previous" } },
+            },
+            {
+              type: "tool-call",
+              toolCallId: "call_test",
+              toolName: "lookup_marker",
+              input: { name: "demo" },
+              providerOptions: { openai: { itemId: "fc_previous" } },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "call_test",
+              toolName: "lookup_marker",
+              output: { type: "text", value: "TEST_OK" },
+            },
+          ],
+        },
+        { role: "user", content: "What was the marker?" },
+      ],
+    });
+    expect(result.text).toBe("The marker is TEST_OK.");
+    expect(bodies[0]).toMatchObject({
+      store: false,
+      input: expect.arrayContaining([
+        expect.objectContaining({
+          role: "assistant",
+          content: [{ type: "output_text", text: "Looking it up." }],
         }),
-      }),
-    );
+        expect.objectContaining({
+          type: "function_call",
+          call_id: "call_test",
+          name: "lookup_marker",
+          arguments: '{"name":"demo"}',
+        }),
+        expect.objectContaining({
+          type: "function_call_output",
+          call_id: "call_test",
+          output: "TEST_OK",
+        }),
+      ]),
+    });
+  });
+
+  test("routes a Responses-only model to the Responses transport", () => {
+    const model = createLLMModel({
+      ...baseParams,
+      supportedEndpoints: ["/responses"],
+    });
+
+    expect(model).toMatchObject({ provider: "openai.responses" });
+  });
+
+  test("routes a chat-completions model to the chat transport", () => {
+    const model = createLLMModel({
+      ...baseParams,
+      modelName: "gpt-4o",
+      supportedEndpoints: ["/chat/completions"],
+    });
+
+    expect(model).toMatchObject({ provider: "openai.chat" });
+  });
+
+  test("prefers chat completions when a model declares both surfaces", () => {
+    const model = createLLMModel({
+      ...baseParams,
+      modelName: "gpt-5.1",
+      supportedEndpoints: ["/chat/completions", "/responses"],
+    });
+
+    expect(model).toMatchObject({ provider: "openai.chat" });
+  });
+
+  // Every caller that does not resolve a model row (subagents, skills, the
+  // knowledge base) passes nothing here, and must keep the behaviour it has
+  // today rather than being guessed onto a surface the model may not serve.
+  test("falls back to chat completions when the surface is unknown", () => {
+    const unknownSurfaces: (SupportedProviderEndpoint[] | null | undefined)[] =
+      [undefined, null, []];
+    for (const supportedEndpoints of unknownSurfaces) {
+      const model = createLLMModel({ ...baseParams, supportedEndpoints });
+      expect(model).toMatchObject({ provider: "openai.chat" });
+    }
   });
 });

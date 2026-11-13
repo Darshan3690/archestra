@@ -1,0 +1,105 @@
+"use client";
+
+import { requiredPagePermissionsMap } from "@archestra/shared/access-control";
+import { usePathname } from "next/navigation";
+import React from "react";
+import { usePermissionMap } from "@/lib/auth/auth.query";
+import { useConnectNavigation } from "@/lib/hooks/use-connect-navigation";
+import {
+  DOTTED_NAV_ITEMS,
+  type NavDotKey,
+  navDotKeyForPathname,
+} from "@/lib/onboarding/nav-onboarding";
+import {
+  useMarkNavItemsSeen,
+  useSeenNavItems,
+} from "@/lib/onboarding/onboarding.query";
+import { useShellReady } from "@/lib/shell-deferral";
+
+/**
+ * Single source of truth for the onboarding red dots: which dotted nav items
+ * are visible to this user (RBAC/feature-flag filtered — hidden items never
+ * propagate a dot), which are still unseen, and the aggregate dots for the
+ * Studio segment and the collapsed-sidebar toggle. Also clears a dot when the
+ * user lands on its route (deep links included).
+ *
+ * Dots wait for seen items and page permissions. Connect additionally waits
+ * for its own visibility settings without holding up unrelated items.
+ */
+export function useNavOnboarding() {
+  const pathname = usePathname();
+  // The dots wait for the page's first data (see useShellReady).
+  const shellReady = useShellReady();
+  const { data: seenData, isSuccess: seenLoaded } = useSeenNavItems({
+    enabled: shellReady,
+  });
+  const permissionMap = usePermissionMap(requiredPagePermissionsMap);
+  const { visible: showConnect } = useConnectNavigation();
+  const { mutate: markItemsSeen } = useMarkNavItemsSeen();
+
+  const ready = seenLoaded && permissionMap !== null;
+
+  const unseenKeys = React.useMemo(() => {
+    if (!ready) return new Set<NavDotKey>();
+    const seen = new Set(seenData?.items ?? []);
+    const visible = (key: NavDotKey): boolean => {
+      switch (key) {
+        case "nav:projects":
+          return permissionMap["/projects"] ?? true;
+        case "nav:apps":
+          return permissionMap["/apps"] ?? true;
+        case "nav:connect":
+          return showConnect;
+        case "nav:model-providers":
+          return permissionMap["/llm/model-providers"] ?? true;
+        case "nav:mcp-registry":
+          return permissionMap["/mcp/registry"] ?? true;
+        case "nav:guardrails":
+          // Same gate as the sidebar row: either page is enough.
+          return (
+            permissionMap["/openappa"] === true ||
+            permissionMap["/openappa/yells"] === true
+          );
+      }
+    };
+    return new Set(
+      DOTTED_NAV_ITEMS.filter(
+        (item) => visible(item.key) && !seen.has(item.key),
+      ).map((item) => item.key),
+    );
+  }, [ready, seenData, permissionMap, showConnect]);
+
+  const markSeen = React.useCallback(
+    (key: NavDotKey) => {
+      if (!unseenKeys.has(key) || inFlightKeys.has(key)) return;
+      inFlightKeys.add(key);
+      markItemsSeen([key], {
+        onSettled: () => inFlightKeys.delete(key),
+      });
+    },
+    [unseenKeys, markItemsSeen],
+  );
+
+  // Deep-link clearing: landing on a dotted route counts as visiting it.
+  React.useEffect(() => {
+    if (!ready) return;
+    const key = navDotKeyForPathname(pathname);
+    if (key) markSeen(key);
+  }, [ready, pathname, markSeen]);
+
+  return {
+    unseenKeys,
+    showChatsDot: DOTTED_NAV_ITEMS.some(
+      (item) => item.mode === "chats" && unseenKeys.has(item.key),
+    ),
+    showStudioDot: DOTTED_NAV_ITEMS.some(
+      (item) => item.mode === "studio" && unseenKeys.has(item.key),
+    ),
+    showCollapsedToggleDot: unseenKeys.size > 0,
+    markSeen,
+  };
+}
+
+// Shared across hook instances (sidebar + app shell) so a route visit only
+// fires one mark-seen request even though both instances observe it.
+const inFlightKeys = new Set<NavDotKey>();

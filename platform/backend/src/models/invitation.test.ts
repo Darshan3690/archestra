@@ -1,8 +1,11 @@
-import { ADMIN_ROLE_NAME, MEMBER_ROLE_NAME } from "@shared";
+import { ADMIN_ROLE_NAME, MEMBER_ROLE_NAME } from "@archestra/shared";
+import { and, eq } from "drizzle-orm";
+import db, { schema } from "@/database";
 import { describe, expect, test } from "@/test";
 import type { BetterAuthSession, BetterAuthSessionUser } from "@/types";
 import InvitationModel from "./invitation";
 import MemberModel from "./member";
+import OrganizationModel from "./organization";
 
 describe("InvitationModel", () => {
   describe("getById", () => {
@@ -160,6 +163,49 @@ describe("InvitationModel", () => {
       expect(updatedInvitation?.status).toBe("accepted");
     });
 
+    test("invitation without an explicit role inherits the org default role", async ({
+      makeOrganization,
+      makeUser,
+      makeInvitation,
+      makeCustomRole,
+    }) => {
+      const org = await makeOrganization();
+      const customRole = await makeCustomRole(org.id);
+      await OrganizationModel.patch(org.id, {
+        defaultMemberRole: customRole.role,
+      });
+
+      const inviter = await makeUser();
+      const user = await makeUser({ email: "no-role@example.com" });
+      const invitation = await makeInvitation(org.id, inviter.id, {
+        email: "no-role@example.com",
+        role: null,
+      });
+
+      const testSession: BetterAuthSession = {
+        id: crypto.randomUUID(),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        userId: user.id,
+        expiresAt: new Date(Date.now() + 86400000),
+        token: "test-session-token",
+      };
+      const testUser: BetterAuthSessionUser = {
+        id: user.id,
+        email: "no-role@example.com",
+        name: "No Role User",
+        image: null,
+        emailVerified: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      await InvitationModel.accept(testSession, testUser, invitation.id);
+
+      const member = await MemberModel.getByUserId(user.id, org.id);
+      expect(member?.role).toBe(customRole.role);
+    });
+
     test("should accept invitation with custom role and assign that role to user", async ({
       makeOrganization,
       makeUser,
@@ -307,6 +353,60 @@ describe("InvitationModel", () => {
       // Check that invitation was updated to accepted
       const updatedInvitation = await InvitationModel.getById(invitation.id);
       expect(updatedInvitation?.status).toBe("accepted");
+    });
+
+    test("should not create a duplicate member row when user is already a member", async ({
+      makeOrganization,
+      makeUser,
+      makeInvitation,
+      makeMember,
+    }) => {
+      const org = await makeOrganization();
+      const inviter = await makeUser();
+      const user = await makeUser({ email: "existing@example.com" });
+
+      // User is already an admin in this org (e.g. seeded admin).
+      await makeMember(user.id, org.id, { role: ADMIN_ROLE_NAME });
+
+      // A stale pending invitation with role=member exists for the same email.
+      const invitation = await makeInvitation(org.id, inviter.id, {
+        email: "existing@example.com",
+        role: MEMBER_ROLE_NAME,
+      });
+
+      const testSession: BetterAuthSession = {
+        id: crypto.randomUUID(),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        userId: user.id,
+        expiresAt: new Date(Date.now() + 86400000),
+        token: "test-session-token",
+      };
+
+      const testUser: BetterAuthSessionUser = {
+        id: user.id,
+        email: "existing@example.com",
+        name: "Existing User",
+        image: null,
+        emailVerified: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      await InvitationModel.accept(testSession, testUser, invitation.id);
+
+      // Existing admin row must be preserved, no duplicate member row added.
+      const rows = await db
+        .select()
+        .from(schema.membersTable)
+        .where(
+          and(
+            eq(schema.membersTable.userId, user.id),
+            eq(schema.membersTable.organizationId, org.id),
+          ),
+        );
+      expect(rows).toHaveLength(1);
+      expect(rows[0].role).toBe(ADMIN_ROLE_NAME);
     });
   });
 

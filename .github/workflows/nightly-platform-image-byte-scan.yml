@@ -1,0 +1,62 @@
+name: Nightly Platform Image Byte Scan
+
+# Independently regenerates vulnerability inventory from the exact full and
+# slim image bytes retained by a recent successful Platform E2E image build.
+# Browser-suite failures do not suppress image coverage. Missing/expired image
+# pairs fail closed instead of selecting an arbitrarily old green test run.
+
+on:
+  schedule:
+    # Platform E2E starts at 03:00 UTC. Select its retained image-build outputs
+    # independently of the longer browser/hibernation suite.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      image-sha:
+        description: "Optional exact SHA tag produced by Platform E2E"
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: nightly-platform-image-byte-scan
+  cancel-in-progress: false
+
+jobs:
+  scan-platform-image-bytes:
+    name: Nightly Docker Image Scanning (Platform, byte-derived)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read # Required to read retained E2E image-build references.
+      contents: read # Required to checkout the validator and local scan actions.
+      id-token: write # Docker Hub OIDC pull login for Docker Scout.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Select available retained E2E image digests
+        id: images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_IMAGE_SHA: ${{ inputs.image-sha }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_BRANCH: ${{ github.ref_name }}
+        run: python3 .github/scripts/platform-byte-scan-inputs.py select
+
+      - name: Log in to Docker Hub
+        uses: $/.github/actions/docker-login
+        with:
+          username: archestra
+          dockerhub-oidc-connection-id: ${{ vars.DOCKERHUB_OIDC_CONNECTION_ID }}
+
+      - name: Scan exact full and slim Platform image bytes
+        uses: $/.github/actions/scan-platform-image-bytes
+        with:
+          image-sha: ${{ steps.images.outputs.source_sha }}
+          full-image: ${{ steps.images.outputs.full }}
+          slim-image: ${{ steps.images.outputs.slim }}

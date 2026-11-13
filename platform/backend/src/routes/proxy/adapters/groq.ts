@@ -1,3 +1,4 @@
+import { fetchWithAbortSignal } from "@/utils/client-disconnect-signal";
 /**
  * Groq LLM Proxy Adapter - OpenAI-compatible
  *
@@ -5,7 +6,12 @@
  * This adapter delegates request/response/stream parsing to the OpenAI adapters
  * and only overrides provider-specific configuration (baseUrl, api key behavior).
  */
-import { ArchestraInternalErrorCode } from "@shared";
+
+import {
+  ArchestraInternalErrorCode,
+  GROQ_REQUEST_EXCEEDS_BUCKET_STATUS,
+  GroqErrorCodes,
+} from "@archestra/shared";
 import { get } from "lodash-es";
 import OpenAIProvider from "openai";
 import type {
@@ -21,12 +27,15 @@ import type {
   LLMRequestAdapter,
   LLMResponseAdapter,
   LLMStreamAdapter,
+  StreamAccumulatorState,
 } from "@/types";
+import { streamChatCompletionChunks } from "./chat-completions-stream";
 import {
   OpenAIRequestAdapter,
   OpenAIResponseAdapter,
   OpenAIStreamAdapter,
 } from "./openai";
+import { PROXY_SDK_MAX_RETRIES } from "./sdk-retry-policy";
 
 // =============================================================================
 // TYPE ALIASES (reuse OpenAI types since Groq is OpenAI-compatible)
@@ -85,14 +94,11 @@ class GroqRequestAdapter
   applyToolResultUpdates(updates: Record<string, string>) {
     return this.delegate.applyToolResultUpdates(updates);
   }
-  applyToonCompression(model: string) {
-    return this.delegate.applyToonCompression(model);
-  }
   convertToolResultContent(messages: GroqMessages) {
     return this.delegate.convertToolResultContent(messages);
   }
-  toProviderRequest() {
-    return this.delegate.toProviderRequest();
+  toProviderRequest(options?: { preserveToolCallIds?: boolean }) {
+    return this.delegate.toProviderRequest(options);
   }
 }
 
@@ -131,6 +137,11 @@ class GroqResponseAdapter implements LLMResponseAdapter<GroqResponse> {
   toRefusalResponse(refusalMessage: string, contentMessage: string) {
     return this.delegate.toRefusalResponse(refusalMessage, contentMessage);
   }
+  withRewrittenToolCalls(
+    toolCalls: Array<{ id: string; name: string; arguments: string }>,
+  ) {
+    return this.delegate.withRewrittenToolCalls(toolCalls);
+  }
 }
 
 class GroqStreamAdapter
@@ -139,8 +150,8 @@ class GroqStreamAdapter
   readonly provider = "groq" as const;
   private delegate: OpenAIStreamAdapter;
 
-  constructor() {
-    this.delegate = new OpenAIStreamAdapter();
+  constructor(request?: GroqRequest) {
+    this.delegate = new OpenAIStreamAdapter({ clientRequest: request });
   }
 
   get state() {
@@ -156,11 +167,17 @@ class GroqStreamAdapter
   formatTextDeltaSSE(text: string) {
     return this.delegate.formatTextDeltaSSE(text);
   }
+  setTextSuffix(getSuffix: (completedText: string) => string) {
+    this.delegate.setTextSuffix(getSuffix);
+  }
   getRawToolCallEvents() {
     return this.delegate.getRawToolCallEvents();
   }
   formatCompleteTextSSE(text: string) {
     return this.delegate.formatCompleteTextSSE(text);
+  }
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]) {
+    return this.delegate.formatToolCallsSSE(toolCalls);
   }
   formatEndSSE() {
     return this.delegate.formatEndSSE();
@@ -196,8 +213,10 @@ export const groqAdapterFactory: LLMProvider<
     return new GroqResponseAdapter(response);
   },
 
-  createStreamAdapter(): LLMStreamAdapter<GroqStreamChunk, GroqResponse> {
-    return new GroqStreamAdapter();
+  createStreamAdapter(
+    request?: GroqRequest,
+  ): LLMStreamAdapter<GroqStreamChunk, GroqResponse> {
+    return new GroqStreamAdapter(request);
   },
 
   extractApiKey(headers: GroqHeaders): string | undefined {
@@ -220,18 +239,14 @@ export const groqAdapterFactory: LLMProvider<
     }
 
     const customFetch = options.agent
-      ? metrics.llm.getObservableFetch(
-          "groq",
-          options.agent,
-          options.source,
-          options.externalAgentId,
-        )
+      ? metrics.llm.getObservableFetch("groq", options.agent, options.source)
       : undefined;
 
     return new OpenAIProvider({
+      maxRetries: PROXY_SDK_MAX_RETRIES,
       apiKey,
       baseURL: options.baseUrl,
-      fetch: customFetch,
+      fetch: fetchWithAbortSignal(customFetch, options.abortSignal),
       defaultHeaders: options.defaultHeaders,
     });
   },
@@ -259,20 +274,26 @@ export const groqAdapterFactory: LLMProvider<
       stream_options: { include_usage: true },
     } as unknown as ChatCompletionCreateParamsStreaming;
 
-    const stream = await groqClient.chat.completions.create(groqRequest);
-
-    return {
-      [Symbol.asyncIterator]: async function* () {
-        for await (const chunk of stream) {
-          yield chunk as GroqStreamChunk;
-        }
-      },
-    };
+    return streamChatCompletionChunks<GroqStreamChunk>(
+      groqClient.chat.completions.create(groqRequest),
+    );
   },
 
   extractInternalCode(error: unknown): ArchestraInternalErrorCode | undefined {
     if (get(error, "error.code") === "context_length_exceeded") {
       return ArchestraInternalErrorCode.ContextLengthExceeded;
+    }
+    // Groq gives the transient throttle (429) and the "request bigger than the
+    // whole bucket" rejection (413) identical bodies, so the status is the only
+    // discriminator. Only the 413 is unretryable — without this it falls through
+    // to the status mapper and the user is told to shrink a payload that was
+    // never the problem.
+    const status = get(error, "status") ?? get(error, "statusCode");
+    if (
+      status === GROQ_REQUEST_EXCEEDS_BUCKET_STATUS &&
+      get(error, "error.code") === GroqErrorCodes.RATE_LIMIT_EXCEEDED
+    ) {
+      return ArchestraInternalErrorCode.RequestExceedsRateLimit;
     }
     return undefined;
   },

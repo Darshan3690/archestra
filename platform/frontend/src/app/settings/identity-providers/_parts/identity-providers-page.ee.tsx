@@ -1,22 +1,18 @@
 "use client";
 
 import {
-  E2eTestId,
+  BUILT_IN_IDENTITY_PROVIDER_IDS,
   IDENTITY_PROVIDER_ID,
-  IDENTITY_TRUSTED_PROVIDER_IDS,
   type IdentityProviderId,
-} from "@shared";
+} from "@archestra/shared";
+import { useSearchParams } from "next/navigation";
 import { useCallback, useState } from "react";
-import { EnterpriseLicenseRequired } from "@/components/enterprise-license-required";
-import { IdentityProviderIcon } from "@/components/identity-provider-icons.ee";
-import { LoadingSpinner } from "@/components/loading";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useIdentityProviders } from "@/lib/auth/identity-provider.query.ee";
-import config from "@/lib/config/config";
+import { useDialogUrlParam } from "@/lib/hooks/use-dialog-url-param";
 import { CreateIdentityProviderDialog } from "./create-identity-provider-dialog.ee";
 import { EditIdentityProviderDialog } from "./edit-identity-provider-dialog.ee";
+import type { IdentityProviderDialogSection } from "./identity-provider-dialog-shell.ee";
+import { IdentityProviderList } from "./identity-provider-list.ee";
 
 /** Configuration for a predefined identity provider card */
 interface IdpConfig {
@@ -40,6 +36,8 @@ interface IdpConfig {
   defaultOidcConfig?: {
     issuer: string;
     discoveryEndpoint: string;
+    /** Register without OIDC discovery (for providers that publish no discovery document) */
+    skipDiscovery?: boolean;
     authorizationEndpoint?: string;
     tokenEndpoint?: string;
     userInfoEndpoint?: string;
@@ -116,16 +114,10 @@ const IDP_CONFIGS: IdpConfig[] = [
     },
   },
   {
-    /**
-     * GitHub OAuth limitation: Users must have a public email set in their
-     * GitHub profile settings for SSO to work. This is because the SSO plugin
-     * only calls /user endpoint, not /user/emails.
-     * See: https://grafana.com/docs/grafana/latest/setup-grafana/configure-access/configure-authentication/github/
-     */
     id: "github",
     providerId: IDENTITY_PROVIDER_ID.GITHUB,
     name: "GitHub",
-    description: "Sign in with GitHub OAuth (requires public email)",
+    description: "Sign in with GitHub OAuth",
     bgColor: "bg-gray-50",
     hideProviderId: true,
     providerType: "oidc",
@@ -140,8 +132,14 @@ const IDP_CONFIGS: IdpConfig[] = [
        * GitHub OAuth doesn't have a standard OIDC discovery endpoint
        * https://stackoverflow.com/a/52164558
        * https://docs.github.com/en/actions/concepts/security/openid-connect
+       *
+       * Registration therefore has to skip discovery outright and rely on the
+       * endpoints below; without this the backend fetches
+       * `${issuer}/.well-known/openid-configuration`, GitHub answers 404, and
+       * creating the provider fails.
        */
       discoveryEndpoint: "",
+      skipDiscovery: true,
       authorizationEndpoint: "https://github.com/login/oauth/authorize",
       tokenEndpoint: "https://github.com/login/oauth/access_token",
       userInfoEndpoint: "https://api.github.com/user",
@@ -260,13 +258,29 @@ type IdentityProvider = NonNullable<
 >[number];
 
 export function IdentityProvidersSettingsContent() {
+  const searchParams = useSearchParams();
   const { data: identityProviders = [], isLoading } = useIdentityProviders();
   const [createConfig, setCreateConfig] = useState<{
     providerId: string;
     config: IdpConfig;
   } | null>(null);
-  const [editingProvider, setEditingProvider] =
-    useState<IdentityProvider | null>(null);
+
+  const editIdFromUrl = searchParams.get("edit");
+  const providerFromUrl =
+    identityProviders.find((item) => item.id === editIdFromUrl) ?? null;
+  const {
+    entity: editingProvider,
+    open: openEditDialog,
+    close: closeEditDialog,
+    openedFromUrl: editOpenedFromUrl,
+  } = useDialogUrlParam<IdentityProvider>({
+    paramName: "edit",
+    entityFromUrl: providerFromUrl,
+    alsoClearOnClose: ["section"],
+  });
+  const initialEditSection = editOpenedFromUrl
+    ? getDeepLinkedSection(searchParams.get("section"))
+    : undefined;
 
   // Find existing providers by matching provider ID
   const getProviderStatus = useCallback(
@@ -277,12 +291,12 @@ export function IdentityProvidersSettingsContent() {
           return p.providerId === config.providerId;
         }
 
-        // For generic providers (empty providerId), match by provider type as well
-        // Check if this is a non-trusted provider and matches the same type (OIDC vs SAML)
-        const isNonTrustedProvider = !IDENTITY_TRUSTED_PROVIDER_IDS.includes(
+        // For generic providers (empty providerId), match custom providers by
+        // provider type as well (OIDC vs SAML).
+        const isCustomProvider = !BUILT_IN_IDENTITY_PROVIDER_IDS.includes(
           p.providerId as IdentityProviderId,
         );
-        if (!isNonTrustedProvider) {
+        if (!isCustomProvider) {
           return false;
         }
 
@@ -301,7 +315,7 @@ export function IdentityProvidersSettingsContent() {
 
       if (existingProvider) {
         // Edit existing provider
-        setEditingProvider(existingProvider);
+        openEditDialog(existingProvider);
       } else {
         // Create new provider
         setCreateConfig({
@@ -310,64 +324,34 @@ export function IdentityProvidersSettingsContent() {
         });
       }
     },
-    [getProviderStatus],
+    [getProviderStatus, openEditDialog],
   );
 
-  // Show message if SSO feature is disabled (check before loading since query is disabled)
-  if (!config.enterpriseFeatures.core) {
-    return <EnterpriseLicenseRequired featureName="Identity Providers" />;
-  }
-
-  if (isLoading) return <LoadingSpinner />;
+  // Gating is handled by the parent (DisabledEnterpriseSection in
+  // identity-providers/page.tsx). When disabled the wrapper renders this UI
+  // dimmed and non-interactive, so we no longer short-circuit here.
+  if (isLoading) return null;
 
   return (
     <div>
-      <div className="grid grid-cols-1 gap-5 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
-        {IDP_CONFIGS.map((config) => {
-          const existingProvider = getProviderStatus(config);
-
-          return (
-            <Card
-              key={config.id}
-              className="cursor-pointer hover:shadow-md transition-shadow flex flex-col h-full"
-              onClick={() => handleProviderClick(config)}
-              data-testid={`${E2eTestId.IdentityProviderCard}-${config.id}`}
-            >
-              <CardHeader className="pb-3">
-                <div className="flex items-center justify-between">
-                  <div
-                    className={`p-2 rounded-lg ${config.bgColor} text-gray-900`}
-                  >
-                    <IdentityProviderIcon
-                      providerId={config.providerId || config.id}
-                      size={24}
-                    />
-                  </div>
-                  <Badge variant={existingProvider ? "default" : "secondary"}>
-                    {existingProvider ? "Enabled" : "Not enabled"}
-                  </Badge>
-                </div>
-                <CardTitle className="text-lg">{config.name}</CardTitle>
-              </CardHeader>
-              <CardContent className="flex flex-col flex-1">
-                <div className="flex-1 min-h-[2.5rem] flex flex-col justify-end mb-4">
-                  <p className="text-sm text-muted-foreground">
-                    {config.description}
-                  </p>
-                </div>
-                <Button
-                  variant={existingProvider ? "outline" : "default"}
-                  size="sm"
-                  className="w-full"
-                  data-testid={`${E2eTestId.IdentityProviderOpenDialogButton}-${config.id}`}
-                >
-                  {existingProvider ? "Edit" : "Enable"}
-                </Button>
-              </CardContent>
-            </Card>
-          );
+      <IdentityProviderList
+        providers={IDP_CONFIGS.map((config) => {
+          const existing = getProviderStatus(config);
+          return {
+            id: config.id,
+            providerId: config.providerId,
+            name: config.name,
+            description: config.description,
+            protocol: config.providerType,
+            configured: !!existing,
+            signInEnabled: existing?.ssoLoginEnabled ?? false,
+          };
         })}
-      </div>
+        onSelect={(id) => {
+          const config = IDP_CONFIGS.find((item) => item.id === id);
+          if (config) handleProviderClick(config);
+        }}
+      />
 
       {/* Create Dialog */}
       {createConfig && (
@@ -439,9 +423,18 @@ export function IdentityProvidersSettingsContent() {
         <EditIdentityProviderDialog
           identityProviderId={editingProvider.id}
           open={!!editingProvider}
-          onOpenChange={(open) => !open && setEditingProvider(null)}
+          onOpenChange={(open) => !open && closeEditDialog()}
+          initialSection={initialEditSection}
         />
       )}
     </div>
   );
+}
+
+function getDeepLinkedSection(
+  section: string | null,
+): IdentityProviderDialogSection | undefined {
+  return section === "team-sync" || section === "role-mapping"
+    ? section
+    : undefined;
 }

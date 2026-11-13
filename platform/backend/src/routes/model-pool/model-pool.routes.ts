@@ -1,0 +1,245 @@
+import { RouteId, SupportedProvidersSchema } from "@archestra/shared";
+import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
+import { z } from "zod";
+import { AUTO_MODEL, isAutoModel } from "@/auto-routing/router";
+import config from "@/config";
+import { LlmProviderApiKeyModel, ModelPoolModel } from "@/models";
+import { listChatModelPools } from "@/services/chat-model-pools";
+import {
+  ApiError,
+  constructResponseSchema,
+  type ModelPoolInput,
+  ModelPoolInputSchema,
+  ModelPoolWithHealthSchema,
+  SelectModelPoolSchema,
+} from "@/types";
+import { withMemberHealth } from "../proxy/model-pool-failover";
+import { isPoolableProvider } from "../proxy/model-pool-transport";
+
+const ModelPoolParamsSchema = z.object({ id: z.string().uuid() });
+
+const modelPoolRoutes: FastifyPluginAsyncZod = async (fastify) => {
+  fastify.get(
+    "/api/model-pools",
+    {
+      schema: {
+        operationId: RouteId.GetModelPools,
+        description:
+          "List the organization's model pools with their members, and which members are benched after a failure",
+        tags: ["Model Pools"],
+        response: constructResponseSchema(z.array(ModelPoolWithHealthSchema)),
+      },
+    },
+    async ({ organizationId }, reply) => {
+      assertModelPoolsEnabled();
+      return reply.send(
+        await withMemberHealth(await ModelPoolModel.list(organizationId)),
+      );
+    },
+  );
+
+  fastify.get(
+    "/api/model-pools/available",
+    {
+      schema: {
+        operationId: RouteId.GetAvailableModelPools,
+        description:
+          "List the model pools the current user can pick in chat: those with a member on a key the user may use",
+        tags: ["Model Pools"],
+        response: constructResponseSchema(
+          z.array(
+            z.object({
+              id: z.string().uuid(),
+              name: z.string(),
+              providers: z.array(SupportedProvidersSchema),
+            }),
+          ),
+        ),
+      },
+    },
+    async ({ organizationId, user }, reply) =>
+      reply.send(await listChatModelPools({ organizationId, userId: user.id })),
+  );
+
+  fastify.post(
+    "/api/model-pools",
+    {
+      schema: {
+        operationId: RouteId.CreateModelPool,
+        description:
+          "Create a model pool: a model name served by provider keys on any provider, each with its own model id, tried by priority and split by weight",
+        tags: ["Model Pools"],
+        body: ModelPoolInputSchema,
+        response: constructResponseSchema(SelectModelPoolSchema),
+      },
+    },
+    async ({ organizationId, user, body }, reply) => {
+      assertModelPoolsEnabled();
+      assertNameNotReserved(body);
+      await assertValidMembers({
+        organizationId,
+        userId: user.id,
+        input: body,
+      });
+      await assertNameHasNoOtherPool({ organizationId, input: body });
+      return reply.send(
+        await ModelPoolModel.create({ organizationId, input: body }),
+      );
+    },
+  );
+
+  fastify.put(
+    "/api/model-pools/:id",
+    {
+      schema: {
+        operationId: RouteId.UpdateModelPool,
+        description: "Replace a model pool's settings and members",
+        tags: ["Model Pools"],
+        params: ModelPoolParamsSchema,
+        body: ModelPoolInputSchema,
+        response: constructResponseSchema(SelectModelPoolSchema),
+      },
+    },
+    async ({ organizationId, user, params, body }, reply) => {
+      assertModelPoolsEnabled();
+      assertNameNotReserved(body);
+      const existing = await ModelPoolModel.findById({
+        organizationId,
+        id: params.id,
+      });
+      if (!existing) throw new ApiError(404, "Model pool not found");
+      await assertValidMembers({
+        organizationId,
+        userId: user.id,
+        input: body,
+        retainedMembers: existing.members,
+      });
+      await assertNameHasNoOtherPool({
+        organizationId,
+        input: body,
+        poolId: params.id,
+      });
+      const pool = await ModelPoolModel.update({
+        organizationId,
+        id: params.id,
+        input: body,
+      });
+      if (!pool) throw new ApiError(404, "Model pool not found");
+      return reply.send(pool);
+    },
+  );
+
+  fastify.delete(
+    "/api/model-pools/:id",
+    {
+      schema: {
+        operationId: RouteId.DeleteModelPool,
+        description: "Delete a model pool",
+        tags: ["Model Pools"],
+        params: ModelPoolParamsSchema,
+        response: constructResponseSchema(z.object({ success: z.boolean() })),
+      },
+    },
+    async ({ organizationId, params }, reply) => {
+      assertModelPoolsEnabled();
+      const deleted = await ModelPoolModel.delete({
+        organizationId,
+        id: params.id,
+      });
+      if (!deleted) throw new ApiError(404, "Model pool not found");
+      return reply.send({ success: true });
+    },
+  );
+};
+
+/** Model pools are a beta feature: while off, their API is not there. */
+function assertModelPoolsEnabled(): void {
+  if (!config.llmProxy.modelPoolsEnabled) {
+    throw new ApiError(404, "Not found");
+  }
+}
+
+/** "auto" and "auto:<name>" name auto routers, which a pool must not shadow. */
+function assertNameNotReserved(input: ModelPoolInput): void {
+  if (isAutoModel(input.name)) {
+    throw new ApiError(
+      400,
+      `"${AUTO_MODEL}" and names starting with "${AUTO_MODEL}:" are reserved for auto routers. Pick another pool name.`,
+    );
+  }
+}
+
+/** One pool per name: a request has to know which pool it belongs to. */
+async function assertNameHasNoOtherPool(params: {
+  organizationId: string;
+  input: ModelPoolInput;
+  poolId?: string;
+}): Promise<void> {
+  const existing = await ModelPoolModel.findIdByName({
+    organizationId: params.organizationId,
+    name: params.input.name,
+  });
+  if (existing && existing !== params.poolId) {
+    throw new ApiError(
+      409,
+      `A pool named ${params.input.name} already exists.`,
+    );
+  }
+}
+
+/**
+ * Members must be distinct keys of this organization on a reachable provider.
+ * Users may add their own personal subscriptions/keys; request planning keeps
+ * those members private even when the pool is granted to another caller.
+ */
+async function assertValidMembers(params: {
+  organizationId: string;
+  userId: string;
+  input: ModelPoolInput;
+  retainedMembers?: ModelPoolInput["members"];
+}): Promise<void> {
+  const retained = new Set(
+    params.retainedMembers?.map(
+      (member) => `${member.providerApiKeyId}:${member.modelId}`,
+    ),
+  );
+  const seen = new Set<string>();
+  for (const member of params.input.members) {
+    const id = `${member.providerApiKeyId}:${member.modelId}`;
+    if (seen.has(id)) {
+      throw new ApiError(
+        400,
+        "A provider key can serve a model in a pool only once.",
+      );
+    }
+    seen.add(id);
+  }
+  const ids = [...new Set(params.input.members.map((m) => m.providerApiKeyId))];
+  const keys = await LlmProviderApiKeyModel.findByIds(ids);
+  const byId = new Map(keys.map((key) => [key.id, key]));
+  for (const id of ids) {
+    const key = byId.get(id);
+    if (!key || key.organizationId !== params.organizationId) {
+      throw new ApiError(400, `Provider key ${id} not found.`);
+    }
+    const addsMember = params.input.members.some(
+      (member) =>
+        member.providerApiKeyId === id &&
+        !retained.has(`${id}:${member.modelId}`),
+    );
+    if (key.userId !== null && key.userId !== params.userId && addsMember) {
+      throw new ApiError(
+        400,
+        `Provider key "${key.name}" belongs to another user; only your own personal connections can be added.`,
+      );
+    }
+    if (!isPoolableProvider(key.provider)) {
+      throw new ApiError(
+        400,
+        `Provider key "${key.name}" is on ${key.provider}, which a pool can't send requests to yet.`,
+      );
+    }
+  }
+}
+
+export default modelPoolRoutes;

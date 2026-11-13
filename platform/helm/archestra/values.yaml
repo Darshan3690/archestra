@@ -9,7 +9,7 @@ archestra:
   # We use the "generic" updater with inline annotation to preserve YAML comments throughout the file.
   # See: https://github.com/googleapis/release-please/blob/main/docs/customizing.md#updating-arbitrary-files
   # See: https://github.com/googleapis/release-please/issues/2195
-  imageTag: "1.2.45" # x-release-please-version
+  imageTag: "1.5.0-rc.31" # x-release-please-version
 
   # Image pull policy for the Archestra container
   # Options: Always, IfNotPresent, Never
@@ -20,7 +20,105 @@ archestra:
   # as the HPA will manage the replica count dynamically
   replicaCount: 1
 
-  # Annotations to add to pods created by the Deployment
+  # null derives max(request drain, worker timeout) + cleanup + 40 seconds.
+  # An explicit value must cover that budget. Applies to web and worker pods.
+  terminationGracePeriodSeconds: null
+  shutdown:
+    # null preserves envFrom, envFromSecrets and envWithValueFrom sources.
+    # Runtime defaults are 60s drain, 20s cleanup and 30s worker task timeout.
+    # Set explicit values here to override imported environment settings.
+    requestDrainSeconds: null
+    cleanupSeconds: null
+    workerTaskTimeoutSeconds: null
+
+  # Optional database connection budgeting across all backend pods.
+  # When configured, Helm divides the budget across peak web and worker pods,
+  # including HPA scale-out, surge, and a terminating old revision.
+  database:
+    # null preserves existing pool configuration or the backend default of 50
+    # query connections per pod. Set a budget to enable automatic pool sizing.
+    # Each peak pod needs at least 13 connections: 1 query, 10 cache, 2 listeners.
+    # Explicitly undersized budgets fail Helm rendering.
+    # Keep the budget below PostgreSQL max_connections, reserving capacity for
+    # migrations, monitoring, administration, and other database clients.
+    # For the bundled database, 200 leaves 50 of its 250 connections in reserve.
+    connectionBudget: null
+    # Optional fixed per-pod override. Prefer connectionBudget so scaling the
+    # chart automatically reduces each pod's pool allocation.
+    poolMax: null
+    # With unprefixed envFrom, null preserves inherited pool configuration on
+    # upgrade (or the backend default if the source supplies no pool limit).
+    # true explicitly uses the bulk pool value; false uses chart sizing when
+    # connectionBudget is set.
+    poolMaxFromEnvFrom: null
+    # Amazon RDS / Aurora IAM database authentication.
+    # Generates a fresh 15-minute IAM token per new connection in the query
+    # pool, cache pool, LISTEN/NOTIFY client, and migration Job, using the pod's
+    # AWS credentials (IRSA, EKS Pod Identity, OIDC token projection, or env/secret
+    # credentials) and verifying the RDS TLS certificate with the bundled cloud
+    # database CA certificates.
+    iamAuth:
+      enabled: false
+      # Optional AWS region for RDS IAM token signing. Derived from the RDS
+      # endpoint hostname or AWS_REGION / AWS_DEFAULT_REGION when left empty.
+      awsRegion: ""
+      # Optional IAM role ARN for RDS IAM authentication.
+      # - On EKS (injectWebIdentityTokenVolume: false): automatically sets
+      #   `eks.amazonaws.com/role-arn` on the platform ServiceAccount (IRSA) unless
+      #   already set in `archestra.orchestrator.kubernetes.serviceAccount.annotations`.
+      # - On non-EKS clusters with OIDC federation (injectWebIdentityTokenVolume: true):
+      #   sets `AWS_ROLE_ARN` on the web, worker, and migration Job pods.
+      roleArn: ""
+      # Mount a projected Kubernetes ServiceAccount token volume (`aws-iam-token`)
+      # and set `AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE` on web, worker,
+      # and migration Job pods. Enable this on non-EKS Kubernetes clusters (GKE,
+      # AKS, kind, on-prem) federated with an AWS IAM OIDC identity provider.
+      # Leave false on EKS (where the EKS Pod Identity Webhook or Pod Identity
+      # Agent injects credentials automatically).
+      injectWebIdentityTokenVolume: false
+      # Audience for the projected ServiceAccount token when
+      # injectWebIdentityTokenVolume is true.
+      webIdentityTokenAudience: "sts.amazonaws.com"
+      # Expiration (in seconds) for the projected ServiceAccount token when
+      # injectWebIdentityTokenVolume is true.
+      webIdentityTokenExpirationSeconds: 3600
+    # Google Cloud SQL Auth Proxy, run as a native sidecar (Kubernetes 1.29+)
+    # in the web, worker, and migration Job pods. The proxy opens a TLS
+    # connection to the instance with an ephemeral client certificate and, with
+    # --auto-iam-authn, logs in as the pod's Google service account (Workload
+    # Identity), so no database password is needed anywhere.
+    #
+    # Point postgresql.external_database_url at the proxy and the IAM user:
+    #   postgresql://<sa-name>%40<project>.iam@127.0.0.1:5432/<database>?sslmode=disable
+    # (traffic to 127.0.0.1 never leaves the pod; the proxy encrypts the rest),
+    # set postgresql.enabled=false, and annotate the platform ServiceAccount
+    # with iam.gke.io/gcp-service-account.
+    cloudSqlProxy:
+      enabled: false
+      # project:region:instance
+      instanceConnectionName: ""
+      image:
+        repository: gcr.io/cloud-sql-connectors/cloud-sql-proxy
+        tag: "2.26.3"
+        digest: "sha256:f333a9c59890c3c67b8505166c5dbdcc0b29fca9173a2e09ca0446ab6997a736"
+      # Local port the application connects to on 127.0.0.1.
+      port: 5432
+      # Port of the proxy's health endpoints, used by the startup probe.
+      healthPort: 9801
+      # Extra flags. Defaults connect over the VPC and log in with IAM.
+      args:
+        - --private-ip
+        - --auto-iam-authn
+        - --structured-logs
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          memory: 256Mi
+
+  # Annotations to add to the web and worker pods (the worker always points
+  # prometheus.io/port and prometheus.io/path at its own metrics endpoint)
   # This is useful for integrations that require pod-level annotations, such as:
   # - Service mesh sidecars (Istio, Linkerd)
   # - Prometheus scraping
@@ -42,7 +140,32 @@ archestra:
   #     azure.workload.identity/use: "true"
   podLabels: {}
 
-  # Node selector for scheduling pods on specific nodes
+  # Pod-level securityContext for the web, worker, and migration pods.
+  # RuntimeDefault applies the container runtime's default syscall filter,
+  # which the platform image runs under unchanged.
+  podSecurityContext:
+    seccompProfile:
+      type: RuntimeDefault
+
+  # Container-level securityContext for the web, worker, and migration
+  # containers and the chart's init containers (the Cloud SQL Auth Proxy
+  # sidecar keeps its own). Processes in the platform image never gain
+  # privileges through setuid binaries, so privilege escalation stays off.
+  # To harden further, add for example:
+  #   capabilities:
+  #     drop: ["ALL"]
+  # The platform image runs as root today, so runAsNonRoot is not supported
+  # yet, and readOnlyRootFilesystem needs writable emptyDir mounts (see
+  # extraVolumes) for /tmp, /var/log/supervisor, and /var/run.
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+
+  # Shared scheduling defaults for web and worker pods.
+  # Each field can be overridden independently in archestra.web / archestra.worker.
+  # Missing or null overrides inherit; {} (nodeSelector/affinity) or [] (tolerations)
+  # clears the corresponding shared value. Overrides replace the whole field.
+  #
+  # Node selector for scheduling the web and worker pods on specific nodes
   # This is useful for targeting specific node pools or nodes with particular labels
   # See: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector
   # Example:
@@ -52,7 +175,7 @@ archestra:
   #     node.kubernetes.io/instance-type: m5.large
   nodeSelector: {}
 
-  # Tolerations for scheduling pods on nodes with specific taints
+  # Tolerations for scheduling the web and worker pods on nodes with specific taints
   # This is useful for running pods on dedicated or specialized nodes (e.g., GPU nodes, spot instances)
   # See: https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/
   # Example:
@@ -66,6 +189,66 @@ archestra:
   #       effect: "NoExecute"
   #       tolerationSeconds: 300
   tolerations: []
+
+  # Affinity rules for the web and worker pods
+  # Use this for node affinity or pod (anti-)affinity
+  # See: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity
+  #
+  # Web and worker pods share app.kubernetes.io/instance (the release name) and
+  # differ by app.kubernetes.io/component (web or worker). matchLabelKeys makes a
+  # pod (anti-)affinity term match only pods of the same component (Kubernetes
+  # 1.31+). Replace "archestra" with your release name.
+  # Example (prefer one pod per node, counted separately for web and worker):
+  #   affinity:
+  #     podAntiAffinity:
+  #       preferredDuringSchedulingIgnoredDuringExecution:
+  #         - weight: 100
+  #           podAffinityTerm:
+  #             topologyKey: kubernetes.io/hostname
+  #             labelSelector:
+  #               matchLabels:
+  #                 app.kubernetes.io/instance: archestra
+  #             matchLabelKeys:
+  #               - app.kubernetes.io/component
+  affinity: {}
+
+  # Separate node pool example (under archestra; use your cluster's labels/taints):
+  #   web:
+  #     nodeSelector:
+  #       nodepool: general-purpose
+  #     tolerations: []
+  #   worker:
+  #     enabled: true
+  #     nodeSelector:
+  #       nodepool: memory-optimized
+  #     tolerations:
+  #       - key: dedicated
+  #         operator: Equal
+  #         value: workers
+  #         effect: NoSchedule
+  # A toleration permits placement on tainted nodes; the selector constrains it.
+  # Required node affinity and nodeSelector must both match the target nodes.
+  # Topology spread remains shared; omitted selectors default to each Deployment.
+  # Migration Jobs and network policy probes keep the shared selector/tolerations.
+  #
+  # Scheduling for the main platform Deployment (also when worker.enabled=false).
+  # null inherits the corresponding shared value above; {} / [] clears it.
+  web:
+    nodeSelector: null
+    tolerations: null
+    affinity: null
+
+  # Topology spread constraints for the web and worker pods
+  # Use this to spread replicas across availability zones or nodes
+  # A constraint without a labelSelector gets each Deployment's own pod
+  # selector, so web pods and worker pods each spread on their own.
+  # See: https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/
+  # Example (spread web pods and worker pods evenly across zones):
+  #   topologySpreadConstraints:
+  #     - maxSkew: 1
+  #       topologyKey: topology.kubernetes.io/zone
+  #       whenUnsatisfiable: DoNotSchedule
+  topologySpreadConstraints: []
 
   # Deployment strategy configuration for the Deployment
   # See https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/deployment-v1/#:~:text=strategy%20(DeploymentStrategy)
@@ -108,6 +291,15 @@ archestra:
     existingSecretName: ""
     # Key within existingSecretName containing the auth secret value.
     existingSecretKey: auth-secret
+    # Keys within existingSecretName containing the session-signing,
+    # secret-encryption, and OpenAPPA offer-signing secrets. Only valid with
+    # existingSecretName. Override them to store every value under an
+    # env-var-safe key (for example ARCHESTRA_AUTH_SESSION_SECRET), so the same
+    # Secret can also be loaded through archestra.envFrom without kubelet
+    # warning about invalid environment variable names.
+    existingSessionSecretKey: session-secret
+    existingSecretsEncryptionSecretKey: secrets-encryption-secret
+    existingOfferSigningSecretKey: offer-signing-secret
     # Extra key/value pairs to add to the Helm-managed <release>-auth Secret.
     # This is useful when you want to mount additional secret-backed files from
     # the same Secret via archestra.extraVolumes, without creating a second Secret.
@@ -167,8 +359,27 @@ archestra:
   #         optional: true
   envFrom: []
 
-  # Additional volumes to mount into the platform and worker pods
+  # code execution runtime configuration. The chart deploys no Dagger Engine: the
+  # backend provisions one per organization (and per environment) through the
+  # Kubernetes API, using the mcp-manager Role below.
+  codeRuntime:
+    # backend gate for the code execution runtime, surfaced as
+    # ARCHESTRA_CODE_RUNTIME_ENABLED. Enabled by default: with the orchestrator
+    # (Kubernetes) configured, the backend provisions per-organization Dagger
+    # engines in code. Set to false to deploy without a code sandbox.
+    enabled: true
+
+    # runtime limits (timeouts, concurrency, output caps) and engine sizing are
+    # env-driven via ARCHESTRA_SKILLS_SANDBOX_* / ARCHESTRA_DAGGER_RUNTIME_* in
+    # archestra.env. To run your own engine instead of the code-managed ones, set
+    # archestra.env.ARCHESTRA_CODE_RUNTIME_DAGGER_RUNNER_HOST and grant the
+    # platform ServiceAccount pods/exec in that engine's namespace.
+
+  # Additional volumes to mount into the platform and worker pods, and into the
+  # migration Job (except persistentVolumeClaim volumes, which the Job skips
+  # because it runs while web/worker pods still hold their claims).
   # Useful for mounting credential files such as a Vertex AI service account key
+  # or a database CA bundle
   # Example:
   #   extraVolumes:
   #     - name: vertex-ai-credentials
@@ -179,7 +390,8 @@ archestra:
   #             path: vertex-ai-key.json
   extraVolumes: []
 
-  # Additional volume mounts for the platform and worker containers
+  # Additional volume mounts for the platform and worker containers, and the
+  # migration Job (mounts of skipped persistentVolumeClaim volumes are dropped)
   # Example:
   #   extraVolumeMounts:
   #     - name: vertex-ai-credentials
@@ -203,6 +415,22 @@ archestra:
     # Set to a positive integer such as 1 to enable during targeted investigations.
     heapSnapshotsNearHeapLimit: 0
 
+  # Persistent "My Files" file storage. provider "db" (default) keeps bytes in
+  # Postgres; "filesystem" stores them on a PVC. When filesystem, the chart
+  # creates a PVC unless `existingClaim` names a pre-provisioned one.
+  fileStorage:
+    provider: db
+    filesystem:
+      mountPath: /data/archestra_results
+      size: 50Gi
+      # "" uses the cluster default StorageClass.
+      storageClassName: ""
+      # multi-replica / HPA needs ReadWriteMany.
+      accessModes:
+        - ReadWriteOnce
+      # set to reuse a pre-provisioned PVC instead of a chart-created one.
+      existingClaim: ""
+
   # Init containers configuration
   initContainers:
     # Wait for PostgreSQL to be ready before starting the application
@@ -210,6 +438,22 @@ archestra:
     # or if you handle readiness checks in another way
     waitForPostgres:
       enabled: true
+      # Maximum seconds to wait for PostgreSQL to become reachable before the
+      # init container gives up and fails. Without a bound, a database that
+      # never comes up leaves the pod stuck in PodInitializing indefinitely
+      # (and any `helm install --atomic` hits its own timeout with no clear
+      # cause). The setup-postgres-extensions init container uses the same budget.
+      timeoutSeconds: 300
+
+    # Worker pods only: block startup until the web Deployment has applied
+    # database migrations. This gate covers fresh installs. Upgrades are covered
+    # by archestra.migrationJob, because the platform Service can still route to
+    # previous-revision web pods while the new release is rolling out.
+    waitForMigrations:
+      enabled: true
+      # Maximum seconds to wait for the web Deployment to finish migrations
+      # before the init container gives up and fails.
+      timeoutSeconds: 600
 
     # Vault secret injection init container
     # Similar to Vault Agent Injector (writes secrets to a shared volume) but:
@@ -236,11 +480,118 @@ archestra:
 
     # Image used by the wait-for-postgres init container.
     # Override to pull from a private registry when Docker Hub is inaccessible.
-    busyboxImage: "busybox:1.36"
+    busyboxImage: "docker.io/library/busybox:1.36"
+    # Digest pinned onto the default busyboxImage when no busyboxImageRegistry
+    # is set, so a moved upstream tag cannot change what runs. A custom image
+    # or registry is used as configured. Empty disables the pin.
+    busyboxImageDigest: "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
+    # Optional registry (and mirror path prefix) replacing the image's registry.
+    # Preserves its repository and tag/digest, including future chart updates.
+    # Example: mirror.example.com/dockerhub -> mirror.example.com/dockerhub/library/busybox:1.36
+    # Empty keeps busyboxImage unchanged. Also applies to network policy probes.
+    busyboxImageRegistry: ""
 
     # Resource requests/limits applied to ALL init containers.
     # Required on clusters that enforce ResourceQuota (e.g., OpenShift restricted-v2 SCC).
     resources: {}
+
+  # Database migration Job.
+  #
+  # Runs tracked Drizzle migrations under the platform advisory lock as a
+  # Helm pre-upgrade hook, before web and worker Deployments roll. Disabling it
+  # also disables migrations in web pod startup, for pipelines that apply them
+  # out of band.
+  #
+  # For external Postgres, reference the same existing Secret here and through
+  # archestra.envWithValueFrom. This keeps credentials out of Helm values.
+  migrationJob:
+    enabled: true
+    # Number of retries before the Job is marked failed and aborts the upgrade.
+    backoffLimit: 3
+    # Hard cap on Job runtime. Set to null to disable the deadline.
+    activeDeadlineSeconds: 600
+    # PostgreSQL lock_timeout for the migration session (via PGOPTIONS). The
+    # pre-upgrade hook runs while the previous release's pods still serve
+    # traffic, so DDL waiting on an ACCESS EXCLUSIVE lock would queue behind
+    # live queries and stall every later query on that table until it gets the
+    # lock. With a lock_timeout the migration fails fast instead (retried per
+    # backoffLimit; the upgrade aborts cleanly rather than freezing traffic).
+    # Accepts any PostgreSQL duration (e.g. "5s", "2500ms"). Set to null to
+    # disable. Ignored when you provide your own PGOPTIONS via migrationJob.env.
+    lockTimeout: 5s
+    # Resource requests/limits for the migration container.
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        memory: "2Gi"
+    # Extra environment variables rendered before the database env. Use
+    # this only when ARCHESTRA_DATABASE_URL contains Kubernetes $(VAR)
+    # references, such as $(PGPASSWORD), that the hook must expand.
+    env: {}
+    # Extra secret-backed environment variables rendered before database env. This
+    # is the recommended hook-only option when ARCHESTRA_DATABASE_URL contains
+    # $(PGPASSWORD):
+    #   - name: PGPASSWORD
+    #     secretName: my-db-secret
+    #     secretKey: password
+    envFromSecrets: []
+    # Extra valueFrom environment variables rendered before database env.
+    envWithValueFrom: []
+    # Extra envFrom entries for the migration Job.
+    envFrom: []
+    serviceAccount:
+      # Run the Job under a hook-only <fullname>-migrate ServiceAccount, created
+      # right before it on each upgrade with the platform ServiceAccount's
+      # annotations and imagePullSecrets. Without it, the Job uses the platform
+      # ServiceAccount, which Helm updates only after the hook: a changed
+      # annotation such as iam.gke.io/gcp-service-account reaches the Job one
+      # upgrade late. Grant the cloud identity to this account name too, or the
+      # Job loses it: on GKE, roles/iam.workloadIdentityUser for
+      # serviceAccount:<project>.svc.id.goog[<namespace>/<fullname>-migrate] on
+      # the Google service account; on EKS, the role's trust-policy subject
+      # system:serviceaccount:<namespace>:<fullname>-migrate.
+      create: false
+    # Whether the migration pod mounts a Kubernetes API token. Migrations
+    # never call the Kubernetes API, so null (the default) mounts none unless
+    # initContainers.vaultSecrets is enabled, whose Vault Kubernetes login
+    # reads it. Cloud identities (GKE Workload Identity, EKS IRSA and Pod
+    # Identity, Azure Workload Identity) and iamAuth.injectWebIdentityTokenVolume
+    # do not depend on it. Set true or false to override.
+    automountServiceAccountToken: null
+
+  # Verifies that this cluster actually enforces NetworkPolicy, by running the
+  # experiment rather than inferring it. After each install/upgrade two throwaway
+  # busybox pods probe the same target; a deny-all egress policy selects only one
+  # of them. Reachable from both means nothing enforces, and every egress rule
+  # configured in the UI would be silently ignored. The result is printed in the
+  # helm output.
+  #
+  # This cannot be answered from the API: GKE with the Calico addon on but node
+  # enforcement off serves the Calico CRDs while enforcing nothing, and GKE
+  # Dataplane V2, kindnet and the EKS VPC CNI enforce while publishing no CRD.
+  #
+  # Never fails the release — both pods always exit 0. The pods are left behind
+  # deliberately; their termination messages carry the verdict, and the platform
+  # reads them to decide what the environments screen reports.
+  #
+  # Nothing else in the namespace may select the pod label
+  # `archestra.io/netpol-probe-role: treatment`: NetworkPolicy is additive, so a
+  # policy that also allows its egress would report a cluster that enforces as
+  # one that does not.
+  networkPolicyProbe:
+    # Disable if the probe pods cannot run on this cluster — an unmirrored
+    # busybox image, a taint they cannot tolerate, a restrictive PodSecurity
+    # policy. Helm waits for hook pods, so one that never starts fails the
+    # release, and this is the way out.
+    enabled: true
+    # Empty means the platform's own Service. Any replacement must be an
+    # in-cluster ClusterIP address, and must not be cluster DNS or the
+    # Kubernetes API: both are reached over node-local paths that several
+    # dataplanes leave unfiltered, which reports an unenforced cluster as
+    # enforcing.
+    targetHost: ""
 
   # Resource requests and limits for the Archestra container
   # See: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
@@ -253,6 +604,24 @@ archestra:
       memory: "2Gi"
     limits:
       memory: "3Gi"
+
+  # Memory inside the web container that is NOT available to the backend's V8
+  # heap, because the same container also runs the Next.js server (and
+  # supervisord) under one memory limit.
+  #
+  # The launcher sizes --max-old-space-size as a percentage of the container's
+  # memory limit. Without this, that percentage is taken over memory the backend
+  # does not solely own, so the heap ceiling it is granted plus the co-located
+  # processes can exceed the limit — and the cgroup kills the container before V8
+  # ever reaches its own ceiling. That turns a diagnosable JS heap OOM into an
+  # opaque SIGKILL, and the stall while it happens fails the probes too.
+  # Subtracting the reservation first restores the intended ordering: V8 reaches
+  # its ceiling, throws, and leaves a stack behind.
+  #
+  # Sized from a measured Next.js server (~150 MiB resident) plus headroom for
+  # growth under load and for supervisord. Only the web container sets this — the
+  # workers run a single Node process and reserve nothing.
+  webContainerReservedMemoryMib: 384
 
   # Kubernetes probe configuration for the platform and worker containers.
   # See: https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/
@@ -279,22 +648,126 @@ archestra:
       timeoutSeconds: 45
       failureThreshold: 3
 
+  # Digests of the images released with this chart's version (the platform,
+  # MCP server base, p4 shim, Agent catalog images), filled in by the release
+  # pipeline. The chart pins the platform image and the platform pins its
+  # default images to them, so an install runs exactly the images released and
+  # attested with it. Leave it as is: a mirror or an
+  # explicit image setting is used as configured, and charts built outside a
+  # release ship none, so the images follow their version tags.
+  releaseImageDigests: {}
+
   # Configuration for the MCP Server Runtime
   orchestrator:
     # Base image for MCP server containers
-    # If not set, defaults to "europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/mcp-server-base:latest"
+    # Default: "ghcr.io/archestra-ai/mcp-server-base:1.5.0-rc.31" # x-release-please-version
+    # (released charts pin it to its digest; see releaseImageDigests)
     baseImage: ""
+
+    # Resource requests/limits applied to generated MCP server containers
+    # (Kubernetes quantities, e.g. "128Mi", "1Gi", "250m"). Ephemeral-storage
+    # governance keeps the scheduler disk-aware and prevents DiskPressure
+    # eviction cascades on over-packed nodes. Leave empty to use the platform
+    # defaults shown in the comments.
+    mcpServerResources:
+      requests:
+        cpu: "" # default: 50m
+        memory: "" # default: 128Mi
+        ephemeralStorage: "" # default: 256Mi
+      limits:
+        memory: "" # default: 512Mi
+        ephemeralStorage: "" # default: 1Gi
+
+    # How often (in seconds) the platform garbage-collects Failed/Evicted MCP
+    # server pods left behind by node-pressure eviction cascades.
+    # Leave empty for the default (600). Set to 0 to disable the reaper.
+    failedPodReapIntervalSeconds: ""
+
+    # How long (in seconds) an idle MCP server pod sits unused before the
+    # platform scales it to zero, waking it again on the next tool call.
+    # Leave empty for the default (1800). Values are floored at 120 so a
+    # server is never hibernated between two normal consecutive tool calls;
+    # an explicit 0 is the operator's kill switch.
+    mcpIdleHibernationSeconds: ""
+
+    # Keeps every node's image cache warm for the MCP servers idle hibernation
+    # can scale to zero, so a wake is fast and survives a registry outage even
+    # on a node the autoscaler added a minute ago. The platform reconciles a
+    # DaemonSet in the MCP namespace whose init containers pull each image and
+    # exit; the images stay on the node because MCP pods pull IfNotPresent.
+    #
+    # It only runs when idle hibernation itself runs, and pre-pulling is an
+    # optimisation throughout: nothing here can block or fail a hibernate, a
+    # wake, an install or a tool call.
+    mcpImagePrepull:
+      # "false" is the kill switch that stops pre-pulling while leaving
+      # hibernation on — for clusters where the extra per-node pod is
+      # unwelcome, or whose Role cannot be granted DaemonSet permissions.
+      # Empty means pre-pulling follows idle hibernation.
+      enabled: ""
+
+      # PriorityClass for the DaemonSet's pods. Empty uses the namespace
+      # default. Point this at a low or negative-priority class (for example a
+      # cluster's "best-effort" class) so warming a cache can never preempt a
+      # real workload.
+      priorityClassName: ""
+
+      # Image for the DaemonSet's own containers (the noop bootstrap and the
+      # keepalive) — never the MCP server base image, whose contents are an
+      # operator's choice. It must provide a statically linked /bin/busybox:
+      # the platform copies that binary into arbitrary MCP images, which may
+      # use a different libc. Override this with a static private mirror when
+      # Docker Hub is unavailable.
+      bootstrapImage: "docker.io/library/busybox:1.36-musl"
+      # Digest pinned onto the default bootstrapImage when no
+      # bootstrapImageRegistry is set. A custom image or registry is used as
+      # configured. Empty disables the pin.
+      bootstrapImageDigest: "sha256:3c6ae8008e2c2eedd141725c30b20d9c36b026eb796688f88205845ef17aa213"
+      # Optional registry (and mirror path prefix), preserving the repository
+      # and static musl tag/digest from bootstrapImage as the chart is updated.
+      # Example: mirror.example.com -> mirror.example.com/library/busybox:1.36-musl
+      # Empty keeps bootstrapImage unchanged.
+      bootstrapImageRegistry: ""
+
+      # Pull secrets in the MCP namespace that can fetch a private bootstrap
+      # image. These are added alongside credentials required by MCP images.
+      bootstrapImagePullSecrets: []
+
+      # Resource requests/limits for the DaemonSet's containers (Kubernetes
+      # quantities, e.g. "16Mi", "10m"). They only run `true` against each
+      # image, so the requests are deliberately tiny — big enough to schedule,
+      # small enough not to distort packing on every node in the cluster.
+      # Leave empty to use the platform defaults shown in the comments.
+      resources:
+        requests:
+          cpu: "" # default: 10m
+          memory: "" # default: 16Mi
+        limits:
+          memory: "" # default: 64Mi
 
     # Kubernetes configuration for MCP Server Runtime
     # This controls how the Archestra platform connects to Kubernetes to manage MCP server pods
     kubernetes:
       # Namespace where MCP server pods will be created
       # If not set, defaults to the namespace specified in the helm release
+      # Create this namespace before installing when it differs from the release
+      # namespace. The chart automatically grants its platform ServiceAccount
+      # MCP-manager permissions there.
       namespace: ""
 
       # Kubernetes cluster DNS domain for internal service URL construction (streamable-http MCP servers)
       # If not set, defaults to cluster.local
       clusterDomain: ""
+
+      # Cluster resolver IP(s) that MCP server, agent and sandbox egress policies
+      # allow DNS (port 53) to. Leave empty for discovery: the kube-system DNS
+      # Service when readable, otherwise the platform pod's /etc/resolv.conf.
+      # Set verified resolver IPs for custom DNS or workloads using a different
+      # resolver from the platform pod.
+      # Example:
+      #   clusterDnsIps:
+      #     - 172.20.0.10
+      clusterDnsIps: []
 
       # Kubeconfig configuration
       # Choose one of the following methods:
@@ -347,76 +820,42 @@ archestra:
       # RBAC (Role-Based Access Control) configuration
       rbac:
         # Specifies whether RBAC resources should be created
+        # When false, set ARCHESTRA_ORCHESTRATOR_MCP_RUNTIME_OWNER_ROLE only if
+        # external RBAC supplies a readable Role with that name in every runtime
+        # namespace and deletes each Role during release uninstall.
         create: true
 
-      # NetworkPolicy configuration for MCP server pods (SSRF protection)
-      # When enabled, creates a Kubernetes NetworkPolicy that prevents MCP server pods from
-      # accessing private/internal IP ranges, blocking SSRF attacks against cluster services,
-      # cloud metadata endpoints, and other internal infrastructure.
-      #
-      # The policy allows:
-      #   - DNS resolution (UDP/TCP port 53)
-      #   - Egress to the public internet
-      #
-      # The policy blocks (IPv4):
-      #   - 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 (RFC 1918 private ranges)
-      #   - 169.254.0.0/16 (link-local / cloud metadata endpoints like AWS IMDSv1, GCP, Azure)
-      #   - 100.64.0.0/10 (carrier-grade NAT / RFC 6598)
-      #   - 127.0.0.0/8 (loopback)
-      #   - 0.0.0.0/32 (some HTTP libraries treat 0.0.0.0 as localhost)
-      #
-      # The policy also blocks (IPv6, for dual-stack clusters):
-      #   - ::1/128 (IPv6 loopback)
-      #   - fc00::/7 (unique local addresses, equivalent to RFC 1918)
-      #   - fe80::/10 (link-local)
-      #
-      # IMPORTANT: This requires a CNI plugin that supports NetworkPolicies (e.g., Calico, Cilium, Weave).
-      # The default GKE CNI (kubenet) does NOT enforce NetworkPolicies unless Dataplane V2 or Calico is enabled.
-      # See: https://kubernetes.io/docs/concepts/services-networking/network-policies/
-      networkPolicy:
-        # Specifies whether the SSRF protection NetworkPolicy should be created
-        create: false
+        # Optional grant of `get` on the kube-system/kube-dns Service to the
+        # platform ServiceAccount. Creates a Role + RoleBinding in kube-system;
+        # the installer must be authorized to manage both there. Requires rbac.create.
+        # Usually unnecessary in-cluster: discovery falls back to the platform
+        # pod's /etc/resolv.conf. Alternatively set clusterDnsIps explicitly.
+        # If no resolver is known, AWS policies omit the DNS bootstrap exception.
+        kubeDnsServiceRead: false
 
-        # Additional IPv4 CIDR ranges to block (appended to the default private ranges).
-        # Note: These are only added to the IPv4 egress rule. IPv6 private ranges
-        # (::1/128, fc00::/7, fe80::/10) are always blocked and not configurable.
+        # Kubernetes namespaces backing deployment environments that the platform
+        # may deploy MCP servers into. The platform ServiceAccount only gets
+        # MCP-manager permissions in the release namespace by default, so an
+        # environment pointing at any other namespace fails with a 403 until that
+        # namespace is listed here.
+        #
+        # For each entry the chart creates a namespace-scoped Role + RoleBinding
+        # granting the platform ServiceAccount the same MCP-manager permissions it
+        # has in the release namespace. The namespaces MUST already exist before
+        # `helm upgrade` (a RoleBinding cannot be created in a missing namespace).
+        # An entry equal to the release namespace is ignored (already covered above).
+        #
+        # This list is also surfaced to the app (as ARCHESTRA_ORCHESTRATOR_ENVIRONMENT_NAMESPACES)
+        # so the environment editor offers a namespace dropdown instead of free text.
+        #
+        # Note: unlike mcpServerRbac.additionalRoleBindings (which only creates a
+        # binding to an externally-managed Role), this creates the Role too.
+        #
         # Example:
-        #   additionalDeniedCidrs:
-        #     - 198.51.100.0/24    # Documentation range
-        #     - 203.0.113.0/24     # Documentation range
-        additionalDeniedCidrs: []
-
-        # Additional egress rules to add to the NetworkPolicy.
-        # Use this to allow MCP server pods to reach specific internal Kubernetes
-        # services that would otherwise be blocked by the private range deny rules.
-        #
-        # IMPORTANT: MCP servers that need to connect to internal K8s services
-        # (e.g., via grafana.monitoring.svc.cluster.local) will be blocked by default
-        # because ClusterIPs fall within the denied private ranges. You must add
-        # explicit egress rules here to allow those connections.
-        #
-        # Example - allow access to Grafana in the monitoring namespace (by pod labels):
-        #   additionalEgressRules:
-        #     - to:
-        #         - namespaceSelector:
-        #             matchLabels:
-        #               kubernetes.io/metadata.name: monitoring
-        #           podSelector:
-        #             matchLabels:
-        #               app: grafana
-        #       ports:
-        #         - protocol: TCP
-        #           port: 3000
-        #
-        # Example - allow access by IP CIDR (e.g., internal API gateway subnet):
-        #   additionalEgressRules:
-        #     - to:
-        #         - ipBlock:
-        #             cidr: 10.0.50.0/24
-        #       ports:
-        #         - protocol: TCP
-        #           port: 443
-        additionalEgressRules: []
+        #   environmentNamespaces:
+        #     - staging
+        #     - production
+        environmentNamespaces: []
 
       # RBAC configuration for MCP server pods that need Kubernetes API access
       # Creates a dedicated service account with namespace-scoped permissions for K8s resources
@@ -449,6 +888,31 @@ archestra:
         #       name: custom-binding-name  # Optional: override the auto-generated binding name
         additionalRoleBindings: []
 
+  # SRE agent: a pre-installed, read-only Kubernetes MCP server and an "SRE"
+  # agent that investigates this installation's pods, logs, and events. It runs
+  # under a dedicated <fullname>-sre ServiceAccount bound to the read-only Role
+  # above (never to mcpServerRbac's additional bindings), so it needs
+  # orchestrator.kubernetes.mcpServerRbac.create. Turning it off removes what it
+  # seeded.
+  sre:
+    enabled: false
+    # Kubernetes API server endpoint CIDRs the SRE MCP server may reach. Its
+    # environment allows egress to these only. Use the endpoint IPs
+    # (`kubectl get endpoints kubernetes -n default`), not the Service IP.
+    # Example:
+    #   apiServerCidrs:
+    #     - 172.16.0.2/32
+    apiServerCidrs: []
+
+  # Knowledge base configuration
+  knowledgeBase:
+    # Perforce permission sync
+    perforceShim:
+      # Image for the p4 shim pod the backend provisions for Perforce
+      # permission sync. If not set, defaults to
+      # "ghcr.io/archestra-ai/p4-shim:<app version>"
+      image: ""
+
   # Background worker configuration
   # Deploys a separate Deployment for processing background jobs from the postgres queue
   # (e.g., knowledge base connector syncs, batch embeddings).
@@ -462,6 +926,12 @@ archestra:
 
     # Number of worker pod replicas
     replicaCount: 1
+
+    # Scheduling for the separate worker Deployment only.
+    # null inherits the corresponding shared archestra.* value; {} / [] clears it.
+    nodeSelector: null
+    tolerations: null
+    affinity: null
 
     # Resource requests and limits for worker pods
     # If not set, inherits from archestra.resources
@@ -483,17 +953,14 @@ archestra:
         maxUnavailable: "25%"
         maxSurge: "25%"
 
-    # Pod annotations for worker pods
-    # If not set, inherits from archestra.podAnnotations
-    podAnnotations: {}
-
-    # Node selector for worker pods
-    # If not set, inherits from archestra.nodeSelector
-    nodeSelector: {}
-
-    # Tolerations for worker pods
-    # If not set, inherits from archestra.tolerations
-    tolerations: []
+  # Optional dedicated listener that aliases the publicly-exposable endpoints
+  # — currently the MS Teams incoming webhook (/api/webhooks/chatops/ms-teams)
+  # — on their own port, so a firewall / load balancer can expose only these
+  # endpoints without exposing the whole API.
+  # The main backend port (9000) keeps serving them either way.
+  # Setting the port injects ARCHESTRA_PUBLIC_ENDPOINTS_PORT into the backend
+  # container and adds a named container port + Service port.
+  publicEndpointsPort: null
 
   # Service configuration
   service:
@@ -507,6 +974,8 @@ archestra:
       backend: null
       metrics: null
       frontend: null
+      # Only used when archestra.publicEndpointsPort is set
+      publicEndpoints: null
 
   # Ingress configuration
   ingress:
@@ -515,6 +984,27 @@ archestra:
 
     # Annotations for the ingress resource
     annotations: {}
+
+    # Route /v1, /v2 and exact /openapi.json straight to the backend port on
+    # any host that also serves the UI.
+    #
+    # Neither prefix has a frontend route — the frontend only forwards them to
+    # the backend. /v1 is the LLM proxy and the MCP gateway; /v2 is A2A. That is
+    # every request an agent makes: completions whose bodies are multi-megabyte
+    # and stay open for the length of a response, plus tool calls and their
+    # once-a-second poll. Forwarding that through the frontend port runs it on
+    # the same single-threaded process that answers the dashboard's API calls,
+    # so the UI gets slow while an agent is working. Routing it at the ingress
+    # removes that contention.
+    #
+    # Applies to hosts declared under `hosts:` below. A host that already
+    # declares its own /v1 or /v2 path keeps those gateway routes. An explicit
+    # /openapi.json path is preserved independently; otherwise it is added for
+    # Terraform model-pool preflight. Backend-only hosts are unchanged.
+    # Set to false to keep everything on whatever `hosts:` says.
+    #
+    # Ignored when `spec:` is used, since that replaces the generated rules.
+    routeBackendApisDirectly: true
 
     # Complete ingress specification
     # When using ARCHESTRA_MCP_SANDBOX_DOMAIN, add a wildcard rule for sandbox subdomains:
@@ -731,18 +1221,35 @@ postgresql:
       scripts:
         grant-superuser.sql: |
           ALTER USER archestra WITH SUPERUSER;
+    # Appended to postgresql.conf. max_connections must cover every backend
+    # pod's query and cache pools, notification listeners, and non-app clients.
+    # When set, Helm allocates database.connectionBudget across rollout pods, leaving
+    # the remainder for migrations, administration, and monitoring.
+    # Raise this ceiling before increasing database.connectionBudget.
+    extendedConfiguration: |
+      max_connections = 250
     resources:
       requests:
         cpu: "1000m"
         memory: "1Gi"
       limits:
         cpu: "1000m"
-        memory: "1Gi"
+        # Higher than the request: a hard 1Gi ceiling has OOM-killed the
+        # bundled instance under load, and a single-replica database restart
+        # is a full platform outage until it comes back.
+        memory: "2Gi"
   # PostgreSQL exporter sidecar for Prometheus metrics (port 9187)
   # Metrics are scraped by the observability stack (Grafana Alloy or Prometheus)
   # and visualized in the Application Metrics Grafana dashboard (PostgreSQL section)
   metrics:
     enabled: true
+    # Same repository/digest pinning rationale as postgresql.image below: the
+    # subchart default points at the archived "bitnami" repository with a
+    # floating "latest" tag.
+    image:
+      repository: bitnamisecure/postgres-exporter
+      tag: latest
+      digest: sha256:53ab72a1b940d7637e91619f1000da9ebef14bc7dad74321a78731d65c79f55b
     service:
       ports:
         metrics: 9187
@@ -754,6 +1261,14 @@ postgresql:
   image:
     repository: bitnamisecure/postgresql
     tag: latest
+    # Bitnami Secure Images only publish a floating "latest" tag for free use,
+    # so pin the exact image by digest: a database must not change versions
+    # whenever its pod happens to be rescheduled onto a new node (a
+    # major-version jump refuses to start against the existing data
+    # directory). This digest is PostgreSQL 18.4.0. Refresh it deliberately
+    # alongside chart updates:
+    #   docker buildx imagetools inspect bitnamisecure/postgresql:latest
+    digest: sha256:91a6c3f4b4d687546c1d07c1ef7c27a5e85e2a0ce8a192fe94cad5bbde0a1aba
   global:
     security:
       allowInsecureImages: true

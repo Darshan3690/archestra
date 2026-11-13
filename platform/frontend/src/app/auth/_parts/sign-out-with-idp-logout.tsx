@@ -1,0 +1,67 @@
+"use client";
+
+import { archestraApiSdk } from "@archestra/shared";
+import { useEffect, useRef } from "react";
+import { LoadingState } from "@/components/loading";
+import { clearSsoSignInAttempt } from "@/lib/auth/sso-sign-in-attempt";
+import { clearPersistedQueryCache } from "@/lib/query-persistence";
+// biome-ignore lint/style/noRestrictedImports: dual-licensed; reset is a no-op when RUM never started
+import { rumClient } from "@/lib/rum.ee";
+
+export function SignOutWithIdpLogout() {
+  const hasStarted = useRef(false);
+
+  useEffect(() => {
+    if (hasStarted.current) return;
+    hasStarted.current = true;
+
+    performSignOut();
+  }, []);
+
+  // Rendered inside the auth card column, which owns no height of its own —
+  // so this is sized like the other in-card waits (see GuardShell) rather than
+  // stretched to a container that would not give it one.
+  return <LoadingState label="Signing out…" />;
+}
+
+async function performSignOut() {
+  clearSsoSignInAttempt();
+
+  // Drop the refresh snapshot before the session goes: it is what makes a
+  // reload paint instantly, and nothing of this user's should survive into
+  // the next sign-in on this browser.
+  clearPersistedQueryCache();
+
+  // Flush pending usage telemetry while the session cookie is still valid,
+  // then forget the RUM session and last-user markers: a telemetry session
+  // must not outlive the user who produced it (on a shared machine the next
+  // sign-in would otherwise inherit this session id).
+  rumClient.reset();
+
+  // Fetch IdP logout URL while still authenticated
+  let idpLogoutUrl: string | null = null;
+  try {
+    const { data } = await archestraApiSdk.getIdentityProviderIdpLogoutUrl();
+    idpLogoutUrl = data?.url ?? null;
+  } catch {
+    // Proceed with local sign-out even if IdP URL fetch fails
+  }
+
+  // Clear local session using direct fetch to avoid React state updates
+  // from authClient.signOut() which can trigger navigation before our redirect
+  try {
+    await fetch("/api/auth/sign-out", {
+      method: "POST",
+      credentials: "include",
+    });
+  } catch {
+    // Proceed with redirect even if session cleanup fails
+  }
+
+  // Redirect to IdP logout or sign-in page
+  if (idpLogoutUrl) {
+    window.location.href = idpLogoutUrl;
+  } else {
+    window.location.href = "/auth/sign-in";
+  }
+}

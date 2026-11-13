@@ -1,11 +1,22 @@
 import { Octokit } from "@octokit/rest";
 import type pino from "pino";
+import { LRUCacheManager } from "@/cache-manager";
+import { resolveInstallationToken } from "@/integrations/github/app-auth";
+import { extractPdfText } from "@/knowledge-base/pdf-ocr";
+import * as metrics from "@/observability/metrics";
 import type {
   ConnectorCredentials,
   ConnectorDocument,
+  ConnectorSkipCategory,
   ConnectorSyncBatch,
+  DocumentPermissions,
   GithubCheckpoint,
   GithubConfig,
+  GroupMembershipYield,
+  GroupMemberYield,
+  PermissionSnapshotYield,
+  PermissionSyncParams,
+  ResolveMappedEmail,
 } from "@/types";
 import { GithubConfigSchema } from "@/types";
 import {
@@ -14,11 +25,87 @@ import {
   extractErrorMessage,
   REQUEST_TIMEOUT_MS,
 } from "../base-connector";
+import { ConnectorIdentityCache } from "../identity-cache";
+import {
+  describePdfEmptyText,
+  describePdfExtractionWarning,
+} from "../pdf-utils";
+import { resolveGithubRepositorySettings } from "./github-repository-settings";
 
 const BATCH_SIZE = 50;
+/**
+ * Largest file the Contents API returns inline. Bigger files come back with no
+ * content, so they are read through the Git Blobs API instead.
+ */
+const CONTENTS_API_MAX_FILE_BYTES = 1024 * 1024;
+/**
+ * Repository files above this size are skipped rather than fetched: the Git
+ * Blobs API stops at 100 MB, and a text file this large is almost always
+ * generated output or a data dump rather than knowledge worth indexing.
+ */
+const MAX_REPOSITORY_FILE_BYTES = 10 * 1024 * 1024;
+/** Cap for the per-pass login → profile cache: sized so a normal org never evicts. */
+const USER_PROFILE_CACHE_MAX_SIZE = 10_000;
+/**
+ * Requests left in the credential's hourly budget below which a permission pass
+ * stops making OPTIONAL identity lookups (the per-login profile fetch).
+ *
+ * Resolving a login to an email is one rate-limited request per account, and a
+ * token gets 5,000 an hour for EVERYTHING — including the content sync that
+ * shares the credential. Without a floor, a pass over a few large repos spends
+ * the whole budget on profile lookups and then every later request 403s, which
+ * fails the mandatory calls too: `resolveRepoAudience` catches, returns an empty
+ * audience, and the repo's entire corpus goes dark. Stopping the optional work
+ * early costs the unresolved accounts their grants (fail-closed under-grant, the
+ * same as a private email, and rescued by an admin member mapping) and leaves
+ * the mandatory calls a budget to finish in.
+ */
+const RATE_LIMIT_RESERVE = 500;
+
+/** A login whose profile we could not (or chose not to) fetch. */
+const UNRESOLVED_PROFILE: { email: string | null; name: string | null } = {
+  email: null,
+  name: null,
+};
 
 export class GithubConnector extends BaseConnector {
   type = "github" as const;
+  supportsPermissionSync = true;
+
+  /**
+   * Per-pass cache of GitHub login → public profile (email null when private).
+   * Size-bounded LRU (no TTL — the instance is per-pass) so a huge org cannot
+   * grow it without limit; eviction only costs a re-fetch.
+   */
+  private userProfileCache = new LRUCacheManager<{
+    email: string | null;
+    name: string | null;
+  }>({ maxSize: USER_PROFILE_CACHE_MAX_SIZE, defaultTtl: 0 });
+  /**
+   * Cross-pass persistence behind `userProfileCache`: login → profile results
+   * (including private-email negatives) survive the pass so the next run does
+   * not re-probe every collaborator/member. Armed per permission pass.
+   */
+  private persistentProfileCache: ConnectorIdentityCache<{
+    email: string | null;
+    name: string | null;
+  }> | null = null;
+  /**
+   * Admin member mappings (login → mapped email), armed per pass. Consulted
+   * FIRST when materializing a direct collaborator grant, so a mapped account
+   * whose GitHub email is private still lands on container audiences instead
+   * of being dropped fail-closed. Group-derived access needs no
+   * materialization — memberships carry the login and resolve the mapping at
+   * query time.
+   */
+  private resolveMappedEmail: ResolveMappedEmail | null = null;
+  /**
+   * Requests left in the credential's hourly budget, as of the last response
+   * this pass saw (`x-ratelimit-remaining`). Null until the first response.
+   */
+  private remainingRateLimit: number | null = null;
+  /** Profile lookups this pass declined to make because of the reserve. */
+  private identityLookupsSkipped = 0;
 
   async validateConfig(
     config: Record<string, unknown>,
@@ -29,10 +116,7 @@ export class GithubConnector extends BaseConnector {
       label: "GitHub",
       invalidConfigError:
         "Invalid GitHub configuration: githubUrl (string) and owner (string) are required",
-      extraChecks: (parsed) =>
-        /^https?:\/\/.+/.test(parsed.githubUrl)
-          ? null
-          : "githubUrl must be a valid HTTP(S) URL",
+      extraChecks: (parsed) => validateGithubConfig(parsed),
     });
   }
 
@@ -48,7 +132,17 @@ export class GithubConnector extends BaseConnector {
     return this.runConnectionTest({
       label: "GitHub",
       probe: async () => {
-        const octokit = createOctokit(parsed, params.credentials, this.log);
+        const octokit = await createOctokit(
+          parsed,
+          params.credentials,
+          this.log,
+        );
+        if (parsed.authMethod === "github_app") {
+          await octokit.rest.apps.listReposAccessibleToInstallation({
+            per_page: 1,
+          });
+          return;
+        }
         await octokit.rest.users.getAuthenticated();
       },
     });
@@ -62,22 +156,25 @@ export class GithubConnector extends BaseConnector {
     const parsed = parseGithubConfig(params.config);
     if (!parsed) return null;
 
-    // Markdown file count cannot be estimated without fetching the full repo tree,
-    // so skip estimation entirely when markdown syncing is enabled.
-    if (parsed.includeMarkdownFiles) return null;
-
     this.log.debug(
       { owner: parsed.owner, repos: parsed.repos },
       "Estimating total items",
     );
 
     try {
-      const octokit = createOctokit(parsed, params.credentials, this.log);
-      const repos = await getRepos(octokit, parsed);
+      const octokit = await createOctokit(parsed, params.credentials, this.log);
+      const repos = (await getRepos(octokit, parsed)).map((repo) => ({
+        repo,
+        settings: resolveGithubRepositorySettings(parsed, repo),
+      }));
+      // File totals require fetching the complete tree for that repository.
+      if (repos.some(({ settings }) => settings.includeRepositoryFiles)) {
+        return null;
+      }
       let total = 0;
 
-      for (const repo of repos) {
-        if (parsed.includeIssues !== false) {
+      for (const { repo, settings } of repos) {
+        if (settings.includeIssues) {
           const result = await octokit.rest.search.issuesAndPullRequests({
             q: `repo:${repo.owner}/${repo.name} is:issue`,
             per_page: 1,
@@ -85,7 +182,7 @@ export class GithubConnector extends BaseConnector {
           total += result.data.total_count;
         }
 
-        if (parsed.includePullRequests !== false) {
+        if (settings.includePullRequests) {
           const result = await octokit.rest.search.issuesAndPullRequests({
             q: `repo:${repo.owner}/${repo.name} is:pr`,
             per_page: 1,
@@ -121,7 +218,7 @@ export class GithubConnector extends BaseConnector {
     const checkpoint = (params.checkpoint as GithubCheckpoint | null) ?? {
       type: "github" as const,
     };
-    const octokit = createOctokit(parsed, params.credentials, this.log);
+    const octokit = await createOctokit(parsed, params.credentials, this.log);
     const repos = await getRepos(octokit, parsed);
 
     this.log.debug(
@@ -136,40 +233,46 @@ export class GithubConnector extends BaseConnector {
       "Starting sync",
     );
 
-    for (let repoIdx = 0; repoIdx < repos.length; repoIdx++) {
-      const repo = repos[repoIdx];
-      const isLastRepo = repoIdx === repos.length - 1;
-      const hasMarkdown = parsed.includeMarkdownFiles === true;
+    const groups: {
+      repo: GithubRepo;
+      config: GithubConfig;
+      kind: "issue" | "pr" | "files";
+    }[] = [];
+    for (const repo of repos) {
+      const settings = resolveGithubRepositorySettings(parsed, repo);
+      const config = { ...parsed, ...settings };
+      if (settings.includeIssues) groups.push({ repo, config, kind: "issue" });
+      if (settings.includePullRequests)
+        groups.push({ repo, config, kind: "pr" });
+      if (settings.includeRepositoryFiles) {
+        groups.push({ repo, config, kind: "files" });
+      }
+    }
 
-      if (parsed.includeIssues !== false) {
+    if (groups.length === 0) {
+      yield { documents: [], checkpoint, hasMore: false };
+      return;
+    }
+
+    // The final enabled group may precede repositories with every type disabled.
+    for (const [index, group] of groups.entries()) {
+      const isLastGroup = index === groups.length - 1;
+      if (group.kind === "files") {
+        yield* this.syncRepoFiles({
+          octokit,
+          config: group.config,
+          repo: group.repo,
+          checkpoint,
+          isLastGroup,
+        });
+      } else {
         yield* this.syncRepoItems({
           octokit,
-          config: parsed,
-          repo,
+          config: group.config,
+          repo: group.repo,
           checkpoint,
-          kind: "issue",
-          isLastGroup:
-            isLastRepo && parsed.includePullRequests === false && !hasMarkdown,
-        });
-      }
-
-      if (parsed.includePullRequests !== false) {
-        yield* this.syncRepoItems({
-          octokit,
-          config: parsed,
-          repo,
-          checkpoint,
-          kind: "pr",
-          isLastGroup: isLastRepo && !hasMarkdown,
-        });
-      }
-
-      if (hasMarkdown) {
-        yield* this.syncRepoMarkdownFiles({
-          octokit,
-          repo,
-          checkpoint,
-          isLastGroup: isLastRepo,
+          kind: group.kind,
+          isLastGroup,
         });
       }
     }
@@ -287,16 +390,33 @@ export class GithubConnector extends BaseConnector {
       };
     }
   }
-  private async *syncRepoMarkdownFiles(params: {
+  private async *syncRepoFiles(params: {
     octokit: Octokit;
+    config: GithubConfig;
     repo: GithubRepo;
     checkpoint: GithubCheckpoint;
     isLastGroup: boolean;
   }): AsyncGenerator<ConnectorSyncBatch> {
-    const { octokit, repo, checkpoint, isLastGroup } = params;
+    const { octokit, config, repo, checkpoint, isLastGroup } = params;
     const repoFullName = `${repo.owner}/${repo.name}`;
+    const fileTypeFilter = getFileTypeFilter(config);
+    const indexedPathPrefixes = normalizePathPrefixes(
+      config.includePaths ?? [],
+    );
+    const excludedPathPrefixes = normalizePathPrefixes(
+      config.excludePaths ?? [],
+      true,
+    );
 
-    this.log.info({ repo: repoFullName }, "Starting markdown file sync");
+    this.log.info(
+      {
+        repo: repoFullName,
+        fileTypeFilter,
+        indexedPathPrefixes,
+        excludedPathPrefixes,
+      },
+      "Starting repository file sync",
+    );
 
     let treeSha: string;
     let branch: string;
@@ -338,7 +458,7 @@ export class GithubConnector extends BaseConnector {
       "Fetching repository tree",
     );
 
-    let treeItems: Array<{ path: string; sha: string }>;
+    let treeItems: RepositoryFile[];
     try {
       const treeResponse = await octokit.rest.git.getTree({
         owner: repo.owner,
@@ -352,22 +472,46 @@ export class GithubConnector extends BaseConnector {
           (item) =>
             item.type === "blob" &&
             item.path &&
-            isMarkdownFile(item.path) &&
+            isWithinIndexedPaths(item.path, indexedPathPrefixes) &&
+            (excludedPathPrefixes.length === 0 ||
+              !isWithinIndexedPaths(item.path, excludedPathPrefixes)) &&
+            isIndexedRepositoryFile(item.path, fileTypeFilter) &&
             item.sha,
         )
         .map((item) => ({
           path: item.path as string,
           sha: item.sha as string,
+          size: item.size,
         }));
+
+      if (
+        treeItems.length === 0 &&
+        allItems.some((item) => item.type === "blob")
+      ) {
+        this.log.warn(
+          { repo: repoFullName, branch, fileCount: 0 },
+          "Repository contains files, but none match File Types and folder filters. Use extensions such as .md or *.md, exact names such as Dockerfile, or * for text files; glob paths are not supported.",
+        );
+      }
+
+      // GitHub caps a recursive tree listing; past the cap it returns a partial
+      // tree with `truncated: true`. Silently indexing a subset looks identical
+      // to "that folder has no matching files", so say it out loud.
+      if (treeResponse.data.truncated) {
+        this.log.warn(
+          { repo: repoFullName, branch, treeSha },
+          "Repository tree was truncated by GitHub, some files will not be indexed",
+        );
+      }
 
       this.log.info(
         {
           repo: repoFullName,
           branch,
           totalTreeItems: allItems.length,
-          markdownFileCount: treeItems.length,
+          fileCount: treeItems.length,
         },
-        "Found markdown files in repository",
+        "Found repository files to index",
       );
     } catch (err) {
       this.log.error(
@@ -377,7 +521,7 @@ export class GithubConnector extends BaseConnector {
           treeSha,
           error: extractErrorMessage(err),
         },
-        "Failed to fetch repository tree, skipping markdown sync",
+        "Failed to fetch repository tree, skipping file sync",
       );
       yield {
         documents: [],
@@ -420,26 +564,56 @@ export class GithubConnector extends BaseConnector {
           totalBatches,
           batchSize: batch.length,
         },
-        "Fetching markdown file contents",
+        "Fetching repository file contents",
       );
 
       for (const file of batch) {
+        if (file.size !== undefined && file.size > MAX_REPOSITORY_FILE_BYTES) {
+          this.log.warn(
+            { repo: repoFullName, path: file.path, size: file.size },
+            "Repository file exceeds the size limit, skipping",
+          );
+          this.trackSkipped({
+            itemId: file.path,
+            sourceId: githubFileSourceId(repo.name, file.path),
+            name: file.path,
+            reason: `File exceeds ${MAX_REPOSITORY_FILE_BYTES} byte size limit`,
+          });
+          continue;
+        }
+
         await this.rateLimit();
-        const content = await this.safeItemFetch({
-          fetch: () => getFileContent(octokit, repo, file.path),
+        const bytes = await this.safeItemFetch({
+          fetch: () => getFileContent(octokit, repo, file),
           fallback: null,
           itemId: file.path,
           resource: "file_content",
+          itemUnavailable: true,
         });
+        if (bytes === null) continue;
 
-        if (content !== null) {
+        const content = await this.readRepositoryFile({
+          repoFullName,
+          path: file.path,
+          bytes,
+        });
+        if (content.text === null) {
+          this.trackSkipped({
+            itemId: file.path,
+            sourceId: githubFileSourceId(repo.name, file.path),
+            name: file.path,
+            reason: content.skipReason,
+            category: content.skipCategory,
+          });
+        } else {
           documents.push(
-            markdownFileToDocument(file.path, content, repo, branch),
+            repositoryFileToDocument(file.path, content.text, repo, branch),
           );
         }
       }
 
       const failures = this.flushFailures();
+      const skipped = this.flushSkipped();
       const hasMoreFiles = i + BATCH_SIZE < treeItems.length;
 
       this.log.info(
@@ -450,14 +624,16 @@ export class GithubConnector extends BaseConnector {
           totalBatches,
           documentsIndexed: documents.length,
           failureCount: failures.length,
+          skippedCount: skipped.length,
           hasMore: hasMoreFiles || !isLastGroup,
         },
-        "Markdown file batch completed",
+        "Repository file batch completed",
       );
 
       yield {
         documents,
         failures,
+        skipped,
         checkpoint: buildCheckpoint({
           type: "github",
           itemUpdatedAt: null,
@@ -467,19 +643,469 @@ export class GithubConnector extends BaseConnector {
       };
     }
   }
+
+  // ===== Permission sync hooks =====
+
+  /**
+   * Repo-scoped snapshot. Each repo is one top-level container
+   * `repo:<owner>/<name>` whose audience is resolved ONCE (private/public +
+   * collaborators + teams); its already-ingested documents are assigned via
+   * read-back — upstream calls are O(repos + collaborators), never O(docs).
+   * The read-back mirrors our own corpus, so the pass's per-container
+   * fail-close diff is naturally empty for GitHub (content-sync owns document
+   * deletions); a repo that VANISHES upstream is caught by the pass's stale
+   * container sweep instead.
+   */
+  async *syncPermissionSnapshot(
+    params: PermissionSyncParams,
+  ): AsyncGenerator<PermissionSnapshotYield> {
+    const config = parseGithubConfig(params.config);
+    if (!config) {
+      throw new Error("Invalid GitHub configuration for permission sync");
+    }
+    const octokit = await createOctokit(config, params.credentials, this.log);
+    this.initPersistentProfileCache(
+      config,
+      params.credentials,
+      params.refreshIdentities,
+    );
+    this.resolveMappedEmail = params.resolveMappedEmail ?? null;
+    const repos = await getRepos(octokit, config);
+    // Stable codepoint order so the resume cursor (a container key) is
+    // monotonic under plain string comparison.
+    const sorted = [...repos].sort((a, b) => {
+      const left = githubRepoKey(a);
+      const right = githubRepoKey(b);
+      return left < right ? -1 : left > right ? 1 : 0;
+    });
+
+    const scope = params.scope ? new Set(params.scope.containerKeys) : null;
+    for (const repo of sorted) {
+      const repoKey = githubRepoKey(repo);
+      const containerKey = `repo:${repoKey}`;
+      if (scope && !scope.has(containerKey)) continue;
+      // Resume: containers strictly before the cursor are already done. The
+      // cursor container is re-processed (idempotent — same audience).
+      if (params.cursor && containerKey < params.cursor) continue;
+
+      const audience = await this.resolveRepoAudience(octokit, repo);
+      yield {
+        kind: "container",
+        containerKey,
+        permissions: audience.permissions,
+        audienceResolutionFailed: audience.resolutionFailed,
+        cursor: containerKey,
+      };
+
+      let afterId: string | null = null;
+      for (;;) {
+        const { documents, nextAfterId } = await params.readIngestedDocuments({
+          metadataFilter: { repo: repoKey },
+          afterId,
+          limit: GITHUB_READBACK_PAGE_SIZE,
+        });
+        for (const doc of documents) {
+          yield {
+            kind: "document",
+            sourceId: doc.sourceId,
+            containerKey,
+            cursor: containerKey,
+          };
+        }
+        if (documents.length < GITHUB_READBACK_PAGE_SIZE) break;
+        afterId = nextAfterId;
+      }
+    }
+
+    this.reportSkippedIdentityLookups();
+  }
+
+  /**
+   * Local-adoption scoping for delta passes: a stored document is covered by
+   * its repository's enumeration (content-sync writes `metadata.repo` =
+   * `<owner>/<name>`, matching the container key). Scoping only — the repo
+   * enumeration resolves the authoritative audience, so this can never
+   * over-grant.
+   */
+  scopeKeyForDocument(metadata: Record<string, unknown>): string | null {
+    const repo = metadata.repo;
+    return typeof repo === "string" && repo.length > 0 ? `repo:${repo}` : null;
+  }
+
+  /**
+   * Org teams → member emails, across every org that owns a synced repo. Group
+   * ids are namespaced `<org>/<team-slug>` to match the tokens written on
+   * documents (see resolveRepoAudience).
+   */
+  async *syncGroups(
+    params: PermissionSyncParams,
+  ): AsyncGenerator<GroupMembershipYield> {
+    const config = parseGithubConfig(params.config);
+    if (!config) {
+      throw new Error("Invalid GitHub configuration for permission sync");
+    }
+    const octokit = await createOctokit(config, params.credentials, this.log);
+    this.initPersistentProfileCache(
+      config,
+      params.credentials,
+      params.refreshIdentities,
+    );
+    const repos = await getRepos(octokit, config);
+    const orgs = [...new Set(repos.map((repo) => repo.owner))].sort();
+
+    for (const org of orgs) {
+      for await (const team of this.paginate((page) =>
+        octokit.rest.teams.list({ org, per_page: 100, page }),
+      )) {
+        const members: GroupMemberYield[] = [];
+        for await (const member of this.paginate((page) =>
+          octokit.rest.teams.listMembersInOrg({
+            org,
+            team_slug: team.slug,
+            per_page: 100,
+            page,
+          }),
+        )) {
+          // Every member is recorded; GitHub only exposes an email the user
+          // made public, so `email` is often null (fail-closed, but visible
+          // to admins as unresolvable instead of silently dropped). The member
+          // listing already carries the public email when there is one, so most
+          // members cost no request of their own.
+          const profile = await this.resolveUserProfile(octokit, member.login, {
+            email: member.email,
+            name: member.name,
+          });
+          members.push({
+            accountId: member.login,
+            displayName: profile.name,
+            email: profile.email,
+          });
+        }
+        yield {
+          groupId: githubGroupId(org, team.slug),
+          members,
+          cursor: `${org}/${team.slug}`,
+        };
+      }
+    }
+
+    this.reportSkippedIdentityLookups();
+  }
+
+  private async resolveRepoAudience(
+    octokit: Octokit,
+    repo: GithubRepo,
+  ): Promise<{ permissions: DocumentPermissions; resolutionFailed: boolean }> {
+    try {
+      await this.rateLimit();
+      const meta = await octokit.rest.repos.get({
+        owner: repo.owner,
+        repo: repo.name,
+      });
+      this.noteRateLimit(meta.headers);
+      const isPublic = !meta.data.private;
+
+      const users: string[] = [];
+      let dropped = 0;
+      for await (const collaborator of this.paginate((page) =>
+        octokit.rest.repos.listCollaborators({
+          owner: repo.owner,
+          repo: repo.name,
+          per_page: 100,
+          page,
+        }),
+      )) {
+        // The public-profile email always wins (automatic matching takes
+        // precedence); the mapping only rescues accounts whose email GitHub
+        // keeps private. The collaborator listing already carries that public
+        // email when there is one, so it costs no request of its own.
+        const email =
+          (
+            await this.resolveUserProfile(octokit, collaborator.login, {
+              email: collaborator.email,
+              name: collaborator.name,
+            })
+          ).email ?? this.resolveMappedEmail?.(collaborator.login);
+        if (email) users.push(email);
+        else dropped++;
+      }
+      this.meterDroppedPrincipals(dropped);
+
+      const groups: string[] = [];
+      for await (const team of this.paginate((page) =>
+        octokit.rest.repos.listTeams({
+          owner: repo.owner,
+          repo: repo.name,
+          per_page: 100,
+          page,
+        }),
+      )) {
+        groups.push(githubGroupId(repo.owner, team.slug));
+      }
+
+      return {
+        permissions: { isPublic, users, groups },
+        resolutionFailed: false,
+      };
+    } catch (error) {
+      // Same per-container failure isolation as Jira/Confluence: a transient
+      // upstream error must not fail the whole pass. Partial results are
+      // discarded — an empty audience fail-closes the repo (under-grant)
+      // until the next successful pass, and the pass counts it so the repo
+      // going dark does not read as "nobody has access to this repo".
+      this.log.error(
+        { repo: githubRepoKey(repo), error: extractErrorMessage(error) },
+        "Could not read the repository's audience; every document in it is fail-closed for this pass",
+      );
+      return {
+        permissions: { isPublic: false, users: [], groups: [] },
+        resolutionFailed: true,
+      };
+    }
+  }
+
+  /**
+   * Meter upstream principals dropped because their email could not be resolved
+   * (private GitHub email). Fail-closed under-grant — surfaced so admins see the
+   * coverage gap rather than silently narrowing an audience.
+   */
+  private meterDroppedPrincipals(count: number): void {
+    if (count <= 0) return;
+    this.log.debug(
+      { count, connectorType: this.type },
+      "Dropped GitHub principals with no resolvable email (fail-closed)",
+    );
+    metrics.rag.reportPermissionSyncDroppedPrincipals({
+      connectorType: this.type,
+      reason: "no_email",
+      count,
+    });
+  }
+
+  /**
+   * Resolve a login to its public profile. GitHub only exposes an email when the
+   * user has made it public — no token scope reveals a private one — so `email`
+   * is null for most members (fail-closed, documented limitation).
+   *
+   * `known` is the email/name GitHub already put in the list response that named
+   * this login. The collaborator and org-member schemas both carry them, and
+   * they are the same public-profile values `GET /users/{login}` would return —
+   * so when one is there, taking it turns a per-account request into no request
+   * at all. This is the difference between O(collaborators) and O(1) requests
+   * for a repo whose collaborators GitHub already told us about.
+   */
+  private async resolveUserProfile(
+    octokit: Octokit,
+    login: string,
+    known?: { email?: string | null; name?: string | null },
+  ): Promise<{ email: string | null; name: string | null }> {
+    if (known?.email) {
+      const profile = { email: known.email, name: known.name ?? null };
+      this.userProfileCache.set(login, profile);
+      await this.persistentProfileCache?.set(login, profile);
+      return profile;
+    }
+
+    const cached = this.userProfileCache.get(login);
+    if (cached !== undefined) return cached;
+    const persisted = await this.persistentProfileCache?.get(login);
+    if (persisted !== undefined) {
+      this.userProfileCache.set(login, persisted);
+      return persisted;
+    }
+
+    if (
+      this.remainingRateLimit !== null &&
+      this.remainingRateLimit <= RATE_LIMIT_RESERVE
+    ) {
+      // Out of budget for optional work. Remembered for the rest of THIS pass
+      // only — never written to the cross-pass cache, which would persist a
+      // fabricated "no email" for a day and lock the account out of its grants
+      // long after the budget recovered.
+      this.identityLookupsSkipped += 1;
+      this.userProfileCache.set(login, UNRESOLVED_PROFILE);
+      return UNRESOLVED_PROFILE;
+    }
+
+    let profile: { email: string | null; name: string | null } =
+      UNRESOLVED_PROFILE;
+    try {
+      await this.rateLimit();
+      const response = await octokit.rest.users.getByUsername({
+        username: login,
+      });
+      this.noteRateLimit(response.headers);
+      profile = {
+        email: response.data.email ?? null,
+        name: response.data.name ?? null,
+      };
+    } catch (error) {
+      this.log.debug(
+        { login, error: extractErrorMessage(error) },
+        "Could not resolve GitHub user profile",
+      );
+    }
+    this.userProfileCache.set(login, profile);
+    await this.persistentProfileCache?.set(login, profile);
+    return profile;
+  }
+
+  /**
+   * Note the credential's remaining hourly budget, which GitHub returns on every
+   * response, so `resolveUserProfile` can stop spending it on optional lookups
+   * before the mandatory calls start failing (see RATE_LIMIT_RESERVE). Read off
+   * the responses rather than an octokit request hook, so it needs nothing of
+   * the client but the shape every REST call already returns. A response without
+   * the header simply leaves the budget unknown, and an unknown budget never
+   * skips anything.
+   */
+  private noteRateLimit(headers?: {
+    "x-ratelimit-remaining"?: string | number;
+  }): void {
+    const remaining = Number(headers?.["x-ratelimit-remaining"]);
+    if (Number.isFinite(remaining)) this.remainingRateLimit = remaining;
+  }
+
+  /** Report (and reset) the identity lookups the reserve made this pass skip. */
+  private reportSkippedIdentityLookups(): void {
+    if (this.identityLookupsSkipped === 0) return;
+    const skipped = this.identityLookupsSkipped;
+    this.identityLookupsSkipped = 0;
+    this.log.warn(
+      { skipped, remainingRateLimit: this.remainingRateLimit },
+      "GitHub rate-limit budget hit the reserve; stopped resolving member emails for this pass (those members lose their grants until the next pass — map them manually on the Users tab if this persists)",
+    );
+    metrics.rag.reportPermissionSyncIdentityLookupsSkipped({
+      connectorType: this.type,
+      count: skipped,
+    });
+  }
+
+  /** Arm the cross-pass profile cache for one permission pass. */
+  private initPersistentProfileCache(
+    config: GithubConfig,
+    credentials: ConnectorCredentials,
+    refresh?: boolean,
+  ): void {
+    this.persistentProfileCache = new ConnectorIdentityCache({
+      namespace: "github-profile",
+      host: resolveGithubApiUrl(config, credentials),
+      credentials,
+      refresh,
+    });
+  }
+
+  /** Rate-limited generic pager over a 100-per-page GitHub list endpoint. */
+  private async *paginate<T>(
+    fetchPage: (page: number) => Promise<{
+      data: T[];
+      headers?: { "x-ratelimit-remaining"?: string | number };
+    }>,
+  ): AsyncGenerator<T> {
+    let page = 1;
+    for (;;) {
+      await this.rateLimit();
+      const response = await fetchPage(page);
+      this.noteRateLimit(response.headers);
+      const items = response.data;
+      for (const item of items) yield item;
+      if (items.length < 100) break;
+      page++;
+    }
+  }
+
+  /**
+   * Turn a fetched blob into indexable text. PDFs go through the shared PDF
+   * extractor (and the run's OCR pass for scanned pages) because their bytes
+   * are not text; every other selected file is read as UTF-8, and one that
+   * turns out to be binary is skipped.
+   */
+  private async readRepositoryFile(params: {
+    repoFullName: string;
+    path: string;
+    bytes: Buffer;
+  }): Promise<
+    | { text: string }
+    | {
+        text: null;
+        skipReason: string;
+        skipCategory: ConnectorSkipCategory;
+      }
+  > {
+    const { repoFullName, path, bytes } = params;
+
+    if (isPdfPath(path)) {
+      const extracted = await extractPdfText({
+        buffer: bytes,
+        filename: path,
+        ocr: this.ocrContext,
+      });
+      const warning = describePdfExtractionWarning(extracted);
+      if (warning) {
+        this.log.warn(
+          { repo: repoFullName, path, reason: warning },
+          "GitHub: PDF page extraction warning",
+        );
+      }
+      if (!extracted.text.trim()) {
+        return {
+          text: null,
+          skipReason:
+            describePdfEmptyText(extracted) ??
+            "PDF yielded no extractable text",
+          skipCategory: "no_extractable_text",
+        };
+      }
+      return { text: extracted.text };
+    }
+
+    const text = bytes.toString("utf-8");
+    if (looksBinary(text)) {
+      return {
+        text: null,
+        skipReason: "Binary file",
+        skipCategory: "unsupported_type",
+      };
+    }
+    return { text };
+  }
 }
 
 // ===== Module-level helpers =====
 
-function createOctokit(
+const GITHUB_READBACK_PAGE_SIZE = 200;
+
+function githubItemSourceId(repoName: string, itemNumber: number): string {
+  return `${repoName}#${itemNumber}`;
+}
+
+function githubFileSourceId(repoName: string, filePath: string): string {
+  return `${repoName}#file:${filePath}`;
+}
+
+function githubRepoKey(repo: { owner: string; name: string }): string {
+  return `${repo.owner}/${repo.name}`;
+}
+
+/**
+ * Namespace a team by its org so team slugs never collide across orgs. Written
+ * on documents and stored by syncGroups identically, so the group data-contract
+ * byte-matches.
+ */
+function githubGroupId(org: string, teamSlug: string): string {
+  return `${org}/${teamSlug}`;
+}
+
+async function createOctokit(
   config: GithubConfig,
   credentials: ConnectorCredentials,
   log: pino.Logger,
-): Octokit {
+): Promise<Octokit> {
   const nativeFetch = globalThis.fetch;
+  const auth = await resolveGithubAuthToken(config, credentials, nativeFetch);
   return new Octokit({
-    auth: credentials.apiToken,
-    baseUrl: config.githubUrl.replace(/\/+$/, ""),
+    auth,
+    baseUrl: resolveGithubApiUrl(config, credentials).replace(/\/+$/, ""),
     log: {
       debug: (message: string) =>
         log.debug({ sdkMessage: message }, "SDK debug"),
@@ -499,11 +1125,73 @@ function createOctokit(
   });
 }
 
+// the App config owns the host its installation token is minted against, so
+// App-auth connectors must talk to that host regardless of config.githubUrl
+function resolveGithubApiUrl(
+  config: GithubConfig,
+  credentials: ConnectorCredentials,
+): string {
+  if (config.authMethod === "github_app" && credentials.githubApp) {
+    return credentials.githubApp.githubUrl;
+  }
+  return config.githubUrl;
+}
+
+async function resolveGithubAuthToken(
+  config: GithubConfig,
+  credentials: ConnectorCredentials,
+  fetchImpl: typeof fetch,
+): Promise<string> {
+  if (config.authMethod !== "github_app") {
+    return credentials.apiToken;
+  }
+
+  const app = credentials.githubApp;
+  if (!app) {
+    throw new Error(
+      "GitHub App credentials were not resolved for this connector",
+    );
+  }
+
+  return resolveInstallationToken(
+    {
+      githubUrl: app.githubUrl,
+      appId: app.appId,
+      installationId: app.installationId,
+      privateKey: credentials.apiToken,
+    },
+    fetchImpl,
+  );
+}
+
 function parseGithubConfig(
   config: Record<string, unknown>,
 ): GithubConfig | null {
   const result = GithubConfigSchema.safeParse({ type: "github", ...config });
   return result.success ? result.data : null;
+}
+
+function validateGithubConfig(config: GithubConfig): string | null {
+  if (!/^https?:\/\/.+/.test(config.githubUrl)) {
+    return "githubUrl must be a valid HTTP(S) URL";
+  }
+
+  if (config.authMethod === "github_app" && !config.githubAppConfigId) {
+    return "GitHub App authentication requires githubAppConfigId";
+  }
+
+  for (const settings of [config, ...(config.repositoryOverrides ?? [])]) {
+    for (const raw of settings.fileTypes ?? []) {
+      const entry = raw.trim();
+      if (entry === "*" || entry === "*.*") continue;
+      const literal = entry.startsWith("*.") ? entry.slice(2) : entry;
+      if (!literal || literal === "." || /[*?[\]{}/\\]/.test(literal)) {
+        return "File Types accepts extensions such as .md or *.md, exact names such as Dockerfile, or * for all text files. Paths and glob patterns are not supported; use Folders to select directories.";
+      }
+    }
+  }
+
+  return null;
 }
 
 type GithubRepo = {
@@ -519,23 +1207,27 @@ async function getRepos(
 ): Promise<GithubRepo[]> {
   if (config.repos && config.repos.length > 0) {
     const repos: GithubRepo[] = [];
-    for (const name of config.repos) {
+    for (const entry of config.repos) {
+      // A repo entry may be a bare name (belongs to config.owner) or a fully
+      // qualified `owner/repo` slug — users routinely paste the latter, and it
+      // is the only way to span multiple owners with a single owner field.
+      // Pairing a slug with config.owner would build `/repos/{owner}/{owner/repo}`
+      // which 404s and gets silently skipped, ingesting nothing.
+      const { owner, name } = parseRepoEntry(entry, config.owner);
       let defaultBranch: string | null = null;
+      let htmlUrl = deriveRepoHtmlUrl({
+        githubUrl: config.githubUrl,
+        owner,
+        name,
+      });
       try {
-        const response = await octokit.rest.repos.get({
-          owner: config.owner,
-          repo: name,
-        });
+        const response = await octokit.rest.repos.get({ owner, repo: name });
         defaultBranch = response.data.default_branch;
+        htmlUrl = response.data.html_url || htmlUrl;
       } catch {
         // If we can't fetch repo metadata, fall back to null (main→master fallback)
       }
-      repos.push({
-        owner: config.owner,
-        name,
-        htmlUrl: `${config.githubUrl.replace(/\/api\/v3$/, "").replace(/\/+$/, "")}/${config.owner}/${name}`,
-        defaultBranch,
-      });
+      repos.push({ owner, name, htmlUrl, defaultBranch });
     }
     return repos;
   }
@@ -545,27 +1237,89 @@ async function getRepos(
   let hasMore = true;
 
   while (hasMore) {
-    const response = await octokit.rest.repos.listForOrg({
-      org: config.owner,
-      per_page: 100,
-      page,
-      type: "all",
-    });
+    if (config.authMethod === "github_app") {
+      const response =
+        await octokit.rest.apps.listReposAccessibleToInstallation({
+          per_page: 100,
+          page,
+        });
 
-    for (const repo of response.data) {
-      repos.push({
-        owner: config.owner,
-        name: repo.name,
-        htmlUrl: repo.html_url,
-        defaultBranch: repo.default_branch ?? null,
+      for (const repo of response.data.repositories) {
+        repos.push({
+          owner: repo.owner?.login ?? config.owner,
+          name: repo.name,
+          htmlUrl: repo.html_url,
+          defaultBranch: repo.default_branch ?? null,
+        });
+      }
+
+      hasMore = response.data.repositories.length >= 100;
+    } else {
+      const response = await octokit.rest.repos.listForOrg({
+        org: config.owner,
+        per_page: 100,
+        page,
+        type: "all",
       });
+
+      for (const repo of response.data) {
+        repos.push({
+          owner: config.owner,
+          name: repo.name,
+          htmlUrl: repo.html_url,
+          defaultBranch: repo.default_branch ?? null,
+        });
+      }
+
+      hasMore = response.data.length >= 100;
     }
 
-    hasMore = response.data.length >= 100;
     page++;
   }
 
   return repos;
+}
+
+/**
+ * Best-effort web URL for a repo when GitHub's own `html_url` is unavailable.
+ * The configured URL is the API base: github.com serves its API from a separate
+ * `api.github.com` host, while GitHub Enterprise Server serves it under
+ * `/api/v3` on the web host.
+ */
+function deriveRepoHtmlUrl(params: {
+  githubUrl: string;
+  owner: string;
+  name: string;
+}): string {
+  const { githubUrl, owner, name } = params;
+  const base = githubUrl.replace(/\/+$/, "").replace(/\/api\/v3$/, "");
+  const webBase = base.replace(
+    /^(https?:\/\/)api\.github\.com$/i,
+    "$1github.com",
+  );
+  return `${webBase}/${owner}/${name}`;
+}
+
+/**
+ * Split a configured repo entry into its owner and bare name. Accepts either a
+ * bare `repo` (owned by `defaultOwner`) or a fully qualified `owner/repo` slug.
+ * Only the first slash separates owner from name; GitHub repo names never
+ * contain slashes, so anything after the first is folded back into the name and
+ * left to fail loudly at the API rather than being silently mis-split.
+ */
+function parseRepoEntry(
+  entry: string,
+  defaultOwner: string,
+): { owner: string; name: string } {
+  const trimmed = entry.trim();
+  const slash = trimmed.indexOf("/");
+  if (slash === -1) {
+    return { owner: defaultOwner, name: trimmed };
+  }
+  return {
+    owner: trimmed.slice(0, slash),
+    name: trimmed.slice(slash + 1),
+  };
 }
 
 const FALLBACK_BRANCHES = ["main", "master", "dev", "develop"];
@@ -640,31 +1394,199 @@ function shouldSkipItem(item: any, labelsToSkip?: string[]): boolean {
   return itemLabels.some((label) => labelsToSkip.includes(label));
 }
 
-function isMarkdownFile(path: string): boolean {
-  const lower = path.toLowerCase();
-  return lower.endsWith(".md") || lower.endsWith(".mdx");
+const DEFAULT_REPOSITORY_FILE_EXTENSIONS = [".md", ".mdx", ".yaml", ".yml"];
+
+/**
+ * Extensions that `*` leaves out without fetching: they are never text, and
+ * fetching each one would spend the credential's hourly request budget only to
+ * discard the result. Anything else that turns out to be binary is caught by
+ * {@link looksBinary} after the fetch. `.pdf` is here because `*` means text
+ * files; an explicit `.pdf` entry selects PDFs for text extraction.
+ */
+const BINARY_FILE_EXTENSIONS = new Set([
+  ".7z",
+  ".avif",
+  ".bin",
+  ".bmp",
+  ".class",
+  ".dll",
+  ".dylib",
+  ".eot",
+  ".exe",
+  ".gif",
+  ".gz",
+  ".ico",
+  ".jar",
+  ".jpeg",
+  ".jpg",
+  ".mov",
+  ".mp3",
+  ".mp4",
+  ".otf",
+  ".pdf",
+  ".png",
+  ".pyc",
+  ".so",
+  ".tar",
+  ".tgz",
+  ".ttf",
+  ".wasm",
+  ".webm",
+  ".webp",
+  ".woff",
+  ".woff2",
+  ".zip",
+]);
+
+type FileTypeFilter = {
+  /** `*`: every text file. */
+  allTextFiles: boolean;
+  suffixes: string[];
+  basenames: string[];
+};
+
+/**
+ * Parse the configured File Types. An entry is one of:
+ * - `*`: every text file;
+ * - an extension, with or without the dot or a leading `*` (`.md`, `md`,
+ *   `*.md`, `.tm.hcl`);
+ * - an exact file name (`Dockerfile`, `Makefile`), matched in any folder.
+ * A dotless entry is ambiguous between the last two, so it matches either way.
+ */
+function getFileTypeFilter(config: GithubConfig): FileTypeFilter {
+  const entries =
+    config.fileTypes && config.fileTypes.length > 0
+      ? config.fileTypes
+      : DEFAULT_REPOSITORY_FILE_EXTENSIONS;
+
+  const filter: FileTypeFilter = {
+    allTextFiles: false,
+    suffixes: [],
+    basenames: [],
+  };
+  for (const raw of entries) {
+    const entry = raw.trim().toLowerCase();
+    if (!entry) continue;
+    if (entry === "*" || entry === "*.*") {
+      filter.allTextFiles = true;
+    } else if (entry.startsWith("*.")) {
+      filter.suffixes.push(entry.slice(1));
+    } else if (entry.startsWith(".")) {
+      filter.suffixes.push(entry);
+    } else {
+      filter.suffixes.push(`.${entry}`);
+      filter.basenames.push(entry);
+    }
+  }
+  return filter;
 }
 
+function isIndexedRepositoryFile(
+  path: string,
+  filter: FileTypeFilter,
+): boolean {
+  const lower = path.toLowerCase();
+  const basename = lower.slice(lower.lastIndexOf("/") + 1);
+  if (
+    filter.basenames.includes(basename) ||
+    filter.suffixes.some((suffix) => lower.endsWith(suffix))
+  ) {
+    return true;
+  }
+  if (!filter.allTextFiles) return false;
+  const dot = basename.lastIndexOf(".");
+  return dot <= 0 || !BINARY_FILE_EXTENSIONS.has(basename.slice(dot));
+}
+
+/**
+ * Git's own heuristic: a NUL byte near the start of a file marks it binary.
+ * Text decoded from such a file is noise, not knowledge.
+ */
+function looksBinary(content: string): boolean {
+  return content.slice(0, 8000).includes("\u0000");
+}
+
+/**
+ * Normalize the configured folders into repo-root-relative prefixes: users
+ * paste `/docs`, `docs/`, or `./docs` interchangeably, and a tree path never
+ * carries a leading slash. Root entries (`/`, `./`, `.`) normalize away for
+ * includes. Exclusions use keepRoot to retain an empty prefix that matches
+ * every file. Blank entries are always discarded.
+ */
+function normalizePathPrefixes(paths: string[], keepRoot = false): string[] {
+  return paths
+    .filter((entry) => entry.trim() !== "")
+    .map((entry) =>
+      entry
+        .trim()
+        .replace(/\\/g, "/")
+        .replace(/\/+/g, "/")
+        .replace(/^(\.\/|\/)+/, "")
+        .replace(/\/+$/, ""),
+    )
+    .map((entry) => (entry === "." ? "" : entry))
+    .filter((entry) => keepRoot || entry !== "");
+}
+
+/**
+ * A file is in scope when it sits at or under one of the prefixes. The `/`
+ * boundary matters: `docs` must not swallow `docs-internal/guide.md`.
+ * Comparison is case-sensitive because git paths are.
+ */
+function isWithinIndexedPaths(path: string, prefixes: string[]): boolean {
+  if (prefixes.length === 0) return true;
+  return prefixes.some(
+    (prefix) =>
+      prefix === "" || path === prefix || path.startsWith(`${prefix}/`),
+  );
+}
+
+type RepositoryFile = { path: string; sha: string; size?: number };
+
+/**
+ * Download a repository file's raw bytes. Decoding is the caller's job: text
+ * files read as UTF-8, while PDFs must reach the extractor byte-for-byte.
+ */
 async function getFileContent(
   octokit: Octokit,
   repo: { owner: string; name: string },
-  path: string,
-): Promise<string> {
-  const response = await octokit.rest.repos.getContent({
-    owner: repo.owner,
-    repo: repo.name,
-    path,
-  });
+  file: RepositoryFile,
+): Promise<Buffer> {
+  if (file.size === undefined || file.size <= CONTENTS_API_MAX_FILE_BYTES) {
+    const response = await octokit.rest.repos.getContent({
+      owner: repo.owner,
+      repo: repo.name,
+      path: file.path,
+    });
 
-  const data = response.data;
-  if (!("content" in data) || !data.content) {
-    throw new Error(`No content returned for ${path}`);
+    const data = response.data;
+    if ("content" in data && data.content) {
+      return Buffer.from(data.content, "base64");
+    }
   }
 
-  return Buffer.from(data.content, "base64").toString("utf-8");
+  // Past the Contents API's inline limit GitHub returns the file's metadata
+  // with empty content; the blob itself is readable up to 100 MB.
+  const blob = await octokit.rest.git.getBlob({
+    owner: repo.owner,
+    repo: repo.name,
+    file_sha: file.sha,
+  });
+  if (!blob.data.content) {
+    throw new Error(`No content returned for ${file.path}`);
+  }
+
+  return Buffer.from(
+    blob.data.content,
+    blob.data.encoding === "base64" ? "base64" : "utf-8",
+  );
 }
 
-function markdownFileToDocument(
+function isPdfPath(path: string): boolean {
+  return path.toLowerCase().endsWith(".pdf");
+}
+
+function repositoryFileToDocument(
   filePath: string,
   content: string,
   repo: { owner: string; name: string; htmlUrl: string },
@@ -672,14 +1594,15 @@ function markdownFileToDocument(
 ): ConnectorDocument {
   const fileName = filePath.split("/").pop() ?? filePath;
   return {
-    id: `${repo.name}#file:${filePath}`,
+    id: githubFileSourceId(repo.name, filePath),
     title: `${fileName} (${repo.owner}/${repo.name})`,
     content,
     sourceUrl: `${repo.htmlUrl}/blob/${branch}/${filePath}`,
     metadata: {
       repo: `${repo.owner}/${repo.name}`,
       filePath,
-      kind: "markdown_file",
+      kind: "repository_file",
+      fileKind: "repository_file",
     },
   };
 }
@@ -703,7 +1626,7 @@ function itemToDocument(
   }
 
   return {
-    id: `${repo.name}#${item.number}`,
+    id: githubItemSourceId(repo.name, item.number),
     title: `${item.title} (${repo.owner}/${repo.name}#${item.number})`,
     content: contentParts.join("\n"),
     sourceUrl: item.html_url,

@@ -1,19 +1,37 @@
 export { anthropicAdapterFactory } from "./anthropic";
+export { archestraAdapterFactory } from "./archestra";
 export { azureAdapterFactory } from "./azure";
 export { azureResponsesAdapterFactory } from "./azure-responses";
 export { bedrockAdapterFactory } from "./bedrock";
+export { bedrockInvokeAdapterFactory } from "./bedrock-invoke";
 export { cerebrasAdapterFactory } from "./cerebras";
 export { cohereAdapterFactory } from "./cohere";
 export { deepseekAdapterFactory } from "./deepseek";
 export { geminiAdapterFactory } from "./gemini";
+export { geminiEmbeddingsAdapterFactory } from "./gemini-embeddings";
+export { githubCopilotAdapterFactory } from "./github-copilot";
+export { githubCopilotResponsesAdapterFactory } from "./github-copilot-responses";
 export { groqAdapterFactory } from "./groq";
+export { jevAdapterFactory } from "./jev";
+export { kimiAdapterFactory } from "./kimi";
+export { kimiCodeAdapterFactory } from "./kimi-code";
+export { microsoft365CopilotAdapterFactory } from "./microsoft-365-copilot";
 export { minimaxAdapterFactory } from "./minimax";
 export { mistralAdapterFactory } from "./mistral";
 export { ollamaAdapterFactory } from "./ollama";
-export { openaiAdapterFactory } from "./openai";
-export { openAiResponsesAdapterFactory } from "./openai-responses";
+export { ollamaNativeAdapterFactory } from "./ollama-native";
+export {
+  makeOpenAiCompatibleEmbeddingsAdapterFactory,
+  openAiEmbeddingsAdapterFactory,
+  openaiAdapterFactory,
+} from "./openai";
+export {
+  openAiResponsesAdapterFactory,
+  openAiResponsesCompactAdapterFactory,
+} from "./openai-responses";
 export { openrouterAdapterFactory } from "./openrouter";
 export { perplexityAdapterFactory } from "./perplexity";
+export { perplexityResponsesAdapterFactory } from "./perplexity-responses";
 export { vllmAdapterFactory } from "./vllm";
-export { xaiAdapterFactory } from "./xai";
+export { xaiAdapterFactory, xaiOpenAiUsageAdapterFactory } from "./xai";
 export { zhipuaiAdapterFactory } from "./zhipuai";

@@ -1,0 +1,220 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { createElement, type ReactNode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("sonner");
+
+const getInteractionsMock = vi.hoisted(() => vi.fn());
+const getUniqueUserIdsMock = vi.hoisted(() => vi.fn());
+vi.mock("@archestra/shared/api-sdk", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@archestra/shared/api-sdk")>()),
+  getLlmProxyLogs: getInteractionsMock,
+  getLlmProxyLogUserIds: getUniqueUserIdsMock,
+}));
+
+import {
+  isSessionId,
+  useExportSessionInteractions,
+  useInteractionUserOptions,
+} from "./interaction.query";
+
+describe("useInteractionUserOptions freshness", () => {
+  it("revalidates an open default picker and cached results when it is reopened", async () => {
+    vi.useFakeTimers();
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 300_000 } },
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+    const initial = [{ id: "synthetic", name: "Before" }];
+    const updated = [{ id: "synthetic", name: "After" }];
+    client.setQueryData(["interactions", "userIds", "options", ""], initial);
+    getUniqueUserIdsMock.mockResolvedValue({ data: updated });
+    const picker = renderHook(
+      ({ enabled }) => useInteractionUserOptions({ search: "", enabled }),
+      { wrapper, initialProps: { enabled: false } },
+    );
+    try {
+      getUniqueUserIdsMock.mockClear();
+      picker.rerender({ enabled: true });
+      await act(() => vi.advanceTimersByTimeAsync(10));
+      expect(picker.result.current.data).toEqual(updated);
+      expect(getUniqueUserIdsMock).toHaveBeenCalledTimes(1);
+      getUniqueUserIdsMock.mockResolvedValue({ data: initial });
+      await act(() => vi.advanceTimersByTimeAsync(20_010));
+      expect(picker.result.current.data).toEqual(initial);
+      expect(getUniqueUserIdsMock).toHaveBeenCalledTimes(2);
+      picker.rerender({ enabled: false });
+      await act(() => vi.advanceTimersByTimeAsync(60_000));
+      expect(getUniqueUserIdsMock).toHaveBeenCalledTimes(2);
+      getUniqueUserIdsMock.mockResolvedValue({ data: updated });
+      picker.rerender({ enabled: true });
+      await act(() => vi.advanceTimersByTimeAsync(10));
+      expect(picker.result.current.data).toEqual(updated);
+      expect(getUniqueUserIdsMock).toHaveBeenCalledTimes(3);
+    } finally {
+      picker.unmount();
+      client.clear();
+      vi.useRealTimers();
+    }
+  });
+});
+
+// The logs search box only filters by session ID (free-text content search was
+// removed), so this predicate decides whether a typed term filters or is
+// ignored. Pin the accepted shapes and the rejection of anything else.
+describe("isSessionId", () => {
+  const uuid = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
+  it("accepts a bare UUID", () => {
+    expect(isSessionId(uuid)).toBe(true);
+  });
+
+  it("accepts a scheduled-<UUID> session ID", () => {
+    expect(isSessionId(`scheduled-${uuid}`)).toBe(true);
+  });
+
+  it("accepts an OpenCode session ID", () => {
+    expect(isSessionId("ses_f49a8a42cffe6WL2TufX4o2cqZ")).toBe(true);
+    expect(isSessionId("ses_")).toBe(false);
+    expect(isSessionId("ses_ report")).toBe(false);
+  });
+
+  it("is case-insensitive", () => {
+    expect(isSessionId(uuid.toUpperCase())).toBe(true);
+  });
+
+  it("rejects arbitrary free-text search terms", () => {
+    expect(isSessionId("summarize the quarterly report")).toBe(false);
+    expect(isSessionId("gpt-4o")).toBe(false);
+    expect(isSessionId("")).toBe(false);
+  });
+
+  it("rejects partial or padded UUIDs", () => {
+    expect(isSessionId(uuid.slice(0, 8))).toBe(false);
+    expect(isSessionId(` ${uuid} `)).toBe(false);
+    expect(isSessionId(`session ${uuid}`)).toBe(false);
+    // Only the `scheduled-` prefix is allowed, not arbitrary prefixes.
+    expect(isSessionId(`task-${uuid}`)).toBe(false);
+  });
+});
+
+// The export must contain the whole session, not just the first page —
+// support workflows share these files to diagnose guardrail decisions, and a
+// silently truncated export would hide the interaction that matters.
+describe("useExportSessionInteractions", () => {
+  const sessionId = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
+  function makePage(params: {
+    ids: string[];
+    total: number;
+    hasNext: boolean;
+  }) {
+    return {
+      data: {
+        data: params.ids.map((id) => ({ id })),
+        pagination: {
+          currentPage: 1,
+          limit: 100,
+          total: params.total,
+          totalPages: Math.ceil(params.total / 100),
+          hasNext: params.hasNext,
+          hasPrev: false,
+        },
+      },
+    };
+  }
+
+  function renderExportHook() {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    return renderHook(() => useExportSessionInteractions(), {
+      wrapper: ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children),
+    });
+  }
+
+  beforeEach(() => {
+    // Unspy DOM/URL prototype spies from the previous test — vi.spyOn on an
+    // already-spied method returns the same mock, so calls would leak across
+    // tests otherwise.
+    vi.restoreAllMocks();
+    getInteractionsMock.mockReset();
+  });
+
+  it("pages through the whole session and downloads every interaction", async () => {
+    getInteractionsMock
+      .mockResolvedValueOnce(
+        makePage({ ids: ["row-1", "row-2"], total: 102, hasNext: true }),
+      )
+      .mockResolvedValueOnce(
+        makePage({ ids: ["row-3"], total: 102, hasNext: false }),
+      );
+
+    let downloadedJson: string | null = null;
+    vi.spyOn(URL, "createObjectURL").mockImplementation((blob) => {
+      void (blob as Blob).text().then((text) => {
+        downloadedJson = text;
+      });
+      return "blob:mock";
+    });
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    const clickSpy = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => {});
+
+    const { result } = renderExportHook();
+    result.current.mutate({ sessionId });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // Both pages were fetched, in chronological order for a readable export.
+    expect(getInteractionsMock).toHaveBeenCalledTimes(2);
+    expect(getInteractionsMock).toHaveBeenNthCalledWith(1, {
+      query: {
+        sessionId,
+        limit: 100,
+        offset: 0,
+        sortBy: "createdAt",
+        sortDirection: "asc",
+      },
+    });
+    expect(getInteractionsMock).toHaveBeenNthCalledWith(2, {
+      query: {
+        sessionId,
+        limit: 100,
+        offset: 100,
+        sortBy: "createdAt",
+        sortDirection: "asc",
+      },
+    });
+
+    expect(clickSpy).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(downloadedJson).not.toBeNull());
+    const payload = JSON.parse(downloadedJson ?? "{}");
+    expect(payload.sessionId).toBe(sessionId);
+    expect(payload.interactionCount).toBe(3);
+    expect(payload.interactions.map((i: { id: string }) => i.id)).toEqual([
+      "row-1",
+      "row-2",
+      "row-3",
+    ]);
+  });
+
+  it("fails the mutation when a page fetch errors", async () => {
+    getInteractionsMock.mockResolvedValueOnce({
+      error: { error: { message: "boom", type: "api_error" } },
+    });
+    const clickSpy = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => {});
+
+    const { result } = renderExportHook();
+    result.current.mutate({ sessionId });
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(clickSpy).not.toHaveBeenCalled();
+  });
+});

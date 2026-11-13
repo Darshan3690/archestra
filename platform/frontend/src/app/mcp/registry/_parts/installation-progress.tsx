@@ -1,10 +1,12 @@
 "use client";
 
-import type { McpDeploymentStatusEntry } from "@shared";
+import type { McpDeploymentStatusEntry } from "@archestra/shared";
 import { FileText } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
+import { DesktopMcpWaitingStatus } from "./desktop-mcp-install-status";
+import type { CatalogServerType } from "./mcp-server-type";
 
 type InstallationStatus =
   | "idle"
@@ -18,12 +20,17 @@ interface InstallationProgressProps {
   serverId?: string;
   deploymentStatuses?: Record<string, McpDeploymentStatusEntry>;
   onMoreDetails?: () => void;
+  /**
+   * A remote MCP server has no deployment; its first phase is connecting. A
+   * desktop MCP server's first phase is waiting for the user's computer.
+   */
+  serverType?: CatalogServerType;
 }
 
 const PHASES = {
   pending: {
     progress: 33,
-    description: "Starting the Deployment",
+    description: "Starting the deployment",
   },
   "discovering-tools": {
     progress: 66,
@@ -96,11 +103,16 @@ export function InstallationProgress({
   serverId,
   deploymentStatuses = {},
   onMoreDetails,
+  serverType,
 }: InstallationProgressProps) {
   const phaseInfo = useMemo(() => {
     if (!status || status === "idle") return null;
-    return PHASES[status as keyof typeof PHASES] ?? null;
-  }, [status]);
+    const phase = PHASES[status as keyof typeof PHASES] ?? null;
+    if (phase && status === "pending" && serverType === "remote") {
+      return { ...phase, description: "Connecting" };
+    }
+    return phase;
+  }, [status, serverType]);
 
   // Check if the K8s deployment has failed while installation is still "pending"
   const deploymentState = serverId ? deploymentStatuses[serverId] : null;
@@ -127,6 +139,14 @@ export function InstallationProgress({
 
   if (!status || status === "idle" || status === "success") {
     return null;
+  }
+
+  // It can wait for days, until the MCP bridge on the user's computer runs
+  // the server: no progress to animate, and the Devices tab says why.
+  if (serverType === "desktop_mcp" && status === "pending") {
+    return (
+      <DesktopMcpWaitingStatus className="text-xs text-muted-foreground" />
+    );
   }
 
   return (

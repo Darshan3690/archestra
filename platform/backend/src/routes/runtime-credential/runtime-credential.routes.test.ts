@@ -1,0 +1,257 @@
+import { and, eq } from "drizzle-orm";
+import type { MockInstance } from "vitest";
+import db, { schema } from "@/database";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { agentSandboxApi } from "@/k8s/agent-runtime/sandbox-api";
+import { registerAuditLogHook } from "@/middleware/audit-log-hook";
+import { createRuntimeCredentialDefinition } from "@/services/agent-runtime/runtime-credentials";
+import { afterEach, beforeEach, describe, expect, test, vi } from "@/test";
+import type { Agent, User } from "@/types";
+
+describe("Runtime credential routes", () => {
+  let app: FastifyInstanceWithZod;
+  let agent: Agent;
+  let user: User;
+  let organizationId: string;
+  let sandboxInstalled: MockInstance<() => boolean>;
+
+  beforeEach(async ({ makeAgent, makeAdmin, makeMember, makeOrganization }) => {
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    user = await makeAdmin();
+    await makeMember(user.id, organizationId, { role: "admin" });
+    await createRuntimeCredentialDefinition({
+      organizationId,
+      userId: user.id,
+      definition: {
+        key: "github",
+        name: "GitHub PAT",
+        description: "Repository access",
+        icon: "logo:github",
+        allowPersonal: true,
+        allowOrganization: false,
+      },
+    });
+    agent = await makeAgent({
+      organizationId,
+      authorId: user.id,
+      agentType: "agent",
+      runtime: {
+        image: "example.com/coding-agent:latest",
+        command: null,
+        inferenceProtocol: "openai_responses",
+        backend: "kubernetes",
+        steerMode: "pipe",
+        privileged: false,
+        environment: null,
+        credentials: [
+          {
+            key: "GITHUB_TOKEN",
+            credentialId: "github",
+            scope: "per_user",
+            label: "GitHub token",
+            required: true,
+          },
+        ],
+        ttlHours: null,
+        idleTimeoutMinutes: null,
+      },
+    });
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { user: User }).user = user;
+      (request as typeof request & { organizationId: string }).organizationId =
+        organizationId;
+    });
+    registerAuditLogHook(app);
+    const { default: routes } = await import("./runtime-credential.routes");
+    await app.register(routes);
+
+    sandboxInstalled = vi
+      .spyOn(agentSandboxApi, "isInstalled", "get")
+      .mockReturnValue(true);
+  });
+
+  test("GitHub App definitions require organization ownership", async () => {
+    const definition = {
+      key: "repository-app",
+      name: "Repository App",
+      kind: "github_app",
+      description: "Repository access",
+      icon: "logo:github",
+      githubUrl: "https://api.github.com",
+      appId: "123",
+      installationId: "456",
+      allowPersonal: true,
+      allowOrganization: false,
+    };
+    const rejected = await app.inject({
+      method: "POST",
+      url: "/api/credentials",
+      payload: definition,
+    });
+    expect(rejected.statusCode).toBe(400);
+    expect(rejected.json().error.message).toContain(
+      "provided by the organization",
+    );
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/credentials",
+      payload: { ...definition, allowPersonal: false, allowOrganization: true },
+    });
+    expect(created.statusCode).toBe(200);
+    expect(created.json()).toMatchObject({
+      kind: "github_app",
+      allowPersonal: false,
+      allowOrganization: true,
+    });
+    const [audit] = await db
+      .select()
+      .from(schema.auditLogsTable)
+      .where(eq(schema.auditLogsTable.action, "credential.created"));
+    expect(audit).toBeDefined();
+    expect(JSON.stringify(audit)).toContain("repository-app");
+  });
+
+  afterEach(async () => {
+    sandboxInstalled.mockRestore();
+    await app.close();
+  });
+
+  test("lists custom credentials and tracks a personal connection without exposing its value", async () => {
+    const initial = await app.inject({
+      method: "GET",
+      url: "/api/credentials",
+    });
+    expect(initial.statusCode).toBe(200);
+    expect(initial.json()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          key: "github",
+          builtIn: false,
+          personalConfigured: false,
+          organizationConfigured: false,
+        }),
+      ]),
+    );
+
+    const connected = await app.inject({
+      method: "PUT",
+      url: "/api/credentials/github/personal",
+      payload: { value: "personal-github-token" },
+    });
+    expect(connected.statusCode).toBe(200);
+
+    const listed = await app.inject({
+      method: "GET",
+      url: "/api/credentials",
+    });
+    const github = listed
+      .json<Array<Record<string, unknown>>>()
+      .find((definition) => definition.key === "github");
+    expect(github).toEqual(
+      expect.objectContaining({
+        personalConfigured: true,
+        organizationConfigured: false,
+      }),
+    );
+    expect(JSON.stringify(listed.json())).not.toContain(
+      "personal-github-token",
+    );
+  });
+
+  test("lists Agents that use a credential", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/credentials/github/usage",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      agents: [{ id: agent.id, name: agent.name }],
+      resources: [],
+    });
+  });
+
+  test("creates a custom credential and reuses its organization connection", async () => {
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/credentials",
+      payload: {
+        key: "gitlab-pat",
+        name: "GitLab access token",
+        description: "Access GitLab repositories",
+        icon: null,
+        allowPersonal: false,
+        allowOrganization: true,
+      },
+    });
+    expect(created.statusCode).toBe(200);
+
+    const connected = await app.inject({
+      method: "PUT",
+      url: "/api/credentials/gitlab-pat/organization",
+      payload: { value: "shared-gitlab-token" },
+    });
+    expect(connected.statusCode).toBe(200);
+
+    const listed = await app.inject({
+      method: "GET",
+      url: "/api/credentials",
+    });
+    expect(
+      listed
+        .json<Array<{ key: string }>>()
+        .slice(0, 2)
+        .map(({ key }) => key),
+    ).toEqual(["github", "gitlab-pat"]);
+    expect(listed.json()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          key: "gitlab-pat",
+          builtIn: false,
+          organizationConfigured: true,
+        }),
+      ]),
+    );
+
+    const [audit] = await db
+      .select({
+        action: schema.auditLogsTable.action,
+        before: schema.auditLogsTable.before,
+        after: schema.auditLogsTable.after,
+      })
+      .from(schema.auditLogsTable)
+      .where(
+        and(
+          eq(schema.auditLogsTable.organizationId, organizationId),
+          eq(schema.auditLogsTable.action, "credential.updated"),
+        ),
+      );
+    expect(audit).toBeDefined();
+    expect(JSON.stringify(audit)).not.toContain("shared-gitlab-token");
+  });
+
+  test("rejects an organization connection for a personal-only credential", async () => {
+    const response = await app.inject({
+      method: "PUT",
+      url: "/api/credentials/github/organization",
+      payload: { value: "not-stored" },
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  test("keeps credentials available when the Agent Sandbox controller is not installed", async () => {
+    sandboxInstalled.mockReturnValue(false);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/credentials",
+    });
+
+    expect(response.statusCode).toBe(200);
+  });
+});

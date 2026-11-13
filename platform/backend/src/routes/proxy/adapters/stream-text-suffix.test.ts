@@ -1,0 +1,1127 @@
+import { describe, expect, test } from "vitest";
+import {
+  formatSessionReceipt,
+  stripSessionReceipts,
+} from "@/openappa/session-token";
+import { anthropicAdapterFactory } from "./anthropic";
+import { makeAnthropicOpenaiAdapterFactory } from "./anthropic-openai";
+import type { AnthropicOpenaiContext } from "./anthropic-openai-translator";
+import { azureAdapterFactory } from "./azure";
+import { azureResponsesAdapterFactory } from "./azure-responses";
+import { makeBedrockOpenaiAdapterFactory } from "./bedrock-openai";
+import { makeCohereOpenaiAdapterFactory } from "./cohere-openai";
+import { makeGeminiOpenaiAdapterFactory } from "./gemini-openai";
+import { openaiAdapterFactory } from "./openai";
+import { openAiResponsesAdapterFactory } from "./openai-responses";
+import { makeResponsesFromChatAdapterFactory } from "./openai-responses-from-chat";
+
+const suffix = "<receipt>";
+const receiptCode = "XK7-Q2M9";
+
+function signedPrefix(_text: string): string {
+  return formatSessionReceipt(receiptCode);
+}
+
+function restoreText(text: string) {
+  const restored = stripSessionReceipts(text);
+  return {
+    text: restored.text,
+    sessionIds: restored.codes.length > 0 ? ["parent"] : [],
+  };
+}
+
+function frames(sse: string): Array<Record<string, unknown>> {
+  return sse.split("\n\n").flatMap((frame) => {
+    const data = frame.match(/^data: (.+)$/m)?.[1];
+    return data && data !== "[DONE]" ? [JSON.parse(data)] : [];
+  });
+}
+
+function textDelta(content: string, finishReason: string | null = null) {
+  return {
+    id: "chatcmpl_1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "gpt-test",
+    choices: [{ index: 0, delta: { content }, finish_reason: finishReason }],
+  };
+}
+
+describe("stream text suffix seam", () => {
+  test("Chat Completions places the receipt on the first text delta", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    let firstText = "";
+    adapter.setTextSuffix?.((text) => {
+      firstText = text;
+      return text === "answer" ? suffix : "";
+    });
+
+    const first = adapter.processChunk(textDelta("answer") as never);
+    const contents = frames(String(first.sseData)).map(
+      (frame) =>
+        (frame.choices as Array<{ delta: { content?: string } }>)[0].delta
+          .content,
+    );
+
+    expect(firstText).toBe("answer");
+    expect(contents).toEqual([suffix, `\n\nanswer`]);
+    expect(adapter.state.text).toBe("answer");
+    expect(adapter.toProviderResponse().choices[0].message.content).toBe(
+      "answer",
+    );
+  });
+
+  test("Anthropic places the receipt on the first text delta", () => {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+    adapter.setTextSuffix?.(() => suffix);
+    adapter.processChunk({
+      type: "message_start",
+      message: { usage: {} },
+    } as never);
+    adapter.processChunk({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    } as never);
+    const delta = adapter.processChunk({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "answer" },
+    } as never);
+    const output = String(delta.sseData);
+
+    expect(output).toContain(`"text":"${suffix}"`);
+    expect(output).toContain(`"text":"\\n\\nanswer"`);
+    expect(adapter.toProviderResponse().content).toContainEqual(
+      expect.objectContaining({ type: "text", text: "answer" }),
+    );
+  });
+
+  test("Anthropic keeps a multipart receipt on only its first text block", () => {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+    adapter.setTextSuffix?.(signedPrefix);
+    let sse = "";
+    const process = (chunk: unknown) => {
+      sse += String(adapter.processChunk(chunk as never).sseData ?? "");
+    };
+
+    process({ type: "message_start", message: { usage: {} } });
+    process({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    });
+    process({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "first" },
+    });
+    process({ type: "content_block_stop", index: 0 });
+    process({
+      type: "content_block_start",
+      index: 1,
+      content_block: { type: "text", text: "" },
+    });
+    process({
+      type: "content_block_delta",
+      index: 1,
+      delta: { type: "text_delta", text: "second" },
+    });
+    process({ type: "content_block_stop", index: 1 });
+    process({ type: "message_stop" });
+    sse += adapter.formatEndSSE();
+
+    const textByBlock = new Map<number, string>();
+    for (const frame of frames(sse)) {
+      if (frame.type !== "content_block_delta") continue;
+      const delta = frame.delta as { type: string; text?: string };
+      if (delta.type !== "text_delta") continue;
+      const index = frame.index as number;
+      textByBlock.set(index, `${textByBlock.get(index) ?? ""}${delta.text}`);
+    }
+
+    expect(restoreText(textByBlock.get(0) ?? "")).toEqual({
+      text: "first",
+      sessionIds: ["parent"],
+    });
+    expect(restoreText(textByBlock.get(1) ?? "")).toEqual({
+      text: "second",
+      sessionIds: [],
+    });
+    expect(adapter.state.text).toBe("firstsecond");
+    expect(
+      frames(sse)
+        .filter((frame) => frame.type === "content_block_stop")
+        .map((frame) => frame.index),
+    ).toEqual([0, 1]);
+    expect(
+      frames(sse).filter((frame) => frame.type === "message_stop"),
+    ).toHaveLength(1);
+    expect(adapter.toProviderResponse().content).toContainEqual(
+      expect.objectContaining({ type: "text", text: "firstsecond" }),
+    );
+  });
+
+  test.each([
+    "end_turn",
+    "max_tokens",
+    "tool_use",
+  ] as const)("Anthropic emits one first-delta prefix and each block stop exactly once across %s", (stopReason) => {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+    const prefixInputs: string[] = [];
+    adapter.setTextSuffix?.((firstText) => {
+      prefixInputs.push(firstText);
+      return signedPrefix(firstText);
+    });
+    let sse = "";
+    const process = (chunk: unknown) => {
+      const result = adapter.processChunk(chunk as never);
+      sse += String(result.sseData ?? "");
+      return result;
+    };
+    process({
+      type: "message_start",
+      message: { id: "msg_1", model: "claude-test", usage: {} },
+    });
+    process({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    });
+    process({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "answer" },
+    });
+    process({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: " tail" },
+    });
+    const stopped = process({ type: "content_block_stop", index: 0 });
+    expect(frames(String(stopped.sseData))).toEqual([
+      { type: "content_block_stop", index: 0 },
+    ]);
+    if (stopReason === "tool_use") {
+      const tool = process({
+        type: "content_block_start",
+        index: 1,
+        content_block: { type: "tool_use", id: "call_1", name: "read" },
+      });
+      expect(tool.sseData).toBeNull();
+      process({ type: "content_block_stop", index: 1 });
+      sse += (adapter.formatToolCallsSSE?.(adapter.state.toolCalls) ?? []).join(
+        "",
+      );
+    }
+    process({ type: "message_delta", delta: { stop_reason: stopReason } });
+    expect(process({ type: "message_stop" })).toMatchObject({
+      sseData: null,
+      isFinal: true,
+    });
+    sse += adapter.formatEndSSE();
+    const output = frames(sse);
+    expect(prefixInputs).toEqual(["answer"]);
+    expect(
+      output
+        .filter(
+          (frame) =>
+            frame.type === "content_block_delta" &&
+            (frame.delta as { type: string }).type === "text_delta",
+        )
+        .map((frame) => (frame.delta as { text: string }).text),
+    ).toEqual([signedPrefix("answer"), "\n\nanswer", " tail"]);
+    expect(
+      output
+        .filter((frame) => frame.type === "content_block_stop")
+        .map((frame) => frame.index),
+    ).toEqual(stopReason === "tool_use" ? [0, 1] : [0]);
+    expect(
+      output.filter((frame) => frame.type === "message_stop"),
+    ).toHaveLength(1);
+    expect(
+      output.find((frame) => frame.type === "message_delta"),
+    ).toMatchObject({ delta: { stop_reason: stopReason } });
+    expect(adapter.state.text).toBe("answer tail");
+    expect(adapter.toProviderResponse().content).toContainEqual(
+      expect.objectContaining({ type: "text", text: "answer tail" }),
+    );
+  });
+
+  test.each([
+    ["OpenAI", openAiResponsesAdapterFactory],
+    ["Azure", azureResponsesAdapterFactory],
+  ])("%s Responses keeps output terminal events and completed response consistent", (_provider, factory) => {
+    const adapter = factory.createStreamAdapter();
+    adapter.setTextSuffix?.(() => suffix);
+    const first = adapter.processChunk({
+      type: "response.output_text.delta",
+      item_id: "msg_1",
+      output_index: 0,
+      content_index: 0,
+      sequence_number: 1,
+      delta: "answer",
+    } as never);
+    expect(frames(String(first.sseData)).map((frame) => frame.delta)).toEqual([
+      suffix,
+      `\n\nanswer`,
+    ]);
+    for (const chunk of [
+      {
+        type: "response.output_text.done",
+        item_id: "msg_1",
+        output_index: 0,
+        content_index: 0,
+        sequence_number: 2,
+        text: "answer",
+      },
+      {
+        type: "response.content_part.done",
+        item_id: "msg_1",
+        output_index: 0,
+        content_index: 0,
+        sequence_number: 3,
+        part: { type: "output_text", text: "answer", annotations: [] },
+      },
+      {
+        type: "response.output_item.done",
+        output_index: 0,
+        sequence_number: 4,
+        item: {
+          id: "msg_1",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "answer", annotations: [] }],
+        },
+      },
+    ]) {
+      expect(adapter.processChunk(chunk as never).sseData).toBeNull();
+    }
+    const completed = adapter.processChunk({
+      type: "response.completed",
+      sequence_number: 5,
+      response: {
+        id: "resp_1",
+        object: "response",
+        model: "gpt-test",
+        status: "completed",
+        output: [
+          {
+            id: "msg_1",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: "answer", annotations: [] }],
+          },
+        ],
+      },
+    } as never);
+
+    const output = frames(
+      `${first.sseData ?? ""}${completed.sseData ?? ""}${adapter.formatEndSSE()}`,
+    );
+    expect(
+      output.filter((frame) => frame.type === "response.output_item.done"),
+    ).toHaveLength(1);
+    expect(
+      output.filter((frame) => frame.type === "response.completed"),
+    ).toHaveLength(1);
+    expect(
+      output.find((frame) => frame.type === "response.output_item.done"),
+    ).toMatchObject({
+      item: {
+        id: "msg_1",
+        content: [{ type: "output_text", text: `${suffix}\n\nanswer` }],
+      },
+    });
+    expect(
+      (
+        adapter.toProviderResponse().output[0] as {
+          content: Array<{ text: string }>;
+        }
+      ).content[0].text,
+    ).toBe("answer");
+  });
+
+  test.each([
+    [
+      "OpenAI messages",
+      openAiResponsesAdapterFactory,
+      [["checking"], ["answer"]],
+    ],
+    [
+      "Azure messages",
+      azureResponsesAdapterFactory,
+      [["checking"], ["answer"]],
+    ],
+    ["OpenAI parts", openAiResponsesAdapterFactory, [["first", "second"]]],
+    ["Azure parts", azureResponsesAdapterFactory, [["first", "second"]]],
+  ] as const)("%s keep the receipt on only the first streamed text part", (_name, factory, texts) => {
+    const adapter = factory.createStreamAdapter();
+    adapter.setTextSuffix?.(signedPrefix);
+    let sse = "";
+    let sequence = 0;
+    const process = (chunk: unknown) => {
+      sse += String(adapter.processChunk(chunk as never).sseData ?? "");
+    };
+    const items = texts.map((parts, outputIndex) => ({
+      id: `msg_${outputIndex}`,
+      type: "message",
+      role: "assistant",
+      status: "completed",
+      phase: outputIndex < texts.length - 1 ? "commentary" : "final_answer",
+      content: parts.map((text: string) => ({
+        type: "output_text",
+        text,
+        annotations: [],
+      })),
+    }));
+    process({
+      type: "response.created",
+      sequence_number: sequence++,
+      response: { id: "resp_1", model: "gpt-test", output: [] },
+    });
+    for (const [outputIndex, item] of items.entries()) {
+      process({
+        type: "response.output_item.added",
+        sequence_number: sequence++,
+        output_index: outputIndex,
+        item: { ...item, status: "in_progress", content: [] },
+      });
+      for (const [contentIndex, part] of item.content.entries()) {
+        const position = {
+          item_id: item.id,
+          output_index: outputIndex,
+          content_index: contentIndex,
+        };
+        process({
+          type: "response.content_part.added",
+          sequence_number: sequence++,
+          ...position,
+          part: { ...part, text: "" },
+        });
+        process({
+          type: "response.output_text.delta",
+          sequence_number: sequence++,
+          ...position,
+          delta: part.text,
+        });
+        process({
+          type: "response.output_text.done",
+          sequence_number: sequence++,
+          ...position,
+          text: part.text,
+        });
+        process({
+          type: "response.content_part.done",
+          sequence_number: sequence++,
+          ...position,
+          part,
+        });
+      }
+      process({
+        type: "response.output_item.done",
+        sequence_number: sequence++,
+        output_index: outputIndex,
+        item,
+      });
+    }
+    process({
+      type: "response.completed",
+      sequence_number: sequence++,
+      response: {
+        id: "resp_1",
+        model: "gpt-test",
+        status: "completed",
+        output: items,
+      },
+    });
+    sse += adapter.formatEndSSE();
+
+    const output = frames(sse);
+    const expectedItems = structuredClone(items);
+    expectedItems[0].content[0].text = `${signedPrefix("")}\n\n${texts[0][0]}`;
+    const expectedParts = expectedItems.flatMap((item) => item.content);
+    expect(
+      output
+        .filter((frame) => frame.type === "response.output_item.done")
+        .map((frame) => frame.item),
+    ).toEqual(expectedItems);
+    expect(
+      output
+        .filter((frame) => frame.type === "response.output_text.done")
+        .map((frame) => frame.text),
+    ).toEqual(expectedParts.map((part) => part.text));
+    expect(
+      output
+        .filter((frame) => frame.type === "response.content_part.done")
+        .map((frame) => frame.part),
+    ).toEqual(expectedParts);
+    expect(
+      output
+        .filter((frame) => frame.type === "response.output_text.delta")
+        .map((frame) => frame.delta)
+        .join(""),
+    ).toBe(expectedParts.map((part) => part.text).join(""));
+    expect(
+      output.filter((frame) => frame.type === "response.completed"),
+    ).toEqual([
+      expect.objectContaining({
+        response: expect.objectContaining({ output: expectedItems }),
+      }),
+    ]);
+    expect(adapter.toProviderResponse().output).toEqual(items);
+  });
+
+  test("does not emit a suffix for an aborted or tool-only Responses turn", () => {
+    const aborted = openAiResponsesAdapterFactory.createStreamAdapter();
+    aborted.setTextSuffix?.(() => suffix);
+    aborted.processChunk({
+      type: "response.output_text.delta",
+      item_id: "msg_1",
+      output_index: 0,
+      content_index: 0,
+      sequence_number: 1,
+      delta: "partial",
+    } as never);
+    expect(String(aborted.formatEndSSE())).not.toContain(suffix);
+
+    const tools = openAiResponsesAdapterFactory.createStreamAdapter();
+    tools.setTextSuffix?.(() => suffix);
+    tools.processChunk({
+      type: "response.output_item.added",
+      output_index: 0,
+      sequence_number: 1,
+      item: {
+        id: "fc_1",
+        call_id: "call_1",
+        type: "function_call",
+        name: "run_tool",
+        arguments: "{}",
+        status: "in_progress",
+      },
+    } as never);
+    const completed = tools.processChunk({
+      type: "response.completed",
+      sequence_number: 2,
+      response: {
+        id: "resp_tools",
+        object: "response",
+        model: "gpt-test",
+        output: [],
+      },
+    } as never);
+
+    expect(completed.isToolCallChunk).toBe(true);
+    expect(
+      `${tools.getRawToolCallEvents().join("")}${tools.formatEndSSE()}`,
+    ).not.toContain(suffix);
+  });
+
+  test("emits subagent trajectory start prefix when OpenAI stream begins with tool calls", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    const banner = "▄█▄▄▄█▄\n██▄█▄██  started subagent ABC-1234";
+    adapter.setTextSuffix?.(() => banner);
+    const result = adapter.processChunk({
+      id: "chunk_1",
+      model: "gpt-test",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_1",
+                type: "function",
+                function: { name: "read", arguments: "" },
+              },
+            ],
+          },
+        },
+      ],
+    } as never);
+    expect(result.sseData).toContain("started subagent ABC-1234");
+    expect(adapter.toProviderResponse().choices[0].message.content).toContain(
+      "started subagent ABC-1234",
+    );
+  });
+
+  test("emits subagent trajectory start prefix when Anthropic stream begins with tool calls", () => {
+    const adapter = anthropicAdapterFactory.createStreamAdapter();
+    const banner = "▄█▄▄▄█▄\n██▄█▄██  started subagent ABC-1234";
+    const prefixInputs: string[] = [];
+    adapter.setTextSuffix?.((firstText) => {
+      prefixInputs.push(firstText);
+      return banner;
+    });
+    adapter.processChunk({
+      type: "message_start",
+      message: { id: "msg_1", model: "claude-test", usage: {} },
+    } as never);
+    const result = adapter.processChunk({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "tool_use", id: "call_1", name: "read" },
+    } as never);
+    expect(result.sseData).toContain("started subagent ABC-1234");
+    let sse = String(result.sseData ?? "");
+    for (const chunk of [
+      { type: "content_block_stop", index: 0 },
+      {
+        type: "content_block_start",
+        index: 1,
+        content_block: { type: "text", text: "" },
+      },
+      {
+        type: "content_block_delta",
+        index: 1,
+        delta: { type: "text_delta", text: "after tool" },
+      },
+      { type: "content_block_stop", index: 1 },
+      { type: "message_delta", delta: { stop_reason: "tool_use" } },
+      { type: "message_stop" },
+    ]) {
+      sse += String(adapter.processChunk(chunk as never).sseData ?? "");
+    }
+    sse += adapter.getRawToolCallEvents().join("");
+    sse += adapter.formatEndSSE();
+    const output = frames(sse);
+    expect(prefixInputs).toEqual([""]);
+    expect(
+      output
+        .filter(
+          (frame) =>
+            frame.type === "content_block_delta" &&
+            (frame.delta as { type: string }).type === "text_delta",
+        )
+        .map((frame) => (frame.delta as { text: string }).text),
+    ).toEqual([banner, "after tool"]);
+    const starts = output
+      .filter((frame) => frame.type === "content_block_start")
+      .map((frame) => frame.index);
+    const stops = output
+      .filter((frame) => frame.type === "content_block_stop")
+      .map((frame) => frame.index);
+    expect(starts.sort()).toEqual([0, 1, 2]);
+    expect(stops.sort()).toEqual([0, 1, 2]);
+    expect(
+      output.filter((frame) => frame.type === "message_stop"),
+    ).toHaveLength(1);
+    expect(adapter.toProviderResponse().content).toContainEqual(
+      expect.objectContaining({ type: "text", text: `${banner}after tool` }),
+    );
+  });
+
+  test("carries the trajectory prefix when a Responses stream begins with tool calls", () => {
+    for (const [name, factory] of [
+      ["OpenAI Responses", openAiResponsesAdapterFactory],
+      ["Azure Responses", azureResponsesAdapterFactory],
+    ] as const) {
+      const adapter = factory.createStreamAdapter();
+      const banner = "▄█▄▄▄█▄\n██▄█▄██  started subagent ABC-1234";
+      adapter.setTextSuffix?.(() => banner);
+      adapter.processChunk({
+        type: "response.created",
+        sequence_number: 0,
+        response: { id: "resp_1" },
+      } as never);
+      const held = adapter.processChunk({
+        type: "response.output_item.added",
+        output_index: 0,
+        sequence_number: 1,
+        item: {
+          id: "fc_1",
+          call_id: "call_spawn",
+          type: "function_call",
+          name: "spawn_agent",
+          arguments: "",
+          status: "in_progress",
+        },
+      } as never);
+      expect(held.isToolCallChunk).toBe(true);
+      expect(adapter.state.text).toContain("started subagent ABC-1234");
+      adapter.processChunk({
+        type: "response.completed",
+        sequence_number: 2,
+        response: {
+          id: "resp_1",
+          object: "response",
+          status: "completed",
+          model: "test-model",
+          output: [
+            {
+              id: "fc_1",
+              call_id: "call_spawn",
+              type: "function_call",
+              name: "spawn_agent",
+              arguments: "{}",
+              status: "completed",
+            },
+          ],
+        },
+      } as never);
+
+      const released =
+        adapter.formatToolCallsSSE?.([
+          {
+            id: "call_spawn",
+            name: "spawn_agent",
+            arguments: "{}",
+          },
+        ]) ?? [];
+      const events = released.map(
+        (frame) =>
+          JSON.parse(String(frame).replace(/^(?:event: .*\n)?data: /, "")) as {
+            type: string;
+            output_index?: number;
+            item_id?: string;
+            item?: { id?: string; call_id?: string };
+            response?: {
+              output: Array<{
+                id?: string;
+                call_id?: string;
+                type: string;
+              }>;
+            };
+          },
+      );
+      const completed = events.find(
+        (event) => event.type === "response.completed",
+      );
+      const completedCallIndex = completed?.response?.output.findIndex(
+        (item) => item.type === "function_call",
+      );
+      const completedCall =
+        completed?.response?.output[completedCallIndex ?? -1];
+      const callFrames = events.filter(
+        (event) => event.type !== "response.completed",
+      );
+
+      expect(JSON.stringify(completed), name).toContain(
+        "started subagent ABC-1234",
+      );
+      expect(completedCallIndex, name).toBe(1);
+      if (!completedCall) throw new Error(`${name} omitted the completed call`);
+      expect(completedCall.id, name).toBe("fc_1");
+      for (const frame of callFrames) {
+        expect(frame.output_index, name).toBe(completedCallIndex);
+        expect(frame.item_id ?? frame.item?.id, name).toBe(completedCall.id);
+        if (frame.item?.call_id) {
+          expect(frame.item.call_id, name).toBe(completedCall.call_id);
+        }
+      }
+    }
+  });
+
+  test.each([
+    ["OpenAI", openaiAdapterFactory],
+    ["Azure", azureAdapterFactory],
+  ])("%s Chat suppresses a suffix for a truncated turn", (_provider, factory) => {
+    const chat = factory.createStreamAdapter();
+    chat.setTextSuffix?.(() => suffix);
+    chat.processChunk(textDelta("partial") as never);
+    chat.processChunk(textDelta("", "length") as never);
+    expect(String(chat.formatEndSSE())).not.toContain(suffix);
+  });
+
+  test("suppresses suffixes for truncated Anthropic and converted Claude turns", () => {
+    const anthropic = anthropicAdapterFactory.createStreamAdapter();
+    anthropic.setTextSuffix?.(() => suffix);
+    anthropic.processChunk({
+      type: "message_start",
+      message: { usage: {} },
+    } as never);
+    anthropic.processChunk({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    } as never);
+    anthropic.processChunk({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "partial" },
+    } as never);
+    anthropic.processChunk({ type: "content_block_stop", index: 0 } as never);
+    anthropic.processChunk({
+      type: "message_delta",
+      delta: { stop_reason: "max_tokens" },
+    } as never);
+    const anthropicEnd = anthropic.processChunk({
+      type: "message_stop",
+    } as never);
+    expect(String(anthropicEnd.sseData)).not.toContain(suffix);
+
+    const routedClaude = makeAnthropicOpenaiAdapterFactory({
+      chatcmplId: "chatcmpl_partial",
+      createdUnix: 1,
+      requestedModel: "claude-test",
+    }).createStreamAdapter();
+    routedClaude.setTextSuffix?.(() => suffix);
+    routedClaude.processChunk({
+      type: "message_start",
+      message: { usage: {} },
+    } as never);
+    routedClaude.processChunk({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "partial" },
+    } as never);
+    routedClaude.processChunk({
+      type: "message_delta",
+      delta: { stop_reason: "max_tokens" },
+    } as never);
+    routedClaude.processChunk({ type: "message_stop" } as never);
+    expect(String(routedClaude.formatEndSSE())).not.toContain(suffix);
+
+    const responsesFromChat = makeResponsesFromChatAdapterFactory(
+      openaiAdapterFactory,
+      {
+        responseId: "resp_partial",
+        createdUnix: 1,
+        requestedModel: "gpt-test",
+      },
+    ).createStreamAdapter();
+    responsesFromChat.setTextSuffix?.(() => suffix);
+    responsesFromChat.processChunk(textDelta("partial") as never);
+    responsesFromChat.processChunk(textDelta("", "length") as never);
+    expect(String(responsesFromChat.formatEndSSE())).not.toContain(suffix);
+  });
+
+  test.each([
+    ["OpenAI", openAiResponsesAdapterFactory],
+    ["Azure", azureResponsesAdapterFactory],
+  ])("%s Responses does not synthesize a footer once failure is known", (_provider, factory) => {
+    const adapter = factory.createStreamAdapter();
+    adapter.setTextSuffix?.(() => suffix);
+    adapter.processChunk({
+      type: "response.output_text.delta",
+      item_id: "msg_1",
+      output_index: 0,
+      content_index: 0,
+      sequence_number: 1,
+      delta: "partial",
+    } as never);
+    expect(
+      adapter.processChunk({
+        type: "response.output_text.done",
+        item_id: "msg_1",
+        output_index: 0,
+        content_index: 0,
+        sequence_number: 2,
+        text: "partial",
+      } as never).sseData,
+    ).toBeNull();
+
+    const failed = adapter.processChunk({
+      type: "response.failed",
+      sequence_number: 3,
+      response: {
+        id: "resp_1",
+        model: "gpt-test",
+        error: { message: "failed" },
+      },
+    } as never);
+    expect(String(failed.sseData)).toContain("partial");
+    expect(String(adapter.formatEndSSE())).not.toContain(suffix);
+  });
+
+  test.each([
+    ["OpenAI", openAiResponsesAdapterFactory],
+    ["Azure", azureResponsesAdapterFactory],
+  ])("%s Responses binds the footer to its final text part", (_provider, factory) => {
+    const adapter = factory.createStreamAdapter();
+    adapter.setTextSuffix?.(signedPrefix);
+    let sse = String(
+      adapter.processChunk({
+        type: "response.output_text.delta",
+        item_id: "msg_1",
+        output_index: 0,
+        content_index: 0,
+        sequence_number: 1,
+        delta: "first",
+      } as never).sseData,
+    );
+    adapter.processChunk({
+      type: "response.output_text.done",
+      item_id: "msg_1",
+      output_index: 0,
+      content_index: 0,
+      sequence_number: 2,
+      text: "first",
+    } as never);
+    adapter.processChunk({
+      type: "response.content_part.done",
+      item_id: "msg_1",
+      output_index: 0,
+      content_index: 0,
+      sequence_number: 3,
+      part: { type: "output_text", text: "first", annotations: [] },
+    } as never);
+    sse += String(
+      adapter.processChunk({
+        type: "response.output_text.delta",
+        item_id: "msg_1",
+        output_index: 0,
+        content_index: 1,
+        sequence_number: 4,
+        delta: "second",
+      } as never).sseData,
+    );
+    for (const chunk of [
+      {
+        type: "response.output_text.done",
+        item_id: "msg_1",
+        output_index: 0,
+        content_index: 1,
+        sequence_number: 5,
+        text: "second",
+      },
+      {
+        type: "response.content_part.done",
+        item_id: "msg_1",
+        output_index: 0,
+        content_index: 1,
+        sequence_number: 6,
+        part: { type: "output_text", text: "second", annotations: [] },
+      },
+      {
+        type: "response.output_item.done",
+        output_index: 0,
+        sequence_number: 7,
+        item: {
+          id: "msg_1",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [
+            { type: "output_text", text: "first", annotations: [] },
+            { type: "output_text", text: "second", annotations: [] },
+          ],
+        },
+      },
+    ]) {
+      expect(adapter.processChunk(chunk as never).sseData).toBeNull();
+    }
+    adapter.processChunk({
+      type: "response.completed",
+      sequence_number: 8,
+      response: {
+        id: "resp_1",
+        object: "response",
+        model: "gpt-test",
+        status: "completed",
+        output: [
+          {
+            id: "msg_1",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [
+              { type: "output_text", text: "first", annotations: [] },
+              { type: "output_text", text: "second", annotations: [] },
+            ],
+          },
+        ],
+      },
+    } as never);
+
+    const output = frames(sse);
+    const textDeltas = output.filter(
+      (frame) => frame.type === "response.output_text.delta",
+    ) as Array<{ delta: string }>;
+
+    expect(textDeltas.map((frame) => frame.delta)).toEqual([
+      signedPrefix("first"),
+      "\n\nfirst",
+      "second",
+    ]);
+    expect(restoreText(`${textDeltas[0].delta}${textDeltas[1].delta}`)).toEqual(
+      {
+        text: "first",
+        sessionIds: ["parent"],
+      },
+    );
+    expect(JSON.stringify(adapter.toProviderResponse())).not.toContain(
+      "protected session",
+    );
+  });
+
+  test("canonical conversion wrappers preserve their own terminal wire shape", () => {
+    const anthropicContext: AnthropicOpenaiContext = {
+      chatcmplId: "chatcmpl_1",
+      createdUnix: 1,
+      requestedModel: "claude-test",
+    };
+    const routedClaude =
+      makeAnthropicOpenaiAdapterFactory(anthropicContext).createStreamAdapter();
+    routedClaude.setTextSuffix?.(signedPrefix);
+    routedClaude.processChunk({
+      type: "message_start",
+      message: { usage: {} },
+    } as never);
+    const routedFirst = routedClaude.processChunk({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "first" },
+    } as never);
+    const routedSecond = routedClaude.processChunk({
+      type: "content_block_delta",
+      index: 1,
+      delta: { type: "text_delta", text: "second" },
+    } as never);
+    const routedOutput = frames(
+      `${routedFirst.sseData}${routedSecond.sseData}${routedClaude.formatEndSSE()}`,
+    );
+    const routedText = routedOutput
+      .map(
+        (frame) =>
+          (frame.choices as Array<{ delta: { content?: string } }>)[0]?.delta
+            .content ?? "",
+      )
+      .join("");
+    expect(restoreText(routedText)).toEqual({
+      text: "firstsecond",
+      sessionIds: ["parent"],
+    });
+    expect(JSON.stringify(routedClaude.toProviderResponse())).not.toContain(
+      "protected session",
+    );
+
+    const responsesFromChat = makeResponsesFromChatAdapterFactory(
+      openaiAdapterFactory,
+      { responseId: "resp_1", createdUnix: 1, requestedModel: "gpt-test" },
+    ).createStreamAdapter();
+    responsesFromChat.setTextSuffix?.(signedPrefix);
+    responsesFromChat.processChunk(textDelta("first") as never);
+    responsesFromChat.processChunk(textDelta("second") as never);
+    responsesFromChat.processChunk(textDelta("", "stop") as never);
+    const output = frames(String(responsesFromChat.formatEndSSE()));
+    expect(output.map((frame) => frame.type)).toContain("response.completed");
+    const completed = output.at(-1)?.response as {
+      output: Array<{ content: Array<{ text: string }> }>;
+    };
+    expect(restoreText(completed.output[0].content[0].text)).toEqual({
+      text: "firstsecond",
+      sessionIds: ["parent"],
+    });
+    expect(
+      JSON.stringify(responsesFromChat.toProviderResponse()),
+    ).not.toContain("protected session");
+  });
+
+  const routedContext = {
+    chatcmplId: "chatcmpl_routed",
+    createdUnix: 1,
+    requestedModel: "routed-test",
+    responseId: "resp_routed",
+  };
+  const claudeAnswer = (stopReason: string) => [
+    { type: "message_start", message: { usage: {} } },
+    {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "answer" },
+    },
+    { type: "message_delta", delta: { stop_reason: stopReason } },
+    { type: "message_stop" },
+  ];
+
+  test.each([
+    {
+      provider: "Claude",
+      adapter: () =>
+        makeResponsesFromChatAdapterFactory(
+          makeAnthropicOpenaiAdapterFactory(routedContext),
+          routedContext,
+        ).createStreamAdapter(),
+      chunks: claudeAnswer("end_turn"),
+    },
+    {
+      provider: "Bedrock",
+      adapter: () =>
+        makeResponsesFromChatAdapterFactory(
+          makeBedrockOpenaiAdapterFactory({
+            ...routedContext,
+            includeUsageInStream: false,
+          }),
+          routedContext,
+        ).createStreamAdapter({ modelId: "routed-test", messages: [] }),
+      chunks: [
+        { messageStart: { role: "assistant" } },
+        {
+          contentBlockDelta: {
+            contentBlockIndex: 0,
+            delta: { text: "answer" },
+          },
+        },
+        { messageStop: { stopReason: "end_turn" } },
+      ],
+    },
+    {
+      provider: "Gemini",
+      adapter: () =>
+        makeResponsesFromChatAdapterFactory(
+          makeGeminiOpenaiAdapterFactory(routedContext),
+          routedContext,
+        ).createStreamAdapter(),
+      chunks: [
+        {
+          candidates: [
+            {
+              content: { parts: [{ text: "answer" }], role: "model" },
+              finishReason: "STOP",
+              index: 0,
+            },
+          ],
+          modelVersion: "routed-test",
+          responseId: "gemini-response",
+        },
+      ],
+    },
+    {
+      provider: "Cohere",
+      adapter: () =>
+        makeResponsesFromChatAdapterFactory(
+          makeCohereOpenaiAdapterFactory(routedContext),
+          routedContext,
+        ).createStreamAdapter(),
+      chunks: [
+        {
+          type: "content-delta",
+          index: 0,
+          delta: { message: { content: { text: "answer" } } },
+        },
+        { type: "message-end", delta: { finish_reason: "COMPLETE" } },
+      ],
+    },
+  ])("Responses through the model router receipts a finished $provider answer", ({
+    adapter: create,
+    chunks,
+  }) => {
+    const adapter = create();
+    adapter.setTextSuffix?.(signedPrefix);
+    for (const chunk of chunks) adapter.processChunk(chunk as never);
+    const completed = frames(String(adapter.formatEndSSE())).at(-1)
+      ?.response as { output: Array<{ content: Array<{ text: string }> }> };
+    const text = completed.output[0].content[0].text;
+    expect(text).toBe(`answer\n\n${formatSessionReceipt(receiptCode)}`);
+    expect(restoreText(text)).toEqual({
+      text: "answer",
+      sessionIds: ["parent"],
+    });
+  });
+
+  test("Responses through the model router does not receipt a cut-off Claude answer", () => {
+    const adapter = makeResponsesFromChatAdapterFactory(
+      makeAnthropicOpenaiAdapterFactory(routedContext),
+      routedContext,
+    ).createStreamAdapter();
+    adapter.setTextSuffix?.(signedPrefix);
+    for (const chunk of claudeAnswer("max_tokens")) {
+      adapter.processChunk(chunk as never);
+    }
+    expect(String(adapter.formatEndSSE())).not.toContain("protected session");
+  });
+});

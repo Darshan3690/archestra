@@ -19,25 +19,28 @@ export const ChatCompletionUsageSchema = z
   })
   .describe("Token usage statistics for the completion");
 
-export const FinishReasonSchema = z.enum([
-  "stop",
-  "length",
-  "tool_calls",
-  "content_filter",
-  "function_call",
-]);
+// Persist/read-back must tolerate nonconforming finish_reasons (same as OpenAI).
+export const FinishReasonSchema = z
+  .enum(["stop", "length", "tool_calls", "content_filter", "function_call"])
+  .or(z.string());
 
 const ChoiceSchema = z
   .object({
     finish_reason: FinishReasonSchema,
-    index: z.number(),
-    logprobs: z.any().nullable(),
+    // Some OpenAI-compatible upstreams omit `index` on choices; without
+    // optional() the response fails serialization (500).
+    index: z.number().optional(),
+    // Log probabilities may be omitted when the upstream did not request them.
+    logprobs: z.any().nullable().optional(),
     message: z
       .object({
-        content: z.string().nullable(),
+        // Tool-call-only replies often omit `content` entirely.
+        content: z.string().nullable().optional(),
         refusal: z.string().nullable().optional(),
         role: z.enum(["assistant"]),
-        annotations: z.array(z.any()).optional(),
+        // Some OpenAI-compatible upstreams return `annotations: null` instead of
+        // omitting it; without nullable() the response fails serialization (500).
+        annotations: z.array(z.any()).nullable().optional(),
         audio: z.any().nullable().optional(),
         function_call: z
           .object({
@@ -46,9 +49,13 @@ const ChoiceSchema = z
           })
           .nullable()
           .optional(),
-        tool_calls: z.array(ToolCallSchema).optional(),
+        tool_calls: z.array(ToolCallSchema).nullable().optional(),
         // vLLM-specific: reasoning field for models that support it
         reasoning: z.string().nullable().optional(),
+        // DeepSeek-style reasoning models return thinking in `reasoning_content`
+        // and require it passed back on tool-call turns; response serialization
+        // must preserve it.
+        reasoning_content: z.string().nullable().optional(),
       })
       .describe("The assistant message in the response"),
   })
@@ -75,6 +82,19 @@ export const ChatCompletionRequestSchema = z
     best_of: z.number().nullable().optional(),
     logprobs: z.boolean().nullable().optional(),
     top_logprobs: z.number().nullable().optional(),
+    /**
+     * Per-request chat-template variables (e.g. `{enable_thinking: false}` on
+     * Qwen3-style templates, the documented reasoning off-switch). Must be
+     * declared or inbound validation strips it before the adapter.
+     */
+    chat_template_kwargs: z.record(z.string(), z.unknown()).optional(),
+    /**
+     * Reasoning depth. vLLM injects the chat template's thinking switch from
+     * it, so a request that carries one reasons at that depth. Declared for the
+     * same reason as `chat_template_kwargs` above: undeclared fields never
+     * reach the adapter.
+     */
+    reasoning_effort: z.string().nullable().optional(),
   })
   .describe("vLLM chat completion request (OpenAI-compatible)");
 

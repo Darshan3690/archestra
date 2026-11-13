@@ -1,0 +1,46 @@
+import { vi } from "vitest";
+import { useRouteTestApp } from "@/test/route-test-app";
+
+// Isolated from oauth.test.ts (which stays mock-free / fast path) because this
+// suite mocks @/logging to observe the warn the initiate handler emits.
+spyOnLogger();
+
+import { describe, expect } from "vitest";
+import logger from "@/logging";
+import { test } from "@/test";
+import { spyOnLogger } from "@/test/logging";
+import oauthRoutes from "./oauth";
+
+/**
+ * Handled client errors on /api/oauth/initiate are formatted by the centralized
+ * error handler but filtered from Sentry, so the handler warns with the
+ * catalogId to keep a misconfigured catalog entry visible in logs. Assert that
+ * observable via its structured fields, without pinning the log message text.
+ */
+describe("POST /api/oauth/initiate observability", () => {
+  const ctx = useRouteTestApp(oauthRoutes);
+
+  test("warns with catalogId and statusCode when initiate rejects with a client error", async () => {
+    ctx.app.addHook("onRequest", async (request) => {
+      request.authMethod = "session";
+      request.sessionInfo = { id: "test-session", createdAt: new Date() };
+    });
+    const catalogId = "00000000-0000-4000-8000-000000000000";
+
+    const response = await ctx.app.inject({
+      method: "POST",
+      url: "/api/oauth/initiate",
+      payload: { catalogId },
+    });
+
+    expect(response.statusCode, response.body).toBe(404);
+
+    const warned = vi
+      .mocked(logger.warn)
+      .mock.calls.find(
+        ([context]) =>
+          (context as { catalogId?: string })?.catalogId === catalogId,
+      );
+    expect(warned?.[0]).toMatchObject({ catalogId, statusCode: 404 });
+  });
+});

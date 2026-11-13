@@ -6,7 +6,11 @@
 
 import type { archestraApiTypes } from "../../index";
 import type { PartialUIMessage } from "../types";
-import type { DualLlmAnalysis, Interaction, InteractionUtils } from "./common";
+import type {
+  Interaction,
+  InteractionUtils,
+  RequestedToolCall,
+} from "./common";
 
 class CohereChatInteraction implements InteractionUtils {
   private request: archestraApiTypes.CohereChatRequest;
@@ -67,9 +71,10 @@ class CohereChatInteraction implements InteractionUtils {
     return Array.from(toolsUsed);
   }
 
-  getToolNamesRefused(): string[] {
-    // TODO: Implement tool refusal detection for Cohere if needed
-    return [];
+  getToolCallsRequested(): RequestedToolCall[] {
+    return (this.response?.message?.tool_calls ?? []).flatMap((toolCall) =>
+      toolCall.id ? [{ id: toolCall.id, name: toolCall.function.name }] : [],
+    );
   }
 
   getToolNamesRequested(): string[] {
@@ -85,10 +90,6 @@ class CohereChatInteraction implements InteractionUtils {
     return Array.from(toolsRequested);
   }
 
-  getToolRefusedCount(): number {
-    return 0;
-  }
-
   getLastUserMessage(): string {
     const reversedMessages = [...this.request.messages].reverse();
     for (const message of reversedMessages) {
@@ -102,7 +103,7 @@ class CohereChatInteraction implements InteractionUtils {
 
       if (Array.isArray(message.content)) {
         return message.content
-          .filter((block) => block.type === "text")
+          .filter(isTextBlock)
           .map((block) => block.text)
           .join("");
       }
@@ -115,7 +116,7 @@ class CohereChatInteraction implements InteractionUtils {
     // Check response content first
     if (this.response?.message?.content) {
       return this.response.message.content
-        .filter((block) => block.type === "text")
+        .filter(isTextBlock)
         .map((block) => block.text)
         .join("");
     }
@@ -134,7 +135,7 @@ class CohereChatInteraction implements InteractionUtils {
 
         if (Array.isArray(message.content)) {
           return message.content
-            .filter((block) => block.type === "text")
+            .filter(isTextBlock)
             .map((block) => block.text)
             .join("");
         }
@@ -144,7 +145,7 @@ class CohereChatInteraction implements InteractionUtils {
     return "";
   }
 
-  mapToUiMessages(_dualLlmAnalyses?: DualLlmAnalysis[]): PartialUIMessage[] {
+  mapToUiMessages(): PartialUIMessage[] {
     const uiMessages: PartialUIMessage[] = [];
     const messages = this.request.messages ?? [];
     const response = this.response;
@@ -158,7 +159,7 @@ class CohereChatInteraction implements InteractionUtils {
           content = message.content;
         } else if (Array.isArray(message.content)) {
           content = message.content
-            .filter((block) => block.type === "text")
+            .filter(isTextBlock)
             .map((block) => block.text)
             .join("");
         }
@@ -178,7 +179,7 @@ class CohereChatInteraction implements InteractionUtils {
             parts.push({ type: "text", text: message.content });
           } else if (Array.isArray(message.content)) {
             for (const block of message.content) {
-              if (block.type === "text" && "text" in block) {
+              if (isTextBlock(block)) {
                 parts.push({ type: "text", text: block.text });
               }
             }
@@ -256,7 +257,7 @@ class CohereChatInteraction implements InteractionUtils {
 
       if (Array.isArray(responseMessage.content)) {
         for (const block of responseMessage.content) {
-          if (block.type === "text" && "text" in block) {
+          if (isTextBlock(block)) {
             parts.push({ type: "text", text: block.text });
           }
         }
@@ -295,6 +296,18 @@ class CohereChatInteraction implements InteractionUtils {
 
     return uiMessages;
   }
+}
+
+// The Cohere content-block union carries an open fallback variant for
+// upstream block types the schema does not model (thinking, citations, ...),
+// so a bare `block.type === "text"` check no longer narrows to the text block.
+function isTextBlock(block: {
+  type: string;
+}): block is { type: "text"; text: string } {
+  return (
+    block.type === "text" &&
+    typeof (block as { text?: unknown }).text === "string"
+  );
 }
 
 export default CohereChatInteraction;

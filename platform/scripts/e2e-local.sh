@@ -47,11 +47,11 @@ if ! docker info &>/dev/null; then
 fi
 
 echo "=== Building platform Docker image ==="
-mkdir -p "$PLATFORM_DIR/prev-static-assets"
+mkdir -p "$PLATFORM_DIR/docker/prev-static-assets"
 docker build -t "$PLATFORM_IMAGE" "$PLATFORM_DIR"
 
 echo "=== Building MCP server base image ==="
-docker build -t "$MCP_BASE_IMAGE" "$PLATFORM_DIR/mcp_server_docker_image"
+docker build -t "$MCP_BASE_IMAGE" "$PLATFORM_DIR/docker_images/mcp_server"
 
 echo "=== Creating Kind cluster '$KIND_CLUSTER' ==="
 # Delete existing cluster with same name (idempotent)
@@ -109,7 +109,7 @@ docker run --rm \
   -v "$HOME/.kube:/root/.kube:ro" \
   -e KUBECONFIG=/root/.kube/config \
   "mcr.microsoft.com/playwright:v${PW_VERSION}-noble" \
-  /bin/bash -c "corepack enable && corepack prepare pnpm@10.24.0 --activate && pnpm test:e2e -- $PLAYWRIGHT_ARGS"
+  /bin/bash -c "corepack enable && corepack prepare pnpm@11.9.0 --activate && pnpm test:e2e -- $PLAYWRIGHT_ARGS"
 
 echo ""
 echo "=== E2E tests complete ==="

@@ -1,14 +1,23 @@
+import {
+  ERROR_REPORTING_DATA_COLLECTION,
+  scrubErrorReportBreadcrumb,
+  scrubErrorReportEvent,
+} from "@archestra/shared/error-reporting";
 import type {
   ErrorEvent,
   EventHint,
   Integration,
   TracesSamplerSamplingContext,
+  TransactionEvent,
 } from "@sentry/core";
 import * as Sentry from "@sentry/node";
 import config from "@/config";
 import logger from "@/logging";
-import { ApiError } from "@/types";
+import { classifyErrorForTracking } from "./error-tracking-policy";
+import { rememberErrorTrackingServerSpan } from "./request-context";
+import { ATTR_MCP_METHOD_NAME } from "./tracing/attributes";
 import {
+  isLongLivedMcpStream,
   isNoiseRoute,
   isNoisyMcpGatewayGetRoute,
   isNoisyTransactionName,
@@ -21,12 +30,34 @@ const {
       enabled,
       dsn,
       environment: sentryEnvironment,
+      errorsOnly,
       tracesSampleRate,
       mcpGatewayTracesSampleRate,
       profilesSampleRate,
     },
   },
 } = config;
+
+/**
+ * Build the Error object reported for a raw upstream-provider failure.
+ *
+ * The upstream HTTP status is attached to the Error so the {@link filterErrorEvent}
+ * 4xx filter drops expected provider CLIENT errors (rate limits, invalid
+ * credentials, provider-side content blocks) as noise, while genuine provider
+ * 5xx failures still report.
+ * @public — exported for testability
+ */
+export function buildRawProviderError(params: {
+  statusCode: number | undefined;
+  errorMessage: string;
+}): Error {
+  const error = new Error(params.errorMessage);
+  error.name = "RawProviderError";
+  if (params.statusCode !== undefined) {
+    (error as Error & { statusCode?: number }).statusCode = params.statusCode;
+  }
+  return error;
+}
 
 export function captureRawProviderErrorInSentry(params: {
   provider: string;
@@ -37,8 +68,10 @@ export function captureRawProviderErrorInSentry(params: {
   errorType: string | undefined;
   rawErrorJson: string;
 }): void {
-  const error = new Error(params.errorMessage);
-  error.name = "RawProviderError";
+  const error = buildRawProviderError({
+    statusCode: params.statusCode,
+    errorMessage: params.errorMessage,
+  });
 
   Sentry.captureException(error, {
     level: "error",
@@ -63,6 +96,58 @@ export function captureRawProviderErrorInSentry(params: {
       rawErrorJson: params.rawErrorJson,
     },
   });
+}
+
+/**
+ * Sentry `beforeSend` filter. Delegates the drop/keep-and-group decision to the
+ * {@link classifyErrorForTracking} policy, then applies the result in Sentry's
+ * shape: return null to drop, or set the event's fingerprint/tags to group an
+ * availability incident. What is kept is scrubbed of request content,
+ * credentials, and personal data before it leaves the deployment.
+ *
+ * https://docs.sentry.io/platforms/javascript/configuration/filtering/
+ * @public — exported for testability
+ */
+export function filterErrorEvent(
+  event: ErrorEvent,
+  hint: EventHint,
+): ErrorEvent | null {
+  const decision = classifyErrorForTracking(hint.originalException);
+  if (!decision.report) {
+    return null;
+  }
+  if (decision.fingerprint) {
+    event.fingerprint = decision.fingerprint;
+  }
+  if (decision.tags) {
+    event.tags = { ...event.tags, ...decision.tags };
+  }
+  return scrubErrorReportEvent(event);
+}
+
+/**
+ * Sentry `beforeSendTransaction` filter. Drops transactions for traffic that
+ * is not worth tracing (health, metrics, OAuth discovery, MCP gateway GETs)
+ * and for long-lived MCP streams.
+ *
+ * A long-lived MCP stream shares its route with ordinary MCP requests, so only
+ * the method recorded on its request spans identifies it. Its duration is how
+ * long the connection lived, and would skew request latency.
+ *
+ * @public — exported for testability
+ */
+export function filterTransactionEvent(
+  event: TransactionEvent,
+): TransactionEvent | null {
+  if (event.transaction && isNoisyTransactionName(event.transaction)) {
+    return null;
+  }
+  if (
+    isLongLivedMcpStream(event.contexts?.trace?.data?.[ATTR_MCP_METHOD_NAME])
+  ) {
+    return null;
+  }
+  return scrubErrorReportEvent(event);
 }
 
 /**
@@ -93,7 +178,27 @@ let sentryClient: Sentry.NodeClient | undefined;
  */
 const initSentry = async (): Promise<void> => {
   if (!enabled) {
-    logger.info("Sentry DSN not configured, skipping Sentry initialization");
+    logger.debug("Error reporting is off, skipping Sentry initialization");
+    return;
+  }
+
+  if (errorsOnly) {
+    sentryClient = Sentry.init({
+      ...getBaseOptions(),
+      integrations: [
+        // Keep per-request scope isolation, without spans or the
+        // outgoing-request breadcrumbs that name upstream hosts.
+        Sentry.httpIntegration({ spans: false, breadcrumbs: false }),
+        Sentry.nativeNodeFetchIntegration({ spans: false, breadcrumbs: false }),
+      ],
+      // No tracing: nothing but error events leaves the deployment, and no
+      // trace headers go out on outgoing requests.
+      tracePropagationTargets: [],
+    });
+    logger.info(
+      { environment: sentryEnvironment },
+      "Error reporting to Archestra initialized (errors only)",
+    );
     return;
   }
 
@@ -101,6 +206,12 @@ const initSentry = async (): Promise<void> => {
 
   // Build integrations array, only including profiling if it loaded successfully
   const integrations: Integration[] = [
+    // Replaces the default HTTP integration, with the same options, to keep the
+    // server span of each request. Request handlers mark it, for example with
+    // the MCP method that {@link filterTransactionEvent} reads.
+    Sentry.httpIntegration({
+      incomingRequestSpanHook: rememberErrorTrackingServerSpan,
+    }),
     // Add Pino integration to send logs to Sentry
     // https://docs.sentry.io/platforms/javascript/guides/fastify/logs/#pino-integration
     Sentry.pinoIntegration(),
@@ -112,16 +223,7 @@ const initSentry = async (): Promise<void> => {
 
   // https://docs.sentry.io/platforms/javascript/guides/fastify/install/commonjs/
   sentryClient = Sentry.init({
-    dsn,
-    environment: sentryEnvironment,
-    release: version,
-
-    /**
-     * Setting this option to true will send default PII data to Sentry
-     * For example, automatic IP address collection on events
-     * https://docs.sentry.io/platforms/javascript/guides/node/configuration/options/#sendDefaultPii
-     */
-    sendDefaultPii: true,
+    ...getBaseOptions(),
 
     integrations,
 
@@ -134,45 +236,6 @@ const initSentry = async (): Promise<void> => {
 
     // Enable logs to be sent to Sentry
     enableLogs: true,
-
-    /**
-     * Disable Sentry's automatic Fastify instrumentation to avoid conflicts
-     * We already have our own OpenTelemetry setup in tracing.ts
-     * https://docs.sentry.io/platforms/javascript/guides/express/opentelemetry/custom-setup/
-     */
-    skipOpenTelemetrySetup: true,
-
-    /**
-     * Filter out expected client errors (4xx) from being sent to Sentry.
-     * These are expected application errors (not found, validation errors, etc.)
-     * that don't indicate bugs and would just create noise in Sentry.
-     *
-     * https://docs.sentry.io/platforms/javascript/configuration/filtering/
-     */
-    beforeSend(event: ErrorEvent, hint: EventHint): ErrorEvent | null {
-      const error = hint.originalException;
-
-      // Filter out ApiError instances with 4xx status codes
-      if (error instanceof ApiError) {
-        if (error.statusCode >= 400 && error.statusCode < 500) {
-          return null;
-        }
-      }
-
-      // Also check for statusCode property on generic errors (e.g., from Fastify)
-      if (
-        error &&
-        typeof error === "object" &&
-        "statusCode" in error &&
-        typeof error.statusCode === "number" &&
-        error.statusCode >= 400 &&
-        error.statusCode < 500
-      ) {
-        return null;
-      }
-
-      return event;
-    },
 
     // https://docs.sentry.io/platforms/javascript/configuration/options/#tracesSampler
     tracesSampler: ({
@@ -205,13 +268,7 @@ const initSentry = async (): Promise<void> => {
       return tracesSampleRate;
     },
 
-    beforeSendTransaction(event) {
-      if (event.transaction && isNoisyTransactionName(event.transaction)) {
-        return null;
-      }
-
-      return event;
-    },
+    beforeSendTransaction: filterTransactionEvent,
   });
 
   logger.info(
@@ -224,3 +281,20 @@ const initSentry = async (): Promise<void> => {
 await initSentry();
 
 export default sentryClient;
+
+/** Options every reporting mode shares, including the privacy filters. */
+function getBaseOptions(): Sentry.NodeOptions {
+  return {
+    dsn,
+    environment: sentryEnvironment,
+    release: version,
+    dataCollection: ERROR_REPORTING_DATA_COLLECTION,
+    /**
+     * Disable Sentry's automatic OpenTelemetry setup: tracing/sdk.ts owns it.
+     * https://docs.sentry.io/platforms/javascript/guides/express/opentelemetry/custom-setup/
+     */
+    skipOpenTelemetrySetup: true,
+    beforeSend: filterErrorEvent,
+    beforeBreadcrumb: (breadcrumb) => scrubErrorReportBreadcrumb(breadcrumb),
+  };
+}

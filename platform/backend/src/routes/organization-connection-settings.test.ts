@@ -1,72 +1,102 @@
 import { vi } from "vitest";
-import type * as originalConfigModule from "@/config";
-import type { FastifyInstanceWithZod } from "@/server";
-import { createFastifyInstance } from "@/server";
+import { auth as betterAuth } from "@/auth/better-auth";
+import { authPlugin } from "@/auth/fastify-plugin";
+import config from "@/config";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { OrganizationModel } from "@/models";
 import { afterEach, beforeEach, describe, expect, test } from "@/test";
 import type { User } from "@/types";
-
-const { hasPermissionMock } = vi.hoisted(() => ({
-  hasPermissionMock: vi.fn(),
-}));
-
-vi.mock("@/auth", async () => {
-  const actual = await vi.importActual<typeof import("@/auth")>("@/auth");
-  return {
-    ...actual,
-    hasPermission: hasPermissionMock,
-  };
-});
-
-vi.mock("@/config", async (importOriginal) => {
-  const actual = await importOriginal<typeof originalConfigModule>();
-  return {
-    default: {
-      ...actual.default,
-      enterpriseFeatures: {
-        ...actual.default.enterpriseFeatures,
-        core: true,
-      },
-    },
-  };
-});
 
 describe("PATCH /api/organization/connection-settings", () => {
   let app: FastifyInstanceWithZod;
   let adminUser: User;
   let organizationId: string;
 
-  beforeEach(async ({ makeAdmin, makeMember, makeOrganization }) => {
-    vi.clearAllMocks();
-    hasPermissionMock.mockResolvedValue({ success: true });
+  beforeEach(
+    async ({ makeAdmin, makeMember, makeOrganization, makeSession }) => {
+      config.enterpriseFeatures.core = true;
+      adminUser = await makeAdmin();
+      const organization = await makeOrganization();
+      organizationId = organization.id;
+      await makeMember(adminUser.id, organizationId, { role: "admin" });
+      const session = await makeSession(adminUser.id, {
+        activeOrganizationId: organizationId,
+      });
+      vi.spyOn(betterAuth.api, "getSession").mockResolvedValue({
+        response: { user: adminUser, session },
+        headers: new Headers(),
+      } as never);
 
-    adminUser = await makeAdmin();
-    const organization = await makeOrganization();
-    organizationId = organization.id;
-    await makeMember(adminUser.id, organizationId, { role: "admin" });
-
-    app = createFastifyInstance();
-    app.addHook("onRequest", async (request) => {
-      (
-        request as typeof request & {
-          user: unknown;
-          organizationId: string;
-        }
-      ).user = adminUser;
-      (
-        request as typeof request & {
-          user: { id: string };
-          organizationId: string;
-        }
-      ).organizationId = organizationId;
-    });
-
-    const { default: organizationRoutes } = await import("./organization");
-    await app.register(organizationRoutes);
-  });
+      app = createFastifyInstance();
+      await app.register(authPlugin);
+      const { default: organizationRoutes } = await import("./organization");
+      await app.register(organizationRoutes);
+    },
+  );
 
   afterEach(async () => {
     vi.restoreAllMocks();
     await app.close();
+  });
+
+  test("Connect starts visible, can be hidden, survives unrelated saves and can be shown again", async () => {
+    const read = () => app.inject({ method: "GET", url: "/api/organization" });
+    const save = (payload: Record<string, unknown>) =>
+      app.inject({
+        method: "PATCH",
+        url: "/api/organization/connection-settings",
+        payload,
+      });
+    expect((await read()).json().connectionPageHidden).toBe(false);
+    const hidden = await save({ connectionPageHidden: true });
+    expect(hidden.statusCode, hidden.body).toBe(200);
+    expect(hidden.json().connectionPageHidden).toBe(true);
+    expect((await read()).json().connectionPageHidden).toBe(true);
+    expect(
+      await OrganizationModel.findByIdForAudit(organizationId, organizationId),
+    ).toMatchObject({
+      connectionPageHidden: true,
+    });
+    expect(
+      (await save({ connectionDefaultClientId: "cursor" })).statusCode,
+    ).toBe(200);
+    expect((await read()).json()).toMatchObject({
+      connectionPageHidden: true,
+      connectionSkillsEnabled: true,
+      connectionLlmProxyEnabled: true,
+      connectionPluginsEnabled: true,
+    });
+    expect((await save({ connectionPageHidden: false })).statusCode).toBe(200);
+    expect((await read()).json().connectionPageHidden).toBe(false);
+  });
+
+  test("a member can read visibility but cannot change it", async ({
+    makeUser,
+    makeMember,
+    makeSession,
+  }) => {
+    const user = await makeUser();
+    await makeMember(user.id, organizationId, { role: "member" });
+    const session = await makeSession(user.id, {
+      activeOrganizationId: organizationId,
+    });
+    vi.mocked(betterAuth.api.getSession).mockResolvedValue({
+      response: { user, session },
+      headers: new Headers(),
+    } as never);
+    const read = await app.inject({ method: "GET", url: "/api/organization" });
+    expect(read.statusCode, read.body).toBe(200);
+    expect(read.json().connectionPageHidden).toBe(false);
+    const save = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: { connectionPageHidden: true },
+    });
+    expect(save.statusCode, save.body).toBe(403);
+    expect(
+      (await OrganizationModel.getById(organizationId))?.connectionPageHidden,
+    ).toBe(false);
   });
 
   test("persists admin defaults and hidden lists", async ({ makeAgent }) => {
@@ -76,30 +106,118 @@ describe("PATCH /api/organization/connection-settings", () => {
       agentType: "mcp_gateway",
       name: "Admin Default Gateway",
     });
-    const proxy = await makeAgent({
-      organizationId,
-      authorId: adminUser.id,
-      agentType: "llm_proxy",
-      name: "Admin Default Proxy",
-    });
 
     const response = await app.inject({
       method: "PATCH",
       url: "/api/organization/connection-settings",
       payload: {
         connectionDefaultMcpGatewayId: gateway.id,
-        connectionDefaultLlmProxyId: proxy.id,
         connectionShownClientIds: ["claude-code"],
-        connectionShownProviders: ["openai", "anthropic"],
       },
     });
 
     expect(response.statusCode).toBe(200);
     const body = response.json();
     expect(body.connectionDefaultMcpGatewayId).toBe(gateway.id);
-    expect(body.connectionDefaultLlmProxyId).toBe(proxy.id);
     expect(body.connectionShownClientIds).toEqual(["claude-code"]);
-    expect(body.connectionShownProviders).toEqual(["openai", "anthropic"]);
+  });
+
+  test("refuses a personal gateway as the new default but keeps one already saved", async ({
+    makeAgent,
+  }) => {
+    const personal = await makeAgent({
+      organizationId,
+      authorId: adminUser.id,
+      agentType: "mcp_gateway",
+      isPersonalGateway: true,
+    });
+    const refused = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: { connectionDefaultMcpGatewayId: personal.id },
+    });
+    expect(refused.statusCode).toBe(400);
+
+    await OrganizationModel.patch(organizationId, {
+      connectionDefaultMcpGatewayId: personal.id,
+    });
+    const unchanged = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: {
+        connectionDefaultMcpGatewayId: personal.id,
+        connectionShownClientIds: ["cursor"],
+      },
+    });
+    expect(unchanged.statusCode, unchanged.body).toBe(200);
+  });
+
+  test("persists order independently of visibility, retains it on unrelated saves, and clears it", async () => {
+    const order = ["codex", "cursor", "claude-code"];
+    const save = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: { connectionClientOrder: order },
+    });
+    expect(save.statusCode).toBe(200);
+    expect(save.json().connectionClientOrder).toEqual(order);
+    expect(save.json().connectionShownClientIds).toBeNull();
+    const reload = await app.inject({
+      method: "GET",
+      url: "/api/organization",
+    });
+    expect(reload.statusCode).toBe(200);
+    expect(reload.json().connectionClientOrder).toEqual(order);
+
+    const otherSave = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: { connectionShownClientIds: ["cursor"] },
+    });
+    expect(otherSave.statusCode).toBe(200);
+    expect(otherSave.json().connectionClientOrder).toEqual(order);
+
+    const clear = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: { connectionClientOrder: null },
+    });
+    expect(clear.statusCode).toBe(200);
+    expect(clear.json().connectionClientOrder).toBeNull();
+    expect(clear.json().connectionShownClientIds).toEqual(["cursor"]);
+  });
+
+  test("rejects repeated order IDs", async () => {
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: { connectionClientOrder: ["codex", "codex"] },
+    });
+    expect(response.statusCode).toBe(400);
+  });
+
+  test("supports ordering a growing catalogue when all agents are visible", async () => {
+    const order = Array.from({ length: 51 }, (_, index) => `agent-${index}`);
+    const save = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: { connectionClientOrder: order },
+    });
+    expect(save.statusCode).toBe(200);
+    expect(save.json().connectionClientOrder).toEqual(order);
+    expect(save.json().connectionShownClientIds).toBeNull();
+  });
+
+  test("refuses the retired connect-page provider list", async () => {
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: { connectionShownProviders: ["openai"] },
+    });
+
+    // Silently stripping it would let a stale tab look like it gated
+    // providers while changing nothing.
+    expect(response.statusCode).toBe(400);
   });
 
   test("rejects a gateway that belongs to another organization", async ({
@@ -148,50 +266,29 @@ describe("PATCH /api/organization/connection-settings", () => {
     expect(response.statusCode).toBe(400);
   });
 
-  test("rejects a proxy that belongs to another organization", async ({
-    makeAgent,
-    makeOrganization,
-    makeUser,
-  }) => {
-    const otherOrg = await makeOrganization();
-    const otherUser = await makeUser();
-    const foreignProxy = await makeAgent({
-      organizationId: otherOrg.id,
-      authorId: otherUser.id,
-      agentType: "llm_proxy",
-      name: "Foreign Proxy",
-    });
-
-    const response = await app.inject({
-      method: "PATCH",
-      url: "/api/organization/connection-settings",
-      payload: {
-        connectionDefaultLlmProxyId: foreignProxy.id,
-      },
-    });
-
-    expect(response.statusCode).toBe(404);
-  });
-
-  test("rejects a wrong-type agent for the proxy slot", async ({
+  test("ignores a stale connection-default LLM proxy key from older clients", async ({
     makeAgent,
   }) => {
-    const gateway = await makeAgent({
+    // The LLM Proxy needs no selection; the request key is simply stripped so
+    // a stale tab's payload keeps working, and the stored column stays as-is.
+    const proxy = await makeAgent({
       organizationId,
       authorId: adminUser.id,
-      agentType: "mcp_gateway",
-      name: "Not a proxy",
+      agentType: "llm_proxy",
+      name: "Stale Client Proxy",
     });
 
     const response = await app.inject({
       method: "PATCH",
       url: "/api/organization/connection-settings",
       payload: {
-        connectionDefaultLlmProxyId: gateway.id,
+        connectionDefaultLlmProxyId: proxy.id,
+        connectionShownClientIds: ["claude-code"],
       },
     });
 
-    expect(response.statusCode).toBe(400);
+    expect(response.statusCode).toBe(200);
+    expect(response.json().connectionDefaultLlmProxyId).toBeNull();
   });
 
   test("persists and clears the default client id", async () => {
@@ -210,6 +307,44 @@ describe("PATCH /api/organization/connection-settings", () => {
     });
     expect(clearResponse.statusCode).toBe(200);
     expect(clearResponse.json().connectionDefaultClientId).toBeNull();
+  });
+
+  test("persists skills, LLM proxy, and plugin availability on the connect page", async () => {
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: {
+        connectionSkillsEnabled: false,
+        connectionLlmProxyEnabled: false,
+        connectionPluginsEnabled: false,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().connectionSkillsEnabled).toBe(false);
+    expect(response.json().connectionLlmProxyEnabled).toBe(false);
+    expect(response.json().connectionPluginsEnabled).toBe(false);
+    expect(
+      await OrganizationModel.findByIdForAudit(organizationId, organizationId),
+    ).toMatchObject({
+      connectionSkillsEnabled: false,
+      connectionLlmProxyEnabled: false,
+      connectionPluginsEnabled: false,
+    });
+
+    const restored = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: {
+        connectionSkillsEnabled: true,
+        connectionLlmProxyEnabled: true,
+        connectionPluginsEnabled: true,
+      },
+    });
+    expect(restored.statusCode).toBe(200);
+    expect(restored.json().connectionSkillsEnabled).toBe(true);
+    expect(restored.json().connectionLlmProxyEnabled).toBe(true);
+    expect(restored.json().connectionPluginsEnabled).toBe(true);
   });
 
   test("allows clearing defaults with null", async ({ makeAgent }) => {

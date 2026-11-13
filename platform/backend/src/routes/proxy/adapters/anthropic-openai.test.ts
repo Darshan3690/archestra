@@ -1,0 +1,430 @@
+/**
+ * Regression: the proxy handler calls getRawToolCallEvents() repeatedly and
+ * dedupes replayed events by array index, so the adapter must return a stable
+ * snapshot. A draining implementation re-based later tool calls to index 0,
+ * so with parallel tool calls the second call's start chunk (id + name) was
+ * skipped as already streamed and openai-compat consumers (model-router /
+ * archestra provider) received a dangling tool call (AbortiveTurn).
+ */
+import { describe, expect, it } from "vitest";
+import { makeAnthropicOpenaiAdapterFactory } from "./anthropic-openai";
+import type { AnthropicOpenaiContext } from "./anthropic-openai-translator";
+import { makeResponsesFromChatAdapterFactory } from "./openai-responses-from-chat";
+
+const ctx: AnthropicOpenaiContext = {
+  chatcmplId: "chatcmpl-test",
+  createdUnix: 0,
+  requestedModel: "archestra:test",
+} as AnthropicOpenaiContext;
+
+function makeAdapter() {
+  return makeAnthropicOpenaiAdapterFactory(ctx).createStreamAdapter();
+}
+
+function feedRawTextAndReasoning(
+  adapter: Pick<ReturnType<typeof makeAdapter>, "processChunk">,
+): string {
+  const process = (chunk: unknown) =>
+    adapter.processChunk(chunk as Parameters<typeof adapter.processChunk>[0]);
+  return [
+    process({
+      type: "message_start",
+      message: {
+        id: "msg_raw",
+        model: "claude-test",
+        usage: { input_tokens: 5, output_tokens: 2 },
+      },
+    }).sseData,
+    process({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "thinking", thinking: "", signature: "" },
+    }).sseData,
+    process({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "thinking_delta", thinking: "RAW reasoning" },
+    }).sseData,
+    process({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "signature_delta", signature: "sig-raw" },
+    }).sseData,
+    process({
+      type: "content_block_start",
+      index: 1,
+      content_block: { type: "text", text: "" },
+    }).sseData,
+    process({
+      type: "content_block_delta",
+      index: 1,
+      delta: { type: "text_delta", text: "RAW" },
+    }).sseData,
+    process({ type: "content_block_stop", index: 1 }).sseData,
+    process({ type: "message_stop" }).sseData,
+  ].join("");
+}
+
+function feedParallelToolCalls(adapter: ReturnType<typeof makeAdapter>) {
+  const feed = (chunk: unknown) =>
+    adapter.processChunk(chunk as Parameters<typeof adapter.processChunk>[0]);
+  feed({ type: "message_start", message: { usage: {} } });
+  feed({
+    type: "content_block_start",
+    index: 0,
+    content_block: { type: "tool_use", id: "toolu_A", name: "run_command" },
+  });
+  feed({
+    type: "content_block_delta",
+    index: 0,
+    delta: { type: "input_json_delta", partial_json: '{"cmd":"ls"}' },
+  });
+  feed({ type: "content_block_stop", index: 0 });
+  feed({
+    type: "content_block_start",
+    index: 1,
+    content_block: { type: "tool_use", id: "toolu_B", name: "run_command" },
+  });
+  feed({
+    type: "content_block_delta",
+    index: 1,
+    delta: { type: "input_json_delta", partial_json: '{"cmd":"pwd"}' },
+  });
+  feed({ type: "content_block_stop", index: 1 });
+}
+
+function assembleToolCalls(wire: string[]) {
+  const byIndex = new Map<
+    number,
+    { id?: string; name?: string; args: string }
+  >();
+  for (const sse of wire) {
+    const match = sse.match(/^data: (\{.*\})/m);
+    if (!match) continue;
+    const toolCall = JSON.parse(match[1]).choices?.[0]?.delta?.tool_calls?.[0];
+    if (!toolCall) continue;
+    const entry = byIndex.get(toolCall.index) ?? { args: "" };
+    if (toolCall.id) entry.id = toolCall.id;
+    if (toolCall.function?.name) entry.name = toolCall.function.name;
+    if (toolCall.function?.arguments) entry.args += toolCall.function.arguments;
+    byIndex.set(toolCall.index, entry);
+  }
+  return byIndex;
+}
+
+describe("AnthropicOpenaiStreamAdapter.getRawToolCallEvents", () => {
+  it("returns a stable snapshot across repeated calls", () => {
+    const adapter = makeAdapter();
+    feedParallelToolCalls(adapter);
+
+    const first = adapter.getRawToolCallEvents();
+    const second = adapter.getRawToolCallEvents();
+    expect(first.length).toBeGreaterThan(0);
+    expect(second).toEqual(first);
+  });
+
+  it("keeps both parallel tool calls intact under the handler's index-dedupe replay", () => {
+    const adapter = makeAdapter();
+    const feed = (chunk: unknown) =>
+      adapter.processChunk(chunk as Parameters<typeof adapter.processChunk>[0]);
+    const streamedEventIndices = new Set<number>();
+    const wire: string[] = [];
+    const flush = () => {
+      const allEvents = adapter.getRawToolCallEvents();
+      for (let i = 0; i < allEvents.length; i++) {
+        if (!streamedEventIndices.has(i)) {
+          wire.push(allEvents[i] as string);
+          streamedEventIndices.add(i);
+        }
+      }
+    };
+
+    feed({ type: "message_start", message: { usage: {} } });
+    feed({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "tool_use", id: "toolu_A", name: "run_command" },
+    });
+    feed({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "input_json_delta", partial_json: '{"cmd":"ls"}' },
+    });
+    flush(); // handler flushes mid-stream once the first call passes policy
+    feed({ type: "content_block_stop", index: 0 });
+    feed({
+      type: "content_block_start",
+      index: 1,
+      content_block: { type: "tool_use", id: "toolu_B", name: "run_command" },
+    });
+    feed({
+      type: "content_block_delta",
+      index: 1,
+      delta: { type: "input_json_delta", partial_json: '{"cmd":"pwd"}' },
+    });
+    flush();
+
+    const byIndex = assembleToolCalls(wire);
+    expect(byIndex.get(0)).toMatchObject({
+      id: "toolu_A",
+      name: "run_command",
+    });
+    expect(JSON.parse(byIndex.get(0)?.args ?? "")).toEqual({ cmd: "ls" });
+    expect(byIndex.get(1)).toMatchObject({
+      id: "toolu_B",
+      name: "run_command",
+    });
+    expect(JSON.parse(byIndex.get(1)?.args ?? "")).toEqual({ cmd: "pwd" });
+  });
+});
+
+// toProviderResponse() is the persisted record, and it delegates to the inner
+// Anthropic adapter, which lists tool calls only once they have been handed
+// over. This wrapper keeps its own buffer and returns OpenAI-shaped events, so
+// reading them has to reach the inner adapter too or the record silently drops
+// calls the client did receive — with no type error and no failing wire
+// assertion.
+describe("AnthropicOpenaiStreamAdapter tool-call release", () => {
+  it("records the delivered tool calls once they are read", () => {
+    const adapter = makeAdapter();
+    feedParallelToolCalls(adapter);
+
+    adapter.getRawToolCallEvents();
+
+    expect(
+      adapter
+        .toProviderResponse()
+        .content.filter((block) => block.type === "tool_use"),
+    ).toMatchObject([{ id: "toolu_A" }, { id: "toolu_B" }]);
+  });
+
+  it("records no tool calls for a turn that ended before the gate", () => {
+    const adapter = makeAdapter();
+    feedParallelToolCalls(adapter);
+
+    expect(
+      adapter
+        .toProviderResponse()
+        .content.some((block) => block.type === "tool_use"),
+    ).toBe(false);
+  });
+
+  // A rewritten call can carry the id the client is given in place of the
+  // provider's (OpenAPPA's trajectory stamp); the non-streamed turn writes it,
+  // so a streamed one must too, while the record keeps the provider's.
+  it("gives the client each rewritten call's own id, and records the provider's", () => {
+    const adapter = makeAdapter();
+    feedParallelToolCalls(adapter);
+
+    const wire =
+      adapter.formatToolCallsSSE?.([
+        {
+          id: "toolu_A",
+          wireId: "appat1-stamped-A",
+          name: "run_command",
+          arguments: '{"cmd":"ls"}',
+        },
+        { id: "toolu_B", name: "run_command", arguments: '{"cmd":"pwd"}' },
+      ]) ?? [];
+
+    const [chunk] = wire.map((sse) =>
+      JSON.parse(String(sse).replace(/^data: /, "")),
+    );
+    expect(
+      chunk.choices[0].delta.tool_calls.map((call: { id: string }) => call.id),
+    ).toEqual(["appat1-stamped-A", "toolu_B"]);
+    expect(
+      adapter
+        .toProviderResponse()
+        .content.filter((block) => block.type === "tool_use"),
+    ).toMatchObject([{ id: "toolu_A" }, { id: "toolu_B" }]);
+  });
+});
+
+describe("AnthropicOpenaiStreamAdapter response replacement", () => {
+  it("drops the buffered raw text and reasoning from the admitted transcript", () => {
+    const adapter = makeAdapter();
+    expect(feedRawTextAndReasoning(adapter)).toContain("RAW");
+    expect(JSON.stringify(adapter.toProviderResponse())).toContain(
+      "RAW reasoning",
+    );
+
+    adapter.prepareResponseReplacement?.();
+    const admittedFrames = [
+      ...adapter.formatCompleteTextSSE("ADMITTED"),
+      adapter.formatEndSSE(),
+    ].join("");
+
+    expect(admittedFrames).toContain("ADMITTED");
+    expect(admittedFrames).not.toContain("RAW");
+    expect(adapter.toProviderResponse().content).toEqual([
+      { type: "text", text: "ADMITTED", citations: null },
+    ]);
+  });
+});
+
+describe("ResponsesFromChatStreamAdapter response replacement", () => {
+  it("restarts the Responses transcript and drops inner raw text and reasoning", () => {
+    const adapter = makeResponsesFromChatAdapterFactory(
+      makeAnthropicOpenaiAdapterFactory(ctx),
+      {
+        responseId: "resp-test",
+        createdUnix: 0,
+        requestedModel: "archestra:test",
+      },
+    ).createStreamAdapter();
+    const rawFrames = feedRawTextAndReasoning(adapter);
+    expect(rawFrames).toContain("RAW");
+    expect(rawFrames).not.toContain("response.completed");
+
+    adapter.prepareResponseReplacement?.();
+    expect(adapter.state.text).toBe("");
+    const admittedWire = [
+      ...adapter.formatCompleteTextSSE("ADMITTED"),
+      adapter.formatEndSSE(),
+    ].join("");
+    const admittedEvents = admittedWire
+      .split("\n")
+      .filter((line) => line.startsWith("data: {") && line !== "data: [DONE]")
+      .map(
+        (line) =>
+          JSON.parse(line.slice("data: ".length)) as {
+            type: string;
+            delta?: string;
+            response?: { output: unknown[]; [key: string]: unknown };
+          },
+      );
+    const loggedResponse = adapter.toProviderResponse();
+    const completed = admittedEvents.find(
+      (event) => event.type === "response.completed",
+    );
+
+    expect(admittedEvents.map((event) => event.type)).toEqual([
+      "response.created",
+      "response.output_item.added",
+      "response.content_part.added",
+      "response.output_text.delta",
+      "response.output_text.done",
+      "response.content_part.done",
+      "response.output_item.done",
+      "response.completed",
+    ]);
+    expect(
+      admittedEvents.find(
+        (event) => event.type === "response.output_text.delta",
+      )?.delta,
+    ).toBe("ADMITTED");
+    expect(completed?.response?.output).toMatchObject([
+      { type: "message", content: [{ type: "output_text", text: "ADMITTED" }] },
+    ]);
+    expect(loggedResponse.content).toEqual([
+      { type: "text", text: "ADMITTED", citations: null },
+    ]);
+    expect(completed?.response?.usage).toMatchObject({
+      input_tokens: 5,
+      output_tokens: 2,
+    });
+    expect(JSON.stringify({ admittedEvents, loggedResponse })).not.toContain(
+      "RAW",
+    );
+  });
+});
+
+describe("ResponsesFromChatAdapter response replacement", () => {
+  it("replaces in the native Anthropic domain before translating to Responses", () => {
+    const factory = makeResponsesFromChatAdapterFactory(
+      makeAnthropicOpenaiAdapterFactory(ctx),
+      {
+        responseId: "resp-test",
+        createdUnix: 0,
+        requestedModel: "archestra:test",
+      },
+    );
+    const adapter = factory.createResponseAdapter({
+      id: "msg-test",
+      type: "message",
+      role: "assistant",
+      model: "claude-test",
+      content: [{ type: "text", text: "RAW", citations: null }],
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: 5, output_tokens: 2 },
+    });
+
+    expect(adapter.getText()).toBe("RAW");
+    expect(adapter.withReplacedText?.("ADMITTED")).toMatchObject({
+      object: "response",
+      output: [
+        {
+          type: "message",
+          content: [{ type: "output_text", text: "ADMITTED" }],
+        },
+      ],
+    });
+    expect(adapter.getLoggedResponse?.()).toMatchObject({
+      type: "message",
+      content: [{ type: "text", text: "ADMITTED" }],
+    });
+  });
+});
+
+// OpenAI clients branch on finish_reason: a refusal or a turn cut off by the
+// context window must not look like a normal "stop", or the client treats a
+// truncated or refused answer as complete.
+describe.each([
+  { stopReason: "refusal", finishReason: "content_filter" },
+  { stopReason: "model_context_window_exceeded", finishReason: "length" },
+])("Anthropic stop_reason $stopReason", ({ stopReason, finishReason }) => {
+  it(`reaches a non-streamed client as finish_reason ${finishReason}`, () => {
+    const adapter = makeAnthropicOpenaiAdapterFactory(
+      ctx,
+    ).createResponseAdapter({
+      id: "msg-test",
+      type: "message",
+      role: "assistant",
+      model: "claude-test",
+      content: [{ type: "text", text: "partial", citations: null }],
+      stop_reason: stopReason,
+      stop_sequence: null,
+      usage: { input_tokens: 5, output_tokens: 2 },
+    });
+
+    expect(adapter.getOriginalResponse()).toMatchObject({
+      choices: [{ finish_reason: finishReason }],
+    });
+  });
+
+  it(`reaches a streamed client as finish_reason ${finishReason}`, () => {
+    const adapter = makeAdapter();
+    const feed = (chunk: unknown) =>
+      adapter.processChunk(chunk as Parameters<typeof adapter.processChunk>[0]);
+    feed({
+      type: "message_start",
+      message: { id: "msg-test", model: "claude-test", usage: {} },
+    });
+    feed({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    });
+    feed({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "partial" },
+    });
+    feed({ type: "content_block_stop", index: 0 });
+    feed({
+      type: "message_delta",
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: 2 },
+    });
+    feed({ type: "message_stop" });
+
+    const finishReasons = String(adapter.formatEndSSE())
+      .split("\n")
+      .filter((line) => line.startsWith("data: {"))
+      .map((line) => JSON.parse(line.slice(6)).choices?.[0]?.finish_reason)
+      .filter(Boolean);
+    expect(finishReasons).toEqual([finishReason]);
+  });
+});

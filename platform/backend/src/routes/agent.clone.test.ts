@@ -1,25 +1,26 @@
-import { BUILT_IN_AGENT_IDS } from "@shared";
+import {
+  BUILT_IN_AGENT_IDS,
+  TOOL_TODO_WRITE_FULL_NAME,
+} from "@archestra/shared";
 import { eq } from "drizzle-orm";
 import { type Mock, vi } from "vitest";
 import {
   getAgentTypePermissionChecker,
+  hasAnyAgentTypeAdminPermission,
+  hasAnyAgentTypeReadPermission,
+  isAgentTypeAdmin,
   requireAgentModifyPermission,
 } from "@/auth";
 import db, { schema } from "@/database";
-import { AgentToolModel, ToolModel } from "@/models";
-import type { FastifyInstanceWithZod } from "@/server";
-import { createFastifyInstance } from "@/server";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { AgentModel, AgentToolModel, ToolModel } from "@/models";
+import AgentExcludedSubagentModel from "@/models/agent-excluded-subagent";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
 import { afterEach, beforeEach, describe, expect, test } from "@/test";
 import { type Agent, ApiError, type User } from "@/types";
 
-vi.mock("@/auth", () => ({
-  getAgentTypePermissionChecker: vi.fn(),
-  hasAnyAgentTypeReadPermission: vi.fn().mockResolvedValue(true),
-  requireAgentModifyPermission: vi.fn(),
-  requireAgentTypePermission: vi.fn(),
-  isAgentTypeAdmin: vi.fn().mockResolvedValue(true),
-  hasAnyAgentTypeAdminPermission: vi.fn().mockResolvedValue(true),
-}));
+vi.mock("@/auth");
 
 const mockGetAgentTypePermissionChecker = getAgentTypePermissionChecker as Mock;
 const mockRequireAgentModifyPermission = requireAgentModifyPermission as Mock;
@@ -31,6 +32,10 @@ describe("clone agent route", () => {
 
   beforeEach(async ({ makeOrganization, makeUser, makeMember }) => {
     vi.clearAllMocks();
+
+    vi.mocked(hasAnyAgentTypeReadPermission).mockResolvedValue(true);
+    vi.mocked(isAgentTypeAdmin).mockResolvedValue(true);
+    vi.mocked(hasAnyAgentTypeAdminPermission).mockResolvedValue(true);
 
     user = await makeUser();
     const organization = await makeOrganization();
@@ -69,7 +74,10 @@ describe("clone agent route", () => {
     makeKnowledgeBase,
     makeKnowledgeBaseConnector,
   }) => {
-    const kb = await makeKnowledgeBase(organizationId, { name: "KB 1" });
+    const kb = await makeKnowledgeBase(organizationId, {
+      name: "KB 1",
+      access: "org",
+    });
     const connector = await makeKnowledgeBaseConnector(kb.id, organizationId, {
       name: "Connector 1",
     });
@@ -79,8 +87,6 @@ describe("clone agent route", () => {
     const targetSubAgent = await makeInternalAgent({
       organizationId,
       name: "Sub Agent",
-      scope: "org",
-      teams: [],
       labels: [],
     });
     const delegationTool = await ToolModel.findOrCreateDelegationTool(
@@ -90,13 +96,10 @@ describe("clone agent route", () => {
     const sourceAgent = await makeInternalAgent({
       organizationId,
       name: "Source Agent",
-      scope: "org",
-      teams: [],
       labels: [{ key: "env", value: "test" }],
       knowledgeBaseIds: [kb.id],
       connectorIds: [connector.id],
       suggestedPrompts: [{ summaryTitle: "S1", prompt: "P1" }],
-      considerContextUntrusted: true,
     });
 
     await makeAgentTool(sourceAgent.id, baseTool.id, {
@@ -116,8 +119,6 @@ describe("clone agent route", () => {
 
     expect(cloned.id).not.toBe(sourceAgent.id);
     expect(cloned.name).toBe(`Copy of ${sourceAgent.name}`);
-    expect(cloned.considerContextUntrusted).toBe(true);
-
     // Associations via API response
     expect(cloned.labels).toEqual(sourceAgent.labels);
     expect(cloned.knowledgeBaseIds).toEqual([kb.id]);
@@ -155,17 +156,134 @@ describe("clone agent route", () => {
     );
   });
 
+  test("clones Auto subagent access with its exclusions", async ({
+    makeInternalAgent,
+  }) => {
+    const excludedTarget = await makeInternalAgent({
+      organizationId,
+      name: "Excluded Sub Agent",
+    });
+    const sourceAgent = await makeInternalAgent({
+      organizationId,
+      name: "All Subagents Source",
+    });
+    await AgentModel.update(sourceAgent.id, { accessAllSubagents: true });
+    await AgentExcludedSubagentModel.replaceForAgent(sourceAgent.id, [
+      excludedTarget.id,
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/agents/${sourceAgent.id}/clone`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const cloned = response.json() as Agent;
+    expect(cloned.accessAllSubagents).toBe(true);
+    expect(
+      await AgentExcludedSubagentModel.findTargetAgentIdsByAgent(cloned.id),
+    ).toEqual([excludedTarget.id]);
+  });
+
+  test("clones Auto tools and subagents without a restorable mixed policy", async ({
+    makeInternalAgent,
+  }) => {
+    const excludedTarget = await makeInternalAgent({
+      organizationId,
+      name: "Excluded Sub Agent",
+    });
+    const sourceAgent = await makeInternalAgent({
+      organizationId,
+      name: "All Subagents Source",
+    });
+    await AgentModel.update(sourceAgent.id, {
+      accessAllTools: true,
+      accessAllSubagents: true,
+    });
+    await AgentExcludedSubagentModel.replaceForAgent(sourceAgent.id, [
+      excludedTarget.id,
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/agents/${sourceAgent.id}/clone`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const cloned = response.json() as Agent;
+    expect(cloned.accessAllTools).toBe(true);
+    expect(cloned.accessAllSubagents).toBe(true);
+    const history = await db
+      .select({ snapshot: schema.agentVersionsTable.snapshot })
+      .from(schema.agentVersionsTable)
+      .where(eq(schema.agentVersionsTable.agentId, cloned.id));
+    // A restorable Auto-tools/Manual-subagents version does not match the
+    // source and must never appear between the closed and final clone states.
+    expect(
+      history.map(({ snapshot }) => ({
+        accessAllTools: snapshot.accessAllTools,
+        accessAllSubagents: snapshot.accessAllSubagents,
+      })),
+    ).not.toContainEqual({ accessAllTools: true, accessAllSubagents: false });
+    expect(
+      await AgentExcludedSubagentModel.findTargetAgentIdsByAgent(cloned.id),
+    ).toEqual([excludedTarget.id]);
+  });
+
+  test("does not force-assign creation-default built-ins the source agent lacked", async ({
+    makeInternalAgent,
+    makeTool,
+    makeAgentTool,
+    makeAgent,
+    seedAndAssignArchestraTools,
+  }) => {
+    // Source is created before the built-ins are seeded, so its own create
+    // can't auto-assign todo_write — it genuinely lacks it.
+    const baseTool = await makeTool({ name: "tool-a" });
+    const sourceAgent = await makeInternalAgent({
+      organizationId,
+      name: "Source Agent",
+      labels: [],
+    });
+    await makeAgentTool(sourceAgent.id, baseTool.id, {
+      credentialResolutionMode: "dynamic",
+    });
+
+    // Seed the built-in rows now, so the clone's create COULD force-assign
+    // todo_write (the pre-fix behavior) — the fix must skip that.
+    const seedHost = await makeAgent({ organizationId });
+    await seedAndAssignArchestraTools(seedHost.id);
+    const todoWrite = await ToolModel.findByName(TOOL_TODO_WRITE_FULL_NAME);
+    if (!todoWrite) throw new Error("todo_write not seeded");
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/agents/${sourceAgent.id}/clone`,
+    });
+    expect(response.statusCode).toBe(200);
+    const cloned = response.json() as Agent;
+
+    const clonedToolIds = (
+      await db
+        .select({ toolId: schema.agentToolsTable.toolId })
+        .from(schema.agentToolsTable)
+        .where(eq(schema.agentToolsTable.agentId, cloned.id))
+    ).map((row) => row.toolId);
+
+    // The clone is an exact copy of the source's assignments — the always-on
+    // default todo_write is NOT force-added.
+    expect(clonedToolIds).toContain(baseTool.id);
+    expect(clonedToolIds).not.toContain(todoWrite.id);
+  });
+
   test("cannot clone built-in agents", async ({ makeInternalAgent }) => {
     const builtIn = await makeInternalAgent({
       organizationId,
       name: "Built In",
-      scope: "org",
       builtInAgentConfig: {
         // Any valid built-in discriminator works here
-        name: BUILT_IN_AGENT_IDS.POLICY_CONFIG,
-        autoConfigureOnToolDiscovery: false,
+        name: BUILT_IN_AGENT_IDS.CONTEXT_COMPACTION,
       },
-      teams: [],
       labels: [],
       knowledgeBaseIds: [],
       connectorIds: [],
@@ -185,8 +303,6 @@ describe("clone agent route", () => {
     const sourceAgent = await makeInternalAgent({
       organizationId,
       name: "Source Agent",
-      scope: "org",
-      teams: [],
       labels: [],
       knowledgeBaseIds: [],
       connectorIds: [],
@@ -216,8 +332,6 @@ describe("clone agent route", () => {
     const sourceAgent = await makeInternalAgent({
       organizationId,
       name: "Org Agent",
-      scope: "org",
-      teams: [],
       labels: [],
       knowledgeBaseIds: [],
       connectorIds: [],
@@ -251,9 +365,8 @@ describe("clone agent route", () => {
     const sourceAgent = await makeInternalAgent({
       organizationId,
       name: "Personal Agent",
-      scope: "personal",
-      authorId: otherUser.id, // Owned by different user
-      teams: [],
+      access: "personal",
+      authorId: otherUser.id,
       labels: [],
       knowledgeBaseIds: [],
       connectorIds: [],
@@ -282,8 +395,7 @@ describe("clone agent route", () => {
     const sourceAgent = await makeInternalAgent({
       organizationId,
       name: "Team Agent",
-      scope: "team",
-      teams: [team.id],
+      access: { teams: [team.id] },
       labels: [],
       knowledgeBaseIds: [],
       connectorIds: [],
@@ -312,14 +424,114 @@ describe("clone agent route", () => {
     expect(response.statusCode).toBe(403);
   });
 
+  test("refuses the retired scope and teams fields on a clone", async ({
+    makeInternalAgent,
+  }) => {
+    const sourceAgent = await makeInternalAgent({
+      organizationId,
+      name: "Org Agent",
+      labels: [],
+      knowledgeBaseIds: [],
+      connectorIds: [],
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/agents/${sourceAgent.id}/clone`,
+      payload: { scope: "team", teams: [] },
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  test("cloning uses explicit grants and does not copy the source audience", async ({
+    makeInternalAgent,
+    makeMember,
+    makeTeam,
+    makeTeamMember,
+    makeUser,
+  }) => {
+    const team = await makeTeam(organizationId, user.id);
+    await makeTeamMember(team.id, user.id);
+    const colleague = await makeUser();
+    await makeMember(colleague.id, organizationId);
+    const source = await makeInternalAgent({
+      organizationId,
+      authorId: user.id,
+    });
+    const grants = [
+      {
+        subject: { type: "team", id: team.id },
+        actions: ["read", "use", "update"],
+      },
+      {
+        subject: { type: "user", id: colleague.id },
+        actions: ["read", "use"],
+      },
+    ];
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/agents/${source.id}/clone`,
+      payload: { initialGrants: grants },
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    const clone = response.json();
+    expect(clone.scope).toBe("team");
+    const policy = await ResourcePermissionPolicyModel.find({
+      organizationId,
+      resource: "agent",
+      scope: clone.id,
+    });
+    expect(policy?.grants).toEqual(expect.arrayContaining(grants));
+    expect(
+      policy?.grants.some((grant) => grant.subject.type === "organization"),
+    ).toBe(false);
+    expect(policy?.grants).toEqual(
+      expect.arrayContaining([
+        {
+          subject: { type: "user", id: user.id },
+          actions: ["read", "use", "update", "delete", "manage-permissions"],
+        },
+      ]),
+    );
+  });
+
+  test("an empty clone request creates private creator access instead of copying sharing", async ({
+    makeInternalAgent,
+    makeTeam,
+  }) => {
+    const team = await makeTeam(organizationId, user.id);
+    const source = await makeInternalAgent({
+      organizationId,
+      authorId: user.id,
+      access: { teams: [team.id] },
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/agents/${source.id}/clone`,
+      payload: {},
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    const clone = response.json();
+    expect(clone.scope).toBe("personal");
+    expect(clone.teams).toEqual([]);
+    const policy = await ResourcePermissionPolicyModel.find({
+      organizationId,
+      resource: "agent",
+      scope: clone.id,
+    });
+    expect(policy?.grants.map((grant) => grant.subject)).toEqual([
+      { type: "user", id: user.id },
+    ]);
+  });
+
   test("clones agent with empty associations", async ({
     makeInternalAgent,
   }) => {
     const sourceAgent = await makeInternalAgent({
       organizationId,
       name: "Minimal Agent",
-      scope: "personal",
-      teams: [],
+      access: "personal",
       labels: [],
       knowledgeBaseIds: [],
       connectorIds: [],
@@ -342,48 +554,16 @@ describe("clone agent route", () => {
     expect(cloned.tools).toEqual([]);
   });
 
-  test("clones agent with multiple teams", async ({
-    makeInternalAgent,
-    makeTeam,
-  }) => {
-    const team1 = await makeTeam(organizationId, user.id);
-    const team2 = await makeTeam(organizationId, user.id);
-
-    const sourceAgent = await makeInternalAgent({
-      organizationId,
-      name: "Multi-Team Agent",
-      scope: "team",
-      teams: [team1.id, team2.id],
-      labels: [],
-      knowledgeBaseIds: [],
-      connectorIds: [],
-    });
-
-    const response = await app.inject({
-      method: "POST",
-      url: `/api/agents/${sourceAgent.id}/clone`,
-    });
-
-    expect(response.statusCode).toBe(200);
-    const cloned = response.json() as Agent;
-
-    expect(cloned.teams.map((t) => t.id)).toEqual(
-      expect.arrayContaining([team1.id, team2.id]),
-    );
-  });
-
-  test("clones all three built-in agent types", async ({
+  test("clones profile and mcp_gateway agent types", async ({
     makeInternalAgent,
   }) => {
-    const agentTypes = ["profile", "mcp_gateway", "llm_proxy"] as const;
+    const agentTypes = ["profile", "mcp_gateway"] as const;
 
     for (const agentType of agentTypes) {
       const sourceAgent = await makeInternalAgent({
         organizationId,
         name: `${agentType} Agent`,
         agentType,
-        scope: "org",
-        teams: [],
         labels: [],
         knowledgeBaseIds: [],
         connectorIds: [],
@@ -430,8 +610,6 @@ describe("clone agent route", () => {
     const sourceAgent = await makeInternalAgent({
       organizationId,
       name: "Headers Agent",
-      scope: "org",
-      teams: [],
       labels: [],
       knowledgeBaseIds: [],
       connectorIds: [],
@@ -453,8 +631,6 @@ describe("clone agent route", () => {
     const sourceAgent = await makeInternalAgent({
       organizationId,
       name: "Email Agent",
-      scope: "org",
-      teams: [],
       labels: [],
       knowledgeBaseIds: [],
       connectorIds: [],
@@ -480,13 +656,10 @@ describe("clone agent route", () => {
     const sourceAgent = await makeInternalAgent({
       organizationId,
       name: "LLM Agent",
-      scope: "org",
-      teams: [],
       labels: [],
       knowledgeBaseIds: [],
       connectorIds: [],
       llmApiKeyId: null,
-      llmModel: "gpt-4",
     });
 
     const response = await app.inject({
@@ -498,7 +671,6 @@ describe("clone agent route", () => {
     const cloned = response.json() as Agent;
 
     expect(cloned.llmApiKeyId).toBeNull();
-    expect(cloned.llmModel).toBe("gpt-4");
   });
 
   test("clones identityProviderId for MCP gateway", async ({
@@ -508,8 +680,6 @@ describe("clone agent route", () => {
       organizationId,
       name: "MCP Gateway",
       agentType: "mcp_gateway",
-      scope: "org",
-      teams: [],
       labels: [],
       knowledgeBaseIds: [],
       connectorIds: [],
@@ -532,7 +702,10 @@ describe("clone agent route", () => {
     makeKnowledgeBase,
     makeKnowledgeBaseConnector,
   }) => {
-    const kb = await makeKnowledgeBase(organizationId, { name: "KB Reject" });
+    const kb = await makeKnowledgeBase(organizationId, {
+      name: "KB Reject",
+      access: "org",
+    });
     const connector = await makeKnowledgeBaseConnector(kb.id, organizationId, {
       name: "Connector Reject",
     });
@@ -541,8 +714,6 @@ describe("clone agent route", () => {
       organizationId,
       name: "LLM Proxy With KB",
       agentType: "llm_proxy",
-      scope: "org",
-      teams: [],
       labels: [],
       knowledgeBaseIds: [kb.id],
       connectorIds: [connector.id],
@@ -562,8 +733,6 @@ describe("clone agent route", () => {
     const sourceAgent = await makeInternalAgent({
       organizationId,
       name: "Rollback Source",
-      scope: "org",
-      teams: [],
       labels: [],
       knowledgeBaseIds: [],
       connectorIds: [],
@@ -601,8 +770,6 @@ describe("clone agent route", () => {
     const sourceAgent = await makeInternalAgent({
       organizationId,
       name: "Prompts Agent",
-      scope: "org",
-      teams: [],
       labels: [],
       knowledgeBaseIds: [],
       connectorIds: [],
@@ -624,8 +791,6 @@ describe("clone agent route", () => {
     const sourceAgent = await makeInternalAgent({
       organizationId,
       name: "Icon Agent",
-      scope: "org",
-      teams: [],
       labels: [],
       knowledgeBaseIds: [],
       connectorIds: [],
@@ -647,8 +812,6 @@ describe("clone agent route", () => {
     const sourceAgent = await makeInternalAgent({
       organizationId,
       name: "Described Agent",
-      scope: "org",
-      teams: [],
       labels: [],
       knowledgeBaseIds: [],
       connectorIds: [],
@@ -672,8 +835,6 @@ describe("clone agent route", () => {
     const sourceAgent = await makeInternalAgent({
       organizationId,
       name: "Prompt Agent",
-      scope: "org",
-      teams: [],
       labels: [],
       knowledgeBaseIds: [],
       connectorIds: [],
@@ -691,31 +852,6 @@ describe("clone agent route", () => {
     expect(cloned.systemPrompt).toBe(systemPrompt);
   });
 
-  test("clones agent with considerContextUntrusted", async ({
-    makeInternalAgent,
-  }) => {
-    const sourceAgent = await makeInternalAgent({
-      organizationId,
-      name: "Untrusted Agent",
-      scope: "org",
-      teams: [],
-      labels: [],
-      knowledgeBaseIds: [],
-      connectorIds: [],
-      considerContextUntrusted: true,
-    });
-
-    const response = await app.inject({
-      method: "POST",
-      url: `/api/agents/${sourceAgent.id}/clone`,
-    });
-
-    expect(response.statusCode).toBe(200);
-    const cloned = response.json() as Agent;
-
-    expect(cloned.considerContextUntrusted).toBe(true);
-  });
-
   test("clones agent with multiple labels", async ({ makeInternalAgent }) => {
     const labels = [
       { key: "env", value: "test" },
@@ -726,8 +862,6 @@ describe("clone agent route", () => {
     const sourceAgent = await makeInternalAgent({
       organizationId,
       name: "Labeled Agent",
-      scope: "org",
-      teams: [],
       labels,
       knowledgeBaseIds: [],
       connectorIds: [],
@@ -762,8 +896,6 @@ describe("clone agent route", () => {
     const otherOrgAgent = await makeInternalAgent({
       organizationId: otherOrg.id,
       name: "Other Org Agent",
-      scope: "org",
-      teams: [],
       labels: [],
       knowledgeBaseIds: [],
       connectorIds: [],
@@ -778,19 +910,14 @@ describe("clone agent route", () => {
     expect(response.statusCode).toBe(404);
   });
 
-  test("preserves toolExposureMode and toolAssignmentMode in clone", async ({
-    makeInternalAgent,
-  }) => {
+  test("preserves toolExposureMode in clone", async ({ makeInternalAgent }) => {
     const sourceAgent = await makeInternalAgent({
       organizationId,
       name: "Search-Only Agent",
-      scope: "org",
-      teams: [],
       labels: [{ key: "env", value: "prod" }],
       knowledgeBaseIds: [],
       connectorIds: [],
       toolExposureMode: "search_and_run_only",
-      toolAssignmentMode: "automatic",
     });
 
     const response = await app.inject({
@@ -802,6 +929,80 @@ describe("clone agent route", () => {
     const cloned = response.json() as Agent;
 
     expect(cloned.toolExposureMode).toBe("search_and_run_only");
-    expect(cloned.toolAssignmentMode).toBe("automatic");
+  });
+
+  test("copies Auto-tool-mode exclusions to the clone", async ({
+    makeInternalAgent,
+    makeInternalMcpCatalog,
+    makeTool,
+  }) => {
+    const toolCatalog = await makeInternalMcpCatalog({ organizationId });
+    const excludedTool = await makeTool({
+      name: "github__create_issue",
+      catalogId: toolCatalog.id,
+    });
+    const sourceAgent = await makeInternalAgent({
+      organizationId,
+      name: "Excluding Agent",
+      accessAllTools: true,
+    });
+    const { agentToolExclusionsService } = await import(
+      "@/services/agent-tool-exclusions"
+    );
+    await agentToolExclusionsService.replaceExclusions({
+      agentId: sourceAgent.id,
+      organizationId,
+      excludedToolIds: [excludedTool.id],
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/agents/${sourceAgent.id}/clone`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const cloned = response.json() as Agent;
+    expect(await agentToolExclusionsService.getExclusions(cloned.id)).toEqual({
+      excludedToolIds: [excludedTool.id],
+    });
+  });
+
+  test("copies Auto-mode knowledge-source exclusions to the clone", async ({
+    makeInternalAgent,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const knowledgeBase = await makeKnowledgeBase(organizationId, {
+      access: "org",
+    });
+    const connector = await makeKnowledgeBaseConnector(
+      knowledgeBase.id,
+      organizationId,
+    );
+    const sourceAgent = await makeInternalAgent({
+      organizationId,
+      name: "Excluding Agent",
+      accessAllTools: true,
+      knowledgeBaseIds: [knowledgeBase.id],
+    });
+    const { agentKnowledgeSourceExclusionsService } = await import(
+      "@/services/agent-knowledge-source-exclusions"
+    );
+    await agentKnowledgeSourceExclusionsService.replaceExclusions({
+      agentId: sourceAgent.id,
+      organizationId,
+      excludedConnectorIds: [connector.id],
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/agents/${sourceAgent.id}/clone`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const cloned = response.json() as Agent;
+    expect(
+      await agentKnowledgeSourceExclusionsService.getExclusions(cloned.id),
+    ).toEqual({ excludedConnectorIds: [connector.id] });
   });
 });

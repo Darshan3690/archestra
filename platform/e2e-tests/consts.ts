@@ -4,7 +4,7 @@ import {
   DEFAULT_ADMIN_PASSWORD,
   DEFAULT_TEAM_NAME,
   MCP_SERVER_TOOL_NAME_SEPARATOR,
-} from "@shared";
+} from "@archestra/shared";
 import dotenv from "dotenv";
 
 // Load .env from platform root - this runs once when the module is imported
@@ -51,12 +51,17 @@ export const WIREMOCK_BASE_URL =
   process.env.E2E_WIREMOCK_BASE_URL ||
   (IS_CI ? "http://127.0.0.1:8080" : "http://127.0.0.1:9092");
 
+export const A2A_FIXTURE_BASE_URL =
+  process.env.E2E_A2A_FIXTURE_BASE_URL || "http://127.0.0.1:9191";
+
 // Internal WireMock URL for backend-to-wiremock connections (used when storing URLs in database)
 // In CI, the backend pod needs to use the Kubernetes service DNS name
 // In local dev, localhost works because everything runs on the same host
-export const WIREMOCK_INTERNAL_URL = IS_CI
-  ? "http://e2e-tests-wiremock:8080"
-  : "http://localhost:9092";
+// The lite harness overrides this: its backend runs in a container, so URLs
+// stored in the DB must use the sidecar's docker network name.
+export const WIREMOCK_INTERNAL_URL =
+  process.env.E2E_WIREMOCK_INTERNAL_URL ||
+  (IS_CI ? "http://e2e-tests-wiremock:8080" : "http://localhost:9092");
 
 export const METRICS_BASE_URL = "http://localhost:9050";
 export const METRICS_BEARER_TOKEN = "foo-bar";
@@ -117,7 +122,7 @@ export {
   getIdentityProviderDialogNavButtonTestId,
   getIdpRoleMappingRuleRowTestId,
   MCP_SERVER_TOOL_NAME_SEPARATOR,
-} from "@shared";
+} from "@archestra/shared";
 
 export const TEST_CATALOG_ITEM_NAME = "internal-dev-test-server";
 export const TEST_TOOL_NAME = `${TEST_CATALOG_ITEM_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}print_archestra_test`;
@@ -127,9 +132,12 @@ export const TEST_TOOL_NAME = `${TEST_CATALOG_ITEM_NAME}${MCP_SERVER_TOOL_NAME_S
 // =============================================================================
 
 export const KEYCLOAK_EXTERNAL_URL = "http://localhost:30081";
-export const KEYCLOAK_BACKEND_URL = IS_CI
-  ? "http://e2e-tests-keycloak:8080"
-  : "http://localhost:30081";
+// URL the backend uses to reach Keycloak (discovery/token/jwks). The lite
+// harness overrides this with the sidecar's docker network name, since its
+// backend runs in a container where localhost is the container itself.
+export const KEYCLOAK_BACKEND_URL =
+  process.env.E2E_KEYCLOAK_BACKEND_URL ||
+  (IS_CI ? "http://e2e-tests-keycloak:8080" : "http://localhost:30081");
 export const KEYCLOAK_REALM = "archestra";
 export const VAULT_ADDR =
   process.env.ARCHESTRA_HASHICORP_VAULT_ADDR ??
@@ -176,6 +184,10 @@ export const SSO_DOMAIN = ADMIN_EMAIL.split("@")[1];
 
 // =============================================================================
 // MCP Server JWKS (example server for JWT propagation testing)
+//
+// The fixture MCP servers behind these images live in the examples repo
+// (archestra-ai/examples, test-fixtures/). Images are built/pushed manually
+// from there; the e2e suite only pulls the pinned tags below.
 // =============================================================================
 
 export const MCP_EXAMPLE_OAUTH_EXTERNAL_URL = "http://localhost:30083";
@@ -202,7 +214,7 @@ export const MCP_SERVER_ID_JAG_RESOURCE_CLIENT_SECRET =
 
 /** Docker image for the JWKS MCP server (used for local K8s deployment tests) */
 export const MCP_SERVER_JWKS_DOCKER_IMAGE =
-  "europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/mcp-server-jwks-keycloak:0.0.3";
+  "ghcr.io/archestra-ai/ci/mcp-server-jwks-keycloak:0.0.3";
 
 /**
  * Keycloak internal URL for use by K8s pods (MCP servers spawned by orchestrator).
@@ -219,3 +231,13 @@ export const KEYCLOAK_K8S_INTERNAL_URL = IS_CI
  * CI uses the default namespace; local dev uses archestra-dev.
  */
 export const MCP_SERVER_NAMESPACE = IS_CI ? "default" : "archestra-dev";
+
+/**
+ * Lets the whole organization find and use an agent or gateway. Organization
+ * and team tokens reach only the objects that their audience holds a use grant
+ * on, so a spec that calls a gateway with the organization token grants this.
+ */
+export const ORGANIZATION_USE_GRANT = {
+  subject: { type: "organization", id: "*" },
+  actions: ["read", "use"],
+} as const;

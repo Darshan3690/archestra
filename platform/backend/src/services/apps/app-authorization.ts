@@ -1,0 +1,174 @@
+import { AppAccessModel, TeamModel } from "@/models";
+import { ResourcePermissions } from "@/services/resource-permissions";
+import { ApiError } from "@/types";
+import type { AppScope } from "@/types/app";
+
+/**
+ * Resolve requested team references — team ids or team names — to a deduped
+ * list of team ids, asserting every one belongs to the caller's org and
+ * throwing `ApiError(400)` otherwise. Shared by the REST app routes (which
+ * pass ids) and the `publish_app` MCP tool (where the model passes whatever
+ * the user said, usually a team name) so neither can assign an app to a
+ * foreign-org team or a team that does not exist. Names match exactly first,
+ * then case-insensitively when that is unambiguous.
+ */
+export async function resolveOrgTeams(
+  teamRefs: string[] | undefined,
+  organizationId: string,
+): Promise<string[]> {
+  const unique = [...new Set((teamRefs ?? []).map((ref) => ref.trim()))];
+  if (unique.length === 0) return [];
+  const orgTeams = await TeamModel.findByOrganization(organizationId);
+  const teamsById = new Map(orgTeams.map((team) => [team.id, team]));
+  const resolved = new Set<string>();
+  const unknown: string[] = [];
+  for (const ref of unique) {
+    const byId = teamsById.get(ref);
+    if (byId) {
+      resolved.add(byId.id);
+      continue;
+    }
+    const exact = orgTeams.filter((team) => team.name === ref);
+    const matches =
+      exact.length > 0
+        ? exact
+        : orgTeams.filter(
+            (team) => team.name.toLowerCase() === ref.toLowerCase(),
+          );
+    if (matches.length > 1) {
+      throw new ApiError(
+        400,
+        `Team name "${ref}" is ambiguous in this organization; pass the team id instead.`,
+      );
+    }
+    if (matches.length === 1) {
+      resolved.add(matches[0].id);
+      continue;
+    }
+    unknown.push(ref);
+  }
+  if (unknown.length > 0) {
+    throw new ApiError(
+      400,
+      `Unknown team(s) for this organization: ${unknown.join(", ")}`,
+    );
+  }
+  return [...resolved];
+}
+
+/**
+ * Shared app write-authorization, used by both the create/update/delete
+ * Archestra MCP tools and the REST CRUD routes so the rule lives in one place.
+ *
+ * Visibility (being able to view an app) is NOT enough to mutate it: reading
+ * and modifying are separate grants on the app's permission policy.
+ */
+
+/** Whether the caller holds `update` on every app (a grant at `*`). */
+export async function callerIsAppAdmin(
+  userId: string,
+  organizationId: string,
+): Promise<boolean> {
+  return ResourcePermissions.allows({
+    userId,
+    organizationId,
+    resource: "app",
+    scope: "*",
+    action: "update",
+  });
+}
+
+/**
+ * Throw `ApiError(403)` unless the caller holds `action` (default `update`) on
+ * the app through its permission policy.
+ */
+export async function assertCallerMayModifyApp(params: {
+  appId: string;
+  action?: "update" | "delete" | "manage-permissions";
+  userId: string;
+  organizationId: string;
+}): Promise<void> {
+  await ResourcePermissions.require({
+    userId: params.userId,
+    organizationId: params.organizationId,
+    resource: "app",
+    scope: params.appId,
+    action: params.action ?? "update",
+  });
+}
+
+/**
+ * Throw `ApiError(403)` unless the caller may modify an app *via chat* — the
+ * authoring path exercised by the `edit_app`/`refine_app`/`set_app_tools`/
+ * `publish_app`/`delete_app`/`preview_app_tool` MCP tools (and a PATCH that
+ * carries new html).
+ *
+ * Stricter than {@link assertCallerMayModifyApp}: an `app:admin` who reaches an
+ * app ONLY through oversight — a personal app authored by someone else, or a
+ * team app for a team they're not in — may view it and manage its settings
+ * (name/visibility/teams/env/tools) over REST, but must NOT drive its build
+ * chat. This mirrors the Projects rule where `viewerRole === "admin"` is
+ * read + manage-settings yet cannot start chats. Once past the oversight gate
+ * the ordinary scope rule still applies (org apps need admin, team apps need a
+ * team-admin member), so this never *widens* who can author.
+ *
+ * A disabled app is additionally frozen for authoring — for its author too
+ * (T-980: a parallel chat of the author rebuilt an app the user had just
+ * disabled). It guards the REST html rewrite, where the author can see the app
+ * but must re-enable it before changing its content; chat tools reach it only
+ * for an app born disabled by an organization default, whose creating session
+ * their loader marks with `creationGraceSession` (every other chat caller is
+ * already reported a disabled app as not found).
+ */
+export async function assertCallerMayAuthorApp(params: {
+  action?: "update" | "delete";
+  userId: string;
+  organizationId: string;
+  app: {
+    id: string;
+    scope: AppScope;
+    authorId: string | null;
+    enabled: boolean;
+  };
+  /**
+   * Set by the chat loader when this call comes from the session an app was
+   * created in while an organization new-app default disabled it. That session
+   * is building the app right now, so the disabled freeze below does not apply
+   * to it; every other caller, and every app someone disabled deliberately,
+   * meets the freeze as before.
+   */
+  creationGraceSession?: boolean;
+}): Promise<void> {
+  // "Reachable without the admin bypass" is exactly "not oversight-only": the
+  // author of a personal app, a member of a team app, and everyone for an org
+  // app all pass; an app-admin seeing someone else's personal app does not. A
+  // disabled app is author-only, so only its author clears this gate.
+  const reachableWithoutAdmin = await AppAccessModel.userHasAppAccess({
+    organizationId: params.organizationId,
+    userId: params.userId,
+    app: {
+      id: params.app.id,
+      organizationId: params.organizationId,
+      authorId: params.app.authorId,
+      enabled: params.app.enabled,
+    },
+  });
+  if (!reachableWithoutAdmin) {
+    throw new ApiError(
+      403,
+      "You can view this app and change its settings, but only its owner can modify the app itself via chat.",
+    );
+  }
+  if (!params.app.enabled && !params.creationGraceSession) {
+    throw new ApiError(
+      403,
+      "This app is disabled: its content cannot be changed until it is re-enabled.",
+    );
+  }
+  await assertCallerMayModifyApp({
+    appId: params.app.id,
+    action: params.action,
+    userId: params.userId,
+    organizationId: params.organizationId,
+  });
+}

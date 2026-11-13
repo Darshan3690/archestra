@@ -1,7 +1,8 @@
-import { archestraApiSdk, type archestraApiTypes } from "@shared";
+import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { handleApiError, toApiError } from "@/lib/utils";
+import { toBulkOutcome } from "@/lib/bulk-action";
+import { handleApiError, throwOnApiError, toApiError } from "@/lib/utils/api";
 
 const {
   getLlmOauthClients,
@@ -9,19 +10,69 @@ const {
   updateLlmOauthClient,
   rotateLlmOauthClientSecret,
   deleteLlmOauthClient,
+  bulkDeleteLlmOauthClients,
 } = archestraApiSdk;
 
-export function useLlmOauthClients() {
+type LlmOauthClientsQuery = NonNullable<
+  archestraApiTypes.GetLlmOauthClientsData["query"]
+>;
+type LlmOauthClientsParams = Partial<LlmOauthClientsQuery> & {
+  enabled?: boolean;
+  toastOnError?: boolean;
+};
+
+export function useLlmOauthClients(params?: LlmOauthClientsParams) {
+  const limit = params?.limit ?? 20;
+  const offset = params?.offset ?? 0;
+  const search = params?.search;
+  const providerApiKeyId = params?.providerApiKeyId;
+  const grantType = params?.grantType;
+  const labels = params?.labels;
+  const access = params?.access;
+  const sharedWith = params?.sharedWith;
+  const owner = params?.owner;
+
   return useQuery({
-    queryKey: ["llm-oauth-clients"],
+    queryKey: [
+      "llm-oauth-clients",
+      limit,
+      offset,
+      search,
+      providerApiKeyId,
+      grantType,
+      labels,
+      { access, sharedWith, owner },
+    ],
     queryFn: async () => {
-      const { data, error } = await getLlmOauthClients();
-      if (error) {
-        handleApiError(error);
-        return [];
-      }
-      return data ?? [];
+      const { data, error } = await getLlmOauthClients({
+        query: {
+          limit,
+          offset,
+          search: search || undefined,
+          providerApiKeyId: providerApiKeyId || undefined,
+          grantType: grantType || undefined,
+          labels,
+          access,
+          sharedWith,
+          owner,
+        },
+      });
+      throwOnApiError(error, { toastOnError: params?.toastOnError ?? true });
+      return (
+        data ?? {
+          data: [],
+          pagination: {
+            currentPage: 1,
+            limit,
+            total: 0,
+            totalPages: 0,
+            hasNext: false,
+            hasPrev: false,
+          },
+        }
+      );
     },
+    enabled: params?.enabled,
   });
 }
 
@@ -105,6 +156,27 @@ export function useDeleteLlmOauthClient() {
     },
     onSuccess: () => {
       toast.success("OAuth client deleted");
+      queryClient.invalidateQueries({ queryKey: ["llm-oauth-clients"] });
+    },
+  });
+}
+
+/**
+ * Deletes a selection of OAuth clients in one request. The caller reports the
+ * batch once via `reportBulkOutcome` rather than a toast per row.
+ */
+export function useBulkDeleteLlmOauthClients() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (clients: readonly { id: string }[]) =>
+      bulkDeleteLlmOauthClients({
+        body: { ids: clients.map((client) => client.id) },
+      }).then(({ data, error }) => {
+        throwOnApiError(error, { toastOnError: false });
+        return toBulkOutcome(data ?? { succeeded: [], failed: [] });
+      }),
+    // Settled rather than success: a partly applied batch still moved rows.
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ["llm-oauth-clients"] });
     },
   });

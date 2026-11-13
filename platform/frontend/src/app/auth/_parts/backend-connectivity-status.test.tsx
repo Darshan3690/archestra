@@ -1,0 +1,316 @@
+import { fireEvent, render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { BackendConnectivityStatus } from "./backend-connectivity-status";
+
+vi.mock("@/components/app-logo", () => ({
+  AppLogo: () => <div data-testid="app-logo" />,
+}));
+
+vi.mock("@/lib/config/backend-connectivity", () => ({
+  useBackendConnectivity: vi.fn(),
+}));
+
+vi.mock("@/lib/hooks/use-app-name");
+vi.mock("next/navigation");
+
+import { useSearchParams } from "next/navigation";
+import { useBackendConnectivity } from "@/lib/config/backend-connectivity";
+import { useAppName } from "@/lib/hooks/use-app-name";
+
+describe("BackendConnectivityStatus", () => {
+  const mockRetry = vi.fn();
+
+  beforeEach(() => {
+    mockRetry.mockReset();
+    vi.mocked(useAppName).mockReturnValue("Sparky");
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams() as unknown as ReturnType<typeof useSearchParams>,
+    );
+  });
+
+  it.each([
+    "initializing",
+    "checking",
+  ] as const)("keeps an indicator on screen while status is %s", (status) => {
+    // This wraps the whole auth column, and it sits between the session gate's
+    // indicator and the sign-in card. Rendering nothing here blanked the
+    // screen mid-boot — twice on one signed-out load — which reads as the page
+    // having thrown its content away rather than as a wait still in progress.
+    vi.mocked(useBackendConnectivity).mockReturnValue({
+      status,
+      attemptCount: 0,
+      estimatedTotalAttempts: 7,
+      elapsedMs: 0,
+      nextRetryInMs: null,
+      retry: mockRetry,
+    });
+
+    render(
+      <BackendConnectivityStatus>
+        <div data-testid="child-content">Login Form</div>
+      </BackendConnectivityStatus>,
+    );
+
+    expect(screen.getByRole("status")).toBeInTheDocument();
+    expect(screen.queryByTestId("child-content")).not.toBeInTheDocument();
+  });
+
+  it("renders children immediately when connected", () => {
+    vi.mocked(useBackendConnectivity).mockReturnValue({
+      status: "connected",
+      attemptCount: 0,
+      estimatedTotalAttempts: 7,
+      elapsedMs: 0,
+      nextRetryInMs: null,
+      retry: mockRetry,
+    });
+
+    render(
+      <BackendConnectivityStatus>
+        <div data-testid="child-content">Login Form</div>
+      </BackendConnectivityStatus>,
+    );
+
+    expect(screen.getByTestId("child-content")).toBeInTheDocument();
+    expect(screen.queryByText("Ready")).not.toBeInTheDocument();
+  });
+
+  it("shows when the next automatic retry will run", () => {
+    vi.mocked(useBackendConnectivity).mockReturnValue({
+      status: "connecting",
+      attemptCount: 0,
+      estimatedTotalAttempts: 7,
+      elapsedMs: 0,
+      nextRetryInMs: 8000,
+      retry: mockRetry,
+    });
+
+    render(
+      <BackendConnectivityStatus>
+        <div data-testid="child-content">Login Form</div>
+      </BackendConnectivityStatus>,
+    );
+
+    expect(screen.getByRole("status")).toHaveAttribute("aria-busy", "true");
+    expect(
+      screen.getByText("Can't reach the Sparky server."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Check your connection. If it persists, ask an administrator to check the service.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Retrying automatically")).toBeInTheDocument();
+    expect(screen.getByText("Next retry in 8s")).toBeInTheDocument();
+    expect(screen.queryByText(/Attempt \d/)).not.toBeInTheDocument();
+    expect(screen.queryByTestId("child-content")).not.toBeInTheDocument();
+  });
+
+  it("keeps retry counters out of the interface", () => {
+    vi.mocked(useBackendConnectivity).mockReturnValue({
+      status: "connecting",
+      attemptCount: 3,
+      estimatedTotalAttempts: 7,
+      elapsedMs: 5000,
+      nextRetryInMs: null,
+      retry: mockRetry,
+    });
+
+    render(
+      <BackendConnectivityStatus>
+        <div>Login Form</div>
+      </BackendConnectivityStatus>,
+    );
+
+    expect(screen.getByText("Retrying automatically")).toBeInTheDocument();
+    expect(screen.getByText("Checking now")).toBeInTheDocument();
+    expect(screen.queryByText(/Attempt \d/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: /Report issue/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows concise recovery actions when the backend is unavailable", () => {
+    vi.mocked(useBackendConnectivity).mockReturnValue({
+      status: "unreachable",
+      attemptCount: 5,
+      estimatedTotalAttempts: 7,
+      elapsedMs: 60000,
+      nextRetryInMs: null,
+      retry: mockRetry,
+    });
+
+    render(
+      <BackendConnectivityStatus>
+        <div data-testid="child-content">Login Form</div>
+      </BackendConnectivityStatus>,
+    );
+
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(
+      screen.getByText("Can't reach the Sparky server."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Check your connection. If it persists, ask an administrator to check the service.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Try again" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Report issue" })).toHaveAttribute(
+      "href",
+      expect.stringMatching(/\/issues$/),
+    );
+    expect(screen.queryByTestId("child-content")).not.toBeInTheDocument();
+  });
+
+  it("shows the shared database guidance before sign-in", () => {
+    vi.mocked(useBackendConnectivity).mockReturnValue({
+      status: "database-connecting",
+      attemptCount: 1,
+      estimatedTotalAttempts: 7,
+      elapsedMs: 1000,
+      nextRetryInMs: 2000,
+      retry: mockRetry,
+    });
+
+    render(
+      <BackendConnectivityStatus>
+        <div data-testid="child-content">Login Form</div>
+      </BackendConnectivityStatus>,
+    );
+
+    expect(screen.getByText("Database unavailable.")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Ask an administrator to check the database service, connection settings, and capacity.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Retrying automatically")).toBeInTheDocument();
+    expect(screen.queryByTestId("child-content")).not.toBeInTheDocument();
+  });
+
+  it("shows the shared offline guidance before sign-in", () => {
+    vi.mocked(useBackendConnectivity).mockReturnValue({
+      status: "browser-offline",
+      attemptCount: 5,
+      estimatedTotalAttempts: 7,
+      elapsedMs: 60000,
+      nextRetryInMs: null,
+      retry: mockRetry,
+    });
+
+    render(
+      <BackendConnectivityStatus>
+        <div data-testid="child-content">Login Form</div>
+      </BackendConnectivityStatus>,
+    );
+
+    expect(screen.getByText("You're offline.")).toBeInTheDocument();
+    expect(
+      screen.getByText("Reconnect to the internet, then retry."),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: "Report issue" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByTestId("child-content")).not.toBeInTheDocument();
+  });
+
+  it("retries immediately when requested", () => {
+    vi.mocked(useBackendConnectivity).mockReturnValue({
+      status: "unreachable",
+      attemptCount: 5,
+      estimatedTotalAttempts: 7,
+      elapsedMs: 60000,
+      nextRetryInMs: null,
+      retry: mockRetry,
+    });
+
+    render(
+      <BackendConnectivityStatus>
+        <div>Login Form</div>
+      </BackendConnectivityStatus>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+
+    expect(mockRetry).toHaveBeenCalledTimes(1);
+  });
+
+  it("confirms recovery before continuing to sign in", () => {
+    vi.mocked(useBackendConnectivity).mockReturnValue({
+      status: "connecting",
+      attemptCount: 2,
+      estimatedTotalAttempts: 7,
+      elapsedMs: 3000,
+      nextRetryInMs: 1000,
+      retry: mockRetry,
+    });
+
+    const { rerender } = render(
+      <BackendConnectivityStatus>
+        <div data-testid="child-content">Login Form</div>
+      </BackendConnectivityStatus>,
+    );
+
+    vi.mocked(useBackendConnectivity).mockReturnValue({
+      status: "connected",
+      attemptCount: 2,
+      estimatedTotalAttempts: 7,
+      elapsedMs: 3500,
+      nextRetryInMs: null,
+      retry: mockRetry,
+    });
+
+    rerender(
+      <BackendConnectivityStatus>
+        <div data-testid="child-content">Login Form</div>
+      </BackendConnectivityStatus>,
+    );
+
+    expect(screen.getByText("Ready")).toBeInTheDocument();
+    expect(screen.getByText("Continuing to sign in.")).toBeInTheDocument();
+    expect(screen.queryByTestId("child-content")).not.toBeInTheDocument();
+  });
+
+  it("confirms recovery before reloading an intended destination", () => {
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("redirectTo=/agents") as unknown as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+    vi.mocked(useBackendConnectivity).mockReturnValue({
+      status: "connecting",
+      attemptCount: 2,
+      estimatedTotalAttempts: 7,
+      elapsedMs: 3000,
+      nextRetryInMs: 1000,
+      retry: mockRetry,
+    });
+
+    const { rerender } = render(
+      <BackendConnectivityStatus>
+        <div>Login Form</div>
+      </BackendConnectivityStatus>,
+    );
+
+    vi.mocked(useBackendConnectivity).mockReturnValue({
+      status: "connected",
+      attemptCount: 2,
+      estimatedTotalAttempts: 7,
+      elapsedMs: 3500,
+      nextRetryInMs: null,
+      retry: mockRetry,
+    });
+
+    rerender(
+      <BackendConnectivityStatus>
+        <div>Login Form</div>
+      </BackendConnectivityStatus>,
+    );
+
+    expect(screen.getByText("Ready")).toBeInTheDocument();
+    expect(screen.getByText("Reloading the page.")).toBeInTheDocument();
+  });
+});

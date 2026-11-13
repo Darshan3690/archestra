@@ -1,83 +1,327 @@
+/**
+ * SQL table names use plural snake_case (`agents`, `mcp_servers`, `conversations`).
+ * File names stay singular kebab-case (`mcp-server.ts`); TS exports below are
+ * always `${plural}Table` regardless of the underlying SQL name.
+ *
+ * Two singular-name exceptions exist:
+ *
+ * 1. Library-owned (permanent — better-auth defines these, do not rename):
+ *      account, apikey, invitation, jwks, member, organization, session, team,
+ *      team_member, two_factor, user, verification,
+ *      oauth_access_token, oauth_client, oauth_consent, oauth_refresh_token
+ *
+ * 2. Status-quo drift (app-code singular names predating this policy — eligible
+ *    to be renamed to plural in future migrations):
+ *      a2a_context, a2a_message, a2a_task, a2a_task_approval_request,
+ *      a2a_artifact, a2a_task_event, a2a_push_notification_config,
+ *      agent_connector_assignment, agent_knowledge_base, agent_team,
+ *      chatops_channel_binding, chatops_processed_message,
+ *      chatops_thread_agent_override,
+ *      conversation_share_team, conversation_share_user,
+ *      identity_provider, incoming_email_subscription, internal_mcp_catalog,
+ *      knowledge_base_connector_assignment, limit_model_usage,
+ *      mcp_catalog_team, mcp_preset_entry, mcp_server,
+ *      mcp_server_user,
+ *      organization_role, processed_email, secret,
+ *      site_notification, skill_team,
+ *      team_external_group, team_token, user_token,
+ *      virtual_api_key_provider_api_key, virtual_api_key_team
+ *
+ * New tables must be plural. Tables not listed in (1) or (2) must be plural.
+ *
+ * Prefix guidance (judgment-based, not lint-enforced): a table scoped to a
+ * single conversation should use the `conversation_` prefix so it sits with
+ * its siblings (`conversation_compactions`, `conversation_enabled_tools`,
+ * `conversation_shares`, `conversation_attachments`). Reserve `chat_` for
+ * feature/runtime concerns, not durable conversation children. A
+ * `conversation_id` column is a strong signal but not a law — two standing
+ * exceptions carry `conversation_id` without the prefix:
+ *   - messages — a top-level entity named for itself, not a conversation child
+ *   - chat_active_runs — ephemeral run state predating this guidance
+ */
+
+export { default as a2aArtifactsTable } from "./a2a-artifact";
+export { default as a2aConnectionsTable } from "./a2a-connection";
 export { default as a2aContextsTable } from "./a2a-context";
+export { default as a2aContextCompactionsTable } from "./a2a-context-compaction";
 export { default as a2aMessagesTable } from "./a2a-message";
+export { default as a2aOutboundRunsTable } from "./a2a-outbound-run";
+export { default as a2aPushNotificationConfigsTable } from "./a2a-push-notification-config";
+export { default as a2aRemoteAgentsTable } from "./a2a-remote-agent";
+export { default as a2aRemoteAgentTeamsTable } from "./a2a-remote-agent-team";
+export { default as a2aRemoteAgentUsersTable } from "./a2a-remote-agent-user";
 export { default as a2aTasksTable } from "./a2a-task";
 export { default as a2aTaskApprovalRequestsTable } from "./a2a-task-approval-request";
+export { default as a2aTaskEventsTable } from "./a2a-task-event";
 export { default as accountsTable } from "./account";
 export { default as agentsTable } from "./agent";
+export { default as agentActivationSkillRulesTable } from "./agent-activation-skill-rule";
 export { default as agentConnectorAssignmentsTable } from "./agent-connector-assignment";
+export { default as agentExcludedConnectorsTable } from "./agent-excluded-connector";
+export { default as agentExcludedSkillsTable } from "./agent-excluded-skill";
+export { default as agentExcludedSubagentsTable } from "./agent-excluded-subagent";
+export { default as agentExcludedToolsTable } from "./agent-excluded-tool";
 export { default as agentKnowledgeBasesTable } from "./agent-knowledge-base";
 export { default as agentLabelsTable } from "./agent-label";
+export { default as agentPinsTable } from "./agent-pin";
+export { default as agentRunsTable } from "./agent-run";
+export { default as agentRunAttentionNoticesTable } from "./agent-run-attention-notice";
+export { default as agentRunInputsTable } from "./agent-run-input";
+export {
+  agentRunShareTeamsTable,
+  agentRunShareUsersTable,
+  default as agentRunSharesTable,
+} from "./agent-run-share";
+export {
+  agentRunReadableTranscriptChunksTable,
+  agentRunReadableTranscriptsTable,
+  agentRunTranscriptChunksTable,
+  agentRunTranscriptsTable,
+} from "./agent-run-transcript";
+export { default as agentSkillsTable } from "./agent-skill";
 export { default as agentSuggestedPromptsTable } from "./agent-suggested-prompt";
 export { default as agentTeamsTable } from "./agent-team";
 export { default as agentToolsTable } from "./agent-tool";
+export { default as agentUsersTable } from "./agent-user";
+export { default as agentVersionsTable } from "./agent-version";
+export { default as agentWorkspacesTable } from "./agent-workspace";
 export { default as apikeysTable } from "./api-key";
+export { default as appsTable } from "./app";
+export { default as appDataTable } from "./app-data";
+export { default as appLabelsTable } from "./app-label";
+export { default as appPinsTable } from "./app-pin";
+export { default as appRenderDiagnosticsTable } from "./app-render-diagnostics";
+export { default as appRenderScreenshotTable } from "./app-render-screenshot";
+export { default as appToolsTable } from "./app-tool";
+export { default as appVersionsTable } from "./app-version";
+export { default as auditLogsTable } from "./audit-log";
+export { default as autoRoutersTable } from "./auto-router";
+export { default as autoRouterVirtualApiKeysTable } from "./auto-router-virtual-api-key";
+export { default as autoRoutingTiersTable } from "./auto-routing-tier";
+export { default as blobProvidersTable } from "./blob-provider";
+export { default as browserStorageStatesTable } from "./browser-storage-state";
 export { default as browserTabStatesTable } from "./browser-tab-state";
+export {
+  chatActiveRunEventsTable,
+  chatActiveRunsTable,
+} from "./chat-active-run";
 export { default as chatopsChannelBindingsTable } from "./chatops-channel-binding";
+export { default as chatopsMsTeamsUserConnectionsTable } from "./chatops-ms-teams-user-connection";
 export { default as chatopsProcessedMessagesTable } from "./chatops-processed-message";
-export { default as chatopsThreadAgentOverrideTable } from "./chatops-thread-agent-override";
+export { default as chatopsThreadContextsTable } from "./chatops-thread-context";
+export { default as chatopsUserAdmissionsTable } from "./chatops-user-admission";
+export {
+  connectionSetupPluginsTable,
+  connectionSetupSkillsTable,
+  default as connectionSetupsTable,
+} from "./connection-setup";
 export { default as connectorRunsTable } from "./connector-run";
+// biome-ignore lint/style/noRestrictedImports: dual-licensed schema; inert without the feature
+export { default as contentEncryptionStateTable } from "./content-encryption-state.ee";
 export { default as conversationsTable } from "./conversation";
+export { default as conversationAttachmentsTable } from "./conversation-attachment";
 export { default as conversationChatErrorsTable } from "./conversation-chat-error";
+export { default as conversationCompactionsTable } from "./conversation-compaction";
 export { default as conversationEnabledToolsTable } from "./conversation-enabled-tool";
 export {
   conversationShareTeamsTable,
   conversationShareUsersTable,
   default as conversationSharesTable,
 } from "./conversation-share";
+export { default as costExportsTable } from "./cost-export";
+export { default as desktopDevicesTable } from "./desktop-device";
+export { default as desktopDeviceServersTable } from "./desktop-device-server";
+export { default as desktopMcpRequestsTable } from "./desktop-mcp-request";
+export { default as encryptionKeyCanariesTable } from "./encryption-key-canary";
+export { default as environmentsTable } from "./environment";
+export { default as environmentDefaultUserLimitsTable } from "./environment-default-user-limits";
+export { default as environmentLabelsTable } from "./environment-label";
+export { default as environmentResourceDefaultsTable } from "./environment-resource-default";
+export { default as externalMcpSkillUsageEventsTable } from "./external-mcp-skill-usage-event";
+export { default as filesTable } from "./file";
+export { default as githubAppAccountsTable } from "./github-app-account";
+export { default as guardrailsDeploymentTable } from "./guardrails-deployment";
+export { guardrailsPolicyRevisionsTable } from "./guardrails-policy";
+export { default as hookFilesTable } from "./hook-file";
 export { default as identityProvidersTable } from "./identity-provider";
 export { default as incomingEmailSubscriptionsTable } from "./incoming-email-subscription";
 export { default as interactionsTable } from "./interaction";
+export { default as interactionBillingTable } from "./interaction-billing";
+export {
+  interactionSessionHeadsBackfillTable,
+  interactionSessionHeadsTable,
+} from "./interaction-session-head";
+export {
+  interactionUserActivityDeltasTable,
+  interactionUserActivityMissingOwnersTable,
+  interactionUserActivityStateTable,
+  interactionUserActivityTable,
+  interactionUserActivityUsersTable,
+} from "./interaction-user-activity";
 export { default as internalMcpCatalogTable } from "./internal-mcp-catalog";
 export { default as invitationsTable } from "./invitation";
+export {
+  jiraChatOpsDeliveriesTable,
+  jiraChatOpsEventsTable,
+} from "./jira-chatops-event";
+export { default as jiraChatOpsIdentitiesTable } from "./jira-chatops-identity";
 export { default as jwksTable } from "./jwks";
+export {
+  kbBm25CorpusStatsTable,
+  kbBm25TermStatsTable,
+} from "./kb-bm25-stats";
 export { default as kbChunksTable } from "./kb-chunk";
+export { default as kbConnectorDocumentCountsTable } from "./kb-connector-document-count";
+export { default as kbContainerAclsTable } from "./kb-container-acl";
+export { default as kbDirectoriesTable } from "./kb-directory";
+export { default as kbDirectoryTeamsTable } from "./kb-directory-team";
 export { default as kbDocumentsTable } from "./kb-document";
-export { default as kbUploadedFilesTable } from "./kb-uploaded-file";
+export { default as kbExternalGroupsTable } from "./kb-external-group";
+export { default as kbExternalUserGroupsTable } from "./kb-external-user-group";
+export { default as kbFilesTable } from "./kb-file";
+export { default as kbFileDocumentsTable } from "./kb-file-document";
+export { default as kbFileLabelsTable } from "./kb-file-label";
+export { default as kbFileTeamsTable } from "./kb-file-team";
+export { default as kbMemberOverridesTable } from "./kb-member-override";
+export { default as kbUploadConnectorsTable } from "./kb-upload-connector";
 export { default as knowledgeBasesTable } from "./knowledge-base";
 export {
   default as knowledgeBaseConnectorsTable,
   knowledgeBaseConnectorAssignmentsTable,
 } from "./knowledge-base-connector";
+export { default as knowledgeBaseConnectorLabelsTable } from "./knowledge-base-connector-label";
+export { default as knowledgeBaseLabelsTable } from "./knowledge-base-label";
 export { default as labelKeysTable } from "./label-key";
 export { default as labelValuesTable } from "./label-value";
 export { default as limitsTable } from "./limit";
+export { default as limitBillingUsageTable } from "./limit-billing-usage";
+export { default as limitLabelsTable } from "./limit-label";
 export { default as limitModelUsageTable } from "./limit-model-usage";
 export { default as llmProviderApiKeysTable } from "./llm-provider-api-key";
+export { default as llmProviderApiKeyLabelsTable } from "./llm-provider-api-key-label";
 export { default as llmProviderApiKeyModelsTable } from "./llm-provider-api-key-model";
+export {
+  llmUsageDailyTable,
+  llmUsageHourlyTable,
+  llmUsageRollupDirtyTable,
+  llmUsageRollupStateTable,
+} from "./llm-usage-hourly";
 export { default as mcpCatalogLabelsTable } from "./mcp-catalog-label";
+export { default as mcpCatalogSkillsTable } from "./mcp-catalog-skill";
 export { default as mcpCatalogTeamsTable } from "./mcp-catalog-team";
+export { default as mcpCatalogUsersTable } from "./mcp-catalog-user";
+export { default as mcpDeploymentLeasesTable } from "./mcp-deployment-lease";
+export { default as mcpGatewayTasksTable } from "./mcp-gateway-task";
 export { default as mcpHttpSessionsTable } from "./mcp-http-session";
+export { default as mcpPresetEntriesTable } from "./mcp-preset-entry";
 export { default as mcpServersTable } from "./mcp-server";
-export { default as mcpServerInstallationRequestsTable } from "./mcp-server-installation-request";
+export { default as mcpServerAlertMutesTable } from "./mcp-server-alert-mute";
+export { default as mcpServerToolDescriptionsTable } from "./mcp-server-tool-description";
 export { default as mcpServerUsersTable } from "./mcp-server-user";
 export { default as mcpToolCallsTable } from "./mcp-tool-call";
 export { default as membersTable } from "./member";
 export { default as messagesTable } from "./message";
 export { default as modelsTable } from "./model";
+export { default as modelCostBackfillsTable } from "./model-cost-backfill";
+export { default as modelLabelsTable } from "./model-label";
+export { default as modelPoolsTable } from "./model-pool";
+export { default as modelPoolMembersTable } from "./model-pool-member";
+export { default as modelPoolVirtualApiKeysTable } from "./model-pool-virtual-api-key";
+export { default as modelTeamsTable } from "./model-team";
+export { default as modelUsersTable } from "./model-user";
 export { default as oauthAccessTokensTable } from "./oauth-access-token";
 export { default as oauthClientsTable } from "./oauth-client";
+export { default as oauthClientLabelsTable } from "./oauth-client-label";
+export { default as oauthClientTeamsTable } from "./oauth-client-team";
 export { default as oauthConsentsTable } from "./oauth-consent";
 export { default as oauthRefreshTokensTable } from "./oauth-refresh-token";
-export { default as optimizationRulesTable } from "./optimization-rule";
+export * from "./openappa";
+export * from "./openappa-batteries";
+export * from "./openappa-github-sync";
+export {
+  openappaPolicyTestRunsTable,
+  openappaPolicyTestSuitesTable,
+} from "./openappa-policy-tests";
+export { openappaYellsTable } from "./openappa-yell";
 export { default as organizationsTable } from "./organization";
 export { organizationRole as organizationRolesTable } from "./organization-role";
+export { default as pluginsTable } from "./plugin";
+export { default as pluginFilesTable } from "./plugin-file";
+export { default as pluginLabelsTable } from "./plugin-label";
+export { default as pluginSkillUsageEventsTable } from "./plugin-skill-usage-event";
+export { default as pluginTeamsTable } from "./plugin-team";
+export { default as pluginUsersTable } from "./plugin-user";
 export { default as processedEmailsTable } from "./processed-email";
+export {
+  default as projectsTable,
+  projectSharesTable,
+  projectShareTeamsTable,
+  projectShareUsersTable,
+} from "./project";
+export { default as projectAppsTable } from "./project-app";
+export { default as projectLabelsTable } from "./project-label";
+export { default as projectPinsTable } from "./project-pin";
+export { default as proxyProviderFilesTable } from "./proxy-provider-file";
+export { default as resourcePermissionPoliciesTable } from "./resource-permission-policy";
+export { default as routingBackfillsTable } from "./routing-backfill";
+export { default as routingDecisionsTable } from "./routing-decision";
+export { default as routingHistoryScoresTable } from "./routing-history-score";
+export { default as routingHistorySessionsTable } from "./routing-history-session";
+export { default as routingHistoryUsageTable } from "./routing-history-usage";
+export { default as routingPlansTable } from "./routing-plan";
+export { default as routingScorerVersionsTable } from "./routing-scorer-version";
+export { default as routingUsageTable } from "./routing-usage";
+export { default as runtimeCredentialConnectionsTable } from "./runtime-credential-connection";
+export { default as runtimeCredentialDefinitionsTable } from "./runtime-credential-definition";
 export { default as scheduleTriggersTable } from "./schedule-trigger";
 export { default as scheduleTriggerRunsTable } from "./schedule-trigger-run";
 export { default as secretsTable } from "./secret";
+export { default as serviceAccountsTable } from "./service-account";
+export { default as serviceAccountFederatedCredentialsTable } from "./service-account-federated-credential";
+export { default as serviceAccountLabelsTable } from "./service-account-label";
+export { default as serviceAccountTokensTable } from "./service-account-token";
 export { default as sessionsTable } from "./session";
+export { default as siteNotificationsTable } from "./site-notification";
+export { default as skillsTable } from "./skill";
+export { default as skillEnvironmentsTable } from "./skill-environment";
+export { default as skillFilesTable } from "./skill-file";
+export { default as skillLabelsTable } from "./skill-label";
+export { default as skillMarketplaceCredentialsTable } from "./skill-marketplace-credential";
+export { default as skillMarketplaceReposTable } from "./skill-marketplace-repo";
+export { default as skillSandboxesTable } from "./skill-sandbox";
+export { default as skillSandboxCommandsTable } from "./skill-sandbox-command";
+export { default as skillSandboxFilesTable } from "./skill-sandbox-file";
+export { default as skillSandboxReplayEventsTable } from "./skill-sandbox-replay-event";
+export { default as skillSandboxSkillMountsTable } from "./skill-sandbox-skill-mount";
+export {
+  default as skillShareLinksTable,
+  skillShareLinkPluginsTable,
+  skillShareLinkSkillsTable,
+} from "./skill-share-link";
+export { default as skillShareLinkRevisionsTable } from "./skill-share-link-revision";
+export { default as skillTeamsTable } from "./skill-team";
+export { default as skillUsageEventsTable } from "./skill-usage-event";
+export { default as skillUsersTable } from "./skill-user";
+export { default as skillVersionsTable } from "./skill-version";
+export { default as skillVersionFilesTable } from "./skill-version-file";
+export { default as startupMigrationsTable } from "./startup-migration";
 export { default as tasksTable } from "./task";
 export { team as teamsTable, teamMember as teamMembersTable } from "./team";
 export { default as teamExternalGroupsTable } from "./team-external-group";
+export { default as teamLabelsTable } from "./team-label";
 export { default as teamTokensTable } from "./team-token";
-export { default as teamVaultFoldersTable } from "./team-vault-folder";
 export { default as toolsTable } from "./tool";
-export { default as toolInvocationPoliciesTable } from "./tool-invocation-policy";
-export { default as trustedDataPoliciesTable } from "./trusted-data-policy";
+export { default as toolObservationsTable } from "./tool-observation";
+export { default as toolSearchTextsTable } from "./tool-search-text";
 export { default as twoFactorsTable } from "./two-factor";
 export { default as usersTable } from "./user";
+export { default as userCredentialsTable } from "./user-credential";
+export { default as userLimitUsageResetsTable } from "./user-limit-usage-reset";
+export { default as userOnboardingSeenItemsTable } from "./user-onboarding-seen-item";
 export { default as userTokensTable } from "./user-token";
 export { default as verificationsTable } from "./verification";
 export { default as virtualApiKeysTable } from "./virtual-api-key";
+export { default as virtualApiKeyLabelsTable } from "./virtual-api-key-label";
+export { default as virtualApiKeyLlmProxiesTable } from "./virtual-api-key-llm-proxy";
 export { default as virtualApiKeyProviderApiKeysTable } from "./virtual-api-key-provider-api-key";
 export { default as virtualApiKeyTeamsTable } from "./virtual-api-key-team";

@@ -1,42 +1,683 @@
-import type { StatisticsTimeFrame } from "@shared";
-import { and, eq, gte, inArray, lte, sql } from "drizzle-orm";
+import {
+  clientForExternalAgentIds,
+  getStatisticsBucketIntervalMinutes,
+  type PaginationQuery,
+  parseCustomStatisticsTimeframe,
+  type StatisticsTimeFrame,
+} from "@archestra/shared";
+import {
+  type AnyColumn,
+  and,
+  asc,
+  desc,
+  eq,
+  gte,
+  inArray,
+  isNotNull,
+  isNull,
+  lte,
+  or,
+  type SQL,
+  type SQLWrapper,
+  sql,
+} from "drizzle-orm";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
 import db, { schema } from "@/database";
+import { notDeleted } from "@/database/schemas/soft-deletable-table";
+import {
+  createPaginatedResult,
+  type PaginatedResult,
+} from "@/database/utils/pagination";
 import type {
   AgentStatistics,
+  AppStatistics,
+  AppStatisticsSortBy,
+  ChatCostBaseline,
   CostSavingsStatistics,
+  CostStatistics,
+  InteractionAuthMethod,
   ModelStatistics,
+  ModelUsageRow,
+  MyClientUsage,
+  MyContextBucketId,
+  MyStatistics,
+  MyUsageBreakdown,
   OverviewStatistics,
+  ProxyCostQuery,
+  ProxyCostStatistics,
+  SkillStatistics,
+  SkillStatisticsSortBy,
+  SortDirection,
   StatisticsTimeSeriesData,
+  StatisticsTimeSeriesPoint,
   TeamStatistics,
+  UserModelUsage,
+  UserStatistics,
+  UserStatisticsSortBy,
 } from "@/types";
+import { isUuid } from "@/utils/uuid";
+import AgentModel from "./agent";
 import AgentTeamModel from "./agent-team";
+import LlmUsageRollupModel, {
+  statisticsTimeBucket,
+  statisticsTimeframeInterval,
+  type UsageFacts,
+} from "./llm-usage-rollup";
+import { interactionBelongsToOrganization } from "./log-organization";
+
+/**
+ * Request, token and spend aggregates over usage rows. With
+ * `perBilledModel`, the numbers come from each receipt's per-model components
+ * (as on the Models view).
+ */
+export function llmUsageAggregates(f: UsageFacts, perBilledModel: boolean) {
+  const agg = usageAggregates(f);
+  const m = agg.model;
+  const double = (value: SQL) =>
+    sql<number>`CAST(${value} AS DOUBLE PRECISION)`;
+  return perBilledModel
+    ? {
+        requests: m.requests,
+        inputTokens: double(m.inputTokens),
+        outputTokens: double(m.outputTokens),
+        cacheReadTokens: double(m.cacheReadTokens),
+        cacheWriteTokens: double(m.cacheWriteTokens),
+        totalTokens: double(m.totalTokens),
+        billedCost: m.billedCost,
+        subscriptionCost: m.subscriptionCost,
+      }
+    : {
+        requests: agg.requests,
+        inputTokens: agg.inputTokens,
+        outputTokens: agg.outputTokens,
+        cacheReadTokens: agg.cacheReadTokens,
+        cacheWriteTokens: agg.cacheWriteTokens,
+        totalTokens: agg.totalTokens,
+        billedCost: agg.billed(f.cost, "DOUBLE PRECISION"),
+        subscriptionCost: agg.subscriptionCost("DOUBLE PRECISION"),
+      };
+}
+
+/** The usage rows of a timeframe (see {@link LlmUsageRollupModel.facts}). */
+export async function usageFacts(
+  timeframe: StatisticsTimeFrame,
+): Promise<UsageFacts> {
+  return LlmUsageRollupModel.facts(await LlmUsageRollupModel.window(timeframe));
+}
 
 class StatisticsModel {
-  /**
-   * Parse custom timeframe to get start and end dates
-   */
-  private static parseCustomTimeframe(
-    timeframe: string,
-  ): { startTime: Date; endTime: Date } | null {
-    if (!timeframe.startsWith("custom:")) {
-      return null;
+  static async getModelUsage(params: {
+    model: string;
+    groupBy: "person" | "key" | "agent" | "client";
+    timeframe: StatisticsTimeFrame;
+    organizationId: string;
+    userId?: string;
+    /** Only usage by this service account. */
+    serviceAccountId?: string;
+    limit: number;
+    offset: number;
+  }): Promise<PaginatedResult<ModelUsageRow>> {
+    const f = await usageFacts(params.timeframe);
+    const m = usageAggregates(f).model;
+    const a = schema.agentsTable;
+    const u = schema.usersTable;
+    const k = schema.virtualApiKeysTable;
+    const p = schema.llmProviderApiKeysTable;
+    const credential = sql<string | null>`CASE
+      WHEN ${f.authMethod} = 'virtual_key' THEN ${f.virtualKeyId}::text
+      WHEN ${f.authMethod} = 'passthrough_virtual_key' THEN ${f.passthroughVirtualKeyId}::text
+      WHEN ${f.authMethod} = 'oauth_client_credentials' THEN ${f.authenticatedAppId}
+      WHEN ${f.authMethod} = 'provider_key' THEN ${f.providerApiKeyId}::text
+      ELSE NULL END`;
+    const identity =
+      params.groupBy === "person"
+        ? sql`${f.userId}`
+        : params.groupBy === "agent"
+          ? sql`${f.profileId}`
+          : params.groupBy === "client"
+            ? sql`${f.externalAgentId}`
+            : sql`COALESCE(${f.authMethod}, 'unknown') || ':' || COALESCE(${credential}, 'unattributed')`;
+    const id = sql<string>`COALESCE(${identity}::text, '__unattributed__')`;
+    const label =
+      params.groupBy === "person"
+        ? sql`${u.name}`
+        : params.groupBy === "agent"
+          ? sql`${a.name}`
+          : params.groupBy === "client"
+            ? sql`${f.externalAgentId}`
+            : sql`COALESCE(${k.name}, ${p.name}, ${f.authenticatedAppName}, ${credential}, ${f.authMethod})`;
+    const scope = and(
+      interactionBelongsToOrganization(params.organizationId, f),
+      eq(m.model, params.model),
+      params.userId ? eq(f.userId, params.userId) : undefined,
+      params.serviceAccountId
+        ? eq(f.serviceAccountId, params.serviceAccountId)
+        : undefined,
+    );
+    const aggregates = {
+      requests: m.requests,
+      totalTokens: m.totalTokens,
+      cacheReadTokens: m.cacheReadTokens,
+      cacheWriteTokens: m.cacheWriteTokens,
+      billedCost: m.billedCost,
+      subscriptionCost: m.subscriptionCost,
+    };
+    const query = () => {
+      const query = db
+        .select({
+          id,
+          name: sql<string>`COALESCE(MAX(${label}), 'Unattributed')`,
+          ...aggregates,
+        })
+        .from(f)
+        .$dynamic();
+      // Only the selected dimension needs label joins. Credential casts stop
+      // PostgreSQL eliminating unused key joins, adding work to every match.
+      if (params.groupBy === "person")
+        return query.leftJoin(u, eq(u.id, f.userId));
+      if (params.groupBy === "agent")
+        return query.leftJoin(a, eq(a.id, f.profileId));
+      if (params.groupBy === "client") return query;
+      return query
+        .leftJoin(
+          k,
+          and(
+            eq(sql`${k.id}::text`, credential),
+            eq(k.organizationId, params.organizationId),
+            inArray(f.authMethod, ["virtual_key", "passthrough_virtual_key"]),
+          ),
+        )
+        .leftJoin(
+          p,
+          and(
+            eq(sql`${p.id}::text`, credential),
+            eq(p.organizationId, params.organizationId),
+            eq(f.authMethod, "provider_key"),
+          ),
+        );
+    };
+    // Page identities first; only their timelines are materialized.
+    const rows = await query()
+      .where(scope)
+      .groupBy(id)
+      .orderBy(desc(aggregates.billedCost), desc(aggregates.totalTokens), id)
+      .limit(params.limit)
+      .offset(params.offset);
+    const [count] = await db
+      .select({ total: sql<number>`COUNT(DISTINCT ${id})::integer` })
+      .from(f)
+      .where(scope);
+    const bucket = sql<string>`to_timestamp(floor(extract(epoch from ${f.hour}) / ${sql.raw(String(getStatisticsBucketIntervalMinutes(params.timeframe) * 60))}) * ${sql.raw(String(getStatisticsBucketIntervalMinutes(params.timeframe) * 60))})`;
+    const points = rows.length
+      ? await db
+          .select({ id, timestamp: bucket, ...aggregates })
+          .from(f)
+          .where(
+            and(
+              scope,
+              inArray(
+                id,
+                rows.map((row) => row.id),
+              ),
+            ),
+          )
+          .groupBy(id, bucket)
+          .orderBy(bucket)
+      : [];
+    const clientAgentIds =
+      params.groupBy === "client"
+        ? [
+            ...new Set(
+              rows
+                .map((row) => extractUsageClientAgentId(row.id))
+                .filter((id): id is string => id !== null),
+            ),
+          ]
+        : [];
+    const clientAgents = clientAgentIds.length
+      ? await db
+          .select({ id: a.id, name: a.name })
+          .from(a)
+          .where(
+            and(
+              inArray(a.id, clientAgentIds),
+              eq(a.organizationId, params.organizationId),
+            ),
+          )
+      : [];
+    const clientAgentNames = new Map(
+      clientAgents.map((agent) => [agent.id, agent.name]),
+    );
+    const numbers = (row: (typeof rows)[number]) => ({
+      requests: Number(row.requests),
+      totalTokens: Number(row.totalTokens),
+      cacheReadTokens: Number(row.cacheReadTokens),
+      cacheWriteTokens: Number(row.cacheWriteTokens),
+      billedCost: Number(row.billedCost),
+      subscriptionCost: Number(row.subscriptionCost),
+    });
+    return createPaginatedResult(
+      rows.map((row) => ({
+        id: row.id,
+        name:
+          params.groupBy === "client"
+            ? (formatUsageClient(row.name, clientAgentNames) ?? "Not reported")
+            : row.name,
+        ...numbers(row),
+        timeSeries: points
+          .filter((point) => point.id === row.id)
+          .map((point) => ({
+            timestamp: new Date(point.timestamp).toISOString(),
+            ...numbers({ ...point, name: "" }),
+          })),
+      })),
+      Number(count.total),
+      { limit: params.limit, offset: params.offset },
+    );
+  }
+
+  static async getProxyCostStatistics(
+    params: ProxyCostQuery & {
+      timeframe: StatisticsTimeFrame;
+      organizationId: string;
+      limit: number;
+      offset: number;
+      /** Only this person's usage. */
+      userId?: string;
+      /**
+       * Only this service account's usage, in addition to the
+       * `serviceAccountId` filter in the query.
+       */
+      ownServiceAccountId?: string;
+    },
+  ): Promise<ProxyCostStatistics> {
+    const { timeframe, organizationId, limit, offset } = params;
+    const f = await usageFacts(timeframe);
+    const agg = usageAggregates(f);
+    const a = schema.agentsTable;
+    const labelValue = sql<
+      string | null
+    >`${f.attributionLabels}->>${params.labelKey ?? ""}`;
+    // One identity per request: the credential for the recorded auth method.
+    // A secondary passthrough key must not duplicate a standard-key request.
+    const method = sql<InteractionAuthMethod>`COALESCE(${f.authMethod}, 'unknown')`;
+    const credential = sql<string | null>`CASE
+      WHEN ${method} = 'virtual_key' THEN ${f.virtualKeyId}::text
+      WHEN ${method} = 'passthrough_virtual_key' THEN ${f.passthroughVirtualKeyId}::text
+      WHEN ${method} = 'oauth_client_credentials' THEN ${f.authenticatedAppId}
+      ELSE NULL END`;
+    const conditions = and(
+      eq(a.organizationId, organizationId),
+      inArray(a.agentType, ["llm_proxy", "profile"]),
+      params.userId ? eq(f.userId, params.userId) : undefined,
+      params.ownServiceAccountId
+        ? eq(f.serviceAccountId, params.ownServiceAccountId)
+        : undefined,
+      params.authMethod ? eq(method, params.authMethod) : undefined,
+      params.credentialId ? eq(credential, params.credentialId) : undefined,
+      params.providerApiKeyId
+        ? eq(f.providerApiKeyId, params.providerApiKeyId)
+        : undefined,
+      params.modelPoolId ? eq(f.modelPoolId, params.modelPoolId) : undefined,
+      params.serviceAccountId
+        ? eq(f.serviceAccountId, params.serviceAccountId)
+        : undefined,
+      params.labelKey && params.labelValue !== undefined
+        ? eq(labelValue, params.labelValue)
+        : undefined,
+      params.labelKey && params.labelUnassigned
+        ? isNull(labelValue)
+        : undefined,
+    );
+    const aggregates = {
+      requests: sql<number>`CAST(COALESCE(SUM(${f.requests}), 0) AS DOUBLE PRECISION)`,
+      inputTokens: agg.inputTokens,
+      outputTokens: agg.outputTokens,
+      cacheReadTokens: agg.cacheReadTokens,
+      cacheWriteTokens: agg.cacheWriteTokens,
+      totalTokens: agg.totalTokens,
+      billedCost: agg.billed(f.cost, "DOUBLE PRECISION"),
+      subscriptionCost: agg.subscriptionCost("DOUBLE PRECISION"),
+      failedOverAttempts: agg.failedOverAttempts,
+    };
+    const bucketMinutes = getStatisticsBucketIntervalMinutes(timeframe);
+    const bucketSeconds = sql.raw(String(bucketMinutes * 60));
+    const bucket = sql<string>`to_timestamp(floor(extract(epoch from ${f.hour}) / ${bucketSeconds}) * ${bucketSeconds})`;
+    // Aggregate in SQL before paging; no team joins or per-credential queries.
+    const keys = schema.llmProviderApiKeysTable;
+    const pools = schema.modelPoolsTable;
+    const [
+      methods,
+      timeSeries,
+      credentials,
+      labelGroups,
+      labelKeys,
+      providerKeys,
+      modelPools,
+    ] = await Promise.all([
+      db
+        .select({ authMethod: method, ...aggregates })
+        .from(f)
+        .innerJoin(a, eq(a.id, f.profileId))
+        .where(conditions)
+        .groupBy(method)
+        .orderBy(desc(aggregates.billedCost), method),
+      db
+        .select({ timestamp: bucket, ...aggregates })
+        .from(f)
+        .innerJoin(a, eq(a.id, f.profileId))
+        .where(conditions)
+        .groupBy(bucket)
+        .orderBy(bucket),
+      db
+        .select({
+          authMethod: method,
+          credentialId: credential,
+          credentialName: sql<string | null>`CASE
+          WHEN ${method} IN ('virtual_key', 'passthrough_virtual_key') THEN MAX(${schema.virtualApiKeysTable.name})
+          WHEN ${method} = 'oauth_client_credentials' THEN MAX(${f.authenticatedAppName})
+          ELSE NULL END`,
+          ...aggregates,
+          total: sql<number>`COUNT(*) OVER ()::double precision`,
+        })
+        .from(f)
+        .innerJoin(a, eq(a.id, f.profileId))
+        .leftJoin(
+          schema.virtualApiKeysTable,
+          and(
+            eq(sql`${schema.virtualApiKeysTable.id}::text`, credential),
+            eq(schema.virtualApiKeysTable.organizationId, organizationId),
+            inArray(method, ["virtual_key", "passthrough_virtual_key"]),
+          ),
+        )
+        .where(conditions)
+        .groupBy(method, credential)
+        .orderBy(
+          desc(aggregates.billedCost),
+          desc(aggregates.requests),
+          method,
+          credential,
+        )
+        .limit(limit)
+        .offset(offset),
+      params.labelKey
+        ? db
+            .select({
+              value: labelValue,
+              ...aggregates,
+              total: sql<number>`COUNT(*) OVER ()::double precision`,
+            })
+            .from(f)
+            .innerJoin(a, eq(a.id, f.profileId))
+            .where(conditions)
+            .groupBy(sql`1`)
+            .orderBy(sql`1`)
+            .limit(limit)
+            .offset(offset)
+        : Promise.resolve([]),
+      params.includeLabelKeys
+        ? db
+            .selectDistinct({
+              key: sql<string>`jsonb_object_keys(COALESCE(${f.attributionLabels}, '{}'::jsonb))`,
+            })
+            .from(f)
+            .innerJoin(a, eq(a.id, f.profileId))
+            .where(conditions)
+            .orderBy(sql`1`)
+        : Promise.resolve([]),
+      // Provider keys and pools are few per organization; the same page
+      // window as credentials bounds them anyway.
+      params.includeProviderKeys
+        ? db
+            .select({
+              providerApiKeyId: f.providerApiKeyId,
+              providerApiKeyName: sql<string | null>`MAX(${keys.name})`,
+              provider: sql<string | null>`MAX(${keys.provider})`,
+              ...aggregates,
+            })
+            .from(f)
+            .innerJoin(a, eq(a.id, f.profileId))
+            .leftJoin(
+              keys,
+              and(
+                eq(keys.id, f.providerApiKeyId),
+                eq(keys.organizationId, organizationId),
+              ),
+            )
+            .where(conditions)
+            .groupBy(f.providerApiKeyId)
+            .orderBy(
+              desc(aggregates.billedCost),
+              desc(aggregates.requests),
+              f.providerApiKeyId,
+            )
+            .limit(limit)
+            .offset(offset)
+        : Promise.resolve([]),
+      params.includeModelPools
+        ? db
+            .select({
+              modelPoolId: f.modelPoolId,
+              modelPoolName: sql<string | null>`MAX(${pools.name})`,
+              ...aggregates,
+            })
+            .from(f)
+            .innerJoin(a, eq(a.id, f.profileId))
+            .leftJoin(
+              pools,
+              and(
+                eq(pools.id, f.modelPoolId),
+                eq(pools.organizationId, organizationId),
+              ),
+            )
+            .where(conditions)
+            .groupBy(f.modelPoolId)
+            .orderBy(
+              desc(aggregates.billedCost),
+              desc(aggregates.requests),
+              f.modelPoolId,
+            )
+            .limit(limit)
+            .offset(offset)
+        : Promise.resolve([]),
+    ]);
+    const totals = {
+      requests: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      totalTokens: 0,
+      billedCost: 0,
+      subscriptionCost: 0,
+      failedOverAttempts: 0,
+    };
+    for (const row of methods) {
+      for (const key of Object.keys(totals) as (keyof typeof totals)[]) {
+        totals[key] += Number(row[key]);
+      }
+    }
+    // Window count is absent on an out-of-range page. Count grouped identities
+    // only in that uncommon case, keeping normal requests to three queries.
+    let total = Number(credentials[0]?.total ?? 0);
+    if (!credentials.length && offset > 0) {
+      const groups = db
+        .select({ credential })
+        .from(f)
+        .innerJoin(a, eq(a.id, f.profileId))
+        .where(conditions)
+        .groupBy(method, credential)
+        .as("credential_groups");
+      const [count] = await db
+        .select({ total: sql<number>`COUNT(*)::double precision` })
+        .from(groups);
+      total = Number(count.total);
+    }
+    let labelTotal = Number(labelGroups[0]?.total ?? 0);
+    if (params.labelKey && !labelGroups.length && offset > 0) {
+      const groups = db
+        .select({ value: labelValue })
+        .from(f)
+        .innerJoin(a, eq(a.id, f.profileId))
+        .where(conditions)
+        .groupBy(sql`1`)
+        .as("label_groups");
+      const [count] = await db
+        .select({ total: sql<number>`COUNT(*)::double precision` })
+        .from(groups);
+      labelTotal = Number(count.total);
     }
 
-    const timeframeValue = timeframe.replace("custom:", "");
-    const [startTimeStr, endTimeStr] = timeframeValue.split("_");
+    // Per-group trends in one round trip, so a breakdown does not ask for each
+    // row's series separately. Each query covers only the groups on this page.
+    const groupKey = (...parts: (string | null)[]) => JSON.stringify(parts);
+    const groupSeries = async (
+      keys: [SQL | AnyColumn, SQL | AnyColumn | null],
+      page: SQL | undefined,
+    ) => {
+      if (!params.includeGroupTimeSeries || page === undefined)
+        return new Map<string, ProxyCostStatistics["timeSeries"]>();
+      const rows = await db
+        .select({
+          first: sql<string | null>`(${keys[0]})::text`,
+          second: keys[1]
+            ? sql<string | null>`(${keys[1]})::text`
+            : sql<null>`NULL::text`,
+          timestamp: bucket,
+          ...aggregates,
+        })
+        .from(f)
+        .innerJoin(a, eq(a.id, f.profileId))
+        .where(and(conditions, page))
+        .groupBy(sql`1`, sql`2`, sql`3`)
+        .orderBy(sql`3`);
+      const series = new Map<string, ProxyCostStatistics["timeSeries"]>();
+      for (const { first, second, ...point } of rows) {
+        const key = keys[1] ? groupKey(first, second) : groupKey(first);
+        const points = series.get(key) ?? [];
+        points.push({
+          ...point,
+          timestamp: new Date(point.timestamp).toISOString(),
+        });
+        series.set(key, points);
+      }
+      return series;
+    };
+    const oneOf = (
+      column: SQL | AnyColumn,
+      values: (string | null)[],
+    ): SQL | undefined => {
+      if (values.length === 0) return undefined;
+      const target = sql`${column}`;
+      const present = values.filter((value) => value !== null);
+      return or(
+        present.length ? inArray(target, present) : undefined,
+        values.includes(null) ? isNull(target) : undefined,
+      );
+    };
+    const [
+      methodSeries,
+      credentialSeries,
+      providerKeySeries,
+      modelPoolSeries,
+      labelSeries,
+    ] = await Promise.all([
+      groupSeries([method, null], methods.length ? sql`true` : undefined),
+      groupSeries(
+        [method, credential],
+        credentials.length
+          ? or(
+              ...credentials.map((row) =>
+                and(
+                  eq(method, row.authMethod),
+                  row.credentialId === null
+                    ? isNull(credential)
+                    : eq(credential, row.credentialId),
+                ),
+              ),
+            )
+          : undefined,
+      ),
+      groupSeries(
+        [f.providerApiKeyId, null],
+        params.includeProviderKeys
+          ? oneOf(
+              f.providerApiKeyId,
+              providerKeys.map((row) => row.providerApiKeyId),
+            )
+          : undefined,
+      ),
+      groupSeries(
+        [f.modelPoolId, null],
+        params.includeModelPools
+          ? oneOf(
+              f.modelPoolId,
+              modelPools.map((row) => row.modelPoolId),
+            )
+          : undefined,
+      ),
+      groupSeries(
+        [labelValue, null],
+        params.labelKey
+          ? oneOf(
+              labelValue,
+              labelGroups.map((row) => row.value),
+            )
+          : undefined,
+      ),
+    ]);
+    const withSeries = <T>(
+      rows: T[],
+      series: Map<string, ProxyCostStatistics["timeSeries"]>,
+      key: (row: T) => string,
+    ) =>
+      params.includeGroupTimeSeries
+        ? rows.map((row) => ({
+            ...row,
+            timeSeries: series.get(key(row)) ?? [],
+          }))
+        : rows;
 
-    if (!startTimeStr || !endTimeStr) {
-      return null;
-    }
-
-    const startTime = new Date(startTimeStr);
-    const endTime = new Date(endTimeStr);
-
-    if (Number.isNaN(startTime.getTime()) || Number.isNaN(endTime.getTime())) {
-      return null;
-    }
-
-    return { startTime, endTime };
+    return {
+      totals,
+      methods: withSeries(methods, methodSeries, (row) =>
+        groupKey(row.authMethod),
+      ),
+      timeSeries: timeSeries.map((row) => ({
+        ...row,
+        timestamp: new Date(row.timestamp).toISOString(),
+      })),
+      credentials: withSeries(
+        credentials.map(({ total: _total, ...row }) => row),
+        credentialSeries,
+        (row) => groupKey(row.authMethod, row.credentialId),
+      ),
+      pagination: { limit, offset, total },
+      providerKeys: params.includeProviderKeys
+        ? withSeries(providerKeys, providerKeySeries, (row) =>
+            groupKey(row.providerApiKeyId),
+          )
+        : undefined,
+      modelPools: params.includeModelPools
+        ? withSeries(modelPools, modelPoolSeries, (row) =>
+            groupKey(row.modelPoolId),
+          )
+        : undefined,
+      labelKeys: params.includeLabelKeys
+        ? labelKeys.map(({ key }) => key)
+        : undefined,
+      labels: params.labelKey
+        ? {
+            key: params.labelKey,
+            groups: withSeries(
+              labelGroups.map(({ total: _total, ...row }) => row),
+              labelSeries,
+              (row) => groupKey(row.value),
+            ),
+            pagination: { limit, offset, total: labelTotal },
+          }
+        : undefined,
+    };
   }
 
   /**
@@ -48,159 +689,28 @@ class StatisticsModel {
     if (typeof timeframe === "string" && timeframe.startsWith("custom:")) {
       return null; // Custom timeframes use date range filtering instead
     }
-
-    switch (timeframe) {
-      case "5m":
-        return "5 minutes";
-      case "15m":
-        return "15 minutes";
-      case "30m":
-        return "30 minutes";
-      case "1h":
-        return "1 hour";
-      case "24h":
-        return "24 hours";
-      case "7d":
-        return "7 days";
-      case "30d":
-        return "30 days";
-      case "90d":
-        return "90 days";
-      case "12m":
-        return "12 months";
-      case "all":
-        return "100 years"; // Effectively all time
-      default:
-        return "24 hours";
-    }
+    return statisticsTimeframeInterval(timeframe);
   }
 
   /**
-   * Get time bucket size for aggregation
-   */
-  private static getTimeBucket(timeframe: StatisticsTimeFrame): string {
-    if (typeof timeframe === "string" && timeframe.startsWith("custom:")) {
-      const customRange = StatisticsModel.parseCustomTimeframe(timeframe);
-      if (!customRange) return "hour";
-
-      const durationMs =
-        customRange.endTime.getTime() - customRange.startTime.getTime();
-      const durationHours = durationMs / (1000 * 60 * 60);
-
-      if (durationHours <= 2) return "minute";
-      if (durationHours <= 48) return "hour";
-      if (durationHours <= 720) return "day"; // 30 days
-      return "week";
-    }
-
-    switch (timeframe) {
-      case "5m":
-        return "minute"; // Will show individual minutes for 5-minute range
-      case "15m":
-        return "minute"; // Will show individual minutes for 15-minute range
-      case "30m":
-        return "minute"; // We'll round to 5-minute intervals in post-processing
-      case "1h":
-        return "minute"; // We'll round to 5-minute intervals in post-processing
-      case "24h":
-        return "hour";
-      case "7d":
-        return "hour"; // We'll group by 6-hour intervals in post-processing
-      case "30d":
-        return "day";
-      case "90d":
-        return "day"; // We'll group by 3-day intervals in post-processing
-      case "12m":
-        return "week";
-      case "all":
-        return "month";
-      default:
-        return "hour";
-    }
-  }
-
-  /**
-   * Get time bucket interval in minutes for custom grouping
-   */
-  private static getBucketIntervalMinutes(
-    timeframe: StatisticsTimeFrame,
-  ): number {
-    if (typeof timeframe === "string" && timeframe.startsWith("custom:")) {
-      const customRange = StatisticsModel.parseCustomTimeframe(timeframe);
-      if (!customRange) return 60;
-
-      const durationMs =
-        customRange.endTime.getTime() - customRange.startTime.getTime();
-      const durationHours = durationMs / (1000 * 60 * 60);
-
-      if (durationHours <= 2) return 5; // 5-minute buckets for short periods
-      if (durationHours <= 48) return 60; // 1-hour buckets for up to 2 days
-      if (durationHours <= 720) return 1440; // 1-day buckets for up to 30 days
-      return 10080; // 1-week buckets for longer periods
-    }
-
-    switch (timeframe) {
-      case "5m":
-        return 1; // 1-minute buckets for 5-minute range
-      case "15m":
-        return 1; // 1-minute buckets for 15-minute range
-      case "30m":
-        return 5; // 5-minute buckets for 30-minute range
-      case "1h":
-        return 5; // 5-minute buckets
-      case "24h":
-        return 60; // 1-hour buckets
-      case "7d":
-        return 360; // 6-hour buckets
-      case "30d":
-        return 1440; // 1-day buckets
-      case "90d":
-        return 4320; // 3-day buckets
-      case "12m":
-        return 10080; // 1-week buckets
-      case "all":
-        return 43200; // 1-month buckets (30 days)
-      default:
-        return 60; // 1-hour buckets
-    }
-  }
-
-  /**
-   * Round timestamp to bucket interval
+   * Round a timestamp down to the start of its bucket.
+   *
+   * Buckets are aligned to whole multiples of the interval measured from the
+   * Unix epoch (1970-01-01T00:00:00Z) and computed entirely in UTC, so the
+   * result stays consistent with the UTC `.toISOString()` returned here and
+   * with the SQL `DATE_TRUNC` that produced the input. Working purely in epoch
+   * milliseconds also avoids the previous local-time `getFullYear()`/`setDate()`
+   * arithmetic, which mistook "days since the epoch" for "day of year" and
+   * projected multi-day buckets (e.g. the 90d view) decades into the future.
    */
   private static roundToBucket(
     timestamp: string,
     intervalMinutes: number,
   ): string {
-    const date = new Date(timestamp);
-
-    if (intervalMinutes >= 1440) {
-      // 1 day or more
-      const days = Math.floor(intervalMinutes / 1440);
-      const dayOfYear = Math.floor(date.getTime() / (1000 * 60 * 60 * 24));
-      const roundedDay = Math.floor(dayOfYear / days) * days;
-
-      const startOfYear = new Date(date.getFullYear(), 0, 1);
-      startOfYear.setDate(startOfYear.getDate() + roundedDay);
-      startOfYear.setHours(0, 0, 0, 0);
-      return startOfYear.toISOString();
-    } else if (intervalMinutes >= 60) {
-      // 1 hour or more
-      const hours = Math.floor(intervalMinutes / 60);
-      const hourOfDay = date.getHours();
-      const roundedHour = Math.floor(hourOfDay / hours) * hours;
-
-      date.setHours(roundedHour, 0, 0, 0);
-      return date.toISOString();
-    } else {
-      // Less than 1 hour
-      const minutes = date.getMinutes();
-      const roundedMinutes =
-        Math.floor(minutes / intervalMinutes) * intervalMinutes;
-
-      date.setMinutes(roundedMinutes, 0, 0);
-      return date.toISOString();
-    }
+    const intervalMs = intervalMinutes * 60 * 1000;
+    const ms = new Date(timestamp).getTime();
+    const rounded = Math.floor(ms / intervalMs) * intervalMs;
+    return new Date(rounded).toISOString();
   }
 
   /**
@@ -213,19 +723,43 @@ class StatisticsModel {
     timeframe: StatisticsTimeFrame,
     groupByField: keyof T,
   ): T[] {
-    const intervalMinutes = StatisticsModel.getBucketIntervalMinutes(timeframe);
+    const intervalMinutes = getStatisticsBucketIntervalMinutes(timeframe);
 
-    // If the interval is standard (60 minutes or more), no custom grouping needed.
+    // Nothing to regroup when SQL already truncated to the final bucket width.
     // Still coerce numeric fields since PostgreSQL DOUBLE PRECISION / DECIMAL
     // values are returned as strings by node-postgres, which causes Zod schema
     // validation failures (z.number() rejects string values).
-    if (intervalMinutes >= 60 && timeframe !== "7d" && timeframe !== "90d") {
+    if (!StatisticsModel.needsRebucketing(timeframe, intervalMinutes)) {
       return timeSeriesData.map((row) => ({
         ...row,
         requests: Number(row.requests) || 0,
         inputTokens: Number(row.inputTokens) || 0,
         outputTokens: Number(row.outputTokens) || 0,
         cost: Number(row.cost) || 0,
+        ...("subscriptionCost" in row
+          ? { subscriptionCost: Number(row.subscriptionCost) || 0 }
+          : {}),
+        ...("cacheReadTokens" in row
+          ? {
+              cacheReadTokens:
+                Number((row as { cacheReadTokens: unknown }).cacheReadTokens) ||
+                0,
+            }
+          : {}),
+        ...("cacheWriteTokens" in row
+          ? {
+              cacheWriteTokens:
+                Number(
+                  (row as { cacheWriteTokens: unknown }).cacheWriteTokens,
+                ) || 0,
+            }
+          : {}),
+        ...("totalTokens" in row
+          ? {
+              totalTokens:
+                Number((row as { totalTokens: unknown }).totalTokens) || 0,
+            }
+          : {}),
       }));
     }
 
@@ -250,6 +784,12 @@ class StatisticsModel {
           inputTokens: 0,
           outputTokens: 0,
           cost: 0,
+          // Reset before accumulating; the `...row` spread would otherwise leave
+          // the first row's value in place and the merge would never sum it.
+          ...("cacheReadTokens" in row ? { cacheReadTokens: 0 } : {}),
+          ...("cacheWriteTokens" in row ? { cacheWriteTokens: 0 } : {}),
+          ...("totalTokens" in row ? { totalTokens: 0 } : {}),
+          ...("subscriptionCost" in row ? { subscriptionCost: 0 } : {}),
         } as T);
       }
 
@@ -264,6 +804,23 @@ class StatisticsModel {
         (existing as { cost: number }).cost +=
           Number((row as { cost: number }).cost) || 0;
       }
+      if ("subscriptionCost" in row && "subscriptionCost" in existing) {
+        (existing as { subscriptionCost: number }).subscriptionCost +=
+          Number(row.subscriptionCost) || 0;
+      }
+      // Aggregate cache-read tokens (present only on model/agent series)
+      if ("cacheReadTokens" in row && "cacheReadTokens" in existing) {
+        (existing as { cacheReadTokens: number }).cacheReadTokens +=
+          Number((row as { cacheReadTokens: number }).cacheReadTokens) || 0;
+      }
+      if ("cacheWriteTokens" in row && "cacheWriteTokens" in existing) {
+        (existing as { cacheWriteTokens: number }).cacheWriteTokens +=
+          Number((row as { cacheWriteTokens: number }).cacheWriteTokens) || 0;
+      }
+      if ("totalTokens" in row && "totalTokens" in existing) {
+        (existing as { totalTokens: number }).totalTokens +=
+          Number((row as { totalTokens: number }).totalTokens) || 0;
+      }
     }
 
     return Array.from(grouped.values()).sort(
@@ -273,97 +830,147 @@ class StatisticsModel {
   }
 
   /**
-   * Get team statistics
+   * Get team statistics.
+   *
+   * With `teamIds`, report only those teams and count each request for the
+   * teams its spend limits charge (see {@link teamChargeScope}), so a team
+   * admin's figures match their team limits. Without it, every team is
+   * reported and a request counts for each team its agent is shared with.
    */
-  static async getTeamStatistics(
-    timeframe: StatisticsTimeFrame,
-    userId?: string,
-    isAgentAdmin?: boolean,
-  ): Promise<TeamStatistics[]> {
-    const interval = StatisticsModel.getTimeframeInterval(timeframe);
-    const timeBucket = StatisticsModel.getTimeBucket(timeframe);
+  static async getTeamStatistics(params: {
+    timeframe: StatisticsTimeFrame;
+    organizationId: string;
+    teamIds?: string[];
+  }): Promise<TeamStatistics[]> {
+    const { timeframe, organizationId, teamIds } = params;
+    const f = await usageFacts(timeframe);
+    const agg = usageAggregates(f);
+    const bucket = usageBucket(f, statisticsTimeBucket(timeframe));
 
-    // Get accessible agent IDs for users that are not agent admins
-    let accessibleAgentIds: string[] = [];
-    if (userId && !isAgentAdmin) {
-      accessibleAgentIds = await AgentTeamModel.getUserAccessibleAgentIds(
-        userId,
-        false,
-      );
-      if (accessibleAgentIds.length === 0) {
-        return [];
-      }
-    }
+    // Collapse the window to one row per agent, billing team and bucket before
+    // fanning out to teams: the team grants then multiply a few hundred rows
+    // rather than every usage row, and are read only for agents that had
+    // traffic. Sums of the partial sums equal the sums of the rows.
+    const usage = db.$with("team_usage").as(
+      db
+        .select({
+          agentId: sql<string>`${f.profileId}`.as("usage_agent_id"),
+          billingTeamId: sql<string | null>`${f.billingTeamId}`.as(
+            "usage_billing_team_id",
+          ),
+          timeBucket: sql<string>`${bucket}`.as("time_bucket"),
+          requests: sql<number>`SUM(${f.requests})`.as("requests"),
+          inputTokens: sql<number>`SUM(${f.inputTokens})`.as("input_tokens"),
+          outputTokens: sql<number>`SUM(${f.outputTokens})`.as("output_tokens"),
+          cacheReadTokens: sql<number>`SUM(${f.cacheReadTokens})`.as(
+            "cache_read_tokens",
+          ),
+          cacheWriteTokens: sql<number>`SUM(${f.cacheWriteTokens})`.as(
+            "cache_write_tokens",
+          ),
+          reportedInputTokens: sql<number>`SUM(${f.reportedInputTokens})`.as(
+            "reported_input_tokens",
+          ),
+          // Billed spend: subscription-fulfilled traffic incurs no per-token
+          // charge, so its list-price `cost` is excluded from the total.
+          cost: sql<number>`SUM(${f.cost}) FILTER (WHERE ${f.billingMode} = 'metered')`.as(
+            "cost",
+          ),
+        })
+        .from(f)
+        .where(isNotNull(f.profileId))
+        .groupBy(f.profileId, f.billingTeamId, bucket),
+    );
+    // Explicit billing teams bypass sharing, so only the other agents' grants
+    // are needed.
+    const teamAssignments = AgentTeamModel.readAssignments(organizationId, {
+      agentIds: db
+        .select({ id: usage.agentId })
+        .from(usage)
+        .where(isNull(usage.billingTeamId)),
+    });
 
-    // Base query for team statistics
-    // Use stored cost from interactions instead of recalculating with average prices
-    const query = db
-      .select({
-        teamId: schema.teamsTable.id,
-        teamName: schema.teamsTable.name,
-        timeBucket: sql<string>`DATE_TRUNC(${sql.raw(`'${timeBucket}'`)}, ${schema.interactionsTable.createdAt})`,
-        requests: sql<number>`CAST(COUNT(*) AS INTEGER)`,
-        inputTokens: sql<number>`CAST(COALESCE(SUM(${schema.interactionsTable.inputTokens}), 0) AS INTEGER)`,
-        outputTokens: sql<number>`CAST(COALESCE(SUM(${schema.interactionsTable.outputTokens}), 0) AS INTEGER)`,
-        cost: sql<number>`CAST(COALESCE(SUM(${schema.interactionsTable.cost}), 0) AS DOUBLE PRECISION)`,
-      })
-      .from(schema.interactionsTable)
-      .innerJoin(
-        schema.agentsTable,
-        eq(schema.interactionsTable.profileId, schema.agentsTable.id),
-      )
-      .innerJoin(
-        schema.agentTeamsTable,
-        eq(schema.agentsTable.id, schema.agentTeamsTable.agentId),
-      )
-      .innerJoin(
-        schema.teamsTable,
-        eq(schema.agentTeamsTable.teamId, schema.teamsTable.id),
-      )
-      .where(
-        and(
-          ...(interval
-            ? [
-                gte(
-                  schema.interactionsTable.createdAt,
-                  sql`NOW() - INTERVAL ${sql.raw(`'${interval}'`)}`,
-                ),
-              ]
-            : (() => {
-                const customRange =
-                  StatisticsModel.parseCustomTimeframe(timeframe);
-                return customRange
-                  ? [
-                      gte(
-                        schema.interactionsTable.createdAt,
-                        customRange.startTime,
-                      ),
-                      lte(
-                        schema.interactionsTable.createdAt,
-                        customRange.endTime,
-                      ),
-                    ]
-                  : [];
-              })()),
-          ...(accessibleAgentIds.length > 0
-            ? [inArray(schema.agentsTable.id, accessibleAgentIds)]
-            : []),
-        ),
-      )
-      .groupBy(
-        schema.teamsTable.id,
-        schema.teamsTable.name,
-        sql`DATE_TRUNC(${sql.raw(`'${timeBucket}'`)}, ${schema.interactionsTable.createdAt})`,
-      )
-      .orderBy(
-        sql`DATE_TRUNC(${sql.raw(`'${timeBucket}'`)}, ${schema.interactionsTable.createdAt})`,
-      );
-
-    const rawTimeSeriesData = await query;
-
-    // Debug logging for 1h timeframe only
-    if (timeframe === "1h") {
-    }
+    const charge = teamIds
+      ? await StatisticsModel.teamChargeScope({ organizationId, teamIds })
+      : null;
+    const rawTimeSeriesData = charge
+      ? await db
+          .select({
+            teamId: schema.teamsTable.id,
+            teamName: schema.teamsTable.name,
+            timeBucket: bucket,
+            requests: agg.requests,
+            inputTokens: agg.inputTokens,
+            outputTokens: agg.outputTokens,
+            cacheReadTokens: agg.cacheReadTokens,
+            cacheWriteTokens: agg.cacheWriteTokens,
+            totalTokens: agg.totalTokens,
+            cost: agg.billed(f.cost, "DOUBLE PRECISION"),
+          })
+          .from(f)
+          .innerJoin(
+            schema.teamsTable,
+            and(
+              eq(schema.teamsTable.organizationId, organizationId),
+              inArray(schema.teamsTable.id, charge.teamIds),
+              charge.chargesTeam(f, schema.teamsTable.id),
+            ),
+          )
+          .where(interactionBelongsToOrganization(organizationId, f))
+          .groupBy(schema.teamsTable.id, schema.teamsTable.name, bucket)
+          .orderBy(bucket)
+      : await db
+          .with(usage)
+          .select({
+            teamId: schema.teamsTable.id,
+            teamName: schema.teamsTable.name,
+            timeBucket: usage.timeBucket,
+            requests: sql<number>`CAST(SUM(${usage.requests}) AS INTEGER)`,
+            inputTokens: sql<number>`CAST(COALESCE(SUM(${usage.inputTokens}), 0) AS DOUBLE PRECISION)`,
+            outputTokens: sql<number>`CAST(COALESCE(SUM(${usage.outputTokens}), 0) AS DOUBLE PRECISION)`,
+            cacheReadTokens: sql<number>`CAST(COALESCE(SUM(${usage.cacheReadTokens}), 0) AS DOUBLE PRECISION)`,
+            cacheWriteTokens: sql<number>`CAST(COALESCE(SUM(${usage.cacheWriteTokens}), 0) AS DOUBLE PRECISION)`,
+            totalTokens: sql<number>`CAST(
+          COALESCE(SUM(${usage.reportedInputTokens}), 0)
+          + COALESCE(SUM(${usage.outputTokens}), 0)
+          + COALESCE(SUM(${usage.cacheWriteTokens}), 0)
+          AS DOUBLE PRECISION)`,
+            cost: sql<number>`CAST(COALESCE(SUM(${usage.cost}), 0) AS DOUBLE PRECISION)`,
+          })
+          .from(usage)
+          .innerJoin(
+            schema.agentsTable,
+            and(
+              eq(usage.agentId, schema.agentsTable.id),
+              notDeleted(schema.agentsTable),
+            ),
+          )
+          .leftJoin(
+            teamAssignments,
+            and(
+              isNull(usage.billingTeamId),
+              eq(teamAssignments.agentId, schema.agentsTable.id),
+            ),
+          )
+          .innerJoin(
+            schema.teamsTable,
+            eq(
+              schema.teamsTable.id,
+              sql`COALESCE(${usage.billingTeamId}, ${teamAssignments.teamId})`,
+            ),
+          )
+          .where(
+            and(
+              eq(schema.agentsTable.organizationId, organizationId),
+              eq(schema.teamsTable.organizationId, organizationId),
+            ),
+          )
+          .groupBy(
+            schema.teamsTable.id,
+            schema.teamsTable.name,
+            usage.timeBucket,
+          )
+          .orderBy(usage.timeBucket);
 
     const timeSeriesData = StatisticsModel.groupTimeSeries(
       rawTimeSeriesData,
@@ -371,51 +978,57 @@ class StatisticsModel {
       "teamId",
     );
 
-    if (timeframe === "1h") {
-    }
+    // Member and agent counts only for the teams that had usage, side by
+    // side; a range with no team usage needs neither.
+    const resultTeamIds = [
+      ...new Set(rawTimeSeriesData.map((row) => row.teamId)),
+    ];
+    const countedAssignments = AgentTeamModel.readAssignments(organizationId, {
+      teamIds: resultTeamIds,
+    });
+    const [teamMemberCounts, teamAgentCounts] =
+      resultTeamIds.length === 0
+        ? [[], []]
+        : await Promise.all([
+            db
+              .select({
+                teamId: schema.teamMembersTable.teamId,
+                memberCount: sql<number>`CAST(COUNT(DISTINCT ${schema.teamMembersTable.userId}) AS INTEGER)`,
+              })
+              .from(schema.teamMembersTable)
+              .where(inArray(schema.teamMembersTable.teamId, resultTeamIds))
+              .groupBy(schema.teamMembersTable.teamId),
+            db
+              .select({
+                teamId: countedAssignments.teamId,
+                agentCount: sql<number>`CAST(COUNT(DISTINCT ${countedAssignments.agentId}) AS INTEGER)`,
+              })
+              .from(countedAssignments)
+              .where(inArray(countedAssignments.teamId, resultTeamIds))
+              .groupBy(countedAssignments.teamId),
+          ]);
 
-    // Get team member counts
-    const teamMemberCounts = await db
-      .select({
-        teamId: schema.teamsTable.id,
-        memberCount: sql<number>`CAST(COUNT(DISTINCT ${schema.membersTable.userId}) AS INTEGER)`,
-      })
-      .from(schema.teamsTable)
-      .leftJoin(
-        schema.membersTable,
-        eq(
-          schema.teamsTable.organizationId,
-          schema.membersTable.organizationId,
-        ),
-      )
-      .groupBy(schema.teamsTable.id);
-
-    // Get agent counts per team
-    const teamAgentCounts = await db
-      .select({
-        teamId: schema.teamsTable.id,
-        agentCount: sql<number>`CAST(COUNT(DISTINCT ${schema.agentTeamsTable.agentId}) AS INTEGER)`,
-      })
-      .from(schema.teamsTable)
-      .leftJoin(
-        schema.agentTeamsTable,
-        eq(schema.teamsTable.id, schema.agentTeamsTable.teamId),
-      )
-      .groupBy(schema.teamsTable.id);
+    const membersByTeam = new Map(
+      teamMemberCounts.map((row) => [row.teamId, row.memberCount]),
+    );
+    const agentsByTeam = new Map(
+      teamAgentCounts.map((row) => [row.teamId, row.agentCount]),
+    );
 
     // Aggregate data by team
     const teamMap = new Map<string, TeamStatistics>();
+    const seriesByTeam = new Map<
+      string,
+      Map<string, StatisticsTimeSeriesPoint>
+    >();
 
     for (const row of timeSeriesData) {
       // Use stored cost from interactions (already calculated per-model)
       const cost = Number(row.cost) || 0;
 
       if (!teamMap.has(row.teamId)) {
-        const memberCount =
-          teamMemberCounts.find((t) => t.teamId === row.teamId)?.memberCount ||
-          0;
-        const agentCount =
-          teamAgentCounts.find((t) => t.teamId === row.teamId)?.agentCount || 0;
+        const memberCount = membersByTeam.get(row.teamId) ?? 0;
+        const agentCount = agentsByTeam.get(row.teamId) ?? 0;
 
         teamMap.set(row.teamId, {
           teamId: row.teamId,
@@ -425,21 +1038,54 @@ class StatisticsModel {
           requests: 0,
           inputTokens: 0,
           outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          totalTokens: 0,
           cost: 0,
           timeSeries: [],
         });
+        seriesByTeam.set(row.teamId, new Map());
       }
 
       const team = teamMap.get(row.teamId);
-      if (!team) continue;
+      const series = seriesByTeam.get(row.teamId);
+      if (!team || !series) continue;
       team.requests += Number(row.requests);
       team.inputTokens += Number(row.inputTokens);
       team.outputTokens += Number(row.outputTokens);
+      team.cacheReadTokens += Number(row.cacheReadTokens) || 0;
+      team.cacheWriteTokens += Number(row.cacheWriteTokens) || 0;
+      team.totalTokens += Number(row.totalTokens) || 0;
       team.cost += cost;
-      team.timeSeries.push({
+      const point = series.get(row.timeBucket) ?? {
         timestamp: row.timeBucket,
-        value: cost,
-      });
+        value: 0,
+        requests: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        totalTokens: 0,
+      };
+      point.value += cost;
+      point.requests = (point.requests ?? 0) + (Number(row.requests) || 0);
+      point.inputTokens =
+        (point.inputTokens ?? 0) + (Number(row.inputTokens) || 0);
+      point.outputTokens =
+        (point.outputTokens ?? 0) + (Number(row.outputTokens) || 0);
+      point.cacheReadTokens =
+        (point.cacheReadTokens ?? 0) + (Number(row.cacheReadTokens) || 0);
+      point.cacheWriteTokens =
+        (point.cacheWriteTokens ?? 0) + (Number(row.cacheWriteTokens) || 0);
+      point.totalTokens =
+        (point.totalTokens ?? 0) + (Number(row.totalTokens) || 0);
+      series.set(row.timeBucket, point);
+    }
+
+    for (const team of teamMap.values()) {
+      team.timeSeries = Array.from(
+        seriesByTeam.get(team.teamId)?.values() ?? [],
+      ).sort((a, b) => a.timestamp.localeCompare(b.timestamp));
     }
 
     return Array.from(teamMap.values());
@@ -448,98 +1094,90 @@ class StatisticsModel {
   /**
    * Get agent statistics
    */
-  static async getAgentStatistics(
-    timeframe: StatisticsTimeFrame,
-    userId?: string,
-    isAgentAdmin?: boolean,
-  ): Promise<AgentStatistics[]> {
-    const interval = StatisticsModel.getTimeframeInterval(timeframe);
-    const timeBucket = StatisticsModel.getTimeBucket(timeframe);
+  static async getAgentStatistics(params: {
+    timeframe: StatisticsTimeFrame;
+    organizationId: string;
+    /** Only this person's usage of each agent. */
+    userId?: string;
+    /** Only this service account's usage of each agent. */
+    serviceAccountId?: string;
+  }): Promise<AgentStatistics[]> {
+    const { timeframe, organizationId, userId, serviceAccountId } = params;
+    const f = await usageFacts(timeframe);
+    const agg = usageAggregates(f);
+    const bucket = usageBucket(f, statisticsTimeBucket(timeframe));
 
-    // Get accessible agent IDs for users that are non-agent admins
-    let accessibleAgentIds: string[] = [];
-    if (userId && !isAgentAdmin) {
-      accessibleAgentIds = await AgentTeamModel.getUserAccessibleAgentIds(
-        userId,
-        false,
-      );
-      if (accessibleAgentIds.length === 0) {
-        return [];
-      }
-    }
+    const teamAssignments = AgentTeamModel.readAssignments(organizationId);
+    // One row per agent naming every team it is shared with, so an agent
+    // shared with several teams still counts each request once.
+    const agentTeams = db
+      .select({
+        agentId: teamAssignments.agentId,
+        teamNames:
+          sql<string>`string_agg(DISTINCT ${schema.teamsTable.name}, ', ' ORDER BY ${schema.teamsTable.name})`.as(
+            "team_names",
+          ),
+      })
+      .from(teamAssignments)
+      .innerJoin(
+        schema.teamsTable,
+        and(
+          eq(schema.teamsTable.id, teamAssignments.teamId),
+          eq(schema.teamsTable.organizationId, organizationId),
+        ),
+      )
+      .groupBy(teamAssignments.agentId)
+      .as("agent_team_names");
 
-    // Use stored cost from interactions instead of recalculating with average prices
     const query = db
       .select({
         agentId: schema.agentsTable.id,
         agentName: schema.agentsTable.name,
         agentType: schema.agentsTable.agentType,
-        teamName: schema.teamsTable.name,
-        timeBucket: sql<string>`DATE_TRUNC(${sql.raw(`'${timeBucket}'`)}, ${schema.interactionsTable.createdAt})`,
-        requests: sql<number>`CAST(COUNT(*) AS INTEGER)`,
-        inputTokens: sql<number>`CAST(COALESCE(SUM(${schema.interactionsTable.inputTokens}), 0) AS INTEGER)`,
-        outputTokens: sql<number>`CAST(COALESCE(SUM(${schema.interactionsTable.outputTokens}), 0) AS INTEGER)`,
-        cost: sql<number>`CAST(COALESCE(SUM(${schema.interactionsTable.cost}), 0) AS DOUBLE PRECISION)`,
+        organizationId: schema.agentsTable.organizationId,
+        teamName: agentTeams.teamNames,
+        timeBucket: bucket,
+        requests: agg.requests,
+        inputTokens: agg.inputTokens,
+        outputTokens: agg.outputTokens,
+        cacheReadTokens: agg.cacheReadTokens,
+        cacheWriteTokens: agg.cacheWriteTokens,
+        totalTokens: agg.totalTokens,
+        // Billed spend: subscription-fulfilled traffic incurs no per-token
+        // charge, so its list-price `cost` is excluded from the reported total.
+        cost: agg.billed(f.cost, "DOUBLE PRECISION"),
       })
-      .from(schema.interactionsTable)
+      .from(f)
       .innerJoin(
         schema.agentsTable,
-        eq(schema.interactionsTable.profileId, schema.agentsTable.id),
+        and(
+          eq(f.profileId, schema.agentsTable.id),
+          notDeleted(schema.agentsTable),
+        ),
       )
-      .leftJoin(
-        schema.agentTeamsTable,
-        eq(schema.agentsTable.id, schema.agentTeamsTable.agentId),
-      )
-      .leftJoin(
-        schema.teamsTable,
-        eq(schema.agentTeamsTable.teamId, schema.teamsTable.id),
-      )
+      .leftJoin(agentTeams, eq(agentTeams.agentId, schema.agentsTable.id))
       .where(
         and(
-          ...(interval
-            ? [
-                gte(
-                  schema.interactionsTable.createdAt,
-                  sql`NOW() - INTERVAL ${sql.raw(`'${interval}'`)}`,
-                ),
-              ]
-            : (() => {
-                const customRange =
-                  StatisticsModel.parseCustomTimeframe(timeframe);
-                return customRange
-                  ? [
-                      gte(
-                        schema.interactionsTable.createdAt,
-                        customRange.startTime,
-                      ),
-                      lte(
-                        schema.interactionsTable.createdAt,
-                        customRange.endTime,
-                      ),
-                    ]
-                  : [];
-              })()),
-          ...(accessibleAgentIds.length > 0
-            ? [inArray(schema.agentsTable.id, accessibleAgentIds)]
-            : []),
+          eq(schema.agentsTable.organizationId, organizationId),
+          userId ? eq(f.userId, userId) : undefined,
+          serviceAccountId
+            ? eq(f.serviceAccountId, serviceAccountId)
+            : undefined,
         ),
       )
       .groupBy(
         schema.agentsTable.id,
         schema.agentsTable.name,
         schema.agentsTable.agentType,
-        schema.teamsTable.name,
-        sql`DATE_TRUNC(${sql.raw(`'${timeBucket}'`)}, ${schema.interactionsTable.createdAt})`,
+        schema.agentsTable.organizationId,
+        agentTeams.teamNames,
+        bucket,
       )
-      .orderBy(
-        sql`DATE_TRUNC(${sql.raw(`'${timeBucket}'`)}, ${schema.interactionsTable.createdAt})`,
-      );
+      .orderBy(bucket);
 
-    const rawTimeSeriesData = await query;
-
-    // Debug logging for 1h timeframe only
-    if (timeframe === "1h") {
-    }
+    const rawTimeSeriesData = await StatisticsModel.collapseProxyRows(
+      await query,
+    );
 
     const timeSeriesData = StatisticsModel.groupTimeSeries(
       rawTimeSeriesData,
@@ -547,11 +1185,16 @@ class StatisticsModel {
       "agentId",
     );
 
-    if (timeframe === "1h") {
-    }
-
     // Aggregate data by agent
     const agentMap = new Map<string, AgentStatistics>();
+    // Rows collapsed onto the LLM Proxy above can repeat a bucket (one per
+    // originating proxy row), so points are merged by timestamp rather than
+    // appended — a series with a duplicate timestamp reads as whichever point
+    // a consumer looks up first, not as the bucket's total.
+    const seriesByAgent = new Map<
+      string,
+      Map<string, StatisticsTimeSeriesPoint>
+    >();
 
     for (const row of timeSeriesData) {
       // Use stored cost from interactions (already calculated per-model)
@@ -566,21 +1209,57 @@ class StatisticsModel {
           requests: 0,
           inputTokens: 0,
           outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          totalTokens: 0,
           cost: 0,
           timeSeries: [],
         });
+        seriesByAgent.set(row.agentId, new Map());
       }
 
       const agent = agentMap.get(row.agentId);
-      if (!agent) continue;
+      const series = seriesByAgent.get(row.agentId);
+      if (!agent || !series) continue;
       agent.requests += Number(row.requests);
       agent.inputTokens += Number(row.inputTokens);
       agent.outputTokens += Number(row.outputTokens);
+      agent.cacheReadTokens += Number(row.cacheReadTokens) || 0;
+      agent.cacheWriteTokens += Number(row.cacheWriteTokens) || 0;
+      agent.totalTokens += Number(row.totalTokens) || 0;
       agent.cost += cost;
-      agent.timeSeries.push({
+      const point = series.get(row.timeBucket) ?? {
         timestamp: row.timeBucket,
-        value: cost,
-      });
+        value: 0,
+        requests: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        totalTokens: 0,
+      };
+      point.value += cost;
+      point.requests = (point.requests ?? 0) + (Number(row.requests) || 0);
+      point.inputTokens =
+        (point.inputTokens ?? 0) + (Number(row.inputTokens) || 0);
+      point.outputTokens =
+        (point.outputTokens ?? 0) + (Number(row.outputTokens) || 0);
+      point.cacheReadTokens =
+        (point.cacheReadTokens ?? 0) + (Number(row.cacheReadTokens) || 0);
+      point.cacheWriteTokens =
+        (point.cacheWriteTokens ?? 0) + (Number(row.cacheWriteTokens) || 0);
+      point.totalTokens =
+        (point.totalTokens ?? 0) + (Number(row.totalTokens) || 0);
+      series.set(row.timeBucket, point);
+    }
+
+    for (const agent of agentMap.values()) {
+      agent.timeSeries = Array.from(
+        seriesByAgent.get(agent.agentId)?.values() ?? [],
+      )
+        // Chronological regardless of the order the rows arrived in: buckets
+        // are uniformly formatted within a response, so they sort as strings.
+        .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
     }
 
     return Array.from(agentMap.values());
@@ -589,155 +1268,892 @@ class StatisticsModel {
   /**
    * Get model statistics
    */
-  static async getModelStatistics(
-    timeframe: StatisticsTimeFrame,
-    userId?: string,
-    isAgentAdmin?: boolean,
-  ): Promise<ModelStatistics[]> {
-    const interval = StatisticsModel.getTimeframeInterval(timeframe);
-    const timeBucket = StatisticsModel.getTimeBucket(timeframe);
+  static async getModelStatistics(params: {
+    timeframe: StatisticsTimeFrame;
+    organizationId: string;
+  }): Promise<ModelStatistics[]> {
+    const { timeframe, organizationId } = params;
+    const f = await usageFacts(timeframe);
+    const m = usageAggregates(f).model;
+    const bucket = usageBucket(f, statisticsTimeBucket(timeframe));
+    const rows = await db
+      .select({
+        model: m.model,
+        timeBucket: bucket,
+        requests: m.requests,
+        inputTokens: m.inputTokens,
+        outputTokens: m.outputTokens,
+        cacheReadTokens: m.cacheReadTokens,
+        cacheWriteTokens: m.cacheWriteTokens,
+        totalTokens: m.totalTokens,
+        // Billed spend: subscription-fulfilled traffic incurs no per-token
+        // charge, so its list-price `cost` is excluded from the reported total.
+        cost: m.billedCost,
+      })
+      .from(f)
+      .where(interactionBelongsToOrganization(organizationId, f))
+      .groupBy(m.model, bucket)
+      .orderBy(bucket);
+    return StatisticsModel.modelStatisticsFromRows({ rows, timeframe });
+  }
 
-    // Get accessible agent IDs for users that are non-agent admins
-    let accessibleAgentIds: string[] = [];
-    if (userId && !isAgentAdmin) {
-      accessibleAgentIds = await AgentTeamModel.getUserAccessibleAgentIds(
-        userId,
-        false,
-      );
+  /**
+   * Per-user usage for adoption reporting.
+   *
+   * Differs from the sibling team/agent/model aggregations in three ways, all
+   * forced by user cardinality: an org has tens of teams and models but can
+   * have thousands of users, so returning every entity with a full time series
+   * in one payload does not scale.
+   *
+   * 1. Totals are paginated and sorted in SQL; only the requested page is
+   *    returned.
+   * 2. The time series is opt-in AND scoped to the page's users, so the
+   *    response is bounded by `limit * buckets` rather than `users * buckets`.
+   * 3. The per-model cut is opt-in and likewise page-scoped.
+   *
+   * Rows with a NULL `user_id` (unattributed traffic — e.g. a shared provider
+   * key with no user context) are excluded by the join, so totals here are
+   * deliberately <= org-wide totals.
+   */
+  static async getUserStatistics(params: {
+    timeframe: StatisticsTimeFrame;
+    organizationId: string;
+    pagination: PaginationQuery;
+    sortBy: UserStatisticsSortBy;
+    sortDirection: SortDirection;
+    includeTimeSeries: boolean;
+    includeModels: boolean;
+    includeModelTimeSeries?: boolean;
+    requestingUserId: string;
+    /**
+     * When false the caller may only see their own usage. Per-user usage is
+     * employee-level data, so it is gated more tightly than the aggregate
+     * team/model views.
+     */
+    canReadAllUsers: boolean;
+  }): Promise<PaginatedResult<UserStatistics>> {
+    const {
+      timeframe,
+      organizationId,
+      pagination,
+      sortBy,
+      sortDirection,
+      includeTimeSeries,
+      includeModels,
+      includeModelTimeSeries = false,
+      requestingUserId,
+      canReadAllUsers,
+    } = params;
 
-      if (accessibleAgentIds.length === 0) {
-        return [];
-      }
+    const f = await usageFacts(timeframe);
+    const agg = usageAggregates(f);
+    const scopeConditions: SQL[] = [
+      interactionBelongsToOrganization(organizationId, f),
+    ];
+
+    // Without permission to read the roster, a caller sees only themselves.
+    if (!canReadAllUsers) {
+      scopeConditions.push(eq(f.userId, requestingUserId));
     }
 
-    // Use stored cost from interactions instead of recalculating with average prices
-    const query = db
-      .select({
-        model: schema.interactionsTable.model,
-        timeBucket: sql<string>`DATE_TRUNC(${sql.raw(`'${timeBucket}'`)}, ${schema.interactionsTable.createdAt})`,
-        requests: sql<number>`CAST(COUNT(*) AS INTEGER)`,
-        inputTokens: sql<number>`CAST(COALESCE(SUM(${schema.interactionsTable.inputTokens}), 0) AS INTEGER)`,
-        outputTokens: sql<number>`CAST(COALESCE(SUM(${schema.interactionsTable.outputTokens}), 0) AS INTEGER)`,
-        cost: sql<number>`CAST(COALESCE(SUM(${schema.interactionsTable.cost}), 0) AS DOUBLE PRECISION)`,
-      })
-      .from(schema.interactionsTable)
-      .innerJoin(
-        schema.agentsTable,
-        eq(schema.interactionsTable.profileId, schema.agentsTable.id),
-      )
-      .where(
-        and(
-          ...(interval
-            ? [
-                gte(
-                  schema.interactionsTable.createdAt,
-                  sql`NOW() - INTERVAL ${sql.raw(`'${interval}'`)}`,
-                ),
-              ]
-            : (() => {
-                const customRange =
-                  StatisticsModel.parseCustomTimeframe(timeframe);
-                return customRange
-                  ? [
-                      gte(
-                        schema.interactionsTable.createdAt,
-                        customRange.startTime,
-                      ),
-                      lte(
-                        schema.interactionsTable.createdAt,
-                        customRange.endTime,
-                      ),
-                    ]
-                  : [];
-              })()),
-          ...(accessibleAgentIds.length > 0
-            ? [inArray(schema.agentsTable.id, accessibleAgentIds)]
-            : []),
-        ),
-      )
-      .groupBy(
-        schema.interactionsTable.model,
-        sql`DATE_TRUNC(${sql.raw(`'${timeBucket}'`)}, ${schema.interactionsTable.createdAt})`,
-      )
-      .orderBy(
-        sql`DATE_TRUNC(${sql.raw(`'${timeBucket}'`)}, ${schema.interactionsTable.createdAt})`,
-      );
+    const whereClause = and(...scopeConditions);
 
-    const rawTimeSeriesData = await query;
-    const timeSeriesData = StatisticsModel.groupTimeSeries(
-      rawTimeSeriesData,
-      timeframe,
-      "model",
+    const billedCostExpr = agg.billed(f.cost, "DOUBLE PRECISION");
+
+    const sortExpr = {
+      totalTokens: agg.totalTokens,
+      requests: agg.requests,
+      billedCost: billedCostExpr,
+      lastActiveAt: sql`MAX(${f.maxCreatedAt})`,
+      userName: sql`${schema.usersTable.name}`,
+    }[sortBy];
+
+    // PHASE 1 — paginated per-user totals.
+    const [rows, [{ total }]] = await Promise.all([
+      db
+        .select({
+          userId: schema.usersTable.id,
+          userName: schema.usersTable.name,
+          userEmail: schema.usersTable.email,
+          requests: agg.requests,
+          inputTokens: agg.inputTokens,
+          outputTokens: agg.outputTokens,
+          cacheReadTokens: agg.cacheReadTokens,
+          cacheWriteTokens: agg.cacheWriteTokens,
+          totalTokens: agg.totalTokens,
+          billedCost: billedCostExpr,
+          subscriptionCost: agg.subscriptionCost("DOUBLE PRECISION"),
+          activeDays: activeDays(f),
+          lastActiveAt: sql<string>`MAX(${f.maxCreatedAt})`,
+        })
+        .from(f)
+        .innerJoin(schema.usersTable, eq(f.userId, schema.usersTable.id))
+        .where(whereClause)
+        .groupBy(
+          schema.usersTable.id,
+          schema.usersTable.name,
+          schema.usersTable.email,
+        )
+        .orderBy(sortDirection === "asc" ? asc(sortExpr) : desc(sortExpr))
+        .limit(pagination.limit)
+        .offset(pagination.offset),
+      db
+        .select({
+          total: sql<number>`CAST(COUNT(DISTINCT ${f.userId}) FILTER (WHERE ${f.requests} > 0) AS INTEGER)`,
+        })
+        .from(f)
+        .innerJoin(schema.usersTable, eq(f.userId, schema.usersTable.id))
+        .where(whereClause),
+    ]);
+
+    const pageUserIds = rows.map((row) => row.userId);
+
+    // PHASE 2 — page-scoped enrichment. Skipped entirely when the page is empty
+    // so an empty `inArray` never reaches SQL.
+    const [timeSeriesByUser, modelsByUser, modelTimeSeriesByUser] =
+      await Promise.all([
+        includeTimeSeries && pageUserIds.length > 0
+          ? StatisticsModel.getUserTimeSeries({
+              timeframe,
+              facts: f,
+              userIds: pageUserIds,
+              whereClause,
+            })
+          : Promise.resolve(new Map<string, StatisticsTimeSeriesPoint[]>()),
+        (includeModels || includeModelTimeSeries) && pageUserIds.length > 0
+          ? StatisticsModel.getUserModelBreakdown({
+              facts: f,
+              userIds: pageUserIds,
+              whereClause,
+            })
+          : Promise.resolve(new Map<string, UserModelUsage[]>()),
+        includeModelTimeSeries && pageUserIds.length > 0
+          ? StatisticsModel.getUserModelTimeSeries({
+              timeframe,
+              facts: f,
+              userIds: pageUserIds,
+              whereClause,
+            })
+          : Promise.resolve(
+              new Map<string, Map<string, StatisticsTimeSeriesPoint[]>>(),
+            ),
+      ]);
+
+    const data = rows.map((row) => ({
+      userId: row.userId,
+      userName: row.userName,
+      userEmail: row.userEmail,
+      requests: Number(row.requests) || 0,
+      inputTokens: Number(row.inputTokens) || 0,
+      outputTokens: Number(row.outputTokens) || 0,
+      cacheReadTokens: Number(row.cacheReadTokens) || 0,
+      cacheWriteTokens: Number(row.cacheWriteTokens) || 0,
+      totalTokens: Number(row.totalTokens) || 0,
+      billedCost: Number(row.billedCost) || 0,
+      subscriptionCost: Number(row.subscriptionCost) || 0,
+      activeDays: Number(row.activeDays) || 0,
+      lastActiveAt: row.lastActiveAt
+        ? new Date(row.lastActiveAt).toISOString()
+        : null,
+      ...(includeModels || includeModelTimeSeries
+        ? {
+            models: (modelsByUser.get(row.userId) ?? []).map((model) => ({
+              ...model,
+              ...(includeModelTimeSeries
+                ? {
+                    timeSeries:
+                      modelTimeSeriesByUser.get(row.userId)?.get(model.model) ??
+                      [],
+                  }
+                : {}),
+            })),
+          }
+        : {}),
+      ...(includeTimeSeries
+        ? { timeSeries: timeSeriesByUser.get(row.userId) ?? [] }
+        : {}),
+    }));
+
+    return createPaginatedResult(data, Number(total) || 0, pagination);
+  }
+
+  /**
+   * The caller's own cost and usage.
+   *
+   * Separate from {@link getUserStatistics} rather than a self-scoped call into
+   * it, for two reasons:
+   *
+   * - **Permission surface.** This is the one statistics view that requires no
+   *   permission over other people's data, so its scope is a fixed
+   *   `user_id = :me` predicate with no parameter that can widen it. Reusing the
+   *   paginated per-user query would make "may I see everyone?" a runtime
+   *   argument on the endpoint that exists precisely because the caller may not.
+   * - **Scope.** `getUserStatistics` narrows to agents the caller can see, which
+   *   is right when reading other people's usage through an agent-shaped lens.
+   *   Applied to your own row it silently drops your own spend on an agent you
+   *   have since lost access to, which reads as usage going missing. Your own
+   *   interactions are yours regardless of which agent served them.
+   *
+   * Restricted to one organization, so a member of several sees this
+   * organization's usage on this organization's page. Interactions whose agent
+   * has been deleted (`profile_id` is ON DELETE SET NULL) name no organization
+   * and are kept: they are still the caller's own spend, and dropping them would
+   * under-report it.
+   */
+  static async getMyStatistics(params: {
+    timeframe: StatisticsTimeFrame;
+    userId: string;
+    organizationId: string;
+  }): Promise<MyStatistics> {
+    const { timeframe, userId, organizationId } = params;
+    const f = await usageFacts(timeframe);
+    const agg = usageAggregates(f);
+
+    const whereClause = and(
+      eq(f.userId, userId),
+      ...StatisticsModel.organizationScopeSubqueryConditions(
+        organizationId,
+        f.profileId,
+      ),
     );
 
-    // Aggregate data by model
-    const modelMap = new Map<string, ModelStatistics>();
-    let totalCost = 0;
+    const [totals, timeSeriesByUser, modelsByUser] = await Promise.all([
+      db
+        .select({
+          requests: agg.requests,
+          inputTokens: agg.inputTokens,
+          outputTokens: agg.outputTokens,
+          cacheReadTokens: agg.cacheReadTokens,
+          cacheWriteTokens: agg.cacheWriteTokens,
+          totalTokens: agg.totalTokens,
+          billedCost: agg.billed(f.cost, "DOUBLE PRECISION"),
+          subscriptionCost: agg.subscriptionCost("DOUBLE PRECISION"),
+          activeDays: activeDays(f),
+          lastActiveAt: sql<string | null>`MAX(${f.maxCreatedAt})`,
+        })
+        .from(f)
+        .where(whereClause),
+      StatisticsModel.getUserTimeSeries({
+        timeframe,
+        facts: f,
+        userIds: [userId],
+        whereClause,
+      }),
+      StatisticsModel.getUserModelBreakdown({
+        facts: f,
+        userIds: [userId],
+        whereClause,
+      }),
+    ]);
 
-    for (const row of timeSeriesData) {
-      if (!row.model) continue;
+    // An aggregate with no GROUP BY always returns exactly one row, even over
+    // zero interactions — the empty case is that row's zeros, not a missing row.
+    const row = totals[0];
 
-      // Use stored cost from interactions (already calculated per-model)
-      const cost = Number(row.cost) || 0;
+    return {
+      requests: Number(row?.requests) || 0,
+      inputTokens: Number(row?.inputTokens) || 0,
+      outputTokens: Number(row?.outputTokens) || 0,
+      cacheReadTokens: Number(row?.cacheReadTokens) || 0,
+      cacheWriteTokens: Number(row?.cacheWriteTokens) || 0,
+      totalTokens: Number(row?.totalTokens) || 0,
+      billedCost: Number(row?.billedCost) || 0,
+      subscriptionCost: Number(row?.subscriptionCost) || 0,
+      activeDays: Number(row?.activeDays) || 0,
+      lastActiveAt: row?.lastActiveAt
+        ? new Date(row.lastActiveAt).toISOString()
+        : null,
+      models: modelsByUser.get(userId) ?? [],
+      timeSeries: timeSeriesByUser.get(userId) ?? [],
+    };
+  }
 
-      totalCost += cost;
+  /**
+   * The diagnostic cuts behind {@link getMyStatistics}: not how much the caller
+   * spent but what shape of work produced it — the price band their tokens fell
+   * into, the context sizes they ran at, and which sessions concentrated the
+   * spend.
+   *
+   * Scoped exactly like {@link getMyStatistics} (own rows, one organization,
+   * agent-deleted rows kept), and carries the same absence of any parameter
+   * that could widen it beyond the caller.
+   *
+   * Cost here is *list price across both billing modes*, not billed spend. The
+   * question this answers is "what consumed my tokens", and for anyone on a
+   * flat-rate plan — which is precisely the heavy agentic user most likely to
+   * ask it — billed spend is zero on every row and every share would be 0/0.
+   * `billedCost` is returned alongside per session so the money view is still
+   * available where it means something.
+   */
+  static async getMyUsageBreakdown(params: {
+    timeframe: StatisticsTimeFrame;
+    userId: string;
+    organizationId: string;
+    /** How many of the costliest sessions to name. */
+    sessionLimit: number;
+  }): Promise<MyUsageBreakdown> {
+    const { timeframe, userId, organizationId, sessionLimit } = params;
+    const interactions = schema.interactionsTable;
 
-      if (!modelMap.has(row.model)) {
-        modelMap.set(row.model, {
-          model: row.model,
-          requests: 0,
-          inputTokens: 0,
-          outputTokens: 0,
-          cost: 0,
-          percentage: 0,
-          timeSeries: [],
-        });
-      }
+    const whereClause = and(
+      ...StatisticsModel.timeframeConditions(timeframe),
+      eq(interactions.userId, userId),
+      ...StatisticsModel.organizationScopeSubqueryConditions(organizationId),
+    );
 
-      const model = modelMap.get(row.model);
-      if (!model) continue;
-      model.requests += Number(row.requests);
-      model.inputTokens += Number(row.inputTokens);
-      model.outputTokens += Number(row.outputTokens);
-      model.cost += cost;
-      model.timeSeries.push({
-        timestamp: row.timeBucket,
-        value: cost,
-      });
+    // Context size as the model saw it on that turn: fresh prompt tokens plus
+    // whatever was replayed from cache. Output is excluded — it is produced by
+    // the turn, not read by it.
+    const contextSizeExpr = sql<number>`(COALESCE(${interactions.inputTokens}, 0) + COALESCE(${interactions.cacheReadTokens}, 0))`;
+    // Bands are powers-of-two-ish around the sizes that actually change
+    // behaviour on today's models, not even decades.
+    const bucketExpr = sql<MyContextBucketId>`CASE
+      WHEN ${contextSizeExpr} < 32000 THEN 'under32k'
+      WHEN ${contextSizeExpr} < 128000 THEN 'under128k'
+      WHEN ${contextSizeExpr} < 256000 THEN 'under256k'
+      ELSE 'over256k'
+    END`;
+    // List price regardless of billing mode — see the doc comment.
+    const listCostExpr = sql<number>`CAST(COALESCE(SUM(${interactions.cost}), 0) AS DOUBLE PRECISION)`;
+    const tokensExpr = sql<number>`CAST(COALESCE(SUM(${interactions.inputTokens}), 0) + COALESCE(SUM(${interactions.outputTokens}), 0) AS DOUBLE PRECISION)`;
+
+    const [[mix], buckets, sessions, clientRows] = await Promise.all([
+      db
+        .select({
+          freshInputTokens: sql<number>`CAST(COALESCE(SUM(${interactions.inputTokens}) FILTER (WHERE NOT ${interactions.inputTokensEstimated}), 0) AS DOUBLE PRECISION)`,
+          cacheReadTokens: tokenSum(interactions.cacheReadTokens),
+          cacheWriteTokens: tokenSum(interactions.cacheWriteTokens),
+          outputTokens: tokenSum(interactions.outputTokens),
+          cacheCost: sql<number>`CAST(COALESCE(SUM(${interactions.cacheCost}), 0) AS DOUBLE PRECISION)`,
+          cacheSavings: sql<number>`CAST(COALESCE(SUM(${interactions.cacheSavings}), 0) AS DOUBLE PRECISION)`,
+          totalCost: listCostExpr,
+          // Counted here rather than in a fourth query: the session cut groups
+          // these rows away, so this is the only pass that still sees them.
+          unsessionedRequests: sql<number>`CAST(COUNT(*) FILTER (WHERE ${interactions.sessionId} IS NULL) AS INTEGER)`,
+        })
+        .from(interactions)
+        .where(whereClause),
+      db
+        .select({
+          bucket: bucketExpr,
+          requests: sql<number>`CAST(COUNT(*) AS INTEGER)`,
+          tokens: tokensExpr,
+          cost: listCostExpr,
+        })
+        .from(interactions)
+        .where(whereClause)
+        .groupBy(bucketExpr),
+      db
+        .select({
+          sessionId: interactions.sessionId,
+          requests: sql<number>`CAST(COUNT(*) AS INTEGER)`,
+          tokens: tokensExpr,
+          cost: listCostExpr,
+          billedCost: billedSum(interactions.cost, "DOUBLE PRECISION"),
+          startedAt: sql<string>`MIN(${interactions.createdAt})`,
+          lastActiveAt: sql<string>`MAX(${interactions.createdAt})`,
+        })
+        .from(interactions)
+        .where(and(whereClause, isNotNull(interactions.sessionId)))
+        .groupBy(interactions.sessionId)
+        .orderBy(desc(listCostExpr))
+        .limit(sessionLimit),
+      db
+        .select({
+          client: interactions.externalAgentId,
+          requests: sql<number>`CAST(COUNT(*) AS INTEGER)`,
+          inputTokens: tokenSum(interactions.inputTokens),
+          outputTokens: tokenSum(interactions.outputTokens),
+          cacheReadTokens: tokenSum(interactions.cacheReadTokens),
+          cacheWriteTokens: tokenSum(interactions.cacheWriteTokens),
+          totalTokens: reportedTokens(interactions),
+          billedCost: billedSum(interactions.cost, "DOUBLE PRECISION"),
+          subscriptionCost: subscriptionCostSum("DOUBLE PRECISION"),
+        })
+        .from(interactions)
+        .where(whereClause)
+        .groupBy(interactions.externalAgentId),
+    ]);
+
+    const sessionIds = sessions
+      .map(({ sessionId }) => sessionId)
+      .filter((id): id is string => id !== null);
+
+    // Phase 2, over the returned page only: what a session "is" — its dominant
+    // model and client. Grouping on the pair and taking the most frequent one
+    // keeps them consistent with each other, so a session is never labelled
+    // with one client's name and another client's model.
+    const labels = sessionIds.length
+      ? await db
+          .selectDistinctOn([interactions.sessionId], {
+            sessionId: interactions.sessionId,
+            model: interactions.model,
+            client: interactions.externalAgentId,
+          })
+          .from(interactions)
+          .where(and(whereClause, inArray(interactions.sessionId, sessionIds)))
+          .groupBy(
+            interactions.sessionId,
+            interactions.model,
+            interactions.externalAgentId,
+          )
+          .orderBy(interactions.sessionId, desc(sql`COUNT(*)`))
+      : [];
+
+    const labelBySession = new Map(
+      labels.map(({ sessionId, model, client }) => [
+        sessionId,
+        { model, client },
+      ]),
+    );
+
+    const clientAgentIds = [
+      ...new Set(
+        [
+          ...clientRows.map(({ client }) => client),
+          ...labels.map(({ client }) => client),
+        ]
+          .map(extractUsageClientAgentId)
+          .filter((id): id is string => id !== null),
+      ),
+    ];
+    const clientAgentRows = clientAgentIds.length
+      ? await db
+          .select({ id: schema.agentsTable.id, name: schema.agentsTable.name })
+          .from(schema.agentsTable)
+          .where(inArray(schema.agentsTable.id, clientAgentIds))
+      : [];
+    const clientAgentNames = new Map(
+      clientAgentRows.map(({ id, name }) => [id, name]),
+    );
+
+    const clientsByLabel = new Map<string | null, MyClientUsage>();
+    for (const row of clientRows) {
+      const client = formatUsageClient(row.client, clientAgentNames);
+      const current = clientsByLabel.get(client) ?? {
+        client,
+        requests: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        totalTokens: 0,
+        percentage: 0,
+        billedCost: 0,
+        subscriptionCost: 0,
+      };
+      current.requests += Number(row.requests) || 0;
+      current.inputTokens += Number(row.inputTokens) || 0;
+      current.outputTokens += Number(row.outputTokens) || 0;
+      current.cacheReadTokens += Number(row.cacheReadTokens) || 0;
+      current.cacheWriteTokens += Number(row.cacheWriteTokens) || 0;
+      current.totalTokens += Number(row.totalTokens) || 0;
+      current.billedCost += Number(row.billedCost) || 0;
+      current.subscriptionCost += Number(row.subscriptionCost) || 0;
+      clientsByLabel.set(client, current);
+    }
+    const clientTotalTokens = Array.from(clientsByLabel.values()).reduce(
+      (sum, client) => sum + client.totalTokens,
+      0,
+    );
+    const clients = Array.from(clientsByLabel.values())
+      .map((client) => ({
+        ...client,
+        percentage:
+          clientTotalTokens > 0
+            ? (client.totalTokens / clientTotalTokens) * 100
+            : 0,
+      }))
+      .sort((a, b) => b.totalTokens - a.totalTokens);
+
+    return {
+      tokenMix: {
+        freshInputTokens: Number(mix?.freshInputTokens) || 0,
+        cacheReadTokens: Number(mix?.cacheReadTokens) || 0,
+        cacheWriteTokens: Number(mix?.cacheWriteTokens) || 0,
+        outputTokens: Number(mix?.outputTokens) || 0,
+        cacheCost: Number(mix?.cacheCost) || 0,
+        cacheSavings: Number(mix?.cacheSavings) || 0,
+      },
+      clients,
+      contextBuckets: CONTEXT_BUCKET_ORDER.flatMap((bucket) => {
+        const row = buckets.find((candidate) => candidate.bucket === bucket);
+        return row
+          ? [
+              {
+                bucket,
+                requests: Number(row.requests) || 0,
+                tokens: Number(row.tokens) || 0,
+                cost: Number(row.cost) || 0,
+              },
+            ]
+          : [];
+      }),
+      topSessions: sessions.flatMap((row) => {
+        // Never null in practice — the query filters them out — but narrowing
+        // here keeps the row and its id from drifting apart via a parallel array.
+        const { sessionId } = row;
+        if (sessionId === null) return [];
+        const startedAt = new Date(row.startedAt);
+        const lastActiveAt = new Date(row.lastActiveAt);
+        return [
+          {
+            sessionId,
+            requests: Number(row.requests) || 0,
+            tokens: Number(row.tokens) || 0,
+            cost: Number(row.cost) || 0,
+            billedCost: Number(row.billedCost) || 0,
+            startedAt: startedAt.toISOString(),
+            lastActiveAt: lastActiveAt.toISOString(),
+            durationMinutes: Math.max(
+              0,
+              Math.round(
+                (lastActiveAt.getTime() - startedAt.getTime()) / 60_000,
+              ),
+            ),
+            model: labelBySession.get(sessionId)?.model ?? null,
+            client: formatUsageClient(
+              labelBySession.get(sessionId)?.client ?? null,
+              clientAgentNames,
+            ),
+          },
+        ];
+      }),
+      totalCost: Number(mix?.totalCost) || 0,
+      unsessionedRequests: Number(mix?.unsessionedRequests) || 0,
+    };
+  }
+
+  /**
+   * Per-MCP-App cost: what each app cost to build, and what it costs to run.
+   *
+   * Neither half is derivable from an interaction row alone, so each comes from
+   * its own key:
+   *
+   * - **build** — the authoring turns are ordinary chat interactions, so they are
+   *   found through `apps.authoring_session_id`, the LLM session id those turns
+   *   were recorded under. That is a join on `interactions.session_id`, which is
+   *   indexed together with `created_at`, so the timeframe filter still drives it.
+   *   One session can author several apps; its spend is reported for each and
+   *   `buildSessionAppCount` says so, rather than the number being quietly split.
+   * - **runtime** — `archestra.llm.complete()` calls carry `interactions.app_id`,
+   *   so an app's own LLM spend is a direct group-by. That column is deliberately
+   *   unindexed (see the interactions schema), so this leans on the timeframe
+   *   filter and reads it from the heap — acceptable for an analytics query, and
+   *   the alternative is an index build that blocks the proxy's write path.
+   * - **usage** — `mcp_tool_calls` is already keyed by app and indexed on it, so
+   *   opens (`tools/list`, one per host opening the app) and tool calls come from
+   *   there.
+   *
+   * Paginated, but sorted in memory rather than in SQL: the three cost sources
+   * live in different tables under different keys, so no single sortable
+   * expression exists without joining all of them for every app in the
+   * organization. The org's app roster is read whole and then ordered, the same
+   * fetch-all-then-slice the Apps list itself does — app cardinality is tens,
+   * not thousands. If that ever stops holding, the roster query is the thing to
+   * push the sort into.
+   */
+  static async getAppStatistics(params: {
+    timeframe: StatisticsTimeFrame;
+    organizationId: string;
+    pagination: PaginationQuery;
+    sortBy: AppStatisticsSortBy;
+    sortDirection: SortDirection;
+    /** App ids the caller may see; undefined means no scope restriction (admins). */
+    accessibleAppIds?: string[];
+  }): Promise<PaginatedResult<AppStatistics> & ChatCostBaseline> {
+    const {
+      timeframe,
+      organizationId,
+      pagination,
+      sortBy,
+      sortDirection,
+      accessibleAppIds,
+    } = params;
+
+    if (accessibleAppIds !== undefined && accessibleAppIds.length === 0) {
+      return {
+        ...createPaginatedResult<AppStatistics>([], 0, pagination),
+        chatBaselineCostPerSession: 0,
+        chatBaselineSessions: 0,
+      };
     }
 
-    // Calculate percentages
-    const models = Array.from(modelMap.values());
-    models.forEach((model) => {
-      model.percentage = totalCost > 0 ? (model.cost / totalCost) * 100 : 0;
+    const appFilters = [
+      eq(schema.appsTable.organizationId, organizationId),
+      notDeleted(schema.appsTable),
+      ...(accessibleAppIds
+        ? [inArray(schema.appsTable.id, accessibleAppIds)]
+        : []),
+    ];
+
+    // PHASE 1 — the whole app roster, newest first. No `limit` and no separate
+    // count query: the page is chosen after the cost figures are assembled (see
+    // the note on sorting above), so this set is both the sort input and the
+    // pagination total.
+    const [appRows, baseline] = await Promise.all([
+      db
+        .select({
+          appId: schema.appsTable.id,
+          appName: schema.appsTable.name,
+          authorName: schema.usersTable.name,
+          createdAt: schema.appsTable.createdAt,
+          authoringSessionId: schema.appsTable.authoringSessionId,
+        })
+        .from(schema.appsTable)
+        .leftJoin(
+          schema.usersTable,
+          eq(schema.appsTable.authorId, schema.usersTable.id),
+        )
+        .where(and(...appFilters))
+        .orderBy(desc(schema.appsTable.createdAt)),
+      StatisticsModel.getChatCostBaseline({ timeframe, organizationId }),
+    ]);
+    const total = appRows.length;
+
+    if (total === 0) {
+      return {
+        ...createPaginatedResult<AppStatistics>([], 0, pagination),
+        ...baseline,
+      };
+    }
+
+    const appIds = appRows.map((row) => row.appId);
+    const buildSessionIds = [
+      ...new Set(
+        appRows
+          .map((row) => row.authoringSessionId)
+          .filter((id): id is string => !!id),
+      ),
+    ];
+
+    const [buildBySession, runtimeByApp, usageByApp, appsPerBuildSession] =
+      await Promise.all([
+        StatisticsModel.getBuildSpendBySession({
+          timeframe,
+          organizationId,
+          sessionIds: buildSessionIds,
+        }),
+        StatisticsModel.getAppRuntimeSpend({ timeframe, appIds }),
+        StatisticsModel.getAppRuntimeUsage({ timeframe, appIds }),
+        StatisticsModel.countAppsPerBuildSession({
+          organizationId,
+          sessionIds: buildSessionIds,
+        }),
+      ]);
+
+    const assembled: AppStatistics[] = appRows.map((row) => {
+      const build = row.authoringSessionId
+        ? buildBySession.get(row.authoringSessionId)
+        : undefined;
+      const runtime = runtimeByApp.get(row.appId);
+      const usage = usageByApp.get(row.appId);
+      const runs = usage?.runs ?? 0;
+      const buildCost = build?.cost ?? 0;
+      const runtimeCost = runtime?.cost ?? 0;
+      const estimatedChatEquivalentCost =
+        runs * baseline.chatBaselineCostPerSession;
+
+      return {
+        appId: row.appId,
+        appName: row.appName,
+        authorName: row.authorName ?? null,
+        createdAt: row.createdAt.toISOString(),
+        buildRequests: build?.requests ?? 0,
+        buildInputTokens: build?.inputTokens ?? 0,
+        buildOutputTokens: build?.outputTokens ?? 0,
+        buildCost,
+        buildSessionAppCount: row.authoringSessionId
+          ? (appsPerBuildSession.get(row.authoringSessionId) ?? 1)
+          : 0,
+        hasBuildSession: !!row.authoringSessionId,
+        runtimeLlmRequests: runtime?.requests ?? 0,
+        runtimeInputTokens: runtime?.inputTokens ?? 0,
+        runtimeOutputTokens: runtime?.outputTokens ?? 0,
+        runtimeCost,
+        runs,
+        toolCalls: usage?.toolCalls ?? 0,
+        estimatedChatEquivalentCost,
+        estimatedNetSavings:
+          estimatedChatEquivalentCost - buildCost - runtimeCost,
+      };
     });
 
-    return models;
+    const sorted = sortAppStatistics(assembled, sortBy, sortDirection);
+    const page = sorted.slice(
+      pagination.offset,
+      pagination.offset + pagination.limit,
+    );
+
+    return {
+      ...createPaginatedResult(page, total, pagination),
+      ...baseline,
+    };
+  }
+
+  /**
+   * Per-skill cost. Two figures, because a skill has two honest ones:
+   *
+   * - `contextTokens` — what the skill's activation blocks added to the context,
+   *   measured at injection time and stored on the activation. Entirely the
+   *   skill's own, and unrecoverable after the fact: the block lands inside an
+   *   ordinary message and `input_tokens` has no per-segment split.
+   * - `attributed*` — the spend of the turns that ran with the skill in context:
+   *   every interaction in an activation's session at or after the activation.
+   *   Shared with whatever else was in those turns, so it is an upper bound on
+   *   the skill's influence rather than a bill.
+   *
+   * Activations are collapsed to one row per (skill, session) on the earliest
+   * activation before joining, so a skill activated repeatedly in one session
+   * does not count that session's turns once per activation.
+   */
+  static async getSkillStatistics(params: {
+    timeframe: StatisticsTimeFrame;
+    organizationId: string;
+    pagination: PaginationQuery;
+    sortBy: SkillStatisticsSortBy;
+    sortDirection: SortDirection;
+    /** Skill ids the caller may see; undefined means no scope restriction (admins). */
+    accessibleSkillIds?: string[];
+  }): Promise<PaginatedResult<SkillStatistics>> {
+    const {
+      timeframe,
+      organizationId,
+      pagination,
+      sortBy,
+      sortDirection,
+      accessibleSkillIds,
+    } = params;
+
+    if (accessibleSkillIds !== undefined && accessibleSkillIds.length === 0) {
+      return createPaginatedResult<SkillStatistics>([], 0, pagination);
+    }
+
+    const events = schema.skillUsageEventsTable;
+    const eventFilters = [
+      eq(schema.skillsTable.organizationId, organizationId),
+      notDeleted(schema.skillsTable),
+      ...StatisticsModel.timeframeConditions(timeframe, events.createdAt),
+      ...(accessibleSkillIds
+        ? [inArray(events.skillId, accessibleSkillIds)]
+        : []),
+    ];
+
+    // PHASE 1 — per-skill activation totals, paginated and sorted in SQL for
+    // everything that lives on the event rows themselves.
+    const activationsExpr = sql<number>`COUNT(*)`;
+    const contextTokensExpr = sql<number>`COALESCE(SUM(${events.contextTokens}), 0)`;
+    const lastActivatedExpr = sql`MAX(${events.createdAt})`;
+
+    // Every option here is a real SQL sort over the activation rows, so the page
+    // is always the page the caller asked for. Attributed cost is not sortable
+    // for that reason — see SKILL_STATISTICS_SORT_BY.
+    const sortExpr = {
+      contextTokens: contextTokensExpr,
+      activations: activationsExpr,
+      lastActivatedAt: lastActivatedExpr,
+      skillName: sql`${schema.skillsTable.name}`,
+    }[sortBy];
+
+    const [rows, [{ total }]] = await Promise.all([
+      db
+        .select({
+          skillId: events.skillId,
+          skillName: schema.skillsTable.name,
+          activations: sql<number>`CAST(${activationsExpr} AS INTEGER)`,
+          distinctUsers: sql<number>`CAST(COUNT(DISTINCT ${events.userId}) AS INTEGER)`,
+          contextTokens: sql<number>`CAST(${contextTokensExpr} AS DOUBLE PRECISION)`,
+          measuredActivations: sql<number>`CAST(COUNT(${events.contextTokens}) AS INTEGER)`,
+          lastActivatedAt: sql<string>`${lastActivatedExpr}`,
+        })
+        .from(events)
+        .innerJoin(
+          schema.skillsTable,
+          eq(events.skillId, schema.skillsTable.id),
+        )
+        .where(and(...eventFilters))
+        .groupBy(events.skillId, schema.skillsTable.name)
+        .orderBy(sortDirection === "asc" ? asc(sortExpr) : desc(sortExpr))
+        .limit(pagination.limit)
+        .offset(pagination.offset),
+      db
+        .select({
+          total: sql<number>`CAST(COUNT(DISTINCT ${events.skillId}) AS INTEGER)`,
+        })
+        .from(events)
+        .innerJoin(
+          schema.skillsTable,
+          eq(events.skillId, schema.skillsTable.id),
+        )
+        .where(and(...eventFilters)),
+    ]);
+
+    const pageSkillIds = rows.map((row) => row.skillId);
+    const attributed =
+      pageSkillIds.length > 0
+        ? await StatisticsModel.getSkillAttributedSpend({
+            timeframe,
+            organizationId,
+            skillIds: pageSkillIds,
+            eventFilters,
+          })
+        : new Map<string, SkillAttributedSpend>();
+
+    const data = rows.map((row) => {
+      const spend = attributed.get(row.skillId);
+      return {
+        skillId: row.skillId,
+        skillName: row.skillName,
+        activations: Number(row.activations) || 0,
+        distinctUsers: Number(row.distinctUsers) || 0,
+        contextTokens: Number(row.contextTokens) || 0,
+        measuredActivations: Number(row.measuredActivations) || 0,
+        attributedSessions: spend?.sessions ?? 0,
+        attributedRequests: spend?.requests ?? 0,
+        attributedInputTokens: spend?.inputTokens ?? 0,
+        attributedOutputTokens: spend?.outputTokens ?? 0,
+        attributedCost: spend?.cost ?? 0,
+        lastActivatedAt: row.lastActivatedAt
+          ? new Date(row.lastActivatedAt).toISOString()
+          : null,
+      };
+    });
+
+    return createPaginatedResult(data, Number(total) || 0, pagination);
   }
 
   /**
    * Get overview statistics
    */
-  static async getOverviewStatistics(
-    timeframe: StatisticsTimeFrame,
-    userId?: string,
-    isAgentAdmin?: boolean,
-  ): Promise<OverviewStatistics> {
+  static async getOverviewStatistics(params: {
+    timeframe: StatisticsTimeFrame;
+    organizationId: string;
+    /** Pick the top agent from only this caller's usage. */
+    topAgentScope?: { userId?: string; serviceAccountId?: string };
+  }): Promise<OverviewStatistics> {
+    const { timeframe, organizationId, topAgentScope } = params;
     const [teamStats, agentStats, modelStats] = await Promise.all([
-      StatisticsModel.getTeamStatistics(timeframe, userId, isAgentAdmin),
-      StatisticsModel.getAgentStatistics(timeframe, userId, isAgentAdmin),
-      StatisticsModel.getModelStatistics(timeframe, userId, isAgentAdmin),
+      StatisticsModel.getTeamStatistics({ timeframe, organizationId }),
+      StatisticsModel.getAgentStatistics({
+        timeframe,
+        organizationId,
+        ...topAgentScope,
+      }),
+      StatisticsModel.getModelStatistics({ timeframe, organizationId }),
     ]);
 
-    const totalRequests = teamStats.reduce(
-      (sum, team) => sum + team.requests,
+    // Model statistics cover every organization interaction. Team statistics
+    // intentionally omit usage with no team assignment, so deriving totals
+    // from them under-counts organization-wide usage.
+    const totalRequests = modelStats.reduce(
+      (sum, model) => sum + model.requests,
       0,
     );
-    const totalTokens = teamStats.reduce(
-      (sum, team) => sum + team.inputTokens + team.outputTokens,
+    const totalTokens = modelStats.reduce(
+      (sum, model) => sum + model.totalTokens,
       0,
     );
-    const totalCost = teamStats.reduce((sum, team) => sum + team.cost, 0);
+    const totalCost = modelStats.reduce((sum, model) => sum + model.cost, 0);
 
     const topTeam =
       teamStats.length > 0
@@ -770,127 +2186,208 @@ class StatisticsModel {
     };
   }
 
+  /** Initial Costs view: one shared model/cost aggregation and a count, no roster. */
   /**
-   * Calculate actual cost: cost - toon_savings
-   * This represents the final cost after all optimizations
-   * - cost = cost after model optimization
-   * - toonSavings = savings from TOON compression
-   * - actual cost = cost after both model optimization and TOON
+   * Costs overview and model chart. With `teamIds`, only requests those
+   * teams' spend limits charge are counted (see {@link teamChargeScope}),
+   * each once even when it charges several of the teams.
    */
-  private static calculateActualCost(
-    cost: number,
-    toonSavings: number,
-  ): number {
-    return cost - toonSavings;
+  static async getCostStatistics(params: {
+    timeframe: StatisticsTimeFrame;
+    organizationId: string;
+    requestingUserId: string;
+    canReadAllUsers: boolean;
+    teamIds?: string[];
+  }): Promise<CostStatistics> {
+    const {
+      timeframe,
+      organizationId,
+      requestingUserId,
+      canReadAllUsers,
+      teamIds,
+    } = params;
+    const f = await usageFacts(timeframe);
+    const m = usageAggregates(f).model;
+    const bucket = usageBucket(f, statisticsTimeBucket(timeframe));
+    const charge = teamIds
+      ? await StatisticsModel.teamChargeScope({ organizationId, teamIds })
+      : null;
+    const scope = and(
+      interactionBelongsToOrganization(organizationId, f),
+      charge?.chargesAny(f),
+    );
+    const activeUsers = db
+      .select({ userId: f.userId })
+      .from(f)
+      .where(
+        and(
+          scope,
+          isNotNull(f.userId),
+          canReadAllUsers ? undefined : eq(f.userId, requestingUserId),
+        ),
+      )
+      .groupBy(f.userId)
+      .as("active_users");
+    const [rows, [people]] = await Promise.all([
+      db
+        .select({
+          model: m.model,
+          timeBucket: bucket,
+          requests: m.requests,
+          inputTokens: m.inputTokens,
+          outputTokens: m.outputTokens,
+          cacheReadTokens: m.cacheReadTokens,
+          cacheWriteTokens: m.cacheWriteTokens,
+          totalTokens: m.totalTokens,
+          cost: m.billedCost,
+          baselineCost: m.baselineCost,
+          actualCost: m.billedCost,
+          cacheSavings: m.cacheSavings,
+          subscriptionCost: m.subscriptionCost,
+        })
+        .from(f)
+        .where(scope)
+        .groupBy(m.model, bucket)
+        .orderBy(bucket),
+      db
+        .select({ activeUsers: sql<number>`COUNT(*)::integer` })
+        .from(activeUsers),
+    ]);
+    return {
+      models: StatisticsModel.modelStatisticsFromRows({ rows, timeframe }),
+      costSavings: StatisticsModel.costSavingsFromRows({ rows, timeframe }),
+      activeUsers: Number(people.activeUsers),
+    };
   }
 
   /**
    * Get cost savings statistics
    */
-  static async getCostSavingsStatistics(
-    timeframe: StatisticsTimeFrame,
-    userId?: string,
-    isAgentAdmin?: boolean,
-  ): Promise<CostSavingsStatistics> {
-    const interval = StatisticsModel.getTimeframeInterval(timeframe);
-    const timeBucket = StatisticsModel.getTimeBucket(timeframe);
-
-    // Get accessible agent IDs for users that are non-agent admins
-    let accessibleAgentIds: string[] = [];
-    if (userId && !isAgentAdmin) {
-      accessibleAgentIds = await AgentTeamModel.getUserAccessibleAgentIds(
-        userId,
-        false,
-      );
-
-      if (accessibleAgentIds.length === 0) {
-        return {
-          totalBaselineCost: 0,
-          totalActualCost: 0,
-          totalSavings: 0,
-          totalOptimizationSavings: 0,
-          totalToonSavings: 0,
-          timeSeries: [],
-        };
-      }
-    }
-
-    const query = db
+  static async getCostSavingsStatistics(params: {
+    timeframe: StatisticsTimeFrame;
+    organizationId: string;
+  }): Promise<CostSavingsStatistics> {
+    const { timeframe, organizationId } = params;
+    const f = await usageFacts(timeframe);
+    const agg = usageAggregates(f);
+    const bucket = usageBucket(f, statisticsTimeBucket(timeframe));
+    const rows = await db
       .select({
-        timeBucket: sql<string>`DATE_TRUNC(${sql.raw(`'${timeBucket}'`)}, ${schema.interactionsTable.createdAt})`,
-        baselineCost: sql<number>`CAST(COALESCE(SUM(${schema.interactionsTable.baselineCost}), 0) AS DECIMAL)`,
-        actualCost: sql<number>`CAST(COALESCE(SUM(${schema.interactionsTable.cost}), 0) AS DECIMAL)`,
-        toonSavings: sql<number>`CAST(COALESCE(SUM(${schema.interactionsTable.toonCostSavings}), 0) AS DECIMAL)`,
+        timeBucket: bucket,
+        // All cost/savings figures are billed (metered) only: cache
+        // savings reflect money actually spent. Subscription traffic is
+        // reported separately as its would-be list-price cost, never as a
+        // saving.
+        baselineCost: agg.billed(f.baselineCost, "DECIMAL"),
+        actualCost: agg.billed(f.cost, "DECIMAL"),
+        cacheSavings: agg.billed(f.cacheSavings, "DECIMAL"),
+        subscriptionCost: agg.subscriptionCost("DECIMAL"),
       })
-      .from(schema.interactionsTable)
-      .innerJoin(
-        schema.agentsTable,
-        eq(schema.interactionsTable.profileId, schema.agentsTable.id),
-      )
-      .where(
-        and(
-          ...(interval
-            ? [
-                gte(
-                  schema.interactionsTable.createdAt,
-                  sql`NOW() - INTERVAL ${sql.raw(`'${interval}'`)}`,
-                ),
-              ]
-            : (() => {
-                const customRange =
-                  StatisticsModel.parseCustomTimeframe(timeframe);
-                return customRange
-                  ? [
-                      gte(
-                        schema.interactionsTable.createdAt,
-                        customRange.startTime,
-                      ),
-                      lte(
-                        schema.interactionsTable.createdAt,
-                        customRange.endTime,
-                      ),
-                    ]
-                  : [];
-              })()),
-          ...(accessibleAgentIds.length > 0
-            ? [inArray(schema.agentsTable.id, accessibleAgentIds)]
-            : []),
-        ),
-      )
-      .groupBy(
-        sql`DATE_TRUNC(${sql.raw(`'${timeBucket}'`)}, ${schema.interactionsTable.createdAt})`,
-      )
-      .orderBy(
-        sql`DATE_TRUNC(${sql.raw(`'${timeBucket}'`)}, ${schema.interactionsTable.createdAt})`,
-      );
+      .from(f)
+      .where(interactionBelongsToOrganization(organizationId, f))
+      .groupBy(bucket)
+      .orderBy(bucket);
+    return StatisticsModel.costSavingsFromRows({ rows, timeframe });
+  }
 
-    const rawTimeSeriesData = await query;
+  private static modelStatisticsFromRows({
+    rows,
+    timeframe,
+  }: {
+    rows: ModelStatisticsRow[];
+    timeframe: StatisticsTimeFrame;
+  }): ModelStatistics[] {
+    const timeSeriesData = StatisticsModel.groupTimeSeries(
+      rows,
+      timeframe,
+      "model",
+    );
 
-    // Custom grouping for cost savings data
-    interface CostSavingsRow {
-      timeBucket: string;
-      baselineCost: number;
-      actualCost: number;
-      toonSavings: number;
+    // Aggregate data by model
+    const modelMap = new Map<string, ModelStatistics>();
+    let totalCost = 0;
+
+    for (const row of timeSeriesData) {
+      if (!row.model) continue;
+
+      // Use stored cost from interactions (already calculated per-model)
+      const cost = Number(row.cost) || 0;
+
+      totalCost += cost;
+
+      if (!modelMap.has(row.model)) {
+        modelMap.set(row.model, {
+          model: row.model,
+          requests: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          totalTokens: 0,
+          cost: 0,
+          percentage: 0,
+          timeSeries: [],
+        });
+      }
+
+      const model = modelMap.get(row.model);
+      if (!model) continue;
+      model.requests += Number(row.requests);
+      model.inputTokens += Number(row.inputTokens);
+      model.outputTokens += Number(row.outputTokens);
+      model.cacheReadTokens += Number(row.cacheReadTokens) || 0;
+      model.cacheWriteTokens += Number(row.cacheWriteTokens) || 0;
+      model.totalTokens += Number(row.totalTokens) || 0;
+      model.cost += cost;
+      model.timeSeries.push({
+        timestamp: row.timeBucket,
+        value: cost,
+        requests: Number(row.requests),
+        inputTokens: Number(row.inputTokens),
+        outputTokens: Number(row.outputTokens),
+        cacheReadTokens: Number(row.cacheReadTokens) || 0,
+        cacheWriteTokens: Number(row.cacheWriteTokens) || 0,
+        totalTokens: Number(row.totalTokens) || 0,
+      });
     }
 
-    const intervalMinutes = StatisticsModel.getBucketIntervalMinutes(timeframe);
+    // Calculate percentages
+    const models = Array.from(modelMap.values());
+    models.forEach((model) => {
+      model.percentage = totalCost > 0 ? (model.cost / totalCost) * 100 : 0;
+    });
+
+    return models;
+  }
+
+  private static costSavingsFromRows({
+    rows,
+    timeframe,
+  }: {
+    rows: CostSavingsRow[];
+    timeframe: StatisticsTimeFrame;
+  }): CostSavingsStatistics {
+    // Custom grouping for cost savings data
+    const intervalMinutes = getStatisticsBucketIntervalMinutes(timeframe);
 
     // Group by custom intervals if needed
     const grouped = new Map<string, CostSavingsRow>();
 
-    for (const row of rawTimeSeriesData) {
-      const bucketKey =
-        intervalMinutes >= 60 && timeframe !== "7d" && timeframe !== "90d"
-          ? row.timeBucket
-          : StatisticsModel.roundToBucket(row.timeBucket, intervalMinutes);
+    for (const row of rows) {
+      const bucketKey = StatisticsModel.needsRebucketing(
+        timeframe,
+        intervalMinutes,
+      )
+        ? StatisticsModel.roundToBucket(row.timeBucket, intervalMinutes)
+        : row.timeBucket;
 
       if (!grouped.has(bucketKey)) {
         grouped.set(bucketKey, {
           timeBucket: bucketKey,
           baselineCost: 0,
           actualCost: 0,
-          toonSavings: 0,
+          cacheSavings: 0,
+          subscriptionCost: 0,
         });
       }
 
@@ -899,7 +2396,8 @@ class StatisticsModel {
 
       existing.baselineCost += Number(row.baselineCost);
       existing.actualCost += Number(row.actualCost);
-      existing.toonSavings += Number(row.toonSavings);
+      existing.cacheSavings += Number(row.cacheSavings);
+      existing.subscriptionCost += Number(row.subscriptionCost);
     }
 
     const timeSeriesData = Array.from(grouped.values()).sort(
@@ -910,28 +2408,48 @@ class StatisticsModel {
     // Calculate totals and build time series
     let totalBaselineCost = 0;
     let totalActualCost = 0;
-    let totalOptimizationSavings = 0;
-    let totalToonSavings = 0;
+    let totalCacheSavings = 0;
+    let totalSubscriptionCost = 0;
 
     const timeSeries = timeSeriesData.map((row) => {
-      const baselineCost = Number(row.baselineCost);
-      const cost = Number(row.actualCost);
-      const toonSavings = Number(row.toonSavings);
+      // `row.actualCost` is SUM(interactions.cost) over METERED rows only: the
+      // real billed spend. It already reflects the prompt-cache discount and on
+      // historical rows the cheaper model a rule swapped in — so it is the true
+      // "Actual Cost". Subscription-fulfilled traffic is excluded here and
+      // surfaced separately as `subscriptionCost`.
+      const actualCost = Number(row.actualCost);
+      // Would-be list-price cost of subscription-covered traffic (not billed).
+      const subscriptionCost = Number(row.subscriptionCost);
+      // `row.baselineCost` is SUM(interactions.baseline_cost). It only differs
+      // from the billed spend on rows written while optimization rules could
+      // swap the requested model for a cheaper one; that feature is gone, so
+      // new rows record the two as equal and this term is zero for them.
+      const baselineModelCost = Number(row.baselineCost);
+      const cacheSavings = Number(row.cacheSavings);
 
-      const actualCost = StatisticsModel.calculateActualCost(cost, toonSavings);
-      const optimizationSavings = baselineCost - cost;
+      // Historical savings from a model swap: identical token usage, requested
+      // model vs. the model actually used.
+      const modelSwapSavings = baselineModelCost - actualCost;
+
+      // "Non-optimized" cost: what the request would have cost with none of the
+      // savings applied (no cache and — on historical
+      // rows — the requested model). Adding each realized saving back onto the
+      // real spend keeps this line exactly that far above the actual-cost line,
+      // so the savings-breakdown chart reconciles with the gap shown in the
+      // non-optimized-vs-actual chart.
+      const baselineCost = actualCost + modelSwapSavings + cacheSavings;
 
       totalBaselineCost += baselineCost;
       totalActualCost += actualCost;
-      totalOptimizationSavings += optimizationSavings;
-      totalToonSavings += toonSavings;
+      totalCacheSavings += cacheSavings;
+      totalSubscriptionCost += subscriptionCost;
 
       return {
         timestamp: row.timeBucket,
         baselineCost,
         actualCost,
-        optimizationSavings,
-        toonSavings,
+        cacheSavings,
+        subscriptionCost,
       };
     });
 
@@ -941,11 +2459,1028 @@ class StatisticsModel {
       totalBaselineCost,
       totalActualCost,
       totalSavings,
-      totalOptimizationSavings,
-      totalToonSavings,
+      totalSubscriptionCost,
+      totalCacheSavings,
       timeSeries,
     };
   }
+
+  // ─── Private helpers ──────────────────────────────────────────────────────
+
+  /**
+   * Whether the rows coming back from SQL still have to be merged into wider
+   * buckets in JS.
+   *
+   * `statisticsTimeBucket` can only ask `DATE_TRUNC` for a whole calendar unit, so a
+   * timeframe whose bucket is a multiple of one — 7d's six hours cut from
+   * hourly rows, 90d's three days cut from daily rows, and every sub-hour
+   * timeframe, cut from per-minute rows — arrives finer than it should be and
+   * is regrouped here. For the rest, the SQL truncation is already the final
+   * bucket. Both bucketing paths ask this so they cannot disagree about which
+   * rows are already final.
+   */
+  private static needsRebucketing(
+    timeframe: StatisticsTimeFrame,
+    intervalMinutes: number,
+  ): boolean {
+    return intervalMinutes < 60 || timeframe === "7d" || timeframe === "90d";
+  }
+
+  /**
+   * WHERE conditions restricting a table to a timeframe, covering both the
+   * relative presets and `custom:<start>_<end>` ranges. Defaults to
+   * `interactions.created_at`; pass another timestamp column to bound a
+   * different table (e.g. `skill_usage_events.created_at`) on the same window.
+   */
+  static timeframeConditions(
+    timeframe: StatisticsTimeFrame,
+    column: AnyColumn = schema.interactionsTable.createdAt,
+  ): SQL[] {
+    const interval = StatisticsModel.getTimeframeInterval(timeframe);
+
+    if (interval) {
+      return [gte(column, sql`NOW() - INTERVAL ${sql.raw(`'${interval}'`)}`)];
+    }
+
+    const customRange = parseCustomStatisticsTimeframe(timeframe);
+    if (!customRange) {
+      // Fail closed. `StatisticsTimeFrameSchema` rejects unparseable custom
+      // ranges at the API boundary, so this is unreachable from a route — but
+      // returning no conditions would drop the date predicate from `and(...)`
+      // and silently turn a bounded request into an unbounded scan of whatever
+      // table it bounds. An impossible condition is the safe answer.
+      return [sql`FALSE`];
+    }
+    return [
+      gte(column, customRange.startTime),
+      lte(column, customRange.endTime),
+    ];
+  }
+
+  /**
+   * Restrict interactions to one organization, via the agent that served them.
+   *
+   * Requires a LEFT JOIN on `agents` at the call site. Deliberately a left join
+   * with an IS NULL escape rather than an inner one: `interactions.profile_id` is
+   * ON DELETE SET NULL, so an inner join would silently drop every interaction
+   * whose agent has since been deleted — which for a build cost means an app
+   * quietly reporting less than it cost.
+   *
+   * The escape has a cost of its own, worth stating: an orphaned row names no
+   * organization, so it counts for whichever organization's query its session id
+   * matches — potentially more than one. That needs a collision between a
+   * conversation uuid and another tenant's authoring session, so it trades a
+   * routine, silent undercount (any deleted agent) for a practically
+   * unreachable overcount. Removing the trade-off entirely means an
+   * `organization_id` snapshot on `interactions`, which is a new column plus a
+   * backfill on the platform's largest write-hot table — worth doing if this
+   * attribution ever carries billing weight, not for a reporting view.
+   */
+  private static organizationScopeConditions(organizationId: string): SQL[] {
+    return [
+      or(
+        eq(schema.agentsTable.organizationId, organizationId),
+        isNull(schema.interactionsTable.profileId),
+      ) as SQL,
+    ];
+  }
+
+  /**
+   * Which requests the spend limits of `teamIds` (and their sub-teams' billing
+   * credentials) charge, mirroring `InteractionModel.updateUsageAfterInteraction`:
+   * a credential billed to a team charges that team and each of its ancestors;
+   * any other request charges the agent's teams its caller belongs to,
+   * directly or through a sub-team. Grants and memberships are read as they
+   * are now, so a later change of either re-attributes past requests here,
+   * while a limit keeps what it already counted.
+   *
+   * Both predicates compare against uncorrelated sets, so PostgreSQL hashes
+   * each set once instead of re-reading grants for every request row.
+   */
+  private static async teamChargeScope(params: {
+    organizationId: string;
+    teamIds: string[];
+  }): Promise<{
+    teamIds: string[];
+    /** The request (a row of `usage`) charges at least one of the teams. */
+    chargesAny: (usage: ChargedUsage) => SQL;
+    /** The request charges the team in `teamId`. */
+    chargesTeam: (usage: ChargedUsage, teamId: SQLWrapper) => SQL;
+  }> {
+    const { organizationId } = params;
+    const known = await db
+      .select({ id: schema.teamsTable.id })
+      .from(schema.teamsTable)
+      .where(
+        and(
+          eq(schema.teamsTable.organizationId, organizationId),
+          sql`${schema.teamsTable.id} = ANY(string_to_array(${[...new Set(params.teamIds)].join(",")}, ','))`,
+        ),
+      );
+    const teamIds = known.map((team) => team.id);
+    if (teamIds.length === 0) {
+      return {
+        teamIds,
+        chargesAny: () => sql`FALSE`,
+        chargesTeam: () => sql`FALSE`,
+      };
+    }
+    const t = schema.teamsTable;
+    // Each scope team covers itself and every descendant: the billing teams
+    // whose spend reaches its limit, and the teams whose members it contains.
+    // Walked in SQL, with the scope teams bound as one parameter, so a deep
+    // hierarchy cannot outgrow the statement's parameter limit.
+    const covered = sql`(WITH RECURSIVE coverage(scope_team_id, team_id) AS (
+        SELECT ${t.id}, ${t.id} FROM ${t}
+        WHERE ${t.organizationId} = ${organizationId}
+          AND ${t.id} = ANY(string_to_array(${teamIds.join(",")}, ','))
+        UNION
+        SELECT coverage.scope_team_id, child.id
+        FROM ${t} AS child
+        INNER JOIN coverage ON child.parent_team_id = coverage.team_id
+        WHERE child.organization_id = ${organizationId}
+      ) SELECT scope_team_id, team_id FROM coverage) AS covered(scope_team_id, team_id)`;
+    const assignments = AgentTeamModel.readAssignments(organizationId);
+    // (scope team, agent, caller) for every agent shared with a scope team
+    // and every caller inside it.
+    const callers = sql`SELECT covered.scope_team_id, shared.agent_id, ${schema.teamMembersTable.userId}
+      FROM (SELECT * FROM ${assignments}) AS shared(agent_id, team_id)
+      INNER JOIN ${covered} ON covered.scope_team_id = shared.team_id
+      INNER JOIN ${schema.teamMembersTable} ON ${schema.teamMembersTable.teamId} = covered.team_id`;
+    return {
+      teamIds,
+      chargesAny: (usage) => sql`CASE WHEN ${usage.billingTeamId} IS NOT NULL
+        THEN ${usage.billingTeamId} IN (SELECT DISTINCT covered.team_id FROM ${covered})
+        ELSE (${usage.profileId}, ${usage.userId}) IN (SELECT agent_id, user_id FROM (${callers}) AS callers(scope_team_id, agent_id, user_id))
+      END`,
+      chargesTeam: (
+        usage,
+        teamId,
+      ) => sql`CASE WHEN ${usage.billingTeamId} IS NOT NULL
+        THEN (${teamId}, ${usage.billingTeamId}) IN (SELECT covered.scope_team_id, covered.team_id FROM ${covered})
+        ELSE (${teamId}, ${usage.profileId}, ${usage.userId}) IN (${callers})
+      END`,
+    };
+  }
+
+  /**
+   * The same organization restriction as {@link organizationScopeConditions},
+   * expressed as a subquery on `interactions.profile_id` instead of a join.
+   *
+   * The join form puts `agents` columns in the WHERE clause, which makes the
+   * condition unusable by any query that doesn't also join that table — the
+   * shared per-user helpers select from `interactions` alone. This form is a
+   * plain predicate on `interactions`, so one WHERE clause can be handed to all
+   * of them. It carries the same deliberate `IS NULL` escape for interactions
+   * whose agent has been deleted.
+   */
+  private static organizationScopeSubqueryConditions(
+    organizationId: string,
+    profileId: SQLWrapper = schema.interactionsTable.profileId,
+  ): SQL[] {
+    return [
+      or(
+        inArray(
+          profileId,
+          db
+            .select({ id: schema.agentsTable.id })
+            .from(schema.agentsTable)
+            .where(eq(schema.agentsTable.organizationId, organizationId)),
+        ),
+        isNull(profileId),
+      ) as SQL,
+    ];
+  }
+
+  /**
+   * What one chat session costs on average in this timeframe — the measured
+   * baseline the per-app savings estimate multiplies.
+   *
+   * Deliberately measured rather than configured: the alternative is a magic
+   * constant nobody can defend, whereas "your own chat sessions averaged $X"
+   * is a number a reader can check. Restricted to `source = 'chat'` so it is
+   * in-product chat rather than every API caller, and to billed (metered) spend
+   * so a subscription-covered org does not get a $0 baseline that makes every
+   * app look worthless — it gets a $0 baseline honestly, because that traffic
+   * genuinely costs it nothing per token.
+   */
+  private static async getChatCostBaseline(params: {
+    timeframe: StatisticsTimeFrame;
+    organizationId: string;
+  }): Promise<ChatCostBaseline> {
+    const { timeframe, organizationId } = params;
+    const perSession = db
+      .select({
+        sessionCost: billedSum(
+          schema.interactionsTable.cost,
+          "DOUBLE PRECISION",
+        ).as("session_cost"),
+      })
+      .from(schema.interactionsTable)
+      .leftJoin(
+        schema.agentsTable,
+        eq(schema.interactionsTable.profileId, schema.agentsTable.id),
+      )
+      .where(
+        and(
+          ...StatisticsModel.timeframeConditions(timeframe),
+          eq(schema.interactionsTable.source, "chat"),
+          isNotNull(schema.interactionsTable.sessionId),
+          ...StatisticsModel.organizationScopeConditions(organizationId),
+        ),
+      )
+      .groupBy(schema.interactionsTable.sessionId)
+      .as("per_session");
+
+    const [row] = await db
+      .select({
+        sessions: sql<number>`CAST(COUNT(*) AS INTEGER)`,
+        averageCost: sql<number>`CAST(COALESCE(AVG(${perSession.sessionCost}), 0) AS DOUBLE PRECISION)`,
+      })
+      .from(perSession);
+
+    return {
+      chatBaselineCostPerSession: Number(row?.averageCost) || 0,
+      chatBaselineSessions: Number(row?.sessions) || 0,
+    };
+  }
+
+  /**
+   * Billed spend of each app-authoring session in the timeframe, keyed by
+   * session id. Rides `interactions_session_created_at_idx`.
+   *
+   * A session id is not a tenant-scoped value — an external caller chooses its
+   * own via `X-Archestra-Session-Id` — so this is additionally restricted to the
+   * organization rather than trusting the id to be unique across tenants.
+   */
+  private static async getBuildSpendBySession(params: {
+    timeframe: StatisticsTimeFrame;
+    organizationId: string;
+    sessionIds: string[];
+  }): Promise<Map<string, InteractionSpend>> {
+    const { timeframe, organizationId, sessionIds } = params;
+    if (sessionIds.length === 0) return new Map();
+
+    const rows = await db
+      .select({
+        sessionId: schema.interactionsTable.sessionId,
+        requests: sql<number>`CAST(COUNT(*) AS INTEGER)`,
+        inputTokens: tokenSum(schema.interactionsTable.inputTokens),
+        outputTokens: tokenSum(schema.interactionsTable.outputTokens),
+        cost: billedSum(schema.interactionsTable.cost, "DOUBLE PRECISION"),
+      })
+      .from(schema.interactionsTable)
+      .leftJoin(
+        schema.agentsTable,
+        eq(schema.interactionsTable.profileId, schema.agentsTable.id),
+      )
+      .where(
+        and(
+          ...StatisticsModel.timeframeConditions(timeframe),
+          inArray(schema.interactionsTable.sessionId, sessionIds),
+          ...StatisticsModel.organizationScopeConditions(organizationId),
+        ),
+      )
+      .groupBy(schema.interactionsTable.sessionId);
+
+    return new Map(
+      rows.flatMap((row) =>
+        row.sessionId
+          ? [[row.sessionId, toInteractionSpend(row)] as const]
+          : [],
+      ),
+    );
+  }
+
+  /**
+   * Billed spend of each app's own runtime LLM calls
+   * (`archestra.llm.complete()`), keyed by app id.
+   */
+  private static async getAppRuntimeSpend(params: {
+    timeframe: StatisticsTimeFrame;
+    appIds: string[];
+  }): Promise<Map<string, InteractionSpend>> {
+    const { timeframe, appIds } = params;
+    if (appIds.length === 0) return new Map();
+
+    const rows = await db
+      .select({
+        appId: schema.interactionsTable.appId,
+        requests: sql<number>`CAST(COUNT(*) AS INTEGER)`,
+        inputTokens: tokenSum(schema.interactionsTable.inputTokens),
+        outputTokens: tokenSum(schema.interactionsTable.outputTokens),
+        cost: billedSum(schema.interactionsTable.cost, "DOUBLE PRECISION"),
+      })
+      .from(schema.interactionsTable)
+      .where(
+        and(
+          ...StatisticsModel.timeframeConditions(timeframe),
+          inArray(schema.interactionsTable.appId, appIds),
+        ),
+      )
+      .groupBy(schema.interactionsTable.appId);
+
+    return new Map(
+      rows.flatMap((row) =>
+        row.appId ? [[row.appId, toInteractionSpend(row)] as const] : [],
+      ),
+    );
+  }
+
+  /**
+   * How often each app actually ran, from the app-runtime MCP log (keyed by app
+   * and indexed on it).
+   *
+   * `runs` counts `tools/list` handshakes. The app gateway lists its tools once
+   * per host opening the app and declares `listChanged: false`, so there is no
+   * re-list to double-count — one row per open. This is the figure the savings
+   * estimate multiplies, so it is the one that has to be clean.
+   *
+   * `toolCalls` counts `tools/call` rows. These include tool previews run from
+   * the authoring flow (`preview_app_tool` logs as the app too), so for an app
+   * under active development it reads a little high. It is an activity
+   * indicator, not an input to any cost figure, and the alternative — filtering
+   * on a synthesised tool-call id prefix — would break the first time that
+   * prefix changed.
+   */
+  private static async getAppRuntimeUsage(params: {
+    timeframe: StatisticsTimeFrame;
+    appIds: string[];
+  }): Promise<Map<string, { runs: number; toolCalls: number }>> {
+    const { timeframe, appIds } = params;
+    if (appIds.length === 0) return new Map();
+
+    const calls = schema.mcpToolCallsTable;
+    const rows = await db
+      .select({
+        appId: calls.appId,
+        runs: sql<number>`CAST(COUNT(*) FILTER (WHERE ${calls.method} = 'tools/list') AS INTEGER)`,
+        toolCalls: sql<number>`CAST(COUNT(*) FILTER (WHERE ${calls.method} = 'tools/call') AS INTEGER)`,
+      })
+      .from(calls)
+      .where(
+        and(
+          ...StatisticsModel.timeframeConditions(timeframe, calls.createdAt),
+          eq(calls.ownerType, "app"),
+          inArray(calls.appId, appIds),
+        ),
+      )
+      .groupBy(calls.appId);
+
+    return new Map(
+      rows.flatMap((row) =>
+        row.appId
+          ? [
+              [
+                row.appId,
+                {
+                  runs: Number(row.runs) || 0,
+                  toolCalls: Number(row.toolCalls) || 0,
+                },
+              ] as const,
+            ]
+          : [],
+      ),
+    );
+  }
+
+  /**
+   * How many apps each authoring session produced, so a shared build session is
+   * disclosed instead of its spend being reported as one app's alone. Counts
+   * across the whole org and all time, not the timeframe: the question is how
+   * many apps that session's tokens paid for, which does not change with the
+   * window being reported.
+   */
+  private static async countAppsPerBuildSession(params: {
+    organizationId: string;
+    sessionIds: string[];
+  }): Promise<Map<string, number>> {
+    const { organizationId, sessionIds } = params;
+    if (sessionIds.length === 0) return new Map();
+
+    const rows = await db
+      .select({
+        sessionId: schema.appsTable.authoringSessionId,
+        count: sql<number>`CAST(COUNT(*) AS INTEGER)`,
+      })
+      .from(schema.appsTable)
+      .where(
+        and(
+          eq(schema.appsTable.organizationId, organizationId),
+          notDeleted(schema.appsTable),
+          inArray(schema.appsTable.authoringSessionId, sessionIds),
+        ),
+      )
+      .groupBy(schema.appsTable.authoringSessionId);
+
+    return new Map(
+      rows.flatMap((row) =>
+        row.sessionId ? [[row.sessionId, Number(row.count) || 0] as const] : [],
+      ),
+    );
+  }
+
+  /**
+   * Spend of the turns that ran with each skill in context, keyed by skill id.
+   *
+   * Activations are first collapsed to one row per (skill, session) on the
+   * earliest activation, so a skill activated several times in one session
+   * attributes that session's turns once rather than once per activation. The
+   * join then takes every interaction of the session from that moment on — the
+   * turns whose context actually carried the skill's block; earlier turns in the
+   * same session did not, and are excluded.
+   *
+   * Restricted to the organization for the same reason as the app build spend:
+   * `session_id` is caller-chosen, so it is not a tenant boundary on its own.
+   */
+  private static async getSkillAttributedSpend(params: {
+    timeframe: StatisticsTimeFrame;
+    organizationId: string;
+    skillIds: string[];
+    eventFilters: SQL[];
+  }): Promise<Map<string, SkillAttributedSpend>> {
+    const { timeframe, organizationId, skillIds, eventFilters } = params;
+    if (skillIds.length === 0) return new Map();
+
+    const events = schema.skillUsageEventsTable;
+    const firstActivations = db
+      .select({
+        skillId: events.skillId,
+        sessionId: events.sessionId,
+        firstActivatedAt: sql`MIN(${events.createdAt})`.as(
+          "first_activated_at",
+        ),
+      })
+      .from(events)
+      .innerJoin(schema.skillsTable, eq(events.skillId, schema.skillsTable.id))
+      .where(
+        and(
+          ...eventFilters,
+          inArray(events.skillId, skillIds),
+          isNotNull(events.sessionId),
+        ),
+      )
+      .groupBy(events.skillId, events.sessionId)
+      .as("first_activations");
+
+    const interactions = schema.interactionsTable;
+    const rows = await db
+      .select({
+        skillId: firstActivations.skillId,
+        sessions: sql<number>`CAST(COUNT(DISTINCT ${firstActivations.sessionId}) AS INTEGER)`,
+        requests: sql<number>`CAST(COUNT(${interactions.id}) AS INTEGER)`,
+        inputTokens: tokenSum(interactions.inputTokens),
+        outputTokens: tokenSum(interactions.outputTokens),
+        cost: billedSum(interactions.cost, "DOUBLE PRECISION"),
+      })
+      .from(firstActivations)
+      .leftJoin(
+        interactions,
+        and(
+          eq(interactions.sessionId, firstActivations.sessionId),
+          gte(interactions.createdAt, firstActivations.firstActivatedAt),
+          ...StatisticsModel.timeframeConditions(timeframe),
+        ),
+      )
+      // Same reason as getBuildSpendBySession: the join key is a caller-chosen
+      // session id, so it cannot stand alone as a tenant boundary. On the ON
+      // clause rather than in a WHERE, so a skill whose sessions have no
+      // matching interactions still returns its (zeroed) row.
+      .leftJoin(
+        schema.agentsTable,
+        and(
+          eq(interactions.profileId, schema.agentsTable.id),
+          eq(schema.agentsTable.organizationId, organizationId),
+        ),
+      )
+      .where(
+        or(
+          isNull(interactions.id),
+          isNotNull(schema.agentsTable.id),
+          isNull(interactions.profileId),
+        ),
+      )
+      .groupBy(firstActivations.skillId);
+
+    return new Map(
+      rows.map((row) => [
+        row.skillId,
+        {
+          sessions: Number(row.sessions) || 0,
+          requests: Number(row.requests) || 0,
+          inputTokens: Number(row.inputTokens) || 0,
+          outputTokens: Number(row.outputTokens) || 0,
+          cost: Number(row.cost) || 0,
+        },
+      ]),
+    );
+  }
+
+  /**
+   * Cost time series for a bounded set of users, keyed by user id. Reuses the
+   * same bucketing as the other statistics views so the chart shapes match.
+   */
+  private static async getUserTimeSeries(params: {
+    timeframe: StatisticsTimeFrame;
+    facts: UsageFacts;
+    userIds: string[];
+    whereClause: SQL | undefined;
+  }): Promise<Map<string, StatisticsTimeSeriesPoint[]>> {
+    const rows = await StatisticsModel.getUserUsageTimeSeries(params);
+    const byUser = new Map<string, StatisticsTimeSeriesPoint[]>();
+    for (const row of rows) {
+      if (!row.userId) continue;
+      const points = byUser.get(row.userId) ?? [];
+      points.push(userUsageTimeSeriesPoint(row));
+      byUser.set(row.userId, points);
+    }
+    return byUser;
+  }
+
+  private static async getUserModelTimeSeries(params: {
+    timeframe: StatisticsTimeFrame;
+    facts: UsageFacts;
+    userIds: string[];
+    whereClause: SQL | undefined;
+  }): Promise<Map<string, Map<string, StatisticsTimeSeriesPoint[]>>> {
+    const rows = await StatisticsModel.getUserUsageTimeSeries({
+      ...params,
+      byModel: true,
+    });
+    const byUser = new Map<string, Map<string, StatisticsTimeSeriesPoint[]>>();
+    for (const row of rows) {
+      if (!row.userId || !row.model) continue;
+      const models =
+        byUser.get(row.userId) ??
+        new Map<string, StatisticsTimeSeriesPoint[]>();
+      const points = models.get(row.model) ?? [];
+      points.push(userUsageTimeSeriesPoint(row));
+      models.set(row.model, points);
+      byUser.set(row.userId, models);
+    }
+    return byUser;
+  }
+
+  /** Aggregate only the requested page, preserving both dimensions during rebucketing. */
+  private static async getUserUsageTimeSeries(params: {
+    timeframe: StatisticsTimeFrame;
+    facts: UsageFacts;
+    userIds: string[];
+    whereClause: SQL | undefined;
+    byModel?: boolean;
+  }) {
+    const {
+      timeframe,
+      facts: f,
+      userIds,
+      whereClause,
+      byModel = false,
+    } = params;
+    const m = usageAggregates(f).model;
+    const model = byModel ? m.model : sql<null>`NULL::text`;
+    // created_at stores UTC without a timezone. Return an explicit instant so
+    // database drivers cannot interpret the bucket in the server's local zone.
+    const bucket = sql<string>`${usageBucket(f, statisticsTimeBucket(timeframe))} AT TIME ZONE 'UTC'`;
+    const rows = await db
+      .select({
+        userId: f.userId,
+        model,
+        timeBucket: bucket,
+        requests: m.requests,
+        inputTokens: m.inputTokens,
+        outputTokens: m.outputTokens,
+        cacheReadTokens: m.cacheReadTokens,
+        cacheWriteTokens: m.cacheWriteTokens,
+        totalTokens: m.totalTokens,
+        cost: m.billedCost,
+        subscriptionCost: m.subscriptionCost,
+      })
+      .from(f)
+      .where(
+        and(
+          whereClause,
+          inArray(f.userId, userIds),
+          byModel ? isNotNull(f.model) : undefined,
+        ),
+      )
+      .groupBy(f.userId, model, bucket)
+      .orderBy(bucket);
+
+    return StatisticsModel.groupTimeSeries(
+      rows.map((row) => ({
+        ...row,
+        groupKey: JSON.stringify([row.userId, row.model]),
+      })),
+      timeframe,
+      "groupKey",
+    );
+  }
+
+  /**
+   * Per-model usage for a bounded set of users, keyed by user id, ordered
+   * heaviest model first. Interactions with no recorded model are skipped
+   * rather than bucketed under a placeholder name.
+   */
+  private static async getUserModelBreakdown(params: {
+    facts: UsageFacts;
+    userIds: string[];
+    whereClause: SQL | undefined;
+  }): Promise<Map<string, UserModelUsage[]>> {
+    const { facts: f, userIds, whereClause } = params;
+    const m = usageAggregates(f).model;
+
+    const rows = await db
+      .select({
+        userId: f.userId,
+        model: m.model,
+        requests: m.requests,
+        inputTokens: m.inputTokens,
+        outputTokens: m.outputTokens,
+        cacheReadTokens: m.cacheReadTokens,
+        cacheWriteTokens: m.cacheWriteTokens,
+        totalTokens: m.totalTokens,
+        billedCost: m.billedCost,
+        subscriptionCost: m.subscriptionCost,
+      })
+      .from(f)
+      .where(and(whereClause, inArray(f.userId, userIds), isNotNull(f.model)))
+      .groupBy(f.userId, m.model)
+      .orderBy(desc(m.totalTokens));
+
+    const byUser = new Map<string, UserModelUsage[]>();
+    for (const row of rows) {
+      if (!row.userId || !row.model) continue;
+      const entries = byUser.get(row.userId) ?? [];
+      entries.push({
+        model: row.model,
+        requests: Number(row.requests) || 0,
+        inputTokens: Number(row.inputTokens) || 0,
+        outputTokens: Number(row.outputTokens) || 0,
+        cacheReadTokens: Number(row.cacheReadTokens) || 0,
+        cacheWriteTokens: Number(row.cacheWriteTokens) || 0,
+        totalTokens: Number(row.totalTokens) || 0,
+        percentage: 0,
+        billedCost: Number(row.billedCost) || 0,
+        subscriptionCost: Number(row.subscriptionCost) || 0,
+      });
+      byUser.set(row.userId, entries);
+    }
+
+    for (const entries of byUser.values()) {
+      const totalTokens = entries.reduce(
+        (sum, entry) => sum + entry.totalTokens,
+        0,
+      );
+      for (const entry of entries) {
+        entry.percentage =
+          totalTokens > 0 ? (entry.totalTokens / totalTokens) * 100 : 0;
+      }
+    }
+    return byUser;
+  }
+
+  /**
+   * Report every proxy-attributed row against the organization's single LLM
+   * Proxy.
+   *
+   * An organization has exactly one LLM Proxy. The rows that preceded that
+   * consolidation were left in place so their history stays reachable, and
+   * `resolveAgent` collapses their ids — and those of legacy dual-purpose
+   * `profile` rows — onto the elected proxy for every new request. Reporting
+   * follows the same rule, so the proxy's spend is one entity over time
+   * rather than a leaderboard of names that no longer resolve to anything a
+   * reader can open, configure, or send traffic to.
+   *
+   * Rows whose organization has no elected proxy (none exists until the
+   * organization's first proxy request or the next startup seed) are left
+   * untouched rather than dropped: their cost is real either way.
+   */
+  private static async collapseProxyRows<
+    T extends {
+      agentId: string;
+      agentName: string;
+      agentType: string;
+      organizationId: string;
+      teamName: string | null;
+    },
+  >(rows: T[]): Promise<T[]> {
+    const proxyOrganizationIds = [
+      ...new Set(
+        rows
+          .filter((row) => PROXY_ATTRIBUTED_AGENT_TYPES.has(row.agentType))
+          .map((row) => row.organizationId),
+      ),
+    ];
+    if (proxyOrganizationIds.length === 0) {
+      return rows;
+    }
+
+    const proxies = await AgentModel.findOrgLlmProxies(proxyOrganizationIds);
+
+    return rows.map((row) => {
+      if (!PROXY_ATTRIBUTED_AGENT_TYPES.has(row.agentType)) {
+        return row;
+      }
+      const proxy = proxies.get(row.organizationId);
+      if (!proxy) {
+        return row;
+      }
+      return {
+        ...row,
+        agentId: proxy.id,
+        agentName: proxy.name,
+        agentType: "llm_proxy",
+        // The LLM Proxy is an org-scoped singleton and carries no team gating;
+        // a donor row's team would misattribute the whole proxy to it.
+        teamName: null,
+      };
+    });
+  }
+}
+
+/**
+ * Agent types whose interactions are LLM Proxy traffic: the proxy itself and
+ * the legacy dual-purpose `profile` rows it absorbed. Kept in step with the
+ * alias handling in `resolveAgent`.
+ */
+const PROXY_ATTRIBUTED_AGENT_TYPES: ReadonlySet<string> = new Set([
+  "llm_proxy",
+  "profile",
+]);
+
+// ─── Billing-mode-aware cost aggregates ─────────────────────────────────────
+// An interaction's `cost` is the list-price estimate. "Billed spend" is that
+// cost only for `metered` rows; `subscription` rows incur no per-token charge
+// and contribute 0. The split is expressed as SQL aggregate FILTERs on
+// billing_mode. billing_mode is intentionally not in the statistics covering
+// index (adding it would require a write-blocking rebuild on a huge table — see
+// the interactions schema), so the FILTER reads it from the heap.
+
+/**
+ * SUM of an interaction token-count column, returned as a JS number.
+ * Cast to DOUBLE PRECISION rather than INTEGER or BIGINT: org-wide token
+ * sums exceed int32 ("integer out of range"), and node-postgres returns
+ * BIGINT as a string. float8 keeps integer sums exact up to 2^53 tokens.
+ */
+function tokenSum(column: AnyColumn): SQL<number> {
+  return sql<number>`CAST(COALESCE(SUM(${column}), 0) AS DOUBLE PRECISION)`;
+}
+
+/**
+ * Provider-reported processed tokens: uncached input, fresh cache writes,
+ * and output. Cache reads remain separate. A 1-hour cache write is a subset,
+ * and reasoning already included in stored output is not added again. Estimated
+ * input is excluded. Estimated output cannot be excluded: the row does not
+ * record which output counts were synthesized. Separate Gemini thoughts are
+ * not persisted in these columns and cannot be reconstructed here.
+ */
+function reportedTokens(table: typeof schema.interactionsTable): SQL<number> {
+  return sql<number>`CAST(
+    COALESCE(SUM(${table.inputTokens}) FILTER (WHERE NOT ${table.inputTokensEstimated}), 0)
+    + COALESCE(SUM(${table.outputTokens}), 0)
+    + COALESCE(SUM(${table.cacheWriteTokens}), 0)
+    AS DOUBLE PRECISION)`;
+}
+
+/** Resolve the executing agent UUID from a direct id or delegation chain. */
+function extractUsageClientAgentId(
+  externalAgentId: string | null,
+): string | null {
+  if (!externalAgentId) return null;
+  const candidate = externalAgentId.split(":").at(-1);
+  return candidate && isUuid(candidate) ? candidate : null;
+}
+
+/** Turn stored client attribution into a useful, non-opaque display label. */
+function formatUsageClient(
+  externalAgentId: string | null,
+  agentNames: Map<string, string>,
+): string | null {
+  if (!externalAgentId) return null;
+
+  const family = clientForExternalAgentIds([externalAgentId]);
+  if (family) return family.label;
+
+  const agentId = extractUsageClientAgentId(externalAgentId);
+  if (agentId) {
+    const agentName = agentNames.get(agentId);
+    return agentName
+      ? `Agent: ${agentName}`
+      : `${archestraMcpBranding.appName} agent`;
+  }
+
+  return externalAgentId;
+}
+
+/**
+ * Context bands, ascending. Kept here rather than derived from the Zod enum so
+ * the SQL CASE, this order and the schema are edited together — a band added to
+ * one and not the others would silently vanish from the response.
+ */
+const CONTEXT_BUCKET_ORDER: readonly MyContextBucketId[] = [
+  "under32k",
+  "under128k",
+  "under256k",
+  "over256k",
+];
+
+/** SUM of an interaction cost column restricted to metered rows (billed spend). */
+function billedSum(
+  column: AnyColumn,
+  cast: "DOUBLE PRECISION" | "DECIMAL",
+): SQL<number> {
+  return sql<number>`CAST(COALESCE(SUM(${column}) FILTER (WHERE ${schema.interactionsTable.billingMode} = 'metered'), 0) AS ${sql.raw(cast)})`;
+}
+
+/** SUM of interaction `cost` restricted to subscription rows (would-be list-price cost). */
+function subscriptionCostSum(
+  cast: "DOUBLE PRECISION" | "DECIMAL",
+): SQL<number> {
+  return sql<number>`CAST(COALESCE(SUM(${schema.interactionsTable.cost}) FILTER (WHERE ${schema.interactionsTable.billingMode} = 'subscription'), 0) AS ${sql.raw(cast)})`;
+}
+
+// ─── App / skill cost assembly ──────────────────────────────────────────────
+
+/** Requests, tokens and billed spend of a set of interactions. */
+interface InteractionSpend {
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cost: number;
+}
+
+/** {@link InteractionSpend} plus the number of sessions it was drawn from. */
+interface SkillAttributedSpend extends InteractionSpend {
+  sessions: number;
+}
+
+/** Coerce one aggregate row's numeric columns (node-postgres returns strings). */
+function toInteractionSpend(row: {
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cost: number;
+}): InteractionSpend {
+  return {
+    requests: Number(row.requests) || 0,
+    inputTokens: Number(row.inputTokens) || 0,
+    outputTokens: Number(row.outputTokens) || 0,
+    cost: Number(row.cost) || 0,
+  };
+}
+
+/**
+ * Order an assembled app page. Sorting happens here rather than in SQL because
+ * the three cost sources live in different tables keyed differently, so no
+ * single sortable expression exists without joining all of them for every app in
+ * the organization.
+ */
+function sortAppStatistics(
+  apps: AppStatistics[],
+  sortBy: AppStatisticsSortBy,
+  direction: SortDirection,
+): AppStatistics[] {
+  const sign = direction === "asc" ? 1 : -1;
+  const value = (app: AppStatistics): number => {
+    switch (sortBy) {
+      case "buildCost":
+        return app.buildCost;
+      case "runtimeCost":
+        return app.runtimeCost;
+      case "runs":
+        return app.runs;
+      case "estimatedNetSavings":
+        return app.estimatedNetSavings;
+      default:
+        return app.buildCost + app.runtimeCost;
+    }
+  };
+
+  return [...apps].sort((a, b) =>
+    sortBy === "appName"
+      ? sign * a.appName.localeCompare(b.appName)
+      : sign * (value(a) - value(b)),
+  );
 }
 
 export default StatisticsModel;
+
+function userUsageTimeSeriesPoint(row: {
+  timeBucket: string;
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  cost: number;
+  subscriptionCost: number;
+}): StatisticsTimeSeriesPoint {
+  const billedCost = Number(row.cost) || 0;
+  return {
+    timestamp: new Date(row.timeBucket).toISOString(),
+    value: billedCost,
+    requests: Number(row.requests) || 0,
+    inputTokens: Number(row.inputTokens) || 0,
+    outputTokens: Number(row.outputTokens) || 0,
+    cacheReadTokens: Number(row.cacheReadTokens) || 0,
+    cacheWriteTokens: Number(row.cacheWriteTokens) || 0,
+    totalTokens: Number(row.totalTokens) || 0,
+    billedCost,
+    subscriptionCost: Number(row.subscriptionCost) || 0,
+  };
+}
+
+// Aggregated query rows, shared by the legacy endpoints and the Costs view.
+type ModelStatisticsRow = {
+  model: string | null;
+  timeBucket: string;
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  cost: number;
+};
+type CostSavingsRow = {
+  timeBucket: string;
+  baselineCost: number;
+  actualCost: number;
+  cacheSavings: number;
+  subscriptionCost: number;
+};
+
+/**
+ * Aggregates over usage rows. The request family counts each request once,
+ * with its own columns; `model` splits receipts by the models they billed.
+ * Casts match what each statistic has always returned.
+ */
+function usageAggregates(f: UsageFacts) {
+  const sum = (column: SQLWrapper, cast: string, filter?: SQL) =>
+    sql<number>`CAST(COALESCE(SUM(${column})${filter ? sql` FILTER (WHERE ${filter})` : sql``}, 0) AS ${sql.raw(cast)})`;
+  const metered = sql`${f.billingMode} = 'metered'`;
+  const subscription = sql`${f.billingMode} = 'subscription'`;
+  const notSubscription = sql`${f.billingMode} <> 'subscription'`;
+  return {
+    requests: sum(f.requests, "INTEGER"),
+    inputTokens: sum(f.inputTokens, "DOUBLE PRECISION"),
+    outputTokens: sum(f.outputTokens, "DOUBLE PRECISION"),
+    cacheReadTokens: sum(f.cacheReadTokens, "DOUBLE PRECISION"),
+    cacheWriteTokens: sum(f.cacheWriteTokens, "DOUBLE PRECISION"),
+    /** See {@link reportedTokens}. */
+    totalTokens: sql<number>`CAST(
+      COALESCE(SUM(${f.reportedInputTokens}), 0)
+      + COALESCE(SUM(${f.outputTokens}), 0)
+      + COALESCE(SUM(${f.cacheWriteTokens}), 0)
+      AS DOUBLE PRECISION)`,
+    /** Billed spend: metered requests only (see {@link billedSum}). */
+    billed: (column: SQLWrapper, cast: "DOUBLE PRECISION" | "DECIMAL") =>
+      sum(column, cast, metered),
+    subscriptionCost: (cast: "DOUBLE PRECISION" | "DECIMAL") =>
+      sum(f.cost, cast, subscription),
+    failedOverAttempts: sum(f.failedOverAttempts, "DOUBLE PRECISION"),
+    model: {
+      model: sql<string>`${f.billedModel}`,
+      requests: sum(f.requests, "INTEGER"),
+      inputTokens: sum(f.modelInputTokens, "BIGINT"),
+      outputTokens: sum(f.modelOutputTokens, "BIGINT"),
+      cacheReadTokens: sum(f.modelCacheReadTokens, "BIGINT"),
+      cacheWriteTokens: sum(f.modelCacheWriteTokens, "BIGINT"),
+      totalTokens: sql<number>`CAST(
+        COALESCE(SUM(${f.modelReportedInputTokens}), 0)
+        + COALESCE(SUM(${f.modelOutputTokens}), 0)
+        + COALESCE(SUM(${f.modelCacheWriteTokens}), 0)
+        AS BIGINT)`,
+      billedCost: sum(f.modelCost, "DOUBLE PRECISION", notSubscription),
+      subscriptionCost: sum(f.modelCost, "DOUBLE PRECISION", subscription),
+      baselineCost: sum(
+        f.modelBaselineCost,
+        "DOUBLE PRECISION",
+        notSubscription,
+      ),
+      cacheSavings: sum(
+        f.modelCacheSavings,
+        "DOUBLE PRECISION",
+        notSubscription,
+      ),
+    },
+  };
+}
+
+/** Calendar days with at least one request. */
+function activeDays(f: UsageFacts) {
+  return sql<number>`CAST(COUNT(DISTINCT DATE(${f.hour})) FILTER (WHERE ${f.requests} > 0) AS INTEGER)`;
+}
+
+/** `DATE_TRUNC(unit, hour)` of usage rows. */
+function usageBucket(f: UsageFacts, unit: string) {
+  return sql<string>`DATE_TRUNC(${sql.raw(`'${unit}'`)}, ${f.hour})`;
+}
+
+/** The columns of a usage row that decide which teams it charges. */
+type ChargedUsage = {
+  billingTeamId: SQLWrapper;
+  profileId: SQLWrapper;
+  userId: SQLWrapper;
+};

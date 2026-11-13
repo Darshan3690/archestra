@@ -1,0 +1,825 @@
+import { randomUUID } from "node:crypto";
+import { type ResourcePermissionGrant, urlSlugify } from "@archestra/shared";
+import {
+  and,
+  desc,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  type SQL,
+  sql,
+} from "drizzle-orm";
+import type { AnyPgColumn } from "drizzle-orm/pg-core";
+import db, { schema, type Transaction, withDbTransaction } from "@/database";
+import { notDeletedConversation } from "@/database/schemas/conversation";
+import { notDeleted } from "@/database/schemas/soft-deletable-table";
+import {
+  hardDelete,
+  restore as restoreRows,
+  softDelete,
+} from "@/database/soft-delete";
+import type { ConversationOrigin, InsertProject, Project } from "@/types";
+import { ProjectLabelModel } from "./entity-labels";
+import ProjectAccessModel from "./project-access";
+import ProjectAppModel from "./project-app";
+import ResourcePermissionPolicyModel from "./resource-permission-policy";
+
+/**
+ * CRUD for `projects`. Access and visibility queries live in
+ * {@link ProjectAccessModel} (models/project-access.ts).
+ *
+ * {@link ProjectModel.delete} soft-deletes: the row is stamped `deleted_at`
+ * and every read here excludes it, so the project is gone from the API. Its
+ * files and scheduled tasks are RETAINED, hidden behind {@link belongsToLiveProject}
+ * (and the transitive project resolution every file path performs), so a
+ * restore brings them back; chats and execution sessions detach. See that method.
+ */
+class ProjectModel {
+  static async transferOwnership(params: {
+    id: string;
+    organizationId: string;
+    previousOwnerId: string | null;
+    updatedAt: Date;
+    ownerId: string;
+  }): Promise<boolean> {
+    const rows = await db
+      .update(schema.projectsTable)
+      .set({
+        userId: params.ownerId,
+
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(schema.projectsTable.id, params.id),
+          eq(schema.projectsTable.organizationId, params.organizationId),
+          params.previousOwnerId === null
+            ? isNull(schema.projectsTable.userId)
+            : eq(schema.projectsTable.userId, params.previousOwnerId),
+          sql`date_trunc('milliseconds', ${schema.projectsTable.updatedAt}) = ${params.updatedAt.toISOString()}::timestamp`,
+          notDeleted(schema.projectsTable),
+        ),
+      )
+      .returning({ id: schema.projectsTable.id });
+    return rows.length === 1;
+  }
+
+  static async create(
+    project: InsertProject,
+    /** Explicit starting audience; a project is otherwise its owner's alone. */
+    options?: { initialPermissionGrants?: ResourcePermissionGrant[] },
+  ): Promise<Project> {
+    const slug = await ProjectModel.generateUniqueSlug({
+      name: project.name,
+      organizationId: project.organizationId,
+    });
+    try {
+      // The access policy is written with the row it governs, so a failure
+      // cannot leave a project nobody can reach.
+      return await withDbTransaction(async (tx) => {
+        const [row] = await tx
+          .insert(schema.projectsTable)
+          .values({ ...project, slug })
+          .returning();
+        if (!row) throw new Error("failed to insert project");
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        await ResourcePermissionPolicyModel.createInitial({
+          tx,
+          organizationId: row.organizationId,
+          resource: "project",
+          scope: row.id,
+          grants: options?.initialPermissionGrants,
+          authorId: row.userId,
+        });
+        // SPDX-SnippetEnd
+        return row;
+      });
+    } catch (error) {
+      if (isUniqueViolation(error)) {
+        throw new ProjectNameExistsError(project.name);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Turn an existing chat into a project, atomically: create the project, move
+   * the chat into it (`conversations.project_id`), and re-point the chat's
+   * no-project files to the project (`files.project_id`). All in one
+   * transaction so a failure leaves no orphaned project or half-moved files.
+   *
+   * The conversation row is locked `FOR UPDATE` so two concurrent conversions
+   * of the same chat can't both create a project (the loser sees `project_id`
+   * already set). The caller (service) owns eligibility/validation; this method
+   * re-checks ownership and the not-already-assigned invariant under the lock.
+   */
+  static async createFromConversation(params: {
+    organizationId: string;
+    userId: string;
+    conversationId: string;
+    name: string;
+    description: string | null;
+    icon: string | null;
+  }): Promise<{ project: Project; filesMoved: number }> {
+    // Computed outside the tx: `generateUniqueSlug` reads the module-level `db`,
+    // and the unique index is the real guard against a slug race.
+    const slug = await ProjectModel.generateUniqueSlug({
+      name: params.name,
+      organizationId: params.organizationId,
+    });
+
+    return db.transaction(async (tx) => {
+      const [conversation] = await tx
+        .select({
+          id: schema.conversationsTable.id,
+          projectId: schema.conversationsTable.projectId,
+        })
+        .from(schema.conversationsTable)
+        .where(
+          and(
+            notDeletedConversation,
+            eq(schema.conversationsTable.id, params.conversationId),
+            eq(schema.conversationsTable.userId, params.userId),
+            eq(schema.conversationsTable.organizationId, params.organizationId),
+          ),
+        )
+        .for("update");
+      if (!conversation) throw new ConversationNotOwnedError();
+      if (conversation.projectId) throw new ProjectAlreadyAssignedError();
+
+      let project: Project;
+      try {
+        const [row] = await tx
+          .insert(schema.projectsTable)
+          .values({
+            organizationId: params.organizationId,
+            userId: params.userId,
+            name: params.name,
+            description: params.description,
+            icon: params.icon,
+            slug,
+          })
+          .returning();
+        if (!row) throw new Error("failed to insert project");
+        project = row;
+      } catch (error) {
+        if (isUniqueViolation(error)) {
+          throw new ProjectNameExistsError(params.name);
+        }
+        throw error;
+      }
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      await ResourcePermissionPolicyModel.createInitial({
+        tx,
+        organizationId: project.organizationId,
+        resource: "project",
+        scope: project.id,
+        authorId: project.userId,
+      });
+      // SPDX-SnippetEnd
+
+      await tx
+        .update(schema.conversationsTable)
+        .set({ projectId: project.id })
+        .where(eq(schema.conversationsTable.id, params.conversationId));
+
+      // Re-point only the caller's OWN no-project files. In a shared chat a
+      // collaborator may have authored no-project files (stamped with their
+      // user id); moving those into the converter's private project would strip
+      // the author's access, so they stay with their author. This also makes a
+      // filename clash in the brand-new project impossible: the caller's files
+      // are already unique per (user, conversation, filename).
+      //
+      // Re-pointing leaves each row's `object_key` in place; that is correct
+      // for every storage provider because reads and byte-purge address files
+      // by `object_key` / row, never by folder path (so no copy, no orphaned
+      // bytes). For an external store the bytes simply keep their original
+      // conversation-folder layout rather than moving under the project slug.
+      //
+      // A file write whose scope was resolved as no-project just before this
+      // runs but inserts just after stays a no-project row (still reachable in
+      // the chat's own Files panel); the conversation lock does not serialize
+      // file inserts. Narrow and non-destructive.
+      const moved = await tx
+        .update(schema.filesTable)
+        .set({ projectId: project.id })
+        .where(
+          and(
+            eq(schema.filesTable.organizationId, params.organizationId),
+            eq(schema.filesTable.conversationId, params.conversationId),
+            eq(schema.filesTable.userId, params.userId),
+            isNull(schema.filesTable.projectId),
+          ),
+        )
+        .returning({ id: schema.filesTable.id });
+
+      return { project, filesMoved: moved.length };
+    });
+  }
+
+  static async findById(id: string): Promise<Project | null> {
+    const [row] = await db
+      .select()
+      .from(schema.projectsTable)
+      .where(
+        and(eq(schema.projectsTable.id, id), notDeleted(schema.projectsTable)),
+      );
+    return row ?? null;
+  }
+
+  /** Owner-scoped fetch — for mutations, which only the owner may perform. */
+  static async findByIdForOwner(params: {
+    id: string;
+    userId: string;
+    organizationId: string;
+  }): Promise<Project | null> {
+    const [row] = await db
+      .select()
+      .from(schema.projectsTable)
+      .where(
+        and(
+          eq(schema.projectsTable.id, params.id),
+          eq(schema.projectsTable.userId, params.userId),
+          eq(schema.projectsTable.organizationId, params.organizationId),
+          notDeleted(schema.projectsTable),
+        ),
+      );
+    return row ?? null;
+  }
+
+  /**
+   * Update the owner-editable fields. Only the keys present in `fields` are
+   * written, so a caller can change name, description, icon, and/or the default
+   * agent independently. A duplicate name surfaces as {@link ProjectNameExistsError}.
+   *
+   * `defaultAgentId` is validated by the service before it reaches here.
+   */
+  static async update(params: {
+    id: string;
+    fields: {
+      name?: string;
+      description?: string | null;
+      icon?: string | null;
+      defaultAgentId?: string | null;
+    };
+  }): Promise<void> {
+    try {
+      await db
+        .update(schema.projectsTable)
+        .set({ ...params.fields, updatedAt: new Date() })
+        .where(
+          and(
+            eq(schema.projectsTable.id, params.id),
+            notDeleted(schema.projectsTable),
+          ),
+        );
+    } catch (error) {
+      if (isUniqueViolation(error) && params.fields.name !== undefined) {
+        throw new ProjectNameExistsError(params.fields.name);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Unpin an agent from every project that named it as their default.
+   *
+   * Agents soft-delete, so the column's `ON DELETE SET NULL` never fires and
+   * the pin would outlive the agent — invisible on reads, but restoring the
+   * agent would silently re-pin those projects. Deliberately includes
+   * soft-deleted projects, whose pins would come back with them.
+   */
+  static async clearDefaultAgent(agentId: string): Promise<void> {
+    await db
+      .update(schema.projectsTable)
+      .set({ defaultAgentId: null, updatedAt: new Date() })
+      .where(eq(schema.projectsTable.defaultAgentId, agentId));
+  }
+
+  /**
+   * Soft delete: the project row is stamped `deleted_at` (hidden from every
+   * read here, its display name freed by the partial unique index) so an
+   * operator can {@link restore} it later — bringing back the share config,
+   * pins, files, and scheduled tasks that all stay attached to the retained
+   * row.
+   *
+   * What the project OWNED is RETAINED, not removed. Its files and schedules
+   * keep pointing at the retained row and are hidden behind the live-project
+   * guard (file access resolves the project via {@link findById}, which excludes
+   * soft-deleted rows; schedules pause via {@link belongsToLiveProject}). Nothing
+   * is purged, so a restore recovers them intact.
+   *
+   * User-started chats and execution sessions DETACH (`project_id` → NULL) and
+   * survive as ordinary sessions, matching `ON DELETE SET NULL`. Left attached
+   * they would keep rendering the deleted project's name and icon. Detach is
+   * one-way: a restore does not re-adopt them. Done in one transaction with the
+   * soft-delete so the two never diverge.
+   */
+  static async delete(id: string): Promise<void> {
+    await db.transaction(async (tx) => {
+      await tx
+        .update(schema.conversationsTable)
+        .set({ projectId: null })
+        .where(eq(schema.conversationsTable.projectId, id));
+      await tx
+        .update(schema.agentRunsTable)
+        .set({ projectId: null })
+        .where(eq(schema.agentRunsTable.projectId, id));
+      await softDelete(
+        tx,
+        schema.projectsTable,
+        eq(schema.projectsTable.id, id),
+      );
+    });
+  }
+
+  /**
+   * Restore a soft-deleted project: clears `deleted_at` so the row (and its
+   * retained files and schedules) is visible again. Org-scoped so an admin can
+   * never restore across tenants. Returns false if no soft-deleted row with
+   * that id exists in the org (already active, wrong org, or absent).
+   *
+   * Three things ride the same transaction:
+   *   - The optional rename. The `(user_id, name)` index is partial on
+   *     `deleted_at IS NULL`, so while the row is deleted it holds NO entry in
+   *     that index and `newName` cannot collide — which is exactly why the
+   *     rename must land BEFORE `deleted_at` is cleared. It is the caller's
+   *     remedy when the display name was re-taken during the deleted window.
+   *   - The name-collision guard. Clearing `deleted_at` re-enters the row into
+   *     that index under its effective name, so the UPDATE itself can raise a
+   *     unique violation — mapped to {@link ProjectNameExistsError} here,
+   *     inside the tx, which is TOCTOU-safe where a pre-check `SELECT` would
+   *     not be.
+   *   - The forward-only schedule bump. While deleted, each trigger's
+   *     `last_executed_at` froze, so `nextRun()` would resolve to a slot that
+   *     passed during the deleted window and fire once on restore. Bumping every
+   *     restored trigger's baseline to `now` lands the next run in the future —
+   *     no catch-up burst.
+   *
+   * The slug is deliberately untouched by `newName`, matching {@link update}:
+   * a rename never re-slugs, so the restored project keeps its own folder.
+   */
+  static async restore(params: {
+    id: string;
+    organizationId: string;
+    /** The retained row's name, only for the {@link ProjectNameExistsError}. */
+    name: string;
+    /** Rename on the way back, to clear a name taken while it was deleted. */
+    newName?: string;
+  }): Promise<boolean> {
+    try {
+      return await db.transaction(async (tx) => {
+        if (params.newName !== undefined) {
+          await tx
+            .update(schema.projectsTable)
+            .set({ name: params.newName, updatedAt: new Date() })
+            .where(
+              and(
+                eq(schema.projectsTable.id, params.id),
+                eq(schema.projectsTable.organizationId, params.organizationId),
+                isNotNull(schema.projectsTable.deletedAt),
+              ),
+            );
+        }
+        const count = await restoreRows(
+          tx,
+          schema.projectsTable,
+          and(
+            eq(schema.projectsTable.id, params.id),
+            eq(schema.projectsTable.organizationId, params.organizationId),
+          ),
+        );
+        if (count === 0) return false;
+        await tx
+          .update(schema.scheduleTriggersTable)
+          .set({ lastExecutedAt: new Date() })
+          .where(eq(schema.scheduleTriggersTable.projectId, params.id));
+        return true;
+      });
+    } catch (error) {
+      if (isUniqueViolation(error)) {
+        throw new ProjectNameExistsError(params.newName ?? params.name);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Fetch a SOFT-DELETED project by id, scoped to its org. The oversight/restore
+   * counterpart to {@link findById} (which excludes soft-deleted rows). Always
+   * org-scoped — never accept an id alone, or an admin could reach another
+   * tenant's deleted project.
+   */
+  static async findDeletedByIdForOrganization(params: {
+    id: string;
+    organizationId: string;
+  }): Promise<Project | null> {
+    const [row] = await db
+      .select()
+      .from(schema.projectsTable)
+      .where(
+        and(
+          eq(schema.projectsTable.id, params.id),
+          eq(schema.projectsTable.organizationId, params.organizationId),
+          isNotNull(schema.projectsTable.deletedAt),
+        ),
+      );
+    return row ?? null;
+  }
+
+  /**
+   * Take a row lock on a SOFT-DELETED project, or return null if there isn't
+   * one. This is what makes restore win a race with permanent deletion: a
+   * concurrent restore either commits first, in which case `deleted_at` is
+   * already NULL and this finds nothing, or it blocks on the lock until the
+   * purge commits and then finds no row at all. Either way exactly one of the
+   * two takes effect, and the caller answers 404.
+   *
+   * Runs on the caller's transaction so the lock, the byte capture, and the
+   * delete are one unit — a lock released before the delete would be no lock.
+   */
+  static async lockIfDeleted(
+    tx: Transaction,
+    params: { id: string; organizationId: string },
+  ): Promise<{ id: string } | null> {
+    const [row] = await tx
+      .select({ id: schema.projectsTable.id })
+      .from(schema.projectsTable)
+      .where(
+        and(
+          eq(schema.projectsTable.id, params.id),
+          eq(schema.projectsTable.organizationId, params.organizationId),
+          isNotNull(schema.projectsTable.deletedAt),
+        ),
+      )
+      .for("update")
+      .limit(1);
+    return row ?? null;
+  }
+
+  /**
+   * Physically delete a project already locked by {@link lockIfDeleted}. The
+   * cascade takes its files, pins, share config, and scheduled tasks (with
+   * their runs); its chats detached at soft-delete time and are unaffected.
+   * Externally-stored file bytes are NOT covered — capture them before this
+   * runs and delete them after it (see `fileStore.captureProjectFileBytes`).
+   */
+  static async hardDeleteLocked(tx: Transaction, id: string): Promise<void> {
+    await hardDelete(tx, schema.projectsTable, eq(schema.projectsTable.id, id));
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    await ResourcePermissionPolicyModel.deleteForTarget({
+      tx,
+      resources: ["project"],
+      scope: id,
+    });
+    // SPDX-SnippetEnd
+  }
+
+  /**
+   * Identity of a project for the audit trail, and nothing else. The
+   * permanent-delete route uses this rather than {@link findByIdForAudit}: a
+   * purge is audited by identity only, never by keeping a copy of what it
+   * destroyed. Soft-deleted rows are included — the purge target is always one.
+   */
+  static async findIdentityForAudit(
+    id: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [row] = await db
+      .select({
+        id: schema.projectsTable.id,
+        name: schema.projectsTable.name,
+      })
+      .from(schema.projectsTable)
+      .where(
+        and(
+          eq(schema.projectsTable.id, id),
+          eq(schema.projectsTable.organizationId, organizationId),
+        ),
+      )
+      .limit(1);
+    return row ?? null;
+  }
+
+  /**
+   * The projects a bulk route was asked to act on, fenced to one organization
+   * and read in one query. Ids arrive straight from a request body, so the
+   * fence is what stops a foreign id being answered as anything but "not
+   * found". Soft-deleted rows are excluded, as the single-project reads
+   * exclude them.
+   */
+  static async findForBulk(params: {
+    ids: string[];
+    organizationId: string;
+  }): Promise<Array<{ id: string; name: string }>> {
+    const { ids, organizationId } = params;
+    if (ids.length === 0) {
+      return [];
+    }
+    return await db
+      .select({
+        id: schema.projectsTable.id,
+        name: schema.projectsTable.name,
+      })
+      .from(schema.projectsTable)
+      .where(
+        and(
+          eq(schema.projectsTable.organizationId, organizationId),
+          inArray(schema.projectsTable.id, ids),
+          isNull(schema.projectsTable.deletedAt),
+        ),
+      );
+  }
+
+  /**
+   * Ids, names, share visibility and deletion state for a bulk route's audit
+   * record, on both sides of the write — much narrower than
+   * {@link findByIdForAudit} so it stays cheap for hundreds of rows. Deleted
+   * rows are included so a bulk delete's "after" side still names what it
+   * removed.
+   */
+  static async findVisibilityForBulkAudit(params: {
+    ids: string[];
+    organizationId: string;
+  }): Promise<
+    Array<{
+      id: string;
+      name: string;
+      visibility: string | null;
+      deleted: boolean;
+    }>
+  > {
+    const { ids, organizationId } = params;
+    if (ids.length === 0) {
+      return [];
+    }
+    const rows = await db
+      .select({
+        id: schema.projectsTable.id,
+        name: schema.projectsTable.name,
+        organizationId: schema.projectsTable.organizationId,
+        userId: schema.projectsTable.userId,
+        deletedAt: schema.projectsTable.deletedAt,
+      })
+      .from(schema.projectsTable)
+      .where(
+        and(
+          eq(schema.projectsTable.organizationId, organizationId),
+          inArray(schema.projectsTable.id, ids),
+        ),
+      )
+      // Sorted so an unchanged batch snapshots identically on both sides.
+      .orderBy(schema.projectsTable.id);
+
+    const audiences = await ProjectAccessModel.getAudiences(rows);
+    return rows.map(({ id, name, deletedAt }) => ({
+      id,
+      name,
+      visibility: audiences.get(id)?.visibility ?? null,
+      deleted: deletedAt !== null,
+    }));
+  }
+
+  /**
+   * Audit snapshot: the project row plus who it is shared with and which apps
+   * are linked into it, org-scoped.
+   *
+   * Deliberately NOT filtered by `deleted_at` — delete and restore are the two
+   * lifecycle events that most need an audit trail, and both would diff against
+   * an empty snapshot on one side if soft-deleted rows were excluded. The
+   * audience is read from the project's permission policy; its id lists are
+   * sorted so an unchanged audience never reads as a change.
+   */
+  static async findByIdForAudit(
+    id: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [row] = await db
+      .select()
+      .from(schema.projectsTable)
+      .where(
+        and(
+          eq(schema.projectsTable.id, id),
+          eq(schema.projectsTable.organizationId, organizationId),
+        ),
+      )
+      .limit(1);
+    if (!row) return null;
+
+    const [audience, labels, appIds] = await Promise.all([
+      ProjectAccessModel.findAudience(row),
+      ProjectLabelModel.getLabelsFor(id),
+      ProjectAppModel.listAppIds(id),
+    ]);
+    return {
+      ...row,
+      visibility: audience.visibility,
+      shareTeamIds: audience.teams.map((team) => team.id).sort(),
+      shareUserIds: audience.users.map((user) => user.id).sort(),
+      labels: labels.map(({ key, value }) => `${key}:${value}`).sort(),
+      appIds,
+    };
+  }
+
+  /** Conversation counts for a set of projects, in one grouped query. */
+  /**
+   * Icons for a page of projects, keyed by id. Kept out of the list's
+   * candidate query because an image icon is a data URL of up to ~1 MB.
+   */
+  static async getIcons(projectIds: string[]): Promise<Map<string, string>> {
+    if (projectIds.length === 0) return new Map();
+    const rows = await db
+      .select({ id: schema.projectsTable.id, icon: schema.projectsTable.icon })
+      .from(schema.projectsTable)
+      .where(inArray(schema.projectsTable.id, projectIds));
+    const icons = new Map<string, string>();
+    for (const row of rows) if (row.icon !== null) icons.set(row.id, row.icon);
+    return icons;
+  }
+
+  static async countConversations(
+    projectIds: string[],
+  ): Promise<Map<string, number>> {
+    if (projectIds.length === 0) return new Map();
+    const rows = await db
+      .select({
+        projectId: schema.conversationsTable.projectId,
+        count: sql<number>`count(*)::int`,
+      })
+      .from(schema.conversationsTable)
+      .where(
+        and(
+          notDeletedConversation,
+          inArray(schema.conversationsTable.projectId, projectIds),
+        ),
+      )
+      .groupBy(schema.conversationsTable.projectId);
+    const map = new Map<string, number>();
+    for (const r of rows) {
+      if (r.projectId) map.set(r.projectId, r.count);
+    }
+    return map;
+  }
+
+  /** All chats of one project, newest activity first, with author names. */
+  static async listConversations(
+    projectId: string,
+    // When set, restricts the result to chats authored by this user. The
+    // service passes it for callers lacking `read` on every chat, so the filter
+    // runs in SQL instead of pulling every project chat into memory.
+    authorUserId?: string,
+  ): Promise<
+    {
+      id: string;
+      title: string | null;
+      authorUserId: string;
+      authorName: string | null;
+      origin: ConversationOrigin;
+      lastMessageAt: Date;
+      createdAt: Date;
+      // The schedule + run that produced a `schedule_trigger` chat (null for
+      // user chats); lets the chat list collapse a schedule's runs into one row
+      // and open the latest run with its sidebar runs navigator.
+      scheduleTriggerId: string | null;
+      scheduleRunId: string | null;
+      // The schedule's display name, shown on a collapsed scheduled chat row.
+      scheduleName: string | null;
+    }[]
+  > {
+    return (
+      db
+        .select({
+          id: schema.conversationsTable.id,
+          title: schema.conversationsTable.title,
+          authorUserId: schema.conversationsTable.userId,
+          authorName: schema.usersTable.name,
+          origin: schema.conversationsTable.origin,
+          lastMessageAt: schema.conversationsTable.lastMessageAt,
+          createdAt: schema.conversationsTable.createdAt,
+          scheduleTriggerId: schema.scheduleTriggerRunsTable.triggerId,
+          scheduleRunId: schema.scheduleTriggerRunsTable.id,
+          scheduleName: schema.scheduleTriggersTable.name,
+        })
+        .from(schema.conversationsTable)
+        .leftJoin(
+          schema.usersTable,
+          eq(schema.conversationsTable.userId, schema.usersTable.id),
+        )
+        // 1:1 — a conversation is linked by at most one run (CAS-set), so this
+        // never fans out conversation rows.
+        .leftJoin(
+          schema.scheduleTriggerRunsTable,
+          eq(
+            schema.scheduleTriggerRunsTable.chatConversationId,
+            schema.conversationsTable.id,
+          ),
+        )
+        .leftJoin(
+          schema.scheduleTriggersTable,
+          eq(
+            schema.scheduleTriggersTable.id,
+            schema.scheduleTriggerRunsTable.triggerId,
+          ),
+        )
+        .where(
+          and(
+            notDeletedConversation,
+            eq(schema.conversationsTable.projectId, projectId),
+            authorUserId
+              ? eq(schema.conversationsTable.userId, authorUserId)
+              : undefined,
+          ),
+        )
+        .orderBy(desc(schema.conversationsTable.lastMessageAt))
+    );
+  }
+
+  // === internal ===
+
+  /**
+   * A URL-safe slug for the project's filesystem folder, unique within the org.
+   * Derived from the name; on a base-slug collision a short random suffix keeps
+   * it distinct (the unique index is the final guard against a create race).
+   * Soft-deleted rows deliberately count as collisions: the retained row keeps
+   * its slug so a `restore()` lands on the same folder, which means a recreated
+   * same-named project must get a fresh folder of its own.
+   */
+  private static async generateUniqueSlug(params: {
+    name: string;
+    organizationId: string;
+  }): Promise<string> {
+    const baseSlug = urlSlugify(params.name) || "project";
+    const [existing] = await db
+      .select({ id: schema.projectsTable.id })
+      .from(schema.projectsTable)
+      .where(
+        and(
+          eq(schema.projectsTable.organizationId, params.organizationId),
+          eq(schema.projectsTable.slug, baseSlug),
+        ),
+      )
+      .limit(1);
+    return existing ? `${baseSlug}-${randomUUID().slice(0, 6)}` : baseSlug;
+  }
+}
+
+export default ProjectModel;
+
+/**
+ * SQL predicate for tables with a `project_id` FK: the row is project-less, or
+ * its project is live (not soft-deleted). The single guard that pauses/hides
+ * what a soft-deleted project owns while the rows stay attached for a restore.
+ * Push it into the SQL `WHERE` (never a post-fetch JS filter), so retained rows
+ * are excluded at the database and never accumulate in an in-process scan.
+ */
+export function belongsToLiveProject(projectIdColumn: AnyPgColumn): SQL {
+  return sql`(
+    ${projectIdColumn} IS NULL
+    OR EXISTS (
+      SELECT 1 FROM ${schema.projectsTable}
+      WHERE ${schema.projectsTable.id} = ${projectIdColumn}
+        AND ${schema.projectsTable.deletedAt} IS NULL
+    )
+  )`;
+}
+
+/** The user already has a project with this name. */
+export class ProjectNameExistsError extends Error {
+  constructor(name: string) {
+    super(`a project named "${name}" already exists`);
+    this.name = "ProjectNameExistsError";
+  }
+}
+
+/** The conversation does not exist or is not owned by the caller. */
+export class ConversationNotOwnedError extends Error {
+  constructor() {
+    super("conversation not found");
+    this.name = "ConversationNotOwnedError";
+  }
+}
+
+/** The conversation is already part of a project, so it can't seed a new one. */
+export class ProjectAlreadyAssignedError extends Error {
+  constructor() {
+    super("conversation already belongs to a project");
+    this.name = "ProjectAlreadyAssignedError";
+  }
+}
+
+// === internal ===
+
+/** Postgres unique_violation, as surfaced by pg and PGlite drivers. */
+function isUniqueViolation(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const code = (error as { code?: string }).code;
+  const cause = (error as { cause?: { code?: string } }).cause;
+  return code === "23505" || cause?.code === "23505";
+}

@@ -23,6 +23,7 @@ import {
   MCP_SERVER_JWKS_DOCKER_IMAGE,
   MCP_SERVER_JWKS_EXTERNAL_URL,
   MCP_SERVER_TOOL_NAME_SEPARATOR,
+  ORGANIZATION_USE_GRANT,
   SSO_DOMAIN,
 } from "../consts";
 import {
@@ -32,10 +33,11 @@ import {
 } from "../utils";
 import {
   callMcpTool,
+  getOrgTokenForProfile,
   initializeMcpSession,
-  listMcpTools,
   makeApiRequest,
   waitForGatewayIdentityProviderReady,
+  waitForMcpGatewayJwtReady,
 } from "../utils/mcp-gateway";
 import { expect, test } from "./api-fixtures";
 
@@ -56,7 +58,7 @@ test.describe("MCP Gateway - JWT Propagation to Upstream MCP Server", () => {
     uninstallMcpServer,
     waitForAgentTool,
   }) => {
-    test.slow();
+    test.setTimeout(300_000);
 
     // STEP 1: Verify the upstream MCP server is healthy
     await waitForApiEndpointHealthy({
@@ -93,7 +95,6 @@ test.describe("MCP Gateway - JWT Propagation to Upstream MCP Server", () => {
       const agentResponse = await createAgent(
         request,
         `JWT Propagation E2E ${Date.now()}`,
-        "personal",
       );
       const agent = await agentResponse.json();
       profileId = agent.id;
@@ -151,11 +152,12 @@ test.describe("MCP Gateway - JWT Propagation to Upstream MCP Server", () => {
       expect(agentTool).toBeDefined();
 
       // STEP 8: Wait for the external JWT gateway auth path to be ready.
-      const tools = await waitForExternalJwtGatewayTools({
+      const tools = await waitForMcpGatewayJwtReady({
         request,
         profileId: pid,
         token: jwt,
         expectedToolName: getServerInfoToolName,
+        identityProviderId,
       });
       const toolNames = tools.map((t) => t.name);
       expect(toolNames).toContain(getServerInfoToolName);
@@ -229,7 +231,7 @@ test.describe("MCP Gateway - JWT Propagation to Upstream MCP Server", () => {
     uninstallMcpServer,
     waitForAgentTool,
   }) => {
-    test.slow();
+    test.setTimeout(300_000);
 
     // Verify the upstream MCP server is healthy
     await waitForApiEndpointHealthy({
@@ -262,10 +264,12 @@ test.describe("MCP Gateway - JWT Propagation to Upstream MCP Server", () => {
 
     try {
       // Create MCP Gateway WITHOUT IdP (so archestra token is used, not JWT)
+      // The organization token reaches only gateways the organization may use.
       const agentResponse = await createAgent(
         request,
         `JWT Reject E2E ${Date.now()}`,
-        "personal",
+        undefined,
+        [ORGANIZATION_USE_GRANT],
       );
       const agent = await agentResponse.json();
       profileId = agent.id;
@@ -308,21 +312,7 @@ test.describe("MCP Gateway - JWT Propagation to Upstream MCP Server", () => {
       });
 
       // Get org token (not a Keycloak JWT)
-      const tokensResponse = await makeApiRequest({
-        request,
-        method: "get",
-        urlSuffix: "/api/tokens",
-      });
-      const tokensData = await tokensResponse.json();
-      const orgToken = tokensData.tokens.find(
-        (t: { isOrganizationToken: boolean }) => t.isOrganizationToken,
-      );
-      const tokenValueResponse = await makeApiRequest({
-        request,
-        method: "get",
-        urlSuffix: `/api/tokens/${orgToken.id}/value`,
-      });
-      const { value: archestraToken } = await tokenValueResponse.json();
+      const archestraToken = await getOrgTokenForProfile(request);
 
       // Initialize session with archestra token (this works - gateway accepts it)
       await initializeMcpSession(request, {
@@ -369,11 +359,13 @@ test.describe("MCP Gateway - JWT Propagation to Upstream MCP Server", () => {
     deleteIdentityProvider,
     createMcpCatalogItem,
     deleteMcpCatalogItem,
+    createEnvironment,
+    deleteEnvironment,
     installMcpServer,
     uninstallMcpServer,
     waitForAgentTool,
   }) => {
-    test.slow();
+    test.setTimeout(300_000);
 
     // STEP 1: Get a JWT from Keycloak
     const jwt = await getKeycloakJwt();
@@ -391,20 +383,45 @@ test.describe("MCP Gateway - JWT Propagation to Upstream MCP Server", () => {
     let profileId: string | undefined;
     let catalogId: string | undefined;
     let serverId: string | undefined;
+    let environmentId: string | undefined;
     const catalogName = `jwks-local-k8s-test-${Date.now()}`;
 
     try {
-      // STEP 3: Create an MCP Gateway profile linked to the IdP
+      // STEP 3: Create a restricted environment and place BOTH the gateway and
+      // the server in it. Two constraints intersect:
+      //  - Egress: the always-on floor (unrestricted/built-in default) blocks the
+      //    reserved/private ranges for SSRF, so a server that must reach a private
+      //    in-cluster IdP needs an explicit `restricted` allowlist (the product's
+      //    intended mechanism; in production the IdP is external and the floor
+      //    allows it). The allowlist is the kind CI cluster's default Pod + Service
+      //    CIDRs — the pod hits Keycloak's Service ClusterIP, which kube-proxy
+      //    DNATs to the backing pod IP before the NetworkPolicy egress check (see
+      //    ssrf-protection.spec), so the Pod CIDR (10.244.0.0/16) is what actually
+      //    has to match; the Service CIDR is included for robustness.
+      //  - Environment isolation: a gateway only sees tools whose server shares its
+      //    environment, so the gateway must join this env too — otherwise its JWT
+      //    tool list is empty and the propagation call finds no tool.
+      const environmentResponse = await createEnvironment(request, {
+        name: `jwt-prop-egress-${Date.now()}`,
+        networkPolicy: {
+          egressMode: "restricted",
+          domainPreset: "none",
+          allowedDomains: [],
+          allowedCidrs: ["10.244.0.0/16", "10.96.0.0/16"],
+        },
+      });
+      environmentId = (await environmentResponse.json()).id;
+
+      // STEP 4: Create an MCP Gateway profile in that environment, linked to the IdP.
       const agentResponse = await createAgent(
         request,
         `JWT Local K8s E2E ${Date.now()}`,
-        "personal",
       );
       const agent = await agentResponse.json();
       profileId = agent.id;
       const pid = profileId as string;
 
-      // Update to MCP Gateway type and link the IdP
+      // Update to MCP Gateway type, link the IdP, and join the server's environment.
       await makeApiRequest({
         request,
         method: "put",
@@ -412,6 +429,7 @@ test.describe("MCP Gateway - JWT Propagation to Upstream MCP Server", () => {
         data: {
           agentType: "mcp_gateway",
           identityProviderId,
+          environmentId,
         },
       });
       await waitForGatewayIdentityProviderReady({
@@ -421,7 +439,8 @@ test.describe("MCP Gateway - JWT Propagation to Upstream MCP Server", () => {
         agentType: "mcp_gateway",
       });
 
-      // STEP 4: Register the JWKS MCP server as a LOCAL catalog item
+      // STEP 4b: Register the JWKS MCP server as a LOCAL catalog item, bound to
+      // the environment above so its pod inherits the Keycloak allowlist.
       // Uses the same Docker image as the Helm-deployed instance but runs
       // as a K8s-orchestrated server via streamable-http transport.
       const catalogResponse = await createMcpCatalogItem(request, {
@@ -429,6 +448,7 @@ test.describe("MCP Gateway - JWT Propagation to Upstream MCP Server", () => {
         description:
           "E2E test: Local K8s JWKS MCP server for JWT propagation testing",
         serverType: "local",
+        environmentId,
         localConfig: {
           dockerImage: MCP_SERVER_JWKS_DOCKER_IMAGE,
           transportType: "streamable-http",
@@ -500,11 +520,12 @@ test.describe("MCP Gateway - JWT Propagation to Upstream MCP Server", () => {
       expect(agentTool).toBeDefined();
 
       // STEP 8: Wait for the external JWT gateway auth path to be ready.
-      const tools = await waitForExternalJwtGatewayTools({
+      const tools = await waitForMcpGatewayJwtReady({
         request,
         profileId: pid,
         token: jwt,
         expectedToolName: getServerInfoToolName,
+        identityProviderId,
       });
       const toolNames = tools.map((t) => t.name);
       expect(toolNames).toContain(getServerInfoToolName);
@@ -563,47 +584,11 @@ test.describe("MCP Gateway - JWT Propagation to Upstream MCP Server", () => {
       if (catalogId) {
         await deleteMcpCatalogItem(request, catalogId);
       }
+      // Delete the environment after the catalog item that references it.
+      if (environmentId) {
+        await deleteEnvironment(request, environmentId);
+      }
       await deleteIdentityProvider(request, identityProviderId);
     }
   });
 });
-
-async function waitForExternalJwtGatewayTools(params: {
-  request: Parameters<typeof initializeMcpSession>[0];
-  profileId: string;
-  token: string;
-  expectedToolName: string;
-}) {
-  let lastError: unknown;
-
-  for (const delayMs of [
-    0, 500, 1000, 2000, 4000, 8000, 8000, 8000, 8000, 8000,
-  ]) {
-    if (delayMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
-
-    try {
-      await initializeMcpSession(params.request, {
-        profileId: params.profileId,
-        token: params.token,
-      });
-
-      const tools = await listMcpTools(params.request, {
-        profileId: params.profileId,
-        token: params.token,
-      });
-
-      if (tools.some((tool) => tool.name === params.expectedToolName)) {
-        return tools;
-      }
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw (
-    lastError ??
-    new Error(`Tool ${params.expectedToolName} was not available via JWT auth`)
-  );
-}

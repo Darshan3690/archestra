@@ -2,35 +2,46 @@
  * biome-ignore-all lint/correctness/noEmptyPattern: oddly enough in extend below this is required
  * see https://vitest.dev/guide/test-context.html#extend-test-context
  */
-import {
-  ARCHESTRA_MCP_CATALOG_ID,
-  DEFAULT_APP_NAME,
-  MEMBER_ROLE_NAME,
-  type SupportedProvider,
-} from "@shared";
+import type { SupportedProvider } from "@archestra/shared";
+import { ARCHESTRA_MCP_CATALOG_ID } from "@archestra/shared/archestra-mcp-server";
+import { DEFAULT_APP_NAME } from "@archestra/shared/consts";
+import { MEMBER_ROLE_NAME } from "@archestra/shared/roles";
+import { and, eq, ne } from "drizzle-orm";
 import { beforeEach as baseBeforeEach, test as baseTest } from "vitest";
 import db, { schema } from "@/database";
-import {
-  AgentModel,
-  AgentToolModel,
-  InternalMcpCatalogModel,
-  LlmProviderApiKeyModel,
-  ScheduleTriggerModel,
-  ScheduleTriggerRunModel,
-  SecretModel,
-  SessionModel,
-  TeamModel,
-  ToolInvocationPolicyModel,
-  ToolModel,
-  TrustedDataPolicyModel,
-  VirtualApiKeyModel,
-} from "@/models";
+import AgentModel from "@/models/agent";
+import AgentToolModel from "@/models/agent-tool";
+import AgentUsageModel from "@/models/agent-usage";
+import AppModel from "@/models/app";
+import AppDataModel from "@/models/app-data";
+import AppToolModel from "@/models/app-tool";
+import AppVersionModel from "@/models/app-version";
+import InternalMcpCatalogModel from "@/models/internal-mcp-catalog";
+import KnowledgeBaseModel from "@/models/knowledge-base";
+import KnowledgeBaseConnectorModel from "@/models/knowledge-base-connector";
+import LlmProviderApiKeyModel from "@/models/llm-provider-api-key";
+import MemberModel from "@/models/member";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import ScheduleTriggerModel from "@/models/schedule-trigger";
+import ScheduleTriggerRunModel from "@/models/schedule-trigger-run";
+import SecretModel from "@/models/secret";
+import ServiceAccountModel from "@/models/service-account";
+import SessionModel from "@/models/session";
+import SkillModel from "@/models/skill";
+import TeamModel from "@/models/team";
+import ToolModel from "@/models/tool";
+import VirtualApiKeyModel from "@/models/virtual-api-key";
+import { createAppBacking } from "@/services/apps/app-mcp-backing";
 import type {
   Agent,
   AgentTool,
+  App,
+  AppTool,
+  AppVersion,
   ConnectorRun,
   InsertAccount,
   InsertAgent,
+  InsertApp,
   InsertConnectorRun,
   InsertConversation,
   InsertInteraction,
@@ -39,12 +50,13 @@ import type {
   InsertKnowledgeBase,
   InsertKnowledgeBaseConnector,
   InsertLlmProviderApiKey,
-  InsertMcpServer,
   InsertMember,
   InsertOrganization,
   InsertOrganizationRole,
   InsertScheduleTrigger,
   InsertSession,
+  InsertSkill,
+  InsertSkillFile,
   InsertTeam,
   InsertUser,
   InsertVirtualApiKey,
@@ -53,21 +65,25 @@ import type {
   OrganizationRole,
   ScheduleTrigger,
   ScheduleTriggerRun,
+  Skill,
   TeamMember,
   Tool,
-  ToolInvocation,
-  TrustedData,
 } from "@/types";
+import { accessGrants, type TestAccess } from "./access-grants";
+import { type LegacySharing, seedLegacySharing } from "./legacy-sharing";
 
 type MakeUserOverrides = Partial<
-  Pick<InsertUser, "email" | "name" | "emailVerified" | "role">
+  Pick<
+    InsertUser,
+    "email" | "name" | "emailVerified" | "role" | "twoFactorEnabled"
+  >
 >;
 
 /**
  * Vitest test extension with fixtures
  * https://vitest.dev/guide/test-context.html#extend-test-context
  */
-interface TestFixtures {
+export interface TestFixtures {
   makeUser: typeof makeUser;
   makeAdmin: typeof makeAdmin;
   makeVirtualApiKey: typeof makeVirtualApiKey;
@@ -80,9 +96,12 @@ interface TestFixtures {
   makeScheduleTriggerRun: typeof makeScheduleTriggerRun;
   makeTool: typeof makeTool;
   makeAgentTool: typeof makeAgentTool;
-  makeToolPolicy: typeof makeToolPolicy;
-  makeTrustedDataPolicy: typeof makeTrustedDataPolicy;
+  makeApp: typeof makeApp;
+  makeAppVersion: typeof makeAppVersion;
+  makeAppTool: typeof makeAppTool;
+  makeAppData: typeof makeAppData;
   makeCustomRole: typeof makeCustomRole;
+  makeServiceAccount: typeof makeServiceAccount;
   makeMember: typeof makeMember;
   makeMcpServer: typeof makeMcpServer;
   makeInternalMcpCatalog: typeof makeInternalMcpCatalog;
@@ -91,17 +110,24 @@ interface TestFixtures {
   makeSession: typeof makeSession;
   makeAuthHeaders: typeof makeAuthHeaders;
   makeKnowledgeBase: typeof makeKnowledgeBase;
+  makeSkill: typeof makeSkill;
   makeKnowledgeBaseConnector: typeof makeKnowledgeBaseConnector;
   makeConnectorRun: typeof makeConnectorRun;
   makeConversation: typeof makeConversation;
   makeInteraction: typeof makeInteraction;
   makeSecret: typeof makeSecret;
+  makeServiceAccountToken: typeof makeServiceAccountToken;
   makeLlmProviderApiKey: typeof makeLlmProviderApiKey;
   makeIdentityProvider: typeof makeIdentityProvider;
   makeOAuthClient: typeof makeOAuthClient;
   makeOAuthAccessToken: typeof makeOAuthAccessToken;
   makeOAuthRefreshToken: typeof makeOAuthRefreshToken;
   seedAndAssignArchestraTools: typeof seedAndAssignArchestraTools;
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  removeObjectPolicies: typeof removeObjectPolicies;
+  // SPDX-SnippetEnd
 }
 
 async function _makeUser(
@@ -143,13 +169,13 @@ async function makeAdmin(overrides: MakeUserOverrides = {}) {
  */
 async function makeVirtualApiKey(
   organizationId: string,
-  overrides: Partial<
-    Pick<InsertVirtualApiKey, "name" | "scope" | "authorId">
-  > & {
+  overrides: Partial<Pick<InsertVirtualApiKey, "name" | "authorId">> & {
     providerApiKeys?: {
       provider: SupportedProvider;
       providerApiKeyId: string;
     }[];
+    /** Who the key is shared with; see `TestAccess`. Defaults to `"org"`. */
+    access?: TestAccess;
   } = {},
 ) {
   const result = await VirtualApiKeyModel.create({
@@ -157,9 +183,9 @@ async function makeVirtualApiKey(
     name:
       overrides.name ??
       `Test Virtual Key ${crypto.randomUUID().substring(0, 8)}`,
-    scope: overrides.scope ?? "org",
     authorId: overrides.authorId ?? null,
     providerApiKeys: overrides.providerApiKeys ?? [],
+    ...accessGrants(overrides.access ?? "org"),
   });
   return result.virtualKey;
 }
@@ -168,8 +194,24 @@ async function makeVirtualApiKey(
  * Creates a test organization in the database
  */
 async function makeOrganization(
-  overrides: Partial<Pick<InsertOrganization, "name" | "slug">> = {},
+  overrides: Partial<
+    Pick<
+      InsertOrganization,
+      | "name"
+      | "slug"
+      | "defaultEnvironmentNamespace"
+      | "defaultMemberRole"
+      | "defaultNetworkPolicy"
+      | "skillMarketplaceAnonymousAccess"
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      | "mcpIdleHibernationEnabled"
+      // SPDX-SnippetEnd
+    >
+  > & { legacyPermissions?: boolean } = {},
 ) {
+  const { legacyPermissions = false, ...organizationOverrides } = overrides;
   const orgId = crypto.randomUUID();
   const [org] = await db
     .insert(schema.organizationsTable)
@@ -178,12 +220,23 @@ async function makeOrganization(
       name: `Test Org ${orgId.substring(0, 8)}`,
       slug: `test-org-${orgId.substring(0, 8)}`,
       createdAt: new Date(),
-      limitCleanupInterval: null,
       theme: "cosmic-night",
       customFont: "lato",
-      ...overrides,
+      ...organizationOverrides,
     })
     .returning();
+  if (!legacyPermissions) {
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    await db.transaction((tx) =>
+      ResourcePermissionPolicyModel.initializeOrganization({
+        tx,
+        organizationId: org.id,
+      }),
+    );
+    // SPDX-SnippetEnd
+  }
   return org;
 }
 
@@ -193,7 +246,9 @@ async function makeOrganization(
 async function makeTeam(
   organizationId: string,
   createdBy: string,
-  overrides: Partial<Pick<InsertTeam, "name" | "description">> = {},
+  overrides: Partial<
+    Pick<InsertTeam, "name" | "description" | "parentId">
+  > = {},
 ) {
   const [team] = await db
     .insert(schema.teamsTable)
@@ -216,8 +271,15 @@ async function makeTeam(
 async function makeTeamMember(
   teamId: string,
   userId: string,
-  overrides: { role?: string; syncedFromSso?: boolean } = {},
+  overrides: { role?: "admin" | "member"; syncedFromSso?: boolean } = {},
 ): Promise<TeamMember> {
+  // Team members are organization members in the product. Keep fixtures valid
+  // now that grant resolution enforces that boundary for every principal.
+  const team = await TeamModel.findById(teamId);
+  if (!team) throw new Error("Team fixture does not exist");
+  if (!(await MemberModel.getByUserId(userId, team.organizationId))) {
+    await makeMember(userId, team.organizationId);
+  }
   return await TeamModel.addMember(
     teamId,
     userId,
@@ -226,13 +288,27 @@ async function makeTeamMember(
   );
 }
 
+type MakeAgentOverrides = Partial<
+  Omit<InsertAgent, "scope" | "teams" | "users">
+> & {
+  authorId?: string;
+  // `isPersonalGateway`, `accessAllSkills` and `slug` mirror
+  // AgentModel.create's own signature: real columns create() honours, but not
+  // part of InsertAgent.
+  isPersonalGateway?: boolean;
+  accessAllSkills?: boolean;
+  slug?: string;
+  /** Who the agent is shared with; see `TestAccess`. Defaults to `"org"`. */
+  access?: TestAccess;
+  /** Retired sharing columns, for upgrade (cutover) tests only. */
+  legacy?: LegacySharing;
+};
+
 /**
  * Creates a test agent using the Agent model.
  * Auto-creates an organization if not provided.
  */
-async function makeAgent(
-  overrides: Partial<InsertAgent> & { authorId?: string } = {},
-): Promise<Agent> {
+async function makeAgent(overrides: MakeAgentOverrides = {}): Promise<Agent> {
   // Auto-create organization if not provided
   let organizationId = overrides.organizationId;
   if (!organizationId) {
@@ -240,31 +316,36 @@ async function makeAgent(
     organizationId = org.id;
   }
 
-  const { authorId, ...agentOverrides } = overrides;
+  const { authorId, access, legacy, ...agentOverrides } = overrides;
 
   const defaults: InsertAgent = {
     name: `Test Agent ${crypto.randomUUID().substring(0, 8)}`,
     organizationId,
-    scope: "org",
+    // The retired visibility column; like the create route, it is always
+    // "personal" and nothing reads it. `access` decides who sees the agent.
+    scope: "personal",
     teams: [],
     labels: [],
     knowledgeBaseIds: [],
     connectorIds: [],
   };
-  return await AgentModel.create(
-    {
-      ...defaults,
-      ...agentOverrides,
-    },
+  const agent = await AgentModel.create(
+    { ...defaults, ...agentOverrides },
     authorId,
+    accessGrants(access ?? "org"),
   );
+  if (legacy) {
+    await seedLegacySharing({ resource: "agent", id: agent.id, legacy });
+    return (await AgentModel.findById(agent.id)) ?? agent;
+  }
+  return agent;
 }
 
 /**
  * Creates an internal test agent (with prompts/chat capabilities).
  */
 async function makeInternalAgent(
-  overrides: Partial<InsertAgent> & { authorId?: string } = {},
+  overrides: MakeAgentOverrides = {},
 ): Promise<Agent> {
   return await makeAgent({
     agentType: "agent",
@@ -343,11 +424,24 @@ async function makeScheduleTriggerRun(
  */
 async function makeTool(
   overrides: Partial<
-    Pick<Tool, "name" | "description" | "parameters" | "catalogId" | "agentId">
+    Pick<
+      Tool,
+      | "name"
+      | "rawName"
+      | "description"
+      | "parameters"
+      | "catalogId"
+      | "agentId"
+      | "meta"
+    >
   > = {},
 ): Promise<Tool> {
+  const name =
+    overrides.name ?? `test-tool-${crypto.randomUUID().substring(0, 8)}`;
   const toolData = {
-    name: `test-tool-${crypto.randomUUID().substring(0, 8)}`,
+    name,
+    // Mirror production: catalog-backed tools carry the raw upstream name.
+    rawName: ToolModel.unslugifyName(name),
     description: "Test tool description",
     parameters: {},
     ...overrides,
@@ -380,43 +474,138 @@ async function makeAgentTool(
 }
 
 /**
- * Creates a test tool invocation policy using the ToolInvocationPolicy model
+ * Creates a test app (with its version 1) via the App model. Auto-creates an
+ * organization if not provided; defaults to org scope.
  */
-async function makeToolPolicy(
+async function makeApp(
+  overrides: Partial<InsertApp> & {
+    html?: string;
+    /** Who the app is shared with; see `TestAccess`. Defaults to `"org"`. */
+    access?: TestAccess;
+    /** Retired sharing on the backing catalog, for upgrade tests only. */
+    legacy?: LegacySharing;
+    environmentId?: string | null;
+    /** Display icon; like scope and environment it lives on the backing catalog. */
+    icon?: string | null;
+  } = {},
+): Promise<App> {
+  let organizationId = overrides.organizationId;
+  if (!organizationId) {
+    const org = await makeOrganization();
+    organizationId = org.id;
+  }
+  const { html, access, legacy, environmentId, icon, ...appOverrides } =
+    overrides;
+  // Visibility/environment live on the backing catalog, so an author is needed
+  // (catalog authorId + personal-scope access checks).
+  const authorId = appOverrides.authorId ?? (await makeUser()).id;
+
+  const name =
+    appOverrides.name ?? `Test App ${crypto.randomUUID().substring(0, 8)}`;
+
+  const created = await AppModel.create({
+    ...accessGrants(access ?? "org"),
+    app: {
+      // Derived like the real create paths, so fixtures carry the slug a
+      // production app has; a test that pins one overrides it below.
+      slug: await AppModel.generateUniqueSlug({ name, organizationId }),
+      // Default to a live (enabled) app so existing tests exercise normal
+      // visibility/consumption; disabled-specific tests pass `enabled: false`.
+      enabled: true,
+      ...appOverrides,
+      name,
+      authorId,
+      organizationId,
+    },
+    payload: {
+      html: html ?? "<!doctype html><title>test app</title>",
+      uiPermissions: null,
+    },
+  });
+  await createAppBacking({
+    app: created,
+    environmentId: environmentId ?? null,
+    icon: icon ?? null,
+    userId: authorId,
+    organizationId,
+  });
+
+  if (legacy) {
+    const [backing] = await db
+      .select({ catalogId: schema.mcpServersTable.catalogId })
+      .from(schema.mcpServersTable)
+      .innerJoin(
+        schema.appsTable,
+        eq(schema.appsTable.mcpServerId, schema.mcpServersTable.id),
+      )
+      .where(eq(schema.appsTable.id, created.id));
+    if (backing?.catalogId) {
+      await seedLegacySharing({
+        resource: "mcpCatalog",
+        id: backing.catalogId,
+        legacy,
+      });
+    }
+  }
+
+  const app = await AppModel.findById(created.id);
+  if (!app) throw new Error("makeApp: failed to load created app");
+  return app;
+}
+
+/** Forks a new app version (changing the html) and returns the new head version. */
+async function makeAppVersion(
+  appId: string,
+  html?: string,
+): Promise<AppVersion> {
+  const app = await AppModel.update({
+    id: appId,
+    version: {
+      html:
+        html ??
+        `<!doctype html><title>v ${crypto.randomUUID().substring(0, 8)}</title>`,
+      uiPermissions: null,
+    },
+  });
+  if (!app) throw new Error("makeAppVersion: app not found");
+  const head = await AppVersionModel.findByAppAndVersion(
+    appId,
+    app.latestVersion,
+  );
+  if (!head) throw new Error("makeAppVersion: head version missing");
+  return head;
+}
+
+/** Attaches a tool to an app via the AppTool model. */
+async function makeAppTool(
+  appId: string,
   toolId: string,
   overrides: Partial<
-    Pick<
-      ToolInvocation.ToolInvocationPolicy,
-      "conditions" | "action" | "reason"
-    >
+    Pick<AppTool, "mcpServerId" | "credentialResolutionMode">
   > = {},
-): Promise<ToolInvocation.ToolInvocationPolicy> {
-  return await ToolInvocationPolicyModel.create({
-    toolId,
-    conditions: [{ key: "test-arg", operator: "equal", value: "test-value" }],
-    action: "block_always",
-    reason: "Test policy reason",
-    ...overrides,
+) {
+  return await AppToolModel.create(appId, toolId, {
+    mcpServerId: overrides.mcpServerId,
+    credentialResolutionMode: overrides.credentialResolutionMode,
   });
 }
 
-/**
- * Creates a test trusted data policy using the TrustedDataPolicy model
- * Returns the created policy
- */
-async function makeTrustedDataPolicy(
-  toolId: string,
-  overrides: Partial<
-    Pick<TrustedData.TrustedDataPolicy, "description" | "conditions" | "action">
-  > = {},
-): Promise<TrustedData.TrustedDataPolicy> {
-  return await TrustedDataPolicyModel.create({
-    toolId,
-    description: overrides.description ?? "Test trusted data policy",
-    conditions: overrides.conditions ?? [
-      { key: "test.path", operator: "equal", value: "test-value" },
-    ],
-    action: overrides.action ?? "mark_as_trusted",
+/** Writes an App Data Store entry (shared partition unless a userId is given). */
+async function makeAppData(
+  appId: string,
+  key: string,
+  value: unknown,
+  userId: string | null = null,
+) {
+  return await AppDataModel.set({
+    appId,
+    userId,
+    key,
+    value,
+    // Fixtures write collaborative (unowned) data; override keeps any future
+    // ownership check a no-op and callerUserId is otherwise unused here.
+    callerUserId: userId ?? "fixture",
+    callerCanOverrideOwner: true,
   });
 }
 
@@ -426,9 +615,14 @@ async function makeTrustedDataPolicy(
  */
 async function makeCustomRole(
   organizationId: string,
-  overrides: Partial<
-    Pick<InsertOrganizationRole, "role" | "name" | "permission">
-  > = {},
+  overrides: Partial<Pick<InsertOrganizationRole, "role" | "name">> & {
+    /**
+     * Stored as-is. A role saved before an action was retired can still carry
+     * it in its stored JSON, so this accepts any action name, not only the
+     * current vocabulary.
+     */
+    permission?: Record<string, string[]>;
+  } = {},
 ): Promise<OrganizationRole> {
   const roleName = `test_role_${crypto.randomUUID().substring(0, 8)}`;
   const roleData = {
@@ -457,12 +651,39 @@ async function makeCustomRole(
 }
 
 /**
+ * Creates a service account. Inserted directly rather than through the model
+ * so a test can seed one for a deployment that has not converted yet, where
+ * the model would also write an access policy.
+ */
+async function makeServiceAccount(
+  organizationId: string,
+  overrides: Partial<{
+    name: string;
+    role: string;
+    disabled: boolean;
+    teamId: string | null;
+    createdBy: string | null;
+  }> = {},
+) {
+  const [result] = await db
+    .insert(schema.serviceAccountsTable)
+    .values({
+      organizationId,
+      name: `test-service-account-${crypto.randomUUID().substring(0, 8)}`,
+      role: MEMBER_ROLE_NAME,
+      ...overrides,
+    })
+    .returning();
+  return result;
+}
+
+/**
  * Creates a test member relationship between user and organization
  */
 async function makeMember(
   userId: string,
   organizationId: string,
-  overrides: Partial<Pick<InsertMember, "role">> = {},
+  overrides: Partial<Pick<InsertMember, "role" | "createdAt">> = {},
 ) {
   const [member] = await db
     .insert(schema.membersTable)
@@ -482,8 +703,25 @@ async function makeMember(
  * Creates a test MCP server in the database
  */
 async function makeMcpServer(
+  // Typed against the raw Drizzle insert shape, not the API-validated
+  // `InsertMcpServer` — this fixture writes directly via `db.insert`, and
+  // `oauthRefreshError` (server-owned state) is intentionally excluded from
+  // the API-facing insert schema.
   overrides: Partial<
-    Pick<InsertMcpServer, "name" | "catalogId" | "ownerId" | "teamId" | "scope">
+    Pick<
+      typeof schema.mcpServersTable.$inferInsert,
+      | "name"
+      | "catalogId"
+      | "ownerId"
+      | "teamId"
+      | "scope"
+      | "serverType"
+      | "secretId"
+      | "localInstallationStatus"
+      | "oauthRefreshError"
+      | "deploymentName"
+      | "deletedAt"
+    >
   > = {},
 ) {
   // Create a catalog if catalogId is not provided
@@ -521,6 +759,7 @@ async function makeInternalMcpCatalog(
       InsertInternalMcpCatalog,
       | "id"
       | "name"
+      | "icon"
       | "serverType"
       | "serverUrl"
       | "description"
@@ -531,39 +770,58 @@ async function makeInternalMcpCatalog(
       | "authDescription"
       | "authFields"
       | "localConfig"
+      | "desktopConfig"
+      | "localConfigSecretId"
       | "userConfig"
       | "oauthConfig"
       | "enterpriseManagedConfig"
-      | "scope"
-      | "teams"
+      | "clonedFrom"
+      | "environmentId"
+      | "multitenant"
+      | "deploymentSpecYaml"
     >
   > & {
-    organizationId?: string;
+    organizationId?: string | null;
     authorId?: string;
+    /** Who the catalog item is shared with; see `TestAccess`. Defaults to `"org"`. */
+    access?: TestAccess;
+    /** Retired sharing columns, for upgrade (cutover) tests only. */
+    legacy?: LegacySharing;
   } = {},
 ) {
-  const { organizationId, authorId, ...catalogOverrides } = overrides;
+  const { organizationId, authorId, access, legacy, ...catalogOverrides } =
+    overrides;
 
-  // Auto-create organization if not provided
+  // Auto-create organization if omitted; explicit null creates a global item.
   let orgId = organizationId;
-  if (!orgId) {
+  if (orgId === undefined) {
     const org = await makeOrganization();
     orgId = org.id;
   }
 
-  return await InternalMcpCatalogModel.create(
-    {
-      name: `test-catalog-${crypto.randomUUID().substring(0, 8)}`,
-      serverType: "remote",
-      serverUrl: "https://api.example.com/mcp/",
-      scope: "org",
-      ...catalogOverrides,
-    },
-    {
-      organizationId: orgId,
-      authorId,
-    },
+  const catalog = {
+    name: `test-catalog-${crypto.randomUUID().substring(0, 8)}`,
+    serverType: "remote" as const,
+    serverUrl: "https://api.example.com/mcp/",
+    // The retired visibility column; `access` decides who sees the item.
+    scope: "personal" as const,
+    ...catalogOverrides,
+  };
+  const created = await InternalMcpCatalogModel.create(
+    catalog,
+    orgId === null
+      ? undefined
+      : {
+          organizationId: orgId,
+          authorId,
+          ...accessGrants(access ?? "org"),
+        },
   );
+  if (legacy) {
+    await seedLegacySharing({ resource: "mcpCatalog", id: created.id, legacy });
+    return (await InternalMcpCatalogModel.findById(created.id)) ?? created;
+  }
+  return created;
 }
 
 /**
@@ -573,7 +831,10 @@ async function makeInvitation(
   organizationId: string,
   inviterId: string,
   overrides: Partial<
-    Pick<InsertInvitation, "email" | "role" | "status" | "expiresAt">
+    Pick<
+      InsertInvitation,
+      "email" | "role" | "status" | "expiresAt" | "createdAt"
+    >
   > = {},
 ) {
   const [invitation] = await db
@@ -642,6 +903,7 @@ async function makeSession(
       | "userAgent"
       | "activeOrganizationId"
       | "impersonatedBy"
+      | "createdAt"
     >
   > = {},
 ) {
@@ -673,7 +935,13 @@ async function makeConversation(
   overrides: Partial<
     Pick<
       InsertConversation,
-      "userId" | "organizationId" | "title" | "selectedModel" | "chatApiKeyId"
+      | "userId"
+      | "organizationId"
+      | "title"
+      | "modelId"
+      | "chatApiKeyId"
+      | "thinkingEffort"
+      | "encryptedChat"
     >
   > = {},
 ) {
@@ -685,7 +953,6 @@ async function makeConversation(
       organizationId: `org-${crypto.randomUUID().substring(0, 8)}`,
       agentId,
       title: `Test Conversation ${crypto.randomUUID().substring(0, 8)}`,
-      selectedModel: "gpt-4o",
       createdAt: new Date(),
       updatedAt: new Date(),
       ...overrides,
@@ -702,7 +969,45 @@ async function makeInteraction(
   overrides: Partial<
     Pick<
       InsertInteraction,
-      "request" | "response" | "type" | "model" | "inputTokens" | "outputTokens"
+      | "request"
+      | "response"
+      | "type"
+      | "model"
+      | "inputTokens"
+      | "inputTokensEstimated"
+      | "outputTokens"
+      | "cost"
+      | "baselineCost"
+      | "cacheSavings"
+      | "cacheCost"
+      | "authMethod"
+      | "virtualKeyId"
+      | "passthroughVirtualKeyId"
+      | "authenticatedAppId"
+      | "authenticatedAppName"
+      | "billingTeamId"
+      | "attributionLabels"
+      | "billingMode"
+      | "sessionId"
+      | "sessionSource"
+      | "parentId"
+      | "encryptedChatConversationId"
+      | "runId"
+      | "cacheReadTokens"
+      | "cacheWriteTokens"
+      | "cacheWrite1hTokens"
+      | "baselineModel"
+      | "externalAgentId"
+      | "userId"
+      | "serviceAccountId"
+      | "appId"
+      | "source"
+      | "providerApiKeyId"
+      | "modelPoolId"
+      | "attempt"
+      | "attemptOutcome"
+      | "failureReason"
+      | "createdAt"
     >
   > = {},
 ) {
@@ -778,6 +1083,13 @@ async function makeInteraction(
       ...overrides,
     })
     .returning();
+  // Inserted directly, so stamp the agent as InteractionModel.create would.
+  if (interaction.profileId) {
+    await AgentUsageModel.recordUse({
+      agentId: interaction.profileId,
+      usedAt: interaction.createdAt,
+    });
+  }
   return interaction;
 }
 
@@ -797,29 +1109,76 @@ async function makeSecret(
 }
 
 /**
+ * Creates a service account and one key for it, the credential automation
+ * presents at the MCP gateway and A2A. `teamId` makes the account act for a
+ * team; omitted, it reaches what is shared with the whole organization.
+ */
+async function makeServiceAccountToken(params: {
+  organizationId: string;
+  teamId?: string | null;
+  role?: string;
+  name?: string;
+}) {
+  const serviceAccount = await ServiceAccountModel.create({
+    organizationId: params.organizationId,
+    name: params.name ?? `service-account-${crypto.randomUUID().slice(0, 8)}`,
+    role: params.role ?? MEMBER_ROLE_NAME,
+    teamId: params.teamId ?? null,
+    createdBy: null,
+  });
+  const { token, id } = await ServiceAccountModel.createToken({
+    serviceAccountId: serviceAccount.id,
+    organizationId: params.organizationId,
+    name: "test key",
+  });
+  return { serviceAccount, tokenId: id, value: token };
+}
+
+/**
  * Creates a test chat API key in the database.
- * Used for testing features that require LLM API keys (e.g., auto-policy configuration).
+ * Used for testing features that require LLM API keys.
  */
 async function makeLlmProviderApiKey(
   organizationId: string,
-  secretId: string,
+  secretId: string | null,
   overrides: Partial<
     Pick<
       InsertLlmProviderApiKey,
-      "name" | "provider" | "scope" | "userId" | "teamId"
+      | "name"
+      | "provider"
+      | "userId"
+      | "isPrimary"
+      | "baseUrl"
+      | "inferenceBaseUrl"
     >
-  > = {},
+  > & {
+    /**
+     * Who the key is shared with; see `TestAccess`. Defaults to its owner
+     * alone for an own key (`userId` set), else to `"org"`.
+     */
+    access?: TestAccess;
+  } = {},
 ) {
-  return await LlmProviderApiKeyModel.create({
-    organizationId,
-    secretId,
-    name:
-      overrides.name ?? `Test API Key ${crypto.randomUUID().substring(0, 8)}`,
-    provider: overrides.provider ?? "anthropic",
-    scope: overrides.scope ?? "org",
-    userId: overrides.userId ?? null,
-    teamId: overrides.teamId ?? null,
-  });
+  return await LlmProviderApiKeyModel.create(
+    {
+      organizationId,
+      secretId,
+      name:
+        overrides.name ?? `Test API Key ${crypto.randomUUID().substring(0, 8)}`,
+      provider: overrides.provider ?? "anthropic",
+      // The retired visibility column, written like the create route does:
+      // "personal" for an own key, "org" for a shared one. Ownership is
+      // `userId`, the audience its grants.
+      scope: overrides.userId ? "personal" : "org",
+      userId: overrides.userId ?? null,
+      ...(overrides.isPrimary !== undefined && {
+        isPrimary: overrides.isPrimary,
+      }),
+      baseUrl: overrides.baseUrl ?? null,
+      inferenceBaseUrl: overrides.inferenceBaseUrl ?? null,
+    },
+    accessGrants(overrides.access ?? (overrides.userId ? "personal" : "org")),
+  );
 }
 
 /**
@@ -835,6 +1194,7 @@ async function makeIdentityProvider(
     oidcConfig?: Record<string, unknown>;
     samlConfig?: Record<string, unknown>;
     roleMapping?: Record<string, unknown>;
+    teamSyncConfig?: Record<string, unknown>;
     ssoLoginEnabled?: boolean;
     userId?: string | null;
   } = {},
@@ -862,9 +1222,11 @@ async function makeIdentityProvider(
       roleMapping: overrides.roleMapping
         ? (JSON.stringify(overrides.roleMapping) as unknown as undefined)
         : undefined,
+      teamSyncConfig: overrides.teamSyncConfig
+        ? (JSON.stringify(overrides.teamSyncConfig) as unknown as undefined)
+        : undefined,
       userId: overrides.userId ?? null,
-      // WORKAROUND: With domainVerification enabled, all SSO providers need domainVerified: true
-      // See: https://github.com/better-auth/better-auth/issues/6481
+      // Model administrator-configured domains as trusted for account linking.
       domainVerified: true,
     })
     .returning();
@@ -881,6 +1243,8 @@ async function makeOAuthClient(
     name?: string;
     redirectUris?: string[];
     userId?: string;
+    scopes?: string[] | null;
+    grantTypes?: string[];
   } = {},
 ) {
   const id = crypto.randomUUID();
@@ -894,12 +1258,16 @@ async function makeOAuthClient(
         "http://localhost:8005/callback",
       ],
       tokenEndpointAuthMethod: "none",
-      grantTypes: ["authorization_code", "refresh_token"],
+      grantTypes: overrides.grantTypes ?? [
+        "authorization_code",
+        "refresh_token",
+      ],
       responseTypes: ["code"],
       public: true,
       type: "web",
       createdAt: new Date(),
       updatedAt: new Date(),
+      ...(overrides.scopes !== undefined ? { scopes: overrides.scopes } : {}),
       ...(overrides.userId ? { userId: overrides.userId } : {}),
     })
     .returning();
@@ -973,17 +1341,83 @@ async function makeOAuthRefreshToken(
  */
 async function makeKnowledgeBase(
   organizationId: string,
-  overrides: Partial<Pick<InsertKnowledgeBase, "name" | "status">> = {},
+  overrides: Partial<
+    Pick<InsertKnowledgeBase, "name" | "description" | "status" | "createdBy">
+  > & {
+    /** Retired sharing columns, for upgrade (cutover) tests only. */
+    legacy?: Pick<InsertKnowledgeBase, "visibility" | "teamIds">;
+    /**
+     * Who the knowledge base is shared with; see `TestAccess`. When set, the
+     * knowledge base is created through `KnowledgeBaseModel.create`, which
+     * writes the grants. Without it the row is inserted with no policy.
+     */
+    access?: TestAccess;
+  } = {},
 ): Promise<KnowledgeBase> {
+  const { access, legacy, ...values } = overrides;
+  if (access !== undefined) {
+    return await KnowledgeBaseModel.create(
+      {
+        organizationId,
+        name: `Test Knowledge Base ${crypto.randomUUID().substring(0, 8)}`,
+        ...values,
+        ...legacy,
+      },
+      accessGrants(access),
+    );
+  }
   const [result] = await db
     .insert(schema.knowledgeBasesTable)
     .values({
       organizationId,
       name: `Test Knowledge Base ${crypto.randomUUID().substring(0, 8)}`,
-      ...overrides,
+      ...values,
+      ...legacy,
     })
     .returning();
   return result;
+}
+
+/**
+ * Creates a skill through `SkillModel.createWithFiles`, the production path,
+ * with the grants `access` gives (author only by default).
+ *
+ * @example
+ *   const skill = await makeSkill(org.id, {
+ *     name: "refunds",
+ *     authorId: alice.id,
+ *     access: { teams: [team.id] },
+ *   });
+ */
+async function makeSkill(
+  organizationId: string,
+  overrides: Partial<Omit<InsertSkill, "organizationId" | "scope">> & {
+    files?: Omit<InsertSkillFile, "skillId">[];
+    /** Environments the skill is restricted to; omitted = every environment. */
+    environmentIds?: string[];
+    /** Who the skill is shared with; see `TestAccess`. Defaults to the author. */
+    access?: TestAccess;
+  } = {},
+): Promise<Skill> {
+  const { files, environmentIds, access, ...skillOverrides } = overrides;
+  const name =
+    skillOverrides.name ?? `test-skill-${crypto.randomUUID().substring(0, 8)}`;
+  const description = skillOverrides.description ?? `The ${name} skill`;
+  const skill = await SkillModel.createWithFiles({
+    skill: {
+      content: `---\nname: ${name}\ndescription: ${description}\n---\n\nBody.`,
+      authorId: null,
+      ...skillOverrides,
+      organizationId,
+      name,
+      description,
+    },
+    files: files ?? [],
+    ...(environmentIds && { environmentIds }),
+    ...accessGrants(access),
+  });
+  if (!skill) throw new Error(`makeSkill: the name "${name}" is taken`);
+  return skill;
 }
 
 /**
@@ -996,30 +1430,55 @@ async function makeKnowledgeBaseConnector(
     Pick<
       InsertKnowledgeBaseConnector,
       | "name"
-      | "visibility"
-      | "teamIds"
+      | "description"
+      | "syncPermissionsFromSource"
       | "connectorType"
       | "config"
       | "schedule"
       | "enabled"
+      | "ftsLanguage"
+      | "environmentId"
     >
-  > = {},
+  > & {
+    /**
+     * Who the connector is shared with; see `TestAccess`. Defaults to `"org"`,
+     * like the other object fixtures. The connector is created through
+     * `KnowledgeBaseConnectorModel.create`, which writes the grants.
+     */
+    access?: TestAccess;
+    /**
+     * Retired sharing columns, for upgrade (cutover) tests only. The row is
+     * then inserted with no policy, as it was before the upgrade.
+     */
+    legacy?: Pick<InsertKnowledgeBaseConnector, "visibility" | "teamIds">;
+  } = {},
 ): Promise<KnowledgeBaseConnector> {
-  const [result] = await db
-    .insert(schema.knowledgeBaseConnectorsTable)
-    .values({
-      organizationId,
-      name: `Test Connector ${crypto.randomUUID().substring(0, 8)}`,
-      connectorType: "jira",
-      config: {
-        type: "jira",
-        jiraBaseUrl: "https://test.atlassian.net",
-        isCloud: true,
-        projectKey: "TEST",
-      },
-      ...overrides,
-    })
-    .returning();
+  const { access, legacy, ...values } = overrides;
+  const row = {
+    organizationId,
+    name: `Test Connector ${crypto.randomUUID().substring(0, 8)}`,
+    connectorType: "jira" as const,
+    config: {
+      type: "jira" as const,
+      jiraBaseUrl: "https://test.atlassian.net",
+      isCloud: true,
+      projectKey: "TEST",
+    },
+    ...values,
+    ...legacy,
+  };
+  const [result] =
+    legacy === undefined
+      ? [
+          await KnowledgeBaseConnectorModel.create(
+            row,
+            accessGrants(access ?? "org"),
+          ),
+        ]
+      : await db
+          .insert(schema.knowledgeBaseConnectorsTable)
+          .values(row)
+          .returning();
 
   // Assign connector to the knowledge base via junction table
   await db.insert(schema.knowledgeBaseConnectorAssignmentsTable).values({
@@ -1036,14 +1495,29 @@ async function makeKnowledgeBaseConnector(
 async function makeConnectorRun(
   connectorId: string,
   overrides: Partial<
-    Pick<InsertConnectorRun, "status" | "startedAt" | "documentsProcessed">
+    Pick<
+      InsertConnectorRun,
+      | "status"
+      | "startedAt"
+      | "documentsProcessed"
+      | "documentsIngested"
+      | "stats"
+      | "leaseOwner"
+      | "leaseExpiresAt"
+      | "leaseEpoch"
+      | "runType"
+    >
   > = {},
 ): Promise<ConnectorRun> {
   const [result] = await db
     .insert(schema.connectorRunsTable)
     .values({
+      // Default to a terminal status: the single-flight unique index allows only
+      // one "running" run per connector, so tests that create several runs for a
+      // connector must not all be running. Pass `status: "running"` explicitly
+      // (one per connector) when a live run is needed.
+      status: "success",
       connectorId,
-      status: "running",
       startedAt: new Date(),
       ...overrides,
     })
@@ -1065,7 +1539,7 @@ async function seedAndAssignArchestraTools(agentId: string): Promise<void> {
     await db.insert(schema.internalMcpCatalogTable).values({
       id: ARCHESTRA_MCP_CATALOG_ID,
       name: DEFAULT_APP_NAME,
-      description: `Built-in ${DEFAULT_APP_NAME} tools for managing profiles, limits, policies, and MCP servers.`,
+      description: `Built-in ${DEFAULT_APP_NAME} tools for managing profiles, limits, and MCP servers.`,
       serverType: "builtin",
     });
   }
@@ -1078,7 +1552,32 @@ async function seedAndAssignArchestraTools(agentId: string): Promise<void> {
   );
 }
 
-export const beforeEach = baseBeforeEach<TestFixtures>;
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+/**
+ * Removes the per-object permission policies that creation wrote in an
+ * organization, keeping its `*` policies. Pair it with
+ * `makeOrganization({ legacyPermissions: true })` to simulate data written
+ * before the upgrade, when objects carried no policy. Call it after creating
+ * the objects and before writing any policy the test models on purpose.
+ */
+async function removeObjectPolicies(organizationId: string): Promise<void> {
+  await db
+    .delete(schema.resourcePermissionPoliciesTable)
+    .where(
+      and(
+        eq(
+          schema.resourcePermissionPoliciesTable.organizationId,
+          organizationId,
+        ),
+        ne(schema.resourcePermissionPoliciesTable.scope, "*"),
+      ),
+    );
+}
+// SPDX-SnippetEnd
+
+export const beforeEach: typeof baseBeforeEach<TestFixtures> = baseBeforeEach;
 export const test = baseTest.extend<TestFixtures>({
   makeUser: async ({}, use) => {
     await use(makeUser);
@@ -1113,14 +1612,23 @@ export const test = baseTest.extend<TestFixtures>({
   makeAgentTool: async ({}, use) => {
     await use(makeAgentTool);
   },
-  makeToolPolicy: async ({}, use) => {
-    await use(makeToolPolicy);
+  makeApp: async ({}, use) => {
+    await use(makeApp);
   },
-  makeTrustedDataPolicy: async ({}, use) => {
-    await use(makeTrustedDataPolicy);
+  makeAppVersion: async ({}, use) => {
+    await use(makeAppVersion);
+  },
+  makeAppTool: async ({}, use) => {
+    await use(makeAppTool);
+  },
+  makeAppData: async ({}, use) => {
+    await use(makeAppData);
   },
   makeCustomRole: async ({}, use) => {
     await use(makeCustomRole);
+  },
+  makeServiceAccount: async ({}, use) => {
+    await use(makeServiceAccount);
   },
   makeMember: async ({}, use) => {
     await use(makeMember);
@@ -1143,6 +1651,9 @@ export const test = baseTest.extend<TestFixtures>({
   makeAuthHeaders: async ({}, use) => {
     await use(makeAuthHeaders);
   },
+  makeSkill: async ({}, use) => {
+    await use(makeSkill);
+  },
   makeKnowledgeBase: async ({}, use) => {
     await use(makeKnowledgeBase);
   },
@@ -1160,6 +1671,9 @@ export const test = baseTest.extend<TestFixtures>({
   },
   makeSecret: async ({}, use) => {
     await use(makeSecret);
+  },
+  makeServiceAccountToken: async ({}, use) => {
+    await use(makeServiceAccountToken);
   },
   makeLlmProviderApiKey: async ({}, use) => {
     await use(makeLlmProviderApiKey);
@@ -1182,4 +1696,11 @@ export const test = baseTest.extend<TestFixtures>({
   seedAndAssignArchestraTools: async ({}, use) => {
     await use(seedAndAssignArchestraTools);
   },
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  removeObjectPolicies: async ({}, use) => {
+    await use(removeObjectPolicies);
+  },
+  // SPDX-SnippetEnd
 });

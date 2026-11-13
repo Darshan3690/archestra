@@ -1,0 +1,140 @@
+import { describe, expect, test } from "vitest";
+import config from "@/config";
+import type { AgentRuntime } from "@/types";
+import { extractFinalAnswer, resolveAgentRuntime } from "./pod-run";
+
+describe("resolveAgentRuntime", () => {
+  test("keeps an Agent without a runtime in the foreground", () => {
+    expect(
+      resolveAgentRuntime({ ...agentWithRuntime, runtime: null }),
+    ).toBeNull();
+  });
+
+  test("resolves a configured runtime without consulting the cluster", () => {
+    // A cluster without the Agent Sandbox controller fails at launch with a
+    // 503, not by silently running the Agent in the foreground.
+    expect(resolveAgentRuntime(agentWithRuntime)).toEqual({
+      ...runtime,
+      agentId: "agent-1",
+      organizationId: "organization-1",
+      environmentId: "environment-1",
+      secretId: "secret-1",
+      agentNetworkPolicy: null,
+    });
+  });
+
+  test("carries the Agent's own network policy to its launch", () => {
+    const policy = {
+      egressMode: "off" as const,
+      domainPreset: "none" as const,
+      allowedDomains: [],
+      allowedCidrs: [],
+    };
+    expect(
+      resolveAgentRuntime({ ...agentWithRuntime, networkPolicy: policy })
+        ?.agentNetworkPolicy,
+    ).toEqual(policy);
+  });
+
+  test("launches a maintained image saved on an older release with this deployment's tag", () => {
+    const current = config.agentRuntime.catalogImages["claude-code"];
+    const repository = current.slice(0, current.lastIndexOf(":"));
+    const resolved = resolveAgentRuntime({
+      ...agentWithRuntime,
+      runtime: { ...runtime, image: `${repository}:1.4.0-rc.31` },
+    });
+    expect(resolved?.image).toBe(current);
+  });
+
+  test("moves an Agent saved with an older release's digest pin to this deployment's image", () => {
+    const current = config.agentRuntime.catalogImages.codex;
+    const name = current.split("@")[0];
+    const repository = name.slice(0, name.lastIndexOf(":"));
+    const resolved = resolveAgentRuntime({
+      ...agentWithRuntime,
+      runtime: {
+        ...runtime,
+        image: `${repository}:1.4.0@sha256:${"e".repeat(64)}`,
+      },
+    });
+    expect(resolved?.image).toBe(current);
+  });
+
+  test("launches the author's own digest pin exactly as saved", () => {
+    for (const image of [
+      `ghcr.io/archestra-ai/agent-codex@sha256:${"e".repeat(64)}`,
+      `registry.example/team/agent-codex:v2@sha256:${"e".repeat(64)}`,
+    ]) {
+      expect(
+        resolveAgentRuntime({
+          ...agentWithRuntime,
+          runtime: { ...runtime, image },
+        })?.image,
+      ).toBe(image);
+    }
+  });
+});
+
+const runtime = {
+  image: "example.com/coding-agent:latest",
+  command: null,
+  inferenceProtocol: "openai_responses",
+  backend: "kubernetes",
+  steerMode: "pipe",
+  privileged: false,
+  environment: null,
+  credentials: null,
+  ttlHours: null,
+  idleTimeoutMinutes: null,
+} satisfies AgentRuntime;
+
+const agentWithRuntime = {
+  id: "agent-1",
+  organizationId: "organization-1",
+  environmentId: "environment-1",
+  runtime,
+  runtimeSecretId: "secret-1",
+};
+
+describe("extractFinalAnswer", () => {
+  test("returns the whole transcript when no runtime fenced an answer", () => {
+    // Every one-shot runtime, and any image predating the fence.
+    expect(extractFinalAnswer("the whole answer\n")).toBe("the whole answer\n");
+  });
+
+  test("keeps only what the runtime fenced, dropping the TUI recording", () => {
+    const transcript = [
+      "\u001b[2J\u001b[H╭─ Claude Code ─╮",
+      "│ working...    │",
+      "",
+      "===ARCHESTRA-FINAL-ANSWER===",
+      "Fixed the divider and opened PR #7.",
+    ].join("\n");
+    expect(extractFinalAnswer(transcript)).toBe(
+      "Fixed the divider and opened PR #7.",
+    );
+  });
+
+  test("takes the last fence when a TUI scrolled an earlier one back", () => {
+    const transcript =
+      "===ARCHESTRA-FINAL-ANSWER===\nstale redraw\n===ARCHESTRA-FINAL-ANSWER===\nthe real answer";
+    expect(extractFinalAnswer(transcript)).toBe("the real answer");
+  });
+
+  test("stops at the end fence before the preserved final TUI frame", () => {
+    const transcript = [
+      "===ARCHESTRA-FINAL-ANSWER===",
+      "the durable answer",
+      "===ARCHESTRA-FINAL-ANSWER-END===",
+      "\u001b[2J\u001b[H╭─ Codex ─╮",
+      "│ completed │",
+    ].join("\n");
+    expect(extractFinalAnswer(transcript)).toBe("the durable answer\n");
+  });
+
+  test("falls back to the transcript when the fence has nothing after it", () => {
+    // The runtime died mid-write; a partial recording beats an empty answer.
+    const transcript = "some output\n===ARCHESTRA-FINAL-ANSWER===\n";
+    expect(extractFinalAnswer(transcript)).toBe(transcript);
+  });
+});

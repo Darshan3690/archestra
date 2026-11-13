@@ -1,0 +1,888 @@
+"use client";
+
+import type { archestraApiTypes } from "@archestra/shared";
+import type { ColumnDef, RowSelectionState } from "@tanstack/react-table";
+import {
+  ArrowLeftRight,
+  ArrowRight,
+  ChevronDown,
+  Copy,
+  KeyRound,
+  type LucideIcon,
+  Pencil,
+  Plus,
+  Server,
+  Trash2,
+} from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { toast } from "sonner";
+import { ErrorBoundary } from "@/app/_parts/error-boundary";
+import { useSetLlmProxyAction } from "@/app/llm/proxy/_parts/llm-proxy-action-context";
+import { CreateLlmProviderApiKeyDialog } from "@/components/create-llm-provider-api-key-dialog";
+import {
+  CreateVirtualKeyDialogWithData,
+  type VirtualKeyType,
+} from "@/components/create-virtual-key-dialog";
+import { formatSpendCap } from "@/components/credential-billing/budget-fields";
+import { DeleteConfirmDialog } from "@/components/delete-confirm-dialog";
+import { EditVirtualKeyDialog } from "@/components/edit-virtual-key-dialog";
+import { EmptyState } from "@/components/empty-state";
+import { EntityLabelFilter } from "@/components/entity-label-filter";
+import {
+  CollectionFilters,
+  FilterBar,
+  FilterSelect,
+  filterControlClass,
+  filterSearchClass,
+} from "@/components/filter-bar";
+import { LabelTags } from "@/components/label-tags";
+import {
+  isProviderApiKeyId,
+  ProviderKeyFilterSelect,
+} from "@/components/provider-key-filter-select";
+import { formatProviderKeySummary } from "@/components/provider-key-mappings-field";
+import { QueryLoadError } from "@/components/query-load-error";
+import {
+  RESOURCE_ACCESS_FILTER_PARAMS,
+  ResourceAccessFilter,
+} from "@/components/resource-access-filter";
+import { ResourceListActions } from "@/components/resource-list-actions";
+import { useScopeFilterParams } from "@/components/resource-scope-filter";
+import { SearchInput } from "@/components/search-input";
+import {
+  TableCard,
+  TableCardList,
+  TableCardView,
+  TableCardViewContent,
+  TableCardViewToggle,
+} from "@/components/table-card-view";
+import { TableRowActions } from "@/components/table-row-actions";
+import { BulkActions } from "@/components/ui/bulk-actions-bar";
+import { createSelectColumn } from "@/components/ui/bulk-select-column";
+import { Button } from "@/components/ui/button";
+import { DataTable } from "@/components/ui/data-table";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { PermissionButton } from "@/components/ui/permission-button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
+  useHasPermissions,
+  useScopedCapabilities,
+  useSession,
+} from "@/lib/auth/auth.query";
+import { holdsItemGrant } from "@/lib/auth/auth.utils";
+import { reportBulkOutcome } from "@/lib/bulk-action";
+import { useBulkRangeSelectionController } from "@/lib/bulk-range-selection-context";
+import { copyToClipboard } from "@/lib/clipboard";
+import {
+  useVirtualApiKeyLabelKeys,
+  useVirtualApiKeyLabelValues,
+} from "@/lib/entity-labels.query";
+import { useBulkCardSelection } from "@/lib/hooks/use-bulk-card-selection";
+import { useDataTableQueryParams } from "@/lib/hooks/use-data-table-query-params";
+import { useModelProviderCatalog } from "@/lib/integration-overrides";
+import { useLlmProviderApiKeys } from "@/lib/llm-provider-api-keys.query";
+import {
+  formatRelativeTime,
+  formatRelativeTimeFromNow,
+} from "@/lib/utils/date-time";
+import { cn } from "@/lib/utils/tailwind";
+import {
+  useAllVirtualApiKeys,
+  useBulkDeleteVirtualApiKeys,
+  useDeleteVirtualApiKey,
+  useFetchVirtualApiKeyValue,
+} from "@/lib/virtual-api-keys.query";
+
+type VirtualKeyRow =
+  archestraApiTypes.GetAllVirtualApiKeysResponses["200"]["data"][number];
+type KeyTypeFilter = NonNullable<
+  NonNullable<archestraApiTypes.GetAllVirtualApiKeysData["query"]>["keyType"]
+>;
+
+export default function VirtualKeysPage() {
+  return (
+    <ErrorBoundary>
+      <VirtualKeysTable />
+    </ErrorBoundary>
+  );
+}
+
+function VirtualKeysTable() {
+  const setActionButton = useSetLlmProxyAction();
+  const {
+    searchParams,
+    pageIndex,
+    pageSize,
+    offset,
+    updateQueryParams,
+    setPagination,
+  } = useDataTableQueryParams();
+
+  const searchFromUrl = searchParams.get("search") || "";
+  const keyTypeFromUrl = searchParams.get("keyType");
+  const providerApiKeyIdFromUrl = searchParams.get("providerApiKeyId");
+  // Label filtering is server-side, so the value rides the list query.
+  const labelsFilter = searchParams.get("labels") || undefined;
+  const keyTypeFilter = isKeyType(keyTypeFromUrl) ? keyTypeFromUrl : undefined;
+  const providerApiKeyIdFilter = isProviderApiKeyId(providerApiKeyIdFromUrl)
+    ? providerApiKeyIdFromUrl
+    : undefined;
+
+  const providerCatalog = useModelProviderCatalog({ fresh: true });
+  const { data: session } = useSession();
+  const currentUserId = session?.user?.id;
+  const { data: canCreate } = useHasPermissions({ llmVirtualKey: ["create"] });
+  const { data: scopedGrants } = useScopedCapabilities();
+
+  const { hasActiveScopeFilters, access, sharedWith, owner } =
+    useScopeFilterParams();
+  const query = useAllVirtualApiKeys({
+    limit: pageSize,
+    offset,
+    search: searchFromUrl || undefined,
+    keyType: keyTypeFilter,
+    providerApiKeyId: providerApiKeyIdFilter,
+    labels: labelsFilter,
+    access,
+    sharedWith,
+    owner,
+    toastOnError: false,
+  });
+
+  const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
+  const [createKeyType, setCreateKeyType] = useState<VirtualKeyType | null>(
+    null,
+  );
+  const [editingKey, setEditingKey] = useState<VirtualKeyRow | null>(null);
+  const [deletingKey, setDeletingKey] = useState<VirtualKeyRow | null>(null);
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [providerDialogOpen, setProviderDialogOpen] = useState(false);
+  const { data: canReadProviders } = useHasPermissions({
+    llmProviderApiKey: ["read"],
+  });
+  const providerQuery = useLlmProviderApiKeys({
+    enabled: canReadProviders === true,
+    toastOnError: false,
+  });
+  const needsFirstProvider =
+    canReadProviders === true &&
+    providerQuery.isSuccess &&
+    providerQuery.data.length === 0 &&
+    query.isSuccess &&
+    query.data.data.length === 0 &&
+    query.data.pagination.total === 0 &&
+    !searchFromUrl &&
+    !keyTypeFilter &&
+    !providerApiKeyIdFilter &&
+    !labelsFilter &&
+    !hasActiveScopeFilters;
+
+  const deleteMutation = useDeleteVirtualApiKey();
+  const bulkDelete = useBulkDeleteVirtualApiKeys();
+
+  const clearSelection = useCallback(() => setRowSelection({}), []);
+
+  // The header's Create control: a small menu, because standard and
+  // passthrough keys are created through the same dialog in different modes.
+  useEffect(() => {
+    if (needsFirstProvider) {
+      setActionButton(null);
+      return () => setActionButton(null);
+    }
+    setActionButton(
+      <div className="flex items-center gap-2">
+        {canCreate ? (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button size="sm">
+                <Plus className="h-4 w-4" />
+                <span>Create Virtual Key</span>
+                <ChevronDown className="h-4 w-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="max-w-72">
+              <DropdownMenuItem
+                className="flex-col items-start gap-0.5"
+                onSelect={() => setCreateKeyType("standard")}
+              >
+                <span className="font-medium">Standard virtual key</span>
+                <span className="text-xs text-muted-foreground">
+                  Authenticates your app through your provider keys
+                </span>
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                className="flex-col items-start gap-0.5"
+                onSelect={() => setCreateKeyType("passthrough")}
+              >
+                <span className="font-medium">Passthrough virtual key</span>
+                <span className="text-xs text-muted-foreground">
+                  Grants no access; attributes bring-your-own-key requests to a
+                  user
+                </span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        ) : (
+          <PermissionButton permissions={{ llmVirtualKey: ["create"] }}>
+            <Plus className="h-4 w-4" />
+            <span>Create Virtual Key</span>
+          </PermissionButton>
+        )}
+        <ResourceListActions resource="llmVirtualKey" />
+      </div>,
+    );
+    return () => setActionButton(null);
+  }, [canCreate, needsFirstProvider, setActionButton]);
+
+  const keys = query.data?.data ?? [];
+  const pagination = query.data?.pagination;
+  const rangeSelection = useBulkRangeSelectionController();
+  const cardSelection = useBulkCardSelection({
+    rows: keys,
+    getRowId: (key) => key.id,
+    rowSelection,
+    setRowSelection,
+    rangeSelection,
+  });
+  const selectedKeys = keys.filter((key) => rowSelection[key.id]);
+  const canDeleteSelected = selectedKeys.every((key) =>
+    holdsItemGrant({
+      grants: scopedGrants,
+      resource: "llmVirtualKey",
+      action: "delete",
+      id: key.id,
+    }),
+  );
+  const hasActiveFilters = Boolean(
+    searchFromUrl ||
+      keyTypeFilter ||
+      providerApiKeyIdFilter ||
+      labelsFilter ||
+      hasActiveScopeFilters,
+  );
+
+  const clearFilters = useCallback(() => {
+    updateQueryParams({
+      search: null,
+      keyType: null,
+      scope: null,
+      providerApiKeyId: null,
+      labels: null,
+      ...Object.fromEntries(
+        RESOURCE_ACCESS_FILTER_PARAMS.map((param) => [param, null]),
+      ),
+      page: "1",
+    });
+  }, [updateQueryParams]);
+
+  const columns: ColumnDef<VirtualKeyRow>[] = [
+    createSelectColumn<VirtualKeyRow>({
+      rowLabel: (row) => `Select ${row.name}`,
+      allLabel: "Select all keys on this page",
+    }),
+    {
+      // The token sits under the name, and the kind reads from the icon.
+      id: "name",
+      accessorKey: "name",
+      header: "Name",
+      size: 240,
+      cell: ({ row }) => (
+        <div className="flex min-w-0 items-center gap-2.5">
+          <VirtualKeyKindIcon keyType={row.original.keyType} />
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="truncate font-medium">{row.original.name}</span>
+              <LabelTags labels={row.original.labels} />
+            </div>
+            <VirtualKeyValueCell
+              id={row.original.id}
+              tokenStart={row.original.tokenStart}
+              canCopy={row.original.authorId === currentUserId}
+            />
+          </div>
+        </div>
+      ),
+    },
+    {
+      id: "providers",
+      header: "Providers",
+      size: 160,
+      cell: ({ row }) => (
+        <span className="block max-w-[160px] truncate text-muted-foreground">
+          <VirtualKeyProviders
+            virtualKey={row.original}
+            label={providerCatalog.label}
+          />
+        </span>
+      ),
+    },
+    {
+      id: "budget",
+      header: "Budget",
+      size: 140,
+      cell: ({ row }) => <VirtualKeyBudget virtualKey={row.original} />,
+    },
+    {
+      id: "activity",
+      header: "Activity",
+      size: 150,
+      cell: ({ row }) => (
+        <div className="space-y-0.5 text-xs">
+          <div>
+            <span className="text-muted-foreground">Used </span>
+            <span>{formatRelativeTimeFromNow(row.original.lastUsedAt)}</span>
+          </div>
+          <div>
+            <span className="text-muted-foreground">Expires </span>
+            <span>
+              {formatRelativeTime(row.original.expiresAt, {
+                pastLabel: "Expired",
+              })}
+            </span>
+          </div>
+        </div>
+      ),
+    },
+    {
+      id: "actions",
+      header: "Actions",
+      size: 100,
+      cell: ({ row }) => (
+        <TableRowActions
+          itemName={row.original.name}
+          permissionScope={row.original.id}
+          actions={[
+            {
+              icon: <Pencil className="h-4 w-4" />,
+              label: "Edit",
+              permissions: { llmVirtualKey: ["update"] },
+              onClick: () => setEditingKey(row.original),
+            },
+            {
+              icon: <Trash2 className="h-4 w-4" />,
+              label: "Delete",
+              permissions: { llmVirtualKey: ["delete"] },
+              variant: "destructive",
+              onClick: () => setDeletingKey(row.original),
+            },
+          ]}
+        />
+      ),
+    },
+  ];
+
+  if (query.isLoadingError) {
+    return (
+      <QueryLoadError
+        title="Couldn't load virtual keys"
+        error={query.error}
+        onRetry={() => query.refetch()}
+      />
+    );
+  }
+
+  if (needsFirstProvider) {
+    return (
+      <>
+        <EmptyState
+          icon={Server}
+          title="Connect your first model provider"
+          description="Add a provider API key or a self-hosted endpoint. Then create a virtual key to use it."
+          action={
+            <div className="flex flex-col items-center gap-3">
+              <PermissionButton
+                size="sm"
+                permissions={{ llmProviderApiKey: ["create"] }}
+                onClick={() => setProviderDialogOpen(true)}
+              >
+                <Plus />
+                <span>Add model provider</span>
+              </PermissionButton>
+              {canCreate && (
+                <Button
+                  size="sm"
+                  variant="link"
+                  onClick={() => setCreateKeyType("passthrough")}
+                >
+                  <span>Use my own API key instead</span>
+                  <ArrowRight />
+                </Button>
+              )}
+            </div>
+          }
+        />
+        <CreateLlmProviderApiKeyDialog
+          open={providerDialogOpen}
+          onOpenChange={setProviderDialogOpen}
+          title="Add model provider"
+          description="Add a provider API key or a self-hosted endpoint"
+          onSuccess={() => setCreateKeyType("standard")}
+        />
+        <CreateVirtualKeyDialogWithData
+          open={createKeyType !== null}
+          onOpenChange={(open) => {
+            if (!open) setCreateKeyType(null);
+          }}
+          keyType={createKeyType ?? "standard"}
+        />
+      </>
+    );
+  }
+
+  return (
+    <TableCardView storageKey="archestra-llm-virtual-keys-view">
+      <div>
+        <CreateLlmProviderApiKeyDialog
+          open={providerDialogOpen}
+          onOpenChange={setProviderDialogOpen}
+          title="Add model provider"
+          description="Add a provider API key or a self-hosted endpoint"
+          onSuccess={() => setCreateKeyType("standard")}
+        />
+        <CollectionFilters>
+          <FilterBar
+            leading
+            actions={<TableCardViewToggle />}
+            search={
+              <SearchInput
+                isLoading={query.isFetching}
+                objectNamePlural="keys"
+                searchFields={["name"]}
+                paramName="search"
+                className={filterSearchClass}
+              />
+            }
+          >
+            <ResourceAccessFilter
+              resource="llmVirtualKey"
+              noun="virtual keys"
+            />
+            <FilterSelect
+              value={keyTypeFilter ?? "all"}
+              onValueChange={(value) =>
+                updateQueryParams({
+                  keyType: value === "all" ? null : value,
+                  page: "1",
+                })
+              }
+              placeholder="Filter by type"
+              showSearch={false}
+              items={[
+                { value: "all", label: "All types" },
+                {
+                  value: "standard",
+                  label: "Standard",
+                  content: <KeyTypeLabel keyType="standard" withHint />,
+                  selectedContent: <KeyTypeLabel keyType="standard" />,
+                },
+                {
+                  value: "passthrough",
+                  label: "Passthrough",
+                  content: <KeyTypeLabel keyType="passthrough" withHint />,
+                  selectedContent: <KeyTypeLabel keyType="passthrough" />,
+                },
+              ]}
+            />
+            <ProviderKeyFilterSelect
+              value={providerApiKeyIdFilter}
+              onValueChange={(providerApiKeyId) =>
+                updateQueryParams({ providerApiKeyId, page: "1" })
+              }
+            />
+            <EntityLabelFilter
+              useLabelKeys={useVirtualApiKeyLabelKeys}
+              useLabelValues={useVirtualApiKeyLabelValues}
+              className={filterControlClass({
+                active: Boolean(labelsFilter),
+              })}
+            />
+          </FilterBar>
+        </CollectionFilters>
+
+        <BulkActions
+          count={selectedKeys.length}
+          noun="key"
+          onClear={clearSelection}
+          busy={bulkDelete.isPending}
+        >
+          <PermissionButton
+            permissions={{}}
+            disabled={!canDeleteSelected}
+            tooltip={
+              canDeleteSelected
+                ? undefined
+                : "You can't delete every selected key"
+            }
+            variant="destructive"
+            size="sm"
+            onClick={() => setBulkDeleteOpen(true)}
+          >
+            <Trash2 className="h-4 w-4" />
+            <span>Delete</span>
+          </PermissionButton>
+        </BulkActions>
+
+        <TableCardViewContent
+          cards={
+            <TableCardList
+              itemCount={keys.length}
+              isLoading={query.isFetching}
+              hasActiveFilters={hasActiveFilters}
+              onClearFilters={clearFilters}
+              emptyIcon={KeyRound}
+              emptyMessage="No virtual keys yet. Create one and choose its provider key mappings."
+              filteredEmptyMessage="No virtual keys match your filters"
+              pagination={{
+                pageIndex,
+                pageSize,
+                total: pagination?.total ?? 0,
+              }}
+              onPaginationChange={setPagination}
+            >
+              {keys.map((key) => (
+                <TableCard
+                  key={key.id}
+                  icon={<VirtualKeyKindIcon keyType={key.keyType} />}
+                  title={key.name}
+                  description={
+                    <div className="flex min-w-0 items-center gap-2">
+                      <VirtualKeyValueCell
+                        id={key.id}
+                        tokenStart={key.tokenStart}
+                        canCopy={key.authorId === currentUserId}
+                      />
+                      <LabelTags labels={key.labels} />
+                    </div>
+                  }
+                  {...cardSelection(key)}
+                  selectionLabel={`Select ${key.name}`}
+                  actions={
+                    <TableRowActions
+                      itemName={key.name}
+                      permissionScope={key.id}
+                      actions={[
+                        {
+                          icon: <Pencil className="h-4 w-4" />,
+                          label: "Edit",
+                          permissions: { llmVirtualKey: ["update"] },
+                          onClick: () => setEditingKey(key),
+                        },
+                        {
+                          icon: <Trash2 className="h-4 w-4" />,
+                          label: "Delete",
+                          permissions: { llmVirtualKey: ["delete"] },
+                          variant: "destructive",
+                          onClick: () => setDeletingKey(key),
+                        },
+                      ]}
+                    />
+                  }
+                  footer={
+                    <div className="flex flex-wrap gap-x-3 gap-y-1">
+                      <span>
+                        Expiry:{" "}
+                        {formatRelativeTime(key.expiresAt, {
+                          pastLabel: "Expired",
+                        })}
+                      </span>
+                      <span>
+                        Last used: {formatRelativeTimeFromNow(key.lastUsedAt)}
+                      </span>
+                    </div>
+                  }
+                >
+                  <dl className="grid grid-cols-[4.5rem_1fr] gap-x-3 gap-y-1 text-xs">
+                    <dt className="text-muted-foreground">Providers</dt>
+                    <dd className="min-w-0 truncate">
+                      <VirtualKeyProviders
+                        virtualKey={key}
+                        label={providerCatalog.label}
+                      />
+                    </dd>
+                    <dt className="text-muted-foreground">Budget</dt>
+                    <dd className="min-w-0">
+                      <VirtualKeyBudget virtualKey={key} inline />
+                    </dd>
+                  </dl>
+                </TableCard>
+              ))}
+            </TableCardList>
+          }
+          table={
+            <DataTable
+              columns={columns}
+              data={keys}
+              getRowId={(row) => row.id}
+              rowSelection={rowSelection}
+              onRowSelectionChange={setRowSelection}
+              rangeSelection={rangeSelection}
+              hideSelectedCount
+              manualPagination
+              pagination={{
+                pageIndex,
+                pageSize,
+                total: pagination?.total ?? 0,
+              }}
+              onPaginationChange={setPagination}
+              isLoading={query.isFetching}
+              hasActiveFilters={hasActiveFilters}
+              onClearFilters={clearFilters}
+              emptyMessage="No virtual keys yet. Create one and choose its provider key mappings."
+              filteredEmptyMessage="No virtual keys match your filters. Try adjusting your search."
+            />
+          }
+        />
+
+        <CreateVirtualKeyDialogWithData
+          open={createKeyType !== null}
+          onOpenChange={(open) => {
+            if (!open) setCreateKeyType(null);
+          }}
+          keyType={createKeyType ?? "standard"}
+        />
+        <EditVirtualKeyDialog
+          virtualKey={editingKey}
+          onOpenChange={(open) => {
+            if (!open) setEditingKey(null);
+          }}
+        />
+        <DeleteConfirmDialog
+          open={!!deletingKey}
+          onOpenChange={(open) => {
+            if (!open) setDeletingKey(null);
+          }}
+          title="Delete Virtual Key"
+          description={`Are you sure you want to delete "${deletingKey?.name}"? This action cannot be undone.`}
+          confirmLabel="Delete"
+          isPending={deleteMutation.isPending}
+          onConfirm={() => {
+            if (!deletingKey) return;
+            deleteMutation.mutate(
+              { id: deletingKey.id },
+              { onSuccess: () => setDeletingKey(null) },
+            );
+          }}
+        />
+        {bulkDeleteOpen && (
+          <DeleteConfirmDialog
+            open={bulkDeleteOpen}
+            onOpenChange={setBulkDeleteOpen}
+            title="Delete virtual keys"
+            description={`Delete ${selectedKeys.length} ${
+              selectedKeys.length === 1 ? "key" : "keys"
+            }? Applications using them stop authenticating. This cannot be undone.`}
+            isPending={bulkDelete.isPending}
+            onConfirm={() => {
+              bulkDelete.mutate(selectedKeys, {
+                onSuccess: (outcome) => {
+                  reportBulkOutcome({
+                    outcome,
+                    verb: "Deleted",
+                    failureVerb: "delete",
+                    noun: "key",
+                  });
+                  setBulkDeleteOpen(false);
+                  // Rows that failed stay ticked so the selection can be
+                  // retried rather than rebuilt.
+                  if (outcome.failed.length === 0) clearSelection();
+                },
+              });
+            }}
+            confirmLabel="Delete keys"
+            pendingLabel="Deleting..."
+          />
+        )}
+      </div>
+    </TableCardView>
+  );
+}
+
+/**
+ * The kind as a tinted icon: a key for a standard key, which carries provider
+ * keys, and crossed arrows for a passthrough key, which only relays the
+ * caller's own provider key.
+ */
+function VirtualKeyKindIcon({
+  keyType,
+}: {
+  keyType: VirtualKeyRow["keyType"];
+}) {
+  const { icon: Icon, label, hint, tone } = KEY_TYPE_STYLES[keyType];
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          role="img"
+          aria-label={`${label} key`}
+          className={cn(
+            "flex size-6 shrink-0 items-center justify-center rounded",
+            tone.tile,
+            tone.text,
+          )}
+        >
+          <Icon className="size-3.5" />
+        </span>
+      </TooltipTrigger>
+      <TooltipContent>
+        <span className="font-medium">{label}:</span> {hint}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+/** A kind filter option, prefixed with the icon the list uses. */
+function KeyTypeLabel({
+  keyType,
+  withHint = false,
+}: {
+  keyType: VirtualKeyRow["keyType"];
+  /** Adds a one-line hint under the label, for the open list. */
+  withHint?: boolean;
+}) {
+  const { icon: Icon, label, hint, tone } = KEY_TYPE_STYLES[keyType];
+  return (
+    <span className="flex items-center gap-2">
+      <Icon className={cn("size-4 shrink-0", tone.text)} />
+      <span className="min-w-0">
+        <span className="block">{label}</span>
+        {withHint && (
+          <span className="block text-xs text-muted-foreground">{hint}</span>
+        )}
+      </span>
+    </span>
+  );
+}
+
+const KEY_TYPE_STYLES = {
+  standard: {
+    icon: KeyRound,
+    label: "Standard",
+    hint: "Uses org provider keys",
+    tone: { tile: "bg-primary/15", text: "text-primary" },
+  },
+  passthrough: {
+    icon: ArrowLeftRight,
+    label: "Passthrough",
+    hint: "Caller brings their own key",
+    tone: {
+      tile: "bg-sky-500/15",
+      text: "text-sky-700 dark:text-sky-300",
+    },
+  },
+} satisfies Record<
+  VirtualKeyRow["keyType"],
+  {
+    icon: LucideIcon;
+    label: string;
+    hint: string;
+    tone: { tile: string; text: string };
+  }
+>;
+
+function VirtualKeyProviders({
+  virtualKey,
+  label,
+}: {
+  virtualKey: VirtualKeyRow;
+  label: Parameters<typeof formatProviderKeySummary>[1];
+}) {
+  if (virtualKey.keyType === "passthrough") {
+    return <span className="text-muted-foreground">Caller's own key</span>;
+  }
+  if (virtualKey.includeFutureProviders)
+    return <span>Current and future providers</span>;
+  return (
+    <span>{formatProviderKeySummary(virtualKey.providerApiKeys, label)}</span>
+  );
+}
+
+/** Who pays for the key and its cap, on two lines or one. */
+function VirtualKeyBudget({
+  virtualKey,
+  inline = false,
+}: {
+  virtualKey: VirtualKeyRow;
+  inline?: boolean;
+}) {
+  const team = virtualKey.billingTeam?.name;
+  const cap = virtualKey.spendCap
+    ? `${formatSpendCap(virtualKey.spendCap)} cap`
+    : "No cap";
+  if (inline) {
+    return (
+      <span className="block truncate">
+        <span className={cn(!team && "text-muted-foreground")}>
+          {team ?? "No team"}
+        </span>
+        <span className="text-muted-foreground"> · {cap}</span>
+      </span>
+    );
+  }
+  return (
+    <div className="min-w-0 text-sm">
+      <div
+        className={cn(
+          "max-w-[140px] truncate",
+          !team && "text-muted-foreground",
+        )}
+      >
+        {team ?? "No team"}
+      </div>
+      <div className="text-xs text-muted-foreground">{cap}</div>
+    </div>
+  );
+}
+
+/**
+ * The token cell: masked prefix with an author-only copy action — the backend
+ * 403s value reads for keys created by someone else.
+ */
+function VirtualKeyValueCell({
+  id,
+  tokenStart,
+  canCopy,
+}: {
+  id: string;
+  tokenStart: string;
+  canCopy: boolean;
+}) {
+  const fetchValue = useFetchVirtualApiKeyValue();
+  return (
+    // min-w-0 + overflow-hidden: the DataTable's fixed layout does not clip
+    // cell content, so an unconstrained flex row paints over the next column.
+    <div className="flex h-5 min-w-0 items-center gap-0.5 overflow-hidden font-mono text-xs text-muted-foreground">
+      <code className="min-w-0 truncate">{`${tokenStart}…`}</code>
+      {canCopy && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          className="size-5 shrink-0"
+          aria-label="Copy key"
+          disabled={fetchValue.isPending}
+          onClick={async () => {
+            const value = await fetchValue.mutateAsync(id);
+            if (!value) return;
+            await copyToClipboard(value);
+            toast.success("Key copied");
+          }}
+        >
+          <Copy className="size-3" />
+        </Button>
+      )}
+    </div>
+  );
+}
+
+function isKeyType(value: string | null): value is KeyTypeFilter {
+  return value === "standard" || value === "passthrough";
+}

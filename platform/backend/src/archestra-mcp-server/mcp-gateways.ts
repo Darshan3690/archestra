@@ -2,17 +2,14 @@ import {
   TOOL_CREATE_MCP_GATEWAY_SHORT_NAME,
   TOOL_EDIT_MCP_GATEWAY_SHORT_NAME,
   TOOL_GET_MCP_GATEWAY_SHORT_NAME,
-} from "@shared";
+} from "@archestra/shared";
 import { z } from "zod";
 import {
-  AgentScopeSchema,
-  ToolAssignmentModeSchema,
   ToolExposureModeSchema,
   UpdateAgentSchemaBase,
   UuidIdSchema,
 } from "@/types";
 import {
-  AgentDetailOutputSchema,
   ConnectorIdsToolInputSchema,
   CreateBaseToolArgsSchema,
   GetResourceToolArgsSchema,
@@ -21,15 +18,22 @@ import {
   handleGetResource,
   KnowledgeBaseIdsToolInputSchema,
   LabelInputSchema,
+  McpGatewayDetailOutputSchema,
 } from "./agent-resources";
 import { defineArchestraTool, defineArchestraTools } from "./helpers";
 
 const CreateMcpGatewayToolArgsSchema = CreateBaseToolArgsSchema.extend({
   knowledgeBaseIds: KnowledgeBaseIdsToolInputSchema.optional(),
   connectorIds: ConnectorIdsToolInputSchema.optional(),
-  toolAssignmentMode: ToolAssignmentModeSchema.optional().describe(
-    "How tools are assigned to this gateway. 'manual' (default) lets an admin pick tools individually. 'automatic' derives the gateway's tools from catalog entries whose labels match the gateway's labels (key-value pairs, OR semantics).",
+  toolExposureMode: ToolExposureModeSchema.optional().describe(
+    "How tools should be loaded for MCP clients and models.",
   ),
+  subAgentIds: z
+    .array(UuidIdSchema)
+    .optional()
+    .describe(
+      "Optional list of agent IDs that this MCP gateway can delegate to as subagents.",
+    ),
 }).strict();
 
 const GetMcpGatewayToolArgsSchema = GetResourceToolArgsSchema.extend({
@@ -61,19 +65,12 @@ const EditMcpGatewayToolArgsSchema = z
     name: UpdateAgentSchemaBase.shape.name
       .optional()
       .describe("New name for the MCP gateway."),
-    scope: AgentScopeSchema.optional().describe(
-      "Updated visibility scope for the MCP gateway.",
-    ),
     toolExposureMode: ToolExposureModeSchema.optional().describe(
-      "How tools should be exposed to MCP clients and models.",
+      "How tools should be loaded for MCP clients and models.",
     ),
-    toolAssignmentMode: ToolAssignmentModeSchema.optional().describe(
-      "How tools are assigned to this gateway. 'manual' lets an admin pick tools individually. 'automatic' derives the gateway's tools from catalog entries whose labels match the gateway's labels (key-value pairs, OR semantics).",
-    ),
-    teams: z
-      .array(UuidIdSchema)
-      .optional()
-      .describe("Replace the teams attached to a team-scoped MCP gateway."),
+    accessAllTools: CreateBaseToolArgsSchema.shape.accessAllTools,
+    accessAllSubagents: CreateBaseToolArgsSchema.shape.accessAllSubagents,
+    subagentLoadBalancing: CreateBaseToolArgsSchema.shape.subagentLoadBalancing,
     knowledgeBaseIds: UpdateAgentSchemaBase.shape.knowledgeBaseIds
       .describe(
         "Replace the MCP gateway's assigned knowledge bases with this set.",
@@ -84,6 +81,12 @@ const EditMcpGatewayToolArgsSchema = z
         "Replace the MCP gateway's directly assigned knowledge connectors with this set.",
       )
       .optional(),
+    subAgentIds: z
+      .array(UuidIdSchema)
+      .optional()
+      .describe(
+        "Optional list of agent IDs that this MCP gateway can delegate to as subagents.",
+      ),
   })
   .strict();
 
@@ -108,7 +111,7 @@ const registry = defineArchestraTools([
     description:
       "Get a specific MCP gateway by ID or name. When searching by name, only your personal gateways are matched.",
     schema: GetMcpGatewayToolArgsSchema,
-    outputSchema: AgentDetailOutputSchema,
+    outputSchema: McpGatewayDetailOutputSchema,
     async handler({ args, context }) {
       return handleGetResource({
         args,

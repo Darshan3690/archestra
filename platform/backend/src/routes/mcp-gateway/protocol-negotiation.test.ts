@@ -1,0 +1,673 @@
+/**
+ * MCP Gateway — dual-revision protocol negotiation over the real route.
+ *
+ * The gateway serves 2025-11-25 and 2026-07-28 clients from one endpoint. These
+ * drive the actual Fastify route so the regression that matters is covered: a
+ * legacy client must keep working byte-for-byte after the negotiation layer was
+ * added in front of it, while a client declaring the newer revision gets
+ * `server/discover` and routing-header enforcement.
+ */
+
+import Fastify, { type FastifyInstance } from "fastify";
+import {
+  serializerCompiler,
+  validatorCompiler,
+  type ZodTypeProvider,
+} from "fastify-type-provider-zod";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import { setupTestCacheManager } from "@/test/cache-manager";
+import { grokToolName } from "./grok-tool-names";
+import mcpGatewayRoutes from "./index";
+
+import {
+  LEGACY_MCP_PROTOCOL_REVISION,
+  STATELESS_MCP_PROTOCOL_REVISION,
+} from "./protocol";
+
+setupTestCacheManager();
+
+function makeMcpHeaders(
+  token: string,
+  extra: Record<string, string> = {},
+): Record<string, string> {
+  return {
+    "content-type": "application/json",
+    accept: "application/json, text/event-stream",
+    authorization: `Bearer ${token}`,
+    ...extra,
+  };
+}
+
+describe("MCP Gateway - protocol revision negotiation", () => {
+  let app: FastifyInstance;
+
+  beforeEach(async () => {
+    app = Fastify().withTypeProvider<ZodTypeProvider>();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    await app.register(mcpGatewayRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  async function setup({
+    makeAgent,
+    makeOrganization,
+    makeServiceAccountToken,
+  }: {
+    makeAgent: (args?: Record<string, unknown>) => Promise<{ id: string }>;
+    makeOrganization: () => Promise<{ id: string }>;
+    makeServiceAccountToken: (args: {
+      organizationId: string;
+    }) => Promise<{ value: string }>;
+  }) {
+    const org = await makeOrganization();
+    const agent = await makeAgent({ organizationId: org.id });
+    const token = await makeServiceAccountToken({ organizationId: org.id });
+    return { agent, token };
+  }
+
+  test("Grok gets reversible namespace-safe tool names without changing other clients or unassigned-tool admission", async ({
+    makeAgent,
+    makeOrganization,
+    makeServiceAccountToken,
+    makeInternalMcpCatalog,
+    makeTool,
+    makeAgentTool,
+  }) => {
+    const organization = await makeOrganization();
+    const agent = await makeAgent({
+      organizationId: organization.id,
+      toolExposureMode: "full",
+    });
+    const token = await makeServiceAccountToken({
+      organizationId: organization.id,
+    });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: organization.id,
+      name: "synthetic-tools",
+    });
+    const tool = await makeTool({
+      catalogId: catalog.id,
+      name: "synthetic_tools__read_note",
+      parameters: { type: "object" },
+    });
+    await makeAgentTool(agent.id, tool.id);
+    const post = (grok: boolean, method = "tools/list", params = {}) =>
+      app.inject({
+        method: "POST",
+        url: `/v1/mcp/${agent.id}`,
+        headers: makeMcpHeaders(
+          token.value,
+          grok ? { "user-agent": "grok-cli/1.0.70" } : {},
+        ),
+        payload: { jsonrpc: "2.0", method, params, id: 91 },
+      });
+    const normal = await post(false);
+    const native = await post(true);
+    const original = normal
+      .json()
+      .result.tools.find((entry: { name: string }) => entry.name === tool.name);
+    expect(original).toBeDefined();
+    expect(native.json().result.tools).toContainEqual({
+      ...original,
+      name: grokToolName(tool.name),
+    });
+    expect(
+      normal.json().result.tools.map((entry: { name: string }) => entry.name),
+    ).toContain(tool.name);
+    const canonical = await post(false, "tools/call", {
+      name: "synthetic_tools__missing",
+      arguments: {},
+    });
+    const encoded = await post(true, "tools/call", {
+      name: grokToolName("synthetic_tools__missing"),
+      arguments: {},
+    });
+    expect(encoded.statusCode).toBe(canonical.statusCode);
+    expect(canonical.json().result.isError).toBe(true);
+    expect(encoded.json().result).toEqual(canonical.json().result);
+    const malformed = await post(true, "tools/call", {
+      name: "synthetic_tools__missing",
+      arguments: {},
+    });
+    expect(malformed.json().error.code).toBe(-32602);
+  });
+
+  test("a legacy initialize keeps working and reports the legacy revision", async ({
+    makeAgent,
+    makeOrganization,
+    makeServiceAccountToken,
+  }) => {
+    const { agent, token } = await setup({
+      makeAgent,
+      makeOrganization,
+      makeServiceAccountToken,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/mcp/${agent.id}`,
+      headers: makeMcpHeaders(token.value),
+      payload: {
+        jsonrpc: "2.0",
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "legacy-client", version: "1.0.0" },
+        },
+        id: 1,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toHaveProperty("result");
+    // An undeclared legacy request is left exactly as it was before the
+    // negotiation layer existed: the SDK negotiates from the initialize body
+    // and the gateway does not inject a version of its own.
+    expect(response.headers["mcp-protocol-version"]).toBeUndefined();
+  });
+
+  test("a client declaring an older supported revision is still served", async ({
+    makeAgent,
+    makeOrganization,
+    makeServiceAccountToken,
+  }) => {
+    // Regression guard on the negotiation layer itself: it must not narrow
+    // acceptance to the two advertised revisions and turn away clients the SDK
+    // has always negotiated.
+    const { agent, token } = await setup({
+      makeAgent,
+      makeOrganization,
+      makeServiceAccountToken,
+    });
+
+    for (const declaredVersion of [
+      LEGACY_MCP_PROTOCOL_REVISION,
+      "2025-06-18",
+      "2024-11-05",
+    ]) {
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/mcp/${agent.id}`,
+        headers: makeMcpHeaders(token.value, {
+          "mcp-protocol-version": declaredVersion,
+        }),
+        payload: { jsonrpc: "2.0", method: "tools/list", params: {}, id: 2 },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().result.tools).toBeDefined();
+      // Echoed verbatim rather than upgraded to the newest legacy revision.
+      expect(response.headers["mcp-protocol-version"]).toBe(declaredVersion);
+    }
+  });
+
+  test("server/discover returns the same capabilities the handshake advertises", async ({
+    makeAgent,
+    makeOrganization,
+    makeServiceAccountToken,
+  }) => {
+    const { agent, token } = await setup({
+      makeAgent,
+      makeOrganization,
+      makeServiceAccountToken,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/mcp/${agent.id}`,
+      headers: makeMcpHeaders(token.value, {
+        "mcp-protocol-version": STATELESS_MCP_PROTOCOL_REVISION,
+        "mcp-method": "server/discover",
+      }),
+      payload: { jsonrpc: "2.0", method: "server/discover", id: 7 },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.id).toBe(7);
+    expect(body.result.protocolVersion).toBe(STATELESS_MCP_PROTOCOL_REVISION);
+    expect(body.result.supportedVersions).toEqual([
+      STATELESS_MCP_PROTOCOL_REVISION,
+      LEGACY_MCP_PROTOCOL_REVISION,
+    ]);
+    expect(body.result.protocolVersions).toEqual(body.result.supportedVersions);
+    expect(body.result.serverInfo.name).toBe(`archestra-agent-${agent.id}`);
+    expect(body.result._meta["io.modelcontextprotocol/serverInfo"].name).toBe(
+      `archestra-agent-${agent.id}`,
+    );
+    // listChanged is true for this revision: subscriptions/listen backs it.
+    expect(body.result.capabilities.tools).toEqual({ listChanged: true });
+    expect(body.result.capabilities.extensions).toHaveProperty(
+      "io.modelcontextprotocol/ui",
+    );
+  });
+
+  test("both handshakes describe the gateway to the model in instructions", async ({
+    makeAgent,
+    makeOrganization,
+    makeServiceAccountToken,
+  }) => {
+    const org = await makeOrganization();
+    const token = await makeServiceAccountToken({ organizationId: org.id });
+    const described = await makeAgent({
+      organizationId: org.id,
+      description:
+        "  Tools for the support team. Prefer the ticketing tools.\n",
+    });
+    const undescribed = await makeAgent({
+      organizationId: org.id,
+      description: "   ",
+    });
+    const verbose = await makeAgent({
+      organizationId: org.id,
+      description: "a".repeat(5000),
+    });
+
+    async function handshake(agentId: string) {
+      const initialize = await app.inject({
+        method: "POST",
+        url: `/v1/mcp/${agentId}`,
+        headers: makeMcpHeaders(token.value),
+        payload: {
+          jsonrpc: "2.0",
+          method: "initialize",
+          params: {
+            protocolVersion: LEGACY_MCP_PROTOCOL_REVISION,
+            capabilities: {},
+            clientInfo: { name: "legacy-client", version: "1.0.0" },
+          },
+          id: 1,
+        },
+      });
+      const discover = await app.inject({
+        method: "POST",
+        url: `/v1/mcp/${agentId}`,
+        headers: makeMcpHeaders(token.value, {
+          "mcp-protocol-version": STATELESS_MCP_PROTOCOL_REVISION,
+          "mcp-method": "server/discover",
+        }),
+        payload: { jsonrpc: "2.0", method: "server/discover", id: 2 },
+      });
+      expect(initialize.statusCode).toBe(200);
+      expect(discover.statusCode).toBe(200);
+      return [initialize.json().result, discover.json().result];
+    }
+
+    for (const result of await handshake(described.id)) {
+      expect(result.instructions).toBe(
+        "Tools for the support team. Prefer the ticketing tools.",
+      );
+    }
+    // Clients add instructions to every prompt, so a long description is cut.
+    for (const result of await handshake(verbose.id)) {
+      expect(result.instructions).toHaveLength(2000);
+      expect(result.instructions.endsWith("…")).toBe(true);
+    }
+    // Without a description there is nothing to say, so the field is omitted
+    // rather than sent empty.
+    for (const result of await handshake(undescribed.id)) {
+      expect(result).not.toHaveProperty("instructions");
+    }
+  });
+
+  test("a routing header that disagrees with the body is rejected", async ({
+    makeAgent,
+    makeOrganization,
+    makeServiceAccountToken,
+  }) => {
+    const { agent, token } = await setup({
+      makeAgent,
+      makeOrganization,
+      makeServiceAccountToken,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/mcp/${agent.id}`,
+      headers: makeMcpHeaders(token.value, {
+        "mcp-protocol-version": STATELESS_MCP_PROTOCOL_REVISION,
+        "mcp-method": "tools/list",
+      }),
+      payload: {
+        jsonrpc: "2.0",
+        method: "tools/call",
+        params: { name: "some_tool", arguments: {} },
+        id: 3,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    const body = response.json();
+    expect(body.error.code).toBe(-32020);
+    expect(body.error.message).toContain("does not match request method");
+    // The id is echoed so the client can correlate the failure.
+    expect(body.id).toBe(3);
+  });
+
+  test("a declared stateless request without routing headers is rejected", async ({
+    makeAgent,
+    makeOrganization,
+    makeServiceAccountToken,
+  }) => {
+    const { agent, token } = await setup({
+      makeAgent,
+      makeOrganization,
+      makeServiceAccountToken,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/mcp/${agent.id}`,
+      headers: makeMcpHeaders(token.value, {
+        "mcp-protocol-version": STATELESS_MCP_PROTOCOL_REVISION,
+      }),
+      payload: { jsonrpc: "2.0", method: "tools/list", id: 4 },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toContain("Missing required");
+  });
+
+  test("an unsupported declared version is rejected", async ({
+    makeAgent,
+    makeOrganization,
+    makeServiceAccountToken,
+  }) => {
+    const { agent, token } = await setup({
+      makeAgent,
+      makeOrganization,
+      makeServiceAccountToken,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/mcp/${agent.id}`,
+      headers: makeMcpHeaders(token.value, {
+        "mcp-protocol-version": "1999-01-01",
+      }),
+      payload: { jsonrpc: "2.0", method: "tools/list", id: 5 },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toContain(
+      STATELESS_MCP_PROTOCOL_REVISION,
+    );
+  });
+
+  test("tools/list carries private cache hints for both revisions", async ({
+    makeAgent,
+    makeOrganization,
+    makeServiceAccountToken,
+  }) => {
+    const { agent, token } = await setup({
+      makeAgent,
+      makeOrganization,
+      makeServiceAccountToken,
+    });
+
+    for (const headers of [
+      makeMcpHeaders(token.value),
+      makeMcpHeaders(token.value, {
+        "mcp-protocol-version": STATELESS_MCP_PROTOCOL_REVISION,
+        "mcp-method": "tools/list",
+      }),
+    ]) {
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/mcp/${agent.id}`,
+        headers,
+        payload: { jsonrpc: "2.0", method: "tools/list", params: {}, id: 6 },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const { result } = response.json();
+      expect(result.ttlMs).toBeGreaterThan(0);
+      // Never shareable: the list is filtered per caller.
+      expect(result.cacheScope).toBe("private");
+    }
+  });
+
+  test("a 2026-07-28 request is not refused by the bundled SDK transport", async ({
+    makeAgent,
+    makeOrganization,
+    makeServiceAccountToken,
+  }) => {
+    // The SDK version this runs on validates MCP-Protocol-Version against its
+    // own supported list, which ends at 2025-11-25, and 400s anything newer.
+    // The gateway answers for the new revision itself, so a declared
+    // 2026-07-28 request must reach the tool surface rather than being
+    // rejected by the transport underneath.
+    const { agent, token } = await setup({
+      makeAgent,
+      makeOrganization,
+      makeServiceAccountToken,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/mcp/${agent.id}`,
+      headers: makeMcpHeaders(token.value, {
+        "mcp-protocol-version": STATELESS_MCP_PROTOCOL_REVISION,
+        "mcp-method": "tools/list",
+      }),
+      payload: { jsonrpc: "2.0", method: "tools/list", params: {}, id: 9 },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ id: 9 });
+    expect(response.json().result.tools).toBeDefined();
+    expect(response.headers["mcp-protocol-version"]).toBe(
+      STATELESS_MCP_PROTOCOL_REVISION,
+    );
+  });
+
+  test("every cacheable result carries private cache hints", async ({
+    makeAgent,
+    makeOrganization,
+    makeServiceAccountToken,
+  }) => {
+    // The revision requires ttlMs/cacheScope on all five of these, not just
+    // tools/list.
+    const { agent, token } = await setup({
+      makeAgent,
+      makeOrganization,
+      makeServiceAccountToken,
+    });
+
+    for (const method of [
+      "tools/list",
+      "prompts/list",
+      "resources/list",
+      "resources/templates/list",
+    ]) {
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/mcp/${agent.id}`,
+        headers: makeMcpHeaders(token.value),
+        payload: { jsonrpc: "2.0", method, params: {}, id: 11 },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const { result } = response.json();
+      expect(result.ttlMs).toBeGreaterThan(0);
+      expect(result.cacheScope).toBe("private");
+    }
+  });
+
+  test("results carry the complete envelope and a stable tool order", async ({
+    makeAgent,
+    makeOrganization,
+    makeServiceAccountToken,
+  }) => {
+    const { agent, token } = await setup({
+      makeAgent,
+      makeOrganization,
+      makeServiceAccountToken,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/mcp/${agent.id}`,
+      headers: makeMcpHeaders(token.value),
+      payload: { jsonrpc: "2.0", method: "tools/list", params: {}, id: 12 },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const { result } = response.json();
+
+    // Every ordinary result is "complete"; older clients ignore the field.
+    expect(result.resultType).toBe("complete");
+    expect(result._meta["io.modelcontextprotocol/serverInfo"]).toMatchObject({
+      name: `archestra-agent-${agent.id}`,
+    });
+
+    // Stable order is what makes the ttlMs hint worth anything to a cache.
+    const names = (result.tools as Array<{ name: string }>).map((t) => t.name);
+    expect(names).toEqual([...names].sort());
+  });
+
+  test("ping answers for legacy clients and is refused for 2026-07-28", async ({
+    makeAgent,
+    makeOrganization,
+    makeServiceAccountToken,
+  }) => {
+    const { agent, token } = await setup({
+      makeAgent,
+      makeOrganization,
+      makeServiceAccountToken,
+    });
+
+    // A legacy client keeps the SDK's automatic pong.
+    const legacy = await app.inject({
+      method: "POST",
+      url: `/v1/mcp/${agent.id}`,
+      headers: makeMcpHeaders(token.value),
+      payload: { jsonrpc: "2.0", method: "ping", id: 20 },
+    });
+    expect(legacy.statusCode).toBe(200);
+    expect(legacy.json()).toMatchObject({ id: 20, result: {} });
+
+    // A client that declared 2026-07-28 opted out of the surface ping
+    // belongs to, so answering would be serving the wrong revision.
+    const stateless = await app.inject({
+      method: "POST",
+      url: `/v1/mcp/${agent.id}`,
+      headers: makeMcpHeaders(token.value, {
+        "mcp-protocol-version": STATELESS_MCP_PROTOCOL_REVISION,
+        "mcp-method": "ping",
+      }),
+      payload: { jsonrpc: "2.0", method: "ping", id: 21 },
+    });
+    expect(stateless.statusCode).toBe(200);
+    expect(stateless.json().error).toMatchObject({ code: -32601 });
+    expect(stateless.json().error.message).toContain("removed");
+  });
+
+  test("capabilities no longer advertise unimplemented subscriptions", async ({
+    makeAgent,
+    makeOrganization,
+    makeServiceAccountToken,
+  }) => {
+    const { agent, token } = await setup({
+      makeAgent,
+      makeOrganization,
+      makeServiceAccountToken,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/mcp/${agent.id}`,
+      headers: makeMcpHeaders(token.value, {
+        "mcp-protocol-version": STATELESS_MCP_PROTOCOL_REVISION,
+        "mcp-method": "server/discover",
+      }),
+      payload: { jsonrpc: "2.0", method: "server/discover", id: 22 },
+    });
+
+    const { capabilities } = response.json().result;
+    expect(capabilities.resources).not.toHaveProperty("subscribe");
+    expect(capabilities.resources.listChanged).toBe(false);
+  });
+
+  test("a tool with an invalid x-mcp-header annotation is excluded from tools/list", async ({
+    makeAgent,
+    makeOrganization,
+    makeInternalMcpCatalog,
+    makeTool,
+    makeAgentTool,
+    makeServiceAccountToken,
+  }) => {
+    const org = await makeOrganization();
+    const agent = await makeAgent({
+      toolExposureMode: "full",
+      organizationId: org.id,
+    });
+    const token = await makeServiceAccountToken({ organizationId: org.id });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "xh-catalog",
+    });
+
+    // Invalid: number is explicitly forbidden as an annotated type.
+    const invalid = await makeTool({
+      catalogId: catalog.id,
+      name: "xh-catalog__bad",
+      parameters: {
+        type: "object",
+        properties: { n: { type: "number", "x-mcp-header": "N" } },
+      },
+    });
+    const valid = await makeTool({
+      catalogId: catalog.id,
+      name: "xh-catalog__good",
+      parameters: {
+        type: "object",
+        properties: { region: { type: "string", "x-mcp-header": "Region" } },
+      },
+    });
+    await makeAgentTool(agent.id, invalid.id);
+    await makeAgentTool(agent.id, valid.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/mcp/${agent.id}`,
+      headers: makeMcpHeaders(token.value),
+      payload: { jsonrpc: "2.0", method: "tools/list", params: {}, id: 30 },
+    });
+
+    const names = (response.json().result.tools as Array<{ name: string }>).map(
+      (t) => t.name,
+    );
+    // One malformed definition must not poison the rest of the list.
+    expect(names).toContain("xh-catalog__good");
+    expect(names).not.toContain("xh-catalog__bad");
+  });
+
+  test("GET declines streaming for the stateless revision", async ({
+    makeAgent,
+    makeOrganization,
+    makeServiceAccountToken,
+  }) => {
+    const { agent, token } = await setup({
+      makeAgent,
+      makeOrganization,
+      makeServiceAccountToken,
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/v1/mcp/${agent.id}`,
+      headers: makeMcpHeaders(token.value, {
+        "mcp-protocol-version": STATELESS_MCP_PROTOCOL_REVISION,
+      }),
+    });
+
+    expect(response.statusCode).toBe(405);
+    expect(response.headers.allow).toBe("POST");
+  });
+});

@@ -1,9 +1,64 @@
-import { getOAuthCallbackErrorState } from "./oauth-callback.utils";
+// @vitest-environment node
+import {
+  buildOAuthCallbackPayload,
+  extractOAuthCallbackParams,
+  getOAuthCallbackErrorState,
+  toInternalReturnPath,
+} from "./oauth-callback.utils";
+
+describe("toInternalReturnPath", () => {
+  const origin = "https://app.example.com";
+
+  test("returns path, query, and hash for a same-origin URL", () => {
+    expect(
+      toInternalReturnPath(
+        "https://app.example.com/agents/123?tab=tools#section",
+        origin,
+      ),
+    ).toBe("/agents/123?tab=tools#section");
+  });
+
+  test("resolves a relative path against the origin", () => {
+    expect(toInternalReturnPath("/mcp/registry?x=1", origin)).toBe(
+      "/mcp/registry?x=1",
+    );
+  });
+
+  test("returns null for a cross-origin URL", () => {
+    expect(
+      toInternalReturnPath("https://evil.example.com/agents", origin),
+    ).toBe(null);
+  });
+
+  test("returns null for javascript: URLs", () => {
+    expect(toInternalReturnPath("javascript:alert(1)", origin)).toBe(null);
+  });
+
+  test("returns null when no return URL is stored", () => {
+    expect(toInternalReturnPath(null, origin)).toBe(null);
+  });
+});
 
 describe("getOAuthCallbackErrorState", () => {
+  test.each([
+    null,
+    "another-tab-state",
+  ])("rejects a callback whose state does not match this tab (%s)", (expectedState) => {
+    expect(
+      getOAuthCallbackErrorState({
+        code: "auth-code",
+        state: "oauth-state",
+        expectedState,
+        error: null,
+        errorDescription: null,
+      }),
+    ).toMatchObject({ title: "OAuth Connection Expired" });
+  });
+
   test("returns null when code and state are present", () => {
     expect(
       getOAuthCallbackErrorState({
+        expectedState: "oauth-state",
         code: "auth-code",
         error: null,
         errorDescription: null,
@@ -15,6 +70,7 @@ describe("getOAuthCallbackErrorState", () => {
   test("prefers provider error description when present", () => {
     expect(
       getOAuthCallbackErrorState({
+        expectedState: "oauth-state",
         code: null,
         error: "invalid_scope",
         errorDescription:
@@ -31,6 +87,7 @@ describe("getOAuthCallbackErrorState", () => {
   test("handles missing code without provider error", () => {
     expect(
       getOAuthCallbackErrorState({
+        expectedState: "oauth-state",
         code: null,
         error: null,
         errorDescription: null,
@@ -46,6 +103,7 @@ describe("getOAuthCallbackErrorState", () => {
   test("handles missing state without provider error", () => {
     expect(
       getOAuthCallbackErrorState({
+        expectedState: "oauth-state",
         code: "auth-code",
         error: null,
         errorDescription: null,
@@ -56,5 +114,62 @@ describe("getOAuthCallbackErrorState", () => {
       description:
         "The OAuth provider redirected back without a state value. Start the installation again and retry the sign-in flow.",
     });
+  });
+});
+
+describe("extractOAuthCallbackParams", () => {
+  it("reads every parameter the callback consumes, including iss", () => {
+    // Regression: iss was sent by RFC 9207 servers, accepted by the backend,
+    // and dropped here. Before the fix this extraction did not read it, so
+    // this assertion is the one that would have failed.
+    const params = new URLSearchParams({
+      code: "auth-code",
+      state: "state-1",
+      iss: "https://login.example.com",
+    });
+
+    expect(extractOAuthCallbackParams(params)).toEqual({
+      code: "auth-code",
+      error: null,
+      errorDescription: null,
+      state: "state-1",
+      iss: "https://login.example.com",
+    });
+  });
+
+  it("reports absent parameters as null rather than omitting them", () => {
+    const params = extractOAuthCallbackParams(new URLSearchParams());
+
+    expect(params.iss).toBeNull();
+    expect(params.code).toBeNull();
+  });
+});
+
+describe("buildOAuthCallbackPayload", () => {
+  it("carries iss to the token exchange when the server sent one", () => {
+    expect(
+      buildOAuthCallbackPayload({
+        code: "auth-code",
+        state: "state-1",
+        iss: "https://login.example.com",
+      }),
+    ).toEqual({
+      code: "auth-code",
+      state: "state-1",
+      iss: "https://login.example.com",
+    });
+  });
+
+  it("omits iss entirely when the server sent none", () => {
+    // Absent, not null: the backend schema takes an optional string, and the
+    // RFC 9207 decision table distinguishes absent from present.
+    const payload = buildOAuthCallbackPayload({
+      code: "auth-code",
+      state: "state-1",
+      iss: null,
+    });
+
+    expect(payload).toEqual({ code: "auth-code", state: "state-1" });
+    expect("iss" in payload).toBe(false);
   });
 });

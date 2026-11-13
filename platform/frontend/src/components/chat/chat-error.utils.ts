@@ -2,9 +2,15 @@ import {
   ChatErrorCode,
   ChatErrorMessages,
   type ChatErrorResponse,
+  DEFAULT_APP_NAME,
   isChatErrorResponse,
+  OUTPUT_LIMIT_REACHED_MESSAGE,
   RetryableErrorCodes,
-} from "@shared";
+} from "@archestra/shared";
+import {
+  getUserFacingApiErrorMessage,
+  isHtmlDocumentMessage,
+} from "@archestra/shared/api-error";
 
 /**
  * AI SDK internal error type names that aren't useful to show users
@@ -29,6 +35,28 @@ export function parseErrorResponse(error: Error): ChatErrorResponse | null {
     // Not JSON or not a ChatErrorResponse
   }
   return null;
+}
+
+/** Simplified cards only show curated copy, never provider or raw error text. */
+export function getSimplifiedChatErrorMessage(
+  error: ChatErrorResponse,
+  appName: string,
+): string {
+  // Allow this shared, curated variant without exposing arbitrary server or
+  // provider text. Other early stops keep the neutral IncompleteResponse copy.
+  if (
+    !error.usageLimitExceeded &&
+    error.code === ChatErrorCode.IncompleteResponse &&
+    error.message === OUTPUT_LIMIT_REACHED_MESSAGE
+  ) {
+    return branded(OUTPUT_LIMIT_REACHED_MESSAGE, appName);
+  }
+  return branded(
+    ChatErrorMessages[
+      error.usageLimitExceeded ? ChatErrorCode.UsageLimitExceeded : error.code
+    ],
+    appName,
+  );
 }
 
 /**
@@ -106,6 +134,7 @@ const CLIENT_ERROR_PATTERNS: Array<{
   {
     test: (msg) =>
       msg === "Failed to fetch" ||
+      msg === "Load failed" ||
       msg.includes("NetworkError") ||
       msg.includes("network"),
     code: ChatErrorCode.NetworkError,
@@ -118,37 +147,90 @@ const CLIENT_ERROR_PATTERNS: Array<{
 ];
 
 /**
+ * Map backend ApiError `type` values to normalized ChatErrorCodes so the inline
+ * error card shows the right badge (code, retryable) regardless of which API
+ * route bounced the request. The backend message is shown verbatim — it's
+ * already user-friendly (e.g. "Request body too large: 65 MB (limit 50 MB)").
+ */
+const BACKEND_ERROR_TYPE_TO_CODE: Record<string, ChatErrorCode> = {
+  api_payload_too_large_error: ChatErrorCode.InvalidRequest,
+  api_validation_error: ChatErrorCode.InvalidRequest,
+  api_authentication_error: ChatErrorCode.Authentication,
+  api_authorization_error: ChatErrorCode.PermissionDenied,
+  api_not_found_error: ChatErrorCode.NotFound,
+  api_internal_server_error: ChatErrorCode.ServerError,
+};
+
+/**
  * Map unstructured errors to a ChatErrorResponse so they display with the
  * same styled error card. Recognizes known client-side patterns (network errors,
- * aborts) and falls back to a generic error for anything else.
+ * aborts), known backend error envelopes, and falls back to a generic error.
  */
-export function mapClientError(error: Error): ChatErrorResponse {
+/**
+ * `ChatErrorMessages` is the shared default copy, written under the default
+ * brand. The backend brands it through `archestraMcpBranding` before sending;
+ * these client-side fallbacks (used when no server message arrives) have to do
+ * the same substitution so a white-labeled deployment never shows the vendor's
+ * name in a chat error.
+ *
+ * Mirrors the backend's `archestraMcpBranding.brandBuiltInText` (which the
+ * frontend cannot import) minus the tool-prefix swap, which never appears in
+ * these messages. If that swap ever grows another token, update both.
+ */
+function branded(message: string, appName: string): string {
+  return appName === DEFAULT_APP_NAME
+    ? message
+    : message.split(DEFAULT_APP_NAME).join(appName);
+}
+
+export function mapClientError(
+  error: Error,
+  appName: string = DEFAULT_APP_NAME,
+): ChatErrorResponse {
   const msg = error.message;
 
   for (const pattern of CLIENT_ERROR_PATTERNS) {
     if (pattern.test(msg)) {
       return {
         code: pattern.code,
-        message: ChatErrorMessages[pattern.code],
+        message: branded(ChatErrorMessages[pattern.code], appName),
         isRetryable: RetryableErrorCodes.has(pattern.code),
       };
     }
   }
 
-  // Try to extract message from backend's { error: { message } } format
+  // An HTML error page (a proxy/ingress 502 reaching the client instead of a
+  // JSON envelope) must not be rendered verbatim — surface friendly copy.
+  if (isHtmlDocumentMessage(msg)) {
+    return {
+      code: ChatErrorCode.ServerError,
+      message: getUserFacingApiErrorMessage(msg),
+      isRetryable: RetryableErrorCodes.has(ChatErrorCode.ServerError),
+    };
+  }
+
+  // Try to extract message + type from backend's { error: { message, type } } format
   let displayMessage = msg;
+  let backendType: string | undefined;
   try {
     const parsed = JSON.parse(msg);
     if (parsed?.error?.message) {
       displayMessage = parsed.error.message;
     }
+    if (typeof parsed?.error?.type === "string") {
+      backendType = parsed.error.type;
+    }
   } catch {
     // Not JSON, use as-is
   }
 
+  const mappedCode = backendType
+    ? BACKEND_ERROR_TYPE_TO_CODE[backendType]
+    : undefined;
+  const code = mappedCode ?? ChatErrorCode.Unknown;
   return {
-    code: ChatErrorCode.Unknown,
-    message: displayMessage || ChatErrorMessages[ChatErrorCode.Unknown],
-    isRetryable: RetryableErrorCodes.has(ChatErrorCode.Unknown),
+    code,
+    message: displayMessage || branded(ChatErrorMessages[code], appName),
+    isRetryable: RetryableErrorCodes.has(code),
   };
 }

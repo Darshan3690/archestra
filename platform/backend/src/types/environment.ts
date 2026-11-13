@@ -1,0 +1,339 @@
+import type { EnvironmentDefaultableResource } from "@archestra/shared";
+import { createSelectSchema } from "drizzle-zod";
+import { z } from "zod";
+import { schema } from "@/database/schema";
+import { isValidCidr } from "@/utils/network";
+import { LabelWithDetailsSchema } from "./label";
+import { RetiredSharingUpdateFieldSchema } from "./visibility";
+
+// === Public schemas & types ===
+
+/**
+ * A valid JavaScript regex source, stored without delimiters or flags. Used as
+ * an environment's allowlist validation rule for MCP config values.
+ */
+export const ValidationRegexSchema = z
+  .string()
+  .max(1000)
+  .refine(
+    (val) => {
+      try {
+        new RegExp(val);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    { message: "Must be a valid regular expression" },
+  );
+
+/**
+ * A single trusted container image registry entry: a `registry-host` or
+ * `registry-host/repository-prefix` (no scheme, tag, or digest). An image is
+ * trusted when its normalized `host/repository` equals an entry or extends it at
+ * a path boundary (so `ghcr.io/acme` trusts `ghcr.io/acme/foo` but not
+ * `ghcr.io/acme-evil`). Used as an environment's image-registry allowlist for
+ * personal local catalog items.
+ */
+export const TrustedImageRegistryEntrySchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(255)
+  .regex(
+    /^[a-z0-9._:/-]+$/i,
+    "Must be a registry reference such as ghcr.io/acme or docker.io/library",
+  );
+
+/**
+ * An environment's list of trusted image registries. NULL or an empty array
+ * disables the check (any image is allowed). Mirrors `ValidationRegexSchema` for
+ * the image-registry policy.
+ */
+export const TrustedImageRegistriesSchema = z
+  .array(TrustedImageRegistryEntrySchema)
+  .max(200);
+
+export const NetworkPolicyEgressModeSchema = z.enum([
+  "off",
+  "restricted",
+  "unrestricted",
+]);
+
+export const NetworkPolicyDomainPresetSchema = z.enum([
+  "none",
+  "common_dependencies",
+  "package_managers",
+]);
+
+export const NetworkPolicySchema = z.object({
+  egressMode: NetworkPolicyEgressModeSchema,
+  domainPreset: NetworkPolicyDomainPresetSchema,
+  allowedDomains: z.array(z.string()),
+  allowedCidrs: z.array(z.string()),
+});
+
+export const NetworkPolicyInputSchema = z
+  .object({
+    egressMode: NetworkPolicyEgressModeSchema.optional(),
+    domainPreset: NetworkPolicyDomainPresetSchema.optional(),
+    allowedDomains: z
+      .array(createNetworkPolicyDomainSchema())
+      .max(500)
+      .optional(),
+    allowedCidrs: z.array(createNetworkPolicyCidrSchema()).max(500).optional(),
+  })
+  .superRefine(validateNetworkPolicyInput)
+  .transform((policy) => normalizeNetworkPolicy(policy));
+
+export const EffectiveNetworkPolicySchema = z.object({
+  source: z.enum(["agent", "environment", "organization_default", "built_in"]),
+  policy: NetworkPolicySchema.nullable(),
+});
+
+export const K8sNetworkPolicyCapabilitiesSchema = z.object({
+  kubernetesNetworkPolicy: z.boolean(),
+  ciliumNetworkPolicy: z.boolean(),
+  gkeFqdnNetworkPolicy: z.boolean(),
+  awsApplicationNetworkPolicy: z.boolean(),
+  provider: z.enum([
+    "cilium",
+    "gke-fqdn",
+    "aws-application-network-policy",
+    "kubernetes",
+    "none",
+  ]),
+  supportsFqdn: z.boolean(),
+  supportsHttpMethods: z.boolean(),
+  message: z.string().nullable(),
+  // Whether enforcement was measured by the chart's probe or merely inferred
+  // from which policy CRDs the API serves. Inference cannot distinguish a
+  // cluster that enforces from one that only stores the objects, so the UI
+  // words its warning differently depending on which answer it has.
+  enforcementSource: z.enum(["probe", "api-discovery"]),
+  // How far the enforcement answer can be trusted, kept separate from
+  // `provider` because that field also names the dialect the runtime writes.
+  // Folding the two together forced an unmeasured cluster to be filed as either
+  // enforcing or not, and both answers are wrong for some cluster: claiming
+  // enforcement hides a real gap, denying it disables controls that work.
+  enforcementStatus: z.enum([
+    "verified-enforced",
+    "verified-not-enforced",
+    "unknown",
+  ]),
+  probe: z.enum(["enforced", "not-enforced", "inconclusive", "absent"]),
+  probedAt: z.string().nullable(),
+});
+
+export const K8sAgentSandboxCapabilitiesSchema = z.object({
+  // Whether the cluster serves every Agent Sandbox resource Agent Runtime
+  // creates. Agent Runtime is available exactly when this is true.
+  installed: z.boolean(),
+  // `<plural>.<group>` names of the resources the cluster does not serve.
+  missingResources: z.array(z.string()),
+  message: z.string(),
+});
+
+export const K8sCapabilitiesSchema = z.object({
+  networkPolicy: K8sNetworkPolicyCapabilitiesSchema,
+  agentSandbox: K8sAgentSandboxCapabilitiesSchema,
+});
+
+export const SelectEnvironmentSchema = createSelectSchema(
+  schema.environmentsTable,
+).extend({
+  networkPolicy: NetworkPolicySchema.nullable(),
+  trustedImageRegistries: TrustedImageRegistriesSchema.nullable(),
+});
+
+export const ReadEnvironmentSchema = SelectEnvironmentSchema.extend({
+  labels: z.array(LabelWithDetailsSchema),
+});
+
+/**
+ * Listing response shape — row columns plus the number of catalog items
+ * currently assigned to this environment, for delete-confirmation UI, and
+ * whether the caller may deploy into it. `canDeploy` answers per environment
+ * from its `use` grants, so the picker can offer one environment while
+ * disabling another.
+ */
+export const EnvironmentWithAssignedCountSchema =
+  SelectEnvironmentSchema.extend({
+    assignedCatalogCount: z.number().int().nonnegative(),
+    labels: z.array(LabelWithDetailsSchema),
+    canDeploy: z.boolean(),
+  });
+
+/**
+ * Where newly created resources of each kind land when their creator does not
+ * pick an environment. `null` (the default for every kind) means the org's
+ * implicit Default environment, i.e. the historical behavior.
+ *
+ * `satisfies` keeps the keys exhaustive against
+ * `ENVIRONMENT_DEFAULTABLE_RESOURCES` — adding a kind there fails to compile
+ * until it is represented here.
+ */
+export const EnvironmentResourceDefaultsSchema = z.object({
+  mcpRegistry: z.string().uuid().nullable(),
+  app: z.string().uuid().nullable(),
+  agent: z.string().uuid().nullable(),
+  mcpGateway: z.string().uuid().nullable(),
+  knowledgeSource: z.string().uuid().nullable(),
+} satisfies Record<EnvironmentDefaultableResource, z.ZodTypeAny>);
+
+/**
+ * Update payload for the per-resource defaults. Omitted kinds are left
+ * unchanged; an explicit `null` resets that kind to the Default environment.
+ */
+export const UpdateEnvironmentResourceDefaultsSchema =
+  EnvironmentResourceDefaultsSchema.partial();
+
+/**
+ * Full listing payload: the org's environments, the count of catalog items
+ * with no environment (which implicitly belong to the default environment),
+ * and where new resources of each kind land.
+ */
+export const EnvironmentListSchema = z.object({
+  environments: z.array(EnvironmentWithAssignedCountSchema),
+  defaultAssignedCatalogCount: z.number().int().nonnegative(),
+  resourceDefaults: EnvironmentResourceDefaultsSchema,
+});
+
+export const KubernetesNamespaceSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(63)
+  .regex(
+    /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/,
+    "Must be a valid Kubernetes namespace name (lowercase letters, numbers, and hyphens only)",
+  );
+
+export const CreateEnvironmentSchema = z.object({
+  name: z.string().trim().min(1).max(50),
+  description: z.string().trim().max(500).nullable().optional(),
+  namespace: KubernetesNamespaceSchema.nullable().optional(),
+  networkPolicy: NetworkPolicyInputSchema.nullable().optional(),
+  restricted: RetiredSharingUpdateFieldSchema,
+  validationRegex: ValidationRegexSchema.nullable().optional(),
+  trustedImageRegistries: TrustedImageRegistriesSchema.nullable().optional(),
+  labels: z.array(LabelWithDetailsSchema).optional(),
+});
+
+/**
+ * All editable fields. Send `null` to clear the nullable ones (namespace,
+ * description, validationRegex, trustedImageRegistries).
+ */
+export const UpdateEnvironmentSchema = z.object({
+  name: z.string().trim().min(1).max(50).optional(),
+  description: z.string().trim().max(500).nullable().optional(),
+  namespace: KubernetesNamespaceSchema.nullable().optional(),
+  networkPolicy: NetworkPolicyInputSchema.nullable().optional(),
+  restricted: RetiredSharingUpdateFieldSchema,
+  validationRegex: ValidationRegexSchema.nullable().optional(),
+  trustedImageRegistries: TrustedImageRegistriesSchema.nullable().optional(),
+  labels: z.array(LabelWithDetailsSchema).optional(),
+});
+
+export type Environment = z.infer<typeof SelectEnvironmentSchema>;
+export type EnvironmentWithAssignedCount = z.infer<
+  typeof EnvironmentWithAssignedCountSchema
+>;
+export type EnvironmentList = z.infer<typeof EnvironmentListSchema>;
+export type EnvironmentResourceDefaults = z.infer<
+  typeof EnvironmentResourceDefaultsSchema
+>;
+export type UpdateEnvironmentResourceDefaults = z.infer<
+  typeof UpdateEnvironmentResourceDefaultsSchema
+>;
+export type CreateEnvironment = z.infer<typeof CreateEnvironmentSchema>;
+export type UpdateEnvironment = z.infer<typeof UpdateEnvironmentSchema>;
+export type TrustedImageRegistries = z.infer<
+  typeof TrustedImageRegistriesSchema
+>;
+export type NetworkPolicyEgressMode = z.infer<
+  typeof NetworkPolicyEgressModeSchema
+>;
+export type NetworkPolicyDomainPreset = z.infer<
+  typeof NetworkPolicyDomainPresetSchema
+>;
+export type NetworkPolicy = z.infer<typeof NetworkPolicySchema>;
+export type NetworkPolicyInput = z.input<typeof NetworkPolicyInputSchema>;
+export type EffectiveNetworkPolicy = z.infer<
+  typeof EffectiveNetworkPolicySchema
+>;
+export type K8sNetworkPolicyCapabilities = z.infer<
+  typeof K8sNetworkPolicyCapabilitiesSchema
+>;
+export type K8sAgentSandboxCapabilities = z.infer<
+  typeof K8sAgentSandboxCapabilitiesSchema
+>;
+export type K8sCapabilities = z.infer<typeof K8sCapabilitiesSchema>;
+
+// === Internal helpers ===
+
+function createNetworkPolicyDomainSchema() {
+  return z
+    .string()
+    .trim()
+    .min(1)
+    .max(253)
+    .regex(
+      /^(\*\.)?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/i,
+      "Must be a domain such as api.example.com or *.example.com",
+    )
+    .transform((domain) => domain.toLowerCase());
+}
+
+function createNetworkPolicyCidrSchema() {
+  return z
+    .string()
+    .trim()
+    .refine(
+      isValidCidr,
+      "Must be a CIDR such as 203.0.113.0/24 or 2001:db8::/32",
+    );
+}
+
+function validateNetworkPolicyInput(
+  value: {
+    allowedDomains?: string[];
+    allowedCidrs?: string[];
+  },
+  ctx: z.RefinementCtx,
+) {
+  const domains = value.allowedDomains ?? [];
+  if (new Set(domains).size !== domains.length) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["allowedDomains"],
+      message: "Allowed domains must be unique.",
+    });
+  }
+
+  const cidrs = value.allowedCidrs ?? [];
+  if (new Set(cidrs).size !== cidrs.length) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["allowedCidrs"],
+      message: "Allowed CIDRs must be unique.",
+    });
+  }
+}
+
+function normalizeNetworkPolicy(value: {
+  egressMode?: NetworkPolicyEgressMode;
+  domainPreset?: NetworkPolicyDomainPreset;
+  allowedDomains?: string[];
+  allowedCidrs?: string[];
+}): NetworkPolicy {
+  const egressMode = value.egressMode ?? "restricted";
+  return {
+    egressMode,
+    domainPreset:
+      egressMode === "restricted" ? (value.domainPreset ?? "none") : "none",
+    allowedDomains:
+      egressMode === "restricted" ? (value.allowedDomains ?? []) : [],
+    allowedCidrs: egressMode === "off" ? [] : (value.allowedCidrs ?? []),
+  };
+}

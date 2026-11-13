@@ -3,20 +3,34 @@
 import { useControllableState } from "@radix-ui/react-use-controllable-state";
 import { BrainIcon, ChevronDownIcon } from "lucide-react";
 import type { ComponentProps } from "react";
-import { createContext, memo, useContext, useEffect, useState } from "react";
+import {
+  createContext,
+  memo,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/utils/tailwind";
 import { Response } from "./response";
 
 type ReasoningContextValue = {
   isStreaming: boolean;
   isOpen: boolean;
   setIsOpen: (open: boolean) => void;
-  duration: number;
+  // Undefined until a live block measures its own duration (or a caller passes
+  // one); a persisted block never has it. `getThinkingMessage` distinguishes the
+  // two, so the type must admit undefined.
+  duration: number | undefined;
+  // True while more thinking may still join a merged run. Any duration measured
+  // so far is a partial sum, so the trigger keeps reading "Thinking…" rather
+  // than announcing a total it is about to revise upward.
+  keepOpen: boolean;
 };
 
 const ReasoningContext = createContext<ReasoningContextValue | null>(null);
@@ -35,9 +49,14 @@ export type ReasoningProps = ComponentProps<typeof Collapsible> & {
   defaultOpen?: boolean;
   onOpenChange?: (open: boolean) => void;
   duration?: number;
+  /**
+   * More content may still arrive — hold the auto-close. A merged run of
+   * thinking blocks streams in bursts with tool calls in between; without this
+   * it would collapse and re-expand once per burst.
+   */
+  keepOpen?: boolean;
 };
 
-const AUTO_CLOSE_DELAY = 1000;
 const MS_IN_S = 1000;
 
 export const Reasoning = memo(
@@ -45,9 +64,12 @@ export const Reasoning = memo(
     className,
     isStreaming = false,
     open,
-    defaultOpen = true,
+    // Collapsed even while streaming: the header already reads "Thinking…",
+    // and opening then auto-closing every block reads as flicker.
+    defaultOpen = false,
     onOpenChange,
     duration: durationProp,
+    keepOpen = false,
     children,
     ...props
   }: ReasoningProps) => {
@@ -58,11 +80,21 @@ export const Reasoning = memo(
     });
     const [duration, setDuration] = useControllableState({
       prop: durationProp,
-      defaultProp: 0,
+      // Undefined, not 0: a reasoning block that never streamed (a persisted
+      // conversation reopened, or a surface that passes no `isStreaming`) has no
+      // measured duration and must read "Thought for a few seconds", not stay
+      // pinned on "Thinking…". A live block still gets a real duration from the
+      // streaming-end effect below.
+      defaultProp: undefined,
     });
 
-    const [hasAutoClosed, setHasAutoClosed] = useState(false);
     const [startTime, setStartTime] = useState<number | null>(null);
+    // A merged run of thinking blocks streams in several bursts, one per block,
+    // with the tool calls it swallowed in between. Accumulate the streaming
+    // intervals so the label reports total thinking time: overwriting would
+    // report only the final block, and wall-clock would fold in the tool runs.
+    // A single-burst block accumulates exactly its own interval, as before.
+    const streamedMsRef = useRef(0);
 
     // Track duration when streaming starts and ends
     useEffect(() => {
@@ -71,23 +103,11 @@ export const Reasoning = memo(
           setStartTime(Date.now());
         }
       } else if (startTime !== null) {
-        setDuration(Math.ceil((Date.now() - startTime) / MS_IN_S));
+        streamedMsRef.current += Date.now() - startTime;
+        setDuration(Math.ceil(streamedMsRef.current / MS_IN_S));
         setStartTime(null);
       }
     }, [isStreaming, startTime, setDuration]);
-
-    // Auto-open when streaming starts, auto-close when streaming ends (once only)
-    useEffect(() => {
-      if (defaultOpen && !isStreaming && isOpen && !hasAutoClosed) {
-        // Add a small delay before closing to allow user to see the content
-        const timer = setTimeout(() => {
-          setIsOpen(false);
-          setHasAutoClosed(true);
-        }, AUTO_CLOSE_DELAY);
-
-        return () => clearTimeout(timer);
-      }
-    }, [isStreaming, isOpen, defaultOpen, setIsOpen, hasAutoClosed]);
 
     const handleOpenChange = (newOpen: boolean) => {
       setIsOpen(newOpen);
@@ -95,10 +115,10 @@ export const Reasoning = memo(
 
     return (
       <ReasoningContext.Provider
-        value={{ isStreaming, isOpen, setIsOpen, duration }}
+        value={{ isStreaming, isOpen, setIsOpen, duration, keepOpen }}
       >
         <Collapsible
-          className={cn("not-prose mb-4", className)}
+          className={cn("not-prose mb-4 pl-2", className)}
           onOpenChange={handleOpenChange}
           open={isOpen}
           {...props}
@@ -119,12 +139,14 @@ const getThinkingMessage = (isStreaming: boolean, duration?: number) => {
   if (duration === undefined) {
     return <p>Thought for a few seconds</p>;
   }
-  return <p>Thought for {duration} seconds</p>;
+  return (
+    <p>{`Thought for ${duration} ${duration === 1 ? "second" : "seconds"}`}</p>
+  );
 };
 
 export const ReasoningTrigger = memo(
   ({ className, children, ...props }: ReasoningTriggerProps) => {
-    const { isStreaming, isOpen, duration } = useReasoning();
+    const { isStreaming, isOpen, duration, keepOpen } = useReasoning();
 
     return (
       <CollapsibleTrigger
@@ -137,7 +159,7 @@ export const ReasoningTrigger = memo(
         {children ?? (
           <>
             <BrainIcon className="size-4" />
-            {getThinkingMessage(isStreaming, duration)}
+            {getThinkingMessage(isStreaming || keepOpen, duration)}
             <ChevronDownIcon
               className={cn(
                 "size-4 transition-transform",
@@ -167,7 +189,25 @@ export const ReasoningContent = memo(
       )}
       {...props}
     >
-      <Response className="grid gap-2">{children}</Response>
+      {/* Thinking is markdown like any other turn, so it can carry code
+          blocks, long identifiers or URLs that have no break opportunity to
+          shrink at. `grid` sized its single `auto` track from the widest of
+          those, which stretched the whole column — prose included — past the
+          chat and put a horizontal scrollbar on the conversation.
+          `flex-col` keeps the same gap rhythm while leaving every child at the
+          container's width, and `break-words` lets a long token wrap onto the
+          next line so the block reads at the chat's width instead of trading
+          the page's scrollbar for one of its own. Fenced code keeps its own
+          body scroller (`white-space: pre` ignores the wrapping), as it does
+          in a message. `overflow-x-auto` is the backstop for the rest: a wide
+          table scrolls inside the block rather than widening the page. */}
+      {/* Same measure as an assistant turn: MessageContent caps its text at
+          max-w-[80%] of the transcript column, and both sit behind the same
+          pl-2, so thinking wraps on the same line length as the answer under
+          it rather than running ~25% wider. */}
+      <Response className="flex max-w-[80%] flex-col gap-2 overflow-x-auto break-words">
+        {children}
+      </Response>
     </CollapsibleContent>
   ),
 );

@@ -1,6 +1,16 @@
-import type { archestraApiTypes } from "@shared";
+import type { UIMessage } from "@ai-sdk/react";
+import {
+  type archestraApiTypes,
+  type ChatMessageFeedback,
+  ChatMessageFeedbackSchema,
+  HOOK_RUN_PART_TYPE,
+  hasRenderableAssistantContent,
+  toPlaceholderTitle,
+} from "@archestra/shared";
 
 const DEFAULT_SESSION_NAME = "New Chat Session";
+
+export const PERSISTED_MESSAGE_ID_METADATA_KEY = "persistedMessageId";
 
 export type ConversationShareVisibility = NonNullable<
   archestraApiTypes.GetChatConversationsResponses["200"][number]["share"]
@@ -25,14 +35,94 @@ export function getChatExternalAgentId(appName: string): string {
  */
 export function conversationStorageKeys(conversationId: string) {
   return {
-    artifactOpen: `archestra-chat-artifact-open-${conversationId}`,
+    rightPanelOpen: `archestra-chat-right-panel-open-${conversationId}`,
+    rightPanelTab: `archestra-chat-right-panel-tab-${conversationId}`,
     draft: `archestra_chat_draft_${conversationId}`,
+    messageQueue: `archestra_chat_queue_${conversationId}`,
+    encryptedChatKey: `archestra_encrypted_chat_key_${conversationId}`,
+    /**
+     * Where the encrypted-chat key lived under the feature's former names
+     * ("locked chat", then "incognito"), newest first. Read (and migrated) on
+     * access, never written — see `getEncryptedChatKey`.
+     */
+    legacyEncryptedChatKeys: [
+      `archestra_locked_chat_key_${conversationId}`,
+      `archestra_incognito_key_${conversationId}`,
+    ],
   };
+}
+
+/**
+ * localStorage key for the new-chat composer's prompt draft. Deliberately a
+ * single, agent-independent key: the draft is the message the user is
+ * composing, so switching the selected agent must NOT swap (and thereby drop)
+ * what they have typed.
+ */
+export const NEW_CHAT_DRAFT_STORAGE_KEY = "archestra_chat_draft_new";
+
+/**
+ * Resolves the prompt-draft localStorage key for the prompt input: a
+ * conversation-scoped key when editing an existing conversation, otherwise the
+ * shared new-chat key. Keeping this in one place ensures the draft survives an
+ * agent change on a new chat (the key does not depend on the agent).
+ */
+export function chatDraftStorageKey(
+  conversationId: string | null | undefined,
+): string {
+  return conversationId
+    ? conversationStorageKeys(conversationId).draft
+    : NEW_CHAT_DRAFT_STORAGE_KEY;
+}
+
+/** The Storage surface the draft migration needs (a subset of `localStorage`). */
+type DraftStorage = Pick<
+  Storage,
+  "length" | "key" | "getItem" | "setItem" | "removeItem"
+>;
+
+/**
+ * One-time migration of pre-upgrade new-chat drafts. Earlier builds keyed the
+ * new-chat draft by agent (`archestra_chat_draft_new_<agentId>`); this build
+ * uses a single agent-independent key. Without migrating, an unsent draft
+ * written before the upgrade would be ignored — and then cleared — on the next
+ * new chat. Adopt one legacy draft into the shared key when it is empty, then
+ * remove every legacy key so the migration effectively runs once. Idempotent.
+ */
+export function migrateLegacyNewChatDraft(storage: DraftStorage): void {
+  const legacyPrefix = `${NEW_CHAT_DRAFT_STORAGE_KEY}_`;
+  const legacyKeys: string[] = [];
+  for (let i = 0; i < storage.length; i++) {
+    const key = storage.key(i);
+    if (key?.startsWith(legacyPrefix)) {
+      legacyKeys.push(key);
+    }
+  }
+  if (legacyKeys.length === 0) {
+    return;
+  }
+
+  // Only adopt a legacy draft when the user has not started a new shared draft.
+  if (!storage.getItem(NEW_CHAT_DRAFT_STORAGE_KEY)) {
+    for (const key of legacyKeys) {
+      const value = storage.getItem(key);
+      if (value) {
+        storage.setItem(NEW_CHAT_DRAFT_STORAGE_KEY, value);
+        break;
+      }
+    }
+  }
+
+  for (const key of legacyKeys) {
+    storage.removeItem(key);
+  }
 }
 
 /**
  * Extracts a display title for a conversation.
  * Priority: explicit title > first user message > default session name
+ *
+ * The first-user-message case covers a chat that has no title at all, so it is
+ * a whole prompt rather than a title — show it title-shaped.
  */
 export function getConversationDisplayTitle(
   title: string | null,
@@ -41,20 +131,33 @@ export function getConversationDisplayTitle(
 ): string {
   if (title) return title;
 
-  // Try to extract from first user message
-  if (messages && messages.length > 0) {
-    for (const msg of messages) {
-      if (msg.role === "user" && msg.parts) {
-        for (const part of msg.parts) {
-          if (part.type === "text" && part.text) {
-            return part.text;
-          }
-        }
-      }
-    }
-  }
+  // A prompt of only whitespace shapes down to nothing, so fall through to the
+  // default name rather than showing a blank row.
+  return (
+    toPlaceholderTitle(getFirstUserMessageText(messages)) ||
+    DEFAULT_SESSION_NAME
+  );
+}
 
-  return DEFAULT_SESSION_NAME;
+/**
+ * Whether a stored title is still the placeholder taken from the opening prompt
+ * rather than one the server generated. A title equal to the *untrimmed* prompt
+ * counts too: conversations created before placeholders were shortened hold the
+ * whole prompt, and should still be retitled.
+ */
+export function isPlaceholderTitle(
+  title: string | null | undefined,
+  // biome-ignore lint/suspicious/noExplicitAny: UIMessage structure from AI SDK is dynamic
+  messages?: any[],
+): boolean {
+  if (!title) return false;
+
+  const firstUserMessage = getFirstUserMessageText(messages).trim();
+  if (!firstUserMessage) return false;
+
+  return (
+    title === firstUserMessage || title === toPlaceholderTitle(firstUserMessage)
+  );
 }
 
 export function getConversationShareTooltip(
@@ -69,4 +172,329 @@ export function getConversationShareTooltip(
   }
 
   return "Shared with your organization";
+}
+
+type ManualCompactionResponse =
+  archestraApiTypes.CompactChatConversationResponses["200"];
+
+export function getManualCompactionSkippedMessage(
+  reason: ManualCompactionResponse["reason"],
+  status?: ManualCompactionResponse["status"],
+): string {
+  switch (reason) {
+    case "nothing_to_compact":
+      if (status === "existing") {
+        return "Conversation is already compacted; there is no new older context to compact yet.";
+      }
+      return "Only the latest user turn is available, so there is no completed earlier context to compact yet.";
+    case "missing_boundary_message_id":
+      return "Older context exists, but it cannot be compacted because saved message IDs are missing.";
+    case "not_beneficial":
+      return "Context compaction was skipped because the generated summary would not reduce context usage.";
+    case "using_existing_summary":
+      return "Conversation is already using compacted context.";
+    case "aborted":
+      return "Context compaction was cancelled.";
+    default:
+      return "There is no completed earlier context to compact yet.";
+  }
+}
+
+export function mergePersistedMessageMetadata(params: {
+  liveMessages: UIMessage[];
+  persistedMessages: UIMessage[];
+  /**
+   * The live thread started from the end of the saved one (a tail read):
+   * saved messages older than the live thread's first are put in front of
+   * it once they arrive.
+   */
+  includeEarlierPersisted?: boolean;
+}): UIMessage[] {
+  const remainingPersistedMessages = [...params.persistedMessages];
+  let changed = false;
+  let firstMatchedPersistedIndex = -1;
+
+  const mergedMessages = params.liveMessages.map((liveMessage) => {
+    const liveMetadata = getObjectMetadata(liveMessage);
+    const persistedMessageId = liveMetadata[PERSISTED_MESSAGE_ID_METADATA_KEY];
+    const persistedIndexById =
+      typeof persistedMessageId === "string"
+        ? remainingPersistedMessages.findIndex(
+            (persistedMessage) => persistedMessage.id === persistedMessageId,
+          )
+        : -1;
+    const persistedIndex =
+      persistedIndexById === -1
+        ? remainingPersistedMessages.findIndex((persistedMessage) =>
+            messagesHaveSameRenderableContent({
+              liveMessage,
+              persistedMessage,
+            }),
+          )
+        : persistedIndexById;
+
+    if (persistedIndex === -1) {
+      return liveMessage;
+    }
+
+    const [persistedMessage] = remainingPersistedMessages.splice(
+      persistedIndex,
+      1,
+    );
+    if (!persistedMessage) {
+      return liveMessage;
+    }
+    if (firstMatchedPersistedIndex === -1) {
+      firstMatchedPersistedIndex =
+        params.persistedMessages.indexOf(persistedMessage);
+    }
+
+    const parts = mergePersistedHookRunParts({
+      liveMessage,
+      liveParts: mergePersistedUserFileParts({
+        liveMessage,
+        persistedMessage,
+      }),
+      persistedMessage,
+    });
+
+    // A live message loaded from the saved thread already carries the saved
+    // id: there is nothing to stamp, so it stays the same object and the
+    // thread is not rebuilt on load.
+    const alreadyResolved =
+      typeof persistedMessageId === "string" ||
+      liveMessage.id === persistedMessage.id;
+    if (parts === liveMessage.parts && alreadyResolved) {
+      return liveMessage;
+    }
+    changed = true;
+    return {
+      ...liveMessage,
+      parts,
+      metadata: {
+        ...getObjectMetadata(persistedMessage),
+        ...liveMetadata,
+        [PERSISTED_MESSAGE_ID_METADATA_KEY]: persistedMessage.id,
+      },
+    };
+  });
+
+  const earlier =
+    params.includeEarlierPersisted && firstMatchedPersistedIndex > 0
+      ? params.persistedMessages
+          .slice(0, firstMatchedPersistedIndex)
+          .filter((message) => remainingPersistedMessages.includes(message))
+      : [];
+  if (earlier.length > 0) {
+    return [...earlier, ...(changed ? mergedMessages : params.liveMessages)];
+  }
+  return changed ? mergedMessages : params.liveMessages;
+}
+
+/**
+ * Resolve a live message's id in the saved thread. In-session messages keep
+ * their AI SDK nanoid as the live `id`, while the saved thread keys the same
+ * message by its DB UUID; mergePersistedMessageMetadata records that mapping
+ * in metadata.persistedMessageId. Returns null when the message cannot be
+ * found in the saved thread under either id.
+ */
+export function resolveCanonicalMessageId(params: {
+  messageId: string;
+  liveMessages: UIMessage[];
+  canonicalMessages: UIMessage[] | undefined;
+}): string | null {
+  const { messageId, liveMessages, canonicalMessages } = params;
+  if (!canonicalMessages) {
+    return null;
+  }
+
+  if (canonicalMessages.some((message) => message.id === messageId)) {
+    return messageId;
+  }
+
+  const liveMessage = liveMessages.find((message) => message.id === messageId);
+  if (!liveMessage) {
+    return null;
+  }
+
+  const persistedMessageId =
+    getObjectMetadata(liveMessage)[PERSISTED_MESSAGE_ID_METADATA_KEY];
+  if (
+    typeof persistedMessageId === "string" &&
+    persistedMessageId.length > 0 &&
+    canonicalMessages.some((message) => message.id === persistedMessageId)
+  ) {
+    return persistedMessageId;
+  }
+
+  return null;
+}
+
+/** Read a message's current feedback verdict from its metadata. */
+export function getMessageFeedback(
+  message: UIMessage | undefined,
+): ChatMessageFeedback | null {
+  if (!message) {
+    return null;
+  }
+  const parsed = ChatMessageFeedbackSchema.safeParse(
+    getObjectMetadata(message).feedback,
+  );
+  return parsed.success ? parsed.data : null;
+}
+
+/** Set or clear one message's feedback metadata, immutably. */
+export function applyFeedbackToMessages(params: {
+  messages: UIMessage[];
+  messageId: string;
+  feedback: ChatMessageFeedback | null;
+}): UIMessage[] {
+  return params.messages.map((message) => {
+    if (message.id !== params.messageId) {
+      return message;
+    }
+
+    return {
+      ...message,
+      metadata: {
+        ...getObjectMetadata(message),
+        feedback: params.feedback ?? undefined,
+      },
+    };
+  });
+}
+
+function messagesHaveSameRenderableContent(params: {
+  liveMessage: UIMessage;
+  persistedMessage: UIMessage;
+}) {
+  return (
+    params.liveMessage.role === params.persistedMessage.role &&
+    getMessageText(params.liveMessage) ===
+      getMessageText(params.persistedMessage)
+  );
+}
+
+function mergePersistedUserFileParts(params: {
+  liveMessage: UIMessage;
+  persistedMessage: UIMessage;
+}) {
+  if (
+    params.liveMessage.role !== "user" ||
+    !params.liveMessage.parts.some((part) => part.type === "file") ||
+    !params.persistedMessage.parts.some((part) => part.type === "file")
+  ) {
+    return params.liveMessage.parts;
+  }
+
+  return params.persistedMessage.parts;
+}
+
+function isHookRunPart(part: { type: string }): boolean {
+  return part.type === HOOK_RUN_PART_TYPE;
+}
+
+/**
+ * Reconcile inline `data-hook-run` debug parts on an assistant message with the
+ * server's read-gated view. The server decides visibility (hook parts are
+ * returned only while the conversation has debug mode on and the viewer is an
+ * admin), so the persisted message is authoritative: its hook parts are spliced
+ * into the live parts at the slot they occupy among the persisted non-hook
+ * parts, and live hook parts the server no longer returns are dropped. This is
+ * what makes the `/debug` toggle take effect without a reload — the toggle
+ * invalidates the conversation query and this merge folds the refetched view
+ * into the live chat state. Idempotent: returns the live parts reference
+ * unchanged when nothing differs, so the sync effect settles.
+ */
+function mergePersistedHookRunParts(params: {
+  liveMessage: UIMessage;
+  liveParts: UIMessage["parts"];
+  persistedMessage: UIMessage;
+}): UIMessage["parts"] {
+  const { liveMessage, liveParts, persistedMessage } = params;
+  if (liveMessage.role !== "assistant") {
+    return liveParts;
+  }
+  const persistedHookParts = persistedMessage.parts.filter(isHookRunPart);
+  if (persistedHookParts.length === 0 && !liveParts.some(isHookRunPart)) {
+    return liveParts;
+  }
+
+  const merged = liveParts.filter((part) => !isHookRunPart(part));
+
+  // Stripping must never leave the message with nothing renderable — the
+  // render-time restore-on-regression guard would resurrect the parts and
+  // fight this merge in an update loop. Keep the live view for that (rare,
+  // hook-chips-only) message instead.
+  if (
+    persistedHookParts.length === 0 &&
+    !hasRenderableAssistantContent({ parts: merged })
+  ) {
+    return liveParts;
+  }
+
+  // Splice each persisted hook part in at the slot it occupies among the
+  // persisted message's non-hook parts ("after k non-hook parts"), preserving
+  // its turn-start / tool-bracket / turn-end position.
+  let nonHookSeen = 0;
+  let inserted = 0;
+  for (const part of persistedMessage.parts) {
+    if (isHookRunPart(part)) {
+      merged.splice(Math.min(nonHookSeen + inserted, merged.length), 0, part);
+      inserted++;
+    } else {
+      nonHookSeen++;
+    }
+  }
+
+  const unchanged =
+    merged.length === liveParts.length &&
+    merged.every((part, index) => {
+      const livePart = liveParts[index];
+      if (part === livePart) {
+        return true;
+      }
+      // Refetches rebuild hook part objects, so compare those structurally.
+      return (
+        livePart !== undefined &&
+        isHookRunPart(part) &&
+        isHookRunPart(livePart) &&
+        JSON.stringify(part) === JSON.stringify(livePart)
+      );
+    });
+
+  return unchanged ? liveParts : merged;
+}
+
+function getMessageText(message: UIMessage) {
+  return message.parts
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("\n");
+}
+
+function getObjectMetadata(message: UIMessage): Record<string, unknown> {
+  return typeof message.metadata === "object" && message.metadata !== null
+    ? { ...message.metadata }
+    : {};
+}
+
+/** The verbatim text of the first user message, or "" when there is none. */
+function getFirstUserMessageText(
+  // biome-ignore lint/suspicious/noExplicitAny: UIMessage structure from AI SDK is dynamic
+  messages?: any[],
+): string {
+  if (messages && messages.length > 0) {
+    for (const msg of messages) {
+      if (msg.role === "user" && msg.parts) {
+        for (const part of msg.parts) {
+          if (part.type === "text" && part.text) {
+            return part.text;
+          }
+        }
+      }
+    }
+  }
+
+  return "";
 }

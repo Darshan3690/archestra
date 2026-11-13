@@ -1,0 +1,247 @@
+import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
+import {
+  type QueryClient,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { toast } from "sonner";
+import {
+  batteriesQueryKey,
+  batteryMatchesPrefix,
+  effectivePolicyQueryKey,
+  invalidatePolicyViews,
+  policyDeclarationsQueryKey,
+} from "@/lib/openappa-policy-views";
+import { reportApiError, throwOnApiError } from "@/lib/utils/api";
+
+export type BatteryMatches =
+  archestraApiTypes.GetOpenappaBatteryMatchesResponses["200"];
+export type BatterySummary =
+  archestraApiTypes.GetOpenappaBatteriesResponses["200"][number];
+export type PolicyDeclarations =
+  archestraApiTypes.GetOpenappaPolicyDeclarationsResponses["200"];
+export type PolicyBattery = PolicyDeclarations["batteries"][number];
+export type BatteryPolicySource =
+  archestraApiTypes.GetOpenappaBatteryPolicySourceResponses["200"];
+/** What an attach names: the battery, and the catalog unless it governs the organization. */
+type CreateInstallParams = Pick<
+  archestraApiTypes.CreateOpenappaBatteryInstallData["body"],
+  "batteryName" | "catalogId"
+>;
+
+/** Why a catalog cannot take a battery yet, for the surfaces that offer one. */
+export const ATTACH_NOTES: Record<
+  Exclude<BatteryMatches["attach"], "ready">,
+  string
+> = {
+  unsynced:
+    "Sync the server's tools first: the battery attaches to their prefix.",
+  conflicting:
+    "This server cannot take a battery: one of its tool prefixes holds a double underscore, which an alias cannot target.",
+};
+
+export const batteryMatchesQueryKey = (catalogId: string) => [
+  batteryMatchesPrefix,
+  catalogId,
+];
+
+/**
+ * What the organization's policy text declares and what came of it: every
+ * included battery with its status, servers and credential rows, the aliases
+ * no battery declares, the composition's last error and a held GitHub pull.
+ */
+export function usePolicyDeclarations() {
+  return useQuery(policyDeclarationsQuery);
+}
+
+/** The composed document the runtime enforces: the root text with its batteries. */
+export function useEffectivePolicy(
+  enabled = true,
+  refetchInterval: number | false = false,
+) {
+  return useQuery({
+    queryKey: effectivePolicyQueryKey,
+    enabled,
+    refetchInterval,
+    queryFn: async () => {
+      const { data, error } =
+        await archestraApiSdk.getOpenappaEffectivePolicy();
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? null;
+    },
+  });
+}
+
+/** The source TOML of one exact include in the current organization policy. */
+export function useBatteryPolicySource(entry: string) {
+  return useQuery({
+    queryKey: [...batteriesQueryKey, "policy-source", entry],
+    queryFn: async (): Promise<BatteryPolicySource> => {
+      const { data, error } =
+        await archestraApiSdk.getOpenappaBatteryPolicySource({
+          query: { entry },
+        });
+      throwOnApiError(error, { toastOnError: false });
+      return answered(data);
+    },
+  });
+}
+
+/** Every battery the organization can install, bundled and uploaded, with its installs. */
+export function useBatteries(enabled = true) {
+  return useQuery({ ...batteriesQuery, enabled });
+}
+
+/**
+ * The guardrails batteries a catalog entry stands for, with their installs,
+ * and whether the entry can take one at all.
+ */
+export function useBatteryMatches(catalogId: string, enabled: boolean) {
+  return useQuery({
+    queryKey: batteryMatchesQueryKey(catalogId),
+    enabled,
+    queryFn: async (): Promise<BatteryMatches> => {
+      const { data, error } = await archestraApiSdk.getOpenappaBatteryMatches({
+        query: { catalogId },
+      });
+      throwOnApiError(error, { toastOnError: false });
+      return answered(data);
+    },
+  });
+}
+
+/** Include a battery for a catalog entry, spelling the package the policy governs. */
+export function useCreateBatteryInstall() {
+  const client = useQueryClient();
+  return useBatteryMutation(
+    async (params: CreateInstallParams) =>
+      settled(await createInstall(client, params)),
+    (battery) => toast.success(`Battery "${battery.name}" attached`),
+  );
+}
+
+/**
+ * Bind a helper variable to an organization credential, or unbind it with a
+ * null key, for every battery that reads it. Included or not, and whether or
+ * not the repository owns the policy text.
+ */
+export function useSetCredentialBinding() {
+  return useBatteryMutation(
+    async (params: { variable: string; key: string | null }) =>
+      settled(
+        await archestraApiSdk.setOpenappaCredentialBinding({
+          path: { variable: params.variable },
+          body: { key: params.key },
+        }),
+      ),
+  );
+}
+
+export function useDeleteBatteryInstall() {
+  return useBatteryMutation(
+    async (id: string) =>
+      settled(
+        await archestraApiSdk.deleteOpenappaBatteryInstall({ path: { id } }),
+      ),
+    () => toast.success("Battery detached"),
+  );
+}
+
+/** Take a battery out of the policy text, install rows or not. */
+export function useRemoveBatteryInclude() {
+  return useBatteryMutation(
+    async (name: string) =>
+      settled(
+        await archestraApiSdk.deleteOpenappaBatteryInclude({ path: { name } }),
+      ),
+    () => toast.success("Battery removed"),
+  );
+}
+
+/**
+ * The one create call: a battery is included once, so a second server joining
+ * one the policy already includes has to name that entry's package — the
+ * server refuses any other spelling. The package is read at write time, always
+ * from the server, so a policy that moved since the render still lands; the
+ * answer goes through the query cache so the page shows what was written to.
+ */
+async function createInstall(client: QueryClient, params: CreateInstallParams) {
+  const packageHash = await includedPackageHash(client, params.batteryName);
+  return archestraApiSdk.createOpenappaBatteryInstall({
+    body: {
+      ...params,
+      ...(packageHash === null ? {} : { packageHash }),
+    },
+  });
+}
+
+/** The included entry's package, else the newest upload's, else none (bundled). */
+async function includedPackageHash(
+  client: QueryClient,
+  name: string,
+): Promise<string | null> {
+  const declarations = await client.fetchQuery({
+    ...policyDeclarationsQuery,
+    staleTime: 0,
+  });
+  const included = declarations?.batteries.find(
+    (battery) => battery.name === name,
+  );
+  if (included) return included.packageHash;
+  const batteries = await client.fetchQuery({
+    ...batteriesQuery,
+    staleTime: 0,
+  });
+  const battery = batteries.find((candidate) => candidate.name === name);
+  return battery?.source === "upload" ? battery.contentHash : null;
+}
+
+const policyDeclarationsQuery = {
+  queryKey: policyDeclarationsQueryKey,
+  queryFn: async () => {
+    const { data, error } =
+      await archestraApiSdk.getOpenappaPolicyDeclarations();
+    throwOnApiError(error, { toastOnError: false });
+    return data ?? null;
+  },
+};
+
+const batteriesQuery = {
+  queryKey: batteriesQueryKey,
+  queryFn: async () => {
+    const { data, error } = await archestraApiSdk.getOpenappaBatteries();
+    throwOnApiError(error, { toastOnError: false });
+    return data ?? [];
+  },
+};
+
+/** The SDK call's data, or its refusal toasted and thrown. */
+function settled<T>(result: { data?: T; error?: unknown }): T {
+  if (result.error !== undefined) throw reportApiError(result.error);
+  return answered(result.data);
+}
+
+/** A response with no error carries data; one with neither is a failure, not an empty answer. */
+function answered<T>(data: T | undefined): T {
+  if (data === undefined)
+    throw new Error("The API answered with neither data nor an error");
+  return data;
+}
+
+/**
+ * A write to the policy's declarations. Whatever happened, every view of the
+ * policy is refetched so a refused write (the battery got included meanwhile,
+ * the text moved under the edit) shows the server's state.
+ */
+function useBatteryMutation<TInput, TOutput>(
+  mutationFn: (input: TInput) => Promise<TOutput>,
+  onSuccess?: (data: TOutput, input: TInput) => void,
+) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn,
+    onSuccess,
+    onSettled: () => invalidatePolicyViews(client),
+  });
+}

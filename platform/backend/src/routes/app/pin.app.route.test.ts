@@ -1,0 +1,408 @@
+import { ADMIN_ROLE_NAME } from "@archestra/shared";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { AppModel, AppPinModel } from "@/models";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import type { User } from "@/types";
+
+describe("PUT/DELETE /api/apps pin routes", () => {
+  let app: FastifyInstanceWithZod;
+  let organizationId: string;
+  let user: User;
+  let actingUser: User;
+
+  beforeEach(async ({ makeOrganization, makeUser, makeMember }) => {
+    organizationId = (await makeOrganization()).id;
+    user = await makeUser();
+    await makeMember(user.id, organizationId, { role: ADMIN_ROLE_NAME });
+    actingUser = user;
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { organizationId: string }).organizationId =
+        organizationId;
+      (request as typeof request & { user: User }).user = actingUser;
+    });
+    const { default: appRoutes } = await import("./app.routes");
+    await app.register(appRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  async function listItems() {
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/apps?limit=100&offset=0",
+    });
+    expect(res.statusCode).toBe(200);
+    return res.json().data as Array<Record<string, unknown>>;
+  }
+
+  test("owned app: pin and unpin; pinnedAt surfaces in GET /api/apps", async ({
+    makeApp,
+  }) => {
+    const owned = await makeApp({
+      organizationId,
+      authorId: user.id,
+      name: "Pinnable",
+    });
+
+    const pin = await app.inject({
+      method: "PUT",
+      url: `/api/apps/${owned.id}/pin`,
+    });
+    expect(pin.statusCode).toBe(200);
+    let item = (await listItems()).find((i) => i.id === owned.id);
+    expect(typeof item?.pinnedAt).toBe("string");
+
+    const unpin = await app.inject({
+      method: "DELETE",
+      url: `/api/apps/${owned.id}/pin`,
+    });
+    expect(unpin.statusCode).toBe(200);
+    item = (await listItems()).find((i) => i.id === owned.id);
+    expect(item?.pinnedAt).toBeNull();
+  });
+
+  test("pinned=true lists only the caller's pinned apps", async ({
+    makeApp,
+  }) => {
+    const pinned = await makeApp({
+      organizationId,
+      authorId: user.id,
+      name: "Pinned",
+    });
+    await makeApp({ organizationId, authorId: user.id, name: "Unpinned" });
+    await app.inject({ method: "PUT", url: `/api/apps/${pinned.id}/pin` });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/apps?limit=100&offset=0&pinned=true",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().data.map((i: { id: string }) => i.id)).toEqual([
+      pinned.id,
+    ]);
+    expect(await listItems()).toHaveLength(2);
+  });
+
+  test("pinned=true lists pinned external apps next to owned ones", async ({
+    makeApp,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeTool,
+  }) => {
+    const owned = await makeApp({
+      organizationId,
+      authorId: user.id,
+      name: "Owned",
+    });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Board",
+      serverType: "remote",
+      serverUrl: "https://example.com/mcp",
+    });
+    const server = await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "show_board",
+      meta: { _meta: { ui: { resourceUri: "ui://board/app.html" } } },
+    });
+
+    const empty = await app.inject({
+      method: "GET",
+      url: "/api/apps?limit=100&offset=0&pinned=true",
+    });
+    expect(empty.json().data).toEqual([]);
+
+    await app.inject({ method: "PUT", url: `/api/apps/${owned.id}/pin` });
+    await app.inject({
+      method: "PUT",
+      url: `/api/apps/external/${server.id}/pin`,
+      payload: { resourceUri: "ui://board/app.html", toolName: "show_board" },
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/apps?limit=100&offset=0&pinned=true",
+    });
+    expect(
+      res
+        .json()
+        .data.map((i: { source: string; name: string }) => i.source)
+        .sort(),
+    ).toEqual(["external", "owned"]);
+  });
+
+  test("external app: pin and unpin by (install, resource, tool); pinnedAt surfaces in the listing", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeTool,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Archestra PM",
+      serverType: "remote",
+      serverUrl: "https://example.com/mcp",
+    });
+    const server = await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "show_board",
+      meta: { _meta: { ui: { resourceUri: "ui://pm/board.html" } } },
+    });
+
+    const pin = await app.inject({
+      method: "PUT",
+      url: `/api/apps/external/${server.id}/pin`,
+      payload: { resourceUri: "ui://pm/board.html", toolName: "show_board" },
+    });
+    expect(pin.statusCode).toBe(200);
+    let item = (await listItems()).find(
+      (i) => i.source === "external" && i.mcpServerId === server.id,
+    );
+    expect(typeof item?.pinnedAt).toBe("string");
+
+    const unpin = await app.inject({
+      method: "DELETE",
+      url: `/api/apps/external/${server.id}/pin?resourceUri=${encodeURIComponent("ui://pm/board.html")}&toolName=show_board`,
+    });
+    expect(unpin.statusCode).toBe(200);
+    item = (await listItems()).find(
+      (i) => i.source === "external" && i.mcpServerId === server.id,
+    );
+    expect(item?.pinnedAt).toBeNull();
+  });
+
+  test("pinning one tool pins only its tile when several tools share a ui resource", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeTool,
+  }) => {
+    // The Jira-style shape: one server, many interactive tools, all sharing a
+    // single widget template. Pinning one tile must not pin the whole group.
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Tracker",
+      serverType: "remote",
+      serverUrl: "https://example.com/mcp",
+    });
+    const server = await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    const sharedUi = {
+      _meta: { ui: { resourceUri: "ui://tracker/app.html" } },
+    };
+    await makeTool({
+      catalogId: catalog.id,
+      name: "createissue",
+      meta: sharedUi,
+    });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "editissue",
+      meta: sharedUi,
+    });
+    await makeTool({ catalogId: catalog.id, name: "getissue", meta: sharedUi });
+
+    const pin = await app.inject({
+      method: "PUT",
+      url: `/api/apps/external/${server.id}/pin`,
+      payload: {
+        resourceUri: "ui://tracker/app.html",
+        toolName: "createissue",
+      },
+    });
+    expect(pin.statusCode).toBe(200);
+
+    const tiles = (await listItems()).filter(
+      (i) => i.source === "external" && i.mcpServerId === server.id,
+    );
+    expect(tiles).toHaveLength(3);
+    const pinnedTools = tiles
+      .filter((i) => i.pinnedAt !== null)
+      .map((i) => i.toolName);
+    expect(pinnedTools).toEqual(["createissue"]);
+
+    // Unpinning that tile clears exactly that pin.
+    const unpin = await app.inject({
+      method: "DELETE",
+      url: `/api/apps/external/${server.id}/pin?resourceUri=${encodeURIComponent("ui://tracker/app.html")}&toolName=createissue`,
+    });
+    expect(unpin.statusCode).toBe(200);
+    const after = (await listItems()).filter(
+      (i) => i.source === "external" && i.mcpServerId === server.id,
+    );
+    expect(after.every((i) => i.pinnedAt === null)).toBe(true);
+  });
+
+  test("pinning an external app with a tool that does not expose the resource returns 404", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeTool,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Tracker 404",
+      serverType: "remote",
+      serverUrl: "https://example.com/mcp",
+    });
+    const server = await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "createissue",
+      meta: { _meta: { ui: { resourceUri: "ui://tracker/app.html" } } },
+    });
+
+    const res = await app.inject({
+      method: "PUT",
+      url: `/api/apps/external/${server.id}/pin`,
+      payload: {
+        resourceUri: "ui://tracker/app.html",
+        toolName: "not-a-real-tool",
+      },
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  // Every /api/ route must be registered in requiredEndpointPermissionsMap or
+  // the auth middleware 403s it for everyone (deny-by-default). A missing
+  // registration is invisible from this file's bare fastify instance (routes
+  // are registered without the auth plugin), so assert on the map directly,
+  // like the knowledge-base route tests do.
+  //
+  // Owned-app pins carry no coarse permission, because a scoped grant can
+  // reach an app without the role-level app:read and demanding it would lock
+  // that viewer out of pinning what they can see. PinApp resolves the app
+  // through loadViewableApp (a per-app grant check) and UnpinApp only removes
+  // the caller's own pin row.
+  //
+  // External-app pins ride on the MCP server's role-level visibility instead,
+  // so they keep app:read.
+  test("pin routes are registered in the endpoint permissions map for members", async () => {
+    const { requiredEndpointPermissionsMap } = await import(
+      "@archestra/shared/access-control"
+    );
+    const { RouteId } = await import("@archestra/shared");
+
+    expect(requiredEndpointPermissionsMap[RouteId.PinApp]).toEqual({});
+    expect(requiredEndpointPermissionsMap[RouteId.UnpinApp]).toEqual({});
+    expect(requiredEndpointPermissionsMap[RouteId.PinExternalApp]).toEqual({
+      app: ["read"],
+    });
+    expect(requiredEndpointPermissionsMap[RouteId.UnpinExternalApp]).toEqual({
+      app: ["read"],
+    });
+  });
+
+  test("a plain (non-admin) member can pin an org-visible app; pins are per-user", async ({
+    makeUser,
+    makeMember,
+    makeApp,
+  }) => {
+    const member = await makeUser({ email: "app-pin-plain-member@test.com" });
+    await makeMember(member.id, organizationId, {});
+    const owned = await makeApp({
+      organizationId,
+      authorId: user.id,
+      name: "Org Shared",
+    });
+
+    actingUser = member;
+    const pin = await app.inject({
+      method: "PUT",
+      url: `/api/apps/${owned.id}/pin`,
+    });
+    expect(pin.statusCode).toBe(200);
+
+    // Pinned for the member…
+    const item = (await listItems()).find((i) => i.id === owned.id);
+    expect(typeof item?.pinnedAt).toBe("string");
+
+    // …but not for the author (pins are personal, like project pins).
+    actingUser = user;
+    const authorItem = (await listItems()).find((i) => i.id === owned.id);
+    expect(authorItem?.pinnedAt).toBeNull();
+  });
+
+  test("pinning an owned app you cannot view returns 404", async ({
+    makeUser,
+    makeMember,
+    makeApp,
+  }) => {
+    const otherAuthor = await makeUser({ email: "app-pin-author@test.com" });
+    const foreignPersonal = await makeApp({
+      organizationId,
+      access: "personal",
+      authorId: otherAuthor.id,
+    });
+    const stranger = await makeUser({ email: "app-pin-stranger@test.com" });
+    await makeMember(stranger.id, organizationId, {});
+    actingUser = stranger;
+
+    const res = await app.inject({
+      method: "PUT",
+      url: `/api/apps/${foreignPersonal.id}/pin`,
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  test("pinning an external app on an inaccessible install returns 404", async ({
+    makeUser,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeTool,
+  }) => {
+    const otherUser = await makeUser({ email: "app-pin-owner@test.com" });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Private PM",
+      serverType: "remote",
+      serverUrl: "https://example.com/mcp",
+      access: "personal",
+      authorId: otherUser.id,
+    });
+    const server = await makeMcpServer({
+      catalogId: catalog.id,
+      scope: "personal",
+      ownerId: otherUser.id,
+    });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "show_board",
+      meta: { _meta: { ui: { resourceUri: "ui://pm/board.html" } } },
+    });
+
+    const res = await app.inject({
+      method: "PUT",
+      url: `/api/apps/external/${server.id}/pin`,
+      payload: { resourceUri: "ui://pm/board.html", toolName: "show_board" },
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  test("can unpin after the app is deleted (no 404, pin removed)", async ({
+    makeApp,
+  }) => {
+    const owned = await makeApp({
+      organizationId,
+      authorId: user.id,
+    });
+    await app.inject({ method: "PUT", url: `/api/apps/${owned.id}/pin` });
+
+    // Soft-delete drops the app from listings; the stale pin must still clear.
+    await AppModel.delete(owned.id);
+
+    const unpin = await app.inject({
+      method: "DELETE",
+      url: `/api/apps/${owned.id}/pin`,
+    });
+    expect(unpin.statusCode).toBe(200);
+    const pins = await AppPinModel.getPinnedAtForApps({
+      userId: user.id,
+      appIds: [owned.id],
+    });
+    expect(pins.has(owned.id)).toBe(false);
+  });
+});

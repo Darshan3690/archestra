@@ -1,0 +1,574 @@
+import {
+  ARCHESTRA_MCP_CATALOG_ID,
+  isCodeRuntimeArchestraToolShortName,
+  isSandboxArchestraToolShortName,
+  TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME,
+  TOOL_RUN_TOOL_SHORT_NAME,
+  TOOL_SEARCH_TOOLS_SHORT_NAME,
+} from "@archestra/shared";
+import { isMcpInstallationAdmin } from "@/auth/mcp-catalog-permissions";
+import type { RequestLookups } from "@/auth/request-lookups";
+import config from "@/config";
+import { knowledgeSourceAccessControlService } from "@/knowledge-base/source-access-control";
+import {
+  AgentExcludedConnectorModel,
+  AgentModel,
+  KnowledgeBaseConnectorModel,
+  ToolModel,
+} from "@/models";
+import ResourcePermissionSubjectModel from "@/models/resource-permission-subject";
+import {
+  type AgentToolExclusionSets,
+  agentToolExclusionsService,
+  isToolIdentityExcluded,
+  isToolRowExcluded,
+} from "@/services/agent-tool-exclusions";
+import type { Tool } from "@/types";
+import { archestraMcpBranding } from "./branding";
+import { filterToolNamesByPermission } from "./rbac";
+
+// Dynamic tool access: when an agent's "access all tools" setting is on, the
+// dispatch surface (search_tools / run_tool) is relaxed from "tools assigned to
+// the agent" to "tools the user can access" — discovery spans every MCP catalog
+// the user can access plus the Archestra built-ins (see
+// isExcludedFromDiscovery for the carve-outs), and run_tool executes such a
+// tool directly without assigning it. Which credential the
+// call uses is decided by the MCP server's connection policy (on-behalf-of the
+// caller, or a pinned service account) — same as for an assigned tool; this
+// surface only widens access. Nothing is written to the agent: access is
+// per-call, so no agent-modify permission is involved. Tool RBAC, invocation
+// policies, and per-conversation tool selections still gate every call. The
+// per-agent "access all tools" setting is the sole gate.
+
+/**
+ * Resolve an unassigned third-party tool name to the catalog tool row the user
+ * can access, for direct dynamic execution by run_tool. Applies the same gates
+ * as discovery (agent setting, org setting, real user, catalog visibility,
+ * per-tool RBAC) and resolves duplicate names with the same deterministic
+ * ordering search_tools uses, so run_tool executes the row search described.
+ * Returns null when the strict assigned-tools-only behavior applies or the
+ * tool is not accessible.
+ */
+export async function resolveDynamicTool(params: {
+  toolName: string;
+  agentId: string;
+  userId?: string;
+  organizationId?: string;
+  /** Pre-loaded per-agent exclusion sets, so a handler that already fetched
+   * them (run_tool dispatch) does not re-query. Loaded here when omitted. */
+  exclusionSets?: AgentToolExclusionSets;
+}): Promise<Tool | null> {
+  const { toolName } = params;
+  // Archestra built-ins are dispatched on the "archestra" route and gated by
+  // isDynamicallyAvailableArchestraTool; a third-party catalog row reusing a
+  // reserved archestra-prefixed name must not be executable through this path.
+  if (
+    archestraMcpBranding.isToolName(toolName) ||
+    isExcludedFromDiscovery(toolName)
+  ) {
+    return null;
+  }
+  const ctx = await dynamicAccessContext(params);
+  if (!ctx) {
+    return null;
+  }
+
+  // Per-agent exclusions (Auto-tool mode): an excluded row must not resolve.
+  // Filtering the candidate list (not just the winner) keeps this consistent
+  // with search, which still shows a same-named row from a non-excluded catalog.
+  const exclusionSets =
+    params.exclusionSets ??
+    (await agentToolExclusionsService.getExclusionSets(params.agentId));
+
+  // Resolve the name within the user-accessible tool set (tool names are only
+  // unique per catalog, so a global name lookup could land on a row in a
+  // catalog the user cannot access).
+  const accessible = (
+    await getAccessibleTools(
+      ctx.userId,
+      ctx.organizationId,
+      ctx.agentEnvironmentId,
+      toolName,
+    )
+  ).filter((candidate) => !isToolRowExcluded(candidate, exclusionSets));
+  const tool = accessible[0];
+  if (!tool) {
+    return null;
+  }
+
+  // Per-tool RBAC, mirroring the search surface (search-tools.ts filters the
+  // same way), so a tool the user cannot see in search cannot be run either.
+  const permitted = await filterToolNamesByPermission(
+    [tool.name],
+    ctx.userId,
+    ctx.organizationId,
+  );
+  return permitted.has(tool.name) ? tool : null;
+}
+
+/**
+ * Resolve the tool that backs an MCP App `ui://` resource when the tool is
+ * reachable only through dynamic access ("all tools" mode) and has no
+ * `agent_tools` assignment — so a resource read can find its catalog/server
+ * without an assignment. Applies the same gates as `resolveDynamicTool` (agent
+ * setting, catalog visibility, per-tool RBAC). Returns null when the strict
+ * assigned-only behavior applies or the resource is not accessible.
+ */
+export async function resolveDynamicToolByUiResource(params: {
+  resourceUri: string;
+  agentId: string;
+  userId?: string;
+  organizationId?: string;
+}): Promise<Tool | null> {
+  const ctx = await dynamicAccessContext(params);
+  if (!ctx) {
+    return null;
+  }
+
+  // Per-agent exclusions (Auto-tool mode): an excluded backing tool must not
+  // make its resource reachable, and an excluded catalog must not count toward
+  // the multi-catalog ambiguity check below.
+  const exclusionSets = await agentToolExclusionsService.getExclusionSets(
+    params.agentId,
+  );
+
+  const accessible = (
+    await ToolModel.getMcpToolsAccessibleToUser({
+      userId: ctx.userId,
+      organizationId: ctx.organizationId,
+      environmentId: ctx.agentEnvironmentId,
+      isAdmin: await userIsCatalogAdmin(ctx.userId, ctx.organizationId),
+      uiResourceUri: params.resourceUri,
+    })
+  ).filter((candidate) => !isToolRowExcluded(candidate, exclusionSets));
+  // A ui:// URI is not globally unique. If it matches tools across more than one
+  // catalog the user can reach, a colliding catalog could serve app HTML in
+  // place of the tool that actually ran — and a resource read carries only the
+  // URI, so it cannot disambiguate. Fail closed rather than guess.
+  const matchedCatalogIds = new Set(accessible.map((t) => t.catalogId));
+  if (matchedCatalogIds.size > 1) {
+    return null;
+  }
+  const tool = accessible[0];
+  if (!tool) {
+    return null;
+  }
+
+  const permitted = await filterToolNamesByPermission(
+    [tool.name],
+    ctx.userId,
+    ctx.organizationId,
+  );
+  return permitted.has(tool.name) ? tool : null;
+}
+
+/**
+ * Whether an unassigned Archestra built-in may execute for this agent/user
+ * anyway. Under dynamic tool access every built-in is runnable without an
+ * assignment, subject to:
+ * - the dynamic-access gates (agent's "access all tools" setting + a real
+ *   authenticated user, see dynamicAccessContext);
+ * - per-agent exclusions (Auto-tool mode);
+ * - the deployment feature gates that also govern registration/execution in
+ *   index.ts — sandbox runtime, Projects, and apps (see
+ *   isBuiltInFeatureEnabled);
+ * - query_knowledge_sources additionally requires at least one knowledge
+ *   connector the user can access and this agent has not excluded.
+ * This is reachability, not authorization: callers must enforce the tool's
+ * RBAC permission separately (executeArchestraTool does so before this gate).
+ * @public — exported so focused tests can pin the dynamic-access contract.
+ */
+export async function isDynamicallyAvailableArchestraTool(params: {
+  toolName: string;
+  agentId: string;
+  userId?: string;
+  oauthClientId?: string;
+  organizationId?: string;
+  /** Pre-loaded per-agent exclusion sets, so a handler that already fetched
+   * them (executeArchestraTool's assignment gate) does not re-query. */
+  exclusionSets?: AgentToolExclusionSets;
+  lookups?: RequestLookups;
+}): Promise<boolean> {
+  const shortName = archestraMcpBranding.getToolShortName(params.toolName);
+  if (shortName == null) {
+    return false;
+  }
+  if (!isBuiltInFeatureEnabled(shortName)) {
+    return false;
+  }
+  const ctx = await dynamicAccessContext(params);
+  if (!ctx) {
+    if (
+      shortName === TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME &&
+      !params.userId &&
+      params.organizationId
+    ) {
+      const [accessAllTools, agentEnvironmentId] = await Promise.all([
+        params.lookups
+          ? params.lookups.agentAccessAllTools(params.agentId)
+          : AgentModel.getAccessAllTools(params.agentId),
+        params.lookups
+          ? params.lookups.agentEnvironmentId(params.agentId)
+          : AgentModel.findEnvironmentId(params.agentId),
+      ]);
+      if (!accessAllTools) {
+        return false;
+      }
+      const exclusionSets =
+        params.exclusionSets ??
+        (await agentToolExclusionsService.getExclusionSets(params.agentId));
+      if (
+        isToolIdentityExcluded(
+          { catalogId: ARCHESTRA_MCP_CATALOG_ID, name: params.toolName },
+          exclusionSets,
+        )
+      ) {
+        return false;
+      }
+      return agentHasSearchableKnowledgeConnectorsForNonUser({
+        agentId: params.agentId,
+        oauthClientId: params.oauthClientId,
+        organizationId: params.organizationId,
+        environmentId: agentEnvironmentId,
+      });
+    }
+    return false;
+  }
+  // Per-agent exclusions (Auto-tool mode): an excluded built-in loses the
+  // dynamic relaxation. Built-ins are matched by dispatch identity (the row
+  // in the Archestra catalog with this name).
+  const exclusionSets =
+    params.exclusionSets ??
+    (await agentToolExclusionsService.getExclusionSets(params.agentId));
+  if (
+    isToolIdentityExcluded(
+      { catalogId: ARCHESTRA_MCP_CATALOG_ID, name: params.toolName },
+      exclusionSets,
+    )
+  ) {
+    return false;
+  }
+  return shortName === TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME
+    ? agentHasSearchableKnowledgeConnectors({
+        agentId: params.agentId,
+        userId: ctx.userId,
+        organizationId: ctx.organizationId,
+        environmentId: ctx.agentEnvironmentId,
+      })
+    : true;
+}
+
+/**
+ * Whether a built-in is reachable through either an active explicit assignment
+ * or the same Auto-mode relaxation used by execution. This is the canonical
+ * agent-level reachability check for discovery and execution/assignment gates;
+ * it does not enforce tool RBAC, so every caller must do that first.
+ */
+export async function isArchestraToolAvailableToAgent(params: {
+  toolName: string;
+  agentId: string;
+  userId?: string;
+  oauthClientId?: string;
+  organizationId?: string;
+  exclusionSets?: AgentToolExclusionSets;
+  lookups?: RequestLookups;
+}): Promise<boolean> {
+  const shortName = archestraMcpBranding.getToolShortName(params.toolName);
+  if (shortName == null) return false;
+
+  const agent =
+    (params.lookups && (await params.lookups.gatewayAgent(params.agentId))) ??
+    undefined;
+  const exclusionSets =
+    params.exclusionSets ??
+    (await agentToolExclusionsService.getActiveExclusionSets(
+      params.agentId,
+      agent,
+    ));
+  const assignedTools = await ToolModel.getMcpToolsByAgent(
+    params.agentId,
+    agent,
+  );
+  if (
+    assignedTools.some(
+      (tool) =>
+        archestraMcpBranding.getToolShortName(tool.name) === shortName &&
+        !isToolRowExcluded(tool, exclusionSets),
+    )
+  ) {
+    return true;
+  }
+
+  return isDynamicallyAvailableArchestraTool({ ...params, exclusionSets });
+}
+
+/**
+ * Tools the user can access that are not yet assigned to the agent — the widened
+ * portion of the search_tools search space. Third-party MCP tools from every
+ * catalog the user can access plus the Archestra built-ins, minus the
+ * exclusions in `isExcludedFromDiscovery`: `agent__` rows, the meta tools
+ * (search_tools/run_tool), feature-gated-off built-in groups, and
+ * query_knowledge_sources when no knowledge connector is both accessible to the
+ * user and un-excluded for this agent.
+ */
+export async function getUnassignedDiscoverableTools(params: {
+  assignedToolNames: Set<string>;
+  agentId: string;
+  userId?: string;
+  oauthClientId?: string;
+  organizationId?: string;
+  /** Pre-loaded per-agent exclusion sets, so a handler that already fetched
+   * them (search_tools, run_tool recovery) does not re-query. */
+  exclusionSets?: AgentToolExclusionSets;
+  lookups?: RequestLookups;
+}): Promise<Tool[]> {
+  const { assignedToolNames } = params;
+  const ctx = await dynamicAccessContext(params);
+  if (!ctx) {
+    const knowledgeToolName = archestraMcpBranding.getToolName(
+      TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME,
+    );
+    if (
+      !params.userId &&
+      params.organizationId &&
+      !assignedToolNames.has(knowledgeToolName) &&
+      (await isDynamicallyAvailableArchestraTool({
+        toolName: knowledgeToolName,
+        agentId: params.agentId,
+        oauthClientId: params.oauthClientId,
+        organizationId: params.organizationId,
+        exclusionSets: params.exclusionSets,
+        lookups: params.lookups,
+      }))
+    ) {
+      const knowledgeTool = await ToolModel.findByName(knowledgeToolName);
+      return knowledgeTool ? [knowledgeTool] : [];
+    }
+    return [];
+  }
+
+  // Per-agent exclusions (Auto-tool mode): excluded catalogs/tools leave the
+  // discovery space entirely.
+  const exclusionSets =
+    params.exclusionSets ??
+    (await agentToolExclusionsService.getExclusionSets(params.agentId));
+
+  const [accessibleTools, hasKnowledgeConnectors] = await Promise.all([
+    getAccessibleTools(ctx.userId, ctx.organizationId, ctx.agentEnvironmentId),
+    agentHasSearchableKnowledgeConnectors({
+      agentId: params.agentId,
+      userId: ctx.userId,
+      organizationId: ctx.organizationId,
+      environmentId: ctx.agentEnvironmentId,
+    }),
+  ]);
+  return accessibleTools.filter(
+    (tool) =>
+      !assignedToolNames.has(tool.name) &&
+      !isExcludedFromDiscovery(tool.name, { hasKnowledgeConnectors }) &&
+      !isToolRowExcluded(tool, exclusionSets),
+  );
+}
+
+/**
+ * Shared gate for the dynamic-access surfaces (search widening, run_tool
+ * dynamic dispatch, the built-in relaxations, and the user-scoped
+ * query_knowledge_sources fallback) so they cannot drift apart. Dynamic access
+ * needs all of:
+ * - the agent's "access all tools" setting on (per-agent opt-in),
+ * - a real authenticated user (org/team-token sessions and the internal
+ *   "system" user keep the strict assigned-tools-only behavior).
+ * Returns the validated user/org pair, or null when the strict behavior
+ * applies.
+ */
+export async function dynamicAccessContext(params: {
+  agentId: string;
+  userId?: string;
+  organizationId?: string;
+  lookups?: RequestLookups;
+}): Promise<{
+  userId: string;
+  organizationId: string;
+  agentEnvironmentId: string | null;
+} | null> {
+  const { agentId, organizationId, userId, lookups } = params;
+  if (!userId || !organizationId || userId === "system") {
+    return null;
+  }
+  const [accessAllTools, agentEnvironmentId] = await Promise.all([
+    lookups
+      ? lookups.agentAccessAllTools(agentId)
+      : AgentModel.getAccessAllTools(agentId),
+    lookups
+      ? lookups.agentEnvironmentId(agentId)
+      : AgentModel.findEnvironmentId(agentId),
+  ]);
+  if (!accessAllTools) {
+    return null;
+  }
+  return { userId, organizationId, agentEnvironmentId };
+}
+
+// === Internal helpers ===
+
+// Whether the agent's Auto knowledge surface has anything left to search:
+// at least one knowledge connector queryable by the user (org-wide or
+// auto-sync-permissions visibility, or team-scoped to one of their teams;
+// knowledgeSource admins see all) that this agent has not excluded. Gates the
+// dynamic availability of query_knowledge_sources, and mirrors the surface
+// handleQueryKnowledgeSources actually queries — a tool that could only ever
+// answer "everything here is disabled" should not be offered.
+async function agentHasSearchableKnowledgeConnectors(params: {
+  agentId: string;
+  userId: string;
+  organizationId: string;
+  environmentId: string | null;
+}): Promise<boolean> {
+  const { agentId, userId, organizationId, environmentId } = params;
+  const [access, excludedConnectorIds] = await Promise.all([
+    knowledgeSourceAccessControlService.buildAccessControlContext({
+      userId,
+      organizationId,
+    }),
+    AgentExcludedConnectorModel.findConnectorIdsByAgent(agentId),
+  ]);
+  const connectors = await KnowledgeBaseConnectorModel.findByOrganization({
+    organizationId,
+    canReadAll: access.canReadAll,
+    viewerTeamIds: access.teamIds,
+    viewerUserId: access.userId,
+    // Query scope: an auto-sync-permissions connector makes the query tool
+    // available to everyone; its per-chunk ACLs gate what a user retrieves.
+    visibilityScope: "query",
+    environmentId,
+    // One more row than the agent excludes is always enough to decide this,
+    // however many connectors the organization has. Fewer rows than the limit
+    // means we have seen the whole visible set, so the check below is exact;
+    // a full page cannot be entirely excluded, because N distinct ids do not
+    // fit in an exclusion set of size N-1.
+    limit: excludedConnectorIds.length + 1,
+  });
+  const excluded = new Set(excludedConnectorIds);
+  return connectors.some((connector) => !excluded.has(connector.id));
+}
+
+async function agentHasSearchableKnowledgeConnectorsForNonUser(params: {
+  agentId: string;
+  oauthClientId?: string;
+  organizationId: string;
+  environmentId: string | null;
+}): Promise<boolean> {
+  const { agentId, oauthClientId, organizationId, environmentId } = params;
+  const [oauthPrincipal, excludedConnectorIds] = await Promise.all([
+    oauthClientId
+      ? ResourcePermissionSubjectModel.resolveOauthClientPrincipal({
+          oauthClientId,
+          organizationId,
+        })
+      : Promise.resolve(null),
+    AgentExcludedConnectorModel.findConnectorIdsByAgent(agentId),
+  ]);
+  return knowledgeSourceAccessControlService.hasQueryableOrganizationConnectorsForNonUser(
+    {
+      organizationId,
+      environmentId,
+      excludedConnectorIds,
+      principal: oauthPrincipal ?? undefined,
+    },
+  );
+}
+
+// Whether a sandbox-group tool is enabled for discovery/dynamic dispatch under
+// the current deployment config. The runtime tools
+// (run_command/upload_file/download_file) follow the code runtime flag; the
+// persistent-files tools (search_files/read_file/…) are always on. Non-sandbox
+// tools are never enabled by this predicate.
+function isSandboxToolEnabled(shortName: string): boolean {
+  if (!isSandboxArchestraToolShortName(shortName)) return false;
+  return (
+    !isCodeRuntimeArchestraToolShortName(shortName) ||
+    config.skillsSandbox.enabled
+  );
+}
+
+// What stays OUT of the unassigned-discovery surface (every other tool —
+// third-party or Archestra built-in — is discoverable):
+// - `agent__`-named rows (proxy-discovered delegation artifacts) are hidden
+//   from search, so they must not be dynamically discoverable/runnable either;
+// - the meta tools (search_tools/run_tool) are the dispatch surface itself:
+//   always exposed in tools/list and kept out of search results even when
+//   assigned (see isExcludedFromSearchResults in search-tools.ts), so an
+//   unassigned catalog row for them must not enter this surface;
+// - built-ins of a feature-gated-off group — sandbox runtime, Projects, apps —
+//   drop out under the same gates as registration/execution (see
+//   isBuiltInFeatureEnabled);
+// - query_knowledge_sources without a searchable knowledge connector — one the
+//   user can access and this agent has not excluded (the
+//   discovery path passes `hasKnowledgeConnectors` it already computed;
+//   the single-tool path checks it in isDynamicallyAvailableArchestraTool).
+// RBAC and the dynamic-access gates still apply on top.
+function isExcludedFromDiscovery(
+  toolName: string,
+  options?: { hasKnowledgeConnectors: boolean },
+): boolean {
+  if (toolName.startsWith("agent__")) {
+    return true;
+  }
+  const shortName = archestraMcpBranding.getToolShortName(toolName);
+  if (shortName == null) {
+    return false; // third-party MCP tool — discoverable
+  }
+  if (
+    shortName === TOOL_SEARCH_TOOLS_SHORT_NAME ||
+    shortName === TOOL_RUN_TOOL_SHORT_NAME
+  ) {
+    return true;
+  }
+  if (shortName === TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME) {
+    return !options?.hasKnowledgeConnectors;
+  }
+  return !isBuiltInFeatureEnabled(shortName);
+}
+
+// Whether a built-in's feature group is live under the current deployment
+// config, mirroring the registration/execution gates in index.ts
+// (getArchestraMcpTools + executeArchestraTool): the sandbox runtime tools
+// follow the code runtime flag (see isSandboxToolEnabled).
+// Everything else — including the plugin, skill, app, and Projects tools, which are
+// registered unconditionally — is always on.
+function isBuiltInFeatureEnabled(shortName: string): boolean {
+  if (isSandboxArchestraToolShortName(shortName)) {
+    return isSandboxToolEnabled(shortName);
+  }
+  return true;
+}
+
+async function getAccessibleTools(
+  userId: string,
+  organizationId: string,
+  environmentId: string | null,
+  name?: string,
+): Promise<Tool[]> {
+  return ToolModel.getMcpToolsAccessibleToUser({
+    userId,
+    organizationId,
+    environmentId,
+    isAdmin: await userIsCatalogAdmin(userId, organizationId),
+    name,
+  });
+}
+
+// Catalog visibility uses the same admin notion as the catalog list endpoint
+// (routes/internal-mcp-catalog.ts): mcpServerInstallation:admin sees all
+// catalogs in the organization, including team-scoped ones.
+/** @public — shared with the app-assignable tool resolver so both surfaces
+ * derive catalog visibility from the same admin notion. */
+export function userIsCatalogAdmin(
+  userId: string,
+  organizationId: string,
+): Promise<boolean> {
+  return isMcpInstallationAdmin({
+    userId: userId,
+    organizationId: organizationId,
+  });
+}

@@ -1,0 +1,157 @@
+name: Deploy platform environment
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Staging or demo installation
+        required: true
+        type: string
+      version:
+        description: Platform image tag
+        required: true
+        type: string
+    secrets:
+      GCP_DEPLOY_SERVICE_ACCOUNT_NAME:
+        required: true
+      GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER:
+        required: true
+
+permissions: {}
+
+env:
+  CI_IMAGE_REGISTRY: ghcr.io/archestra-ai/ci
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Required to check out the chart and deployment values.
+      id-token: write # Required for Google Workload Identity Federation.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Authenticate to Google Cloud
+        uses: archestra-ai/.github/actions/google-auth@c3001f82a468e05482bd7c8cd08ff97f94e80d2e # v1.14.0
+        with:
+          service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT_NAME }}
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER }}
+          setup_gcloud: "true"
+
+      - name: Install gke-gcloud-auth-plugin
+        run: gcloud components install gke-gcloud-auth-plugin
+
+      - name: Configure kubectl
+        env:
+          GKE_USE_DNS_ENDPOINT: ${{ vars.GKE_USE_DNS_ENDPOINT }}
+        run: |
+          endpoint_args=()
+          if [[ "$GKE_USE_DNS_ENDPOINT" == "true" ]]; then
+            endpoint_args+=(--dns-endpoint)
+          fi
+          gcloud container clusters get-credentials archestra-staging \
+            --zone us-central1-a \
+            --project friendly-path-465518-r6 "${endpoint_args[@]}"
+
+      - name: Deploy platform
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          PLATFORM_IMAGE_TAG: ${{ inputs.version }}
+        run: |
+          case "$TARGET_ENVIRONMENT" in
+            staging)
+              release=archestra-platform
+              namespace=archestra
+              values_file=.github/values-staging.yaml
+              runtime_secret=archestra-platform-runtime
+              ;;
+            demo)
+              release=archestra-demo
+              namespace=archestra-demo
+              values_file=.github/values-demo.yaml
+              runtime_secret=archestra-demo-runtime
+              ;;
+            *)
+              echo "Unsupported deployment environment" >&2
+              exit 1
+              ;;
+          esac
+
+          # Application credentials never pass through this workflow. Each
+          # installation reads them from a Kubernetes Secret that
+          # archestra-ai/infra syncs from GCP Secret Manager; the values files
+          # reference it through archestra.envFromSecrets. Without it the
+          # migration hook and pods cannot start, so stop before upgrading.
+          if ! kubectl get secret "$runtime_secret" --namespace "$namespace" --output name >/dev/null; then
+            echo "::error::Secret $runtime_secret is missing in namespace $namespace; it is synced by archestra-ai/infra." >&2
+            exit 1
+          fi
+
+          # Development deployments select the platform and runtime companions
+          # from one CI registry; chart defaults remain for released installs.
+          helm_args=(
+            upgrade "$release" ./platform/helm/archestra
+            --install --namespace "$namespace"
+            --set "archestra.image=${CI_IMAGE_REGISTRY}/platform:${PLATFORM_IMAGE_TAG}"
+            --set "archestra.env.ARCHESTRA_KNOWLEDGE_BASE_PERFORCE_SHIM_IMAGE=${CI_IMAGE_REGISTRY}/p4-shim:${PLATFORM_IMAGE_TAG}"
+            --set "archestra.env.ARCHESTRA_AGENT_RUNTIME_IMAGE_REGISTRY=${CI_IMAGE_REGISTRY}"
+            --set "archestra.env.ARCHESTRA_ORCHESTRATOR_MCP_SERVER_BASE_IMAGE=${CI_IMAGE_REGISTRY}/mcp-server-base:${PLATFORM_IMAGE_TAG}"
+            --values .github/values-staging-demo-shared.yaml
+            --values "$values_file"
+            --atomic --timeout 15m
+          )
+
+          if [[ "$TARGET_ENVIRONMENT" == staging ]]; then
+            helm_args+=(--create-namespace)
+          fi
+
+          # Helm's single wait spans a migration hook, rolling Deployments,
+          # and post-upgrade network-policy probes. Record only resource states
+          # and timestamps, so the next slow run shows which phase consumed it.
+          profile_log="$RUNNER_TEMP/helm-rollout-profile.log"
+          python3 -u .github/scripts/profile-helm-rollout.py \
+            --namespace "$namespace" --release "$release" \
+            > "$profile_log" 2>&1 &
+          profile_pid=$!
+          show_profile() {
+            kill "$profile_pid" 2>/dev/null || true
+            wait "$profile_pid" 2>/dev/null || true
+            echo "::group::Helm rollout timeline"
+            cat "$profile_log"
+            echo "::endgroup::"
+          }
+          trap show_profile EXIT
+
+          # Deploy jobs run with cancel-in-progress: false in a per-environment
+          # concurrency group, so no other Helm operation can be legitimately
+          # running when this step starts. If a previous runner lost heartbeat
+          # mid-upgrade, clear the orphaned pending-* state before upgrading.
+          release_status=$(
+            helm status "$release" --namespace "$namespace" --output json 2>/dev/null \
+              | jq -r '.info.status // empty' || true
+          )
+          case "$release_status" in
+            pending-upgrade|pending-rollback)
+              echo "Release $release in $namespace is stuck in $release_status; rolling back to clear lock..."
+              rollback_revision=$(
+                helm history "$release" --namespace "$namespace" --output json 2>/dev/null \
+                  | jq -r '[.[] | select(.status == "deployed" or .status == "superseded") | .revision] | last // empty' || true
+              )
+              if [[ -n "$rollback_revision" ]]; then
+                helm rollback "$release" "$rollback_revision" --namespace "$namespace" --cleanup-on-fail --timeout 5m
+              else
+                helm rollback "$release" --namespace "$namespace" --cleanup-on-fail --timeout 5m
+              fi
+              ;;
+            pending-install)
+              echo "Release $release in $namespace is stuck in pending-install; uninstalling to clear lock..."
+              helm uninstall "$release" --namespace "$namespace" --wait --timeout 5m
+              ;;
+          esac
+
+          helm "${helm_args[@]}"

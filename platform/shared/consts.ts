@@ -1,8 +1,81 @@
+import { openCodeFamilyRecord } from "./opencode-family";
+/**
+ * Loopback host every self-directed dial names — the frontend server reaching
+ * the backend in the same container, and the backend reaching its own LLM
+ * proxy and MCP gateway.
+ *
+ * It is an address literal, not `localhost`, on purpose. In production the API
+ * binds IPv4 only (`api.host = "0.0.0.0"` in the backend config), so it never
+ * has an IPv6 listener — while `localhost` resolves to `::1` FIRST:
+ * getaddrinfo applies RFC 6724 precedence no matter how /etc/hosts is ordered,
+ * and musl (the Alpine runtime image) compiles that table in with no
+ * /etc/gai.conf to retune it. Dialing the name therefore always targets a dead
+ * address first. Clients with Happy Eyeballs recover on the second attempt but
+ * pay for the refused one (~57ms per new connection, measured in the quickstart
+ * image) and log `ECONNREFUSED ::1:9000`; clients without it — busybox wget, or
+ * Node started with `--no-network-family-autoselection` — simply fail. That is
+ * the `::1` noise reported in issues #4917 and #6933.
+ *
+ * Name the address, not the name: it is unambiguous in every environment the
+ * platform runs in and no resolver can reorder it.
+ */
+export const LOOPBACK_HOST = "127.0.0.1";
+
+/**
+ * Where the backend API is reachable from the frontend server when
+ * `ARCHESTRA_INTERNAL_API_BASE_URL` is not set. Both processes always share a
+ * container — the unified image runs them under one supervisord, and the Helm
+ * chart exposes ports 3000 and 9000 on a single container — so the loopback
+ * literal is correct everywhere.
+ *
+ * That variable moves the runtime consumers (the frontend proxy, the generated
+ * API client, lib/config). It does NOT move the Next.js `rewrites()`
+ * destination, which this constant governs alone: with `output: "standalone"`
+ * the config is evaluated during `next build` and the resolved destination is
+ * frozen into `.next/routes-manifest.json`, where no runtime environment can
+ * reach it.
+ */
+export const DEFAULT_INTERNAL_API_BASE_URL = `http://${LOOPBACK_HOST}:9000`;
+
+/**
+ * Prefix of the Better Auth cookie names when `ARCHESTRA_AUTH_COOKIE_PREFIX`
+ * is not set. The backend names its cookies with it, and the frontend server
+ * reads the same variable to recognise a session cookie on a document request.
+ */
+export const DEFAULT_AUTH_COOKIE_PREFIX = "archestra";
+
+/**
+ * Names the Better Auth session cookie can carry for `prefix`: the plain name,
+ * and the `__Secure-` variant Better Auth uses when the cookie is Secure.
+ */
+export function getAuthSessionCookieNames(prefix: string): string[] {
+  const name = `${prefix}.session_token`;
+  return [name, `__Secure-${name}`];
+}
+
 /** Default app name used as fallback when organization.appName is not configured */
 export const DEFAULT_APP_NAME = "Archestra";
 export const DEFAULT_APP_FULL_NAME = "Archestra.AI";
 export const DEFAULT_APP_DESCRIPTION =
   "Enterprise MCP-native Secure AI Platform";
+
+/**
+ * True for the default brand or one of its own variants (e.g. "Archestra
+ * Staging", "Archestra Dev") — never true for a genuinely different
+ * white-labeled name. Used to gate Archestra-only visuals, like the mark the
+ * Claude Code startup guard draws, that must never appear under someone
+ * else's brand.
+ */
+export function isDefaultBrandedAppName(appName: string): boolean {
+  return appName.startsWith(DEFAULT_APP_NAME);
+}
+
+/**
+ * Name given to the personal MCP gateway seeded for every member. It is a
+ * placeholder, not a chosen name, so the connect flow does not register it as
+ * a client-side server name — see `resolveMcpClientServerName`.
+ */
+export const PERSONAL_MCP_GATEWAY_NAME = "My Gateway";
 
 /**
  * Prefix used for newly generated platform-managed tokens (team tokens, user
@@ -23,6 +96,15 @@ export const ALL_ARCHESTRA_TOKEN_PREFIXES = [
   ...LEGACY_ARCHESTRA_TOKEN_PREFIXES,
 ] as const;
 
+/**
+ * Constraints enforced by the Better Auth api-key plugin on API key creation.
+ * Pinned explicitly in the backend plugin config and mirrored in the frontend
+ * create-API-key form validation so limits and error copy cannot drift.
+ */
+export const API_KEY_MIN_EXPIRATION_DAYS = 1;
+export const API_KEY_MAX_EXPIRATION_DAYS = 365;
+export const API_KEY_MAX_NAME_LENGTH = 32;
+
 export const DEFAULT_ADMIN_EMAIL = "admin@example.com";
 export const DEFAULT_ADMIN_PASSWORD = "password";
 
@@ -30,23 +112,100 @@ export const DEFAULT_ADMIN_EMAIL_ENV_VAR_NAME = "ARCHESTRA_AUTH_ADMIN_EMAIL";
 export const DEFAULT_ADMIN_PASSWORD_ENV_VAR_NAME =
   "ARCHESTRA_AUTH_ADMIN_PASSWORD";
 
-export const EMAIL_PLACEHOLDER = "admin@example.com";
-export const PASSWORD_PLACEHOLDER = "password";
+/**
+ * Max length (characters) of a `search` filter on the tool / agent-tool list
+ * endpoints. Those filters travel in the QUERY STRING, and Node counts the
+ * request line against `maxHeaderSize` — so an unbounded search term is not
+ * merely a wasteful query, it is refused by the HTTP parser with a 431 before
+ * any handler or schema runs, which surfaces as an opaque "API request failed"
+ * with nothing in the server logs.
+ *
+ * Generous next to any real tool name (`<catalogName>__<rawName>`) while
+ * staying far below the parser's limit, so callers that pass a name through —
+ * the policy editors look a tool up by name — cannot turn a malformed name
+ * into a transport-layer error.
+ */
+export const TOOL_SEARCH_MAX_LENGTH = 512;
 
-export const DEFAULT_LLM_PROXY_NAME = "Default LLM Proxy";
+/**
+ * Max length (characters) of a project's display name. Kept short so project
+ * lists, headers, and dialogs stay readable. Enforced by the projects API and
+ * the create/edit forms.
+ */
+export const PROJECT_NAME_MAX_LENGTH = 64;
+
+/**
+ * Max length (characters) of a project's description. Kept to roughly a
+ * sentence or two so it stays a short blurb in project cards/headers rather
+ * than a wall of text. Enforced by the projects API and the create/edit forms.
+ */
+export const PROJECT_DESCRIPTION_MAX_LENGTH = 200;
+
+/**
+ * Filename of a project's instructions file. Once saved it is an ordinary,
+ * available project file — listed, readable, and writable through the normal
+ * file surfaces like any other — with one special rule: it cannot be deleted
+ * (emptying it is how its guidance is removed). Its content is injected into the
+ * system prompt of every chat in the project, and it is surfaced as a pinned,
+ * editable entry in the project's Files panel.
+ */
+export const PROJECT_INSTRUCTIONS_FILENAME = "instructions.md";
+
+/**
+ * Max length (characters) the instructions editor / API accepts in one save. It
+ * is injected into every turn's system prompt, so the UI editing path is
+ * deliberately bounded. (Agent writes via the generic file tools are bounded
+ * instead by the sandbox artifact byte limit.)
+ */
+export const PROJECT_INSTRUCTIONS_MAX_LENGTH = 100_000;
+
+/**
+ * Max size (bytes) of a Markdown/plain-text file the in-place editor saves in one
+ * write. Editing happens in a textarea, so this caps it below the sandbox
+ * artifact limit; larger generated files can still be downloaded and read, just
+ * not hand-edited here. The backend write route is the authority; the editor
+ * mirrors it.
+ */
+export const EDITABLE_TEXT_FILE_MAX_BYTES = 1_000_000;
+
+/**
+ * Max size (bytes) of a single file uploaded by dragging it onto the project
+ * Files panel. Enforced both client-side (instant feedback before encoding) and
+ * server-side (the real gate). Kept comfortably under the API body limit: a
+ * 25 MB file is ~33 MB once base64-encoded, and uploads are one request per
+ * file, so a multi-file drop never aggregates into one oversized body.
+ */
+export const MAX_PROJECT_UPLOAD_BYTES = 25 * 1024 * 1024;
+/** {@link MAX_PROJECT_UPLOAD_BYTES} expressed in whole MB, for user-facing copy. */
+export const MAX_PROJECT_UPLOAD_MB = MAX_PROJECT_UPLOAD_BYTES / (1024 * 1024);
+
+export const DEFAULT_LLM_PROXY_NAME = "LLM Proxy";
 /** @deprecated Default Team is no longer auto-created/auto-assigned. Kept for backward compat with E2E tests. */
 export const DEFAULT_TEAM_NAME = "Default Team";
+
+export const SESSION_MAX_AGE_MIN_SECONDS = 3600;
+export const SESSION_MAX_AGE_MAX_SECONDS = 31_536_000;
 
 export const OAUTH_ACCESS_TOKEN_MIN_LIFETIME_SECONDS = 300;
 export const OAUTH_ACCESS_TOKEN_MAX_LIFETIME_SECONDS = 31_536_000;
 export const DEFAULT_OAUTH_ACCESS_TOKEN_LIFETIME_SECONDS = 31_536_000;
 export const LLM_OAUTH_CLIENT_CREDENTIALS_ACCESS_TOKEN_LIFETIME_SECONDS = 3_600;
+export const MCP_OAUTH_CLIENT_CREDENTIALS_ACCESS_TOKEN_LIFETIME_SECONDS = 3_600;
 
 /**
  * Separator used to construct fully-qualified MCP tool names
  * Format: {mcpServerName}__{toolName}
  */
 export const MCP_SERVER_TOOL_NAME_SEPARATOR = "__";
+
+/**
+ * The one placeholder through which an MCP server's mutable display name can
+ * reach a custom K8s deployment spec (`deploymentSpecYaml`). A catalog rename
+ * flags installs of such catalogs `reinstallRequired` instead of being a pure
+ * DB cascade. Must match the `${archestra.*}` placeholder syntax in the
+ * backend's k8s-yaml-generator (pinned by a backend test).
+ */
+export const SERVER_NAME_PLACEHOLDER = "${archestra.server_name}";
 
 export const WEBSITE_URL = "https://archestra.ai";
 export const GITHUB_REPO_URL = "https://github.com/archestra-ai/archestra";
@@ -58,10 +217,241 @@ export const MCP_CATALOG_API_BASE_URL =
   `${WEBSITE_URL}/mcp-catalog/api`;
 
 /**
+ * The env keys the Claude Code connect flow writes into the `env` block of
+ * `~/.claude/settings.json` to route Claude Code through the LLM proxy, per
+ * provider. The connect setup script sets them, and the disconnect surfaces
+ * (the /connection Disconnect panel and the startup guard's disconnect action)
+ * remove exactly these keys — one list so the two directions can't drift.
+ * `ANTHROPIC_CUSTOM_HEADERS` is handled separately: it is merged/stripped
+ * line-wise so user-owned header lines survive.
+ */
+export const CLAUDE_CODE_PROXY_ENV_KEYS = {
+  anthropic: ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"],
+  bedrock: [
+    "CLAUDE_CODE_USE_BEDROCK",
+    "AWS_REGION",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    // Virtual-key mode only: the proxy virtual key, sent as a Bedrock bearer
+    // token (the Anthropic path's ANTHROPIC_AUTH_TOKEN equivalent).
+    "AWS_BEARER_TOKEN_BEDROCK",
+  ],
+} as const;
+
+/** Claude Code custom-headers env key (line-wise merged/stripped, see above). */
+export const CLAUDE_CODE_CUSTOM_HEADERS_ENV_KEY = "ANTHROPIC_CUSTOM_HEADERS";
+
+/**
+ * The env vars the Copilot CLI reads to route inference through a custom
+ * OpenAI-compatible provider. Both connect setup script renderers configure
+ * them: PowerShell applies them directly (`irm | iex` runs in the caller's
+ * session, and User scope persists them), bash prints ready-to-paste export
+ * lines (a piped script cannot export into the caller's shell). One list so
+ * the renderers can't drift.
+ */
+export const COPILOT_PROVIDER_ENV_KEYS = {
+  type: "COPILOT_PROVIDER_TYPE",
+  baseUrl: "COPILOT_PROVIDER_BASE_URL",
+  apiKey: "COPILOT_PROVIDER_API_KEY",
+  model: "COPILOT_MODEL",
+  /**
+   * Custom headers the CLI sends only to the BYOK provider endpoint —
+   * carries the Archestra attribution headers (client id, and in passthrough
+   * mode the personal passthrough key). Newline-separated `Name: Value`
+   * pairs; a literal `\n` also separates entries.
+   */
+  headers: "COPILOT_PROVIDER_HEADERS",
+  /** "completions" (default) or "responses"; setup selects "responses" where the proxy serves it. */
+  wireApi: "COPILOT_PROVIDER_WIRE_API",
+} as const;
+
+/**
+ * Copilot CLI's environment-variable provider configuration (BYOK), from
+ * `copilot help providers`. Once providers.json carries the Archestra provider
+ * these only interfere: with COPILOT_PROVIDER_BASE_URL set Copilot ignores
+ * providers.json and uses the variables (sending the prefixed model name as
+ * the wire model); with only COPILOT_MODEL set it refuses to start the saved
+ * model ("Reasoning effort 'medium' is not supported for model
+ * 'archestra/<model>'", Copilot CLI 1.0.105); other partial sets print
+ * warnings. Setup removes the ones an earlier setup saved, the launch check
+ * drops them all from Copilot's environment while the LLM proxy is connected,
+ * and the closing note reports any that remain.
+ */
+export const COPILOT_LEGACY_PROVIDER_ENV_VARS = [
+  "COPILOT_MODEL",
+  "COPILOT_PROVIDER_BASE_URL",
+  "COPILOT_PROVIDER_TYPE",
+  "COPILOT_PROVIDER_API_KEY",
+  "COPILOT_PROVIDER_API_KEY_COMMAND",
+  "COPILOT_PROVIDER_BEARER_TOKEN",
+  "COPILOT_PROVIDER_WIRE_API",
+  "COPILOT_PROVIDER_TRANSPORT",
+  "COPILOT_PROVIDER_AZURE_API_VERSION",
+  "COPILOT_PROVIDER_HEADERS",
+  "COPILOT_PROVIDER_MODEL_ID",
+  "COPILOT_PROVIDER_WIRE_MODEL",
+  "COPILOT_PROVIDER_MAX_PROMPT_TOKENS",
+  "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS",
+] as const;
+
+/**
+ * Set by the Copilot CLI profile wrapper while it runs the launch check, once
+ * the wrapper itself drops COPILOT_LEGACY_PROVIDER_ENV_VARS for the launch.
+ * A guard refreshed under an older wrapper (which cannot) reports the
+ * variables instead.
+ */
+export const COPILOT_ENV_HANDLED_MARKER = "ARCHESTRA_COPILOT_ENV_HANDLED";
+
+/**
+ * Per-client startup-guard ("pre-loader") install locations, one entry per
+ * scriptable CLI client that gets a guard. For each client the connect setup
+ * script writes the guard to `~/<scriptRelpath>` (PowerShell:
+ * `~/<psScriptRelpath>`) and wraps that client's binary in the user's shell
+ * profiles inside the `markerStart`…`markerEnd` block. The guard records
+ * remotes its own disconnect action already removed in `~/<skipRelpath>` (one
+ * resource kind per line) so later launches skip them, and removes itself
+ * entirely once nothing connected is left to check; connect clears the skip
+ * file so a fresh setup re-arms every check. The Disconnect panel tells users
+ * to remove exactly these paths.
+ *
+ * Cursor is a GUI IDE with no wrappable terminal launch command, so it has no
+ * guard entry — its connect is reversed from the Disconnect panel instead.
+ */
+export const STARTUP_GUARD_INSTALL = {
+  "grok-build": {
+    scriptRelpath: ".archestra/grok/startup.sh",
+    psScriptRelpath: ".archestra/grok/startup.ps1",
+    skipRelpath: ".archestra/grok/startup.skip",
+    markerStart: "# BEGIN ARCHESTRA MANAGED GROK",
+    markerEnd: "# END ARCHESTRA MANAGED GROK",
+  },
+  pi: {
+    scriptRelpath: ".archestra/pi/startup.sh",
+    psScriptRelpath: ".archestra/pi/startup.ps1",
+    skipRelpath: ".archestra/pi/startup.skip",
+    markerStart: "# >>> archestra pi guard >>>",
+    markerEnd: "# <<< archestra pi guard <<<",
+  },
+  "claude-code": {
+    scriptRelpath: ".archestra/claude-startup-guard.sh",
+    // Windows (PowerShell) guard; forward slashes — PowerShell accepts them.
+    psScriptRelpath: ".archestra/claude-startup-guard.ps1",
+    skipRelpath: ".archestra/claude-startup-guard.skip",
+    markerStart: "# >>> archestra claude guard >>>",
+    markerEnd: "# <<< archestra claude guard <<<",
+  },
+  codex: {
+    scriptRelpath: ".archestra/codex-startup-guard.sh",
+    psScriptRelpath: ".archestra/codex-startup-guard.ps1",
+    skipRelpath: ".archestra/codex-startup-guard.skip",
+    markerStart: "# >>> archestra codex guard >>>",
+    markerEnd: "# <<< archestra codex guard <<<",
+  },
+  "kimi-code": {
+    scriptRelpath: ".archestra/kimi-code-startup-guard.sh",
+    psScriptRelpath: ".archestra/kimi-code-startup-guard.ps1",
+    skipRelpath: ".archestra/kimi-code-startup-guard.skip",
+    markerStart: "# >>> archestra kimi-code guard >>>",
+    markerEnd: "# <<< archestra kimi-code guard <<<",
+  },
+  "copilot-cli": {
+    scriptRelpath: ".archestra/copilot-startup-guard.sh",
+    psScriptRelpath: ".archestra/copilot-startup-guard.ps1",
+    skipRelpath: ".archestra/copilot-startup-guard.skip",
+    markerStart: "# >>> archestra copilot guard >>>",
+    markerEnd: "# <<< archestra copilot guard <<<",
+  },
+  ...openCodeFamilyRecord((client) => ({
+    scriptRelpath: `.archestra/${client.stateName}-startup-guard.sh`,
+    psScriptRelpath: `.archestra/${client.stateName}-startup-guard.ps1`,
+    skipRelpath: `.archestra/${client.stateName}-startup-guard.skip`,
+    markerStart: `# >>> archestra ${client.stateName} guard >>>`,
+    markerEnd: `# <<< archestra ${client.stateName} guard <<<`,
+  })),
+} as const;
+
+/** Client ids that get a startup guard (keys of {@link STARTUP_GUARD_INSTALL}). */
+export type StartupGuardClientId = keyof typeof STARTUP_GUARD_INSTALL;
+
+/**
+ * Monotonic format version of the installed startup guard. It is NOT the
+ * platform release version — it is a plain counter that increments by one
+ * whenever the generated guard's behavior or install layout changes in a way
+ * that warrants refreshing the installed startup check.
+ *
+ * The connect setup stamps this number into the guard it installs; the public
+ * `/v1/health` endpoint reports the running instance's current value. On every
+ * launch the guard refreshes ONLY when the instance reports a STRICTLY
+ * GREATER number than the one it was stamped with. Comparing a monotonic
+ * counter — rather than release strings — is what keeps a rollback or an older
+ * instance silent: a guard from a newer deploy simply sees an equal-or-lower
+ * number and says nothing. Bump this by exactly one when a guard change
+ * should refresh installed generated checks. User settings and permissions
+ * are never replayed by this update.
+ *
+ * Preview installs already used version 2. Version 3 repairs their PowerShell
+ * permission cleanup; reusing version 2 would not prompt those users to reconnect.
+ * Version 10 moves Claude Code allow rules to the tool prefix `/v1/health`
+ * reports, so installed guards pick that up without a reconnect.
+ * Version 11 adds the Copilot CLI provider-environment repair (see
+ * COPILOT_LEGACY_PROVIDER_ENV_VARS) to the guard, so installed guards pick it
+ * up at their next launch.
+ */
+export const STARTUP_GUARD_FORMAT_VERSION = 11;
+
+/**
+ * The managed instructions a deployment uses until an admin edits them. It
+ * names the deployment's own Remote Agents, so users of Claude Code or Codex
+ * don't mistake them for their client vendor's.
+ */
+export function defaultRuntimeHandoffInstructions(appName: string): string {
+  return `In your first reply, briefly answer the user, then add: "By the way, say 'move this to ${appName} Remote Agents' to continue this session in the cloud." Say this only once per session. When asked, use the Remote Agents Handoff skill and create a remote agent if needed.`;
+}
+
+/**
+ * The managed instructions in effect. Unedited ones (stored as null, or the
+ * earlier default's exact text) follow the current default, so a deployment
+ * that never changed them picks up new wording.
+ */
+export function resolveRuntimeHandoffInstructions(params: {
+  stored: string | null | undefined;
+  appName: string;
+}): string {
+  const { stored, appName } = params;
+  return stored == null || stored === LEGACY_RUNTIME_HANDOFF_INSTRUCTIONS
+    ? defaultRuntimeHandoffInstructions(appName)
+    : stored;
+}
+
+const LEGACY_RUNTIME_HANDOFF_INSTRUCTIONS = `In your first reply, briefly answer the user, then add: "By the way, say 'move this to Cloud runtime' to continue this session in the cloud." Say this only once per session. When asked, use the Agent Runtime Handoff skill and create a runtime agent if needed.`;
+
+/**
  * Header name for external agent ID.
  * Clients can pass this header to associate interactions with their own agent identifiers.
  */
 export const EXTERNAL_AGENT_ID_HEADER = "X-Archestra-Agent-Id";
+
+/** OpenCode's request-local agent name, used only for display classification. */
+export const OPENCODE_AGENT_HEADER = "X-Archestra-OpenCode-Agent";
+
+/**
+ * The client session an OpenAPPA root is bound to, and the parent root a child
+ * session hangs from. A caller that manages roots deliberately sends them; for
+ * everyone else the wire adapter derives the session from what the client
+ * already sends (see `appaSessionIdentity`). Shared because the proxy, the MCP
+ * gateway and Chat all speak them.
+ */
+export const APPA_SESSION_HEADER = "X-Appa-Session-ID";
+export const APPA_PARENT_HEADER = "X-Appa-Parent-ID";
+
+/**
+ * MCP App whose runtime is making this LLM call (`archestra.llm.complete()`),
+ * set by the in-process app-runtime tool so the interaction records which app
+ * spent the tokens instead of collapsing into the shared App Runtime agent.
+ * Honored only over the loopback socket and only for an app of the executing
+ * agent's organization — external clients cannot use it to attribute spend to
+ * an app they do not own.
+ */
+export const APP_ID_HEADER = "X-Archestra-App-Id";
 
 /**
  * Header name for user ID.
@@ -69,6 +459,17 @@ export const EXTERNAL_AGENT_ID_HEADER = "X-Archestra-Agent-Id";
  * Particularly useful for identifying which user was using the Archestra Chat.
  */
 export const USER_ID_HEADER = "X-Archestra-User-Id";
+
+/**
+ * Header name for a passthrough virtual key.
+ * Clients can pass this header to authenticate the acting Archestra user on an
+ * LLM proxy request whose provider credential is something the proxy forwards
+ * untouched (e.g. a Claude Code subscription token or a raw provider key in the
+ * Authorization header). The passthrough key carries no provider credential of
+ * its own — it only attributes the interaction to its owner and gates access to
+ * the proxy. Standard virtual keys still go in the Authorization header.
+ */
+export const VIRTUAL_KEY_HEADER = "X-Archestra-Virtual-Key";
 
 /**
  * Header name for session ID.
@@ -85,22 +486,24 @@ export const SESSION_ID_HEADER = "X-Archestra-Session-Id";
 export const SOURCE_HEADER = "X-Archestra-Source";
 
 /**
- * Header used by internal delegated agent calls to indicate that the parent
- * execution context was already untrusted/sensitive.
+ * `1` says no person is there to answer for the session: Scheduled task runs
+ * send it, and any client may. Agent Runtime runs count as unattended without
+ * it. Guardrails' Break the glass settings can then let calls waiting for
+ * human approval through, with a yell.
  */
-export const UNTRUSTED_CONTEXT_HEADER = "X-Archestra-Context-Untrusted";
+export const UNATTENDED_HEADER = "X-Archestra-Unattended";
 
 /**
- * Header name for execution ID.
- * Clients can pass this header to associate interactions with a specific execution run.
+ * Header name for a run ID.
+ * Clients can pass this header to associate interactions with a specific run.
  */
-export const EXECUTION_ID_HEADER = "X-Archestra-Execution-Id";
+export const RUN_ID_HEADER = "X-Archestra-Run-Id";
 
 /**
- * Composite meta header with format: external-agent-id/execution-id/session-id.
+ * Composite meta header with format: external-agent-id/run-id/session-id.
  * Provides a convenience way to set all three values at once.
  * Individual headers take precedence over meta header values.
- * Any segment can be empty (e.g., "/exec-123/" sets only execution-id).
+ * Any segment can be empty (e.g., "/run-123/" sets only run-id).
  *
  * Values must not contain "/" since it is used as the segment delimiter.
  */
@@ -120,6 +523,21 @@ export const PROVIDER_BASE_URL_HEADER = "X-Archestra-Provider-Base-Url";
  * clients from spoofing arbitrary key IDs.
  */
 export const CHAT_API_KEY_ID_HEADER = "X-Archestra-Chat-Api-Key-Id";
+
+/**
+ * Header used to pass the model pool a chat was set to from chat → LLM proxy.
+ * In-process calls are pooled only when they carry it; like
+ * CHAT_API_KEY_ID_HEADER, it is only honored with the in-process proof.
+ */
+export const MODEL_POOL_ID_HEADER = "X-Archestra-Model-Pool-Id";
+
+/**
+ * Header naming the auto router a chat or agent call runs on: its chat's or
+ * agent's own selection, with no pool or explicit subagent tier. The proxy
+ * routes the session across that router's model trio. Like
+ * MODEL_POOL_ID_HEADER, it is only honored with the in-process proof.
+ */
+export const AUTO_ROUTER_ID_HEADER = "X-Archestra-Auto-Router-Id";
 
 export const DEFAULT_VAULT_TOKEN = "dev-root-token";
 
@@ -142,3 +560,37 @@ export function getArchestraTokenPrefix(value: string): string | null {
 export function hasArchestraTokenPrefix(value: string): boolean {
   return getArchestraTokenPrefix(value) !== null;
 }
+
+/**
+ * Whether a file may be edited in place through the generic text editor: only
+ * Markdown and plain-text files, by extension or MIME. Intentionally narrower
+ * than the Files preview's text rendering (which also shows JSON/CSV/logs) — the
+ * editor targets `.md`/`.txt` only. Single source of truth for both the backend
+ * write route's gate and the frontend's Edit affordance, so they cannot drift.
+ */
+export function isEditableTextFile(params: {
+  filename: string;
+  mimeType: string;
+}): boolean {
+  const name = params.filename.toLowerCase();
+  const mime = params.mimeType.toLowerCase();
+  return (
+    name.endsWith(".md") ||
+    name.endsWith(".txt") ||
+    mime === "text/markdown" ||
+    mime === "text/plain"
+  );
+}
+
+/**
+ * Bounds of `GET /api/agents/options`. IDs travel in the query string, and
+ * Node refuses a request line + headers over 16 KB with a 431, so the ID
+ * filter stays at the same cap as `/api/agents/credential-readiness`.
+ */
+export const AGENT_OPTIONS_MAX_IDS = 200;
+export const AGENT_OPTIONS_MAX_PAGE_SIZE = 1000;
+
+/** Highest spending limit one auto-routing backfill may be given, in USD. */
+export const AUTO_ROUTING_BACKFILL_MAX_COST_USD = 1000;
+/** Scorer calls a backfill has in flight: how many per-call costs it may overshoot its spending limit by. */
+export const AUTO_ROUTING_BACKFILL_SCORER_CALLS = 4;

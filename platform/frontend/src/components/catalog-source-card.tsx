@@ -1,0 +1,55 @@
+import { type ReactNode, useId } from "react";
+import { UnstyledButton } from "@/components/ui/unstyled-button";
+
+/**
+ * Primary source choice used at the beginning of catalog-backed create flows.
+ * Skills, Plugins, and Agents intentionally share this surface so choosing a
+ * curated template never feels like a separate kind of resource.
+ */
+export function CatalogSourceCard({
+  icon,
+  title,
+  description,
+  onClick,
+  badge,
+  disabled = false,
+  disabledReason,
+}: {
+  icon: ReactNode;
+  title: string;
+  description: string;
+  onClick: () => void;
+  badge?: ReactNode;
+  disabled?: boolean;
+  disabledReason?: string;
+}) {
+  const disabledReasonId = useId();
+
+  return (
+    <UnstyledButton
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-describedby={
+        disabled && disabledReason ? disabledReasonId : undefined
+      }
+      className="group flex h-full flex-col gap-3 rounded-xl border bg-card p-5 text-left text-card-foreground shadow-sm transition-colors hover:border-primary/40 hover:bg-muted/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:border-border disabled:hover:bg-card"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex size-10 items-center justify-center rounded-lg bg-muted text-foreground transition-colors group-hover:bg-primary/10 group-hover:text-primary">
+          {icon}
+        </div>
+        {badge}
+      </div>
+      <div className="space-y-1">
+        <div className="font-medium leading-none">{title}</div>
+        <p className="text-sm text-muted-foreground">{description}</p>
+        {disabled && disabledReason ? (
+          <p id={disabledReasonId} className="text-xs text-muted-foreground">
+            {disabledReason}
+          </p>
+        ) : null}
+      </div>
+    </UnstyledButton>
+  );
+}

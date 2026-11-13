@@ -1,27 +1,23 @@
 // This file configures the initialization of Sentry on the client.
 // The added config here will be used whenever a users loads a page in their browser.
 // https://docs.sentry.io/platforms/javascript/guides/nextjs/
+//
+// The SDK itself loads after the app is interactive (see lib/error-reporting).
 
-import * as Sentry from "@sentry/nextjs";
 import config from "@/lib/config/config";
-import { getFrontendBrowserSentryOptions } from "../sentry.shared";
+import { errorReporting } from "@/lib/error-reporting";
 
 const {
-  sentry: { dsn, environment },
+  sentry: { dsnOverride, environmentOverride },
 } = config;
 
-// Only initialize Sentry if DSN is configured
-if (dsn) {
-  const browserOptions = getFrontendBrowserSentryOptions({ dsn, environment });
+errorReporting.start({
+  dsnOverride,
+  environmentOverride,
+  nodeEnv: process.env.NODE_ENV,
+});
 
-  Sentry.init({
-    ...browserOptions,
-    // Preserve the default browser integrations and add Replay on top.
-    integrations: [
-      ...Sentry.getDefaultIntegrations(browserOptions),
-      Sentry.replayIntegration(),
-    ],
-  });
-}
-
-export const onRouterTransitionStart = Sentry.captureRouterTransitionStart;
+export const onRouterTransitionStart: typeof import("@sentry/nextjs").captureRouterTransitionStart =
+  (...args) => {
+    errorReporting.captureRouterTransitionStart(...args);
+  };

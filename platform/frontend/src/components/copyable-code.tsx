@@ -4,7 +4,8 @@ import { Check, Copy } from "lucide-react";
 import { type ReactNode, useCallback, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
+import { copyToClipboard } from "@/lib/clipboard";
+import { cn } from "@/lib/utils/tailwind";
 
 interface CopyableCodeProps {
   /** The text to copy to clipboard */
@@ -29,7 +30,7 @@ export function CopyableCode({
   const [copied, setCopied] = useState(false);
 
   const handleCopy = useCallback(async () => {
-    await navigator.clipboard.writeText(value);
+    await copyToClipboard(value);
     setCopied(true);
     toast.success(toastMessage);
     setTimeout(() => setCopied(false), 2000);
@@ -58,8 +59,8 @@ export function CopyableCode({
       </div>
       <Button
         variant="ghost"
-        size="icon"
-        className="h-6 w-6 shrink-0"
+        size="icon-xs"
+        className="shrink-0"
         onClick={handleCopy}
       >
         {copied ? (
@@ -67,6 +68,9 @@ export function CopyableCode({
         ) : (
           <Copy className="h-3 w-3" />
         )}
+        <span className="sr-only">
+          {copied ? "Copied!" : "Copy to clipboard"}
+        </span>
       </Button>
     </div>
   );

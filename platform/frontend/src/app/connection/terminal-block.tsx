@@ -3,39 +3,113 @@
 import { Check, Copy } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
+import { SecretCopyButton } from "@/components/secret-copy-button";
+import {
+  TerminalCard,
+  terminalActionClass,
+  terminalCodeClass,
+} from "@/components/terminal-surface";
+import { UnstyledButton } from "@/components/ui/unstyled-button";
+import { copyToClipboard } from "@/lib/clipboard";
+import { cn } from "@/lib/utils/tailwind";
 
 interface TerminalBlockProps {
-  /** Raw code to render and copy. */
-  code: string;
+  /** Raw code to render and copy. Ignored when `rows` is provided. */
+  code?: string;
+  /**
+   * Multiple code rows in one card, each with its own copy button and an
+   * optional `#`-style comment line (e.g. Bedrock's two endpoints).
+   */
+  rows?: {
+    comment?: string;
+    /** A short tag before the code saying what it is, e.g. "BASE URL". */
+    badge?: string;
+    code: string;
+    /**
+     * When set, the row's `code` is a placeholder rendering of something that
+     * embeds a secret, and copying becomes an explicit choice between the real
+     * value and the placeholder (see SecretCopyButton).
+     */
+    getSecretText?: () => Promise<string | null>;
+  }[];
+  /**
+   * Optional row rendered inside the card above the code — e.g. the provider
+   * toggler tabs used by the setup-script and proxy-endpoint cards.
+   */
+  header?: React.ReactNode;
 }
 
-export function TerminalBlock({ code }: TerminalBlockProps) {
-  const [copied, setCopied] = useState(false);
+export function TerminalBlock({ code, rows, header }: TerminalBlockProps) {
+  const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
 
-  const onCopy = async () => {
-    await navigator.clipboard.writeText(code);
-    setCopied(true);
+  const effectiveRows = rows ?? (code !== undefined ? [{ code }] : []);
+
+  const onCopy = async (rowCode: string, index: number) => {
+    await copyToClipboard(rowCode);
+    setCopiedIndex(index);
     toast.success("Copied to clipboard");
-    setTimeout(() => setCopied(false), 1600);
+    setTimeout(() => setCopiedIndex(null), 1600);
   };
 
   return (
-    <div className="relative overflow-hidden rounded-xl border border-[#1f2937] bg-[#0d1117] shadow-lg">
-      <button
-        type="button"
-        onClick={onCopy}
-        aria-label="Copy to clipboard"
-        className="absolute right-2 top-2 flex size-7 items-center justify-center rounded border border-[#1f2937] bg-[#0d1117] text-[#9ca3af] transition-colors hover:text-white"
-      >
-        {copied ? (
-          <Check className="size-3.5 text-[#4ade80]" strokeWidth={2.5} />
-        ) : (
-          <Copy className="size-3.5" strokeWidth={2} />
-        )}
-      </button>
-      <pre className="m-0 max-h-[360px] overflow-auto px-5 py-4 pr-12 font-mono text-[13px] leading-[1.65] text-[#e5e7eb]">
-        {code}
-      </pre>
-    </div>
+    <TerminalCard>
+      {header}
+      {effectiveRows.map((row, index) => (
+        <div
+          key={row.code}
+          className={
+            index > 0 ? "relative border-t border-terminal-edge" : "relative"
+          }
+        >
+          {row.getSecretText ? (
+            <div className="absolute right-2 top-2">
+              <SecretCopyButton
+                variant="terminal"
+                getSecretText={row.getSecretText}
+                placeholderText={row.code}
+              />
+            </div>
+          ) : (
+            <UnstyledButton
+              type="button"
+              onClick={() => onCopy(row.code, index)}
+              aria-label="Copy to clipboard"
+              className={cn(
+                terminalActionClass,
+                "absolute right-2 top-2 size-7",
+              )}
+            >
+              {copiedIndex === index ? (
+                <Check
+                  className="size-3.5 text-terminal-success"
+                  strokeWidth={2.5}
+                />
+              ) : (
+                <Copy className="size-3.5" strokeWidth={2} />
+              )}
+            </UnstyledButton>
+          )}
+          <pre
+            className={cn(
+              "m-0 max-h-[360px] overflow-auto px-5 py-4 pr-12",
+              terminalCodeClass,
+            )}
+          >
+            {row.comment && (
+              <span className="select-none text-terminal-comment">
+                # {row.comment}
+                {"\n"}
+              </span>
+            )}
+            {row.badge && (
+              <span className="mr-3 select-none rounded bg-green-100 px-1.5 py-0.5 text-[11px] font-semibold text-green-800 dark:bg-green-950 dark:text-green-300">
+                {row.badge}
+              </span>
+            )}
+            {row.code}
+          </pre>
+        </div>
+      ))}
+    </TerminalCard>
   );
 }

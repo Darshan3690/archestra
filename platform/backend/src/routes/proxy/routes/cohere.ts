@@ -4,8 +4,8 @@
  * Handles routing for Cohere LLM proxy endpoints.
  */
 
+import { RouteId } from "@archestra/shared";
 import fastifyHttpProxy from "@fastify/http-proxy";
-import { RouteId } from "@shared";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
 import config from "@/config";
@@ -13,6 +13,7 @@ import logger from "@/logging";
 import { Cohere, constructResponseSchema, UuidIdSchema } from "@/types";
 import { cohereAdapterFactory } from "../adapters";
 import { PROXY_API_PREFIX, PROXY_BODY_LIMIT } from "../common";
+import { createPassthroughAuthenticator } from "../llm-proxy-auth";
 import { handleLLMProxy } from "../llm-proxy-handler";
 import { createProxyPreHandler } from "./proxy-prehandler";
 
@@ -22,7 +23,7 @@ const cohereProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
   // e.g. POST /v1/cohere/:agentId/chat or POST /v1/cohere/chat
   const CHAT_SUFFIX = "/chat";
 
-  logger.info("[UnifiedProxy] Registering unified Cohere routes");
+  logger.debug("[UnifiedProxy] Registering unified Cohere routes");
 
   // Ensure proxy upstream is always a string to satisfy fastify-http-proxy types
   const cohereBaseUrl = config.llm.cohere.baseUrl ?? "https://api.cohere.ai";
@@ -36,6 +37,7 @@ const cohereProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
       endpointSuffix: CHAT_SUFFIX,
       upstream: cohereBaseUrl,
       providerName: "Cohere",
+      authenticate: createPassthroughAuthenticator("cohere"),
       skipErrorResponse: {
         error: {
           message: "Chat requests should use the dedicated endpoint",

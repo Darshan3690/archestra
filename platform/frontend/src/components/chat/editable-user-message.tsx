@@ -1,25 +1,33 @@
 "use client";
 
-import { AlertTriangle, FileText, Paperclip } from "lucide-react";
-import Link from "next/link";
-import {
-  type KeyboardEventHandler,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-} from "react";
+import { AlertTriangle, BookPlus, FileText, Paperclip } from "lucide-react";
+import { memo, useState } from "react";
 import { Message, MessageContent } from "@/components/ai-elements/message";
+import {
+  AttachmentImage,
+  AttachmentLink,
+} from "@/components/chat/attachment-content";
+import {
+  EditableMessageEditor,
+  useMessageEditor,
+} from "@/components/chat/editable-message-editor";
 import { MessageActions } from "@/components/chat/message-actions";
+import { SaveToKnowledgeDialog } from "@/components/chat/save-to-knowledge-dialog";
+import { SkillPill } from "@/components/chat/skill-pill";
 import { UserMessageText } from "@/components/chat/user-message-text";
-import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { UnstyledButton } from "@/components/ui/unstyled-button";
 import {
   getAttachmentFallbackLabel,
   isCsvAttachment,
   isPlainTextAttachment,
 } from "@/lib/chat/chat-attachment-display";
-import { cn } from "@/lib/utils";
+import { attachmentIdFromUrl } from "@/lib/chat/conversation-files";
+import { cn } from "@/lib/utils/tailwind";
 
 export interface FileAttachment {
   url: string;
@@ -35,7 +43,24 @@ interface EditableUserMessageProps {
   isEditing: boolean;
   editDisabled?: boolean;
   attachments?: FileAttachment[];
-  onStartEdit: (partKey: string, messageId: string) => void;
+  /**
+   * The conversation these attachments belong to. Needed to open them in a
+   * encrypted chat, where the bytes only come back to a request bearing that
+   * conversation's key.
+   */
+  conversationId?: string;
+  /**
+   * Whether an attachment on this message may be copied into a knowledge base.
+   * False in an encrypted chat, where the backend refuses it — copying would write
+   * a plaintext copy others can read. Decided by the caller, which already
+   * knows the conversation, so a transcript of N messages does not open N
+   * subscriptions to it.
+   */
+  canSaveToKnowledge?: boolean;
+  /** Skill the user invoked via slash command for this message, if any. */
+  skill?: { name: string; href?: string };
+  /** Omit for a read-only transcript: hides edit and regenerate. */
+  onStartEdit?: (partKey: string, messageId: string) => void;
   onCancelEdit: () => void;
   onSave: (
     messageId: string,
@@ -44,7 +69,10 @@ interface EditableUserMessageProps {
   ) => Promise<void>;
 }
 
-export function EditableUserMessage({
+// Memoized so a streamed chunk, which re-renders the whole transcript, skips
+// every user bubble. Callers pass stable callbacks and attachment arrays (see
+// ChatMessages) so the memo holds.
+export const EditableUserMessage = memo(function EditableUserMessage({
   messageId,
   partIndex,
   partKey,
@@ -52,50 +80,24 @@ export function EditableUserMessage({
   isEditing,
   editDisabled = false,
   attachments = [],
+  conversationId,
+  canSaveToKnowledge = true,
+  skill,
   onStartEdit,
   onCancelEdit,
   onSave,
 }: EditableUserMessageProps) {
-  const [editedText, setEditedText] = useState(text);
-  const [isSaving, setIsSaving] = useState(false);
-  const [isComposing, setIsComposing] = useState(false);
   const [isRegenerateConfirming, setIsRegenerateConfirming] = useState(false);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-
-  // Reset edited text when entering edit mode
-  useEffect(() => {
-    if (isEditing) {
-      setEditedText(text);
-    }
-  }, [isEditing, text]);
-
-  // Auto-focus textarea and move caret to end when entering edit mode
-  useLayoutEffect(() => {
-    if (isEditing && textareaRef.current) {
-      const textarea = textareaRef.current;
-      textarea.focus();
-      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
-      textarea.scrollTop = textarea.scrollHeight;
-    }
-  }, [isEditing]);
+  const editor = useMessageEditor({
+    text,
+    isEditing,
+    onSave: (newText) => onSave(messageId, partIndex, newText),
+    onCancelEdit,
+  });
+  const { setIsSaving } = editor;
 
   const handleStartEdit = () => {
-    onStartEdit(partKey, messageId);
-  };
-
-  const handleCancelEdit = () => {
-    setEditedText(text);
-    onCancelEdit();
-  };
-
-  const handleSaveEdit = async () => {
-    setIsSaving(true);
-    try {
-      await onSave(messageId, partIndex, editedText);
-      onCancelEdit();
-    } finally {
-      setIsSaving(false);
-    }
+    onStartEdit?.(partKey, messageId);
   };
 
   const handleRegenerateClick = async () => {
@@ -113,80 +115,27 @@ export function EditableUserMessage({
     }
   };
 
-  const handleKeyDown: KeyboardEventHandler<HTMLTextAreaElement> = (e) => {
-    if (e.key === "Enter") {
-      // IME (Input Method Editor) check for international keyboards
-      if (isComposing || e.nativeEvent.isComposing) {
-        return;
-      }
-
-      // Allow Shift+Enter for new line
-      if (e.shiftKey) {
-        return;
-      }
-
-      e.preventDefault();
-
-      // Don't submit if saving or text is empty
-      if (isSaving || editedText.trim() === "") {
-        return;
-      }
-
-      handleSaveEdit();
-    } else if (e.key === "Escape") {
-      handleCancelEdit();
-    }
-  };
-
   if (isEditing) {
     return (
-      <Message from="user" className="relative pb-9">
-        <MessageContent
-          aria-label="Message content"
-          className="max-w-[70%] min-w-[50%] px-3 py-0 pt-3 ring-2 !bg-primary/90 ring-primary/50"
-        >
-          <div>
-            <Textarea
-              ref={textareaRef}
-              value={editedText}
-              onChange={(e) => setEditedText(e.target.value)}
-              onKeyDown={handleKeyDown}
-              onCompositionStart={() => setIsComposing(true)}
-              onCompositionEnd={() => setIsComposing(false)}
-              className="max-h-[160px] resize-none border-0 focus-visible:ring-0 shadow-none bg-primary text-sm"
-              disabled={isSaving}
-              placeholder="Edit your message..."
-            />
-            <div className="flex gap-2 py-3 justify-between items-start">
-              <div className="flex gap-2 items-start">
-                <AlertTriangle className="h-3 w-3 text-amber-400 shrink-0 mt-0.5" />
-                <span className="text-xs text-primary-foreground/80">
-                  Editing this message will <strong>regenerate</strong> the
-                  response and <strong>remove</strong> all subsequent messages.
-                </span>
-              </div>
-              <div className="flex gap-2 shrink-0">
-                <Button
-                  size="sm"
-                  variant="outline-transparent"
-                  onClick={handleCancelEdit}
-                  disabled={isSaving}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={handleSaveEdit}
-                  disabled={isSaving || editedText.trim() === ""}
-                >
-                  Send
-                </Button>
-              </div>
-            </div>
+      <EditableMessageEditor
+        from="user"
+        editor={editor}
+        outerClassName="relative pb-9"
+        contentClassName="max-w-[70%] min-w-[50%] px-3 py-0 pt-3 ring-2 !bg-primary/90 ring-primary/50"
+        textareaClassName="max-h-[160px] resize-none border-0 focus-visible:ring-0 shadow-none bg-primary text-sm"
+        placeholder="Edit your message..."
+        saveLabel="Send"
+        saveVariant="secondary"
+        banner={
+          <div className="flex gap-2 items-start">
+            <AlertTriangle className="h-3 w-3 text-amber-400 shrink-0 mt-0.5" />
+            <span className="text-xs text-primary-foreground/80">
+              Editing this message will <strong>regenerate</strong> the response
+              and <strong>remove</strong> all subsequent messages.
+            </span>
           </div>
-        </MessageContent>
-      </Message>
+        }
+      />
     );
   }
 
@@ -203,14 +152,30 @@ export function EditableUserMessage({
       className="group/message"
       onMouseLeave={() => setIsRegenerateConfirming(false)}
     >
-      <div className="relative flex flex-col items-end pb-2 w-full">
+      {/* No bottom padding here: the message row's mb-4 IS the 16px rhythm gap
+          to the next block (see chat/CLAUDE.md); extra padding would compound. */}
+      <div className="relative flex flex-col items-end w-full">
+        {/* Skill invoked via slash command — same pill shape as the tool-call
+            SkillPill so the slash-command attribution and the model-driven
+            load_skill call read as the same thing. Right-aligned (inheriting
+            the parent column's `items-end`) so it sits above the bubble it
+            belongs to rather than drifting to the far-left column edge. */}
+        {skill && (
+          <SkillPill
+            skillName={skill.name}
+            href={skill.href}
+            className="mb-2"
+          />
+        )}
         {/* Image attachments above the message bubble */}
         {imageAttachments.length > 0 && (
           <div className="flex flex-wrap gap-1 justify-end mb-2">
-            {imageAttachments.map((attachment) => (
-              <img
-                key={attachment.url}
-                src={attachment.url}
+            {imageAttachments.map((attachment, index) => (
+              <AttachmentImage
+                // biome-ignore lint/suspicious/noArrayIndexKey: the same file attached twice shares one url (and, once saved, one stored attachment), so the url is not unique; a message's attachments never reorder
+                key={index}
+                url={attachment.url}
+                conversationId={conversationId}
                 alt={attachment.filename || "Attached image"}
                 className="max-h-32 rounded-lg object-cover"
               />
@@ -220,51 +185,65 @@ export function EditableUserMessage({
         {/* Other file attachments above the message bubble */}
         {otherAttachments.length > 0 && (
           <div className="flex flex-wrap gap-1 justify-end mb-2">
-            {otherAttachments.map((attachment) => (
-              <Link
-                key={attachment.url}
-                href={attachment.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                download={attachment.filename}
-                className="flex items-center gap-2 text-sm rounded-lg border bg-muted/50 p-2 hover:bg-muted transition-colors"
+            {otherAttachments.map((attachment, index) => (
+              <div
+                // biome-ignore lint/suspicious/noArrayIndexKey: see the image attachments above — urls repeat when a file is attached twice
+                key={index}
+                className="group/attachment flex items-center gap-1 rounded-lg border bg-muted/50 p-1"
               >
-                {isCsvAttachment(attachment.mediaType, attachment.filename) ||
-                isPlainTextAttachment(
-                  attachment.mediaType,
-                  attachment.filename,
-                ) ? (
-                  <FileText className="h-4 w-4 text-muted-foreground" />
-                ) : (
-                  <Paperclip className="h-4 w-4 text-muted-foreground" />
-                )}
-                <span className="truncate max-w-[200px]">
-                  {attachment.filename ||
-                    getAttachmentFallbackLabel({
-                      mediaType: attachment.mediaType,
-                      filename: attachment.filename,
-                    })}
-                </span>
-              </Link>
+                <AttachmentLink
+                  url={attachment.url}
+                  conversationId={conversationId}
+                  download={attachment.filename}
+                  className="flex min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-sm transition-colors hover:bg-muted"
+                >
+                  {isCsvAttachment(attachment.mediaType, attachment.filename) ||
+                  isPlainTextAttachment(
+                    attachment.mediaType,
+                    attachment.filename,
+                  ) ? (
+                    <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  ) : (
+                    <Paperclip className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  )}
+                  <span className="truncate max-w-[200px]">
+                    {attachment.filename ||
+                      getAttachmentFallbackLabel({
+                        mediaType: attachment.mediaType,
+                        filename: attachment.filename,
+                      })}
+                  </span>
+                </AttachmentLink>
+                {canSaveToKnowledge ? (
+                  <SaveAttachmentButton attachment={attachment} />
+                ) : null}
+              </div>
             ))}
           </div>
         )}
         {/* Text message bubble - only show if there's text */}
         {text && (
-          <div className="flex max-w-[80%] items-center justify-end gap-2">
-            <MessageActions
-              textToCopy={text}
-              onEditClick={handleStartEdit}
-              onRegenerateClick={handleRegenerateClick}
-              isRegenerateConfirming={isRegenerateConfirming}
-              editDisabled={editDisabled}
-              className={cn(
-                "shrink-0 transition-opacity",
-                isRegenerateConfirming
-                  ? "opacity-100"
-                  : "opacity-0 group-hover/message:opacity-100",
-              )}
-            />
+          <div className="group/user-message-text-row relative flex max-w-[80%] items-center justify-end">
+            {/* Actions float to the left of the bubble so growing the panel
+              (e.g. into the regenerate-confirmation copy) does not squeeze the
+              bubble's width. The wrapper owns the gap as right-padding so the
+              cursor can travel from the bubble into the panel without leaving
+              the group-hover region. */}
+            <div className="absolute right-full top-1/2 -translate-y-1/2 pr-2">
+              <MessageActions
+                textToCopy={text}
+                onEditClick={onStartEdit && handleStartEdit}
+                onRegenerateClick={onStartEdit && handleRegenerateClick}
+                isRegenerateConfirming={isRegenerateConfirming}
+                editDisabled={editDisabled}
+                className={cn(
+                  "shrink-0 transition-opacity",
+                  isRegenerateConfirming
+                    ? "opacity-100"
+                    : "pointer-events-none opacity-0 group-hover/user-message-text-row:pointer-events-auto group-hover/user-message-text-row:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100",
+                )}
+              />
+            </div>
             <MessageContent className="max-w-none">
               <UserMessageText text={text} />
             </MessageContent>
@@ -272,5 +251,53 @@ export function EditableUserMessage({
         )}
       </div>
     </Message>
+  );
+});
+
+/**
+ * "Save to knowledge" on an attachment chip in the message stream.
+ *
+ * Revealed on hover rather than always shown: the chip's job is to say which
+ * file the message carried, and a permanent second button competes with that on
+ * every past message. Rendered only for real chat attachments — a file part can
+ * also be an inline image or a sandbox artifact, neither of which has an
+ * attachment to copy (see `attachmentIdFromUrl`).
+ */
+function SaveAttachmentButton({ attachment }: { attachment: FileAttachment }) {
+  const [saving, setSaving] = useState(false);
+  const attachmentId = attachmentIdFromUrl(attachment.url);
+  if (!attachmentId) return null;
+
+  const name =
+    attachment.filename ||
+    getAttachmentFallbackLabel({
+      mediaType: attachment.mediaType,
+      filename: attachment.filename,
+    });
+
+  return (
+    <>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <UnstyledButton
+            type="button"
+            onClick={() => setSaving(true)}
+            className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-muted hover:text-foreground focus-visible:opacity-100 group-hover/attachment:opacity-100"
+          >
+            <BookPlus className="h-3.5 w-3.5" />
+            <span className="sr-only">Save {name} to knowledge</span>
+          </UnstyledButton>
+        </TooltipTrigger>
+        <TooltipContent>Save to knowledge</TooltipContent>
+      </Tooltip>
+
+      {saving && (
+        <SaveToKnowledgeDialog
+          open
+          onOpenChange={(next) => !next && setSaving(false)}
+          attachments={[{ id: attachmentId, name }]}
+        />
+      )}
+    </>
   );
 }

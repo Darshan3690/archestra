@@ -1,21 +1,24 @@
-import type { SSOOptions } from "@better-auth/sso";
-import type { IdentityProviderOidcConfig, IdpRoleMappingConfig } from "@shared";
+import type {
+  IdentityProviderOidcConfig,
+  IdpRoleMappingConfig,
+} from "@archestra/shared";
 import {
-  IDENTITY_PROVIDER_ID,
-  IDENTITY_TRUSTED_PROVIDER_IDS,
   MEMBER_ROLE_NAME,
-} from "@shared";
+  preserveIdentityProviderSecrets,
+  TimeInMs,
+} from "@archestra/shared";
+import type { SSOOptions } from "@better-auth/sso";
 import { APIError } from "better-auth";
 import { and, eq } from "drizzle-orm";
 import { jwtDecode } from "jwt-decode";
-import type { BetterAuth } from "@/auth/better-auth";
 import {
   cacheIdpGroups,
   extractGroupsFromClaims,
 } from "@/auth/idp-team-sync-cache.ee";
-import config from "@/config";
-import db, { schema } from "@/database";
+import { LRUCacheManager } from "@/cache-manager";
+import db, { schema, withDbTransaction } from "@/database";
 import logger from "@/logging";
+import { registerProcessLocalCache } from "@/process-local-cache-registry";
 import { evaluateRoleMappingTemplate } from "@/templating";
 import type {
   IdentityProvider,
@@ -24,9 +27,10 @@ import type {
   UpdateIdentityProvider,
 } from "@/types";
 import { ApiError } from "@/types";
-import { isPrivateOrLoopbackHostname } from "@/utils/network";
+import { validateOutboundUrl } from "@/utils/outbound-url";
 import AccountModel from "./account";
 import MemberModel from "./member";
+import OrganizationModel from "./organization";
 
 interface RoleMappingContext {
   token?: Record<string, unknown>;
@@ -50,6 +54,20 @@ export type IdpGetRoleData = Parameters<
 >[0];
 
 class IdentityProviderModel {
+  /**
+   * Process-local cache for {@link findAllPublic}. Backs the unauthenticated
+   * SSO-provider list the login page fetches on every render, so without a
+   * cache each login-page view costs a database query for a list that only
+   * changes when an admin edits identity providers. Writes in this process
+   * clear it immediately; other pods converge within the TTL.
+   */
+  private static readonly publicProvidersCache = registerProcessLocalCache(
+    new LRUCacheManager<PublicIdentityProvider[]>({
+      maxSize: 1,
+      defaultTtl: TimeInMs.Minute,
+    }),
+  );
+
   /**
    * Evaluates role mapping rules against SSO user data using Handlebars templates.
    *
@@ -200,6 +218,10 @@ class IdentityProviderModel {
       );
     }
 
+    // Captured outside the try so the terminal fallback below can still resolve
+    // the organization's default role after an evaluation error.
+    let idpOrganizationId: string | null = null;
+
     try {
       // Fetch the identity provider configuration to get role mapping rules
       logger.debug(
@@ -209,6 +231,7 @@ class IdentityProviderModel {
       const idpProvider = await IdentityProviderModel.findByProviderId(
         provider.providerId,
       );
+      idpOrganizationId = idpProvider?.organizationId ?? null;
 
       logger.debug(
         {
@@ -323,7 +346,9 @@ class IdentityProviderModel {
               providerId: provider.providerId,
             },
           },
-          MEMBER_ROLE_NAME,
+          await IdentityProviderModel.resolveDefaultRole(
+            idpProvider.organizationId,
+          ),
         );
 
         logger.debug(
@@ -438,14 +463,16 @@ class IdentityProviderModel {
     }
 
     // Fallback to default role when no role mapping is configured
+    const fallbackRole =
+      await IdentityProviderModel.resolveDefaultRole(idpOrganizationId);
     logger.debug(
       {
         providerId: provider?.providerId,
-        fallbackRole: MEMBER_ROLE_NAME,
+        fallbackRole,
       },
       "[resolveSsoRole] Using fallback role because no mapping was configured or evaluation failed",
     );
-    return MEMBER_ROLE_NAME;
+    return fallbackRole;
   }
 
   /**
@@ -454,6 +481,13 @@ class IdentityProviderModel {
    * Does NOT expose any sensitive configuration data.
    */
   static async findAllPublic(): Promise<PublicIdentityProvider[]> {
+    const cached = IdentityProviderModel.publicProvidersCache.get(
+      PUBLIC_PROVIDERS_CACHE_KEY,
+    );
+    if (cached) {
+      return cached;
+    }
+
     const idpProviders = await db
       .select({
         id: schema.identityProvidersTable.id,
@@ -462,38 +496,11 @@ class IdentityProviderModel {
       .from(schema.identityProvidersTable)
       .where(eq(schema.identityProvidersTable.ssoLoginEnabled, true));
 
+    IdentityProviderModel.publicProvidersCache.set(
+      PUBLIC_PROVIDERS_CACHE_KEY,
+      idpProviders,
+    );
     return idpProviders;
-  }
-
-  static async getTrustedAccountLinkingProviderIds(): Promise<string[]> {
-    let configuredProviderIds: Array<{ providerId: string }> = [];
-
-    try {
-      configuredProviderIds = await db
-        .selectDistinct({
-          providerId: schema.identityProvidersTable.providerId,
-        })
-        .from(schema.identityProvidersTable);
-    } catch (error) {
-      if (
-        error instanceof Error &&
-        error.message.includes("Database not initialized")
-      ) {
-        return [...IDENTITY_TRUSTED_PROVIDER_IDS];
-      }
-
-      throw error;
-    }
-
-    return [
-      ...new Set([
-        ...IDENTITY_TRUSTED_PROVIDER_IDS,
-        ...configuredProviderIds
-          .map(({ providerId }) => providerId)
-          .filter((providerId) => providerId.length > 0)
-          .sort((a, b) => a.localeCompare(b)),
-      ]),
-    ];
   }
 
   /**
@@ -596,50 +603,14 @@ class IdentityProviderModel {
     data: Omit<InsertIdentityProvider, "id">,
     organizationId: string,
     headers: HeadersInit,
-    auth: BetterAuth,
+    auth: SsoProviderRegistrar,
   ): Promise<IdentityProvider> {
-    // Parse JSON configs if they exist
-    const parsedData = {
-      providerId: data.providerId,
-      issuer: data.issuer,
-      domain:
-        normalizePersistedAllowedEmailDomain({
-          providerId: data.providerId,
-          domain: data.domain,
-        }) || SSO_REGISTRATION_PLACEHOLDER_DOMAIN,
-      ssoLoginEnabled: data.ssoLoginEnabled ?? true,
-      organizationId,
-      ...(data.oidcConfig && {
-        oidcConfig:
-          typeof data.oidcConfig === "string"
-            ? JSON.parse(data.oidcConfig)
-            : data.oidcConfig,
-      }),
-      ...(data.samlConfig && {
-        samlConfig:
-          typeof data.samlConfig === "string"
-            ? JSON.parse(data.samlConfig)
-            : data.samlConfig,
-      }),
-    };
-
-    // Ensure required mapping fields for OIDC
-    if (parsedData.oidcConfig?.mapping) {
-      parsedData.oidcConfig.mapping = {
-        id: parsedData.oidcConfig.mapping.id || "sub",
-        email: parsedData.oidcConfig.mapping.email || "email",
-        name: parsedData.oidcConfig.mapping.name || "name",
-        ...parsedData.oidcConfig.mapping,
-      };
-    }
-
-    const registrationData = await hydrateOidcConfigForRegistration(parsedData);
-    const { ssoLoginEnabled: _ssoLoginEnabled, ...betterAuthRegistrationData } =
-      registrationData;
+    const { betterAuthRegistrationData, body } =
+      await buildSsoProviderRegistration(data, organizationId);
 
     // Register with Better Auth
     await auth.api.registerSSOProvider({
-      body: betterAuthRegistrationData,
+      body,
       headers: new Headers(headers),
     });
 
@@ -661,11 +632,10 @@ class IdentityProviderModel {
     }
 
     /**
-     * WORKAROUND: With `domainVerification: { enabled: true }` in Better Auth's SSO plugin,
-     * all identity providers require `domainVerified: true` for sign-in to work without DNS verification.
-     * We auto-set this for all providers to bypass the DNS verification requirement.
-     * See: https://github.com/better-auth/better-auth/issues/6481
-     * TODO: Remove this workaround once the upstream issue is fixed.
+     * Better Auth trusts an SSO provider for implicit account linking only
+     * when its configured domain is verified and matches the returned email.
+     * Archestra administrators explicitly configure these allowed domains, so
+     * mark the provider domain as verified without Better Auth's DNS flow.
      */
     // Also store roleMapping and teamSyncConfig if provided (Better Auth doesn't handle these fields)
     // Note: These are stored as JSON text but typed as objects in Drizzle schema
@@ -675,14 +645,10 @@ class IdentityProviderModel {
     const samlConfigJson = serializeConfigValue(data.samlConfig);
     const roleMappingJson = serializeConfigValue(data.roleMapping);
     const teamSyncConfigJson = serializeConfigValue(data.teamSyncConfig);
-    const persistedDomain = normalizePersistedAllowedEmailDomain({
-      providerId: data.providerId,
-      domain: data.domain,
-    });
     const [updatedProvider] = await db
       .update(schema.identityProvidersTable)
       .set({
-        domain: persistedDomain,
+        domain: data.domain,
         domainVerified: true,
         ssoLoginEnabled: data.ssoLoginEnabled ?? true,
         ...(oidcConfigJson !== undefined && {
@@ -705,6 +671,8 @@ class IdentityProviderModel {
     if (!updatedProvider) {
       throw new Error("Failed to update identity provider after creation");
     }
+
+    IdentityProviderModel.publicProvidersCache.clear();
 
     return {
       ...updatedProvider,
@@ -738,34 +706,46 @@ class IdentityProviderModel {
       return null;
     }
 
-    // Serialize roleMapping and teamSyncConfig if provided as objects
-    // Note: These are stored as JSON text but typed as objects in Drizzle schema
+    /**
+     * The CRUD API redacts credentials on read, so an edit that only renames a
+     * provider comes back with blank secrets. Both config blobs are written
+     * whole, so taking that literally would wipe `clientSecret` (and the SAML
+     * private keys) and break SSO on an unrelated change. Restore any secret
+     * the caller left blank from the row we just loaded before serializing.
+     *
+     * This sits in the model rather than the route on purpose: `update` is the
+     * only writer of these columns and already holds the existing row, so
+     * guarding here means no future caller can blank a credential by accident.
+     */
     const { oidcConfig, samlConfig, roleMapping, teamSyncConfig, ...restData } =
-      data;
+      preserveIdentityProviderSecrets({
+        incoming: data,
+        existing: existingProvider,
+      });
     const oidcConfigJson = serializeConfigValue(oidcConfig);
     const samlConfigJson = serializeConfigValue(samlConfig);
     const roleMappingJson = serializeConfigValue(roleMapping);
     const teamSyncConfigJson = serializeConfigValue(teamSyncConfig);
-    const nextProviderId = restData.providerId ?? existingProvider.providerId;
-    const nextDomain = normalizePersistedAllowedEmailDomain({
-      providerId: nextProviderId,
-      domain: restData.domain ?? existingProvider.domain,
-    });
+    const nextDomain = restData.domain ?? existingProvider.domain;
 
     // Update in database
-    // WORKAROUND: Always ensure domainVerified is true to enable account linking
-    // See: https://github.com/better-auth/better-auth/issues/6481
+    // Keep administrator-configured domains trusted for implicit account linking.
     const [updatedProvider] = await db
       .update(schema.identityProvidersTable)
       .set({
         ...restData,
         domain: nextDomain,
         domainVerified: true,
+        // These columns are `text` typed as their parsed config, so the
+        // serialized JSON is cast to the column type rather than to the
+        // (redaction-tolerant) request type the payload was destructured from.
         ...(oidcConfigJson !== undefined && {
-          oidcConfig: oidcConfigJson as unknown as typeof oidcConfig,
+          oidcConfig:
+            oidcConfigJson as unknown as StoredIdentityProviderConfigs["oidcConfig"],
         }),
         ...(samlConfigJson !== undefined && {
-          samlConfig: samlConfigJson as unknown as typeof samlConfig,
+          samlConfig:
+            samlConfigJson as unknown as StoredIdentityProviderConfigs["samlConfig"],
         }),
         ...(roleMappingJson !== undefined && {
           roleMapping: roleMappingJson as unknown as typeof roleMapping,
@@ -784,6 +764,8 @@ class IdentityProviderModel {
       .returning();
 
     if (!updatedProvider) return null;
+
+    IdentityProviderModel.publicProvidersCache.clear();
 
     return {
       ...updatedProvider,
@@ -813,7 +795,7 @@ class IdentityProviderModel {
     }
 
     // Wrap deletions in a transaction to ensure atomicity
-    await db.transaction(async (tx) => {
+    await withDbTransaction(async (tx) => {
       /**
        * Clean up associated SSO accounts to prevent orphaned records
        * This is important because orphaned accounts can cause issues with future IdP logins
@@ -847,15 +829,15 @@ class IdentityProviderModel {
       }
     });
 
+    IdentityProviderModel.publicProvidersCache.clear();
+
     return true;
   }
 
   /**
    * Sets domainVerified flag directly (TEST ONLY)
-   * This is used to simulate legacy data that has domainVerified: false
-   * to test the workaround in update() that sets it back to true.
-   * TODO: Remove this when upstream issue is fixed:
-   * https://github.com/better-auth/better-auth/issues/6481
+   * Used to verify that updating a provider restores the trusted state for
+   * its administrator-configured allowed domains.
    */
   static async setDomainVerifiedForTesting(
     id: string,
@@ -874,12 +856,75 @@ class IdentityProviderModel {
       "IdentityProviderModel.setDomainVerifiedForTesting: completed",
     );
   }
+
+  static async findByIdForAudit(
+    id: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [row] = await db
+      .select()
+      .from(schema.identityProvidersTable)
+      .where(
+        and(
+          eq(schema.identityProvidersTable.id, id),
+          eq(schema.identityProvidersTable.organizationId, organizationId),
+        ),
+      )
+      .limit(1);
+
+    if (!row) return null;
+
+    // REDACTED: oidcConfig (clientSecret), samlConfig (x509Certificate/privateKey),
+    // roleMapping, and teamSyncConfig are omitted — they contain credentials and secrets.
+    return {
+      id: row.id,
+      organizationId: row.organizationId ?? null,
+      issuer: row.issuer,
+      providerId: row.providerId,
+      domain: row.domain,
+      domainVerified: row.domainVerified ?? null,
+      ssoLoginEnabled: row.ssoLoginEnabled,
+    };
+  }
+
+  /**
+   * Terminal fallback role for a first-time SSO login: the organization's
+   * configured default role for new users, which itself falls back to
+   * "member". This keeps SSO in step with the other provisioning paths —
+   * invitation acceptance and ChatOps auto-provisioning both already honour
+   * the org setting.
+   *
+   * Only reached when the IdP has no role mapping at all, or its rules
+   * produced no match and it defines no `defaultRole` of its own; an explicit
+   * per-IdP default still wins over the org-wide one.
+   *
+   * Never throws: a failure to read the setting degrades to "member" rather
+   * than blocking the login.
+   */
+  private static async resolveDefaultRole(
+    organizationId: string | null,
+  ): Promise<string> {
+    if (!organizationId) {
+      return MEMBER_ROLE_NAME;
+    }
+
+    try {
+      return await OrganizationModel.getDefaultMemberRole(organizationId);
+    } catch (error) {
+      logger.error(
+        { err: error, organizationId },
+        "[resolveSsoRole] Failed to read the organization default role, falling back to the member role",
+      );
+      return MEMBER_ROLE_NAME;
+    }
+  }
 }
 
 export default IdentityProviderModel;
 
 const OIDC_DISCOVERY_TIMEOUT_MS = 10_000;
 const SSO_REGISTRATION_PLACEHOLDER_DOMAIN = "sso-placeholder.example.com";
+const PUBLIC_PROVIDERS_CACHE_KEY = "public-providers";
 
 function serializeConfigValue(
   value: string | object | null | undefined,
@@ -895,15 +940,61 @@ function serializeConfigValue(
   return JSON.stringify(value);
 }
 
-function normalizePersistedAllowedEmailDomain(params: {
-  providerId: string;
-  domain: string;
-}): string {
-  if (params.providerId === IDENTITY_PROVIDER_ID.GOOGLE) {
-    return params.domain;
+/**
+ * The registration Better Auth gets for a new SSO provider, and the data it is
+ * built from: JSON configs parsed, OIDC mapping defaults filled in, discovery
+ * hydrated, and a blank discovery endpoint dropped.
+ */
+async function buildSsoProviderRegistration(
+  data: Omit<InsertIdentityProvider, "id">,
+  organizationId: string,
+) {
+  // Parse JSON configs if they exist
+  const parsedData = {
+    providerId: data.providerId,
+    issuer: data.issuer,
+    domain: data.domain || SSO_REGISTRATION_PLACEHOLDER_DOMAIN,
+    ssoLoginEnabled: data.ssoLoginEnabled ?? true,
+    organizationId,
+    ...(data.oidcConfig && {
+      oidcConfig:
+        typeof data.oidcConfig === "string"
+          ? JSON.parse(data.oidcConfig)
+          : data.oidcConfig,
+    }),
+    ...(data.samlConfig && {
+      samlConfig:
+        typeof data.samlConfig === "string"
+          ? JSON.parse(data.samlConfig)
+          : data.samlConfig,
+    }),
+  };
+
+  // Ensure required mapping fields for OIDC
+  if (parsedData.oidcConfig?.mapping) {
+    parsedData.oidcConfig.mapping = {
+      id: parsedData.oidcConfig.mapping.id || "sub",
+      email: parsedData.oidcConfig.mapping.email || "email",
+      name: parsedData.oidcConfig.mapping.name || "name",
+      ...parsedData.oidcConfig.mapping,
+    };
   }
 
-  return "";
+  const registrationData = await hydrateOidcConfigForRegistration(parsedData);
+  const { ssoLoginEnabled: _ssoLoginEnabled, ...betterAuthRegistrationData } =
+    registrationData;
+
+  return {
+    betterAuthRegistrationData,
+    body: {
+      ...betterAuthRegistrationData,
+      ...(betterAuthRegistrationData.oidcConfig && {
+        oidcConfig: withoutBlankDiscoveryEndpoint(
+          betterAuthRegistrationData.oidcConfig,
+        ),
+      }),
+    },
+  };
 }
 
 async function hydrateOidcConfigForRegistration<
@@ -937,6 +1028,31 @@ async function hydrateOidcConfigForRegistration<
     ...data,
     oidcConfig: hydratedOidcConfig,
   };
+}
+
+/**
+ * Drops a blank `discoveryEndpoint` from the config handed to Better Auth.
+ *
+ * Better Auth validates every OIDC endpoint on the registration body with
+ * `z.url()`, so it rejects an empty string outright rather than reading it as
+ * "not configured". A provider that skips discovery legitimately has none —
+ * GitHub publishes no OpenID discovery document, so its preset sets
+ * `skipDiscovery` and points the authorization/token/userinfo endpoints at
+ * GitHub's OAuth URLs directly — and would otherwise fail registration with
+ * "Invalid URL".
+ *
+ * Only the outbound body is trimmed. The stored config keeps the empty string,
+ * which is the shape both the API schema and the admin form expect.
+ */
+function withoutBlankDiscoveryEndpoint<
+  T extends { discoveryEndpoint?: string },
+>(oidcConfig: T): T | Omit<T, "discoveryEndpoint"> {
+  if (oidcConfig.discoveryEndpoint) {
+    return oidcConfig;
+  }
+
+  const { discoveryEndpoint: _discoveryEndpoint, ...rest } = oidcConfig;
+  return rest;
 }
 
 async function discoverOidcConfig(
@@ -992,11 +1108,28 @@ async function discoverOidcConfig(
       ...oidcConfig,
       issuer: oidcConfig.issuer.trim() || discoveredIssuer,
       skipDiscovery: true,
+      /**
+       * Record where the document was actually fetched from. Callers may leave
+       * this blank and let it be derived from the issuer, and the derived URL is
+       * the one that answered — persisting it keeps RP-initiated logout (which
+       * re-reads the document for `end_session_endpoint`) working, and keeps a
+       * blank string out of the Better Auth registration body.
+       */
+      discoveryEndpoint,
       authorizationEndpoint: discoveryDocument.authorization_endpoint,
       tokenEndpoint: discoveryDocument.token_endpoint,
       jwksEndpoint: discoveryDocument.jwks_uri,
+      /**
+       * Entra On-Behalf-Of signs in with the app's own API scope, so the
+       * access token is not one Graph's userinfo endpoint accepts: sign-in
+       * reads the ID token instead, unless a userinfo endpoint was set.
+       */
       userInfoEndpoint:
-        discoveryDocument.userinfo_endpoint ?? oidcConfig.userInfoEndpoint,
+        oidcConfig.enterpriseManagedCredentials?.exchangeStrategy ===
+        "entra_obo"
+          ? oidcConfig.userInfoEndpoint
+          : (discoveryDocument.userinfo_endpoint ??
+            oidcConfig.userInfoEndpoint),
       tokenEndpointAuthentication:
         oidcConfig.tokenEndpointAuthentication ||
         selectTokenEndpointAuthentication(
@@ -1068,35 +1201,21 @@ function selectTokenEndpointAuthentication(
 }
 
 function assertValidOidcDiscoveryEndpoint(discoveryEndpoint: string): void {
-  let parsedUrl: URL;
-  try {
-    parsedUrl = new URL(discoveryEndpoint);
-  } catch {
-    throw new ApiError(
-      400,
-      `OIDC discovery endpoint "${discoveryEndpoint}" is not a valid URL.`,
-    );
+  const validated = validateOutboundUrl(discoveryEndpoint);
+  if (validated.ok) {
+    return;
   }
 
-  const allowLocalDevelopmentDiscovery = !config.production;
-
-  if (
-    !config.test.enableE2eTestEndpoints &&
-    !allowLocalDevelopmentDiscovery &&
-    parsedUrl.protocol !== "https:"
-  ) {
-    throw new ApiError(400, "OIDC discovery endpoint must use HTTPS.");
-  }
-
-  if (
-    !config.test.enableE2eTestEndpoints &&
-    !allowLocalDevelopmentDiscovery &&
-    isPrivateOrLoopbackHostname(parsedUrl.hostname)
-  ) {
-    throw new ApiError(
-      400,
-      `OIDC discovery endpoint host "${parsedUrl.hostname}" is not allowed.`,
-    );
+  switch (validated.reason) {
+    case "not_a_url":
+      throw new ApiError(
+        400,
+        `OIDC discovery endpoint "${discoveryEndpoint}" is not a valid URL.`,
+      );
+    case "scheme_not_https":
+      throw new ApiError(400, "OIDC discovery endpoint must use HTTPS.");
+    case "private_or_loopback_host":
+      throw new ApiError(400, `OIDC discovery endpoint host is not allowed.`);
   }
 }
 
@@ -1108,3 +1227,26 @@ interface OidcDiscovery {
   userinfo_endpoint?: string;
   token_endpoint_auth_methods_supported?: string[];
 }
+
+/** Column types for the two JSON-as-text config blobs on the providers table. */
+type StoredIdentityProviderConfigs =
+  typeof schema.identityProvidersTable.$inferInsert;
+
+/**
+ * The Better Auth call the identity provider model makes. The identity provider
+ * route, which composes Better Auth into the server, passes the instance in.
+ * The compiler checks there that the call accepts this body's typed fields; the
+ * OIDC and SAML configs are parsed JSON, so they are not checked, as before.
+ */
+interface SsoProviderRegistrar {
+  api: {
+    registerSSOProvider: (params: {
+      body: SsoProviderRegistrationBody;
+      headers: Headers;
+    }) => Promise<unknown>;
+  };
+}
+
+type SsoProviderRegistrationBody = Awaited<
+  ReturnType<typeof buildSsoProviderRegistration>
+>["body"];

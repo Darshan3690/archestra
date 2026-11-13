@@ -4,67 +4,113 @@ import {
   type McpDeploymentStatusEntry,
   type McpDeploymentStatusesMessage,
   type McpInstallationStatusMessage,
-} from "@shared";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+  type McpServersChangedMessage,
+} from "@archestra/shared";
+import {
+  type QueryClient,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { toast } from "sonner";
-import { invalidateToolAssignmentQueries } from "@/lib/agent-tools.hook";
-import { useSession } from "@/lib/auth/auth.query";
+import { clipErrorMessage, trackEvent } from "@/lib/analytics";
+import { useHasPermissions, useSession } from "@/lib/auth/auth.query";
+import { toBulkOutcome } from "@/lib/bulk-action";
 import { useFeature } from "@/lib/config/config.query";
-import { handleApiError } from "@/lib/utils";
+import { isInstallInProgress } from "@/lib/mcp/install-status";
+import {
+  type McpRegistryIssueIndexWire,
+  mcpRegistryIssueIndexQueryKey,
+  mcpRegistryQueryKey,
+} from "@/lib/mcp/mcp-registry.query";
+import { coverageQueryPrefix } from "@/lib/openappa-policy-views";
+import {
+  externalMcpSkillDetailQueryKey,
+  externalMcpSkillsQueryKey,
+} from "@/lib/skills/skill.query";
+import { invalidateToolAssignmentQueries } from "@/lib/use-invalidate-tool-assignment-queries";
+import {
+  getApiErrorMessage,
+  handleApiError,
+  throwOnApiError,
+} from "@/lib/utils/api";
 import websocketService from "@/lib/websocket/websocket";
 
 const {
+  bulkDeleteMcpServers,
   deleteMcpServer,
   getMcpServers,
   getMcpServerTools,
   installMcpServer,
   getMcpServer,
+  muteMcpCatalogAlert,
+  muteMcpServerAlert,
   reauthenticateMcpServer,
   reinstallMcpServer,
+  reloadMcpServerTools,
+  unmuteMcpCatalogAlert,
+  unmuteMcpServerAlert,
 } = archestraApiSdk;
 
 type McpServersQuery = Partial<
   NonNullable<archestraApiTypes.GetMcpServersData["query"]>
 >;
 type McpServersParams = McpServersQuery & {
-  initialData?: archestraApiTypes.GetMcpServersResponses["200"];
   hasInstallingServers?: boolean;
   enabled?: boolean;
 };
 
 export function useMcpServers(params?: McpServersParams) {
+  // The endpoint requires mcpServerInstallation:read; skip the request for
+  // users whose role lacks it instead of letting it 403.
+  const { data: canReadInstallations } = useHasPermissions({
+    mcpServerInstallation: ["read"],
+  });
+  // Per-install agent usage is opt-in, as in the API: building it
+  // looks up the agents of every listed install, and only a server's own page
+  // shows it. Every other list reads status and names, and with a boolean key
+  // those callers share one cached request.
+  const includeAssignedAgents = params?.includeAssignedAgents ?? false;
+
   return useQuery({
     // Include catalogId in queryKey only when provided to maintain cache separation
     queryKey: [
       "mcp-servers",
       {
         catalogId: params?.catalogId,
+        catalogSlug: params?.catalogSlug,
+        includeAssignedAgents,
         assignmentScope: params?.assignmentScope,
         assignmentTeamIds: params?.assignmentTeamIds,
       },
     ],
     queryFn: async () => {
-      const response = await getMcpServers({
-        query:
-          params?.catalogId ||
-          params?.assignmentScope ||
-          params?.assignmentTeamIds
-            ? {
-                ...(params?.catalogId && { catalogId: params.catalogId }),
-                ...(params?.assignmentScope && {
-                  assignmentScope: params.assignmentScope,
-                }),
-                ...(params?.assignmentTeamIds && {
-                  assignmentTeamIds: params.assignmentTeamIds,
-                }),
-              }
-            : undefined,
+      const { data, error } = await getMcpServers({
+        query: {
+          includeAssignedAgents,
+          ...(params?.catalogId && { catalogId: params.catalogId }),
+          ...(params?.catalogSlug && { catalogSlug: params.catalogSlug }),
+          ...(params?.assignmentScope && {
+            assignmentScope: params.assignmentScope,
+          }),
+          ...(params?.assignmentTeamIds && {
+            assignmentTeamIds: params.assignmentTeamIds,
+          }),
+        },
       });
-      return response.data ?? [];
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? [];
     },
-    initialData: params?.initialData,
-    enabled: params?.enabled,
+    enabled: (params?.enabled ?? true) && !!canReadInstallations,
     refetchInterval: params?.hasInstallingServers ? 2000 : false,
   });
 }
@@ -76,15 +122,35 @@ export function useMcpInstallationStatusCacheSync(enabled = true) {
     if (!enabled) return;
 
     websocketService.connect();
-    const unsubscribe = websocketService.subscribe(
+    const unsubscribeStatus = websocketService.subscribe(
       "mcp_installation_status",
       (message: McpInstallationStatusMessage) => {
         const { serverId, status, error } = message.payload;
 
+        // Several components mount this hook at once, and each gets this
+        // callback for the same message — dedupe by server so one runtime
+        // failure produces one event. A later non-error status re-arms the
+        // server (a retried install can fail again and be captured again).
+        if (status === "error") {
+          if (!runtimeInstallErrorsAlreadyTracked.has(serverId)) {
+            runtimeInstallErrorsAlreadyTracked.add(serverId);
+            const server = findCachedMcpServer(queryClient, serverId);
+            trackEvent("mcp_server_installation_failed", {
+              serverId,
+              serverName: server?.name,
+              catalogId: server?.catalogId ?? undefined,
+              stage: "runtime",
+              errorMessage: clipErrorMessage(error),
+            });
+          }
+        } else {
+          runtimeInstallErrorsAlreadyTracked.delete(serverId);
+        }
+
         queryClient.setQueriesData<
           archestraApiTypes.GetMcpServersResponses["200"]
         >({ queryKey: ["mcp-servers"] }, (servers) => {
-          if (!servers) return servers;
+          if (!Array.isArray(servers)) return servers;
           let didUpdate = false;
           const nextServers = servers.map((server) => {
             if (server.id !== serverId) return server;
@@ -97,17 +163,73 @@ export function useMcpInstallationStatusCacheSync(enabled = true) {
           });
           return didUpdate ? nextServers : servers;
         });
+        patchIssueIndexServer({
+          queryClient,
+          serverId,
+          patch: {
+            localInstallationStatus: status,
+            localInstallationError: error ?? undefined,
+          },
+        });
 
         if (status === "success" || status === "error") {
+          // Refetch the full mcp-servers list: the install row may have
+          // changes the surgical setQueriesData above doesn't cover. In
+          // particular, the per-install reinstall route returns 200 with
+          // status="pending" before the background task clears
+          // `reinstall_required`; without this invalidation the button
+          // stays visible until a manual refresh.
+          void queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
           void queryClient.invalidateQueries({ queryKey: ["mcp-catalog"] });
+          void queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey });
           void queryClient.invalidateQueries({
             queryKey: ["mcp-servers", serverId, "tools"],
           });
+          if (status === "success") {
+            void invalidateExternalMcpSkillQueries(queryClient);
+          }
         }
       },
     );
+    const unsubscribeLifecycle = websocketService.subscribe(
+      "mcp_servers_changed",
+      (message: McpServersChangedMessage) => {
+        const { serverIds, catalogIds } = message.payload;
+        removeExternalMcpSkillCachesForSources({
+          queryClient,
+          serverIds,
+          catalogIds,
+        });
+        removeMcpServersFromCache({ queryClient, serverIds, catalogIds });
+        void invalidateExternalMcpSkillQueries(queryClient);
+        void queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+        void queryClient.invalidateQueries({ queryKey: ["mcp-catalog"] });
+        void queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey });
+        invalidateToolAssignmentQueries(queryClient);
+      },
+    );
+    const unsubscribeReady = websocketService.subscribe(
+      "websocket_ready",
+      () => {
+        const isReconnect = websocketReadySyncedClients.has(queryClient);
+        websocketReadySyncedClients.add(queryClient);
+        if (!isReconnect) return;
+        void invalidateExternalMcpSkillQueries(queryClient);
+        void queryClient.invalidateQueries({
+          queryKey: externalMcpSkillDetailQueryKey,
+        });
+        void queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+        void queryClient.invalidateQueries({ queryKey: ["mcp-catalog"] });
+        void queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey });
+        invalidateToolAssignmentQueries(queryClient);
+      },
+    );
 
-    return unsubscribe;
+    return () => {
+      unsubscribeStatus();
+      unsubscribeLifecycle();
+      unsubscribeReady();
+    };
   }, [enabled, queryClient]);
 }
 
@@ -117,12 +239,30 @@ export function useMcpInstallationStatusCacheSync(enabled = true) {
  *
  * @param catalogId - Optional catalog ID to filter. If provided, only returns servers for that catalog.
  */
-export function useMcpServersGroupedByCatalog(params?: McpServersQuery) {
-  const { data: servers } = useMcpServers({
+export function useMcpServersGroupedByCatalog(
+  params?: McpServersQuery & {
+    /**
+     * Only the installs of these catalog items, for a list that shows a few
+     * of them: asked in requests of a hundred ids, the endpoint's limit.
+     * Omitted, every install the caller can see is read.
+     */
+    catalogIdsIn?: string[];
+  },
+) {
+  const scoped = params?.catalogIdsIn !== undefined;
+  const { data: allServers } = useMcpServers({
+    includeAssignedAgents: false,
     catalogId: params?.catalogId,
     assignmentScope: params?.assignmentScope,
     assignmentTeamIds: params?.assignmentTeamIds,
+    enabled: !scoped,
   });
+  const scopedServers = useMcpServersForCatalogIds({
+    catalogIds: params?.catalogIdsIn ?? [],
+    assignmentScope: params?.assignmentScope,
+    assignmentTeamIds: params?.assignmentTeamIds,
+  });
+  const servers = scoped ? scopedServers : allServers;
   const { data: session } = useSession();
   const currentUserId = session?.user?.id;
 
@@ -160,23 +300,94 @@ export function useInstallMcpServer() {
     mutationFn: async (
       data: archestraApiTypes.InstallMcpServerData["body"] & {
         dontShowToast?: boolean;
+        /** A desktop MCP server: its toasts speak of the user's computer. */
+        desktop?: boolean;
       },
     ) => {
+      const { desktop, ...body } = data;
       const { data: installedServer, error } = await installMcpServer({
-        body: data,
+        body,
       });
       if (error) {
-        handleApiError(error);
+        // `handleApiError` doesn't throw, so API rejections still flow
+        // through onSuccess (with `installedServer` undefined) — capture the
+        // failure here, at the only place the API error is visible.
+        trackEvent("mcp_server_installation_failed", {
+          serverName: data.name,
+          catalogId: data.catalogId,
+          stage: "request",
+          errorMessage: clipErrorMessage(getApiErrorMessage(error)),
+        });
+        handleApiError(error, { toastOnError: false });
+        const rawErrorMessage = getApiErrorMessage(error);
+        // Some MCP servers return an entire tool schema in a malformed
+        // discovery response. It is neither useful nor safe in a dialog.
+        const boundedErrorMessage = rawErrorMessage.includes(
+          "Streamable HTTP error: Error POSTing to endpoint: {",
+        )
+          ? "The upstream MCP server returned an unexpected response while listing tools."
+          : rawErrorMessage.length > 1000
+            ? `${rawErrorMessage.slice(0, 1000)}…`
+            : rawErrorMessage;
+        const redundantPrefix = `Failed to connect to MCP server ${data.name}: `;
+        const errorMessage = boundedErrorMessage.startsWith(redundantPrefix)
+          ? boundedErrorMessage.slice(redundantPrefix.length)
+          : boundedErrorMessage;
+        if (desktop) {
+          toast.error(`Couldn't connect ${data.name} from your device`, {
+            description: errorMessage,
+          });
+          return {
+            installedServer,
+            errorMessage,
+            dontShowToast: data.dontShowToast,
+          };
+        }
+        toast.error(`Failed to install ${data.name}`, {
+          description: errorMessage.includes(
+            "Upstream MCP server returned HTTP 401",
+          )
+            ? "The MCP server rejected the connection (HTTP 401)."
+            : errorMessage.includes("Upstream MCP server returned HTTP 403")
+              ? "The MCP server denied access (HTTP 403)."
+              : "Check the server configuration and try again.",
+        });
+        return {
+          installedServer,
+          errorMessage,
+          dontShowToast: data.dontShowToast,
+        };
       }
-      return { installedServer, dontShowToast: data.dontShowToast };
+      return {
+        installedServer,
+        errorMessage: null,
+        dontShowToast: data.dontShowToast,
+      };
     },
     onSuccess: async ({ installedServer, dontShowToast }, variables) => {
-      // Show success toast for remote servers (local servers show toast after async tool fetch completes)
-      if (!dontShowToast && installedServer) {
+      if (installedServer) {
+        trackEvent("mcp_server_installed", {
+          serverId: installedServer.id,
+          serverName: variables.name,
+          catalogId: variables.catalogId,
+          scope: variables.scope,
+        });
+      }
+      // Toast only an install that is already done. A local install comes
+      // back pending; its toast is shown when the install actually finishes.
+      if (
+        !dontShowToast &&
+        installedServer &&
+        !isInstallInProgress(installedServer.localInstallationStatus)
+      ) {
         toast.success(`Successfully installed ${variables.name}`);
       }
       // Refetch instead of just invalidating to ensure data is fresh
       await queryClient.refetchQueries({ queryKey: ["mcp-servers"] });
+      void queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey });
+      if (installedServer) {
+        await invalidateExternalMcpSkillQueries(queryClient);
+      }
       // Invalidate tools queries since MCP server installation creates new tools
       queryClient.invalidateQueries({ queryKey: ["tools"] });
       queryClient.invalidateQueries({ queryKey: ["tools", "unassigned"] });
@@ -195,9 +406,58 @@ export function useInstallMcpServer() {
       }
       // Invalidate all chat MCP tools (new tools may be available)
       queryClient.invalidateQueries({ queryKey: ["chat", "agents"] });
+      // A new connection can be exactly the one an agent was waiting on, so the
+      // chat picker and composer notice have to re-ask what is still missing.
+      queryClient.invalidateQueries({
+        queryKey: ["agents", "credential-readiness"],
+      });
     },
-    onError: (_error, variables) => {
+    onError: (error, variables) => {
+      // Thrown (non-API) failures, e.g. the request never reached the backend.
+      trackEvent("mcp_server_installation_failed", {
+        serverName: variables.name,
+        catalogId: variables.catalogId,
+        stage: "request",
+        errorMessage: clipErrorMessage(error.message),
+      });
       toast.error(`Failed to install ${variables.name}`);
+    },
+  });
+}
+
+/**
+ * Uninstalls a selection of MCP servers in one request, bypassing
+ * `useDeleteMcpServer` — which toasts and refetches per call, so a selection
+ * would fire one toast and one refetch per row. Built-in and app-backing
+ * servers come back in `failed` with the reason they cannot be uninstalled.
+ */
+export function useBulkUninstallMcpServers() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (servers: readonly { id: string; name: string }[]) =>
+      bulkDeleteMcpServers({
+        body: { ids: servers.map((server) => server.id) },
+      }).then(({ data, error }) => {
+        throwOnApiError(error, { toastOnError: false });
+        const result = data ?? { succeeded: [], failed: [] };
+        return {
+          ...toBulkOutcome(result),
+          succeededIds: result.succeeded.map((server) => server.id),
+        };
+      }),
+    onSuccess: (outcome) => {
+      removeExternalMcpSkillCachesForSources({
+        queryClient,
+        serverIds: outcome.succeededIds,
+      });
+    },
+    onSettled: async () => {
+      await Promise.all([
+        queryClient.refetchQueries({ queryKey: ["mcp-servers"] }),
+        queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey }),
+        invalidateExternalMcpSkillQueries(queryClient),
+      ]);
+      invalidateToolAssignmentQueries(queryClient);
     },
   });
 }
@@ -205,21 +465,122 @@ export function useInstallMcpServer() {
 export function useDeleteMcpServer() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (data: { id: string; name: string }) => {
+    mutationFn: async (data: {
+      id: string;
+      name: string;
+      /**
+       * A desktop MCP server: its toasts speak of the computer it is removed
+       * from, the viewer's own or another user's.
+       */
+      desktop?: "mine" | "theirs";
+    }) => {
       const response = await deleteMcpServer({ path: { id: data.id } });
+      // The generated client runs with `throwOnError: false`, so a refusal
+      // resolves like a success: without this, a 403 fell straight through to
+      // `onSuccess` and the UI reported "Successfully uninstalled" while the
+      // install was still there. `onError` below names the server and carries
+      // the API's reason, so the refusal is not toasted twice.
+      throwOnApiError(response.error, { toastOnError: false });
       return response.data;
     },
     onSuccess: async (_, variables) => {
+      trackEvent("mcp_server_uninstalled", {
+        serverId: variables.id,
+        serverName: variables.name,
+      });
+      removeExternalMcpSkillCachesForSources({
+        queryClient,
+        serverIds: [variables.id],
+      });
       // Refetch instead of just invalidating to ensure data is fresh
-      await queryClient.refetchQueries({ queryKey: ["mcp-servers"] });
+      await Promise.all([
+        queryClient.refetchQueries({ queryKey: ["mcp-servers"] }),
+        queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey }),
+        invalidateExternalMcpSkillQueries(queryClient),
+      ]);
       // Invalidate all tool assignment queries (tools, agent-tools, chat, etc.)
       invalidateToolAssignmentQueries(queryClient);
-      toast.success(`Successfully uninstalled ${variables.name}`);
+      toast.success(
+        variables.desktop
+          ? `${variables.name} disconnected from ${variables.desktop === "mine" ? "your" : "their"} device`
+          : `Successfully uninstalled ${variables.name}`,
+      );
     },
     onError: (error, variables) => {
       console.error("Uninstall error:", error);
-      toast.error(`Failed to uninstall ${variables.name}`);
+      toast.error(
+        variables.desktop
+          ? `Couldn't disconnect ${variables.name} from ${variables.desktop === "mine" ? "your" : "their"} device`
+          : `Failed to uninstall ${variables.name}`,
+        { description: error.message },
+      );
     },
+  });
+}
+
+/**
+ * Re-discover a server's tools from the live server and persist them to the
+ * tool catalog (add/update/remove) — no reinstall, no pod restart. Refreshes
+ * every query that renders tool lists or counts, since the shared catalog
+ * rows may have changed for all installs of the same server.
+ */
+export function useReloadMcpServerTools() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (data: {
+      id: string;
+      name?: string;
+      catalogId?: string | null;
+    }) => {
+      const { data: result, error } = await reloadMcpServerTools({
+        path: { id: data.id },
+      });
+      if (error) {
+        handleApiError(error);
+        throw new Error(getApiErrorMessage(error));
+      }
+      return result;
+    },
+    onSuccess: async (result, variables) => {
+      // Callers pass only the server id; recover name/catalogId from the
+      // cache (same lookup useMcpInstallationStatusCacheSync uses) for the
+      // toast and catalog-scoped invalidation.
+      const cachedServer = findCachedMcpServer(queryClient, variables.id);
+      const name = variables.name ?? cachedServer?.name;
+      const catalogId = variables.catalogId ?? cachedServer?.catalogId;
+
+      await Promise.all([
+        queryClient.refetchQueries({ queryKey: ["mcp-servers"] }),
+        queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey }),
+        invalidateExternalMcpSkillQueries(queryClient),
+      ]);
+      invalidateToolAssignmentQueries(queryClient);
+      queryClient.invalidateQueries({
+        queryKey: ["mcp-servers", variables.id, "tools"],
+      });
+      if (catalogId) {
+        queryClient.invalidateQueries({
+          queryKey: ["mcp-catalog", catalogId, "tools"],
+        });
+      }
+      const target = name ?? "server";
+      const changed =
+        (result?.created ?? 0) +
+        (result?.updated ?? 0) +
+        (result?.deleted ?? 0);
+      toast.success(
+        changed > 0 && result
+          ? `Refreshed ${target} tools: ${result.created} added, ${result.updated} updated, ${result.deleted} removed`
+          : `${name ?? "Server"} tools are already up to date`,
+      );
+    },
+    onError: (_error, variables) => {
+      toast.error(`Failed to refresh ${variables.name ?? "server"} tools`);
+    },
+    // A sync can change the tools' prefix, which is what the policy's rules
+    // and aliases name: what the policy covers has to be read again.
+    onSettled: () =>
+      queryClient.invalidateQueries({ queryKey: [coverageQueryPrefix] }),
   });
 }
 
@@ -231,14 +592,52 @@ export function useMcpServerTools(mcpServerId: string | null) {
       const { data, error } = await getMcpServerTools({
         path: { id: mcpServerId },
       });
-      if (error) {
-        // handleApiError not used to prevent "MCP server not found" error from being shown
-        console.error("Failed to fetch MCP server tools:", error);
-        return [];
-      }
+      // A not-yet-connected server 404s here; treat that as an empty tool list
+      // (no error state, no toast) rather than a failure.
+      throwOnApiError(error, { allowNotFound: true, toastOnError: false });
       return data ?? [];
     },
     enabled: !!mcpServerId,
+  });
+}
+
+/**
+ * The agents with tools assigned from each of these installs, read one install
+ * at a time. Server lists skip them (`includeAssignedAgents: false`): building
+ * them for every install of a catalog is what made the registry slow, and only
+ * a confirmation about specific installs needs them.
+ */
+export function useMcpServersAssignedAgents(params: {
+  serverIds: string[];
+  enabled: boolean;
+}) {
+  return useQueries({
+    queries: params.serverIds.map((id) => ({
+      // The whole install, not a bare agent array: the list caches under the
+      // same ["mcp-servers"] prefix are rewritten as arrays of servers.
+      queryKey: ["mcp-servers", id, "detail"],
+      queryFn: async () => {
+        const { data, error } = await getMcpServer({ path: { id } });
+        throwOnApiError(error, { toastOnError: false });
+        return data ?? null;
+      },
+      enabled: params.enabled,
+    })),
+    combine: (results) => ({
+      agentsByServerId: new Map(
+        params.serverIds.map((id, index) => [
+          id,
+          results[index]?.data?.assignedAgents ?? [],
+        ]),
+      ),
+      isPending: results.some((result) => result.isPending),
+      // A failed refetch keeps the agents it already showed: a server-list
+      // refresh while the confirmation is open rereads the install, which
+      // someone may have removed by then.
+      isError: results.some(
+        (result) => result.isError && result.data === undefined,
+      ),
+    }),
   });
 }
 
@@ -252,6 +651,7 @@ export function useMcpServerInstallationStatus(
     queryFn: async () => {
       if (!installingMcpServerId) {
         await queryClient.refetchQueries({ queryKey: ["mcp-servers"] });
+        void queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey });
         return "success";
       }
       const response = await getMcpServer({
@@ -266,6 +666,7 @@ export function useMcpServerInstallationStatus(
       }
       if (result === "error") {
         await queryClient.refetchQueries({ queryKey: ["mcp-servers"] });
+        void queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey });
         toast.error("Failed to install server");
       }
       return result;
@@ -310,9 +711,11 @@ export function useMcpServerInstallationStatus(
           void queryClient.refetchQueries({
             queryKey: ["mcp-servers", installingMcpServerId],
           });
+          void invalidateExternalMcpSkillQueries(queryClient);
           toast.success("Successfully installed server");
         } else if (status === "error" && previous !== "error") {
           void queryClient.refetchQueries({ queryKey: ["mcp-servers"] });
+          void queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey });
           toast.error("Failed to install server");
         }
       },
@@ -347,6 +750,7 @@ export function useReauthenticateMcpServer() {
         return;
       }
       await queryClient.refetchQueries({ queryKey: ["mcp-servers"] });
+      void queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey });
       invalidateToolAssignmentQueries(queryClient);
       toast.success(`Successfully re-authenticated ${variables.name}`);
     },
@@ -375,6 +779,12 @@ export function useReinstallMcpServer() {
         body,
       });
       if (response.error) {
+        trackEvent("mcp_server_installation_failed", {
+          serverId: id,
+          serverName: name,
+          stage: "request",
+          errorMessage: clipErrorMessage(getApiErrorMessage(response.error)),
+        });
         handleApiError(response.error);
         return null;
       }
@@ -382,7 +792,11 @@ export function useReinstallMcpServer() {
     },
     onSuccess: async (_result, variables) => {
       // Refetch servers to get updated status (will show "pending" initially)
-      await queryClient.refetchQueries({ queryKey: ["mcp-servers"] });
+      await Promise.all([
+        queryClient.refetchQueries({ queryKey: ["mcp-servers"] }),
+        queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey }),
+        invalidateExternalMcpSkillQueries(queryClient),
+      ]);
       // Invalidate tools queries since tools may have been synced
       queryClient.invalidateQueries({ queryKey: ["tools"] });
       queryClient.invalidateQueries({ queryKey: ["tools", "unassigned"] });
@@ -399,44 +813,679 @@ export function useReinstallMcpServer() {
   });
 }
 
+/** The alert kinds the API lets a viewer dismiss from their own queue. */
+export type DismissibleAlertKind =
+  archestraApiTypes.MuteMcpServerAlertData["path"]["kind"];
+
+export type DismissibleMcpAlert = {
+  catalogId: string;
+  catalogName: string;
+  serverId: string | null;
+  serverName?: string;
+  kind: DismissibleAlertKind;
+  issueFingerprint: string;
+};
+
+/**
+ * Dismiss one or more alerts from the calling viewer's queue. The backend
+ * still calls this state a mute; that transport vocabulary is deliberately
+ * kept behind this UI-facing hook.
+ */
+export function useDismissMcpServerAlerts() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (variables: {
+      alerts: DismissibleMcpAlert[];
+      reason?: string;
+    }) => {
+      const results = await Promise.all(
+        variables.alerts.map(async (alert) => {
+          try {
+            const response = alert.serverId
+              ? await muteMcpServerAlert({
+                  path: { id: alert.serverId, kind: alert.kind },
+                  body: {
+                    issueFingerprint: alert.issueFingerprint,
+                    ...(variables.reason ? { reason: variables.reason } : {}),
+                  },
+                })
+              : await muteMcpCatalogAlert({
+                  path: { id: alert.catalogId, kind: alert.kind },
+                  body: {
+                    issueFingerprint: alert.issueFingerprint,
+                    ...(variables.reason ? { reason: variables.reason } : {}),
+                  },
+                });
+            if (response.error) {
+              handleApiError(response.error);
+              return { alert, succeeded: false };
+            }
+            return { alert, succeeded: true };
+          } catch (error) {
+            toast.error(
+              error instanceof Error
+                ? error.message
+                : `Could not dismiss alert for ${alertDisplayName(alert)}`,
+            );
+            return { alert, succeeded: false };
+          }
+        }),
+      );
+      return {
+        succeeded: results
+          .filter((result) => result.succeeded)
+          .map((result) => result.alert),
+        failed: results
+          .filter((result) => !result.succeeded)
+          .map((result) => result.alert),
+      };
+    },
+    onSuccess: async ({ succeeded, failed }, variables) => {
+      if (succeeded.length === 0) return;
+      await Promise.all([
+        queryClient.refetchQueries({ queryKey: ["mcp-servers"] }),
+        queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey }),
+        queryClient.refetchQueries({ queryKey: ["mcp-catalog"] }),
+      ]);
+      toast.success(
+        succeeded.length === 1 && failed.length === 0
+          ? `Dismissed alert for ${alertDisplayName(succeeded[0])}`
+          : failed.length > 0
+            ? `Dismissed ${succeeded.length} of ${variables.alerts.length} alerts`
+            : `Dismissed ${succeeded.length} alerts`,
+      );
+    },
+  });
+}
+
+/** Restore one or more dismissed alerts to the calling viewer's queue. */
+export function useRestoreMcpServerAlerts() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (variables: { alerts: DismissibleMcpAlert[] }) => {
+      const results = await Promise.all(
+        variables.alerts.map(async (alert) => {
+          try {
+            const response = alert.serverId
+              ? await unmuteMcpServerAlert({
+                  path: { id: alert.serverId, kind: alert.kind },
+                  query: { issueFingerprint: alert.issueFingerprint },
+                })
+              : await unmuteMcpCatalogAlert({
+                  path: { id: alert.catalogId, kind: alert.kind },
+                  query: { issueFingerprint: alert.issueFingerprint },
+                });
+            if (response.error) {
+              handleApiError(response.error);
+              return { alert, succeeded: false };
+            }
+            return { alert, succeeded: true };
+          } catch (error) {
+            toast.error(
+              error instanceof Error
+                ? error.message
+                : `Could not restore alert for ${alertDisplayName(alert)}`,
+            );
+            return { alert, succeeded: false };
+          }
+        }),
+      );
+      return {
+        succeeded: results
+          .filter((result) => result.succeeded)
+          .map((result) => result.alert),
+        failed: results
+          .filter((result) => !result.succeeded)
+          .map((result) => result.alert),
+      };
+    },
+    onSuccess: async ({ succeeded, failed }, variables) => {
+      if (succeeded.length === 0) return;
+      await Promise.all([
+        queryClient.refetchQueries({ queryKey: ["mcp-servers"] }),
+        queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey }),
+        queryClient.refetchQueries({ queryKey: ["mcp-catalog"] }),
+      ]);
+      toast.success(
+        succeeded.length === 1 && failed.length === 0
+          ? `Restored alert for ${alertDisplayName(succeeded[0])}`
+          : failed.length > 0
+            ? `Restored ${succeeded.length} of ${variables.alerts.length} alerts`
+            : `Restored ${succeeded.length} alerts`,
+      );
+    },
+  });
+}
+
+function alertDisplayName(alert: DismissibleMcpAlert | undefined): string {
+  return alert?.serverName ?? alert?.catalogName ?? "MCP server";
+}
+
+export type McpDeploymentFeedState =
+  | "loading"
+  | "ready"
+  /**
+   * The socket came back and the feed was asked for again, but its answer has
+   * not arrived: the statuses shown are the ones from before the gap.
+   */
+  | "reconnecting"
+  | "disabled"
+  | "disconnected";
+
+export type McpDeploymentStatusFeed = {
+  statuses: Record<string, McpDeploymentStatusEntry>;
+  /**
+   * Why callers need this: an empty `statuses` is ambiguous on its own. It
+   * means "nothing has arrived yet" on a Kubernetes deployment and "there will
+   * never be anything" everywhere else, and a UI that cannot tell them apart
+   * shows a permanent "Checking" on every non-Kubernetes deployment.
+   */
+  state: McpDeploymentFeedState;
+};
+
+// Handed to every disabled caller by identity, so it must not be writable.
+const NO_DEPLOYMENT_STATUSES: Record<string, McpDeploymentStatusEntry> =
+  Object.freeze({});
+
+const DISABLED_DEPLOYMENT_FEED: McpDeploymentStatusFeed = Object.freeze({
+  statuses: NO_DEPLOYMENT_STATUSES,
+  state: "disabled",
+});
+
+// `useFeature` reports undefined until the config query resolves, which is not
+// the same as the flag being off: reporting "disabled" there would settle the
+// UI on the wrong answer for every deployment during the first render pass.
+const CONFIG_PENDING_DEPLOYMENT_FEED: McpDeploymentStatusFeed = Object.freeze({
+  statuses: NO_DEPLOYMENT_STATUSES,
+  state: "loading",
+});
+
+/**
+ * Whether the socket carrying the feed is up. "connecting" is the first
+ * attempt, still in flight — the only phase where nothing has been decided
+ * yet; "disconnected" is an attempt that ended without a live socket, whether
+ * it never opened or opened and later closed.
+ */
+type DeploymentFeedConnection = "connecting" | "connected" | "disconnected";
+
+// The deployment-status feed is shared module state rather than per-component
+// state because the backend keys the subscription by socket, not by component:
+// one component unsubscribing on unmount used to cut the feed for every other
+// component still reading it. Consumers are reference counted instead, and the
+// subscription is re-sent whenever it could have gone stale, since the backend
+// captures the caller's accessible-server list once, at subscribe time.
+const deploymentFeedListeners = new Set<() => void>();
+let deploymentFeedConsumers = 0;
+let deploymentFeed: McpDeploymentStatusFeed = {
+  statuses: NO_DEPLOYMENT_STATUSES,
+  state: "loading",
+};
+let deploymentFeedHasStatuses = false;
+let deploymentFeedAwaitingResubscribe = false;
+let deploymentFeedSocketUnsubscribe: (() => void) | null = null;
+let deploymentFeedConnectionUnsubscribe: (() => void) | null = null;
+let deploymentFeedConnection: DeploymentFeedConnection = "connecting";
+let deploymentFeedServersSignature: string | null = null;
+let deploymentFeedUserId: string | null = null;
+
+function currentDeploymentFeedState(): McpDeploymentFeedState {
+  // "loading" is only honest while the first connection attempt is in flight
+  // or while a live socket has yet to push its first payload. Once an attempt
+  // has failed there is nothing to wait for, and a backend that never accepts
+  // the socket must not read as "loading" forever.
+  if (deploymentFeedConnection === "disconnected") return "disconnected";
+  if (deploymentFeedAwaitingResubscribe) return "reconnecting";
+  return deploymentFeedHasStatuses ? "ready" : "loading";
+}
+
+function publishDeploymentFeed(
+  statuses: Record<string, McpDeploymentStatusEntry>,
+): void {
+  deploymentFeed = { statuses, state: currentDeploymentFeedState() };
+  for (const listener of deploymentFeedListeners) {
+    listener();
+  }
+}
+
+function sendDeploymentFeedSubscribe(): void {
+  // Only a live socket carries a subscription: the backend attaches it to the
+  // connection it arrived on. Queueing one for a socket that has not opened
+  // yet would duplicate the subscribe the open handler below already sends.
+  if (!websocketService.isConnected()) return;
+
+  websocketService.send({
+    type: "subscribe_mcp_deployment_statuses",
+    payload: {},
+  });
+}
+
+function handleDeploymentFeedConnectionChange(isConnected: boolean): void {
+  deploymentFeedConnection = isConnected ? "connected" : "disconnected";
+  if (isConnected) {
+    // Statuses from before the gap may be stale until the new answer lands.
+    if (deploymentFeedHasStatuses) deploymentFeedAwaitingResubscribe = true;
+    // The backend drops the subscription along with the closed socket, so
+    // every new connection has to ask for the feed again.
+    sendDeploymentFeedSubscribe();
+  }
+  publishDeploymentFeed(deploymentFeed.statuses);
+}
+
+function retainDeploymentFeed(): void {
+  deploymentFeedConsumers += 1;
+  if (deploymentFeedConsumers > 1) return;
+
+  deploymentFeedSocketUnsubscribe = websocketService.subscribe(
+    "mcp_deployment_statuses",
+    (message: McpDeploymentStatusesMessage) => {
+      deploymentFeedHasStatuses = true;
+      deploymentFeedAwaitingResubscribe = false;
+      publishDeploymentFeed(message.payload.statuses);
+    },
+  );
+  deploymentFeedConnectionUnsubscribe = websocketService.onConnectionChange(
+    handleDeploymentFeedConnectionChange,
+  );
+  websocketService.connect();
+  // A socket that is already open gets no further open event, so it is
+  // subscribed here; one that is still connecting is subscribed by the
+  // connection handler the moment it opens.
+  deploymentFeedConnection = websocketService.isConnected()
+    ? "connected"
+    : "connecting";
+  sendDeploymentFeedSubscribe();
+}
+
+function releaseDeploymentFeed(): void {
+  deploymentFeedConsumers -= 1;
+  if (deploymentFeedConsumers > 0) return;
+
+  websocketService.send({
+    type: "unsubscribe_mcp_deployment_statuses",
+    payload: {},
+  });
+  deploymentFeedSocketUnsubscribe?.();
+  deploymentFeedSocketUnsubscribe = null;
+  deploymentFeedConnectionUnsubscribe?.();
+  deploymentFeedConnectionUnsubscribe = null;
+  deploymentFeedHasStatuses = false;
+  deploymentFeedAwaitingResubscribe = false;
+  deploymentFeedConnection = "connecting";
+  deploymentFeedServersSignature = null;
+  deploymentFeedUserId = null;
+  deploymentFeed = {
+    statuses: NO_DEPLOYMENT_STATUSES,
+    state: "loading",
+  };
+}
+
+/**
+ * Re-subscribe when the set of installed servers changes. The backend resolves
+ * which servers the caller may see once, when the subscription is created, so
+ * a server installed afterwards would otherwise never appear in the feed.
+ */
+function refreshDeploymentFeedForServers(signature: string): void {
+  if (deploymentFeedConsumers === 0) return;
+
+  const previousSignature = deploymentFeedServersSignature;
+  deploymentFeedServersSignature = signature;
+  // The first signature we see is the list the backend resolved for us at
+  // subscribe time, so only a later change is worth another round trip.
+  if (previousSignature === null || previousSignature === signature) return;
+
+  sendDeploymentFeedSubscribe();
+}
+
+/**
+ * Drop everything the feed holds when the signed-in user changes. The statuses
+ * carry pod names and runtime error messages for the servers the previous user
+ * could see, and a sign-out/sign-in without a page reload leaves this module
+ * loaded, so they would otherwise be shown to whoever signs in next.
+ */
+function resetDeploymentFeedForUser(userId: string): void {
+  if (deploymentFeedUserId === userId) return;
+
+  const previousUserId = deploymentFeedUserId;
+  deploymentFeedUserId = userId;
+  if (previousUserId === null || deploymentFeedConsumers === 0) return;
+
+  deploymentFeedHasStatuses = false;
+  deploymentFeedServersSignature = null;
+  publishDeploymentFeed(NO_DEPLOYMENT_STATUSES);
+  // The live socket still holds the previous user's subscription; the backend
+  // re-resolves the accessible servers when it is asked again.
+  sendDeploymentFeedSubscribe();
+}
+
+/**
+ * The ids of every installed server the query cache already knows about. Read
+ * from the cache rather than fetched: `useMcpDeploymentStatuses` is mounted for
+ * the whole session, and a query of its own under the `mcp-servers` key would
+ * race the server-rendered data the registry page primes that key with.
+ *
+ * The registry's issue index counts as a server list: it is the one every page
+ * loads (for the sidebar count), so a session that never caches the full list
+ * still re-subscribes when an install appears or goes away.
+ */
+function cachedMcpServersSignature(queryClient: QueryClient): string | null {
+  const serverIds = new Set<string>();
+  let sawServerList = false;
+
+  const index = queryClient.getQueryData<McpRegistryIssueIndexWire>(
+    mcpRegistryIssueIndexQueryKey,
+  );
+  if (index) {
+    sawServerList = true;
+    for (const server of index.servers) serverIds.add(server.id);
+  }
+
+  for (const [queryKey, servers] of queryClient.getQueriesData<
+    archestraApiTypes.GetMcpServersResponses["200"]
+  >({ queryKey: ["mcp-servers"] })) {
+    // The same prefix also keys per-server tool lists and the auto-mode agent
+    // list; only the two-element key with a filter object is a server list.
+    if (queryKey.length !== 2 || typeof queryKey[1] !== "object") continue;
+    if (!Array.isArray(servers)) continue;
+    sawServerList = true;
+    for (const server of servers) {
+      serverIds.add(server.id);
+    }
+  }
+
+  return sawServerList ? [...serverIds].sort().join(",") : null;
+}
+
+// No cache exists while rendering on the server, and the feed only runs in the
+// browser anyway.
+const noCachedMcpServersSignature = () => null;
+
 /**
  * Subscribe to real-time MCP deployment statuses via WebSocket.
- * Returns a record mapping server IDs to their deployment status entries.
- * Only subscribes when the K8s runtime feature flag is enabled.
+ *
+ * The underlying subscription is shared and reference counted, so several
+ * components can read the feed at once and it outlives any one of them
+ * unmounting. Only subscribes when the K8s runtime feature flag is enabled;
+ * everywhere else the returned state is "disabled" and never "loading".
  */
-export function useMcpDeploymentStatuses(): Record<
-  string,
-  McpDeploymentStatusEntry
-> {
-  const [statuses, setStatuses] = useState<
-    Record<string, McpDeploymentStatusEntry>
-  >({});
+export function useMcpDeploymentStatuses(): McpDeploymentStatusFeed {
   const isK8sEnabled = useFeature("orchestratorK8sRuntime");
+  const { data: session } = useSession();
+  const sessionUserId = session?.user?.id ?? null;
+  const [feed, setFeed] = useState(deploymentFeed);
 
   useEffect(() => {
-    if (!isK8sEnabled) return;
+    if (isK8sEnabled !== true) return;
 
-    websocketService.connect();
-    websocketService.send({
-      type: "subscribe_mcp_deployment_statuses",
-      payload: {},
-    });
-
-    const unsubscribe = websocketService.subscribe(
-      "mcp_deployment_statuses",
-      (message: McpDeploymentStatusesMessage) => {
-        setStatuses(message.payload.statuses);
-      },
-    );
+    const listener = () => setFeed(deploymentFeed);
+    deploymentFeedListeners.add(listener);
+    retainDeploymentFeed();
+    // A feed retained by an earlier consumer already holds statuses; adopt
+    // them instead of rendering "loading" until the next push.
+    setFeed(deploymentFeed);
 
     return () => {
-      websocketService.send({
-        type: "unsubscribe_mcp_deployment_statuses",
-        payload: {},
-      });
-      unsubscribe();
+      deploymentFeedListeners.delete(listener);
+      releaseDeploymentFeed();
     };
   }, [isK8sEnabled]);
 
-  return statuses;
+  useEffect(() => {
+    if (isK8sEnabled !== true || sessionUserId === null) return;
+    resetDeploymentFeedForUser(sessionUserId);
+  }, [isK8sEnabled, sessionUserId]);
+
+  if (isK8sEnabled === undefined) return CONFIG_PENDING_DEPLOYMENT_FEED;
+  if (!isK8sEnabled) return DISABLED_DEPLOYMENT_FEED;
+  return feed;
+}
+
+/**
+ * Keeps the backend's subscription pointed at the servers this session can
+ * actually see: it captures the accessible list once per subscribe, so a newly
+ * installed server is invisible until we re-subscribe.
+ *
+ * Mounted ONCE, by the app shell. Watching the query cache from every consumer
+ * meant a cache write during one component's render pushed a store update into
+ * another's; the driver's notifications are deferred one microtask for the
+ * same reason, which React requires before reporting a new external-store
+ * snapshot.
+ */
+export function useMcpDeploymentFeedDriver(): void {
+  const isK8sEnabled = useFeature("orchestratorK8sRuntime");
+  const queryClient = useQueryClient();
+  const subscribeToQueryCache = useCallback(
+    (onCacheChange: () => void) => {
+      let active = true;
+      let queued = false;
+      const unsubscribe = queryClient.getQueryCache().subscribe(() => {
+        if (queued) return;
+        queued = true;
+        queueMicrotask(() => {
+          queued = false;
+          if (active) onCacheChange();
+        });
+      });
+      return () => {
+        active = false;
+        unsubscribe();
+      };
+    },
+    [queryClient],
+  );
+  const readServersSignature = useCallback(
+    () => cachedMcpServersSignature(queryClient),
+    [queryClient],
+  );
+  const serversSignature = useSyncExternalStore(
+    subscribeToQueryCache,
+    readServersSignature,
+    noCachedMcpServersSignature,
+  );
+
+  useEffect(() => {
+    if (isK8sEnabled !== true || serversSignature === null) return;
+    refreshDeploymentFeedForServers(serversSignature);
+  }, [isK8sEnabled, serversSignature]);
+}
+
+// Server ids whose async ("runtime") install failure was already sent to
+// analytics. Module-level so the capture happens once regardless of how many
+// components have `useMcpInstallationStatusCacheSync` mounted.
+const runtimeInstallErrorsAlreadyTracked = new Set<string>();
+// The first ready event follows the page's own fresh loads; only a reconnect
+// can have missed lifecycle events and needs a full cache resync.
+const websocketReadySyncedClients = new WeakSet<QueryClient>();
+
+function invalidateExternalMcpSkillQueries(queryClient: QueryClient) {
+  return queryClient.invalidateQueries({ queryKey: externalMcpSkillsQueryKey });
+}
+
+function removeExternalMcpSkillCachesForSources(params: {
+  queryClient: QueryClient;
+  serverIds?: string[];
+  catalogIds?: string[];
+}) {
+  const serverIds = new Set(params.serverIds ?? []);
+  const catalogIds = new Set(params.catalogIds ?? []);
+  params.queryClient.setQueriesData<
+    archestraApiTypes.GetExternalMcpSkillsResponses["200"]
+  >(
+    { queryKey: externalMcpSkillsQueryKey },
+    (skills) =>
+      skills?.filter(
+        (skill) =>
+          !serverIds.has(skill.mcpServerId) && !catalogIds.has(skill.catalogId),
+      ) ?? skills,
+  );
+  params.queryClient.setQueriesData<
+    archestraApiTypes.GetExternalMcpSkillResponses["200"] | null
+  >({ queryKey: externalMcpSkillDetailQueryKey }, (skill) => {
+    if (!skill) return skill;
+    return serverIds.has(skill.mcpServerId) || catalogIds.has(skill.catalogId)
+      ? null
+      : skill;
+  });
+}
+
+function removeMcpServersFromCache(params: {
+  queryClient: QueryClient;
+  serverIds: string[];
+  catalogIds: string[];
+}) {
+  const serverIds = new Set(params.serverIds);
+  const catalogIds = new Set(params.catalogIds);
+  params.queryClient.setQueryData<McpRegistryIssueIndexWire>(
+    mcpRegistryIssueIndexQueryKey,
+    (index) =>
+      index && {
+        ...index,
+        servers: index.servers.filter(
+          (server) =>
+            !serverIds.has(server.id) &&
+            !(server.catalogId && catalogIds.has(server.catalogId)),
+        ),
+      },
+  );
+  params.queryClient.setQueriesData<
+    archestraApiTypes.GetMcpServersResponses["200"]
+  >({ queryKey: ["mcp-servers"] }, (servers) =>
+    Array.isArray(servers)
+      ? servers.filter(
+          (server) =>
+            !serverIds.has(server.id) && !catalogIds.has(server.catalogId),
+        )
+      : servers,
+  );
+}
+
+function patchIssueIndexServer(params: {
+  queryClient: QueryClient;
+  serverId: string;
+  patch: Partial<McpRegistryIssueIndexWire["servers"][number]>;
+}) {
+  params.queryClient.setQueryData<McpRegistryIssueIndexWire>(
+    mcpRegistryIssueIndexQueryKey,
+    (index) => {
+      if (!index?.servers.some((server) => server.id === params.serverId)) {
+        return index;
+      }
+      return {
+        ...index,
+        servers: index.servers.map((server) =>
+          server.id === params.serverId
+            ? { ...server, ...params.patch }
+            : server,
+        ),
+      };
+    },
+  );
+}
+
+/**
+ * The installs of the given catalog items, assignable to a target when a scope
+ * is given; `undefined` until every chunk has answered. Each chunk is cached
+ * under `["mcp-servers", …]` like any server list, so status pushes and server
+ * changes reach it.
+ */
+function useMcpServersForCatalogIds(params: {
+  catalogIds: string[];
+  assignmentScope?: McpServersQuery["assignmentScope"];
+  assignmentTeamIds?: string[];
+}) {
+  const { data: canReadInstallations } = useHasPermissions({
+    mcpServerInstallation: ["read"],
+  });
+  const sortedIds = [...new Set(params.catalogIds)].sort();
+  const chunks: string[][] = [];
+  for (let i = 0; i < sortedIds.length; i += MAX_CATALOG_IDS_PER_REQUEST) {
+    chunks.push(sortedIds.slice(i, i + MAX_CATALOG_IDS_PER_REQUEST));
+  }
+  const servers = useQueries({
+    queries: chunks.map((catalogIds) => ({
+      queryKey: [
+        "mcp-servers",
+        {
+          catalogIds,
+          includeAssignedAgents: false,
+          assignmentScope: params.assignmentScope,
+          assignmentTeamIds: params.assignmentTeamIds,
+        },
+      ],
+      enabled: !!canReadInstallations,
+      queryFn: async () => {
+        const { data, error } = await getMcpServers({
+          query: {
+            catalogIds,
+            includeAssignedAgents: false,
+            ...(params.assignmentScope && {
+              assignmentScope: params.assignmentScope,
+            }),
+            ...(params.assignmentTeamIds && {
+              assignmentTeamIds: params.assignmentTeamIds,
+            }),
+          },
+        });
+        throwOnApiError(error, { toastOnError: false });
+        return data ?? [];
+      },
+    })),
+    combine: combineServerChunks,
+  });
+
+  // A changed set of catalogs (the list's search, say) is a new request:
+  // keep the installs already known for the catalogs still asked for until
+  // it answers, so those rows do not read "Not connected" meanwhile. Only
+  // for the same target: another scope or team set can use other installs.
+  const targetKey = JSON.stringify([
+    params.assignmentScope ?? null,
+    params.assignmentTeamIds ?? null,
+  ]);
+  const lastAnswer = useRef<{
+    targetKey: string;
+    servers: NonNullable<typeof servers>;
+  } | null>(null);
+  if (servers) lastAnswer.current = { targetKey, servers };
+  const requestedKey = sortedIds.join(",");
+  // biome-ignore lint/correctness/useExhaustiveDependencies: requestedKey stands for sortedIds
+  return useMemo(() => {
+    if (servers) return servers;
+    const kept = lastAnswer.current;
+    if (!kept || kept.targetKey !== targetKey) return undefined;
+    const requested = new Set(sortedIds);
+    return kept.servers.filter(
+      (server) => server.catalogId && requested.has(server.catalogId),
+    );
+  }, [servers, requestedKey, targetKey]);
+}
+
+function combineServerChunks<T>(results: Array<{ data: T[] | undefined }>) {
+  return results.every((result) => result.data)
+    ? results.flatMap((result) => result.data ?? [])
+    : undefined;
+}
+
+const MAX_CATALOG_IDS_PER_REQUEST = 100;
+
+/**
+ * An install's name and catalog from whatever the cache holds: any cached
+ * server list, else the registry's issue index (cached on every page for the
+ * sidebar badge), so pages that no longer load a full list still find it.
+ */
+function findCachedMcpServer(
+  queryClient: QueryClient,
+  serverId: string,
+): { name: string; catalogId: string | null } | undefined {
+  const listed = queryClient
+    .getQueriesData<archestraApiTypes.GetMcpServersResponses["200"]>({
+      queryKey: ["mcp-servers"],
+    })
+    .flatMap(([, servers]) => (Array.isArray(servers) ? servers : []))
+    .find((candidate) => candidate.id === serverId);
+  if (listed) return listed;
+  const indexed = queryClient
+    .getQueryData<McpRegistryIssueIndexWire>(mcpRegistryIssueIndexQueryKey)
+    ?.servers.find((candidate) => candidate.id === serverId);
+  return indexed
+    ? { name: indexed.name, catalogId: indexed.catalogId ?? null }
+    : undefined;
 }

@@ -1,0 +1,320 @@
+import { randomBytes } from "node:crypto";
+import { LLM_PROXY_OAUTH_SCOPE } from "@archestra/shared";
+import { LlmOauthClientModel, OAuthAccessTokenModel } from "@/models";
+import { describe, expect, test } from "@/test";
+import { validateLlmOAuthAccessToken } from "./proxy/llm-proxy-auth";
+
+/**
+ * End-to-end authorization tests for LLM OAuth client (authorization_code)
+ * tokens at the LLM proxy boundary. An authorization_code client mints
+ * USER-BOUND tokens via better-auth's standard authorize→token exchange. These
+ * carry an acting user but no provider keys of their own, so the proxy must
+ * resolve the user's identity on the user-token path and pick the user's own
+ * provider key — that is what makes a pre-registered client act on behalf of
+ * the signed-in user (the LLM analog of per-user resolution).
+ */
+describe("LLM OAuth authorization_code proxy authorization", () => {
+  async function mintUserToken(params: { clientId: string; userId: string }) {
+    const accessToken = randomBytes(32).toString("base64url");
+    await OAuthAccessTokenModel.create({
+      tokenHash: OAuthAccessTokenModel.hashTokenForLookup(accessToken),
+      clientId: params.clientId,
+      userId: params.userId,
+      expiresAt: new Date(Date.now() + 3_600_000),
+      scopes: [LLM_PROXY_OAUTH_SCOPE],
+      // No referenceId → user-identity path (not the client_credentials branch).
+      referenceId: null,
+    });
+    return accessToken;
+  }
+
+  test("resolves the acting user and their own provider key", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeAgent,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "member" });
+    const proxy = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+      // The organization's proxy, which every member reaches.
+      isDefault: true,
+    });
+    // The user's own (org-scoped) provider key — NOT a key stored on the client.
+    const secret = await makeSecret({ secret: { apiKey: "sk-user-openai" } });
+    await makeLlmProviderApiKey(org.id, secret.id, { provider: "openai" });
+
+    const { oauthClient } = await LlmOauthClientModel.create({
+      organizationId: org.id,
+      authorId: user.id,
+      name: "Agentic Chat Server",
+      grantType: "authorization_code",
+      redirectUris: ["https://chat.example.com/oauth/callback"],
+    });
+    // The authorization_code client carries no provider keys of its own.
+    expect(oauthClient.providerApiKeys).toEqual([]);
+
+    const token = await mintUserToken({
+      clientId: oauthClient.clientId,
+      userId: user.id,
+    });
+
+    const result = await validateLlmOAuthAccessToken({
+      tokenValue: token,
+      expectedProvider: "openai",
+      agent: proxy,
+    });
+
+    expect(result).not.toBeNull();
+    expect(result?.authMethod).toBe("oauth_user");
+    expect(result?.userId).toBe(user.id);
+    // Resolved from the USER's own key, not the client.
+    expect(result?.apiKey).toBe("sk-user-openai");
+    expect(result?.authenticatedApp?.clientId).toBe(oauthClient.clientId);
+  });
+
+  test("authorizes an allowed proxy for a client_credentials client shared with a team (grants are management-plane only)", async ({
+    makeOrganization,
+    makeUser,
+    makeTeam,
+    makeAgent,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const author = await makeUser();
+    const team = await makeTeam(org.id, author.id);
+    const proxy = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+    });
+    const secret = await makeSecret({ secret: { apiKey: "sk-svc-openai" } });
+    const providerKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openai",
+    });
+
+    const { oauthClient } = await LlmOauthClientModel.create({
+      organizationId: org.id,
+      authorId: author.id,
+      name: "team-scoped service",
+      providerApiKeys: [
+        { provider: "openai", providerApiKeyId: providerKey.id },
+      ],
+      initialGrants: [
+        { subject: { type: "team", id: team.id }, actions: ["read"] },
+      ],
+    });
+
+    // client_credentials tokens carry no user.
+    const accessToken = randomBytes(32).toString("base64url");
+    await OAuthAccessTokenModel.createClientCredentialsToken({
+      tokenHash: OAuthAccessTokenModel.hashTokenForLookup(accessToken),
+      clientId: oauthClient.clientId,
+      expiresAt: new Date(Date.now() + 3_600_000),
+      scopes: [LLM_PROXY_OAUTH_SCOPE],
+    });
+
+    const result = await validateLlmOAuthAccessToken({
+      tokenValue: accessToken,
+      expectedProvider: "openai",
+      agent: proxy,
+    });
+
+    expect(result).not.toBeNull();
+    expect(result?.authMethod).toBe("oauth_client_credentials");
+    expect(result?.apiKey).toBe("sk-svc-openai");
+    expect(result?.authenticatedApp?.clientId).toBe(oauthClient.clientId);
+  });
+
+  test("rejects a token whose user cannot access the proxy", async ({
+    makeOrganization,
+    makeUser,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    // A user with no membership in the proxy's organization.
+    const outsider = await makeUser();
+    const proxy = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+    });
+    const { oauthClient } = await LlmOauthClientModel.create({
+      organizationId: org.id,
+      authorId: outsider.id,
+      name: "Agentic Chat Server",
+      grantType: "authorization_code",
+      redirectUris: ["https://chat.example.com/oauth/callback"],
+    });
+
+    const token = await mintUserToken({
+      clientId: oauthClient.clientId,
+      userId: outsider.id,
+    });
+
+    await expect(
+      validateLlmOAuthAccessToken({
+        tokenValue: token,
+        expectedProvider: "openai",
+        agent: proxy,
+      }),
+    ).rejects.toThrow();
+  });
+
+  /**
+   * A user-bound token grants exactly the user's own access: membership in the
+   * proxy's organization plus the user's own agent access (RBAC) on the target
+   * proxy. The client never widens what its users can reach.
+   */
+  test("does not grant access beyond the user's own RBAC", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeAgent,
+    makeTeam,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "member" });
+    // A restricted (team-scoped) proxy the user is NOT a member of.
+    const owningTeam = await makeTeam(org.id, user.id, { name: "Owners" });
+    const proxy = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+      access: { teams: [owningTeam.id] },
+    });
+    const secret = await makeSecret({ secret: { apiKey: "sk-user-openai" } });
+    await makeLlmProviderApiKey(org.id, secret.id, { provider: "openai" });
+
+    const { oauthClient } = await LlmOauthClientModel.create({
+      organizationId: org.id,
+      authorId: user.id,
+      name: "Chat Interface",
+      grantType: "authorization_code",
+      redirectUris: ["https://chat.example.com/oauth/callback"],
+    });
+
+    const token = await mintUserToken({
+      clientId: oauthClient.clientId,
+      userId: user.id,
+    });
+
+    await expect(
+      validateLlmOAuthAccessToken({
+        tokenValue: token,
+        expectedProvider: "openai",
+        agent: proxy,
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  test("validates a user-bound token for a proxy the user's own RBAC can reach", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeAgent,
+    makeTeam,
+    makeTeamMember,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "member" });
+    // A team-scoped proxy whose team the user IS a member of.
+    const team = await makeTeam(org.id, user.id, { name: "Chat Users" });
+    await makeTeamMember(team.id, user.id);
+    const proxy = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+      // The organization's proxy, which every member reaches.
+      isDefault: true,
+      access: { teams: [team.id] },
+    });
+    const secret = await makeSecret({ secret: { apiKey: "sk-user-openai" } });
+    await makeLlmProviderApiKey(org.id, secret.id, { provider: "openai" });
+
+    const { oauthClient } = await LlmOauthClientModel.create({
+      organizationId: org.id,
+      authorId: user.id,
+      name: "Chat Interface",
+      grantType: "authorization_code",
+      redirectUris: ["https://chat.example.com/oauth/callback"],
+    });
+
+    const token = await mintUserToken({
+      clientId: oauthClient.clientId,
+      userId: user.id,
+    });
+
+    const result = await validateLlmOAuthAccessToken({
+      tokenValue: token,
+      expectedProvider: "openai",
+      agent: proxy,
+    });
+
+    expect(result).not.toBeNull();
+    expect(result?.authMethod).toBe("oauth_user");
+    expect(result?.userId).toBe(user.id);
+    expect(result?.apiKey).toBe("sk-user-openai");
+  });
+  test("bound client credentials identify the service account and cannot reach a proxy outside its grants", async ({
+    makeOrganization,
+    makeServiceAccount,
+    makeAgent,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const account = await makeServiceAccount(org.id);
+    const proxy = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+      access: "org",
+      isDefault: true,
+    });
+    const privateProxy = await makeAgent({
+      organizationId: org.id,
+      agentType: "llm_proxy",
+      access: "personal",
+    });
+    const secret = await makeSecret({ secret: { apiKey: "sk-test" } });
+    const key = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openai",
+    });
+    const { oauthClient } = await LlmOauthClientModel.create({
+      organizationId: org.id,
+      authorId: crypto.randomUUID(),
+      name: "worker",
+      serviceAccountId: account.id,
+      providerApiKeys: [{ provider: "openai", providerApiKeyId: key.id }],
+    });
+    const token = randomBytes(32).toString("base64url");
+    await OAuthAccessTokenModel.createClientCredentialsToken({
+      tokenHash: OAuthAccessTokenModel.hashTokenForLookup(token),
+      clientId: oauthClient.clientId,
+      expiresAt: new Date(Date.now() + 3600000),
+      scopes: [LLM_PROXY_OAUTH_SCOPE],
+    });
+    const result = await validateLlmOAuthAccessToken({
+      tokenValue: token,
+      expectedProvider: "openai",
+      agent: proxy,
+    });
+    expect(result?.serviceAccountId).toBe(account.id);
+    expect(result?.userId).toBeUndefined();
+    await expect(
+      validateLlmOAuthAccessToken({
+        tokenValue: token,
+        expectedProvider: "openai",
+        agent: privateProxy,
+      }),
+    ).rejects.toThrow("Service account cannot access");
+  });
+});

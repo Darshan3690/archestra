@@ -1,5 +1,43 @@
-import type { SecretsManagerType } from "@shared";
+import type { SecretsManagerType } from "@archestra/shared";
+import type { Transaction } from "@/database/schema";
 import type { SecretValue, SelectSecret } from "./secret";
+
+/**
+ * `ApiError.internalCode` set when the external secrets backend (e.g. Vault)
+ * cannot be reached or fails an operation. Lets error tracking group one
+ * secrets-backend outage into a single issue instead of one per endpoint.
+ */
+export const SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE =
+  "secrets_manager_unavailable";
+
+export interface SecretReadOptions {
+  /**
+   * Read the backing store rather than any process-local cache. For callers
+   * that must observe a rotation performed on another replica immediately;
+   * backends that do not cache ignore it.
+   */
+  skipCache?: boolean;
+  /**
+   * Run the database read inside this transaction. A transactional read
+   * neither consults nor populates the process-local cache. Backends that keep
+   * the secret value outside the database ignore it.
+   */
+  transaction?: Transaction;
+  /**
+   * With `transaction`: lock the secret row (SELECT ... FOR UPDATE) until the
+   * transaction ends, so a concurrent writer waits for it.
+   */
+  forUpdate?: boolean;
+}
+
+export interface SecretWriteOptions {
+  /**
+   * Run the database write inside this transaction. The process-local cache
+   * entry is dropped rather than replaced, because the row is not committed
+   * yet; read it back with `skipCache` after the commit.
+   */
+  transaction?: Transaction;
+}
 
 /**
  * SecretManager interface for managing secrets
@@ -42,7 +80,10 @@ export interface ISecretManager {
    * @param secretId - The unique identifier of the secret
    * @returns The secret if found, null otherwise
    */
-  getSecret(secretId: string): Promise<SelectSecret | null>;
+  getSecret(
+    secretId: string,
+    options?: SecretReadOptions,
+  ): Promise<SelectSecret | null>;
 
   /**
    * Update a secret by ID
@@ -53,6 +94,7 @@ export interface ISecretManager {
   updateSecret(
     secretId: string,
     secretValue: SecretValue,
+    options?: SecretWriteOptions,
   ): Promise<SelectSecret | null>;
 
   /**
@@ -109,25 +151,6 @@ export interface VaultConfig {
   awsStsEndpoint: string;
   /** Value for X-Vault-AWS-IAM-Server-ID header (optional, for additional security) */
   awsIamServerIdHeader?: string;
-}
-
-/**
- * Item returned when listing secrets in a Vault folder
- */
-export interface VaultSecretListItem {
-  /** Secret name/key within the folder */
-  name: string;
-  /** Full Vault path to the secret */
-  path: string;
-}
-
-/**
- * Result of checking connectivity to a Vault folder
- */
-export interface VaultFolderConnectivityResult {
-  connected: boolean;
-  secretCount: number;
-  error?: string;
 }
 
 export type VaultAuthMethod = "token" | "kubernetes" | "aws";

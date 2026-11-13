@@ -1,10 +1,10 @@
-import { IncomingEmailSecurityModeSchema } from "@shared";
+import { IncomingEmailSecurityModeSchema } from "@archestra/shared";
 import { z } from "zod";
 import {
   AgentScopeSchema,
+  MissingCredentialBehaviorSchema,
   PassthroughHeadersSchema,
   SelectAgentSchema,
-  ToolAssignmentModeSchema,
   ToolExposureModeSchema,
 } from "./agent";
 import { CredentialResolutionModeSchema } from "./enterprise-managed-credentials";
@@ -69,13 +69,11 @@ const ExportAgentConfigSchema = z.object({
   scope: AgentScopeSchema.describe(
     "Original scope; imports always default to personal",
   ),
-  considerContextUntrusted: z.boolean(),
-  toolAssignmentMode: ToolAssignmentModeSchema,
   toolExposureMode: ToolExposureModeSchema,
-  llmModel: z
-    .string()
-    .nullable()
-    .describe("Informational; not auto-configured on import"),
+  // Optional so payloads exported before this setting existed still import.
+  missingCredentialBehavior: MissingCredentialBehaviorSchema.optional(),
+  // default(false) keeps exports from before the field existed importable
+  accessAllTools: z.boolean().default(false),
   incomingEmailEnabled: z.boolean(),
   incomingEmailSecurityMode: IncomingEmailSecurityModeSchema,
   incomingEmailAllowedDomain: z.string().nullable(),

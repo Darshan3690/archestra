@@ -1,0 +1,591 @@
+import {
+  archestraApiSdk,
+  type archestraApiTypes,
+  MAX_PROJECT_UPLOAD_BYTES,
+  MAX_PROJECT_UPLOAD_MB,
+} from "@archestra/shared";
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { toast } from "sonner";
+import { useHasPermissions } from "@/lib/auth/auth.query";
+import { toBulkOutcome } from "@/lib/bulk-action";
+import {
+  readFileAsBase64,
+  summarizeUploadResults,
+  type UploadOutcome,
+  validateUploadFile,
+} from "@/lib/files/file-upload";
+import { useAllMatching } from "@/lib/hooks/use-all-matching";
+import { PERSISTED_QUERY_META } from "@/lib/query-persistence";
+import { scheduleTriggerKeys } from "@/lib/schedule-trigger.query";
+import {
+  getApiErrorMessage,
+  getApiErrorType,
+  handleApiError,
+  throwOnApiError,
+} from "@/lib/utils/api";
+
+const {
+  bulkDeleteProjects,
+  createProject,
+  createProjectFromConversation,
+  deleteProject,
+  deleteSkillSandboxArtifact,
+  getProject,
+  getProjectConversations,
+  getProjectRuns,
+  getProjectFiles,
+  getProjectInstructions,
+  getProjects,
+  permanentlyDeleteProject,
+  pinProject,
+  restoreProject,
+  setProjectInstructions,
+  unpinProject,
+  updateProject,
+  uploadProjectFiles,
+} = archestraApiSdk;
+
+type ProjectListQuery = NonNullable<archestraApiTypes.GetProjectsData["query"]>;
+type ProjectListFilters = Omit<ProjectListQuery, "limit" | "offset">;
+
+/**
+ * One page of the projects list, optionally scoped, searched and split by
+ * pins. The list lives under a `["projects", "list", …]` key so it can be
+ * invalidated without touching the per-project detail queries
+ * (`["projects", id, …]`). The previous page stays on screen while the next
+ * one loads.
+ */
+export function useProjects(
+  options?: { enabled?: boolean; toastOnError?: boolean } & ProjectListQuery,
+) {
+  const { enabled, toastOnError, limit, offset, ...filters } = options ?? {};
+  const query = normalizeProjectFilters(filters);
+  // The endpoint requires project:read; skip the request for users whose role
+  // lacks it (e.g. the sidebar mounts this for everyone) instead of 403ing.
+  const { data: canReadProjects } = useHasPermissions({ project: ["read"] });
+  return useQuery({
+    queryKey: projectListQueryKey({ limit, offset, ...filters }),
+    // The sidebar's pinned list comes back on refresh with the rest of it.
+    meta: filters.pinned === true ? PERSISTED_QUERY_META : undefined,
+    enabled: (enabled ?? true) && !!canReadProjects,
+    placeholderData: keepPreviousData,
+    queryFn: async () => {
+      const { data, error } = await getProjects({
+        query: { ...withoutNulls(query), limit, offset },
+      });
+      throwOnApiError(error, { toastOnError });
+      return data;
+    },
+  });
+}
+
+/**
+ * The sidebar's read of the pinned projects. The server seeds a full page
+ * load of a shell-seeded route with it, under the same key.
+ */
+export const SIDEBAR_PINNED_PROJECTS_QUERY = {
+  pinned: true,
+  limit: 100,
+  offset: 0,
+} as const satisfies ProjectListQuery;
+
+/** The cache key of one page of the projects list. */
+export function projectListQueryKey({
+  limit,
+  offset,
+  ...filters
+}: ProjectListQuery) {
+  return [
+    "projects",
+    "list",
+    {
+      ...normalizeProjectFilters(filters),
+      limit: limit ?? null,
+      offset: offset ?? null,
+    },
+  ] as const;
+}
+
+/** Every project matching the table's filters, not just the page in view. */
+export function useAllMatchingProjects(
+  filters: ProjectListFilters,
+  options?: { enabled?: boolean },
+) {
+  const query = normalizeProjectFilters(filters);
+  return useAllMatching({
+    queryKey: ["projects", "list", "all-matching", query],
+    enabled: options?.enabled,
+    fetchPage: async ({ limit, offset }) => {
+      const { data, error } = await getProjects({
+        query: { ...withoutNulls(query), limit, offset },
+      });
+      throwOnApiError(error, { toastOnError: false });
+      return data?.data ?? [];
+    },
+  });
+}
+
+export function useProject(id: string | undefined) {
+  return useQuery({
+    queryKey: ["projects", id],
+    enabled: !!id,
+    queryFn: async () => {
+      const { data, error } = await getProject({
+        path: { id: id as string },
+      });
+      throwOnApiError(error, { allowNotFound: true });
+      return data ?? null;
+    },
+  });
+}
+
+export function useProjectConversations(
+  id: string | undefined,
+  options?: { enabled?: boolean },
+) {
+  return useQuery({
+    queryKey: ["projects", id, "conversations"],
+    enabled: !!id && (options?.enabled ?? true),
+    queryFn: async () => {
+      const { data, error } = await getProjectConversations({
+        path: { id: id as string },
+      });
+      throwOnApiError(error, { allowNotFound: true });
+      return data ?? null;
+    },
+  });
+}
+
+export function useProjectRuns(
+  id: string | undefined,
+  options?: { enabled?: boolean },
+) {
+  return useQuery({
+    queryKey: ["projects", id, "runs"],
+    enabled: !!id && (options?.enabled ?? true),
+    queryFn: async () => {
+      const { data, error } = await getProjectRuns({
+        path: { id: id as string },
+      });
+      throwOnApiError(error, { allowNotFound: true });
+      return data ?? null;
+    },
+    refetchInterval: 3_000,
+  });
+}
+
+/** Files belonging to the project; polled like the My Files page. */
+export function useProjectFiles(id: string | undefined) {
+  return useQuery({
+    queryKey: ["projects", id, "files"],
+    enabled: !!id,
+    refetchInterval: 5000,
+    queryFn: async () => {
+      const { data, error } = await getProjectFiles({
+        path: { id: id as string },
+      });
+      throwOnApiError(error, { allowNotFound: true });
+      return data ?? null;
+    },
+  });
+}
+
+/** The project's instructions ("" when never saved). */
+export function useProjectInstructions(id: string | undefined) {
+  return useQuery({
+    queryKey: ["projects", id, "instructions"],
+    enabled: !!id,
+    queryFn: async () => {
+      const { data, error } = await getProjectInstructions({
+        path: { id: id as string },
+      });
+      throwOnApiError(error, { allowNotFound: true });
+      return data ?? null;
+    },
+  });
+}
+
+export function useSetProjectInstructions() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: { id: string; content: string }) => {
+      const { error } = await setProjectInstructions({
+        path: { id: params.id },
+        body: { content: params.content },
+      });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return true;
+    },
+    onSuccess: (ok, { id }) => {
+      if (!ok) return;
+      toast.success("Instructions saved");
+      queryClient.invalidateQueries({
+        queryKey: ["projects", id, "instructions"],
+      });
+      // The first save materializes the instructions.md file.
+      queryClient.invalidateQueries({ queryKey: ["projects", id, "files"] });
+    },
+  });
+}
+
+export function useCreateProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      body: NonNullable<archestraApiTypes.CreateProjectData["body"]>,
+    ) => {
+      const { data, error } = await createProject({ body });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (project) => {
+      if (!project) return;
+      toast.success(`Project "${project.name}" created`);
+      queryClient.invalidateQueries({ queryKey: ["projects", "list"] });
+    },
+  });
+}
+
+/**
+ * Turn a chat into a project: creates the project, moves the chat into it, and
+ * transfers the chat's files. The chat now carries a project tag, so the
+ * conversations list is invalidated alongside the projects list.
+ */
+export function useCreateProjectFromConversation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      body: NonNullable<
+        archestraApiTypes.CreateProjectFromConversationData["body"]
+      >,
+    ) => {
+      const { data, error } = await createProjectFromConversation({ body });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (project) => {
+      if (!project) return;
+      toast.success(`Project "${project.name}" created from this chat`);
+      queryClient.invalidateQueries({ queryKey: ["projects", "list"] });
+      queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    },
+  });
+}
+
+export function useUpdateProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      params: { id: string } & NonNullable<
+        archestraApiTypes.UpdateProjectData["body"]
+      >,
+    ) => {
+      const { id, ...body } = params;
+      const { error } = await updateProject({ path: { id }, body });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return true;
+    },
+    onSuccess: (ok, { id }) => {
+      if (!ok) return;
+      queryClient.invalidateQueries({ queryKey: ["projects", "list"] });
+      queryClient.invalidateQueries({ queryKey: ["projects", id] });
+    },
+  });
+}
+
+/** Pin/unpin a project for the current user (personal — toggle by `pinned`). */
+export function usePinProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, pinned }: { id: string; pinned: boolean }) => {
+      const { error } = pinned
+        ? await pinProject({ path: { id } })
+        : await unpinProject({ path: { id } });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return true;
+    },
+    onSuccess: (ok, { id }) => {
+      if (!ok) return;
+      queryClient.invalidateQueries({ queryKey: ["projects", "list"] });
+      queryClient.invalidateQueries({ queryKey: ["projects", id] });
+    },
+  });
+}
+
+/** Deletes a selection of projects in one request, reporting per-project outcomes. */
+export function useBulkDeleteProjects() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (projects: readonly { id: string; name: string }[]) =>
+      bulkDeleteProjects({
+        body: { ids: projects.map((project) => project.id) },
+      }).then(({ data, error }) => {
+        throwOnApiError(error, { toastOnError: false });
+        return toBulkOutcome(data ?? { succeeded: [], failed: [] });
+      }),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["projects"] }),
+  });
+}
+
+export function useDeleteProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id }: { id: string }) => {
+      const { error } = await deleteProject({ path: { id } });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return true;
+    },
+    onSuccess: (ok, { id }) => {
+      if (!ok) return;
+      toast.success(
+        "Project deleted — its chats were kept as ordinary conversations.",
+      );
+      // Refresh only the project LIST queries (`["projects", "list", …]`). This
+      // can't prefix-match the deleted project's own detail/conversations/files
+      // queries (`["projects", id, …]`), which are still mounted for the instant
+      // before we navigate away and would 404 on the now-gone id.
+      queryClient.invalidateQueries({ queryKey: ["projects", "list"] });
+      // The project's scheduled tasks are retained but hidden (paused) with it,
+      // so drop them from any open scheduled-tasks list. Chats detach rather
+      // than hide, so the conversations list needs no invalidation here.
+      queryClient.invalidateQueries({
+        queryKey: scheduleTriggerKeys.all,
+        // The confirmation dialog still observes this project's schedule count
+        // until the mutation resolves. Refetching it now would return a 404.
+        predicate: (query) => {
+          const filters = query.queryKey[2];
+          return (
+            typeof filters !== "object" ||
+            filters === null ||
+            !("projectId" in filters) ||
+            filters.projectId !== id
+          );
+        },
+      });
+    },
+  });
+}
+
+/** Restore a soft-deleted project from the trash view (project admins). */
+export function useRestoreProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id }: { id: string }) => {
+      const { data, error } = await restoreProject({
+        path: { id },
+        body: null,
+      });
+      if (error) {
+        // The only 409 this route answers is the name collision: deleting
+        // frees the display name, so the owner may hold an active project
+        // under it by now. The API's own message ends by telling the caller to
+        // pass `name` — an instruction with no UI behind it until restore
+        // grows a rename field, so the remedy that does exist is named here
+        // instead. Everything else keeps the server's wording.
+        if (getApiErrorType(error) === "api_conflict_error") {
+          toast.error(
+            "Its owner already has an active project under this name. " +
+              "Rename that project, then restore this one.",
+            { duration: 12000 },
+          );
+          return null;
+        }
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (project) => {
+      if (!project) return;
+      toast.success(`Project "${project.name}" restored`);
+      queryClient.invalidateQueries({ queryKey: ["projects", "list"] });
+      // Its scheduled tasks were retained-but-paused, and resume with it.
+      queryClient.invalidateQueries({ queryKey: scheduleTriggerKeys.all });
+    },
+  });
+}
+
+/**
+ * Permanently destroy a soft-deleted project: its files (records and stored
+ * bytes), pins, share configuration, and scheduled tasks. Its chats detached
+ * at soft-delete time and survive as ordinary conversations.
+ */
+export function usePermanentlyDeleteProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id }: { id: string }) => {
+      const { error } = await permanentlyDeleteProject({ path: { id } });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return true;
+    },
+    onSuccess: (ok, { id }) => {
+      if (!ok) return;
+      toast.success("Project permanently deleted");
+      queryClient.invalidateQueries({ queryKey: ["projects", "list"] });
+      // Drop the detail/conversations/files queries for an id that no longer
+      // resolves, rather than letting them refetch into a 404.
+      queryClient.removeQueries({ queryKey: ["projects", id] });
+      queryClient.invalidateQueries({ queryKey: scheduleTriggerKeys.all });
+    },
+  });
+}
+
+/**
+ * Delete one or more project files (persisted skill-sandbox artifacts). Runs the
+ * deletes concurrently and reports a single summary toast and the ids that
+ * failed. Deleting a project file removes it project-wide, so it also refreshes
+ * any chat Files panels (`["conversation-files", …]`) that list project files.
+ */
+export function useDeleteProjectFiles(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (items: Array<{ id: string }>) => {
+      const results = await Promise.allSettled(
+        items.map((item) =>
+          deleteSkillSandboxArtifact({ path: { artifactId: item.id } }),
+        ),
+      );
+      const failedIds = items
+        .filter((_, i) => {
+          const r = results[i];
+          return r.status === "rejected" || r.value.error != null;
+        })
+        .map((item) => item.id);
+      return { total: items.length, failedIds };
+    },
+    onSuccess: ({ total, failedIds }) => {
+      const deleted = total - failedIds.length;
+      if (failedIds.length === 0) {
+        toast.success(total === 1 ? "File deleted" : `Deleted ${total} files`);
+      } else {
+        toast.error(
+          `Deleted ${deleted} of ${total}; ${failedIds.length} failed`,
+        );
+      }
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({
+        queryKey: ["projects", projectId, "files"],
+      });
+      queryClient.invalidateQueries({ queryKey: ["conversation-files"] });
+    },
+  });
+}
+
+/**
+ * Upload dropped files into the project, one request per file, sequentially —
+ * so a multi-file drop never aggregates into one oversized body and one file's
+ * failure (oversize, server error) never aborts the rest. Over-limit / empty
+ * files are caught client-side before any request. A new project file is visible
+ * to every chat in the project, so it also refreshes chat Files panels
+ * (`["conversation-files", …]`).
+ */
+export function useUploadProjectFiles(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (files: File[]): Promise<UploadOutcome[]> => {
+      const results: UploadOutcome[] = [];
+      for (const file of files) {
+        const validation = validateUploadFile(file, MAX_PROJECT_UPLOAD_BYTES);
+        if (!validation.ok) {
+          results.push({
+            name: file.name,
+            ok: false,
+            reason: validation.reason,
+          });
+          continue;
+        }
+        try {
+          const dataBase64 = await readFileAsBase64(file);
+          const { error } = await uploadProjectFiles({
+            path: { id: projectId },
+            body: { name: file.name, mimeType: file.type, dataBase64 },
+          });
+          results.push({
+            name: file.name,
+            ok: error == null,
+            reason: error == null ? undefined : "server",
+            serverMessage:
+              error == null ? undefined : getApiErrorMessage(error),
+          });
+        } catch (error) {
+          results.push({
+            name: file.name,
+            ok: false,
+            reason: "server",
+            serverMessage: getApiErrorMessage(error),
+          });
+        }
+      }
+      return results;
+    },
+    onSuccess: (results) => {
+      for (const { type, message } of summarizeUploadResults(
+        results,
+        MAX_PROJECT_UPLOAD_MB,
+      )) {
+        if (type === "success") toast.success(message);
+        else toast.error(message);
+      }
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({
+        queryKey: ["projects", projectId, "files"],
+      });
+      queryClient.invalidateQueries({ queryKey: ["conversation-files"] });
+    },
+  });
+}
+
+// ===== Internal =====
+
+/** Filters with every absent one as `null`, so equal filters share a query key. */
+function normalizeProjectFilters(filters: ProjectListFilters) {
+  return {
+    scope: filters.scope ?? null,
+    search: filters.search?.trim() || null,
+    teamIds: filters.teamIds ?? null,
+    authorIds: filters.authorIds ?? null,
+    excludeAuthorIds: filters.excludeAuthorIds ?? null,
+    access: filters.access ?? null,
+    sharedWith: filters.sharedWith ?? null,
+    owner: filters.owner ?? null,
+    status: filters.status ?? null,
+    labels: filters.labels ?? null,
+    pinned: filters.pinned ?? null,
+  };
+}
+
+function withoutNulls(
+  query: ReturnType<typeof normalizeProjectFilters>,
+): ProjectListFilters {
+  return Object.fromEntries(
+    Object.entries(query).filter(([, value]) => value !== null),
+  ) as ProjectListFilters;
+}

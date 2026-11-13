@@ -1,0 +1,232 @@
+import { randomUUID } from "node:crypto";
+import { and, desc, eq, isNotNull, isNull, sql } from "drizzle-orm";
+import db, { schema } from "@/database";
+import { lockGuardrailsPolicy } from "@/models/guardrails-policy";
+import type { AppaGithubSource } from "@/types/openappa-github-sync";
+
+const table = schema.openappaGithubSyncTable;
+
+class OpenAppaGithubSyncModel {
+  static async find(organizationId: string) {
+    const [row] = await db
+      .select()
+      .from(table)
+      .where(eq(table.organizationId, organizationId));
+    return row ?? null;
+  }
+  static async save(
+    organizationId: string,
+    source: Omit<
+      AppaGithubSource,
+      "gitlabTokenId" | "selfService" | "selfServiceDirectory"
+    > & {
+      gitlabTokenId?: string | null;
+      /** Off unless the source says otherwise. */
+      selfService?: boolean;
+      /** The servers' folder; mcp unless the source says otherwise. */
+      selfServiceDirectory?: string;
+      setupPullRequestNumber?: number;
+    },
+  ) {
+    const {
+      validationDirectory,
+      setupPullRequestNumber = null,
+      gitlabTokenId = null,
+      selfService = false,
+      selfServiceDirectory = "mcp",
+      ...policySource
+    } = source;
+    const values = {
+      setupPullRequestNumber,
+      gitlabTokenId,
+      selfService,
+      selfServiceDirectory,
+      ...policySource,
+      revision: randomUUID(),
+      sourceCommit: null,
+      lastSyncedAt: null,
+      lastSyncError: null,
+    };
+    await db.transaction(async (tx) => {
+      await lockGuardrailsPolicy(tx, organizationId);
+      const [suite] = await tx
+        .select()
+        .from(schema.openappaPolicyTestSuitesTable)
+        .where(
+          eq(
+            schema.openappaPolicyTestSuitesTable.organizationId,
+            organizationId,
+          ),
+        );
+      const directory = validationDirectory ?? suite?.directory ?? "traces";
+      await tx
+        .delete(schema.openappaPolicyTestSuitesTable)
+        .where(
+          eq(
+            schema.openappaPolicyTestSuitesTable.organizationId,
+            organizationId,
+          ),
+        );
+      await tx
+        .insert(schema.openappaPolicyTestSuitesTable)
+        .values({ organizationId, directory });
+      await tx
+        .insert(table)
+        .values({ organizationId, ...values })
+        .onConflictDoUpdate({ target: table.organizationId, set: values });
+    });
+  }
+  /** Turn self-service on or off for the source, and name its folder. */
+  static async setSelfService(
+    organizationId: string,
+    selfService: boolean,
+    selfServiceDirectory?: string,
+  ) {
+    await db
+      .update(table)
+      .set({
+        selfService,
+        ...(selfServiceDirectory ? { selfServiceDirectory } : {}),
+      })
+      .where(eq(table.organizationId, organizationId));
+  }
+  /** Change or stop the schedule. */
+  static async setInterval(
+    organizationId: string,
+    interval: AppaGithubSource["interval"] | null,
+  ) {
+    await db.transaction(async (tx) => {
+      await lockGuardrailsPolicy(tx, organizationId);
+      await tx
+        .update(table)
+        .set({ interval, revision: randomUUID() })
+        .where(
+          and(
+            eq(table.organizationId, organizationId),
+            sql`${table.interval} is distinct from ${interval}`,
+          ),
+        );
+    });
+  }
+  /**
+   * Record a pull's outcome, answering whether it was still the pull this row
+   * expected: a download that raced a source edit or a disconnect records
+   * nothing, and its caller must not act as though it had.
+   */
+  static async finish(params: {
+    organizationId: string;
+    revision: string;
+    outcome:
+      | { error: string | null }
+      | { content: string; contentHash: string; sourceCommit: string };
+  }): Promise<boolean> {
+    const { organizationId, revision, outcome } = params;
+    return db.transaction(async (tx) => {
+      await lockGuardrailsPolicy(tx, organizationId);
+      const [source] = await tx
+        .update(table)
+        .set({
+          ...("error" in outcome
+            ? { lastSyncError: outcome.error }
+            : {
+                setupPullRequestNumber: null,
+                content: outcome.content,
+                sourceCommit: outcome.sourceCommit,
+                lastSyncError: null,
+              }),
+          lastSyncedAt: new Date(),
+          // A writer that read this revision has had its turn; whatever else
+          // read it is answering for a row that no longer exists.
+          revision: randomUUID(),
+        })
+        .where(
+          and(
+            eq(table.organizationId, organizationId),
+            eq(table.revision, revision),
+            isNotNull(table.interval),
+          ),
+        )
+        .returning();
+      // A download racing a source edit or disconnect must not publish a policy revision.
+      if (!source) return false;
+      if ("error" in outcome) return true;
+      const policies = schema.guardrailsPolicyRevisionsTable;
+      const [current] = await tx
+        .select()
+        .from(policies)
+        .where(eq(policies.organizationId, organizationId))
+        .orderBy(desc(policies.revision))
+        .limit(1);
+      if (current?.contentHash === outcome.contentHash) return true;
+      await tx.insert(policies).values({
+        organizationId,
+        revision: (current?.revision ?? 0) + 1,
+        content: outcome.content,
+        contentHash: outcome.contentHash,
+        updatedBy: null,
+      });
+      return true;
+    });
+  }
+
+  // The interval paces policy downloads. A pending setup pull request is
+  // checked every minute instead: an operator is waiting on that merge, and
+  // the check reads one pull request rather than the policy.
+  static async findDue() {
+    return db
+      .select()
+      .from(table)
+      .where(
+        and(
+          isNotNull(table.interval),
+          sql`(${table.lastSyncedAt} IS NULL OR ${table.lastSyncedAt} <= NOW() - CASE WHEN ${table.setupPullRequestNumber} IS NOT NULL THEN INTERVAL '1 minute' WHEN ${table.interval} = '15m' THEN INTERVAL '15 minutes' WHEN ${table.interval} = '1h' THEN INTERVAL '1 hour' ELSE INTERVAL '1 day' END)`,
+        ),
+      );
+  }
+  /** Every source a pull has accepted a commit from: those with pull requests to check. */
+  static async findConnected() {
+    return db
+      .select()
+      .from(table)
+      .where(
+        and(
+          isNotNull(table.interval),
+          isNotNull(table.repo),
+          isNotNull(table.sourceCommit),
+        ),
+      );
+  }
+  /** Sources whose setup pull request has not merged: no commit accepted yet. */
+  static async findAwaitingSetup() {
+    return db
+      .select()
+      .from(table)
+      .where(
+        and(
+          isNotNull(table.interval),
+          isNotNull(table.repo),
+          isNotNull(table.setupPullRequestNumber),
+          isNull(table.sourceCommit),
+        ),
+      );
+  }
+  static async enqueue(organizationId: string) {
+    // The partial unique index also deduplicates simultaneous requests on different replicas.
+    await db
+      .insert(schema.tasksTable)
+      .values({
+        taskType: "openappa_github_sync",
+        payload: { organizationId },
+        maxAttempts: 1,
+      })
+      .onConflictDoNothing();
+  }
+  static async findByIdForAudit(id: string, organizationId: string) {
+    if (id !== organizationId) return null;
+    const row = await OpenAppaGithubSyncModel.find(organizationId);
+    if (!row) return null;
+    const { content, ...metadata } = row;
+    return { ...metadata, hasPolicy: content !== null };
+  }
+}
+export default OpenAppaGithubSyncModel;

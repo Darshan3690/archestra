@@ -1,0 +1,678 @@
+import { randomUUID } from "node:crypto";
+import { gzipSync } from "node:zlib";
+import { ADMIN_ROLE_NAME, RouteId } from "@archestra/shared";
+import { requiredEndpointPermissionsMap } from "@archestra/shared/access-control";
+import { eq } from "drizzle-orm";
+import { vi } from "vitest";
+import { executeArchestraTool } from "@/archestra-mcp-server";
+import { hasPermission } from "@/auth";
+import config from "@/config";
+// biome-ignore lint/style/noRestrictedImports: dual-licensed; turns at-rest content encryption on
+import { _resetContentKeys } from "@/content-encryption/index.ee";
+import db, { schema } from "@/database";
+import {
+  createFastifyInstance,
+  type FastifyInstanceWithZod,
+} from "@/fastify-instance";
+import { registerAuditLogHook } from "@/middleware/audit-log-hook";
+import ConversationModel from "@/models/conversation";
+import McpToolCallModel from "@/models/mcp-tool-call";
+import OpenAppaYellModel from "@/models/openappa-yell";
+import { stampToolCallId } from "@/openappa/trajectory-stamp";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import { ApiError, type User } from "@/types";
+import routes from "./openappa-yells.routes";
+
+describe("OpenAPPA yells", () => {
+  let app: FastifyInstanceWithZod;
+  let organizationId: string;
+  let user: User;
+  let originalEnabled: boolean;
+  beforeEach(async ({ makeOrganization, makeUser, makeMember }) => {
+    originalEnabled = config.openappa.enabled;
+    config.openappa.enabled = true;
+    organizationId = (await makeOrganization()).id;
+    user = await makeUser();
+    await makeMember(user.id, organizationId, { role: ADMIN_ROLE_NAME });
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      Object.assign(request, { user, organizationId });
+    });
+    app.addHook("preHandler", async (request) => {
+      const operation =
+        request.method === "PATCH"
+          ? RouteId.UpdateOpenAppaYell
+          : RouteId.GetOpenAppaYells;
+      const required = requiredEndpointPermissionsMap[operation];
+      if (!required) throw new ApiError(403, "Unknown route");
+      const { success } = await hasPermission(
+        required,
+        request.headers,
+        undefined,
+        { userId: user.id, organizationId },
+      );
+      if (!success) throw new ApiError(403, "Forbidden");
+    });
+    registerAuditLogHook(app);
+    await app.register(routes);
+  });
+  afterEach(async () => {
+    config.openappa.enabled = originalEnabled;
+    await app.close();
+  });
+  const record = (
+    message: string,
+    overrides: {
+      organizationId?: string;
+      callerId?: string;
+      superyell?: boolean;
+    } = {},
+  ) =>
+    OpenAppaYellModel.record({
+      organizationId,
+      callerId: `user:${user.id}`,
+      sessionId: randomUUID(),
+      toolCallId: randomUUID(),
+      message,
+      withTrajectory: false,
+      ...overrides,
+    });
+
+  test("downloads identical gzip bytes and keeps archives out of metadata", async () => {
+    const yell = await record("Diagnostic report");
+    const archive = gzipSync(JSON.stringify({ message: "A tool was blocked" }));
+    expect(
+      (await app.inject({ url: `/api/openappa/yells/${yell.id}/archive` }))
+        .statusCode,
+    ).toBe(404);
+    await OpenAppaYellModel.storeArchive({
+      id: yell.id,
+      organizationId,
+      archive,
+    });
+    const result = await app.inject({
+      url: `/api/openappa/yells/${yell.id}/archive`,
+    });
+    expect(result.statusCode).toBe(200);
+    expect(result.rawPayload).toEqual(archive);
+    expect(result.headers["content-type"]).toBe("application/gzip");
+    expect(result.headers["content-disposition"]).toContain(
+      `openappa-yell-${yell.id}.json.gz`,
+    );
+    const metadata = (
+      await app.inject({ url: `/api/openappa/yells/${yell.id}` })
+    ).json();
+    expect(metadata.hasArchive).toBe(true);
+    expect(metadata).not.toHaveProperty("archive");
+    expect(
+      (await app.inject({ url: "/api/openappa/yells" })).json().data[0],
+    ).not.toHaveProperty("archive");
+  });
+
+  test("flags superyells and counts the unresolved ones", async () => {
+    const superyell = await record("Turn it off", { superyell: true });
+    await record("Confusing block");
+    const resolved = await record("Resolved one", { superyell: true });
+    await OpenAppaYellModel.setResolved({
+      id: resolved.id,
+      organizationId,
+      userId: user.id,
+      resolved: true,
+    });
+    const list = (await app.inject({ url: "/api/openappa/yells" })).json();
+    expect(
+      list.data.find((row: { id: string }) => row.id === superyell.id),
+    ).toMatchObject({ superyell: true });
+    expect(
+      (await app.inject({ url: "/api/openappa/yells/summary" })).json(),
+    ).toEqual({ unresolved: 2, superyells: 1 });
+  });
+
+  test("lists a session's yells with their place in its trace", async ({
+    makeAgent,
+    makeInteraction,
+  }) => {
+    const agent = await makeAgent({ organizationId });
+    await makeInteraction(agent.id, { sessionId: "chat-1" });
+    const yellCall = (llmToolCallId: string) =>
+      McpToolCallModel.create({
+        agentId: agent.id,
+        mcpServerName: "archestra",
+        method: "tools/call",
+        toolCall: { id: llmToolCallId, name: "archestra__yell", arguments: {} },
+        toolResult: null,
+        sessionId: "chat-1",
+        llmToolCallId,
+      });
+    const first = await yellCall("toolu_1");
+    const second = await yellCall("toolu_2");
+    const inSession = (toolCallId: string, superyell = false) =>
+      OpenAppaYellModel.record({
+        organizationId,
+        callerId: `user:${user.id}`,
+        sessionId: `user:${user.id}|chat-1`,
+        toolCallId,
+        message: toolCallId,
+        withTrajectory: false,
+        superyell,
+      });
+    const yell = await inSession("toolu_1");
+    const superyell = await inSession("toolu_2", true);
+    const unlogged = await record("From a session with no logged requests");
+
+    const list = (
+      await app.inject({
+        url: "/api/openappa/yells?status=all&llmSessionId=chat-1",
+      })
+    ).json();
+
+    expect(
+      Object.fromEntries(
+        list.data.map((row: { id: string; trace: unknown }) => [
+          row.id,
+          row.trace,
+        ]),
+      ),
+    ).toEqual({
+      [yell.id]: { llmSessionId: "chat-1", mcpToolCallId: first.id },
+      [superyell.id]: { llmSessionId: "chat-1", mcpToolCallId: second.id },
+    });
+    const all = (
+      await app.inject({ url: "/api/openappa/yells?status=all" })
+    ).json();
+    expect(
+      all.data.find((row: { id: string }) => row.id === unlogged.id),
+    ).toMatchObject({ trace: null });
+  });
+
+  test("links a yell to its call when logged content is encrypted at rest", async ({
+    makeAgent,
+    makeInteraction,
+  }) => {
+    config.contentEncryption.secret = "yell-trace-link-secret-0123456789";
+    _resetContentKeys();
+    try {
+      const agent = await makeAgent({ organizationId });
+      await makeInteraction(agent.id, { sessionId: "run-1" });
+      // Gateway clients send the model's id back with its trajectory stamp.
+      const stamped = stampToolCallId({
+        callId: "toolu_1",
+        sessionId: "run-1",
+        organizationId,
+        callerId: `user:${user.id}`,
+        secret: "stamp-secret",
+      });
+      const call = await McpToolCallModel.create({
+        agentId: agent.id,
+        mcpServerName: "archestra",
+        method: "tools/call",
+        toolCall: { id: "archestra-1", name: "archestra__yell", arguments: {} },
+        toolResult: null,
+        sessionId: "run-1",
+        llmToolCallId: stamped,
+      });
+      const yell = await OpenAppaYellModel.record({
+        organizationId,
+        callerId: `user:${user.id}`,
+        sessionId: `user:${user.id}|run-1`,
+        toolCallId: "toolu_1",
+        message: "Blocked",
+        withTrajectory: false,
+        superyell: false,
+      });
+
+      const body = (
+        await app.inject({ url: `/api/openappa/yells/${yell.id}` })
+      ).json();
+
+      expect(body.trace).toEqual({
+        llmSessionId: "run-1",
+        mcpToolCallId: call.id,
+      });
+    } finally {
+      config.contentEncryption.secret = undefined;
+      _resetContentKeys();
+    }
+  });
+
+  test("lists and counts only the active organization's reports and paginates search", async ({
+    makeOrganization,
+  }) => {
+    const first = await record("Mailbox block");
+    const second = await record("Mailbox remedy");
+    await record("Other issue");
+    await record("Mailbox private", {
+      organizationId: (await makeOrganization()).id,
+    });
+    const response = await app.inject({
+      url: "/api/openappa/yells?search=Mailbox&limit=1",
+    });
+    expect(response.statusCode).toBe(200);
+    const page = response.json();
+    expect(page.data).toHaveLength(1);
+    expect(page.pagination.hasNext).toBe(true);
+    const next = await app.inject({
+      url: `/api/openappa/yells?search=Mailbox&limit=1&cursor=${encodeURIComponent(page.pagination.nextCursor)}`,
+    });
+    expect([page.data[0].id, next.json().data[0].id].sort()).toEqual(
+      [first.id, second.id].sort(),
+    );
+    expect(next.json().pagination.hasNext).toBe(false);
+    expect(
+      (await app.inject({ url: "/api/openappa/yells/summary" })).json(),
+    ).toEqual({ unresolved: 3, superyells: 0 });
+  });
+
+  test("resolves and reopens reports with a non-secret audit diff", async () => {
+    const yell = await record("Confidential report text", {
+      callerId: "user:another-reporter",
+    });
+    const response = await app.inject({
+      method: "PATCH",
+      url: `/api/openappa/yells/${yell.id}`,
+      payload: { resolved: true },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      resolvedBy: user.id,
+      resolvedAt: expect.any(String),
+    });
+    expect(
+      (await app.inject({ url: "/api/openappa/yells/summary" })).json(),
+    ).toEqual({ unresolved: 0, superyells: 0 });
+    expect(
+      (await app.inject({ url: "/api/openappa/yells?status=resolved" })).json()
+        .data,
+    ).toHaveLength(1);
+    await vi.waitFor(async () => {
+      const rows = await db
+        .select()
+        .from(schema.auditLogsTable)
+        .where(eq(schema.auditLogsTable.resourceId, yell.id));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        action: "openappaYell.updated",
+        before: { resolvedAt: null, resolvedBy: null },
+        after: { resolvedAt: expect.any(String), resolvedBy: user.id },
+      });
+      expect(JSON.stringify(rows)).not.toContain(yell.message);
+    });
+    const reopened = await app.inject({
+      method: "PATCH",
+      url: `/api/openappa/yells/${yell.id}`,
+      payload: { resolved: false },
+    });
+    expect(reopened.json()).toMatchObject({
+      resolvedAt: null,
+      resolvedBy: null,
+    });
+    expect(
+      (await app.inject({ url: "/api/openappa/yells/summary" })).json(),
+    ).toEqual({ unresolved: 1, superyells: 0 });
+  });
+
+  test("a log reader can read and resolve all organization reports", async ({
+    makeUser,
+    makeMember,
+    makeCustomRole,
+    makeAgent,
+  }) => {
+    const role = await makeCustomRole(organizationId, {
+      permission: { log: ["read"] },
+    });
+    const reporter = user;
+    const other = await record("Shared report");
+    await OpenAppaYellModel.storeArchive({
+      id: other.id,
+      organizationId,
+      archive: gzipSync("private"),
+    });
+    user = await makeUser();
+    await makeMember(user.id, organizationId, { role: role.role });
+    const own = await record("Own report");
+    expect(
+      (await app.inject({ url: `/api/openappa/yells/${other.id}/archive` }))
+        .statusCode,
+    ).toBe(200);
+    const list = await app.inject({ url: "/api/openappa/yells" });
+    expect(list.statusCode).toBe(200);
+    expect(list.json().data).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: own.id,
+          caller: { id: user.id, name: user.name, email: user.email },
+        }),
+        expect.objectContaining({
+          id: other.id,
+          caller: {
+            id: reporter.id,
+            name: reporter.name,
+            email: reporter.email,
+          },
+        }),
+      ]),
+    );
+    expect(list.json().data).toHaveLength(2);
+    expect(
+      (await app.inject({ url: "/api/openappa/yells/summary" })).json(),
+    ).toEqual({ unresolved: 2, superyells: 0 });
+    const agent = await makeAgent({ organizationId, accessAllTools: true });
+    const context = {
+      agent,
+      agentId: agent.id,
+      organizationId,
+      userId: user.id,
+    };
+    const toolResult = await executeArchestraTool(
+      "archestra__get_openappa_yell",
+      { id: own.id },
+      context,
+    );
+    expect(JSON.stringify(toolResult.content)).toContain(own.message);
+    const sharedToolResult = await executeArchestraTool(
+      "archestra__get_openappa_yell",
+      { id: other.id },
+      context,
+    );
+    expect(JSON.stringify(sharedToolResult.content)).toContain(other.message);
+    expect(JSON.stringify(sharedToolResult.content)).toContain(reporter.name);
+    expect(
+      (await app.inject({ url: `/api/openappa/yells/${other.id}` })).statusCode,
+    ).toBe(200);
+    const resolved = await app.inject({
+      method: "PATCH",
+      url: `/api/openappa/yells/${other.id}`,
+      payload: { resolved: true },
+    });
+    expect(resolved.statusCode, resolved.body).toBe(200);
+    expect(resolved.json().resolvedBy).toBe(user.id);
+  });
+
+  test("links a yell to the first chat that reads it and shows it only to that chat's owner", async ({
+    makeAgent,
+    makeConversation,
+    makeOrganization,
+  }) => {
+    const yell = await record("Investigated report");
+    const untouched = await record("Unread report");
+    const colleaguesYell = await record("Colleague's report");
+    const deletedYell = await record("Report with a deleted chat");
+    const agent = await makeAgent({ organizationId, accessAllTools: true });
+    const chat = (title: string, overrides = {}) =>
+      makeConversation(agent.id, {
+        userId: user.id,
+        organizationId,
+        title,
+        ...overrides,
+      });
+    const first = await chat("First investigation");
+    const second = await chat("Second investigation");
+    const deleted = await chat("Deleted investigation");
+    const colleagues = await chat("Colleague's investigation", {
+      userId: "another-user",
+    });
+    const foreign = await chat("Other organization", {
+      organizationId: (await makeOrganization()).id,
+    });
+    const read = async (id: string, conversationId?: string) => {
+      const result = await executeArchestraTool(
+        "archestra__get_openappa_yell",
+        { id },
+        {
+          agent,
+          agentId: agent.id,
+          organizationId,
+          userId: user.id,
+          conversationId,
+        },
+      );
+      expect(result.isError, JSON.stringify(result.content)).toBeFalsy();
+    };
+    const linkedChat = async (id: string) =>
+      (
+        await db
+          .select({ conversationId: schema.openappaYellsTable.conversationId })
+          .from(schema.openappaYellsTable)
+          .where(eq(schema.openappaYellsTable.id, id))
+      )[0]?.conversationId;
+
+    await read(yell.id);
+    await read(yell.id, randomUUID());
+    await read(yell.id, foreign.id);
+    expect(await linkedChat(yell.id)).toBeNull();
+    await read(yell.id, first.id);
+    await read(yell.id, second.id);
+    expect(await linkedChat(yell.id)).toBe(first.id);
+
+    await read(colleaguesYell.id, colleagues.id);
+    await read(deletedYell.id, deleted.id);
+    await ConversationModel.delete(deleted.id, user.id, organizationId);
+    expect(await linkedChat(colleaguesYell.id)).toBe(colleagues.id);
+    expect(await linkedChat(deletedYell.id)).toBe(deleted.id);
+
+    const detail = (
+      await app.inject({ url: `/api/openappa/yells/${yell.id}` })
+    ).json();
+    expect(detail.conversation).toEqual({
+      id: first.id,
+      title: "First investigation",
+      createdAt: expect.any(String),
+    });
+    expect(detail).not.toHaveProperty("conversationId");
+    for (const hidden of [colleaguesYell, deletedYell])
+      expect(
+        (await app.inject({ url: `/api/openappa/yells/${hidden.id}` })).json()
+          .conversation,
+      ).toBeNull();
+
+    const list = (await app.inject({ url: "/api/openappa/yells" })).json().data;
+    const conversationOf = (id: string) =>
+      list.find((row: { id: string }) => row.id === id).conversation;
+    expect(conversationOf(yell.id)).toEqual(detail.conversation);
+    expect(conversationOf(untouched.id)).toBeNull();
+    expect(conversationOf(colleaguesYell.id)).toBeNull();
+    expect(conversationOf(deletedYell.id)).toBeNull();
+  });
+
+  test("resolves and reopens a yell from chat with an audit record", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+    makeCustomRole,
+  }) => {
+    const yell = await record("Report fixed in chat");
+    const agent = await makeAgent({ organizationId, accessAllTools: true });
+    const resolve = (args: Record<string, unknown>, userId = user.id) =>
+      executeArchestraTool("archestra__resolve_openappa_yell", args, {
+        agent,
+        agentId: agent.id,
+        organizationId,
+        userId,
+      });
+
+    const resolved = await resolve({ id: yell.id });
+    expect(resolved.isError, JSON.stringify(resolved.content)).toBeFalsy();
+    expect(JSON.stringify(resolved.content)).toContain(yell.message);
+    expect(
+      await OpenAppaYellModel.find({ id: yell.id, organizationId }),
+    ).toMatchObject({
+      id: yell.id,
+      resolvedBy: user.id,
+    });
+    expect(
+      (await app.inject({ url: "/api/openappa/yells/summary" })).json(),
+    ).toEqual({ unresolved: 0, superyells: 0 });
+    await vi.waitFor(async () => {
+      const rows = await db
+        .select()
+        .from(schema.auditLogsTable)
+        .where(eq(schema.auditLogsTable.resourceId, yell.id));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        action: "openappaYell.updated",
+        resourceType: "openappaYell",
+        before: { resolvedAt: null, resolvedBy: null },
+        after: { resolvedAt: expect.any(String), resolvedBy: user.id },
+      });
+      expect(JSON.stringify(rows)).not.toContain(yell.message);
+    });
+
+    await resolve({ id: yell.id, resolved: false });
+    expect(
+      await OpenAppaYellModel.find({ id: yell.id, organizationId }),
+    ).toMatchObject({
+      resolvedAt: null,
+      resolvedBy: null,
+    });
+    expect(
+      (await app.inject({ url: "/api/openappa/yells/summary" })).json(),
+    ).toEqual({ unresolved: 1, superyells: 0 });
+
+    const role = await makeCustomRole(organizationId, {
+      permission: { guardrailsPolicy: ["read", "update"] },
+    });
+    const policyEditor = await makeUser();
+    await makeMember(policyEditor.id, organizationId, { role: role.role });
+    expect((await resolve({ id: yell.id }, policyEditor.id)).isError).toBe(
+      true,
+    );
+    expect(
+      (await app.inject({ url: "/api/openappa/yells/summary" })).json(),
+    ).toEqual({ unresolved: 1, superyells: 0 });
+  });
+
+  test("keeps reports with missing users and non-user callers visible", async () => {
+    const missing = await record("Former user's report", {
+      callerId: "user:deleted",
+    });
+    const system = await record("System report", {
+      callerId: "system:gateway",
+    });
+    const list = (await app.inject({ url: "/api/openappa/yells" })).json();
+    expect(list.data).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: missing.id, caller: null }),
+        expect.objectContaining({ id: system.id, caller: null }),
+      ]),
+    );
+  });
+
+  test("names the app that sent a yell, within the report organization", async ({
+    makeApp,
+    makeOrganization,
+  }) => {
+    const reporter = await makeApp({ organizationId, name: "Release notes" });
+    const foreignApp = await makeApp({
+      organizationId: (await makeOrganization()).id,
+      name: "Other release notes",
+    });
+    const yell = await record("App report", { callerId: `app:${reporter.id}` });
+    const foreign = await record("Unmatched app", {
+      callerId: `app:${foreignApp.id}`,
+    });
+    const list = (await app.inject({ url: "/api/openappa/yells" })).json();
+    expect(list.data).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: yell.id,
+          caller: null,
+          callerApp: { id: reporter.id, name: "Release notes" },
+        }),
+        expect.objectContaining({ id: foreign.id, callerApp: null }),
+      ]),
+    );
+  });
+
+  test("identifies service-account callers within the report organization", async ({
+    makeServiceAccount,
+    makeOrganization,
+  }) => {
+    const account = await makeServiceAccount(organizationId, {
+      name: "Report automation",
+    });
+    const otherAccount = await makeServiceAccount(
+      (await makeOrganization()).id,
+      { name: "Other automation" },
+    );
+    const yell = await record("Automated report", {
+      callerId: `user:service-account:${account.id}`,
+    });
+    const foreign = await record("Unmatched caller", {
+      callerId: `user:service-account:${otherAccount.id}`,
+    });
+    const list = (await app.inject({ url: "/api/openappa/yells" })).json();
+    expect(list.data).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: yell.id,
+          caller: {
+            id: `service-account:${account.id}`,
+            name: account.name,
+            email: null,
+            type: "service_account",
+          },
+        }),
+        expect.objectContaining({ id: foreign.id, caller: null }),
+      ]),
+    );
+    const detail = (
+      await app.inject({ url: `/api/openappa/yells/${yell.id}` })
+    ).json();
+    expect(detail.caller).toEqual({
+      id: `service-account:${account.id}`,
+      name: account.name,
+      email: null,
+      type: "service_account",
+    });
+  });
+
+  test("denies callers without log:read", async ({
+    makeUser,
+    makeMember,
+    makeCustomRole,
+  }) => {
+    const yell = await record("Shared report");
+    const role = await makeCustomRole(organizationId, {
+      permission: { guardrailsPolicy: ["read", "update"] },
+    });
+    user = await makeUser();
+    await makeMember(user.id, organizationId, { role: role.role });
+    for (const url of [
+      "/api/openappa/yells",
+      "/api/openappa/yells/summary",
+      `/api/openappa/yells/${yell.id}`,
+      `/api/openappa/yells/${yell.id}/archive`,
+    ]) {
+      expect((await app.inject({ url })).statusCode).toBe(403);
+    }
+  });
+
+  test("does not disclose or mutate another organization's report", async ({
+    makeOrganization,
+  }) => {
+    const yell = await record("Other organization", {
+      organizationId: (await makeOrganization()).id,
+    });
+    await OpenAppaYellModel.storeArchive({
+      id: yell.id,
+      organizationId: yell.organizationId,
+      archive: gzipSync("private"),
+    });
+    expect(
+      (await app.inject({ url: `/api/openappa/yells/${yell.id}/archive` }))
+        .statusCode,
+    ).toBe(404);
+    expect(
+      (await app.inject({ url: `/api/openappa/yells/${yell.id}` })).statusCode,
+    ).toBe(404);
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: `/api/openappa/yells/${yell.id}`,
+          payload: { resolved: true },
+        })
+      ).statusCode,
+    ).toBe(404);
+  });
+});

@@ -1,0 +1,1410 @@
+import type { PaginationQuery } from "@archestra/shared";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  getTableColumns,
+  ilike,
+  inArray,
+  isNotNull,
+  isNull,
+  lt,
+  notInArray,
+  or,
+  type SQL,
+  sql,
+} from "drizzle-orm";
+import { actorFromUserId } from "@/auth/service-account-user-id";
+import config from "@/config";
+import db, { schema } from "@/database";
+import { PreparedQuery } from "@/database/prepared-query";
+import { createPaginatedResult } from "@/database/utils/pagination";
+import { agentRunLlmSessionId } from "@/services/agent-runtime/runtime-contract";
+import type {
+  AgentRunFailure,
+  AgentRunListItem,
+  AgentRunRecord,
+  AgentRunSession,
+  AgentRuntimeTier,
+  InsertAgentRunRecord,
+} from "@/types";
+import { A2A_TERMINAL_TASK_STATES, type A2ATaskState } from "@/types/a2a-task";
+import type { AgentWorkspace } from "@/types/agent-workspace";
+import type { ChatOpsProviderType } from "@/types/chatops";
+import { escapeLikePattern } from "@/utils/sql-search";
+import A2AMessageModel from "./a2a/message";
+import AgentRunAttentionNoticeModel from "./agent-run-attention-notice";
+import ResourcePermissionPolicyModel from "./resource-permission-policy";
+
+/**
+ * The Agent run carrying one A2A task. Holds no lifecycle state of its own — the
+ * task's state machine is the record of how the work is going.
+ */
+class AgentRunModel {
+  /** Closed turns can retain an interactive process until workspace cleanup. */
+  static async listRetainedForCredentialRefresh(): Promise<AgentRunRecord[]> {
+    return db
+      .select(getTableColumns(schema.agentRunsTable))
+      .from(schema.agentRunsTable)
+      .innerJoin(
+        schema.agentWorkspacesTable,
+        eq(
+          schema.agentWorkspacesTable.lastTaskId,
+          schema.agentRunsTable.taskId,
+        ),
+      )
+      .where(
+        and(
+          isNotNull(schema.agentRunsTable.endedAt),
+          inArray(schema.agentWorkspacesTable.state, ["idle", "active"]),
+          sql`${schema.agentWorkspacesTable.expiresAt} > now()`,
+        ),
+      );
+  }
+
+  static async create(
+    run: InsertAgentRunRecord & {
+      id?: AgentRunRecord["id"];
+      replacePriorAttempt?: boolean;
+    },
+  ): Promise<AgentRunRecord> {
+    const { replacePriorAttempt, ...values } = run;
+    // A run is governed by its policy from the moment it exists: the actor's
+    // grant is what lets them open the share editor and share it.
+    return db.transaction(async (tx) => {
+      if (replacePriorAttempt) {
+        const existingRuns = await tx
+          .select({
+            id: schema.agentRunsTable.id,
+            workloadName: schema.agentRunsTable.workloadName,
+          })
+          .from(schema.agentRunsTable)
+          .where(eq(schema.agentRunsTable.taskId, values.taskId));
+        const workloadNames = existingRuns.map(
+          (existing) => existing.workloadName,
+        );
+        // Delete the previous attempt's agent_workspaces row in the same
+        // transaction that inserts the replacement agent_runs row, so the row
+        // is gone before startAgentRunSession inserts the next workspace with
+        // id: taskId (including after a post-launch failure in followAgentRun).
+        await tx
+          .delete(schema.agentWorkspacesTable)
+          .where(
+            or(
+              eq(schema.agentWorkspacesTable.id, values.taskId),
+              eq(schema.agentWorkspacesTable.activeTaskId, values.taskId),
+              eq(schema.agentWorkspacesTable.lastTaskId, values.taskId),
+              ...(workloadNames.length > 0
+                ? [
+                    inArray(
+                      schema.agentWorkspacesTable.workloadName,
+                      workloadNames,
+                    ),
+                  ]
+                : []),
+            ),
+          );
+        await tx
+          .delete(schema.agentRunsTable)
+          .where(eq(schema.agentRunsTable.taskId, values.taskId));
+        await tx
+          .delete(schema.resourcePermissionPoliciesTable)
+          .where(
+            and(
+              eq(schema.resourcePermissionPoliciesTable.resource, "agentRun"),
+              eq(schema.resourcePermissionPoliciesTable.scope, values.taskId),
+            ),
+          );
+      }
+      const [created] = await tx
+        .insert(schema.agentRunsTable)
+        .values(values)
+        .returning();
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      await ResourcePermissionPolicyModel.createInitial({
+        tx,
+        organizationId: created.organizationId,
+        resource: "agentRun",
+        scope: created.taskId,
+        authorId:
+          created.actorKind === "serviceAccount"
+            ? `service-account:${created.actorId}`
+            : created.actorUserId,
+        grants: [],
+      });
+      // SPDX-SnippetEnd
+      return created;
+    });
+  }
+
+  /**
+   * Records the LLM session that handed this run its work. The first writer
+   * wins: a retried launch replaces the row and records it again, and nothing
+   * later may re-point a run at another session.
+   */
+  static async setOriginLlmSessionId(params: {
+    taskId: string;
+    originLlmSessionId: string;
+  }): Promise<void> {
+    await db
+      .update(schema.agentRunsTable)
+      .set({ originLlmSessionId: params.originLlmSessionId })
+      .where(
+        and(
+          eq(schema.agentRunsTable.taskId, params.taskId),
+          isNull(schema.agentRunsTable.originLlmSessionId),
+        ),
+      );
+  }
+
+  /**
+   * Handoffs that touch an LLM session, oldest first. `handedTo`: the runs it
+   * handed work to (it is their origin). `handedFrom`: the run whose own
+   * session it is (it was handed work). `actorUserId` limits them to that
+   * user's own runs.
+   */
+  static async findHandoffsForLlmSession(params: {
+    organizationId: string;
+    llmSessionId: string;
+    side: "handedTo" | "handedFrom";
+    actorUserId?: string;
+    limit: number;
+  }): Promise<
+    {
+      runId: string;
+      originLlmSessionId: string;
+      llmSessionId: string;
+      agentName: string;
+      title: string;
+      startedAt: Date;
+    }[]
+  > {
+    const runs = schema.agentRunsTable;
+    const rows = await db
+      .select({
+        runId: runs.taskId,
+        originLlmSessionId: runs.originLlmSessionId,
+        workloadName: runs.workloadName,
+        agentName: schema.agentsTable.name,
+        title: runs.title,
+        startedAt: runs.startedAt,
+      })
+      .from(runs)
+      .innerJoin(schema.agentsTable, eq(runs.agentId, schema.agentsTable.id))
+      .where(
+        and(
+          eq(runs.organizationId, params.organizationId),
+          isNotNull(runs.originLlmSessionId),
+          params.side === "handedTo"
+            ? eq(runs.originLlmSessionId, params.llmSessionId)
+            : eq(runs.workloadName, params.llmSessionId),
+          ...(params.actorUserId
+            ? [eq(runs.actorUserId, params.actorUserId)]
+            : []),
+        ),
+      )
+      .orderBy(asc(runs.startedAt))
+      .limit(params.limit);
+    return rows.flatMap((row) =>
+      row.originLlmSessionId
+        ? [
+            {
+              runId: row.runId,
+              originLlmSessionId: row.originLlmSessionId,
+              llmSessionId: agentRunLlmSessionId(row),
+              agentName: row.agentName,
+              title: row.title,
+              startedAt: row.startedAt,
+            },
+          ]
+        : [],
+    );
+  }
+
+  static async findByTaskId(taskId: string): Promise<AgentRunRecord | null> {
+    const [run] = await db
+      .select()
+      .from(schema.agentRunsTable)
+      .where(eq(schema.agentRunsTable.taskId, taskId))
+      .limit(1);
+    return run ?? null;
+  }
+
+  /**
+   * Remove a failed attempt's run record, workspace row, and initial permission
+   * policy before the supervisor retries or fails over the same task.
+   */
+  static async deleteAttemptByTaskId(taskId: string): Promise<void> {
+    await db.transaction(async (tx) => {
+      const existingRuns = await tx
+        .select({
+          id: schema.agentRunsTable.id,
+          workloadName: schema.agentRunsTable.workloadName,
+        })
+        .from(schema.agentRunsTable)
+        .where(eq(schema.agentRunsTable.taskId, taskId));
+      const workloadNames = existingRuns.map((run) => run.workloadName);
+      await tx
+        .delete(schema.agentWorkspacesTable)
+        .where(
+          or(
+            eq(schema.agentWorkspacesTable.id, taskId),
+            eq(schema.agentWorkspacesTable.activeTaskId, taskId),
+            eq(schema.agentWorkspacesTable.lastTaskId, taskId),
+            ...(workloadNames.length > 0
+              ? [
+                  inArray(
+                    schema.agentWorkspacesTable.workloadName,
+                    workloadNames,
+                  ),
+                ]
+              : []),
+          ),
+        );
+      await tx
+        .delete(schema.agentRunsTable)
+        .where(eq(schema.agentRunsTable.taskId, taskId));
+      await tx
+        .delete(schema.resourcePermissionPoliciesTable)
+        .where(
+          and(
+            eq(schema.resourcePermissionPoliciesTable.resource, "agentRun"),
+            eq(schema.resourcePermissionPoliciesTable.scope, taskId),
+          ),
+        );
+    });
+  }
+
+  /**
+   * The run a live virtual key was minted for. Two rows for one key is not a
+   * binding: the caller must fail closed rather than pick a workspace.
+   */
+  static async findByVirtualApiKeyId(
+    virtualApiKeyId: string,
+  ): Promise<AgentRunRecord | "ambiguous" | null> {
+    const rows = await AgentRunModel.byVirtualApiKey
+      .get()
+      .execute({ virtualApiKeyId });
+    if (rows.length === 1) return rows[0];
+    return rows.length === 0 ? null : "ambiguous";
+  }
+
+  /** Resolve an owned session URL (or any of its task aliases) to its current turn. */
+  static async findCurrentSessionForActor(params: {
+    taskId: string;
+    actorUserId: string;
+    organizationId: string;
+  }): Promise<AgentRunSession | null> {
+    const actor = actorFromUserId(params.actorUserId);
+    const workspaces = schema.agentWorkspacesTable;
+    const [workspace] = await db
+      .select()
+      .from(workspaces)
+      .where(
+        and(
+          eq(workspaces.organizationId, params.organizationId),
+          eq(workspaces.actorKind, actor.kind),
+          eq(workspaces.actorId, actor.id),
+          or(
+            eq(workspaces.id, params.taskId),
+            sql`${workspaces.workloadName} IN (
+          SELECT workload_name FROM agent_runs WHERE task_id = ${params.taskId}::uuid
+          AND organization_id = ${params.organizationId}
+          AND actor_kind = ${actor.kind} AND actor_id = ${actor.id}
+        )`,
+          ),
+        ),
+      )
+      .limit(1);
+    const run = await AgentRunModel.findForActorByTaskId({
+      ...params,
+      taskId: workspace?.lastTaskId ?? params.taskId,
+    });
+    return run && (!workspace || run.workloadName === workspace.workloadName)
+      ? run
+      : null;
+  }
+
+  /**
+   * `findCurrentSessionForActor` for a batch of ids, in four queries whatever
+   * the batch size: the actor's turns among the ids, their workspaces, then
+   * each session's current turn and its prompt. Keyed by requested id; an id
+   * that names nothing the actor started is left out.
+   */
+  static async findCurrentSessionsForActor(params: {
+    taskIds: string[];
+    actorUserId: string;
+    organizationId: string;
+  }): Promise<Map<string, AgentRunSession>> {
+    const found = new Map<string, AgentRunSession>();
+    if (params.taskIds.length === 0) return found;
+    const actor = actorFromUserId(params.actorUserId);
+    const runs = schema.agentRunsTable;
+    const workspaces = schema.agentWorkspacesTable;
+    const ownedBy = (table: typeof runs | typeof workspaces) => [
+      eq(table.organizationId, params.organizationId),
+      eq(table.actorKind, actor.kind),
+      eq(table.actorId, actor.id),
+    ];
+    // An id names a workspace, or a turn whose workload has one.
+    const turns = await db
+      .select({ taskId: runs.taskId, workloadName: runs.workloadName })
+      .from(runs)
+      .where(and(...ownedBy(runs), inArray(runs.taskId, params.taskIds)));
+    const turnWorkloads = new Map(
+      turns.map((turn) => [turn.taskId, turn.workloadName]),
+    );
+    const workspaceRows = await db
+      .select()
+      .from(workspaces)
+      .where(
+        and(
+          ...ownedBy(workspaces),
+          turnWorkloads.size > 0
+            ? or(
+                inArray(workspaces.id, params.taskIds),
+                inArray(workspaces.workloadName, [
+                  ...new Set(turnWorkloads.values()),
+                ]),
+              )
+            : inArray(workspaces.id, params.taskIds),
+        ),
+      );
+    const workspaceFor = (taskId: string) =>
+      workspaceRows.find(
+        (row) =>
+          row.id === taskId || row.workloadName === turnWorkloads.get(taskId),
+      );
+    const currentTaskIds = new Map(
+      params.taskIds.map((taskId) => [
+        taskId,
+        workspaceFor(taskId)?.lastTaskId ?? taskId,
+      ]),
+    );
+    const sessions = await AgentRunModel.addRunPrompts(
+      await AgentRunModel.selectRunSessionsWhere({
+        conditions: [
+          ...ownedBy(runs),
+          inArray(runs.taskId, [...new Set(currentTaskIds.values())]),
+        ],
+      }),
+    );
+    const byTaskId = new Map(
+      sessions.map((session) => [session.taskId, session]),
+    );
+    for (const taskId of params.taskIds) {
+      const workspace = workspaceFor(taskId);
+      const run = byTaskId.get(currentTaskIds.get(taskId) ?? taskId);
+      if (run && (!workspace || run.workloadName === workspace.workloadName)) {
+        found.set(taskId, run);
+      }
+    }
+    return found;
+  }
+
+  /**
+   * Deletes the task of every turn of a session, which takes its run rows
+   * with it. One statement, so a failure leaves every turn in place, and the
+   * delete can be retried.
+   */
+  static async deleteSession(
+    session: Pick<
+      AgentRunRecord,
+      "workloadName" | "organizationId" | "actorKind" | "actorId"
+    >,
+  ): Promise<void> {
+    await db.delete(schema.a2aTasksTable).where(
+      inArray(
+        schema.a2aTasksTable.id,
+        db
+          .select({ taskId: schema.agentRunsTable.taskId })
+          .from(schema.agentRunsTable)
+          .where(
+            and(
+              eq(schema.agentRunsTable.workloadName, session.workloadName),
+              eq(schema.agentRunsTable.organizationId, session.organizationId),
+              eq(schema.agentRunsTable.actorKind, session.actorKind),
+              eq(schema.agentRunsTable.actorId, session.actorId),
+            ),
+          ),
+      ),
+    );
+  }
+
+  /**
+   * The current turn's task of a run addressed by its stable run id: the
+   * workspace id, or the task id of a run with no workspace. Null when the id
+   * names a later turn of a workspace rather than the run. Organization-scoped
+   * only; callers authorize access to the returned task.
+   */
+  static async findCurrentTurnTaskId(params: {
+    runId: string;
+    organizationId: string;
+  }): Promise<string | null> {
+    const workspaces = schema.agentWorkspacesTable;
+    const [workspace] = await db
+      .select({ lastTaskId: workspaces.lastTaskId })
+      .from(workspaces)
+      .where(
+        and(
+          eq(workspaces.id, params.runId),
+          eq(workspaces.organizationId, params.organizationId),
+        ),
+      )
+      .limit(1);
+    if (workspace) return workspace.lastTaskId;
+    const [laterTurn] = await db
+      .select({ id: schema.agentRunsTable.id })
+      .from(schema.agentRunsTable)
+      .innerJoin(
+        workspaces,
+        eq(workspaces.workloadName, schema.agentRunsTable.workloadName),
+      )
+      .where(eq(schema.agentRunsTable.taskId, params.runId))
+      .limit(1);
+    return laterTurn ? null : params.runId;
+  }
+
+  /** Stable run ids for task ids: the task's workspace id, else the task id. */
+  static async findRunIdsByTaskIds(
+    taskIds: string[],
+  ): Promise<Map<string, string>> {
+    if (taskIds.length === 0) return new Map();
+    const rows = await db
+      .select({
+        taskId: schema.agentRunsTable.taskId,
+        workspaceId: schema.agentWorkspacesTable.id,
+      })
+      .from(schema.agentRunsTable)
+      .innerJoin(
+        schema.agentWorkspacesTable,
+        eq(
+          schema.agentWorkspacesTable.workloadName,
+          schema.agentRunsTable.workloadName,
+        ),
+      )
+      .where(inArray(schema.agentRunsTable.taskId, taskIds));
+    const runIds = new Map(taskIds.map((taskId) => [taskId, taskId]));
+    for (const row of rows) runIds.set(row.taskId, row.workspaceId);
+    return runIds;
+  }
+
+  /** Stream history metadata in bounded pages; cursor comparisons stay in PostgreSQL. */
+  static async listPreviousTurns(params: {
+    run: AgentRunRecord;
+    afterId?: string;
+  }) {
+    const table = schema.agentRunsTable;
+    return db
+      .select()
+      .from(table)
+      .where(
+        and(
+          eq(table.workloadName, params.run.workloadName),
+          eq(table.organizationId, params.run.organizationId),
+          eq(table.actorKind, params.run.actorKind),
+          eq(table.actorId, params.run.actorId),
+          sql`${table.id} <> ${params.run.id}::uuid`,
+          isNotNull(table.endedAt),
+          sql`${table.startedAt} <= (SELECT started_at FROM agent_runs WHERE id = ${params.run.id}::uuid)`,
+          params.afterId
+            ? sql`(${table.startedAt}, ${table.id}) >
+        (SELECT started_at, id FROM agent_runs WHERE id = ${params.afterId}::uuid)`
+            : undefined,
+        ),
+      )
+      .orderBy(asc(table.startedAt), asc(table.id))
+      .limit(100);
+  }
+
+  /** A new protocol task in an existing context continues its owner's latest
+   * workspace for this Agent; a context shared across Agents is not a shell grant. */
+  static async findLatestInContext(params: {
+    contextId: string;
+    agentId: string;
+    organizationId: string;
+    actorKind: AgentRunRecord["actorKind"];
+    actorId: string;
+  }): Promise<AgentRunRecord | null> {
+    const [result] = await db
+      .select({
+        run: getTableColumns(schema.agentRunsTable),
+        workspace: {
+          state: schema.agentWorkspacesTable.state,
+          expiresAt: schema.agentWorkspacesTable.expiresAt,
+        },
+      })
+      .from(schema.agentRunsTable)
+      .innerJoin(
+        schema.a2aTasksTable,
+        eq(schema.agentRunsTable.taskId, schema.a2aTasksTable.id),
+      )
+      .leftJoin(
+        schema.agentWorkspacesTable,
+        eq(
+          schema.agentRunsTable.workloadName,
+          schema.agentWorkspacesTable.workloadName,
+        ),
+      )
+      .where(
+        and(
+          eq(schema.a2aTasksTable.contextId, params.contextId),
+          eq(schema.agentRunsTable.agentId, params.agentId),
+          eq(schema.agentRunsTable.organizationId, params.organizationId),
+          eq(schema.agentRunsTable.actorKind, params.actorKind),
+          eq(schema.agentRunsTable.actorId, params.actorId),
+        ),
+      )
+      .orderBy(
+        desc(schema.agentRunsTable.startedAt),
+        desc(schema.agentRunsTable.id),
+      )
+      .limit(1);
+    // Only implicit context continuation falls back to a fresh workspace.
+    // Keep active/transitional workspaces so the claim still prevents overlap,
+    // and never search backwards into an older workspace after the latest expires.
+    return result?.workspace &&
+      !["deleted", "deleting"].includes(result.workspace.state) &&
+      result.workspace.expiresAt.getTime() > Date.now()
+      ? result.run
+      : null;
+  }
+
+  /**
+   * The latest run a person started on this Agent from one chat thread, with
+   * its workspace. A follow-up message in the thread continues that workspace,
+   * the same way a protocol task continues its context's latest workspace.
+   */
+  static async findLatestInChatOpsThread(params: {
+    bindingId: string;
+    threadId: string;
+    agentId: string;
+    organizationId: string;
+    actorKind: AgentRunRecord["actorKind"];
+    actorId: string;
+    jiraRequesterAccountId?: string;
+  }): Promise<{
+    run: AgentRunRecord;
+    workspace: Pick<
+      AgentWorkspace,
+      "id" | "state" | "expiresAt" | "activeTaskId"
+    > | null;
+  } | null> {
+    const [result] = await db
+      .select({
+        run: getTableColumns(schema.agentRunsTable),
+        workspace: {
+          id: schema.agentWorkspacesTable.id,
+          state: schema.agentWorkspacesTable.state,
+          expiresAt: schema.agentWorkspacesTable.expiresAt,
+          activeTaskId: schema.agentWorkspacesTable.activeTaskId,
+        },
+      })
+      .from(schema.agentRunsTable)
+      .leftJoin(
+        schema.agentWorkspacesTable,
+        eq(
+          schema.agentRunsTable.workloadName,
+          schema.agentWorkspacesTable.workloadName,
+        ),
+      )
+      .where(
+        and(
+          sql`${schema.agentRunsTable.completionTarget}->>'type' = 'chatops'`,
+          sql`${schema.agentRunsTable.completionTarget}->>'bindingId' = ${params.bindingId}`,
+          sql`${schema.agentRunsTable.completionTarget}->>'threadId' = ${params.threadId}`,
+          eq(schema.agentRunsTable.agentId, params.agentId),
+          eq(schema.agentRunsTable.organizationId, params.organizationId),
+          eq(schema.agentRunsTable.actorKind, params.actorKind),
+          eq(schema.agentRunsTable.actorId, params.actorId),
+          params.jiraRequesterAccountId
+            ? sql`${schema.agentRunsTable.completionTarget}->>'jiraRequesterAccountId' = ${params.jiraRequesterAccountId}`
+            : undefined,
+        ),
+      )
+      .orderBy(
+        desc(schema.agentRunsTable.startedAt),
+        desc(schema.agentRunsTable.id),
+      )
+      .limit(1);
+    return result ?? null;
+  }
+
+  /** Durable turns addressed to one bot in a thread, including other replicas. */
+  static async listCancelableInChatOpsThread(params: {
+    provider: ChatOpsProviderType;
+    channelId: string;
+    threadId: string;
+    pinnedAgentId?: string;
+  }): Promise<AgentRunRecord[]> {
+    return db
+      .select(getTableColumns(schema.agentRunsTable))
+      .from(schema.agentRunsTable)
+      .innerJoin(
+        schema.chatopsChannelBindingsTable,
+        and(
+          sql`${schema.agentRunsTable.completionTarget}->>'bindingId' = ${schema.chatopsChannelBindingsTable.id}::text`,
+          eq(
+            schema.agentRunsTable.organizationId,
+            schema.chatopsChannelBindingsTable.organizationId,
+          ),
+        ),
+      )
+      .innerJoin(
+        schema.a2aTasksTable,
+        eq(schema.agentRunsTable.taskId, schema.a2aTasksTable.id),
+      )
+      .where(
+        and(
+          eq(schema.chatopsChannelBindingsTable.provider, params.provider),
+          eq(schema.chatopsChannelBindingsTable.channelId, params.channelId),
+          sql`${schema.agentRunsTable.completionTarget}->>'type' = 'chatops'`,
+          sql`${schema.agentRunsTable.completionTarget}->>'threadId' = ${params.threadId}`,
+          params.pinnedAgentId
+            ? sql`${schema.agentRunsTable.completionTarget}->>'pinnedAgentId' = ${params.pinnedAgentId}`
+            : sql`${schema.agentRunsTable.completionTarget}->>'pinnedAgentId' IS NULL`,
+          notInArray(schema.a2aTasksTable.state, [...A2A_TERMINAL_TASK_STATES]),
+        ),
+      );
+  }
+
+  static async updateAttentionState(params: {
+    taskId: string;
+    attentionState: AgentRunRecord["attentionState"];
+  }): Promise<boolean> {
+    return db.transaction(async (tx) => {
+      const [run] = await tx
+        .select()
+        .from(schema.agentRunsTable)
+        .where(
+          and(
+            eq(schema.agentRunsTable.taskId, params.taskId),
+            isNull(schema.agentRunsTable.endedAt),
+          ),
+        )
+        .for("update");
+      if (!run) return false;
+      const [task] = await tx
+        .select({ state: schema.a2aTasksTable.state })
+        .from(schema.a2aTasksTable)
+        .where(eq(schema.a2aTasksTable.id, params.taskId));
+      if (!task || A2A_TERMINAL_TASK_STATES.includes(task.state)) return false;
+      if (run.attentionState === params.attentionState) return true;
+      const [updated] = await tx
+        .update(schema.agentRunsTable)
+        .set({ attentionState: params.attentionState })
+        .where(eq(schema.agentRunsTable.id, run.id))
+        .returning();
+      await AgentRunAttentionNoticeModel.recordTransition(updated, tx);
+      return true;
+    });
+  }
+
+  /** Sessions whose pod should still exist, across every organization. */
+  static async listOpen(): Promise<AgentRunRecord[]> {
+    return (
+      db
+        .select(getTableColumns(schema.agentRunsTable))
+        .from(schema.agentRunsTable)
+        .innerJoin(
+          schema.a2aTasksTable,
+          eq(schema.agentRunsTable.taskId, schema.a2aTasksTable.id),
+        )
+        // Capturing the runtime's end and settling its task are separate writes.
+        // Recover a crash between them instead of abandoning an active task.
+        .where(
+          or(
+            isNull(schema.agentRunsTable.endedAt),
+            inArray(schema.a2aTasksTable.state, [
+              "TASK_STATE_SUBMITTED",
+              "TASK_STATE_WORKING",
+            ]),
+          ),
+        )
+    );
+  }
+
+  /** Terminal runs whose channel completion reply is still pending. */
+  static async listPendingCompletionNotifications(): Promise<AgentRunRecord[]> {
+    return db
+      .select(getTableColumns(schema.agentRunsTable))
+      .from(schema.agentRunsTable)
+      .innerJoin(
+        schema.a2aTasksTable,
+        eq(schema.agentRunsTable.taskId, schema.a2aTasksTable.id),
+      )
+      .where(
+        and(
+          isNotNull(schema.agentRunsTable.completionTarget),
+          isNull(schema.agentRunsTable.completionNotifiedAt),
+          inArray(schema.a2aTasksTable.state, A2A_TERMINAL_TASK_STATES),
+        ),
+      );
+  }
+
+  static async listForAgent(params: {
+    agentId: string;
+    organizationId: string;
+  }): Promise<AgentRunListItem[]> {
+    const {
+      logs: _logs,
+      completionTarget: _completionTarget,
+      completionNotificationClaimedAt: _completionNotificationClaimedAt,
+      completionNotifiedAt: _completionNotifiedAt,
+      activeDeadlineSeconds: _activeDeadlineSeconds,
+      ...runColumns
+    } = getTableColumns(schema.agentRunsTable);
+    const runAudience = {
+      organizationId: schema.agentRunsTable.organizationId,
+      resource: "agentRun" as const,
+      scopeColumn: schema.agentRunsTable.taskId,
+      ownerColumn: schema.agentRunsTable.actorUserId,
+    };
+    const rows = await db
+      .select({
+        ...runColumns,
+        sessionId: sql<string>`COALESCE(${schema.agentWorkspacesTable.id}, ${schema.agentRunsTable.taskId})`,
+        workspaceState: schema.agentWorkspacesTable.state,
+        workspaceExpiresAt: schema.agentWorkspacesTable.expiresAt,
+        state: schema.a2aTasksTable.state,
+        statusReason: schema.a2aTasksTable.statusReason,
+        failure: failureExpression(),
+        stateChangedAt: schema.a2aTasksTable.stateChangedAt,
+        hardDeadlineAt: hardDeadlineAtExpression(),
+        lastModelActivityAt: lastModelActivityAtExpression(),
+        initiatorName: sql<
+          string | null
+        >`coalesce(${schema.usersTable.name}, ${schema.serviceAccountsTable.name})`,
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        shareVisibility:
+          ResourcePermissionPolicyModel.sharedAudience(runAudience),
+        shareTeamNames: ResourcePermissionPolicyModel.sharedRecipientNames({
+          ...runAudience,
+          subject: "team",
+        }),
+        shareUserNames: ResourcePermissionPolicyModel.sharedRecipientNames({
+          ...runAudience,
+          subject: "user",
+        }),
+        // SPDX-SnippetEnd
+      })
+      .from(schema.agentRunsTable)
+      .innerJoin(
+        schema.a2aTasksTable,
+        eq(schema.agentRunsTable.taskId, schema.a2aTasksTable.id),
+      )
+      .innerJoin(
+        schema.agentsTable,
+        eq(schema.agentRunsTable.agentId, schema.agentsTable.id),
+      )
+      .leftJoin(
+        schema.agentWorkspacesTable,
+        eq(
+          schema.agentWorkspacesTable.workloadName,
+          schema.agentRunsTable.workloadName,
+        ),
+      )
+      .leftJoin(
+        schema.usersTable,
+        eq(schema.agentRunsTable.actorUserId, schema.usersTable.id),
+      )
+      .leftJoin(
+        schema.serviceAccountsTable,
+        and(
+          eq(schema.agentRunsTable.actorKind, "serviceAccount"),
+          sql`${schema.agentRunsTable.actorId} = ${schema.serviceAccountsTable.id}::text`,
+          eq(
+            schema.agentRunsTable.organizationId,
+            schema.serviceAccountsTable.organizationId,
+          ),
+        ),
+      )
+      .where(
+        and(
+          eq(schema.agentRunsTable.agentId, params.agentId),
+          eq(schema.agentRunsTable.organizationId, params.organizationId),
+          // One row per session: its current turn, as the sidebar lists it.
+          sql`(${schema.agentWorkspacesTable.lastTaskId} IS NULL
+            OR ${schema.agentWorkspacesTable.lastTaskId} = ${schema.agentRunsTable.taskId})`,
+        ),
+      )
+      .orderBy(desc(schema.agentRunsTable.startedAt));
+    return rows.map(({ workspaceState, workspaceExpiresAt, ...run }) => ({
+      ...run,
+      workspace:
+        workspaceState && workspaceExpiresAt
+          ? { state: workspaceState, expiresAt: workspaceExpiresAt }
+          : null,
+    }));
+  }
+
+  /** Read-only fleet rows for run dashboards, newest first. */
+  static async listDashboard(params: {
+    agentIds: string[];
+    organizationId: string;
+    limit: number;
+    state?: A2ATaskState;
+    failedSince?: Date;
+    thread?: { bindingId: string; threadId: string };
+  }) {
+    if (params.agentIds.length === 0) return [];
+
+    const rows = await db
+      .select({
+        taskId: schema.agentRunsTable.taskId,
+        runId: sql<string>`coalesce(${schema.agentWorkspacesTable.id}, ${schema.agentRunsTable.taskId})`,
+        title: schema.agentRunsTable.title,
+        actorKind: schema.agentRunsTable.actorKind,
+        actorId: schema.agentRunsTable.actorId,
+        actorName: schema.usersTable.name,
+        workloadName: schema.agentRunsTable.workloadName,
+        startedAt: schema.agentRunsTable.startedAt,
+        endedAt: schema.agentRunsTable.endedAt,
+        state: schema.a2aTasksTable.state,
+        statusReason: schema.a2aTasksTable.statusReason,
+        failure: failureExpression(),
+        stateChangedAt: schema.a2aTasksTable.stateChangedAt,
+        hardDeadlineAt: hardDeadlineAtExpression(),
+        lastModelActivityAt: lastModelActivityAtExpression(),
+        attentionState: schema.agentRunsTable.attentionState,
+        agentId: schema.agentsTable.id,
+        agentName: schema.agentsTable.name,
+        agentIcon: schema.agentsTable.icon,
+        threadId: sql<
+          string | null
+        >`${schema.agentRunsTable.completionTarget}->>'threadId'`,
+        threadProvider: schema.chatopsChannelBindingsTable.provider,
+        threadWorkspaceId: schema.chatopsChannelBindingsTable.workspaceId,
+        threadChannelId: schema.chatopsChannelBindingsTable.channelId,
+        threadChannelName: schema.chatopsChannelBindingsTable.channelName,
+      })
+      .from(schema.agentRunsTable)
+      .innerJoin(
+        schema.a2aTasksTable,
+        eq(schema.agentRunsTable.taskId, schema.a2aTasksTable.id),
+      )
+      .innerJoin(
+        schema.agentsTable,
+        eq(schema.agentRunsTable.agentId, schema.agentsTable.id),
+      )
+      .leftJoin(
+        schema.agentWorkspacesTable,
+        eq(
+          schema.agentWorkspacesTable.workloadName,
+          schema.agentRunsTable.workloadName,
+        ),
+      )
+      .leftJoin(
+        schema.usersTable,
+        eq(schema.agentRunsTable.actorUserId, schema.usersTable.id),
+      )
+      .leftJoin(
+        schema.chatopsChannelBindingsTable,
+        and(
+          eq(
+            schema.chatopsChannelBindingsTable.id,
+            sql`(${schema.agentRunsTable.completionTarget}->>'bindingId')::uuid`,
+          ),
+          eq(
+            schema.chatopsChannelBindingsTable.organizationId,
+            params.organizationId,
+          ),
+        ),
+      )
+      .where(
+        and(
+          params.thread
+            ? and(
+                eq(
+                  sql`${schema.agentRunsTable.completionTarget}->>'bindingId'`,
+                  params.thread.bindingId,
+                ),
+                eq(
+                  sql`${schema.agentRunsTable.completionTarget}->>'threadId'`,
+                  params.thread.threadId,
+                ),
+              )
+            : undefined,
+          inArray(schema.agentRunsTable.agentId, params.agentIds),
+          eq(schema.agentRunsTable.organizationId, params.organizationId),
+          params.state
+            ? eq(schema.a2aTasksTable.state, params.state)
+            : undefined,
+          params.failedSince
+            ? and(
+                eq(schema.a2aTasksTable.state, "TASK_STATE_FAILED"),
+                // Bind UTC wall time explicitly for the timezone-less column.
+                sql`${schema.a2aTasksTable.stateChangedAt} >= ${params.failedSince.toISOString()}`,
+              )
+            : undefined,
+          // Alert correlation needs historical failed turns; normal lists keep
+          // one current turn per workspace.
+          params.failedSince
+            ? undefined
+            : or(
+                isNull(schema.agentWorkspacesTable.id),
+                eq(
+                  schema.agentWorkspacesTable.lastTaskId,
+                  schema.agentRunsTable.taskId,
+                ),
+              ),
+        ),
+      )
+      .orderBy(
+        desc(
+          params.failedSince
+            ? schema.a2aTasksTable.stateChangedAt
+            : schema.agentRunsTable.startedAt,
+        ),
+        desc(schema.agentRunsTable.id),
+      )
+      .limit(params.limit);
+
+    const prompts = await A2AMessageModel.findFirstUserPartsByTaskIds(
+      rows.map((row) => row.taskId),
+    );
+    return rows.map((row) => ({
+      ...row,
+      prompt: extractPrompt(prompts.get(row.taskId) ?? []),
+    }));
+  }
+
+  /** Chat run sessions started by one user, newest first. */
+  static async listForActor(params: {
+    actorUserId: string;
+    organizationId: string;
+    pagination: PaginationQuery;
+    search?: string;
+    pinned?: boolean;
+    sort?: "started" | "recent" | "pinned";
+  }) {
+    const actor = actorFromUserId(params.actorUserId);
+    const conditions = [
+      eq(schema.agentRunsTable.actorKind, actor.kind),
+      eq(schema.agentRunsTable.actorId, actor.id),
+      eq(schema.agentRunsTable.organizationId, params.organizationId),
+      sql`NOT EXISTS (SELECT 1 FROM agent_workspaces w
+        WHERE w.workload_name = ${schema.agentRunsTable.workloadName}
+        AND w.last_task_id <> ${schema.agentRunsTable.taskId})`,
+    ];
+    if (params.pinned !== undefined) {
+      conditions.push(
+        params.pinned
+          ? isNotNull(schema.agentRunsTable.pinnedAt)
+          : isNull(schema.agentRunsTable.pinnedAt),
+      );
+    }
+    if (params.search?.trim()) {
+      conditions.push(
+        ilike(
+          schema.agentRunsTable.title,
+          `%${escapeLikePattern(params.search.trim())}%`,
+        ),
+      );
+    }
+    const [rows, [{ total }]] = await Promise.all([
+      AgentRunModel.selectRunSessionsWhere({
+        conditions,
+        pagination: params.pagination,
+        sort: params.sort,
+      }),
+      db
+        .select({ total: sql<number>`count(*)` })
+        .from(schema.agentRunsTable)
+        .where(and(...conditions)),
+    ]);
+    return createPaginatedResult(
+      await AgentRunModel.addRunPrompts(rows),
+      Number(total),
+      params.pagination,
+    );
+  }
+
+  static async findForActorByTaskId(params: {
+    taskId: string;
+    actorUserId: string;
+    organizationId: string;
+  }): Promise<AgentRunSession | null> {
+    const rows = await AgentRunModel.selectRunSessions(params);
+    const [session] = await AgentRunModel.addRunPrompts(rows);
+    return session ?? null;
+  }
+
+  /**
+   * A single run session by task, scoped only to the organization — not
+   * to the actor who started it. Used to serve shared (read-only) viewers, whose
+   * access is authorized separately by the run's permission policy. Callers must
+   * verify share access before exposing the result.
+   */
+  static async findSessionByTaskId(params: {
+    taskId: string;
+    organizationId: string;
+  }): Promise<AgentRunSession | null> {
+    const rows = await AgentRunModel.selectRunSessionsWhere({
+      conditions: [
+        eq(schema.agentRunsTable.taskId, params.taskId),
+        eq(schema.agentRunsTable.organizationId, params.organizationId),
+      ],
+    });
+    const [session] = await AgentRunModel.addRunPrompts(rows);
+    return session ?? null;
+  }
+
+  /** Run sessions assigned to one project, newest first. */
+  static async listForProject(params: {
+    projectId: string;
+    organizationId: string;
+    actorUserId?: string;
+  }): Promise<AgentRunSession[]> {
+    const rows = await AgentRunModel.selectRunSessionsWhere({
+      conditions: [
+        eq(schema.agentRunsTable.projectId, params.projectId),
+        eq(schema.agentRunsTable.organizationId, params.organizationId),
+        ...(params.actorUserId
+          ? [eq(schema.agentRunsTable.actorUserId, params.actorUserId)]
+          : []),
+      ],
+    });
+    return await AgentRunModel.addRunPrompts(rows);
+  }
+
+  /**
+   * A warm Sandbox from a neighbouring pool changes the tier a run runs at,
+   * and the size of the volume it got.
+   */
+  static async updateRuntimeLimitsTier(params: {
+    taskId: string;
+    tier: AgentRuntimeTier | null;
+    workspaceGiB: number | undefined;
+  }): Promise<void> {
+    const current = await AgentRunModel.findByTaskId(params.taskId);
+    if (!current?.runtimeLimits) return;
+    const { workspaceGiB: _previous, ...rest } = current.runtimeLimits;
+    await db
+      .update(schema.agentRunsTable)
+      .set({
+        runtimeLimits: {
+          ...rest,
+          tier: params.tier,
+          ...(params.workspaceGiB === undefined
+            ? {}
+            : { workspaceGiB: params.workspaceGiB }),
+        },
+      })
+      .where(eq(schema.agentRunsTable.taskId, params.taskId));
+  }
+
+  static async updateTitleIfCurrent(params: {
+    taskId: string;
+    expectedTitle: string;
+    title: string;
+  }): Promise<boolean> {
+    const updated = await db
+      .update(schema.agentRunsTable)
+      .set({ title: params.title })
+      .where(
+        and(
+          eq(schema.agentRunsTable.taskId, params.taskId),
+          eq(schema.agentRunsTable.title, params.expectedTitle),
+        ),
+      )
+      .returning({ id: schema.agentRunsTable.id });
+    return updated.length > 0;
+  }
+
+  static async updateForActor(params: {
+    taskId: string;
+    actorUserId: string;
+    organizationId: string;
+    title?: string;
+    pinnedAt?: Date | null;
+    projectId?: string | null;
+  }): Promise<AgentRunSession | null> {
+    const actor = actorFromUserId(params.actorUserId);
+    const updated = await db
+      .update(schema.agentRunsTable)
+      .set({
+        title: params.title,
+        pinnedAt: params.pinnedAt,
+        projectId: params.projectId,
+      })
+      .where(
+        and(
+          eq(schema.agentRunsTable.taskId, params.taskId),
+          eq(schema.agentRunsTable.actorKind, actor.kind),
+          eq(schema.agentRunsTable.actorId, actor.id),
+          eq(schema.agentRunsTable.organizationId, params.organizationId),
+        ),
+      )
+      .returning({ taskId: schema.agentRunsTable.taskId });
+    if (updated.length === 0) return null;
+    return await AgentRunModel.findForActorByTaskId(params);
+  }
+
+  /**
+   * Mark a session finished. Returns false when it was already closed, so a
+   * caller racing the reconciler can tell whether it owns the teardown.
+   */
+  static async close(params: { id: string; logs?: string }): Promise<boolean> {
+    return db.transaction(async (tx) => {
+      const [closed] = await tx
+        .update(schema.agentRunsTable)
+        .set({ endedAt: new Date(), logs: params.logs, attentionState: null })
+        .where(
+          and(
+            eq(schema.agentRunsTable.id, params.id),
+            isNull(schema.agentRunsTable.endedAt),
+          ),
+        )
+        .returning();
+      if (!closed) return false;
+      // Closing already clears attention. Resolve any posted notice as part of
+      // that same write, without changing teardown or task lifecycle decisions.
+      await AgentRunAttentionNoticeModel.recordTransition(closed, tx);
+      return true;
+    });
+  }
+
+  static async clearVirtualApiKey(id: string): Promise<void> {
+    await db
+      .update(schema.agentRunsTable)
+      .set({ virtualApiKeyId: null })
+      .where(eq(schema.agentRunsTable.id, id));
+  }
+
+  /** Claim delivery, including a claim abandoned by a crashed sender. */
+  static async claimCompletionNotification(
+    taskId: string,
+  ): Promise<AgentRunRecord | null> {
+    const staleBefore = new Date(Date.now() - NOTIFICATION_CLAIM_TTL_MS);
+    const [claimed] = await db
+      .update(schema.agentRunsTable)
+      .set({ completionNotificationClaimedAt: new Date() })
+      .where(
+        and(
+          eq(schema.agentRunsTable.taskId, taskId),
+          isNull(schema.agentRunsTable.completionNotifiedAt),
+          or(
+            isNull(schema.agentRunsTable.completionNotificationClaimedAt),
+            lt(
+              schema.agentRunsTable.completionNotificationClaimedAt,
+              staleBefore,
+            ),
+          ),
+        ),
+      )
+      .returning();
+    return claimed ?? null;
+  }
+
+  /** Record provider acceptance; only an active claimant can finish delivery. */
+  static async markCompletionNotified(id: string): Promise<void> {
+    await db
+      .update(schema.agentRunsTable)
+      .set({ completionNotifiedAt: new Date() })
+      .where(
+        and(
+          eq(schema.agentRunsTable.id, id),
+          isNotNull(schema.agentRunsTable.completionNotificationClaimedAt),
+          isNull(schema.agentRunsTable.completionNotifiedAt),
+        ),
+      );
+  }
+
+  /** Release a failed attempt so the next reconciliation can retry it. */
+  static async releaseCompletionNotification(id: string): Promise<void> {
+    await db
+      .update(schema.agentRunsTable)
+      .set({ completionNotificationClaimedAt: null })
+      .where(
+        and(
+          eq(schema.agentRunsTable.id, id),
+          isNull(schema.agentRunsTable.completionNotifiedAt),
+        ),
+      );
+  }
+
+  // === Internal helpers ===
+
+  private static async selectRunSessions(params: {
+    actorUserId: string;
+    organizationId: string;
+    taskId?: string;
+  }) {
+    const actor = actorFromUserId(params.actorUserId);
+    return AgentRunModel.selectRunSessionsWhere({
+      conditions: [
+        eq(schema.agentRunsTable.actorKind, actor.kind),
+        eq(schema.agentRunsTable.actorId, actor.id),
+        eq(schema.agentRunsTable.organizationId, params.organizationId),
+        ...(params.taskId
+          ? [eq(schema.agentRunsTable.taskId, params.taskId)]
+          : []),
+      ],
+    });
+  }
+
+  private static async selectRunSessionsWhere(params: {
+    conditions: SQL[];
+    pagination?: PaginationQuery;
+    sort?: "started" | "recent" | "pinned";
+  }) {
+    const {
+      logs: _logs,
+      completionTarget: _completionTarget,
+      completionNotificationClaimedAt: _completionNotificationClaimedAt,
+      completionNotifiedAt: _completionNotifiedAt,
+      activeDeadlineSeconds: _activeDeadlineSeconds,
+      ...runColumns
+    } = getTableColumns(schema.agentRunsTable);
+    const query = db
+      .select({
+        ...runColumns,
+        state: schema.a2aTasksTable.state,
+        statusReason: schema.a2aTasksTable.statusReason,
+        failure: failureExpression(),
+        stateChangedAt: schema.a2aTasksTable.stateChangedAt,
+        hardDeadlineAt: hardDeadlineAtExpression(),
+        lastModelActivityAt: lastModelActivityAtExpression(),
+        sessionId: sql<string>`COALESCE(${schema.agentWorkspacesTable.id}, ${schema.agentRunsTable.taskId})`,
+        agent: {
+          id: schema.agentsTable.id,
+          name: schema.agentsTable.name,
+          icon: schema.agentsTable.icon,
+        },
+        projectName: schema.projectsTable.name,
+        projectIcon: schema.projectsTable.icon,
+      })
+      .from(schema.agentRunsTable)
+      .innerJoin(
+        schema.a2aTasksTable,
+        eq(schema.agentRunsTable.taskId, schema.a2aTasksTable.id),
+      )
+      .innerJoin(
+        schema.agentsTable,
+        eq(schema.agentRunsTable.agentId, schema.agentsTable.id),
+      )
+      .leftJoin(
+        schema.agentWorkspacesTable,
+        eq(
+          schema.agentWorkspacesTable.workloadName,
+          schema.agentRunsTable.workloadName,
+        ),
+      )
+      .leftJoin(
+        schema.projectsTable,
+        eq(schema.agentRunsTable.projectId, schema.projectsTable.id),
+      )
+      .where(and(...params.conditions))
+      .orderBy(
+        ...(params.sort === "pinned"
+          ? [
+              desc(schema.agentRunsTable.pinnedAt),
+              desc(schema.agentRunsTable.startedAt),
+              desc(schema.agentRunsTable.taskId),
+            ]
+          : params.sort === "recent"
+            ? [
+                desc(
+                  sql`COALESCE(${schema.a2aTasksTable.stateChangedAt}, ${schema.agentRunsTable.startedAt})`,
+                ),
+                // Match the stable client-side recency sort of started-at rows.
+                desc(schema.agentRunsTable.startedAt),
+                desc(schema.agentRunsTable.taskId),
+              ]
+            : [desc(schema.agentRunsTable.startedAt)]),
+      )
+      .$dynamic();
+
+    return params.pagination
+      ? await query
+          .limit(params.pagination.limit)
+          .offset(params.pagination.offset)
+      : await query;
+  }
+
+  private static async addRunPrompts(
+    rows: Awaited<ReturnType<typeof AgentRunModel.selectRunSessions>>,
+  ): Promise<AgentRunSession[]> {
+    const prompts = await A2AMessageModel.findFirstUserPartsByTaskIds(
+      rows.map((row) => row.taskId),
+    );
+    return rows.map((row) => ({
+      ...row,
+      llmSessionId: agentRunLlmSessionId(row),
+      prompt: extractPrompt(prompts.get(row.taskId) ?? []),
+    }));
+  }
+  private static readonly byVirtualApiKey = new PreparedQuery((database) =>
+    database
+      .select()
+      .from(schema.agentRunsTable)
+      .where(
+        eq(
+          schema.agentRunsTable.virtualApiKeyId,
+          sql.placeholder("virtualApiKeyId"),
+        ),
+      )
+      .limit(2)
+      .prepare("archestra_agent_run_by_virtual_key"),
+  );
+}
+
+export default AgentRunModel;
+
+const NOTIFICATION_CLAIM_TTL_MS = 2 * 60 * 1_000;
+
+function extractPrompt(parts: unknown[]): string {
+  return parts
+    .map((part) =>
+      part &&
+      typeof part === "object" &&
+      typeof (part as { text?: unknown }).text === "string"
+        ? (part as { text: string }).text
+        : "",
+    )
+    .join("")
+    .trim();
+}
+
+/** A FAILED task's stored classification plus its status reason. */
+function failureExpression(): SQL<AgentRunFailure | null> {
+  const failure = schema.a2aTasksTable.failure;
+  return sql<AgentRunFailure | null>`
+    CASE WHEN ${schema.a2aTasksTable.state} = 'TASK_STATE_FAILED'
+      AND ${failure} IS NOT NULL
+    THEN jsonb_build_object(
+      'code', ${failure}->>'code',
+      'retriable', (${failure}->>'retriable')::boolean,
+      'message', COALESCE(${schema.a2aTasksTable.statusReason}, '')
+    ) END
+  `;
+}
+
+function hardDeadlineAtExpression(): SQL<Date> {
+  return sql<Date>`
+    ${schema.agentRunsTable.startedAt} +
+    COALESCE(
+      ${schema.agentRunsTable.activeDeadlineSeconds},
+      COALESCE(
+        (${schema.agentsTable.runtime}->>'ttlHours')::integer,
+        ${config.agentRuntime.defaultTtlHours}
+      ) * 60 * 60
+    ) * interval '1 second'
+  `.mapWith(schema.agentRunsTable.startedAt);
+}
+
+function lastModelActivityAtExpression(): SQL<Date | null> {
+  return sql<Date | null>`(
+    SELECT ${schema.interactionsTable.createdAt}
+    FROM ${schema.interactionsTable}
+    WHERE ${schema.interactionsTable.runId} = ${schema.agentRunsTable.taskId}::text
+    ORDER BY ${schema.interactionsTable.createdAt} DESC
+    LIMIT 1
+  )`.mapWith(schema.agentRunsTable.startedAt);
+}

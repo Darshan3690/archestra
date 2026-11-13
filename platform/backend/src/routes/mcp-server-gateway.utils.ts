@@ -1,0 +1,118 @@
+import { MCP_APPS_SERVER_EXTENSION_CAPABILITIES } from "@archestra/shared";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  CallToolRequestSchema,
+  type CallToolResult,
+  ListToolsRequestSchema,
+  type ListToolsResult,
+  ReadResourceRequestSchema,
+  type ReadResourceResult,
+} from "@modelcontextprotocol/sdk/types.js";
+import type { GatedCaller } from "@/auth/permission-gated";
+import mcpClient from "@/clients/mcp-client";
+import config from "@/config";
+import { McpServerToolDescriptionModel, ToolModel } from "@/models";
+import type { McpServerCapabilitiesWithExtensions } from "@/types/mcp-capabilities";
+import { RESOURCE_NOT_FOUND_ERROR_CODE } from "./mcp-gateway/protocol";
+import { normalizeToolInputSchema } from "./mcp-gateway/utils";
+
+type McpListTool = ListToolsResult["tools"][number];
+
+/**
+ * Build the server-scoped MCP server backing the Apps run path
+ * (`POST /api/mcp/server/:mcpServerId`). It serves one installed external
+ * server's runtime — `tools/list` (from discovered tools), `resources/read`
+ * (restricted to `ui://` UI resources), and `tools/call` — all bound to the
+ * route's `mcpServerId`, with no agent/owner context. `resources/read` refuses
+ * any non-`ui://` URI so sandboxed app code cannot read the installed server's
+ * model-facing data resources through the install's own credentials. Access
+ * (`mcpServerInstallation:read`) and the `_meta.ui.visibility` model-only tool
+ * gate are enforced by the route before here.
+ */
+export function createServerScopedServer(params: {
+  mcpServerId: string;
+  catalogId: string;
+  caller: GatedCaller;
+}): { server: McpServer } {
+  const { mcpServerId, catalogId, caller } = params;
+  const mcpServer = new McpServer(
+    {
+      name: `archestra-mcp-server-${mcpServerId}`,
+      version: config.api.version,
+    },
+    {
+      capabilities: {
+        resources: { subscribe: false, listChanged: false },
+        extensions: { ...MCP_APPS_SERVER_EXTENSION_CAPABILITIES },
+        tools: { listChanged: false },
+      } as McpServerCapabilitiesWithExtensions,
+    },
+  );
+  const { server } = mcpServer;
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const tools = await ToolModel.findByCatalogIdWithMeta(catalogId, caller);
+    // This connection runs every call through one installation, so describe
+    // its tools the way that installation does.
+    const ownDescriptions = (
+      await McpServerToolDescriptionModel.findForPairs(
+        tools.map((tool) => ({ mcpServerId, toolId: tool.id })),
+      )
+    ).get(mcpServerId);
+    const listed: McpListTool[] = tools.map((tool) => {
+      const meta = tool.meta as {
+        annotations?: McpListTool["annotations"];
+        _meta?: McpListTool["_meta"];
+      } | null;
+      return {
+        // The connection talks directly to the one upstream server, which uses
+        // its own native (raw) tool names. Strip Archestra's discovery prefix so
+        // the app's tools/call (raw name) and the upstream agree.
+        name: ToolModel.unslugifyName(tool.name),
+        description:
+          (ownDescriptions?.has(tool.id)
+            ? ownDescriptions.get(tool.id)
+            : tool.description) ?? undefined,
+        inputSchema: normalizeToolInputSchema(tool.parameters),
+        annotations: meta?.annotations ?? {},
+        _meta: meta?._meta ?? {},
+      };
+    });
+    return { tools: listed };
+  });
+
+  server.setRequestHandler(
+    ReadResourceRequestSchema,
+    async ({ params: { uri } }) => {
+      // The app sandbox may read only `ui://` UI resources. A non-`ui://` URI is
+      // one of the installed server's model-facing data resources; proxying it
+      // here would let sandboxed app code exfiltrate it through the install's own
+      // credentials. Refuse rather than forward (mirrors the owned-app gateway,
+      // which serves only its own `ui://` resource).
+      if (!uri.startsWith("ui://")) {
+        throw {
+          code: RESOURCE_NOT_FOUND_ERROR_CODE,
+          message: `Resource not found: ${uri}`,
+        };
+      }
+      return (await mcpClient.readResourceForServer({
+        caller,
+        mcpServerId,
+        uri,
+      })) as ReadResourceResult;
+    },
+  );
+
+  server.setRequestHandler(
+    CallToolRequestSchema,
+    async ({ params: { name, arguments: args } }) =>
+      (await mcpClient.callToolForServer({
+        caller,
+        mcpServerId,
+        name,
+        arguments: args,
+      })) as CallToolResult,
+  );
+
+  return { server: mcpServer };
+}

@@ -1,12 +1,10 @@
 "use client";
 
-import { type ComponentProps, memo, useMemo } from "react";
-import { Streamdown } from "streamdown";
-import { cn } from "@/lib/utils";
-
-type ResponseProps = ComponentProps<typeof Streamdown> & {
-  isStreaming?: boolean;
-};
+import { memo, Suspense } from "react";
+import { appInteractive } from "@/lib/app-interactive";
+import { preloadableLazy } from "@/lib/utils/preloadable-lazy";
+import { cn } from "@/lib/utils/tailwind";
+import type { ResponseProps } from "./response-markdown";
 
 /**
  * Check if a URL points to the same origin as the current page.
@@ -22,62 +20,54 @@ export function isSameOriginUrl(url: string): boolean {
   }
 }
 
-export const Response = memo(
-  ({ className, linkSafety, isStreaming = false, ...props }: ResponseProps) => {
-    const mergedLinkSafety = useMemo(
-      () => ({
-        enabled: true,
-        ...linkSafety,
-        onLinkCheck: async (url: string) => {
-          if (isSameOriginUrl(url)) return true;
-          if (linkSafety?.onLinkCheck) return linkSafety.onLinkCheck(url);
-          return false;
-        },
-      }),
-      [linkSafety],
-    );
+const markdown = preloadableLazy(() => import("./response-markdown"));
 
-    return (
-      <Streamdown
-        mode={isStreaming ? "streaming" : "static"}
-        isAnimating={isStreaming}
-        animated={isStreaming ? { animation: "fadeIn", sep: "word" } : false}
-        caret={isStreaming ? "block" : undefined}
-        controls={{
-          code: { copy: true, download: true },
-          table: { copy: true, download: true },
-        }}
-        className={cn(
-          "size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
-          // Add proper list styling
-          "[&_ul]:list-inside [&_ul]:list-disc [&_ul]:ml-6 [&_ul]:my-2",
-          "[&_ol]:list-inside [&_ol]:list-decimal [&_ol]:ml-6 [&_ol]:my-2",
-          "[&_li]:my-1 [&_li>p]:inline",
-          // Add proper heading styling
-          "[&_h1]:text-2xl [&_h1]:font-bold [&_h1]:my-4",
-          "[&_h2]:text-xl [&_h2]:font-bold [&_h2]:my-3",
-          "[&_h3]:text-lg [&_h3]:font-semibold [&_h3]:my-2",
-          // Add proper paragraph spacing
-          "[&_p]:my-2",
-          // Add proper code block styling
-          // Only style inline code, not code inside pre elements
-          "[&_:not(pre)>code]:bg-muted [&_:not(pre)>code]:text-foreground [&_:not(pre)>code]:px-1 [&_:not(pre)>code]:py-0.5 [&_:not(pre)>code]:rounded",
-          "[&_pre]:bg-muted [&_pre]:p-3 [&_pre]:rounded [&_pre]:my-2 [&_pre]:overflow-x-auto",
-          // Fix streamdown code blocks - remove padding from code elements inside them
-          "[&_[data-streamdown='code-block']_code]:p-0 [&_[data-streamdown='code-block']_code]:bg-transparent",
-          // Fix button link styling - use group variant to match parent's is-user/is-assistant class
-          "group-[.is-user]:[&_[data-streamdown='link']]:text-primary-foreground",
-          "group-[.is-assistant]:[&_[data-streamdown='link']]:text-secondary-foreground",
-          className,
-        )}
-        linkSafety={mergedLinkSafety}
-        {...props}
-      />
-    );
-  },
+/**
+ * Fetch the markdown renderer ahead of need — a conversation page calls this
+ * as it mounts, the new-chat composer on the first key or Send press, and
+ * every other page on the first idle callback after it hydrates. The empty
+ * new-chat screen shows no markdown, so it does not load it while idle.
+ */
+export const preloadResponseMarkdown = markdown.preload;
+
+/** Hand over the renderer a page imported statically (see preloadableLazy). */
+export const provideResponseMarkdown = markdown.provide;
+
+if (typeof window !== "undefined" && window.location.pathname !== "/chat") {
+  void appInteractive.whenIdle().then(preloadResponseMarkdown);
+}
+
+/**
+ * Markdown for a message. The renderer (streamdown, its highlighter and
+ * sanitizer) is a separate chunk; until it has loaded, the text shows as
+ * plain, wrapped text in the same box, so nothing jumps when it swaps in.
+ */
+export const Response = memo(
+  (props: ResponseProps) =>
+    // A page that ships the renderer with its route (a conversation, whose
+    // HTML holds its last messages) renders the markdown in the same pass.
+    // Without a boundary of its own, the server sends the transcript with its
+    // markdown in one piece rather than message by message, each swapping in
+    // over its plain text and growing the transcript as it lands.
+    markdown.isLoaded() ? (
+      <markdown.Component {...props} />
+    ) : (
+      <Suspense fallback={<PlainResponse {...props} />}>
+        <markdown.Component {...props} />
+      </Suspense>
+    ),
   (prevProps, nextProps) =>
     prevProps.children === nextProps.children &&
-    prevProps.isStreaming === nextProps.isStreaming,
+    prevProps.isStreaming === nextProps.isStreaming &&
+    prevProps.preserveLineBreaks === nextProps.preserveLineBreaks,
 );
 
 Response.displayName = "Response";
+
+function PlainResponse({ className, children }: ResponseProps) {
+  return (
+    <div className={cn("size-full whitespace-pre-wrap", className)}>
+      {typeof children === "string" ? children : null}
+    </div>
+  );
+}

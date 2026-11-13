@@ -1,0 +1,595 @@
+import { deleteAppBacking } from "@/services/apps/app-mcp-backing";
+import { describe, expect, test } from "@/test";
+import { AppSlugSchema } from "@/types/app";
+import AppModel from "./app";
+import AppAccessModel from "./app-access";
+import AppVersionModel from "./app-version";
+
+describe("AppModel.create", () => {
+  test("creates an app with an immutable version 1", async ({ makeApp }) => {
+    const app = await makeApp({ html: "<h1>hi</h1>" });
+    expect(app.latestVersion).toBe(1);
+
+    const head = await AppVersionModel.findByAppAndVersion(app.id, 1);
+    expect(head?.html).toBe("<h1>hi</h1>");
+  });
+
+  test("rejects a name conflict for the same author", async ({
+    makeApp,
+    makeUser,
+  }) => {
+    const author = await makeUser();
+    const first = await makeApp({
+      name: "Dup",
+      authorId: author.id,
+    });
+    // Names are unique per author (apps_org_author_name_uidx), regardless of
+    // scope, so the same author cannot reuse a name even across scopes.
+    await expect(
+      makeApp({
+        name: "Dup",
+        access: "personal",
+        authorId: author.id,
+        organizationId: first.organizationId,
+      }),
+    ).rejects.toThrow();
+  });
+
+  test("lets distinct authors keep same-named personal apps", async ({
+    makeApp,
+    makeUser,
+  }) => {
+    const a = await makeUser();
+    const b = await makeUser();
+    const first = await makeApp({
+      name: "Mine",
+      access: "personal",
+      authorId: a.id,
+    });
+    const second = await makeApp({
+      name: "Mine",
+      access: "personal",
+      authorId: b.id,
+      organizationId: first.organizationId,
+    });
+    expect(second.id).not.toBe(first.id);
+  });
+});
+
+describe("AppModel.update", () => {
+  test("metadata-only edit does not fork a version", async ({ makeApp }) => {
+    const app = await makeApp();
+    const updated = await AppModel.update({
+      id: app.id,
+      patch: { description: "now described" },
+    });
+    expect(updated?.description).toBe("now described");
+    expect(updated?.latestVersion).toBe(1);
+  });
+
+  test("an html change forks v2 and bumps the head", async ({ makeApp }) => {
+    const app = await makeApp({ html: "<h1>v1</h1>" });
+    const updated = await AppModel.update({
+      id: app.id,
+      version: { html: "<h1>v2</h1>", uiPermissions: null },
+    });
+    expect(updated?.latestVersion).toBe(2);
+    const v2 = await AppVersionModel.findByAppAndVersion(app.id, 2);
+    expect(v2?.html).toBe("<h1>v2</h1>");
+  });
+
+  test("an identical payload is a no-op (suppressed fork)", async ({
+    makeApp,
+  }) => {
+    const app = await makeApp({ html: "<h1>same</h1>" });
+    const updated = await AppModel.update({
+      id: app.id,
+      version: { html: "<h1>same</h1>", uiPermissions: null },
+    });
+    expect(updated?.latestVersion).toBe(1);
+  });
+});
+
+describe("AppModel spec", () => {
+  const spec = {
+    summary: "A todo app",
+    features: ["add", "complete"],
+    tools: ["archestra__app_data_get"],
+  };
+
+  test("snapshots the spec onto version 1 at create", async ({ makeApp }) => {
+    const app = await makeApp({ spec });
+    expect(app.spec).toEqual(spec);
+    const v1 = await AppVersionModel.findByAppAndVersion(app.id, 1);
+    expect(v1?.spec).toEqual(spec);
+  });
+
+  test("a spec-only edit updates the head without forking", async ({
+    makeApp,
+  }) => {
+    const app = await makeApp({ spec });
+    const nextSpec = { ...spec, summary: "A better todo app" };
+    const updated = await AppModel.update({
+      id: app.id,
+      patch: { spec: nextSpec },
+    });
+    expect(updated?.spec).toEqual(nextSpec);
+    expect(updated?.latestVersion).toBe(1);
+  });
+
+  test("snapshots the head spec onto a forked version", async ({ makeApp }) => {
+    const app = await makeApp({ spec });
+    const updated = await AppModel.update({
+      id: app.id,
+      version: { html: "<h1>v2</h1>", uiPermissions: null },
+    });
+    expect(updated?.latestVersion).toBe(2);
+    const v2 = await AppVersionModel.findByAppAndVersion(app.id, 2);
+    expect(v2?.spec).toEqual(spec);
+  });
+
+  test("a spec set in the same edit as an html fork lands on the new version", async ({
+    makeApp,
+  }) => {
+    const app = await makeApp({ spec });
+    const nextSpec = { ...spec, features: ["add", "complete", "filter"] };
+    const updated = await AppModel.update({
+      id: app.id,
+      patch: { spec: nextSpec },
+      version: { html: "<h1>v2</h1>", uiPermissions: null },
+    });
+    expect(updated?.latestVersion).toBe(2);
+    const v2 = await AppVersionModel.findByAppAndVersion(app.id, 2);
+    expect(v2?.spec).toEqual(nextSpec);
+  });
+});
+
+describe("AppModel.delete (soft)", () => {
+  test("hides the app and frees its name for re-use", async ({ makeApp }) => {
+    const app = await makeApp({ name: "Reusable" });
+    // The delete flow soft-deletes the app and tears down its backing catalog,
+    // which owns the name-uniqueness — freeing the name.
+    await deleteAppBacking(app);
+    expect(await AppModel.delete(app.id)).toBe(true);
+    expect(await AppModel.findById(app.id)).toBeNull();
+
+    const recreated = await makeApp({
+      name: "Reusable",
+      organizationId: app.organizationId,
+    });
+    expect(recreated.id).not.toBe(app.id);
+  });
+});
+
+describe("AppModel.findIdByOrgAuthorName", () => {
+  test("finds an author's active app by name, ignores deleted and other authors", async ({
+    makeUser,
+    makeApp,
+  }) => {
+    const author = await makeUser();
+    const other = await makeUser();
+    const app = await makeApp({
+      name: "Lookup",
+      authorId: author.id,
+    });
+
+    expect(
+      await AppModel.findIdByOrgAuthorName({
+        organizationId: app.organizationId,
+        authorId: author.id,
+        name: "Lookup",
+      }),
+    ).toBe(app.id);
+
+    expect(await AppModel.delete(app.id)).toBe(true);
+    expect(
+      await AppModel.findIdByOrgAuthorName({
+        organizationId: app.organizationId,
+        authorId: author.id,
+        name: "Lookup",
+      }),
+    ).toBeNull();
+
+    // A same-name app under a different author is not surfaced for the original.
+    const otherApp = await makeApp({
+      name: "Lookup",
+      authorId: other.id,
+      organizationId: app.organizationId,
+    });
+    expect(
+      await AppModel.findIdByOrgAuthorName({
+        organizationId: app.organizationId,
+        authorId: author.id,
+        name: "Lookup",
+      }),
+    ).toBeNull();
+    expect(
+      await AppModel.findIdByOrgAuthorName({
+        organizationId: app.organizationId,
+        authorId: other.id,
+        name: "Lookup",
+      }),
+    ).toBe(otherApp.id);
+  });
+});
+
+describe("AppVersionModel.computeContentHash", () => {
+  test("is stable across permission key ordering", () => {
+    const a = AppVersionModel.computeContentHash({
+      html: "<p/>",
+      uiPermissions: { camera: {}, clipboardWrite: {} },
+    });
+    const b = AppVersionModel.computeContentHash({
+      html: "<p/>",
+      uiPermissions: { clipboardWrite: {}, camera: {} },
+    });
+    expect(a).toBe(b);
+  });
+
+  test("differs when html differs", () => {
+    const a = AppVersionModel.computeContentHash({
+      html: "<p>1</p>",
+      uiPermissions: null,
+    });
+    const b = AppVersionModel.computeContentHash({
+      html: "<p>2</p>",
+      uiPermissions: null,
+    });
+    expect(a).not.toBe(b);
+  });
+});
+
+describe("AppAccessModel accessibility", () => {
+  test("scopes visibility by org/personal/team and excludes deleted", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeTeam,
+    makeTeamMember,
+    makeApp,
+  }) => {
+    const org = await makeOrganization();
+    const author = await makeUser();
+    const member = await makeUser();
+    const outsider = await makeUser();
+    await makeMember(author.id, org.id);
+    await makeMember(member.id, org.id);
+    await makeMember(outsider.id, org.id);
+    const team = await makeTeam(org.id, author.id);
+    await makeTeamMember(team.id, author.id);
+    await makeTeamMember(team.id, member.id);
+
+    const orgApp = await makeApp({ organizationId: org.id });
+    const personalApp = await makeApp({
+      organizationId: org.id,
+      access: "personal",
+      authorId: author.id,
+    });
+    const teamApp = await makeApp({
+      organizationId: org.id,
+      access: { teams: [team.id] },
+      authorId: author.id,
+    });
+    const deletedApp = await makeApp({ organizationId: org.id });
+    await AppModel.delete(deletedApp.id);
+
+    const authorIds = await AppAccessModel.getUserAccessibleAppIds({
+      organizationId: org.id,
+      userId: author.id,
+    });
+    expect(new Set(authorIds)).toEqual(
+      new Set([orgApp.id, personalApp.id, teamApp.id]),
+    );
+
+    const memberIds = await AppAccessModel.getUserAccessibleAppIds({
+      organizationId: org.id,
+      userId: member.id,
+    });
+    expect(new Set(memberIds)).toEqual(new Set([orgApp.id, teamApp.id]));
+
+    const outsiderIds = await AppAccessModel.getUserAccessibleAppIds({
+      organizationId: org.id,
+      userId: outsider.id,
+    });
+    expect(outsiderIds).toEqual([orgApp.id]);
+
+    expect(outsiderIds).not.toContain(deletedApp.id);
+  });
+
+  test("userHasAppAccess honors grants", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeApp,
+  }) => {
+    const org = await makeOrganization();
+    const author = await makeUser();
+    const other = await makeUser();
+    await makeMember(author.id, org.id);
+    await makeMember(other.id, org.id);
+    const personalApp = await makeApp({
+      organizationId: org.id,
+      access: "personal",
+      authorId: author.id,
+    });
+
+    expect(
+      await AppAccessModel.userHasAppAccess({
+        organizationId: org.id,
+        userId: author.id,
+        app: personalApp,
+      }),
+    ).toBe(true);
+    expect(
+      await AppAccessModel.userHasAppAccess({
+        organizationId: org.id,
+        userId: other.id,
+        app: personalApp,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("AppModel.generateUniqueSlug", () => {
+  test("derives the slug from the app name", async ({ makeOrganization }) => {
+    const org = await makeOrganization();
+
+    expect(
+      await AppModel.generateUniqueSlug({
+        name: "Sales Dashboard!",
+        organizationId: org.id,
+      }),
+    ).toBe("sales-dashboard");
+  });
+
+  test("suffixes a slug already taken in the organization", async ({
+    makeApp,
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    await makeApp({ name: "Dashboard", organizationId: org.id });
+
+    const slug = await AppModel.generateUniqueSlug({
+      name: "Dashboard",
+      organizationId: org.id,
+    });
+    expect(slug).toMatch(/^dashboard-[0-9a-f]{6}$/);
+  });
+
+  test("does not suffix across organizations", async ({
+    makeApp,
+    makeOrganization,
+  }) => {
+    // Slugs are unique per org, so another org holding `dashboard` is no reason
+    // to give this one an uglier URL.
+    const other = await makeOrganization();
+    await makeApp({ name: "Dashboard", organizationId: other.id });
+    const org = await makeOrganization();
+
+    expect(
+      await AppModel.generateUniqueSlug({
+        name: "Dashboard",
+        organizationId: org.id,
+      }),
+    ).toBe("dashboard");
+  });
+
+  test("frees a slug when the app holding it is soft-deleted", async ({
+    makeApp,
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const app = await makeApp({ name: "Dashboard", organizationId: org.id });
+    await AppModel.delete(app.id);
+
+    expect(
+      await AppModel.generateUniqueSlug({
+        name: "Dashboard",
+        organizationId: org.id,
+      }),
+    ).toBe("dashboard");
+  });
+
+  test.each([
+    ["a name that slugifies to nothing", "!!! ???"],
+    ["a reserved segment", "Catalog"],
+    ["a uuid-shaped name", "7b0839a1-4663-4371-a739-e5dac7f8c33e"],
+  ])("falls back to `app` for %s", async (_label, name) => {
+    const slug = await AppModel.generateUniqueSlug({
+      name,
+      organizationId: crypto.randomUUID(),
+    });
+    expect(slug).toBe("app");
+  });
+
+  test("truncates a long name without leaving a trailing hyphen", async () => {
+    // "aaa… bbb" cut at the boundary would otherwise end in "-", which
+    // AppSlugSchema refuses.
+    const name = `${"a".repeat(92)} bbbbbbbbbb`;
+    const slug = await AppModel.generateUniqueSlug({
+      name,
+      organizationId: crypto.randomUUID(),
+    });
+
+    expect(slug).toBe("a".repeat(92));
+    expect(AppSlugSchema.safeParse(slug).success).toBe(true);
+    // Short enough that the `-<6 hex>` collision suffix still fits the cap.
+    expect(slug.length).toBeLessThanOrEqual(100 - 7);
+  });
+});
+
+describe("AppModel.resolveIdFromIdOrSlug", () => {
+  test("resolves a slug to the app id", async ({ makeApp }) => {
+    const app = await makeApp({ name: "Sales Dashboard" });
+
+    expect(
+      await AppModel.resolveIdFromIdOrSlug({
+        idOrSlug: "sales-dashboard",
+        organizationId: app.organizationId,
+      }),
+    ).toBe(app.id);
+  });
+
+  test("resolves an app id to itself", async ({ makeApp }) => {
+    const app = await makeApp();
+
+    expect(
+      await AppModel.resolveIdFromIdOrSlug({
+        idOrSlug: app.id,
+        organizationId: app.organizationId,
+      }),
+    ).toBe(app.id);
+  });
+
+  test("does not resolve another organization's slug", async ({
+    makeApp,
+    makeOrganization,
+  }) => {
+    const app = await makeApp({ name: "Sales Dashboard" });
+    const other = await makeOrganization();
+
+    expect(
+      await AppModel.resolveIdFromIdOrSlug({
+        idOrSlug: "sales-dashboard",
+        organizationId: other.id,
+      }),
+    ).toBeNull();
+    // ...nor its id, which is likewise scoped to the owning org.
+    expect(
+      await AppModel.resolveIdFromIdOrSlug({
+        idOrSlug: app.id,
+        organizationId: other.id,
+      }),
+    ).toBeNull();
+  });
+
+  test("stops resolving a soft-deleted app", async ({ makeApp }) => {
+    const app = await makeApp({ name: "Sales Dashboard" });
+    await AppModel.delete(app.id);
+
+    expect(
+      await AppModel.resolveIdFromIdOrSlug({
+        idOrSlug: "sales-dashboard",
+        organizationId: app.organizationId,
+      }),
+    ).toBeNull();
+  });
+
+  test("returns null for an unknown segment", async ({ makeApp }) => {
+    const app = await makeApp();
+
+    expect(
+      await AppModel.resolveIdFromIdOrSlug({
+        idOrSlug: "no-such-app",
+        organizationId: app.organizationId,
+      }),
+    ).toBeNull();
+  });
+
+  test("stops resolving the old slug after a rename", async ({ makeApp }) => {
+    const app = await makeApp({ name: "Sales Dashboard" });
+    await AppModel.update({ id: app.id, patch: { slug: "revenue" } });
+
+    const organizationId = app.organizationId;
+    expect(
+      await AppModel.resolveIdFromIdOrSlug({
+        idOrSlug: "revenue",
+        organizationId,
+      }),
+    ).toBe(app.id);
+    expect(
+      await AppModel.resolveIdFromIdOrSlug({
+        idOrSlug: "sales-dashboard",
+        organizationId,
+      }),
+    ).toBeNull();
+    // The id form is the stable address a rename never breaks.
+    expect(
+      await AppModel.resolveIdFromIdOrSlug({
+        idOrSlug: app.id,
+        organizationId,
+      }),
+    ).toBe(app.id);
+  });
+});
+
+describe("AppModel.update slug", () => {
+  test("persists a new slug without disturbing the rest of the app", async ({
+    makeApp,
+  }) => {
+    const app = await makeApp({
+      name: "Sales Dashboard",
+      description: "Tracks revenue",
+    });
+
+    const updated = await AppModel.update({
+      id: app.id,
+      patch: { slug: "revenue" },
+    });
+
+    expect(updated).toMatchObject({
+      id: app.id,
+      slug: "revenue",
+      name: "Sales Dashboard",
+      description: "Tracks revenue",
+      latestVersion: app.latestVersion,
+    });
+  });
+
+  test("does not move the slug when the app is renamed", async ({
+    makeApp,
+  }) => {
+    // The slug is an address the author controls, so a display-name edit must
+    // not silently break every link that used it.
+    const app = await makeApp({ name: "Sales Dashboard" });
+
+    const updated = await AppModel.update({
+      id: app.id,
+      patch: { name: "Revenue Board" },
+    });
+
+    expect(updated?.name).toBe("Revenue Board");
+    expect(updated?.slug).toBe("sales-dashboard");
+  });
+
+  test("accepts a re-send of the app's own slug", async ({ makeApp }) => {
+    // The partial unique index must not fire against the row being updated.
+    const app = await makeApp({ name: "Sales Dashboard" });
+
+    const updated = await AppModel.update({
+      id: app.id,
+      patch: { slug: "sales-dashboard" },
+    });
+
+    expect(updated?.slug).toBe("sales-dashboard");
+  });
+
+  test("rejects a slug another app in the organization holds", async ({
+    makeApp,
+  }) => {
+    const taken = await makeApp({ name: "Taken" });
+    const mine = await makeApp({
+      name: "Mine",
+      organizationId: taken.organizationId,
+    });
+
+    await expect(
+      AppModel.update({ id: mine.id, patch: { slug: "taken" } }),
+    ).rejects.toThrow();
+  });
+
+  test("allows a slug an app in another organization holds", async ({
+    makeApp,
+  }) => {
+    // Slugs are org-scoped, so two tenants may both own /a/dashboard.
+    await makeApp({ name: "Dashboard" });
+    const mine = await makeApp({ name: "Mine" });
+
+    const updated = await AppModel.update({
+      id: mine.id,
+      patch: { slug: "dashboard" },
+    });
+
+    expect(updated?.slug).toBe("dashboard");
+  });
+});

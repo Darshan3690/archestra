@@ -1,6 +1,12 @@
-import { addDays, subDays } from "date-fns";
+// @vitest-environment node
+import { addDays } from "date-fns/addDays";
+import { subDays } from "date-fns/subDays";
+import { subHours } from "date-fns/subHours";
+import { subMinutes } from "date-fns/subMinutes";
+import { subMonths } from "date-fns/subMonths";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  formatCompactRelativeTime,
   formatDate,
   formatRelativeTime,
   formatRelativeTimeFromNow,
@@ -59,6 +65,21 @@ describe("format-relative-time", () => {
       expect(formatRelativeTimeFromNow(addDays(new Date(), 3))).toBe(
         "in 3 days",
       );
+    });
+  });
+
+  describe("formatCompactRelativeTime", () => {
+    // Dates are built inside the test, after the fake clock is installed.
+    it.each([
+      { ago: (now: Date) => subMinutes(now, 5), expected: "5m ago" },
+      { ago: (now: Date) => subHours(now, 2), expected: "2h ago" },
+      { ago: (now: Date) => subDays(now, 1), expected: "1d ago" },
+      { ago: (now: Date) => subMonths(now, 3), expected: "3mo ago" },
+    ])("abbreviates units to fit a table cell ($expected)", ({
+      ago,
+      expected,
+    }) => {
+      expect(formatCompactRelativeTime(ago(new Date()))).toBe(expected);
     });
   });
 

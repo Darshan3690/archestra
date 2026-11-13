@@ -1,0 +1,585 @@
+import { BUILT_IN_AGENT_IDS } from "@archestra/shared";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { AgentModel, ProjectModel } from "@/models";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import { projectService } from "@/services/project";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import { shareForTest } from "@/test/sharing";
+import type { User } from "@/types";
+
+describe("project default agent", () => {
+  let app: FastifyInstanceWithZod;
+  let organizationId: string;
+  let owner: User;
+
+  beforeEach(async ({ makeOrganization, makeUser, makeMember }) => {
+    organizationId = (await makeOrganization()).id;
+    owner = await makeUser();
+    await makeMember(owner.id, organizationId);
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { organizationId: string }).organizationId =
+        organizationId;
+      (request as typeof request & { user: User }).user = owner;
+    });
+    const { default: projectRoutes } = await import("./project.routes");
+    await app.register(projectRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  async function seedProject(name = "pinned") {
+    return projectService.create({
+      organizationId,
+      userId: owner.id,
+      name,
+      description: null,
+    });
+  }
+
+  test("pins an org-scoped chat agent and reports it on the detail", async ({
+    makeInternalAgent,
+  }) => {
+    const project = await seedProject();
+    const agent = await makeInternalAgent({
+      organizationId,
+      name: "Test1 Agent",
+    });
+
+    const patch = await app.inject({
+      method: "PATCH",
+      url: `/api/projects/${project.id}`,
+      payload: { defaultAgentId: agent.id },
+    });
+    expect(patch.statusCode).toBe(200);
+    expect((await ProjectModel.findById(project.id))?.defaultAgentId).toBe(
+      agent.id,
+    );
+
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/projects/${project.id}`,
+    });
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().defaultAgent).toEqual({
+      id: agent.id,
+      name: "Test1 Agent",
+    });
+  });
+
+  test("accepts the default agent at creation", async ({
+    makeInternalAgent,
+  }) => {
+    const agent = await makeInternalAgent({ organizationId });
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      payload: { name: "created-with-agent", defaultAgentId: agent.id },
+    });
+    expect(created.statusCode).toBe(200);
+    expect(
+      (await ProjectModel.findById(created.json().id))?.defaultAgentId,
+    ).toBe(agent.id);
+  });
+
+  test("rejects an ineligible agent at creation, creating nothing", async ({
+    makeInternalAgent,
+  }) => {
+    const personalAgent = await makeInternalAgent({
+      organizationId,
+      access: "personal",
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      payload: { name: "never-created", defaultAgentId: personalAgent.id },
+    });
+    expect(res.statusCode).toBe(400);
+    const list = await app.inject({ method: "GET", url: "/api/projects" });
+    expect(list.json().data).toEqual([]);
+  });
+
+  test("reports a null default agent when the project pins none", async () => {
+    const project = await seedProject("unpinned");
+
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/projects/${project.id}`,
+    });
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().defaultAgent).toBeNull();
+  });
+
+  test("null clears the pin", async ({ makeInternalAgent }) => {
+    const project = await seedProject("clearable");
+    const agent = await makeInternalAgent({ organizationId });
+    await projectService.update({
+      id: project.id,
+      organizationId,
+      userId: owner.id,
+      defaultAgentId: agent.id,
+    });
+
+    const cleared = await app.inject({
+      method: "PATCH",
+      url: `/api/projects/${project.id}`,
+      payload: { defaultAgentId: null },
+    });
+    expect(cleared.statusCode).toBe(200);
+    expect(
+      (await ProjectModel.findById(project.id))?.defaultAgentId,
+    ).toBeNull();
+  });
+
+  test("an omitted defaultAgentId leaves the existing pin alone", async ({
+    makeInternalAgent,
+  }) => {
+    const project = await seedProject("untouched");
+    const agent = await makeInternalAgent({ organizationId });
+    await projectService.update({
+      id: project.id,
+      organizationId,
+      userId: owner.id,
+      defaultAgentId: agent.id,
+    });
+
+    const renamed = await app.inject({
+      method: "PATCH",
+      url: `/api/projects/${project.id}`,
+      payload: { name: "renamed-only" },
+    });
+    expect(renamed.statusCode).toBe(200);
+    expect((await ProjectModel.findById(project.id))?.defaultAgentId).toBe(
+      agent.id,
+    );
+  });
+
+  describe("eligibility follows who the project is shared with", () => {
+    test("the owner may pin their own personal agent while the project is unshared", async ({
+      makeInternalAgent,
+    }) => {
+      const project = await seedProject("private-personal");
+      const personal = await makeInternalAgent({
+        organizationId,
+        access: "personal",
+        authorId: owner.id,
+      });
+
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/api/projects/${project.id}`,
+        payload: { defaultAgentId: personal.id },
+      });
+      expect(res.statusCode).toBe(200);
+      expect((await ProjectModel.findById(project.id))?.defaultAgentId).toBe(
+        personal.id,
+      );
+    });
+
+    test("that same personal agent is rejected once the project is org-wide", async ({
+      makeInternalAgent,
+    }) => {
+      const project = await seedProject("org-shared-personal");
+      const personal = await makeInternalAgent({
+        organizationId,
+        access: "personal",
+        authorId: owner.id,
+      });
+      await shareForTest({
+        resource: "project",
+        scope: project.id,
+        organizationId,
+        visibility: "organization",
+        teamIds: [],
+      });
+
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/api/projects/${project.id}`,
+        payload: { defaultAgentId: personal.id },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    test("sharing a project hides a pin only its owner could use", async ({
+      makeInternalAgent,
+      makeTeam,
+      makeTeamMember,
+    }) => {
+      const team = await makeTeam(organizationId, owner.id, { name: "Shared" });
+      await makeTeamMember(team.id, owner.id);
+      const project = await seedProject("outgrown");
+      const personal = await makeInternalAgent({
+        organizationId,
+        access: "personal",
+        authorId: owner.id,
+      });
+      await projectService.update({
+        id: project.id,
+        organizationId,
+        userId: owner.id,
+        defaultAgentId: personal.id,
+      });
+
+      // The rest of the team cannot reach the owner's personal agent, so the
+      // pin stops being offered once the project is shared with them. Sharing
+      // is a permission edit that never touches the project row, so the read
+      // path is what hides the pin.
+      await shareForTest({
+        resource: "project",
+        scope: project.id,
+        organizationId,
+        visibility: "team",
+        teamIds: [team.id],
+      });
+      const detail = await app.inject({
+        method: "GET",
+        url: `/api/projects/${project.id}`,
+      });
+      expect(detail.statusCode).toBe(200);
+      expect(detail.json().defaultAgent).toBeNull();
+    });
+
+    test("a team agent must cover every team the project is shared with", async ({
+      makeTeam,
+      makeTeamMember,
+      makeInternalAgent,
+    }) => {
+      const teamA = await makeTeam(organizationId, owner.id, { name: "A" });
+      const teamB = await makeTeam(organizationId, owner.id, { name: "B" });
+      await makeTeamMember(teamA.id, owner.id);
+      await makeTeamMember(teamB.id, owner.id);
+      const coversBoth = await makeInternalAgent({
+        organizationId,
+        access: { teams: [teamA.id, teamB.id] },
+      });
+      const coversOne = await makeInternalAgent({
+        organizationId,
+        access: { teams: [teamA.id] },
+      });
+
+      const project = await seedProject("team-shared");
+      await shareForTest({
+        resource: "project",
+        scope: project.id,
+        organizationId,
+        visibility: "team",
+        teamIds: [teamA.id, teamB.id],
+      });
+
+      const rejected = await app.inject({
+        method: "PATCH",
+        url: `/api/projects/${project.id}`,
+        payload: { defaultAgentId: coversOne.id },
+      });
+      expect(rejected.statusCode).toBe(400);
+
+      const accepted = await app.inject({
+        method: "PATCH",
+        url: `/api/projects/${project.id}`,
+        payload: { defaultAgentId: coversBoth.id },
+      });
+      expect(accepted.statusCode).toBe(200);
+      expect((await ProjectModel.findById(project.id))?.defaultAgentId).toBe(
+        coversBoth.id,
+      );
+    });
+
+    test("a team agent the owner cannot reach is refused, even though it covers the shared team", async ({
+      makeInternalAgent,
+      makeTeam,
+      makeTeamMember,
+      makeUser,
+      makeMember,
+    }) => {
+      // The owner starts chats here too, so a pin they cannot run is broken for
+      // them — and unsharing later would have to take it away again.
+      const outsider = await makeUser({ email: "outsider@test.com" });
+      await makeMember(outsider.id, organizationId, {});
+      const team = await makeTeam(organizationId, outsider.id, { name: "Far" });
+      await makeTeamMember(team.id, outsider.id);
+      const teamAgent = await makeInternalAgent({
+        organizationId,
+        access: { teams: [team.id] },
+      });
+
+      const project = await seedProject("owner-outside-team");
+      await shareForTest({
+        resource: "project",
+        scope: project.id,
+        organizationId,
+        visibility: "team",
+        teamIds: [team.id],
+      });
+
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/api/projects/${project.id}`,
+        payload: { defaultAgentId: teamAgent.id },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    test("a named-user share needs an agent every named person can reach", async ({
+      makeInternalAgent,
+      makeMember,
+      makeUser,
+    }) => {
+      const colleague = await makeUser({ email: "colleague@test.com" });
+      await makeMember(colleague.id, organizationId, {});
+      const stranger = await makeUser({ email: "stranger@test.com" });
+      await makeMember(stranger.id, organizationId, {});
+      const sharedWithColleague = await makeInternalAgent({
+        organizationId,
+        access: { users: [colleague.id] },
+        authorId: owner.id,
+      });
+
+      const project = await seedProject("user-shared");
+      await shareForTest({
+        resource: "project",
+        scope: project.id,
+        organizationId,
+        visibility: "user",
+        teamIds: [],
+        userIds: [colleague.id],
+      });
+
+      const accepted = await app.inject({
+        method: "PATCH",
+        url: `/api/projects/${project.id}`,
+        payload: { defaultAgentId: sharedWithColleague.id },
+      });
+      expect(accepted.statusCode).toBe(200);
+
+      // Adding someone the agent was never shared with outgrows the pin.
+      await shareForTest({
+        resource: "project",
+        scope: project.id,
+        organizationId,
+        visibility: "user",
+        teamIds: [],
+        userIds: [colleague.id, stranger.id],
+      });
+      const detail = await app.inject({
+        method: "GET",
+        url: `/api/projects/${project.id}`,
+      });
+      expect(detail.json().defaultAgent).toBeNull();
+    });
+  });
+
+  describe("rejects an agent the whole project cannot use", () => {
+    test.for([
+      // Shared with no one the owner can act as / authored by no one, so even
+      // the owner cannot reach it.
+      { label: "team-scoped", overrides: { access: { teams: [] } } },
+      { label: "personal-scoped", overrides: { access: "personal" as const } },
+      // Not a chat agent at all.
+      {
+        label: "an mcp_gateway",
+        overrides: { agentType: "mcp_gateway" as const },
+      },
+      {
+        label: "an llm_proxy",
+        overrides: { agentType: "llm_proxy" as const },
+      },
+      // A platform-internal agent that never appears in the chat picker.
+      {
+        label: "built-in",
+        overrides: {
+          builtInAgentConfig: {
+            name: BUILT_IN_AGENT_IDS.CHAT_TITLE_GENERATION,
+          } as const,
+        },
+      },
+    ])("$label", async ({ label, overrides }, { makeAgent }) => {
+      const project = await seedProject(`reject-${label}`);
+      const agent = await makeAgent({
+        organizationId,
+        agentType: "agent",
+        ...overrides,
+      });
+
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/api/projects/${project.id}`,
+        payload: { defaultAgentId: agent.id },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(
+        (await ProjectModel.findById(project.id))?.defaultAgentId,
+      ).toBeNull();
+    });
+  });
+
+  test("rejects an agent from another organization", async ({
+    makeOrganization,
+    makeInternalAgent,
+  }) => {
+    const project = await seedProject("cross-org");
+    const otherOrg = await makeOrganization();
+    const foreignAgent = await makeInternalAgent({
+      organizationId: otherOrg.id,
+    });
+
+    const res = await app.inject({
+      method: "PATCH",
+      url: `/api/projects/${project.id}`,
+      payload: { defaultAgentId: foreignAgent.id },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(
+      (await ProjectModel.findById(project.id))?.defaultAgentId,
+    ).toBeNull();
+  });
+
+  test("rejects a soft-deleted agent", async ({ makeInternalAgent }) => {
+    const project = await seedProject("deleted-agent");
+    const agent = await makeInternalAgent({ organizationId });
+    await AgentModel.delete(agent.id);
+
+    const res = await app.inject({
+      method: "PATCH",
+      url: `/api/projects/${project.id}`,
+      payload: { defaultAgentId: agent.id },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(
+      (await ProjectModel.findById(project.id))?.defaultAgentId,
+    ).toBeNull();
+  });
+
+  // Agents soft-delete, so the column's ON DELETE SET NULL never fires and the
+  // pin outlives its eligibility. The read path is what has to notice.
+  test("stops reporting a pin whose agent was deleted", async ({
+    makeInternalAgent,
+  }) => {
+    const project = await seedProject("goes-stale");
+    const agent = await makeInternalAgent({ organizationId });
+    await projectService.update({
+      id: project.id,
+      organizationId,
+      userId: owner.id,
+      defaultAgentId: agent.id,
+    });
+
+    await AgentModel.delete(agent.id);
+
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/projects/${project.id}`,
+    });
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().defaultAgent).toBeNull();
+    // The column keeps its value; re-picking in the dialog repairs it.
+    expect((await ProjectModel.findById(project.id))?.defaultAgentId).toBe(
+      agent.id,
+    );
+  });
+
+  // The editor is shown "no default" for a stale pin, so selecting that back is
+  // a no-op it cannot send. Without the repair, re-widening the agent's scope
+  // resurrects a pin the user was last told was absent.
+  test("clears a stale pin on the next update instead of letting it resurrect", async ({
+    makeInternalAgent,
+  }) => {
+    const project = await seedProject("no-resurrect");
+    const agent = await makeInternalAgent({ organizationId });
+    await projectService.update({
+      id: project.id,
+      organizationId,
+      userId: owner.id,
+      defaultAgentId: agent.id,
+    });
+
+    const key = { organizationId, resource: "agent" as const, scope: agent.id };
+    const policy = await ResourcePermissionPolicyModel.find(key);
+    if (!policy) throw new Error("Expected persisted resource policy");
+    await ResourcePermissionPolicyModel.replace({
+      ...key,
+      revision: policy.revision,
+      grants: [],
+    });
+
+    // An unrelated edit — the caller never mentions the default agent.
+    const renamed = await app.inject({
+      method: "PATCH",
+      url: `/api/projects/${project.id}`,
+      payload: { name: "renamed-while-stale" },
+    });
+    expect(renamed.statusCode).toBe(200);
+    expect(
+      (await ProjectModel.findById(project.id))?.defaultAgentId,
+    ).toBeNull();
+
+    await ResourcePermissionPolicyModel.replace({
+      ...key,
+      revision: policy.revision + 1,
+      grants: policy.grants,
+    });
+
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/projects/${project.id}`,
+    });
+    expect(detail.json().defaultAgent).toBeNull();
+  });
+
+  test("leaves a still-valid pin alone on an unrelated update", async ({
+    makeInternalAgent,
+  }) => {
+    const project = await seedProject("valid-pin-kept");
+    const agent = await makeInternalAgent({ organizationId });
+    await projectService.update({
+      id: project.id,
+      organizationId,
+      userId: owner.id,
+      defaultAgentId: agent.id,
+    });
+
+    await app.inject({
+      method: "PATCH",
+      url: `/api/projects/${project.id}`,
+      payload: { description: "unrelated" },
+    });
+    expect((await ProjectModel.findById(project.id))?.defaultAgentId).toBe(
+      agent.id,
+    );
+  });
+
+  test("stops reporting a pin after the actor’s read grant is revoked", async ({
+    makeInternalAgent,
+  }) => {
+    const project = await seedProject("rescoped");
+    const agent = await makeInternalAgent({ organizationId });
+    await projectService.update({
+      id: project.id,
+      organizationId,
+      userId: owner.id,
+      defaultAgentId: agent.id,
+    });
+
+    const key = { organizationId, resource: "agent" as const, scope: agent.id };
+    const policy = await ResourcePermissionPolicyModel.find(key);
+    if (!policy) throw new Error("Expected persisted resource policy");
+    await ResourcePermissionPolicyModel.replace({
+      ...key,
+      revision: policy.revision,
+      grants: [],
+    });
+
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/projects/${project.id}`,
+    });
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().defaultAgent).toBeNull();
+  });
+});

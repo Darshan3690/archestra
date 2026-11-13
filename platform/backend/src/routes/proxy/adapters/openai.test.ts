@@ -1,6 +1,6 @@
-import { describe, expect, test } from "@/test";
+import { describe, expect, test } from "vitest";
 import type { OpenAi } from "@/types";
-import { openaiAdapterFactory } from "./openai";
+import { openaiAdapterFactory, withReplyAudioWithinLimit } from "./openai";
 
 function createMockResponse(
   message: OpenAi.Types.ChatCompletionsResponse["choices"][0]["message"],
@@ -28,6 +28,12 @@ function createMockResponse(
       completion_tokens: usage?.completion_tokens ?? 50,
       total_tokens:
         (usage?.prompt_tokens ?? 100) + (usage?.completion_tokens ?? 50),
+      ...(usage?.prompt_tokens_details
+        ? { prompt_tokens_details: usage.prompt_tokens_details }
+        : {}),
+      ...(usage?.completion_tokens_details
+        ? { completion_tokens_details: usage.completion_tokens_details }
+        : {}),
     },
   };
 }
@@ -220,7 +226,107 @@ describe("OpenAIResponseAdapter", () => {
     });
   });
 
+  describe("getFinishReasons", () => {
+    test("extracts the finish reason from the first choice", () => {
+      const response = createMockResponse({
+        role: "assistant",
+        content: "Hello",
+      });
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+      expect(adapter.getFinishReasons()).toEqual(["stop"]);
+    });
+
+    test("returns empty array when choices is empty", () => {
+      const response = {
+        ...createMockResponse({ role: "assistant", content: "x" }),
+        choices: [],
+      };
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+      expect(adapter.getFinishReasons()).toEqual([]);
+      expect(adapter.getText()).toBe("");
+      expect(adapter.getToolCalls()).toEqual([]);
+      expect(adapter.hasToolCalls()).toBe(false);
+    });
+  });
+
+  describe("responses without choices (upstream error bodies)", () => {
+    test("surfaces the embedded upstream error message and status", () => {
+      const response = {
+        error: { message: "Rate limit exceeded", code: 429 },
+      } as unknown as OpenAi.Types.ChatCompletionsResponse;
+
+      expect(() =>
+        openaiAdapterFactory.createResponseAdapter(response),
+      ).toThrow(
+        expect.objectContaining({
+          statusCode: 429,
+          message: "Rate limit exceeded",
+        }),
+      );
+    });
+
+    test("defaults to 502 with a generic message when no error details exist", () => {
+      const response = {} as unknown as OpenAi.Types.ChatCompletionsResponse;
+
+      expect(() =>
+        openaiAdapterFactory.createResponseAdapter(response),
+      ).toThrow(
+        expect.objectContaining({
+          statusCode: 502,
+          message:
+            "Upstream openai provider returned a response without choices",
+        }),
+      );
+    });
+
+    test("ignores non-HTTP error codes when picking the status", () => {
+      const response = {
+        error: { message: "boom", code: "model_not_found" },
+      } as unknown as OpenAi.Types.ChatCompletionsResponse;
+
+      expect(() =>
+        openaiAdapterFactory.createResponseAdapter(response),
+      ).toThrow(expect.objectContaining({ statusCode: 502 }));
+    });
+  });
+
   describe("getUsage", () => {
+    test("prices an audio chat response's audio tokens at the audio tariff", () => {
+      // gpt-audio: 20 text + 100 audio tokens in, 10 text + 250 audio out.
+      const response = {
+        ...createMockResponse(
+          { role: "assistant", content: "Hello" },
+          {
+            prompt_tokens: 120,
+            completion_tokens: 260,
+            prompt_tokens_details: { audio_tokens: 100, text_tokens: 20 },
+            completion_tokens_details: { audio_tokens: 250, text_tokens: 10 },
+          },
+        ),
+        model: "gpt-audio-2025-08-28",
+      };
+      const usage = openaiAdapterFactory
+        .createResponseAdapter(response)
+        .getUsage();
+      expect(usage).toMatchObject({
+        inputTokens: 120,
+        outputTokens: 260,
+        providerReportedCost: 0.01935,
+        mediaTariff: true,
+      });
+      // A text-only turn on the same model keeps the per-token chat price.
+      const textOnly = openaiAdapterFactory
+        .createResponseAdapter({
+          ...createMockResponse({ role: "assistant", content: "Hello" }),
+          model: "gpt-audio-2025-08-28",
+        })
+        .getUsage();
+      expect(textOnly.providerReportedCost).toBeUndefined();
+      expect(textOnly.mediaTariff).toBeUndefined();
+    });
+
     test("extracts usage tokens from response", () => {
       const response = createMockResponse(
         { role: "assistant", content: "Test" },
@@ -233,7 +339,48 @@ describe("OpenAIResponseAdapter", () => {
       expect(usage).toEqual({
         inputTokens: 150,
         outputTokens: 75,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
       });
+    });
+
+    test("subtracts cached tokens from prompt to avoid double-counting", () => {
+      const response = createMockResponse(
+        { role: "assistant", content: "Test" },
+        {
+          prompt_tokens: 150,
+          completion_tokens: 75,
+          prompt_tokens_details: { cached_tokens: 120 },
+        },
+      );
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+
+      // OpenAI's cached_tokens are a SUBSET of prompt_tokens: uncached = 150-120.
+      expect(adapter.getUsage()).toEqual({
+        inputTokens: 30,
+        outputTokens: 75,
+        cacheReadTokens: 120,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+      });
+    });
+
+    test("extracts reasoning_tokens from completion_tokens_details", () => {
+      const response = createMockResponse(
+        { role: "assistant", content: "Test" },
+        {
+          prompt_tokens: 150,
+          completion_tokens: 75,
+          completion_tokens_details: { reasoning_tokens: 40 },
+        },
+      );
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+
+      // reasoning_tokens are a subset already inside completion_tokens.
+      expect(adapter.getUsage().reasoningTokens).toBe(40);
     });
   });
 
@@ -254,6 +401,76 @@ describe("OpenAIResponseAdapter", () => {
         "Tool call blocked by policy",
       );
       expect(refusal.choices[0].finish_reason).toBe("stop");
+    });
+
+    test("clears logprobs that encode the withheld raw text", () => {
+      const response = createMockResponse({
+        role: "assistant",
+        content: "withheld raw text",
+      });
+      response.choices[0].logprobs = {
+        content: [
+          {
+            token: "withheld raw text",
+            bytes: [],
+            logprob: -0.1,
+            top_logprobs: [],
+          },
+        ],
+        refusal: null,
+      };
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+      const refusal = adapter.toRefusalResponse(
+        "Full refusal",
+        "Tool call blocked by policy",
+      );
+
+      expect(refusal.choices[0].logprobs).toBeNull();
+      expect(JSON.stringify(refusal.choices[0])).not.toContain(
+        "withheld raw text",
+      );
+    });
+  });
+
+  describe("withReplacedText", () => {
+    test("replaces the message content", () => {
+      const response = createMockResponse({
+        role: "assistant",
+        content: "Original content",
+      });
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+      const replaced = adapter.withReplacedText?.("approved replacement");
+
+      expect(replaced?.choices[0].message.content).toBe("approved replacement");
+      expect(replaced?.choices[0].finish_reason).toBe("stop");
+    });
+
+    test("clears logprobs that encode the replaced raw text", () => {
+      const response = createMockResponse({
+        role: "assistant",
+        content: "withheld raw text",
+      });
+      response.choices[0].logprobs = {
+        content: [
+          {
+            token: "withheld raw text",
+            bytes: [],
+            logprob: -0.1,
+            top_logprobs: [],
+          },
+        ],
+        refusal: null,
+      };
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+      const replaced = adapter.withReplacedText?.("approved replacement");
+
+      expect(replaced?.choices[0].logprobs).toBeNull();
+      expect(JSON.stringify(replaced?.choices[0])).not.toContain(
+        "withheld raw text",
+      );
     });
   });
 });
@@ -385,6 +602,7 @@ describe("OpenAIRequestAdapter", () => {
         {
           id: "call_123",
           name: "get_weather",
+          arguments: { location: "NYC" },
           content: { temperature: 72, unit: "fahrenheit" },
           isError: false,
         },
@@ -688,16 +906,794 @@ describe("openaiAdapterFactory", () => {
       expect(apiKey).toBeUndefined();
     });
   });
+});
 
-  describe("provider info", () => {
-    test("has correct provider name", () => {
-      expect(openaiAdapterFactory.provider).toBe("openai");
+describe("OpenAIStreamAdapter", () => {
+  type Chunk = OpenAi.Types.ChatCompletionChunk;
+
+  test.each([
+    false,
+    true,
+  ])("keeps reading until terminal usage with finish-chunk usage=%s", (finishHasUsage) => {
+    const adapter = openaiAdapterFactory.createStreamAdapter({
+      model: "test-model",
+      messages: [{ role: "user", content: "Hello" }],
+      stream: true,
+    });
+    const chunk = (choices: Chunk["choices"], tokens: number): Chunk => ({
+      id: "reply",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test-model",
+      choices,
+      usage: {
+        prompt_tokens: tokens,
+        completion_tokens: tokens,
+        total_tokens: tokens * 2,
+      },
+    });
+    // An early usage-only chunk and an empty heartbeat are not terminal.
+    expect(adapter.processChunk(chunk([], 0)).isFinal).toBe(false);
+    expect(
+      adapter.processChunk({ ...chunk([], 0), usage: undefined }).isFinal,
+    ).toBe(false);
+    expect(
+      adapter.processChunk(
+        chunk(
+          [
+            {
+              index: 0,
+              delta: { role: "assistant", content: "Hello" },
+              finish_reason: null,
+            },
+          ],
+          0,
+        ),
+      ).isFinal,
+    ).toBe(false);
+    expect(
+      adapter.processChunk(
+        chunk(
+          [{ index: 0, delta: { content: " world" }, finish_reason: null }],
+          2,
+        ),
+      ).isFinal,
+    ).toBe(false);
+    expect(
+      adapter.processChunk({
+        ...chunk([{ index: 0, delta: {}, finish_reason: "stop" }], 2),
+        usage: finishHasUsage ? chunk([], 2).usage : undefined,
+      }).isFinal,
+    ).toBe(false);
+    expect(adapter.processChunk(chunk([], 7)).isFinal).toBe(true);
+    expect(adapter.toProviderResponse().choices[0].message.content).toBe(
+      "Hello world",
+    );
+    expect(adapter.state.usage).toMatchObject({
+      inputTokens: 7,
+      outputTokens: 7,
+    });
+  });
+
+  function usageOf(endSse: string | Uint8Array): unknown {
+    const text =
+      typeof endSse === "string" ? endSse : new TextDecoder().decode(endSse);
+    const firstData = text.split("\n\n")[0].replace(/^data: /, "");
+    return (JSON.parse(firstData) as { usage?: unknown }).usage;
+  }
+
+  // gpt-audio streams its reply in `delta.audio`: audio and transcript pieces
+  // with no text content. Only the first chunk (which carries `role`) reached
+  // the client, so it played a tenth of a second and never saw the words, and
+  // the recorded turn had no reply at all.
+  test("relays a spoken reply, records its transcript, and keeps the usage details", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter({
+      model: "gpt-audio",
+      messages: [{ role: "user", content: "Say hello." }],
+      stream: true,
+      stream_options: { include_usage: true },
+    } as OpenAi.Types.ChatCompletionsRequest);
+    const chunk = (delta: object, extra: object = {}) =>
+      ({
+        id: "chatcmpl-a",
+        object: "chat.completion.chunk",
+        created: 0,
+        model: "gpt-audio",
+        choices: [{ index: 0, delta, finish_reason: null }],
+        ...extra,
+      }) as unknown as Chunk;
+
+    const relayed = [
+      adapter.processChunk(
+        chunk({
+          role: "assistant",
+          content: null,
+          audio: { id: "audio_1", data: "AAAA", expires_at: 99 },
+        }),
+      ),
+      adapter.processChunk(chunk({ audio: { transcript: "Hello " } })),
+      adapter.processChunk(chunk({ audio: { data: "BBBB" } })),
+      adapter.processChunk(chunk({ audio: { transcript: "there." } })),
+    ];
+    for (const result of relayed) {
+      expect(result.sseData).toMatch(/^data: /);
+      expect(result.isResponsePreamble ?? false).toBe(false);
+    }
+    expect(relayed[2].sseData).toContain('"data":"BBBB"');
+
+    adapter.processChunk({
+      ...chunk({}),
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    } as Chunk);
+    adapter.processChunk({
+      ...chunk({}),
+      choices: [],
+      usage: {
+        prompt_tokens: 19,
+        completion_tokens: 72,
+        total_tokens: 91,
+        prompt_tokens_details: { cached_tokens: 0, audio_tokens: 0 },
+        completion_tokens_details: { audio_tokens: 56, text_tokens: 16 },
+      },
+    } as unknown as Chunk);
+
+    const response = adapter.toProviderResponse();
+    expect(response.choices[0].message).toMatchObject({
+      content: null,
+      audio: { id: "audio_1", transcript: "Hello there.", expires_at: 99 },
+    });
+    // Plugins see the turn without the audio; the log row keeps it to play.
+    expect(JSON.stringify(response)).not.toContain("AAAA");
+    expect(adapter.toLoggedResponse?.().choices[0].message).toMatchObject({
+      audio: { id: "audio_1", transcript: "Hello there.", data: "AAAABBBB" },
     });
 
-    test("has correct interaction type", () => {
-      expect(openaiAdapterFactory.interactionType).toBe(
-        "openai:chatCompletions",
-      );
+    const endSse = adapter.formatEndSSE();
+    const end =
+      typeof endSse === "string" ? endSse : new TextDecoder().decode(endSse);
+    const usage = JSON.parse(end.split("\n\n")[1].replace(/^data: /, "")) as {
+      usage: unknown;
+    };
+    expect(usage.usage).toMatchObject({
+      prompt_tokens: 19,
+      completion_tokens: 72,
+      completion_tokens_details: { audio_tokens: 56, text_tokens: 16 },
     });
+  });
+
+  test("a logged spoken reply keeps its audio up to the clip limit", () => {
+    const reply = (data: string) => ({
+      id: "chatcmpl-b",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            audio: { id: "audio_2", data, transcript: "Hi.", expires_at: 1 },
+          },
+        },
+      ],
+    });
+    // A short clip is kept as it came, so the Logs page can play it.
+    const short = reply("UklGRiQAAABXQVZF");
+    expect(withReplyAudioWithinLimit(short)).toBe(short);
+    // Past 2 MB the audio is dropped and marked, the transcript kept.
+    const long = reply("A".repeat(2_800_008));
+    expect(withReplyAudioWithinLimit(long).choices[0].message.audio).toEqual({
+      id: "audio_2",
+      transcript: "Hi.",
+      expires_at: 1,
+      data_omitted: "too_large",
+    });
+    expect(long.choices[0].message.audio.data).toHaveLength(2_800_008);
+    const text = { choices: [{ message: { content: "Hello" } }] };
+    expect(withReplyAudioWithinLimit(text)).toBe(text);
+  });
+
+  // The refusal is emitted as a further delta, which clients concatenate onto
+  // the content they have accumulated — so the client holds the model's text
+  // AND the refusal. Reporting the refusal alone dropped the model's own answer
+  // from the record, leaving later readers a turn in which it never spoke.
+  test("toProviderResponse keeps streamed content and appends the refusal", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [
+        { index: 0, delta: { content: "let me check" }, finish_reason: null },
+      ],
+    } as Chunk);
+
+    adapter.formatCompleteTextSSE("blocked message");
+    const response = adapter.toProviderResponse();
+
+    expect(response.choices[0].message.content).toBe(
+      "let me checkblocked message",
+    );
+    expect(response.choices[0].finish_reason).toBe("stop");
+  });
+
+  // Reasoning models stream their thinking in `reasoning_content`. It reached
+  // the client but was never accumulated, so the recorded turn looked as though
+  // the model had gone straight to its answer.
+  test("toProviderResponse records the reasoning the model streamed", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [
+        {
+          index: 0,
+          // Not part of the typed delta — the adapter reads it by cast for the
+          // same reason.
+          delta: {
+            reasoning_content: "weighing ",
+          } as Chunk["choices"][number]["delta"],
+          finish_reason: null,
+        },
+      ],
+    } as Chunk);
+    adapter.processChunk({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [
+        {
+          index: 0,
+          // Not part of the typed delta — the adapter reads it by cast for the
+          // same reason.
+          delta: {
+            reasoning_content: "it up",
+          } as Chunk["choices"][number]["delta"],
+          finish_reason: null,
+        },
+      ],
+    } as Chunk);
+    adapter.processChunk({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [
+        { index: 0, delta: { content: "the answer" }, finish_reason: null },
+      ],
+    } as Chunk);
+
+    const message = adapter.toProviderResponse().choices[0].message as {
+      content: string | null;
+      reasoning_content?: string;
+    };
+    expect(message.reasoning_content).toBe("weighing it up");
+    expect(message.content).toBe("the answer");
+  });
+
+  test("carries the trailing usage chunk into the final SSE as gross prompt_tokens with cache detail", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [{ index: 0, delta: { content: "hi" }, finish_reason: null }],
+    } as Chunk);
+    adapter.processChunk({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    } as Chunk);
+    // OpenAI/OpenRouter send usage in a separate trailing chunk with empty choices.
+    adapter.processChunk({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [],
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 42,
+        total_tokens: 142,
+        prompt_tokens_details: { cached_tokens: 10 },
+      },
+    } as Chunk);
+
+    // The upstream's own prompt_tokens (100, already gross) is round-tripped as-is,
+    // with the cache-read subset republished via prompt_tokens_details.
+    expect(usageOf(adapter.formatEndSSE())).toEqual({
+      prompt_tokens: 100,
+      completion_tokens: 42,
+      total_tokens: 142,
+      prompt_tokens_details: { cached_tokens: 10 },
+    });
+  });
+
+  test("omits prompt_tokens_details in the final SSE when nothing was cached", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      id: "chatcmpl-4",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [{ index: 0, delta: { content: "hi" }, finish_reason: "stop" }],
+    } as Chunk);
+    adapter.processChunk({
+      id: "chatcmpl-4",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [],
+      usage: { prompt_tokens: 100, completion_tokens: 42, total_tokens: 142 },
+    } as Chunk);
+
+    expect(usageOf(adapter.formatEndSSE())).toEqual({
+      prompt_tokens: 100,
+      completion_tokens: 42,
+      total_tokens: 142,
+    });
+  });
+
+  test("sends usage on its own trailing chunk with empty choices when the client set include_usage, as OpenAI does", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter({
+      model: "gpt-x",
+      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+      stream_options: { include_usage: true },
+    } as Parameters<typeof openaiAdapterFactory.createStreamAdapter>[0]);
+    adapter.processChunk({
+      id: "chatcmpl-6",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [{ index: 0, delta: { content: "hi" }, finish_reason: "stop" }],
+    } as Chunk);
+    adapter.processChunk({
+      id: "chatcmpl-6",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [],
+      usage: { prompt_tokens: 100, completion_tokens: 42, total_tokens: 142 },
+    } as Chunk);
+
+    const frames = String(adapter.formatEndSSE()).split("\n\n").filter(Boolean);
+    expect(frames).toHaveLength(3);
+    expect(frames[2]).toBe("data: [DONE]");
+    const [finish, usage] = frames
+      .slice(0, 2)
+      .map((frame) => JSON.parse(frame.replace(/^data: /, "")));
+    expect(finish.choices[0].finish_reason).toBe("stop");
+    expect(finish.usage).toBeUndefined();
+    expect(usage).toMatchObject({
+      id: "chatcmpl-6",
+      object: "chat.completion.chunk",
+      choices: [],
+      usage: { prompt_tokens: 100, completion_tokens: 42, total_tokens: 142 },
+    });
+  });
+
+  test("toProviderResponse reports gross prompt_tokens with cache detail (non-streaming path)", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      id: "chatcmpl-5",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [{ index: 0, delta: { content: "hi" }, finish_reason: "stop" }],
+    } as Chunk);
+    adapter.processChunk({
+      id: "chatcmpl-5",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [],
+      usage: {
+        prompt_tokens: 4000,
+        completion_tokens: 100,
+        total_tokens: 4100,
+        prompt_tokens_details: { cached_tokens: 3900 },
+      },
+    } as Chunk);
+
+    expect(adapter.toProviderResponse().usage).toEqual({
+      prompt_tokens: 4000,
+      completion_tokens: 100,
+      total_tokens: 4100,
+      prompt_tokens_details: { cached_tokens: 3900 },
+    });
+  });
+
+  function deltaOf(
+    sseData: string | Uint8Array | null,
+  ): Record<string, unknown> {
+    if (sseData === null) throw new Error("expected sseData, got null");
+    const text =
+      typeof sseData === "string" ? sseData : new TextDecoder().decode(sseData);
+    const json = JSON.parse(text.replace(/^data: /, "").trim()) as {
+      choices: Array<{ delta: Record<string, unknown> }>;
+    };
+    return json.choices[0].delta;
+  }
+
+  test("forwards a reasoning-only chunk (reasoning_content) instead of dropping it", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    const result = adapter.processChunk({
+      id: "chatcmpl-r",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "qwen3",
+      choices: [
+        {
+          index: 0,
+          delta: { reasoning_content: "Let me think..." },
+          finish_reason: null,
+        },
+      ],
+    } as unknown as Chunk);
+
+    expect(result.sseData).not.toBeNull();
+    expect(deltaOf(result.sseData)).toMatchObject({
+      reasoning_content: "Let me think...",
+    });
+  });
+
+  test("forwards a reasoning-only chunk using the `reasoning` field (OpenRouter)", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    const result = adapter.processChunk({
+      id: "chatcmpl-r2",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "glm",
+      choices: [{ index: 0, delta: { reasoning: "hmm" }, finish_reason: null }],
+    } as unknown as Chunk);
+
+    expect(result.sseData).not.toBeNull();
+    expect(deltaOf(result.sseData)).toMatchObject({ reasoning: "hmm" });
+  });
+
+  test("still drops a truly empty delta chunk (no content, no reasoning)", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    const result = adapter.processChunk({
+      id: "chatcmpl-e",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "qwen3",
+      choices: [{ index: 0, delta: {}, finish_reason: null }],
+    } as Chunk);
+
+    expect(result.sseData).toBeNull();
+  });
+
+  test("streams reasoning without its accompanying tool call and records it", () => {
+    // The call remains buffered for policy evaluation, but reasoning is not call
+    // data and must reach the client and the accumulated response.
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    const result = adapter.processChunk({
+      id: "chatcmpl-rt",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "qwen3",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            reasoning_content: "thinking",
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_1",
+                type: "function",
+                function: { name: "search", arguments: "{}" },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+    } as unknown as Chunk);
+
+    expect(deltaOf(result.sseData)).toEqual({ reasoning_content: "thinking" });
+    expect(result.isToolCallChunk).toBe(true);
+    expect(
+      (
+        adapter.toProviderResponse().choices[0].message as {
+          reasoning_content?: string;
+        }
+      ).reasoning_content,
+    ).toBe("thinking");
+    expect(deltaOf(adapter.getRawToolCallEvents()[0])).toEqual({
+      tool_calls: expect.any(Array),
+    });
+  });
+
+  test("relays spoken audio without the tool call it carries, which waits for policy evaluation", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    const result = adapter.processChunk({
+      id: "chatcmpl-audio-tool",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-audio",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            audio: { id: "audio_1", data: "AAAA", transcript: "Checking." },
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_1",
+                type: "function",
+                function: { name: "blocked_tool", arguments: '{"x":1}' },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+    } as unknown as Chunk);
+
+    expect(result.sseData).not.toContain("blocked_tool");
+    expect(deltaOf(result.sseData)).toEqual({
+      audio: { id: "audio_1", data: "AAAA", transcript: "Checking." },
+    });
+    expect(result.isToolCallChunk).toBe(true);
+    // Only the call is held, so releasing it does not replay the audio.
+    expect(deltaOf(adapter.getRawToolCallEvents()[0])).toEqual({
+      tool_calls: [expect.objectContaining({ id: "call_1" })],
+    });
+  });
+
+  test("keeps reasoning when a trajectory prefix and tool call share the opening chunk", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    adapter.setTextSuffix?.(() => "[appa] protected child trajectory");
+
+    const result = adapter.processChunk({
+      id: "chatcmpl-prefixed-reasoning",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "qwen3",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            reasoning_content: "thinking",
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_1",
+                type: "function",
+                function: { name: "search", arguments: "{}" },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+    } as unknown as Chunk);
+
+    expect(result.sseData).toContain("[appa] protected child trajectory");
+    expect(result.sseData).toContain('"reasoning_content":"thinking"');
+    expect(result.sseData).not.toContain('"tool_calls"');
+  });
+
+  function finishReasonOf(endSse: string | Uint8Array): unknown {
+    const text =
+      typeof endSse === "string" ? endSse : new TextDecoder().decode(endSse);
+    const firstData = text.split("\n\n")[0].replace(/^data: /, "");
+    return (
+      JSON.parse(firstData) as {
+        choices?: Array<{ finish_reason?: unknown }>;
+      }
+    ).choices?.[0]?.finish_reason;
+  }
+
+  test("clears held calls and closes a replaced stream as stop", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      id: "chatcmpl-3",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_1",
+                type: "function",
+                function: { name: "list", arguments: '{"a":1}' },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+    } as Chunk);
+
+    expect(adapter.state.toolCalls).toHaveLength(1);
+    expect(adapter.getRawToolCallEvents()).toHaveLength(1);
+
+    adapter.prepareResponseReplacement?.();
+    const replacementWire = [
+      ...adapter.formatCompleteTextSSE("blocked"),
+      adapter.formatEndSSE(),
+    ].join("");
+
+    expect(adapter.state.toolCalls).toEqual([]);
+    expect(adapter.getRawToolCallEvents()).toEqual([]);
+    expect(replacementWire).not.toContain("call_1");
+    expect(finishReasonOf(adapter.formatEndSSE())).toBe("stop");
+
+    const response = adapter.toProviderResponse();
+    expect(response.choices[0].finish_reason).toBe("stop");
+    expect(response.choices[0].message.tool_calls).toBeUndefined();
+    expect(response.choices[0].message.content).toBe("blocked");
+  });
+
+  test("omits usage when the provider sent none", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      id: "chatcmpl-2",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [{ index: 0, delta: { content: "hi" }, finish_reason: "stop" }],
+    } as Chunk);
+
+    expect(usageOf(adapter.formatEndSSE())).toBeUndefined();
+  });
+});
+
+describe("execute custom-tool normalization", () => {
+  // Cursor attaches its ApplyPatch custom tool in the flat Responses-API
+  // shape; OpenAI's /chat/completions rejects that with "Missing required
+  // parameter: 'tools[N].custom'". The adapter must forward the nested Chat
+  // Completions shape instead, leaving other tools untouched.
+  const flatCustomTool = {
+    type: "custom",
+    name: "ApplyPatch",
+    description: "Use this tool to edit files.",
+    format: {
+      type: "grammar",
+      definition: "start: begin_patch hunk end_patch",
+      syntax: "lark",
+    },
+  };
+  const functionTool = {
+    type: "function",
+    function: { name: "Read", parameters: {} },
+  };
+
+  function captureClient() {
+    const captured: { params?: Record<string, unknown> } = {};
+    const client = {
+      chat: {
+        completions: {
+          create: (params: Record<string, unknown>) => {
+            captured.params = params;
+            return createMockResponse({ role: "assistant", content: "ok" });
+          },
+        },
+      },
+    };
+    return { captured, client };
+  }
+
+  test("nests a flat Responses-style custom tool before forwarding", async () => {
+    const { captured, client } = captureClient();
+    const request = createMockRequest([{ role: "user", content: "hi" }], {
+      tools: [
+        functionTool,
+        flatCustomTool,
+      ] as OpenAi.Types.ChatCompletionsRequest["tools"],
+    });
+
+    await openaiAdapterFactory.execute(client, request);
+
+    const tools = captured.params?.tools as Array<Record<string, unknown>>;
+    expect(tools[0]).toEqual(functionTool);
+    expect(tools[1]).toEqual({
+      type: "custom",
+      custom: {
+        name: "ApplyPatch",
+        description: "Use this tool to edit files.",
+        format: {
+          type: "grammar",
+          grammar: {
+            definition: "start: begin_patch hunk end_patch",
+            syntax: "lark",
+          },
+        },
+      },
+    });
+    // The caller's request object must not be mutated.
+    expect(request.tools?.[1]).toEqual(flatCustomTool);
+  });
+
+  test("nulls out empty assistant content arrays before forwarding", async () => {
+    // Cursor sends assistant tool-call turns with content: []; OpenAI rejects
+    // the empty array ("Expected an array with minimum length 1").
+    const { captured, client } = captureClient();
+    const request = createMockRequest([
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: [],
+        tool_calls: [
+          {
+            id: "call_1",
+            type: "function",
+            function: { name: "Read", arguments: "{}" },
+          },
+        ],
+      },
+      { role: "tool", tool_call_id: "call_1", content: "file contents" },
+    ] as OpenAi.Types.ChatCompletionsRequest["messages"]);
+
+    await openaiAdapterFactory.execute(client, request);
+
+    const messages = captured.params?.messages as Array<
+      Record<string, unknown>
+    >;
+    expect(messages[1].content).toBeNull();
+    expect(messages[1].tool_calls).toBeDefined();
+    // Non-empty content and other roles stay untouched.
+    expect(messages[0].content).toBe("hi");
+    expect(messages[2].content).toBe("file contents");
+  });
+
+  test("leaves already-nested custom tools and tool-less requests untouched", async () => {
+    const { captured, client } = captureClient();
+    const nested = {
+      type: "custom",
+      custom: { name: "ApplyPatch" },
+    };
+    const request = createMockRequest([{ role: "user", content: "hi" }], {
+      tools: [nested] as OpenAi.Types.ChatCompletionsRequest["tools"],
+    });
+
+    await openaiAdapterFactory.execute(client, request);
+    expect((captured.params?.tools as unknown[])[0]).toEqual(nested);
+  });
+});
+
+describe("OpenAIRequestAdapter replayed tool-call ids", () => {
+  test("fits a Gemini call id after the result update looked it up", () => {
+    const geminiCallId = `gemsig-${"s".repeat(450)}.gemini-call-read-1`;
+    const request = createMockRequest([
+      { role: "user", content: "Read a.txt" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: geminiCallId,
+            type: "function",
+            function: { name: "read", arguments: "{}" },
+          },
+        ],
+      },
+      { role: "tool", tool_call_id: geminiCallId, content: "SECRET" },
+    ]);
+
+    const adapter = openaiAdapterFactory.createRequestAdapter(request);
+    adapter.applyToolResultUpdates({ [geminiCallId]: "sanitized" });
+    const messages = adapter.toProviderRequest().messages;
+
+    const assistant = messages[1] as { tool_calls: Array<{ id: string }> };
+    const id = assistant.tool_calls[0].id;
+    expect(id).toMatch(/^call_[0-9a-f]{32}$/);
+    expect(messages[2]).toMatchObject({ tool_call_id: id });
+    expect(JSON.stringify(messages[2])).toContain("sanitized");
+    expect(JSON.stringify(messages)).not.toContain("SECRET");
+    expect(adapter.getToolResults()[0].id).toBe(geminiCallId);
   });
 });

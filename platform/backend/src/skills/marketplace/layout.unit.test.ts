@@ -1,0 +1,451 @@
+import { describe, expect, test } from "vitest";
+import { parseSkillManifest } from "@/skills/parser";
+import type { SkillFile } from "@/types";
+import {
+  computeLayout,
+  type MaterializePluginInput,
+  type MaterializeRequest,
+  type MaterializeSkillInput,
+} from "./layout";
+
+function makeResourceFile(path: string): SkillFile {
+  return {
+    id: `file-${path}`,
+    skillId: "11111111-2222-3333-4444-555555555555",
+    path,
+    content: `contents of ${path}`,
+    encoding: "utf8",
+    digest: null,
+    kind: "reference",
+    createdAt: new Date("2026-01-01T00:00:00.000Z"),
+  };
+}
+
+function makeSkill(
+  files: SkillFile[],
+  overrides: Partial<MaterializeSkillInput> = {},
+): MaterializeSkillInput {
+  return {
+    id: "11111111-2222-3333-4444-555555555555",
+    name: "PDF Helper",
+    description: "Helps with PDFs",
+    content: "# PDF Helper",
+    license: null,
+    compatibility: null,
+    allowedTools: null,
+    agentName: null,
+    templated: false,
+    metadata: {},
+    updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+    files,
+    ...overrides,
+  };
+}
+
+describe("computeLayout", () => {
+  test("drops resource files whose path collides only by case", () => {
+    const files = computeTestLayout({
+      ref: { kind: "link", id: "aaaaaaaa-1111-2222-3333-444444444444" },
+      marketplaceName: "org-abcd1234-skills",
+      ownerName: "Acme Corp",
+      displayName: "Acme Skills",
+      skills: [
+        makeSkill([
+          makeResourceFile("docs/Note.md"),
+          makeResourceFile("docs/note.md"),
+        ]),
+      ],
+    });
+
+    // exactly one survives so the on-disk tree is unambiguous across
+    // case-sensitive and case-insensitive filesystems
+    const docPaths = files
+      .map((f) => f.path)
+      .filter((p) => /\/docs\/note\.md$/i.test(p));
+    expect(docPaths).toHaveLength(1);
+
+    // no two files in the tree share a case-insensitive path
+    const lowered = files.map((f) => f.path.toLowerCase());
+    expect(new Set(lowered).size).toBe(lowered.length);
+  });
+
+  test("keeps files whose names merely contain dots but are not `..` segments", () => {
+    const files = computeTestLayout({
+      ref: { kind: "link", id: "aaaaaaaa-1111-2222-3333-444444444444" },
+      marketplaceName: "org-abcd1234-skills",
+      ownerName: "Acme Corp",
+      displayName: "Acme Skills",
+      skills: [
+        makeSkill([
+          makeResourceFile("notes../file.md"),
+          makeResourceFile("..foo/bar.md"),
+        ]),
+      ],
+    });
+
+    // a "notes.." / "..foo" folder is a legitimate segment, not a traversal
+    expect(files.some((f) => /\/notes\.\.\/file\.md$/.test(f.path))).toBe(true);
+    expect(files.some((f) => /\/\.\.foo\/bar\.md$/.test(f.path))).toBe(true);
+  });
+
+  test("drops resource files that traverse out of the skill root", () => {
+    const files = computeTestLayout({
+      ref: { kind: "link", id: "aaaaaaaa-1111-2222-3333-444444444444" },
+      marketplaceName: "org-abcd1234-skills",
+      ownerName: "Acme Corp",
+      displayName: "Acme Skills",
+      skills: [
+        makeSkill([
+          makeResourceFile("../evil.md"),
+          makeResourceFile("a/../../etc.md"),
+        ]),
+      ],
+    });
+
+    expect(files.some((f) => /evil\.md$/.test(f.path))).toBe(false);
+    expect(files.some((f) => /etc\.md$/.test(f.path))).toBe(false);
+  });
+
+  test("drops Windows-style backslash traversal segments", () => {
+    const files = computeTestLayout({
+      ref: { kind: "link", id: "aaaaaaaa-1111-2222-3333-444444444444" },
+      marketplaceName: "org-abcd1234-skills",
+      ownerName: "Acme Corp",
+      displayName: "Acme Skills",
+      skills: [makeSkill([makeResourceFile("..\\evil.md")])],
+    });
+
+    // materialize.ts re-splits stored paths, so a backslash ".." segment must
+    // be rejected too, not just POSIX "../".
+    expect(files.some((f) => /evil\.md$/.test(f.path))).toBe(false);
+  });
+
+  test("preserves the display name in metadata, letting an author-provided displayName win", () => {
+    const files = computeTestLayout({
+      ref: { kind: "link", id: "aaaaaaaa-1111-2222-3333-444444444444" },
+      marketplaceName: "org-abcd1234-skills",
+      ownerName: "Acme Corp",
+      displayName: "Acme Skills",
+      skills: [
+        makeSkill([], { id: "a1", name: "PDF Helper" }),
+        makeSkill([], {
+          id: "a2",
+          name: "Build App",
+          metadata: { displayName: "Custom Label" },
+        }),
+      ],
+    });
+
+    const byDir = new Map(
+      files
+        .filter((f) => f.path.endsWith("/SKILL.md"))
+        .map((f) => [f.path.split("/").at(-2), parseSkillManifest(f.content)]),
+    );
+    expect(byDir.get("pdf-helper")?.metadata.displayName).toBe("PDF Helper");
+    expect(byDir.get("build-app")?.metadata.displayName).toBe("Custom Label");
+  });
+
+  test("every SKILL.md frontmatter name equals its directory, matches the Agent Skills spec, and is unique", () => {
+    const files = computeTestLayout({
+      ref: { kind: "link", id: "aaaaaaaa-1111-2222-3333-444444444444" },
+      marketplaceName: "org-abcd1234-skills",
+      ownerName: "Acme Corp",
+      displayName: "Acme Skills",
+      skills: [
+        makeSkill([], { id: "a1", name: "Archestra Platform Operations" }),
+        makeSkill([], { id: "a2", name: "Build App" }),
+        makeSkill([], { id: "a3", name: "PDF Helper" }),
+        // collides with the previous slug → disambiguated with -2
+        makeSkill([], { id: "a4", name: "PDF HELPER" }),
+        // slugifies to empty → id-derived fallback
+        makeSkill([], {
+          id: "eeeeeeee-1111-2222-3333-444444444444",
+          name: "🎉🎉",
+        }),
+        // longer than the spec's 64-char cap
+        makeSkill([], { id: "a5", name: "x".repeat(80) }),
+      ],
+    });
+
+    const skillMds = files.filter((f) =>
+      /^plugins\/[^/]+\/skills\/[^/]+\/SKILL\.md$/.test(f.path),
+    );
+    expect(skillMds).toHaveLength(6);
+
+    const seen = new Set<string>();
+    for (const file of skillMds) {
+      const dir = file.path.split("/").at(-2);
+      const parsed = parseSkillManifest(file.content);
+      expect(parsed.name).toBe(dir);
+      expect(parsed.name).toMatch(/^[a-z0-9]+(-[a-z0-9]+)*$/);
+      expect(parsed.name.length).toBeLessThanOrEqual(64);
+      seen.add(parsed.name);
+    }
+    expect(seen.size).toBe(skillMds.length);
+  });
+
+  test("stamps every client manifest with the supplied revision version", () => {
+    const files = computeLayout(
+      {
+        ref: { kind: "link", id: "aaaaaaaa-1111-2222-3333-444444444444" },
+        marketplaceName: "org-abcd1234-skills",
+        ownerName: "Acme Corp",
+        displayName: "Acme Skills",
+        skills: [makeSkill([])],
+      },
+      7,
+    );
+
+    const manifests = files.filter((file) => file.path.endsWith(".json"));
+    expect(manifests).toHaveLength(8);
+    for (const manifest of manifests) {
+      const parsed = JSON.parse(manifest.content);
+      const version = parsed.plugins?.[0]?.version ?? parsed.version;
+      expect(version).toBe("0.7.0");
+    }
+  });
+
+  test("zero plugins leaves the legacy tree byte-identical", () => {
+    const req: MaterializeRequest = {
+      ref: { kind: "link", id: "aaaaaaaa-1111-2222-3333-444444444444" },
+      marketplaceName: "org-abcd1234-skills",
+      ownerName: "Acme Corp",
+      displayName: "Acme Skills",
+      skills: [makeSkill([])],
+    };
+    expect(computeLayout(req, 3)).toEqual(
+      computeLayout({ ...req, plugins: [] }, 3),
+    );
+  });
+
+  test("emits each plugin only into its target client catalog", () => {
+    const plugins: MaterializePluginInput[] = [
+      makePlugin("claude-code", "claude-hook"),
+      makePlugin("copilot-cli", "copilot-hook"),
+      makePlugin("codex", "codex-hook"),
+      makePlugin("cursor", "cursor-hook"),
+    ];
+    const files = computeLayout(
+      {
+        ref: { kind: "link", id: "aaaaaaaa-1111-2222-3333-444444444444" },
+        marketplaceName: "org-abcd1234-skills",
+        ownerName: "Acme Corp",
+        displayName: "Acme Skills",
+        skills: [makeSkill([])],
+        plugins,
+      },
+      9,
+    );
+    const byPath = new Map(files.map((file) => [file.path, file]));
+    const manifestNames = (filePath: string) =>
+      JSON.parse(byPath.get(filePath)?.content ?? "{}").plugins.map(
+        (plugin: { name: string }) => plugin.name,
+      );
+
+    expect(manifestNames(".claude-plugin/marketplace.json")).toEqual([
+      "org-abcd1234-skills",
+      "claude-hook",
+    ]);
+    expect(manifestNames(".cursor-plugin/marketplace.json")).toEqual([
+      "org-abcd1234-skills",
+      "cursor-hook",
+    ]);
+    expect(manifestNames(".agents/plugins/marketplace.json")).toEqual([
+      "org-abcd1234-skills",
+      "codex-hook",
+    ]);
+    expect(manifestNames(".github/plugin/marketplace.json")).toEqual([
+      "org-abcd1234-skills",
+      "copilot-hook",
+    ]);
+    expect(byPath.has("plugins/org-abcd1234-skills/plugin.json")).toBe(true);
+
+    for (const plugin of plugins) {
+      const root = `plugins/${plugin.pluginSlug}`;
+      const hookFile = byPath.get(`${root}/hooks/hooks.json`);
+      expect(hookFile?.content).toBe(plugin.files[0].content);
+      expect(hookFile?.mode).toBe("100644");
+      const pluginManifest = files.find(
+        (file) =>
+          file.path.startsWith(`${root}/`) && file.path.endsWith("plugin.json"),
+      );
+      expect(JSON.parse(pluginManifest?.content ?? "{}")).not.toHaveProperty(
+        "hooks",
+      );
+    }
+  });
+
+  test("lists a Claude Desktop plugin under the name its manifest declares", () => {
+    const withManifest = (
+      pluginSlug: string,
+      name: string,
+    ): MaterializePluginInput => ({
+      ...makePlugin("claude-desktop", pluginSlug),
+      files: [
+        {
+          path: ".claude-plugin/plugin.json",
+          content: JSON.stringify({ name, version: "1.3.1" }),
+          encoding: "utf8",
+          mode: "100644",
+        },
+      ],
+    });
+    const files = computeLayout(
+      {
+        ref: { kind: "link", id: "aaaaaaaa-1111-2222-3333-444444444444" },
+        marketplaceName: "org-abcd1234-plugins",
+        ownerName: "Acme Corp",
+        displayName: "Acme Plugins",
+        skills: [],
+        plugins: [
+          withManifest("productivity-9fabc89b", "productivity"),
+          // Two plugins declaring one name keep their unique slugs.
+          withManifest("notes-11111111", "notes"),
+          withManifest("notes-22222222", "notes"),
+          makePlugin("claude-desktop", "hooks-only-33333333"),
+        ],
+      },
+      2,
+    );
+    const marketplace = JSON.parse(
+      files.find((file) => file.path === ".claude-plugin/marketplace.json")
+        ?.content ?? "{}",
+    );
+
+    expect(
+      marketplace.plugins.map((plugin: { name: string; source: string }) => [
+        plugin.name,
+        plugin.source,
+      ]),
+    ).toEqual([
+      ["org-abcd1234-plugins", "./plugins/org-abcd1234-plugins"],
+      ["hooks-only-33333333", "./plugins/hooks-only-33333333"],
+      ["notes-11111111", "./plugins/notes-11111111"],
+      ["notes-22222222", "./plugins/notes-22222222"],
+      ["productivity", "./plugins/productivity-9fabc89b"],
+    ]);
+  });
+});
+
+function computeTestLayout(
+  req: Parameters<typeof computeLayout>[0],
+): ReturnType<typeof computeLayout> {
+  return computeLayout(req, 1);
+}
+
+function makePlugin(
+  clientType: MaterializePluginInput["clientType"],
+  pluginSlug: string,
+): MaterializePluginInput {
+  return {
+    pluginSlug,
+    displayName: pluginSlug,
+    description: `Plugin for ${clientType}`,
+    clientType,
+    files: [
+      {
+        path: "hooks/hooks.json",
+        content: `  { "native": "${clientType}" }  \n`,
+        encoding: "utf8",
+        mode: "100644",
+      },
+    ],
+  };
+}
+
+test.each([
+  false,
+  true,
+])("connection plugin carries its gateway and onboarding with shared skills: %s", (withSkills) => {
+  const request: MaterializeRequest = {
+    ref: { kind: "link", id: "aaaaaaaa-1111-2222-3333-444444444444" },
+    marketplaceName: "test-extensions",
+    ownerName: "Test Org",
+    displayName: "Test Platform",
+    skills: withSkills
+      ? [
+          makeSkill([makeResourceFile("reference/example.md")], {
+            name: "connection-setup",
+          }),
+        ]
+      : [],
+    connection: {
+      appName: "Test Platform",
+      gatewayUrl: "https://example.test/v1/mcp/team",
+      serverName: "team_gateway",
+      frontendUrl: "https://dashboard.example.test",
+      iconLogo: null,
+    },
+  };
+  const files = computeTestLayout(request);
+  const get = (name: string) =>
+    files.find((file) => file.path === `plugins/test-extensions/${name}`)
+      ?.content;
+  const manifest = JSON.parse(get(".codex-plugin/plugin.json") ?? "");
+  expect(manifest.interface.displayName).toBe("Test Platform");
+  expect(get("plugin.json")).toBeUndefined(); // Native Codex silently omits the portable transport.
+  const servers = JSON.parse(get(".mcp.json") ?? "").mcpServers;
+  expect(servers.team_gateway).toEqual({
+    url: request.connection?.gatewayUrl,
+    required: true,
+  });
+  const setup = get(
+    manifest.extensions["com.openai"].onboardingSkill.replace(/^\.\//, ""),
+  );
+  expect(setup).toContain("approved terminal installer");
+  expect(setup).toContain("server exactly named team_gateway");
+  expect(setup).toContain("stop immediately without calling another server");
+  expect(setup).toContain("without a remedy");
+  expect(get("assets/logo.svg")).toContain("<svg");
+  if (withSkills) {
+    expect(manifest.extensions["com.openai"].onboardingSkill).toContain(
+      "connection-setup-2",
+    );
+    expect(get("skills/connection-setup/reference/example.md")).toBe(
+      "contents of reference/example.md",
+    );
+  }
+  expect(new Set(files.map((file) => file.path.toLowerCase())).size).toBe(
+    files.length,
+  );
+});
+
+test("ChatGPT connection packaging omits non-portable skill names without changing other marketplaces", () => {
+  const request: MaterializeRequest = {
+    ref: { kind: "link", id: "aaaaaaaa-1111-2222-3333-444444444444" },
+    marketplaceName: "test-extensions",
+    ownerName: "Test Org",
+    displayName: "Test Platform",
+    skills: [
+      makeSkill([], { id: "valid", name: "valid-skill" }),
+      makeSkill([makeResourceFile("reference/example.md")], {
+        id: "invalid",
+        name: "Not Portable",
+      }),
+    ],
+    connection: {
+      appName: "Test Platform",
+      gatewayUrl: "https://example.test/v1/mcp/team",
+      serverName: "team_gateway",
+      frontendUrl: "https://dashboard.example.test",
+      iconLogo: null,
+    },
+  };
+  const files = computeTestLayout(request);
+  expect(
+    files
+      .filter((file) => file.path.endsWith("/SKILL.md"))
+      .map((file) => file.path),
+  ).toEqual([
+    "plugins/test-extensions/skills/valid-skill/SKILL.md",
+    "plugins/test-extensions/skills/connection-setup/SKILL.md",
+  ]);
+  expect(files.some((file) => file.path.includes("/not-portable/"))).toBe(
+    false,
+  );
+  expect(
+    computeTestLayout({ ...request, connection: undefined }).some((file) =>
+      file.path.endsWith("/skills/not-portable/SKILL.md"),
+    ),
+  ).toBe(true);
+});

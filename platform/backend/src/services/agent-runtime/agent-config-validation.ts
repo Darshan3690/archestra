@@ -1,0 +1,192 @@
+import { isDeepStrictEqual } from "node:util";
+import { findAgentRuntimeTier } from "@archestra/shared";
+import { userHasPermission } from "@/auth/utils";
+import config from "@/config";
+import {
+  LlmProviderApiKeyModel,
+  LlmProviderApiKeyModelLinkModel,
+  TeamModel,
+} from "@/models";
+import { CredentialAccess } from "@/services/credential-access";
+import type { Agent, AgentRuntime, AgentType } from "@/types";
+import { ApiError } from "@/types";
+import { isAnyAgentRuntimeBackendDriverEnabled } from "./backends";
+import { getResolvedAgentRuntimeModelCompatibility } from "./model-compatibility";
+import { organizationAgentRuntimeTiers } from "./runtime-tiers";
+
+// Checks every surface that writes an Agent's runtime or model must run. The
+// agents REST routes and the create_agent/edit_agent MCP tools both call these,
+// so neither can store a runtime or model pairing the other would refuse.
+
+export async function requireAgentRuntimePermission(params: {
+  agentType: AgentType;
+  runtime?: AgentRuntime | null;
+  isAdmin: boolean;
+  userId: string;
+  organizationId: string;
+  previous?: AgentRuntime | null;
+}): Promise<void> {
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  // Omitted and unchanged values preserve existing configuration, including
+  // on ordinary edits after a role loses permission. Null removes a runtime.
+  const changesRuntime =
+    params.runtime !== undefined &&
+    !isDeepStrictEqual(params.runtime, params.previous ?? null);
+  if (
+    changesRuntime &&
+    !(await userHasPermission(
+      params.userId,
+      params.organizationId,
+      "agent",
+      "configure-runtime",
+    ))
+  ) {
+    throw new ApiError(
+      403,
+      "Configure runtime permission is required to change an agent runtime",
+    );
+  }
+  // SPDX-SnippetEnd
+  if (params.runtime == null) return;
+  if (!isAnyAgentRuntimeBackendDriverEnabled()) {
+    throw new ApiError(
+      400,
+      "Agent Runtime is unavailable: this cluster does not have the Agent Sandbox controller installed",
+    );
+  }
+  if (params.agentType !== "agent") {
+    throw new ApiError(400, "Agent Runtime can only be configured for Agents");
+  }
+  if (params.runtime.privileged && !params.isAdmin) {
+    throw new ApiError(
+      403,
+      "Only Agent administrators can enable a privileged background deployment",
+    );
+  }
+  if (params.runtime.privileged && !config.agentRuntime.allowPrivileged) {
+    throw new ApiError(
+      403,
+      "Privileged background deployments are disabled by the deployment operator",
+    );
+  }
+}
+
+/**
+ * Refuse a runtime whose default or scaleup tier is not one of the
+ * organization's tiers, naming the tiers it has.
+ */
+export async function assertAgentRuntimeTiersExist(params: {
+  runtime: Pick<AgentRuntime, "tier" | "maxTier"> | null | undefined;
+  organizationId: string;
+}): Promise<void> {
+  if (!params.runtime) return;
+  const { tiers } = await organizationAgentRuntimeTiers(params.organizationId);
+  for (const [label, name] of [
+    ["default tier", params.runtime.tier],
+    ["scaleup tier", params.runtime.maxTier],
+  ] as const) {
+    if (name && !findAgentRuntimeTier(tiers, name)) {
+      throw new ApiError(
+        400,
+        `The ${label} ${name} is not one of the organization's runtime tiers: ${tiers.map((tier) => tier.name).join(", ")}`,
+      );
+    }
+  }
+}
+
+/**
+ * Refuse a runtime that newly reads a saved credential the caller may not use:
+ * the Agent's runs would hand its value to whatever they execute. `previous`
+ * is the stored runtime on an edit, so credentials it already read stay put.
+ */
+export async function assertCanBindRuntimeCredentials(params: {
+  organizationId: string;
+  userId: string;
+  previous: AgentRuntime | null | undefined;
+  next: AgentRuntime | null | undefined;
+}): Promise<void> {
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  if (params.next == null) return;
+  await CredentialAccess.requireUseOfNewKeys({
+    organizationId: params.organizationId,
+    userId: params.userId,
+    previous: runtimeCredentialKeys(params.previous),
+    next: runtimeCredentialKeys(params.next),
+  });
+  // SPDX-SnippetEnd
+}
+
+/** Refuse a model/key pair the caller cannot use, or a half-set pair. */
+export async function assertAgentModelSelectionAvailable(params: {
+  agent: Pick<Agent, "llmApiKeyId" | "modelId">;
+  organizationId: string;
+  userId: string;
+}): Promise<void> {
+  const { llmApiKeyId, modelId } = params.agent;
+  if (!llmApiKeyId && !modelId) return;
+  if (!llmApiKeyId || !modelId) {
+    throw new ApiError(
+      400,
+      "An agent's model and API key must be set together",
+    );
+  }
+  const userTeamIds = await TeamModel.getUserTeamIds(params.userId);
+  const availableKeys = await LlmProviderApiKeyModel.getAvailableKeysForUser(
+    params.organizationId,
+    params.userId,
+    userTeamIds,
+  );
+  const selectedKey = availableKeys.find((key) => key.id === llmApiKeyId);
+  const selectedModelIsLinked = selectedKey
+    ? (
+        await LlmProviderApiKeyModelLinkModel.getModelsForApiKeyIds([
+          selectedKey.id,
+        ])
+      ).some(({ model }) => model.id === modelId)
+    : false;
+  if (!selectedModelIsLinked) {
+    throw new ApiError(
+      400,
+      "The selected model and API key must be linked and available to you",
+    );
+  }
+}
+
+export async function assertAgentRuntimeModelCompatibility(params: {
+  runtime:
+    | Pick<AgentRuntime, "command" | "inferenceProtocol" | "claudeCode">
+    | null
+    | undefined;
+  agent: Pick<Agent, "llmApiKeyId" | "modelId">;
+  organizationId: string;
+  userId: string;
+  /**
+   * Whether this write picks the agent's model or key. A write that only
+   * changes the runtime keeps the pair the agent already has, so the caller
+   * need not be able to use that key themselves; the runtime is still checked
+   * against that pair, as the agent's runs use it.
+   */
+  selectsModel: boolean;
+}): Promise<void> {
+  const { runtime } = params;
+  if (!runtime) return;
+  if (params.selectsModel) await assertAgentModelSelectionAvailable(params);
+  const result = await getResolvedAgentRuntimeModelCompatibility({
+    ...params,
+    runtime,
+    asStored: !params.selectsModel,
+  });
+  if (!result.compatibility.compatible) {
+    throw new ApiError(409, result.compatibility.message);
+  }
+}
+
+function runtimeCredentialKeys(runtime: AgentRuntime | null | undefined) {
+  return (runtime?.credentials ?? []).flatMap((declaration) =>
+    declaration.credentialId ? [declaration.credentialId] : [],
+  );
+}

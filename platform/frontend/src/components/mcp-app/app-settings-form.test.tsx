@@ -1,0 +1,600 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, test, vi } from "vitest";
+
+// Radix's Select (the "Opens in" control) measures and scrolls its popover.
+global.ResizeObserver = class ResizeObserver {
+  observe = vi.fn();
+  unobserve = vi.fn();
+  disconnect = vi.fn();
+};
+Element.prototype.scrollIntoView = vi.fn();
+Element.prototype.hasPointerCapture = vi.fn();
+Element.prototype.releasePointerCapture = vi.fn();
+
+const {
+  updateMutateAsync,
+  setEnabledMutateAsync,
+  setLockedMutateAsync,
+  assignMutateAsync,
+  unassignMutateAsync,
+  useAppToolsMock,
+  savePermissions,
+} = vi.hoisted(() => ({
+  savePermissions: vi.fn(async () => {}),
+  updateMutateAsync: vi.fn(),
+  setEnabledMutateAsync: vi.fn(),
+  setLockedMutateAsync: vi.fn(),
+  assignMutateAsync: vi.fn(),
+  unassignMutateAsync: vi.fn(),
+  useAppToolsMock: vi.fn(),
+}));
+
+vi.mock("@/lib/app.query", () => ({
+  useAppTools: useAppToolsMock,
+  useUpdateApp: () => ({ mutateAsync: updateMutateAsync, isPending: false }),
+  useSetAppEnabled: () => ({
+    mutateAsync: setEnabledMutateAsync,
+    isPending: false,
+  }),
+  useSetAppLocked: () => ({
+    mutateAsync: setLockedMutateAsync,
+    isPending: false,
+  }),
+  useAssignToolToApp: () => ({
+    mutateAsync: assignMutateAsync,
+    isPending: false,
+  }),
+  useUnassignToolFromApp: () => ({
+    mutateAsync: unassignMutateAsync,
+    isPending: false,
+  }),
+}));
+
+vi.mock("@/lib/apps/use-app-access");
+vi.mock("@/lib/teams/team.query");
+vi.mock("@/lib/organization.query");
+
+// Both children have their own behavior-focused suites (app-tools-editor.test
+// covers the editor; the environment selector fetches environments). The stub
+// editor exposes onSelectionChange so tests can stage tool changes.
+vi.mock("@/app/apps/_parts/app-tools-editor", () => ({
+  AppToolsEditor: ({
+    selectedToolIds,
+    onSelectionChange,
+  }: {
+    selectedToolIds: Set<string>;
+    onSelectionChange: (ids: Set<string>) => void;
+  }) => (
+    <>
+      <button
+        type="button"
+        data-testid="stage-tool-t2"
+        onClick={() =>
+          onSelectionChange(new Set([...selectedToolIds, "tool-2"]))
+        }
+      >
+        stage tool-2
+      </button>
+      <button
+        type="button"
+        data-testid="unstage-tool-t1"
+        onClick={() =>
+          onSelectionChange(
+            new Set([...selectedToolIds].filter((id) => id !== "tool-1")),
+          )
+        }
+      >
+        unstage tool-1
+      </button>
+    </>
+  ),
+}));
+// The access editor is its own tested component; here it only has to hand
+// the dialog a save so the one Save can be asserted to commit it.
+vi.mock("@/components/resource-permissions", async () => {
+  const { useEffect } = await import("react");
+  return {
+    ResourcePermissions: ({
+      registerSave,
+    }: {
+      registerSave?: (save: (() => Promise<void>) | null) => void;
+    }) => {
+      useEffect(() => {
+        registerSave?.(savePermissions);
+        return () => registerSave?.(null);
+      }, [registerSave]);
+      return <div data-testid="resource-permissions" />;
+    },
+  };
+});
+vi.mock("@/components/environment-selector", () => ({
+  EnvironmentSelector: () => null,
+}));
+
+// The picker itself (emoji tab, logo tab, upload, clear) is a shared component;
+// here it only has to report a chosen value so the save path can be asserted.
+vi.mock("@/components/agent-icon-picker", () => ({
+  AgentIconPicker: ({
+    value,
+    onChange,
+  }: {
+    value: string | null;
+    onChange: (icon: string | null) => void;
+  }) => (
+    <>
+      <span data-testid="icon-value">{value ?? "none"}</span>
+      <button
+        type="button"
+        data-testid="pick-icon"
+        onClick={() => onChange("🚀")}
+      >
+        pick icon
+      </button>
+      <button
+        type="button"
+        data-testid="clear-icon"
+        onClick={() => onChange(null)}
+      >
+        clear icon
+      </button>
+    </>
+  ),
+}));
+
+import { useAppAccess } from "@/lib/apps/use-app-access";
+import { useAssignableTeams } from "@/lib/teams/team.query";
+import { AppSettingsForm } from "./app-settings-form";
+
+const APP = {
+  id: "app-1",
+  name: "Budget",
+  description: "Team budget tracker",
+  scope: "personal",
+  authorId: "author-id",
+  enabled: true,
+  locked: false,
+  teams: [],
+  users: [],
+  labels: [],
+  environmentId: null,
+} as unknown as Parameters<typeof AppSettingsForm>[0]["app"];
+
+function toolsQuery(over: Record<string, unknown> = {}) {
+  return {
+    data: [{ id: "tool-1", name: "hf__paper_search" }],
+    isPending: false,
+    isError: false,
+    ...over,
+  };
+}
+
+function renderForm(over: Partial<Parameters<typeof AppSettingsForm>[0]> = {}) {
+  const onOpenChange = vi.fn();
+  const utils = render(
+    <AppSettingsForm app={APP} open onOpenChange={onOpenChange} {...over} />,
+  );
+  return { onOpenChange, ...utils };
+}
+
+// The dialog now renders through the shared left-nav shell (a Radix dialog in a
+// portal), so the form lives on document, not inside the render container.
+function submitForm() {
+  const form = document.querySelector("form");
+  expect(form).not.toBeNull();
+  fireEvent.submit(form as HTMLFormElement);
+}
+
+// Fields are split across General/Tools/Access sidebar sections; interacting
+// with a non-General field means clicking its nav item first.
+function goToSection(label: "General" | "Tools" | "Status") {
+  fireEvent.click(screen.getByRole("button", { name: label }));
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.mocked(useAppAccess).mockReturnValue({
+    canEdit: true,
+    canDeleteApp: true,
+    isPending: false,
+  });
+  vi.mocked(useAssignableTeams).mockReturnValue({
+    data: [],
+  } as unknown as ReturnType<typeof useAssignableTeams>);
+  useAppToolsMock.mockReturnValue(toolsQuery());
+  updateMutateAsync.mockResolvedValue({ id: "app-1" });
+  assignMutateAsync.mockResolvedValue({ ok: true });
+  unassignMutateAsync.mockResolvedValue({ ok: true });
+});
+
+describe("AppSettingsForm save", () => {
+  test("shows access on General and commits it with the one Save", async () => {
+    const { onOpenChange } = renderForm();
+
+    expect(
+      screen.queryByRole("button", { name: "Permissions" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId("resource-permissions")).toBeVisible();
+    goToSection("Tools");
+    submitForm();
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(savePermissions).toHaveBeenCalledTimes(1);
+    expect(updateMutateAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test("shows labels on General and saves an in-progress label", async () => {
+    const user = userEvent.setup();
+    const { onOpenChange } = renderForm();
+
+    expect(screen.getByLabelText("Label key")).not.toBeVisible();
+    await user.click(screen.getByRole("button", { name: /^Advanced$/ }));
+    await user.type(screen.getByLabelText("Label key"), "region");
+    await user.type(screen.getByLabelText("Label value"), "eu");
+    await user.click(screen.getByRole("button", { name: /^Advanced$/ }));
+    expect(screen.getByLabelText("Label key")).not.toBeVisible();
+    submitForm();
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(updateMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          labels: [{ key: "region", value: "eu" }],
+        }),
+      }),
+    );
+  });
+
+  test("flushes an in-progress label when switching away from General before Save", async () => {
+    // The labels editor lives in General and unmounts on section switch; a
+    // valid draft must survive a Save issued from another section.
+    const user = userEvent.setup();
+    const { onOpenChange } = renderForm();
+
+    expect(screen.getByLabelText("Label key")).not.toBeVisible();
+    await user.click(screen.getByRole("button", { name: /^Advanced$/ }));
+    await user.type(screen.getByLabelText("Label key"), "region");
+    await user.type(screen.getByLabelText("Label value"), "eu");
+    goToSection("Status");
+    submitForm();
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(updateMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          labels: [{ key: "region", value: "eu" }],
+        }),
+      }),
+    );
+  });
+
+  test("saves trimmed identity fields and closes; unchanged tools fire no mutations", async () => {
+    const { onOpenChange } = renderForm();
+
+    fireEvent.change(screen.getByLabelText("Name *"), {
+      target: { value: "  Budget v2  " },
+    });
+    submitForm();
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(updateMutateAsync).toHaveBeenCalledWith({
+      appId: "app-1",
+      body: {
+        name: "Budget v2",
+        description: "Team budget tracker",
+        environmentId: null,
+        // Labels are replaced wholesale too, so the full current set rides
+        // every save — here the fixture's empty one.
+        labels: [],
+        icon: null,
+        openInFullscreen: false,
+      },
+    });
+    expect(assignMutateAsync).not.toHaveBeenCalled();
+    expect(unassignMutateAsync).not.toHaveBeenCalled();
+  });
+
+  test("switches the app to opening fullscreen", async () => {
+    const user = userEvent.setup();
+    const { onOpenChange } = renderForm();
+
+    await user.click(screen.getByRole("combobox", { name: "Opens in" }));
+    await user.click(screen.getByRole("option", { name: /fullscreen/i }));
+    submitForm();
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(updateMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ openInFullscreen: true }),
+      }),
+    );
+  });
+
+  test("seeds from the app's saved display default and re-sends it on an unrelated save", async () => {
+    const { onOpenChange } = renderForm({
+      app: { ...APP, openInFullscreen: true } as typeof APP,
+    });
+    expect(
+      screen.getByRole("combobox", { name: "Opens in" }),
+    ).toHaveTextContent("Fullscreen");
+
+    fireEvent.change(screen.getByLabelText("Name *"), {
+      target: { value: "Budget v2" },
+    });
+    submitForm();
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(updateMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ openInFullscreen: true }),
+      }),
+    );
+  });
+
+  test("sends a picked icon", async () => {
+    const { onOpenChange } = renderForm();
+
+    fireEvent.click(screen.getByTestId("pick-icon"));
+    submitForm();
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(updateMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ icon: "🚀" }),
+      }),
+    );
+  });
+
+  test("seeds from the app's icon and re-sends it on an unrelated save", async () => {
+    const { onOpenChange, getByTestId } = renderForm({
+      app: { ...APP, icon: "🚀" } as typeof APP,
+    });
+    expect(getByTestId("icon-value")).toHaveTextContent("🚀");
+
+    fireEvent.change(screen.getByLabelText("Name *"), {
+      target: { value: "Budget v2" },
+    });
+    submitForm();
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(updateMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ name: "Budget v2", icon: "🚀" }),
+      }),
+    );
+  });
+
+  test("clearing the icon sends null so it goes back to the generic glyph", async () => {
+    const { onOpenChange } = renderForm({
+      app: { ...APP, icon: "🚀" } as typeof APP,
+    });
+
+    fireEvent.click(screen.getByTestId("clear-icon"));
+    submitForm();
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(updateMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ icon: null }),
+      }),
+    );
+  });
+
+  test("assigns a staged tool with dynamic credential resolution on save", async () => {
+    const { onOpenChange } = renderForm();
+
+    goToSection("Tools");
+    fireEvent.click(screen.getByTestId("stage-tool-t2"));
+    submitForm();
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(assignMutateAsync).toHaveBeenCalledWith({
+      appId: "app-1",
+      toolId: "tool-2",
+      body: { credentialResolutionMode: "dynamic" },
+    });
+    expect(unassignMutateAsync).not.toHaveBeenCalled();
+  });
+
+  test("a failed update leaves the form open", async () => {
+    updateMutateAsync.mockResolvedValue(null);
+    const { onOpenChange } = renderForm();
+
+    submitForm();
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalled());
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(assignMutateAsync).not.toHaveBeenCalled();
+  });
+
+  test("a failed tool change keeps the form open with the selection staged", async () => {
+    assignMutateAsync.mockResolvedValue(null);
+    const { onOpenChange } = renderForm();
+
+    goToSection("Tools");
+    fireEvent.click(screen.getByTestId("stage-tool-t2"));
+    submitForm();
+
+    await waitFor(() => expect(assignMutateAsync).toHaveBeenCalled());
+    expect(updateMutateAsync).toHaveBeenCalled();
+    expect(onOpenChange).not.toHaveBeenCalled();
+  });
+
+  test("a failed tools query still allows saving identity, skipping tool changes", async () => {
+    useAppToolsMock.mockReturnValue(
+      toolsQuery({ data: undefined, isError: true }),
+    );
+    const { onOpenChange } = renderForm();
+
+    // Save stays enabled: identity/visibility still commit even though the tool
+    // diff is skipped while the assignments couldn't load.
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    // The editor is not rendered unseeded — it would show every assigned tool
+    // unchecked and let the user stage edits the save would drop. The Tools
+    // section shows the couldn't-load note in its place.
+    goToSection("Tools");
+    expect(screen.queryByTestId("stage-tool-t2")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/Tool assignments couldn't be loaded/i),
+    ).toBeInTheDocument();
+
+    submitForm();
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(updateMutateAsync).toHaveBeenCalled();
+    expect(assignMutateAsync).not.toHaveBeenCalled();
+    expect(unassignMutateAsync).not.toHaveBeenCalled();
+  });
+
+  test("a background refetch does not overwrite the staged selection", async () => {
+    const { onOpenChange, rerender } = renderForm();
+
+    goToSection("Tools");
+    fireEvent.click(screen.getByTestId("stage-tool-t2"));
+    // Refetch lands a changed server set while tool-2 is staged.
+    useAppToolsMock.mockReturnValue(
+      toolsQuery({
+        data: [
+          { id: "tool-1", name: "hf__paper_search" },
+          { id: "tool-3", name: "hf__dataset_search" },
+        ],
+      }),
+    );
+    rerender(<AppSettingsForm app={APP} open onOpenChange={onOpenChange} />);
+    submitForm();
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    // The staged selection {tool-1, tool-2} survives the refetch: tool-2 is
+    // assigned. tool-3 — assigned concurrently by someone else after this
+    // dialog seeded — is untouched: the diff runs against the seeded
+    // snapshot, so an unrelated save here must not unassign it.
+    expect(assignMutateAsync).toHaveBeenCalledWith({
+      appId: "app-1",
+      toolId: "tool-2",
+      body: { credentialResolutionMode: "dynamic" },
+    });
+    expect(unassignMutateAsync).not.toHaveBeenCalled();
+  });
+
+  test("retrying after a partial failure re-sends only the failed change", async () => {
+    // First save carries two changes: the unassign of tool-1 succeeds, the
+    // assign of tool-2 fails.
+    assignMutateAsync.mockResolvedValueOnce(null);
+    const { onOpenChange } = renderForm();
+
+    goToSection("Tools");
+    fireEvent.click(screen.getByTestId("stage-tool-t2"));
+    fireEvent.click(screen.getByTestId("unstage-tool-t1"));
+    submitForm();
+    await waitFor(() => expect(assignMutateAsync).toHaveBeenCalledTimes(1));
+    expect(unassignMutateAsync).toHaveBeenCalledTimes(1);
+    expect(onOpenChange).not.toHaveBeenCalled();
+
+    // Retry: only the failed assign is left in the diff — the applied
+    // unassign was folded into the snapshot and must not be re-sent.
+    submitForm();
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(assignMutateAsync).toHaveBeenCalledTimes(2);
+    expect(assignMutateAsync).toHaveBeenLastCalledWith({
+      appId: "app-1",
+      toolId: "tool-2",
+      body: { credentialResolutionMode: "dynamic" },
+    });
+    expect(unassignMutateAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test("an empty name blocks submit and shows a validation message", async () => {
+    const { onOpenChange } = renderForm();
+
+    fireEvent.change(screen.getByLabelText("Name *"), {
+      target: { value: "   " },
+    });
+    submitForm();
+
+    await waitFor(() =>
+      expect(screen.getByText("Name is required.")).toBeInTheDocument(),
+    );
+    expect(updateMutateAsync).not.toHaveBeenCalled();
+    expect(onOpenChange).not.toHaveBeenCalled();
+  });
+});
+
+describe("AppSettingsForm URL field", () => {
+  const SLUGGED = {
+    ...(APP as object),
+    slug: "budget",
+  } as Parameters<typeof AppSettingsForm>[0]["app"];
+
+  test("seeds the field from the app's current slug", () => {
+    renderForm({ app: SLUGGED });
+
+    expect(screen.getByLabelText("URL")).toHaveValue("budget");
+  });
+
+  test("sends a changed slug", async () => {
+    const { onOpenChange } = renderForm({ app: SLUGGED });
+
+    fireEvent.change(screen.getByLabelText("URL"), {
+      target: { value: "  team-budget  " },
+    });
+    submitForm();
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(updateMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ slug: "team-budget" }),
+      }),
+    );
+  });
+
+  test("omits an unchanged slug so a save cannot 409 against its own row", async () => {
+    const { onOpenChange } = renderForm({ app: SLUGGED });
+
+    fireEvent.change(screen.getByLabelText("Name *"), {
+      target: { value: "Budget v2" },
+    });
+    submitForm();
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(updateMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.not.objectContaining({ slug: expect.anything() }),
+      }),
+    );
+  });
+
+  test("treats a cleared field as leave-alone, not as an empty slug", async () => {
+    // The API has no way to unset a URL, so an empty field must not be sent —
+    // it would come back a 400 rather than clearing anything.
+    const { onOpenChange } = renderForm({ app: SLUGGED });
+
+    fireEvent.change(screen.getByLabelText("URL"), { target: { value: "" } });
+    submitForm();
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(updateMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.not.objectContaining({ slug: expect.anything() }),
+      }),
+    );
+  });
+
+  test.each([
+    ["uppercase", "Team-Budget"],
+    ["an underscore", "team_budget"],
+    ["a space", "team budget"],
+  ])("blocks the save on %s and never calls the API", async (_label, value) => {
+    const { onOpenChange } = renderForm({ app: SLUGGED });
+
+    fireEvent.change(screen.getByLabelText("URL"), { target: { value } });
+    submitForm();
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/lowercase letters, numbers and single hyphens/i),
+      ).toBeInTheDocument(),
+    );
+    expect(updateMutateAsync).not.toHaveBeenCalled();
+    expect(onOpenChange).not.toHaveBeenCalled();
+  });
+});

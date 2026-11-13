@@ -1,0 +1,167 @@
+// @vitest-environment node
+import { describe, expect, it } from "vitest";
+import {
+  excludedSourcesSummary,
+  excludedSubagentsSummary,
+  getDescriptionPlaceholder,
+  getNamePlaceholder,
+  normalizeSuggestedPrompts,
+  shouldOfferAppCatalogs,
+  shouldShowDescriptionField,
+  TOOL_CONNECTION_PROMPTING,
+} from "./agent-form.utils";
+
+describe("getNamePlaceholder", () => {
+  it("returns type-specific placeholders", () => {
+    expect(getNamePlaceholder("agent")).toBe("Enter agent name");
+    expect(getNamePlaceholder("mcp_gateway")).toBe("Enter MCP Gateway name");
+    expect(getNamePlaceholder("llm_proxy")).toBe("Enter LLM Proxy name");
+    expect(getNamePlaceholder("profile")).toBe("Enter profile name");
+  });
+});
+
+describe("getDescriptionPlaceholder", () => {
+  it("returns type-specific description placeholders", () => {
+    expect(getDescriptionPlaceholder("agent")).toBe(
+      "Describe what this agent does",
+    );
+    expect(getDescriptionPlaceholder("mcp_gateway")).toBe(
+      "Describe what this MCP Gateway is for",
+    );
+    expect(getDescriptionPlaceholder("llm_proxy")).toBe(
+      "Describe what this LLM Proxy is for",
+    );
+    expect(getDescriptionPlaceholder("profile")).toBe(
+      "Describe what this profile is for",
+    );
+  });
+});
+
+describe("shouldShowDescriptionField", () => {
+  it("shows descriptions for non-built-in types", () => {
+    expect(
+      shouldShowDescriptionField({ agentType: "agent", isBuiltIn: false }),
+    ).toBe(true);
+    expect(
+      shouldShowDescriptionField({
+        agentType: "mcp_gateway",
+        isBuiltIn: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldShowDescriptionField({ agentType: "llm_proxy", isBuiltIn: false }),
+    ).toBe(true);
+    expect(
+      shouldShowDescriptionField({ agentType: "profile", isBuiltIn: false }),
+    ).toBe(true);
+  });
+
+  it("hides descriptions for built-in types", () => {
+    expect(
+      shouldShowDescriptionField({ agentType: "agent", isBuiltIn: true }),
+    ).toBe(false);
+  });
+});
+
+describe("normalizeSuggestedPrompts", () => {
+  it("uses summaryTitle as prompt when prompt is empty", () => {
+    const result = normalizeSuggestedPrompts([
+      { summaryTitle: "Check my cluster", prompt: "" },
+    ]);
+    expect(result).toEqual([
+      { summaryTitle: "Check my cluster", prompt: "Check my cluster" },
+    ]);
+  });
+
+  it("preserves explicit prompt when both fields are set", () => {
+    const result = normalizeSuggestedPrompts([
+      { summaryTitle: "Hello", prompt: "Say hello to me" },
+    ]);
+    expect(result).toEqual([
+      { summaryTitle: "Hello", prompt: "Say hello to me" },
+    ]);
+  });
+
+  it("discards entries when both fields are empty", () => {
+    const result = normalizeSuggestedPrompts([
+      { summaryTitle: "", prompt: "" },
+      { summaryTitle: "  ", prompt: "  " },
+    ]);
+    expect(result).toEqual([]);
+  });
+
+  it("trims whitespace from both fields", () => {
+    const result = normalizeSuggestedPrompts([
+      { summaryTitle: "  Draw something  ", prompt: "  Please draw  " },
+    ]);
+    expect(result).toEqual([
+      { summaryTitle: "Draw something", prompt: "Please draw" },
+    ]);
+  });
+
+  it("handles a mix of complete, label-only, and empty entries", () => {
+    const result = normalizeSuggestedPrompts([
+      { summaryTitle: "Full", prompt: "Full prompt text" },
+      { summaryTitle: "Label only", prompt: "" },
+      { summaryTitle: "", prompt: "" },
+      { summaryTitle: "  Whitespace  ", prompt: "   " },
+    ]);
+    expect(result).toEqual([
+      { summaryTitle: "Full", prompt: "Full prompt text" },
+      { summaryTitle: "Label only", prompt: "Label only" },
+      { summaryTitle: "Whitespace", prompt: "Whitespace" },
+    ]);
+  });
+});
+
+describe("shouldOfferAppCatalogs", () => {
+  it("offers owned Apps to a chat agent (renders inline from the __open tool)", () => {
+    expect(shouldOfferAppCatalogs("agent")).toBe(true);
+  });
+
+  it("offers owned Apps to an MCP gateway (exposes the tool to a connected client)", () => {
+    expect(shouldOfferAppCatalogs("mcp_gateway")).toBe(true);
+  });
+
+  it("offers owned Apps to a legacy profile (a gateway served at /v1/mcp/:profileId)", () => {
+    expect(shouldOfferAppCatalogs("profile")).toBe(true);
+  });
+
+  it("does not offer Apps to an LLM proxy (no app-render surface)", () => {
+    expect(shouldOfferAppCatalogs("llm_proxy")).toBe(false);
+  });
+});
+
+describe("Auto-mode knowledge summary", () => {
+  it("names the absence of exceptions rather than counting to zero", () => {
+    expect(excludedSourcesSummary(0)).toBe(
+      "Every knowledge source, with no exceptions.",
+    );
+    expect(excludedSourcesSummary(1)).toBe("Every knowledge source, except 1.");
+  });
+});
+
+describe("TOOL_CONNECTION_PROMPTING", () => {
+  // One record's noun must not leak into a string every record type renders:
+  // `block` said "the gateway" on agents and proxies too.
+  it("names no record type, so agents and proxies read the same", () => {
+    for (const line of Object.values(TOOL_CONNECTION_PROMPTING)) {
+      expect(line).not.toMatch(/gateway|proxy|\bagent\b/i);
+    }
+  });
+
+  it("says what happens to the person chatting, not what is requested", () => {
+    for (const line of Object.values(TOOL_CONNECTION_PROMPTING)) {
+      expect(line).not.toMatch(/^Requested|^Require /);
+    }
+  });
+});
+
+describe("All-mode subagent summary", () => {
+  it("says every local agent is a subagent, and counts exclusions", () => {
+    expect(excludedSubagentsSummary(0)).toBe("All local agents are subagents.");
+    expect(excludedSubagentsSummary(2)).toBe(
+      "All local agents are subagents, except 2 excluded.",
+    );
+  });
+});

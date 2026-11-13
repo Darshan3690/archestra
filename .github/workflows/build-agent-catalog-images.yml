@@ -1,0 +1,194 @@
+name: Build Agent Catalog Images
+
+# Reusable via workflow_call (release + dev publishes); also runs a build-only
+# validation (no push) of the images a change can affect: in the merge queue,
+# and on a pull request only while it carries the build-agent-images label.
+# Each validation builds every affected image for both architectures on paid
+# runners, so a pull request does not rebuild them on every push.
+on:
+  workflow_call:
+    inputs:
+      image_registry:
+        description: "Destination registry prefix"
+        type: string
+        default: ghcr.io/archestra-ai
+      push_to_gcr:
+        description: "Whether to publish the images"
+        required: true
+        type: boolean
+      version:
+        description: "Version tag for every image"
+        required: true
+        type: string
+      checkout_ref:
+        description: "Optional ref to checkout"
+        required: false
+        type: string
+        default: ""
+      reuse_from_version:
+        description: "Previous main SHA whose images may be reused when inputs are unchanged"
+        required: false
+        type: string
+        default: ""
+      environment:
+        description: "GitHub Environment whose secrets the publishing jobs read (release-publish for releases); empty for none"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER:
+        required: false
+      GCP_SERVICE_ACCOUNT_NAME:
+        required: false
+  merge_group:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      # Dockerfile, native wrappers, in-image tests, and patches. Context is platform/.
+      - "platform/docker_images/agent/**"
+      # Shared helper copied into every catalog target.
+      - "platform/backend/src/static/workspace-files.py"
+      - "platform/.dockerignore"
+      - ".github/workflows/build-agent-catalog-images.yml"
+      - ".github/workflows/build-native-multi-arch-image.yml"
+      # The selector counts itself as a shared input.
+      - ".github/scripts/agent-image-inputs.py"
+      # Local build action and the builder recipe it invokes.
+      - ".github/actions/build-docker-image/**"
+      - ".github/actions/setup-docker-builder/**"
+
+permissions: {}
+
+# Adding some other label to a pull request starts a run of its own group, so
+# it does not cancel a validation already in progress.
+concurrency:
+  group: build-agent-catalog-images-${{ inputs.version || github.event.pull_request.number || github.ref }}-${{ github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'build-agent-images' && format('-{0}', github.run_id) || '' }}
+  cancel-in-progress: true
+
+jobs:
+  # Reusable callers pass a version; direct pull_request and merge_group runs
+  # do not, so the version selects publication.
+  build:
+    name: Build ${{ matrix.image }}
+    if: ${{ inputs.version != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - agent-claude-code
+          - agent-codex
+          - agent-opencode
+          - agent-hermes
+          - agent-openclaw
+          - agent-grok
+          - agent-kimi
+          - agent-copilot
+    permissions:
+      contents: read # Required to invoke the reusable image build workflow.
+      packages: write # Publish CI images with the repository token.
+      id-token: write # Required for Workload Identity Federation.
+    uses: $/.github/workflows/build-native-multi-arch-image.yml
+    with:
+      environment: ${{ inputs.environment }}
+      image_directory: ./platform
+      dockerfile: ./platform/docker_images/agent/Dockerfile
+      target: ${{ matrix.image }}
+      image_name: ${{ matrix.image }}
+      image_registry: ${{ inputs.image_registry }}
+      version: ${{ inputs.version }}
+      push_image: ${{ inputs.push_to_gcr }}
+      auth_provider: ${{ startsWith(inputs.image_registry, 'ghcr.io/') && 'ghcr' || 'gar' }}
+      checkout_ref: ${{ inputs.checkout_ref }}
+      reuse_from_version: ${{ inputs.reuse_from_version }}
+      reuse_paths: '["platform/docker_images/agent", "platform/backend/src/static/workspace-files.py", "platform/.dockerignore", ".github/workflows/build-agent-catalog-images.yml"]'
+    secrets:
+      GCP_SERVICE_ACCOUNT_NAME: ${{ secrets.GCP_SERVICE_ACCOUNT_NAME }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER }}
+
+  # Picks the Dockerfile targets the change can affect, from the diff against
+  # the merge group's base or the pull request's merge base. The rules live in
+  # .github/scripts/agent-image-inputs.py; anything it cannot place builds
+  # every image, and a failed diff fails this job instead of skipping builds.
+  affected-agent-images:
+    name: Detect Affected Agent Images
+    if: >-
+      inputs.version == '' && (
+        github.event_name == 'merge_group' ||
+        contains(github.event.pull_request.labels.*.name, 'build-agent-images'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # Also covers the compare API that finds a pull request's merge base.
+      # Requesting more breaks the publish callers, which grant only
+      # contents, packages, and id-token to this reusable workflow.
+      contents: read # Required to checkout the repository and fetch the diff base.
+    outputs:
+      images: ${{ steps.diff.outputs.images }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      # The token reaches only these commands, never .git/config. Diffing two
+      # commits needs only their trees, so depth-1 fetches are enough. A pull
+      # request checks out its merge commit, so its head is fetched as well.
+      - name: Diff against the base
+        id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha || github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          base="${QUEUE_BASE_SHA}"
+          if [ -z "${base}" ]; then
+            # A pull request's own changes: diff from where it left its base
+            # branch, not that branch's tip, which carries other merged work.
+            base=$(gh api "repos/${REPOSITORY}/compare/${PR_BASE_SHA}...${HEAD_SHA}" --jq .merge_base_commit.sha)
+          fi
+          git -c credential.helper= \
+              -c credential.helper='!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' \
+              fetch --depth=1 origin "${base}" "${HEAD_SHA}"
+          images=$(python3 .github/scripts/agent-image-inputs.py "${base}" "${HEAD_SHA}")
+          echo "images=${images}" >> "${GITHUB_OUTPUT}"
+          { echo '### Agent images to validate'; echo '```'; echo "${images}"; echo '```'; } >> "${GITHUB_STEP_SUMMARY}"
+
+  # Builds each affected image for both native architectures without
+  # publishing. This job does not request the reusable publish workflow's
+  # OIDC permission.
+  validate-agent-catalog-images:
+    name: Validate ${{ matrix.image }} (${{ matrix.arch }})
+    needs: [affected-agent-images]
+    if: ${{ inputs.version == '' && needs.affected-agent-images.outputs.images != '[]' }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm-32core' || 'ubuntu-24.04-16core' }}
+    timeout-minutes: 45
+    permissions:
+      contents: read # Required to checkout the repository and build the image.
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        image: ${{ fromJSON(needs.affected-agent-images.outputs.images) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Build agent catalog image
+        uses: $/.github/actions/build-docker-image
+        with:
+          context: ./platform
+          dockerfile: ./platform/docker_images/agent/Dockerfile
+          target: ${{ matrix.image }}
+          platforms: linux/${{ matrix.arch }}
+          push: "false"
+          load: "true"
+          tags: ${{ matrix.image }}:${{ github.sha }}
+          # Read-only: the publish paths own cache export for this image.
+          cache-from: type=registry,ref=ghcr.io/archestra-ai/ci/${{ matrix.image }}:buildcache-${{ matrix.arch }}

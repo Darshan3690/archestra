@@ -1,0 +1,218 @@
+import {
+  CHATGPT_CLIENT_ID,
+  CLAUDE_CLIENT_ID,
+  CODEX_CLIENT_ID,
+  CURSOR_CLIENT_ID,
+  isChatGptOriginator,
+  isChatGptUserAgent,
+  isCodexClientMetadata,
+  isCodexOriginator,
+  isCodexUserAgent,
+  isCursorUserAgent,
+  isKiloUserAgent,
+  isKimiCodeUserAgent,
+  isOpenCodeUserAgent,
+  KILO_CLIENT_ID,
+  KIMI_CODE_CLIENT_ID,
+  OPENCODE_CLIENT_ID,
+} from "@archestra/shared";
+import { getHeaderValue } from "./meta-header";
+import { isClaudeMetadataUserId } from "./session-id";
+
+export function detectGrokClientId(
+  headers: Record<string, string | string[] | undefined>,
+): "grok-build" | undefined {
+  const identifier = getHeaderValue(headers, "x-grok-client-identifier");
+  const userAgent = getHeaderValue(headers, "user-agent");
+  return identifier === "grok-shell" ||
+    identifier === "grok-pager" ||
+    /^(?:grok-pager\/[^\s]+\s+)?grok-shell\/[^\s]+(?:\s|$)/i.test(
+      userAgent ?? "",
+    )
+    ? "grok-build"
+    : undefined;
+}
+
+/**
+ * Client-app auto-discovery.
+ *
+ * When the caller does NOT supply an explicit `X-Archestra-Agent-Id` header,
+ * we best-effort attribute the request to a known client app and persist that
+ * id in `interactions.external_agent_id`. Identification is per-app; recording
+ * is uniform. Known client families are recorded as generic ids: Claude clients
+ * ({@link detectClaudeClientId} → {@link CLAUDE_CLIENT_ID}), Codex clients
+ * ({@link detectCodexClientId} → {@link CODEX_CLIENT_ID}), and OpenCode
+ * ({@link detectOpenCodeClientId} → {@link OPENCODE_CLIENT_ID}). The
+ * finer split (Claude Code vs Desktop) is only knowable when the caller sets
+ * `X-Archestra-Agent-Id` itself (the setup scripts do this), never from the
+ * request alone.
+ *
+ * Two Claude signals, in order:
+ * 1. The Anthropic `x-anthropic-billing-header` hint embedded in a `system`
+ *    text block, e.g. `cc_version=2.1.195.1ff; cc_entrypoint=claude-vscode;`.
+ *    Any non-empty `cc_entrypoint` (known or unknown) ⇒ Claude.
+ * 2. A Claude/Anthropic `metadata.user_id` format (see
+ *    {@link isClaudeMetadataUserId}).
+ */
+export function detectClaudeClientId(
+  body:
+    | {
+        system?: unknown;
+        metadata?: { user_id?: string | null } | null;
+      }
+    | undefined,
+): typeof CLAUDE_CLIENT_ID | undefined {
+  if (!body) {
+    return undefined;
+  }
+  if (hasAnthropicBillingEntrypoint(body.system)) {
+    return CLAUDE_CLIENT_ID;
+  }
+  if (isClaudeMetadataUserId(body.metadata?.user_id)) {
+    return CLAUDE_CLIENT_ID;
+  }
+  return undefined;
+}
+
+/**
+ * Codex client auto-discovery — the Codex counterpart to
+ * {@link detectClaudeClientId}. When the caller sets no explicit
+ * `X-Archestra-Agent-Id`, three Codex signals attribute the request to
+ * {@link CODEX_CLIENT_ID}, in order:
+ * 1. The Codex `client_metadata` body shape (a Responses-request object
+ *    carrying the UUID session/thread ids).
+ * 2. A first-party Codex `originator` header (`codex_cli_rs` by default; see
+ *    {@link isCodexOriginator}) — the Codex analog of the Anthropic billing
+ *    header.
+ * 3. A Codex User-Agent (Codex repeats the originator as the UA's leading
+ *    token, e.g. `codex_cli_rs/0.20.0 (Linux 6.6; x86_64) …`), in case a
+ *    middlebox drops the originator header.
+ */
+export function detectCodexClientId(
+  headers: Record<string, string | string[] | undefined>,
+  body: { client_metadata?: unknown } | undefined,
+): typeof CODEX_CLIENT_ID | undefined {
+  if (
+    isCodexClientMetadata(body?.client_metadata) ||
+    isCodexOriginator(getHeaderValue(headers, "originator")) ||
+    isCodexUserAgent(getHeaderValue(headers, "user-agent"))
+  ) {
+    return CODEX_CLIENT_ID;
+  }
+  return undefined;
+}
+
+/**
+ * ChatGPT desktop app auto-discovery. The app's Work and Codex tabs run
+ * Codex's app server, so their requests are Codex requests on the wire; only
+ * the originator names the app: `Codex Desktop` for the process, and a Work
+ * thread's own `codex_work_desktop` (see {@link isChatGptOriginator}). The
+ * User-Agent leads with the process originator, so it names the app also on a
+ * CLI thread the app resumes.
+ */
+export function detectChatGptClientId(
+  headers: Record<string, string | string[] | undefined>,
+): typeof CHATGPT_CLIENT_ID | undefined {
+  if (
+    isChatGptOriginator(getHeaderValue(headers, "originator")) ||
+    isChatGptUserAgent(getHeaderValue(headers, "user-agent"))
+  ) {
+    return CHATGPT_CLIENT_ID;
+  }
+  return undefined;
+}
+
+/**
+ * Cursor client auto-discovery — the Cursor counterpart to
+ * {@link detectClaudeClientId}. Cursor's BYOK requests are built and sent by
+ * Cursor's backend and carry exactly one client-identity signal: the
+ * `User-Agent: Cursor/<version>` header (no originator-style header, no
+ * metadata body field). See {@link isCursorUserAgent}.
+ */
+export function detectCursorClientId(
+  headers: Record<string, string | string[] | undefined>,
+): typeof CURSOR_CLIENT_ID | undefined {
+  if (isCursorUserAgent(getHeaderValue(headers, "user-agent"))) {
+    return CURSOR_CLIENT_ID;
+  }
+  return undefined;
+}
+
+/**
+ * Auto-detects OpenCode clients.
+ * Matches `opencode/<version>` in User-Agent or `originator: opencode` on
+ * OpenAI Responses. Returns {@link OPENCODE_CLIENT_ID}.
+ */
+export function detectOpenCodeClientId(
+  headers: Record<string, string | string[] | undefined>,
+): typeof OPENCODE_CLIENT_ID | undefined {
+  if (
+    isOpenCodeUserAgent(getHeaderValue(headers, "user-agent")) ||
+    getHeaderValue(headers, "originator")?.trim().toLowerCase() === "opencode"
+  ) {
+    return OPENCODE_CLIENT_ID;
+  }
+  return undefined;
+}
+
+/**
+ * Auto-detects Kilo Code's CLI from its `kilo/…` User-Agent. Returns
+ * {@link KILO_CLIENT_ID}.
+ */
+export function detectKiloClientId(
+  headers: Record<string, string | string[] | undefined>,
+): typeof KILO_CLIENT_ID | undefined {
+  if (isKiloUserAgent(getHeaderValue(headers, "user-agent"))) {
+    return KILO_CLIENT_ID;
+  }
+  return undefined;
+}
+
+/**
+ * Kimi Code auto-discovery from its `kimi-code-cli/<version>` User-Agent.
+ * Returns {@link KIMI_CODE_CLIENT_ID}.
+ */
+export function detectKimiCodeClientId(
+  headers: Record<string, string | string[] | undefined>,
+): typeof KIMI_CODE_CLIENT_ID | undefined {
+  return isKimiCodeUserAgent(getHeaderValue(headers, "user-agent"))
+    ? KIMI_CODE_CLIENT_ID
+    : undefined;
+}
+
+// Anthropic `cc_entrypoint` values for in-scope Claude clients are e.g.
+// `claude-code`, `claude-vscode`, `cowork`, `claude-desktop`. Detection does
+// NOT gate on this list: any non-empty `cc_entrypoint` (known or unknown)
+// attributes to the generic Claude id (per spec). The capture below is a seam for a
+// future per-app split.
+const CC_ENTRYPOINT_RE = /cc_entrypoint=([^;\s]+)/i;
+
+/**
+ * Whether any `system` text block carries an `x-anthropic-billing-header` line
+ * with a non-empty `cc_entrypoint`. `system` is either a string or an array of
+ * content blocks (`{ type, text }`); other shapes are ignored.
+ */
+function hasAnthropicBillingEntrypoint(system: unknown): boolean {
+  const text = flattenSystemText(system);
+  if (!text.toLowerCase().includes("x-anthropic-billing-header")) {
+    return false;
+  }
+  const match = text.match(CC_ENTRYPOINT_RE);
+  return match !== null && match[1].trim().length > 0;
+}
+
+function flattenSystemText(system: unknown): string {
+  if (typeof system === "string") {
+    return system;
+  }
+  if (Array.isArray(system)) {
+    return system
+      .map((block) =>
+        block && typeof block === "object" && "text" in block
+          ? String((block as { text?: unknown }).text ?? "")
+          : "",
+      )
+      .join("\n");
+  }
+  return "";
+}

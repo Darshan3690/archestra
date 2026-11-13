@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { ApiError } from "@archestra/shared/types";
 import type { Azure, OpenAi } from "@/types";
+import { ChatCompletionRequestSchema } from "@/types/llm-providers/openai/api";
+import { CacheControlSchema } from "@/types/llm-providers/openai/messages";
+import { toResponsesUsage } from "./responses-usage";
 
 type ResponsesRequest = Azure.Types.ResponsesRequest;
 type ResponsesResponse = Azure.Types.ResponsesResponse;
@@ -14,7 +18,10 @@ export interface OpenaiResponsesContext {
   requestedModel: string;
 }
 
-export function responsesToOpenaiChat(req: ResponsesRequest): {
+export function responsesToOpenaiChat(
+  req: ResponsesRequest,
+  options?: { preserveContentParts: boolean },
+): {
   chatBody: OpenAiRequest;
   responsesContext: OpenaiResponsesContext;
 } {
@@ -30,6 +37,7 @@ export function responsesToOpenaiChat(req: ResponsesRequest): {
     messages.push(
       ...responseInputToChatMessages(
         req.input as unknown as LooseResponseItem[],
+        options?.preserveContentParts,
       ),
     );
   }
@@ -39,6 +47,21 @@ export function responsesToOpenaiChat(req: ResponsesRequest): {
     messages,
     stream: req.stream === true ? true : undefined,
   };
+
+  const responseFormat = translateTextFormat(req.text);
+  if (responseFormat !== undefined) chatBody.response_format = responseFormat;
+
+  const extensions = req as ResponsesRequest & Record<string, unknown>;
+  for (const field of [
+    "cache_control",
+    "cachedContent",
+    "prompt_cache_key",
+    "prompt_cache_retention",
+    "prompt_cache_options",
+  ] as const) {
+    if (extensions[field] !== undefined)
+      Object.assign(chatBody, { [field]: extensions[field] });
+  }
 
   if (req.temperature !== undefined) {
     chatBody.temperature = req.temperature;
@@ -51,11 +74,23 @@ export function responsesToOpenaiChat(req: ResponsesRequest): {
   if (req.tools) {
     chatBody.tools = req.tools.flatMap((tool) => {
       if (tool.type !== "function" || !("name" in tool)) {
+        if (
+          options?.preserveContentParts &&
+          "cache_control" in tool &&
+          tool.cache_control !== undefined
+        )
+          throw new ApiError(
+            400,
+            "Unsupported Responses tool with cache_control",
+          );
         return [];
       }
       return [
         {
           type: "function" as const,
+          ...(options?.preserveContentParts && "cache_control" in tool
+            ? cacheControlFields(tool.cache_control)
+            : {}),
           function: {
             name: tool.name as string,
             description:
@@ -86,11 +121,45 @@ export function responsesToOpenaiChat(req: ResponsesRequest): {
   };
 }
 
+/**
+ * How a Chat Completions turn ends, in Responses terms. Responses has no
+ * finish_reason: a turn cut off by its token budget or by a content filter is
+ * `incomplete` with a reason, and clients read `completed` as a whole answer.
+ */
+export function responsesEndingFromFinishReason(
+  finishReason: string | null | undefined,
+): {
+  status: "completed" | "incomplete";
+  incomplete_details: { reason: "max_output_tokens" | "content_filter" } | null;
+} {
+  if (finishReason === "length") {
+    return {
+      status: "incomplete",
+      incomplete_details: { reason: "max_output_tokens" },
+    };
+  }
+  if (finishReason === "content_filter") {
+    return {
+      status: "incomplete",
+      incomplete_details: { reason: "content_filter" },
+    };
+  }
+  return { status: "completed", incomplete_details: null };
+}
+
 export function chatCompletionToResponses(
   response: OpenAiResponse,
   ctx: OpenaiResponsesContext,
 ): ResponsesResponse {
+  const wireUsage = response.usage as typeof response.usage & {
+    prompt_tokens_details?: {
+      cached_tokens?: number;
+      cache_write_tokens?: number;
+      cache_write_1h_tokens?: number;
+    };
+  };
   const choice = response.choices[0];
+  const ending = responsesEndingFromFinishReason(choice?.finish_reason);
   const output: ResponsesResponse["output"] = [];
 
   if (choice?.message) {
@@ -112,7 +181,7 @@ export function chatCompletionToResponses(
         id: `msg_${randomUUID()}`,
         type: "message",
         role: "assistant",
-        status: "completed",
+        status: ending.status,
         content: messageContent,
       } as unknown as ResponsesResponse["output"][number]);
     }
@@ -135,28 +204,55 @@ export function chatCompletionToResponses(
     object: "response",
     created_at: ctx.createdUnix,
     model: ctx.requestedModel,
-    status: "completed",
+    ...ending,
     output,
     usage: response.usage
-      ? {
-          input_tokens: response.usage.prompt_tokens,
-          output_tokens: response.usage.completion_tokens,
-          total_tokens: response.usage.total_tokens,
-        }
+      ? toResponsesUsage({
+          inputTokens:
+            response.usage.prompt_tokens -
+            (wireUsage?.prompt_tokens_details?.cached_tokens ?? 0) -
+            (wireUsage?.prompt_tokens_details?.cache_write_tokens ?? 0),
+          outputTokens: response.usage.completion_tokens,
+          reasoningTokens:
+            response.usage.completion_tokens_details?.reasoning_tokens ?? 0,
+          cacheReadTokens: wireUsage?.prompt_tokens_details?.cached_tokens ?? 0,
+          cacheWriteTokens:
+            wireUsage?.prompt_tokens_details?.cache_write_tokens ?? 0,
+          cacheWrite1hTokens:
+            wireUsage?.prompt_tokens_details?.cache_write_1h_tokens,
+        })
       : undefined,
   } as ResponsesResponse;
 }
 
 function responseInputToChatMessages(
   input: LooseResponseItem[],
+  preserveContentParts = false,
 ): OpenAiRequest["messages"] {
-  return input.flatMap((item) => {
-    if (item.type === "message") {
-      const role = item.role === "assistant" ? "assistant" : "user";
+  return input.flatMap((item): OpenAiRequest["messages"] => {
+    if (!item || typeof item !== "object") return [];
+    if (
+      item.type === "message" ||
+      item.role === "user" ||
+      item.role === "assistant" ||
+      item.role === "system" ||
+      item.role === "developer"
+    ) {
+      const role =
+        item.role === "assistant"
+          ? "assistant"
+          : item.role === "system" || item.role === "developer"
+            ? "system"
+            : "user";
       return [
         {
           role,
-          content: stringifyResponseContent(item.content),
+          content: preserveContentParts
+            ? responseContentToChat(item.content)
+            : stringifyResponseContent(item.content),
+          ...(preserveContentParts
+            ? cacheControlFields(item.cache_control)
+            : {}),
         } as OpenAiRequest["messages"][number],
       ];
     }
@@ -165,6 +261,9 @@ function responseInputToChatMessages(
       return [
         {
           role: "assistant",
+          ...(preserveContentParts
+            ? cacheControlFields(item.cache_control)
+            : {}),
           content: null,
           tool_calls: [
             {
@@ -190,12 +289,50 @@ function responseInputToChatMessages(
           role: "tool",
           tool_call_id:
             typeof item.call_id === "string" ? item.call_id : "unknown",
-          content: typeof item.output === "string" ? item.output : "",
-        },
+          content: preserveContentParts
+            ? responseContentToChat(item.output)
+            : stringifyResponseContent(item.output),
+          ...(preserveContentParts
+            ? cacheControlFields(item.cache_control)
+            : {}),
+        } as OpenAiRequest["messages"][number],
       ];
     }
 
+    if (preserveContentParts && item.cache_control !== undefined)
+      throw new ApiError(
+        400,
+        "Unsupported Responses input item with cache_control",
+      );
     return [];
+  });
+}
+
+function responseContentToChat(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  return content.map((part: LooseResponseItem) => {
+    if (!part || typeof part !== "object") return part;
+    const marker = cacheControlFields(part.cache_control);
+    if (part.type === "input_text" || part.type === "output_text")
+      return { type: "text", text: part.text, ...marker };
+    if (part.type === "input_image")
+      return {
+        type: "image_url",
+        image_url: { url: part.image_url, detail: part.detail },
+        ...marker,
+      };
+    if (part.type === "input_file")
+      return {
+        type: "file",
+        file: {
+          file_data: part.file_data,
+          file_id: part.file_id,
+          file_url: part.file_url,
+          filename: part.filename,
+        },
+        ...marker,
+      };
+    return part;
   });
 }
 
@@ -225,4 +362,43 @@ function responseToolChoiceToChatToolChoice(
   if (toolChoice === "none") return "none";
   if (toolChoice === "required") return "required";
   return "auto";
+}
+
+function cacheControlFields(value: unknown) {
+  if (value === undefined) return {};
+  const parsed = CacheControlSchema.safeParse(value);
+  if (!parsed.success)
+    throw new ApiError(
+      400,
+      "Invalid cache_control: expected ephemeral with optional 5m or 1h ttl",
+    );
+  return { cache_control: parsed.data };
+}
+
+/** Validate the Responses envelope before translating its output constraint. */
+function translateTextFormat(text: unknown): OpenAiRequest["response_format"] {
+  if (text === undefined || text === null) return undefined;
+  const invalid = () =>
+    new ApiError(
+      400,
+      "Invalid or unsupported text.format for Chat Completions translation.",
+    );
+  if (typeof text !== "object" || Array.isArray(text)) throw invalid();
+  const format = (text as Record<string, unknown>).format;
+  if (format === undefined) return undefined;
+  if (!format || typeof format !== "object" || Array.isArray(format))
+    throw invalid();
+  const { type, ...details } = format as Record<string, unknown>;
+  const allowed =
+    type === "json_schema"
+      ? ["type", "name", "schema", "strict", "description"]
+      : ["type"];
+  if (Object.keys(format).some((key) => !allowed.includes(key)))
+    throw invalid();
+  if (type === "json_schema" && details.schema === undefined) throw invalid();
+  const result = ChatCompletionRequestSchema.shape.response_format.safeParse(
+    type === "json_schema" ? { type, json_schema: details } : { type },
+  );
+  if (!result.success) throw invalid();
+  return result.data;
 }

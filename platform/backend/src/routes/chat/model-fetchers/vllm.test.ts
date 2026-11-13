@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import config from "@/config";
+import { PLACEHOLDER_BEARER_TOKEN } from "./types";
 import { fetchVllmModels } from "./vllm";
 
 describe("fetchVllmModels", () => {
@@ -70,5 +71,69 @@ describe("fetchVllmModels", () => {
     await expect(fetchVllmModels("k")).rejects.toThrow(
       "Failed to fetch vLLM models: 403",
     );
+  });
+
+  test("sends placeholder bearer token when no API key is present", async () => {
+    await fetchVllmModels("");
+    const [, init] = lastFetchCall();
+    expect((init as RequestInit).headers).toMatchObject({
+      Authorization: PLACEHOLDER_BEARER_TOKEN,
+    });
+  });
+
+  test("createdAt is undefined when created is missing", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ data: [{ id: "m" }] }), { status: 200 }),
+    );
+    const models = await fetchVllmModels("k");
+    expect(models[0].createdAt).toBeUndefined();
+  });
+
+  test("createdAt is undefined when created is 0", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ data: [{ id: "m", created: 0 }] }), {
+        status: 200,
+      }),
+    );
+    const models = await fetchVllmModels("k");
+    expect(models[0].createdAt).toBeUndefined();
+  });
+
+  test("reports the context window the server was launched with", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ data: [{ id: "m", max_model_len: 131072 }] }),
+        { status: 200 },
+      ),
+    );
+    const models = await fetchVllmModels("k");
+    expect(models[0].capabilities?.contextLength).toBe(131072);
+  });
+
+  test("reports no capabilities when the server omits the field", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ data: [{ id: "m" }] }), { status: 200 }),
+    );
+    const models = await fetchVllmModels("k");
+    expect(models[0].capabilities).toBeUndefined();
+  });
+
+  test.each([
+    ["a string", "131072"],
+    ["a float", 4096.5],
+    ["zero", 0],
+    ["a negative", -1],
+    ["null", null],
+  ])("discards a context window reported as %s", async (_label, value) => {
+    // The value lands in an integer column at the top of the priority chain,
+    // where nothing downstream can correct it.
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ data: [{ id: "m", max_model_len: value }] }),
+        { status: 200 },
+      ),
+    );
+    const models = await fetchVllmModels("k");
+    expect(models[0].capabilities).toBeUndefined();
   });
 });

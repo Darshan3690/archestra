@@ -1,8 +1,8 @@
 import { describe, expect, test, vi } from "vitest";
 import { fetchAzureModels } from "./azure";
 
-vi.mock("@/config", () => ({
-  default: {
+vi.mock("@/config", async () =>
+  (await import("@/test/mocks/config")).configModuleMock({
     llm: {
       azure: {
         baseUrl:
@@ -10,44 +10,158 @@ vi.mock("@/config", () => ({
         apiVersion: "2024-02-01",
       },
     },
-  },
-}));
-
-vi.mock("@/logging", () => ({
-  default: { warn: vi.fn(), error: vi.fn() },
-}));
+  }),
+);
 
 vi.mock("@/clients/azure-openai-credentials", () => ({
+  getAzureManagementBearerTokenProvider: vi.fn(() => async () => "mgmt-token"),
   getAzureOpenAiBearerTokenProvider: vi.fn(() => async () => "entra-token"),
   isAzureOpenAiEntraIdEnabled: vi.fn(() => false),
 }));
 
 import {
+  getAzureManagementBearerTokenProvider,
   getAzureOpenAiBearerTokenProvider,
   isAzureOpenAiEntraIdEnabled,
 } from "@/clients/azure-openai-credentials";
 
 const mockIsAzureOpenAiEntraIdEnabled = vi.mocked(isAzureOpenAiEntraIdEnabled);
+const mockGetAzureManagementBearerTokenProvider = vi.mocked(
+  getAzureManagementBearerTokenProvider,
+);
 const mockGetAzureOpenAiBearerTokenProvider = vi.mocked(
   getAzureOpenAiBearerTokenProvider,
 );
 
 describe("fetchAzureModels", () => {
+  test.each([
+    "/openai",
+    "/openai/v1",
+  ])("does not use ambient management identity for an API-key endpoint at %s", async (path) => {
+    mockIsAzureOpenAiEntraIdEnabled.mockReturnValue(true);
+    const mockFetch = vi.fn<typeof fetch>(async (input) => {
+      const url = new URL(String(input));
+      if (url.hostname === "management.azure.com") {
+        if (url.pathname === "/subscriptions") {
+          return Response.json({ value: [{ subscriptionId: "sub-1" }] });
+        }
+        if (url.pathname.endsWith("/resources")) {
+          return Response.json({
+            value: url.searchParams.get("$filter")?.includes("projects")
+              ? [
+                  {
+                    id: "/subscriptions/sub-1/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/unrelated-foundry/projects/resource-alias",
+                  },
+                ]
+              : [],
+          });
+        }
+        return Response.json({
+          value: [
+            {
+              name: "unrelated-embedding",
+              properties: { model: { name: "text-embedding-3-small" } },
+            },
+          ],
+        });
+      }
+      if (path === "/openai") {
+        // A failed key-authenticated listing must not borrow another identity.
+        return new Response("Unauthorized", { status: 401 });
+      }
+      return Response.json({
+        data: [{ id: "endpoint-chat", model: "gpt-4o-mini" }],
+      });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+    try {
+      const models = await fetchAzureModels(
+        "endpoint-key",
+        `https://resource-alias.openai.azure.com${path}`,
+      );
+      expect(models.map((model) => model.id)).toEqual(
+        path === "/openai" ? [] : ["endpoint-chat"],
+      );
+      expect(
+        mockFetch.mock.calls.every(
+          ([input]) =>
+            new URL(String(input)).hostname !== "management.azure.com",
+        ),
+      ).toBe(true);
+    } finally {
+      mockIsAzureOpenAiEntraIdEnabled.mockReturnValue(false);
+    }
+  });
+
+  test.each([
+    "/openai",
+    "/openai/deployments/shared-embedding",
+    "/openai/v1",
+  ])("discovers deployments independently for two API-key endpoints at %s", async (path) => {
+    const deployments = {
+      "first-resource.openai.azure.com": [
+        { id: "primary-chat", model: "gpt-4o" },
+        { id: "shared-embedding", model: "text-embedding-3-small" },
+      ],
+      "second-resource.openai.azure.com": [
+        { id: "secondary-chat", model: "gpt-4o-mini" },
+        { id: "shared-embedding", model: "text-embedding-3-small" },
+        { id: "large-embedding", model: "text-embedding-3-large" },
+      ],
+    };
+    const mockFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = new URL(String(input));
+      const isFirst = url.hostname === "first-resource.openai.azure.com";
+      const expectedKey = isFirst ? "first-key" : "second-key";
+      expect(new Headers(init?.headers).get("api-key")).toBe(expectedKey);
+      // Newer inference API versions no longer expose deployment listing.
+      if (url.searchParams.get("api-version") !== "2023-03-15-preview") {
+        return new Response("Resource not found", { status: 404 });
+      }
+      return Response.json({
+        data: deployments[url.hostname as keyof typeof deployments],
+      });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const results = await Promise.all([
+      fetchAzureModels(
+        "first-key",
+        `https://first-resource.openai.azure.com${path}`,
+      ),
+      fetchAzureModels(
+        "second-key",
+        `https://second-resource.openai.azure.com${path}`,
+      ),
+    ]);
+
+    expect(results.map((models) => models.map((model) => model.id))).toEqual([
+      ["primary-chat", "shared-embedding"],
+      ["secondary-chat", "shared-embedding", "large-embedding"],
+    ]);
+    expect(results[1][0].underlyingModelName).toBe("gpt-4o-mini");
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
   test("returns empty array when baseUrl is empty and no override", async () => {
     const result = await fetchAzureModels("test-key", null);
-    expect(result).toEqual([
-      { id: "gpt-4o", displayName: "gpt-4o", provider: "azure" },
-    ]);
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([{ id: "gpt-4o", displayName: "gpt-4o", provider: "azure" }]);
   });
 
   test("returns empty array when baseUrl override is only whitespace", async () => {
     const result = await fetchAzureModels("test-key", "   ");
-    expect(result).toEqual([]);
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([]);
   });
 
   test("returns empty array when endpoint regex fails", async () => {
     const result = await fetchAzureModels("test-key", "not-a-valid-url");
-    expect(result).toEqual([]);
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([]);
   });
 
   test("returns models from successful response", async () => {
@@ -64,14 +178,106 @@ describe("fetchAzureModels", () => {
       "https://my-resource.openai.azure.com/openai/deployments/gpt-4o",
     );
 
-    expect(result).toEqual([
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([
       { id: "gpt-4o", displayName: "gpt-4o", provider: "azure" },
       { id: "gpt-4o-mini", displayName: "gpt-4o-mini", provider: "azure" },
     ]);
     expect(mockFetch).toHaveBeenCalledWith(
-      "https://my-resource.openai.azure.com/openai/deployments?api-version=2024-02-01",
+      "https://my-resource.openai.azure.com/openai/deployments?api-version=2023-03-15-preview",
       { headers: { "api-key": "test-key" } },
     );
+
+    vi.unstubAllGlobals();
+  });
+
+  test("keeps native media deployments and their modalities when chat completion is unavailable", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: [
+          {
+            id: "gpt-image-1",
+            model: "gpt-image-1",
+            capabilities: { chat_completion: false },
+          },
+          {
+            id: "gpt-realtime-translate",
+            model: "gpt-realtime-translate",
+            capabilities: { chat_completion: false },
+          },
+          {
+            id: "gpt-audio",
+            model: "gpt-audio",
+            capabilities: { chat_completion: true },
+          },
+        ],
+      }),
+    });
+    vi.stubGlobal("fetch", mockFetch);
+    try {
+      const result = await fetchAzureModels(
+        "test-key",
+        "https://my-resource.openai.azure.com/openai/v1",
+      );
+      expect(result).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: "gpt-image-1",
+            capabilities: expect.objectContaining({
+              outputModalities: ["image"],
+              supportsToolCalling: false,
+            }),
+          }),
+          expect.objectContaining({
+            id: "gpt-realtime-translate",
+            capabilities: expect.objectContaining({
+              inputModalities: ["audio"],
+              supportsToolCalling: false,
+            }),
+          }),
+          expect.objectContaining({
+            id: "gpt-audio",
+            capabilities: expect.objectContaining({
+              outputModalities: ["text", "audio"],
+              supportsToolCalling: false,
+            }),
+          }),
+        ]),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  test("captures the backing model name from data-plane deployments for pricing", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        // A deployment whose name differs from the backing model.
+        data: [{ id: "prod-chat", model: "gpt-4o" }, { id: "gpt-4o-mini" }],
+      }),
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const result = await fetchAzureModels(
+      "test-key",
+      "https://my-resource.openai.azure.com/openai/deployments/prod-chat",
+    );
+
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([
+      {
+        id: "prod-chat",
+        displayName: "prod-chat",
+        provider: "azure",
+        underlyingModelName: "gpt-4o",
+      },
+      // No `model` field → underlyingModelName omitted.
+      { id: "gpt-4o-mini", displayName: "gpt-4o-mini", provider: "azure" },
+    ]);
 
     vi.unstubAllGlobals();
   });
@@ -90,7 +296,9 @@ describe("fetchAzureModels", () => {
       "https://my-resource.openai.azure.com/openai",
     );
 
-    expect(result).toEqual([
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([
       { id: "gpt-4o", displayName: "gpt-4o", provider: "azure" },
       {
         id: "text-embedding-3-large",
@@ -99,10 +307,228 @@ describe("fetchAzureModels", () => {
       },
     ]);
     expect(mockFetch).toHaveBeenCalledWith(
-      "https://my-resource.openai.azure.com/openai/deployments?api-version=2024-02-01",
+      "https://my-resource.openai.azure.com/openai/deployments?api-version=2023-03-15-preview",
       { headers: { "api-key": "test-key" } },
     );
 
+    vi.unstubAllGlobals();
+  });
+
+  test("falls back to Azure management deployments when data-plane deployment discovery is unavailable", async () => {
+    mockIsAzureOpenAiEntraIdEnabled.mockReturnValue(true);
+
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+        text: async () =>
+          '{"error":{"code":"404","message":"Resource not found"}}',
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          value: [{ subscriptionId: "sub-1" }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          value: [
+            {
+              id: "/subscriptions/sub-1/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/my-resource",
+            },
+          ],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          value: [
+            {
+              name: "gpt-5.2-chat",
+              properties: { provisioningState: "Succeeded" },
+            },
+            {
+              name: "gpt-5.4-mini",
+              properties: { provisioningState: "Succeeded" },
+            },
+            {
+              name: "failed-deployment",
+              properties: { provisioningState: "Failed" },
+            },
+          ],
+        }),
+      });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const result = await fetchAzureModels(
+      "",
+      "https://my-resource.openai.azure.com/openai",
+    );
+
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([
+      { id: "gpt-5.2-chat", displayName: "gpt-5.2-chat", provider: "azure" },
+      { id: "gpt-5.4-mini", displayName: "gpt-5.4-mini", provider: "azure" },
+    ]);
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      1,
+      "https://my-resource.openai.azure.com/openai/deployments?api-version=2023-03-15-preview",
+      { headers: { Authorization: "Bearer entra-token" } },
+    );
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        href: "https://management.azure.com/subscriptions?api-version=2020-01-01",
+      }),
+      { headers: { Authorization: "Bearer mgmt-token" } },
+    );
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      4,
+      expect.objectContaining({
+        href: "https://management.azure.com/subscriptions/sub-1/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/my-resource/deployments?api-version=2024-10-01",
+      }),
+      { headers: { Authorization: "Bearer mgmt-token" } },
+    );
+    expect(mockGetAzureManagementBearerTokenProvider).toHaveBeenCalled();
+
+    mockIsAzureOpenAiEntraIdEnabled.mockReturnValue(false);
+    vi.unstubAllGlobals();
+  });
+
+  test("resolves a Foundry project resource to its parent Azure Cognitive Services account for deployment discovery", async () => {
+    mockIsAzureOpenAiEntraIdEnabled.mockReturnValue(true);
+
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+        text: async () =>
+          '{"error":{"code":"404","message":"Resource not found"}}',
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          value: [{ subscriptionId: "sub-1" }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          value: [],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          value: [
+            {
+              id: "/subscriptions/sub-1/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/parent-resource/projects/project-resource",
+              name: "parent-resource/project-resource",
+            },
+          ],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          value: [
+            {
+              name: "gpt-5.2-chat",
+              properties: { provisioningState: "Succeeded" },
+            },
+            {
+              name: "text-embedding-3-large",
+              properties: { provisioningState: "Succeeded" },
+            },
+          ],
+        }),
+      });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const result = await fetchAzureModels(
+      "",
+      "https://project-resource.openai.azure.com/openai",
+    );
+
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([
+      { id: "gpt-5.2-chat", displayName: "gpt-5.2-chat", provider: "azure" },
+      {
+        id: "text-embedding-3-large",
+        displayName: "text-embedding-3-large",
+        provider: "azure",
+      },
+    ]);
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      4,
+      expect.objectContaining({
+        href: "https://management.azure.com/subscriptions/sub-1/resources?api-version=2021-04-01&%24filter=resourceType+eq+%27Microsoft.CognitiveServices%2Faccounts%2Fprojects%27",
+      }),
+      { headers: { Authorization: "Bearer mgmt-token" } },
+    );
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      5,
+      expect.objectContaining({
+        href: "https://management.azure.com/subscriptions/sub-1/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/parent-resource/deployments?api-version=2024-10-01",
+      }),
+      { headers: { Authorization: "Bearer mgmt-token" } },
+    );
+
+    mockIsAzureOpenAiEntraIdEnabled.mockReturnValue(false);
+    vi.unstubAllGlobals();
+  });
+
+  test("does not fall back to resource-level model catalog when deployment discovery and management discovery are unavailable", async () => {
+    mockIsAzureOpenAiEntraIdEnabled.mockReturnValue(true);
+
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+        text: async () =>
+          '{"error":{"code":"404","message":"Resource not found"}}',
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          value: [{ subscriptionId: "sub-1" }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          value: [],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          value: [],
+        }),
+      });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const result = await fetchAzureModels(
+      "",
+      "https://my-resource.openai.azure.com/openai",
+    );
+
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([]);
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    expect(mockFetch).not.toHaveBeenCalledWith(
+      "https://my-resource.openai.azure.com/openai/models?api-version=2024-02-01",
+      expect.any(Object),
+    );
+
+    mockIsAzureOpenAiEntraIdEnabled.mockReturnValue(false);
     vi.unstubAllGlobals();
   });
 
@@ -119,7 +545,7 @@ describe("fetchAzureModels", () => {
     );
 
     expect(mockFetch).toHaveBeenCalledWith(
-      "https://my-resource.openai.azure.com/openai/deployments?api-version=2024-02-01",
+      "https://my-resource.openai.azure.com/openai/deployments?api-version=2023-03-15-preview",
       { headers: { "api-key": "test-key" } },
     );
 
@@ -141,7 +567,7 @@ describe("fetchAzureModels", () => {
     );
 
     expect(mockFetch).toHaveBeenCalledWith(
-      "https://my-resource.openai.azure.com/openai/deployments?api-version=2024-02-01",
+      "https://my-resource.openai.azure.com/openai/deployments?api-version=2023-03-15-preview",
       { headers: { Authorization: "Bearer entra-token" } },
     );
     expect(mockGetAzureOpenAiBearerTokenProvider).toHaveBeenCalledWith(
@@ -155,16 +581,37 @@ describe("fetchAzureModels", () => {
   test("lists chat models from Azure OpenAI v1 model endpoint", async () => {
     mockIsAzureOpenAiEntraIdEnabled.mockReturnValue(true);
 
-    const mockFetch = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        data: [
-          { id: "gpt-4.1", capabilities: { chat_completion: true } },
-          { id: "grok-3", capabilities: { chat_completion: true } },
-          { id: "text-embedding", capabilities: { chat_completion: false } },
-        ],
-      }),
-    });
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ value: [{ subscriptionId: "sub-1" }] }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ value: [] }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ value: [] }),
+      })
+      // Classic deployment listing is absent on this resource, so the catalog
+      // is all that is left.
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+        text: async () => "Resource not found",
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          data: [
+            { id: "gpt-4.1", capabilities: { chat_completion: true } },
+            { id: "grok-3", capabilities: { chat_completion: true } },
+            { id: "text-embedding", capabilities: { chat_completion: false } },
+          ],
+        }),
+      });
     vi.stubGlobal("fetch", mockFetch);
 
     const result = await fetchAzureModels(
@@ -172,13 +619,127 @@ describe("fetchAzureModels", () => {
       "https://my-resource.services.ai.azure.com/openai/v1",
     );
 
-    expect(result).toEqual([
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([
       { id: "gpt-4.1", displayName: "gpt-4.1", provider: "azure" },
       { id: "grok-3", displayName: "grok-3", provider: "azure" },
+      {
+        id: "text-embedding",
+        displayName: "text-embedding",
+        provider: "azure",
+      },
     ]);
-    expect(mockFetch).toHaveBeenCalledWith(
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      5,
       "https://my-resource.services.ai.azure.com/openai/v1/models",
       { headers: { Authorization: "Bearer entra-token" } },
+    );
+
+    mockIsAzureOpenAiEntraIdEnabled.mockReturnValue(false);
+    vi.unstubAllGlobals();
+  });
+
+  test("prefers real deployments over the regional catalog on a v1 base URL", async () => {
+    // /openai/v1/models lists everything the region can run; Azure only accepts
+    // a deployment name as `model`, so a catalog id would 404 at chat time.
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        data: [
+          {
+            id: "DeepSeek-V4-Pro",
+            model: "DeepSeek-V4-Pro",
+            object: "deployment",
+          },
+        ],
+      }),
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const result = await fetchAzureModels(
+      "azure-key",
+      "https://my-resource.openai.azure.com/openai/v1",
+    );
+
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([
+      {
+        id: "DeepSeek-V4-Pro",
+        displayName: "DeepSeek-V4-Pro",
+        provider: "azure",
+        underlyingModelName: "DeepSeek-V4-Pro",
+      },
+    ]);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      1,
+      "https://my-resource.openai.azure.com/openai/deployments?api-version=2023-03-15-preview",
+      expect.anything(),
+    );
+
+    vi.unstubAllGlobals();
+  });
+
+  test("lists Azure management deployments before Azure OpenAI v1 available models", async () => {
+    mockIsAzureOpenAiEntraIdEnabled.mockReturnValue(true);
+
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          value: [{ subscriptionId: "sub-1" }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          value: [
+            {
+              id: "/subscriptions/sub-1/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/my-resource",
+            },
+          ],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          value: [
+            {
+              name: "gpt-5-nano",
+              properties: { provisioningState: "Succeeded" },
+            },
+            { name: "gpt-4.1", properties: { provisioningState: "Succeeded" } },
+            {
+              name: "grok-4-1-fast-non-reasoning",
+              properties: { provisioningState: "Succeeded" },
+            },
+          ],
+        }),
+      });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const result = await fetchAzureModels(
+      "",
+      "https://my-resource.services.ai.azure.com/openai/v1",
+    );
+
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([
+      { id: "gpt-5-nano", displayName: "gpt-5-nano", provider: "azure" },
+      { id: "gpt-4.1", displayName: "gpt-4.1", provider: "azure" },
+      {
+        id: "grok-4-1-fast-non-reasoning",
+        displayName: "grok-4-1-fast-non-reasoning",
+        provider: "azure",
+      },
+    ]);
+    expect(mockFetch).not.toHaveBeenCalledWith(
+      "https://my-resource.services.ai.azure.com/openai/v1/models",
+      expect.any(Object),
     );
 
     mockIsAzureOpenAiEntraIdEnabled.mockReturnValue(false);
@@ -197,9 +758,9 @@ describe("fetchAzureModels", () => {
       "bad-key",
       "https://my-resource.openai.azure.com/openai/deployments/gpt-4o",
     );
-    expect(result).toEqual([
-      { id: "gpt-4o", displayName: "gpt-4o", provider: "azure" },
-    ]);
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([{ id: "gpt-4o", displayName: "gpt-4o", provider: "azure" }]);
 
     vi.unstubAllGlobals();
   });
@@ -212,9 +773,9 @@ describe("fetchAzureModels", () => {
       "test-key",
       "https://my-resource.openai.azure.com/openai/deployments/gpt-4o",
     );
-    expect(result).toEqual([
-      { id: "gpt-4o", displayName: "gpt-4o", provider: "azure" },
-    ]);
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([{ id: "gpt-4o", displayName: "gpt-4o", provider: "azure" }]);
 
     vi.unstubAllGlobals();
   });
@@ -230,9 +791,9 @@ describe("fetchAzureModels", () => {
       "test-key",
       "https://my-resource.openai.azure.com/openai/deployments/gpt-4o",
     );
-    expect(result).toEqual([
-      { id: "gpt-4o", displayName: "gpt-4o", provider: "azure" },
-    ]);
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([{ id: "gpt-4o", displayName: "gpt-4o", provider: "azure" }]);
 
     vi.unstubAllGlobals();
   });
@@ -248,9 +809,9 @@ describe("fetchAzureModels", () => {
       "test-key",
       "https://my-resource.openai.azure.com/openai/deployments/gpt-4o",
     );
-    expect(result).toEqual([
-      { id: "gpt-4o", displayName: "gpt-4o", provider: "azure" },
-    ]);
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([{ id: "gpt-4o", displayName: "gpt-4o", provider: "azure" }]);
 
     vi.unstubAllGlobals();
   });
@@ -269,13 +830,36 @@ describe("fetchAzureModels", () => {
       "https://my-resource.openai.azure.com/openai/deployments/gpt-5.2-chat",
     );
 
-    expect(result).toEqual([
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([
       {
         id: "gpt-5.2-chat",
         displayName: "gpt-5.2-chat",
         provider: "azure",
       },
     ]);
+
+    vi.unstubAllGlobals();
+  });
+
+  test("does not treat a resource-level /openai path as a deployment name", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      text: async () =>
+        '{"error":{"code":"404","message":"Resource not found"}}',
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const result = await fetchAzureModels(
+      "test-key",
+      "https://my-resource.openai.azure.com/openai",
+    );
+
+    expect(
+      result.map(({ azureCapabilities: _evidence, ...model }) => model),
+    ).toEqual([]);
 
     vi.unstubAllGlobals();
   });
@@ -294,7 +878,7 @@ describe("fetchAzureModels", () => {
 
     // Should call the endpoint without the deployment name
     expect(mockFetch).toHaveBeenCalledWith(
-      "https://my-company.openai.azure.com/openai/deployments?api-version=2024-02-01",
+      "https://my-company.openai.azure.com/openai/deployments?api-version=2023-03-15-preview",
       expect.any(Object),
     );
 
@@ -314,7 +898,7 @@ describe("fetchAzureModels", () => {
     );
 
     expect(mockFetch).toHaveBeenCalledWith(
-      "http://localhost:9092/azure/openai/deployments?api-version=2024-02-01",
+      "http://localhost:9092/azure/openai/deployments?api-version=2023-03-15-preview",
       expect.any(Object),
     );
 

@@ -1,26 +1,34 @@
-import { LocalConfigFormSchema } from "@shared";
+import {
+  HEADER_NAME_REGEX,
+  HEADER_NAME_VALIDATION_MESSAGE,
+  HttpUrlSchema,
+  LocalConfigFormSchema,
+  ResourcePermissionGrantSchema,
+} from "@archestra/shared";
 import { z } from "zod";
+import { desktopMcpTargetError } from "@/lib/mcp/desktop-mcp";
 
-const HEADER_NAME_REGEX = /^[A-Za-z0-9-]+$/;
+const SSO_CALLBACK_PATH = "/api/auth/sso/callback";
 
 const headerNameSchema = z
   .string()
   .trim()
   .min(1, "Header name is required")
   .max(128, "Header name is too long")
-  .regex(
-    HEADER_NAME_REGEX,
-    "Header name must contain only alphanumeric characters and hyphens",
-  );
+  .regex(HEADER_NAME_REGEX, HEADER_NAME_VALIDATION_MESSAGE);
 
 const additionalHeaderSchema = z.object({
   fieldName: z.string().optional(),
+  sourceAuthFieldName: z.string().optional(),
   headerName: headerNameSchema,
+  credentialId: z.string().min(1).max(128).optional(),
+  credentialScope: z.enum(["personal", "organization"]).optional(),
   promptOnInstallation: z.boolean(),
   required: z.boolean(),
   value: z.string().optional(),
   description: z.string().optional().or(z.literal("")),
   includeBearerPrefix: z.boolean().optional(),
+  sensitive: z.boolean().optional(),
 });
 
 // Simplified OAuth config schema
@@ -29,8 +37,10 @@ export const oauthConfigSchema = z
     client_id: z.string().optional().or(z.literal("")),
     client_secret: z.string().optional().or(z.literal("")),
     audience: z.string().optional().or(z.literal("")),
+    resource: z.string().optional().or(z.literal("")),
     redirect_uris: z.string().optional().or(z.literal("")),
     scopes: z.string().optional().or(z.literal("")),
+    additional_scopes: z.string().optional().or(z.literal("")),
     supports_resource_metadata: z.boolean(),
     authServerUrl: z
       .string()
@@ -132,6 +142,20 @@ export const oauthConfigSchema = z
     }
 
     if (
+      value.grantType === "authorization_code" &&
+      value.redirect_uris
+        ?.split(",")
+        .some((uri) => uri.trim().includes(SSO_CALLBACK_PATH))
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "MCP OAuth redirect URIs must use /oauth-callback, not the SSO callback URL",
+        path: ["redirect_uris"],
+      });
+    }
+
+    if (
       value.grantType === "client_credentials" &&
       !value.tokenEndpoint?.trim() &&
       !value.authServerUrl?.trim() &&
@@ -171,20 +195,24 @@ const enterpriseManagedConfigSchema = z.object({
     .optional(),
   headerName: z.string().optional(),
   responseFieldPath: z.string().optional(),
+  clientIdOverride: z.string().optional(),
+  clientSecretOverride: z.string().optional(),
+  privateKeyPemOverride: z.string().optional(),
+  privateKeyIdOverride: z.string().optional(),
 });
 
-export const formSchema = z
+const activeAuthFormSchema = z
   .object({
     name: z.string().trim().min(1, "Name is required"),
     description: z.string().optional().or(z.literal("")),
     icon: z.string().nullable().optional(),
-    serverType: z.enum(["remote", "local"]),
+    serverType: z.enum(["remote", "local", "desktop_mcp"]),
     multitenant: z.boolean().optional(),
-    serverUrl: z
-      .string()
-      .url({ error: "Must be a valid URL" })
-      .optional()
-      .or(z.literal("")),
+    serverUrl: HttpUrlSchema.optional().or(z.literal("")),
+    // Carried from an existing entry so a save keeps it; choosing "None"
+    // clears it.
+    requiresAuth: z.boolean().optional(),
+    managesAuthFields: z.boolean().optional(),
     authMethod: z.enum([
       "none",
       "bearer",
@@ -202,26 +230,38 @@ export const formSchema = z
       .nullable()
       .optional(),
     localConfig: LocalConfigFormSchema.optional(),
+    // What a desktop MCP server tells each computer: the command that starts
+    // it or the URL where it listens (`kind` says which `value` is). With an
+    // empty value the item cannot be added to a computer yet.
+    desktopConfig: z
+      .object({
+        kind: z.enum(["command", "url"]),
+        value: z.string(),
+      })
+      .optional(),
     // Kubernetes Deployment spec YAML (for local servers)
     deploymentSpecYaml: z.string().optional(),
     // Original YAML from API (used to detect if user modified the YAML)
     originalDeploymentSpecYaml: z.string().optional(),
-    // BYOS: External Vault path for OAuth client secret
-    oauthClientSecretVaultPath: z.string().optional(),
-    // BYOS: External Vault key for OAuth client secret
-    oauthClientSecretVaultKey: z.string().optional(),
-    // BYOS: External Vault path for local config secret env vars
-    localConfigVaultPath: z.string().optional(),
-    // BYOS: External Vault key for local config secret env vars
-    localConfigVaultKey: z.string().optional(),
+
     // Labels for categorizing catalog items
     labels: z
       .array(z.object({ key: z.string(), value: z.string() }))
       .optional(),
     // Scope for catalog item visibility
     scope: z.enum(["personal", "team", "org"]).optional(),
-    // Team IDs for team-scoped items
-    teams: z.array(z.string()).optional(),
+    initialGrants: z
+      .array(ResourcePermissionGrantSchema.extend({ name: z.string() }))
+      .optional(),
+    // Teams a team-scoped item is shared with, each with its access level
+    teams: z
+      .array(z.object({ id: z.string(), level: z.enum(["use", "write"]) }))
+      .optional(),
+    // Deployment environment assignment (null = the default environment)
+    environmentId: z.string().uuid().nullable().optional(),
+    // Read-only setup instructions (markdown) surfaced from the catalog item.
+    // Rendered at the top of the form; not part of the submitted payload.
+    instructions: z.string().optional(),
   })
   .superRefine((data, ctx) => {
     const normalizedHeaders = new Set<string>();
@@ -294,7 +334,7 @@ export const formSchema = z
     },
     {
       message:
-        "Either command or Docker image must be provided. If Docker image is set, command is optional.",
+        "Either command or container image must be provided. If container image is set, command is optional.",
       path: ["localConfig", "command"],
     },
   )
@@ -328,6 +368,86 @@ export const formSchema = z
         path: ["enterpriseManagedConfig", "identityProviderId"],
       });
     }
+  })
+  .superRefine((data, ctx) => {
+    if (data.serverType !== "desktop_mcp" || !data.desktopConfig) return;
+    const message = desktopMcpTargetError(data.desktopConfig);
+    if (message) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message,
+        path: ["desktopConfig", "value"],
+      });
+    }
   });
 
+export const formSchema = z.preprocess(
+  omitInactiveFields,
+  activeAuthFormSchema,
+);
+
 export type McpCatalogFormValues = z.infer<typeof formSchema>;
+
+// RHF retains unmounted fields so switching back restores the user's draft.
+// Validate and submit only the selected hosting's and method's configuration,
+// without mutating those retained values or suppressing errors in shared
+// fields.
+function omitInactiveFields(value: unknown) {
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  if ("serverType" in value && value.serverType === "desktop_mcp") {
+    return omitConnectionFields(value);
+  }
+  if (!("authMethod" in value)) {
+    return value;
+  }
+
+  const data = { ...value } as Record<string, unknown>;
+  // Only a desktop MCP server has a command for computers.
+  delete data.desktopConfig;
+  if (
+    data.authMethod !== "oauth" &&
+    data.authMethod !== "oauth_client_credentials"
+  ) {
+    delete data.oauthConfig;
+  } else if (
+    data.authMethod === "oauth_client_credentials" &&
+    data.oauthConfig &&
+    typeof data.oauthConfig === "object"
+  ) {
+    const oauthConfig = { ...data.oauthConfig } as Record<string, unknown>;
+    delete oauthConfig.authorizationEndpoint;
+    delete oauthConfig.oauthServerUrl;
+    data.oauthConfig = oauthConfig;
+  }
+  if (data.authMethod !== "bearer") {
+    data.authHeaderName = "";
+  }
+  if (
+    data.authMethod !== "enterprise_managed" &&
+    data.authMethod !== "idp_jwt"
+  ) {
+    delete data.enterpriseManagedConfig;
+  }
+  return data;
+}
+
+// A desktop MCP server runs on each user's own computer: the gateway has no
+// server URL for it, no deployment and no authentication. Whatever the form
+// still holds for those, from a hosting the user chose first, is neither
+// validated nor submitted. Its own `desktopConfig` stays.
+function omitConnectionFields(value: object) {
+  const data = { ...value } as Record<string, unknown>;
+  data.serverUrl = "";
+  data.multitenant = false;
+  data.authMethod = "none";
+  data.authHeaderName = "";
+  data.additionalHeaders = [];
+  delete data.oauthConfig;
+  delete data.enterpriseManagedConfig;
+  delete data.localConfig;
+  delete data.deploymentSpecYaml;
+  delete data.originalDeploymentSpecYaml;
+  return data;
+}

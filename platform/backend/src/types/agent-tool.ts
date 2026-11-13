@@ -1,10 +1,11 @@
+import { TOOL_SEARCH_MAX_LENGTH } from "@archestra/shared";
 import {
   createInsertSchema,
   createSelectSchema,
   createUpdateSchema,
 } from "drizzle-zod";
 import { z } from "zod";
-import { schema } from "@/database";
+import { schema } from "@/database/schema";
 import { CredentialResolutionModeSchema } from "@/types/enterprise-managed-credentials";
 import { UuidIdSchema } from "./api";
 import { ToolParametersContentSchema } from "./tool";
@@ -64,8 +65,24 @@ export const BulkAgentToolAssignmentSchema =
     agentId: UuidIdSchema,
   });
 
+export const BulkAgentToolRemovalSchema = z.object({
+  agentId: UuidIdSchema,
+  toolId: UuidIdSchema,
+});
+
+/**
+ * Ceiling on entries in one bulk agent-tool request body.
+ *
+ * A fence, not a tuning knob: the widest realistic save is a single MCP server's
+ * catalog across a handful of agents, which is two orders of magnitude below
+ * this. It bounds the work one request can hold open a write transaction for.
+ * The statement-level parameter limit is a separate concern, handled by
+ * chunking the pair lookup rather than by this cap.
+ */
+export const MAX_BULK_AGENT_TOOL_ENTRIES = 5000;
+
 export const AgentToolFilterSchema = z.object({
-  search: z.string().optional(),
+  search: z.string().max(TOOL_SEARCH_MAX_LENGTH).optional(),
   agentId: UuidIdSchema.optional(),
   origin: z.string().optional().describe("A catalogId to filter by"),
   mcpServerOwnerId: z
@@ -94,9 +111,17 @@ export type AgentToolFilters = z.infer<typeof AgentToolFilterSchema>;
 
 export type McpToolAssignment = {
   toolName: string;
+  /**
+   * Raw upstream tool name (tools.raw_name). Preferred over splitting `toolName`
+   * when dispatching to the upstream server. Null for legacy rows not yet
+   * re-synced; callers fall back to splitting `toolName`.
+   */
+  rawName: string | null;
   mcpServerId: string | null;
   credentialResolutionMode: z.infer<typeof CredentialResolutionModeSchema>;
   catalogId: string | null;
   catalogName: string | null;
   meta: Record<string, unknown> | null;
+  /** Tool input schema, for x-mcp-header extraction on the call path. */
+  parameters?: Record<string, unknown> | null;
 };

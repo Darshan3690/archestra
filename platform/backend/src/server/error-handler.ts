@@ -1,0 +1,435 @@
+import * as Sentry from "@sentry/node";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import {
+  hasZodFastifySchemaValidationErrors,
+  isResponseSerializationError,
+} from "fastify-type-provider-zod";
+import config from "@/config";
+import {
+  getDatabaseOutageErrorCode,
+  getDbResourceExhaustionErrorCode,
+  getNonDatabaseConnectionTarget,
+  isDbStatementTimeoutError,
+} from "@/database/retry";
+import { ApiError } from "@/types";
+import { FAILED_QUERY_CLIENT_MESSAGE, hasFailedQueryText } from "@/utils/db";
+import { incomingRequestAbortTracker } from "@/utils/incoming-request-abort";
+import {
+  getNetworkErrorCode,
+  isFetchConnectivityError,
+} from "@/utils/network-errors";
+
+export function handleServerError(
+  this: FastifyInstance,
+  error: ApiError | Error,
+  request: FastifyRequest,
+  reply: FastifyReply,
+) {
+  const requestContext = buildRequestErrorContext(request);
+
+  if (incomingRequestAbortTracker.isAbortedError(error)) {
+    this.log.info(requestContext, "Client closed the incoming request");
+    return reply.status(499).send();
+  }
+
+  // A stream can fail before committing its headers. The error body is JSON,
+  // not the file or range the route originally prepared to send.
+  if (!reply.raw.headersSent) {
+    reply.type("application/json");
+    for (const header of [
+      "content-length",
+      "content-range",
+      "content-encoding",
+      "content-disposition",
+      "accept-ranges",
+      "etag",
+      "last-modified",
+    ]) {
+      reply.removeHeader(header);
+    }
+  }
+
+  // Handle response serialization errors (when response doesn't match schema)
+  if (isResponseSerializationError(error)) {
+    const issues = error.cause?.issues ?? [];
+    const validationErrors = issues.map((issue) => ({
+      path: issue.path?.join("."),
+      code: issue.code,
+      message: issue.message,
+    }));
+
+    this.log.error(
+      {
+        ...requestContext,
+        statusCode: 500,
+        method: error.method,
+        url: error.url,
+        validationErrors,
+      },
+      `Response serialization error on ${error.method} ${error.url}: ${JSON.stringify(validationErrors)}`,
+    );
+
+    // Preserve validation details in the exception report.
+    Sentry.captureException(error, {
+      extra: {
+        method: error.method,
+        url: error.url,
+        validationErrors,
+      },
+      tags: {
+        error_type: "response_serialization",
+      },
+    });
+
+    return reply.status(500).send({
+      error: {
+        message: "Response doesn't match the schema",
+        type: "api_internal_server_error",
+      },
+    });
+  }
+
+  // Handle Zod validation errors (from fastify-type-provider-zod)
+  if (hasZodFastifySchemaValidationErrors(error)) {
+    const message = error.message || "Validation error";
+    this.log.info(
+      { ...requestContext, error: message, statusCode: 400 },
+      "HTTP 400 validation error occurred",
+    );
+
+    return reply.status(400).send({
+      error: {
+        message,
+        type: "api_validation_error",
+      },
+    });
+  }
+
+  // Handle Fastify "body too large" before the generic Error branch so it
+  // returns 413 (not 500) with a message that names the limit and observed
+  // size. The frontend chat-error mapper picks up `error.message`, so a
+  // useful text here flows straight into the UI.
+  if (isBodyTooLargeError(error)) {
+    // Report the limit that actually applied. A route can raise its own
+    // above the global default, so naming the global here would misstate
+    // the ceiling the request hit.
+    const routeLimit = request.routeOptions?.bodyLimit;
+    const limit =
+      typeof routeLimit === "number" ? routeLimit : config.api.bodyLimit;
+    const contentLength = parseContentLength(request);
+    const message = formatBodyTooLargeMessage({ limit, contentLength });
+
+    this.log.warn(
+      {
+        ...requestContext,
+        statusCode: 413,
+        code: (error as { code?: string }).code ?? BODY_TOO_LARGE_CODE,
+        bodyLimit: limit,
+        contentLength,
+      },
+      "HTTP 413 request body too large",
+    );
+
+    return reply.status(413).send({
+      error: {
+        message,
+        type: "api_payload_too_large_error",
+      },
+    });
+  }
+
+  // Fastify's own typed errors (unsupported media type, malformed
+  // content-type, …) carry the intended 4xx status. Without this branch
+  // they fall through to the generic handler below, which miscodes a
+  // client mistake as a 500 and captures it as a server exception.
+  const errorStatusCode = (error as { statusCode?: unknown }).statusCode;
+  if (
+    !(error instanceof ApiError) &&
+    typeof errorStatusCode === "number" &&
+    errorStatusCode >= 400 &&
+    errorStatusCode < 500
+  ) {
+    const coerced = new ApiError(
+      errorStatusCode,
+      error.message || "Bad Request",
+    );
+    this.log.info(
+      {
+        ...requestContext,
+        error: coerced.message,
+        statusCode: coerced.statusCode,
+      },
+      "HTTP 40x request error occurred",
+    );
+    return reply.status(coerced.statusCode).send({
+      error: { message: coerced.message, type: coerced.type },
+    });
+  }
+
+  // Native HTTP fetch errors and connection failures to a host other than
+  // the database share socket codes with database connections. Preserve
+  // their known origin before the broader database errno matching. A proxy
+  // relay already chose its status from the same transport failure, which it
+  // keeps as `cause`; leave that status alone.
+  const isUpstreamRelay = error instanceof ApiError && error.upstream === true;
+  const outboundTarget = isUpstreamRelay
+    ? null
+    : getNonDatabaseConnectionTarget(error);
+  if (outboundTarget || isFetchConnectivityError(error)) {
+    return replyUpstreamUnavailable.call(this, {
+      reply,
+      requestContext,
+      outboundTarget,
+      errorCode: getNetworkErrorCode(error),
+    });
+  }
+
+  // Transient database connectivity failures (DNS lookup, connection
+  // refused during a database restart, pool connect timeouts) that
+  // survived the retry budget are availability incidents, not bugs in
+  // whichever route happened to be in flight. Respond with a retryable
+  // 503 instead of a 500, and group them in error tracking by root
+  // cause rather than by the query text the ORM wraps them in. A bare
+  // socket errno counts only when the database client raised it.
+  const transientDbErrorCode = getDatabaseOutageErrorCode(error);
+  if (transientDbErrorCode) {
+    this.log.error(
+      {
+        ...requestContext,
+        error: error.message,
+        statusCode: 503,
+        dbErrorCode: transientDbErrorCode,
+      },
+      "HTTP 503 database temporarily unavailable",
+    );
+
+    return reply.status(503).send({
+      error: {
+        message:
+          "Cannot reach the database. Retry shortly; if it continues, ask an administrator to check the database service and connection settings.",
+        type: "api_service_unavailable_error",
+      },
+    });
+  }
+
+  const resourceExhaustionCode = getDbResourceExhaustionErrorCode(error);
+  const isStatementTimeout = isDbStatementTimeoutError(error);
+  if (resourceExhaustionCode || isStatementTimeout) {
+    const message = resourceExhaustionCode
+      ? resourceExhaustionCode === "disk_full"
+        ? "Database storage is full. Ask an administrator to free or expand it."
+        : resourceExhaustionCode === "too_many_connections"
+          ? "Database connection limit reached. Ask an administrator to check database capacity."
+          : "Database resources are exhausted. Ask an administrator to check database capacity."
+      : "Database query timed out. Retry; if it continues, ask an administrator to check database load.";
+
+    this.log.error(
+      {
+        ...requestContext,
+        error: error.message,
+        statusCode: 503,
+        dbErrorCode: resourceExhaustionCode ?? "statement_timeout",
+      },
+      "HTTP 503 database unavailable",
+    );
+    return reply.status(503).send({
+      error: { message, type: "api_service_unavailable_error" },
+    });
+  }
+
+  // The passthrough proxy returns 500 for connect timeouts, either preserving
+  // undici's code or wrapping it in a generic error in older versions. Keep
+  // both responses retryable and point the caller at the configured upstream.
+  const providerErrorCode = (error as { code?: string }).code;
+  if (
+    request.url.startsWith("/v1/") &&
+    (providerErrorCode === "UND_ERR_CONNECT_TIMEOUT" ||
+      (providerErrorCode === "FST_REPLY_FROM_INTERNAL_SERVER_ERROR" &&
+        error.message === "Connect Timeout Error"))
+  ) {
+    this.log.warn(
+      { ...requestContext, statusCode: 503 },
+      "HTTP 503 model provider connection timed out",
+    );
+    return reply.status(503).send({
+      error: {
+        message:
+          "Could not connect to the model provider. Check its base URL and network access, then retry.",
+        type: "api_service_unavailable_error",
+      },
+    });
+  }
+
+  // Any other connection failure or timeout came from an outbound client
+  // that named no endpoint. It is not a database outage (that needs the
+  // database client's provenance, above), so report it as an upstream one.
+  // An ApiError keeps the status its route chose.
+  const unattributedNetworkErrorCode =
+    error instanceof ApiError ? null : getNetworkErrorCode(error);
+  if (unattributedNetworkErrorCode) {
+    return replyUpstreamUnavailable.call(this, {
+      reply,
+      requestContext,
+      outboundTarget: null,
+      errorCode: unattributedNetworkErrorCode,
+    });
+  }
+
+  // Handle ApiError objects
+  if (error instanceof ApiError) {
+    const { statusCode, message, type, internalCode } = error;
+    const logPayload = {
+      ...requestContext,
+      error: message,
+      statusCode,
+      ...(internalCode && { internalCode }),
+    };
+
+    if (statusCode >= 500) {
+      // Sentry's Fastify error hook reports it, filtered and grouped by
+      // classifyErrorForTracking: 502/504 upstream failures are dropped as
+      // noise, and a secrets-backend outage is grouped by root cause.
+      this.log.error(logPayload, "HTTP 50x request error occurred");
+    } else if (statusCode >= 400) {
+      this.log.info(logPayload, "HTTP 40x request error occurred");
+    } else {
+      this.log.error(logPayload, "HTTP request error occurred");
+    }
+
+    // A throttling error that knows when it clears says so, so clients wait
+    // that long instead of guessing with their own escalating backoff.
+    // Headers cannot be added once a streaming reply has committed them.
+    const { retryAfterSeconds } = error;
+    if (
+      typeof retryAfterSeconds === "number" &&
+      Number.isFinite(retryAfterSeconds) &&
+      retryAfterSeconds > 0 &&
+      !reply.raw.headersSent
+    ) {
+      reply.header("retry-after", String(Math.ceil(retryAfterSeconds)));
+    }
+    if (typeof error.shouldRetry === "boolean" && !reply.raw.headersSent) {
+      reply.header("x-should-retry", String(error.shouldRetry));
+    }
+
+    return reply.status(statusCode).send({
+      error: {
+        // A route can build an ApiError from a failed query's message.
+        message: hasFailedQueryText(error)
+          ? FAILED_QUERY_CLIENT_MESSAGE
+          : message,
+        type,
+        ...(internalCode && { internal_code: internalCode }),
+        ...(error.details && { details: error.details }),
+      },
+    });
+  }
+
+  // Handle standard Error objects
+  const message = error.message || "Internal server error";
+  const statusCode = 500;
+  const errorCode = (error as { code?: string }).code;
+
+  this.log.error(
+    {
+      ...requestContext,
+      error: message,
+      statusCode,
+      ...(errorCode && { code: errorCode }),
+      stack: error.stack,
+    },
+    "HTTP 50x request error occurred",
+  );
+
+  return reply.status(statusCode).send({
+    error: {
+      // A failed query's message holds its SQL and parameter values. Keep it
+      // in the log, not in the response.
+      message: hasFailedQueryText(error)
+        ? FAILED_QUERY_CLIENT_MESSAGE
+        : message,
+      type: "api_internal_server_error",
+    },
+  });
+}
+
+/**
+ * Answer a request whose outbound connection failed with a retryable 503 that
+ * names the host the backend could not reach and the error code, when known.
+ */
+function replyUpstreamUnavailable(
+  this: FastifyInstance,
+  params: {
+    reply: FastifyReply;
+    requestContext: ReturnType<typeof buildRequestErrorContext>;
+    outboundTarget: string | null;
+    errorCode: string | null;
+  },
+) {
+  const { reply, requestContext, outboundTarget, errorCode } = params;
+  this.log.warn(
+    { ...requestContext, statusCode: 503, outboundTarget, errorCode },
+    "HTTP 503 upstream service unavailable",
+  );
+  const code = errorCode ? ` (${errorCode})` : "";
+  return reply.status(503).send({
+    error: {
+      message: outboundTarget
+        ? `Could not connect to ${outboundTarget}${code}. Check that the network egress policy allows this host and that the service is reachable, then retry.`
+        : `Could not connect to an upstream service${code}. Check the service URL and network access, then retry.`,
+      type: "api_service_unavailable_error",
+    },
+  });
+}
+
+/** Fastify code emitted when a request body exceeds the configured limit. */
+const BODY_TOO_LARGE_CODE = "FST_ERR_CTP_BODY_TOO_LARGE";
+
+/**
+ * Extract the route, URL, method, and a sample of headers we want correlated
+ * with every error log line. Without these, "HTTP 50x request error occurred"
+ * is unactionable — you can't tell which endpoint failed or how big the payload
+ * was.
+ */
+function buildRequestErrorContext(request: FastifyRequest) {
+  return {
+    method: request.method,
+    url: request.url,
+    route: request.routeOptions?.url,
+    routeId:
+      (request.routeOptions?.config as { operationId?: string } | undefined)
+        ?.operationId ?? undefined,
+    reqId: request.id,
+    contentLength: parseContentLength(request),
+    contentType: request.headers["content-type"],
+  };
+}
+
+function parseContentLength(request: FastifyRequest): number | undefined {
+  const raw = request.headers["content-length"];
+  if (typeof raw !== "string") return undefined;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function isBodyTooLargeError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  // A thrown ApiError(413) is a route speaking deliberately — its message
+  // already names the limit in that route's own terms. This branch only
+  // rescues Fastify's raw parser error, which arrives without a usable text.
+  if (error instanceof ApiError) return false;
+  const e = error as { code?: string; statusCode?: number };
+  return e.code === BODY_TOO_LARGE_CODE || e.statusCode === 413;
+}
+
+function formatBodyTooLargeMessage(params: {
+  limit: number;
+  contentLength?: number;
+}): string {
+  const limitMb = (params.limit / (1024 * 1024)).toFixed(0);
+  if (params.contentLength !== undefined) {
+    const gotMb = (params.contentLength / (1024 * 1024)).toFixed(1);
+    return `Request body too large: ${gotMb} MB (limit ${limitMb} MB). Use a smaller attachment, or raise ARCHESTRA_API_BODY_LIMIT.`;
+  }
+  return `Request body too large (limit ${limitMb} MB). Use a smaller attachment, or raise ARCHESTRA_API_BODY_LIMIT.`;
+}

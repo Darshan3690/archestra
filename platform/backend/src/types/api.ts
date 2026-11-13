@@ -1,9 +1,12 @@
-import { ApiError, ApiErrorTypeSchema } from "@shared";
+import { ApiError, ApiErrorTypeSchema } from "@archestra/shared/types";
 import { z } from "zod";
 
 export { ApiError, ApiErrorTypeSchema };
 
-export const UuidIdSchema = z.uuidv4();
+// Any RFC 9562 version: entity ids are minted as v4 by the database default
+// and as monotonic v7 by models that need a chronological tiebreaker (see
+// utils/uuid.ts), so version-pinned validation would reject real ids.
+export const UuidIdSchema = z.uuid();
 
 export const UuidOrSlugSchema = z.string().min(1);
 
@@ -13,6 +16,7 @@ export type ErrorResponseSchema<T extends z.infer<typeof ApiErrorTypeSchema>> =
       message: string;
       type: T;
       internal_code?: string;
+      details?: Record<string, unknown>;
     };
   };
 
@@ -29,10 +33,20 @@ export const generateErrorResponseSchema = <
     }),
   });
 
+/** A 403 can carry `details` whose shape its `internal_code` sets. */
+const ForbiddenErrorResponseSchema = z.object({
+  error: z.object({
+    message: z.string(),
+    type: z.literal("api_authorization_error"),
+    internal_code: z.string().optional(),
+    details: z.record(z.string(), z.unknown()).optional(),
+  }),
+});
+
 export const ErrorResponsesSchema = {
   400: generateErrorResponseSchema("api_validation_error"),
   401: generateErrorResponseSchema("api_authentication_error"),
-  403: generateErrorResponseSchema("api_authorization_error"),
+  403: ForbiddenErrorResponseSchema,
   404: generateErrorResponseSchema("api_not_found_error"),
   409: generateErrorResponseSchema("api_conflict_error"),
   500: generateErrorResponseSchema("api_internal_server_error"),

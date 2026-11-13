@@ -1,0 +1,2748 @@
+import type { EnvironmentTarget } from "@archestra/sandbox-rs";
+import {
+  MAX_PROJECT_UPLOAD_BYTES,
+  PROJECT_INSTRUCTIONS_FILENAME,
+  TOOL_COPY_FILE_SHORT_NAME,
+  TOOL_DELETE_FILE_SHORT_NAME,
+  TOOL_DOWNLOAD_FILE_SHORT_NAME,
+  TOOL_EDIT_FILE_SHORT_NAME,
+  TOOL_READ_FILE_RAW_SHORT_NAME,
+  TOOL_READ_FILE_SHORT_NAME,
+  TOOL_RUN_COMMAND_SHORT_NAME,
+  TOOL_SAVE_FILE_SHORT_NAME,
+  TOOL_SEARCH_FILES_SHORT_NAME,
+  TOOL_UPLOAD_FILE_SHORT_NAME,
+} from "@archestra/shared";
+import { z } from "zod";
+import config from "@/config";
+import { daggerEnvironmentRuntimeManager } from "@/k8s/dagger-environment-runtime/manager";
+import logger from "@/logging";
+import {
+  AgentModel,
+  EnvironmentModel,
+  FileNameExistsError,
+  OrganizationModel,
+  SkillSandboxConversationGoneError,
+  SkillSandboxModel,
+} from "@/models";
+import { loadConversationAttachmentSource } from "@/services/conversation-attachment-source";
+import { projectService } from "@/services/project";
+import { executionSandboxRegistry } from "@/skills-sandbox/execution-sandbox-registry";
+import { UnsafePathError } from "@/skills-sandbox/file-path";
+import { FileBytesMissingError } from "@/skills-sandbox/file-storage";
+import type {
+  MyFileResolutionError,
+  MyFileTarget,
+} from "@/skills-sandbox/file-store";
+import {
+  FileNotDeletableError,
+  fileStore,
+  OBJECT_REF_PREFIX,
+} from "@/skills-sandbox/file-store";
+import {
+  isInlineSafeImageMime,
+  resolveArtifactMime,
+} from "@/skills-sandbox/mime-sniff";
+import {
+  type ProjectFileScope,
+  resolveExplicitProjectFileScope,
+  resolveProjectFileScope,
+} from "@/skills-sandbox/project-file-scope";
+import {
+  SKILL_SANDBOX_ATTACHMENTS_DIR,
+  SKILL_SANDBOX_HOME,
+} from "@/skills-sandbox/runtime-image";
+import { skillSandboxRuntimeService } from "@/skills-sandbox/skill-sandbox-runtime-service";
+import {
+  SKILL_SANDBOX_LIMITS,
+  SkillSandboxError,
+} from "@/skills-sandbox/types";
+import { asSandboxId, type SandboxId } from "@/types";
+import { isUuid } from "@/utils/uuid";
+import {
+  decodeUtf8Text,
+  defineArchestraTool,
+  defineArchestraTools,
+  errorResult,
+  structuredSuccessResult,
+} from "./helpers";
+import type { ArchestraContext } from "./types";
+
+/**
+ * Code execution + file tools for the conversation sandbox: `run_command`,
+ * `upload_file`, `download_file`, `search_files`, `read_file`, `save_file`,
+ * `edit_file`, `delete_file`.
+ *
+ * Each conversation has an implicit default sandbox, created lazily on first
+ * use — there is no create step. Commands, uploads, and activated skills all
+ * accumulate in one durable, replayable recipe (Postgres is the source of
+ * truth; Dagger materializes it on demand). `target` lets advanced callers run
+ * against a fresh isolated sandbox or an explicit one instead of the default.
+ *
+ * RBAC (see `rbac.ts`, enforced in the dispatch path before the handler runs):
+ * `run_command`, `upload_file`, and `download_file` are gated by
+ * `agent:read`; the file tools (`search_files`, `read_file`, `save_file`,
+ * `edit_file`, `delete_file`) by `agent:read` too. Skills become runnable here by
+ * loading them (`load_skill`), which mounts them into the default sandbox; that
+ * path is `skill:read`-gated.
+ *
+ * Model-facing text in this file follows the skill terminology glossary in
+ * `skills/skill-activation.ts` and is pinned by `skill-tool-text.test.ts`.
+ */
+
+// read_file default line window (matches the SOTA Read default).
+const READ_FILE_DEFAULT_LINES = 2000;
+
+// Cap raw image bytes read_file will return inline so the base64 payload stays
+// under the model's ~5 MB per-image limit (base64 inflates by ~4/3). Larger
+// images are refused with a hint to copy the file into the sandbox instead.
+const READ_FILE_IMAGE_BYTES_LIMIT = 3.75 * 1024 * 1024;
+
+// typed target — no magic strings. omitted = the conversation's default
+// sandbox (lazily created); { fresh: true } = a new isolated sandbox (its id is
+// returned); { id } = an explicit existing sandbox in the same conversation.
+// Both fields are optional and weakly typed on purpose: models routinely guess
+// `{ fresh: false }` or `{ id: "" }` meaning "the default sandbox", so the
+// schema accepts those shapes and `normalizeTarget` maps any no-op guess back to
+// the default rather than rejecting it.
+const SandboxTargetSchema = z
+  .strictObject({
+    fresh: z
+      .boolean()
+      .optional()
+      .describe(
+        "Set true for a brand-new empty sandbox, without the conversation's attachments or earlier work; its id is returned.",
+      ),
+    id: z
+      .string()
+      .optional()
+      .describe("An existing sandbox id (UUID) returned by an earlier call."),
+  })
+  .optional()
+  .describe(
+    "Which sandbox to use. Omit (or leave empty) for the conversation's default " +
+      "sandbox (created on first use), which holds the conversation's attachments. " +
+      'Pass `{ "fresh": true }` for a new empty ' +
+      'sandbox, or `{ "id": "<uuid>" }` to target a specific one.',
+  );
+
+type SandboxTarget = z.infer<typeof SandboxTargetSchema>;
+
+// Canonical target intent after normalizing a (loosely typed) SandboxTarget:
+// a fresh sandbox, a specific id, or the default (undefined).
+type SandboxTargetIntent = { fresh: true } | { id: string } | undefined;
+
+const RunCommandSchema = z
+  .strictObject({
+    command: z
+      .string()
+      .min(1)
+      .max(SKILL_SANDBOX_LIMITS.maxCommandBytes)
+      .describe(
+        "Shell command to execute (bash). Runs in the sandbox's working " +
+          "directory (or `cwd` when provided). Returns text output only — use " +
+          "download_file for generated files.",
+      ),
+    cwd: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Optional absolute path inside the container. Defaults to the " +
+          "sandbox's working directory (/home/sandbox).",
+      ),
+    timeoutSeconds: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "Optional wall-clock limit in seconds, capped at the deployment " +
+          "maximum.",
+      ),
+    target: SandboxTargetSchema,
+  })
+  .describe(
+    "Run a shell command in the conversation's sandbox. State persists across " +
+      "calls. Returns stdout, stderr, exit code, and timing.",
+  );
+
+const RunCommandOutputSchema = z.object({
+  commandId: z.string(),
+  sandboxId: z.string(),
+  command: z.string(),
+  cwd: z.string().nullable(),
+  stdout: z.string(),
+  stderr: z.string(),
+  exitCode: z.number(),
+  durationMs: z.number(),
+  timedOut: z.boolean(),
+  truncated: z.boolean(),
+  binaryStripped: z
+    .boolean()
+    .describe(
+      "True when NUL bytes were stripped from stdout/stderr before storage.",
+    ),
+  stagingNotices: z
+    .array(z.string())
+    .describe(
+      "Notices about chat attachments that could not be auto-staged (e.g. too " +
+        "large). Empty when all attachments are available in the sandbox.",
+    ),
+});
+
+const DownloadFileSchema = z
+  .strictObject({
+    path: z
+      .string()
+      .min(1)
+      .describe(
+        "Path to the file inside the container — absolute, or relative to the " +
+          "sandbox's working directory.",
+      ),
+    mimeType: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Optional MIME type recorded with the file. Sniffed from the bytes " +
+          "when omitted.",
+      ),
+    overwrite: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        "Replace an existing same-named persistent file in place, keeping its id. " +
+          "Default false errors if the name is already taken.",
+      ),
+    target: SandboxTargetSchema,
+  })
+  .describe(
+    "Copy a file that already exists at a path in the sandbox into the conversation's persistent " +
+      "files. Use this for anything on the sandbox's disk — a file run_command wrote (text or " +
+      "binary) or a staged attachment — its bytes are not returned to you, so you never read " +
+      "them back.",
+  );
+
+const DownloadFileOutputSchema = z.object({
+  fileId: z.string(),
+  sandboxId: z.string(),
+  path: z.string(),
+  mimeType: z.string(),
+  sizeBytes: z.number(),
+  stagingNotices: z
+    .array(z.string())
+    .describe(
+      "Notices about chat attachments that could not be auto-staged (e.g. too " +
+        "large). Empty when all attachments are available in the sandbox.",
+    ),
+  overwritten: z
+    .boolean()
+    .describe("True when an existing same-named file was replaced in place."),
+});
+
+/**
+ * Every file selector in this module picks its file one of two ways — by id or
+ * by name — and refuses both or neither. One predicate and one message so the
+ * rule cannot drift between upload_file, read_file_raw, and copy_file.
+ */
+const exactlyOneOf = (a: string, b: string) =>
+  [
+    (v: Record<string, unknown>) => (v[a] != null) !== (v[b] != null),
+    {
+      message: `provide exactly one of \`${a}\` or \`${b}\`; leave the other out or empty`,
+    },
+  ] as const;
+
+const ID_OR_FILENAME = exactlyOneOf("id", "filename");
+const ATTACHMENT_ID_OR_FILENAME = exactlyOneOf("attachmentId", "filename");
+
+/**
+ * An optional selector where a blank value means "not given". A model that
+ * fills every declared field sends "" or whitespace for the selector it does
+ * not mean, and that must not count as a second selector.
+ */
+const optionalSelector = (base: z.ZodString = z.string()) =>
+  base.optional().transform((value) => (value?.trim() ? value : undefined));
+
+/** `id` XOR `filename` selector fields, described per call site. */
+const idOrFilenameShape = (describe: { id: string; filename: string }) => ({
+  id: optionalSelector().describe(describe.id),
+  filename: optionalSelector().describe(describe.filename),
+});
+
+/**
+ * A chat attachment as a source of bytes, shared by upload_file and copy_file.
+ * Ids are never model-visible — the attachment notice only names the sandbox
+ * directory — so the name is the selector a model can actually reach for, and
+ * latest-wins because attachment names are not unique.
+ */
+const chatAttachmentSource = (describe: { self: string; id: string }) =>
+  z
+    .strictObject({
+      type: z.literal("chat_attachment"),
+      attachmentId: optionalSelector()
+        .refine(
+          (value) => value === undefined || isUuid(value),
+          "must be the attachment's id — when you only know the name, use `filename` instead",
+        )
+        .describe(describe.id),
+      filename: optionalSelector().describe(
+        "Original filename of an attachment in this conversation (when " +
+          "you have no id). If the same name was attached more than once, " +
+          "the newest one wins.",
+      ),
+    })
+    .refine(...ATTACHMENT_ID_OR_FILENAME)
+    .describe(describe.self);
+
+const UploadSourceSchema = z.discriminatedUnion("type", [
+  chatAttachmentSource({
+    self: "Copy bytes from a file the user attached to this conversation.",
+    id:
+      "Id of an attachment in the current conversation. The bytes are " +
+      "copied directly and never enter your context.",
+  }),
+  z
+    .strictObject({
+      type: z.literal("base64"),
+      dataBase64: z.string().min(1).describe("Base64-encoded file bytes."),
+      mimeType: z.string().min(1).optional(),
+      originalName: z.string().min(1).optional(),
+    })
+    .describe("Upload raw bytes provided inline as base64."),
+  z
+    .strictObject({
+      type: z.literal("text"),
+      text: z.string().describe("UTF-8 text content of the file."),
+      mimeType: z.string().min(1).optional(),
+      originalName: z.string().min(1).optional(),
+    })
+    .describe("Upload a UTF-8 text file provided inline."),
+  z
+    .strictObject({
+      type: z.literal("my_file"),
+      id: optionalSelector(z.string().trim())
+        .refine(
+          (v) =>
+            v === undefined || isUuid(v) || v.startsWith(OBJECT_REF_PREFIX),
+          "must be a file id or ref from search_files",
+        )
+        .describe(
+          "Id or ref of a persistent file, as returned by search_files " +
+            "(`id` for stored files, `ref` for hand-placed ones).",
+        ),
+      filename: optionalSelector().describe(
+        "Exact filename of a persistent file (when you have no id).",
+      ),
+    })
+    .refine(...ID_OR_FILENAME)
+    .describe(
+      "Copy a file from the user's persistent files into the " +
+        "sandbox. Find files with search_files first.",
+    ),
+]);
+
+type UploadSource = z.infer<typeof UploadSourceSchema>;
+
+const UploadFileSchema = z
+  .strictObject({
+    path: z
+      .string()
+      .min(1)
+      .describe(
+        "Destination path inside the container — absolute under /skills or " +
+          "/home/sandbox, or relative to the sandbox's working directory.",
+      ),
+    source: UploadSourceSchema.describe(
+      "Where the file bytes come from. One of four shapes, each tagged by a " +
+        '`type`: a chat attachment (`{"type":"chat_attachment","attachmentId"|"filename":...}`), ' +
+        'inline base64 (`{"type":"base64","dataBase64":...}`), inline text ' +
+        '(`{"type":"text","text":"print(1)"}`), or a file from the user\'s ' +
+        'persistent files (`{"type":"my_file","filename":...}`, found via ' +
+        "search_files). Use this to place input bytes; to create a file the " +
+        "sandbox will then run or read, write it with run_command instead.",
+    ),
+    target: SandboxTargetSchema,
+  })
+  .describe(
+    "Place a file into the conversation's sandbox. The file persists in the " +
+      "sandbox for every later command.",
+  );
+
+const UploadFileOutputSchema = z.object({
+  uploadId: z.string(),
+  sandboxId: z.string(),
+  path: z.string(),
+  mimeType: z.string(),
+  sizeBytes: z.number(),
+});
+
+/**
+ * Opt a file tool out of the chat-derived scope and onto a named project. The
+ * point is headless use: a client with no conversation (an external MCP client
+ * on a gateway) has nothing to derive scope from, so it names the project it
+ * found via `list_projects` / `get_project`.
+ */
+const PROJECT_ID_FILE_ARG = z
+  .string()
+  .optional()
+  .describe(
+    "Use this project's files instead of the current chat's — how you reach " +
+      "project files when working outside a chat (get_project returns the id). " +
+      "Only projects you own or that are shared with you can be used. Cannot " +
+      "be used from a chat that already belongs to a different project, nor " +
+      'combined with scope: "app".',
+  );
+
+const SearchFilesSchema = z
+  .strictObject({
+    query: z
+      .string()
+      .optional()
+      .describe(
+        "Case-insensitive substring matched against filenames only. Omit it (or pass empty) to list the files (the first 200).",
+      ),
+    scope: z
+      .enum(["chat", "app"])
+      .optional()
+      .describe(
+        '"chat" (default) = this chat\'s files; "app" = the files of the app ' +
+          "the user has open, which is how you find what the app has produced " +
+          "before copying one out with copy_file.",
+      ),
+    project_id: PROJECT_ID_FILE_ARG,
+  })
+  .describe(
+    "List or search persistent files by filename substring; omit the query to " +
+      "list them (the first 200). Filenames only, not contents. Lists this " +
+      "chat's files, the open app's files with scope: \"app\", or a project's " +
+      "files with project_id.",
+  );
+
+const SearchFilesOutputSchema = z.object({
+  files: z.array(
+    z.object({
+      id: z
+        .string()
+        .nullable()
+        .describe("Row id (UUID), or null for a hand-placed file with no row."),
+      ref: z
+        .string()
+        .describe(
+          "Stable handle for this file — pass it to read_file / upload_file / " +
+            "edit_file / delete_file. Works for hand-placed files too (where " +
+            "`id` is null).",
+        ),
+      filename: z.string(),
+      mimeType: z.string(),
+      sizeBytes: z.number(),
+      createdAt: z.string(),
+    }),
+  ),
+});
+
+const ReadFileSchema = z
+  .strictObject({
+    ...idOrFilenameShape({
+      id:
+        "Id or ref of the file to read — the `id` or `ref` from search_files, " +
+        "or a fileId from save_file.",
+      filename:
+        "Filename to read instead of `id`; rejected as ambiguous if more than one file shares the name.",
+    }),
+    offset: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe("1-based line number to start reading from. Defaults to 1."),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe(
+        `Maximum number of lines to read. Defaults to ${READ_FILE_DEFAULT_LINES}.`,
+      ),
+    project_id: PROJECT_ID_FILE_ARG,
+  })
+  .refine(...ID_OR_FILENAME)
+  .describe(
+    "Read a persistent file directly, without copying it into the sandbox. Text " +
+      "files come back as numbered lines (`<n>\\t<line>`); images (PNG, JPEG, " +
+      "WebP, GIF) are returned inline so you can view them. Identify the file by " +
+      "`id` (the `id` or `ref` from search_files / save_file) or by `filename`. Page " +
+      "large text files with `offset`/`limit`. Pass project_id to read a project's " +
+      "file (e.g. its instructions.md) instead of the chat's. For other binary types " +
+      "(PDF, archives, …), copy the file into the sandbox with upload_file + " +
+      "run_command.",
+  );
+
+const ReadFileOutputSchema = z.object({
+  kind: z
+    .enum(["text", "image"])
+    .describe(
+      "`text` = numbered lines in the text content; `image` = the file is " +
+        "returned as an inline image block.",
+    ),
+  fileId: z
+    .string()
+    .nullable()
+    .describe("The file's id, or null for a hand-placed file with no row."),
+  filename: z.string(),
+  mimeType: z.string(),
+  sizeBytes: z.number(),
+  // text reads only
+  totalLines: z.number().optional(),
+  startLine: z.number().optional(),
+  returnedLines: z.number().optional(),
+  truncated: z
+    .boolean()
+    .optional()
+    .describe(
+      "True when more lines follow the returned window (raise `offset` to continue).",
+    ),
+  content: z
+    .string()
+    .optional()
+    .describe(
+      "The returned window's text, WITHOUT the line numbers — the file's own " +
+        "bytes. Present for text reads so a structured consumer (an app via " +
+        "archestra.tools.call, which unwraps to structuredContent and never " +
+        "sees the text block) gets usable content instead of only metadata. " +
+        "The numbered rendering stays in the text output, where line numbers " +
+        "are what makes edit_file addressable.",
+    ),
+});
+
+const ReadFileRawSchema = z
+  .strictObject(
+    idOrFilenameShape({
+      id: "File id (the `id` or `ref` from search_files / save_file).",
+      filename:
+        "Filename to read instead of `id`; rejected as ambiguous if more than one file shares the name.",
+    }),
+  )
+  .refine(...ID_OR_FILENAME)
+  .describe(
+    "Read a persistent file's exact bytes, base64-encoded, whatever its type — " +
+      "text, images, or any binary (3D models, PDFs, archives). For programs " +
+      "that parse the content; there is no paging and no line numbering.",
+  );
+
+const ReadFileRawOutputSchema = z.object({
+  fileId: z
+    .string()
+    .nullable()
+    .describe("The file's id, or null for a hand-placed file with no row."),
+  filename: z.string(),
+  mimeType: z.string(),
+  sizeBytes: z.number(),
+  contentBase64: z.string().describe("The file's exact bytes, base64-encoded."),
+});
+
+const CopyFileSchema = z
+  .strictObject({
+    from: z
+      .discriminatedUnion("type", [
+        z
+          .strictObject({
+            type: z.literal("chat_file"),
+            ...idOrFilenameShape({
+              id: "File id from search_files.",
+              filename: "Filename instead of `id`; ambiguous names rejected.",
+            }),
+          })
+          .refine(...ID_OR_FILENAME)
+          .describe("A file from this chat's scope (conversation or project)."),
+        chatAttachmentSource({
+          self: "A file the user attached to this chat.",
+          id: "Id of an attachment uploaded to THIS conversation.",
+        }),
+        z
+          .strictObject({
+            type: z.literal("app_file"),
+            ...idOrFilenameShape({
+              id: "File id in the app's store.",
+              filename: "Filename instead of `id`.",
+            }),
+          })
+          .refine(...ID_OR_FILENAME)
+          .describe(
+            "A file from the open app's per-viewer store (what the app saved for this user).",
+          ),
+      ])
+      .describe(
+        'Where the bytes come from: {"type":"chat_file","id"|"filename"} | {"type":"chat_attachment","attachmentId"|"filename"} | {"type":"app_file","id"|"filename"}.',
+      ),
+    to: z
+      .strictObject({
+        scope: z
+          .enum(["chat", "app"])
+          .describe(
+            '"app" = the open app\'s per-viewer store; "chat" = this chat\'s files (the project\'s files when this chat belongs to a project).',
+          ),
+        filename: z
+          .string()
+          .min(1)
+          .max(256)
+          .optional()
+          .describe(
+            "Destination filename; defaults to the source's name. Plain filename, no paths.",
+          ),
+        overwrite: z
+          .boolean()
+          .optional()
+          .describe(
+            "Replace an existing same-named destination file in place. Default false: a duplicate name is an error.",
+          ),
+      })
+      .describe("Where the copy lands."),
+  })
+  .refine((v) => (v.from.type === "app_file") !== (v.to.scope === "app"), {
+    message:
+      "copy_file exchanges files with the open app: exactly one side must be the app (from app_file to chat, or from chat_file/chat_attachment to app).",
+  })
+  .describe(
+    "Copy a file between this chat and the app the user has open. One side is " +
+      "always the app; the other is the chat's files or an attachment.",
+  );
+
+const CopyFileOutputSchema = z.object({
+  fileId: z.string().describe("Id of the copy at the destination."),
+  filename: z.string(),
+  mimeType: z.string(),
+  sizeBytes: z.number(),
+  destination: z
+    .enum(["conversation", "project", "app"])
+    .describe("The scope the copy landed in."),
+  overwritten: z.boolean(),
+});
+
+const SaveFileSchema = z
+  .strictObject({
+    filename: z
+      .string()
+      .min(1)
+      .max(256)
+      .describe(
+        'Plain filename including extension (e.g. "joke.md"). No paths.',
+      ),
+    content: z.string().optional().describe("UTF-8 text content of the file."),
+    contentBase64: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("Base64-encoded binary content."),
+    mimeType: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("Optional MIME type. Sniffed from the bytes when omitted."),
+    overwrite: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        "Replace an existing file of the same name in place, keeping its id. " +
+          "Default false errors if the name is already taken.",
+      ),
+    project_id: PROJECT_ID_FILE_ARG,
+  })
+  .refine((v) => (v.content != null) !== (v.contentBase64 != null), {
+    message: "provide exactly one of `content` or `contentBase64`",
+  })
+  .describe(
+    "Write bytes you provide inline in this call (text or base64 in the arguments) to the " +
+      "conversation's persistent files — for content originating in your reply. If the content " +
+      "already exists as a file in the sandbox (you wrote it, or the user attached it), export it " +
+      "with download_file by its path instead, so the bytes never enter your context.",
+  );
+
+const SaveFileOutputSchema = z.object({
+  fileId: z.string(),
+  filename: z.string(),
+  projectName: z
+    .string()
+    .nullable()
+    .describe("Owning project when saved into a project; null otherwise."),
+  mimeType: z.string(),
+  sizeBytes: z.number(),
+  overwritten: z
+    .boolean()
+    .describe("True when an existing same-named file was replaced in place."),
+});
+
+const EditFileSchema = z
+  .strictObject({
+    ...idOrFilenameShape({
+      id: "Id of the file to edit — the `id` or `ref` from search_files, or a fileId from save_file.",
+      filename:
+        "Filename to edit instead of `id`; rejected as ambiguous if more than one file shares the name.",
+    }),
+    old_string: z
+      .string()
+      .min(1)
+      .describe(
+        "The exact text to replace; must match the file's current content " +
+          "(read it first with read_file). Include enough surrounding context to " +
+          "be unique unless replace_all is set.",
+      ),
+    new_string: z
+      .string()
+      .describe("The text to insert in place of old_string."),
+    replace_all: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        "Replace every occurrence of old_string. Default false replaces a single " +
+          "occurrence and errors if old_string is not unique.",
+      ),
+    project_id: PROJECT_ID_FILE_ARG,
+  })
+  .refine(...ID_OR_FILENAME)
+  .refine((v) => v.old_string !== v.new_string, {
+    message: "new_string must differ from old_string",
+  })
+  .describe(
+    "Edit an existing persistent file by replacing a snippet, keeping " +
+      "its id and filename. Give the exact `old_string` to find and the " +
+      "`new_string` to put in its place; set `replace_all` to change every " +
+      "occurrence. Text files only — to replace a binary file, use save_file " +
+      "with overwrite.",
+  );
+
+const EditFileOutputSchema = z.object({
+  fileId: z.string(),
+  filename: z.string(),
+  mimeType: z.string(),
+  sizeBytes: z.number(),
+  replacements: z
+    .number()
+    .describe("How many occurrences of old_string were replaced."),
+});
+
+const DeleteFileSchema = z
+  .strictObject({
+    ...idOrFilenameShape({
+      id: "Id of the file to delete — the `id` or `ref` from search_files, or a fileId from save_file.",
+      filename:
+        "Filename to delete instead of `id`; rejected as ambiguous if more than one file shares the name.",
+    }),
+    project_id: PROJECT_ID_FILE_ARG,
+  })
+  .refine(...ID_OR_FILENAME)
+  .describe("Permanently delete a persistent file.");
+
+const DeleteFileOutputSchema = z.object({
+  fileId: z
+    .string()
+    .describe("The deleted file's id, or its `ref` for a rowless file."),
+  filename: z.string(),
+  deleted: z.literal(true),
+});
+
+const registry = defineArchestraTools([
+  defineArchestraTool({
+    shortName: TOOL_RUN_COMMAND_SHORT_NAME,
+    title: "Run Command",
+    description:
+      "Execute a shell command in the conversation's sandbox (Debian, " +
+      "working dir /home/sandbox). Created on first use and persists across " +
+      "calls — files written by one command are visible to the next. Python " +
+      "runs in a uv project at /home/sandbox: `python3` is the project venv; " +
+      "install packages with `uv add --project /home/sandbox <pkg>` (pip is " +
+      `disabled). Files the user attached to the conversation are staged under ${SKILL_SANDBOX_ATTACHMENTS_DIR}/. ` +
+      "Loaded skills are mounted under /skills and are on PYTHONPATH, so " +
+      "their modules import directly. Returns stdout, stderr, " +
+      "exit code, and timing (text only — use download_file for generated " +
+      "files).",
+    schema: RunCommandSchema,
+    outputSchema: RunCommandOutputSchema,
+    async handler({ args, context }) {
+      const guard = ensureRuntimeUsable(context);
+      if ("error" in guard) return errorResult(guard.error);
+
+      const resolved = await resolveTarget({
+        target: args.target,
+        userCtx: guard.userCtx,
+        context,
+      });
+      if ("error" in resolved) return errorResult(resolved.error);
+
+      try {
+        const result = await skillSandboxRuntimeService.runCommand({
+          sandboxId: resolved.sandboxId,
+          caller: { ...guard.userCtx, agentId: context.agent.id },
+          command: args.command,
+          cwd: args.cwd,
+          timeoutSeconds: args.timeoutSeconds,
+          environment: await resolveEnvironmentTarget(context),
+        });
+
+        logger.info(
+          {
+            sandboxId: resolved.sandboxId,
+            commandId: result.commandId,
+            exitCode: result.exitCode,
+            durationMs: result.durationMs,
+            timedOut: result.timedOut,
+          },
+          "[Sandbox] command executed",
+        );
+
+        return structuredSuccessResult(
+          { ...result },
+          withStagingNotices(
+            formatCommandSummary(result),
+            result.stagingNotices,
+          ),
+        );
+      } catch (error) {
+        return handleRuntimeError(error, resolved.sandboxId, "run_command");
+      }
+    },
+  }),
+  defineArchestraTool({
+    shortName: TOOL_DOWNLOAD_FILE_SHORT_NAME,
+    title: "Download File",
+    description:
+      "Copy a file that already exists at a path in the conversation's sandbox into the " +
+      "conversation's persistent files. Use this for anything on the sandbox's disk — a file " +
+      "run_command wrote (text or binary) or a staged attachment under " +
+      `${SKILL_SANDBOX_ATTACHMENTS_DIR}/ — its bytes are not returned to you, so you never read ` +
+      "them back or re-type them. Pass `overwrite: true` to replace an existing same-named " +
+      "persistent file in place.",
+    schema: DownloadFileSchema,
+    outputSchema: DownloadFileOutputSchema,
+    async handler({ args, context }) {
+      const guard = ensureRuntimeUsable(context);
+      if ("error" in guard) return errorResult(guard.error);
+
+      const resolved = await resolveTarget({
+        target: args.target,
+        userCtx: guard.userCtx,
+        context,
+      });
+      if ("error" in resolved) return errorResult(resolved.error);
+
+      let scope: ProjectFileScope | null;
+      try {
+        scope = await resolveProjectFileScope({
+          conversationId: context.conversationId,
+          userId: guard.userCtx.userId,
+          organizationId: guard.userCtx.organizationId,
+        });
+      } catch (error) {
+        return handleRuntimeError(error, resolved.sandboxId, "download_file");
+      }
+
+      try {
+        const result = await skillSandboxRuntimeService.exportArtifact({
+          sandboxId: resolved.sandboxId,
+          caller: { ...guard.userCtx, agentId: context.agent.id },
+          path: args.path,
+          mimeType: args.mimeType,
+          projectId: scope?.projectId ?? null,
+          overwrite: args.overwrite,
+          environment: await resolveEnvironmentTarget(context),
+        });
+
+        logger.info(
+          {
+            sandboxId: resolved.sandboxId,
+            fileId: result.artifactId,
+            sizeBytes: result.sizeBytes,
+          },
+          "[Sandbox] file downloaded",
+        );
+
+        // Bytes flow sandbox -> DB -> Files panel via the artifacts route; the
+        // model only ever sees a short reference here, never the blob or a link.
+        return structuredSuccessResult(
+          {
+            fileId: result.artifactId,
+            sandboxId: result.sandboxId,
+            path: result.path,
+            mimeType: result.mimeType,
+            sizeBytes: result.sizeBytes,
+            stagingNotices: result.stagingNotices,
+            overwritten: result.overwritten,
+          },
+          withStagingNotices(
+            `${result.overwritten ? "Replaced" : "Saved"} ${result.path} (${result.sizeBytes} bytes) to the conversation's persistent files.`,
+            result.stagingNotices,
+          ),
+        );
+      } catch (error) {
+        return handleRuntimeError(error, resolved.sandboxId, "download_file");
+      }
+    },
+  }),
+  defineArchestraTool({
+    shortName: TOOL_UPLOAD_FILE_SHORT_NAME,
+    title: "Upload File",
+    description:
+      "Place a file into the conversation's sandbox at a path, from a chat " +
+      "attachment, inline base64, inline text, or one of your persistent " +
+      "files. The file then persists in the sandbox for later commands. " +
+      `Files the user attached to the conversation are already staged under ${SKILL_SANDBOX_ATTACHMENTS_DIR}/ — use this tool ` +
+      "to write inline content, place a file at a specific path, or target a " +
+      "non-default sandbox.",
+    schema: UploadFileSchema,
+    outputSchema: UploadFileOutputSchema,
+    async handler({ args, context }) {
+      const guard = ensureRuntimeUsable(context);
+      if ("error" in guard) return errorResult(guard.error);
+
+      const resolved = await resolveTarget({
+        target: args.target,
+        userCtx: guard.userCtx,
+        context,
+      });
+      if ("error" in resolved) return errorResult(resolved.error);
+
+      let uploadScope: ProjectFileScope | null;
+      try {
+        uploadScope = await resolveProjectFileScope({
+          conversationId: context.conversationId,
+          userId: guard.userCtx.userId,
+          organizationId: guard.userCtx.organizationId,
+        });
+      } catch (error) {
+        return handleRuntimeError(error, resolved.sandboxId, "upload_file");
+      }
+
+      const loaded = await loadUploadSource({
+        source: args.source,
+        userCtx: guard.userCtx,
+        conversationId: context.conversationId,
+        appId: context.appId,
+        scope: uploadScope,
+      });
+      if ("error" in loaded) return errorResult(loaded.error);
+
+      try {
+        const result = await skillSandboxRuntimeService.uploadFile({
+          sandboxId: resolved.sandboxId,
+          path: args.path,
+          data: loaded.data,
+          mimeType: loaded.mimeType,
+          originalName: loaded.originalName,
+          // Tag the upload's origin: a PFS "my_file" pull vs an inline source.
+          origin: args.source.type === "my_file" ? "my_file" : null,
+        });
+
+        logger.info(
+          {
+            sandboxId: resolved.sandboxId,
+            uploadId: result.uploadId,
+            sizeBytes: result.sizeBytes,
+            sourceType: args.source.type,
+          },
+          "[Sandbox] file uploaded",
+        );
+
+        return structuredSuccessResult(
+          { ...result },
+          `Uploaded ${result.path} (${result.sizeBytes} bytes). It is now part of the sandbox and visible to every subsequent command.`,
+        );
+      } catch (error) {
+        return handleRuntimeError(error, resolved.sandboxId, "upload_file");
+      }
+    },
+  }),
+  defineArchestraTool({
+    shortName: TOOL_SEARCH_FILES_SHORT_NAME,
+    title: "Search Files",
+    description:
+      "List or search the conversation's persistent files. The query is a " +
+      "case-insensitive substring matched against filenames only, not contents — omit " +
+      "it (or pass empty) to list the files (the first 200; narrow with a substring if " +
+      "there are more). Returns metadata only — each result carries a stable `ref` you " +
+      "pass to read_file, edit_file, or delete_file, or to upload_file to copy the file " +
+      'into the sandbox. Pass scope: "app" to list the files of the app the user has ' +
+      "open instead — the only way to see what an app holds, and the discovery step " +
+      "before copying one of its files out with copy_file. Pass project_id to list a " +
+      "project's files instead, which is how you reach them outside a chat.",
+    schema: SearchFilesSchema,
+    outputSchema: SearchFilesOutputSchema,
+    async handler({ args, context }) {
+      const guard = ensureUsable(context);
+      if ("error" in guard) return errorResult(guard.error);
+
+      // An app runtime is always confined to its own store, whatever it asks
+      // for. For an agent, scope "app" means the app open in this chat, keyed
+      // off the same access-verified openedAppId that gates copy_file — never
+      // an app id taken from a tool argument.
+      const appId =
+        context.appId ??
+        (args.scope === "app" ? context.openedAppId : undefined);
+      if (args.scope === "app" && !appId) {
+        return errorResult(
+          "No app is open in this chat, so there are no app files to list. Ask the user to open the app first, then retry.",
+        );
+      }
+      if (args.scope === "app" && args.project_id) {
+        return errorResult(
+          "project_id cannot be combined with scope: \"app\" — ask for the project's files or the open app's, not both.",
+        );
+      }
+
+      let fileScope: MyFileScope | null;
+      try {
+        fileScope = await resolveFileScope({
+          projectId: args.project_id,
+          conversationId: context.conversationId,
+          appId,
+          userCtx: guard.userCtx,
+        });
+      } catch (error) {
+        if (error instanceof SkillSandboxError)
+          return errorResult(error.message);
+        throw error;
+      }
+
+      // A headless no-project call has no conversation to scope to — no files.
+      if (!fileScope) {
+        return structuredSuccessResult(
+          { files: [] },
+          "No persistent files matched.",
+        );
+      }
+      const matches = await fileStore.search({
+        organizationId: guard.userCtx.organizationId,
+        userId: guard.userCtx.userId,
+        scope: fileScope,
+        query: args.query,
+      });
+
+      // Cap an empty/broad query so a large project can't dump its whole file list into context.
+      const MAX_LISTED_FILES = 200;
+      const shown = matches.slice(0, MAX_LISTED_FILES);
+      const result = {
+        files: shown.map((f) => ({
+          id: f.id,
+          ref: f.downloadRef,
+          filename: f.filename,
+          mimeType: f.mimeType,
+          sizeBytes: f.sizeBytes,
+          createdAt: f.createdAt.toISOString(),
+        })),
+      };
+      const summary =
+        matches.length === 0
+          ? fileScope.kind === "app"
+            ? "The open app has no files matching that."
+            : "No persistent files matched."
+          : shown
+              .map(
+                (f) =>
+                  `${f.filename} (${f.mimeType}, ${f.sizeBytes} bytes) ref=${f.downloadRef}`,
+              )
+              .join("\n") +
+            (matches.length > MAX_LISTED_FILES
+              ? `\n(showing the first ${MAX_LISTED_FILES} of ${matches.length}; narrow with a filename substring.)`
+              : "");
+      return structuredSuccessResult(result, summary);
+    },
+  }),
+  defineArchestraTool({
+    shortName: TOOL_READ_FILE_SHORT_NAME,
+    title: "Read File",
+    description:
+      "Read a persistent file directly, without copying it into the sandbox. Text " +
+      "files come back as numbered lines; images (PNG, JPEG, WebP, GIF) are " +
+      "returned inline so you can view them. Identify the file by `id` (the `id` or " +
+      "`ref` from search_files / save_file) or by `filename`. Page large text files " +
+      "with `offset`/`limit`. Pass project_id to read a project's file — including " +
+      "its instructions.md — which is how you reach them outside a chat. For other " +
+      "binary types, copy the file into the sandbox with upload_file and inspect it " +
+      "with run_command.",
+    schema: ReadFileSchema,
+    outputSchema: ReadFileOutputSchema,
+    async handler({ args, context }) {
+      const guard = ensureUsable(context);
+      if ("error" in guard) return errorResult(guard.error);
+
+      const ref = args.id ?? args.filename ?? "";
+      let fileScope: MyFileScope | null;
+      try {
+        fileScope = await resolveFileScope({
+          projectId: args.project_id,
+          conversationId: context.conversationId,
+          appId: context.appId,
+          userCtx: guard.userCtx,
+        });
+      } catch (error) {
+        if (error instanceof SkillSandboxError)
+          return errorResult(error.message);
+        throw error;
+      }
+
+      if (!fileScope) {
+        return errorResult(describeMyFileError("not_found", ref));
+      }
+      const resolved = await fileStore.resolveMyFileSource({
+        organizationId: guard.userCtx.organizationId,
+        userId: guard.userCtx.userId,
+        id: args.id,
+        filename: args.filename,
+        scope: fileScope,
+      });
+      if ("error" in resolved) {
+        return errorResult(describeMyFileError(resolved.error, ref));
+      }
+
+      const { data, mimeType, originalName, fileId } = resolved;
+
+      // Inline-safe raster image? Decide from the BYTES, not the (spoofable) mime
+      // label — `claimed: undefined` means only a real PNG/JPEG/WebP/GIF signature
+      // counts. Such files are returned as an image block the model can see.
+      const imageMime = resolveArtifactMime({
+        buffer: data,
+        claimed: undefined,
+      });
+      if (isInlineSafeImageMime(imageMime)) {
+        if (data.byteLength > READ_FILE_IMAGE_BYTES_LIMIT) {
+          return errorResult(
+            `"${originalName}" is too large to view inline (${data.byteLength} bytes > ${READ_FILE_IMAGE_BYTES_LIMIT} byte limit). ` +
+              sandboxInspectHint("inspect"),
+          );
+        }
+        logger.info(
+          { fileId, sizeBytes: data.byteLength, mimeType: imageMime },
+          "[Sandbox] image read from PFS",
+        );
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `${originalName} (${imageMime}, ${data.byteLength} bytes)`,
+            },
+            {
+              type: "image" as const,
+              data: data.toString("base64"),
+              mimeType: imageMime,
+            },
+          ],
+          structuredContent: {
+            kind: "image",
+            fileId,
+            filename: originalName,
+            mimeType: imageMime,
+            sizeBytes: data.byteLength,
+          },
+          isError: false,
+        };
+      }
+
+      const limit = config.skillsSandbox.artifactBytesLimit;
+      if (data.byteLength > limit) {
+        return errorResult(
+          `"${originalName}" is too large to read inline (${data.byteLength} bytes > ${limit} byte limit). ` +
+            sandboxInspectHint("inspect"),
+        );
+      }
+
+      // Byte-level guard: the mime label is untrustworthy (a binary payload can be
+      // saved as e.g. text/plain), so readability is decided by the bytes — only
+      // NUL-free, valid UTF-8 is returned as text.
+      const text = decodeUtf8Text(data);
+      if (text === null) {
+        return errorResult(
+          `"${originalName}" (${mimeType}) is not text or a supported image. ` +
+            sandboxInspectHint("process"),
+        );
+      }
+
+      if (data.byteLength === 0) {
+        logger.info({ fileId, sizeBytes: 0 }, "[Sandbox] file read from PFS");
+        return structuredSuccessResult(
+          {
+            kind: "text",
+            fileId,
+            filename: originalName,
+            mimeType,
+            sizeBytes: 0,
+            totalLines: 0,
+            startLine: 1,
+            returnedLines: 0,
+            truncated: false,
+            content: "",
+          },
+          `"${originalName}" is empty.`,
+        );
+      }
+
+      const startLine = args.offset ?? 1;
+      const maxLines = args.limit ?? READ_FILE_DEFAULT_LINES;
+      const numbered = numberLines({
+        text,
+        startLine,
+        maxLines,
+        byteLimit: config.skillsSandbox.outputBytesLimit,
+      });
+      const truncated =
+        numbered.byteCapped ||
+        startLine - 1 + numbered.returnedLines < numbered.totalLines;
+
+      const summary: string[] = [];
+      if (numbered.returnedLines > 0) {
+        summary.push(numbered.body);
+        if (truncated) {
+          summary.push(
+            "",
+            `Output truncated (lines ${startLine}-${startLine + numbered.returnedLines - 1} of ${numbered.totalLines}); ` +
+              "re-run read_file with a higher `offset` to read the rest.",
+          );
+        }
+      } else if (numbered.byteCapped) {
+        // The first in-window line alone exceeds the output cap, so nothing
+        // could be rendered — explain rather than imply the range is empty.
+        summary.push(
+          `Line ${startLine} is too large to render inline (over the ${config.skillsSandbox.outputBytesLimit}-byte output cap). ` +
+            sandboxInspectHint("inspect"),
+        );
+      } else {
+        // offset past end of file.
+        summary.push(
+          `No lines at offset ${startLine}; the file has ${numbered.totalLines} line${numbered.totalLines === 1 ? "" : "s"}.`,
+        );
+      }
+
+      logger.info(
+        {
+          fileId,
+          sizeBytes: data.byteLength,
+          returnedLines: numbered.returnedLines,
+        },
+        "[Sandbox] file read from PFS",
+      );
+
+      return structuredSuccessResult(
+        {
+          kind: "text",
+          fileId,
+          filename: originalName,
+          mimeType,
+          sizeBytes: data.byteLength,
+          totalLines: numbered.totalLines,
+          startLine,
+          returnedLines: numbered.returnedLines,
+          truncated,
+          content: numbered.returnedLines > 0 ? numbered.raw : "",
+        },
+        summary.join("\n"),
+      );
+    },
+  }),
+  // App-runtime only (never seeded; see APP_RUNTIME_ONLY_ARCHESTRA_TOOL_SHORT_
+  // NAMES): the program-shaped sibling of read_file. An app parsing a file —
+  // a 3D model, a PDF, its own saved state — needs the exact bytes, not a
+  // paged, line-numbered rendering built for a model's context window.
+  defineArchestraTool({
+    shortName: TOOL_READ_FILE_RAW_SHORT_NAME,
+    title: "Read File (raw bytes)",
+    description:
+      "Read a persistent file's exact bytes, base64-encoded, whatever its " +
+      "type — text, images, or any binary (3D models, PDFs, archives). No " +
+      "paging, no line numbers. Identify the file by `id` or `filename`.",
+    schema: ReadFileRawSchema,
+    outputSchema: ReadFileRawOutputSchema,
+    async handler({ args, context }) {
+      const guard = ensureUsable(context);
+      if ("error" in guard) return errorResult(guard.error);
+
+      let scope: ProjectFileScope | null;
+      try {
+        scope = await resolveProjectFileScope({
+          conversationId: context.conversationId,
+          userId: guard.userCtx.userId,
+          organizationId: guard.userCtx.organizationId,
+        });
+      } catch (error) {
+        if (error instanceof SkillSandboxError)
+          return errorResult(error.message);
+        throw error;
+      }
+
+      const ref = args.id ?? args.filename ?? "";
+      const fileScope = resolveChatFileScope(
+        scope,
+        context.conversationId,
+        context.appId,
+      );
+      if (!fileScope) {
+        return errorResult(describeMyFileError("not_found", ref));
+      }
+      const resolved = await fileStore.resolveMyFileSource({
+        organizationId: guard.userCtx.organizationId,
+        userId: guard.userCtx.userId,
+        id: args.id,
+        filename: args.filename,
+        scope: fileScope,
+      });
+      if ("error" in resolved) {
+        return errorResult(describeMyFileError(resolved.error, ref));
+      }
+
+      const { data, mimeType, originalName, fileId } = resolved;
+      const limit = config.skillsSandbox.artifactBytesLimit;
+      if (data.byteLength > limit) {
+        return errorResult(
+          `"${originalName}" is too large to read raw (${data.byteLength} bytes > ${limit} byte limit).`,
+        );
+      }
+
+      logger.info(
+        { fileId, sizeBytes: data.byteLength, mimeType },
+        "[Sandbox] file read raw from PFS",
+      );
+      return structuredSuccessResult(
+        {
+          fileId,
+          filename: originalName,
+          mimeType,
+          sizeBytes: data.byteLength,
+          contentBase64: Buffer.from(data).toString("base64"),
+        },
+        `"${originalName}" (${mimeType}, ${data.byteLength} bytes) returned as base64.`,
+      );
+    },
+  }),
+  defineArchestraTool({
+    shortName: TOOL_SAVE_FILE_SHORT_NAME,
+    title: "Save File",
+    description:
+      "Write bytes you are providing inline in this call — text or base64 included in the " +
+      "arguments — to the conversation's persistent files. Use this for content that originates " +
+      "in your reply: a summary or note you wrote, a short snippet you are typing out. If the " +
+      "content already exists as a file in the sandbox — you wrote it with a command, or the user " +
+      "attached it — do not read it back and paste its bytes here; export it with download_file by " +
+      "its path instead, so the bytes never enter your context. Pass `overwrite: true` to replace " +
+      "an existing same-named file in place (e.g. a full rewrite); otherwise a duplicate name is " +
+      "rejected. Pass project_id to save into a project's files — how you write to a project " +
+      "when working outside a chat.",
+    schema: SaveFileSchema,
+    outputSchema: SaveFileOutputSchema,
+    async handler({ args, context }) {
+      const guard = ensureUsable(context);
+      if ("error" in guard) return errorResult(guard.error);
+
+      const filename = args.filename.trim();
+      if (
+        filename.includes("/") ||
+        filename.includes("\\") ||
+        filename.startsWith(".")
+      ) {
+        return errorResult(
+          "filename must be a plain name without paths or a leading dot.",
+        );
+      }
+
+      let data: Buffer;
+      if (args.contentBase64 != null) {
+        if (!BASE64_RE.test(args.contentBase64)) {
+          return errorResult("contentBase64 is not valid base64.");
+        }
+        data = Buffer.from(args.contentBase64, "base64");
+      } else {
+        data = Buffer.from(args.content ?? "", "utf8");
+      }
+      // An empty file is allowed: the model may intentionally create a blank
+      // file (parity with the in-place file editor and project instructions,
+      // which both accept empty content). Only the byte cap is enforced.
+      const limit = config.skillsSandbox.artifactBytesLimit;
+      if (data.byteLength > limit) {
+        return errorResult(
+          `the file is too large (${data.byteLength} bytes > ${limit} byte limit).`,
+        );
+      }
+
+      let fileScope: MyFileScope | null;
+      try {
+        fileScope = await resolveFileScope({
+          projectId: args.project_id,
+          conversationId: context.conversationId,
+          appId: context.appId,
+          userCtx: guard.userCtx,
+        });
+      } catch (error) {
+        if (error instanceof SkillSandboxError) {
+          return errorResult(error.message);
+        }
+        throw error;
+      }
+      const scope: ProjectFileScope | null =
+        fileScope?.kind === "project"
+          ? {
+              projectId: fileScope.projectId,
+              projectName: fileScope.projectName,
+            }
+          : null;
+      if (
+        scope &&
+        filename.toLowerCase() === PROJECT_INSTRUCTIONS_FILENAME &&
+        !(await canWriteProjectInstructions({
+          projectId: scope.projectId,
+          userCtx: guard.userCtx,
+        }))
+      ) {
+        return errorResult(INSTRUCTIONS_WRITE_REFUSED);
+      }
+
+      const mimeType = resolveArtifactMime({
+        buffer: data,
+        claimed: args.mimeType,
+      });
+
+      // Overwrite: replace an existing same-named file in this scope in place,
+      // keeping its id. Falls through to create when none
+      // exists. Without overwrite, a duplicate name surfaces as an error below.
+      // A headless no-project write resolves the orphan it created on a prior run
+      // (no conversation/project scope), so re-runs stay idempotent.
+      if (args.overwrite) {
+        // A project's hand-placed object (no row) is overwritten in place too.
+        const existing: MyFileTarget | MyFileResolutionError = fileScope
+          ? await fileStore.resolveMyFileTarget({
+              organizationId: guard.userCtx.organizationId,
+              userId: guard.userCtx.userId,
+              filename,
+              scope: fileScope,
+            })
+          : await fileStore
+              .resolveOrphanRef({
+                organizationId: guard.userCtx.organizationId,
+                userId: guard.userCtx.userId,
+                filename,
+              })
+              .then((row) =>
+                "error" in row ? row : { kind: "row" as const, file: row },
+              );
+        if (!("error" in existing)) {
+          const updated = await fileStore.replace({
+            target: existing,
+            mimeType,
+            data,
+            organizationId: guard.userCtx.organizationId,
+            userId: guard.userCtx.userId,
+          });
+          if (!updated) {
+            return errorResult(describeMyFileError("not_found", filename));
+          }
+          return saveFileSuccess({
+            fileId: updated.fileId,
+            mimeType: updated.mimeType,
+            sizeBytes: data.byteLength,
+            filename,
+            scope,
+            overwritten: true,
+          });
+        }
+        if (existing.error !== "not_found") {
+          return errorResult(describeMyFileError(existing.error, filename));
+        }
+        // not_found → create below.
+      }
+
+      try {
+        const row = await fileStore.put({
+          organizationId: guard.userCtx.organizationId,
+          userId: guard.userCtx.userId,
+          projectId: scope?.projectId ?? null,
+          conversationId: context.conversationId ?? null,
+          appId: context.appId ?? null,
+          filename,
+          mimeType,
+          sizeBytes: data.byteLength,
+          data,
+        });
+        return saveFileSuccess({
+          fileId: row.id,
+          mimeType: row.mimeType,
+          sizeBytes: row.sizeBytes,
+          filename,
+          scope,
+          overwritten: false,
+        });
+      } catch (error) {
+        if (error instanceof FileNameExistsError) {
+          return errorResult(
+            `A file named "${filename}" already exists${scope ? ` in ${scope.projectName}` : ""}. Choose a different name, pass overwrite: true, or delete the existing file first.`,
+          );
+        }
+        if (error instanceof UnsafePathError) {
+          return errorResult(`"${filename}" is not a usable file name.`);
+        }
+        if (error instanceof SkillSandboxError) {
+          return errorResult(error.message);
+        }
+        throw error;
+      }
+    },
+  }),
+  defineArchestraTool({
+    shortName: TOOL_EDIT_FILE_SHORT_NAME,
+    title: "Edit File",
+    description:
+      "Edit an existing persistent file by replacing a snippet, " +
+      "keeping its id and filename. Give the exact `old_string` to find (read " +
+      "the file first with read_file) and the `new_string` to put in its place; " +
+      "set `replace_all` to change every occurrence. Identify the file by `id` " +
+      "(the `id` or `ref` from search_files, or a fileId from save_file) or by " +
+      "`filename`. Text files only — to " +
+      "replace a binary file, use save_file with overwrite for inline content, or " +
+      "download_file with overwrite for a file in the sandbox. Pass project_id to " +
+      "edit a project's file when working outside a chat.",
+    schema: EditFileSchema,
+    outputSchema: EditFileOutputSchema,
+    async handler({ args, context }) {
+      const guard = ensureUsable(context);
+      if ("error" in guard) return errorResult(guard.error);
+
+      const ref = args.id ?? args.filename ?? "";
+      let fileScope: MyFileScope | null;
+      try {
+        fileScope = await resolveFileScope({
+          projectId: args.project_id,
+          conversationId: context.conversationId,
+          appId: context.appId,
+          userCtx: guard.userCtx,
+        });
+      } catch (error) {
+        if (error instanceof SkillSandboxError)
+          return errorResult(error.message);
+        throw error;
+      }
+      if (!fileScope) {
+        return errorResult(describeMyFileError("not_found", ref));
+      }
+      // Covers a project's hand-placed objects too (no row, `obj_` ref): they
+      // are rewritten in place and stay rowless, so their ref is unchanged.
+      const target = await fileStore.resolveMyFileTarget({
+        organizationId: guard.userCtx.organizationId,
+        userId: guard.userCtx.userId,
+        id: args.id,
+        filename: args.filename,
+        scope: fileScope,
+      });
+      if ("error" in target) {
+        return errorResult(describeMyFileError(target.error, ref));
+      }
+      const resolved =
+        target.kind === "row"
+          ? {
+              ref: target.file.id,
+              filename: target.file.filename,
+              mimeType: target.file.mimeType,
+              projectId: target.file.projectId,
+            }
+          : target;
+      if (
+        resolved.projectId &&
+        resolved.filename === PROJECT_INSTRUCTIONS_FILENAME &&
+        !(await canWriteProjectInstructions({
+          projectId: resolved.projectId,
+          userCtx: guard.userCtx,
+        }))
+      ) {
+        return errorResult(INSTRUCTIONS_WRITE_REFUSED);
+      }
+
+      // Read the current bytes through the facade (it re-authorizes the file we
+      // just resolved). Gone bytes surface as a clear model-facing message.
+      let current: Awaited<ReturnType<typeof fileStore.get>>;
+      try {
+        current = await fileStore.get({
+          ref: resolved.ref,
+          organizationId: guard.userCtx.organizationId,
+          userId: guard.userCtx.userId,
+        });
+      } catch (error) {
+        if (error instanceof FileBytesMissingError) {
+          return errorResult(describeMyFileError("missing_bytes", ref));
+        }
+        throw error;
+      }
+      if (!current) {
+        return errorResult(describeMyFileError("not_found", ref));
+      }
+
+      const text = decodeUtf8Text(current.data);
+      if (text === null) {
+        return errorResult(
+          `edit_file edits text files only; "${resolved.filename}" (${resolved.mimeType}) is not UTF-8 text. Replace it wholesale with save_file (overwrite: true).`,
+        );
+      }
+
+      const occurrences = countOccurrences(text, args.old_string);
+      if (occurrences === 0) {
+        return errorResult(
+          `old_string was not found in "${resolved.filename}". Read it with read_file and copy the exact text to replace.`,
+        );
+      }
+      if (occurrences > 1 && !args.replace_all) {
+        return errorResult(
+          `old_string is not unique in "${resolved.filename}" (${occurrences} occurrences). Add surrounding context to make it unique, or set replace_all: true.`,
+        );
+      }
+      const replacements = args.replace_all ? occurrences : 1;
+      const updatedText = args.replace_all
+        ? text.split(args.old_string).join(args.new_string)
+        : replaceFirst(text, args.old_string, args.new_string);
+      const data = Buffer.from(updatedText, "utf8");
+      const limit = config.skillsSandbox.artifactBytesLimit;
+      if (data.byteLength > limit) {
+        return errorResult(
+          `the edited file is too large (${data.byteLength} bytes > ${limit} byte limit).`,
+        );
+      }
+
+      // Keep the stored mime — a snippet edit of a text file never changes type.
+      const updated = await fileStore.replace({
+        target,
+        mimeType: resolved.mimeType,
+        data,
+        organizationId: guard.userCtx.organizationId,
+        userId: guard.userCtx.userId,
+      });
+      if (!updated) {
+        return errorResult(describeMyFileError("not_found", ref));
+      }
+
+      logger.info(
+        {
+          fileId: updated.fileId,
+          sizeBytes: data.byteLength,
+          replacements,
+          projectScoped: fileScope.kind === "project",
+        },
+        "[Sandbox] file edited in PFS",
+      );
+
+      return structuredSuccessResult(
+        {
+          fileId: updated.fileId,
+          filename: resolved.filename,
+          mimeType: resolved.mimeType,
+          sizeBytes: data.byteLength,
+          replacements,
+        },
+        `Updated ${resolved.filename} (${replacements} replacement${replacements === 1 ? "" : "s"}, ${data.byteLength} bytes).`,
+      );
+    },
+  }),
+  defineArchestraTool({
+    shortName: TOOL_DELETE_FILE_SHORT_NAME,
+    title: "Delete File",
+    description:
+      "Permanently delete a persistent file, identified by `id` (the `id` or " +
+      "`ref` from search_files, or a fileId from save_file) or by `filename`. " +
+      "Pass project_id to " +
+      "delete a project's file when working outside a chat.",
+    schema: DeleteFileSchema,
+    outputSchema: DeleteFileOutputSchema,
+    async handler({ args, context }) {
+      const guard = ensureUsable(context);
+      if ("error" in guard) return errorResult(guard.error);
+
+      const ref = args.id ?? args.filename ?? "";
+      let fileScope: MyFileScope | null;
+      try {
+        fileScope = await resolveFileScope({
+          projectId: args.project_id,
+          conversationId: context.conversationId,
+          appId: context.appId,
+          userCtx: guard.userCtx,
+        });
+      } catch (error) {
+        if (error instanceof SkillSandboxError)
+          return errorResult(error.message);
+        throw error;
+      }
+      if (!fileScope) {
+        return errorResult(describeMyFileError("not_found", ref));
+      }
+      // Covers a project's hand-placed objects too (no row, `obj_` ref), so
+      // anything search_files lists can be deleted here.
+      const target = await fileStore.resolveMyFileTarget({
+        organizationId: guard.userCtx.organizationId,
+        userId: guard.userCtx.userId,
+        id: args.id,
+        filename: args.filename,
+        scope: fileScope,
+      });
+      if ("error" in target) {
+        return errorResult(describeMyFileError(target.error, ref));
+      }
+      const resolved =
+        target.kind === "row"
+          ? {
+              ref: target.file.id,
+              filename: target.file.filename,
+              projectId: target.file.projectId,
+            }
+          : target;
+      // The project instructions file is available but never deletable — refuse
+      // up front with the canonical message (the store would otherwise throw,
+      // and this call site is not wrapped to surface it).
+      if (
+        resolved.projectId &&
+        resolved.filename === PROJECT_INSTRUCTIONS_FILENAME
+      ) {
+        return errorResult(
+          new FileNotDeletableError(resolved.filename).message,
+        );
+      }
+
+      const deleted = await fileStore.delete({
+        ref: resolved.ref,
+        organizationId: guard.userCtx.organizationId,
+        userId: guard.userCtx.userId,
+      });
+      if (!deleted) {
+        return errorResult(describeMyFileError("not_found", ref));
+      }
+
+      logger.info(
+        { fileId: resolved.ref, projectScoped: fileScope.kind === "project" },
+        "[Sandbox] file deleted from PFS",
+      );
+
+      return structuredSuccessResult(
+        { fileId: resolved.ref, filename: resolved.filename, deleted: true },
+        `Deleted ${resolved.filename}.`,
+      );
+    },
+  }),
+  // Agent-side exchange with the chat's open app. The app's namespace is
+  // hermetic by design — an app can never reach a chat's files — so the agent,
+  // acting as the user with the user's RBAC, is the one sanctioned broker. The
+  // "app" side keys off context.openedAppId (set by the chat route after
+  // re-verifying the viewer's access this turn), never off a tool argument.
+  defineArchestraTool({
+    shortName: TOOL_COPY_FILE_SHORT_NAME,
+    title: "Copy File",
+    description:
+      "Exchange a file between this chat and the app the user has open: copy a " +
+      "chat/project file or a chat attachment INTO the open app's file store " +
+      "(so the app can load it), or copy a file OUT of the app's store into " +
+      "this chat's files (so it appears in the Files panel, can be read here, " +
+      "or downloaded). Exactly one side is always the app. Use it when the " +
+      "user asks to open a file in the app, or to save something the app " +
+      "produced. The copy is per-viewer: it lands in the current user's own " +
+      'namespace of the app. To copy OUT, call search_files with scope: "app" ' +
+      "first to see what the app holds — its store is not otherwise visible " +
+      "from here, so a filename you did not list is a guess.",
+    schema: CopyFileSchema,
+    outputSchema: CopyFileOutputSchema,
+    async handler({ args, context }) {
+      const guard = ensureUsable(context);
+      if ("error" in guard) return errorResult(guard.error);
+      if (!context.conversationId) {
+        return errorResult(
+          "copy_file exchanges files between a chat and its open app; this run has no chat conversation.",
+        );
+      }
+      const fromIsApp = args.from.type === "app_file";
+      const toIsApp = args.to.scope === "app";
+      const openedAppId = context.openedAppId;
+      if ((fromIsApp || toIsApp) && !openedAppId) {
+        return errorResult(
+          "No app is open in this chat. Ask the user to open the app to exchange files with, then retry.",
+        );
+      }
+
+      let scope: ProjectFileScope | null;
+      try {
+        scope = await resolveProjectFileScope({
+          conversationId: context.conversationId,
+          userId: guard.userCtx.userId,
+          organizationId: guard.userCtx.organizationId,
+        });
+      } catch (error) {
+        if (error instanceof SkillSandboxError)
+          return errorResult(error.message);
+        throw error;
+      }
+
+      // Source bytes through the same loader upload_file uses: conversation-
+      // bound attachment check, scoped my_file resolution, one LoadedUpload
+      // shape. The app side passes the verified openedAppId so resolution is
+      // confined to the app's namespace; the chat side passes no appId.
+      const source: UploadSource =
+        args.from.type === "chat_attachment"
+          ? {
+              type: "chat_attachment",
+              attachmentId: args.from.attachmentId,
+              filename: args.from.filename,
+            }
+          : { type: "my_file", id: args.from.id, filename: args.from.filename };
+      const loaded = await loadUploadSource({
+        source,
+        userCtx: guard.userCtx,
+        conversationId: context.conversationId,
+        appId: fromIsApp ? openedAppId : undefined,
+        scope: fromIsApp ? null : scope,
+      });
+      if ("error" in loaded) {
+        return errorResult(loaded.error);
+      }
+
+      const filename = (
+        args.to.filename ??
+        loaded.originalName ??
+        (args.from.type !== "chat_attachment" ? (args.from.filename ?? "") : "")
+      ).trim();
+      if (
+        !filename ||
+        filename.includes("/") ||
+        filename.includes("\\") ||
+        filename.startsWith(".")
+      ) {
+        return errorResult(
+          `"${filename}" is not a usable file name. Pass \`to.filename\` with a plain filename including extension.`,
+        );
+      }
+
+      const destProjectId = toIsApp ? null : (scope?.projectId ?? null);
+      // The project instructions file is writable only through its own editor —
+      // a copy must not overwrite (or shadow) it. Same guard as save_file's.
+      if (destProjectId && filename === PROJECT_INSTRUCTIONS_FILENAME) {
+        return errorResult(
+          `"${PROJECT_INSTRUCTIONS_FILENAME}" is reserved for the project's instructions; copy under a different name.`,
+        );
+      }
+      // Destination-side cap: a project's upload limit is tighter than the
+      // sandbox artifact limit, and the DESTINATION's rule is the one that
+      // governs what may land there.
+      const destCap = destProjectId
+        ? MAX_PROJECT_UPLOAD_BYTES
+        : config.skillsSandbox.artifactBytesLimit;
+      if (loaded.data.byteLength > destCap) {
+        return errorResult(
+          `"${filename}" is too large for the destination (${loaded.data.byteLength} bytes > ${destCap} byte limit).`,
+        );
+      }
+
+      const mimeType = resolveArtifactMime({
+        buffer: loaded.data,
+        claimed: loaded.mimeType,
+      });
+      const destScope = toIsApp
+        ? resolveChatFileScope(null, undefined, openedAppId)
+        : resolveChatFileScope(scope, context.conversationId, undefined);
+      if (!destScope) {
+        return errorResult(describeMyFileError("not_found", filename));
+      }
+
+      // Overwrite-else-create, mirroring save_file: replace in place keeps the
+      // destination row's id; without overwrite a duplicate name is an error.
+      if (args.to.overwrite) {
+        // A project's hand-placed object (no row) is overwritten in place too.
+        const existing = await fileStore.resolveMyFileTarget({
+          organizationId: guard.userCtx.organizationId,
+          userId: guard.userCtx.userId,
+          filename,
+          scope: destScope,
+        });
+        if (!("error" in existing)) {
+          const updated = await fileStore.replace({
+            target: existing,
+            mimeType,
+            data: loaded.data,
+            organizationId: guard.userCtx.organizationId,
+            userId: guard.userCtx.userId,
+          });
+          if (!updated) {
+            return errorResult(describeMyFileError("not_found", filename));
+          }
+          return copyFileSuccess({
+            file: updated,
+            filename,
+            fromType: args.from.type,
+            toIsApp,
+            destProjectId,
+            overwritten: true,
+          });
+        }
+        if (existing.error !== "not_found") {
+          return errorResult(describeMyFileError(existing.error, filename));
+        }
+      }
+
+      try {
+        const row = await fileStore.put({
+          organizationId: guard.userCtx.organizationId,
+          userId: guard.userCtx.userId,
+          projectId: destProjectId,
+          conversationId: toIsApp ? null : (context.conversationId ?? null),
+          appId: toIsApp ? (openedAppId ?? null) : null,
+          filename,
+          mimeType,
+          sizeBytes: loaded.data.byteLength,
+          data: loaded.data,
+        });
+        return copyFileSuccess({
+          file: {
+            fileId: row.id,
+            mimeType: row.mimeType,
+            sizeBytes: row.sizeBytes,
+          },
+          filename,
+          fromType: args.from.type,
+          toIsApp,
+          destProjectId,
+          overwritten: false,
+        });
+      } catch (error) {
+        if (error instanceof FileNameExistsError) {
+          return errorResult(
+            `A file named "${filename}" already exists at the destination. Choose a different name, pass to.overwrite: true, or delete the existing file first.`,
+          );
+        }
+        if (error instanceof UnsafePathError) {
+          return errorResult(`"${filename}" is not a usable file name.`);
+        }
+        if (error instanceof SkillSandboxError) {
+          return errorResult(error.message);
+        }
+        throw error;
+      }
+    },
+  }),
+] as const);
+
+export const toolEntries = registry.toolEntries;
+export const tools = registry.tools;
+
+// === internal helpers ===
+
+interface UserContext {
+  organizationId: string;
+  userId: string;
+}
+
+/**
+ * Resolve the Dagger runtime target for the calling agent.
+ *
+ * An agent bound to an Environment always routes to that environment's own
+ * engine, carrying its egress policy. An operator-supplied runner host does NOT
+ * override that: running such an agent on the shared engine would give its code
+ * that engine's egress and silently defeat the environment's network isolation,
+ * so this fails closed instead.
+ *
+ * An agent with its own network policy always routes to its own engine, in its
+ * bound environment's namespace (or the organization default when unbound), and
+ * fails closed the same way, whatever runner host is configured.
+ *
+ * An unbound agent routes to its organization's default engine, unless a runner
+ * host is configured — then it returns undefined, meaning "use the process-default
+ * engine", and no org-default engine is provisioned. Also returns undefined when
+ * the caller or org can't be resolved.
+ */
+async function resolveEnvironmentTarget(
+  context: ArchestraContext,
+): Promise<EnvironmentTarget | undefined> {
+  const { organizationId } = context;
+  const agentId = context.agent?.id;
+  if (!agentId || !organizationId) return undefined;
+
+  const agent = await AgentModel.findById(agentId);
+  if (agent?.networkPolicy) {
+    return resolveAgentEngineTarget({
+      agent: {
+        id: agent.id,
+        name: agent.name,
+        environmentId: agent.environmentId,
+      },
+      organizationId,
+    });
+  }
+  if (!agent?.environmentId) {
+    // Unbound agent → the organization's default engine. But when an operator
+    // configured an explicit runner host (a BYO engine), defer to it: returning
+    // undefined routes the run to that process-default engine unchanged.
+    if (config.daggerRuntime.runnerHost) return undefined;
+    const organization =
+      await OrganizationModel.getDefaultEngineTarget(organizationId);
+    if (!organization) return undefined;
+    return daggerEnvironmentRuntimeManager.organizationDefaultTarget(
+      organization,
+    );
+  }
+
+  // The agent IS bound to an environment, so its sandbox MUST run on that
+  // environment's isolated engine (carrying the environment's egress policy).
+  // Fail closed if that engine can't be resolved — never fall back to the shared
+  // default engine, which would run the agent's code with unrestricted egress
+  // and silently defeat the environment's network isolation.
+  const environment = await EnvironmentModel.findByIdForOrganization(
+    agent.environmentId,
+    organizationId,
+  );
+  if (!environment) {
+    // SkillSandboxError reaches the caller verbatim; a plain Error is flattened
+    // to "an internal error", stranding whoever has to fix the deployment.
+    logger.error(
+      { agentId, environmentId: agent.environmentId, organizationId },
+      "[Sandbox] bound agent's environment was not found",
+    );
+    throw new SkillSandboxError(
+      `Agent is bound to environment ${agent.environmentId}, which was not found — refusing to run on the shared runtime.`,
+    );
+  }
+  const target =
+    daggerEnvironmentRuntimeManager.environmentTargetForEnvironment(
+      environment,
+    );
+  if (!target) {
+    logger.error(
+      { agentId, environmentId: environment.id, organizationId },
+      "[Sandbox] could not resolve the isolated runtime for a bound agent",
+    );
+    throw new SkillSandboxError(
+      `Could not resolve the isolated runtime for environment "${environment.name}" — refusing to run on the shared runtime. Is the orchestrator (Kubernetes) configured?`,
+    );
+  }
+  return target;
+}
+
+/**
+ * The engine of an agent with its own network policy. Its sandbox MUST run
+ * there: the shared or environment engine would give its code a different
+ * egress policy than the one the agent declares, so every miss fails closed.
+ */
+async function resolveAgentEngineTarget(params: {
+  agent: { id: string; name: string; environmentId: string | null };
+  organizationId: string;
+}): Promise<EnvironmentTarget> {
+  const { agent, organizationId } = params;
+  let namespace: string | null;
+  if (agent.environmentId) {
+    const environment = await EnvironmentModel.findByIdForOrganization(
+      agent.environmentId,
+      organizationId,
+    );
+    if (!environment) {
+      logger.error(
+        {
+          agentId: agent.id,
+          environmentId: agent.environmentId,
+          organizationId,
+        },
+        "[Sandbox] bound agent's environment was not found",
+      );
+      throw new SkillSandboxError(
+        `Agent is bound to environment ${agent.environmentId}, which was not found — refusing to run on the shared runtime.`,
+      );
+    }
+    namespace = environment.namespace;
+  } else {
+    const organization =
+      await OrganizationModel.getDefaultEngineTarget(organizationId);
+    if (!organization) {
+      throw new SkillSandboxError(
+        `Could not resolve the isolated runtime for agent "${agent.name}" — refusing to run on the shared runtime.`,
+      );
+    }
+    namespace = organization.defaultEnvironmentNamespace;
+  }
+  const target = daggerEnvironmentRuntimeManager.agentTarget({
+    id: agent.id,
+    namespace,
+  });
+  if (!target) {
+    logger.error(
+      { agentId: agent.id, organizationId },
+      "[Sandbox] could not resolve the isolated runtime for an agent with its own network policy",
+    );
+    throw new SkillSandboxError(
+      `Could not resolve the isolated runtime for agent "${agent.name}", which has its own network policy — refusing to run on the shared runtime. Is the orchestrator (Kubernetes) configured?`,
+    );
+  }
+  return target;
+}
+
+/**
+ * The next step read_file suggests for a file it can't show inline: the sandbox
+ * when this deployment has one, otherwise a plain dead end (naming tools the
+ * agent doesn't have only sends it looking for them).
+ */
+function sandboxInspectHint(verb: "inspect" | "process"): string {
+  return config.skillsSandbox.enabled
+    ? `Copy it into the sandbox with upload_file and ${verb} it with run_command.`
+    : "This deployment has no code sandbox to open it in.";
+}
+
+/**
+ * Guard for the code runtime tools (run_command/upload_file/download_file),
+ * which materialize a Dagger container: the runtime must be on, then the same
+ * user check as {@link ensureUsable}.
+ */
+function ensureRuntimeUsable(
+  context: ArchestraContext,
+): { userCtx: UserContext } | { error: string } {
+  if (!config.skillsSandbox.enabled) {
+    return {
+      error: "The sandbox is not enabled on this deployment.",
+    };
+  }
+  return ensureUsable(context);
+}
+
+/**
+ * Guard for every file tool: an authenticated user. The persistent-file tools
+ * only touch the file store, so they work without the code runtime.
+ * `agent:read` is enforced earlier in the dispatch path (see `rbac.ts`), so
+ * handlers don't re-check it here.
+ */
+function ensureUsable(
+  context: ArchestraContext,
+): { userCtx: UserContext } | { error: string } {
+  if (!context.organizationId || !context.userId) {
+    return { error: "This tool requires an authenticated user session." };
+  }
+  return {
+    userCtx: {
+      organizationId: context.organizationId,
+      userId: context.userId,
+    },
+  };
+}
+
+/**
+ * Map a loosely-typed {@link SandboxTarget} to a canonical intent. Models often
+ * express "the default sandbox" as `{ fresh: false }`, `{ id: "" }`, the nil
+ * UUID, or `{}`, so those collapse to the default (undefined). `fresh: true` wins over an id; a
+ * non-empty id is validated as a UUID and otherwise reported clearly.
+ */
+function normalizeTarget(
+  target: SandboxTarget,
+): { intent: SandboxTargetIntent } | { error: string } {
+  if (!target) {
+    return { intent: undefined };
+  }
+  if (target.fresh === true) {
+    return { intent: { fresh: true } };
+  }
+  const id = target.id?.trim();
+  if (id && id !== NIL_UUID) {
+    if (!isUuid(id)) {
+      return {
+        error: `target.id must be a sandbox id (UUID). ${TARGET_HINT}`,
+      };
+    }
+    return { intent: { id } };
+  }
+  // `{ fresh: false }`, `{ id: "" }`, the nil UUID, or `{}` — the model meant the default.
+  return { intent: undefined };
+}
+
+const NIL_UUID = "00000000-0000-0000-0000-000000000000";
+
+const TARGET_HINT =
+  "Omit `target` to use the conversation's default sandbox, which holds the conversation's attachments and earlier work, or pass `target: { fresh: true }` to start an empty one.";
+
+/**
+ * Resolve a {@link SandboxTarget} to a concrete sandbox id, creating the
+ * conversation default (or a fresh sandbox) as needed. Explicit ids are scoped
+ * to the calling user + organization.
+ *
+ * An MCP App runtime is the exception: it has exactly ONE sandbox — the
+ * (org, viewer, app) default — and every sandbox-backed capability it uses
+ * resolves to that same instance, so an explicit `target` is refused rather
+ * than silently minting a second one.
+ */
+async function resolveTarget(params: {
+  target: SandboxTarget;
+  userCtx: UserContext;
+  context: ArchestraContext;
+}): Promise<{ sandboxId: SandboxId } | { error: string }> {
+  const { target, userCtx, context } = params;
+  const conversationId = context.conversationId ?? null;
+  const isolationKey = context.isolationKey ?? null;
+
+  if (context.appId) {
+    const normalizedAppTarget = normalizeTarget(target);
+    if ("error" in normalizedAppTarget) {
+      return { error: normalizedAppTarget.error };
+    }
+    if (normalizedAppTarget.intent) {
+      return {
+        error:
+          "Apps always use the app's own sandbox — omit `target`. A separate or shared sandbox is not available here.",
+      };
+    }
+    const sandbox = await SkillSandboxModel.findOrCreateAppDefault({
+      organizationId: userCtx.organizationId,
+      userId: userCtx.userId,
+      appId: context.appId,
+      defaultCwd: SKILL_SANDBOX_HOME,
+    });
+    return { sandboxId: asSandboxId(sandbox.id) };
+  }
+
+  const normalized = normalizeTarget(target);
+  if ("error" in normalized) {
+    return { error: normalized.error };
+  }
+  const intent = normalized.intent;
+
+  if (intent && "id" in intent) {
+    const sandbox = await SkillSandboxModel.findById(intent.id);
+    // scope to the same org + user + conversation (or, for conversation-less
+    // sandboxes, the same execution): an explicit id must not be a back door
+    // to a sandbox from another conversation or another headless execution.
+    if (
+      !sandbox ||
+      sandbox.organizationId !== userCtx.organizationId ||
+      sandbox.userId !== userCtx.userId ||
+      !sandboxConversationInScope({
+        sandbox,
+        userCtx,
+        conversationId,
+        isolationKey,
+        // app callers return above, so this is always null here; passed
+        // explicitly so a non-app caller can never match an app's sandbox.
+        appId: null,
+      })
+    ) {
+      logger.warn(
+        {
+          organizationId: userCtx.organizationId,
+          userId: userCtx.userId,
+          conversationId,
+          targetId: intent.id,
+          reason: "out_of_scope_sandbox_id",
+        },
+        "[Sandbox] rejected out-of-scope sandbox id",
+      );
+      return {
+        error: `No accessible sandbox with id ${intent.id} exists. ${TARGET_HINT}`,
+      };
+    }
+    return { sandboxId: asSandboxId(sandbox.id) };
+  }
+
+  if (intent && "fresh" in intent) {
+    let sandbox: Awaited<ReturnType<typeof SkillSandboxModel.create>>;
+    try {
+      sandbox = await SkillSandboxModel.create({
+        organizationId: userCtx.organizationId,
+        userId: userCtx.userId,
+        conversationId,
+        defaultCwd: SKILL_SANDBOX_HOME,
+        isDefault: false,
+      });
+    } catch (error) {
+      if (error instanceof SkillSandboxConversationGoneError) {
+        return { error: CONVERSATION_GONE_ERROR };
+      }
+      throw error;
+    }
+    if (!conversationId && isolationKey) {
+      executionSandboxRegistry.registerOwned({
+        organizationId: userCtx.organizationId,
+        userId: userCtx.userId,
+        isolationKey,
+        sandboxId: sandbox.id,
+      });
+    }
+    return { sandboxId: asSandboxId(sandbox.id) };
+  }
+
+  let sandbox: Awaited<
+    ReturnType<typeof executionSandboxRegistry.getOrCreateRunDefault>
+  >;
+  try {
+    sandbox = await executionSandboxRegistry.getOrCreateRunDefault({
+      organizationId: userCtx.organizationId,
+      userId: userCtx.userId,
+      conversationId,
+      isolationKey,
+      defaultCwd: SKILL_SANDBOX_HOME,
+    });
+  } catch (error) {
+    if (error instanceof SkillSandboxConversationGoneError) {
+      return { error: CONVERSATION_GONE_ERROR };
+    }
+    throw error;
+  }
+  if (sandbox) return { sandboxId: asSandboxId(sandbox.id) };
+  return {
+    error:
+      "No conversation context for the default sandbox. Pass `target: { fresh: true }` or `target: { id }`.",
+  };
+}
+
+const CONVERSATION_GONE_ERROR =
+  "This conversation no longer exists, so its sandbox is unavailable.";
+
+/**
+ * Conversation-scope half of the explicit `{id}` check. Conversation-bound
+ * sandboxes must match the caller's conversation. Conversation-less sandboxes
+ * (headless executions, stateless gateway clients) are never reachable from a
+ * conversation; within a headless execution they must belong to that
+ * execution, while gateway callers without an isolation scope keep their
+ * org+user-wide access (they have no narrower scope to check against).
+ */
+function sandboxConversationInScope(params: {
+  sandbox: { id: string; conversationId: string | null; appId: string | null };
+  userCtx: UserContext;
+  conversationId: string | null;
+  isolationKey: string | null;
+  appId: string | null;
+}): boolean {
+  const { sandbox, userCtx, conversationId, isolationKey, appId } = params;
+  // An app's sandbox belongs to that app alone, and an app caller reaches
+  // nothing else. Checked before the org+user-wide fallback below, which would
+  // otherwise let any conversation-less caller reach another app's sandbox.
+  if (sandbox.appId !== null || appId !== null) {
+    return sandbox.appId === appId;
+  }
+  if (sandbox.conversationId !== null) {
+    return sandbox.conversationId === conversationId;
+  }
+  if (conversationId !== null) {
+    return false;
+  }
+  if (isolationKey) {
+    return executionSandboxRegistry.isOwned({
+      organizationId: userCtx.organizationId,
+      userId: userCtx.userId,
+      isolationKey,
+      sandboxId: sandbox.id,
+    });
+  }
+  return true;
+}
+
+function handleRuntimeError(
+  error: unknown,
+  sandboxId: SandboxId,
+  tool: string,
+) {
+  if (error instanceof FileNameExistsError) {
+    return errorResult(
+      `${error.message}. Choose a different name, pass overwrite: true, or delete the existing file first.`,
+    );
+  }
+  if (error instanceof SkillSandboxError) {
+    return errorResult(error.message);
+  }
+  logger.error(
+    { err: error, sandboxId },
+    `[Sandbox] ${tool} failed unexpectedly`,
+  );
+  return errorResult(`${tool} failed due to an internal error.`);
+}
+
+// base64 alphabet plus padding and incidental whitespace.
+const BASE64_RE = /^[A-Za-z0-9+/\s]*={0,2}$/;
+
+interface LoadedUpload {
+  data: Buffer;
+  mimeType?: string;
+  originalName?: string;
+}
+
+/** Count non-overlapping occurrences of a non-empty needle (literal). */
+function countOccurrences(haystack: string, needle: string): number {
+  if (needle === "") return 0;
+  return haystack.split(needle).length - 1;
+}
+
+/** Replace the first literal occurrence of `needle` (no regex/`$` semantics). */
+function replaceFirst(
+  haystack: string,
+  needle: string,
+  replacement: string,
+): string {
+  const i = haystack.indexOf(needle);
+  if (i === -1) return haystack;
+  return haystack.slice(0, i) + replacement + haystack.slice(i + needle.length);
+}
+
+/**
+ * Render a `cat -n`-style window of `text` (line number + tab + content),
+ * starting at 1-based `startLine`, at most `maxLines` lines, stopping early if
+ * the rendered output would exceed `byteLimit`. A single trailing newline is
+ * dropped so a newline-terminated file isn't reported with a phantom blank last
+ * line (matching `cat -n`).
+ */
+function numberLines(params: {
+  text: string;
+  startLine: number;
+  maxLines: number;
+  byteLimit: number;
+}): {
+  body: string;
+  raw: string;
+  returnedLines: number;
+  totalLines: number;
+  byteCapped: boolean;
+} {
+  const trimmed = params.text.endsWith("\n")
+    ? params.text.slice(0, -1)
+    : params.text;
+  const all = trimmed.split("\n");
+  const totalLines = all.length;
+  const from = Math.min(Math.max(params.startLine - 1, 0), totalLines);
+  const window = all.slice(from, from + params.maxLines);
+  const out: string[] = [];
+  // The same window without the line-number prefixes. Built in this loop so the
+  // byte cap below trims both renderings at exactly the same line.
+  const rawOut: string[] = [];
+  let bytes = 0;
+  let byteCapped = false;
+  for (let i = 0; i < window.length; i++) {
+    const rendered = `${from + i + 1}\t${window[i]}`;
+    const add =
+      (out.length === 0 ? 0 : 1) + Buffer.byteLength(rendered, "utf8");
+    if (bytes + add > params.byteLimit) {
+      byteCapped = true;
+      break;
+    }
+    bytes += add;
+    out.push(rendered);
+    rawOut.push(window[i]);
+  }
+  return {
+    body: out.join("\n"),
+    raw: rawOut.join("\n"),
+    returnedLines: out.length,
+    totalLines,
+    byteCapped,
+  };
+}
+
+/** Build the copy_file success result for both the create and overwrite paths. */
+function copyFileSuccess(params: {
+  file: { fileId: string; mimeType: string; sizeBytes: number };
+  filename: string;
+  fromType: "chat_file" | "chat_attachment" | "app_file";
+  toIsApp: boolean;
+  destProjectId: string | null;
+  overwritten: boolean;
+}) {
+  const { file, filename, fromType, toIsApp, destProjectId, overwritten } =
+    params;
+  const destination = toIsApp
+    ? ("app" as const)
+    : destProjectId
+      ? ("project" as const)
+      : ("conversation" as const);
+  logger.info(
+    {
+      fileId: file.fileId,
+      sizeBytes: file.sizeBytes,
+      fromType,
+      destination,
+      destProjectId,
+      appScoped: toIsApp,
+      overwritten,
+    },
+    "[Sandbox] file copied across scopes",
+  );
+  return structuredSuccessResult(
+    {
+      fileId: file.fileId,
+      filename,
+      mimeType: file.mimeType,
+      sizeBytes: file.sizeBytes,
+      destination,
+      overwritten,
+    },
+    `Copied ${filename} to the ${destination === "app" ? "open app's files" : `${destination} files`}${overwritten ? " (replaced the existing file)" : ""}.`,
+  );
+}
+
+/** Build the save_file success result for both the create and overwrite paths. */
+function saveFileSuccess(params: {
+  fileId: string;
+  mimeType: string;
+  sizeBytes: number;
+  filename: string;
+  scope: ProjectFileScope | null;
+  overwritten: boolean;
+}) {
+  const { fileId, mimeType, sizeBytes, filename, scope, overwritten } = params;
+  logger.info(
+    {
+      fileId,
+      sizeBytes,
+      projectScoped: !!scope,
+      overwritten,
+    },
+    "[Sandbox] result saved to PFS",
+  );
+  return structuredSuccessResult(
+    {
+      fileId,
+      filename,
+      projectName: scope?.projectName ?? null,
+      mimeType,
+      sizeBytes,
+      overwritten,
+    },
+    `${overwritten ? "Overwrote" : "Saved"} ${scope ? `${scope.projectName}/` : ""}${filename} (${sizeBytes} bytes)${overwritten ? " in place" : " to persistent files"}.`,
+  );
+}
+
+/** Map a my_file resolution failure to a model-facing message. */
+/**
+ * The My Files scope a chat's file tools operate in: the owning project for a
+ * project chat, otherwise the current conversation. Returns null for a headless
+ * no-project call (no conversation to scope to) — no-project file tools then
+ * have nothing to read, and a no-project write falls back to a flat orphan.
+ */
+function resolveChatFileScope(
+  projectScope: ProjectFileScope | null,
+  conversationId: string | undefined,
+  appId?: string | undefined,
+):
+  | { kind: "project"; projectId: string; projectName: string }
+  | { kind: "conversation"; conversationId: string }
+  | { kind: "app"; appId: string }
+  | null {
+  // An app runtime's namespace is the (app, viewer) pair — it never reaches a
+  // chat's or a project's files, so this wins over the conversation scope even
+  // if one were somehow present.
+  if (appId) {
+    return { kind: "app", appId };
+  }
+  if (projectScope) {
+    return {
+      kind: "project",
+      projectId: projectScope.projectId,
+      projectName: projectScope.projectName,
+    };
+  }
+  return conversationId ? { kind: "conversation", conversationId } : null;
+}
+
+/** A resolved My Files scope (the non-null result of {@link resolveChatFileScope}). */
+type MyFileScope = NonNullable<ReturnType<typeof resolveChatFileScope>>;
+
+/**
+ * Scope for the file tools that accept an explicit `project_id` (the reads
+ * plus save/edit/delete). Without one this is exactly the chat scope; with one
+ * the named project is used after re-verifying the caller's access to it.
+ *
+ * The explicit id is REFUSED, never silently ignored, when it cannot apply — a
+ * caller told it read a project must not have been served something else:
+ *  - an app runtime is confined to its own (app, viewer) namespace;
+ *  - a chat that already belongs to a project stays confined to THAT project,
+ *    so content inside a project chat cannot steer the model into a second
+ *    project the user happens to have access to.
+ *
+ * Writes take it too, under the same access rule as a project upload in the UI
+ * (owner or share). That is what lets a headless client save into a project;
+ * the project-chat confinement above still keeps a chat from writing into a
+ * second project.
+ */
+async function resolveFileScope(params: {
+  projectId: string | undefined;
+  conversationId: string | undefined;
+  appId: string | undefined;
+  userCtx: UserContext;
+}): Promise<MyFileScope | null> {
+  const { projectId, conversationId, appId, userCtx } = params;
+
+  const chatScope = await resolveProjectFileScope({
+    conversationId,
+    userId: userCtx.userId,
+    organizationId: userCtx.organizationId,
+  });
+  if (!projectId) {
+    return resolveChatFileScope(chatScope, conversationId, appId);
+  }
+
+  if (appId) {
+    throw new SkillSandboxError(
+      "project_id cannot be used here — an app can only reach its own files",
+    );
+  }
+  if (chatScope && chatScope.projectId !== projectId) {
+    throw new SkillSandboxError(
+      `this chat belongs to project "${chatScope.projectName}"; only its files can be used here — drop project_id`,
+    );
+  }
+
+  const scope = await resolveExplicitProjectFileScope({
+    projectId,
+    userId: userCtx.userId,
+    organizationId: userCtx.organizationId,
+  });
+  return {
+    kind: "project",
+    projectId: scope.projectId,
+    projectName: scope.projectName,
+  };
+}
+
+const INSTRUCTIONS_WRITE_REFUSED = `"${PROJECT_INSTRUCTIONS_FILENAME}" steers every chat in the project; only the project's owner or a project admin can change it.`;
+
+/**
+ * `instructions.md` steers every chat in its project, so writing it is project
+ * management (owner or project admin) — the UI editor's gate. Plain project
+ * access, enough for every other project file, does not reach it.
+ */
+async function canWriteProjectInstructions(params: {
+  projectId: string;
+  userCtx: UserContext;
+}): Promise<boolean> {
+  return projectService.canManage({
+    id: params.projectId,
+    organizationId: params.userCtx.organizationId,
+    userId: params.userCtx.userId,
+  });
+}
+
+function describeMyFileError(
+  error: MyFileResolutionError["error"],
+  ref: string,
+): string {
+  switch (error) {
+    case "ambiguous":
+      return `Multiple persistent files are named "${ref}". Run search_files and use the \`id\` of the one you mean.`;
+    case "outside_project":
+      return "This chat belongs to a project; only the project's files can be used here. Run search_files to see them.";
+    case "missing_bytes":
+      return `The persistent file ${ref} exists but its bytes are no longer in storage.`;
+    default:
+      return `No persistent file ${ref} exists. Run search_files to see what is available.`;
+  }
+}
+
+/**
+ * Resolve upload source bytes. chat_attachment reads server-side and is scoped
+ * to the caller's org AND the current conversation — the bytes never enter the
+ * model context, and an attachment from another conversation is rejected to
+ * prevent cross-conversation exfiltration.
+ */
+async function loadUploadSource(params: {
+  source: UploadSource;
+  userCtx: UserContext;
+  conversationId: string | undefined;
+  /** App runtime making the call; confines my_file resolution to its namespace. */
+  appId: string | undefined;
+  /** Project file scope of the conversation; confines my_file resolution. */
+  scope: ProjectFileScope | null;
+}): Promise<LoadedUpload | { error: string }> {
+  const { source, userCtx, conversationId, appId, scope } = params;
+  switch (source.type) {
+    case "base64": {
+      if (!BASE64_RE.test(source.dataBase64)) {
+        return { error: "source.dataBase64 is not valid base64." };
+      }
+      return {
+        data: Buffer.from(source.dataBase64, "base64"),
+        mimeType: source.mimeType,
+        originalName: source.originalName,
+      };
+    }
+    case "text": {
+      return {
+        data: Buffer.from(source.text, "utf8"),
+        mimeType: source.mimeType ?? "text/plain",
+        originalName: source.originalName,
+      };
+    }
+    case "chat_attachment": {
+      return loadConversationAttachmentSource({
+        organizationId: userCtx.organizationId,
+        userId: userCtx.userId,
+        conversationId,
+        attachmentId: source.attachmentId,
+        filename: source.filename,
+      });
+    }
+    case "my_file": {
+      const fileScope = resolveChatFileScope(scope, conversationId, appId);
+      const ref = source.id ?? source.filename ?? "";
+      if (!fileScope) {
+        return { error: describeMyFileError("not_found", ref) };
+      }
+      const resolved = await fileStore.resolveMyFileSource({
+        organizationId: userCtx.organizationId,
+        userId: userCtx.userId,
+        id: source.id,
+        filename: source.filename,
+        scope: fileScope,
+      });
+      if ("error" in resolved) {
+        logger.warn(
+          {
+            organizationId: userCtx.organizationId,
+            userId: userCtx.userId,
+            conversationId,
+            ref,
+            reason: resolved.error,
+          },
+          "[Sandbox] rejected my_file upload",
+        );
+        return { error: describeMyFileError(resolved.error, ref) };
+      }
+      return {
+        data: resolved.data,
+        mimeType: resolved.mimeType,
+        originalName: resolved.originalName,
+      };
+    }
+  }
+}
+
+function formatCommandSummary(result: {
+  exitCode: number;
+  durationMs: number;
+  timedOut: boolean;
+  truncated: boolean;
+  binaryStripped: boolean;
+  stdout: string;
+  stderr: string;
+}): string {
+  const lines = [`Exit code: ${result.exitCode} (${result.durationMs} ms)`];
+  if (result.timedOut) {
+    lines.push("The command was killed by the wall-clock timeout.");
+  }
+  if (result.truncated) {
+    lines.push(
+      "Output was truncated; re-run with a narrower command " +
+        "(grep/head/tail/sed) to read the rest.",
+    );
+  }
+  if (result.binaryStripped) {
+    lines.push(
+      "stdout/stderr held binary (NUL) bytes that were removed before " +
+        "storage, so the text below is incomplete. Redirect binary output to " +
+        "a file (`> out`) and fetch it with download_file, or inspect bytes " +
+        "with `xxd`/`wc -c`.",
+    );
+  }
+  lines.push("", "stdout:", result.stdout || "(empty)");
+  // On a non-zero exit always surface a stderr section (marked empty when truly
+  // blank) — symmetric to stdout, so a failing command never leaves the agent
+  // unable to tell "no stderr" from "stderr withheld". On success keep it terse:
+  // only show stderr when there is something to show.
+  if (result.stderr || result.exitCode !== 0) {
+    lines.push("", "stderr:", result.stderr || "(empty)");
+  }
+  return lines.join("\n");
+}
+
+/** Append auto-staging notices to a tool summary so skips are model-visible. */
+function withStagingNotices(summary: string, notices: string[]): string {
+  if (notices.length === 0) return summary;
+  return [
+    summary,
+    "",
+    "Attachment notices:",
+    ...notices.map((n) => `- ${n}`),
+  ].join("\n");
+}

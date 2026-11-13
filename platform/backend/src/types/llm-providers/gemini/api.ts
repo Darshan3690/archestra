@@ -146,6 +146,9 @@ export const FinishReasonSchema = z
     "UNEXPECTED_TOOL_CALL",
     "TOO_MANY_TOOL_CALLS",
   ])
+  // Google may introduce new finish reasons; a closed enum fails Fastify
+  // response serialization (500) for otherwise successful proxy responses.
+  .or(z.string())
   .optional()
   .describe(`
   The reason why the model stopped generating tokens.
@@ -157,7 +160,10 @@ export const FinishReasonSchema = z
 
 export const CandidateSchema = z
   .object({
-    content: ContentSchema,
+    // Blocked responses leave content unset:
+    // https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/capabilities/process-blocked-responses
+    // https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/capabilities/configure-safety-filters
+    content: ContentSchema.optional(),
     finishReason: FinishReasonSchema,
     safetyRatings: z.array(SafetyRatingSchema).optional(),
     citationMetadata: CitationMetadataSchema.optional(),
@@ -167,8 +173,11 @@ export const CandidateSchema = z
     avgLogprobs: z.number().optional(),
     logprobsResult: z.any().optional(),
     urlContextMetadata: z.any().optional(),
+    // Proto marks index as optional int32 (OUTPUT_ONLY); JSON often omits it.
+    // https://github.com/googleapis/googleapis/blob/master/google/ai/generativelanguage/v1beta/generative_service.proto
     index: z
       .number()
+      .optional()
       .describe("Index of the candidate in the list of response candidates."),
     finishMessage: z
       .string()
@@ -190,11 +199,13 @@ const PromptFeedbackSchema = z
         "PROHIBITED_CONTENT",
         "IMAGE_SAFETY",
       ])
+      .or(z.string())
       .optional()
       .describe(
         `Specifies the reason why the prompt was blocked. https://ai.google.dev/api/generate-content#BlockReason`,
       ),
-    safetyRatings: z.array(SafetyRatingSchema),
+    // Prompt-blocked replies always set blockReason; safetyRatings may be absent.
+    safetyRatings: z.array(SafetyRatingSchema).optional(),
   })
   .describe(`
   Returns the prompt's feedback related to the content filters.
@@ -213,6 +224,10 @@ const ModalityTokenCountSchema = z
 
 export const UsageMetadataSchema = z
   .object({
+    trafficType: z
+      .string()
+      .optional()
+      .describe("Traffic tier that served the request."),
     promptTokenCount: z.number().optional(),
     cachedContentTokenCount: z.number().optional(),
     candidatesTokenCount: z.number().optional(),
@@ -270,8 +285,11 @@ export const GenerateContentRequestSchema = z
 
 export const GenerateContentResponseSchema = z
   .object({
+    // Prompt blocked → candidates unset (promptFeedback only):
+    // https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/capabilities/process-blocked-responses
     candidates: z
       .array(CandidateSchema)
+      .optional()
       .describe("Candidate responses from the model"),
     promptFeedback: PromptFeedbackSchema.optional().describe(
       "Returns the prompt's feedback related to the content filters",
@@ -292,11 +310,25 @@ https://ai.google.dev/api/generate-content#v1beta.GenerateContentResponse
 `);
 
 export const GenerateContentHeadersSchema = z.object({
+  "x-vertex-ai-llm-request-type": z.string().optional(),
+  "x-vertex-ai-llm-shared-request-type": z.string().optional(),
+  authorization: z
+    .string()
+    .optional()
+    .describe("OAuth access token as a Bearer credential."),
   "user-agent": z.string().optional().describe("The user agent of the client"),
+  "x-archestra-virtual-key": z
+    .string()
+    .optional()
+    .describe("Passthrough virtual key used for proxy authentication."),
   "x-goog-api-key": z
     .string()
     .optional()
     .describe(
       "API key for Google Gemini. Required for Google AI Studio mode, optional for Vertex AI mode (uses ADC).",
     ),
+  "x-goog-user-project": z
+    .string()
+    .optional()
+    .describe("Google Cloud quota project for OAuth-authenticated requests."),
 });

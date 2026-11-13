@@ -1,4 +1,5 @@
-import { archestraApiSdk } from "@shared";
+import { archestraApiSdk, MCP_EXECUTED_AS_META_KEY } from "@archestra/shared";
+import { expect } from "@playwright/test";
 import {
   DEFAULT_TEAM_NAME,
   ENGINEERING_TEAM_NAME,
@@ -7,7 +8,9 @@ import {
 import { test } from "../fixtures";
 import {
   addCustomSelfHostedCatalogItem,
+  callMcpTool,
   createSharedTestGatewayViaApi,
+  getTeamTokenForProfile,
   goToMcpRegistry,
   installLocalCatalogItem,
   settleRegistryAfterInstall,
@@ -15,7 +18,9 @@ import {
   waitForMcpServerToolsDiscovered,
 } from "../utils";
 
-test("Verify tool calling using dynamic credentials", async ({
+test("Verify tool calling using dynamic credentials", {
+  tag: "@needs-kubernetes",
+}, async ({
   request,
   adminPage,
   editorPage,
@@ -38,7 +43,7 @@ test("Verify tool calling using dynamic credentials", async ({
       page: adminPage,
       cookieHeaders,
       catalogItemName: CATALOG_ITEM_NAME,
-      scope: "org",
+      shareWithOrganization: true,
       envVars: {
         key: "ARCHESTRA_TEST",
         promptOnInstallation: true,
@@ -115,9 +120,10 @@ test("Verify tool calling using dynamic credentials", async ({
 
   const toolsResponse = await archestraApiSdk.getTools({
     headers: { Cookie: cookieHeaders },
+    query: { limit: 100, offset: 0 },
   });
   const toolIds =
-    toolsResponse.data
+    toolsResponse.data?.data
       ?.filter((tool) => tool.name.startsWith(`${CATALOG_ITEM_NAME}__`))
       .map((tool) => tool.id) ?? [];
   if (toolIds.length === 0) {
@@ -188,6 +194,21 @@ test("Verify tool calling using dynamic credentials", async ({
       profileId: sharedGateway.id,
     });
   }
+
+  // The gateway reports which connection served the call, so a client (and the
+  // MCP logs behind it) can tell whose credential ran the tool.
+  const engineeringToolResult = await callMcpTool(request, {
+    profileId: sharedGateway.id,
+    token: await getTeamTokenForProfile(request, ENGINEERING_TEAM_NAME),
+    toolName: `${CATALOG_ITEM_NAME}__print_archestra_test`,
+    timeoutMs: 60_000,
+  });
+  expect(engineeringToolResult._meta?.[MCP_EXECUTED_AS_META_KEY]).toMatchObject(
+    {
+      kind: "team",
+      teamName: ENGINEERING_TEAM_NAME,
+    },
+  );
 
   // CLEANUP: Delete existing created MCP servers / installations
   await archestraApiSdk.deleteInternalMcpCatalogItem({

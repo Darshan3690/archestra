@@ -1,0 +1,325 @@
+// @vitest-environment node
+import { describe, expect, it } from "vitest";
+import { buildCurlExample } from "./virtual-key-request-example";
+
+const base = "https://archestra.example.com/v1";
+const key = "arch_test123";
+
+describe("buildCurlExample", () => {
+  it.each([
+    "standard",
+    "passthrough",
+    "token",
+  ] as const)("shows native Gemini image generation with %s authentication", (keyType) => {
+    const example = buildCurlExample({
+      connectionBaseUrl: base,
+      target: { kind: "provider", provider: "gemini" },
+      keyType,
+      keyValue: key,
+      model: "gemini-nano-banana-2.1",
+      imageOperation: "generate",
+    });
+    expect(example).toContain(
+      `${base}/gemini/v1beta/models/gemini-nano-banana-2.1:generateContent`,
+    );
+    const credential = keyType === "passthrough" ? "$GEMINI_API_KEY" : key;
+    expect(example).toContain(
+      keyType === "token"
+        ? `Authorization: Bearer ${credential}`
+        : `x-goog-api-key: ${credential}`,
+    );
+    if (keyType === "passthrough")
+      expect(example).toContain(`X-Archestra-Virtual-Key: ${key}`);
+    const match = example?.match(/-d '([\s\S]*)'$/);
+    const body = JSON.parse(match?.[1] ?? "null");
+    expect(body.generationConfig).toEqual({
+      responseModalities: ["TEXT", "IMAGE"],
+    });
+    expect(body.contents[0].parts[0].text).toContain("Draw");
+    expect(body).not.toHaveProperty("messages");
+    expect(body).not.toHaveProperty("model");
+    expect(body.generationConfig).not.toHaveProperty("temperature");
+  });
+
+  it("does not offer an unimplemented Gemini edit example", () => {
+    expect(
+      buildCurlExample({
+        connectionBaseUrl: base,
+        target: { kind: "provider", provider: "gemini" },
+        keyType: "standard",
+        keyValue: key,
+        model: "gemini-nano-banana-2.1",
+        imageOperation: "edit",
+      }),
+    ).toBeNull();
+  });
+
+  it.each([
+    "standard",
+    "passthrough",
+    "token",
+  ] as const)("shows native Azure image generation and multipart edits for %s credentials", (keyType) => {
+    const params = {
+      connectionBaseUrl: base,
+      target: { kind: "provider" as const, provider: "azure" as const },
+      keyType,
+      keyValue: key,
+      model: "gpt-image-1",
+    };
+    const generation = buildCurlExample({
+      ...params,
+      imageOperation: "generate",
+    });
+    expect(generation).toContain(`${base}/azure/images/generations`);
+    expect(generation).toContain('"prompt":');
+    expect(generation).not.toContain('"messages"');
+    const edit = buildCurlExample({ ...params, imageOperation: "edit" });
+    expect(edit).toContain(`${base}/azure/images/edits`);
+    expect(edit).toContain("--form-string 'model=gpt-image-1'");
+    expect(edit).toContain('-F "image[]=@edit.png"');
+    expect(edit).not.toContain("Content-Type:");
+    expect(edit).toContain(
+      `Authorization: Bearer ${keyType === "passthrough" ? "$AZURE_API_KEY" : key}`,
+    );
+    if (keyType === "passthrough")
+      expect(edit).toContain(`X-Archestra-Virtual-Key: ${key}`);
+  });
+
+  it("does not advertise an Azure image request on the Unified Model API or another provider", () => {
+    for (const target of [
+      { kind: "model-router" as const },
+      { kind: "provider" as const, provider: "openai" as const },
+    ]) {
+      expect(
+        buildCurlExample({
+          connectionBaseUrl: base,
+          target,
+          keyType: "standard",
+          keyValue: key,
+          model: "gpt-image-1",
+          imageOperation: "edit",
+        }),
+      ).toBeNull();
+    }
+  });
+
+  it("quotes deployment names as literal multipart fields", () => {
+    const edit = buildCurlExample({
+      connectionBaseUrl: base,
+      target: { kind: "provider", provider: "azure" },
+      keyType: "standard",
+      keyValue: key,
+      model: "studio's-image",
+      imageOperation: "edit",
+    });
+    expect(edit).toContain("--form-string 'model=studio'\\''s-image'");
+  });
+  it("sends a standard key as the bearer token on the Unified Model API", () => {
+    expect(
+      buildCurlExample({
+        connectionBaseUrl: base,
+        target: { kind: "model-router" },
+        keyType: "standard",
+        keyValue: key,
+        model: "openai:gpt-5.4",
+      }),
+    ).toBe(`curl "${base}/unified-model/chat/completions" \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "openai:gpt-5.4",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello!"
+      }
+    ]
+  }'`);
+  });
+
+  it("uses chat completions with a bearer token for OpenAI-wire providers", () => {
+    const example = buildCurlExample({
+      connectionBaseUrl: base,
+      target: { kind: "provider", provider: "zhipuai" },
+      keyType: "standard",
+      keyValue: key,
+      model: "glm-5.1",
+    });
+    expect(example).toContain(`curl "${base}/zhipuai/chat/completions"`);
+    expect(example).toContain(`-H "Authorization: Bearer ${key}"`);
+    expect(example).toContain('"model": "glm-5.1"');
+  });
+
+  it("uses Responses for an OpenAI model that requires it", () => {
+    const example = buildCurlExample({
+      connectionBaseUrl: base,
+      target: { kind: "provider", provider: "openai" },
+      keyType: "standard",
+      keyValue: key,
+      model: "gpt-5.6-sol",
+    });
+    expect(example).toContain(`curl "${base}/openai/responses"`);
+    expect(example).toContain('"input": "Hello!"');
+    expect(example).not.toContain('"messages"');
+  });
+
+  it("uses Responses for a Copilot model published as Responses only", () => {
+    const example = buildCurlExample({
+      connectionBaseUrl: base,
+      target: { kind: "model-router" },
+      keyType: "standard",
+      keyValue: key,
+      model: "github-copilot:gpt-5.4-codex",
+      supportedEndpoints: ["/responses"],
+    });
+    expect(example).toContain(`curl "${base}/unified-model/responses"`);
+    expect(example).toContain('"input": "Hello!"');
+  });
+
+  it("uses Responses for any provider's model published as Responses only", () => {
+    const example = buildCurlExample({
+      connectionBaseUrl: base,
+      target: { kind: "model-router" },
+      keyType: "standard",
+      keyValue: key,
+      model: "azure:gpt-5.5-pro",
+      supportedEndpoints: ["/responses"],
+    });
+    expect(example).toContain(`curl "${base}/unified-model/responses"`);
+  });
+
+  it("asks for a pool on chat completions even when its name looks like a Responses model", () => {
+    const example = buildCurlExample({
+      connectionBaseUrl: base,
+      target: { kind: "model-router" },
+      keyType: "standard",
+      keyValue: key,
+      model: "openai:gpt-5.4-codex",
+      isPool: true,
+    });
+    expect(example).toContain(`curl "${base}/unified-model/chat/completions"`);
+    expect(example).toContain('"model": "openai:gpt-5.4-codex"');
+  });
+
+  it("calls the endpoint it is told to for auto routing", () => {
+    const params = {
+      connectionBaseUrl: base,
+      target: { kind: "model-router" },
+      keyType: "standard",
+      keyValue: key,
+      model: "auto",
+    } as const;
+    expect(
+      buildCurlExample({ ...params, routerEndpoint: "chat/completions" }),
+    ).toContain(`curl "${base}/unified-model/chat/completions"`);
+    const responses = buildCurlExample({
+      ...params,
+      routerEndpoint: "responses",
+    });
+    expect(responses).toContain(`curl "${base}/unified-model/responses"`);
+    expect(responses).toContain('"model": "auto"');
+  });
+
+  it("uses the Perplexity Agent API for vendor-prefixed models", () => {
+    const example = buildCurlExample({
+      connectionBaseUrl: base,
+      target: { kind: "provider", provider: "perplexity" },
+      keyType: "standard",
+      keyValue: key,
+      model: "perplexity/glm-5.2",
+    });
+    expect(example).toContain(`curl "${base}/perplexity/responses"`);
+    expect(example).toContain('"input": "Hello!"');
+  });
+
+  it("uses each provider's own path and auth header for Anthropic and Gemini", () => {
+    const anthropic = buildCurlExample({
+      connectionBaseUrl: base,
+      target: { kind: "provider", provider: "anthropic" },
+      keyType: "standard",
+      keyValue: key,
+      model: "claude-opus-4-8",
+    });
+    expect(anthropic).toContain(`curl "${base}/anthropic/v1/messages"`);
+    expect(anthropic).toContain(`-H "x-api-key: ${key}"`);
+    expect(anthropic).toContain('"max_tokens": 256');
+
+    const gemini = buildCurlExample({
+      connectionBaseUrl: base,
+      target: { kind: "provider", provider: "gemini" },
+      keyType: "standard",
+      keyValue: key,
+      model: "gemini-3.5-pro",
+    });
+    expect(gemini).toContain(
+      `curl "${base}/gemini/v1beta/models/gemini-3.5-pro:generateContent"`,
+    );
+    expect(gemini).toContain(`-H "x-goog-api-key: ${key}"`);
+  });
+
+  it("keeps the caller's provider key and adds the virtual key header for passthrough keys", () => {
+    const example = buildCurlExample({
+      connectionBaseUrl: base,
+      target: { kind: "provider", provider: "github-copilot" },
+      keyType: "passthrough",
+      keyValue: key,
+      model: "gpt-5.4",
+    });
+    expect(example).toContain(
+      '-H "Authorization: Bearer $GITHUB_COPILOT_API_KEY"',
+    );
+    expect(example).toContain(`-H "X-Archestra-Virtual-Key: ${key}"`);
+  });
+
+  it("has no Unified Model API request for a passthrough key", () => {
+    expect(
+      buildCurlExample({
+        connectionBaseUrl: base,
+        target: { kind: "model-router" },
+        keyType: "passthrough",
+        keyValue: key,
+        model: "openai:gpt-5.4",
+      }),
+    ).toBeNull();
+  });
+
+  it("posts a decisions request to Jev's single endpoint", () => {
+    const example = buildCurlExample({
+      connectionBaseUrl: base,
+      target: { kind: "provider", provider: "jev" },
+      keyType: "standard",
+      keyValue: key,
+      model: "jev-1.13.0",
+    });
+    expect(example).toContain(`curl "${base}/jev/decisions"`);
+    expect(example).toContain(`-H "Authorization: Bearer ${key}"`);
+    expect(example).toContain('"model": "jev-1.13.0"');
+    expect(example).toContain('"questions"');
+  });
+
+  it("sends an OAuth or IdP token as the bearer even where keys use another header", () => {
+    const example = buildCurlExample({
+      connectionBaseUrl: base,
+      target: { kind: "provider", provider: "anthropic" },
+      keyType: "token",
+      keyValue: "$ARCHESTRA_ACCESS_TOKEN",
+      model: "claude-opus-4-8",
+    });
+    expect(example).toContain(
+      '-H "Authorization: Bearer $ARCHESTRA_ACCESS_TOKEN"',
+    );
+    expect(example).not.toContain("x-api-key");
+  });
+
+  it("has no example for providers whose wire format it does not cover", () => {
+    expect(
+      buildCurlExample({
+        connectionBaseUrl: base,
+        target: { kind: "provider", provider: "bedrock" },
+        keyType: "standard",
+        keyValue: key,
+        model: "anthropic.claude",
+      }),
+    ).toBeNull();
+  });
+});

@@ -1,0 +1,129 @@
+import {
+  createInsertSchema,
+  createSelectSchema,
+  createUpdateSchema,
+} from "drizzle-zod";
+import { z } from "zod";
+import { schema } from "@/database/schema";
+
+export const CredentialKindSchema = z.enum([
+  "secret",
+  "github_app",
+  "github_app_user",
+  "gitlab_token",
+]);
+export type CredentialKind = z.infer<typeof CredentialKindSchema>;
+
+const ConnectionKeySchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(
+    /^[a-z][a-z0-9._-]*$/,
+    "Credential identifiers start with a letter and use lowercase letters, numbers, dots, dashes, or underscores",
+  );
+
+export const SelectRuntimeCredentialDefinitionSchema = createSelectSchema(
+  schema.runtimeCredentialDefinitionsTable,
+  { kind: CredentialKindSchema },
+);
+
+export const InsertRuntimeCredentialDefinitionSchema = createInsertSchema(
+  schema.runtimeCredentialDefinitionsTable,
+  {
+    key: ConnectionKeySchema,
+    kind: CredentialKindSchema.optional(),
+    name: (field) => field.trim().min(1).max(120),
+    description: (field) => field.trim().max(1_000),
+    icon: (field) => field.max(700_000),
+  },
+)
+  .omit({
+    id: true,
+    organizationId: true,
+    createdBy: true,
+    createdByServiceAccountId: true,
+    createdAt: true,
+    updatedAt: true,
+  })
+  .refine(
+    (definition) =>
+      (definition.allowPersonal ?? true) !==
+      (definition.allowOrganization ?? false),
+    {
+      message: "Choose either personal connections or organization connections",
+      path: ["allowPersonal"],
+    },
+  );
+
+export const UpdateRuntimeCredentialDefinitionSchema = createUpdateSchema(
+  schema.runtimeCredentialDefinitionsTable,
+  {
+    description: (field) => field.trim().max(1_000),
+    icon: (field) => field.max(700_000),
+  },
+)
+  .pick({
+    name: true,
+    githubUrl: true,
+    gitlabUrl: true,
+    appId: true,
+    installationId: true,
+    githubClientId: true,
+    githubAppCredentialKey: true,
+    description: true,
+    icon: true,
+  })
+  .partial();
+
+export const RuntimeCredentialDefinitionViewSchema = z.object({
+  id: z.string().uuid(),
+  kind: CredentialKindSchema,
+  githubUrl: z.string().nullable(),
+  gitlabUrl: z.string().nullable(),
+  appId: z.string().nullable(),
+  installationId: z.string().nullable(),
+  githubClientId: z.string().nullable(),
+  githubAppCredentialKey: z.string().nullable(),
+  key: ConnectionKeySchema,
+  name: z.string(),
+  description: z.string(),
+  icon: z.string().nullable(),
+  builtIn: z.boolean(),
+  allowPersonal: z.boolean(),
+  allowOrganization: z.boolean(),
+  personalConfigured: z.boolean(),
+  organizationConfigured: z.boolean(),
+});
+
+export const RuntimeCredentialUsageSchema = z.object({
+  resources: z.array(
+    z.object({
+      id: z.string().uuid(),
+      name: z.string(),
+      kind: z.enum(["mcp", "skill", "plugin", "knowledge", "copilot"]),
+    }),
+  ),
+  agents: z.array(
+    z.object({
+      id: z.string().uuid(),
+      name: z.string(),
+    }),
+  ),
+});
+
+export type RuntimeCredentialDefinition = z.infer<
+  typeof SelectRuntimeCredentialDefinitionSchema
+>;
+export type InsertRuntimeCredentialDefinition = z.infer<
+  typeof InsertRuntimeCredentialDefinitionSchema
+>;
+export type UpdateRuntimeCredentialDefinition = z.infer<
+  typeof UpdateRuntimeCredentialDefinitionSchema
+>;
+export type RuntimeCredentialDefinitionView = z.infer<
+  typeof RuntimeCredentialDefinitionViewSchema
+>;
+export type RuntimeCredentialUsage = z.infer<
+  typeof RuntimeCredentialUsageSchema
+>;

@@ -19,7 +19,7 @@ import type {
 } from "@/types";
 import { stripHtmlEmail } from "@/utils/strip-html";
 import {
-  DEFAULT_AGENT_EMAIL_NAME,
+  getDefaultAgentEmailName,
   MAX_ATTACHMENT_SIZE,
   MAX_ATTACHMENTS_PER_EMAIL,
   MAX_TOTAL_ATTACHMENTS_SIZE,
@@ -295,11 +295,12 @@ export class OutlookEmailProvider implements AgentIncomingEmailProvider {
 
       try {
         // Fetch the full message including conversationId for thread context
-        // Also include hasAttachments to determine if we need to fetch attachments
+        // Also include hasAttachments to determine if we need to fetch attachments,
+        // and internetMessageHeaders to verify sender authentication
         const message: Message = await client
           .api(`/users/${this.config.mailboxAddress}/messages/${messageId}`)
           .select(
-            "id,conversationId,subject,body,bodyPreview,from,toRecipients,receivedDateTime,hasAttachments",
+            "id,conversationId,subject,body,bodyPreview,from,toRecipients,receivedDateTime,hasAttachments,internetMessageHeaders",
           )
           .get();
 
@@ -361,6 +362,11 @@ export class OutlookEmailProvider implements AgentIncomingEmailProvider {
             originalResource: notif.resource,
           },
           attachments: attachments.length > 0 ? attachments : undefined,
+          headers: (message.internetMessageHeaders ?? []).flatMap((header) =>
+            header.name && typeof header.value === "string"
+              ? [{ name: header.name, value: header.value }]
+              : [],
+          ),
         });
       } catch (error) {
         logger.error(
@@ -646,7 +652,7 @@ export class OutlookEmailProvider implements AgentIncomingEmailProvider {
   async sendReply(options: EmailReplyOptions): Promise<string> {
     const { originalEmail, body, htmlBody, agentName } = options;
     const client = this.getGraphClient();
-    const displayName = agentName || DEFAULT_AGENT_EMAIL_NAME;
+    const displayName = agentName || getDefaultAgentEmailName();
 
     logger.info(
       {

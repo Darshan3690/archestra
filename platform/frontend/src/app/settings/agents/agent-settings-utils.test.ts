@@ -1,9 +1,13 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
+import type { ModelTierSelection } from "@/components/model-tier-pickers";
 import {
   buildSavePayload,
   detectChanges,
   resolveInitialState,
 } from "./agent-settings-utils";
+
+const NO_TIERS: ModelTierSelection = { fast: null, smart: null };
 
 const apiKeys = [
   { id: "key-1", provider: "openai", name: "OpenAI Key", scope: "org" },
@@ -22,88 +26,68 @@ const apiKeys = [
 ];
 
 describe("resolveInitialState", () => {
-  it("resolves API key from provider", () => {
+  it("resolves the API key and model from the org defaults", () => {
     const org = {
-      defaultLlmModel: "gpt-4o",
-      defaultLlmProvider: "openai",
+      defaultModelId: "model-uuid-1",
+      defaultLlmApiKeyId: "key-1",
       defaultAgentId: "agent-1",
+      defaultAutoRouterId: null,
     };
     const state = resolveInitialState(org, apiKeys);
     expect(state).toEqual({
       selectedApiKeyId: "key-1",
-      defaultModel: "gpt-4o",
+      defaultModel: "model-uuid-1",
+      tiers: { fast: null, smart: null },
       defaultAgentId: "agent-1",
+      defaultAutoRouterId: null,
     });
   });
 
-  it("resolves anthropic provider", () => {
-    const org = {
-      defaultLlmModel: "claude-sonnet-4-20250514",
-      defaultLlmProvider: "anthropic",
-      defaultAgentId: null,
-    };
-    const state = resolveInitialState(org, apiKeys);
-    expect(state).toEqual({
-      selectedApiKeyId: "key-2",
-      defaultModel: "claude-sonnet-4-20250514",
-      defaultAgentId: "",
-    });
+  it("resolves the fast and smart tiers from the org defaults", () => {
+    const state = resolveInitialState(
+      {
+        defaultModelId: "model-uuid-1",
+        defaultLlmApiKeyId: "key-1",
+        defaultFastModelId: "model-uuid-fast",
+        defaultSmartModelId: null,
+      },
+      apiKeys,
+    );
+    expect(state.tiers).toEqual({ fast: "model-uuid-fast", smart: null });
   });
 
   it("handles null/undefined org fields", () => {
     const org = {
-      defaultLlmModel: null,
-      defaultLlmProvider: null,
+      defaultModelId: null,
+      defaultLlmApiKeyId: null,
       defaultAgentId: null,
+      defaultAutoRouterId: null,
     };
     const state = resolveInitialState(org, apiKeys);
     expect(state).toEqual({
       selectedApiKeyId: "",
       defaultModel: "",
+      tiers: { fast: null, smart: null },
       defaultAgentId: "",
+      defaultAutoRouterId: null,
     });
   });
 
-  it("handles missing provider in api keys", () => {
+  it("leaves the API key empty when the configured key was deleted", () => {
     const org = {
-      defaultLlmModel: "gpt-4o",
-      defaultLlmProvider: "azure",
+      defaultModelId: "model-uuid-1",
+      defaultLlmApiKeyId: "deleted-key",
       defaultAgentId: null,
+      defaultAutoRouterId: null,
     };
     const state = resolveInitialState(org, apiKeys);
     expect(state.selectedApiKeyId).toBe("");
   });
 
-  it("prefers exact API key ID over provider-based lookup", () => {
+  it("handles an empty api keys list", () => {
     const org = {
-      defaultLlmModel: "claude-haiku-3",
-      defaultLlmProvider: "anthropic",
-      defaultLlmApiKeyId: "key-3",
-      defaultAgentId: null,
-    };
-    const state = resolveInitialState(org, apiKeys);
-    expect(state).toEqual({
-      selectedApiKeyId: "key-3",
-      defaultModel: "claude-haiku-3",
-      defaultAgentId: "",
-    });
-  });
-
-  it("falls back to provider when API key ID not found", () => {
-    const org = {
-      defaultLlmModel: "claude-haiku-3",
-      defaultLlmProvider: "anthropic",
-      defaultLlmApiKeyId: "deleted-key",
-      defaultAgentId: null,
-    };
-    const state = resolveInitialState(org, apiKeys);
-    expect(state.selectedApiKeyId).toBe("key-2");
-  });
-
-  it("handles empty api keys list", () => {
-    const org = {
-      defaultLlmModel: "gpt-4o",
-      defaultLlmProvider: "openai",
+      defaultModelId: "model-uuid-1",
+      defaultLlmApiKeyId: "key-1",
     };
     const state = resolveInitialState(org, []);
     expect(state.selectedApiKeyId).toBe("");
@@ -113,21 +97,17 @@ describe("resolveInitialState", () => {
 describe("detectChanges", () => {
   const saved = {
     selectedApiKeyId: "key-1",
-    defaultModel: "gpt-4o",
+    defaultModel: "model-uuid-a",
+    tiers: NO_TIERS,
     defaultAgentId: "agent-1",
+    defaultAutoRouterId: null,
   };
 
   it("detects no changes when state matches saved", () => {
-    const result = detectChanges(
-      {
-        selectedApiKeyId: "key-1",
-        defaultModel: "gpt-4o",
-        defaultAgentId: "agent-1",
-      },
-      saved,
-    );
+    const result = detectChanges({ ...saved }, saved);
     expect(result).toEqual({
       hasModelChanges: false,
+      hasAutoChanges: false,
       hasAgentChanges: false,
       hasChanges: false,
     });
@@ -135,31 +115,34 @@ describe("detectChanges", () => {
 
   it("detects model change", () => {
     const result = detectChanges(
-      {
-        selectedApiKeyId: "key-1",
-        defaultModel: "gpt-4o-mini",
-        defaultAgentId: "agent-1",
-      },
+      { ...saved, defaultModel: "model-uuid-b" },
       saved,
     );
     expect(result).toEqual({
       hasModelChanges: true,
+      hasAutoChanges: false,
       hasAgentChanges: false,
       hasChanges: true,
     });
   });
 
+  it("detects a tier change as a model change", () => {
+    const result = detectChanges(
+      { ...saved, tiers: { fast: "model-uuid-fast", smart: null } },
+      saved,
+    );
+    expect(result.hasModelChanges).toBe(true);
+    expect(result.hasChanges).toBe(true);
+  });
+
   it("detects agent change", () => {
     const result = detectChanges(
-      {
-        selectedApiKeyId: "key-1",
-        defaultModel: "gpt-4o",
-        defaultAgentId: "agent-2",
-      },
+      { ...saved, defaultAgentId: "agent-2" },
       saved,
     );
     expect(result).toEqual({
       hasModelChanges: false,
+      hasAutoChanges: false,
       hasAgentChanges: true,
       hasChanges: true,
     });
@@ -168,62 +151,47 @@ describe("detectChanges", () => {
   it("detects both model and agent changes", () => {
     const result = detectChanges(
       {
-        selectedApiKeyId: "key-1",
-        defaultModel: "gpt-4o-mini",
+        ...saved,
+        defaultModel: "model-uuid-b",
+        tiers: NO_TIERS,
         defaultAgentId: "agent-2",
+        defaultAutoRouterId: null,
       },
       saved,
     );
     expect(result).toEqual({
       hasModelChanges: true,
+      hasAutoChanges: false,
       hasAgentChanges: true,
       hasChanges: true,
     });
   });
 
-  it("treats empty saved state as no changes when local is also empty", () => {
-    const result = detectChanges(
-      { selectedApiKeyId: "", defaultModel: "", defaultAgentId: "" },
-      { selectedApiKeyId: "", defaultModel: "", defaultAgentId: "" },
-    );
-    expect(result.hasChanges).toBe(false);
-  });
-
   it("detects change when clearing a previously set model", () => {
     const result = detectChanges(
-      { selectedApiKeyId: "", defaultModel: "", defaultAgentId: "" },
-      { selectedApiKeyId: "key-1", defaultModel: "gpt-4o", defaultAgentId: "" },
-    );
-    expect(result.hasModelChanges).toBe(true);
-    expect(result.hasChanges).toBe(true);
-  });
-
-  it("detects API key change even when model name is the same", () => {
-    const result = detectChanges(
       {
-        selectedApiKeyId: "key-2",
-        defaultModel: "gpt-4o",
-        defaultAgentId: "agent-1",
-      },
-      saved,
-    );
-    expect(result.hasModelChanges).toBe(true);
-    expect(result.hasChanges).toBe(true);
-  });
-
-  it("detects change between two keys with same provider", () => {
-    const savedAnthropic = {
-      selectedApiKeyId: "key-2",
-      defaultModel: "claude-haiku-3",
-      defaultAgentId: "",
-    };
-    const result = detectChanges(
-      {
-        selectedApiKeyId: "key-3",
-        defaultModel: "claude-haiku-3",
+        selectedApiKeyId: "",
+        defaultModel: "",
+        tiers: NO_TIERS,
         defaultAgentId: "",
+        defaultAutoRouterId: null,
       },
-      savedAnthropic,
+      {
+        selectedApiKeyId: "key-1",
+        defaultModel: "model-uuid-a",
+        tiers: NO_TIERS,
+        defaultAgentId: "",
+        defaultAutoRouterId: null,
+      },
+    );
+    expect(result.hasModelChanges).toBe(true);
+    expect(result.hasChanges).toBe(true);
+  });
+
+  it("detects an API key change even when the model is the same", () => {
+    const result = detectChanges(
+      { ...saved, selectedApiKeyId: "key-2" },
+      saved,
     );
     expect(result.hasModelChanges).toBe(true);
     expect(result.hasChanges).toBe(true);
@@ -231,142 +199,172 @@ describe("detectChanges", () => {
 });
 
 describe("buildSavePayload", () => {
-  it("builds payload with model change only", () => {
-    const saved = {
-      selectedApiKeyId: "key-1",
-      defaultModel: "gpt-4o",
-      defaultAgentId: "agent-1",
-    };
+  const saved = {
+    selectedApiKeyId: "key-1",
+    defaultModel: "model-uuid-a",
+    tiers: NO_TIERS,
+    defaultAgentId: "agent-1",
+    defaultAutoRouterId: null,
+  };
+
+  it("sends only the router id when the default becomes an auto router, keeping the model built-in agents run on", () => {
     const payload = buildSavePayload(
-      {
-        selectedApiKeyId: "key-1",
-        defaultModel: "gpt-4o-mini",
-        defaultAgentId: "agent-1",
-      },
+      { ...saved, defaultAutoRouterId: "router-a" },
       saved,
-      apiKeys,
+    );
+    expect(payload).toEqual({ defaultAutoRouterId: "router-a" });
+  });
+
+  it("sends the other router's id when the default moves between routers", () => {
+    const onRouterA = { ...saved, defaultAutoRouterId: "router-a" };
+    expect(
+      detectChanges({ ...saved, defaultAutoRouterId: "router-b" }, onRouterA),
+    ).toMatchObject({ hasAutoChanges: true, hasModelChanges: false });
+    expect(
+      buildSavePayload(
+        { ...saved, defaultAutoRouterId: "router-b" },
+        onRouterA,
+      ),
+    ).toEqual({ defaultAutoRouterId: "router-b" });
+  });
+
+  it("sends null to leave auto", () => {
+    expect(
+      buildSavePayload(saved, { ...saved, defaultAutoRouterId: "router-a" }),
+    ).toEqual({ defaultAutoRouterId: null });
+  });
+
+  it("sends the model and key together on a model change", () => {
+    const payload = buildSavePayload(
+      { ...saved, selectedApiKeyId: "key-2", defaultModel: "model-uuid-b" },
+      saved,
     );
     expect(payload).toEqual({
-      defaultLlmModel: "gpt-4o-mini",
-      defaultLlmProvider: "openai",
+      defaultModelId: "model-uuid-b",
+      defaultLlmApiKeyId: "key-2",
+      defaultFastModelId: null,
+      defaultSmartModelId: null,
+    });
+  });
+
+  it("sends the whole trio with its key on a tier change", () => {
+    const payload = buildSavePayload(
+      {
+        ...saved,
+        tiers: { fast: "model-uuid-fast", smart: "model-uuid-smart" },
+      },
+      saved,
+    );
+    expect(payload).toEqual({
+      defaultModelId: "model-uuid-a",
       defaultLlmApiKeyId: "key-1",
+      defaultFastModelId: "model-uuid-fast",
+      defaultSmartModelId: "model-uuid-smart",
+    });
+  });
+
+  it("clears the tiers together with an incomplete model selection", () => {
+    const payload = buildSavePayload(
+      {
+        ...saved,
+        defaultModel: "",
+        tiers: { fast: "model-uuid-fast", smart: null },
+      },
+      saved,
+    );
+    expect(payload).toEqual({
+      defaultModelId: null,
+      defaultLlmApiKeyId: null,
+      defaultFastModelId: null,
+      defaultSmartModelId: null,
     });
   });
 
   it("builds payload with agent change only", () => {
-    const saved = {
-      selectedApiKeyId: "key-1",
-      defaultModel: "gpt-4o",
-      defaultAgentId: "agent-1",
-    };
     const payload = buildSavePayload(
-      {
-        selectedApiKeyId: "key-1",
-        defaultModel: "gpt-4o",
-        defaultAgentId: "agent-2",
-      },
+      { ...saved, defaultAgentId: "agent-2" },
       saved,
-      apiKeys,
     );
-    expect(payload).toEqual({
-      defaultAgentId: "agent-2",
-    });
+    expect(payload).toEqual({ defaultAgentId: "agent-2" });
   });
 
-  it("builds payload with both changes", () => {
-    const saved = {
-      selectedApiKeyId: "key-1",
-      defaultModel: "gpt-4o",
-      defaultAgentId: "agent-1",
-    };
+  it("builds payload with both model and agent changes", () => {
     const payload = buildSavePayload(
       {
         selectedApiKeyId: "key-2",
-        defaultModel: "claude-sonnet-4-20250514",
+        defaultModel: "model-uuid-b",
+        tiers: NO_TIERS,
         defaultAgentId: "",
+        defaultAutoRouterId: null,
       },
       saved,
-      apiKeys,
     );
     expect(payload).toEqual({
-      defaultLlmModel: "claude-sonnet-4-20250514",
-      defaultLlmProvider: "anthropic",
+      defaultModelId: "model-uuid-b",
       defaultLlmApiKeyId: "key-2",
+      defaultFastModelId: null,
+      defaultSmartModelId: null,
       defaultAgentId: null,
     });
   });
 
-  it("builds payload when only API key changes (same model name)", () => {
-    const saved = {
-      selectedApiKeyId: "key-2",
-      defaultModel: "claude-haiku-3",
-      defaultAgentId: "",
-    };
-    const payload = buildSavePayload(
-      {
-        selectedApiKeyId: "key-3",
-        defaultModel: "claude-haiku-3",
-        defaultAgentId: "",
-      },
-      saved,
-      apiKeys,
-    );
-    expect(payload).toEqual({
-      defaultLlmModel: "claude-haiku-3",
-      defaultLlmProvider: "anthropic",
-      defaultLlmApiKeyId: "key-3",
-    });
-  });
-
-  it("returns empty payload when no changes", () => {
-    const saved = {
-      selectedApiKeyId: "key-1",
-      defaultModel: "gpt-4o",
-      defaultAgentId: "agent-1",
-    };
-    const payload = buildSavePayload(
-      {
-        selectedApiKeyId: "key-1",
-        defaultModel: "gpt-4o",
-        defaultAgentId: "agent-1",
-      },
-      saved,
-      apiKeys,
-    );
+  it("returns an empty payload when nothing changed", () => {
+    const payload = buildSavePayload({ ...saved }, saved);
     expect(payload).toEqual({});
   });
 
-  it("sets provider to null when model is cleared", () => {
-    const saved = {
-      selectedApiKeyId: "key-1",
-      defaultModel: "gpt-4o",
-      defaultAgentId: "",
-    };
+  it("clears both the model and key when the model is cleared", () => {
     const payload = buildSavePayload(
-      { selectedApiKeyId: "key-1", defaultModel: "", defaultAgentId: "" },
-      saved,
-      apiKeys,
+      {
+        selectedApiKeyId: "key-1",
+        defaultModel: "",
+        tiers: NO_TIERS,
+        defaultAgentId: "",
+        defaultAutoRouterId: null,
+      },
+      {
+        selectedApiKeyId: "key-1",
+        defaultModel: "model-uuid-a",
+        tiers: NO_TIERS,
+        defaultAgentId: "",
+        defaultAutoRouterId: null,
+      },
     );
     expect(payload).toEqual({
-      defaultLlmModel: null,
-      defaultLlmProvider: null,
+      defaultModelId: null,
       defaultLlmApiKeyId: null,
+      defaultFastModelId: null,
+      defaultSmartModelId: null,
     });
   });
 
-  it("sets defaultAgentId to null when clearing agent", () => {
-    const saved = {
-      selectedApiKeyId: "key-1",
-      defaultModel: "gpt-4o",
-      defaultAgentId: "agent-1",
-    };
+  it("clears both when only a key is set without a model", () => {
     const payload = buildSavePayload(
-      { selectedApiKeyId: "key-1", defaultModel: "gpt-4o", defaultAgentId: "" },
-      saved,
-      apiKeys,
+      {
+        selectedApiKeyId: "key-2",
+        defaultModel: "",
+        tiers: NO_TIERS,
+        defaultAgentId: "",
+        defaultAutoRouterId: null,
+      },
+      {
+        selectedApiKeyId: "key-1",
+        defaultModel: "model-uuid-a",
+        tiers: NO_TIERS,
+        defaultAgentId: "",
+        defaultAutoRouterId: null,
+      },
     );
     expect(payload).toEqual({
-      defaultAgentId: null,
+      defaultModelId: null,
+      defaultLlmApiKeyId: null,
+      defaultFastModelId: null,
+      defaultSmartModelId: null,
     });
+  });
+
+  it("sets defaultAgentId to null when clearing the agent", () => {
+    const payload = buildSavePayload({ ...saved, defaultAgentId: "" }, saved);
+    expect(payload).toEqual({ defaultAgentId: null });
   });
 });

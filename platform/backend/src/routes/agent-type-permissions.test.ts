@@ -1,25 +1,22 @@
-import { ADMIN_ROLE_NAME, BUILT_IN_AGENT_IDS } from "@shared";
+import { ADMIN_ROLE_NAME, BUILT_IN_AGENT_IDS } from "@archestra/shared";
 import { vi } from "vitest";
-import type { FastifyInstanceWithZod } from "@/server";
-import { createFastifyInstance } from "@/server";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { agentSandboxApi } from "@/k8s/agent-runtime/sandbox-api";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
 import { afterEach, beforeEach, describe, expect, test } from "@/test";
 import type { User } from "@/types";
 
-vi.mock("@/observability", () => ({
-  initializeObservabilityMetrics: vi.fn(),
-  metrics: {
-    llm: { initializeMetrics: vi.fn() },
-    mcp: { initializeMcpMetrics: vi.fn() },
-    agentExecution: { initializeAgentExecutionMetrics: vi.fn() },
-  },
-}));
+vi.mock("@/observability");
 
 /**
  * Route-level integration tests for agent-type permission isolation.
  *
- * Verifies that the 3-resource RBAC split (agent, mcpGateway, llmProxy)
- * correctly enforces access control at the HTTP route level. A user with
- * permissions on one resource should NOT be able to access the other two.
+ * Verifies that the per-type RBAC split (agent, mcpGateway) correctly
+ * enforces access control at the HTTP route level — a user with permissions
+ * on one resource should NOT be able to access the other — and that
+ * `llm_proxy` rows are rejected by the generic agent routes (the LLM Proxy
+ * is managed through its dedicated routes).
  *
  * Also verifies scope-based access: members can only CRUD personal agents,
  * team-admins can manage team-scoped agents, and admins can manage all scopes.
@@ -93,11 +90,12 @@ describe("agent type permission isolation (routes)", () => {
         expect(agentRes.statusCode).toBe(403);
 
         // Forbidden from listing LLM proxies
+        // llm_proxy is not a valid generic-list filter
         const proxyRes = await memberApp.inject({
           method: "GET",
           url: "/api/agents?agentType=llm_proxy",
         });
-        expect(proxyRes.statusCode).toBe(403);
+        expect(proxyRes.statusCode).toBe(400);
 
         // Can create a personal MCP gateway
         const createGwRes = await memberApp.inject({
@@ -106,8 +104,6 @@ describe("agent type permission isolation (routes)", () => {
           payload: {
             name: "test-gw",
             agentType: "mcp_gateway",
-            scope: "personal",
-            teams: [],
             labels: [],
             knowledgeBaseIds: [],
             connectorIds: [],
@@ -122,8 +118,6 @@ describe("agent type permission isolation (routes)", () => {
           payload: {
             name: "test-agent",
             agentType: "agent",
-            scope: "personal",
-            teams: [],
             labels: [],
             knowledgeBaseIds: [],
             connectorIds: [],
@@ -131,43 +125,42 @@ describe("agent type permission isolation (routes)", () => {
         });
         expect(createAgentRes.statusCode).toBe(403);
 
-        // Forbidden from creating an LLM proxy
+        // llm_proxy creation is rejected outright
         const createProxyRes = await memberApp.inject({
           method: "POST",
           url: "/api/agents",
           payload: {
             name: "test-proxy",
             agentType: "llm_proxy",
-            scope: "personal",
-            teams: [],
             labels: [],
             knowledgeBaseIds: [],
             connectorIds: [],
           },
         });
-        expect(createProxyRes.statusCode).toBe(403);
+        expect(createProxyRes.statusCode).toBe(400);
       } finally {
         await memberApp.close();
       }
     });
 
-    test("user with only llmProxy perms can list proxies but not agents or gateways", async ({
+    test("llmProxy perms grant no access to the generic agent routes", async ({
       makeCustomRole,
       makeMember,
     }) => {
       await makeCustomRole(organizationId, {
         role: "proxy_only",
-        permission: { llmProxy: ["read", "create", "update", "delete"] },
+        permission: { llmProxy: ["read", "update"] },
       });
       await makeMember(memberUser.id, organizationId, { role: "proxy_only" });
       const memberApp = await createAppForUser(memberUser);
 
       try {
+        // llm_proxy is not a valid generic-list filter
         const proxyRes = await memberApp.inject({
           method: "GET",
           url: "/api/agents?agentType=llm_proxy",
         });
-        expect(proxyRes.statusCode).toBe(200);
+        expect(proxyRes.statusCode).toBe(400);
 
         const agentRes = await memberApp.inject({
           method: "GET",
@@ -181,21 +174,26 @@ describe("agent type permission isolation (routes)", () => {
         });
         expect(gwRes.statusCode).toBe(403);
 
-        // Can create a personal LLM proxy
+        // Unfiltered listing needs read on at least one generic agent type
+        const unfilteredRes = await memberApp.inject({
+          method: "GET",
+          url: "/api/agents?limit=10&offset=0",
+        });
+        expect(unfilteredRes.statusCode).toBe(403);
+
+        // llm_proxy creation is rejected outright
         const createRes = await memberApp.inject({
           method: "POST",
           url: "/api/agents",
           payload: {
             name: "test-proxy",
             agentType: "llm_proxy",
-            scope: "personal",
-            teams: [],
             labels: [],
             knowledgeBaseIds: [],
             connectorIds: [],
           },
         });
-        expect(createRes.statusCode).toBe(200);
+        expect(createRes.statusCode).toBe(400);
       } finally {
         await memberApp.close();
       }
@@ -207,10 +205,15 @@ describe("agent type permission isolation (routes)", () => {
     }) => {
       await makeCustomRole(organizationId, {
         role: "agent_only",
-        permission: { agent: ["read", "create", "update", "delete"] },
+        permission: {
+          agent: ["read", "create", "update", "delete", "configure-runtime"],
+        },
       });
       await makeMember(memberUser.id, organizationId, { role: "agent_only" });
       const memberApp = await createAppForUser(memberUser);
+      const sandboxInstalled = vi
+        .spyOn(agentSandboxApi, "isInstalled", "get")
+        .mockReturnValue(true);
 
       try {
         const agentRes = await memberApp.inject({
@@ -225,12 +228,58 @@ describe("agent type permission isolation (routes)", () => {
         });
         expect(gwRes.statusCode).toBe(403);
 
+        // llm_proxy is not a valid generic-list filter
         const proxyRes = await memberApp.inject({
           method: "GET",
           url: "/api/agents?agentType=llm_proxy",
         });
-        expect(proxyRes.statusCode).toBe(403);
+        expect(proxyRes.statusCode).toBe(400);
+
+        const runtimeAgent = await memberApp.inject({
+          method: "POST",
+          url: "/api/agents",
+          payload: {
+            name: "runtime-agent",
+            agentType: "agent",
+            runtime: {
+              image: "example.com/coding-agent:latest",
+              command: null,
+              inferenceProtocol: "openai_responses",
+              backend: "kubernetes",
+              steerMode: "pipe",
+              privileged: false,
+              environment: null,
+              credentials: null,
+              ttlHours: null,
+              idleTimeoutMinutes: null,
+            },
+          },
+        });
+        expect(runtimeAgent.statusCode).toBe(200);
+
+        const privilegedAgent = await memberApp.inject({
+          method: "POST",
+          url: "/api/agents",
+          payload: {
+            name: "privileged-runtime-agent",
+            agentType: "agent",
+            runtime: {
+              image: "example.com/coding-agent:latest",
+              command: null,
+              inferenceProtocol: "openai_responses",
+              backend: "kubernetes",
+              steerMode: "pipe",
+              privileged: true,
+              environment: null,
+              credentials: null,
+              ttlHours: null,
+              idleTimeoutMinutes: null,
+            },
+          },
+        });
+        expect(privilegedAgent.statusCode).toBe(403);
       } finally {
+        sandboxInstalled.mockRestore();
         await memberApp.close();
       }
     });
@@ -264,11 +313,12 @@ describe("agent type permission isolation (routes)", () => {
         });
         expect(gwRes.statusCode).toBe(200);
 
+        // llm_proxy is not a valid generic-list filter
         const proxyRes = await memberApp.inject({
           method: "GET",
           url: "/api/agents?agentType=llm_proxy",
         });
-        expect(proxyRes.statusCode).toBe(403);
+        expect(proxyRes.statusCode).toBe(400);
       } finally {
         await memberApp.close();
       }
@@ -285,22 +335,37 @@ describe("agent type permission isolation (routes)", () => {
       const proxy = await makeAgent({
         organizationId,
         agentType: "llm_proxy",
-        scope: "org",
         authorId: adminUser.id,
       });
       const gateway = await makeAgent({
         organizationId,
         agentType: "mcp_gateway",
-        scope: "org",
         authorId: adminUser.id,
       });
 
       // Give member only mcpGateway CRUD + admin (so they can modify org-scope)
-      await makeCustomRole(organizationId, {
+      const gw_crud = await makeCustomRole(organizationId, {
         role: "gw_crud",
         permission: {
           mcpGateway: ["read", "create", "update", "delete", "admin"],
         },
+      });
+      const grantKey = {
+        organizationId,
+        resource: "mcpGateway" as const,
+        scope: "*" as const,
+      };
+      const grantPolicy = await ResourcePermissionPolicyModel.find(grantKey);
+      await ResourcePermissionPolicyModel.replace({
+        ...grantKey,
+        revision: grantPolicy?.revision ?? 0,
+        grants: [
+          ...(grantPolicy?.grants ?? []),
+          {
+            subject: { type: "role", id: gw_crud.id },
+            actions: ["read", "update", "delete"],
+          },
+        ],
       });
       await makeMember(memberUser.id, organizationId, { role: "gw_crud" });
       const memberApp = await createAppForUser(memberUser);
@@ -313,12 +378,13 @@ describe("agent type permission isolation (routes)", () => {
         });
         expect(getGwRes.statusCode).toBe(200);
 
-        // CANNOT get the LLM proxy (returns 404 to avoid leaking existence)
+        // CANNOT get the LLM proxy — generic reads reject llm_proxy rows
+        // (same-org, so the managed-resource 400 leaks nothing)
         const getProxyRes = await memberApp.inject({
           method: "GET",
           url: `/api/agents/${proxy.id}`,
         });
-        expect(getProxyRes.statusCode).toBe(404);
+        expect(getProxyRes.statusCode).toBe(400);
 
         // CAN update the MCP gateway
         const updateGwRes = await memberApp.inject({
@@ -328,20 +394,20 @@ describe("agent type permission isolation (routes)", () => {
         });
         expect(updateGwRes.statusCode).toBe(200);
 
-        // CANNOT update the LLM proxy
+        // CANNOT update the LLM proxy — generic updates reject llm_proxy rows
         const updateProxyRes = await memberApp.inject({
           method: "PUT",
           url: `/api/agents/${proxy.id}`,
           payload: { name: "updated-proxy" },
         });
-        expect(updateProxyRes.statusCode).toBe(404);
+        expect(updateProxyRes.statusCode).toBe(400);
 
-        // CANNOT delete the LLM proxy
+        // CANNOT delete the LLM proxy — generic deletes reject llm_proxy rows
         const deleteProxyRes = await memberApp.inject({
           method: "DELETE",
           url: `/api/agents/${proxy.id}`,
         });
-        expect(deleteProxyRes.statusCode).toBe(404);
+        expect(deleteProxyRes.statusCode).toBe(400);
 
         // CAN delete the MCP gateway
         const deleteGwRes = await memberApp.inject({
@@ -370,20 +436,144 @@ describe("agent type permission isolation (routes)", () => {
   });
 
   describe("scope enforcement", () => {
-    test("admin can create shared agents with teams for all agent types", async ({
+    test("team RBAC applies to inherited parent resources but not sibling resources", async ({
+      makeCustomRole,
+      makeMember,
+      makeTeam,
+      makeTeamMember,
+      makeUser,
+    }) => {
+      const parent = await makeTeam(organizationId, adminUser.id);
+      const child = await makeTeam(organizationId, adminUser.id, {
+        parentId: parent.id,
+      });
+      const grandchild = await makeTeam(organizationId, adminUser.id, {
+        parentId: child.id,
+      });
+      const sibling = await makeTeam(organizationId, adminUser.id);
+
+      const createAgent = async (name: string, teamId: string) => {
+        const response = await app.inject({
+          method: "POST",
+          url: "/api/agents",
+          payload: {
+            name,
+            agentType: "agent",
+            initialGrants: [
+              {
+                subject: { type: "team", id: teamId },
+                actions: ["read", "use"],
+              },
+            ],
+            labels: [],
+            knowledgeBaseIds: [],
+            connectorIds: [],
+          },
+        });
+        expect(response.statusCode).toBe(200);
+        return response.json() as { id: string };
+      };
+      const parentAgent = await createAgent("parent-agent", parent.id);
+      const childAgent = await createAgent("child-agent", child.id);
+      const siblingAgent = await createAgent("sibling-agent", sibling.id);
+
+      await makeCustomRole(organizationId, {
+        role: "hierarchy_editor",
+        permission: {
+          agent: ["read", "update", "team-admin"],
+        },
+      });
+      await makeMember(memberUser.id, organizationId, {
+        role: "hierarchy_editor",
+      });
+      const grantKey = {
+        organizationId,
+        resource: "agent" as const,
+        scope: parentAgent.id,
+      };
+      const grantPolicy = await ResourcePermissionPolicyModel.find(grantKey);
+      await ResourcePermissionPolicyModel.replace({
+        ...grantKey,
+        revision: grantPolicy?.revision ?? 0,
+        grants: [
+          ...(grantPolicy?.grants.filter(
+            (grant) =>
+              grant.subject.type !== "team" || grant.subject.id !== parent.id,
+          ) ?? []),
+          {
+            subject: { type: "team", id: parent.id },
+            actions: ["read", "update"],
+          },
+        ],
+      });
+      await makeTeamMember(grandchild.id, memberUser.id);
+      const memberApp = await createAppForUser(memberUser);
+
+      const parentOnlyUser = await makeUser({
+        email: "parent-only@test.com",
+      });
+      await makeMember(parentOnlyUser.id, organizationId, {
+        role: "hierarchy_editor",
+      });
+      await makeTeamMember(parent.id, parentOnlyUser.id);
+      const parentOnlyApp = await createAppForUser(parentOnlyUser);
+
+      try {
+        const inheritedRead = await memberApp.inject({
+          method: "GET",
+          url: `/api/agents/${parentAgent.id}`,
+        });
+        expect(inheritedRead.statusCode).toBe(200);
+
+        const inheritedUpdate = await memberApp.inject({
+          method: "PUT",
+          url: `/api/agents/${parentAgent.id}`,
+          payload: { name: "updated-parent-agent" },
+        });
+        expect(inheritedUpdate.statusCode).toBe(200);
+
+        const siblingRead = await memberApp.inject({
+          method: "GET",
+          url: `/api/agents/${siblingAgent.id}`,
+        });
+        expect(siblingRead.statusCode).toBe(404);
+
+        const siblingUpdate = await memberApp.inject({
+          method: "PUT",
+          url: `/api/agents/${siblingAgent.id}`,
+          payload: { name: "must-not-change" },
+        });
+        expect(siblingUpdate.statusCode).toBe(403);
+
+        const childReadFromParent = await parentOnlyApp.inject({
+          method: "GET",
+          url: `/api/agents/${childAgent.id}`,
+        });
+        expect(childReadFromParent.statusCode).toBe(404);
+      } finally {
+        await memberApp.close();
+        await parentOnlyApp.close();
+      }
+    });
+
+    test("admin can create shared agents with teams for the generic agent types", async ({
       makeTeam,
     }) => {
       const team = await makeTeam(organizationId, adminUser.id);
 
-      for (const agentType of ["agent", "mcp_gateway", "llm_proxy"] as const) {
+      for (const agentType of ["agent", "mcp_gateway"] as const) {
         const res = await app.inject({
           method: "POST",
           url: "/api/agents",
           payload: {
             name: `admin-team-${agentType}`,
             agentType,
-            teams: [team.id],
-            scope: "team",
+            initialGrants: [
+              {
+                subject: { type: "team", id: team.id },
+                actions: ["read", "use"],
+              },
+            ],
             labels: [],
             knowledgeBaseIds: [],
             connectorIds: [],
@@ -398,11 +588,16 @@ describe("agent type permission isolation (routes)", () => {
           url: `/api/agents/${created.id}`,
         });
         expect(getRes.statusCode).toBe(200);
-        const agent = getRes.json();
-        expect(agent.teams).toContainEqual(
-          expect.objectContaining({ id: team.id }),
-        );
-        expect(agent.scope).toBe("team");
+        // The team reaches the agent through the grant the create wrote.
+        const policy = await ResourcePermissionPolicyModel.find({
+          organizationId,
+          resource: agentType === "agent" ? "agent" : "mcpGateway",
+          scope: created.id,
+        });
+        expect(policy?.grants).toContainEqual({
+          subject: { type: "team", id: team.id },
+          actions: ["read", "use"],
+        });
       }
     });
 
@@ -419,7 +614,6 @@ describe("agent type permission isolation (routes)", () => {
         permission: {
           agent: ["read", "create", "update", "delete", "team-admin"],
           mcpGateway: ["read", "create", "update", "delete", "team-admin"],
-          llmProxy: ["read", "create", "update", "delete", "team-admin"],
         },
       });
       await makeMember(memberUser.id, organizationId, {
@@ -432,11 +626,7 @@ describe("agent type permission isolation (routes)", () => {
       try {
         const createdIds: string[] = [];
 
-        for (const agentType of [
-          "agent",
-          "mcp_gateway",
-          "llm_proxy",
-        ] as const) {
+        for (const agentType of ["agent", "mcp_gateway"] as const) {
           // Can create team-scoped agents
           const createRes = await memberApp.inject({
             method: "POST",
@@ -444,8 +634,12 @@ describe("agent type permission isolation (routes)", () => {
             payload: {
               name: `team-admin-${agentType}`,
               agentType,
-              teams: [team.id],
-              scope: "team",
+              initialGrants: [
+                {
+                  subject: { type: "team", id: team.id },
+                  actions: ["read", "use"],
+                },
+              ],
               labels: [],
               knowledgeBaseIds: [],
               connectorIds: [],
@@ -471,14 +665,12 @@ describe("agent type permission isolation (routes)", () => {
           payload: {
             name: "team-admin-org-agent",
             agentType: "agent",
-            scope: "org",
-            teams: [],
             labels: [],
             knowledgeBaseIds: [],
             connectorIds: [],
           },
         });
-        expect(orgRes.statusCode).toBe(403);
+        expect(orgRes.statusCode).toBe(200);
 
         // Can delete team-scoped agents
         for (const id of createdIds) {
@@ -493,7 +685,7 @@ describe("agent type permission isolation (routes)", () => {
       }
     });
 
-    test("non-admin user can only create personal agents, not shared", async ({
+    test("resource creation authority permits initial sharing grants", async ({
       makeCustomRole,
       makeMember,
       makeTeam,
@@ -506,7 +698,6 @@ describe("agent type permission isolation (routes)", () => {
         permission: {
           agent: ["read", "create"],
           mcpGateway: ["read", "create"],
-          llmProxy: ["read", "create"],
         },
       });
       await makeMember(memberUser.id, organizationId, { role: "no_admin" });
@@ -516,41 +707,35 @@ describe("agent type permission isolation (routes)", () => {
 
       try {
         // Forbidden from creating team-scoped agents
-        for (const agentType of [
-          "agent",
-          "mcp_gateway",
-          "llm_proxy",
-        ] as const) {
+        for (const agentType of ["agent", "mcp_gateway"] as const) {
           const teamRes = await memberApp.inject({
             method: "POST",
             url: "/api/agents",
             payload: {
               name: `non-admin-team-${agentType}`,
               agentType,
-              teams: [team.id],
-              scope: "team",
+              initialGrants: [
+                {
+                  subject: { type: "team", id: team.id },
+                  actions: ["read", "use"],
+                },
+              ],
               labels: [],
               knowledgeBaseIds: [],
               connectorIds: [],
             },
           });
-          expect(teamRes.statusCode).toBe(403);
+          expect(teamRes.statusCode).toBe(200);
         }
 
         // Can create personal agents for all types
-        for (const agentType of [
-          "agent",
-          "mcp_gateway",
-          "llm_proxy",
-        ] as const) {
+        for (const agentType of ["agent", "mcp_gateway"] as const) {
           const personalRes = await memberApp.inject({
             method: "POST",
             url: "/api/agents",
             payload: {
               name: `personal-${agentType}`,
               agentType,
-              scope: "personal",
-              teams: [],
               labels: [],
               knowledgeBaseIds: [],
               connectorIds: [],
@@ -574,7 +759,7 @@ describe("agent type permission isolation (routes)", () => {
         permission: {
           agent: ["read"],
           mcpGateway: ["read", "create"],
-          llmProxy: ["read", "create", "update"],
+          llmProxy: ["read", "update"],
         },
       });
       await makeMember(memberUser.id, organizationId, {
@@ -592,7 +777,7 @@ describe("agent type permission isolation (routes)", () => {
 
         expect(permissions.agent).toEqual(["read"]);
         expect(permissions.mcpGateway).toEqual(["read", "create"]);
-        expect(permissions.llmProxy).toEqual(["read", "create", "update"]);
+        expect(permissions.llmProxy).toEqual(["read", "update"]);
       } finally {
         await memberApp.close();
       }
@@ -609,11 +794,9 @@ describe("agent type permission isolation (routes)", () => {
       await makeAgent({
         organizationId,
         agentType: "agent",
-        scope: "org",
-        name: "Policy Configuration Subagent",
+        name: "Context Compaction Subagent",
         builtInAgentConfig: {
-          name: BUILT_IN_AGENT_IDS.POLICY_CONFIG,
-          autoConfigureOnToolDiscovery: true,
+          name: BUILT_IN_AGENT_IDS.CONTEXT_COMPACTION,
         },
         authorId: adminUser.id,
       });
@@ -630,13 +813,10 @@ describe("agent type permission isolation (routes)", () => {
       // Admin should see built-in agents
       const adminRes = await app.inject({
         method: "GET",
-        url: "/api/agents/all?agentType=agent",
+        url: "/api/agents?agentType=agent&includeBuiltIn=true",
       });
-      if (adminRes.statusCode !== 200) {
-        console.error("ADMIN ALL ERROR:", adminRes.json());
-      }
-      expect(adminRes.statusCode).toBe(200);
-      const adminAgents = adminRes.json();
+      expect(adminRes.statusCode, adminRes.body).toBe(200);
+      const adminAgents = adminRes.json().data;
       const adminBuiltIn = adminAgents.filter(
         (a: { builtIn: boolean }) => a.builtIn,
       );
@@ -647,10 +827,10 @@ describe("agent type permission isolation (routes)", () => {
       try {
         const memberRes = await memberApp.inject({
           method: "GET",
-          url: "/api/agents/all?agentType=agent",
+          url: "/api/agents?agentType=agent&includeBuiltIn=true",
         });
         expect(memberRes.statusCode).toBe(200);
-        const memberAgents = memberRes.json();
+        const memberAgents = memberRes.json().data;
         const memberBuiltIn = memberAgents.filter(
           (a: { builtIn: boolean }) => a.builtIn,
         );

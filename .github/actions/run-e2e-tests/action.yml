@@ -31,18 +31,35 @@ inputs:
     description: "Optional path to environment file to source before running tests"
     required: false
     default: ""
+  blob_report_dir:
+    description: |
+      Blob-report directory, relative to the e2e-tests directory. Give a job's
+      second and later legs their own directory: the container runs as root, so
+      a leg that shares one directory leaves root-owned files the host runner
+      cannot delete between legs.
+    required: false
+    default: "blob-report"
+  blob_report_name:
+    description: |
+      Optional blob-report file name (must end in .zip). Playwright only
+      suffixes the default name for --shard runs, so legs that split one
+      project another way must name their reports apart, or the report job's
+      merged download overwrites one with the other.
+    required: false
+    default: ""
 
 outputs:
   has_flaky_tests:
     description: "Whether flaky tests were detected"
     value: ${{ steps.check-flaky.outputs.has_flaky_tests }}
-  blob_report_path:
-    description: "Path to the blob report directory"
-    value: ${{ steps.paths.outputs.blob_report_path }}
 
 runs:
   using: composite
   steps:
+    # NOTE: setup-archestra-platform pre-pulls this same image in the background
+    # (deriving the tag from the same package.json field) so the pull overlaps
+    # environment setup; the docker run below then finds it cached or attaches
+    # to the in-flight pull.
     - name: Resolve Playwright version
       id: playwright
       shell: bash
@@ -58,16 +75,6 @@ runs:
         } >> "$GITHUB_ENV"
         echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-    - name: Set output paths
-      id: paths
-      shell: bash
-      env:
-        WORKING_DIRECTORY: ${{ inputs.working_directory }}
-        E2E_TESTS_PATH: ${{ inputs.e2e_tests_path }}
-      run: |
-        echo "blob_report_path=${WORKING_DIRECTORY}/${E2E_TESTS_PATH}/blob-report/" >> $GITHUB_OUTPUT
-        echo "output_file=${WORKING_DIRECTORY}/playwright-output.txt" >> $GITHUB_OUTPUT
-
     - name: Run E2E tests
       id: e2e
       shell: bash
@@ -76,10 +83,18 @@ runs:
         SHARD: ${{ inputs.shard }}
         EXTRA_ARGS: ${{ inputs.extra_args }}
         WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        E2E_TESTS_PATH: ${{ inputs.e2e_tests_path }}
         ENV_FILE: ${{ inputs.env_file }}
         TIMEOUT_MINUTES: ${{ inputs.timeout }}
+        BLOB_REPORT_DIR: ${{ inputs.blob_report_dir }}
+        BLOB_REPORT_NAME: ${{ inputs.blob_report_name }}
       run: |
         set -o pipefail
+
+        # Absolute container path: Playwright resolves a relative
+        # PLAYWRIGHT_BLOB_OUTPUT_DIR against its own cwd, which is not the
+        # directory the upload step reads from.
+        BLOB_OUTPUT_DIR="/work/${WORKING_DIRECTORY#./}/${E2E_TESTS_PATH}/${BLOB_REPORT_DIR}"
 
         # Source environment file if provided
         ENV_ARGS=()
@@ -106,6 +121,10 @@ runs:
           echo "Loaded ${#ENV_ARGS[@]} environment variable flags"
         fi
 
+        if [ -n "${BLOB_REPORT_NAME}" ]; then
+          ENV_ARGS+=("-e" "PLAYWRIGHT_BLOB_OUTPUT_NAME=${BLOB_REPORT_NAME}")
+        fi
+
         # Mount kubeconfig if available (for K8s e2e tests)
         KUBE_ARGS=()
         if [ -f "$HOME/.kube/config" ]; then
@@ -114,17 +133,21 @@ runs:
           KUBE_ARGS+=("-e" "KUBECONFIG=/root/.kube/config")
         fi
 
-        docker run --rm \
+        # Bound the Playwright run itself so a hung test can't hold the runner
+        # until the job-level timeout. `timeout` exits 124 on expiry, which
+        # pipefail turns into a step failure handled by the caller.
+        timeout "${TIMEOUT_MINUTES}m" docker run --rm \
           --network host \
           --ipc=host \
           -v "$GITHUB_WORKSPACE:/work" \
           -w "/work/${WORKING_DIRECTORY#./}" \
           -e CI=true \
           -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+          -e "PLAYWRIGHT_BLOB_OUTPUT_DIR=${BLOB_OUTPUT_DIR}" \
           "${KUBE_ARGS[@]}" \
           "${ENV_ARGS[@]}" \
           "mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-noble" \
-          /bin/bash -c "corepack enable && corepack prepare pnpm@10.24.0 --activate && pnpm test:e2e -- --project=${PROJECTS} ${SHARD} ${EXTRA_ARGS}" \
+          /bin/bash -c "corepack enable && corepack prepare pnpm@11.9.0 --activate && pnpm test:e2e -- --project=${PROJECTS} ${SHARD} ${EXTRA_ARGS}" \
           2>&1 | tee "${WORKING_DIRECTORY}/playwright-output.txt"
 
     - name: Check for flaky tests

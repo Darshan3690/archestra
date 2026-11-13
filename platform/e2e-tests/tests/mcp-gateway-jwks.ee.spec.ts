@@ -8,16 +8,23 @@
  * 4. Authenticate to MCP Gateway using the JWT
  * 5. Verify tool calls succeed and the Archestra user is linked in audit logs
  */
-import { API_BASE_URL, MCP_GATEWAY_URL_SUFFIX, SSO_DOMAIN } from "../consts";
+import {
+  API_BASE_URL,
+  MCP_GATEWAY_URL_SUFFIX,
+  ORGANIZATION_USE_GRANT,
+  SSO_DOMAIN,
+} from "../consts";
 import { getKeycloakJwt } from "../utils";
 import {
-  assignArchestraToolsToProfile,
+  assignWhoamiToolToProfile,
   callMcpTool,
+  getOrgTokenForProfile,
   initializeMcpSession,
   listMcpTools,
   makeApiRequest,
   makeMcpGatewayRequestHeaders,
   waitForGatewayIdentityProviderReady,
+  waitForMcpGatewayJwtReady,
 } from "../utils/mcp-gateway";
 import { expect, test } from "./api-fixtures";
 
@@ -26,13 +33,15 @@ import { expect, test } from "./api-fixtures";
 // =============================================================================
 
 test.describe("MCP Gateway - External IdP JWKS Authentication", () => {
-  test("should authenticate with external IdP JWT, call tools, and log external identity", async ({
+  test("should authenticate with external IdP JWT, call tools, and log external identity", {
+    tag: "@needs-keycloak",
+  }, async ({
     request,
     deleteAgent,
     createIdentityProvider,
     deleteIdentityProvider,
   }) => {
-    test.slow();
+    test.setTimeout(300_000);
 
     // STEP 1: Verify Keycloak is reachable and get a test JWT
     const jwt = await getKeycloakJwt();
@@ -58,10 +67,9 @@ test.describe("MCP Gateway - External IdP JWKS Authentication", () => {
         urlSuffix: "/api/agents",
         data: {
           name: `JWKS E2E Test ${Date.now()}`,
-          teams: [],
-          scope: "org",
           agentType: "mcp_gateway",
           identityProviderId,
+          initialGrants: [ORGANIZATION_USE_GRANT],
         },
       });
       const agent = (await agentResponse.json()) as { id: string };
@@ -75,20 +83,22 @@ test.describe("MCP Gateway - External IdP JWKS Authentication", () => {
         agentType: "mcp_gateway",
       });
 
-      // STEP 4: Assign Archestra tools to the profile
-      await assignArchestraToolsToProfile(request, pid);
+      // STEP 4: Assign the tool this authentication flow calls.
+      await assignWhoamiToolToProfile(request, pid);
 
       // STEP 5: Wait for IdP linkage/tool assignments to settle before using the
       // external JWT against the gateway. This avoids transient 401s in CI where
       // the profile update is visible before the auth path is fully ready.
-      const tools = await waitForExternalJwtGatewayReady({
+      const tools = await waitForMcpGatewayJwtReady({
         request,
         profileId: pid,
         token: jwt,
+        identityProviderId,
+        expectedToolName: "archestra__whoami",
       });
       expect(tools.length).toBeGreaterThan(0);
 
-      // Verify archestra tools are present
+      // Verify whoami is available through progressive discovery.
       const toolNames = tools.map((t) => t.name);
       expect(toolNames).toContain("archestra__whoami");
 
@@ -132,7 +142,9 @@ test.describe("MCP Gateway - External IdP JWKS Authentication", () => {
     }
   });
 
-  test("should reject invalid JWT with 401", async ({
+  test("should reject invalid JWT with 401", {
+    tag: "@needs-keycloak",
+  }, async ({
     request,
     deleteAgent,
     createIdentityProvider,
@@ -154,10 +166,9 @@ test.describe("MCP Gateway - External IdP JWKS Authentication", () => {
         urlSuffix: "/api/agents",
         data: {
           name: `JWKS Reject Test ${Date.now()}`,
-          teams: [],
-          scope: "org",
           agentType: "mcp_gateway",
           identityProviderId,
+          initialGrants: [ORGANIZATION_USE_GRANT],
         },
       });
       const agent = (await agentResponse.json()) as { id: string };
@@ -200,34 +211,22 @@ test.describe("MCP Gateway - External IdP JWKS Authentication", () => {
     deleteAgent,
   }) => {
     // Create a profile WITHOUT an IdP linked
+    // The organization token reaches only gateways the organization may use.
     const agentResponse = await createAgent(
       request,
       `No IdP Test ${Date.now()}`,
-      "personal",
+      undefined,
+      [ORGANIZATION_USE_GRANT],
     );
     const agent = await agentResponse.json();
     const profileId = agent.id;
 
     try {
-      // Assign Archestra tools
-      await assignArchestraToolsToProfile(request, profileId);
+      // Assign the tool used by this authentication flow.
+      await assignWhoamiToolToProfile(request, profileId);
 
       // Get org token - should work since no IdP is configured
-      const tokensResponse = await makeApiRequest({
-        request,
-        method: "get",
-        urlSuffix: "/api/tokens",
-      });
-      const tokensData = await tokensResponse.json();
-      const orgToken = tokensData.tokens.find(
-        (t: { isOrganizationToken: boolean }) => t.isOrganizationToken,
-      );
-      const tokenValueResponse = await makeApiRequest({
-        request,
-        method: "get",
-        urlSuffix: `/api/tokens/${orgToken.id}/value`,
-      });
-      const { value: archestraToken } = await tokenValueResponse.json();
+      const archestraToken = await getOrgTokenForProfile(request);
 
       // Initialize and list tools with archestra token
       await initializeMcpSession(request, {
@@ -245,42 +244,3 @@ test.describe("MCP Gateway - External IdP JWKS Authentication", () => {
     }
   });
 });
-
-async function waitForExternalJwtGatewayReady(params: {
-  request: Parameters<typeof initializeMcpSession>[0];
-  profileId: string;
-  token: string;
-}) {
-  let lastError: unknown;
-
-  for (const delayMs of [
-    0, 500, 1000, 2000, 4000, 8000, 8000, 8000, 8000, 8000,
-  ]) {
-    if (delayMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
-
-    try {
-      await initializeMcpSession(params.request, {
-        profileId: params.profileId,
-        token: params.token,
-      });
-
-      const tools = await listMcpTools(params.request, {
-        profileId: params.profileId,
-        token: params.token,
-      });
-
-      if (tools.length > 0) {
-        return tools;
-      }
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw (
-    lastError ??
-    new Error("MCP Gateway did not become ready for external JWT auth")
-  );
-}

@@ -1,24 +1,77 @@
 import { z } from "zod";
 
 export const ADMIN_ROLE_NAME = "admin";
+export const PLATFORM_ADMIN_ROLE_NAME = "platform_admin";
 export const EDITOR_ROLE_NAME = "editor";
 export const MEMBER_ROLE_NAME = "member";
+/**
+ * better-auth's default organization creator role. It is not one of our
+ * predefined roles; legacy permissions fall back to Admin only when no custom
+ * role with this identifier exists.
+ */
+export const OWNER_ROLE_NAME = "owner";
 export const PredefinedRoleNameSchema = z.enum([
   ADMIN_ROLE_NAME,
+  PLATFORM_ADMIN_ROLE_NAME,
   EDITOR_ROLE_NAME,
   MEMBER_ROLE_NAME,
 ]);
 
 export type PredefinedRoleName = z.infer<typeof PredefinedRoleNameSchema>;
 
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+export const RoleAssignmentSchema = z
+  .string()
+  .regex(/^[a-z0-9_-]+(?:,[a-z0-9_-]+)*$/, "Select at least one role")
+  .describe("One or more organization role identifiers, separated by commas");
+// SPDX-SnippetEnd
+
+/**
+ * Display names for the predefined roles. The identifiers are snake_case for
+ * better-auth, but CSS `capitalize` only touches the first letter — which
+ * rendered `platform_admin` as "Platform_admin" in the roles UI.
+ */
+export const roleDisplayNames: Record<PredefinedRoleName, string> = {
+  admin: "Admin",
+  platform_admin: "Platform Admin",
+  editor: "Editor",
+  member: "Member",
+};
+
 export const roleDescriptions: Record<PredefinedRoleName, string> = {
   admin:
     "Full access to all resources including user management, roles, and platform settings",
+  platform_admin:
+    "Runs the platform — everything an admin can do, except reading other users' logs, reading the audit log, and impersonating users",
   editor:
-    "Full access to core resources and settings, but cannot manage users, roles, or identity providers",
+    "Full access to core resources, but cannot change organization settings or manage users, roles, or identity providers",
   member:
     "Can manage agents, tools, and chat, with read-only access to most other resources",
 };
+
+/**
+ * Human-readable label for any role identifier: the curated name for a
+ * predefined role, otherwise the custom role's identifier with separators
+ * turned back into spaces (custom roles carry their own display name, so
+ * this is the fallback for places that only have the identifier).
+ */
+export function getRoleDisplayName(role: string): string {
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  if (role.includes(","))
+    return role
+      .split(",")
+      .map((part) => getRoleDisplayName(part.trim()))
+      .join(", ");
+  // SPDX-SnippetEnd
+  if (role in roleDisplayNames) {
+    return roleDisplayNames[role as PredefinedRoleName];
+  }
+  return role.replace(/[_-]+/g, " ");
+}
 
 const AnyRoleName = PredefinedRoleNameSchema.or(z.string());
 export type AnyRoleName = z.infer<typeof AnyRoleName>;

@@ -1,17 +1,16 @@
 import {
-  createPaginatedResponseSchema,
-  PaginationQuerySchema,
+  CursorQuerySchema,
+  createCursorPaginatedResponseSchema,
   RouteId,
-} from "@shared";
+} from "@archestra/shared";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
-import { hasPermission } from "@/auth";
+import { userHasPermission } from "@/auth";
 import { McpToolCallModel } from "@/models";
 import {
   ApiError,
   constructResponseSchema,
-  createSortingQuerySchema,
-  SelectMcpToolCallSchema,
+  McpToolCallResponseSchema,
   UuidIdSchema,
 } from "@/types";
 
@@ -21,7 +20,8 @@ const mcpToolCallRoutes: FastifyPluginAsyncZod = async (fastify) => {
     {
       schema: {
         operationId: RouteId.GetMcpToolCalls,
-        description: "Get all MCP tool calls with pagination and sorting",
+        description:
+          "Get MCP tool calls in the active organization with cursor pagination, newest first. `log:read` returns rows attributed to the caller. `log:admin` includes every row in the organization. Each row's `sessionId` names the LLM proxy session that issued it, when known, and `llmToolCallId` the model's own id for the call.",
         tags: ["MCP Tool Call"],
         querystring: z
           .object({
@@ -36,24 +36,28 @@ const mcpToolCallRoutes: FastifyPluginAsyncZod = async (fastify) => {
               .datetime()
               .optional()
               .describe("Filter by end date (ISO 8601 format)"),
-            search: z
+            mcpServerName: z
+              .string()
+              .optional()
+              .describe("Filter by exact MCP server name"),
+            userId: z
               .string()
               .optional()
               .describe(
-                "Free-text search across MCP server name, tool name, and arguments (case-insensitive)",
+                "Filter by the user the call is attributed to. Ignored without `log:admin`, which already scopes the listing to the caller.",
+              ),
+            sessionId: z
+              .string()
+              .min(1)
+              .max(1024)
+              .optional()
+              .describe(
+                "Filter by the LLM proxy session that issued the call: calls recorded with that session, and tool calls whose run resolves to it.",
               ),
           })
-          .merge(PaginationQuerySchema)
-          .merge(
-            createSortingQuerySchema([
-              "createdAt",
-              "agentId",
-              "mcpServerName",
-              "method",
-            ] as const),
-          ),
+          .merge(CursorQuerySchema),
         response: constructResponseSchema(
-          createPaginatedResponseSchema(SelectMcpToolCallSchema),
+          createCursorPaginatedResponseSchema(McpToolCallResponseSchema),
         ),
       },
     },
@@ -63,49 +67,40 @@ const mcpToolCallRoutes: FastifyPluginAsyncZod = async (fastify) => {
           agentId,
           startDate,
           endDate,
-          search,
+          mcpServerName,
+          userId,
+          sessionId,
           limit,
-          offset,
-          sortBy,
-          sortDirection,
+          cursor,
         },
         user,
-        headers,
+        organizationId,
       },
       reply,
     ) => {
-      const pagination = { limit, offset };
-      const sorting = { sortBy, sortDirection };
-      const filters = {
-        startDate: startDate ? new Date(startDate) : undefined,
-        endDate: endDate ? new Date(endDate) : undefined,
-        search: search || undefined,
-      };
-
-      if (agentId) {
-        return reply.send(
-          await McpToolCallModel.getAllMcpToolCallsForAgentPaginated(
-            agentId,
-            pagination,
-            sorting,
-            undefined,
-            filters,
-          ),
-        );
-      }
-
-      const { success: isMcpServerAdmin } = await hasPermission(
-        { mcpServerInstallation: ["admin"] },
-        headers,
+      const cursorQuery = { limit, cursor };
+      // log:read scopes the view to the caller's own attributed rows;
+      // log:admin lifts it within the active organization.
+      const canSeeAllLogs = await userHasPermission(
+        user.id,
+        organizationId,
+        "log",
+        "admin",
       );
-
       return reply.send(
-        await McpToolCallModel.findAllPaginated(
-          pagination,
-          sorting,
-          user.id,
-          isMcpServerAdmin,
-          filters,
+        await McpToolCallModel.findAllCursorPaginated(
+          cursorQuery,
+          undefined,
+          undefined,
+          {
+            organizationId,
+            agentId,
+            startDate: startDate ? new Date(startDate) : undefined,
+            endDate: endDate ? new Date(endDate) : undefined,
+            mcpServerName,
+            sessionId,
+            ownUserId: canSeeAllLogs ? userId : user.id,
+          },
         ),
       );
     },
@@ -116,27 +111,35 @@ const mcpToolCallRoutes: FastifyPluginAsyncZod = async (fastify) => {
     {
       schema: {
         operationId: RouteId.GetMcpToolCall,
-        description: "Get MCP tool call by ID",
+        description:
+          "Get an MCP tool call in the active organization by ID. `log:read` permits a row attributed to the caller. `log:admin` permits any row in the organization.",
         tags: ["MCP Tool Call"],
         params: z.object({
           mcpToolCallId: UuidIdSchema,
         }),
-        response: constructResponseSchema(SelectMcpToolCallSchema),
+        response: constructResponseSchema(McpToolCallResponseSchema),
       },
     },
-    async ({ params: { mcpToolCallId }, user, headers }, reply) => {
-      const { success: isMcpServerAdmin } = await hasPermission(
-        { mcpServerInstallation: ["admin"] },
-        headers,
-      );
-
-      const mcpToolCall = await McpToolCallModel.findById(
-        mcpToolCallId,
+    async ({ params: { mcpToolCallId }, user, organizationId }, reply) => {
+      const canSeeAllLogs = await userHasPermission(
         user.id,
-        isMcpServerAdmin,
+        organizationId,
+        "log",
+        "admin",
       );
+      const mcpToolCall = await McpToolCallModel.findById({
+        id: mcpToolCallId,
+        organizationId,
+        ownUserId: canSeeAllLogs ? undefined : user.id,
+      });
 
       if (!mcpToolCall) {
+        throw new ApiError(404, "MCP tool call not found");
+      }
+
+      // Own-logs view: someone else's (or unattributed) row does not exist
+      // for this caller — 404, not 403, so existence is not disclosed.
+      if (!canSeeAllLogs && mcpToolCall.userId !== user.id) {
         throw new ApiError(404, "MCP tool call not found");
       }
 

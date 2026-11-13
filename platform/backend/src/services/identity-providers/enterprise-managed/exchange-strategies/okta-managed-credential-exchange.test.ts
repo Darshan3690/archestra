@@ -1,7 +1,7 @@
-import { OAUTH_TOKEN_TYPE } from "@shared";
-import { vi } from "vitest";
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+import { OAUTH_TOKEN_TYPE } from "@archestra/shared";
+import { describe, expect, test, vi } from "vitest";
 import type { ExternalIdentityProviderConfig } from "@/services/identity-providers/oidc";
-import { describe, expect, test } from "@/test";
 import { oktaManagedCredentialExchangeStrategy } from "./okta-managed-credential-exchange";
 
 describe("oktaManagedCredentialExchangeStrategy", () => {

@@ -29,9 +29,15 @@ import {
 } from "@sentry/opentelemetry";
 import config from "@/config";
 import logger from "@/logging";
+import { auditLogExporter } from "@/observability/audit-log-export";
 import sentryClient from "@/observability/sentry";
 import { isNoiseRoute } from "@/observability/utils";
 import { ATTR_ROUTE_CATEGORY } from "./attributes";
+import { getHttpInstrumentationConfig } from "./http-instrumentation";
+import { infrastructureSpansEnabled } from "./infrastructure-spans";
+import { PipelineSampler, PipelineSpanProcessor } from "./pipeline-sampling";
+import { SessionIdGenerator } from "./session";
+import { SessionOperationLogProcessor } from "./session-logs";
 
 const {
   api: { name, version },
@@ -42,21 +48,28 @@ const {
       verboseTracing,
       tracesSampleRate,
     },
-    sentry: { enabled: sentryEnabled },
+    sentry: { enabled: sentryEnabled, errorsOnly: sentryErrorsOnly },
   },
 } = config;
 
 /**
+ * Whether Sentry receives traces. Reporting to Archestra's default project is
+ * errors only, so tracing stays exactly as the deployment configured it.
+ */
+const sentryTracingEnabled = sentryEnabled && !sentryErrorsOnly;
+
+/**
  * Whether to enable infrastructure auto-instrumentations (HTTP, pg, DNS, net).
  *
- * When Sentry is configured, auto-instrumentations are always enabled so Sentry
- * receives full traces for internal debugging. A FilteringSpanProcessor ensures
- * only GenAI/MCP spans reach the customer-facing OTLP endpoint.
+ * When Sentry traces (an explicitly configured DSN), auto-instrumentations are
+ * always enabled so Sentry receives full traces for debugging. A
+ * FilteringSpanProcessor ensures only GenAI/MCP spans reach the
+ * customer-facing OTLP endpoint.
  *
- * When Sentry is not configured, auto-instrumentations are only enabled if
+ * Otherwise auto-instrumentations are only enabled if
  * ARCHESTRA_OTEL_VERBOSE_TRACING=true.
  */
-const enableAutoInstrumentations = sentryEnabled || verboseTracing;
+const enableAutoInstrumentations = infrastructureSpansEnabled();
 
 // Configure the OTLP exporter to send traces to the OpenTelemetry Collector
 const traceExporter = new OTLPTraceExporter(traceExporterConfig);
@@ -105,21 +118,27 @@ class AgentSpanFilterProcessor implements SpanProcessor {
 // Build the OTLP span processor — filtered when Sentry is enabled
 const otlpBatchProcessor = new BatchSpanProcessor(traceExporter);
 const otlpProcessor: SpanProcessor =
-  sentryEnabled && !verboseTracing
+  sentryTracingEnabled && !verboseTracing
     ? new AgentSpanFilterProcessor(otlpBatchProcessor)
     : otlpBatchProcessor;
 
 // Create span processors array
-const spanProcessors: SpanProcessor[] = [otlpProcessor];
+const spanProcessors: SpanProcessor[] = [
+  new PipelineSpanProcessor(otlpProcessor, "otlp"),
+  new PipelineSpanProcessor(new SessionOperationLogProcessor(), "otlp"),
+];
 
-// Add Sentry span processor if Sentry is enabled (receives ALL spans, unfiltered)
-if (sentryEnabled) {
-  spanProcessors.push(new SentrySpanProcessor());
+// Add Sentry span processor if Sentry traces (receives ALL spans, unfiltered)
+if (sentryTracingEnabled) {
+  spanProcessors.push(
+    new PipelineSpanProcessor(new SentrySpanProcessor(), "diagnostics"),
+  );
 }
 
 // Initialize the OpenTelemetry SDK with auto-instrumentations
 const sdk = new NodeSDK({
   resource,
+  idGenerator: new SessionIdGenerator(),
   /**
    * IMPORTANT: We DON'T set `traceExporter` here because we're using custom `spanProcessors`.
    *
@@ -142,7 +161,7 @@ const sdk = new NodeSDK({
      * When Sentry is enabled, it instruments Fastify automatically so we skip this.
      * https://docs.sentry.io/platforms/javascript/guides/fastify/migration/v7-to-v8/v8-opentelemetry/
      */
-    ...(!sentryEnabled && enableAutoInstrumentations
+    ...(!sentryTracingEnabled && enableAutoInstrumentations
       ? [
           new FastifyOtelInstrumentation({
             registerOnInitialization: true,
@@ -153,9 +172,10 @@ const sdk = new NodeSDK({
         ]
       : []),
     getNodeAutoInstrumentations({
-      "@opentelemetry/instrumentation-http": {
+      "@opentelemetry/instrumentation-http": getHttpInstrumentationConfig({
         enabled: enableAutoInstrumentations,
-      },
+        errorTrackingEnabled: sentryTracingEnabled,
+      }),
       "@opentelemetry/instrumentation-undici": {
         enabled: enableAutoInstrumentations,
       },
@@ -177,33 +197,44 @@ const sdk = new NodeSDK({
     }),
   ],
   /**
-   * If Sentry is configured, add Sentry components for proper integration
+   * If Sentry is configured, add Sentry components for proper integration.
+   * The context manager also keeps error-only reporting's per-request scopes
+   * apart.
    */
   contextManager: sentryEnabled ? new Sentry.SentryContextManager() : undefined,
   sampler:
-    sentryEnabled && sentryClient
-      ? new SentrySampler(sentryClient)
+    sentryTracingEnabled && sentryClient
+      ? new PipelineSampler(
+          new ParentBasedSampler({
+            root: new TraceIdRatioBasedSampler(tracesSampleRate),
+          }),
+          new SentrySampler(sentryClient),
+          verboseTracing,
+        )
       : new ParentBasedSampler({
           root: new TraceIdRatioBasedSampler(tracesSampleRate),
         }),
-  textMapPropagator: sentryEnabled ? new SentryPropagator() : undefined,
+  textMapPropagator: sentryTracingEnabled ? new SentryPropagator() : undefined,
   // Use multiple span processors to send traces to both Sentry and OTLP endpoints
   spanProcessors,
   // Export pino logs (with trace context) to the OTLP endpoint
-  logRecordProcessors: [new BatchLogRecordProcessor(logExporter)],
+  logRecordProcessors: [new BatchLogRecordProcessor({ exporter: logExporter })],
 });
 
 // Start the SDK
 sdk.start();
 
 // Log telemetry configuration details
-logger.info(
+logger.debug(
   {
     sentryEnabled,
-    tracesSampleRate: sentryEnabled ? "managed by Sentry" : tracesSampleRate,
+    sentryTracingEnabled,
+    tracesSampleRate: sentryTracingEnabled
+      ? "managed by Sentry"
+      : tracesSampleRate,
     verboseTracing,
     enableAutoInstrumentations,
-    otlpFiltering: sentryEnabled && !verboseTracing,
+    otlpFiltering: sentryTracingEnabled && !verboseTracing,
     otlpTraceEndpoint: traceExporterConfig.url,
     otlpLogEndpoint: logExporterConfig.url,
     spanProcessorCount: spanProcessors.length,
@@ -212,8 +243,8 @@ logger.info(
   "OpenTelemetry SDK initialized with trace and log pipelines",
 );
 
-// Validate Sentry + OpenTelemetry integration if Sentry is configured
-if (sentryClient) {
+// Validate Sentry + OpenTelemetry integration if Sentry traces
+if (sentryTracingEnabled && sentryClient) {
   try {
     Sentry.validateOpenTelemetrySetup();
     logger.info("Sentry + OpenTelemetry integration validated successfully");
@@ -222,11 +253,7 @@ if (sentryClient) {
   }
 }
 
-// Gracefully shutdown the SDK on process exit
-process.on("SIGTERM", () => {
-  sdk
-    .shutdown()
-    .then(() => logger.info("Tracing terminated"))
-    .catch((error) => logger.error("Error terminating tracing", error))
-    .finally(() => process.exit(0));
-});
+// The server owns signals and flushes telemetry after requests and audit writes.
+export async function shutdownTelemetry(): Promise<void> {
+  await Promise.all([sdk.shutdown(), auditLogExporter.shutdown()]);
+}

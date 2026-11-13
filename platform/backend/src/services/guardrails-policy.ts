@@ -1,0 +1,579 @@
+import { createHash } from "node:crypto";
+import {
+  ARCHESTRA_TOOL_SHORT_NAMES,
+  TOOL_ASK_USER_SHORT_NAME,
+  TOOL_RUN_COMMAND_SHORT_NAME,
+} from "@archestra/shared";
+import ipaddr from "ipaddr.js";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
+import config from "@/config";
+import { enterpriseTier } from "@/enterprise-tier";
+import logger from "@/logging";
+import GuardrailsPolicyModel from "@/models/guardrails-policy";
+import OpenAppaGithubSyncModel from "@/models/openappa-github-sync";
+import OpenAppaPolicyTestsModel from "@/models/openappa-policy-tests";
+import ToolModel from "@/models/tool";
+import { ARCHESTRA_BATTERY } from "@/openappa/archestra-audience";
+import { openappaBatteriesService } from "@/openappa/batteries";
+import { coverageVisibility } from "@/openappa/coverage";
+import {
+  addedGrants,
+  bundledEntry,
+  openappaDeclarations,
+  type PolicyResolution,
+} from "@/openappa/declarations";
+import { formatHostClientCodingAliases } from "@/openappa/host-tool-rules";
+import { withoutRepositoryIncludes } from "@/openappa/policy-text";
+import {
+  classifyRuleTarget,
+  type RuleTarget,
+  ruleTargetWarning,
+  touchedRuleNames,
+} from "@/openappa/rule-targets";
+import { CredentialAccess } from "@/services/credential-access";
+import { openappaRepositoryIncludes } from "@/services/openappa-github-access";
+import { SKILL_SANDBOX_TOOL_RESULTS_DIR } from "@/skills-sandbox/runtime-image";
+import { ApiError } from "@/types";
+import type { GuardrailsPolicy } from "@/types/guardrails-policy";
+import type { PolicyTestFile } from "@/types/openappa-policy-tests";
+
+/**
+ * A document and the revision it would replace, resolved together with the
+ * stored credential bindings applied: resolving one says nothing about the
+ * other, and every write compares the two as the host would compose them.
+ */
+async function resolveBoth(params: {
+  organizationId: string;
+  content: string;
+  previous: string;
+}): Promise<{ submitted: PolicyResolution; previous: PolicyResolution }> {
+  const { organizationId } = params;
+  const [submitted, previous] = await Promise.all([
+    openappaDeclarations.resolveWithBindings({
+      organizationId,
+      content: params.content,
+    }),
+    openappaDeclarations.resolveWithBindings({
+      organizationId,
+      content: params.previous,
+    }),
+  ]);
+  return { submitted: submitted.resolution, previous: previous.resolution };
+}
+
+/**
+ * Two entries answering one battery name: the runtime refuses to compose such a
+ * document, and the installs derived from it would collide on one row. The
+ * error names both entries so the author can see which line to drop.
+ */
+function duplicateEntryErrors(resolution: PolicyResolution): string[] {
+  const byName = new Map<string, typeof resolution.entries>();
+  for (const entry of resolution.entries)
+    if (entry.battery)
+      byName.set(entry.name, [...(byName.get(entry.name) ?? []), entry]);
+  return [...byName]
+    .filter(([, entries]) => entries.length > 1)
+    .map(
+      ([name, entries]) =>
+        `include: ${JSON.stringify(name)} is included ${entries.length} times: ${entries
+          .map((entry) => `${JSON.stringify(entry.entry)} (line ${entry.line})`)
+          .join(", ")}`,
+    );
+}
+
+/**
+ * What this deployment's recompose would make of a document that composes on
+ * its own: a battery the deployment holds back composes as empty, and the root
+ * may name what it declares. A refusal the revision being replaced already
+ * meets is a warning, so a write that leaves it as it was is never blocked by
+ * it; one the document introduces is an error. Either way the held-back
+ * batteries are named with it, since they are what the refusal is fixed by.
+ * A held-back battery the document composes without is no refusal; its status
+ * is the effective policy's to report.
+ */
+async function deploymentRefusal(params: {
+  organizationId: string;
+  content: string;
+  previous: string;
+}): Promise<{ errors: string[]; warnings: string[] }> {
+  const { organizationId, content, previous } = params;
+  const submitted = await openappaBatteriesService.composeInDeployment({
+    organizationId,
+    content,
+  });
+  if (submitted.refusal.length === 0) return { errors: [], warnings: [] };
+  const kept = new Set(
+    previous === content
+      ? submitted.refusal
+      : (
+          await openappaBatteriesService.composeInDeployment({
+            organizationId,
+            content: previous,
+          })
+        ).refusal,
+  );
+  const introduced = submitted.refusal.filter((error) => !kept.has(error));
+  const inDeployment = (line: string) => `in this deployment: ${line}`;
+  const keptNote =
+    " (the current revision is refused the same way; the runtime keeps enforcing the last composition that opened)";
+  if (introduced.length > 0)
+    return {
+      errors: [...introduced, ...submitted.heldBack].map(inDeployment),
+      warnings: [],
+    };
+  return {
+    errors: [],
+    warnings: [...submitted.refusal, ...submitted.heldBack].map(
+      (line) => inDeployment(line) + keptNote,
+    ),
+  };
+}
+
+/** The 409 a lost revision race answers with; a retrying writer waits for this one. */
+export const GUARDRAILS_REVISION_CONFLICT = "guardrails_policy_revision_stale";
+
+/** @public — the LLM annotator the default policy routes every call no rule names to; tests assert it. */
+export const UNDECLARED_TOOL_ANNOTATOR = "archestra.llm-annotator";
+
+export const guardrailsPolicyService = {
+  async get(organizationId: string): Promise<GuardrailsPolicy> {
+    requireEnabled();
+    const initial = initialPolicy();
+    return (
+      (await GuardrailsPolicyModel.findLatest(organizationId)) ?? {
+        organizationId,
+        revision: 0,
+        content: initial,
+        contentHash: hash(initial),
+        updatedAt: null,
+        updatedBy: null,
+      }
+    );
+  },
+
+  annotate() {
+    requireEnabled();
+    return {
+      version: 1 as const,
+      answer: {
+        delta: {},
+        requires: { history: [], attention: [] },
+        emits: [],
+      },
+    };
+  },
+
+  /**
+   * Check a document by composing it, the way a recompose composes it: the
+   * batteries its `include` list names are resolved and composed under it, and the
+   * result is opened in a memory runtime. Validation never installs a policy,
+   * executes a tool or contacts a declared external service.
+   *
+   * An include entry that resolves to nothing is refused only when it is new or
+   * changed against `previous` — the revision this document would replace. An
+   * unchanged entry that stopped resolving composes as an empty battery, so one
+   * stale entry never takes a whole policy down. `previous` defaults to the
+   * organization's latest revision, which is what every save is measured against.
+   *
+   * Such an entry is a warning, not an error: the document is valid and the
+   * battery it names governs nothing. A caller that reports "valid" and stops
+   * there hides a battery that stopped working, so every path that reports a
+   * validation reports its warnings too.
+   */
+  async validate(
+    text: string,
+    params: {
+      organizationId: string;
+      previous?: string;
+      /** Whose readable catalogs the added tool rules are checked against; unchecked without one. */
+      userId?: string;
+      /** Both documents already resolved, when the caller resolved them itself. */
+      resolved?: { submitted: PolicyResolution; previous: PolicyResolution };
+      /** Repository files the text includes, read from elsewhere than the accepted commit. */
+      files?: ReadonlyMap<string, string>;
+    },
+  ): Promise<{ valid: boolean; errors: string[]; warnings: string[] }> {
+    requireEnabled();
+    const { organizationId } = params;
+    // Repository files the texts include are folded in before anything reads
+    // them, as a recompose folds them; a file that cannot be read refuses the
+    // submitted text, and leaves the previous one compared without its files.
+    const submitted = await openappaRepositoryIncludes.expand({
+      organizationId,
+      content: text,
+      files: params.files,
+    });
+    if (submitted.errors.length > 0)
+      return { valid: false, errors: submitted.errors, warnings: [] };
+    const content = submitted.content;
+    const written = params.previous ?? (await this.get(organizationId)).content;
+    const folded = await openappaRepositoryIncludes.expand({
+      organizationId,
+      content: written,
+    });
+    const previous =
+      folded.errors.length > 0
+        ? withoutRepositoryIncludes(written)
+        : folded.content;
+    const resolved =
+      params.resolved ??
+      (await resolveBoth({ organizationId, content, previous }));
+    const resolution = resolved.submitted;
+    const errors = [
+      ...resolution.errors,
+      ...(await openappaDeclarations.credentialErrors(content)),
+    ];
+    const kept = new Set(resolved.previous.entries.map((entry) => entry.entry));
+    const warnings: string[] = [];
+    for (const entry of resolution.entries)
+      if (!entry.battery)
+        (kept.has(entry.entry) ? warnings : errors).push(
+          kept.has(entry.entry)
+            ? `include: ${JSON.stringify(entry.entry)} resolves to no battery and governs nothing`
+            : `include: no battery answers ${JSON.stringify(entry.entry)}`,
+        );
+    errors.push(...duplicateEntryErrors(resolution));
+    if (errors.length === 0) {
+      const composed = await openappaDeclarations.composeForCheck({
+        root: content,
+        resolution,
+        deployed: await openappaBatteriesService.deployedBatteries({
+          organizationId,
+          resolution,
+        }),
+      });
+      if ((composed.content ?? null) === null) errors.push(...composed.errors);
+      else {
+        const deployed = await deploymentRefusal({
+          organizationId,
+          content,
+          previous,
+        });
+        errors.push(...deployed.errors);
+        warnings.push(...deployed.warnings);
+      }
+    }
+    if (errors.length === 0 && params.userId)
+      for (const target of await this.touchedRuleTargets({
+        organizationId,
+        userId: params.userId,
+        content,
+        previous,
+      })) {
+        const warning = ruleTargetWarning(target);
+        if (warning) warnings.push(warning);
+      }
+    return { valid: errors.length === 0, errors, warnings };
+  },
+
+  /**
+   * What the root rules `content` adds or changes against `previous` point at,
+   * checked against the MCP tools of the catalogs the caller can read, so the
+   * answer never reveals a tool the caller could not otherwise see.
+   */
+  async touchedRuleTargets(params: {
+    organizationId: string;
+    userId: string;
+    content: string;
+    previous: string;
+  }): Promise<RuleTarget[]> {
+    const names = touchedRuleNames(params.content, params.previous);
+    if (names.length === 0) return [];
+    const { visibleCatalogIds } = await coverageVisibility(
+      params.userId,
+      params.organizationId,
+    );
+    const { tools } = await ToolModel.findCoverageInventory(
+      params.organizationId,
+      { includeAppCatalogs: true, catalogIds: visibleCatalogIds },
+    );
+    // Built-in tools exist in code even when a feature flag keeps one unseeded.
+    const inventory = new Set([
+      ...tools.map((tool) => tool.name),
+      ...ARCHESTRA_TOOL_SHORT_NAMES.map((name) =>
+        archestraMcpBranding.getToolName(name),
+      ),
+    ]);
+    return names.map((name) => classifyRuleTarget(name, inventory));
+  },
+
+  /**
+   * Save a new revision of the organization's policy.
+   *
+   * Every user-driven write of the text passes here, so this is where a credential
+   * grant — an organization credential's value reaching a battery's helper sandbox,
+   * or a root external or profile that names it as its `token_env` — is authorized. A grant the submitted text adds, or whose key it changes
+   * against the latest revision, takes `credential:update`; removing one takes
+   * nothing beyond the route's own permission. The diff runs against the latest
+   * revision, so a stale `expectedRevision` still ends in the save's own conflict.
+   */
+  async update(params: {
+    organizationId: string;
+    userId: string;
+    content: string;
+    expectedRevision: number;
+    validation?: { expectedVersion: string; files?: PolicyTestFile[] };
+  }) {
+    requireEnabled();
+    const { organizationId, userId, content } = params;
+    if ((await OpenAppaGithubSyncModel.find(organizationId))?.interval)
+      throw new ApiError(409, "Stop Git sync before editing this policy.");
+    const latest = await this.get(organizationId);
+    const resolved = await resolveBoth({
+      organizationId,
+      content,
+      previous: latest.content,
+    });
+    await requireGrantPermission({
+      organizationId,
+      userId,
+      granted: addedGrants(
+        openappaDeclarations.grants(resolved.previous),
+        openappaDeclarations.grants(resolved.submitted),
+      ),
+    });
+    const validation = await this.validate(content, {
+      organizationId,
+      userId,
+      previous: latest.content,
+      resolved,
+    });
+    if (!validation.valid)
+      throw new ApiError(400, validation.errors.join("\n"));
+    const saved = await GuardrailsPolicyModel.save({
+      organizationId,
+      updatedBy: userId,
+      content,
+      contentHash: hash(content),
+      expectedRevision: params.expectedRevision,
+      validation: params.validation,
+    });
+    if (!saved)
+      throw new ApiError(
+        409,
+        "This policy changed since you opened it. Reload the latest revision before saving.",
+        GUARDRAILS_REVISION_CONFLICT,
+      );
+    if (latest.revision === 0 || latest.contentHash !== saved.contentHash) {
+      try {
+        await OpenAppaPolicyTestsModel.enqueuePolicyValidation(
+          organizationId,
+          saved.contentHash,
+        );
+      } catch {
+        logger.warn(
+          { organizationId },
+          "OpenAPPA could not queue informational validation after a policy change",
+        );
+      }
+    }
+    return { ...saved, warnings: validation.warnings };
+  },
+};
+
+/**
+ * A write that adds or rekeys a credential grant hands that credential's value
+ * to helper code, so it takes `use` on the credential. A key with no credential
+ * behind it yet would hand over whichever one is created under it later, so it
+ * takes `use` on every credential.
+ */
+export async function requireGrantPermission(params: {
+  organizationId: string;
+  userId: string;
+  granted: ReturnType<typeof addedGrants>;
+}): Promise<void> {
+  const { organizationId, userId, granted } = params;
+  const message = `Use access to the credential is required: this policy hands ${granted
+    .map((grant) => `${grant.variable} to ${grant.battery}`)
+    .join(", ")}`;
+  for (const key of new Set(granted.map((grant) => grant.key)))
+    await CredentialAccess.requireUseOfKey({
+      organizationId,
+      userId,
+      key,
+      message,
+    });
+}
+
+function requireEnabled() {
+  if (!enterpriseTier.isOpenappaActive())
+    throw new ApiError(404, "Guardrails v2 is disabled");
+}
+const CODING_BATTERY = "coding";
+const CLAUDE_CODE_BATTERY = "claude-code";
+function hash(content: string) {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+/**
+ * The deployment's statement that its own host is first-party. A frontend URL
+ * that is not HTTP(S), names no host, or names a loopback or unspecified address
+ * names no host the organization runs, so there is none.
+ */
+export function deploymentHint(): string | null {
+  const url = URL.canParse(config.frontendBaseUrl)
+    ? new URL(config.frontendBaseUrl)
+    : null;
+  if (
+    url === null ||
+    (url.protocol !== "http:" && url.protocol !== "https:") ||
+    url.hostname === "" ||
+    isLocalHostname(url.hostname)
+  )
+    return null;
+  return `\`${url.host}\` is this organization's own platform deployment, the one these policies run on: a call to it, such as fetching a link one of its tools returned, reaches the organization's own platform.`;
+}
+
+function deploymentHintLine(): string {
+  const hint = deploymentHint();
+  return hint === null ? "" : `hint = ${JSON.stringify(hint)}`;
+}
+
+function isLocalHostname(hostname: string): boolean {
+  const name = hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (name === "localhost" || name.endsWith(".localhost")) return true;
+  if (!ipaddr.isValid(name)) return false;
+  const range = ipaddr.process(name).range();
+  return range === "loopback" || range === "unspecified";
+}
+
+/**
+ * The text an organization that never saved a revision is read as. It installs
+ * the bundled `archestra` battery over the built-in tools, under the name they
+ * carry in this deployment, and the bundled `coding` battery over the client
+ * built-ins this host derives as `host/archestra/<name>`: `claude-code` maps it
+ * onto Claude Code's tools, and the root maps it onto the other clients'. It
+ * reads the organization's members as `internal`, and has the organization's
+ * default model label each sandbox command, each shell command the client
+ * batteries route to a model, and each tool no rule names.
+ */
+export function initialPolicy(): string {
+  return `include = [
+  "${bundledEntry(ARCHESTRA_BATTERY)}",
+  "${bundledEntry(CODING_BATTERY)}",
+  "${bundledEntry(CLAUDE_CODE_BATTERY)}",
+]
+
+[aliases.mcp]
+${ARCHESTRA_BATTERY} = ["${archestraMcpBranding.serverName}"]
+
+# The client battery's rules name Claude Code's tools; here they govern the
+# built-ins of whichever client runs through this deployment.
+[aliases.host]
+${CLAUDE_CODE_BATTERY} = ["archestra"]
+
+# The coding battery's tools under Codex's, OpenCode's, Claude Desktop
+# Cowork's, Kimi Code's, Copilot CLI's and Grok's spellings. Kimi Code shares
+# Claude Code's other tool names; the proxy also evaluates its Read, Write and
+# Edit \`path\` and Copilot CLI's \`view\` and \`create\` \`path\` as \`file_path\`, and
+# Copilot CLI's lowercase \`edit\` \`path\` as \`filePath\`.
+${formatHostClientCodingAliases()}
+
+[policy]
+version = 2
+
+[policy.audience]
+internal = ["${ARCHESTRA_BATTERY}:members"]
+
+[policy.deployment]
+context_control = true
+${deploymentHintLine()}
+
+# Lets an agent hand a risky read to a subagent. The subagent must reply in
+# the strict JSON shape the agent asked for, so injected instructions and
+# extra data can't slip back. A reply that fits gets the agent's trust.
+# Built into the runtime.
+[[policy.sanitizer]]
+name = "attest-schema"
+on = ["tool_output"]
+
+[policy.sanitizer.permits]
+trust = { from = "suspicious", to = "trusted" }
+
+# Labels each sandbox command (run_command) with the annotator model,
+# through the LLM proxy.
+[[policy.annotator]]
+name = "archestra.run-command"
+builtin = "archestra"
+hint = "run_command runs a shell command in this conversation's sandbox, a scratch workspace. For a command that only lists, reads or changes files in the sandbox, with no network access, leave delta.trust and delta.audience null. That includes ${SKILL_SANDBOX_TOOL_RESULTS_DIR}, the results of this conversation's earlier tool calls, labelled when those calls ran. The exception is a file that visibly holds credentials or secrets."
+ranks = ["suspicious", "trusted"]
+marks = []
+effects = []
+
+[[policy.tool]]
+name = "${archestraMcpBranding.getToolName(TOOL_RUN_COMMAND_SHORT_NAME)}"
+annotator = "archestra.run-command"
+
+# The client batteries' shell and Monitor annotators, with the batteries' own
+# mandate, asked of the annotator model instead of a local claude process.
+[[policy.annotator]]
+name = "${CLAUDE_CODE_BATTERY}.bash-repository-requirements"
+builtin = "archestra"
+
+[[policy.annotator]]
+name = "${CLAUDE_CODE_BATTERY}.bash-requirements"
+builtin = "archestra"
+
+[[policy.annotator]]
+name = "${CLAUDE_CODE_BATTERY}.monitor-requirements"
+builtin = "archestra"
+
+# Labels each call no rule names with the OpenAPPA annotator model (the
+# organization's default model unless Guardrails settings pick another).
+[[policy.annotator]]
+name = "${UNDECLARED_TOOL_ANNOTATOR}"
+builtin = "archestra"
+ranks = ["suspicious", "trusted"]
+audiences = ["self", "internal"]
+marks = []
+effects = []
+hint = "Routine requester-local file and shell operations, diagnostics, edits, builds, tests, dependency installs and client setup need no audience or trust requirement when they neither publish data nor destroy anything. A network fetch or an install alone discloses no trajectory data."
+
+# Questions carry no data: they keep an empty label even if the catch-all
+# below is made stricter. search_tools gets the same from the archestra battery.
+[[policy.tool]]
+name = "${archestraMcpBranding.getToolName(TOOL_ASK_USER_SHORT_NAME)}"
+delta = {}
+
+# Starting a subagent opens a child trajectory under this deployment's context
+# control; what the subagent hands back is checked when it returns.
+[[policy.tool]]
+name = "host/archestra/Agent"
+delta = {}
+
+# \`Task\` is the earlier name of \`Agent\`.
+[[policy.tool]]
+name = "host/archestra/Task"
+delta = {}
+
+# Claude Desktop Code tab's local turn UI tools (the desktop equivalents of
+# EndConversation and TodoWrite) render inside the session's own window.
+[[policy.tool]]
+name = "host/archestra/mcp__ccd_turn__wrap_up"
+delta = {}
+
+[[policy.tool]]
+name = "host/archestra/mcp__ccd_turn__update_plan"
+delta = {}
+
+[[policy.tool]]
+name = "*"
+annotator = "${UNDECLARED_TOOL_ANNOTATOR}"
+
+# Review one exact call for any attention mark, trust or audience gap.
+[[policy.authority]]
+name = "human-approval"
+hint = "Ask the person running this session to approve this exact call."
+
+[policy.authority.permits]
+trust_below = "trusted"
+audience_missing = ["public"]
+attention = ["*"]
+
+[externals]
+timeout_ms = 20000
+
+[externals.authorities.human-approval]
+builtin = "hitl"
+`;
+}

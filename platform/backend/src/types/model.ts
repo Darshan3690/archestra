@@ -1,20 +1,112 @@
 import {
+  MAX_CONFIGURABLE_NUM_CTX,
+  MAX_CUSTOM_MODEL_TOKEN_LIMIT,
+  MAX_STOP_SEQUENCE_LENGTH,
+  MAX_STOP_SEQUENCES,
   ModelInputModalitySchema,
   ModelOutputModalitySchema,
+  ProviderEndpointSchema,
   SupportedEmbeddingDimensionsSchema,
   SupportedProvidersSchema,
-} from "@shared";
+} from "@archestra/shared";
+import {
+  isValidModelPrice,
+  normalizeModelPrice,
+} from "@archestra/shared/model-price";
 import {
   createInsertSchema,
   createSelectSchema,
   createUpdateSchema,
 } from "drizzle-zod";
 import { z } from "zod";
-import { schema } from "@/database";
+import { schema } from "@/database/schema";
+import { LabelWithDetailsSchema } from "./label";
+import { RetiredSharingUpdateFieldSchema } from "./visibility";
 
-export type { ModelInputModality, ModelOutputModality } from "@shared";
-// Re-export modality schemas and types from @shared for convenience
-export { ModelInputModalitySchema, ModelOutputModalitySchema } from "@shared";
+export type {
+  ModelInputModality,
+  ModelOutputModality,
+} from "@archestra/shared";
+// Re-export modality schemas and types from @archestra/shared for convenience
+export {
+  ModelInputModalitySchema,
+  ModelOutputModalitySchema,
+} from "@archestra/shared";
+
+/**
+ * Ollama model default generation parameters, pulled from `/api/show`.
+ * A free-form key/value map (e.g. num_ctx, temperature, stop); repeated keys
+ * such as `stop` are collected into an array. Stored for display only — nothing
+ * applies these at request time.
+ */
+const ModelDefaultParametersSchema = z.record(
+  z.string(),
+  z.union([z.string(), z.number(), z.array(z.string())]),
+);
+export type ModelDefaultParameters = z.infer<
+  typeof ModelDefaultParametersSchema
+>;
+
+/**
+ * Thinking-effort levels for Ollama's native `think` parameter.
+ * `none` → `think: false`; the rest map to the native string levels.
+ */
+export const ReasoningEffortSchema = z.enum(["none", "low", "medium", "high"]);
+export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
+
+/**
+ * Re-exported from `@archestra/shared` so backend callers keep importing these
+ * from the module that owns the schema they bound. The frontend form imports
+ * the same constants directly to mirror these rules.
+ */
+export type {
+  MAX_CONFIGURABLE_NUM_CTX,
+  MAX_STOP_SEQUENCE_LENGTH,
+  MAX_STOP_SEQUENCES,
+};
+
+/**
+ * Admin-configured, per-model generation parameters that Archestra SENDS on
+ * every native Ollama (`ollama-native`) chat turn (unlike `defaultParameters`,
+ * which is display-only). Each field is optional — an omitted field inherits
+ * Ollama's own Modelfile/server default. Precedence at request time is:
+ * request body > these configured values > omitted.
+ *
+ * Only `ollama-native` models accept these — the update route rejects them for
+ * every other provider, since nothing else ever sends them and a stray value
+ * would still redefine the displayed context window (see
+ * `ModelModel.resolveEffectiveContextLength`).
+ */
+export const ConfiguredParametersSchema = z.object({
+  temperature: z.number().min(0).optional(),
+  top_p: z.number().min(0).max(1).optional(),
+  top_k: z.number().int().min(0).optional(),
+  repeat_penalty: z.number().min(0).optional(),
+  seed: z.number().int().optional(),
+  /**
+   * Bounded on both axes: this row is world-readable to anyone with
+   * `llmModel:read` and is serialized into every native turn, so an unbounded
+   * array would be a cheap way to bloat both. Ollama only ever uses a handful
+   * of stop sequences.
+   */
+  stop: z
+    .array(z.string().max(MAX_STOP_SEQUENCE_LENGTH))
+    .max(MAX_STOP_SEQUENCES)
+    .optional(),
+  /**
+   * Upper bound is a sanity backstop. The update route additionally rejects
+   * anything above the model's own architectural `contextLength` — but only
+   * when that is known: a proxy-discovered row can have a null `contextLength`,
+   * and then this bound is the only ceiling. An unbounded value here would make
+   * Ollama allocate (or refuse) an absurd KV cache while Archestra kept
+   * displaying the inflated window.
+   */
+  num_ctx: z.number().int().min(1).max(MAX_CONFIGURABLE_NUM_CTX).optional(),
+  /** `-1` = generate until the context fills, `-2` = fill the context. */
+  num_predict: z.number().int().min(-2).optional(),
+  reasoning_effort: ReasoningEffortSchema.optional(),
+});
+export type ConfiguredParameters = z.infer<typeof ConfiguredParametersSchema>;
 
 /**
  * Fields to extend for drizzle-zod schema generation.
@@ -24,6 +116,8 @@ const fieldsToExtend = {
   embeddingDimensions: SupportedEmbeddingDimensionsSchema.nullable(),
   inputModalities: z.array(ModelInputModalitySchema).nullable(),
   outputModalities: z.array(ModelOutputModalitySchema).nullable(),
+  defaultParameters: ModelDefaultParametersSchema.nullable(),
+  configuredParameters: ConfiguredParametersSchema.nullable(),
 };
 
 /**
@@ -47,6 +141,8 @@ export const CreateModelSchema = InsertModelSchema.omit({
   updatedAt: true,
 }).extend({
   embeddingDimensions: SupportedEmbeddingDimensionsSchema.nullable().optional(),
+  defaultParameters: ModelDefaultParametersSchema.nullable().optional(),
+  configuredParameters: ConfiguredParametersSchema.nullable().optional(),
 });
 
 /**
@@ -58,9 +154,42 @@ export type CreateModel = z.infer<typeof CreateModelSchema>;
 
 /**
  * Price source indicates where the effective price comes from.
+ *
+ * - `custom`: admin-set override.
+ * - `models_dev`: synced from the models.dev registry.
+ * - `provider`: published by the selected provider instance.
+ * - `derived_multiplier`: cache price derived from the input price via a provider
+ *   multiplier (used only for cache prices when the registry omits them).
+ * - `default`: estimated flat fallback — a guess, surfaced as such in the UI.
  */
-export const PriceSourceSchema = z.enum(["custom", "models_dev", "default"]);
+export const PriceSourceSchema = z.enum([
+  "custom",
+  "models_dev",
+  "provider",
+  "aws",
+  "derived_multiplier",
+  "default",
+]);
 export type PriceSource = z.infer<typeof PriceSourceSchema>;
+
+const MediaRateSchema = z.object({
+  /** What the rate meters: text, image or audio, or text and image together. */
+  kind: z.enum(["text", "image", "audio", "text_and_image"]),
+  usd: z.number(),
+});
+
+/**
+ * A media model's rates as its vendor publishes them: per million tokens (image
+ * and audio tokens priced apart from text), per million characters of speech
+ * input, or per minute of transcribed audio. These are the rates the proxy
+ * charges media calls by; the per-token chat prices do not apply to them.
+ */
+export const MediaPricingSchema = z.object({
+  per: z.enum(["million_tokens", "million_characters", "minute"]),
+  input: z.array(MediaRateSchema),
+  output: z.array(MediaRateSchema),
+});
+export type MediaPricing = z.infer<typeof MediaPricingSchema>;
 
 /**
  * Model capabilities for API responses.
@@ -71,21 +200,63 @@ export const ModelCapabilitiesSchema = SelectModelSchema.pick({
   inputModalities: true,
   outputModalities: true,
   supportsToolCalling: true,
+  supportsReasoningEffort: true,
 }).extend({
+  /** Provider-declared OpenAI-compatible surfaces, when the catalog provides them. */
+  supportedEndpoints: z.array(ProviderEndpointSchema).nullable().optional(),
+  /**
+   * Endpoint-scoped agent-suitability verdict from the `api_key_models` link
+   * (not a `models` column). Tri-state: `false` is evidence-backed, `true`
+   * means the evidence says fine, null means no evidence. Only `false` is
+   * ever surfaced. Aggregated pessimistically when a listing spans several
+   * keys.
+   */
+  recommendedForAgents: z.boolean().nullable(),
   /** Price per million tokens for input (computed from per-token price) */
   pricePerMillionInput: z.string().nullable(),
   /** Price per million tokens for output (computed from per-token price) */
   pricePerMillionOutput: z.string().nullable(),
   /** Whether the price is a custom admin-set override */
   isCustomPrice: z.boolean(),
-  /** Source of the effective price */
+  /** Source of the effective input/output price */
   priceSource: PriceSourceSchema,
+  /** Price per million cache-read tokens, or null when not priced */
+  pricePerMillionCacheRead: z.string().nullable(),
+  /** Price per million cache-write tokens (default TTL), or null when not priced */
+  pricePerMillionCacheWrite: z.string().nullable(),
+  /** Source of the effective cache price (null when cache is unpriced) */
+  cachePriceSource: PriceSourceSchema.nullable(),
+  /** Media rates, for an image, speech or transcription model; else null */
+  mediaPricing: MediaPricingSchema.nullable(),
 });
 export type ModelCapabilities = z.infer<typeof ModelCapabilitiesSchema>;
 
 /**
- * Schema for updating model details (pricing + modalities) from the edit dialog.
+ * An admin-set token limit: a whole number of tokens, or `null` to clear the
+ * override. The upper bound is only a runaway-typo guard — these overrides
+ * exist precisely because the provider published no limit to check against.
  */
+const CustomModelTokenLimitSchema = z
+  .number()
+  .int("Must be a whole number of tokens")
+  .min(1, "Must be 1 or greater")
+  .max(MAX_CUSTOM_MODEL_TOKEN_LIMIT)
+  .nullable()
+  .optional();
+
+/** Canonicalize validated prices before passing them to PostgreSQL. */
+const CustomModelPriceSchema = z
+  .string()
+  .refine(
+    isValidModelPrice,
+    "Prices must be decimal numbers between 0 and 99999999.99",
+  )
+  .transform(normalizeModelPrice)
+  .pipe(z.string())
+  .nullable()
+  .optional();
+
+/** Schema for updating model details (pricing + modalities) from the edit dialog. */
 export const PatchModelBodySchema = createUpdateSchema(
   schema.modelsTable,
   fieldsToExtend,
@@ -93,23 +264,64 @@ export const PatchModelBodySchema = createUpdateSchema(
   .pick({
     customPricePerMillionInput: true,
     customPricePerMillionOutput: true,
+    customPricePerMillionCacheRead: true,
+    customPricePerMillionCacheWrite: true,
+    longContextThreshold: true,
+    longContextPricePerMillionInput: true,
+    longContextPricePerMillionOutput: true,
+    longContextPricePerMillionCacheRead: true,
+    longContextPricePerMillionCacheWrite: true,
+    customContextLength: true,
+    customOutputLength: true,
     ignored: true,
     embeddingDimensions: true,
     inputModalities: true,
     outputModalities: true,
+    configuredParameters: true,
   })
   .extend({
-    customPricePerMillionInput: z.string().nullable().optional(),
-    customPricePerMillionOutput: z.string().nullable().optional(),
+    customPricePerMillionInput: CustomModelPriceSchema,
+    customPricePerMillionOutput: CustomModelPriceSchema,
+    customPricePerMillionCacheRead: CustomModelPriceSchema,
+    customPricePerMillionCacheWrite: CustomModelPriceSchema,
+    longContextThreshold: z
+      .number()
+      .int("Must be a whole number of tokens")
+      .min(1, "Must be 1 or greater")
+      .max(MAX_CUSTOM_MODEL_TOKEN_LIMIT)
+      .nullable()
+      .optional(),
+    longContextPricePerMillionInput: CustomModelPriceSchema,
+    longContextPricePerMillionOutput: CustomModelPriceSchema,
+    longContextPricePerMillionCacheRead: CustomModelPriceSchema,
+    longContextPricePerMillionCacheWrite: CustomModelPriceSchema,
+    /**
+     * Admin-set context window / max output tokens, overriding whatever the
+     * provider reported (including nothing at all). `null` clears the override
+     * and falls back to the synced value; omitted leaves it untouched.
+     */
+    customContextLength: CustomModelTokenLimitSchema,
+    customOutputLength: CustomModelTokenLimitSchema,
+    teamIds: RetiredSharingUpdateFieldSchema,
     ignored: z.boolean().optional(),
     embeddingDimensions:
       SupportedEmbeddingDimensionsSchema.nullable().optional(),
     inputModalities: z
       .array(ModelInputModalitySchema)
       .min(1, "At least one input modality is required")
+      .refine(
+        (modalities) => new Set(modalities).size === modalities.length,
+        "Input modalities must be unique",
+      )
       .nullable()
       .optional(),
     outputModalities: z.array(ModelOutputModalitySchema).nullable().optional(),
+    // Per-model generation parameters sent on every native Ollama chat turn.
+    configuredParameters: ConfiguredParametersSchema.nullable().optional(),
+    // Key/value labels. Omitted leaves existing labels untouched; `[]` clears
+    // them. Deployment-wide like the row itself — see `labels` on the read
+    // schema below.
+    labels: z.array(LabelWithDetailsSchema).optional(),
   })
   .refine(
     (data) => {
@@ -148,23 +360,42 @@ export const PatchModelBodySchema = createUpdateSchema(
   )
   .refine(
     (data) => {
-      if (
-        data.customPricePerMillionInput != null &&
-        data.customPricePerMillionInput !== undefined
-      ) {
-        const price = parseFloat(data.customPricePerMillionInput);
-        if (Number.isNaN(price) || price < 0) return false;
-      }
-      if (
-        data.customPricePerMillionOutput != null &&
-        data.customPricePerMillionOutput !== undefined
-      ) {
-        const price = parseFloat(data.customPricePerMillionOutput);
-        if (Number.isNaN(price) || price < 0) return false;
+      // Cache read/write overrides must be set together or both null.
+      const readProvided = data.customPricePerMillionCacheRead !== undefined;
+      const writeProvided = data.customPricePerMillionCacheWrite !== undefined;
+      if (readProvided !== writeProvided) return false;
+      if (readProvided && writeProvided) {
+        const readSet = data.customPricePerMillionCacheRead !== null;
+        const writeSet = data.customPricePerMillionCacheWrite !== null;
+        if (readSet !== writeSet) return false;
       }
       return true;
     },
-    { message: "Prices must be non-negative numbers" },
+    {
+      message:
+        "Both custom cache prices must be set together or both must be null",
+    },
+  )
+  .refine(
+    (data) => {
+      // The threshold and its four prices are written together, all set or all null.
+      const fields = [
+        data.longContextThreshold,
+        data.longContextPricePerMillionInput,
+        data.longContextPricePerMillionOutput,
+        data.longContextPricePerMillionCacheRead,
+        data.longContextPricePerMillionCacheWrite,
+      ];
+      return (
+        fields.every((value) => value === undefined) ||
+        fields.every((value) => value === null) ||
+        fields.every((value) => value != null)
+      );
+    },
+    {
+      message:
+        "Long-context threshold and all four long-context prices must be set together or all be null",
+    },
   );
 export type PatchModelBody = z.infer<typeof PatchModelBodySchema>;
 
@@ -181,22 +412,84 @@ export const LinkedApiKeySchema = z.object({
 export type LinkedApiKey = z.infer<typeof LinkedApiKeySchema>;
 
 /**
+ * Schema for a team a model is restricted to (minimal info for display)
+ */
+export const ModelTeamDetailSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+});
+export type ModelTeamDetail = z.infer<typeof ModelTeamDetailSchema>;
+
+/**
  * Schema for model with linked API keys (for settings page display)
  */
 export const ModelWithApiKeysSchema = SelectModelSchema.extend({
-  /** Whether this model is marked as the fastest (lowest latency) for any linked API key */
-  isFastest: z.boolean(),
   /** Whether this model is marked as the best (highest quality) for any linked API key */
   isBest: z.boolean(),
   /** API keys that provide access to this model */
   apiKeys: z.array(LinkedApiKeySchema),
+  /** Teams this model is restricted to (empty = available to everyone) */
+  teams: z.array(ModelTeamDetailSchema),
+  // People the model is shared with individually — the finer-grained peer of a
+  // team restriction, so the form can show who it reaches by name.
+  users: z.array(
+    z.object({ id: z.string(), name: z.string(), email: z.string() }),
+  ),
+  /**
+   * Labels attached to this model. The model catalog is deployment-wide (it
+   * has no organization column), so its labels are shared for the same reason
+   * its rows are.
+   */
+  labels: z.array(LabelWithDetailsSchema),
   /** Price per million tokens for input (computed from raw/custom pricing) */
   pricePerMillionInput: z.string().nullable(),
   /** Price per million tokens for output (computed from raw/custom pricing) */
   pricePerMillionOutput: z.string().nullable(),
   /** Whether the effective price is a custom admin-set override */
   isCustomPrice: z.boolean(),
-  /** Source of the effective price */
+  /** Source of the effective input/output price */
   priceSource: PriceSourceSchema,
+  /** Price per million cache-read tokens, or null when not priced */
+  pricePerMillionCacheRead: z.string().nullable(),
+  /** Price per million cache-write tokens (default TTL), or null when not priced */
+  pricePerMillionCacheWrite: z.string().nullable(),
+  /** Source of the effective cache price (null when cache is unpriced) */
+  cachePriceSource: PriceSourceSchema.nullable(),
+  /** Media rates, for an image, speech or transcription model; else null */
+  mediaPricing: MediaPricingSchema.nullable(),
+  /** True when the provider charges nothing for this model (both raw prices are zero). */
+  isFree: z.boolean(),
+  /**
+   * Context window the model will actually enforce, from
+   * `ModelModel.resolveEffectiveContextLength`. **Use this for display.**
+   *
+   * The inherited `contextLength` is the *architectural* window and stays the
+   * ceiling that `num_ctx` is validated against, so it must not be overwritten
+   * with this value — doing so would cap `num_ctx` at an Ollama Modelfile's
+   * default and make raising the window impossible.
+   */
+  effectiveContextLength: z.number().nullable(),
+  /**
+   * Whether the platform's embedding client can send images to this model.
+   * `null` when the client imposes no per-model limit (Gemini). Only meaningful
+   * for embedding models; the edit dialog uses it to disable the image input
+   * modality, and the update route rejects what the dialog disables.
+   */
+  embeddingClientImageCapable: z.boolean().nullable(),
 });
 export type ModelWithApiKeys = z.infer<typeof ModelWithApiKeysSchema>;
+
+/**
+ * A model as a picker shows it: name, provider and price. The slim form of
+ * {@link ModelWithApiKeysSchema}.
+ */
+export const LlmModelOptionSchema = ModelWithApiKeysSchema.pick({
+  id: true,
+  modelId: true,
+  provider: true,
+  description: true,
+  pricePerMillionInput: true,
+  pricePerMillionOutput: true,
+  isFree: true,
+  isBest: true,
+});

@@ -30,15 +30,20 @@ import { ChatCompletionUsageSchema, FinishReasonSchema } from "../openai/api";
 const CerebrasChoiceSchema = z
   .object({
     finish_reason: FinishReasonSchema,
-    index: z.number(),
-    logprobs: z.any().nullable(),
+    // Some OpenAI-compatible upstreams omit `index` on choices; without
+    // optional() the response fails serialization (500).
+    index: z.number().optional(),
+    // Log probabilities may be omitted when the upstream did not request them.
+    logprobs: z.any().nullable().optional(),
     message: z
       .object({
         // Cerebras: content is optional when tool_calls are present
         content: z.string().nullable().optional(),
         refusal: z.string().nullable().optional(),
         role: z.enum(["assistant"]),
-        annotations: z.array(z.any()).optional(),
+        // Some OpenAI-compatible upstreams return `annotations: null` instead of
+        // omitting it; without nullable() the response fails serialization (500).
+        annotations: z.array(z.any()).nullable().optional(),
         audio: z.any().nullable().optional(),
         function_call: z
           .object({
@@ -47,6 +52,10 @@ const CerebrasChoiceSchema = z
           })
           .nullable()
           .optional(),
+        // DeepSeek-style reasoning models return thinking in `reasoning_content`
+        // and require it passed back on tool-call turns; response serialization
+        // must preserve it.
+        reasoning_content: z.string().nullable().optional(),
         tool_calls: z.array(ToolCallSchema).optional(),
       })
       .describe(

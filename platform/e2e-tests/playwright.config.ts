@@ -1,3 +1,7 @@
+// NOTE: nothing under e2e-tests/ is part of the platform Docker image — CI's
+// image-reuse key deliberately excludes this directory, so e2e-only changes
+// reuse the previously built image instead of rebuilding it (see the
+// "Resolve platform image reuse" step in .github/workflows/platform-e2e-tests.yml).
 import { defineConfig, devices } from "@playwright/test";
 import { adminAuthFile, IS_CI } from "./consts";
 
@@ -8,13 +12,21 @@ const projectNames = {
   setupAdmin: "setup-admin",
   setupUsers: "setup-users",
   setupTeams: "setup-teams",
-  credentialsWithVault: "credentials-with-vault",
   quickstart: "quickstart",
+  quickstartRecovery: "quickstart-recovery",
   chromium: "chromium",
   firefox: "firefox",
   webkit: "webkit",
   identityProviders: "identity-providers",
+  identityProvidersSaml: "identity-providers-saml",
   api: "api",
+  apiK8s: "api-k8s",
+  openappa: "openappa",
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  apiK8sHibernation: "api-k8s-hibernation",
+  // SPDX-SnippetEnd
   vaultK8s: "vault-k8s",
 };
 
@@ -28,50 +40,105 @@ const testPatterns = {
   teamsSetup: /auth\.teams\.setup\.ts/,
   quickstart: "**/quickstart.spec.ts",
   // Special test files that need isolated execution
-  credentialsWithVault: "**/credentials-with-vault.ee.spec.ts",
   identityProviders: "**/identity-providers.ee.spec.ts",
   // Vault K8s startup test — runs in a dedicated CI job with Vault K8s auth
   vaultK8s: "**/vault-k8s-startup.spec.ts",
   llmProxy: "**/llm-proxy/**/*.spec.ts",
+  // OpenAPPA specs need a stack booted with ARCHESTRA_BETA=true,
+  // which the ordinary lite stack is deliberately NOT: with it on the proxy
+  // rejects any tool-declaring request that omits the two APPA tools, which
+  // other lite specs rely on. So these live in their own project, run by
+  // CI against their own stack (in the quickstart job), and must stay out of every
+  // other project's testMatch.
+  openappa: "**/openappa/**/*.spec.ts",
 };
 
 const uiTestMatch = [
+  "**/agent-creation-footer.spec.ts",
+  "**/agent-runtime-create.spec.ts",
+  "**/resource-creation-footer.spec.ts",
+  "**/agent-version-history.spec.ts",
   "**/agents.spec.ts",
+  "**/apps.spec.ts",
+  "**/audit-log.spec.ts",
   "**/auth-origin.spec.ts",
   "**/auth-redirect.spec.ts",
-  "**/auth.spec.ts",
-  "**/chat-auth-required.spec.ts",
-  "**/chat-localstorage.spec.ts",
+  "**/chat-browser-setup.spec.ts",
+  "**/chat-message-queue.spec.ts",
   "**/chat-permissions.spec.ts",
+  "**/chat-refresh.spec.ts",
   "**/chat.spec.ts",
-  "**/credentials-with-vault.ee.spec.ts",
+  "**/context-window.spec.ts",
+  "**/connection.spec.ts",
+  "**/cost-chart-legend-mobile.spec.ts",
   "**/dynamic-credentials.spec.ts",
   "**/identity-providers.ee.spec.ts",
   "**/invitation.spec.ts",
-  "**/llm-provider-api-keys.spec.ts",
+  "**/list-return-url.spec.ts",
+  "**/llm-logs-slack-source.spec.ts",
+  "**/loading-states.spec.ts",
+  "**/mcp-edit.spec.ts",
   "**/mcp-install.spec.ts",
+  "**/model-limits.spec.ts",
+  "**/outbound-a2a.spec.ts",
+  "**/project-panel-overflow.spec.ts",
   "**/quickstart.spec.ts",
+  "**/skill-page-editing.spec.ts",
+  "**/skill-share.spec.ts",
+  "**/connection-skills.spec.ts",
+  "**/skill-version-history.spec.ts",
+  "**/skills-bulk-actions.spec.ts",
   "**/static-credentials-management.spec.ts",
-  "**/test-mcp-server.spec.ts",
-  "**/virtual-api-keys.spec.ts",
+  "**/users-role-filter.spec.ts",
 ];
 
+// API specs that run in the lite environment (platform as a plain container
+// with WireMock/Keycloak sidecars). MCP-server installs work there too: the
+// quickstart entrypoint provisions an embedded Kind cluster for the
+// orchestrator.
 const apiTestMatch = [
-  "**/built-in-agents.spec.ts",
-  "**/chat-api.spec.ts",
+  "**/a2a-public-origin.spec.ts",
+  "**/knowledge-permission-sync.spec.ts",
   "**/custom-yaml-restart.spec.ts",
-  "**/image-pull-secrets.spec.ts",
-  "**/mcp-enterprise-managed.ee.spec.ts",
-  "**/mcp-gateway-auth-at-call-time.spec.ts",
   "**/mcp-gateway-jwks-credential-priority.ee.spec.ts",
   "**/mcp-gateway-jwks.ee.spec.ts",
-  "**/mcp-gateway-jwt-propagation.ee.spec.ts",
-  "**/oauth-self-hosted.spec.ts",
   "**/orchestrator.spec.ts",
-  "**/ssrf-protection.spec.ts",
-  "**/vault-k8s-startup.spec.ts",
   testPatterns.llmProxy,
 ];
+
+// API specs that genuinely need the Kind+Helm CI environment: host-cluster
+// kubectl access (image-pull-secrets), NetworkPolicy enforcement (ssrf,
+// jwt-propagation), or helm-deployed fixture servers (oauth-self-hosted,
+// enterprise-managed). Everything else belongs in apiTestMatch above.
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+// Idle hibernation also needs a host cluster but has its own project below:
+// it flips the organization-wide toggle and waits out real idle windows, so
+// it can neither share workers with specs that own MCP servers of their own
+// nor fit the budget this leg is sized for.
+// SPDX-SnippetEnd
+const apiK8sTestMatch = [
+  "**/image-pull-secrets.spec.ts",
+  "**/mcp-enterprise-managed.ee.spec.ts",
+  "**/mcp-gateway-jwt-propagation.ee.spec.ts",
+  "**/oauth-self-hosted.spec.ts",
+  "**/ssrf-protection.spec.ts",
+];
+
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+// Every idle-hibernation spec. Run serially in their own CI leg: one of them
+// turns the organization-wide toggle on to exercise the real sweeper, which
+// would otherwise be free to hibernate a sibling spec's server mid-test.
+const hibernationTestMatch = [
+  "**/mcp-hibernation.spec.ts",
+  "**/mcp-hibernation-capacity.spec.ts",
+  "**/mcp-hibernation-recovery.spec.ts",
+  "**/mcp-hibernation-topology.spec.ts",
+];
+// SPDX-SnippetEnd
 
 const quickstartTestMatch = [
   "**/auth-origin.spec.ts",
@@ -84,11 +151,59 @@ const quickstartTestMatch = [
  * These tests run in their own dedicated projects for isolation.
  */
 const browserTestIgnore = [
-  testPatterns.credentialsWithVault,
   testPatterns.identityProviders,
   testPatterns.quickstart,
   testPatterns.llmProxy,
+  testPatterns.openappa,
 ];
+
+// CI splits the chromium project across two lite stacks by FILE, not with
+// Playwright's --shard: --shard cuts the alphabetical test list in half by test
+// COUNT, which piled the MCP-install-heavy specs onto one runner (~196s vs
+// ~115s of tests). E2E_CHROMIUM_SHARD=2 runs exactly the files below;
+// E2E_CHROMIUM_SHARD=1 runs every other uiTestMatch file — so a new spec lands
+// on shard 1 by default and can never be silently skipped. Shard 1 also hosts
+// the api and identity-providers projects after chromium, which this list is
+// balanced against. Unset (local runs) keeps the whole project.
+const chromiumShard2TestMatch = [
+  "**/dynamic-credentials.spec.ts",
+  "**/invitation.spec.ts",
+  "**/loading-states.spec.ts",
+  "**/mcp-edit.spec.ts",
+  "**/model-limits.spec.ts",
+  "**/outbound-a2a.spec.ts",
+  "**/resource-creation-footer.spec.ts",
+  "**/skill-page-editing.spec.ts",
+  "**/skill-share.spec.ts",
+  "**/skill-version-history.spec.ts",
+  "**/skills-bulk-actions.spec.ts",
+  "**/static-credentials-management.spec.ts",
+  "**/users-role-filter.spec.ts",
+];
+const chromiumShard = process.env.E2E_CHROMIUM_SHARD;
+
+/**
+ * Slow hosts scale every timeout below, and set how many workers run at once.
+ * A 2-CPU Agent Runtime on the lite dev stack runs the browser, the dev
+ * servers and PostgreSQL on the same CPUs; `scripts/dev-lite.sh e2e` sets both
+ * from the CPUs it has. Timeouts written into a spec are not scaled.
+ */
+const TIMEOUT_SCALE = Math.max(1, Number(process.env.E2E_TIMEOUT_SCALE) || 1);
+const LOCAL_WORKERS = Math.max(1, Number(process.env.E2E_WORKERS) || 3);
+const chromiumTestFiles =
+  chromiumShard === "2"
+    ? {
+        testMatch: chromiumShard2TestMatch.filter((f) =>
+          uiTestMatch.includes(f),
+        ),
+        testIgnore: browserTestIgnore,
+      }
+    : chromiumShard === "1"
+      ? {
+          testMatch: uiTestMatch,
+          testIgnore: [...browserTestIgnore, ...chromiumShard2TestMatch],
+        }
+      : { testMatch: uiTestMatch, testIgnore: browserTestIgnore };
 
 /**
  * Common dependency configurations
@@ -98,7 +213,6 @@ const browserTestIgnore = [
  * to distribute test files across shards without pulling in entire project chains.
  *
  * The setup-teams project is the final setup step that all tests depend on.
- * Previously, we had inter-test dependencies (chromium → credentials-with-vault → identity-providers → api)
  * which caused each shard to run the same tests.
  */
 const dependencies = {
@@ -117,9 +231,9 @@ export default defineConfig({
   forbidOnly: IS_CI,
   /* Retry on CI only */
   retries: IS_CI ? 2 : 0,
-  workers: IS_CI ? "90%" : 3,
+  workers: IS_CI ? "90%" : LOCAL_WORKERS,
   /* Global timeout for each test */
-  timeout: 60_000,
+  timeout: 60_000 * TIMEOUT_SCALE,
   /* Reporter to use. See https://playwright.dev/docs/test-reporters */
   reporter: IS_CI ? [["blob"], ["github"], ["line"]] : "line",
   /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
@@ -131,13 +245,13 @@ export default defineConfig({
     /* Take screenshot only when test fails */
     screenshot: "only-on-failure",
     /* Timeout for each action (click, fill, etc.) */
-    actionTimeout: 15_000,
+    actionTimeout: 15_000 * TIMEOUT_SCALE,
     /* Timeout for navigation actions */
-    navigationTimeout: 30_000,
+    navigationTimeout: 30_000 * TIMEOUT_SCALE,
   },
   /* Expect timeout for assertions */
   expect: {
-    timeout: 10_000,
+    timeout: 10_000 * TIMEOUT_SCALE,
   },
 
   /* Configure projects for major browsers */
@@ -162,15 +276,15 @@ export default defineConfig({
       // Teams setup needs users to be created first
       dependencies: [projectNames.setupUsers],
     },
-    // Vault integration tests - tests BYOS (Bring Your Own Secrets) with HashiCorp Vault
-    // Note: This test file manages its own secrets manager state (switches to Vault, then back to DB)
+    // SAML is kept executable but off the merge queue until its previously
+    // quarantined Keycloak flow has a green scheduled/manual history.
     {
-      name: projectNames.credentialsWithVault,
-      testMatch: testPatterns.credentialsWithVault,
+      name: projectNames.identityProvidersSaml,
       testDir: "./tests",
+      testMatch: testPatterns.identityProviders,
+      grep: /@saml/,
       use: {
         ...devices["Desktop Chrome"],
-        storageState: adminAuthFile,
       },
       dependencies: dependencies.testProjects,
     },
@@ -183,13 +297,27 @@ export default defineConfig({
         storageState: adminAuthFile,
       },
       dependencies: dependencies.testProjects,
+      grepInvert: /@k8s-recovery/,
+    },
+    // Recovery against a deliberately broken image is valuable but has a
+    // documented cluster deletion race. Keep it executable on scheduled and
+    // manual runs without putting that flake back on the merge queue.
+    {
+      name: projectNames.quickstartRecovery,
+      testDir: "./tests",
+      testMatch: quickstartTestMatch,
+      grep: /@k8s-recovery/,
+      use: {
+        ...devices["Desktop Chrome"],
+        storageState: adminAuthFile,
+      },
+      dependencies: dependencies.testProjects,
     },
     // Main UI tests on Chrome
     {
       name: projectNames.chromium,
       testDir: "./tests",
-      testMatch: uiTestMatch,
-      testIgnore: browserTestIgnore,
+      ...chromiumTestFiles,
       use: {
         ...devices["Desktop Chrome"],
         storageState: adminAuthFile,
@@ -232,19 +360,68 @@ export default defineConfig({
         // No storageState - identity provider tests authenticate fresh via ensureAdminAuthenticated()
       },
       dependencies: dependencies.testProjects,
+      grepInvert: /@saml/,
     },
-    // API integration tests
+    // API integration tests (lite environment)
     {
       name: projectNames.api,
       testDir: "./tests",
       testMatch: apiTestMatch,
-      testIgnore: [testPatterns.vaultK8s],
       use: {
         ...devices["Desktop Chrome"],
         storageState: adminAuthFile,
       },
       dependencies: dependencies.testProjects,
     },
+    // OpenAPPA root tool flow (lite environment, but a stack booted with
+    // ARCHESTRA_BETA=true — see scripts/e2e-lite.sh and the
+    // OpenAPPA half of the quickstart CI job). Never add these specs to another
+    // project: against an OpenAPPA-off stack they cannot pass.
+    {
+      name: projectNames.openappa,
+      testDir: "./tests",
+      testMatch: testPatterns.openappa,
+      // These tests replace the deployment policy and restore it afterward.
+      workers: 1,
+      use: {
+        ...devices["Desktop Chrome"],
+        storageState: adminAuthFile,
+      },
+      dependencies: dependencies.testProjects,
+    },
+    // API integration tests that need the Kind+Helm CI environment
+    {
+      name: projectNames.apiK8s,
+      testDir: "./tests",
+      testMatch: apiK8sTestMatch,
+      use: {
+        ...devices["Desktop Chrome"],
+        storageState: adminAuthFile,
+      },
+      dependencies: dependencies.testProjects,
+    },
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Idle hibernation against a real cluster: sweeper, wake, capacity,
+    // topology and administrator recovery.
+    {
+      name: projectNames.apiK8sHibernation,
+      testDir: "./tests",
+      testMatch: hibernationTestMatch,
+      // One retry, not the global two: these specs run serially and re-run
+      // their heavyweight fixtures (a cold pod install alone approaches
+      // 7 min) on every retry, so the global setting can push one genuinely
+      // bad file past the CI step budget — the run then reports as a timeout
+      // with no artifacts instead of as results.
+      retries: IS_CI ? 1 : 0,
+      use: {
+        ...devices["Desktop Chrome"],
+        storageState: adminAuthFile,
+      },
+      dependencies: dependencies.testProjects,
+    },
+    // SPDX-SnippetEnd
     // Vault K8s startup test — validates platform starts with DB URL from Vault via K8s auth
     {
       name: projectNames.vaultK8s,

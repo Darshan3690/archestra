@@ -1,0 +1,239 @@
+import { renderHook } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+// The shell's deferral gate is released here unless a test holds it.
+const mockShellReady = vi.fn(() => true);
+vi.mock("@/lib/shell-deferral", () => ({
+  useShellReady: () => mockShellReady(),
+}));
+vi.mock("next/navigation");
+vi.mock("@/lib/auth/auth.query");
+vi.mock("@/lib/organization.query");
+
+const markMutate = vi.fn();
+const mockSeenQuery: { data?: { items: string[] }; isSuccess: boolean } = {
+  data: { items: [] },
+  isSuccess: true,
+};
+
+const seenQueryOptions = vi.fn();
+vi.mock("@/lib/onboarding/onboarding.query", () => ({
+  useSeenNavItems: (options?: { enabled?: boolean }) => {
+    seenQueryOptions(options);
+    return mockSeenQuery;
+  },
+  useMarkNavItemsSeen: () => ({ mutate: markMutate }),
+}));
+
+import { usePathname } from "next/navigation";
+import { useHasPermissions, usePermissionMap } from "@/lib/auth/auth.query";
+import { useOrganization } from "@/lib/organization.query";
+import { useNavOnboarding } from "./use-nav-onboarding";
+
+const allPermissions = {
+  "/projects": true,
+  "/apps": true,
+  "/llm/model-providers": true,
+  "/mcp/registry": true,
+  "/openappa": true,
+};
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.mocked(useOrganization).mockReturnValue({
+    data: { connectionPageHidden: false },
+  } as ReturnType<typeof useOrganization>);
+  mockShellReady.mockReturnValue(true);
+  mockSeenQuery.data = { items: [] };
+  mockSeenQuery.isSuccess = true;
+  vi.mocked(usePathname).mockReturnValue("/chat");
+  vi.mocked(usePermissionMap).mockReturnValue(allPermissions);
+  vi.mocked(useHasPermissions).mockReturnValue({ data: true } as ReturnType<
+    typeof useHasPermissions
+  >);
+});
+
+describe("useNavOnboarding", () => {
+  it("does not leave an unseen Connect dot when Connect is hidden", () => {
+    mockSeenQuery.data = { items: ["nav:projects", "nav:apps"] };
+    vi.mocked(useOrganization).mockReturnValue({
+      data: { connectionPageHidden: true },
+    } as ReturnType<typeof useOrganization>);
+    const { result } = renderHook(() => useNavOnboarding());
+    expect(result.current.unseenKeys.has("nav:connect")).toBe(false);
+    expect(result.current.showChatsDot).toBe(false);
+    expect(result.current.showStudioDot).toBe(true);
+  });
+
+  it.each([
+    "pending",
+    "error",
+  ] as const)("keeps unrelated dots when organization settings are %s", (status) => {
+    vi.mocked(useOrganization).mockReturnValue({
+      data: undefined,
+      status,
+      isPending: status === "pending",
+      isError: status === "error",
+      error: status === "error" ? new Error("Settings unavailable") : null,
+    } as ReturnType<typeof useOrganization>);
+
+    const { result } = renderHook(() => useNavOnboarding());
+
+    expect(result.current.unseenKeys).toEqual(
+      new Set([
+        "nav:projects",
+        "nav:apps",
+        "nav:model-providers",
+        "nav:mcp-registry",
+        "nav:guardrails",
+      ]),
+    );
+    expect(result.current.showChatsDot).toBe(true);
+    expect(result.current.showStudioDot).toBe(true);
+    expect(result.current.showCollapsedToggleDot).toBe(true);
+  });
+
+  it("shows all dots for a fresh user, including the aggregates", () => {
+    const { result } = renderHook(() => useNavOnboarding());
+
+    expect(result.current.unseenKeys).toEqual(
+      new Set([
+        "nav:projects",
+        "nav:apps",
+        "nav:connect",
+        "nav:model-providers",
+        "nav:mcp-registry",
+        "nav:guardrails",
+      ]),
+    );
+    expect(result.current.showChatsDot).toBe(true);
+    expect(result.current.showStudioDot).toBe(true);
+    expect(result.current.showCollapsedToggleDot).toBe(true);
+  });
+
+  it("keeps dots hidden while the seen query is still loading (no flash)", () => {
+    mockSeenQuery.isSuccess = false;
+    mockSeenQuery.data = undefined;
+
+    const { result } = renderHook(() => useNavOnboarding());
+
+    expect(result.current.unseenKeys.size).toBe(0);
+    expect(result.current.showStudioDot).toBe(false);
+    expect(result.current.showCollapsedToggleDot).toBe(false);
+    expect(markMutate).not.toHaveBeenCalled();
+  });
+
+  it("neither reads nor marks anything seen until the page's first data has settled", () => {
+    mockShellReady.mockReturnValue(false);
+    mockSeenQuery.isSuccess = false;
+    mockSeenQuery.data = undefined;
+    // /projects is a dotted route. The hook marks it seen only after the gate
+    // is released.
+    vi.mocked(usePathname).mockReturnValue("/projects");
+
+    const { result } = renderHook(() => useNavOnboarding());
+
+    expect(seenQueryOptions).toHaveBeenLastCalledWith({ enabled: false });
+    expect(result.current.unseenKeys.size).toBe(0);
+    result.current.markSeen("nav:projects");
+    expect(markMutate).not.toHaveBeenCalled();
+  });
+
+  it("excludes RBAC-hidden items and does not roll them up into aggregates", () => {
+    mockSeenQuery.data = { items: ["nav:projects", "nav:apps", "nav:connect"] };
+    vi.mocked(usePermissionMap).mockReturnValue({
+      ...allPermissions,
+      "/llm/model-providers": false,
+      "/mcp/registry": false,
+      "/openappa": false,
+    });
+
+    const { result } = renderHook(() => useNavOnboarding());
+
+    expect(result.current.unseenKeys.size).toBe(0);
+    expect(result.current.showStudioDot).toBe(false);
+    expect(result.current.showCollapsedToggleDot).toBe(false);
+  });
+
+  it("hides permission-gated chats items independently", () => {
+    vi.mocked(usePermissionMap).mockReturnValue({
+      ...allPermissions,
+      "/projects": false,
+      "/apps": false,
+    });
+
+    const { result } = renderHook(() => useNavOnboarding());
+
+    expect(result.current.unseenKeys.has("nav:projects")).toBe(false);
+    expect(result.current.unseenKeys.has("nav:apps")).toBe(false);
+    expect(result.current.unseenKeys.has("nav:mcp-registry")).toBe(true);
+  });
+
+  it("shows the Guardrails dot when either OpenAPPA page is permitted", () => {
+    vi.mocked(usePermissionMap).mockReturnValue({
+      ...allPermissions,
+      "/openappa": false,
+      "/openappa/yells": true,
+    });
+    expect(
+      renderHook(() => useNavOnboarding()).result.current.unseenKeys.has(
+        "nav:guardrails",
+      ),
+    ).toBe(true);
+
+    vi.mocked(usePermissionMap).mockReturnValue({
+      ...allPermissions,
+      "/openappa": false,
+      "/openappa/yells": false,
+    });
+    expect(
+      renderHook(() => useNavOnboarding()).result.current.unseenKeys.has(
+        "nav:guardrails",
+      ),
+    ).toBe(false);
+  });
+
+  it("clears the studio aggregate once all visible studio items are seen", () => {
+    mockSeenQuery.data = {
+      items: ["nav:model-providers", "nav:mcp-registry", "nav:guardrails"],
+    };
+
+    const { result } = renderHook(() => useNavOnboarding());
+
+    expect(result.current.showStudioDot).toBe(false);
+    // Chats-side items still keep their aggregates on.
+    expect(result.current.showChatsDot).toBe(true);
+    expect(result.current.showCollapsedToggleDot).toBe(true);
+  });
+
+  it("clears the chats aggregate once all visible chats items are seen", () => {
+    mockSeenQuery.data = {
+      items: ["nav:projects", "nav:apps", "nav:connect"],
+    };
+
+    const { result } = renderHook(() => useNavOnboarding());
+
+    expect(result.current.showChatsDot).toBe(false);
+    expect(result.current.showStudioDot).toBe(true);
+  });
+
+  it("marks a dotted route as seen when the user lands on it (deep link)", () => {
+    vi.mocked(usePathname).mockReturnValue("/llm/model-providers/anthropic");
+
+    renderHook(() => useNavOnboarding());
+
+    expect(markMutate).toHaveBeenCalledWith(
+      ["nav:model-providers"],
+      expect.anything(),
+    );
+  });
+
+  it("does not re-mark a route that is already seen", () => {
+    mockSeenQuery.data = { items: ["nav:projects"] };
+    vi.mocked(usePathname).mockReturnValue("/projects");
+
+    renderHook(() => useNavOnboarding());
+
+    expect(markMutate).not.toHaveBeenCalled();
+  });
+});

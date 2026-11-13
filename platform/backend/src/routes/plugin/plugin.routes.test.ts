@@ -1,0 +1,1267 @@
+import { PLUGIN_MARKETPLACE_IMPORT_LIMIT } from "@archestra/shared";
+import { vi } from "vitest";
+import config from "@/config";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { registerAuditLogHook } from "@/middleware/audit-log-hook";
+import { AuditLogModel, PluginModel } from "@/models";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import { createGithubPat } from "@/services/github-pat";
+import {
+  accessGrants,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  type TestAccess,
+  test,
+} from "@/test";
+import { STUB_COMMIT_SHA, stubGithub } from "@/test/github-skills-stub";
+import { useRouteTestApp } from "@/test/route-test-app";
+import { grantEverywhere } from "@/test/wildcard-grants";
+import type { CreatePlugin, User } from "@/types";
+import pluginRoutes from "./plugin.routes";
+
+beforeEach(() => {
+  config.beta = false;
+  grantEverywhere(["plugin"]);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+const HOOKS_BYTES = `{
+    "description": "keep four-space indentation",
+    "hooks": { "SessionStart": [] }
+}
+`;
+
+function createPayload(): CreatePlugin {
+  return {
+    displayName: "Session attribution",
+    description: "Attributes local client sessions",
+    clientType: "claude-code",
+    files: [
+      {
+        path: "hooks/hooks.json",
+        content: HOOKS_BYTES,
+        encoding: "utf8",
+        mode: "100644",
+      },
+      {
+        path: "scripts/attribute.sh",
+        content: "#!/bin/sh\necho attributed\n",
+        encoding: "utf8",
+        mode: "100755",
+      },
+    ],
+  };
+}
+
+describe("plugin routes", () => {
+  const ctx = useRouteTestApp(pluginRoutes);
+
+  test("creates, lists, and reads an opaque plugin without rewriting files", async () => {
+    const created = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins",
+      payload: createPayload(),
+    });
+
+    expect(created.statusCode).toBe(200);
+    expect(created.json()).toMatchObject({
+      displayName: "Session attribution",
+      clientType: "claude-code",
+      supportedPlatforms: ["posix"],
+      enabled: true,
+      approvedContentHash: expect.any(String),
+    });
+    expect(created.json().contentHash).toBe(created.json().approvedContentHash);
+    expect(created.json().pluginSlug).toMatch(
+      /^session-attribution-[a-f0-9]{8}$/,
+    );
+    expect(created.json().files).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "hooks/hooks.json",
+          content: HOOKS_BYTES,
+          mode: "100644",
+        }),
+        expect.objectContaining({
+          path: "scripts/attribute.sh",
+          mode: "100755",
+        }),
+      ]),
+    );
+
+    const list = await ctx.app.inject({
+      method: "GET",
+      url: "/api/plugins",
+    });
+    expect(list.statusCode).toBe(200);
+    expect(list.json()).toEqual([
+      expect.objectContaining({ id: created.json().id, fileCount: 2 }),
+    ]);
+
+    const detail = await ctx.app.inject({
+      method: "GET",
+      url: `/api/plugins/${created.json().id}`,
+    });
+    expect(detail.statusCode).toBe(200);
+    expect(
+      detail
+        .json()
+        .files.find(
+          (file: { path: string }) => file.path === "hooks/hooks.json",
+        ).content,
+    ).toBe(HOOKS_BYTES);
+  });
+
+  test("keeps an icon across edits that leave it out, and clears it on null", async () => {
+    const created = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins",
+      payload: { ...createPayload(), icon: "🧩" },
+    });
+    expect(created.json().icon).toBe("🧩");
+    const id = created.json().id;
+
+    const renamed = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/plugins/${id}`,
+      payload: { displayName: "Renamed" },
+    });
+    expect(renamed.json()).toMatchObject({
+      displayName: "Renamed",
+      icon: "🧩",
+    });
+    const cleared = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/plugins/${id}`,
+      payload: { icon: null },
+    });
+    expect(cleared.json().icon).toBeNull();
+  });
+
+  test("atomically replaces files and records a new approved content hash", async () => {
+    const created = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins",
+      payload: createPayload(),
+    });
+    const originalHash = created.json().contentHash;
+    const replacement = `${HOOKS_BYTES}\n`;
+
+    const updated = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/plugins/${created.json().id}`,
+      payload: {
+        displayName: "Renamed in Archestra",
+        supportedPlatforms: ["posix", "windows"],
+        files: [
+          {
+            path: "hooks/hooks.json",
+            content: replacement,
+            encoding: "utf8",
+            mode: "100644",
+          },
+        ],
+      },
+    });
+
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json().pluginSlug).toBe(created.json().pluginSlug);
+    expect(updated.json().supportedPlatforms).toEqual(["posix", "windows"]);
+    expect(updated.json().contentHash).not.toBe(originalHash);
+    expect(updated.json().approvedContentHash).toBe(updated.json().contentHash);
+    expect(updated.json().files).toHaveLength(1);
+    expect(updated.json().files[0].content).toBe(replacement);
+  });
+
+  test("atomically updates a GitHub plugin source, ref, cadence, and visibility", async () => {
+    const plugin = await PluginModel.create({
+      organizationId: ctx.organizationId,
+      userId: ctx.user.id,
+      input: createPayload(),
+      source: {
+        repo: "old-owner/plugin",
+        ref: "main",
+        sha: "old-commit",
+        subdir: "",
+        exclude: [],
+        syncInterval: "1d",
+        syncRef: "main",
+      },
+    });
+    if (!plugin) throw new Error("failed to seed GitHub plugin");
+    const observed = await PluginModel.findByIdForSync(plugin.id);
+    if (!observed) throw new Error("failed to load GitHub sync state");
+    await PluginModel.markGithubSyncResult({
+      id: plugin.id,
+      expectedSyncGeneration: observed.syncGeneration,
+      expectedPendingSourceSha: observed.pendingSourceSha,
+      sourceSha: STUB_COMMIT_SHA,
+      files: plugin.files,
+      error: null,
+    });
+
+    const updated = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/plugins/${plugin.id}`,
+      payload: {
+        githubSource: {
+          repoUrl: "https://github.com/new-owner/plugin.git",
+          ref: "release",
+          syncInterval: "1h",
+        },
+      },
+    });
+
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json()).toMatchObject({
+      sourceRepo: "new-owner/plugin",
+      sourceRef: "release",
+      githubSyncRef: "release",
+      githubSyncInterval: "1h",
+      sourceSha: "old-commit",
+      pendingSourceSha: null,
+      pendingContentHash: null,
+      pendingDetectedAt: null,
+      lastSyncedAt: null,
+    });
+    expect(updated.json().files).toEqual(plugin.files);
+
+    const fetchMock = stubGithub([
+      {
+        owner: "new-owner",
+        repo: "plugin",
+        files: { "hooks/hooks.json": "updated bytes\n" },
+      },
+    ]);
+    const preview = await ctx.app.inject({
+      method: "POST",
+      url: `/api/plugins/${plugin.id}/github/preview-update`,
+      payload: {},
+    });
+    expect(preview.statusCode).toBe(200);
+    expect(
+      fetchMock.mock.calls.some(([input]) =>
+        String(input).includes("/repos/new-owner/plugin/commits/release"),
+      ),
+    ).toBe(true);
+  });
+
+  test("replaces an expired GitHub token without changing approved plugin bytes", async ({
+    makeMember,
+  }) => {
+    // Using a stored GitHub credential needs credential:read.
+    await makeMember(ctx.user.id, ctx.organizationId, { role: "admin" });
+    const expiredPat = await createGithubPat({
+      organizationId: ctx.organizationId,
+      data: { name: "Expired token", token: "ghp_expired" },
+    });
+    const replacementPat = await createGithubPat({
+      organizationId: ctx.organizationId,
+      data: { name: "Replacement token", token: "ghp_replacement" },
+    });
+    const plugin = await PluginModel.create({
+      organizationId: ctx.organizationId,
+      userId: ctx.user.id,
+      input: createPayload(),
+      source: {
+        repo: "private-owner/plugin",
+        ref: "main",
+        sha: "approved-commit",
+        subdir: "",
+        exclude: [],
+        syncInterval: "1d",
+        syncRef: "main",
+        githubPatId: expiredPat.id,
+      },
+    });
+    if (!plugin) throw new Error("failed to seed GitHub plugin");
+    const observed = await PluginModel.findByIdForSync(plugin.id);
+    if (!observed) throw new Error("failed to load GitHub sync state");
+    await PluginModel.markGithubSyncResult({
+      id: plugin.id,
+      expectedSyncGeneration: observed.syncGeneration,
+      expectedPendingSourceSha: observed.pendingSourceSha,
+      error: "Bad credentials",
+    });
+
+    const updated = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/plugins/${plugin.id}`,
+      payload: {
+        githubSource: {
+          repoUrl: "private-owner/plugin",
+          ref: "main",
+          syncInterval: "1d",
+          authentication: {
+            githubAppConfigId: null,
+            githubPatId: replacementPat.id,
+          },
+        },
+      },
+    });
+
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json()).toMatchObject({
+      sourceSha: "approved-commit",
+      githubPatId: replacementPat.id,
+      githubAppConfigId: null,
+      lastSyncedAt: null,
+      lastSyncError: null,
+    });
+    expect(updated.json().files).toEqual(plugin.files);
+
+    const preserved = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/plugins/${plugin.id}`,
+      payload: {
+        githubSource: {
+          repoUrl: "private-owner/plugin",
+          ref: "main",
+          syncInterval: "1d",
+        },
+      },
+    });
+    expect(preserved.statusCode).toBe(200);
+    expect(preserved.json()).toMatchObject({
+      githubPatId: replacementPat.id,
+      githubAppConfigId: null,
+    });
+
+    const fetchMock = stubGithub([
+      {
+        owner: "private-owner",
+        repo: "plugin",
+        files: { "hooks/hooks.json": "replacement-auth bytes\n" },
+      },
+    ]);
+    const preview = await ctx.app.inject({
+      method: "POST",
+      url: `/api/plugins/${plugin.id}/github/preview-update`,
+      payload: {},
+    });
+    expect(preview.statusCode).toBe(200);
+    expect(
+      fetchMock.mock.calls.some(([, init]) =>
+        JSON.stringify(
+          (init as { headers?: unknown } | undefined)?.headers ?? {},
+        ).includes("ghp_replacement"),
+      ),
+    ).toBe(true);
+
+    const cleared = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/plugins/${plugin.id}`,
+      payload: {
+        githubSource: {
+          repoUrl: "private-owner/plugin",
+          ref: "main",
+          syncInterval: "1d",
+          authentication: {
+            githubAppConfigId: null,
+            githubPatId: null,
+          },
+        },
+      },
+    });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json()).toMatchObject({
+      githubPatId: null,
+      githubAppConfigId: null,
+    });
+  });
+
+  test("names the creator on the read and keeps naming them after an update", async () => {
+    const created = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins",
+      payload: createPayload(),
+    });
+    const id = created.json().id;
+    // Name and email both, not just an id: the field exists so somebody can be
+    // contacted, and the caller cannot resolve an id it has no roster for.
+    const creator = {
+      id: ctx.user.id,
+      name: ctx.user.name || null,
+      email: ctx.user.email || null,
+    };
+    expect(created.json().createdBy).toEqual(creator);
+
+    const detail = await ctx.app.inject({
+      method: "GET",
+      url: `/api/plugins/${id}`,
+    });
+    expect(detail.json().createdBy).toEqual(creator);
+
+    // The detail page seeds its cache from the update response, so a shape that
+    // dropped the creator there would blank the fact until the next refetch.
+    const updated = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/plugins/${id}`,
+      payload: { displayName: "Renamed" },
+    });
+    expect(updated.json().createdBy).toEqual(creator);
+  });
+
+  test("rejects GitHub source settings for manual plugins and non-GitHub URLs", async () => {
+    const manual = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins",
+      payload: createPayload(),
+    });
+    const manualUpdate = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/plugins/${manual.json().id}`,
+      payload: {
+        githubSource: {
+          repoUrl: "owner/plugin",
+          ref: null,
+          syncInterval: null,
+        },
+      },
+    });
+    expect(manualUpdate.statusCode).toBe(409);
+
+    const github = await PluginModel.create({
+      organizationId: ctx.organizationId,
+      userId: ctx.user.id,
+      input: createPayload(),
+      source: {
+        repo: "owner/plugin",
+        ref: "main",
+        sha: "old-commit",
+        subdir: "",
+        exclude: [],
+      },
+    });
+    if (!github) throw new Error("failed to seed GitHub plugin");
+    const invalidUrl = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/plugins/${github.id}`,
+      payload: {
+        githubSource: {
+          repoUrl: "https://gitlab.com/owner/plugin",
+          ref: "main",
+          syncInterval: "1d",
+        },
+      },
+    });
+    expect(invalidUrl.statusCode).toBe(400);
+  });
+
+  test("rejects unsafe, duplicate, and malformed file sets", async () => {
+    const invalidFileSets = [
+      [{ path: "../hooks/hooks.json", content: "{}" }],
+      [
+        { path: "hooks/hooks.json", content: "{}" },
+        { path: "HOOKS/HOOKS.JSON", content: "{}" },
+      ],
+      [
+        {
+          path: "hooks/hooks.json",
+          content: "not base64",
+          encoding: "base64",
+        },
+      ],
+    ];
+
+    for (const files of invalidFileSets) {
+      const response = await ctx.app.inject({
+        method: "POST",
+        url: "/api/plugins",
+        payload: {
+          displayName: "Invalid plugin",
+          clientType: "claude-code",
+          files,
+        },
+      });
+      expect(response.statusCode).toBe(400);
+    }
+  });
+
+  test("creates a hookless Claude plugin", async () => {
+    const response = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins",
+      payload: {
+        displayName: "Agent toolkit",
+        clientType: "claude-code",
+        files: [
+          {
+            path: "agents/reviewer.md",
+            content: "Review changes.\n",
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().files).toEqual([
+      expect.objectContaining({ path: "agents/reviewer.md" }),
+    ]);
+  });
+
+  test("hides plugins belonging to another organization", async ({
+    makeOrganization,
+  }) => {
+    const other = await makeOrganization();
+    const foreign = await PluginModel.create({
+      organizationId: other.id,
+      userId: ctx.user.id,
+      input: createPayload(),
+    });
+    if (!foreign) throw new Error("failed to seed foreign plugin");
+
+    const response = await ctx.app.inject({
+      method: "GET",
+      url: `/api/plugins/${foreign.id}`,
+    });
+    expect(response.statusCode).toBe(404);
+  });
+
+  test("access filter splits rows by how the caller reaches them, ignoring wildcard grants", async ({
+    makeMember,
+    makeTeam,
+    makeTeamMember,
+    makeUser,
+  }) => {
+    await makeMember(ctx.user.id, ctx.organizationId, { role: "admin" });
+    const otherUser = await makeUser();
+    await makeMember(otherUser.id, ctx.organizationId, { role: "member" });
+    const myTeam = await makeTeam(ctx.organizationId, ctx.user.id);
+    await makeTeamMember(myTeam.id, ctx.user.id);
+    const otherTeam = await makeTeam(ctx.organizationId, otherUser.id);
+
+    const seed = async (
+      displayName: string,
+      access: TestAccess,
+      userId = otherUser.id,
+    ) => {
+      const plugin = await PluginModel.create({
+        organizationId: ctx.organizationId,
+        userId,
+        input: { ...createPayload(), displayName },
+        ...accessGrants(access),
+      });
+      if (!plugin) throw new Error("failed to seed plugin");
+    };
+    await seed("Mine", "personal", ctx.user.id);
+    await seed("Other Personal", "personal");
+    await seed("Org", "org");
+    await seed("My Team", { teams: [myTeam.id] });
+    await seed("Other Team", { teams: [otherTeam.id] });
+    await seed("Shared With Me", { users: [ctx.user.id] });
+
+    const list = async (access?: string) => {
+      const response = await ctx.app.inject({
+        method: "GET",
+        url: `/api/plugins${access ? `?access=${access}` : ""}`,
+      });
+      expect(response.statusCode, response.body).toBe(200);
+      return response
+        .json()
+        .map((plugin: { displayName: string }) => plugin.displayName)
+        .sort();
+    };
+
+    // The caller reads every plugin through a `*` grant, which the filter
+    // must not count as "shared".
+    expect(await list()).toEqual([
+      "Mine",
+      "My Team",
+      "Org",
+      "Other Personal",
+      "Other Team",
+      "Shared With Me",
+    ]);
+    expect(await list("mine,shared,org")).toEqual([
+      "Mine",
+      "My Team",
+      "Org",
+      "Shared With Me",
+    ]);
+    expect(await list("others")).toEqual(["Other Personal", "Other Team"]);
+    expect(await list("mine")).toEqual(["Mine"]);
+    expect(await list("shared")).toEqual(["My Team", "Shared With Me"]);
+    expect(await list("org")).toEqual(["Org"]);
+  });
+
+  test("soft-deletes the plugin and removes it from reads", async () => {
+    const created = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins",
+      payload: createPayload(),
+    });
+
+    const deleted = await ctx.app.inject({
+      method: "DELETE",
+      url: `/api/plugins/${created.json().id}`,
+    });
+    expect(deleted.statusCode).toBe(200);
+    expect(deleted.json()).toEqual({ success: true });
+
+    const detail = await ctx.app.inject({
+      method: "GET",
+      url: `/api/plugins/${created.json().id}`,
+    });
+    expect(detail.statusCode).toBe(404);
+  });
+
+  test("refuses the retired audience fields on create and edit", async ({
+    makeTeam,
+  }) => {
+    const team = await makeTeam(ctx.organizationId, ctx.user.id, {
+      name: "Plugin reviewers",
+    });
+
+    const refused = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins",
+      payload: { ...createPayload(), scope: "team", teamIds: [team.id] },
+    });
+    expect(refused.statusCode).toBe(400);
+
+    // Without initialGrants the creator alone holds the new plugin.
+    const created = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins",
+      payload: createPayload(),
+    });
+    expect(created.statusCode).toBe(200);
+    const pluginId = created.json().id as string;
+    const policy = await ResourcePermissionPolicyModel.find({
+      organizationId: ctx.organizationId,
+      resource: "plugin",
+      scope: pluginId,
+    });
+    expect(policy?.grants.map((grant) => grant.subject.type).sort()).toEqual([
+      "user",
+    ]);
+
+    // Edits do not touch access any more: the old fields are refused.
+    const updated = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/plugins/${pluginId}`,
+      payload: { scope: "org" },
+    });
+    expect(updated.statusCode).toBe(400);
+  });
+
+  test("previews and imports a GitHub subtree by immutable commit", async () => {
+    stubGithub([
+      {
+        owner: "route-plugin",
+        repo: "plugin",
+        files: {
+          "hooks/hooks.json": '{ "hooks": {} }\n',
+          "scripts/run.sh": "#!/bin/sh\ntrue\n",
+          ".mcp.json": "{}",
+        },
+        modes: { "scripts/run.sh": "100755" },
+      },
+    ]);
+
+    const preview = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins/github/preview",
+      payload: { repoUrl: "route-plugin/plugin", ref: "main" },
+    });
+    expect(preview.statusCode).toBe(200);
+    expect(preview.json()).toMatchObject({
+      repo: "route-plugin/plugin",
+      commitSha: STUB_COMMIT_SHA,
+      skippedFiles: [],
+    });
+    expect(preview.json().files).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: "scripts/run.sh", mode: "100755" }),
+        expect.objectContaining({ path: ".mcp.json", mode: "100644" }),
+      ]),
+    );
+
+    const imported = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins/github/import",
+      payload: {
+        repoUrl: "https://github.com/route-plugin/plugin/tree/release",
+        displayName: "Imported plugin",
+        description: "Imported from GitHub",
+        clientType: "claude-code",
+        supportedPlatforms: ["windows"],
+        approvedCommitSha: STUB_COMMIT_SHA,
+      },
+    });
+    expect(imported.statusCode).toBe(200);
+    expect(imported.json()).toMatchObject({
+      sourceKind: "github",
+      sourceRepo: "route-plugin/plugin",
+      sourceRef: "release",
+      sourceSha: STUB_COMMIT_SHA,
+      supportedPlatforms: ["windows"],
+      approvedContentHash: expect.any(String),
+    });
+  });
+
+  test("discovers and batch-imports selected marketplace plugins with explicit permissions", async ({
+    makeMember,
+  }) => {
+    await makeMember(ctx.user.id, ctx.organizationId, { role: "admin" });
+    registerAuditLogHook(ctx.app);
+    stubGithub([
+      {
+        owner: "plugin-marketplace",
+        repo: "catalog",
+        files: {
+          ".claude-plugin/marketplace.json": JSON.stringify({
+            plugins: [
+              {
+                name: "first-plugin",
+                description: "First plugin",
+                version: "1.0.0",
+                source: "./plugins/first",
+              },
+              {
+                name: "second-plugin",
+                description: "Second plugin",
+                version: "2.0.0",
+                source: "./plugins/second",
+              },
+            ],
+          }),
+          "plugins/first/hooks/hooks.json": "{}\n",
+          "plugins/second/.mcp.json": '{ "mcpServers": {} }\n',
+          "plugins/second/agents/reviewer.md": "Review changes.\n",
+        },
+      },
+    ]);
+
+    const discovered = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins/github/marketplace/discover",
+      payload: { repoUrl: "plugin-marketplace/catalog", ref: "main" },
+    });
+    expect(discovered.statusCode).toBe(200);
+    expect(discovered.json().entries).toHaveLength(2);
+    expect(discovered.json().entries).toEqual([
+      expect.objectContaining({ name: "first-plugin", fileCount: 1 }),
+      expect.objectContaining({ name: "second-plugin", fileCount: 2 }),
+    ]);
+    expect(discovered.headers["cache-control"]).toBe("no-store");
+
+    const selected = discovered
+      .json()
+      .entries.map(
+        (entry: {
+          name: string;
+          description: string;
+          clientType: "claude-code";
+          sourceRepoUrl: string;
+          sourceRef: string;
+          sourceSubdir: string;
+          sourceCommitSha: string;
+        }) => ({
+          name: entry.name,
+          displayName: entry.name === "first-plugin" ? "First" : "Second",
+          description: entry.description,
+          clientType: entry.clientType,
+          supportedPlatforms: ["posix"],
+          sourceRepoUrl: entry.sourceRepoUrl,
+          sourceRef: entry.sourceRef,
+          sourceSubdir: entry.sourceSubdir,
+          approvedSourceSha: entry.sourceCommitSha,
+          exclude: [],
+        }),
+      );
+    const importPayload = {
+      repoUrl: "plugin-marketplace/catalog",
+      ref: "main",
+      marketplacePath: ".claude-plugin/marketplace.json",
+      approvedCommitSha: STUB_COMMIT_SHA,
+      trackingRef: "main",
+      selected,
+      initialGrants: [
+        { subject: { type: "role", id: "member" }, actions: ["read"] },
+      ],
+      syncInterval: "1d",
+    } as const;
+    const imported = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins/github/marketplace/import",
+      payload: importPayload,
+    });
+    expect(imported.statusCode).toBe(200);
+    expect(imported.json().failed).toEqual([]);
+    expect(imported.json().created).toEqual([
+      expect.objectContaining({
+        displayName: "First",
+        sourceMarketplaceRepo: "plugin-marketplace/catalog",
+        sourceMarketplacePluginName: "first-plugin",
+        githubSyncInterval: "1d",
+      }),
+      expect.objectContaining({
+        displayName: "Second",
+        sourceMarketplaceRepo: "plugin-marketplace/catalog",
+        sourceMarketplacePluginName: "second-plugin",
+        githubSyncInterval: "1d",
+        files: expect.arrayContaining([
+          expect.objectContaining({ path: ".mcp.json" }),
+          expect.objectContaining({ path: "agents/reviewer.md" }),
+        ]),
+      }),
+    ]);
+
+    for (const plugin of imported.json().created) {
+      const policy = await ResourcePermissionPolicyModel.find({
+        organizationId: ctx.organizationId,
+        resource: "plugin",
+        scope: plugin.id,
+      });
+      expect(policy?.grants).toEqual(
+        expect.arrayContaining([...importPayload.initialGrants]),
+      );
+      expect(
+        policy?.grants.find(
+          (grant) =>
+            grant.subject.type === "role" && grant.subject.id === "member",
+        )?.actions,
+      ).toEqual(["read"]);
+    }
+    await vi.waitFor(async () => {
+      const audit = await AuditLogModel.findPaginated({
+        organizationId: ctx.organizationId,
+        resourceType: "plugin",
+        limit: 20,
+        offset: 0,
+      });
+      expect(audit.data).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            action: "plugin.created",
+            outcome: "success",
+            before: null,
+            after: expect.any(Object),
+          }),
+        ]),
+      );
+    });
+
+    const duplicate = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins/github/marketplace/import",
+      payload: {
+        ...importPayload,
+        selected: selected.map((entry: { displayName: string }) => ({
+          ...entry,
+          displayName: `${entry.displayName} Copy`,
+        })),
+      },
+    });
+    expect(duplicate.statusCode).toBe(200);
+    expect(duplicate.json().created).toEqual([]);
+    expect(duplicate.json().failed).toEqual([
+      expect.objectContaining({ name: "first-plugin" }),
+      expect.objectContaining({ name: "second-plugin" }),
+    ]);
+
+    // Claude Desktop reads the Claude Code plugin format, so the same entries
+    // import again as Desktop copies. Another client's format does not.
+    const desktop = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins/github/marketplace/import",
+      payload: {
+        ...importPayload,
+        selected: selected.map((entry: { displayName: string }) => ({
+          ...entry,
+          clientType: "claude-desktop",
+        })),
+      },
+    });
+    expect(desktop.statusCode).toBe(200);
+    expect(desktop.json().failed).toEqual([]);
+    expect(
+      desktop
+        .json()
+        .created.map(
+          (plugin: {
+            clientType: string;
+            sourceMarketplacePluginName: string;
+          }) => [plugin.sourceMarketplacePluginName, plugin.clientType],
+        ),
+    ).toEqual([
+      ["first-plugin", "claude-desktop"],
+      ["second-plugin", "claude-desktop"],
+    ]);
+
+    const codex = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins/github/marketplace/import",
+      payload: {
+        ...importPayload,
+        selected: selected.map((entry: { displayName: string }) => ({
+          ...entry,
+          clientType: "codex",
+        })),
+      },
+    });
+    expect(codex.statusCode).toBe(200);
+    expect(codex.json().created).toEqual([]);
+    expect(codex.json().failed).toHaveLength(2);
+  });
+
+  test("rejects marketplace imports above the batch limit", async () => {
+    const response = await ctx.app.inject({
+      method: "POST",
+      url: "/api/plugins/github/marketplace/import",
+      payload: {
+        repoUrl: "https://github.com/plugin-marketplace/catalog",
+        ref: "main",
+        marketplacePath: ".claude-plugin/marketplace.json",
+        approvedCommitSha: STUB_COMMIT_SHA,
+        trackingRef: "main",
+        selected: Array.from(
+          { length: PLUGIN_MARKETPLACE_IMPORT_LIMIT + 1 },
+          (_, index) => ({
+            name: `plugin-${index}`,
+            displayName: `Plugin ${index}`,
+            description: "Marketplace plugin",
+            clientType: "claude-code",
+            supportedPlatforms: ["posix"],
+            sourceRepoUrl: `https://github.com/plugin-source/plugin-${index}`,
+            sourceRef: "main",
+            sourceSubdir: "",
+            approvedSourceSha: STUB_COMMIT_SHA,
+            exclude: [],
+          }),
+        ),
+        syncInterval: null,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.body).toContain(
+      `Select at most ${PLUGIN_MARKETPLACE_IMPORT_LIMIT} plugins per import`,
+    );
+  });
+
+  test("keeps approved bytes live until a GitHub update is explicitly applied", async () => {
+    const plugin = await PluginModel.create({
+      organizationId: ctx.organizationId,
+      userId: ctx.user.id,
+      input: {
+        displayName: "Tracked plugin",
+        description: "Tracked from GitHub",
+        clientType: "claude-code",
+        files: [
+          {
+            path: "hooks/hooks.json",
+            content: "old bytes\n",
+            encoding: "utf8",
+            mode: "100644",
+          },
+        ],
+      },
+      source: {
+        repo: "route-update/plugin",
+        ref: "main",
+        sha: "old-commit",
+        subdir: "",
+        exclude: [],
+      },
+    });
+    if (!plugin) throw new Error("failed to seed tracked plugin");
+    const oldHash = plugin.contentHash;
+
+    const directEdit = await ctx.app.inject({
+      method: "PUT",
+      url: `/api/plugins/${plugin.id}`,
+      payload: {
+        files: [
+          {
+            path: "hooks/hooks.json",
+            content: "bypassed approval\n",
+            encoding: "utf8",
+            mode: "100644",
+          },
+        ],
+      },
+    });
+    expect(directEdit.statusCode).toBe(409);
+
+    const fetchMock = stubGithub([
+      {
+        owner: "route-update",
+        repo: "plugin",
+        files: { "hooks/hooks.json": "new bytes\n" },
+      },
+    ]);
+
+    const preview = await ctx.app.inject({
+      method: "POST",
+      url: `/api/plugins/${plugin.id}/github/preview-update`,
+      payload: {},
+    });
+    expect(preview.statusCode).toBe(200);
+    expect(preview.json().commitSha).toBe(STUB_COMMIT_SHA);
+    expect(preview.json().files[0].content).toBe("new bytes\n");
+
+    const beforeApply = await PluginModel.findById({
+      id: plugin.id,
+      organizationId: ctx.organizationId,
+    });
+    expect(beforeApply?.sourceSha).toBe("old-commit");
+    expect(beforeApply?.contentHash).toBe(oldHash);
+    expect(beforeApply?.files[0].content).toBe("old bytes\n");
+
+    const applied = await ctx.app.inject({
+      method: "POST",
+      url: `/api/plugins/${plugin.id}/github/apply-update`,
+      payload: { approvedCommitSha: STUB_COMMIT_SHA },
+    });
+    expect(applied.statusCode).toBe(200);
+    expect(applied.json().sourceSha).toBe(STUB_COMMIT_SHA);
+    expect(applied.json().contentHash).not.toBe(oldHash);
+    expect(applied.json().approvedContentHash).toBe(applied.json().contentHash);
+    expect(applied.json().files[0].content).toBe("new bytes\n");
+    expect(
+      fetchMock.mock.calls.some(([input]) =>
+        String(input).includes(`/commits/${STUB_COMMIT_SHA}`),
+      ),
+    ).toBe(true);
+
+    const mismatched = await ctx.app.inject({
+      method: "POST",
+      url: `/api/plugins/${plugin.id}/github/apply-update`,
+      payload: {
+        approvedCommitSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      },
+    });
+    expect(mismatched.statusCode).toBe(409);
+  });
+});
+
+describe("plugin audit records", () => {
+  let app: FastifyInstanceWithZod;
+  let organizationId: string;
+  let actor: User;
+
+  beforeEach(async ({ makeOrganization, makeUser }) => {
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    actor = await makeUser();
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (
+        request as typeof request & { organizationId: string; user: User }
+      ).organizationId = organizationId;
+      (request as typeof request & { user: User }).user = actor;
+    });
+    registerAuditLogHook(app);
+    await app.register(pluginRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  test("create, update, and delete record non-secret before/after diffs", async () => {
+    const createdResponse = await app.inject({
+      method: "POST",
+      url: "/api/plugins",
+      payload: createPayload(),
+    });
+    const created = createdResponse.json();
+    await app.inject({
+      method: "PUT",
+      url: `/api/plugins/${created.id}`,
+      payload: { displayName: "Renamed plugin" },
+    });
+    await app.inject({
+      method: "DELETE",
+      url: `/api/plugins/${created.id}`,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const { data } = await AuditLogModel.findPaginated({
+      organizationId,
+      resourceType: "plugin",
+      sortDirection: "asc",
+      limit: 20,
+      offset: 0,
+    });
+    expect(data.map((row) => row.action)).toEqual([
+      "plugin.created",
+      "plugin.updated",
+      "plugin.deleted",
+    ]);
+    for (const row of data) {
+      expect(row.resourceId).toBe(created.id);
+      expect(JSON.stringify(row.before)).not.toContain(HOOKS_BYTES);
+      expect(JSON.stringify(row.after)).not.toContain(HOOKS_BYTES);
+    }
+    expect(data[0].after).toMatchObject({ displayName: "Session attribution" });
+    expect(data[1].before).toMatchObject({
+      displayName: "Session attribution",
+    });
+    expect(data[1].after).toMatchObject({ displayName: "Renamed plugin" });
+    expect(data[2].before).toMatchObject({ displayName: "Renamed plugin" });
+  });
+
+  test("previewing an update audits the pending candidate", async () => {
+    const plugin = await PluginModel.create({
+      organizationId,
+      userId: actor.id,
+      input: createPayload(),
+      source: {
+        repo: "audit-owner/plugin",
+        ref: "main",
+        sha: "approved-commit",
+        subdir: "",
+        exclude: [],
+        syncInterval: "1d",
+        syncRef: "main",
+      },
+    });
+    if (!plugin) throw new Error("failed to create Plugin");
+    stubGithub([
+      {
+        owner: "audit-owner",
+        repo: "plugin",
+        files: { "hooks/hooks.json": '{"version":2}\n' },
+      },
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/plugins/${plugin.id}/github/preview-update`,
+      payload: {},
+    });
+    expect(response.statusCode).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const { data } = await AuditLogModel.findPaginated({
+      organizationId,
+      resourceType: "plugin",
+      sortDirection: "asc",
+      limit: 20,
+      offset: 0,
+    });
+    expect(data).toHaveLength(1);
+    expect(data[0]).toMatchObject({
+      action: "plugin.updated",
+      resourceId: plugin.id,
+      before: { pendingSourceSha: null },
+      after: { pendingSourceSha: STUB_COMMIT_SHA },
+    });
+  });
+
+  test("previewing the already-approved commit does not emit an update audit", async () => {
+    const plugin = await PluginModel.create({
+      organizationId,
+      userId: actor.id,
+      input: createPayload(),
+      source: {
+        repo: "no-op-owner/plugin",
+        ref: "main",
+        sha: STUB_COMMIT_SHA,
+        subdir: "",
+        exclude: [],
+        syncInterval: "1d",
+        syncRef: "main",
+      },
+    });
+    if (!plugin) throw new Error("failed to create Plugin");
+    stubGithub([
+      {
+        owner: "no-op-owner",
+        repo: "plugin",
+        files: { "hooks/hooks.json": HOOKS_BYTES },
+      },
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/plugins/${plugin.id}/github/preview-update`,
+      payload: {},
+    });
+    expect(response.statusCode).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const { data } = await AuditLogModel.findPaginated({
+      organizationId,
+      resourceType: "plugin",
+      sortDirection: "asc",
+      limit: 20,
+      offset: 0,
+    });
+    expect(data).toHaveLength(0);
+  });
+
+  test("preview rejects a stale fetch instead of replacing a concurrent candidate", async () => {
+    const plugin = await PluginModel.create({
+      organizationId,
+      userId: actor.id,
+      input: createPayload(),
+      source: {
+        repo: "race-owner/plugin",
+        ref: "main",
+        sha: "approved-commit",
+        subdir: "",
+        exclude: [],
+        syncInterval: "1d",
+        syncRef: "main",
+      },
+    });
+    if (!plugin) throw new Error("failed to create Plugin");
+    stubGithub([
+      {
+        owner: "race-owner",
+        repo: "plugin",
+        files: { "hooks/hooks.json": '{"version":2}\n' },
+      },
+    ]);
+    const githubFetch = globalThis.fetch;
+    let releaseFetch: (() => void) | undefined;
+    let markFetchStarted: (() => void) | undefined;
+    const fetchStarted = new Promise<void>((resolve) => {
+      markFetchStarted = resolve;
+    });
+    const fetchGate = new Promise<void>((resolve) => {
+      releaseFetch = resolve;
+    });
+    vi.stubGlobal("fetch", async (...args: Parameters<typeof fetch>) => {
+      markFetchStarted?.();
+      await fetchGate;
+      return githubFetch(...args);
+    });
+
+    const preview = app.inject({
+      method: "POST",
+      url: `/api/plugins/${plugin.id}/github/preview-update`,
+      payload: {},
+    });
+    await fetchStarted;
+    const observed = await PluginModel.findByIdForSync(plugin.id);
+    if (!observed) throw new Error("failed to load Plugin sync state");
+    await PluginModel.markGithubSyncResult({
+      id: plugin.id,
+      expectedSyncGeneration: observed.syncGeneration,
+      expectedPendingSourceSha: observed.pendingSourceSha,
+      sourceSha: "concurrent-candidate",
+      files: plugin.files,
+      error: null,
+    });
+    releaseFetch?.();
+
+    expect((await preview).statusCode).toBe(409);
+    await expect(PluginModel.findByIdForSync(plugin.id)).resolves.toMatchObject(
+      {
+        pendingSourceSha: "concurrent-candidate",
+      },
+    );
+  });
+});

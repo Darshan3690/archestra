@@ -1,0 +1,1413 @@
+import {
+  ADMIN_ROLE_NAME,
+  type ArchestraToolShortName,
+  TOOL_ASK_USER_SHORT_NAME,
+  TOOL_COPY_FILE_SHORT_NAME,
+  TOOL_DOWNLOAD_FILE_SHORT_NAME,
+  TOOL_LIST_APP_VERSIONS_SHORT_NAME,
+  TOOL_LIST_APPS_SHORT_NAME,
+  TOOL_LIST_SKILLS_SHORT_NAME,
+  TOOL_LOAD_SKILL_SHORT_NAME,
+  TOOL_READ_FILE_SHORT_NAME,
+  TOOL_RESTORE_APP_VERSION_SHORT_NAME,
+  TOOL_RUN_COMMAND_SHORT_NAME,
+  TOOL_RUN_TOOL_SHORT_NAME,
+  TOOL_SAVE_FILE_SHORT_NAME,
+  TOOL_SCAFFOLD_APP_SHORT_NAME,
+  TOOL_SEARCH_FILES_SHORT_NAME,
+  TOOL_SEARCH_TOOLS_SHORT_NAME,
+  TOOL_UPLOAD_FILE_SHORT_NAME,
+} from "@archestra/shared";
+import type { Tool } from "ai";
+import { archestraMcpBranding } from "@/archestra-mcp-server";
+import config, { parseOpenAppaConfig } from "@/config";
+import { AgentModel, SkillModel } from "@/models";
+import GuardrailsDeploymentModel from "@/models/guardrails-deployment";
+import type { OpenedApp } from "@/services/apps/opened-app-context";
+import { SKILL_CATALOG_CHAR_BUDGET } from "@/skills/skill-catalog-prompt";
+import {
+  SKILL_SANDBOX_ATTACHMENTS_DIR,
+  SKILL_SANDBOX_HOME,
+} from "@/skills-sandbox/runtime-image";
+import { accessGrants, describe, expect, test } from "@/test";
+import {
+  APP_BUILD_CONDUCT_INSTRUCTION,
+  buildAgentSystemPrompt,
+  buildAppaRemedyInstruction,
+  OPENED_APP_PREFIX,
+  PROJECT_FILES_PREFIX,
+  PROJECT_INSTRUCTIONS_PREFIX,
+  TOOL_DENIAL_INSTRUCTION,
+  TOOL_UI_RESULT_INSTRUCTION,
+} from "./agent-system-prompt";
+
+const loadSkillToolName = archestraMcpBranding.getToolName(
+  TOOL_LOAD_SKILL_SHORT_NAME,
+);
+const someTool: Record<string, Tool> = { some_tool: {} as Tool };
+const withLoadSkill: Record<string, Tool> = { [loadSkillToolName]: {} as Tool };
+const searchToolsToolName = archestraMcpBranding.getToolName(
+  TOOL_SEARCH_TOOLS_SHORT_NAME,
+);
+const runToolToolName = archestraMcpBranding.getToolName(
+  TOOL_RUN_TOOL_SHORT_NAME,
+);
+
+const brand = (shortName: ArchestraToolShortName) =>
+  archestraMcpBranding.getToolName(shortName);
+const askUserToolName = brand(TOOL_ASK_USER_SHORT_NAME);
+const withAskUser: Record<string, Tool> = { [askUserToolName]: {} as Tool };
+const searchFilesToolName = brand(TOOL_SEARCH_FILES_SHORT_NAME);
+// Sandbox runtime + persistent-file tools: the "full" file surface.
+const withFileTools: Record<string, Tool> = {
+  [brand(TOOL_RUN_COMMAND_SHORT_NAME)]: {} as Tool,
+  [brand(TOOL_DOWNLOAD_FILE_SHORT_NAME)]: {} as Tool,
+  [brand(TOOL_UPLOAD_FILE_SHORT_NAME)]: {} as Tool,
+  [searchFilesToolName]: {} as Tool,
+  [brand(TOOL_READ_FILE_SHORT_NAME)]: {} as Tool,
+  [brand(TOOL_SAVE_FILE_SHORT_NAME)]: {} as Tool,
+};
+// Persistent-file tools only (no code runtime): the file surface alone.
+const withFilesOnly: Record<string, Tool> = {
+  [searchFilesToolName]: {} as Tool,
+  [brand(TOOL_READ_FILE_SHORT_NAME)]: {} as Tool,
+  [brand(TOOL_SAVE_FILE_SHORT_NAME)]: {} as Tool,
+};
+// Sandbox runtime only (file tools not assigned): no persistent-file tools.
+const withSandboxOnly: Record<string, Tool> = {
+  [brand(TOOL_RUN_COMMAND_SHORT_NAME)]: {} as Tool,
+  [brand(TOOL_DOWNLOAD_FILE_SHORT_NAME)]: {} as Tool,
+  [brand(TOOL_UPLOAD_FILE_SHORT_NAME)]: {} as Tool,
+};
+
+async function seedSkill(organizationId: string) {
+  return await SkillModel.createWithFiles({
+    skill: {
+      organizationId,
+      name: "pdf-processing",
+      description: "Extract text from PDF files.",
+      content: "# PDF Processing\nUse pdftotext.",
+      metadata: {},
+      sourceType: "manual",
+    },
+    files: [],
+    ...accessGrants("org"),
+  });
+}
+
+/**
+ * An owned-app OpenedApp literal with quiet defaults, so each test states only
+ * the fields it asserts on — and a new OpenedApp field is a one-line edit here
+ * instead of one per literal.
+ */
+function ownedApp(
+  overrides: Partial<Extract<OpenedApp, { kind: "owned" }>> &
+    Pick<Extract<OpenedApp, { kind: "owned" }>, "id" | "name">,
+): OpenedApp {
+  return {
+    kind: "owned",
+    description: null,
+    tools: [],
+    files: [],
+    hasFileStore: false,
+    reportedContext: null,
+    ...overrides,
+  };
+}
+
+describe("buildAgentSystemPrompt", () => {
+  test("passes the base prompt through and always appends the denial instruction", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    });
+
+    expect(prompt).toBe(`You are helpful.\n\n${TOOL_DENIAL_INSTRUCTION}`);
+    // No remedy instruction: OpenAPPA is off, so no ruling can reach the model.
+    expect(prompt).not.toContain(
+      buildAppaRemedyInstruction({ canAskUser: false }),
+    );
+  });
+
+  test("sends choices to ask_user only in a run that can show the user a question", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+    const common = {
+      agent,
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    };
+    const choiceRule = `When you need a decision, a clarification, a preference, or an approval from the user, ask with ${askUserToolName}. The user then answers in the client's question interface. Ask multiple-choice questions with ${askUserToolName} too, not in plain text. A link or command the user must open or run goes in your reply text, not in the question.`;
+
+    // Chat: the stream shows the question and waits for the answer.
+    const chat = await buildAgentSystemPrompt({
+      ...common,
+      mcpTools: withAskUser,
+      canAskUser: true,
+    });
+    expect(chat).toContain(`${TOOL_DENIAL_INSTRUCTION} ${choiceRule}`);
+
+    // A2A, ChatOps, schedules and subagents list the tool too, but nobody can
+    // answer it there: a plain-text question is the only one that arrives.
+    const headless = await buildAgentSystemPrompt({
+      ...common,
+      mcpTools: withAskUser,
+    });
+    expect(headless).toContain(TOOL_DENIAL_INSTRUCTION);
+    expect(headless).not.toContain(askUserToolName);
+
+    // Nor where the tool is not in the set the model sees.
+    const withoutTool = await buildAgentSystemPrompt({
+      ...common,
+      mcpTools: someTool,
+      canAskUser: true,
+    });
+    expect(withoutTool).not.toContain(askUserToolName);
+  });
+
+  test("opens remedy review without a redundant consent question", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    // Enforcement needs both switches; otherwise no ruling can reach the
+    // model and the remedy instruction is omitted.
+    const openappa = config.openappa;
+    config.openappa = parseOpenAppaConfig();
+    await GuardrailsDeploymentModel.setEnabled(true);
+
+    try {
+      const prompt = await buildAgentSystemPrompt({
+        agent,
+        mcpTools: {},
+        organizationId: agent.organizationId,
+        userId: user.id,
+        agentId: agent.id,
+      });
+
+      expect(prompt).toBe(
+        `You are helpful.\n\n${TOOL_DENIAL_INSTRUCTION}\n\n${buildAppaRemedyInstruction({ canAskUser: false })}`,
+      );
+      // The model sees its own call answered with a ruling, never a call to
+      // the notice tool, and calls the control tool by its branded name.
+      const instruction = buildAppaRemedyInstruction({ canAskUser: true });
+      expect(
+        await buildAgentSystemPrompt({
+          agent,
+          mcpTools: withAskUser,
+          canAskUser: true,
+          organizationId: agent.organizationId,
+          userId: user.id,
+          agentId: agent.id,
+        }),
+      ).toContain(instruction);
+      // The instruction says who decides; it never tells the model to skip
+      // the user, which provider safety classifiers refuse.
+      expect(instruction).not.toContain("Do not ask permission");
+      expect(instruction).not.toMatch(/immediately/i);
+      expect(instruction).not.toContain("get_remedy_plans");
+      // A run nobody can answer a question in never points at ask_user.
+      const headless = buildAppaRemedyInstruction({ canAskUser: false });
+      expect(headless).not.toContain(askUserToolName);
+    } finally {
+      config.openappa = openappa;
+    }
+  });
+
+  test("omits the remedy instruction when only the server flag is on", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const openappa = config.openappa;
+    config.openappa = parseOpenAppaConfig();
+    await GuardrailsDeploymentModel.setEnabled(false);
+
+    try {
+      const prompt = await buildAgentSystemPrompt({
+        agent,
+        mcpTools: {},
+        organizationId: agent.organizationId,
+        userId: user.id,
+        agentId: agent.id,
+      });
+
+      expect(prompt).toBe(`You are helpful.\n\n${TOOL_DENIAL_INSTRUCTION}`);
+    } finally {
+      config.openappa = openappa;
+    }
+  });
+
+  test("renders Handlebars user context from a fetched user and their teams", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+    makeTeam,
+    makeTeamMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "Hi {{user.name}} <{{user.email}}>. Teams: {{user.teams}}.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser({ email: "alice@test.com" });
+    await makeMember(user.id, agent.organizationId);
+    const team = await makeTeam(agent.organizationId, user.id, {
+      name: "Platform",
+    });
+    await makeTeamMember(team.id, user.id);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    });
+
+    expect(prompt).toContain("<alice@test.com>.");
+    expect(prompt).toContain("Teams: Platform.");
+  });
+
+  test("renders the invoking user's organization role", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "Role: {{user.role}}.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser({ email: "admin@test.com" });
+    await makeMember(user.id, agent.organizationId, { role: ADMIN_ROLE_NAME });
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    });
+
+    expect(prompt).toContain(`Role: ${ADMIN_ROLE_NAME}.`);
+  });
+
+  test("substitutes the valid variables when the prompt also holds an unparseable expression", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    // A prompt that documents its own variables cannot be compiled, and used to
+    // send every expression in it to the model as literal text.
+    const agent = await makeAgent({
+      systemPrompt: "Hi {{user.name}}. Available: {{user.*}}.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser({ name: "Alice", email: "alice@test.com" });
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    });
+
+    expect(prompt).toContain("Hi Alice.");
+    expect(prompt).not.toContain("{{user.name}}");
+    // Only the expression Handlebars cannot read stays as the author wrote it.
+    expect(prompt).toContain("Available: {{user.*}}.");
+  });
+
+  test("an over-budget catalog drops descriptions and names list_skills only when the agent has it", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "Base.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId, { role: ADMIN_ROLE_NAME });
+    await SkillModel.createWithFiles({
+      skill: {
+        organizationId: agent.organizationId,
+        name: "oversized",
+        description: "x".repeat(SKILL_CATALOG_CHAR_BUDGET + 1),
+        content: "# Oversized",
+        metadata: {},
+        sourceType: "manual",
+      },
+      files: [],
+      ...accessGrants("org"),
+    });
+    const listSkillsToolName = brand(TOOL_LIST_SKILLS_SHORT_NAME);
+    const build = (mcpTools: Record<string, Tool>) =>
+      buildAgentSystemPrompt({
+        agent,
+        mcpTools,
+        organizationId: agent.organizationId,
+        userId: user.id,
+        agentId: agent.id,
+      });
+
+    const searchable = await build({
+      ...withLoadSkill,
+      [listSkillsToolName]: {} as Tool,
+    });
+    expect(searchable).toContain('<skill name="oversized"/>');
+    expect(searchable).not.toContain("xxxx");
+    expect(searchable).toContain(listSkillsToolName);
+    expect(await build(withLoadSkill)).not.toContain(listSkillsToolName);
+  });
+
+  test("includes the skill catalog only when the load-skill tool is present", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "Base.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId, { role: ADMIN_ROLE_NAME });
+    await seedSkill(agent.organizationId);
+
+    const withCatalog = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: withLoadSkill,
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    });
+    expect(withCatalog).toContain("<available_skills>");
+    expect(withCatalog).toContain("pdf-processing");
+
+    await AgentModel.setActivationSkillPolicyState({
+      id: agent.id,
+      mode: "manual",
+      revision: 1,
+    });
+    const restrictedCatalog = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: withLoadSkill,
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    });
+    expect(restrictedCatalog).not.toContain("pdf-processing");
+
+    const withoutCatalog = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: someTool,
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    });
+    expect(withoutCatalog).not.toContain("<available_skills>");
+  });
+
+  test("adds file-handling guidance only when the agent has file tools", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "Base.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+    const common = {
+      agent,
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    };
+
+    const withFiles = await buildAgentSystemPrompt({
+      ...common,
+      mcpTools: withFileTools,
+    });
+    // sandbox surface
+    expect(withFiles).toContain("code execution environment");
+    expect(withFiles).toContain(SKILL_SANDBOX_ATTACHMENTS_DIR);
+    // persistent-files surface + the "find the file the user referred to" path
+    expect(withFiles).toContain("persistent files");
+    expect(withFiles).toContain("Files panel");
+    expect(withFiles).toContain(searchFilesToolName);
+    expect(withFiles).toContain("did not attach this turn");
+
+    // an agent with no file tools gets no file-handling guidance at all
+    const withoutFiles = await buildAgentSystemPrompt({
+      ...common,
+      mcpTools: someTool,
+    });
+    expect(withoutFiles).not.toContain("code execution environment");
+    expect(withoutFiles).not.toContain(SKILL_SANDBOX_ATTACHMENTS_DIR);
+    expect(withoutFiles).not.toContain("persistent files");
+  });
+
+  test("words file guidance to the tools present: sandbox-only omits persistent-file discovery", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "Base.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: withSandboxOnly,
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    });
+
+    // sandbox guidance is present, but the persistent-file search/discovery
+    // paragraph is not — those tools aren't available to this agent.
+    expect(prompt).toContain("code execution environment");
+    expect(prompt).not.toContain(searchFilesToolName);
+    expect(prompt).not.toContain("did not attach this turn");
+  });
+
+  test("without the code runtime, file guidance never mentions the sandbox", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "Base.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: withFilesOnly,
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    });
+
+    // The persistent-file guidance is all there...
+    expect(prompt).toContain("Files panel");
+    expect(prompt).toContain(searchFilesToolName);
+    expect(prompt).toContain("did not attach this turn");
+    // ...but nothing points at a sandbox the agent doesn't have.
+    expect(prompt).not.toMatch(/sandbox/i);
+    expect(prompt).not.toContain(SKILL_SANDBOX_HOME);
+  });
+
+  test("app-exchange guidance is gated on copy_file and keeps the source filename", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "Base.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+    const common = {
+      agent,
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    };
+
+    const withCopy = await buildAgentSystemPrompt({
+      ...common,
+      mcpTools: {
+        ...withFileTools,
+        [brand(TOOL_COPY_FILE_SHORT_NAME)]: {} as Tool,
+      },
+    });
+    expect(withCopy).toContain(brand(TOOL_COPY_FILE_SHORT_NAME));
+    // The copy lands under the source's own name — that name (extension and
+    // all) is how the app finds the file and how it picks a parser. Guidance
+    // that told the model to rename every copy into an app-declared input slot
+    // made agents hand a .obj to an app as "model.stl", which then parsed it as
+    // STL and drew garbage.
+    expect(withCopy).toContain("keeps the source's filename");
+    expect(withCopy).toContain("never rewrite the extension");
+
+    const withoutCopy = await buildAgentSystemPrompt({
+      ...common,
+      mcpTools: withFileTools,
+    });
+    expect(withoutCopy).not.toContain(brand(TOOL_COPY_FILE_SHORT_NAME));
+    expect(withoutCopy).not.toContain("keeps the source's filename");
+  });
+
+  test("adds the tool-result instruction only when tools are present", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "Base.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+    const common = {
+      agent,
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    };
+
+    expect(
+      await buildAgentSystemPrompt({ ...common, mcpTools: someTool }),
+    ).toContain(TOOL_UI_RESULT_INSTRUCTION);
+    expect(
+      await buildAgentSystemPrompt({ ...common, mcpTools: {} }),
+    ).not.toContain(TOOL_UI_RESULT_INSTRUCTION);
+  });
+
+  test("adds the app-build conduct instruction when the agent can build apps", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "Base.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+    const common = {
+      agent,
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    };
+
+    // Direct exposure: keyed off the scaffold_app tool being assigned.
+    const withScaffoldApp: Record<string, Tool> = {
+      [brand(TOOL_SCAFFOLD_APP_SHORT_NAME)]: {} as Tool,
+    };
+    expect(
+      await buildAgentSystemPrompt({ ...common, mcpTools: withScaffoldApp }),
+    ).toContain(APP_BUILD_CONDUCT_INSTRUCTION);
+    expect(
+      await buildAgentSystemPrompt({ ...common, mcpTools: someTool }),
+    ).not.toContain(APP_BUILD_CONDUCT_INSTRUCTION);
+
+    // search_and_run_only can dispatch scaffold_app without it being listed,
+    // so the mode alone qualifies.
+    const searchAgent = await makeAgent({
+      systemPrompt: "Base.",
+      toolExposureMode: "search_and_run_only",
+    });
+    await makeMember(user.id, searchAgent.organizationId);
+    expect(
+      await buildAgentSystemPrompt({
+        agent: searchAgent,
+        mcpTools: {},
+        organizationId: searchAgent.organizationId,
+        userId: user.id,
+        agentId: searchAgent.id,
+      }),
+    ).toContain(APP_BUILD_CONDUCT_INSTRUCTION);
+  });
+
+  test("adds the tool-loading instruction only in search_and_run_only mode", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const user = await makeUser();
+    const searchAgent = await makeAgent({
+      systemPrompt: "Base.",
+      toolExposureMode: "search_and_run_only",
+    });
+    await makeMember(user.id, searchAgent.organizationId);
+
+    const searchPrompt = await buildAgentSystemPrompt({
+      agent: searchAgent,
+      mcpTools: {},
+      organizationId: searchAgent.organizationId,
+      userId: user.id,
+      agentId: searchAgent.id,
+    });
+    expect(searchPrompt).toContain("must be discovered");
+    // Search by capability, never with the value being looked up — the model
+    // was querying search_tools with the user's target string ("tabman").
+    expect(searchPrompt).toContain(
+      "never with the specific value you are looking up",
+    );
+    // Reuse a name already in hand instead of re-discovering it.
+    expect(searchPrompt).toContain(
+      "call `archestra__run_tool` with it directly instead of searching again",
+    );
+    // Don't fire the same discovery query twice in a turn.
+    expect(searchPrompt).toContain(
+      "Do not repeat a `archestra__search_tools` call you have already made",
+    );
+
+    const fullAgent = await makeAgent({
+      systemPrompt: "Base.",
+      toolExposureMode: "full",
+      organizationId: searchAgent.organizationId,
+    });
+    const fullPrompt = await buildAgentSystemPrompt({
+      agent: fullAgent,
+      mcpTools: {},
+      organizationId: fullAgent.organizationId,
+      userId: user.id,
+      agentId: fullAgent.id,
+    });
+    expect(fullPrompt).not.toContain("must be discovered");
+  });
+
+  // The app tools are hidden from tools/list in search_and_run_only mode, so
+  // the tool-loading section names scaffold_app verbatim (run_tool only
+  // accepts names the model has seen) — unconditionally, with no dispatch-gate
+  // mirroring: a non-dispatchable name is refused by run_tool with a clear
+  // error at call time.
+  test("names direct app build and rollback paths in the tool-loading instruction", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const user = await makeUser();
+    const scaffoldAppName = brand(TOOL_SCAFFOLD_APP_SHORT_NAME);
+    const listAppsName = brand(TOOL_LIST_APPS_SHORT_NAME);
+    const listAppVersionsName = brand(TOOL_LIST_APP_VERSIONS_SHORT_NAME);
+    const restoreAppVersionName = brand(TOOL_RESTORE_APP_VERSION_SHORT_NAME);
+
+    const searchAgent = await makeAgent({
+      systemPrompt: "Base.",
+      toolExposureMode: "search_and_run_only",
+    });
+    await makeMember(user.id, searchAgent.organizationId);
+    const common = {
+      mcpTools: {},
+      organizationId: searchAgent.organizationId,
+      userId: user.id,
+    };
+
+    // nothing assigned — the steering still names the build entry point
+    const searchPrompt = await buildAgentSystemPrompt({
+      ...common,
+      agent: searchAgent,
+      agentId: searchAgent.id,
+    });
+    expect(searchPrompt).toContain(scaffoldAppName);
+    expect(searchPrompt).toContain(listAppsName);
+    expect(searchPrompt).toContain(listAppVersionsName);
+    expect(searchPrompt).toContain(restoreAppVersionName);
+    expect(searchPrompt).toContain(
+      "Never call `read_app` or reproduce historical HTML through `edit_app` for a rollback.",
+    );
+
+    // full mode has no tool-loading section, so no app steering either
+    const fullAgent = await makeAgent({
+      systemPrompt: "Base.",
+      toolExposureMode: "full",
+      organizationId: searchAgent.organizationId,
+    });
+    const fullPrompt = await buildAgentSystemPrompt({
+      ...common,
+      agent: fullAgent,
+      agentId: fullAgent.id,
+    });
+    expect(fullPrompt).not.toContain(scaffoldAppName);
+    expect(fullPrompt).not.toContain(restoreAppVersionName);
+  });
+
+  test("appends the hook session context last", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "Base.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      hookSessionContext: "SESSION-CONTEXT-MARKER",
+    });
+
+    expect(prompt?.endsWith("SESSION-CONTEXT-MARKER")).toBe(true);
+  });
+
+  test("injects project instructions right after the agent's own prompt", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      projectInstructions: "PROJECT-RULES-MARKER",
+    });
+
+    // Present, framed by the canonical prefix, and positioned after the agent
+    // prompt but before the denial instruction.
+    expect(prompt).toContain(PROJECT_INSTRUCTIONS_PREFIX);
+    expect(prompt).toContain("PROJECT-RULES-MARKER");
+    expect(prompt).toBe(
+      `You are helpful.\n\n${PROJECT_INSTRUCTIONS_PREFIX}\n\nPROJECT-RULES-MARKER\n\n${TOOL_DENIAL_INSTRUCTION}`,
+    );
+  });
+
+  test("omits the project instructions section when none are given", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    });
+
+    expect(prompt).not.toContain(PROJECT_INSTRUCTIONS_PREFIX);
+  });
+
+  test("lists the project's files with read/search guidance from the tools present", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: withFileTools,
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      projectFileNames: ["styles.css", "index.html", "app4.js"],
+    });
+
+    expect(prompt).toContain(PROJECT_FILES_PREFIX);
+    // Sorted for a byte-stable block, regardless of input (newest-first) order.
+    expect(prompt).toContain('"app4.js", "index.html", "styles.css"');
+    // The core behavioral fix: the model must not deny files that exist.
+    expect(prompt).toContain(
+      "never claim no files were attached while this list is non-empty",
+    );
+    expect(prompt).toContain(`\`${brand(TOOL_READ_FILE_SHORT_NAME)}\``);
+    expect(prompt).toContain(`\`${searchFilesToolName}\``);
+  });
+
+  test("caps the project-files manifest and never presents it as complete", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: null,
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const fileNames = Array.from(
+      { length: 103 },
+      (_, i) => `file-${String(i).padStart(3, "0")}.txt`,
+    );
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      projectFileNames: fileNames,
+    });
+
+    expect(prompt).toContain(PROJECT_FILES_PREFIX);
+    expect(prompt).toContain(", and 3 more.");
+    // Without the file tools no tool names may be referenced.
+    expect(prompt).not.toContain(searchFilesToolName);
+    expect(prompt).not.toContain(brand(TOOL_READ_FILE_SHORT_NAME));
+  });
+
+  test("omits the project-files manifest when the project has no files", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: withFileTools,
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      projectFileNames: [],
+    });
+
+    expect(prompt).not.toContain(PROJECT_FILES_PREFIX);
+  });
+
+  test("names the open external app, its tool namespace, and how to discover its tools", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "search_and_run_only",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: { [searchToolsToolName]: {} as Tool },
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      openedApp: {
+        kind: "external",
+        name: "Archestra HR",
+        description: "Applicant tracking.",
+        toolNamespace: "archestra_hr",
+      },
+    });
+
+    expect(prompt).toContain(`${OPENED_APP_PREFIX} "Archestra HR".`);
+    expect(prompt).toContain("Applicant tracking.");
+    // The namespace is what makes the app reachable: the model must be told the
+    // dispatchable prefix, not just the display name.
+    expect(prompt).toContain("`archestra_hr__*`");
+    expect(prompt).toContain(`\`${searchToolsToolName}\``);
+    expect(prompt).toContain('`query: "^archestra_hr__"`');
+  });
+
+  test("omits the tool-discovery hint when the agent has no search_tools", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: someTool,
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      openedApp: {
+        kind: "external",
+        name: "Archestra HR",
+        description: null,
+        toolNamespace: "archestra_hr",
+      },
+    });
+
+    expect(prompt).toContain("`archestra_hr__*`");
+    // Never name a tool the agent cannot call.
+    expect(prompt).not.toContain(searchToolsToolName);
+  });
+
+  test("drops the tool guidance when the open app's namespace is unknown", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "search_and_run_only",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: { [searchToolsToolName]: {} as Tool },
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      openedApp: {
+        kind: "external",
+        name: "Archestra HR",
+        description: null,
+        toolNamespace: null,
+      },
+    });
+
+    // Still framed as the open app, but with no prefix invented for it — a
+    // wrong namespace sends the model hunting for tools that do not exist.
+    expect(prompt).toContain(`${OPENED_APP_PREFIX} "Archestra HR".`);
+    expect(prompt).not.toContain("__*");
+    expect(prompt).not.toContain('mode: "regex"');
+  });
+
+  test("tells the model to change, not rebuild, an open owned app", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      openedApp: ownedApp({
+        id: "opened-app-1",
+        name: "Expense Tracker",
+        description: "Logs receipts.",
+      }),
+    });
+
+    expect(prompt).toContain(`${OPENED_APP_PREFIX} "Expense Tracker".`);
+    expect(prompt).toContain("change this app rather than building a new one");
+    // The owned block must not leak the external block's tool guidance.
+    expect(prompt).not.toContain("__*");
+    // A toolless app (a game, a static tracker) gets no tool sentence at all —
+    // an empty list would only send the model looking for capabilities.
+    expect(prompt).not.toContain("It is built on these tools");
+  });
+
+  test("names each file in the open app's per-viewer store with its size", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      openedApp: ownedApp({
+        id: "opened-app-5",
+        name: "Expense Tracker",
+        files: [
+          { filename: "budget.xlsx", sizeBytes: 2048 },
+          { filename: "receipts.csv", sizeBytes: 12 },
+        ],
+        hasFileStore: true,
+      }),
+    });
+
+    // Filenames are app/user-authored, so they render quoted as data; the size
+    // is what lets the model answer "how big is it" without a lookup.
+    expect(prompt).toContain(
+      'Its per-user file store currently holds: "budget.xlsx" (2048 bytes), "receipts.csv" (12 bytes).',
+    );
+    // The inventory must read as authoritative for this turn, not as a stale
+    // hint the model should re-derive.
+    expect(prompt).toContain("This inventory is current as of this turn");
+    expect(prompt).not.toContain("and 0 more");
+  });
+
+  test("caps a long file inventory without reading as the complete one", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const files = Array.from({ length: 54 }, (_, i) => ({
+      filename: `file_${i}.txt`,
+      sizeBytes: i,
+    }));
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      openedApp: ownedApp({
+        id: "opened-app-6",
+        name: "Kitchen Sink",
+        files,
+        hasFileStore: true,
+      }),
+    });
+
+    expect(prompt).toContain('"file_0.txt"');
+    expect(prompt).toContain('"file_49.txt"');
+    expect(prompt).not.toContain('"file_50.txt"');
+    // Silent truncation would read as "these are all of them" and let the
+    // model deny a file that exists.
+    expect(prompt).toContain(", and 4 more.");
+  });
+
+  test("states that the open app's file store is empty rather than staying silent", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      openedApp: ownedApp({
+        id: "opened-app-7",
+        name: "Expense Tracker",
+        hasFileStore: true,
+      }),
+    });
+
+    // "No files" is a real answer — without the line the model would go
+    // hunting or guess, exactly what the inventory exists to prevent.
+    expect(prompt).toContain("Its per-user file store is currently empty");
+  });
+
+  test("says nothing about files when the deployment has no file store", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      openedApp: ownedApp({ id: "opened-app-8", name: "Expense Tracker" }),
+    });
+
+    // "No file feature" must not read as "no files": a deployment without the
+    // sandbox says nothing rather than describing a store that does not exist.
+    expect(prompt).not.toContain("per-user file store");
+  });
+
+  test("quotes what the open app reports it is currently showing", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      openedApp: ownedApp({
+        id: "opened-app-9",
+        name: "Expense Tracker",
+        reportedContext: "Viewing receipts.csv",
+      }),
+    });
+
+    // App-authored text stays quoted as data, and the block anchors the user's
+    // deictic "this file" / "what I'm looking at" to it.
+    expect(prompt).toContain(
+      'The app reports what it is currently showing as: "Viewing receipts.csv".',
+    );
+    expect(prompt).toContain(
+      `When the user says "this file" or "what I'm looking at", they mean this.`,
+    );
+  });
+
+  test("names an open owned app's assigned tools", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "search_and_run_only",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const openedApp = ownedApp({
+      id: "opened-app-2",
+      name: "Notification Triage",
+      description: "A notification-style inbox.",
+      tools: ["github__search_issues", "github__search_pull_requests"],
+    });
+    const common = {
+      agent,
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      openedApp,
+    };
+
+    const prompt = await buildAgentSystemPrompt({ ...common, mcpTools: {} });
+
+    // The assigned tools are the app's curated core — call them directly.
+    expect(prompt).toContain(
+      "It is built on these tools: `github__search_issues`, `github__search_pull_requests`.",
+    );
+    expect(prompt).not.toContain("and 0 more");
+    // Without run_tool there is nothing to pass a name to.
+    expect(prompt).not.toContain("These names are exact");
+    // Without search_tools there is no discovery path to point at.
+    expect(prompt).not.toContain("__*");
+
+    // The real search_and_run_only case: the chat has both dispatchers. The
+    // assigned four are only a slice of the github server; the block must point
+    // discovery at `github__*` so the model reaches search_users, search_repos,
+    // and the rest — not stop at the listed set, which is the bug the "nothing
+    // to discover" framing caused.
+    const withDispatchers = await buildAgentSystemPrompt({
+      ...common,
+      mcpTools: {
+        [runToolToolName]: {} as Tool,
+        [searchToolsToolName]: {} as Tool,
+      },
+    });
+    expect(withDispatchers).toContain(
+      `pass one to \`${runToolToolName}\` directly rather than searching for it first`,
+    );
+    expect(withDispatchers).toContain(
+      "only a slice of what the `github` MCP server can do",
+    );
+    expect(withDispatchers).toContain(
+      `search \`github__*\` with \`${searchToolsToolName}\``,
+    );
+    // The block must never steer the model away from the reachable long tail.
+    expect(withDispatchers).not.toContain("nothing to discover");
+  });
+
+  test("points discovery at every backing server an owned app draws on", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "search_and_run_only",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {
+        [runToolToolName]: {} as Tool,
+        [searchToolsToolName]: {} as Tool,
+      },
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      openedApp: ownedApp({
+        id: "opened-app-3",
+        name: "Cross-poster",
+        // Two upstream servers plus a recognized archestra built-in: the
+        // built-in is already directly available and must not become a search
+        // target (its short name is in the registered set, so it is excluded).
+        tools: [
+          "github__search_issues",
+          "linear__list_issues",
+          searchToolsToolName,
+        ],
+      }),
+    });
+
+    // Both real servers are named as domains and get a scoped discovery regex.
+    expect(prompt).toContain("`github` and `linear` MCP servers");
+    expect(prompt).toContain("`github__*` and `linear__*`");
+    // The archestra built-in is not a server to go discover more of.
+    expect(prompt).not.toContain("archestra__*");
+  });
+
+  test("caps a long tool list without reading as the complete one", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "search_and_run_only",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const tools = Array.from({ length: 34 }, (_, i) => `srv__tool_${i}`);
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+      openedApp: ownedApp({ id: "opened-app-4", name: "Kitchen Sink", tools }),
+    });
+
+    expect(prompt).toContain("`srv__tool_0`");
+    expect(prompt).toContain("`srv__tool_29`");
+    expect(prompt).not.toContain("`srv__tool_30`");
+    // Silent truncation would read as "these are all of them" and invite the
+    // model to conclude the app cannot do the rest.
+    expect(prompt).toContain(", and 4 more.");
+  });
+
+  test("omits the open-app section for an ordinary chat", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: "You are helpful.",
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    });
+
+    expect(prompt).not.toContain(OPENED_APP_PREFIX);
+  });
+
+  test("returns the denial instruction alone for an agent with no base prompt or tools", async ({
+    makeAgent,
+    makeUser,
+    makeMember,
+  }) => {
+    const agent = await makeAgent({
+      systemPrompt: null,
+      toolExposureMode: "full",
+    });
+    const user = await makeUser();
+    await makeMember(user.id, agent.organizationId);
+
+    const prompt = await buildAgentSystemPrompt({
+      agent,
+      mcpTools: {},
+      organizationId: agent.organizationId,
+      userId: user.id,
+      agentId: agent.id,
+    });
+
+    expect(prompt).toBe(TOOL_DENIAL_INSTRUCTION);
+  });
+});

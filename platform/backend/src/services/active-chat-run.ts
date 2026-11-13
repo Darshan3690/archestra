@@ -1,0 +1,809 @@
+import type { UIMessageChunk } from "ai";
+import config from "@/config";
+import type { EncryptedChatAuditContext } from "@/content-encryption/encrypted-chat";
+import logger from "@/logging";
+import ActiveChatRunModel from "@/models/chat-active-run";
+import {
+  type ActiveChatRunNotifier,
+  createActiveChatRunNotifier,
+} from "@/services/active-chat-run-notifier";
+import { ApiError } from "@/types";
+import type { ChatActiveRunStatus } from "@/types/chat-active-run";
+
+const EVENT_FLUSH_INTERVAL_MS = 500;
+const EVENT_BATCH_SIZE = 256;
+// Liveness: a draining run refreshes its row's `updatedAt` at least every
+// RUN_TOUCH_INTERVAL_MS, checked every LIVENESS_CHECK_INTERVAL_MS even while
+// the stream is silent, so a live run's row is never older than ~20s. A run
+// untouched for STALE_RUNNING_MS has lost its owning process (hard kill, OOM,
+// crashed pod) and is failed by the reaper or by a Stop request.
+const RUN_TOUCH_INTERVAL_MS = 15 * 1000;
+const LIVENESS_CHECK_INTERVAL_MS = 5 * 1000;
+const STALE_RUNNING_MS = 60 * 1000;
+// Upper bound on how long Stop waits for the run to leave `running`, so the
+// request always resolves even when the owner neither finishes nor goes stale.
+const STOP_WAIT_TIMEOUT_MS = 15 * 1000;
+const TERMINAL_CLEANUP_INTERVAL_MS = 60 * 1000;
+const ACTIVE_CHAT_RUN_TERMINAL_RETENTION_MS = 60 * 60 * 1000;
+export const ACTIVE_CHAT_RUN_TERMINAL_REPLAY_GRACE_MS = 2 * 60 * 1000;
+
+/**
+ * @public - exported for testability
+ */
+export class ActiveChatRunService {
+  private nextTerminalCleanupAt = 0;
+  // Run ids this process created and believes may still be 'running'. Used to
+  // fail only this pod's runs on graceful shutdown (no schema-level pod id).
+  private readonly inFlightRunIds = new Set<string>();
+  // Lets a Stop request handled by this process abort its stream immediately.
+  // Cross-replica requests still wake the owner through the notifier below.
+  private readonly abortControllersByRunId = new Map<string, AbortController>();
+  private isShuttingDown = false;
+
+  constructor(
+    private readonly notifier: ActiveChatRunNotifier,
+    private readonly replayPollIntervalMs: number,
+    private readonly stopPollIntervalMs: number,
+  ) {}
+
+  get shuttingDown(): boolean {
+    return this.isShuttingDown;
+  }
+
+  async createRun(params: {
+    conversationId: string;
+    userId: string;
+    organizationId: string;
+  }) {
+    // Refuse new runs once shutdown started, so nothing is created after
+    // failInFlightRuns() has already snapshotted this pod's runs to fail.
+    if (this.isShuttingDown) {
+      return null;
+    }
+
+    this.cleanupTerminalRunsIfNeeded(params.conversationId);
+
+    const run = await ActiveChatRunModel.create(params);
+    if (run) {
+      return this.registerCreatedRun(run);
+    }
+
+    try {
+      await ActiveChatRunModel.markStaleRunningAsFailed(STALE_RUNNING_MS);
+    } catch (error) {
+      logger.warn(
+        { error, conversationId: params.conversationId },
+        "Failed to mark stale active chat runs as failed",
+      );
+    }
+
+    const retriedRun = await ActiveChatRunModel.create(params);
+    return retriedRun ? this.registerCreatedRun(retriedRun) : null;
+  }
+
+  beginShutdown(): void {
+    this.isShuttingDown = true;
+  }
+
+  // Single terminal-transition entry point so the in-flight set stays bounded.
+  // Removes from the set only after the DB write resolves: if it throws, the id
+  // is retained so failInFlightRuns()/the reaper still fail the run later.
+  async markTerminal(params: {
+    runId: string;
+    status: Exclude<ChatActiveRunStatus, "running">;
+    error?: string | null;
+  }): Promise<void> {
+    await ActiveChatRunModel.markTerminal(params);
+    this.inFlightRunIds.delete(params.runId);
+    await this.notifyEvent(params.runId);
+  }
+
+  // Periodic safety net for runs orphaned by a hard kill (OOM/SIGKILL) that
+  // never reached graceful shutdown. Graceful shutdown handles the common case.
+  // Intentionally does not prune inFlightRunIds: a leftover id is a harmless
+  // no-op for failInFlightRuns (it re-asserts status='running' in SQL), and the
+  // set is fully cleared on shutdown.
+  async reapStaleRuns(): Promise<void> {
+    try {
+      const reaped =
+        await ActiveChatRunModel.markStaleRunningAsFailed(STALE_RUNNING_MS);
+      if (reaped > 0) {
+        logger.info({ reaped }, "Reaped stale active chat runs");
+      }
+    } catch (error) {
+      logger.warn({ error }, "Failed to reap stale active chat runs");
+    }
+  }
+
+  // Best-effort cleanup on graceful shutdown: fail this pod's still-running runs
+  // so their conversations are not blocked until the stale reaper catches up.
+  async failInFlightRuns(): Promise<number> {
+    const ids = Array.from(this.inFlightRunIds);
+
+    const failed = await ActiveChatRunModel.markRunningAsFailedByIds({
+      ids,
+      error: "Server shut down before the chat stream completed.",
+    });
+
+    // Remove only the snapshotted ids, and only after the write resolves
+    // (mirrors markTerminal): on throw the ids are retained for the stale-run
+    // reaper, and a run registered concurrently during the shutdown window is
+    // left to its own registerCreatedRun/markTerminal rather than clobbered.
+    for (const id of ids) {
+      this.inFlightRunIds.delete(id);
+    }
+
+    if (failed > 0) {
+      logger.info({ failed }, "Failed in-flight active chat runs on shutdown");
+    }
+
+    return failed;
+  }
+
+  async requestStop(params: {
+    conversationId: string;
+    organizationId: string;
+  }) {
+    const run = await ActiveChatRunModel.requestStop(params);
+    if (run) {
+      const abortController = this.abortControllersByRunId.get(run.id);
+      if (abortController && !abortController.signal.aborted) {
+        abortController.abort();
+      }
+      await this.notifyStop(run.id);
+    }
+
+    return run;
+  }
+
+  /**
+   * Stop's hand-off barrier: resolves once the run has left `running`.
+   *
+   * A live owner (on any replica) aborts on the stop request and marks the run
+   * terminal within moments. An owner that died without graceful shutdown
+   * never will, so a run whose liveness touch is older than the stale window
+   * is failed here instead of waiting for the reaper — the user asked to stop
+   * it, and a live owner keeps its row fresh, so only an ownerless run
+   * qualifies. Bounded by `timeoutMs`; a run still `running` at the deadline
+   * rejects the hand-off so the client keeps waiting rather than sending an
+   * overlapping turn. Its owner or the reaper still owns terminalization.
+   */
+  async waitForTerminal(
+    runId: string,
+    options: { timeoutMs?: number } = {},
+  ): Promise<void> {
+    const deadline = Date.now() + (options.timeoutMs ?? STOP_WAIT_TIMEOUT_MS);
+
+    while (true) {
+      const run = await ActiveChatRunModel.findById(runId);
+      if (!run || run.status !== "running") {
+        return;
+      }
+
+      if (Date.now() - run.updatedAt.getTime() > STALE_RUNNING_MS) {
+        const failed = await ActiveChatRunModel.markRunAsFailedIfStale({
+          runId,
+          staleMs: STALE_RUNNING_MS,
+        });
+        if (failed) {
+          logger.info(
+            { runId, conversationId: run.conversationId },
+            "Failed ownerless active chat run on stop request",
+          );
+          await this.notifyEvent(runId);
+          return;
+        }
+        // A liveness touch landed first: the owner is alive, keep waiting.
+        continue;
+      }
+
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        logger.warn(
+          { runId, conversationId: run.conversationId },
+          "Active chat run still running after stop wait deadline",
+        );
+        throw new ApiError(
+          409,
+          "The response is still stopping. Queued messages will wait until it finishes.",
+        );
+      }
+
+      // Terminal transitions publish on the event channel. The timeout is a
+      // correctness fallback for a missed/cross-replica notification; every
+      // wake re-reads the durable row before Stop is allowed to return.
+      await this.notifier.waitForEvent({
+        runId,
+        timeoutMs: Math.min(this.replayPollIntervalMs, remainingMs),
+      });
+    }
+  }
+
+  /**
+   * Finalize the run a soft-deleted conversation left behind, at restore time.
+   * Deleting a conversation only stamps `stopRequestedAt` (the row itself
+   * survives, unlike the old hard delete's cascade); a stream that still owns
+   * the row observes that within a poll and marks the run terminal itself, but
+   * when nothing owns it — the backend restarted mid-run, the pod was
+   * rescheduled — the row stays `running` until the stale reaper catches it,
+   * and `running` blocks the next turn on the restored chat via
+   * the one-running-run-per-conversation unique index.
+   *
+   * Restore never resurrects a stream, so the run is finished by definition:
+   * mark it cancelled and wake any straggling stream so it stops promptly.
+   * `markTerminal` only transitions a `running` row, so a run that finished on
+   * its own in the meantime keeps the status it reached.
+   */
+  async cancelRunForRestoredConversation(conversationId: string) {
+    const run =
+      await ActiveChatRunModel.findRunningByConversation(conversationId);
+    if (!run) {
+      return null;
+    }
+
+    const cancelled = await ActiveChatRunModel.markTerminal({
+      runId: run.id,
+      status: "cancelled",
+    });
+    await this.notifyStop(run.id);
+
+    return cancelled;
+  }
+
+  drainStreamToEvents(params: {
+    runId: string;
+    conversationId: string;
+    stream: ReadableStream<UIMessageChunk>;
+    getTerminalStatus: () => Promise<{
+      status: "completed" | "failed" | "cancelled";
+      error?: string | null;
+    }>;
+    abortController?: AbortController;
+    /**
+     * Encrypted chats: replay event payloads are raw stream chunks, so
+     * they are stored encrypted under the conversation key.
+     */
+    encryptedChatAudit?: EncryptedChatAuditContext | null;
+    /**
+     * EncryptedChat with no key to encrypt under (no escrow record): payload
+     * persistence is suppressed rather than written in plaintext. The run row
+     * still tracks liveness (flushes touch it), but reconnect replay is
+     * unavailable for that run.
+     */
+    suppressEventPayloads?: boolean;
+  }): { terminalReady: Promise<void> } {
+    // Resolves once the drain has attempted the terminal write on every path
+    // below (or found the run gone). The route awaits this before closing the
+    // client stream, so a client that sends its next message the instant the
+    // response ends doesn't race a row still flagged `running` into a 409.
+    let resolveTerminalReady!: () => void;
+    const terminalReady = new Promise<void>((resolve) => {
+      resolveTerminalReady = resolve;
+    });
+    void (async () => {
+      const reader = params.stream.getReader();
+      // A timer-triggered flush can fail (or observe the run as gone) while the
+      // drain is blocked on reader.read(). The batcher owns that failure and
+      // wakes us here: abort the chat so upstream stops producing, and cancel
+      // the reader so the pending read resolves and the loop reaches its catch.
+      const writer = new ActiveChatRunEventBatcher({
+        runId: params.runId,
+        suppressPayloads: params.suppressEventPayloads ?? false,
+        encryptedChatAudit: params.encryptedChatAudit ?? null,
+        onFlush: () => this.notifyEvent(params.runId),
+        onAsyncFailure: (error) => {
+          if (!params.abortController?.signal.aborted) {
+            params.abortController?.abort(persistenceAbortReason(error));
+          }
+          void reader.cancel().catch((cancelError) => {
+            logger.warn(
+              { cancelError, runId: params.runId },
+              "Failed to cancel active chat run event reader after async flush failure",
+            );
+          });
+        },
+      });
+      const stopLivenessTouches = writer.startLivenessTouches();
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          await writer.write(value);
+
+          // An error chunk is terminal for the client (the error renders and
+          // the user can immediately retry/resend), but the row only flips to
+          // `failed` once this drain completes — and a wedged upstream stream
+          // can keep it `running` until the stale reaper, 409-blocking every
+          // send in the meantime. Fail the run the moment the error event is
+          // durably flushed: write-then-flush ordering guarantees a replaying
+          // client can never observe the failed status without the error
+          // event, and markTerminal's running-only guard makes the
+          // end-of-stream terminal write below a no-op.
+          if (value.type === "error") {
+            await writer.flush();
+            await this.markTerminal({
+              runId: params.runId,
+              status: "failed",
+              error: value.errorText,
+            });
+          }
+        }
+
+        await writer.flush();
+        const terminal = await params.getTerminalStatus();
+        await this.markTerminal({
+          runId: params.runId,
+          status: terminal.status,
+          error: terminal.error,
+        });
+      } catch (error) {
+        if (!params.abortController?.signal.aborted) {
+          params.abortController?.abort(persistenceAbortReason(error));
+        }
+        await reader.cancel().catch((cancelError) => {
+          logger.warn(
+            { cancelError, runId: params.runId },
+            "Failed to cancel active chat run event reader after drain error",
+          );
+        });
+
+        // The run row was deleted (its conversation was hard-deleted and
+        // cascaded) while this drain was alive. This is an expected lifecycle
+        // exit, not a persistence failure: stop draining, do not retry inserts
+        // for the gone row, and route through markTerminal only to drop the id
+        // from in-flight tracking (its running-only guard makes the write a
+        // no-op against the missing row).
+        if (error instanceof ActiveChatRunGoneError) {
+          logger.info(
+            { runId: params.runId, conversationId: params.conversationId },
+            "Active chat run row gone during drain, stopping persistence",
+          );
+          await this.markTerminal({ runId: params.runId, status: "cancelled" });
+          return;
+        }
+
+        await writer.flush().catch((flushError) => {
+          logger.error(
+            { flushError, runId: params.runId },
+            "Failed to flush active chat run events after drain error",
+          );
+        });
+        await this.markTerminal({
+          runId: params.runId,
+          status: "failed",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        stopLivenessTouches();
+      }
+    })()
+      .catch((error) => {
+        logger.error(
+          { error, runId: params.runId, conversationId: params.conversationId },
+          "Unexpected active chat run drain failure",
+        );
+      })
+      // Resolves even on an unexpected failure so a waiting client EOF can never
+      // hang; markTerminal's running-only guard already makes a double write a
+      // no-op, and a genuinely stuck `running` row is backstopped by the reaper.
+      .finally(() => {
+        resolveTerminalReady();
+      });
+
+    return { terminalReady };
+  }
+
+  createReplayStream(
+    runId: string,
+    encryptedChatAudit?: EncryptedChatAuditContext | null,
+  ): ReadableStream<UIMessageChunk> {
+    let isCancelled = false;
+    const notifier = this.notifier;
+    const replayPollIntervalMs = this.replayPollIntervalMs;
+    const audit = encryptedChatAudit ?? null;
+
+    return new ReadableStream<UIMessageChunk>({
+      async start(controller) {
+        let lastSeq = 0;
+
+        try {
+          while (!isCancelled) {
+            // Status and events come from one statement snapshot: observing a
+            // terminal status guarantees every event is already in `events`
+            // (see readStatusAndEventsAfter), so closing right after draining
+            // them can never lose a tail chunk.
+            const snapshot = await ActiveChatRunModel.readStatusAndEventsAfter({
+              runId,
+              seq: lastSeq,
+              encryptedChatAudit: audit,
+            });
+
+            // Run row gone: its conversation was hard-deleted and cascaded,
+            // taking all events with it. Nothing left to replay.
+            if (!snapshot) {
+              controller.close();
+              return;
+            }
+
+            for (const event of snapshot.events) {
+              for (const payload of event.payloads) {
+                controller.enqueue(payload);
+              }
+              lastSeq = event.seq;
+            }
+
+            if (snapshot.status !== "running") {
+              controller.close();
+              return;
+            }
+
+            // LISTEN/NOTIFY normally wakes reconnecting clients as soon as new
+            // events are written. The timeout is a fallback poll; in polling
+            // compatibility mode it becomes the only wake-up mechanism.
+            await notifier.waitForEvent({
+              runId,
+              timeoutMs: replayPollIntervalMs,
+            });
+          }
+        } catch (error) {
+          controller.error(error);
+        }
+      },
+      cancel() {
+        isCancelled = true;
+      },
+    });
+  }
+
+  startStopPolling(params: {
+    runId: string;
+    conversationId: string;
+    abortController: AbortController;
+  }): () => void {
+    let stopped = false;
+    const waitController = new AbortController();
+    this.abortControllersByRunId.set(params.runId, params.abortController);
+
+    void (async () => {
+      while (!stopped && !params.abortController.signal.aborted) {
+        try {
+          const run = await ActiveChatRunModel.findById(params.runId);
+          // The row existed when polling started, so a null read now means the
+          // run row is gone (e.g. reaped). Conversation deletion is a soft
+          // delete and leaves this row in place, requesting a stop instead —
+          // that path aborts via stopRequestedAt below. Treat a missing row as
+          // cancellation regardless: there is nothing left to stream into.
+          if (!run) {
+            if (!params.abortController.signal.aborted) {
+              logger.info(
+                { conversationId: params.conversationId, runId: params.runId },
+                "Active chat run row no longer exists, aborting stream",
+              );
+              params.abortController.abort();
+            }
+            return;
+          }
+          if (run.stopRequestedAt && !params.abortController.signal.aborted) {
+            logger.info(
+              { conversationId: params.conversationId, runId: params.runId },
+              "Active chat run stop requested, aborting stream",
+            );
+            params.abortController.abort();
+            return;
+          }
+        } catch (error) {
+          logger.warn(
+            { error, conversationId: params.conversationId },
+            "Failed to poll active chat run stop flag",
+          );
+        }
+
+        // Default mode wakes this loop with Postgres LISTEN/NOTIFY. The timeout
+        // is still a safety poll so missed notifications or broken listener
+        // connections do not leave Stop requests undetected forever. Reading
+        // before the first wait closes the small create/register race where a
+        // Stop notification can arrive before this waiter is installed.
+        await this.notifier.waitForStop({
+          runId: params.runId,
+          timeoutMs: this.stopPollIntervalMs,
+          abortSignal: waitController.signal,
+        });
+      }
+    })();
+
+    return () => {
+      stopped = true;
+      if (
+        this.abortControllersByRunId.get(params.runId) ===
+        params.abortController
+      ) {
+        this.abortControllersByRunId.delete(params.runId);
+      }
+      waitController.abort();
+    };
+  }
+
+  // Track a freshly created run, closing the window where shutdown began while
+  // ActiveChatRunModel.create was awaiting: fail it now rather than orphan it.
+  private async registerCreatedRun(
+    run: NonNullable<Awaited<ReturnType<typeof ActiveChatRunModel.create>>>,
+  ): Promise<typeof run | null> {
+    this.inFlightRunIds.add(run.id);
+
+    if (this.isShuttingDown) {
+      await this.markTerminal({
+        runId: run.id,
+        status: "failed",
+        error: "Server shut down before the chat stream completed.",
+      });
+      return null;
+    }
+
+    return run;
+  }
+
+  private async notifyEvent(runId: string): Promise<void> {
+    await this.notifier.notifyEvent(runId).catch((error) => {
+      logger.warn({ error, runId }, "Failed to notify active chat run event");
+    });
+  }
+
+  private async notifyStop(runId: string): Promise<void> {
+    await this.notifier.notifyStop(runId).catch((error) => {
+      logger.warn({ error, runId }, "Failed to notify active chat run stop");
+    });
+  }
+
+  private cleanupTerminalRunsIfNeeded(conversationId: string): void {
+    const now = Date.now();
+    if (now < this.nextTerminalCleanupAt) {
+      return;
+    }
+
+    this.nextTerminalCleanupAt = now + TERMINAL_CLEANUP_INTERVAL_MS;
+    void ActiveChatRunModel.deleteTerminalOlderThan(
+      ACTIVE_CHAT_RUN_TERMINAL_RETENTION_MS,
+    ).catch((error) => {
+      logger.warn(
+        { error, conversationId },
+        "Failed to clean up old terminal chat runs",
+      );
+    });
+  }
+}
+
+export const activeChatRunService = new ActiveChatRunService(
+  createActiveChatRunNotifier(),
+  config.chat.activeRun.replayPollIntervalMs,
+  config.chat.activeRun.stopPollIntervalMs,
+);
+
+class ActiveChatRunEventBatcher {
+  private nextSeq = 1;
+  private pending: UIMessageChunk[] = [];
+  private flushTimer: NodeJS.Timeout | null = null;
+  private flushPromise: Promise<void> = Promise.resolve();
+  private lastRunTouchAt = 0;
+  private asyncFailure: unknown = null;
+  private readonly runId: string;
+  private readonly suppressPayloads: boolean;
+  private readonly encryptedChatAudit: EncryptedChatAuditContext | null;
+  private readonly onFlush: () => Promise<void>;
+  private readonly onAsyncFailure: (error: unknown) => void;
+
+  constructor(params: {
+    runId: string;
+    suppressPayloads: boolean;
+    encryptedChatAudit: EncryptedChatAuditContext | null;
+    onFlush: () => Promise<void>;
+    onAsyncFailure: (error: unknown) => void;
+  }) {
+    this.runId = params.runId;
+    this.suppressPayloads = params.suppressPayloads;
+    this.encryptedChatAudit = params.encryptedChatAudit;
+    this.onFlush = params.onFlush;
+    this.onAsyncFailure = params.onAsyncFailure;
+  }
+
+  async write(payload: UIMessageChunk): Promise<void> {
+    if (this.asyncFailure) {
+      throw this.asyncFailure;
+    }
+
+    this.pending.push(payload);
+
+    if (this.pending.length >= EVENT_BATCH_SIZE) {
+      await this.flush();
+      return;
+    }
+
+    if (!this.flushTimer) {
+      // Own the timer-triggered flush: an unowned rejection here (e.g. the FK
+      // violation from a deleted run) would escape as a process-level
+      // unhandledRejection and trip the DB safety net into exiting. Store it so
+      // the next write()/flush() surfaces it into the drain catch, and wake an
+      // idle drain immediately via onAsyncFailure.
+      this.flushTimer = setTimeout(() => {
+        void this.flush().catch((error) => {
+          this.asyncFailure ??= error;
+          this.onAsyncFailure(error);
+        });
+      }, EVENT_FLUSH_INTERVAL_MS);
+    }
+  }
+
+  async flush(): Promise<void> {
+    if (this.asyncFailure) {
+      throw this.asyncFailure;
+    }
+
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+
+    if (this.pending.length === 0) {
+      await this.flushPromise;
+      return;
+    }
+
+    // Suppression is now only for an encrypted-chat run with no key to encrypt
+    // under; the appendEvents call below still runs when a liveness touch is
+    // due, so a long silent stream is not reaped as stale.
+    const payloads = this.suppressPayloads
+      ? []
+      : compactReplayPayloads(this.pending);
+    const seq = this.nextSeq;
+    const touchRun = this.shouldTouchRun();
+    this.pending = [];
+    this.nextSeq += 1;
+
+    this.flushPromise = this.flushPromise.then(async () => {
+      const result = await ActiveChatRunModel.appendEvents({
+        runId: this.runId,
+        encryptedChatAudit: this.encryptedChatAudit,
+        seq,
+        payloads,
+        touchRun,
+      });
+      if (result === "run_missing") {
+        throw new ActiveChatRunGoneError(this.runId);
+      }
+      await this.onFlush();
+    });
+
+    await this.flushPromise;
+  }
+
+  /**
+   * Flushes touch the run only when they happen, and a silent stream (a long
+   * tool call or reasoning step, or a scheduled run that emits nothing for
+   * minutes) does not flush. Check on a timer too, so a live run's liveness
+   * never depends on how chatty its stream is. Returns the stop function.
+   */
+  startLivenessTouches(): () => void {
+    const timer = setInterval(() => {
+      void this.touchIfDue().catch((error) => {
+        this.asyncFailure ??= error;
+        this.onAsyncFailure(error);
+      });
+    }, LIVENESS_CHECK_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }
+
+  private async touchIfDue(): Promise<void> {
+    if (this.asyncFailure || !this.shouldTouchRun()) {
+      return;
+    }
+
+    let result: Awaited<ReturnType<typeof ActiveChatRunModel.appendEvents>>;
+    try {
+      result = await ActiveChatRunModel.appendEvents({
+        runId: this.runId,
+        seq: this.nextSeq,
+        payloads: [],
+        touchRun: true,
+      });
+    } catch (error) {
+      // A transient DB error must not kill a live chat: retry on the next
+      // check, well inside the stale window.
+      this.lastRunTouchAt = 0;
+      logger.warn(
+        { error, runId: this.runId },
+        "Failed to touch active chat run liveness",
+      );
+      return;
+    }
+
+    if (result === "run_missing") {
+      throw new ActiveChatRunGoneError(this.runId);
+    }
+  }
+
+  private shouldTouchRun(): boolean {
+    const now = Date.now();
+    if (
+      this.lastRunTouchAt &&
+      now - this.lastRunTouchAt < RUN_TOUCH_INTERVAL_MS
+    ) {
+      return false;
+    }
+
+    this.lastRunTouchAt = now;
+    return true;
+  }
+}
+
+/**
+ * The reason a chat is aborted with when its events can no longer be
+ * persisted, so the response can report the failure instead of ending as if
+ * the user had pressed Stop.
+ */
+export class ActiveChatRunPersistenceError extends Error {
+  constructor(cause: unknown) {
+    super("The chat run could not be saved, so it was stopped.", { cause });
+    this.name = "ActiveChatRunPersistenceError";
+  }
+}
+
+function persistenceAbortReason(
+  error: unknown,
+): ActiveChatRunPersistenceError | undefined {
+  return error instanceof ActiveChatRunGoneError
+    ? undefined
+    : new ActiveChatRunPersistenceError(error);
+}
+
+// Signals that the run row was deleted out from under an in-flight drain, so
+// the drain should stop persisting rather than treat it as a generic failure.
+class ActiveChatRunGoneError extends Error {
+  constructor(runId: string) {
+    super(`Active chat run ${runId} no longer exists`);
+    this.name = "ActiveChatRunGoneError";
+  }
+}
+
+function compactReplayPayloads(payloads: UIMessageChunk[]): UIMessageChunk[] {
+  const compacted: UIMessageChunk[] = [];
+
+  for (const payload of payloads) {
+    const previous = compacted.at(-1);
+    if (
+      canMergeDeltaChunks(previous, payload) &&
+      isMergeableDeltaChunk(payload)
+    ) {
+      previous.delta += payload.delta;
+      continue;
+    }
+
+    compacted.push({ ...payload });
+  }
+
+  return compacted;
+}
+
+function canMergeDeltaChunks(
+  previous: UIMessageChunk | undefined,
+  current: UIMessageChunk,
+): previous is MergeableDeltaChunk {
+  return (
+    isMergeableDeltaChunk(current) &&
+    (previous?.type === "text-delta" || previous?.type === "reasoning-delta") &&
+    previous.type === current.type &&
+    previous.id === current.id &&
+    !previous.providerMetadata &&
+    !current.providerMetadata
+  );
+}
+
+function isMergeableDeltaChunk(
+  payload: UIMessageChunk,
+): payload is MergeableDeltaChunk {
+  return payload.type === "text-delta" || payload.type === "reasoning-delta";
+}
+
+type MergeableDeltaChunk = Extract<
+  UIMessageChunk,
+  { type: "text-delta" | "reasoning-delta" }
+>;

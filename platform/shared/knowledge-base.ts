@@ -6,7 +6,173 @@ export type EmbeddingModel = string;
 /** Maximum number of chunks to embed per embedding API call */
 export const EMBEDDING_BATCH_SIZE = 100;
 
-export const SUPPORTED_EMBEDDING_DIMENSIONS = [3072, 1536, 768] as const;
+/**
+ * Default cadence of the scheduled permission-sync pass for
+ * `auto-sync-permissions` connectors: the next pass is due this many seconds
+ * after the last one (manual, content-ingest-triggered, or scheduled) started.
+ */
+export const DEFAULT_PERMISSION_SYNC_INTERVAL_SECONDS = 30 * 60;
+
+/**
+ * Floor for the per-connector permission-sync interval. Also bounds how long
+ * per-user group-membership lookups may be served from cache: a cached ACL
+ * check is never staler than the shortest interval a connector can sync at.
+ */
+export const MIN_PERMISSION_SYNC_INTERVAL_SECONDS = 15 * 60;
+
+/**
+ * Ceiling for the per-connector permission-sync interval. Anything slower is
+ * better expressed as follow-documents mode; without a ceiling, an
+ * effectively-infinite interval would silently disable the scheduled pass
+ * while looking configured.
+ */
+export const MAX_PERMISSION_SYNC_INTERVAL_SECONDS = 7 * 24 * 60 * 60;
+
+/**
+ * Sentinel `permissionSyncIntervalSeconds` value: no interval-scheduled
+ * passes — permissions follow the documents sync schedule instead. A pass
+ * runs after every completed documents sync (permissions can change upstream
+ * without any document changing) and on manual trigger. Stored as 0 so the
+ * column stays NOT NULL.
+ */
+export const PERMISSION_SYNC_FOLLOW_DOCUMENTS_SCHEDULE = 0;
+
+/**
+ * Cadence of the FULL permission reconcile (the correctness backstop that
+ * fail-closes vanished documents and containers). The user-facing frequency
+ * setting drives cheap probe-driven DELTA passes; a pass is promoted to full
+ * when the last full reconcile is older than this. Internal constant, not an
+ * operator knob.
+ */
+export const PERMISSION_SYNC_FULL_RECONCILE_INTERVAL_SECONDS = 24 * 60 * 60;
+
+/**
+ * PostgreSQL text-search configurations available for a connector's keyword
+ * (full-text) index. Each name is a stock `pg_ts_config` entry, so every value
+ * here resolves on any standard PostgreSQL installation without extensions.
+ *
+ * The choice controls stemming and stop words: indexing a German corpus under
+ * `english` leaves "laufende" and "läuft" as unrelated tokens, so keyword search
+ * silently under-matches. `simple` disables stemming and stop-word removal
+ * entirely — the right pick for code, identifiers, or a mixed-language corpus
+ * where a wrong stemmer is worse than none.
+ */
+export const TEXT_SEARCH_LANGUAGES = [
+  "simple",
+  "arabic",
+  "armenian",
+  "basque",
+  "catalan",
+  "danish",
+  "dutch",
+  "english",
+  "finnish",
+  "french",
+  "german",
+  "greek",
+  "hindi",
+  "hungarian",
+  "indonesian",
+  "irish",
+  "italian",
+  "lithuanian",
+  "nepali",
+  "norwegian",
+  "portuguese",
+  "romanian",
+  "russian",
+  "serbian",
+  "spanish",
+  "swedish",
+  "tamil",
+  "turkish",
+  "yiddish",
+] as const;
+
+export type TextSearchLanguage = (typeof TEXT_SEARCH_LANGUAGES)[number];
+
+/** Matches the `kb_chunks.fts_language` column default. */
+export const DEFAULT_TEXT_SEARCH_LANGUAGE: TextSearchLanguage = "english";
+
+export const TextSearchLanguageSchema = z
+  .enum(TEXT_SEARCH_LANGUAGES)
+  .meta({ id: "TextSearchLanguage" });
+
+/**
+ * Bounds for the configurable chunk size. The floor keeps a chunk large enough
+ * to carry a coherent passage once the title prefix and metadata suffix are
+ * subtracted; the ceiling stays under the input limit of every embedding model
+ * we support.
+ */
+export const MIN_CHUNK_SIZE_TOKENS = 128;
+export const MAX_CHUNK_SIZE_TOKENS = 2048;
+export const DEFAULT_CHUNK_SIZE_TOKENS = 512;
+
+/**
+ * How many chunks either side of a search hit are stitched back on before the
+ * result is returned. 0 disables the expansion.
+ */
+export const DEFAULT_CONTEXT_EXPANSION_RADIUS = 1;
+export const MAX_CONTEXT_EXPANSION_RADIUS = 4;
+
+/**
+ * Bounds for the child-chunk size used by parent/child (multi-granularity)
+ * indexing. A document is split at {@link DEFAULT_CHUNK_SIZE_TOKENS} into
+ * parent passages, and each parent is subdivided into children of this size.
+ * Only the children are indexed and embedded; a hit resolves back to the
+ * enclosing parent, so retrieval matches at the finer size while the model
+ * still reads the wider passage.
+ *
+ * 0 disables the second pass, leaving one chunk per parent — the single-pass
+ * behaviour, and the default. The ceiling is {@link MAX_CHUNK_SIZE_TOKENS}: a
+ * child is bounded by the same embedding-model input limit a chunk is, and a
+ * child larger than its parent subdivides nothing.
+ */
+export const MIN_CHILD_CHUNK_SIZE_TOKENS = 32;
+export const DEFAULT_CHILD_CHUNK_SIZE_TOKENS = 0;
+
+/**
+ * How document context is generated and added to the search index.
+ *
+ * `disabled` indexes chunks as-is. `document` generates one inexpensive
+ * summary for the whole document. `chunk` generates passage-specific context
+ * for sufficiently long documents and falls back to the document summary for
+ * short ones where the extra calls provide little benefit.
+ */
+export const CONTEXTUAL_RETRIEVAL_MODES = [
+  "disabled",
+  "document",
+  "chunk",
+] as const;
+
+export const ContextualRetrievalModeSchema = z
+  .enum(CONTEXTUAL_RETRIEVAL_MODES)
+  .meta({ id: "ContextualRetrievalMode" });
+
+export type ContextualRetrievalMode = z.infer<
+  typeof ContextualRetrievalModeSchema
+>;
+
+/**
+ * Bounds for the BM25 keyword-ranker tuning constants, shared by the env-var
+ * parser, the settings API schema, and the settings UI so all three reject the
+ * same values.
+ *
+ * `k1` (term-frequency saturation) has no natural upper bound in the formula;
+ * 10 is far past where additional repetitions stop mattering. `b`
+ * (document-length normalization) is a mixing weight and is only meaningful in
+ * [0, 1]. The defaults are Lucene/Elasticsearch's.
+ */
+export const BM25_K1_MIN = 0;
+export const BM25_K1_MAX = 10;
+export const BM25_K1_DEFAULT = 1.2;
+export const BM25_B_MIN = 0;
+export const BM25_B_MAX = 1;
+export const BM25_B_DEFAULT = 0.75;
+
+export const SUPPORTED_EMBEDDING_DIMENSIONS = [
+  3072, 1536, 1408, 1024, 768, 384,
+] as const;
 export type SupportedEmbeddingDimension =
   (typeof SUPPORTED_EMBEDDING_DIMENSIONS)[number];
 
@@ -42,7 +208,7 @@ export const SupportedEmbeddingDimensionsSchema =
 /**
  * Maps a dimension size to its database column name.
  * - 1536 → "embedding" (original column, kept for backward compatibility)
- * - 768  → "embedding_768"
+ * - every other supported size → "embedding_<dimensions>" (e.g. "embedding_768")
  */
 export function getEmbeddingColumnName(dimensions: number): string {
   if (dimensions === 1536) return "embedding";
@@ -62,16 +228,37 @@ export const CONNECTOR_TYPE_LABELS = {
   servicenow: "ServiceNow",
   sharepoint: "SharePoint",
   gdrive: "Google Drive",
-  file_upload: "File Upload",
   dropbox: "Dropbox",
   onedrive: "OneDrive",
   asana: "Asana",
   linear: "Linear",
   outline: "Outline",
   salesforce: "Salesforce",
+  web_crawler: "Web Crawler",
+  perforce: "Perforce (Helix Core)",
+  mfiles: "M-Files",
 } as const;
 
 export type ConnectorType = keyof typeof CONNECTOR_TYPE_LABELS;
+
+/**
+ * Notion has no groups: its permission sync rosters the whole workspace as one
+ * synthetic group whose id embeds the Notion workspace id, so two Notion
+ * connectors never share a grant. The connector builds the id; the UI strips
+ * the prefix back off to show the workspace's own id.
+ */
+export const NOTION_WORKSPACE_MEMBERS_GROUP_ID_PREFIX = "workspace-members-";
+
+/**
+ * The Notion workspace id carried by a synthetic members-group id, or null for
+ * an id that does not carry one.
+ */
+export function notionWorkspaceIdFromGroupId(groupId: string): string | null {
+  if (!groupId.startsWith(NOTION_WORKSPACE_MEMBERS_GROUP_ID_PREFIX)) {
+    return null;
+  }
+  return groupId.slice(NOTION_WORKSPACE_MEMBERS_GROUP_ID_PREFIX.length) || null;
+}
 
 const CONNECTOR_PLACEHOLDER_DEPARTMENTS = [
   "Engineering",
@@ -103,6 +290,14 @@ export function getConnectorNamePlaceholder(
 export const RERANKER_MIN_RELEVANCE_SCORE = 3;
 
 /**
+ * Minimum relevance score (0..1) for chunks reranked through a native rerank
+ * API (Cohere Rerank). Cohere scores are query-relative with no universal
+ * cutoff, so this is a conservative floor that only drops clearly irrelevant
+ * chunks rather than mirroring the 3/10 LLM threshold.
+ */
+export const RERANKER_NATIVE_MIN_RELEVANCE_SCORE = 0.1;
+
+/**
  * Nomic embedding models require task instruction prefixes in the input text.
  * Documents should use "search_document: " and queries should use "search_query: ".
  * See: https://huggingface.co/nomic-ai/nomic-embed-text-v1.5
@@ -111,6 +306,17 @@ type NomicTaskType = "search_document" | "search_query";
 
 export function isNomicModel(model: string): boolean {
   return model.startsWith("nomic") || model.includes("/nomic-embed-text");
+}
+
+/**
+ * Whether an embedding model accepts the `dimensions` request parameter.
+ * Nomic models and OpenAI's ada-002 reject it ("This model does not support
+ * specifying dimensions").
+ */
+export function acceptsEmbeddingDimensionsParameter(model: string): boolean {
+  return (
+    !isNomicModel(model) && !/(?:^|\/)text-embedding-ada-002$/i.test(model)
+  );
 }
 
 /**

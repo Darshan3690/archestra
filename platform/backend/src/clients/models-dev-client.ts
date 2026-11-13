@@ -2,11 +2,11 @@ import {
   MODELS_DEV_PROVIDER_MAP,
   type SupportedProvider,
   TimeInMs,
-} from "@shared";
+} from "@archestra/shared";
 import { z } from "zod";
 import { CacheKey, cacheManager } from "@/cache-manager";
 import logger from "@/logging";
-import { ModelModel } from "@/models";
+import ModelModel from "@/models/model";
 import {
   type CreateModel,
   type ModelInputModality,
@@ -27,9 +27,28 @@ const MODELS_DEV_SYNC_CACHE_KEY =
 const SYNC_INTERVAL_MS = 24 * TimeInMs.Hour;
 
 /**
+ * Set when a sync fails after all retries, so a models.dev outage is retried
+ * every 15 minutes instead of on every scheduled tick.
+ */
+const MODELS_DEV_SYNC_FAILED_CACHE_KEY =
+  `${CacheKey.ModelsDevSync}-failed` as const;
+const SYNC_RETRY_AFTER_FAILURE_MS = 15 * TimeInMs.Minute;
+
+/**
  * models.dev API endpoint
  */
 const MODELS_DEV_API_URL = "https://models.dev/api.json";
+
+/**
+ * How long a fetched models.dev API response is served from memory before
+ * hitting the network again.
+ */
+const FETCH_CACHE_TTL_MS = 5 * TimeInMs.Minute;
+
+/**
+ * Default timeout for a single models.dev API fetch.
+ */
+const DEFAULT_FETCH_TIMEOUT_MS = 30 * TimeInMs.Second;
 
 /**
  * Retry configuration for background sync
@@ -46,6 +65,17 @@ const RETRY_CONFIG = {
 
 /**
  * Cost information for a model (prices per million tokens in USD)
+ *
+ * Only input/output + cache_read/cache_write are persisted and used in cost
+ * calculation. Intentionally NOT persisted:
+ * - `reasoning`: reasoning/thinking tokens are a subset of output tokens and are
+ *   billed at the output rate (reasoning === output for current models), so a
+ *   separate reasoning price would double-count what output pricing already covers.
+ * - `input_audio` / `output_audio`: genuinely distinct rates, but nothing
+ *   captures audio token counts yet (no adapter usage parsing, interaction
+ *   columns, or o11y attributes), so persisting them would be dead data. Persist
+ *   these as step 0 of an end-to-end audio cost-tracking feature, not on their own.
+ *
  * @public — exported for testability
  */
 export type ModelsDevCost = {
@@ -189,6 +219,47 @@ const ModelsDevApiResponseSchema = z.record(
   ModelsDevProviderSchema,
 );
 
+/**
+ * Convert a models.dev `cost` object (prices per million tokens) into our
+ * per-token string representation. Returns null for any price the registry omits.
+ * @public — shared by the registry client and provider model sync.
+ */
+export function modelsDevCostToPerToken(cost: ModelsDevCost | undefined): {
+  promptPricePerToken: string | null;
+  completionPricePerToken: string | null;
+  cacheReadPricePerToken: string | null;
+  cacheWritePricePerToken: string | null;
+} {
+  // Round to the `numeric(20, 12)` column precision so the per-token string is
+  // free of float-division noise (e.g. 0.8 / 1e6 = 8.000000000000001e-7) and
+  // matches exactly what the database stores.
+  const perToken = (perMillion: number | undefined): string | null =>
+    perMillion !== undefined
+      ? Number.parseFloat((perMillion / 1_000_000).toFixed(12)).toString()
+      : null;
+
+  return {
+    promptPricePerToken: perToken(cost?.input),
+    completionPricePerToken: perToken(cost?.output),
+    cacheReadPricePerToken: perToken(cost?.cache_read),
+    cacheWritePricePerToken: perToken(cost?.cache_write),
+  };
+}
+
+/**
+ * Sanitize a models.dev output-token limit into a stored `outputLength`.
+ * Keeps only positive integers; drops 0/null/negative/non-integer garbage so a
+ * reseller's malformed row cannot poison the model's output-token budget.
+ * @public — shared by the registry client and provider model sync.
+ */
+export function sanitizeOutputLimit(
+  output: number | null | undefined,
+): number | null {
+  return typeof output === "number" && Number.isInteger(output) && output > 0
+    ? output
+    : null;
+}
+
 // ============================================================================
 // Client implementation
 // ============================================================================
@@ -197,40 +268,67 @@ const ModelsDevApiResponseSchema = z.record(
  * models.dev Model Registry Client.
  *
  * Fetches model metadata from models.dev API and syncs it to our database.
- * Provides caching to avoid excessive API calls.
+ * Validated fetch results are cached in memory for a short TTL, and
+ * concurrent callers share a single in-flight request. The raw fallback used
+ * when schema validation fails and the `{}` error result are never cached,
+ * so a transient bad response does not stick for the TTL.
+ *
+ * @public — exported so tests can construct instances with custom options
  */
-class ModelsDevClient {
+export class ModelsDevClient {
+  private readonly fetchTimeoutMs: number;
+  // Hand-rolled instead of cacheManager/LRUCacheManager: single-flight
+  // coalescing needs the in-flight promise as instance state, and the
+  // multi-MB registry payload does not belong in the Postgres-backed cache.
+  private cachedResponse: {
+    data: ModelsDevApiResponse;
+    fetchedAt: number;
+  } | null = null;
+  private inflightFetch: Promise<ModelsDevApiResponse> | null = null;
+  // Bumped by clearFetchCache so a fetch started before the clear cannot
+  // repopulate the cache with pre-clear data when it settles.
+  private fetchGeneration = 0;
+
+  constructor(opts?: { fetchTimeoutMs?: number }) {
+    this.fetchTimeoutMs = opts?.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
+  }
+
   /**
    * Fetches all providers and models from models.dev API.
    * Validates the response against the expected schema.
+   * Serves a cached response within the TTL and deduplicates concurrent calls.
    */
   async fetchModelsFromApi(): Promise<ModelsDevApiResponse> {
-    try {
-      const response = await fetch(MODELS_DEV_API_URL);
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      const json = await response.json();
-      const parseResult = ModelsDevApiResponseSchema.safeParse(json);
-
-      if (!parseResult.success) {
-        logger.warn(
-          { errors: parseResult.error.format() },
-          "models.dev API response validation failed, using partial data",
-        );
-        // Fall back to casting if validation fails - the API may have added new fields
-        return json as ModelsDevApiResponse;
-      }
-
-      return parseResult.data;
-    } catch (error) {
-      logger.error(
-        { error: error instanceof Error ? error.message : String(error) },
-        "Error fetching models from models.dev API",
-      );
-      return {};
+    if (
+      this.cachedResponse &&
+      Date.now() - this.cachedResponse.fetchedAt < FETCH_CACHE_TTL_MS
+    ) {
+      return this.cachedResponse.data;
     }
+
+    if (this.inflightFetch) {
+      return this.inflightFetch;
+    }
+
+    const fetchPromise = this.doFetchModelsFromApi();
+    this.inflightFetch = fetchPromise;
+    try {
+      return await fetchPromise;
+    } finally {
+      if (this.inflightFetch === fetchPromise) {
+        this.inflightFetch = null;
+      }
+    }
+  }
+
+  /**
+   * Drops the in-memory fetch cache and detaches any in-flight fetch so the
+   * next call hits the network. Tests use it to isolate cases.
+   */
+  clearFetchCache(): void {
+    this.fetchGeneration++;
+    this.cachedResponse = null;
+    this.inflightFetch = null;
   }
 
   /**
@@ -284,14 +382,7 @@ class ModelsDevClient {
     }
 
     // Convert cost from per-million to per-token (store as string for precision)
-    const promptPricePerToken =
-      model.cost?.input !== undefined
-        ? (model.cost.input / 1_000_000).toString()
-        : null;
-    const completionPricePerToken =
-      model.cost?.output !== undefined
-        ? (model.cost.output / 1_000_000).toString()
-        : null;
+    const prices = modelsDevCostToPerToken(model.cost);
 
     return {
       externalId: `${providerId}/${model.id}`,
@@ -299,11 +390,14 @@ class ModelsDevClient {
       modelId: model.id,
       description: model.name,
       contextLength: model.limit?.context ?? null,
+      outputLength: sanitizeOutputLimit(model.limit?.output),
       inputModalities,
       outputModalities,
       supportsToolCalling: model.tool_call ?? false,
-      promptPricePerToken,
-      completionPricePerToken,
+      promptPricePerToken: prices.promptPricePerToken,
+      completionPricePerToken: prices.completionPricePerToken,
+      cacheReadPricePerToken: prices.cacheReadPricePerToken,
+      cacheWritePricePerToken: prices.cacheWritePricePerToken,
       lastSyncedAt: new Date(),
     };
   }
@@ -344,9 +438,11 @@ class ModelsDevClient {
     const apiResponse = await this.fetchModelsFromApi();
     const providerIds = Object.keys(apiResponse);
 
+    // The fetch reports a failed request as an empty catalog, and models.dev
+    // never legitimately lists no providers, so this is an outage: throwing
+    // lets the caller retry and back off instead of calling it a sync.
     if (providerIds.length === 0) {
-      logger.warn("No providers returned from models.dev API");
-      return 0;
+      throw new Error("No providers returned from models.dev API");
     }
 
     logger.info(
@@ -385,6 +481,11 @@ class ModelsDevClient {
     // derived/vertex providers. The externalId contains the original models.dev
     // provider (e.g., "google/gemini-2.5-flash" vs "google-vertex/gemini-2.5-flash").
     const preferredSourcePrefixes: Record<SupportedProvider, string[]> = {
+      // Voyage models come from the KB's own static table, never from
+      // models.dev, so there is no source to prefer.
+      voyage: [],
+      // Jev models come from a static table, never from models.dev.
+      jev: [],
       gemini: ["google/"], // Prefer google over google-vertex
       openai: ["openai/"], // Prefer direct providers over aggregators
       openrouter: ["openrouter/"],
@@ -392,16 +493,29 @@ class ModelsDevClient {
       cohere: ["cohere/"],
       cerebras: ["cerebras/"],
       mistral: ["mistral/"],
-      perplexity: ["perplexity/"],
+      // Not synced from models.dev (mapProvider skips it), which has no Agent
+      // API catalog.
+      perplexity: [],
       groq: ["groq/"],
       xai: ["xai/"],
       bedrock: ["amazon-bedrock/"],
       ollama: ["ollama/"],
+      "ollama-native": ["ollama/"],
       vllm: ["vllm/"],
       zhipuai: ["zhipuai/"],
       deepseek: ["deepseek/"],
       minimax: ["minimax/"],
+      kimi: ["moonshotai/"],
+      // The two Kimi Code regions list the same plan ids; prefer the global
+      // catalog, whose endpoint matches the provider's default region.
+      "kimi-code": ["kimi-code-plan-global/", "kimi-code-plan-cn/"],
       azure: ["azure/"],
+      // Not synced via models.dev (subscription-dependent /models endpoint)
+      "github-copilot": [],
+      // Not synced via models.dev (single static pseudo-model)
+      "microsoft-365-copilot": [],
+      // Not synced via models.dev (upstream is another Archestra instance)
+      archestra: [],
     };
 
     const getSourcePriority = (model: CreateModel): number => {
@@ -460,17 +574,34 @@ class ModelsDevClient {
   }
 
   /**
-   * Convenience method to sync if needed (non-blocking).
-   * Call this in the models route to trigger background sync.
-   * Uses exponential backoff retry for transient failures.
+   * Syncs when the last sync is older than the sync interval, retrying
+   * transient failures with exponential backoff. A sync that still fails is
+   * logged and rethrown, and no call tries again for 15 minutes (shared
+   * across pods), so each failure window reports once. Run by the scheduled
+   * model sync.
    */
-  syncIfNeeded(): void {
-    this.syncWithRetry().catch((error) => {
+  async syncIfNeeded(): Promise<void> {
+    if (await cacheManager.get<true>(MODELS_DEV_SYNC_FAILED_CACHE_KEY)) {
+      return;
+    }
+    try {
+      await this.syncWithRetry();
+    } catch (error) {
       logger.error(
         { error: error instanceof Error ? error.message : String(error) },
         "Background models.dev sync failed after all retries",
       );
-    });
+      await cacheManager
+        .set(
+          MODELS_DEV_SYNC_FAILED_CACHE_KEY,
+          true,
+          SYNC_RETRY_AFTER_FAILURE_MS,
+        )
+        .catch(() => {
+          // Logged by the cache manager; the next call simply retries.
+        });
+      throw error;
+    }
   }
 
   /**
@@ -514,6 +645,46 @@ class ModelsDevClient {
    */
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Performs the actual network fetch. Only validated responses are cached:
+   * the raw validation-fallback and the `{}` error result are returned
+   * uncached so retries refetch instead of reusing a bad payload.
+   */
+  private async doFetchModelsFromApi(): Promise<ModelsDevApiResponse> {
+    const generation = this.fetchGeneration;
+    try {
+      const response = await fetch(MODELS_DEV_API_URL, {
+        signal: AbortSignal.timeout(this.fetchTimeoutMs),
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const json = await response.json();
+      const parseResult = ModelsDevApiResponseSchema.safeParse(json);
+
+      if (!parseResult.success) {
+        logger.warn(
+          { errors: parseResult.error.format() },
+          "models.dev API response validation failed, using partial data",
+        );
+        // Fall back to casting if validation fails - the API may have added new fields
+        return json as ModelsDevApiResponse;
+      }
+
+      if (generation === this.fetchGeneration) {
+        this.cachedResponse = { data: parseResult.data, fetchedAt: Date.now() };
+      }
+      return parseResult.data;
+    } catch (error) {
+      logger.error(
+        { error: error instanceof Error ? error.message : String(error) },
+        "Error fetching models from models.dev API",
+      );
+      return {};
+    }
   }
 
   /**

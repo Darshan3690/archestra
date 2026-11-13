@@ -2,13 +2,27 @@ import {
   calculatePaginationMeta,
   createPaginatedResponseSchema,
   PaginationQuerySchema,
+  parseLabelsParam,
   RouteId,
-} from "@shared";
+} from "@archestra/shared";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
-import { hasAnyAgentTypeAdminPermission, hasPermission } from "@/auth";
-import config from "@/config";
-import { AgentToolModel, TeamModel } from "@/models";
+import { hasPermission } from "@/auth";
+import { enterpriseTier } from "@/enterprise-tier";
+import { MemberModel, TeamLabelModel, TeamModel } from "@/models";
+import {
+  validateInheritedTeamRoles,
+  validateNewTeamMembership,
+  validateTeamRoles,
+} from "@/services/role-assignment";
+import {
+  canManageTeamMembers,
+  canReadTeam,
+  checkLastAdminInvariant,
+  cleanupCredentialSourcesAfterMemberRemoval,
+  getTeamForOrg,
+  validateTeamParent,
+} from "@/services/team-authorization";
 import {
   AddTeamExternalGroupBodySchema,
   AddTeamMemberBodySchema,
@@ -17,11 +31,21 @@ import {
   constructResponseSchema,
   DeleteObjectResponseSchema,
   SelectTeamExternalGroupSchema,
+  SelectTeamListItemSchema,
   SelectTeamMemberListItemSchema,
   SelectTeamMemberSchema,
   SelectTeamSchema,
+  TeamMemberRoleSchema,
   UpdateTeamBodySchema,
+  UpdateTeamMemberBodySchema,
 } from "@/types";
+import { BulkDeleteBodySchema, BulkOutcomeSchema, runBulk } from "./bulk-route";
+
+/** A query string "true" or "false" read as a boolean. */
+const BooleanQueryParamSchema = z.preprocess(
+  (value) => (value === "false" ? false : value === "true" ? true : value),
+  z.boolean(),
+);
 
 const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
   fastify.get(
@@ -33,38 +57,64 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
         tags: ["Teams"],
         querystring: PaginationQuerySchema.extend({
           name: z.string().optional(),
+          includeRelations: BooleanQueryParamSchema.describe(
+            "Include team members, labels and descendant teams (default true). Set to false to get only the team fields and memberCount.",
+          ).optional(),
+          includeMembers: BooleanQueryParamSchema.describe(
+            "Include the members array of each team (default true). Set to false to get labels and descendant teams without members. Use memberCount for the number of members.",
+          ).optional(),
+          // Filter teams by labels. Format: key1:val1|val2;key2:val3
+          // (AND across keys, OR within a key's values).
+          labels: z.string().optional(),
+          // When true, always return only the teams the caller is a member of,
+          // even for organization-level team managers. Resource
+          // team-assignment pickers use this so a manager who isn't a member of
+          // a team isn't offered teams they can't actually assign to.
+          mine: z
+            .preprocess((val) => val === "true" || val === true, z.boolean())
+            .optional(),
         }),
         response: constructResponseSchema(
-          createPaginatedResponseSchema(SelectTeamSchema),
+          createPaginatedResponseSchema(SelectTeamListItemSchema),
         ),
       },
     },
     async (request, reply) => {
-      const { limit, offset, name } = request.query;
-      const { success: isTeamAdmin } = await hasPermission(
-        { team: ["admin"] },
+      const { limit, offset, name, mine, includeRelations, includeMembers } =
+        request.query;
+      const labels = parseLabelsParam(request.query.labels);
+      const { success: canManageAllTeams } = await hasPermission(
+        { team: ["update"] },
         request.headers,
+        request.serviceAccount,
+        { userId: request.user.id, organizationId: request.organizationId },
       );
 
-      // Non-team admins only see teams they're members of
-      if (!isTeamAdmin) {
+      // Members (and anyone passing ?mine) only see teams they belong to.
+      if (!canManageAllTeams || mine) {
         const result = await TeamModel.getUserTeamsPaginated({
           userId: request.user.id,
           limit,
           offset,
           name,
+          labels,
+          includeRelations,
+          includeMembers,
         });
         return reply.send({
           data: result.data,
           pagination: calculatePaginationMeta(result.total, { limit, offset }),
         });
       }
-      // Team admins see all teams in the organization
+      // Organization-level team managers see all teams in the organization
       const result = await TeamModel.findByOrganizationPaginated({
         organizationId: request.organizationId,
         limit,
         offset,
         name,
+        labels,
+        includeRelations,
+        includeMembers,
       });
       return reply.send({
         data: result.data,
@@ -84,13 +134,49 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
         response: constructResponseSchema(SelectTeamSchema),
       },
     },
-    async ({ body: { name, description }, user, organizationId }, reply) => {
+    async (
+      {
+        body: { name, description, parentId, labels, roles },
+        user,
+        organizationId,
+        headers,
+      },
+      reply,
+    ) => {
+      await validateTeamRoles({ roles, organizationId, userId: user.id });
+      await assertValidTeamParent({
+        parentId: parentId ?? null,
+        organizationId,
+      });
+      await validateInheritedTeamRoles({
+        teamId: parentId,
+        organizationId,
+        userId: user.id,
+      });
+      if (parentId) {
+        const { success: canManageAllTeams } = await hasPermission(
+          { team: ["update"] },
+          headers,
+        );
+        if (
+          !canManageAllTeams &&
+          !(await TeamModel.isUserTeamAdmin(parentId, user.id))
+        ) {
+          throw new ApiError(
+            403,
+            "You can only create a child under a team you can manage",
+          );
+        }
+      }
       return reply.send(
         await TeamModel.create({
           name,
           description,
           organizationId,
           createdBy: user.id,
+          parentId,
+          labels,
+          roles,
         }),
       );
     },
@@ -101,40 +187,43 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
     {
       schema: {
         operationId: RouteId.GetTeam,
-        description: "Get a team by ID",
+        description:
+          "Get a team by ID, with the caller's role in it as myRole when they are a member",
         tags: ["Teams"],
         params: z.object({
           id: z.string(),
         }),
+        querystring: z.object({
+          includeMembers: BooleanQueryParamSchema.describe(
+            "Include the team's members array (default true). Set to false for a large team when only its details are needed; page through members with GET /api/teams/{id}/members/page.",
+          ).optional(),
+        }),
         response: constructResponseSchema(SelectTeamSchema),
       },
     },
-    async ({ params: { id }, organizationId, user, headers }, reply) => {
-      const team = await TeamModel.findById(id);
-
-      if (!team) {
-        throw new ApiError(404, "Team not found");
-      }
-
-      // Verify the team belongs to the user's organization
-      if (team.organizationId !== organizationId) {
-        throw new ApiError(404, "Team not found");
-      }
-
-      // Check if user is team:admin or member of the team
-      // Non team:admins can only see their own teams
-      const { success: isTeamAdmin } = await hasPermission(
-        { team: ["admin"] },
+    async (
+      {
+        params: { id },
+        query: { includeMembers },
+        organizationId,
+        user,
         headers,
-      );
-      if (!isTeamAdmin) {
-        const isMember = await TeamModel.isUserInTeam(id, user.id);
-        if (!isMember) {
-          throw new ApiError(404, "Team not found");
-        }
-      }
+      },
+      reply,
+    ) => {
+      const team = await findReadableTeam({
+        teamId: id,
+        organizationId,
+        userId: user.id,
+        headers,
+        includeMembers: includeMembers ?? true,
+      });
 
-      return reply.send(team);
+      const [labels, myRole] = await Promise.all([
+        TeamLabelModel.getLabelsForTeam(id),
+        TeamModel.getMemberRole(id, user.id),
+      ]);
+      return reply.send({ ...team, labels, ...(myRole && { myRole }) });
     },
   );
 
@@ -152,29 +241,54 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
         response: constructResponseSchema(SelectTeamSchema),
       },
     },
-    async ({ params: { id }, body, organizationId, user, headers }, reply) => {
+    async ({ params: { id }, body, organizationId, headers, user }, reply) => {
       // Verify the team exists and belongs to the user's organization
-      const existingTeam = await TeamModel.findById(id);
+      const existingTeam = await TeamModel.findById(id, {
+        includeMembers: false,
+      });
       if (!existingTeam || existingTeam.organizationId !== organizationId) {
         throw new ApiError(404, "Team not found");
       }
 
-      // Check if user has team:admin permission or is a member of the team
-      const { success: isTeamAdmin } = await hasPermission(
-        { team: ["admin"] },
+      const { success: canUpdateTeams } = await hasPermission(
+        { team: ["update"] },
         headers,
       );
 
-      if (!isTeamAdmin) {
-        const isMember = await TeamModel.isUserInTeam(id, user.id);
-        if (!isMember) {
-          throw new ApiError(
-            403,
-            "You must be a member of this team to update it",
-          );
-        }
+      if (
+        !(await canManageTeamMembers({
+          isOrgTeamManager: canUpdateTeams,
+          userId: user.id,
+          teamId: id,
+        }))
+      ) {
+        throw new ApiError(403, "You are not authorized to update this team");
       }
 
+      if (body.parentId !== undefined) {
+        if (body.parentId !== existingTeam.parentId && !canUpdateTeams) {
+          throw new ApiError(
+            403,
+            "Changing a team's parent requires organization team management permission.",
+          );
+        }
+        await assertValidTeamParent({
+          teamId: id,
+          parentId: body.parentId,
+          organizationId,
+        });
+      }
+
+      await validateTeamRoles({
+        roles: body.roles,
+        organizationId,
+        userId: user.id,
+      });
+      await validateInheritedTeamRoles({
+        teamId: body.parentId,
+        organizationId,
+        userId: user.id,
+      });
       const team = await TeamModel.update(id, body);
 
       if (!team) {
@@ -182,6 +296,68 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
       }
 
       return reply.send(team);
+    },
+  );
+
+  fastify.delete(
+    "/api/teams/bulk",
+    {
+      schema: {
+        operationId: RouteId.BulkDeleteTeams,
+        description:
+          "Delete several teams in one request. Ids outside the caller's " +
+          "organization are reported in `failed` as not found and leave the " +
+          "rest of the batch applied. Resources scoped to a deleted team lose " +
+          "that assignment, exactly as they do on the single-team delete.",
+        tags: ["Teams"],
+        body: BulkDeleteBodySchema,
+        response: constructResponseSchema(BulkOutcomeSchema),
+      },
+    },
+    async (request, reply) => {
+      const { organizationId, headers } = request;
+
+      // Request-level: team deletion is one org-wide permission, the same for
+      // every id, so an unauthorized caller is a 403 that writes nothing
+      // rather than N identical per-team failures.
+      const { success: canDeleteTeams } = await hasPermission(
+        { team: ["delete"] },
+        headers,
+      );
+      if (!canDeleteTeams) {
+        throw new ApiError(403, "You are not authorized to delete these teams");
+      }
+
+      const snapshot = async (ids: string[]) => ({
+        teams: (await TeamModel.findByIds(ids))
+          .filter((team) => team.organizationId === organizationId)
+          .map(({ id, name }) => ({ id, name }))
+          // Sorted so an unchanged batch snapshots identically on both sides.
+          .sort((a, b) => a.id.localeCompare(b.id)),
+      });
+
+      const outcome = await runBulk({
+        ids: request.body.ids,
+        logLabel: "teams bulk delete",
+        notFoundMessage: "Team not found",
+        unexpectedMessage: "Could not delete this team",
+        load: async (ids) =>
+          new Map(
+            (await TeamModel.findByIds(ids))
+              .filter((team) => team.organizationId === organizationId)
+              .map((team) => [team.id, team]),
+          ),
+        describe: (team) => team.name,
+        applyEach: async (_team, id) => {
+          const success = await TeamModel.delete(id);
+          if (!success) {
+            throw new ApiError(404, "Team not found");
+          }
+        },
+        audit: { target: request, snapshot },
+      });
+
+      return reply.send(outcome);
     },
   );
 
@@ -198,27 +374,22 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
         response: constructResponseSchema(DeleteObjectResponseSchema),
       },
     },
-    async ({ params: { id }, organizationId, user, headers }, reply) => {
+    async ({ params: { id }, organizationId, headers }, reply) => {
       // Verify the team exists and belongs to the user's organization
-      const existingTeam = await TeamModel.findById(id);
+      const existingTeam = await TeamModel.findById(id, {
+        includeMembers: false,
+      });
       if (!existingTeam || existingTeam.organizationId !== organizationId) {
         throw new ApiError(404, "Team not found");
       }
 
-      // Check if user has team:admin permission or is a member of the team
-      const { success: isTeamAdmin } = await hasPermission(
-        { team: ["admin"] },
+      const { success: canDeleteTeams } = await hasPermission(
+        { team: ["delete"] },
         headers,
       );
 
-      if (!isTeamAdmin) {
-        const isMember = await TeamModel.isUserInTeam(id, user.id);
-        if (!isMember) {
-          throw new ApiError(
-            403,
-            "You must be a member of this team to delete it",
-          );
-        }
+      if (!canDeleteTeams) {
+        throw new ApiError(403, "You are not authorized to delete this team");
       }
 
       const success = await TeamModel.delete(id);
@@ -247,25 +418,83 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
       },
     },
     async ({ params: { id }, organizationId, user, headers }, reply) => {
-      // Verify the team exists and belongs to the user's organization
-      const team = await TeamModel.findById(id);
-      if (!team || team.organizationId !== organizationId) {
-        throw new ApiError(404, "Team not found");
-      }
-
-      // Check if user is team:admin or member of the team
-      const { success: isTeamAdmin } = await hasPermission(
-        { team: ["admin"] },
+      await findReadableTeam({
+        teamId: id,
+        organizationId,
+        userId: user.id,
         headers,
-      );
-      if (!isTeamAdmin) {
-        const isMember = await TeamModel.isUserInTeam(id, user.id);
-        if (!isMember) {
-          throw new ApiError(404, "Team not found");
-        }
-      }
-
+        includeMembers: false,
+      });
       return reply.send(await TeamModel.getTeamMembersWithUsers(id));
+    },
+  );
+
+  fastify.get(
+    "/api/teams/:id/members/page",
+    {
+      schema: {
+        operationId: RouteId.GetTeamMembersPage,
+        description:
+          "Get one page of a team's members, ordered by name, with optional search",
+        tags: ["Teams"],
+        params: z.object({
+          id: z.string(),
+        }),
+        querystring: PaginationQuerySchema.extend({
+          search: z
+            .string()
+            .max(512, "Search must be at most 512 characters")
+            .optional()
+            .describe(
+              "Search by user name or email. Every whitespace-separated word must appear in the name or the email.",
+            ),
+          userIds: z
+            .preprocess(
+              (value) => (typeof value === "string" ? value.split(",") : value),
+              z.array(z.string().min(1)).min(1).max(100),
+            )
+            .optional()
+            .describe(
+              "Return only these users (comma-separated, at most 100), to check which of them are members. With search, a user must match both.",
+            ),
+          role: TeamMemberRoleSchema.optional().describe(
+            "Return only members with this team role.",
+          ),
+        }),
+        response: constructResponseSchema(
+          createPaginatedResponseSchema(SelectTeamMemberListItemSchema),
+        ),
+      },
+    },
+    async (
+      {
+        params: { id },
+        query: { limit, offset, search, userIds, role },
+        organizationId,
+        user,
+        headers,
+      },
+      reply,
+    ) => {
+      await findReadableTeam({
+        teamId: id,
+        organizationId,
+        userId: user.id,
+        headers,
+        includeMembers: false,
+      });
+      const result = await TeamModel.getTeamMembersWithUsersPaginated({
+        teamId: id,
+        limit,
+        offset,
+        search: search || undefined,
+        userIds,
+        role,
+      });
+      return reply.send({
+        data: result.data,
+        pagination: calculatePaginationMeta(result.total, { limit, offset }),
+      });
     },
   );
 
@@ -284,16 +513,88 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
       },
     },
     async (
-      { params: { id }, body: { userId, role }, organizationId },
+      { params: { id }, body: { userId, role }, organizationId, user, headers },
       reply,
     ) => {
-      // Verify the team exists and belongs to the user's organization
-      const team = await TeamModel.findById(id);
-      if (!team || team.organizationId !== organizationId) {
+      const team = await getTeamForOrg({ teamId: id, organizationId });
+      if (!team) {
         throw new ApiError(404, "Team not found");
       }
 
+      await assertCanManageTeam({
+        teamId: id,
+        userId: user.id,
+        headers,
+        action: "manage team members",
+      });
+
+      const orgMember = await MemberModel.getByUserId(userId, organizationId);
+      if (!orgMember) {
+        throw new ApiError(404, "User not found in this organization");
+      }
+
+      const isMember = await TeamModel.isUserInTeam(id, userId);
+      if (isMember) {
+        throw new ApiError(409, "User is already a member of this team");
+      }
+
+      await validateNewTeamMembership({
+        teamId: id,
+        organizationId,
+        userId: user.id,
+      });
       const member = await TeamModel.addMember(id, userId, role);
+
+      return reply.send(member);
+    },
+  );
+
+  fastify.put(
+    "/api/teams/:id/members/:userId",
+    {
+      schema: {
+        operationId: RouteId.UpdateTeamMember,
+        description: "Update a team member role",
+        tags: ["Teams"],
+        params: z.object({
+          id: z.string(),
+          userId: z.string(),
+        }),
+        body: UpdateTeamMemberBodySchema,
+        response: constructResponseSchema(SelectTeamMemberSchema),
+      },
+    },
+    async (
+      { params: { id, userId }, body: { role }, organizationId, user, headers },
+      reply,
+    ) => {
+      const team = await getTeamForOrg({ teamId: id, organizationId });
+      if (!team) {
+        throw new ApiError(404, "Team not found");
+      }
+
+      await assertCanManageTeam({
+        teamId: id,
+        userId: user.id,
+        headers,
+        action: "manage team member roles",
+      });
+
+      await assertNotRemovingLastTeamAdmin({
+        teamId: id,
+        userId,
+        nextRole: role,
+      });
+
+      const member = await TeamModel.updateMemberRole({
+        teamId: id,
+        userId,
+        role,
+      });
+
+      if (!member) {
+        throw new ApiError(404, "Team member not found");
+      }
 
       return reply.send(member);
     },
@@ -313,12 +614,27 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
         response: constructResponseSchema(DeleteObjectResponseSchema),
       },
     },
-    async ({ params: { id, userId }, organizationId, user }, reply) => {
-      // Verify the team exists and belongs to the user's organization
-      const team = await TeamModel.findById(id);
-      if (!team || team.organizationId !== organizationId) {
+    async (
+      { params: { id, userId }, organizationId, user, headers },
+      reply,
+    ) => {
+      const team = await getTeamForOrg({ teamId: id, organizationId });
+      if (!team) {
         throw new ApiError(404, "Team not found");
       }
+
+      await assertCanManageTeam({
+        teamId: id,
+        userId: user.id,
+        headers,
+        action: "manage team members",
+      });
+
+      await assertNotRemovingLastTeamAdmin({
+        teamId: id,
+        userId,
+        nextRole: null,
+      });
 
       const success = await TeamModel.removeMember(id, userId);
 
@@ -326,20 +642,14 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
         throw new ApiError(404, "Team member not found");
       }
 
-      const userIsAgentAdmin = await hasAnyAgentTypeAdminPermission({
-        userId: user.id,
-        organizationId,
-      });
-
       // Clean up invalid credential sources (personal tokens) for this user
       // if they no longer have access to agents through other teams
       try {
-        const cleanedCount =
-          await AgentToolModel.cleanupInvalidCredentialSourcesForUser(
-            userId,
-            id,
-            userIsAgentAdmin,
-          );
+        const cleanedCount = await cleanupCredentialSourcesAfterMemberRemoval({
+          removedUserId: userId,
+          teamId: id,
+          organizationId,
+        });
 
         if (cleanedCount > 0) {
           fastify.log.info(
@@ -352,6 +662,43 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
       }
 
       return reply.send({ success: true });
+    },
+  );
+
+  fastify.get(
+    "/api/teams/labels/keys",
+    {
+      schema: {
+        operationId: RouteId.GetTeamLabelKeys,
+        description: "Get all label keys used by teams",
+        tags: ["Teams"],
+        response: constructResponseSchema(z.array(z.string())),
+      },
+    },
+    async ({ organizationId }, reply) => {
+      return reply.send(await TeamLabelModel.getAllKeys(organizationId));
+    },
+  );
+
+  fastify.get(
+    "/api/teams/labels/values",
+    {
+      schema: {
+        operationId: RouteId.GetTeamLabelValues,
+        description: "Get all label values used by teams",
+        tags: ["Teams"],
+        querystring: z.object({
+          key: z.string().optional().describe("Filter values by label key"),
+        }),
+        response: constructResponseSchema(z.array(z.string())),
+      },
+    },
+    async ({ query: { key }, organizationId }, reply) => {
+      return reply.send(
+        key
+          ? await TeamLabelModel.getValuesByKey({ organizationId, key })
+          : await TeamLabelModel.getAllValues(organizationId),
+      );
     },
   );
 
@@ -373,7 +720,7 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
     },
     async ({ params: { id }, organizationId, user, headers }, reply) => {
       // Verify enterprise license
-      if (!config.enterpriseFeatures.core) {
+      if (!enterpriseTier.isCoreActive()) {
         throw new ApiError(
           403,
           "Team Sync is an enterprise feature. Please contact sales@archestra.ai to enable it.",
@@ -381,20 +728,28 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
       }
 
       // Verify the team exists and belongs to the user's organization
-      const team = await TeamModel.findById(id);
+      const team = await TeamModel.findById(id, { includeMembers: false });
       if (!team || team.organizationId !== organizationId) {
         throw new ApiError(404, "Team not found");
       }
 
-      // Check if user is team:admin or member of the team
-      const { success: isTeamAdmin } = await hasPermission(
-        { team: ["admin"] },
+      const { success: canManageAllTeams } = await hasPermission(
+        { team: ["update"] },
         headers,
       );
-      if (!isTeamAdmin) {
-        const isMember = await TeamModel.isUserInTeam(id, user.id);
-        if (!isMember) {
-          throw new ApiError(404, "Team not found");
+      if (!canManageAllTeams) {
+        // Group-sync mappings are identity-provider configuration, so a role
+        // that can read identity providers may view them without being on the
+        // team (mutations stay team-admin-gated below).
+        const { success: canReadIdentityProviders } = await hasPermission(
+          { identityProvider: ["read"] },
+          headers,
+        );
+        if (!canReadIdentityProviders) {
+          const isMember = await TeamModel.isUserInTeam(id, user.id);
+          if (!isMember) {
+            throw new ApiError(404, "Team not found");
+          }
         }
       }
 
@@ -407,8 +762,7 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
     {
       schema: {
         operationId: RouteId.AddTeamExternalGroup,
-        description:
-          "Add an external group mapping to a team for SSO team sync",
+        description: "Link an identity provider group to a team for Team Sync",
         tags: ["Teams"],
         params: z.object({
           id: z.string(),
@@ -418,11 +772,17 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
       },
     },
     async (
-      { params: { id }, body: { groupIdentifier }, organizationId },
+      {
+        params: { id },
+        body: { groupIdentifier, identityProviderId, role },
+        organizationId,
+        user,
+        headers,
+      },
       reply,
     ) => {
       // Verify enterprise license
-      if (!config.enterpriseFeatures.core) {
+      if (!enterpriseTier.isCoreActive()) {
         throw new ApiError(
           403,
           "Team Sync is an enterprise feature. Please contact sales@archestra.ai to enable it.",
@@ -430,31 +790,50 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
       }
 
       // Verify the team exists and belongs to the user's organization
-      const team = await TeamModel.findById(id);
+      const team = await TeamModel.findById(id, { includeMembers: false });
       if (!team || team.organizationId !== organizationId) {
         throw new ApiError(404, "Team not found");
+      }
+
+      await assertCanManageTeam({
+        teamId: id,
+        userId: user.id,
+        headers,
+        action: "manage Team Sync for this team",
+      });
+
+      if (identityProviderId) {
+        if (
+          !(await TeamModel.isIdentityProviderInOrganization({
+            identityProviderId,
+            organizationId: organizationId,
+          }))
+        ) {
+          throw new ApiError(400, "Identity provider not found");
+        }
       }
 
       // Normalize group identifier to lowercase for case-insensitive matching
       const normalizedGroupIdentifier = groupIdentifier.toLowerCase();
 
-      // Check if the mapping already exists
+      // Check if the mapping already exists for this provider
       const existingGroups = await TeamModel.getExternalGroups(id);
       if (
         existingGroups.some(
-          (g) => g.groupIdentifier.toLowerCase() === normalizedGroupIdentifier,
+          (g) =>
+            g.groupIdentifier.toLowerCase() === normalizedGroupIdentifier &&
+            (g.identityProviderId ?? null) === (identityProviderId ?? null),
         )
       ) {
-        throw new ApiError(
-          409,
-          "This external group is already mapped to this team",
-        );
+        throw new ApiError(409, "This group is already linked to this team");
       }
 
-      const externalGroup = await TeamModel.addExternalGroup(
-        id,
-        normalizedGroupIdentifier,
-      );
+      const externalGroup = await TeamModel.addExternalGroup({
+        teamId: id,
+        groupIdentifier: normalizedGroupIdentifier,
+        identityProviderId,
+        role,
+      });
 
       return reply.send(externalGroup);
     },
@@ -466,7 +845,7 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
       schema: {
         operationId: RouteId.RemoveTeamExternalGroup,
         description:
-          "Remove an external group mapping from a team for SSO team sync",
+          "Unlink an identity provider group from a team's Team Sync",
         tags: ["Teams"],
         params: z.object({
           id: z.string(),
@@ -475,9 +854,12 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
         response: constructResponseSchema(DeleteObjectResponseSchema),
       },
     },
-    async ({ params: { id, groupId }, organizationId }, reply) => {
+    async (
+      { params: { id, groupId }, organizationId, user, headers },
+      reply,
+    ) => {
       // Verify enterprise license
-      if (!config.enterpriseFeatures.core) {
+      if (!enterpriseTier.isCoreActive()) {
         throw new ApiError(
           403,
           "Team Sync is an enterprise feature. Please contact sales@archestra.ai to enable it.",
@@ -485,15 +867,22 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
       }
 
       // Verify the team exists and belongs to the user's organization
-      const team = await TeamModel.findById(id);
+      const team = await TeamModel.findById(id, { includeMembers: false });
       if (!team || team.organizationId !== organizationId) {
         throw new ApiError(404, "Team not found");
       }
 
+      await assertCanManageTeam({
+        teamId: id,
+        userId: user.id,
+        headers,
+        action: "manage Team Sync for this team",
+      });
+
       const success = await TeamModel.removeExternalGroupById(id, groupId);
 
       if (!success) {
-        throw new ApiError(404, "External group mapping not found");
+        throw new ApiError(404, "Team Sync group link not found");
       }
 
       return reply.send({ success: true });
@@ -502,3 +891,102 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
 };
 
 export default teamRoutes;
+
+async function assertCanManageTeam(params: {
+  teamId: string;
+  userId: string;
+  headers: Parameters<typeof hasPermission>[1];
+  action: string;
+}) {
+  // Resolve the org-level "team manager" flag from the request session/API key
+  // (honoring API-key scoping), then defer the shared rule to the service.
+  //
+  // This is deliberately NOT team:create. Creating a team says nothing about
+  // the teams the caller does not belong to, so reading it as blanket
+  // administration let a role holding only team:read + team:create manage
+  // membership on — and reach the tokens of — every other team. Callers who
+  // legitimately administer their own team still pass via the team-admin
+  // branch inside canManageTeamMembers.
+  const { success: isOrgTeamManager } = await hasPermission(
+    { team: ["update"] },
+    params.headers,
+  );
+
+  const allowed = await canManageTeamMembers({
+    isOrgTeamManager,
+    userId: params.userId,
+    teamId: params.teamId,
+  });
+
+  if (!allowed) {
+    throw new ApiError(403, `You must be a team admin to ${params.action}`);
+  }
+}
+
+/**
+ * The team, when it is in the caller's organization and the caller may read
+ * it. Answers 404 otherwise, so a team the caller cannot read looks the same
+ * as one that does not exist.
+ */
+async function findReadableTeam(params: {
+  teamId: string;
+  organizationId: string;
+  userId: string;
+  headers: Parameters<typeof hasPermission>[1];
+  includeMembers?: boolean;
+}) {
+  const team = await getTeamForOrg({
+    teamId: params.teamId,
+    organizationId: params.organizationId,
+    includeMembers: params.includeMembers,
+  });
+  if (!team) {
+    throw new ApiError(404, "Team not found");
+  }
+
+  const { success: isOrgTeamManager } = await hasPermission(
+    { team: ["update"] },
+    params.headers,
+  );
+  const canRead = await canReadTeam({
+    isOrgTeamManager,
+    userId: params.userId,
+    teamId: params.teamId,
+  });
+  if (!canRead) {
+    throw new ApiError(404, "Team not found");
+  }
+  return team;
+}
+
+async function assertValidTeamParent(params: {
+  teamId?: string;
+  parentId: string | null;
+  organizationId: string;
+}) {
+  const result = await validateTeamParent(params);
+  if (result.ok) {
+    return;
+  }
+  const messages = {
+    parent_not_found: "Parent team not found",
+    self_parent: "A team cannot be its own parent",
+    cycle: "A team cannot be moved under one of its descendants",
+  } as const;
+  throw new ApiError(400, messages[result.reason]);
+}
+
+async function assertNotRemovingLastTeamAdmin(params: {
+  teamId: string;
+  userId: string;
+  nextRole: "admin" | "member" | null;
+}) {
+  const check = await checkLastAdminInvariant(params);
+  if (check.ok) {
+    return;
+  }
+  if (check.reason === "member_not_found") {
+    throw new ApiError(404, "Team member not found");
+  }
+  throw new ApiError(400, "Cannot remove the last admin from a team");
+}

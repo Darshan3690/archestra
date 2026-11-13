@@ -1,6 +1,8 @@
-import { eq, inArray } from "drizzle-orm";
-import db, { schema } from "@/database";
+import { and, eq, inArray } from "drizzle-orm";
+import db, { schema, withDbTransaction } from "@/database";
+import { notDeletedConversation } from "@/database/schemas/conversation";
 import logger from "@/logging";
+import ToolModel from "./tool";
 
 class ConversationEnabledToolModel {
   /**
@@ -46,7 +48,12 @@ class ConversationEnabledToolModel {
           schema.conversationsTable.hasCustomToolSelection,
       })
       .from(schema.conversationsTable)
-      .where(eq(schema.conversationsTable.id, conversationId))
+      .where(
+        and(
+          notDeletedConversation,
+          eq(schema.conversationsTable.id, conversationId),
+        ),
+      )
       .limit(1);
 
     const hasCustom = result[0]?.hasCustomToolSelection ?? false;
@@ -57,6 +64,30 @@ class ConversationEnabledToolModel {
     );
 
     return hasCustom;
+  }
+
+  /**
+   * Resolve the conversation's enabled-tool selection to a set of tool NAMES,
+   * or `null` when the conversation has no custom selection (meaning: no
+   * per-conversation filter — all assigned tools are allowed).
+   *
+   * search_tools/run_tool use this to apply the same per-conversation gate the
+   * visible tool list already enforces via `filterToolsByEnabledIds`
+   * (clients/chat-mcp-client.ts). An empty set means a custom selection that
+   * enabled zero tools.
+   */
+  static async getEnabledToolNameSet(
+    conversationId: string,
+  ): Promise<Set<string> | null> {
+    const hasCustom =
+      await ConversationEnabledToolModel.hasCustomSelection(conversationId);
+    if (!hasCustom) {
+      return null;
+    }
+    const toolIds =
+      await ConversationEnabledToolModel.findByConversation(conversationId);
+    const names = await ToolModel.getNamesByIds(toolIds);
+    return new Set(names);
   }
 
   /**
@@ -92,7 +123,7 @@ class ConversationEnabledToolModel {
       }
     }
 
-    await db.transaction(async (tx) => {
+    await withDbTransaction(async (tx) => {
       // Update the conversation to mark it as having custom tool selection
       await tx
         .update(schema.conversationsTable)
@@ -135,7 +166,7 @@ class ConversationEnabledToolModel {
       "ConversationEnabledToolModel.clearCustomSelection: clearing",
     );
 
-    await db.transaction(async (tx) => {
+    await withDbTransaction(async (tx) => {
       // Update the conversation to mark it as not having custom tool selection
       await tx
         .update(schema.conversationsTable)

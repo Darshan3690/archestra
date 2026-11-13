@@ -1,23 +1,40 @@
 import type { UIMessage } from "@ai-sdk/react";
 import { act, render, waitFor } from "@testing-library/react";
-import { useEffect } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
+import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ChatProvider, useGlobalChat } from "./global-chat.context";
+import { chatMessageQueue } from "@/lib/chat/chat-message-queue";
+import { useAppName } from "@/lib/hooks/use-app-name";
+import {
+  ChatProvider,
+  useChatSession,
+  useChatSessionSnapshot,
+  useGlobalChat,
+} from "./global-chat.context";
+
+type ChatSessionSnapshot = ReturnType<
+  ReturnType<typeof useGlobalChat>["getSession"]
+>;
 
 const mocks = vi.hoisted(() => ({
   addToolApprovalResponse: vi.fn(),
   addToolResult: vi.fn(),
+  clearChatErrors: vi.fn(),
+  clearError: vi.fn(),
+  getQueryData: vi.fn(),
   invalidateQueries: vi.fn(),
   mutate: vi.fn(),
+  mutateAsync: vi.fn(),
   regenerate: vi.fn(),
+  resumeStream: vi.fn(),
   sendMessage: vi.fn(),
   setMessages: vi.fn(),
   stop: vi.fn(),
-  useChat: vi.fn(),
+  useOffStreamChat: vi.fn(),
 }));
 
-vi.mock("@ai-sdk/react", () => ({
-  useChat: mocks.useChat,
+vi.mock("@/lib/chat/use-off-stream-chat", () => ({
+  useOffStreamChat: mocks.useOffStreamChat,
 }));
 
 vi.mock("ai", () => ({
@@ -25,10 +42,26 @@ vi.mock("ai", () => ({
   lastAssistantMessageIsCompleteWithApprovalResponses: vi.fn(() => true),
 }));
 
-vi.mock("@tanstack/react-query", () => ({
-  useQueryClient: () => ({
+vi.mock("sonner");
+
+vi.mock("@tanstack/react-query", () => {
+  // The real useQueryClient returns a stable client. A fresh object per call
+  // would destabilize callbacks that list it as a dependency (e.g.
+  // regenerateUserMessage) and loop the session-sync effect.
+  const queryClient = {
+    getQueryData: mocks.getQueryData,
     invalidateQueries: mocks.invalidateQueries,
-  }),
+  };
+  return {
+    useQueryClient: () => queryClient,
+    useMutation: () => ({
+      mutateAsync: mocks.mutateAsync,
+    }),
+  };
+});
+
+const conversationMock = vi.hoisted(() => ({
+  data: { title: null as string | null } as { title: string | null } | null,
 }));
 
 vi.mock("@/lib/chat/chat.query", () => ({
@@ -36,11 +69,22 @@ vi.mock("@/lib/chat/chat.query", () => ({
     isPending: false,
     mutate: mocks.mutate,
   }),
+  useResolveChatMcpElicitation: () => ({
+    isPending: false,
+    mutateAsync: mocks.mutateAsync,
+  }),
+  useClearChatErrors: () => ({
+    mutateAsync: mocks.clearChatErrors,
+  }),
+  useConversation: () => ({ data: conversationMock.data }),
+  useConversationUpdatedCacheSync: () => {},
 }));
 
-vi.mock("@/lib/hooks/use-app-name", () => ({
-  useAppName: () => "Archestra",
-}));
+vi.mock("@/lib/hooks/use-app-name");
+
+beforeEach(() => {
+  vi.mocked(useAppName).mockReturnValue("Archestra");
+});
 
 vi.mock("@/lib/config/config", () => ({
   default: {
@@ -50,21 +94,38 @@ vi.mock("@/lib/config/config", () => ({
   },
 }));
 
+// Bespoke factory (not the canonical __mocks__ one): this file partially
+// mocks @/lib/config/config above, which the canonical mock's importActual
+// chain would break on. (Message-queue draining stays inert here because no
+// messages are ever enqueued for the test conversations.)
+vi.mock("@/lib/config/config.query", () => ({
+  useFeature: () => false,
+}));
+
 describe("ChatProvider retries", () => {
-  let chatOptions: Parameters<typeof mocks.useChat>[0] | undefined;
+  let chatOptions: Parameters<typeof mocks.useOffStreamChat>[0] | undefined;
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // Model an in-flight replay by default: resumeStream() resolves only when
+    // the replayed stream concludes, so a plain vi.fn() (returning undefined)
+    // would misrepresent the SDK contract.
+    mocks.resumeStream.mockReturnValue(new Promise(() => {}));
+    // regenerate now clears persisted chat errors unconditionally (fire-and-
+    // forget with a .catch), so the mutateAsync mock must return a promise.
+    mocks.clearChatErrors.mockResolvedValue({ success: true });
     chatOptions = undefined;
     const messages: UIMessage[] = [];
-    mocks.useChat.mockImplementation((options) => {
+    mocks.useOffStreamChat.mockImplementation((options) => {
       chatOptions = options;
       return {
         addToolApprovalResponse: mocks.addToolApprovalResponse,
         addToolResult: mocks.addToolResult,
+        clearError: mocks.clearError,
         error: undefined,
         messages,
         regenerate: mocks.regenerate,
+        resumeStream: mocks.resumeStream,
         sendMessage: mocks.sendMessage,
         setMessages: mocks.setMessages,
         status: "ready",
@@ -84,7 +145,9 @@ describe("ChatProvider retries", () => {
       </ChatProvider>,
     );
 
-    await waitFor(() => expect(mocks.useChat).toHaveBeenCalled());
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled(), {
+      timeout: 5_000,
+    });
 
     vi.useFakeTimers();
     act(() => {
@@ -110,7 +173,7 @@ describe("ChatProvider retries", () => {
       </ChatProvider>,
     );
 
-    await waitFor(() => expect(mocks.useChat).toHaveBeenCalled());
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
 
     vi.useFakeTimers();
     act(() => {
@@ -120,14 +183,3072 @@ describe("ChatProvider retries", () => {
 
     expect(mocks.regenerate).toHaveBeenCalledTimes(1);
   });
+
+  const networkError = () =>
+    new Error(
+      JSON.stringify({
+        code: "network_error",
+        isRetryable: true,
+        message: "Connection error. Please check your network and try again.",
+      }),
+    );
+
+  it("auto-retries a structured network_error", async () => {
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    vi.useFakeTimers();
+    act(() => {
+      chatOptions?.onError?.(networkError());
+      vi.advanceTimersByTime(1500);
+    });
+
+    expect(mocks.regenerate).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the stale persisted error card after a network_error retry succeeds", async () => {
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    vi.useFakeTimers();
+    act(() => {
+      chatOptions?.onError?.(networkError());
+      vi.advanceTimersByTime(1500);
+    });
+    expect(mocks.regenerate).toHaveBeenCalledTimes(1);
+
+    vi.useRealTimers();
+    await act(async () => {
+      await chatOptions?.onFinish?.({ message: { parts: [] }, isAbort: false });
+    });
+
+    expect(mocks.clearChatErrors).toHaveBeenCalledWith({
+      id: "conversation-1",
+    });
+  });
+
+  it("does not clear persisted errors when a run succeeds after a non-retried error", async () => {
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    // server_error is not silently auto-retried, so it stays terminal and leaves
+    // no pending "clear on retry" intent for the next successful turn.
+    act(() => {
+      chatOptions?.onError?.(
+        new Error(
+          JSON.stringify({
+            code: "server_error",
+            isRetryable: true,
+            message: "The AI provider is experiencing issues.",
+          }),
+        ),
+      );
+    });
+    await act(async () => {
+      await chatOptions?.onFinish?.({ message: { parts: [] }, isAbort: false });
+    });
+
+    expect(mocks.clearChatErrors).not.toHaveBeenCalled();
+  });
+
+  it("does not clear persisted errors on a later success after the retry reattaches with a 204", async () => {
+    let resolveResume: (() => void) | undefined;
+    mocks.resumeStream.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveResume = resolve;
+        }),
+    );
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    // network_error auto-retries; its regenerate re-POSTs into the still-live run
+    // and lands the duplicate-run 409, so the session reattaches via resumeStream.
+    vi.useFakeTimers();
+    act(() => {
+      chatOptions?.onError?.(networkError());
+      chatOptions?.onFinish?.({
+        message: { parts: [] },
+        isAbort: false,
+        isError: true,
+        isDisconnect: true,
+      });
+      vi.advanceTimersByTime(1500);
+    });
+    expect(mocks.regenerate).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      chatOptions?.onError?.(
+        new Error("This conversation already has an active response."),
+      );
+      chatOptions?.onFinish?.({
+        message: { parts: [] },
+        isAbort: false,
+        isError: true,
+        isDisconnect: false,
+      });
+    });
+    expect(mocks.resumeStream).toHaveBeenCalledTimes(1);
+
+    // The run had already finished: resumeStream resolves 204 with no
+    // onFinish/onError, concluding recovery.
+    vi.useRealTimers();
+    await act(async () => {
+      resolveResume?.();
+    });
+
+    // A later unrelated turn succeeds — it must NOT clear the persisted error,
+    // since the reattach already concluded the recovery.
+    mocks.clearChatErrors.mockClear();
+    await act(async () => {
+      await chatOptions?.onFinish?.({ message: { parts: [] }, isAbort: false });
+    });
+
+    expect(mocks.clearChatErrors).not.toHaveBeenCalled();
+  });
+
+  it("clears persisted chat errors once a user-message regenerate is issued", async () => {
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+    // The conversation cache holds a persisted error card from the failed turn.
+    mocks.getQueryData.mockReturnValue({
+      chatErrors: [{ id: "chat-error-1" }],
+    });
+    mocks.clearChatErrors.mockResolvedValue({ success: true });
+    // updateChatMessage returns the saved thread keyed by DB ids.
+    mocks.mutateAsync.mockResolvedValue({
+      messages: [
+        { id: "user-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+      ],
+    });
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    await act(async () => {
+      await latestSessionRef.current?.regenerateUserMessage({
+        messageId: "user-1",
+        partIndex: 0,
+        text: "hi",
+      });
+    });
+
+    expect(mocks.regenerate).toHaveBeenCalledWith({ messageId: "user-1" });
+    expect(mocks.clearChatErrors).toHaveBeenCalledWith({
+      id: "conversation-1",
+    });
+  });
+
+  it("clears chat errors on regenerate even when the client cache shows none", async () => {
+    // The failed turn persists its error row asynchronously, so the client
+    // cache frequently has not loaded it yet when the user regenerates. The
+    // clear must still fire — otherwise the stale row (still on the server)
+    // resurfaces on the next conversation refetch, above the new answer.
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+    mocks.getQueryData.mockReturnValue({ chatErrors: [] });
+    mocks.mutateAsync.mockResolvedValue({
+      messages: [
+        { id: "user-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+      ],
+    });
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    await act(async () => {
+      await latestSessionRef.current?.regenerateUserMessage({
+        messageId: "user-1",
+        partIndex: 0,
+        text: "hi",
+      });
+    });
+
+    expect(mocks.regenerate).toHaveBeenCalledWith({ messageId: "user-1" });
+    expect(mocks.clearChatErrors).toHaveBeenCalledWith({
+      id: "conversation-1",
+    });
+  });
+
+  it("separates transport heartbeats from substantive response progress", async () => {
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+    const initialTransportSequence =
+      latestSessionRef.current?.transportActivitySequence ?? 0;
+    const initialProgressSequence =
+      latestSessionRef.current?.responseProgressSequence ?? 0;
+
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-heartbeat",
+        data: { timestamp: Date.now() },
+      });
+    });
+
+    await waitFor(() => {
+      expect(latestSessionRef.current?.transportActivitySequence).toBe(
+        initialTransportSequence + 1,
+      );
+      expect(latestSessionRef.current?.responseProgressSequence).toBe(
+        initialProgressSequence,
+      );
+    });
+
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-token-usage",
+        data: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+      });
+    });
+
+    await waitFor(() => {
+      expect(latestSessionRef.current?.transportActivitySequence).toBe(
+        initialTransportSequence + 2,
+      );
+      expect(latestSessionRef.current?.responseProgressSequence).toBe(
+        initialProgressSequence + 1,
+      );
+    });
+  });
+
+  it("counts heartbeats as response progress while a tool call awaits output", async () => {
+    // While a tool executes server-side the stream is intentionally silent
+    // apart from heartbeats. Those heartbeats must keep the response-progress
+    // window fresh, or the "upstream provider may have stalled" warning fires
+    // for any tool run longer than the idle threshold.
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+    const messages: UIMessage[] = [
+      {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "run the tool" }],
+      },
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolName: "archestra__run_command",
+            toolCallId: "tool-call-1",
+            state: "input-available",
+            input: {},
+          } as unknown as UIMessage["parts"][number],
+        ],
+      },
+    ];
+    mocks.useOffStreamChat.mockImplementation((options) => {
+      chatOptions = options;
+      return {
+        addToolApprovalResponse: mocks.addToolApprovalResponse,
+        addToolResult: mocks.addToolResult,
+        clearError: mocks.clearError,
+        error: undefined,
+        messages,
+        regenerate: mocks.regenerate,
+        resumeStream: mocks.resumeStream,
+        sendMessage: mocks.sendMessage,
+        setMessages: mocks.setMessages,
+        status: "streaming",
+        stop: mocks.stop,
+      };
+    });
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+    const initialProgressSequence =
+      latestSessionRef.current?.responseProgressSequence ?? 0;
+
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-heartbeat",
+        data: { timestamp: Date.now() },
+      });
+    });
+
+    await waitFor(() => {
+      expect(latestSessionRef.current?.responseProgressSequence).toBe(
+        initialProgressSequence + 1,
+      );
+    });
+  });
+
+  it("keeps heartbeats transport-only once the pending tool call has output", async () => {
+    // Output arrived and the provider is generating again: silence is now a
+    // potential upstream stall, so heartbeats must not refresh the
+    // response-progress window.
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+    const messages: UIMessage[] = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolName: "archestra__run_command",
+            toolCallId: "tool-call-1",
+            state: "output-available",
+            input: {},
+            output: { ok: true },
+          } as unknown as UIMessage["parts"][number],
+        ],
+      },
+    ];
+    mocks.useOffStreamChat.mockImplementation((options) => {
+      chatOptions = options;
+      return {
+        addToolApprovalResponse: mocks.addToolApprovalResponse,
+        addToolResult: mocks.addToolResult,
+        clearError: mocks.clearError,
+        error: undefined,
+        messages,
+        regenerate: mocks.regenerate,
+        resumeStream: mocks.resumeStream,
+        sendMessage: mocks.sendMessage,
+        setMessages: mocks.setMessages,
+        status: "streaming",
+        stop: mocks.stop,
+      };
+    });
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+    const initialTransportSequence =
+      latestSessionRef.current?.transportActivitySequence ?? 0;
+    const initialProgressSequence =
+      latestSessionRef.current?.responseProgressSequence ?? 0;
+
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-heartbeat",
+        data: { timestamp: Date.now() },
+      });
+    });
+
+    await waitFor(() => {
+      expect(latestSessionRef.current?.transportActivitySequence).toBe(
+        initialTransportSequence + 1,
+      );
+    });
+    expect(latestSessionRef.current?.responseProgressSequence).toBe(
+      initialProgressSequence,
+    );
+  });
+
+  it("updates live context token estimate from usage and compaction data", async () => {
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-token-usage",
+        data: {
+          inputTokens: 100,
+          outputTokens: 20,
+          totalTokens: 120,
+        },
+      });
+    });
+
+    // the indicator tracks prompt (input) occupancy, not input+output total
+    await waitFor(() =>
+      expect(latestSessionRef.current?.contextTokensUsed).toBe(100),
+    );
+
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-context-compaction-finish",
+        data: {
+          compactionId: "compaction-1",
+          originalTokenEstimate: 120,
+          compactedTokenEstimate: 35,
+        },
+      });
+    });
+
+    await waitFor(() =>
+      expect(latestSessionRef.current?.contextTokensUsed).toBe(35),
+    );
+    expect(latestSessionRef.current?.contextCompaction.lastCompaction).toEqual({
+      compactionId: "compaction-1",
+      originalTokenEstimate: 120,
+      compactedTokenEstimate: 35,
+    });
+  });
+
+  it("updates live context tokens from auto compaction estimates", async () => {
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-token-usage",
+        data: {
+          inputTokens: 100,
+          outputTokens: 20,
+          totalTokens: 120,
+        },
+      });
+    });
+
+    // the indicator tracks prompt (input) occupancy, not input+output total
+    await waitFor(() =>
+      expect(latestSessionRef.current?.contextTokensUsed).toBe(100),
+    );
+
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-context-compaction-finish",
+        data: {
+          trigger: "auto",
+          compactionId: "compaction-1",
+          originalTokenEstimate: 1_652_781,
+          compactedTokenEstimate: 794_797,
+        },
+      });
+    });
+
+    await waitFor(() =>
+      expect(
+        latestSessionRef.current?.contextCompaction.lastCompaction,
+      ).toEqual({
+        trigger: "auto",
+        compactionId: "compaction-1",
+        originalTokenEstimate: 1_652_781,
+        compactedTokenEstimate: 794_797,
+      }),
+    );
+    expect(latestSessionRef.current?.contextTokensUsed).toBe(794_797);
+  });
+
+  it("seeds context tokens from the turn-start window estimate, then refines from per-step usage", async () => {
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    // turn-start estimate seeds the indicator before the model responds
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-context-window-estimate",
+        data: { estimatedTokens: 542_000 },
+      });
+    });
+
+    await waitFor(() =>
+      expect(latestSessionRef.current?.contextTokensUsed).toBe(542_000),
+    );
+
+    // a per-step usage event then refines the seed with the provider's real
+    // prompt size (input tokens), e.g. right after an auto-compaction drop
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-token-usage",
+        data: { inputTokens: 7_199, outputTokens: 86, totalTokens: 7_285 },
+      });
+    });
+
+    await waitFor(() =>
+      expect(latestSessionRef.current?.contextTokensUsed).toBe(7_199),
+    );
+  });
+
+  it("clears pending MCP elicitation when the stream finishes or terminally errors", async () => {
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-mcp-elicitation",
+        data: {
+          id: "00000000-0000-4000-8000-000000000001",
+          conversationId: "conversation-1",
+          toolName: "delivery__collect_delivery_details",
+          message: "Please confirm delivery details",
+          mode: "form",
+        },
+      });
+    });
+
+    await waitFor(() =>
+      expect(latestSessionRef.current?.pendingMcpElicitations).toMatchObject([
+        { id: "00000000-0000-4000-8000-000000000001" },
+      ]),
+    );
+
+    act(() => {
+      chatOptions?.onFinish?.({ message: { parts: [] }, isAbort: false });
+    });
+
+    await waitFor(() =>
+      expect(latestSessionRef.current?.pendingMcpElicitations).toEqual([]),
+    );
+
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-mcp-elicitation",
+        data: {
+          id: "00000000-0000-4000-8000-000000000002",
+          conversationId: "conversation-1",
+          toolName: "delivery__collect_delivery_details",
+          message: "Please confirm delivery details",
+          mode: "form",
+        },
+      });
+    });
+
+    await waitFor(() =>
+      expect(latestSessionRef.current?.pendingMcpElicitations).toMatchObject([
+        { id: "00000000-0000-4000-8000-000000000002" },
+      ]),
+    );
+
+    act(() => {
+      chatOptions?.onError?.(
+        new Error(JSON.stringify({ code: "server_error", message: "boom" })),
+      );
+    });
+
+    await waitFor(() =>
+      expect(latestSessionRef.current?.pendingMcpElicitations).toEqual([]),
+    );
+  });
+
+  it("configures active-run reconnect URL and resumes when the last persisted message is from the user", async () => {
+    const { DefaultChatTransport } = await import("ai");
+    render(
+      <ChatProvider>
+        <RegisterChatSession
+          initialMessages={[
+            {
+              id: "user-1",
+              role: "user",
+              parts: [{ type: "text", text: "hello" }],
+            },
+          ]}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    await waitFor(() => expect(mocks.resumeStream).toHaveBeenCalledTimes(1));
+    expect(chatOptions?.resume).toBeUndefined();
+    const transportOptions = vi.mocked(DefaultChatTransport).mock.calls[0]?.[0];
+    expect(
+      transportOptions?.prepareReconnectToStreamRequest?.({
+        id: "conversation-1",
+        api: "/api/chat",
+        body: undefined,
+        credentials: "include",
+        headers: {},
+        requestMetadata: undefined,
+      }),
+    ).toMatchObject({
+      api: "/api/chat/conversations/conversation-1/active-run",
+    });
+  });
+
+  it("sends the reasoning depth the composer is showing with the turn", async () => {
+    // The stored column is written by a separate request the send can overtake,
+    // so the turn carries the depth rather than trusting the row to be current.
+    const { DefaultChatTransport } = await import("ai");
+    // The unconfirmed pick lives under a longer key beside the conversation.
+    mocks.getQueryData.mockImplementation((key: unknown) =>
+      Array.isArray(key) && key[0] === "conversation" && key.length === 2
+        ? { thinkingEffort: "high" }
+        : undefined,
+    );
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    const transportOptions = vi.mocked(DefaultChatTransport).mock.calls[0]?.[0];
+    const prepared = await transportOptions?.prepareSendMessagesRequest?.({
+      id: "conversation-1",
+      messages: [],
+      trigger: "submit-message",
+      messageId: undefined,
+      api: "/api/chat",
+      body: undefined,
+      credentials: "include",
+      headers: {},
+      requestMetadata: undefined,
+    } as never);
+
+    expect(prepared?.body).toMatchObject({
+      id: "conversation-1",
+      thinkingEffort: "high",
+    });
+  });
+
+  it("prefers a pick the server has not confirmed over the stored row", async () => {
+    // Finishing a message invalidates the conversation query; the refetch would
+    // otherwise hand back the row the persist request has not reached yet.
+    const { DefaultChatTransport } = await import("ai");
+    mocks.getQueryData.mockImplementation((key: unknown) => {
+      if (!Array.isArray(key) || key[0] !== "conversation") return undefined;
+      return key.length === 2 ? { thinkingEffort: "low" } : { effort: "high" };
+    });
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    const transportOptions = vi.mocked(DefaultChatTransport).mock.calls[0]?.[0];
+    const prepared = await transportOptions?.prepareSendMessagesRequest?.({
+      id: "conversation-1",
+      messages: [],
+      trigger: "submit-message",
+      messageId: undefined,
+      api: "/api/chat",
+      body: undefined,
+      credentials: "include",
+      headers: {},
+      requestMetadata: undefined,
+    } as never);
+
+    expect(prepared?.body).toMatchObject({ thinkingEffort: "high" });
+  });
+
+  it("sends a pending switch back to the default instead of the stored depth", async () => {
+    // The default is null, so an unboxed pending value would read as "nothing
+    // pending" and the turn would keep sending the depth the user just left.
+    const { DefaultChatTransport } = await import("ai");
+    mocks.getQueryData.mockImplementation((key: unknown) => {
+      if (!Array.isArray(key) || key[0] !== "conversation") return undefined;
+      return key.length === 2 ? { thinkingEffort: "high" } : { effort: null };
+    });
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    const transportOptions = vi.mocked(DefaultChatTransport).mock.calls[0]?.[0];
+    const prepared = await transportOptions?.prepareSendMessagesRequest?.({
+      id: "conversation-1",
+      messages: [],
+      trigger: "submit-message",
+      messageId: undefined,
+      api: "/api/chat",
+      body: undefined,
+      credentials: "include",
+      headers: {},
+      requestMetadata: undefined,
+    } as never);
+
+    expect(prepared?.body).toMatchObject({ thinkingEffort: null });
+  });
+
+  it("shows a toast for duplicate active-run submits", async () => {
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    act(() => {
+      chatOptions?.onError?.(
+        new Error("This conversation already has an active response."),
+      );
+    });
+
+    expect(vi.mocked(toast.error)).toHaveBeenCalledWith(
+      "This conversation already has a response in progress. Stop it before sending another message.",
+    );
+    expect(mocks.regenerate).not.toHaveBeenCalled();
+    // A cold 409 (no auto-recovery in flight) is a genuine concurrent submit —
+    // reattaching would silently drop the message the user just typed.
+    expect(mocks.resumeStream).not.toHaveBeenCalled();
+    // The SDK error is cleared so the benign guard never renders as a hard
+    // inline error panel — the toast is the only surfaced feedback.
+    expect(mocks.clearError).toHaveBeenCalledTimes(1);
+  });
+
+  it("reattaches to the active run when our own auto-recovery retry hits the duplicate-run 409", async () => {
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    // A transient network error severs the stream; the auto-retry re-POSTs
+    // into the still-running backend run and gets the duplicate-run 409.
+    // The AI SDK fires onFinish from a finally block right after onError
+    // (with isError set) — replicate that sequence, since clearing the
+    // recovery flag there would misclassify the upcoming 409 as a genuine
+    // duplicate submit.
+    vi.useFakeTimers();
+    act(() => {
+      chatOptions?.onError?.(new Error("Failed to fetch"));
+      chatOptions?.onFinish?.({
+        message: { parts: [] },
+        isAbort: false,
+        isError: true,
+        isDisconnect: true,
+      });
+      vi.advanceTimersByTime(1500);
+    });
+    expect(mocks.regenerate).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      chatOptions?.onError?.(
+        new Error("This conversation already has an active response."),
+      );
+      chatOptions?.onFinish?.({
+        message: { parts: [] },
+        isAbort: false,
+        isError: true,
+        isDisconnect: false,
+      });
+    });
+
+    // The 409 was provoked by our own recovery retry: reattach to the live
+    // run via the replay endpoint instead of telling the user to stop a
+    // response they cannot see.
+    expect(mocks.resumeStream).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(toast.error)).not.toHaveBeenCalled();
+  });
+
+  it("concludes recovery when the reattach finds the run already finished (204 no-op)", async () => {
+    let resolveResume: (() => void) | undefined;
+    mocks.resumeStream.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveResume = resolve;
+        }),
+    );
+
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-mcp-elicitation",
+        data: {
+          id: "00000000-0000-4000-8000-000000000001",
+          conversationId: "conversation-1",
+          toolName: "archestra__ask_user",
+          message: "Which region?",
+          mode: "form",
+        },
+      });
+    });
+
+    // Sever the stream, let the auto-retry fire, and land its duplicate-run
+    // 409 — the session is now reattaching via resumeStream().
+    vi.useFakeTimers();
+    act(() => {
+      chatOptions?.onError?.(new Error("Failed to fetch"));
+      chatOptions?.onFinish?.({
+        message: { parts: [] },
+        isAbort: false,
+        isError: true,
+        isDisconnect: true,
+      });
+      vi.advanceTimersByTime(1500);
+    });
+    act(() => {
+      chatOptions?.onError?.(
+        new Error("This conversation already has an active response."),
+      );
+      chatOptions?.onFinish?.({
+        message: { parts: [] },
+        isAbort: false,
+        isError: true,
+        isDisconnect: false,
+      });
+    });
+    expect(mocks.resumeStream).toHaveBeenCalledTimes(1);
+    expect(latestSessionRef.current?.isRecovering).toBe(true);
+    // Still the live run's question while the chat reattaches to it.
+    expect(latestSessionRef.current?.pendingMcpElicitations).toHaveLength(1);
+
+    // The run finished before the reattach landed: reconnectToStream gets the
+    // 204 and the SDK resolves resumeStream() WITHOUT firing onFinish or
+    // onError (ai@6 makeRequest early-returns on a null reconnect stream).
+    await act(async () => {
+      resolveResume?.();
+    });
+
+    // Recovery must conclude — a stuck flag would misroute the next genuine
+    // concurrent submit's 409 into the reattach path (silently dropping the
+    // typed message) and keep the frozen snapshot rendered indefinitely.
+    expect(latestSessionRef.current?.isRecovering).toBe(false);
+    expect(mocks.clearError).toHaveBeenCalled();
+    // A finished run waits on no question.
+    expect(latestSessionRef.current?.pendingMcpElicitations).toEqual([]);
+
+    // A later cold 409 is a genuine concurrent submit again: toast, no
+    // reattach.
+    act(() => {
+      chatOptions?.onError?.(
+        new Error("This conversation already has an active response."),
+      );
+    });
+    expect(mocks.resumeStream).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(toast.error)).toHaveBeenCalledWith(
+      "This conversation already has a response in progress. Stop it before sending another message.",
+    );
+  });
+
+  // NOTE: if the regression returns (regenerateUserMessage stops clearing the
+  // restore-on-regression buffer), this test HANGS instead of failing an
+  // assertion: the restore manufactures a new messages identity every render,
+  // the session-sync effect re-fires on it, and the resulting render loop
+  // never yields back to the test runner. A hung CI job here means this bug.
+  it("does not resurrect the pre-edit assistant answer while edit-regenerate rebuilds it", async () => {
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+    const userMessage = {
+      id: "user-1",
+      role: "user",
+      parts: [{ type: "text", text: "bye" }],
+    } as UIMessage;
+    const oldAssistant = {
+      id: "assistant-1",
+      role: "assistant",
+      parts: [{ type: "text", text: "Goodbye!" }],
+    } as UIMessage;
+    // Live SDK message list the useChat mock serves on every render.
+    const liveMessages = { current: [userMessage, oldAssistant] };
+    mocks.useOffStreamChat.mockImplementation((options) => {
+      chatOptions = options;
+      return {
+        addToolApprovalResponse: mocks.addToolApprovalResponse,
+        addToolResult: mocks.addToolResult,
+        clearError: mocks.clearError,
+        error: undefined,
+        messages: liveMessages.current,
+        regenerate: mocks.regenerate,
+        resumeStream: mocks.resumeStream,
+        sendMessage: mocks.sendMessage,
+        setMessages: mocks.setMessages,
+        status: "ready",
+        stop: mocks.stop,
+      };
+    });
+    const editedUser = {
+      ...userMessage,
+      parts: [{ type: "text", text: "bye, edited" }],
+    } as UIMessage;
+    // Persisted thread returned by the edit mutation.
+    mocks.mutateAsync.mockResolvedValue({
+      messages: [editedUser, oldAssistant],
+    });
+    // Mirror the SDK contract: setMessages replaces the live list, and
+    // regenerate({messageId}) synchronously truncates it up to and including
+    // the user anchor before requesting (AbstractChat.regenerate slices
+    // state.messages in the same task).
+    mocks.setMessages.mockImplementation(
+      (next: UIMessage[] | ((current: UIMessage[]) => UIMessage[])) => {
+        // Both forms, like the SDK: callers pass a list or an updater run
+        // against the live list.
+        liveMessages.current =
+          typeof next === "function" ? next(liveMessages.current) : next;
+      },
+    );
+    mocks.regenerate.mockImplementation(
+      async ({ messageId }: { messageId: string }) => {
+        const index = liveMessages.current.findIndex((m) => m.id === messageId);
+        liveMessages.current = liveMessages.current.slice(0, index + 1);
+      },
+    );
+
+    // Fresh JSX per render call — reusing one element identity makes React
+    // bail out of re-rendering the subtree, so the regression renders below
+    // would never reach the hook.
+    const makeTree = () => (
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>
+    );
+    const { rerender } = render(makeTree());
+    await waitFor(() =>
+      expect(latestSessionRef.current?.messages).toHaveLength(2),
+    );
+
+    await act(async () => {
+      await latestSessionRef.current?.regenerateUserMessage({
+        messageId: "user-1",
+        partIndex: 0,
+        text: "bye, edited",
+      });
+    });
+    expect(mocks.regenerate).toHaveBeenCalledWith({ messageId: "user-1" });
+
+    // First render after the edit: regenerate has truncated the live list to
+    // the user anchor.
+    rerender(makeTree());
+
+    // The regenerate stream then rebuilds the SAME assistant message from
+    // empty. The restore-on-regression buffer must not resurrect the pre-edit
+    // answer here — two writers fighting over one message is the update loop
+    // that crashes the page (React #185, "Maximum update depth").
+    liveMessages.current = [
+      editedUser,
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [],
+      } as unknown as UIMessage,
+    ];
+    rerender(makeTree());
+
+    const lastMessage = latestSessionRef.current?.messages.at(-1);
+    expect(lastMessage?.id).toBe("assistant-1");
+    expect(lastMessage?.parts).toEqual([]);
+  });
+
+  it("marks the session as recovering while auto-retrying or reattaching, but not for terminal errors", async () => {
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+    expect(latestSessionRef.current?.isRecovering).toBe(false);
+
+    // Transient network error → auto-retry scheduled → recovering: the UI
+    // must not flash the error while the retry is in flight.
+    act(() => {
+      chatOptions?.onError?.(new Error("Failed to fetch"));
+    });
+    await waitFor(() =>
+      expect(latestSessionRef.current?.isRecovering).toBe(true),
+    );
+
+    // Duplicate-run 409 → resumeStream reattach → still recovering.
+    act(() => {
+      chatOptions?.onError?.(
+        new Error("This conversation already has an active response."),
+      );
+    });
+    await waitFor(() =>
+      expect(latestSessionRef.current?.isRecovering).toBe(true),
+    );
+
+    // Stream concluded → recovery over.
+    act(() => {
+      chatOptions?.onFinish?.({ message: { parts: [] }, isAbort: false });
+    });
+    await waitFor(() =>
+      expect(latestSessionRef.current?.isRecovering).toBe(false),
+    );
+
+    // Terminal (structured, non-retryable) error → not recovering: the
+    // error must surface.
+    act(() => {
+      chatOptions?.onError?.(
+        new Error(JSON.stringify({ code: "server_error", message: "boom" })),
+      );
+    });
+    await waitFor(() =>
+      expect(latestSessionRef.current?.isRecovering).toBe(false),
+    );
+  });
 });
 
-function RegisterChatSession() {
+describe("streamed session updates", () => {
+  type StreamState = { messages: UIMessage[]; status: string };
+  let streamState: StreamState;
+  const listeners = new Set<() => void>();
+  const setStreamState = (next: StreamState) => {
+    streamState = next;
+    for (const listener of listeners) listener();
+  };
+  const assistantReply = (text: string): UIMessage[] => [
+    { id: "user-1", role: "user", parts: [{ type: "text", text: "hi" }] },
+    { id: "assistant-1", role: "assistant", parts: [{ type: "text", text }] },
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    streamState = { messages: [], status: "ready" };
+    mocks.useOffStreamChat.mockImplementation(function useStreamingChat() {
+      const state = useSyncExternalStore(
+        (listener) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+        () => streamState,
+      );
+      return {
+        addToolApprovalResponse: mocks.addToolApprovalResponse,
+        addToolResult: mocks.addToolResult,
+        clearError: mocks.clearError,
+        error: undefined,
+        messages: state.messages,
+        regenerate: mocks.regenerate,
+        resumeStream: mocks.resumeStream,
+        sendMessage: mocks.sendMessage,
+        setMessages: mocks.setMessages,
+        status: state.status,
+        stop: mocks.stop,
+      };
+    });
+  });
+
+  it("re-renders session subscribers per chunk but global consumers only when generation starts or stops", async () => {
+    const globalRenders: boolean[] = [];
+    function GlobalConsumer() {
+      const { generatingConversationIds } = useGlobalChat();
+      globalRenders.push(generatingConversationIds.has("conversation-1"));
+      return null;
+    }
+    let latestText = "";
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <GlobalConsumer />
+        <CaptureChatSession
+          onSession={(session) => {
+            const part = session?.messages.at(-1)?.parts[0];
+            latestText = part?.type === "text" ? part.text : "";
+          }}
+        />
+      </ChatProvider>,
+    );
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    act(() => {
+      setStreamState({ messages: assistantReply(""), status: "streaming" });
+    });
+    await waitFor(() => expect(globalRenders.at(-1)).toBe(true));
+    const rendersBeforeChunks = globalRenders.length;
+
+    let text = "";
+    for (let chunk = 0; chunk < 20; chunk++) {
+      text += `word${chunk} `;
+      act(() => {
+        setStreamState({ messages: assistantReply(text), status: "streaming" });
+      });
+    }
+    await waitFor(() => expect(latestText).toBe(text));
+    // The sidebar and other global consumers sit out every streamed chunk.
+    expect(globalRenders.length).toBe(rendersBeforeChunks);
+
+    act(() => {
+      setStreamState({ messages: assistantReply(text), status: "ready" });
+    });
+    await waitFor(() => expect(globalRenders.at(-1)).toBe(false));
+  });
+});
+
+describe("ChatProvider auto title generation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    conversationMock.data = { title: null };
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // A tool-only first exchange spans two user and two assistant messages,
+  // none of which carry assistant text.
+  const toolOnlyMessages: UIMessage[] = [
+    {
+      id: "u1",
+      role: "user",
+      parts: [{ type: "text", text: "Show me the Archestra PM board" }],
+    },
+    {
+      id: "a1",
+      role: "assistant",
+      parts: [
+        {
+          type: "tool-search",
+          toolCallId: "t1",
+          state: "output-available",
+          input: {},
+          output: {},
+        },
+      ],
+    } as unknown as UIMessage,
+    {
+      id: "u2",
+      role: "user",
+      parts: [{ type: "text", text: "continue" }],
+    },
+    {
+      id: "a2",
+      role: "assistant",
+      parts: [
+        {
+          type: "tool-board",
+          toolCallId: "t2",
+          state: "output-available",
+          input: {},
+          output: {},
+        },
+      ],
+    } as unknown as UIMessage,
+  ];
+
+  it("titles an untitled chat after a tool-only exchange", async () => {
+    let chatOptions: Parameters<typeof mocks.useOffStreamChat>[0] | undefined;
+
+    mocks.useOffStreamChat.mockImplementation((options) => {
+      chatOptions = options;
+      return {
+        addToolApprovalResponse: mocks.addToolApprovalResponse,
+        addToolResult: mocks.addToolResult,
+        error: undefined,
+        messages: toolOnlyMessages,
+        regenerate: mocks.regenerate,
+        sendMessage: mocks.sendMessage,
+        setMessages: mocks.setMessages,
+        status: "ready",
+        stop: mocks.stop,
+      };
+    });
+
+    // Simulate the "instant title" set on conversation creation (first user message text)
+    mocks.getQueryData.mockReturnValue({
+      title: "Show me the Archestra PM board",
+    });
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    // Trigger onFinish to simulate the AI stream completing
+    act(() => {
+      chatOptions?.onFinish?.({
+        message: toolOnlyMessages[toolOnlyMessages.length - 1],
+        isAbort: false,
+      });
+    });
+
+    await waitFor(() =>
+      expect(mocks.mutate).toHaveBeenCalledWith(
+        { id: "conversation-1", regenerate: true },
+        expect.any(Object),
+      ),
+    );
+  });
+
+  it("titles an existing untitled chat after the first settled exchange", async () => {
+    let chatOptions: Parameters<typeof mocks.useOffStreamChat>[0] | undefined;
+
+    mocks.useOffStreamChat.mockImplementation((options) => {
+      chatOptions = options;
+      return {
+        addToolApprovalResponse: mocks.addToolApprovalResponse,
+        addToolResult: mocks.addToolResult,
+        error: undefined,
+        messages: toolOnlyMessages,
+        regenerate: mocks.regenerate,
+        sendMessage: mocks.sendMessage,
+        setMessages: mocks.setMessages,
+        status: "ready",
+        stop: mocks.stop,
+      };
+    });
+    mocks.getQueryData.mockReturnValue({ title: null });
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    act(() => {
+      chatOptions?.onFinish?.({
+        message: toolOnlyMessages[toolOnlyMessages.length - 1],
+        isAbort: false,
+      });
+    });
+
+    await waitFor(() =>
+      expect(mocks.mutate).toHaveBeenCalledWith(
+        { id: "conversation-1", regenerate: false },
+        expect.any(Object),
+      ),
+    );
+  });
+
+  it("titles an app chat still carrying its seeded app name", async () => {
+    let chatOptions: Parameters<typeof mocks.useOffStreamChat>[0] | undefined;
+
+    mocks.useOffStreamChat.mockImplementation((options) => {
+      chatOptions = options;
+      return {
+        addToolApprovalResponse: mocks.addToolApprovalResponse,
+        addToolResult: mocks.addToolResult,
+        error: undefined,
+        messages: toolOnlyMessages,
+        regenerate: mocks.regenerate,
+        sendMessage: mocks.sendMessage,
+        setMessages: mocks.setMessages,
+        status: "ready",
+        stop: mocks.stop,
+      };
+    });
+    // An app chat is created titled with the app's name, which is neither empty
+    // nor the first user message — only the flag marks it as replaceable.
+    mocks.getQueryData.mockReturnValue({
+      title: "Expense Tracker",
+      titleIsPlaceholder: true,
+    });
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    act(() => {
+      chatOptions?.onFinish?.({
+        message: toolOnlyMessages[toolOnlyMessages.length - 1],
+        isAbort: false,
+      });
+    });
+
+    await waitFor(() =>
+      expect(mocks.mutate).toHaveBeenCalledWith(
+        { id: "conversation-1", regenerate: false },
+        expect.any(Object),
+      ),
+    );
+  });
+
+  it("leaves a renamed app chat alone", async () => {
+    let chatOptions: Parameters<typeof mocks.useOffStreamChat>[0] | undefined;
+
+    mocks.useOffStreamChat.mockImplementation((options) => {
+      chatOptions = options;
+      return {
+        addToolApprovalResponse: mocks.addToolApprovalResponse,
+        addToolResult: mocks.addToolResult,
+        error: undefined,
+        messages: toolOnlyMessages,
+        regenerate: mocks.regenerate,
+        sendMessage: mocks.sendMessage,
+        setMessages: mocks.setMessages,
+        status: "ready",
+        stop: mocks.stop,
+      };
+    });
+    // Renaming clears the flag, so the app chat is no longer replaceable.
+    mocks.getQueryData.mockReturnValue({
+      title: "Q3 budget planning",
+      titleIsPlaceholder: false,
+    });
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    // Awaited: the title decision sits behind the cache invalidations onFinish
+    // awaits, so asserting synchronously would pass before it is even reached.
+    await act(async () => {
+      await chatOptions?.onFinish?.({
+        message: toolOnlyMessages[toolOnlyMessages.length - 1],
+        isAbort: false,
+      });
+    });
+
+    expect(mocks.mutate).not.toHaveBeenCalled();
+  });
+
+  it("does not regenerate a title the conversation already has", async () => {
+    let chatOptions: Parameters<typeof mocks.useOffStreamChat>[0] | undefined;
+
+    mocks.useOffStreamChat.mockImplementation((options) => {
+      chatOptions = options;
+      return {
+        addToolApprovalResponse: mocks.addToolApprovalResponse,
+        addToolResult: mocks.addToolResult,
+        error: undefined,
+        messages: toolOnlyMessages,
+        regenerate: mocks.regenerate,
+        sendMessage: mocks.sendMessage,
+        setMessages: mocks.setMessages,
+        status: "ready",
+        stop: mocks.stop,
+      };
+    });
+    mocks.getQueryData.mockReturnValue({ title: "Existing title" });
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+    act(() => {
+      chatOptions?.onFinish?.({
+        message: toolOnlyMessages[toolOnlyMessages.length - 1],
+        isAbort: false,
+      });
+    });
+
+    expect(mocks.mutate).not.toHaveBeenCalled();
+  });
+
+  it("attempts automatic title generation only once", async () => {
+    let chatOptions: Parameters<typeof mocks.useOffStreamChat>[0] | undefined;
+
+    mocks.useOffStreamChat.mockImplementation((options) => {
+      chatOptions = options;
+      return {
+        addToolApprovalResponse: mocks.addToolApprovalResponse,
+        addToolResult: mocks.addToolResult,
+        error: undefined,
+        messages: toolOnlyMessages,
+        regenerate: mocks.regenerate,
+        sendMessage: mocks.sendMessage,
+        setMessages: mocks.setMessages,
+        status: "ready",
+        stop: mocks.stop,
+      };
+    });
+    mocks.getQueryData.mockReturnValue({ title: null });
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    act(() => {
+      chatOptions?.onFinish?.({
+        message: toolOnlyMessages[toolOnlyMessages.length - 1],
+        isAbort: false,
+      });
+      chatOptions?.onFinish?.({
+        message: toolOnlyMessages[toolOnlyMessages.length - 1],
+        isAbort: false,
+      });
+    });
+
+    await waitFor(() => expect(mocks.mutate).toHaveBeenCalledTimes(1));
+  });
+});
+
+describe("ChatProvider title animation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("marks a title as animating and auto-clears it after the animation window", async () => {
+    let markTitleAnimating: ((id: string) => void) | undefined;
+    let animatingTitleIds: Set<string> = new Set();
+
+    render(
+      <ChatProvider>
+        <CaptureTitleAnimation
+          onValue={(value) => {
+            markTitleAnimating = value.markTitleAnimating;
+            animatingTitleIds = value.animatingTitleIds;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(markTitleAnimating).toBeDefined());
+
+    vi.useFakeTimers();
+    act(() => {
+      markTitleAnimating?.("conversation-1");
+    });
+    expect(animatingTitleIds.has("conversation-1")).toBe(true);
+
+    act(() => {
+      vi.advanceTimersByTime(3000);
+    });
+    expect(animatingTitleIds.has("conversation-1")).toBe(false);
+  });
+});
+
+describe("stopping with queued messages", () => {
+  const conversationId = "conversation-stop-queue";
+  let chatOptions: Parameters<typeof mocks.useOffStreamChat>[0] | undefined;
+  let status: "ready" | "streaming";
+  let messages: UIMessage[];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    chatMessageQueue.clear(conversationId);
+    chatOptions = undefined;
+    status = "streaming";
+    mocks.resumeStream.mockResolvedValue(undefined);
+    messages = [];
+    mocks.useOffStreamChat.mockImplementation((options) => {
+      chatOptions = options;
+      return {
+        addToolApprovalResponse: mocks.addToolApprovalResponse,
+        addToolResult: mocks.addToolResult,
+        clearError: mocks.clearError,
+        error: undefined,
+        messages,
+        regenerate: mocks.regenerate,
+        resumeStream: mocks.resumeStream,
+        sendMessage: mocks.sendMessage,
+        setMessages: mocks.setMessages,
+        status,
+        stop: mocks.stop,
+      };
+    });
+  });
+
+  afterEach(() => {
+    chatMessageQueue.clear(conversationId);
+  });
+
+  it("discards queued messages when the active response is stopped", async () => {
+    const tree = () => (
+      <ChatProvider>
+        <RegisterChatSession conversationId={conversationId} />
+      </ChatProvider>
+    );
+    const { rerender } = render(tree());
+    await waitFor(() => expect(chatOptions).toBeDefined());
+
+    act(() => {
+      chatMessageQueue.enqueue(conversationId, { text: "show budget" });
+    });
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await chatOptions?.onFinish?.({
+        message: { id: "assistant-stopped", role: "assistant", parts: [] },
+        isAbort: true,
+        isError: false,
+      });
+    });
+    expect(chatMessageQueue.get(conversationId)).toHaveLength(0);
+
+    status = "ready";
+    rerender(tree());
+    await waitFor(() => expect(mocks.sendMessage).not.toHaveBeenCalled());
+    expect(chatMessageQueue.get(conversationId)).toHaveLength(0);
+  });
+
+  it.each([
+    "ready",
+    "approval-requested",
+    "input-available",
+    "approval-responded",
+  ])("does not interrupt when the current session is %s", async (state) => {
+    let session: ChatSessionSnapshot;
+    if (state === "ready") status = "ready";
+    else
+      messages = [
+        {
+          id: "assistant",
+          role: "assistant",
+          parts: [
+            {
+              type: "dynamic-tool",
+              toolName: "write",
+              toolCallId: "call",
+              state,
+              input: {},
+            },
+          ],
+        },
+      ] as UIMessage[];
+    render(
+      <ChatProvider>
+        <RegisterChatSession conversationId={conversationId} />
+        <CaptureChatSession
+          conversationId={conversationId}
+          onSession={(value) => {
+            session = value;
+          }}
+        />
+      </ChatProvider>,
+    );
+    await waitFor(() => expect(session).toBeDefined());
+    const stopServer = vi.fn().mockResolvedValue(undefined);
+    act(() => {
+      chatMessageQueue.enqueue(conversationId, { text: "correction" });
+      session?.stop({
+        preserveQueuedMessages: true,
+        interruptQueued: true,
+        stopServer,
+      });
+    });
+    expect(stopServer).not.toHaveBeenCalled();
+    expect(mocks.stop).not.toHaveBeenCalled();
+    if (state !== "ready")
+      expect(chatMessageQueue.get(conversationId)).toHaveLength(1);
+  });
+
+  it.each([
+    true,
+    false,
+  ])("sends the full queue in one turn after interrupt (aborted=%s)", async (isAbort) => {
+    let session: ChatSessionSnapshot;
+    let finishStop: () => void = () => {};
+    const stopServer = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishStop = resolve;
+        }),
+    );
+    const tree = () => (
+      <ChatProvider>
+        <RegisterChatSession conversationId={conversationId} />
+        <CaptureChatSession
+          conversationId={conversationId}
+          onSession={(value) => {
+            session = value;
+          }}
+        />
+      </ChatProvider>
+    );
+    const { rerender } = render(tree());
+    await waitFor(() => expect(session).toBeDefined());
+    act(() => {
+      chatMessageQueue.enqueue(conversationId, {
+        text: "first correction",
+        files: [
+          {
+            url: "data:text/plain;base64,SGk=",
+            mediaType: "text/plain",
+            filename: "note.txt",
+          },
+        ],
+      });
+      chatMessageQueue.enqueue(conversationId, { text: "second correction" });
+      session?.stop({
+        preserveQueuedMessages: true,
+        interruptQueued: true,
+        stopServer,
+      });
+      session?.stop({
+        preserveQueuedMessages: true,
+        interruptQueued: true,
+        stopServer,
+      });
+    });
+    expect(stopServer).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await chatOptions?.onFinish?.({
+        message: { id: "interrupted", role: "assistant", parts: [] },
+        isAbort,
+        isError: false,
+      });
+    });
+    status = "ready";
+    rerender(tree());
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    await act(async () => finishStop());
+    await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledTimes(1));
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parts: [{ type: "text", text: "second correction" }],
+      }),
+    );
+    const append = mocks.setMessages.mock.calls.at(-1)?.[0];
+    expect(typeof append).toBe("function");
+    if (typeof append !== "function")
+      throw new Error("Missing batch transcript update");
+    expect(append([])).toEqual([
+      expect.objectContaining({
+        role: "user",
+        parts: [
+          { type: "text", text: "first correction" },
+          {
+            type: "file",
+            url: "data:text/plain;base64,SGk=",
+            mediaType: "text/plain",
+            filename: "note.txt",
+          },
+        ],
+      }),
+    ]);
+    expect(chatMessageQueue.get(conversationId)).toHaveLength(0);
+    rerender(tree());
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends the oldest queued message immediately after a steering interrupt", async () => {
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+    const tree = () => (
+      <ChatProvider>
+        <RegisterChatSession conversationId={conversationId} />
+        <CaptureChatSession
+          conversationId={conversationId}
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>
+    );
+    const { rerender } = render(tree());
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      chatMessageQueue.enqueue(conversationId, { text: "change direction" });
+      chatMessageQueue.enqueue(conversationId, { text: "then summarize" });
+      latestSessionRef.current?.stop({ preserveQueuedMessages: true });
+    });
+    expect(mocks.stop).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await chatOptions?.onFinish?.({
+        message: { id: "assistant-interrupted", role: "assistant", parts: [] },
+        isAbort: true,
+        isError: false,
+      });
+    });
+    expect(chatMessageQueue.get(conversationId)).toHaveLength(2);
+
+    status = "ready";
+    rerender(tree());
+    await waitFor(() =>
+      expect(mocks.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          role: "user",
+          parts: [{ type: "text", text: "change direction" }],
+        }),
+      ),
+    );
+    expect(
+      chatMessageQueue.get(conversationId).map(({ text }) => text),
+    ).toEqual(["then summarize"]);
+
+    status = "streaming";
+    rerender(tree());
+    await act(async () => {
+      await chatOptions?.onFinish?.({
+        message: { id: "assistant-steered", role: "assistant", parts: [] },
+        isAbort: false,
+        isError: false,
+      });
+    });
+    status = "ready";
+    rerender(tree());
+    await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledTimes(2));
+    expect(mocks.sendMessage).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        parts: [{ type: "text", text: "then summarize" }],
+      }),
+    );
+    expect(chatMessageQueue.get(conversationId)).toHaveLength(0);
+  });
+
+  it.each([
+    "resolve",
+    "reject",
+  ] as const)("coalesces repeated interrupts and waits for the stop request to %s before draining", async (outcome) => {
+    let session: ChatSessionSnapshot;
+    let settleStop: () => void = () => {};
+    const stopServer = vi.fn(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          settleStop =
+            outcome === "resolve"
+              ? resolve
+              : () => reject(new Error("Stop unavailable"));
+        }),
+    );
+    const tree = () => (
+      <ChatProvider>
+        <RegisterChatSession conversationId={conversationId} />
+        <CaptureChatSession
+          conversationId={conversationId}
+          onSession={(value) => {
+            session = value;
+          }}
+        />
+      </ChatProvider>
+    );
+    const { rerender } = render(tree());
+    await waitFor(() => expect(session).toBeDefined());
+    act(() => {
+      chatMessageQueue.enqueue(conversationId, { text: "first correction" });
+      chatMessageQueue.enqueue(conversationId, { text: "second correction" });
+      session?.stop({ preserveQueuedMessages: true, stopServer });
+      session?.stop({ preserveQueuedMessages: true, stopServer });
+      session?.stop({ preserveQueuedMessages: true, stopServer });
+    });
+    expect(stopServer).toHaveBeenCalledTimes(1);
+    expect(mocks.stop).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await chatOptions?.onFinish?.({
+        message: { id: "assistant-stopped", role: "assistant", parts: [] },
+        isAbort: true,
+        isError: false,
+      });
+    });
+    status = "ready";
+    rerender(tree());
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(chatMessageQueue.get(conversationId)).toHaveLength(2);
+
+    await act(async () => settleStop());
+    await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledTimes(1));
+    expect(mocks.stop).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parts: [{ type: "text", text: "first correction" }],
+      }),
+    );
+    expect(
+      chatMessageQueue.get(conversationId).map(({ text }) => text),
+    ).toEqual(["second correction"]);
+  });
+
+  it.each([
+    "same turn",
+    "new turn",
+  ] as const)("scopes steering preservation through a stream error to the %s", async (turn) => {
+    let session: ChatSessionSnapshot;
+    let resolveStop: () => void = () => {};
+    const stopServer = () =>
+      new Promise<void>((resolve) => {
+        resolveStop = resolve;
+      });
+    messages = [
+      {
+        id: "original-user",
+        role: "user",
+        parts: [{ type: "text", text: "Original request" }],
+      },
+    ];
+    const tree = () => (
+      <ChatProvider>
+        <RegisterChatSession conversationId={conversationId} />
+        <CaptureChatSession
+          conversationId={conversationId}
+          onSession={(value) => {
+            session = value;
+          }}
+        />
+      </ChatProvider>
+    );
+    const { rerender } = render(tree());
+    await waitFor(() => expect(session).toBeDefined());
+    act(() => {
+      chatMessageQueue.enqueue(conversationId, {
+        text: "keep this correction",
+      });
+      session?.stop({ preserveQueuedMessages: true, stopServer });
+    });
+    await act(async () => {
+      await chatOptions?.onFinish?.({
+        message: { id: "failed-stream", role: "assistant", parts: [] },
+        isAbort: false,
+        isError: true,
+      });
+    });
+    if (turn === "new turn") {
+      messages = [
+        ...messages,
+        {
+          id: "new-user",
+          role: "user",
+          parts: [{ type: "text", text: "A different request" }],
+        },
+      ];
+      rerender(tree());
+    }
+    await act(async () => resolveStop());
+    expect(mocks.stop).toHaveBeenCalledTimes(turn === "same turn" ? 1 : 0);
+    await act(async () => {
+      await chatOptions?.onFinish?.({
+        message: { id: "aborted-stream", role: "assistant", parts: [] },
+        isAbort: true,
+        isError: false,
+      });
+    });
+    expect(chatMessageQueue.get(conversationId)).toHaveLength(
+      turn === "same turn" ? 1 : 0,
+    );
+    status = "ready";
+    rerender(tree());
+    await waitFor(() =>
+      expect(mocks.sendMessage).toHaveBeenCalledTimes(
+        turn === "same turn" ? 1 : 0,
+      ),
+    );
+  });
+
+  it("keeps instructions queued while an initially empty-queue stop is settling", async () => {
+    let session: ChatSessionSnapshot;
+    render(
+      <ChatProvider>
+        <RegisterChatSession conversationId={conversationId} />
+        <CaptureChatSession
+          conversationId={conversationId}
+          onSession={(value) => {
+            session = value;
+          }}
+        />
+      </ChatProvider>,
+    );
+    await waitFor(() => expect(session).toBeDefined());
+    await act(async () => {
+      session?.stop({
+        preserveQueuedMessages: true,
+        stopServer: async () => {
+          chatMessageQueue.enqueue(conversationId, {
+            text: "keep this instruction",
+          });
+          await chatOptions?.onFinish?.({
+            message: { id: "assistant-stopped", role: "assistant", parts: [] },
+            isAbort: true,
+            isError: false,
+          });
+        },
+      });
+    });
+    expect(chatMessageQueue.get(conversationId)).toHaveLength(1);
+    expect(mocks.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    "streaming",
+    "aborted",
+  ] as const)("preserves the queue after a failed stop when the server is %s", async (serverStatus) => {
+    let session: ChatSessionSnapshot;
+    render(
+      <ChatProvider>
+        <RegisterChatSession conversationId={conversationId} />
+        <CaptureChatSession
+          conversationId={conversationId}
+          onSession={(value) => {
+            session = value;
+          }}
+        />
+      </ChatProvider>,
+    );
+    await waitFor(() => expect(session).toBeDefined());
+    const stopServer = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Stop unavailable"));
+    await act(async () => {
+      chatMessageQueue.enqueue(conversationId, {
+        text: "keep the first correction",
+      });
+      chatMessageQueue.enqueue(conversationId, {
+        text: "keep the second correction",
+      });
+      session?.stop({ preserveQueuedMessages: true, stopServer });
+    });
+    expect(mocks.stop).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(chatMessageQueue.get(conversationId)).toHaveLength(2);
+
+    if (serverStatus === "aborted") {
+      await act(async () => {
+        await chatOptions?.onFinish?.({
+          message: {
+            id: "assistant-server-aborted",
+            role: "assistant",
+            parts: [],
+          },
+          isAbort: true,
+          isError: false,
+        });
+      });
+      expect(chatMessageQueue.get(conversationId)).toHaveLength(2);
+      return;
+    }
+
+    stopServer.mockResolvedValueOnce(undefined);
+    await act(async () => {
+      session?.stop({ preserveQueuedMessages: true, stopServer });
+    });
+    expect(stopServer).toHaveBeenCalledTimes(2);
+    expect(mocks.stop).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await chatOptions?.onFinish?.({
+        message: { id: "assistant-stopped", role: "assistant", parts: [] },
+        isAbort: true,
+        isError: false,
+      });
+    });
+    expect(chatMessageQueue.get(conversationId)).toHaveLength(2);
+  });
+});
+
+describe("manual context compaction and the message queue", () => {
+  const conversationId = "conversation-compaction-queue";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    chatMessageQueue.clear(conversationId);
+    // resumeStream() resolves immediately here: the queued-message drain waits
+    // for the mount-time resume attempt to settle, and these tests have nothing
+    // to resume (no trailing user message).
+    mocks.resumeStream.mockResolvedValue(undefined);
+    const messages: UIMessage[] = [];
+    mocks.useOffStreamChat.mockImplementation((options) => {
+      void options;
+      return {
+        addToolApprovalResponse: mocks.addToolApprovalResponse,
+        addToolResult: mocks.addToolResult,
+        clearError: mocks.clearError,
+        error: undefined,
+        messages,
+        regenerate: mocks.regenerate,
+        resumeStream: mocks.resumeStream,
+        sendMessage: mocks.sendMessage,
+        setMessages: mocks.setMessages,
+        status: "ready",
+        stop: mocks.stop,
+      };
+    });
+  });
+
+  afterEach(() => {
+    chatMessageQueue.clear(conversationId);
+  });
+
+  const renderSession = () => {
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession conversationId={conversationId} />
+        <CaptureChatSession
+          conversationId={conversationId}
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    return latestSessionRef;
+  };
+
+  // The point of queueing during compaction: the message waits for the rewrite
+  // instead of starting a turn against a thread that is being replaced.
+  it("holds a queued message while a manual compaction is in flight, then drains it", async () => {
+    const latestSessionRef = renderSession();
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      latestSessionRef.current?.beginManualContextCompaction();
+    });
+    await waitFor(() =>
+      expect(latestSessionRef.current?.contextCompaction.isCompacting).toBe(
+        true,
+      ),
+    );
+
+    act(() => {
+      chatMessageQueue.enqueue(conversationId, { text: "after compaction" });
+    });
+
+    // The SDK reads "ready" throughout — only the compaction flag holds it back.
+    await waitFor(() =>
+      expect(chatMessageQueue.get(conversationId)).toHaveLength(1),
+    );
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+
+    act(() => {
+      latestSessionRef.current?.endManualContextCompaction();
+    });
+
+    await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledTimes(1));
+    expect(mocks.sendMessage.mock.calls[0]?.[0]).toMatchObject({
+      role: "user",
+      parts: [{ type: "text", text: "after compaction" }],
+    });
+    expect(chatMessageQueue.get(conversationId)).toHaveLength(0);
+  });
+
+  // Manual compaction is tracked apart from the stream-driven flag, so the
+  // stream-end cleanup cannot release the queue mid-rewrite.
+  it("keeps compacting through a stream finish that lands during the manual run", async () => {
+    const latestSessionRef = renderSession();
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      latestSessionRef.current?.beginManualContextCompaction();
+    });
+    await waitFor(() =>
+      expect(latestSessionRef.current?.contextCompaction.isCompacting).toBe(
+        true,
+      ),
+    );
+
+    act(() => {
+      // A compaction the stream reported, recorded while the manual run is
+      // still open (its finish clears only the stream-side flag).
+      latestSessionRef.current?.recordContextCompaction({
+        compactionId: "compaction-stream",
+        trigger: "auto",
+      });
+    });
+
+    expect(latestSessionRef.current?.contextCompaction.isCompacting).toBe(true);
+
+    act(() => {
+      latestSessionRef.current?.endManualContextCompaction();
+    });
+    await waitFor(() =>
+      expect(latestSessionRef.current?.contextCompaction.isCompacting).toBe(
+        false,
+      ),
+    );
+  });
+});
+
+describe("context window breakdown state", () => {
+  let chatOptions: Parameters<typeof mocks.useOffStreamChat>[0] | undefined;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    chatOptions = undefined;
+    // The real useChat returns a referentially-stable messages array between
+    // renders when nothing changed. Returning a fresh [] from each mock call
+    // instead makes stableMessages a new identity every render, which re-fires
+    // the session-sync effect → notifySessionUpdate → re-render in an infinite
+    // loop that hangs render(<ChatProvider>) and never exits the worker. Hoist
+    // one stable empty array so the mock honors that contract.
+    const messages: UIMessage[] = [];
+    mocks.useOffStreamChat.mockImplementation((options) => {
+      chatOptions = options;
+      return {
+        addToolApprovalResponse: mocks.addToolApprovalResponse,
+        addToolResult: mocks.addToolResult,
+        error: undefined,
+        messages,
+        regenerate: mocks.regenerate,
+        resumeStream: mocks.resumeStream,
+        sendMessage: mocks.sendMessage,
+        setMessages: mocks.setMessages,
+        status: "ready",
+        stop: mocks.stop,
+      };
+    });
+  });
+
+  const validBreakdown = {
+    provider: "anthropic",
+    model: "claude-sonnet-4-6",
+    contextLength: 200_000,
+    usedTokens: 84_200,
+    freeTokens: 115_800,
+    usedPercent: 42.1,
+    estimatedInputCostUsd: 0.04,
+    segments: [{ category: "messages", tokens: 84_200, items: [] }],
+  } as const;
+
+  it("stores a valid breakdown in session state when the event arrives", async () => {
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-context-window-breakdown",
+        data: validBreakdown,
+      });
+    });
+
+    await waitFor(() =>
+      expect(latestSessionRef.current?.contextWindow).toMatchObject({
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+        usedTokens: 84_200,
+      }),
+    );
+  });
+
+  it("silently ignores a malformed breakdown payload without throwing", async () => {
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    // First set a valid breakdown so we have something to check against.
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-context-window-breakdown",
+        data: validBreakdown,
+      });
+    });
+
+    await waitFor(() =>
+      expect(latestSessionRef.current?.contextWindow).not.toBeNull(),
+    );
+
+    // Now send a malformed payload — contextWindow should not change.
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-context-window-breakdown",
+        data: { provider: 42, usedTokens: "not-a-number" },
+      });
+    });
+
+    // Give React a tick to flush any potential state update.
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Still the previous valid value — malformed payload was dropped.
+    expect(latestSessionRef.current?.contextWindow).toMatchObject({
+      provider: "anthropic",
+      usedTokens: 84_200,
+    });
+  });
+
+  it("resets contextWindow to null when a new turn estimate arrives", async () => {
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    // Establish a breakdown from a previous turn.
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-context-window-breakdown",
+        data: validBreakdown,
+      });
+    });
+
+    await waitFor(() =>
+      expect(latestSessionRef.current?.contextWindow).not.toBeNull(),
+    );
+
+    // A new turn-start estimate arrives — breakdown should clear immediately.
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-context-window-estimate",
+        data: { estimatedTokens: 10_000 },
+      });
+    });
+
+    await waitFor(() =>
+      expect(latestSessionRef.current?.contextWindow).toBeNull(),
+    );
+
+    // contextTokensUsed is seeded from the estimate.
+    expect(latestSessionRef.current?.contextTokensUsed).toBe(10_000);
+  });
+
+  it("contextWindow is isolated per conversation and starts as null", async () => {
+    // Register two separate conversations and confirm each starts with no breakdown.
+    const sessionA: { current: ChatSessionSnapshot } = { current: undefined };
+    const sessionB: { current: ChatSessionSnapshot } = { current: undefined };
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession conversationId="conv-a" />
+        <RegisterChatSession conversationId="conv-b" />
+        <CaptureChatSession
+          conversationId="conv-a"
+          onSession={(s) => {
+            sessionA.current = s;
+          }}
+        />
+        <CaptureChatSession
+          conversationId="conv-b"
+          onSession={(s) => {
+            sessionB.current = s;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(sessionA.current).toBeDefined());
+    await waitFor(() => expect(sessionB.current).toBeDefined());
+
+    expect(sessionA.current?.contextWindow).toBeNull();
+    expect(sessionB.current?.contextWindow).toBeNull();
+  });
+
+  it("reconciles contextWindow.usedTokens when data-token-usage refines the prompt token count", async () => {
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-context-window-breakdown",
+        data: validBreakdown,
+      });
+    });
+
+    await waitFor(() =>
+      expect(latestSessionRef.current?.contextWindow?.usedTokens).toBe(84_200),
+    );
+    expect(latestSessionRef.current?.contextTokensUsed).toBe(84_200);
+
+    // Provider reports exact prompt tokens after the response finishes.
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-token-usage",
+        data: { inputTokens: 168_400, outputTokens: 120, totalTokens: 168_520 },
+      });
+    });
+
+    await waitFor(() =>
+      expect(latestSessionRef.current?.contextTokensUsed).toBe(168_400),
+    );
+    expect(latestSessionRef.current?.contextWindow?.usedTokens).toBe(168_400);
+    expect(latestSessionRef.current?.contextWindow?.freeTokens).toBe(
+      200_000 - 168_400,
+    );
+  });
+
+  it("clears stale contextWindow when compaction updates contextTokensUsed", async () => {
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+        <CaptureChatSession
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-context-window-breakdown",
+        data: validBreakdown,
+      });
+    });
+
+    await waitFor(() =>
+      expect(latestSessionRef.current?.contextWindow).not.toBeNull(),
+    );
+    expect(latestSessionRef.current?.contextTokensUsed).toBe(
+      validBreakdown.usedTokens,
+    );
+
+    act(() => {
+      latestSessionRef.current?.recordContextCompaction({
+        trigger: "manual",
+        originalTokenEstimate: 84_200,
+        compactedTokenEstimate: 12_000,
+      });
+    });
+
+    await waitFor(() =>
+      expect(latestSessionRef.current?.contextTokensUsed).toBe(12_000),
+    );
+    expect(latestSessionRef.current?.contextWindow).toBeNull();
+  });
+});
+
+describe("ChatProvider app-tool cache invalidation", () => {
+  let chatOptions: Parameters<typeof mocks.useOffStreamChat>[0] | undefined;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    chatOptions = undefined;
+    const messages: UIMessage[] = [];
+    mocks.useOffStreamChat.mockImplementation((options) => {
+      chatOptions = options;
+      return {
+        addToolApprovalResponse: mocks.addToolApprovalResponse,
+        addToolResult: mocks.addToolResult,
+        error: undefined,
+        messages,
+        regenerate: mocks.regenerate,
+        resumeStream: mocks.resumeStream,
+        sendMessage: mocks.sendMessage,
+        setMessages: mocks.setMessages,
+        status: "ready",
+        stop: mocks.stop,
+      };
+    });
+  });
+
+  const publishMessage = (partOverrides: Record<string, unknown> = {}) =>
+    ({
+      id: "assistant-1",
+      role: "assistant",
+      parts: [
+        {
+          type: "tool-archestra__publish_app",
+          toolCallId: "call-1",
+          state: "output-available",
+          input: { appId: "app-1", scope: "org" },
+          output: { id: "app-1", scope: "org", runUrl: "/a/app-1" },
+          ...partOverrides,
+        },
+      ],
+    }) as unknown as UIMessage;
+
+  it("invalidates the app caches when a publish_app result finishes", async () => {
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    // publish_app mutates the app's scope server-side, inside the chat loop —
+    // no frontend mutation hook runs, so onFinish must mark the app caches
+    // stale or the settings dialog serves the pre-publish scope from cache.
+    await act(async () => {
+      await chatOptions?.onFinish?.({
+        message: publishMessage(),
+        isAbort: false,
+      });
+    });
+
+    expect(mocks.invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ["apps"],
+    });
+    expect(mocks.invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ["mcp-catalog"],
+    });
+  });
+
+  it("does not invalidate the app caches for an errored publish_app", async () => {
+    render(
+      <ChatProvider>
+        <RegisterChatSession />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(mocks.useOffStreamChat).toHaveBeenCalled());
+
+    await act(async () => {
+      await chatOptions?.onFinish?.({
+        message: publishMessage({ state: "output-error", errorText: "denied" }),
+        isAbort: false,
+      });
+    });
+
+    expect(mocks.invalidateQueries).not.toHaveBeenCalledWith({
+      queryKey: ["apps"],
+    });
+  });
+});
+
+function CaptureTitleAnimation({
+  onValue,
+}: {
+  onValue: (value: {
+    markTitleAnimating: (id: string) => void;
+    animatingTitleIds: Set<string>;
+  }) => void;
+}) {
+  const { markTitleAnimating, animatingTitleIds } = useGlobalChat();
+
+  useEffect(() => {
+    onValue({ markTitleAnimating, animatingTitleIds });
+  }, [onValue, markTitleAnimating, animatingTitleIds]);
+
+  return null;
+}
+
+describe("pending MCP elicitation questions", () => {
+  const conversationId = "conversation-questions";
+  let chatOptions: Parameters<typeof mocks.useOffStreamChat>[0] | undefined;
+  let messages: UIMessage[];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    chatMessageQueue.clear(conversationId);
+    chatOptions = undefined;
+    messages = [];
+    // Nothing to resume (no trailing user message), so the queue drain is
+    // gated only by what these tests set up.
+    mocks.resumeStream.mockResolvedValue(undefined);
+    mocks.useOffStreamChat.mockImplementation((options) => {
+      chatOptions = options;
+      return {
+        addToolApprovalResponse: mocks.addToolApprovalResponse,
+        addToolResult: mocks.addToolResult,
+        clearError: mocks.clearError,
+        error: undefined,
+        messages,
+        regenerate: mocks.regenerate,
+        resumeStream: mocks.resumeStream,
+        sendMessage: mocks.sendMessage,
+        setMessages: mocks.setMessages,
+        status: "ready",
+        stop: mocks.stop,
+      };
+    });
+  });
+
+  afterEach(() => {
+    chatMessageQueue.clear(conversationId);
+  });
+
+  const renderSession = () => {
+    const latestSessionRef: { current: ChatSessionSnapshot } = {
+      current: undefined,
+    };
+    const tree = () => (
+      <ChatProvider>
+        <RegisterChatSession conversationId={conversationId} />
+        <CaptureChatSession
+          conversationId={conversationId}
+          onSession={(session) => {
+            latestSessionRef.current = session;
+          }}
+        />
+      </ChatProvider>
+    );
+    const { rerender } = render(tree());
+    return { latestSessionRef, rerender: () => rerender(tree()) };
+  };
+
+  const question = (id: string, extra?: { toolCallId?: string }) => ({
+    type: "data-mcp-elicitation",
+    data: {
+      id,
+      conversationId,
+      toolName: "archestra__ask_user",
+      message: `Question ${id}?`,
+      mode: "form",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          choice: { type: "string", enum: ["Yes", "No"] },
+        },
+        required: ["choice"],
+      },
+      ...extra,
+    },
+  });
+
+  const resolved = (id: string, forConversation = conversationId) => ({
+    type: "data-mcp-elicitation-resolved",
+    data: { id, conversationId: forConversation, outcome: "answered" },
+  });
+
+  const pendingIds = (session: ChatSessionSnapshot) =>
+    session?.pendingMcpElicitations.map((request) => request.id);
+
+  it("keeps every question in arrival order and drops one when the backend reports it resolved", async () => {
+    const { latestSessionRef } = renderSession();
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      chatOptions?.onData?.(question("q-1"));
+      chatOptions?.onData?.(question("q-2"));
+      // A duplicate delivery of the same question is not a second question.
+      chatOptions?.onData?.(question("q-1"));
+    });
+    await waitFor(() =>
+      expect(pendingIds(latestSessionRef.current)).toEqual(["q-1", "q-2"]),
+    );
+
+    act(() => {
+      chatOptions?.onData?.(resolved("q-1", "another-conversation"));
+    });
+    act(() => {
+      chatOptions?.onData?.(resolved("q-1"));
+    });
+    await waitFor(() =>
+      expect(pendingIds(latestSessionRef.current)).toEqual(["q-2"]),
+    );
+  });
+
+  it("never brings back a settled question when the run is replayed", async () => {
+    const { latestSessionRef } = renderSession();
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      chatOptions?.onData?.(question("q-1"));
+      chatOptions?.onData?.(resolved("q-1"));
+    });
+    await waitFor(() =>
+      expect(pendingIds(latestSessionRef.current)).toEqual([]),
+    );
+
+    // A reconnect replays the turn from its first event: the question arrives
+    // again, and its resolution only after it.
+    act(() => {
+      chatOptions?.onData?.(question("q-1"));
+    });
+    await act(async () => {});
+    expect(pendingIds(latestSessionRef.current)).toEqual([]);
+
+    act(() => {
+      chatOptions?.onData?.(resolved("q-1"));
+    });
+    expect(pendingIds(latestSessionRef.current)).toEqual([]);
+  });
+
+  it("drops a question once the tool call that asked it has finished", async () => {
+    const toolPart = (state: "input-available" | "output-available") =>
+      ({
+        type: "dynamic-tool",
+        toolName: "archestra__ask_user",
+        toolCallId: "call-1",
+        state,
+        input: { question: "Question q-1?" },
+        ...(state === "output-available"
+          ? { output: { content: [{ type: "text", text: "done" }] } }
+          : {}),
+      }) as UIMessage["parts"][number];
+    messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [toolPart("input-available")],
+      },
+    ];
+    const { latestSessionRef, rerender } = renderSession();
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      chatOptions?.onData?.(question("q-1", { toolCallId: "call-1" }));
+      chatOptions?.onData?.(question("q-2", { toolCallId: "call-2" }));
+    });
+    await waitFor(() =>
+      expect(pendingIds(latestSessionRef.current)).toEqual(["q-1", "q-2"]),
+    );
+
+    messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [toolPart("output-available")],
+      },
+    ];
+    rerender();
+
+    await waitFor(() =>
+      expect(pendingIds(latestSessionRef.current)).toEqual(["q-2"]),
+    );
+  });
+
+  it("drops an answered question, keeps a failed one, and drops a refused one with a note", async () => {
+    const { latestSessionRef } = renderSession();
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      chatOptions?.onData?.(question("q-1"));
+      chatOptions?.onData?.(question("q-2"));
+      chatOptions?.onData?.(question("q-3"));
+    });
+    await waitFor(() =>
+      expect(pendingIds(latestSessionRef.current)).toEqual([
+        "q-1",
+        "q-2",
+        "q-3",
+      ]),
+    );
+
+    mocks.mutateAsync.mockResolvedValueOnce("answered");
+    await act(async () => {
+      await latestSessionRef.current?.resolveMcpElicitation({
+        id: "q-1",
+        action: "accept",
+        content: { choice: "Yes" },
+      });
+    });
+    expect(mocks.mutateAsync).toHaveBeenLastCalledWith({
+      id: "q-1",
+      conversationId,
+      action: "accept",
+      content: { choice: "Yes" },
+    });
+    await waitFor(() =>
+      expect(pendingIds(latestSessionRef.current)).toEqual(["q-2", "q-3"]),
+    );
+
+    // Any other failure was already reported; the question stays for a retry.
+    mocks.mutateAsync.mockResolvedValueOnce("failed");
+    await act(async () => {
+      await latestSessionRef.current?.resolveMcpElicitation({
+        id: "q-2",
+        action: "cancel",
+      });
+    });
+    expect(pendingIds(latestSessionRef.current)).toEqual(["q-2", "q-3"]);
+
+    // 409: the backend is no longer waiting on it. Nothing else explained
+    // that yet, so the user gets a note rather than a card that just vanishes.
+    mocks.mutateAsync.mockResolvedValueOnce("stale");
+    await act(async () => {
+      await latestSessionRef.current?.resolveMcpElicitation({
+        id: "q-2",
+        action: "cancel",
+      });
+    });
+    await waitFor(() =>
+      expect(pendingIds(latestSessionRef.current)).toEqual(["q-3"]),
+    );
+    expect(toast.info).toHaveBeenCalledTimes(1);
+    expect(toast.error).not.toHaveBeenCalled();
+
+    // Once the resolved event has retired it, a late 409 stays quiet.
+    act(() => {
+      chatOptions?.onData?.(resolved("q-3"));
+    });
+    mocks.mutateAsync.mockResolvedValueOnce("stale");
+    await act(async () => {
+      await latestSessionRef.current?.resolveMcpElicitation({
+        id: "q-3",
+        action: "cancel",
+      });
+    });
+    expect(pendingIds(latestSessionRef.current)).toEqual([]);
+    expect(toast.info).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps pending questions through a dropped stream the chat recovers from", async () => {
+    const { latestSessionRef } = renderSession();
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      chatOptions?.onData?.(question("q-1"));
+      chatOptions?.onData?.(question("q-2"));
+    });
+    await waitFor(() =>
+      expect(pendingIds(latestSessionRef.current)).toEqual(["q-1", "q-2"]),
+    );
+
+    // The connection drops: the SDK reports the error, then finishes the
+    // errored stream, while the auto-retry is scheduled. The card (and the
+    // picks in it) must stay up until the recovered run settles it.
+    vi.useFakeTimers();
+    try {
+      act(() => {
+        chatOptions?.onError?.(new Error("Failed to fetch"));
+        chatOptions?.onFinish?.({
+          message: { parts: [] },
+          isAbort: false,
+          isError: true,
+          isDisconnect: true,
+        });
+      });
+      expect(pendingIds(latestSessionRef.current)).toEqual(["q-1", "q-2"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds queued messages while a question is pending", async () => {
+    const { latestSessionRef } = renderSession();
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      chatOptions?.onData?.(question("q-1"));
+    });
+    await waitFor(() =>
+      expect(pendingIds(latestSessionRef.current)).toEqual(["q-1"]),
+    );
+
+    act(() => {
+      chatMessageQueue.enqueue(conversationId, { text: "and another thing" });
+    });
+    await act(async () => {});
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+
+    act(() => {
+      chatOptions?.onData?.(resolved("q-1"));
+    });
+    await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledTimes(1));
+  });
+
+  it("ignores a data-mcp-elicitation payload that fails schema validation", async () => {
+    const { latestSessionRef } = renderSession();
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      chatOptions?.onData?.({
+        type: "data-mcp-elicitation",
+        data: {
+          conversationId,
+          toolName: "archestra__ask_user",
+          message: "Missing id and mode",
+        },
+      });
+      chatOptions?.onData?.(question("q-1"));
+    });
+
+    await waitFor(() =>
+      expect(pendingIds(latestSessionRef.current)).toEqual(["q-1"]),
+    );
+  });
+
+  it("clears a pending question after repeated submit failures so the queue can drain", async () => {
+    const { latestSessionRef } = renderSession();
+    await waitFor(() => expect(latestSessionRef.current).toBeDefined());
+
+    act(() => {
+      chatOptions?.onData?.(question("q-1"));
+    });
+    await waitFor(() =>
+      expect(pendingIds(latestSessionRef.current)).toEqual(["q-1"]),
+    );
+
+    act(() => {
+      chatMessageQueue.enqueue(conversationId, { text: "and another thing" });
+    });
+    await act(async () => {});
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+
+    vi.useFakeTimers();
+    try {
+      mocks.mutateAsync.mockResolvedValue("failed");
+      await act(async () => {
+        await latestSessionRef.current?.resolveMcpElicitation({
+          id: "q-1",
+          action: "accept",
+          content: { choice: "Yes" },
+        });
+      });
+      expect(pendingIds(latestSessionRef.current)).toEqual(["q-1"]);
+      expect(mocks.sendMessage).not.toHaveBeenCalled();
+
+      await act(async () => {
+        vi.advanceTimersByTime(30_000);
+      });
+      expect(pendingIds(latestSessionRef.current)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledTimes(1));
+  });
+});
+
+function RegisterChatSession({
+  conversationId = "conversation-1",
+  initialMessages,
+}: {
+  conversationId?: string;
+  initialMessages?: UIMessage[];
+}) {
   const { registerSession } = useGlobalChat();
 
   useEffect(() => {
-    registerSession({ conversationId: "conversation-1" });
-  }, [registerSession]);
+    registerSession({ conversationId, initialMessages });
+  }, [conversationId, initialMessages, registerSession]);
+
+  return null;
+}
+
+describe("useChatSession snapshot", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.resumeStream.mockReturnValue(new Promise(() => {}));
+    const messages: UIMessage[] = [];
+    mocks.useOffStreamChat.mockImplementation(() => ({
+      addToolApprovalResponse: mocks.addToolApprovalResponse,
+      addToolResult: mocks.addToolResult,
+      clearError: mocks.clearError,
+      error: undefined,
+      messages,
+      regenerate: mocks.regenerate,
+      resumeStream: mocks.resumeStream,
+      sendMessage: mocks.sendMessage,
+      setMessages: mocks.setMessages,
+      status: "ready",
+      stop: mocks.stop,
+    }));
+  });
+
+  it("runs effects keyed on the session's functions once it appears, even when an urgent re-render lands at the same time", async () => {
+    // What a just-created chat waits for before sending its opening message.
+    // An unrelated urgent state update arriving with the session snapshot must
+    // not leave those effects believing the functions were already there.
+    const seenSendMessage: string[] = [];
+    function SessionConsumer() {
+      const { subscribeSessionUpdates } = useGlobalChat();
+      const [, setUnrelated] = useState(0);
+      const session = useChatSession({ conversationId: "conversation-1" });
+      // Subscribed after the snapshot's own listener, so this urgent no-op
+      // update lands while the snapshot's transition update is still pending.
+      useEffect(
+        () => subscribeSessionUpdates(() => setUnrelated((value) => value)),
+        [subscribeSessionUpdates],
+      );
+      const sendMessage = session?.sendMessage;
+      useEffect(() => {
+        seenSendMessage.push(typeof sendMessage);
+      }, [sendMessage]);
+      return null;
+    }
+
+    render(
+      <ChatProvider>
+        <SessionConsumer />
+      </ChatProvider>,
+    );
+
+    await waitFor(() => expect(seenSendMessage).toContain("function"));
+  });
+});
+
+function CaptureChatSession({
+  conversationId = "conversation-1",
+  onSession,
+}: {
+  conversationId?: string;
+  onSession: (session: ChatSessionSnapshot) => void;
+}) {
+  const session = useChatSessionSnapshot(conversationId);
+
+  useEffect(() => {
+    onSession(session ?? undefined);
+  }, [onSession, session]);
 
   return null;
 }

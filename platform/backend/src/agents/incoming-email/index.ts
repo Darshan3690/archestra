@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
-import { type A2AAttachment, executeA2AMessage } from "@/agents/a2a-executor";
-import { userHasPermission } from "@/auth";
+import { executeA2AMessage } from "@/agents/a2a-executor";
+import { watchTaskCompletion } from "@/agents/task-completion-watcher";
 import config from "@/config";
 import logger from "@/logging";
 import AgentModel from "@/models/agent";
@@ -11,6 +11,9 @@ import ProcessedEmailModel from "@/models/processed-email";
 import TeamModel from "@/models/team";
 import UserModel from "@/models/user";
 import { RouteCategory, startActiveChatSpan } from "@/observability/tracing";
+import { resolveAgentRuntime } from "@/services/agent-runtime/pod-run";
+import { startDetachedAgentTask } from "@/services/agent-runtime/start-task";
+import { ResourcePermissions } from "@/services/resource-permissions";
 import type {
   AgentIncomingEmailProvider,
   EmailProviderConfig,
@@ -18,12 +21,14 @@ import type {
   IncomingEmail,
   SubscriptionInfo,
 } from "@/types";
+import type { A2AAttachment } from "@/types/a2a-attachment";
 import {
-  DEFAULT_AGENT_EMAIL_NAME,
+  getDefaultAgentEmailName,
   MAX_EMAIL_BODY_SIZE,
   PROCESSED_EMAIL_RETENTION_MS,
 } from "./constants";
 import { OutlookEmailProvider } from "./outlook-provider";
+import { verifySenderAuthentication } from "./sender-authentication";
 
 export {
   EMAIL_SUBSCRIPTION_RENEWAL_INTERVAL,
@@ -268,7 +273,7 @@ async function autoSetupSubscriptionWithRetry(
 export async function initializeEmailProvider(): Promise<void> {
   const provider = getEmailProvider();
   if (!provider) {
-    logger.info(
+    logger.debug(
       "[IncomingEmail] No email provider configured, skipping initialization",
     );
     return;
@@ -475,7 +480,7 @@ export async function processIncomingEmail(
       messageId: email.messageId,
       toAddress: email.toAddress,
       fromAddress: email.fromAddress,
-      subject: email.subject,
+      // subject is message content — deliberately not logged
     },
     "[IncomingEmail] Processing incoming email",
   );
@@ -523,6 +528,7 @@ export async function processIncomingEmail(
   // Apply security mode validation
   const securityMode = agent.incomingEmailSecurityMode;
   const senderEmail = email.fromAddress.toLowerCase();
+  const senderUser = await UserModel.findByEmail(senderEmail);
 
   logger.debug(
     {
@@ -534,13 +540,36 @@ export async function processIncomingEmail(
     "[IncomingEmail] Applying security mode validation",
   );
 
+  // Private and internal modes trust the From address, so it must be authenticated.
+  if (securityMode === "private" || securityMode === "internal") {
+    const senderAuth = verifySenderAuthentication({
+      headers: email.headers,
+      fromAddress: senderEmail,
+    });
+    if (!senderAuth.authenticated) {
+      logger.warn(
+        {
+          messageId: email.messageId,
+          agentId,
+          securityMode,
+          senderEmail,
+          reason: senderAuth.reason,
+        },
+        "[IncomingEmail] Sender authentication failed",
+      );
+      throw new Error(
+        `Unauthorized: sender ${senderEmail} could not be authenticated (${senderAuth.reason})`,
+      );
+    }
+  }
+
   // Determine userId for the request (used for 'private' mode).
   let userId: string = "system";
 
   switch (securityMode) {
     case "private": {
       // Private mode: Sender must be an Archestra user with access to the agent
-      const user = await UserModel.findByEmail(senderEmail);
+      const user = senderUser;
       if (!user) {
         logger.warn(
           {
@@ -551,24 +580,27 @@ export async function processIncomingEmail(
           "[IncomingEmail] Private mode: sender email not found in Archestra users",
         );
         throw new Error(
+          // white-label-ok: internal error sentinel matched by the ChatOps handler; the user-facing sentence is branded there
           `Unauthorized: email sender ${senderEmail} is not a registered Archestra user`,
         );
       }
 
       // Check if user is an agent admin (can access all agents)
-      const isAgentAdmin = await userHasPermission(
-        user.id,
-        agent.organizationId,
-        "agent",
-        "admin",
-      );
+      const isAgentAdmin = await ResourcePermissions.allows({
+        userId: user.id,
+        organizationId: agent.organizationId,
+        resource: "agent",
+        scope: "*",
+        action: "update",
+      });
 
       // Check if user has access to the agent via team membership or admin permission
-      const hasAccess = await AgentTeamModel.userHasAgentAccess(
-        user.id,
-        agentId,
-        isAgentAdmin,
-      );
+      const hasAccess = await AgentTeamModel.userHasAgentAccess({
+        userId: user.id,
+        agentId: agentId,
+        isAgentAdmin: isAgentAdmin,
+        action: "use",
+      });
 
       if (!hasAccess) {
         logger.warn(
@@ -787,35 +819,122 @@ ${formattedHistory}
     "[IncomingEmail] Invoking agent with email content",
   );
 
-  // Resolve user for span attributes (skip when userId is "system")
-  const emailUser =
-    userId !== "system" ? await UserModel.getById(userId) : null;
+  // Only private mode authenticates the sender as a platform user. Internal
+  // and public messages run as the system actor even when the address happens
+  // to match a user, so they cannot consume that user's personal credentials.
+  const emailUser = userId === "system" ? null : senderUser;
+
+  const runtime = resolveAgentRuntime(agent);
+  if (runtime) {
+    try {
+      const task = await startDetachedAgentTask({
+        actor: emailUser
+          ? {
+              id: emailUser.id,
+              kind: "user",
+              organizationId: organization,
+            }
+          : {
+              id: "system",
+              kind: "system",
+              organizationId: organization,
+            },
+        agentId,
+        message,
+        attachments: a2aAttachments.length > 0 ? a2aAttachments : undefined,
+        systemParams: {
+          sessionId: buildEmailSessionId(email.conversationId),
+          source: "email",
+          routeCategory: RouteCategory.EMAIL,
+          completionTarget: shouldSendReply
+            ? {
+                type: "email",
+                providerId: provider.providerId,
+                originalMessageId: email.messageId,
+                fromAddress: email.fromAddress,
+                toAddress: email.toAddress,
+                subject: email.subject ?? null,
+              }
+            : undefined,
+        },
+      });
+      if (shouldSendReply) {
+        void watchTaskCompletion({
+          taskId: task.id,
+          target: {
+            type: "email",
+            providerId: provider.providerId,
+            originalMessageId: email.messageId,
+            fromAddress: email.fromAddress,
+            toAddress: email.toAddress,
+            subject: email.subject ?? null,
+          },
+          agentName: agent.name || getDefaultAgentEmailName(),
+        });
+      }
+      logger.info(
+        { agentId, taskId: task.id, originalMessageId: email.messageId },
+        "[IncomingEmail] Started Agent Runtime for email",
+      );
+      return undefined;
+    } catch (error) {
+      await ProcessedEmailModel.deleteByMessageId(email.messageId);
+      throw error;
+    }
+  }
 
   // Execute using the shared A2A service, wrapped in a parent span so all
   // LLM and MCP tool calls appear as children of a single unified trace.
   // userId is determined by security mode:
   // - private: actual user ID from email lookup
   // - internal/public: "system" (anonymous)
-  const result = await startActiveChatSpan({
-    agentName: agent.name,
-    agentId,
-    routeCategory: RouteCategory.EMAIL,
-    triggerSource: "email",
-    user: emailUser
-      ? { id: emailUser.id, email: emailUser.email, name: emailUser.name }
-      : null,
-    callback: async () => {
-      return executeA2AMessage({
+  // The email was optimistically marked as processed above for cross-pod
+  // dedup. If the agent run fails for a transient reason (provider 429/5xx,
+  // timeout), release that claim so a provider redelivery is reprocessed
+  // instead of being deduplicated away and lost forever. Validation failures
+  // (missing/disabled agent, etc.) throw earlier and stay marked, since
+  // retrying them won't help.
+  let result: Awaited<ReturnType<typeof executeA2AMessage>>;
+  try {
+    result = await startActiveChatSpan({
+      agentName: agent.name,
+      agentId,
+      teams: await AgentTeamModel.getTeamLabelInfoForAgent(agentId),
+      userTeams: emailUser
+        ? await TeamModel.getTeamLabelInfoForUser({
+            userId: emailUser.id,
+            organizationId: organization,
+          })
+        : [],
+      routeCategory: RouteCategory.EMAIL,
+      triggerSource: "email",
+      user: emailUser
+        ? { id: emailUser.id, email: emailUser.email, name: emailUser.name }
+        : null,
+      callback: async () => {
+        return executeA2AMessage({
+          agentId,
+          message,
+          organizationId: organization,
+          userId,
+          sessionId: buildEmailSessionId(email.conversationId),
+          source: "email",
+          attachments: a2aAttachments.length > 0 ? a2aAttachments : undefined,
+        });
+      },
+    });
+  } catch (error) {
+    await ProcessedEmailModel.deleteByMessageId(email.messageId);
+    logger.warn(
+      {
+        messageId: email.messageId,
         agentId,
-        message,
-        organizationId: organization,
-        userId,
-        sessionId: buildEmailSessionId(email.conversationId),
-        source: "email",
-        attachments: a2aAttachments.length > 0 ? a2aAttachments : undefined,
-      });
-    },
-  });
+        error: error instanceof Error ? error.message : String(error),
+      },
+      "[IncomingEmail] Agent run failed; released processed marker so a redelivery can retry",
+    );
+    throw error;
+  }
 
   logger.info(
     {
@@ -824,14 +943,14 @@ ${formattedHistory}
       responseLength: result.text.length,
       finishReason: result.finishReason,
     },
-    "[IncomingEmail] Agent execution completed",
+    "[IncomingEmail] Agent run completed",
   );
 
   // Optionally send the agent's response back via email reply
   if (shouldSendReply && result.text) {
     try {
       // Use the agent name for the email reply
-      const replyAgentName = agent.name || DEFAULT_AGENT_EMAIL_NAME;
+      const replyAgentName = agent.name || getDefaultAgentEmailName();
 
       const replyId = await provider.sendReply({
         originalEmail: email,

@@ -1,0 +1,231 @@
+import { archestraApiClient } from "@archestra/shared";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { HttpResponse, http } from "msw";
+import { setupServer } from "msw/node";
+import { RuntimeCredentialDefinitionDialog } from "./runtime-credential-definition-dialog";
+
+const server = setupServer();
+beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
+afterAll(() => server.close());
+afterEach(() => server.resetHandlers());
+beforeEach(() => {
+  archestraApiClient.setConfig({ baseUrl: "http://localhost:9000" });
+  Element.prototype.scrollIntoView = vi.fn();
+  Element.prototype.hasPointerCapture = vi.fn().mockReturnValue(false);
+  Element.prototype.setPointerCapture = vi.fn();
+  Element.prototype.releasePointerCapture = vi.fn();
+});
+
+it.each([
+  { name: "no App", apps: [] },
+  {
+    name: "an App without OAuth",
+    apps: [
+      {
+        kind: "github_app",
+        allowOrganization: true,
+        githubUrl: "https://api.github.com",
+        organizationConfigured: true,
+        githubClientId: null,
+      },
+    ],
+  },
+  {
+    name: "an App without connected credentials",
+    apps: [
+      {
+        kind: "github_app",
+        allowOrganization: true,
+        githubUrl: "https://api.github.com",
+        organizationConfigured: false,
+        githubClientId: "example-client",
+      },
+    ],
+  },
+])("explains why GitHub user credentials are unavailable with $name", async ({
+  apps,
+}) => {
+  server.use(
+    http.get("http://localhost:9000/api/credentials", () =>
+      HttpResponse.json(apps),
+    ),
+  );
+  const user = userEvent.setup();
+  render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <RuntimeCredentialDefinitionDialog definition={null} onClose={() => {}} />
+    </QueryClientProvider>,
+  );
+  await user.click(screen.getByRole("combobox", { name: "Credential type" }));
+  const userConnection = screen.getByRole("option", {
+    name: /GitHub user credential/,
+  });
+  expect(userConnection).toHaveAttribute("aria-disabled", "true");
+  expect(userConnection).toHaveTextContent(/OAuth client ID/);
+  expect(
+    screen.getByRole("option", { name: "GitHub App" }),
+  ).not.toHaveAttribute("aria-disabled", "true");
+});
+
+it("enables a personal connection after an organization OAuth App is connected", async () => {
+  server.use(
+    http.get("http://localhost:9000/api/credentials", () =>
+      HttpResponse.json([
+        {
+          key: "example-app",
+          name: "Example App",
+          kind: "github_app",
+          allowOrganization: true,
+          githubUrl: "https://api.github.com",
+          organizationConfigured: true,
+          githubClientId: "example-client",
+        },
+      ]),
+    ),
+  );
+  const user = userEvent.setup();
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <RuntimeCredentialDefinitionDialog definition={null} onClose={() => {}} />
+    </QueryClientProvider>,
+  );
+  await waitFor(() =>
+    expect(
+      screen.queryByText("Checking available GitHub Apps…"),
+    ).not.toBeInTheDocument(),
+  );
+  await user.click(screen.getByRole("combobox", { name: "Credential type" }));
+  await user.click(
+    screen.getByRole("option", { name: /GitHub user credential/ }),
+  );
+  expect(
+    screen.getByRole("combobox", { name: "Organization GitHub App" }),
+  ).toBeInTheDocument();
+});
+
+it("creates the guided OpenAPPA GitHub App with its organization identity", async () => {
+  server.use(
+    http.get("http://localhost:9000/api/credentials", () =>
+      HttpResponse.json([]),
+    ),
+    http.post("http://localhost:9000/api/credentials", async ({ request }) => {
+      const body = await request.json();
+      expect(body).toMatchObject({
+        name: "OpenAPPA Git sync",
+        description:
+          "Creates the OpenAPPA policy repository and opens pull requests for policy changes.",
+        icon: "logo:openappa",
+        kind: "github_app",
+        allowOrganization: true,
+        allowPersonal: false,
+        appId: "123",
+        installationId: "456",
+      });
+      return HttpResponse.json({ id: "new-credential" });
+    }),
+  );
+  const onCreated = vi.fn();
+  const user = userEvent.setup();
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <RuntimeCredentialDefinitionDialog
+        definition={null}
+        initialKind="github_app"
+        initialScope="organization"
+        initialValues={{
+          name: "OpenAPPA Git sync",
+          description:
+            "Creates the OpenAPPA policy repository and opens pull requests for policy changes.",
+          icon: "logo:openappa",
+        }}
+        hideProvidedBy
+        size="medium"
+        onClose={() => {}}
+        onCreated={onCreated}
+      />
+    </QueryClientProvider>,
+  );
+
+  expect(screen.getByRole("textbox", { name: "Name" })).toHaveValue(
+    "OpenAPPA Git sync",
+  );
+  expect(screen.queryByText("Provided by")).not.toBeInTheDocument();
+  expect(
+    screen.queryByText(/GitHub user credentials need/),
+  ).not.toBeInTheDocument();
+  await user.type(screen.getByRole("textbox", { name: "App ID" }), "123");
+  await user.type(
+    screen.getByRole("textbox", { name: "Installation ID" }),
+    "456",
+  );
+  await user.click(screen.getByRole("button", { name: "Add" }));
+  await waitFor(() => expect(onCreated).toHaveBeenCalledWith("new-credential"));
+});
+
+it.each([
+  {
+    name: "starts shared with everyone for someone who may share that widely",
+    offered: [
+      {
+        subject: { type: "organization", id: "*" },
+        name: "Everyone in the organization",
+      },
+    ],
+    initialGrants: [
+      { subject: { type: "organization", id: "*" }, actions: ["read", "use"] },
+    ],
+  },
+  {
+    name: "starts with its creator alone for someone who may not",
+    offered: [{ subject: { type: "team", id: "team-1" }, name: "Platform" }],
+    initialGrants: [],
+  },
+])("a new credential $name", async ({ offered, initialGrants }) => {
+  let created: unknown;
+  server.use(
+    http.get("http://localhost:9000/api/credentials", () =>
+      HttpResponse.json([]),
+    ),
+    http.get(
+      "http://localhost:9000/api/resource-permissions/credential/creation-subjects",
+      () => HttpResponse.json(offered),
+    ),
+    http.post("http://localhost:9000/api/credentials", async ({ request }) => {
+      created = await request.json();
+      return HttpResponse.json({ id: "new-credential" });
+    }),
+  );
+  const onCreated = vi.fn();
+  const user = userEvent.setup();
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <RuntimeCredentialDefinitionDialog
+        definition={null}
+        initialKind="github_app"
+        initialScope="organization"
+        initialValues={{ name: "Deploy bot", description: "", icon: null }}
+        onClose={() => {}}
+        onCreated={onCreated}
+      />
+    </QueryClientProvider>,
+  );
+  await user.type(screen.getByRole("textbox", { name: "App ID" }), "123");
+  await user.type(
+    screen.getByRole("textbox", { name: "Installation ID" }),
+    "456",
+  );
+  await waitFor(() =>
+    expect(
+      screen.queryAllByText("Everyone in the organization").length > 0,
+    ).toBe(initialGrants.length > 0),
+  );
+  await user.click(screen.getByRole("button", { name: "Add" }));
+  await waitFor(() => expect(onCreated).toHaveBeenCalledWith("new-credential"));
+  expect(created).toMatchObject({ initialGrants });
+});

@@ -8,8 +8,7 @@
  * OpenAI shapes.
  *
  * Everything between the route and these translations (auth, cost optimization,
- * trusted-data / tool-invocation policies, TOON compression, OTEL, interaction
- * logging) runs on Converse shapes, reusing the battle-tested Bedrock adapter.
+ * proxy plugin rulings, OTEL, interaction logging) runs on Converse shapes, reusing the battle-tested Bedrock adapter.
  */
 
 import type { ConverseStreamOutput } from "@aws-sdk/client-bedrock-runtime";
@@ -28,6 +27,7 @@ import {
   type ConverseToOpenaiSseEncoder,
   converseResponseToOpenai,
   createConverseToOpenaiSseEncoder,
+  mapStopReason,
   type OpenaiContext,
 } from "./bedrock-openai-translator";
 
@@ -45,6 +45,9 @@ class BedrockOpenaiResponseAdapter
 {
   readonly provider = "bedrock" as const;
   private inner: LLMResponseAdapter<BedrockResponse>;
+  // The inner (logged-shape) response after a dispatch-mode repair, so
+  // getLoggedResponse persists the rewritten turn rather than the original.
+  private rewrittenInner: BedrockResponse | null = null;
   private ctx: OpenaiContext;
 
   constructor(response: BedrockResponse, ctx: OpenaiContext) {
@@ -90,7 +93,7 @@ class BedrockOpenaiResponseAdapter
   }
 
   getLoggedResponse(): BedrockResponse {
-    return this.inner.getOriginalResponse();
+    return this.rewrittenInner ?? this.inner.getOriginalResponse();
   }
 
   /**
@@ -98,33 +101,53 @@ class BedrockOpenaiResponseAdapter
    * the Bedrock-style refusal shape would not round-trip correctly through
    * OpenAI SDK parsers.
    */
+  withRewrittenToolCalls(
+    toolCalls: Array<{ id: string; name: string; arguments: string }>,
+  ): BedrockResponse {
+    // Rewrite in the inner wire shape (which is what gets logged), then
+    // translate for the client exactly as getOriginalResponse does. If the
+    // inner adapter cannot rewrite, hand back the untouched translation — the
+    // handler only reaches here when the planner produced a rewrite, and a
+    // silent no-op would strand the client with a call it cannot execute; but
+    // every inner adapter this wraps does implement it.
+    const inner =
+      this.inner.withRewrittenToolCalls?.(toolCalls) ??
+      this.inner.getOriginalResponse();
+    this.rewrittenInner = inner;
+    return converseResponseToOpenai(
+      inner,
+      this.ctx,
+    ) as unknown as BedrockResponse;
+  }
+
+  withReplacedText(text: string): BedrockResponse {
+    // Replaced in the inner wire shape (which is what gets logged), then
+    // translated for the client as getOriginalResponse does.
+    const inner = this.inner.withReplacedText?.(text);
+    if (!inner) {
+      throw new Error("Wrapped response adapter cannot replace response text");
+    }
+    this.rewrittenInner = inner;
+    return converseResponseToOpenai(
+      inner,
+      this.ctx,
+    ) as unknown as BedrockResponse;
+  }
+
   toRefusalResponse(
-    _refusalMessage: string,
+    refusalMessage: string,
     contentMessage: string,
   ): BedrockResponse {
-    const usage = this.inner.getUsage();
-    return {
-      id: this.ctx.chatcmplId,
-      object: "chat.completion",
-      created: this.ctx.createdUnix,
-      model: this.ctx.requestedModel,
-      choices: [
-        {
-          index: 0,
-          logprobs: null,
-          finish_reason: "stop",
-          message: {
-            role: "assistant",
-            content: contentMessage,
-          },
-        },
-      ],
-      usage: {
-        prompt_tokens: usage.inputTokens ?? 0,
-        completion_tokens: usage.outputTokens ?? 0,
-        total_tokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
-      },
-    } as unknown as BedrockResponse;
+    // Stores the refusal in the inner Converse format for interaction logging.
+    // This prevents logging the blocked tool call payload.
+    this.rewrittenInner = this.inner.toRefusalResponse(
+      refusalMessage,
+      contentMessage,
+    );
+    return converseResponseToOpenai(
+      this.rewrittenInner,
+      this.ctx,
+    ) as unknown as BedrockResponse;
   }
 }
 
@@ -134,10 +157,11 @@ class BedrockOpenaiStreamAdapter
   readonly provider = "bedrock" as const;
   private inner: LLMStreamAdapter<BedrockStreamEvent, BedrockResponse>;
   private encoder: ConverseToOpenaiSseEncoder;
+  private upstreamUsage?: BedrockResponse["usage"];
   /**
    * Tool-call events translated at arrival (once) and cached here. The handler
-   * retrieves them via `getRawToolCallEvents()` after the per-tool policy
-   * decides they can be streamed; for blocked tools the handler simply never
+   * retrieves them via `getRawToolCallEvents()` after the proxy plugins
+   * decide they can be streamed; for blocked tools the handler simply never
    * calls that method and the bytes are discarded when the stream ends.
    * Translating at arrival (not at flush) avoids repeated encoder state
    * advancement when the handler polls multiple times across chunks.
@@ -169,6 +193,7 @@ class BedrockOpenaiStreamAdapter
     const innerResult = this.inner.processChunk(event);
 
     const e = event as Loose;
+    if (e.metadata?.usage) this.upstreamUsage = e.metadata.usage;
     const isToolEvent = isToolCallEvent(e);
 
     if (isToolEvent) {
@@ -202,7 +227,28 @@ class BedrockOpenaiStreamAdapter
   }
 
   formatCompleteTextSSE(text: string): Uint8Array[] {
+    // Mark the inner adapter as refusal-replaced (side effect only; its
+    // Converse-format bytes are unused here) so inner.toProviderResponse()
+    // persists the refusal rather than the blocked tool calls. The encoder
+    // already emits a self-contained "stop" finish for the wire.
+    this.inner.formatCompleteTextSSE(text);
     return this.encoder.formatCompleteText(text);
+  }
+
+  formatToolCallsSSE(
+    toolCalls: StreamAccumulatorState["toolCalls"],
+  ): Uint8Array[] {
+    // Inner read for its side effect only (release semantics for the persisted
+    // Converse-shape turn); the wire bytes are the OpenAI-shaped ones. The
+    // cached translated events name the calls the model made directly and are
+    // dropped — that is the call being repaired.
+    this.inner.formatToolCallsSSE?.(toolCalls);
+    this.pendingToolCallEventBytes = [];
+    return this.encoder.formatToolCalls(toolCalls);
+  }
+
+  getOpenAiFinishReason(): string {
+    return mapStopReason(this.state.stopReason ?? undefined);
   }
 
   formatEndSSE(): Uint8Array {
@@ -217,7 +263,10 @@ class BedrockOpenaiStreamAdapter
    * not through this method.
    */
   toProviderResponse(): BedrockResponse {
-    return this.inner.toProviderResponse();
+    return {
+      ...this.inner.toProviderResponse(),
+      ...(this.upstreamUsage ? { usage: this.upstreamUsage } : {}),
+    };
   }
 }
 
@@ -247,6 +296,7 @@ export function makeBedrockOpenaiAdapterFactory(
 > {
   return {
     ...bedrockAdapterFactory,
+    translatesWireFormat: true,
     createResponseAdapter(response) {
       return new BedrockOpenaiResponseAdapter(response, ctx);
     },

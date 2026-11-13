@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { A2A_OAUTH_SCOPE, coerceMalformedToolInputs } from "@archestra/shared";
 import {
   convertToModelMessages,
   type FilePart,
@@ -5,34 +7,94 @@ import {
   type TextPart,
   type TextUIPart,
   type UIMessage,
+  type UIMessageChunk,
 } from "ai";
+import { z } from "zod";
+import { ensureToolCallsHaveResults } from "@/agents/tool-call-results";
+import { serviceAccountUserId } from "@/auth/service-account-user-id";
 import logger from "@/logging";
-import { A2AMessageModel, AgentModel, TeamModel, UserModel } from "@/models";
+import {
+  A2AArtifactModel,
+  A2AMessageModel,
+  A2APushNotificationConfigModel,
+  A2ATaskApprovalRequestModel,
+  A2ATaskModel,
+  AgentModel,
+  AgentRunModel,
+  AgentTeamModel,
+  TeamModel,
+  UserModel,
+} from "@/models";
 import { RouteCategory, startActiveChatSpan } from "@/observability/tracing";
-import { validateMCPGatewayToken } from "@/routes/mcp-gateway.utils";
-import type { A2AContext } from "@/types";
+import {
+  attachHitlReviews,
+  decideCallerHitlReviews,
+} from "@/openappa/a2a-hitl-review";
+import { validateMCPGatewayToken } from "@/routes/mcp-gateway/utils";
+import {
+  resolveAgentRuntime,
+  resumeAgentRun,
+  runTaskInAgentRuntime,
+} from "@/services/agent-runtime/pod-run";
+import { preflightAgentRuntimeLaunch } from "@/services/agent-runtime/preflight";
+import type {
+  A2AContext,
+  A2AMessage,
+  AgentRunCompletionTarget,
+  AgentRunLimits,
+  AgentRunRecord,
+} from "@/types";
+import type { A2AAttachment } from "@/types/a2a-attachment";
+import { isTerminalA2ATaskState } from "@/types/a2a-task";
+import {
+  type OutboundUrlRejection,
+  validateOutboundUrl,
+} from "@/utils/outbound-url";
 import type { InteractionSource } from "../../../../shared";
-import { executeA2AMessage } from "../a2a-executor";
+import { type A2AExecuteResult, executeA2AMessage } from "../a2a-executor";
 import { type A2AActor, A2AError, A2AErrorKind } from "./a2a-base";
+import {
+  type A2AContextCompactionEvent,
+  applyA2AContextCompaction,
+} from "./a2a-context-compaction";
 import {
   A2AContextManager,
   A2ATaskManager,
   type A2ATaskWithData,
   getApprovalRequestsMap,
+  toApprovalRequest,
 } from "./a2a-model-manager";
 import {
   type A2AArchestraApprovalRequest,
   type A2AArchestraTaskApprovalDecision,
   type A2AArchestraTaskOps,
+  type A2AProtocolCancelTaskRequest,
+  type A2AProtocolDeleteTaskPushNotificationConfigRequest,
+  type A2AProtocolGetTaskPushNotificationConfigRequest,
   type A2AProtocolGetTaskRequest,
+  type A2AProtocolListTaskPushNotificationConfigsRequest,
+  type A2AProtocolListTaskPushNotificationConfigsResponse,
+  type A2AProtocolListTasksRequest,
+  type A2AProtocolListTasksResponse,
   type A2AProtocolMessage,
-  type A2AProtocolPart,
   A2AProtocolRole,
   type A2AProtocolSendMessageRequest,
   type A2AProtocolSendMessageResponse,
+  type A2AProtocolStreamResponse,
+  type A2AProtocolSubscribeToTaskRequest,
   type A2AProtocolTask,
+  type A2AProtocolTaskPushNotificationConfig,
   A2AProtocolTaskState,
 } from "./a2a-protocol";
+import { extractProtocolPartsFromUIMessage } from "./a2a-response-parts";
+import { a2aTaskRunService } from "./a2a-task-run-service";
+import {
+  buildStatusReasonMessage,
+  settleFailedA2ATask,
+} from "./a2a-task-settlement";
+
+/** Wire name of the single text artifact carrying a tasked run's answer. */
+const RESPONSE_ARTIFACT_NAME = "agent-response";
 
 interface A2AManagerConfig {
   /**
@@ -66,6 +128,106 @@ interface A2AManagerConfig {
    * Default: false (= approval flow is on)
    */
   disableApprovalFlow?: boolean;
+
+  /**
+   * Skip the actor-ownership check when resolving contexts and tasks.
+   *
+   * Only for trusted internal callers that authorize access themselves: the
+   * chatops manager verifies channel membership and agent access before every
+   * execution, and its server-side sessions share one context per chat thread
+   * across all participants (e.g. a Telegram group), so the per-actor
+   * ownership model does not apply.
+   *
+   * Default: false (= contexts/tasks are actor-owned)
+   */
+  trustedContextAccess?: boolean;
+
+  /**
+   * How much of the A2A task lifecycle this manager drives.
+   *
+   * - "approval-only" (default): tasks exist purely as approval handles —
+   *   the pre-existing behavior every internal consumer (chatops) is built
+   *   on. Plain sends return `{message}`; no run detachment, no events.
+   * - "full": the v2 protocol surface. Streaming and `returnImmediately`
+   *   sends create durable tasks whose runs are registered with the task run
+   *   service (delta events, artifacts, heartbeats, cancellation), terminal
+   *   failures persist as TASK_STATE_FAILED, and spec guards apply (messages
+   *   to terminal or already-running tasks are rejected). Requires stateful
+   *   mode.
+   */
+  taskMode?: "full" | "approval-only";
+  /**
+   * The caller answers OpenAPPA human reviews like any tool approval: a
+   * reviewed remedy call pauses the task, and the caller's
+   * `taskOps.approvalDecisions` becomes the reviewer's ruling.
+   */
+  callerAnswersOpenappaReviews?: boolean;
+}
+
+/**
+ * Out-of-band execution parameters passed through to `executeA2AMessage`.
+ *
+ * Named (rather than inlined on `sendMessage`) so callers that build it as an
+ * intermediate `const` can annotate it: TypeScript only applies
+ * excess-property checking to object literals assigned directly to a typed
+ * target, so an unannotated intermediate silently swallows a misspelled key.
+ * That is not hypothetical — chatops passed `route:` for a while and every
+ * ChatOps run was traced as `a2a` because nothing reads that key.
+ */
+export interface A2ASystemParams {
+  /** New A2A task, retained runtime workspace: terminal tasks remain immutable. */
+  resumeFromTaskId?: string;
+  /** Caller-owned runtime title; bypasses automatic title generation. */
+  runtimeTitle?: string;
+  /** The run's tier and limits, already resolved against the Agent's settings. */
+  runtimeLimits?: AgentRunLimits;
+  sessionId?: string;
+  /** Project assigned by an interactive Chat execution launcher. */
+  projectId?: string;
+  source?: InteractionSource;
+  routeCategory?: RouteCategory;
+  completionTarget?: AgentRunCompletionTarget;
+  /** Awaited after persistence, before launch: register delivery without awaiting network I/O. */
+  onRuntimeSessionCreated?: (session: {
+    taskId: string;
+    workspaceId: string;
+  }) => Promise<void>;
+  /**
+   * Interactive is reserved for a person opening the execution terminal in
+   * Chat. Every other durable task is one-shot so delegation surfaces can
+   * receive a terminal result without waiting for somebody to exit a TUI.
+   */
+  runtimeMode?: "interactive" | "one_shot";
+  /**
+   * Per-turn framing prepended to the executed user turn but NOT
+   * persisted with it. Callers with server-side sessions (chatops) put
+   * situational context here — "(Telegram conversation, thread id: …)",
+   * group framing — so the stored history stays clean instead of
+   * repeating the frame on every persisted turn.
+   */
+  ephemeralExecutionPrefix?: string;
+  /**
+   * Verified OpenAPPA source for a runtime spawn or steer. Server-built only.
+   * Protocol requests cannot set this.
+   */
+  runtimeCrossing?: import("@/services/agent-runtime/runtime-crossing").RuntimeCrossing;
+  /** Ephemeral per-run credentials redeemed from a one-time `transfer_credential` grant. */
+  ephemeralCredentials?: Record<string, string>;
+  /** Supervisor retry and subagent failover policy for this run. */
+  subagentExecutionPolicy?: import("@/services/agent-runtime/pod-run").SubagentExecutionPolicy;
+  /** Called if a detached runtime launch fails before any workload starts. */
+  onRuntimeLaunchFailed?: () => Promise<void>;
+}
+
+/**
+ * How a full-task-mode send executes its run.
+ * - "blocking": awaited; the response carries the settled outcome.
+ * - "detached": the task handle returns immediately and the run continues in
+ *   the background (`returnImmediately`, SendStreamingMessage).
+ */
+interface A2ATaskRunRequest {
+  createTask: boolean;
+  detached: boolean;
 }
 
 export class A2AManager {
@@ -75,43 +237,151 @@ export class A2AManager {
     this.config = config ?? {};
   }
 
+  /**
+   * Re-adopt a container-backed task whose Job outlived the backend process
+   * that launched it. The ordinary lifecycle remains authoritative, so the
+   * recovered run produces the same artifact and terminal events as a run
+   * that never crossed a restart.
+   */
+  public async adoptAgentRun(params: {
+    taskId: string;
+    session: AgentRunRecord;
+  }): Promise<void> {
+    if (this.config.taskMode !== "full") {
+      throw new Error(
+        "[A2AManager] Agent Runtime task adoption requires full mode",
+      );
+    }
+    const task = await A2ATaskManager.loadTaskWithDataById(params.taskId);
+    if (
+      task.state !== A2AProtocolTaskState.Submitted &&
+      task.state !== A2AProtocolTaskState.Working
+    ) {
+      return;
+    }
+    await this.runTaskLifecycle({
+      task,
+      contextId: task.contextId,
+      organizationId: params.session.organizationId,
+      survivesRestart: true,
+      executeRun: (runOpts) =>
+        resumeAgentRun({
+          session: params.session,
+          onTextDelta: runOpts.onTextDelta,
+          abortSignal: runOpts.abortSignal,
+        }),
+    });
+  }
+
   public async sendMessage(params: {
     actor: A2AActor;
     agentId: string;
     request: A2AProtocolSendMessageRequest;
     // systemParams are currently used for passing through to executeA2AMessage(...)
-    systemParams?: {
-      sessionId?: string;
-      source?: InteractionSource;
-      routeCategory?: RouteCategory;
-      chatOpsBindingId?: string;
-      chatOpsThreadId?: string;
-    };
+    systemParams?: A2ASystemParams;
+    /**
+     * Fired when loading the context's history triggered a persisted
+     * cross-turn compaction (stateful mode only), before the agent executes.
+     * Chatops uses it to tell the user their conversation was summarized.
+     */
+    onContextCompacted?: (
+      event: A2AContextCompactionEvent,
+    ) => void | Promise<void>;
+    /**
+     * When provided (SendStreamingMessage), forwarded to the executor so each
+     * incremental text delta is surfaced to the streaming caller. The buffered
+     * response returned here is unchanged and remains authoritative.
+     */
+    onTextDelta?: (delta: string) => void;
+    /**
+     * Approval-only mode: forwarded to the executor so the caller sees every
+     * UI message chunk (text and tool-call progress) as the run produces it.
+     * Chatops streams these into the chat. Full-mode tasked runs ignore it.
+     */
+    onUiMessageChunk?: (chunk: UIMessageChunk) => Promise<void>;
+    /**
+     * Cancellation signal forwarded into the agent run (approval-only mode:
+     * chatops aborts a muted thread's in-flight model requests). Full-mode
+     * tasked runs ignore it — their lifetime is owned by the task run
+     * service, so a caller disconnect no longer cancels the run.
+     */
+    abortSignal?: AbortSignal;
+    /**
+     * Full task mode only: create a task for this send and run it blocking or
+     * detached. Ignored (with a warning) in approval-only mode.
+     */
+    taskRun?: A2ATaskRunRequest;
+    /**
+     * Fired just before a detached task run's snapshot is returned:
+     * `followFromSeq` is the event-log watermark the caller should stream
+     * events after — 0 for a freshly created task (nothing emitted yet), the
+     * pre-resume watermark for a resumed one (so the resume's Working event
+     * is delivered but earlier history is not replayed).
+     */
+    onDetachedTaskRun?: (info: {
+      taskId: string;
+      followFromSeq: number;
+    }) => void | Promise<void>;
   }): Promise<A2AProtocolSendMessageResponse> {
+    // Set once an approval resume has CAS'd the task to WORKING: if anything
+    // between that point and the run lifecycle taking ownership throws
+    // (history load, compaction, team lookup), the catch below settles the
+    // task to FAILED instead of stranding a heartbeat-less WORKING task
+    // until the reaper fires.
+    let resumedWorkingTask: { taskId: string; contextId: string } | null = null;
     try {
-      const { actor, agentId, request, systemParams } = params;
+      const { actor, agentId, request, systemParams, abortSignal } = params;
+      const fullTaskMode = this.config.taskMode === "full";
 
-      const a2aUser =
+      const [a2aUser, agent] = await Promise.all([
         actor.kind === "user" && actor.id !== "system"
-          ? await UserModel.getById(actor.id)
-          : null;
-
-      const agent = await AgentModel.findById(agentId);
+          ? UserModel.getById(actor.id)
+          : null,
+        AgentModel.findById(agentId),
+      ]);
       if (!agent) {
         throw new A2AError(A2AErrorKind.AgentNotFound);
       }
 
+      if (
+        fullTaskMode &&
+        actor.oauthExecution &&
+        resolveAgentRuntime(agent) &&
+        (params.taskRun?.createTask || request.message.taskId)
+      ) {
+        throw new A2AError(
+          A2AErrorKind.UnsupportedOperation,
+          "OAuth applications cannot use Agent Runtime; use an in-process agent instead.",
+        );
+      }
+
+      const contextAccessOptions = {
+        trustedActorAccess: Boolean(this.config.trustedContextAccess),
+      };
       let task: A2ATaskWithData | undefined;
       let context: A2AContext | undefined;
+      // Event-log watermark captured BEFORE any task op runs, so a detached
+      // caller following the stream sees everything this send causes (starting
+      // with the resume's Working event) and nothing from before it.
+      let resumeWatermark = 0;
       if (request.message.taskId) {
         const { task: fetchedTask, context: fetchedContext } =
           await A2ATaskManager.findAndValidateTaskWithContext(
             request.message.taskId,
             undefined,
             actor,
+            contextAccessOptions,
           );
         task = fetchedTask;
         context = fetchedContext;
+        resumeWatermark = fetchedTask.nextEventSeq - 1;
+        if (
+          fullTaskMode &&
+          fetchedTask.agentId &&
+          fetchedTask.agentId !== agentId
+        ) {
+          throw new A2AError(A2AErrorKind.TaskNotFound);
+        }
         if (
           request.message.contextId &&
           context.id !== request.message.contextId
@@ -123,7 +393,28 @@ export class A2AManager {
         context = await A2AContextManager.findAndValidateContext(
           request.message.contextId,
           actor,
+          contextAccessOptions,
         );
+      }
+
+      // Spec guards (A2A v1.0, full mode only to keep chatops semantics
+      // untouched): terminal tasks are absorbing, and our execution model is
+      // single-writer-per-task — the only joinable state is INPUT_REQUIRED
+      // (approval resume), so a send addressed to a SUBMITTED/WORKING task is
+      // rejected rather than racing the live run.
+      if (fullTaskMode && task) {
+        if (isTerminalA2ATaskState(task.state)) {
+          throw new A2AError(
+            A2AErrorKind.UnsupportedOperation,
+            "the task is in a terminal state; start a new task in the same context instead",
+          );
+        }
+        if (task.state !== A2AProtocolTaskState.InputRequired) {
+          throw new A2AError(
+            A2AErrorKind.UnsupportedOperation,
+            "the task is still running; wait for it to reach an input-required or terminal state",
+          );
+        }
       }
 
       let taskWasSwitchedToWorkingState: boolean | undefined = false;
@@ -140,16 +431,25 @@ export class A2AManager {
             task: updatedTask,
             switchedToWorkingState,
             approvalDecisionsWasApplied,
-          } = await this.processTaskOps({ task, taskOps });
+          } = await this.processTaskOps({ task, taskOps, actor });
           task = updatedTask;
           taskWasSwitchedToWorkingState = switchedToWorkingState;
           taskApprovalDecisionsWasApplied = approvalDecisionsWasApplied;
+          if (fullTaskMode && switchedToWorkingState) {
+            resumedWorkingTask = { taskId: task.id, contextId: task.contextId };
+          }
         }
       }
 
       const messageParts: (TextPart | FilePart)[] = [];
       (request.message.parts || []).forEach((p) => {
-        if (p.text !== undefined) {
+        // Blank text carries no turn: the executor only builds a current user
+        // turn from text that survives `trim()`, so keeping it would let
+        // `needToExecute` pass and send the prior context — which ends with an
+        // assistant turn — as the whole request. Blank text falls through to
+        // the file branch rather than returning, so a part carrying both keeps
+        // its payload.
+        if (p.text !== undefined && p.text.trim() !== "") {
           messageParts.push({ type: "text" as const, text: p.text });
           return;
         }
@@ -163,8 +463,18 @@ export class A2AManager {
         }
       });
 
+      const runtime = resolveAgentRuntime(agent);
+      const resumeInteractiveSession = Boolean(
+        runtime &&
+          fullTaskMode &&
+          params.taskRun?.createTask &&
+          systemParams?.runtimeMode === "interactive" &&
+          systemParams.resumeFromTaskId,
+      );
       const needToExecute =
-        messageParts.length > 0 || taskWasSwitchedToWorkingState;
+        messageParts.length > 0 ||
+        taskWasSwitchedToWorkingState ||
+        resumeInteractiveSession;
       if (!needToExecute) {
         if (taskApprovalDecisionsWasApplied) {
           if (!task) {
@@ -178,8 +488,40 @@ export class A2AManager {
         throw new A2AError(A2AErrorKind.NothingToExecute);
       }
 
+      // A detached run returns its task handle before execution. Reject an
+      // incompatible model before compaction, context creation, or turn writes.
+      // Protocol terminal tasks remain immutable. A new task addressed to
+      // their context reuses the same owned workspace, just like MCP/UI
+      // continuation, rather than silently creating another development box.
+      const previousRuntimeRun =
+        runtime && fullTaskMode && !task && context
+          ? await AgentRunModel.findLatestInContext({
+              contextId: context.id,
+              agentId,
+              organizationId: actor.organizationId,
+              actorKind: actor.kind,
+              actorId: actor.id,
+            })
+          : null;
+      const resumeFromTaskId =
+        systemParams?.resumeFromTaskId ?? previousRuntimeRun?.taskId;
+      if (
+        fullTaskMode &&
+        params.taskRun?.createTask &&
+        params.taskRun.detached &&
+        !task &&
+        runtime
+      ) {
+        await preflightAgentRuntimeLaunch({
+          runtime,
+          agent,
+          actor,
+          ephemeralCredentials: systemParams?.ephemeralCredentials,
+        });
+      }
+
       // Fetch history messages from the db
-      const contextDbMessages =
+      let contextDbMessages =
         !this.config.stateless && context
           ? await A2AContextManager.getContextMessagesWithOverrides({
               context,
@@ -188,16 +530,97 @@ export class A2AManager {
           : task && taskWasSwitchedToWorkingState
             ? task.history
             : [];
-      const contextUiMessages = contextDbMessages.map(
-        (m) => m.content as UIMessage,
+
+      // Stateful contexts accumulate history forever; apply the persisted
+      // cross-turn compaction (and create a new one when the history crosses
+      // the model-window threshold) before building the request.
+      if (!this.config.stateless && context && contextDbMessages.length > 0) {
+        const compactionResult = await applyA2AContextCompaction({
+          oauthExecution: actor.oauthExecution,
+          contextId: context.id,
+          messages: contextDbMessages,
+          agent: {
+            id: agent.id,
+            llmApiKeyId: agent.llmApiKeyId,
+            modelId: agent.modelId,
+            organizationId: agent.organizationId,
+          },
+          userId: actor.kind === "user" ? actor.id : null,
+          sessionId: systemParams?.sessionId,
+          abortSignal,
+        });
+        contextDbMessages = compactionResult.messages;
+        if (compactionResult.created) {
+          await params.onContextCompacted?.(compactionResult.created);
+        }
+      }
+      // Repair malformed tool inputs at the source so both the provider request
+      // and the UI-continuation copy (`originalUiMessages` below) stay valid.
+      const contextUiMessages = coerceMalformedToolInputs(
+        contextDbMessages.map((m) => m.content as UIMessage),
       );
-      const requestMessages: ModelMessage[] =
-        await convertToModelMessages(contextUiMessages);
+      const requestMessages: ModelMessage[] = ensureToolCallsHaveResults(
+        await convertToModelMessages(contextUiMessages),
+      );
+
+      // The executor owns building the current user turn: it applies
+      // model-aware, provider-specific attachment handling, so we pass the
+      // turn's text + attachments rather than baking it into `requestMessages`
+      // (which stays prior-context only). Attachments are reconstructed from the
+      // protocol file parts, preserving filenames.
+      const currentTurnAttachments: A2AAttachment[] = (
+        request.message.parts || []
+      )
+        .filter((p) => p.raw !== undefined && p.mediaType !== undefined)
+        .map((p) => ({
+          contentType: p.mediaType as string,
+          contentBase64: Buffer.from(p.raw as Uint8Array).toString("base64"),
+          name: p.filename,
+        }));
+      const currentTurnText = messageParts
+        .filter((part): part is TextPart => part.type === "text")
+        .map((part) => part.text)
+        .join("\n");
+      // Ephemeral framing rides only the executed turn; the persisted user
+      // message and the mirrored UI turn below keep the caller's raw text.
+      const executedTurnText =
+        systemParams?.ephemeralExecutionPrefix && messageParts.length > 0
+          ? `${systemParams.ephemeralExecutionPrefix}\n\n${currentTurnText}`
+          : currentTurnText;
 
       if (messageParts.length > 0) {
-        // We need to separately push user message to both contextUiMessages and requestMessages.
-        // Full contextUiMessages are passed to executeA2AMessage for proper processing of final uiMessage
-        // requestMessages are passed to executeA2AMessage for the agent execution.
+        // Mirror the current turn's text into contextUiMessages so the
+        // generated final UIMessage continues from it. Files are not supported
+        // in UI history, so only text parts are carried here.
+        const uiMessageParts: TextUIPart[] = [];
+        messageParts.forEach((part) => {
+          if (part.type === "text") {
+            uiMessageParts.push({ type: "text" as const, text: part.text });
+          }
+        });
+        contextUiMessages.push({
+          id: request.message.messageId,
+          parts: uiMessageParts,
+          role: "user",
+        });
+      }
+
+      let userMessageSavedInDb = false;
+      /** Returns the db row when the turn was persisted at context level (no task yet). */
+      const saveUserMessageInDb = async (): Promise<A2AMessage | null> => {
+        if (userMessageSavedInDb) {
+          return null;
+        }
+        userMessageSavedInDb = true;
+        if (messageParts.length === 0) {
+          return null;
+        }
+        if (!context) {
+          // This should never happen: context must be defined before.
+          throw new Error(
+            "[A2AManager] No context when inserting user message in the db",
+          );
+        }
         const uiMessageParts: TextUIPart[] = [];
         messageParts.forEach((part) => {
           if (part.type === "text") {
@@ -205,90 +628,233 @@ export class A2AManager {
           }
           // Files are currently not supported in history.
         });
-        contextUiMessages.push({
+        const userUiMessage: UIMessage = {
           id: request.message.messageId,
           parts: uiMessageParts,
           role: "user",
+        };
+        if (task) {
+          const { task: updatedTask } = await A2ATaskManager.addMessageToTask({
+            task,
+            message: request.message,
+            uiMessage: userUiMessage,
+          });
+          task = updatedTask;
+          return null;
+        }
+        const { dbMessage } = await A2AContextManager.addMessageToContext({
+          context,
+          message: request.message,
+          uiMessage: userUiMessage,
         });
-        requestMessages.push({ role: "user", content: messageParts });
+        return dbMessage;
+      };
+
+      // Stateful mode persists the user turn BEFORE execution: an aborted run
+      // (e.g. superseded by the sender's follow-up message) must still leave
+      // its turn in the thread's history so the successor run sees it. When
+      // the run later creates an approval task, this row is re-parented into
+      // the task's history.
+      let persistedContextUserMessage: A2AMessage | null = null;
+      if (!this.config.stateless) {
+        if (!context) {
+          context = await A2AContextManager.createContext(actor);
+        }
+        persistedContextUserMessage = await saveUserMessageInDb();
       }
 
       const sessionId = systemParams?.sessionId ?? context?.id;
-      const result = await startActiveChatSpan({
-        agentName: agent.name,
-        agentId,
-        agentType: agent.agentType ?? undefined,
-        sessionId,
-        routeCategory: systemParams?.routeCategory ?? RouteCategory.A2A,
-        user: a2aUser
-          ? { id: a2aUser.id, email: a2aUser.email, name: a2aUser.name }
-          : null,
-        callback: async () => {
-          return executeA2AMessage({
-            agentId,
-            message: "",
-            messages: requestMessages,
-            organizationId: actor.organizationId,
-            userId: actor.kind === "user" ? actor.id : "system",
-            sessionId,
-            source: systemParams?.source,
-            parentDelegationChain: undefined, // This is the root call, chain starts with agentId
-            blockOnApprovalRequired: false, // No need to block. We check approval flow availability below
-            originalUiMessages: contextUiMessages,
-            chatOpsBindingId: systemParams?.chatOpsBindingId,
-            chatOpsThreadId: systemParams?.chatOpsThreadId,
-          });
-        },
-      });
+      const [teams, userTeams] = await Promise.all([
+        AgentTeamModel.getTeamLabelInfoForAgent(agentId),
+        a2aUser
+          ? TeamModel.getTeamLabelInfoForUser({
+              userId: a2aUser.id,
+              organizationId: agent.organizationId,
+            })
+          : [],
+      ]);
+      // Agent Runtime belongs to the Agent itself and is selected only
+      // for a durable task. Invocation surfaces decide whether a plain send
+      // should remain a Message or be promoted to that task lifecycle.
+      let runtimeExecutionEntered = false;
+      const executeRun = (runOpts: {
+        abortSignal?: AbortSignal;
+        onTextDelta?: (delta: string) => void;
+        onUiMessageChunk?: (chunk: UIMessageChunk) => Promise<void>;
+        /** Present only under the task lifecycle; a plain send has no task. */
+        taskId?: string;
+      }) =>
+        startActiveChatSpan({
+          agentName: agent.name,
+          agentId,
+          agentType: agent.agentType ?? undefined,
+          sessionId,
+          labels: agent.labels,
+          teams,
+          userTeams,
+          routeCategory: systemParams?.routeCategory ?? RouteCategory.A2A,
+          user: a2aUser
+            ? { id: a2aUser.id, email: a2aUser.email, name: a2aUser.name }
+            : null,
+          callback: async () => {
+            // Only a task run goes to the container. This keeps the runtime
+            // decision independent from the protocol surface: A2A can promote
+            // a direct send, while foreground Chat can remain message-based.
+            if (runtime && runOpts.taskId) {
+              runtimeExecutionEntered = true;
+              return runTaskInAgentRuntime({
+                resumeFromTaskId,
+                runtime,
+                limits: systemParams?.runtimeLimits,
+                // Each task is a turn; continuations share the retained
+                // Sandbox identity and adoption never repeats a started turn.
+                taskId: runOpts.taskId,
+                agentId,
+                actor,
+                organizationId: actor.organizationId,
+                projectId: systemParams?.projectId,
+                completionTarget: systemParams?.completionTarget,
+                onRuntimeSessionCreated: systemParams?.onRuntimeSessionCreated,
+                task: executedTurnText,
+                title: systemParams?.runtimeTitle,
+                modelId: agent.modelId,
+                llmApiKeyId: agent.llmApiKeyId,
+                runMode: systemParams?.runtimeMode ?? "one_shot",
+                titleUserId: actor.kind === "user" ? actor.id : undefined,
+                runtimeCrossing: systemParams?.runtimeCrossing,
+                ephemeralCredentials: systemParams?.ephemeralCredentials,
+                subagentExecutionPolicy: systemParams?.subagentExecutionPolicy,
+                onLaunchFailed: systemParams?.onRuntimeLaunchFailed,
+                onTextDelta: runOpts.onTextDelta,
+                abortSignal: runOpts.abortSignal,
+              });
+            }
+            return executeA2AMessage({
+              agentId,
+              message: executedTurnText,
+              attachments:
+                currentTurnAttachments.length > 0
+                  ? currentTurnAttachments
+                  : undefined,
+              messages: requestMessages,
+              organizationId: actor.organizationId,
+              userId: a2aActorUserId(actor),
+              oauthExecution: actor.oauthExecution,
+              sessionId,
+              runId: runOpts.taskId,
+              source: systemParams?.source,
+              // A chat posts a paused review to the requester (see ChatOps).
+              // Detached tasks a chat starts report back without a form.
+              openappaReviewPause:
+                this.config.callerAnswersOpenappaReviews === true ||
+                (!fullTaskMode &&
+                  systemParams?.routeCategory === RouteCategory.CHATOPS),
+              parentDelegationChain: undefined, // This is the root call, chain starts with agentId
+              originalUiMessages: contextUiMessages,
+              chatOpsBindingId:
+                systemParams?.completionTarget?.type === "chatops"
+                  ? systemParams.completionTarget.bindingId
+                  : undefined,
+              chatOpsThreadId:
+                systemParams?.completionTarget?.type === "chatops"
+                  ? systemParams.completionTarget.threadId
+                  : undefined,
+              chatOpsPinnedAgentId:
+                systemParams?.completionTarget?.type === "chatops"
+                  ? systemParams.completionTarget.pinnedAgentId
+                  : undefined,
+              onTextDelta: runOpts.onTextDelta,
+              onUiMessageChunk: runOpts.onUiMessageChunk,
+              abortSignal: runOpts.abortSignal,
+            });
+          },
+        });
 
-      if (!this.config.stateless && !context) {
-        // In stateful mode context should be created in the db on every successful execution
-        context = await A2AContextManager.createContext(actor);
+      // ---- Full task mode: run under the durable task lifecycle -----------
+      // A tasked run is requested explicitly (streaming / returnImmediately)
+      // or implied by resuming an existing task. Everything below this block
+      // is the pre-existing message-response flow, untouched for
+      // approval-only managers and plain blocking sends.
+      const taskRunRequested =
+        fullTaskMode && (params.taskRun?.createTask || Boolean(task));
+      if (taskRunRequested) {
+        if (this.config.stateless) {
+          throw new Error("[A2AManager] Full task mode requires stateful mode");
+        }
+        if (!context) {
+          // This should never happen: stateful mode created the context above.
+          throw new Error("[A2AManager] No context for a task run");
+        }
+        // `context` is a mutable binding; capture the id so the narrowing
+        // survives into the lifecycle closure.
+        const runContextId = context.id;
+
+        let runTask: A2ATaskWithData;
+        if (task) {
+          runTask = task;
+        } else {
+          const created = await A2ATaskModel.createForRun({
+            contextId: context.id,
+            agentId,
+            userMessageId: persistedContextUserMessage?.id,
+          });
+          runTask = {
+            ...created,
+            approvalRequests: [],
+            history: persistedContextUserMessage
+              ? [{ ...persistedContextUserMessage, taskId: created.id }]
+              : [],
+            artifacts: [],
+          };
+        }
+
+        const lifecycle = async () => {
+          try {
+            const response = await this.runTaskLifecycle({
+              task: runTask,
+              contextId: runContextId,
+              organizationId: actor.organizationId,
+              executeRun,
+              survivesRestart: Boolean(runtime),
+            });
+            if (runtime && !runtimeExecutionEntered) {
+              await systemParams?.onRuntimeLaunchFailed?.();
+            }
+            return response;
+          } catch (error) {
+            if (!runtimeExecutionEntered) {
+              await systemParams?.onRuntimeLaunchFailed?.();
+            }
+            throw error;
+          }
+        };
+
+        if (params.taskRun?.detached) {
+          const snapshot = A2ATaskManager.toProtocolTask(runTask);
+          await params.onDetachedTaskRun?.({
+            taskId: runTask.id,
+            followFromSeq: task ? resumeWatermark : 0,
+          });
+          // Never-rejecting detached continuation: the lifecycle persists its
+          // own terminal outcome; an escaping rejection here would take the
+          // process down under the unhandled-rejection policy.
+          void lifecycle().catch((error) => {
+            logger.error(
+              { error, taskId: runTask.id, agentId },
+              "[A2AManager] Detached A2A task run crashed",
+            );
+          });
+          return { task: snapshot };
+        }
+
+        return await lifecycle();
       }
 
-      let userMessageSavedInDb = false;
-      const saveUserMessageInDb = async () => {
-        if (userMessageSavedInDb) {
-          return;
-        }
-        if (messageParts.length > 0) {
-          if (!context) {
-            // This should never happen: context must be defined before.
-            throw new Error(
-              "[A2AManager] No context when inserting user message in the db",
-            );
-          }
-          const uiMessageParts: TextUIPart[] = [];
-          messageParts.forEach((part) => {
-            if (part.type === "text") {
-              uiMessageParts.push({ type: "text" as const, text: part.text });
-            }
-            // Files are currently not supported in history.
-          });
-          const userUiMessage: UIMessage = {
-            id: request.message.messageId,
-            parts: uiMessageParts,
-            role: "user",
-          };
-          if (task) {
-            const { task: updatedTask } = await A2ATaskManager.addMessageToTask(
-              {
-                task,
-                message: request.message,
-                uiMessage: userUiMessage,
-              },
-            );
-            task = updatedTask;
-          } else {
-            await A2AContextManager.addMessageToContext({
-              context,
-              message: request.message,
-              uiMessage: userUiMessage,
-            });
-          }
-        }
-        userMessageSavedInDb = true;
-      };
+      const result = await executeRun({
+        abortSignal,
+        onTextDelta: params.onTextDelta,
+        onUiMessageChunk: params.onUiMessageChunk,
+      });
 
       const approvalRequests = extractApprovalRequestsFromUiMessage(
         result.responseUiMessage,
@@ -323,91 +889,69 @@ export class A2AManager {
             actor,
             state: A2AProtocolTaskState.InputRequired,
             approvalRequests,
+            agentId,
+            options: contextAccessOptions,
           });
+
+          // The stateful pre-persist stored the triggering user turn on the
+          // context before this task existed; re-parent it so the protocol
+          // task history carries it (as it does in the stateless flow).
+          if (persistedContextUserMessage) {
+            const attached = await A2AMessageModel.assignTask(
+              persistedContextUserMessage.id,
+              task.id,
+            );
+            if (attached) {
+              task = { ...task, history: [attached, ...task.history] };
+            }
+          }
+        }
+
+        await this.attachCallerReviews({
+          organizationId: actor.organizationId,
+          taskId: task.id,
+          approvalRequests,
+        });
+        if (this.config.callerAnswersOpenappaReviews) {
+          // The reply shows each review's text, which only the stored rows carry.
+          task = {
+            ...task,
+            approvalRequests: (
+              await A2ATaskApprovalRequestModel.findByTaskId(task.id)
+            )
+              .sort((a, b) => a.approvalId.localeCompare(b.approvalId))
+              .map(toApprovalRequest),
+          };
         }
 
         // In approval flow user message must be created in the db even in the stateless mode.
         await saveUserMessageInDb();
 
-        if (!context) {
-          // This should never happen
-          throw new Error("[A2AManager] No context when creating message");
-        }
-        const { task: updatedTask } = await A2ATaskManager.addMessageToTask({
+        // In approval flow the agent message is persisted even in stateless mode.
+        const { task: updatedTask } = await this.persistAgentMessage({
+          context,
           task,
-          message: {
-            messageId: result.responseUiMessage.id,
-            contextId: context.id,
-            role: A2AProtocolRole.Agent,
-            parts: extractProtocolPartsFromUIMessage(result.responseUiMessage),
-          },
-          uiMessage: result.responseUiMessage,
+          responseUiMessage: result.responseUiMessage,
+          stateless: false,
         });
-        task = updatedTask;
+        task = updatedTask ?? task;
 
         return { task: A2ATaskManager.toProtocolTask(task) };
       }
 
-      if (!this.config.stateless) {
-        // In stateful mode user message should be created in the db on every successful execution
-        await saveUserMessageInDb();
-      }
+      const {
+        resultMessage,
+        task: persistedTask,
+        context: persistedContext,
+      } = await this.persistAgentMessage({
+        context,
+        task,
+        responseUiMessage: result.responseUiMessage,
+        stateless: Boolean(this.config.stateless),
+      });
+      task = persistedTask ?? task;
+      context = persistedContext ?? context;
 
-      let resultMessage: A2AProtocolMessage | undefined;
-      if (this.config.stateless) {
-        // In stateless mode we do not save messages in the db, but we need to return a message with id
-        resultMessage = {
-          messageId: result.responseUiMessage.id,
-          contextId: context?.id,
-          taskId: task?.id,
-          role: A2AProtocolRole.Agent,
-          parts: extractProtocolPartsFromUIMessage(result.responseUiMessage),
-        };
-      } else {
-        if (!context) {
-          // This should never happen: context is always defined in the stateful mode.
-          throw new Error("[A2AManager] No context when saving message to db");
-        }
-
-        if (task) {
-          // In case when we are within task execution, we should properly update the message
-          //   because it can be already created in the db as part of approval flow
-          const { task: updatedTask, protocolMessage } =
-            await A2ATaskManager.addMessageToTask({
-              task,
-              message: {
-                messageId: result.responseUiMessage.id,
-                contextId: context.id,
-                role: A2AProtocolRole.Agent,
-                parts: extractProtocolPartsFromUIMessage(
-                  result.responseUiMessage,
-                ),
-              },
-              uiMessage: result.responseUiMessage,
-            });
-          task = updatedTask;
-          resultMessage = protocolMessage;
-        } else {
-          const { context: updatedContext, protocolMessage } =
-            await A2AContextManager.addMessageToContext({
-              context,
-              message: {
-                messageId: result.responseUiMessage.id,
-                parts: extractProtocolPartsFromUIMessage(
-                  result.responseUiMessage,
-                ),
-                role: A2AProtocolRole.Agent,
-              },
-              uiMessage: result.responseUiMessage,
-            });
-          context = updatedContext;
-          resultMessage = protocolMessage;
-        }
-      }
-      if (!resultMessage) {
-        // This should never happen: resultMessage is always created above
-        throw new Error("[A2AManager] resultMessage is not defined");
-      }
       if (task && task.state !== A2AProtocolTaskState.Completed) {
         await A2ATaskManager.updateTaskState(
           task,
@@ -417,6 +961,22 @@ export class A2AManager {
 
       return { message: resultMessage };
     } catch (error) {
+      // A resumed task is WORKING but its run may never have started; settle
+      // it so pollers see a terminal outcome. If the run's own lifecycle
+      // already settled it (or a cancel won), this CAS is a no-op.
+      if (resumedWorkingTask) {
+        await settleFailedA2ATask({
+          taskId: resumedWorkingTask.taskId,
+          contextId: resumedWorkingTask.contextId,
+          statusReason: error instanceof Error ? error.message : String(error),
+        }).catch((settleError) => {
+          logger.error(
+            { settleError, taskId: resumedWorkingTask?.taskId },
+            "[A2AManager] Failed to settle a resumed task after a send error",
+          );
+        });
+      }
+
       if (error instanceof A2AError) {
         throw error;
       }
@@ -428,9 +988,398 @@ export class A2AManager {
     }
   }
 
+  /**
+   * Run one execution under the durable task lifecycle (full task mode):
+   * start transition, delta events + artifact chunks through the run
+   * service, and exactly one terminal/interrupt transaction — COMPLETED,
+   * INPUT_REQUIRED (approvals), CANCELED, or FAILED. The task row is the
+   * authority at every step: every transition is a CAS, so whichever of
+   * {this run, CancelTask, the reaper} settles the task first wins and the
+   * others observe it.
+   */
+  private async runTaskLifecycle(params: {
+    task: A2ATaskWithData;
+    contextId: string;
+    organizationId: string;
+    executeRun: (runOpts: {
+      abortSignal?: AbortSignal;
+      onTextDelta?: (delta: string) => void;
+      taskId?: string;
+    }) => Promise<A2AExecuteResult>;
+    /** This task's work runs in a container, so it outlives this process. */
+    survivesRestart?: boolean;
+  }): Promise<A2AProtocolSendMessageResponse> {
+    const { contextId } = params;
+    let task = params.task;
+    const taskId = task.id;
+
+    // A resumed run continues the task's existing response artifact instead
+    // of minting a second one — a task carries exactly one `agent-response`
+    // artifact across approval interrupts.
+    const existingArtifact = (await A2AArtifactModel.findByTaskId(taskId)).find(
+      (artifact) => artifact.name === RESPONSE_ARTIFACT_NAME,
+    );
+    const artifactId = existingArtifact?.id ?? randomUUID();
+
+    // Fresh liveness signal before anything else: a task resumed long after
+    // its interrupt still holds the pre-interrupt heartbeat, which would
+    // otherwise make it instantly reapable as an orphan.
+    await A2ATaskModel.touchHeartbeat(taskId);
+
+    // Start transition. A freshly created task starts from SUBMITTED; a task
+    // being fed new input starts from INPUT_REQUIRED. An approval resume
+    // already flipped to WORKING (with its event) inside the resume
+    // transaction, so there is nothing to do. A CAS miss means the task was
+    // canceled between creation/validation and here.
+    if (task.state !== A2AProtocolTaskState.Working) {
+      const workingEvent: A2AProtocolStreamResponse = {
+        statusUpdate: {
+          taskId,
+          contextId,
+          status: { state: A2AProtocolTaskState.Working },
+        },
+      };
+      const started = await A2ATaskModel.transitionStateWithEvent({
+        id: taskId,
+        to: A2AProtocolTaskState.Working,
+        allowedFrom: [
+          A2AProtocolTaskState.Submitted,
+          A2AProtocolTaskState.InputRequired,
+        ],
+        eventPayload: workingEvent,
+      });
+      if (!started) {
+        const refreshed = await A2ATaskManager.loadTaskWithDataById(taskId);
+        return { task: A2ATaskManager.toProtocolTask(refreshed) };
+      }
+      task = { ...task, ...started };
+      a2aTaskRunService.notify(taskId, workingEvent);
+    }
+
+    let isFirstChunk = true;
+    const run = a2aTaskRunService.startRun({
+      taskId,
+      survivesRestart: params.survivesRestart,
+      artifact: { id: artifactId, name: RESPONSE_ARTIFACT_NAME },
+      buildDeltaEvent: (chunk) => {
+        const append = !isFirstChunk;
+        isFirstChunk = false;
+        return {
+          artifactUpdate: {
+            taskId,
+            contextId,
+            artifact: {
+              artifactId,
+              name: RESPONSE_ARTIFACT_NAME,
+              parts: [{ text: chunk }],
+            },
+            ...(append ? { append: true } : {}),
+          },
+        };
+      },
+    });
+
+    try {
+      const result = await params.executeRun({
+        abortSignal: run.signal,
+        onTextDelta: run.onTextDelta,
+        taskId,
+      });
+      await run.drainDeltas();
+
+      const approvalRequests = extractApprovalRequestsFromUiMessage(
+        result.responseUiMessage,
+      );
+      const parts = extractProtocolPartsFromUIMessage(result.responseUiMessage);
+      const agentMessage = {
+        id: result.responseUiMessage.id,
+        contextId,
+        role: A2AProtocolRole.Agent,
+        parts,
+        content: result.responseUiMessage,
+      };
+
+      if (approvalRequests.length > 0) {
+        if (this.config.disableApprovalFlow) {
+          await settleFailedA2ATask({
+            taskId,
+            contextId,
+            statusReason:
+              "The agent requested tool approval, but the approval flow is disabled.",
+          });
+          throw new A2AError(A2AErrorKind.OutputApprovalFlowIsDisabled);
+        }
+
+        const sortedRequests = [...approvalRequests].sort((a, b) =>
+          a.approvalId.localeCompare(b.approvalId),
+        );
+        const interruptEvent: A2AProtocolStreamResponse = {
+          statusUpdate: {
+            taskId,
+            contextId,
+            status: { state: A2AProtocolTaskState.InputRequired },
+          },
+        };
+        await A2ATaskModel.interruptForApproval({
+          taskId,
+          agentMessage,
+          approvalRequests: sortedRequests.map((request) => ({
+            taskId,
+            approvalId: request.approvalId,
+            toolCallId: request.toolCallId,
+            toolName: request.toolName,
+            approved: request.approved,
+            resolved: request.resolved,
+          })),
+          eventPayload: interruptEvent,
+        });
+        // Before announcing the pause, so a caller who answers at once
+        // answers a review, not a plain tool approval.
+        await this.attachCallerReviews({
+          organizationId: params.organizationId,
+          taskId,
+          approvalRequests,
+        });
+        a2aTaskRunService.notify(taskId, interruptEvent);
+        // A CAS miss here means a cancellation landed while the run was
+        // interrupting — the refreshed task carries whichever outcome won.
+        const refreshed = await A2ATaskManager.loadTaskWithDataById(taskId);
+        return { task: A2ATaskManager.toProtocolTask(refreshed) };
+      }
+
+      // Seal from the authoritative response message (which spans an
+      // approval interrupt), not `result.text` (this run's generation only).
+      const completedEvent: A2AProtocolStreamResponse = {
+        statusUpdate: {
+          taskId,
+          contextId,
+          status: {
+            state: A2AProtocolTaskState.Completed,
+            message: {
+              messageId: result.responseUiMessage.id,
+              contextId,
+              taskId,
+              role: A2AProtocolRole.Agent,
+              parts,
+            },
+          },
+        },
+      };
+      const finalParts: { text: string }[] = [
+        { text: parts.map((part) => part.text ?? "").join("") },
+      ];
+      await A2ATaskModel.completeRun({
+        taskId,
+        agentMessage,
+        artifact: {
+          id: artifactId,
+          name: RESPONSE_ARTIFACT_NAME,
+          parts: finalParts,
+        },
+        eventPayloads: [
+          {
+            // Seal the artifact: replace-with-final-content + lastChunk, so
+            // event-following clients hold the authoritative artifact even if
+            // a delta batch was reordered away by a crash.
+            artifactUpdate: {
+              taskId,
+              contextId,
+              artifact: {
+                artifactId,
+                name: RESPONSE_ARTIFACT_NAME,
+                parts: finalParts,
+              },
+              lastChunk: true,
+            },
+          },
+          completedEvent,
+        ],
+      });
+      a2aTaskRunService.notify(taskId, completedEvent);
+
+      // CAS miss = cancellation won while the run was completing: the
+      // completion transaction rolled back, and the task stays CANCELED with
+      // no completed outputs.
+      const refreshed = await A2ATaskManager.loadTaskWithDataById(taskId);
+      return { task: A2ATaskManager.toProtocolTask(refreshed) };
+    } catch (error) {
+      // EVERY escape path settles the task (a CAS no-op when something —
+      // cancellation, the disableApprovalFlow settle above — already did).
+      // Outcome decided BEFORE persistence (an abort is a cancellation, not a
+      // failure), and the terminal write must never mask the original error.
+      const wasAborted = run.signal.aborted;
+      const reason = error instanceof Error ? error.message : String(error);
+      try {
+        if (wasAborted) {
+          await A2ATaskModel.transitionStateWithEvent({
+            id: taskId,
+            to: A2AProtocolTaskState.Canceled,
+            allowedFrom: [
+              A2AProtocolTaskState.Submitted,
+              A2AProtocolTaskState.Working,
+            ],
+            statusReason: "The task run was aborted.",
+            clearApprovals: true,
+            eventPayload: {
+              statusUpdate: {
+                taskId,
+                contextId,
+                status: {
+                  state: A2AProtocolTaskState.Canceled,
+                  message: buildStatusReasonMessage({
+                    taskId,
+                    contextId,
+                    reason: "The task run was aborted.",
+                  }),
+                },
+              },
+            },
+          });
+          // Terminal state and its event committed together; let parked
+          // subscribers read the cancellation now.
+          a2aTaskRunService.wakeSubscribers(taskId);
+        } else {
+          await settleFailedA2ATask({
+            taskId,
+            contextId,
+            statusReason: reason,
+          });
+        }
+      } catch (persistError) {
+        logger.error(
+          { persistError, taskId },
+          "[A2AManager] Failed to persist the terminal state of an A2A task run; the reaper will settle it",
+        );
+      }
+
+      throw error;
+    } finally {
+      run.finish();
+    }
+  }
+
+  /**
+   * Resolve a task for this route's agent + actor. Tasks bound to a different
+   * agent answer TaskNotFound (existence non-disclosure); rows with no
+   * binding (pre-binding tasks, tasks whose agent was deleted) fall back to
+   * the actor/context ownership check alone. That fallback is deliberately
+   * actor-scoped, not open: reaching such a task through another agent still
+   * requires a gateway token valid for THAT agent plus ownership of the
+   * task's context, so no other actor ever gains access — the only latitude
+   * is which of their own agent endpoints the owner may use.
+   */
+  private async findTaskForAgent(params: {
+    taskId: string;
+    actor: A2AActor;
+    agentId: string;
+  }): Promise<A2ATaskWithData> {
+    let task: A2ATaskWithData;
+    try {
+      ({ task } = await A2ATaskManager.findAndValidateTaskWithContext(
+        params.taskId,
+        undefined,
+        params.actor,
+        { trustedActorAccess: Boolean(this.config.trustedContextAccess) },
+      ));
+    } catch (error) {
+      // Existence non-disclosure: another actor's task must answer exactly
+      // like an unknown one, not with the distinguishable context error.
+      if (
+        error instanceof A2AError &&
+        error.kind === A2AErrorKind.ContextNotFound
+      ) {
+        throw new A2AError(A2AErrorKind.TaskNotFound);
+      }
+      throw error;
+    }
+    if (task.agentId && task.agentId !== params.agentId) {
+      throw new A2AError(A2AErrorKind.TaskNotFound);
+    }
+    return task;
+  }
+
+  /**
+   * Persist the agent response message and return the protocol message.
+   * - stateless: returns the message literal, no DB write.
+   * - task present: writes via addMessageToTask (updates an existing approval message in place).
+   * - context only: writes via addMessageToContext.
+   */
+  private async persistAgentMessage(args: {
+    context: A2AContext | undefined;
+    task: A2ATaskWithData | undefined;
+    responseUiMessage: UIMessage;
+    stateless: boolean;
+  }): Promise<{
+    resultMessage: A2AProtocolMessage;
+    task?: A2ATaskWithData;
+    context?: A2AContext;
+  }> {
+    const { context, task, responseUiMessage, stateless } = args;
+    const parts = extractProtocolPartsFromUIMessage(responseUiMessage);
+
+    if (stateless) {
+      return {
+        resultMessage: {
+          messageId: responseUiMessage.id,
+          contextId: context?.id,
+          taskId: task?.id,
+          role: A2AProtocolRole.Agent,
+          parts,
+        },
+      };
+    }
+
+    if (!context) {
+      // This should never happen: context is always defined in the stateful mode.
+      throw new Error("[A2AManager] No context when saving message to db");
+    }
+
+    if (task) {
+      const { task: updatedTask, protocolMessage } =
+        await A2ATaskManager.addMessageToTask({
+          task,
+          message: {
+            messageId: responseUiMessage.id,
+            contextId: context.id,
+            role: A2AProtocolRole.Agent,
+            parts,
+          },
+          uiMessage: responseUiMessage,
+        });
+      return { resultMessage: protocolMessage, task: updatedTask };
+    }
+
+    const { context: updatedContext, protocolMessage } =
+      await A2AContextManager.addMessageToContext({
+        context,
+        message: {
+          messageId: responseUiMessage.id,
+          role: A2AProtocolRole.Agent,
+          parts,
+        },
+        uiMessage: responseUiMessage,
+      });
+    return { resultMessage: protocolMessage, context: updatedContext };
+  }
+
+  /** Links paused remedy calls to their OpenAPPA reviews for the caller. */
+  private async attachCallerReviews(params: {
+    organizationId: string;
+    taskId: string;
+    approvalRequests: A2AArchestraApprovalRequest[];
+  }): Promise<void> {
+    if (!this.config.callerAnswersOpenappaReviews) return;
+    await attachHitlReviews({
+      ...params,
+      answerer: { kind: "caller" },
+      now: new Date(),
+    });
+  }
+
   async processTaskOps(params: {
     task: A2ATaskWithData;
     taskOps: A2AArchestraTaskOps;
+    actor: A2AActor;
   }): Promise<{
     task: A2ATaskWithData;
     switchedToWorkingState?: boolean;
@@ -439,7 +1388,7 @@ export class A2AManager {
     const { taskOps } = params;
     let { task } = params;
 
-    const approvalDecisions = taskOps.approvalDecisions ?? [];
+    let approvalDecisions = taskOps.approvalDecisions ?? [];
     if (approvalDecisions.length > 0) {
       if (this.config.disableApprovalFlow) {
         throw new A2AError(A2AErrorKind.InputApprovalFlowIsDisabled);
@@ -488,36 +1437,76 @@ export class A2AManager {
         );
       }
 
-      // UIMessage content will be mutated
-      applyApprovalDecisionsToUiMessage({
-        message: lastMessageContent,
-        approvalDecisions,
-      });
-      // Apply to messages to db first
-      await A2AMessageModel.updateContent(lastMessage.id, lastMessageContent);
-      // Apply to task db
-      task = await A2ATaskManager.updateTaskApprovalDecisions({
-        task,
-        approvalDecisions,
-      });
-
-      const hasPendingApprovalRequests = task.approvalRequests.some(
-        (r) => !r.resolved,
-      );
-      if (!hasPendingApprovalRequests) {
-        task = await A2ATaskManager.updateTaskState(
-          task,
-          A2AProtocolTaskState.Working,
-        );
-        task = await A2ATaskManager.removeTaskApprovalRequests(task);
-        return {
-          task,
-          switchedToWorkingState: true,
-          approvalDecisionsWasApplied: true,
-        };
+      if (this.config.callerAnswersOpenappaReviews) {
+        approvalDecisions = await decideCallerHitlReviews({
+          organizationId: params.actor.organizationId,
+          taskId: task.id,
+          userId: a2aActorUserId(params.actor),
+          approvalDecisions,
+          now: new Date(),
+        });
       }
 
-      return { task, approvalDecisionsWasApplied: true };
+      // The model applies the decisions, re-derives the message content from
+      // its FRESH database state, and resumes the task in the same
+      // transaction when the last pending decision lands. Deciding
+      // partial-vs-resume there (under the task's row lock, not from this
+      // method's snapshot) is what keeps two concurrent decisions on
+      // different approvals from both taking the partial path and stranding
+      // a fully-resolved task in INPUT_REQUIRED.
+      const result = await A2ATaskModel.applyApprovalDecisionsAndMaybeResume({
+        taskId: task.id,
+        lastMessageId: lastMessage.id,
+        approvalDecisions: approvalDecisions.map((d) => ({
+          approvalId: d.approvalId,
+          approved: d.approved,
+        })),
+        applyDecisionsToContent: (freshContent) => {
+          const message = (freshContent ?? lastMessageContent) as UIMessage;
+          applyApprovalDecisionsToUiMessage({ message, approvalDecisions });
+          return message;
+        },
+        resumeEventPayload: {
+          statusUpdate: {
+            taskId: task.id,
+            contextId: task.contextId,
+            status: { state: A2AProtocolTaskState.Working },
+          },
+        },
+      });
+
+      if (!("task" in result)) {
+        if (result.outcome === "task_not_input_required") {
+          throw new A2AError(
+            A2AErrorKind.TaskIsNotInputRequired,
+            "the task was resumed or canceled concurrently",
+          );
+        }
+        throw new A2AError(A2AErrorKind.ApprovalIdAlreadyResolved);
+      }
+
+      // Mirror the transaction's outcome into the in-memory task: fresh row,
+      // fresh approval rows, and the content the transaction persisted.
+      const refreshedHistory = [
+        ...task.history.slice(0, -1),
+        { ...lastMessage, content: result.content },
+      ];
+      const refreshedApprovals = [...result.approvalRows]
+        .sort((a, b) => a.approvalId.localeCompare(b.approvalId))
+        .map(toApprovalRequest);
+      task = {
+        ...task,
+        ...result.task,
+        history: refreshedHistory,
+        approvalRequests:
+          result.outcome === "resumed" ? [] : refreshedApprovals,
+      };
+
+      return {
+        task,
+        switchedToWorkingState: result.outcome === "resumed",
+        approvalDecisionsWasApplied: true,
+      };
     }
 
     return { task };
@@ -528,27 +1517,351 @@ export class A2AManager {
     agentId: string;
     request: A2AProtocolGetTaskRequest;
   }): Promise<A2AProtocolTask> {
-    const { task } = await A2ATaskManager.findAndValidateTaskWithContext(
-      params.request.id,
-      undefined,
-      params.actor,
-    );
-    if (!task) {
-      throw new A2AError(A2AErrorKind.TaskNotFound);
+    const task = await this.findTaskForAgent({
+      taskId: params.request.id,
+      actor: params.actor,
+      agentId: params.agentId,
+    });
+    return A2ATaskManager.toProtocolTask(task, {
+      historyLength: params.request.historyLength,
+    });
+  }
+
+  /**
+   * A2A `CancelTask`: durably CAS the task to CANCELED (with its terminal
+   * event and approval cleanup) FIRST, then best-effort abort the run — a
+   * non-cooperative run can then never overwrite the canceled outcome, and a
+   * run on another pod observes the state via its own poll / append guard.
+   */
+  public async cancelTask(params: {
+    actor: A2AActor;
+    agentId: string;
+    request: A2AProtocolCancelTaskRequest;
+    /** Why the task stopped, when the platform rather than the client cancels it. */
+    statusReason?: string;
+  }): Promise<A2AProtocolTask> {
+    const task = await this.findTaskForAgent({
+      taskId: params.request.id,
+      actor: params.actor,
+      agentId: params.agentId,
+    });
+
+    if (isTerminalA2ATaskState(task.state)) {
+      throw new A2AError(A2AErrorKind.TaskNotCancelable);
     }
-    return A2ATaskManager.toProtocolTask(task);
+
+    const statusReason =
+      params.statusReason ?? "The task was canceled by the client.";
+    const canceled = await A2ATaskModel.transitionStateWithEvent({
+      id: task.id,
+      to: A2AProtocolTaskState.Canceled,
+      allowedFrom: [
+        A2AProtocolTaskState.Submitted,
+        A2AProtocolTaskState.Working,
+        A2AProtocolTaskState.InputRequired,
+        A2AProtocolTaskState.AuthRequired,
+        A2AProtocolTaskState.Unspecified,
+      ],
+      statusReason,
+      clearApprovals: true,
+      eventPayload: {
+        statusUpdate: {
+          taskId: task.id,
+          contextId: task.contextId,
+          status: {
+            state: A2AProtocolTaskState.Canceled,
+            message: buildStatusReasonMessage({
+              taskId: task.id,
+              contextId: task.contextId,
+              reason: statusReason,
+            }),
+          },
+        },
+      },
+    });
+    if (!canceled) {
+      // Lost the race to another terminal transition (concurrent cancel or a
+      // completing run) — per spec a terminal task is not cancelable.
+      throw new A2AError(A2AErrorKind.TaskNotCancelable);
+    }
+
+    a2aTaskRunService.abortLocal(task.id);
+    // The canceled state and its terminal event committed together above, so
+    // subscribers on every replica can read the cancellation now rather than
+    // waiting out their fallback interval.
+    a2aTaskRunService.wakeSubscribers(task.id);
+
+    const refreshed = await A2ATaskManager.loadTaskWithData(canceled);
+    return A2ATaskManager.toProtocolTask(refreshed);
+  }
+
+  /**
+   * A2A `SubscribeToTask` validation + snapshot: returns the authorized task
+   * (throwing -32004 when it is already terminal, per spec — finished work is
+   * fetched with GetTask) together with the event-sequence watermark bound to
+   * that snapshot. The transport layer polls `readTaskEventsAfter` from the
+   * watermark, so no event can be duplicated or skipped between snapshot and
+   * first poll.
+   */
+  public async subscribeToTask(params: {
+    actor: A2AActor;
+    agentId: string;
+    request: A2AProtocolSubscribeToTaskRequest;
+  }): Promise<{ task: A2AProtocolTask; taskId: string; watermark: number }> {
+    const task = await this.findTaskForAgent({
+      taskId: params.request.id,
+      actor: params.actor,
+      agentId: params.agentId,
+    });
+
+    if (isTerminalA2ATaskState(task.state)) {
+      throw new A2AError(
+        A2AErrorKind.UnsupportedOperation,
+        "the task is already in a terminal state; use GetTask to fetch it",
+      );
+    }
+
+    // The snapshot must be consistent with the watermark: an event landing
+    // between the watermark read and the snapshot assembly would either be
+    // skipped (watermark after snapshot) or double-delivered on top of the
+    // snapshot's artifact content (watermark before snapshot). Re-read the
+    // allocator after assembling the snapshot and retry until it is stable —
+    // with one writer per task and 250ms delta batching, a retry is rare.
+    let snapshot = task;
+    let watermark = task.nextEventSeq - 1;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const after = await A2ATaskModel.findById(snapshot.id);
+      if (!after) {
+        throw new A2AError(A2AErrorKind.TaskNotFound);
+      }
+      if (after.nextEventSeq - 1 === watermark) {
+        return {
+          task: A2ATaskManager.toProtocolTask(snapshot),
+          taskId: snapshot.id,
+          watermark,
+        };
+      }
+      watermark = after.nextEventSeq - 1;
+      snapshot = await A2ATaskManager.loadTaskWithData(after);
+    }
+
+    // Never hand out an unstable snapshot/watermark pair — a skipped or
+    // double-applied artifact chunk is worse than asking the client to retry.
+    throw new Error(
+      `A2A task ${task.id} emitted events continuously during snapshot assembly; retry SubscribeToTask`,
+    );
+  }
+
+  /**
+   * Poll step for SubscribeToTask streams: the task's current state plus its
+   * events strictly after `afterSeq`. Terminal state + drained events =
+   * close the stream.
+   */
+  public async readTaskEventsAfter(params: {
+    taskId: string;
+    afterSeq: number;
+  }): Promise<{
+    state: A2AProtocolTaskState;
+    events: { seq: number; payload: A2AProtocolStreamResponse }[];
+  } | null> {
+    const result = await A2ATaskModel.readTaskAndEventsAfter(params);
+    if (!result) {
+      return null;
+    }
+    return { state: result.task.state, events: result.events };
+  }
+
+  /**
+   * A2A `CreateTaskPushNotificationConfig`. The URL is validated up front so a
+   * caller learns about an unreachable or disallowed endpoint synchronously
+   * rather than through silent non-delivery.
+   */
+  public async createTaskPushNotificationConfig(params: {
+    actor: A2AActor;
+    agentId: string;
+    request: A2AProtocolTaskPushNotificationConfig;
+  }): Promise<A2AProtocolTaskPushNotificationConfig> {
+    const task = await this.findTaskForAgent({
+      taskId: params.request.taskId,
+      actor: params.actor,
+      agentId: params.agentId,
+    });
+
+    const { pushNotificationConfig: input } = params.request;
+    const validated = validateOutboundUrl(input.url);
+    if (!validated.ok) {
+      throw new A2AError(
+        A2AErrorKind.InvalidPushNotificationUrl,
+        PUSH_URL_REJECTION_DETAIL[validated.reason],
+      );
+    }
+
+    // A client that supplies an id is re-registering that config; keep the id
+    // stable so repeated setup calls do not pile up duplicate webhooks.
+    if (input.id) {
+      const updated = await A2APushNotificationConfigModel.update({
+        id: input.id,
+        taskId: task.id,
+        url: input.url,
+        token: input.token,
+        authScheme: input.authentication?.scheme,
+        authCredentials: input.authentication?.credentials,
+      });
+      if (updated) {
+        return toProtocolPushConfig(updated);
+      }
+    }
+
+    const created = await A2APushNotificationConfigModel.create({
+      taskId: task.id,
+      url: input.url,
+      token: input.token,
+      authScheme: input.authentication?.scheme,
+      authCredentials: input.authentication?.credentials,
+    });
+    return toProtocolPushConfig(created);
+  }
+
+  /** A2A `GetTaskPushNotificationConfig`. Credentials are never echoed back. */
+  public async getTaskPushNotificationConfig(params: {
+    actor: A2AActor;
+    agentId: string;
+    request: A2AProtocolGetTaskPushNotificationConfigRequest;
+  }): Promise<A2AProtocolTaskPushNotificationConfig> {
+    const task = await this.findTaskForAgent({
+      taskId: params.request.taskId,
+      actor: params.actor,
+      agentId: params.agentId,
+    });
+
+    const config = await A2APushNotificationConfigModel.findByIdForTask({
+      id: params.request.id,
+      taskId: task.id,
+    });
+    if (!config) {
+      throw new A2AError(A2AErrorKind.PushNotificationConfigNotFound);
+    }
+    return toProtocolPushConfig(config);
+  }
+
+  /** A2A `ListTaskPushNotificationConfigs`. */
+  public async listTaskPushNotificationConfigs(params: {
+    actor: A2AActor;
+    agentId: string;
+    request: A2AProtocolListTaskPushNotificationConfigsRequest;
+  }): Promise<A2AProtocolListTaskPushNotificationConfigsResponse> {
+    const task = await this.findTaskForAgent({
+      taskId: params.request.taskId,
+      actor: params.actor,
+      agentId: params.agentId,
+    });
+
+    const configs = await A2APushNotificationConfigModel.findByTaskId(task.id);
+    return { configs: configs.map(toProtocolPushConfig) };
+  }
+
+  /** A2A `DeleteTaskPushNotificationConfig`. */
+  public async deleteTaskPushNotificationConfig(params: {
+    actor: A2AActor;
+    agentId: string;
+    request: A2AProtocolDeleteTaskPushNotificationConfigRequest;
+  }): Promise<Record<string, never>> {
+    const task = await this.findTaskForAgent({
+      taskId: params.request.taskId,
+      actor: params.actor,
+      agentId: params.agentId,
+    });
+
+    const deleted = await A2APushNotificationConfigModel.delete({
+      id: params.request.id,
+      taskId: task.id,
+    });
+    if (!deleted) {
+      throw new A2AError(A2AErrorKind.PushNotificationConfigNotFound);
+    }
+    return {};
+  }
+
+  /** A2A `ListTasks`, scoped to the calling actor and the route's agent. */
+  public async listTasks(params: {
+    actor: A2AActor;
+    agentId: string;
+    request: A2AProtocolListTasksRequest;
+  }): Promise<A2AProtocolListTasksResponse> {
+    const { request } = params;
+    const pageSize = request.pageSize ?? 20;
+
+    const cursor = request.pageToken
+      ? decodeListTasksPageToken(request.pageToken)
+      : undefined;
+
+    const { tasks, totalSize } = await A2ATaskModel.listForActor({
+      actorKind: params.actor.kind,
+      actorId: params.actor.id,
+      agentIds: [params.agentId],
+      contextId: request.contextId,
+      state: request.status,
+      statusChangedAfter: request.statusTimestampAfter
+        ? new Date(request.statusTimestampAfter)
+        : undefined,
+      cursor,
+      pageSize,
+    });
+
+    const withData = await A2ATaskManager.loadTasksWithData(tasks);
+
+    const last = tasks[tasks.length - 1];
+    const nextPageToken =
+      tasks.length === pageSize && last
+        ? encodeListTasksPageToken({
+            stateChangedAt: last.stateChangedAt ?? last.createdAt,
+            id: last.id,
+          })
+        : "";
+
+    return {
+      tasks: withData.map((task) =>
+        A2ATaskManager.toProtocolTask(task, {
+          historyLength: request.historyLength ?? 0,
+          includeArtifacts: request.includeArtifacts ?? false,
+        }),
+      ),
+      nextPageToken,
+      pageSize,
+      totalSize,
+    };
   }
 
   public async resolveActorByMCPGatewayToken(
     agentId: string,
     token: string,
   ): Promise<A2AActor> {
-    const tokenAuth = await validateMCPGatewayToken(agentId, token);
+    const tokenAuth = await validateMCPGatewayToken(
+      agentId,
+      token,
+      A2A_OAUTH_SCOPE,
+    );
     if (!tokenAuth) {
       throw new A2AError(A2AErrorKind.InvalidToken);
     }
 
     const organizationId = tokenAuth.organizationId;
+    const oauthExecution = tokenAuth.oauthClientId
+      ? {
+          tokenId: tokenAuth.tokenId,
+          clientId: tokenAuth.oauthClientId,
+          serviceAccountId: tokenAuth.serviceAccountId,
+        }
+      : undefined;
+
+    if (tokenAuth.serviceAccountId) {
+      return {
+        id: tokenAuth.serviceAccountId,
+        kind: "serviceAccount",
+        organizationId,
+        oauthExecution,
+      };
+    }
 
     if (tokenAuth.userId) {
       const user = await UserModel.getById(tokenAuth.userId);
@@ -561,21 +1874,16 @@ export class A2AManager {
         kind: "user",
         organizationId,
       };
-    } else if (tokenAuth.teamId) {
-      const team = await TeamModel.findById(tokenAuth.teamId);
-      if (!team) {
-        throw new A2AError(A2AErrorKind.TeamNotFound);
-      }
+    }
+
+    if (tokenAuth.oauthClientId) {
+      // Machine credentials authenticate the application itself. Token or
+      // secret rotation must not change the owner of its retained tasks.
       return {
-        id: tokenAuth.teamId,
-        kind: "team",
+        id: tokenAuth.oauthClientId,
+        kind: "oauthClient",
         organizationId,
-      };
-    } else if (tokenAuth.isOrganizationToken) {
-      return {
-        id: tokenAuth.organizationId,
-        kind: "organization",
-        organizationId,
+        oauthExecution,
       };
     }
 
@@ -587,17 +1895,86 @@ export class A2AManager {
   }
 }
 
-function extractProtocolPartsFromUIMessage(
-  uiMessage: UIMessage,
-): A2AProtocolPart[] {
-  const protocolParts: A2AProtocolPart[] = [];
-  const parts = uiMessage.parts;
-  for (const part of parts) {
-    if (part.type === "text") {
-      protocolParts.push({ text: part.text });
-    }
+/**
+ * The principal a turn runs as. A service account acts under its synthetic
+ * user id so the run is authorized against the account's own grants; every
+ * other non-user actor runs as the headless "system" sentinel.
+ */
+function a2aActorUserId(actor: A2AActor): string {
+  switch (actor.kind) {
+    case "user":
+      return actor.id;
+    case "serviceAccount":
+      return serviceAccountUserId(actor.id);
+    default:
+      return "system";
   }
-  return protocolParts;
+}
+
+/**
+ * Opaque, stable ListTasks cursor: the (status-change timestamp, id) pair of
+ * the last row of the previous page, base64-encoded. Both components are
+ * immutable once written (heartbeats touch a different column), so pages
+ * never skip or duplicate under concurrent activity.
+ */
+function encodeListTasksPageToken(cursor: {
+  stateChangedAt: Date;
+  id: string;
+}): string {
+  return Buffer.from(
+    JSON.stringify({ t: cursor.stateChangedAt.toISOString(), id: cursor.id }),
+  ).toString("base64url");
+}
+
+function decodeListTasksPageToken(token: string): {
+  stateChangedAt: Date;
+  id: string;
+} {
+  try {
+    const decoded = JSON.parse(Buffer.from(token, "base64url").toString());
+    const timestamp = new Date(decoded.t);
+    if (
+      Number.isNaN(timestamp.getTime()) ||
+      // The id is cast to ::uuid in SQL — validate here so a malformed token
+      // is a clean -32602 instead of a database error.
+      !z.uuid().safeParse(decoded.id).success
+    ) {
+      throw new Error("malformed");
+    }
+    return { stateChangedAt: timestamp, id: decoded.id };
+  } catch {
+    throw new A2AError(A2AErrorKind.InvalidPageToken);
+  }
+}
+
+/** Why a webhook URL was refused, phrased for the caller. */
+const PUSH_URL_REJECTION_DETAIL: Record<OutboundUrlRejection, string> = {
+  not_a_url: "the url is not a valid absolute URL",
+  scheme_not_https: "the url must use https",
+  userinfo_not_allowed: "the url must not contain embedded user credentials",
+  private_or_loopback_host:
+    "the url must not point at a private or loopback address",
+};
+
+/** Protocol shape of a stored config. Credentials are deliberately omitted. */
+function toProtocolPushConfig(config: {
+  id: string;
+  taskId: string;
+  url: string;
+  token: string | null;
+  authScheme: string | null;
+}): A2AProtocolTaskPushNotificationConfig {
+  return {
+    taskId: config.taskId,
+    pushNotificationConfig: {
+      id: config.id,
+      url: config.url,
+      ...(config.token ? { token: config.token } : {}),
+      ...(config.authScheme
+        ? { authentication: { scheme: config.authScheme } }
+        : {}),
+    },
+  };
 }
 
 function extractApprovalRequestsFromUiMessage(
@@ -610,6 +1987,7 @@ function extractApprovalRequestsFromUiMessage(
     state: string;
     type: string;
     toolCallId: string;
+    input?: unknown;
   }[];
   for (const part of parts) {
     if (
@@ -621,6 +1999,15 @@ function extractApprovalRequestsFromUiMessage(
         approvalId: part.approval.id,
         toolCallId: part.toolCallId,
         toolName: part.type.substring("tool-".length),
+        // The tool call's arguments, carried so approval prompts can describe
+        // what the tool will do (and unwrap a `run_tool` dispatch to its real
+        // target). Only an object input is meaningful here.
+        toolInput:
+          typeof part.input === "object" &&
+          part.input !== null &&
+          !Array.isArray(part.input)
+            ? (part.input as Record<string, unknown>)
+            : undefined,
         approved: Boolean(part.approval?.approved),
         resolved: part.state === "approval-responded",
       });

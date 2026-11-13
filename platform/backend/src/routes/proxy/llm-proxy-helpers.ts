@@ -1,3 +1,21 @@
+import {
+  priceBillingUsage,
+  resolvePricingQuote,
+} from "@/services/billable-usage";
+import { ThroughputError } from "@/services/llm-throughput";
+import type { AutoRoutingRequestContext } from "@/types/auto-routing";
+import { asRecord } from "@/utils/as-record";
+import {
+  type BillingAttribution,
+  componentCacheCosts,
+  type PricedBillingUsage,
+  type PricedComponent,
+  priceTokens,
+  type QuotedPrices,
+  sumMoney,
+} from "@/utils/billable-usage";
+import { withMediaUsageAvailability } from "@/utils/media-usage";
+import { ObservedProviderUsageError } from "@/utils/observed-provider-usage-error";
 /**
  * LLM Proxy Helpers
  *
@@ -5,31 +23,57 @@
  * duplication between streaming and non-streaming code paths.
  */
 
-import { context as otelContext } from "@opentelemetry/api";
 import {
   ApiError,
-  type ArchestraInternalErrorCode,
+  ArchestraInternalErrorCode,
+  type BillingMode,
   type InteractionSource,
+  isAlwaysExposedArchestraToolShortName,
+  MCP_SERVER_TOOL_NAME_SEPARATOR,
   type SupportedProvider,
   type SupportedProviderDiscriminator,
-} from "@shared";
+  TOOL_RUN_TOOL_SHORT_NAME,
+  TOOL_SEARCH_TOOLS_SHORT_NAME,
+} from "@archestra/shared";
+import { context as otelContext } from "@opentelemetry/api";
 import type { FastifyReply } from "fastify";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
+import {
+  resolveRunToolDispatch,
+  resolveRunToolTarget,
+  resolveRunToolTargetName,
+} from "@/archestra-mcp-server/run-tool-target";
+import { isNativeAnthropicModelShape } from "@/clients/anthropic-endpoint";
 import logger from "@/logging";
 import { metrics } from "@/observability";
+import type { ProxyRequestFailure } from "@/observability/llm-proxy-request";
 import { SESSION_ID_KEY } from "@/observability/request-context";
-import type { SpanUserInfo } from "@/observability/tracing";
+import type { SpanTeamInfo, SpanUserInfo } from "@/observability/tracing";
+import { toolCallArgumentsText } from "@/openappa/tool-call-arguments";
+import type { LlmProxyToolCallRefusal } from "@/proxy/plugins/registry";
+import { getTokenizer } from "@/tokenizers";
 import type {
-  Agent,
-  DualLlmAnalysis,
+  CommonMcpToolDefinition,
+  GatewayAgent,
   InsertInteraction,
   InteractionAuthMethod,
   InteractionRequest,
   InteractionResponse,
-  ToolCompressionStats,
-  ToonSkipReason,
-  UnsafeContextBoundary,
+  ToolCallBlock,
+  UsageView,
 } from "@/types";
+import {
+  collectErrorCodes,
+  isConnectionErrno,
+  isTimeoutErrno,
+} from "@/utils/network-errors";
 import * as utils from "./utils";
+import { estimateToolTokens } from "./utils/cost-optimization";
+import {
+  FOREIGN_TOOL_NAME_PREFIX,
+  type GatewayToolIdentity,
+  type ToolNameResolution,
+} from "./utils/gateway-tool-names";
 import type { SessionSource } from "./utils/headers/session-id";
 
 /**
@@ -43,56 +87,588 @@ export function toSpanUserInfo(
 }
 
 /**
+ * Whether to forward the inbound `anthropic-beta` header to the upstream.
+ *
+ * The Anthropic SDK auto-adds beta flags (e.g. `pdfs-2024-09-25`) that are
+ * proprietary to genuine Anthropic. An Anthropic-compatible endpoint (a custom
+ * base URL serving a non-Claude model) rejects them with a turn-0 400. Forward
+ * for real Anthropic (no base-URL override) and for Claude proxied behind a
+ * custom URL (model name still reads `claude`); strip otherwise.
+ */
+export function shouldForwardAnthropicBeta(
+  model: string,
+  baseUrlOverridden: boolean,
+): boolean {
+  return isNativeAnthropicModelShape(model, baseUrlOverridden);
+}
+
+/**
  * Normalize tool calls from either streaming or non-streaming responses
- * into the shape expected by `evaluatePolicies`.
+ * into the shape OpenAPPA rules on.
  *
  * - String arguments: validated as JSON, wrapped in `{ raw: ... }` if invalid
  * - Object arguments: serialized with JSON.stringify
+ * - Names and namespaces are canonicalized to platform tool names.
+ * - `run_tool` dispatches unwrap to their target tools so policies evaluate
+ *   the executing tool rather than the wrapper.
+ *
+ * `resolution` defaults to wire names with strict dispatch matching.
+ * Wrappers recognized by compatibility scanning are also unwrapped.
  */
 export function normalizeToolCallsForPolicy(
-  toolCalls: Array<{ name: string; arguments: string | object }>,
-): Array<{ toolCallName: string; toolCallArgs: string }> {
+  toolCalls: Array<{
+    name: string;
+    arguments: string | object;
+    namespace?: string;
+  }>,
+  resolution: ToolNameResolution = SPELLED_RESOLUTION,
+): Array<{
+  toolCallName: string;
+  toolCallArgs: string;
+  isRunToolDispatchTarget?: boolean;
+  isNativeDispatchTarget?: boolean;
+}> {
   return toolCalls.map((tc) => {
+    const nativeDispatch = resolution.nativeDispatch?.(tc);
+    if (nativeDispatch)
+      return { ...nativeDispatch, isNativeDispatchTarget: true };
+    let args: unknown;
     let argsString: string;
     if (typeof tc.arguments === "string") {
+      const text = toolCallArgumentsText(tc.arguments);
       try {
-        JSON.parse(tc.arguments);
-        argsString = tc.arguments;
+        args = JSON.parse(text);
+        argsString = text;
       } catch {
+        args = undefined;
         argsString = JSON.stringify({ raw: tc.arguments });
       }
     } else {
+      args = tc.arguments;
       argsString = JSON.stringify(tc.arguments);
     }
-    return { toolCallName: tc.name, toolCallArgs: argsString };
+
+    const canonicalName = resolution.canonicalize(tc.name, tc.namespace);
+    const dispatchCall = {
+      toolName: canonicalName,
+      args,
+      loose: resolution.looseRunToolDispatch,
+    };
+    const dispatch = resolveRunToolDispatch(dispatchCall);
+    if (dispatch.kind === "target") {
+      const { toolInput } = resolveRunToolTarget(dispatchCall);
+      return {
+        toolCallName: dispatch.toolName,
+        toolCallArgs: JSON.stringify(toolInput),
+        isRunToolDispatchTarget: true,
+      };
+    }
+    return { toolCallName: canonicalName, toolCallArgs: argsString };
   });
 }
 
 /**
- * Calculate both baseline and actual costs for an interaction.
+ * A tool call as the stream/response adapters accumulate it, in the shape
+ * {@link planDispatchModeToolCallRewrites} reads and rewrites.
+ */
+export interface AccumulatedToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+  /** The namespace the model called the tool in, on a wire that has them. */
+  namespace?: string;
+  /**
+   * The id the client is given for this call when it is not the provider's:
+   * OpenAPPA's trajectory stamp. Matching against the provider's response
+   * stays on `id`; only what is written to the client changes.
+   */
+  wireId?: string;
+  /** Server-generated review to emit as text immediately before this call. */
+  reviewDetails?: string;
+}
+
+/**
+ * Rewrite a dispatch-mode agent's *direct* tool calls into `run_tool` calls.
+ *
+ * In `search_and_run_only` exposure (which Auto tool mode implies) every
+ * third-party tool — and the app-authoring built-ins along with them — is
+ * reachable through `run_tool` but deliberately absent from the request's tool
+ * list. When the model calls one directly — which it does routinely, because it
+ * learned the exact name from `search_tools`, a skill body, the system prompt,
+ * or its own earlier turn — the name is not in `enabledToolNames` and the
+ * guardrail drops the whole batch, ending the turn with a steer the user reads
+ * as an assistant message. The tool was never unreachable; only the calling
+ * convention was wrong.
+ *
+ * So repair the convention instead of refusing: re-address the call to
+ * `run_tool` with the model's own name and arguments moved into `tool_name` /
+ * `tool_args`. Nothing about enforcement changes — `normalizeToolCallsForPolicy`
+ * unwraps the rewritten call straight back to the same target, so it is policy-
+ * evaluated exactly like a `run_tool` dispatch the model had written itself.
+ *
+ * Rewritten calls target `run_tool` using the declared client spelling and namespace.
+ * `toolIdentity` defaults to wire spellings.
+ *
+ * When a model copies client prefixes onto names returned by `search_tools`
+ * (such as `mcp__<label>__<tool>`, `<label>_<tool>`, or Codex namespaces),
+ * `run_tool` expects the undecorated target name. Verified `run_tool` attestations
+ * identify the client prefix so the proxy can remove it before dispatch.
+ * Plugins still rule on the target tool identity.
+ *
+ * Returns `null` when there is nothing to do — no dispatch pair in the tool
+ * list (`full` exposure, where a missing tool really is disabled), or every
+ * call already directly callable — so callers keep the untouched raw events.
+ *
+ * The call's `id` is preserved: the client correlates its tool result by id,
+ * and the rewrite must be invisible to that bookkeeping.
+ */
+export function planDispatchModeToolCallRewrites(params: {
+  toolCalls: AccumulatedToolCall[];
+  enabledToolNames: Set<string>;
+  toolIdentity?: Pick<
+    GatewayToolIdentity,
+    "canonicalize" | "spellingOf" | "attestationOf"
+  >;
+}): AccumulatedToolCall[] | null {
+  const { toolCalls, enabledToolNames } = params;
+  const toolIdentity = params.toolIdentity ?? SPELLED_IDENTITY;
+
+  const runToolName = findRunToolName(enabledToolNames);
+  const runTool = runToolName ? toolIdentity.spellingOf(runToolName) : null;
+  if (!runTool || !hasSearchToolsName(enabledToolNames)) {
+    return null;
+  }
+  const decoration = provenDecoration(
+    runTool,
+    toolIdentity.attestationOf(runTool.name, runTool.namespace),
+  );
+
+  let rewroteAny = false;
+  const rewritten = toolCalls.map((toolCall) => {
+    const canonicalName = toolIdentity.canonicalize(
+      toolCall.name,
+      toolCall.namespace,
+    );
+
+    // Already callable, or one of the built-ins that stay top-level in every
+    // exposure mode (`run_tool` itself included — a genuine dispatch must not
+    // be wrapped a second time).
+    if (
+      isAlwaysDirectlyCallableBuiltIn(canonicalName) ||
+      enabledToolNames.has(canonicalName)
+    ) {
+      return toolCall;
+    }
+
+    // Undeclared tools receive a foreign prefix only when matching built-in names.
+    // This prefix prevents lookalikes from assuming platform identities.
+    // The target name passes to `run_tool` without client decoration.
+    const targetName =
+      undecorated(toolCall, decoration) ??
+      (canonicalName.startsWith(FOREIGN_TOOL_NAME_PREFIX)
+        ? spelledName(toolCall.name, toolCall.namespace)
+        : canonicalName);
+
+    // `run_tool` expands a bare Archestra short name to its built-in
+    // (`read_file` -> `archestra__read_file`). A third-party tool whose
+    // unprefixed name collides with one of those would therefore come out of
+    // the wrapper as a DIFFERENT tool than the model asked for — and a
+    // policy-bypassed built-in at that. Refusing such a call is the safe
+    // outcome; silently retargeting it is not.
+    if (resolveRunToolTargetName(targetName) !== targetName) {
+      return toolCall;
+    }
+
+    // Arguments the model did not emit as a JSON object cannot be re-wrapped
+    // faithfully — `tool_args` has to be that object. Leave the call alone and
+    // let the guardrail refuse it with the existing steer rather than invent a
+    // shape and dispatch something the model did not ask for.
+    let toolArgs: unknown;
+    try {
+      toolArgs = JSON.parse(toolCallArgumentsText(toolCall.arguments));
+    } catch {
+      return toolCall;
+    }
+    if (
+      typeof toolArgs !== "object" ||
+      toolArgs === null ||
+      Array.isArray(toolArgs)
+    ) {
+      return toolCall;
+    }
+
+    rewroteAny = true;
+    return {
+      id: toolCall.id,
+      name: runTool.name,
+      ...(runTool.namespace ? { namespace: runTool.namespace } : {}),
+      arguments: JSON.stringify({
+        tool_name: targetName,
+        tool_args: toolArgs,
+      }),
+    };
+  });
+
+  return rewroteAny ? rewritten : null;
+}
+
+function findRunToolName(declaredToolNames: Set<string>): string | null {
+  for (const name of declaredToolNames) {
+    if (
+      archestraMcpBranding.getToolShortName(name) === TOOL_RUN_TOOL_SHORT_NAME
+    ) {
+      return name;
+    }
+  }
+  return null;
+}
+
+function hasSearchToolsName(declaredToolNames: Set<string>): boolean {
+  for (const name of declaredToolNames) {
+    if (
+      archestraMcpBranding.getToolShortName(name) ===
+      TOOL_SEARCH_TOOLS_SHORT_NAME
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * True for the built-ins that `filterExposedTools` keeps top-level whatever the
+ * agent's exposure mode — the search_tools/run_tool pair and the always-exposed
+ * skill/sandbox/persistent-file surface.
+ *
+ * Deliberately narrower than `archestraMcpBranding.isToolName`. Not every
+ * built-in is directly callable: under `search_and_run_only` the app-authoring
+ * surface (`read_app`, `edit_app`, `render_app`, `list_apps`, …) is hidden from
+ * the tool list on purpose and reached through `run_tool`, exactly like a
+ * third-party tool. Exempting *every* built-in from the repair therefore
+ * skipped the one group that most needs it: a direct call to a hidden app tool
+ * was neither rewritten here nor refused by the guardrail (which applies the
+ * same built-in exemption), so it reached the caller as a name the caller never
+ * declared and died there as an unknown-tool error the model had to recover
+ * from on its own.
+ */
+function isAlwaysDirectlyCallableBuiltIn(toolName: string): boolean {
+  const shortName = archestraMcpBranding.getToolShortName(toolName);
+  if (shortName === null) {
+    return false;
+  }
+  return (
+    shortName === TOOL_SEARCH_TOOLS_SHORT_NAME ||
+    shortName === TOOL_RUN_TOOL_SHORT_NAME ||
+    isAlwaysExposedArchestraToolShortName(shortName)
+  );
+}
+
+/**
+ * The cost recorded for a response: what the provider says it billed when it
+ * reports one (OpenRouter does on every response), otherwise the all-in cost
+ * of every billed component at the request's quote, with any missing rate
+ * estimated.
+ */
+export async function calculateUsageCost(params: {
+  model: string;
+  usage: UsageView;
+  provider: SupportedProvider;
+  providerApiKeyId?: string;
+  billingEndpoint?: "fireworks" | "other";
+  requestedModel?: string;
+}): Promise<number | undefined> {
+  const { model, usage, provider } = params;
+  if (usage.usageUnavailable || usage.costUnavailable) return undefined;
+  return Number(
+    (
+      await priceBillingUsage({
+        model,
+        usage,
+        provider,
+        mode: "enforce",
+        providerApiKeyId: params.providerApiKeyId,
+        billingEndpoint: params.billingEndpoint,
+        requestedModel: params.requestedModel,
+      })
+    ).cost,
+  );
+}
+
+/** The model a request is compared against, and what it would have cost there. */
+export interface InteractionBaseline {
+  model: string;
+  cost: string;
+}
+
+/**
+ * Calculate the costs recorded on an interaction, and the settled usage that
+ * charges its budgets.
  */
 export async function calculateInteractionCosts(params: {
-  baselineModel: string;
   actualModel: string;
-  usage: { inputTokens: number; outputTokens: number };
+  usage: UsageView;
   providerName: SupportedProvider;
+  providerApiKeyId?: string;
+  billingEndpoint?: "fireworks" | "other";
+  requestedModel?: string;
+  autoRouting?: AutoRoutingRequestContext;
 }): Promise<{
-  baselineCost: number | undefined;
+  billingUsage?: PricedBillingUsage;
   actualCost: number | undefined;
+  cacheCost: number | undefined;
+  cacheSavings: number | undefined;
+  cacheReadSavings: number | undefined;
+  baseline?: InteractionBaseline;
 }> {
-  const baselineCost = await utils.costOptimization.calculateCost(
-    params.baselineModel,
-    params.usage.inputTokens,
-    params.usage.outputTokens,
-    params.providerName,
+  if (params.usage.usageUnavailable || params.usage.costUnavailable) {
+    return {
+      actualCost: undefined,
+      cacheCost: undefined,
+      cacheSavings: undefined,
+      cacheReadSavings: undefined,
+    };
+  }
+  const billingUsage = await priceBillingUsage({
+    model: params.actualModel,
+    usage: params.usage,
+    provider: params.providerName,
+    mode: "enforce",
+    providerApiKeyId: params.providerApiKeyId,
+    billingEndpoint: params.billingEndpoint,
+    requestedModel: params.requestedModel,
+  });
+  const actualCost = Number(billingUsage.cost);
+  const componentsCache = billingUsage.components.map(componentCacheCosts);
+  const smartCost = params.autoRouting
+    ? await smartBaselineCost({
+        smart: params.autoRouting.smartModel,
+        usage: params.usage,
+        billingUsage,
+      })
+    : null;
+  const cached =
+    (params.usage.cacheReadTokens ?? 0) > 0 ||
+    (params.usage.cacheWriteTokens ?? 0) > 0;
+  const total = (key: keyof (typeof componentsCache)[number]) =>
+    componentsCache.reduce((sum, item) => sum + item[key], 0);
+  return {
+    billingUsage,
+    actualCost,
+    // A request that used no cache records no cache figures.
+    cacheCost: cached ? total("cacheCost") : undefined,
+    cacheSavings: cached ? total("cacheSavings") : undefined,
+    cacheReadSavings: cached ? total("cacheReadSavings") : undefined,
+    ...(params.autoRouting && smartCost !== null
+      ? {
+          baseline: {
+            model: params.autoRouting.smartModel.modelId,
+            cost: smartCost,
+          },
+        }
+      : {}),
+  };
+}
+
+/**
+ * What a routed request would have cost on the smart tier, on the same usage.
+ * Only the executor's components are repriced, whatever model
+ * id the provider reported for them; advisor components keep their own prices.
+ * Null when the smart tier has no configured or synced price for that usage.
+ */
+async function smartBaselineCost(params: {
+  smart: AutoRoutingRequestContext["smartModel"];
+  usage: UsageView;
+  billingUsage: PricedBillingUsage;
+}): Promise<string | null> {
+  const { smart, usage, billingUsage } = params;
+  const routed = billingUsage.components
+    .filter(servedByExecutor)
+    .map((item) => ({
+      id: item.id,
+      kind: item.kind,
+      model: smart.modelId,
+      inputTokens: item.inputTokens,
+      outputTokens: item.outputTokens,
+      cacheReadTokens: item.cacheReadTokens,
+      cacheWriteTokens: item.cacheWriteTokens,
+      cacheWrite1hTokens: item.cacheWrite1hTokens,
+    }));
+  const quote = await resolvePricingQuote({
+    model: smart.modelId,
+    provider: smart.provider,
+    providerApiKeyId: smart.providerApiKeyId,
+    usage: {
+      ...usage,
+      billingQuote: undefined,
+      billingUsage: {
+        version: 1,
+        status: billingUsage.status,
+        issues: [],
+        components: routed,
+      },
+    },
+  });
+  const costs: string[] = [];
+  for (const component of billingUsage.components) {
+    const quoted = servedByExecutor(component)
+      ? quote.components.get(component.id)
+      : undefined;
+    if (!quoted) {
+      costs.push(component.cost);
+      continue;
+    }
+    if (!smartPriceKnown(quoted, component)) return null;
+    costs.push(priceTokens(component, quoted.prices));
+  }
+  return sumMoney(costs);
+}
+
+/** The routed tier ran it: everything but an advisor's turns. */
+function servedByExecutor(component: Pick<PricedComponent, "kind">): boolean {
+  return component.kind !== "advisor_message";
+}
+
+function smartPriceKnown(
+  quoted: QuotedPrices,
+  tokens: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    cacheWrite1hTokens: number;
+  },
+): boolean {
+  const { prices } = quoted;
+  return (
+    prices.source !== "default" &&
+    !(
+      (tokens.inputTokens > 0 && prices.input === null) ||
+      (tokens.outputTokens > 0 && prices.output === null) ||
+      (tokens.cacheReadTokens > 0 && prices.cacheRead === null) ||
+      (tokens.cacheWriteTokens > tokens.cacheWrite1hTokens &&
+        prices.cacheWrite === null) ||
+      (tokens.cacheWrite1hTokens > 0 && prices.cacheWrite1h === null)
+    )
   );
-  const actualCost = await utils.costOptimization.calculateCost(
-    params.actualModel,
-    params.usage.inputTokens,
-    params.usage.outputTokens,
-    params.providerName,
+}
+
+/**
+ * Some Anthropic-compatible endpoints (a non-Claude model behind a custom base
+ * URL) report `input_tokens: 0` even for a non-empty prompt, which would zero out
+ * this request's input-token cost and usage-limit accounting. When usage shows zero
+ * uncached input yet produced output, and no cache tokens explain the zero, replace
+ * `inputTokens` with a local estimate and mark the row estimated.
+ *
+ * Intentionally provider-agnostic: a zero-input-with-output response for a non-empty
+ * request is a provider accounting bug regardless of vendor, and the estimate is the
+ * right remedy for all of them. The normal path (any non-zero input, or a legitimately
+ * fully-cached prompt) returns untouched and is never tokenized. Estimation is
+ * best-effort: any failure degrades to the provider's (zero) value rather than
+ * breaking interaction recording.
+ */
+export function applyInputTokenFallback(params: {
+  usage: UsageView;
+  provider: SupportedProvider;
+  providerMessages: unknown;
+  tools: CommonMcpToolDefinition[];
+  model: string;
+}): UsageView {
+  const { usage } = params;
+  if (usage.usageUnavailable || usage.costUnavailable) return usage;
+  const hasCacheTokens =
+    (usage.cacheReadTokens ?? 0) !== 0 ||
+    (usage.cacheWriteTokens ?? 0) !== 0 ||
+    (usage.cacheWrite1hTokens ?? 0) !== 0;
+  if (usage.inputTokens !== 0 || usage.outputTokens <= 0 || hasCacheTokens) {
+    return usage;
+  }
+
+  let estimatedInputTokens: number;
+  try {
+    estimatedInputTokens = estimateRequestInputTokens({
+      provider: params.provider,
+      providerMessages: params.providerMessages,
+      tools: params.tools,
+    });
+  } catch (error) {
+    // An unexpected message shape must not break interaction recording — fall back
+    // to the provider's value (zero input) and surface the failure for triage.
+    logger.warn(
+      { err: error, provider: params.provider, model: params.model },
+      "Failed to estimate input tokens for a zero-input response; leaving it unrecorded",
+    );
+    return usage;
+  }
+  if (estimatedInputTokens <= 0) {
+    return usage;
+  }
+
+  logger.warn(
+    {
+      provider: params.provider,
+      model: params.model,
+      estimatedInputTokens,
+      outputTokens: usage.outputTokens,
+    },
+    "Provider reported 0 input tokens for a non-empty request; recording a local estimate",
   );
-  return { baselineCost, actualCost };
+  return {
+    ...usage,
+    inputTokens: estimatedInputTokens,
+    inputTokensEstimated: true,
+    billingQuote: undefined,
+    ...(usage.billingUsage
+      ? {
+          billingUsage: {
+            ...usage.billingUsage,
+            status: "incomplete" as const,
+            issues: [...usage.billingUsage.issues, "estimated_input_tokens"],
+          },
+        }
+      : {}),
+  };
+}
+
+/**
+ * The input a pool member we stopped waiting on is likely billed for, priced
+ * as that member. Marked estimated on the row; undefined when the prompt can't
+ * be counted, so recording the attempt never fails on it.
+ */
+export async function estimateCutOffAttemptUsage(params: {
+  /** The request's own wire, whose message shape the tokenizer reads. */
+  provider: SupportedProvider;
+  providerMessages: unknown;
+  tools: CommonMcpToolDefinition[];
+  member: {
+    provider?: SupportedProvider;
+    modelId?: string;
+    providerApiKeyId?: string;
+    billingEndpoint?: "fireworks" | "other";
+    requestedModel?: string;
+  };
+}): Promise<{ inputTokens: number; cost: string | null } | undefined> {
+  const { member } = params;
+  if (!member.provider || !member.modelId) return undefined;
+  let inputTokens: number;
+  try {
+    inputTokens = estimateRequestInputTokens(params);
+  } catch (error) {
+    logger.warn(
+      { err: error, provider: params.provider, model: member.modelId },
+      "Failed to estimate the input of a cut-off model pool attempt",
+    );
+    return undefined;
+  }
+  if (inputTokens <= 0) return undefined;
+  const cost = await calculateUsageCost({
+    model: member.modelId,
+    usage: { inputTokens, outputTokens: 0 },
+    provider: member.provider,
+    providerApiKeyId: member.providerApiKeyId,
+    billingEndpoint: member.billingEndpoint,
+    requestedModel: member.requestedModel,
+  });
+  return { inputTokens, cost: cost?.toFixed(10) ?? null };
 }
 
 /**
@@ -100,17 +676,24 @@ export async function calculateInteractionCosts(params: {
  * Pure function — callers handle `InteractionModel.create()` and error handling.
  */
 export function buildInteractionRecord(params: {
-  agent: Agent;
+  agent: GatewayAgent;
+  billingAttribution?: BillingAttribution;
   externalAgentId?: string;
   authMethod?: InteractionAuthMethod;
+  billingMode: BillingMode;
   authenticatedApp?: {
     id: string;
     name: string;
     clientId: string;
   };
-  executionId?: string;
+  billingTeamId?: string;
+  runId?: string;
   userId?: string;
+  serviceAccountId?: string;
   virtualKeyId?: string;
+  passthroughVirtualKeyId?: string;
+  /** MCP App whose runtime made this call; only app-runtime completions set it. */
+  appId?: string;
   sessionId?: string | null;
   sessionSource?: SessionSource;
   source?: InteractionSource | null;
@@ -119,66 +702,158 @@ export function buildInteractionRecord(params: {
   processedRequest: unknown;
   response: unknown;
   actualModel: string;
-  baselineModel: string;
-  usage: { inputTokens: number; outputTokens: number };
-  costs: { baselineCost: number | undefined; actualCost: number | undefined };
-  toonStats: ToolCompressionStats;
-  toonSkipReason: ToonSkipReason | null;
-  dualLlmAnalyses: DualLlmAnalysis[];
-  unsafeContextBoundary?: UnsafeContextBoundary;
+  usage: UsageView;
+  costs: {
+    billingUsage?: PricedBillingUsage;
+    actualCost: number | undefined;
+    cacheCost: number | undefined;
+    cacheSavings: number | undefined;
+    baseline?: InteractionBaseline;
+  };
+  toolCallBlock?: ToolCallBlock;
 }): InsertInteraction {
   return {
     profileId: params.agent.id,
+    environmentId: params.billingAttribution?.environmentId,
+    billingAttribution: params.billingAttribution,
+    billingUsage: params.costs.billingUsage,
     externalAgentId: params.externalAgentId,
     authMethod: params.authMethod,
+    billingMode: params.billingMode,
     authenticatedAppId: params.authenticatedApp?.id,
     authenticatedAppName: params.authenticatedApp?.name,
-    executionId: params.executionId,
+    billingTeamId: params.billingTeamId,
+    runId: params.runId,
     userId: params.userId,
+    serviceAccountId: params.serviceAccountId,
     virtualKeyId: params.virtualKeyId,
+    passthroughVirtualKeyId: params.passthroughVirtualKeyId,
+    appId: params.appId,
     sessionId: params.sessionId,
     sessionSource: params.sessionSource,
     source: params.source,
     type: params.providerType,
     request: params.request as InteractionRequest,
     processedRequest: params.processedRequest as InteractionRequest,
-    response: params.response as InteractionResponse,
-    dualLlmAnalyses: params.dualLlmAnalyses,
-    unsafeContextBoundary: params.unsafeContextBoundary,
+    response: withMediaUsageAvailability(
+      params.response,
+      params.usage,
+    ) as InteractionResponse,
+    toolCallBlock: params.toolCallBlock,
     model: params.actualModel,
-    baselineModel: params.baselineModel,
-    inputTokens: params.usage.inputTokens,
-    outputTokens: params.usage.outputTokens,
-    cost: params.costs.actualCost?.toFixed(10) ?? null,
-    baselineCost: params.costs.baselineCost?.toFixed(10) ?? null,
-    toonTokensBefore: params.toonStats.tokensBefore,
-    toonTokensAfter: params.toonStats.tokensAfter,
-    toonCostSavings: params.toonStats.costSavings?.toFixed(10) ?? null,
-    toonSkipReason: params.toonSkipReason,
+    // An auto-routed request is compared against its smart tier. Otherwise the
+    // baseline is the model actually used, so the savings statistics, which
+    // read `baseline_cost - cost`, report no saving instead of a negative one.
+    baselineModel: params.costs.baseline?.model ?? params.actualModel,
+    inputTokens: params.usage.usageUnavailable
+      ? null
+      : params.usage.inputTokens,
+    inputTokensEstimated: params.usage.inputTokensEstimated ?? false,
+    outputTokens: params.usage.usageUnavailable
+      ? null
+      : params.usage.outputTokens,
+    cacheReadTokens: params.usage.cacheReadTokens ?? null,
+    cacheWriteTokens: params.usage.cacheWriteTokens ?? null,
+    cacheWrite1hTokens: params.usage.cacheWrite1hTokens ?? null,
+    cost:
+      params.costs.billingUsage?.mode === "enforce"
+        ? params.costs.billingUsage.cost
+        : (params.costs.actualCost?.toFixed(10) ?? null),
+    baselineCost:
+      params.costs.baseline?.cost ??
+      (params.costs.billingUsage?.mode === "enforce"
+        ? params.costs.billingUsage.cost
+        : (params.costs.actualCost?.toFixed(10) ?? null)),
+    cacheCost: params.costs.cacheCost?.toFixed(10) ?? null,
+    cacheSavings: params.costs.cacheSavings?.toFixed(10) ?? null,
   };
 }
 
 /**
- * Record OTEL spans and Prometheus metrics for blocked tool calls.
- * Used by both streaming and non-streaming paths when tool invocation
- * policies refuse tool calls.
+ * Restores original provider tool-call IDs for interaction logging.
+ * Replaces proxy trajectory stamps (`wireId`) with provider call IDs, ensuring
+ * logged requests and responses match across turns.
  */
+export function withProviderToolCallIds<T>(
+  response: T,
+  toolCalls: readonly { id: string; wireId?: string }[],
+): T {
+  const providerIds = new Map(
+    toolCalls.flatMap((call) =>
+      call.wireId && call.wireId !== call.id
+        ? [[call.wireId, call.id] as const]
+        : [],
+    ),
+  );
+  if (providerIds.size === 0) return response;
+  const restore = (value: unknown): unknown => {
+    if (typeof value === "string") return providerIds.get(value) ?? value;
+    if (Array.isArray(value)) return value.map(restore);
+    if (typeof value === "object" && value !== null)
+      return Object.fromEntries(
+        Object.entries(value).map(([key, entry]) => [key, restore(entry)]),
+      );
+    return value;
+  };
+  return restore(response) as T;
+}
+
+/**
+ * Record OTEL spans and Prometheus metrics for blocked tool calls.
+ * Used by both streaming and non-streaming paths when guardrails refuse
+ * tool calls.
+ */
+/**
+ * The row-level marker for a turn whose tool calls a guardrail refused.
+ *
+ * A refusal is otherwise persisted as an ordinary assistant turn — normal
+ * finish reason, no error field — so nothing on the row separates it from a
+ * healthy one. That is invisible exactly where it costs most: an unattended
+ * agent whose correct output is sometimes nothing looks identical whether it
+ * did the work or was cut off mid-turn. Spans and the blocked-tool counter
+ * already carry the event, but neither can be joined to a session's rows after
+ * the fact, which is what triaging one of these actually requires.
+ *
+ * A turn that still runs can have calls replaced by denial notices; those
+ * count too. Returns undefined when nothing was blocked, so the column stays
+ * NULL on the overwhelming majority of rows.
+ */
+export function toToolCallBlock(
+  refusal: LlmProxyToolCallRefusal | null,
+  blocked: readonly { reason: string }[],
+): ToolCallBlock | undefined {
+  if (refusal) {
+    return {
+      reason: refusal.reason,
+      blockedToolCallCount: refusal.allToolCallNames.length,
+    };
+  }
+  if (blocked.length === 0) return undefined;
+  return {
+    reason: [...new Set(blocked.map((call) => call.reason))].join("\n"),
+    blockedToolCallCount: blocked.length,
+  };
+}
+
 export function recordBlockedToolCallMetrics(params: {
   allToolCallNames: string[];
   reason: string;
-  agent: Agent;
+  agent: GatewayAgent;
+  teams?: SpanTeamInfo[];
+  userTeams?: SpanTeamInfo[];
   sessionId?: string | null;
   resolvedUser?: { id: string; email: string; name: string } | null;
   providerName: SupportedProvider;
   toolCallCount: number;
   actualModel: string;
   source: InteractionSource;
-  externalAgentId?: string;
 }): void {
   utils.tracing.recordBlockedToolSpans({
     toolCallNames: params.allToolCallNames,
     blockedReason: params.reason,
     agent: params.agent,
+    teams: params.teams,
+    userTeams: params.userTeams,
     sessionId: params.sessionId,
     agentType: params.agent.agentType ?? undefined,
     user: toSpanUserInfo(params.resolvedUser),
@@ -191,7 +866,6 @@ export function recordBlockedToolCallMetrics(params: {
       params.toolCallCount,
       params.actualModel,
       params.source,
-      params.externalAgentId,
     ),
   );
 }
@@ -210,6 +884,149 @@ export function withSessionContext<T>(
   return otelContext.with(ctx, fn);
 }
 
+/**
+ * The error message the proxy records and reports for an upstream failure:
+ * a transport failure's own description (see classifyUpstreamTransportFailure),
+ * else what the provider adapter extracts from the error.
+ */
+export function upstreamErrorMessage(
+  error: unknown,
+  extractErrorMessage: (error: unknown) => string,
+): string {
+  if (explicitHttpStatus(error) === undefined && !isClientAbortError(error)) {
+    const transportFailure = classifyUpstreamTransportFailure(error);
+    if (transportFailure) return transportFailure.message;
+  }
+  return extractErrorMessage(error);
+}
+
+/**
+ * Why a model pool should move this request to its next member, or undefined
+ * when the failure would recur on any member (a bad request, a content
+ * filter) or nobody waits for the answer. Rate limits, overload, server
+ * errors, timeouts and unreachable upstreams are member-local, and so are a
+ * member's rejected credential (401/403) and a model it does not serve (404).
+ */
+export function poolFailoverReason(
+  error: unknown,
+  provider?: SupportedProvider,
+): { reason: string; status: number; retryAfterMs?: number } | undefined {
+  if (error instanceof ObservedProviderUsageError) return undefined;
+  if (error instanceof ApiError || isClientAbortError(error)) return undefined;
+  const status =
+    explicitHttpStatus(error) ?? classifyTransientUpstreamError(error);
+  if (status === undefined) return undefined;
+  // Credit exhaustion is not a transient rate limit. Match structured quota
+  // codes and Anthropic's specific balance refusal, never arbitrary 400 text.
+  const payload = asRecord(asRecord(error)?.error);
+  const detail = asRecord(payload?.error) ?? payload;
+  const codes = [detail?.code, detail?.type, asRecord(error)?.code];
+  const creditExhausted =
+    status === 402 ||
+    (status === 429 && codes.includes("insufficient_quota")) ||
+    (status === 400 &&
+      provider === "anthropic" &&
+      typeof detail?.message === "string" &&
+      /^your credit balance is too low\b/i.test(detail.message.trim()));
+  if (creditExhausted)
+    return { reason: `credit_exhausted (${status})`, status };
+  const failsOver =
+    status === 401 ||
+    status === 403 ||
+    status === 404 ||
+    status === 408 ||
+    status === 429 ||
+    status >= 500;
+  if (!failsOver) return undefined;
+  const retryAfter = extractRetryAfterHeader(error);
+  const retryAfterMs =
+    retryAfter === undefined
+      ? undefined
+      : /^\d+$/.test(retryAfter)
+        ? Number(retryAfter) * 1000
+        : Math.max(0, Date.parse(retryAfter) - Date.now());
+  const reason =
+    status === 429
+      ? "rate_limited"
+      : status === 401 || status === 403
+        ? "auth_failed"
+        : status === 404
+          ? "model_not_found"
+          : status === 408 || status === 504
+            ? "timeout"
+            : explicitHttpStatus(error) === undefined
+              ? "unreachable"
+              : "server_error";
+  return { reason: `${reason} (${status})`, status, retryAfterMs };
+}
+
+/**
+ * Identifies connection failures eligible for retry. Errors with an HTTP
+ * status, provider error payload, client abort, or timeout are excluded.
+ * The caller limits retries to failures before the first response chunk.
+ */
+export function isRetryableUpstreamConnectionFailure(error: unknown): boolean {
+  if (error instanceof ObservedProviderUsageError) return false;
+  if (
+    error instanceof ApiError ||
+    explicitHttpStatus(error) !== undefined ||
+    isClientAbortError(error) ||
+    hasUpstreamErrorPayload(error)
+  ) {
+    return false;
+  }
+  const code = classifyUpstreamTransportFailure(error)?.code;
+  return (
+    code === "upstream_connection_closed" || code === "upstream_unreachable"
+  );
+}
+
+/** Final request classification, using the same status/transport rules as the error response. */
+export function classifyProxyFailure(error: unknown): ProxyRequestFailure {
+  const explicitStatus = explicitHttpStatus(error);
+  const transportFailure =
+    explicitStatus === undefined && !isClientAbortError(error)
+      ? classifyUpstreamTransportFailure(error)
+      : undefined;
+  const statusCode =
+    explicitStatus ??
+    (isClientAbortError(error) ? 499 : transportFailure?.status) ??
+    500;
+  const origin =
+    statusCode === 499
+      ? "client"
+      : error instanceof ThroughputError ||
+          (error instanceof ApiError && !error.upstream)
+        ? "archestra"
+        : error instanceof ObservedProviderUsageError ||
+            transportFailure ||
+            explicitStatus !== undefined ||
+            (error instanceof ApiError && error.upstream) ||
+            (error instanceof Error &&
+              (hasProviderHttpErrorShape(error) ||
+                hasUpstreamErrorPayload(error)))
+          ? "provider"
+          : "archestra";
+  return {
+    statusCode,
+    origin,
+    outcome:
+      statusCode === 499
+        ? "cancelled"
+        : statusCode === 429
+          ? "throttled"
+          : origin === "archestra" && (statusCode === 402 || statusCode === 403)
+            ? "denied"
+            : origin === "provider" &&
+                (statusCode === 503 || statusCode === 529)
+              ? "overloaded"
+              : origin === "provider" &&
+                  (statusCode === 408 || statusCode === 504)
+                ? "timeout"
+                : "error",
+  };
+}
+
 export function handleError(
   error: unknown,
   reply: FastifyReply,
@@ -218,42 +1035,175 @@ export function handleError(
   extractInternalCode: (
     error: unknown,
   ) => ArchestraInternalErrorCode | undefined,
+  /** Provider-specific mid-stream error framing; defaults to SSE. */
+  formatStreamErrorFrame?: (event: unknown) => string,
+  /**
+   * True when the route translates the upstream provider's wire format into
+   * the client's (e.g. an OpenAI-format client served by an Anthropic
+   * upstream). The upstream's error body would be foreign to the client, so
+   * it is not relayed.
+   */
+  translatesWireFormat?: boolean,
 ): FastifyReply | never {
+  if (error instanceof ThroughputError && !reply.raw.headersSent) {
+    if (error.quota?.retryAfter != null && !error.quota.oversized)
+      reply.header("Retry-After", error.quota.retryAfter);
+    return reply.code(error.status).send({
+      error: {
+        message: error.message,
+        type: "archestra_throughput_error",
+        code: error.code,
+        quota: error.quota,
+      },
+    });
+  }
   logger.error(error);
 
   // Extract status code from error, checking multiple common property names
   // and ensuring the value is a valid number (not undefined/null)
-  let statusCode: number = 500;
-  if (error instanceof Error) {
-    const errorObj = error as Error & {
-      status?: number;
-      statusCode?: number;
-    };
-    if (typeof errorObj.status === "number") {
-      statusCode = errorObj.status;
-    } else if (typeof errorObj.statusCode === "number") {
-      statusCode = errorObj.statusCode;
+  const explicitStatus = explicitHttpStatus(error);
+  const hasExplicitStatus = explicitStatus !== undefined;
+  let statusCode: number = explicitStatus ?? 500;
+
+  // Some SDK transport and streaming failures do not carry an HTTP status.
+  let transportFailure: UpstreamTransportFailure | undefined;
+  if (!hasExplicitStatus) {
+    if (isClientAbortError(error)) {
+      // The proxy client disconnected and the disconnect was propagated to
+      // the in-flight provider call as an AbortSignal (see
+      // createDownstreamAbortSignal). Nobody is waiting for this response —
+      // report 499 (client closed request) so the interaction record names
+      // the cause and error tracking's 4xx rule treats it as expected
+      // instead of a crash of ours.
+      statusCode = 499;
+    } else {
+      // A status-less SDK connection/timeout failure ("Connection error.",
+      // "fetch failed", ETIMEDOUT, a stream "terminated" by the other side)
+      // is by definition the upstream failing, not a crash of ours — but it
+      // carries neither a parsed provider body nor response headers, so the
+      // provider-shape check below cannot mark it. Classify it here so error
+      // tracking drops the relay while clients still get the mapped 502/504.
+      transportFailure = classifyUpstreamTransportFailure(error);
+      if (transportFailure) {
+        statusCode = transportFailure.status;
+      }
     }
   }
+  const isClassifiedTransportFailure = transportFailure !== undefined;
 
-  const errorMessage = extractErrorMessage(error);
-  const internalCode = extractInternalCode(error);
+  // The internal code preserves overload semantics after streaming starts.
+  // Any non-ApiError 503 in the proxy's catch is the provider saying it is
+  // unavailable — whether stated explicitly (e.g. Google's UNAVAILABLE "high
+  // demand" errors) or classified from a status-less SDK failure — our own
+  // service-unavailable paths always throw ApiError.
+  const isUpstreamOverload =
+    statusCode === 529 || (statusCode === 503 && !(error instanceof ApiError));
+
+  // Provider-returned 5xx relays (an SDK error carrying the provider's own
+  // HTTP failure) are upstream faults, not crashes of ours — marked so error
+  // tracking drops the relay as noise while clients still get the status.
+  // The status-less variant is an in-stream failure: once the provider's
+  // stream commits 200, a failure arrives as an SSE `error` event that the
+  // SDK relays with a parsed provider body but no HTTP status (e.g.
+  // Anthropic's mid-stream `api_error` "Internal server error").
+  const isUpstreamProviderFailure =
+    statusCode >= 500 &&
+    !(error instanceof ApiError) &&
+    hasProviderHttpErrorShape(error) &&
+    (hasExplicitStatus || hasUpstreamErrorPayload(error));
+
+  const errorMessage = transportFailure?.message ?? extractErrorMessage(error);
+  const adapterInternalCode = extractInternalCode(error);
+  const internalCode =
+    adapterInternalCode ??
+    (error instanceof ApiError ? error.internalCode : undefined) ??
+    (isUpstreamOverload
+      ? ArchestraInternalErrorCode.ProviderOverloaded
+      : undefined);
+
+  // Provider errors reach native clients unchanged. The Archestra envelope
+  // drops the provider's error type and details, which clients read to decide
+  // how to recover: Anthropic's `rate_limit_error` became `unknown_api_error`,
+  // so a subscription usage limit looked like throttling, and a
+  // `thread_not_found` 404 lost the code Claude Code needs to replay an
+  // expired server-side thread. These keep the envelope: Archestra's own
+  // ApiErrors (e.g. limit blocks), errors the adapter reclassifies
+  // (adapterInternalCode), routes that translate the wire format (the
+  // provider's body would be foreign to the client), and errors without a
+  // trustworthy provider body.
+  const relayable =
+    !(error instanceof ApiError) &&
+    adapterInternalCode === undefined &&
+    !translatesWireFormat;
+  const isRateLimitOrOverload = statusCode === 429 || statusCode === 529;
+  // Rate limits and overloads keep the old rule and relay any parsed body,
+  // including the `{ error: { message } }` that fetch-based adapters
+  // synthesize. Other statuses need a body that is recognizably the
+  // provider's own.
+  const upstreamBody = !relayable
+    ? undefined
+    : isRateLimitOrOverload
+      ? extractUpstreamErrorBody(error)
+      : extractTrustedProviderErrorBody(error);
+  const upstreamPassthroughBody =
+    upstreamBody !== undefined &&
+    statusCode >= 400 &&
+    (hasExplicitStatus || isRateLimitOrOverload)
+      ? upstreamBody
+      : undefined;
+
+  // Headers cannot be changed after streaming starts.
+  if (!reply.raw.headersSent) {
+    const retryAfter = extractRetryAfterHeader(error);
+    if (retryAfter !== undefined) {
+      reply.header("retry-after", retryAfter);
+    }
+    forwardUpstreamRateLimitHeaders(error, reply);
+  }
 
   // If headers already sent (mid-stream error), write error to stream.
   // Clients (like AI SDK) detect errors via HTTP status code, but we can't change
-  // the status after headers are committed - so SSE error event is our only option.
+  // the status after headers are committed - so an in-stream error event is our
+  // only option. The framing must match the stream the client is already
+  // parsing, hence formatStreamErrorFrame (SSE for everyone but Ollama native).
   // Check reply.raw.headersSent (set after writeHead) rather than reply.sent
   // (which is only set after hijack or full send).
   if (isStreaming && reply.raw.headersSent) {
     const errorEvent = {
       type: "error",
       error: {
-        type: "api_error",
+        // Keep the provider's own error object (its code, details, policy
+        // review data) so native streaming clients classify and recover from
+        // the failure as they would talking to the provider directly. This
+        // uses upstreamBody, not upstreamPassthroughBody: the status (200) is
+        // already sent, so the status checks of the passthrough do not apply,
+        // and the error object is all the client has to go on.
+        ...(upstreamBody !== undefined
+          ? providerErrorFields(upstreamBody)
+          : {}),
+        // A transport failure has no provider body: frame it as a server
+        // error with its own code, so a client that classifies by type
+        // (the AI SDK's Responses parser, OpenCode, Kilo Code) treats it as
+        // retryable like the provider's own 5xx instead of a final API error.
+        type:
+          transportFailure?.type ??
+          (upstreamBody !== undefined && error instanceof Error
+            ? nestedProviderErrorType(error)
+            : undefined) ??
+          "api_error",
+        ...(transportFailure ? { code: transportFailure.code } : {}),
         message: errorMessage,
+        // Surface the normalized code (e.g. provider_insufficient_balance)
+        // mid-stream too, so a failure after headers commit stays classifiable.
+        ...(internalCode ? { internal_code: internalCode } : {}),
       },
     };
     try {
-      reply.raw.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`);
+      reply.raw.write(
+        formatStreamErrorFrame
+          ? formatStreamErrorFrame(errorEvent)
+          : `event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`,
+      );
       reply.raw.end();
     } catch (writeError) {
       // Connection already closed by the client — nothing more we can do.
@@ -265,7 +1215,497 @@ export function handleError(
     return reply;
   }
 
+  // Provider error body is relayed verbatim (bypassing the Archestra envelope
+  // the central handler would build): the proxy's provider routes speak each
+  // provider's wire format, and native clients parse this body for the error
+  // type. Sent pre-serialized so a route's per-status response schema cannot
+  // reshape it.
+  if (upstreamPassthroughBody !== undefined) {
+    return reply
+      .status(statusCode)
+      .type("application/json; charset=utf-8")
+      .send(JSON.stringify(upstreamPassthroughBody));
+  }
+
   // Headers not sent yet - throw ApiError to let central handler return proper status code
   // This matches V1 handler behavior and ensures clients receive correct HTTP status
-  throw new ApiError(statusCode, errorMessage, internalCode);
+  const apiError = new ApiError(statusCode, errorMessage, internalCode);
+  // Keep the original cause chain for internal diagnostics. The response
+  // serializer emits only the public message and deliberately omits causes.
+  apiError.cause = error;
+  // Keep the retry guidance an Archestra error already carries.
+  if (error instanceof ApiError) {
+    apiError.retryAfterSeconds = error.retryAfterSeconds;
+    apiError.shouldRetry = error.shouldRetry;
+  }
+  apiError.upstream =
+    isUpstreamProviderFailure ||
+    isUpstreamOverload ||
+    isClassifiedTransportFailure;
+  throw apiError;
+}
+
+/**
+ * Whether the error looks like a provider SDK's HTTP error (a parsed error
+ * body, response headers, or the AWS SDK's response metadata) rather than an
+ * internal error that merely carries a status code.
+ */
+function hasProviderHttpErrorShape(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return (
+    "error" in error ||
+    "headers" in error ||
+    "$metadata" in error ||
+    // The Bedrock client's non-OK errors carry the provider's raw body as
+    // `responseBody` (see clients/bedrock-client.ts) rather than a parsed
+    // `error` member — without this, a relayed Bedrock 500/502 was treated
+    // as a crash of ours.
+    "responseBody" in error
+  );
+}
+
+/**
+ * Whether the error is an abort of a request we initiated — the fetch/SDK
+ * AbortError raised when the signal wired to the proxy client's disconnect
+ * fires, or the SDK's own user-abort wrapper around it. Deliberately does NOT
+ * match AbortSignal.timeout's TimeoutError ("… aborted due to timeout", a 504
+ * classified below): the message fallback is anchored so only a bare abort
+ * matches.
+ */
+function isClientAbortError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return (
+    error.name === "AbortError" ||
+    error.name === "APIUserAbortError" ||
+    /\boperation was aborted\.?$/i.test(error.message)
+  );
+}
+
+/**
+ * A status-less transport failure with the status, error type, code and
+ * message the proxy reports for it. A bare undici "terminated" (the upstream
+ * closed its socket mid-stream) or "fetch failed" tells a client nothing;
+ * the message names what happened and keeps the cause ("other side closed").
+ */
+interface UpstreamTransportFailure {
+  status: 502 | 503 | 504 | 529;
+  type: "server_error";
+  code:
+    | "upstream_connection_closed"
+    | "upstream_unreachable"
+    | "upstream_timeout"
+    | "upstream_overloaded";
+  message: string;
+}
+
+function classifyUpstreamTransportFailure(
+  error: unknown,
+): UpstreamTransportFailure | undefined {
+  const status = classifyTransientUpstreamError(error);
+  if (status === undefined || !(error instanceof Error)) return undefined;
+  const causes = collectCauseMessages(error);
+  const detail = causes.length > 0 ? ` (${causes.join(": ")})` : "";
+  const text = [error.message, ...causes].join(" ");
+  if (status === 503 || status === 529) {
+    return {
+      status,
+      type: "server_error",
+      code: "upstream_overloaded",
+      message: error.message,
+    };
+  }
+  if (status === 504) {
+    return {
+      status,
+      type: "server_error",
+      code: "upstream_timeout",
+      message: `The model provider did not finish the response in time${detail}. Retry the request.`,
+    };
+  }
+  if (
+    /terminated|other side closed|socket hang up|connection (?:reset|closed|aborted)|ECONNRESET|UND_ERR_SOCKET/i.test(
+      text,
+    )
+  ) {
+    return {
+      status,
+      type: "server_error",
+      code: "upstream_connection_closed",
+      message: `The model provider closed the connection before the response finished${detail}. Retry the request.`,
+    };
+  }
+  return {
+    status,
+    type: "server_error",
+    code: "upstream_unreachable",
+    message:
+      "Could not connect to the model provider. Check its credentials and network access, then retry.",
+  };
+}
+
+/** Messages down the `cause` chain, innermost last, without the error's own. */
+function collectCauseMessages(error: Error): string[] {
+  const messages: string[] = [];
+  const seen = new Set<unknown>([error]);
+  let cause: unknown = error.cause;
+  while (cause && typeof cause === "object" && !seen.has(cause)) {
+    seen.add(cause);
+    const message = (cause as { message?: unknown }).message;
+    if (typeof message === "string" && message && message !== error.message) {
+      messages.push(message);
+    }
+    cause = (cause as { cause?: unknown }).cause;
+  }
+  return messages;
+}
+
+/**
+ * The HTTP status an SDK error carries, checking the common property names.
+ * AWS SDK errors (Bedrock) carry it on `$metadata`, so without that check a
+ * throttling 429 or provider 503 surfaced as a 500.
+ */
+function explicitHttpStatus(error: unknown): number | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const errorObj = error as Error & {
+    status?: number;
+    statusCode?: number;
+    $metadata?: { httpStatusCode?: number };
+  };
+  if (typeof errorObj.status === "number") return errorObj.status;
+  if (typeof errorObj.statusCode === "number") return errorObj.statusCode;
+  if (typeof errorObj.$metadata?.httpStatusCode === "number") {
+    return errorObj.$metadata.httpStatusCode;
+  }
+  return undefined;
+}
+
+/**
+ * Classify status-less SDK transport and overload errors as upstream failures.
+ */
+function classifyTransientUpstreamError(
+  error: unknown,
+): 502 | 503 | 504 | 529 | undefined {
+  if (!(error instanceof Error)) return undefined;
+
+  const overloadStatus = classifyUpstreamOverload(error);
+  if (overloadStatus !== undefined) return overloadStatus;
+
+  const { name, message } = error;
+  const codes = collectErrorCodes(error);
+
+  const isTimeout =
+    name === "APIConnectionTimeoutError" ||
+    /timed out|timeout/i.test(message) ||
+    codes.some(isTimeoutErrno);
+  if (isTimeout) return 504;
+
+  const isConnectionFailure =
+    name === "APIConnectionError" ||
+    /^connection error\.?$/i.test(message) ||
+    /fetch failed|socket hang up|network error|connection (?:reset|refused|closed|aborted)|terminated/i.test(
+      message,
+    ) ||
+    codes.some(isConnectionErrno);
+  if (isConnectionFailure) return 502;
+
+  return undefined;
+}
+
+/**
+ * Anthropic's `overloaded_error` maps to 529; other provider overloads map to
+ * 503. Message matching is limited to SDK-like errors so internal failures are
+ * not reclassified.
+ */
+function classifyUpstreamOverload(error: unknown): 503 | 529 | undefined {
+  if (!(error instanceof Error)) return undefined;
+
+  if (
+    nestedProviderErrorType(error) === "overloaded_error" ||
+    /\boverloaded_error\b/.test(error.message)
+  ) {
+    return 529;
+  }
+  const hasProviderErrorShape =
+    "error" in error ||
+    "headers" in error ||
+    "status" in error ||
+    "statusCode" in error;
+  if (hasProviderErrorShape && /\boverloaded\b/i.test(error.message)) {
+    return 503;
+  }
+
+  return undefined;
+}
+
+/**
+ * Read a provider error type from the SDK's direct or nested error body.
+ */
+function nestedProviderErrorType(error: Error): string | undefined {
+  const body = (error as Error & { error?: unknown }).error;
+  const inner =
+    body && typeof body === "object"
+      ? (body as { error?: unknown }).error
+      : undefined;
+  for (const candidate of [inner, body]) {
+    if (candidate && typeof candidate === "object") {
+      const type = (candidate as { type?: unknown }).type;
+      if (typeof type === "string" && type !== "error") return type;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Whether the SDK error carries an upstream error payload. OpenAI-compatible
+ * upstreams are free-form in what they put under the stream's `error` member —
+ * usually an object, but some send a bare string — and the SDK relays either
+ * verbatim, so both shapes identify an in-stream provider failure.
+ */
+function hasUpstreamErrorPayload(error: unknown): boolean {
+  if (extractUpstreamErrorBody(error) !== undefined) return true;
+  if (!(error instanceof Error)) return false;
+  const body = (error as Error & { error?: unknown }).error;
+  return typeof body === "string" && body.length > 0;
+}
+
+/**
+ * The parsed upstream error body carried by a provider SDK error. The
+ * Anthropic SDK stores the full response envelope
+ * (`{ type: "error", error: { type, message } }`) on `.error`, while
+ * OpenAI-compatible SDKs store only the body's `error` member — the latter is
+ * re-wrapped so the relayed body matches what the provider originally sent.
+ */
+function extractUpstreamErrorBody(error: unknown): object | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const body = (error as Error & { error?: unknown }).error;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return undefined;
+  }
+  if ("error" in body) return body;
+  return { error: body };
+}
+
+/**
+ * The parsed provider error body, only when it is recognizably the provider's
+ * own: an object whose error member carries a string `type` or `code`.
+ * Synthetic errors (a bare message from a fetch-based adapter, a status-less
+ * SDK failure) carry neither and keep the Archestra envelope.
+ */
+function extractTrustedProviderErrorBody(error: unknown): object | undefined {
+  const body = extractUpstreamErrorBody(error) as
+    | { error?: unknown }
+    | undefined;
+  const inner = body?.error;
+  if (!inner || typeof inner !== "object" || Array.isArray(inner)) {
+    return undefined;
+  }
+  const { type, code } = inner as { type?: unknown; code?: unknown };
+  return typeof type === "string" || typeof code === "string"
+    ? body
+    : undefined;
+}
+
+/** The provider's own error object, for mid-stream frames. */
+function providerErrorFields(body: object): Record<string, unknown> {
+  return asRecord((body as { error?: unknown }).error) ?? {};
+}
+
+/**
+ * Forward the provider's rate-limit state headers so native clients can tell
+ * an account/usage limit apart from server-side throttling and show reset
+ * times (e.g. Anthropic's `anthropic-ratelimit-unified-status` drives the
+ * "usage limit" vs "server is limiting requests" distinction in clients).
+ * Values are validated to printable ASCII so junk is not relayed.
+ */
+function forwardUpstreamRateLimitHeaders(
+  error: unknown,
+  reply: FastifyReply,
+): void {
+  if (!(error instanceof Error)) return;
+  const headers = (error as Error & { headers?: unknown }).headers;
+
+  let entries: [string, unknown][];
+  if (headers instanceof Headers) {
+    entries = [...headers.entries()];
+  } else if (headers && typeof headers === "object") {
+    entries = Object.entries(headers);
+  } else {
+    return;
+  }
+
+  for (const [name, value] of entries) {
+    const lowerName = name.toLowerCase();
+    if (
+      !RATE_LIMIT_HEADER_PREFIXES.some((prefix) => lowerName.startsWith(prefix))
+    ) {
+      continue;
+    }
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (
+      trimmed.length === 0 ||
+      trimmed.length > 256 ||
+      /[^\t\x20-\x7e]/.test(trimmed)
+    ) {
+      continue;
+    }
+    reply.header(lowerName, trimmed);
+  }
+}
+
+const RATE_LIMIT_HEADER_PREFIXES = ["anthropic-ratelimit-", "x-ratelimit-"];
+
+/**
+ * Read a valid Retry-After value from current or legacy SDK error headers.
+ */
+function extractRetryAfterHeader(error: unknown): string | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const headers = (error as Error & { headers?: unknown }).headers;
+
+  let value: unknown;
+  if (headers instanceof Headers) {
+    value = headers.get("retry-after");
+  } else if (headers && typeof headers === "object") {
+    const record = headers as Record<string, unknown>;
+    value = record["retry-after"] ?? record["Retry-After"];
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (/^\d+$/.test(trimmed) || Number.isFinite(Date.parse(trimmed))) {
+      return trimmed;
+    }
+  }
+
+  // Kimi/Moonshot often puts "please try again after 1 seconds" in the body
+  // without a Retry-After header. Cap so a daily-quota reset cannot hang the
+  // stream (see sdk-retry-policy.ts).
+  const match = error.message.match(/try again after (\d+) seconds?/i);
+  if (!match) return undefined;
+  const seconds = Number(match[1]);
+  if (!Number.isInteger(seconds) || seconds < 1 || seconds > 30) {
+    return undefined;
+  }
+  return String(seconds);
+}
+
+/**
+ * Estimate input tokens for a request from its provider messages + tool schemas,
+ * using the provider's tokenizer (mirrors the cost-optimization estimator). The
+ * system prompt is not separately counted, matching that path. May throw on an
+ * unexpected message shape; the caller (applyInputTokenFallback) contains that.
+ */
+function estimateRequestInputTokens(params: {
+  provider: SupportedProvider;
+  providerMessages: unknown;
+  tools: CommonMcpToolDefinition[];
+}): number {
+  const tokenizer = getTokenizer(params.provider);
+  const messageTokens = tokenizer.countTokens(
+    params.providerMessages as Parameters<typeof tokenizer.countTokens>[0],
+  );
+  const toolTokens = estimateToolTokens(params.tools, tokenizer);
+  return messageTokens + toolTokens;
+}
+
+/** A name as one string: a namespaced name joins as `<namespace>__<name>`. */
+function spelledName(name: string, namespace?: string): string {
+  return namespace
+    ? `${namespace}${MCP_SERVER_TOOL_NAME_SEPARATOR}${name}`
+    : name;
+}
+
+/** Names taken as spelled, with the strict `run_tool` match. */
+const SPELLED_RESOLUTION: ToolNameResolution = {
+  canonicalize: spelledName,
+  looseRunToolDispatch: false,
+};
+
+/** Names taken as spelled, each its own declared spelling, none attested. */
+const SPELLED_IDENTITY: Pick<
+  GatewayToolIdentity,
+  "canonicalize" | "spellingOf" | "attestationOf"
+> = {
+  canonicalize: spelledName,
+  spellingOf: (name) => ({ name }),
+  attestationOf: () => undefined,
+};
+
+/**
+ * How the client decorates the gateway's tools, read off an attested
+ * declaration of one of them: the namespace it sits in, and what its wire name
+ * puts in front of the name the gateway advertised (Claude Code's
+ * `mcp__<label>__`, OpenCode's `<label>_`, nothing for Codex or a bare name).
+ */
+function provenDecoration(
+  spelling: { name: string; namespace?: string },
+  attestation: { advertisedName: string } | undefined,
+): { namespace?: string; prefix: string } | undefined {
+  if (!attestation || !spelling.name.endsWith(attestation.advertisedName)) {
+    return undefined;
+  }
+  return {
+    namespace: spelling.namespace,
+    prefix: spelling.name.slice(
+      0,
+      spelling.name.length - attestation.advertisedName.length,
+    ),
+  };
+}
+
+/** A call's name less `decoration`, when the call carries exactly it. */
+function undecorated(
+  toolCall: { name: string; namespace?: string },
+  decoration: { namespace?: string; prefix: string } | undefined,
+): string | undefined {
+  if (
+    !decoration ||
+    toolCall.namespace !== decoration.namespace ||
+    !toolCall.name.startsWith(decoration.prefix) ||
+    toolCall.name.length === decoration.prefix.length
+  ) {
+    return undefined;
+  }
+  return toolCall.name.slice(decoration.prefix.length);
+}
+
+/** Handler-owned component metrics; HTTP wrappers own other providers' tokens. */
+export function reportBillableUsageMetrics(params: {
+  usage: PricedBillingUsage;
+  agent: GatewayAgent;
+  source: InteractionSource;
+  billingMode: BillingMode;
+  authMethod?: InteractionAuthMethod;
+  tokens: boolean;
+}) {
+  for (const component of params.usage.components) {
+    if (params.tokens)
+      metrics.llm.reportLLMTokens(
+        component.provider,
+        params.agent,
+        {
+          input: component.inputTokens,
+          output: component.outputTokens,
+          cacheRead: component.cacheReadTokens,
+          cacheWrite: component.cacheWriteTokens,
+        },
+        component.model,
+        params.source,
+      );
+    metrics.llm.reportLLMCost({
+      provider: component.provider,
+      profile: params.agent,
+      model: component.model,
+      cost: component.cost ? Number(component.cost) : 0,
+      source: params.source,
+      billingMode: params.billingMode,
+      authMethod: params.authMethod,
+    });
+    metrics.llm.reportLLMCacheCost(
+      component.provider,
+      params.agent,
+      component.model,
+      componentCacheCosts(component),
+      params.source,
+    );
+  }
 }

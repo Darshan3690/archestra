@@ -1,0 +1,309 @@
+/**
+ * ChatGPT/Codex subscription client for the OpenAI provider's **Responses**
+ * endpoint — the path the first-party OpenAI Codex CLI uses.
+ *
+ * The Codex backend natively speaks the Responses API, so — unlike the
+ * chat-completions path (see ./openai-codex-client, which translates chat ⇄
+ * responses) — no format translation is needed here. The inbound Responses
+ * request is forwarded to the Codex backend with the mandatory transforms
+ * (store:false, stream:true, encrypted reasoning) and the ChatGPT identity/auth
+ * headers (see services/openai-codex-token), and the Responses event stream is
+ * returned to the caller unchanged. Non-streaming callers get the final
+ * Response folded from the stream's terminal `response.completed` event.
+ */
+import OpenAIProvider from "openai";
+import type {
+  CompactedResponse,
+  ResponseCompactParams,
+  ResponseCreateParamsStreaming,
+  ResponseStreamEvent,
+} from "openai/resources/responses/responses";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
+import config from "@/config";
+import {
+  OPENAI_CODEX_INSTRUCTIONS,
+  type OpenAiCodexCredential,
+} from "@/services/openai-codex-credentials";
+import {
+  createOpenAiCodexFetch,
+  normalizeCodexErrorResponse,
+} from "@/services/openai-codex-token";
+import {
+  ApiError,
+  type CreateClientOptions,
+  type OpenAi,
+  type OpenAiCodexPassthrough,
+} from "@/types";
+import { fetchWithAbortSignal } from "@/utils/client-disconnect-signal";
+import { resolveCodexSession } from "./openai-codex-session";
+import { PROXY_SDK_MAX_RETRIES } from "./sdk-retry-policy";
+
+type ResponsesRequest = OpenAi.Types.ResponsesRequest;
+type ResponsesResponse = OpenAi.Types.ResponsesResponse;
+
+/**
+ * Builds the duck-typed Codex client the OpenAI Responses adapter hands back for
+ * a ChatGPT-subscription credential. Returned as `OpenAIProvider` because the
+ * factory only touches `responses.create` and `responses.compact`.
+ */
+export function createOpenAiCodexResponsesClient(params: {
+  credential: OpenAiCodexCredential;
+  options: CreateClientOptions;
+  innerFetch?: FetchLike;
+}): OpenAIProvider {
+  return new OpenAiCodexResponsesClient(params) as unknown as OpenAIProvider;
+}
+
+/**
+ * Builds a Codex Responses client for OpenCode's request-local OAuth bridge.
+ * Unlike the stored credential client above, this never calls the token manager
+ * and deliberately makes no retry after an upstream 401.
+ */
+export function createOpenAiCodexPassthroughResponsesClient(params: {
+  credential: OpenAiCodexPassthrough;
+  options: CreateClientOptions;
+  innerFetch?: FetchLike;
+}): OpenAIProvider {
+  return new OpenAiCodexPassthroughResponsesClient(
+    params,
+  ) as unknown as OpenAIProvider;
+}
+
+// ===== Internal helpers =====
+
+type FetchLike = (
+  input: string | URL | Request,
+  init?: RequestInit,
+) => Promise<Response>;
+
+class OpenAiCodexResponsesClient {
+  responses = {
+    create: (
+      request: ResponsesRequest & { stream?: boolean },
+    ): Promise<ResponsesResponse | AsyncIterable<ResponseStreamEvent>> =>
+      this.create(request),
+    // Compaction sends the same conversation prefix, so it uses the session's
+    // cache key too, unless the caller sent its own.
+    compact: (request: ResponseCompactParams): Promise<CompactedResponse> =>
+      this.openai.responses.compact(
+        this.promptCacheKey && !request.prompt_cache_key
+          ? { ...request, prompt_cache_key: this.promptCacheKey }
+          : request,
+      ),
+  };
+
+  private openai: OpenAIProvider;
+  private promptCacheKey: string | undefined;
+
+  constructor(params: {
+    credential: OpenAiCodexCredential;
+    options: CreateClientOptions;
+    innerFetch?: FetchLike;
+  }) {
+    const { credential, options, innerFetch } = params;
+    const session = resolveCodexSession({
+      archestraSessionId: options.sessionId,
+      agentId: options.agent?.id,
+    });
+    this.promptCacheKey = session.promptCacheKey;
+    this.openai = new OpenAIProvider({
+      maxRetries: PROXY_SDK_MAX_RETRIES,
+      // The Codex backend authenticates via the fetch wrapper's OAuth bearer;
+      // the SDK still needs a non-empty key.
+      apiKey: "chatgpt-oauth",
+      // Always the Codex backend — a per-key base URL (meant for api.openai.com
+      // proxies) would misroute the subscription request.
+      baseURL: config.llm.openai.codex.apiBaseUrl,
+      fetch: createOpenAiCodexFetch({
+        credential,
+        providerApiKeyId: options.llmProviderApiKeyId,
+        sessionId: session.sessionId,
+        innerFetch: fetchWithAbortSignal(innerFetch, options.abortSignal),
+      }),
+    });
+  }
+
+  private async create(
+    request: ResponsesRequest & { stream?: boolean },
+  ): Promise<ResponsesResponse | AsyncIterable<ResponseStreamEvent>> {
+    const wantsStream = request.stream === true;
+    const codexBody = applyCodexResponsesTransforms(
+      request,
+      this.promptCacheKey,
+    );
+
+    // The Codex backend requires streaming; accumulate for non-streaming callers.
+    const upstream = (await this.openai.responses.create(
+      codexBody,
+    )) as unknown as AsyncIterable<ResponseStreamEvent>;
+
+    if (wantsStream) {
+      return upstream;
+    }
+    return foldCodexResponsesStream(upstream);
+  }
+}
+
+class OpenAiCodexPassthroughResponsesClient {
+  responses = {
+    create: (
+      request: ResponsesRequest & { stream?: boolean },
+    ): Promise<ResponsesResponse | AsyncIterable<ResponseStreamEvent>> =>
+      this.create(request),
+    compact: (request: ResponseCompactParams): Promise<CompactedResponse> =>
+      this.openai.responses.compact(request),
+  };
+
+  private openai: OpenAIProvider;
+
+  constructor(params: {
+    credential: OpenAiCodexPassthrough;
+    options: CreateClientOptions;
+    innerFetch?: FetchLike;
+  }) {
+    const { credential, options, innerFetch } = params;
+    this.openai = new OpenAIProvider({
+      // The bridge must relay an expired OAuth access token to OpenCode, which
+      // owns refresh and token rotation. Do not retry 401s or call any token API.
+      maxRetries: 0,
+      apiKey: "chatgpt-oauth",
+      baseURL: config.llm.openai.codex.apiBaseUrl,
+      fetch: createOpenAiCodexPassthroughFetch({
+        credential,
+        innerFetch: fetchWithAbortSignal(innerFetch, options.abortSignal),
+        onResponseHeaders: options.onResponseHeaders,
+      }),
+    });
+  }
+
+  private async create(
+    request: ResponsesRequest & { stream?: boolean },
+  ): Promise<ResponsesResponse | AsyncIterable<ResponseStreamEvent>> {
+    const wantsStream = request.stream === true;
+    const upstream = (await this.openai.responses.create(
+      applyCodexResponsesTransforms(request),
+    )) as unknown as AsyncIterable<ResponseStreamEvent>;
+
+    return wantsStream ? upstream : foldCodexResponsesStream(upstream);
+  }
+}
+
+/**
+ * Applies the mandatory Codex-backend transforms to an inbound Responses request
+ * without reshaping the caller's content: force `store:false`/`stream:true`, add
+ * encrypted reasoning to `include`, drop `max_output_tokens` (the Codex backend
+ * rejects it with 400 "Unsupported parameter" — the chat⇄responses translator
+ * path likewise never forwards an output cap), and supply the Codex persona only
+ * when the caller (e.g. a non-Codex client) sent no instructions of its own.
+ * Codex sends its instructions as a developer message, not as `instructions`.
+ * A persona added to such a request made Codex answer twice. A
+ * `promptCacheKey` is used only when the caller sent no `prompt_cache_key`.
+ */
+function applyCodexResponsesTransforms(
+  request: ResponsesRequest & { stream?: boolean },
+  promptCacheKey?: string,
+): ResponseCreateParamsStreaming {
+  const loose = request as {
+    include?: unknown;
+    input?: unknown;
+    instructions?: string | null;
+    prompt_cache_key?: string | null;
+  };
+  const callerInstructed =
+    loose.instructions != null ||
+    (Array.isArray(loose.input) &&
+      loose.input.some(
+        (item) =>
+          typeof item === "object" &&
+          item !== null &&
+          "role" in item &&
+          (item.role === "developer" || item.role === "system"),
+      ));
+  const existingInclude = Array.isArray(loose.include)
+    ? (loose.include as string[])
+    : [];
+  const { max_output_tokens: _maxOutputTokens, ...rest } =
+    request as unknown as Record<string, unknown>;
+  return {
+    ...rest,
+    store: false,
+    stream: true,
+    include: Array.from(
+      new Set([...existingInclude, "reasoning.encrypted_content"]),
+    ),
+    ...(callerInstructed
+      ? {}
+      : {
+          instructions: archestraMcpBranding.brandBuiltInText(
+            OPENAI_CODEX_INSTRUCTIONS,
+          ),
+        }),
+    ...(promptCacheKey && !loose.prompt_cache_key
+      ? { prompt_cache_key: promptCacheKey }
+      : {}),
+  } as unknown as ResponseCreateParamsStreaming;
+}
+
+/**
+ * Folds a Codex Responses event stream into the final Response for a
+ * non-streaming caller. The terminal `response.completed`/`response.incomplete`
+ * event already carries the complete Response object.
+ */
+async function foldCodexResponsesStream(
+  stream: AsyncIterable<ResponseStreamEvent>,
+): Promise<ResponsesResponse> {
+  let final: ResponsesResponse | undefined;
+  for await (const event of stream) {
+    if (
+      event.type === "response.completed" ||
+      event.type === "response.incomplete"
+    ) {
+      final = event.response as unknown as ResponsesResponse;
+    } else if (event.type === "response.failed") {
+      const message =
+        (event.response as { error?: { message?: string } }).error?.message ??
+        "request failed";
+      throw new ApiError(
+        502,
+        `ChatGPT subscription (Codex) request failed: ${message}`,
+      );
+    }
+  }
+  if (!final) {
+    throw new ApiError(
+      502,
+      "ChatGPT subscription (Codex) returned no completed response",
+    );
+  }
+  return final;
+}
+
+function createOpenAiCodexPassthroughFetch(params: {
+  credential: OpenAiCodexPassthrough;
+  innerFetch?: FetchLike;
+  onResponseHeaders?: (headers: Headers) => void;
+}): FetchLike {
+  const { credential, innerFetch, onResponseHeaders } = params;
+  const baseFetch = innerFetch ?? fetch;
+
+  return async (input, init) => {
+    const headers = new Headers(init?.headers);
+    headers.set("authorization", `Bearer ${credential.accessToken}`);
+    headers.set("chatgpt-account-id", credential.accountId);
+    headers.set("OpenAI-Beta", "responses=experimental");
+    if (credential.residency) {
+      headers.set("x-openai-internal-codex-residency", credential.residency);
+    }
+    if (credential.originator) headers.set("originator", credential.originator);
+    const version =
+      credential.version ??
+      credential.userAgent?.match(/\bcodex[\w-]*\/(\d+\.\d+\.\d+)/i)?.[1];
+    if (version) headers.set("version", version);
+    if (credential.sessionId) headers.set("session-id", credential.sessionId);
+    if (credential.userAgent) headers.set("User-Agent", credential.userAgent);
+
+    const response = await baseFetch(input, { ...init, headers });
+    if (response.ok) onResponseHeaders?.(response.headers);
+    return normalizeCodexErrorResponse(response);
+  };
+}

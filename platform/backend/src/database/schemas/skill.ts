@@ -1,0 +1,241 @@
+import { sql } from "drizzle-orm";
+import {
+  boolean,
+  index,
+  integer,
+  jsonb,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from "drizzle-orm/pg-core";
+import type { GitProvider } from "@/types/git-host";
+import type { SkillGithubSyncInterval, SkillSourceType } from "@/types/skill";
+import type { ResourceVisibilityScope } from "@/types/visibility";
+import runtimeCredentialDefinitionsTable from "./runtime-credential-definition";
+import serviceAccountsTable from "./service-account";
+import { softDeletablePgTable } from "./soft-deletable-table";
+import usersTable from "./user";
+
+/**
+ * Agent Skills: reusable SKILL.md instruction sets.
+ *
+ * A skill belongs to an organization and carries a visibility `scope`
+ * (`personal`/`team`/`org`) like agents. It holds the catalog metadata
+ * (`name`/`description`, surfaced to the model) plus the SKILL.md markdown
+ * body (`content`, loaded on activation). Bundled resource files live in the
+ * `skill_files` table; team assignments live in `skill_team`; environment
+ * assignments live in `skill_environment` (no rows = available in every
+ * environment).
+ *
+ * @see https://agentskills.io/specification
+ */
+const skillsTable = softDeletablePgTable(
+  "skills",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: text("organization_id").notNull(),
+    /** User who created/imported the skill; nulled if the user is removed. */
+    authorId: text("author_id").references(() => usersTable.id, {
+      onDelete: "set null",
+    }),
+    /**
+     * Visibility/management scope: `personal` (author only), `team` (members of
+     * the assigned teams, see `skill_team`), or `org` (everyone). Mirrors the
+     * `agents.scope` model.
+     */
+    scope: text("scope")
+      .$type<ResourceVisibilityScope>()
+      .notNull()
+      .default("personal"),
+    /** Short identifier surfaced in the skill catalog. */
+    name: text("name").notNull(),
+    /** One-line summary the model uses to decide when to activate. */
+    description: text("description").notNull(),
+    /**
+     * Emoji or base64 image data URL shown with the name; null = the source
+     * glyph. Archestra-side, so it stays editable on a Git-synced row.
+     */
+    icon: text("icon"),
+    /** Full markdown instructions (the SKILL.md body). */
+    content: text("content").notNull(),
+    /**
+     * Canonical serialized YAML frontmatter for this skill — the exact bytes
+     * that precede `content` in the `SKILL.md` published over MCP (SEP-2640).
+     * Derived from the frontmatter columns above (`name`, `description`,
+     * `license`, …) and rewritten by the same write that changes them, so it
+     * never drifts from them.
+     *
+     * Persisted rather than serialized per read so the published bytes are
+     * fixed at write time: a change to the serializer (or to js-yaml) can only
+     * affect a skill on its next write, never retroactively churn the digest a
+     * host already approved. Null on rows written before the column existed,
+     * until the `skill_publication_backfill` tick digests them — reads never
+     * fill anything, they withhold a row in this state.
+     *
+     * That freezing is also why this is NOT derived in the database: a
+     * generated column would recompute on every write, so one edit to the
+     * expression would rewrite every digest at once and every host would see
+     * mass tampering. The database enforces the weaker, correct guarantee
+     * instead — see `digest` below.
+     */
+    frontmatterBlob: text("frontmatter_blob"),
+    /**
+     * `sha256:<hex>` over the canonical `SKILL.md` bytes (`frontmatterBlob` +
+     * `content`) — the digest published for the manifest. Recomputed by every
+     * write that touches either half; filled for legacy rows alongside
+     * `frontmatterBlob` by the backfill tick.
+     *
+     * STALENESS IS DATABASE-ENFORCED. The
+     * `skills_invalidate_publication_artifacts` BEFORE UPDATE trigger
+     * (migration 0407) resets this column and `frontmatterBlob` to null
+     * whenever a write moves a covered field (`name`, `description`,
+     * `license`, `compatibility`, `allowedTools`, `metadata`, `content`)
+     * without supplying a fresh digest. The row is then withheld from
+     * publication until a model-layer write or the backfill tick restores the
+     * pair. A stale digest — which a conforming MCP host reads as tampering
+     * rather than staleness — is therefore not reachable, whatever a future
+     * write path forgets to do.
+     *
+     * Triggers are invisible in a Drizzle schema; see the migration before
+     * assuming a nulled digest is a bug.
+     */
+    digest: text("digest"),
+    /**
+     * Head version number, pointing at the latest `skill_versions` row. Bumped
+     * in the same transaction as an edit that forks a new version. Every skill
+     * has at least version 1 (written on create / backfilled on migration).
+     */
+    latestVersion: integer("latest_version").notNull(),
+    /** Optional `license` frontmatter field. */
+    license: text("license"),
+    /** Optional `compatibility` frontmatter field (environment requirements). */
+    compatibility: text("compatibility"),
+    /**
+     * Optional `allowed-tools` frontmatter field (agentskills.io): a
+     * space-separated list of tools the skill is pre-approved to use.
+     * Round-trips through SKILL.md.
+     */
+    allowedTools: text("allowed_tools"),
+    /**
+     * Optional `agent` frontmatter field: the name of the agent the skill runs
+     * in. When set, activation delegates the skill (instructions + task) to
+     * that agent instead of loading the instructions into the caller's context.
+     */
+    agentName: text("agent_name"),
+    /**
+     * When true, the SKILL.md body is rendered through Handlebars (with the
+     * activating user's context) at activation, like an agent system prompt.
+     * Set automatically when converting a templated agent; off for authored
+     * skills unless they opt in via the `templated` frontmatter field.
+     */
+    templated: boolean("templated").notNull().default(false),
+    /** Optional arbitrary `metadata` frontmatter map. */
+    metadata: jsonb("metadata")
+      .$type<Record<string, string>>()
+      .notNull()
+      .default({}),
+    /** How the skill entered the system. */
+    sourceType: text("source_type")
+      .$type<SkillSourceType>()
+      .notNull()
+      .default("manual"),
+    /** Provenance for imported skills, e.g. `owner/repo@ref:path`. */
+    sourceRef: text("source_ref"),
+    /** Repository web origin; null preserves the legacy github.com source. */
+    sourceOrigin: text("source_origin"),
+    /** Commit SHA the skill was imported at, when known. */
+    sourceCommit: text("source_commit"),
+    /**
+     * Recurring-pull frequency for a GitHub-synced skill. Non-null marks the
+     * skill as synced: its content (SKILL.md + files) is read-only in
+     * Archestra and a background worker re-pulls it from the source repo on
+     * this schedule. Null = editable in Archestra (a one-time snapshot for
+     * `github` skills). Cleared on "disconnect".
+     */
+    githubSyncInterval: text(
+      "github_sync_interval",
+    ).$type<SkillGithubSyncInterval>(),
+    /**
+     * Git ref (branch or tag) a synced skill tracks; null tracks the repo's
+     * default branch (HEAD). Only meaningful while `githubSyncInterval` is
+     * set — `sourceRef` pins the requested-ref-or-SHA at import and is
+     * provenance, not the tracking target.
+     */
+    githubSyncRef: text("github_sync_ref"),
+    /**
+     * GitHub App config used to authenticate scheduled pulls; null for public
+     * repos. PATs are never stored, so a PAT import cannot be synced. Deleting
+     * the config nulls this and subsequent private-repo syncs fail (recorded
+     * in `lastSyncError`).
+     */
+    githubAppConfigId: uuid("github_app_config_id").references(
+      () => runtimeCredentialDefinitionsTable.id,
+      { onDelete: "set null" },
+    ),
+    /**
+     * Stored PAT used to authenticate scheduled pulls; the stored-token twin
+     * of `githubAppConfigId` (at most one of the two is set). Deleting the
+     * PAT is blocked while synced skills reference it.
+     */
+    githubPatId: uuid("github_pat_id").references(
+      () => runtimeCredentialDefinitionsTable.id,
+      {
+        onDelete: "set null",
+      },
+    ),
+    /** Git host of a synced skill; null means GitHub. */
+    sourceProvider: text("source_provider").$type<GitProvider>(),
+    /** GitLab access token for scheduled pulls; the GitLab twin of `githubAppConfigId`. */
+    gitlabTokenId: uuid("gitlab_token_id").references(
+      () => runtimeCredentialDefinitionsTable.id,
+      { onDelete: "set null" },
+    ),
+    /** When the last scheduled/manual sync ran (success or failure). */
+    lastSyncedAt: timestamp("last_synced_at", { mode: "date" }),
+    /** Why the last sync failed; null when it succeeded. */
+    lastSyncError: text("last_sync_error"),
+    /**
+     * Total activations: `load_skill` by name (catalog clients), slash-command
+     * activation in chat, and skill-delegation dispatch each count one. File
+     * reads and catalog listing don't. Incremented by `SkillModel.recordUsage`
+     * without touching `updatedAt`.
+     */
+    usageCount: integer("usage_count").notNull().default(0),
+    /** When the skill was last activated (see `usageCount`). */
+    lastUsedAt: timestamp("last_used_at", { mode: "date" }),
+    /** Service account creator; separate from human ownership. */
+    createdByServiceAccountId: uuid("created_by_service_account_id").references(
+      () => serviceAccountsTable.id,
+      { onDelete: "set null" },
+    ),
+    createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { mode: "date" })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [
+    index("skills_organization_id_idx").on(table.organizationId),
+    index("skills_scope_idx").on(table.scope),
+    // the sync worker's check-due scan touches only synced skills.
+    index("skills_github_sync_due_idx")
+      .on(table.lastSyncedAt)
+      .where(sql`${table.githubSyncInterval} is not null`),
+    // A name is unique per (org, author): the author segment of a skill://
+    // URI then names one skill. A skill a service account wrote keys on the
+    // service account instead. A skill with neither (a built-in, or one whose
+    // author was deleted) is unconstrained, so deleting a user can never fail
+    // on a name clash. Soft-deleted rows are excluded so deleting a skill
+    // frees its name.
+    uniqueIndex("skills_org_author_name_idx")
+      .on(
+        table.organizationId,
+        sql`coalesce(${table.authorId}, ${table.createdByServiceAccountId}::text)`,
+        table.name,
+      )
+      .where(sql`${table.deletedAt} IS NULL`),
+  ],
+);
+
+export default skillsTable;

@@ -1,7 +1,15 @@
 "use client";
 
-import { archestraApiSdk } from "@shared";
-import { ChevronDown, CircuitBoard, Loader2, Play, Zap } from "lucide-react";
+import { archestraApiSdk } from "@archestra/shared";
+import {
+  ChevronDown,
+  CircuitBoard,
+  Loader2,
+  Play,
+  RefreshCw,
+  Search,
+  Zap,
+} from "lucide-react";
 import {
   type PointerEvent as ReactPointerEvent,
   useCallback,
@@ -14,7 +22,10 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { cn } from "@/lib/utils";
+import { UnstyledButton } from "@/components/ui/unstyled-button";
+import { useReloadMcpServerTools } from "@/lib/mcp/mcp-server.query";
+import { cn } from "@/lib/utils/tailwind";
+import { filterMcpTools } from "./mcp-tool-search";
 
 interface McpTool {
   name: string;
@@ -49,6 +60,7 @@ interface McpInspectorProps {
 }
 
 export function McpInspector({ serverId, isActive }: McpInspectorProps) {
+  const reloadTools = useReloadMcpServerTools();
   const [tools, setTools] = useState<McpTool[]>([]);
   const [selectedTool, setSelectedTool] = useState<McpTool | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -56,6 +68,7 @@ export function McpInspector({ serverId, isActive }: McpInspectorProps) {
   const [paramValues, setParamValues] = useState<Record<string, string>>({});
   const [isCallingTool, setIsCallingTool] = useState(false);
   const [showSchema, setShowSchema] = useState(false);
+  const [toolSearch, setToolSearch] = useState("");
   const [requestLog, setRequestLog] = useState<RequestLogEntry[]>([]);
   const logIdRef = useRef(0);
   const [logPanelRatio, setLogPanelRatio] = useState(0.4);
@@ -154,6 +167,7 @@ export function McpInspector({ serverId, isActive }: McpInspectorProps) {
       setTools([]);
       setSelectedTool(null);
       setParamValues({});
+      setToolSearch("");
       setRequestLog([]);
       logIdRef.current = 0;
       loadTools();
@@ -255,6 +269,7 @@ export function McpInspector({ serverId, isActive }: McpInspectorProps) {
 
   const properties = selectedTool?.inputSchema?.properties ?? {};
   const requiredParams = selectedTool?.inputSchema?.required ?? [];
+  const filteredTools = filterMcpTools(tools, toolSearch);
 
   return (
     <div className="flex flex-col flex-1 min-h-0 gap-3">
@@ -267,14 +282,28 @@ export function McpInspector({ serverId, isActive }: McpInspectorProps) {
           </span>
         </div>
         <div className="h-3 w-px bg-border" />
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={loadTools}
-          className="h-7 px-2.5 text-xs gap-1.5"
-        >
+        <Button variant="outline" size="xs" onClick={loadTools}>
           <Zap className="h-3 w-3" />
           List Tools
+        </Button>
+        <Button
+          variant="outline"
+          size="xs"
+          disabled={reloadTools.isPending}
+          onClick={() =>
+            reloadTools.mutate(
+              { id: serverId },
+              { onSuccess: () => void loadTools() },
+            )
+          }
+          title="Re-sync the registry's tool catalog from the live server so agents and gateway clients see the current tools"
+        >
+          {reloadTools.isPending ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : (
+            <RefreshCw className="h-3 w-3" />
+          )}
+          <span>Refresh Tools</span>
         </Button>
       </div>
 
@@ -286,15 +315,29 @@ export function McpInspector({ serverId, isActive }: McpInspectorProps) {
               Tools
             </span>
             <span className="font-mono text-[10px] tabular-nums text-muted-foreground">
-              {tools.length}
+              {toolSearch.trim()
+                ? `${filteredTools.length}/${tools.length}`
+                : tools.length}
             </span>
           </div>
-          <ScrollArea className="flex-1 min-h-0">
+          <div className="px-1.5 pt-1.5 flex-shrink-0">
+            <div className="relative">
+              <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-muted-foreground" />
+              <Input
+                value={toolSearch}
+                onChange={(e) => setToolSearch(e.target.value)}
+                placeholder="Search tools"
+                aria-label="Search tools"
+                className="h-7 pl-7 font-mono text-xs"
+              />
+            </div>
+          </div>
+          <ScrollArea className="h-[480px]">
             <div className="p-1.5 space-y-0.5">
-              {tools.map((tool) => {
+              {filteredTools.map((tool) => {
                 const isSelected = selectedTool?.name === tool.name;
                 return (
-                  <button
+                  <UnstyledButton
                     key={tool.name}
                     type="button"
                     onClick={() => handleSelectTool(tool)}
@@ -323,12 +366,12 @@ export function McpInspector({ serverId, isActive }: McpInspectorProps) {
                         {tool.description}
                       </div>
                     )}
-                  </button>
+                  </UnstyledButton>
                 );
               })}
-              {tools.length === 0 && (
+              {filteredTools.length === 0 && (
                 <div className="px-3 py-8 text-xs text-muted-foreground text-center font-mono tracking-[0.08em]">
-                  No tools
+                  {tools.length === 0 ? "No tools" : "No matching tools"}
                 </div>
               )}
             </div>
@@ -398,6 +441,7 @@ export function McpInspector({ serverId, isActive }: McpInspectorProps) {
                             </Label>
                             <Input
                               placeholder={prop.description || `Enter ${name}`}
+                              aria-label={name}
                               value={paramValues[name] ?? ""}
                               onChange={(e) =>
                                 setParamValues((prev) => ({
@@ -418,14 +462,14 @@ export function McpInspector({ serverId, isActive }: McpInspectorProps) {
                 <Button
                   onClick={handleCallTool}
                   disabled={isCallingTool}
-                  className="gap-2 font-mono text-xs tracking-[0.08em] h-9 px-4"
+                  className="font-mono text-xs tracking-[0.08em]"
                 >
                   {isCallingTool ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
                   ) : (
                     <Play className="h-3.5 w-3.5 fill-current" />
                   )}
-                  Call Tool
+                  <span>Call Tool</span>
                 </Button>
 
                 {/* Latest response for this tool */}
@@ -478,7 +522,7 @@ export function McpInspector({ serverId, isActive }: McpInspectorProps) {
                 {/* JSON Schema toggle */}
                 {selectedTool.inputSchema && (
                   <div>
-                    <button
+                    <UnstyledButton
                       type="button"
                       onClick={() => setShowSchema((v) => !v)}
                       className="group flex items-center gap-1.5 font-mono text-[10px] tracking-[0.08em] text-muted-foreground hover:text-foreground transition-colors"
@@ -490,7 +534,7 @@ export function McpInspector({ serverId, isActive }: McpInspectorProps) {
                         )}
                       />
                       <span>Schema</span>
-                    </button>
+                    </UnstyledButton>
                     {showSchema && (
                       <div className="rounded-md bg-zinc-950 border border-zinc-800 p-3 mt-2 overflow-auto">
                         <pre className="text-zinc-400 font-mono text-xs leading-relaxed whitespace-pre-wrap">
@@ -522,7 +566,7 @@ export function McpInspector({ serverId, isActive }: McpInspectorProps) {
               style={{ flex: `0 0 ${logPanelRatio * 100}%` }}
             >
               {/* Drag handle — precision rails */}
-              <button
+              <UnstyledButton
                 type="button"
                 onPointerDown={handleDragStart}
                 aria-label="Resize log panel"
@@ -532,7 +576,7 @@ export function McpInspector({ serverId, isActive }: McpInspectorProps) {
                   <span className="block h-px w-10 bg-muted-foreground/30 group-hover:bg-emerald-500/60 transition-colors" />
                   <span className="block h-px w-10 bg-muted-foreground/30 group-hover:bg-emerald-500/60 transition-colors" />
                 </div>
-              </button>
+              </UnstyledButton>
 
               <div className="px-4 py-2 flex items-center gap-2 flex-shrink-0 border-b bg-background/50">
                 <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
@@ -581,7 +625,7 @@ function RequestLogItem({
 
   return (
     <div className="text-xs font-mono group">
-      <button
+      <UnstyledButton
         type="button"
         onClick={() => setExpanded((v) => !v)}
         className={cn(
@@ -622,7 +666,7 @@ function RequestLogItem({
           {entry.durationMs}
           <span className="text-muted-foreground/50 ml-0.5">ms</span>
         </span>
-      </button>
+      </UnstyledButton>
       {expanded && (
         <div className="px-4 pb-3 pl-[4.25rem] space-y-2.5">
           <div>

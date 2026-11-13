@@ -23,6 +23,16 @@ If release name contains chart name it will be used as a full name.
 {{- end }}
 {{- end }}
 
+{{/* Broad Role used by the platform to manage MCP runtime resources. */}}
+{{- define "archestra-platform.mcpManagerRoleName" -}}
+{{- printf "%s-mcp-manager" (include "archestra-platform.fullname" .) }}
+{{- end }}
+
+{{/* Narrow Helm-managed Role that owns runtime-created MCP resources. */}}
+{{- define "archestra-platform.mcpRuntimeOwnerRoleName" -}}
+{{- printf "%s-mcp-runtime-owner" (include "archestra-platform.fullname" .) }}
+{{- end }}
+
 {{/*
 Create chart name and version as used by the chart label.
 */}}
@@ -52,30 +62,30 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Maintenance mode can serve the frontend overlay and public config without
+database access. The chart can only detect this when the env var is set
+directly through archestra.env.
+*/}}
+{{- define "archestra-platform.maintenanceModeEnabled" -}}
+{{- if and (hasKey .Values.archestra.env "ARCHESTRA_MAINTENANCE_MODE_MESSAGE") (ne (toString (get .Values.archestra.env "ARCHESTRA_MAINTENANCE_MODE_MESSAGE")) "") -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end }}
+
+{{/*
 Environment variables for the Archestra Platform container
 */}}
-{{- define "archestra-platform.env" -}}
-{{/*
-List of sensitive environment variables that should be stored in the Secret
-and referenced via secretKeyRef instead of being exposed as plaintext in Pod specs.
-This must match the list in secret.yaml.
-Additionally, any env var matching ARCHESTRA_CHAT_*_API_KEY is treated as sensitive.
-*/}}
-{{- $sensitiveEnvVars := list
-  "ARCHESTRA_AUTH_SECRET"
-  "ARCHESTRA_AUTH_ADMIN_PASSWORD"
-  "ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_PASSWORD"
-  "ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_BEARER"
-  "ARCHESTRA_METRICS_SECRET"
-  "ARCHESTRA_HASHICORP_VAULT_TOKEN"
-}}
+{{- define "archestra-platform.databaseEnv" -}}
+{{- $databaseSecretName := .migrationDatabaseSecretNameOverride | default (include "archestra-platform.authSecretName" .) -}}
 {{- if eq (toString .Values.postgresql.external_database_url) "from_vault" }}
 {{/* Database URL provided by vault-secrets init container — no env var generated */}}
 {{- else if .Values.postgresql.external_database_url }}
 - name: ARCHESTRA_DATABASE_URL
   valueFrom:
     secretKeyRef:
-      name: {{ include "archestra-platform.authSecretName" . }}
+      name: {{ $databaseSecretName }}
       key: database-url
 {{- else if .Values.postgresql.enabled }}
 {{/*
@@ -91,28 +101,409 @@ The Bitnami chart auto-generates a strong password and persists it across helm u
 - name: ARCHESTRA_DATABASE_URL
   value: postgresql://{{ .Values.postgresql.auth.username }}:$(PGPASSWORD)@{{ include "archestra-platform.fullname" . }}-postgresql:5432/{{ .Values.postgresql.auth.database }}
 {{- end }}
+{{- $iamAuth := (.Values.archestra.database).iamAuth | default dict }}
+{{- $envOverrides := merge (dict) (.Values.archestra.env | default dict) (.migrationJobEnvOverride | default dict) }}
+{{- range .Values.archestra.envFromSecrets }}
+{{- $_ := set $envOverrides .name true }}
+{{- end }}
+{{- range .Values.archestra.envWithValueFrom }}
+{{- $_ := set $envOverrides .name true }}
+{{- end }}
+{{- if and $iamAuth.enabled (not (hasKey $envOverrides "ARCHESTRA_DATABASE_IAM_AUTH_ENABLED")) }}
+- name: ARCHESTRA_DATABASE_IAM_AUTH_ENABLED
+  value: "true"
+{{- end }}
+{{- if and $iamAuth.awsRegion (not (hasKey $envOverrides "ARCHESTRA_DATABASE_AWS_REGION")) }}
+- name: ARCHESTRA_DATABASE_AWS_REGION
+  value: {{ $iamAuth.awsRegion | quote }}
+{{- end }}
+{{- if $iamAuth.injectWebIdentityTokenVolume }}
+{{- if and $iamAuth.roleArn (not (hasKey $envOverrides "AWS_ROLE_ARN")) }}
+- name: AWS_ROLE_ARN
+  value: {{ $iamAuth.roleArn | quote }}
+{{- end }}
+{{- if not (hasKey $envOverrides "AWS_WEB_IDENTITY_TOKEN_FILE") }}
+- name: AWS_WEB_IDENTITY_TOKEN_FILE
+  value: "/var/run/secrets/aws-iam-token/serviceaccount/token"
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Budget a Deployment's target replicas, surge, and one terminating old revision.
+Percentage maxSurge values round up, matching Kubernetes Deployment behavior.
+*/}}
+{{- define "archestra-platform.rolloutPodCount" -}}
+{{- $replicas := int .replicas -}}
+{{- $surge := 0 -}}
+{{- $strategy := .strategy | default dict -}}
+{{- if eq ($strategy.type | default "RollingUpdate") "RollingUpdate" -}}
+  {{- $rollingUpdate := $strategy.rollingUpdate | default dict -}}
+  {{- $rawSurge := "25%" -}}
+  {{- if hasKey $rollingUpdate "maxSurge" -}}
+    {{- $rawSurge = toString $rollingUpdate.maxSurge -}}
+  {{- end -}}
+  {{- if hasSuffix "%" $rawSurge -}}
+    {{- $percent := int (trimSuffix "%" $rawSurge) -}}
+    {{- $surge = div (add (mul $replicas $percent) 99) 100 -}}
+  {{- else -}}
+    {{- $surge = int $rawSurge -}}
+  {{- end -}}
+  {{- $surge = add $surge $replicas -}}
+{{- end -}}
+{{- add $replicas $surge -}}
+{{- end }}
+
+{{/*
+Divide the connection budget across web and worker rollout pods. Each pod
+reserves ten cache connections and two notification listeners outside its query
+pool. HPA maxReplicas is the web ceiling. Overlapping rollouts need extra headroom.
+*/}}
+{{- define "archestra-platform.databasePoolMax" -}}
+{{- $webReplicas := int .Values.archestra.replicaCount -}}
+{{- if .Values.archestra.horizontalPodAutoscaler.enabled -}}
+  {{- $webReplicas = int .Values.archestra.horizontalPodAutoscaler.maxReplicas -}}
+{{- end -}}
+{{- $peakPods := int (include "archestra-platform.rolloutPodCount" (dict "replicas" $webReplicas "strategy" .Values.archestra.deploymentStrategy)) -}}
+{{- if .Values.archestra.worker.enabled -}}
+  {{- $workerPods := int (include "archestra-platform.rolloutPodCount" (dict "replicas" .Values.archestra.worker.replicaCount "strategy" .Values.archestra.worker.deploymentStrategy)) -}}
+  {{- $peakPods = add $peakPods $workerPods -}}
+{{- end -}}
+{{- $peakPods = max 1 $peakPods -}}
+{{- $configuredPoolMax := .Values.archestra.database.poolMax -}}
+{{- if ne (toString $configuredPoolMax) "<nil>" -}}
+  {{- if or (lt (int $configuredPoolMax) 1) (gt (int $configuredPoolMax) 500) -}}
+    {{- fail "Configuration error: archestra.database.poolMax must be between 1 and 500." -}}
+  {{- end -}}
+  {{- int $configuredPoolMax -}}
+{{- else -}}
+  {{- $budget := int .Values.archestra.database.connectionBudget -}}
+  {{- $connectionsPerPod := div $budget $peakPods -}}
+  {{- if lt $connectionsPerPod 13 -}}
+    {{- fail (printf "Configuration error: archestra.database.connectionBudget (%d) must provide at least 13 connections (1 query, 10 cache, 2 listeners) for each of the %d peak backend pods." $budget $peakPods) -}}
+  {{- end -}}
+  {{- min 500 (sub $connectionsPerPod 12) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Keys of the chart-managed auth Secret that come from Helm values: the external
+database URL, sensitive archestra.env values, ARCHESTRA_CHAT_*_API_KEY values,
+and authSecret.extraData. Rendered into secret.yaml and hashed by
+archestra-platform.authSecretChecksum.
+*/}}
+{{- define "archestra-platform.authSecretValuesData" -}}
+{{- if and .Values.postgresql.external_database_url (ne (toString .Values.postgresql.external_database_url) "from_vault") }}
+database-url: {{ .Values.postgresql.external_database_url | b64enc }}
+{{- end }}
+{{- range splitList "," (include "archestra-platform.sensitiveEnvVars" .) }}
+{{- if hasKey $.Values.archestra.env . }}
+{{- $value := index $.Values.archestra.env . }}
+{{- if $value }}
+{{ . | lower | replace "_" "-" }}: {{ $value | b64enc }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- range $key, $value := .Values.archestra.env }}
+{{- if and (hasPrefix "ARCHESTRA_CHAT_" $key) (hasSuffix "_API_KEY" $key) $value }}
+{{ $key | lower | replace "_" "-" }}: {{ $value | b64enc }}
+{{- end }}
+{{- end }}
+{{- range $key, $value := .Values.archestra.authSecret.extraData }}
+{{ $key }}: {{ $value | toString | b64enc }}
+{{- end }}
+{{- end }}
+
+{{/*
+Checksum of the values-sourced keys of the chart-managed auth Secret, set as
+the checksum/auth-secret pod annotation on the web and worker Deployments so a
+changed value rolls them. Empty when authSecret.existingSecretName is set: the
+chart renders no Secret then. The generated keys (auth-secret, session-secret,
+secrets-encryption-secret, offer-signing-secret) are left out on purpose: they
+are random on any render without cluster access (helm template, GitOps
+controllers), which would roll the pods on every sync. Change one in the
+Secret directly and restart the pods.
+*/}}
+{{- define "archestra-platform.authSecretChecksum" -}}
+{{- if not .Values.archestra.authSecret.existingSecretName -}}
+{{- include "archestra-platform.authSecretValuesData" . | sha256sum -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Sensitive environment variables, comma-joined. A non-empty archestra.env value
+for one of them is stored in the Helm-managed auth Secret (secret.yaml) and
+referenced via secretKeyRef instead of being exposed as plaintext in Pod specs.
+Additionally, any env var matching ARCHESTRA_CHAT_*_API_KEY is treated as
+sensitive. Read it with: splitList "," (include "archestra-platform.sensitiveEnvVars" .)
+*/}}
+{{- define "archestra-platform.sensitiveEnvVars" -}}
+{{- join "," (list
+  "ARCHESTRA_AUTH_SECRET"
+  "ARCHESTRA_AUTH_SESSION_SECRET"
+  "ARCHESTRA_SECRETS_ENCRYPTION_SECRET"
+  "ARCHESTRA_SECRETS_ENCRYPTION_SECRET_PREVIOUS"
+  "ARCHESTRA_CONTENT_ENCRYPTION_SECRET"
+  "ARCHESTRA_CONTENT_ENCRYPTION_SECRET_PREVIOUS"
+  "ARCHESTRA_AUTH_ADMIN_PASSWORD"
+  "ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_PASSWORD"
+  "ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_BEARER"
+  "ARCHESTRA_AUDIT_LOG_OTEL_AUTH_PASSWORD"
+  "ARCHESTRA_AUDIT_LOG_OTEL_AUTH_BEARER"
+  "ARCHESTRA_METRICS_SECRET"
+  "ARCHESTRA_HASHICORP_VAULT_TOKEN"
+  "ARCHESTRA_OPENAPPA_OFFER_SIGNING_SECRET"
+  "ARCHESTRA_AGENTS_INCOMING_EMAIL_OUTLOOK_CLIENT_SECRET"
+  "ARCHESTRA_KNOWLEDGE_BASE_GOOGLE_DRIVE_OAUTH_CLIENT_SECRET"
+  "ARCHESTRA_FILE_STORAGE_S3_SECRET_ACCESS_KEY"
+  "ARCHESTRA_NGROK_AUTH_TOKEN"
+  "ARCHESTRA_ANTHROPIC_IDENTITY_TOKEN"
+  "AWS_SECRET_ACCESS_KEY"
+  "AWS_SESSION_TOKEN"
+) -}}
+{{- end }}
+
+{{- define "archestra-platform.env" -}}
+{{/*
+Names supplied explicitly through archestra.env, envFromSecrets, or
+envWithValueFrom. The chart skips its own injection of a variable named here,
+so a value sourced from an external Secret replaces the default instead of
+producing a duplicate env entry.
+*/}}
+{{- $explicitEnvNames := dict }}
+{{- range $key, $_ := .Values.archestra.env }}
+{{- $_ := set $explicitEnvNames $key true }}
+{{- end }}
+{{- range .Values.archestra.envFromSecrets }}
+{{- $_ := set $explicitEnvNames .name true }}
+{{- end }}
+{{- range .Values.archestra.envWithValueFrom }}
+{{- $_ := set $explicitEnvNames .name true }}
+{{- end }}
+{{- $podNameProvided := hasKey .Values.archestra.env "POD_NAME" }}
+{{- $podNamespaceProvided := hasKey .Values.archestra.env "POD_NAMESPACE" }}
+{{- range .Values.archestra.envWithValueFrom }}
+  {{- if eq .name "POD_NAME" }}{{- $podNameProvided = true }}{{- end }}
+  {{- if eq .name "POD_NAMESPACE" }}{{- $podNamespaceProvided = true }}{{- end }}
+{{- end }}
+{{- if not $podNameProvided }}
+- name: POD_NAME
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.name
+{{- end }}
+{{- if not $podNamespaceProvided }}
+- name: POD_NAMESPACE
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.namespace
+{{- end }}
+{{- if not (hasKey .Values.archestra.env "ARCHESTRA_DATABASE_RUN_MIGRATIONS_ON_STARTUP") }}
+- name: ARCHESTRA_DATABASE_RUN_MIGRATIONS_ON_STARTUP
+  value: {{ .Values.archestra.migrationJob.enabled | quote }}
+{{- end }}
+{{- include "archestra-platform.databaseEnv" . }}
+{{- $databasePoolProvided := hasKey .Values.archestra.env "ARCHESTRA_DATABASE_POOL_MAX" }}
+{{- range .Values.archestra.envWithValueFrom }}
+  {{- if eq .name "ARCHESTRA_DATABASE_POOL_MAX" }}{{- $databasePoolProvided = true }}{{- end }}
+{{- end }}
+{{- range .Values.archestra.envFromSecrets }}
+  {{- if eq .name "ARCHESTRA_DATABASE_POOL_MAX" }}{{- $databasePoolProvided = true }}{{- end }}
+{{- end }}
+{{- $bulkPool := .Values.archestra.database.poolMaxFromEnvFrom }}
+{{- if ne (toString $bulkPool) "<nil>" }}
+  {{- if not (kindIs "bool" $bulkPool) }}
+    {{- fail "Configuration error: archestra.database.poolMaxFromEnvFrom must be true, false, or null." }}
+  {{- end }}
+  {{- if $bulkPool }}
+    {{- if not .Values.archestra.envFrom }}
+      {{- fail "Configuration error: archestra.database.poolMaxFromEnvFrom requires archestra.envFrom." }}
+    {{- end }}
+    {{- $hasUnprefixedSource := false }}
+    {{- range .Values.archestra.envFrom }}
+      {{- if not .prefix }}{{- $hasUnprefixedSource = true }}{{- end }}
+    {{- end }}
+    {{- if not $hasUnprefixedSource }}
+      {{- fail "Configuration error: archestra.database.poolMaxFromEnvFrom requires an unprefixed envFrom source supplying ARCHESTRA_DATABASE_POOL_MAX." }}
+    {{- end }}
+    {{- if or $databasePoolProvided (ne (toString .Values.archestra.database.poolMax) "<nil>") }}
+      {{- fail "Configuration error: archestra.database.poolMaxFromEnvFrom cannot be combined with an explicit pool override." }}
+    {{- end }}
+    {{- $databasePoolProvided = true }}
+  {{- end }}
+{{- else if and (not $databasePoolProvided) (eq (toString .Values.archestra.database.poolMax) "<nil>") }}
+  {{/* Preserve existing bulk environment imports on upgrade. Helm cannot
+       inspect their keys; explicit env would silently override a supplied pool.
+       Prefixed sources cannot supply ARCHESTRA_DATABASE_POOL_MAX. */}}
+  {{- range .Values.archestra.envFrom }}
+    {{- if not .prefix }}{{- $databasePoolProvided = true }}{{- end }}
+  {{- end }}
+{{- end }}
+{{/* An omitted budget preserves the backend default on upgrade. Check for nil
+     explicitly so zero budgets still reach validation instead of opting out. */}}
+{{- $databasePoolConfigured := or (ne (toString .Values.archestra.database.poolMax) "<nil>") (ne (toString .Values.archestra.database.connectionBudget) "<nil>") }}
+{{- if and (not $databasePoolProvided) $databasePoolConfigured }}
+- name: ARCHESTRA_DATABASE_POOL_MAX
+  value: {{ include "archestra-platform.databasePoolMax" . | quote }}
+{{- end }}
 {{/*
 When both external_database_url is null and postgresql.enabled is false,
 ARCHESTRA_DATABASE_URL is not set here. Use archestra.envFromSecrets to inject it from a pre-existing K8s secret.
 */}}
 {{/*
 Assigns value from autogenerated auth-secret to ARCHESTRA_AUTH_SECRET by default.
-If ARCHESTRA_AUTH_SECRET env variable is explicitly set, it will override the autogenerated default.
+If ARCHESTRA_AUTH_SECRET is explicitly set (archestra.env, envFromSecrets, or
+envWithValueFrom), it overrides the autogenerated default.
 */}}
-{{- if not (hasKey .Values.archestra.env "ARCHESTRA_AUTH_SECRET") }}
+{{- if not (hasKey $explicitEnvNames "ARCHESTRA_AUTH_SECRET") }}
 - name: ARCHESTRA_AUTH_SECRET
   valueFrom:
     secretKeyRef:
       name: {{ include "archestra-platform.authSecretName" . }}
-      key: {{ include "archestra-platform.authSecretKey" . }}
+      key: {{ include "archestra-platform.authSecretKeyFor" (dict "root" . "value" "existingSecretKey" "default" "auth-secret") | quote }}
+{{- end }}
+
+{{/*
+Inject the session-signing and secret-encryption secrets from the auth Secret
+(Helm-managed or authSecret.existingSecretName) — an external Secret must
+provide both keys. The keys default to session-secret and
+secrets-encryption-secret; an external Secret can name them through
+authSecret.existingSessionSecretKey and existingSecretsEncryptionSecretKey.
+An explicit archestra.env, envFromSecrets, or envWithValueFrom entry overrides
+the injection.
+*/}}
+{{- $authSecretName := include "archestra-platform.authSecretName" . }}
+{{- if not (hasKey $explicitEnvNames "ARCHESTRA_AUTH_SESSION_SECRET") }}
+- name: ARCHESTRA_AUTH_SESSION_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ $authSecretName }}
+      key: {{ include "archestra-platform.authSecretKeyFor" (dict "root" . "value" "existingSessionSecretKey" "default" "session-secret") | quote }}
+      # optional so pods still start when the key is absent (the pre-upgrade
+      # migration Job runs before the Secret is updated; config.ts then falls
+      # back to ARCHESTRA_AUTH_SECRET).
+      optional: true
+{{- end }}
+{{- if not (hasKey $explicitEnvNames "ARCHESTRA_SECRETS_ENCRYPTION_SECRET") }}
+- name: ARCHESTRA_SECRETS_ENCRYPTION_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ $authSecretName }}
+      key: {{ include "archestra-platform.authSecretKeyFor" (dict "root" . "value" "existingSecretsEncryptionSecretKey" "default" "secrets-encryption-secret") | quote }}
+      optional: true
+{{- end }}
+{{- if not (hasKey $explicitEnvNames "ARCHESTRA_OPENAPPA_OFFER_SIGNING_SECRET") }}
+- name: ARCHESTRA_OPENAPPA_OFFER_SIGNING_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ $authSecretName }}
+      key: {{ include "archestra-platform.authSecretKeyFor" (dict "root" . "value" "existingOfferSigningSecretKey" "default" "offer-signing-secret") | quote }}
+      # optional so pods still start when the key is absent (pre-upgrade
+      # migration Job ordering, or an external Secret without this key;
+      # config.ts then falls back to a key derived from the auth secret).
+      optional: true
 {{- end }}
 {{- if not (hasKey .Values.archestra.env "ARCHESTRA_ORCHESTRATOR_K8S_NAMESPACE") }}
 - name: ARCHESTRA_ORCHESTRATOR_K8S_NAMESPACE
   value: {{ default .Release.Namespace .Values.archestra.orchestrator.kubernetes.namespace | quote }}
 {{- end }}
+{{/* The release name, told to the backend rather than left for it to infer.
+     Cluster objects the backend creates for ITSELF (the MCP image pre-pull
+     DaemonSet) are named after it, so two releases sharing a namespace never
+     fight over one object — and a backend that inferred the name from a pod
+     read could infer a different one after a blip and strand a second,
+     permanently orphaned object in the cluster. */}}
+{{- if not (hasKey .Values.archestra.env "ARCHESTRA_ORCHESTRATOR_HELM_RELEASE_NAME") }}
+- name: ARCHESTRA_ORCHESTRATOR_HELM_RELEASE_NAME
+  value: {{ .Release.Name | quote }}
+{{- end }}
+{{- if and .Values.archestra.orchestrator.kubernetes.rbac.create (not (hasKey .Values.archestra.env "ARCHESTRA_ORCHESTRATOR_MCP_RUNTIME_OWNER_ROLE")) }}
+- name: ARCHESTRA_ORCHESTRATOR_MCP_RUNTIME_OWNER_ROLE
+  value: {{ include "archestra-platform.mcpRuntimeOwnerRoleName" . | quote }}
+{{- end }}
+{{- if and .Values.archestra.releaseImageDigests (not (hasKey .Values.archestra.env "ARCHESTRA_RELEASE_IMAGE_DIGESTS")) }}
+- name: ARCHESTRA_RELEASE_IMAGE_DIGESTS
+  value: {{ .Values.archestra.releaseImageDigests | toJson | quote }}
+{{- end }}
 {{- if .Values.archestra.orchestrator.baseImage }}
 - name: ARCHESTRA_ORCHESTRATOR_MCP_SERVER_BASE_IMAGE
   value: {{ .Values.archestra.orchestrator.baseImage | quote }}
+{{- end }}
+{{- if .Values.archestra.knowledgeBase.perforceShim.image }}
+- name: ARCHESTRA_KNOWLEDGE_BASE_PERFORCE_SHIM_IMAGE
+  value: {{ .Values.archestra.knowledgeBase.perforceShim.image | quote }}
+{{- end }}
+{{- with .Values.archestra.orchestrator.mcpServerResources }}
+{{- if .requests.cpu }}
+- name: ARCHESTRA_ORCHESTRATOR_MCP_SERVER_CPU_REQUEST
+  value: {{ .requests.cpu | quote }}
+{{- end }}
+{{- if .requests.memory }}
+- name: ARCHESTRA_ORCHESTRATOR_MCP_SERVER_MEMORY_REQUEST
+  value: {{ .requests.memory | quote }}
+{{- end }}
+{{- if .requests.ephemeralStorage }}
+- name: ARCHESTRA_ORCHESTRATOR_MCP_SERVER_EPHEMERAL_STORAGE_REQUEST
+  value: {{ .requests.ephemeralStorage | quote }}
+{{- end }}
+{{- if .limits.memory }}
+- name: ARCHESTRA_ORCHESTRATOR_MCP_SERVER_MEMORY_LIMIT
+  value: {{ .limits.memory | quote }}
+{{- end }}
+{{- if .limits.ephemeralStorage }}
+- name: ARCHESTRA_ORCHESTRATOR_MCP_SERVER_EPHEMERAL_STORAGE_LIMIT
+  value: {{ .limits.ephemeralStorage | quote }}
+{{- end }}
+{{- end }}
+{{/* "0" is a meaningful value (disables the reaper), so compare against the
+     empty string instead of relying on truthiness. */}}
+{{- if ne (toString .Values.archestra.orchestrator.failedPodReapIntervalSeconds) "" }}
+- name: ARCHESTRA_ORCHESTRATOR_FAILED_POD_REAP_INTERVAL_SECONDS
+  value: {{ .Values.archestra.orchestrator.failedPodReapIntervalSeconds | quote }}
+{{- end }}
+{{/* "0" is a meaningful value — the operator's kill switch — so compare
+     against the empty string instead of relying on truthiness. */}}
+{{- if ne (toString .Values.archestra.orchestrator.mcpIdleHibernationSeconds) "" }}
+- name: ARCHESTRA_ORCHESTRATOR_MCP_IDLE_HIBERNATION_SECONDS
+  value: {{ .Values.archestra.orchestrator.mcpIdleHibernationSeconds | quote }}
+{{- end }}
+{{- with .Values.archestra.orchestrator.mcpImagePrepull }}
+{{/* "false" is a meaningful value — the operator's kill switch for pre-pulling
+     alone, leaving hibernation on — so compare against the empty string instead
+     of relying on truthiness. */}}
+{{- if ne (toString .enabled) "" }}
+- name: ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_ENABLED
+  value: {{ .enabled | quote }}
+{{- end }}
+{{- if .priorityClassName }}
+- name: ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_PRIORITY_CLASS_NAME
+  value: {{ .priorityClassName | quote }}
+{{- end }}
+{{/* This binary is copied into arbitrary MCP images and must be static: the
+     generic init-container busybox can use a libc the target image lacks. */}}
+{{- $prepullBootstrapImage := include "archestra-platform.pinnedImage" (dict "image" (.bootstrapImage | default "docker.io/library/busybox:1.36-musl") "registry" .bootstrapImageRegistry "defaultImage" "docker.io/library/busybox:1.36-musl" "digest" .bootstrapImageDigest) }}
+{{- if $prepullBootstrapImage }}
+- name: ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_BOOTSTRAP_IMAGE
+  value: {{ $prepullBootstrapImage | quote }}
+{{- end }}
+{{- if .bootstrapImagePullSecrets }}
+- name: ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_BOOTSTRAP_IMAGE_PULL_SECRETS
+  value: {{ join "," .bootstrapImagePullSecrets | quote }}
+{{- end }}
+{{- with .resources }}
+{{- if .requests.cpu }}
+- name: ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_CPU_REQUEST
+  value: {{ .requests.cpu | quote }}
+{{- end }}
+{{- if .requests.memory }}
+- name: ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_MEMORY_REQUEST
+  value: {{ .requests.memory | quote }}
+{{- end }}
+{{- if .limits.memory }}
+- name: ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_MEMORY_LIMIT
+  value: {{ .limits.memory | quote }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- if and .Values.archestra.orchestrator.kubernetes.kubeconfig.enabled .Values.archestra.orchestrator.kubernetes.kubeconfig.secretName }}
 - name: ARCHESTRA_ORCHESTRATOR_KUBECONFIG
@@ -124,6 +515,47 @@ If ARCHESTRA_AUTH_SECRET env variable is explicitly set, it will override the au
 - name: ARCHESTRA_ORCHESTRATOR_K8S_CLUSTER_DOMAIN
   value: {{ .Values.archestra.orchestrator.kubernetes.clusterDomain | quote }}
 {{- end }}
+{{- if and .Values.archestra.orchestrator.kubernetes.clusterDnsIps (not (hasKey .Values.archestra.env "ARCHESTRA_ORCHESTRATOR_K8S_CLUSTER_DNS_IPS")) }}
+- name: ARCHESTRA_ORCHESTRATOR_K8S_CLUSTER_DNS_IPS
+  value: {{ join "," .Values.archestra.orchestrator.kubernetes.clusterDnsIps | quote }}
+{{- end }}
+{{- if and .Values.archestra.orchestrator.kubernetes.rbac.environmentNamespaces (not (hasKey .Values.archestra.env "ARCHESTRA_ORCHESTRATOR_ENVIRONMENT_NAMESPACES")) }}
+- name: ARCHESTRA_ORCHESTRATOR_ENVIRONMENT_NAMESPACES
+  value: {{ join "," .Values.archestra.orchestrator.kubernetes.rbac.environmentNamespaces | quote }}
+{{- end }}
+{{- if .Values.archestra.sre.enabled }}
+{{- if not (hasKey .Values.archestra.env "ARCHESTRA_SRE_AGENT_ENABLED") }}
+- name: ARCHESTRA_SRE_AGENT_ENABLED
+  value: "true"
+{{- end }}
+{{/* The SRE ServiceAccount (templates/sre-serviceaccount.yaml) is bound to
+     the read-only Role, which exists only when the chart creates the MCP
+     server RBAC. */}}
+{{- if and .Values.archestra.orchestrator.kubernetes.mcpServerRbac.create (not (hasKey .Values.archestra.env "ARCHESTRA_SRE_K8S_SERVICE_ACCOUNT")) }}
+- name: ARCHESTRA_SRE_K8S_SERVICE_ACCOUNT
+  value: {{ printf "%s-sre" (include "archestra-platform.fullname" .) | quote }}
+{{- end }}
+{{- if and .Values.archestra.sre.apiServerCidrs (not (hasKey .Values.archestra.env "ARCHESTRA_SRE_APISERVER_CIDRS")) }}
+- name: ARCHESTRA_SRE_APISERVER_CIDRS
+  value: {{ join "," .Values.archestra.sre.apiServerCidrs | quote }}
+{{- end }}
+{{- end }}
+{{/* always emitted: "false" is the backend kill switch, and it must reach the
+     backend even when a runner host arrives through archestra.env. */}}
+{{- if not (hasKey .Values.archestra.env "ARCHESTRA_CODE_RUNTIME_ENABLED") }}
+- name: ARCHESTRA_CODE_RUNTIME_ENABLED
+  value: {{ .Values.archestra.codeRuntime.enabled | quote }}
+{{- end }}
+{{/* Back-compat: the removed chart-deployed engine's bring-your-own pointer
+     lived at archestra.codeRuntime.dagger.runnerHost. Carry a leftover value
+     into the env var so an upgrade keeps routing to that engine instead of
+     silently dropping it and provisioning engines in-cluster. An explicit
+     archestra.env entry wins. */}}
+{{- $leftoverRunnerHost := dig "dagger" "runnerHost" "" .Values.archestra.codeRuntime }}
+{{- if and $leftoverRunnerHost (not (hasKey .Values.archestra.env "ARCHESTRA_CODE_RUNTIME_DAGGER_RUNNER_HOST")) }}
+- name: ARCHESTRA_CODE_RUNTIME_DAGGER_RUNNER_HOST
+  value: {{ $leftoverRunnerHost | quote }}
+{{- end }}
 {{- if .Values.archestra.diagnostics.enabled }}
 - name: ARCHESTRA_NODE_DIAGNOSTIC_DIR
   value: "/var/diagnostics"
@@ -132,21 +564,14 @@ If ARCHESTRA_AUTH_SECRET env variable is explicitly set, it will override the au
   value: {{ .Values.archestra.diagnostics.heapSnapshotsNearHeapLimit | quote }}
 {{- end }}
 {{- end }}
-{{- range $key, $value := .Values.archestra.env }}
-{{/* Check if env var is in the explicit sensitive list OR matches ARCHESTRA_CHAT_*_API_KEY pattern */}}
-{{- $isSensitive := or (has $key $sensitiveEnvVars) (and (hasPrefix "ARCHESTRA_CHAT_" $key) (hasSuffix "_API_KEY" $key)) }}
-{{/* Only use secretKeyRef for sensitive vars with non-empty values; empty values are set as regular env vars */}}
-{{- if and $isSensitive $value }}
-{{/* Sensitive env vars with values are stored in the Secret and referenced via secretKeyRef */}}
-- name: {{ $key }}
-  valueFrom:
-    secretKeyRef:
-      name: {{ include "archestra-platform.authSecretName" $ }}
-      key: {{ $key | lower | replace "_" "-" }}
-{{- else }}
-- name: {{ $key }}
-  value: {{ $value | quote }}
+{{- if eq .Values.archestra.fileStorage.provider "filesystem" }}
+- name: ARCHESTRA_FILE_STORAGE_PROVIDER
+  value: "filesystem"
+- name: ARCHESTRA_FILE_STORAGE_FILESYSTEM_ROOT
+  value: {{ .Values.archestra.fileStorage.filesystem.mountPath | quote }}
 {{- end }}
+{{- range $key, $value := .Values.archestra.env }}
+{{- include "archestra-platform.envEntry" (dict "root" $ "key" $key "value" $value) }}
 {{- end }}
 {{- range .Values.archestra.envFromSecrets }}
 - name: {{ .name }}
@@ -160,6 +585,99 @@ If ARCHESTRA_AUTH_SECRET env variable is explicitly set, it will override the au
   valueFrom:
     {{- toYaml .valueFrom | nindent 4 }}
 {{- end }}
+{{- if and (not (hasKey .Values.archestra.env "ARCHESTRA_SERVER_REQUEST_DRAIN_SECONDS")) (hasKey (.Values.archestra.shutdown | default dict) "requestDrainSeconds") (ne (toString (get (.Values.archestra.shutdown | default dict) "requestDrainSeconds")) "<nil>") }}
+- name: ARCHESTRA_SERVER_REQUEST_DRAIN_SECONDS
+  value: {{ include "archestra-platform.shutdownDrain" . | quote }}
+{{- end }}
+{{- if and (not (hasKey .Values.archestra.env "ARCHESTRA_SERVER_SHUTDOWN_CLEANUP_SECONDS")) (hasKey (.Values.archestra.shutdown | default dict) "cleanupSeconds") (ne (toString (get (.Values.archestra.shutdown | default dict) "cleanupSeconds")) "<nil>") }}
+- name: ARCHESTRA_SERVER_SHUTDOWN_CLEANUP_SECONDS
+  value: {{ include "archestra-platform.shutdownCleanup" . | quote }}
+{{- end }}
+{{- if and (not (hasKey .Values.archestra.env "ARCHESTRA_KNOWLEDGE_BASE_TASK_WORKER_SHUTDOWN_TIMEOUT_SECONDS")) (hasKey (.Values.archestra.shutdown | default dict) "workerTaskTimeoutSeconds") (ne (toString (get (.Values.archestra.shutdown | default dict) "workerTaskTimeoutSeconds")) "<nil>") }}
+- name: ARCHESTRA_KNOWLEDGE_BASE_TASK_WORKER_SHUTDOWN_TIMEOUT_SECONDS
+  value: {{ include "archestra-platform.shutdownWorker" . | quote }}
+{{- end }}
+- name: ARCHESTRA_SERVER_POD_GRACE_SECONDS
+  value: {{ include "archestra-platform.shutdownPodGrace" . | quote }}
+
+{{- end }}
+
+{{/*
+One archestra.env entry. A sensitive value is read from the auth Secret, which
+holds it (templates/secret.yaml); anything else renders as a literal.
+Usage: include "archestra-platform.envEntry" (dict "root" $ "key" $key "value" $value)
+*/}}
+{{- define "archestra-platform.envEntry" -}}
+{{- $root := .root }}
+{{- $key := .key }}
+{{- $value := .value }}
+{{/* Check if env var is in the explicit sensitive list OR matches ARCHESTRA_CHAT_*_API_KEY pattern */}}
+{{- $sensitiveEnvVars := splitList "," (include "archestra-platform.sensitiveEnvVars" $root) }}
+{{- $isSensitive := or (has $key $sensitiveEnvVars) (and (hasPrefix "ARCHESTRA_CHAT_" $key) (hasSuffix "_API_KEY" $key)) }}
+{{/* Only use secretKeyRef for sensitive vars with non-empty values; empty values are set as regular env vars */}}
+{{- if and $isSensitive $value }}
+{{/* Sensitive env vars with values are stored in the Secret and referenced via secretKeyRef */}}
+{{- $secretNameForKey := include "archestra-platform.authSecretName" $root }}
+{{- if and (has $key (list "AWS_SECRET_ACCESS_KEY" "AWS_SESSION_TOKEN")) $root.migrationAwsSecretNameOverride }}
+{{- $secretNameForKey = $root.migrationAwsSecretNameOverride }}
+{{- end }}
+- name: {{ $key }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ $secretNameForKey }}
+      key: {{ $key | lower | replace "_" "-" }}
+{{- /*
+optional: the pre-upgrade migrate Job renders from the NEW templates but runs
+BEFORE the upgraded Secret is applied, so on the upgrade that first introduces
+one of these keys the referenced Secret key does not exist yet and a required
+ref would wedge the Job in CreateContainerConfigError until its deadline.
+Migrations don't need the key; app pods start after the Secret update in the
+same apply, and the application's own fail-closed key check (canary) catches a
+genuinely missing key loudly at startup.
+*/}}
+{{- if has $key (list "ARCHESTRA_CONTENT_ENCRYPTION_SECRET" "ARCHESTRA_CONTENT_ENCRYPTION_SECRET_PREVIOUS" "ARCHESTRA_ANTHROPIC_IDENTITY_TOKEN") }}
+      optional: true
+{{- end }}
+{{- else }}
+- name: {{ $key }}
+  value: {{ $value | quote }}
+{{- end }}
+{{- end }}
+
+{{/*
+Expose declared memory resources in MiB so the production Node launcher can
+derive a V8 old-space ceiling. Only emit fields that are explicitly configured:
+resourceFieldRef otherwise falls back to node allocatable memory.
+
+Callers may pass `reservedMib` for a container that runs something else besides
+this Node process. The launcher subtracts it from the limit before applying its
+percentage, so the split is taken over memory this process can actually use.
+Omit it for single-process containers.
+*/}}
+{{- define "archestra-platform.nodeMemoryEnv" -}}
+{{- $resources := .resources | default dict -}}
+{{- $requests := get $resources "requests" | default dict -}}
+{{- $limits := get $resources "limits" | default dict -}}
+{{- if .reservedMib }}
+- name: ARCHESTRA_NODE_MEMORY_RESERVED_MIB
+  value: {{ .reservedMib | quote }}
+{{- end }}
+{{- if get $requests "memory" }}
+- name: ARCHESTRA_NODE_MEMORY_REQUEST_MIB
+  valueFrom:
+    resourceFieldRef:
+      containerName: {{ .containerName }}
+      resource: requests.memory
+      divisor: 1Mi
+{{- end }}
+{{- if get $limits "memory" }}
+- name: ARCHESTRA_NODE_MEMORY_LIMIT_MIB
+  valueFrom:
+    resourceFieldRef:
+      containerName: {{ .containerName }}
+      resource: limits.memory
+      divisor: 1Mi
+{{- end }}
 {{- end }}
 
 {{/*
@@ -170,13 +688,26 @@ Auth secret name for the Archestra Platform
 {{- end }}
 
 {{/*
-Auth secret key for the Archestra Platform
+Hook-only auth secret name for the database migration Job.
 */}}
-{{- define "archestra-platform.authSecretKey" -}}
-{{- if and (not .Values.archestra.authSecret.existingSecretName) (ne .Values.archestra.authSecret.existingSecretKey "auth-secret") -}}
-{{- fail "archestra.authSecret.existingSecretKey requires archestra.authSecret.existingSecretName to also be set." -}}
+{{- define "archestra-platform.migrationJobAuthSecretName" -}}
+{{- printf "%s-migrate-auth" (include "archestra-platform.fullname" .) -}}
+{{- end }}
+
+{{/*
+Key within the auth Secret for one of its values. Takes a dict with the root
+context ("root"), the authSecret value naming the key ("value"), and the key
+the Helm-managed Secret uses ("default"). A custom key only makes sense with
+authSecret.existingSecretName, because the Helm-managed Secret always writes
+the default keys.
+*/}}
+{{- define "archestra-platform.authSecretKeyFor" -}}
+{{- $authSecret := .root.Values.archestra.authSecret -}}
+{{- $key := default .default (get $authSecret .value) -}}
+{{- if and (not $authSecret.existingSecretName) (ne $key .default) -}}
+{{- fail (printf "archestra.authSecret.%s requires archestra.authSecret.existingSecretName to also be set." .value) -}}
 {{- end -}}
-{{- default "auth-secret" .Values.archestra.authSecret.existingSecretKey -}}
+{{- $key -}}
 {{- end }}
 
 {{/*
@@ -184,6 +715,40 @@ Diagnostics PVC claim name
 */}}
 {{- define "archestra-platform.diagnosticsClaimName" -}}
 {{- default (printf "%s-diagnostics" (include "archestra-platform.fullname" .)) .Values.archestra.diagnostics.existingClaimName -}}
+{{- end }}
+
+{{/*
+File storage PVC claim name
+*/}}
+{{- define "archestra-platform.fileStorageClaimName" -}}
+{{- default (printf "%s-file-storage" (include "archestra-platform.fullname" .)) .Values.archestra.fileStorage.filesystem.existingClaim -}}
+{{- end }}
+
+{{/*
+Annotations for the platform ServiceAccount, as YAML: the configured
+annotations plus the IRSA role derived from archestra.database.iamAuth. The
+migration Job's hook ServiceAccount carries the same annotations.
+*/}}
+{{- define "archestra-platform.serviceAccountAnnotations" -}}
+{{- $saAnnotations := deepCopy (.Values.archestra.orchestrator.kubernetes.serviceAccount.annotations | default dict) -}}
+{{- $iamAuth := (.Values.archestra.database).iamAuth | default dict -}}
+{{- if and $iamAuth.roleArn (not $iamAuth.injectWebIdentityTokenVolume) (not (hasKey $saAnnotations "eks.amazonaws.com/role-arn")) -}}
+{{- $_ := set $saAnnotations "eks.amazonaws.com/role-arn" $iamAuth.roleArn -}}
+{{- end -}}
+{{- toYaml $saAnnotations -}}
+{{- end }}
+
+{{/*
+ServiceAccount name for the database migration Job: the hook-only
+<fullname>-migrate account when migrationJob.serviceAccount.create is set,
+otherwise the platform ServiceAccount.
+*/}}
+{{- define "archestra-platform.migrationJobServiceAccountName" -}}
+{{- if (.Values.archestra.migrationJob.serviceAccount).create -}}
+{{- printf "%s-migrate" (include "archestra-platform.fullname" .) -}}
+{{- else -}}
+{{- include "archestra-platform.serviceAccountName" . -}}
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -198,12 +763,149 @@ ServiceAccount name for the Archestra Platform
 {{- end }}
 
 {{/*
+RBAC rules granting the platform ServiceAccount the permissions it needs to
+manage MCP server workloads AND the Dagger sandbox engines it provisions per
+environment and per organization (StatefulSet + engine-config ConfigMap + egress
+NetworkPolicy, reached via pods/exec + pods/attach) in a namespace. The chart
+deploys no engine itself; this Role is what lets the backend create them. Shared
+by the release-namespace Role and the per-namespace Roles generated from
+rbac.environmentNamespaces, so both grant exactly the same access (no drift).
+*/}}
+{{/*
+Read-only rules of the Kubernetes MCP servers' Role (mcp-server-operator), also
+granted to the SRE agent in the release namespace when MCP servers run in
+another one (templates/sre-serviceaccount.yaml).
+*/}}
+{{- define "archestra-platform.mcpServerOperatorRules" -}}
+# Minimal read-only permissions for basic Kubernetes inspection
+# Pods - read access only
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+# Pod logs - essential for debugging
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+# Services - common resource to inspect
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch"]
+# Deployments and workloads - common resources to inspect
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+# Events - useful for debugging
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch"]
+{{- end }}
+
+{{- define "archestra-platform.mcpManagerRules" -}}
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "create", "update", "patch", "delete", "watch"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["get", "create"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/attach"]
+  verbs: ["get", "create"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "create", "update", "patch", "delete", "watch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "create", "update", "patch", "delete", "watch"]
+# MCP deployment diagnostics read namespace events to explain failing pods.
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch"]
+# Agent image prefetch reads the default ServiceAccount's image pull secrets.
+- apiGroups: [""]
+  resources: ["serviceaccounts"]
+  resourceNames: ["default"]
+  verbs: ["get"]
+# ConfigMaps for the per-environment Dagger engine config (engine.json).
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "create", "update", "patch", "delete", "watch"]
+# Deployments for MCP servers; StatefulSets for the per-environment Dagger engine.
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets"]
+  verbs: ["get", "list", "create", "update", "patch", "delete", "watch"]
+# Agent Sandbox owns persistent workspaces; transcript recovery reads them.
+# Dagger owns rebuildable engine caches and lists/deletes orphaned cache claims.
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: ["agents.x-k8s.io"]
+  resources: ["sandboxes"]
+  verbs: ["get", "list", "create", "patch", "delete"]
+- apiGroups: ["agents.x-k8s.io"]
+  resources: ["sandboxes/status"]
+  verbs: ["get"]
+- apiGroups: ["extensions.agents.x-k8s.io"]
+  resources: ["sandboxclaims", "sandboxtemplates", "sandboxwarmpools"]
+  verbs: ["get", "list", "create", "patch", "delete"]
+# DaemonSet for the MCP image pre-puller, which keeps every node's image cache
+# warm so a hibernated MCP server wakes without reaching the registry. Narrower
+# than the rule above on purpose: the reconciler only reads and rewrites its own
+# single DaemonSet, and never watches one.
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list", "create", "update", "patch", "delete"]
+# Disposable Claude sign-in Jobs; workspace storage remains managed by Sandbox.
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["create", "delete"]
+# Standard Kubernetes NetworkPolicy for IP/CIDR egress rules.
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["get", "list", "create", "update", "patch", "delete", "watch"]
+# CiliumNetworkPolicy for DNS/FQDN egress rules on Cilium-enabled clusters.
+- apiGroups: ["cilium.io"]
+  resources: ["ciliumnetworkpolicies"]
+  verbs: ["get", "list", "create", "update", "patch", "delete", "watch"]
+# GKE FQDNNetworkPolicy for DNS/FQDN egress rules on supported GKE clusters.
+- apiGroups: ["networking.gke.io"]
+  resources: ["fqdnnetworkpolicies"]
+  verbs: ["get", "list", "create", "update", "patch", "delete", "watch"]
+# EKS Auto Mode ApplicationNetworkPolicy for DNS/FQDN egress rules.
+- apiGroups: ["networking.k8s.aws"]
+  resources: ["applicationnetworkpolicies"]
+  verbs: ["get", "list", "create", "update", "patch", "delete", "watch"]
+{{- end }}
+
+{{/*
 Worker selector labels
 */}}
 {{- define "archestra-platform.workerSelectorLabels" -}}
 app.kubernetes.io/name: {{ include "archestra-platform.name" . }}-worker
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: worker
+{{- end }}
+
+{{/*
+Topology spread constraints for one Deployment. archestra.topologySpreadConstraints
+is shared by the web and worker Deployments, so a constraint without a
+labelSelector gets the rendering Deployment's own selector labels: each
+Deployment then spreads its own pods.
+Usage: include "archestra-platform.topologySpreadConstraints" (dict "constraints" .Values.archestra.topologySpreadConstraints "selectorLabels" (include "archestra-platform.selectorLabels" .))
+*/}}
+{{- define "archestra-platform.topologySpreadConstraints" -}}
+{{- $selector := fromYaml .selectorLabels -}}
+{{- $out := list -}}
+{{- range .constraints -}}
+{{- $constraint := deepCopy . -}}
+{{- if not (hasKey $constraint "labelSelector") -}}
+{{- $_ := set $constraint "labelSelector" (dict "matchLabels" $selector) -}}
+{{- end -}}
+{{- $out = append $out $constraint -}}
+{{- end -}}
+{{- toYaml $out -}}
 {{- end }}
 
 {{/*
@@ -220,15 +922,230 @@ app.kubernetes.io/part-of: archestra
 {{- end }}
 
 {{/*
+Database migration Job labels.
+
+The name label is suffixed with `-migrate` so the platform Service selector
+never routes traffic to the short-lived migration pod.
+*/}}
+{{- define "archestra-platform.migrationJobLabels" -}}
+helm.sh/chart: {{ include "archestra-platform.chart" . }}
+app.kubernetes.io/name: {{ include "archestra-platform.name" . }}-migrate
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: migrate
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: archestra
+{{- end }}
+
+{{/*
+NetworkPolicy enforcement probe labels.
+
+The name label is suffixed with `-netpol-probe` so the platform Service selector
+never routes traffic to a probe pod. The backend finds the probe pods by the
+`app.kubernetes.io/component` label, so it must stay in step with the selector in
+`backend/src/k8s/network-policy-probe.ts`.
+*/}}
+{{- define "archestra-platform.networkPolicyProbeLabels" -}}
+helm.sh/chart: {{ include "archestra-platform.chart" . }}
+app.kubernetes.io/name: {{ include "archestra-platform.name" . }}-netpol-probe
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: netpol-probe
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: archestra
+{{- end }}
+
+{{/*
+Host the probe pods try to reach.
+
+Defaults to the platform's own Service: pod -> ClusterIP -> pod is the datapath
+the product's real egress policies govern and it needs no internet access. Do not
+substitute cluster DNS or the Kubernetes API: NodeLocal DNSCache answers from a
+link-local address on the same node, and on kind/docker-desktop the apiserver
+ClusterIP resolves to the node itself. Several dataplanes leave those node-local
+paths unfiltered, which would report a non-enforcing cluster as enforcing.
+
+Fully qualified (trailing dot) so the resolver does not walk the search list.
+Under the deny-all arm every one of those lookups has to time out, which is far
+slower than the single failure the probe actually needs.
+*/}}
+{{- define "archestra-platform.networkPolicyProbeTarget" -}}
+{{- $domain := .Values.archestra.orchestrator.kubernetes.clusterDomain | default "cluster.local" -}}
+{{- .Values.archestra.networkPolicyProbe.targetHost | default (printf "%s.%s.svc.%s." (include "archestra-platform.fullname" .) .Release.Namespace $domain) -}}
+{{- end }}
+
+{{/*
+Control arm: establish that the target is reachable at all.
+
+Patient and stops at the first success, because on a fresh install the platform
+may still be booting. If this arm never connects the run proves nothing and the
+treatment result must be discarded rather than read as "enforced".
+
+The verdict also travels in the container's termination message: the treatment
+pod is network-isolated by construction and so cannot report to the API server
+itself, but the kubelet copies /dev/termination-log into the pod status on its
+behalf, and the backend reads it from there.
+
+Always exits 0 — this is a diagnostic, and a failing hook would abort the release.
+Avoids $(...) and $((...)), which Kubernetes would try to expand as variable
+references before the shell ever sees them. Each attempt is wrapped in `timeout`
+because a blocked path stalls on DNS as well as the connection, well past what
+the connect timeout implies.
+
+25 attempts at 3s covers a platform that is still booting while staying well
+inside Helm's default --timeout, which the hook wait counts against.
+
+Takes a dict of: host. The port is the chart's fixed backend Service port.
+*/}}
+{{- define "archestra-platform.networkPolicyProbeControlScript" -}}
+command: ["/bin/sh", "-c"]
+args:
+  - |
+    result=blocked
+    i=0
+    while [ $i -lt 25 ]; do
+      if timeout 3 nc -z -w 2 {{ .host }} 9000 2>/dev/null; then
+        result=reachable
+        break
+      fi
+      i=`expr $i + 1`
+      sleep 1
+    done
+    printf '%s' "$result" > /dev/termination-log
+    {{- /*
+      Silent when the target answers: a healthy release should cost the operator
+      no output at all.
+
+      When the target never answers, the treatment arm is blocked for that same
+      reason rather than by any policy, and cannot tell the two apart. This arm
+      is the only one that can, so it reports the run measured nothing — and
+      says it without depending on which line Helm printed first.
+    */}}
+    if [ "$result" = blocked ]; then
+      echo "[archestra] ⚠️ ⚠️ ⚠️  NETWORK POLICY CHECK INCONCLUSIVE  ⚠️ ⚠️ ⚠️  Could not reach {{ .host }}:9000, so enforcement was never measured — environment egress rules (MCP servers, code sandboxes) may be accepted and then silently ignored, leaving pods able to reach cloud metadata endpoints and private cluster ranges. Re-run once the platform is up to get a verdict — see https://archestra.ai/docs/administration/deployment#ssrf-protection-for-mcp-server-pods"
+    fi
+    exit 0
+{{- end }}
+
+{{/*
+Treatment arm: decide whether the deny-all policy selecting this pod bites.
+
+Two safeguards, both learned from watching this misreport on a cluster that does
+enforce:
+
+Settles first. A dataplane programs a new pod's rules asynchronously, so the
+container can start and connect in the gap before they land. Taking the first
+attempt as the answer turns that race into a confident "not enforced".
+
+Then takes a majority of five attempts rather than trusting any single one. A
+lone success cannot outvote a genuinely enforced path, and a lone blip on an
+unenforced cluster cannot fake enforcement — the direction that would hide the
+warning this probe exists to raise. Every attempt runs; there is no early exit,
+since both error directions need the full sample.
+
+Takes a dict of: host. The port is the chart's fixed backend Service port.
+*/}}
+{{- define "archestra-platform.networkPolicyProbeTreatmentScript" -}}
+command: ["/bin/sh", "-c"]
+args:
+  - |
+    sleep 5
+    ok=0
+    i=0
+    while [ $i -lt 5 ]; do
+      if timeout 3 nc -z -w 2 {{ .host }} 9000 2>/dev/null; then
+        ok=`expr $ok + 1`
+      fi
+      i=`expr $i + 1`
+      sleep 1
+    done
+    if [ `expr $ok \* 2` -gt 5 ]; then
+      result=reachable
+    else
+      result=blocked
+    fi
+    printf '%s' "$result" > /dev/termination-log
+    {{- /*
+      Speaks only to warn. Being blocked is also what a target that never came up
+      looks like from inside this pod, so an all-clear here would sometimes
+      announce enforcement nobody measured. The verdict still leaves in the
+      termination message, where the platform resolves it against the control arm
+      and can claim enforcement holding both halves of the evidence.
+
+      One line, because the two supported Helm majors disagree about hook output:
+      Helm 4 routes it through its structured logger, where the whole pod log
+      becomes one `level=... msg="..."` record and every newline arrives as a
+      literal \n, while Helm 3 copies the stream verbatim. A stacked banner
+      renders on 3 and reaches 4 as a row of escapes. Emoji survive both.
+    */}}
+    if [ "$result" = reachable ]; then
+      echo "[archestra] ⚠️ ⚠️ ⚠️  NETWORK POLICY NOT ENFORCED  ⚠️ ⚠️ ⚠️  Environment egress rules (MCP servers, code sandboxes) are accepted and then silently ignored, so pods reach cloud metadata endpoints and private cluster ranges — see https://archestra.ai/docs/administration/deployment#ssrf-protection-for-mcp-server-pods"
+    fi
+    exit 0
+{{- end }}
+
+{{/*
 Shared init containers for both platform and worker Deployments.
-Handles Vault secret injection, pgvector extension setup, and PostgreSQL readiness.
+Handles the Cloud SQL Auth Proxy sidecar, Vault secret injection, pgvector
+extension setup, and PostgreSQL readiness.
 */}}
 {{- define "archestra-platform.initContainers" -}}
+{{- $cloudSqlProxy := (.Values.archestra.database).cloudSqlProxy | default dict }}
+{{- if $cloudSqlProxy.enabled }}
+{{- if not $cloudSqlProxy.instanceConnectionName }}
+{{- fail "archestra.database.cloudSqlProxy.instanceConnectionName is required when the Cloud SQL Auth Proxy is enabled" }}
+{{- end }}
+{{- if .Values.postgresql.enabled }}
+{{- fail "archestra.database.cloudSqlProxy requires postgresql.enabled=false" }}
+{{- end }}
+# Cloud SQL Auth Proxy as a native sidecar: it starts before the remaining
+# init containers, keeps running beside the app, and stops after it.
+- name: cloud-sql-proxy
+  image: {{ printf "%s:%s" $cloudSqlProxy.image.repository $cloudSqlProxy.image.tag }}{{ with $cloudSqlProxy.image.digest }}@{{ . }}{{ end }}
+  restartPolicy: Always
+  args:
+    - --port={{ $cloudSqlProxy.port }}
+    - --health-check
+    - --http-address=0.0.0.0
+    - --http-port={{ $cloudSqlProxy.healthPort }}
+    - --exit-zero-on-sigterm
+    {{- range $cloudSqlProxy.args }}
+    - {{ . | quote }}
+    {{- end }}
+    - {{ $cloudSqlProxy.instanceConnectionName | quote }}
+  startupProbe:
+    httpGet:
+      path: /startup
+      port: {{ $cloudSqlProxy.healthPort }}
+    periodSeconds: 1
+    failureThreshold: 60
+  livenessProbe:
+    httpGet:
+      path: /liveness
+      port: {{ $cloudSqlProxy.healthPort }}
+    periodSeconds: 10
+    failureThreshold: 6
+  securityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+  {{- with $cloudSqlProxy.resources }}
+  resources:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
 {{- if .Values.archestra.initContainers.vaultSecrets.enabled }}
 # Vault secret injection init container
 - name: vault-secrets
   image: {{ include "archestra-platform.image" . }}
   workingDir: /app/backend
+  {{- include "archestra-platform.containerSecurityContext" . | nindent 2 }}
   env:
     {{- include "archestra-platform.env" . | nindent 4 }}
     - name: VAULT_INJECTOR_SECRETS
@@ -241,7 +1158,9 @@ Handles Vault secret injection, pgvector extension setup, and PostgreSQL readine
 {{- if .Values.postgresql.enabled }}
 # Ensure the pgvector extension exists in the application database.
 - name: setup-postgres-extensions
-  image: {{ printf "%s:%s" (.Values.postgresql.image.repository | default "bitnami/postgresql") (.Values.postgresql.image.tag | default "latest") }}
+  {{- /* Honor the digest pin the same way the Bitnami subchart does: with a digest, the tag is informational and the digest wins. */}}
+  image: {{ printf "%s:%s" (.Values.postgresql.image.repository | default "bitnami/postgresql") (.Values.postgresql.image.tag | default "latest") }}{{ with .Values.postgresql.image.digest }}@{{ . }}{{ end }}
+  {{- include "archestra-platform.containerSecurityContext" . | nindent 2 }}
   {{- with .Values.archestra.initContainers.resources }}
   resources:
     {{- toYaml . | nindent 4 }}
@@ -256,20 +1175,45 @@ Handles Vault secret injection, pgvector extension setup, and PostgreSQL readine
     - sh
     - -c
     - |
+      max_attempts={{ .Values.archestra.initContainers.waitForPostgres.timeoutSeconds | default 300 }}
+      attempt=0
       until pg_isready -h {{ include "archestra-platform.fullname" . }}-postgresql -U postgres; do
-        echo "Waiting for PostgreSQL..."
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge "$max_attempts" ]; then
+          echo "PostgreSQL did not become ready after ${max_attempts}s - giving up" >&2
+          exit 1
+        fi
+        echo "Waiting for PostgreSQL... (${attempt}/${max_attempts})"
         sleep 1
       done
       psql -h {{ include "archestra-platform.fullname" . }}-postgresql -U postgres -d {{ .Values.postgresql.auth.database }} -c "CREATE EXTENSION IF NOT EXISTS vector;"
 {{- end }}
 - name: wait-for-postgres
-  image: {{ .Values.archestra.initContainers.busyboxImage | default "busybox:1.36" }}
+  image: {{ include "archestra-platform.busyboxImage" . }}
+  {{- include "archestra-platform.containerSecurityContext" . | nindent 2 }}
   {{- with .Values.archestra.initContainers.resources }}
   resources:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- /*
+  Only the database URL and what it expands: this container runs a third-party
+  image and needs nothing else, so it never sees the platform's other secrets.
+  */}}
+  {{- $waitForPostgresEnv := include "archestra-platform.waitForPostgresEnv" . | trim }}
+  {{- if $waitForPostgresEnv }}
   env:
-    {{- include "archestra-platform.env" . | nindent 4 }}
+    {{- $waitForPostgresEnv | nindent 4 }}
+  {{- end }}
+  {{- /* Bulk sources are mirrored only when they are the URL's sole possible source. */}}
+  {{- if and (or .Values.archestra.envFrom .initContainerExtraEnvFrom) (ne (include "archestra-platform.databaseUrlFromEnvFrom" .) "") }}
+  envFrom:
+    {{- with .Values.archestra.envFrom }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .initContainerExtraEnvFrom }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
   {{- if .Values.archestra.initContainers.vaultSecrets.enabled }}
   volumeMounts:
     - name: vault-secrets
@@ -289,8 +1233,9 @@ Handles Vault secret injection, pgvector extension setup, and PostgreSQL readine
       fi
 
       # Parse host and port from ARCHESTRA_DATABASE_URL
-      # Format: postgresql://user:pass@host[:port]/database
+      # Format: postgresql://user:pass@host[:port]/database[?query]
       DB_URL="${ARCHESTRA_DATABASE_URL##*@}"  # Remove prefix up to last @ (handles passwords with @)
+      DB_URL="${DB_URL%%\?*}"                 # Remove ?query suffix
       HOST_PORT="${DB_URL%%/*}"               # Remove /database suffix
       HOST="${HOST_PORT%%:*}"                 # Extract host
       # Extract port, defaulting to 5432 if not specified
@@ -300,8 +1245,15 @@ Handles Vault secret injection, pgvector extension setup, and PostgreSQL readine
       esac
 
       echo "Waiting for PostgreSQL at ${HOST}:${PORT}..."
+      max_attempts={{ .Values.archestra.initContainers.waitForPostgres.timeoutSeconds | default 300 }}
+      attempt=0
       until nc -z "${HOST}" "${PORT}"; do
-        echo "PostgreSQL is unavailable - sleeping"
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge "$max_attempts" ]; then
+          echo "PostgreSQL at ${HOST}:${PORT} did not become reachable after ${max_attempts}s - giving up" >&2
+          exit 1
+        fi
+        echo "PostgreSQL is unavailable - sleeping (${attempt}/${max_attempts})"
         sleep 1
       done
       echo "PostgreSQL is up - continuing"
@@ -311,10 +1263,112 @@ Handles Vault secret injection, pgvector extension setup, and PostgreSQL readine
 {{- end }}
 
 {{/*
+Environment for the wait-for-postgres init container: ARCHESTRA_DATABASE_URL
+from whichever source the main container uses, plus any variable a literal URL
+expands through $(NAME). Entries keep the main container's order, so
+expansion resolves the same way.
+*/}}
+{{- define "archestra-platform.waitForPostgresEnv" -}}
+{{- /* Render the full env for its validation failures only; it is not emitted. */}}
+{{- $_ := include "archestra-platform.env" . }}
+{{- include "archestra-platform.databaseEnv" . }}
+{{- $names := dict "ARCHESTRA_DATABASE_URL" true }}
+{{- $literalUrl := toString (get (.Values.archestra.env | default dict) "ARCHESTRA_DATABASE_URL" | default "") }}
+{{- range regexFindAll "\\$\\([A-Za-z_][A-Za-z0-9_]*\\)" $literalUrl -1 }}
+{{- $_ := set $names (trimSuffix ")" (trimPrefix "$(" .)) true }}
+{{- end }}
+{{- range $key, $value := .Values.archestra.env }}
+{{- if hasKey $names $key }}
+{{- include "archestra-platform.envEntry" (dict "root" $ "key" $key "value" $value) }}
+{{- end }}
+{{- end }}
+{{- range .Values.archestra.envFromSecrets }}
+{{- if hasKey $names .name }}
+- name: {{ .name }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ .secretName }}
+      key: {{ .secretKey }}
+{{- end }}
+{{- end }}
+{{- range .Values.archestra.envWithValueFrom }}
+{{- if hasKey $names .name }}
+- name: {{ .name }}
+  valueFrom:
+    {{- toYaml .valueFrom | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Non-empty when ARCHESTRA_DATABASE_URL can only come from a bulk envFrom
+source: no bundled or external database and no named entry supplies it.
+*/}}
+{{- define "archestra-platform.databaseUrlFromEnvFrom" -}}
+{{- $named := or .Values.postgresql.enabled .Values.postgresql.external_database_url (hasKey (.Values.archestra.env | default dict) "ARCHESTRA_DATABASE_URL") }}
+{{- range .Values.archestra.envFromSecrets }}
+{{- if eq .name "ARCHESTRA_DATABASE_URL" }}{{- $named = true }}{{- end }}
+{{- end }}
+{{- range .Values.archestra.envWithValueFrom }}
+{{- if eq .name "ARCHESTRA_DATABASE_URL" }}{{- $named = true }}{{- end }}
+{{- end }}
+{{- if not $named }}true{{- end }}
+{{- end }}
+
+{{/*
+securityContext for the chart's own containers, from archestra.containerSecurityContext.
+*/}}
+{{- define "archestra-platform.containerSecurityContext" -}}
+{{- with .Values.archestra.containerSecurityContext -}}
+securityContext:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}
+
+{{/*
+Worker-only init container that blocks worker startup until the web Deployment
+has applied database migrations.
+
+This is reliable on fresh installs, where no previous web pods exist. Upgrades
+are covered by the pre-upgrade migration Job.
+*/}}
+{{- define "archestra-platform.waitForMigrationsInitContainer" -}}
+{{- if .Values.archestra.initContainers.waitForMigrations.enabled }}
+- name: wait-for-migrations
+  image: {{ include "archestra-platform.busyboxImage" . }}
+  {{- include "archestra-platform.containerSecurityContext" . | nindent 2 }}
+  {{- with .Values.archestra.initContainers.resources }}
+  resources:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  command:
+    - sh
+    - -c
+    - |
+      HOST={{ include "archestra-platform.fullname" . | quote }}
+      PORT=9000
+      echo "Waiting for migrations (platform web server at ${HOST}:${PORT})..."
+      max_attempts={{ .Values.archestra.initContainers.waitForMigrations.timeoutSeconds | default 600 }}
+      attempt=0
+      until nc -z "${HOST}" "${PORT}"; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge "$max_attempts" ]; then
+          echo "Platform web server at ${HOST}:${PORT} did not become reachable after ${max_attempts}s - giving up" >&2
+          exit 1
+        fi
+        echo "Platform web server is unavailable - sleeping (${attempt}/${max_attempts})"
+        sleep 1
+      done
+      echo "Platform web server is up - migrations applied, continuing"
+{{- end }}
+{{- end }}
+
+{{/*
 Shared volumes for both platform and worker Deployments.
 */}}
 {{- define "archestra-platform.volumes" -}}
-{{- if or (and .Values.archestra.orchestrator.kubernetes.kubeconfig.enabled .Values.archestra.orchestrator.kubernetes.kubeconfig.secretName) .Values.archestra.initContainers.vaultSecrets.enabled .Values.archestra.diagnostics.enabled .Values.archestra.extraVolumes }}
+{{- $iamAuth := (.Values.archestra.database).iamAuth | default dict -}}
+{{- if or (and .Values.archestra.orchestrator.kubernetes.kubeconfig.enabled .Values.archestra.orchestrator.kubernetes.kubeconfig.secretName) .Values.archestra.initContainers.vaultSecrets.enabled .Values.archestra.diagnostics.enabled (eq .Values.archestra.fileStorage.provider "filesystem") $iamAuth.injectWebIdentityTokenVolume .Values.archestra.extraVolumes }}
 volumes:
   {{- if and .Values.archestra.orchestrator.kubernetes.kubeconfig.enabled .Values.archestra.orchestrator.kubernetes.kubeconfig.secretName }}
   - name: kubeconfig
@@ -331,6 +1385,21 @@ volumes:
     persistentVolumeClaim:
       claimName: {{ include "archestra-platform.diagnosticsClaimName" . }}
   {{- end }}
+  {{- if eq .Values.archestra.fileStorage.provider "filesystem" }}
+  - name: file-storage
+    persistentVolumeClaim:
+      claimName: {{ include "archestra-platform.fileStorageClaimName" . }}
+  {{- end }}
+  {{- if $iamAuth.injectWebIdentityTokenVolume }}
+  - name: aws-iam-token
+    projected:
+      defaultMode: 420
+      sources:
+        - serviceAccountToken:
+            audience: {{ $iamAuth.webIdentityTokenAudience | default "sts.amazonaws.com" | quote }}
+            expirationSeconds: {{ $iamAuth.webIdentityTokenExpirationSeconds | default 3600 }}
+            path: token
+  {{- end }}
   {{- with .Values.archestra.extraVolumes }}
   {{- toYaml . | nindent 2 }}
   {{- end }}
@@ -341,7 +1410,8 @@ volumes:
 Shared volume mounts for the main container.
 */}}
 {{- define "archestra-platform.volumeMounts" -}}
-{{- if or (and .Values.archestra.orchestrator.kubernetes.kubeconfig.enabled .Values.archestra.orchestrator.kubernetes.kubeconfig.secretName) .Values.archestra.initContainers.vaultSecrets.enabled .Values.archestra.diagnostics.enabled .Values.archestra.extraVolumeMounts }}
+{{- $iamAuth := (.Values.archestra.database).iamAuth | default dict -}}
+{{- if or (and .Values.archestra.orchestrator.kubernetes.kubeconfig.enabled .Values.archestra.orchestrator.kubernetes.kubeconfig.secretName) .Values.archestra.initContainers.vaultSecrets.enabled .Values.archestra.diagnostics.enabled (eq .Values.archestra.fileStorage.provider "filesystem") $iamAuth.injectWebIdentityTokenVolume .Values.archestra.extraVolumeMounts }}
 volumeMounts:
   {{- if and .Values.archestra.orchestrator.kubernetes.kubeconfig.enabled .Values.archestra.orchestrator.kubernetes.kubeconfig.secretName }}
   - name: kubeconfig
@@ -357,6 +1427,16 @@ volumeMounts:
   - name: diagnostics
     mountPath: /var/diagnostics
     readOnly: false
+  {{- end }}
+  {{- if eq .Values.archestra.fileStorage.provider "filesystem" }}
+  - name: file-storage
+    mountPath: {{ .Values.archestra.fileStorage.filesystem.mountPath }}
+    readOnly: false
+  {{- end }}
+  {{- if $iamAuth.injectWebIdentityTokenVolume }}
+  - name: aws-iam-token
+    mountPath: /var/run/secrets/aws-iam-token/serviceaccount
+    readOnly: true
   {{- end }}
   {{- with .Values.archestra.extraVolumeMounts }}
   {{- toYaml . | nindent 2 }}
@@ -390,8 +1470,13 @@ This helper constructs the image reference smartly:
 This maintains backward compatibility with existing deployments that set the full image:tag
 in archestra.image, while also supporting the new imageTag field used by release-please.
 
+A released chart also pins the default image (archestra/platform at the
+chart's own version) to the digest in archestra.releaseImageDigests.images.platform.
+Any other image or tag is used as configured.
+
 Examples:
   image: "archestra/platform", imageTag: "1.0.0" -> "archestra/platform:1.0.0"
+    (released 1.0.0 chart: "archestra/platform:1.0.0@sha256:...")
   image: "archestra/platform:ci-test", imageTag: "1.0.0" -> "archestra/platform:ci-test"
   image: "registry.io:5000/archestra/platform", imageTag: "1.0.0" -> "registry.io:5000/archestra/platform:1.0.0"
 */}}
@@ -407,6 +1492,158 @@ Examples:
 {{- $image -}}
 {{- else -}}
 {{- /* No tag in image, append imageTag */ -}}
+{{- $pins := .Values.archestra.releaseImageDigests | default dict -}}
+{{- $digest := get ($pins.images | default dict) "platform" -}}
+{{- if and $digest (eq (toString $pins.version) (toString $imageTag)) (has $image (list "archestra/platform" "docker.io/archestra/platform")) -}}
+{{- printf "%s:%s@%s" $image $imageTag $digest -}}
+{{- else -}}
 {{- printf "%s:%s" $image $imageTag -}}
 {{- end -}}
+{{- end -}}
 {{- end }}
+
+{{/*
+Resolve each scheduling field independently. A missing/null tier value inherits
+archestra.*, while an explicit empty map/list clears it. Do not use `default`:
+it treats empty collections as unset and would restore global constraints.
+*/}}
+{{- define "archestra-platform.scheduling" -}}
+{{- $tier := .tier | default dict -}}
+{{- range $field := list "nodeSelector" "tolerations" "affinity" -}}
+  {{- $value := index $.global $field -}}
+  {{- $override := index $tier $field -}}
+  {{- if ne $override nil -}}
+    {{- $value = $override -}}
+  {{- end -}}
+  {{- with $value }}
+{{ $field }}:
+  {{- toYaml . | nindent 2 }}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Imported durations are preserved and checked against pod grace at startup. */}}
+{{- define "archestra-platform.shutdownDuration" -}}
+{{- $value := toString .value -}}
+{{- if or (not (regexMatch "^[0-9]+$" $value)) (lt (int $value) .minimum) (gt (int $value) 86400) -}}
+{{- fail (printf "%s must be integer seconds between %d and 86400" .name .minimum) -}}
+{{- end -}}
+{{- $value -}}
+{{- end -}}
+
+{{- define "archestra-platform.shutdownDrain" -}}
+{{- $settings := .Values.archestra.shutdown | default dict -}}
+{{- $value := 60 -}}
+{{- if and (hasKey $settings "requestDrainSeconds") (ne (toString (get $settings "requestDrainSeconds")) "<nil>") -}}
+{{- $value = get $settings "requestDrainSeconds" -}}
+{{- end -}}
+{{- if hasKey .Values.archestra.env "ARCHESTRA_SERVER_REQUEST_DRAIN_SECONDS" -}}
+{{- $value = get .Values.archestra.env "ARCHESTRA_SERVER_REQUEST_DRAIN_SECONDS" -}}
+{{- end -}}
+{{- include "archestra-platform.shutdownDuration" (dict "name" "requestDrainSeconds" "minimum" 1 "value" $value) -}}
+{{- end -}}
+{{- define "archestra-platform.shutdownCleanup" -}}
+{{- $settings := .Values.archestra.shutdown | default dict -}}
+{{- $value := 20 -}}
+{{- if and (hasKey $settings "cleanupSeconds") (ne (toString (get $settings "cleanupSeconds")) "<nil>") -}}
+{{- $value = get $settings "cleanupSeconds" -}}
+{{- end -}}
+{{- if hasKey .Values.archestra.env "ARCHESTRA_SERVER_SHUTDOWN_CLEANUP_SECONDS" -}}
+{{- $value = get .Values.archestra.env "ARCHESTRA_SERVER_SHUTDOWN_CLEANUP_SECONDS" -}}
+{{- end -}}
+{{- include "archestra-platform.shutdownDuration" (dict "name" "cleanupSeconds" "minimum" 5 "value" $value) -}}
+{{- end -}}
+{{- define "archestra-platform.shutdownWorker" -}}
+{{- $settings := .Values.archestra.shutdown | default dict -}}
+{{- $value := 30 -}}
+{{- if and (hasKey $settings "workerTaskTimeoutSeconds") (ne (toString (get $settings "workerTaskTimeoutSeconds")) "<nil>") -}}
+{{- $value = get $settings "workerTaskTimeoutSeconds" -}}
+{{- end -}}
+{{- if hasKey .Values.archestra.env "ARCHESTRA_KNOWLEDGE_BASE_TASK_WORKER_SHUTDOWN_TIMEOUT_SECONDS" -}}
+{{- $value = toString (get .Values.archestra.env "ARCHESTRA_KNOWLEDGE_BASE_TASK_WORKER_SHUTDOWN_TIMEOUT_SECONDS") -}}
+{{- end -}}
+{{- include "archestra-platform.shutdownDuration" (dict "name" "worker shutdown timeout" "minimum" 1 "value" $value) -}}
+{{- end -}}
+{{/* A template cannot read values inside unprefixed envFrom or per-key references. */}}
+{{- define "archestra-platform.shutdownUnknown" -}}
+{{- $settings := .root.Values.archestra.shutdown | default dict -}}
+{{- $chartValue := get $settings .field -}}
+{{- $unknown := false -}}
+{{- $literal := hasKey .root.Values.archestra.env .name -}}
+{{- $chartExplicit := and (hasKey $settings .field) (ne (toString $chartValue) "<nil>") -}}
+{{- if and (not $literal) (not $chartExplicit) -}}
+{{- range .root.Values.archestra.envFrom -}}
+{{- if not .prefix -}}{{- $unknown = true -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{/* Per-key references follow literal env; only an explicit chart injection overrides them. */}}
+{{- if not (and (not $literal) $chartExplicit) -}}
+{{- range concat (.root.Values.archestra.envFromSecrets | default list) (.root.Values.archestra.envWithValueFrom | default list) -}}
+{{- if eq .name $.name -}}{{- $unknown = true -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $unknown -}}
+{{- end -}}
+
+{{- define "archestra-platform.shutdownPodGrace" -}}
+{{- $minimum := add (max (int (include "archestra-platform.shutdownDrain" .)) (int (include "archestra-platform.shutdownWorker" .))) (int (include "archestra-platform.shutdownCleanup" .)) 40 -}}
+{{- $provided := .Values.archestra.terminationGracePeriodSeconds -}}
+{{- if ne (toString $provided) "<nil>" -}}
+{{- $provided = include "archestra-platform.shutdownDuration" (dict "name" "terminationGracePeriodSeconds" "minimum" 1 "value" $provided) -}}
+{{- $knownDrain := int (include "archestra-platform.shutdownDrain" .) -}}
+{{- $knownCleanup := int (include "archestra-platform.shutdownCleanup" .) -}}
+{{- $knownWorker := int (include "archestra-platform.shutdownWorker" .) -}}
+{{- if eq (include "archestra-platform.shutdownUnknown" (dict "root" . "field" "requestDrainSeconds" "name" "ARCHESTRA_SERVER_REQUEST_DRAIN_SECONDS")) "true" -}}{{- $knownDrain = 1 -}}{{- end -}}
+{{- if eq (include "archestra-platform.shutdownUnknown" (dict "root" . "field" "cleanupSeconds" "name" "ARCHESTRA_SERVER_SHUTDOWN_CLEANUP_SECONDS")) "true" -}}{{- $knownCleanup = 5 -}}{{- end -}}
+{{- if eq (include "archestra-platform.shutdownUnknown" (dict "root" . "field" "workerTaskTimeoutSeconds" "name" "ARCHESTRA_KNOWLEDGE_BASE_TASK_WORKER_SHUTDOWN_TIMEOUT_SECONDS")) "true" -}}{{- $knownWorker = 1 -}}{{- end -}}
+{{- $minimum = add (max $knownDrain $knownWorker) $knownCleanup 40 -}}
+{{- if lt (int $provided) (int $minimum) -}}
+{{- fail (printf "terminationGracePeriodSeconds must be at least %d for the configured shutdown budgets" $minimum) -}}
+{{- end -}}
+{{- $provided -}}
+{{- else -}}
+{{- $minimum -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Replace only an image's registry, retaining the repository and tag/digest.
+A first path component containing a dot/port, or localhost, is a registry.
+Unqualified image names keep their complete repository path. Registry overrides
+may include a mirror path prefix; ignore trailing slashes when joining.
+*/}}
+{{- define "archestra-platform.imageRegistry" -}}
+{{- $image := .image -}}
+{{- $registry := .registry | default "" | trimSuffix "/" -}}
+{{- if $registry -}}
+{{- $parts := splitList "/" $image -}}
+{{- $first := first $parts -}}
+{{- if and (gt (len $parts) 1) (or (contains "." $first) (contains ":" $first) (eq "localhost" $first)) -}}
+{{- $image = join "/" (rest $parts) -}}
+{{- end -}}
+{{- printf "%s/%s" $registry $image -}}
+{{- else -}}
+{{- $image -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Shared by startup checks in web, migration, and worker pods. */}}
+{{- define "archestra-platform.busyboxImage" -}}
+{{- $init := .Values.archestra.initContainers -}}
+{{- include "archestra-platform.pinnedImage" (dict "image" ($init.busyboxImage | default "docker.io/library/busybox:1.36") "registry" $init.busyboxImageRegistry "defaultImage" "docker.io/library/busybox:1.36" "digest" $init.busyboxImageDigest) -}}
+{{- end -}}
+
+{{/*
+An image reference with the chart's digest pin. The digest applies only while
+the image is the chart default and no registry override is set: a mirror or a
+custom image may not carry the same digest, so it is used as configured.
+Usage: include "archestra-platform.pinnedImage" (dict "image" ... "registry" ... "defaultImage" ... "digest" ...)
+*/}}
+{{- define "archestra-platform.pinnedImage" -}}
+{{- $registry := .registry | default "" | trimSuffix "/" -}}
+{{- if and .digest (not $registry) (eq .image .defaultImage) -}}
+{{- printf "%s@%s" .image .digest -}}
+{{- else -}}
+{{- include "archestra-platform.imageRegistry" (dict "image" .image "registry" $registry) -}}
+{{- end -}}
+{{- end -}}

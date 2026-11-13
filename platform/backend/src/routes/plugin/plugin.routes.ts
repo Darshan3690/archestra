@@ -1,0 +1,1088 @@
+import { randomUUID } from "node:crypto";
+import {
+  type GitProvider,
+  gitHostFromUrl,
+  PLUGIN_MARKETPLACE_IMPORT_LIMIT,
+  parseLabelsParam,
+  ResourceAccessQuerySchema,
+  ResourceOwnerQuerySchema,
+  ResourceSharedWithQuerySchema,
+  RouteId,
+} from "@archestra/shared";
+import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
+import { z } from "zod";
+import { userHasPermission } from "@/auth";
+import type { GitAccess } from "@/git-hosts/git-access";
+import {
+  PluginLabelModel,
+  PluginModel,
+  PluginTeamModel,
+  TaskModel,
+} from "@/models";
+import ResourcePermissionSubjectModel from "@/models/resource-permission-subject";
+import {
+  importPluginFromGithub,
+  normalizePluginRepoUrl,
+  PluginImportError,
+} from "@/plugins/github-import";
+import {
+  discoverGithubMarketplace,
+  MarketplaceDiscoveryError,
+} from "@/plugins/github-marketplace";
+import {
+  GithubMarketplaceChangedError,
+  prepareGithubMarketplaceImports,
+} from "@/plugins/github-marketplace-import";
+import {
+  assertPluginSourceHost,
+  hasSinglePluginGitAuth,
+  type PluginGitAuth,
+  pluginSourceGitHost,
+  resolvePluginImportAccess,
+  resolvePluginSourceAccess,
+  storedCredentialId,
+} from "@/plugins/plugin-source-access";
+import { transferResourceOwnership } from "@/services/resource-ownership";
+import { ResourcePermissions } from "@/services/resource-permissions";
+import { taskQueueService } from "@/task-queue";
+import {
+  ApiError,
+  ClientTypeSchema,
+  CreatePluginSchema,
+  constructResponseSchema,
+  DeleteObjectResponseSchema,
+  type Plugin,
+  PluginGithubSyncIntervalSchema,
+  PluginListItemSchema,
+  PluginPlatformSchema,
+  PluginWithFilesSchema,
+  UpdatePluginSchema,
+  UuidIdSchema,
+} from "@/types";
+import { GitProviderSchema } from "@/types/git-host";
+import { isUniqueConstraintError } from "@/utils/db";
+import { registerEntityLabelRoutes } from "../entity-labels";
+
+const PluginParamsSchema = z.object({ id: UuidIdSchema });
+
+/**
+ * How a request reads a plugin repository on GitHub or GitLab. Authentication
+ * is optional (public cloud repositories) and at most one method may be
+ * supplied: a stored GitHub App (`githubAppConfigId`, any GitHub host), a
+ * stored GitLab token (`gitlabTokenId`, any GitLab host), a legacy stored
+ * GitHub PAT (`githubPatId`), or a transient github.com token (`githubToken`,
+ * never stored). A credential decides the host, so self-hosted GitHub and
+ * GitLab need one.
+ */
+const gitAuthShape = {
+  provider: GitProviderSchema.optional().describe(
+    "Git host of a public repository; defaults to github. Ignored when a credential is given.",
+  ),
+  githubToken: z.string().min(1).optional(),
+  githubAppConfigId: z.string().uuid().optional(),
+  githubPatId: z.string().uuid().optional(),
+  gitlabTokenId: z.string().uuid().optional(),
+};
+
+const singleGitAuthError = {
+  message:
+    "Provide at most one of githubToken, githubPatId, githubAppConfigId, or gitlabTokenId",
+};
+
+const GitAuthSchema = z
+  .object(gitAuthShape)
+  .refine(hasSinglePluginGitAuth, singleGitAuthError);
+
+const GithubCommitShaSchema = z
+  .string()
+  .regex(/^[a-f0-9]{40}$/i, "Expected a full 40-character Git commit SHA");
+
+const GithubPluginSourceSchema = z
+  .object({
+    repoUrl: z.string().trim().min(1),
+    ref: z.string().trim().min(1).nullable().optional(),
+    subdir: z.string().trim().default(""),
+    exclude: z.array(z.string().trim().min(1)).max(50).default([]),
+    ...gitAuthShape,
+  })
+  .refine(hasSinglePluginGitAuth, singleGitAuthError);
+
+const GithubPluginPreviewSchema = z.object({
+  repo: z.string(),
+  sourceProvider: GitProviderSchema,
+  sourceOrigin: z.string().nullable(),
+  requestedRef: z.string().nullable(),
+  commitSha: z.string(),
+  subdir: z.string(),
+  files: z.array(
+    z.object({
+      path: z.string(),
+      content: z.string(),
+      encoding: z.enum(["utf8", "base64"]),
+      mode: z.enum(["100644", "100755"]),
+    }),
+  ),
+  skippedFiles: z.array(z.string()),
+});
+
+const MarketplacePathSchema = z.enum([
+  ".claude-plugin/marketplace.json",
+  ".github/plugin/marketplace.json",
+  ".agents/plugins/marketplace.json",
+  ".cursor-plugin/marketplace.json",
+  "marketplace.json",
+]);
+
+const GithubMarketplaceEntrySchema = z.object({
+  marketplacePath: z.string(),
+  name: z.string(),
+  description: z.string(),
+  version: z.string(),
+  clientType: ClientTypeSchema.nullable(),
+  sourceRepoUrl: z.string().nullable(),
+  sourceRef: z.string().nullable(),
+  sourceSubdir: z.string(),
+  sourceCommitSha: z.string().nullable(),
+  fileCount: z.number().int().nonnegative(),
+  supported: z.boolean(),
+  reason: z.string().nullable(),
+});
+
+const GithubMarketplaceDiscoverySchema = z.object({
+  repoUrl: z.string(),
+  ref: z.string().nullable(),
+  commitSha: z.string(),
+  marketplacePath: z.string().nullable(),
+  entries: z.array(GithubMarketplaceEntrySchema),
+  reason: z.string().nullable(),
+});
+
+const marketplaceRepositoryShape = {
+  repoUrl: z.string().trim().min(1),
+  ref: z.string().trim().min(1).nullable().optional(),
+  ...gitAuthShape,
+};
+
+const GithubMarketplaceSourceSchema = z
+  .object({
+    ...marketplaceRepositoryShape,
+    marketplacePath: MarketplacePathSchema.optional(),
+  })
+  .refine(hasSinglePluginGitAuth, singleGitAuthError);
+
+const MarketplaceImportSelectionSchema = z.object({
+  name: z.string().min(1),
+  displayName: z.string().trim().min(1).max(120),
+  description: z.string().max(1_000).default(""),
+  clientType: ClientTypeSchema,
+  supportedPlatforms: z.array(PluginPlatformSchema).min(1),
+  sourceRepoUrl: z.string().min(1),
+  sourceRef: z.string().nullable(),
+  sourceSubdir: z.string(),
+  approvedSourceSha: GithubCommitShaSchema,
+  exclude: z.array(z.string().trim().min(1)).max(50).default([]),
+});
+
+const GithubMarketplaceImportSchema = z
+  .object({
+    ...marketplaceRepositoryShape,
+    marketplacePath: MarketplacePathSchema.nullable().describe(
+      "The reviewed manifest path, or null to import plugin folders discovered in a repository without a marketplace manifest",
+    ),
+    approvedCommitSha: GithubCommitShaSchema,
+    trackingRef: z.string().trim().min(1).nullable(),
+    selected: z
+      .array(MarketplaceImportSelectionSchema)
+      .min(1)
+      .max(
+        PLUGIN_MARKETPLACE_IMPORT_LIMIT,
+        `Select at most ${PLUGIN_MARKETPLACE_IMPORT_LIMIT} plugins per import`,
+      ),
+    initialGrants: CreatePluginSchema.shape.initialGrants,
+    syncInterval: z
+      .union([PluginGithubSyncIntervalSchema, z.null()])
+      .default("1d"),
+  })
+  .refine(hasSinglePluginGitAuth, singleGitAuthError);
+
+const pluginRoutes: FastifyPluginAsyncZod = async (fastify) => {
+  fastify.post(
+    "/api/plugins/:id/transfer-ownership",
+    {
+      schema: {
+        operationId: RouteId.TransferPluginOwnership,
+        description: "Transfer ownership to another organization member",
+        tags: ["Ownership"],
+        params: z.object({ id: z.string().uuid() }),
+        body: z.object({ ownerId: z.string().min(1) }),
+        response: constructResponseSchema(z.object({ success: z.boolean() })),
+      },
+    },
+    async ({ params, body, user, organizationId }) => {
+      await transferResourceOwnership({
+        kind: "plugin",
+        id: params.id,
+        ownerId: body.ownerId,
+        userId: user.id,
+        organizationId,
+      });
+      return { success: true };
+    },
+  );
+
+  registerEntityLabelRoutes(fastify, {
+    basePath: "/api/plugins",
+    tag: "Plugins",
+    entityNamePlural: "plugins",
+    model: PluginLabelModel,
+    keysOperationId: RouteId.GetPluginLabelKeys,
+    valuesOperationId: RouteId.GetPluginLabelValues,
+  });
+
+  fastify.get(
+    "/api/plugins",
+    {
+      schema: {
+        operationId: RouteId.GetPlugins,
+        description: "List plugins for the organization",
+        tags: ["Plugins"],
+        querystring: z.object({
+          labels: z
+            .string()
+            .optional()
+            .describe(
+              "Filter by labels. Format: key1:val1|val2;key2:val3. AND across keys, OR within values.",
+            ),
+          access: ResourceAccessQuerySchema,
+          sharedWith: ResourceSharedWithQuerySchema,
+          owner: ResourceOwnerQuerySchema,
+        }),
+        response: constructResponseSchema(z.array(PluginListItemSchema)),
+      },
+    },
+    async ({ organizationId, user, query }, reply) => {
+      const isAdmin = await ResourcePermissions.allows({
+        userId: user.id,
+        organizationId: organizationId,
+        resource: "plugin",
+        scope: "*",
+        action: "update",
+      });
+      const accessiblePluginIds = isAdmin
+        ? undefined
+        : await PluginTeamModel.getUserAccessiblePluginIds({
+            organizationId,
+            userId: user.id,
+          });
+      const plugins = await PluginModel.findByOrganization({
+        organizationId,
+        accessiblePluginIds,
+        labels: parseLabelsParam(query.labels),
+        access: await ResourcePermissionSubjectModel.resolveAccessFilter({
+          userId: user.id,
+          organizationId,
+          relations: query.access,
+          sharedWith: query.sharedWith,
+          ownerIds: query.owner,
+        }),
+      });
+      return reply.send(plugins);
+    },
+  );
+
+  fastify.post(
+    "/api/plugins/github/marketplace/discover",
+    {
+      schema: {
+        operationId: RouteId.DiscoverGithubPluginMarketplace,
+        description:
+          "Discover and normalize plugins advertised by a GitHub marketplace repository",
+        tags: ["Plugins"],
+        body: GithubMarketplaceSourceSchema,
+        response: constructResponseSchema(GithubMarketplaceDiscoverySchema),
+      },
+    },
+    async (request, reply) => {
+      const { organizationId, user, body } = request;
+      await requirePluginAdmin({ organizationId, userId: user.id });
+      const access = await resolvePluginImportAccess({
+        ...body,
+        organizationId,
+        userId: user.id,
+      });
+      const discovery = await runMarketplaceDiscovery(() =>
+        discoverGithubMarketplace({
+          repoUrl: body.repoUrl,
+          ref: body.ref,
+          marketplacePath: body.marketplacePath,
+          access,
+        }),
+      );
+      reply.header("Cache-Control", "no-store");
+      return reply.send(discovery);
+    },
+  );
+
+  fastify.post(
+    "/api/plugins/github/marketplace/import",
+    {
+      schema: {
+        operationId: RouteId.ImportGithubPluginMarketplace,
+        description:
+          "Import selected plugins from one reviewed GitHub marketplace snapshot",
+        tags: ["Plugins"],
+        body: GithubMarketplaceImportSchema,
+        response: constructResponseSchema(
+          z.object({
+            created: z.array(PluginWithFilesSchema),
+            failed: z.array(z.object({ name: z.string(), error: z.string() })),
+          }),
+        ),
+      },
+    },
+    async (request, reply) => {
+      const { organizationId, user, body } = request;
+      await requirePluginAdmin({ organizationId, userId: user.id });
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      if (body.initialGrants?.length) {
+        await ResourcePermissions.validateInitialGrants({
+          organizationId,
+          userId: user.id,
+          resource: "plugin",
+          grants: body.initialGrants,
+          target: {
+            id: randomUUID(),
+            name: "Imported plugin",
+            authorId: user.id,
+          },
+        });
+      }
+      // SPDX-SnippetEnd
+      const access = await resolvePluginImportAccess({
+        ...body,
+        organizationId,
+        userId: user.id,
+      });
+      let preparedBatch: Awaited<
+        ReturnType<typeof prepareGithubMarketplaceImports>
+      >;
+      try {
+        preparedBatch = await runMarketplaceDiscovery(() =>
+          prepareGithubMarketplaceImports({
+            repoUrl: body.repoUrl,
+            ref: body.ref,
+            marketplacePath: body.marketplacePath,
+            approvedCommitSha: body.approvedCommitSha,
+            trackingRef: body.trackingRef,
+            selections: body.selected,
+            access,
+          }),
+        );
+      } catch (error) {
+        if (error instanceof GithubMarketplaceChangedError) {
+          throw new ApiError(409, error.message);
+        }
+        throw error;
+      }
+      const created = [];
+      const failed = [...preparedBatch.failed];
+      for (const {
+        selection,
+        imported,
+        manifestPath,
+      } of preparedBatch.prepared) {
+        try {
+          const plugin = await PluginModel.create({
+            organizationId,
+            userId: user.id,
+            input: {
+              displayName: selection.displayName,
+              description: selection.description,
+              clientType: selection.clientType,
+              supportedPlatforms: selection.supportedPlatforms,
+              files: imported.files,
+            },
+            // SPDX-SnippetBegin
+            // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+            // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+            initialPermissionGrants: body.initialGrants ?? [],
+            // SPDX-SnippetEnd
+            source: {
+              repo: imported.repo,
+              ref: selection.sourceRef,
+              sha: imported.commitSha,
+              subdir: imported.subdir,
+              exclude: selection.exclude,
+              marketplaceRepo: preparedBatch.marketplace.repoUrl,
+              marketplacePath: manifestPath,
+              marketplacePluginName: selection.name,
+              syncInterval: body.syncInterval,
+              syncRef: selection.sourceRef,
+              ...pluginSourceRecord({ imported, auth: body, access }),
+            },
+          });
+          if (!plugin) throw new Error("Plugin identity already exists");
+          created.push(plugin);
+        } catch (error) {
+          failed.push({
+            name: selection.name,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      request.auditAfter = {
+        created: created.map((plugin) => ({
+          id: plugin.id,
+          displayName: plugin.displayName,
+          sourceSha: plugin.sourceSha,
+        })),
+        failed,
+      };
+      return reply.send({ created, failed });
+    },
+  );
+
+  fastify.post(
+    "/api/plugins/github/preview",
+    {
+      schema: {
+        operationId: RouteId.PreviewGithubPlugin,
+        description:
+          "Resolve a GitHub ref and preview the exact by-value plugin bytes",
+        tags: ["Plugins"],
+        body: GithubPluginSourceSchema,
+        response: constructResponseSchema(GithubPluginPreviewSchema),
+      },
+    },
+    async ({ organizationId, user, body }, reply) => {
+      await requirePluginAdmin({ organizationId, userId: user.id });
+      const access = await resolvePluginImportAccess({
+        ...body,
+        organizationId,
+        userId: user.id,
+      });
+      const imported = await runGithubImport(() =>
+        importPluginFromGithub({
+          repoUrl: body.repoUrl,
+          ref: body.ref,
+          trackingRef: body.ref,
+          subdir: body.subdir,
+          exclude: body.exclude,
+          access,
+        }),
+      );
+      return reply.send(imported);
+    },
+  );
+
+  fastify.post(
+    "/api/plugins/github/import",
+    {
+      schema: {
+        operationId: RouteId.ImportGithubPlugin,
+        description:
+          "Import and approve a plugin from an immutable GitHub commit",
+        tags: ["Plugins"],
+        body: GithubPluginSourceSchema.and(
+          z.object({
+            displayName: z.string().trim().min(1).max(120),
+            description: z.string().max(1_000).default(""),
+            clientType: ClientTypeSchema,
+            supportedPlatforms: z.array(PluginPlatformSchema).min(1).optional(),
+            initialGrants: CreatePluginSchema.shape.initialGrants,
+            approvedCommitSha: GithubCommitShaSchema,
+            trackingRef: z.string().trim().min(1).nullable().optional(),
+          }),
+        ),
+        response: constructResponseSchema(PluginWithFilesSchema),
+      },
+    },
+    async ({ organizationId, user, body }, reply) => {
+      await requirePluginAdmin({ organizationId, userId: user.id });
+      const access = await resolvePluginImportAccess({
+        ...body,
+        organizationId,
+        userId: user.id,
+      });
+      const imported = await runGithubImport(() =>
+        importPluginFromGithub({
+          repoUrl: body.repoUrl,
+          ref: body.approvedCommitSha,
+          trackingRef: body.trackingRef ?? body.ref,
+          subdir: body.subdir,
+          exclude: body.exclude,
+          access,
+        }),
+      );
+      assertApprovedCommit(imported.commitSha, body.approvedCommitSha);
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      if (body.initialGrants?.length) {
+        await ResourcePermissions.validateInitialGrants({
+          organizationId,
+          userId: user.id,
+          resource: "plugin",
+          grants: body.initialGrants,
+          target: {
+            id: randomUUID(),
+            name: body.displayName,
+            authorId: user.id,
+          },
+        });
+      }
+      // SPDX-SnippetEnd
+      const plugin = await PluginModel.create({
+        organizationId,
+        userId: user.id,
+        input: {
+          displayName: body.displayName,
+          description: body.description,
+          clientType: body.clientType,
+          supportedPlatforms: body.supportedPlatforms,
+          files: imported.files,
+        },
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        initialPermissionGrants: body.initialGrants ?? [],
+        // SPDX-SnippetEnd
+        source: {
+          repo: imported.repo,
+          ref: body.trackingRef ?? body.ref ?? imported.requestedRef ?? null,
+          sha: imported.commitSha,
+          subdir: imported.subdir,
+          exclude: body.exclude,
+          ...pluginSourceRecord({ imported, auth: body, access }),
+        },
+      });
+      if (!plugin) {
+        throw new ApiError(409, "A plugin with this plugin identity exists");
+      }
+      return reply.send(plugin);
+    },
+  );
+
+  fastify.post(
+    "/api/plugins/:id/github/preview-update",
+    {
+      schema: {
+        operationId: RouteId.PreviewGithubPluginUpdate,
+        description:
+          "Preview the latest tracked GitHub commit without changing approved bytes",
+        tags: ["Plugins"],
+        params: PluginParamsSchema,
+        body: GitAuthSchema.optional(),
+        response: constructResponseSchema(GithubPluginPreviewSchema),
+      },
+    },
+    async (request, reply) => {
+      const { organizationId, user, params, body } = request;
+      await requirePluginAdmin({ organizationId, userId: user.id });
+      const { syncState: observed, imported } =
+        await importExistingGithubPlugin({
+          id: params.id,
+          organizationId,
+          userId: user.id,
+          auth: body ?? {},
+        });
+      if (imported.commitSha !== observed.sourceSha) {
+        const written = await PluginModel.markGithubSyncResult({
+          id: observed.id,
+          expectedSyncGeneration: observed.syncGeneration,
+          expectedPendingSourceSha: observed.pendingSourceSha,
+          sourceSha: imported.commitSha,
+          files: imported.files,
+          error: null,
+        });
+        if (!written) {
+          throw new ApiError(409, "Plugin sync state changed; preview again");
+        }
+      } else {
+        request.auditSkip = true;
+      }
+      return reply.send(imported);
+    },
+  );
+
+  fastify.post(
+    "/api/plugins/:id/github/apply-update",
+    {
+      schema: {
+        operationId: RouteId.ApplyGithubPluginUpdate,
+        description:
+          "Re-fetch and explicitly approve the latest tracked GitHub commit",
+        tags: ["Plugins"],
+        params: PluginParamsSchema,
+        body: GitAuthSchema.and(
+          z.object({ approvedCommitSha: GithubCommitShaSchema }),
+        ),
+        response: constructResponseSchema(PluginWithFilesSchema),
+      },
+    },
+    async ({ organizationId, user, params, body }, reply) => {
+      await requirePluginAdmin({ organizationId, userId: user.id });
+      const internal = await PluginModel.findByIdForSync(params.id);
+      if (
+        !internal ||
+        internal.organizationId !== organizationId ||
+        !internal.pendingSourceSha ||
+        internal.pendingSourceSha.toLowerCase() !==
+          body.approvedCommitSha.toLowerCase()
+      ) {
+        throw new ApiError(
+          409,
+          "The approved commit must match the current pending update candidate",
+        );
+      }
+      const { imported } = await importExistingGithubPlugin({
+        id: params.id,
+        organizationId,
+        userId: user.id,
+        approvedCommitSha: body.approvedCommitSha,
+        auth: body,
+      });
+      const plugin = await PluginModel.applyGithubUpdate({
+        id: params.id,
+        organizationId,
+        userId: user.id,
+        expectedPendingSha: imported.commitSha,
+        files: imported.files,
+      });
+      if (!plugin) {
+        throw new ApiError(
+          409,
+          "The pending update candidate changed; review it again",
+        );
+      }
+      return reply.send(plugin);
+    },
+  );
+
+  fastify.patch(
+    "/api/plugins/:id/github/sync",
+    {
+      schema: {
+        operationId: RouteId.UpdatePluginGithubSync,
+        description: "Change or pause a Plugin Git sync schedule",
+        tags: ["Plugins"],
+        params: PluginParamsSchema,
+        body: z.object({
+          interval: z.union([PluginGithubSyncIntervalSchema, z.null()]),
+        }),
+        response: constructResponseSchema(PluginWithFilesSchema),
+      },
+    },
+    async ({ organizationId, user, params, body }, reply) => {
+      await requirePluginAdmin({ organizationId, userId: user.id });
+      const existing = await PluginModel.findById({
+        id: params.id,
+        organizationId,
+      });
+      if (!existing) throw new ApiError(404, "Plugin not found");
+      if (body.interval !== null && existing.sourceKind !== "github") {
+        throw new ApiError(400, "Only Git-sourced plugins can be synced");
+      }
+      await PluginModel.setGithubSync({
+        id: existing.id,
+        interval: body.interval,
+      });
+      const plugin = await PluginModel.findById({
+        id: existing.id,
+        organizationId,
+      });
+      if (!plugin) throw new ApiError(404, "Plugin not found");
+      return reply.send(plugin);
+    },
+  );
+
+  fastify.post(
+    "/api/plugins/:id/github/check",
+    {
+      schema: {
+        operationId: RouteId.TriggerPluginGithubSync,
+        description: "Queue an immediate Plugin Git source check",
+        tags: ["Plugins"],
+        params: PluginParamsSchema,
+        response: constructResponseSchema(z.object({ queued: z.boolean() })),
+      },
+    },
+    async (request, reply) => {
+      const { organizationId, user, params } = request;
+      await requirePluginAdmin({ organizationId, userId: user.id });
+      const plugin = await PluginModel.findById({
+        id: params.id,
+        organizationId,
+      });
+      if (!plugin) throw new ApiError(404, "Plugin not found");
+      if (plugin.sourceKind !== "github" || !plugin.sourceRepo) {
+        throw new ApiError(400, "Plugin is not connected to a Git source");
+      }
+      const active = await TaskModel.findActivePayloadValues(
+        "plugin_github_sync",
+        "pluginId",
+      );
+      if (active.has(plugin.id)) {
+        request.auditAfter = { pluginId: plugin.id, queued: false };
+        return reply.send({ queued: false });
+      }
+      try {
+        await taskQueueService.enqueue({
+          taskType: "plugin_github_sync",
+          payload: { pluginId: plugin.id, force: true },
+        });
+        request.auditAfter = { pluginId: plugin.id, queued: true };
+        return reply.send({ queued: true });
+      } catch (error) {
+        if (isUniqueConstraintError(error)) {
+          request.auditAfter = { pluginId: plugin.id, queued: false };
+          return reply.send({ queued: false });
+        }
+        throw error;
+      }
+    },
+  );
+
+  fastify.post(
+    "/api/plugins",
+    {
+      schema: {
+        operationId: RouteId.CreatePlugin,
+        description:
+          "Create a plugin. Hook configuration bytes are stored verbatim.",
+        tags: ["Plugins"],
+        body: CreatePluginSchema,
+        response: constructResponseSchema(PluginWithFilesSchema),
+      },
+    },
+    async ({ organizationId, user, body }, reply) => {
+      await requirePluginAdmin({ organizationId, userId: user.id });
+      if (body.initialGrants?.length) {
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        await ResourcePermissions.validateInitialGrants({
+          organizationId,
+          userId: user.id,
+          resource: "plugin",
+          grants: body.initialGrants,
+          target: {
+            id: randomUUID(),
+            name: body.displayName,
+            authorId: user.id,
+          },
+        });
+        // SPDX-SnippetEnd
+      }
+      const plugin = await PluginModel.create({
+        organizationId,
+        userId: user.id,
+        input: body,
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        initialPermissionGrants: body.initialGrants ?? [],
+        // SPDX-SnippetEnd
+      });
+      if (!plugin) {
+        throw new ApiError(409, "A plugin with this plugin identity exists");
+      }
+      return reply.send(plugin);
+    },
+  );
+
+  fastify.get(
+    "/api/plugins/:id",
+    {
+      schema: {
+        operationId: RouteId.GetPlugin,
+        description: "Get one plugin and its opaque files",
+        tags: ["Plugins"],
+        params: PluginParamsSchema,
+        response: constructResponseSchema(PluginWithFilesSchema),
+      },
+    },
+    async ({ organizationId, user, params }, reply) => {
+      await requirePluginAdmin({ organizationId, userId: user.id });
+      const plugin = await PluginModel.findById({
+        id: params.id,
+        organizationId,
+      });
+      if (!plugin) throw new ApiError(404, "Plugin not found");
+      return reply.send(plugin);
+    },
+  );
+
+  fastify.put(
+    "/api/plugins/:id",
+    {
+      schema: {
+        operationId: RouteId.UpdatePlugin,
+        description:
+          "Update plugin metadata, GitHub source settings, or files. Access is edited through the resource permissions API.",
+        tags: ["Plugins"],
+        params: PluginParamsSchema,
+        body: UpdatePluginSchema,
+        response: constructResponseSchema(PluginWithFilesSchema),
+      },
+    },
+    async ({ organizationId, user, params, body }, reply) => {
+      await requirePluginAdmin({ organizationId, userId: user.id });
+      const existing = await PluginModel.findById({
+        id: params.id,
+        organizationId,
+      });
+      if (!existing) throw new ApiError(404, "Plugin not found");
+      if (body.files && existing.sourceKind === "github") {
+        throw new ApiError(
+          409,
+          "GitHub-sourced plugin files are read-only; preview and approve a source update instead",
+        );
+      }
+      if (body.githubSource && existing.sourceKind !== "github") {
+        throw new ApiError(
+          409,
+          "Only GitHub-sourced plugins have GitHub source settings",
+        );
+      }
+      const githubSource = body.githubSource;
+      const authentication = githubSource?.authentication;
+      if (
+        authentication &&
+        (authentication.githubAppConfigId ||
+          authentication.githubPatId ||
+          authentication.gitlabTokenId)
+      ) {
+        const access = await resolvePluginImportAccess({
+          githubAppConfigId: authentication.githubAppConfigId ?? undefined,
+          githubPatId: authentication.githubPatId ?? undefined,
+          gitlabTokenId: authentication.gitlabTokenId ?? undefined,
+          organizationId,
+          userId: user.id,
+        });
+        assertPluginSourceHost({ plugin: existing, access });
+      }
+      const input = githubSource
+        ? {
+            ...body,
+            githubSource: {
+              ...githubSource,
+              repoUrl: await runGithubImport(async () =>
+                normalizePluginRepoUrl({
+                  repoUrl: githubSource.repoUrl,
+                  // parsing only needs the source's host, never its token
+                  access: { host: pluginSourceGitHost(existing) },
+                }),
+              ),
+            },
+          }
+        : body;
+      const plugin = await PluginModel.update({
+        id: params.id,
+        organizationId,
+        userId: user.id,
+        input,
+      });
+      if (!plugin) throw new ApiError(404, "Plugin not found");
+      return reply.send(plugin);
+    },
+  );
+
+  fastify.delete(
+    "/api/plugins/:id",
+    {
+      schema: {
+        operationId: RouteId.DeletePlugin,
+        description: "Delete a plugin",
+        tags: ["Plugins"],
+        params: PluginParamsSchema,
+        response: constructResponseSchema(DeleteObjectResponseSchema),
+      },
+    },
+    async ({ organizationId, user, params }, reply) => {
+      await requirePluginAdmin({ organizationId, userId: user.id });
+      const existing = await PluginModel.findById({
+        id: params.id,
+        organizationId,
+      });
+      if (!existing) throw new ApiError(404, "Plugin not found");
+      const plugin = await PluginModel.delete({
+        id: params.id,
+        organizationId,
+      });
+      if (!plugin) throw new ApiError(404, "Plugin not found");
+      return reply.send({ success: true });
+    },
+  );
+};
+
+export default pluginRoutes;
+
+// === Internal helpers ===
+
+/**
+ * Where an imported plugin's source lives and the stored credential that keeps
+ * reading it. A credential is only recorded for its own host: a github.com
+ * source advertised by a marketplace elsewhere is read publicly.
+ */
+function pluginSourceRecord(params: {
+  imported: { sourceProvider: GitProvider; sourceOrigin: string | null };
+  auth: PluginGitAuth;
+  access: GitAccess | undefined;
+}) {
+  const accessHost =
+    params.access?.host ?? gitHostFromUrl({ provider: "github" });
+  const sourceHost = gitHostFromUrl({
+    provider: params.imported.sourceProvider,
+    url: params.imported.sourceOrigin,
+  });
+  const sameHost =
+    accessHost.provider === sourceHost.provider &&
+    accessHost.webUrl === sourceHost.webUrl;
+  return {
+    sourceProvider: params.imported.sourceProvider,
+    sourceOrigin: params.imported.sourceOrigin,
+    githubAppConfigId: sameHost
+      ? (params.auth.githubAppConfigId ?? null)
+      : null,
+    githubPatId: sameHost ? (params.auth.githubPatId ?? null) : null,
+    gitlabTokenId: sameHost ? (params.auth.gitlabTokenId ?? null) : null,
+  };
+}
+
+async function requirePluginAdmin(params: {
+  organizationId: string;
+  userId: string;
+}): Promise<void> {
+  const allowed = await ResourcePermissions.allows({
+    userId: params.userId,
+    organizationId: params.organizationId,
+    resource: "plugin",
+    scope: "*",
+    action: "update",
+  });
+  if (!allowed) {
+    throw new ApiError(
+      403,
+      "You need permission to manage every plugin to approve executable plugins",
+    );
+  }
+}
+
+async function runGithubImport<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    if (error instanceof PluginImportError) {
+      throw new ApiError(400, error.message);
+    }
+    throw error;
+  }
+}
+
+async function runMarketplaceDiscovery<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    if (error instanceof MarketplaceDiscoveryError) {
+      throw new ApiError(400, error.message);
+    }
+    throw error;
+  }
+}
+
+async function importExistingGithubPlugin(params: {
+  id: string;
+  organizationId: string;
+  userId: string;
+  approvedCommitSha?: string;
+  /** Request-supplied authentication; empty uses the source's stored credential. */
+  auth: PluginGitAuth;
+}) {
+  const [plugin, syncState] = await Promise.all([
+    PluginModel.findById(params),
+    PluginModel.findByIdForSync(params.id),
+  ]);
+  if (
+    !plugin ||
+    !syncState ||
+    syncState.organizationId !== params.organizationId
+  ) {
+    throw new ApiError(404, "Plugin not found");
+  }
+  if (plugin.sourceKind !== "github" || !plugin.sourceRepo) {
+    throw new ApiError(409, "Plugin is not linked to a Git source");
+  }
+  const access = await resolveExistingPluginAccess({
+    plugin: syncState,
+    auth: params.auth,
+    userId: params.userId,
+  });
+  const imported = await runGithubImport(() =>
+    importPluginFromGithub({
+      repoUrl: plugin.sourceRepo as string,
+      ref:
+        params.approvedCommitSha ??
+        plugin.pendingSourceSha ??
+        syncState.githubSyncRef ??
+        plugin.sourceRef,
+      subdir: plugin.sourceSubdir ?? "",
+      exclude: plugin.sourceExclude,
+      access,
+    }),
+  );
+  if (params.approvedCommitSha) {
+    assertApprovedCommit(imported.commitSha, params.approvedCommitSha);
+  }
+  return { plugin, syncState, imported };
+}
+
+/**
+ * Request-supplied authentication for the plugin's own host, or else the
+ * source's stored credential (which needs `credential:read`).
+ */
+async function resolveExistingPluginAccess(params: {
+  plugin: Plugin;
+  auth: PluginGitAuth;
+  userId: string;
+}): Promise<GitAccess | undefined> {
+  const { plugin, auth } = params;
+  if (
+    auth.githubToken ||
+    auth.githubAppConfigId ||
+    auth.githubPatId ||
+    auth.gitlabTokenId
+  ) {
+    const access = await resolvePluginImportAccess({
+      ...auth,
+      provider: plugin.sourceProvider ?? "github",
+      organizationId: plugin.organizationId,
+      userId: params.userId,
+    });
+    assertPluginSourceHost({ plugin, access });
+    return access;
+  }
+  if (storedCredentialId(plugin)) {
+    const allowed = await userHasPermission(
+      params.userId,
+      plugin.organizationId,
+      "credential",
+      "read",
+    );
+    if (!allowed) {
+      throw new ApiError(403, "You do not have access to Git credentials");
+    }
+  }
+  return resolvePluginSourceAccess(plugin);
+}
+
+function assertApprovedCommit(actual: string, approved: string): void {
+  if (actual.toLowerCase() !== approved.toLowerCase()) {
+    throw new ApiError(
+      409,
+      "The repository resolved a different commit than the one reviewed; preview again",
+    );
+  }
+}

@@ -1,0 +1,1939 @@
+import {
+  CreatedByNullableSchema,
+  calculatePaginationMeta,
+  createPaginatedResponseSchema,
+  PaginationQuerySchema,
+  parseLabelsParam,
+  ResourceAccessQuerySchema,
+  type ResourceAccessRelation,
+  ResourceOwnerQuerySchema,
+  ResourceSharedWithQuerySchema,
+  type ResourceVisibilityScope,
+  RouteId,
+} from "@archestra/shared";
+import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
+import { z } from "zod";
+import {
+  DEFAULT_APP_TEMPLATE_ID,
+  getAppTemplates,
+  resolveCreateAppHtml,
+} from "@/app-templates";
+import { userHasPermission } from "@/auth/utils";
+import logger from "@/logging";
+import {
+  AgentModel,
+  AppAccessModel,
+  AppLabelModel,
+  AppModel,
+  AppPinModel,
+  AppRenderDiagnosticsModel,
+  AppRenderScreenshotModel,
+  AppToolModel,
+  AppVersionModel,
+  CreatedByModel,
+  InternalMcpCatalogModel,
+  lookupCreator,
+  McpCatalogLabelModel,
+  McpServerModel,
+  UserModel,
+} from "@/models";
+import type { VersionPayload } from "@/models/app-version";
+import { resourceAccessSelection } from "@/models/resource-permission-subject";
+import { resolveEncryptedChatCreationIfRequested } from "@/routes/chat/encrypted-chat";
+import {
+  assignToolToApp,
+  type ToolAssignmentError,
+} from "@/services/agent-tool-assignment";
+import {
+  assertCallerMayAuthorApp,
+  assertCallerMayModifyApp,
+  callerIsAppAdmin,
+} from "@/services/apps/app-authorization";
+import {
+  createSeededAppConversation,
+  createSeededExternalAppConversation,
+  resolveDefaultChatAgentId,
+} from "@/services/apps/app-chat-conversation";
+import {
+  createAppBacking,
+  deleteAppBacking,
+  syncAppBacking,
+} from "@/services/apps/app-mcp-backing";
+import { buildValidatedVersionPayload } from "@/services/apps/app-ui-policy";
+import { restoreAppVersion } from "@/services/apps/app-version-restore";
+import { resolveNewAppLifecycleDefaults } from "@/services/apps/new-app-defaults";
+import {
+  assertCanAssignEnvironment,
+  resolveDefaultEnvironmentForNewResource,
+} from "@/services/environments/environment";
+import { transferResourceOwnership } from "@/services/resource-ownership";
+import { ResourcePermissions } from "@/services/resource-permissions";
+import {
+  ApiError,
+  type App,
+  type AppListItem,
+  AppListItemSchema,
+  AppRenderDiagnosticEntrySchema,
+  AppScopeSchema,
+  AppTemplateSchema,
+  AppVersionSummarySchema,
+  type AppViewerRole,
+  AssignedToolSchema,
+  CreateAppSchema,
+  CredentialResolutionModeSchema,
+  constructResponseSchema,
+  DeleteObjectResponseSchema,
+  ExternalAppResolutionSchema,
+  PublicAppSchema,
+  SelectAppVersionSchema,
+  UpdateAppSchema,
+  UuidIdSchema,
+} from "@/types";
+import { isUniqueConstraintError } from "@/utils/db";
+import { externalAppLabel } from "@/utils/external-app-label";
+import {
+  appIconUrl,
+  externalAppIconUrl,
+  replyWithIconImage,
+  splitListIcon,
+} from "@/utils/servable-icon";
+import {
+  BulkDeleteBodySchema,
+  BulkOutcomeSchema,
+  runBulk,
+} from "../bulk-route";
+
+// A comma-joined id list on the query string ("a,b,c" → ["a","b","c"]), for
+// the admin owner sub-filter on the list route. Mirrors the Projects list.
+const CommaSeparatedIds = z.preprocess(
+  (value) =>
+    typeof value === "string" ? value.split(",").filter(Boolean) : value,
+  z.array(z.string()),
+);
+
+// The REST create body. Who can reach the new app is its `initialGrants`
+// alone; the schema is strict so the retired `scope`/`teamIds` fields are
+// refused rather than silently dropped.
+const CreateAppBodySchema = CreateAppSchema.extend({
+  // When set, also create a chat conversation with this app already rendered, so
+  // the client opens it directly at `/chat/<conversationId>` with no model turn.
+  openInChat: z.boolean().optional(),
+}).strict();
+// Who can reach an app is decided by its resource permission policy, which the
+// permissions API writes on its own, so the update body carries no sharing
+// fields: the stored visibility columns are carried through untouched.
+const UpdateAppBodySchema = UpdateAppSchema;
+const RestoreAppVersionBodySchema = z.strictObject({
+  baseVersion: z.number().int().positive(),
+});
+
+// Create/update responses carry soft save-time validation warnings (the save
+// succeeded; the html has structural issues worth surfacing to the author).
+const AppWithWarningsSchema = PublicAppSchema.extend({
+  warnings: z.array(z.string()).optional(),
+});
+
+// Create response additionally carries the seeded chat conversation id when the
+// app was created with `openInChat` (absent if seeding was skipped or failed).
+const CreateAppResponseSchema = AppWithWarningsSchema.extend({
+  conversationId: z.string().uuid().optional(),
+});
+
+// open-in-chat returns the seeded conversation to navigate to (`/chat/<id>`).
+const OpenAppInChatResponseSchema = z.object({
+  conversationId: z.string().uuid(),
+});
+
+// The external variant also says how the conversation was set up: "render"
+// seeds the app already mounted; "prompt" leaves it empty and the client sends
+// `prompt` as the first user message (the tool has required inputs the agent
+// must collect before calling it).
+const OpenExternalAppInChatResponseSchema = OpenAppInChatResponseSchema.extend({
+  mode: z.enum(["render", "prompt"]),
+  prompt: z.string().optional(),
+});
+
+// The single-app GET resolves the app's team assignments so the detail page can
+// render team-name badges and seed the visibility editor, plus the caller's
+// viewerRole so the settings surface can show a "Viewing as administrator"
+// banner when an admin opens an app they only see through oversight.
+const AppWithTeamsSchema = PublicAppSchema.extend({
+  teams: z.array(z.object({ id: z.string(), name: z.string() })),
+  // People the app is shared with individually. A non-empty list on a
+  // `personal`-scoped app is what the settings form renders as "Users" — the
+  // grant lives beside the scope rather than in it.
+  users: z.array(
+    z.object({ id: z.string(), name: z.string(), email: z.string() }),
+  ),
+  viewerRole: z.enum(["owner", "shared", "admin"]),
+  // The author's display name, so an admin viewing an app they only see through
+  // oversight can be shown "Viewing as administrator · <name>". Null when the
+  // author row is gone or nameless.
+  authorName: z.string().nullable(),
+  /** The author, in the shape shared by every major object. */
+  createdBy: CreatedByNullableSchema,
+});
+
+const appRoutes: FastifyPluginAsyncZod = async (fastify) => {
+  fastify.post(
+    "/api/apps/:id/transfer-ownership",
+    {
+      schema: {
+        operationId: RouteId.TransferAppOwnership,
+        description: "Transfer ownership to another organization member",
+        tags: ["Ownership"],
+        params: z.object({ id: z.string().uuid() }),
+        body: z.object({ ownerId: z.string().min(1) }),
+        response: constructResponseSchema(z.object({ success: z.boolean() })),
+      },
+    },
+    async ({ params, body, user, organizationId }) => {
+      await transferResourceOwnership({
+        kind: "app",
+        id: params.id,
+        ownerId: body.ownerId,
+        userId: user.id,
+        organizationId,
+      });
+      return { success: true };
+    },
+  );
+
+  fastify.get(
+    "/api/apps",
+    {
+      schema: {
+        operationId: RouteId.GetApps,
+        description: "List apps visible to the caller (paginated).",
+        tags: ["Apps"],
+        querystring: PaginationQuerySchema.extend({
+          search: z.string().optional(),
+          // Visibility filter; absence = "All". Mirrors the Projects list.
+          scope: AppScopeSchema.optional(),
+          // Admin-only owner sub-filter for personal apps (silently ignored for
+          // non-admins): authorIds keeps only these authors, excludeAuthorIds
+          // drops them. Used by the "Other users" / user-picker toolbar.
+          authorIds: CommaSeparatedIds.optional(),
+          excludeAuthorIds: CommaSeparatedIds.optional(),
+          labels: z
+            .string()
+            .optional()
+            .describe(
+              "Filter by labels. Format: key1:val1|val2;key2:val3. AND across keys, OR within values.",
+            ),
+          access: ResourceAccessQuerySchema,
+          sharedWith: ResourceSharedWithQuerySchema,
+          owner: ResourceOwnerQuerySchema,
+          pinned: z
+            .preprocess(
+              (value) => (typeof value === "string" ? value === "true" : value),
+              z.boolean(),
+            )
+            .optional()
+            .describe("Only return apps the current user has pinned."),
+        }),
+        response: constructResponseSchema(
+          createPaginatedResponseSchema(AppListItemSchema),
+        ),
+      },
+    },
+    async ({ query, user, organizationId }, reply) => {
+      // The Apps surface unifies two sources: owned apps (this org's app rows)
+      // and external UI-providing installed MCP servers. Both are access-filtered
+      // by their own model; we merge, sort, and paginate over the combined set.
+      // Cardinality is small (tens), so fetching all-then-slicing is fine.
+      const isAppAdmin = await callerIsAppAdmin(user.id, organizationId);
+      const hasBaseRead = await userHasPermission(
+        user.id,
+        organizationId,
+        "app",
+        "read",
+      );
+      const [reachableAppIds, pins] = await Promise.all([
+        AppAccessModel.getUserAccessibleAppIds({
+          organizationId,
+          userId: user.id,
+          access: resourceAccessSelection(query),
+        }),
+        query.pinned ? AppPinModel.getPinnedRefs(user.id) : undefined,
+      ]);
+      // A pinned-only listing loads just the pinned apps instead of building
+      // every card and dropping the unpinned ones at the end.
+      const pinnedAppIds = pins ? new Set(pins.appIds) : undefined;
+      const accessibleAppIds = pinnedAppIds
+        ? reachableAppIds.filter((id) => pinnedAppIds.has(id))
+        : reachableAppIds;
+      // Grants are the only way to reach an app, so there is no longer a set
+      // an administrator sees only through oversight.
+      const nonAdminAccessibleIds = new Set(accessibleAppIds);
+      const ownedFilters = {
+        organizationId,
+        accessibleAppIds,
+        ...(query.search ? { search: query.search } : {}),
+      };
+      const [ownedCount, external] = await Promise.all([
+        AppModel.countByOrganization(ownedFilters),
+        hasBaseRead && (!pins || pins.hasExternal)
+          ? McpServerModel.findUiCapableForCaller({
+              userId: user.id,
+              organizationId,
+              ...(query.search ? { search: query.search } : {}),
+            })
+          : Promise.resolve([]),
+      ]);
+      const owned = await AppModel.findByOrganization({
+        ...ownedFilters,
+        limit: ownedCount,
+        offset: 0,
+      });
+      // Resolve author display names for personal apps only — the card shows an
+      // "Owned by <author>" badge when an app admin views someone else's
+      // personal app, so other scopes don't need the lookup.
+      const personalAuthorIds = [
+        ...new Set(
+          owned
+            .filter((app) => app.scope === "personal" && app.authorId !== null)
+            .map((app) => app.authorId as string),
+        ),
+      ];
+      const [
+        usersByApp,
+        teamsByApp,
+        authorNames,
+        creators,
+        ownedPins,
+        externalPins,
+      ] = await Promise.all([
+        AppAccessModel.getUserDetailsForApps(owned.map((app) => app.id)),
+        AppAccessModel.getTeamDetailsForApps(owned.map((app) => app.id)),
+        UserModel.getNamesByIds(personalAuthorIds),
+        // Every owned app's author, not just the personal-scoped ones
+        // `authorNames` covers: an org-scoped app still has somebody to ask
+        // about it, and that is the whole point of the column.
+        CreatedByModel.resolve(
+          owned.map((app) => CreatedByModel.id(app, app.authorId)),
+        ),
+        // Per-user pins (mirrors the projects list): surfaced as `pinnedAt` so
+        // the client can group pinned-first, like the Projects page.
+        AppPinModel.getPinnedAtForApps({
+          userId: user.id,
+          appIds: owned.map((app) => app.id),
+        }),
+        AppPinModel.getPinnedAtForExternalApps({
+          userId: user.id,
+          refs: external.map((catalogApp) => ({
+            mcpServerId: catalogApp.mcpServerId,
+            resourceUri: catalogApp.resourceUri,
+            toolName: catalogApp.toolName,
+          })),
+        }),
+      ]);
+
+      // An external item's labels are its backing catalog's (edited in the MCP
+      // registry), so the one `?labels=` filter spans both halves of the mixed
+      // listing instead of silently dropping every external app.
+      const externalLabels =
+        await McpCatalogLabelModel.getLabelsForCatalogItems([
+          ...new Set(external.map((catalogApp) => catalogApp.catalogId)),
+        ]);
+      const labelFilter = parseLabelsParam(query.labels);
+
+      // Each owned app's relationship to the caller: authored by them (owner),
+      // reached through its scope (shared), or seen only via app:admin oversight
+      // (admin). Drives the "Owned by <name>" badge and the "All"/owner filters.
+      const viewerRoleOf = (app: App): AppViewerRole =>
+        app.authorId === user.id
+          ? "owner"
+          : nonAdminAccessibleIds.has(app.id)
+            ? "shared"
+            : "admin";
+
+      // The owner sub-filter is admin-only; drop it for everyone else so a
+      // member can't probe authorship by hand-crafting the query.
+      const authorInclude =
+        isAppAdmin && query.authorIds?.length
+          ? new Set(query.authorIds)
+          : undefined;
+      const authorExclude =
+        isAppAdmin && query.excludeAuthorIds?.length
+          ? new Set(query.excludeAuthorIds)
+          : undefined;
+      const authorFilterActive =
+        authorInclude !== undefined || authorExclude !== undefined;
+
+      const ownedItems = owned
+        .map((app) => ({
+          source: "owned" as const,
+          id: app.id,
+          slug: app.slug,
+          name: app.name,
+          description: app.description,
+          scope: app.scope,
+          authorId: app.authorId,
+          authorName:
+            app.authorId !== null
+              ? (authorNames.get(app.authorId) ?? null)
+              : null,
+          createdBy: lookupCreator(
+            creators,
+            CreatedByModel.id(app, app.authorId),
+          ),
+          viewerRole: viewerRoleOf(app),
+          latestVersion: app.latestVersion,
+          enabled: app.enabled,
+          locked: app.locked,
+          teams: teamsByApp.get(app.id) ?? [],
+          users: usersByApp.get(app.id) ?? [],
+          executionModel: "viewer-scoped" as const,
+          cspOrigin: "platform-pinned" as const,
+          pinnedAt: ownedPins.get(app.id) ?? null,
+          labels: app.labels,
+          // The app's own icon, so a card can show what the app is instead of
+          // the same generic glyph on every row.
+          ...splitListIcon(app.icon, (version) => appIconUrl(app.id, version)),
+        }))
+        .filter((item) => {
+          if (query.scope !== undefined && item.scope !== query.scope)
+            return false;
+          if (!matchesLabelFilter(item.labels, labelFilter)) return false;
+          // "All" (no scope) hides oversight-only apps; they surface under
+          // Personal → Other users, exactly like the Projects list.
+          if (query.scope === undefined && item.viewerRole === "admin")
+            return false;
+          if (
+            authorInclude &&
+            !(item.authorId !== null && authorInclude.has(item.authorId))
+          )
+            return false;
+          if (
+            authorExclude &&
+            item.authorId !== null &&
+            authorExclude.has(item.authorId)
+          )
+            return false;
+          return true;
+        });
+
+      const externalItems = external
+        .map((catalogApp) => ({
+          source: "external" as const,
+          // An external app is somebody else's catalog entry; nobody here
+          // created it, so there is no one to name.
+          createdBy: null,
+          catalogId: catalogApp.catalogId,
+          mcpServerId: catalogApp.mcpServerId,
+          scope: catalogApp.scope,
+          // The server name as the title, suffixed with "/ <tool>" (short
+          // tool name, never the slug prefix) only when the server exposes
+          // several UI tools; the tool's own description as the subtitle.
+          name: externalAppLabel(catalogApp),
+          description: catalogApp.toolDescription,
+          resourceUri: catalogApp.resourceUri,
+          toolName: catalogApp.toolName,
+          // The server's registry icon so the card can show which server the
+          // app comes from.
+          ...splitListIcon(catalogApp.serverIcon, (version) =>
+            externalAppIconUrl(catalogApp.catalogId, version),
+          ),
+          requiresInput: catalogApp.requiresInput,
+          executionModel: "server-scoped" as const,
+          cspOrigin: "author-declared" as const,
+          pinnedAt:
+            externalPins.get(
+              AppPinModel.externalPinKey({
+                mcpServerId: catalogApp.mcpServerId,
+                resourceUri: catalogApp.resourceUri,
+                toolName: catalogApp.toolName,
+              }),
+            ) ?? null,
+          labels: externalLabels.get(catalogApp.catalogId) ?? [],
+        }))
+        .filter((item) => {
+          if (query.scope !== undefined && item.scope !== query.scope)
+            return false;
+          if (!matchesLabelFilter(item.labels, labelFilter)) return false;
+          // The owner sub-filter targets owned personal apps; external installs
+          // have no comparable author and none are oversight-only, so drop them
+          // whenever an author filter is active rather than mis-attributing them.
+          if (authorFilterActive) return false;
+          // Nor do they carry a policy of their own, so the "Shared with" and
+          // "Owner" filters never match one.
+          if (query.sharedWith?.length || query.owner?.length) return false;
+          // An install the caller reaches is their own personal one, one
+          // shared with a team of theirs, or the organization's; never
+          // oversight-only, so `others` holds no external app.
+          if (
+            query.access &&
+            !query.access.includes(EXTERNAL_APP_ACCESS_RELATION[item.scope])
+          )
+            return false;
+          return true;
+        });
+
+      const items: AppListItem[] = [...ownedItems, ...externalItems].filter(
+        (item) => !query.pinned || item.pinnedAt !== null,
+      );
+      items.sort((a, b) => a.name.localeCompare(b.name));
+
+      return reply.send({
+        data: items.slice(query.offset, query.offset + query.limit),
+        pagination: calculatePaginationMeta(items.length, query),
+      });
+    },
+  );
+
+  fastify.get(
+    "/api/apps/external/:catalogId",
+    {
+      schema: {
+        operationId: RouteId.GetExternalApp,
+        description:
+          "Resolve an external UI-providing app by catalog id: its UI resource and the caller's accessible installs (for the standalone run page's install selector).",
+        tags: ["Apps"],
+        params: z.object({ catalogId: UuidIdSchema }),
+        response: constructResponseSchema(ExternalAppResolutionSchema),
+      },
+    },
+    async ({ params, user, organizationId }, reply) => {
+      const resolved = await McpServerModel.findCatalogAppForCaller({
+        userId: user.id,
+        organizationId,
+        catalogId: params.catalogId,
+      });
+      if (!resolved) {
+        throw new ApiError(404, "Not found");
+      }
+      return reply.send(resolved);
+    },
+  );
+
+  fastify.get(
+    "/api/apps/external/:catalogId/icon",
+    {
+      schema: {
+        operationId: RouteId.GetExternalAppIcon,
+        description:
+          "The image icon of an external app's backing server, for the apps list, which links image icons instead of carrying them inline.",
+        tags: ["Apps"],
+        params: z.object({ catalogId: UuidIdSchema }),
+        querystring: z.object({
+          v: z.string().optional().describe("Content version; any value."),
+        }),
+      },
+    },
+    async (request, reply) => {
+      // The same gate as resolving the app itself: a catalog the caller can
+      // reach that provides a UI.
+      const resolved = await McpServerModel.findCatalogAppForCaller({
+        userId: request.user.id,
+        organizationId: request.organizationId,
+        catalogId: request.params.catalogId,
+      });
+      if (!resolved) {
+        throw new ApiError(404, "Icon not found");
+      }
+      return replyWithIconImage({
+        request,
+        reply,
+        icon: await InternalMcpCatalogModel.findIconById(
+          request.params.catalogId,
+        ),
+      });
+    },
+  );
+
+  fastify.get(
+    "/api/apps/:appId/icon",
+    {
+      schema: {
+        operationId: RouteId.GetAppIcon,
+        description:
+          "The image icon of an app the caller may view, for the apps list, which links image icons instead of carrying them inline.",
+        tags: ["Apps"],
+        params: z.object({ appId: UuidIdSchema }),
+        querystring: z.object({
+          v: z.string().optional().describe("Content version; any value."),
+        }),
+      },
+    },
+    async (request, reply) => {
+      const app = await loadViewableApp({
+        appId: request.params.appId,
+        userId: request.user.id,
+        organizationId: request.organizationId,
+      });
+      return replyWithIconImage({ request, reply, icon: app.icon });
+    },
+  );
+
+  fastify.get(
+    "/api/apps/labels/keys",
+    {
+      schema: {
+        operationId: RouteId.GetAppLabelKeys,
+        description: "Get all label keys used by apps",
+        tags: ["Apps"],
+        response: constructResponseSchema(z.array(z.string())),
+      },
+    },
+    async ({ organizationId }, reply) => {
+      return reply.send(await AppLabelModel.getAllKeys(organizationId));
+    },
+  );
+
+  fastify.get(
+    "/api/apps/labels/values",
+    {
+      schema: {
+        operationId: RouteId.GetAppLabelValues,
+        description: "Get all label values used by apps",
+        tags: ["Apps"],
+        querystring: z.object({
+          key: z.string().optional().describe("Filter values by label key"),
+        }),
+        response: constructResponseSchema(z.array(z.string())),
+      },
+    },
+    async ({ query: { key }, organizationId }, reply) => {
+      return reply.send(
+        key
+          ? await AppLabelModel.getValuesByKey({ organizationId, key })
+          : await AppLabelModel.getAllValues(organizationId),
+      );
+    },
+  );
+
+  fastify.get(
+    "/api/app-templates",
+    {
+      schema: {
+        operationId: RouteId.GetAppTemplates,
+        description: "List the curated starter templates a new app can use.",
+        tags: ["Apps"],
+        response: constructResponseSchema(z.array(AppTemplateSchema)),
+      },
+    },
+    async (_request, reply) => {
+      return reply.send(await getAppTemplates());
+    },
+  );
+
+  fastify.post(
+    "/api/apps",
+    {
+      schema: {
+        operationId: RouteId.CreateApp,
+        description: "Create a new MCP App.",
+        tags: ["Apps"],
+        body: CreateAppBodySchema,
+        response: constructResponseSchema(CreateAppResponseSchema),
+      },
+    },
+    async ({ body, user, organizationId }, reply) => {
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      await ResourcePermissions.validateInitialGrants({
+        organizationId,
+        userId: user.id,
+        resource: "app",
+        grants: body.initialGrants ?? [],
+        target: {
+          id: crypto.randomUUID(),
+          name: body.name,
+          authorId: user.id,
+        },
+      });
+      // SPDX-SnippetEnd
+      // `openInChat` hands the new app straight to a chat agent to build (the
+      // Apps page create flow), so that agent is resolved up front: the app
+      // binds to its environment below, and the seeded conversation reuses the
+      // very same agent rather than resolving one of its own.
+      //
+      // Best-effort, like the seeding itself — a failure here must not fail the
+      // create. It costs the environment inference: the app falls back to the
+      // configured landing environment and seeding resolves the agent on its
+      // own, exactly as both did before this was inferred at all.
+      const builderAgentId = body.openInChat
+        ? await resolveDefaultChatAgentId({
+            userId: user.id,
+            organizationId,
+          }).catch((error) => {
+            logger.warn(
+              { err: error, organizationId },
+              "Failed to resolve the chat agent for a new app",
+            );
+            return null;
+          })
+        : null;
+      const environmentId = await resolveNewAppEnvironmentId({
+        userId: user.id,
+        organizationId,
+        requested: body.environmentId,
+        builderAgentId,
+      });
+      await assertEnvironmentAssignable({
+        userId: user.id,
+        organizationId,
+        environmentId,
+      });
+      const { html, seededFromTemplate } = await resolveCreateAppHtml({
+        html: body.html,
+        name: body.name,
+      });
+      const { payload, warnings } = await buildValidatedVersionPayload({
+        html,
+        uiPermissions: body.uiPermissions,
+      });
+      const slug =
+        body.slug ??
+        (await AppModel.generateUniqueSlug({
+          name: body.name,
+          organizationId,
+        }));
+      const lifecycleDefaults =
+        await resolveNewAppLifecycleDefaults(organizationId);
+      // Names are unique per author and slugs per org; a duplicate of either
+      // fails this insert before any backing is created.
+      const created = await AppModel.create({
+        initialPermissionGrants: body.initialGrants ?? [],
+        app: {
+          organizationId,
+          authorId: user.id,
+          name: body.name,
+          slug,
+          description: body.description ?? null,
+          templateId: seededFromTemplate ? DEFAULT_APP_TEMPLATE_ID : null,
+          enabled: lifecycleDefaults.enabled,
+          locked: lifecycleDefaults.locked,
+        },
+        payload,
+      }).catch((error) => {
+        throw appConflictError(error, { name: body.name, slug });
+      });
+      // An app must never exist without its backing (the catalog owns its
+      // visibility + environment); on backing failure delete the app row.
+      try {
+        await createAppBacking({
+          app: created,
+          environmentId,
+          icon: body.icon ?? null,
+          userId: user.id,
+          organizationId,
+        });
+      } catch (error) {
+        await AppModel.purge(created.id);
+        throw error;
+      }
+      if (body.labels?.length) {
+        await AppLabelModel.syncAppLabels(created.id, body.labels);
+      }
+      const app = await AppModel.findById(created.id);
+      if (!app) throw new ApiError(500, "App created but could not be loaded.");
+
+      // Optionally open the new app in chat in this same request: seed a
+      // conversation with the app already rendered so the client navigates
+      // straight to `/chat/<conversationId>`. Best-effort — the app is created
+      // regardless; if seeding fails (e.g. no LLM configured) we return the app
+      // without a conversationId and the client falls back to the apps page.
+      let conversationId: string | undefined;
+      if (body.openInChat) {
+        try {
+          ({ conversationId } = await createSeededAppConversation({
+            appId: app.id,
+            userId: user.id,
+            organizationId,
+            // The agent whose environment the app was just bound to, so the
+            // chat that builds it runs as that agent (see `builderAgentId`).
+            ...(builderAgentId ? { agentId: builderAgentId } : {}),
+            creationBuildChat: true,
+          }));
+          // The Apps page creates a blank app and drops the user straight into
+          // this conversation to build it. When an organization default is
+          // what locked or disabled the app, that build has to be able to
+          // start, so the conversation gets the same creation-time grace
+          // `scaffold_app` gives its own (chat carries the conversation id as
+          // its session key). Everyone else meets both from the app's first
+          // moment.
+          if (lifecycleDefaults.locked || !lifecycleDefaults.enabled) {
+            await AppModel.setCreationGraceSessionKey(app.id, conversationId);
+          }
+        } catch (error) {
+          logger.warn(
+            { err: error, appId: app.id, conversationId },
+            "Failed to open the newly created app in chat",
+          );
+        }
+      }
+
+      return reply.send({
+        ...app,
+        createdBy: await CreatedByModel.resolveOne(
+          CreatedByModel.id(app, app.authorId),
+        ),
+        ...(warnings.length > 0 ? { warnings } : {}),
+        ...(conversationId ? { conversationId } : {}),
+      });
+    },
+  );
+
+  fastify.post(
+    "/api/apps/:appId/open-in-chat",
+    {
+      schema: {
+        operationId: RouteId.OpenAppInChat,
+        description:
+          "Open an existing app in chat: create a conversation with the app already rendered (no model turn) and return its id to navigate to.",
+        tags: ["Apps"],
+        params: z.object({ appId: UuidIdSchema }),
+        response: constructResponseSchema(OpenAppInChatResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      const {
+        params: { appId },
+        user,
+        organizationId,
+      } = request;
+      // The service re-checks app visibility (404s if the caller can't view it).
+      const { conversationId } = await createSeededAppConversation({
+        appId,
+        userId: user.id,
+        organizationId,
+        // Present only when the client generated a conversation key and sent
+        // it — the same header the composer's encrypted-chat toggle uses. Opening
+        // an app is a browser POST, so the key reaches the server on exactly
+        // the flow that creates the conversation.
+        encryptedChat: resolveEncryptedChatCreationIfRequested(request),
+      });
+      return reply.send({ conversationId });
+    },
+  );
+
+  fastify.post(
+    "/api/apps/external/:mcpServerId/open-in-chat",
+    {
+      schema: {
+        operationId: RouteId.OpenExternalAppInChat,
+        description:
+          "Open an external (MCP-server) UI app in chat: create a conversation and return its id to navigate to. When the tool needs no inputs the app is seeded already rendered (no model turn); when it has required inputs the conversation is created empty and the response carries an opening prompt for the client to send.",
+        tags: ["Apps"],
+        params: z.object({ mcpServerId: UuidIdSchema }),
+        body: z.object({ resourceUri: z.string().min(1) }),
+        response: constructResponseSchema(OpenExternalAppInChatResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      const {
+        params: { mcpServerId },
+        body: { resourceUri },
+        user,
+        organizationId,
+      } = request;
+      // The service re-checks install access + that the resource exists (404s
+      // otherwise).
+      const result = await createSeededExternalAppConversation({
+        mcpServerId,
+        resourceUri,
+        userId: user.id,
+        organizationId,
+        encryptedChat: resolveEncryptedChatCreationIfRequested(request),
+      });
+      return reply.send(result);
+    },
+  );
+
+  fastify.put(
+    "/api/apps/:appId/pin",
+    {
+      schema: {
+        operationId: RouteId.PinApp,
+        description:
+          "Pin an app for the current user (mirrors project pins). Personal — " +
+          "does not affect other members. Any user who can view the app may pin it.",
+        tags: ["Apps"],
+        params: z.object({ appId: UuidIdSchema }),
+        response: constructResponseSchema(z.object({ ok: z.literal(true) })),
+      },
+    },
+    async ({ params: { appId }, user, organizationId }, reply) => {
+      await loadViewableApp({ appId, userId: user.id, organizationId });
+      await AppPinModel.pinOwned({ userId: user.id, appId });
+      return reply.send({ ok: true as const });
+    },
+  );
+
+  fastify.delete(
+    "/api/apps/:appId/pin",
+    {
+      schema: {
+        operationId: RouteId.UnpinApp,
+        description:
+          "Remove the current user's pin on an app. Idempotent; intentionally " +
+          "no visibility check, so a stale pin on an app that was since " +
+          "re-scoped away (or deleted) can still be cleared.",
+        tags: ["Apps"],
+        params: z.object({ appId: UuidIdSchema }),
+        response: constructResponseSchema(z.object({ ok: z.literal(true) })),
+      },
+    },
+    async ({ params: { appId }, user }, reply) => {
+      await AppPinModel.unpinOwned({ userId: user.id, appId });
+      return reply.send({ ok: true as const });
+    },
+  );
+
+  fastify.put(
+    "/api/apps/external/:mcpServerId/pin",
+    {
+      schema: {
+        operationId: RouteId.PinExternalApp,
+        description:
+          "Pin an external (MCP-server) UI app for the current user, identified " +
+          "by install + resource + tool (several tools of one server can share " +
+          "a UI resource, so the tool name pins one tile, not the group). " +
+          "Personal — does not affect other members.",
+        tags: ["Apps"],
+        params: z.object({ mcpServerId: UuidIdSchema }),
+        body: z.object({
+          resourceUri: z.string().min(1),
+          toolName: z.string().min(1),
+        }),
+        response: constructResponseSchema(z.object({ ok: z.literal(true) })),
+      },
+    },
+    async (
+      { params: { mcpServerId }, body: { resourceUri, toolName }, user },
+      reply,
+    ) => {
+      // Same gate as external open-in-chat: the install must be accessible and
+      // actually expose this UI resource for this tool (404s otherwise, no
+      // existence leak).
+      const uiResource = await McpServerModel.findInstalledUiResourceForCaller({
+        userId: user.id,
+        mcpServerId,
+        resourceUri,
+        toolName,
+      });
+      if (!uiResource) {
+        throw new ApiError(404, "No runnable app found for this install.");
+      }
+      await AppPinModel.pinExternal({
+        userId: user.id,
+        mcpServerId,
+        resourceUri,
+        toolName,
+      });
+      return reply.send({ ok: true as const });
+    },
+  );
+
+  fastify.delete(
+    "/api/apps/external/:mcpServerId/pin",
+    {
+      schema: {
+        operationId: RouteId.UnpinExternalApp,
+        description:
+          "Remove the current user's pin on an external app. Idempotent; " +
+          "intentionally no access check, so a stale pin on an install the " +
+          "user lost access to can still be cleared. `resourceUri` and " +
+          "`toolName` ride the query string (DELETE carries no body).",
+        tags: ["Apps"],
+        params: z.object({ mcpServerId: UuidIdSchema }),
+        querystring: z.object({
+          resourceUri: z.string().min(1),
+          toolName: z.string().min(1),
+        }),
+        response: constructResponseSchema(z.object({ ok: z.literal(true) })),
+      },
+    },
+    async (
+      { params: { mcpServerId }, query: { resourceUri, toolName }, user },
+      reply,
+    ) => {
+      await AppPinModel.unpinExternal({
+        userId: user.id,
+        mcpServerId,
+        resourceUri,
+        toolName,
+      });
+      return reply.send({ ok: true as const });
+    },
+  );
+
+  fastify.get(
+    "/api/apps/:appId",
+    {
+      schema: {
+        operationId: RouteId.GetApp,
+        description:
+          "Get a single app by id or slug, if the caller may view it.",
+        tags: ["Apps"],
+        // The only app route that takes a slug: it backs the `/a/<segment>` run
+        // page, which has nothing but the URL segment to go on. Every other
+        // route — and the runtime and connector especially — stays uuid-keyed.
+        params: z.object({ appId: z.string().min(1) }),
+        response: constructResponseSchema(AppWithTeamsSchema),
+      },
+    },
+    async ({ params: { appId: idOrSlug }, user, organizationId }, reply) => {
+      const appId = await AppModel.resolveIdFromIdOrSlug({
+        idOrSlug,
+        organizationId,
+      });
+      if (appId === null) {
+        throw new ApiError(404, `No app found with id ${idOrSlug}.`);
+      }
+      const app = await loadViewableApp({
+        appId,
+        userId: user.id,
+        organizationId,
+        addressedAs: idOrSlug,
+      });
+      return reply.send(
+        await buildAppDetail({ app, userId: user.id, organizationId }),
+      );
+    },
+  );
+
+  fastify.patch(
+    "/api/apps/:appId",
+    {
+      schema: {
+        operationId: RouteId.UpdateApp,
+        description:
+          "Update an app's metadata and/or html (forks a new version).",
+        tags: ["Apps"],
+        params: z.object({ appId: UuidIdSchema }),
+        body: UpdateAppBodySchema,
+        response: constructResponseSchema(AppWithWarningsSchema),
+      },
+    },
+    async ({ params: { appId }, body, user, organizationId }, reply) => {
+      // Permissions live in the version envelope, so they can only change
+      // alongside new html (no silent no-op).
+      if (body.html === undefined && body.uiPermissions !== undefined) {
+        throw new ApiError(
+          400,
+          "Changing uiPermissions requires supplying html (they are part of the app version).",
+        );
+      }
+
+      const app = await loadViewableApp({
+        action: "update",
+        appId,
+        userId: user.id,
+        organizationId,
+      });
+      await assertCallerMayModifyApp({
+        appId: app.id,
+        userId: user.id,
+        organizationId,
+      });
+      // Changing the html is editing the app itself, not its settings — hold it
+      // to the stricter chat-authoring gate so an admin who only sees the app
+      // through oversight can retitle/re-scope it but not rewrite its content.
+      if (body.html !== undefined) {
+        if (app.locked) {
+          throw new ApiError(
+            409,
+            `App "${app.name}" is locked; its content cannot be replaced. Unlock it first.`,
+          );
+        }
+        await assertCallerMayAuthorApp({
+          userId: user.id,
+          organizationId,
+          app: {
+            id: app.id,
+            scope: app.scope,
+            authorId: app.authorId,
+            enabled: app.enabled,
+          },
+        });
+      }
+      // Re-binding the environment is authorized like the initial bind: org
+      // membership + the restricted-env permission. Only an actual change is
+      // re-authorized — editing other fields of an app bound to a restricted
+      // environment must not require deploy-to-restricted (the settings form
+      // echoes the unchanged environmentId). Existing tool assignments are not
+      // stripped here; out-of-environment ones are refused at call time.
+      if (
+        body.environmentId !== undefined &&
+        body.environmentId !== app.environmentId
+      ) {
+        await assertEnvironmentAssignable({
+          userId: user.id,
+          organizationId,
+          environmentId: body.environmentId,
+        });
+      }
+
+      const patch: Partial<
+        Pick<
+          App,
+          | "name"
+          | "slug"
+          | "description"
+          | "environmentId"
+          | "icon"
+          | "openInFullscreen"
+        >
+      > = {};
+      if (body.name !== undefined) patch.name = body.name;
+      if (body.slug !== undefined) patch.slug = body.slug;
+      if (body.description !== undefined) patch.description = body.description;
+      if (body.environmentId !== undefined)
+        patch.environmentId = body.environmentId;
+      if (body.icon !== undefined) patch.icon = body.icon;
+      if (body.openInFullscreen !== undefined)
+        patch.openInFullscreen = body.openInFullscreen;
+
+      // Permissions ride the version envelope; an html-bearing edit inherits
+      // the current head's value when the caller omits it.
+      let version: VersionPayload | undefined;
+      let warnings: string[] = [];
+      if (body.html !== undefined) {
+        const head = await AppVersionModel.findByAppAndVersion(
+          app.id,
+          app.latestVersion,
+        );
+        const validated = await buildValidatedVersionPayload({
+          html: body.html,
+          uiPermissions:
+            body.uiPermissions !== undefined
+              ? body.uiPermissions
+              : (head?.uiPermissions ?? null),
+        });
+        version = validated.payload;
+        warnings = validated.warnings;
+      }
+
+      const updated = await AppModel.update({
+        id: appId,
+        expectedLatestVersion: body.baseVersion,
+        ...(Object.keys(patch).length > 0 ? { patch } : {}),
+        ...(version ? { version } : {}),
+      }).catch((error) => {
+        throw appConflictError(error, { name: body.name, slug: body.slug });
+      });
+      if (!updated) {
+        throw new ApiError(404, `No app found with id ${appId}.`);
+      }
+      // Labels are replaced wholesale: omitted leaves them unchanged, `[]`
+      // clears them. Re-read so the response echoes the persisted set (with its
+      // key/value ids) rather than the pre-sync snapshot.
+      let result = updated;
+      if (body.labels !== undefined) {
+        await AppLabelModel.syncAppLabels(appId, body.labels);
+        result = (await AppModel.findById(appId)) ?? updated;
+      }
+      await syncAppBacking(result);
+      return reply.send(warnings.length > 0 ? { ...result, warnings } : result);
+    },
+  );
+
+  fastify.delete(
+    "/api/apps/bulk",
+    {
+      schema: {
+        operationId: RouteId.BulkDeleteApps,
+        description:
+          "Soft-delete several apps in one request. Each id is authorized " +
+          "exactly as the single-app delete authorizes its own, so an app the " +
+          "caller cannot see or administer — and a locked app, which is never " +
+          "deletable until unlocked — is reported in `failed` while the rest " +
+          "of the batch still applies.",
+        tags: ["Apps"],
+        body: BulkDeleteBodySchema,
+        response: constructResponseSchema(BulkOutcomeSchema),
+      },
+    },
+    async (request, reply) => {
+      const { user, organizationId } = request;
+
+      const outcome = await runBulk({
+        ids: request.body.ids,
+        logLabel: "apps bulk delete",
+        notFoundMessage: "App not found",
+        unexpectedMessage: "Could not delete this app",
+        load: async (ids) => {
+          const found = new Map<string, App>();
+          for (const appId of ids) {
+            const app = await loadViewableApp({
+              action: "delete",
+              appId,
+              userId: user.id,
+              organizationId,
+            }).catch(() => null);
+            if (app) found.set(appId, app);
+          }
+          return found;
+        },
+        describe: (app) => app.name,
+        authorize: async (app) => {
+          await assertCallerMayModifyApp({
+            action: "delete",
+            appId: app.id,
+            userId: user.id,
+            organizationId,
+          });
+          if (app.locked) {
+            throw new ApiError(
+              409,
+              `App "${app.name}" is locked and cannot be deleted. Unlock it first.`,
+            );
+          }
+        },
+        applyEach: async (app, appId) => {
+          const deleted = await AppModel.delete(appId);
+          if (!deleted) {
+            throw new ApiError(404, `No app found with id ${appId}.`);
+          }
+          await deleteAppBacking(app);
+        },
+        audit: {
+          target: request,
+          snapshot: async (ids) => ({
+            apps: await AppModel.findVisibilityForBulkAudit({
+              ids,
+              organizationId,
+            }),
+          }),
+        },
+      });
+
+      return reply.send(outcome);
+    },
+  );
+
+  fastify.delete(
+    "/api/apps/:appId",
+    {
+      schema: {
+        operationId: RouteId.DeleteApp,
+        description: "Soft-delete an app the caller owns or administers.",
+        tags: ["Apps"],
+        params: z.object({ appId: UuidIdSchema }),
+        response: constructResponseSchema(DeleteObjectResponseSchema),
+      },
+    },
+    async ({ params: { appId }, user, organizationId }, reply) => {
+      const app = await loadViewableApp({
+        action: "delete",
+        appId,
+        userId: user.id,
+        organizationId,
+      });
+      await assertCallerMayModifyApp({
+        action: "delete",
+        appId: app.id,
+        userId: user.id,
+        organizationId,
+      });
+      if (app.locked) {
+        throw new ApiError(
+          409,
+          `App "${app.name}" is locked and cannot be deleted. Unlock it first.`,
+        );
+      }
+      const success = await AppModel.delete(appId);
+      if (!success) {
+        throw new ApiError(404, `No app found with id ${appId}.`);
+      }
+      await deleteAppBacking(app);
+      logger.info({ appId, userId: user.id }, "App deleted via REST");
+      return reply.send({ success });
+    },
+  );
+
+  // Enable/disable an app — the enabled/disabled lifecycle. A disabled app is
+  // author-only and its launch tool is withheld from every gateway/agent
+  // surface; enabling makes it live at its scope, disabling pulls it back to
+  // author-only. Kept off the generic PATCH so the transition has its own
+  // audit and a stricter, single-purpose authorization.
+  for (const action of ["enable", "disable"] as const) {
+    const enable = action === "enable";
+    fastify.post(
+      `/api/apps/:appId/${action}`,
+      {
+        schema: {
+          operationId: enable ? RouteId.EnableApp : RouteId.DisableApp,
+          description: enable
+            ? "Enable a disabled app, making it live at its scope."
+            : "Disable an app, pulling it back to an author-only state.",
+          tags: ["Apps"],
+          params: z.object({ appId: UuidIdSchema }),
+          response: constructResponseSchema(AppWithTeamsSchema),
+        },
+      },
+      async ({ params: { appId }, user, organizationId }, reply) => {
+        const app = await loadViewableApp({
+          appId,
+          userId: user.id,
+          organizationId,
+        });
+        await assertCallerMayModifyApp({
+          appId: app.id,
+          userId: user.id,
+          organizationId,
+        });
+        const updated = await AppModel.setEnabled(appId, enable);
+        if (!updated) {
+          throw new ApiError(404, `No app found with id ${appId}.`);
+        }
+        logger.info(
+          { appId, userId: user.id, enabled: enable },
+          enable ? "App enabled via REST" : "App disabled via REST",
+        );
+        return reply.send(
+          await buildAppDetail({
+            app: updated,
+            userId: user.id,
+            organizationId,
+          }),
+        );
+      },
+    );
+  }
+
+  // Lock/unlock an app. The lock freezes the app against modification from
+  // chat (every authoring MCP tool refuses, and agents may unlock only on the
+  // user's direct request); on REST it additionally refuses the destructive
+  // paths — replacing the html and deleting the app — while settings-level
+  // metadata edits remain available to authorized users, who hold this toggle.
+  for (const action of ["lock", "unlock"] as const) {
+    const lock = action === "lock";
+    fastify.post(
+      `/api/apps/:appId/${action}`,
+      {
+        schema: {
+          operationId: lock ? RouteId.LockApp : RouteId.UnlockApp,
+          description: lock
+            ? "Lock an app, refusing all chat-driven modification (and REST html replacement/deletion) until unlocked."
+            : "Unlock a locked app, making it editable again.",
+          tags: ["Apps"],
+          params: z.object({ appId: UuidIdSchema }),
+          response: constructResponseSchema(AppWithTeamsSchema),
+        },
+      },
+      async ({ params: { appId }, user, organizationId }, reply) => {
+        const app = await loadViewableApp({
+          appId,
+          userId: user.id,
+          organizationId,
+        });
+        await assertCallerMayModifyApp({
+          appId: app.id,
+          userId: user.id,
+          organizationId,
+        });
+        const updated = await AppModel.setLocked(appId, lock);
+        if (!updated) {
+          throw new ApiError(404, `No app found with id ${appId}.`);
+        }
+        logger.info(
+          { appId, userId: user.id, locked: lock },
+          lock ? "App locked via REST" : "App unlocked via REST",
+        );
+        return reply.send(
+          await buildAppDetail({
+            app: updated,
+            userId: user.id,
+            organizationId,
+          }),
+        );
+      },
+    );
+  }
+
+  fastify.get(
+    "/api/apps/:appId/versions",
+    {
+      schema: {
+        operationId: RouteId.GetAppVersions,
+        description: "List an app's versions, newest first.",
+        tags: ["Apps"],
+        params: z.object({ appId: UuidIdSchema }),
+        response: constructResponseSchema(z.array(SelectAppVersionSchema)),
+      },
+    },
+    async ({ params: { appId }, user, organizationId }, reply) => {
+      await loadViewableApp({ appId, userId: user.id, organizationId });
+      return reply.send(await AppVersionModel.listForApp(appId));
+    },
+  );
+
+  fastify.get(
+    "/api/apps/:appId/versions/summaries",
+    {
+      schema: {
+        operationId: RouteId.GetAppVersionSummaries,
+        description:
+          "List an app's version metadata without returning the HTML artifacts.",
+        tags: ["Apps"],
+        params: z.object({ appId: UuidIdSchema }),
+        response: constructResponseSchema(z.array(AppVersionSummarySchema)),
+      },
+    },
+    async ({ params: { appId }, user, organizationId }, reply) => {
+      await loadViewableApp({ appId, userId: user.id, organizationId });
+      return reply.send(await AppVersionModel.listSummariesForApp(appId));
+    },
+  );
+
+  fastify.get(
+    "/api/apps/:appId/versions/:version",
+    {
+      schema: {
+        operationId: RouteId.GetAppVersion,
+        description: "Get a specific app version.",
+        tags: ["Apps"],
+        params: z.object({
+          appId: UuidIdSchema,
+          version: z.coerce.number().int().positive(),
+        }),
+        response: constructResponseSchema(SelectAppVersionSchema),
+      },
+    },
+    async ({ params: { appId, version }, user, organizationId }, reply) => {
+      await loadViewableApp({ appId, userId: user.id, organizationId });
+      const row = await AppVersionModel.findByAppAndVersion(appId, version);
+      if (!row) {
+        throw new ApiError(404, `App ${appId} has no version ${version}.`);
+      }
+      return reply.send(row);
+    },
+  );
+
+  fastify.post(
+    "/api/apps/:appId/versions/:version/restore",
+    {
+      schema: {
+        operationId: RouteId.RestoreAppVersion,
+        description:
+          "Restore an immutable app version by copying its artifact forward " +
+          "as a new head version. History is never rewritten.",
+        tags: ["Apps"],
+        params: z.object({
+          appId: UuidIdSchema,
+          version: z.coerce.number().int().positive(),
+        }),
+        body: RestoreAppVersionBodySchema,
+        response: constructResponseSchema(AppWithWarningsSchema),
+      },
+    },
+    async (
+      {
+        params: { appId, version },
+        body: { baseVersion },
+        user,
+        organizationId,
+      },
+      reply,
+    ) => {
+      const app = await loadViewableApp({
+        action: "update",
+        appId,
+        userId: user.id,
+        organizationId,
+      });
+      if (app.locked) {
+        throw new ApiError(
+          409,
+          `App "${app.name}" is locked; its content cannot be restored. Unlock it first.`,
+        );
+      }
+      await assertCallerMayAuthorApp({
+        userId: user.id,
+        organizationId,
+        app: {
+          id: app.id,
+          scope: app.scope,
+          authorId: app.authorId,
+          enabled: app.enabled,
+        },
+      });
+
+      const restored = await restoreAppVersion({
+        appId,
+        version,
+        baseVersion,
+      });
+      logger.info(
+        {
+          appId,
+          restoredFromVersion: version,
+          latestVersion: restored.app.latestVersion,
+          userId: user.id,
+        },
+        "Restored app version via REST",
+      );
+      return reply.send(
+        restored.warnings.length > 0
+          ? { ...restored.app, warnings: restored.warnings }
+          : restored.app,
+      );
+    },
+  );
+
+  fastify.get(
+    "/api/apps/:appId/tools",
+    {
+      schema: {
+        operationId: RouteId.GetAppTools,
+        description:
+          "List the tools assigned to an app, including each assignment's " +
+          "stored server pin and credential resolution mode.",
+        tags: ["Apps"],
+        params: z.object({ appId: UuidIdSchema }),
+        response: constructResponseSchema(z.array(AssignedToolSchema)),
+      },
+    },
+    async ({ params: { appId }, user, organizationId }, reply) => {
+      await loadViewableApp({ appId, userId: user.id, organizationId });
+      return reply.send(await AppToolModel.getToolsForApp(appId));
+    },
+  );
+
+  fastify.post(
+    "/api/apps/:appId/diagnostics",
+    {
+      schema: {
+        operationId: RouteId.PostAppRenderDiagnostics,
+        description:
+          "Record the calling user's latest render diagnostics for an app. An empty entries array means the render was clean.",
+        tags: ["Apps"],
+        params: z.object({ appId: UuidIdSchema }),
+        body: z.object({
+          version: z.number().int().positive(),
+          entries: z.array(AppRenderDiagnosticEntrySchema).max(50),
+        }),
+        response: constructResponseSchema(z.object({ success: z.boolean() })),
+      },
+    },
+    async ({ params: { appId }, body, user, organizationId }, reply) => {
+      // The iframe never calls this — the trusted host page does — but the
+      // endpoint must not trust an arbitrary appId regardless. user_id comes
+      // only from the session.
+      const app = await loadViewableApp({
+        appId,
+        userId: user.id,
+        organizationId,
+      });
+      // An app cannot have rendered a version it doesn't have yet; rejecting a
+      // future version stops a stale/buggy client from pinning a snapshot that
+      // masks the real head from get_app_diagnostics.
+      if (body.version > app.latestVersion) {
+        throw new ApiError(
+          400,
+          `version ${body.version} exceeds the app's latest version ${app.latestVersion}.`,
+        );
+      }
+      await AppRenderDiagnosticsModel.record({
+        appId,
+        userId: user.id,
+        version: body.version,
+        entries: body.entries,
+      });
+      return reply.send({ success: true });
+    },
+  );
+
+  fastify.post(
+    "/api/apps/:appId/screenshot",
+    {
+      schema: {
+        operationId: RouteId.PostAppRenderScreenshot,
+        description:
+          "Record the calling user's latest render screenshot for an app (a base64 image data URL the app self-captured).",
+        tags: ["Apps"],
+        params: z.object({ appId: UuidIdSchema }),
+        body: z.object({
+          version: z.number().int().positive(),
+          // ~2MB of base64 covers a downscaled JPEG; the SDK caps before posting.
+          dataUrl: z
+            .string()
+            .max(2_000_000)
+            .regex(
+              /^data:image\/(png|jpeg|webp);base64,/,
+              "must be a base64 image data URL",
+            ),
+        }),
+        response: constructResponseSchema(z.object({ success: z.boolean() })),
+      },
+    },
+    async ({ params: { appId }, body, user, organizationId }, reply) => {
+      // Same trust model as diagnostics: the trusted host page posts this, never
+      // the iframe, but the appId is still re-checked and user_id comes only from
+      // the session.
+      const app = await loadViewableApp({
+        appId,
+        userId: user.id,
+        organizationId,
+      });
+      if (body.version > app.latestVersion) {
+        throw new ApiError(
+          400,
+          `version ${body.version} exceeds the app's latest version ${app.latestVersion}.`,
+        );
+      }
+      const match = /^data:(image\/(?:png|jpeg|webp));base64,(.+)$/s.exec(
+        body.dataUrl,
+      );
+      if (!match) {
+        throw new ApiError(400, "invalid image data URL.");
+      }
+      const [, mimeType, data] = match;
+      if (!isCanonicalBase64(data)) {
+        throw new ApiError(400, "image data is not valid base64.");
+      }
+      await AppRenderScreenshotModel.record({
+        appId,
+        userId: user.id,
+        version: body.version,
+        mimeType,
+        data,
+      });
+      return reply.send({ success: true });
+    },
+  );
+
+  fastify.post(
+    "/api/apps/:appId/tools/:toolId",
+    {
+      schema: {
+        operationId: RouteId.AssignToolToApp,
+        description: "Assign an upstream tool to an app.",
+        tags: ["Apps"],
+        params: z.object({ appId: UuidIdSchema, toolId: UuidIdSchema }),
+        body: z
+          .object({
+            mcpServerId: UuidIdSchema.nullable().optional(),
+            credentialResolutionMode: CredentialResolutionModeSchema.optional(),
+          })
+          .optional(),
+        response: constructResponseSchema(z.object({ success: z.boolean() })),
+      },
+    },
+    async (
+      { params: { appId, toolId }, body, user, organizationId },
+      reply,
+    ) => {
+      await assertCallerMayModifyAppById({
+        appId,
+        userId: user.id,
+        organizationId,
+      });
+      const result = await assignToolToApp({
+        appId,
+        organizationId,
+        toolId,
+        mcpServerId: body?.mcpServerId,
+        credentialResolutionMode: body?.credentialResolutionMode,
+      });
+      if (isAssignmentError(result)) {
+        throw new ApiError(
+          result.code === "not_found"
+            ? 404
+            : result.code === "forbidden"
+              ? 403
+              : 400,
+          result.error.message,
+        );
+      }
+      return reply.send({ success: true });
+    },
+  );
+
+  fastify.delete(
+    "/api/apps/:appId/tools/:toolId",
+    {
+      schema: {
+        operationId: RouteId.UnassignToolFromApp,
+        description: "Unassign a tool from an app.",
+        tags: ["Apps"],
+        params: z.object({ appId: UuidIdSchema, toolId: UuidIdSchema }),
+        response: constructResponseSchema(DeleteObjectResponseSchema),
+      },
+    },
+    async ({ params: { appId, toolId }, user, organizationId }, reply) => {
+      await assertCallerMayModifyAppById({
+        appId,
+        userId: user.id,
+        organizationId,
+      });
+      const success = await AppToolModel.delete(appId, toolId);
+      if (!success) {
+        throw new ApiError(404, "App tool not found");
+      }
+      return reply.send({ success });
+    },
+  );
+};
+
+// =============================================================================
+// Internal helpers
+// =============================================================================
+
+/** Which "Show" relation an external app's install reaches the caller in. */
+const EXTERNAL_APP_ACCESS_RELATION: Record<
+  ResourceVisibilityScope,
+  ResourceAccessRelation
+> = {
+  personal: "mine",
+  team: "shared",
+  org: "org",
+};
+
+/**
+ * Map a write that tripped one of the `apps` unique indexes to the 409 naming
+ * the field that actually collided. Both indexes surface the same error class,
+ * so they have to be told apart by constraint name — otherwise a taken URL
+ * reports as a taken name. Any other error is returned unchanged to rethrow.
+ */
+function appConflictError(
+  error: unknown,
+  attempted: { name?: string; slug?: string },
+): unknown {
+  if (
+    attempted.slug !== undefined &&
+    isUniqueConstraintError(error, "apps_org_slug_uidx")
+  ) {
+    return new ApiError(
+      409,
+      `The URL "${attempted.slug}" is already taken in this organization.`,
+    );
+  }
+  if (
+    attempted.name !== undefined &&
+    isUniqueConstraintError(error, "apps_org_author_name_uidx")
+  ) {
+    return new ApiError(
+      409,
+      `You already have an app named "${attempted.name}".`,
+    );
+  }
+  return error;
+}
+
+/** Load an app the caller may view, or throw 404 (no existence leak). */
+async function loadViewableApp(params: {
+  appId: string;
+  action?: "read" | "update" | "delete";
+  userId: string;
+  organizationId: string;
+  /**
+   * What the 404 names, when the caller addressed the app by something other
+   * than its id (a slug). Echoing the resolved id would hand a caller who may
+   * not view the app the very identifier they could not otherwise obtain.
+   */
+  addressedAs?: string;
+}): Promise<App> {
+  const app = await AppModel.findByIdForCaller({
+    id: params.appId,
+    organizationId: params.organizationId,
+    userId: params.userId,
+    isAppAdmin: await callerIsAppAdmin(params.userId, params.organizationId),
+  });
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  const effective = app
+    ? await ResourcePermissions.getEffective({
+        ...params,
+        resource: "app",
+        scope: params.appId,
+      })
+    : null;
+  // SPDX-SnippetEnd
+  if (
+    !app ||
+    !effective?.grants.some(
+      (grant) => grant.action === "read" || grant.action === params.action,
+    )
+  ) {
+    throw new ApiError(
+      404,
+      `No app found with id ${params.addressedAs ?? params.appId}.`,
+    );
+  }
+  return app;
+}
+
+/**
+ * Assemble the single-app detail payload — team assignments, the caller's
+ * viewerRole, and the author's display name — shared by GET, enable, and
+ * disable so all three return the same shape.
+ */
+async function buildAppDetail(params: {
+  app: App;
+  userId: string;
+  organizationId: string;
+}) {
+  const { app, userId, organizationId } = params;
+  const usersByApp = await AppAccessModel.getUserDetailsForApps([app.id]);
+  const teamsByApp = await AppAccessModel.getTeamDetailsForApps([app.id]);
+  const viewerRole = await resolveViewerRole({ app, userId, organizationId });
+  const createdBy = await CreatedByModel.resolveOne(
+    CreatedByModel.id(app, app.authorId),
+  );
+  return {
+    ...app,
+    teams: teamsByApp.get(app.id) ?? [],
+    users: usersByApp.get(app.id) ?? [],
+    viewerRole,
+    // Kept alongside `createdBy` because the settings surface renders it inline
+    // in a "Viewing as administrator · <name>" banner, not as a labelled fact.
+    authorName: createdBy?.name ?? null,
+    createdBy,
+  };
+}
+
+/**
+ * The caller's relationship to an app they can already view: their own (owner),
+ * reached through its scope (shared), or seen only via app:admin oversight
+ * (admin). The single-app analogue of the list route's viewerRole labelling.
+ */
+async function resolveViewerRole(params: {
+  app: App;
+  userId: string;
+  organizationId: string;
+}): Promise<AppViewerRole> {
+  if (params.app.authorId === params.userId) return "owner";
+  const reachableWithoutAdmin = await AppAccessModel.userHasAppAccess({
+    organizationId: params.organizationId,
+    userId: params.userId,
+    app: {
+      id: params.app.id,
+      organizationId: params.app.organizationId,
+      authorId: params.app.authorId,
+      enabled: params.app.enabled,
+    },
+  });
+  return reachableWithoutAdmin ? "shared" : "admin";
+}
+
+/** Load + scope-modify-authorize an app for a tool assignment change. */
+async function assertCallerMayModifyAppById(params: {
+  appId: string;
+  userId: string;
+  organizationId: string;
+}): Promise<void> {
+  const app = await loadViewableApp({ ...params, action: "update" });
+  await assertCallerMayModifyApp({
+    appId: app.id,
+    userId: params.userId,
+    organizationId: params.organizationId,
+  });
+}
+
+function isAssignmentError(
+  result: ToolAssignmentError | "duplicate" | "updated" | null,
+): result is ToolAssignmentError {
+  return result !== null && result !== "duplicate" && result !== "updated";
+}
+
+/**
+ * Whether an item's labels satisfy a parsed `?labels=` filter: AND across keys
+ * (every key must match), OR within a key's values. A null/empty filter matches
+ * everything.
+ */
+function matchesLabelFilter(
+  labels: { key: string; value: string }[],
+  filter: Record<string, string[]> | undefined,
+): boolean {
+  if (!filter) return true;
+  return Object.entries(filter).every(([key, values]) =>
+    labels.some((label) => label.key === key && values.includes(label.value)),
+  );
+}
+
+function isCanonicalBase64(value: string): boolean {
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
+
+  const canonical = Buffer.from(value, "base64").toString("base64");
+  return value === canonical || value === canonical.replace(/=+$/, "");
+}
+
+/**
+ * Authorize binding an app to `environmentId` (null = org default). Mirrors the
+ * agent/knowledge-base/MCP-catalog path: org membership of the environment plus
+ * a `use` grant on it are enforced by `assertCanAssignEnvironment`, which also
+ * gates a restricted *default* environment.
+ */
+async function assertEnvironmentAssignable(params: {
+  userId: string;
+  organizationId: string;
+  environmentId: string | null;
+}): Promise<void> {
+  const { userId, organizationId, environmentId } = params;
+  await assertCanAssignEnvironment({ environmentId, organizationId, userId });
+}
+
+/**
+ * The environment a new app binds to. An explicit value in the body wins
+ * (including a deliberate null, which means the default environment). Otherwise
+ * the app follows the agent that will build it — the chat agent an
+ * `openInChat` create hands it to — because that is the environment the agent
+ * discovers tools in, so what `search_tools` just found is assignable to the
+ * app it is building (the same binding `scaffold_app` makes for an app created
+ * from chat). Only when there is no such agent, or its environment is one this
+ * caller may not deploy to, does the org's configured landing environment for
+ * new apps decide, and then the Default one.
+ */
+async function resolveNewAppEnvironmentId(params: {
+  userId: string;
+  organizationId: string;
+  requested: string | null | undefined;
+  /** The chat agent that will build the app, when the create opens it in chat. */
+  builderAgentId: string | null;
+}): Promise<string | null> {
+  const { userId, organizationId, requested, builderAgentId } = params;
+  if (requested !== undefined) return requested;
+
+  if (builderAgentId) {
+    const agentEnvironmentId =
+      await AgentModel.findEnvironmentId(builderAgentId);
+    // A restricted environment the caller may not deploy to falls through to
+    // the configured default rather than failing the create — inferring an
+    // environment must never turn "New app" into a 403 (choosing that
+    // environment explicitly is still refused by assertEnvironmentAssignable).
+    if (
+      agentEnvironmentId &&
+      (await environmentIsAssignable({
+        environmentId: agentEnvironmentId,
+        organizationId,
+        userId,
+      }))
+    ) {
+      return agentEnvironmentId;
+    }
+  }
+
+  return resolveDefaultEnvironmentForNewResource({
+    organizationId,
+    resource: "app",
+    userId,
+  });
+}
+
+/**
+ * The boolean form of {@link assertEnvironmentAssignable}, for an environment
+ * this route *inferred* rather than was handed: it falls back instead of
+ * failing the request.
+ */
+async function environmentIsAssignable(params: {
+  environmentId: string;
+  organizationId: string;
+  userId: string;
+}): Promise<boolean> {
+  try {
+    await assertCanAssignEnvironment(params);
+    return true;
+  } catch (error) {
+    if (error instanceof ApiError) return false;
+    throw error;
+  }
+}
+
+export default appRoutes;

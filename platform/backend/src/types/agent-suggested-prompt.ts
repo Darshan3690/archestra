@@ -1,10 +1,10 @@
 import {
   MAX_SUGGESTED_PROMPT_TEXT_LENGTH,
   MAX_SUGGESTED_PROMPT_TITLE_LENGTH,
-} from "@shared";
+} from "@archestra/shared";
 import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 import { z } from "zod";
-import { schema } from "@/database";
+import { schema } from "@/database/schema";
 
 export const SelectSuggestedPromptSchema = createSelectSchema(
   schema.agentSuggestedPromptsTable,

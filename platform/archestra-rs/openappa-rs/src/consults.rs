@@ -1,0 +1,565 @@
+//! Every external consult a dispatch makes, kept as a row of
+//! `openappa_external_consults`: a dataset, never an input to a decision.
+use appa_eventlog::postgres::PostgresError;
+use appa_runtime::api::{
+    ConsultBackend, ConsultRecord, ConsultTranscriber, ExternalOutcome, ExternalRole, NoAnswerClass,
+};
+use serde_json::{Value, json};
+use std::{
+    sync::{Mutex, PoisonError},
+    time::SystemTime,
+};
+
+/// Records beyond this many in one dispatch are dropped.
+const BUFFER_CAP: usize = 256;
+
+/// Holds one dispatch's records until the dispatch returns: the runtime hands
+/// them over on the consult's own task, where no SQL may run.
+#[derive(Default)]
+pub(crate) struct ConsultBuffer {
+    buffered: Mutex<Buffered>,
+}
+
+#[derive(Default)]
+struct Buffered {
+    records: Vec<ConsultRecord>,
+    dropped: usize,
+}
+
+impl ConsultTranscriber for ConsultBuffer {
+    fn record(&self, record: ConsultRecord) {
+        let mut buffered = self.buffered.lock().unwrap_or_else(PoisonError::into_inner);
+        if buffered.records.len() < BUFFER_CAP {
+            buffered.records.push(record);
+        } else {
+            buffered.dropped += 1;
+        }
+    }
+}
+
+impl ConsultBuffer {
+    fn take(&self) -> Buffered {
+        std::mem::take(&mut *self.buffered.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+/// Who a dispatch's consults are filed under.
+pub(crate) struct Attribution {
+    pub organization_id: String,
+    pub session_id: String,
+    pub caller_id: Option<String>,
+    /// The host's Log Content mode is Metadata only for this dispatch.
+    pub withhold_content: bool,
+}
+
+impl Attribution {
+    /// `records` as this attribution may store them.
+    fn columns(&self, records: Vec<ConsultRecord>) -> Columns {
+        let records = records.into_iter();
+        if self.withhold_content {
+            records.map(without_content).collect()
+        } else {
+            records.collect()
+        }
+    }
+}
+
+/// Stores what `buffer` holds on the dispatch's leased connection. A failure is
+/// reported and swallowed: the dataset never changes what the dispatch returns.
+pub(crate) fn store(pg: &crate::Sql<'_>, attribution: Attribution, buffer: &ConsultBuffer) {
+    let Buffered { records, dropped } = buffer.take();
+    if dropped > 0 {
+        eprintln!(
+            "OpenAPPA: one dispatch made more than {BUFFER_CAP} external consults; {dropped} were not recorded"
+        );
+    }
+    if records.is_empty() {
+        return;
+    }
+    let count = records.len();
+    let columns = attribution.columns(records);
+    if let Err(error) = insert(pg, attribution, columns) {
+        eprintln!("OpenAPPA: {count} external consult records were not stored: {error}");
+    }
+}
+
+fn insert(
+    pg: &crate::Sql<'_>,
+    attribution: Attribution,
+    mut columns: Columns,
+) -> Result<(), crate::SqlError> {
+    let cipher = pg.0.cipher();
+    for index in 0..columns.id.len() {
+        let context = |field: &str| {
+            appa_eventlog::encryption::field_context(&[
+                "openappa_external_consults",
+                &attribution.organization_id,
+                &attribution.session_id,
+                &columns.id[index],
+                field,
+            ])
+        };
+        columns.request[index] = cipher
+            .seal_json(&context("request"), &columns.request[index])
+            .map_err(PostgresError::from)?;
+        columns.answer[index] = columns.answer[index]
+            .as_ref()
+            .map(|value| cipher.seal_json(&context("answer"), value))
+            .transpose()
+            .map_err(PostgresError::from)?;
+        columns.raw_response[index] = columns.raw_response[index]
+            .as_ref()
+            .map(|bytes| cipher.seal_bytes(&context("raw_response"), bytes))
+            .transpose()
+            .map_err(PostgresError::from)?;
+        columns.diagnostics[index] = columns.diagnostics[index]
+            .as_ref()
+            .map(|bytes| cipher.seal_bytes(&context("diagnostics"), bytes))
+            .transpose()
+            .map_err(PostgresError::from)?;
+    }
+    pg.with_client(move |client| {
+        client
+            .execute(
+                "INSERT INTO openappa_external_consults (id, organization_id, session_id, caller_id, started_at, duration_ms, role, external_name, backend, request, outcome, answer, raw_response, http_status, diagnostics, diagnostics_truncated, root, trajectory, call_id, offer_id, call_digest) \
+                 SELECT c.id::uuid, $2::text, $3::text, $4::text, c.started_at, c.duration_ms, c.role, c.external_name, c.backend, c.request, c.outcome, c.answer, c.raw_response, c.http_status, c.diagnostics, c.diagnostics_truncated, c.root, c.trajectory, c.call_id, c.offer_id, c.call_digest \
+                 FROM UNNEST($1::text[], $5::timestamptz[], $6::int8[], $7::text[], $8::text[], $9::text[], $10::jsonb[], $11::text[], $12::jsonb[], $13::bytea[], $14::int4[], $15::bytea[], $16::bool[], $17::text[], $18::text[], $19::text[], $20::text[], $21::text[]) \
+                 AS c(id, started_at, duration_ms, role, external_name, backend, request, outcome, answer, raw_response, http_status, diagnostics, diagnostics_truncated, root, trajectory, call_id, offer_id, call_digest)",
+                &[
+                    &columns.id,
+                    &attribution.organization_id,
+                    &attribution.session_id,
+                    &attribution.caller_id,
+                    &columns.started_at,
+                    &columns.duration_ms,
+                    &columns.role,
+                    &columns.external_name,
+                    &columns.backend,
+                    &columns.request,
+                    &columns.outcome,
+                    &columns.answer,
+                    &columns.raw_response,
+                    &columns.http_status,
+                    &columns.diagnostics,
+                    &columns.diagnostics_truncated,
+                    &columns.root,
+                    &columns.trajectory,
+                    &columns.call_id,
+                    &columns.offer_id,
+                    &columns.call_digest,
+                ],
+            )
+            .map(drop)
+            .map_err(described)
+    })
+}
+
+/// The driver's own message is only "db error"; the server's reason is its source.
+pub(crate) fn described(error: impl std::error::Error) -> PostgresError {
+    match error.source() {
+        Some(source) => PostgresError(format!("{error}: {source}")),
+        None => PostgresError(error.to_string()),
+    }
+}
+
+/// The records in the column types the table declares, one array per column:
+/// one statement stores a whole dispatch.
+#[derive(Default)]
+struct Columns {
+    id: Vec<String>,
+    started_at: Vec<SystemTime>,
+    duration_ms: Vec<i64>,
+    role: Vec<&'static str>,
+    external_name: Vec<String>,
+    backend: Vec<&'static str>,
+    request: Vec<Value>,
+    outcome: Vec<&'static str>,
+    answer: Vec<Option<Value>>,
+    raw_response: Vec<Option<Vec<u8>>>,
+    http_status: Vec<Option<i32>>,
+    diagnostics: Vec<Option<Vec<u8>>>,
+    diagnostics_truncated: Vec<bool>,
+    root: Vec<String>,
+    trajectory: Vec<String>,
+    call_id: Vec<Option<String>>,
+    offer_id: Vec<Option<String>>,
+    call_digest: Vec<Option<String>>,
+}
+
+impl FromIterator<ConsultRecord> for Columns {
+    fn from_iter<I: IntoIterator<Item = ConsultRecord>>(records: I) -> Self {
+        let mut columns = Columns::default();
+        for record in records {
+            let (diagnostics, diagnostics_truncated) = match record.diagnostics {
+                Some(diagnostics) => (Some(diagnostics.bytes), diagnostics.truncated),
+                None => (None, false),
+            };
+            columns.id.push(record.id.to_string());
+            columns.started_at.push(record.started_at.into());
+            columns
+                .duration_ms
+                .push(i64::try_from(record.duration_ms).unwrap_or(i64::MAX));
+            columns.role.push(role_name(record.role));
+            columns.external_name.push(record.external_name);
+            columns.backend.push(backend_name(record.backend));
+            columns.request.push(record.request);
+            columns.outcome.push(outcome_name(record.outcome));
+            columns.answer.push(record.answer);
+            columns.raw_response.push(record.raw_response);
+            columns.http_status.push(record.http_status.map(i32::from));
+            columns.diagnostics.push(diagnostics);
+            columns.diagnostics_truncated.push(diagnostics_truncated);
+            columns.root.push(record.context.root);
+            columns.trajectory.push(record.context.trajectory);
+            columns.call_id.push(record.context.call_id);
+            columns.offer_id.push(record.context.offer_id);
+            columns.call_digest.push(record.context.call_digest);
+        }
+        columns
+    }
+}
+
+/// The `__redacted` value the Logs pages recognize as content the Log Content
+/// setting kept out of storage. `platform/shared/log-content.ts` is the source
+/// of truth.
+const LOG_CONTENT_POLICY_REDACTED_VALUE: &str = "log_content_policy";
+
+/// `record` with its content dropped: the envelope sent to the external, its
+/// answer, raw response and diagnostics. The request keeps only its kind, the
+/// governed tool's name and, for an authority, the requirements it was asked
+/// to waive, beside the not-stored marker; who consulted which external, when,
+/// how and with what outcome stays.
+fn without_content(record: ConsultRecord) -> ConsultRecord {
+    let mut request = not_stored();
+    if let Some(kind) = record.request.get("kind") {
+        request["kind"] = kind.clone();
+    }
+    if let Some(name) = record.request.pointer("/artifact/args/name") {
+        request["artifact"] = json!({ "args": { "name": name, "arguments": not_stored() } });
+    }
+    if let Some(tool) = record.request.pointer("/artifact/tool") {
+        let requirements: Vec<Value> = record
+            .request
+            .pointer("/artifact/requirements")
+            .and_then(Value::as_array)
+            .map(|requirements| {
+                requirements
+                    .iter()
+                    .map(requirement_without_content)
+                    .collect()
+            })
+            .unwrap_or_default();
+        request["artifact"] = json!({
+            "tool": tool,
+            "arguments": not_stored(),
+            "requirements": requirements,
+        });
+    }
+    ConsultRecord {
+        request,
+        answer: None,
+        raw_response: None,
+        diagnostics: None,
+        ..record
+    }
+}
+
+fn not_stored() -> Value {
+    json!({ "__redacted": LOG_CONTENT_POLICY_REDACTED_VALUE })
+}
+
+/// A requirement names policy vocabulary: a trust rank, an effect, an approval
+/// mark, or `public`. A list of required readers can come from the call's own
+/// arguments, so it is content.
+fn requirement_without_content(requirement: &Value) -> Value {
+    match requirement.get("required") {
+        Some(Value::Array(_)) => {
+            let mut kept = requirement.clone();
+            kept["required"] = not_stored();
+            kept
+        }
+        _ => requirement.clone(),
+    }
+}
+
+// The stored names are the runtime's own serde names. The backend's zod enums
+// list the same strings.
+pub(crate) fn role_name(role: ExternalRole) -> &'static str {
+    match role {
+        ExternalRole::Authority => "authority",
+        ExternalRole::Sanitizer => "sanitizer",
+        ExternalRole::Annotator => "annotator",
+        ExternalRole::AudienceSource => "audience_source",
+        ExternalRole::ContextProvider => "context_provider",
+    }
+}
+
+fn backend_name(backend: ConsultBackend) -> &'static str {
+    match backend {
+        ConsultBackend::Url => "url",
+        ConsultBackend::Command => "command",
+        ConsultBackend::Module => "module",
+        ConsultBackend::Llm => "llm",
+        ConsultBackend::Jev => "jev",
+        ConsultBackend::ClaudeCode => "claude_code",
+        ConsultBackend::Hitl => "hitl",
+        ConsultBackend::Archestra => "archestra",
+        ConsultBackend::Stock => "stock",
+    }
+}
+
+/// A no-answer is stored as its class alone; a url external's status is in
+/// `http_status`.
+fn outcome_name(outcome: ExternalOutcome) -> &'static str {
+    match outcome {
+        ExternalOutcome::Answered => "answered",
+        ExternalOutcome::NoAnswer(class) => match class {
+            NoAnswerClass::Unregistered => "unregistered",
+            NoAnswerClass::Unreachable => "unreachable",
+            NoAnswerClass::Dismissed => "dismissed",
+            NoAnswerClass::NonSuccess { .. } => "non_success",
+            NoAnswerClass::Timeout => "timeout",
+            NoAnswerClass::Transport => "transport",
+            NoAnswerClass::Malformed => "malformed",
+            NoAnswerClass::Oversized => "oversized",
+            NoAnswerClass::UnsupportedVersion => "unsupported_version",
+            NoAnswerClass::ModuleError => "module_error",
+            NoAnswerClass::ModulePanicked => "module_panicked",
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Attribution, BUFFER_CAP, ConsultBuffer, backend_name, outcome_name, role_name};
+    use appa_runtime::api::{
+        ConsultBackend, ConsultContext, ConsultRecord, ConsultTranscriber, Diagnostics,
+        ExternalOutcome, ExternalRole, NoAnswerClass,
+    };
+    use serde_json::{Value, json};
+
+    fn record() -> ConsultRecord {
+        ConsultRecord {
+            id: uuid::Uuid::now_v7(),
+            started_at: chrono::Utc::now(),
+            duration_ms: 1,
+            role: ExternalRole::Annotator,
+            external_name: "scan".into(),
+            backend: ConsultBackend::Url,
+            request: json!({}),
+            outcome: ExternalOutcome::Answered,
+            answer: Some(json!({})),
+            raw_response: None,
+            http_status: Some(200),
+            diagnostics: None,
+            context: ConsultContext {
+                root: "root".into(),
+                trajectory: "root".into(),
+                call_id: None,
+                offer_id: None,
+                call_digest: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_dispatch_keeps_its_first_records_up_to_the_cap_and_counts_the_rest() {
+        let buffer = ConsultBuffer::default();
+        let first = record();
+        buffer.record(first.clone());
+        for _ in 1..BUFFER_CAP + 3 {
+            buffer.record(record());
+        }
+        let taken = buffer.take();
+        assert_eq!(taken.records.len(), BUFFER_CAP);
+        assert_eq!(taken.records[0], first);
+        assert_eq!(taken.dropped, 3);
+        assert!(
+            buffer.take().records.is_empty(),
+            "taking empties the buffer"
+        );
+    }
+
+    #[test]
+    fn stored_role_and_backend_names_are_the_runtime_serde_names() {
+        for role in [
+            ExternalRole::Authority,
+            ExternalRole::Sanitizer,
+            ExternalRole::Annotator,
+            ExternalRole::AudienceSource,
+            ExternalRole::ContextProvider,
+        ] {
+            assert_eq!(serde_json::to_value(role).unwrap(), json!(role_name(role)));
+        }
+        for backend in [
+            ConsultBackend::Url,
+            ConsultBackend::Command,
+            ConsultBackend::Module,
+            ConsultBackend::Llm,
+            ConsultBackend::ClaudeCode,
+            ConsultBackend::Hitl,
+            ConsultBackend::Archestra,
+            ConsultBackend::Stock,
+        ] {
+            assert_eq!(
+                serde_json::to_value(backend).unwrap(),
+                json!(backend_name(backend))
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_outcome_is_the_serde_name_of_its_class() {
+        assert_eq!(
+            serde_json::to_value(ExternalOutcome::Answered).unwrap(),
+            json!(outcome_name(ExternalOutcome::Answered))
+        );
+        for class in [
+            NoAnswerClass::Unregistered,
+            NoAnswerClass::Unreachable,
+            NoAnswerClass::Dismissed,
+            NoAnswerClass::NonSuccess { status: 503 },
+            NoAnswerClass::Timeout,
+            NoAnswerClass::Transport,
+            NoAnswerClass::Malformed,
+            NoAnswerClass::Oversized,
+            NoAnswerClass::UnsupportedVersion,
+            NoAnswerClass::ModuleError,
+            NoAnswerClass::ModulePanicked,
+        ] {
+            let class_name = match serde_json::to_value(class).unwrap() {
+                Value::String(name) => name,
+                Value::Object(fields) => fields.keys().next().unwrap().clone(),
+                other => panic!("unexpected class shape {other}"),
+            };
+            assert_eq!(outcome_name(ExternalOutcome::NoAnswer(class)), class_name);
+        }
+    }
+
+    fn attribution(withhold_content: bool) -> Attribution {
+        Attribution {
+            organization_id: "organization".into(),
+            session_id: "session".into(),
+            caller_id: None,
+            withhold_content,
+        }
+    }
+
+    /// A consult that carries content in every column that can hold it.
+    fn consulted(request: Value) -> ConsultRecord {
+        ConsultRecord {
+            request,
+            answer: Some(json!({ "labels": ["secret"] })),
+            raw_response: Some(b"raw".to_vec()),
+            diagnostics: Some(Diagnostics {
+                bytes: b"model=m1".to_vec(),
+                truncated: true,
+            }),
+            context: ConsultContext {
+                root: "root".into(),
+                trajectory: "child".into(),
+                call_id: Some("call:1".into()),
+                offer_id: Some("offer".into()),
+                call_digest: Some("digest".into()),
+            },
+            ..record()
+        }
+    }
+
+    #[test]
+    fn a_withheld_consult_keeps_who_and_how_never_what() {
+        let request = json!({
+            "kind": "annotation",
+            "name": "gatekeeper",
+            "declaration": { "hint": "Review this post." },
+            "artifact": { "args": { "name": "annotated_read", "arguments": { "a": 1 } } },
+        });
+        let columns = attribution(true).columns(vec![consulted(request)]);
+
+        assert_eq!(
+            columns.request,
+            [json!({
+                "__redacted": "log_content_policy",
+                "kind": "annotation",
+                "artifact": { "args": {
+                    "name": "annotated_read",
+                    "arguments": { "__redacted": "log_content_policy" },
+                } },
+            })]
+        );
+        assert_eq!(columns.answer, [None]);
+        assert_eq!(columns.raw_response, [None]);
+        assert_eq!(columns.diagnostics, [None]);
+        assert_eq!(columns.diagnostics_truncated, [false]);
+        assert_eq!(columns.role, ["annotator"]);
+        assert_eq!(columns.external_name, ["scan"]);
+        assert_eq!(columns.backend, ["url"]);
+        assert_eq!(columns.outcome, ["answered"]);
+        assert_eq!(columns.http_status, [Some(200)]);
+        assert_eq!(columns.trajectory, ["child"]);
+        assert_eq!(columns.call_id, [Some("call:1".to_owned())]);
+        assert_eq!(columns.offer_id, [Some("offer".to_owned())]);
+        assert_eq!(columns.call_digest, [Some("digest".to_owned())]);
+    }
+
+    #[test]
+    fn a_withheld_authority_consult_keeps_its_tool_and_requirements_never_readers() {
+        let request = json!({
+            "kind": "authority",
+            "name": "desk",
+            "declaration": { "permits": { "trust_below": "trusted" } },
+            "artifact": {
+                "tool": "send",
+                "arguments": { "to": "alice@corp.example" },
+                "requirements": [
+                    { "kind": "trust", "required": "trusted" },
+                    { "kind": "audience", "required": "public" },
+                    { "kind": "audience", "required": ["alice@corp.example"] },
+                    { "kind": "attention", "mark": "irreversible" },
+                ],
+            },
+        });
+        let columns = attribution(true).columns(vec![consulted(request)]);
+        assert_eq!(
+            columns.request,
+            [json!({
+                "__redacted": "log_content_policy",
+                "kind": "authority",
+                "artifact": {
+                    "tool": "send",
+                    "arguments": { "__redacted": "log_content_policy" },
+                    "requirements": [
+                        { "kind": "trust", "required": "trusted" },
+                        { "kind": "audience", "required": "public" },
+                        { "kind": "audience", "required": { "__redacted": "log_content_policy" } },
+                        { "kind": "attention", "mark": "irreversible" },
+                    ],
+                },
+            })]
+        );
+    }
+
+    #[test]
+    fn a_withheld_request_without_a_named_artifact_keeps_only_its_kind() {
+        let request = json!({ "kind": "authority", "artifact": { "subject": "x" } });
+        let columns = attribution(true).columns(vec![consulted(request)]);
+        assert_eq!(
+            columns.request,
+            [json!({ "__redacted": "log_content_policy", "kind": "authority" })]
+        );
+    }
+
+    #[test]
+    fn a_consult_stored_with_content_is_untouched() {
+        let request = json!({
+            "kind": "annotation",
+            "artifact": { "args": { "name": "t", "arguments": { "a": 1 } } },
+        });
+        let columns = attribution(false).columns(vec![consulted(request.clone())]);
+        assert_eq!(columns.request, [request]);
+        assert_eq!(columns.answer, [Some(json!({ "labels": ["secret"] }))]);
+        assert_eq!(columns.raw_response, [Some(b"raw".to_vec())]);
+        assert_eq!(columns.diagnostics, [Some(b"model=m1".to_vec())]);
+        assert_eq!(columns.diagnostics_truncated, [true]);
+    }
+}

@@ -2,12 +2,12 @@
 
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect } from "react";
-import { AuthViewWithErrorHandling } from "@/app/auth/_components/auth-view-with-error-handling";
-import { BackendConnectivityStatus } from "@/app/auth/_components/backend-connectivity-status";
+import { AuthViewWithErrorHandling } from "@/app/auth/_parts/auth-view-with-error-handling";
+import { BackendConnectivityStatus } from "@/app/auth/_parts/backend-connectivity-status";
+import { SignInNotice } from "@/app/auth/_parts/sign-in-notice";
 import { AppLogo } from "@/components/app-logo";
 import { CommunityLinks } from "@/components/community-links";
-import { DefaultCredentialsWarning } from "@/components/default-credentials-warning";
-import { LoadingSpinner } from "@/components/loading";
+import { LoadingState } from "@/components/loading";
 import {
   Card,
   CardContent,
@@ -25,34 +25,30 @@ export function AuthPageWithInvitationCheck({ path }: { path: string }) {
   const invitationId = searchParams.get("invitationId");
   const redirectTo = searchParams.get("redirectTo");
 
-  const { data: invitationData, isLoading } = useInvitationCheck(invitationId);
+  const { data: invitationData } = useInvitationCheck(invitationId);
   const { data: publicConfig, isLoading: isLoadingPublicConfig } =
     usePublicConfig();
   const isBasicAuthDisabled = publicConfig?.disableBasicAuth ?? false;
 
-  // Check if this is a sign-up path (includes "sign-up-with-invitation")
   const isSignUpPath = path.startsWith("sign-up");
 
-  // Redirect existing users from sign-up to sign-in
+  // Sign-up always goes through the invitation flow, which has its own page
+  // (with invitation validation and existing-user handling).
   useEffect(() => {
-    if (
-      isSignUpPath &&
-      invitationId &&
-      invitationData &&
-      invitationData.userExists
-    ) {
-      // User already exists, redirect to sign-in with invitation ID preserved
-      router.push(`/auth/sign-in?invitationId=${invitationId}`);
+    if (isSignUpPath && invitationId) {
+      router.replace(
+        `/auth/sign-up-with-invitation?${searchParams.toString()}`,
+      );
     }
-  }, [isSignUpPath, invitationId, invitationData, router]);
+  }, [isSignUpPath, invitationId, router, searchParams]);
 
-  // Show loading while checking invitation
-  if (isLoading && invitationId && isSignUpPath) {
-    return (
-      <main className="h-full flex items-center justify-center">
-        <LoadingSpinner />
-      </main>
-    );
+  // Show loading while checking the invitation or redirecting to the
+  // sign-up-with-invitation page
+  if (invitationId && isSignUpPath) {
+    // No wrapper: `fill` centres in the frame slot the shell already gives
+    // this route. A `h-full` <main> around it resolves to zero height inside
+    // that flex column and drops the indicator at the top of the screen.
+    return <LoadingState variant="fill" />;
   }
 
   // Block direct sign-up without invitation
@@ -101,53 +97,72 @@ export function AuthPageWithInvitationCheck({ path }: { path: string }) {
   const showExistingUserMessage =
     path === "sign-in" && invitationId && invitationData;
 
-  // Only show default credentials warning when basic auth is enabled
-  const showDefaultCredentialsWarning =
+  // The notice (default credentials, SSO setup) only concerns password
+  // sign-in. With it disabled, the card already says how to sign in.
+  const showSignInNotice =
     path === "sign-in" &&
     !invitationId &&
     !isLoadingPublicConfig &&
     !isBasicAuthDisabled;
 
   const isSignInOrSignUp = path === "sign-in" || isSignUpPath;
+  // Every standalone auth surface mirrors the sign-in layout (logo on top);
+  // only flows that continue an already-branded page skip it.
+  const showLogo =
+    isSignInOrSignUp ||
+    path === "two-factor" ||
+    path === "two-factor-setup" ||
+    path === "recover-account";
 
   return (
     <BackendConnectivityStatus>
       <main className="h-full flex items-center justify-center p-4">
-        <div className="space-y-4 w-full max-w-md">
-          {isSignInOrSignUp && <AppLogo />}
-          {showDefaultCredentialsWarning && (
-            <div className="p-0 m-0 pb-4">
-              <DefaultCredentialsWarning alwaysShow />
+        {/*
+          The banner sits under the card and out of the column's flow, and the
+          column keeps its own `space-y-4` in a child so the banner's presence
+          cannot add a gap to it either. The queries it depends on answer after
+          the card has painted, and in a vertically centred column anything
+          that joins the column afterwards moves the card — which is what it
+          did, by 55px, every time someone opened sign-in on a deployment still
+          using the default credentials. Out of flow, it can arrive whenever it
+          arrives and nothing above it moves.
+        */}
+        <div className="relative w-full max-w-md">
+          {showSignInNotice && (
+            <div className="absolute inset-x-0 top-full pt-4">
+              <SignInNotice />
             </div>
           )}
-          {showExistingUserMessage && (
-            <Card className="mb-4">
-              <CardHeader className="pb-3">
-                <CardTitle className="text-base">Welcome Back!</CardTitle>
-                <CardDescription>
-                  You already have an account. Please sign in to join the new
-                  organization.
-                </CardDescription>
-              </CardHeader>
-            </Card>
-          )}
-          {/*
+          <div className="space-y-4">
+            {showLogo && <AppLogo />}
+            {showExistingUserMessage && (
+              <Card className="mb-4">
+                <CardHeader className="pb-3">
+                  <CardTitle className="text-base">Welcome Back!</CardTitle>
+                  <CardDescription>
+                    You already have an account. Please sign in to join the new
+                    organization.
+                  </CardDescription>
+                </CardHeader>
+              </Card>
+            )}
+            {/*
             callbackURL behavior differs by flow:
             - Invitation flow: Points back to auth page with invitationId preserved.
               After OAuth/SSO completes, user returns here to trigger invitation acceptance.
             - Normal flow: Points to final destination (from redirectTo param or /).
               After auth completes, user goes directly to their intended page.
           */}
-          <AuthViewWithErrorHandling
-            path={path}
-            callbackURL={getAuthCallbackURL({
-              invitationId,
-              path,
-              redirectTo,
-              searchParams,
-            })}
-          />
-          {isSignInOrSignUp && <CommunityLinks />}
+            <AuthViewWithErrorHandling
+              path={path}
+              callbackURL={getAuthCallbackURL({
+                invitationId,
+                redirectTo,
+                searchParams,
+              })}
+            />
+            {isSignInOrSignUp && <CommunityLinks />}
+          </div>
         </div>
       </main>
     </BackendConnectivityStatus>
@@ -164,16 +179,15 @@ const OAUTH_AUTHORIZE_REQUIRED_PARAMS = [
 
 function getAuthCallbackURL(params: {
   invitationId: string | null;
-  path: string;
   redirectTo: string | null;
   searchParams: ReturnType<typeof useSearchParams>;
 }) {
-  const { invitationId, path, redirectTo, searchParams } = params;
+  const { invitationId, redirectTo, searchParams } = params;
 
   if (invitationId) {
-    return `${
-      path === "sign-in" ? "/auth/sign-in" : "/auth/sign-up"
-    }?invitationId=${invitationId}`;
+    // Only sign-in reaches this point; sign-up with an invitation is
+    // redirected to /auth/sign-up-with-invitation before rendering.
+    return `/auth/sign-in?invitationId=${invitationId}`;
   }
 
   const oauthAuthorizeCallbackURL = getOAuthAuthorizeCallbackURL(searchParams);

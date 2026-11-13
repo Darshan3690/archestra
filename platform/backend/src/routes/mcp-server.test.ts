@@ -1,38 +1,62 @@
-import { OAUTH_TOKEN_TYPE } from "@shared";
+import { OAUTH_TOKEN_TYPE, PLAYWRIGHT_MCP_CATALOG_ID } from "@archestra/shared";
 import { and, eq } from "drizzle-orm";
+import type { FastifyRequest } from "fastify";
 import { vi } from "vitest";
+import { hasPermission, userHasPermission } from "@/auth/utils";
 import db, { schema } from "@/database";
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+import { enterpriseTier } from "@/enterprise-tier";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+// SPDX-SnippetEnd
+import {
+  InternalMcpCatalogModel,
+  McpServerModel,
+  PlaywrightRuntimeModel,
+} from "@/models";
 import McpServerUserModel from "@/models/mcp-server-user";
 import { secretManager } from "@/secrets-manager";
-import type { FastifyInstanceWithZod } from "@/server";
-import { createFastifyInstance } from "@/server";
-import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import {
+  getMcpOAuthCallerBinding,
+  issueMcpOAuthCredentialGrant,
+} from "@/services/mcp-oauth-credential-grant";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mustExist,
+  test,
+} from "@/test";
+import { setupTestCacheManager } from "@/test/cache-manager";
+import { grantEverywhere } from "@/test/wildcard-grants";
 import type { User } from "@/types";
+import { ApiError } from "@/types";
+
+setupTestCacheManager();
 
 const {
   connectAndGetToolsMock,
   exchangeEnterpriseManagedCredentialMock,
-  hasPermissionMock,
   invalidateConnectionsForServerMock,
   inspectServerMock,
   k8sGetOrLoadDeploymentMock,
   k8sRestartServerMock,
   k8sStartServerMock,
   k8sStopServerMock,
-  userHasPermissionMock,
   MockMcpServerConnectionTimeoutError,
   MockMcpServerNotReadyError,
 } = vi.hoisted(() => ({
   connectAndGetToolsMock: vi.fn(),
   exchangeEnterpriseManagedCredentialMock: vi.fn(),
-  hasPermissionMock: vi.fn(),
   invalidateConnectionsForServerMock: vi.fn(),
   inspectServerMock: vi.fn(),
   k8sGetOrLoadDeploymentMock: vi.fn(),
   k8sRestartServerMock: vi.fn(),
   k8sStartServerMock: vi.fn(),
   k8sStopServerMock: vi.fn(),
-  userHasPermissionMock: vi.fn(),
   MockMcpServerNotReadyError: class MockMcpServerNotReadyError extends Error {},
   MockMcpServerConnectionTimeoutError: class MockMcpServerConnectionTimeoutError extends Error {},
 }));
@@ -51,10 +75,7 @@ vi.mock("@/services/identity-providers/enterprise-managed/exchange", () => ({
   exchangeEnterpriseManagedCredential: exchangeEnterpriseManagedCredentialMock,
 }));
 
-vi.mock("@/auth/utils", () => ({
-  hasPermission: hasPermissionMock,
-  userHasPermission: userHasPermissionMock,
-}));
+vi.mock("@/auth/utils");
 
 vi.mock("@/k8s/mcp-server-runtime", () => ({
   McpServerRuntimeManager: {
@@ -63,8 +84,50 @@ vi.mock("@/k8s/mcp-server-runtime", () => ({
     restartServer: k8sRestartServerMock,
     stopServer: k8sStopServerMock,
     getOrLoadDeployment: k8sGetOrLoadDeploymentMock,
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    ensureAwake: vi.fn(),
+    isDeploymentDormant: vi.fn(() => false),
+    registerHibernationListener: vi.fn(),
+    // SPDX-SnippetEnd
   },
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  McpServerWakeError: class McpServerWakeError extends Error {},
+  // SPDX-SnippetEnd
 }));
+
+const hasPermissionMock = vi.mocked(hasPermission);
+const userHasPermissionMock = vi.mocked(userHasPermission);
+
+// Wait for the reinstall route's `setImmediate`-scheduled background work
+// to flip the install row off "pending". Fails the test if it doesn't —
+// without this assertion a stalled async reinstall would exit the polling
+// loop silently and leak into the next test in the file.
+async function drainPendingReinstall(mcpServerId: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const [serverRow] = await db
+      .select()
+      .from(schema.mcpServersTable)
+      .where(eq(schema.mcpServersTable.id, mcpServerId));
+
+    if (!serverRow) {
+      throw new Error(
+        `drainPendingReinstall(${mcpServerId}): mcp_server row not found`,
+      );
+    }
+    if (serverRow.localInstallationStatus !== "pending") {
+      return;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(
+    `drainPendingReinstall(${mcpServerId}) timed out after 2s — background reinstall did not complete`,
+  );
+}
 
 describe("mcp server inspect route", () => {
   let app: FastifyInstanceWithZod;
@@ -77,8 +140,20 @@ describe("mcp server inspect route", () => {
     const organization = await makeOrganization();
     organizationId = organization.id;
     await makeMember(user.id, organization.id);
-    hasPermissionMock.mockResolvedValue({ success: true });
+    hasPermissionMock.mockResolvedValue({ success: true, error: null });
     userHasPermissionMock.mockResolvedValue(true);
+    grantEverywhere(
+      ["mcpRegistry"],
+      async () =>
+        (
+          await hasPermissionMock.getMockImplementation()?.(
+            // The retired action this grant replaced; per-test stubs that
+            // key on real actions leave it denied.
+            { mcpServerInstallation: ["admin"] } as never,
+            {},
+          )
+        )?.success ?? false,
+    );
     k8sStartServerMock.mockResolvedValue(undefined);
     k8sRestartServerMock.mockResolvedValue(undefined);
     k8sStopServerMock.mockResolvedValue(undefined);
@@ -100,6 +175,11 @@ describe("mcp server inspect route", () => {
           organizationId: string;
         }
       ).organizationId = organizationId;
+      request.authMethod = "session";
+      request.sessionInfo = {
+        id: "test-mcp-session",
+        createdAt: new Date(),
+      };
     });
 
     const { default: mcpServerRoutes } = await import("./mcp-server");
@@ -136,6 +216,7 @@ describe("mcp server inspect route", () => {
   }) {
     const otherUser = await params.makeUser({ email: "other@example.com" });
     const catalog = await params.makeInternalMcpCatalog({
+      organizationId,
       serverType: "local",
     });
     const mcpServer = await params.makeMcpServer({
@@ -143,7 +224,7 @@ describe("mcp server inspect route", () => {
       catalogId: catalog.id,
     });
 
-    hasPermissionMock.mockResolvedValueOnce({ success: false });
+    hasPermissionMock.mockResolvedValueOnce({ success: false, error: null });
 
     const response = await app.inject({
       method: params.method,
@@ -203,13 +284,167 @@ describe("mcp server inspect route", () => {
     });
   });
 
+  // Regression: the registry deliberately shows an installation admin every
+  // connection in the organization, other members' personal ones included, so
+  // they can manage them. The Inspector, though, calls the upstream signed with
+  // the selected connection's own credential — picking a colleague's there
+  // authenticated as that colleague.
+  describe("credential ownership", () => {
+    test("refuses to inspect another member's personal connection", async ({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+      makeUser,
+    }) => {
+      const colleague = await makeUser({ email: "colleague@example.com" });
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "remote",
+      });
+      const mcpServer = await makeMcpServer({
+        ownerId: colleague.id,
+        catalogId: catalog.id,
+        scope: "personal",
+      });
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/mcp_server/${mcpServer.id}/inspect`,
+        payload: { method: "tools/list" },
+      });
+
+      // The caller holds mcpServerInstallation:admin (hasPermissionMock
+      // resolves true) and can still see the install — admin is deliberately
+      // not a way to borrow the credential.
+      expect(response.statusCode).toBe(403);
+      expect(response.json().error.message).toContain("another user");
+      expect(inspectServerMock).not.toHaveBeenCalled();
+    });
+
+    test("refuses to inspect a team connection of a team the caller is not in", async ({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+      makeTeam,
+      makeUser,
+    }) => {
+      const colleague = await makeUser({ email: "colleague@example.com" });
+      const otherTeam = await makeTeam(organizationId, colleague.id, {
+        name: "Not Mine",
+      });
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "remote",
+      });
+      const mcpServer = await makeMcpServer({
+        ownerId: colleague.id,
+        catalogId: catalog.id,
+        scope: "team",
+        teamId: otherTeam.id,
+      });
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/mcp_server/${mcpServer.id}/inspect`,
+        payload: { method: "tools/list" },
+      });
+
+      expect(response.statusCode).toBe(403);
+      expect(inspectServerMock).not.toHaveBeenCalled();
+    });
+
+    test("inspects the caller's own connection", async ({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    }) => {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "remote",
+      });
+      const mcpServer = await makeMcpServer({
+        ownerId: user.id,
+        catalogId: catalog.id,
+        scope: "personal",
+      });
+      inspectServerMock.mockResolvedValueOnce({ tools: [] });
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/mcp_server/${mcpServer.id}/inspect`,
+        payload: { method: "tools/list" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(inspectServerMock).toHaveBeenCalledTimes(1);
+    });
+
+    test("inspects a connection shared through a team the caller belongs to", async ({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+      makeTeam,
+      makeTeamMember,
+      makeUser,
+    }) => {
+      const colleague = await makeUser({ email: "colleague@example.com" });
+      const team = await makeTeam(organizationId, colleague.id, {
+        name: "Shared",
+      });
+      await makeTeamMember(team.id, user.id);
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "remote",
+      });
+      const mcpServer = await makeMcpServer({
+        ownerId: colleague.id,
+        catalogId: catalog.id,
+        scope: "team",
+        teamId: team.id,
+      });
+      inspectServerMock.mockResolvedValueOnce({ tools: [] });
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/mcp_server/${mcpServer.id}/inspect`,
+        payload: { method: "tools/list" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(inspectServerMock).toHaveBeenCalledTimes(1);
+    });
+
+    test("inspects an org-scoped connection anyone may use", async ({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+      makeUser,
+    }) => {
+      const colleague = await makeUser({ email: "colleague@example.com" });
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "remote",
+      });
+      const mcpServer = await makeMcpServer({
+        ownerId: colleague.id,
+        catalogId: catalog.id,
+        scope: "org",
+      });
+      inspectServerMock.mockResolvedValueOnce({ tools: [] });
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/mcp_server/${mcpServer.id}/inspect`,
+        payload: { method: "tools/list" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(inspectServerMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
   test("filters team-installed connections by selected assignment team", async ({
     makeInternalMcpCatalog,
     makeMcpServer,
     makeTeam,
     makeTeamMember,
   }) => {
-    hasPermissionMock.mockResolvedValueOnce({ success: false });
+    hasPermissionMock.mockResolvedValueOnce({ success: false, error: null });
 
     const selectedTeam = await makeTeam(organizationId, user.id, {
       name: "Selected Team",
@@ -221,6 +456,7 @@ describe("mcp server inspect route", () => {
     await makeTeamMember(otherTeam.id, user.id);
 
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       serverType: "remote",
     });
     const selectedServer = await makeMcpServer({
@@ -247,14 +483,14 @@ describe("mcp server inspect route", () => {
     ]);
   });
 
-  test("filters out personal connections whose owner is not in the selected assignment team", async ({
+  test("filters out all personal connections for team assignments", async ({
     makeInternalMcpCatalog,
     makeMcpServer,
     makeTeam,
     makeTeamMember,
     makeUser,
   }) => {
-    hasPermissionMock.mockResolvedValueOnce({ success: true });
+    hasPermissionMock.mockResolvedValueOnce({ success: true, error: null });
 
     const otherUser = await makeUser({ email: "other-owner@example.com" });
     const selectedTeam = await makeTeam(organizationId, user.id, {
@@ -263,15 +499,18 @@ describe("mcp server inspect route", () => {
     await makeTeamMember(selectedTeam.id, user.id);
 
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       serverType: "remote",
     });
-    const ownPersonalServer = await makeMcpServer({
+    await makeMcpServer({
       ownerId: user.id,
       catalogId: catalog.id,
+      serverType: "remote",
     });
     await makeMcpServer({
       ownerId: otherUser.id,
       catalogId: catalog.id,
+      serverType: "remote",
     });
 
     const response = await app.inject({
@@ -280,19 +519,17 @@ describe("mcp server inspect route", () => {
     });
 
     expect(response.statusCode).toBe(200);
-    expect(response.json().map((server: { id: string }) => server.id)).toEqual([
-      ownPersonalServer.id,
-    ]);
+    expect(response.json()).toEqual([]);
   });
 
-  test("filters personal connections by organization membership for org assignment scope", async ({
+  test("does not expose member-owned personal connections for org assignment scope", async ({
     makeInternalMcpCatalog,
     makeMcpServer,
     makeMember,
     makeOrganization,
     makeUser,
   }) => {
-    hasPermissionMock.mockResolvedValueOnce({ success: true });
+    hasPermissionMock.mockResolvedValueOnce({ success: true, error: null });
 
     const organization = await makeOrganization();
     organizationId = organization.id;
@@ -300,12 +537,16 @@ describe("mcp server inspect route", () => {
     const outsideOwner = await makeUser({ email: "outside-owner@example.com" });
     await makeMember(memberOwner.id, organization.id, { role: "member" });
 
-    const catalog = await makeInternalMcpCatalog({ serverType: "remote" });
-    const memberOwnedServer = await makeMcpServer({
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      serverType: "remote",
+    });
+    await makeMcpServer({
       ownerId: memberOwner.id,
       catalogId: catalog.id,
     });
     const orgOwnedServer = await makeMcpServer({
+      scope: "org",
       catalogId: catalog.id,
     });
     await makeMcpServer({
@@ -324,7 +565,7 @@ describe("mcp server inspect route", () => {
         .json()
         .map((server: { id: string }) => server.id)
         .sort(),
-    ).toEqual([memberOwnedServer.id, orgOwnedServer.id].sort());
+    ).toEqual([orgOwnedServer.id]);
   });
 
   test("filters connections for personal assignment scope", async ({
@@ -335,7 +576,7 @@ describe("mcp server inspect route", () => {
     makeTeamMember,
     makeUser,
   }) => {
-    hasPermissionMock.mockResolvedValueOnce({ success: true });
+    hasPermissionMock.mockResolvedValueOnce({ success: true, error: null });
 
     const organization = await makeOrganization();
     organizationId = organization.id;
@@ -348,16 +589,22 @@ describe("mcp server inspect route", () => {
     });
     await makeTeamMember(authorTeam.id, user.id);
 
-    const catalog = await makeInternalMcpCatalog({ serverType: "remote" });
-    const ownPersonalServer = await makeMcpServer({
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      serverType: "remote",
+    });
+    await makeMcpServer({
       ownerId: user.id,
       catalogId: catalog.id,
+      serverType: "remote",
     });
     await makeMcpServer({
       ownerId: otherUser.id,
       catalogId: catalog.id,
+      serverType: "remote",
     });
     const authorTeamServer = await makeMcpServer({
+      scope: "team",
       ownerId: otherUser.id,
       catalogId: catalog.id,
       teamId: authorTeam.id,
@@ -368,6 +615,7 @@ describe("mcp server inspect route", () => {
       teamId: otherTeam.id,
     });
     const orgOwnedServer = await makeMcpServer({
+      scope: "org",
       catalogId: catalog.id,
     });
 
@@ -382,9 +630,7 @@ describe("mcp server inspect route", () => {
         .json()
         .map((server: { id: string }) => server.id)
         .sort(),
-    ).toEqual(
-      [ownPersonalServer.id, authorTeamServer.id, orgOwnedServer.id].sort(),
-    );
+    ).toEqual([authorTeamServer.id, orgOwnedServer.id].sort());
   });
 
   test("automatically retries protected remote MCP server installation with the current identity-provider access token", async ({
@@ -392,6 +638,7 @@ describe("mcp server inspect route", () => {
     makeInternalMcpCatalog,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Protected Remote",
       serverType: "remote",
       serverUrl: "http://localhost:30082/mcp",
@@ -436,10 +683,150 @@ describe("mcp server inspect route", () => {
     });
   });
 
+  test("install does not reuse a caller-supplied secret from another connection", async ({
+    makeInternalMcpCatalog,
+  }) => {
+    const existingSecret = await secretManager().createSecret(
+      { access_token: "fake-existing-token" },
+      "existing-connection-secret",
+    );
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      serverType: "remote",
+      serverUrl: "http://127.0.0.1:30082/mcp",
+    });
+    connectAndGetToolsMock.mockResolvedValue([
+      { name: "ping", inputSchema: { type: "object", properties: {} } },
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/mcp_server",
+      payload: {
+        name: "new-connection",
+        catalogId: catalog.id,
+        scope: "personal",
+        secretId: existingSecret.id,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(connectAndGetToolsMock).not.toHaveBeenCalled();
+    expect(
+      (await secretManager().getSecret(existingSecret.id))?.secret,
+    ).toEqual({ access_token: "fake-existing-token" });
+  });
+
+  test("OAuth callback credentials can be installed and rotated once by their caller", async ({
+    makeInternalMcpCatalog,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      serverType: "remote",
+      serverUrl: "http://127.0.0.1:30082/mcp",
+      oauthConfig: {
+        name: "OAuth MCP",
+        server_url: "http://127.0.0.1:30082/mcp",
+        grant_type: "authorization_code",
+        client_id: "test-oauth-client",
+        redirect_uris: ["http://localhost:3000/oauth-callback"],
+        scopes: ["read"],
+        default_scopes: ["read"],
+        supports_resource_metadata: false,
+      },
+    });
+    connectAndGetToolsMock.mockResolvedValue([
+      { name: "ping", inputSchema: { type: "object", properties: {} } },
+    ]);
+    const callerBinding = getMcpOAuthCallerBinding({
+      user,
+      organizationId,
+      authMethod: "session",
+      sessionInfo: { id: "test-mcp-session" },
+    } as FastifyRequest);
+    const initialSecret = await secretManager().createSecret(
+      { access_token: "fake-first-token" },
+      "oauth-first-token",
+    );
+    await issueMcpOAuthCredentialGrant({
+      secretId: initialSecret.id,
+      catalogId: catalog.id,
+      callerBinding,
+    });
+
+    const install = await app.inject({
+      method: "POST",
+      url: "/api/mcp_server",
+      payload: {
+        name: catalog.name,
+        catalogId: catalog.id,
+        secretId: initialSecret.id,
+      },
+    });
+    expect(install.statusCode, install.body).toBe(200);
+    const serverId = install.json().id;
+    expect(install.json().secretId).toBe(initialSecret.id);
+
+    const rotatedSecret = await secretManager().createSecret(
+      { access_token: "fake-rotated-token" },
+      "oauth-rotated-token",
+    );
+    await issueMcpOAuthCredentialGrant({
+      secretId: rotatedSecret.id,
+      catalogId: catalog.id,
+      serverId,
+      callerBinding,
+    });
+    const reauth = await app.inject({
+      method: "PATCH",
+      url: `/api/mcp_server/${serverId}/reauthenticate`,
+      payload: { secretId: rotatedSecret.id },
+    });
+    expect(reauth.statusCode, reauth.body).toBe(200);
+    expect(reauth.json().secretId).toBe(rotatedSecret.id);
+    expect(await secretManager().getSecret(initialSecret.id)).toBeNull();
+
+    const replay = await app.inject({
+      method: "PATCH",
+      url: `/api/mcp_server/${serverId}/reauthenticate`,
+      payload: { secretId: rotatedSecret.id },
+    });
+    expect(replay.statusCode).toBe(400);
+    expect((await McpServerModel.findById(serverId))?.secretId).toBe(
+      rotatedSecret.id,
+    );
+
+    const otherSessionSecret = await secretManager().createSecret(
+      { access_token: "fake-other-session-token" },
+      "oauth-other-session-token",
+    );
+    await issueMcpOAuthCredentialGrant({
+      secretId: otherSessionSecret.id,
+      catalogId: catalog.id,
+      serverId,
+      callerBinding: getMcpOAuthCallerBinding({
+        user,
+        organizationId,
+        authMethod: "session",
+        sessionInfo: { id: "other-session" },
+      } as FastifyRequest),
+    });
+    const foreignSession = await app.inject({
+      method: "PATCH",
+      url: `/api/mcp_server/${serverId}/reauthenticate`,
+      payload: { secretId: otherSessionSecret.id },
+    });
+    expect(foreignSession.statusCode).toBe(400);
+    expect((await McpServerModel.findById(serverId))?.secretId).toBe(
+      rotatedSecret.id,
+    );
+  });
+
   test("installs a remote MCP server with static additional headers from the catalog", async ({
     makeInternalMcpCatalog,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Static Header Remote",
       serverType: "remote",
       serverUrl: "http://localhost:30082/mcp",
@@ -499,6 +886,7 @@ describe("mcp server inspect route", () => {
     makeInternalMcpCatalog,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Mixed Header Remote",
       serverType: "remote",
       serverUrl: "http://localhost:30082/mcp",
@@ -568,6 +956,7 @@ describe("mcp server inspect route", () => {
     makeInternalMcpCatalog,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Known Header Remote",
       serverType: "remote",
       serverUrl: "http://localhost:30082/mcp",
@@ -634,6 +1023,7 @@ describe("mcp server inspect route", () => {
     makeInternalMcpCatalog,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Local Header Server",
       serverType: "local",
       userConfig: {
@@ -676,10 +1066,49 @@ describe("mcp server inspect route", () => {
     });
   });
 
+  test("personal install cannot override the catalog-owned Kubernetes service account", async ({
+    makeInternalMcpCatalog,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Catalog-Owned Runtime Identity",
+      serverType: "local",
+      localConfig: {
+        command: "node",
+        arguments: ["server.js"],
+        environment: [],
+        transportType: "streamable-http",
+        httpPort: 8080,
+        httpPath: "/mcp",
+        serviceAccount: "default",
+      },
+    });
+
+    hasPermissionMock.mockResolvedValue({ success: false, error: null });
+    userHasPermissionMock.mockResolvedValue(false);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/mcp_server",
+      payload: {
+        name: "Catalog-Owned Runtime Identity",
+        catalogId: catalog.id,
+        scope: "personal",
+        serviceAccount: "request-supplied-runtime",
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const updatedCatalog = await InternalMcpCatalogModel.findById(catalog.id);
+    expect(updatedCatalog?.localConfig?.serviceAccount).toBe("default");
+    expect(k8sStartServerMock).toHaveBeenCalledTimes(1);
+  });
+
   test("installs a local MCP server with both secret env vars and prompted header user config", async ({
     makeInternalMcpCatalog,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Local Mixed Secret Server",
       serverType: "local",
       userConfig: {
@@ -746,6 +1175,7 @@ describe("mcp server inspect route", () => {
     makeInternalMcpCatalog,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Local Static Header Server",
       serverType: "local",
       userConfig: {
@@ -802,6 +1232,7 @@ describe("mcp server inspect route", () => {
     makeInternalMcpCatalog,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Local Filtered Header Server",
       serverType: "local",
       userConfig: {
@@ -875,6 +1306,7 @@ describe("mcp server inspect route", () => {
     makeMcpServer,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Local Header Reinstall",
       serverType: "local",
       userConfig: {
@@ -932,18 +1364,7 @@ describe("mcp server inspect route", () => {
       header_x_api_key: "header-value",
     });
 
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      const [serverRow] = await db
-        .select()
-        .from(schema.mcpServersTable)
-        .where(eq(schema.mcpServersTable.id, mcpServer.id));
-
-      if (serverRow?.localInstallationStatus !== "pending") {
-        break;
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    await drainPendingReinstall(mcpServer.id);
   });
 
   test("local reinstall ignores unknown keys and installer overrides for catalog static headers", async ({
@@ -951,6 +1372,7 @@ describe("mcp server inspect route", () => {
     makeMcpServer,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Local Reinstall Filtered Header Server",
       serverType: "local",
       userConfig: {
@@ -1022,18 +1444,7 @@ describe("mcp server inspect route", () => {
     });
     expect(storedSecret?.secret).not.toHaveProperty("unknown_key");
 
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      const [serverRow] = await db
-        .select()
-        .from(schema.mcpServersTable)
-        .where(eq(schema.mcpServersTable.id, mcpServer.id));
-
-      if (serverRow?.localInstallationStatus !== "pending") {
-        break;
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    await drainPendingReinstall(mcpServer.id);
   });
 
   test("rejects reinstall of another user's personal connection by an editor", async ({
@@ -1043,6 +1454,7 @@ describe("mcp server inspect route", () => {
   }) => {
     const otherUser = await makeUser({ email: "reinstall-owner@example.com" });
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       serverType: "remote",
       serverUrl: "http://localhost:30082/mcp",
     });
@@ -1050,7 +1462,6 @@ describe("mcp server inspect route", () => {
       ownerId: otherUser.id,
       catalogId: catalog.id,
     });
-
     const response = await app.inject({
       method: "POST",
       url: `/api/mcp_server/${mcpServer.id}/reinstall`,
@@ -1061,7 +1472,958 @@ describe("mcp server inspect route", () => {
     expect(connectAndGetToolsMock).not.toHaveBeenCalled();
   });
 
-  test("automatically retries protected remote MCP server installation with an exchanged enterprise-managed credential", async ({
+  // Regression: the reinstall route used to short-circuit value persistence
+  // for remote serverType, dropping any `userConfigValues` in the request
+  // body. End-user symptom was an admin adding a new required header to a
+  // remote catalog, clicking Reinstall, and the pod coming back with no
+  // value for the new header.
+  test("reinstall of a remote MCP server persists userConfigValues into the install's secret", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Remote Reinstall With New Required Header",
+      serverType: "remote",
+      serverUrl: "http://localhost:30082/mcp",
+      userConfig: {
+        header_x_api_key: {
+          type: "string",
+          title: "x-api-key",
+          description: "Newly-required header added on a catalog edit",
+          promptOnInstallation: true,
+          required: true,
+          sensitive: true,
+          headerName: "x-api-key",
+        },
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+    // makeMcpServer hardcodes `serverType: "local"`; force remote so this
+    // test exercises the remote code path of the route.
+    await db
+      .update(schema.mcpServersTable)
+      .set({ serverType: "remote" })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    await McpServerUserModel.assignUserToMcpServer(mcpServer.id, user.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+      payload: {
+        userConfigValues: {
+          header_x_api_key: "fresh-header-value",
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const [updatedServer] = await db
+      .select()
+      .from(schema.mcpServersTable)
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+
+    expect(updatedServer?.secretId).toBeTruthy();
+    if (!updatedServer?.secretId) {
+      throw new Error("Expected reinstall to persist a secretId");
+    }
+
+    const storedSecret = await secretManager().getSecret(
+      updatedServer.secretId,
+    );
+    expect(storedSecret?.secret).toMatchObject({
+      header_x_api_key: "fresh-header-value",
+    });
+
+    // Drain the route's setImmediate-deferred reinstall so background
+    // work cannot leak into the next test in the file, where its async
+    // write could fire after the test database is gone.
+    await drainPendingReinstall(mcpServer.id);
+  });
+
+  test("reinstall cannot overwrite a credential still used by another connection", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeUser,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Remote Connection",
+      serverType: "remote",
+      serverUrl: "http://localhost:30082/mcp",
+      userConfig: {
+        header_x_api_key: {
+          type: "string",
+          title: "x-api-key",
+          description: "Connection credential",
+          promptOnInstallation: true,
+          required: true,
+          sensitive: true,
+          headerName: "x-api-key",
+        },
+      },
+    });
+    const otherOwner = await makeUser();
+    const target = await makeMcpServer({
+      ownerId: otherOwner.id,
+      catalogId: catalog.id,
+    });
+    const current = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+    const shared = await secretManager().createSecret(
+      { header_x_api_key: "original-value" },
+      "shared-credential",
+    );
+    await db
+      .update(schema.mcpServersTable)
+      .set({ secretId: shared.id, serverType: "remote" })
+      .where(eq(schema.mcpServersTable.id, current.id));
+    await db
+      .update(schema.mcpServersTable)
+      .set({ secretId: shared.id, serverType: "remote" })
+      .where(eq(schema.mcpServersTable.id, target.id));
+    await McpServerUserModel.assignUserToMcpServer(current.id, user.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${current.id}/reinstall`,
+      payload: {
+        userConfigValues: { header_x_api_key: "replacement-value" },
+      },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect((await secretManager().getSecret(shared.id))?.secret).toMatchObject({
+      header_x_api_key: "original-value",
+    });
+    expect((await McpServerModel.findById(target.id))?.secretId).toBe(
+      shared.id,
+    );
+  });
+
+  // A partial reinstall (user fills only a newly-added required header) must
+  // not 400 on a required header whose value is already on the install's bag.
+  test("reinstall accepts a body that omits required userConfig fields already on the install's secret bag", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Remote Reinstall Required UserConfig From Bag",
+      serverType: "remote",
+      serverUrl: "http://localhost:30082/mcp",
+      userConfig: {
+        header_existing: {
+          type: "string",
+          title: "x-existing",
+          description: "Existing header set at original install",
+          promptOnInstallation: true,
+          required: true,
+          sensitive: false,
+          headerName: "x-existing",
+        },
+        header_new: {
+          type: "string",
+          title: "x-new",
+          description: "New header added in a catalog edit",
+          promptOnInstallation: true,
+          required: true,
+          sensitive: false,
+          headerName: "x-new",
+        },
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+    await db
+      .update(schema.mcpServersTable)
+      .set({ serverType: "remote" })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    const existingBag = await secretManager().createSecret(
+      { header_existing: "on-the-bag" },
+      `${mcpServer.name}-existing-bag`,
+    );
+    await db
+      .update(schema.mcpServersTable)
+      .set({ secretId: existingBag.id })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    await McpServerUserModel.assignUserToMcpServer(mcpServer.id, user.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+      payload: {
+        userConfigValues: { header_new: "user-fills-only-the-new-one" },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const [updatedServer] = await db
+      .select()
+      .from(schema.mcpServersTable)
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    expect(updatedServer?.secretId).toBeTruthy();
+
+    const storedSecret = await secretManager().getSecret(
+      mustExist(updatedServer.secretId),
+    );
+    expect(storedSecret?.secret).toMatchObject({
+      header_existing: "on-the-bag",
+      header_new: "user-fills-only-the-new-one",
+    });
+
+    await drainPendingReinstall(mcpServer.id);
+  });
+
+  // An explicit empty string clears an optional userConfig field from the bag
+  // while leaving unrelated entries (OAuth tokens, etc.) untouched.
+  test("reinstall body with empty string for an optional userConfig field deletes it from the bag", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Remote Reinstall Optional UserConfig Clear",
+      serverType: "remote",
+      serverUrl: "http://localhost:30082/mcp",
+      userConfig: {
+        header_optional: {
+          type: "string",
+          title: "x-optional",
+          description: "Optional header the user can clear",
+          promptOnInstallation: true,
+          required: false,
+          sensitive: false,
+          headerName: "x-optional",
+        },
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+    await db
+      .update(schema.mcpServersTable)
+      .set({ serverType: "remote" })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    const existingBag = await secretManager().createSecret(
+      { header_optional: "to-be-cleared", unrelated_key: "keep-me" },
+      `${mcpServer.name}-existing-bag`,
+    );
+    await db
+      .update(schema.mcpServersTable)
+      .set({ secretId: existingBag.id })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    await McpServerUserModel.assignUserToMcpServer(mcpServer.id, user.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+      payload: { userConfigValues: { header_optional: "" } },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const [updatedServer] = await db
+      .select()
+      .from(schema.mcpServersTable)
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    const storedSecret = await secretManager().getSecret(
+      mustExist(updatedServer.secretId),
+    );
+    expect(storedSecret?.secret).not.toHaveProperty("header_optional");
+    // Unrelated bag entries (OAuth tokens, etc.) must stay put.
+    expect(storedSecret?.secret).toMatchObject({ unrelated_key: "keep-me" });
+
+    await drainPendingReinstall(mcpServer.id);
+  });
+
+  // A whitespace-only submission for a required userConfig field passes
+  // validation via the existing-bag fallback; it must not then overwrite the
+  // stored header with whitespace.
+  test("reinstall ignores a whitespace-only userConfig submission and keeps the stored value", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Remote Reinstall Whitespace UserConfig",
+      serverType: "remote",
+      serverUrl: "http://localhost:30082/mcp",
+      userConfig: {
+        header_required: {
+          type: "string",
+          title: "x-required",
+          description: "Required header already set at install",
+          promptOnInstallation: true,
+          required: true,
+          sensitive: false,
+          headerName: "x-required",
+        },
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+    await db
+      .update(schema.mcpServersTable)
+      .set({ serverType: "remote" })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    const existingBag = await secretManager().createSecret(
+      { header_required: "valid-value" },
+      `${mcpServer.name}-existing-bag`,
+    );
+    await db
+      .update(schema.mcpServersTable)
+      .set({ secretId: existingBag.id })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    await McpServerUserModel.assignUserToMcpServer(mcpServer.id, user.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+      payload: { userConfigValues: { header_required: "   " } },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const [updatedServer] = await db
+      .select()
+      .from(schema.mcpServersTable)
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    const storedSecret = await secretManager().getSecret(
+      mustExist(updatedServer.secretId),
+    );
+    expect(storedSecret?.secret).toMatchObject({
+      header_required: "valid-value",
+    });
+
+    await drainPendingReinstall(mcpServer.id);
+  });
+
+  // Required-userConfig validation runs even on an empty body, so a newly-added
+  // required connection setting that nothing satisfies fails fast with 400
+  // rather than starting the server on stale config.
+  test("reinstall with an empty body 400s when a required userConfig field is unsatisfied", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Remote Reinstall Empty Body Missing UserConfig",
+      serverType: "remote",
+      serverUrl: "http://localhost:30082/mcp",
+      userConfig: {
+        header_required: {
+          type: "string",
+          title: "x-required",
+          description: "Required header with no value anywhere yet",
+          promptOnInstallation: true,
+          required: true,
+          sensitive: false,
+          headerName: "x-required",
+        },
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+    await db
+      .update(schema.mcpServersTable)
+      .set({ serverType: "remote" })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    await McpServerUserModel.assignUserToMcpServer(mcpServer.id, user.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+      payload: {},
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toContain("header_required");
+  });
+
+  // Regression: reinstall of a local MCP server with a newly-added prompted
+  // plain_text env var used to land the value only in the K8s secret bag.
+  // On the next pod start, the secret-typed-only filter dropped it, and the
+  // install row's `environmentValues` column was empty, so neither source
+  // carried the value into the pod env.
+  test("reinstall of a local MCP server persists plain prompted env values into mcp_server.environmentValues", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Local Reinstall Plain Prompted Env",
+      serverType: "local",
+      localConfig: {
+        command: "node",
+        arguments: ["server.js"],
+        environment: [
+          {
+            key: "PROMPTED_PLAIN_VALUE",
+            type: "plain_text",
+            promptOnInstallation: true,
+            required: true,
+          },
+        ],
+        transportType: "streamable-http",
+        httpPort: 8080,
+        httpPath: "/mcp",
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+    // Simulate the install state from before the catalog edit added the
+    // new prompted var (its environmentValues column has no entry for it).
+    await db
+      .update(schema.mcpServersTable)
+      .set({ environmentValues: {} })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    await McpServerUserModel.assignUserToMcpServer(mcpServer.id, user.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+      payload: {
+        environmentValues: {
+          PROMPTED_PLAIN_VALUE: "user-entered-at-reinstall",
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const [updatedServer] = await db
+      .select()
+      .from(schema.mcpServersTable)
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+
+    expect(updatedServer?.environmentValues).toMatchObject({
+      PROMPTED_PLAIN_VALUE: "user-entered-at-reinstall",
+    });
+
+    await drainPendingReinstall(mcpServer.id);
+  });
+
+  // Regression: the install dialog drops empty fields before submitting,
+  // so a partial reinstall (user fills only the new prompted var, leaves
+  // the others blank because the dialog doesn't pre-fill from the row)
+  // must not erase entries already on `environmentValues`.
+  test("reinstall preserves existing plain env values that the request body did not carry", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Local Reinstall Partial Submission",
+      serverType: "local",
+      localConfig: {
+        command: "node",
+        arguments: ["server.js"],
+        environment: [
+          {
+            key: "EXISTING_VAR",
+            type: "plain_text",
+            promptOnInstallation: true,
+            required: false,
+          },
+          {
+            key: "NEW_REQUIRED_VAR",
+            type: "plain_text",
+            promptOnInstallation: true,
+            required: true,
+          },
+        ],
+        transportType: "streamable-http",
+        httpPort: 8080,
+        httpPath: "/mcp",
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+    await db
+      .update(schema.mcpServersTable)
+      .set({ environmentValues: { EXISTING_VAR: "set-at-original-install" } })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    await McpServerUserModel.assignUserToMcpServer(mcpServer.id, user.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+      payload: {
+        environmentValues: {
+          NEW_REQUIRED_VAR: "user-fills-only-this",
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const [updatedServer] = await db
+      .select()
+      .from(schema.mcpServersTable)
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+
+    expect(updatedServer?.environmentValues).toMatchObject({
+      EXISTING_VAR: "set-at-original-install",
+      NEW_REQUIRED_VAR: "user-fills-only-this",
+    });
+
+    await drainPendingReinstall(mcpServer.id);
+  });
+
+  // Required plain env vars already on the row are satisfied by the merged
+  // effective state — without this, a partial reinstall would 400 before
+  // the merge path could preserve the stored value.
+  test("reinstall accepts a body that omits required plain env vars already on the install row", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Local Reinstall Required From Row",
+      serverType: "local",
+      localConfig: {
+        command: "node",
+        arguments: ["server.js"],
+        environment: [
+          {
+            key: "EXISTING_REQUIRED",
+            type: "plain_text",
+            promptOnInstallation: true,
+            required: true,
+          },
+          {
+            key: "NEW_REQUIRED",
+            type: "plain_text",
+            promptOnInstallation: true,
+            required: true,
+          },
+        ],
+        transportType: "streamable-http",
+        httpPort: 8080,
+        httpPath: "/mcp",
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+    await db
+      .update(schema.mcpServersTable)
+      .set({ environmentValues: { EXISTING_REQUIRED: "row-value" } })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    await McpServerUserModel.assignUserToMcpServer(mcpServer.id, user.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+      payload: {
+        environmentValues: { NEW_REQUIRED: "user-fills-only-this" },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const [updatedServer] = await db
+      .select()
+      .from(schema.mcpServersTable)
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+
+    expect(updatedServer?.environmentValues).toMatchObject({
+      EXISTING_REQUIRED: "row-value",
+      NEW_REQUIRED: "user-fills-only-this",
+    });
+
+    await drainPendingReinstall(mcpServer.id);
+  });
+
+  // Same shape as the plain-env case above but for secret-typed required
+  // env vars: a partial reinstall body shouldn't be rejected when the
+  // missing secret is already on the install's secret bag.
+  test("reinstall accepts a body that omits required secret env vars already on the install's secret bag", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Local Reinstall Required Secret From Bag",
+      serverType: "local",
+      localConfig: {
+        command: "node",
+        arguments: ["server.js"],
+        environment: [
+          {
+            key: "EXISTING_SECRET",
+            type: "secret",
+            promptOnInstallation: true,
+            required: true,
+          },
+          {
+            key: "NEW_REQUIRED",
+            type: "plain_text",
+            promptOnInstallation: true,
+            required: true,
+          },
+        ],
+        transportType: "streamable-http",
+        httpPort: 8080,
+        httpPath: "/mcp",
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+    const existingBag = await secretManager().createSecret(
+      { EXISTING_SECRET: "in-the-bag" },
+      `${mcpServer.name}-existing-bag`,
+    );
+    await db
+      .update(schema.mcpServersTable)
+      .set({ secretId: existingBag.id })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    await McpServerUserModel.assignUserToMcpServer(mcpServer.id, user.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+      payload: {
+        environmentValues: { NEW_REQUIRED: "user-fills-only-the-new-one" },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const [updatedServer] = await db
+      .select()
+      .from(schema.mcpServersTable)
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    const storedSecret = await secretManager().getSecret(
+      mustExist(updatedServer.secretId),
+    );
+    expect(storedSecret?.secret).toMatchObject({
+      EXISTING_SECRET: "in-the-bag",
+      NEW_REQUIRED: "user-fills-only-the-new-one",
+    });
+
+    await drainPendingReinstall(mcpServer.id);
+  });
+
+  // An explicit empty string for a prompted plain key clears it from the
+  // row. Distinguishes "user wants to delete this value" from "user didn't
+  // touch this field" (the latter signaled by omitting the key entirely).
+  test("reinstall body with empty string for a plain env key clears that entry", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Local Reinstall Clear Via Empty String",
+      serverType: "local",
+      localConfig: {
+        command: "node",
+        arguments: ["server.js"],
+        environment: [
+          {
+            key: "OPTIONAL_PLAIN",
+            type: "plain_text",
+            promptOnInstallation: true,
+            required: false,
+          },
+        ],
+        transportType: "streamable-http",
+        httpPort: 8080,
+        httpPath: "/mcp",
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+    await db
+      .update(schema.mcpServersTable)
+      .set({ environmentValues: { OPTIONAL_PLAIN: "to-be-cleared" } })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    await McpServerUserModel.assignUserToMcpServer(mcpServer.id, user.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+      payload: { environmentValues: { OPTIONAL_PLAIN: "" } },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const [updatedServer] = await db
+      .select()
+      .from(schema.mcpServersTable)
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+
+    expect(updatedServer?.environmentValues).toEqual({});
+
+    await drainPendingReinstall(mcpServer.id);
+  });
+
+  // A whitespace-only submission for a required secret passes validation via
+  // the existing-bag fallback; it must not then overwrite the stored secret
+  // with whitespace, leaving the restarted server with broken credentials.
+  test("reinstall ignores a whitespace-only secret submission and keeps the stored secret", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Local Reinstall Whitespace Secret",
+      serverType: "local",
+      localConfig: {
+        command: "node",
+        arguments: ["server.js"],
+        environment: [
+          {
+            key: "API_SECRET",
+            type: "secret",
+            promptOnInstallation: true,
+            required: true,
+          },
+        ],
+        transportType: "streamable-http",
+        httpPort: 8080,
+        httpPath: "/mcp",
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+    const existingBag = await secretManager().createSecret(
+      { API_SECRET: "valid-credential" },
+      `${mcpServer.name}-existing-bag`,
+    );
+    await db
+      .update(schema.mcpServersTable)
+      .set({ secretId: existingBag.id })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    await McpServerUserModel.assignUserToMcpServer(mcpServer.id, user.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+      payload: { environmentValues: { API_SECRET: "   " } },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const [updatedServer] = await db
+      .select()
+      .from(schema.mcpServersTable)
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    const storedSecret = await secretManager().getSecret(
+      mustExist(updatedServer.secretId),
+    );
+    expect(storedSecret?.secret).toMatchObject({
+      API_SECRET: "valid-credential",
+    });
+
+    await drainPendingReinstall(mcpServer.id);
+  });
+
+  // The plain-env column is rebuilt from the catalog's current plain prompted
+  // keys, so a var removed from the catalog or flipped to secret-typed can't
+  // survive as stale plaintext in the column (and thus in the pod env via the
+  // unconditional overlay).
+  test("reinstall prunes column keys no longer plain-prompted in the catalog", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Local Reinstall Prune Stale Column",
+      serverType: "local",
+      localConfig: {
+        command: "node",
+        arguments: ["server.js"],
+        environment: [
+          {
+            key: "KEPT_PLAIN",
+            type: "plain_text",
+            promptOnInstallation: true,
+            required: false,
+          },
+          {
+            key: "FLIPPED_TO_SECRET",
+            type: "secret",
+            promptOnInstallation: true,
+            required: false,
+          },
+        ],
+        transportType: "streamable-http",
+        httpPort: 8080,
+        httpPath: "/mcp",
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+    await db
+      .update(schema.mcpServersTable)
+      .set({
+        environmentValues: {
+          KEPT_PLAIN: "old",
+          FLIPPED_TO_SECRET: "stale-plaintext",
+          REMOVED_FROM_CATALOG: "orphan",
+        },
+      })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    await McpServerUserModel.assignUserToMcpServer(mcpServer.id, user.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+      payload: { environmentValues: { KEPT_PLAIN: "new" } },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const [updatedServer] = await db
+      .select()
+      .from(schema.mcpServersTable)
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+
+    expect(updatedServer?.environmentValues).toEqual({ KEPT_PLAIN: "new" });
+
+    await drainPendingReinstall(mcpServer.id);
+  });
+
+  // Required-env validation runs even when the reinstall body is empty, so a
+  // newly-added required var that nothing satisfies fails fast with 400
+  // instead of only breaking later at pod start.
+  test("reinstall with an empty body 400s when a newly-added required env var is unsatisfied", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Local Reinstall Empty Body Missing Required",
+      serverType: "local",
+      localConfig: {
+        command: "node",
+        arguments: ["server.js"],
+        environment: [
+          {
+            key: "NEWLY_REQUIRED",
+            type: "plain_text",
+            promptOnInstallation: true,
+            required: true,
+          },
+        ],
+        transportType: "streamable-http",
+        httpPort: 8080,
+        httpPath: "/mcp",
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+    await db
+      .update(schema.mcpServersTable)
+      .set({ environmentValues: {} })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    await McpServerUserModel.assignUserToMcpServer(mcpServer.id, user.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+      payload: { environmentValues: {} },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toContain("NEWLY_REQUIRED");
+  });
+
+  // The hoisted validation must not over-reject: an empty body still succeeds
+  // when the required var is already satisfied on the install row. The column
+  // is also rebuilt on an empty body, so a stale key left by a catalog edit is
+  // pruned even when the (auto-cascade) reinstall carries no values.
+  test("reinstall with an empty body succeeds and prunes stale column keys", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Local Reinstall Empty Body Satisfied",
+      serverType: "local",
+      localConfig: {
+        command: "node",
+        arguments: ["server.js"],
+        environment: [
+          {
+            key: "ALREADY_SET",
+            type: "plain_text",
+            promptOnInstallation: true,
+            required: true,
+          },
+        ],
+        transportType: "streamable-http",
+        httpPort: 8080,
+        httpPath: "/mcp",
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+    await db
+      .update(schema.mcpServersTable)
+      .set({
+        environmentValues: {
+          ALREADY_SET: "from-original-install",
+          REMOVED_FROM_CATALOG: "orphan",
+        },
+      })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    await McpServerUserModel.assignUserToMcpServer(mcpServer.id, user.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+      payload: { environmentValues: {} },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const [updatedServer] = await db
+      .select()
+      .from(schema.mcpServersTable)
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+
+    expect(updatedServer?.environmentValues).toEqual({
+      ALREADY_SET: "from-original-install",
+    });
+
+    await drainPendingReinstall(mcpServer.id);
+  });
+
+  test("installs a protected remote MCP server with an exchanged enterprise-managed credential on first discovery", async ({
     makeAccount,
     makeIdentityProvider,
     makeInternalMcpCatalog,
@@ -1083,6 +2445,7 @@ describe("mcp server inspect route", () => {
     });
 
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "GitHub Remote",
       serverType: "remote",
       serverUrl: "https://api.githubcopilot.com/mcp/",
@@ -1106,19 +2469,13 @@ describe("mcp server inspect route", () => {
       value: "exchanged-github-token",
     });
 
-    connectAndGetToolsMock
-      .mockRejectedValueOnce(
-        new Error(
-          "Failed to connect to MCP server GitHub: Streamable HTTP error: Error POSTing to endpoint: bad request: missing required Authorization header",
-        ),
-      )
-      .mockResolvedValueOnce([
-        {
-          name: "add_issue_comment",
-          description: "Post a comment to a GitHub issue",
-          inputSchema: { type: "object", properties: {} },
-        },
-      ]);
+    connectAndGetToolsMock.mockResolvedValueOnce([
+      {
+        name: "add_issue_comment",
+        description: "Post a comment to a GitHub issue",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ]);
 
     const response = await app.inject({
       method: "POST",
@@ -1137,8 +2494,520 @@ describe("mcp server inspect route", () => {
         requestedIssuer: "github",
       }),
     });
-    expect(connectAndGetToolsMock.mock.calls[1][0]).toMatchObject({
-      secrets: { access_token: "exchanged-github-token" },
+    expect(connectAndGetToolsMock).toHaveBeenCalledTimes(1);
+    expect(connectAndGetToolsMock.mock.calls[0][0]).toMatchObject({
+      enterpriseTransportCredential: {
+        headerName: "Authorization",
+        headerValue: "Bearer exchanged-github-token",
+      },
+    });
+    // The exchanged credential travels as a resolved header, never as a static
+    // secret — the static path would ignore the catalog's injection mode.
+    expect(connectAndGetToolsMock.mock.calls[0][0].secrets).not.toHaveProperty(
+      "access_token",
+    );
+  });
+
+  // Regression: install-time discovery used to hand the exchanged credential to
+  // the transport as a static `access_token`, which always emits
+  // `Authorization: Bearer` and silently ignores a configured custom header.
+  test("enterprise-managed install discovery honors a custom injection header", async ({
+    makeAccount,
+    makeIdentityProvider,
+    makeInternalMcpCatalog,
+  }) => {
+    const identityProvider = await makeIdentityProvider(user.id, {
+      providerId: "keycloak",
+      issuer: "http://localhost:30081/realms/archestra",
+      oidcConfig: {
+        clientId: "archestra-oidc",
+        clientSecret: "archestra-oidc-secret",
+        tokenEndpoint:
+          "http://localhost:30081/realms/archestra/protocol/openid-connect/token",
+        tokenEndpointAuthentication: "client_secret_post",
+        enterpriseManagedCredentials: {
+          exchangeStrategy: "rfc8693",
+          subjectTokenType: OAUTH_TOKEN_TYPE.AccessToken,
+        },
+      },
+    });
+
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Custom Header Remote",
+      serverType: "remote",
+      serverUrl: "https://internal.example.com/mcp",
+      enterpriseManagedConfig: {
+        identityProviderId: identityProvider.id,
+        requestedCredentialType: "bearer_token",
+        tokenInjectionMode: "header",
+        headerName: "x-provider-api-token",
+      },
+    });
+
+    await makeAccount(user.id, {
+      providerId: "keycloak",
+      accessToken: "session-access-token",
+    });
+
+    exchangeEnterpriseManagedCredentialMock.mockResolvedValueOnce({
+      credentialType: "bearer_token",
+      expiresInSeconds: null,
+      issuedTokenType: OAUTH_TOKEN_TYPE.AccessToken,
+      value: "exchanged-custom-header-token",
+    });
+
+    connectAndGetToolsMock.mockResolvedValueOnce([
+      {
+        name: "get-server-info",
+        description: "Returns server details",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/mcp_server",
+      payload: {
+        name: "Custom Header Remote",
+        catalogId: catalog.id,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(connectAndGetToolsMock).toHaveBeenCalledTimes(1);
+
+    const [discoveryParams] = connectAndGetToolsMock.mock.calls[0];
+    // Bare value under the configured header — not `Bearer …`, and not
+    // `Authorization`.
+    expect(discoveryParams.enterpriseTransportCredential).toMatchObject({
+      headerName: "x-provider-api-token",
+      headerValue: "exchanged-custom-header-token",
+    });
+    expect(discoveryParams.secrets).not.toHaveProperty("access_token");
+  });
+
+  // Regression: enterprise-managed catalogs with install-time userConfig used
+  // to run the static-secret `validateConnection` probe before discovery,
+  // which hit the MCP server without any Authorization header and failed the
+  // install on servers that require auth for tools/list.
+  test("enterprise-managed install with install-time config skips the unauthenticated connection probe", async ({
+    makeAccount,
+    makeIdentityProvider,
+    makeInternalMcpCatalog,
+  }) => {
+    const identityProvider = await makeIdentityProvider(user.id, {
+      providerId: "keycloak",
+      issuer: "http://localhost:30081/realms/archestra",
+      oidcConfig: {
+        clientId: "archestra-oidc",
+        clientSecret: "archestra-oidc-secret",
+        tokenEndpoint:
+          "http://localhost:30081/realms/archestra/protocol/openid-connect/token",
+        tokenEndpointAuthentication: "client_secret_post",
+        enterpriseManagedCredentials: {
+          exchangeStrategy: "rfc8693",
+          subjectTokenType: OAUTH_TOKEN_TYPE.AccessToken,
+        },
+      },
+    });
+
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Protected Remote With Config",
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com/mcp",
+      enterpriseManagedConfig: {
+        identityProviderId: identityProvider.id,
+        requestedCredentialType: "bearer_token",
+        tokenInjectionMode: "authorization_bearer",
+      },
+      userConfig: {
+        header_x_tenant: {
+          type: "string",
+          title: "x-tenant",
+          description: "Tenant header",
+          promptOnInstallation: true,
+          required: true,
+          sensitive: false,
+          headerName: "x-tenant",
+        },
+      },
+    });
+
+    await makeAccount(user.id, {
+      providerId: "keycloak",
+      accessToken: "session-access-token",
+    });
+
+    exchangeEnterpriseManagedCredentialMock.mockResolvedValueOnce({
+      credentialType: "bearer_token",
+      expiresInSeconds: null,
+      issuedTokenType: OAUTH_TOKEN_TYPE.AccessToken,
+      value: "exchanged-downstream-token",
+    });
+
+    connectAndGetToolsMock.mockResolvedValueOnce([
+      {
+        name: "get-server-info",
+        description: "Returns server details",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/mcp_server",
+      payload: {
+        name: "Protected Remote With Config",
+        catalogId: catalog.id,
+        userConfigValues: {
+          header_x_tenant: "tenant-a",
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    // Exactly one connect for this catalog: the discovery call carrying the
+    // exchanged credential — no prior unauthenticated validateConnection
+    // probe. Filter by catalog id so deferred background discovery leaked
+    // from sibling tests can't pollute the count.
+    const callsForCatalog = connectAndGetToolsMock.mock.calls.filter(
+      ([params]) =>
+        (params as { catalogItem?: { id?: string } }).catalogItem?.id ===
+        catalog.id,
+    );
+    expect(callsForCatalog).toHaveLength(1);
+    expect(callsForCatalog[0][0]).toMatchObject({
+      secrets: {
+        header_x_tenant: "tenant-a",
+      },
+      enterpriseTransportCredential: {
+        headerName: "Authorization",
+        headerValue: "Bearer exchanged-downstream-token",
+      },
+    });
+  });
+
+  test("enterprise-managed local server install discovery sends the exchanged credential", async ({
+    makeAccount,
+    makeIdentityProvider,
+    makeInternalMcpCatalog,
+  }) => {
+    const identityProvider = await makeIdentityProvider(user.id, {
+      providerId: "keycloak",
+      issuer: "http://localhost:30081/realms/archestra",
+      oidcConfig: {
+        clientId: "archestra-oidc",
+        clientSecret: "archestra-oidc-secret",
+        tokenEndpoint:
+          "http://localhost:30081/realms/archestra/protocol/openid-connect/token",
+        tokenEndpointAuthentication: "client_secret_post",
+        enterpriseManagedCredentials: {
+          exchangeStrategy: "rfc8693",
+          subjectTokenType: OAUTH_TOKEN_TYPE.AccessToken,
+        },
+      },
+    });
+
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Protected Local Http",
+      serverType: "local",
+      enterpriseManagedConfig: {
+        identityProviderId: identityProvider.id,
+        requestedCredentialType: "bearer_token",
+        tokenInjectionMode: "authorization_bearer",
+      },
+      localConfig: {
+        transportType: "streamable-http",
+        dockerImage: "example/protected-mcp:latest",
+      },
+    });
+
+    await makeAccount(user.id, {
+      providerId: "keycloak",
+      accessToken: "session-access-token",
+    });
+
+    exchangeEnterpriseManagedCredentialMock.mockResolvedValueOnce({
+      credentialType: "bearer_token",
+      expiresInSeconds: null,
+      issuedTokenType: OAUTH_TOKEN_TYPE.AccessToken,
+      value: "exchanged-local-token",
+    });
+
+    connectAndGetToolsMock.mockResolvedValueOnce([
+      {
+        name: "get-server-info",
+        description: "Returns server details",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/mcp_server",
+      payload: {
+        name: "Protected Local Http",
+        catalogId: catalog.id,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const serverId = response.json().id as string;
+
+    // Local discovery runs in a deferred background task; wait for it.
+    let finalStatus: string | null | undefined;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const [serverRow] = await db
+        .select()
+        .from(schema.mcpServersTable)
+        .where(eq(schema.mcpServersTable.id, serverId));
+      finalStatus = serverRow?.localInstallationStatus;
+      if (finalStatus && finalStatus !== "pending") {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    expect(finalStatus).toBe("success");
+    const callsForCatalog = connectAndGetToolsMock.mock.calls.filter(
+      ([params]) =>
+        (params as { catalogItem?: { id?: string } }).catalogItem?.id ===
+        catalog.id,
+    );
+    expect(callsForCatalog).toHaveLength(1);
+    expect(callsForCatalog[0][0]).toMatchObject({
+      enterpriseTransportCredential: {
+        headerName: "Authorization",
+        headerValue: "Bearer exchanged-local-token",
+      },
+    });
+  });
+
+  test("sends enterprise-managed credentials on first discovery without depending on auth-error retry matching", async ({
+    makeAccount,
+    makeIdentityProvider,
+    makeInternalMcpCatalog,
+  }) => {
+    const identityProvider = await makeIdentityProvider(user.id, {
+      providerId: "missing-auth-header-idp",
+      issuer: "https://login.example.com/tenant/v2.0",
+      oidcConfig: {
+        clientId: "web-client-id",
+        clientSecret: "web-client-secret",
+        tokenEndpoint: "https://login.example.com/tenant/oauth2/v2.0/token",
+        enterpriseManagedCredentials: {
+          exchangeStrategy: "entra_obo",
+          subjectTokenType: OAUTH_TOKEN_TYPE.AccessToken,
+          tokenEndpoint: "https://login.example.com/tenant/oauth2/v2.0/token",
+          tokenEndpointAuthentication: "client_secret_post",
+        },
+      },
+    });
+
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Header Required Remote",
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com/mcp",
+      enterpriseManagedConfig: {
+        identityProviderId: identityProvider.id,
+        requestedCredentialType: "bearer_token",
+        resourceIdentifier: "api://downstream-app",
+        tokenInjectionMode: "authorization_bearer",
+      },
+    });
+
+    await makeAccount(user.id, {
+      providerId: "missing-auth-header-idp",
+      accessToken: "session-access-token",
+    });
+
+    exchangeEnterpriseManagedCredentialMock.mockResolvedValueOnce({
+      credentialType: "bearer_token",
+      expiresInSeconds: 300,
+      issuedTokenType: OAUTH_TOKEN_TYPE.AccessToken,
+      value: "downstream-user-token",
+    });
+
+    connectAndGetToolsMock.mockResolvedValueOnce([
+      {
+        name: "debug_auth",
+        description: "Debug auth",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/mcp_server",
+      payload: {
+        name: catalog.name,
+        catalogId: catalog.id,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(connectAndGetToolsMock).toHaveBeenCalledTimes(1);
+    expect(exchangeEnterpriseManagedCredentialMock).toHaveBeenCalledWith({
+      identityProviderId: identityProvider.id,
+      assertion: "session-access-token",
+      enterpriseManagedConfig: expect.objectContaining({
+        resourceIdentifier: "api://downstream-app",
+      }),
+    });
+    expect(connectAndGetToolsMock.mock.calls[0][0]).toMatchObject({
+      enterpriseTransportCredential: {
+        headerName: "Authorization",
+        headerValue: "Bearer downstream-user-token",
+      },
+    });
+  });
+
+  test("uses the current SSO access token for implicit enterprise-managed install discovery without a matching IdP", async ({
+    makeAccount,
+    makeInternalMcpCatalog,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Implicit Protected Remote",
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com/mcp",
+      enterpriseManagedConfig: {
+        requestedCredentialType: "bearer_token",
+        resourceIdentifier: "api://downstream-app",
+        tokenInjectionMode: "authorization_bearer",
+      },
+    });
+
+    await makeAccount(user.id, {
+      providerId: "external-sso-without-idp-row",
+      accessToken: "raw-session-access-token",
+    });
+
+    connectAndGetToolsMock.mockResolvedValueOnce([
+      {
+        name: "debug_auth",
+        description: "Debug auth",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/mcp_server",
+      payload: {
+        name: catalog.name,
+        catalogId: catalog.id,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(exchangeEnterpriseManagedCredentialMock).not.toHaveBeenCalled();
+    expect(connectAndGetToolsMock).toHaveBeenCalledTimes(1);
+    expect(connectAndGetToolsMock.mock.calls[0][0]).toMatchObject({
+      enterpriseTransportCredential: {
+        headerName: "Authorization",
+        headerValue: "Bearer raw-session-access-token",
+      },
+    });
+  });
+
+  test("uses the configured token-exchange identity provider for shared install discovery", async ({
+    makeAccount,
+    makeIdentityProvider,
+    makeInternalMcpCatalog,
+    makeTeam,
+  }) => {
+    await makeIdentityProvider(user.id, {
+      providerId: "login-sso",
+      issuer: "https://login-sso.example.com",
+      oidcConfig: {
+        clientId: "login-client",
+        clientSecret: "login-secret",
+        tokenEndpoint: "https://login-sso.example.com/oauth/token",
+      },
+    });
+    const exchangeIdentityProvider = await makeIdentityProvider(user.id, {
+      providerId: "mcp-exchange-idp",
+      issuer: "https://exchange-idp.example.com/tenant/v2.0",
+      oidcConfig: {
+        clientId: "exchange-client",
+        clientSecret: "exchange-secret",
+        tokenEndpoint: "https://exchange-idp.example.com/oauth2/v2.0/token",
+        enterpriseManagedCredentials: {
+          exchangeStrategy: "entra_obo",
+          subjectTokenType: OAUTH_TOKEN_TYPE.AccessToken,
+          tokenEndpoint: "https://exchange-idp.example.com/oauth2/v2.0/token",
+          tokenEndpointAuthentication: "client_secret_post",
+        },
+      },
+    });
+    const team = await makeTeam(organizationId, user.id);
+
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Shared Protected Remote",
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com/mcp",
+      enterpriseManagedConfig: {
+        identityProviderId: exchangeIdentityProvider.id,
+        requestedCredentialType: "bearer_token",
+        resourceIdentifier: "api://downstream-app",
+        tokenInjectionMode: "authorization_bearer",
+      },
+    });
+
+    await makeAccount(user.id, {
+      providerId: "login-sso",
+      accessToken: "login-sso-access-token",
+    });
+    await makeAccount(user.id, {
+      providerId: "mcp-exchange-idp",
+      accessToken: "exchange-idp-access-token",
+    });
+
+    exchangeEnterpriseManagedCredentialMock.mockResolvedValueOnce({
+      credentialType: "bearer_token",
+      expiresInSeconds: 300,
+      issuedTokenType: OAUTH_TOKEN_TYPE.AccessToken,
+      value: "shared-install-discovery-token",
+    });
+    connectAndGetToolsMock.mockResolvedValueOnce([
+      {
+        name: "list_records",
+        description: "List records",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/mcp_server",
+      payload: {
+        name: catalog.name,
+        catalogId: catalog.id,
+        scope: "team",
+        teamId: team.id,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(exchangeEnterpriseManagedCredentialMock).toHaveBeenCalledWith({
+      identityProviderId: exchangeIdentityProvider.id,
+      assertion: "exchange-idp-access-token",
+      enterpriseManagedConfig: expect.objectContaining({
+        resourceIdentifier: "api://downstream-app",
+      }),
+    });
+    expect(connectAndGetToolsMock).toHaveBeenCalledTimes(1);
+    expect(connectAndGetToolsMock.mock.calls[0][0]).toMatchObject({
+      enterpriseTransportCredential: {
+        headerName: "Authorization",
+        headerValue: "Bearer shared-install-discovery-token",
+      },
     });
   });
 
@@ -1154,7 +3023,7 @@ describe("mcp server inspect route", () => {
     const agent = await makeAgent({
       name: "Protected Resource Demo Agent",
       agentType: "mcp_gateway",
-      scope: "personal",
+      access: "personal",
       organizationId,
       authorId: user.id,
     });
@@ -1175,6 +3044,7 @@ describe("mcp server inspect route", () => {
     });
 
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Protected Resource Remote",
       serverType: "remote",
       serverUrl: "https://mcp.example.com/mcp",
@@ -1234,28 +3104,22 @@ describe("mcp server inspect route", () => {
     });
     global.fetch = fetchMock as typeof fetch;
 
-    connectAndGetToolsMock
-      .mockRejectedValueOnce(
-        new Error(
-          "Failed to connect to MCP server Protected Resource: Streamable HTTP error: unauthorized",
-        ),
-      )
-      .mockResolvedValueOnce([
-        {
-          name: "read_resource_todos",
-          description: "Read todos",
-          inputSchema: { type: "object", properties: {} },
-          _meta: {
-            archestraResourceUri: "todo://todos",
-          },
+    connectAndGetToolsMock.mockResolvedValueOnce([
+      {
+        name: "read_resource_todos",
+        description: "Read todos",
+        inputSchema: { type: "object", properties: {} },
+        _meta: {
+          archestraResourceUri: "todo://todos",
         },
-      ]);
+      },
+    ]);
 
     const response = await app.inject({
       method: "POST",
       url: "/api/mcp_server",
       payload: {
-        name: "Protected Resource",
+        name: catalog.name,
         catalogId: catalog.id,
         agentIds: [agent.id],
       },
@@ -1269,12 +3133,15 @@ describe("mcp server inspect route", () => {
         requestedCredentialType: "id_jag",
       }),
     });
-    expect(connectAndGetToolsMock.mock.calls[1][0]).toMatchObject({
-      secrets: { access_token: "mcp-server-access-token" },
+    expect(connectAndGetToolsMock.mock.calls[0][0]).toMatchObject({
+      enterpriseTransportCredential: {
+        headerName: "Authorization",
+        headerValue: "Bearer mcp-server-access-token",
+      },
     });
 
     const persistedTool = await ToolModel.findByName(
-      "protected_resource__read_resource_todos",
+      "protected_resource_remote__read_resource_todos",
     );
     expect(persistedTool).toMatchObject({
       catalogId: catalog.id,
@@ -1303,9 +3170,11 @@ describe("mcp server inspect route", () => {
   });
 
   test("persists enterprise-managed config on installed MCP servers", async ({
+    makeAccount,
     makeInternalMcpCatalog,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Managed Remote",
       serverType: "remote",
       serverUrl: "http://localhost:30082/mcp",
@@ -1325,6 +3194,11 @@ describe("mcp server inspect route", () => {
       },
     ]);
 
+    await makeAccount(user.id, {
+      providerId: "session-provider",
+      accessToken: "session-access-token",
+    });
+
     const response = await app.inject({
       method: "POST",
       url: "/api/mcp_server",
@@ -1338,10 +3212,11 @@ describe("mcp server inspect route", () => {
     expect(response.json()).not.toHaveProperty("enterpriseManagedConfig");
   });
 
-  test("returns 500 when protected remote MCP server installation still lacks usable auth after automatic fallback", async ({
+  test("returns 502 when protected remote MCP server installation still lacks usable auth after automatic fallback", async ({
     makeInternalMcpCatalog,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Protected Remote Missing Token",
       serverType: "remote",
       serverUrl: "http://localhost:30082/mcp",
@@ -1362,7 +3237,7 @@ describe("mcp server inspect route", () => {
       },
     });
 
-    expect(response.statusCode).toBe(500);
+    expect(response.statusCode).toBe(502);
     expect(response.json()).toMatchObject({
       error: {
         message: expect.stringContaining(
@@ -1379,6 +3254,7 @@ describe("mcp server inspect route", () => {
     makeInternalMcpCatalog,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Protected Remote Refresh",
       serverType: "remote",
       serverUrl: "http://localhost:30082/mcp",
@@ -1470,6 +3346,7 @@ describe("mcp server inspect route", () => {
     makeInternalMcpCatalog,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Protected Remote Basic Refresh",
       serverType: "remote",
       serverUrl: "http://localhost:30082/mcp",
@@ -1558,6 +3435,7 @@ describe("mcp server inspect route", () => {
     makeInternalMcpCatalog,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Protected Remote Expired Refresh Token",
       serverType: "remote",
       serverUrl: "http://localhost:30082/mcp",
@@ -1603,7 +3481,7 @@ describe("mcp server inspect route", () => {
       },
     });
 
-    expect(response.statusCode).toBe(500);
+    expect(response.statusCode).toBe(502);
     expect(connectAndGetToolsMock).toHaveBeenCalledTimes(1);
   });
 
@@ -1613,6 +3491,7 @@ describe("mcp server inspect route", () => {
     makeInternalMcpCatalog,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Protected Remote Unsupported Refresh",
       serverType: "remote",
       serverUrl: "http://localhost:30082/mcp",
@@ -1655,8 +3534,230 @@ describe("mcp server inspect route", () => {
       },
     });
 
-    expect(response.statusCode).toBe(500);
+    expect(response.statusCode).toBe(502);
     expect(connectAndGetToolsMock).toHaveBeenCalledTimes(1);
+  });
+
+  // Regression: the inspector reaches the same upstream as the MCP Gateway, but
+  // connected with only the install's static secrets. For an enterprise-managed
+  // catalog that meant no auth header at all — the configured injection mode
+  // was never consulted, so a custom-header server saw an unauthenticated call.
+  test("inspect sends the enterprise-managed credential under the configured custom header", async ({
+    makeAccount,
+    makeIdentityProvider,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const identityProvider = await makeIdentityProvider(user.id, {
+      providerId: "keycloak",
+      issuer: "http://localhost:30081/realms/archestra",
+      oidcConfig: {
+        clientId: "archestra-oidc",
+        clientSecret: "archestra-oidc-secret",
+        tokenEndpoint:
+          "http://localhost:30081/realms/archestra/protocol/openid-connect/token",
+        tokenEndpointAuthentication: "client_secret_post",
+        enterpriseManagedCredentials: {
+          exchangeStrategy: "rfc8693",
+          subjectTokenType: OAUTH_TOKEN_TYPE.AccessToken,
+        },
+      },
+    });
+
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Inspect Custom Header",
+      serverType: "remote",
+      serverUrl: "https://internal.example.com/mcp",
+      enterpriseManagedConfig: {
+        identityProviderId: identityProvider.id,
+        requestedCredentialType: "bearer_token",
+        tokenInjectionMode: "header",
+        headerName: "x-provider-api-token",
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+
+    await makeAccount(user.id, {
+      providerId: "keycloak",
+      accessToken: "session-access-token",
+    });
+
+    exchangeEnterpriseManagedCredentialMock.mockResolvedValueOnce({
+      credentialType: "bearer_token",
+      expiresInSeconds: null,
+      issuedTokenType: OAUTH_TOKEN_TYPE.AccessToken,
+      value: "exchanged-inspect-token",
+    });
+
+    inspectServerMock.mockResolvedValueOnce({ tools: [] });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/inspect`,
+      payload: { method: "tools/list" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(inspectServerMock).toHaveBeenCalledTimes(1);
+    expect(inspectServerMock.mock.calls[0][0]).toMatchObject({
+      method: "tools/list",
+      enterpriseTransportCredential: {
+        headerName: "x-provider-api-token",
+        headerValue: "exchanged-inspect-token",
+      },
+    });
+  });
+
+  test("inspect sends a bearer Authorization for the default injection mode", async ({
+    makeAccount,
+    makeIdentityProvider,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const identityProvider = await makeIdentityProvider(user.id, {
+      providerId: "keycloak",
+      issuer: "http://localhost:30081/realms/archestra",
+      oidcConfig: {
+        clientId: "archestra-oidc",
+        clientSecret: "archestra-oidc-secret",
+        tokenEndpoint:
+          "http://localhost:30081/realms/archestra/protocol/openid-connect/token",
+        tokenEndpointAuthentication: "client_secret_post",
+        enterpriseManagedCredentials: {
+          exchangeStrategy: "rfc8693",
+          subjectTokenType: OAUTH_TOKEN_TYPE.AccessToken,
+        },
+      },
+    });
+
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Inspect Bearer",
+      serverType: "remote",
+      serverUrl: "https://internal.example.com/mcp",
+      enterpriseManagedConfig: {
+        identityProviderId: identityProvider.id,
+        requestedCredentialType: "bearer_token",
+        tokenInjectionMode: "authorization_bearer",
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+
+    await makeAccount(user.id, {
+      providerId: "keycloak",
+      accessToken: "session-access-token",
+    });
+
+    exchangeEnterpriseManagedCredentialMock.mockResolvedValueOnce({
+      credentialType: "bearer_token",
+      expiresInSeconds: null,
+      issuedTokenType: OAUTH_TOKEN_TYPE.AccessToken,
+      value: "exchanged-inspect-bearer",
+    });
+
+    inspectServerMock.mockResolvedValueOnce({ tools: [] });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/inspect`,
+      payload: { method: "tools/list" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(inspectServerMock.mock.calls[0][0]).toMatchObject({
+      enterpriseTransportCredential: {
+        headerName: "Authorization",
+        headerValue: "Bearer exchanged-inspect-bearer",
+      },
+    });
+  });
+
+  // Fail closed: connecting anyway would reach the upstream with no credential,
+  // which is the unauthenticated call this fix exists to stop.
+  test("inspect returns 401 when the enterprise-managed credential cannot be resolved", async ({
+    makeIdentityProvider,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const identityProvider = await makeIdentityProvider(user.id, {
+      providerId: "keycloak",
+      issuer: "http://localhost:30081/realms/archestra",
+      oidcConfig: {
+        clientId: "archestra-oidc",
+        clientSecret: "archestra-oidc-secret",
+        tokenEndpoint:
+          "http://localhost:30081/realms/archestra/protocol/openid-connect/token",
+        tokenEndpointAuthentication: "client_secret_post",
+        enterpriseManagedCredentials: {
+          exchangeStrategy: "rfc8693",
+          subjectTokenType: OAUTH_TOKEN_TYPE.AccessToken,
+        },
+      },
+    });
+
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Inspect Unlinked",
+      serverType: "remote",
+      serverUrl: "https://internal.example.com/mcp",
+      enterpriseManagedConfig: {
+        identityProviderId: identityProvider.id,
+        requestedCredentialType: "bearer_token",
+        tokenInjectionMode: "header",
+        headerName: "x-provider-api-token",
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+
+    // No linked account for the caller, so no assertion to exchange.
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/inspect`,
+      payload: { method: "tools/list" },
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json().error.message).toContain("keycloak");
+    expect(inspectServerMock).not.toHaveBeenCalled();
+  });
+
+  // Non-enterprise catalogs must keep inspecting with their static secrets.
+  test("inspect leaves non-enterprise catalogs without an enterprise credential", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      serverType: "remote",
+      serverUrl: "https://plain.example.com/mcp",
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+
+    inspectServerMock.mockResolvedValueOnce({ tools: [] });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/inspect`,
+      payload: { method: "tools/list" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(
+      inspectServerMock.mock.calls[0][0].enterpriseTransportCredential,
+    ).toBeUndefined();
   });
 
   test("returns 409 when the MCP server is not running yet", async ({
@@ -1664,6 +3765,7 @@ describe("mcp server inspect route", () => {
     makeMcpServer,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       serverType: "local",
     });
     const mcpServer = await makeMcpServer({
@@ -1698,6 +3800,7 @@ describe("mcp server inspect route", () => {
     makeMcpServer,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       serverType: "local",
     });
     const mcpServer = await makeMcpServer({
@@ -1727,11 +3830,44 @@ describe("mcp server inspect route", () => {
     });
   });
 
+  test("preserves retryable renewal responses in the inspector", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      serverType: "local",
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+
+    inspectServerMock.mockRejectedValueOnce(
+      new ApiError(
+        503,
+        "MCP credential renewal is draining active calls. Retry shortly.",
+      ),
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/inspect`,
+      payload: { method: "tools/list" },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json().error.message).toBe(
+      "MCP credential renewal is draining active calls. Retry shortly.",
+    );
+  });
+
   test("keeps unexpected inspect failures as 502 responses", async ({
     makeInternalMcpCatalog,
     makeMcpServer,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       serverType: "local",
     });
     const mcpServer = await makeMcpServer({
@@ -1761,6 +3897,7 @@ describe("mcp server inspect route", () => {
     makeMcpServer,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Remote Reauth Server",
       serverType: "remote",
       serverUrl: "http://localhost:30082/mcp",
@@ -1820,6 +3957,7 @@ describe("mcp server inspect route", () => {
     makeMcpServer,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Remote Static Header Reauth Server",
       serverType: "remote",
       serverUrl: "http://localhost:30082/mcp",
@@ -1892,6 +4030,7 @@ describe("mcp server inspect route", () => {
   }) => {
     const otherUser = await makeUser({ email: "reauth-owner@example.com" });
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       serverType: "remote",
       serverUrl: "http://localhost:30082/mcp",
     });
@@ -1899,7 +4038,6 @@ describe("mcp server inspect route", () => {
       ownerId: otherUser.id,
       catalogId: catalog.id,
     });
-
     const response = await app.inject({
       method: "PATCH",
       url: `/api/mcp_server/${mcpServer.id}/reauthenticate`,
@@ -1916,6 +4054,7 @@ describe("mcp server inspect route", () => {
     makeMcpServer,
   }) => {
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Protected Remote Reinstall",
       serverType: "remote",
       serverUrl: "http://localhost:30082/mcp",
@@ -1959,19 +4098,7 @@ describe("mcp server inspect route", () => {
     });
 
     expect(response.statusCode).toBe(200);
-
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      const [serverRow] = await db
-        .select()
-        .from(schema.mcpServersTable)
-        .where(eq(schema.mcpServersTable.id, mcpServer.id));
-
-      if (serverRow?.localInstallationStatus === "success") {
-        break;
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    await drainPendingReinstall(mcpServer.id);
 
     expect(connectAndGetToolsMock).toHaveBeenCalledTimes(2);
     expect(connectAndGetToolsMock.mock.calls[0][0]).toMatchObject({
@@ -2015,6 +4142,7 @@ describe("mcp server inspect route", () => {
       const { default: AgentToolModel } = await import("@/models/agent-tool");
 
       const catalog = await makeInternalMcpCatalog({
+        organizationId,
         name: "Auto Assign Remote",
         serverType: "remote",
         serverUrl: "http://localhost:30082/mcp",
@@ -2064,12 +4192,13 @@ describe("mcp server inspect route", () => {
       const otherAgent = await makeAgent({
         name: "Explicit Target",
         agentType: "mcp_gateway",
-        scope: "personal",
+        access: "personal",
         organizationId: organizationId,
         authorId: user.id,
       });
 
       const catalog = await makeInternalMcpCatalog({
+        organizationId,
         name: "Auto Assign Remote With Explicit",
         serverType: "remote",
         serverUrl: "http://localhost:30082/mcp",
@@ -2125,6 +4254,7 @@ describe("mcp server inspect route", () => {
       });
 
       const catalog = await makeInternalMcpCatalog({
+        organizationId,
         name: "Auto Assign Remote Isolated",
         serverType: "remote",
         serverUrl: "http://localhost:30082/mcp",
@@ -2161,6 +4291,7 @@ describe("mcp server inspect route", () => {
       const { default: AgentModel } = await import("@/models/agent");
 
       const catalog = await makeInternalMcpCatalog({
+        organizationId,
         name: "Re-install Pinning",
         serverType: "remote",
         serverUrl: "http://localhost:30082/mcp",
@@ -2228,6 +4359,7 @@ describe("mcp server inspect route", () => {
       });
 
       const catalog = await makeInternalMcpCatalog({
+        organizationId,
         name: "Auto Assign Team Remote",
         serverType: "remote",
         serverUrl: "http://localhost:30082/mcp",
@@ -2265,31 +4397,32 @@ describe("mcp server inspect route", () => {
   });
 
   function configurePermissions(opts: {
-    isTeamAdmin: boolean;
+    canManageAllTeams: boolean;
     isEditor: boolean;
   }) {
     hasPermissionMock.mockImplementation(
       async (permission: Record<string, string[]>) => {
-        if (permission.team?.includes("admin")) {
-          return { success: opts.isTeamAdmin };
+        if (permission.team?.includes("create")) {
+          return { success: opts.canManageAllTeams, error: null };
         }
         if (permission.mcpServerInstallation?.includes("update")) {
-          return { success: opts.isEditor };
+          return { success: opts.isEditor, error: null };
         }
-        return { success: false };
+        return { success: false, error: null };
       },
     );
   }
 
-  test("install scope=team: team:admin can install for a non-member team", async ({
+  test("install scope=team: organization-level team manager cannot install without installation permissions", async ({
     makeInternalMcpCatalog,
     makeTeam,
     makeUser,
   }) => {
-    configurePermissions({ isTeamAdmin: true, isEditor: false });
+    configurePermissions({ canManageAllTeams: true, isEditor: false });
     const otherUser = await makeUser();
     const team = await makeTeam(organizationId, otherUser.id);
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Team Scoped Install",
       serverType: "local",
       localConfig: {
@@ -2313,7 +4446,7 @@ describe("mcp server inspect route", () => {
       },
     });
 
-    expect(response.statusCode).toBe(200);
+    expect(response.statusCode).toBe(403);
   });
 
   test("install scope=team: editor + member of team succeeds", async ({
@@ -2322,11 +4455,12 @@ describe("mcp server inspect route", () => {
     makeTeamMember,
     makeUser,
   }) => {
-    configurePermissions({ isTeamAdmin: false, isEditor: true });
+    configurePermissions({ canManageAllTeams: false, isEditor: true });
     const otherUser = await makeUser();
     const team = await makeTeam(organizationId, otherUser.id);
     await makeTeamMember(team.id, user.id);
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Team Scoped Install Editor Member",
       serverType: "local",
       localConfig: {
@@ -2358,10 +4492,11 @@ describe("mcp server inspect route", () => {
     makeTeam,
     makeUser,
   }) => {
-    configurePermissions({ isTeamAdmin: false, isEditor: true });
+    configurePermissions({ canManageAllTeams: false, isEditor: true });
     const otherUser = await makeUser();
     const team = await makeTeam(organizationId, otherUser.id);
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Team Scoped Install Editor Non-Member",
       serverType: "local",
     });
@@ -2388,10 +4523,11 @@ describe("mcp server inspect route", () => {
     makeTeam,
     makeTeamMember,
   }) => {
-    configurePermissions({ isTeamAdmin: false, isEditor: false });
+    configurePermissions({ canManageAllTeams: false, isEditor: false });
     const team = await makeTeam(organizationId, user.id);
     await makeTeamMember(team.id, user.id);
     const catalog = await makeInternalMcpCatalog({
+      organizationId,
       name: "Team Scoped Install No Editor",
       serverType: "local",
     });
@@ -2413,16 +4549,19 @@ describe("mcp server inspect route", () => {
     );
   });
 
-  test("revoke team-scoped: team:admin can revoke for a non-member team", async ({
+  test("revoke team-scoped: organization-level team manager cannot revoke without installation permissions", async ({
     makeInternalMcpCatalog,
     makeMcpServer,
     makeTeam,
     makeUser,
   }) => {
-    configurePermissions({ isTeamAdmin: true, isEditor: false });
+    configurePermissions({ canManageAllTeams: true, isEditor: false });
     const otherUser = await makeUser();
     const team = await makeTeam(organizationId, otherUser.id);
-    const catalog = await makeInternalMcpCatalog({ serverType: "remote" });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      serverType: "remote",
+    });
     const mcpServer = await makeMcpServer({
       catalogId: catalog.id,
       scope: "team",
@@ -2435,7 +4574,7 @@ describe("mcp server inspect route", () => {
       url: `/api/mcp_server/${mcpServer.id}`,
     });
 
-    expect(response.statusCode).toBe(200);
+    expect(response.statusCode).toBe(403);
   });
 
   test("revoke team-scoped: editor not a member is rejected", async ({
@@ -2444,10 +4583,13 @@ describe("mcp server inspect route", () => {
     makeTeam,
     makeUser,
   }) => {
-    configurePermissions({ isTeamAdmin: false, isEditor: true });
+    configurePermissions({ canManageAllTeams: false, isEditor: true });
     const otherUser = await makeUser();
     const team = await makeTeam(organizationId, otherUser.id);
-    const catalog = await makeInternalMcpCatalog({ serverType: "remote" });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      serverType: "remote",
+    });
     const mcpServer = await makeMcpServer({
       catalogId: catalog.id,
       scope: "team",
@@ -2464,5 +4606,922 @@ describe("mcp server inspect route", () => {
     expect(response.json().error.message).toContain(
       "You can only revoke connections for teams you are a member of",
     );
+  });
+});
+
+describe("mcp server core route coverage", () => {
+  let app: FastifyInstanceWithZod;
+  let user: User;
+  let organizationId: string;
+
+  const UNKNOWN_ID = "00000000-0000-4000-8000-0000000000aa";
+
+  beforeEach(async ({ makeUser, makeOrganization, makeMember }) => {
+    user = await makeUser();
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    await makeMember(user.id, organization.id);
+    hasPermissionMock.mockResolvedValue({ success: true, error: null });
+    userHasPermissionMock.mockResolvedValue(true);
+    grantEverywhere(
+      ["mcpRegistry"],
+      async () =>
+        (
+          await hasPermissionMock.getMockImplementation()?.(
+            // The retired action this grant replaced; per-test stubs that
+            // key on real actions leave it denied.
+            { mcpServerInstallation: ["admin"] } as never,
+            {},
+          )
+        )?.success ?? false,
+    );
+    k8sStopServerMock.mockResolvedValue(undefined);
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (
+        request as typeof request & { user: User; organizationId: string }
+      ).user = user;
+      (
+        request as typeof request & { user: User; organizationId: string }
+      ).organizationId = organizationId;
+    });
+
+    const { default: mcpServerRoutes } = await import("./mcp-server");
+    await app.register(mcpServerRoutes);
+  });
+
+  afterEach(async () => {
+    hasPermissionMock.mockReset();
+    userHasPermissionMock.mockReset();
+    k8sStopServerMock.mockReset();
+    await app.close();
+  });
+
+  describe("GET /api/mcp_server", () => {
+    test("lists the agents using each server via explicit tool assignments", async ({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+      makeTool,
+      makeAgent,
+      makeAgentTool,
+    }) => {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "local",
+      });
+      const server = await makeMcpServer({
+        ownerId: user.id,
+        catalogId: catalog.id,
+      });
+      const tool = await makeTool({ catalogId: catalog.id });
+      const agent = await makeAgent({
+        organizationId,
+        name: "Server Consumer",
+        access: "personal",
+        authorId: user.id,
+      });
+      await makeAgentTool(agent.id, tool.id);
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/mcp_server?includeAssignedAgents=true",
+      });
+
+      expect(response.statusCode).toBe(200);
+      const servers = response.json();
+      const returned = servers.find((s: { id: string }) => s.id === server.id);
+      // The owner rides along so the UI can tell same-named personal agents
+      // ("My Assistant", "My Gateway") apart, and so the Usage tab can mark the
+      // viewer's own agents by id rather than by matching a display string.
+      expect(returned.assignedAgents).toEqual([
+        {
+          id: agent.id,
+          name: "Server Consumer",
+          agentType: agent.agentType,
+          accessAllTools: agent.accessAllTools,
+          organizationId,
+          scope: "personal",
+          ownerId: user.id,
+          ownerEmail: user.email,
+          // Unpinned: resolves to an install at call time.
+          pinned: false,
+        },
+      ]);
+      // Without the explicit opt-in, and with an explicit false, the list
+      // carries no agents.
+      for (const url of [
+        "/api/mcp_server",
+        "/api/mcp_server?includeAssignedAgents=false",
+      ]) {
+        const compact = await app.inject({ method: "GET", url });
+        expect(compact.statusCode).toBe(200);
+        expect(compact.json()).toEqual(
+          servers.map((entry: { assignedAgents: unknown[] }) => ({
+            ...entry,
+            assignedAgents: [],
+          })),
+        );
+      }
+    });
+
+    test("names to a member only the agents they can open, on the list and on one server", async ({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+      makeTool,
+      makeAgent,
+      makeAgentTool,
+      makeUser,
+      makeMember,
+    }) => {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "local",
+      });
+      const server = await makeMcpServer({
+        ownerId: user.id,
+        catalogId: catalog.id,
+      });
+      const tool = await makeTool({ catalogId: catalog.id });
+      const colleague = await makeUser();
+      await makeMember(colleague.id, organizationId);
+      const agents = [
+        await makeAgent({
+          organizationId,
+          name: "Mine",
+          access: "personal",
+          authorId: user.id,
+        }),
+        await makeAgent({
+          organizationId,
+          name: "Shared",
+          access: "org",
+          authorId: colleague.id,
+        }),
+        // Someone else's personal agent: its name and owner are not the
+        // caller's to see, even though it uses the caller's server.
+        await makeAgent({
+          organizationId,
+          name: "Theirs",
+          access: "personal",
+          authorId: colleague.id,
+        }),
+      ];
+      for (const agent of agents) {
+        await makeAgentTool(agent.id, tool.id);
+      }
+      // A member: no shared installations to manage.
+      userHasPermissionMock.mockImplementation(
+        async (_userId, _organizationId, resource, action) =>
+          !(resource === "mcpServerInstallation" && action === "update"),
+      );
+
+      const list = await app.inject({
+        method: "GET",
+        url: "/api/mcp_server?includeAssignedAgents=true",
+      });
+      const listed = list
+        .json()
+        .find((s: { id: string }) => s.id === server.id);
+      expect(
+        listed.assignedAgents.map((a: { name: string }) => a.name).sort(),
+      ).toEqual(["Mine", "Shared"]);
+
+      // Visibility is checked for the agents the response names, never by
+      // listing every agent the member can reach; a status-only list (the
+      // default) names none and checks nothing.
+      const { default: AgentModel } = await import("@/models/agent");
+      const accessibleIds = vi.spyOn(AgentModel, "findAccessibleIdsForUser");
+      await app.inject({
+        method: "GET",
+        url: "/api/mcp_server?includeAssignedAgents=false",
+      });
+      expect(accessibleIds).not.toHaveBeenCalled();
+      await app.inject({ method: "GET", url: "/api/mcp_server" });
+      expect(accessibleIds).not.toHaveBeenCalled();
+      await app.inject({
+        method: "GET",
+        url: "/api/mcp_server?includeAssignedAgents=true",
+      });
+      expect(accessibleIds).toHaveBeenCalledTimes(1);
+      expect(
+        [...(accessibleIds.mock.calls[0]?.[3]?.among ?? [])].sort(),
+      ).toEqual(agents.map((agent) => agent.id).sort());
+      accessibleIds.mockRestore();
+
+      const single = await app.inject({
+        method: "GET",
+        url: `/api/mcp_server/${server.id}`,
+      });
+      expect(
+        single
+          .json()
+          .assignedAgents.map((a: { name: string }) => a.name)
+          .sort(),
+      ).toEqual(["Mine", "Shared"]);
+
+      // Someone who manages shared installations keeps the full list.
+      userHasPermissionMock.mockResolvedValue(true);
+      const managed = await app.inject({
+        method: "GET",
+        url: `/api/mcp_server/${server.id}`,
+      });
+      expect(
+        managed
+          .json()
+          .assignedAgents.map((a: { name: string }) => a.name)
+          .sort(),
+      ).toEqual(["Mine", "Shared", "Theirs"]);
+    });
+
+    // The registry lists other members' personal connections to an
+    // installation admin so they can manage them, but the surfaces that
+    // authenticate AS a connection (the Inspector) must offer only the ones
+    // the caller may actually present upstream.
+    test("marks which listed connections the caller may authenticate as", async ({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+      makeTeam,
+      makeTeamMember,
+      makeUser,
+    }) => {
+      const colleague = await makeUser({ email: "colleague@example.com" });
+      // Only the predefined Admin role is shown another member's personal
+      // connection at all — the case this flag has to get right.
+      await db
+        .update(schema.membersTable)
+        .set({ role: "admin" })
+        .where(
+          and(
+            eq(schema.membersTable.userId, user.id),
+            eq(schema.membersTable.organizationId, organizationId),
+          ),
+        );
+      const myTeam = await makeTeam(organizationId, user.id, { name: "Mine" });
+      await makeTeamMember(myTeam.id, user.id);
+      const theirTeam = await makeTeam(organizationId, colleague.id, {
+        name: "Theirs",
+      });
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "remote",
+      });
+
+      const mine = await makeMcpServer({
+        ownerId: user.id,
+        catalogId: catalog.id,
+        scope: "personal",
+      });
+      const theirs = await makeMcpServer({
+        ownerId: colleague.id,
+        catalogId: catalog.id,
+        scope: "personal",
+      });
+      const sharedWithMe = await makeMcpServer({
+        ownerId: colleague.id,
+        catalogId: catalog.id,
+        scope: "team",
+        teamId: myTeam.id,
+      });
+      const sharedWithThem = await makeMcpServer({
+        ownerId: colleague.id,
+        catalogId: catalog.id,
+        scope: "team",
+        teamId: theirTeam.id,
+      });
+      const orgWide = await makeMcpServer({
+        ownerId: colleague.id,
+        catalogId: catalog.id,
+        scope: "org",
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/mcp_server",
+      });
+
+      expect(response.statusCode).toBe(200);
+      const byId = new Map<string, boolean>(
+        response
+          .json()
+          .map((s: { id: string; canUseCredential: boolean }) => [
+            s.id,
+            s.canUseCredential,
+          ]),
+      );
+      expect(byId.get(mine.id)).toBe(true);
+      expect(byId.get(sharedWithMe.id)).toBe(true);
+      expect(byId.get(orgWide.id)).toBe(true);
+      expect(byId.get(theirs.id)).toBe(false);
+      expect(byId.get(sharedWithThem.id)).toBe(false);
+    });
+  });
+
+  describe("GET /api/mcp_server/:id", () => {
+    test("returns an MCP server the caller can access", async ({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    }) => {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "local",
+      });
+      const server = await makeMcpServer({
+        ownerId: user.id,
+        catalogId: catalog.id,
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/mcp_server/${server.id}`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().id).toBe(server.id);
+      expect(response.json().assignedAgents).toEqual([]);
+    });
+
+    test("returns 404 for an unknown id", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/mcp_server/${UNKNOWN_ID}`,
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json().error.message).toBe("MCP server not found");
+    });
+  });
+
+  describe("GET /api/mcp_server/:id/installation-status", () => {
+    test("returns the installation status for an accessible server", async ({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    }) => {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "local",
+      });
+      const server = await makeMcpServer({
+        ownerId: user.id,
+        catalogId: catalog.id,
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/mcp_server/${server.id}/installation-status`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        localInstallationStatus: "idle",
+        localInstallationError: null,
+      });
+    });
+  });
+
+  describe("GET /api/mcp_server/:id/tools", () => {
+    test("returns the catalog tools for an accessible server", async ({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+      makeTool,
+    }) => {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "local",
+      });
+      const server = await makeMcpServer({
+        ownerId: user.id,
+        catalogId: catalog.id,
+      });
+      const tool = await makeTool({ catalogId: catalog.id });
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/mcp_server/${server.id}/tools`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      const tools = response.json();
+      expect(tools).toHaveLength(1);
+      expect(tools[0]).toMatchObject({
+        id: tool.id,
+        name: tool.name,
+        assignedAgentCount: 0,
+        assignedAgents: [],
+      });
+    });
+
+    test("returns an empty list when the catalog has no tools", async ({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    }) => {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "local",
+      });
+      const server = await makeMcpServer({
+        ownerId: user.id,
+        catalogId: catalog.id,
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/mcp_server/${server.id}/tools`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual([]);
+    });
+  });
+
+  describe("DELETE /api/mcp_server/:id", () => {
+    test("returns 404 for an unknown id", async () => {
+      const response = await app.inject({
+        method: "DELETE",
+        url: `/api/mcp_server/${UNKNOWN_ID}`,
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json().error.message).toBe("MCP server not found");
+    });
+
+    test("refuses to delete a built-in MCP server with 400", async ({
+      makeInternalMcpCatalog,
+    }) => {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "builtin",
+      });
+      const builtin = await McpServerModel.create({
+        name: "builtin-server",
+        catalogId: catalog.id,
+        serverType: "builtin",
+        scope: "org",
+        ownerId: user.id,
+      });
+
+      const response = await app.inject({
+        method: "DELETE",
+        url: `/api/mcp_server/${builtin.id}`,
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toBe(
+        "Cannot delete built-in MCP servers",
+      );
+      await expect(McpServerModel.findById(builtin.id)).resolves.not.toBeNull();
+    });
+
+    test("refuses to delete the managed Playwright runtime", async ({
+      makeInternalMcpCatalog,
+    }) => {
+      await makeInternalMcpCatalog({
+        id: PLAYWRIGHT_MCP_CATALOG_ID,
+        organizationId: null,
+        name: "Playwright",
+        serverType: "local",
+        localConfig: {
+          command: "node",
+          arguments: ["cli.js", "--isolated"],
+          transportType: "streamable-http",
+          httpPort: 8080,
+        },
+      });
+      await PlaywrightRuntimeModel.reconcileAll();
+      const runtime = mustExist(
+        await PlaywrightRuntimeModel.findForEnvironment(null),
+      );
+
+      const response = await app.inject({
+        method: "DELETE",
+        url: `/api/mcp_server/${runtime.id}`,
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toBe(
+        "The Playwright browser runtime is managed automatically.",
+      );
+      await expect(McpServerModel.findById(runtime.id)).resolves.not.toBeNull();
+    });
+
+    test("uninstalling the last connection retains tools and assignments (binding retained)", async ({
+      makeInternalMcpCatalog,
+    }) => {
+      const { default: AgentModel } = await import("@/models/agent");
+
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        name: "Retain On Uninstall",
+        serverType: "remote",
+        serverUrl: "http://localhost:30082/mcp",
+      });
+
+      connectAndGetToolsMock.mockResolvedValueOnce([
+        {
+          name: "retained-tool",
+          description: "kept after uninstall",
+          inputSchema: { type: "object", properties: {} },
+        },
+      ]);
+
+      const installResponse = await app.inject({
+        method: "POST",
+        url: "/api/mcp_server",
+        payload: { name: "Retain On Uninstall", catalogId: catalog.id },
+      });
+      expect(installResponse.statusCode).toBe(200);
+      const installedServer = installResponse.json();
+
+      const toolsBefore = await db
+        .select()
+        .from(schema.toolsTable)
+        .where(eq(schema.toolsTable.catalogId, catalog.id));
+      expect(toolsBefore).toHaveLength(1);
+      const tool = toolsBefore[0];
+
+      const personalGateway = await AgentModel.getPersonalMcpGateway(
+        user.id,
+        organizationId,
+      );
+      if (!personalGateway) throw new Error("expected personal gateway");
+
+      const assignmentBefore = await db
+        .select({ mcpServerId: schema.agentToolsTable.mcpServerId })
+        .from(schema.agentToolsTable)
+        .where(
+          and(
+            eq(schema.agentToolsTable.agentId, personalGateway.id),
+            eq(schema.agentToolsTable.toolId, tool.id),
+          ),
+        );
+      expect(assignmentBefore).toHaveLength(1);
+      expect(assignmentBefore[0].mcpServerId).toBe(installedServer.id);
+
+      const deleteResponse = await app.inject({
+        method: "DELETE",
+        url: `/api/mcp_server/${installedServer.id}`,
+      });
+      expect(deleteResponse.statusCode).toBe(200);
+
+      // The connection is gone, but the catalog's capability is retained.
+      await expect(
+        McpServerModel.findById(installedServer.id),
+      ).resolves.toBeNull();
+
+      const toolsAfter = await db
+        .select()
+        .from(schema.toolsTable)
+        .where(eq(schema.toolsTable.catalogId, catalog.id));
+      expect(toolsAfter).toHaveLength(1);
+
+      const assignmentAfter = await db
+        .select({ mcpServerId: schema.agentToolsTable.mcpServerId })
+        .from(schema.agentToolsTable)
+        .where(
+          and(
+            eq(schema.agentToolsTable.agentId, personalGateway.id),
+            eq(schema.agentToolsTable.toolId, tool.id),
+          ),
+        );
+      expect(assignmentAfter).toHaveLength(1);
+      // Soft delete keeps the server row, so the FK never fires — the binding
+      // still points at the (soft-deleted) install and survives a restore.
+      expect(assignmentAfter[0].mcpServerId).toBe(installedServer.id);
+    });
+
+    test("refuses to delete an app server with 400", async ({
+      makeInternalMcpCatalog,
+    }) => {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "app",
+      });
+      const appServer = await McpServerModel.create({
+        name: "app-server",
+        catalogId: catalog.id,
+        serverType: "app",
+        scope: "org",
+        ownerId: user.id,
+      });
+
+      const response = await app.inject({
+        method: "DELETE",
+        url: `/api/mcp_server/${appServer.id}`,
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toBe(
+        "App servers are managed via the Apps API; delete the app instead.",
+      );
+      await expect(
+        McpServerModel.findById(appServer.id),
+      ).resolves.not.toBeNull();
+    });
+  });
+
+  describe("PATCH /api/mcp_server/:id/reauthenticate", () => {
+    test("does not attach another connection's secret", async ({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    }) => {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "remote",
+        serverUrl: "http://127.0.0.1:30082/mcp",
+      });
+      const ownServer = await makeMcpServer({
+        ownerId: user.id,
+        catalogId: catalog.id,
+        scope: "personal",
+      });
+      const ownSecret = await secretManager().createSecret(
+        { access_token: "fake-own-token" },
+        "own-connection-secret",
+      );
+      const otherSecret = await secretManager().createSecret(
+        { access_token: "fake-other-token" },
+        "other-connection-secret",
+      );
+      await McpServerModel.update(ownServer.id, { secretId: ownSecret.id });
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/mcp_server/${ownServer.id}/reauthenticate`,
+        payload: { secretId: otherSecret.id },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect((await McpServerModel.findById(ownServer.id))?.secretId).toBe(
+        ownSecret.id,
+      );
+      expect(await secretManager().getSecret(ownSecret.id)).not.toBeNull();
+      expect(await secretManager().getSecret(otherSecret.id)).not.toBeNull();
+    });
+    test("rejects a request with no credential fields (400)", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/mcp_server/${UNKNOWN_ID}/reauthenticate`,
+        payload: {},
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toBe(
+        "At least one credential field is required",
+      );
+    });
+
+    test("returns 404 for an unknown id when a credential is supplied", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/mcp_server/${UNKNOWN_ID}/reauthenticate`,
+        payload: { accessToken: "fresh-token" },
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json().error.message).toBe("MCP server not found");
+    });
+
+    test("rejects re-authenticating an app server with 400", async ({
+      makeInternalMcpCatalog,
+    }) => {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "app",
+      });
+      const appServer = await McpServerModel.create({
+        name: "app-server",
+        catalogId: catalog.id,
+        serverType: "app",
+        scope: "org",
+        ownerId: user.id,
+      });
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/mcp_server/${appServer.id}/reauthenticate`,
+        payload: { accessToken: "fresh-token" },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toBe(
+        "App servers are managed via the Apps API and have no credentials to re-authenticate.",
+      );
+    });
+  });
+
+  describe("POST /api/mcp_server/:id/reinstall", () => {
+    test("returns 404 for an unknown id", async () => {
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/mcp_server/${UNKNOWN_ID}/reinstall`,
+        payload: {},
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json().error.message).toBe("MCP server not found");
+    });
+
+    test("rejects reinstalling an app server with 400", async ({
+      makeInternalMcpCatalog,
+    }) => {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "app",
+      });
+      const appServer = await McpServerModel.create({
+        name: "app-server",
+        catalogId: catalog.id,
+        serverType: "app",
+        scope: "org",
+        ownerId: user.id,
+      });
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/mcp_server/${appServer.id}/reinstall`,
+        payload: {},
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toBe(
+        "App servers run in-process and are not reinstallable; manage them via the Apps API.",
+      );
+    });
+
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    test("a personal owner cannot change hibernation for an install sharing a multitenant deployment", async ({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    }) => {
+      vi.spyOn(enterpriseTier, "isCoreActive").mockReturnValue(true);
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "local",
+        multitenant: true,
+        localConfig: { command: "node", arguments: ["server.js"] },
+      });
+      const mcpServer = await makeMcpServer({
+        ownerId: user.id,
+        catalogId: catalog.id,
+        scope: "personal",
+      });
+      // The owner passes the lifecycle gate on their own connection; what is
+      // under test is the shared-blast-radius gate behind it: a multitenant
+      // catalog runs ONE pod for every install, so "disabled" here would pin
+      // it awake for the whole organization.
+      hasPermissionMock.mockResolvedValue({ success: false, error: null });
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+        payload: { hibernationMode: "disabled" },
+      });
+
+      expect(response.statusCode).toBe(403);
+      expect(response.json().error.message).toContain("multitenant");
+      const [row] = await db
+        .select()
+        .from(schema.mcpServersTable)
+        .where(eq(schema.mcpServersTable.id, mcpServer.id));
+      expect(row.hibernationMode).toBe("inherit");
+    });
+
+    test("an installation admin can change hibernation on a multitenant install", async ({
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    }) => {
+      vi.spyOn(enterpriseTier, "isCoreActive").mockReturnValue(true);
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "local",
+        multitenant: true,
+        localConfig: { command: "node", arguments: ["server.js"] },
+      });
+      const mcpServer = await makeMcpServer({
+        ownerId: user.id,
+        catalogId: catalog.id,
+        scope: "personal",
+      });
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+        payload: { hibernationMode: "disabled" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      await drainPendingReinstall(mcpServer.id);
+      const [row] = await db
+        .select()
+        .from(schema.mcpServersTable)
+        .where(eq(schema.mcpServersTable.id, mcpServer.id));
+      expect(row.hibernationMode).toBe("disabled");
+      await drainPendingReinstall(mcpServer.id);
+    });
+    // SPDX-SnippetEnd
+  });
+
+  describe("POST /api/mcp_server", () => {
+    test("returns 400 when the referenced catalog item does not exist", async () => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/mcp_server",
+        payload: { name: "ghost", catalogId: UNKNOWN_ID, scope: "personal" },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toBe("Catalog item not found");
+    });
+
+    test("returns 400 when installing an app-type catalog item", async ({
+      makeInternalMcpCatalog,
+    }) => {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        serverType: "app",
+      });
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/mcp_server",
+        payload: { name: "app", catalogId: catalog.id, scope: "personal" },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toBe("Catalog item not found");
+    });
+
+    test("rejects manual Playwright browser installations", async ({
+      makeInternalMcpCatalog,
+    }) => {
+      const catalog = await makeInternalMcpCatalog({
+        id: PLAYWRIGHT_MCP_CATALOG_ID,
+        organizationId: null,
+        name: "Playwright",
+        serverType: "local",
+        localConfig: {
+          command: "node",
+          arguments: ["cli.js", "--isolated"],
+          transportType: "streamable-http",
+          httpPort: 8080,
+        },
+      });
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/mcp_server",
+        payload: {
+          name: catalog.name,
+          catalogId: catalog.id,
+          scope: "personal",
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toBe("Catalog item not found");
+    });
+
+    test("ignores client-supplied OAuth refresh-failure fields — they are server-owned state", async ({
+      makeInternalMcpCatalog,
+    }) => {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        name: "Refresh Field Injection Server",
+        serverType: "local",
+        localConfig: {
+          command: "node",
+          arguments: ["server.js"],
+          environment: [],
+          transportType: "streamable-http",
+          httpPort: 8080,
+          httpPath: "/mcp",
+        },
+      });
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/mcp_server",
+        payload: {
+          name: "Refresh Field Injection Server",
+          catalogId: catalog.id,
+          scope: "personal",
+          // A caller cannot seed these at install time — they're written only
+          // by the OAuth refresh subsystem, and oauthRefreshErrorDescription
+          // is unsanitized if set directly (bypassing sanitizeOAuthErrorDescription).
+          oauthRefreshError: "refresh_failed",
+          oauthRefreshErrorMessage: "invalid_grant",
+          oauthRefreshErrorDescription: "<script>alert(1)</script>",
+          oauthRefreshFailedAt: new Date().toISOString(),
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.oauthRefreshError).toBeNull();
+      expect(body.oauthRefreshErrorMessage).toBeNull();
+      expect(body.oauthRefreshErrorDescription).toBeNull();
+      expect(body.oauthRefreshFailedAt).toBeNull();
+    });
   });
 });

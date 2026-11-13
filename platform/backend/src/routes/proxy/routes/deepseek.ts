@@ -1,5 +1,5 @@
+import { RouteId } from "@archestra/shared";
 import fastifyHttpProxy from "@fastify/http-proxy";
-import { RouteId } from "@shared";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
 import config from "@/config";
@@ -7,6 +7,7 @@ import logger from "@/logging";
 import { constructResponseSchema, DeepSeek, UuidIdSchema } from "@/types";
 import { deepseekAdapterFactory } from "../adapters";
 import { PROXY_API_PREFIX, PROXY_BODY_LIMIT } from "../common";
+import { createPassthroughAuthenticator } from "../llm-proxy-auth";
 import { handleLLMProxy } from "../llm-proxy-handler";
 import { createProxyPreHandler } from "./proxy-prehandler";
 
@@ -14,7 +15,7 @@ const deepseekProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
   const API_PREFIX = `${PROXY_API_PREFIX}/deepseek`;
   const CHAT_COMPLETIONS_SUFFIX = "/chat/completions";
 
-  logger.info("[UnifiedProxy] Registering unified DeepSeek routes");
+  logger.debug("[UnifiedProxy] Registering unified DeepSeek routes");
 
   await fastify.register(fastifyHttpProxy, {
     upstream: config.llm.deepseek.baseUrl,
@@ -25,6 +26,7 @@ const deepseekProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
       endpointSuffix: CHAT_COMPLETIONS_SUFFIX,
       upstream: config.llm.deepseek.baseUrl,
       providerName: "DeepSeek",
+      authenticate: createPassthroughAuthenticator("deepseek"),
     }),
   });
 

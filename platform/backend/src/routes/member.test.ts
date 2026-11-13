@@ -1,5 +1,5 @@
-import type { FastifyInstanceWithZod } from "@/server";
-import { createFastifyInstance } from "@/server";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
 import { afterEach, beforeEach, describe, expect, test } from "@/test";
 import type { User } from "@/types";
 
@@ -8,37 +8,41 @@ describe("member routes", () => {
   let user: User;
   let organizationId: string;
 
-  beforeEach(async ({ makeAdmin, makeMember, makeOrganization }) => {
-    user = await makeAdmin();
-    const organization = await makeOrganization();
-    organizationId = organization.id;
-    await makeMember(user.id, organizationId, { role: "admin" });
+  beforeEach(
+    async ({ makeAccount, makeAdmin, makeMember, makeOrganization }) => {
+      user = await makeAdmin();
+      await makeAccount(user.id);
+      const organization = await makeOrganization();
+      organizationId = organization.id;
+      await makeMember(user.id, organizationId, { role: "admin" });
 
-    app = createFastifyInstance();
-    app.addHook("onRequest", async (request) => {
-      (
-        request as typeof request & {
-          user: unknown;
-          organizationId: string;
-        }
-      ).user = user;
-      (
-        request as typeof request & {
-          user: { id: string };
-          organizationId: string;
-        }
-      ).organizationId = organizationId;
-    });
+      app = createFastifyInstance();
+      app.addHook("onRequest", async (request) => {
+        (
+          request as typeof request & {
+            user: unknown;
+            organizationId: string;
+          }
+        ).user = user;
+        (
+          request as typeof request & {
+            user: { id: string };
+            organizationId: string;
+          }
+        ).organizationId = organizationId;
+      });
 
-    const { default: memberRoutes } = await import("./member");
-    await app.register(memberRoutes);
-  });
+      const { default: memberRoutes } = await import("./member");
+      await app.register(memberRoutes);
+    },
+  );
 
   afterEach(async () => {
     await app.close();
   });
 
   test("returns paginated members for the current organization", async ({
+    makeAccount,
     makeMember,
     makeUser,
   }) => {
@@ -46,6 +50,8 @@ describe("member routes", () => {
     const beta = await makeUser({ name: "Beta Example" });
     await makeMember(alpha.id, organizationId, { role: "member" });
     await makeMember(beta.id, organizationId, { role: "editor" });
+    await makeAccount(alpha.id);
+    await makeAccount(beta.id);
 
     const response = await app.inject({
       method: "GET",
@@ -70,6 +76,7 @@ describe("member routes", () => {
   });
 
   test("filters members by name or email and role", async ({
+    makeAccount,
     makeMember,
     makeUser,
   }) => {
@@ -83,6 +90,8 @@ describe("member routes", () => {
     });
     await makeMember(targetUser.id, organizationId, { role: "member" });
     await makeMember(otherUser.id, organizationId, { role: "editor" });
+    await makeAccount(targetUser.id);
+    await makeAccount(otherUser.id);
 
     const response = await app.inject({
       method: "GET",
@@ -105,6 +114,103 @@ describe("member routes", () => {
         hasPrev: false,
       },
     });
+  });
+
+  test("matches search tokens regardless of the order they are stored in", async ({
+    makeAccount,
+    makeMember,
+    makeUser,
+  }) => {
+    // Directory syncs commonly store "Last, First M." while people search
+    // "First Last".
+    const targetUser = await makeUser({
+      name: "Lovelace, Ada M.",
+      email: "ada.lovelace@example.com",
+    });
+    await makeMember(targetUser.id, organizationId, { role: "member" });
+    await makeAccount(targetUser.id);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/members?limit=10&offset=0&name=Ada%20Lovelace",
+    });
+    const payload = response.json();
+
+    expect(response.statusCode).toBe(200);
+    expect(payload.data).toMatchObject([{ name: "Lovelace, Ada M." }]);
+  });
+
+  test("matches when tokens are spread across name and email", async ({
+    makeAccount,
+    makeMember,
+    makeUser,
+  }) => {
+    const targetUser = await makeUser({
+      name: "Ada Lovelace",
+      email: "analytical.engine@example.com",
+    });
+    await makeMember(targetUser.id, organizationId, { role: "member" });
+    await makeAccount(targetUser.id);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/members?limit=10&offset=0&name=Lovelace%20analytical",
+    });
+    const payload = response.json();
+
+    expect(response.statusCode).toBe(200);
+    expect(payload.data).toMatchObject([{ name: "Ada Lovelace" }]);
+  });
+
+  test("requires every token to match, so extra words still narrow results", async ({
+    makeAccount,
+    makeMember,
+    makeUser,
+  }) => {
+    const ada = await makeUser({
+      name: "Ada Lovelace",
+      email: "ada@example.com",
+    });
+    const charles = await makeUser({
+      name: "Charles Babbage",
+      email: "charles@example.com",
+    });
+    await makeMember(ada.id, organizationId, { role: "member" });
+    await makeMember(charles.id, organizationId, { role: "member" });
+    await makeAccount(ada.id);
+    await makeAccount(charles.id);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/members?limit=10&offset=0&name=Ada%20Babbage",
+    });
+    const payload = response.json();
+
+    expect(response.statusCode).toBe(200);
+    expect(payload.data).toEqual([]);
+    expect(payload.pagination.total).toBe(0);
+  });
+
+  test("treats LIKE wildcards in the query as literal characters", async ({
+    makeAccount,
+    makeMember,
+    makeUser,
+  }) => {
+    const targetUser = await makeUser({
+      name: "Ada Lovelace",
+      email: "ada@example.com",
+    });
+    await makeMember(targetUser.id, organizationId, { role: "member" });
+    await makeAccount(targetUser.id);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/members?limit=10&offset=0&name=%25",
+    });
+    const payload = response.json();
+
+    expect(response.statusCode).toBe(200);
+    expect(payload.data).toEqual([]);
   });
 });
 

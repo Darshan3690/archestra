@@ -1,4 +1,9 @@
-import { type IdentityProviderFormValues, OAUTH_TOKEN_TYPE } from "@shared";
+// @vitest-environment node
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+import {
+  type IdentityProviderFormValues,
+  OAUTH_TOKEN_TYPE,
+} from "@archestra/shared";
 import { describe, expect, it } from "vitest";
 import { normalizeIdentityProviderFormValues } from "./identity-provider-form.utils";
 
@@ -25,21 +30,10 @@ function makeOidcFormValues(
 }
 
 describe("normalizeIdentityProviderFormValues", () => {
-  it("clears allowed email domains for non-Google OIDC providers", () => {
+  it("keeps allowed email domains for non-Google OIDC providers", () => {
     const normalized = normalizeIdentityProviderFormValues(
       makeOidcFormValues({
         providerId: "Okta",
-        domain: "example.com",
-      }),
-    );
-
-    expect(normalized.domain).toBe("");
-  });
-
-  it("keeps allowed email domains for Google providers", () => {
-    const normalized = normalizeIdentityProviderFormValues(
-      makeOidcFormValues({
-        providerId: "Google",
         domain: "example.com",
       }),
     );
@@ -94,6 +88,76 @@ describe("normalizeIdentityProviderFormValues", () => {
     );
   });
 
+  it("leaves the discovery endpoint blank for providers that skip discovery", () => {
+    const normalized = normalizeIdentityProviderFormValues(
+      makeOidcFormValues({
+        providerId: "GitHub",
+        issuer: "https://github.com",
+        oidcConfig: {
+          issuer: "https://github.com",
+          skipDiscovery: true,
+          pkce: false,
+          clientId: "client-id",
+          clientSecret: "client-secret",
+          discoveryEndpoint: "",
+          authorizationEndpoint: "https://github.com/login/oauth/authorize",
+          tokenEndpoint: "https://github.com/login/oauth/access_token",
+          userInfoEndpoint: "https://api.github.com/user",
+          mapping: { id: "id", email: "email", name: "name" },
+        },
+      }),
+    );
+
+    expect(normalized.oidcConfig?.discoveryEndpoint).toBe("");
+    expect(normalized.oidcConfig?.authorizationEndpoint).toBe(
+      "https://github.com/login/oauth/authorize",
+    );
+  });
+
+  it("keeps an explicit discovery endpoint even when discovery is skipped", () => {
+    const normalized = normalizeIdentityProviderFormValues(
+      makeOidcFormValues({
+        providerId: "generic-oidc",
+        issuer: "https://login.example.com",
+        oidcConfig: {
+          issuer: "https://login.example.com",
+          skipDiscovery: true,
+          pkce: true,
+          clientId: "client-id",
+          clientSecret: "client-secret",
+          discoveryEndpoint:
+            "https://discovery.example.com/.well-known/openid-configuration",
+          mapping: { id: "sub", email: "email", name: "name" },
+        },
+      }),
+    );
+
+    expect(normalized.oidcConfig?.discoveryEndpoint).toBe(
+      "https://discovery.example.com/.well-known/openid-configuration",
+    );
+  });
+
+  it("still derives a blank discovery endpoint from the issuer when discovery runs", () => {
+    const normalized = normalizeIdentityProviderFormValues(
+      makeOidcFormValues({
+        providerId: "Okta",
+        issuer: "https://integrator-8514409.okta.com",
+        oidcConfig: {
+          issuer: "",
+          pkce: true,
+          clientId: "client-id",
+          clientSecret: "client-secret",
+          discoveryEndpoint: "",
+          mapping: { id: "sub", email: "email", name: "name" },
+        },
+      }),
+    );
+
+    expect(normalized.oidcConfig?.discoveryEndpoint).toBe(
+      "https://integrator-8514409.okta.com/.well-known/openid-configuration",
+    );
+  });
+
   it("fills inferred Keycloak enterprise-managed defaults when the section is used", () => {
     const normalized = normalizeIdentityProviderFormValues(
       makeOidcFormValues({
@@ -122,6 +186,53 @@ describe("normalizeIdentityProviderFormValues", () => {
         subjectTokenType: OAUTH_TOKEN_TYPE.AccessToken,
       }),
     );
+  });
+
+  it("drops an Entra Agent ID section left without a blueprint client ID", () => {
+    const normalized = normalizeIdentityProviderFormValues(
+      makeOidcFormValues({
+        oidcConfig: {
+          ...makeOidcFormValues().oidcConfig!,
+          enterpriseManagedCredentials: {
+            entraAgentId: {
+              blueprintClientId: "  ",
+              certificateThumbprint: "",
+              requireAgentIdentity: false,
+            },
+          },
+        },
+      }),
+    );
+
+    expect(normalized.oidcConfig?.enterpriseManagedCredentials).toBeUndefined();
+  });
+
+  it("keeps a configured Entra Agent ID section, trimmed and without blank fields", () => {
+    const normalized = normalizeIdentityProviderFormValues(
+      makeOidcFormValues({
+        issuer: "https://login.microsoftonline.com/tenant-id/v2.0",
+        providerId: "EntraID",
+        oidcConfig: {
+          ...makeOidcFormValues().oidcConfig!,
+          enterpriseManagedCredentials: {
+            entraAgentId: {
+              blueprintClientId: " blueprint-id ",
+              clientSecret: "",
+              certificateThumbprint: " abc ",
+              requireAgentIdentity: true,
+            },
+          },
+        },
+      }),
+    );
+
+    expect(
+      normalized.oidcConfig?.enterpriseManagedCredentials?.entraAgentId,
+    ).toEqual({
+      blueprintClientId: "blueprint-id",
+      certificateThumbprint: "abc",
+      requireAgentIdentity: true,
+    });
   });
 
   it("does not create enterprise-managed defaults when the section is unused", () => {
@@ -185,7 +296,7 @@ describe("normalizeIdentityProviderFormValues", () => {
           userInfoEndpoint: "https://graph.microsoft.com/oidc/userinfo",
           discoveryEndpoint:
             "https://login.microsoftonline.com/test-tenant/v2.0/.well-known/openid-configuration",
-          mapping: { id: "sub", email: "email", name: "name" },
+          mapping: { id: "sub", email: "", name: "name" },
           enterpriseManagedCredentials: {
             clientId: "archestra-oidc",
             clientSecret: "archestra-oidc-secret",
@@ -207,7 +318,11 @@ describe("normalizeIdentityProviderFormValues", () => {
     expect(normalized.oidcConfig?.mapping?.email).toBe("preferred_username");
   });
 
-  it("preserves custom Entra OBO email mappings", () => {
+  it.each([
+    "email",
+    "preferred_username",
+    "upn",
+  ])("preserves an explicit Entra OBO email claim: %s", (emailClaim) => {
     const normalized = normalizeIdentityProviderFormValues(
       makeOidcFormValues({
         providerId: "EntraID",
@@ -220,7 +335,7 @@ describe("normalizeIdentityProviderFormValues", () => {
           userInfoEndpoint: "https://graph.microsoft.com/oidc/userinfo",
           discoveryEndpoint:
             "https://login.microsoftonline.com/test-tenant/v2.0/.well-known/openid-configuration",
-          mapping: { id: "sub", email: "upn", name: "name" },
+          mapping: { id: "sub", email: emailClaim, name: "name" },
           enterpriseManagedCredentials: {
             exchangeStrategy: "entra_obo",
             clientId: "archestra-oidc",
@@ -230,6 +345,6 @@ describe("normalizeIdentityProviderFormValues", () => {
     );
 
     expect(normalized.oidcConfig?.userInfoEndpoint).toBeUndefined();
-    expect(normalized.oidcConfig?.mapping?.email).toBe("upn");
+    expect(normalized.oidcConfig?.mapping?.email).toBe(emailClaim);
   });
 });

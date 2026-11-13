@@ -1,24 +1,59 @@
-import { render, screen } from "@testing-library/react";
+import { OUTPUT_LIMIT_REACHED_MESSAGE } from "@archestra/shared";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { toast } from "sonner";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useHasPermissions } from "@/lib/auth/auth.query";
+import { useFeature } from "@/lib/config/config.query";
+import { useAppName } from "@/lib/hooks/use-app-name";
 
-vi.mock("sonner", () => ({
-  toast: {
-    success: vi.fn(),
-  },
+vi.mock("sonner");
+
+vi.mock("@/lib/auth/auth.query");
+vi.mock("@/lib/config/config.query", () => ({
+  useFeature: vi.fn(() => false),
 }));
 
-vi.mock("@/lib/auth/auth.query", () => ({
-  useHasPermissions: () => ({ data: true }),
+// The card brands the client-side fallback copy, which otherwise reaches for
+// the appearance-settings query and needs a QueryClientProvider.
+vi.mock("@/lib/hooks/use-app-name");
+
+vi.mock("@/lib/llm-provider-api-keys.query", () => ({
+  useCreateLlmProviderApiKey: () => ({
+    isPending: false,
+    mutateAsync: vi.fn().mockResolvedValue({ id: "key-1" }),
+  }),
+  useReconnectLlmProviderApiKey: () => ({
+    isPending: false,
+    mutateAsync: vi.fn().mockResolvedValue({ id: "key-1" }),
+  }),
+  // No existing personal subscription key → the card takes the create path.
+  useAvailableLlmProviderApiKeys: () => ({ data: [] }),
+}));
+
+// Invoke onToken on click so we can exercise the connect → auto-resend flow.
+vi.mock("@/components/github-copilot-sign-in", () => ({
+  GithubCopilotSignIn: ({ onToken }: { onToken: (token: string) => void }) => (
+    <button type="button" onClick={() => onToken("gho_test")}>
+      Sign in with GitHub
+    </button>
+  ),
 }));
 
 import { InlineChatError } from "./inline-chat-error";
+import { ProviderAuthRequiredCard } from "./provider-auth-required-card";
 
 describe("InlineChatError", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(useAppName).mockReturnValue("Archestra");
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+    } as ReturnType<typeof useHasPermissions>);
+    vi.mocked(useFeature).mockReturnValue(false);
   });
 
-  it("shows only the support message and correlation IDs in slim mode", () => {
+  it("shows a useful explanation alongside support and correlation IDs in slim mode", () => {
     render(
       <InlineChatError
         error={
@@ -37,14 +72,18 @@ describe("InlineChatError", () => {
             }),
           )
         }
-        supportMessage="Contact support@example.com and include these IDs."
+        supportMessage="Contact your administrator and include these IDs."
         slimChatErrorUi
       />,
     );
 
     expect(
-      screen.getByText("Contact support@example.com and include these IDs."),
+      screen.getByText("Contact your administrator and include these IDs."),
     ).toBeInTheDocument();
+    expect(
+      screen.getByText("The AI provider is experiencing issues."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("The provider failed")).not.toBeInTheDocument();
     expect(screen.getByText("session-12345678")).toBeInTheDocument();
     expect(screen.getByText("trace-12345678")).toBeInTheDocument();
     expect(screen.getByText("span-12345678")).toBeInTheDocument();
@@ -57,7 +96,66 @@ describe("InlineChatError", () => {
     ).toBeInTheDocument();
   });
 
-  it("falls back to the mapped error message in slim mode without a support message", () => {
+  it.each([
+    false,
+    true,
+  ])("keeps output-limit guidance with slim mode=%s without offering an unchanged retry", (slim) => {
+    render(
+      <InlineChatError
+        error={
+          new Error(
+            JSON.stringify({
+              code: "incomplete_response",
+              message: OUTPUT_LIMIT_REACHED_MESSAGE,
+              isRetryable: false,
+            }),
+          )
+        }
+        onRetry={vi.fn()}
+        slimChatErrorUi={slim}
+      />,
+    );
+
+    expect(
+      screen.getByText(/output limit before producing a reply/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/try a smaller task/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/increase the output-token limit/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /try again/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps other incomplete replies neutral in slim mode", () => {
+    render(
+      <InlineChatError
+        error={
+          new Error(
+            JSON.stringify({
+              code: "incomplete_response",
+              message: "private provider detail",
+              isRetryable: false,
+            }),
+          )
+        }
+        slimChatErrorUi
+      />,
+    );
+
+    expect(
+      screen.getByText("The model stopped before completing a reply."),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/increase the output-token limit/),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("private provider detail"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows curated error copy in slim mode without a support message", () => {
     render(
       <InlineChatError
         error={
@@ -80,7 +178,9 @@ describe("InlineChatError", () => {
       />,
     );
 
-    expect(screen.getByText("The provider failed")).toBeInTheDocument();
+    expect(
+      screen.getByText("The AI provider is experiencing issues."),
+    ).toBeInTheDocument();
     expect(screen.getByText("session-12345678")).toBeInTheDocument();
     expect(screen.getByText("trace-12345678")).toBeInTheDocument();
     expect(screen.getByText("span-12345678")).toBeInTheDocument();
@@ -88,6 +188,112 @@ describe("InlineChatError", () => {
     expect(
       screen.queryByText("secret provider detail"),
     ).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["rate_limit", /Too many requests/],
+    ["context_too_long", /conversation is too long/],
+    ["content_filtered", /rephrase your request/],
+    ["usage_limit_exceeded", /configured usage limit/],
+    ["unknown", /unexpected error occurred/],
+  ])("keeps %s guidance visible with support configured", (code, message) => {
+    render(
+      <InlineChatError
+        error={
+          new Error(
+            JSON.stringify({
+              code,
+              message: "private upstream payload",
+              isRetryable: false,
+            }),
+          )
+        }
+        supportMessage="Ask your administrator for help."
+        slimChatErrorUi
+      />,
+    );
+    expect(screen.getByText(message)).toBeInTheDocument();
+    expect(
+      screen.getByText("Ask your administrator for help."),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("private upstream payload"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("copies the explanation, support, and IDs without raw details in slim mode", async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    render(
+      <InlineChatError
+        error={
+          new Error(
+            JSON.stringify({
+              code: "rate_limit",
+              message: "private upstream payload",
+              isRetryable: true,
+              traceId: "trace-example",
+              originalError: { provider: "openai", raw: "private debug data" },
+            }),
+          )
+        }
+        supportMessage="  Contact your administrator.  "
+        conversationId="session-example"
+        agentName="Private Agent"
+        selectedModel="private-model"
+        slimChatErrorUi
+      />,
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Copy error details" }),
+    );
+    expect(writeText).toHaveBeenCalledWith(
+      "Too many requests. Please wait a moment and try again.\nContact your administrator.\nSession: session-example\nTrace: trace-example",
+    );
+  });
+
+  it("uses a safe fallback for unstructured errors even with blank support", () => {
+    vi.mocked(useAppName).mockReturnValue("Example Workspace");
+    render(
+      <InlineChatError
+        error={new Error("Error: private internal failure at service.ts:42")}
+        supportMessage="   "
+        slimChatErrorUi
+      />,
+    );
+    expect(screen.getByText(/unexpected error occurred/)).toBeInTheDocument();
+    expect(
+      screen.queryByText(/private internal failure/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("brands usage-limit guidance and never duplicates it beneath support", () => {
+    vi.mocked(useAppName).mockReturnValue("Example Workspace");
+    render(
+      <InlineChatError
+        error={
+          new Error(
+            JSON.stringify({
+              code: "rate_limit",
+              message: "private limit detail",
+              usageLimitExceeded: true,
+              isRetryable: false,
+            }),
+          )
+        }
+        supportMessage="Contact your administrator."
+        slimChatErrorUi
+      />,
+    );
+    expect(
+      screen.getAllByText(/Example Workspace blocked this request/),
+    ).toHaveLength(1);
+    expect(screen.queryByText(/Too many requests/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/private limit detail/)).not.toBeInTheDocument();
   });
 
   it("still shows a copy button in slim mode when no IDs are available", () => {
@@ -133,6 +339,69 @@ describe("InlineChatError", () => {
     ).toBeInTheDocument();
   });
 
+  it("renders an empty-response turn as a neutral outcome, not a destructive error", () => {
+    const { container } = render(
+      <InlineChatError
+        error={
+          new Error(
+            JSON.stringify({
+              code: "empty_response",
+              message:
+                "The model ended its turn without a reply. Rephrasing your message may help.",
+              isRetryable: true,
+            }),
+          )
+        }
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "The model ended its turn without a reply. Rephrasing your message may help.",
+      ),
+    ).toBeInTheDocument();
+    expect(container.querySelector(".bg-destructive\\/10")).toBeNull();
+    expect(container.querySelector(".bg-muted\\/30")).not.toBeNull();
+  });
+
+  it("renders an incomplete-tool-call turn as a retryable destructive error, not a neutral outcome", () => {
+    const { container } = render(
+      <InlineChatError
+        error={
+          new Error(
+            JSON.stringify({
+              code: "incomplete_tool_call",
+              message:
+                "The model started a tool call but didn't finish it, so the turn ended without a reply. Retrying may help.",
+              isRetryable: true,
+            }),
+          )
+        }
+      />,
+    );
+
+    expect(container.querySelector(".bg-destructive\\/10")).not.toBeNull();
+    expect(container.querySelector(".bg-muted\\/30")).toBeNull();
+  });
+
+  it("keeps destructive styling for genuine errors", () => {
+    const { container } = render(
+      <InlineChatError
+        error={
+          new Error(
+            JSON.stringify({
+              code: "server_error",
+              message: "The AI provider is experiencing issues.",
+              isRetryable: true,
+            }),
+          )
+        }
+      />,
+    );
+
+    expect(container.querySelector(".bg-destructive\\/10")).not.toBeNull();
+  });
+
   it("falls back to the structured error message and conversation ID as session", () => {
     render(
       <InlineChatError
@@ -152,5 +421,209 @@ describe("InlineChatError", () => {
     expect(screen.getByText("Something went wrong")).toBeInTheDocument();
     expect(screen.getByText("conversation-12345678")).toBeInTheDocument();
     expect(screen.getByText("Session")).toBeInTheDocument();
+  });
+
+  it("renders a connect-account card for a per-user provider auth error", () => {
+    render(
+      <InlineChatError
+        error={
+          new Error(
+            JSON.stringify({
+              code: "provider_auth_required",
+              message: "Connect your GitHub Copilot account to use this model.",
+              isRetryable: false,
+              authAction: {
+                provider: "github-copilot",
+                providerLabel: "GitHub Copilot",
+              },
+            }),
+          )
+        }
+      />,
+    );
+
+    expect(screen.getByText("Connect GitHub Copilot")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /Sign in with GitHub/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not claim success when the clipboard write fails", async () => {
+    const user = userEvent.setup();
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: vi.fn().mockRejectedValue(new Error("denied")) },
+    });
+    render(
+      <InlineChatError error={new Error("Failed to fetch")} slimChatErrorUi />,
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "Copy error details" }),
+    );
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledTimes(1));
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("toasts success once the clipboard write resolves", async () => {
+    const user = userEvent.setup();
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: vi.fn().mockResolvedValue(undefined) },
+    });
+    render(
+      <InlineChatError error={new Error("Failed to fetch")} slimChatErrorUi />,
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "Copy error details" }),
+    );
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledTimes(1));
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("auto-resends the original prompt after connecting the provider", async () => {
+    const onProviderConnected = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <InlineChatError
+        error={
+          new Error(
+            JSON.stringify({
+              code: "provider_auth_required",
+              message: "Connect your GitHub Copilot account to use this model.",
+              isRetryable: false,
+              authAction: {
+                provider: "github-copilot",
+                providerLabel: "GitHub Copilot",
+              },
+            }),
+          )
+        }
+        onProviderConnected={onProviderConnected}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: /Sign in with GitHub/i }),
+    );
+
+    await waitFor(() => expect(onProviderConnected).toHaveBeenCalledTimes(1));
+  });
+
+  it("uses connect-before-send copy without claiming it will retry", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <ProviderAuthRequiredCard
+        provider="github-copilot"
+        providerLabel="GitHub Copilot"
+        agentName="Research Agent"
+        variant="preflight"
+      />,
+    );
+
+    expect(
+      screen.getByText("Connect GitHub Copilot to use Research Agent"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/connect your own account before sending a message/i),
+    ).toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("button", { name: "Sign in with GitHub" }),
+    );
+
+    await waitFor(() =>
+      expect(toast.success).toHaveBeenCalledWith("GitHub Copilot connected"),
+    );
+  });
+
+  it("points at Model Providers for a provider that has no subscription flow", () => {
+    // The card picks a sign-in by looking the provider up in the subscription
+    // registry; a provider with no entry has no device flow to offer, so it
+    // must fall back to the Model Providers link rather than render nothing.
+    render(
+      <ProviderAuthRequiredCard
+        provider="anthropic"
+        providerLabel="anthropic"
+      />,
+    );
+
+    expect(
+      screen.getByRole("link", { name: "Connect in Model Providers" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Sign in with/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  const retryableError = () =>
+    new Error(
+      JSON.stringify({
+        code: "network_error",
+        message: "Connection error. Please check your network and try again.",
+        isRetryable: true,
+      }),
+    );
+
+  const nonRetryableError = () =>
+    new Error(
+      JSON.stringify({
+        code: "authentication",
+        message: "Authentication failed.",
+        isRetryable: false,
+      }),
+    );
+
+  it("shows a Try again button for a retryable error and calls onRetry", async () => {
+    const onRetry = vi.fn().mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    render(<InlineChatError error={retryableError()} onRetry={onRetry} />);
+
+    await user.click(screen.getByRole("button", { name: "Try again" }));
+
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides Try again for a non-retryable error even when onRetry is provided", () => {
+    render(<InlineChatError error={nonRetryableError()} onRetry={vi.fn()} />);
+
+    expect(
+      screen.queryByRole("button", { name: "Try again" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("hides Try again for a retryable error when no onRetry is provided", () => {
+    render(<InlineChatError error={retryableError()} />);
+
+    expect(
+      screen.queryByRole("button", { name: "Try again" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("disables Try again while a retry is in flight so it cannot double-fire", async () => {
+    let resolveRetry: (() => void) | undefined;
+    const onRetry = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRetry = resolve;
+        }),
+    );
+    const user = userEvent.setup();
+    render(<InlineChatError error={retryableError()} onRetry={onRetry} />);
+
+    const button = screen.getByRole("button", { name: "Try again" });
+    await user.click(button);
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(button).toBeDisabled());
+
+    await user.click(button);
+    expect(onRetry).toHaveBeenCalledTimes(1);
+
+    resolveRetry?.();
+    await waitFor(() => expect(button).not.toBeDisabled());
   });
 });

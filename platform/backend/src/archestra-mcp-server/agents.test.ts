@@ -1,14 +1,38 @@
 // biome-ignore-all lint/suspicious/noExplicitAny: test
 import {
+  ARCHESTRA_MCP_CATALOG_ID,
   ARCHESTRA_MCP_SERVER_NAME,
+  type ArchestraToolShortName,
+  buildAgentCatalogRuntime,
+  buildCustomAgentRuntime,
   MCP_SERVER_TOOL_NAME_SEPARATOR,
-} from "@shared";
+  TOOL_CREATE_AGENT_SHORT_NAME,
+  TOOL_EDIT_AGENT_SHORT_NAME,
+  TOOL_GET_AGENT_SHORT_NAME,
+  TOOL_GET_AGENT_SKILL_POLICY_SHORT_NAME,
+  TOOL_LIST_AGENTS_SHORT_NAME,
+  TOOL_LIST_LLM_MODELS_SHORT_NAME,
+  TOOL_PATCH_AGENT_SKILL_POLICY_SHORT_NAME,
+  TOOL_SEARCH_TOOLS_SHORT_NAME,
+} from "@archestra/shared";
 import { and, eq } from "drizzle-orm";
+import { type MockInstance, vi } from "vitest";
+import config from "@/config";
 import db, { schema } from "@/database";
-import { AgentKnowledgeBaseModel, AgentModel } from "@/models";
-import { beforeEach, describe, expect, test } from "@/test";
+import { agentSandboxApi } from "@/k8s/agent-runtime/sandbox-api";
+import {
+  AgentKnowledgeBaseModel,
+  AgentModel,
+  LlmProviderApiKeyModelLinkModel,
+  ModelModel,
+  OrganizationModel,
+  ToolModel,
+} from "@/models";
+import { createRuntimeCredentialDefinition } from "@/services/agent-runtime/runtime-credentials";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
 import type { Agent } from "@/types";
 import { type ArchestraContext, executeArchestraTool } from ".";
+import { archestraMcpBranding } from "./branding";
 
 describe("agent tool execution", () => {
   let testAgent: Agent;
@@ -24,6 +48,213 @@ describe("agent tool execution", () => {
       userId: user.id,
       organizationId: org.id,
     };
+  });
+
+  test("a revisioned skill policy limits activation and rejects stale changes", async ({
+    makeSkill,
+    makeInternalAgent,
+  }) => {
+    const organizationId = mockContext.organizationId as string;
+    const target = await makeInternalAgent({ organizationId });
+    const runtimeContext = {
+      ...mockContext,
+      agent: { id: target.id, name: target.name },
+    };
+    const allowed = await makeSkill(organizationId, { access: "org" });
+    const excluded = await makeSkill(organizationId, { access: "org" });
+    const initial = await executeArchestraTool(
+      `archestra__${TOOL_GET_AGENT_SKILL_POLICY_SHORT_NAME}`,
+      { id: target.id },
+      mockContext,
+    );
+    expect(initial.isError).toBe(false);
+    expect(initial.structuredContent).toMatchObject({
+      mode: "all",
+      revision: 0,
+    });
+
+    const reference = { source: "native", skillId: allowed.id };
+    const updated = await executeArchestraTool(
+      `archestra__${TOOL_PATCH_AGENT_SKILL_POLICY_SHORT_NAME}`,
+      {
+        id: target.id,
+        patch: {
+          expectedRevision: 0,
+          mode: "manual",
+          operations: [{ op: "add", disposition: "allow", reference }],
+        },
+      },
+      mockContext,
+    );
+    expect(updated.isError, JSON.stringify(updated.content)).toBe(false);
+    expect(updated.structuredContent).toMatchObject({
+      mode: "manual",
+      revision: 1,
+      allowedReferences: [reference],
+    });
+    const activated = await executeArchestraTool(
+      "archestra__load_skill",
+      { name: allowed.name },
+      runtimeContext,
+    );
+    expect(activated.isError).toBe(false);
+    const refused = await executeArchestraTool(
+      "archestra__load_skill",
+      { name: excluded.name },
+      runtimeContext,
+    );
+    expect(refused.isError).toBe(true);
+
+    const stale = await executeArchestraTool(
+      `archestra__${TOOL_PATCH_AGENT_SKILL_POLICY_SHORT_NAME}`,
+      { id: target.id, patch: { expectedRevision: 0, mode: "all" } },
+      mockContext,
+    );
+    expect(stale.isError).toBe(true);
+    expect(JSON.stringify(stale.content)).toContain("policy was modified");
+    const current = await executeArchestraTool(
+      `archestra__${TOOL_GET_AGENT_SKILL_POLICY_SHORT_NAME}`,
+      { id: target.id },
+      mockContext,
+    );
+    expect(current.structuredContent).toMatchObject({
+      mode: "manual",
+      revision: 1,
+    });
+  });
+
+  test.for([
+    TOOL_GET_AGENT_SKILL_POLICY_SHORT_NAME,
+    TOOL_PATCH_AGENT_SKILL_POLICY_SHORT_NAME,
+  ])("%s requires skill read permission even for an agent editor", async (tool, {
+    makeUser,
+    makeMember,
+    makeCustomRole,
+    makeAgent,
+  }) => {
+    const organizationId = mockContext.organizationId as string;
+    const user = await makeUser();
+    const role = await makeCustomRole(organizationId, {
+      permission: { agent: ["read", "update"] },
+    });
+    await makeMember(user.id, organizationId, { role: role.role });
+    const agent = await makeAgent({
+      organizationId,
+      authorId: user.id,
+      agentType: "agent",
+    });
+    const result = await executeArchestraTool(
+      `archestra__${tool}`,
+      {
+        id: agent.id,
+        ...(tool === TOOL_PATCH_AGENT_SKILL_POLICY_SHORT_NAME
+          ? { patch: { expectedRevision: 0, mode: "manual" } }
+          : {}),
+      },
+      { ...mockContext, userId: user.id },
+    );
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result.content)).toContain(
+      "Permission to read skills",
+    );
+  });
+
+  test.for([
+    TOOL_GET_AGENT_SKILL_POLICY_SHORT_NAME,
+    TOOL_PATCH_AGENT_SKILL_POLICY_SHORT_NAME,
+  ])("%s refuses agents outside the caller's organization", async (tool, {
+    makeOrganization,
+    makeAgent,
+  }) => {
+    const other = await makeOrganization();
+    const target = await makeAgent({
+      organizationId: other.id,
+      agentType: "agent",
+    });
+    const result = await executeArchestraTool(
+      `archestra__${tool}`,
+      {
+        id: target.id,
+        ...(tool === TOOL_PATCH_AGENT_SKILL_POLICY_SHORT_NAME
+          ? { patch: { expectedRevision: 0, mode: "manual" } }
+          : {}),
+      },
+      mockContext,
+    );
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result.content)).toContain("Agent not found");
+  });
+
+  test("skill policy updates cannot add a skill from another organization", async ({
+    makeOrganization,
+    makeInternalAgent,
+    makeSkill,
+  }) => {
+    const target = await makeInternalAgent({
+      organizationId: mockContext.organizationId as string,
+    });
+    const other = await makeOrganization();
+    const skill = await makeSkill(other.id, { access: "org" });
+    const result = await executeArchestraTool(
+      `archestra__${TOOL_PATCH_AGENT_SKILL_POLICY_SHORT_NAME}`,
+      {
+        id: target.id,
+        patch: {
+          expectedRevision: 0,
+          mode: "manual",
+          operations: [
+            {
+              op: "add",
+              disposition: "allow",
+              reference: { source: "native", skillId: skill.id },
+            },
+          ],
+        },
+      },
+      mockContext,
+    );
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result.content)).toContain("not currently available");
+    const current = await executeArchestraTool(
+      `archestra__${TOOL_GET_AGENT_SKILL_POLICY_SHORT_NAME}`,
+      { id: target.id },
+      mockContext,
+    );
+    expect(current.structuredContent).toMatchObject({
+      mode: "all",
+      revision: 0,
+      allowedReferences: [],
+    });
+  });
+
+  test("skill policy updates require an update grant on the target agent", async ({
+    makeUser,
+    makeMember,
+    makeCustomRole,
+    makeInternalAgent,
+  }) => {
+    const organizationId = mockContext.organizationId as string;
+    const user = await makeUser();
+    const role = await makeCustomRole(organizationId, {
+      permission: { agent: ["read", "update"], skill: ["read"] },
+    });
+    await makeMember(user.id, organizationId, { role: role.role });
+    const target = await makeInternalAgent({ organizationId, access: "org" });
+    const result = await executeArchestraTool(
+      `archestra__${TOOL_PATCH_AGENT_SKILL_POLICY_SHORT_NAME}`,
+      { id: target.id, patch: { expectedRevision: 0, mode: "manual" } },
+      { ...mockContext, userId: user.id },
+    );
+    expect(result.isError).toBe(true);
+    const current = await executeArchestraTool(
+      `archestra__${TOOL_GET_AGENT_SKILL_POLICY_SHORT_NAME}`,
+      { id: target.id },
+      mockContext,
+    );
+    expect(current.structuredContent).toMatchObject({
+      mode: "all",
+      revision: 0,
+    });
   });
 
   test("create_agent requires name", async () => {
@@ -47,6 +278,131 @@ describe("agent tool execution", () => {
       "Successfully created agent",
     );
     expect((result.content[0] as any).text).toContain("New Test Agent");
+    // The reader gets the agent's own edit page, not a list that would have to
+    // resolve the id itself.
+    expect((result.content[0] as any).text).toContain(
+      `/agents/${extractCreatedId(result)}/edit`,
+    );
+  });
+
+  test("create_agent stores the agent's own network policy and edit_agent clears it", async () => {
+    const created = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}create_agent`,
+      {
+        name: "Locked Agent",
+        networkPolicy: {
+          egressMode: "restricted",
+          domainPreset: "package_managers",
+          allowedDomains: ["api.example.com"],
+        },
+      },
+      mockContext,
+    );
+    expect(created.isError).toBe(false);
+    const id = extractCreatedId(created);
+    expect((await AgentModel.findById(id))?.networkPolicy).toEqual({
+      egressMode: "restricted",
+      domainPreset: "package_managers",
+      allowedDomains: ["api.example.com"],
+      allowedCidrs: [],
+    });
+
+    const edited = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}${TOOL_EDIT_AGENT_SHORT_NAME}`,
+      { id, networkPolicy: null },
+      mockContext,
+    );
+    expect(edited.isError).toBe(false);
+    expect((await AgentModel.findById(id))?.networkPolicy).toBeNull();
+  });
+
+  test("create_agent refuses an invalid network policy", async () => {
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}create_agent`,
+      {
+        name: "Bad Policy Agent",
+        networkPolicy: { egressMode: "restricted", allowedCidrs: ["nope"] },
+      },
+      mockContext,
+    );
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain("Invalid networkPolicy");
+  });
+
+  test("edit_agent refuses a network policy from a member who cannot update environments", async ({
+    makeUser,
+    makeMember,
+  }) => {
+    const member = await makeUser();
+    await makeMember(member.id, mockContext.organizationId as string, {
+      role: "member",
+    });
+    const memberContext = { ...mockContext, userId: member.id };
+    const created = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}create_agent`,
+      { name: "Member Agent" },
+      memberContext,
+    );
+    expect(created.isError).toBe(false);
+    const id = extractCreatedId(created);
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}${TOOL_EDIT_AGENT_SHORT_NAME}`,
+      { id, networkPolicy: { egressMode: "unrestricted" } },
+      memberContext,
+    );
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain(
+      "requires permission to update environments",
+    );
+    expect((await AgentModel.findById(id))?.networkPolicy).toBeNull();
+  });
+
+  test("create_agent defaults Manual agents to progressive loading", async () => {
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}create_agent`,
+      { name: "Manual Progressive Agent", accessAllTools: false },
+      mockContext,
+    );
+    expect(result.isError).toBe(false);
+    const created = await AgentModel.findById(
+      extractCreatedId(result),
+      mockContext.userId,
+      true,
+    );
+    expect(created?.accessAllTools).toBe(false);
+    expect(created?.toolExposureMode).toBe("search_and_run_only");
+  });
+
+  test("create_agent attributes the calling user as author", async () => {
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}create_agent`,
+      { name: "Attributed Agent" },
+      mockContext,
+    );
+    expect(result.isError).toBe(false);
+
+    const created = await AgentModel.findById(
+      extractCreatedId(result),
+      mockContext.userId,
+      true,
+    );
+    expect(created?.authorId).toBe(mockContext.userId);
+  });
+
+  test("create_agent refuses the retired scope and teams arguments", async () => {
+    // Who can reach a new agent is its initialGrants alone.
+    for (const sharing of [
+      { scope: "org" },
+      { teams: [crypto.randomUUID()] },
+    ]) {
+      const result = await executeArchestraTool(
+        `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}create_agent`,
+        { name: "Retired Sharing Agent", ...sharing },
+        mockContext,
+      );
+      expect(result.isError).toBe(true);
+    }
   });
 
   test("create_agent persists toolExposureMode", async () => {
@@ -381,6 +737,108 @@ describe("agent tool execution", () => {
     );
   });
 
+  test("get_agent does not cross the active organization boundary", async ({
+    makeAgent,
+    makeOrganization,
+  }) => {
+    const otherOrganization = await makeOrganization();
+    const foreignAgent = await makeAgent({
+      name: `Foreign ${crypto.randomUUID()}`,
+      agentType: "agent",
+      organizationId: otherOrganization.id,
+    });
+
+    for (const lookup of [
+      { id: foreignAgent.id },
+      { name: foreignAgent.name },
+    ]) {
+      const result = await executeArchestraTool(
+        `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}get_agent`,
+        lookup,
+        mockContext,
+      );
+      expect(result.isError).toBe(true);
+      expect((result.content[0] as any).text).toMatch(/agent not found/i);
+    }
+  });
+
+  test("get_agent exposes the skills the caller can activate through it", async ({
+    makeAgent,
+    makeSkill,
+  }) => {
+    const organizationId = mockContext.organizationId;
+    if (!organizationId) throw new Error("Expected organization context");
+    await OrganizationModel.patch(organizationId, { skillToolsEnabled: true });
+    await ToolModel.seedArchestraTools(ARCHESTRA_MCP_CATALOG_ID);
+    const agent = await makeAgent({
+      name: "Skilled Agent",
+      agentType: "agent",
+      organizationId,
+    });
+    await ToolModel.assignSkillToolsToAgent(agent.id, organizationId);
+    const skill = await makeSkill(organizationId, {
+      name: "triage-incidents",
+      description: "Triage incoming incidents",
+      content: "# Instructions",
+      access: "org",
+    });
+    if (!skill) throw new Error("Expected skill to be created");
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}get_agent`,
+      { id: agent.id },
+      mockContext,
+    );
+
+    expect(result.isError).toBe(false);
+    const parsed = JSON.parse((result.content[0] as any).text);
+    expect(parsed.skillsEnabled).toBe(true);
+    expect(parsed.skillsNotice).toMatch(/never follow directions/i);
+    expect(parsed.skills).toEqual([
+      {
+        reference: { source: "native", skillId: skill.id },
+        name: "triage-incidents",
+        activationName: "triage-incidents",
+        description: "Triage incoming incidents",
+        // Derived from the skill's grants, not the retired column.
+        scope: "org",
+        providerName: null,
+      },
+    ]);
+  });
+
+  test("get_agent omits activation skills when the caller cannot read skills", async ({
+    makeAgent,
+    makeCustomRole,
+    makeMember,
+    makeUser,
+  }) => {
+    const organizationId = mockContext.organizationId;
+    if (!organizationId) throw new Error("Expected organization context");
+    const restrictedUser = await makeUser();
+    const role = await makeCustomRole(organizationId, {
+      permission: { agent: ["read"] },
+    });
+    await makeMember(restrictedUser.id, organizationId, { role: role.role });
+    const sharedAgent = await makeAgent({
+      name: "Shared Agent",
+      agentType: "agent",
+      organizationId,
+    });
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}get_agent`,
+      { id: sharedAgent.id },
+      { ...mockContext, userId: restrictedUser.id },
+    );
+
+    expect(result.isError).toBe(false);
+    const parsed = JSON.parse((result.content[0] as any).text);
+    expect(parsed).not.toHaveProperty("skillsEnabled");
+    expect(parsed).not.toHaveProperty("skillsNotice");
+    expect(parsed).not.toHaveProperty("skills");
+  });
+
   test("list_agents returns results", async () => {
     const result = await executeArchestraTool(
       `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}list_agents`,
@@ -393,18 +851,153 @@ describe("agent tool execution", () => {
     expect(parsed).toHaveProperty("agents");
   });
 
+  // A gateway session read another agent's tools here and called one of them.
+  test("list_agents says each agent's tools are not the caller's", async () => {
+    const result = await executeArchestraTool(
+      archestraMcpBranding.getToolName(TOOL_LIST_AGENTS_SHORT_NAME),
+      {},
+      mockContext,
+    );
+    const parsed = JSON.parse((result.content[0] as { text: string }).text);
+    // Ahead of the agents, so a model reads it before their tool lists.
+    expect(Object.keys(parsed)).toEqual(["total", "hint", "agents"]);
+    expect(parsed.hint).toContain("not tools you can call");
+    expect(parsed.hint).toContain(
+      archestraMcpBranding.getToolName(TOOL_SEARCH_TOOLS_SHORT_NAME),
+    );
+  });
+
+  test("list_agents identifies agents that can retain and steer runtime work", async ({
+    makeAgent,
+  }) => {
+    const foregroundAgent = await makeAgent({
+      organizationId: testAgent.organizationId,
+      agentType: "agent",
+    });
+    const runtimeAgent = await makeAgent({
+      organizationId: testAgent.organizationId,
+      agentType: "agent",
+      runtime: {
+        image: "example.test/agent:current",
+        command: null,
+        inferenceProtocol: "anthropic",
+        backend: "kubernetes",
+        steerMode: "pipe",
+        privileged: false,
+        environment: null,
+        credentials: null,
+        ttlHours: null,
+        maxCostUsd: null,
+        idleTimeoutMinutes: null,
+      },
+    });
+    const result = await executeArchestraTool(
+      archestraMcpBranding.getToolName(TOOL_LIST_AGENTS_SHORT_NAME),
+      {},
+      mockContext,
+    );
+    expect(result.isError).toBe(false);
+    const parsed = JSON.parse((result.content[0] as { text: string }).text);
+    expect(parsed.agents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: runtimeAgent.id,
+          executionMode: "runtime",
+        }),
+        expect.objectContaining({
+          id: foregroundAgent.id,
+          executionMode: "foreground",
+        }),
+      ]),
+    );
+  });
+
+  test("list_agents filters by provider key and returns its display name", async ({
+    makeAgent,
+    makeLlmProviderApiKey,
+  }) => {
+    if (!mockContext.organizationId)
+      throw new Error("Missing organization fixture");
+    const key = await makeLlmProviderApiKey(mockContext.organizationId, null, {
+      userId: mockContext.userId,
+      name: "Operations provider",
+      provider: "openai",
+      access: "org",
+    });
+    const selected = await makeAgent({
+      name: "Configured assistant",
+      agentType: "agent",
+      organizationId: mockContext.organizationId,
+      llmApiKeyId: key.id,
+    });
+    const result = await executeArchestraTool(
+      archestraMcpBranding.getToolName(TOOL_LIST_AGENTS_SHORT_NAME),
+      { providerApiKeyId: key.id },
+      mockContext,
+    );
+    expect(result.isError).toBe(false);
+    const parsed = JSON.parse((result.content[0] as any).text);
+    expect(parsed.total).toBe(1);
+    expect(parsed.agents).toMatchObject([
+      {
+        id: selected.id,
+        resolvedLlmProviderKeyName: "Operations provider",
+        resolvedLlmModelName: null,
+      },
+    ]);
+  });
+
+  test("list_agents can select agents using the organization default", async ({
+    makeAgent,
+    makeLlmProviderApiKey,
+  }) => {
+    if (!mockContext.organizationId)
+      throw new Error("Missing organization fixture");
+    const inherited = await makeAgent({
+      name: "Inherited assistant",
+      agentType: "agent",
+      organizationId: mockContext.organizationId,
+    });
+    const key = await makeLlmProviderApiKey(mockContext.organizationId, null, {
+      userId: mockContext.userId,
+      name: "Pinned key",
+      provider: "openai",
+      access: "org",
+    });
+    const pinned = await makeAgent({
+      name: "Pinned assistant",
+      agentType: "agent",
+      organizationId: mockContext.organizationId,
+      llmApiKeyId: key.id,
+    });
+    const result = await executeArchestraTool(
+      archestraMcpBranding.getToolName(TOOL_LIST_AGENTS_SHORT_NAME),
+      { providerApiKeyId: "organization-default" },
+      mockContext,
+    );
+    expect(result.isError).toBe(false);
+    const parsed = JSON.parse((result.content[0] as { text: string }).text);
+    expect(parsed.agents.map((agent: { id: string }) => agent.id)).toContain(
+      inherited.id,
+    );
+    expect(
+      parsed.agents.map((agent: { id: string }) => agent.id),
+    ).not.toContain(pinned.id);
+  });
+
   test("list_agents includes tools and knowledge sources", async ({
     makeAgent,
     makeTool,
     makeAgentTool,
     makeKnowledgeBase,
     makeKnowledgeBaseConnector,
-    makeOrganization,
   }) => {
-    const org = await makeOrganization();
+    if (!mockContext.organizationId)
+      throw new Error("Missing organization fixture");
+    const organizationId = mockContext.organizationId;
     const agent = await makeAgent({
       name: "Agent With Resources",
-      organizationId: org.id,
+      organizationId,
       agentType: "agent",
     });
 
@@ -416,11 +1009,11 @@ describe("agent tool execution", () => {
     await makeAgentTool(agent.id, tool.id);
 
     // Create and assign a knowledge base
-    const kb = await makeKnowledgeBase(org.id, {
+    const kb = await makeKnowledgeBase(organizationId, {
       name: "Product Docs",
     });
     await AgentKnowledgeBaseModel.assign(agent.id, kb.id);
-    const connector = await makeKnowledgeBaseConnector(kb.id, org.id, {
+    const connector = await makeKnowledgeBaseConnector(kb.id, organizationId, {
       name: "Jira Connector",
     });
     await AgentModel.update(agent.id, {
@@ -462,6 +1055,77 @@ describe("agent tool execution", () => {
 });
 
 describe("agent RBAC visibility", () => {
+  test.for([
+    "admin",
+    "member",
+  ] as const)("list_agents scopes %s results and provider metadata to the context organization", async (role, {
+    makeUser,
+    makeOrganization,
+    makeMember,
+    makeAgent,
+    makeLlmProviderApiKey,
+  }) => {
+    const organization = await makeOrganization();
+    const unrelatedOrganization = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, organization.id, { role });
+    const localKey = await makeLlmProviderApiKey(organization.id, null, {
+      name: "Local provider",
+      provider: "openai",
+    });
+    const unrelatedKey = await makeLlmProviderApiKey(
+      unrelatedOrganization.id,
+      null,
+      {
+        name: "Unrelated provider",
+        provider: "openai",
+      },
+    );
+    const localAgent = await makeAgent({
+      name: "Local assistant",
+      agentType: "agent",
+      organizationId: organization.id,
+      llmApiKeyId: localKey.id,
+    });
+    await makeAgent({
+      name: "Unrelated assistant",
+      agentType: "agent",
+      organizationId: unrelatedOrganization.id,
+      llmApiKeyId: unrelatedKey.id,
+    });
+    const context: ArchestraContext = {
+      agent: { id: localAgent.id, name: localAgent.name },
+      userId: user.id,
+      organizationId: organization.id,
+    };
+    for (const args of [{}, { providerApiKeyId: localKey.id }]) {
+      const result = await executeArchestraTool(
+        archestraMcpBranding.getToolName(TOOL_LIST_AGENTS_SHORT_NAME),
+        args,
+        context,
+      );
+      expect(result.isError).toBe(false);
+      const parsed = JSON.parse((result.content[0] as any).text);
+      expect(parsed.total).toBe(1);
+      expect(parsed.agents).toMatchObject([
+        {
+          id: localAgent.id,
+          resolvedLlmProviderKeyName: "Local provider",
+        },
+      ]);
+    }
+    const unrelatedResult = await executeArchestraTool(
+      archestraMcpBranding.getToolName(TOOL_LIST_AGENTS_SHORT_NAME),
+      { providerApiKeyId: unrelatedKey.id },
+      context,
+    );
+    expect(unrelatedResult.isError).toBe(false);
+    expect(JSON.parse((unrelatedResult.content[0] as any).text)).toMatchObject({
+      total: 0,
+      agents: [],
+    });
+  });
+
   test("list_agents only returns agents accessible to non-admin member", async ({
     makeUser,
     makeOrganization,
@@ -483,15 +1147,13 @@ describe("agent RBAC visibility", () => {
       name: "Visible Agent",
       agentType: "agent",
       organizationId: org.id,
-      scope: "team",
-      teams: [teamA.id],
+      access: { teams: [teamA.id] },
     });
     await makeAgent({
       name: "Hidden Agent",
       agentType: "agent",
       organizationId: org.id,
-      scope: "team",
-      teams: [teamB.id],
+      access: { teams: [teamB.id] },
     });
 
     const memberContext: ArchestraContext = {
@@ -513,6 +1175,135 @@ describe("agent RBAC visibility", () => {
     expect(agentNames).not.toContain("Hidden Agent");
   });
 
+  test("list_agents narrows an admin's results by access", async ({
+    makeUser,
+    makeOrganization,
+    makeMember,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const admin = await makeUser();
+    await makeMember(admin.id, org.id, { role: "admin" });
+    const otherUser = await makeUser();
+    await makeMember(otherUser.id, org.id, { role: "member" });
+
+    const mine = await makeAgent({
+      name: "Access Mine",
+      agentType: "agent",
+      organizationId: org.id,
+      access: "personal",
+      authorId: admin.id,
+    });
+    await makeAgent({
+      name: "Access Other Personal",
+      agentType: "agent",
+      organizationId: org.id,
+      access: "personal",
+      authorId: otherUser.id,
+    });
+    await makeAgent({
+      name: "Access Org",
+      agentType: "agent",
+      organizationId: org.id,
+      access: "org",
+      authorId: otherUser.id,
+    });
+
+    const context: ArchestraContext = {
+      agent: { id: mine.id, name: mine.name },
+      userId: admin.id,
+      organizationId: org.id,
+    };
+    const listNames = async (access?: string[]) => {
+      const result = await executeArchestraTool(
+        archestraMcpBranding.getToolName(TOOL_LIST_AGENTS_SHORT_NAME),
+        { name: "Access", ...(access ? { access } : {}) },
+        context,
+      );
+      expect(result.isError, JSON.stringify(result.content)).toBe(false);
+      return JSON.parse((result.content[0] as any).text)
+        .agents.map((agent: { name: string }) => agent.name)
+        .sort();
+    };
+
+    // Omitted keeps today's behaviour: the admin's wildcard grant reaches
+    // every agent.
+    expect(await listNames()).toEqual([
+      "Access Mine",
+      "Access Org",
+      "Access Other Personal",
+    ]);
+    expect(await listNames(["mine"])).toEqual(["Access Mine"]);
+    expect(await listNames(["others"])).toEqual(["Access Other Personal"]);
+    expect(await listNames(["mine", "org"])).toEqual([
+      "Access Mine",
+      "Access Org",
+    ]);
+  });
+
+  test("list_agents narrows by shared_with and owner_ids", async ({
+    makeUser,
+    makeOrganization,
+    makeMember,
+    makeAgent,
+    makeTeam,
+  }) => {
+    const org = await makeOrganization();
+    const admin = await makeUser();
+    await makeMember(admin.id, org.id, { role: "admin" });
+    const otherUser = await makeUser();
+    await makeMember(otherUser.id, org.id, { role: "member" });
+    const team = await makeTeam(org.id, admin.id);
+
+    const mine = await makeAgent({
+      name: "Narrow Mine",
+      agentType: "agent",
+      organizationId: org.id,
+      access: "personal",
+      authorId: admin.id,
+    });
+    await makeAgent({
+      name: "Narrow Team",
+      agentType: "agent",
+      organizationId: org.id,
+      access: { teams: [team.id] },
+      authorId: otherUser.id,
+    });
+    await makeAgent({
+      name: "Narrow Org",
+      agentType: "agent",
+      organizationId: org.id,
+      access: "org",
+      authorId: otherUser.id,
+    });
+
+    const context: ArchestraContext = {
+      agent: { id: mine.id, name: mine.name },
+      userId: admin.id,
+      organizationId: org.id,
+    };
+    const listNames = async (args: Record<string, string[]>) => {
+      const result = await executeArchestraTool(
+        archestraMcpBranding.getToolName(TOOL_LIST_AGENTS_SHORT_NAME),
+        { name: "Narrow", ...args },
+        context,
+      );
+      expect(result.isError, JSON.stringify(result.content)).toBe(false);
+      return JSON.parse((result.content[0] as any).text)
+        .agents.map((agent: { name: string }) => agent.name)
+        .sort();
+    };
+
+    expect(await listNames({ shared_with: [`team:${team.id}`] })).toEqual([
+      "Narrow Team",
+    ]);
+    expect(await listNames({ shared_with: ["org"] })).toEqual(["Narrow Org"]);
+    expect(await listNames({ owner_ids: [admin.id] })).toEqual(["Narrow Mine"]);
+    expect(
+      await listNames({ owner_ids: [otherUser.id], shared_with: ["org"] }),
+    ).toEqual(["Narrow Org"]);
+  });
+
   test("get_agent by name does not return inaccessible team-scoped agent", async ({
     makeUser,
     makeOrganization,
@@ -531,8 +1322,7 @@ describe("agent RBAC visibility", () => {
       name: "Secret Agent",
       agentType: "agent",
       organizationId: org.id,
-      scope: "team",
-      teams: [teamB.id],
+      access: { teams: [teamB.id] },
     });
 
     const memberContext: ArchestraContext = {
@@ -549,6 +1339,702 @@ describe("agent RBAC visibility", () => {
 
     expect(result.isError).toBe(true);
     expect((result.content[0] as any).text).toContain("not found");
+    expect((result.content[0] as any).text).toContain(
+      archestraMcpBranding.getToolName(TOOL_LIST_AGENTS_SHORT_NAME),
+    );
+  });
+});
+
+describe("edit_agent migrated sharing", () => {
+  test("ignores retired sharing fields and permits a content-only edit", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeAgent,
+    makeTeam,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const team = await makeTeam(org.id, user.id);
+    const agent = await makeAgent({
+      organizationId: org.id,
+      agentType: "agent",
+      access: { teams: [team.id] },
+      // Stored as it was before permission policies, so the check below
+      // proves an edit leaves the retired columns alone.
+      legacy: { scope: "team", teams: [team.id] },
+    });
+    const context = {
+      organizationId: org.id,
+      userId: user.id,
+      agent: { id: agent.id, name: agent.name },
+    };
+    // The tool no longer accepts scope/teams at all, so a caller still sending
+    // them is refused by the strict input schema and nothing is written.
+    for (const sharing of [
+      { teams: [] },
+      { scope: "org" },
+      { teams: [crypto.randomUUID()] },
+    ]) {
+      const result = await executeArchestraTool(
+        `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}edit_agent`,
+        { id: agent.id, ...sharing },
+        context,
+      );
+      expect(result.isError).toBe(true);
+      const unchanged = await AgentModel.findById(agent.id);
+      expect(unchanged?.scope).toBe("team");
+      expect(unchanged?.teams.map((entry) => entry.id)).toEqual([team.id]);
+    }
+    const edited = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}edit_agent`,
+      { id: agent.id, description: "Updated description" },
+      context,
+    );
+    expect(edited.isError).toBe(false);
+    expect((await AgentModel.findById(agent.id))?.description).toBe(
+      "Updated description",
+    );
+    // A content-only edit leaves the stored visibility exactly where it was.
+    const after = await AgentModel.findById(agent.id);
+    expect(after?.scope).toBe("team");
+    expect(after?.teams.map((entry) => entry.id)).toEqual([team.id]);
+  });
+});
+
+describe("agent runtime and model tools", () => {
+  let mockContext: ArchestraContext;
+  let organizationId: string;
+  let previousAllowPrivileged: boolean;
+  let sandboxInstalled: MockInstance<() => boolean>;
+  let secretId: () => Promise<string>;
+
+  beforeEach(
+    async ({
+      makeAgent,
+      makeUser,
+      makeOrganization,
+      makeMember,
+      makeSecret,
+    }) => {
+      secretId = async () =>
+        (await makeSecret({ secret: { apiKey: "test-key" } })).id;
+      const org = await makeOrganization();
+      organizationId = org.id;
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const caller = await makeAgent({ organizationId: org.id });
+      mockContext = {
+        agent: { id: caller.id, name: caller.name },
+        userId: user.id,
+        organizationId: org.id,
+      };
+      previousAllowPrivileged = config.agentRuntime.allowPrivileged;
+      sandboxInstalled = vi
+        .spyOn(agentSandboxApi, "isInstalled", "get")
+        .mockReturnValue(true);
+    },
+  );
+
+  afterEach(() => {
+    config.agentRuntime.allowPrivileged = previousAllowPrivileged;
+    sandboxInstalled.mockRestore();
+  });
+
+  const call = (
+    shortName: ArchestraToolShortName,
+    args: Record<string, unknown>,
+  ) =>
+    executeArchestraTool(
+      archestraMcpBranding.getToolName(shortName),
+      args,
+      mockContext,
+    );
+  const findCreated = async (
+    result: Awaited<ReturnType<typeof executeArchestraTool>>,
+  ) => AgentModel.findById(extractCreatedId(result), mockContext.userId, true);
+
+  async function linkModel(params: {
+    keyId: string;
+    provider: "anthropic" | "gemini";
+    modelId: string;
+  }) {
+    const model = await ModelModel.create({
+      externalId: `${params.provider}/${params.modelId}`,
+      provider: params.provider,
+      modelId: params.modelId,
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      supportsToolCalling: true,
+      lastSyncedAt: new Date(),
+    });
+    await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(params.keyId, [
+      model.id,
+    ]);
+    return model;
+  }
+
+  test("MCP templates and runtime edits require Configure runtime while ordinary edits work", async ({
+    makeUser,
+    makeMember,
+    makeCustomRole,
+    makeAgent,
+  }) => {
+    const user = await makeUser();
+    const role = await makeCustomRole(organizationId, {
+      permission: { agent: ["read", "create"] },
+    });
+    await makeMember(user.id, organizationId, { role: role.role });
+    mockContext.userId = user.id;
+    const refused = await call(TOOL_CREATE_AGENT_SHORT_NAME, {
+      name: "Template worker",
+      runtime: { template: "codex" },
+    });
+    expect(refused.isError).toBe(true);
+    expect(JSON.stringify(refused)).toContain("Configure runtime permission");
+    const runtime = buildCustomAgentRuntime({
+      image: "example.test/worker:v1",
+    });
+    const agent = await makeAgent({
+      organizationId,
+      authorId: user.id,
+      agentType: "agent",
+      runtime,
+    });
+    const edited = await call(TOOL_EDIT_AGENT_SHORT_NAME, {
+      id: agent.id,
+      name: "Renamed worker",
+    });
+    expect(edited.isError).not.toBe(true);
+    expect((await AgentModel.findById(agent.id))?.runtime).toEqual(runtime);
+    for (const next of [null, { image: "example.test/worker:v2" }]) {
+      const denied = await call(TOOL_EDIT_AGENT_SHORT_NAME, {
+        id: agent.id,
+        runtime: next,
+      });
+      expect(denied.isError).toBe(true);
+      expect(JSON.stringify(denied)).toContain("Configure runtime permission");
+    }
+    expect((await AgentModel.findById(agent.id))?.runtime).toEqual(runtime);
+  });
+
+  test("create_agent builds a Claude Code agent the way the catalog card does", async () => {
+    const result = await call(TOOL_CREATE_AGENT_SHORT_NAME, {
+      name: "Claude Code",
+      runtime: { template: "claude-code" },
+    });
+
+    expect(result.isError).toBe(false);
+    expect((result.content[0] as any).text).toContain("Runtime: Claude Code");
+    const created = await findCreated(result);
+    expect(created?.runtime).toEqual(
+      buildAgentCatalogRuntime({
+        id: "claude-code",
+        image: config.agentRuntime.catalogImages["claude-code"],
+      }),
+    );
+    expect(created?.accessAllTools).toBe(true);
+    expect(created?.systemPrompt).toContain("You are Claude Code");
+  });
+
+  test("create_agent applies runtime overrides on top of a template", async ({
+    makeLlmProviderApiKey,
+  }) => {
+    const key = await makeLlmProviderApiKey(organizationId, await secretId(), {
+      provider: "anthropic",
+      access: "org",
+    });
+    const model = await linkModel({
+      keyId: key.id,
+      provider: "anthropic",
+      modelId: "claude-provider-billing-test",
+    });
+    const result = await call(TOOL_CREATE_AGENT_SHORT_NAME, {
+      name: "Provider-billed Claude Code",
+      systemPrompt: "Own prompt",
+      accessAllTools: false,
+      llmApiKeyId: key.id,
+      modelId: model.id,
+      runtime: {
+        template: "claude-code",
+        claudeCode: { authentication: "provider" },
+        ttlHours: 4,
+        credentials: [
+          {
+            key: "GITHUB_TOKEN",
+            scope: "per_user",
+            label: "GitHub token",
+            required: true,
+          },
+        ],
+      },
+    });
+
+    expect(result.isError).toBe(false);
+    const created = await findCreated(result);
+    expect(created?.runtime).toMatchObject({
+      command: ["archestra-claude-code"],
+      inferenceProtocol: "anthropic",
+      claudeCode: { authentication: "provider" },
+      ttlHours: 4,
+      credentials: [expect.objectContaining({ key: "GITHUB_TOKEN" })],
+    });
+    expect(created?.systemPrompt).toBe("Own prompt");
+    expect(created?.accessAllTools).toBe(false);
+  });
+
+  test("create_agent refuses to read a saved credential the caller cannot use", async ({
+    makeUser,
+    makeMember,
+    makeCustomRole,
+  }) => {
+    const define = (key: string, initialGrants?: []) =>
+      createRuntimeCredentialDefinition({
+        organizationId,
+        userId: mockContext.userId as string,
+        definition: {
+          key,
+          name: key === "shared" ? "Shared key" : "Restricted key",
+          kind: "secret",
+          description: "",
+          icon: null,
+          allowPersonal: false,
+          allowOrganization: true,
+        },
+        initialGrants,
+      });
+    // Shared with the organization, as a new credential is by default.
+    await define("shared");
+    // Kept to admins: its value would reach every run of the new Agent.
+    await define("restricted", []);
+    const member = await makeUser();
+    const runtimeRole = await makeCustomRole(organizationId, {
+      permission: { agent: ["configure-runtime"] },
+    });
+    await makeMember(member.id, organizationId, {
+      role: `member,${runtimeRole.role}`,
+    });
+    mockContext = { ...mockContext, userId: member.id };
+    const create = (credentialId: string) =>
+      call(TOOL_CREATE_AGENT_SHORT_NAME, {
+        name: `Reads ${credentialId}`,
+        runtime: {
+          template: "claude-code",
+          credentials: [
+            {
+              key: "GITHUB_TOKEN",
+              credentialId,
+              scope: "shared",
+              label: "GitHub token",
+              required: true,
+            },
+          ],
+        },
+      });
+
+    const refused = await create("restricted");
+    expect(refused.isError).toBe(true);
+    expect((refused.content[0] as any).text).toContain(
+      `You don't have access to the "Restricted key" credential, so you can't attach it.`,
+    );
+    const allowed = await create("shared");
+    expect(allowed.isError, (allowed.content[0] as any).text).toBe(false);
+  });
+
+  test("create_agent fills a custom image's runtime with the page defaults", async () => {
+    const result = await call(TOOL_CREATE_AGENT_SHORT_NAME, {
+      name: "Custom runtime",
+      runtime: {
+        image: "example.test/agent:1",
+        inferenceProtocol: "openai_chat",
+      },
+    });
+
+    expect(result.isError).toBe(false);
+    expect((await findCreated(result))?.runtime).toEqual({
+      ...buildCustomAgentRuntime({ image: "example.test/agent:1" }),
+      inferenceProtocol: "openai_chat",
+    });
+  });
+
+  test("create_agent refuses a runtime the REST route would refuse", async ({
+    makeLlmProviderApiKey,
+  }) => {
+    const before = await AgentModel.findAllPaginated(
+      { limit: 100, offset: 0 },
+      undefined,
+      { organizationId, agentType: "agent" },
+      mockContext.userId,
+      true,
+    );
+    const key = await makeLlmProviderApiKey(organizationId, await secretId(), {
+      provider: "gemini",
+      access: "org",
+    });
+    const model = await linkModel({
+      keyId: key.id,
+      provider: "gemini",
+      modelId: "runtime-tool-test",
+    });
+
+    const incompatible = await call(TOOL_CREATE_AGENT_SHORT_NAME, {
+      name: "Codex on Gemini",
+      runtime: { template: "codex" },
+      llmApiKeyId: key.id,
+      modelId: model.id,
+    });
+    expect(incompatible.isError).toBe(true);
+    expect((incompatible.content[0] as any).text).toContain(
+      "Codex runtime requires an OpenAI",
+    );
+
+    config.agentRuntime.allowPrivileged = false;
+    const privileged = await call(TOOL_CREATE_AGENT_SHORT_NAME, {
+      name: "Privileged",
+      runtime: { template: "codex", privileged: true },
+    });
+    expect((privileged.content[0] as any).text).toContain(
+      "disabled by the deployment operator",
+    );
+
+    const wrongTemplateSettings = await call(TOOL_CREATE_AGENT_SHORT_NAME, {
+      name: "Codex with Claude settings",
+      runtime: {
+        template: "codex",
+        claudeCode: { authentication: "provider" },
+      },
+    });
+    expect((wrongTemplateSettings.content[0] as any).text).toContain(
+      "only to the claude-code template",
+    );
+
+    sandboxInstalled.mockReturnValue(false);
+    const disabled = await call(TOOL_CREATE_AGENT_SHORT_NAME, {
+      name: "Runtime off",
+      runtime: { template: "claude-code" },
+    });
+    expect((disabled.content[0] as any).text).toContain(
+      "Agent Sandbox controller installed",
+    );
+
+    const after = await AgentModel.findAllPaginated(
+      { limit: 100, offset: 0 },
+      undefined,
+      { organizationId, agentType: "agent" },
+      mockContext.userId,
+      true,
+    );
+    expect(after.data.length).toBe(before.data.length);
+  });
+
+  test("create_agent refuses a template the organization turned off", async () => {
+    await OrganizationModel.patch(organizationId, {
+      popularAgentOverrides: { codex: { hidden: true } },
+    });
+
+    const result = await call(TOOL_CREATE_AGENT_SHORT_NAME, {
+      name: "Hidden Codex",
+      runtime: { template: "codex" },
+    });
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain(
+      "Codex template is turned off",
+    );
+  });
+
+  test("create_agent pins a model the caller can use and refuses one they cannot", async ({
+    makeLlmProviderApiKey,
+    makeUser,
+  }) => {
+    const key = await makeLlmProviderApiKey(organizationId, await secretId(), {
+      provider: "anthropic",
+      access: "org",
+    });
+    const model = await linkModel({
+      keyId: key.id,
+      provider: "anthropic",
+      modelId: "claude-tool-test",
+    });
+
+    const created = await call(TOOL_CREATE_AGENT_SHORT_NAME, {
+      name: "Pinned model",
+      llmApiKeyId: key.id,
+      modelId: model.id,
+    });
+    expect(created.isError).toBe(false);
+    expect(await findCreated(created)).toMatchObject({
+      llmApiKeyId: key.id,
+      modelId: model.id,
+    });
+
+    const halfPair = await call(TOOL_CREATE_AGENT_SHORT_NAME, {
+      name: "Half pair",
+      modelId: model.id,
+    });
+    expect((halfPair.content[0] as any).text).toContain("must be set together");
+
+    const stranger = await makeUser();
+    const privateKey = await makeLlmProviderApiKey(
+      organizationId,
+      await secretId(),
+      {
+        userId: stranger.id,
+        provider: "anthropic",
+      },
+    );
+    const unavailable = await call(TOOL_CREATE_AGENT_SHORT_NAME, {
+      name: "Someone else's key",
+      llmApiKeyId: privateKey.id,
+      modelId: model.id,
+    });
+    expect((unavailable.content[0] as any).text).toContain(
+      "must be linked and available to you",
+    );
+  });
+
+  test("edit_agent turns a chat agent into a runtime agent and back", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      agentType: "agent",
+      authorId: mockContext.userId,
+    });
+
+    const toRuntime = await call(TOOL_EDIT_AGENT_SHORT_NAME, {
+      id: agent.id,
+      runtime: { template: "opencode" },
+    });
+    expect(toRuntime.isError).toBe(false);
+    expect((toRuntime.content[0] as any).text).toContain("Runtime: OpenCode");
+    expect((await AgentModel.findById(agent.id))?.runtime).toMatchObject({
+      command: ["archestra-opencode"],
+    });
+
+    const toChat = await call(TOOL_EDIT_AGENT_SHORT_NAME, {
+      id: agent.id,
+      runtime: null,
+    });
+    expect(toChat.isError).toBe(false);
+    expect((await AgentModel.findById(agent.id))?.runtime).toBeNull();
+  });
+
+  test("edit_agent checks a runtime change against the agent's stored model", async ({
+    makeAgent,
+    makeLlmProviderApiKey,
+  }) => {
+    const key = await makeLlmProviderApiKey(organizationId, await secretId(), {
+      provider: "gemini",
+      access: "org",
+    });
+    const model = await linkModel({
+      keyId: key.id,
+      provider: "gemini",
+      modelId: "runtime-edit-test",
+    });
+    const agent = await makeAgent({
+      organizationId,
+      agentType: "agent",
+      authorId: mockContext.userId,
+      llmApiKeyId: key.id,
+      modelId: model.id,
+    });
+
+    const result = await call(TOOL_EDIT_AGENT_SHORT_NAME, {
+      id: agent.id,
+      runtime: { template: "codex" },
+    });
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain(
+      "Codex runtime requires an OpenAI",
+    );
+    expect((await AgentModel.findById(agent.id))?.runtime).toBeNull();
+  });
+
+  test("edit_agent moves the image of an agent whose key the caller cannot use", async ({
+    makeAgent,
+    makeLlmProviderApiKey,
+    makeUser,
+  }) => {
+    const stranger = await makeUser();
+    const privateKey = await makeLlmProviderApiKey(
+      organizationId,
+      await secretId(),
+      { provider: "anthropic", userId: stranger.id },
+    );
+    const model = await linkModel({
+      keyId: privateKey.id,
+      provider: "anthropic",
+      modelId: "runtime-only-edit-test",
+    });
+    const agent = await makeAgent({
+      organizationId,
+      agentType: "agent",
+      authorId: mockContext.userId,
+      llmApiKeyId: privateKey.id,
+      modelId: model.id,
+      runtime: {
+        ...buildCustomAgentRuntime({ image: "example.test/agent:1" }),
+        inferenceProtocol: "anthropic",
+      },
+    });
+
+    // Only the runtime changes: the agent keeps its pair, and the new runtime
+    // is checked against that pair, as the agent's runs use it.
+    const moved = await call(TOOL_EDIT_AGENT_SHORT_NAME, {
+      id: agent.id,
+      runtime: {
+        image: "example.test/agent:2",
+        inferenceProtocol: "anthropic",
+      },
+    });
+    expect(moved.isError, JSON.stringify(moved.content)).toBe(false);
+    expect(await AgentModel.findById(agent.id)).toMatchObject({
+      llmApiKeyId: privateKey.id,
+      modelId: model.id,
+      runtime: { image: "example.test/agent:2" },
+    });
+
+    const incompatible = await call(TOOL_EDIT_AGENT_SHORT_NAME, {
+      id: agent.id,
+      runtime: { template: "codex" },
+    });
+    expect(incompatible.isError).toBe(true);
+    expect((incompatible.content[0] as any).text).toContain(
+      "Codex runtime requires an OpenAI",
+    );
+
+    // Naming the pair is choosing it, and the caller cannot use that key.
+    const reselected = await call(TOOL_EDIT_AGENT_SHORT_NAME, {
+      id: agent.id,
+      runtime: {
+        image: "example.test/agent:3",
+        inferenceProtocol: "anthropic",
+      },
+      llmApiKeyId: privateKey.id,
+      modelId: model.id,
+    });
+    expect(reselected.isError).toBe(true);
+    expect((reselected.content[0] as any).text).toContain(
+      "must be linked and available to you",
+    );
+    expect((await AgentModel.findById(agent.id))?.runtime).toMatchObject({
+      image: "example.test/agent:2",
+    });
+  });
+
+  test("get_agent returns the runtime and pinned model", async ({
+    makeAgent,
+  }) => {
+    const runtime = buildCustomAgentRuntime({ image: "example.test/agent:2" });
+    const agent = await makeAgent({
+      organizationId,
+      agentType: "agent",
+      authorId: mockContext.userId,
+      runtime,
+    });
+
+    const result = await call(TOOL_GET_AGENT_SHORT_NAME, { id: agent.id });
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      runtime,
+      llmApiKeyId: null,
+      modelId: null,
+    });
+  });
+
+  test("list_llm_models lists the caller's keys with their linked models", async ({
+    makeLlmProviderApiKey,
+    makeUser,
+  }) => {
+    const key = await makeLlmProviderApiKey(organizationId, await secretId(), {
+      provider: "anthropic",
+      access: "org",
+    });
+    const model = await linkModel({
+      keyId: key.id,
+      provider: "anthropic",
+      modelId: "claude-list-test",
+    });
+    const stranger = await makeUser();
+    const privateKey = await makeLlmProviderApiKey(
+      organizationId,
+      await secretId(),
+      {
+        userId: stranger.id,
+        provider: "anthropic",
+      },
+    );
+
+    const result = await call(TOOL_LIST_LLM_MODELS_SHORT_NAME, {});
+    expect(result.isError).toBe(false);
+    const apiKeys = (result.structuredContent as any).apiKeys;
+    expect(apiKeys).toContainEqual({
+      id: key.id,
+      name: key.name,
+      provider: "anthropic",
+      models: [{ id: model.id, name: "claude-list-test" }],
+      omittedModelCount: 0,
+    });
+    expect(apiKeys.map((k: { id: string }) => k.id)).not.toContain(
+      privateKey.id,
+    );
+
+    const filtered = await call(TOOL_LIST_LLM_MODELS_SHORT_NAME, {
+      query: "no-such-model",
+    });
+    expect(
+      (filtered.structuredContent as any).apiKeys.find(
+        (k: { id: string }) => k.id === key.id,
+      ).models,
+    ).toEqual([]);
+  });
+
+  test("create_agent, edit_agent, and get_agent configure and return subagentLoadBalancing", async () => {
+    const created = await call(TOOL_CREATE_AGENT_SHORT_NAME, {
+      name: "Code Review Router",
+      subagentLoadBalancing: {
+        enabled: true,
+        algorithm: "round_robin",
+        retries: 1,
+        fallbackEnabled: true,
+      },
+    });
+    expect(created.isError).toBe(false);
+    const agentId = extractCreatedId(created);
+
+    const fetched = await call(TOOL_GET_AGENT_SHORT_NAME, { id: agentId });
+    expect(fetched.isError).toBe(false);
+    expect((fetched.structuredContent as any).subagentLoadBalancing).toEqual({
+      enabled: true,
+      algorithm: "round_robin",
+      retries: 1,
+      fallbackEnabled: true,
+    });
+
+    const edited = await call(TOOL_EDIT_AGENT_SHORT_NAME, {
+      id: agentId,
+      subagentLoadBalancing: {
+        enabled: true,
+        algorithm: "random",
+        retries: 2,
+        fallbackEnabled: false,
+      },
+    });
+    expect(edited.isError).toBe(false);
+
+    const refetched = await call(TOOL_GET_AGENT_SHORT_NAME, { id: agentId });
+    expect(refetched.isError).toBe(false);
+    expect((refetched.structuredContent as any).subagentLoadBalancing).toEqual({
+      enabled: true,
+      algorithm: "random",
+      retries: 2,
+      fallbackEnabled: false,
+    });
   });
 });
 

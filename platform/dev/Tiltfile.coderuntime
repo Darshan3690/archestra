@@ -1,0 +1,40 @@
+# code execution runtime — the Dagger Engine that backs the sandbox tools
+# (archestra__run_command / upload_file / download_file).
+#
+# The engine is NOT deployed here. The backend provisions a Dagger Engine per
+# organization (and per environment) in code via the Kubernetes API and reaches
+# it over the kube-pod:// transport (kubectl exec), the same machinery it uses
+# for MCP server pods. This file only builds the native addon the backend loads.
+# The root Tiltfile loads it when ARCHESTRA_CODE_RUNTIME_ENABLED=true.
+#
+# Because the dev backend runs on the host rather than in a pod, it reaches the
+# cluster through a kubeconfig file (ARCHESTRA_ORCHESTRATOR_KUBECONFIG), not the
+# in-pod service account, and it needs small engine resources
+# (ARCHESTRA_DAGGER_RUNTIME_ENGINE_* — a default colima VM can't fit the 8Gi/50Gi
+# production defaults); run-backend-dev.sh sets these when they're unset. Setting
+# an explicit ARCHESTRA_CODE_RUNTIME_DAGGER_RUNNER_HOST still points the backend
+# at a pre-existing engine instead (the bring-your-own escape hatch).
+
+# Rebuild the native skill-sandbox addon (napi) when its Rust sources change.
+# Tilt has no other knowledge of the cargo build, and the compiled .node is
+# gitignored — without this the backend silently loads a stale (or missing)
+# binary. The backend depends on this resource (Tiltfile.dev), and because Node
+# caches the loaded .node, a rebuild restarts the backend so the fresh binary
+# is picked up. Only runs under the code runtime, the addon's sole consumer.
+local_resource(
+  'sandbox-rs-build',
+  # build:dev = the release-fast profile (no LTO, incremental) for fast in-loop
+  # rebuilds; CI/Docker still build the optimized --release binary. The
+  # prebuilt install runs first, as for app-runtime-rs-build (Tiltfile.dev).
+  cmd='node ../scripts/napi-prebuilt.mjs sandbox-rs || pnpm --filter @archestra/sandbox-rs build:dev',
+  deps=[
+    '../archestra-rs/sandbox-rs/src',
+    '../archestra-rs/sandbox-core/src',
+    '../archestra-rs/sandbox-rs/Cargo.toml',
+    '../archestra-rs/sandbox-core/Cargo.toml',
+    '../archestra-rs/Cargo.toml',
+    '../archestra-rs/Cargo.lock',
+  ],
+  resource_deps=['pnpm-install'],
+  labels=['code-runtime'],
+)

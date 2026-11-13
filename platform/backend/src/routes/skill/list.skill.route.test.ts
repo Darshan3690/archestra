@@ -1,0 +1,997 @@
+import { ADMIN_ROLE_NAME, MEMBER_ROLE_NAME } from "@archestra/shared";
+import { makeSignature } from "better-auth/crypto";
+import { authPlugin } from "@/auth/fastify-plugin";
+import { createFastifyInstance } from "@/fastify-instance";
+import {
+  AgentExcludedSkillModel,
+  AgentModel,
+  EnvironmentModel,
+  SkillModel,
+  TeamModel,
+} from "@/models";
+import MemberModel from "@/models/member";
+import { agentActivationSkillPolicyService } from "@/services/agent-activation-skill-policy";
+import { describe, expect, type TestAccess, test } from "@/test";
+import { drainBackgroundWork } from "@/utils/background-work";
+import skillRoutes from "./skill.routes";
+import {
+  MANIFEST,
+  manifestNamed,
+  seedImportedSkill,
+  useSkillRouteTestApp,
+} from "./skill.test-helpers";
+
+/** Publishes a skill created through the route to the whole organization. */
+const PUBLISH_TO_ORGANIZATION = [
+  {
+    subject: { type: "organization" as const, id: "*" as const },
+    actions: ["read" as const, "use" as const],
+  },
+];
+
+describe("GET /api/skills", () => {
+  const ctx = useSkillRouteTestApp(skillRoutes);
+
+  test("compact lists omit manifest bodies while preserving visibility and counts", async ({
+    makeMember,
+    makeUser,
+  }) => {
+    await makeMember(ctx.user.id, ctx.organizationId, {
+      role: MEMBER_ROLE_NAME,
+    });
+    const visible = await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "visible-manifest",
+      sourceRef: "example/skills@main:skills/visible",
+      access: "org",
+    });
+    const owner = await makeUser();
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      authorId: owner.id,
+      name: "private-manifest",
+      sourceRef: "example/skills@main:skills/private",
+      access: "personal",
+    });
+    const full = await ctx.app.inject({ method: "GET", url: "/api/skills" });
+    const compact = await ctx.app.inject({
+      method: "GET",
+      url: "/api/skills?includeContent=false",
+    });
+    expect(full.statusCode, full.body).toBe(200);
+    expect(compact.statusCode, compact.body).toBe(200);
+    expect(full.json().data).toHaveLength(1);
+    expect(full.json().data[0]).toMatchObject({
+      id: visible.id,
+      content: "# visible-manifest",
+    });
+    expect(compact.json()).toEqual({
+      ...full.json(),
+      data: full
+        .json()
+        .data.map((skill: { content: string }) => ({ ...skill, content: "" })),
+    });
+    const explicit = await ctx.app.inject({
+      method: "GET",
+      url: "/api/skills?includeContent=true",
+    });
+    expect(explicit.json()).toEqual(full.json());
+  });
+
+  test("skillIds filters exact accessible rows before pagination and counting", async ({
+    makeMember,
+    makeOrganization,
+    makeUser,
+  }) => {
+    await makeMember(ctx.user.id, ctx.organizationId, {
+      role: MEMBER_ROLE_NAME,
+    });
+    const imported = await Promise.all(
+      ["import-first", "import-second", "older-same-repo"].map((name) =>
+        seedImportedSkill({
+          organizationId: ctx.organizationId,
+          name,
+          sourceRef: `example/skills@main:skills/${name}`,
+          access: "org",
+        }),
+      ),
+    );
+    const otherOrg = await makeOrganization();
+    const foreign = await seedImportedSkill({
+      organizationId: otherOrg.id,
+      name: "foreign",
+      sourceRef: "example/skills@main:skills/foreign",
+      access: "org",
+    });
+    const owner = await makeUser();
+    const privateSkill = await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      authorId: owner.id,
+      name: "other-personal",
+      sourceRef: "example/skills@main:skills/private",
+      access: "personal",
+    });
+    const skillIds = [
+      imported[0].id,
+      imported[1].id,
+      foreign.id,
+      privateSkill.id,
+    ];
+    const params = new URLSearchParams({
+      skillIds: skillIds.join(","),
+      limit: "1",
+      sortBy: "name",
+      sortDirection: "asc",
+    });
+    const first = await ctx.app.inject({
+      method: "GET",
+      url: `/api/skills?${params}`,
+    });
+    expect(first.statusCode, first.body).toBe(200);
+    expect(first.json().data.map((skill: { id: string }) => skill.id)).toEqual([
+      imported[0].id,
+    ]);
+    expect(first.json().pagination).toMatchObject({
+      total: 2,
+      totalPages: 2,
+      hasNext: true,
+    });
+    params.set("offset", "1");
+    const second = await ctx.app.inject({
+      method: "GET",
+      url: `/api/skills?${params}`,
+    });
+    expect(second.json().data.map((skill: { id: string }) => skill.id)).toEqual(
+      [imported[1].id],
+    );
+    const cleared = await ctx.app.inject({ method: "GET", url: "/api/skills" });
+    expect(
+      cleared
+        .json()
+        .data.map((skill: { id: string }) => skill.id)
+        .sort(),
+    ).toEqual(imported.map((skill) => skill.id).sort());
+    const empty = await ctx.app.inject({
+      method: "GET",
+      url: `/api/skills?skillIds=${foreign.id}`,
+    });
+    expect(empty.json().data).toEqual([]);
+    expect(empty.json().pagination.total).toBe(0);
+    const malformed = await ctx.app.inject({
+      method: "GET",
+      url: "/api/skills?skillIds=not-an-id",
+    });
+    expect(malformed.statusCode).toBe(400);
+  });
+
+  test("forAgentId restricts the list to the agent's environment", async ({
+    makeAgent,
+    makeMember,
+  }) => {
+    await makeMember(ctx.user.id, ctx.organizationId, {
+      role: ADMIN_ROLE_NAME,
+    });
+    const staging = await EnvironmentModel.create({
+      organizationId: ctx.organizationId,
+      name: "Staging",
+    });
+    const production = await EnvironmentModel.create({
+      organizationId: ctx.organizationId,
+      name: "Production",
+    });
+    const stagingAgent = await makeAgent({
+      name: "Env Agent",
+      organizationId: ctx.organizationId,
+      environmentId: staging.id,
+      agentType: "agent",
+    });
+    const defaultAgent = await makeAgent({
+      name: "Default Agent",
+      organizationId: ctx.organizationId,
+      agentType: "agent",
+    });
+
+    // no environments = available to agents in every environment
+    await ctx.app.inject({
+      method: "POST",
+      url: "/api/skills",
+      payload: { content: manifestNamed("everywhere-skill") },
+    });
+    await ctx.app.inject({
+      method: "POST",
+      url: "/api/skills",
+      payload: {
+        content: manifestNamed("staging-skill"),
+        environmentIds: [staging.id],
+      },
+    });
+    // a skill can be assigned to more than one environment
+    await ctx.app.inject({
+      method: "POST",
+      url: "/api/skills",
+      payload: {
+        content: manifestNamed("staging-and-prod-skill"),
+        environmentIds: [staging.id, production.id],
+      },
+    });
+    await ctx.app.inject({
+      method: "POST",
+      url: "/api/skills",
+      payload: {
+        content: manifestNamed("prod-only-skill"),
+        environmentIds: [production.id],
+      },
+    });
+
+    const stagingList = await ctx.app.inject({
+      method: "GET",
+      url: `/api/skills?forAgentId=${stagingAgent.id}`,
+    });
+    expect(stagingList.statusCode).toBe(200);
+    expect(
+      stagingList
+        .json()
+        .data.map((s: { name: string }) => s.name)
+        .sort(),
+    ).toEqual(["everywhere-skill", "staging-and-prod-skill", "staging-skill"]);
+
+    // a Default-environment agent sees only unassigned skills
+    const dflt = await ctx.app.inject({
+      method: "GET",
+      url: `/api/skills?forAgentId=${defaultAgent.id}`,
+    });
+    expect(dflt.json().data.map((s: { name: string }) => s.name)).toEqual([
+      "everywhere-skill",
+    ]);
+
+    // without the filter, the management surface lists every environment
+    const all = await ctx.app.inject({ method: "GET", url: "/api/skills" });
+    expect(all.json().data).toHaveLength(4);
+  });
+
+  test("forAgentId applies the agent's Manual skill allowlist", async ({
+    makeAgent,
+    makeMember,
+  }) => {
+    await makeMember(ctx.user.id, ctx.organizationId, {
+      role: ADMIN_ROLE_NAME,
+    });
+    const agent = await makeAgent({
+      name: "Manual Skill Agent",
+      organizationId: ctx.organizationId,
+      agentType: "agent",
+    });
+    const allowed = await ctx.app.inject({
+      method: "POST",
+      url: "/api/skills",
+      payload: { content: manifestNamed("allowed-skill") },
+    });
+    await ctx.app.inject({
+      method: "POST",
+      url: "/api/skills",
+      payload: { content: manifestNamed("blocked-skill") },
+    });
+
+    await agentActivationSkillPolicyService.initializePolicy({
+      agentId: agent.id,
+      organizationId: ctx.organizationId,
+      userId: ctx.user.id,
+      policy: {
+        mode: "manual",
+        allowedReferences: [{ source: "native", skillId: allowed.json().id }],
+        excludedReferences: [],
+      },
+    });
+
+    const response = await ctx.app.inject({
+      method: "GET",
+      url: `/api/skills?forAgentId=${agent.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(
+      response.json().data.map((skill: { name: string }) => skill.name),
+    ).toEqual(["allowed-skill"]);
+    expect(response.json().pagination.total).toBe(1);
+  });
+
+  test("forAgentId lists the effective Auto-mode skills published by a gateway", async ({
+    makeAgent,
+  }) => {
+    // The test app already made this user a member; editing the gateway's
+    // environment view takes the admin's organization-wide grants.
+    await MemberModel.updateRole(
+      ctx.user.id,
+      ctx.organizationId,
+      ADMIN_ROLE_NAME,
+    );
+    const gateway = await makeAgent({
+      name: "Skill Gateway",
+      organizationId: ctx.organizationId,
+      agentType: "mcp_gateway",
+    });
+    await AgentModel.setAccessAllSkills(gateway.id, true);
+
+    const published = await ctx.app.inject({
+      method: "POST",
+      url: "/api/skills",
+      payload: {
+        content: manifestNamed("published-skill"),
+        initialGrants: PUBLISH_TO_ORGANIZATION,
+      },
+    });
+    const excluded = await ctx.app.inject({
+      method: "POST",
+      url: "/api/skills",
+      payload: {
+        content: manifestNamed("excluded-skill"),
+        initialGrants: PUBLISH_TO_ORGANIZATION,
+      },
+    });
+    await ctx.app.inject({
+      method: "POST",
+      url: "/api/skills",
+      // An unpublished skill: only its author reaches it.
+      payload: { content: manifestNamed("team-skill") },
+    });
+    await AgentExcludedSkillModel.replaceExclusions({
+      agentId: gateway.id,
+      skillIds: [excluded.json().id],
+    });
+
+    const response = await ctx.app.inject({
+      method: "GET",
+      url: `/api/skills?forAgentId=${gateway.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().pagination.total).toBe(1);
+    expect(
+      response.json().data.map((skill: { id: string }) => skill.id),
+    ).toEqual([published.json().id]);
+
+    const eligible = await ctx.app.inject({
+      method: "GET",
+      url: `/api/skills?forAgentId=${gateway.id}&agentSkillView=eligible&mcpGatewayEnvironment=default`,
+    });
+    expect(eligible.statusCode).toBe(200);
+    expect(eligible.json().pagination.total).toBe(2);
+    expect(
+      eligible
+        .json()
+        .data.map((skill: { id: string }) => skill.id)
+        .sort(),
+    ).toEqual([excluded.json().id, published.json().id].sort());
+  });
+
+  test("previews All-mode skills for a draft gateway environment", async () => {
+    // The helper already made the caller a member; publishing to everyone
+    // takes Full access on every skill.
+    await MemberModel.updateRole(
+      ctx.user.id,
+      ctx.organizationId,
+      ADMIN_ROLE_NAME,
+    );
+    const staging = await EnvironmentModel.create({
+      organizationId: ctx.organizationId,
+      name: "Gateway staging",
+    });
+    const production = await EnvironmentModel.create({
+      organizationId: ctx.organizationId,
+      name: "Gateway production",
+    });
+    const everywhere = await ctx.app.inject({
+      method: "POST",
+      url: "/api/skills",
+      payload: {
+        content: manifestNamed("gateway-everywhere"),
+        initialGrants: PUBLISH_TO_ORGANIZATION,
+      },
+    });
+    const inStaging = await ctx.app.inject({
+      method: "POST",
+      url: "/api/skills",
+      payload: {
+        content: manifestNamed("gateway-staging"),
+        initialGrants: PUBLISH_TO_ORGANIZATION,
+        environmentIds: [staging.id],
+      },
+    });
+    await ctx.app.inject({
+      method: "POST",
+      url: "/api/skills",
+      payload: {
+        content: manifestNamed("gateway-production"),
+        initialGrants: PUBLISH_TO_ORGANIZATION,
+        environmentIds: [production.id],
+      },
+    });
+    await ctx.app.inject({
+      method: "POST",
+      url: "/api/skills",
+      payload: {
+        // An unpublished skill: only its author reaches it.
+        content: manifestNamed("gateway-team-skill"),
+      },
+    });
+
+    const response = await ctx.app.inject({
+      method: "GET",
+      url: `/api/skills?mcpGatewayEnvironment=${staging.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().pagination.total).toBe(2);
+    expect(
+      response
+        .json()
+        .data.map((skill: { id: string }) => skill.id)
+        .sort(),
+    ).toEqual([everywhere.json().id, inStaging.json().id].sort());
+  });
+
+  test("forAgentId does not disclose an unreadable agent's policy", async ({
+    makeAgent,
+    makeMember,
+    makeUser,
+  }) => {
+    await makeMember(ctx.user.id, ctx.organizationId, {
+      role: MEMBER_ROLE_NAME,
+    });
+    const otherAuthor = await makeUser();
+    const privateAgent = await makeAgent({
+      name: "Private Skill Agent",
+      organizationId: ctx.organizationId,
+      agentType: "agent",
+      access: "personal",
+      authorId: otherAuthor.id,
+    });
+
+    const response = await ctx.app.inject({
+      method: "GET",
+      url: `/api/skills?forAgentId=${privateAgent.id}`,
+    });
+
+    expect(response.statusCode).toBe(404);
+  });
+
+  test("lists skills with a file count that includes SKILL.md", async () => {
+    await ctx.app.inject({
+      method: "POST",
+      url: "/api/skills",
+      payload: {
+        content: MANIFEST,
+        files: [{ path: "references/FORMS.md", content: "# Forms" }],
+      },
+    });
+
+    const response = await ctx.app.inject({
+      method: "GET",
+      url: "/api/skills",
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.data).toHaveLength(1);
+    // one bundled resource (references/FORMS.md) plus the SKILL.md manifest.
+    expect(body.data[0].fileCount).toBe(2);
+  });
+
+  test("lists most-used skills first by default; sortBy overrides", async () => {
+    for (const name of ["alpha", "beta", "gamma"]) {
+      await ctx.app.inject({
+        method: "POST",
+        url: "/api/skills",
+        payload: { content: manifestNamed(name) },
+      });
+    }
+    const list = await ctx.app.inject({ method: "GET", url: "/api/skills" });
+    const beta = list
+      .json()
+      .data.find((s: { name: string }) => s.name === "beta");
+
+    SkillModel.recordUsage({ skillId: beta.id, userId: null });
+    SkillModel.recordUsage({ skillId: beta.id, userId: ctx.user.id });
+    SkillModel.recordUsage({ skillId: beta.id, userId: ctx.user.id });
+    await drainBackgroundWork();
+
+    const byUsage = await ctx.app.inject({
+      method: "GET",
+      url: "/api/skills",
+    });
+    const names = byUsage
+      .json()
+      .data.map((s: { name: string; usageCount: number }) => s.name);
+    expect(names[0]).toBe("beta");
+    expect(byUsage.json().data[0].usageCount).toBe(3);
+    // distinct attributed users; the null-user activation doesn't count one.
+    expect(byUsage.json().data[0].usageUserCount).toBe(1);
+    expect(byUsage.json().data[1].usageUserCount).toBe(0);
+
+    const byName = await ctx.app.inject({
+      method: "GET",
+      url: "/api/skills?sortBy=name&sortDirection=asc",
+    });
+    expect(byName.json().data.map((s: { name: string }) => s.name)).toEqual([
+      "alpha",
+      "beta",
+      "gamma",
+    ]);
+  });
+
+  test("scope and teamIds filter the list by visibility", async ({
+    makeTeam,
+    makeUser,
+  }) => {
+    await MemberModel.updateRole(
+      ctx.user.id,
+      ctx.organizationId,
+      ADMIN_ROLE_NAME,
+    );
+    const otherAuthor = await makeUser();
+    const teamA = await makeTeam(ctx.organizationId, ctx.user.id);
+    const teamB = await makeTeam(ctx.organizationId, ctx.user.id);
+
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "org-skill",
+      sourceRef: "shared/org@main:SKILL.md",
+      access: "org",
+    });
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "my-personal-skill",
+      sourceRef: "mine/personal@main:SKILL.md",
+      authorId: ctx.user.id,
+    });
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "team-a-skill",
+      sourceRef: "team/a@main:SKILL.md",
+      access: { teams: [teamA.id] },
+    });
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "team-b-skill",
+      sourceRef: "team/b@main:SKILL.md",
+      access: { teams: [teamB.id] },
+    });
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "other-personal-skill",
+      sourceRef: "other/personal@main:SKILL.md",
+      authorId: otherAuthor.id,
+    });
+
+    const listNames = async (query: string) => {
+      const response = await ctx.app.inject({
+        method: "GET",
+        url: `/api/skills${query}`,
+      });
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      const names = body.data.map((s: { name: string }) => s.name).sort();
+      expect(body.pagination.total).toBe(names.length);
+      return names;
+    };
+
+    expect(await listNames("?scope=org")).toEqual(["org-skill"]);
+    expect(await listNames("?scope=personal")).toEqual([
+      "my-personal-skill",
+      "other-personal-skill",
+    ]);
+    expect(await listNames("?scope=team")).toEqual([
+      "team-a-skill",
+      "team-b-skill",
+    ]);
+    expect(await listNames(`?scope=team&teamIds=${teamA.id}`)).toEqual([
+      "team-a-skill",
+    ]);
+  });
+
+  test("access filter splits rows by how the caller reaches them, ignoring wildcard grants", async ({
+    makeMember,
+    makeTeam,
+    makeTeamMember,
+    makeUser,
+  }) => {
+    await MemberModel.updateRole(
+      ctx.user.id,
+      ctx.organizationId,
+      ADMIN_ROLE_NAME,
+    );
+    const otherUser = await makeUser();
+    await makeMember(otherUser.id, ctx.organizationId, {
+      role: MEMBER_ROLE_NAME,
+    });
+    const myTeam = await makeTeam(ctx.organizationId, ctx.user.id);
+    await makeTeamMember(myTeam.id, ctx.user.id);
+    const otherTeam = await makeTeam(ctx.organizationId, otherUser.id);
+
+    const seed = (name: string, access?: TestAccess, authorId = otherUser.id) =>
+      seedImportedSkill({
+        organizationId: ctx.organizationId,
+        name,
+        sourceRef: `access/${name}@main:SKILL.md`,
+        authorId,
+        access,
+      });
+    await seed("mine", undefined, ctx.user.id);
+    await seed("other-personal");
+    await seed("org", "org");
+    await seed("my-team", { teams: [myTeam.id] });
+    await seed("other-team", { teams: [otherTeam.id] });
+    await seed("shared-with-me", { users: [ctx.user.id] });
+
+    const listNames = async (access?: string) => {
+      const response = await ctx.app.inject({
+        method: "GET",
+        url: `/api/skills${access ? `?access=${access}` : ""}`,
+      });
+      expect(response.statusCode, response.body).toBe(200);
+      const body = response.json();
+      const names = body.data.map((s: { name: string }) => s.name).sort();
+      expect(body.pagination.total).toBe(names.length);
+      return names;
+    };
+
+    // The admin reads every skill through a `*` grant, which the filter must
+    // not count as "shared".
+    expect(await listNames()).toEqual([
+      "mine",
+      "my-team",
+      "org",
+      "other-personal",
+      "other-team",
+      "shared-with-me",
+    ]);
+    expect(await listNames("mine,shared,org")).toEqual([
+      "mine",
+      "my-team",
+      "org",
+      "shared-with-me",
+    ]);
+    expect(await listNames("others")).toEqual(["other-personal", "other-team"]);
+    expect(await listNames("mine")).toEqual(["mine"]);
+    expect(await listNames("shared")).toEqual(["my-team", "shared-with-me"]);
+    expect(await listNames("org")).toEqual(["org"]);
+  });
+
+  test("author filters apply for admins and are ignored for non-admins", async ({
+    makeUser,
+  }) => {
+    const otherAuthor = await makeUser();
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "org-skill",
+      sourceRef: "shared/org@main:SKILL.md",
+      access: "org",
+    });
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "my-personal-skill",
+      sourceRef: "mine/personal@main:SKILL.md",
+      authorId: ctx.user.id,
+    });
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "other-personal-skill",
+      sourceRef: "other/personal@main:SKILL.md",
+      authorId: otherAuthor.id,
+    });
+    // Another author's skill shared by grant is not "personal": the
+    // exclude-other-personal filter keeps it, like a built-in with no author.
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "other-shared-skill",
+      sourceRef: "other/shared@main:SKILL.md",
+      authorId: otherAuthor.id,
+      access: { users: [otherAuthor.id, ctx.user.id], preset: "view" },
+    });
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "built-in-skill",
+      sourceRef: "builtin/skill@main:SKILL.md",
+    });
+
+    const listNames = async (query: string) => {
+      const response = await ctx.app.inject({
+        method: "GET",
+        url: `/api/skills${query}`,
+      });
+      expect(response.statusCode).toBe(200);
+      return response
+        .json()
+        .data.map((s: { name: string }) => s.name)
+        .sort();
+    };
+
+    await MemberModel.updateRole(
+      ctx.user.id,
+      ctx.organizationId,
+      ADMIN_ROLE_NAME,
+    );
+    expect(
+      await listNames(`?scope=personal&authorIds=${otherAuthor.id}`),
+    ).toEqual(["other-personal-skill", "other-shared-skill"]);
+    // authorless rows (e.g. built-ins) survive an exclude filter
+    expect(await listNames(`?excludeAuthorIds=${otherAuthor.id}`)).toEqual([
+      "built-in-skill",
+      "my-personal-skill",
+      "org-skill",
+    ]);
+    // Only another author's author-only skill is hidden.
+    expect(await listNames("?excludeOtherPersonalSkills=true")).toEqual([
+      "built-in-skill",
+      "my-personal-skill",
+      "org-skill",
+      "other-shared-skill",
+    ]);
+  });
+
+  test("non-admins cannot use author filters to see other users' personal skills", async ({
+    makeUser,
+  }) => {
+    await MemberModel.updateRole(
+      ctx.user.id,
+      ctx.organizationId,
+      MEMBER_ROLE_NAME,
+    );
+    const otherAuthor = await makeUser();
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "my-personal-skill",
+      sourceRef: "mine/personal@main:SKILL.md",
+      authorId: ctx.user.id,
+    });
+    await seedImportedSkill({
+      organizationId: ctx.organizationId,
+      name: "other-personal-skill",
+      sourceRef: "other/personal@main:SKILL.md",
+      authorId: otherAuthor.id,
+    });
+
+    const response = await ctx.app.inject({
+      method: "GET",
+      url: `/api/skills?scope=personal&authorIds=${otherAuthor.id}`,
+    });
+    expect(response.statusCode).toBe(200);
+    // the authorIds filter is dropped; scope access control still applies
+    expect(response.json().data.map((s: { name: string }) => s.name)).toEqual([
+      "my-personal-skill",
+    ]);
+  });
+
+  test("status=deleted returns only the trash for an admin and exposes deletedAt", async () => {
+    const active = (
+      await ctx.app.inject({
+        method: "POST",
+        url: "/api/skills",
+        payload: { content: manifestNamed("active-skill") },
+      })
+    ).json();
+    const trashed = (
+      await ctx.app.inject({
+        method: "POST",
+        url: "/api/skills",
+        payload: { content: manifestNamed("trashed-skill") },
+      })
+    ).json();
+    await ctx.app.inject({
+      method: "DELETE",
+      url: `/api/skills/${trashed.id}`,
+    });
+
+    await MemberModel.updateRole(
+      ctx.user.id,
+      ctx.organizationId,
+      ADMIN_ROLE_NAME,
+    );
+    const trash = await ctx.app.inject({
+      method: "GET",
+      url: "/api/skills?status=deleted",
+    });
+    expect(trash.statusCode).toBe(200);
+    const ids = trash.json().data.map((s: { id: string }) => s.id);
+    expect(ids).toEqual([trashed.id]);
+    // the trash view needs deletedAt to show when a skill was removed
+    expect(trash.json().data[0].deletedAt).toEqual(expect.any(String));
+
+    // the default (active) view still excludes the deleted skill
+    const activeList = await ctx.app.inject({
+      method: "GET",
+      url: "/api/skills",
+    });
+    const activeIds = activeList.json().data.map((s: { id: string }) => s.id);
+    expect(activeIds).toContain(active.id);
+    expect(activeIds).not.toContain(trashed.id);
+  });
+
+  test("members cannot view the deleted-skills trash", async () => {
+    await MemberModel.updateRole(
+      ctx.user.id,
+      ctx.organizationId,
+      MEMBER_ROLE_NAME,
+    );
+    const response = await ctx.app.inject({
+      method: "GET",
+      url: "/api/skills?status=deleted",
+    });
+    expect(response.statusCode).toBe(403);
+  });
+});
+
+describe("GET /api/skills?visibleTo over authenticated HTTP", () => {
+  test("matches the target's grants and filters without inheriting the administrator's access", async ({
+    makeAgent,
+    makeCustomRole,
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeSession,
+    makeTeam,
+    makeTeamMember,
+  }) => {
+    const org = await makeOrganization();
+    const admin = await makeUser();
+    const target = await makeUser();
+    const outsider = await makeUser();
+    const otherOrg = await makeOrganization();
+    await makeMember(admin.id, org.id, { role: ADMIN_ROLE_NAME });
+    await makeMember(target.id, org.id, { role: MEMBER_ROLE_NAME });
+    await makeMember(outsider.id, otherOrg.id);
+    const team = await makeTeam(org.id, admin.id);
+    await makeTeamMember(team.id, target.id);
+    const seed = (name: string, authorId: string, access: TestAccess) =>
+      seedImportedSkill({
+        organizationId: org.id,
+        name,
+        authorId,
+        access,
+        sourceRef: `example/skills@main:${name}`,
+      });
+    const personal = await seed("a-personal", target.id, "personal");
+    const shared = await seed("b-shared", admin.id, {
+      users: [target.id],
+      preset: "view",
+    });
+    const teamSkill = await seed("c-team", admin.id, {
+      teams: [team.id],
+      level: "use",
+    });
+    const orgSkill = await seed("d-organization", admin.id, "org");
+    const privateAdmin = await seed("e-private-admin", admin.id, "personal");
+    const cookieFor = async (userId: string) => {
+      const session = await makeSession(userId, {
+        activeOrganizationId: org.id,
+      });
+      const signature = await makeSignature(
+        session.token,
+        process.env.ARCHESTRA_AUTH_SECRET as string,
+      );
+      return `archestra.session_token=${encodeURIComponent(`${session.token}.${signature}`)}`;
+    };
+    const adminCookie = await cookieFor(admin.id);
+    const targetCookie = await cookieFor(target.id);
+    const app = createFastifyInstance();
+    await app.register(authPlugin);
+    await app.register(skillRoutes);
+    const url = await app.listen({ port: 0, host: "127.0.0.1" });
+    const read = async (query: string, cookie?: string) => {
+      const response = await fetch(`${url}/api/skills${query}`, {
+        headers: cookie ? { cookie } : {},
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    try {
+      const own = await read("?sortBy=name&sortDirection=asc", targetCookie);
+      const preview = await read(
+        `?visibleTo=${target.id}&sortBy=name&sortDirection=asc`,
+        adminCookie,
+      );
+      expect(own.status, JSON.stringify(own.body)).toBe(200);
+      expect(preview.status, JSON.stringify(preview.body)).toBe(200);
+      expect(preview.body).toEqual(own.body);
+      expect(
+        preview.body.data.map((skill: { id: string }) => skill.id),
+      ).toEqual([personal.id, shared.id, teamSkill.id, orgSkill.id]);
+      const adminList = await read("", adminCookie);
+      expect(
+        adminList.body.data.map((skill: { id: string }) => skill.id),
+      ).toContain(privateAdmin.id);
+      const filtered = await read(
+        `?visibleTo=${target.id}&search=shared&limit=1`,
+        adminCookie,
+      );
+      expect(
+        filtered.body.data.map((skill: { id: string }) => skill.id),
+      ).toEqual([shared.id]);
+      expect(filtered.body.pagination.total).toBe(1);
+      const page = await read(
+        `?visibleTo=${target.id}&sortBy=name&sortDirection=asc&limit=2&offset=2`,
+        adminCookie,
+      );
+      expect(page.body.data.map((skill: { id: string }) => skill.id)).toEqual([
+        teamSkill.id,
+        orgSkill.id,
+      ]);
+      expect(page.body.pagination.total).toBe(4);
+      const ownFilter = await read(
+        `?visibleTo=${target.id}&access=mine`,
+        adminCookie,
+      );
+      const ownFilterControl = await read("?access=mine", targetCookie);
+      expect(ownFilter.status).toBe(200);
+      expect(ownFilter.body).toEqual(ownFilterControl.body);
+      expect(
+        ownFilter.body.data.map((skill: { id: string }) => skill.id),
+      ).toEqual([personal.id]);
+      expect((await read(`?visibleTo=${target.id}`, targetCookie)).status).toBe(
+        403,
+      );
+      expect(
+        (await read(`?visibleTo=${outsider.id}`, adminCookie)).status,
+      ).toBe(404);
+      expect((await read("?visibleTo=unknown-user", adminCookie)).status).toBe(
+        404,
+      );
+      expect((await read(`?visibleTo=${target.id}`)).status).toBe(401);
+      const privateAgent = await makeAgent({
+        organizationId: org.id,
+        agentType: "agent",
+        authorId: admin.id,
+        access: "personal",
+      });
+      expect(
+        (
+          await read(
+            `?visibleTo=${target.id}&forAgentId=${privateAgent.id}`,
+            adminCookie,
+          )
+        ).status,
+      ).toBe(404);
+      const ownAgent = await makeAgent({
+        organizationId: org.id,
+        agentType: "agent",
+        authorId: target.id,
+        access: "personal",
+      });
+      const ownAgentPreview = await read(
+        `?visibleTo=${target.id}&forAgentId=${ownAgent.id}`,
+        adminCookie,
+      );
+      expect(ownAgentPreview.status).toBe(200);
+      expect(ownAgentPreview.body).toEqual(
+        (await read(`?forAgentId=${ownAgent.id}`, targetCookie)).body,
+      );
+      expect(
+        (await read(`?visibleTo=${target.id}&status=deleted`, adminCookie))
+          .status,
+      ).toBe(403);
+      const skillReader = await makeCustomRole(org.id, {
+        permission: { skill: ["read"] },
+      });
+      await MemberModel.updateRole(target.id, org.id, skillReader.role);
+      const gatewayPreview = await read(
+        `?visibleTo=${target.id}&mcpGatewayEnvironment=default`,
+        adminCookie,
+      );
+      expect(gatewayPreview.status).toBe(403);
+      expect(gatewayPreview.body).toEqual(
+        (await read("?mcpGatewayEnvironment=default", targetCookie)).body,
+      );
+      await MemberModel.updateRole(target.id, org.id, MEMBER_ROLE_NAME);
+      await TeamModel.removeMember(team.id, target.id);
+      const afterRevoke = await read(`?visibleTo=${target.id}`, adminCookie);
+      expect(
+        afterRevoke.body.data.map((skill: { id: string }) => skill.id),
+      ).not.toContain(teamSkill.id);
+      await MemberModel.deleteByMemberOrUserId(target.id, org.id);
+      expect((await read(`?visibleTo=${target.id}`, adminCookie)).status).toBe(
+        404,
+      );
+    } finally {
+      await app.close();
+    }
+  });
+});

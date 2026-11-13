@@ -1,0 +1,97 @@
+"use client";
+
+import { useState } from "react";
+import { ConversationArtifactPanel } from "@/components/chat/conversation-artifact";
+import { Button } from "@/components/ui/button";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
+import { cn } from "@/lib/utils/tailwind";
+
+/**
+ * The shared textarea editor shell: a controlled textarea with a count/limit
+ * footer and Cancel/Save. The counting policy stays with the caller (project
+ * instructions count characters; the file editor counts UTF-8 bytes), passed in
+ * as `count`/`max`, so this stays a pure presentational component. Save is
+ * disabled while saving or over the limit. Used by both the project-instructions
+ * editor and the Files-panel text editor so they behave identically.
+ */
+export function PlainTextEditor({
+  value,
+  onChange,
+  count,
+  max,
+  saving,
+  onSave,
+  onCancel,
+  placeholder,
+  markdown = false,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  count: number;
+  max: number;
+  saving: boolean;
+  onSave: () => void;
+  onCancel: () => void;
+  placeholder?: string;
+  markdown?: boolean;
+}) {
+  const overLimit = count > max;
+  const [mode, setMode] = useState("edit");
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-2 p-3">
+      {markdown && (
+        <Tabs value={mode} onValueChange={setMode}>
+          <TabsList>
+            <TabsTrigger value="edit">Edit</TabsTrigger>
+            <TabsTrigger value="preview">Preview</TabsTrigger>
+          </TabsList>
+        </Tabs>
+      )}
+      {markdown && mode === "preview" ? (
+        <div className="min-h-40 flex-1 overflow-auto rounded-md border">
+          <ConversationArtifactPanel
+            artifact={value}
+            isOpen
+            onToggle={() => {}}
+            embedded
+            hideHeader
+          />
+        </div>
+      ) : (
+        <Textarea
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+          aria-label={placeholder || "Text editor"}
+          className="min-h-40 flex-1 resize-none font-mono text-xs"
+          autoFocus
+        />
+      )}
+      <div className="flex items-center justify-between">
+        <span
+          className={cn(
+            "text-[11px]",
+            overLimit ? "text-destructive" : "text-muted-foreground",
+          )}
+        >
+          {count.toLocaleString()} / {max.toLocaleString()}
+        </span>
+        <div className="flex gap-2">
+          <Button
+            variant="ghost"
+            size="xs"
+            onClick={onCancel}
+            disabled={saving}
+          >
+            Cancel
+          </Button>
+          <Button size="xs" onClick={onSave} disabled={saving || overLimit}>
+            Save
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}

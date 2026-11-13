@@ -1,21 +1,29 @@
 "use client";
 
-import { EmojiPicker } from "@ferrucc-io/emoji-picker";
 import {
+  AppWindow,
   Bot,
+  Folder,
   ImageIcon,
   Layers,
   Network,
+  Puzzle,
   Route,
   Server,
   SmileIcon,
+  Sparkles,
   Upload,
   X,
 } from "lucide-react";
+import dynamic from "next/dynamic";
 import Image from "next/image";
 import { useCallback, useRef, useState } from "react";
 import { toast } from "sonner";
-import type { AgentIconVariant } from "@/components/agent-icon";
+import { AgentIcon, type AgentIconVariant } from "@/components/agent-icon";
+import {
+  isAgentImageIcon,
+  isBuiltInServiceIcon,
+} from "@/components/agent-icon.utils";
 import { Button } from "@/components/ui/button";
 import {
   Popover,
@@ -23,31 +31,52 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { cn } from "@/lib/utils";
+import { UnstyledButton } from "@/components/ui/unstyled-button";
+import { cn } from "@/lib/utils/tailwind";
 import { ServiceLogoPicker } from "./service-logo-picker";
 
+const AgentEmojiPicker = dynamic(
+  async () => {
+    const module = await import("./agent-emoji-picker");
+    return module.AgentEmojiPicker;
+  },
+  { loading: () => <div className="h-[336px] w-full" aria-hidden="true" /> },
+);
+
 const MAX_IMAGE_SIZE = 512 * 1024; // 512 KB
+
+/** Entities that open a form with an icon picker, and the glyph each falls back to. */
+export type AgentIconPickerFallback =
+  | AgentIconVariant
+  | "server"
+  | "project"
+  | "app"
+  | "skill"
+  | "plugin";
 
 interface AgentIconPickerProps {
   value: string | null;
   onChange: (icon: string | null) => void;
   className?: string;
+  /** Show the current icon without allowing it to be changed or removed. */
+  disabled?: boolean;
   /** Show a "Logos" tab with pre-built service brand logos */
   showLogos?: boolean;
-  fallbackType?: AgentIconVariant | "server";
+  fallbackType?: AgentIconPickerFallback;
 }
 
 export function AgentIconPicker({
   value,
   onChange,
   className,
+  disabled = false,
   showLogos = false,
   fallbackType = "agent",
 }: AgentIconPickerProps) {
   const [open, setOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const isImage = value?.startsWith("data:");
+  const isImage = isAgentImageIcon(value);
 
   const handleEmojiSelect = useCallback(
     (emoji: string) => {
@@ -110,15 +139,33 @@ export function AgentIconPicker({
         ? Route
         : fallbackType === "server"
           ? Server
-          : Bot;
+          : fallbackType === "project"
+            ? Folder
+            : fallbackType === "app"
+              ? AppWindow
+              : fallbackType === "skill"
+                ? Sparkles
+                : fallbackType === "plugin"
+                  ? Puzzle
+                  : Bot;
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover
+      open={disabled ? false : open}
+      onOpenChange={(next) => {
+        if (!disabled) setOpen(next);
+      }}
+    >
       <PopoverTrigger asChild>
-        <button
+        <UnstyledButton
           type="button"
+          aria-label={disabled ? "Icon" : value ? "Change icon" : "Choose icon"}
+          disabled={disabled}
           className={cn(
-            "relative group flex h-12 w-12 shrink-0 items-center justify-center rounded-lg border-2 border-dashed hover:border-primary/50 hover:bg-accent transition-colors cursor-pointer",
+            "relative group flex h-12 w-12 shrink-0 items-center justify-center rounded-lg border-2 border-dashed transition-colors",
+            disabled
+              ? "cursor-default opacity-80"
+              : "cursor-pointer hover:border-primary/50 hover:bg-accent",
             value && "border-solid border-border",
             className,
           )}
@@ -127,18 +174,20 @@ export function AgentIconPicker({
             isImage ? (
               <Image
                 src={value}
-                alt="Agent icon"
+                alt=""
                 width={32}
                 height={32}
                 className="rounded-md object-contain"
               />
+            ) : isBuiltInServiceIcon(value) ? (
+              <AgentIcon icon={value} size={28} />
             ) : (
               <span className="text-2xl leading-none">{value}</span>
             )
           ) : (
             <FallbackIcon className="h-5 w-5 text-muted-foreground" />
           )}
-          {value && (
+          {value && !disabled && (
             // biome-ignore lint/a11y/useSemanticElements: can't use <button> here as it's nested inside PopoverTrigger's <button>
             <div
               role="button"
@@ -152,10 +201,14 @@ export function AgentIconPicker({
               <X className="h-2.5 w-2.5" />
             </div>
           )}
-        </button>
+        </UnstyledButton>
       </PopoverTrigger>
-      <PopoverContent className="w-[352px] p-0" align="start" sideOffset={8}>
-        <Tabs defaultValue={defaultTab}>
+      <PopoverContent
+        className="w-[352px] overflow-hidden rounded-lg p-0"
+        align="start"
+        sideOffset={4}
+      >
+        <Tabs defaultValue={defaultTab} className="gap-0">
           <TabsList className="w-full rounded-none border-b bg-transparent p-0 h-auto">
             {showLogos && (
               <TabsTrigger
@@ -193,22 +246,11 @@ export function AgentIconPicker({
           )}
           <TabsContent
             value="emoji"
-            className="m-0"
+            className="m-0 w-full overflow-hidden rounded-none"
             onWheel={(e) => e.stopPropagation()}
             onTouchMove={(e) => e.stopPropagation()}
           >
-            <EmojiPicker
-              onEmojiSelect={handleEmojiSelect}
-              emojisPerRow={8}
-              emojiSize={32}
-            >
-              <EmojiPicker.Header>
-                <EmojiPicker.Input placeholder="Search emoji..." />
-              </EmojiPicker.Header>
-              <EmojiPicker.Group>
-                <EmojiPicker.List containerHeight={280} />
-              </EmojiPicker.Group>
-            </EmojiPicker>
+            {open && <AgentEmojiPicker onEmojiSelect={handleEmojiSelect} />}
           </TabsContent>
           <TabsContent value="upload" className="m-0 p-4">
             <div className="flex flex-col items-center gap-3 py-6">

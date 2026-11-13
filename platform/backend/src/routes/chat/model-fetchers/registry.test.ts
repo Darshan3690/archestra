@@ -1,43 +1,19 @@
-import type { GoogleGenAI } from "@google/genai";
-import { vi } from "vitest";
-import config from "@/config";
-import { beforeEach, describe, expect, test } from "@/test";
-import { fetchModelsForProvider, testProviderApiKey } from "./registry";
+import { beforeEach, describe, expect, test, vi } from "vitest";
+import { encodeXaiSubscriptionCredential } from "@/services/xai-subscription-credentials";
+import { testProviderApiKey } from "./registry";
 
 const mockFetch = vi.fn();
-global.fetch = mockFetch;
-
-vi.mock("@/clients/gemini-client", () => ({
-  createGoogleGenAIClient: vi.fn(),
-  isVertexAiEnabled: vi.fn(),
-}));
-
-vi.mock("@/clients/bedrock-credentials", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("@/clients/bedrock-credentials")>();
-  return {
-    ...actual,
-    isBedrockIamAuthEnabled: vi.fn(),
-  };
+// The shared test setup restores the real fetch after every test, so
+// re-apply the mock before each one.
+vi.stubGlobal("fetch", mockFetch);
+beforeEach(() => {
+  vi.stubGlobal("fetch", mockFetch);
 });
-
-import { isBedrockIamAuthEnabled } from "@/clients/bedrock-credentials";
-import {
-  createGoogleGenAIClient,
-  isVertexAiEnabled,
-} from "@/clients/gemini-client";
-import { PLACEHOLDER_BEARER_TOKEN } from "./types";
-
-const mockCreateGoogleGenAIClient = vi.mocked(createGoogleGenAIClient);
-const mockIsVertexAiEnabled = vi.mocked(isVertexAiEnabled);
-const mockIsBedrockIamAuthEnabled = vi.mocked(isBedrockIamAuthEnabled);
 
 describe("provider fetcher registry", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockFetch.mockReset();
-    mockIsVertexAiEnabled.mockReturnValue(false);
-    mockIsBedrockIamAuthEnabled.mockReturnValue(false);
   });
 
   test("testProviderApiKey uses baseUrl override", async () => {
@@ -52,7 +28,11 @@ describe("provider fetcher registry", () => {
     });
 
     const customBaseUrl = "https://my-openai-proxy.example.com/v1";
-    await testProviderApiKey("openai", "test-key", customBaseUrl);
+    await testProviderApiKey({
+      provider: "openai",
+      apiKey: "test-key",
+      baseUrl: customBaseUrl,
+    });
 
     expect(mockFetch.mock.calls[0][0]).toBe(`${customBaseUrl}/models`);
   });
@@ -68,12 +48,12 @@ describe("provider fetcher registry", () => {
         }),
     });
 
-    await testProviderApiKey(
-      "openai",
-      "test-key",
-      "https://gateway.example.com/v1",
-      { "kubeflow-userid": "user@example.com" },
-    );
+    await testProviderApiKey({
+      provider: "openai",
+      apiKey: "test-key",
+      baseUrl: "https://gateway.example.com/v1",
+      extraHeaders: { "kubeflow-userid": "user@example.com" },
+    });
 
     expect(mockFetch.mock.calls[0][1].headers).toMatchObject({
       Authorization: "Bearer test-key",
@@ -81,161 +61,19 @@ describe("provider fetcher registry", () => {
     });
   });
 
-  test("fetchModelsForProvider returns models when provider has an API key", async ({
-    makeOrganization,
-    makeUser,
-    makeMember,
-    makeSecret,
-    makeLlmProviderApiKey,
-  }) => {
-    const org = await makeOrganization();
-    const user = await makeUser();
-    await makeMember(user.id, org.id);
-    const secret = await makeSecret({ secret: { apiKey: "test-key" } });
-    await makeLlmProviderApiKey(org.id, secret.id, { provider: "deepseek" });
-
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: () =>
-        Promise.resolve({
-          data: [
-            {
-              id: "deepseek-chat",
-              created: 1700000000,
-            },
-          ],
-        }),
+  test("rejects a foreign subscription marker before the provider fetcher", async () => {
+    const xaiCredential = encodeXaiSubscriptionCredential({
+      refreshToken: "rt-never-forward",
+      userId: "x-user",
     });
 
-    const models = await fetchModelsForProvider({
-      provider: "deepseek",
-      organizationId: org.id,
-      userId: user.id,
-      userTeamIds: [],
-    });
-
-    expect(models).toHaveLength(1);
-    expect(models[0].id).toBe("deepseek-chat");
-  });
-
-  test("returns empty array when provider has no API key", async ({
-    makeOrganization,
-    makeUser,
-    makeMember,
-  }) => {
-    const org = await makeOrganization();
-    const user = await makeUser();
-    await makeMember(user.id, org.id);
-
-    const models = await fetchModelsForProvider({
-      provider: "openai",
-      organizationId: org.id,
-      userId: user.id,
-      userTeamIds: [],
-    });
-
-    expect(models).toEqual([]);
+    await expect(
+      testProviderApiKey({
+        provider: "openai",
+        apiKey: xaiCredential,
+        baseUrl: "https://attacker.example/v1",
+      }),
+    ).rejects.toMatchObject({ statusCode: 401 });
     expect(mockFetch).not.toHaveBeenCalled();
-  });
-
-  test("vLLM returns models without API key when enabled", async ({
-    makeOrganization,
-    makeUser,
-    makeMember,
-  }) => {
-    const org = await makeOrganization();
-    const user = await makeUser();
-    await makeMember(user.id, org.id);
-    const originalEnabled = config.llm.vllm.enabled;
-
-    try {
-      config.llm.vllm.enabled = true;
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ data: [{ id: "my-model" }] }),
-      });
-
-      const models = await fetchModelsForProvider({
-        provider: "vllm",
-        organizationId: org.id,
-        userId: user.id,
-        userTeamIds: [],
-      });
-
-      expect(models).toHaveLength(1);
-      expect(mockFetch.mock.calls[0][1].headers.Authorization).toBe(
-        PLACEHOLDER_BEARER_TOKEN,
-      );
-    } finally {
-      config.llm.vllm.enabled = originalEnabled;
-    }
-  });
-
-  test("Gemini uses Vertex AI when enabled, even without API key", async ({
-    makeOrganization,
-    makeUser,
-    makeMember,
-  }) => {
-    const org = await makeOrganization();
-    const user = await makeUser();
-    await makeMember(user.id, org.id);
-    mockIsVertexAiEnabled.mockReturnValue(true);
-
-    const mockPager = {
-      [Symbol.asyncIterator]: async function* () {
-        yield {
-          name: "publishers/google/models/gemini-2.5-pro",
-          version: "default",
-          tunedModelInfo: {},
-        };
-      },
-    };
-
-    mockCreateGoogleGenAIClient.mockReturnValue({
-      models: {
-        list: vi.fn().mockResolvedValue(mockPager),
-        get: vi.fn(),
-      },
-    } as unknown as GoogleGenAI);
-
-    const models = await fetchModelsForProvider({
-      provider: "gemini",
-      organizationId: org.id,
-      userId: user.id,
-      userTeamIds: [],
-    });
-
-    expect(models).toHaveLength(1);
-    expect(models[0].id).toBe("gemini-2.5-pro");
-    expect(mockFetch).not.toHaveBeenCalled();
-  });
-
-  test("returns empty array and logs through errors when provider fetch fails", async ({
-    makeOrganization,
-    makeUser,
-    makeMember,
-    makeSecret,
-    makeLlmProviderApiKey,
-  }) => {
-    const org = await makeOrganization();
-    const user = await makeUser();
-    await makeMember(user.id, org.id);
-    const secret = await makeSecret({ secret: { apiKey: "test-key" } });
-    await makeLlmProviderApiKey(org.id, secret.id, { provider: "groq" });
-
-    mockFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 401,
-      text: () => Promise.resolve("Unauthorized"),
-    });
-
-    const models = await fetchModelsForProvider({
-      provider: "groq",
-      organizationId: org.id,
-      userId: user.id,
-      userTeamIds: [],
-    });
-
-    expect(models).toEqual([]);
   });
 });

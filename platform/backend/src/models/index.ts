@@ -1,63 +1,189 @@
-export { default as A2AContextModel } from "./a2a-context";
-export { default as A2AMessageModel } from "./a2a-message";
-export { default as A2ATaskModel } from "./a2a-task";
-export { default as A2ATaskApprovalRequestModel } from "./a2a-task-approval-request";
+export { default as A2AArtifactModel } from "./a2a/artifact";
+export { default as A2AContextModel } from "./a2a/context";
+export { default as A2AContextCompactionModel } from "./a2a/context-compaction";
+export { default as A2AMessageModel } from "./a2a/message";
+export { default as A2APushNotificationConfigModel } from "./a2a/push-notification-config";
+export { default as A2ATaskModel } from "./a2a/task";
+export { default as A2ATaskApprovalRequestModel } from "./a2a/task-approval-request";
+export { default as A2aOutboundRunModel } from "./a2a-outbound-run";
+export {
+  A2aConnectionModel,
+  default as A2aRemoteAgentModel,
+} from "./a2a-remote-agent";
 export { default as AccountModel } from "./account";
 export { default as AgentModel } from "./agent";
+export { default as AgentActivationSkillRuleModel } from "./agent-activation-skill-rule";
 export { default as AgentConnectorAssignmentModel } from "./agent-connector-assignment";
+export { default as AgentExcludedConnectorModel } from "./agent-excluded-connector";
+export { default as AgentExcludedSkillModel } from "./agent-excluded-skill";
+export { default as AgentExcludedSubagentModel } from "./agent-excluded-subagent";
+export { default as AgentExcludedToolModel } from "./agent-excluded-tool";
 export { default as AgentKnowledgeBaseModel } from "./agent-knowledge-base";
 export { default as AgentLabelModel } from "./agent-label";
+export { default as AgentPinModel } from "./agent-pin";
+export { default as AgentRunModel } from "./agent-run";
+export { default as AgentRunInputModel } from "./agent-run-input";
+export { default as AgentRunTranscriptModel } from "./agent-run-transcript";
+export { default as AgentSkillModel } from "./agent-skill";
 export { default as AgentTeamModel } from "./agent-team";
 export { default as AgentToolModel } from "./agent-tool";
+export { default as AgentVersionModel } from "./agent-version";
+export { default as AgentWorkspaceModel } from "./agent-workspace";
+export { default as AppModel } from "./app";
+export { default as AppAccessModel } from "./app-access";
+export { default as AppDataModel } from "./app-data";
+export { default as AppLabelModel } from "./app-label";
+export { default as AppPinModel } from "./app-pin";
+export { default as AppRenderDiagnosticsModel } from "./app-render-diagnostics";
+export { default as AppRenderScreenshotModel } from "./app-render-screenshot";
+export { default as AppToolModel } from "./app-tool";
+export { default as AppVersionModel } from "./app-version";
+export { default as AuditLogModel } from "./audit-log";
+export { default as BrowserStorageStateModel } from "./browser-storage-state";
 export { default as BrowserTabStateModel } from "./browser-tab-state";
+export { default as ActiveChatRunModel } from "./chat-active-run";
 export { default as ChatOpsChannelBindingModel } from "./chatops-channel-binding";
 export { default as ChatOpsConfigModel } from "./chatops-config";
+export { default as ChatOpsMsTeamsUserConnectionModel } from "./chatops-ms-teams-user-connection";
 export { default as ChatOpsProcessedMessageModel } from "./chatops-processed-message";
-export { default as ChatOpsThreadAgentOverrideModel } from "./chatops-thread-agent-override";
+export { default as ChatOpsThreadContextModel } from "./chatops-thread-context";
+export { default as ConnectedClientModel } from "./connected-client";
+export { default as ConnectionSetupModel } from "./connection-setup";
 export { default as ConnectorRunModel } from "./connector-run";
 export { default as ConversationModel } from "./conversation";
+export { default as ConversationAttachmentModel } from "./conversation-attachment";
 export { default as ConversationChatErrorModel } from "./conversation-chat-error";
+export { default as ConversationCompactionModel } from "./conversation-compaction";
 export { default as ConversationEnabledToolModel } from "./conversation-enabled-tool";
-export { default as ConversationShareModel } from "./conversation-share";
+export { default as CreatedByModel, lookupCreator } from "./created-by";
+export {
+  EnvironmentLabelModel,
+  KbFileLabelModel,
+  KnowledgeBaseConnectorLabelModel,
+  KnowledgeBaseLabelModel,
+  LimitLabelModel,
+  LlmProviderApiKeyLabelModel,
+  ModelLabelModel,
+  OauthClientLabelModel,
+  PluginLabelModel,
+  ProjectLabelModel,
+  ServiceAccountLabelModel,
+  SkillLabelModel,
+  VirtualApiKeyLabelModel,
+} from "./entity-labels";
+export { default as EnvironmentModel } from "./environment";
+export { default as EnvironmentDefaultUserLimitModel } from "./environment-default-user-limit";
+export { default as EnvironmentResourceDefaultModel } from "./environment-resource-default";
+export { default as ExternalMcpSkillUsageEventModel } from "./external-mcp-skill-usage-event";
+export { default as FileModel, FileNameExistsError } from "./file";
+export { default as GithubAppAccountModel } from "./github-app-account";
+export { default as GithubAppConfigModel } from "./github-app-config";
+export { default as HookFileModel } from "./hook-file";
+export { default as InstanceUsageModel } from "./instance-usage";
 export { default as InteractionModel } from "./interaction";
+export { default as InteractionCostBackfillModel } from "./interaction-cost-backfill";
 export { default as InternalMcpCatalogModel } from "./internal-mcp-catalog";
 export { default as InvitationModel } from "./invitation";
 export { default as KbChunkModel } from "./kb-chunk";
+export { default as KbConnectorDocumentCountModel } from "./kb-connector-document-count";
+export { default as KbContainerAclModel } from "./kb-container-acl";
+export { default as KbDirectoryModel } from "./kb-directory";
 export { default as KbDocumentModel } from "./kb-document";
-export { default as KbUploadedFileModel } from "./kb-uploaded-file";
+export { default as KbExternalGroupModel } from "./kb-external-group";
+export { default as KbExternalUserGroupModel } from "./kb-external-user-group";
+export { default as KbFileModel } from "./kb-file";
+export { default as KbMemberOverrideModel } from "./kb-member-override";
 export { default as KnowledgeBaseModel } from "./knowledge-base";
 export { default as KnowledgeBaseConnectorModel } from "./knowledge-base-connector";
 export { default as LimitModel, LimitValidationService } from "./limit";
 export { default as LlmOauthClientModel } from "./llm-oauth-client";
 export { default as LlmProviderApiKeyModel } from "./llm-provider-api-key";
 export { default as LlmProviderApiKeyModelLinkModel } from "./llm-provider-api-key-model";
+export { default as LlmUsageRollupModel } from "./llm-usage-rollup";
+export { default as ManagedOauthClientModel } from "./managed-oauth-client";
 export { default as McpCatalogLabelModel } from "./mcp-catalog-label";
+export { default as McpCatalogSkillModel } from "./mcp-catalog-skill";
+export type { ClusterLeaseGuard } from "./mcp-deployment-lease";
+export {
+  ClusterLeaseHeldError,
+  default as McpDeploymentLeaseModel,
+} from "./mcp-deployment-lease";
+export { default as McpGatewayTaskModel } from "./mcp-gateway-task";
 export { default as McpHttpSessionModel } from "./mcp-http-session";
+export { default as McpOauthClientModel } from "./mcp-oauth-client";
 export { default as McpServerModel } from "./mcp-server";
-export { default as McpServerInstallationRequestModel } from "./mcp-server-installation-request";
+export { default as McpServerAlertMuteModel } from "./mcp-server-alert-mute";
+export { default as McpServerToolDescriptionModel } from "./mcp-server-tool-description";
 export { default as McpToolCallModel } from "./mcp-tool-call";
 export { default as MemberModel } from "./member";
 export { default as MessageModel } from "./message";
 export { default as ModelModel } from "./model";
+export { default as ModelCostBackfillModel } from "./model-cost-backfill";
+export { default as ModelPoolModel } from "./model-pool";
+export { default as ModelTeamModel } from "./model-team";
+export { default as ModelUserModel } from "./model-user";
 export { default as OAuthAccessTokenModel } from "./oauth-access-token";
 export { default as OAuthClientModel } from "./oauth-client";
-export { default as OptimizationRuleModel } from "./optimization-rule";
+export { default as OAuthRefreshTokenModel } from "./oauth-refresh-token";
+export { default as OpenappaExternalConsultModel } from "./openappa-external-consult";
+export { default as OpenappaLabelChangeModel } from "./openappa-label-change";
+export { default as OpenAppaOperationModel } from "./openappa-operation";
+export { default as OpenAppaSessionModel } from "./openappa-session";
 export { default as OrganizationModel } from "./organization";
 export { default as OrganizationRoleModel } from "./organization-role";
+export { default as PlaywrightRuntimeModel } from "./playwright-runtime";
+export { default as PluginModel } from "./plugin";
+export { default as PluginSkillUsageEventModel } from "./plugin-skill-usage-event";
+export { default as PluginTeamModel } from "./plugin-team";
+export {
+  ConversationNotOwnedError,
+  default as ProjectModel,
+  ProjectAlreadyAssignedError,
+} from "./project";
+export { default as ProjectAccessModel } from "./project-access";
+export { default as ProjectAppModel } from "./project-app";
+export { default as ProjectPinModel } from "./project-pin";
+export { default as RuntimeCredentialConnectionModel } from "./runtime-credential-connection";
+export { default as RuntimeCredentialDefinitionModel } from "./runtime-credential-definition";
 export { default as ScheduleTriggerModel } from "./schedule-trigger";
 export { default as ScheduleTriggerRunModel } from "./schedule-trigger-run";
 /** @public — re-exported for testability (consumed by src/test/fixtures.ts) */
 export { default as SecretModel } from "./secret";
+export { default as ServiceAccountModel } from "./service-account";
 /** @public — re-exported for testability (consumed by src/test/fixtures.ts) */
 export { default as SessionModel } from "./session";
+export { default as SkillModel } from "./skill";
+export { default as SkillEnvironmentModel } from "./skill-environment";
+export { default as SkillFileModel } from "./skill-file";
+export { default as SkillMarketplaceCredentialModel } from "./skill-marketplace-credential";
+export { default as SkillMarketplaceRepoModel } from "./skill-marketplace-repo";
+export {
+  default as SkillSandboxModel,
+  SkillInvalidFilePathError,
+  SkillSandboxConversationGoneError,
+} from "./skill-sandbox";
+export { default as SkillSandboxFileModel } from "./skill-sandbox-file";
+export { default as SkillSandboxReplayEventModel } from "./skill-sandbox-replay-event";
+export { default as SkillShareLinkModel } from "./skill-share-link";
+export { default as SkillShareLinkRevisionModel } from "./skill-share-link-revision";
+export { default as SkillTeamModel } from "./skill-team";
+export { default as SkillUsageEventModel } from "./skill-usage-event";
+export { default as SkillUserModel } from "./skill-user";
+export { default as SkillVersionModel } from "./skill-version";
+export { default as SreRuntimeModel } from "./sre-runtime";
 export { default as StatisticsModel } from "./statistics";
 export { default as TaskModel } from "./task";
 export { default as TeamModel } from "./team";
+export { default as TeamLabelModel } from "./team-label";
 export { default as TeamTokenModel } from "./team-token";
 export { default as ToolModel } from "./tool";
-export { default as ToolInvocationPolicyModel } from "./tool-invocation-policy";
-export { default as TrustedDataPolicyModel } from "./trusted-data-policy";
+export { default as ToolObservationModel } from "./tool-observation";
+export { default as ToolSearchTextModel } from "./tool-search-text";
+export { default as UsageStatisticsModel } from "./usage-statistics";
 export { default as UserModel } from "./user";
+export { default as UserCredentialModel } from "./user-credential";
+export { default as UserLimitUsageResetModel } from "./user-limit-usage-reset";
+export { default as UserOnboardingSeenItemModel } from "./user-onboarding-seen-item";
 export { default as UserTokenModel } from "./user-token";
 export { default as VerificationModel } from "./verification";
 export { default as VirtualApiKeyModel } from "./virtual-api-key";

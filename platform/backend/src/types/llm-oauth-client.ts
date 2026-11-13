@@ -1,7 +1,31 @@
-import { type SupportedProvider, SupportedProvidersSchema } from "@shared";
+import {
+  CreatedByNullableSchema,
+  type SupportedProvider,
+  SupportedProvidersSchema,
+} from "@archestra/shared";
 import { z } from "zod";
+import { CredentialBillingSchema } from "./credential-billing";
+import { LabelWithDetailsSchema } from "./label";
 
 export const LLM_OAUTH_CLIENT_METADATA_TYPE = "llm_oauth_client";
+
+/**
+ * Which OAuth grant an LLM OAuth client uses:
+ * - `client_credentials`: a shared application credential with no acting user,
+ *   scoped to the organization. It brings its own provider keys
+ *   (`providerApiKeys`).
+ * - `authorization_code`: a pre-registered client that mints user-bound tokens,
+ *   so the proxy resolves the acting user's own provider keys, cost limits, and
+ *   policies. The client carries no provider keys — the user's identity governs
+ *   access — so it is identified by its `redirectUris` instead.
+ */
+export const LlmOauthClientGrantTypeSchema = z.enum([
+  "client_credentials",
+  "authorization_code",
+]);
+export type LlmOauthClientGrantType = z.infer<
+  typeof LlmOauthClientGrantTypeSchema
+>;
 
 export const LlmOauthClientProviderKeySchema = z.object({
   provider: SupportedProvidersSchema,
@@ -11,25 +35,45 @@ export const LlmOauthClientProviderKeySchema = z.object({
 export const LlmOauthClientMetadataSchema = z.object({
   type: z.literal(LLM_OAUTH_CLIENT_METADATA_TYPE),
   organizationId: z.string(),
-  allowedLlmProxyIds: z.array(z.string().uuid()).default([]),
-  providerApiKeys: z.array(LlmOauthClientProviderKeySchema),
+  providerApiKeys: z.array(LlmOauthClientProviderKeySchema).default([]),
+  // Rows created before authorization_code support have no grantType; treat
+  // them as the original client_credentials clients.
+  grantType: LlmOauthClientGrantTypeSchema.default("client_credentials"),
+  // Rows created before authorship was recorded have no author. Who can see
+  // or manage a client is its grants' business, not this metadata's.
+  authorId: z.string().nullable().default(null),
+  /** Team a client-credentials client's spend is charged to. */
+  billingTeamId: z.string().nullable().default(null),
 });
 
-export const LlmOauthClientSchema = z.object({
-  id: z.string(),
-  clientId: z.string(),
-  name: z.string(),
-  organizationId: z.string(),
-  allowedLlmProxyIds: z.array(z.string()),
-  providerApiKeys: z.array(
-    LlmOauthClientProviderKeySchema.extend({
-      providerApiKeyName: z.string(),
-    }),
-  ),
-  disabled: z.boolean(),
-  createdAt: z.date(),
-  updatedAt: z.date(),
-});
+export const LlmOauthClientSchema = z
+  .object({
+    id: z.string(),
+    clientId: z.string(),
+    serviceAccountId: z.string().nullable(),
+    name: z.string(),
+    organizationId: z.string(),
+    grantType: LlmOauthClientGrantTypeSchema,
+    providerApiKeys: z.array(
+      LlmOauthClientProviderKeySchema.extend({
+        providerApiKeyName: z.string(),
+      }),
+    ),
+    redirectUris: z.array(z.string()),
+    disabled: z.boolean(),
+    authorId: z.string().nullable(),
+    authorName: z.string().nullable(),
+    /** The author, in the shape shared by every major object. */
+    createdBy: CreatedByNullableSchema,
+    labels: z.array(LabelWithDetailsSchema),
+    /** Model pools added to a client that calls as the app; see `mayUseModelPool`. */
+    modelPoolIds: z.array(z.string()).default([]),
+    /** Auto routers added to a client that calls as the app. */
+    autoRouterIds: z.array(z.string()).default([]),
+    createdAt: z.date(),
+    updatedAt: z.date(),
+  })
+  .merge(CredentialBillingSchema);
 
 export const LlmOauthClientWithSecretSchema = LlmOauthClientSchema.extend({
   clientSecret: z.string(),

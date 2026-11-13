@@ -49,6 +49,15 @@ const BrowserPressKeyPayloadSchema = z.object({
   key: z.string(), // Key name like "Enter", "Tab", "ArrowDown", "PageDown"
 });
 
+const BrowserScrollPayloadSchema = z.object({
+  conversationId: z.string().uuid(),
+  // Pointer position in viewport coordinates; the page under it scrolls
+  x: z.number().finite().min(0).max(10_000),
+  y: z.number().finite().min(0).max(10_000),
+  deltaX: z.number().finite().min(-10_000).max(10_000),
+  deltaY: z.number().finite().min(-10_000).max(10_000),
+});
+
 const BrowserGetSnapshotPayloadSchema = z.object({
   conversationId: z.string().uuid(),
 });
@@ -89,6 +98,35 @@ const McpExecResizePayloadSchema = z.object({
   rows: z.number().int().min(1),
 });
 
+// Agent run attach: the same shape as the MCP exec conversation, keyed by run.
+const AgentRunIdPayloadSchema = z.object({
+  runId: z.string().uuid(),
+});
+const AgentRunAttachInputPayloadSchema = z.object({
+  runId: z.string().uuid(),
+  data: z.string(),
+});
+const AgentRunAttachResizePayloadSchema = z.object({
+  runId: z.string().uuid(),
+  cols: z.number().int().min(1),
+  rows: z.number().int().min(1),
+});
+const SubscribeAgentRunLogsPayloadSchema = z.object({
+  includeSessionHistory: z.boolean().optional(),
+  runId: z.string().uuid(),
+  lines: z.number().int().min(1).max(10_000).optional(),
+  /**
+   * For an ended run with a complete recording: send only about this many of
+   * its last bytes, leaving out earlier turns (see `omittedBytes`).
+   */
+  tailBytes: z
+    .number()
+    .int()
+    .min(64 * 1024)
+    .max(64 * 1024 * 1024)
+    .optional(),
+});
+
 // MCP Deployment Status payloads
 const SubscribeMcpDeploymentStatusesPayloadSchema = z.object({});
 const UnsubscribeMcpDeploymentStatusesPayloadSchema = z.object({});
@@ -120,6 +158,10 @@ export const ClientWebSocketMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("browser_press_key"),
     payload: BrowserPressKeyPayloadSchema,
+  }),
+  z.object({
+    type: z.literal("browser_scroll"),
+    payload: BrowserScrollPayloadSchema,
   }),
   z.object({
     type: z.literal("browser_get_snapshot"),
@@ -156,6 +198,30 @@ export const ClientWebSocketMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("mcp_exec_resize"),
     payload: McpExecResizePayloadSchema,
+  }),
+  z.object({
+    type: z.literal("subscribe_agent_run_attach"),
+    payload: AgentRunIdPayloadSchema,
+  }),
+  z.object({
+    type: z.literal("unsubscribe_agent_run_attach"),
+    payload: AgentRunIdPayloadSchema,
+  }),
+  z.object({
+    type: z.literal("agent_run_attach_input"),
+    payload: AgentRunAttachInputPayloadSchema,
+  }),
+  z.object({
+    type: z.literal("agent_run_attach_resize"),
+    payload: AgentRunAttachResizePayloadSchema,
+  }),
+  z.object({
+    type: z.literal("subscribe_agent_run_logs"),
+    payload: SubscribeAgentRunLogsPayloadSchema,
+  }),
+  z.object({
+    type: z.literal("unsubscribe_agent_run_logs"),
+    payload: AgentRunIdPayloadSchema,
   }),
   z.object({
     type: z.literal("subscribe_mcp_deployment_statuses"),
@@ -231,6 +297,15 @@ export type BrowserTypeResultMessage = {
 
 export type BrowserPressKeyResultMessage = {
   type: "browser_press_key_result";
+  payload: {
+    conversationId: string;
+    success: boolean;
+    error?: string;
+  };
+};
+
+export type BrowserScrollResultMessage = {
+  type: "browser_scroll_result";
   payload: {
     conversationId: string;
     success: boolean;
@@ -320,6 +395,12 @@ export type McpExecClosedMessage = {
   type: "mcp_exec_closed";
   payload: {
     serverId: string;
+    /**
+     * Human-readable reason the session ended, populated when the K8s exec
+     * reported a failure status (e.g. the image is distroless and has no
+     * `/bin/sh`). Absent on a clean exit.
+     */
+    reason?: string;
   };
 };
 
@@ -330,6 +411,16 @@ export const MCP_DEPLOYMENT_STATES = [
   "running",
   "failed",
   "succeeded",
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  // Deployment deliberately scaled to 0 replicas by the idle-hibernation
+  // manager; woken (scaled back to 1) on demand.
+  "hibernated",
+  // Deployment scaling back up from idle hibernation; the hibernation
+  // annotation is still present and it is not yet available.
+  "waking",
+  // SPDX-SnippetEnd
 ] as const;
 
 export type McpDeploymentState = (typeof MCP_DEPLOYMENT_STATES)[number];
@@ -341,6 +432,111 @@ export type McpDeploymentStatusEntry = {
   restartCount?: number;
   podAge?: string; // e.g. "24m", "2h", "3d"
   podName?: string;
+  // Stable per-deployment identity, known at install time (before a pod is
+  // scheduled). Multi-tenant catalogs share one deployment across rows, so the
+  // UI dedupes by this to count pods, not caller rows.
+  deploymentName?: string;
+};
+
+// Agent run attach + logs, server -> client
+
+/**
+ * Where an attach has got to before the terminal is live.
+ *
+ * Attaching is not instant: the run's task is marked working as soon as the
+ * workload is accepted, so a browser can ask for the terminal while the pod is
+ * still being scheduled or its image pulled. These are the waits the backend
+ * already performs, named so the UI can say which one is happening instead of
+ * showing an unqualified "Connecting…" for what can be minutes.
+ *
+ * Ordered: a client may treat every earlier phase as complete.
+ */
+export const AGENT_RUN_ATTACH_PHASES = [
+  /** The workload is accepted but no pod carries it yet. */
+  "queued",
+  /** A pod exists and Kubernetes is placing it on a node. */
+  "scheduling",
+  /** The node is preparing the container, usually pulling its image. */
+  "pulling",
+  /** The container runs; its agent session is still coming up. */
+  "starting",
+  /** The session exists and the terminal stream is being opened. */
+  "attaching",
+] as const;
+
+export type AgentRunAttachPhase = (typeof AGENT_RUN_ATTACH_PHASES)[number];
+
+export type AgentRunAttachProgressMessage = {
+  type: "agent_run_attach_progress";
+  payload: {
+    runId: string;
+    phase: AgentRunAttachPhase;
+    /** Short phrase naming the wait, e.g. "Pulling the agent image". */
+    message: string;
+    /**
+     * The runtime's own explanation when it has one — an unschedulable pod's
+     * reason, a failing image pull. This is the part that turns a stuck run
+     * from a hang into something the person watching can act on.
+     */
+    detail?: string | null;
+    /** Named once a pod carries the run, for operators reading logs. */
+    resourceName?: string | null;
+  };
+};
+
+export type AgentRunAttachStartedMessage = {
+  type: "agent_run_attach_started";
+  payload: { runId: string; command: string; resourceName: string };
+};
+
+export type AgentRunAttachOutputMessage = {
+  type: "agent_run_attach_output";
+  payload: { runId: string; data: string };
+};
+
+export type AgentRunAttachErrorMessage = {
+  type: "agent_run_attach_error";
+  payload: { runId: string; error: string };
+};
+
+export type AgentRunAttachClosedMessage = {
+  type: "agent_run_attach_closed";
+  payload: {
+    runId: string;
+    /** Why the session ended, when the exec reported a failure status. */
+    reason?: string;
+  };
+};
+
+export type AgentRunLogsMessage = {
+  type: "agent_run_logs";
+  payload: {
+    runId: string;
+    logs: string;
+    channel?: "terminal" | "readable";
+  };
+};
+
+export type AgentRunLogsErrorMessage = {
+  type: "agent_run_logs_error";
+  payload: { runId: string; error: string };
+};
+
+export type AgentRunLogsEndedMessage = {
+  type: "agent_run_logs_ended";
+  payload: {
+    runId: string;
+    source?: "full" | "tail";
+    truncated?: boolean;
+    totalBytes?: number;
+    /** Stored bytes a `tailBytes` subscription left out. */
+    omittedBytes?: number;
+    readable?: {
+      provider: string;
+      version: number;
+      totalBytes: number;
+    };
+  };
 };
 
 export type McpDeploymentStatusesMessage = {
@@ -372,11 +568,83 @@ export type McpInstallationStatusMessage = {
   };
 };
 
+/**
+ * MCP source rows removed from one organization. Clients use this to evict
+ * server-backed projections immediately across tabs without polling.
+ */
+export type McpServersChangedMessage = {
+  type: "mcp_servers_changed";
+  payload: {
+    change: "uninstalled";
+    serverIds: string[];
+    catalogIds: string[];
+  };
+};
+
+/** Sent after the server has authenticated and scoped a WebSocket client. */
+export type WebSocketReadyMessage = {
+  type: "websocket_ready";
+  payload: Record<string, never>;
+};
+
 export type ErrorMessage = {
   type: "error";
   payload: {
     message: string;
   };
+};
+
+/**
+ * Sent to a conversation's owner when a message lands in it, so the sidebar
+ * refreshes its new-messages indicator even when the client was not attached
+ * to the stream (e.g. it navigated away before the response finished).
+ */
+export type ConversationUpdatedMessage = {
+  type: "conversation_updated";
+  payload: {
+    conversationId: string;
+  };
+};
+
+/** One replayed assertion in a live validation run. */
+export type OpenAppaValidationProgressStep = {
+  line: number;
+  tool: string;
+  expected: string;
+  actual: string | null;
+  status: "passed" | "failed" | "cannot_run";
+  error?: string | null;
+  /** Why a blocked call was blocked. */
+  reasons?: string[];
+};
+
+/**
+ * Progress of one validation run, pushed to the user who started it while
+ * replay works through the files one at a time. `token` is the id the client
+ * sent with the run request, so a page only follows the run it started.
+ */
+export type OpenAppaValidationProgressMessage = {
+  type: "openappa_validation_progress";
+  payload:
+    | { token: string; phase: "started"; paths: string[] }
+    | { token: string; phase: "file_started"; path: string }
+    | {
+        token: string;
+        phase: "file_finished";
+        path: string;
+        status: "passed" | "failed" | "cannot_run";
+        assertionCount: number;
+        durationMs: number;
+        error?: string | null;
+        steps: OpenAppaValidationProgressStep[];
+      }
+    | {
+        token: string;
+        phase: "finished";
+        /** The recorded run, or null when the run could not be recorded. */
+        runId: string | null;
+        error?: string;
+      };
 };
 
 export type ServerWebSocketMessage =
@@ -387,6 +655,7 @@ export type ServerWebSocketMessage =
   | BrowserClickResultMessage
   | BrowserTypeResultMessage
   | BrowserPressKeyResultMessage
+  | BrowserScrollResultMessage
   | BrowserSnapshotMessage
   | BrowserSetZoomResultMessage
   | McpLogsMessage
@@ -396,8 +665,20 @@ export type ServerWebSocketMessage =
   | McpExecOutputMessage
   | McpExecErrorMessage
   | McpExecClosedMessage
+  | AgentRunAttachProgressMessage
+  | AgentRunAttachStartedMessage
+  | AgentRunAttachOutputMessage
+  | AgentRunAttachErrorMessage
+  | AgentRunAttachClosedMessage
+  | AgentRunLogsMessage
+  | AgentRunLogsErrorMessage
+  | AgentRunLogsEndedMessage
   | McpDeploymentStatusesMessage
   | McpInstallationStatusMessage
+  | McpServersChangedMessage
+  | WebSocketReadyMessage
+  | ConversationUpdatedMessage
+  | OpenAppaValidationProgressMessage
   | ErrorMessage;
 
 /**

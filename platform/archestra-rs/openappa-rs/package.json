@@ -1,0 +1,29 @@
+{
+  "name": "@archestra/openappa-rs",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "index.cjs",
+  "types": "index.d.ts",
+  "scripts": {
+    "build": "napi build --release --platform",
+    "build:dev": "napi build --profile release-fast --platform",
+    "type-check": "cargo check -p openappa_rs",
+    "test": "node --test smoke.test.cjs policy.test.cjs tenants.test.cjs peer.test.cjs archestra-annotator.test.cjs subagent.test.cjs replay.test.cjs lease.test.cjs opening-identity.test.cjs encrypted-chat.test.cjs",
+    "check:ci": "pnpm build && pnpm smoke:load",
+    "check:musl": "pnpm build && pnpm smoke:load",
+    "smoke:load": "node load.test.cjs",
+    "lint": "cargo fmt --check --all"
+  },
+  "dependencies": {
+    "@archestra/napi-loader": "workspace:*"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.4.0"
+  },
+  "files": [
+    "index.cjs",
+    "index.d.ts",
+    "*.node"
+  ]
+}

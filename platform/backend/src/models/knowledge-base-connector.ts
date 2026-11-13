@@ -1,5 +1,21 @@
-import { and, count, desc, eq, ilike, inArray, or, sql } from "drizzle-orm";
-import db, { schema } from "@/database";
+// This file contains Enterprise regions licensed under LICENSE_ENTERPRISE.
+import type { ResourcePermissionGrant } from "@archestra/shared";
+import {
+  and,
+  count,
+  desc,
+  eq,
+  ilike,
+  inArray,
+  isNotNull,
+  or,
+  type SQL,
+  sql,
+} from "drizzle-orm";
+import db, { schema, withDbTransaction } from "@/database";
+import { notDeleted } from "@/database/schemas/soft-deletable-table";
+import { hardDelete, softDelete } from "@/database/soft-delete";
+import { connectorInEnvironmentPredicate } from "@/services/environments/environment-isolation";
 import type {
   InsertKnowledgeBaseConnector,
   KnowledgeBaseConnector,
@@ -9,6 +25,14 @@ import type {
   ConnectorSyncStatus,
   ConnectorType,
 } from "@/types/knowledge-connector";
+import { escapeLikePattern } from "@/utils/sql-search";
+import CreatedByModel from "./created-by";
+import InteractionUserActivityModel from "./interaction-user-activity";
+import ResourcePermissionPolicyModel from "./resource-permission-policy";
+import ResourcePermissionSubjectModel, {
+  type GrantPrincipal,
+  type ResourceAccessFilter,
+} from "./resource-permission-subject";
 
 class KnowledgeBaseConnectorModel {
   static async findByOrganization(params: {
@@ -17,23 +41,47 @@ class KnowledgeBaseConnectorModel {
     offset?: number;
     canReadAll?: boolean;
     viewerTeamIds?: string[];
+    viewerUserId?: string;
+    viewerPrincipal?: GrantPrincipal;
+    visibilityScope?: ConnectorVisibilityScope;
+    /**
+     * When provided (including explicit `null` = Default), restrict to connectors
+     * in that environment (environment isolation). Omit to return all
+     * environments (e.g. the management UI listing).
+     */
+    environmentId?: string | null;
   }): Promise<KnowledgeBaseConnector[]> {
     let query = db
       .select()
       .from(schema.knowledgeBaseConnectorsTable)
       .where(
         and(
+          notDeleted(schema.knowledgeBaseConnectorsTable),
           eq(
             schema.knowledgeBaseConnectorsTable.organizationId,
             params.organizationId,
           ),
-          buildVisibilityFilter({
+          await buildVisibilityFilter({
+            organizationId: params.organizationId,
             canReadAll: params.canReadAll,
+            userId: params.viewerUserId,
+            principal: params.viewerPrincipal,
             teamIds: params.viewerTeamIds,
+            scope: params.visibilityScope,
           }),
+          params.environmentId !== undefined
+            ? connectorInEnvironmentPredicate(params.environmentId)
+            : undefined,
         ),
       )
-      .orderBy(desc(schema.knowledgeBaseConnectorsTable.createdAt))
+      // `id` breaks `createdAt` ties, which this paginates over: `createdAt`
+      // defaults to now(), the transaction timestamp, so rows inserted together
+      // are stamped identically and LIMIT/OFFSET over a non-total order can
+      // render a row twice and drop another.
+      .orderBy(
+        desc(schema.knowledgeBaseConnectorsTable.createdAt),
+        desc(schema.knowledgeBaseConnectorsTable.id),
+      )
       .$dynamic();
 
     if (params.limit !== undefined) {
@@ -51,7 +99,13 @@ class KnowledgeBaseConnectorModel {
       .select({ count: count() })
       .from(schema.knowledgeBaseConnectorsTable)
       .where(
-        eq(schema.knowledgeBaseConnectorsTable.organizationId, organizationId),
+        and(
+          notDeleted(schema.knowledgeBaseConnectorsTable),
+          eq(
+            schema.knowledgeBaseConnectorsTable.organizationId,
+            organizationId,
+          ),
+        ),
       );
 
     return result?.count ?? 0;
@@ -63,8 +117,17 @@ class KnowledgeBaseConnectorModel {
     offset: number;
     search?: string;
     connectorType?: ConnectorType;
+    excludeConnectorTypes?: ConnectorType[];
     canReadAll?: boolean;
     viewerTeamIds?: string[];
+    viewerUserId?: string;
+    viewerPrincipal?: GrantPrincipal;
+    visibilityScope?: ConnectorVisibilityScope;
+    status?: "active" | "deleted";
+    /** The list's `access`, `sharedWith`, and `owner` filters. */
+    access?: ResourceAccessFilter;
+    /** Restrict to these connector ids; omit when not filtering. */
+    ids?: string[];
   }): Promise<{ data: KnowledgeBaseConnector[]; total: number }> {
     const {
       organizationId,
@@ -72,16 +135,45 @@ class KnowledgeBaseConnectorModel {
       offset,
       search,
       connectorType,
+      excludeConnectorTypes,
       canReadAll,
       viewerTeamIds,
+      visibilityScope,
+      status,
+      access,
     } = params;
-    const searchPattern = search ? `%${search}%` : null;
+    const searchPattern = search ? `%${escapeLikePattern(search)}%` : null;
 
     const filters = [
+      // Added once to the shared array: covers both the data query and the
+      // count() total below, so a page can never show N rows with a total of
+      // N + rows the other filter would have excluded. `status=deleted` is the
+      // trash view; every other read stays notDeleted.
+      status === "deleted"
+        ? isNotNull(schema.knowledgeBaseConnectorsTable.deletedAt)
+        : notDeleted(schema.knowledgeBaseConnectorsTable),
       eq(schema.knowledgeBaseConnectorsTable.organizationId, organizationId),
-      buildVisibilityFilter({ canReadAll, teamIds: viewerTeamIds }),
+      await buildVisibilityFilter({
+        organizationId,
+        canReadAll,
+        userId: params.viewerUserId,
+        principal: params.viewerPrincipal,
+        teamIds: viewerTeamIds,
+        scope: visibilityScope,
+      }),
+      ...(params.ids
+        ? [inArray(schema.knowledgeBaseConnectorsTable.id, params.ids)]
+        : []),
       ...(connectorType
         ? [eq(schema.knowledgeBaseConnectorsTable.connectorType, connectorType)]
+        : []),
+      ...(excludeConnectorTypes && excludeConnectorTypes.length > 0
+        ? [
+            sql`${schema.knowledgeBaseConnectorsTable.connectorType} NOT IN (${sql.join(
+              excludeConnectorTypes.map((type) => sql`${type}`),
+              sql`, `,
+            )})`,
+          ]
         : []),
       ...(searchPattern
         ? [
@@ -94,6 +186,19 @@ class KnowledgeBaseConnectorModel {
             ),
           ]
         : []),
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      access
+        ? ResourcePermissionPolicyModel.accessRelationCondition({
+            ...access,
+            organizationId,
+            resource: "knowledgeConnector",
+            scopeColumn: schema.knowledgeBaseConnectorsTable.id,
+            ownerColumn: schema.knowledgeBaseConnectorsTable.createdBy,
+          })
+        : undefined,
+      // SPDX-SnippetEnd
     ];
 
     const [data, totalResult] = await Promise.all([
@@ -101,7 +206,27 @@ class KnowledgeBaseConnectorModel {
         .select()
         .from(schema.knowledgeBaseConnectorsTable)
         .where(and(...filters))
-        .orderBy(desc(schema.knowledgeBaseConnectorsTable.createdAt))
+        // The trash renders `deletedAt` as its only temporal column, so it
+        // sorts by it — ordering by `createdAt` there would scatter the visible
+        // column into arbitrary order. `deletedAt` is non-null across that
+        // slice by construction (the `isNotNull` filter above), so no null
+        // ordering.
+        //
+        // `id` breaks ties on both branches: LIMIT/OFFSET needs a total order,
+        // or a tie group straddling a page boundary renders a row twice and
+        // drops another. Ties are the normal case, not the edge one —
+        // `createdAt` defaults to now(), the transaction timestamp, so rows
+        // inserted together are stamped identically, and a cascade hands
+        // `softDelete` one shared `at` deliberately. The uuid is random: a
+        // determinism key, not a recency proxy. This settles the order for a
+        // fixed snapshot only — OFFSET paging still shifts under a concurrent
+        // restore/purge, which would take keyset pagination to close.
+        .orderBy(
+          status === "deleted"
+            ? desc(schema.knowledgeBaseConnectorsTable.deletedAt)
+            : desc(schema.knowledgeBaseConnectorsTable.createdAt),
+          desc(schema.knowledgeBaseConnectorsTable.id),
+        )
         .limit(limit)
         .offset(offset),
       db
@@ -118,6 +243,11 @@ class KnowledgeBaseConnectorModel {
     params?: {
       canReadAll?: boolean;
       viewerTeamIds?: string[];
+      viewerUserId?: string;
+      viewerPrincipal?: GrantPrincipal;
+      visibilityScope?: ConnectorVisibilityScope;
+      /** When provided (incl. `null` = Default), restrict to this environment. */
+      environmentId?: string | null;
     },
   ): Promise<KnowledgeBaseConnector[]> {
     return await db
@@ -128,17 +258,34 @@ class KnowledgeBaseConnectorModel {
         description: schema.knowledgeBaseConnectorsTable.description,
         visibility: schema.knowledgeBaseConnectorsTable.visibility,
         teamIds: schema.knowledgeBaseConnectorsTable.teamIds,
+        syncPermissionsFromSource:
+          schema.knowledgeBaseConnectorsTable.syncPermissionsFromSource,
         connectorType: schema.knowledgeBaseConnectorsTable.connectorType,
         config: schema.knowledgeBaseConnectorsTable.config,
         secretId: schema.knowledgeBaseConnectorsTable.secretId,
+        environmentId: schema.knowledgeBaseConnectorsTable.environmentId,
         schedule: schema.knowledgeBaseConnectorsTable.schedule,
+        ftsLanguage: schema.knowledgeBaseConnectorsTable.ftsLanguage,
+        permissionSyncIntervalSeconds:
+          schema.knowledgeBaseConnectorsTable.permissionSyncIntervalSeconds,
         enabled: schema.knowledgeBaseConnectorsTable.enabled,
         lastSyncAt: schema.knowledgeBaseConnectorsTable.lastSyncAt,
         lastSyncStatus: schema.knowledgeBaseConnectorsTable.lastSyncStatus,
         lastSyncError: schema.knowledgeBaseConnectorsTable.lastSyncError,
+        lastPermissionSyncAt:
+          schema.knowledgeBaseConnectorsTable.lastPermissionSyncAt,
+        lastPermissionSyncStatus:
+          schema.knowledgeBaseConnectorsTable.lastPermissionSyncStatus,
+        aclConfigEpoch: schema.knowledgeBaseConnectorsTable.aclConfigEpoch,
         checkpoint: schema.knowledgeBaseConnectorsTable.checkpoint,
+        permissionSyncState:
+          schema.knowledgeBaseConnectorsTable.permissionSyncState,
+        createdBy: schema.knowledgeBaseConnectorsTable.createdBy,
+        createdByServiceAccountId:
+          schema.knowledgeBaseConnectorsTable.createdByServiceAccountId,
         createdAt: schema.knowledgeBaseConnectorsTable.createdAt,
         updatedAt: schema.knowledgeBaseConnectorsTable.updatedAt,
+        deletedAt: schema.knowledgeBaseConnectorsTable.deletedAt,
       })
       .from(schema.knowledgeBaseConnectorAssignmentsTable)
       .innerJoin(
@@ -150,17 +297,43 @@ class KnowledgeBaseConnectorModel {
       )
       .where(
         and(
+          notDeleted(schema.knowledgeBaseConnectorsTable),
           eq(
             schema.knowledgeBaseConnectorAssignmentsTable.knowledgeBaseId,
             knowledgeBaseId,
           ),
-          buildVisibilityFilter({
+          await buildVisibilityFilter({
             canReadAll: params?.canReadAll,
+            userId: params?.viewerUserId,
+            principal: params?.viewerPrincipal,
             teamIds: params?.viewerTeamIds,
+            scope: params?.visibilityScope,
           }),
+          params?.environmentId !== undefined
+            ? connectorInEnvironmentPredicate(params.environmentId)
+            : undefined,
         ),
       )
       .orderBy(desc(schema.knowledgeBaseConnectorsTable.createdAt));
+  }
+
+  /**
+   * The viewer's read reach over `knowledge_base_connectors`, as
+   * findByKnowledgeBaseIds applies it without a `visibilityScope`, for a
+   * statement that embeds the same filter. Undefined when it filters nothing.
+   */
+  static async visibilityCondition(params: {
+    canReadAll?: boolean;
+    viewerTeamIds?: string[];
+    viewerUserId?: string;
+    viewerPrincipal?: GrantPrincipal;
+  }): Promise<SQL | undefined> {
+    return await buildVisibilityFilter({
+      canReadAll: params.canReadAll,
+      userId: params.viewerUserId,
+      principal: params.viewerPrincipal,
+      teamIds: params.viewerTeamIds,
+    });
   }
 
   static async findByKnowledgeBaseIds(
@@ -168,6 +341,9 @@ class KnowledgeBaseConnectorModel {
     params?: {
       canReadAll?: boolean;
       viewerTeamIds?: string[];
+      viewerUserId?: string;
+      viewerPrincipal?: GrantPrincipal;
+      visibilityScope?: ConnectorVisibilityScope;
     },
   ): Promise<(KnowledgeBaseConnector & { knowledgeBaseId: string })[]> {
     if (knowledgeBaseIds.length === 0) return [];
@@ -179,17 +355,34 @@ class KnowledgeBaseConnectorModel {
         description: schema.knowledgeBaseConnectorsTable.description,
         visibility: schema.knowledgeBaseConnectorsTable.visibility,
         teamIds: schema.knowledgeBaseConnectorsTable.teamIds,
+        syncPermissionsFromSource:
+          schema.knowledgeBaseConnectorsTable.syncPermissionsFromSource,
         connectorType: schema.knowledgeBaseConnectorsTable.connectorType,
         config: schema.knowledgeBaseConnectorsTable.config,
         secretId: schema.knowledgeBaseConnectorsTable.secretId,
+        environmentId: schema.knowledgeBaseConnectorsTable.environmentId,
         schedule: schema.knowledgeBaseConnectorsTable.schedule,
+        ftsLanguage: schema.knowledgeBaseConnectorsTable.ftsLanguage,
+        permissionSyncIntervalSeconds:
+          schema.knowledgeBaseConnectorsTable.permissionSyncIntervalSeconds,
         enabled: schema.knowledgeBaseConnectorsTable.enabled,
         lastSyncAt: schema.knowledgeBaseConnectorsTable.lastSyncAt,
         lastSyncStatus: schema.knowledgeBaseConnectorsTable.lastSyncStatus,
         lastSyncError: schema.knowledgeBaseConnectorsTable.lastSyncError,
+        lastPermissionSyncAt:
+          schema.knowledgeBaseConnectorsTable.lastPermissionSyncAt,
+        lastPermissionSyncStatus:
+          schema.knowledgeBaseConnectorsTable.lastPermissionSyncStatus,
+        aclConfigEpoch: schema.knowledgeBaseConnectorsTable.aclConfigEpoch,
         checkpoint: schema.knowledgeBaseConnectorsTable.checkpoint,
+        permissionSyncState:
+          schema.knowledgeBaseConnectorsTable.permissionSyncState,
+        createdBy: schema.knowledgeBaseConnectorsTable.createdBy,
+        createdByServiceAccountId:
+          schema.knowledgeBaseConnectorsTable.createdByServiceAccountId,
         createdAt: schema.knowledgeBaseConnectorsTable.createdAt,
         updatedAt: schema.knowledgeBaseConnectorsTable.updatedAt,
+        deletedAt: schema.knowledgeBaseConnectorsTable.deletedAt,
         knowledgeBaseId:
           schema.knowledgeBaseConnectorAssignmentsTable.knowledgeBaseId,
       })
@@ -203,13 +396,17 @@ class KnowledgeBaseConnectorModel {
       )
       .where(
         and(
+          notDeleted(schema.knowledgeBaseConnectorsTable),
           inArray(
             schema.knowledgeBaseConnectorAssignmentsTable.knowledgeBaseId,
             knowledgeBaseIds,
           ),
-          buildVisibilityFilter({
+          await buildVisibilityFilter({
             canReadAll: params?.canReadAll,
+            userId: params?.viewerUserId,
+            principal: params?.viewerPrincipal,
             teamIds: params?.viewerTeamIds,
+            scope: params?.visibilityScope,
           }),
         ),
       );
@@ -219,7 +416,12 @@ class KnowledgeBaseConnectorModel {
     const [result] = await db
       .select()
       .from(schema.knowledgeBaseConnectorsTable)
-      .where(eq(schema.knowledgeBaseConnectorsTable.id, id));
+      .where(
+        and(
+          eq(schema.knowledgeBaseConnectorsTable.id, id),
+          notDeleted(schema.knowledgeBaseConnectorsTable),
+        ),
+      );
 
     return result ?? null;
   }
@@ -230,66 +432,456 @@ class KnowledgeBaseConnectorModel {
     return await db
       .select()
       .from(schema.knowledgeBaseConnectorsTable)
-      .where(inArray(schema.knowledgeBaseConnectorsTable.id, ids));
+      .where(
+        and(
+          inArray(schema.knowledgeBaseConnectorsTable.id, ids),
+          notDeleted(schema.knowledgeBaseConnectorsTable),
+        ),
+      );
   }
 
   static async create(
     data: InsertKnowledgeBaseConnector,
+    /** Explicit starting audience; omitted derives one from the visibility. */
+    options?: {
+      initialPermissionGrants?: ResourcePermissionGrant[];
+      /** Publish to the whole organization; for system callers only. */
+      publishToOrganization?: boolean;
+    },
   ): Promise<KnowledgeBaseConnector> {
-    const [result] = await db
-      .insert(schema.knowledgeBaseConnectorsTable)
-      .values(data)
-      .returning();
+    // The access policy is written with the row it governs, so a failure
+    // cannot leave a connector nobody can reach.
+    return await withDbTransaction(async (tx) => {
+      const [result] = await tx
+        .insert(schema.knowledgeBaseConnectorsTable)
+        .values(
+          await CreatedByModel.forInsert({
+            data: {
+              ...data,
+              syncPermissionsFromSource: syncSwitchFor(data) ?? false,
+            },
+            userIdField: "createdBy",
+            transaction: tx,
+          }),
+        )
+        .returning();
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      await ResourcePermissionPolicyModel.createInitial({
+        tx,
+        organizationId: result.organizationId,
+        resource: "knowledgeConnector",
+        scope: result.id,
+        grants: options?.initialPermissionGrants,
+        // The creator gets full access, like the author of every other
+        // resource. A connector a system caller creates has no creator.
+        authorId: CreatedByModel.id(result, result.createdBy) ?? null,
+        publishToOrganization: options?.publishToOrganization,
+      });
+      // SPDX-SnippetEnd
 
-    return result;
+      return result;
+    });
   }
 
+  /**
+   * `notDeleted`-filtered like every read: a soft-deleted connector is gone, so
+   * a write must not land on it either. Returns null when nothing matched. The
+   * background pipeline relies on this — a sync/embedding job that finishes
+   * after its connector was deleted no-ops here instead of stamping sync status
+   * onto a deleted row.
+   */
   static async update(
     id: string,
     data: Partial<UpdateKnowledgeBaseConnector>,
   ): Promise<KnowledgeBaseConnector | null> {
+    const syncPermissionsFromSource = syncSwitchFor(data);
     const [result] = await db
       .update(schema.knowledgeBaseConnectorsTable)
-      .set(data)
-      .where(eq(schema.knowledgeBaseConnectorsTable.id, id))
+      .set(
+        syncPermissionsFromSource === undefined
+          ? data
+          : { ...data, syncPermissionsFromSource },
+      )
+      .where(
+        and(
+          eq(schema.knowledgeBaseConnectorsTable.id, id),
+          notDeleted(schema.knowledgeBaseConnectorsTable),
+        ),
+      )
       .returning();
 
     return result ?? null;
+  }
+
+  /**
+   * Advance the connector's sync checkpoint, gated atomically on the given run
+   * still being `running`. If the run was reclaimed (its owner became a zombie),
+   * the EXISTS guard fails and the stale checkpoint write is dropped — a newer
+   * run's checkpoint can't be clobbered.
+   */
+  /**
+   * Atomically bump the connector's ACL fencing epoch. Called whenever
+   * visibility or teamIds change so every ACL writer that read the old epoch
+   * (an in-flight content-sync or permission-sync write) no-ops — the newest
+   * config change always wins regardless of job ordering. Returns the new epoch.
+   */
+  static async bumpAclConfigEpoch(connectorId: string): Promise<number> {
+    const { rows } = await db.execute<{ acl_config_epoch: number }>(sql`
+      UPDATE knowledge_base_connectors
+      SET acl_config_epoch = acl_config_epoch + 1
+      WHERE id = ${connectorId}
+        AND deleted_at IS NULL
+      RETURNING acl_config_epoch
+    `);
+    return Number(rows[0]?.acl_config_epoch ?? 0);
+  }
+
+  static async setCheckpointIfRunActive(params: {
+    connectorId: string;
+    runId: string;
+    checkpoint: Record<string, unknown>;
+  }): Promise<void> {
+    await db.execute(sql`
+      UPDATE knowledge_base_connectors
+      SET checkpoint = ${JSON.stringify(params.checkpoint)}::jsonb
+      WHERE id = ${params.connectorId}
+        AND deleted_at IS NULL
+        AND EXISTS (
+          SELECT 1 FROM connector_runs
+          WHERE id = ${params.runId} AND status = 'running'
+        )
+    `);
+  }
+
+  /**
+   * Mirror a reaped run's terminal status onto its connector, but only while the
+   * connector still reflects THAT run — it is still `running` and its
+   * `last_sync_at` equals the run's `started_at` (each run stamps the connector
+   * with its own start; see Fix P in connector-sync). If a newer run has since
+   * claimed the connector, its `last_sync_at` differs and this no-ops, so the
+   * reaper can't clobber it. Compared in SQL against the run's `started_at` to
+   * preserve exact timestamp precision.
+   */
+  static async markReapedStatusIfCurrent(params: {
+    connectorId: string;
+    runId: string;
+    status: ConnectorSyncStatus;
+    error: string | null;
+  }): Promise<void> {
+    await db.execute(sql`
+      UPDATE knowledge_base_connectors
+      SET last_sync_status = ${params.status}, last_sync_error = ${params.error}
+      WHERE id = ${params.connectorId}
+        AND deleted_at IS NULL
+        AND last_sync_status = 'running'
+        AND last_sync_at = (
+          SELECT started_at FROM connector_runs WHERE id = ${params.runId}
+        )
+    `);
+  }
+
+  /**
+   * Mirror an explicit cancellation onto the connector only if it still points
+   * at that run. A newer run stamps a different `last_sync_at`, so a late
+   * cancellation response cannot overwrite the newer run's live status.
+   */
+  static async markContentRunCancelledIfCurrent(params: {
+    connectorId: string;
+    runId: string;
+  }): Promise<void> {
+    await db.execute(sql`
+      UPDATE knowledge_base_connectors
+      SET last_sync_status = 'cancelled', last_sync_error = NULL
+      WHERE id = ${params.connectorId}
+        AND deleted_at IS NULL
+        AND last_sync_status = 'running'
+        AND last_sync_at = (
+          SELECT started_at FROM connector_runs WHERE id = ${params.runId}
+        )
+    `);
+  }
+
+  /**
+   * Reconcile connectors left showing `running` when they have no running run —
+   * e.g. a run finalized but its connector-status write was lost. Derives the
+   * connector's status from its latest run (the authoritative source) in one
+   * statement, replacing the old task-scanning cleanup loop. A connector whose
+   * latest run is still `running` is skipped (it is genuinely in progress), so
+   * this never races a live run. Returns the ids it corrected, for logging.
+   *
+   * Scoped to `content` runs only: `last_sync_status`/`last_sync_error` mirror
+   * the CONTENT run family, and (by Guarantee 2) a permission run can be
+   * `running` concurrently with a content run. Without this filter the latest
+   * run per connector could be a permission run, and mirroring its status into
+   * the content fields would clobber a live content run's status — the exact
+   * cross-lane leak the runtime-isolation split forbids. Permission-run status
+   * lives in `last_permission_sync_*` and is owned by the permission reaper.
+   */
+  static async reconcileOrphanedConnectorStatuses(): Promise<string[]> {
+    const { rows } = await db.execute<{ id: string }>(sql`
+      UPDATE knowledge_base_connectors c
+      SET last_sync_status = latest.status,
+          last_sync_error = latest.error
+      FROM (
+        SELECT DISTINCT ON (connector_id)
+          connector_id, status, error
+        FROM connector_runs
+        WHERE run_type = 'content'
+        ORDER BY connector_id, started_at DESC
+      ) latest
+      WHERE c.id = latest.connector_id
+        AND c.deleted_at IS NULL
+        AND c.last_sync_status = 'running'
+        AND latest.status <> 'running'
+      RETURNING c.id
+    `);
+    return rows.map((r) => r.id);
   }
 
   static async findAllEnabled(): Promise<KnowledgeBaseConnector[]> {
     return await db
       .select()
       .from(schema.knowledgeBaseConnectorsTable)
-      .where(eq(schema.knowledgeBaseConnectorsTable.enabled, true));
+      .where(
+        and(
+          notDeleted(schema.knowledgeBaseConnectorsTable),
+          eq(schema.knowledgeBaseConnectorsTable.enabled, true),
+        ),
+      );
   }
 
-  static async findAllWithStatus(
-    status: ConnectorSyncStatus,
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  /**
+   * Enabled `auto-sync-permissions` connectors of the given types — the
+   * permission-sync scheduler's due-loop input. Both predicates are pushed into
+   * SQL rather than filtered in the handler: the permission family covers a
+   * small slice of a deployment's connectors, so loading every enabled one to
+   * throw most of them away scales the scheduler's memory with the whole fleet
+   * instead of with the connectors it can actually schedule.
+   */
+  static async findEnabledAutoSyncPermissions(
+    connectorTypes: ConnectorType[],
   ): Promise<KnowledgeBaseConnector[]> {
+    if (connectorTypes.length === 0) return [];
+
+    const t = schema.knowledgeBaseConnectorsTable;
     return await db
       .select()
-      .from(schema.knowledgeBaseConnectorsTable)
-      .where(eq(schema.knowledgeBaseConnectorsTable.lastSyncStatus, status));
+      .from(t)
+      .where(
+        and(
+          notDeleted(t),
+          eq(t.enabled, true),
+          eq(t.syncPermissionsFromSource, true),
+          inArray(t.connectorType, connectorTypes),
+        ),
+      );
   }
 
+  // SPDX-SnippetEnd
+
+  /**
+   * Soft-delete: stamps `deleted_at`. Returns false when no active row matched
+   * (already deleted / unknown id) — the delete routes surface that as a 404.
+   * Side-effects (queued-sync cancellation, secret revocation, cache
+   * invalidation) are NOT here; they live in the knowledge-source-deletion
+   * service so every write surface (REST + MCP) runs them identically.
+   */
   static async delete(id: string): Promise<boolean> {
+    const count = await softDelete(
+      db,
+      schema.knowledgeBaseConnectorsTable,
+      eq(schema.knowledgeBaseConnectorsTable.id, id),
+    );
+
+    return count > 0;
+  }
+
+  /**
+   * Restore: clears `deleted_at` AND sets `enabled = false` in the same
+   * UPDATE. Not the shared stamp-removal helper on purpose: the stored secret
+   * was destroyed at soft-delete (see revokeConnectorSecret in the
+   * knowledge-source-deletion service), and both sync schedulers select on
+   * `enabled = true` every 30s (findAllEnabled /
+   * findEnabledAutoSyncPermissions) — a restore that left `enabled` alone
+   * would enroll a credential-less connector into an immediately-failing sync
+   * loop. One statement means no window between revive and disable. The
+   * connector comes back disabled; an admin re-authenticates, then re-enables.
+   * Returns false when no soft-deleted row matched (restore route 404s).
+   */
+  static async restore(id: string): Promise<boolean> {
     const rows = await db
-      .delete(schema.knowledgeBaseConnectorsTable)
-      .where(eq(schema.knowledgeBaseConnectorsTable.id, id))
+      .update(schema.knowledgeBaseConnectorsTable)
+      .set({ deletedAt: null, enabled: false })
+      .where(
+        and(
+          eq(schema.knowledgeBaseConnectorsTable.id, id),
+          isNotNull(schema.knowledgeBaseConnectorsTable.deletedAt),
+        ),
+      )
       .returning({ id: schema.knowledgeBaseConnectorsTable.id });
 
     return rows.length > 0;
   }
 
+  /**
+   * Org-scoped lookup of a SOFT-DELETED connector, for the restore route. Does
+   * NOT filter `notDeleted` — it is the one point read that must see deleted
+   * rows.
+   */
+  static async findDeletedByIdForOrganization(
+    id: string,
+    organizationId: string,
+  ): Promise<KnowledgeBaseConnector | null> {
+    const [result] = await db
+      .select()
+      .from(schema.knowledgeBaseConnectorsTable)
+      .where(
+        and(
+          eq(schema.knowledgeBaseConnectorsTable.id, id),
+          eq(
+            schema.knowledgeBaseConnectorsTable.organizationId,
+            organizationId,
+          ),
+          isNotNull(schema.knowledgeBaseConnectorsTable.deletedAt),
+        ),
+      );
+
+    return result ?? null;
+  }
+
+  /**
+   * Physical delete, for the permanent-delete route. Locks on `(id,
+   * organization_id, deleted_at IS NOT NULL)` — self-authorizing, and a
+   * concurrent restore wins the race; see KnowledgeBaseModel.purge. Children —
+   * runs, documents (and their chunks), ACLs, external groups, member
+   * overrides, assignments — all cascade. Queued-sync cancellation and secret
+   * revocation already happened at soft-delete time (knowledge-source-deletion
+   * service), so there is nothing external left.
+   *
+   * The statement timeout is raised for the duration: the document/chunk
+   * cascade of a large connector is a single statement, and under the
+   * pool-wide 30s ceiling it would abort identically on every retry, leaving
+   * the connector permanently un-purgeable (same reasoning as AgentModel.purge).
+   */
+  static async purge(params: {
+    id: string;
+    organizationId: string;
+  }): Promise<boolean> {
+    return await withDbTransaction(async (tx) => {
+      await InteractionUserActivityModel.lifecycleFence(tx);
+      // `sql.raw`: SET is a utility command and takes no bind parameters, so
+      // `= $1` is a syntax error. The value is a module constant, never input.
+      await tx.execute(
+        sql.raw(`SET LOCAL statement_timeout = ${PURGE_STATEMENT_TIMEOUT_MS}`),
+      );
+
+      const [locked] = await tx
+        .select({ id: schema.knowledgeBaseConnectorsTable.id })
+        .from(schema.knowledgeBaseConnectorsTable)
+        .where(
+          and(
+            eq(schema.knowledgeBaseConnectorsTable.id, params.id),
+            eq(
+              schema.knowledgeBaseConnectorsTable.organizationId,
+              params.organizationId,
+            ),
+            isNotNull(schema.knowledgeBaseConnectorsTable.deletedAt),
+          ),
+        )
+        .for("update")
+        .limit(1);
+      if (!locked) return false;
+
+      const count = await hardDelete(
+        tx,
+        schema.knowledgeBaseConnectorsTable,
+        eq(schema.knowledgeBaseConnectorsTable.id, params.id),
+      );
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      await ResourcePermissionPolicyModel.deleteForTarget({
+        tx,
+        resources: ["knowledgeConnector"],
+        scope: params.id,
+      });
+      // SPDX-SnippetEnd
+      return count > 0;
+    });
+  }
+
+  /** Identity-only audit snapshot for purge audit rows; org-scoped. */
+  static async findIdentityForAudit(
+    id: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [row] = await db
+      .select({
+        id: schema.knowledgeBaseConnectorsTable.id,
+        name: schema.knowledgeBaseConnectorsTable.name,
+        connectorType: schema.knowledgeBaseConnectorsTable.connectorType,
+        deletedAt: schema.knowledgeBaseConnectorsTable.deletedAt,
+      })
+      .from(schema.knowledgeBaseConnectorsTable)
+      .where(
+        and(
+          eq(schema.knowledgeBaseConnectorsTable.id, id),
+          eq(
+            schema.knowledgeBaseConnectorsTable.organizationId,
+            organizationId,
+          ),
+        ),
+      );
+    if (!row) return null;
+    return { ...row, deletedAt: row.deletedAt?.toISOString() ?? null };
+  }
+
+  /**
+   * Link a connector to a knowledge base. Returns false — without writing —
+   * when either side is soft-deleted, which every caller surfaces as a 404.
+   *
+   * A hard delete + FK cascade used to make a link to a gone parent
+   * impossible; under soft-delete the rows survive, so the DB would happily
+   * accept one. Callers validate both sides first (org scope, access control);
+   * this is the last-line guard that closes the delete-in-between window.
+   */
   static async assignToKnowledgeBase(
     connectorId: string,
     knowledgeBaseId: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
+    const [connector] = await db
+      .select({ id: schema.knowledgeBaseConnectorsTable.id })
+      .from(schema.knowledgeBaseConnectorsTable)
+      .where(
+        and(
+          eq(schema.knowledgeBaseConnectorsTable.id, connectorId),
+          notDeleted(schema.knowledgeBaseConnectorsTable),
+        ),
+      );
+    if (!connector) return false;
+
+    const [kb] = await db
+      .select({ id: schema.knowledgeBasesTable.id })
+      .from(schema.knowledgeBasesTable)
+      .where(
+        and(
+          eq(schema.knowledgeBasesTable.id, knowledgeBaseId),
+          notDeleted(schema.knowledgeBasesTable),
+        ),
+      );
+    if (!kb) return false;
+
     await db
       .insert(schema.knowledgeBaseConnectorAssignmentsTable)
       .values({ connectorId, knowledgeBaseId })
       .onConflictDoNothing();
+
+    return true;
   }
 
   static async unassignFromKnowledgeBase(
@@ -318,16 +910,28 @@ class KnowledgeBaseConnectorModel {
   }
 
   static async getKnowledgeBaseIds(connectorId: string): Promise<string[]> {
+    // Join the KB parent so soft-deleted KBs drop out of "which KBs does this
+    // connector feed" — symmetric to getConnectorIds filtering deleted connectors.
     const results = await db
       .select({
         knowledgeBaseId:
           schema.knowledgeBaseConnectorAssignmentsTable.knowledgeBaseId,
       })
       .from(schema.knowledgeBaseConnectorAssignmentsTable)
-      .where(
+      .innerJoin(
+        schema.knowledgeBasesTable,
         eq(
-          schema.knowledgeBaseConnectorAssignmentsTable.connectorId,
-          connectorId,
+          schema.knowledgeBaseConnectorAssignmentsTable.knowledgeBaseId,
+          schema.knowledgeBasesTable.id,
+        ),
+      )
+      .where(
+        and(
+          eq(
+            schema.knowledgeBaseConnectorAssignmentsTable.connectorId,
+            connectorId,
+          ),
+          notDeleted(schema.knowledgeBasesTable),
         ),
       );
 
@@ -341,20 +945,39 @@ class KnowledgeBaseConnectorModel {
       .update(schema.knowledgeBaseConnectorsTable)
       .set({ checkpoint: null })
       .where(
-        eq(schema.knowledgeBaseConnectorsTable.organizationId, organizationId),
+        and(
+          eq(
+            schema.knowledgeBaseConnectorsTable.organizationId,
+            organizationId,
+          ),
+          notDeleted(schema.knowledgeBaseConnectorsTable),
+        ),
       );
   }
 
   static async getConnectorIds(knowledgeBaseId: string): Promise<string[]> {
+    // Joins the connector parent so a soft-deleted-but-still-assigned connector
+    // is dropped from the returned ids — otherwise non-vectorSearch consumers
+    // of these ids (retrieval, hot-path tool visibility) would keep serving it.
     const results = await db
       .select({
         connectorId: schema.knowledgeBaseConnectorAssignmentsTable.connectorId,
       })
       .from(schema.knowledgeBaseConnectorAssignmentsTable)
-      .where(
+      .innerJoin(
+        schema.knowledgeBaseConnectorsTable,
         eq(
-          schema.knowledgeBaseConnectorAssignmentsTable.knowledgeBaseId,
-          knowledgeBaseId,
+          schema.knowledgeBaseConnectorAssignmentsTable.connectorId,
+          schema.knowledgeBaseConnectorsTable.id,
+        ),
+      )
+      .where(
+        and(
+          eq(
+            schema.knowledgeBaseConnectorAssignmentsTable.knowledgeBaseId,
+            knowledgeBaseId,
+          ),
+          notDeleted(schema.knowledgeBaseConnectorsTable),
         ),
       );
 
@@ -376,36 +999,310 @@ class KnowledgeBaseConnectorModel {
             schema.knowledgeBaseConnectorsTable.organizationId,
             organizationId,
           ),
+          // A soft-deleted connector frees its (name, type) for reuse.
+          notDeleted(schema.knowledgeBaseConnectorsTable),
         ),
       );
 
     return result ?? null;
   }
+
+  static async countReferencingGithubAppConfig(params: {
+    githubAppConfigId: string;
+    organizationId: string;
+  }): Promise<number> {
+    const [row] = await db
+      .select({ value: count() })
+      .from(schema.knowledgeBaseConnectorsTable)
+      .where(
+        and(
+          notDeleted(schema.knowledgeBaseConnectorsTable),
+          eq(
+            schema.knowledgeBaseConnectorsTable.organizationId,
+            params.organizationId,
+          ),
+          // only connectors actively authenticating via this App config count;
+          // a stale githubAppConfigId left in the JSON after switching to PAT
+          // must not block deletion. A soft-deleted connector no longer counts.
+          sql`${schema.knowledgeBaseConnectorsTable.config}->>'authMethod' = 'github_app'`,
+          sql`${schema.knowledgeBaseConnectorsTable.config}->>'githubAppConfigId' = ${params.githubAppConfigId}`,
+        ),
+      );
+
+    return row?.value ?? 0;
+  }
+
+  /**
+   * Prior/post-state snapshot for the audit hook. `notDeleted`-filtered like
+   * every other read: both surfaces capture `before` ahead of the handler (the
+   * row is still active then) and never fetch an after-state for a `.deleted`
+   * action, so filtering keeps the delete record's before-state intact while a
+   * re-delete of an already-deleted connector records no phantom prior state.
+   * Returns the raw Drizzle row, not the `omit()`'d API schema.
+   */
+  static async findByIdForAudit(
+    id: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [row] = await db
+      .select()
+      .from(schema.knowledgeBaseConnectorsTable)
+      .where(
+        and(
+          eq(schema.knowledgeBaseConnectorsTable.id, id),
+          eq(
+            schema.knowledgeBaseConnectorsTable.organizationId,
+            organizationId,
+          ),
+          notDeleted(schema.knowledgeBaseConnectorsTable),
+        ),
+      )
+      .limit(1);
+
+    if (!row) return null;
+
+    const kbAssigned = await db
+      .select({
+        id: schema.knowledgeBasesTable.id,
+        name: schema.knowledgeBasesTable.name,
+      })
+      .from(schema.knowledgeBaseConnectorAssignmentsTable)
+      .innerJoin(
+        schema.knowledgeBasesTable,
+        eq(
+          schema.knowledgeBaseConnectorAssignmentsTable.knowledgeBaseId,
+          schema.knowledgeBasesTable.id,
+        ),
+      )
+      .where(eq(schema.knowledgeBaseConnectorAssignmentsTable.connectorId, id));
+
+    const knowledgeBases = kbAssigned
+      .map((r) => `${r.name} (${r.id})`)
+      .sort((a, b) => a.localeCompare(b));
+
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Admin member-override mappings (kb_member_overrides is audited:false).
+    // Without them here, the member-override routes' connector.updated rows
+    // would record identical before/after snapshots — the mapping itself,
+    // who an upstream account resolves to, would never reach the audit log.
+    const overrideRows = await db
+      .select({
+        externalAccountId: schema.kbMemberOverridesTable.externalAccountId,
+        userId: schema.kbMemberOverridesTable.userId,
+        email: schema.usersTable.email,
+      })
+      .from(schema.kbMemberOverridesTable)
+      .leftJoin(
+        schema.usersTable,
+        eq(schema.usersTable.id, schema.kbMemberOverridesTable.userId),
+      )
+      .where(eq(schema.kbMemberOverridesTable.connectorId, id));
+
+    const memberOverrides = overrideRows
+      .map(
+        (o) =>
+          `${o.externalAccountId} -> ${o.email ?? "unknown"} (${o.userId})`,
+      )
+      .sort((a, b) => a.localeCompare(b));
+    // SPDX-SnippetEnd
+
+    const configKeys =
+      row.config && typeof row.config === "object" && !Array.isArray(row.config)
+        ? Object.keys(row.config as Record<string, unknown>).sort()
+        : [];
+
+    return {
+      id: row.id,
+      name: row.name,
+      description: row.description ?? null,
+      organizationId: row.organizationId,
+      connectorType: row.connectorType,
+      visibility: row.visibility,
+      teamIds: [...(row.teamIds ?? [])].sort(),
+      schedule: row.schedule,
+      enabled: row.enabled,
+      lastSyncStatus: row.lastSyncStatus ?? null,
+      lastSyncAt: row.lastSyncAt?.toISOString() ?? null,
+      lastSyncError: row.lastSyncError
+        ? String(row.lastSyncError).slice(0, 500)
+        : null,
+      knowledgeBases,
+      memberOverrides,
+      configKeys,
+      ...(row.config?.type === "github"
+        ? {
+            githubRepositorySettings: {
+              defaults: {
+                includeIssues: row.config.includeIssues ?? true,
+                includePullRequests: row.config.includePullRequests ?? true,
+                includeRepositoryFiles:
+                  row.config.includeRepositoryFiles ?? false,
+                labelsToSkip: row.config.labelsToSkip ?? [],
+                fileTypes: row.config.fileTypes ?? [],
+                includePaths: row.config.includePaths ?? [],
+                excludePaths: row.config.excludePaths ?? [],
+              },
+              repositories: (row.config.repositoryOverrides ?? []).map(
+                ({
+                  repository,
+                  includeIssues,
+                  includePullRequests,
+                  includeRepositoryFiles,
+                  labelsToSkip,
+                  fileTypes,
+                  includePaths,
+                  excludePaths,
+                }) => ({
+                  repository,
+                  includeIssues: includeIssues ?? null,
+                  includePullRequests: includePullRequests ?? null,
+                  includeRepositoryFiles: includeRepositoryFiles ?? null,
+                  labelsToSkip: labelsToSkip ?? null,
+                  fileTypes: fileTypes ?? null,
+                  includePaths: includePaths ?? null,
+                  excludePaths: excludePaths ?? null,
+                }),
+              ),
+            },
+          }
+        : {}),
+      permissionSyncIntervalSeconds: row.permissionSyncIntervalSeconds ?? null,
+      environmentId: row.environmentId ?? null,
+      createdAt: row.createdAt.toISOString(),
+    };
+  }
 }
 
 export default KnowledgeBaseConnectorModel;
 
-function buildVisibilityFilter(params: {
+/**
+ * Which access notion a visibility-filtered read serves.
+ * - `management` (default): the connector itself (lists, detail, config),
+ *   filtered by the same grants for every connector type.
+ * - `query`: which connectors a user's knowledge queries may span —
+ *   auto-sync-permissions connectors stay in scope for everyone; their
+ *   per-chunk ACLs enforce what the user actually retrieves.
+ */
+type ConnectorVisibilityScope = "management" | "query";
+
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+async function buildVisibilityFilter(params: {
+  /** Omitted by lookups keyed by knowledge base, which are not fenced to one. */
+  organizationId?: string;
   canReadAll?: boolean;
+  userId?: string;
+  /** The caller's already-resolved subjects, when the request has them. */
+  principal?: GrantPrincipal;
   teamIds?: string[];
+  scope?: ConnectorVisibilityScope;
 }) {
-  if (params.canReadAll) {
-    return undefined;
-  }
+  if (params.canReadAll && !params.userId) return undefined;
 
-  // No access context means "org-wide only" by default; callers must opt into
-  // team-scoped connectors by passing the viewer's team IDs or canReadAll.
-  if (!params.teamIds || params.teamIds.length === 0) {
-    return sql`${schema.knowledgeBaseConnectorsTable.visibility} != 'team-scoped'`;
-  }
-
-  const teamIds = sql.join(
-    params.teamIds.map((teamId) => sql`${teamId}`),
-    sql`, `,
+  const table = schema.knowledgeBaseConnectorsTable;
+  const context = {
+    organizationId: table.organizationId,
+    resource: "knowledgeConnector" as const,
+    scopeColumn: table.id,
+    action: params.scope === "query" ? ("use" as const) : ("read" as const),
+  };
+  const principals =
+    params.principal || params.userId
+      ? params.principal
+        ? [params.principal]
+        : await ResourcePermissionSubjectModel.resolvePrincipals({
+            userId: params.userId ?? "",
+            organizationId: params.organizationId,
+          })
+      : undefined;
+  const kbContext = {
+    organizationId: table.organizationId,
+    resource: "knowledgeBase" as const,
+    scopeColumn: sql`permission_kb_assignment.knowledge_base_id`,
+    action: "use" as const,
+  };
+  const grantReach = (targetContext: typeof context | typeof kbContext) =>
+    principals
+      ? params.userId
+        ? ResourcePermissionPolicyModel.grantConditionForAny({
+            ...targetContext,
+            organizationColumn: table.organizationId,
+            principals,
+          })
+        : or(
+            ResourcePermissionPolicyModel.grantConditionForAny({
+              ...targetContext,
+              organizationColumn: table.organizationId,
+              principals,
+            }),
+            ResourcePermissionPolicyModel.organizationAccessCondition(
+              targetContext,
+            ),
+          )
+      : // A caller with no user of its own reaches what is published to the
+        // organization at large, plus what its teams were granted.
+        or(
+          ResourcePermissionPolicyModel.organizationAccessCondition(
+            targetContext,
+          ),
+          ResourcePermissionPolicyModel.grantsReadToAnyTeam({
+            ...targetContext,
+            teamIds: params.teamIds ?? [],
+          }),
+        );
+  const reach = or(
+    grantReach(context),
+    // Queries span every auto-sync connector, every file-upload connector, and
+    // every connector assigned to a knowledge base the caller holds Can use on.
+    params.scope === "query"
+      ? or(
+          eq(table.syncPermissionsFromSource, true),
+          eq(table.connectorType, "file_upload"),
+          sql`EXISTS (
+            SELECT 1 FROM ${schema.knowledgeBaseConnectorAssignmentsTable} permission_kb_assignment
+            INNER JOIN ${schema.knowledgeBasesTable} permission_kb
+              ON permission_kb.id = permission_kb_assignment.knowledge_base_id
+              AND permission_kb.deleted_at IS NULL
+            WHERE permission_kb_assignment.connector_id = ${table.id}
+              AND ${grantReach(kbContext)}
+          )`,
+        )
+      : undefined,
   );
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  return reach;
+}
+// SPDX-SnippetEnd
 
-  return sql`(
-    ${schema.knowledgeBaseConnectorsTable.visibility} != 'team-scoped'
-    OR ${schema.knowledgeBaseConnectorsTable.teamIds} ?| ARRAY[${teamIds}]
-  )`;
+/**
+ * Ceiling for {@link KnowledgeBaseConnectorModel.purge}'s transaction, ten
+ * times the pool-wide default. The document/chunk cascade happens INSIDE the
+ * DELETE statement, so the pool-wide 30s `statement_timeout` applies to the
+ * whole of it; for a connector with a large corpus that aborts identically on
+ * every retry, making the row permanently un-purgeable. `SET LOCAL` scopes the
+ * change to this transaction and reverts on commit, so no other query loses
+ * its safety net. Finite rather than unlimited: a purge that cannot finish in
+ * five minutes should surface as a failure, not hold locks indefinitely.
+ */
+const PURGE_STATEMENT_TIMEOUT_MS = 300_000;
+
+/**
+ * The permission-sync switch a write sets: stated outright, or implied by the
+ * visibility input that still carries it (`auto-sync-permissions`). Undefined
+ * when the write touches neither, so the stored switch stays as it is.
+ */
+function syncSwitchFor(data: {
+  syncPermissionsFromSource?: boolean;
+  visibility?: string;
+}): boolean | undefined {
+  if (data.syncPermissionsFromSource !== undefined) {
+    return data.syncPermissionsFromSource;
+  }
+  if (data.visibility === undefined) return undefined;
+  return data.visibility === "auto-sync-permissions";
 }

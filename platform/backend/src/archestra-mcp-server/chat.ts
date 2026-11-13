@@ -1,32 +1,35 @@
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
-  TOOL_ARTIFACT_WRITE_SHORT_NAME,
-  TOOL_SWAP_AGENT_SHORT_NAME,
-  TOOL_SWAP_TO_DEFAULT_AGENT_SHORT_NAME,
+  ASK_USER_OTHER_ANSWER_FIELD,
+  TOOL_ASK_USER_SHORT_NAME,
+  TOOL_EXECUTE_REMEDY_PLAN_SHORT_NAME,
   TOOL_TODO_WRITE_SHORT_NAME,
-  type ToolStateMcpToolError,
-  ToolStateMcpToolErrorSchema,
-} from "@shared";
+} from "@archestra/shared";
 import { z } from "zod";
-import { isAgentTypeAdmin } from "@/auth/agent-type-permissions";
 import logger from "@/logging";
 import {
-  AgentModel,
-  ChatOpsChannelBindingModel,
-  ChatOpsThreadAgentOverrideModel,
-  ConversationModel,
-  OrganizationModel,
-  ScheduleTriggerRunModel,
-} from "@/models";
-import { resolveConversationLlmSelectionForAgent } from "@/utils/llm-resolution";
+  CurrentTrajectorySchema,
+  parseCurrentTrajectory,
+} from "@/openappa/current-trajectory";
+import {
+  getHitlAskUserArguments,
+  hitlRulingFromLabels,
+  peekHitlDecision,
+  recordHitlRuling,
+  reviewSessionFromTrajectory,
+  sealHitlClosure,
+} from "@/openappa/hitl-review";
+import type { OpenAppaSession } from "@/openappa/service";
+import {
+  authenticatedRuntimeSpender,
+  parseWorkloadPrincipal,
+} from "@/services/agent-runtime/runtime-identity";
+import { archestraMcpBranding } from "./branding";
 import {
   catchError,
   defineArchestraTool,
   defineArchestraTools,
-  EmptyToolArgsSchema,
   errorResult,
   structuredSuccessResult,
-  structuredToolErrorResult,
 } from "./helpers";
 import type { ArchestraContext } from "./types";
 
@@ -53,40 +56,100 @@ const TodoWriteOutputSchema = z.object({
     .describe("How many todo items were written."),
 });
 
-const SwapAgentStateCodeSchema = z.enum([
-  "no_agent_found",
-  "already_using_agent",
-  "no_default_agent",
-  "default_agent_not_found",
-  "already_using_default_agent",
-]);
-
-const SwapAgentOutputSchema = z.discriminatedUnion("success", [
-  z.object({
-    success: z.literal(true).describe("Whether the swap succeeded."),
-    agent_id: z.string().describe("The agent ID the conversation now uses."),
-    agent_name: z
+const AskUserOptionSchema = z
+  .object({
+    label: z.string().min(1).max(200).describe("The option shown to the user."),
+    description: z
       .string()
-      .describe("The agent name the conversation now uses."),
-  }),
-  z.object({
-    success: z.literal(false).describe("Whether the swap succeeded."),
-    code: SwapAgentStateCodeSchema.describe("Why the swap was not applied."),
-    message: z.string().describe("Human-readable explanation."),
-    archestraError: ToolStateMcpToolErrorSchema,
-  }),
-]);
+      .max(500)
+      .optional()
+      .describe("Optional extra detail shown next to the option."),
+  })
+  .strict();
 
-type SwapAgentStateCode = z.infer<typeof SwapAgentStateCodeSchema>;
-
-const ArtifactWriteOutputSchema = z.object({
-  success: z.literal(true).describe("Whether the artifact write succeeded."),
-  characterCount: z
-    .number()
-    .int()
-    .nonnegative()
-    .describe("The number of characters written to the artifact."),
+const AskUserOutputSchema = z.object({
+  action: z
+    .enum(["accept", "decline", "cancel"])
+    .describe("Whether the choice form was submitted, declined, or canceled."),
+  selected: z
+    .array(z.string())
+    .describe("The labels the user selected. Empty when declined or canceled."),
+  text: z
+    .string()
+    .optional()
+    .describe("What the user typed instead of picking an option."),
+  timedOut: z
+    .boolean()
+    .optional()
+    .describe("True when the question expired without an answer."),
 });
+
+const AskUserSchema = z.object({
+  question: z
+    .string()
+    .min(1)
+    .max(2000)
+    .describe(
+      "The question shown above the options, as plain text. Put links and commands in your reply text.",
+    ),
+  header: z
+    .string()
+    .trim()
+    .min(1)
+    .max(30)
+    .optional()
+    .describe(
+      "A very short label shown as the question's tab, e.g. 'Visibility'.",
+    ),
+  options: z
+    .array(AskUserOptionSchema)
+    .min(2)
+    .max(12)
+    .describe("The options the user can pick. Labels must be unique."),
+  allowMultiple: z
+    .boolean()
+    .optional()
+    .describe(
+      "When true, the user may select more than one option. Defaults to false (exactly one).",
+    ),
+  remedy_offer_ids: z
+    .array(z.string().min(1).max(128))
+    .max(12)
+    .optional()
+    .describe(
+      "Exact offer IDs from the blocked ruling that this question asks the user to decide: a review execute_remedy_plan requires, or a plan that would prevent what the user asked for. Say in the question what it would prevent. Omit for ordinary questions.",
+    ),
+});
+
+const AskUserExecutionSchema = AskUserSchema.extend({
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  // The proxy can replace the question with a complete HITL review. Its size
+  // is not bounded by the ordinary question limit; the handler resolves the
+  // scoped, server-held review before allowing that exception.
+  question: z.string().min(1),
+  // SPDX-SnippetEnd
+  // Earlier proxy versions attached option previews to staged review calls.
+  // Bound reviews use server-held arguments; ordinary questions still use
+  // the public option schema.
+  options: z
+    .array(AskUserOptionSchema.extend({ preview: z.string().optional() }))
+    .min(2)
+    .max(12),
+  trajectory: CurrentTrajectorySchema.optional(),
+});
+
+const NO_CHOICE_FORM_MESSAGE =
+  "This client did not answer the choice form. Use its own question tool only if the user permits it and it supports all choices. Otherwise explain that this gateway question could not be shown and wait for the user. Do not repeat this call unchanged or treat it as a user answer. Do not ask this as a plain-text chat question.";
+
+// A headless run (A2A, ChatOps, a schedule, a subagent) has no one to show a
+// form to; the reply is the only place a question can reach the user.
+const NO_VIEWER_MESSAGE =
+  "No one can answer a choice form in this session. Ask the question in your reply instead, and list the options.";
+
+const HITL_NO_VIEWER_MESSAGE =
+  "This client cannot show the HITL review. Keep the tool call blocked. Do not ask for approval in plain text and do not retry it.";
 
 const registry = defineArchestraTools([
   defineArchestraTool({
@@ -106,7 +169,11 @@ const registry = defineArchestraTools([
       const { agent: contextAgent } = context;
 
       logger.info(
-        { agentId: contextAgent.id, todoArgs: args },
+        {
+          agentId: contextAgent.id,
+          argumentKeys: Object.keys(args),
+          argumentsSize: JSON.stringify(args).length,
+        },
         "todo_write tool called",
       );
 
@@ -121,115 +188,196 @@ const registry = defineArchestraTools([
     },
   }),
   defineArchestraTool({
-    shortName: TOOL_SWAP_AGENT_SHORT_NAME,
-    title: "Swap Agent",
-    description:
-      "Switch the current conversation to a different agent. The new agent will automatically continue the conversation. Use this when the user asks to switch to or talk to a different agent.",
-    schema: z
-      .object({
-        agent_name: z
-          .string()
-          .trim()
-          .min(1)
-          .describe("The name of the agent to switch to."),
-      })
-      .strict(),
-    outputSchema: SwapAgentOutputSchema,
-    async handler({ args, context }) {
-      return handleSwapAgent({
-        agentName: args.agent_name,
-        context,
-      });
-    },
-  }),
-  defineArchestraTool({
-    shortName: TOOL_SWAP_TO_DEFAULT_AGENT_SHORT_NAME,
-    title: "Swap to Default Agent",
-    description:
-      "Return to the default agent. You MUST call this — without asking the user — when you don't have the right tools to fulfill a request, when you are stuck and cannot help further, when you are done with your task, or when the user wants to go back. Always write a brief message before calling this tool summarizing why you are switching back (e.g. what you accomplished, what tool is missing, or why you cannot continue).",
-    schema: EmptyToolArgsSchema,
-    outputSchema: SwapAgentOutputSchema,
-    async handler({ context }) {
-      return handleSwapToDefaultAgent({ context });
-    },
-  }),
-  defineArchestraTool({
-    shortName: TOOL_ARTIFACT_WRITE_SHORT_NAME,
-    title: "Write Artifact",
-    description:
-      "Write or update a markdown artifact for the current conversation. Use this tool to maintain a persistent document that evolves throughout the conversation. The artifact should contain well-structured markdown content that can be referenced and updated as the conversation progresses. Each call to this tool completely replaces the existing artifact content. " +
-      "Mermaid diagrams: Use ```mermaid blocks. " +
-      "Supports: Headers, emphasis, lists, links, images, code blocks, tables, blockquotes, task lists, mermaid diagrams.",
-    schema: z
-      .object({
-        content: z
-          .string()
-          .min(1)
-          .describe(
-            "The markdown content to write to the conversation artifact. This completely replaces any existing artifact content.",
-          ),
-      })
-      .strict(),
-    outputSchema: ArtifactWriteOutputSchema,
-    async handler({ args, context }) {
-      const { agent: contextAgent } = context;
+    shortName: TOOL_ASK_USER_SHORT_NAME,
+    title: "Ask User",
+    description: `Ask the user to pick from a short list of options. For guardrail reviews, use this tool with the offer IDs: the platform shows the review in the client's own question card or form. Do not substitute a native question or a plain-text answer for that review. For connected clients, the platform renders an offer-bound approval card; its native schema omits remedy_offer_ids by design. Do not reconstruct the card or mistake its platform-generated text for your own. Supported clients offer Inspect to show the complete review in the conversation. For ordinary questions, prefer the client's own question tool (Claude Code AskUserQuestion, Codex, OpenCode) when it supports all choices and the user has not explicitly requested this gateway tool. Otherwise call this tool: ${archestraMcpBranding.appName} chat shows the options as a form, and MCP clients get them with elicitation/create. Some clients use proxy conversion to their native question tool when it supports all choices. Other clients without MCP elicitation cannot show this form. Ask multiple-choice questions, including yes or no, with a question tool rather than in plain text. Links and commands go in your reply text, not in the question or options: question forms show them as plain text. The form always adds its own "Type something" choice, so the user may type an answer instead of picking, returned as \`text\`; do not add an "Other" option. It is not for secrets, so never ask for a password, token, or key this way. To ask several questions at once, call this tool once per question in the same turn and give each a short header.`,
+    schema: AskUserExecutionSchema,
+    publicSchema: AskUserSchema,
+    outputSchema: AskUserOutputSchema,
+    async handler({ args, context, toolName }) {
+      const review = remedyReviewScope(args, context);
+      const liveOffers = review?.ids ?? [];
+      const session = review?.session;
+      const hitlArgs = session
+        ? await getHitlAskUserArguments({
+            session,
+            offerIds: liveOffers,
+            presentation: "form",
+          })
+        : undefined;
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      // An offer ID or trajectory alone must not relax ordinary validation.
+      // Only a live review supplies the canonical text shown to the user.
+      if (!hitlArgs) AskUserSchema.parse(args);
+      // SPDX-SnippetEnd
+      // A staged HITL review owns its copy and fixed choices. The model can
+      // route the offer to ask_user, but it cannot soften or replace the review.
+      const effectiveArgs = hitlArgs ?? args;
+      const labels = effectiveArgs.options.map((option) => option.label);
+      if (new Set(labels).size !== labels.length) {
+        return errorResult("Give each option a different label.");
+      }
+      // A guardrail review is a decision, so only ordinary questions take text.
+      const allowText = !hitlArgs;
 
-      logger.info(
-        {
-          agentId: contextAgent.id,
-          contentLength: args.content.length,
-          scheduleTriggerRunId: context.scheduleTriggerRunId ?? null,
-          conversationId: context.conversationId ?? null,
-          userId: context.userId ?? null,
-          organizationId: context.organizationId ?? null,
-        },
-        "artifact_write tool called",
-      );
-
-      try {
-        // Scheduled run context — write to the run (conversationId is a
-        // synthetic isolation key, not a real DB conversation)
-        if (context.scheduleTriggerRunId) {
-          const updated = await ScheduleTriggerRunModel.setArtifact(
-            context.scheduleTriggerRunId,
-            args.content,
-          );
-
-          if (!updated) {
-            return errorResult(
-              "Failed to update scheduled run artifact. The run may no longer exist.",
-            );
-          }
-        } else if (
-          context.conversationId &&
-          context.userId &&
-          context.organizationId
-        ) {
-          const updated = await ConversationModel.update(
-            context.conversationId,
-            context.userId,
-            context.organizationId,
-            { artifact: args.content },
-          );
-
-          if (!updated) {
-            return errorResult(
-              "Failed to update conversation artifact. The conversation may not exist or you may not have permission to update it.",
-            );
-          }
-        } else {
+      const elicitation = context.elicitation;
+      // The live review text is gone once the review is closed. The offer id
+      // still identifies that closure, so do not open another form.
+      if (session && liveOffers.length === 1) {
+        const closed = await peekHitlDecision({
+          session,
+          offerId: liveOffers[0],
+        });
+        if (closed?.ruling === "none" || closed?.ruling === "deny") {
           return errorResult(
-            "This tool requires conversation context. It can only be used within an active chat conversation or scheduled run.",
+            "This review is already closed. Keep the call blocked. Do not ask again.",
           );
         }
-
-        return structuredSuccessResult(
-          { success: true, characterCount: args.content.length },
-          `Successfully updated artifact (${args.content.length} characters)`,
-        );
-      } catch (error) {
-        return catchError(error, "writing artifact");
       }
+      if (!elicitation) {
+        if (hitlArgs && session) {
+          const stored = await sealOrReturnStoredRuling({
+            session,
+            offerId: hitlArgs.remedy_offer_ids[0],
+            closure: "unavailable",
+          });
+          if (stored) return stored;
+        }
+        return errorResult(
+          hitlArgs ? HITL_NO_VIEWER_MESSAGE : NO_VIEWER_MESSAGE,
+        );
+      }
+
+      const outcome = await elicitation.elicit({
+        toolName,
+        message: effectiveArgs.question,
+        requestedSchema: withTextField({
+          schema: effectiveArgs.allowMultiple
+            ? buildMultiChoiceSchema(effectiveArgs.options)
+            : buildSingleChoiceSchema(
+                effectiveArgs.options,
+                hitlArgs ? "Decision" : "Choice",
+              ),
+          allowText,
+        }),
+        toolCallId: context.currentToolCallId,
+        header: effectiveArgs.header,
+      });
+
+      // The gateway also reports a decline no person gave as no viewer.
+      if (outcome.status === "no_viewer") {
+        if (hitlArgs && session) {
+          const stored = await sealOrReturnStoredRuling({
+            session,
+            offerId: hitlArgs.remedy_offer_ids[0],
+            closure: "unavailable",
+          });
+          if (stored) return stored;
+        }
+        return errorResult(
+          hitlArgs ? HITL_NO_VIEWER_MESSAGE : NO_CHOICE_FORM_MESSAGE,
+        );
+      }
+
+      // No answer in time reads as a dismissal: nothing was accepted.
+      const result =
+        outcome.status === "answered"
+          ? outcome.result
+          : { action: "cancel" as const };
+      if (result.action !== "accept") {
+        const action = result.action === "decline" ? "decline" : "cancel";
+        // A client decline or dismissal is not a human Deny, including when
+        // the form carried a staged review.
+        if (hitlArgs && session) {
+          const stored = await sealOrReturnStoredRuling({
+            session,
+            offerId: hitlArgs.remedy_offer_ids[0],
+            closure:
+              outcome.status === "unanswered"
+                ? "unanswered"
+                : action === "decline"
+                  ? "declined"
+                  : "cancelled",
+          });
+          if (stored) return stored;
+        }
+        return structuredSuccessResult(
+          {
+            action,
+            selected: [],
+            ...(outcome.status === "unanswered" ? { timedOut: true } : {}),
+          },
+          [
+            outcome.status === "unanswered"
+              ? "The user did not answer the question in time."
+              : action === "decline"
+                ? "The MCP client declined the choice form. It may not have reached the user."
+                : "The user dismissed the question.",
+            "No selection was returned. Do not ask again, offer the same options in prose, or end with a follow-up question or invitation. Wait for a new user message before revisiting this question.",
+            // Several questions asked in one turn all carry the turn's offers,
+            // so a dismissed one only refuses the remedy if it offered it.
+            liveOffers.length > 0
+              ? "If this question offered the remedy, the user did not accept it: do not retry the blocked call and do not ask again. Briefly state that the action remains blocked, without repeating the offered plan, and stop."
+              : "Do not proceed with the question.",
+          ].join(" "),
+        );
+      }
+
+      const selected = selectedLabels({
+        content: result.content,
+        options: effectiveArgs.options,
+        allowMultiple: effectiveArgs.allowMultiple === true,
+      });
+      const text = allowText ? typedText(result.content) : undefined;
+      if (selected.length === 0 && text === undefined) {
+        return errorResult(
+          allowText
+            ? "The user sent the form with no option selected and no text."
+            : "The user sent the form with no option selected.",
+        );
+      }
+      if (!effectiveArgs.allowMultiple && selected.length > 1) {
+        return errorResult("The user selected more than one option.");
+      }
+      const hitlRuling = hitlArgs ? hitlRulingFromLabels(selected) : undefined;
+      if (hitlArgs && !hitlRuling) {
+        return errorResult("The HITL review returned an invalid choice.");
+      }
+      if (hitlArgs && hitlRuling && session) {
+        const recorded = await recordHitlRuling({
+          session,
+          offerId: hitlArgs.remedy_offer_ids[0],
+          ruling: hitlRuling,
+        });
+        if (!recorded) {
+          return errorResult(
+            "This review is no longer pending. No ruling was recorded. Keep the call blocked and do not reopen the review automatically.",
+          );
+        }
+      }
+
+      return structuredSuccessResult(
+        { action: "accept", selected, ...(text === undefined ? {} : { text }) },
+        [
+          selected.length > 0
+            ? `The user picked: ${selected.join(", ")}. Act on this choice.`
+            : "",
+          text === undefined
+            ? ""
+            : `The user typed: ${JSON.stringify(text)}. Act on this answer.`,
+          hitlRuling === "deny"
+            ? "The user denied the remedy. Keep the blocked call blocked. Do not ask again and do not call execute_remedy_plan."
+            : liveOffers.length > 0
+              ? `Live remedy offers: ${liveOffers.join(", ")}. If the user's pick accepts a remedy, apply it with ${archestraMcpBranding.getToolName(
+                  TOOL_EXECUTE_REMEDY_PLAN_SHORT_NAME,
+                )} using the offer_id and plan from the ruling, then retry the blocked call after the plan is authorized. The user already answered, so do not ask about the same plan again.`
+              : "",
+        ]
+          .filter((part) => part.length > 0)
+          .join(" "),
+      );
     },
   }),
 ] as const);
@@ -240,354 +388,157 @@ export const toolEntries = registry.toolEntries;
 
 export const tools = registry.tools;
 
-function swapAgentStateResult(params: {
-  code: SwapAgentStateCode;
-  message: string;
-  toolName: string;
-}): CallToolResult {
-  const archestraError: ToolStateMcpToolError = {
-    type: "tool_state",
-    code: params.code,
-    message: params.message,
-    toolName: params.toolName,
+async function sealOrReturnStoredRuling(params: {
+  session: OpenAppaSession;
+  offerId: string;
+  closure: "declined" | "cancelled" | "unanswered" | "unavailable";
+}) {
+  const sealed = await sealHitlClosure(params);
+  if (sealed !== "approve" && sealed !== "deny") return undefined;
+  return structuredSuccessResult(
+    {
+      action: "accept" as const,
+      selected: [sealed === "approve" ? "Approve" : "Deny"],
+    },
+    sealed === "approve"
+      ? "An approval is already recorded for this offer. Retry execute_remedy_plan for the same offer before retrying the blocked call. Do not ask again."
+      : "A denial is already recorded for this offer. The original call remains blocked. Do not ask again and do not call execute_remedy_plan.",
+  );
+}
+
+function buildSingleChoiceSchema(
+  options: Array<{ label: string; description?: string }>,
+  title = "Choice",
+) {
+  const enumDescriptions = options.map((option) => option.description);
+  return {
+    type: "object" as const,
+    properties: {
+      choice: {
+        type: "string" as const,
+        title,
+        enum: options.map((option) => option.label),
+        ...(enumDescriptions.some((description) => description)
+          ? { enumDescriptions }
+          : {}),
+      },
+    },
+    required: ["choice"],
   };
+}
 
-  return structuredToolErrorResult({
-    error: archestraError,
-    text: JSON.stringify({
-      success: false,
-      code: params.code,
-      message: params.message,
-      archestraError,
-    }),
-    structuredContent: {
-      success: false,
-      code: params.code,
-      message: params.message,
+/**
+ * Adds an optional "Type something" text field. The pick turns optional too, so a
+ * typed answer stands on its own.
+ */
+function withTextField(params: {
+  schema:
+    | ReturnType<typeof buildSingleChoiceSchema>
+    | ReturnType<typeof buildMultiChoiceSchema>;
+  allowText: boolean;
+}) {
+  const { schema, allowText } = params;
+  if (!allowText) return schema;
+  return {
+    type: "object" as const,
+    properties: {
+      ...schema.properties,
+      [ASK_USER_OTHER_ANSWER_FIELD]: {
+        type: "string" as const,
+        title: "Type something",
+      },
     },
-    // These are expected chat-routing states, not MCP transport failures. Keep
-    // isError false so the agent can respond normally instead of surfacing a
-    // global chat error.
-    isError: false,
+    required: [],
+  };
+}
+
+function typedText(content: unknown): string | undefined {
+  if (!content || typeof content !== "object" || Array.isArray(content)) {
+    return undefined;
+  }
+  const value = (content as Record<string, unknown>)[
+    ASK_USER_OTHER_ANSWER_FIELD
+  ];
+  const text = typeof value === "string" ? value.trim() : "";
+  return text.length > 0 ? text : undefined;
+}
+
+function optionKey(index: number) {
+  return `option_${index}`;
+}
+
+function remedyReviewScope(
+  args: {
+    remedy_offer_ids?: string[];
+    trajectory?: unknown;
+  },
+  context: ArchestraContext,
+): { session: OpenAppaSession; ids: string[] } | undefined {
+  const ids = args.remedy_offer_ids;
+  if (!ids || ids.length === 0 || !context.organizationId) return undefined;
+  const trajectory = parseCurrentTrajectory(args.trajectory);
+  if (!trajectory) return undefined;
+  const session = reviewSessionFromTrajectory({
+    organizationId: context.organizationId,
+    trajectory,
+    context,
   });
+  const callerId = session.caller_id;
+  const spender = authenticatedRuntimeSpender({
+    userId: context.userId,
+    callerId: context.openappaSession?.caller_id,
+  });
+  if (
+    !spender ||
+    (parseWorkloadPrincipal(spender) && callerId !== spender) ||
+    (parseWorkloadPrincipal(callerId) && callerId !== spender)
+  )
+    return undefined;
+  return {
+    session,
+    ids,
+  };
 }
 
-async function handleSwapAgent(params: {
-  agentName: string;
-  context: ArchestraContext;
-}): Promise<CallToolResult> {
-  const { agentName, context } = params;
-  const { agent: contextAgent } = context;
-  logger.info(
-    {
-      agentId: contextAgent.id,
-      agentName,
-      chatOpsBindingId: context.chatOpsBindingId ?? null,
-      conversationId: context.conversationId ?? null,
-    },
-    "swap_agent tool called",
-  );
-
-  try {
-    if (!context.userId || !context.organizationId) {
-      return errorResult(
-        "This tool requires user and organization context. It can only be used within an authenticated chat session.",
-      );
-    }
-
-    const hasConversationContext = Boolean(context.conversationId);
-    const hasChatOpsContext = Boolean(context.chatOpsBindingId);
-    if (!hasConversationContext && !hasChatOpsContext) {
-      return errorResult(
-        "This tool requires conversation context. It can only be used within an active chat conversation or chatops channel.",
-      );
-    }
-
-    // Look up agent by name
-    const isAdmin =
-      context.userId && context.organizationId
-        ? await isAgentTypeAdmin({
-            userId: context.userId,
-            organizationId: context.organizationId,
-            agentType: "agent",
-          })
-        : false;
-
-    const results = await AgentModel.findAllPaginated(
-      { limit: 5, offset: 0 },
-      undefined,
-      {
-        name: agentName,
-        agentType: "agent",
-        // Hide other users' personal agents. swap_agent is the primary
-        // Archestra MCP use-case and requires only the caller's own personal
-        // agents to be visible, even though admins can see all personal
-        // agents in the UI.
-        excludeOtherPersonalAgents: true,
-      },
-      context.userId,
-      isAdmin,
-    );
-
-    if (results.data.length === 0) {
-      return swapAgentStateResult({
-        code: "no_agent_found",
-        message: `No agent found matching "${agentName}".`,
-        toolName: TOOL_SWAP_AGENT_SHORT_NAME,
-      });
-    }
-
-    // Pick exact name match if available, otherwise first result
-    const targetAgent =
-      results.data.find(
-        (a) => a.name.toLowerCase() === agentName.toLowerCase(),
-      ) ?? results.data[0];
-
-    // Prevent swapping to the same agent
-    if (targetAgent.id === contextAgent.id) {
-      return swapAgentStateResult({
-        code: "already_using_agent",
-        message: `Already using agent "${targetAgent.name}". Choose a different agent.`,
-        toolName: TOOL_SWAP_AGENT_SHORT_NAME,
-      });
-    }
-
-    // In chatops-triggered A2A runs we can have both:
-    // - chatOpsBindingId: real channel binding context
-    // - conversationId: synthetic isolation key for tool/session caching
-    // Prefer the chatops binding whenever available.
-    if (context.chatOpsBindingId) {
-      if (!context.chatOpsThreadId) {
-        return errorResult(
-          "This tool requires thread context in chatops. Cannot determine which thread to swap.",
-        );
-      }
-
-      // Validate binding exists and user has permission
-      const binding = await ChatOpsChannelBindingModel.findById(
-        context.chatOpsBindingId,
-      );
-      if (!binding || binding.organizationId !== context.organizationId) {
-        return errorResult("Failed to update chatops channel agent.");
-      }
-
-      // Personal agent scope check
-      if (targetAgent.scope === "personal") {
-        if (!binding.isDm) {
-          return errorResult(
-            "Personal agents cannot be assigned to channels. Use an org-scoped or team-scoped agent instead.",
-          );
-        }
-        if (targetAgent.authorId !== context.userId) {
-          return errorResult(
-            "You can only assign your own personal agents to your DM.",
-          );
-        }
-      }
-
-      // Write thread-scoped override instead of mutating channel binding
-      const override = await ChatOpsThreadAgentOverrideModel.upsert(
-        context.chatOpsBindingId,
-        context.chatOpsThreadId,
-        targetAgent.id,
-      );
-      if (!override) {
-        return errorResult("Failed to update chatops thread agent.");
-      }
-    } else if (context.conversationId) {
-      const llmSelection = await resolveConversationLlmSelectionForAgent({
-        agent: {
-          llmApiKeyId: targetAgent.llmApiKeyId ?? null,
-          llmModel: targetAgent.llmModel ?? null,
-        },
-        organizationId: context.organizationId,
-        userId: context.userId,
-      });
-
-      // Update the conversation's agent and LLM selection together so the
-      // follow-up response uses the new agent's model/key immediately.
-      const updated = await ConversationModel.update(
-        context.conversationId,
-        context.userId,
-        context.organizationId,
+function buildMultiChoiceSchema(
+  options: Array<{ label: string; description?: string }>,
+) {
+  return {
+    type: "object" as const,
+    properties: Object.fromEntries(
+      options.map((option, index) => [
+        optionKey(index),
         {
-          agentId: targetAgent.id,
-          chatApiKeyId: llmSelection.chatApiKeyId,
-          selectedModel: llmSelection.selectedModel,
-          selectedProvider: llmSelection.selectedProvider,
+          type: "boolean" as const,
+          title: option.label,
+          description: option.description,
+          default: false,
         },
-      );
-      if (!updated) {
-        logger.warn(
-          {
-            conversationId: context.conversationId,
-            userId: context.userId,
-            organizationId: context.organizationId,
-            chatOpsBindingId: context.chatOpsBindingId ?? null,
-          },
-          "swap_agent: conversation update failed, possible missing chatOpsBindingId",
-        );
-        return errorResult("Failed to update conversation agent.");
-      }
-    }
-
-    return structuredSuccessResult(
-      {
-        success: true,
-        agent_id: targetAgent.id,
-        agent_name: targetAgent.name,
-      },
-      `Successfully swapped to agent "${targetAgent.name}" (ID: ${targetAgent.id}).`,
-    );
-  } catch (error) {
-    return catchError(error, "swapping agent");
-  }
+      ]),
+    ),
+  };
 }
 
-async function handleSwapToDefaultAgent(params: {
-  context: ArchestraContext;
-}): Promise<CallToolResult> {
-  const { context } = params;
-  const { agent: contextAgent } = context;
-
-  logger.info(
-    {
-      agentId: contextAgent.id,
-      chatOpsBindingId: context.chatOpsBindingId ?? null,
-      conversationId: context.conversationId ?? null,
-    },
-    "swap_to_default_agent tool called",
-  );
-
-  try {
-    if (!context.userId || !context.organizationId) {
-      return errorResult(
-        "This tool requires user and organization context. It can only be used within an authenticated chat session.",
-      );
-    }
-
-    const hasConversationContext = Boolean(context.conversationId);
-    const hasChatOpsContext = Boolean(context.chatOpsBindingId);
-    if (!hasConversationContext && !hasChatOpsContext) {
-      return errorResult(
-        "This tool requires conversation context. It can only be used within an active chat conversation or chatops channel.",
-      );
-    }
-
-    const org = await OrganizationModel.getById(context.organizationId);
-    const defaultAgentId = org?.defaultAgentId ?? null;
-
-    if (!defaultAgentId) {
-      return swapAgentStateResult({
-        code: "no_default_agent",
-        message: "No default agent is configured for this organization.",
-        toolName: TOOL_SWAP_TO_DEFAULT_AGENT_SHORT_NAME,
-      });
-    }
-
-    const targetAgent = await AgentModel.findById(defaultAgentId);
-    if (!targetAgent) {
-      return swapAgentStateResult({
-        code: "default_agent_not_found",
-        message: "Default agent not found.",
-        toolName: TOOL_SWAP_TO_DEFAULT_AGENT_SHORT_NAME,
-      });
-    }
-
-    if (targetAgent.id === contextAgent.id) {
-      return swapAgentStateResult({
-        code: "already_using_default_agent",
-        message: `Already using the default agent "${targetAgent.name}".`,
-        toolName: TOOL_SWAP_TO_DEFAULT_AGENT_SHORT_NAME,
-      });
-    }
-
-    // In chatops-triggered A2A runs we can have both:
-    // - chatOpsBindingId: real channel binding context
-    // - conversationId: synthetic isolation key for tool/session caching
-    // Prefer the chatops binding whenever available.
-    if (context.chatOpsBindingId) {
-      if (!context.chatOpsThreadId) {
-        return errorResult(
-          "This tool requires thread context in chatops. Cannot determine which thread to swap.",
-        );
-      }
-
-      // Validate binding exists and user has permission
-      const binding = await ChatOpsChannelBindingModel.findById(
-        context.chatOpsBindingId,
-      );
-      if (!binding || binding.organizationId !== context.organizationId) {
-        return errorResult("Failed to update chatops channel agent.");
-      }
-
-      // Personal agent scope check
-      if (targetAgent.scope === "personal") {
-        if (!binding.isDm) {
-          return errorResult(
-            "Personal agents cannot be assigned to channels. Use an org-scoped or team-scoped agent instead.",
-          );
-        }
-        if (targetAgent.authorId !== context.userId) {
-          return errorResult(
-            "You can only assign your own personal agents to your DM.",
-          );
-        }
-      }
-
-      // Write thread-scoped override instead of mutating channel binding
-      const override = await ChatOpsThreadAgentOverrideModel.upsert(
-        context.chatOpsBindingId,
-        context.chatOpsThreadId,
-        targetAgent.id,
-      );
-      if (!override) {
-        return errorResult("Failed to update chatops thread agent.");
-      }
-    } else if (context.conversationId) {
-      const llmSelection = await resolveConversationLlmSelectionForAgent({
-        agent: {
-          llmApiKeyId: targetAgent.llmApiKeyId ?? null,
-          llmModel: targetAgent.llmModel ?? null,
-        },
-        organizationId: context.organizationId,
-        userId: context.userId,
-      });
-
-      const updated = await ConversationModel.update(
-        context.conversationId,
-        context.userId,
-        context.organizationId,
-        {
-          agentId: defaultAgentId,
-          chatApiKeyId: llmSelection.chatApiKeyId,
-          selectedModel: llmSelection.selectedModel,
-          selectedProvider: llmSelection.selectedProvider,
-        },
-      );
-      if (!updated) {
-        logger.warn(
-          {
-            conversationId: context.conversationId,
-            userId: context.userId,
-            organizationId: context.organizationId,
-            chatOpsBindingId: context.chatOpsBindingId ?? null,
-          },
-          "swap_to_default_agent: conversation update failed, possible missing chatOpsBindingId",
-        );
-        return errorResult("Failed to update conversation agent.");
-      }
-    }
-
-    return structuredSuccessResult(
-      {
-        success: true,
-        agent_id: targetAgent.id,
-        agent_name: targetAgent.name,
-      },
-      `Successfully swapped to default agent "${targetAgent.name}" (ID: ${targetAgent.id}).`,
-    );
-  } catch (error) {
-    return catchError(error, "swapping to default agent");
+function selectedLabels(params: {
+  content: unknown;
+  options: Array<{ label: string }>;
+  allowMultiple: boolean;
+}): string[] {
+  const { content, options, allowMultiple } = params;
+  if (!content || typeof content !== "object" || Array.isArray(content)) {
+    return [];
   }
+  const record = content as Record<string, unknown>;
+  const allowed = new Set(options.map((option) => option.label));
+
+  if (!allowMultiple) {
+    const choice = record.choice;
+    return typeof choice === "string" && allowed.has(choice) ? [choice] : [];
+  }
+
+  return options.flatMap((option, index) =>
+    record[optionKey(index)] === true && allowed.has(option.label)
+      ? [option.label]
+      : [],
+  );
 }

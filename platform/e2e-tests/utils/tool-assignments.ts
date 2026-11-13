@@ -1,19 +1,19 @@
-import { expect, type Page } from "@playwright/test";
 import {
   E2eTestId,
   getAgentToolCatalogPillTestId,
   getAssignmentComboboxDisabledOptionTestId,
   getAssignmentComboboxOptionTestId,
   getAssignmentComboboxSearchInputTestId,
-} from "@shared";
+} from "@archestra/shared";
+import { expect, type Page } from "@playwright/test";
 import { goToPage } from "../fixtures";
+import { waitForAgentsTable } from "./agents-table";
 
 type AssignmentTarget = {
   page: Page;
   targetName: string;
   catalogItemName: string;
   pagePath: "/agents" | "/mcp/gateways";
-  dialogTitle: "Edit Agent" | "Edit MCP Gateway";
 };
 
 export async function openGatewayCatalogToolAssignment(params: {
@@ -26,22 +26,128 @@ export async function openGatewayCatalogToolAssignment(params: {
     targetName: params.gatewayName,
     catalogItemName: params.catalogItemName,
     pagePath: "/mcp/gateways",
-    dialogTitle: "Edit MCP Gateway",
   });
 }
 
+/**
+ * Save the tools step of the open agent/gateway setup wizard (the page that
+ * replaced the edit dialog): Save the step and wait for the wizard to return
+ * to the record's page, which is what a successful Save does.
+ */
 export async function saveOpenProfileDialog(page: Page): Promise<void> {
-  const saveButton = page.getByRole("button", { name: "Save" });
-  const updateButton = page.getByRole("button", { name: "Update" });
-
-  if (await saveButton.isVisible().catch(() => false)) {
-    await saveButton.click();
-  } else {
-    await expect(updateButton).toBeVisible({ timeout: 15_000 });
-    await updateButton.click();
+  // The per-server tool-config modal has no submit of its own (its choices
+  // commit live; the only control is the Close X) and while it is open the
+  // layer beneath is aria-hidden, so no role query can reach the wizard's
+  // Save. It normally auto-closes after the credential choice commits, but
+  // on slow runners it can linger — wait briefly for the auto-close, then
+  // close it manually.
+  const configModal = page
+    .getByRole("dialog")
+    .filter({ has: page.getByTestId(E2eTestId.TokenSelect) })
+    .first();
+  if (await configModal.isVisible().catch(() => false)) {
+    const autoClosed = await configModal
+      .waitFor({ state: "hidden", timeout: 3_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!autoClosed) {
+      await configModal.getByRole("button", { name: "Close" }).click();
+      await expect(configModal).toBeHidden({ timeout: 5_000 });
+    }
   }
 
+  // The step's Save submits only while the form is dirty (a clean step's
+  // Save just returns), and the assignment above made it dirty.
+  const submitButton = page.getByTestId(E2eTestId.AgentSetupSubmitButton);
+  await expect(submitButton).toBeVisible({ timeout: 15_000 });
+  await submitButton.click();
+
+  // Saving stays on the tab it was done from, so there is no navigation to
+  // wait for — only the write itself, which the toast below reports.
   await page.waitForLoadState("domcontentloaded");
+}
+
+function personalPinConfirmButton(page: Page) {
+  return page
+    .getByRole("button", { name: /^Use th(is|ese) connections?$/ })
+    .first();
+}
+
+/**
+ * Choosing a personal-scope connection prompts a confirmation ("Use this
+ * connection for everyone?") because every caller of the tool would then connect
+ * as that one owner. Confirm it so the choice applies; non-personal connections
+ * don't prompt. Returns whether a confirmation was handled.
+ */
+async function confirmPersonalCredentialPinIfPrompted(
+  page: Page,
+): Promise<boolean> {
+  const confirmButton = personalPinConfirmButton(page);
+  // The dialog mounts asynchronously after the option click commits (React
+  // state + portal + entrance animation). `waitFor` actually waits for it —
+  // `isVisible({ timeout })` ignores its timeout and reads the current state,
+  // which is how a too-early Escape used to cancel a still-mounting dialog.
+  // 5s (not 3s): on standard CI runners the prompt can render a beat later.
+  const appeared = await confirmButton
+    .waitFor({ state: "visible", timeout: 5_000 })
+    .then(() => true)
+    .catch(() => false);
+  if (!appeared) {
+    return false;
+  }
+
+  // The dialog re-renders while animating in, which can detach the resolved
+  // node between visibility check and click. Short per-attempt clicks inside
+  // toPass re-resolve the locator each round instead of pinning one stale node
+  // for the whole budget; a button that is already gone means the dialog
+  // closed, which is the state the toBeHidden assertion accepts.
+  await expect(async () => {
+    if (await confirmButton.isVisible().catch(() => false)) {
+      await confirmButton.click({ timeout: 2_000 });
+    }
+    await expect(confirmButton).toBeHidden({ timeout: 2_000 });
+  }).toPass({ timeout: 15_000 });
+  return true;
+}
+
+/**
+ * Select a static credential in the open tool-config modal: click the option,
+ * confirm the personal-pin dialog if it appears, otherwise close the still-open
+ * dropdown. Applying the pin (confirm) leaves the wizard step open for saving,
+ * so a trailing Escape only runs when no confirmation was shown.
+ */
+export async function selectCredentialOption(
+  page: Page,
+  credentialOption: ReturnType<Page["getByRole"]>,
+): Promise<void> {
+  const tokenSelectTrigger = page.getByTestId(E2eTestId.TokenSelect).last();
+  const confirmButton = personalPinConfirmButton(page);
+
+  // The dialog's capability rows re-render around the connection dropdown, so
+  // between asserting the option visible and clicking it the whole dropdown
+  // can collapse (select unmount/remount) — the old forced click then waited
+  // out its full timeout on a node that no longer existed. Re-resolve state
+  // each attempt: a visible pin-confirm dialog means a previous click already
+  // committed; a missing option means the dropdown collapsed and needs
+  // reopening via its trigger.
+  await expect(async () => {
+    if (await confirmButton.isVisible().catch(() => false)) {
+      return;
+    }
+    if (!(await credentialOption.isVisible().catch(() => false))) {
+      await tokenSelectTrigger.click({ timeout: 2_000 });
+      await expect(credentialOption).toBeVisible({ timeout: 2_000 });
+    }
+    await credentialOption.click({ timeout: 2_000 });
+  }).toPass({ timeout: 20_000 });
+
+  const confirmed = await confirmPersonalCredentialPinIfPrompted(page);
+  // Close the dropdown only when it is demonstrably still open — a blind
+  // Escape after the dropdown already closed dismisses the tool-config modal.
+  if (!confirmed && (await credentialOption.isVisible().catch(() => false))) {
+    await page.keyboard.press("Escape");
+  }
+  await page.waitForTimeout(200);
 }
 
 export async function assignCatalogCredentialToGateway(params: {
@@ -55,11 +161,14 @@ export async function assignCatalogCredentialToGateway(params: {
     catalogItemName: params.catalogItemName,
     gatewayName: params.gatewayName,
   });
-  await params.page
-    .getByRole("option", { name: params.credentialName })
-    .click();
-  await params.page.keyboard.press("Escape");
-  await params.page.waitForTimeout(200);
+  const credentialOption = params.page.getByRole("option", {
+    name: params.credentialName,
+  });
+  // 30s, not 10s: the option list renders from a query result that can
+  // transiently miss a just-created credential until the mount-time refetch
+  // lands; the options re-render in place once fresh data arrives.
+  await expect(credentialOption).toBeVisible({ timeout: 30_000 });
+  await selectCredentialOption(params.page, credentialOption);
   await saveOpenProfileDialog(params.page);
 }
 
@@ -68,31 +177,41 @@ async function openCatalogToolAssignment({
   targetName,
   catalogItemName,
   pagePath,
-  dialogTitle,
 }: AssignmentTarget): Promise<void> {
   await goToPage(page, `${pagePath}?name=${encodeURIComponent(targetName)}`);
   await page.waitForLoadState("domcontentloaded");
 
+  // The row's Edit opens where the configuration is edited: an agent's edit
+  // page, whose Tools step holds its tools, or a gateway's single Settings
+  // tab.
+  const isAgent = pagePath === "/agents";
+  if (isAgent) await waitForAgentsTable(page);
   const editButton = page.getByTestId(
     `${E2eTestId.EditAgentButton}-${targetName}`,
   );
   await expect(editButton).toBeVisible({ timeout: 30_000 });
   await editButton.click();
+  await page.waitForURL(new RegExp(`${pagePath}/[^/?]+`), { timeout: 30_000 });
+  // Retry the step click until the URL says so: like the row's Edit above, it
+  // can render before hydration wires its handler.
+  const toolsSection = isAgent ? "tools" : "settings";
+  const onToolsSection = isAgent
+    ? /\/edit\?(?:.*&)?step=tools/
+    : /[?&]section=settings/;
+  await expect(async () => {
+    if (!onToolsSection.test(page.url())) {
+      await page
+        .getByTestId(`${E2eTestId.AgentSetupStep}-${toolsSection}`)
+        .click();
+    }
+    await page.waitForURL(onToolsSection, { timeout: 3_000 });
+  }).toPass({ timeout: 30_000 });
 
-  const dialog = page.getByRole("dialog", { name: dialogTitle });
-  await expect(dialog).toBeVisible({ timeout: 15_000 });
+  const toolsSectionAnchor = page.getByTestId(E2eTestId.AgentToolsSection);
+  await expect(toolsSectionAnchor).toBeVisible({ timeout: 15_000 });
+  await toolsSectionAnchor.scrollIntoViewIfNeeded();
 
-  const capabilitiesAnchor = dialog.getByTestId(
-    E2eTestId.AgentCapabilitiesSection,
-  );
-  await capabilitiesAnchor.scrollIntoViewIfNeeded();
-
-  const capabilitiesHeading = dialog.getByRole("heading", {
-    name: "Capabilities",
-  });
-  await expect(capabilitiesHeading).toBeVisible({ timeout: 10_000 });
-
-  const addButton = dialog.getByTestId(E2eTestId.AgentToolsAddButton);
+  const addButton = page.getByTestId(E2eTestId.AgentToolsAddButton);
   await expect(addButton).toBeVisible({ timeout: 10_000 });
   await addButton.click();
 
@@ -169,11 +288,27 @@ async function openCatalogToolAssignment({
 
   if (catalogAssignmentState === "enabled") {
     await enabledCatalogItem.click();
-    await page.keyboard.press("Escape");
+    // Clicking the catalog item opens the per-server tool-config MODAL
+    // (item-name heading, "Connect on behalf of" credential select, tool
+    // checkboxes) layered over the wizard page. While it is up, everything
+    // beneath is unclickable even though isVisible() still reports the
+    // combobox — so only dismiss a leftover combobox when no modal
+    // appeared, and do it with a neutral in-page click (Escape is banned
+    // here: it lands on whatever the CURRENT top layer is, and closing the
+    // modal by accident strands every later step).
+    const modalAppeared = await visibleTokenSelect
+      .waitFor({ state: "visible", timeout: 5_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!modalAppeared && (await searchInput.isVisible().catch(() => false))) {
+      // The section itself is the neutral target now that it carries no
+      // heading of its own — the tab above names it.
+      await page.getByTestId(E2eTestId.AgentToolsSection).click();
+    }
   }
 
   try {
-    await expect(visibleTokenSelect).toBeVisible({ timeout: 5_000 });
+    await expect(visibleTokenSelect).toBeVisible({ timeout: 15_000 });
   } catch {
     await expect
       .poll(
@@ -189,7 +324,7 @@ async function openCatalogToolAssignment({
           }
           return "missing";
         },
-        { timeout: 10_000, intervals: [500, 1000, 2000] },
+        { timeout: 20_000, intervals: [500, 1000, 2000, 4000] },
       )
       .not.toBe("missing");
 
@@ -199,10 +334,37 @@ async function openCatalogToolAssignment({
       await pillButtonByRole.click({ force: true });
     }
 
-    await expect(visibleTokenSelect).toBeVisible({ timeout: 10_000 });
+    await expect(visibleTokenSelect).toBeVisible({ timeout: 15_000 });
   }
 
-  await visibleTokenSelect.click();
+  // Surrounding capability rows re-render briefly when the catalog selection
+  // commits — a single click can land on a node that detaches mid-action and
+  // silently open nothing. Retry until the dropdown is verifiably open,
+  // probing for the always-present "Resolve at call time" option (unique to
+  // this dropdown — the tools combobox also renders role=option items).
+  // No Escape anywhere in this loop (see the comment above): a still-open
+  // combobox just swallows the first trigger click as its outside-dismiss,
+  // and the next retry's click then opens the dropdown.
+  const dynamicCredentialOption = page
+    .getByRole("option", { name: /Resolve at call time/ })
+    .first();
+  await expect(async () => {
+    if (await dynamicCredentialOption.isVisible().catch(() => false)) {
+      return;
+    }
+    // The credential select lives in the tool-config modal; if the modal
+    // got dismissed along the way, clicking the assigned server's pill
+    // reopens it.
+    if (!(await visibleTokenSelect.isVisible().catch(() => false))) {
+      if (await pillButtonByTestId.isVisible().catch(() => false)) {
+        await pillButtonByTestId.click();
+      } else if (await pillButtonByRole.isVisible().catch(() => false)) {
+        await pillButtonByRole.click();
+      }
+    }
+    await visibleTokenSelect.click({ timeout: 2_000 });
+    await expect(dynamicCredentialOption).toBeVisible({ timeout: 2_000 });
+  }).toPass({ timeout: 20_000 });
 }
 
 function escapeRegExp(value: string): string {

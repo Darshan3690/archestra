@@ -1,7 +1,10 @@
+import { ENCRYPTED_CHAT_REDACTED_VALUES } from "@archestra/shared";
 import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 import { z } from "zod";
-import { schema } from "@/database";
+import { schema } from "@/database/schema";
 import { CommonToolCallSchema } from "./common-llm-format";
+import { EnterpriseCredentialClientTypeSchema } from "./enterprise-managed-credentials";
+import { ToolOwnerTypeSchema } from "./tool-owner";
 
 /**
  * Auth method types for MCP tool call logging.
@@ -12,10 +15,19 @@ export const MCPGatewayAuthMethodSchema = z.enum([
   "user_token",
   "org_token",
   "team_token",
+  "service_account_token",
   "external_idp",
   "session",
 ]);
 export type MCPGatewayAuthMethod = z.infer<typeof MCPGatewayAuthMethodSchema>;
+
+/**
+ * Who sent a call over the HTTP gateway: any outside agent ("api"), or the
+ * built-in chat's loopback client ("chat"), which marks itself with the
+ * X-Archestra-Source header.
+ */
+export const McpGatewayCallSourceSchema = z.enum(["api", "chat"]);
+export type McpGatewayCallSource = z.infer<typeof McpGatewayCallSourceSchema>;
 
 /**
  * Select schema for MCP tool calls (includes joined userName from users table)
@@ -24,6 +36,15 @@ export type MCPGatewayAuthMethod = z.infer<typeof MCPGatewayAuthMethodSchema>;
  * - tools/list: { tools: [...] }
  * - initialize: { capabilities, serverInfo }
  */
+/**
+ * The two shapes an encrypted-chat row's content takes when it is not available to
+ * the reader: encrypted under the browser key, or never stored.
+ */
+const EncryptedChatUnavailableContentSchema = z.union([
+  z.object({ __encryptedChatSealed: z.string() }),
+  z.object({ __redacted: z.enum(ENCRYPTED_CHAT_REDACTED_VALUES) }),
+]);
+
 export const SelectMcpToolCallSchema = createSelectSchema(
   schema.mcpToolCallsTable,
   {
@@ -31,15 +52,28 @@ export const SelectMcpToolCallSchema = createSelectSchema(
     // toolResult can have different structures depending on the method type
     toolResult: z.unknown().nullable(),
     authMethod: MCPGatewayAuthMethodSchema.nullable(),
+    source: McpGatewayCallSourceSchema.nullable(),
+    credentialClientType: EnterpriseCredentialClientTypeSchema.nullable(),
   },
-).extend({
-  userName: z.string().nullable(),
-});
+)
+  // Server-side plumbing telling the read path which key the row is under.
+  // Clients never need it: a locked row announces itself through the sentinel,
+  // which carries the conversation id.
+  // toolName/isError are statistics columns derived from toolCall/toolResult.
+  .omit({ encryptedChatConversationId: true, toolName: true, isError: true })
+  .extend({
+    userName: z.string().nullable(),
+    // Name of the owning app for app-owned calls; null for agent-owned calls
+    // or when the app was deleted.
+    appName: z.string().nullable(),
+  });
 
 /**
- * Insert schema for MCP tool calls
- * Note: agentId is required when creating new tool calls
- * (it's nullable in the DB schema to preserve calls when agents are deleted)
+ * Insert schema for MCP tool calls. `ownerType` is optional and the DB column
+ * defaults to "agent", so existing agent call sites are unchanged; the refine
+ * then requires the matching owner id (agentId for agent calls, appId for app
+ * calls). Both id columns stay nullable in the DB so audit rows survive owner
+ * deletion.
  */
 export const InsertMcpToolCallSchema = createInsertSchema(
   schema.mcpToolCallsTable,
@@ -48,10 +82,62 @@ export const InsertMcpToolCallSchema = createInsertSchema(
     // toolResult can have different structures depending on the method type
     toolResult: z.unknown().nullable(),
     authMethod: MCPGatewayAuthMethodSchema.nullable().optional(),
+    source: McpGatewayCallSourceSchema.nullable().optional(),
+    credentialClientType:
+      EnterpriseCredentialClientTypeSchema.nullable().optional(),
   },
-).extend({
-  // Override agentId to be required for creating tool calls
-  agentId: z.string().uuid(),
+)
+  // Derived by McpToolCallModel.create from toolCall/toolResult.
+  .omit({ toolName: true, isError: true })
+  .extend({
+    ownerType: ToolOwnerTypeSchema.optional(),
+    agentId: z.string().uuid().nullable().optional(),
+    appId: z.string().uuid().nullable().optional(),
+  })
+  .superRefine((value, ctx) => {
+    // Exactly the matching owner id must be set and the other must be absent, so
+    // a row can never be authorized through the wrong owner path.
+    if ((value.ownerType ?? "agent") === "agent") {
+      if (!value.agentId) {
+        ctx.addIssue({
+          code: "custom",
+          message: "agent-owned tool calls require agentId",
+        });
+      }
+      if (value.appId) {
+        ctx.addIssue({
+          code: "custom",
+          message: "agent-owned tool calls must not set appId",
+        });
+      }
+    } else {
+      if (!value.appId) {
+        ctx.addIssue({
+          code: "custom",
+          message: "app-owned tool calls require appId",
+        });
+      }
+      if (value.agentId) {
+        ctx.addIssue({
+          code: "custom",
+          message: "app-owned tool calls must not set agentId",
+        });
+      }
+    }
+  });
+
+/**
+ * What routes serialize. An encrypted-chat row carries a sentinel where the
+ * recorded call would be — unavailable, not malformed — so the response schema
+ * has to admit it or one such row fails serialization for the whole list.
+ * Deliberately separate from the select schema above: widening that would push
+ * the union onto every consumer of `McpToolCall`, which only ever handles real
+ * calls. `toolResult` needs no equivalent; it is already unknown.
+ */
+export const McpToolCallResponseSchema = SelectMcpToolCallSchema.extend({
+  toolCall: z
+    .union([CommonToolCallSchema, EncryptedChatUnavailableContentSchema])
+    .nullable(),
 });
 
 export type McpToolCall = z.infer<typeof SelectMcpToolCallSchema>;

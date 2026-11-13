@@ -1,45 +1,101 @@
+// This file contains Enterprise regions licensed under LICENSE_ENTERPRISE.
 import {
+  ARCHESTRA_MCP_CATALOG_ID,
   AUTO_PROVISIONED_INVITATION_STATUS,
-  addNomicTaskPrefix,
+  CursorQuerySchema,
+  createCursorPaginatedResponseSchema,
+  getArchestraMcpServerName,
+  isModelSelectionComplete,
+  providerHasEndpointLocalModels,
+  providerRequiresPerUserCredential,
   RouteId,
-} from "@shared";
-import { and, eq, inArray, like } from "drizzle-orm";
+  type StoredAgentRuntimeTierSettings,
+} from "@archestra/shared";
+import {
+  INSTALLER_CLIENT_KEY_PROVIDERS,
+  INSTALLER_CLIENT_LABELS,
+  type InstallerClientId,
+} from "@archestra/shared/connection-setup";
+import { and, desc, eq, inArray, like, notExists, sql } from "drizzle-orm";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
+import { chatOpsManager } from "@/agents/chatops/chatops-manager";
+import { assertModelTrioTiers } from "@/agents/subagent-tiers";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
+import { hasPermission } from "@/auth";
+import { getPermissionsForUserContext, isGlobalAdmin } from "@/auth/utils";
+import { describeOrganizationDefaultModel } from "@/auto-routing/organization-default";
 import config from "@/config";
-import db, { schema } from "@/database";
-import { callEmbedding } from "@/knowledge-base/embedding-clients";
-import { resolveApiKeyFromChatApiKey } from "@/knowledge-base/kb-llm-client";
+import db, { schema, type Transaction, withDbTransaction } from "@/database";
+import {
+  enterpriseTier,
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  MCP_IDLE_HIBERNATION_ENTERPRISE_MESSAGE,
+  // SPDX-SnippetEnd
+} from "@/enterprise-tier";
+import { daggerEnvironmentRuntimeManager } from "@/k8s/dagger-environment-runtime/manager";
+import mcpServerRuntimeManager from "@/k8s/mcp-server-runtime/manager";
 import logger from "@/logging";
 import {
   AgentModel,
   InteractionModel,
-  InvitationModel,
+  InternalMcpCatalogModel,
+  KbConnectorDocumentCountModel,
   KbDocumentModel,
   KnowledgeBaseConnectorModel,
   LlmProviderApiKeyModel,
+  LlmProviderApiKeyModelLinkModel,
+  McpServerModel,
   McpToolCallModel,
   MemberModel,
-  ModelModel,
   OrganizationModel,
+  OrganizationRoleModel,
+  SessionModel,
   ToolModel,
-  UserModel,
-  UserTokenModel,
 } from "@/models";
+import AgentRuntimeTemplateModel from "@/models/agent-runtime-template";
+import AutoRouterModel from "@/models/auto-router";
+import { openappaBatteriesService } from "@/openappa/batteries";
 import {
+  assertRuntimeAgentsSupportOrganizationDefault,
+  countHiddenAgentsBlockingDefault,
+  listRuntimeAgentsInheritingOrganizationDefault,
+} from "@/services/agent-runtime/model-compatibility";
+import { prepareAgentRuntimeTierChange } from "@/services/agent-runtime/runtime-tier-settings";
+import { organizationAgentRuntimeTiers } from "@/services/agent-runtime/runtime-tiers";
+import { reconcileCatalogDeployments } from "@/services/environments/deployment-reconciliation";
+import { knowledgeSettingsService } from "@/services/knowledge-settings";
+import { removeMemberTarget } from "@/services/member-removal";
+import { reconcileManagedPlaywrightSetting } from "@/services/playwright-runtime";
+import { ResourcePermissions } from "@/services/resource-permissions";
+import { syncBuiltInSkillsForOrganization } from "@/services/seed";
+import {
+  AgentRuntimeTiersResponseSchema,
   ApiError,
   AppearanceSettingsSchema,
   CompleteOnboardingSchema,
+  type ConnectionClientProviderKeys,
   constructResponseSchema,
+  KeywordRankingStatusSchema,
+  type NetworkPolicy,
+  OrganizationDefaultModelSchema,
+  type OrganizationRole,
   SelectOrganizationSchema,
+  type TrustedImageRegistries,
   UpdateAgentSettingsSchema,
   UpdateAppearanceSettingsSchema,
   UpdateAuthSettingsSchema,
   UpdateConnectionSettingsSchema,
+  UpdateDefaultEnvironmentSchema,
+  UpdateIntegrationSettingsSchema,
   UpdateKnowledgeSettingsSchema,
-  UpdateLlmSettingsSchema,
+  UpdateMcpSettingsSchema,
   UpdateSecuritySettingsSchema,
+  UpdateSkillsSettingsSchema,
 } from "@/types";
+import { trackBackgroundWork } from "@/utils/background-work";
 
 const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
   fastify.get(
@@ -63,6 +119,21 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
     },
   );
 
+  fastify.get(
+    "/api/organization/default-model",
+    {
+      schema: {
+        operationId: RouteId.GetOrganizationDefaultModel,
+        description:
+          "Get the model agents and chats on the organization default run on, and the tiers auto routing routes them across",
+        tags: ["Organization"],
+        response: constructResponseSchema(OrganizationDefaultModelSchema),
+      },
+    },
+    async ({ organizationId }, reply) =>
+      reply.send(await describeOrganizationDefaultModel(organizationId)),
+  );
+
   fastify.patch(
     "/api/organization/appearance-settings",
     {
@@ -74,12 +145,40 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
         response: constructResponseSchema(SelectOrganizationSchema),
       },
     },
-    async ({ organizationId, body }, reply) => {
+    async ({ organizationId, body, user }, reply) => {
       const currentOrganization =
         await OrganizationModel.getById(organizationId);
       if (!currentOrganization) {
         throw new ApiError(404, "Organization not found");
       }
+
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      if (
+        config.enterpriseFeatures.fullWhiteLabeling &&
+        body.appName !== undefined
+      ) {
+        // The built-in tools take their prefix from appName; one an MCP server
+        // already gives its tools would route calls to either of them.
+        const serverName = getArchestraMcpServerName({
+          appName: body.appName,
+          fullWhiteLabeling: true,
+        });
+        if (
+          serverName !== archestraMcpBranding.serverName &&
+          (await InternalMcpCatalogModel.findRootByNameInOrg({
+            name: serverName,
+            organizationId,
+          }))
+        )
+          throw new ApiError(
+            409,
+            `An MCP server already gives its tools the "${serverName}" prefix this app name would give the built-in tools.`,
+            "catalog_name_conflict",
+          );
+      }
+      // SPDX-SnippetEnd
 
       const organization = await OrganizationModel.patch(organizationId, body);
 
@@ -87,6 +186,9 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
         throw new ApiError(404, "Organization not found");
       }
 
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
       if (
         config.enterpriseFeatures.fullWhiteLabeling &&
         (body.appName !== undefined || body.iconLogo !== undefined)
@@ -99,11 +201,29 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
           currentOrganization.iconLogo !== organization.iconLogo;
 
         if (appNameChanged || iconChanged) {
-          await ToolModel.syncArchestraBuiltInCatalog({
+          const renamedTools = await ToolModel.syncArchestraBuiltInCatalog({
             organization: organization,
           });
+          // A saved policy's `archestra` alias spells the old prefix.
+          if (renamedTools.length > 0)
+            await openappaBatteriesService.onCatalogPrefixesRenamed({
+              catalogId: ARCHESTRA_MCP_CATALOG_ID,
+              // The built-in catalog is global: every organization spells it.
+              organizationId: null,
+              userId: user.id,
+              renamedTools,
+            });
+        }
+
+        // appName is baked into the built-in skills' stored rows (name, body,
+        // tool-prefix references), so re-brand them now — without this the
+        // catalog/load_skill output only updates after a backend restart. A
+        // pristine copy auto-rebrands; an admin-edited copy is preserved.
+        if (appNameChanged) {
+          await syncBuiltInSkillsForOrganization(organization);
         }
       }
+      // SPDX-SnippetEnd
 
       return reply.send(organization);
     },
@@ -115,9 +235,95 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
       schema: {
         operationId: RouteId.UpdateSecuritySettings,
         description:
-          "Update security settings (global tool policy, chat file uploads)",
+          "Update security settings (default tool guardrails, chat file uploads)",
         tags: ["Organization"],
         body: UpdateSecuritySettingsSchema,
+        response: constructResponseSchema(SelectOrganizationSchema),
+      },
+    },
+    async ({ organizationId, body, user }, reply) => {
+      // Keep the existing permission gate for security settings; the browser
+      // lifecycle control additionally requires a built-in administrator role.
+      if (
+        body.playwrightMcpEnabled !== undefined &&
+        !(await isGlobalAdmin(user.id, organizationId))
+      ) {
+        throw new ApiError(
+          403,
+          "Only administrators can change the built-in browser setting",
+        );
+      }
+      const organization =
+        body.playwrightMcpEnabled !== undefined
+          ? await reconcileManagedPlaywrightSetting({
+              organizationId,
+              settings: body,
+            })
+          : await OrganizationModel.patch(organizationId, body);
+
+      if (!organization) {
+        throw new ApiError(404, "Organization not found");
+      }
+
+      return reply.send(organization);
+    },
+  );
+
+  fastify.patch(
+    "/api/organization/mcp-settings",
+    {
+      schema: {
+        operationId: RouteId.UpdateMcpSettings,
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        description:
+          "Update MCP settings (online catalog availability, idle hibernation)",
+        // SPDX-SnippetEnd
+        tags: ["Organization"],
+        body: UpdateMcpSettingsSchema,
+        response: constructResponseSchema(SelectOrganizationSchema),
+      },
+    },
+    async ({ organizationId, body }, reply) => {
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      // Scaling idle MCP servers to zero is enterprise-licensed. Refuse the
+      // field outright rather than silently dropping it, so an unlicensed
+      // deployment can't believe it turned the feature off either.
+      if (
+        "mcpIdleHibernationEnabled" in body &&
+        !enterpriseTier.isCoreActive()
+      ) {
+        throw new ApiError(403, MCP_IDLE_HIBERNATION_ENTERPRISE_MESSAGE);
+      }
+      // Stamp before committing the toggle. Another replica may observe the
+      // enabled setting immediately after that commit; every deployment must
+      // already have a full idle window when its first sweep starts.
+      if (body.mcpIdleHibernationEnabled === true) {
+        await McpServerModel.grantIdleWindowToAll();
+      }
+      // SPDX-SnippetEnd
+
+      const organization = await OrganizationModel.patch(organizationId, body);
+
+      if (!organization) {
+        throw new ApiError(404, "Organization not found");
+      }
+
+      return reply.send(organization);
+    },
+  );
+
+  fastify.patch(
+    "/api/organization/skills-settings",
+    {
+      schema: {
+        operationId: RouteId.UpdateSkillsSettings,
+        description: "Update Skills settings (online catalog availability)",
+        tags: ["Organization"],
+        body: UpdateSkillsSettingsSchema,
         response: constructResponseSchema(SelectOrganizationSchema),
       },
     },
@@ -132,26 +338,71 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
     },
   );
 
-  fastify.patch(
-    "/api/organization/llm-settings",
+  fastify.get(
+    "/api/organization/agent-runtime-tiers",
     {
       schema: {
-        operationId: RouteId.UpdateLlmSettings,
+        operationId: RouteId.GetAgentRuntimeTiers,
         description:
-          "Update LLM settings (TOON compression, compression scope, limit cleanup interval)",
+          "The organization's Agent Runtime tiers in effect, smallest first: each tier's name, CPU, memory, the spares it keeps ready, and the default tier",
         tags: ["Organization"],
-        body: UpdateLlmSettingsSchema,
-        response: constructResponseSchema(SelectOrganizationSchema),
+        response: constructResponseSchema(AgentRuntimeTiersResponseSchema),
       },
     },
-    async ({ organizationId, body }, reply) => {
-      const organization = await OrganizationModel.patch(organizationId, body);
+    async ({ organizationId }, reply) => {
+      return reply.send({
+        ...(await organizationAgentRuntimeTiers(organizationId)),
+        defaultWorkspaceGiB: config.agentRuntime.workspaceStorageGiB,
+      });
+    },
+  );
 
-      if (!organization) {
-        throw new ApiError(404, "Organization not found");
-      }
-
-      return reply.send(organization);
+  fastify.get(
+    "/api/organization/agent-settings/default-model-dependents",
+    {
+      schema: {
+        operationId: RouteId.GetDefaultModelRuntimeDependents,
+        description:
+          "Agent Runtime agents the caller can read that run on the organization's default model (no usable model of their own), with the runtime each one uses and whether the caller may give it a model",
+        tags: ["Organization"],
+        querystring: z.object({
+          /** A candidate default (models.id) to count hidden blockers for. */
+          modelId: z.string().uuid().optional(),
+        }),
+        response: constructResponseSchema(
+          z.object({
+            agents: z.array(
+              RuntimeDependentSchema.extend({
+                id: z.string(),
+                name: z.string(),
+                /** Whether the caller may give this agent a model of its own. */
+                canUpdate: z.boolean(),
+              }),
+            ),
+            /**
+             * How many agents the caller can't read couldn't run `modelId`
+             * (0 without one): the only thing it learns about them.
+             */
+            hiddenBlockingCount: z.number().int(),
+          }),
+        ),
+      },
+    },
+    async ({ organizationId, user, query }, reply) => {
+      const [{ agents }, hiddenBlockingCount] = await Promise.all([
+        listRuntimeAgentsInheritingOrganizationDefault({
+          organizationId,
+          userId: user.id,
+        }),
+        query.modelId
+          ? countHiddenAgentsBlockingDefault({
+              organizationId,
+              userId: user.id,
+              modelId: query.modelId,
+            })
+          : 0,
+      ]);
+      return reply.send({ agents, hiddenBlockingCount });
     },
   );
 
@@ -160,20 +411,114 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
     {
       schema: {
         operationId: RouteId.UpdateAgentSettings,
-        description: "Update agent settings (default model, default agent)",
+        description:
+          "Update agent settings (default model or auto routing, default agent, skill slash commands, Agent Runtime tiers)",
         tags: ["Organization"],
         body: UpdateAgentSettingsSchema,
         response: constructResponseSchema(SelectOrganizationSchema),
       },
     },
-    async ({ organizationId, body }, reply) => {
-      if (body.defaultLlmApiKeyId) {
-        const apiKey = await LlmProviderApiKeyModel.findById(
-          body.defaultLlmApiKeyId,
-        );
-        if (!apiKey || apiKey.organizationId !== organizationId) {
-          throw new ApiError(404, "API key not found");
+    async ({ organizationId, body, user }, reply) => {
+      // Tier changes are checked here and written with the patch below, in
+      // its transaction: renamed tiers are followed by the agents that name
+      // them, and a tier still in use cannot go.
+      let writeTierChanges: ((tx: Transaction) => Promise<void>) | null = null;
+      // What the organization stores for its tiers differs from the request
+      // (a pooled flag becomes a spare count), so it travels apart from body.
+      let storedTiers: StoredAgentRuntimeTierSettings | null | undefined;
+      if (body.agentRuntimeTiers !== undefined) {
+        // Tier sizes reserve cluster capacity, so like the built-in browser
+        // they need a built-in administrator role.
+        if (!(await isGlobalAdmin(user.id, organizationId))) {
+          throw new ApiError(
+            403,
+            "Only administrators can change the Agent Runtime tiers",
+          );
         }
+        // A reset (null) restores the defaults under the same check: a
+        // custom tier still in use cannot vanish from under its agents.
+        const prepared = await prepareAgentRuntimeTierChange({
+          organizationId,
+          input: body.agentRuntimeTiers,
+        });
+        storedTiers = prepared.settings;
+        writeTierChanges = prepared.write;
+      }
+      const { agentRuntimeTiers: _requestedTiers, ...rest } = body;
+      const data =
+        storedTiers === undefined
+          ? rest
+          : { ...rest, agentRuntimeTiers: storedTiers };
+      // The default model and its API key are a pair: persist both or neither.
+      const currentOrg =
+        body.defaultModelId !== undefined ||
+        body.defaultLlmApiKeyId !== undefined ||
+        body.defaultFastModelId !== undefined ||
+        body.defaultSmartModelId !== undefined
+          ? await OrganizationModel.getById(organizationId)
+          : null;
+      const merged = {
+        modelId:
+          body.defaultModelId !== undefined
+            ? body.defaultModelId
+            : (currentOrg?.defaultModelId ?? null),
+        apiKeyId:
+          body.defaultLlmApiKeyId !== undefined
+            ? body.defaultLlmApiKeyId
+            : (currentOrg?.defaultLlmApiKeyId ?? null),
+        fastModelId:
+          body.defaultFastModelId !== undefined
+            ? body.defaultFastModelId
+            : (currentOrg?.defaultFastModelId ?? null),
+        smartModelId:
+          body.defaultSmartModelId !== undefined
+            ? body.defaultSmartModelId
+            : (currentOrg?.defaultSmartModelId ?? null),
+      };
+
+      // Validate the merged result only when this update touches either field.
+      if (
+        body.defaultModelId !== undefined ||
+        body.defaultLlmApiKeyId !== undefined
+      ) {
+        if (
+          !isModelSelectionComplete({
+            modelId: merged.modelId,
+            apiKeyId: merged.apiKeyId,
+          })
+        ) {
+          throw new ApiError(
+            400,
+            "The default model and API key must be set together",
+          );
+        }
+        await assertOrganizationDefaultModelSelection({
+          organizationId,
+          modelId: merged.modelId,
+          apiKeyId: merged.apiKeyId,
+        });
+        await assertRuntimeAgentsSupportOrganizationDefault({
+          organizationId,
+          userId: user.id,
+          modelId: merged.modelId,
+        });
+      }
+
+      if (
+        body.defaultFastModelId !== undefined ||
+        body.defaultSmartModelId !== undefined
+      ) {
+        await assertModelTrioTiers(merged);
+      }
+
+      if (
+        body.defaultAutoRouterId &&
+        !(await AutoRouterModel.findInOrganization(
+          organizationId,
+          body.defaultAutoRouterId,
+        ))
+      ) {
+        throw new ApiError(400, "The selected auto router no longer exists.");
       }
 
       if (body.defaultAgentId) {
@@ -183,7 +528,19 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
         }
       }
 
-      const organization = await OrganizationModel.patch(organizationId, body);
+      const write = async (tx: Transaction) => {
+        await writeTierChanges?.(tx);
+        return OrganizationModel.patchInTransaction({
+          id: organizationId,
+          data,
+          tx,
+        });
+      };
+      const organization = writeTierChanges
+        ? await withDbTransaction(write).finally(() =>
+            OrganizationModel.invalidateSettingsCaches(organizationId),
+          )
+        : await OrganizationModel.patch(organizationId, data);
 
       if (!organization) {
         throw new ApiError(404, "Organization not found");
@@ -199,7 +556,7 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
       schema: {
         operationId: RouteId.UpdateConnectionSettings,
         description:
-          "Update /connection admin settings (default gateway/proxy, hidden clients/providers)",
+          "Update /connection admin settings (default gateway, hidden clients, skills/LLM proxy availability)",
         tags: ["Organization"],
         body: UpdateConnectionSettingsSchema,
         response: constructResponseSchema(SelectOrganizationSchema),
@@ -219,24 +576,227 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
         ) {
           throw new ApiError(400, "Agent is not an MCP gateway");
         }
+        // One member's personal gateway is no default for everyone. A value
+        // saved before this rule may be resubmitted unchanged.
+        if (agent.isPersonalGateway) {
+          const current = await OrganizationModel.getById(organizationId);
+          if (current?.connectionDefaultMcpGatewayId !== agent.id) {
+            throw new ApiError(
+              400,
+              "A personal MCP gateway cannot be the default",
+            );
+          }
+        }
       }
 
-      if (body.connectionDefaultLlmProxyId) {
-        const agent = await AgentModel.findById(
-          body.connectionDefaultLlmProxyId,
-        );
-        if (!agent || agent.organizationId !== organizationId) {
-          throw new ApiError(404, "LLM proxy not found");
-        }
-        if (agent.agentType !== "llm_proxy" && agent.agentType !== "profile") {
-          throw new ApiError(400, "Agent is not an LLM proxy");
-        }
+      if (body.connectionClientProviderKeys) {
+        await validateConnectionClientProviderKeys({
+          organizationId,
+          mapping: body.connectionClientProviderKeys,
+        });
       }
 
       const organization = await OrganizationModel.patch(organizationId, body);
 
       if (!organization) {
         throw new ApiError(404, "Organization not found");
+      }
+
+      return reply.send(organization);
+    },
+  );
+
+  fastify.patch(
+    "/api/organization/integration-settings",
+    {
+      schema: {
+        operationId: RouteId.UpdateIntegrationSettings,
+        description:
+          "Customize the built-in integration catalogs: hide model providers, messaging channels, knowledge connectors, or coding agent templates, order coding agent templates, and override model provider labels. Omitted catalogs are left unchanged; null clears a catalog's overrides.",
+        tags: ["Organization"],
+        body: UpdateIntegrationSettingsSchema,
+        response: constructResponseSchema(SelectOrganizationSchema),
+      },
+    },
+    async ({ organizationId, body }, reply) => {
+      const organization =
+        body.popularAgentOverrides !== undefined
+          ? await AgentRuntimeTemplateModel.updateIntegrationSettings({
+              organizationId,
+              data: body,
+            })
+          : await OrganizationModel.patch(organizationId, body);
+
+      if (!organization) {
+        throw new ApiError(404, "Organization not found");
+      }
+
+      // Hiding a messaging channel has to actually stop it: a Slack or Teams
+      // bot left listening would keep answering after the admin switched the
+      // channel off. The manager re-reads the overrides on initialize.
+      if (body.messagingChannelOverrides !== undefined) {
+        await chatOpsManager.reinitialize();
+      }
+
+      return reply.send(organization);
+    },
+  );
+
+  fastify.patch(
+    "/api/organization/default-environment",
+    {
+      schema: {
+        operationId: RouteId.UpdateDefaultEnvironment,
+        description:
+          "Configure the implicit default environment (the deployment target referenced by internal_mcp_catalog.environment_id = null). Pass null for name to reset to the built-in 'Default' label, or null for namespace to unset it. Omitted fields are left unchanged. When the namespace or network policy changes and the runtime is enabled, all default-environment MCP servers are reconciled.",
+        tags: ["Organization"],
+        body: UpdateDefaultEnvironmentSchema,
+        response: constructResponseSchema(SelectOrganizationSchema),
+      },
+    },
+    async ({ organizationId, body }, reply) => {
+      const namespaceChanging = "namespace" in body;
+      const networkPolicyChanging = "networkPolicy" in body;
+
+      // Validate that the new namespace actually exists in the cluster before
+      // touching the DB — mirrors the environment PATCH route, avoiding a
+      // state where the DB names a namespace pods can never start in.
+      if (
+        namespaceChanging &&
+        body.namespace != null &&
+        mcpServerRuntimeManager.isEnabled
+      ) {
+        try {
+          await mcpServerRuntimeManager.validateNamespace(body.namespace);
+        } catch (err) {
+          throw new ApiError(
+            400,
+            err instanceof Error ? err.message : "Namespace validation failed",
+          );
+        }
+      }
+
+      const currentOrganization =
+        namespaceChanging || networkPolicyChanging
+          ? await OrganizationModel.getById(organizationId)
+          : null;
+      const namespaceActuallyChanging =
+        namespaceChanging &&
+        currentOrganization !== null &&
+        (body.namespace ?? null) !==
+          (currentOrganization?.defaultEnvironmentNamespace ?? null);
+      const networkPolicyActuallyChanging =
+        networkPolicyChanging &&
+        currentOrganization !== null &&
+        !sameNetworkPolicy(
+          body.networkPolicy ?? null,
+          currentOrganization?.defaultNetworkPolicy ?? null,
+        );
+
+      // Pre-load deployments while the OLD namespace is still in the DB, so
+      // the in-memory K8sDeployment objects point at the old namespace and
+      // the restart's teardown targets the right place (mirrors the
+      // environment PATCH route).
+      let catalogsToReconcile: { id: string; multitenant: boolean }[] = [];
+      if (namespaceActuallyChanging && mcpServerRuntimeManager.isEnabled) {
+        catalogsToReconcile =
+          await InternalMcpCatalogModel.findDefaultEnvironmentLocalCatalogs(
+            organizationId,
+          );
+        const servers = await McpServerModel.findByCatalogIds(
+          catalogsToReconcile.map((catalog) => catalog.id),
+        );
+        await Promise.all(
+          servers.map((server) =>
+            mcpServerRuntimeManager.getOrLoadDeployment(server.id),
+          ),
+        );
+      }
+
+      // Map the clean API shape to DB columns, including only keys that are
+      // present in the body so omitting a field leaves it unchanged (an
+      // explicit null clears the column).
+      const data: Partial<{
+        defaultEnvironmentName: string | null;
+        defaultEnvironmentDescription: string | null;
+        defaultEnvironmentNamespace: string | null;
+        defaultNetworkPolicy: typeof body.networkPolicy;
+        defaultEnvironmentValidationRegex: string | null;
+        defaultEnvironmentTrustedImageRegistries: TrustedImageRegistries | null;
+      }> = {};
+      if ("name" in body) {
+        data.defaultEnvironmentName = body.name ?? null;
+      }
+      if ("description" in body) {
+        data.defaultEnvironmentDescription = body.description ?? null;
+      }
+      if ("namespace" in body) {
+        data.defaultEnvironmentNamespace = body.namespace ?? null;
+      }
+      if ("networkPolicy" in body) {
+        data.defaultNetworkPolicy = body.networkPolicy ?? null;
+      }
+      if ("validationRegex" in body) {
+        data.defaultEnvironmentValidationRegex = body.validationRegex ?? null;
+      }
+      if ("trustedImageRegistries" in body) {
+        data.defaultEnvironmentTrustedImageRegistries =
+          body.trustedImageRegistries ?? null;
+      }
+
+      const organization = await OrganizationModel.patch(organizationId, data);
+
+      if (!organization) {
+        throw new ApiError(404, "Organization not found");
+      }
+
+      if (
+        (namespaceActuallyChanging || networkPolicyActuallyChanging) &&
+        mcpServerRuntimeManager.isEnabled
+      ) {
+        const catalogs =
+          catalogsToReconcile.length > 0
+            ? catalogsToReconcile
+            : await InternalMcpCatalogModel.findDefaultEnvironmentLocalCatalogs(
+                organizationId,
+              );
+        await reconcileCatalogDeployments({
+          catalogs,
+          reason: namespaceActuallyChanging
+            ? "default environment namespace change"
+            : "default environment network policy change",
+        });
+      }
+
+      // The default engine carries the org's default egress policy and lives in
+      // the org's default namespace, so re-provision it when either changes.
+      // Awaited (like the MCP reconcile above) so the response reflects the
+      // applied egress policy rather than returning 200 while the engine still
+      // runs the old, looser policy; the manager no-ops when code-runtime/k8s is
+      // off. Runs after the DB patch, so a failure surfaces a retryable error.
+      if ("networkPolicy" in body || "namespace" in body) {
+        await daggerEnvironmentRuntimeManager.reconcileOrganizationDefault(
+          organization,
+        );
+      }
+
+      // A namespace change provisions the engine in the new namespace above but
+      // leaves the old one running with its retained cache PVC; tear it down.
+      // currentOrganization holds the pre-patch namespace (loaded before the
+      // patch when the namespace was changing).
+      if (namespaceActuallyChanging) {
+        await daggerEnvironmentRuntimeManager.teardownOrganizationDefaultEngine(
+          organization,
+          currentOrganization?.defaultEnvironmentNamespace ?? null,
+        );
+        // Unbound agents with their own network policy run their engine in
+        // the default namespace too; move them along in the background, as a
+        // move waits for each old engine to stop.
+        trackBackgroundWork(
+          daggerEnvironmentRuntimeManager.reconcileAgentEngines({
+            organizationId,
+          }),
+        );
       }
 
       return reply.send(organization);
@@ -254,11 +814,106 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
         response: constructResponseSchema(SelectOrganizationSchema),
       },
     },
-    async ({ organizationId, body }, reply) => {
+    async ({ organizationId, body, user, headers, serviceAccount }, reply) => {
+      // The default role is stamped onto every account provisioned without an
+      // explicit role (self-signup, ChatOps auto-provisioning, role-less
+      // invitation acceptance), so choosing it is member administration rather
+      // than a general organization setting. Gate it on member:create so the
+      // broader organizationSettings:update — which roles like editor hold to
+      // manage appearance and auth options — is not by itself enough to decide
+      // what new accounts are granted.
+      if ("defaultMemberRole" in body) {
+        const { success: canProvisionMembers } = await hasPermission(
+          { member: ["create"] },
+          headers,
+          serviceAccount,
+          { userId: user.id, organizationId },
+        );
+        if (!canProvisionMembers) {
+          throw new ApiError(
+            403,
+            "You are not authorized to change the default role for new members",
+          );
+        }
+      }
+
+      // A non-null default role must resolve to a real role in this org
+      // (predefined or custom) — otherwise new members would be provisioned
+      // with a role that grants no permissions.
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      for (const roleIdentifier of body.defaultMemberRole?.split(",") ?? []) {
+        const role = await OrganizationRoleModel.getByIdentifier(
+          roleIdentifier,
+          organizationId,
+        );
+        if (!role) {
+          throw new ApiError(400, "Default role not found");
+        }
+
+        // Existence alone is not enough: predefined roles resolve here too, so
+        // without this the field could name a role more privileged than the
+        // caller and have future accounts provisioned into it. Hold the caller
+        // to the same "only grant what you have" rule custom-role authoring
+        // uses.
+        await assertCallerCanGrantRole({
+          role,
+          userId: user.id,
+          organizationId,
+        });
+      }
+      // SPDX-SnippetEnd
+
+      // Requiring 2FA is enterprise-licensed enforcement (see enterprise-tier
+      // for the small-team allowance). Session caps ride the same gate.
+      if (
+        (body.requireTwoFactor === true ||
+          typeof body.sessionMaxAgeSeconds === "number") &&
+        !enterpriseTier.isCoreActive()
+      ) {
+        throw new ApiError(
+          403,
+          "Requiring two-factor authentication and session lifetime caps " +
+            "are enterprise features. Please contact sales@archestra.ai to " +
+            "enable them.",
+        );
+      }
+
+      // Enrolling in 2FA requires confirming a password (better-auth's
+      // /two-factor/enable mandates it), so on a password-less deployment the
+      // requirement would lock every member out with no way to satisfy it.
+      // SSO deployments enforce MFA at the identity provider instead.
+      if (body.requireTwoFactor === true && config.auth.disableBasicAuth) {
+        throw new ApiError(
+          400,
+          "Two-factor authentication cannot be required while email/password " +
+            "sign-in is disabled: enrolling requires confirming a password. " +
+            "Enforce multi-factor authentication at your identity provider " +
+            "instead.",
+        );
+      }
+
+      const before = await OrganizationModel.getById(organizationId);
       const organization = await OrganizationModel.patch(organizationId, body);
 
       if (!organization) {
         throw new ApiError(404, "Organization not found");
+      }
+
+      // Flipping require-2FA ON revokes every session belonging to a member
+      // who has not enrolled — their next sign-in lands in mandatory setup.
+      // Enrolled members keep their sessions. (The signed session cookie
+      // cache means revocation can lag by up to its 60s TTL.)
+      if (body.requireTwoFactor === true && !before?.requireTwoFactor) {
+        const revoked =
+          await SessionModel.deleteAllForOrganizationMembersWithoutTwoFactor(
+            organizationId,
+          );
+        logger.info(
+          { organizationId, revoked },
+          "require-2FA enabled — revoked sessions of non-enrolled members",
+        );
       }
 
       return reply.send(organization);
@@ -279,74 +934,182 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
     async ({ organizationId, body }, reply) => {
       const currentOrg = await OrganizationModel.getById(organizationId);
 
-      // Embedding model is locked once both key and model have been saved
+      // Effective (post-save) embedding + reranker pairs. Distinguish "not
+      // changing" (undefined) from "clearing" (null) so a cleared field is seen
+      // as cleared, not masked back to its current value.
+      const effectiveEmbeddingKeyId =
+        body.embeddingChatApiKeyId !== undefined
+          ? body.embeddingChatApiKeyId
+          : (currentOrg?.embeddingChatApiKeyId ?? null);
+      const effectiveEmbeddingModel =
+        body.embeddingModel !== undefined
+          ? body.embeddingModel
+          : (currentOrg?.embeddingModel ?? null);
+      const effectiveRerankerKeyId =
+        body.rerankerChatApiKeyId !== undefined
+          ? body.rerankerChatApiKeyId
+          : (currentOrg?.rerankerChatApiKeyId ?? null);
+      const effectiveRerankerModel =
+        body.rerankerModel !== undefined
+          ? body.rerankerModel
+          : (currentOrg?.rerankerModel ?? null);
+      const effectiveOcrKeyId =
+        body.ocrChatApiKeyId !== undefined
+          ? body.ocrChatApiKeyId
+          : (currentOrg?.ocrChatApiKeyId ?? null);
+      const effectiveOcrModel =
+        body.ocrModel !== undefined
+          ? body.ocrModel
+          : (currentOrg?.ocrModel ?? null);
+
+      // Embedding is locked once fully configured: changing OR clearing it (any
+      // difference from the current pair, incl. a null clear) must go through the
+      // drop-embedding route, which also deletes the now-stale vectors and resets
+      // connector checkpoints.
       const isEmbeddingConfigLocked =
         !!currentOrg?.embeddingChatApiKeyId && !!currentOrg?.embeddingModel;
-
-      if (body.embeddingModel) {
-        if (
-          isEmbeddingConfigLocked &&
-          body.embeddingModel !== currentOrg.embeddingModel
-        ) {
-          throw new ApiError(
-            400,
-            "Embedding model cannot be changed once configured. Changing models requires re-embedding all documents.",
-          );
-        }
-      }
-
       if (
         isEmbeddingConfigLocked &&
-        body.embeddingChatApiKeyId !== undefined &&
-        body.embeddingChatApiKeyId !== currentOrg.embeddingChatApiKeyId
+        (effectiveEmbeddingKeyId !== currentOrg?.embeddingChatApiKeyId ||
+          effectiveEmbeddingModel !== currentOrg?.embeddingModel)
       ) {
         throw new ApiError(
           400,
-          "Embedding API key cannot be changed once configured. Drop the embedding configuration before selecting a different key.",
+          "Embedding configuration cannot be changed once set. Drop the existing configuration to reconfigure — all documents will need to be re-embedded.",
+          "embedding_validation_failed",
         );
       }
 
-      // Validate embedding API key exists
-      if (body.embeddingChatApiKeyId) {
-        const chatApiKey = await LlmProviderApiKeyModel.findById(
-          body.embeddingChatApiKeyId,
-        );
-        if (!chatApiKey) {
-          throw new ApiError(404, "Embedding API key not found");
-        }
-      }
-
-      const shouldValidateEmbeddingSelection =
+      // Only validate the embedding/reranker pairs when the patch actually
+      // touches them: a patch to an unrelated knowledge setting (e.g.
+      // permissionSyncSchedule) must not be blocked by — or fire a live probe
+      // for — pre-existing embedding state it doesn't change.
+      const patchTouchesEmbedding =
         body.embeddingChatApiKeyId !== undefined ||
         body.embeddingModel !== undefined;
-      const effectiveEmbeddingKeyId =
-        body.embeddingChatApiKeyId ?? currentOrg?.embeddingChatApiKeyId ?? null;
-      const effectiveEmbeddingModel =
-        body.embeddingModel ?? currentOrg?.embeddingModel ?? null;
+      const patchTouchesReranker =
+        body.rerankerChatApiKeyId !== undefined ||
+        body.rerankerModel !== undefined;
+      const patchTouchesOcr =
+        body.ocrChatApiKeyId !== undefined || body.ocrModel !== undefined;
 
+      // Embedding is mandatory: a half-configured pair (a key with no model, or a
+      // model with no key) is invalid and blocks save. To clear the embedding
+      // entirely, use the drop-embedding route.
       if (
-        shouldValidateEmbeddingSelection &&
+        patchTouchesEmbedding &&
+        Boolean(effectiveEmbeddingKeyId) !== Boolean(effectiveEmbeddingModel)
+      ) {
+        throw new ApiError(
+          400,
+          "Both an embedding API key and model are required. To clear the embedding configuration, use Drop.",
+          "embedding_validation_failed",
+        );
+      }
+
+      // Validate BOTH configurations by actually exercising them (a real embedding
+      // call, a real structured-output reranker call) — not just checking fields
+      // are filled. Embedding is validated when set; the reranker is optional but
+      // must be valid when set, and a half-configured reranker blocks save. The
+      // failing field is carried in the ApiError's internal_code so the UI can
+      // show it per-field.
+      if (
+        patchTouchesEmbedding &&
         effectiveEmbeddingKeyId &&
         effectiveEmbeddingModel
       ) {
-        const resolved = await resolveApiKeyFromChatApiKey(
-          effectiveEmbeddingKeyId,
-        );
-        if (!resolved) {
-          throw new ApiError(400, "Could not resolve embedding API key");
-        }
-
-        const model = await ModelModel.findByProviderAndModelId(
-          resolved.provider,
-          effectiveEmbeddingModel,
-        );
-
-        if (model?.embeddingDimensions === null || !model) {
+        const result = await knowledgeSettingsService.validateEmbeddingConfig({
+          keyId: effectiveEmbeddingKeyId,
+          model: effectiveEmbeddingModel,
+          organizationId,
+        });
+        if (!result.ok) {
           throw new ApiError(
             400,
-            "Embedding model must be marked as an embedding model with configured dimensions in LLM Providers > Models.",
+            result.error ?? "Embedding validation failed.",
+            "embedding_validation_failed",
           );
         }
+      }
+
+      if (
+        patchTouchesReranker &&
+        Boolean(effectiveRerankerKeyId) !== Boolean(effectiveRerankerModel)
+      ) {
+        throw new ApiError(
+          400,
+          "Both a reranker API key and model are required, or clear both.",
+          "reranker_validation_failed",
+        );
+      }
+      if (
+        patchTouchesReranker &&
+        effectiveRerankerKeyId &&
+        effectiveRerankerModel
+      ) {
+        const result = await knowledgeSettingsService.validateRerankerConfig({
+          keyId: effectiveRerankerKeyId,
+          model: effectiveRerankerModel,
+          organizationId,
+        });
+        if (!result.ok) {
+          throw new ApiError(
+            400,
+            result.error ?? "Reranker validation failed.",
+            "reranker_validation_failed",
+          );
+        }
+      }
+
+      if (
+        patchTouchesOcr &&
+        Boolean(effectiveOcrKeyId) !== Boolean(effectiveOcrModel)
+      ) {
+        throw new ApiError(
+          400,
+          "Both an OCR API key and model are required, or clear both.",
+          "ocr_validation_failed",
+        );
+      }
+      if (patchTouchesOcr && effectiveOcrKeyId && effectiveOcrModel) {
+        const result = await knowledgeSettingsService.validateOcrConfig({
+          keyId: effectiveOcrKeyId,
+          model: effectiveOcrModel,
+          organizationId,
+        });
+        if (!result.ok) {
+          throw new ApiError(
+            400,
+            result.error ?? "OCR validation failed.",
+            "ocr_validation_failed",
+          );
+        }
+      }
+
+      // Turning OCR on (unset -> configured) resets connector checkpoints so
+      // the next sync re-presents documents that were previously skipped as
+      // having no extractable text — a delta sync would otherwise never show
+      // them again and enabling OCR would appear to do nothing. Key/model
+      // swaps and clears deliberately do not trigger this. The reset runs
+      // BEFORE the organization write: resetting is idempotent and benign on
+      // its own, while the reverse order could persist an enabled OCR whose
+      // reset failed — and a retry would then see OCR as "already configured"
+      // and never reset at all.
+      const ocrWasConfigured =
+        !!currentOrg?.ocrChatApiKeyId && !!currentOrg?.ocrModel;
+      const ocrBecomesConfigured =
+        patchTouchesOcr &&
+        !ocrWasConfigured &&
+        !!effectiveOcrKeyId &&
+        !!effectiveOcrModel;
+      if (ocrBecomesConfigured) {
+        await KnowledgeBaseConnectorModel.resetCheckpointsByOrganization(
+          organizationId,
+        );
+        logger.info(
+          { organizationId },
+          "OCR enabled — connector checkpoints reset for a full re-sync",
+        );
       }
 
       const organization = await OrganizationModel.patch(organizationId, body);
@@ -381,6 +1144,9 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
 
       // Delete all KB documents (chunks cascade via FK)
       await KbDocumentModel.deleteByOrganization(organizationId);
+      await KbConnectorDocumentCountModel.refreshForOrganization({
+        organizationId,
+      });
 
       // Reset connector checkpoints so next sync does a full re-ingest
       await KnowledgeBaseConnectorModel.resetCheckpointsByOrganization(
@@ -420,70 +1186,104 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
         ),
       },
     },
-    async ({ body }, reply) => {
-      // Validate API key exists
-      const chatApiKey = await LlmProviderApiKeyModel.findById(
-        body.embeddingChatApiKeyId,
+    async ({ body, organizationId }, reply) => {
+      const result = await knowledgeSettingsService.validateEmbeddingConfig({
+        keyId: body.embeddingChatApiKeyId,
+        model: body.embeddingModel,
+        organizationId,
+      });
+      return reply.send({
+        success: result.ok,
+        ...(result.error ? { error: result.error } : {}),
+      });
+    },
+  );
+
+  fastify.post(
+    "/api/organization/knowledge-settings/test-reranker",
+    {
+      schema: {
+        operationId: RouteId.TestRerankerConnection,
+        description:
+          "Test the reranker connection with a sample structured-output call",
+        tags: ["Organization"],
+        body: z.object({
+          rerankerChatApiKeyId: z.string().uuid(),
+          rerankerModel: z.string().min(1),
+        }),
+        response: constructResponseSchema(
+          z.object({
+            success: z.boolean(),
+            error: z.string().optional(),
+          }),
+        ),
+      },
+    },
+    async ({ body, organizationId }, reply) => {
+      const result = await knowledgeSettingsService.validateRerankerConfig({
+        keyId: body.rerankerChatApiKeyId,
+        model: body.rerankerModel,
+        organizationId,
+      });
+      return reply.send({
+        success: result.ok,
+        ...(result.error ? { error: result.error } : {}),
+      });
+    },
+  );
+
+  fastify.get(
+    "/api/organization/knowledge-settings/keyword-ranking-status",
+    {
+      schema: {
+        operationId: RouteId.GetKeywordRankingStatus,
+        description:
+          "Where BM25 keyword ranking stands for the organization: whether " +
+          "its corpus statistics cover every language with indexed " +
+          "documents (until they do, keyword search ranks that language " +
+          "with PostgreSQL's built-in ts_rank), when they were last rebuilt " +
+          "and when the next rebuild is due",
+        tags: ["Organization"],
+        response: constructResponseSchema(KeywordRankingStatusSchema),
+      },
+    },
+    async ({ organizationId }, reply) => {
+      return reply.send(
+        await knowledgeSettingsService.getKeywordRankingStatus(organizationId),
       );
-      if (!chatApiKey) {
-        throw new ApiError(404, "API key not found");
-      }
+    },
+  );
 
-      // Resolve the actual secret
-      const resolved = await resolveApiKeyFromChatApiKey(
-        body.embeddingChatApiKeyId,
-      );
-      if (!resolved) {
-        return reply.send({
-          success: false,
-          error: "Could not resolve API key secret",
-        });
-      }
-
-      const model = await ModelModel.findByProviderAndModelId(
-        resolved.provider,
-        body.embeddingModel,
-      );
-      if (!model?.embeddingDimensions) {
-        return reply.send({
-          success: false,
-          error:
-            "Embedding model must be marked as an embedding model with configured dimensions in LLM Providers > Models.",
-        });
-      }
-
-      try {
-        const response = await callEmbedding({
-          inputs: [
-            addNomicTaskPrefix(
-              body.embeddingModel,
-              "hello world",
-              "search_document",
-            ),
-          ],
-          model: body.embeddingModel,
-          apiKey: resolved.apiKey,
-          baseUrl: resolved.baseUrl,
-          dimensions: model.embeddingDimensions,
-          provider: resolved.provider,
-        });
-
-        if (response.data.length > 0) {
-          return reply.send({ success: true });
-        }
-
-        return reply.send({
-          success: false,
-          error: "No embedding data returned",
-        });
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "Unknown error";
-        logger.error(
-          { err },
-          "[testEmbeddingConnection] embedding call failed",
-        );
-        return reply.send({ success: false, error: message });
-      }
+  fastify.post(
+    "/api/organization/knowledge-settings/test-ocr",
+    {
+      schema: {
+        operationId: RouteId.TestOcrConnection,
+        description:
+          "Test the OCR configuration by sending a synthetic PDF page to the model",
+        tags: ["Organization"],
+        body: z.object({
+          ocrChatApiKeyId: z.string().uuid(),
+          ocrModel: z.string().min(1),
+        }),
+        response: constructResponseSchema(
+          z.object({
+            success: z.boolean(),
+            error: z.string().optional(),
+          }),
+        ),
+      },
+    },
+    async ({ body, organizationId }, reply) => {
+      const result = await knowledgeSettingsService.validateOcrConfig({
+        keyId: body.ocrChatApiKeyId,
+        model: body.ocrModel,
+        organizationId,
+      });
+      return reply.send({
+        success: result.ok,
+        ...(result.error ? { error: result.error } : {}),
+      });
     },
   );
 
@@ -547,8 +1347,19 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
       schema: {
         operationId: RouteId.GetMemberSignupStatus,
         description:
-          "Get which members have completed signup (have an account record)",
+          "Get which members have not completed signup (no account record). Pass `userIds` to ask about the members on screen instead of every member.",
         tags: ["Organization"],
+        querystring: z.object({
+          userIds: z
+            .preprocess(
+              (value) => (typeof value === "string" ? value.split(",") : value),
+              z.array(z.string()).max(100),
+            )
+            .optional()
+            .describe(
+              "Only these members (comma-separated user IDs), such as the rows of one Users page. Without it, every member of the organization is checked.",
+            ),
+        }),
         response: constructResponseSchema(
           z.object({
             pendingSignupMembers: z.array(
@@ -566,93 +1377,73 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
         ),
       },
     },
-    async ({ organizationId }, reply) => {
-      // Get all member user IDs for this organization
-      const members = await db
-        .select({ userId: schema.membersTable.userId })
-        .from(schema.membersTable)
-        .where(eq(schema.membersTable.organizationId, organizationId));
-
-      if (members.length === 0) {
+    async ({ organizationId, query }, reply) => {
+      if (query.userIds && query.userIds.length === 0) {
         return reply.send({ pendingSignupMembers: [] });
       }
 
-      const memberUserIds = members.map((m) => m.userId);
+      const members = schema.membersTable;
+      const users = schema.usersTable;
+      const invitations = schema.invitationsTable;
 
-      // Find which of these users have an account record
-      const usersWithAccounts = await db
-        .select({ userId: schema.accountsTable.userId })
-        .from(schema.accountsTable)
-        .where(inArray(schema.accountsTable.userId, memberUserIds));
-
-      const hasAccountSet = new Set(usersWithAccounts.map((a) => a.userId));
-      const pendingUserIds = memberUserIds.filter(
-        (id) => !hasAccountSet.has(id),
-      );
-
-      if (pendingUserIds.length === 0) {
-        return reply.send({ pendingSignupMembers: [] });
-      }
-
-      // Look up auto-provisioned invitations to get provider and invitation ID
-      const invitations = await db
-        .select({
-          id: schema.invitationsTable.id,
-          email: schema.invitationsTable.email,
-          status: schema.invitationsTable.status,
-        })
-        .from(schema.invitationsTable)
-        .where(
-          like(
-            schema.invitationsTable.status,
-            `${AUTO_PROVISIONED_INVITATION_STATUS}%`,
-          ),
-        );
-
-      // Build email → { provider, invitationId } map
-      const emailToInvitation = new Map<
-        string,
-        { provider: string | null; invitationId: string }
-      >();
-      for (const inv of invitations) {
-        const parts = inv.status.split(":");
-        emailToInvitation.set(inv.email, {
-          provider: parts.length === 2 ? parts[1] : null,
-          invitationId: inv.id,
-        });
-      }
-
-      // Get emails for pending users
-      const pendingUsers = await db
-        .select({
-          id: schema.usersTable.id,
-          email: schema.usersTable.email,
-          name: schema.usersTable.name,
-          image: schema.usersTable.image,
-          role: schema.membersTable.role,
-        })
-        .from(schema.membersTable)
-        .innerJoin(
-          schema.usersTable,
-          eq(schema.membersTable.userId, schema.usersTable.id),
-        )
+      // The newest auto-provisioned invitation for the member's email, if
+      // any: its status carries the provider ("auto-provisioned:<provider>")
+      // and its id builds the sign-up link.
+      const invitation = db
+        .select({ id: invitations.id, status: invitations.status })
+        .from(invitations)
         .where(
           and(
-            eq(schema.membersTable.organizationId, organizationId),
-            inArray(schema.usersTable.id, pendingUserIds),
+            eq(invitations.organizationId, members.organizationId),
+            eq(invitations.email, users.email),
+            like(invitations.status, `${AUTO_PROVISIONED_INVITATION_STATUS}%`),
+          ),
+        )
+        .orderBy(desc(invitations.createdAt))
+        .limit(1)
+        .as("auto_provisioned_invitation");
+
+      // One statement: the members (of one page, when `userIds` is given)
+      // that have no account row yet, each with its invitation. This used to
+      // read every member id, every account of those members and every
+      // auto-provisioned invitation, then send every pending member of the
+      // organization on each Users page load.
+      const rows = await db
+        .select({
+          userId: members.userId,
+          name: users.name,
+          email: users.email,
+          image: users.image,
+          role: members.role,
+          invitationId: invitation.id,
+          invitationStatus: invitation.status,
+        })
+        .from(members)
+        .innerJoin(users, eq(members.userId, users.id))
+        .leftJoinLateral(invitation, sql`true`)
+        .where(
+          and(
+            eq(members.organizationId, organizationId),
+            notExists(
+              db
+                .select({ one: sql`1` })
+                .from(schema.accountsTable)
+                .where(eq(schema.accountsTable.userId, members.userId)),
+            ),
+            query.userIds ? inArray(members.userId, query.userIds) : undefined,
           ),
         );
 
-      const pendingSignupMembers = pendingUsers.map((u) => {
-        const inv = emailToInvitation.get(u.email);
+      const pendingSignupMembers = rows.map((row) => {
+        const parts = row.invitationStatus?.split(":") ?? [];
         return {
-          userId: u.id,
-          name: u.name,
-          email: u.email,
-          image: u.image,
-          role: u.role,
-          provider: inv?.provider ?? null,
-          invitationId: inv?.invitationId ?? null,
+          userId: row.userId,
+          name: row.name,
+          email: row.email,
+          image: row.image,
+          role: row.role,
+          provider: parts.length === 2 ? parts[1] : null,
+          invitationId: row.invitationId ?? null,
         };
       });
 
@@ -676,81 +1467,83 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
         response: constructResponseSchema(z.object({ success: z.boolean() })),
       },
     },
-    async ({ organizationId, params }, reply) => {
-      const { userId } = params;
+    async ({ organizationId, params, user }, reply) => {
+      const result = await removeMemberTarget({
+        organizationId,
+        actorUserId: user.id,
+        target: { kind: "pendingSignup", id: params.userId },
+      });
 
-      // Verify user has no account (is actually pending signup)
-      const [account] = await db
-        .select({ userId: schema.accountsTable.userId })
-        .from(schema.accountsTable)
-        .where(eq(schema.accountsTable.userId, userId))
-        .limit(1);
-
-      if (account) {
+      if (result.status === "classification_changed") {
         throw new ApiError(
           400,
           "Cannot delete a member who has already completed signup",
         );
       }
-
-      // Get user email to find their invitation
-      const user = await UserModel.getById(userId);
-      if (!user) {
+      if (result.status === "self") {
+        throw new ApiError(400, "You cannot remove your own account");
+      }
+      if (result.status === "not_found") {
         throw new ApiError(404, "User not found");
       }
-
-      // Delete invitation(s) with auto-provisioned status for this email
-      const invitations = await db
-        .select({ id: schema.invitationsTable.id })
-        .from(schema.invitationsTable)
-        .where(
-          and(
-            eq(schema.invitationsTable.email, user.email),
-            like(
-              schema.invitationsTable.status,
-              `${AUTO_PROVISIONED_INVITATION_STATUS}%`,
-            ),
-          ),
-        );
-
-      for (const inv of invitations) {
-        await InvitationModel.delete(inv.id);
-      }
-
-      // Delete personal tokens
-      await UserTokenModel.deleteByUserAndOrg(userId, organizationId);
-
-      // Delete member record
-      await MemberModel.deleteByMemberOrUserId(userId, organizationId);
-
-      // Delete user record (no other memberships since auto-provisioned)
-      await UserModel.delete(userId);
+      await openappaBatteriesService.recompileOrganizations([organizationId]);
 
       return reply.send({ success: true });
     },
   );
 
   fastify.get(
-    "/api/organization/members",
+    "/api/organization/member-options",
     {
       schema: {
-        operationId: RouteId.GetOrganizationMembers,
-        description: "Get all members of the organization",
+        operationId: RouteId.GetOrganizationMemberOptions,
+        description:
+          "Search visible organization member identities in bounded pages. The same directory visibility applies: member:read sees all members; other authenticated callers see only teammates.",
         tags: ["Organization"],
+        querystring: CursorQuerySchema.extend({
+          search: z.string().optional(),
+          searchMode: z
+            .enum(["name", "name_or_email"])
+            .default("name_or_email"),
+          ids: z
+            .preprocess(
+              (value) => (typeof value === "string" ? value.split(",") : value),
+              z.array(z.string().min(1)).max(100),
+            )
+            .optional(),
+          emails: z
+            .preprocess(
+              (value) => (typeof value === "string" ? value.split(",") : value),
+              z.array(z.string().min(1)).max(100),
+            )
+            .optional(),
+        }),
         response: constructResponseSchema(
-          z.array(
-            z.object({
-              id: z.string(),
-              name: z.string(),
-              email: z.string(),
-            }),
+          createCursorPaginatedResponseSchema(
+            z.object({ id: z.string(), name: z.string(), email: z.string() }),
           ),
         ),
       },
     },
-    async ({ organizationId }, reply) => {
-      const members = await MemberModel.findAllByOrganization(organizationId);
-      return reply.send(members);
+    async ({ organizationId, user, headers, serviceAccount, query }, reply) => {
+      const { success: canSeeAllMembers } = await hasPermission(
+        { member: ["read"] },
+        headers,
+        serviceAccount,
+        { userId: user.id, organizationId },
+      );
+      return reply.send(
+        await MemberModel.findOptions({
+          organizationId,
+          viewerId: user.id,
+          canSeeAllMembers,
+          pagination: { limit: query.limit, cursor: query.cursor },
+          search: query.search,
+          searchMode: query.searchMode,
+          ids: query.ids,
+          emails: query.emails,
+        }),
+      );
     },
   );
 
@@ -803,4 +1596,132 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
   );
 };
 
+async function assertOrganizationDefaultModelSelection(params: {
+  organizationId: string;
+  modelId: string | null;
+  apiKeyId: string | null;
+}): Promise<void> {
+  if (!params.modelId && !params.apiKeyId) return;
+  if (!params.modelId || !params.apiKeyId) {
+    throw new ApiError(
+      400,
+      "The default model and API key must be set together",
+    );
+  }
+  const apiKey = await LlmProviderApiKeyModel.findById(params.apiKeyId);
+  if (!apiKey || apiKey.organizationId !== params.organizationId) {
+    throw new ApiError(404, "API key not found");
+  }
+  const modelIsLinked = (
+    await LlmProviderApiKeyModelLinkModel.getModelsForApiKeyIds([apiKey.id])
+  ).some(({ model }) => model.id === params.modelId);
+  if (!modelIsLinked) {
+    throw new ApiError(400, "The default model and API key must be linked");
+  }
+}
+
 export default organizationRoutes;
+
+// === Internal helpers ===
+
+/** An inheriting Agent Runtime agent's runtime, as far as a default model goes. */
+const RuntimeDependentSchema = z.object({
+  runtimeCommand: z.array(z.string()).nullable(),
+  inferenceProtocol: z.enum(["openai_responses", "openai_chat", "anthropic"]),
+  /** Absent when Claude Code picks the authentication automatically. */
+  claudeCodeAuthentication: z.enum(["provider", "subscription"]).optional(),
+});
+
+/**
+ * Every mapped key must belong to the organization, match its provider, and
+ * be a provider the client can route — one key per provider, except where a
+ * provider's keys are separate endpoints. Per-user providers (GitHub Copilot)
+ * can't be mapped: each user connects their own account at setup time, and
+ * the connection flow refuses to wrap someone else's personal key.
+ */
+async function validateConnectionClientProviderKeys(params: {
+  organizationId: string;
+  mapping: ConnectionClientProviderKeys;
+}) {
+  const entries = Object.entries(params.mapping).flatMap(([clientId, keys]) =>
+    (keys ?? []).map((key) => ({
+      ...key,
+      clientId: clientId as InstallerClientId,
+    })),
+  );
+  const keys = await LlmProviderApiKeyModel.findByIds([
+    ...new Set(entries.map((entry) => entry.providerApiKeyId)),
+  ]);
+  const keysById = new Map(keys.map((key) => [key.id, key]));
+  const seen = new Set<string>();
+  for (const { clientId, provider, providerApiKeyId } of entries) {
+    const key = keysById.get(providerApiKeyId);
+    if (!key || key.organizationId !== params.organizationId) {
+      throw new ApiError(404, "Provider API key not found");
+    }
+    if (key.provider !== provider) {
+      throw new ApiError(
+        400,
+        `Key "${key.name}" is for provider "${key.provider}", not "${provider}"`,
+      );
+    }
+    if (providerRequiresPerUserCredential(provider)) {
+      throw new ApiError(
+        400,
+        `${provider} is per-user — each user connects their own account, so it can't be mapped to a setup command's virtual key.`,
+      );
+    }
+    if (!INSTALLER_CLIENT_KEY_PROVIDERS[clientId].includes(provider)) {
+      throw new ApiError(
+        400,
+        `${INSTALLER_CLIENT_LABELS[clientId]} can't route ${provider} requests.`,
+      );
+    }
+    const slot = `${clientId}:${provider}`;
+    if (seen.has(slot) && !providerHasEndpointLocalModels(provider)) {
+      throw new ApiError(
+        400,
+        `${INSTALLER_CLIENT_LABELS[clientId]} can map only one ${provider} key.`,
+      );
+    }
+    seen.add(slot);
+  }
+}
+
+async function assertCallerCanGrantRole(params: {
+  role: OrganizationRole;
+  userId: string;
+  organizationId: string;
+}) {
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  await ResourcePermissions.validateSubjectAssignment({
+    organizationId: params.organizationId,
+    userId: params.userId,
+    subjects: [{ type: "role", id: params.role.id }],
+  });
+  // SPDX-SnippetEnd
+  const callerPermissions = await getPermissionsForUserContext({
+    userId: params.userId,
+    organizationId: params.organizationId,
+  });
+  const { valid, missingPermissions } =
+    OrganizationRoleModel.validateRolePermissions(
+      callerPermissions,
+      params.role.permission,
+    );
+  if (!valid) {
+    throw new ApiError(
+      403,
+      `You cannot grant permissions you don't have: ${missingPermissions.join(", ")}`,
+    );
+  }
+}
+
+function sameNetworkPolicy(
+  a: NetworkPolicy | null,
+  b: NetworkPolicy | null,
+): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}

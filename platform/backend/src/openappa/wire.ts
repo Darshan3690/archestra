@@ -1,0 +1,2278 @@
+/**
+ * Denial notice restoration on the three provider wire formats.
+ *
+ * The client holds notice calls in its history; the provider must see the calls
+ * the model actually made. Restoration swaps each notice call back to the
+ * original tool and arguments in place and replaces the notice's result with
+ * the ruling, touching nothing else — thinking blocks, reasoning items,
+ * call ids and item order all survive, which is what keeps a restored turn
+ * valid for the provider and identical on every request.
+ *
+ * Structural reading only, the way `declaredToolEntries` reads declarations:
+ * one rewriter per container shape rather than a typed model per provider, so
+ * a body this proxy forwards but does not fully model still restores correctly.
+ */
+import {
+  APPA_PARENT_HEADER,
+  APPA_SESSION_HEADER,
+  type SupportedProviderDiscriminator,
+} from "@archestra/shared";
+import config from "@/config";
+import logger from "@/logging";
+import { OpenAppaSessionModel } from "@/models";
+import { parseClaudeMetadataSessionId } from "@/routes/proxy/utils/headers/session-id";
+import { clientSessionId } from "./actor";
+import {
+  type AppaChildTrajectoryReceipt,
+  appendChildTrajectoryReceipt,
+  stripChildTrajectoryReceipts,
+} from "./child-trajectory-receipt";
+import { stripChildTrajectoryReferences } from "./child-trajectory-reference-format";
+import { parseGrokDurableHistory } from "./grok-durable-history";
+import {
+  type NoticeOriginalCall,
+  readNotice,
+  readRemedyExecution,
+} from "./notice";
+import {
+  appendSessionReceipt,
+  type SessionReceiptLayout,
+  stripSessionReceipts,
+} from "./session-token";
+import {
+  parseTrajectoryStamp,
+  restoreTrajectoryStampText,
+  type TrajectoryStamp,
+} from "./trajectory-stamp";
+
+export type AppaWireFamily =
+  | "anthropic:messages"
+  | "openai:responses"
+  | "openai:chatCompletions";
+
+export type AppaSessionIdentity = {
+  sessionId?: string;
+  parentId?: string;
+  /** The field that supplied the selected session id. */
+  provenance?:
+    | "appa-header"
+    | "claude-code-header"
+    | "claude-code-metadata"
+    | "claude-desktop-header"
+    | "claude-desktop-metadata"
+    | "claude-metadata"
+    | "opencode-session"
+    | "codex-turn-metadata"
+    | "copilot-cli-prompt-cache-key"
+    | "opencode-session-header"
+    | "opencode-hosted-header"
+    | "kilo-session-header"
+    | "kilo-hosted-header"
+    | "pi-session-header"
+    | "kimi-code-cache-key"
+    | "grok-session-header"
+    | "prompt-cache-key"
+    | "metadata-session-id"
+    | "conversation"
+    | "none";
+};
+
+/** The wire families this proxy can restore notices on. */
+export function appaWireFamily(
+  interactionType: string,
+): AppaWireFamily | undefined {
+  return APPA_WIRE_FAMILY_BY_INTERACTION_TYPE[
+    interactionType as SupportedProviderDiscriminator
+  ];
+}
+
+/**
+ * A wire whose tool calls, call ids and text this proxy reads structurally:
+ * the three APPA families, and the shapes of the other chat wires it
+ * forwards. Notices restore on {@link AppaWireFamily} only.
+ */
+export type ProviderWire =
+  | AppaWireFamily
+  | "bedrock:converse"
+  | "gemini:generateContent";
+
+/**
+ * A wire whose history the proxy puts back the way the model wrote it:
+ * notices, remedy receipts and stamped ask_user arguments. Bedrock Converse
+ * restores history without the rest of an APPA family's protocol.
+ */
+export type HistoryWire = AppaWireFamily | "bedrock:converse";
+
+/** The wire an interaction type's history restores on. */
+export function historyWire(interactionType: string): HistoryWire | undefined {
+  const family = appaWireFamily(interactionType);
+  if (family) return family;
+  return interactionType === "bedrock:converse"
+    ? "bedrock:converse"
+    : undefined;
+}
+
+/** The wire an interaction type's request body is shaped as. */
+export function providerWire(
+  interactionType: string,
+): ProviderWire | undefined {
+  return (
+    appaWireFamily(interactionType) ??
+    OTHER_STAMP_WIRES[interactionType as SupportedProviderDiscriminator]
+  );
+}
+
+/**
+ * Restores notice tool calls in request history back to original calls and rulings.
+ * Updates model-visible history in place.
+ */
+export function restoreAppaNotices(params: {
+  family: HistoryWire;
+  body: unknown;
+  /** Resolved, with the namespace the call names, to this platform's notice tool. */
+  isNoticeTool: (name: string, namespace?: string) => boolean;
+  /** Merely spelled like it: a malformed notice is someone else's call. */
+  mayBeNoticeTool: (name: string) => boolean;
+}): { callIds: ReadonlySet<string>; memoryTexts: number } {
+  let memoryTexts = 0;
+  // Memory jobs serialize earlier tool traffic inside a user text. Restore
+  // those notices too, but never let historical IDs exempt live tool results
+  // from admission (a transcript can reuse a current call ID).
+  for (const site of params.family === "bedrock:converse"
+    ? []
+    : historyTextSites(params.family, params.body)) {
+    const memory = parseGrokDurableHistory(site.get());
+    if (!memory) continue;
+    const flatCalls = new Map<object, Record<string, unknown>>();
+    for (const message of memory.messages) {
+      if (message.role !== "assistant" || !Array.isArray(message.tool_calls))
+        continue;
+      message.tool_calls = message.tool_calls.map((entry) => {
+        const call = asRecord(entry);
+        if (!call || asRecord(call.function)) return entry;
+        const normalized = { id: call.id, function: call };
+        flatCalls.set(normalized, call);
+        return normalized;
+      });
+    }
+    const restored = restoreNoticeCalls({
+      ...params,
+      family: "openai:chatCompletions",
+      body: memory,
+    });
+    if (restored.size === 0) continue;
+    for (const message of memory.messages) {
+      if (!Array.isArray(message.tool_calls)) continue;
+      message.tool_calls = message.tool_calls.map(
+        (entry) => flatCalls.get(entry) ?? entry,
+      );
+    }
+    site.set(memory.serialize());
+    memoryTexts++;
+  }
+  return { callIds: restoreNoticeCalls(params), memoryTexts };
+}
+
+/** Only direct wire calls establish restoration provenance for this request. */
+function restoreNoticeCalls(params: {
+  family: HistoryWire;
+  body: unknown;
+  isNoticeTool: (name: string, namespace?: string) => boolean;
+  mayBeNoticeTool: (name: string) => boolean;
+}): ReadonlySet<string> {
+  const restoredCallIds = new Set<string>();
+  const calls = toolCallSites({
+    family: params.family,
+    body: params.body,
+    match: (name, namespace) =>
+      params.isNoticeTool(name, namespace) || params.mayBeNoticeTool(name),
+  });
+  for (const call of calls) {
+    const notice = readNotice({ callId: call.id, arguments: call.arguments });
+    // Unparseable notices remain as recorded so sessions continue without interruption.
+    if (!notice) continue;
+    // A denied call to a custom tool reached the client as an ordinary function
+    // call, because the notice tool is one; the notice's record is what says to
+    // call it a custom tool call again, since the request carrying it back may
+    // declare no tools at all.
+    const custom = notice.original.kind === "custom";
+    // A model can call a name no tool has, spaces and all. Put back in
+    // history, that name fails the provider's own validation and ends the
+    // session; the notice already records the call and its ruling.
+    if (!PROVIDER_TOOL_NAME.test(notice.tool)) continue;
+    if (!call.restore(notice.tool, notice.original, notice.namespace)) continue;
+    restoredCallIds.add(parseTrajectoryStamp(call.id)?.callId ?? call.id);
+    restoreResult({
+      ...params,
+      callId: call.id,
+      result: notice.result,
+      custom,
+    });
+  }
+  return restoredCallIds;
+}
+
+/**
+ * A catalog lookup may run in place of a held native call. Its result is the
+ * held call's ruling, so provider history must also name that original call.
+ * The caller supplies only receipts read from this exact runtime session.
+ */
+export function restoreDeferredNativeCalls(params: {
+  family: HistoryWire;
+  body: unknown;
+  carrierName: string;
+  originals: ReadonlyMap<
+    string,
+    { name: string; arguments: Record<string, unknown> }
+  >;
+}): ReadonlySet<string> {
+  const restored = new Set<string>();
+  for (const call of toolCallSites({
+    ...params,
+    match: (name, namespace) =>
+      name === params.carrierName && namespace === undefined,
+  })) {
+    const id = parseTrajectoryStamp(call.id)?.callId ?? call.id;
+    const original = params.originals.get(id);
+    if (
+      call.kind !== "function" ||
+      !original ||
+      !PROVIDER_TOOL_NAME.test(original.name) ||
+      !call.restore(original.name, {
+        kind: "function",
+        arguments: original.arguments,
+      })
+    )
+      continue;
+    restored.add(id);
+  }
+  return restored;
+}
+
+/**
+ * Removes the gateway-only execution receipt from a direct control call in
+ * provider history. It deliberately does not restore custom calls: only the
+ * function control call the provider actually emitted can carry this receipt.
+ */
+export function restoreAppaRemedyExecutions(params: {
+  family: HistoryWire;
+  body: unknown;
+  isControlTool: (name: string, namespace?: string) => boolean;
+  /** Restores typed historical records only; never declares a tool available. */
+  allowHistoricalControl?: boolean;
+}): string | undefined {
+  let historicalControlToolName: string | undefined;
+  const calls = toolCallSites({
+    family: params.family,
+    body: params.body,
+    match: (name, namespace) =>
+      params.isControlTool(name, namespace) ||
+      params.allowHistoricalControl === true,
+  });
+  for (const call of calls) {
+    if (call.kind !== "function") continue;
+    const execution = readRemedyExecution({
+      callId: call.id,
+      toolName: call.name,
+      namespace: call.namespace,
+      arguments: call.arguments,
+    });
+    if (!execution) continue;
+    historicalControlToolName = execution.tool_name;
+    call.restoreFunctionArguments({
+      kind: "function",
+      arguments: execution.parsedOriginalArguments,
+      rawArguments: execution.original_arguments,
+    });
+  }
+  return historicalControlToolName;
+}
+
+/**
+ * Removes proxy-stamped arguments from function calls in provider history.
+ * The provider receives each call as originally generated by the model.
+ */
+export function stripProxyArguments(params: {
+  family: HistoryWire;
+  body: unknown;
+  /** Resolved, with the namespace the call names, to a tool the proxy stamps. */
+  isStampedTool: (name: string, namespace?: string) => boolean;
+  names: ReadonlySet<string>;
+}): number {
+  let stripped = 0;
+  const calls = toolCallSites({
+    family: params.family,
+    body: params.body,
+    match: params.isStampedTool,
+  });
+  for (const call of calls) {
+    if (call.kind !== "function") continue;
+    const argumentsValue = asRecord(
+      typeof call.arguments === "string"
+        ? parseJson(call.arguments)
+        : call.arguments,
+    );
+    if (!argumentsValue) continue;
+    const kept = Object.entries(argumentsValue).filter(
+      ([name]) => !params.names.has(name),
+    );
+    if (kept.length === Object.keys(argumentsValue).length) continue;
+    call.restoreFunctionArguments({
+      kind: "function",
+      arguments: Object.fromEntries(kept),
+    });
+    stripped++;
+  }
+  return stripped;
+}
+
+/**
+ * Removes parameters from a declared tool's input schema, wherever its wire
+ * keeps it: Anthropic's `input_schema`, the Responses and Gemini `parameters`,
+ * Gemini's `parametersJsonSchema`, Chat Completions' `function.parameters`,
+ * Bedrock Converse's `toolSpec.inputSchema.json`.
+ */
+export function stripDeclaredParameters(params: {
+  tool: unknown;
+  names: ReadonlySet<string>;
+}): boolean {
+  const schema = declaredInputSchema(params.tool);
+  const properties = asRecord(schema?.properties);
+  if (!schema || !properties) return false;
+  const kept = Object.entries(properties).filter(
+    ([name]) => !params.names.has(name),
+  );
+  if (kept.length === Object.keys(properties).length) return false;
+  schema.properties = Object.fromEntries(kept);
+  // Strict function schemas list every property as required.
+  if (Array.isArray(schema.required))
+    schema.required = schema.required.filter(
+      (name) => typeof name !== "string" || !params.names.has(name),
+    );
+  return true;
+}
+
+/** A tool call in provider-bound history, as {@link providerToolCalls} reads it. */
+export type ProviderToolCall = {
+  /** The call's id; Gemini and native Ollama may send a call without one. */
+  id?: string;
+  name: string;
+  /** The namespace the call names (Codex Responses). */
+  namespace?: string;
+  /** A custom call's input is free-form text the model wrote, never ours. */
+  kind: "function" | "custom";
+  /** The arguments as an object, when they are one or JSON text of one. */
+  readArguments: () => Record<string, unknown> | undefined;
+  /** Writes arguments back as the wire recorded them: text stays text, an object an object. */
+  writeArguments: (next: Record<string, unknown> | string) => void;
+};
+
+/**
+ * Every tool call in a request's history, on any wire this proxy forwards.
+ * Reads in place; nothing changes until a caller writes arguments back.
+ */
+export function providerToolCalls(params: {
+  wire: ProviderWire;
+  body: unknown;
+}): ProviderToolCall[] {
+  const calls: ProviderToolCall[] = [];
+  const add = (
+    holder: Record<string, unknown>,
+    key: string,
+    call: Pick<ProviderToolCall, "id" | "name" | "namespace" | "kind">,
+  ) => {
+    calls.push({
+      ...call,
+      readArguments: () => {
+        const recorded = holder[key];
+        return asRecord(
+          typeof recorded === "string" ? parseJson(recorded) : recorded,
+        );
+      },
+      writeArguments: (next) => {
+        const recorded = holder[key];
+        holder[key] =
+          typeof recorded === "string"
+            ? typeof next === "string"
+              ? next
+              : JSON.stringify(next)
+            : typeof next === "string"
+              ? (asRecord(parseJson(next)) ?? recorded)
+              : next;
+      },
+    });
+  };
+  const idOf = (value: unknown) =>
+    typeof value === "string" ? value : undefined;
+  if (params.wire === "anthropic:messages") {
+    for (const block of anthropicBlocks(params.body)) {
+      if (block.type !== "tool_use" || typeof block.name !== "string") continue;
+      add(block, "input", {
+        id: idOf(block.id),
+        name: block.name,
+        kind: "function",
+      });
+    }
+  } else if (params.wire === "openai:responses") {
+    for (const item of responsesItems(params.body)) {
+      if (item.type !== "function_call" && item.type !== "custom_tool_call")
+        continue;
+      if (typeof item.name !== "string") continue;
+      const namespace =
+        typeof item.namespace === "string" && item.namespace !== ""
+          ? item.namespace
+          : undefined;
+      add(item, item.type === "function_call" ? "arguments" : "input", {
+        id: idOf(item.call_id),
+        name: item.name,
+        ...(namespace ? { namespace } : {}),
+        kind: item.type === "function_call" ? "function" : "custom",
+      });
+    }
+  } else if (params.wire === "openai:chatCompletions") {
+    for (const message of chatMessages(params.body)) {
+      for (const entry of asArray(message.tool_calls) ?? []) {
+        const call = asRecord(entry);
+        const fn = asRecord(call?.function);
+        if (!call || !fn || typeof fn.name !== "string") continue;
+        add(fn, "arguments", {
+          id: idOf(call.id),
+          name: fn.name,
+          kind: "function",
+        });
+      }
+    }
+  } else if (params.wire === "bedrock:converse") {
+    for (const message of chatMessages(params.body)) {
+      for (const block of asArray(message.content) ?? []) {
+        const toolUse = asRecord(asRecord(block)?.toolUse);
+        if (!toolUse || typeof toolUse.name !== "string") continue;
+        add(toolUse, "input", {
+          id: idOf(toolUse.toolUseId),
+          name: toolUse.name,
+          kind: "function",
+        });
+      }
+    }
+  } else {
+    for (const content of asArray(asRecord(params.body)?.contents) ?? []) {
+      for (const part of asArray(asRecord(content)?.parts) ?? []) {
+        const functionCall = asRecord(asRecord(part)?.functionCall);
+        if (!functionCall || typeof functionCall.name !== "string") continue;
+        add(functionCall, "args", {
+          id: idOf(functionCall.id),
+          name: functionCall.name,
+          kind: "function",
+        });
+      }
+    }
+  }
+  return calls;
+}
+
+/**
+ * Restores original provider tool-call IDs from trajectory stamps across call
+ * and result items. Returns all parsed stamps to identify source context.
+ * Runs before any component inspects history.
+ *
+ * Covers all chat wires. When a conversation switches providers mid-session,
+ * it retains previous IDs.
+ */
+export function restoreTrajectoryStamps(params: {
+  interactionType: string;
+  body: unknown;
+}): TrajectoryStamp[] {
+  const found: TrajectoryStamp[] = [];
+  for (const site of callIdSites(params)) {
+    const stamp = parseTrajectoryStamp(site.get());
+    if (!stamp) continue;
+    site.set(stamp.callId);
+    found.push(stamp);
+  }
+  return found;
+}
+
+/**
+ * Removes session-receipt marks from conversation history before request
+ * forwarding. Only message text fields are inspected. Tool arguments, results,
+ * reasoning, and instructions are not treated as control data.
+ *
+ * Stripping is unconditional: receipts must never reach providers or logs,
+ * even when OpenAPPA is off. Lineage evidence resolution (a database lookup
+ * restricted to the request's caller) happens separately, only with APPA on.
+ */
+export function stripSessionReceiptsFromRequest(params: {
+  family: AppaWireFamily;
+  body: unknown;
+}): string[] {
+  const codes: string[] = [];
+  for (const site of historyTextSites(params.family, params.body)) {
+    const memory = rewriteGrokMemoryText(
+      site.get(),
+      (text) => stripSessionReceipts(text).text,
+    );
+    if (memory !== undefined) {
+      site.set(memory);
+      continue;
+    }
+    const restored = stripSessionReceipts(site.get());
+    site.set(restored.text);
+    codes.push(...restored.codes);
+  }
+  return [...new Set(codes)];
+}
+
+/** Resolves stripped receipt codes to caller-owned lineage evidence. */
+export async function sessionReceiptEvidence(params: {
+  organizationId: string;
+  callerId: string;
+  codes: string[];
+}): Promise<string[]> {
+  const unique = [...new Set(params.codes)];
+  if (unique.length === 0) return [];
+  const owners = await OpenAppaSessionModel.receiptTokenOwners({
+    organizationId: params.organizationId,
+    tokens: unique,
+  });
+  const sessionIds: string[] = [];
+  for (const code of unique) {
+    const owner = owners.get(code);
+    if (!owner) {
+      logger.debug({ code }, "OpenAPPA ignored an unknown session receipt");
+      continue;
+    }
+    if (owner.callerId !== params.callerId) continue;
+    sessionIds.push(clientSessionId(owner.sessionId));
+  }
+  return sessionIds;
+}
+
+/** Prepends one session receipt to the first non-empty model text part. */
+export function appendSessionReceiptToResponse(params: {
+  family: AppaWireFamily;
+  response: unknown;
+  code: string;
+  layout?: SessionReceiptLayout;
+}): boolean {
+  for (const site of responseTextSites(params.family, params.response)) {
+    if (!site.get()) continue;
+    site.set(appendSessionReceipt(site.get(), params.code, params.layout));
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Removes child-trajectory carriers before forwarding requests.
+ * Returns only proofs from the current conversation context.
+ * Proofs inside child-return notifications are transport metadata,
+ * not lineage evidence for the parent.
+ */
+export function stripChildTrajectoryReceiptsFromRequest(params: {
+  references?: string[];
+  family: AppaWireFamily;
+  body: unknown;
+}): AppaChildTrajectoryReceipt[] {
+  const receipts: AppaChildTrajectoryReceipt[] = [];
+  // A receipt returned by a tool belongs to its callee, never to the caller.
+  for (const site of toolResultTextSites(params.family, params.body)) {
+    site.set(
+      stripChildTrajectoryReceipts(
+        stripChildTrajectoryReferences(site.get(), {
+          preserveLineBoundaries: true,
+          collectReferences: false,
+        }).text,
+        { preserveLineBoundaries: true },
+      ).text,
+    );
+  }
+  for (const site of historyTextSites(params.family, params.body)) {
+    const memory = rewriteGrokMemoryText(
+      site.get(),
+      (text) =>
+        stripChildTrajectoryReceipts(
+          stripChildTrajectoryReferences(text, {
+            preserveLineBoundaries: true,
+            collectReferences: false,
+          }).text,
+          { preserveLineBoundaries: true },
+        ).text,
+    );
+    if (memory !== undefined) {
+      site.set(memory);
+      continue;
+    }
+    // SDK reminders and summaries can wrap notifications in prose. Strip the
+    // nested return's receipts first so only the caller's own context remains.
+    const text = site.get().replace(
+      /<(task-notification|subagent_notification|teammate-message)\b[^>]*>[\s\S]*?<\/\1>/giu,
+      (envelope) =>
+        stripChildTrajectoryReceipts(
+          stripChildTrajectoryReferences(envelope, {
+            preserveLineBoundaries: true,
+            collectReferences: false,
+          }).text,
+          {
+            preserveLineBoundaries: true,
+          },
+        ).text,
+    );
+    const ownText = text.replace(
+      /<system-reminder>\r?\n?(?:Background subagent |While you were idle, \d+ background subagents? completed:)[\s\S]*?<\/system-reminder>/g,
+      (envelope) =>
+        stripChildTrajectoryReceipts(
+          stripChildTrajectoryReferences(envelope, {
+            preserveLineBoundaries: true,
+            collectReferences: false,
+          }).text,
+          { preserveLineBoundaries: true },
+        ).text,
+    );
+    const compact = stripChildTrajectoryReferences(ownText, {
+      preserveLineBoundaries: true,
+    });
+    params.references?.push(...compact.references);
+    const stripped = stripChildTrajectoryReceipts(compact.text, {
+      preserveLineBoundaries: true,
+    });
+    site.set(stripped.text);
+    receipts.push(...stripped.receipts);
+  }
+  return receipts;
+}
+
+/** Memory contents describe earlier actors; none establish this request's lineage. */
+function rewriteGrokMemoryText(
+  text: string,
+  rewrite: (value: string) => string,
+): string | undefined {
+  const history = parseGrokDurableHistory(text);
+  if (!history) return undefined;
+  const body = { messages: history.messages };
+  for (const site of [
+    ...historyTextSites("openai:chatCompletions", body),
+    ...toolResultTextSites("openai:chatCompletions", body),
+  ])
+    site.set(rewrite(site.get()));
+  return history.serialize();
+}
+
+/**
+ * Puts the provider's call id back wherever a client copied a trajectory stamp
+ * into text it carries between turns: message text and tool-result text, never
+ * thinking, reasoning or tool arguments. Returns how many texts changed.
+ */
+export function restoreTrajectoryStampsInText(params: {
+  wire: ProviderWire;
+  body: unknown;
+}): number {
+  // Stamps are minted on the APPA families only (trajectoryStamper).
+  if (
+    params.wire === "bedrock:converse" ||
+    params.wire === "gemini:generateContent"
+  )
+    return 0;
+  let restored = 0;
+  for (const site of [
+    ...historyTextSites(params.wire, params.body),
+    ...toolResultTextSites(params.wire, params.body),
+  ]) {
+    const text = site.get();
+    const next = restoreTrajectoryStampText(text);
+    if (next === text) continue;
+    site.set(next);
+    restored++;
+  }
+  return restored;
+}
+
+/** Prepends one child-trajectory display and proof carrier. */
+export function appendChildTrajectoryReceiptToResponse(params: {
+  family: AppaWireFamily;
+  response: unknown;
+  footer: string;
+}): boolean {
+  for (const site of responseTextSites(params.family, params.response)) {
+    if (!site.get()) continue;
+    site.set(appendChildTrajectoryReceipt(site.get(), params.footer));
+    return true;
+  }
+  for (const site of responseTextSites(params.family, params.response)) {
+    site.set(params.footer);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Removes tools from every declaration container, each by its exact wire name
+ * and namespace: a namespace member only from the namespace it names, and a
+ * tool with no namespace only outside every namespace, Anthropic inline tool
+ * changes included.
+ */
+export function stripAppaTools(params: {
+  body: unknown;
+  tools: readonly DeclaredToolSpelling[];
+}): void {
+  if (params.tools.length === 0) return;
+  const isStripped = (tool: unknown, namespace: string | undefined) => {
+    const name = declaredToolName(tool);
+    return params.tools.some(
+      (spelling) => spelling.name === name && spelling.namespace === namespace,
+    );
+  };
+  // Search outputs the strip leaves with nothing in them: the provider refuses
+  // an empty one, so each leaves the history together with its call.
+  const emptiedSearches = new Set<Record<string, unknown>>();
+  for (const { holder, key } of toolContainers(params.body)) {
+    // Gemini accepts a lone tool object where it accepts a list of them; the
+    // filter below needs the list.
+    if (asRecord(holder[key])) holder[key] = [holder[key]];
+    const declared = holder[key];
+    if (!Array.isArray(declared)) continue;
+    const remaining = declared.filter((tool) => {
+      const group = groupedMembers(tool);
+      if (group) {
+        // A group keeps its other tools; only the named one leaves. A group
+        // the strip empties leaves with it: the provider refuses one.
+        const namespace = groupNamespace(tool);
+        const kept = group.members.filter(
+          (member) => !isStripped(member, namespace),
+        );
+        group.holder[group.key] = kept;
+        return kept.length > 0 || group.members.length === 0;
+      }
+      return !isStripped(tool, undefined);
+    });
+    holder[key] = remaining;
+    if (
+      holder.type === "tool_search_output" &&
+      declared.length > 0 &&
+      remaining.length === 0
+    )
+      emptiedSearches.add(holder);
+  }
+  const record = asRecord(params.body);
+  if (emptiedSearches.size > 0 && record && Array.isArray(record.input)) {
+    const callIds = new Set(
+      [...emptiedSearches].flatMap((search) =>
+        typeof search.call_id === "string" ? [search.call_id] : [],
+      ),
+    );
+    record.input = record.input.filter((item) => {
+      const entry = asRecord(item);
+      if (!entry) return true;
+      if (emptiedSearches.has(entry)) return false;
+      return !(
+        entry.type === "tool_search_call" &&
+        typeof entry.call_id === "string" &&
+        callIds.has(entry.call_id)
+      );
+    });
+  }
+  // A change that names a tool no longer declared is rejected by the provider.
+  stripInlineToolChanges(params.body, (change) =>
+    isStripped({ name: change.name }, undefined),
+  );
+}
+
+/**
+ * Loads declarations up front: drops `defer_loading` from each, by its exact
+ * wire name and namespace, in the request's own tool containers. Copies a
+ * tool search output carries in history stay as they came. A client that
+ * defers its MCP tools behind the provider's own tool search (Copilot CLI)
+ * otherwise reaches them only through that search, which can come back
+ * empty for exactly these tools. A namespace may mix loaded and deferred
+ * members, so the rest of it stays deferred.
+ */
+export function loadDeclarationsUpFront(params: {
+  body: unknown;
+  tools: readonly DeclaredToolSpelling[];
+}): void {
+  if (params.tools.length === 0) return;
+  const record = asRecord(params.body);
+  if (!record) return;
+  const named = (tool: unknown, namespace: string | undefined) => {
+    const name = declaredToolName(tool);
+    return params.tools.some(
+      (spelling) => spelling.name === name && spelling.namespace === namespace,
+    );
+  };
+  const load = (tool: unknown, namespace: string | undefined) => {
+    const declaration = asRecord(tool);
+    if (declaration?.defer_loading === true && named(tool, namespace))
+      delete declaration.defer_loading;
+  };
+  const containers: unknown[] = TOOL_CONTAINERS.map((key) => record[key]);
+  const toolConfig = asRecord(record.toolConfig);
+  if (toolConfig) containers.push(toolConfig.tools);
+  for (const container of containers) {
+    for (const tool of containerTools(container)) {
+      const group = groupedMembers(tool);
+      if (!group) {
+        load(tool, undefined);
+        continue;
+      }
+      const namespace = groupNamespace(tool);
+      for (const member of group.members) load(member, namespace);
+    }
+  }
+}
+
+/**
+ * Tool name → the namespace this request declares it in, for the tools Codex
+ * declares inside a `namespace` block. The provider expects a call to such a
+ * tool to name its namespace, so a notice records it for restoration.
+ */
+export function declaredToolNamespaces(body: unknown): Map<string, string> {
+  const namespaces = new Map<string, string>();
+  for (const { holder, key } of toolContainers(body)) {
+    if (!Array.isArray(holder[key])) continue;
+    for (const tool of holder[key] as unknown[]) {
+      const group = groupedMembers(tool);
+      const namespace = asRecord(tool)?.name;
+      if (!group || typeof namespace !== "string") continue;
+      for (const member of group.members) {
+        const name = declaredToolName(member);
+        if (name !== undefined && !namespaces.has(name))
+          namespaces.set(name, namespace);
+      }
+    }
+  }
+  return namespaces;
+}
+
+/**
+ * Takes the `tool_reference` blocks that name a removed declaration out of
+ * Anthropic tool results and provider-run search results. The provider
+ * requires every reference to have a definition in `tools` and rejects the
+ * request otherwise ("Tool reference ... not found in available tools"), and
+ * the reference would stay in history for every later request. A client tool
+ * result left with nothing in it says so in text.
+ */
+export function stripToolReferences(params: {
+  body: unknown;
+  tools: readonly DeclaredToolSpelling[];
+}): void {
+  if (params.tools.length === 0) return;
+  const names = new Set(params.tools.map((tool) => tool.name));
+  const messages = asRecord(params.body)?.messages;
+  if (!Array.isArray(messages)) return;
+  const isRemoved = (part: unknown) => {
+    const reference = asRecord(part);
+    return (
+      reference?.type === "tool_reference" &&
+      typeof reference.tool_name === "string" &&
+      names.has(reference.tool_name)
+    );
+  };
+  for (const message of messages) {
+    const content = asRecord(message)?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      const record = asRecord(block);
+      if (record?.type === "tool_result" && Array.isArray(record.content)) {
+        const kept = record.content.filter((part) => !isRemoved(part));
+        if (kept.length === record.content.length) continue;
+        record.content =
+          kept.length > 0
+            ? kept
+            : [{ type: "text", text: "[appa] No tools were loaded." }];
+      }
+      // The provider-run search keeps its references in an object, and an
+      // empty list is a valid search result.
+      const search = asRecord(record?.content);
+      if (
+        record?.type === "tool_search_tool_result" &&
+        Array.isArray(search?.tool_references)
+      ) {
+        search.tool_references = search.tool_references.filter(
+          (part) => !isRemoved(part),
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Where a request declares its tools: the top-level containers of the
+ * Anthropic and OpenAI families, Bedrock Converse's `toolConfig.tools`, and
+ * two kinds of Responses input item: `additional_tools`, where Codex declares
+ * the tools of the models it drives over the lite Responses wire, and
+ * `tool_search_output`, where a client-run tool search hands the model the
+ * tools it loaded. On a model with tool search, Codex declares only the
+ * search and no MCP tool inline, so the tools the model calls are declared
+ * there and nowhere else.
+ */
+function toolContainers(
+  body: unknown,
+): Array<{ holder: Record<string, unknown>; key: string }> {
+  const record = asRecord(body);
+  if (!record) return [];
+  const containers = TOOL_CONTAINERS.map((key) => ({ holder: record, key }));
+  const toolConfig = asRecord(record.toolConfig);
+  if (toolConfig) containers.push({ holder: toolConfig, key: "tools" });
+  if (Array.isArray(record.input))
+    for (const item of record.input) {
+      const entry = asRecord(item);
+      if (
+        entry?.type === "additional_tools" ||
+        entry?.type === "tool_search_output"
+      )
+        containers.push({ holder: entry, key: "tools" });
+    }
+  return containers;
+}
+
+/**
+ * The tools a container holds, read without changing its shape: Gemini
+ * accepts a lone tool object where it accepts a list of them.
+ */
+function containerTools(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value;
+  return asRecord(value) ? [value] : [];
+}
+
+/**
+ * A declaration that groups tools: a Codex namespace, whose members the
+ * model calls by their own names, or Gemini's `functionDeclarations` entry.
+ */
+function groupedMembers(
+  tool: unknown,
+):
+  | { holder: Record<string, unknown>; key: string; members: unknown[] }
+  | undefined {
+  const record = asRecord(tool);
+  if (!record) return undefined;
+  const members = namespaceMembers(tool);
+  if (members) return { holder: record, key: "tools", members };
+  if (Array.isArray(record.functionDeclarations))
+    return {
+      holder: record,
+      key: "functionDeclarations",
+      members: record.functionDeclarations,
+    };
+  return undefined;
+}
+
+/**
+ * Tools the provider runs on the model's behalf, which never reach this proxy
+ * as a client tool call it can gate. Responses web search is governed on its
+ * result; other hosted tools run outside OpenAPPA's tool-call boundary.
+ */
+export function providerHostedTool(tool: unknown): string | undefined {
+  const record = asRecord(tool);
+  const type = record?.type;
+  if (typeof type !== "string") return undefined;
+  return HOSTED_TOOL_TYPES.has(type) || HOSTED_TOOL_TYPE_PATTERN.test(type)
+    ? type
+    : undefined;
+}
+
+export function isClientRunToolType(type: string): boolean {
+  return (
+    CLIENT_RUN_TOOL_TYPES.has(type) || CLIENT_RUN_TOOL_TYPE_PATTERN.test(type)
+  );
+}
+
+/**
+ * The client session this request belongs to, as the client itself reports it
+ * through generic wire fields.
+ *
+ * A session id cannot come from static client configuration: it changes every
+ * time a person starts a new session, and no external client has logic to mint
+ * one for us. Client-specific signals - Claude Code's session header, Codex's
+ * turn metadata, OpenCode's session headers - are extracted by the client
+ * adapters (`appa-plugin-archestra/adapters`), which run before these generic
+ * fallbacks. An explicit `X-Appa-Session-ID` still wins where it is sent
+ * (Chat, the qualification harness, any caller that manages roots
+ * deliberately).
+ *
+ * What each family offers generically, and why:
+ *  - anthropic:messages - Claude clients repeat the session uuid inside
+ *    `metadata.user_id` (a JSON blob of device/account/session), which is
+ *    per-session and survives a restart of the same session.
+ *  - openai:responses / chatCompletions - the legacy OpenCode
+ *    `x-opencode-session` header, then request fields that are stable across a
+ *    conversation: `prompt_cache_key` (OpenAI's own per-conversation cache
+ *    partition), an explicit `metadata.session_id`, then `conversation`.
+ *  - any other wire - the headers above only. Its body is not read.
+ */
+export function appaSessionIdentity(params: {
+  /** Undefined for a wire OpenAPPA does not read: headers only. */
+  family: AppaWireFamily | undefined;
+  body: unknown;
+  headers: Record<string, unknown>;
+}): AppaSessionIdentity {
+  const header = (name: string): string | undefined => {
+    const value = params.headers[name];
+    return typeof value === "string" && value.length > 0 ? value : undefined;
+  };
+  const explicit = header(APPA_SESSION_HEADER.toLowerCase());
+  const parentId = header(APPA_PARENT_HEADER.toLowerCase());
+  if (explicit)
+    return {
+      sessionId: explicit,
+      parentId,
+      provenance: "appa-header",
+    };
+
+  const body = asRecord(params.body);
+  const field = (value: unknown): string | undefined =>
+    typeof value === "string" && value.length > 0 ? value : undefined;
+
+  if (params.family === "anthropic:messages") {
+    const userId = field(asRecord(body?.metadata)?.user_id);
+    const metadataSession = userId
+      ? (parseClaudeMetadataSessionId(userId) ?? userId)
+      : undefined;
+    if (metadataSession) {
+      // Claude session ID from user_id metadata.
+      return {
+        sessionId: metadataSession,
+        parentId,
+        provenance: "claude-metadata",
+      };
+    }
+    return { parentId, provenance: "none" };
+  }
+
+  const openCodeSession = header("x-opencode-session");
+  if (openCodeSession) {
+    return {
+      sessionId: openCodeSession,
+      parentId,
+      provenance: "opencode-session",
+    };
+  }
+
+  // The body of another wire names nothing this reads.
+  if (!params.family) return { parentId, provenance: "none" };
+
+  const cacheKey = field(body?.prompt_cache_key);
+  const declared = field(asRecord(body?.metadata)?.session_id);
+  const conversation = field(body?.conversation);
+  if (cacheKey)
+    return {
+      sessionId: cacheKey,
+      parentId,
+      provenance: "prompt-cache-key",
+    };
+  if (declared)
+    return {
+      sessionId: declared,
+      parentId,
+      provenance: "metadata-session-id",
+    };
+  return conversation
+    ? {
+        sessionId: conversation,
+        parentId,
+        provenance: "conversation",
+      }
+    : { parentId, provenance: "none" };
+}
+
+/**
+ * Computes turn boundary IDs for this request.
+ * User messages start a turn; tool results continue the active turn.
+ */
+export function appaTurnBoundaries(params: {
+  family: AppaWireFamily;
+  body: unknown;
+}): { promptOperationId?: string; turnEndOperationId: string } {
+  // A fingerprint of the history, not a hash of any secret: it only makes a
+  // retried request report the same turn.
+  const digest = digestOf(canonicalJson(params.body ?? null));
+  return {
+    ...(endsWithUserTurn(params)
+      ? { promptOperationId: `prompt:${digest}` }
+      : {}),
+    turnEndOperationId: `turn_end:${digest}`,
+  };
+}
+
+/**
+ * The calls a Responses request answers in its last round: the function call
+ * outputs after its last message. The model's reply to the request answers
+ * them.
+ */
+export function latestResponsesToolRound(body: unknown): Set<string> {
+  const input = (body as { input?: unknown } | null)?.input;
+  const ids = new Set<string>();
+  if (!Array.isArray(input)) return ids;
+  for (let index = input.length - 1; index >= 0; index--) {
+    const item = input[index] as {
+      type?: unknown;
+      role?: unknown;
+      call_id?: unknown;
+    } | null;
+    if (
+      item?.type === "function_call_output" &&
+      typeof item.call_id === "string"
+    ) {
+      ids.add(item.call_id);
+      continue;
+    }
+    if (item?.type === "message" || typeof item?.role === "string") break;
+  }
+  return ids;
+}
+
+/** A declared tool as the client spells it: its name, and the Codex namespace it sits in. */
+export type DeclaredToolSpelling = { name: string; namespace?: string };
+
+/**
+ * Every tool this request declares, in every container and group, in order.
+ *
+ * Reads `tools`, `additional_tools`, Bedrock Converse's `toolConfig.tools`,
+ * the Responses `additional_tools` and `tool_search_output` input items, and
+ * the Anthropic inline declarations still in force.
+ * A Codex namespace and a Gemini `functionDeclarations` entry stand for their
+ * members, never for themselves: Codex calls a namespace member by its own
+ * name, in the namespace it was declared in, which each member entry carries.
+ * Reading changes nothing, so a lone Gemini tool object stays an object.
+ */
+export function declaredToolEntries(body: unknown): DeclaredToolEntry[] {
+  const entries: DeclaredToolEntry[] = [];
+  for (const { holder, key } of toolContainers(body)) {
+    for (const tool of containerTools(holder[key])) {
+      const group = groupedMembers(tool);
+      if (!group) {
+        entries.push(declaredToolEntry(tool));
+        continue;
+      }
+      const namespace = groupNamespace(tool);
+      for (const member of group.members) {
+        entries.push(declaredToolEntry(member, namespace, true));
+      }
+    }
+  }
+  for (const definition of inlineToolDefinitions(body).values())
+    entries.push(declaredToolEntry(definition));
+  return entries;
+}
+
+/**
+ * A tool change an Anthropic request makes inside its messages. Claude Code
+ * declares a tool it loads mid-conversation in a system message, as a
+ * `tool_addition` block that carries the definition; an addition or a
+ * `tool_removal` that names a tool by `tool_reference` loads or unloads one
+ * declared in `tools`.
+ */
+type InlineToolChange = {
+  block: Record<string, unknown>;
+  name: string;
+  /** Present only on an addition that carries its own declaration. */
+  definition?: Record<string, unknown>;
+  removal: boolean;
+};
+
+function inlineToolChanges(body: unknown): InlineToolChange[] {
+  const messages = asRecord(body)?.messages;
+  if (!Array.isArray(messages)) return [];
+  const changes: InlineToolChange[] = [];
+  for (const message of messages) {
+    const content = asRecord(message)?.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      const block = asRecord(part);
+      if (block?.type !== "tool_addition" && block?.type !== "tool_removal")
+        continue;
+      const tool = asRecord(block.tool);
+      const definition =
+        tool?.type === "tool_definition"
+          ? asRecord(tool.definition)
+          : undefined;
+      const name = definition ? definition.name : tool?.name;
+      if (typeof name !== "string") continue;
+      changes.push({
+        block,
+        name,
+        ...(definition && block.type === "tool_addition" ? { definition } : {}),
+        removal: block.type === "tool_removal",
+      });
+    }
+  }
+  return changes;
+}
+
+/**
+ * The inline declarations still in force, by name, in message order: a later
+ * removal takes back an earlier addition, and a later addition replaces it.
+ * Declarations in `tools` stay declared; a removal only unloads them.
+ */
+function inlineToolDefinitions(
+  body: unknown,
+): Map<string, Record<string, unknown>> {
+  const active = new Map<string, Record<string, unknown>>();
+  for (const change of inlineToolChanges(body)) {
+    if (change.removal) active.delete(change.name);
+    else if (change.definition) active.set(change.name, change.definition);
+  }
+  return active;
+}
+
+/**
+ * Takes the inline tool changes `drop` selects out of their messages, and a
+ * message left with no content with them: the provider rejects an empty one.
+ */
+function stripInlineToolChanges(
+  body: unknown,
+  drop: (change: InlineToolChange) => boolean,
+): void {
+  const record = asRecord(body);
+  if (!record || !Array.isArray(record.messages)) return;
+  const dropped = new Set<unknown>(
+    inlineToolChanges(body)
+      .filter(drop)
+      .map((change) => change.block),
+  );
+  if (dropped.size === 0) return;
+  record.messages = record.messages.flatMap((entry) => {
+    const message = asRecord(entry);
+    if (!message || !Array.isArray(message.content)) return [entry];
+    const kept = message.content.filter((block) => !dropped.has(block));
+    if (kept.length === message.content.length) return [entry];
+    if (kept.length === 0) return [];
+    message.content = kept;
+    return [entry];
+  });
+}
+
+// === Internal helpers ===
+
+/**
+ * The transport's wire family, not a provider-name suffix. Keep this explicit:
+ * a future provider with a similarly named interaction type must opt in after
+ * its request and history shapes are audited.
+ */
+const APPA_WIRE_FAMILY_BY_INTERACTION_TYPE: Partial<
+  Record<SupportedProviderDiscriminator, AppaWireFamily>
+> = {
+  "anthropic:messages": "anthropic:messages",
+  "bedrock:invoke": "anthropic:messages",
+  "openai:responses": "openai:responses",
+  "github-copilot:responses": "openai:responses",
+  "perplexity:responses": "openai:responses",
+  "openai:chatCompletions": "openai:chatCompletions",
+  "azure:chatCompletions": "openai:chatCompletions",
+  "archestra:chatCompletions": "openai:chatCompletions",
+  "cerebras:chatCompletions": "openai:chatCompletions",
+  "deepseek:chatCompletions": "openai:chatCompletions",
+  "github-copilot:chatCompletions": "openai:chatCompletions",
+  "groq:chatCompletions": "openai:chatCompletions",
+  "kimi:chatCompletions": "openai:chatCompletions",
+  "kimi-code:chatCompletions": "openai:chatCompletions",
+  "microsoft-365-copilot:chatCompletions": "openai:chatCompletions",
+  "minimax:chatCompletions": "openai:chatCompletions",
+  "mistral:chatCompletions": "openai:chatCompletions",
+  "ollama:chatCompletions": "openai:chatCompletions",
+  "openrouter:chatCompletions": "openai:chatCompletions",
+  "perplexity:chatCompletions": "openai:chatCompletions",
+  "vllm:chatCompletions": "openai:chatCompletions",
+  "xai:chatCompletions": "openai:chatCompletions",
+  "xai:responses": "openai:responses",
+  "zhipuai:chatCompletions": "openai:chatCompletions",
+};
+
+/**
+ * Where the other chat wires carry a call's id, for putting the provider's
+ * back: in an APPA family's shape (Cohere and native Ollama name calls the
+ * way Chat Completions does; Azure Responses is the Responses wire), or in
+ * their own.
+ */
+const OTHER_STAMP_WIRES: Partial<
+  Record<SupportedProviderDiscriminator, ProviderWire>
+> = {
+  "azure:responses": "openai:responses",
+  "bedrock:converse": "bedrock:converse",
+  "cohere:chat": "openai:chatCompletions",
+  "gemini:generateContent": "gemini:generateContent",
+  "ollama-native:chat": "openai:chatCompletions",
+};
+
+/** Where the three families declare tools; Responses adds `additional_tools`. */
+const TOOL_CONTAINERS = ["tools", "additional_tools"] as const;
+
+const CLIENT_RUN_TOOL_TYPES = new Set([
+  "function",
+  "custom",
+  "namespace",
+  "tool_search",
+  "local_shell",
+  "computer_use_preview",
+  "computer_use",
+]);
+const CLIENT_RUN_TOOL_TYPE_PATTERN =
+  /^(?:bash|computer|memory|text_editor)_\d{8}$/;
+const HOSTED_TOOL_TYPES = new Set([
+  "mcp",
+  "mcp_toolset",
+  "web_search",
+  "web_search_preview",
+  "file_search",
+  "code_interpreter",
+  "image_generation",
+]);
+const HOSTED_TOOL_TYPE_PATTERN =
+  /^(?:advisor|web_search|web_fetch|code_execution)_\d{8}$|^tool_search_tool_(?:regex|bm25)_\d{8}$/;
+
+/** Adjusts tool call IDs to match expected provider prefixes (fc_, ctc_). */
+function itemIdOfKind(id: string, type: keyof typeof ITEM_ID_PREFIXES): string {
+  const prefix = ITEM_ID_PREFIXES[type];
+  for (const other of Object.values(ITEM_ID_PREFIXES)) {
+    if (other !== prefix && id.startsWith(other))
+      return `${prefix}${id.slice(other.length)}`;
+  }
+  return id;
+}
+
+const ITEM_ID_PREFIXES = {
+  function_call: "fc_",
+  custom_tool_call: "ctc_",
+  function_call_output: "fco_",
+  custom_tool_call_output: "ctco_",
+} as const;
+
+function declaredInputSchema(
+  tool: unknown,
+): Record<string, unknown> | undefined {
+  const record = asRecord(tool);
+  if (!record) return undefined;
+  return (
+    asRecord(record.input_schema) ??
+    asRecord(record.parameters) ??
+    asRecord(record.parametersJsonSchema) ??
+    asRecord(asRecord(record.function)?.parameters) ??
+    asRecord(asRecord(asRecord(record.toolSpec)?.inputSchema)?.json)
+  );
+}
+
+type DeclaredToolEntry = {
+  /** The declaration: a Codex namespace member or a Gemini `functionDeclarations` member when grouped. */
+  tool: unknown;
+  /**
+   * The object that carries the tool's `name` and `description`: the tool
+   * itself, or its `function`, `custom` or `toolSpec`. Absent when nameless.
+   */
+  holder?: Record<string, unknown>;
+  /** {@link declaredToolName} of the declaration. */
+  name?: string;
+  /** `name` of the enclosing Codex `namespace` declaration. Never set for Gemini groups. */
+  namespace?: string;
+  /** Whether this is a member of a client-callable tool group. */
+  grouped?: boolean;
+};
+
+function declaredToolEntry(
+  tool: unknown,
+  namespace?: string,
+  grouped = false,
+): DeclaredToolEntry {
+  const holder = declarationHolder(tool);
+  const name = declaredToolName(tool);
+  return {
+    tool,
+    ...(grouped ? { grouped } : {}),
+    ...(holder ? { holder } : {}),
+    ...(name !== undefined ? { name } : {}),
+    ...(namespace !== undefined ? { namespace } : {}),
+  };
+}
+
+/**
+ * The wire name of a declared tool: Anthropic, Responses and Gemini name the
+ * tool itself; Chat Completions nests it under `function`, or under `custom`
+ * for a free-form tool; Bedrock Converse under `toolSpec`.
+ */
+function declaredToolName(tool: unknown): string | undefined {
+  const name = declarationHolder(tool)?.name;
+  return typeof name === "string" ? name : undefined;
+}
+
+/** The object a declaration keeps its name and description on, per {@link declaredToolName}. */
+function declarationHolder(tool: unknown): Record<string, unknown> | undefined {
+  const record = asRecord(tool);
+  if (!record) return undefined;
+  if (typeof record.name === "string") return record;
+  for (const nested of [record.function, record.custom, record.toolSpec]) {
+    const inner = asRecord(nested);
+    if (typeof inner?.name === "string") return inner;
+  }
+  return undefined;
+}
+
+/**
+ * The namespace a group's members are declared, and called, in: a Codex
+ * namespace's own name. A Gemini `functionDeclarations` entry has none, and
+ * an empty name is none, as it is on a call.
+ */
+function groupNamespace(tool: unknown): string | undefined {
+  if (!namespaceMembers(tool)) return undefined;
+  const name = asRecord(tool)?.name;
+  return typeof name === "string" && name !== "" ? name : undefined;
+}
+
+/** Extracts member tools declared inside a Codex namespace declaration. */
+function namespaceMembers(tool: unknown): unknown[] | undefined {
+  const record = asRecord(tool);
+  return record?.type === "namespace" && Array.isArray(record.tools)
+    ? record.tools
+    : undefined;
+}
+
+/** Returns true if the final item in history is a user message rather than a tool result. */
+function endsWithUserTurn(params: {
+  family: AppaWireFamily;
+  body: unknown;
+}): boolean {
+  const history = historyEntries(params);
+  if (!history) {
+    return (
+      params.family === "openai:responses" &&
+      typeof asRecord(params.body)?.input === "string"
+    );
+  }
+  return isUserAuthored(params.family, history.at(-1));
+}
+
+function historyKey(family: AppaWireFamily): "input" | "messages" {
+  return family === "openai:responses" ? "input" : "messages";
+}
+
+function historyEntries(params: {
+  family: AppaWireFamily;
+  body: unknown;
+}): unknown[] | undefined {
+  return asArray(asRecord(params.body)?.[historyKey(params.family)]);
+}
+
+/** A user message is a tool-result turn only when every content block is a result. */
+function isUserAuthored(family: AppaWireFamily, entry: unknown): boolean {
+  const record = asRecord(entry);
+  if (!record || record.role !== "user") return false;
+  if (family === "openai:responses")
+    return (
+      record.type !== "function_call_output" &&
+      record.type !== "custom_tool_call_output"
+    );
+  if (family === "openai:chatCompletions") return true;
+  const content = asArray(record.content);
+  return (
+    content === undefined ||
+    content.length === 0 ||
+    content.some((block) => asRecord(block)?.type !== "tool_result")
+  );
+}
+
+/** The tool names every APPA wire's provider accepts in a request. */
+const PROVIDER_TOOL_NAME = /^[A-Za-z0-9_-]+$/;
+
+type ToolCallSite = {
+  id: string;
+  name: string;
+  /** The namespace the call names (Codex Responses). */
+  namespace?: string;
+  kind: "function" | "custom";
+  arguments: unknown;
+  restore: (
+    tool: string,
+    original: NoticeOriginalCall,
+    namespace?: string,
+  ) => boolean;
+  restoreFunctionArguments: (original: NoticeFunctionCall) => void;
+};
+
+type NoticeFunctionCall = Extract<NoticeOriginalCall, { kind: "function" }>;
+
+function toolCallSites(params: {
+  family: HistoryWire;
+  body: unknown;
+  match: (name: string, namespace?: string) => boolean;
+}): ToolCallSite[] {
+  const found: ToolCallSite[] = [];
+  // Claimed by name and namespace alone. The client echoes the name the proxy
+  // sent, and a tool of its own that happens to take a `ruling` argument must
+  // never be read as a notice — nor rejected as a malformed one.
+  const claim = (name: unknown, namespace?: string): boolean =>
+    typeof name === "string" && params.match(name, namespace);
+
+  if (params.family === "anthropic:messages") {
+    for (const block of anthropicBlocks(params.body)) {
+      if (block.type !== "tool_use") continue;
+      if (!claim(block.name) || typeof block.id !== "string") continue;
+      found.push({
+        id: block.id,
+        name: block.name as string,
+        kind: "function",
+        arguments: block.input,
+        restore: (tool, original) => {
+          if (original.kind !== "function") return false;
+          block.name = tool;
+          block.input = original.arguments;
+          return true;
+        },
+        restoreFunctionArguments: (original) => {
+          block.input = original.arguments;
+        },
+      });
+    }
+    return found;
+  }
+
+  if (params.family === "openai:responses") {
+    for (const item of responsesItems(params.body)) {
+      if (item.type !== "function_call" && item.type !== "custom_tool_call")
+        continue;
+      const id = item.call_id;
+      const namespace =
+        typeof item.namespace === "string" && item.namespace !== ""
+          ? item.namespace
+          : undefined;
+      if (!claim(item.name, namespace) || typeof id !== "string") continue;
+      found.push({
+        id,
+        name: item.name as string,
+        ...(namespace ? { namespace } : {}),
+        kind: item.type === "function_call" ? "function" : "custom",
+        arguments: item.arguments ?? item.input,
+        restore: (tool, original, namespace) => {
+          item.name = tool;
+          // The client echoes the notice call under the notice tool's
+          // namespace, or none; the denied call is put back under its own.
+          if (namespace) item.namespace = namespace;
+          else delete item.namespace;
+          // The item id follows the call's kind too, should a client have
+          // minted one for the notice call by its own kind.
+          const type =
+            original.kind === "custom" ? "custom_tool_call" : "function_call";
+          if (item.type !== type && typeof item.id === "string")
+            item.id = itemIdOfKind(item.id, type);
+          item.type = type;
+          if (original.kind === "custom") {
+            // Its one argument is the free-form text the model wrote.
+            item.input = original.input;
+            delete item.arguments;
+            return true;
+          }
+          item.arguments =
+            original.rawArguments ?? JSON.stringify(original.arguments);
+          delete item.input;
+          return true;
+        },
+        restoreFunctionArguments: (original) => {
+          item.arguments =
+            original.rawArguments ?? JSON.stringify(original.arguments);
+          delete item.input;
+        },
+      });
+    }
+    return found;
+  }
+
+  if (params.family === "bedrock:converse") {
+    for (const message of chatMessages(params.body)) {
+      for (const block of asArray(message.content) ?? []) {
+        const toolUse = asRecord(asRecord(block)?.toolUse);
+        if (!toolUse || typeof toolUse.toolUseId !== "string") continue;
+        if (!claim(toolUse.name)) continue;
+        found.push({
+          id: toolUse.toolUseId,
+          name: toolUse.name as string,
+          kind: "function",
+          arguments: toolUse.input,
+          restore: (tool, original) => {
+            if (original.kind !== "function") return false;
+            toolUse.name = tool;
+            toolUse.input = original.arguments;
+            return true;
+          },
+          restoreFunctionArguments: (original) => {
+            toolUse.input = original.arguments;
+          },
+        });
+      }
+    }
+    return found;
+  }
+
+  for (const message of chatMessages(params.body)) {
+    if (!Array.isArray(message.tool_calls)) continue;
+    for (const entry of message.tool_calls) {
+      const call = asRecord(entry);
+      const fn = asRecord(call?.function);
+      if (!call || !fn || typeof call.id !== "string") continue;
+      if (!claim(fn.name)) continue;
+      found.push({
+        id: call.id,
+        name: fn.name as string,
+        kind: "function",
+        arguments: fn.arguments,
+        restore: (tool, original) => {
+          if (original.kind !== "function") return false;
+          fn.name = tool;
+          fn.arguments =
+            original.rawArguments ?? JSON.stringify(original.arguments);
+          return true;
+        },
+        restoreFunctionArguments: (original) => {
+          fn.arguments =
+            original.rawArguments ?? JSON.stringify(original.arguments);
+        },
+      });
+    }
+  }
+  return found;
+}
+
+/**
+ * Replaces the notice call's result with the ruling.
+ *
+ * A client that recorded no result for the notice — an interrupted turn, a
+ * cleared result — still gets the denial: the provider is owed one result per
+ * call, and it must be the ruling rather than whatever the client wrote.
+ */
+function restoreResult(params: {
+  family: HistoryWire;
+  body: unknown;
+  callId: string;
+  result: string;
+  custom?: boolean;
+}): void {
+  if (params.family === "anthropic:messages") {
+    for (const block of anthropicBlocks(params.body)) {
+      if (block.type === "tool_result" && block.tool_use_id === params.callId) {
+        block.content = params.result;
+        block.is_error = true;
+        return;
+      }
+    }
+    insertAnthropicResult(params);
+    return;
+  }
+
+  if (params.family === "openai:responses") {
+    for (const item of responsesItems(params.body)) {
+      if (
+        (item.type === "function_call_output" ||
+          item.type === "custom_tool_call_output") &&
+        item.call_id === params.callId
+      ) {
+        // The output's kind follows the call's: a custom tool call restored
+        // from a notice is answered by a custom tool call output, under an
+        // item id of that kind, which the provider checks.
+        const type = params.custom
+          ? "custom_tool_call_output"
+          : "function_call_output";
+        if (item.type !== type && typeof item.id === "string")
+          item.id = itemIdOfKind(item.id, type);
+        item.type = type;
+        item.output = params.result;
+        return;
+      }
+    }
+    insertResponsesResult(params);
+    return;
+  }
+
+  if (params.family === "bedrock:converse") {
+    for (const message of chatMessages(params.body)) {
+      for (const block of asArray(message.content) ?? []) {
+        const toolResult = asRecord(asRecord(block)?.toolResult);
+        if (toolResult?.toolUseId !== params.callId) continue;
+        toolResult.content = [{ text: params.result }];
+        toolResult.status = "error";
+        return;
+      }
+    }
+    insertConverseResult(params);
+    return;
+  }
+
+  for (const message of chatMessages(params.body)) {
+    if (message.role === "tool" && message.tool_call_id === params.callId) {
+      message.content = params.result;
+      return;
+    }
+  }
+  insertChatResult(params);
+}
+
+function insertAnthropicResult(params: {
+  body: unknown;
+  callId: string;
+  result: string;
+}): void {
+  const messages = asArray(asRecord(params.body)?.messages);
+  if (!messages) return;
+  const alreadyHasResult = messages.some((message) =>
+    asArray(asRecord(message)?.content)?.some((block) => {
+      const record = asRecord(block);
+      return (
+        record?.type === "tool_result" && record.tool_use_id === params.callId
+      );
+    }),
+  );
+  if (alreadyHasResult) return;
+
+  const index = messages.findIndex((message) =>
+    asArray(asRecord(message)?.content)?.some((block) => {
+      const record = asRecord(block);
+      return record?.type === "tool_use" && record.id === params.callId;
+    }),
+  );
+  if (index < 0) return;
+  // When a turn is interrupted, append the ruling so every tool call has a result.
+  const result = {
+    type: "tool_result",
+    tool_use_id: params.callId,
+    content: params.result,
+    is_error: true,
+  };
+
+  // If a subsequent user message exists, prepend the tool_result into it
+  // to satisfy Anthropic's alternating role constraint.
+  const next = asRecord(messages[index + 1]);
+  if (next?.role === "user") {
+    const content = asArray(next.content);
+    if (content) {
+      content.unshift(result);
+      return;
+    }
+    if (typeof next.content === "string") {
+      next.content = [result, { type: "text", text: next.content }];
+      return;
+    }
+  }
+
+  messages.splice(index + 1, 0, { role: "user", content: [result] });
+}
+
+function insertResponsesResult(params: {
+  body: unknown;
+  callId: string;
+  result: string;
+}): void {
+  const body = asRecord(params.body);
+  const input = asArray(body?.input);
+  if (!input) return;
+  const alreadyHasResult = input.some((item) => {
+    const record = asRecord(item);
+    return (
+      (record?.type === "function_call_output" ||
+        record?.type === "custom_tool_call_output") &&
+      record.call_id === params.callId
+    );
+  });
+  if (alreadyHasResult) return;
+
+  const index = input.findIndex((item) => {
+    const record = asRecord(item);
+    return (
+      (record?.type === "function_call" ||
+        record?.type === "custom_tool_call") &&
+      record.call_id === params.callId
+    );
+  });
+  if (index < 0) return;
+  const custom = asRecord(input[index])?.type === "custom_tool_call";
+  input.splice(index + 1, 0, {
+    type: custom ? "custom_tool_call_output" : "function_call_output",
+    call_id: params.callId,
+    output: params.result,
+  });
+}
+
+function insertConverseResult(params: {
+  body: unknown;
+  callId: string;
+  result: string;
+}): void {
+  const messages = asArray(asRecord(params.body)?.messages);
+  if (!messages) return;
+  const index = messages.findIndex((message) =>
+    asArray(asRecord(message)?.content)?.some(
+      (block) =>
+        asRecord(asRecord(block)?.toolUse)?.toolUseId === params.callId,
+    ),
+  );
+  if (index < 0) return;
+  // When a turn is interrupted, append the ruling so every tool call has a
+  // result, first in the next user message as Converse requires.
+  const result = {
+    toolResult: {
+      toolUseId: params.callId,
+      content: [{ text: params.result }],
+      status: "error",
+    },
+  };
+  const next = asRecord(messages[index + 1]);
+  const content = asArray(next?.content);
+  if (next?.role === "user" && content) {
+    content.unshift(result);
+    return;
+  }
+  messages.splice(index + 1, 0, { role: "user", content: [result] });
+}
+
+function insertChatResult(params: {
+  body: unknown;
+  callId: string;
+  result: string;
+}): void {
+  const messages = asArray(asRecord(params.body)?.messages);
+  if (!messages) return;
+  const alreadyHasResult = messages.some((message) => {
+    const record = asRecord(message);
+    return record?.role === "tool" && record.tool_call_id === params.callId;
+  });
+  if (alreadyHasResult) return;
+
+  const index = messages.findIndex((message) =>
+    asArray(asRecord(message)?.tool_calls)?.some(
+      (call) => asRecord(call)?.id === params.callId,
+    ),
+  );
+  if (index < 0) return;
+  messages.splice(index + 1, 0, {
+    role: "tool",
+    tool_call_id: params.callId,
+    content: params.result,
+  });
+}
+
+function anthropicBlocks(body: unknown): Record<string, unknown>[] {
+  const blocks: Record<string, unknown>[] = [];
+  for (const message of asArray(asRecord(body)?.messages) ?? []) {
+    for (const block of asArray(asRecord(message)?.content) ?? []) {
+      const record = asRecord(block);
+      if (record) blocks.push(record);
+    }
+  }
+  return blocks;
+}
+
+export function responsesItems(body: unknown): Record<string, unknown>[] {
+  const items: Record<string, unknown>[] = [];
+  for (const item of asArray(asRecord(body)?.input) ?? []) {
+    const record = asRecord(item);
+    if (record) items.push(record);
+  }
+  return items;
+}
+
+export function chatMessages(body: unknown): Record<string, unknown>[] {
+  const messages: Record<string, unknown>[] = [];
+  for (const message of asArray(asRecord(body)?.messages) ?? []) {
+    const record = asRecord(message);
+    if (record) messages.push(record);
+  }
+  return messages;
+}
+
+type CallIdSite = { get: () => string; set: (id: string) => void };
+
+/**
+ * Where each chat wire carries a tool call's id, on the call and on its
+ * result: the three APPA families and the other wires a conversation can move
+ * to. String ids only, in history order.
+ */
+function callIdSites(params: {
+  interactionType: string;
+  body: unknown;
+}): CallIdSite[] {
+  const sites: CallIdSite[] = [];
+  const add = (record: Record<string, unknown> | undefined, key: string) => {
+    if (!record || typeof record[key] !== "string") return;
+    sites.push({
+      get: () => record[key] as string,
+      set: (id) => {
+        record[key] = id;
+      },
+    });
+  };
+  const wire = providerWire(params.interactionType);
+  if (wire === "anthropic:messages") {
+    for (const block of anthropicBlocks(params.body)) {
+      if (block.type === "tool_use") add(block, "id");
+      else if (block.type === "tool_result") add(block, "tool_use_id");
+    }
+  } else if (wire === "openai:responses") {
+    for (const item of responsesItems(params.body)) add(item, "call_id");
+  } else if (wire === "openai:chatCompletions") {
+    for (const message of chatMessages(params.body)) {
+      add(message, "tool_call_id");
+      for (const call of asArray(message.tool_calls) ?? []) {
+        add(asRecord(call), "id");
+      }
+    }
+  } else if (wire === "bedrock:converse") {
+    for (const message of chatMessages(params.body)) {
+      for (const block of asArray(message.content) ?? []) {
+        add(asRecord(asRecord(block)?.toolUse), "toolUseId");
+        add(asRecord(asRecord(block)?.toolResult), "toolUseId");
+      }
+    }
+  } else if (wire === "gemini:generateContent") {
+    for (const content of asArray(asRecord(params.body)?.contents) ?? []) {
+      for (const part of asArray(asRecord(content)?.parts) ?? []) {
+        add(asRecord(asRecord(part)?.functionCall), "id");
+        add(asRecord(asRecord(part)?.functionResponse), "id");
+      }
+    }
+  }
+  return sites;
+}
+
+type TextSite = {
+  get: () => string;
+  set: (text: string) => void;
+};
+
+/**
+ * Text that a client may carry between turns. This accepts only the documented
+ * message containers for each wire, rather than walking arbitrary nested data.
+ */
+function historyTextSites(family: AppaWireFamily, body: unknown): TextSite[] {
+  const sites: TextSite[] = [];
+  const addContent = (message: Record<string, unknown>) => {
+    if (typeof message.content === "string") {
+      sites.push({
+        get: () => message.content as string,
+        set: (text) => {
+          message.content = text;
+        },
+      });
+      return;
+    }
+    for (const part of asArray(message.content) ?? []) {
+      const record = asRecord(part);
+      if (
+        !record ||
+        typeof record.text !== "string" ||
+        !HISTORY_TEXT_PART_TYPES.has(record.type as string)
+      )
+        continue;
+      sites.push({
+        get: () => record.text as string,
+        set: (text) => {
+          record.text = text;
+        },
+      });
+    }
+  };
+
+  if (family === "openai:responses") {
+    const record = asRecord(body);
+    if (typeof record?.input === "string") {
+      sites.push({
+        get: () => record.input as string,
+        set: (text) => {
+          record.input = text;
+        },
+      });
+      return sites;
+    }
+    for (const item of responsesItems(body)) {
+      if (
+        (item.type !== undefined && item.type !== "message") ||
+        (item.role !== "user" && item.role !== "assistant")
+      )
+        continue;
+      addContent(item);
+    }
+    return sites;
+  }
+
+  for (const message of chatMessages(body)) {
+    if (message.role !== "user" && message.role !== "assistant") continue;
+    addContent(message);
+  }
+  return sites;
+}
+
+/**
+ * Tool-result text a client carries between turns: an Anthropic
+ * `tool_result`'s content, a Responses call output, a Chat Completions `tool`
+ * message. Text parts only.
+ */
+function toolResultTextSites(
+  family: AppaWireFamily,
+  body: unknown,
+): TextSite[] {
+  const sites: TextSite[] = [];
+  const add = (holder: Record<string, unknown>, key: string) => {
+    if (typeof holder[key] === "string") {
+      sites.push({
+        get: () => holder[key] as string,
+        set: (text) => {
+          holder[key] = text;
+        },
+      });
+      return;
+    }
+    for (const part of asArray(holder[key]) ?? []) {
+      const record = asRecord(part);
+      if (
+        !record ||
+        typeof record.text !== "string" ||
+        !HISTORY_TEXT_PART_TYPES.has(record.type as string)
+      )
+        continue;
+      sites.push({
+        get: () => record.text as string,
+        set: (text) => {
+          record.text = text;
+        },
+      });
+    }
+  };
+  if (family === "anthropic:messages") {
+    for (const block of anthropicBlocks(body)) {
+      if (block.type === "tool_result") add(block, "content");
+    }
+  } else if (family === "openai:responses") {
+    for (const item of responsesItems(body)) {
+      if (
+        item.type === "function_call_output" ||
+        item.type === "custom_tool_call_output"
+      )
+        add(item, "output");
+    }
+  } else {
+    for (const message of chatMessages(body)) {
+      if (message.role === "tool") add(message, "content");
+    }
+  }
+  return sites;
+}
+
+/** Text parts the proxy may return as model-visible assistant content. */
+function responseTextSites(
+  family: AppaWireFamily,
+  response: unknown,
+): TextSite[] {
+  const sites: TextSite[] = [];
+  const responseRecord = asRecord(response);
+  if (!responseRecord) return sites;
+
+  if (family === "anthropic:messages") {
+    const content = asArray(responseRecord.content);
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        const record = asRecord(part);
+        if (record?.type !== "text" || typeof record.text !== "string")
+          continue;
+        sites.push({
+          get: () => record.text as string,
+          set: (text) => {
+            record.text = text;
+          },
+        });
+      }
+      if (sites.length === 0) {
+        sites.push({
+          get: () => "",
+          set: (text) => {
+            content.unshift({ type: "text", text });
+          },
+        });
+      }
+    }
+    return sites;
+  }
+
+  if (family === "openai:responses") {
+    const output = asArray(responseRecord.output);
+    if (Array.isArray(output)) {
+      for (const item of output) {
+        const message = asRecord(item);
+        if (message?.type !== "message" || message.role !== "assistant")
+          continue;
+        for (const part of asArray(message.content) ?? []) {
+          const record = asRecord(part);
+          if (record?.type !== "output_text" || typeof record.text !== "string")
+            continue;
+          sites.push({
+            get: () => record.text as string,
+            set: (text) => {
+              record.text = text;
+            },
+          });
+        }
+      }
+      if (sites.length === 0) {
+        sites.push({
+          get: () => "",
+          set: (text) => {
+            output.unshift({
+              id: `msg_${Math.random().toString(36).slice(2, 10)}`,
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text, annotations: [] }],
+            });
+          },
+        });
+      }
+    }
+    return sites;
+  }
+
+  for (const choice of asArray(responseRecord.choices) ?? []) {
+    const message = asRecord(asRecord(choice)?.message);
+    if (!message) continue;
+    if (typeof message.content === "string") {
+      sites.push({
+        get: () => message.content as string,
+        set: (text) => {
+          message.content = text;
+        },
+      });
+      continue;
+    }
+    if (message.content === null || message.content === undefined) {
+      sites.push({
+        get: () => "",
+        set: (text) => {
+          message.content = text;
+        },
+      });
+      continue;
+    }
+    for (const part of asArray(message.content) ?? []) {
+      const record = asRecord(part);
+      if (record?.type !== "text" || typeof record.text !== "string") continue;
+      sites.push({
+        get: () => record.text as string,
+        set: (text) => {
+          record.text = text;
+        },
+      });
+    }
+  }
+  return sites;
+}
+
+const HISTORY_TEXT_PART_TYPES = new Set(["text", "input_text", "output_text"]);
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+const MAX_CANONICAL_JSON_DEPTH = 64;
+
+/** Serializes value to canonical JSON, bounded by depth and proxy bodyLimit. */
+export function canonicalJson(
+  value: unknown,
+  options?: { maxDepth?: number; maxBytes?: number },
+): string {
+  const maxDepth = options?.maxDepth ?? MAX_CANONICAL_JSON_DEPTH;
+  const maxBytes = options?.maxBytes ?? config.api.bodyLimit;
+  let byteCount = 0;
+
+  function serialize(val: unknown, depth: number): string {
+    if (depth >= maxDepth) {
+      return '"[depth-exceeded]"';
+    }
+    if (byteCount >= maxBytes) {
+      return '"[size-exceeded]"';
+    }
+
+    if (Array.isArray(val)) {
+      const items = val.map((item) => {
+        if (
+          item === undefined ||
+          typeof item === "function" ||
+          typeof item === "symbol"
+        ) {
+          byteCount += 4;
+          return "null";
+        }
+        return serialize(item, depth + 1);
+      });
+      byteCount += 2 + (items.length > 1 ? items.length - 1 : 0);
+      return `[${items.join(",")}]`;
+    }
+
+    const record = asRecord(val);
+    if (record) {
+      const entries = Object.keys(record)
+        .sort()
+        .flatMap((key) => {
+          const entry = record[key];
+          if (
+            entry === undefined ||
+            typeof entry === "function" ||
+            typeof entry === "symbol"
+          ) {
+            return [];
+          }
+          const serializedKey = JSON.stringify(key);
+          byteCount += serializedKey.length + 1;
+          const serializedValue = serialize(entry, depth + 1);
+          return [`${serializedKey}:${serializedValue}`];
+        });
+      byteCount += 2 + (entries.length > 1 ? entries.length - 1 : 0);
+      return `{${entries.join(",")}}`;
+    }
+
+    const primitive = JSON.stringify(val) ?? "null";
+    byteCount += primitive.length;
+    return primitive;
+  }
+
+  try {
+    const result = serialize(value, 0);
+    if (byteCount > maxBytes) {
+      return '"[size-exceeded]"';
+    }
+    return result;
+  } catch (err) {
+    if (err instanceof RangeError) {
+      return '"[stack-overflow]"';
+    }
+    throw err;
+  }
+}
+
+function asArray(value: unknown): unknown[] | undefined {
+  return Array.isArray(value) ? value : undefined;
+}
+
+/** Non-cryptographic fingerprint digest for retry idempotency. */
+function digestOf(text: string): string {
+  return fingerprint(text);
+}
+
+/**
+ * A stable 128-bit fingerprint of a string: two FNV-1a lanes over the text,
+ * hex-encoded, plus its length.
+ *
+ * CodeQL [js/insufficient-password-hash] False positive: This is a non-cryptographic
+ * FNV-1a fingerprint for turn-boundary idempotency, never used for passwords or secrets.
+ */
+function fingerprint(text: string): string {
+  const lanes = [0x811c9dc5, 0x01000193 ^ 0x811c9dc5];
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    for (let lane = 0; lane < lanes.length; lane++) {
+      const mixed = (lanes[lane] ^ code ^ (index & 0xff)) >>> 0;
+      lanes[lane] = Math.imul(mixed, 0x01000193) >>> 0;
+    }
+  }
+  return (
+    lanes.map((lane) => lane.toString(16).padStart(8, "0")).join("") +
+    text.length.toString(16).padStart(8, "0")
+  );
+}

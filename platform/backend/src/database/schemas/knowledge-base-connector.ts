@@ -1,6 +1,14 @@
 import {
+  DEFAULT_PERMISSION_SYNC_INTERVAL_SECONDS,
+  DEFAULT_TEXT_SEARCH_LANGUAGE,
+  type TextSearchLanguage,
+} from "@archestra/shared";
+import { sql } from "drizzle-orm";
+import {
+  bigint,
   boolean,
   index,
+  integer,
   jsonb,
   pgTable,
   text,
@@ -12,12 +20,17 @@ import type {
   ConnectorConfig,
   ConnectorSyncStatus,
   ConnectorType,
+  PermissionSyncState,
 } from "@/types";
 import type { KnowledgeSourceVisibility } from "@/types/knowledge-base";
+import environmentsTable from "./environment";
 import knowledgeBasesTable from "./knowledge-base";
 import secretTable from "./secret";
+import serviceAccountsTable from "./service-account";
+import { softDeletablePgTable } from "./soft-deletable-table";
+import usersTable from "./user";
 
-const knowledgeBaseConnectorsTable = pgTable(
+const knowledgeBaseConnectorsTable = softDeletablePgTable(
   "knowledge_base_connectors",
   {
     id: uuid("id").primaryKey().defaultRandom(),
@@ -29,17 +42,93 @@ const knowledgeBaseConnectorsTable = pgTable(
       .notNull()
       .default("org-wide"),
     teamIds: jsonb("team_ids").$type<string[]>().notNull().default([]),
+    /**
+     * Whether this connector mirrors the upstream source's own access control
+     * onto each document (the permission-sync pass). The single switch every
+     * permission-sync reader consults. It replaces the
+     * `visibility = 'auto-sync-permissions'` mode, which shared a column with
+     * the retired org/team audience.
+     */
+    syncPermissionsFromSource: boolean("sync_permissions_from_source")
+      .notNull()
+      .default(false),
     connectorType: text("connector_type").$type<ConnectorType>().notNull(),
     config: jsonb("config").$type<ConnectorConfig>().notNull(),
     secretId: uuid("secret_id").references(() => secretTable.id, {
       onDelete: "set null",
     }),
+    /**
+     * Optional deployment Environment this connector belongs to. Null = the org
+     * default environment. Referential only; the write path validates org
+     * ownership. ON DELETE SET NULL falls the row back to the default.
+     */
+    environmentId: uuid("environment_id").references(
+      () => environmentsTable.id,
+      { onDelete: "set null" },
+    ),
     schedule: text("schedule").notNull().default("0 */6 * * *"),
+    /**
+     * PostgreSQL text-search configuration used to build the keyword index for
+     * this connector's documents. Set it to the language the corpus is written
+     * in so stemming matches ("laufende"/"läuft" only collapse under `german`),
+     * or to `simple` to disable stemming for code and mixed-language corpora.
+     * Applied at ingest: changing it takes effect on the next sync.
+     */
+    ftsLanguage: text("fts_language")
+      .$type<TextSearchLanguage>()
+      .notNull()
+      .default(DEFAULT_TEXT_SEARCH_LANGUAGE),
+    /**
+     * Cadence of the scheduled permission-sync pass for `auto-sync-permissions`
+     * connectors: the next pass is due this many seconds after the last one
+     * (manual, content-ingest-triggered, or scheduled) finished starting.
+     * Ignored for other visibilities.
+     */
+    permissionSyncIntervalSeconds: integer("permission_sync_interval_seconds")
+      .notNull()
+      .default(DEFAULT_PERMISSION_SYNC_INTERVAL_SECONDS),
     enabled: boolean("enabled").notNull().default(true),
     lastSyncAt: timestamp("last_sync_at", { mode: "date" }),
     lastSyncStatus: text("last_sync_status").$type<ConnectorSyncStatus>(),
     lastSyncError: text("last_sync_error"),
+    // Permission-sync status, kept separate from the content-sync fields above
+    // so a permission run never clobbers `lastSyncAt` / `lastSyncStatus`.
+    lastPermissionSyncAt: timestamp("last_permission_sync_at", {
+      mode: "date",
+    }),
+    lastPermissionSyncStatus: text(
+      "last_permission_sync_status",
+    ).$type<ConnectorSyncStatus>(),
     checkpoint: jsonb("checkpoint").$type<ConnectorCheckpoint>(),
+    /**
+     * Opaque per-connector permission-sync probe state (audit-log cursors,
+     * config fingerprints, last full-reconcile timestamp) read and written
+     * only by the permission-sync delta machinery. NULL until the first pass.
+     */
+    permissionSyncState: jsonb(
+      "permission_sync_state",
+    ).$type<PermissionSyncState>(),
+    // Monotonic fencing token bumped atomically whenever `visibility` or
+    // `teamIds` change. Every ACL writer (content-sync ingest and the
+    // permission-sync pass) fences its write on the value it read alongside the
+    // visibility config, so a write computed against a now-stale config no-ops.
+    aclConfigEpoch: bigint("acl_config_epoch", { mode: "number" })
+      .notNull()
+      .default(0),
+    /**
+     * Who created this. Nullable: rows predating creator tracking have no
+     * answer, and `ON DELETE SET NULL` gives the column back to "unknown" when
+     * the account is deleted rather than taking the connector with it — the
+     * organization owns connectors, not the person who happened to make it.
+     */
+    createdBy: text("created_by").references(() => usersTable.id, {
+      onDelete: "set null",
+    }),
+    /** Service account creator; separate from human ownership. */
+    createdByServiceAccountId: uuid("created_by_service_account_id").references(
+      () => serviceAccountsTable.id,
+      { onDelete: "set null" },
+    ),
     createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { mode: "date" })
       .notNull()
@@ -47,9 +136,16 @@ const knowledgeBaseConnectorsTable = pgTable(
       .$onUpdate(() => new Date()),
   },
   (table) => [
-    index("knowledge_base_connectors_organization_id_idx").on(
-      table.organizationId,
-    ),
+    // Partial: every read of this table but the trash listing filters
+    // `deleted_at IS NULL`, so both indexes only ever need the active rows.
+    // The trash's `status=deleted` slice scans instead — deliberately
+    // unindexed, since soft-deleted rows are a small tail of a small table.
+    index("knowledge_base_connectors_organization_id_idx")
+      .on(table.organizationId)
+      .where(sql`deleted_at IS NULL`),
+    index("knowledge_base_connectors_environment_id_idx")
+      .on(table.environmentId)
+      .where(sql`deleted_at IS NULL`),
   ],
 );
 

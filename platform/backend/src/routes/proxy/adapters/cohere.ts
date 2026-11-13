@@ -1,12 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { ArchestraInternalErrorCode } from "@shared";
-import { encode as toonEncode } from "@toon-format/toon";
+import type { ArchestraInternalErrorCode } from "@archestra/shared";
 import { get } from "lodash-es";
 import config from "@/config";
 import logger from "@/logging";
-import { ModelModel } from "@/models";
 import { metrics } from "@/observability";
-import { getTokenizer } from "@/tokenizers";
+import { cohereUsageTokens } from "@/observability/metrics/llm-usage";
 import type {
   ChunkProcessingResult,
   Cohere,
@@ -20,12 +18,13 @@ import type {
   LLMResponseAdapter,
   LLMStreamAdapter,
   StreamAccumulatorState,
-  ToolCompressionStats,
   UsageView,
 } from "@/types";
-import { extractCommonMessageText } from "@/types";
-import type { ToolCompressionStats as CompressionStats } from "../utils/toon-conversion";
-import { unwrapToolContent } from "../utils/unwrap-tool-content";
+import {
+  extractCommonMessageText,
+  extractCommonToolCallArguments,
+} from "@/types";
+import { upstreamHttpError } from "./upstream-http-error";
 
 // =============================================================================
 // TYPE ALIASES
@@ -90,14 +89,15 @@ class CohereRequestAdapter
       // Cohere uses "tool" role for tool results (similar to OpenAI)
       if (message.role === "tool") {
         const toolMsg = message as Cohere.Types.ToolMessage;
-        const toolName = this.findToolName(toolMsg.tool_call_id);
+        const toolCall = this.findToolCall(toolMsg.tool_call_id);
 
         const parsed = safeJsonParse(toolMsg.content);
         const content = parsed.ok ? parsed.value : toolMsg.content;
 
         results.push({
           id: toolMsg.tool_call_id,
-          name: toolName ?? "unknown",
+          name: toolCall?.name ?? "unknown",
+          arguments: toolCall?.arguments,
           content,
           isError: false,
         });
@@ -145,16 +145,6 @@ class CohereRequestAdapter
     Object.assign(this.toolResultUpdates, updates);
   }
 
-  async applyToonCompression(model: string): Promise<ToolCompressionStats> {
-    const { messages: compressedMessages, stats } =
-      await convertToolResultsToToon(this.request.messages, model);
-    this.request = {
-      ...this.request,
-      messages: compressedMessages,
-    };
-    return stats;
-  }
-
   convertToolResultContent(messages: CohereMessages): CohereMessages {
     return messages;
   }
@@ -195,7 +185,9 @@ class CohereRequestAdapter
   // Private Helpers
   // ---------------------------------------------------------------------------
 
-  private findToolName(toolCallId: string): string | null {
+  private findToolCall(
+    toolCallId: string,
+  ): { name: string; arguments?: Record<string, unknown> } | null {
     for (let i = this.request.messages.length - 1; i >= 0; i--) {
       const message = this.request.messages[i];
       if (message.role === "assistant") {
@@ -203,7 +195,12 @@ class CohereRequestAdapter
         if (assistantMsg.tool_calls) {
           for (const toolCall of assistantMsg.tool_calls) {
             if (toolCall.id === toolCallId) {
-              return toolCall.function.name;
+              return {
+                name: toolCall.function.name,
+                arguments: extractCommonToolCallArguments(
+                  toolCall.function.arguments,
+                ),
+              };
             }
           }
         }
@@ -224,16 +221,17 @@ class CohereRequestAdapter
       // Handle tool messages
       if (message.role === "tool") {
         const toolMsg = message as Cohere.Types.ToolMessage;
-        const toolName = this.findToolName(toolMsg.tool_call_id);
+        const toolCall = this.findToolCall(toolMsg.tool_call_id);
 
-        if (toolName) {
+        if (toolCall) {
           const parsed = safeJsonParse(toolMsg.content);
           const toolResult = parsed.ok ? parsed.value : toolMsg.content;
 
           commonMessage.toolCalls = [
             {
               id: toolMsg.tool_call_id,
-              name: toolName,
+              name: toolCall.name,
+              arguments: toolCall.arguments,
               content: toolResult,
               isError: false,
             },
@@ -258,7 +256,7 @@ class CohereRequestAdapter
     return messages.map((message) => {
       if (message.role === "tool") {
         const toolMsg = message as Cohere.Types.ToolMessage;
-        if (updates[toolMsg.tool_call_id]) {
+        if (Object.hasOwn(updates, toolMsg.tool_call_id)) {
           return {
             ...toolMsg,
             content: updates[toolMsg.tool_call_id],
@@ -318,13 +316,8 @@ class CohereResponseAdapter implements LLMResponseAdapter<CohereResponse> {
   }
 
   getUsage(): UsageView {
-    const usage = this.response.usage;
-    return {
-      inputTokens:
-        usage?.tokens?.input_tokens ?? usage?.billed_units?.input_tokens ?? 0,
-      outputTokens:
-        usage?.tokens?.output_tokens ?? usage?.billed_units?.output_tokens ?? 0,
-    };
+    const { input, output } = cohereUsageTokens(this.response.usage);
+    return { inputTokens: input, outputTokens: output };
   }
 
   getFinishReasons(): string[] {
@@ -334,6 +327,31 @@ class CohereResponseAdapter implements LLMResponseAdapter<CohereResponse> {
 
   getOriginalResponse(): CohereResponse {
     return this.response;
+  }
+
+  withRewrittenToolCalls(
+    toolCalls: Array<{ id: string; name: string; arguments: string }>,
+  ): CohereResponse {
+    // Positional: one rewritten entry per call this response carries, in
+    // order, so ids the client correlates by are untouched.
+    const existing = this.response?.message?.tool_calls;
+    if (!existing) return this.response;
+    const tool_calls = existing.map((toolCall, index) => {
+      const rewritten = toolCalls[index];
+      if (!rewritten) return toolCall;
+      return {
+        ...toolCall,
+        function: {
+          ...toolCall.function,
+          name: rewritten.name,
+          arguments: rewritten.arguments,
+        },
+      };
+    });
+    return {
+      ...this.response,
+      message: { ...this.response.message, tool_calls },
+    };
   }
 
   toRefusalResponse(
@@ -354,6 +372,11 @@ class CohereResponseAdapter implements LLMResponseAdapter<CohereResponse> {
       finish_reason: "COMPLETE",
     };
   }
+
+  /** The response as one text answer, as a governed child's turn ends. */
+  withReplacedText(text: string): CohereResponse {
+    return this.toRefusalResponse("", text);
+  }
 }
 
 // =============================================================================
@@ -366,6 +389,16 @@ class CohereStreamAdapter
   readonly provider = "cohere" as const;
   readonly state: StreamAccumulatorState;
   private currentToolCallIndex = -1;
+  // Highest content index forwarded to the client, so an appended refusal block
+  // does not reuse an index the client already saw.
+  private maxStreamedBlockIndex = -1;
+  // Set to the refusal text when the streamed response was replaced by a policy
+  // refusal, so formatEndSSE finishes as COMPLETE (not the upstream TOOL_CALL)
+  // and toProviderResponse persists the refusal instead of the blocked calls.
+  private replacedText: string | null = null;
+  private get responseReplacedWithText(): boolean {
+    return this.replacedText !== null;
+  }
 
   constructor() {
     this.state = {
@@ -410,6 +443,10 @@ class CohereStreamAdapter
         // Pass through raw Cohere chunk - @ai-sdk/cohere expects native format
         // The SDK schema expects: { type, index, delta: { message: { content: {...} } } }
         // Cohere API sends this structure natively - do not modify
+        this.maxStreamedBlockIndex = Math.max(
+          this.maxStreamedBlockIndex,
+          get(chunk, "index", 0) as number,
+        );
         sseData = formatSSE(chunk);
         break;
       }
@@ -542,10 +579,10 @@ class CohereStreamAdapter
             (get(usage, "billed_units.output_tokens", 0) as number),
         };
         isFinal = true;
-        // Do NOT send message-end yet if you want to inspect or modify final state
-        // But for Cohere we generally pass it through unless we need policy check refutation
-        // The Proxy Handler handles policy checks on completion.
-        sseData = formatSSE(chunk);
+        // Withhold the upstream message-end: it carries the tool-call finish
+        // reason and would reach the client before the proxy plugins rule on
+        // the tool calls. formatEndSSE emits the single message-end after
+        // the ruling (COMPLETE when a refusal replaced the response).
         break;
       }
 
@@ -599,12 +636,43 @@ class CohereStreamAdapter
     );
   }
 
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]): string[] {
+    // The same three-frame shape processChunk builds for a live call
+    // (start carries id/name, delta carries the whole argument string, end
+    // closes it), so @ai-sdk/cohere accumulates it identically.
+    return toolCalls.flatMap((toolCall) => [
+      `data: ${JSON.stringify({
+        type: "tool-call-start",
+        delta: {
+          message: {
+            tool_calls: {
+              id: toolCall.id,
+              type: "function",
+              function: { name: toolCall.name, arguments: "" },
+            },
+          },
+        },
+      })}\n\n`,
+      `data: ${JSON.stringify({
+        type: "tool-call-delta",
+        delta: {
+          message: {
+            tool_calls: { function: { arguments: toolCall.arguments } },
+          },
+        },
+      })}\n\n`,
+      `data: ${JSON.stringify({ type: "tool-call-end" })}\n\n`,
+    ]);
+  }
+
   formatCompleteTextSSE(text: string): string[] {
+    this.replacedText = text;
+    const index = this.maxStreamedBlockIndex + 1;
     // Format must match Cohere API stream format for @ai-sdk/cohere
     return [
       `data: ${JSON.stringify({
         type: "content-start",
-        index: 0,
+        index,
         delta: {
           message: {
             content: {
@@ -616,7 +684,7 @@ class CohereStreamAdapter
       })}\n\n`,
       `data: ${JSON.stringify({
         type: "content-delta",
-        index: 0,
+        index,
         delta: {
           message: {
             content: {
@@ -627,7 +695,7 @@ class CohereStreamAdapter
       })}\n\n`,
       `data: ${JSON.stringify({
         type: "content-end",
-        index: 0,
+        index,
       })}\n\n`,
     ];
   }
@@ -636,7 +704,9 @@ class CohereStreamAdapter
     const event = {
       type: "message-end",
       delta: {
-        finish_reason: this.state.stopReason ?? "COMPLETE",
+        finish_reason: this.responseReplacedWithText
+          ? "COMPLETE"
+          : (this.state.stopReason ?? "COMPLETE"),
         usage: {
           tokens: {
             input_tokens: this.state.usage?.inputTokens ?? 0,
@@ -658,8 +728,21 @@ class CohereStreamAdapter
       });
     }
 
+    // A refusal does not erase what the model already said: its text streamed as
+    // it arrived and the refusal was appended after it as a further content
+    // block, so the client holds both. Recording the refusal alone deletes the
+    // model's own answer from the turn.
+    if (this.replacedText !== null) {
+      content.push({ type: "text", text: this.replacedText });
+    }
+
+    // Calls held back by the gate never reached the client, so they must not
+    // appear in the record — a turn that names them would owe tool results
+    // nothing will ever send.
     const toolCalls: CohereResponse["message"]["tool_calls"] = [];
-    for (const toolCall of this.state.toolCalls) {
+    for (const toolCall of this.replacedText === null
+      ? this.state.toolCalls
+      : []) {
       toolCalls.push({
         id: toolCall.id,
         type: "function",
@@ -678,8 +761,10 @@ class CohereStreamAdapter
         tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       },
       finish_reason:
-        (this.state.stopReason as CohereResponse["finish_reason"]) ??
-        "COMPLETE",
+        this.replacedText !== null
+          ? "COMPLETE"
+          : ((this.state.stopReason as CohereResponse["finish_reason"]) ??
+            "COMPLETE"),
       usage: {
         tokens: {
           input_tokens: this.state.usage?.inputTokens ?? 0,
@@ -688,125 +773,6 @@ class CohereStreamAdapter
       },
     };
   }
-}
-
-// =============================================================================
-// TOON COMPRESSION
-// =============================================================================
-
-export async function convertToolResultsToToon(
-  messages: CohereMessages,
-  model: string,
-): Promise<{
-  messages: CohereMessages;
-  stats: CompressionStats;
-}> {
-  const tokenizer = getTokenizer("cohere");
-
-  let totalTokensBefore = 0;
-  let totalTokensAfter = 0;
-
-  const result = messages.map((message) => {
-    if (message.role === "tool") {
-      const toolMsg = message as Cohere.Types.ToolMessage;
-
-      try {
-        const unwrapped = unwrapToolContent(toolMsg.content);
-        const parsedRes = safeJsonParse(unwrapped);
-        if (!parsedRes.ok) {
-          logger.info(
-            {
-              toolCallId: toolMsg.tool_call_id,
-              contentPreview: toolMsg.content.substring(0, 100),
-            },
-            "convertToolResultsToToon: skipping - content is not JSON",
-          );
-          return message;
-        }
-
-        const parsed = parsedRes.value as unknown;
-        const noncompressed = unwrapped;
-        const compressed = toonEncode(parsed);
-
-        const tokensBefore = tokenizer.countTokens([
-          { role: "user", content: noncompressed },
-        ]);
-        const tokensAfter = tokenizer.countTokens([
-          { role: "user", content: compressed },
-        ]);
-
-        // Only use TOON compression if it actually saves tokens
-        if (tokensAfter < tokensBefore) {
-          totalTokensBefore += tokensBefore;
-          totalTokensAfter += tokensAfter;
-
-          logger.info(
-            {
-              toolCallId: toolMsg.tool_call_id,
-              beforeLength: noncompressed.length,
-              afterLength: compressed.length,
-              tokensBefore,
-              tokensAfter,
-              tokensSaved: tokensBefore - tokensAfter,
-              provider: "cohere",
-            },
-            "convertToolResultsToToon: compressed",
-          );
-
-          return {
-            ...toolMsg,
-            content: compressed,
-          };
-        } else {
-          logger.info(
-            {
-              toolCallId: toolMsg.tool_call_id,
-              beforeLength: noncompressed.length,
-              afterLength: compressed.length,
-              tokensBefore,
-              tokensAfter,
-              tokensDiff: tokensAfter - tokensBefore,
-              provider: "cohere",
-            },
-            "convertToolResultsToToon: skipping - compression increases tokens",
-          );
-          return message;
-        }
-      } catch {
-        logger.info(
-          {
-            toolCallId: toolMsg.tool_call_id,
-            contentPreview: toolMsg.content.substring(0, 100),
-          },
-          "convertToolResultsToToon: skipping - content is not JSON",
-        );
-        return message;
-      }
-    }
-    return message;
-  });
-
-  // Calculate cost savings
-  let costSavings = 0;
-  if (totalTokensBefore > 0) {
-    const savedTokens = totalTokensBefore - totalTokensAfter;
-    costSavings = await ModelModel.calculateCostSavings(
-      model,
-      savedTokens,
-      "cohere",
-    );
-  }
-
-  return {
-    messages: result,
-    stats: {
-      tokensBefore: totalTokensBefore,
-      tokensAfter: totalTokensAfter,
-      costSavings: costSavings,
-      wasEffective: totalTokensAfter < totalTokensBefore,
-      hadToolResults: totalTokensBefore > 0,
-    },
-  };
 }
 
 // =============================================================================
@@ -827,12 +793,7 @@ function createCohereClient(
   const baseUrl = options.baseUrl || config.llm.cohere.baseUrl;
   // Only wrap fetch with metrics when agent context is available
   const observableFetch = options.agent
-    ? metrics.llm.getObservableFetch(
-        "cohere",
-        options.agent,
-        options.source,
-        options.externalAgentId,
-      )
+    ? metrics.llm.getObservableFetch("cohere", options.agent, options.source)
     : fetch;
 
   return {
@@ -846,12 +807,14 @@ function createCohereClient(
             ...options.defaultHeaders,
           },
           body: JSON.stringify({ ...request, stream: false }),
+          signal: options.abortSignal,
         });
 
         if (!response.ok) {
-          const errorText = await response.text();
-          throw new Error(
+          const errorText = await response.text().catch(() => "");
+          throw upstreamHttpError(
             `Cohere API error: ${response.status} - ${errorText}`,
+            response.status,
           );
         }
 
@@ -868,12 +831,14 @@ function createCohereClient(
             ...options.defaultHeaders,
           },
           body: JSON.stringify({ ...request, stream: true }),
+          signal: options.abortSignal,
         });
 
         if (!response.ok) {
-          const errorText = await response.text();
-          throw new Error(
+          const errorText = await response.text().catch(() => "");
+          throw upstreamHttpError(
             `Error from Cohere API : ${response.status} - ${errorText}`,
+            response.status,
           );
         }
 
@@ -903,7 +868,12 @@ function createCohereClient(
             try {
               yield JSON.parse(data);
             } catch {
-              logger.warn({ data }, "Failed to parse Cohere's stream data");
+              // data is raw completion content — log only its size at warn.
+              logger.warn(
+                { dataLength: data.length },
+                "Failed to parse Cohere's stream data",
+              );
+              logger.debug({ data }, "Unparseable Cohere stream data");
             }
           }
         }
@@ -928,28 +898,11 @@ function extractErrorMessage(error: unknown): string {
 }
 
 function extractInternalCode(
-  error: unknown,
+  _error: unknown,
 ): ArchestraInternalErrorCode | undefined {
-  // Cohere 400 bodies are `{ message: string }` and the context-overflow
-  // messages start with "too many tokens: total number of tokens in the
-  // prompt cannot exceed N". No structured code in the public error schema.
-  const message: unknown = get(error, "error.message") ?? get(error, "message");
-  if (
-    typeof message === "string" &&
-    message.toLowerCase().includes("too many tokens")
-  ) {
-    return ArchestraInternalErrorCode.ContextLengthExceeded;
-  }
+  // Cohere 400 bodies are `{ message: string }` with no structured code, so there
+  // is no structured signal to classify overflow against.
   return undefined;
-}
-
-export function getUsageTokens(usage: Cohere.Types.Usage) {
-  return {
-    input:
-      usage?.tokens?.input_tokens ?? usage?.billed_units?.input_tokens ?? 0,
-    output:
-      usage?.tokens?.output_tokens ?? usage?.billed_units?.output_tokens ?? 0,
-  };
 }
 
 export const cohereAdapterFactory: LLMProvider<

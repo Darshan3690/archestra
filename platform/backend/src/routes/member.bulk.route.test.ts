@@ -1,0 +1,258 @@
+import {
+  ADMIN_ROLE_NAME,
+  AUTO_PROVISIONED_INVITATION_STATUS,
+  MAX_BULK_IDS,
+  RouteId,
+} from "@archestra/shared";
+import { requiredEndpointPermissionsMap } from "@archestra/shared/access-control";
+import { and, eq } from "drizzle-orm";
+import { vi } from "vitest";
+import config from "@/config";
+import db, { schema } from "@/database";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { registerAuditLogHook } from "@/middleware/audit-log-hook";
+import {
+  MemberModel,
+  RuntimeCredentialConnectionModel,
+  UserModel,
+} from "@/models";
+import { openappaBatteriesService } from "@/openappa/batteries";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import {
+  deployGithubWithRoster,
+  storedHostMembers,
+} from "@/test/openappa-github-roster";
+import { GitHubUserIdSchema, type User } from "@/types";
+import memberRoutes from "./member";
+
+describe("DELETE /api/members/bulk", () => {
+  let app: FastifyInstanceWithZod;
+  let organizationId: string;
+  let user: User;
+
+  beforeEach(
+    async ({ makeAccount, makeAdmin, makeMember, makeOrganization }) => {
+      organizationId = (await makeOrganization()).id;
+      user = await makeAdmin();
+      await makeAccount(user.id);
+      await makeMember(user.id, organizationId, { role: ADMIN_ROLE_NAME });
+
+      app = createFastifyInstance();
+      app.addHook("onRequest", async (request) => {
+        Object.assign(request, { organizationId, user });
+      });
+      registerAuditLogHook(app);
+      await app.register(memberRoutes);
+    },
+  );
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await app.close();
+  });
+
+  const bulkDelete = (targets: unknown) =>
+    app.inject({
+      method: "DELETE",
+      url: "/api/members/bulk",
+      payload: { targets },
+    });
+
+  test("removes a mixed deduplicated batch and does not disclose foreign or missing targets", async ({
+    makeAccount,
+    makeInvitation,
+    makeMember,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const acceptedUser = await makeUser();
+    const acceptedMember = await makeMember(acceptedUser.id, organizationId);
+    await makeAccount(acceptedUser.id);
+    const pendingUser = await makeUser({ email: "pending@example.com" });
+    await makeMember(pendingUser.id, organizationId);
+    await makeInvitation(organizationId, user.id, {
+      email: pendingUser.email,
+      status: `${AUTO_PROVISIONED_INVITATION_STATUS}:slack`,
+    });
+
+    const foreignOrganization = await makeOrganization();
+    const foreignUser = await makeUser();
+    const foreignMember = await makeMember(
+      foreignUser.id,
+      foreignOrganization.id,
+    );
+    await makeAccount(foreignUser.id);
+    const missing = crypto.randomUUID();
+
+    const response = await bulkDelete([
+      { kind: "member", id: acceptedMember.id },
+      { kind: "member", id: acceptedMember.id },
+      { kind: "pendingSignup", id: pendingUser.id },
+      { kind: "member", id: foreignMember.id },
+      { kind: "pendingSignup", id: missing },
+    ]);
+
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json()).toEqual({
+      succeeded: [
+        { kind: "member", id: acceptedMember.id },
+        { kind: "pendingSignup", id: pendingUser.id },
+      ],
+      failed: [
+        { kind: "member", id: foreignMember.id, error: "Member not found" },
+        { kind: "pendingSignup", id: missing, error: "Member not found" },
+      ],
+    });
+    expect(await MemberModel.getById(acceptedMember.id)).toBeUndefined();
+    expect(await UserModel.getById(pendingUser.id)).toBeUndefined();
+    expect(await MemberModel.getById(foreignMember.id)).toBeDefined();
+  });
+
+  test("guards self-removal and rechecks each target's accepted status", async ({
+    makeMember,
+    makeUser,
+  }) => {
+    const pendingUser = await makeUser();
+    await makeMember(pendingUser.id, organizationId);
+
+    const response = await bulkDelete([
+      { kind: "member", id: await currentMemberId() },
+      { kind: "member", id: await pendingMemberId(pendingUser.id) },
+    ]);
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      succeeded: [],
+      failed: [
+        {
+          kind: "member",
+          id: await currentMemberId(),
+          error: "You cannot remove your own account",
+        },
+        {
+          kind: "member",
+          id: await pendingMemberId(pendingUser.id),
+          error: "Member signup status changed",
+        },
+      ],
+    });
+    expect(await UserModel.getById(user.id)).toBeDefined();
+  });
+
+  test("validates the batch cap and writes one safe audit record only when rows change", async ({
+    makeAccount,
+    makeMember,
+    makeUser,
+  }) => {
+    const acceptedUser = await makeUser();
+    const member = await makeMember(acceptedUser.id, organizationId);
+    await makeAccount(acceptedUser.id);
+
+    expect((await bulkDelete([])).statusCode).toBe(400);
+    expect(
+      (
+        await bulkDelete(
+          Array.from({ length: MAX_BULK_IDS + 1 }, () => ({
+            kind: "member",
+            id: crypto.randomUUID(),
+          })),
+        )
+      ).statusCode,
+    ).toBe(400);
+
+    expect(
+      (await bulkDelete([{ kind: "member", id: crypto.randomUUID() }]))
+        .statusCode,
+    ).toBe(200);
+    expect(await auditRows()).toEqual([]);
+
+    expect(
+      (await bulkDelete([{ kind: "member", id: member.id }])).statusCode,
+    ).toBe(200);
+    expect(await auditRows()).toEqual([
+      {
+        before: { members: [{ kind: "member", id: member.id }] },
+        after: { members: [] },
+      },
+    ]);
+  });
+
+  test("the member roster ends with the members a batch leaves", async ({
+    makeAccount,
+    makeMember,
+    makeUser,
+    makeInternalMcpCatalog,
+    makeTool,
+  }) => {
+    const openappa = { ...config.openappa };
+    const sandbox = config.daggerRuntime.enabled;
+    try {
+      await deployGithubWithRoster({
+        organizationId,
+        userId: user.id,
+        makeInternalMcpCatalog,
+        makeTool,
+      });
+      const connected = async (email: string, githubId: number) => {
+        const member = await makeUser({ email });
+        await makeAccount(member.id);
+        const membership = await makeMember(member.id, organizationId);
+        await RuntimeCredentialConnectionModel.upsert({
+          organizationId,
+          scope: "personal",
+          userId: member.id,
+          credentialId: "github-user",
+          value: "token",
+          githubId: GitHubUserIdSchema.parse(githubId),
+        });
+        return membership.id;
+      };
+      const ana = await connected("ana@corp.example", 1001);
+      const bob = await connected("bob@corp.example", 1002);
+      await connected("carol@corp.example", 1003);
+      await openappaBatteriesService.recompile(organizationId);
+
+      const response = await bulkDelete([
+        { kind: "member", id: ana },
+        { kind: "member", id: bob },
+      ]);
+      expect(response.statusCode, response.body).toBe(200);
+      expect(await storedHostMembers(organizationId)).toEqual({
+        "github:1003": "carol@corp.example",
+      });
+    } finally {
+      config.openappa = openappa;
+      config.daggerRuntime.enabled = sandbox;
+    }
+  });
+
+  test("requires member delete permission", () => {
+    expect(requiredEndpointPermissionsMap[RouteId.BulkDeleteMembers]).toEqual({
+      member: ["delete"],
+    });
+  });
+
+  async function currentMemberId() {
+    return (await MemberModel.getByUserId(user.id, organizationId))?.id ?? "";
+  }
+
+  async function pendingMemberId(userId: string) {
+    return (await MemberModel.getByUserId(userId, organizationId))?.id ?? "";
+  }
+
+  async function auditRows() {
+    return db
+      .select({
+        before: schema.auditLogsTable.before,
+        after: schema.auditLogsTable.after,
+      })
+      .from(schema.auditLogsTable)
+      .where(
+        and(
+          eq(schema.auditLogsTable.action, "member.bulk_deleted"),
+          eq(schema.auditLogsTable.organizationId, organizationId),
+        ),
+      );
+  }
+});

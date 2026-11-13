@@ -1,0 +1,1740 @@
+import config from "@/config";
+import A2aRemoteAgentModel from "@/models/a2a-remote-agent";
+import AgentModel from "@/models/agent";
+import AgentRuntimeTemplateModel from "@/models/agent-runtime-template";
+import AgentToolModel from "@/models/agent-tool";
+import ApiKeyModel from "@/models/api-key";
+import AppModel from "@/models/app";
+import AutoRouterModel from "@/models/auto-router";
+import BlobProviderModel from "@/models/blob-provider";
+import BrowserStorageStateModel from "@/models/browser-storage-state";
+import ChatOpsChannelBindingModel from "@/models/chatops-channel-binding";
+import chatOpsConfigModel from "@/models/chatops-config";
+import CostExportModel from "@/models/cost-export";
+import DesktopDeviceModel from "@/models/desktop-device";
+import DevFeedbackConfigModel from "@/models/dev-feedback-config";
+import EnvironmentModel from "@/models/environment";
+import EnvironmentDefaultUserLimitModel from "@/models/environment-default-user-limit";
+import EnvironmentResourceDefaultModel from "@/models/environment-resource-default";
+import GithubAppConfigModel from "@/models/github-app-config";
+import GithubPatModel from "@/models/github-pat";
+import GuardrailsDeploymentModel from "@/models/guardrails-deployment";
+import GuardrailsPolicyModel from "@/models/guardrails-policy";
+import HookFileModel from "@/models/hook-file";
+import InternalMcpCatalogModel from "@/models/internal-mcp-catalog";
+import KbDirectoryModel from "@/models/kb-directory";
+import KbFileModel from "@/models/kb-file";
+import KnowledgeBaseModel from "@/models/knowledge-base";
+import KnowledgeBaseConnectorModel from "@/models/knowledge-base-connector";
+import LimitModel from "@/models/limit";
+import LlmOauthClientModel from "@/models/llm-oauth-client";
+import LlmProviderApiKeyModel from "@/models/llm-provider-api-key";
+import ManagedOauthClientModel from "@/models/managed-oauth-client";
+import McpOauthClientModel from "@/models/mcp-oauth-client";
+import McpServerModel from "@/models/mcp-server";
+import MemberModel from "@/models/member";
+import ModelModel from "@/models/model";
+import ModelCostBackfillModel from "@/models/model-cost-backfill";
+import ModelPoolModel from "@/models/model-pool";
+import OpenAppaBatteryInstallModel from "@/models/openappa-battery-install";
+import OpenAppaBatteryPackageModel from "@/models/openappa-battery-package";
+import OpenAppaCredentialBindingModel from "@/models/openappa-credential-binding";
+import OpenAppaGithubSyncModel from "@/models/openappa-github-sync";
+import OpenAppaYellModel from "@/models/openappa-yell";
+import OrganizationModel from "@/models/organization";
+import OrganizationRoleModel from "@/models/organization-role";
+import PluginModel from "@/models/plugin";
+import ProjectModel from "@/models/project";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import RuntimeCredentialDefinitionModel from "@/models/runtime-credential-definition";
+import ScheduleTriggerModel from "@/models/schedule-trigger";
+import ServiceAccountModel from "@/models/service-account";
+import ServiceAccountFederatedCredentialModel from "@/models/service-account-federated-credential";
+import SiteNotificationModel from "@/models/site-notification";
+import SkillModel from "@/models/skill";
+import SkillShareLinkModel from "@/models/skill-share-link";
+import TeamModel from "@/models/team";
+import UserLimitUsageResetModel from "@/models/user-limit-usage-reset";
+import UserTokenModel from "@/models/user-token";
+import VirtualApiKeyModel from "@/models/virtual-api-key";
+import { findConnectedClientForAudit } from "@/services/connected-client";
+import { type AuditEventName, AuditEventNameSchema } from "@/types/audit-log";
+import type { AuditableRouteConfig } from "@/types/audit-route-config";
+
+/**
+ * Return value of `resolveAuditableRouteConfig`.  `viaWalkUp` is true when the
+ * config was inherited from a parent path segment rather than being registered
+ * for the exact route pattern.  The hook uses this to suppress POST walk-ups
+ * which would otherwise mis-attribute a child-resource creation to the parent.
+ */
+type ResolvedAuditableRoute = {
+  cfg: AuditableRouteConfig;
+  viaWalkUp: boolean;
+};
+
+/**
+ * Derives a dotted audit event name from a resource type and HTTP method.
+ * Returns null when the candidate name is not in the closed AuditEventNameSchema
+ * (i.e., the resource type is unknown or the method doesn't map to a verb).
+ *
+ * @public — consumed by audit-log-hook.ts and audit-log-snapshot.test.ts
+ */
+export function deriveAction(
+  resourceType: string | null,
+  method: string,
+): AuditEventName | null {
+  if (!resourceType) return null;
+  const verb =
+    method === "POST"
+      ? "created"
+      : method === "PUT" || method === "PATCH"
+        ? "updated"
+        : method === "DELETE"
+          ? "deleted"
+          : null;
+  if (!verb) return null;
+  const candidate = `${resourceType}.${verb}`;
+  return AuditEventNameSchema.safeParse(candidate).success
+    ? (candidate as AuditEventName)
+    : null;
+}
+
+/**
+ * Maps Fastify parameterized route patterns to their resource type and an
+ * optional snapshot fetcher.  The audit preHandler hook uses `fetchById` to
+ * capture `before`; the onResponse hook uses it again for `after`.
+ *
+ * Rules:
+ * - POST routes (no :id in path) register without `fetchById`; the hook
+ *   obtains the id from the response body when needed.
+ * - Non-`:id` params use `resourceIdParam` (e.g. `agentId`, `roleId`).
+ * - `resolveAuditableRouteConfig` walks up path segments so nested routes
+ *   (e.g. `/api/mcp_server/:id/reinstall`) reuse the parent snapshot fetcher.
+ * - EE-only routes are added at startup via `initAuditRegistry()`.
+ * @public — consumed by audit-log-snapshot.test.ts to verify registry invariants
+ */
+export const AUDITABLE_ROUTES: Record<string, AuditableRouteConfig> = {
+  "/api/openappa/yells/:id": {
+    resourceType: "openappaYell",
+    action: "openappaYell.updated",
+    fetchById: (id, organizationId) =>
+      OpenAppaYellModel.findByIdForAudit(id, organizationId),
+  },
+  "/api/guardrails-policy": {
+    resourceType: "guardrailsPolicy",
+    action: "guardrailsPolicy.updated",
+    resourceIdSource: "organizationContext",
+    fetchById: (id, orgId) => GuardrailsPolicyModel.findByIdForAudit(id, orgId),
+  },
+  "/api/a2a/remote-agents/:id/transfer-ownership": {
+    resourceType: "agent",
+    action: "agent.updated",
+    fetchById: (id, orgId) => A2aRemoteAgentModel.findByIdForAudit(id, orgId),
+    onlyWhenChanged: true,
+  },
+  "/api/internal_mcp_catalog/:id/transfer-ownership": {
+    resourceType: "internalMcpCatalog",
+    action: "internalMcpCatalog.updated",
+    fetchById: (id, orgId) =>
+      InternalMcpCatalogModel.findByIdForAudit(id, orgId),
+    onlyWhenChanged: true,
+  },
+  "/api/apps/:id/transfer-ownership": {
+    resourceType: "app",
+    action: "app.updated",
+    fetchById: (id, orgId) => AppModel.findByIdForAudit(id, orgId),
+    onlyWhenChanged: true,
+  },
+  "/api/projects/:id/transfer-ownership": {
+    resourceType: "project",
+    action: "project.updated",
+    fetchById: (id, orgId) => ProjectModel.findByIdForAudit(id, orgId),
+    onlyWhenChanged: true,
+  },
+  // Linking or unlinking an app changes the project's `appIds` snapshot. Both
+  // methods are a project update — without this, DELETE would walk up to
+  // project.deleted.
+  "/api/projects/:id/apps/:appId": {
+    resourceType: "project",
+    action: "project.updated",
+    fetchById: (id, orgId) => ProjectModel.findByIdForAudit(id, orgId),
+    onlyWhenChanged: true,
+  },
+  "/api/plugins/:id/transfer-ownership": {
+    resourceType: "plugin",
+    action: "plugin.updated",
+    fetchById: (id, orgId) => PluginModel.findByIdForAudit(id, orgId),
+    onlyWhenChanged: true,
+  },
+  "/api/skills/:id/transfer-ownership": {
+    resourceType: "skill",
+    action: "skill.updated",
+    fetchById: (id, orgId) => SkillModel.findByIdForAudit(id, orgId),
+    onlyWhenChanged: true,
+  },
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  "/api/resource-permissions/:resource/:scope": {
+    resourceType: "resourcePermissions",
+    resourceIdParam: "scope",
+    action: "resourcePermissions.updated",
+    fetchById: (id, organizationId, routeParams) =>
+      ResourcePermissionPolicyModel.findByIdForAudit(
+        id,
+        organizationId,
+        routeParams,
+      ),
+    onlyWhenChanged: true,
+  },
+  // SPDX-SnippetEnd
+  "/api/client-connections/:id/decision": {
+    resourceType: "clientConnection",
+    action: "clientConnection.updated",
+  },
+  // These provider-account routes authenticate outside ordinary API auth;
+  // grok-native-privacy records their audit with the verified proxy identity.
+  "/v1/xai/native/privacy/coding-data-retention": {
+    resourceType: "clientPrivacy",
+    action: "clientPrivacy.updated",
+    onlyWhenChanged: true,
+  },
+  "/v1/xai/:agentId/native/privacy/coding-data-retention": {
+    resourceType: "clientPrivacy",
+    action: "clientPrivacy.updated",
+    onlyWhenChanged: true,
+  },
+  // A user approving or denying the sign-in of a tunnel client (the handler
+  // sets the snapshots), and removing their device.
+  "/api/desktop-devices/sign-in/:id/decision": {
+    resourceType: "desktopDeviceSignIn",
+    action: "desktopDeviceSignIn.updated",
+  },
+  "/api/desktop-devices/:id": {
+    resourceType: "desktopDevice",
+    fetchById: (id, orgId) => DesktopDeviceModel.findByIdForAudit(id, orgId),
+  },
+  // Start and Stop of one MCP server on the device. The snapshot of the
+  // device holds which of its MCP servers are stopped.
+  "/api/desktop-devices/:id/servers/:catalogId": {
+    resourceType: "desktopDevice",
+    action: "desktopDevice.updated",
+    fetchById: (id, orgId) => DesktopDeviceModel.findByIdForAudit(id, orgId),
+  },
+  // Disconnecting a client: the resource is the user whose client it was;
+  // the snapshot names the client.
+  "/api/connected-clients/:clientId": {
+    resourceType: "connectedClient",
+    action: "connectedClient.disconnected",
+    resourceIdSource: "currentUser",
+    fetchById: (userId, organizationId, routeParams) =>
+      findConnectedClientForAudit({
+        organizationId,
+        userId,
+        clientId: String(routeParams?.clientId),
+      }),
+  },
+  "/api/hooks": {
+    resourceType: "hook",
+    fetchById: (id, organizationId) =>
+      HookFileModel.findByIdForAudit(id, organizationId),
+  },
+  "/api/hooks/:id": {
+    resourceType: "hook",
+    fetchById: (id, organizationId) =>
+      HookFileModel.findByIdForAudit(id, organizationId),
+  },
+  "/api/agent-runtime-templates/settings": {
+    resourceType: "organization",
+    resourceIdSource: "organizationContext",
+    action: "organization.updated",
+    fetchById: (id) => AgentRuntimeTemplateModel.findByIdForAudit(id),
+  },
+  // Agents
+  "/api/agents": {
+    resourceType: "agent",
+    fetchById: (id, orgId) => AgentModel.findByIdForAudit(id, orgId),
+  },
+  "/api/agents/:id": {
+    resourceType: "agent",
+    fetchById: (id, orgId) => AgentModel.findByIdForAudit(id, orgId),
+  },
+  "/api/agents/:id/transfer-ownership": {
+    resourceType: "agent",
+    action: "agent.updated",
+    fetchById: (id, orgId) => AgentModel.findByIdForAudit(id, orgId),
+    onlyWhenChanged: true,
+  },
+  "/api/agents/:id/runtime/credentials/:key": {
+    resourceType: "agent",
+    action: "agent.updated",
+    fetchById: (id, orgId) => AgentModel.findByIdForAudit(id, orgId),
+    onlyWhenChanged: true,
+  },
+  "/api/agents/:id/runtime/claude-code/account": {
+    resourceType: "agent",
+    action: "agent.updated",
+    onlyWhenChanged: true,
+  },
+  "/api/agents/:id/runtime/claude-code/account/complete": {
+    resourceType: "agent",
+    action: "agent.updated",
+    onlyWhenChanged: true,
+  },
+  "/api/credentials": {
+    resourceType: "credential",
+    fetchById: (id, orgId) =>
+      RuntimeCredentialDefinitionModel.findByIdForAudit(id, orgId),
+  },
+  "/api/credentials/:key": {
+    resourceType: "credential",
+    resourceIdParam: "key",
+    fetchById: (key, orgId) =>
+      RuntimeCredentialDefinitionModel.findByKeyForAudit(key, orgId),
+  },
+  "/api/credentials/:key/organization": {
+    resourceType: "credential",
+    resourceIdParam: "key",
+    action: "credential.updated",
+    onlyWhenChanged: true,
+  },
+  "/api/credentials/github/callback": {
+    resourceType: "credential",
+    action: "credential.updated",
+    onlyWhenChanged: true,
+  },
+  "/api/credentials/:key/personal": {
+    resourceType: "credential",
+    resourceIdParam: "key",
+    action: "credential.updated",
+    onlyWhenChanged: true,
+  },
+  "/api/agents/:id/runs": {
+    resourceType: "agentRun",
+    action: "agentRun.created",
+  },
+  "/api/agent-runs/:taskId/cancel": {
+    resourceType: "agentRun",
+    resourceIdParam: "taskId",
+    action: "agentRun.canceled",
+  },
+  "/api/agent-runs/:taskId/continue": {
+    resourceType: "agentRun",
+    action: "agentRun.created",
+  },
+  "/api/agent-runs/:taskId/workspace/files": {
+    resourceType: "agentRun",
+    resourceIdParam: "taskId",
+    action: "agentRun.updated",
+  },
+  "/api/agent-runs/:taskId/workspace": {
+    resourceType: "agentRun",
+    resourceIdParam: "taskId",
+    action: "agentRun.updated",
+  },
+  "/api/agent-runs/:taskId/openappa-review": {
+    resourceType: "agentRun",
+    resourceIdParam: "taskId",
+    action: "agentRun.reviewDecided",
+  },
+  "/api/agent-runs/:taskId": {
+    resourceType: "agentRun",
+    resourceIdParam: "taskId",
+  },
+  "/api/agents/:id/restore": {
+    resourceType: "agent",
+    action: "agent.restored",
+    fetchById: (id, orgId) => AgentModel.findByIdForAudit(id, orgId),
+  },
+  // Restoring a config version rewrites the agent's whole config surface.
+  // Registered explicitly because the walk-up to "/api/agents/:id" resolves
+  // with viaWalkUp set, and the hook discards every walk-up POST — without
+  // this entry the restore produces no audit record at all.
+  "/api/agents/:id/versions/:version/restore": {
+    resourceType: "agent",
+    action: "agent.updated",
+    fetchById: (id, orgId) => AgentModel.findByIdForAudit(id, orgId),
+  },
+  // Permanent deletion. Registered explicitly for two reasons: the walk-up to
+  // `/api/agents/:id` would log it as `agent.deleted` (indistinguishable from a
+  // recoverable soft delete), and it would attach that route's FULL snapshot as
+  // `before` — a copy of exactly the config the caller asked to destroy. The
+  // identity fetcher is the guarantee that a purge is audited by who/what/when
+  // and nothing more.
+  "/api/agents/:id/permanent": {
+    resourceType: "agent",
+    action: "agent.purged",
+    fetchById: (id, orgId) => AgentModel.findIdentityForAudit(id, orgId),
+  },
+  "/api/agents/:agentId": {
+    resourceType: "agent",
+    resourceIdParam: "agentId",
+    fetchById: (id, orgId) => AgentModel.findByIdForAudit(id, orgId),
+  },
+
+  // Syncing/removing delegation targets mutates the agent's subagent surface.
+  // Registered explicitly so the POST sync isn't dropped as a walk-up (which
+  // falls to unknown.created with a null resourceType) and the single-target
+  // DELETE inherits agent.updated instead of deriving agent.deleted.
+  "/api/agents/:agentId/delegations": {
+    resourceType: "agent",
+    resourceIdParam: "agentId",
+    action: "agent.updated",
+    fetchById: (id, orgId) => AgentModel.findByIdForAudit(id, orgId),
+  },
+  "/api/agents/:agentId/delegations/:targetAgentId": {
+    resourceType: "agent",
+    resourceIdParam: "agentId",
+    action: "agent.updated",
+    fetchById: (id, orgId) => AgentModel.findByIdForAudit(id, orgId),
+  },
+  "/api/agents/:agentId/a2a-delegations": {
+    resourceType: "agent",
+    resourceIdParam: "agentId",
+    action: "agent.updated",
+    fetchById: (id, orgId) => AgentModel.findByIdForAudit(id, orgId),
+  },
+
+  // External A2A identities are agent-like resources in the product model.
+  // Reuse the agent audit vocabulary while the snapshot fetcher keeps their
+  // connection metadata tenant-scoped and excludes secret identifiers.
+  "/api/a2a/remote-agents": {
+    resourceType: "agent",
+    fetchById: (id, orgId) => A2aRemoteAgentModel.findByIdForAudit(id, orgId),
+  },
+  "/api/a2a/remote-agents/:id": {
+    resourceType: "agent",
+    fetchById: (id, orgId) => A2aRemoteAgentModel.findByIdForAudit(id, orgId),
+  },
+
+  "/api/agent-tools/:id": {
+    resourceType: "agentTool",
+    fetchById: (id, orgId) => AgentToolModel.findByIdForAudit(id, orgId),
+  },
+  // Explicit entry prevents walk-up from inheriting agent.created for POSTs to
+  // /api/agents/:agentId/tools/:toolId (assign a tool to an agent).
+  "/api/agents/:agentId/tools/:toolId": {
+    resourceType: "agentTool",
+    resourceIdParam: "toolId",
+    fetchById: (toolId, orgId, params) => {
+      const agentId = params?.agentId;
+      if (typeof agentId !== "string") return Promise.resolve(null);
+      return AgentToolModel.findByAgentAndToolForAudit(agentId, toolId, orgId);
+    },
+  },
+
+  // Apps
+  "/api/apps": {
+    resourceType: "app",
+    fetchById: (id, orgId) => AppModel.findByIdForAudit(id, orgId),
+  },
+  "/api/apps/:appId": {
+    resourceType: "app",
+    resourceIdParam: "appId",
+    fetchById: (id, orgId) => AppModel.findByIdForAudit(id, orgId),
+  },
+  // A version restore is a write-forward update, not a new app. Register the
+  // POST explicitly so it cannot be discarded as a walk-up create.
+  "/api/apps/:appId/versions/:version/restore": {
+    resourceType: "app",
+    resourceIdParam: "appId",
+    action: "app.updated",
+    fetchById: (id, orgId) => AppModel.findByIdForAudit(id, orgId),
+  },
+  // Tool assignment changes the app's effective tool surface; appToolsTable is
+  // audited:false ("parent carries the signal"), so record app.updated with the
+  // app snapshot instead of inheriting app.created from the POST walk-up.
+  "/api/apps/:appId/tools/:toolId": {
+    resourceType: "app",
+    resourceIdParam: "appId",
+    action: "app.updated",
+    fetchById: (id, orgId) => AppModel.findByIdForAudit(id, orgId),
+  },
+
+  // MCP Servers
+  "/api/mcp_server": {
+    resourceType: "mcpServer",
+    fetchById: (id, orgId) => McpServerModel.findByIdForAudit(id, orgId),
+  },
+  "/api/mcp_server/:id": {
+    resourceType: "mcpServer",
+    fetchById: (id, orgId) => McpServerModel.findByIdForAudit(id, orgId),
+  },
+  // Explicit entry prevents walk-up from inheriting mcpServer.created verb.
+  "/api/mcp_server/:id/reinstall": {
+    resourceType: "mcpServer",
+    action: "mcpServer.reinstalled",
+    fetchById: (id, orgId) => McpServerModel.findByIdForAudit(id, orgId),
+  },
+  // Destroys and recreates the physical deployment. Registered explicitly so it
+  // is not logged as `mcpServer.created` by the walk-up to `/api/mcp_server/:id`
+  // — a hard reset is the one MCP action an operator has to be able to find
+  // after the fact, and it must not be indistinguishable from an install.
+  "/api/mcp_server/:id/hard-reset": {
+    resourceType: "mcpServer",
+    action: "mcpServer.hardReset",
+    fetchById: (id, orgId) => McpServerModel.findByIdForAudit(id, orgId),
+  },
+  // Restore is a POST carrying :id — register directly so the POST walk-up
+  // isn't dropped (which would mis-log it as unknown.created). findByIdForAudit
+  // does NOT filter soft-deleted rows, so `before` captures the deleted install
+  // and `after` the revived one (deletedAt → null, reinstallRequired → true).
+  "/api/mcp_server/:id/restore": {
+    resourceType: "mcpServer",
+    action: "mcpServer.restored",
+    fetchById: (id, orgId) => McpServerModel.findByIdForAudit(id, orgId),
+  },
+
+  "/api/roles": {
+    resourceType: "role",
+    fetchById: (id, orgId) => OrganizationRoleModel.findByIdForAudit(id, orgId),
+  },
+  "/api/roles/:roleId": {
+    resourceType: "role",
+    resourceIdParam: "roleId",
+    fetchById: (id, orgId) => OrganizationRoleModel.findByIdForAudit(id, orgId),
+  },
+
+  // Teams
+  "/api/teams": {
+    resourceType: "team",
+    fetchById: (id, orgId) => TeamModel.findByIdForAudit(id, orgId),
+  },
+  "/api/teams/:id": {
+    resourceType: "team",
+    fetchById: (id, orgId) => TeamModel.findByIdForAudit(id, orgId),
+  },
+
+  // API Keys (REDACTED — raw key excluded from snapshot)
+  "/api/api-keys": {
+    resourceType: "apiKey",
+    fetchById: (id, orgId) => ApiKeyModel.findByIdForAudit(id, orgId),
+  },
+  "/api/api-keys/:id": {
+    resourceType: "apiKey",
+    fetchById: (id, orgId) => ApiKeyModel.findByIdForAudit(id, orgId),
+  },
+
+  // Service Accounts
+  "/api/service-accounts": {
+    resourceType: "serviceAccount",
+    fetchById: (id, orgId) => ServiceAccountModel.findByIdForAudit(id, orgId),
+  },
+  "/api/service-accounts/:id": {
+    resourceType: "serviceAccount",
+    fetchById: (id, orgId) => ServiceAccountModel.findByIdForAudit(id, orgId),
+  },
+  // Issuing/revoking a token mutates the account's credential surface; the
+  // account survives, so pin serviceAccount.updated (not the derived
+  // serviceAccount.created for the POST or serviceAccount.deleted for the
+  // per-token DELETE).
+  "/api/service-accounts/:id/tokens": {
+    resourceType: "serviceAccount",
+    resourceIdParam: "id",
+    action: "serviceAccount.updated",
+    fetchById: (id, orgId) => ServiceAccountModel.findByIdForAudit(id, orgId),
+  },
+  "/api/service-accounts/:id/tokens/:tokenId": {
+    resourceType: "serviceAccount",
+    resourceIdParam: "id",
+    action: "serviceAccount.updated",
+    fetchById: (id, orgId) => ServiceAccountModel.findByIdForAudit(id, orgId),
+  },
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  // Trust policies for workload identity federation. `:id` is the account,
+  // so both entries name `credentialId`: the POST, which has none in its
+  // path, then takes the new credential's id from the response body.
+  "/api/service-accounts/:id/federated-credentials": {
+    resourceType: "serviceAccountFederatedCredential",
+    resourceIdParam: "credentialId",
+    fetchById: (id, orgId) =>
+      ServiceAccountFederatedCredentialModel.findByIdForAudit(id, orgId),
+  },
+  "/api/service-accounts/:id/federated-credentials/:credentialId": {
+    resourceType: "serviceAccountFederatedCredential",
+    resourceIdParam: "credentialId",
+    fetchById: (id, orgId) =>
+      ServiceAccountFederatedCredentialModel.findByIdForAudit(id, orgId),
+  },
+  // SPDX-SnippetEnd
+
+  // LLM Provider API Keys (REDACTED — secretId and key material excluded)
+  "/api/llm-provider-api-keys": {
+    resourceType: "llmProviderApiKey",
+    fetchById: (id, orgId) =>
+      LlmProviderApiKeyModel.findByIdForAudit(id, orgId),
+  },
+  "/api/llm-provider-api-keys/:id": {
+    resourceType: "llmProviderApiKey",
+    fetchById: (id, orgId) =>
+      LlmProviderApiKeyModel.findByIdForAudit(id, orgId),
+  },
+
+  "/api/llm-provider-api-keys/:id/reconnect": {
+    resourceType: "llmProviderApiKey",
+    resourceIdParam: "id",
+    action: "llmProviderApiKey.updated",
+    fetchById: (id, orgId) =>
+      LlmProviderApiKeyModel.findByIdForAudit(id, orgId),
+  },
+
+  // Knowledge Bases
+  "/api/knowledge-bases": {
+    resourceType: "knowledgeBase",
+    fetchById: (id, orgId) => KnowledgeBaseModel.findByIdForAudit(id, orgId),
+  },
+  "/api/knowledge-bases/:id": {
+    resourceType: "knowledgeBase",
+    fetchById: (id, orgId) => KnowledgeBaseModel.findByIdForAudit(id, orgId),
+  },
+  // findIdentityForAudit, not findByIdForAudit: the full snapshot is
+  // notDeleted-filtered (deliberately, for delete records), so it cannot see
+  // the still-deleted "before" state of a restore. The identity read sees both
+  // states, capturing the deletedAt → null diff.
+  "/api/knowledge-bases/:id/restore": {
+    resourceType: "knowledgeBase",
+    action: "knowledgeBase.restored",
+    fetchById: (id, orgId) =>
+      KnowledgeBaseModel.findIdentityForAudit(id, orgId),
+  },
+  // Identity-only snapshot, same as the retention sweep's purge audit rows.
+  "/api/knowledge-bases/:id/permanent": {
+    resourceType: "knowledgeBase",
+    action: "knowledgeBase.purged",
+    fetchById: (id, orgId) =>
+      KnowledgeBaseModel.findIdentityForAudit(id, orgId),
+  },
+
+  "/api/knowledge-files/:fileId/content": {
+    resourceType: "knowledgeFile",
+    action: "knowledgeFile.content_upserted",
+    resourceIdParam: "fileId",
+    fetchById: (id, orgId) => KbFileModel.findByIdForAudit(id, orgId),
+  },
+  // Knowledge file repository
+  "/api/knowledge-files": {
+    resourceType: "knowledgeFile",
+    fetchById: (id, orgId) => KbFileModel.findByIdForAudit(id, orgId),
+  },
+  "/api/knowledge-files/:fileId": {
+    resourceType: "knowledgeFile",
+    resourceIdParam: "fileId",
+    fetchById: (id, orgId) => KbFileModel.findByIdForAudit(id, orgId),
+  },
+  // Copying a chat attachment into the repository creates a file like the
+  // plain upload does; registered explicitly so the POST isn't dropped as a
+  // walk-up to the collection route.
+  "/api/knowledge-files/from-attachment": {
+    resourceType: "knowledgeFile",
+    action: "knowledgeFile.created",
+    fetchById: (id, orgId) => KbFileModel.findByIdForAudit(id, orgId),
+  },
+  // Indexing rewrites a knowledge base's contents (and can create the base);
+  // the handler supplies the resource id and post-state itself because the
+  // response carries `knowledgeBaseId`, not `id`, and the result spans many
+  // files.
+  "/api/knowledge-files/index": {
+    resourceType: "knowledgeBase",
+    action: "knowledgeBase.updated",
+  },
+  "/api/knowledge-directories": {
+    resourceType: "knowledgeDirectory",
+    fetchById: (id, orgId) => KbDirectoryModel.findByIdForAudit(id, orgId),
+  },
+  "/api/knowledge-directories/:directoryId": {
+    resourceType: "knowledgeDirectory",
+    resourceIdParam: "directoryId",
+    fetchById: (id, orgId) => KbDirectoryModel.findByIdForAudit(id, orgId),
+  },
+
+  // Connectors
+  "/api/connectors": {
+    resourceType: "connector",
+    fetchById: (id, orgId) =>
+      KnowledgeBaseConnectorModel.findByIdForAudit(id, orgId),
+  },
+  "/api/connectors/:id": {
+    resourceType: "connector",
+    fetchById: (id, orgId) =>
+      KnowledgeBaseConnectorModel.findByIdForAudit(id, orgId),
+  },
+  // findIdentityForAudit for the same reason as the knowledge-base restore
+  // entry: the full snapshot cannot see the still-deleted "before" state.
+  "/api/connectors/:id/restore": {
+    resourceType: "connector",
+    action: "connector.restored",
+    fetchById: (id, orgId) =>
+      KnowledgeBaseConnectorModel.findIdentityForAudit(id, orgId),
+  },
+  // Identity-only snapshot, same as the retention sweep's purge audit rows.
+  "/api/connectors/:id/permanent": {
+    resourceType: "connector",
+    action: "connector.purged",
+    fetchById: (id, orgId) =>
+      KnowledgeBaseConnectorModel.findIdentityForAudit(id, orgId),
+  },
+  // Member overrides change who a connector's grants resolve to. Explicit
+  // entries pin both mutations to connector.updated — a walk-up to
+  // /api/connectors/:id would otherwise log the mapping DELETE as
+  // connector.deleted.
+  "/api/connectors/:id/member-overrides": {
+    resourceType: "connector",
+    action: "connector.updated",
+    fetchById: (id, orgId) =>
+      KnowledgeBaseConnectorModel.findByIdForAudit(id, orgId),
+  },
+  "/api/connectors/:id/member-overrides/:externalAccountId": {
+    resourceType: "connector",
+    action: "connector.updated",
+    fetchById: (id, orgId) =>
+      KnowledgeBaseConnectorModel.findByIdForAudit(id, orgId),
+  },
+  // Recomputes who can read every document the connector has ingested, so the
+  // operator who forced the pass is an audit-relevant fact. Registered
+  // explicitly: a POST resolved by walk-up is dropped, and the parent's
+  // create semantics would be wrong anyway — nothing is created.
+  "/api/connectors/:id/permission-sync": {
+    resourceType: "connector",
+    action: "connector.permission_sync_triggered",
+    fetchById: (id, orgId) =>
+      KnowledgeBaseConnectorModel.findByIdForAudit(id, orgId),
+  },
+
+  // GitHub App configs
+  "/api/github-app-configs": {
+    resourceType: "credential",
+    fetchById: (id, orgId) => GithubAppConfigModel.findByIdForAudit(id, orgId),
+  },
+  "/api/github-app-configs/:id": {
+    resourceType: "credential",
+    fetchById: (id, orgId) => GithubAppConfigModel.findByIdForAudit(id, orgId),
+  },
+
+  // GitLab access tokens, stored as organization credentials
+  "/api/git-credentials/gitlab": {
+    resourceType: "credential",
+    fetchById: (id, orgId) =>
+      RuntimeCredentialDefinitionModel.findByIdForAudit(id, orgId),
+  },
+  // Blob providers (organization object storage destinations)
+  "/api/blob-providers": {
+    resourceType: "blobProvider",
+    fetchById: (id, orgId) => BlobProviderModel.findByIdForAudit(id, orgId),
+  },
+  "/api/blob-providers/:id": {
+    resourceType: "blobProvider",
+    fetchById: (id, orgId) => BlobProviderModel.findByIdForAudit(id, orgId),
+  },
+  "/api/blob-providers/:id/test": {
+    resourceType: "blobProvider",
+    action: "blobProvider.tested",
+    fetchById: (id, orgId) => BlobProviderModel.findByIdForAudit(id, orgId),
+  },
+  // Scheduled cost exports
+  "/api/cost-exports": {
+    resourceType: "costExport",
+    fetchById: (id, orgId) => CostExportModel.findByIdForAudit(id, orgId),
+  },
+  "/api/cost-exports/:id": {
+    resourceType: "costExport",
+    fetchById: (id, orgId) => CostExportModel.findByIdForAudit(id, orgId),
+  },
+  // A run moves the watermark and last-run fields, so before/after shows it.
+  "/api/cost-exports/:id/run": {
+    resourceType: "costExport",
+    action: "costExport.run",
+    fetchById: (id, orgId) => CostExportModel.findByIdForAudit(id, orgId),
+  },
+  // Stored GitHub personal access tokens
+  "/api/github-pats": {
+    resourceType: "credential",
+    fetchById: (id, orgId) => GithubPatModel.findByIdForAudit(id, orgId),
+  },
+  "/api/github-pats/:id": {
+    resourceType: "credential",
+    fetchById: (id, orgId) => GithubPatModel.findByIdForAudit(id, orgId),
+  },
+
+  // Limits
+  "/api/limits": {
+    resourceType: "limit",
+    fetchById: (id, orgId) => LimitModel.findByIdForAudit(id, orgId),
+  },
+  "/api/limits/:id": {
+    resourceType: "limit",
+    fetchById: (id, orgId) => LimitModel.findByIdForAudit(id, orgId),
+  },
+  // A reset changes only the window start, so before/after shows lastCleanup
+  // moving.
+  "/api/limits/:id/reset": {
+    resourceType: "limit",
+    action: "limit.reset",
+    fetchById: (id, orgId) => LimitModel.findByIdForAudit(id, orgId),
+  },
+
+  // Default user limits (per-environment + org-wide)
+  "/api/default-user-limits": {
+    resourceType: "defaultUserLimit",
+    fetchById: (id, orgId) =>
+      EnvironmentDefaultUserLimitModel.findByIdForAudit(id, orgId),
+  },
+  "/api/default-user-limits/:id": {
+    resourceType: "defaultUserLimit",
+    fetchById: (id, orgId) =>
+      EnvironmentDefaultUserLimitModel.findByIdForAudit(id, orgId),
+  },
+  // An admin resetting one user's limit usage: the snapshot is the user's
+  // reset marker, so before/after shows when it moved.
+  "/api/default-user-limits/users/:userId/reset": {
+    resourceType: "userLimitUsage",
+    resourceIdParam: "userId",
+    action: "userLimitUsage.reset",
+    fetchById: (userId, orgId) =>
+      UserLimitUsageResetModel.findByUserIdForAudit(userId, orgId),
+  },
+
+  // Projects. Delete soft-deletes and restore is an oversight action on
+  // another member's project, so both need a trail. The pin and instructions
+  // children are denylisted in audit-log-hook.ts rather than registered: they
+  // would inherit project.updated/project.deleted by walk-up while changing
+  // nothing on the project row (a pin is per-user state; instructions are a
+  // file), producing empty diffs under the wrong action.
+  "/api/projects": {
+    resourceType: "project",
+    fetchById: (id, orgId) => ProjectModel.findByIdForAudit(id, orgId),
+  },
+  // Converting a chat into a project creates one; POST walk-ups are dropped, so
+  // it needs its own entry or the create goes unrecorded.
+  "/api/projects/from-conversation": {
+    resourceType: "project",
+    action: "project.created",
+    fetchById: (id, orgId) => ProjectModel.findByIdForAudit(id, orgId),
+  },
+  "/api/projects/:id": {
+    resourceType: "project",
+    fetchById: (id, orgId) => ProjectModel.findByIdForAudit(id, orgId),
+  },
+  "/api/projects/:id/restore": {
+    resourceType: "project",
+    action: "project.restored",
+    fetchById: (id, orgId) => ProjectModel.findByIdForAudit(id, orgId),
+  },
+  // Identity-only, like the other purges — see the agent entry above.
+  "/api/projects/:id/permanent": {
+    resourceType: "project",
+    action: "project.purged",
+    fetchById: (id, orgId) => ProjectModel.findIdentityForAudit(id, orgId),
+  },
+
+  // Skills
+  "/api/skills": {
+    resourceType: "skill",
+    fetchById: (id, orgId) => SkillModel.findByIdForAudit(id, orgId),
+  },
+  "/api/skills/:id": {
+    resourceType: "skill",
+    fetchById: (id, orgId) => SkillModel.findByIdForAudit(id, orgId),
+  },
+  // Bulk delete acts on a list of skills from the request body, so there is
+  // no single resourceId and `fetchById` (which sees route params only) cannot
+  // represent the batch. The handler sets `auditBefore` and `auditAfter`
+  // itself — see buildBulkSkillAuditSnapshot in routes/skill/skill.routes.ts.
+  "/api/skills/bulk-delete": {
+    resourceType: "skill",
+    action: "skill.bulk_deleted",
+    resourceIdSource: "organizationContext",
+  },
+  // Restore is a POST carrying :id; register it directly so the hook captures
+  // the target id and the before/after (deletedAt) snapshots. findByIdForAudit
+  // returns soft-deleted rows, so the "before" is the still-deleted skill.
+  "/api/skills/:id/restore": {
+    resourceType: "skill",
+    action: "skill.restored",
+    fetchById: (id, orgId) => SkillModel.findByIdForAudit(id, orgId),
+  },
+  // Identity-only, like the other purges — see the agent entry above.
+  "/api/skills/:id/permanent": {
+    resourceType: "skill",
+    action: "skill.purged",
+    fetchById: (id, orgId) => SkillModel.findIdentityForAudit(id, orgId),
+  },
+  // Reset is a POST carrying :id, so the hook suppresses the parent walk-up.
+  // Register it directly to capture the target id and before/after snapshots of
+  // this destructive overwrite.
+  "/api/skills/:id/reset": {
+    resourceType: "skill",
+    action: "skill.updated",
+    fetchById: (id, orgId) => SkillModel.findByIdForAudit(id, orgId),
+  },
+  // Enabling skill slash commands patches the org record — audit as org-level change.
+  "/api/skills/enable-defaults": {
+    resourceType: "organization",
+    action: "organization.updated",
+    resourceIdSource: "organizationContext",
+    fetchById: (id, _orgId) => OrganizationModel.findByIdForAudit(id, _orgId),
+  },
+  "/api/guardrails-deployment": {
+    resourceType: "organization",
+    action: "organization.updated",
+    resourceIdSource: "organizationContext",
+    fetchById: () => GuardrailsDeploymentModel.findByIdForAudit(),
+  },
+  "/api/openappa/github-sync": {
+    resourceType: "organization",
+    action: "organization.updated",
+    resourceIdSource: "organizationContext",
+    fetchById: (id, orgId) =>
+      OpenAppaGithubSyncModel.findByIdForAudit(id, orgId),
+  },
+  "/api/openappa/github-sync/repository": {
+    resourceType: "organization",
+    action: "organization.updated",
+    resourceIdSource: "organizationContext",
+    fetchById: (id, orgId) =>
+      OpenAppaGithubSyncModel.findByIdForAudit(id, orgId),
+  },
+  // Creating and installing the App only touch GitHub and a short-lived setup
+  // record; the stored credential is audited when installation completes.
+  "/api/openappa/github-app/manifest": {
+    resourceType: "credential",
+    action: "credential.created",
+  },
+  "/api/openappa/github-app/manifest/complete": {
+    resourceType: "credential",
+    action: "credential.created",
+  },
+  "/api/openappa/github-app/install": {
+    resourceType: "credential",
+    action: "credential.created",
+    fetchById: (id, orgId) =>
+      RuntimeCredentialDefinitionModel.findByIdForAudit(id, orgId),
+  },
+  // GitHub Copilot enterprise plans: only the stored plan key is audited.
+  // The manifest, return, check and validate steps touch GitHub and a
+  // short-lived setup record; their routes skip the audit.
+  "/api/github-copilot-app/manifest": {
+    resourceType: "llmProviderApiKey",
+    action: "llmProviderApiKey.created",
+  },
+  "/api/github-copilot-app/manifest/complete": {
+    resourceType: "llmProviderApiKey",
+    action: "llmProviderApiKey.created",
+  },
+  "/api/github-copilot-app/pending": {
+    resourceType: "llmProviderApiKey",
+    action: "llmProviderApiKey.deleted",
+  },
+  "/api/github-copilot-app/organization/check": {
+    resourceType: "llmProviderApiKey",
+    action: "llmProviderApiKey.created",
+  },
+  "/api/github-copilot-app/existing/validate": {
+    resourceType: "llmProviderApiKey",
+    action: "llmProviderApiKey.created",
+  },
+  // These store the plan key.
+  "/api/github-copilot-app/install": {
+    resourceType: "llmProviderApiKey",
+    action: "llmProviderApiKey.created",
+    fetchById: (id, orgId) =>
+      LlmProviderApiKeyModel.findByIdForAudit(id, orgId),
+  },
+  "/api/github-copilot-app/existing": {
+    resourceType: "llmProviderApiKey",
+    action: "llmProviderApiKey.created",
+    fetchById: (id, orgId) =>
+      LlmProviderApiKeyModel.findByIdForAudit(id, orgId),
+  },
+  "/api/github-copilot-app/credential": {
+    resourceType: "llmProviderApiKey",
+    action: "llmProviderApiKey.created",
+    fetchById: (id, orgId) =>
+      LlmProviderApiKeyModel.findByIdForAudit(id, orgId),
+  },
+  "/api/openappa/battery-installs": {
+    resourceType: "openappaBatteryInstall",
+    fetchById: (id, orgId) =>
+      OpenAppaBatteryInstallModel.findByIdForAudit(id, orgId),
+  },
+  // Removing an include is an edit of the policy text, recorded as one.
+  "/api/openappa/battery-includes/:name": {
+    resourceType: "guardrailsPolicy",
+    action: "guardrailsPolicy.updated",
+    resourceIdSource: "organizationContext",
+    fetchById: (id, orgId) => GuardrailsPolicyModel.findByIdForAudit(id, orgId),
+  },
+  // Uploads are named, deletes are by the bytes: a name has as many stored
+  // versions as it has been uploaded, and only the hash says which one.
+  "/api/openappa/battery-packages/:name": {
+    resourceType: "openappaBatteryPackage",
+    resourceIdParam: "name",
+    actionByMethod: { PUT: "openappaBatteryPackage.updated" },
+    fetchById: (name, orgId) =>
+      OpenAppaBatteryPackageModel.findNewestByNameForAudit(name, orgId),
+  },
+  "/api/openappa/credential-bindings/:variable": {
+    resourceType: "openappaCredentialBinding",
+    resourceIdParam: "variable",
+    fetchById: (variable, orgId) =>
+      OpenAppaCredentialBindingModel.findByIdForAudit(variable, orgId),
+  },
+  "/api/openappa/battery-packages/:contentHash": {
+    resourceType: "openappaBatteryPackage",
+    resourceIdParam: "contentHash",
+    fetchById: (contentHash, orgId) =>
+      OpenAppaBatteryPackageModel.findByIdForAudit(contentHash, orgId),
+  },
+  // Bulk import creates multiple skills, so there is no single resourceId and
+  // fetchById can't represent the result. The route handler sets
+  // `request.auditAfter` with the created list; resourceId stays null.
+  "/api/skills/github/import": {
+    resourceType: "skill",
+    action: "skill.imported",
+  },
+
+  // Marketplace share links (bearer capabilities; snapshots are redacted)
+  "/api/skill-share-links": {
+    resourceType: "skillShareLink",
+    action: "skillShareLink.created",
+    fetchById: (id, orgId) => SkillShareLinkModel.findByIdForAudit(id, orgId),
+  },
+  "/api/skill-share-links/:id/rotate": {
+    resourceType: "skillShareLink",
+    action: "skillShareLink.rotated",
+    fetchById: (id, orgId) => SkillShareLinkModel.findByIdForAudit(id, orgId),
+  },
+  "/api/skill-share-links/:id": {
+    resourceType: "skillShareLink",
+    action: "skillShareLink.revoked",
+    fetchById: (id, orgId) => SkillShareLinkModel.findByIdForAudit(id, orgId),
+  },
+
+  // Plugins
+  "/api/plugins": {
+    resourceType: "plugin",
+    fetchById: (id, orgId) => PluginModel.findByIdForAudit(id, orgId),
+  },
+  "/api/plugins/:id": {
+    resourceType: "plugin",
+    fetchById: (id, orgId) => PluginModel.findByIdForAudit(id, orgId),
+  },
+  "/api/plugins/github/import": {
+    resourceType: "plugin",
+    action: "plugin.created",
+    fetchById: (id, orgId) => PluginModel.findByIdForAudit(id, orgId),
+  },
+  "/api/plugins/github/marketplace/import": {
+    resourceType: "plugin",
+    action: "plugin.created",
+  },
+  "/api/plugins/:id/github/apply-update": {
+    resourceType: "plugin",
+    action: "plugin.updated",
+    fetchById: (id, orgId) => PluginModel.findByIdForAudit(id, orgId),
+  },
+  "/api/plugins/:id/github/preview-update": {
+    resourceType: "plugin",
+    action: "plugin.updated",
+    fetchById: (id, orgId) => PluginModel.findByIdForAudit(id, orgId),
+  },
+  "/api/plugins/:id/github/sync": {
+    resourceType: "plugin",
+    action: "plugin.updated",
+    fetchById: (id, orgId) => PluginModel.findByIdForAudit(id, orgId),
+  },
+  "/api/plugins/:id/github/check": {
+    resourceType: "plugin",
+    action: "plugin.syncTriggered",
+  },
+
+  // Scheduled agent triggers (sub-routes resolve via `resolveAuditableRouteConfig`)
+  "/api/schedule-triggers": {
+    resourceType: "scheduleTrigger",
+    fetchById: (id, orgId) => ScheduleTriggerModel.findByIdForAudit(id, orgId),
+  },
+  "/api/schedule-triggers/:id": {
+    resourceType: "scheduleTrigger",
+    fetchById: (id, orgId) => ScheduleTriggerModel.findByIdForAudit(id, orgId),
+  },
+
+  // The latest notification is one organization settings slot, including inactive drafts.
+  "/api/site-notification": {
+    resourceType: "organization",
+    action: "organization.updated",
+    resourceIdSource: "organizationContext",
+    fetchById: async (_id, orgId) =>
+      (await SiteNotificationModel.getLatest(orgId)) ?? null,
+  },
+
+  // Organization (settings, onboarding, knowledge admin actions, members)
+  "/api/organization": {
+    resourceType: "organization",
+    resourceIdSource: "organizationContext",
+    fetchById: (id, _orgId) => OrganizationModel.findByIdForAudit(id, _orgId),
+  },
+  "/api/organization/members/:userId/pending-signup": {
+    resourceType: "member",
+    resourceIdParam: "userId",
+    fetchById: (userId, orgId) =>
+      MemberModel.findByUserIdForAudit(userId, orgId),
+  },
+
+  // Deployment environments
+  "/api/environments": {
+    resourceType: "environment",
+    fetchById: (id, orgId) => EnvironmentModel.findByIdForAudit(id, orgId),
+  },
+  "/api/environments/:id": {
+    resourceType: "environment",
+    fetchById: (id, orgId) => EnvironmentModel.findByIdForAudit(id, orgId),
+  },
+  // Org-wide setting rather than one environment's row, so the audited
+  // resource is the organization and the snapshot is the whole defaults map.
+  "/api/environments/defaults": {
+    resourceType: "environment",
+    action: "environment.updated",
+    resourceIdSource: "organizationContext",
+    fetchById: (id, orgId) =>
+      EnvironmentResourceDefaultModel.findByIdForAudit(id, orgId),
+  },
+  "/api/user-tokens/me/rotate": {
+    resourceType: "userToken",
+    action: "userToken.rotated",
+    resourceIdSource: "currentUserPersonalToken",
+    fetchById: (id, orgId) => UserTokenModel.findByIdForAudit(id, orgId),
+  },
+
+  // The LLM Proxy (organization-scoped singleton; no id in the route)
+  "/api/llm-proxy": {
+    resourceType: "llmProxy",
+    resourceIdSource: "organizationContext",
+    fetchById: (orgId) => AgentModel.findOrgLlmProxyForAudit(orgId),
+  },
+
+  // LLM virtual keys & OAuth clients
+  "/api/model-pools": {
+    resourceType: "modelPool",
+    fetchById: (id, orgId) => ModelPoolModel.findByIdForAudit(id, orgId),
+  },
+  "/api/model-pools/:id": {
+    resourceType: "modelPool",
+    fetchById: (id, orgId) => ModelPoolModel.findByIdForAudit(id, orgId),
+  },
+  "/api/auto-routing/routers": {
+    resourceType: "autoRouter",
+    fetchById: (id, orgId) => AutoRouterModel.findByIdForAudit(id, orgId),
+  },
+  "/api/auto-routing/routers/:id": {
+    resourceType: "autoRouter",
+    fetchById: (id, orgId) => AutoRouterModel.findByIdForAudit(id, orgId),
+  },
+  "/api/llm-virtual-keys": {
+    resourceType: "virtualApiKey",
+    fetchById: (id, orgId) => VirtualApiKeyModel.findByIdForAudit(id, orgId),
+  },
+  "/api/llm-virtual-keys/:id": {
+    resourceType: "virtualApiKey",
+    fetchById: (id, orgId) => VirtualApiKeyModel.findByIdForAudit(id, orgId),
+  },
+
+  // Saved browser logins (admin "Sign out" on the Playwright server page)
+  "/api/browser-storage-states/:userId": {
+    resourceType: "browserStorageState",
+    resourceIdParam: "userId",
+    fetchById: (id, orgId) =>
+      BrowserStorageStateModel.findByIdForAudit(id, orgId),
+  },
+
+  "/api/oauth-clients": {
+    resourceType: "oauthClient",
+    fetchById: (id, orgId) =>
+      ManagedOauthClientModel.findByIdForAudit(id, orgId),
+  },
+  "/api/oauth-clients/:id": {
+    resourceType: "oauthClient",
+    fetchById: (id, orgId) =>
+      ManagedOauthClientModel.findByIdForAudit(id, orgId),
+  },
+  "/api/oauth-clients/:id/rotate-secret": {
+    resourceType: "oauthClient",
+    action: "oauthClient.rotated",
+    fetchById: (id, orgId) =>
+      ManagedOauthClientModel.findByIdForAudit(id, orgId),
+  },
+  "/api/llm-oauth-clients": {
+    resourceType: "oauthClient",
+    fetchById: (id, orgId) => LlmOauthClientModel.findByIdForAudit(id, orgId),
+  },
+  "/api/llm-oauth-clients/:id": {
+    resourceType: "oauthClient",
+    fetchById: (id, orgId) => LlmOauthClientModel.findByIdForAudit(id, orgId),
+  },
+
+  "/api/mcp-oauth-clients": {
+    resourceType: "oauthClient",
+    fetchById: (id, orgId) => McpOauthClientModel.findByIdForAudit(id, orgId),
+  },
+  "/api/mcp-oauth-clients/:id": {
+    resourceType: "oauthClient",
+    fetchById: (id, orgId) => McpOauthClientModel.findByIdForAudit(id, orgId),
+  },
+
+  // LLM model catalog (admin) — sync has distinct semantics from a generic update.
+  "/api/llm-models/sync": {
+    resourceType: "llmModel",
+    action: "llmModel.synced",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, _orgId) => ModelModel.snapshotModelCatalogForAudit(),
+  },
+  "/api/llm-models/:id": {
+    resourceType: "llmModel",
+    fetchById: (id, orgId) => ModelModel.findByIdForAudit(id, orgId),
+  },
+  // Before/after are the model's latest cost backfill, so the record shows the
+  // range and prices the recompute was started with.
+  "/api/llm-models/:id/cost-backfill": {
+    resourceType: "llmModel",
+    action: "llmModel.cost_backfill_started",
+    fetchById: (id, _orgId) => ModelCostBackfillModel.findLatestForAudit(id),
+  },
+
+  // Internal catalog
+  "/api/internal_mcp_catalog": {
+    resourceType: "internalMcpCatalog",
+    fetchById: (id, _orgId) =>
+      InternalMcpCatalogModel.findByIdForAudit(id, _orgId),
+  },
+  "/api/internal_mcp_catalog/:id": {
+    resourceType: "internalMcpCatalog",
+    fetchById: (id, orgId) =>
+      InternalMcpCatalogModel.findByIdForAudit(id, orgId),
+  },
+  "/api/internal_mcp_catalog/by-name/:name": {
+    resourceType: "internalMcpCatalog",
+    resourceIdParam: "name",
+    fetchById: (name, orgId) =>
+      InternalMcpCatalogModel.findByNameForAudit(name, orgId),
+  },
+
+  // ChatOps
+  "/api/chatops/bindings": {
+    resourceType: "chatOpsBinding",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, orgId) =>
+      ChatOpsChannelBindingModel.findBindingsFingerprintForOrganization(orgId),
+  },
+  "/api/chatops/bindings/assignment-plan": {
+    resourceType: "chatOpsBinding",
+    action: "chatOpsBinding.updated",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, orgId) =>
+      ChatOpsChannelBindingModel.findBindingsFingerprintForOrganization(orgId),
+  },
+  "/api/chatops/bindings/dm": {
+    resourceType: "chatOpsBinding",
+    fetchById: (id, orgId) =>
+      ChatOpsChannelBindingModel.findByIdForAudit(id, orgId),
+  },
+  "/api/chatops/bindings/:id": {
+    resourceType: "chatOpsBinding",
+    fetchById: (id, orgId) =>
+      ChatOpsChannelBindingModel.findByIdForAudit(id, orgId),
+  },
+  // The binding is the caller's own Telegram DM link, only known inside the
+  // handler — the unlink handler supplies the resource id and `before`.
+  "/api/chatops/telegram/link": {
+    resourceType: "chatOpsBinding",
+  },
+  "/api/chatops/config/ms-teams": {
+    resourceType: "chatOpsConfig",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, _orgId) =>
+      chatOpsConfigModel.getRedactedSnapshotForAudit(),
+  },
+  "/api/chatops/jira/config": {
+    resourceType: "chatOpsConfig",
+    action: "chatOpsConfig.updated",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, orgId) =>
+      chatOpsConfigModel.getJiraSnapshotForAudit(orgId),
+  },
+  "/api/chatops/jira/bots": {
+    resourceType: "chatOpsConfig",
+    action: "chatOpsConfig.updated",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, orgId) =>
+      chatOpsConfigModel.getJiraSnapshotForAudit(orgId),
+  },
+  "/api/chatops/jira/bots/:botId": {
+    resourceType: "chatOpsConfig",
+    action: "chatOpsConfig.updated",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, orgId) =>
+      chatOpsConfigModel.getJiraSnapshotForAudit(orgId),
+  },
+  "/api/chatops/jira/bots/:botId/bindings": {
+    resourceType: "chatOpsBinding",
+    action: "chatOpsBinding.updated",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, orgId) =>
+      ChatOpsChannelBindingModel.findBindingsFingerprintForOrganization(orgId),
+  },
+  // Which chatops Slack bot and channel the UI feedback overlay posts to.
+  "/api/dev-feedback/setup": {
+    resourceType: "chatOpsConfig",
+    resourceIdSource: "organizationContext",
+    fetchById: async (_id, _orgId) =>
+      (await DevFeedbackConfigModel.get()) ?? {},
+  },
+  "/api/chatops/config/slack": {
+    resourceType: "chatOpsConfig",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, _orgId) =>
+      chatOpsConfigModel.getRedactedSnapshotForAudit(),
+  },
+  "/api/chatops/config/slack/convert-app": {
+    resourceType: "chatOpsConfig",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, _orgId) =>
+      chatOpsConfigModel.getRedactedSnapshotForAudit(),
+  },
+  "/api/chatops/config/slack/apps/migrate": {
+    resourceType: "chatOpsConfig",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, _orgId) =>
+      chatOpsConfigModel.getRedactedSnapshotForAudit(),
+  },
+  "/api/chatops/config/slack/app-config-token": {
+    resourceType: "chatOpsConfig",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, _orgId) =>
+      chatOpsConfigModel.getRedactedSnapshotForAudit(),
+  },
+  "/api/chatops/config/slack/agents/:agentId/app": {
+    resourceType: "chatOpsConfig",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, _orgId) =>
+      chatOpsConfigModel.getRedactedSnapshotForAudit(),
+  },
+  "/api/chatops/config/slack/router/app": {
+    resourceType: "chatOpsConfig",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, _orgId) =>
+      chatOpsConfigModel.getRedactedSnapshotForAudit(),
+  },
+  // Joining a channel claims its binding for the bot's agent when unowned.
+  "/api/chatops/config/slack/agents/:agentId/channels/:channelId/join": {
+    resourceType: "chatOpsBinding",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, orgId) =>
+      ChatOpsChannelBindingModel.findBindingsFingerprintForOrganization(orgId),
+  },
+  // Joining records the channel's binding, with no agent when it is new.
+  "/api/chatops/config/slack/router/channels/:channelId/join": {
+    resourceType: "chatOpsBinding",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, orgId) =>
+      ChatOpsChannelBindingModel.findBindingsFingerprintForOrganization(orgId),
+  },
+  "/api/chatops/config/slack/agents/:agentId": {
+    resourceType: "chatOpsConfig",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, _orgId) =>
+      chatOpsConfigModel.getRedactedSnapshotForAudit(),
+  },
+  "/api/chatops/config/ngrok": {
+    resourceType: "chatOpsConfig",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, _orgId) =>
+      chatOpsConfigModel.getRedactedSnapshotForAudit(),
+  },
+  // Channel discovery refresh is semantically distinct from a generic binding update.
+  "/api/chatops/channel-discovery/refresh": {
+    resourceType: "chatOpsBinding",
+    action: "chatOpsBinding.refreshed",
+    resourceIdSource: "organizationContext",
+    fetchById: (_id, orgId) =>
+      ChatOpsChannelBindingModel.findBindingsFingerprintForOrganization(orgId),
+  },
+
+  // Agent tool bulk assignment (assignment counts)
+  "/api/agents/tools/bulk-assign": {
+    resourceType: "agentTool",
+    action: "agentTool.bulk_assigned",
+    resourceIdSource: "organizationContext",
+    fetchById: (id, _orgId) =>
+      AgentToolModel.countAssignmentsForOrganization(id),
+  },
+  // Deliberately no `fetchById`: the snapshot must be per-agent, and only the
+  // handler can derive it (the affected agents come from the request body,
+  // which fetchById never sees). Omitting it also leaves `auditBefore` unset by
+  // the preHandler, so the handler owns both sides. See
+  // buildBulkToolUpdateAuditSnapshot in routes/agent-tool.ts.
+  "/api/agents/tools/bulk-update": {
+    resourceType: "agentTool",
+    action: "agentTool.bulk_updated",
+    resourceIdSource: "organizationContext",
+  },
+
+  // Team membership & Team Sync group links live in join tables the team
+  // snapshot reflects; the parent team survives member/mapping removal, so pin
+  // team.updated on both the POST (add) and the per-child DELETE.
+  "/api/teams/:id/members": {
+    resourceType: "team",
+    action: "team.updated",
+    fetchById: (id, orgId) => TeamModel.findByIdForAudit(id, orgId),
+  },
+  "/api/teams/:id/members/:userId": {
+    resourceType: "team",
+    action: "team.updated",
+    fetchById: (id, orgId) => TeamModel.findByIdForAudit(id, orgId),
+  },
+  "/api/teams/:id/external-groups": {
+    resourceType: "team",
+    action: "team.updated",
+    fetchById: (id, orgId) => TeamModel.findByIdForAudit(id, orgId),
+  },
+  "/api/teams/:id/external-groups/:groupId": {
+    resourceType: "team",
+    action: "team.updated",
+    fetchById: (id, orgId) => TeamModel.findByIdForAudit(id, orgId),
+  },
+
+  // Refreshing an MCP server's tool surface mutates the server.
+  "/api/mcp_server/:id/reload-tools": {
+    resourceType: "mcpServer",
+    action: "mcpServer.updated",
+    fetchById: (id, orgId) => McpServerModel.findByIdForAudit(id, orgId),
+  },
+
+  // Internal catalog lifecycle actions (reinstall/refresh/approve/reset) — POSTs
+  // carrying :id, so register directly to avoid the parent walk-up being dropped.
+  "/api/internal_mcp_catalog/:id/reinstall": {
+    resourceType: "internalMcpCatalog",
+    action: "internalMcpCatalog.reinstalled",
+    fetchById: (id, orgId) =>
+      InternalMcpCatalogModel.findByIdForAudit(id, orgId),
+  },
+  // Catalog restore is a POST carrying :id — register directly (walk-up POSTs
+  // are dropped). One catalog-level summary record: the snapshot carries the
+  // install/tool counts affected, and `before`/`after` diff on deletedAt (plus
+  // the counts the cascade revives).
+  "/api/internal_mcp_catalog/:id/restore": {
+    resourceType: "internalMcpCatalog",
+    action: "internalMcpCatalog.restored",
+    fetchById: (id, orgId) =>
+      InternalMcpCatalogModel.findByIdForAudit(id, orgId),
+  },
+  "/api/internal_mcp_catalog/:id/refresh-image": {
+    resourceType: "internalMcpCatalog",
+    action: "internalMcpCatalog.updated",
+    fetchById: (id, orgId) =>
+      InternalMcpCatalogModel.findByIdForAudit(id, orgId),
+  },
+  "/api/internal_mcp_catalog/:id/approve": {
+    resourceType: "internalMcpCatalog",
+    action: "internalMcpCatalog.updated",
+    fetchById: (id, orgId) =>
+      InternalMcpCatalogModel.findByIdForAudit(id, orgId),
+  },
+  "/api/internal_mcp_catalog/:id/reset-deployment-yaml": {
+    resourceType: "internalMcpCatalog",
+    action: "internalMcpCatalog.updated",
+    fetchById: (id, orgId) =>
+      InternalMcpCatalogModel.findByIdForAudit(id, orgId),
+  },
+
+  // Connector sync/resync + KB-link and document child mutations; the connector
+  // survives, so the per-child DELETEs pin connector.updated (not .deleted).
+  "/api/connectors/:id/sync": {
+    resourceType: "connector",
+    action: "connector.synced",
+    fetchById: (id, orgId) =>
+      KnowledgeBaseConnectorModel.findByIdForAudit(id, orgId),
+  },
+  "/api/connectors/:id/runs/:runId/cancel": {
+    resourceType: "connector",
+    action: "connector.updated",
+    fetchById: (id, orgId) =>
+      KnowledgeBaseConnectorModel.findByIdForAudit(id, orgId),
+  },
+  "/api/connectors/:id/force-resync": {
+    resourceType: "connector",
+    action: "connector.updated",
+    fetchById: (id, orgId) =>
+      KnowledgeBaseConnectorModel.findByIdForAudit(id, orgId),
+  },
+  "/api/connectors/:id/knowledge-bases": {
+    resourceType: "connector",
+    action: "connector.updated",
+    fetchById: (id, orgId) =>
+      KnowledgeBaseConnectorModel.findByIdForAudit(id, orgId),
+  },
+  "/api/connectors/:id/knowledge-bases/:kbId": {
+    resourceType: "connector",
+    action: "connector.updated",
+    fetchById: (id, orgId) =>
+      KnowledgeBaseConnectorModel.findByIdForAudit(id, orgId),
+  },
+  // A batch of documents is still a mutation of the connector that owns them,
+  // exactly as the single-document delete is, so it keeps connector.updated
+  // and the connector's own snapshot rather than inventing a document-level
+  // resource type for rows that are never audited individually.
+  "/api/connectors/:id/documents/bulk": {
+    resourceType: "connector",
+    action: "connector.updated",
+    fetchById: (id, orgId) =>
+      KnowledgeBaseConnectorModel.findByIdForAudit(id, orgId),
+  },
+  "/api/connectors/:id/documents/:docId": {
+    resourceType: "connector",
+    action: "connector.updated",
+    fetchById: (id, orgId) =>
+      KnowledgeBaseConnectorModel.findByIdForAudit(id, orgId),
+  },
+
+  // Agent import (creates agents in bulk — no single resourceId, like skill
+  // import) and clone (creates one agent; its id comes from the response body,
+  // so resourceIdParam names a param the route lacks to skip the source :id).
+  "/api/agents/import": {
+    resourceType: "agent",
+    action: "agent.imported",
+  },
+  "/api/agents/:id/clone": {
+    resourceType: "agent",
+    action: "agent.created",
+    resourceIdParam: "clonedAgentId",
+    fetchById: (id, orgId) => AgentModel.findByIdForAudit(id, orgId),
+  },
+
+  // Org-scoped admin actions that mutate organization state.
+  "/api/organization/knowledge-settings/drop-embedding": {
+    resourceType: "organization",
+    action: "organization.updated",
+    resourceIdSource: "organizationContext",
+    fetchById: (id, _orgId) => OrganizationModel.findByIdForAudit(id, _orgId),
+  },
+  "/api/organization/complete-onboarding": {
+    resourceType: "organization",
+    action: "organization.updated",
+    resourceIdSource: "organizationContext",
+    fetchById: (id, _orgId) => OrganizationModel.findByIdForAudit(id, _orgId),
+  },
+
+  // Schedule-trigger enable/disable/run-now — POSTs carrying :id.
+  "/api/schedule-triggers/:id/enable": {
+    resourceType: "scheduleTrigger",
+    action: "scheduleTrigger.updated",
+    fetchById: (id, orgId) => ScheduleTriggerModel.findByIdForAudit(id, orgId),
+  },
+  "/api/schedule-triggers/:id/disable": {
+    resourceType: "scheduleTrigger",
+    action: "scheduleTrigger.updated",
+    fetchById: (id, orgId) => ScheduleTriggerModel.findByIdForAudit(id, orgId),
+  },
+  "/api/schedule-triggers/:id/run-now": {
+    resourceType: "scheduleTrigger",
+    action: "scheduleTrigger.triggered",
+    fetchById: (id, orgId) => ScheduleTriggerModel.findByIdForAudit(id, orgId),
+  },
+
+  // OAuth client secret rotation — security-critical.
+  "/api/llm-oauth-clients/:id/rotate-secret": {
+    resourceType: "oauthClient",
+    action: "oauthClient.rotated",
+    fetchById: (id, orgId) => LlmOauthClientModel.findByIdForAudit(id, orgId),
+  },
+  "/api/mcp-oauth-clients/:id/rotate-secret": {
+    resourceType: "oauthClient",
+    action: "oauthClient.rotated",
+    fetchById: (id, orgId) => McpOauthClientModel.findByIdForAudit(id, orgId),
+  },
+
+  // ===== Bulk routes =====
+  //
+  // `PATCH /api/<resource>/bulk` and `DELETE /api/<resource>/bulk` share one
+  // path, so they are told apart by `actionByMethod` rather than by `action`.
+  //
+  // Every one of them is registered explicitly, for two reasons. Walking up to
+  // the parent (`/api/agents`, say) would derive `agent.updated`/`agent.deleted`
+  // and lose the fact that a batch is what happened — the one thing an auditor
+  // reading a bulk delete most needs to see. And none of them can use
+  // `fetchById`: a batch has no single resource id, and the rows it touches are
+  // named by the request body, which the fetcher never sees. The handlers set
+  // `auditBefore`/`auditAfter` themselves, through `runBulk`'s `audit` option,
+  // so one record covers the whole batch on both sides.
+  "/api/agents/bulk": {
+    resourceType: "agent",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "agent.bulk_deleted" },
+  },
+  "/api/apps/bulk": {
+    resourceType: "app",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "app.bulk_deleted" },
+  },
+  "/api/projects/bulk": {
+    resourceType: "project",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "project.bulk_deleted" },
+  },
+  "/api/api-keys/bulk": {
+    resourceType: "apiKey",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "apiKey.bulk_deleted" },
+  },
+  "/api/service-accounts/bulk": {
+    resourceType: "serviceAccount",
+    resourceIdSource: "organizationContext",
+    actionByMethod: {
+      DELETE: "serviceAccount.bulk_deleted",
+      PATCH: "serviceAccount.bulk_updated",
+    },
+  },
+  "/api/environments/bulk": {
+    resourceType: "environment",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "environment.bulk_deleted" },
+  },
+  "/api/roles/bulk": {
+    resourceType: "role",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "role.bulk_deleted" },
+  },
+  "/api/agent-runs/bulk": {
+    resourceType: "agentRun",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "agentRun.bulk_deleted" },
+  },
+  "/api/agent-runs/bulk/workspace": {
+    resourceType: "agentRun",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "agentRun.bulk_files_deleted" },
+  },
+  "/api/agent-runs/bulk-cancel": {
+    resourceType: "agentRun",
+    resourceIdSource: "organizationContext",
+    action: "agentRun.bulk_canceled",
+  },
+  "/api/teams/bulk": {
+    resourceType: "team",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "team.bulk_deleted" },
+  },
+  "/api/members/bulk": {
+    resourceType: "member",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "member.bulk_deleted" },
+    onlyWhenChanged: true,
+  },
+  "/api/mcp_server/bulk": {
+    resourceType: "mcpServer",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "mcpServer.bulk_deleted" },
+  },
+  "/api/llm-virtual-keys/bulk": {
+    resourceType: "virtualApiKey",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "virtualApiKey.bulk_deleted" },
+  },
+  "/api/oauth-clients/bulk": {
+    resourceType: "oauthClient",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "oauthClient.bulk_deleted" },
+  },
+  "/api/llm-oauth-clients/bulk": {
+    resourceType: "oauthClient",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "oauthClient.bulk_deleted" },
+  },
+  "/api/llm-models/bulk": {
+    resourceType: "llmModel",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { PATCH: "llmModel.bulk_updated" },
+  },
+  "/api/limits/bulk": {
+    resourceType: "limit",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "limit.bulk_deleted" },
+  },
+  "/api/llm-provider-api-keys/bulk": {
+    resourceType: "llmProviderApiKey",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "llmProviderApiKey.bulk_deleted" },
+  },
+  "/api/knowledge-bases/bulk": {
+    resourceType: "knowledgeBase",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "knowledgeBase.bulk_deleted" },
+  },
+  "/api/connectors/bulk": {
+    resourceType: "connector",
+    resourceIdSource: "organizationContext",
+    actionByMethod: {
+      PATCH: "connector.bulk_updated",
+      DELETE: "connector.bulk_deleted",
+    },
+  },
+  "/api/knowledge-files/bulk": {
+    resourceType: "knowledgeFile",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "knowledgeFile.bulk_deleted" },
+  },
+  "/api/knowledge-directories/bulk": {
+    resourceType: "knowledgeDirectory",
+    resourceIdSource: "organizationContext",
+    actionByMethod: { DELETE: "knowledgeDirectory.bulk_deleted" },
+  },
+  "/api/sessions/bulk": {
+    resourceType: "auth",
+    resourceIdSource: "currentUser",
+    action: "auth.sessions_revoked",
+  },
+};
+
+/**
+ * Looks up the auditable route config, falling back to the longest registered
+ * prefix so `/api/mcp_server/:id/reinstall` inherits `/api/mcp_server/:id`,
+ * `/api/connectors/:id/knowledge-bases` inherits `/api/connectors/:id`, etc.
+ *
+ * Returns `{ cfg, viaWalkUp }` where `viaWalkUp` is true when the config was
+ * inherited from a parent segment.  The hook uses this to suppress POST
+ * walk-ups which would mis-attribute child-resource creations to the parent.
+ */
+export function resolveAuditableRouteConfig(
+  routePattern: string | undefined,
+): ResolvedAuditableRoute | undefined {
+  if (!routePattern) return undefined;
+  let p = routePattern;
+  let viaWalkUp = false;
+  for (;;) {
+    const cfg = AUDITABLE_ROUTES[p];
+    if (cfg) return { cfg, viaWalkUp };
+    const lastSlash = p.lastIndexOf("/");
+    if (lastSlash <= 0) return undefined;
+    p = p.slice(0, lastSlash);
+    viaWalkUp = true;
+  }
+}
+
+/**
+ * Extends `AUDITABLE_ROUTES` with EE-only entries (identity providers).
+ * Must be called once at server startup before requests begin, when the
+ * enterprise license is active.
+ */
+export async function initAuditRegistry(): Promise<void> {
+  if (!config.enterpriseFeatures.core) return;
+  // biome-ignore lint/style/noRestrictedImports: conditional EE import, never runs in OSS builds
+  const idpModule = await import("../models/identity-provider.ee");
+  const IdentityProviderModel = idpModule.default;
+  AUDITABLE_ROUTES["/api/identity-providers"] = {
+    resourceType: "identityProvider",
+    fetchById: (id, orgId) => IdentityProviderModel.findByIdForAudit(id, orgId),
+  };
+  AUDITABLE_ROUTES["/api/identity-providers/:id"] = {
+    resourceType: "identityProvider",
+    fetchById: (id, orgId) => IdentityProviderModel.findByIdForAudit(id, orgId),
+  };
+}

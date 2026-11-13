@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+    paths:
+      - ".github/**"
+      - "platform/**"
   # Allow manual triggering of the workflow
   workflow_dispatch:
 
@@ -11,92 +14,221 @@ on:
 # Each job will explicitly declare the permissions it needs
 permissions: {}
 
-concurrency:
-  group: on-commits-to-main-${{ github.ref }}
-  cancel-in-progress: false
+# Concurrency is handled per-job (below) rather than per-workflow so that a new
+# commit doesn't have to wait for the previous run to finish end-to-end:
+#   - builds for superseded commits are cancelled (safe: images are pushed
+#     per-sha and the newer commit contains the older one's changes)
+#   - deploys are NEVER cancelled mid-flight (killing `helm upgrade` leaves the
+#     release stuck in a pending-upgrade state); instead they queue, and GitHub
+#     keeps at most one pending job per group, cancelling older pending ones, so
+#     queued deploys collapse to the newest commit
 
 jobs:
   deploy-dev-platform-images:
     name: Build Platform Staging and MCP Server Base Images
-    uses: ./.github/workflows/deploy-dev-platform-images.yml
+    # A newer commit's build supersedes an in-flight one, so cancel it and let
+    # the build for the newest commit start immediately (it can also run while
+    # the previous commit's deploy is still in progress)
+    concurrency:
+      group: on-commits-to-main-build-${{ github.ref }}
+      cancel-in-progress: true
+    uses: $/.github/workflows/deploy-dev-platform-images.yml
     permissions:
       contents: read # Required to invoke the reusable image publishing workflow.
+      packages: write # Publish development images and build caches to GHCR.
       id-token: write # Required for Workload Identity Federation.
     with:
       version: ${{ github.sha }}
     secrets:
-      DEVELOPMENT_OAUTH_PROXY_RELEASER_GCP_SERVICE_ACCOUNT_NAME: ${{ secrets.DEVELOPMENT_OAUTH_PROXY_RELEASER_GCP_SERVICE_ACCOUNT_NAME }}
-      DEVELOPMENT_OAUTH_PROXY_RELEASER_GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER: ${{ secrets.DEVELOPMENT_OAUTH_PROXY_RELEASER_GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER }}
+      DEVELOPMENT_GCP_DEPLOY_SERVICE_ACCOUNT_NAME: ${{ vars.DEVELOPMENT_GCP_DEPLOY_SERVICE_ACCOUNT_NAME }}
+      DEVELOPMENT_GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER: ${{ vars.DEVELOPMENT_GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER }}
+      # Passed by name so the staging-build environment can supply the value.
       PLATFORM_NEXTJS_SOURCE_MAP_SENTRY_AUTH_TOKEN: ${{ secrets.PLATFORM_NEXTJS_SOURCE_MAP_SENTRY_AUTH_TOKEN }}
-      TURBOREPO_REMOTE_CACHING_TOKEN: ${{ secrets.TURBOREPO_REMOTE_CACHING_TOKEN }}
-      TURBOREPO_REMOTE_CACHING_TEAM: ${{ secrets.TURBOREPO_REMOTE_CACHING_TEAM }}
 
   deploy-to-staging:
     name: Deploy to staging
-    runs-on: blacksmith-2vcpu-ubuntu-2404
     needs: [deploy-dev-platform-images]
+    # Do not cancel an in-flight Helm upgrade; pending runs collapse to the latest commit.
+    concurrency:
+      group: on-commits-to-main-deploy-${{ github.ref }}
+      cancel-in-progress: false
+    uses: $/.github/workflows/deploy-platform-environment.yml
     permissions:
-      contents: read # Required to checkout the repository and deploy the chart.
-      id-token: write # Required for Workload Identity Federation.
+      contents: read # Required by the reusable workflow to check out the chart.
+      id-token: write # Required for Google Workload Identity Federation.
+    with:
+      environment: staging
+      version: ${{ github.sha }}
+    secrets:
+      GCP_DEPLOY_SERVICE_ACCOUNT_NAME: ${{ vars.DEVELOPMENT_GCP_DEPLOY_SERVICE_ACCOUNT_NAME }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER: ${{ vars.DEVELOPMENT_GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER }}
+
+  deploy-to-demo:
+    name: Deploy demo instance
+    needs: [deploy-dev-platform-images]
+    concurrency:
+      group: on-commits-to-main-demo-${{ github.ref }}
+      cancel-in-progress: false
+    uses: $/.github/workflows/deploy-platform-environment.yml
+    permissions:
+      contents: read # Required by the reusable workflow to check out the chart.
+      id-token: write # Required for Google Workload Identity Federation.
+    with:
+      environment: demo
+      version: ${{ github.sha }}
+    secrets:
+      GCP_DEPLOY_SERVICE_ACCOUNT_NAME: ${{ vars.DEVELOPMENT_GCP_DEPLOY_SERVICE_ACCOUNT_NAME }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER: ${{ vars.DEVELOPMENT_GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER }}
+
+  # Publishes an exact-source cache of backend NAPI binaries on main so fresh
+  # PR and merge-group runs can skip the much larger Cargo target restore.
+  # On a miss, the existing Cargo cache and build remain the fallback.
+  # See backend-test-dependencies in on-pull-requests.yml for the consumer.
+  warm-backend-build-cache:
+    name: Warm Backend Build Cache
+    runs-on: ubuntu-24.04-8core
+    timeout-minutes: 20
+    concurrency:
+      group: on-commits-to-main-warm-backend-cache
+      # Finish publishing the cache; newer pending commits collapse to the latest.
+      cancel-in-progress: false
+    permissions:
+      contents: read # Check out sources for the exact-source declaration cache.
+      packages: write # Publish declarations to GHCR.
+    defaults:
+      run:
+        working-directory: ./platform
     steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Authenticate to Google Cloud
-        uses: ./.github/actions/google-auth
+      - name: Setup environment
+        uses: $/.github/actions/setup-env
         with:
-          service_account: ${{ secrets.DEVELOPMENT_OAUTH_PROXY_RELEASER_GCP_SERVICE_ACCOUNT_NAME }}
-          workload_identity_provider: ${{ secrets.DEVELOPMENT_OAUTH_PROXY_RELEASER_GCP_WORKLOAD_IDENTITY_PROVIDER_IDENTIFIER }}
+          working-directory: ./platform
 
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+      - name: Restore backend NAPI binaries
+        id: native-cache
+        uses: $/.github/actions/cache-backend-napi
 
-      - name: Install gke-gcloud-auth-plugin
+      # shared-key must stay identical to the backend preparation job's.
+      - name: Cache cargo registry and target on native cache miss
+        if: steps.native-cache.outputs.usable != 'true'
+        uses: $/.github/actions/setup-rust-build
+        with:
+          workspaces: platform/archestra-rs
+          shared-key: backend-unit-tests
+
+      # Retry pattern mirrors backend preparation (rustup race on cold builds).
+      - name: Build backend workspace dependencies
+        if: steps.native-cache.outputs.usable != 'true'
         run: |
-          gcloud components install gke-gcloud-auth-plugin
+          pnpm exec turbo build --filter="@backend^..." || {
+            echo "Build failed — syncing pinned Rust toolchain and retrying once..."
+            rustup show
+            pnpm exec turbo build --filter="@backend^..."
+          }
 
-      - name: Configure kubectl
-        run: |
-          gcloud container clusters get-credentials archestra-staging \
-            --zone us-central1-a \
-            --project friendly-path-465518-r6
+      # Walk the solution even when Turbo has cached a successful dependency
+      # check: the portable artifact also needs shared/linter declarations.
+      - name: Build portable backend declarations
+        run: pnpm --dir backend type-check
 
-      - name: Deploy to staging
+      - name: Pack portable backend declarations
+        run: node scripts/backend-types-prebuilt.mjs --pack "$RUNNER_TEMP/backend-types-cache"
+
+      # Forks and the private mirror cannot write the public org's packages.
+      - name: Log in to GHCR
+        if: github.repository == 'archestra-ai/archestra'
+        uses: $/.github/actions/docker-login
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Publish portable backend declarations
+        if: github.repository == 'archestra-ai/archestra'
         env:
-          PLATFORM_IMAGE_TAG: ${{ github.sha }}
-          ARCHESTRA_STAGING_DATABASE_URL: ${{ secrets.ARCHESTRA_STAGING_DATABASE_URL }}
-          ARCHESTRA_STAGING_METRICS_SECRET: ${{ secrets.ARCHESTRA_STAGING_METRICS_SECRET }}
-          ARCHESTRA_STAGING_OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.ARCHESTRA_STAGING_OTEL_EXPORTER_OTLP_ENDPOINT }}
-          ARCHESTRA_STAGING_AUTH_SECRET: ${{ secrets.ARCHESTRA_STAGING_AUTH_SECRET }}
-          ARCHESTRA_STAGING_AUTH_ADMIN_EMAIL: ${{ secrets.ARCHESTRA_STAGING_AUTH_ADMIN_EMAIL }}
-          ARCHESTRA_STAGING_AUTH_ADMIN_PASSWORD: ${{ secrets.ARCHESTRA_STAGING_AUTH_ADMIN_PASSWORD }}
-          ARCHESTRA_STAGING_SENTRY_BACKEND_DSN: ${{ secrets.ARCHESTRA_STAGING_SENTRY_BACKEND_DSN }}
-          ARCHESTRA_STAGING_SENTRY_FRONTEND_DSN: ${{ secrets.ARCHESTRA_STAGING_SENTRY_FRONTEND_DSN }}
-          ARCHESTRA_STAGING_OUTLOOK_TENANT_ID: ${{ secrets.ARCHESTRA_STAGING_OUTLOOK_TENANT_ID }}
-          ARCHESTRA_STAGING_OUTLOOK_CLIENT_ID: ${{ secrets.ARCHESTRA_STAGING_OUTLOOK_CLIENT_ID }}
-          ARCHESTRA_STAGING_OUTLOOK_CLIENT_SECRET: ${{ secrets.ARCHESTRA_STAGING_OUTLOOK_CLIENT_SECRET }}
-          ARCHESTRA_STAGING_CHAT_ANTHROPIC_API_KEY: ${{ secrets.ARCHESTRA_STAGING_CHAT_ANTHROPIC_API_KEY }}
+          REPOSITORY: ghcr.io/archestra-ai/ci/backend-types-cache
         run: |
-          helm upgrade archestra-platform \
-            ./platform/helm/archestra \
-            --install \
-            --namespace archestra \
-            --create-namespace \
-            --set "archestra.image=europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/platform:${PLATFORM_IMAGE_TAG}" \
-            --set "archestra.databaseUrl=${ARCHESTRA_STAGING_DATABASE_URL}" \
-            --set "archestra.env.ARCHESTRA_METRICS_SECRET=${ARCHESTRA_STAGING_METRICS_SECRET}" \
-            --set "archestra.env.ARCHESTRA_OTEL_EXPORTER_OTLP_ENDPOINT=${ARCHESTRA_STAGING_OTEL_EXPORTER_OTLP_ENDPOINT}" \
-            --set "archestra.env.ARCHESTRA_AUTH_SECRET=${ARCHESTRA_STAGING_AUTH_SECRET}" \
-            --set "archestra.env.ARCHESTRA_AUTH_ADMIN_EMAIL=${ARCHESTRA_STAGING_AUTH_ADMIN_EMAIL}" \
-            --set "archestra.env.ARCHESTRA_AUTH_ADMIN_PASSWORD=${ARCHESTRA_STAGING_AUTH_ADMIN_PASSWORD}" \
-            --set "archestra.env.ARCHESTRA_SENTRY_BACKEND_DSN=${ARCHESTRA_STAGING_SENTRY_BACKEND_DSN}" \
-            --set "archestra.env.ARCHESTRA_SENTRY_FRONTEND_DSN=${ARCHESTRA_STAGING_SENTRY_FRONTEND_DSN}" \
-            --set "archestra.env.ARCHESTRA_AGENTS_INCOMING_EMAIL_OUTLOOK_TENANT_ID=${ARCHESTRA_STAGING_OUTLOOK_TENANT_ID}" \
-            --set "archestra.env.ARCHESTRA_AGENTS_INCOMING_EMAIL_OUTLOOK_CLIENT_ID=${ARCHESTRA_STAGING_OUTLOOK_CLIENT_ID}" \
-            --set "archestra.env.ARCHESTRA_AGENTS_INCOMING_EMAIL_OUTLOOK_CLIENT_SECRET=${ARCHESTRA_STAGING_OUTLOOK_CLIENT_SECRET}" \
-            --set "archestra.env.ARCHESTRA_CHAT_ANTHROPIC_API_KEY=${ARCHESTRA_STAGING_CHAT_ANTHROPIC_API_KEY}" \
-            --values .github/values-staging.yaml \
-            --wait
+          key="$(node scripts/backend-types-prebuilt.mjs --key)"
+          docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --tag "$REPOSITORY:$key" --push --file - "$RUNNER_TEMP/backend-types-cache" <<'EOF'
+          FROM scratch
+          COPY backend-types.json /
+          EOF
+
+  # The only writer of the Turbo cache that Platform Lint and Unit Tests
+  # (on-pull-requests.yml) restores. Pull-request and merge-group runs never
+  # save it, so a cache hit there replays a result main produced. It runs the
+  # same Turbo check tasks on the same runner image, so task hashes match for
+  # every package a merge group leaves unchanged. Production builds are left
+  # out: their .next and dist outputs would make each entry hundreds of MB.
+  warm-turbo-cache:
+    name: Warm Turbo Cache
+    runs-on: ubuntu-24.04-16core
+    timeout-minutes: 20
+    concurrency:
+      group: on-commits-to-main-warm-turbo-cache
+      # Readers use the newest entry, so a newer commit supersedes this one.
+      cancel-in-progress: true
+    permissions:
+      contents: read # Check out sources and fetch the default branch.
+    defaults:
+      run:
+        working-directory: ./platform
+    env:
+      # Nothing is restored, so each entry holds only this commit's results.
+      TURBO_CACHE_DIR: ${{ github.workspace }}/platform/.turbo/cache
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Setup environment
+        uses: $/.github/actions/setup-env
+        with:
+          working-directory: ./platform
+
+      # The backend check:commit migration linter diffs against
+      # origin/<default branch>; see the same step in Platform Lint and Unit Tests.
+      - name: Fetch base ref for migration checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git -c credential.helper= \
+              -c credential.helper='!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' \
+              fetch --depth=1 origin \
+              "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+
+      - name: Restore Rust build cache
+        uses: $/.github/actions/setup-rust-build
+        with:
+          workspaces: platform/archestra-rs
+          shared-key: backend-unit-tests
+          save-if: "false"
+
+      # --continue lets the other tasks finish and be cached when one fails.
+      - name: Run Platform Lint and Unit Tests Turbo checks
+        run: |
+          status=0
+          pnpm exec turbo check:commit --filter=@backend --continue || status=$?
+          pnpm exec turbo check:ci --filter=!@backend --continue || status=$?
+          exit "$status"
+
+      # Turbo stores only successful tasks, so a partial run is safe to save.
+      - name: Save Turbo cache
+        if: ${{ !cancelled() }}
+        uses: $/.github/actions/turbo-cache
+        with:
+          name: platform-lint
+          mode: save

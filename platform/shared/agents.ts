@@ -1,4 +1,3 @@
-import { TOOL_SWAP_TO_DEFAULT_AGENT_FULL_NAME } from "./archestra-mcp-server";
 import { MCP_SERVER_TOOL_NAME_SEPARATOR } from "./consts";
 
 /**
@@ -7,6 +6,12 @@ import { MCP_SERVER_TOOL_NAME_SEPARATOR } from "./consts";
  * These are dynamically generated and are not Archestra MCP tools.
  */
 export const AGENT_TOOL_PREFIX = `agent${MCP_SERVER_TOOL_NAME_SEPARATOR}`;
+
+/**
+ * The delegation tool that runs a task in a fresh-context copy of the calling
+ * agent: same tools and instructions, none of the conversation.
+ */
+export const SELF_FORK_TOOL_NAME = `${AGENT_TOOL_PREFIX}self`;
 
 /** Maximum number of suggested prompts per agent */
 export const MAX_SUGGESTED_PROMPTS = 10;
@@ -24,15 +29,20 @@ export function isAgentTool(toolName: string): boolean {
   return toolName.startsWith(AGENT_TOOL_PREFIX);
 }
 
-export const SWAP_AGENT_POKE_TEXT =
-  "(Agent was swapped. Please continue the conversation.)";
-export const SWAP_AGENT_POKE_PREFIX = "(Switched to ";
-export const SWAP_AGENT_POKE_AGENT_NAME_SUFFIX =
-  ". Please continue the conversation.";
-export const SWAP_AGENT_FAILED_POKE_TEXT =
-  "(The agent swap failed — you are still the same agent. Briefly explain to the user that the switch did not happen and continue the conversation.)";
-export const SWAP_TO_DEFAULT_AGENT_POKE_TEXT =
-  "(Switched back to the default agent. Briefly explain why you switched back and continue the conversation.)";
+/**
+ * Prefix for skill delegation tools.
+ * Format: skill__<slugified_skill_name>
+ * One is synthesized per accessible skill whose SKILL.md declares an `agent`;
+ * calling it runs the skill (instructions + task) in that agent.
+ */
+export const SKILL_TOOL_PREFIX = `skill${MCP_SERVER_TOOL_NAME_SEPARATOR}`;
+
+/**
+ * Check if a tool name is a skill delegation tool (skill__<name>).
+ */
+export function isSkillTool(toolName: string): boolean {
+  return toolName.startsWith(SKILL_TOOL_PREFIX);
+}
 
 // Hop-by-hop (RFC 7230) and protocol-level headers that must not be forwarded
 export const BLOCKED_PASSTHROUGH_HEADERS = new Set([
@@ -50,8 +60,8 @@ export const BLOCKED_PASSTHROUGH_HEADERS = new Set([
 
 export const MAX_PASSTHROUGH_HEADERS = 20;
 
-export const HEADER_NAME_REGEX = /^[a-zA-Z0-9-]+$/;
+/** RFC 9110 `field-name` is an RFC 9110 `token`. */
+export const HEADER_NAME_REGEX = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
-export function makeSwapAgentPokeText(agentName: string): string {
-  return `${SWAP_AGENT_POKE_PREFIX}${agentName}${SWAP_AGENT_POKE_AGENT_NAME_SUFFIX} If you have the ${TOOL_SWAP_TO_DEFAULT_AGENT_FULL_NAME} tool and you don't have the right tools to fulfill the request, use it immediately — write a brief message explaining why you are switching back, then call ${TOOL_SWAP_TO_DEFAULT_AGENT_FULL_NAME}.)`;
-}
+export const HEADER_NAME_VALIDATION_MESSAGE =
+  "Header name contains invalid HTTP header characters";

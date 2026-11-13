@@ -4,9 +4,13 @@ import {
   createUpdateSchema,
 } from "drizzle-zod";
 import { z } from "zod";
-import { schema } from "@/database";
+import { schema } from "@/database/schema";
 
-export type TaskHandler = (payload: Record<string, unknown>) => Promise<void>;
+export type TaskHandlerContext = { taskId: string };
+export type TaskHandler = (
+  payload: Record<string, unknown>,
+  context: TaskHandlerContext,
+) => Promise<void>;
 
 export const TaskStatusSchema = z.enum([
   "pending",
@@ -19,10 +23,43 @@ export type TaskStatus = z.infer<typeof TaskStatusSchema>;
 export const TaskTypeSchema = z.enum([
   "connector_sync",
   "batch_embedding",
-  "process_uploaded_files",
+  "permission_sync",
   "check_due_connectors",
+  "check_due_permission_syncs",
   "check_due_schedule_triggers",
   "schedule_trigger_run_execute",
+  "audit_log_cleanup",
+  "headless_sandbox_cleanup",
+  "content_retention_cleanup",
+  "content_encryption_backfill",
+  "check_due_openappa_github_syncs",
+  "openappa_github_sync",
+  "openappa_policy_validation",
+  "check_due_skill_github_syncs",
+  "skill_github_sync",
+  "check_due_plugin_github_syncs",
+  "plugin_github_sync",
+  "skill_publication_backfill",
+  "interaction_session_preview_backfill",
+  "llm_usage_rollup",
+  "cost_export",
+  "cost_export_run",
+  "mcp_tool_description_backfill",
+  "tool_search_text_reconcile",
+  "interaction_user_activity_rebuild",
+  "p4_shim_reconcile",
+  "kb_bm25_stats_refresh",
+  "openappa_effective_policy_recompile",
+  "openappa_unenforced_cleanup",
+  "llm_model_sync",
+  "agent_run_attention_notice",
+  "auto_routing_dispatch",
+  "auto_routing_fit",
+  "auto_routing_backfill",
+  "check_due_model_cost_backfills",
+  "model_cost_backfill",
+  "jira_chatops_event",
+  "jira_chatops_poll",
 ]);
 export type TaskType = z.infer<typeof TaskTypeSchema>;
 
@@ -34,6 +71,70 @@ export type BatchEmbeddingPayload = {
   documentIds: string[];
   connectorRunId: string;
 };
+export type PermissionSyncPayload = {
+  connectorId: string;
+};
+export type SkillGithubSyncPayload = {
+  skillId: string;
+};
+export type PluginGithubSyncPayload = {
+  pluginId: string;
+  force?: boolean;
+};
+
+// ===== Queue lanes (runtime isolation) =====
+
+/**
+ * Execution lanes derived statically from task type (no `tasks` schema change).
+ * Each lane has its own dequeue filter and concurrency cap in the worker, so a
+ * saturated lane can neither consume another lane's slots nor head-of-line-block
+ * its dequeue. `permission_sync` runs wholly in its own lane, isolated from
+ * content ingestion and from live queries.
+ */
+export const TASK_LANES = {
+  content: ["connector_sync", "batch_embedding"],
+  permission: ["permission_sync"],
+  system: [
+    "check_due_connectors",
+    "check_due_permission_syncs",
+    "check_due_schedule_triggers",
+    "schedule_trigger_run_execute",
+    "audit_log_cleanup",
+    "headless_sandbox_cleanup",
+    "content_retention_cleanup",
+    "content_encryption_backfill",
+    "check_due_openappa_github_syncs",
+    "openappa_github_sync",
+    "openappa_policy_validation",
+    "check_due_skill_github_syncs",
+    "skill_github_sync",
+    "check_due_plugin_github_syncs",
+    "plugin_github_sync",
+    "skill_publication_backfill",
+    "interaction_session_preview_backfill",
+    "llm_usage_rollup",
+    "cost_export",
+    "cost_export_run",
+    "mcp_tool_description_backfill",
+    "tool_search_text_reconcile",
+    "interaction_user_activity_rebuild",
+    "p4_shim_reconcile",
+    "kb_bm25_stats_refresh",
+    "openappa_effective_policy_recompile",
+    "openappa_unenforced_cleanup",
+    "llm_model_sync",
+    "agent_run_attention_notice",
+    "auto_routing_dispatch",
+    "auto_routing_fit",
+    "auto_routing_backfill",
+    "check_due_model_cost_backfills",
+    "model_cost_backfill",
+    "jira_chatops_event",
+    "jira_chatops_poll",
+  ],
+} as const satisfies Record<string, TaskType[]>;
+
+export type TaskLane = keyof typeof TASK_LANES;
 
 export const SelectTaskSchema = createSelectSchema(schema.tasksTable, {
   taskType: TaskTypeSchema,

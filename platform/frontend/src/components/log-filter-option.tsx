@@ -1,30 +1,8 @@
 "use client";
 
-import type { archestraApiTypes, InteractionSource } from "@shared";
-import { AgentIcon } from "@/components/agent-icon";
+import type { ClientFamily, InteractionSource } from "@archestra/shared";
+import { ClientIcon } from "@/components/provider-icon";
 import { SourceLabel } from "@/components/source-badge";
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-
-type ProfileOption = archestraApiTypes.GetAllAgentsResponses["200"][number];
-
-export function ProfileFilterOption({
-  profile,
-}: {
-  profile: Pick<ProfileOption, "agentType" | "icon" | "name">;
-}) {
-  return (
-    <span className="flex items-center gap-2 min-w-0">
-      <AgentIcon
-        icon={profile.icon}
-        fallbackType={
-          profile.agentType === "profile" ? "agent" : profile.agentType
-        }
-        className="text-muted-foreground"
-      />
-      <span className="truncate">{profile.name}</span>
-    </span>
-  );
-}
 
 export function SourceFilterOption({ source }: { source: InteractionSource }) {
   return (
@@ -34,28 +12,15 @@ export function SourceFilterOption({ source }: { source: InteractionSource }) {
   );
 }
 
-export function UserFilterOption({ name }: { name: string }) {
+export function ClientFilterOption({
+  client,
+}: {
+  client: Pick<ClientFamily, "label" | "provider" | "icon" | "mark">;
+}) {
   return (
     <span className="flex items-center gap-2 min-w-0">
-      <Avatar className="h-5 w-5">
-        <AvatarFallback className="text-[10px]">
-          {getInitials(name)}
-        </AvatarFallback>
-      </Avatar>
-      <span className="truncate">{name}</span>
+      <ClientIcon client={client} size={16} />
+      <span className="truncate">{client.label}</span>
     </span>
   );
-}
-
-function getInitials(name: string) {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-
-  if (parts.length === 0) {
-    return "U";
-  }
-
-  return parts
-    .slice(0, 2)
-    .map((part) => part[0]?.toUpperCase() ?? "")
-    .join("");
 }

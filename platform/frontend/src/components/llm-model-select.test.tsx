@@ -1,6 +1,11 @@
+import {
+  OPENROUTER_AUTO_MODEL_ID,
+  OPENROUTER_FREE_MODEL_ID,
+} from "@archestra/shared";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useOrganization } from "@/lib/organization.query";
 import { LlmModelSearchableSelect } from "./llm-model-select";
 
 vi.mock("next/image", () => ({
@@ -8,6 +13,17 @@ vi.mock("next/image", () => ({
     <img alt={alt} src={src} />
   ),
 }));
+
+vi.mock("@/lib/organization.query");
+
+// The components under test resolve provider labels through
+// useModelProviderCatalog() -> useOrganization(); no organization data means
+// "no admin overrides", i.e. every provider visible under its built-in name.
+beforeEach(() => {
+  vi.mocked(useOrganization).mockReturnValue({
+    data: undefined,
+  } as unknown as ReturnType<typeof useOrganization>);
+});
 
 describe("LlmModelSearchableSelect", () => {
   it("can render fit-content dropdown content with full option labels", async () => {
@@ -47,5 +63,278 @@ describe("LlmModelSearchableSelect", () => {
       "break-words",
     );
     expect(screen.getByText(modelName)).not.toHaveClass("truncate");
+  });
+
+  it("renders a Free badge for zero-cost models", async () => {
+    const user = userEvent.setup();
+    render(
+      <LlmModelSearchableSelect
+        value=""
+        onValueChange={vi.fn()}
+        options={[
+          {
+            value: "free-1",
+            model: "free-model",
+            provider: "openrouter",
+            isFree: true,
+          },
+          { value: "paid-1", model: "paid-model", provider: "openai" },
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox"));
+    expect(screen.getByText("Free")).toBeInTheDocument();
+  });
+
+  it("filters to free models when 'Free only' is enabled", async () => {
+    const user = userEvent.setup();
+    render(
+      <LlmModelSearchableSelect
+        value=""
+        onValueChange={vi.fn()}
+        freeFilterable
+        options={[
+          {
+            value: "free-1",
+            model: "free-model",
+            provider: "openrouter",
+            isFree: true,
+          },
+          { value: "paid-1", model: "paid-model", provider: "openai" },
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox"));
+    expect(screen.getByText("paid-model")).toBeInTheDocument();
+    expect(screen.getByText("free-model")).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+    await user.click(screen.getByLabelText("Free models only"));
+    await user.click(screen.getByRole("combobox"));
+
+    expect(screen.queryByText("paid-model")).not.toBeInTheDocument();
+    expect(screen.getByText("free-model")).toBeInTheDocument();
+  });
+
+  it("renders the unified Free badge for the OpenRouter free router", async () => {
+    const user = userEvent.setup();
+    render(
+      <LlmModelSearchableSelect
+        value=""
+        onValueChange={vi.fn()}
+        options={[
+          {
+            value: OPENROUTER_FREE_MODEL_ID,
+            model: OPENROUTER_FREE_MODEL_ID,
+            provider: "openrouter",
+            isFree: true,
+          },
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox"));
+    expect(screen.getByText("Free")).toBeInTheDocument();
+  });
+
+  it("renders a Latest badge for OpenRouter ~latest aliases", async () => {
+    const user = userEvent.setup();
+    render(
+      <LlmModelSearchableSelect
+        value=""
+        onValueChange={vi.fn()}
+        options={[
+          {
+            value: "alias",
+            model: "~anthropic/claude-sonnet-latest",
+            provider: "openrouter",
+          },
+          {
+            value: "pinned",
+            model: "anthropic/claude-sonnet-4.6",
+            provider: "openrouter",
+          },
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox"));
+    expect(screen.getByText("Latest")).toBeInTheDocument();
+  });
+
+  it("renders model modalities, tool support, and context in option rows", async () => {
+    const user = userEvent.setup();
+    render(
+      <LlmModelSearchableSelect
+        value=""
+        onValueChange={vi.fn()}
+        options={[
+          {
+            value: "vision-model",
+            model: "Vision Model",
+            modelId: "vision-model-v1",
+            description: "vision-model-v1",
+            provider: "openai",
+            capabilities: {
+              contextLength: 128000,
+              inputModalities: ["text", "image"],
+              outputModalities: ["text"],
+              supportsToolCalling: true,
+              supportsReasoningEffort: null,
+              recommendedForAgents: true,
+              pricePerMillionInput: null,
+              pricePerMillionOutput: null,
+              isCustomPrice: false,
+              priceSource: "default",
+              pricePerMillionCacheRead: null,
+              pricePerMillionCacheWrite: null,
+              cachePriceSource: "default",
+              mediaPricing: null,
+            },
+          },
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox"));
+
+    expect(screen.getByLabelText("Supports text input")).toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Supports vision (images)"),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Supports tool calling")).toBeInTheDocument();
+    // Null is "nobody said", not "it reasons", so the glyph stays off.
+    expect(
+      screen.queryByLabelText("Supports reasoning"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText("128,000 token context window"),
+    ).toHaveTextContent("128K");
+    expect(screen.getAllByText("vision-model-v1")).toHaveLength(1);
+  });
+
+  it("marks a reasoning model in the option row", async () => {
+    const user = userEvent.setup();
+    render(
+      <LlmModelSearchableSelect
+        value=""
+        onValueChange={vi.fn()}
+        options={[
+          {
+            value: "reasoning-model",
+            model: "Reasoning Model",
+            modelId: "openai/gpt-oss-20b",
+            description: "openai/gpt-oss-20b",
+            provider: "openrouter",
+            capabilities: {
+              contextLength: 131000,
+              inputModalities: ["text"],
+              outputModalities: ["text"],
+              supportsToolCalling: true,
+              supportsReasoningEffort: true,
+              recommendedForAgents: true,
+              pricePerMillionInput: null,
+              pricePerMillionOutput: null,
+              isCustomPrice: false,
+              priceSource: "default",
+              pricePerMillionCacheRead: null,
+              pricePerMillionCacheWrite: null,
+              cachePriceSource: "default",
+              mediaPricing: null,
+            },
+          },
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox"));
+
+    expect(screen.getByLabelText("Supports reasoning")).toBeInTheDocument();
+  });
+
+  it("pins the routers to the top of the list", async () => {
+    const user = userEvent.setup();
+    render(
+      <LlmModelSearchableSelect
+        value=""
+        onValueChange={vi.fn()}
+        options={[
+          { value: "a", model: "aaa/model", provider: "openrouter" },
+          {
+            value: OPENROUTER_AUTO_MODEL_ID,
+            model: OPENROUTER_AUTO_MODEL_ID,
+            provider: "openrouter",
+          },
+          {
+            value: OPENROUTER_FREE_MODEL_ID,
+            model: OPENROUTER_FREE_MODEL_ID,
+            provider: "openrouter",
+            isFree: true,
+          },
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox"));
+    const free = screen.getByText(OPENROUTER_FREE_MODEL_ID);
+    const auto = screen.getByText(OPENROUTER_AUTO_MODEL_ID);
+    const other = screen.getByText("aaa/model");
+    // The free router precedes the auto router, which precedes everything else.
+    expect(
+      free.compareDocumentPosition(auto) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      auto.compareDocumentPosition(other) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("orders recommended models above the rest", async () => {
+    const user = userEvent.setup();
+    render(
+      <LlmModelSearchableSelect
+        value=""
+        onValueChange={vi.fn()}
+        options={[
+          { value: "z", model: "zzz/model", provider: "openrouter" },
+          {
+            value: "best",
+            model: "best/model",
+            provider: "openrouter",
+            isBest: true,
+          },
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox"));
+    const best = screen.getByText("best/model");
+    const rest = screen.getByText("zzz/model");
+    expect(
+      best.compareDocumentPosition(rest) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("detects the free router by modelId when the label is a display name", async () => {
+    const user = userEvent.setup();
+    render(
+      <LlmModelSearchableSelect
+        value=""
+        onValueChange={vi.fn()}
+        options={[
+          {
+            value: "models-table-uuid",
+            model: "Free Models Router",
+            modelId: OPENROUTER_FREE_MODEL_ID,
+            provider: "openrouter",
+            isFree: true,
+          },
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox"));
+    expect(screen.getByText("Free")).toBeInTheDocument();
   });
 });

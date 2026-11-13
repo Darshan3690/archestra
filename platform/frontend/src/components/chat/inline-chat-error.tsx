@@ -1,10 +1,13 @@
 "use client";
 
+import { ChatErrorCode } from "@archestra/shared";
 import {
   AlertCircle,
   ChevronDown,
   ChevronRight,
   Copy,
+  Gauge,
+  MessageSquareDashed,
   RefreshCw,
 } from "lucide-react";
 import { useState } from "react";
@@ -18,11 +21,15 @@ import {
 } from "@/components/ui/collapsible";
 import { useHasPermissions } from "@/lib/auth/auth.query";
 import type { ModelSource } from "@/lib/chat/use-chat-preferences";
+import { copyToClipboard } from "@/lib/clipboard";
+import { useAppName } from "@/lib/hooks/use-app-name";
 import {
   formatOriginalError,
+  getSimplifiedChatErrorMessage,
   mapClientError,
   parseErrorResponse,
 } from "./chat-error.utils";
+import { ProviderAuthRequiredCard } from "./provider-auth-required-card";
 
 interface InlineChatErrorProps {
   error: Error;
@@ -32,6 +39,13 @@ interface InlineChatErrorProps {
   agentName?: string;
   selectedModel?: string;
   modelSource?: ModelSource | null;
+  /** Re-run the original prompt after the user connects a per-user provider. */
+  onProviderConnected?: () => void;
+  /**
+   * When set and the error is retryable, render a "Try again" button that resends
+   * the last user turn and clears this error. Read-only viewers omit it.
+   */
+  onRetry?: () => void | Promise<void>;
 }
 
 export function InlineChatError({
@@ -42,12 +56,59 @@ export function InlineChatError({
   agentName,
   selectedModel,
   modelSource,
+  onProviderConnected,
+  onRetry,
 }: InlineChatErrorProps) {
   const [isDetailsOpen, setIsDetailsOpen] = useState(false);
+  const [isRetrying, setIsRetrying] = useState(false);
   const { data: isAdmin } = useHasPermissions({
     organizationSettings: ["read"],
   });
-  const chatError = parseErrorResponse(error) ?? mapClientError(error);
+  const appName = useAppName();
+  const chatError = parseErrorResponse(error) ?? mapClientError(error, appName);
+
+  const simplifiedMessage = getSimplifiedChatErrorMessage(chatError, appName);
+  const trimmedSupportMessage = supportMessage?.trim();
+
+  // A per-user provider the user hasn't linked yet → an inline "connect your
+  // account" card instead of a generic error.
+  if (
+    chatError.code === ChatErrorCode.ProviderAuthRequired &&
+    chatError.authAction
+  ) {
+    return (
+      <ProviderAuthRequiredCard
+        provider={chatError.authAction.provider}
+        providerLabel={chatError.authAction.providerLabel}
+        onConnected={onProviderConnected}
+      />
+    );
+  }
+
+  const isUsageLimitExceeded = chatError.usageLimitExceeded === true;
+  // An empty turn that survived the backend's auto-retries is the model's
+  // answer for this conversation, not a system failure — render it as a
+  // neutral outcome rather than a destructive error.
+  // A cut-short reply is shown next to the reply itself — same neutral tone.
+  const isModelTurnOutcome =
+    chatError.code === ChatErrorCode.EmptyResponse ||
+    chatError.code === ChatErrorCode.IncompleteResponse;
+  const isNeutralOutcome = isUsageLimitExceeded || isModelTurnOutcome;
+  const StatusIcon = isUsageLimitExceeded
+    ? Gauge
+    : isModelTurnOutcome
+      ? MessageSquareDashed
+      : AlertCircle;
+  // Padding is explicit: assistant MessageContent is flat/unpadded by default,
+  // but this renders as a bordered card and needs the inset back.
+  const containerClassName = isNeutralOutcome
+    ? "bg-muted/30 border border-border rounded-lg px-4 py-3"
+    : "bg-destructive/10 border border-destructive/20 rounded-lg px-4 py-3";
+  const iconClassName = isNeutralOutcome
+    ? "text-muted-foreground"
+    : "text-destructive";
+  const usageLimitMessage =
+    isUsageLimitExceeded && supportMessage ? chatError.message : undefined;
   // Conversation IDs double as chat session IDs for the end-user chat flow.
   const sessionId = chatError.sessionId ?? conversationId;
 
@@ -58,10 +119,15 @@ export function InlineChatError({
   if (chatError.spanId)
     refEntries.push({ label: "Span", value: chatError.spanId });
 
-  const copyDebugInfo = () => {
+  const copyDebugInfo = async () => {
     const lines: string[] = [];
 
-    lines.push(supportMessage?.trim() || chatError.message);
+    if (slimChatErrorUi) {
+      lines.push(simplifiedMessage);
+      if (trimmedSupportMessage) lines.push(trimmedSupportMessage);
+    } else {
+      lines.push(trimmedSupportMessage || chatError.message);
+    }
     if (!slimChatErrorUi) {
       if (agentName) lines.push(`Agent: ${agentName}`);
       if (selectedModel) lines.push(`Model: ${selectedModel}`);
@@ -81,22 +147,60 @@ export function InlineChatError({
       lines.push(`${entry.label}: ${entry.value}`);
     }
 
-    navigator.clipboard.writeText(lines.join("\n"));
-    toast.success(
-      slimChatErrorUi ? "Error details copied" : "Debug info copied",
-    );
+    try {
+      await copyToClipboard(lines.join("\n"));
+      toast.success(
+        slimChatErrorUi ? "Error details copied" : "Debug info copied",
+      );
+    } catch {
+      toast.error("Couldn't copy to clipboard");
+    }
   };
+
+  const retryButton =
+    chatError.isRetryable && onRetry ? (
+      <Button
+        variant="outline"
+        size="xs"
+        className="gap-1.5 self-start"
+        disabled={isRetrying}
+        onClick={() => {
+          setIsRetrying(true);
+          void (async () => {
+            try {
+              await onRetry();
+            } catch (error) {
+              console.error("[InlineChatError] Retry failed", error);
+            } finally {
+              setIsRetrying(false);
+            }
+          })();
+        }}
+      >
+        <RefreshCw
+          className={`h-3.5 w-3.5 ${isRetrying ? "animate-spin" : ""}`}
+        />
+        Try again
+      </Button>
+    ) : null;
 
   if (slimChatErrorUi) {
     return (
       <Message from="assistant">
-        <MessageContent className="bg-destructive/10 border border-destructive/20 rounded-lg">
-          <div className="flex items-start gap-2 text-destructive">
-            <AlertCircle className="h-4 w-4 mt-0.5 flex-shrink-0" />
-            <div className="flex-1 space-y-2">
-              <p className="text-sm text-foreground">
-                {supportMessage ? supportMessage : chatError.message}
-              </p>
+        <MessageContent
+          className={`${containerClassName} group-[.is-assistant]:[&_p]:my-0`}
+        >
+          <div className="flex items-start gap-2">
+            <StatusIcon
+              className={`h-4 w-4 mt-0.5 flex-shrink-0 ${iconClassName}`}
+            />
+            <div className="flex flex-1 flex-col gap-2">
+              <p className="text-sm text-foreground">{simplifiedMessage}</p>
+              {trimmedSupportMessage && (
+                <p className="text-xs text-muted-foreground">
+                  {trimmedSupportMessage}
+                </p>
+              )}
 
               <div className="flex items-center gap-1.5 flex-wrap">
                 {refEntries.map((entry) => (
@@ -119,6 +223,7 @@ export function InlineChatError({
                   <Copy className="h-3 w-3" />
                 </Button>
               </div>
+              {retryButton}
             </div>
           </div>
         </MessageContent>
@@ -128,10 +233,14 @@ export function InlineChatError({
 
   return (
     <Message from="assistant">
-      <MessageContent className="bg-destructive/10 border border-destructive/20 rounded-lg">
-        <div className="flex items-start gap-2 text-destructive">
-          <AlertCircle className="h-4 w-4 mt-0.5 flex-shrink-0" />
-          <div className="flex-1 space-y-2">
+      <MessageContent
+        className={`${containerClassName} group-[.is-assistant]:[&_p]:my-0`}
+      >
+        <div className="flex items-start gap-2">
+          <StatusIcon
+            className={`h-4 w-4 mt-0.5 flex-shrink-0 ${iconClassName}`}
+          />
+          <div className="flex flex-1 flex-col gap-2">
             {supportMessage ? (
               <p className="text-sm text-foreground">{supportMessage}</p>
             ) : (
@@ -181,6 +290,13 @@ export function InlineChatError({
                 <Copy className="h-3 w-3" />
               </Button>
             </div>
+            {usageLimitMessage && (
+              <p className="text-xs text-muted-foreground">
+                {usageLimitMessage}
+              </p>
+            )}
+
+            {retryButton}
 
             {isAdmin && (
               <Collapsible open={isDetailsOpen} onOpenChange={setIsDetailsOpen}>
@@ -195,7 +311,7 @@ export function InlineChatError({
                     ) : (
                       <ChevronRight className="h-3 w-3 mr-1" />
                     )}
-                    Error Details
+                    <span>Error Details</span>
                   </Button>
                 </CollapsibleTrigger>
                 <CollapsibleContent className="space-y-2 mt-1">
@@ -216,9 +332,19 @@ export function InlineChatError({
                     </p>
                   )}
                   {chatError.originalError && (
-                    <pre className="max-h-48 overflow-auto rounded-md bg-muted/50 p-3 text-xs font-mono whitespace-pre-wrap break-words text-foreground">
-                      {formatOriginalError(chatError.originalError)}
-                    </pre>
+                    <>
+                      {/* biome-ignore-start lint/a11y/noNoninteractiveTabindex: scrollable error detail must be keyboard focusable (WCAG 2.1.1) */}
+                      <section
+                        tabIndex={0}
+                        aria-label="Error details"
+                        className="max-h-48 overflow-auto rounded-md bg-muted/50"
+                      >
+                        {/* biome-ignore-end lint/a11y/noNoninteractiveTabindex: scrollable error detail must be keyboard focusable (WCAG 2.1.1) */}
+                        <pre className="p-3 text-xs font-mono whitespace-pre-wrap break-words text-foreground">
+                          {formatOriginalError(chatError.originalError)}
+                        </pre>
+                      </section>
+                    </>
                   )}
                 </CollapsibleContent>
               </Collapsible>
@@ -239,6 +365,6 @@ function formatModelSource(source: ModelSource | null | undefined): string {
     case "user":
       return "user override";
     default:
-      return "no model selected";
+      return "auto-selected (best available)";
   }
 }

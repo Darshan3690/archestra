@@ -1,25 +1,21 @@
 import { createEvent, fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useHasPermissions } from "@/lib/auth/auth.query";
 import { type TableRowAction, TableRowActions } from "./table-row-actions";
 
 // Mocking icons
 const MockIcon = () => <span data-testid="mock-icon">Icon</span>;
 
-// Mocking hooks
-const { useHasPermissionsMock, useMissingPermissionsMock } = vi.hoisted(() => ({
+// The PermissionButton mock below reads the same hook the component does, so a
+// single shared hoisted driver keeps both in lockstep; the bare auth.query mock
+// delegates the real hook to it in `beforeEach`.
+const { useHasPermissionsMock } = vi.hoisted(() => ({
   useHasPermissionsMock: vi.fn(() => ({ data: true })),
-  useMissingPermissionsMock: vi.fn(() => ({})),
 }));
 
-vi.mock("@/lib/auth/auth.query", () => ({
-  useHasPermissions: useHasPermissionsMock,
-  useMissingPermissions: useMissingPermissionsMock,
-}));
-
-vi.mock("@/lib/auth/auth.utils", () => ({
-  formatMissingPermissions: vi.fn(() => "Missing permissions"),
-}));
+vi.mock("@/lib/auth/auth.query");
 
 // Mocking UI components to simplify testing
 vi.mock("@/components/ui/button", () => ({
@@ -89,13 +85,17 @@ vi.mock("@/components/ui/dropdown-menu", () => ({
   DropdownMenuItem: ({
     children,
     onClick,
-    disabled,
     className,
+    variant: _variant,
+    asChild: _asChild,
+    ...props
   }: {
     children: React.ReactNode;
     onClick?: React.MouseEventHandler;
-    disabled?: boolean;
     className?: string;
+    variant?: string;
+    asChild?: boolean;
+    [key: string]: unknown;
   }) => (
     <div
       role="menuitem"
@@ -106,8 +106,8 @@ vi.mock("@/components/ui/dropdown-menu", () => ({
         }
       }}
       tabIndex={0}
-      data-disabled={disabled}
       className={className}
+      {...props}
     >
       {children}
     </div>
@@ -117,6 +117,9 @@ vi.mock("@/components/ui/dropdown-menu", () => ({
   ),
 }));
 
+// The real PermissionButton is exercised end to end in
+// table-row-actions.integration.test.tsx; this suite stands in for it so the
+// cases below stay about how TableRowActions arranges its rows.
 vi.mock("@/components/ui/permission-button", () => ({
   PermissionButton: ({
     children,
@@ -167,6 +170,9 @@ describe("TableRowActions", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(useHasPermissions).mockImplementation(
+      useHasPermissionsMock as unknown as typeof useHasPermissions,
+    );
     useHasPermissionsMock.mockReturnValue({ data: true });
   });
 
@@ -191,6 +197,33 @@ describe("TableRowActions", () => {
     );
 
     expect(screen.getByLabelText(/more actions/i)).toBeInTheDocument();
+  });
+
+  it("appends itemName to each action's accessible name so identical row buttons are distinguishable", () => {
+    render(
+      <TooltipProvider>
+        <TableRowActions
+          actions={primaryActions}
+          dropdownActions={dropdownActions}
+          itemName="My Agent"
+        />
+      </TooltipProvider>,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "Edit My Agent" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("More actions My Agent")).toBeInTheDocument();
+  });
+
+  it("keeps the bare action label as the accessible name when itemName is not provided", () => {
+    render(
+      <TooltipProvider>
+        <TableRowActions actions={primaryActions} />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
   });
 
   it("calls stopPropagation on primary action click", () => {
@@ -242,6 +275,55 @@ describe("TableRowActions", () => {
     ).toBeInTheDocument();
   });
 
+  it("explains an available dropdown action with its tooltip, and still fires it", async () => {
+    const user = userEvent.setup();
+    const onClick = vi.fn();
+
+    render(
+      <TooltipProvider>
+        <TableRowActions
+          actions={primaryActions}
+          dropdownActions={[
+            {
+              icon: <MockIcon />,
+              label: "Pin default",
+              tooltip: "Your new chats start on this agent.",
+              onClick,
+            },
+          ]}
+        />
+      </TooltipProvider>,
+    );
+
+    expect(
+      screen.getByText("Your new chats start on this agent."),
+    ).toBeInTheDocument();
+    // The tooltip must not cost the item its behaviour: an enabled item stays
+    // its own trigger rather than gaining a wrapper element.
+    await user.click(screen.getByRole("menuitem", { name: /pin default/i }));
+    expect(onClick).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves an action with no tooltip showing just its label", () => {
+    render(
+      <TooltipProvider>
+        <TableRowActions
+          actions={primaryActions}
+          dropdownActions={[
+            { icon: <MockIcon />, label: "Clone", onClick: vi.fn() },
+          ]}
+        />
+      </TooltipProvider>,
+    );
+
+    // The primary buttons and the "More actions" trigger have tooltips of
+    // their own; what must not exist is one for this item.
+    const tooltips = screen
+      .getAllByTestId("tooltip-content")
+      .map((node) => node.textContent);
+    expect(tooltips).not.toContain("Clone");
+  });
+
   it("disables primary action if permissions are missing", () => {
     useHasPermissionsMock.mockReturnValue({ data: false });
     const actionsWithPerms: TableRowAction[] = [
@@ -280,36 +362,13 @@ describe("TableRowActions", () => {
       </TooltipProvider>,
     );
 
+    // `aria-disabled`, not Radix's `disabled`: a disabled item leaves the
+    // menu's roving focus and typeahead, taking its stated reason with it.
     const item = screen.getByRole("menuitem", { name: /secure delete/i });
-    expect(item).toHaveAttribute("data-disabled", "true");
-  });
-
-  it("applies cursor-pointer to enabled dropdown items and cursor-not-allowed to disabled ones", () => {
-    const mixedActions: TableRowAction[] = [
-      {
-        icon: <MockIcon />,
-        label: "Enabled",
-        onClick: vi.fn(),
-      },
-      {
-        icon: <MockIcon />,
-        label: "Disabled",
-        disabled: true,
-        onClick: vi.fn(),
-      },
-    ];
-
-    render(
-      <TooltipProvider>
-        <TableRowActions actions={[]} dropdownActions={mixedActions} />
-      </TooltipProvider>,
+    expect(item).toHaveAttribute("aria-disabled", "true");
+    expect(item).toHaveAccessibleDescription(
+      "Missing permissions: Agents (delete)",
     );
-
-    const enabledItem = screen.getByRole("menuitem", { name: /enabled/i });
-    const disabledItem = screen.getByRole("menuitem", { name: /disabled/i });
-
-    expect(enabledItem).toHaveClass("cursor-pointer");
-    expect(disabledItem).toHaveClass("cursor-not-allowed");
   });
 
   it("prevents onClick if dropdown item is disabled", () => {

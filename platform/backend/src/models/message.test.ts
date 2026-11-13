@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import db, { schema } from "@/database";
 import { describe, expect, test } from "@/test";
 import ConversationModel from "./conversation";
@@ -13,14 +13,13 @@ describe("MessageModel", () => {
     }) => {
       const user = await makeUser();
       const org = await makeOrganization();
-      const agent = await makeAgent({ name: "Touch Test Agent", teams: [] });
+      const agent = await makeAgent({ name: "Touch Test Agent" });
 
       const conversation = await ConversationModel.create({
         userId: user.id,
         organizationId: org.id,
         agentId: agent.id,
         title: "Touch Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const originalUpdatedAt = conversation.updatedAt;
@@ -50,6 +49,43 @@ describe("MessageModel", () => {
     });
   });
 
+  describe("existsForConversation", () => {
+    test("reports emptiness without loading rows", async ({
+      makeUser,
+      makeOrganization,
+      makeAgent,
+    }) => {
+      const user = await makeUser();
+      const org = await makeOrganization();
+      const agent = await makeAgent({ name: "Exists Test Agent" });
+
+      const conversation = await ConversationModel.create({
+        userId: user.id,
+        organizationId: org.id,
+        agentId: agent.id,
+        title: "Exists Test",
+      });
+
+      expect(await MessageModel.existsForConversation(conversation.id)).toBe(
+        false,
+      );
+
+      await MessageModel.create({
+        conversationId: conversation.id,
+        role: "user",
+        content: {
+          id: "temp-id",
+          role: "user",
+          parts: [{ type: "text", text: "Hello" }],
+        },
+      });
+
+      expect(await MessageModel.existsForConversation(conversation.id)).toBe(
+        true,
+      );
+    });
+  });
+
   describe("bulkCreate", () => {
     test("updates conversation updatedAt when messages are bulk created", async ({
       makeUser,
@@ -60,7 +96,6 @@ describe("MessageModel", () => {
       const org = await makeOrganization();
       const agent = await makeAgent({
         name: "Bulk Touch Test Agent",
-        teams: [],
       });
 
       const conversation = await ConversationModel.create({
@@ -68,7 +103,6 @@ describe("MessageModel", () => {
         organizationId: org.id,
         agentId: agent.id,
         title: "Bulk Touch Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const originalUpdatedAt = conversation.updatedAt;
@@ -117,7 +151,6 @@ describe("MessageModel", () => {
       const org = await makeOrganization();
       const agent = await makeAgent({
         name: "Multi Conv Touch Agent",
-        teams: [],
       });
 
       const conversation1 = await ConversationModel.create({
@@ -125,7 +158,6 @@ describe("MessageModel", () => {
         organizationId: org.id,
         agentId: agent.id,
         title: "Conversation 1",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const conversation2 = await ConversationModel.create({
@@ -133,7 +165,6 @@ describe("MessageModel", () => {
         organizationId: org.id,
         agentId: agent.id,
         title: "Conversation 2",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const original1 = conversation1.updatedAt;
@@ -184,6 +215,82 @@ describe("MessageModel", () => {
     });
   });
 
+  describe("unpaired surrogates", () => {
+    // A completion cut mid-character (or a tool result truncated by whatever
+    // produced it) leaves half an astral character behind. Postgres jsonb is
+    // UTF-8, which has no encoding for a lone surrogate, so the insert fails
+    // with "invalid input syntax for type json" and the turn is lost entirely.
+    // Storing it with the broken half replaced beats not storing it at all.
+    const HIGH = "\uD83D";
+
+    test("stores a message whose text was cut mid-character", async ({
+      makeUser,
+      makeOrganization,
+      makeAgent,
+    }) => {
+      const user = await makeUser();
+      const org = await makeOrganization();
+      const agent = await makeAgent({ name: "Test Agent" });
+      const conversation = await ConversationModel.create({
+        userId: user.id,
+        organizationId: org.id,
+        agentId: agent.id,
+        title: "Test Conversation",
+      });
+
+      const message = await MessageModel.create({
+        conversationId: conversation.id,
+        role: "assistant",
+        content: {
+          id: "temp-id",
+          role: "assistant",
+          parts: [{ type: "text", text: `tabBtn('inc', '${HIGH}` }],
+        },
+      });
+
+      // The turn survives the round trip instead of vanishing...
+      const found = await MessageModel.findById(message.id);
+      expect(found).toBeDefined();
+      const text = JSON.stringify(found?.content);
+      // ...with the stranded half replaced rather than carried forward.
+      expect(text).not.toMatch(
+        /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/,
+      );
+      expect(text).toContain("tabBtn");
+    });
+
+    test("leaves an intact emoji untouched", async ({
+      makeUser,
+      makeOrganization,
+      makeAgent,
+    }) => {
+      const user = await makeUser();
+      const org = await makeOrganization();
+      const agent = await makeAgent({ name: "Test Agent" });
+      const conversation = await ConversationModel.create({
+        userId: user.id,
+        organizationId: org.id,
+        agentId: agent.id,
+        title: "Test Conversation",
+      });
+
+      const message = await MessageModel.create({
+        conversationId: conversation.id,
+        role: "assistant",
+        content: {
+          id: "temp-id",
+          role: "assistant",
+          parts: [{ type: "text", text: "shipped \u{1F4CE} done" }],
+        },
+      });
+
+      const found = await MessageModel.findById(message.id);
+      expect(JSON.stringify(found?.content)).toContain(
+        "shipped \u{1F4CE} done",
+      );
+    });
+  });
+
   describe("findById", () => {
     test("returns message by ID", async ({
       makeUser,
@@ -192,14 +299,13 @@ describe("MessageModel", () => {
     }) => {
       const user = await makeUser();
       const org = await makeOrganization();
-      const agent = await makeAgent({ name: "Test Agent", teams: [] });
+      const agent = await makeAgent({ name: "Test Agent" });
 
       const conversation = await ConversationModel.create({
         userId: user.id,
         organizationId: org.id,
         agentId: agent.id,
         title: "Test Conversation",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const message = await MessageModel.create({
@@ -238,7 +344,6 @@ describe("MessageModel", () => {
       const org = await makeOrganization();
       const agent = await makeAgent({
         name: "Complex Content Agent",
-        teams: [],
       });
 
       const conversation = await ConversationModel.create({
@@ -246,7 +351,6 @@ describe("MessageModel", () => {
         organizationId: org.id,
         agentId: agent.id,
         title: "Complex Content Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const complexContent = {
@@ -291,14 +395,13 @@ describe("MessageModel", () => {
     }) => {
       const user = await makeUser();
       const org = await makeOrganization();
-      const agent = await makeAgent({ name: "Content ID Agent", teams: [] });
+      const agent = await makeAgent({ name: "Content ID Agent" });
 
       const conversation = await ConversationModel.create({
         userId: user.id,
         organizationId: org.id,
         agentId: agent.id,
         title: "Content ID Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const message = await MessageModel.create({
@@ -311,23 +414,43 @@ describe("MessageModel", () => {
         },
       });
 
-      const found = await MessageModel.findByContentId("nanoid-abc123");
+      const found = await MessageModel.findByAnyIdInConversation(
+        "nanoid-abc123",
+        conversation.id,
+      );
 
       expect(found).toBeDefined();
       expect(found?.id).toBe(message.id);
       expect(found?.content.id).toBe("nanoid-abc123");
     });
 
-    test("returns null for non-existent content ID", async () => {
-      const found = await MessageModel.findByContentId(
+    test("returns null for non-existent content ID", async ({
+      makeUser,
+      makeOrganization,
+      makeAgent,
+    }) => {
+      const user = await makeUser();
+      const org = await makeOrganization();
+      const agent = await makeAgent({
+        name: "Missing Content Agent",
+      });
+      const conversation = await ConversationModel.create({
+        userId: user.id,
+        organizationId: org.id,
+        agentId: agent.id,
+        title: "Missing Content Test",
+      });
+
+      const found = await MessageModel.findByAnyIdInConversation(
         "nonexistent-content-id",
+        conversation.id,
       );
 
       expect(found).toBeNull();
     });
   });
 
-  describe("findByAnyId", () => {
+  describe("findByAnyIdInConversation", () => {
     test("finds by DB UUID", async ({
       makeUser,
       makeOrganization,
@@ -335,14 +458,13 @@ describe("MessageModel", () => {
     }) => {
       const user = await makeUser();
       const org = await makeOrganization();
-      const agent = await makeAgent({ name: "AnyId UUID Agent", teams: [] });
+      const agent = await makeAgent({ name: "AnyId UUID Agent" });
 
       const conversation = await ConversationModel.create({
         userId: user.id,
         organizationId: org.id,
         agentId: agent.id,
         title: "AnyId UUID Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const message = await MessageModel.create({
@@ -355,7 +477,10 @@ describe("MessageModel", () => {
         },
       });
 
-      const found = await MessageModel.findByAnyId(message.id);
+      const found = await MessageModel.findByAnyIdInConversation(
+        message.id,
+        conversation.id,
+      );
 
       expect(found).toBeDefined();
       expect(found?.id).toBe(message.id);
@@ -370,7 +495,6 @@ describe("MessageModel", () => {
       const org = await makeOrganization();
       const agent = await makeAgent({
         name: "AnyId Content Agent",
-        teams: [],
       });
 
       const conversation = await ConversationModel.create({
@@ -378,7 +502,6 @@ describe("MessageModel", () => {
         organizationId: org.id,
         agentId: agent.id,
         title: "AnyId Content Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const message = await MessageModel.create({
@@ -392,15 +515,35 @@ describe("MessageModel", () => {
       });
 
       // Search by nanoid content ID (not DB UUID)
-      const found = await MessageModel.findByAnyId("27udLUYB4QsD2P8E");
+      const found = await MessageModel.findByAnyIdInConversation(
+        "27udLUYB4QsD2P8E",
+        conversation.id,
+      );
 
       expect(found).toBeDefined();
       expect(found?.id).toBe(message.id);
       expect(found?.content.id).toBe("27udLUYB4QsD2P8E");
     });
 
-    test("returns null when neither UUID nor content ID matches", async () => {
-      const found = await MessageModel.findByAnyId("completely-unknown-id");
+    test("returns null when neither UUID nor content ID matches", async ({
+      makeUser,
+      makeOrganization,
+      makeAgent,
+    }) => {
+      const user = await makeUser();
+      const org = await makeOrganization();
+      const agent = await makeAgent({ name: "AnyId Missing Agent" });
+      const conversation = await ConversationModel.create({
+        userId: user.id,
+        organizationId: org.id,
+        agentId: agent.id,
+        title: "AnyId Missing Test",
+      });
+
+      const found = await MessageModel.findByAnyIdInConversation(
+        "completely-unknown-id",
+        conversation.id,
+      );
 
       expect(found).toBeNull();
     });
@@ -414,14 +557,13 @@ describe("MessageModel", () => {
     }) => {
       const user = await makeUser();
       const org = await makeOrganization();
-      const agent = await makeAgent({ name: "Update Agent", teams: [] });
+      const agent = await makeAgent({ name: "Update Agent" });
 
       const conversation = await ConversationModel.create({
         userId: user.id,
         organizationId: org.id,
         agentId: agent.id,
         title: "Update Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const message = await MessageModel.create({
@@ -454,14 +596,13 @@ describe("MessageModel", () => {
     }) => {
       const user = await makeUser();
       const org = await makeOrganization();
-      const agent = await makeAgent({ name: "Multi-part Agent", teams: [] });
+      const agent = await makeAgent({ name: "Multi-part Agent" });
 
       const conversation = await ConversationModel.create({
         userId: user.id,
         organizationId: org.id,
         agentId: agent.id,
         title: "Multi-part Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const message = await MessageModel.create({
@@ -496,14 +637,13 @@ describe("MessageModel", () => {
     }) => {
       const user = await makeUser();
       const org = await makeOrganization();
-      const agent = await makeAgent({ name: "Invalid Index Agent", teams: [] });
+      const agent = await makeAgent({ name: "Invalid Index Agent" });
 
       const conversation = await ConversationModel.create({
         userId: user.id,
         organizationId: org.id,
         agentId: agent.id,
         title: "Invalid Index Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const message = await MessageModel.create({
@@ -533,7 +673,6 @@ describe("MessageModel", () => {
       const org = await makeOrganization();
       const agent = await makeAgent({
         name: "Negative Index Agent",
-        teams: [],
       });
 
       const conversation = await ConversationModel.create({
@@ -541,7 +680,6 @@ describe("MessageModel", () => {
         organizationId: org.id,
         agentId: agent.id,
         title: "Negative Index Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const message = await MessageModel.create({
@@ -576,14 +714,13 @@ describe("MessageModel", () => {
     }) => {
       const user = await makeUser();
       const org = await makeOrganization();
-      const agent = await makeAgent({ name: "Metadata Agent", teams: [] });
+      const agent = await makeAgent({ name: "Metadata Agent" });
 
       const conversation = await ConversationModel.create({
         userId: user.id,
         organizationId: org.id,
         agentId: agent.id,
         title: "Metadata Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const message = await MessageModel.create({
@@ -619,14 +756,13 @@ describe("MessageModel", () => {
     }) => {
       const user = await makeUser();
       const org = await makeOrganization();
-      const agent = await makeAgent({ name: "Empty String Agent", teams: [] });
+      const agent = await makeAgent({ name: "Empty String Agent" });
 
       const conversation = await ConversationModel.create({
         userId: user.id,
         organizationId: org.id,
         agentId: agent.id,
         title: "Empty String Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const message = await MessageModel.create({
@@ -651,14 +787,13 @@ describe("MessageModel", () => {
     }) => {
       const user = await makeUser();
       const org = await makeOrganization();
-      const agent = await makeAgent({ name: "Non-text Part Agent", teams: [] });
+      const agent = await makeAgent({ name: "Non-text Part Agent" });
 
       const conversation = await ConversationModel.create({
         userId: user.id,
         organizationId: org.id,
         agentId: agent.id,
         title: "Non-text Part Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const message = await MessageModel.create({
@@ -694,6 +829,64 @@ describe("MessageModel", () => {
     });
   });
 
+  describe("updateTextPartAndDeleteSubsequent", () => {
+    // A stale client can PATCH a part index that no longer exists (e.g. the
+    // message changed under it). That's a client-input problem, so it must
+    // surface as a 400 ApiError rather than an unhandled 500.
+    test("rejects an out-of-range part index with a 400 ApiError", async ({
+      makeUser,
+      makeOrganization,
+      makeAgent,
+    }) => {
+      const user = await makeUser();
+      const org = await makeOrganization();
+      const agent = await makeAgent({ name: "Edit Part Agent" });
+
+      const conversation = await ConversationModel.create({
+        userId: user.id,
+        organizationId: org.id,
+        agentId: agent.id,
+        title: "Edit Part Test",
+      });
+
+      const message = await MessageModel.create({
+        conversationId: conversation.id,
+        role: "user",
+        content: {
+          id: "temp-id",
+          role: "user",
+          parts: [{ type: "text", text: "only part" }],
+        },
+      });
+
+      await expect(
+        MessageModel.updateTextPartAndDeleteSubsequent(
+          message.id,
+          5,
+          "new text",
+          false,
+        ),
+      ).rejects.toMatchObject({
+        statusCode: 400,
+        message: "Invalid part index",
+      });
+    });
+
+    test("rejects an unknown message id with a 404 ApiError", async () => {
+      await expect(
+        MessageModel.updateTextPartAndDeleteSubsequent(
+          "00000000-0000-0000-0000-000000000000",
+          0,
+          "text",
+          false,
+        ),
+      ).rejects.toMatchObject({
+        statusCode: 404,
+        message: "Message not found",
+      });
+    });
+  });
+
   describe("deleteAfterMessage", () => {
     test("deletes messages created after target message", async ({
       makeUser,
@@ -702,14 +895,13 @@ describe("MessageModel", () => {
     }) => {
       const user = await makeUser();
       const org = await makeOrganization();
-      const agent = await makeAgent({ name: "Delete After Agent", teams: [] });
+      const agent = await makeAgent({ name: "Delete After Agent" });
 
       const conversation = await ConversationModel.create({
         userId: user.id,
         organizationId: org.id,
         agentId: agent.id,
         title: "Delete After Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const message1 = await MessageModel.create({
@@ -722,8 +914,6 @@ describe("MessageModel", () => {
         },
       });
 
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
       const message2 = await MessageModel.create({
         conversationId: conversation.id,
         role: "assistant",
@@ -733,8 +923,6 @@ describe("MessageModel", () => {
           parts: [{ type: "text", text: "Message 2" }],
         },
       });
-
-      await new Promise((resolve) => setTimeout(resolve, 10));
 
       const message3 = await MessageModel.create({
         conversationId: conversation.id,
@@ -746,8 +934,6 @@ describe("MessageModel", () => {
         },
       });
 
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
       await MessageModel.create({
         conversationId: conversation.id,
         role: "assistant",
@@ -757,8 +943,6 @@ describe("MessageModel", () => {
           parts: [{ type: "text", text: "Message 4" }],
         },
       });
-
-      await new Promise((resolve) => setTimeout(resolve, 10));
 
       await MessageModel.create({
         conversationId: conversation.id,
@@ -770,6 +954,7 @@ describe("MessageModel", () => {
         },
       });
 
+      await pinMessageTimestamps(conversation.id);
       await MessageModel.deleteAfterMessage(conversation.id, message3.id);
 
       const remaining = await MessageModel.findByConversation(conversation.id);
@@ -788,14 +973,13 @@ describe("MessageModel", () => {
     }) => {
       const user = await makeUser();
       const org = await makeOrganization();
-      const agent = await makeAgent({ name: "Most Recent Agent", teams: [] });
+      const agent = await makeAgent({ name: "Most Recent Agent" });
 
       const conversation = await ConversationModel.create({
         userId: user.id,
         organizationId: org.id,
         agentId: agent.id,
         title: "Most Recent Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       await MessageModel.create({
@@ -808,8 +992,6 @@ describe("MessageModel", () => {
         },
       });
 
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
       await MessageModel.create({
         conversationId: conversation.id,
         role: "assistant",
@@ -819,8 +1001,6 @@ describe("MessageModel", () => {
           parts: [{ type: "text", text: "Message 2" }],
         },
       });
-
-      await new Promise((resolve) => setTimeout(resolve, 10));
 
       const message3 = await MessageModel.create({
         conversationId: conversation.id,
@@ -832,6 +1012,7 @@ describe("MessageModel", () => {
         },
       });
 
+      await pinMessageTimestamps(conversation.id);
       await MessageModel.deleteAfterMessage(conversation.id, message3.id);
 
       const remaining = await MessageModel.findByConversation(conversation.id);
@@ -847,7 +1028,6 @@ describe("MessageModel", () => {
       const org = await makeOrganization();
       const agent = await makeAgent({
         name: "Non-existent Message Agent",
-        teams: [],
       });
 
       const conversation = await ConversationModel.create({
@@ -855,7 +1035,6 @@ describe("MessageModel", () => {
         organizationId: org.id,
         agentId: agent.id,
         title: "Non-existent Message Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       await expect(
@@ -873,14 +1052,13 @@ describe("MessageModel", () => {
     }) => {
       const user = await makeUser();
       const org = await makeOrganization();
-      const agent = await makeAgent({ name: "Isolation Agent", teams: [] });
+      const agent = await makeAgent({ name: "Isolation Agent" });
 
       const conversationA = await ConversationModel.create({
         userId: user.id,
         organizationId: org.id,
         agentId: agent.id,
         title: "Conversation A",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const conversationB = await ConversationModel.create({
@@ -888,7 +1066,6 @@ describe("MessageModel", () => {
         organizationId: org.id,
         agentId: agent.id,
         title: "Conversation B",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const messageA1 = await MessageModel.create({
@@ -901,8 +1078,6 @@ describe("MessageModel", () => {
         },
       });
 
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
       await MessageModel.create({
         conversationId: conversationA.id,
         role: "assistant",
@@ -912,8 +1087,6 @@ describe("MessageModel", () => {
           parts: [{ type: "text", text: "A2" }],
         },
       });
-
-      await new Promise((resolve) => setTimeout(resolve, 10));
 
       await MessageModel.create({
         conversationId: conversationA.id,
@@ -935,8 +1108,6 @@ describe("MessageModel", () => {
         },
       });
 
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
       await MessageModel.create({
         conversationId: conversationB.id,
         role: "assistant",
@@ -946,8 +1117,6 @@ describe("MessageModel", () => {
           parts: [{ type: "text", text: "B2" }],
         },
       });
-
-      await new Promise((resolve) => setTimeout(resolve, 10));
 
       await MessageModel.create({
         conversationId: conversationB.id,
@@ -959,6 +1128,7 @@ describe("MessageModel", () => {
         },
       });
 
+      await pinMessageTimestamps(conversationA.id);
       await MessageModel.deleteAfterMessage(conversationA.id, messageA1.id);
 
       const remainingA = await MessageModel.findByConversation(
@@ -979,14 +1149,13 @@ describe("MessageModel", () => {
     }) => {
       const user = await makeUser();
       const org = await makeOrganization();
-      const agent = await makeAgent({ name: "Timestamp Agent", teams: [] });
+      const agent = await makeAgent({ name: "Timestamp Agent" });
 
       const conversation = await ConversationModel.create({
         userId: user.id,
         organizationId: org.id,
         agentId: agent.id,
         title: "Timestamp Test",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const message1 = await MessageModel.create({
@@ -999,8 +1168,6 @@ describe("MessageModel", () => {
         },
       });
 
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
       await MessageModel.create({
         conversationId: conversation.id,
         role: "assistant",
@@ -1010,8 +1177,6 @@ describe("MessageModel", () => {
           parts: [{ type: "text", text: "Message 2" }],
         },
       });
-
-      await new Promise((resolve) => setTimeout(resolve, 10));
 
       await MessageModel.create({
         conversationId: conversation.id,
@@ -1023,6 +1188,7 @@ describe("MessageModel", () => {
         },
       });
 
+      await pinMessageTimestamps(conversation.id);
       await MessageModel.deleteAfterMessage(conversation.id, message1.id);
 
       const remaining = await MessageModel.findByConversation(conversation.id);
@@ -1039,7 +1205,6 @@ describe("MessageModel", () => {
       const org = await makeOrganization();
       const agent = await makeAgent({
         name: "Cross-conversation Agent",
-        teams: [],
       });
 
       // Create two separate conversations
@@ -1048,7 +1213,6 @@ describe("MessageModel", () => {
         organizationId: org.id,
         agentId: agent.id,
         title: "Conversation A",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       const conversationB = await ConversationModel.create({
@@ -1056,7 +1220,6 @@ describe("MessageModel", () => {
         organizationId: org.id,
         agentId: agent.id,
         title: "Conversation B",
-        selectedModel: "claude-3-haiku-20240307",
       });
 
       // Create a message in conversation B
@@ -1080,3 +1243,25 @@ describe("MessageModel", () => {
     });
   });
 });
+
+/**
+ * Pin the conversation's messages to strictly increasing `createdAt` in
+ * insertion order (ids are client-generated monotonic UUIDv7). "After" tests
+ * must not derive order from insert-time clocks: `now()` is not monotonic — a
+ * clock step between back-to-back writes can date a later message before an
+ * earlier one, which flakes every assertion built on sleeps between inserts.
+ */
+async function pinMessageTimestamps(conversationId: string): Promise<void> {
+  const rows = await db
+    .select({ id: schema.messagesTable.id })
+    .from(schema.messagesTable)
+    .where(eq(schema.messagesTable.conversationId, conversationId))
+    .orderBy(asc(schema.messagesTable.id));
+  const base = Date.now() - rows.length * 1_000;
+  for (const [index, row] of rows.entries()) {
+    await db
+      .update(schema.messagesTable)
+      .set({ createdAt: new Date(base + index * 1_000) })
+      .where(eq(schema.messagesTable.id, row.id));
+  }
+}

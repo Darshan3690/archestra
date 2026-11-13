@@ -1,9 +1,14 @@
+// @vitest-environment node
+import {
+  EMBEDDING_ONLY_PROVIDERS,
+  providerSupportsChat,
+  SupportedProviders,
+} from "@archestra/shared";
 import { describe, expect, it } from "vitest";
 import {
-  getShownProviders,
+  getConnectableProviders,
   resolveEffectiveId,
   resolveInitialClientId,
-  toMcpServerSlug,
 } from "./connection-flow.utils";
 
 const baseParams = {
@@ -102,12 +107,22 @@ describe("resolveEffectiveId", () => {
 describe("resolveInitialClientId", () => {
   const visibleClientIds = ["claude-code", "cursor", "generic"] as const;
 
-  it("returns null when nothing else is specified", () => {
+  it("falls back to the first visible client when nothing else is specified", () => {
     expect(
       resolveInitialClientId({
         urlClientId: null,
         adminDefaultClientId: null,
         visibleClientIds,
+      }),
+    ).toBe("claude-code");
+  });
+
+  it("returns null when no clients are visible at all", () => {
+    expect(
+      resolveInitialClientId({
+        urlClientId: null,
+        adminDefaultClientId: null,
+        visibleClientIds: [],
       }),
     ).toBeNull();
   });
@@ -142,62 +157,38 @@ describe("resolveInitialClientId", () => {
     ).toBe("cursor");
   });
 
-  it("returns null when the admin default isn't visible", () => {
+  it("falls back to the first visible client when the admin default isn't visible", () => {
     expect(
       resolveInitialClientId({
         urlClientId: null,
         adminDefaultClientId: "hidden-client",
         visibleClientIds,
       }),
-    ).toBeNull();
+    ).toBe("claude-code");
   });
 });
 
-describe("getShownProviders", () => {
-  it("returns null when organization is undefined", () => {
-    expect(getShownProviders(undefined)).toBeNull();
+describe("getConnectableProviders", () => {
+  it("offers every chat provider when the deployment has switched none off", () => {
+    expect(getConnectableProviders({ modelProviderOverrides: null })).toEqual(
+      SupportedProviders.filter(providerSupportsChat),
+    );
   });
 
-  it("returns null when the field is null (show all)", () => {
-    expect(getShownProviders({ connectionShownProviders: null })).toBeNull();
+  it("never offers an embeddings-only provider, which has no chat endpoint", () => {
+    const providers = getConnectableProviders({ modelProviderOverrides: null });
+    for (const provider of EMBEDDING_ONLY_PROVIDERS) {
+      expect(providers).not.toContain(provider);
+    }
+    // Guards the assertion above against silently passing on an empty set.
+    expect(EMBEDDING_ONLY_PROVIDERS.size).toBeGreaterThan(0);
   });
 
-  it("returns known providers unchanged", () => {
-    expect(
-      getShownProviders({
-        connectionShownProviders: ["openai", "anthropic"],
-      }),
-    ).toEqual(["openai", "anthropic"]);
-  });
-
-  it("drops unknown provider IDs silently", () => {
-    expect(
-      getShownProviders({
-        connectionShownProviders: ["openai", "not-a-provider", "anthropic"],
-      }),
-    ).toEqual(["openai", "anthropic"]);
-  });
-});
-
-describe("toMcpServerSlug", () => {
-  it("lowercases a single-word name", () => {
-    expect(toMcpServerSlug("Archestra")).toBe("archestra");
-  });
-
-  it("dash-separates multi-word names", () => {
-    expect(toMcpServerSlug("Acme AI")).toBe("acme-ai");
-  });
-
-  it("collapses runs of non-alphanumerics into a single dash", () => {
-    expect(toMcpServerSlug("Foo !! Bar__Baz")).toBe("foo-bar-baz");
-  });
-
-  it("trims leading and trailing dashes", () => {
-    expect(toMcpServerSlug("  !Foo!  ")).toBe("foo");
-  });
-
-  it("falls back to 'archestra' when the input has no alphanumerics", () => {
-    expect(toMcpServerSlug("!!!")).toBe("archestra");
-    expect(toMcpServerSlug("")).toBe("archestra");
+  it("drops the providers the deployment switched off", () => {
+    const providers = getConnectableProviders({
+      modelProviderOverrides: { anthropic: { hidden: true } },
+    });
+    expect(providers).not.toContain("anthropic");
+    expect(providers).toContain("openai");
   });
 });

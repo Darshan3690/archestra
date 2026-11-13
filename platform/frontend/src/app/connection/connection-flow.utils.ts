@@ -1,10 +1,23 @@
 import {
   type archestraApiTypes,
-  isSupportedProvider,
+  type ChatProvider,
+  EMBEDDING_ONLY_PROVIDERS,
+  type EmbeddingOnlyProvider,
+  isIntegrationHidden,
+  providerSupportsChat,
   type SupportedProvider,
-} from "@shared";
+  SupportedProviders,
+} from "@archestra/shared";
+import { QueryClientContext } from "@tanstack/react-query";
+import { useContext, useMemo } from "react";
+import config, { getConfiguredExternalProxyUrls } from "@/lib/config/config";
+import { documentOriginQueryKey } from "@/lib/connection-approval-query-keys";
 
-const DEFAULT_MCP_SERVER_SLUG = "archestra";
+/** A provider with its own LLM proxy endpoint: chat providers plus Jev. */
+export type ProxyEndpointProvider = Exclude<
+  SupportedProvider,
+  EmbeddingOnlyProvider
+>;
 
 export type ConnectionBaseUrl = NonNullable<
   archestraApiTypes.GetOrganizationResponses["200"]["connectionBaseUrls"]
@@ -36,33 +49,45 @@ export function resolveAdminDefaultBaseUrl(
 }
 
 /**
- * Slugify the org's app name for use as an MCP server key (e.g. the key in
- * `mcpServers` or the CLI arg for `claude mcp add`). White-label deployments
- * rely on this — a user of "Acme AI" should see `acme-ai` in their config,
- * not `archestra`.
+ * The providers /connection may offer: every one this deployment has not
+ * switched off, under Available model providers in LLM settings.
+ *
+ * The connect page used to carry a second, page-local provider list. It only
+ * ever narrowed what this page displayed, never what could be configured, so
+ * one deployment-wide list now answers both.
  */
-export function toMcpServerSlug(appName: string): string {
-  const slug = appName
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  return slug || DEFAULT_MCP_SERVER_SLUG;
+export function getConnectableProviders(
+  organization:
+    | {
+        modelProviderOverrides?: Record<string, { hidden?: boolean }> | null;
+      }
+    | null
+    | undefined,
+): ChatProvider[] {
+  const overrides = organization?.modelProviderOverrides ?? null;
+  return SupportedProviders.filter(
+    (provider): provider is ChatProvider =>
+      // Embeddings-only providers serve no chat endpoint to connect a client
+      // to, so they are never offered here however the overrides are set.
+      providerSupportsChat(provider) &&
+      !isIntegrationHidden(overrides, provider),
+  );
 }
 
 /**
- * Narrow `organization.connectionShownProviders` (typed as `string[] | null`
- * by the generated API client) to `SupportedProvider[] | null`, dropping any
- * provider IDs the frontend doesn't know about.
+ * The providers the LLM Proxy page lists endpoints for: the connectable chat
+ * providers plus decisions-only ones like Jev, which serve a proxy endpoint
+ * but no chat. Embeddings-only providers have no proxy endpoint at all.
  */
-export function getShownProviders(
-  organization:
-    | { connectionShownProviders?: readonly string[] | null }
-    | null
-    | undefined,
-): SupportedProvider[] | null {
-  const raw = organization?.connectionShownProviders;
-  if (!raw) return null;
-  return raw.filter(isSupportedProvider);
+export function getProxyEndpointProviders(
+  organization: Parameters<typeof getConnectableProviders>[0],
+): ProxyEndpointProvider[] {
+  const overrides = organization?.modelProviderOverrides ?? null;
+  return SupportedProviders.filter(
+    (provider): provider is ProxyEndpointProvider =>
+      !EMBEDDING_ONLY_PROVIDERS.has(provider) &&
+      !isIntegrationHidden(overrides, provider),
+  );
 }
 
 /**
@@ -77,9 +102,10 @@ export function getShownProviders(
 /**
  * Decide which client to pre-select on the `/connection` page.
  *
- * Priority: URL param (`?clientId=`) → admin default. If neither is set, no
- * client is pre-selected. Candidates that aren't in the visible set are
- * skipped so we never select a tile the user can't see.
+ * Priority: URL param (`?clientId=`) → admin default → first visible client,
+ * so the wizard always opens with a working selection. Candidates that aren't
+ * in the visible set are skipped so we never select a client the user can't
+ * see.
  */
 export function resolveInitialClientId(params: {
   urlClientId: string | null;
@@ -90,7 +116,12 @@ export function resolveInitialClientId(params: {
   const visible = new Set(visibleClientIds);
   const pick = (id: string | null | undefined): string | null =>
     id && visible.has(id) ? id : null;
-  return pick(urlClientId) ?? pick(adminDefaultClientId);
+  return (
+    pick(urlClientId) ??
+    pick(adminDefaultClientId) ??
+    visibleClientIds[0] ??
+    null
+  );
 }
 
 export function resolveEffectiveId(params: {
@@ -117,4 +148,49 @@ export function resolveEffectiveId(params: {
     firstAvailable ??
     null
   );
+}
+
+/**
+ * The connection base URL for the whole page: the admin default, then the
+ * first URL the deployment offers. Users don't pick one; admins can hide env
+ * URLs, and those never show up here.
+ */
+export function useConnectionBaseUrl(
+  metadata: readonly ConnectionBaseUrl[] | null | undefined,
+): string {
+  // On the server there is no window: a seeded document carries its origin,
+  // so the server render picks the URL the browser picks.
+  const seededOrigin = useContext(QueryClientContext)?.getQueryData<string>(
+    documentOriginQueryKey,
+  );
+  return useMemo(() => {
+    const configured = getConfiguredExternalProxyUrls();
+    const origin =
+      typeof window !== "undefined" ? window.location.origin : seededOrigin;
+    return resolveConnectionBaseUrl({
+      externalProxyUrls:
+        configured.length > 0 ? configured : origin ? [`${origin}/v1`] : [],
+      internalProxyUrl: config.api.internalProxyUrl,
+      metadata,
+    });
+  }, [metadata, seededOrigin]);
+}
+
+/**
+ * {@link useConnectionBaseUrl} for given URLs: the server seed passes the
+ * document's own origin where the browser passes `window.location.origin`.
+ */
+export function resolveConnectionBaseUrl(params: {
+  externalProxyUrls: readonly string[];
+  internalProxyUrl: string;
+  metadata: readonly ConnectionBaseUrl[] | null | undefined;
+}): string {
+  const baseUrls = resolveCandidateBaseUrls({
+    ...params,
+    metadata: params.metadata ?? null,
+  });
+  const adminDefault = resolveAdminDefaultBaseUrl(params.metadata ?? null);
+  return adminDefault && baseUrls.includes(adminDefault)
+    ? adminDefault
+    : baseUrls[0];
 }

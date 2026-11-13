@@ -1,0 +1,447 @@
+import { z } from "zod";
+import type { AgentCatalogId } from "./agent-catalog-images";
+import AGENT_CATALOG_IMAGE_NAMES from "./agent-catalog-images.json";
+import { CONNECTOR_TYPE_LABELS, type ConnectorType } from "./knowledge-base";
+import {
+  providerDisplayNames,
+  type SupportedProvider,
+  SupportedProvidersSchema,
+} from "./model-constants";
+
+/**
+ * Messaging channels an admin can hide or relabel. Mirrors the tabs on
+ * /messaging-channels: the three ChatOps providers plus email and A2A.
+ */
+export const MessagingChannelIdSchema = z.enum([
+  "slack",
+  "ms-teams",
+  "telegram",
+  "jira",
+  "email",
+  "a2a",
+]);
+export type MessagingChannelId = z.infer<typeof MessagingChannelIdSchema>;
+
+export const MESSAGING_CHANNEL_LABELS: Record<MessagingChannelId, string> = {
+  slack: "Slack",
+  "ms-teams": "MS Teams",
+  telegram: "Telegram",
+  jira: "Jira",
+  email: "Email",
+  a2a: "A2A",
+};
+
+/**
+ * Keyed off the label map so a connector type added to
+ * `CONNECTOR_TYPE_LABELS` is configurable without a second edit here.
+ */
+export const KnowledgeConnectorIdSchema = z.enum(
+  Object.keys(CONNECTOR_TYPE_LABELS) as [ConnectorType, ...ConnectorType[]],
+);
+
+export const PopularAgentIdSchema = z.enum(
+  Object.keys(AGENT_CATALOG_IMAGE_NAMES) as [
+    AgentCatalogId,
+    ...AgentCatalogId[],
+  ],
+);
+
+export const MAX_INTEGRATION_DISPLAY_NAME_LENGTH = 60;
+
+/**
+ * An admin override of a built-in catalog entry.
+ *
+ * `hidden` removes an entry from its picker. Integration catalogs also refuse
+ * to configure hidden entries in the API; popular agent templates only control
+ * suggestions and runtime image choices. An absent entry means "available, named as
+ * it ships".
+ */
+const integrationToggleShape = { hidden: z.boolean().optional() };
+
+/**
+ * Strict on input: a key this catalog does not take (a name on a toggle-only
+ * catalog, say) is a client mistake worth a 400 rather than a silent strip.
+ */
+export const IntegrationToggleSchema = z.strictObject(integrationToggleShape);
+export type IntegrationToggle = z.infer<typeof IntegrationToggleSchema>;
+
+/**
+ * Lenient on the way out. These columns are jsonb, so a row written by an
+ * older build can hold a key this one no longer knows; validating the stored
+ * value strictly would turn that into a 500 on the organization endpoint —
+ * one stale key taking the whole app down for everyone.
+ */
+export const StoredIntegrationToggleSchema = z.object(integrationToggleShape);
+
+/**
+ * The two ways into GitHub Copilot: a person's own Copilot subscription
+ * (`personal`, a sign-in with their GitHub account) and the organization's
+ * Copilot plan connected through a GitHub App (`enterprise`). An admin can
+ * turn each one off while the provider stays on.
+ */
+export const CopilotPlanSchema = z.enum(["personal", "enterprise"]);
+export type CopilotPlan = z.infer<typeof CopilotPlanSchema>;
+
+/**
+ * The name the enterprise plan shows under until an admin gives it one. The
+ * personal plan has no name of its own: it shows under the provider's name.
+ */
+export const GITHUB_COPILOT_ORGANIZATION_LABEL = "GitHub Copilot Organization";
+
+/**
+ * Model providers additionally take the organization's own name for the
+ * provider, which replaces the built-in one everywhere it is rendered.
+ * Messaging channels and knowledge connectors are deliberately toggle-only:
+ * they name a single external service each, so there is nothing to rename that
+ * would not make the setup instructions harder to follow.
+ *
+ * `plans` is for GitHub Copilot only; the input schema refuses it on any other
+ * provider.
+ */
+const modelProviderOverrideShape = {
+  ...integrationToggleShape,
+  displayName: z
+    .string()
+    .trim()
+    .max(MAX_INTEGRATION_DISPLAY_NAME_LENGTH)
+    .nullish(),
+};
+
+export const ModelProviderOverrideSchema = z.strictObject({
+  ...modelProviderOverrideShape,
+  plans: z
+    .strictObject({
+      personal: IntegrationToggleSchema.optional(),
+      enterprise: z.strictObject(modelProviderOverrideShape).optional(),
+    })
+    .optional(),
+});
+export type ModelProviderOverride = z.infer<typeof ModelProviderOverrideSchema>;
+
+// ---- Input: what PATCH /api/organization/integration-settings accepts ----
+
+export const ModelProviderOverridesSchema = z
+  .partialRecord(SupportedProvidersSchema, ModelProviderOverrideSchema)
+  .superRefine((overrides, ctx) => {
+    for (const [provider, override] of Object.entries(overrides)) {
+      if (!override?.plans) continue;
+      if (provider !== "github-copilot") {
+        ctx.addIssue({
+          code: "custom",
+          path: [provider, "plans"],
+          message: "Only GitHub Copilot has plans to turn off.",
+        });
+        continue;
+      }
+      // Both plans off is GitHub Copilot off. Keep one switch for that, so
+      // every place that asks whether the provider is offered gets one answer.
+      if (
+        CopilotPlanSchema.options.every(
+          (plan) => override.plans?.[plan]?.hidden === true,
+        )
+      ) {
+        ctx.addIssue({
+          code: "custom",
+          path: [provider, "plans"],
+          message:
+            "To turn off both plans, turn off GitHub Copilot as a provider.",
+        });
+      }
+    }
+  });
+
+export const MessagingChannelOverridesSchema = z.partialRecord(
+  MessagingChannelIdSchema,
+  IntegrationToggleSchema,
+);
+
+export const KnowledgeConnectorOverridesSchema = z.partialRecord(
+  KnowledgeConnectorIdSchema,
+  IntegrationToggleSchema,
+);
+
+const popularAgentOverrideShape = {
+  ...integrationToggleShape,
+  position: z.number().int().nonnegative().optional(),
+};
+const PopularAgentOverrideSchema = z.strictObject(popularAgentOverrideShape);
+
+// Explicit properties keep the generated OpenAPI/SDK request contract closed.
+// The satisfies check requires every maintained template to be represented.
+export const PopularAgentOverridesSchema = z.strictObject({
+  "claude-code": PopularAgentOverrideSchema.optional(),
+  codex: PopularAgentOverrideSchema.optional(),
+  opencode: PopularAgentOverrideSchema.optional(),
+  hermes: PopularAgentOverrideSchema.optional(),
+  openclaw: PopularAgentOverrideSchema.optional(),
+  grok: PopularAgentOverrideSchema.optional(),
+  kimi: PopularAgentOverrideSchema.optional(),
+  copilot: PopularAgentOverrideSchema.optional(),
+} satisfies Record<
+  AgentCatalogId,
+  z.ZodOptional<typeof PopularAgentOverrideSchema>
+>);
+
+export const StoredPopularAgentOverridesSchema = z.partialRecord(
+  PopularAgentIdSchema,
+  z.object(popularAgentOverrideShape),
+);
+export type PopularAgentOverrides = z.infer<
+  typeof StoredPopularAgentOverridesSchema
+>;
+
+// ---- Stored: what the organization columns may actually hold ----
+
+export const StoredModelProviderOverridesSchema = z.partialRecord(
+  SupportedProvidersSchema,
+  z.object({
+    ...modelProviderOverrideShape,
+    plans: z
+      .object({
+        personal: StoredIntegrationToggleSchema.optional(),
+        enterprise: z.object(modelProviderOverrideShape).optional(),
+      })
+      .optional(),
+  }),
+);
+export type ModelProviderOverrides = z.infer<
+  typeof StoredModelProviderOverridesSchema
+>;
+
+export const StoredMessagingChannelOverridesSchema = z.partialRecord(
+  MessagingChannelIdSchema,
+  StoredIntegrationToggleSchema,
+);
+export type MessagingChannelOverrides = z.infer<
+  typeof StoredMessagingChannelOverridesSchema
+>;
+
+export const StoredKnowledgeConnectorOverridesSchema = z.partialRecord(
+  KnowledgeConnectorIdSchema,
+  StoredIntegrationToggleSchema,
+);
+export type KnowledgeConnectorOverrides = z.infer<
+  typeof StoredKnowledgeConnectorOverridesSchema
+>;
+
+/**
+ * The name an entry ships with, ignoring any admin override.
+ *
+ * Only for the two places where the shipped name IS the point: the settings
+ * dialog's own placeholder (what the admin is overriding), and the catalog's
+ * fallback. Everywhere else must resolve through the catalog, or a renamed
+ * provider silently reads under its shipped name.
+ *
+ * The local alias is deliberate: `integration-labels-via-catalog.grit` flags
+ * direct indexing of `providerDisplayNames`, and this is the sanctioned way
+ * through it.
+ */
+export function builtInProviderLabel(provider: SupportedProvider): string {
+  const labels: Record<SupportedProvider, string> = providerDisplayNames;
+  return labels[provider];
+}
+
+type IntegrationOverrides<Id extends string> = Partial<
+  Record<Id, IntegrationToggle>
+> | null;
+
+/** True when an admin has switched this catalog entry off. */
+export function isIntegrationHidden<Id extends string>(
+  overrides: IntegrationOverrides<Id>,
+  id: Id,
+): boolean {
+  return overrides?.[id]?.hidden === true;
+}
+
+/**
+ * True when one GitHub Copilot plan is not offered: either GitHub Copilot as a
+ * whole is off, or an admin turned off just this plan.
+ */
+export function isCopilotPlanHidden(
+  overrides: ModelProviderOverrides | null,
+  plan: CopilotPlan,
+): boolean {
+  const copilot = overrides?.["github-copilot"];
+  return copilot?.hidden === true || copilot?.plans?.[plan]?.hidden === true;
+}
+
+/**
+ * True when a provider key belongs to something an admin turned off. For
+ * GitHub Copilot that is the key's own plan: an organization's GitHub App key
+ * is the enterprise plan, any other key a personal sign-in. Each plan's switch
+ * alone decides its keys.
+ */
+export function isProviderKeyHidden(
+  overrides: ModelProviderOverrides | null,
+  key: { provider: SupportedProvider; isGithubAppKey?: boolean | null },
+): boolean {
+  return key.provider === "github-copilot"
+    ? isCopilotPlanHidden(
+        overrides,
+        key.isGithubAppKey ? "enterprise" : "personal",
+      )
+    : isIntegrationHidden(overrides, key.provider);
+}
+
+/**
+ * What a person reads when a GitHub Copilot plan they asked for is turned
+ * off: "GitHub Copilot enterprise plans are turned off for this organization…".
+ */
+export function copilotPlanTurnedOffMessage(
+  overrides: ModelProviderOverrides | null,
+  plan: CopilotPlan,
+): string {
+  const label = integrationLabel(
+    overrides,
+    "github-copilot",
+    builtInProviderLabel("github-copilot"),
+  );
+  return `${label} ${COPILOT_PLAN_NOUNS[plan]} are turned off for this organization. Ask an administrator to turn them on under Settings → LLM → Model providers.`;
+}
+
+/** The plan names the Model Providers page uses for its two sections. */
+const COPILOT_PLAN_NOUNS: Record<CopilotPlan, string> = {
+  personal: "personal subscriptions",
+  enterprise: "enterprise plans",
+};
+
+/** The name the GitHub Copilot enterprise plan shows under. */
+export function copilotEnterprisePlanLabel(
+  overrides: ModelProviderOverrides | null,
+): string {
+  const custom =
+    overrides?.["github-copilot"]?.plans?.enterprise?.displayName?.trim();
+  return custom ? custom : GITHUB_COPILOT_ORGANIZATION_LABEL;
+}
+
+/**
+ * The label to render for a catalog entry: the admin's override when they set
+ * one, otherwise the built-in name.
+ */
+export function integrationLabel<Id extends string>(
+  overrides: Partial<Record<Id, ModelProviderOverride>> | null,
+  id: Id,
+  fallback: string,
+): string {
+  const custom = overrides?.[id]?.displayName?.trim();
+  return custom ? custom : fallback;
+}
+
+/**
+ * Drops entries that carry no customization, so an admin who toggles a
+ * provider off and back on leaves no residue behind and newly added catalog
+ * entries keep defaulting to visible.
+ */
+export function pruneIntegrationOverrides<Id extends string>(
+  overrides: Partial<Record<Id, ModelProviderOverride>>,
+): Partial<Record<Id, ModelProviderOverride>> | null {
+  const pruned: Partial<Record<Id, ModelProviderOverride>> = {};
+  for (const [id, override] of Object.entries(overrides) as [
+    Id,
+    ModelProviderOverride | undefined,
+  ][]) {
+    if (!override) continue;
+    const displayName = override.displayName?.trim() || null;
+    const hidden = override.hidden === true;
+    const plans = prunePlans(override.plans);
+    if (!hidden && !displayName && !plans) continue;
+    pruned[id] = {
+      ...(hidden ? { hidden: true } : {}),
+      ...(displayName ? { displayName } : {}),
+      // Kept while the provider is off too, so switching it back on restores
+      // the plan the admin had turned off.
+      ...(plans ? { plans } : {}),
+    };
+  }
+  return Object.keys(pruned).length > 0 ? pruned : null;
+}
+
+/**
+ * The catalog entries an organization offers: everything an admin has not
+ * switched off. This is the shape the availability control renders — a chip
+ * per allowed entry — so an untouched organization shows the whole catalog.
+ */
+export function allowedIntegrationIds<Id extends string>(
+  overrides: Partial<Record<Id, ModelProviderOverride>> | null,
+  catalog: readonly Id[],
+): Id[] {
+  return catalog.filter((id) => !isIntegrationHidden(overrides, id));
+}
+
+/**
+ * Rewrites overrides so exactly `allowed` stays on.
+ *
+ * Names survive the rewrite: model providers keep `displayName` in the same
+ * column as the off switch, so switching a provider off and back on must not
+ * cost the organization the name it chose for it.
+ */
+export function withAllowedIntegrationIds<Id extends string>(
+  overrides: Partial<Record<Id, ModelProviderOverride>> | null,
+  catalog: readonly Id[],
+  allowed: readonly Id[],
+): Partial<Record<Id, ModelProviderOverride>> | null {
+  const allowedIds = new Set<string>(allowed);
+  const next: Partial<Record<Id, ModelProviderOverride>> = {};
+  for (const id of catalog) {
+    next[id] = {
+      ...(overrides?.[id] ?? {}),
+      hidden: !allowedIds.has(id),
+    };
+  }
+  return pruneIntegrationOverrides(next);
+}
+
+/** Saved positions precede unpositioned entries; ties keep the catalog order. */
+export function orderedPopularAgentIds(
+  overrides: PopularAgentOverrides | null,
+  catalog: readonly AgentCatalogId[],
+): AgentCatalogId[] {
+  return catalog
+    .filter((id) => !isIntegrationHidden(overrides, id))
+    .sort(
+      (a, b) =>
+        (overrides?.[a]?.position ?? Number.MAX_SAFE_INTEGER) -
+        (overrides?.[b]?.position ?? Number.MAX_SAFE_INTEGER),
+    );
+}
+
+/** Store both visibility and order in the existing catalog customization. */
+export function withOrderedPopularAgentIds(
+  overrides: PopularAgentOverrides | null,
+  catalog: readonly AgentCatalogId[],
+  allowed: readonly string[],
+): PopularAgentOverrides {
+  return Object.fromEntries(
+    catalog.map((id) => {
+      const position = allowed.indexOf(id);
+      return [
+        id,
+        position < 0 ? { ...overrides?.[id], hidden: true } : { position },
+      ];
+    }),
+  );
+}
+
+// ===================================================================
+// Internal
+// ===================================================================
+
+/**
+ * The plans an admin turned off or named, or undefined when every plan is
+ * offered under its default name.
+ */
+function prunePlans(
+  plans: ModelProviderOverride["plans"],
+): ModelProviderOverride["plans"] {
+  const pruned: NonNullable<ModelProviderOverride["plans"]> = {};
+  if (plans?.personal?.hidden === true) pruned.personal = { hidden: true };
+  const enterpriseHidden = plans?.enterprise?.hidden === true;
+  const enterpriseName = plans?.enterprise?.displayName?.trim() || null;
+  if (enterpriseHidden || enterpriseName) {
+    pruned.enterprise = {
+      ...(enterpriseHidden ? { hidden: true } : {}),
+      ...(enterpriseName ? { displayName: enterpriseName } : {}),
+    };
+  }
+  return Object.keys(pruned).length > 0 ? pruned : undefined;
+}

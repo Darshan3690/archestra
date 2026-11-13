@@ -1,7 +1,7 @@
-import { archestraApiSdk, type archestraApiTypes } from "@shared";
+import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { handleApiError } from "@/lib/utils";
+import { handleApiError, throwOnApiError } from "@/lib/utils/api";
 
 const {
   getIncomingEmailStatus,
@@ -23,10 +23,7 @@ export function useIncomingEmailStatus() {
     queryKey: incomingEmailKeys.status(),
     queryFn: async () => {
       const { data, error } = await getIncomingEmailStatus();
-      if (error) {
-        handleApiError(error);
-        return null;
-      }
+      throwOnApiError(error);
       return data as archestraApiTypes.GetIncomingEmailStatusResponses["200"];
     },
   });
@@ -98,7 +95,10 @@ export function useDeleteIncomingEmailSubscription() {
  * Hook to fetch the email address for a specific agent (internal agent)
  * Pass null to disable the query
  */
-export function useAgentEmailAddress(agentId: string | null) {
+export function useAgentEmailAddress(
+  agentId: string | null,
+  options?: { toastOnError?: boolean },
+) {
   return useQuery({
     queryKey: incomingEmailKeys.promptEmailAddress(agentId ?? ""),
     queryFn: async () => {
@@ -106,10 +106,10 @@ export function useAgentEmailAddress(agentId: string | null) {
       const { data, error } = await getAgentEmailAddress({
         path: { agentId },
       });
-      if (error) {
-        handleApiError(error);
-        return null;
-      }
+      throwOnApiError(error, {
+        allowNotFound: true,
+        toastOnError: options?.toastOnError,
+      });
       return data as archestraApiTypes.GetAgentEmailAddressResponses["200"];
     },
     enabled: !!agentId,

@@ -2,52 +2,58 @@
 
 import {
   type archestraApiTypes,
-  type Permissions,
   type PredefinedRoleName,
   roleDescriptions,
-} from "@shared";
-import { allAvailableActions } from "@shared/access-control";
-import type { ColumnDef } from "@tanstack/react-table";
-import { Copy, Download, Eye, Pencil, Plus, Trash2 } from "lucide-react";
+} from "@archestra/shared";
+
+import type { ColumnDef, RowSelectionState } from "@tanstack/react-table";
+import { Download, Pencil, Plus, Trash2 } from "lucide-react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import type { ReactNode } from "react";
 import { useCallback, useEffect, useState } from "react";
-import { toast } from "sonner";
 import { useSetSettingsAction } from "@/app/settings/layout";
+import {
+  openRowOnPlainClick,
+  RowClickShield,
+} from "@/components/agent-pages/row-click-shield";
 import { DeleteConfirmDialog } from "@/components/delete-confirm-dialog";
-import { FormDialog } from "@/components/form-dialog";
+import {
+  CollectionFilters,
+  FilterBar,
+  filterSearchClass,
+} from "@/components/filter-bar";
+import { QueryLoadError } from "@/components/query-load-error";
 import { RoleTypeIcon } from "@/components/role-type-icon";
 import { SearchInput } from "@/components/search-input";
 import {
   type TableRowAction,
   TableRowActions,
 } from "@/components/table-row-actions";
-import { Button } from "@/components/ui/button";
+import { BulkActions } from "@/components/ui/bulk-actions-bar";
+import { BulkActionsScope } from "@/components/ui/bulk-actions-context";
+import { createSelectColumn } from "@/components/ui/bulk-select-column";
 import { DataTable } from "@/components/ui/data-table";
-import {
-  DialogBody,
-  DialogForm,
-  DialogStickyFooter,
-} from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { PermissionButton } from "@/components/ui/permission-button";
-import { Textarea } from "@/components/ui/textarea";
+import { reportBulkOutcome } from "@/lib/bulk-action";
+import { useControlledRowSelection } from "@/lib/hooks/use-bulk-selection";
 import { useDataTableQueryParams } from "@/lib/hooks/use-data-table-query-params";
 import {
-  useCreateRole,
+  useAllMatchingRoles,
+  useBulkDeleteRoles,
   useDeleteRole,
   useRolesPaginated,
-  useUpdateRole,
 } from "@/lib/role.query";
 import { downloadRoleAsJson } from "./role-export";
-import { RolePermissionBuilder } from "./role-permission-builder.ee";
 
 type Role = archestraApiTypes.GetRoleResponses["200"];
 
 /**
- * Enterprise Edition roles list with custom role management.
- * Shows both predefined roles (read-only) and custom roles (CRUD).
+ * Enterprise Edition roles list. Every role opens on its own page; custom
+ * roles are created, edited and deleted there, predefined ones are read-only.
  */
-export function RolesList() {
+export function RolesList({ headerAction }: { headerAction?: ReactNode }) {
+  const router = useRouter();
   const setActionButton = useSetSettingsAction();
   const {
     pageIndex,
@@ -58,36 +64,42 @@ export function RolesList() {
     updateQueryParams,
   } = useDataTableQueryParams();
   const nameFilter = searchParams.get("name") || undefined;
-  const { data: rolesResponse, isLoading } = useRolesPaginated({
+  const {
+    data: rolesResponse,
+    isFetching: isLoading,
+    isLoadingError,
+    refetch,
+  } = useRolesPaginated({
     limit: pageSize,
     offset,
     name: nameFilter,
   });
-  const createMutation = useCreateRole();
-  const updateMutation = useUpdateRole();
   const deleteMutation = useDeleteRole();
+  const bulkDelete = useBulkDeleteRoles();
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
+  const clearSelection = useCallback(() => {
+    setRowSelection({});
+    setEscalatedFor(null);
+  }, []);
 
-  const [createDialogOpen, setCreateDialogOpen] = useState(false);
-  const [editDialogOpen, setEditDialogOpen] = useState(false);
-  const [viewPermissionsDialogOpen, setViewPermissionsDialogOpen] =
-    useState(false);
-  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const filterSignature = nameFilter ?? "";
+  const [escalatedFor, setEscalatedFor] = useState<string | null>(null);
+  const allMatchingSelected = escalatedFor === filterSignature;
+  const { data: allMatchingRoles, isFetching: isFetchingAllMatching } =
+    useAllMatchingRoles(
+      { search: nameFilter || undefined },
+      { enabled: allMatchingSelected },
+    );
 
-  const [selectedRole, setSelectedRole] = useState<Role | null>(null);
-  const [viewPermissionsRole, setViewPermissionsRole] = useState<Role | null>(
-    null,
-  );
   const [roleToDelete, setRoleToDelete] = useState<Role | null>(null);
-
-  const [roleName, setRoleName] = useState("");
-  const [roleDescription, setRoleDescription] = useState("");
-  const [permission, setPermission] = useState<Permissions>({});
 
   useEffect(() => {
     setActionButton(
       <PermissionButton
         permissions={{ ac: ["create"] }}
-        onClick={() => setCreateDialogOpen(true)}
+        size="sm"
+        onClick={() => router.push("/settings/roles/new")}
       >
         <Plus className="h-4 w-4" />
         Create Custom Role
@@ -95,118 +107,7 @@ export function RolesList() {
     );
 
     return () => setActionButton(null);
-  }, [setActionButton]);
-
-  const handleCreateRole = useCallback(() => {
-    if (!roleName.trim()) {
-      toast.error("Role name is required");
-      return;
-    }
-
-    if (Object.keys(permission).length === 0) {
-      toast.error("At least one permission must be granted");
-      return;
-    }
-
-    createMutation.mutate(
-      // Cast needed: shared Permissions type includes "team-admin" before API types are regenerated
-      {
-        name: roleName,
-        description: roleDescription || undefined,
-        permission,
-      } as Parameters<typeof createMutation.mutate>[0],
-      {
-        onSuccess: () => {
-          setCreateDialogOpen(false);
-          setRoleName("");
-          setRoleDescription("");
-          setPermission({});
-          toast.success("Role created successfully");
-        },
-        onError: (error: Error) => {
-          toast.error(error.message || "Failed to create role");
-        },
-      },
-    );
-  }, [roleDescription, roleName, permission, createMutation]);
-
-  const handleEditRole = useCallback(() => {
-    if (!selectedRole) return;
-
-    if (!roleName.trim()) {
-      toast.error("Role name is required");
-      return;
-    }
-
-    if (Object.keys(permission).length === 0) {
-      toast.error("At least one permission must be granted");
-      return;
-    }
-
-    updateMutation.mutate(
-      // Cast needed: shared Permissions type includes "team-admin" before API types are regenerated
-      {
-        roleId: selectedRole.id,
-        data: {
-          name: roleName,
-          description: roleDescription || undefined,
-          permission,
-        },
-      } as Parameters<typeof updateMutation.mutate>[0],
-      {
-        onSuccess: () => {
-          setEditDialogOpen(false);
-          setSelectedRole(null);
-          setRoleName("");
-          setRoleDescription("");
-          setPermission({});
-          toast.success("Role updated successfully");
-        },
-        onError: (error: Error) => {
-          toast.error(error.message || "Failed to update role");
-        },
-      },
-    );
-  }, [selectedRole, roleDescription, roleName, permission, updateMutation]);
-
-  const handleDeleteRole = useCallback(() => {
-    if (roleToDelete) {
-      deleteMutation.mutate(roleToDelete.id, {
-        onSuccess: () => {
-          setDeleteDialogOpen(false);
-          setRoleToDelete(null);
-          toast.success("Role deleted successfully");
-        },
-        onError: (error: Error) => {
-          toast.error(error.message || "Failed to delete role");
-        },
-      });
-    }
-  }, [roleToDelete, deleteMutation]);
-
-  const openEditDialog = useCallback((role: Role) => {
-    setSelectedRole(role);
-    setRoleName(role.name);
-    setRoleDescription(role.description ?? "");
-    setPermission(role.permission);
-    setEditDialogOpen(true);
-  }, []);
-
-  const openDuplicateDialog = useCallback((role: Role) => {
-    // Role names must be lowercase letters, numbers, and underscores only
-    // (validated by better-auth at create time). Make sure the suggested
-    // copy name follows the same rule.
-    const sanitized = role.name.toLowerCase().replace(/[^a-z0-9_]/g, "_");
-    setRoleName(`${sanitized}_copy`);
-    setRoleDescription(
-      role.description ??
-        (role.predefined
-          ? (roleDescriptions[role.name as PredefinedRoleName] ?? "")
-          : ""),
-    );
-    setPermission(role.permission);
-    setCreateDialogOpen(true);
-  }, []);
+  }, [setActionButton, router]);
 
   // Sort: predefined first, then custom
   const allRoles = [...(rolesResponse?.data ?? [])].sort((a, b) => {
@@ -216,7 +117,39 @@ export function RolesList() {
   });
   const total = rolesResponse?.pagination.total ?? 0;
 
+  // Predefined roles never enter a selection, so the counts and the offer are
+  // both about the custom ones alone.
+  const selectableOnPage = allRoles.filter((role) => !role.predefined);
+  const { effectiveRowSelection, onRowSelectionChange } =
+    useControlledRowSelection({
+      rowSelection,
+      setRowSelection,
+      rows: allRoles,
+      getRowId: (row) => row.id,
+      allMatchingSelected,
+      clearEscalation: () => setEscalatedFor(null),
+      canSelect: (row) => !row.predefined,
+    });
+  const selectedOnPage = selectableOnPage.filter(
+    (role) => effectiveRowSelection[role.id],
+  );
+  const selectedRoles =
+    allMatchingSelected && allMatchingRoles
+      ? allMatchingRoles.filter((role) => !role.predefined)
+      : selectedOnPage;
+  const customRoleTotal = allMatchingRoles
+    ? allMatchingRoles.filter((role) => !role.predefined).length
+    : Math.max(total - (allRoles.length - selectableOnPage.length), 0);
+
   const columns: ColumnDef<Role>[] = [
+    createSelectColumn<Role>({
+      rowLabel: (role) => `Select ${role.name}`,
+      allLabel: "Select all roles on this page",
+      // Predefined roles are immutable — there is nothing a bulk action could
+      // do to them.
+      canSelect: (role) => !role.predefined,
+      disabledReason: () => "Predefined roles cannot be deleted",
+    }),
     {
       id: "icon",
       size: 24,
@@ -242,7 +175,14 @@ export function RolesList() {
         const description = role.description || predefinedDescription;
         return (
           <div>
-            <div className="font-medium capitalize">{role.name}</div>
+            <RowClickShield className="contents">
+              <Link
+                href={`/settings/roles/${role.id}`}
+                className="font-medium capitalize"
+              >
+                {role.name}
+              </Link>
+            </RowClickShield>
             {description && (
               <div className="text-xs text-muted-foreground">{description}</div>
             )}
@@ -256,294 +196,171 @@ export function RolesList() {
       enableSorting: false,
       cell: ({ row }) => {
         const role = row.original;
-
-        if (role.predefined) {
-          const actions: TableRowAction[] = [
-            {
-              icon: <Eye className="h-4 w-4" />,
-              label: "View permissions",
-              onClick: () => {
-                setViewPermissionsRole(role);
-                setViewPermissionsDialogOpen(true);
+        const exportRole: TableRowAction = {
+          icon: <Download className="h-4 w-4" />,
+          label: "Export role",
+          onClick: () => downloadRoleAsJson(role),
+        };
+        // The row itself opens the role, so there is no View here; Edit and
+        // Delete exist only for custom roles.
+        const actions: TableRowAction[] = role.predefined
+          ? [exportRole]
+          : [
+              {
+                icon: <Pencil className="h-4 w-4" />,
+                label: "Edit role",
+                permissions: { ac: ["update"] },
+                onClick: () => router.push(`/settings/roles/${role.id}/edit`),
               },
-            },
-            {
-              icon: <Download className="h-4 w-4" />,
-              label: "Export role",
-              onClick: () => downloadRoleAsJson(role),
-            },
-            {
-              icon: <Copy className="h-4 w-4" />,
-              label: "Duplicate as custom role",
-              permissions: { ac: ["create"] },
-              onClick: () => openDuplicateDialog(role),
-            },
-          ];
-          return <TableRowActions actions={actions} />;
-        }
-
-        const actions: TableRowAction[] = [
-          {
-            icon: <Pencil className="h-4 w-4" />,
-            label: "Edit role",
-            permissions: { ac: ["update"] },
-            onClick: () => openEditDialog(role),
-          },
-          {
-            icon: <Download className="h-4 w-4" />,
-            label: "Export role",
-            onClick: () => downloadRoleAsJson(role),
-          },
-          {
-            icon: <Copy className="h-4 w-4" />,
-            label: "Duplicate role",
-            permissions: { ac: ["create"] },
-            onClick: () => openDuplicateDialog(role),
-          },
-          {
-            icon: <Trash2 className="h-4 w-4" />,
-            label: "Delete role",
-            permissions: { ac: ["delete"] },
-            variant: "destructive",
-            onClick: () => {
-              setRoleToDelete(role);
-              setDeleteDialogOpen(true);
-            },
-          },
-        ];
-        return <TableRowActions actions={actions} />;
+              exportRole,
+              {
+                icon: <Trash2 className="h-4 w-4" />,
+                label: "Delete role",
+                permissions: { ac: ["delete"] },
+                variant: "destructive",
+                onClick: () => setRoleToDelete(role),
+              },
+            ];
+        return <TableRowActions actions={actions} itemName={role.name} />;
       },
     },
   ];
 
   return (
     <>
-      <div className="space-y-6">
-        <SearchInput
-          objectNamePlural="roles"
-          searchFields={["name"]}
-          paramName="name"
-        />
+      <BulkActionsScope>
+        <CollectionFilters>
+          <FilterBar
+            onClearFilters={
+              nameFilter
+                ? () => updateQueryParams({ name: null, page: "1" })
+                : undefined
+            }
+            actions={headerAction}
+            search={
+              <SearchInput
+                isLoading={isLoading}
+                objectNamePlural="roles"
+                searchFields={["name"]}
+                paramName="name"
+                className={filterSearchClass}
+              />
+            }
+          />
+        </CollectionFilters>
 
-        <DataTable
-          columns={columns}
-          data={allRoles}
-          isLoading={isLoading}
-          manualPagination
-          pagination={{
-            pageIndex,
-            pageSize,
-            total,
-          }}
-          onPaginationChange={setPagination}
-          hasActiveFilters={Boolean(nameFilter)}
-          onClearFilters={() =>
-            updateQueryParams({
-              name: null,
-              page: "1",
-            })
-          }
-          emptyMessage="No roles found"
-          hideSelectedCount
-        />
-      </div>
-
-      {/* Create Role Dialog */}
-      <FormDialog
-        open={createDialogOpen}
-        onOpenChange={setCreateDialogOpen}
-        title="Create Custom Role"
-        description="Create a new custom role with specific permissions. Users with this role will only have access to the selected resources and actions."
-        size="large"
-      >
-        <DialogForm
-          className="flex min-h-0 flex-1 flex-col"
-          onSubmit={handleCreateRole}
-        >
-          <DialogBody className="space-y-4 pb-4">
-            <div className="space-y-2">
-              <Label htmlFor="name">Role Name *</Label>
-              <Input
-                id="name"
-                placeholder="e.g., Developer, Viewer, Editor"
-                value={roleName}
-                onChange={(e) => setRoleName(e.target.value)}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="description">Description</Label>
-              <Textarea
-                id="description"
-                placeholder="What this role is used for"
-                value={roleDescription}
-                onChange={(e) => setRoleDescription(e.target.value)}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>Permissions *</Label>
-              <RolePermissionBuilder
-                permission={permission}
-                onChange={setPermission}
-                userPermissions={allAvailableActions}
-              />
-            </div>
-          </DialogBody>
-          <DialogStickyFooter className="mt-0">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => {
-                setCreateDialogOpen(false);
-                setRoleName("");
-                setRoleDescription("");
-                setPermission({});
+        {isLoadingError ? (
+          <QueryLoadError
+            title="Couldn't load your roles"
+            onRetry={() => refetch()}
+          />
+        ) : (
+          <>
+            <BulkActions
+              count={selectedRoles.length}
+              noun="role"
+              onClear={clearSelection}
+              busy={bulkDelete.isPending || isFetchingAllMatching}
+              selectAllMatching={{
+                total: customRoleTotal,
+                pageFullySelected:
+                  selectableOnPage.length > 0 &&
+                  selectedOnPage.length === selectableOnPage.length,
+                active: allMatchingSelected,
+                onSelectAll: () => setEscalatedFor(filterSignature),
+                matchDescription: nameFilter
+                  ? "match this search query"
+                  : "can be deleted",
               }}
             >
-              Cancel
-            </Button>
-            <Button type="submit" disabled={createMutation.isPending}>
-              {createMutation.isPending ? "Creating..." : "Create Role"}
-            </Button>
-          </DialogStickyFooter>
-        </DialogForm>
-      </FormDialog>
+              <PermissionButton
+                permissions={{ ac: ["delete"] }}
+                variant="destructive"
+                size="sm"
+                onClick={() => setBulkDeleteOpen(true)}
+              >
+                <Trash2 className="h-4 w-4" />
+                <span>Delete</span>
+              </PermissionButton>
+            </BulkActions>
 
-      {/* Edit Role Dialog */}
-      <FormDialog
-        open={editDialogOpen}
-        onOpenChange={setEditDialogOpen}
-        title="Edit Role"
-        description="Modify the role name and permissions. Changes will affect all users with this role."
-        size="large"
-      >
-        <DialogForm
-          className="flex min-h-0 flex-1 flex-col"
-          onSubmit={handleEditRole}
-        >
-          <DialogBody className="space-y-4 pb-4">
-            <div className="space-y-2">
-              <Label htmlFor="edit-name">Role Name *</Label>
-              <Input
-                id="edit-name"
-                placeholder="e.g., Developer, Viewer, Editor"
-                value={roleName}
-                onChange={(e) => setRoleName(e.target.value)}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="edit-description">Description</Label>
-              <Textarea
-                id="edit-description"
-                placeholder="What this role is used for"
-                value={roleDescription}
-                onChange={(e) => setRoleDescription(e.target.value)}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>Permissions *</Label>
-              <RolePermissionBuilder
-                permission={permission}
-                onChange={setPermission}
-                userPermissions={allAvailableActions}
-              />
-            </div>
-          </DialogBody>
-          <DialogStickyFooter className="mt-0">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => {
-                setEditDialogOpen(false);
-                setSelectedRole(null);
-                setRoleName("");
-                setRoleDescription("");
-                setPermission({});
+            <DataTable
+              columns={columns}
+              data={allRoles}
+              onRowClick={(role, event) =>
+                openRowOnPlainClick(event, () =>
+                  router.push(`/settings/roles/${role.id}`),
+                )
+              }
+              getRowId={(row) => row.id}
+              rowSelection={effectiveRowSelection}
+              onRowSelectionChange={onRowSelectionChange}
+              isLoading={isLoading}
+              manualPagination
+              pagination={{
+                pageIndex,
+                pageSize,
+                total,
               }}
-            >
-              Cancel
-            </Button>
-            <Button type="submit" disabled={updateMutation.isPending}>
-              {updateMutation.isPending ? "Saving..." : "Save Changes"}
-            </Button>
-          </DialogStickyFooter>
-        </DialogForm>
-      </FormDialog>
+              onPaginationChange={setPagination}
+              hasActiveFilters={Boolean(nameFilter)}
+              onClearFilters={() =>
+                updateQueryParams({
+                  name: null,
+                  page: "1",
+                })
+              }
+              emptyMessage="No roles found"
+              hideSelectedCount
+            />
 
-      <FormDialog
-        open={viewPermissionsDialogOpen}
-        onOpenChange={(open) => {
-          setViewPermissionsDialogOpen(open);
-          if (!open) {
-            setViewPermissionsRole(null);
-          }
-        }}
-        title="View Predefined Role"
-        description="This is a predefined role. It cannot be modified."
-        size="large"
-      >
-        {viewPermissionsRole && (
-          <DialogBody className="space-y-4 pb-4">
-            <div className="space-y-2">
-              <Label htmlFor="view-name">Role Name</Label>
-              <Input
-                id="view-name"
-                value={viewPermissionsRole.name}
-                disabled
-                className="capitalize"
+            {bulkDeleteOpen && (
+              <DeleteConfirmDialog
+                open={bulkDeleteOpen}
+                onOpenChange={setBulkDeleteOpen}
+                title="Delete roles"
+                description={`Delete ${selectedRoles.length} ${
+                  selectedRoles.length === 1 ? "role" : "roles"
+                }? Members holding them fall back to the default role.`}
+                isPending={bulkDelete.isPending}
+                onConfirm={() => {
+                  bulkDelete.mutate(selectedRoles, {
+                    onSuccess: (outcome) => {
+                      reportBulkOutcome({
+                        outcome,
+                        verb: "Deleted",
+                        failureVerb: "delete",
+                        noun: "role",
+                      });
+                      setBulkDeleteOpen(false);
+                      if (outcome.failed.length === 0) clearSelection();
+                    },
+                  });
+                }}
+                confirmLabel="Delete roles"
+                pendingLabel="Deleting..."
               />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="view-description">Description</Label>
-              <Textarea
-                id="view-description"
-                value={
-                  viewPermissionsRole.description ||
-                  roleDescriptions[
-                    viewPermissionsRole.name as PredefinedRoleName
-                  ] ||
-                  ""
-                }
-                disabled
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>Permissions</Label>
-              <RolePermissionBuilder
-                permission={viewPermissionsRole.permission}
-                onChange={() => {}}
-                userPermissions={viewPermissionsRole.permission}
-                readOnly
-                readOnlyTooltip="This is a predefined role. Permissions cannot be modified."
-              />
-            </div>
-          </DialogBody>
+            )}
+          </>
         )}
-        <DialogStickyFooter className="mt-0">
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => {
-              setViewPermissionsDialogOpen(false);
-              setViewPermissionsRole(null);
-            }}
-          >
-            Close
-          </Button>
-        </DialogStickyFooter>
-      </FormDialog>
+      </BulkActionsScope>
 
       <DeleteConfirmDialog
-        open={deleteDialogOpen}
+        open={!!roleToDelete}
         onOpenChange={(open) => {
-          setDeleteDialogOpen(open);
-          if (!open) {
-            setRoleToDelete(null);
-          }
+          if (!open) setRoleToDelete(null);
         }}
         title="Delete Role"
         description={`Are you sure you want to delete the role "${roleToDelete?.name ?? ""}"? This action cannot be undone.`}
         isPending={deleteMutation.isPending}
-        onConfirm={handleDeleteRole}
+        onConfirm={() => {
+          if (!roleToDelete) return;
+          deleteMutation.mutate(roleToDelete.id, {
+            onSuccess: (deleted) => {
+              if (deleted) setRoleToDelete(null);
+            },
+          });
+        }}
       />
     </>
   );

@@ -1,0 +1,540 @@
+import {
+  AGENT_RUN_ATTACH_PHASES,
+  AGENT_RUNTIME_TIER_MAX_CPU_LIMIT,
+  AGENT_RUNTIME_TIER_NAME_MAX_LENGTH,
+  ApiError,
+} from "@archestra/shared";
+import {
+  createInsertSchema,
+  createSelectSchema,
+  createUpdateSchema,
+} from "drizzle-zod";
+import { z } from "zod";
+import { schema } from "@/database/schema";
+import { A2ATaskFailureSchema, A2ATaskStateSchema } from "./a2a-task";
+import type { NetworkPolicy } from "./environment";
+
+/**
+ * Runtime backends an Agent Runtime configuration can name. The enum is the
+ * seam where other backends (a VM per task or a managed sandbox) can slot in
+ * without changing the layers above it.
+ */
+export const AgentRuntimeBackendSchema = z.enum(["kubernetes"]);
+export type AgentRuntimeBackend = z.infer<typeof AgentRuntimeBackendSchema>;
+export const AgentWorkspaceStateSchema = z.enum([
+  "active",
+  "idle",
+  "suspending",
+  "suspended",
+  "resuming",
+  "deleting",
+  "deleted",
+]);
+export type AgentWorkspaceState = z.infer<typeof AgentWorkspaceStateSchema>;
+
+export const AgentRunActorKindSchema = z.enum([
+  "user",
+  "team",
+  "organization",
+  "oauthClient",
+  "serviceAccount",
+  "system",
+]);
+export type AgentRunActorKind = z.infer<typeof AgentRunActorKindSchema>;
+
+/** Non-lifecycle attention signal reported by a native runtime client. */
+export const AgentRunAttentionStateSchema = z.enum([
+  "input_required",
+  "auth_required",
+]);
+export type AgentRunAttentionState = z.infer<
+  typeof AgentRunAttentionStateSchema
+>;
+
+/**
+ * How a steer message reaches the running process.
+ *
+ * `pipe` writes to a FIFO that the client reads, so it can inject the message
+ * at the next turn boundary. `tmux_keys` types directly into the tmux session for CLIs
+ * that own their own input loop, such as Claude Code.
+ */
+export const AgentRuntimeSteerModeSchema = z.enum(["pipe", "tmux_keys"]);
+export type AgentRuntimeSteerMode = z.infer<typeof AgentRuntimeSteerModeSchema>;
+
+/**
+ * The container resources of one run: its tier's size (see
+ * `services/agent-runtime/runtime-tiers.ts`). No CPU limit by default
+ * (matching the MCP server runtime): throttling an agent loop mid-turn
+ * produces confusing timeouts rather than back-pressure.
+ */
+export const AgentRuntimeResourcesSchema = z.object({
+  cpuRequest: z.string().optional(),
+  memoryRequest: z.string().optional(),
+  cpuLimit: z.string().optional(),
+  memoryLimit: z.string().optional(),
+});
+export type AgentRuntimeResources = z.infer<typeof AgentRuntimeResourcesSchema>;
+
+/**
+ * Runtime tiers: the container sizes a run can get, as the organization's
+ * administrators define and name them (Settings > Agents > Runtime tiers). An
+ * Agent names the tier its runs get by default and the largest one a run may
+ * ask for. The resolution lives in `services/agent-runtime/runtime-tiers.ts`.
+ */
+export const AgentRuntimeTierSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(AGENT_RUNTIME_TIER_NAME_MAX_LENGTH);
+export type AgentRuntimeTier = z.infer<typeof AgentRuntimeTierSchema>;
+
+/**
+ * Limits a caller asks for one run. Each must stay within the Agent's own. A
+ * tier is chosen by name, or by the CPU and memory the work needs, which gives
+ * the smallest tier that fits and has no smaller workspace than the Agent's
+ * default tier.
+ */
+export const AgentRunLimitsRequestSchema = z.object({
+  tier: AgentRuntimeTierSchema.optional(),
+  minCpu: z
+    .number()
+    .positive()
+    .max(AGENT_RUNTIME_TIER_MAX_CPU_LIMIT)
+    .optional(),
+  minMemoryGib: z.number().positive().max(256).optional(),
+  idleTimeoutMinutes: z
+    .number()
+    .int()
+    .min(1)
+    .max(24 * 60)
+    .optional(),
+  maxDurationHours: z
+    .number()
+    .int()
+    .min(1)
+    .max(24 * 30)
+    .optional(),
+  maxCostUsd: z.number().int().min(1).max(100_000).optional(),
+});
+export type AgentRunLimitsRequest = z.infer<typeof AgentRunLimitsRequestSchema>;
+
+/**
+ * What a run got: the tier it runs at (null only on a run recorded before
+ * every run had one), its idle, duration and spend limits, and the size of
+ * its workspace volume.
+ */
+export const AgentRunLimitsSchema = z.object({
+  tier: AgentRuntimeTierSchema.nullable(),
+  idleTimeoutMinutes: z.number().int().min(1),
+  maxDurationHours: z.number().int().min(1),
+  maxCostUsd: z.number().int().min(1).nullable(),
+  workspaceGiB: z
+    .number()
+    .nonnegative()
+    .optional()
+    .describe(
+      "Size of the run's workspace volume in GiB, recorded when the workspace was created. Absent on runs whose workspace predates recorded sizes.",
+    ),
+});
+export type AgentRunLimits = z.infer<typeof AgentRunLimitsSchema>;
+
+/** Where a detached run delivers its terminal result. */
+export const AgentRunCompletionTargetSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("chatops"),
+    bindingId: z.string().uuid(),
+    threadId: z.string().min(1),
+    /**
+     * The conversation was with a Slack bot pinned to this agent, so that bot
+     * (not the main Slack app) posts the result.
+     */
+    pinnedAgentId: z.string().uuid().optional(),
+    /** Jira service fallback shares an actor, but never a requester workspace. */
+    jiraRequesterAccountId: z.string().min(1).max(256).optional(),
+    conversationReference: z.record(z.string(), z.unknown()).optional(),
+    /** Placeholder and mute state belong to this turn, not later UI continuations. */
+    originatingTaskId: z.string().uuid().optional(),
+    placeholderActivityId: z.string().optional(),
+    muteMarkerAtStart: z.string().nullable().optional(),
+  }),
+  z.object({
+    type: z.literal("email"),
+    providerId: z.string().min(1),
+    originalMessageId: z.string().min(1),
+    fromAddress: z.string().email(),
+    toAddress: z.string().email(),
+    subject: z.string().nullable(),
+  }),
+]);
+export type AgentRunCompletionTarget = z.infer<
+  typeof AgentRunCompletionTargetSchema
+>;
+
+// ===================== Credential declarations =====================
+
+/**
+ * `shared` — one organization-level value serves every user of the agent.
+ * `per_user` — each invoking user supplies their own (`user_credentials`).
+ *
+ * `per_user` exists for credentials that carry an individual's identity
+ * upstream: a personal Claude subscription token, a personal GitHub PAT. A
+ * Agent Runtime run needing one cannot start until that user has deposited it,
+ * which is why missing credentials surface as an actionable prompt rather than
+ * an opaque failure.
+ */
+export const AgentRuntimeCredentialScopeSchema = z.enum(["shared", "per_user"]);
+export type AgentRuntimeCredentialScope = z.infer<
+  typeof AgentRuntimeCredentialScopeSchema
+>;
+
+export const AgentRuntimeCredentialDeclarationSchema = z.object({
+  /** Environment variable the resolved value is injected under. */
+  key: z
+    .string()
+    .min(1)
+    .max(128)
+    .regex(
+      /^[A-Z_][A-Z0-9_]*$/,
+      "Credential keys are environment variable names (A-Z, 0-9, underscore)",
+    ),
+  scope: AgentRuntimeCredentialScopeSchema,
+  /**
+   * Stable connection identifier. Declarations sharing this identifier and
+   * scope reuse one stored secret even when their environment variable names
+   * differ. Omitted declarations retain the legacy per-Agent storage model.
+   */
+  credentialId: z
+    .string()
+    .min(1)
+    .max(128)
+    .regex(
+      /^[a-z][a-z0-9._-]*$/,
+      "Credential IDs start with a letter and use lowercase letters, numbers, dots, dashes, or underscores",
+    )
+    .optional(),
+  /** Human label shown when prompting a user to supply the credential. */
+  label: z.string().min(1).max(200),
+  /** How to obtain it, e.g. "Run `claude setup-token` and paste the result". */
+  description: z.string().max(1000).optional(),
+  required: z.boolean(),
+});
+export type AgentRuntimeCredentialDeclaration = z.infer<
+  typeof AgentRuntimeCredentialDeclarationSchema
+>;
+
+/** One credential the invoking user still needs to supply. */
+export const MissingAgentRuntimeCredentialSchema = z.object({
+  key: z.string(),
+  credentialId: z.string().optional(),
+  label: z.string(),
+  description: z.string().optional(),
+  /**
+   * False when the caller may not use the saved credential, so they cannot
+   * add their value and an admin has to share it with them first.
+   */
+  canConnect: z.boolean().optional(),
+  /**
+   * True when the credential is an organization one and only people who
+   * manage organization settings may run with it, so the caller cannot fix
+   * this by connecting anything; an admin has to run the Agent or change it.
+   */
+  adminOnly: z.boolean().optional(),
+});
+export type MissingAgentRuntimeCredential = z.infer<
+  typeof MissingAgentRuntimeCredentialSchema
+>;
+
+/**
+ * Machine-readable marker on the 409 returned when a spawn is blocked purely
+ * for want of personal credentials. Clients key the "connect your credentials"
+ * prompt off this rather than parsing prose.
+ */
+export const AGENT_RUNTIME_CREDENTIALS_REQUIRED_CODE =
+  "AGENT_RUNTIME_CREDENTIALS_REQUIRED";
+
+/**
+ * Raised when a session cannot start only because the person it would act as
+ * has not supplied credentials the Agent declares. Carries the list so every
+ * surface can name exactly what to add instead of reporting an opaque failure.
+ */
+export class AgentRuntimeCredentialsRequiredError extends ApiError {
+  readonly code = AGENT_RUNTIME_CREDENTIALS_REQUIRED_CODE;
+  readonly agentId: string;
+  readonly missing: MissingAgentRuntimeCredential[];
+
+  constructor(agentId: string, missing: MissingAgentRuntimeCredential[]) {
+    super(
+      409,
+      `This Agent's Agent Runtime needs credentials you have not set up yet: ${missing
+        .map((entry) => entry.label)
+        .join(", ")}`,
+    );
+    this.name = "AgentRuntimeCredentialsRequiredError";
+    this.agentId = agentId;
+    this.missing = missing;
+  }
+}
+
+// ===================== Agent Runtime configuration =====================
+
+export const AgentRuntimeEnvironmentEntrySchema = z.object({
+  key: z.string().min(1),
+  value: z.string(),
+});
+export type AgentRuntimeEnvironmentEntry = z.infer<
+  typeof AgentRuntimeEnvironmentEntrySchema
+>;
+
+/** Optional dedicated container runtime for delegated and long-running work. */
+export const AgentRuntimeSchema = z.object({
+  image: z.string().trim().min(1).max(2_000),
+  command: z.array(z.string()).nullable(),
+  /** Wire protocol the image uses to reach Archestra's unified model API. */
+  inferenceProtocol: z.enum(["openai_responses", "openai_chat", "anthropic"]),
+  backend: AgentRuntimeBackendSchema,
+  steerMode: AgentRuntimeSteerModeSchema,
+  privileged: z.boolean(),
+  /**
+   * The default tier of the Agent's runs, by name. Absent means the
+   * organization's default tier. A tier the organization no longer has reads
+   * as that default too.
+   */
+  tier: AgentRuntimeTierSchema.nullable().optional(),
+  /**
+   * The scaleup tier: the largest tier a caller may ask for when it starts a
+   * run, so a run can move its work to a larger run of the same Agent. Absent
+   * means the Agent's default tier; a smaller tier counts as the default tier.
+   */
+  maxTier: AgentRuntimeTierSchema.nullable().optional(),
+  /** Container ports users can forward from an active workspace. */
+  ports: z.array(z.number().int().min(1).max(65_535)).max(20).optional(),
+  environment: z.array(AgentRuntimeEnvironmentEntrySchema).nullable(),
+  credentials: z.array(AgentRuntimeCredentialDeclarationSchema).nullable(),
+  /**
+   * Whether a connected client may hand this Agent a credential VALUE through
+   * the transfer_credential tool. On unless an operator turns it off, so an
+   * Agent stored before this field existed reads as enabled. Only an explicit
+   * `false` refuses: `resolveAgentRuntime` spreads the stored JSON without
+   * re-parsing it, so a schema-level default would never reach those rows.
+   *
+   * This gates STORAGE, not exposure. transfer_credential is one global tool
+   * that takes the Agent as an argument, so the model has already sent the
+   * value by the time the handler reads this. Turning it off stops the value
+   * being persisted and injected into runs. It cannot unsee what the calling
+   * client's transcript already holds — a credential that must never enter a
+   * model's context belongs in Settings instead.
+   */
+  allowAgentSuppliedCredentialValues: z.boolean().optional(),
+  /** Native Claude account authentication and its CLI-published model alias. */
+  claudeCode: z
+    .object({
+      authentication: z.enum(["provider", "subscription"]),
+      model: z.string().trim().min(1).max(256).optional(),
+    })
+    .optional(),
+  ttlHours: z
+    .number()
+    .int()
+    .min(1)
+    .max(24 * 30)
+    .nullable(),
+  /** Hard LLM spend ceiling for the short-lived virtual key backing one run. */
+  maxCostUsd: z.number().int().min(1).max(100_000).nullable().optional(),
+  idleTimeoutMinutes: z
+    .number()
+    .int()
+    .min(1)
+    .max(24 * 60)
+    .nullable(),
+});
+export type AgentRuntime = z.infer<typeof AgentRuntimeSchema>;
+
+/** Resolved runtime: Agent-owned config plus server-only associations. */
+export type ResolvedAgentRuntime = AgentRuntime & {
+  agentId: string;
+  organizationId: string;
+  environmentId: string | null;
+  secretId: string | null;
+  /** The Agent's own egress override; absent or null inherits the environment. */
+  agentNetworkPolicy?: NetworkPolicy | null;
+};
+
+export const SelectAgentRunRecordSchema = createSelectSchema(
+  schema.agentRunsTable,
+).extend({
+  backend: AgentRuntimeBackendSchema,
+  actorKind: AgentRunActorKindSchema,
+  attentionState: z.union([AgentRunAttentionStateSchema, z.null()]),
+  completionTarget: AgentRunCompletionTargetSchema.nullable(),
+  /** Null on runs that started before limits were recorded. */
+  runtimeLimits: AgentRunLimitsSchema.nullable(),
+});
+export const InsertAgentRunRecordSchema = createInsertSchema(
+  schema.agentRunsTable,
+)
+  .extend({
+    backend: AgentRuntimeBackendSchema,
+    actorKind: AgentRunActorKindSchema,
+    attentionState: z
+      .union([AgentRunAttentionStateSchema, z.null()])
+      .optional(),
+    completionTarget: AgentRunCompletionTargetSchema.nullable().optional(),
+    runtimeLimits: AgentRunLimitsSchema.nullable().optional(),
+  })
+  .omit({ id: true, startedAt: true, endedAt: true });
+
+/**
+ * Why a FAILED run failed, in machine-readable form. `code` comes from the
+ * vocabulary in `services/agent-runtime/run-failure.ts` (or `image.<code>` for
+ * an image-owned envelope); `retriable` says whether a new run of the same
+ * Agent is likely to succeed unchanged; `message` repeats `statusReason`.
+ */
+export const AgentRunFailureSchema = A2ATaskFailureSchema.extend({
+  message: z.string(),
+});
+export type AgentRunFailure = z.infer<typeof AgentRunFailureSchema>;
+
+export const SelectAgentRunSchema = SelectAgentRunRecordSchema.omit({
+  logs: true,
+  // Read through the session-handoffs route, which checks log access.
+  originLlmSessionId: true,
+  completionTarget: true,
+  completionNotificationClaimedAt: true,
+  completionNotifiedAt: true,
+  activeDeadlineSeconds: true,
+}).extend({
+  state: A2ATaskStateSchema,
+  statusReason: z.string().nullable(),
+  /** Null unless the run FAILED and its failure was classified. */
+  failure: AgentRunFailureSchema.nullable(),
+  stateChangedAt: z.date().nullable(),
+  /** Effective Kubernetes lifetime limit, resolved for this run. */
+  hardDeadlineAt: z.date(),
+  /** Most recent model-router request attributed to this run. */
+  lastModelActivityAt: z.date().nullable(),
+});
+
+/** Run metadata shown to Agent managers alongside the runtime state. */
+export const SelectAgentRunListItemSchema = SelectAgentRunSchema.extend({
+  /** The run's stable id across turns: its workspace, or its only task. */
+  sessionId: z.string().uuid(),
+  initiatorName: z.string().nullable(),
+  /** The run's saved files; null for a run that never had a workspace. */
+  workspace: z
+    .object({ state: AgentWorkspaceStateSchema, expiresAt: z.date() })
+    .nullable(),
+  canAttach: z.boolean().optional(),
+  /** Who the run is shared with, derived from its permission policy. */
+  shareVisibility: z.union([
+    z.enum(["organization", "team", "user"]),
+    z.null(),
+  ]),
+  shareTeamNames: z
+    .array(z.string())
+    .nullable()
+    .describe("Share recipient teams; null unless the viewer owns the run"),
+  shareUserNames: z
+    .array(z.string())
+    .nullable()
+    .describe("Share recipient users; null unless the viewer owns the run"),
+});
+
+/** A user's durable run session as rendered in Chat and its sidebar. */
+export const SelectAgentRunSessionSchema = SelectAgentRunSchema.extend({
+  sessionId: z.string().uuid(),
+  llmSessionId: z
+    .string()
+    .describe(
+      "Key of the run's LLM logs (/llm/logs/:id): the session id its runtime sends",
+    ),
+  prompt: z.string(),
+  agent: z.object({
+    id: z.string().uuid(),
+    name: z.string(),
+    icon: z.string().nullable(),
+  }),
+  projectName: z.string().nullable(),
+  projectIcon: z.string().nullable(),
+});
+
+/**
+ * How the requesting user relates to a run they're allowed to open.
+ * `owner` started it; `shared` is not its owner. Terminal access is conveyed
+ * separately by `canAttach`, including managers of an owning service account.
+ */
+export const AgentRunViewerRoleSchema = z.enum(["owner", "shared"]);
+
+/** A point-in-time view of what an active runtime is waiting on. */
+export const AgentRunStartupProgressSchema = z.object({
+  phase: z.enum(AGENT_RUN_ATTACH_PHASES),
+  message: z.string(),
+  detail: z.string().nullable(),
+  resourceName: z.string().nullable(),
+});
+export type AgentRunStartupProgress = z.infer<
+  typeof AgentRunStartupProgressSchema
+>;
+
+/** A single run session plus the viewer's relationship to it. */
+/** A run session plus whether its completed turn's CLI is still attachable. */
+export const AgentRunSessionResponseSchema = SelectAgentRunSessionSchema.extend(
+  { terminalRetained: z.boolean() },
+);
+
+export const GetAgentRunResponseSchema = AgentRunSessionResponseSchema.extend({
+  portForwardCommand: z.string().nullable().optional(),
+  workspace: z
+    .object({
+      state: AgentWorkspaceStateSchema,
+      expiresAt: z.date(),
+      idleAt: z.date().nullable(),
+      connection: z
+        .object({ hostname: z.string(), shellCommand: z.string() })
+        .nullable(),
+    })
+    .nullable()
+    .optional(),
+  viewerRole: AgentRunViewerRoleSchema,
+  canAttach: z.boolean().optional(),
+  /** Present on the detail endpoint while an owned run is starting. */
+  startupProgress: AgentRunStartupProgressSchema.nullable().optional(),
+});
+
+export const UpdateAgentRunSchema = createUpdateSchema(schema.agentRunsTable)
+  .pick({ title: true, pinnedAt: true, projectId: true })
+  .extend({
+    title: z.string().trim().min(1).max(100).optional(),
+    pinnedAt: z.string().datetime().nullable().optional(),
+    projectId: z.string().uuid().nullable().optional(),
+  })
+  .refine(
+    ({ title, pinnedAt, projectId }) =>
+      title !== undefined || pinnedAt !== undefined || projectId !== undefined,
+    "At least one field must be provided",
+  );
+
+export const StartAgentRunResponseSchema = z.object({
+  sessionId: z.string().uuid().optional(),
+  taskId: z.string().uuid(),
+  state: A2ATaskStateSchema,
+  agentId: z.string().uuid(),
+  agentName: z.string(),
+  prompt: z.string(),
+  projectId: z.string().uuid().nullable(),
+  createdAt: z.date(),
+  /** The tier and limits the run got, within the Agent's own; null for a continuation of a run that recorded none. */
+  limits: AgentRunLimitsSchema.nullable(),
+});
+
+export type AgentRunRecord = z.infer<typeof SelectAgentRunRecordSchema>;
+export type InsertAgentRunRecord = z.infer<typeof InsertAgentRunRecordSchema>;
+export type AgentRun = z.infer<typeof SelectAgentRunSchema>;
+export type AgentRunListItem = z.infer<typeof SelectAgentRunListItemSchema>;
+export type AgentRunSession = z.infer<typeof SelectAgentRunSessionSchema>;
+export type AgentRunViewerRole = z.infer<typeof AgentRunViewerRoleSchema>;
+export type GetAgentRunResponse = z.infer<typeof GetAgentRunResponseSchema>;
+
+export const SelectUserCredentialSchema = createSelectSchema(
+  schema.userCredentialsTable,
+);
+export type UserCredential = z.infer<typeof SelectUserCredentialSchema>;

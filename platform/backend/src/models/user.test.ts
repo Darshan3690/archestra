@@ -1,8 +1,43 @@
-import { ADMIN_ROLE_NAME, MEMBER_ROLE_NAME } from "@shared";
-import { predefinedPermissionsMap } from "@shared/access-control";
+import { ADMIN_ROLE_NAME, MEMBER_ROLE_NAME } from "@archestra/shared";
+import { predefinedPermissionsMap } from "@archestra/shared/access-control";
+import { eq } from "drizzle-orm";
+import db, { schema, withDbTransaction } from "@/database";
 import { beforeEach, describe, expect, test } from "@/test";
+import McpServerModel from "./mcp-server";
 import MemberModel from "./member";
+import SecretModel from "./secret";
+import SkillModel from "./skill";
 import UserModel from "./user";
+
+describe("UserModel.getProxyIdentity", () => {
+  test("reads current user metadata only for an existing membership in the requested organization", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+  }) => {
+    const org = await makeOrganization();
+    const other = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id);
+    await expect(UserModel.getProxyIdentity(user.id, org.id)).resolves.toEqual({
+      id: user.id,
+      email: user.email,
+      name: user.name,
+    });
+    await expect(
+      UserModel.getProxyIdentity(user.id, other.id),
+    ).resolves.toBeNull();
+
+    await UserModel.patch(user.id, { name: "Updated proxy owner" });
+    expect((await UserModel.getProxyIdentity(user.id, org.id))?.name).toBe(
+      "Updated proxy owner",
+    );
+    await MemberModel.deleteAllByUserId(user.id);
+    await expect(
+      UserModel.getProxyIdentity(user.id, org.id),
+    ).resolves.toBeNull();
+  });
+});
 
 describe("User.getUserPermissions", () => {
   let testOrgId: string;
@@ -97,6 +132,44 @@ describe("UserModel.findByEmail", () => {
 });
 
 describe("UserModel.delete", () => {
+  test("soft-deletes private agents before their author is removed", async ({
+    makeAgent,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const organization = await makeOrganization();
+    const user = await makeUser();
+    const privateAgent = await makeAgent({
+      organizationId: organization.id,
+      authorId: user.id,
+      agentType: "agent",
+      access: "personal",
+    });
+    const sharedAgent = await makeAgent({
+      organizationId: organization.id,
+      authorId: user.id,
+      agentType: "agent",
+      access: "org",
+    });
+
+    await withDbTransaction(async (tx) => {
+      expect(await UserModel.delete(user.id, tx)).toBe(true);
+    });
+
+    const agents = await db
+      .select({
+        id: schema.agentsTable.id,
+        deletedAt: schema.agentsTable.deletedAt,
+      })
+      .from(schema.agentsTable);
+    expect(
+      agents.find((agent) => agent.id === privateAgent.id)?.deletedAt,
+    ).not.toBeNull();
+    expect(
+      agents.find((agent) => agent.id === sharedAgent.id)?.deletedAt,
+    ).toBeNull();
+  });
+
   test("should delete a user", async ({ makeUser }) => {
     const user = await makeUser({ email: "deleteme@test.com" });
 
@@ -137,5 +210,307 @@ describe("UserModel.delete", () => {
     const deleted = await UserModel.delete(crypto.randomUUID());
 
     expect(deleted).toBe(false);
+  });
+});
+
+/**
+ * Deleting a user must take the skills only they could reach with them.
+ * `skills.author_id` is `set null`, so without this such a skill survives as an
+ * active orphan no one can see or edit. A skill the author shared by grant
+ * stays: its recipients still use it.
+ *
+ * Soft-deleted, not purged: content stays recoverable, and nothing here can
+ * fail on a cascade FK and block the user's removal.
+ */
+describe("UserModel.delete personal skill cleanup", () => {
+  test("soft-deletes the user's author-only skills and keeps skills shared by grant", async ({
+    makeUser,
+    makeOrganization,
+    makeTeam,
+    makeSkill,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const bystander = await makeUser({ email: "bystander@test.com" });
+    const team = await makeTeam(org.id, bystander.id);
+    const authorOnly = await makeSkill(org.id, {
+      authorId: user.id,
+      name: "own-notes",
+    });
+    // Shared by grant with a person, a team, or the organization: each keeps
+    // a recipient, so none is the departing user's to take along.
+    const sharedWithPerson = await makeSkill(org.id, {
+      authorId: user.id,
+      name: "shared-notes",
+      access: { users: [user.id, bystander.id], preset: "view" },
+    });
+    const sharedWithTeam = await makeSkill(org.id, {
+      authorId: user.id,
+      name: "team-runbook",
+      access: { teams: [team.id] },
+    });
+    const sharedWithOrg = await makeSkill(org.id, {
+      authorId: user.id,
+      name: "org-runbook",
+      access: "org",
+    });
+    const someoneElses = await makeSkill(org.id, {
+      authorId: bystander.id,
+      name: "their-notes",
+    });
+
+    expect(await UserModel.delete(user.id)).toBe(true);
+
+    // Soft-deleted, not purged: the row survives with `deletedAt` stamped,
+    // invisible to filtered reads.
+    expect(await SkillModel.findById(authorOnly.id)).toBeNull();
+    expect(
+      await SkillModel.findDeletedById(authorOnly.id, org.id),
+    ).not.toBeNull();
+    for (const kept of [
+      sharedWithPerson,
+      sharedWithTeam,
+      sharedWithOrg,
+      someoneElses,
+    ]) {
+      expect(await SkillModel.findById(kept.id)).not.toBeNull();
+    }
+  });
+
+  test("runs the same cleanup inside a caller's transaction", async ({
+    makeUser,
+    makeOrganization,
+    makeSkill,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const personal = await makeSkill(org.id, {
+      authorId: user.id,
+      name: "tx-notes",
+    });
+
+    await withDbTransaction(async (tx) => {
+      expect(await UserModel.delete(user.id, tx)).toBe(true);
+    });
+
+    expect(await SkillModel.findById(personal.id)).toBeNull();
+    expect(
+      await SkillModel.findDeletedById(personal.id, org.id),
+    ).not.toBeNull();
+  });
+});
+
+/**
+ * Deleting a user must take their personal MCP credentials with them.
+ * `mcp_server.owner_id` is `set null`, so without an explicit purge the install
+ * survives ownerless with its secret bag (OAuth tokens, prompted secrets) intact.
+ *
+ * These go through `UserModel.delete` rather than the model method directly:
+ * the original bug was that the cleanup lived in better-auth's
+ * `user.delete.before` hook, which a raw Drizzle delete never fires. Testing
+ * the real deletion entry point is the point.
+ */
+describe("UserModel.delete personal MCP credential cleanup", () => {
+  test("purges the user's personal MCP install and its credential secret", async ({
+    makeUser,
+    makeMcpServer,
+  }) => {
+    const user = await makeUser();
+    const secret = await SecretModel.create({
+      name: "personal-oauth",
+      secret: { access_token: "at-1", refresh_token: "rt-1" },
+    });
+    const server = await makeMcpServer({
+      ownerId: user.id,
+      scope: "personal",
+      serverType: "remote",
+      secretId: secret.id,
+    });
+
+    await UserModel.delete(user.id);
+
+    expect(await McpServerModel.findById(server.id)).toBeNull();
+    expect(await SecretModel.findById(secret.id)).toBeNull();
+  });
+
+  test("purges soft-deleted personal installs, whose secrets uninstall deliberately retains", async ({
+    makeUser,
+    makeMcpServer,
+  }) => {
+    const user = await makeUser();
+    const secret = await SecretModel.create({
+      name: "retained-after-uninstall",
+      secret: { access_token: "at-2" },
+    });
+    // Uninstall keeps the row + secret so a restore can recover credentials.
+    // Once the owner is gone nobody can restore it, so it is pure residue.
+    const server = await makeMcpServer({
+      ownerId: user.id,
+      scope: "personal",
+      serverType: "remote",
+      secretId: secret.id,
+      deletedAt: new Date(),
+    });
+
+    await UserModel.delete(user.id);
+
+    const [row] = await db
+      .select()
+      .from(schema.mcpServersTable)
+      .where(eq(schema.mcpServersTable.id, server.id));
+    expect(row).toBeUndefined();
+    expect(await SecretModel.findById(secret.id)).toBeNull();
+  });
+
+  test("leaves org- and team-scoped installs owned by the user alone", async ({
+    makeUser,
+    makeOrganization,
+    makeTeam,
+    makeMcpServer,
+  }) => {
+    const user = await makeUser();
+    const org = await makeOrganization();
+    const team = await makeTeam(org.id, user.id);
+
+    // scope is the discriminator, NOT owner_id — shared installs legitimately
+    // outlive the person who happened to install them.
+    const orgSecret = await SecretModel.create({
+      name: "org-cred",
+      secret: { access_token: "org" },
+    });
+    const orgServer = await makeMcpServer({
+      ownerId: user.id,
+      scope: "org",
+      serverType: "remote",
+      secretId: orgSecret.id,
+    });
+    const teamSecret = await SecretModel.create({
+      name: "team-cred",
+      secret: { access_token: "team" },
+    });
+    const teamServer = await makeMcpServer({
+      ownerId: user.id,
+      scope: "team",
+      teamId: team.id,
+      serverType: "remote",
+      secretId: teamSecret.id,
+    });
+
+    await UserModel.delete(user.id);
+
+    expect(await McpServerModel.findById(orgServer.id)).not.toBeNull();
+    expect(await SecretModel.findById(orgSecret.id)).not.toBeNull();
+    expect(await McpServerModel.findById(teamServer.id)).not.toBeNull();
+    expect(await SecretModel.findById(teamSecret.id)).not.toBeNull();
+  });
+
+  test("leaves another user's personal install alone", async ({
+    makeUser,
+    makeMcpServer,
+  }) => {
+    const deletedUser = await makeUser();
+    const otherUser = await makeUser();
+    const otherSecret = await SecretModel.create({
+      name: "other-cred",
+      secret: { access_token: "other" },
+    });
+    const otherServer = await makeMcpServer({
+      ownerId: otherUser.id,
+      scope: "personal",
+      serverType: "remote",
+      secretId: otherSecret.id,
+    });
+
+    await UserModel.delete(deletedUser.id);
+
+    expect(await McpServerModel.findById(otherServer.id)).not.toBeNull();
+    expect(await SecretModel.findById(otherSecret.id)).not.toBeNull();
+  });
+
+  test("still deletes the user when an install carries no secret", async ({
+    makeUser,
+    makeMcpServer,
+  }) => {
+    const user = await makeUser();
+    const server = await makeMcpServer({
+      ownerId: user.id,
+      scope: "personal",
+      serverType: "remote",
+      secretId: null,
+    });
+
+    expect(await UserModel.delete(user.id)).toBe(true);
+    expect(await McpServerModel.findById(server.id)).toBeNull();
+  });
+
+  // Regression: the auth flows (rejected-SSO cleanup, linked-IdP temp users)
+  // call UserModel.delete inside withDbTransaction. Cleanup running on the
+  // base connection while the caller's transaction is open deadlocks the
+  // single-connection test database — this test hangs, not fails, if that
+  // regresses.
+  test("delete inside a caller's transaction purges installs on the same executor", async ({
+    makeUser,
+    makeMcpServer,
+  }) => {
+    const user = await makeUser();
+    const plainSecret = await SecretModel.create({
+      name: "tx-plain",
+      secret: { access_token: "at-tx" },
+    });
+    const plainServer = await makeMcpServer({
+      ownerId: user.id,
+      scope: "personal",
+      serverType: "remote",
+      secretId: plainSecret.id,
+    });
+    const vaultSecret = await SecretModel.create({
+      name: "tx-vault",
+      secret: { vaultPath: "kv/data/creds" },
+      isVault: true,
+    });
+    const vaultServer = await makeMcpServer({
+      ownerId: user.id,
+      scope: "personal",
+      serverType: "remote",
+      secretId: vaultSecret.id,
+    });
+
+    await withDbTransaction(async (tx) => {
+      expect(await UserModel.delete(user.id, tx)).toBe(true);
+    });
+
+    const [userRow] = await db
+      .select()
+      .from(schema.usersTable)
+      .where(eq(schema.usersTable.id, user.id));
+    expect(userRow).toBeUndefined();
+    expect(await McpServerModel.findById(plainServer.id)).toBeNull();
+    expect(await McpServerModel.findById(vaultServer.id)).toBeNull();
+    expect(await SecretModel.findById(plainSecret.id)).toBeNull();
+    // Vault-backed secret rows survive: SQL cannot purge the backing store,
+    // and the row is the only pointer left for a manual sweep.
+    expect(await SecretModel.findById(vaultSecret.id)).not.toBeNull();
+  });
+});
+
+describe("UserModel.createOrGetExistingDefaultAdminUser", () => {
+  test("signs a new admin up through Better Auth, then returns the same user", async () => {
+    const email = "first-admin@example.com";
+
+    const created = await UserModel.createOrGetExistingDefaultAdminUser({
+      email,
+      password: "first-admin-password",
+      name: "First Admin",
+    });
+
+    expect(created).toMatchObject({ email, name: "First Admin" });
+    const [row] = await db
+      .select()
+      .from(schema.usersTable)
+      .where(eq(schema.usersTable.email, email));
+    expect(row).toMatchObject({ role: ADMIN_ROLE_NAME, emailVerified: true });
+    await expect(
+      UserModel.createOrGetExistingDefaultAdminUser({ email }),
+    ).resolves.toMatchObject({ id: created?.id });
   });
 });

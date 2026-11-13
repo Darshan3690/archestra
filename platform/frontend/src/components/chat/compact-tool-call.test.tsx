@@ -1,12 +1,35 @@
-import { render, screen } from "@testing-library/react";
+import {
+  TOOL_EXECUTE_REMEDY_PLAN_SHORT_NAME,
+  TOOL_GET_REMEDY_PLANS_SHORT_NAME,
+  TOOL_LOAD_SKILL_SHORT_NAME,
+  TOOL_RUN_TOOL_SHORT_NAME,
+} from "@archestra/shared";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useHasPermissions, useSession } from "@/lib/auth/auth.query";
+import { useExternalMcpSkills } from "@/lib/skills/skill.query";
 
 const mockIsToolName = vi.fn();
+const mockGetToolShortName = vi.fn();
 
 vi.mock("@/lib/mcp/archestra-mcp-server", () => ({
   useArchestraMcpIdentity: () => ({
     isToolName: mockIsToolName,
+    getToolShortName: mockGetToolShortName,
   }),
+}));
+
+vi.mock("@/lib/auth/auth.query");
+vi.mock("@/lib/skills/skill.query");
+vi.mock("@/lib/runtime-credentials.query", () => ({
+  useRuntimeCredentials: () => ({ data: [] }),
+}));
+vi.mock("@/components/settings/runtime-credential-definition-dialog", () => ({
+  RuntimeCredentialDefinitionDialog: () => (
+    <div role="dialog">Add credential</div>
+  ),
 }));
 
 vi.mock("@/components/mcp-catalog-icon", () => ({
@@ -20,10 +43,657 @@ vi.mock("@/components/mcp-catalog-icon", () => ({
 }));
 
 import { CompactToolGroup } from "./compact-tool-call";
+import { RemedyChainCard } from "./openappa-remedy-chain-card";
+import { identifyRemedyChains } from "./openappa-remedy-chains";
+
+const LOAD_SKILL_TOOL_NAME = "archestra__load_skill";
+
+function loadSkillEntry(input: Record<string, unknown>) {
+  return {
+    kind: "tool" as const,
+    key: "load-skill-1",
+    toolName: LOAD_SKILL_TOOL_NAME,
+    part: {
+      type: `tool-${LOAD_SKILL_TOOL_NAME}`,
+      state: "output-available",
+      toolCallId: "call-1",
+      input,
+      output: { ok: true },
+    } as never,
+    toolResultPart: null,
+    errorText: undefined,
+  };
+}
 
 describe("CompactToolGroup", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    sessionStorage.clear();
+    // Default: no tool is treated as `load_skill`, so CompactCircle stays on
+    // the default code path. Tests that exercise the SkillPill branch can
+    // override per-call.
+    mockGetToolShortName.mockReturnValue(null);
+    vi.mocked(useSession).mockReturnValue({ data: undefined } as never);
+    vi.mocked(useHasPermissions).mockReturnValue({ data: false } as never);
+    vi.mocked(useExternalMcpSkills).mockReturnValue({ data: [] } as never);
+  });
+
+  it("opens a saved policy's circle on its one-line result, with no diff", () => {
+    mockGetToolShortName.mockImplementation((name: string) =>
+      name === "archestra__update_guardrails_policy"
+        ? "update_guardrails_policy"
+        : null,
+    );
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CompactToolGroup
+          tools={[
+            {
+              kind: "tool",
+              key: "publish",
+              toolName: "archestra__update_guardrails_policy",
+              part: {
+                type: "tool-archestra__update_guardrails_policy",
+                state: "output-available",
+                toolCallId: "publish",
+                input: {},
+                output: {
+                  structuredContent: {
+                    delivery: "revision",
+                    revision: 1,
+                    before: "starter",
+                    after: "starter",
+                    enforcement: { enabled: true },
+                    effective: { error: null, batteries: [] },
+                  },
+                },
+              } as never,
+              toolResultPart: null,
+              errorText: undefined,
+            },
+          ]}
+        />
+      </QueryClientProvider>,
+    );
+    expect(
+      screen.getByRole("link", { name: "View Guardrails" }),
+    ).toHaveAttribute("href", "/openappa");
+    expect(
+      screen.getByRole("button", { name: "update guardrails policy" }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("Saved revision 1")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Policy diff")).not.toBeInTheDocument();
+  });
+
+  it("keeps saved validations visible without claiming a run or policy activation", () => {
+    mockGetToolShortName.mockImplementation((name: string) =>
+      name.replace(/^archestra__/, ""),
+    );
+    const client = new QueryClient();
+    const publication = {
+      delivery: "revision",
+      revision: 2,
+      version: "specs-v2",
+      policyChanged: false,
+      validation: { valid: true, errors: [], warnings: [] },
+    };
+    const show = (output: unknown) => (
+      <QueryClientProvider client={client}>
+        <CompactToolGroup
+          tools={[
+            {
+              kind: "tool",
+              key: "publish",
+              toolName: "archestra__update_guardrails_validation",
+              part: {
+                type: "tool-archestra__update_guardrails_validation",
+                state: "output-available",
+                toolCallId: "publish",
+                input: {},
+                output,
+              } as never,
+              toolResultPart: null,
+              errorText: undefined,
+            },
+          ]}
+        />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(show({ structuredContent: publication }));
+    expect(screen.getByText("Saved validations")).toBeInTheDocument();
+    expect(screen.getByText(/not run yet/)).toBeInTheDocument();
+    expect(screen.queryByText(/draft replay/)).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "View Validations" }),
+    ).toHaveAttribute("href", "/openappa/validation");
+    expect(
+      screen.getByRole("button", {
+        name: "update guardrails validation",
+      }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(screen.queryByText(/Enforcement confirmed/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Saved revision/)).not.toBeInTheDocument();
+    rerender(show({ content: JSON.stringify(publication) }));
+    expect(screen.getByText("Saved validations")).toBeInTheDocument();
+    rerender(
+      show({
+        structuredContent: {
+          ...publication,
+          delivery: "pull_request",
+          number: 17,
+          url: "https://github.com/example/policies/pull/17",
+          before: "unchanged policy",
+          after: "unchanged policy",
+        },
+      }),
+    );
+    expect(
+      screen.getByRole("link", { name: "Review pull request" }),
+    ).toHaveAttribute("href", "https://github.com/example/policies/pull/17");
+    expect(screen.getByText(/merge it to apply/)).toBeInTheDocument();
+    expect(screen.queryByText("Saved validations")).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "update guardrails validation",
+      }),
+    );
+    expect(screen.queryByLabelText("Policy diff")).not.toBeInTheDocument();
+    rerender(show({ structuredContent: publication, isError: true }));
+    expect(
+      screen.queryByRole("link", { name: "View Validations" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("opens the native credential dialog for a completed compact chat tool call", () => {
+    mockGetToolShortName.mockImplementation((name: string) =>
+      name === "archestra__request_runtime_credential_setup"
+        ? "request_runtime_credential_setup"
+        : null,
+    );
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CompactToolGroup
+          tools={[
+            {
+              kind: "tool",
+              key: "setup",
+              toolName: "archestra__request_runtime_credential_setup",
+              part: {
+                type: "tool-archestra__request_runtime_credential_setup",
+                state: "output-available",
+                toolCallId: "setup-call",
+                input: { kind: "github_app" },
+                output: {
+                  action: "open_credential_dialog",
+                  kind: "github_app",
+                },
+              } as never,
+              toolResultPart: null,
+              errorText: undefined,
+            },
+          ]}
+        />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByRole("dialog", { name: "" })).toHaveTextContent(
+      "Add credential",
+    );
+  });
+
+  it.each([
+    { turnActive: true, name: "read file (running)", dot: "bg-blue-500" },
+    { turnActive: false, name: "read file (blocked)", dot: "bg-orange-500" },
+  ])("shows a negotiating guarded call as running while its turn is active ($turnActive)", ({
+    turnActive,
+    name,
+    dot,
+  }) => {
+    mockGetToolShortName.mockImplementation((toolName: string) =>
+      toolName.startsWith("archestra__")
+        ? toolName.replace("archestra__", "")
+        : null,
+    );
+    const ruling =
+      '[appa] Blocked.\n  - archestra__execute_remedy_plan(offer_id: "0d0d0d0d0d0d0d0d")';
+    const notice = {
+      type: "tool-archestra__get_remedy_plans",
+      state: "output-available",
+      toolCallId: "call-notice",
+      input: {
+        tool: "fs__read_file",
+        arguments: {},
+        ruling,
+        notice: { v: 1, call_id: "call-notice" },
+      },
+      output: ruling,
+    };
+    const [chain] = identifyRemedyChains([notice], {
+      getToolShortName: mockGetToolShortName,
+    });
+
+    render(
+      <CompactToolGroup
+        turnActive={turnActive}
+        tools={[
+          {
+            kind: "tool",
+            key: "chain-1",
+            toolName: "archestra__get_remedy_plans",
+            part: notice as never,
+            toolResultPart: null,
+            errorText: undefined,
+            remedyChain: chain,
+          },
+        ]}
+      />,
+    );
+
+    const circle = screen.getByRole("button", { name });
+    const statusDot = circle.querySelector("span.absolute");
+    expect(statusDot?.className).toContain(dot);
+    expect(statusDot?.className.includes("animate-pulse")).toBe(turnActive);
+  });
+
+  it.each([
+    { released: false, dialogs: 0 },
+    { released: true, dialogs: 1 },
+  ])("opens a guarded credential setup's dialog only once it is released (released: $released)", ({
+    released,
+    dialogs,
+  }) => {
+    mockGetToolShortName.mockImplementation((name: string) =>
+      name.startsWith("archestra__") ? name.replace("archestra__", "") : null,
+    );
+    const target = "archestra__request_runtime_credential_setup";
+    const ruling =
+      '[appa] Blocked.\n  - archestra__execute_remedy_plan(offer_id: "0c0c0c0c0c0c0c0c")';
+    const notice = {
+      type: "tool-archestra__get_remedy_plans",
+      state: "output-available",
+      toolCallId: "call-notice",
+      input: {
+        tool: target,
+        arguments: { kind: "github_app" },
+        ruling,
+        notice: { v: 1, call_id: "call-notice" },
+      },
+      output: ruling,
+    };
+    const parts: unknown[] = [
+      notice,
+      {
+        type: "tool-archestra__execute_remedy_plan",
+        state: "output-available",
+        toolCallId: "call-remedy",
+        input: { offer_id: "0c0c0c0c0c0c0c0c" },
+        output: "[appa] Authorized.",
+      },
+    ];
+    if (released) {
+      parts.push({
+        type: `tool-${target}`,
+        state: "output-available",
+        toolCallId: "call-retry",
+        input: { kind: "github_app" },
+        output: { action: "open_credential_dialog", kind: "github_app" },
+      });
+    }
+    const [chain] = identifyRemedyChains(parts, {
+      getToolShortName: mockGetToolShortName,
+    });
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CompactToolGroup
+          tools={[
+            {
+              kind: "tool",
+              key: "chain-1",
+              toolName: "archestra__get_remedy_plans",
+              part: notice as never,
+              toolResultPart: null,
+              errorText: undefined,
+              remedyChain: chain,
+            },
+          ]}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(screen.queryAllByRole("dialog", { name: "" })).toHaveLength(dialogs);
+  });
+
+  it("shows a denial notice's arguments as the object they hold", async () => {
+    const noticeToolName = "archestra__get_remedy_plans";
+    mockGetToolShortName.mockImplementation((name: string) =>
+      name === noticeToolName ? TOOL_GET_REMEDY_PLANS_SHORT_NAME : null,
+    );
+    vi.mocked(useSession).mockReturnValue({ data: undefined } as never);
+
+    // The expanded card reaches for queries of its own, so it needs a client.
+    const { container } = render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CompactToolGroup
+          tools={[
+            {
+              kind: "tool",
+              key: "notice-1",
+              toolName: noticeToolName,
+              part: {
+                type: `tool-${noticeToolName}`,
+                state: "output-available",
+                toolCallId: "call-notice",
+                // The blocked call's arguments arrive in their wire form: a JSON
+                // string on the OpenAI families.
+                input: {
+                  tool: "archestra__load_skill",
+                  arguments: '{"name":"appa-guide"}',
+                  ruling: "[appa] Blocked: this call cannot run yet.",
+                  notice: { v: 1, call_id: "call-notice" },
+                },
+                output: "[appa] Blocked: this call cannot run yet.",
+              } as never,
+              toolResultPart: null,
+              errorText: undefined,
+            },
+          ]}
+        />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole("button"));
+
+    expect(container).toHaveTextContent('"name": "appa-guide"');
+  });
+
+  it.each([
+    {
+      ruling: "deny",
+      text: "[appa] Denied: the human reviewer refused this call to archestra__todo_write.",
+      circle: "Guardrails step (denied by you)",
+      header: "Denied by you",
+    },
+    {
+      ruling: "approve",
+      text: "[appa] Authorized. Call the archestra__todo_write tool again with exactly these arguments: {}",
+      circle: "Guardrails step (approved by you)",
+      header: "Approved by you",
+    },
+    {
+      // The reviewer approved, but a policy publish retired the offer first.
+      ruling: "superseded",
+      text: "[appa] this offer no longer stands; re-propose the call",
+      circle: "Guardrails step (policy changed, the agent will ask again)",
+      header: "Policy changed, the agent will ask again",
+    },
+  ])("says the viewer's own ruling on a reviewed remedy ($ruling)", ({
+    ruling,
+    text,
+    circle,
+    header,
+  }) => {
+    const remedyToolName = "archestra__execute_remedy_plan";
+    mockGetToolShortName.mockImplementation((name: string) =>
+      name === remedyToolName ? TOOL_EXECUTE_REMEDY_PLAN_SHORT_NAME : null,
+    );
+    vi.mocked(useSession).mockReturnValue({ data: undefined } as never);
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CompactToolGroup
+          tools={[
+            {
+              kind: "tool",
+              key: "remedy-1",
+              toolName: remedyToolName,
+              part: {
+                type: `tool-${remedyToolName}`,
+                state: "output-available",
+                toolCallId: "call-remedy",
+                input: { offer_id: "offer-1", plan: "Human review" },
+                output: {
+                  content: text,
+                  _meta: { archestraHumanRuling: ruling },
+                },
+              } as never,
+              toolResultPart: null,
+              errorText: undefined,
+            },
+          ]}
+        />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: circle }));
+
+    expect(screen.getByText(header)).toBeInTheDocument();
+    expect(screen.queryByText("Completed")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    { humanRuling: undefined, label: "Blocked" },
+    { humanRuling: "deny", label: "Denied by you" },
+  ])("names a guarded call by its target until it is released ($label)", ({
+    humanRuling,
+    label,
+  }) => {
+    mockGetToolShortName.mockImplementation((name: string) =>
+      name.startsWith("archestra__") ? name.replace("archestra__", "") : null,
+    );
+    const ruling =
+      '[appa] Blocked.\n  - archestra__execute_remedy_plan(offer_id: "0b0b0b0b0b0b0b0b", plan: "Accept")';
+    const notice = {
+      type: "tool-archestra__get_remedy_plans",
+      state: "output-available",
+      toolCallId: "call-notice",
+      input: {
+        tool: "fs__read_file",
+        arguments: { path: "/notes.md" },
+        ruling,
+        notice: { v: 1, call_id: "call-notice" },
+      },
+      output: ruling,
+    };
+    const [chain] = identifyRemedyChains(
+      [
+        notice,
+        {
+          type: "tool-archestra__execute_remedy_plan",
+          state: "output-available",
+          toolCallId: "call-remedy",
+          input: { offer_id: "0b0b0b0b0b0b0b0b", plan: "Accept" },
+          output: {
+            content: [{ type: "text", text: "[appa] Not authorized." }],
+            ...(humanRuling
+              ? { _meta: { archestraHumanRuling: humanRuling } }
+              : {}),
+          },
+        },
+      ],
+      { getToolShortName: mockGetToolShortName },
+    );
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CompactToolGroup
+          tools={[
+            {
+              kind: "tool",
+              key: "chain-1",
+              toolName: "archestra__get_remedy_plans",
+              part: notice as never,
+              toolResultPart: null,
+              errorText: undefined,
+              remedyChain: chain,
+            },
+          ]}
+        />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `read file (${label.toLowerCase()})`,
+      }),
+    );
+
+    expect(screen.getByText("fs__read_file")).toBeInTheDocument();
+    expect(screen.getAllByText(label).length).toBeGreaterThan(0);
+    expect(screen.getByText("Guardrails")).toBeInTheDocument();
+    expect(
+      screen
+        .getAllByText(/^(Checked what's allowed|Guardrails step)$/)
+        .map((node) => node.textContent),
+    ).toEqual(["Checked what's allowed", "Guardrails step"]);
+  });
+
+  describe("a remedy step reaching the person", () => {
+    const ruling =
+      '[appa] Blocked.\n  - archestra__execute_remedy_plan(offer_id: "0a0a0a0a0a0a0a0a", plan: "Share it")';
+    const card = (remedy: Record<string, unknown>) => {
+      mockGetToolShortName.mockImplementation((name: string) =>
+        name.startsWith("archestra__") ? name.replace("archestra__", "") : null,
+      );
+      const [chain] = identifyRemedyChains(
+        [
+          {
+            type: "tool-archestra__get_remedy_plans",
+            state: "output-available",
+            toolCallId: "call-notice",
+            input: {
+              tool: "fs__read_file",
+              arguments: { path: "/notes.md" },
+              ruling,
+              notice: { v: 1, call_id: "call-notice" },
+            },
+            output: ruling,
+          },
+          {
+            type: "tool-archestra__execute_remedy_plan",
+            toolCallId: "call-remedy",
+            input: { offer_id: "0a0a0a0a0a0a0a0a", plan: "Share it" },
+            ...remedy,
+          },
+        ] as never,
+        { getToolShortName: mockGetToolShortName },
+      );
+      return (
+        <QueryClientProvider client={new QueryClient()}>
+          <RemedyChainCard
+            chain={chain}
+            collapsible
+            onToolApprovalResponse={vi.fn()}
+          />
+        </QueryClientProvider>
+      );
+    };
+
+    it("opens the plan when a step already on screen starts waiting for approval", () => {
+      const { rerender, container } = render(
+        card({ state: "input-available" }),
+      );
+      expect(container).not.toHaveTextContent("Share it");
+
+      rerender(
+        card({
+          state: "approval-requested",
+          approval: { id: "approval-1" },
+        }),
+      );
+
+      expect(screen.getByRole("button", { name: "Approve" })).toBeVisible();
+      expect(container).toHaveTextContent("Share it");
+    });
+
+    it("shows why a step failed without expanding it, minus the runtime's marker", () => {
+      render(
+        card({
+          state: "output-error",
+          errorText: "[appa] Not authorized.",
+        }),
+      );
+      fireEvent.click(screen.getByText("fs__read_file"));
+
+      expect(screen.getByText("Not authorized.")).toBeVisible();
+    });
+  });
+
+  it("renders a compact Skill marker for a load_skill activation (no path)", () => {
+    mockGetToolShortName.mockReturnValue(TOOL_LOAD_SKILL_SHORT_NAME);
+
+    render(
+      <CompactToolGroup tools={[loadSkillEntry({ name: "Build App" })]} />,
+    );
+
+    expect(screen.queryByText("Skill:")).not.toBeInTheDocument();
+    expect(screen.getByText("Build App")).toBeInTheDocument();
+  });
+
+  it("explains a skill pill on hover only when the tooltip adds to its name", async () => {
+    mockGetToolShortName.mockReturnValue(TOOL_LOAD_SKILL_SHORT_NAME);
+    const user = userEvent.setup();
+    const entry = loadSkillEntry({ name: "Build App" });
+    const { rerender } = render(<CompactToolGroup tools={[entry]} />);
+
+    await user.hover(screen.getByRole("status", { name: "Build App" }));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+
+    rerender(
+      <CompactToolGroup
+        tools={[
+          {
+            ...entry,
+            part: {
+              ...(entry.part as object),
+              state: "input-available",
+              output: undefined,
+            } as never,
+          },
+        ]}
+      />,
+    );
+    await user.hover(screen.getByRole("status", { name: "Loading Build App" }));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "Loading Build App",
+    );
+  });
+
+  it("hides external installation qualifiers from the Skill marker", () => {
+    mockGetToolShortName.mockReturnValue(TOOL_LOAD_SKILL_SHORT_NAME);
+
+    render(
+      <CompactToolGroup
+        tools={[
+          loadSkillEntry({
+            name: "TTRPG Helper [personal:7e8933c4] / fallout-rpg",
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("fallout-rpg")).toBeInTheDocument();
+    expect(screen.queryByText(/personal:7e8933c4/)).not.toBeInTheDocument();
+    const marker = screen.getByRole("status", {
+      name: "fallout-rpg from TTRPG Helper",
+    });
+    expect(marker).toHaveAttribute("tabindex", "0");
+    expect(marker).not.toHaveAttribute("title");
+  });
+
+  it("renders a plain tool circle, not a Skill pill, for a load_skill file read (with path)", () => {
+    // Reading a bundled file (name + path) is a sub-action of an already-loaded
+    // skill, not a second trigger — it must not paint another "Skill:" pill.
+    mockGetToolShortName.mockReturnValue(TOOL_LOAD_SKILL_SHORT_NAME);
+    mockIsToolName.mockReturnValue(true);
+
+    render(
+      <CompactToolGroup
+        tools={[
+          loadSkillEntry({ name: "Build App", path: "references/api.md" }),
+        ]}
+      />,
+    );
+
+    expect(screen.queryByText("Skill:")).not.toBeInTheDocument();
+    expect(screen.getByTestId("mcp-catalog-icon")).toBeInTheDocument();
   });
 
   it("keeps the built-in MCP icon when the icon map temporarily lacks built-in tool metadata", () => {
@@ -35,6 +705,7 @@ describe("CompactToolGroup", () => {
       <CompactToolGroup
         tools={[
           {
+            kind: "tool",
             key: "tool-1",
             toolName: "sparky__get_mcp_servers",
             part: {
@@ -54,6 +725,116 @@ describe("CompactToolGroup", () => {
 
     expect(screen.getByTestId("mcp-catalog-icon")).toHaveTextContent(
       "00000000-0000-4000-8000-000000000001",
+    );
+  });
+
+  it("shows the target tool's server icon for a run_tool dispatch", () => {
+    mockIsToolName.mockImplementation((toolName: string) =>
+      toolName.startsWith("archestra__"),
+    );
+    mockGetToolShortName.mockImplementation((toolName: string) =>
+      toolName === "archestra__run_tool" ? TOOL_RUN_TOOL_SHORT_NAME : null,
+    );
+
+    render(
+      <CompactToolGroup
+        tools={[
+          {
+            kind: "tool",
+            key: "tool-1",
+            toolName: "archestra__run_tool",
+            part: {
+              type: "tool-archestra__run_tool",
+              state: "output-available",
+              toolCallId: "call-1",
+              input: {
+                tool_name: "context7__resolve-library-id",
+                tool_args: { libraryName: "react" },
+              },
+              output: { ok: true },
+            },
+            toolResultPart: null,
+            errorText: undefined,
+          },
+        ]}
+        toolIconMap={
+          new Map([
+            [
+              "context7__resolve-library-id",
+              { icon: "data:image/png;base64,x", catalogId: "catalog-ctx7" },
+            ],
+          ])
+        }
+      />,
+    );
+
+    expect(screen.getByTestId("mcp-catalog-icon")).toHaveTextContent(
+      "catalog-ctx7",
+    );
+  });
+
+  it("keeps the built-in icon for a run_tool call whose target is not known yet", () => {
+    mockIsToolName.mockImplementation((toolName: string) =>
+      toolName.startsWith("archestra__"),
+    );
+    mockGetToolShortName.mockImplementation((toolName: string) =>
+      toolName === "archestra__run_tool" ? TOOL_RUN_TOOL_SHORT_NAME : null,
+    );
+
+    render(
+      <CompactToolGroup
+        tools={[
+          {
+            kind: "tool",
+            key: "tool-1",
+            toolName: "archestra__run_tool",
+            part: {
+              type: "tool-archestra__run_tool",
+              state: "input-streaming",
+              toolCallId: "call-1",
+              input: {},
+            },
+            toolResultPart: null,
+            errorText: undefined,
+          },
+        ]}
+        toolIconMap={new Map()}
+      />,
+    );
+
+    expect(screen.getByTestId("mcp-catalog-icon")).toHaveTextContent(
+      "00000000-0000-4000-8000-000000000001",
+    );
+  });
+
+  it("renders a hook entry as a circle and expands its card on click", async () => {
+    mockIsToolName.mockReturnValue(false);
+
+    render(
+      <CompactToolGroup
+        tools={[
+          {
+            kind: "hook",
+            key: "hook-1",
+            data: {
+              hookEventName: "PreToolUse",
+              fileName: "guard.py",
+              outcome: "proceeded",
+              exitCode: 0,
+            },
+          },
+        ]}
+        toolIconMap={new Map()}
+      />,
+    );
+
+    // collapsed: just the circle, no expanded card
+    expect(screen.queryByTestId("hook-run-chip")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button"));
+
+    expect(await screen.findByTestId("hook-run-chip")).toHaveTextContent(
+      "PreToolUse",
     );
   });
 });

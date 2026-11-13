@@ -14,39 +14,38 @@ export const actions = [
   "read",
   "update",
   "delete",
-  "team-admin",
-  "admin",
   "cancel",
-  "enable",
   "query",
+  "impersonate",
+  "full-view",
+  "admin",
+  "configure-runtime",
 ] as const;
 
 export const resources = [
   "agent",
+  "skill",
+  "plugin",
+  "app",
+  "guardrailsPolicy",
   "mcpGateway",
   "llmProxy",
-  "toolPolicy",
   "log",
   "identityProvider",
   "mcpRegistry",
   "mcpServerInstallation",
   "knowledgeSource",
-  "knowledgeSettings",
-  "mcpServerInstallationRequest",
+  "environment",
+  "credential",
   "chat",
+  "project",
   "llmCost",
+  "costExport",
   "llmLimit",
-  "optimizationRule",
   "llmProviderApiKey",
   "llmVirtualKey",
-  "llmOauthClient",
   "llmModel",
-  "secret",
   "organizationSettings",
-  "llmSettings",
-  "agentSettings",
-  "agentTrigger",
-  "scheduledTask",
   /**
    * Better-auth access control resource - needed for organization role management
    * See: https://github.com/better-auth/better-auth/issues/2336#issuecomment-2820620809
@@ -67,18 +66,21 @@ export const resources = [
   "invitation",
   "team",
   "apiKey",
-  "simpleView",
-  "chatAgentPicker",
-  "chatProviderSettings",
-  "chatExpandToolCalls",
+  "oauthClient",
+  "serviceAccount",
+  "auditLog",
+  "accessPolicies",
 ] as const;
 
 export const resourceLabels: Record<Resource, string> = {
   agent: "Agents",
+  skill: "Skills",
+  plugin: "Plugins",
+  app: "Apps",
+  guardrailsPolicy: "Guardrails Policy",
   mcpGateway: "MCP Gateways",
-  llmProxy: "LLM Proxies",
-  toolPolicy: "Tools & Policies",
-  log: "Logs",
+  llmProxy: "LLM Proxy",
+  log: "LLM & MCP Logs",
   organization: "Organization",
   identityProvider: "Identity Providers",
   member: "Users",
@@ -86,72 +88,76 @@ export const resourceLabels: Record<Resource, string> = {
   mcpRegistry: "MCP Registry",
   mcpServerInstallation: "MCP Server Installations",
   knowledgeSource: "Knowledge Sources",
-  knowledgeSettings: "Knowledge Settings",
-  mcpServerInstallationRequest: "MCP Server Installation Requests",
+  environment: "Environments",
+  credential: "Credentials",
   team: "Teams",
   ac: "Roles",
   chat: "Chats",
-  llmCost: "LLM Costs",
+  project: "Projects",
+  llmCost: "LLM Cost Analytics",
+  costExport: "Cost Exports",
   llmLimit: "LLM Limits",
-  optimizationRule: "Optimization Rules",
   llmProviderApiKey: "LLM Provider API Keys",
   llmVirtualKey: "LLM Virtual Keys",
-  llmOauthClient: "LLM OAuth Clients",
   llmModel: "LLM Models",
-  secret: "Secrets",
   apiKey: "API Keys",
+  oauthClient: "OAuth Clients",
+  serviceAccount: "Service Accounts",
+  auditLog: "Audit Log",
+  accessPolicies: "Access Policies",
   organizationSettings: "Organization Settings",
-  llmSettings: "LLM Settings",
-  agentSettings: "Agent Settings",
-  agentTrigger: "Agent Triggers",
-  scheduledTask: "Scheduled Tasks",
-  simpleView: "Simple View",
-  chatAgentPicker: "Chat Agent Picker",
-  chatProviderSettings: "Chat Provider Settings",
-  chatExpandToolCalls: "Chat Expand Tool Calls",
 };
 
 export const resourceDescriptions: Record<Resource, string> = {
-  agent: "Agents with prompts and tool assignments",
-  mcpGateway: "Unified MCP endpoints that aggregate tools for clients",
-  llmProxy: "LLM proxy endpoints with security policies and observability",
-  toolPolicy: "Tools, tool invocation policies, and trusted data policies",
-  log: "LLM proxy and MCP tool call logs",
-  chat: "Chat conversations",
-  agentTrigger: "Agent triggers (Slack, MS Teams, incoming emails)",
-  scheduledTask: "Scheduled agent tasks that run on a schedule",
-  llmProviderApiKey: "LLM provider API keys and their visibility",
-  llmVirtualKey: "LLM virtual keys and their visibility",
-  llmOauthClient: "OAuth clients authorized to call LLM proxies",
-  llmModel: "LLM model catalog entries and chat capabilities",
-  llmLimit: "LLM usage limits",
-  llmSettings: "LLM settings (compression, cleanup interval)",
-  agentSettings:
-    "Agent settings (default model, default agent, security engine, chat file uploads)",
-  llmCost: "LLM usage and cost analytics",
-  mcpRegistry: "MCP server registry management",
-  mcpServerInstallation: "Installed MCP servers and their runtime",
-  mcpServerInstallationRequest: "Requests for new MCP server installations",
-  optimizationRule: "LLM optimization rules for routing to cheaper models",
-  member: "Users and role assignments",
-  ac: "Custom RBAC roles",
-  team: "Teams for organizing users and access control",
+  agent: "AI agents configured with prompts, models, and tools",
+  skill: "Reusable instructions and workflows that can be attached to agents",
+  plugin: "Extensions that run hooks on connected developer machines",
+  app: "Interactive MCP apps with their own data store and tools",
+  mcpGateway:
+    "Unified endpoints that expose tools from multiple MCP servers to clients",
+  llmProxy:
+    "Proxy endpoint that routes LLM requests with security policies and logging",
+  guardrailsPolicy:
+    "Guardrails (OpenAPPA) policies that inspect and filter prompts and tool calls",
+  log: "Request logs and alerts from the LLM Proxy, MCP tool calls, and Guardrails",
+  chat: "Conversations with agents and models in the chat interface",
+  project:
+    "Shared workspaces containing chats, files, schedules, and agent runs",
+  llmProviderApiKey: "Upstream API keys used to connect external LLM providers",
+  llmVirtualKey:
+    "Keys issued by the platform for accessing models through the LLM Proxy",
+  llmModel: "Models listed in the model catalog for chat and agent use",
+  llmLimit: "Rate, token, and spend limits for LLM usage",
+  llmCost: "Organization-wide LLM token usage and cost reports",
+  costExport:
+    "Scheduled FOCUS exports of LLM cost and usage to a blob provider",
+  mcpRegistry:
+    "Catalog of approved MCP servers available to install and deploy",
+  mcpServerInstallation:
+    "Installed MCP server instances and their runtime state",
+  environment:
+    "Target environments where installed MCP servers and workloads run",
+  credential:
+    "Stored secrets, GitHub tokens, and GitHub Apps used across the platform",
+  member:
+    "User accounts, invitations, and role assignments in the organization",
+  ac: "Custom roles and their organization-wide permission sets",
+  team: "User groups for assigning roles and sharing access to resources",
   invitation: "User invitations",
-  identityProvider: "Identity providers for authentication",
-  secret: "Secrets manager configuration and connectivity",
-  apiKey: "User API keys for programmatic access",
+  identityProvider:
+    "Single sign-on (SSO) and external identity provider connections",
+  apiKey: "Personal API keys for authenticating to the platform API",
+  oauthClient:
+    "External apps authorized to access MCP Gateways, Agents, and the LLM Proxy",
+  serviceAccount:
+    "Non-human accounts and tokens for automated API and CI/CD access",
+  auditLog: "Record of administrative changes, sign-ins, and security events",
+  accessPolicies:
+    "Organization-wide policies that govern access across all resource types",
   organizationSettings:
-    "Organization settings (appearance, authentication, etc)",
+    "Global settings for authentication, security, notifications, and secrets",
   knowledgeSource:
-    "Knowledge sources including knowledge bases and connectors for RAG-based document retrieval",
-  knowledgeSettings:
-    "Knowledge settings (embedding and reranking models configuration)",
-  simpleView: "Controls if the simple view of the app is enabled",
-  chatAgentPicker: "Controls visibility of the agent picker in chat",
-  chatProviderSettings:
-    "Controls visibility of model and API key selectors in chat",
-  chatExpandToolCalls:
-    "Controls ability to expand and view tool call details in chat",
+    "Knowledge bases and connectors that supply documents and data to agents",
   organization: "Organization (internal, used by authentication system)",
 };
 
@@ -159,49 +165,36 @@ export const resourceDescriptions: Record<Resource, string> = {
  * Resources that are internal to better-auth and should not be shown
  * in user-facing documentation or the RBAC UI.
  */
-export const internalResources: Resource[] = ["organization"];
+export const internalResources: Resource[] = ["organization", "invitation"];
 
 /**
  * Groups resources by category for the RBAC UI (role builder and permissions card).
  * Used in both the create/edit role dialog and the account permissions display.
  */
 export const resourceCategories: Record<string, Resource[]> = {
-  Agents: ["agent", "agentTrigger", "scheduledTask", "agentSettings"],
-  MCP: [
-    "mcpGateway",
-    "toolPolicy",
-    "mcpRegistry",
-    "mcpServerInstallation",
-    "mcpServerInstallationRequest",
-  ],
+  Agents: ["agent", "skill", "plugin", "app", "guardrailsPolicy"],
+  MCP: ["mcpGateway", "mcpRegistry", "mcpServerInstallation"],
   LLM: [
     "llmProxy",
     "llmProviderApiKey",
     "llmVirtualKey",
-    "llmOauthClient",
     "llmModel",
     "llmLimit",
-    "optimizationRule",
-    "llmSettings",
     "llmCost",
+    "costExport",
   ],
-  Knowledge: ["knowledgeSource", "knowledgeSettings"],
-  Other: [
-    "chat",
-    "log",
-    "simpleView",
-    "chatAgentPicker",
-    "chatProviderSettings",
-    "chatExpandToolCalls",
-  ],
+  Other: ["chat", "project", "knowledgeSource", "log", "auditLog"],
   Administration: [
+    "accessPolicies",
     "member",
     "ac",
     "team",
-    "invitation",
     "identityProvider",
-    "secret",
     "apiKey",
+    "oauthClient",
+    "serviceAccount",
+    "credential",
+    "environment",
     "organizationSettings",
   ],
 };
@@ -222,9 +215,6 @@ export type AgentType = "profile" | "mcp_gateway" | "llm_proxy" | "agent";
 /** Database-level agent scope values */
 export type AgentScope = "personal" | "team" | "org";
 
-/** Database-level agent tool assignment mode values */
-export type AgentToolAssignmentMode = "manual" | "automatic";
-
 /**
  * Maps an agent's `agentType` to the corresponding RBAC resource.
  *
@@ -233,7 +223,9 @@ export type AgentToolAssignmentMode = "manual" | "automatic";
  * - "llm_proxy" → "llmProxy"
  * - "profile" → "agent" (legacy profiles use the "agent" resource)
  */
-export function getResourceForAgentType(agentType: AgentType): Resource {
+export function getResourceForAgentType(
+  agentType: AgentType,
+): Extract<Resource, "agent" | "mcpGateway" | "llmProxy"> {
   switch (agentType) {
     case "mcp_gateway":
       return "mcpGateway";

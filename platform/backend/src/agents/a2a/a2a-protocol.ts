@@ -1,10 +1,48 @@
+import { randomUUID } from "node:crypto";
 import z from "zod";
+import { A2ATaskStateSchema } from "@/types/a2a-task";
 
 /**
  * Types and schemas for the A2A Protocol.
  * Types and schemas with name starting with "A2AArchestra"
  *   are for Archestra A2A Protocol extensions in metadata.
  */
+
+/**
+ * Wire-shape variant negotiated per request via the `A2A-Version` header.
+ * The A2A spec mandates that an absent or empty header means pre-1.0
+ * semantics, which is exactly the stream shape this endpoint has always
+ * served ("legacy": statusUpdate-first frames carrying a `final` flag).
+ * `A2A-Version: 1.0` selects the strict v1.0 lifecycle shape: an initial
+ * `task` frame, `artifactUpdate` frames, and no `final` field.
+ */
+export type A2AProtocolVersion = "legacy" | "v1";
+
+/** Major.Minor versions this endpoint can serve. */
+const SUPPORTED_A2A_VERSIONS: Record<string, A2AProtocolVersion> = {
+  "0.3": "legacy",
+  "1.0": "v1",
+};
+
+/**
+ * Resolve the wire shape for a request, or null when the client asked for a
+ * version we cannot serve — the caller answers that with
+ * `VersionNotSupportedError` (-32009) rather than silently serving 1.0
+ * semantics to, say, a future 2.x client (A2A v1.0 §3.6).
+ */
+export function resolveA2AProtocolVersion(
+  header: string | string[] | undefined,
+): A2AProtocolVersion | null {
+  const raw = Array.isArray(header) ? header[0] : header;
+  const value = raw?.trim();
+  if (!value) {
+    return "legacy";
+  }
+  return SUPPORTED_A2A_VERSIONS[value] ?? null;
+}
+
+/** Versions advertised in the error when negotiation fails. */
+export const SUPPORTED_A2A_VERSION_LIST = Object.keys(SUPPORTED_A2A_VERSIONS);
 
 export enum A2AProtocolRole {
   Unspecified = "ROLE_UNSPECIFIED",
@@ -59,14 +97,68 @@ export const A2AProtocolMessageSchema = z.object({
 });
 export type A2AProtocolMessage = z.infer<typeof A2AProtocolMessageSchema>;
 
+/**
+ * `messageId` as it arrives from a client, as opposed to the one we hand back.
+ *
+ * `Message.message_id` is a plain proto3 string, so a protobuf-JSON client that
+ * never assigned one omits the field entirely — or serializes it as `""`, since
+ * proto3 JSON drops default values. Both mean "unset", and refusing the whole
+ * request over an identifier the server can perfectly well mint is the same
+ * unhelpful strictness the `parts` field above already forgives. So an absent
+ * or blank id becomes a generated one; a caller-supplied id is passed through
+ * untouched (never trimmed), because callers use it to correlate and to detect
+ * their own replays.
+ *
+ * The UUID check is deliberately at the wire boundary: `messageId` is stored
+ * verbatim as `a2a_message.id`, a `uuid` column, so an id in any other shape
+ * cannot be persisted. Validating here turns that into a pointed
+ * "Invalid Request" naming the offending field instead of a failed INSERT
+ * surfacing as an opaque internal error.
+ */
+const A2AProtocolIncomingMessageIdSchema = z
+  .string()
+  .optional()
+  .transform((messageId) =>
+    messageId && messageId.trim() !== "" ? messageId : randomUUID(),
+  )
+  .pipe(
+    z.uuid(
+      "messageId must be a UUID; omit it to have one generated for this message",
+    ),
+  );
+
+/**
+ * Inbound `Message`: {@link A2AProtocolMessageSchema} with the lenient
+ * `messageId` above. Parsing always yields a `messageId`, so everything
+ * downstream keeps treating it as required.
+ */
+const A2AProtocolIncomingMessageSchema = A2AProtocolMessageSchema.extend({
+  messageId: A2AProtocolIncomingMessageIdSchema,
+});
+
 // --- Archestra Task metadata ---
 
 export const A2AArchestraApprovalRequestSchema = z.object({
   approvalId: z.string(),
   toolCallId: z.string(),
   toolName: z.string(),
+  // Arguments the tool was called with. Carried so human-facing approval
+  // prompts (e.g. ChatOps) can show what the tool will do, and so a `run_tool`
+  // dispatch can be unwrapped to the real target tool + its args. Optional
+  // because it is only populated on the live (in-memory) approval path; tasks
+  // reloaded from the database do not persist it.
+  toolInput: z.record(z.string(), z.unknown()).optional(),
   approved: z.boolean(),
   resolved: z.boolean(),
+  // Set when the paused call is the remedy for an OpenAPPA offer that needs
+  // human review: the text to show, and when the review expires.
+  openappaReview: z
+    .object({
+      offerId: z.string(),
+      text: z.string(),
+      expiresAt: z.string(),
+    })
+    .optional(),
 });
 export type A2AArchestraApprovalRequest = z.infer<
   typeof A2AArchestraApprovalRequestSchema
@@ -78,26 +170,40 @@ const A2AArchestraTaskMetadataSchema = z.object({
 
 // --- A2A Task ---
 
-const A2AProtocolArtifactSchema = z.object({});
+/** A2A v1.0 `Artifact`: a task output, distinct from conversational messages. */
+export const A2AProtocolArtifactSchema = z.object({
+  artifactId: z.string(),
+  name: z.string().optional(),
+  description: z.string().optional(),
+  parts: z.array(A2AProtocolPartSchema).min(1),
+  metadata: z.any().optional(),
+  extensions: z.array(z.string()).optional(),
+});
+export type A2AProtocolArtifact = z.infer<typeof A2AProtocolArtifactSchema>;
 
-export enum A2AProtocolTaskState {
-  Unspecified = "TASK_STATE_UNSPECIFIED",
-  Submitted = "TASK_STATE_SUBMITTED",
-  Working = "TASK_STATE_WORKING",
-  Completed = "TASK_STATE_COMPLETED",
-  Failed = "TASK_STATE_FAILED",
-  Canceled = "TASK_STATE_CANCELED",
-  InputRequired = "TASK_STATE_INPUT_REQUIRED",
-  Rejected = "TASK_STATE_REJECTED",
-  AuthRequired = "TASK_STATE_AUTH_REQUIRED",
-}
+/**
+ * Enum-style accessor over the wire values in {@link A2ATaskStateSchema}
+ * (single source of truth, shared with the `a2a_task.state` column type).
+ */
+export const A2AProtocolTaskState = {
+  Unspecified: "TASK_STATE_UNSPECIFIED",
+  Submitted: "TASK_STATE_SUBMITTED",
+  Working: "TASK_STATE_WORKING",
+  Completed: "TASK_STATE_COMPLETED",
+  Failed: "TASK_STATE_FAILED",
+  Canceled: "TASK_STATE_CANCELED",
+  InputRequired: "TASK_STATE_INPUT_REQUIRED",
+  Rejected: "TASK_STATE_REJECTED",
+  AuthRequired: "TASK_STATE_AUTH_REQUIRED",
+} as const satisfies Record<string, A2AProtocolTaskState>;
+export type A2AProtocolTaskState = z.infer<typeof A2ATaskStateSchema>;
 
 const A2AProtocolTaskStatusSchema = z.object({
-  state: z.enum(A2AProtocolTaskState),
+  state: A2ATaskStateSchema,
   message: A2AProtocolMessageSchema.optional(),
-  timestamp: z.number().optional(),
+  /** RFC 3339 datetime (protobuf JSON `google.protobuf.Timestamp`). */
+  timestamp: z.iso.datetime().optional(),
 });
-
 export const A2AProtocolTaskSchema = z.object({
   id: z.string(),
   contextId: z.string().optional(),
@@ -108,22 +214,149 @@ export const A2AProtocolTaskSchema = z.object({
 });
 export type A2AProtocolTask = z.infer<typeof A2AProtocolTaskSchema>;
 
+/**
+ * A2A v1.0 `history_length` semantics, shared by GetTask, ListTasks, and
+ * SendMessageConfiguration: unset = server default (full history), 0 = omit
+ * the `history` field entirely, N > 0 = at most the N most recent messages.
+ */
+const A2AProtocolHistoryLengthSchema = z.number().int().nonnegative();
+
 export const A2AProtocolGetTaskRequestSchema = z.object({
   tenant: z.string().optional(),
   id: z.string(),
-  historyLength: z.number().optional(),
+  historyLength: A2AProtocolHistoryLengthSchema.optional(),
 });
 export type A2AProtocolGetTaskRequest = z.infer<
   typeof A2AProtocolGetTaskRequestSchema
 >;
 
+// --- A2A CancelTask / SubscribeToTask / ListTasks ---
+
+export const A2AProtocolCancelTaskRequestSchema = z.object({
+  tenant: z.string().optional(),
+  id: z.string(),
+  metadata: z.any().optional(),
+});
+export type A2AProtocolCancelTaskRequest = z.infer<
+  typeof A2AProtocolCancelTaskRequestSchema
+>;
+
+export const A2AProtocolSubscribeToTaskRequestSchema = z.object({
+  tenant: z.string().optional(),
+  id: z.string(),
+});
+export type A2AProtocolSubscribeToTaskRequest = z.infer<
+  typeof A2AProtocolSubscribeToTaskRequestSchema
+>;
+
+export const A2AProtocolListTasksRequestSchema = z.object({
+  tenant: z.string().optional(),
+  contextId: z.string().optional(),
+  status: A2ATaskStateSchema.optional(),
+  pageSize: z.number().int().min(1).max(100).optional(),
+  pageToken: z.string().optional(),
+  historyLength: A2AProtocolHistoryLengthSchema.optional(),
+  /** RFC 3339 datetime; only tasks whose status changed after it are returned. */
+  statusTimestampAfter: z.iso.datetime().optional(),
+  /** Defaults to false, in which case `artifacts` is omitted from every task. */
+  includeArtifacts: z.boolean().optional(),
+});
+export type A2AProtocolListTasksRequest = z.infer<
+  typeof A2AProtocolListTasksRequestSchema
+>;
+
+// --- A2A push notification configs ---
+
+/** A2A v1.0 `AuthenticationInfo` for an outbound webhook call. */
+const A2AProtocolAuthenticationInfoSchema = z.object({
+  scheme: z.string(),
+  credentials: z.string().optional(),
+});
+
+/**
+ * A2A v1.0 `PushNotificationConfig`. `id` is server-assigned on create and
+ * required to address the config afterwards; `credentials` is write-only —
+ * reads never echo it back.
+ */
+const A2AProtocolPushNotificationConfigSchema = z.object({
+  id: z.string().optional(),
+  url: z.string(),
+  token: z.string().optional(),
+  authentication: A2AProtocolAuthenticationInfoSchema.optional(),
+});
+
+export const A2AProtocolTaskPushNotificationConfigSchema = z.object({
+  tenant: z.string().optional(),
+  taskId: z.string(),
+  pushNotificationConfig: A2AProtocolPushNotificationConfigSchema,
+});
+export type A2AProtocolTaskPushNotificationConfig = z.infer<
+  typeof A2AProtocolTaskPushNotificationConfigSchema
+>;
+
+export const A2AProtocolGetTaskPushNotificationConfigRequestSchema = z.object({
+  tenant: z.string().optional(),
+  taskId: z.string(),
+  id: z.string(),
+});
+export type A2AProtocolGetTaskPushNotificationConfigRequest = z.infer<
+  typeof A2AProtocolGetTaskPushNotificationConfigRequestSchema
+>;
+
+export const A2AProtocolListTaskPushNotificationConfigsRequestSchema = z.object(
+  {
+    tenant: z.string().optional(),
+    taskId: z.string(),
+  },
+);
+export type A2AProtocolListTaskPushNotificationConfigsRequest = z.infer<
+  typeof A2AProtocolListTaskPushNotificationConfigsRequestSchema
+>;
+
+export const A2AProtocolListTaskPushNotificationConfigsResponseSchema =
+  z.object({
+    configs: z.array(A2AProtocolTaskPushNotificationConfigSchema),
+  });
+export type A2AProtocolListTaskPushNotificationConfigsResponse = z.infer<
+  typeof A2AProtocolListTaskPushNotificationConfigsResponseSchema
+>;
+
+export const A2AProtocolDeleteTaskPushNotificationConfigRequestSchema =
+  z.object({
+    tenant: z.string().optional(),
+    taskId: z.string(),
+    id: z.string(),
+  });
+export type A2AProtocolDeleteTaskPushNotificationConfigRequest = z.infer<
+  typeof A2AProtocolDeleteTaskPushNotificationConfigRequestSchema
+>;
+
+export const A2AProtocolListTasksResponseSchema = z.object({
+  tasks: z.array(A2AProtocolTaskSchema),
+  nextPageToken: z.string(),
+  pageSize: z.number().int(),
+  totalSize: z.number().int(),
+});
+export type A2AProtocolListTasksResponse = z.infer<
+  typeof A2AProtocolListTasksResponseSchema
+>;
+
 // --- A2A Send Message ---
 
-const A2AProtocolSendMessageConfigurationSchema = z.object({});
+const A2AProtocolSendMessageConfigurationSchema = z.object({
+  /**
+   * A2A v1.0 `return_immediately` (default false = blocking, the INVERSE of
+   * the pre-1.0 `blocking` flag): when true the server creates the task,
+   * returns its handle right away, and the run continues detached — the
+   * caller polls GetTask or opens SubscribeToTask.
+   */
+  returnImmediately: z.boolean().optional(),
+  historyLength: A2AProtocolHistoryLengthSchema.optional(),
+});
 
 export const A2AProtocolSendMessageRequestSchema = z.object({
   tenant: z.string().optional(),
-  message: A2AProtocolMessageSchema,
+  message: A2AProtocolIncomingMessageSchema,
   configuration: A2AProtocolSendMessageConfigurationSchema.optional(),
   metadata: z.any().optional(),
 });
@@ -137,4 +370,54 @@ export const A2AProtocolSendMessageResponseSchema = z.object({
 });
 export type A2AProtocolSendMessageResponse = z.infer<
   typeof A2AProtocolSendMessageResponseSchema
+>;
+
+// --- A2A Streaming (SendStreamingMessage) ---
+
+/**
+ * Incremental task-state change emitted over a streaming response. Mirrors the
+ * A2A v1.0 TaskStatusUpdateEvent (the `status.message` carries the partial or
+ * final agent message for that update). `final` is NOT part of v1.0 — it is
+ * the pre-1.0 end-of-stream marker, emitted only on the legacy wire shape
+ * (see {@link A2AProtocolVersion}); v1.0 clients detect completion from the
+ * task state plus stream closure.
+ */
+const A2AProtocolTaskStatusUpdateEventSchema = z.object({
+  taskId: z.string(),
+  contextId: z.string(),
+  status: A2AProtocolTaskStatusSchema,
+  final: z.boolean().optional(),
+  metadata: z.any().optional(),
+});
+/**
+ * A2A v1.0 TaskArtifactUpdateEvent: one chunk of a task artifact. Chunked
+ * delivery repeats the same `artifact.artifactId` with `append: true`;
+ * `lastChunk: true` seals the artifact. Both default to false.
+ */
+const A2AProtocolTaskArtifactUpdateEventSchema = z.object({
+  taskId: z.string(),
+  contextId: z.string(),
+  artifact: A2AProtocolArtifactSchema,
+  append: z.boolean().optional(),
+  lastChunk: z.boolean().optional(),
+  metadata: z.any().optional(),
+});
+/**
+ * A single event in a SendStreamingMessage / SubscribeToTask stream. Exactly
+ * one field is set per event: `statusUpdate` for incremental working/terminal
+ * state (carrying partial text), `artifactUpdate` for an artifact chunk,
+ * `message` for a complete agent message, or `task` for a full task snapshot
+ * (the first frame of a v1.0 lifecycle stream, or an approval-required task at
+ * the end of a legacy stream). Field naming mirrors the non-streaming
+ * SendMessage response (`message`/`task`) so clients parse both shapes the
+ * same way.
+ */
+export const A2AProtocolStreamResponseSchema = z.object({
+  statusUpdate: A2AProtocolTaskStatusUpdateEventSchema.optional(),
+  artifactUpdate: A2AProtocolTaskArtifactUpdateEventSchema.optional(),
+  message: A2AProtocolMessageSchema.optional(),
+  task: A2AProtocolTaskSchema.optional(),
+});
+export type A2AProtocolStreamResponse = z.infer<
+  typeof A2AProtocolStreamResponseSchema
 >;

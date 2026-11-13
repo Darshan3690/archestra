@@ -1,5 +1,20 @@
-import { describe, expect, it } from "vitest";
-import { isSameOriginUrl } from "./response";
+import { render } from "@testing-library/react";
+import { createElement } from "react";
+import { beforeAll, describe, expect, it } from "vitest";
+import { isSameOriginUrl, preloadResponseMarkdown, Response } from "./response";
+
+// The renderer is a lazy chunk; once loaded it renders in the same pass.
+beforeAll(() => preloadResponseMarkdown());
+
+const APP_ID = "7b0839a1-4663-4371-a739-e5dac7f8c33e";
+
+// linkSafety off makes Streamdown render a real <a href> we can read, instead of
+// the safe-link <button> whose target lives in an onClick closure.
+function renderResponse(markdown: string) {
+  return render(
+    createElement(Response, { linkSafety: { enabled: false } }, markdown),
+  );
+}
 
 describe("isSameOriginUrl", () => {
   // jsdom sets window.location.origin to "http://localhost:3000" by default in vitest
@@ -45,5 +60,113 @@ describe("isSameOriginUrl", () => {
 
   it("returns false for data: URI", () => {
     expect(isSameOriginUrl("data:text/html,<h1>hi</h1>")).toBe(false);
+  });
+});
+
+const TABLE_MARKDOWN = "| a | b |\n| --- | --- |\n| 1 | 2 |";
+
+describe("Response markdown tables", () => {
+  // Streamdown paints table-wrapper with an opaque bg-sidebar mat that clashes
+  // with themed chat bubbles (bg-secondary), and ignores its className prop, so
+  // Response must flatten it via descendant overrides on the root. Guards both
+  // sides of that contract: the override classes, and the data-streamdown
+  // attribute + mat class they target (either can drift on a streamdown upgrade).
+  it("flattens streamdown's opaque table-wrapper mat", () => {
+    const { container } = renderResponse(TABLE_MARKDOWN);
+    const wrapper = container.querySelector(
+      '[data-streamdown="table-wrapper"]',
+    );
+    expect(wrapper).not.toBeNull();
+    expect(wrapper?.className).toContain("bg-sidebar");
+
+    const root = container.firstElementChild;
+    expect(root?.className).toContain(
+      "[&_[data-streamdown='table-wrapper']]:bg-transparent",
+    );
+    expect(root?.className).toContain(
+      "[&_[data-streamdown='table-wrapper']]:border-0",
+    );
+    expect(root?.className).toContain(
+      "[&_[data-streamdown='table-wrapper']]:p-0",
+    );
+    // The toolbar loses its mat backdrop, so its buttons must inherit the
+    // bubble's paired text color to stay visible on bg-secondary.
+    expect(root?.className).toContain(
+      "[&_[data-streamdown='table-wrapper']_button]:text-inherit",
+    );
+    // Opaque bg-background surfaces inside the wrapper must re-pair with
+    // text-foreground, not the bubble's inherited secondary-foreground.
+    expect(root?.className).toContain(
+      "[&_[data-streamdown='table-wrapper']_.bg-background]:text-foreground",
+    );
+  });
+
+  it("keeps the table scroll cap and sticky header overrides", () => {
+    const { container } = renderResponse(TABLE_MARKDOWN);
+    expect(container.querySelector('[data-streamdown="table"]')).not.toBeNull();
+
+    const root = container.firstElementChild;
+    expect(root?.className).toContain(
+      "[&_[data-streamdown='table-wrapper']>div:last-child]:max-h-[420px]",
+    );
+    expect(root?.className).toContain(
+      "[&_[data-streamdown='table-header']]:sticky",
+    );
+  });
+});
+
+// Renders through the real Streamdown pipeline (including rehype-harden), so it
+// verifies the repair runs before harden — harden would otherwise drop a
+// slash-less relative link and it would never reach an <a href>.
+describe("Response app-link canonicalization", () => {
+  it("renders a slash-dropped app link as the absolute app path", () => {
+    const { container } = renderResponse(`[Open](a/${APP_ID})`);
+    const anchor = container.querySelector("a");
+    expect(anchor?.getAttribute("href")).toBe(`/a/${APP_ID}`);
+    expect(anchor?.textContent).toBe("Open");
+  });
+
+  it("leaves an already-absolute app link unchanged", () => {
+    const { container } = renderResponse(`[Open](/a/${APP_ID})`);
+    expect(container.querySelector("a")?.getAttribute("href")).toBe(
+      `/a/${APP_ID}`,
+    );
+  });
+
+  it("does not rewrite an external link", () => {
+    const { container } = renderResponse(
+      `[Site](https://example.com/a/${APP_ID})`,
+    );
+    expect(container.querySelector("a")?.getAttribute("href")).toBe(
+      `https://example.com/a/${APP_ID}`,
+    );
+  });
+
+  it("repairs a slash-dropped custom-slug app link", () => {
+    // An app addressed by its slug is the same link shape as one addressed by
+    // its id, and the model drops the leading slash on both.
+    const { container } = renderResponse("[Open](a/sales-dashboard)");
+    expect(container.querySelector("a")?.getAttribute("href")).toBe(
+      "/a/sales-dashboard",
+    );
+  });
+
+  it.each([
+    ["uppercase, which no slug contains", "a/Sales-Dashboard"],
+    ["an underscore", "a/sales_dashboard"],
+    ["a trailing hyphen", "a/sales-"],
+    ["a nested path segment", "a/sales/dashboard"],
+  ])("does not repair a slashless a/ prefix with %s", (_label, url) => {
+    // The repair keys on the id and slug shapes only, so anything that could
+    // not be an app address is left alone. (harden then blocks the slashless
+    // relative link, so no anchor survives — the point is only that our plugin
+    // did not rewrite it.)
+    const { container } = renderResponse(`[Docs](${url})`);
+    expect(container.querySelector(`a[href="/${url}"]`)).toBeNull();
+  });
+
+  it("does not rewrite the pattern inside a code span", () => {
+    const { container } = renderResponse(`\`a/${APP_ID}\``);
+    expect(container.querySelector("code")?.textContent).toBe(`a/${APP_ID}`);
   });
 });

@@ -1,7 +1,7 @@
 "use client";
 
-import { type AgentScope, E2eTestId } from "@shared";
-import { Zap } from "lucide-react";
+import { type AgentScope, E2eTestId } from "@archestra/shared";
+import { RefreshCw } from "lucide-react";
 import { useEffect } from "react";
 import {
   Select,
@@ -11,9 +11,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useMcpServersGroupedByCatalog } from "@/lib/mcp/mcp-server.query";
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/utils/tailwind";
 import Divider from "./divider";
-import { LoadingSpinner } from "./loading";
+import { LoadingState } from "./loading";
 
 // Special value for dynamic team credential option
 export const DYNAMIC_CREDENTIAL_VALUE = "__dynamic__";
@@ -33,7 +33,8 @@ interface TokenSelectProps {
 
 /**
  * Self-contained component for selecting credential source for MCP tool execution.
- * Shows all available credentials with their owner emails and team assignments.
+ * Shows shared organization/team installations. Every personal installation
+ * resolves only at call time and can never be pinned to an assignment.
  *
  * Fetches all credentials for the specified catalogId (no agent filtering).
  */
@@ -62,36 +63,26 @@ export function TokenSelect({
   const teamCredentials = mcpServers.filter(
     (server) => server.scope === "team",
   );
-  const userCredentials = mcpServers.filter(
-    (server) => server.scope === "personal",
-  );
+  const staticTargets = [...organizationCredentials, ...teamCredentials];
 
   const isLoading = !groupedCredentials;
 
   const staticCredentialOutsideOfGroupedCredentials =
     value &&
     value !== DYNAMIC_CREDENTIAL_VALUE &&
-    !groupedCredentials?.[catalogId]?.some(
-      (credential) => credential.id === value,
-    );
+    !staticTargets.some((credential) => credential.id === value);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: it's expected here to avoid unneeded invocations
   useEffect(() => {
     if (shouldSetDefaultValue && !value) {
-      if (prefersEnterpriseManaged) {
-        onValueChange(DYNAMIC_CREDENTIAL_VALUE);
-      } else if (mcpServers.length > 0) {
-        // Default to the first credential
-        onValueChange(mcpServers[0].id);
-      } else {
-        // Default to dynamic credential when no static credentials available
-        onValueChange(DYNAMIC_CREDENTIAL_VALUE);
-      }
+      // Resolve-at-call-time is the default; pinning a static credential is an
+      // explicit choice.
+      onValueChange(DYNAMIC_CREDENTIAL_VALUE);
     }
   }, []);
 
   if (isLoading) {
-    return <LoadingSpinner className="w-3 h-3 inline-block ml-2" />;
+    return <LoadingState className="ml-2" variant="inline" />;
   }
 
   if (staticCredentialOutsideOfGroupedCredentials) {
@@ -128,15 +119,15 @@ export function TokenSelect({
           description={
             prefersEnterpriseManaged
               ? "Ask your identity provider for a runtime credential for this server."
-              : "Use the caller's available runtime credential instead of a fixed connection."
+              : "Follow the server's default credential setting — the caller's own connection, unless the server always uses one account."
           }
         >
           <div className="flex items-center gap-1">
-            <Zap className="h-3! w-3! text-amber-500" />
-            <span>Resolve at call time</span>
+            <RefreshCw className="h-3! w-3! text-muted-foreground" />
+            <span>Resolve at call time (Recommended)</span>
           </div>
         </SelectItem>
-        {mcpServers.length > 0 && (
+        {staticTargets.length > 0 ? (
           <>
             {organizationCredentials.length > 0 && (
               <>
@@ -156,7 +147,8 @@ export function TokenSelect({
                 ))}
               </>
             )}
-            <Divider className="my-2" />
+            {organizationCredentials.length > 0 &&
+              teamCredentials.length > 0 && <Divider className="my-2" />}
             {teamCredentials.length > 0 && (
               <>
                 <div className="px-2 pt-1 pb-1 text-xs text-muted-foreground">
@@ -175,24 +167,15 @@ export function TokenSelect({
                 ))}
               </>
             )}
-            {userCredentials.length > 0 && (
-              <>
-                <div className="px-2 pt-2 pb-1 text-xs text-muted-foreground">
-                  Static - User Credentials
-                </div>
-                {userCredentials.map((server) => (
-                  <SelectItem
-                    key={server.id}
-                    value={server.id}
-                    className="cursor-pointer"
-                    data-testid={E2eTestId.StaticCredentialToUse}
-                    description={`Owned by ${server.ownerEmail || "Deleted user"}`}
-                  >
-                    {server.ownerEmail || "Deleted user"}
-                  </SelectItem>
-                ))}
-              </>
-            )}
+          </>
+        ) : (
+          <>
+            <div className="px-2 pt-2 pb-1 text-xs text-muted-foreground">
+              Static
+            </div>
+            <div className="px-2 pb-2 text-xs text-muted-foreground">
+              No shared credentials for this server.
+            </div>
           </>
         )}
       </SelectContent>

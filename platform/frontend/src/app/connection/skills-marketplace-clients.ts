@@ -1,0 +1,180 @@
+import {
+  OPENCODE_FAMILY_CLIENTS,
+  type OpenCodeFamilyClientId,
+  type OpenCodeFamilyDescriptor,
+} from "@archestra/shared";
+/**
+ * Builders for the Claude Code / Codex install snippets shown inside the
+ * Skills marketplace step. The two snippets share a `cloneUrl` +
+ * `marketplaceName` produced by a single `skill_share_link` row.
+ */
+export interface SkillMarketplaceInstallStep {
+  label: string;
+  body?: string;
+  code?: string;
+  language?: "bash" | "text";
+}
+
+export interface SkillMarketplaceClient {
+  id:
+    | "claude-code"
+    | "codex"
+    | "cursor"
+    | "copilot-cli"
+    | "pi"
+    | OpenCodeFamilyClientId
+    | "grok-build";
+  getInstallSteps: (
+    params: SkillMarketplaceInstallParams,
+  ) => SkillMarketplaceInstallStep[];
+}
+
+export interface SkillMarketplaceInstallParams {
+  cloneUrl: string;
+  marketplaceName: string;
+}
+
+export const SKILL_MARKETPLACE_CLIENTS: SkillMarketplaceClient[] = [
+  {
+    id: "grok-build",
+    getInstallSteps: () => [
+      {
+        label: "Install and refresh shared skills",
+        body: "Use the Grok Build connection installer to deliver native SKILL.md packages and resources to the dedicated managed profile. No plugins or marketplace registrations are installed. The launcher refreshes skills before each session.",
+        code: "node ~/.archestra/grok/launch.cjs",
+        language: "bash",
+      },
+    ],
+  },
+  {
+    id: "claude-code",
+    getInstallSteps: ({ cloneUrl, marketplaceName }) => [
+      {
+        label: "Register the marketplace",
+        code: `claude plugin marketplace add ${cloneUrl}`,
+        language: "bash",
+      },
+      {
+        label: "Install the skills plugin",
+        body: "Installs the shared skills as a single plugin; they load next time you start Claude Code.",
+        code: `claude plugin install ${marketplaceName}@${marketplaceName}`,
+        language: "bash",
+      },
+    ],
+  },
+  {
+    id: "codex",
+    getInstallSteps: ({ cloneUrl }) => [
+      {
+        label: "Register the marketplace",
+        code: `codex plugin marketplace add ${cloneUrl}`,
+        language: "bash",
+      },
+      {
+        label: "Install the skills plugin",
+        body: 'Run /plugins inside Codex and pick "Install Plugin" to install the included skills.',
+        code: "/plugins",
+        language: "bash",
+      },
+    ],
+  },
+  {
+    id: "copilot-cli",
+    getInstallSteps: ({ cloneUrl, marketplaceName }) => [
+      {
+        label: "Register the marketplace",
+        code: `copilot plugin marketplace add ${cloneUrl}`,
+        language: "bash",
+      },
+      {
+        label: "Browse and install the skills plugin",
+        body: "Pick the shared plugin from the marketplace browser; Copilot installs the included skills from there.",
+        code: `copilot plugin marketplace browse ${marketplaceName}`,
+        language: "bash",
+      },
+    ],
+  },
+  {
+    id: "cursor",
+    getInstallSteps: ({ cloneUrl, marketplaceName }) => [
+      {
+        label: "Install shared skills",
+        body: "Cursor discovers skills inside this folder, including nested skill folders.",
+        code: `git clone '${cloneUrl.replaceAll("'", "'\\''")}' "$HOME/.cursor/skills/${marketplaceName}"`,
+        language: "bash",
+      },
+      {
+        label: "Load or update skills",
+        body: "Reload Cursor and verify the skills under Customize → Skills. Run this command later to fetch updates.",
+        code: `git -C "$HOME/.cursor/skills/${marketplaceName}" pull --ff-only`,
+        language: "bash",
+      },
+    ],
+  },
+  {
+    id: "pi",
+    getInstallSteps: () => [
+      {
+        label: "Include shared skills in connection setup",
+        body: "Keep Skills selected in Choose what to include. The connection command installs the selected skills from the authorized marketplace.",
+      },
+      {
+        label: "Start Pi with shared skills",
+        body: "arcpi refreshes the marketplace and loads its SKILL.md files using Pi’s native skill loader. Your own skills stay available.",
+        code: "arcpi",
+        language: "bash",
+      },
+    ],
+  },
+  ...OPENCODE_FAMILY_CLIENTS.map(openCodeFamilySkillsClient),
+];
+
+export const SKILL_MARKETPLACE_TTL_PRESETS: {
+  id: string;
+  label: string;
+  days: number | null;
+}[] = [
+  { id: "30d", label: "30 days", days: 30 },
+  { id: "90d", label: "90 days", days: 90 },
+  { id: "never", label: "Never expires", days: null },
+];
+
+export function computeSkillMarketplaceExpiresAt(
+  days: number | null,
+  now: Date = new Date(),
+): string | null {
+  if (days === null) return null;
+  const d = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
+  return d.toISOString();
+}
+
+/**
+ * OpenCode and Kilo Code have no plugin marketplace, but load every SKILL.md
+ * under their skills folder recursively, so a plain clone there is the
+ * install. "$HOME" rather than "~": the manual flow has no OS picker, and
+ * Windows PowerShell expands $HOME for git.exe but leaves ~ literal.
+ */
+function openCodeFamilySkillsClient(
+  client: OpenCodeFamilyDescriptor,
+): SkillMarketplaceClient {
+  return {
+    id: client.id,
+    getInstallSteps: ({ cloneUrl, marketplaceName }) => {
+      const skillsDir = `"$HOME/.config/${client.dir}/skills/${marketplaceName}"`;
+      return [
+        {
+          label: `Clone the marketplace into ${client.label}'s skills folder`,
+          body: `${client.label} loads the shared skills the next time it starts.`,
+          code: `git clone ${cloneUrl} ${skillsDir}`,
+          language: "bash",
+        },
+        {
+          label: "Pull updates",
+          body: "Run this whenever the shared skills change.",
+          code: `git -C ${skillsDir} pull`,
+          language: "bash",
+        },
+      ];
+    },
+  };
+}

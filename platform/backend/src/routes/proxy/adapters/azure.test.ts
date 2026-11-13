@@ -1,13 +1,12 @@
 import type OpenAIProvider from "openai";
-import { vi } from "vitest";
-import { describe, expect, test } from "@/test";
+import { describe, expect, test, vi } from "vitest";
+import config from "@/config";
 
-vi.mock("@/observability", () => ({
-  metrics: { llm: { getObservableFetch: vi.fn() } },
-}));
+vi.mock("@/observability");
 
 vi.mock("@/clients/azure-openai-credentials", () => ({
   getAzureOpenAiBearerTokenProvider: vi.fn(() => async () => "entra-token"),
+  isAnthropicAzureFoundryEntraIdEnabled: vi.fn(() => false),
   isAzureOpenAiEntraIdEnabled: vi.fn(() => false),
 }));
 
@@ -51,11 +50,13 @@ describe("azureAdapterFactory", () => {
   });
 
   describe("getBaseUrl", () => {
-    test("returns string or undefined depending on config", () => {
-      // In test environments ARCHESTRA_AZURE_OPENAI_BASE_URL is unset,
-      // so baseUrl coerces to undefined via `config.llm.azure.baseUrl || undefined`
-      const url = azureAdapterFactory.getBaseUrl();
-      expect(url === undefined || typeof url === "string").toBe(true);
+    test("returns the configured Azure endpoint", () => {
+      config.llm.azure.baseUrl =
+        "https://configured-resource.openai.azure.com/openai";
+
+      expect(azureAdapterFactory.getBaseUrl()).toBe(
+        "https://configured-resource.openai.azure.com/openai",
+      );
     });
   });
 
@@ -188,6 +189,41 @@ describe("azureAdapterFactory", () => {
       expect(azureAdapterFactory.extractErrorMessage(null)).toBe(
         "Internal server error",
       );
+    });
+  });
+
+  describe("createStreamAdapter", () => {
+    // The azure stream adapter delegates to OpenAIStreamAdapter; this pins that
+    // the delegation covers reasoning forwarding — Foundry-hosted reasoning
+    // models (DeepSeek-R1, gpt-oss, ...) stream thinking in `reasoning_content`
+    // deltas that must reach streaming clients unmodified.
+    test("forwards a reasoning-only chunk (reasoning_content) instead of dropping it", () => {
+      const adapter = azureAdapterFactory.createStreamAdapter();
+      const result = adapter.processChunk({
+        id: "chatcmpl-r",
+        object: "chat.completion.chunk",
+        created: 0,
+        model: "DeepSeek-R1",
+        choices: [
+          {
+            index: 0,
+            delta: { reasoning_content: "Let me think..." },
+            finish_reason: null,
+          },
+        ],
+      } as unknown as Parameters<typeof adapter.processChunk>[0]);
+
+      expect(result.sseData).not.toBeNull();
+      const text =
+        typeof result.sseData === "string"
+          ? result.sseData
+          : new TextDecoder().decode(result.sseData as Uint8Array);
+      const delta = (
+        JSON.parse(text.replace(/^data: /, "").trim()) as {
+          choices: Array<{ delta: Record<string, unknown> }>;
+        }
+      ).choices[0].delta;
+      expect(delta).toMatchObject({ reasoning_content: "Let me think..." });
     });
   });
 });

@@ -1,24 +1,57 @@
 import {
+  CreatedByNullableSchema,
   EnvFromSchema,
+  HttpUrlSchema,
+  ImagePullPolicySchema,
   ImagePullSecretConfigSchema,
   LocalConfigEnvironmentDefaultSchema,
   LocalConfigSchema,
   OAuthConfigSchema,
-} from "@shared";
+} from "@archestra/shared";
 import {
   createInsertSchema,
   createSelectSchema,
   createUpdateSchema,
 } from "drizzle-zod";
 import { z } from "zod";
-import { schema } from "@/database";
-import { EnterpriseManagedCredentialConfigSchema } from "./enterprise-managed-credentials";
+import { schema } from "@/database/schema";
+import {
+  CatalogTeamAccessLevelSchema,
+  CatalogTeamInputSchema,
+} from "./catalog-team-level";
+import { DesktopMcpConfigSchema } from "./desktop-mcp";
+import {
+  type EnterpriseManagedCredentialConfig,
+  EnterpriseManagedCredentialConfigResponseSchema,
+  EnterpriseManagedCredentialConfigSchema,
+} from "./enterprise-managed-credentials";
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+import { McpServerHibernationModeSchema } from "./mcp-hibernation";
+import { McpServerAlertMuteSchema } from "./mcp-server-alert-mute";
+import { RetiredSharingFieldSchema } from "./visibility";
+// SPDX-SnippetEnd
 
 export const InternalMcpCatalogServerTypeSchema = z.enum([
   "local",
   "remote",
   "builtin",
+  // Platform-authored MCP App: in-process, HTML-backed, viewer-scoped. Backs a
+  // real mcp_server exposing an `open` launch tool, but opts out of K8s deploy /
+  // install / cascade / discovery. Served in-process via the owned-app builder.
+  "app",
+  // An MCP server on a user's own computer. It has no URL and no deployment:
+  // calls go through a queue that the tunnel client on the device polls.
+  "desktop_mcp",
 ]);
+
+/**
+ * Image-approval state for a personal local catalog item gated by an
+ * environment's trusted image registries. `pending` = blocked, awaiting an
+ * admin; `approved` = installs proceed. NULL on the row = no decision recorded.
+ */
+export const CatalogItemApprovalStatusSchema = z.enum(["pending", "approved"]);
 
 // Define Zod schemas for complex JSONB fields
 const AuthFieldSchema = z.object({
@@ -63,6 +96,8 @@ const LocalConfigSelectSchema = z.object({
         key: z.string(),
         type: z.enum(["plain_text", "secret", "boolean", "number"]),
         value: z.string().optional(),
+        credentialId: z.string().min(1).max(128).optional(),
+        credentialScope: z.enum(["personal", "organization"]).optional(),
         promptOnInstallation: z.boolean(),
         required: z.boolean().optional(), // Optional in database
         description: z.string().optional(), // Optional in database
@@ -92,6 +127,7 @@ const LocalConfigSelectSchema = z.object({
       ]),
     )
     .optional(),
+  imagePullPolicy: ImagePullPolicySchema.optional(),
 });
 
 const CatalogLabelSchema = z.object({
@@ -99,25 +135,93 @@ const CatalogLabelSchema = z.object({
   value: z.string().min(1),
 });
 
+// The preset feature is removed. Its columns remain on the Drizzle table
+// (non-destructive — see database/schemas/internal-mcp-catalog.ts) but are no
+// longer exposed by the API, so they are omitted from the derived schemas.
+const PRESET_COLUMNS_OMIT = {
+  parentCatalogItemId: true,
+  childName: true,
+  presetEntryId: true,
+  presetFieldValues: true,
+  presetSecretId: true,
+} as const;
+
+// The catalog-item image-approval flag is system/admin-managed: set by the
+// install gate (services/mcp-install-policy.ts) and the approve/decline
+// endpoints, never writable through the catalog create/edit API — otherwise a
+// `mcpRegistry:update` holder could self-approve. Omitted from the derived
+// insert/update schemas (but kept on the select schema).
+const CATALOG_ITEM_APPROVAL_COLUMNS_OMIT = {
+  catalogItemApprovalStatus: true,
+  catalogItemApprovalReason: true,
+  catalogItemApprovalReviewedBy: true,
+  catalogItemApprovalReviewedAt: true,
+} as const;
+const INTERNAL_DISCOVERY_COLUMNS_OMIT = {
+  skillsRefreshGeneration: true,
+} as const;
+
 export const SelectInternalMcpCatalogSchema = createSelectSchema(
   schema.internalMcpCatalogTable,
-).extend({
-  serverType: InternalMcpCatalogServerTypeSchema,
-  authFields: z.array(AuthFieldSchema).nullable(),
-  userConfig: z.record(z.string(), UserConfigFieldSchema).nullable(),
-  oauthConfig: OAuthConfigSchema.nullable(),
-  enterpriseManagedConfig: EnterpriseManagedCredentialConfigSchema.nullable(),
-  localConfig: LocalConfigSelectSchema.nullable(),
-  // Labels are loaded from the junction table, not from the DB row
-  labels: z.array(CatalogLabelSchema).default([]),
-  // Teams are loaded from the junction table, not from the DB row
-  teams: z.array(z.object({ id: z.string(), name: z.string() })).default([]),
-  authorName: z.string().nullable().optional(),
-});
+)
+  .omit({ ...PRESET_COLUMNS_OMIT, ...INTERNAL_DISCOVERY_COLUMNS_OMIT })
+  .extend({
+    serverType: InternalMcpCatalogServerTypeSchema,
+    authFields: z.array(AuthFieldSchema).nullable(),
+    userConfig: z.record(z.string(), UserConfigFieldSchema).nullable(),
+    oauthConfig: OAuthConfigSchema.nullable(),
+    enterpriseManagedConfig:
+      EnterpriseManagedCredentialConfigResponseSchema.nullable(),
+    localConfig: LocalConfigSelectSchema.nullable(),
+    desktopConfig: DesktopMcpConfigSchema.nullable(),
+    clonedFrom: z.string().uuid().nullable(),
+    // Serialized as a nullable string (not the enum) because the OpenAPI client
+    // generator drops `null` from a `nullable` enum; the column keeps its
+    // `$type<CatalogItemApprovalStatus>` and the model methods stay typed.
+    catalogItemApprovalStatus: z.string().nullable(),
+    // Labels are loaded from the junction table, not from the DB row
+    labels: z.array(CatalogLabelSchema).default([]),
+    // Teams are loaded from the junction table, not from the DB row. A stored
+    // NULL level is resolved to `write` on read, so this never serializes null.
+    teams: z
+      .array(
+        z.object({
+          id: z.string(),
+          name: z.string(),
+          level: CatalogTeamAccessLevelSchema,
+        }),
+      )
+      .default([]),
+    authorName: z.string().nullable().optional(),
+    /** The author, in the shape shared by every major object. */
+    createdBy: CreatedByNullableSchema.optional(),
+  });
 
 export const ListInternalMcpCatalogSchema =
   SelectInternalMcpCatalogSchema.extend({
+    /** The calling viewer's own alert dismissals for this catalog. */
+    alertMutes: z.array(McpServerAlertMuteSchema).optional(),
     toolCount: z.number().int().default(0),
+    // True when the catalog exposes a tool with a `ui://` MCP App resource —
+    // an external UI-providing server or an owned-app backing. Derived from the
+    // catalog's tools (see InternalMcpCatalogModel.getToolStats). Optional so
+    // callers constructing catalog items (e.g. the legacy registry) need not set
+    // it; the model always populates it on list reads.
+    providesUi: z.boolean().optional(),
+    skillCount: z.number().int().default(0),
+    providesSkills: z.boolean().optional(),
+    // For `serverType:"app"` backings only, the id of the app they back, so the
+    // registry can link to / manage the app. Populated only on the includeApps
+    // path; null for everything else.
+    appId: z.string().nullable().optional(),
+    // For `serverType:"app"` backings only, whether the backing app is enabled.
+    // The capability picker greys a disabled (false) app as "Disabled".
+    // Populated only on the includeApps path; null/absent for everything else.
+    appEnabled: z.boolean().nullable().optional(),
+    // True when installing this item right now would be blocked by the trusted-
+    // image-registry gate (gated + not approved), so the registry can prevent the
+    // install up front. Populated on the list route only.
+    imageApprovalRequired: z.boolean().optional(),
   });
 
 const InsertInternalMcpCatalogSchemaBase = createInsertSchema(
@@ -126,8 +230,10 @@ const InsertInternalMcpCatalogSchemaBase = createInsertSchema(
   .extend({
     // Allow explicit ID for builtin catalog items (e.g., Archestra)
     id: z.string().uuid().optional(),
-    name: z.string().trim().min(1, "Name cannot be empty"),
+    name: z.string().trim().min(1, "Name cannot be empty").max(255),
     serverType: InternalMcpCatalogServerTypeSchema,
+    serverUrl: HttpUrlSchema.nullable().optional(),
+    dynamicConnectionMcpServerId: z.string().uuid().nullable().optional(),
     authFields: z.array(AuthFieldSchema).nullable().optional(),
     userConfig: z
       .record(z.string(), UserConfigFieldSchema)
@@ -137,27 +243,69 @@ const InsertInternalMcpCatalogSchemaBase = createInsertSchema(
     enterpriseManagedConfig:
       EnterpriseManagedCredentialConfigSchema.nullable().optional(),
     localConfig: LocalConfigSchema.nullable().optional(),
+    desktopConfig: DesktopMcpConfigSchema.nullable().optional(),
+    clonedFrom: z.string().uuid().nullable().optional(),
     // Labels are synced separately via McpCatalogLabelModel
     labels: z.array(CatalogLabelSchema).optional(),
-    // Team IDs for team scope (synced separately)
-    teams: z.array(z.string()).optional(),
+    // Teams for team scope (synced separately). A bare id keeps whatever level
+    // is already stored for that team; an object sets it explicitly.
+    teams: z.array(CatalogTeamInputSchema).optional(),
   })
   .omit({
     createdAt: true,
     updatedAt: true,
+    // Soft-delete bookkeeping, written only by delete/restore, never from input.
+    deletedAt: true,
     organizationId: true,
     authorId: true,
+    createdByServiceAccountId: true,
+    // Frozen K8s deployment identity (multitenant) — computed by
+    // InternalMcpCatalogModel.create / the startup adopt pass, never
+    // accepted from input.
+    deploymentName: true,
+    ...PRESET_COLUMNS_OMIT,
+    ...CATALOG_ITEM_APPROVAL_COLUMNS_OMIT,
+    ...INTERNAL_DISCOVERY_COLUMNS_OMIT,
   });
 
 export const InsertInternalMcpCatalogSchema =
   InsertInternalMcpCatalogSchemaBase.superRefine(validateInternalMcpCatalog);
 
+/**
+ * The body of the catalog create route and tool. Who can reach the new item is
+ * its initial grants alone; the retired `scope` and `teams` fields are not
+ * accepted.
+ */
+export const CreateInternalMcpCatalogBodySchema =
+  InsertInternalMcpCatalogSchemaBase.omit({
+    scope: true,
+    teams: true,
+  })
+    .extend({
+      scope: RetiredSharingFieldSchema,
+      teams: RetiredSharingFieldSchema,
+    })
+    .superRefine(validateInternalMcpCatalog);
+
+// A field that changes what an entry runs or where it connects must also be
+// listed in MCP_RUNTIME_FIELDS (services/mcp-advanced-settings.ts); otherwise
+// someone with Full access alone could change it.
 const UpdateInternalMcpCatalogSchemaBase = createUpdateSchema(
   schema.internalMcpCatalogTable,
 )
   .extend({
-    name: z.string().trim().min(1, "Name cannot be empty"),
+    name: z.string().trim().min(1, "Name cannot be empty").max(255),
     serverType: InternalMcpCatalogServerTypeSchema,
+    serverUrl: HttpUrlSchema.nullable().optional(),
+    dynamicConnectionMcpServerId: z.string().uuid().nullable().optional(),
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Operational per-server idle-hibernation override, cascaded by the PUT
+    // route onto every live install of the catalog — never stored on the
+    // catalog row itself.
+    hibernationMode: McpServerHibernationModeSchema.optional(),
+    // SPDX-SnippetEnd
     authFields: z.array(AuthFieldSchema).nullable().optional(),
     userConfig: z
       .record(z.string(), UserConfigFieldSchema)
@@ -167,19 +315,32 @@ const UpdateInternalMcpCatalogSchemaBase = createUpdateSchema(
     enterpriseManagedConfig:
       EnterpriseManagedCredentialConfigSchema.nullable().optional(),
     localConfig: LocalConfigSchema.nullable().optional(),
+    desktopConfig: DesktopMcpConfigSchema.nullable().optional(),
     // Labels are synced separately via McpCatalogLabelModel
     labels: z.array(CatalogLabelSchema).optional(),
-    // Team IDs for team scope (synced separately)
-    teams: z.array(z.string()).optional(),
   })
   .omit({
     id: true,
     createdAt: true,
     updatedAt: true,
+    // Soft-delete bookkeeping, written only by delete/restore, never from input.
+    deletedAt: true,
     organizationId: true,
     authorId: true,
+    createdByServiceAccountId: true,
+    // Who can reach a catalog item is decided by its resource permission
+    // policy, which the permissions API writes on its own. The stored
+    // visibility column is carried through an update untouched.
+    scope: true,
     // Tenancy is locked after creation
     multitenant: true,
+    // Frozen at creation/adopt time — renames must never touch it
+    deploymentName: true,
+    // Clone lineage is locked after creation
+    clonedFrom: true,
+    ...PRESET_COLUMNS_OMIT,
+    ...CATALOG_ITEM_APPROVAL_COLUMNS_OMIT,
+    ...INTERNAL_DISCOVERY_COLUMNS_OMIT,
   });
 
 export const UpdateInternalMcpCatalogSchema =
@@ -194,17 +355,30 @@ export type InternalMcpCatalogServerType = z.infer<
   typeof InternalMcpCatalogServerTypeSchema
 >;
 
+export type CatalogItemApprovalStatus = z.infer<
+  typeof CatalogItemApprovalStatusSchema
+>;
+
 export type AuthField = z.infer<typeof AuthFieldSchema>;
 export type UserConfigField = z.infer<typeof UserConfigFieldSchema>;
+export type UserConfigFieldDefault = z.infer<
+  typeof UserConfigFieldDefaultSchema
+>;
 export type UserConfig = Record<string, UserConfigField>;
 export type OAuthConfig = z.infer<typeof OAuthConfigSchema>;
 
 // Export LocalConfig type for reuse in database schema
 export type LocalConfig = z.infer<typeof LocalConfigSelectSchema>;
 
-export type InternalMcpCatalog = z.infer<typeof SelectInternalMcpCatalogSchema>;
-export type ListInternalMcpCatalog = z.infer<
-  typeof ListInternalMcpCatalogSchema
+/**
+ * A catalog item as the backend holds it: unlike the API response, its
+ * `enterpriseManagedConfig` may carry the exchange client's secrets.
+ */
+export type InternalMcpCatalog = WithEnterpriseManagedSecrets<
+  z.infer<typeof SelectInternalMcpCatalogSchema>
+>;
+export type ListInternalMcpCatalog = WithEnterpriseManagedSecrets<
+  z.infer<typeof ListInternalMcpCatalogSchema>
 >;
 export type InsertInternalMcpCatalog = z.infer<
   typeof InsertInternalMcpCatalogSchema
@@ -241,13 +415,39 @@ function validateInternalMcpCatalog(
   value: {
     serverType?: InternalMcpCatalogServerType;
     enterpriseManagedConfig?: unknown;
-    localConfig?: { transportType?: "stdio" | "streamable-http" } | null;
+    localConfig?: {
+      transportType?: "stdio" | "streamable-http";
+      environment?: Array<{ key: string }>;
+    } | null;
     userConfig?: Record<string, UserConfigField> | null;
+    desktopConfig?: unknown;
   },
   ctx: z.RefinementCtx,
 ): void {
   validateEnterpriseManagedTransportConfig(value, ctx);
   validateHeaderMappedUserConfig(value.userConfig, ctx);
+  validateDesktopConfigServerType(value, ctx);
+}
+
+/**
+ * Only a desktop MCP catalog item has a command for devices. A partial update
+ * that does not name the server type is checked against the stored item by
+ * the service.
+ */
+function validateDesktopConfigServerType(
+  value: {
+    serverType?: InternalMcpCatalogServerType;
+    desktopConfig?: unknown;
+  },
+  ctx: z.RefinementCtx,
+): void {
+  if (!value.desktopConfig || !value.serverType) return;
+  if (value.serverType === "desktop_mcp") return;
+  ctx.addIssue({
+    code: z.ZodIssueCode.custom,
+    path: ["desktopConfig"],
+    message: "Only a desktop MCP server has a command for devices.",
+  });
 }
 
 function validateHeaderMappedUserConfig(
@@ -273,10 +473,11 @@ function validateHeaderMappedUserConfig(
     }
     normalizedHeaderNames.set(normalizedHeaderName, fieldName);
 
-    if (
-      fieldConfig.sensitive === true &&
-      fieldConfig.promptOnInstallation === false
-    ) {
+    // A header value is "static" (= persisted in plaintext at
+    // `userConfig[field].default` on the catalog row) when it is not
+    // install-prompted.
+    const isStaticHeader = fieldConfig.promptOnInstallation === false;
+    if (fieldConfig.sensitive === true && isStaticHeader) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["userConfig", fieldName, "sensitive"],
@@ -284,5 +485,25 @@ function validateHeaderMappedUserConfig(
           "Static header-mapped userConfig fields cannot be marked sensitive.",
       });
     }
+
+    // Sensitive header-mapped fields must not carry a plaintext `default`.
+    // `default` is persisted as-is in the catalog row's userConfig jsonb, so
+    // a sensitive default would land in plaintext on the row.
+    if (
+      fieldConfig.sensitive === true &&
+      fieldConfig.default !== undefined &&
+      !isStaticHeader
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["userConfig", fieldName, "default"],
+        message:
+          "Sensitive header-mapped userConfig fields cannot carry a plaintext default. Supply the value via the per-install Secret bag (installation scope) instead.",
+      });
+    }
   }
 }
+
+type WithEnterpriseManagedSecrets<T> = Omit<T, "enterpriseManagedConfig"> & {
+  enterpriseManagedConfig: EnterpriseManagedCredentialConfig | null;
+};

@@ -1,0 +1,1417 @@
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+// SPDX-FileCopyrightText: 2026 Archestra Inc.
+
+/**
+ * Seam integration tests: the REAL {@link McpServerRuntimeManager} driving the
+ * REAL {@link K8sDeployment}, with only the process boundary faked (the
+ * `@kubernetes/client-node` API objects) and real `mcp_server` /
+ * `internal_mcp_catalog` rows behind the manager's lazy load.
+ *
+ * `manager.test.ts` mocks `./k8s-deployment` wholesale and `k8s-deployment.test.ts`
+ * never constructs a manager, so nothing else in the suite exercises the wiring
+ * between them. That gap is not hypothetical: a cache-cold deployment (state
+ * "not_created", whose `refreshState` early-returns) once made the manager's
+ * wake silently do nothing while both sides' unit tests stayed green.
+ *
+ * Every assertion here is on an observable outcome — the merge-patch bodies that
+ * reached the fake API server, the annotations/replicas the fake cluster is left
+ * holding, and the resulting `statusSummary` — never on "a method was called".
+ */
+import type * as k8s from "@kubernetes/client-node";
+import { eq } from "drizzle-orm";
+import { vi } from "vitest";
+import config from "@/config";
+import db, { schema } from "@/database";
+import {
+  MCP_HIBERNATED_ANNOTATION,
+  MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION,
+} from "@/k8s/shared";
+import {
+  RuntimeCredentialConnectionModel,
+  RuntimeCredentialDefinitionModel,
+} from "@/models";
+import { MCP_SERVER_LAST_USED_REFRESH_INTERVAL_MS } from "@/models/mcp-server";
+import { secretManager } from "@/secrets-manager";
+// biome-ignore lint/style/noRestrictedImports: runtime-gated EE service import
+import { mcpActiveUseTracker } from "@/services/mcp-active-use.ee";
+import { describe, expect, test } from "@/test";
+import type K8sDeployment from "./k8s-deployment";
+import { McpServerDeploymentFailedError } from "./k8s-deployment";
+import { McpServerRuntimeManager, McpServerWakeError } from "./manager";
+import type { K8sRuntimeStatus } from "./schemas";
+
+const NAMESPACE = "seam-test-namespace";
+const DEPLOYMENT_NAME = "mcp-seam-server";
+const MERGE_PATCH_CONTENT_TYPE = "application/merge-patch+json";
+const NOT_FOUND = { statusCode: 404, message: "not found" };
+
+const IDLE_WINDOW_SECONDS = 300;
+/** Idle window + the throttled-last-used-stamp grace the sweeper adds. */
+const IDLE_CUTOFF_MS =
+  IDLE_WINDOW_SECONDS * 1000 + MCP_SERVER_LAST_USED_REFRESH_INTERVAL_MS;
+
+type MergePatchBody = {
+  metadata?: {
+    annotations?: Record<string, string | null>;
+    resourceVersion?: string;
+  };
+  spec?: { replicas?: number };
+};
+
+const CONFLICT = { statusCode: 409, message: "the object has been modified" };
+
+type RecordedPatch = {
+  name: string;
+  namespace: string;
+  body: MergePatchBody;
+  contentType: string | undefined;
+};
+
+/**
+ * A single physical Deployment as the API server would hold it: replicas,
+ * annotations, and a pod whose readiness the test schedules. Merge patches are
+ * really applied (a `null` annotation value deletes the key), so the assertions
+ * below read cluster truth rather than replaying the caller's intent.
+ */
+class FakeK8sCluster {
+  readonly patches: RecordedPatch[] = [];
+  exists = true;
+  replicas: number;
+  annotations: Record<string, string>;
+  /**
+   * The API server's optimistic-concurrency token: bumped by every write, and
+   * the thing a patch's `metadata.resourceVersion` is checked against. This is
+   * the whole cross-replica locking story — the cluster object IS the lock.
+   */
+  resourceVersion = 1;
+  /** Terminal container waiting reason surfaced on the pod, if any. */
+  containerWaitingReason: string | null = null;
+  /** Deployment reads act as the clock the pod's readiness is scheduled on. */
+  private deploymentReads = 0;
+  private readyFromRead: number;
+
+  constructor(init: {
+    replicas: number;
+    annotations?: Record<string, string>;
+    /** false = the pod never comes up on its own (default true). */
+    podComesUp?: boolean;
+  }) {
+    this.replicas = init.replicas;
+    this.annotations = { ...init.annotations };
+    this.readyFromRead =
+      init.podComesUp === false ? Number.POSITIVE_INFINITY : 1;
+  }
+
+  /** From the read AFTER next onward, the scaled-up pod reports Running. */
+  becomeReadyAfterNextRead(): void {
+    this.readyFromRead = this.deploymentReads + 2;
+  }
+
+  get patchBodies(): MergePatchBody[] {
+    return this.patches.map((patch) => patch.body);
+  }
+
+  /**
+   * Patch bodies with the compare-and-swap precondition stripped, so tests
+   * about WHAT was patched read cleanly. Whether a precondition was sent is
+   * asserted separately — it is a different claim.
+   */
+  get patchedIntents(): MergePatchBody[] {
+    return this.patches.map(({ body }) => {
+      if (body.metadata?.resourceVersion === undefined) return body;
+      const { resourceVersion: _dropped, ...metadata } = body.metadata;
+      const stripped: MergePatchBody = { ...body };
+      if (Object.keys(metadata).length > 0) stripped.metadata = metadata;
+      else delete stripped.metadata;
+      return stripped;
+    });
+  }
+
+  private get podRunning(): boolean {
+    return (
+      this.replicas > 0 &&
+      this.containerWaitingReason === null &&
+      this.deploymentReads >= this.readyFromRead
+    );
+  }
+
+  readDeployment(): k8s.V1Deployment {
+    if (!this.exists) throw NOT_FOUND;
+    this.deploymentReads++;
+    return {
+      metadata: {
+        name: DEPLOYMENT_NAME,
+        namespace: NAMESPACE,
+        annotations: { ...this.annotations },
+        resourceVersion: String(this.resourceVersion),
+        uid: "seam-deployment-uid",
+      },
+      spec: { replicas: this.replicas },
+      status: {
+        availableReplicas: this.podRunning ? this.replicas : 0,
+        readyReplicas: this.podRunning ? this.replicas : 0,
+      },
+    } as k8s.V1Deployment;
+  }
+
+  patchDeployment(
+    request: { name: string; namespace: string; body: MergePatchBody },
+    options: unknown,
+  ): k8s.V1Deployment {
+    if (!this.exists) throw NOT_FOUND;
+    // A patch carrying a resourceVersion is a compare-and-swap: the API
+    // server rejects it outright if anything else wrote to the object first.
+    const precondition = request.body.metadata?.resourceVersion;
+    if (
+      precondition !== undefined &&
+      precondition !== String(this.resourceVersion)
+    ) {
+      throw CONFLICT;
+    }
+    this.patches.push({
+      name: request.name,
+      namespace: request.namespace,
+      body: request.body,
+      contentType: extractPatchContentType(options),
+    });
+
+    if (request.body.spec?.replicas !== undefined) {
+      this.replicas = request.body.spec.replicas;
+    }
+    for (const [key, value] of Object.entries(
+      request.body.metadata?.annotations ?? {},
+    )) {
+      // Merge-patch semantics: an explicit null deletes the key.
+      if (value === null) delete this.annotations[key];
+      else this.annotations[key] = value;
+    }
+    this.resourceVersion++;
+    return this.readDeployment();
+  }
+
+  /** Any write by somebody else — an operator, a controller, a sibling pod. */
+  externalWrite(mutate: (cluster: FakeK8sCluster) => void = () => {}): void {
+    mutate(this);
+    this.resourceVersion++;
+  }
+
+  listPods(labelSelector?: string): k8s.V1Pod[] {
+    if (!this.exists || this.replicas === 0) return [];
+    // Only the runtime's own selectors match; the network-policy probe's
+    // selector must find nothing so capability discovery stays inconclusive.
+    const ours =
+      labelSelector?.startsWith("mcp-server-id=") ||
+      labelSelector === "app=mcp-server";
+    if (!ours) return [];
+
+    const running = this.podRunning;
+    return [
+      {
+        metadata: {
+          name: `${DEPLOYMENT_NAME}-6d4f9c7b5-abcde`,
+          creationTimestamp: new Date(),
+          labels: { app: "mcp-server" },
+        },
+        status: {
+          phase: running ? "Running" : "Pending",
+          conditions: [{ type: "Ready", status: running ? "True" : "False" }],
+          containerStatuses: [
+            {
+              name: "mcp-server",
+              ready: running,
+              restartCount: 0,
+              state: running
+                ? { running: {} }
+                : {
+                    waiting: {
+                      reason:
+                        this.containerWaitingReason ?? "ContainerCreating",
+                      message: this.containerWaitingReason
+                        ? "container cannot be created"
+                        : "creating container",
+                    },
+                  },
+            },
+          ],
+        },
+      } as unknown as k8s.V1Pod,
+    ];
+  }
+}
+
+/**
+ * Recover the Content-Type a patch call's options carry: the client packs it
+ * into middleware that stamps the outgoing request, so replay it on a recorder.
+ * Merge-patch is load-bearing — it is what makes a null annotation a deletion.
+ */
+function extractPatchContentType(options: unknown): string | undefined {
+  let contentType: string | undefined;
+  const recorder = {
+    setHeaderParam: (key: string, value: string) => {
+      if (key === "Content-Type") contentType = value;
+    },
+  };
+  const middleware =
+    (options as { middleware?: Array<{ pre: (req: unknown) => unknown }> })
+      ?.middleware ?? [];
+  for (const entry of middleware) entry.pre(recorder);
+  return contentType;
+}
+
+type ManagerInternals = {
+  k8sApi: k8s.CoreV1Api;
+  k8sAppsApi: k8s.AppsV1Api;
+  k8sAuthApi: k8s.AuthorizationV1Api;
+  k8sNetworkingApi: k8s.NetworkingV1Api;
+  k8sCustomObjectsApi: k8s.CustomObjectsApi;
+  k8sAttach: k8s.Attach;
+  k8sLog: k8s.Log;
+  k8sExec: k8s.Exec;
+  namespace: string;
+  status: K8sRuntimeStatus;
+  mcpServerIdToDeploymentMap: Map<string, K8sDeployment>;
+  sweepIdleDeployments: () => Promise<void>;
+};
+
+/**
+ * A real manager whose K8s clients are the fake API server. The constructor's
+ * own `loadKubeConfig()` is irrelevant here (it may fail on a machine with no
+ * kubeconfig) — the clients and the runtime status are replaced outright, which
+ * is the only injection point the manager exposes.
+ */
+function makeManager(cluster: FakeK8sCluster) {
+  const coreApi = {
+    listNamespacedPod: vi.fn(
+      async ({ labelSelector }: { labelSelector?: string }) => ({
+        items: cluster.listPods(labelSelector),
+      }),
+    ),
+    readNamespacedPod: vi.fn(async () => {
+      throw NOT_FOUND;
+    }),
+    listNamespacedEvent: vi.fn(async () => ({ items: [] })),
+    readNamespacedService: vi.fn(async () => {
+      throw NOT_FOUND;
+    }),
+  } as unknown as k8s.CoreV1Api;
+
+  const appsApi = {
+    readNamespacedDeployment: vi.fn(async () => cluster.readDeployment()),
+    patchNamespacedDeployment: vi.fn(
+      async (
+        request: { name: string; namespace: string; body: MergePatchBody },
+        options: unknown,
+      ) => cluster.patchDeployment(request, options),
+    ),
+  } as unknown as k8s.AppsV1Api;
+
+  const customObjectsApi = {
+    // No CRDs served: capability discovery degrades to "no FQDN dialect".
+    getAPIResources: vi.fn(async () => {
+      throw NOT_FOUND;
+    }),
+  } as unknown as k8s.CustomObjectsApi;
+
+  // Idle hibernation ships behind a beta flag that is off by default, and the
+  // sweeper re-reads it on every tick — without it nothing in this seam sleeps.
+  config.orchestrator.mcpIdleHibernation.betaEnabled = true;
+
+  const manager = new McpServerRuntimeManager();
+  const internals = manager as unknown as ManagerInternals;
+  internals.k8sApi = coreApi;
+  internals.k8sAppsApi = appsApi;
+  internals.k8sAuthApi = {} as k8s.AuthorizationV1Api;
+  internals.k8sNetworkingApi = {} as k8s.NetworkingV1Api;
+  internals.k8sCustomObjectsApi = customObjectsApi;
+  internals.k8sAttach = {} as k8s.Attach;
+  internals.k8sLog = {} as k8s.Log;
+  internals.k8sExec = {} as k8s.Exec;
+  internals.namespace = NAMESPACE;
+  internals.status = "running";
+
+  return { manager, internals };
+}
+
+/**
+ * A local, single-tenant install whose deployment name is frozen, in an
+ * organization that has opted into idle hibernation — the sweeper checks that
+ * toggle on every tick, so without it nothing here would ever sleep.
+ */
+async function makeLocalInstall(fixtures: {
+  makeOrganization: (
+    overrides?: Record<string, unknown>,
+  ) => Promise<{ id: string }>;
+  makeInternalMcpCatalog: (
+    overrides?: Record<string, unknown>,
+  ) => Promise<{ id: string }>;
+  makeMcpServer: (
+    overrides?: Record<string, unknown>,
+  ) => Promise<{ id: string; name: string }>;
+}) {
+  await fixtures.makeOrganization({ mcpIdleHibernationEnabled: true });
+  const catalog = await fixtures.makeInternalMcpCatalog({
+    name: "Seam Catalog",
+    serverType: "local",
+    localConfig: { command: "node", arguments: ["server.js"] },
+  });
+  const mcpServer = await fixtures.makeMcpServer({
+    catalogId: catalog.id,
+    name: "seam-server",
+    deploymentName: DEPLOYMENT_NAME,
+  });
+  return { catalog, mcpServer };
+}
+
+/** The exact body `hibernate()` must send for a deployment at `replicas`. */
+function hibernatePatchBody(replicas: number): MergePatchBody {
+  return {
+    metadata: {
+      annotations: {
+        [MCP_HIBERNATED_ANNOTATION]: "true",
+        [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: String(replicas),
+      },
+    },
+    spec: { replicas: 0 },
+  };
+}
+
+/** The exact body `completeWake()` must send (null = delete the key). */
+const COMPLETE_WAKE_PATCH_BODY: MergePatchBody = {
+  metadata: {
+    annotations: {
+      [MCP_HIBERNATED_ANNOTATION]: null,
+      [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: null,
+    },
+  },
+};
+
+describe("McpServerRuntimeManager ↔ K8sDeployment hibernation seam", () => {
+  test("renders log and diagnostic commands from the loaded deployment identity", async ({
+    makeOrganization,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const cluster = new FakeK8sCluster({ replicas: 1 });
+    const { manager } = makeManager(cluster);
+    const { mcpServer } = await makeLocalInstall({
+      makeOrganization,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    });
+    const deployment = await manager.getOrLoadDeployment(mcpServer.id);
+    if (!deployment) throw new Error("deployment did not load");
+    vi.spyOn(deployment, "getRecentLogs").mockResolvedValue("recent log line");
+
+    await expect(manager.getMcpServerLogs(mcpServer.id, 42)).resolves.toEqual({
+      logs: "recent log line",
+      containerName: DEPLOYMENT_NAME,
+      command: `kubectl logs -n ${NAMESPACE} deployment/${DEPLOYMENT_NAME} --tail=42`,
+      namespace: NAMESPACE,
+    });
+    await expect(
+      manager.getMcpServerLogsCommand(mcpServer.id, 42),
+    ).resolves.toBe(
+      `kubectl logs -n ${NAMESPACE} deployment/${DEPLOYMENT_NAME} --tail=42 -f`,
+    );
+    await expect(
+      manager.getMcpServerDescribeCommand(mcpServer.id),
+    ).resolves.toBe(
+      `kubectl describe deployment -n ${NAMESPACE} ${DEPLOYMENT_NAME}`,
+    );
+    expect(manager.getExecCommand(mcpServer.id)).toContain(`-n ${NAMESPACE}`);
+  });
+
+  test("cache-cold wake: a deployment this process never loaded is scaled up and fully woken", async ({
+    makeOrganization,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    // The cluster holds a hibernated deployment; this process has no
+    // K8sDeployment for it at all (another replica hibernated it, or we
+    // restarted since). The lazily built object starts "not_created", the
+    // state refreshState refuses to evaluate — the exact shape of the bug
+    // that shipped: the wake used to silently do nothing here.
+    const cluster = new FakeK8sCluster({
+      replicas: 0,
+      annotations: { [MCP_HIBERNATED_ANNOTATION]: "true" },
+    });
+    const { manager, internals } = makeManager(cluster);
+    const { mcpServer } = await makeLocalInstall({
+      makeOrganization,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    });
+    expect(internals.mcpServerIdToDeploymentMap.has(mcpServer.id)).toBe(false);
+
+    await manager.ensureAwake(mcpServer.id);
+
+    // Scale-up first, annotation removal second — the order that makes a
+    // half-woken deployment recognisable in between.
+    expect(cluster.patchedIntents).toEqual([
+      { spec: { replicas: 1 } },
+      COMPLETE_WAKE_PATCH_BODY,
+    ]);
+    expect(cluster.patches.every((p) => p.name === DEPLOYMENT_NAME)).toBe(true);
+    expect(cluster.patches.every((p) => p.namespace === NAMESPACE)).toBe(true);
+    // Both annotations are really gone from the cluster object.
+    expect(cluster.annotations).toEqual({});
+    expect(cluster.replicas).toBe(1);
+
+    const deployment = internals.mcpServerIdToDeploymentMap.get(mcpServer.id);
+    expect(deployment?.statusSummary.state).toBe("running");
+  });
+
+  test("round trip on one physical deployment: hibernate at 2 replicas, wake back to 2", async ({
+    makeOrganization,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    // An operator scaled this deployment to 2; hibernation must record that
+    // and the wake must restore it, not reset to 1.
+    const cluster = new FakeK8sCluster({ replicas: 2 });
+    const { manager, internals } = makeManager(cluster);
+    const { mcpServer } = await makeLocalInstall({
+      makeOrganization,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    });
+
+    const deployment = await manager.getOrLoadDeployment(mcpServer.id);
+    expect(deployment).toBeDefined();
+    if (!deployment) return;
+    // Seed the pre-refresh state a started deployment would carry, then let
+    // cluster truth decide: refreshState is the real path to "running".
+    deployment.syncStateFromSibling("pending");
+    await deployment.refreshState();
+    expect(deployment.statusSummary.state).toBe("running");
+
+    // Idle past the window + stamp grace, with no in-flight use.
+    config.orchestrator.mcpIdleHibernation.windowSeconds = IDLE_WINDOW_SECONDS;
+    await db
+      .update(schema.mcpServersTable)
+      .set({ lastUsedAt: new Date(Date.now() - IDLE_CUTOFF_MS - 60_000) })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+
+    await internals.sweepIdleDeployments();
+
+    expect(cluster.replicas).toBe(0);
+    expect(cluster.annotations).toEqual({
+      [MCP_HIBERNATED_ANNOTATION]: "true",
+      [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "2",
+    });
+    expect(deployment.statusSummary.state).toBe("hibernated");
+    // A hibernated deployment must not keep advertising its dead pod.
+    expect(deployment.statusSummary.podName).toBeUndefined();
+
+    await manager.ensureAwake(mcpServer.id);
+
+    expect(cluster.patchedIntents).toEqual([
+      hibernatePatchBody(2),
+      { spec: { replicas: 2 } },
+      COMPLETE_WAKE_PATCH_BODY,
+    ]);
+    // The annotation-removal patch must be a merge patch — that is the only
+    // strategy under which a null value deletes the key rather than storing it.
+    expect(cluster.patches.at(-1)?.contentType).toBe(MERGE_PATCH_CONTENT_TYPE);
+    expect(cluster.replicas).toBe(2);
+    expect(cluster.annotations).toEqual({});
+    expect(deployment.statusSummary.state).toBe("running");
+
+    // EVERY lifecycle write carries a compare-and-swap precondition, the
+    // annotation removal included. It used to go out unconditional, justified
+    // as "deleting keys is idempotent" — true of the merge operation, false of
+    // the state: the marker is an ownership token bound to spec.replicas, so
+    // landing this on top of a concurrent hibernate leaves `replicas: 0` with
+    // no marker, which I1 forbids anything from ever waking.
+    const [hibernatePatch, wakePatch, completeWakePatch] = cluster.patchBodies;
+    expect(hibernatePatch.metadata?.resourceVersion).toBeDefined();
+    expect(wakePatch.metadata?.resourceVersion).toBeDefined();
+    expect(completeWakePatch.metadata?.resourceVersion).toBeDefined();
+  });
+
+  test("cache-cold with the annotation at replicas >= 1 resumes without a second scale-up", async ({
+    makeOrganization,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    // A wake interrupted by a restart: beginWake landed, completeWake never
+    // did. The replacement process must not re-issue the scale-up.
+    const cluster = new FakeK8sCluster({
+      replicas: 2,
+      annotations: {
+        [MCP_HIBERNATED_ANNOTATION]: "true",
+        [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "2",
+      },
+    });
+    const { manager, internals } = makeManager(cluster);
+    const { mcpServer } = await makeLocalInstall({
+      makeOrganization,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    });
+
+    await manager.ensureAwake(mcpServer.id);
+
+    expect(cluster.patchedIntents).toEqual([COMPLETE_WAKE_PATCH_BODY]);
+    expect(cluster.patchedIntents.some((body) => body.spec !== undefined)).toBe(
+      false,
+    );
+    expect(cluster.replicas).toBe(2);
+    expect(cluster.annotations).toEqual({});
+    expect(
+      internals.mcpServerIdToDeploymentMap.get(mcpServer.id)?.statusSummary
+        .state,
+    ).toBe("running");
+  });
+
+  test("cache-cold at replicas 0 WITHOUT the annotation is not ours — nothing is patched", async ({
+    makeOrganization,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    // An operator scaled this deployment to zero. Waking it would override a
+    // deliberate human decision.
+    const cluster = new FakeK8sCluster({ replicas: 0 });
+    const { manager } = makeManager(cluster);
+    const { mcpServer } = await makeLocalInstall({
+      makeOrganization,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    });
+
+    await manager.ensureAwake(mcpServer.id);
+
+    expect(cluster.patches).toEqual([]);
+    expect(cluster.replicas).toBe(0);
+    expect(cluster.annotations).toEqual({});
+  });
+
+  test("a wake whose pod cannot start reports the real failure, keeps the annotation, and recovers through a status refresh", async ({
+    makeOrganization,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const cluster = new FakeK8sCluster({
+      replicas: 0,
+      annotations: {
+        [MCP_HIBERNATED_ANNOTATION]: "true",
+        [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "1",
+      },
+      podComesUp: false,
+    });
+    // The scaled-up pod comes back in a terminal container state — a bad image
+    // or config, not a slow start.
+    cluster.containerWaitingReason = "CreateContainerConfigError";
+    const { manager, internals } = makeManager(cluster);
+    const { mcpServer } = await makeLocalInstall({
+      makeOrganization,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    });
+
+    // NOT McpServerWakeError: telling the caller to "retry shortly" would loop
+    // forever on a pod only an operator can fix, and would bury the reason.
+    const error = await manager.ensureAwake(mcpServer.id).then(
+      () => null,
+      (thrown) => thrown,
+    );
+    expect(error).toBeInstanceOf(McpServerDeploymentFailedError);
+    expect(error).not.toBeInstanceOf(McpServerWakeError);
+    expect((error as Error).message).toContain("CreateContainerConfigError");
+
+    // Scaled up, but the annotation deliberately stays: the sweeper only ever
+    // considers cached-"running" deployments and a live read of annotation +
+    // replicas >= 1 says "waking", so a half-woken deployment cannot be
+    // re-hibernated out from under the recovery.
+    expect(cluster.patchedIntents).toEqual([{ spec: { replicas: 1 } }]);
+    expect(cluster.replicas).toBe(1);
+    expect(cluster.annotations[MCP_HIBERNATED_ANNOTATION]).toBe("true");
+    const deployment = internals.mcpServerIdToDeploymentMap.get(mcpServer.id);
+    // A broken pod is the ordinary deployment lifecycle's problem, so the
+    // cached state says so rather than pretending the server is asleep.
+    expect(deployment?.statusSummary.state).toBe("failed");
+
+    // The operator fixes the image. The status refresh — not another wake —
+    // is what notices, and it finishes the half-done wake itself.
+    cluster.containerWaitingReason = null;
+    cluster.becomeReadyAfterNextRead();
+    // Scaled up with the annotation still on it reads as "waking", never as a
+    // failure that needs a human.
+    await deployment?.refreshState();
+    expect(deployment?.statusSummary.state).toBe("waking");
+    // Once the pod actually reports available, the refresh drops the
+    // annotations itself.
+    await deployment?.refreshState();
+
+    expect(cluster.patchedIntents).toEqual([
+      { spec: { replicas: 1 } },
+      COMPLETE_WAKE_PATCH_BODY,
+    ]);
+    expect(cluster.annotations).toEqual({});
+    expect(deployment?.statusSummary.state).toBe("running");
+  });
+
+  test("self-heal: a status refresh finishes a wake whose annotation removal never landed", async ({
+    makeOrganization,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    // Available replicas with the annotation still on the object: completeWake
+    // failed (or its process died). Left alone the deployment reads "pending"
+    // forever, so the ordinary status refresh has to finish the job.
+    const cluster = new FakeK8sCluster({
+      replicas: 1,
+      annotations: {
+        [MCP_HIBERNATED_ANNOTATION]: "true",
+        [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "1",
+      },
+    });
+    const { manager } = makeManager(cluster);
+    const { mcpServer } = await makeLocalInstall({
+      makeOrganization,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    });
+
+    const deployment = await manager.getOrLoadDeployment(mcpServer.id);
+    expect(deployment).toBeDefined();
+    if (!deployment) return;
+    deployment.syncStateFromSibling("pending");
+
+    await manager.refreshAllStates();
+
+    expect(cluster.patchedIntents).toEqual([COMPLETE_WAKE_PATCH_BODY]);
+    expect(cluster.patches.at(-1)?.contentType).toBe(MERGE_PATCH_CONTENT_TYPE);
+    expect(cluster.annotations).toEqual({});
+    expect(cluster.replicas).toBe(1);
+    expect(deployment.statusSummary.state).toBe("running");
+  });
+
+  /**
+   * Race-freedom coverage matrix — every entry path that can move a
+   * deployment through the hibernation states, raced against the others.
+   * "Entry path" means what actually reaches the state machine; callers that
+   * merely wrap one of these inherit its coverage.
+   *
+   * Raced HERE (real manager + real K8sDeployment + real transition-lease
+   * rows + a CAS-enforcing fake API server):
+   *   - sweep × sweep (two replicas) — one scale-to-zero lands
+   *   - sweep × operator write — hibernate aborts cleanly
+   *   - demand (trackActiveUse + ensureAwake, the gateway funnel's shape,
+   *     also reinstall's and the restart route's) × armed sweep
+   *   - demand × the hibernate's still-held transition gate
+   *   - demand × demand (two replicas) — one scale-up + one annotation drop
+   *   - sweep × a mid-wake deployment — never claimed
+   *   - passive refresh (refreshAllStates, the state watch's worker) ×
+   *     demand wake — hibernated and finish-wake shapes
+   *
+   * Pinned elsewhere, cited rather than duplicated:
+   *   - hard reset × demand wake, × queued wake, × concurrent resets —
+   *     routes/mcp-server.hard-reset.test.ts
+   *   - external/foreign replica controllers × sweep —
+   *     hibernation-foreign-scaler.ee.test.ts
+   *   - cross-replica cache divergence and wake-vs-re-zero —
+   *     hibernation-multi-replica.ee.test.ts
+   *   - passive discovery paths that must never wake —
+   *     manager.dormancy.test.ts
+   *   - the action-transition table itself —
+   *     hibernation-state-machine{,.ee}.test.ts
+   *   - the caller-facing funnel's retry-within-budget contract —
+   *     clients/mcp-client.test.ts
+   *   - real-cluster transitions end to end, including "no illegal
+   *     transition was ever refused" — e2e mcp-hibernation*.spec.ts
+   */
+  describe("cross-replica concurrency (resourceVersion compare-and-swap)", () => {
+    /** One idle, running install ready for a sweep, in its own manager. */
+    async function makeIdleCandidate(
+      cluster: FakeK8sCluster,
+      fixtures: {
+        makeOrganization: (
+          overrides?: Record<string, unknown>,
+        ) => Promise<{ id: string }>;
+        makeInternalMcpCatalog: (
+          overrides?: Record<string, unknown>,
+        ) => Promise<{ id: string }>;
+        makeMcpServer: (
+          overrides?: Record<string, unknown>,
+        ) => Promise<{ id: string; name: string }>;
+      },
+      mcpServerId?: string,
+    ) {
+      const { manager, internals } = makeManager(cluster);
+      const mcpServer = mcpServerId
+        ? { id: mcpServerId }
+        : (await makeLocalInstall(fixtures)).mcpServer;
+      const deployment = await manager.getOrLoadDeployment(mcpServer.id);
+      if (!deployment) throw new Error("deployment did not load");
+      deployment.syncStateFromSibling("pending");
+      await deployment.refreshState();
+      return { manager, internals, deployment, mcpServer };
+    }
+
+    test("two replicas sweeping the same deployment: exactly one scale-to-zero lands", async ({
+      makeOrganization,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    }) => {
+      // Two Archestra pods hold their own K8sDeployment for ONE physical
+      // Deployment and sweep on their own timers. Without a compare-and-swap
+      // both would patch: the loser would record a pre-hibernation replica
+      // count of 0 (read after the winner scaled it down) and a later wake
+      // would "restore" the deployment to a single replica it never had.
+      const cluster = new FakeK8sCluster({ replicas: 3 });
+      const fixtures = {
+        makeOrganization,
+        makeInternalMcpCatalog,
+        makeMcpServer,
+      };
+      const first = await makeIdleCandidate(cluster, fixtures);
+      // Second "replica": a distinct manager over the SAME install and the
+      // same fake cluster.
+      const second = await makeIdleCandidate(
+        cluster,
+        fixtures,
+        first.mcpServer.id,
+      );
+      expect(first.deployment.statusSummary.state).toBe("running");
+      expect(second.deployment.statusSummary.state).toBe("running");
+
+      config.orchestrator.mcpIdleHibernation.windowSeconds =
+        IDLE_WINDOW_SECONDS;
+      await db
+        .update(schema.mcpServersTable)
+        .set({ lastUsedAt: new Date(Date.now() - IDLE_CUTOFF_MS - 60_000) })
+        .where(eq(schema.mcpServersTable.id, first.mcpServer.id));
+
+      await Promise.all([
+        first.internals.sweepIdleDeployments(),
+        second.internals.sweepIdleDeployments(),
+      ]);
+
+      // Exactly one write reached the API server, and it recorded the real
+      // pre-hibernation count.
+      expect(cluster.patchedIntents).toEqual([hibernatePatchBody(3)]);
+      expect(cluster.replicas).toBe(0);
+      expect(cluster.annotations).toEqual({
+        [MCP_HIBERNATED_ANNOTATION]: "true",
+        [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "3",
+      });
+
+      // The loser converged rather than erroring: whichever manager lost sees
+      // the deployment as hibernated too (either from its own patch or from
+      // the idempotent already-at-zero path).
+      const states = [
+        first.deployment.statusSummary.state,
+        second.deployment.statusSummary.state,
+      ];
+      expect(states).toContain("hibernated");
+      expect(states).not.toContain("failed");
+    });
+
+    test("an operator patch between the read and the patch aborts the hibernate cleanly", async ({
+      makeOrganization,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    }) => {
+      // Never hibernate on doubt: the replica count this sweep read is now
+      // stale, so recording it would scale the operator's change away on the
+      // next wake. Abandon the attempt and let the next sweep re-evaluate.
+      const cluster = new FakeK8sCluster({ replicas: 1 });
+      const { internals, deployment, mcpServer } = await makeIdleCandidate(
+        cluster,
+        { makeOrganization, makeInternalMcpCatalog, makeMcpServer },
+      );
+      expect(deployment.statusSummary.state).toBe("running");
+
+      config.orchestrator.mcpIdleHibernation.windowSeconds =
+        IDLE_WINDOW_SECONDS;
+      await db
+        .update(schema.mcpServersTable)
+        .set({ lastUsedAt: new Date(Date.now() - IDLE_CUTOFF_MS - 60_000) })
+        .where(eq(schema.mcpServersTable.id, mcpServer.id));
+
+      // Somebody scales the deployment up the instant after hibernate() has
+      // read it — the last read hibernate() performs is its own live read.
+      const appsApi = (
+        internals as unknown as {
+          k8sAppsApi: { readNamespacedDeployment: ReturnType<typeof vi.fn> };
+        }
+      ).k8sAppsApi;
+      const readSpy = appsApi.readNamespacedDeployment;
+      readSpy.mockImplementation(async () => {
+        const read = cluster.readDeployment();
+        cluster.externalWrite((c) => {
+          c.replicas = 5;
+        });
+        return read;
+      });
+
+      await expect(internals.sweepIdleDeployments()).resolves.toBeUndefined();
+
+      // Nothing was patched, the operator's scale stands, and the deployment
+      // was never marked asleep.
+      expect(cluster.patches).toEqual([]);
+      expect(cluster.replicas).toBe(5);
+      expect(cluster.annotations).toEqual({});
+      expect(deployment.statusSummary.state).not.toBe("hibernated");
+    });
+
+    test("a demand caller racing an armed sweep never ends with a sleeping deployment", async ({
+      makeOrganization,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    }) => {
+      // The full demand entry path — active-use registration around the wake,
+      // exactly as the gateway funnel holds it from before the wake through
+      // dispatch — against a sweeper that has every reason to hibernate (the
+      // persisted stamp is stale past the window). Whichever way the
+      // interleaving falls (the sweep hibernates first and the wake brings it
+      // back, or the active-use guard vetoes the sweep), the invariant is the
+      // same: a deployment with a live caller ends awake and unmarked.
+      const cluster = new FakeK8sCluster({ replicas: 1 });
+      const fixtures = {
+        makeOrganization,
+        makeInternalMcpCatalog,
+        makeMcpServer,
+      };
+      const sweeper = await makeIdleCandidate(cluster, fixtures);
+      const demand = await makeIdleCandidate(
+        cluster,
+        fixtures,
+        sweeper.mcpServer.id,
+      );
+
+      config.orchestrator.mcpIdleHibernation.windowSeconds =
+        IDLE_WINDOW_SECONDS;
+      await db
+        .update(schema.mcpServersTable)
+        .set({ lastUsedAt: new Date(Date.now() - IDLE_CUTOFF_MS - 60_000) })
+        .where(eq(schema.mcpServersTable.id, sweeper.mcpServer.id));
+
+      // The caller's demand outlives the sweep tick, the way a dispatched
+      // tool call outlives the wake that preceded it.
+      let releaseCall: () => void = () => {};
+      const callStillRunning = new Promise<void>((resolve) => {
+        releaseCall = resolve;
+      });
+      const demandPath = mcpActiveUseTracker.trackActiveUse(
+        sweeper.mcpServer.id,
+        async () => {
+          await demand.manager.ensureAwake(sweeper.mcpServer.id);
+          await callStillRunning;
+        },
+      );
+      const sweep = sweeper.internals
+        .sweepIdleDeployments()
+        .finally(releaseCall);
+
+      await expect(Promise.all([demandPath, sweep])).resolves.toBeDefined();
+
+      // Awake and unmarked, whoever won each step.
+      expect(cluster.annotations).toEqual({});
+      expect(cluster.replicas).toBeGreaterThanOrEqual(1);
+      expect(sweeper.deployment.statusSummary.state).not.toBe("failed");
+      expect(demand.deployment.statusSummary.state).not.toBe("failed");
+    });
+
+    test("a wake arriving while the hibernate still holds the transition gate waits it out and completes", async ({
+      makeOrganization,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    }) => {
+      // The T-1265 interleaving, pinned deterministically: the sweep has
+      // patched the deployment asleep and is still inside its post-hibernate
+      // cleanup (the transition lease is held while the hibernation listeners
+      // run), when demand lands on another replica. The wake must queue
+      // behind the gate — not error, not skip — and finish the full
+      // hibernate → scale-up → annotation-drop sequence.
+      const cluster = new FakeK8sCluster({ replicas: 1 });
+      const fixtures = {
+        makeOrganization,
+        makeInternalMcpCatalog,
+        makeMcpServer,
+      };
+      const sweeper = await makeIdleCandidate(cluster, fixtures);
+      const demand = await makeIdleCandidate(
+        cluster,
+        fixtures,
+        sweeper.mcpServer.id,
+      );
+
+      config.orchestrator.mcpIdleHibernation.windowSeconds =
+        IDLE_WINDOW_SECONDS;
+      await db
+        .update(schema.mcpServersTable)
+        .set({ lastUsedAt: new Date(Date.now() - IDLE_CUTOFF_MS - 60_000) })
+        .where(eq(schema.mcpServersTable.id, sweeper.mcpServer.id));
+
+      // The listener runs under the lease. It fires the demand wake and holds
+      // the gate long enough that the wake verifiably arrives while the
+      // hibernate transition is still in flight.
+      let wake: Promise<void> | undefined;
+      sweeper.manager.registerHibernationListener(async () => {
+        wake = demand.manager.ensureAwake(sweeper.mcpServer.id);
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      });
+
+      await sweeper.internals.sweepIdleDeployments();
+      expect(
+        wake,
+        "the hibernate never ran, so the race was never staged",
+      ).toBeDefined();
+      await expect(wake).resolves.toBeUndefined();
+
+      // The whole story in the API server's own write log: put to sleep,
+      // scaled back up, annotations dropped — in that order, once each.
+      expect(cluster.patchedIntents).toEqual([
+        hibernatePatchBody(1),
+        { spec: { replicas: 1 } },
+        COMPLETE_WAKE_PATCH_BODY,
+      ]);
+      expect(cluster.annotations).toEqual({});
+      expect(cluster.replicas).toBe(1);
+      expect(demand.deployment.statusSummary.state).toBe("running");
+    });
+
+    test("two replicas waking one hibernated deployment: exactly one scale-up and one annotation drop land", async ({
+      makeOrganization,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    }) => {
+      // In-process simultaneous demand shares one wake by the single-flight
+      // map; ACROSS replicas the only protection is the transition lease and
+      // the cluster CAS. Both callers must resolve, and the API server must
+      // see exactly one wake's writes — a doubled scale-up or a second
+      // annotation drop is how replica counts and ownership markers get lost.
+      const cluster = new FakeK8sCluster({
+        replicas: 0,
+        annotations: {
+          [MCP_HIBERNATED_ANNOTATION]: "true",
+          [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "2",
+        },
+      });
+      const fixtures = {
+        makeOrganization,
+        makeInternalMcpCatalog,
+        makeMcpServer,
+      };
+      const first = await makeIdleCandidate(cluster, fixtures);
+      const second = await makeIdleCandidate(
+        cluster,
+        fixtures,
+        first.mcpServer.id,
+      );
+
+      await expect(
+        Promise.all([
+          first.manager.ensureAwake(first.mcpServer.id),
+          second.manager.ensureAwake(first.mcpServer.id),
+        ]),
+      ).resolves.toBeDefined();
+
+      expect(cluster.patchedIntents).toEqual([
+        { spec: { replicas: 2 } },
+        COMPLETE_WAKE_PATCH_BODY,
+      ]);
+      expect(cluster.annotations).toEqual({});
+      expect(cluster.replicas).toBe(2);
+    });
+
+    test("the passive refresh contributes no writes while a wake runs beside it", async ({
+      makeOrganization,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    }) => {
+      // The status refresh may FINISH a wake it observes, but it must never
+      // start one: on a hibernated deployment it is read-only, whatever else
+      // is happening. Raced against a demand wake on another replica, the API
+      // server must see exactly the wake's own two writes.
+      const cluster = new FakeK8sCluster({
+        replicas: 0,
+        annotations: {
+          [MCP_HIBERNATED_ANNOTATION]: "true",
+          [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "1",
+        },
+      });
+      const fixtures = {
+        makeOrganization,
+        makeInternalMcpCatalog,
+        makeMcpServer,
+      };
+      const refresher = await makeIdleCandidate(cluster, fixtures);
+      const waker = await makeIdleCandidate(
+        cluster,
+        fixtures,
+        refresher.mcpServer.id,
+      );
+
+      await expect(
+        Promise.all([
+          refresher.manager.refreshAllStates(),
+          waker.manager.ensureAwake(refresher.mcpServer.id),
+        ]),
+      ).resolves.toBeDefined();
+
+      expect(cluster.patchedIntents).toEqual([
+        { spec: { replicas: 1 } },
+        COMPLETE_WAKE_PATCH_BODY,
+      ]);
+      expect(cluster.annotations).toEqual({});
+      expect(cluster.replicas).toBe(1);
+    });
+
+    test("finish-wake claimed by the refresh and a demand wake at once lands exactly one annotation drop", async ({
+      makeOrganization,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    }) => {
+      // Ready pod, annotations still on: both the self-heal refresh and a
+      // demand wake want to write the same completeWake. The cluster CAS
+      // must let exactly one land; the loser converges without erroring and
+      // without a second write.
+      const cluster = new FakeK8sCluster({
+        replicas: 1,
+        annotations: {
+          [MCP_HIBERNATED_ANNOTATION]: "true",
+          [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "1",
+        },
+      });
+      const fixtures = {
+        makeOrganization,
+        makeInternalMcpCatalog,
+        makeMcpServer,
+      };
+      const refresher = await makeIdleCandidate(cluster, fixtures);
+      const waker = await makeIdleCandidate(
+        cluster,
+        fixtures,
+        refresher.mcpServer.id,
+      );
+
+      await expect(
+        Promise.all([
+          refresher.manager.refreshAllStates(),
+          waker.manager.ensureAwake(refresher.mcpServer.id),
+        ]),
+      ).resolves.toBeDefined();
+
+      expect(cluster.patchedIntents).toEqual([COMPLETE_WAKE_PATCH_BODY]);
+      expect(cluster.annotations).toEqual({});
+      expect(cluster.replicas).toBe(1);
+      expect(waker.deployment.statusSummary.state).toBe("running");
+    });
+
+    test("the sweeper never claims a deployment that is mid-wake", async ({
+      makeOrganization,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+    }) => {
+      // Annotation still on, replicas restored, pod not yet ready: the shape
+      // every deployment passes through while a wake is in flight. A sweep
+      // tick landing exactly here must leave it alone — hibernating it would
+      // scale away the pod the waiting caller's wake just paid for.
+      const cluster = new FakeK8sCluster({
+        replicas: 1,
+        annotations: {
+          [MCP_HIBERNATED_ANNOTATION]: "true",
+          [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "1",
+        },
+        podComesUp: false,
+      });
+      const { internals, deployment, mcpServer } = await makeIdleCandidate(
+        cluster,
+        { makeOrganization, makeInternalMcpCatalog, makeMcpServer },
+      );
+      expect(deployment.statusSummary.state).toBe("waking");
+
+      config.orchestrator.mcpIdleHibernation.windowSeconds =
+        IDLE_WINDOW_SECONDS;
+      await db
+        .update(schema.mcpServersTable)
+        .set({ lastUsedAt: new Date(Date.now() - IDLE_CUTOFF_MS - 60_000) })
+        .where(eq(schema.mcpServersTable.id, mcpServer.id));
+
+      await expect(internals.sweepIdleDeployments()).resolves.toBeUndefined();
+
+      expect(cluster.patches).toEqual([]);
+      expect(cluster.replicas).toBe(1);
+      expect(cluster.annotations).toEqual({
+        [MCP_HIBERNATED_ANNOTATION]: "true",
+        [MCP_PRE_HIBERNATION_REPLICAS_ANNOTATION]: "1",
+      });
+    });
+  });
+});
+
+test.for([
+  false,
+  true,
+])("credential renewal drains shared aliases without extending the drain on retries (hibernation=%s)", async (hibernationEnabled, {
+  makeOrganization,
+  makeUser,
+  makeInternalMcpCatalog,
+  makeMcpServer,
+}) => {
+  const organization = await makeOrganization({
+    mcpIdleHibernationEnabled: hibernationEnabled,
+  });
+  config.orchestrator.mcpIdleHibernation.betaEnabled = hibernationEnabled;
+  const owner = await makeUser();
+  await RuntimeCredentialDefinitionModel.create({
+    organizationId: organization.id,
+    createdBy: owner.id,
+    definition: {
+      key: "repository-app",
+      name: "Repository App",
+      kind: "github_app",
+      description: "",
+      icon: null,
+      allowPersonal: false,
+      allowOrganization: true,
+    },
+  });
+  const catalog = await makeInternalMcpCatalog({
+    organizationId: organization.id,
+    name: "Renewable shared server",
+    serverType: "local",
+    multitenant: true,
+    localConfig: {
+      command: "node",
+      arguments: ["server.js"],
+      environment: [
+        {
+          key: "GITHUB_TOKEN",
+          type: "secret",
+          credentialId: "repository-app",
+          credentialScope: "organization",
+          promptOnInstallation: false,
+          required: true,
+        },
+      ],
+    },
+  });
+  const first = await makeMcpServer({
+    catalogId: catalog.id,
+    name: "renewable-first",
+    deploymentName: DEPLOYMENT_NAME,
+  });
+  const second = await makeMcpServer({
+    catalogId: catalog.id,
+    name: "renewable-second",
+    deploymentName: DEPLOYMENT_NAME,
+  });
+  const cluster = new FakeK8sCluster({
+    replicas: 1,
+    annotations: {
+      "archestra.ai/credential-expires-at": String(Date.now() + 60_000),
+      "archestra.ai/credential-refresh-at": String(Date.now() - 1),
+    },
+  });
+  const { manager } = makeManager(cluster);
+  config.orchestrator.mcpIdleHibernation.betaEnabled = hibernationEnabled;
+  let finish: (() => void) | undefined;
+  let started: (() => void) | undefined;
+  const active = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const completed = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  const operation = mcpActiveUseTracker.trackCredentialUse(
+    first.id,
+    async () => {
+      started?.();
+      await completed;
+    },
+  );
+  await active;
+  let dispatched = false;
+  try {
+    await expect(
+      manager.withFreshCredentials(second.id, async () => {
+        dispatched = true;
+      }),
+    ).rejects.toThrow("draining active calls");
+    expect(dispatched).toBe(false);
+    await expect(
+      manager.withFreshCredentials(second.id, async () => {
+        dispatched = true;
+      }),
+    ).rejects.toThrow("draining active calls");
+    expect(
+      (
+        await db
+          .select()
+          .from(schema.mcpServersTable)
+          .where(eq(schema.mcpServersTable.id, second.id))
+      )[0]?.lastUsedAt,
+    ).toEqual(second.lastUsedAt);
+    expect(cluster.replicas).toBe(1);
+    // Another replica has completed renewal. Both aliases may now dispatch.
+    cluster.annotations["archestra.ai/credential-refresh-at"] = String(
+      Date.now() + 45 * 60_000,
+    );
+    cluster.annotations["archestra.ai/credential-expires-at"] = String(
+      Date.now() + 60 * 60_000,
+    );
+    expect(
+      await manager.withFreshCredentials(second.id, async () => "new-process"),
+    ).toBe("new-process");
+    // A resolved optional App with no connected value must not restart forever.
+    delete cluster.annotations["archestra.ai/credential-refresh-at"];
+    delete cluster.annotations["archestra.ai/credential-expires-at"];
+    cluster.annotations["archestra.ai/credentials-resolved"] = "true";
+    expect(
+      await manager.withFreshCredentials(
+        second.id,
+        async () => "optional-unconnected",
+      ),
+    ).toBe("optional-unconnected");
+  } finally {
+    finish?.();
+    await operation;
+    mcpActiveUseTracker.remove(first.id);
+    mcpActiveUseTracker.remove(second.id);
+    await manager.shutdown();
+  }
+});
+
+test.for([
+  false,
+  true,
+])("renewal starts with pre-resolved secrets when the source fails during teardown (shared=%s)", async (shared, {
+  makeOrganization,
+  makeUser,
+  makeInternalMcpCatalog,
+  makeMcpServer,
+}) => {
+  const organization = await makeOrganization();
+  const owner = await makeUser();
+  await RuntimeCredentialDefinitionModel.create({
+    organizationId: organization.id,
+    createdBy: owner.id,
+    definition: {
+      key: "renewal-secret",
+      name: "Renewal secret",
+      kind: "secret",
+      description: "",
+      icon: null,
+      allowPersonal: false,
+      allowOrganization: true,
+    },
+  });
+  await RuntimeCredentialDefinitionModel.create({
+    organizationId: organization.id,
+    createdBy: owner.id,
+    definition: {
+      key: "optional-app",
+      name: "Optional app",
+      kind: "github_app",
+      description: "",
+      icon: null,
+      allowPersonal: false,
+      allowOrganization: true,
+    },
+  });
+  const connection = {
+    organizationId: organization.id,
+    scope: "organization" as const,
+    userId: null,
+    credentialId: "renewal-secret",
+  };
+  await RuntimeCredentialConnectionModel.upsert({
+    ...connection,
+    value: "pre-resolved-value",
+  });
+  const catalog = await makeInternalMcpCatalog({
+    organizationId: organization.id,
+    name: "Renewal handoff",
+    serverType: "local",
+    multitenant: shared,
+    localConfig: {
+      command: "node",
+      arguments: ["server.js"],
+      environment: [
+        {
+          key: "GITHUB_TOKEN",
+          type: "secret",
+          credentialId: "optional-app",
+          credentialScope: "organization",
+          promptOnInstallation: false,
+          required: false,
+        },
+        {
+          key: "API_TOKEN",
+          type: "secret",
+          credentialId: "renewal-secret",
+          credentialScope: "organization",
+          promptOnInstallation: false,
+          required: true,
+        },
+      ],
+    },
+  });
+  const server = await makeMcpServer({
+    catalogId: catalog.id,
+    name: "renewal-handoff",
+    deploymentName: DEPLOYMENT_NAME,
+  });
+  if (shared) {
+    const sibling = await makeMcpServer({
+      catalogId: catalog.id,
+      name: "renewal-sibling",
+      deploymentName: DEPLOYMENT_NAME,
+    });
+    await db
+      .update(schema.mcpServersTable)
+      .set({ lastUsedAt: new Date(0) })
+      .where(eq(schema.mcpServersTable.id, sibling.id));
+  }
+  await db
+    .update(schema.mcpServersTable)
+    .set({ lastUsedAt: new Date(0) })
+    .where(eq(schema.mcpServersTable.id, server.id));
+  const cluster = new FakeK8sCluster({
+    replicas: 1,
+    annotations: {
+      "archestra.ai/credential-expires-at": String(Date.now() + 60_000),
+      "archestra.ai/credential-refresh-at": String(Date.now() - 1),
+    },
+  });
+  const { manager, internals } = makeManager(cluster);
+  const source = vi.spyOn(secretManager(), "getSecret");
+  internals.k8sNetworkingApi.createNamespacedNetworkPolicy = vi.fn(
+    async ({ body }) => body,
+  );
+  let installedSecret: k8s.V1Secret | undefined;
+  internals.k8sApi.createNamespacedSecret = vi.fn(async ({ body }) => {
+    installedSecret = body;
+    return body;
+  });
+  internals.k8sAppsApi.deleteNamespacedDeployment = vi.fn(async () => {
+    cluster.exists = false;
+    // Simulate losing the credential source after the safe preflight succeeded.
+    source.mockRejectedValue(new Error("Credential source unavailable"));
+    return {};
+  });
+  internals.k8sAppsApi.createNamespacedDeployment = vi.fn(async ({ body }) => {
+    cluster.exists = true;
+    cluster.annotations = body.metadata?.annotations ?? {};
+    return body;
+  });
+  try {
+    await expect(
+      manager.withFreshCredentials(server.id, async () => "replacement-ready"),
+    ).resolves.toBe("replacement-ready");
+    expect(
+      Buffer.from(installedSecret?.data?.API_TOKEN ?? "", "base64").toString(),
+    ).toBe("pre-resolved-value");
+    await expect(
+      RuntimeCredentialConnectionModel.resolveValue(connection),
+    ).rejects.toThrow("Credential source unavailable");
+    expect(cluster.exists).toBe(true);
+  } finally {
+    source.mockRestore();
+    await manager.shutdown();
+  }
+});

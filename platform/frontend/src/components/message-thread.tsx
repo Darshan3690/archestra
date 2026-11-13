@@ -3,21 +3,24 @@
 import {
   type archestraApiTypes,
   type BlockedToolPart,
-  type DualLlmPart,
+  extractMcpToolError,
+  foldCitationSources,
+  isMediaNotKept,
+  MEDIA_NOT_KEPT_REASON,
   type PartialUIMessage,
-  type PolicyDeniedPart,
-  TOOL_SWAP_AGENT_SHORT_NAME,
-  TOOL_SWAP_TO_DEFAULT_AGENT_SHORT_NAME,
-} from "@shared";
+} from "@archestra/shared";
 import type { ChatStatus } from "ai";
 import {
   Check,
+  FileAudio,
+  FileVideo2,
+  FileX,
+  ImageOff,
   Paperclip,
   RefreshCcwIcon,
-  ShieldCheck,
   TriangleAlert,
 } from "lucide-react";
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import {
   Conversation,
   ConversationContent,
@@ -44,32 +47,26 @@ import {
   ToolInput,
   ToolOutput,
 } from "@/components/ai-elements/tool";
+import { AttachmentAudio } from "@/components/chat/attachment-content";
+import {
+  isBlankReasoningPart,
+  stripAssistantProtocolMarkers,
+} from "@/components/chat/chat-messages.utils";
 import { InlineChatError } from "@/components/chat/inline-chat-error";
 import {
   hasKnowledgeBaseToolCall,
   KnowledgeGraphCitations,
 } from "@/components/chat/knowledge-graph-citations";
 import { MessageActions } from "@/components/chat/message-actions";
-import {
-  findScrollContainer,
-  PreexistingUnsafeContextDivider,
-  SensitiveContextStickyIndicator,
-  shouldShowStickyBoundaryIndicator,
-  UnsafeContextStartsHereDivider,
-} from "@/components/chat/message-boundary-divider";
-import { PolicyDeniedTool } from "@/components/chat/policy-denied-tool";
-import { SwapAgentBoundaryDivider } from "@/components/chat/swap-agent-boundary";
 import { UserMessageText } from "@/components/chat/user-message-text";
 import Divider from "@/components/divider";
-import { Button } from "@/components/ui/button";
-import { getToolNameFromPart } from "@/lib/chat/chat-tools-display.utils";
-import { parsePolicyDenied } from "@/lib/chat/mcp-error-ui";
 import {
-  getRenderedToolName,
-  getSwapToolShortName,
-} from "@/lib/chat/swap-agent.utils";
+  type EmbeddingPartData,
+  EmbeddingVectors,
+} from "@/components/embedding-vectors";
+import { Button } from "@/components/ui/button";
 import { useOrganization } from "@/lib/organization.query";
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/utils/tailwind";
 
 type PersistedChatError =
   archestraApiTypes.GetChatConversationResponses["200"]["chatErrors"][number];
@@ -87,10 +84,9 @@ const MessageThread = ({
   containerClassName,
   topPart,
   hideDivider,
-  profileId,
   agentName,
   selectedModel,
-  unsafeContextBoundary,
+  openPendingTools = false,
 }: {
   messages: PartialUIMessage[];
   chatErrors?: PersistedChatError[];
@@ -100,10 +96,13 @@ const MessageThread = ({
   containerClassName?: string;
   topPart?: React.ReactNode;
   hideDivider?: boolean;
-  profileId?: string;
   agentName?: string;
   selectedModel?: string;
-  unsafeContextBoundary?: archestraApiTypes.GetInteractionResponses["200"]["unsafeContextBoundary"];
+  /**
+   * Open a tool call that has no result yet. A logged request that ends on
+   * one is waiting on it, so it is what a reader opened the request to see.
+   */
+  openPendingTools?: boolean;
 }) => {
   const status: ChatStatus = "streaming" as ChatStatus;
   const { data: organization } = useOrganization();
@@ -118,51 +117,10 @@ const MessageThread = ({
     }
     return -1;
   }, [messages]);
-  const unsafeBoundaryRef = useRef<HTMLDivElement>(null);
-  const [showStickyUnsafeIndicator, setShowStickyUnsafeIndicator] =
-    useState(false);
-
-  useEffect(() => {
-    const boundaryElement = unsafeBoundaryRef.current;
-    if (!boundaryElement) {
-      setShowStickyUnsafeIndicator(false);
-      return;
-    }
-
-    const scrollContainer = findScrollContainer(boundaryElement);
-    if (!scrollContainer) {
-      setShowStickyUnsafeIndicator(false);
-      return;
-    }
-
-    const updateStickyState = () => {
-      const boundaryRect = boundaryElement.getBoundingClientRect();
-      const containerRect = scrollContainer.getBoundingClientRect();
-      setShowStickyUnsafeIndicator(
-        shouldShowStickyBoundaryIndicator({
-          boundaryTop: boundaryRect.top,
-          boundaryBottom: boundaryRect.bottom,
-          containerTop: containerRect.top,
-        }),
-      );
-    };
-
-    updateStickyState();
-    scrollContainer.addEventListener("scroll", updateStickyState, {
-      passive: true,
-    });
-    window.addEventListener("resize", updateStickyState);
-
-    return () => {
-      scrollContainer.removeEventListener("scroll", updateStickyState);
-      window.removeEventListener("resize", updateStickyState);
-    };
-  });
-
   return (
     <div
       className={cn(
-        "mx-auto relative size-full h-[calc(100vh-3rem)]",
+        "mx-auto relative size-full h-[calc(100dvh-3rem)]",
         containerClassName,
       )}
     >
@@ -170,12 +128,6 @@ const MessageThread = ({
         <Conversation className="h-full">
           <ConversationContent>
             {topPart}
-            <SensitiveContextStickyIndicator
-              visible={showStickyUnsafeIndicator}
-            />
-            {unsafeContextBoundary?.kind === "preexisting_untrusted" && (
-              <PreexistingUnsafeContextDivider dividerRef={unsafeBoundaryRef} />
-            )}
             {!hideDivider && <Divider className="my-4" />}
             <div className="max-w-4xl mx-auto">
               {timelineItems.map((item) => {
@@ -249,54 +201,13 @@ const MessageThread = ({
                           }
                         }
 
-                        // Skip dual-llm-analysis parts that follow a tool (invocation or result)
-                        // They will be rendered together with the tool
-                        if (_isDualLlmPart(part) && i > 0) {
-                          const prevPart = message.parts[i - 1];
-                          if (
-                            prevPart.type === "dynamic-tool" ||
-                            ("type" in prevPart &&
-                              prevPart.type === "tool-invocation") ||
-                            _isToolPrefixedPart(prevPart)
-                          ) {
-                            return null;
-                          }
-                        }
-
                         switch (part.type) {
                           case "text": {
-                            const policyDenied = parsePolicyDenied(part.text);
-                            const shouldRenderUnsafeContextDivider =
-                              message.role === "assistant" &&
-                              shouldRenderToolResultUnsafeBoundary({
-                                message,
-                                partIndex: i,
-                                unsafeContextBoundary,
-                              });
-                            const shouldRenderPolicyDeniedUnsafeBoundary =
-                              policyDenied?.unsafeContextActiveAtRequestStart &&
-                              !hasUnsafeBoundaryBefore({
-                                messages,
-                                beforeMessageIndex: idx,
-                                beforePartIndex: i,
-                                unsafeContextBoundary,
-                              });
-                            if (policyDenied) {
-                              return (
-                                <Fragment key={partKey}>
-                                  {shouldRenderPolicyDeniedUnsafeBoundary && (
-                                    <PreexistingUnsafeContextDivider
-                                      dividerRef={unsafeBoundaryRef}
-                                    />
-                                  )}
-                                  <PolicyDeniedTool
-                                    policyDenied={policyDenied}
-                                    {...(profileId
-                                      ? { editable: true, profileId }
-                                      : { editable: false })}
-                                  />
-                                </Fragment>
-                              );
+                            // Some models emit whitespace-only text alongside
+                            // tool calls (e.g. a lone " "); rendering it would
+                            // produce an empty message bubble
+                            if (!part.text.trim()) {
+                              return null;
                             }
                             const isLastAssistantMessage =
                               message.role === "assistant" &&
@@ -334,13 +245,22 @@ const MessageThread = ({
                               }
                             }
 
+                            // Fold the machine-oriented Sources block (quotes +
+                            // chunk refs for the verifier) out of the visible
+                            // text; the citation chips re-present the quotes.
+                            const citationFold =
+                              citationParts && message.role === "assistant"
+                                ? foldCitationSources(
+                                    stripAssistantProtocolMarkers(part.text),
+                                  )
+                                : null;
+                            const visibleText =
+                              message.role === "assistant"
+                                ? stripAssistantProtocolMarkers(part.text)
+                                : part.text;
+
                             return (
                               <Fragment key={partKey}>
-                                {shouldRenderUnsafeContextDivider && (
-                                  <UnsafeContextStartsHereDivider
-                                    dividerRef={unsafeBoundaryRef}
-                                  />
-                                )}
                                 <Message from={message.role}>
                                   <MessageContent>
                                     {message.role === "system" && (
@@ -351,11 +271,17 @@ const MessageThread = ({
                                     {message.role === "user" ? (
                                       <UserMessageText text={part.text} />
                                     ) : (
-                                      <Response>{part.text}</Response>
+                                      <Response>
+                                        {citationFold &&
+                                        citationFold.entries.length > 0
+                                          ? citationFold.displayText
+                                          : visibleText}
+                                      </Response>
                                     )}
                                     {citationParts && (
                                       <KnowledgeGraphCitations
                                         parts={citationParts}
+                                        citedQuotes={citationFold?.entries}
                                       />
                                     )}
                                   </MessageContent>
@@ -363,7 +289,7 @@ const MessageThread = ({
                                 {message.role === "assistant" &&
                                   i === messages.length - 1 && (
                                     <MessageActions
-                                      textToCopy={part.text}
+                                      textToCopy={visibleText}
                                       className="-mt-1 w-fit"
                                     />
                                   )}
@@ -371,38 +297,19 @@ const MessageThread = ({
                             );
                           }
                           case "file": {
-                            const filePart = part as {
-                              type: "file";
-                              url: string;
-                              mediaType: string;
-                              filename?: string;
-                            };
-                            if (filePart.mediaType?.startsWith("image/")) {
-                              return (
-                                <div
-                                  key={partKey}
-                                  className="py-1 flex justify-start"
-                                >
-                                  <img
-                                    src={filePart.url}
-                                    alt={filePart.filename || "Image"}
-                                    className="max-h-32 rounded-lg object-cover"
-                                  />
-                                </div>
-                              );
-                            }
                             return (
-                              <div
+                              <LoggedFilePart
                                 key={partKey}
-                                className="py-1 flex justify-start"
-                              >
-                                <div className="flex items-center gap-2 text-sm rounded-lg border bg-muted/50 p-2">
-                                  <Paperclip className="size-4 text-muted-foreground" />
-                                  <span className="truncate">
-                                    {filePart.filename || "Attached file"}
-                                  </span>
-                                </div>
-                              </div>
+                                part={
+                                  part as {
+                                    url: string;
+                                    mediaType: string;
+                                    filename?: string;
+                                  }
+                                }
+                                fromUser={message.role === "user"}
+                                conversationId={conversationId}
+                              />
                             );
                           }
                           case "tool-invocation":
@@ -411,34 +318,17 @@ const MessageThread = ({
                               part.type === "dynamic-tool"
                                 ? part.toolName
                                 : part.toolCallId;
-                            const swapToolShortName = getSwapToolShortName({
-                              toolName,
-                            });
-                            if (
-                              swapToolShortName ===
-                                TOOL_SWAP_AGENT_SHORT_NAME ||
-                              swapToolShortName ===
-                                TOOL_SWAP_TO_DEFAULT_AGENT_SHORT_NAME
-                            ) {
-                              return null;
-                            }
                             const isDanger = [
                               "gather_sensitive_data",
                               "send_email",
                               "analyze_email_blocked",
                             ].includes(part.toolCallId);
-                            const isShield =
-                              part.toolCallId === "dual_llm_activated";
                             const isSuccess =
                               part.toolCallId === "attack_blocked";
                             const getIcon = () => {
                               if (isDanger)
                                 return (
                                   <TriangleAlert className="size-4 text-muted-foreground" />
-                                );
-                              if (isShield)
-                                return (
-                                  <ShieldCheck className="size-4 text-muted-foreground" />
                                 );
                               if (isSuccess)
                                 return (
@@ -448,14 +338,12 @@ const MessageThread = ({
                             };
                             const getColorClass = () => {
                               if (isDanger) return "bg-red-500/30";
-                              if (isShield) return "bg-sky-400/60";
                               if (isSuccess) return "bg-emerald-700/60";
                               return "";
                             };
 
-                            // Look ahead for tool result and dual LLM analysis
+                            // Look ahead for the tool result
                             let toolResultPart = null;
-                            let dualLlmPart: DualLlmPart | null = null;
 
                             // Check if next part is a tool result (same tool call ID)
                             const nextPart = message.parts[i + 1];
@@ -467,29 +355,25 @@ const MessageThread = ({
                               nextPart.toolCallId === part.toolCallId
                             ) {
                               toolResultPart = nextPart;
-
-                              // Check if there's a dual LLM part after the tool result
-                              const dualLlmPartCandidate = message.parts[i + 2];
-                              if (_isDualLlmPart(dualLlmPartCandidate)) {
-                                dualLlmPart = dualLlmPartCandidate;
-                              }
-                            } else {
-                              // Check if the next part is directly a dual LLM analysis
-                              if (_isDualLlmPart(nextPart)) {
-                                dualLlmPart = nextPart;
-                              }
                             }
 
                             return (
                               <Tool
                                 key={part.toolCallId ?? partKey}
                                 className={getColorClass()}
+                                defaultOpen={
+                                  openPendingTools &&
+                                  !toolResultPart &&
+                                  isPendingToolState(part.state)
+                                }
                               >
                                 <ToolHeader
                                   type={`tool-${toolName}`}
                                   state={
-                                    dualLlmPart
-                                      ? "output-available-dual-llm"
+                                    isCancelledToolOutput(
+                                      toolResultPart?.output ?? part.output,
+                                    )
+                                      ? "output-cancelled"
                                       : toolResultPart
                                         ? "output-available"
                                         : part.state
@@ -504,10 +388,12 @@ const MessageThread = ({
                                   {toolResultPart && (
                                     <ToolOutput
                                       label={
-                                        toolResultPart.errorText
-                                          ? "Error"
-                                          : dualLlmPart
-                                            ? "Unsafe result"
+                                        isCancelledToolOutput(
+                                          toolResultPart.output,
+                                        )
+                                          ? "Cancelled"
+                                          : toolResultPart.errorText
+                                            ? "Error"
                                             : "Result"
                                       }
                                       output={toolResultPart.output as unknown}
@@ -517,36 +403,34 @@ const MessageThread = ({
                                   {!toolResultPart && Boolean(part.output) && (
                                     <ToolOutput
                                       label={
-                                        part.errorText
-                                          ? "Error"
-                                          : dualLlmPart
-                                            ? "Unsafe result"
+                                        isCancelledToolOutput(part.output)
+                                          ? "Cancelled"
+                                          : part.errorText
+                                            ? "Error"
                                             : "Result"
                                       }
                                       output={part.output as unknown}
                                       errorText={part.errorText}
                                     />
                                   )}
-                                  {dualLlmPart && (
-                                    <>
-                                      <ToolOutput
-                                        label="Safe result"
-                                        output={dualLlmPart.safeResult}
-                                      />
-                                      <ToolOutput
-                                        label="Questions and Answers"
-                                        output={undefined}
-                                        conversations={dualLlmPart.conversations.slice(
-                                          1,
-                                        )}
-                                      />
-                                    </>
-                                  )}
                                 </ToolContent>
                               </Tool>
                             );
                           }
                           case "reasoning":
+                            // Empty reasoning parts (redacted/signature-only
+                            // thinking, kept for provider replay) must not render
+                            // as empty "Thinking…" accordions.
+                            if (isBlankReasoningPart(part)) {
+                              return null;
+                            }
+                            // One accordion per part, deliberately. Chat folds
+                            // adjacent thinking into runs, but that helper
+                            // models chat's visible-part set, which this view
+                            // does not share — it draws blocked-tool blocks the
+                            // helper would treat as invisible and merge across,
+                            // reordering the transcript. Tool cards here separate thinking
+                            // anyway, so the folding has little to do.
                             return (
                               <Reasoning
                                 key={partKey}
@@ -562,6 +446,28 @@ const MessageThread = ({
                               </Reasoning>
                             );
                           default: {
+                            if (part.type === "data-embedding") {
+                              return (
+                                <div key={partKey} className="py-1">
+                                  <EmbeddingVectors
+                                    data={
+                                      (part as { data: EmbeddingPartData }).data
+                                    }
+                                  />
+                                </div>
+                              );
+                            }
+                            if (part.type === "data-missing-media") {
+                              return (
+                                <MissingMedia
+                                  key={partKey}
+                                  media={
+                                    (part as { data: MissingMediaData }).data
+                                  }
+                                  fromUser={message.role === "user"}
+                                />
+                              );
+                            }
                             // Handle custom blocked-tool type
                             if (_isBlockedToolPart(part)) {
                               const blockedPart = part as BlockedToolPart;
@@ -606,21 +512,8 @@ const MessageThread = ({
 
                             // Handle tool-* prefixed parts (persisted tool calls from DB)
                             if (_isToolPrefixedPart(part)) {
-                              const toolName = getRenderedToolName(part);
-                              const swapToolShortName = toolName
-                                ? getSwapToolShortName({ toolName })
-                                : null;
-                              if (
-                                swapToolShortName ===
-                                  TOOL_SWAP_AGENT_SHORT_NAME ||
-                                swapToolShortName ===
-                                  TOOL_SWAP_TO_DEFAULT_AGENT_SHORT_NAME
-                              ) {
-                                return null;
-                              }
-                              // Look ahead for tool result and dual LLM analysis
+                              // Look ahead for the tool result
                               let toolResultPart = null;
-                              let dualLlmPart: DualLlmPart | null = null;
 
                               const nextPart = message.parts[i + 1];
                               if (
@@ -630,21 +523,24 @@ const MessageThread = ({
                                 nextPart.toolCallId === part.toolCallId
                               ) {
                                 toolResultPart = nextPart;
-                                const dualLlmCandidate = message.parts[i + 2];
-                                if (_isDualLlmPart(dualLlmCandidate)) {
-                                  dualLlmPart = dualLlmCandidate;
-                                }
-                              } else if (_isDualLlmPart(nextPart)) {
-                                dualLlmPart = nextPart;
                               }
 
                               return (
-                                <Tool key={`${message.id}-${part.toolCallId}`}>
+                                <Tool
+                                  key={`${message.id}-${part.toolCallId}`}
+                                  defaultOpen={
+                                    openPendingTools &&
+                                    !toolResultPart &&
+                                    isPendingToolState(part.state)
+                                  }
+                                >
                                   <ToolHeader
                                     type={part.type}
                                     state={
-                                      dualLlmPart
-                                        ? "output-available-dual-llm"
+                                      isCancelledToolOutput(
+                                        toolResultPart?.output ?? part.output,
+                                      )
+                                        ? "output-cancelled"
                                         : toolResultPart
                                           ? "output-available"
                                           : part.state
@@ -661,10 +557,12 @@ const MessageThread = ({
                                     {toolResultPart && (
                                       <ToolOutput
                                         label={
-                                          toolResultPart.errorText
-                                            ? "Error"
-                                            : dualLlmPart
-                                              ? "Unsafe result"
+                                          isCancelledToolOutput(
+                                            toolResultPart.output,
+                                          )
+                                            ? "Cancelled"
+                                            : toolResultPart.errorText
+                                              ? "Error"
                                               : "Result"
                                         }
                                         output={
@@ -681,10 +579,10 @@ const MessageThread = ({
                                       Boolean(part.output) && (
                                         <ToolOutput
                                           label={
-                                            part.errorText
-                                              ? "Error"
-                                              : dualLlmPart
-                                                ? "Unsafe result"
+                                            isCancelledToolOutput(part.output)
+                                              ? "Cancelled"
+                                              : part.errorText
+                                                ? "Error"
                                                 : "Result"
                                           }
                                           output={part.output as unknown}
@@ -693,74 +591,16 @@ const MessageThread = ({
                                           }
                                         />
                                       )}
-                                    {dualLlmPart && (
-                                      <>
-                                        <ToolOutput
-                                          label="Safe result"
-                                          output={dualLlmPart.safeResult}
-                                        />
-                                        <ToolOutput
-                                          label="Questions and Answers"
-                                          output={undefined}
-                                          conversations={dualLlmPart.conversations.slice(
-                                            1,
-                                          )}
-                                        />
-                                      </>
-                                    )}
                                   </ToolContent>
                                 </Tool>
                               );
                             }
 
-                            // Handle custom dual-llm-analysis type (standalone, not following a tool)
-                            if (_isDualLlmPart(part)) {
-                              const dualLlmPart = part as DualLlmPart;
-
-                              return (
-                                <Tool key={partKey} className="bg-sky-400/20">
-                                  <ToolHeader
-                                    type="tool-dual-llm-action"
-                                    state="output-available-dual-llm"
-                                    icon={
-                                      <ShieldCheck className="size-4 text-muted-foreground" />
-                                    }
-                                  />
-                                  <ToolContent>
-                                    <ToolOutput
-                                      label="Safe result"
-                                      output={dualLlmPart.safeResult}
-                                    />
-                                    <ToolOutput
-                                      label="Questions and answers"
-                                      output={undefined}
-                                      conversations={dualLlmPart.conversations.slice(
-                                        1,
-                                      )}
-                                    />
-                                  </ToolContent>
-                                </Tool>
-                              );
-                            }
                             return null;
                           }
                         }
                       });
                     })()}
-                    {shouldRenderUnsafeContextDividerAfterMessage({
-                      message,
-                      unsafeContextBoundary,
-                    }) && (
-                      <UnsafeContextStartsHereDivider
-                        dividerRef={unsafeBoundaryRef}
-                      />
-                    )}
-                    {message.role === "assistant" && (
-                      <SwapAgentBoundaryDivider
-                        parts={message.parts ?? []}
-                        hasToolError={hasSwapToolErrorInMessageThread}
-                      />
-                    )}
                   </div>
                 );
               })}
@@ -783,12 +623,7 @@ const MessageThread = ({
   );
 };
 
-export type {
-  BlockedToolPart,
-  DualLlmPart,
-  PolicyDeniedPart,
-  PartialUIMessage,
-};
+export type { BlockedToolPart, PartialUIMessage };
 
 // Type guard for tool-* prefixed parts (persisted tool calls from DB)
 function _isToolPrefixedPart(part: unknown): part is {
@@ -809,16 +644,7 @@ function _isToolPrefixedPart(part: unknown): part is {
   );
 }
 
-// Type guards for custom part types
-function _isDualLlmPart(part: unknown): part is DualLlmPart {
-  return (
-    typeof part === "object" &&
-    part !== null &&
-    "type" in part &&
-    (part as { type: string }).type === "dual-llm-analysis"
-  );
-}
-
+// Type guard for custom part types
 function _isBlockedToolPart(part: unknown): part is BlockedToolPart {
   return (
     typeof part === "object" &&
@@ -877,181 +703,6 @@ function getMessageCreatedAt(message: PartialUIMessage): number | null {
   return Number.isNaN(createdAt) ? null : createdAt;
 }
 
-function shouldRenderToolResultUnsafeBoundary(params: {
-  message: PartialUIMessage;
-  partIndex: number;
-  unsafeContextBoundary?: archestraApiTypes.GetInteractionResponses["200"]["unsafeContextBoundary"];
-}): boolean {
-  const { message, partIndex, unsafeContextBoundary } = params;
-
-  if (unsafeContextBoundary?.kind !== "tool_result") {
-    return false;
-  }
-
-  let sawBoundaryToolResult = false;
-  for (let i = 0; i < (message.parts?.length ?? 0); i++) {
-    const part = message.parts[i];
-    if (
-      "toolCallId" in part &&
-      "state" in part &&
-      part.state === "output-available" &&
-      toolPartMatchesUnsafeContextBoundary(part, unsafeContextBoundary)
-    ) {
-      sawBoundaryToolResult = true;
-      continue;
-    }
-
-    if (
-      sawBoundaryToolResult &&
-      part.type === "text" &&
-      typeof part.text === "string" &&
-      part.text.trim().length > 0
-    ) {
-      return i === partIndex;
-    }
-  }
-
-  return false;
-}
-
-function shouldRenderUnsafeContextDividerAfterMessage(params: {
-  message: PartialUIMessage;
-  unsafeContextBoundary?: archestraApiTypes.GetInteractionResponses["200"]["unsafeContextBoundary"];
-}): boolean {
-  const { message, unsafeContextBoundary } = params;
-
-  if (unsafeContextBoundary?.kind !== "tool_result") {
-    return false;
-  }
-
-  let sawBoundaryToolResult = false;
-  for (const part of message.parts ?? []) {
-    if (
-      "toolCallId" in part &&
-      "state" in part &&
-      part.state === "output-available" &&
-      toolPartMatchesUnsafeContextBoundary(part, unsafeContextBoundary)
-    ) {
-      sawBoundaryToolResult = true;
-      continue;
-    }
-
-    if (
-      sawBoundaryToolResult &&
-      part.type === "text" &&
-      typeof part.text === "string" &&
-      part.text.trim().length > 0
-    ) {
-      return false;
-    }
-  }
-
-  return sawBoundaryToolResult;
-}
-
-function hasUnsafeBoundaryBefore(params: {
-  messages: PartialUIMessage[];
-  beforeMessageIndex: number;
-  beforePartIndex: number;
-  unsafeContextBoundary?: archestraApiTypes.GetInteractionResponses["200"]["unsafeContextBoundary"];
-}): boolean {
-  if (params.unsafeContextBoundary?.kind === "preexisting_untrusted") {
-    return true;
-  }
-
-  for (
-    let messageIndex = 0;
-    messageIndex <= params.beforeMessageIndex;
-    messageIndex++
-  ) {
-    const message = params.messages[messageIndex];
-    const lastPartIndex =
-      messageIndex === params.beforeMessageIndex
-        ? params.beforePartIndex - 1
-        : (message.parts?.length ?? 0) - 1;
-
-    for (let partIndex = 0; partIndex <= lastPartIndex; partIndex++) {
-      const part = message.parts?.[partIndex];
-      if (!part) {
-        continue;
-      }
-
-      if (
-        part.type === "text" &&
-        parsePolicyDenied(part.text)?.unsafeContextActiveAtRequestStart
-      ) {
-        return true;
-      }
-
-      if (
-        "state" in part &&
-        part.state === "output-available" &&
-        toolPartMatchesUnsafeContextBoundaryInThread(
-          part,
-          params.unsafeContextBoundary,
-        )
-      ) {
-        return true;
-      }
-    }
-  }
-
-  return false;
-}
-
-function toolPartMatchesUnsafeContextBoundaryInThread(
-  part: PartialUIMessage["parts"][number],
-  unsafeContextBoundary?: archestraApiTypes.GetInteractionResponses["200"]["unsafeContextBoundary"],
-): boolean {
-  if (!("type" in part) || typeof part.type !== "string") {
-    return false;
-  }
-
-  if (unsafeContextBoundary?.kind !== "tool_result") {
-    return false;
-  }
-
-  return toolPartMatchesUnsafeContextBoundary(part, unsafeContextBoundary);
-}
-
-function toolPartMatchesUnsafeContextBoundary(
-  part: PartialUIMessage["parts"][number],
-  boundary: Extract<
-    NonNullable<
-      archestraApiTypes.GetInteractionResponses["200"]["unsafeContextBoundary"]
-    >,
-    { kind: "tool_result" }
-  >,
-): boolean {
-  if ("toolCallId" in part && part.toolCallId === boundary.toolCallId) {
-    return true;
-  }
-
-  const partToolName = getToolNameFromPart(part);
-  return partToolName === boundary.toolName;
-}
-
-function hasSwapToolErrorInMessageThread(
-  part: { toolCallId?: string; errorText?: string },
-  allParts: Array<{ toolCallId?: string; errorText?: string }>,
-): boolean {
-  if (typeof part.errorText === "string" && part.errorText.length > 0) {
-    return true;
-  }
-
-  if (!part.toolCallId) {
-    return false;
-  }
-
-  return allParts.some(
-    (candidate) =>
-      candidate !== part &&
-      candidate.toolCallId === part.toolCallId &&
-      typeof candidate.errorText === "string" &&
-      candidate.errorText.length > 0,
-  );
-}
-
 function getPartKey(
   messageId: string | undefined,
   part: PartialUIMessage["parts"][number],
@@ -1082,4 +733,162 @@ function getPartSignature(part: PartialUIMessage["parts"][number]): string {
       }
       return `part:${JSON.stringify(part)}`;
   }
+}
+
+/**
+ * A tool result the run's user cancelled mid-flight (stopped run or cancelled
+ * background task), detected through the shared schema-validated extractor —
+ * rendered as its own Cancelled state, neither a success nor an error.
+ */
+function isCancelledToolOutput(output: unknown): boolean {
+  return extractMcpToolError(output)?.type === "cancelled";
+}
+
+function isPendingToolState(state: string | undefined): boolean {
+  return state === "input-available" || state === "input-streaming";
+}
+
+// ============================================================================
+// Logged media
+// ============================================================================
+
+type MissingMediaData = {
+  kind: "audio" | "image" | "video" | "file";
+  label: string;
+  reason: string;
+};
+
+const MISSING_MEDIA_ICON = {
+  audio: FileAudio,
+  image: ImageOff,
+  video: FileVideo2,
+  file: FileX,
+} as const;
+
+/**
+ * A file a logged call carried: an image shown inline, audio in the chat's
+ * player, anything else as a named chip. The caption (format, size, length)
+ * is one grey line under the media. A user's media sits on their side.
+ */
+function LoggedFilePart({
+  part,
+  fromUser,
+  conversationId,
+}: {
+  part: { url: string; mediaType: string; filename?: string };
+  fromUser: boolean;
+  conversationId: string | undefined;
+}) {
+  const isImage = part.mediaType?.startsWith("image/");
+  const isAudio = part.mediaType?.startsWith("audio/");
+  // A renderer that builds its own link around stripped bytes still lands
+  // here; say what was there instead of showing a broken image or player.
+  if (isMediaNotKept(part.url)) {
+    const kind = isImage
+      ? "image"
+      : isAudio
+        ? "audio"
+        : part.mediaType?.startsWith("video/")
+          ? "video"
+          : "file";
+    return (
+      <MissingMedia
+        media={{
+          kind,
+          label:
+            part.filename ||
+            { image: "Image", audio: "Audio", video: "Video", file: "File" }[
+              kind
+            ],
+          reason: MEDIA_NOT_KEPT_REASON,
+        }}
+        fromUser={fromUser}
+      />
+    );
+  }
+  if (!isImage && !isAudio) {
+    return (
+      <div
+        className={cn("flex py-1", fromUser ? "justify-end" : "justify-start")}
+      >
+        <div className="flex items-center gap-2 rounded-lg border bg-muted/50 p-2 text-sm">
+          <Paperclip className="size-4 text-muted-foreground" />
+          <span className="truncate">{part.filename || "Attached file"}</span>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <figure
+      className={cn(
+        "flex flex-col gap-1.5 py-1",
+        fromUser ? "items-end" : "items-start",
+      )}
+    >
+      {isImage ? (
+        <LoggedImage url={part.url} alt={part.filename || "Image"} />
+      ) : (
+        <AttachmentAudio
+          url={part.url}
+          conversationId={conversationId}
+          label={part.filename || "Audio"}
+        />
+      )}
+      {part.filename ? (
+        <figcaption className="text-xs text-muted-foreground tabular-nums">
+          {part.filename}
+        </figcaption>
+      ) : null}
+    </figure>
+  );
+}
+
+/** An image, or a note when its link no longer loads (provider links expire). */
+function LoggedImage({ url, alt }: { url: string; alt: string }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) {
+    return (
+      <MissingMedia
+        media={{
+          kind: "image",
+          label: alt,
+          reason: "The provider's link to this image no longer loads",
+        }}
+        fromUser={false}
+      />
+    );
+  }
+  return (
+    <img
+      src={url}
+      alt={alt}
+      onError={() => setFailed(true)}
+      className="max-h-64 max-w-full rounded-lg border object-contain"
+    />
+  );
+}
+
+/** Media the call carried that the log did not keep, named, with the reason. */
+function MissingMedia({
+  media,
+  fromUser,
+}: {
+  media: MissingMediaData;
+  fromUser: boolean;
+}) {
+  const Icon = MISSING_MEDIA_ICON[media.kind] ?? FileX;
+  return (
+    <div
+      className={cn("flex py-1", fromUser ? "justify-end" : "justify-start")}
+    >
+      <div className="flex max-w-full items-center gap-2 rounded-lg border px-3 py-2 text-sm">
+        <Icon
+          aria-hidden="true"
+          className="size-4 shrink-0 text-muted-foreground"
+        />
+        <span className="truncate font-medium tabular-nums">{media.label}</span>
+        <span className="truncate text-muted-foreground">{media.reason}</span>
+      </div>
+    </div>
+  );
 }

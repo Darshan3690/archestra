@@ -1,31 +1,21 @@
-import { archestraApiSdk } from "@shared";
+import { archestraApiSdk } from "@archestra/shared";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook } from "@testing-library/react";
 import type React from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { handleApiError } from "@/lib/utils";
+import { handleApiError } from "@/lib/utils/api";
 import { useUpdateChatOpsConfigInQuickstart } from "./chatops-config.query";
 
-vi.mock("@shared", async () => {
-  const actual = await vi.importActual("@shared");
-  return {
-    ...actual,
-    archestraApiSdk: {
-      updateChatOpsConfigInQuickstart: vi.fn(),
-      refreshChatOpsChannelDiscovery: vi.fn().mockResolvedValue({}),
-    },
-  };
-});
-
-vi.mock("sonner", () => ({
-  toast: {
-    success: vi.fn(),
-    error: vi.fn(),
-  },
+vi.mock("@archestra/shared/api-sdk", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@archestra/shared/api-sdk")>()),
+  updateChatOpsConfigInQuickstart: vi.fn(),
+  refreshChatOpsChannelDiscovery: vi.fn().mockResolvedValue({}),
 }));
 
-vi.mock("@/lib/utils", async () => {
-  const actual = await vi.importActual("@/lib/utils");
+vi.mock("sonner");
+
+vi.mock("@/lib/utils/api", async () => {
+  const actual = await vi.importActual("@/lib/utils/api");
   return {
     ...actual,
     handleApiError: vi.fn(),

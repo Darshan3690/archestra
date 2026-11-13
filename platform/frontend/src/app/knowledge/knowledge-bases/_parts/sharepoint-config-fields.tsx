@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
 "use client";
 
 import type { UseFormReturn } from "react-hook-form";
@@ -10,6 +11,13 @@ import {
   FormMessage,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 
 interface SharePointConfigFieldsProps {
@@ -22,6 +30,7 @@ export function SharePointConfigFields({
   form,
   prefix = "config",
 }: SharePointConfigFieldsProps) {
+  const includePages = form.watch(`${prefix}.includePages`) !== false;
   return (
     <div className="space-y-4">
       <FormField
@@ -30,6 +39,10 @@ export function SharePointConfigFields({
         render={({ field }) => (
           <FormItem>
             <FormLabel>Drive IDs (optional)</FormLabel>
+            <FormDescription>
+              Comma-separated list of document library (drive) IDs to sync.
+              Leave blank to sync all document libraries in the site.
+            </FormDescription>
             <FormControl>
               <Input
                 placeholder="b!abc123, b!def456"
@@ -37,10 +50,6 @@ export function SharePointConfigFields({
                 value={(field.value as string) ?? ""}
               />
             </FormControl>
-            <FormDescription>
-              Comma-separated list of document library (drive) IDs to sync.
-              Leave blank to sync all document libraries in the site.
-            </FormDescription>
             <FormMessage />
           </FormItem>
         )}
@@ -52,6 +61,9 @@ export function SharePointConfigFields({
         render={({ field }) => (
           <FormItem>
             <FormLabel>Folder Path (optional)</FormLabel>
+            <FormDescription>
+              Restrict sync to a specific folder path within each drive.
+            </FormDescription>
             <FormControl>
               <Input
                 placeholder="General/Documents/Engineering"
@@ -59,9 +71,6 @@ export function SharePointConfigFields({
                 value={(field.value as string) ?? ""}
               />
             </FormControl>
-            <FormDescription>
-              Restrict sync to a specific folder path within each drive.
-            </FormDescription>
             <FormMessage />
           </FormItem>
         )}
@@ -109,6 +118,53 @@ export function SharePointConfigFields({
           </FormItem>
         )}
       />
+      {includePages && (
+        <FormField
+          control={form.control}
+          name={`${prefix}.pagePublicationStatus`}
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>Page publication status</FormLabel>
+              <FormDescription>
+                Filters the current page version, not earlier published
+                versions. Previously indexed pages outside this selection are
+                removed on the next sync. Document library files are unaffected.
+              </FormDescription>
+              <Select
+                value={field.value ?? "both"}
+                onValueChange={field.onChange}
+              >
+                <FormControl>
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                </FormControl>
+                <SelectContent>
+                  <SelectItem
+                    value="published"
+                    description="Sync pages whose current version is published."
+                  >
+                    Published only
+                  </SelectItem>
+                  <SelectItem
+                    value="draft"
+                    description="Sync pages whose current version is a draft."
+                  >
+                    Draft only
+                  </SelectItem>
+                  <SelectItem
+                    value="both"
+                    description="Sync all accessible pages, regardless of publication status."
+                  >
+                    Both
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+      )}
     </div>
   );
 }

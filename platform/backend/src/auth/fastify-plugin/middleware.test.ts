@@ -1,8 +1,18 @@
+import { RouteId, SupportedProviders } from "@archestra/shared";
 import * as Sentry from "@sentry/node";
-import { SupportedProviders } from "@shared";
+import { eq } from "drizzle-orm";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { vi } from "vitest";
-import { describe, expect, test } from "@/test";
+import config from "@/config";
+import db, { schema } from "@/database";
+import { enterpriseTier } from "@/enterprise-tier";
+import { OrganizationModel } from "@/models";
+import {
+  ARCHESTRA_CLI_DOWNLOAD_PREFIX,
+  OAUTH_CALLBACK_PATH,
+} from "@/routes/route-paths";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import { ApiError } from "@/types";
 import { Authnz } from "./middleware";
 
 // Mock Sentry
@@ -60,26 +70,22 @@ describe("Authnz", () => {
       }
     });
 
-    test("should skip auth for OPTIONS and HEAD requests", async () => {
-      const methods = ["OPTIONS", "HEAD"];
+    test("should skip auth for OPTIONS requests", async () => {
+      const mockRequest = {
+        url: "/some/protected/path",
+        method: "OPTIONS",
+        headers: {},
+      } as FastifyRequest;
 
-      for (const method of methods) {
-        const mockRequest = {
-          url: "/some/protected/path",
-          method,
-          headers: {},
-        } as FastifyRequest;
+      const mockReply = {
+        status: vi.fn().mockReturnThis(),
+        send: vi.fn(),
+      } as unknown as FastifyReply;
 
-        const mockReply = {
-          status: vi.fn().mockReturnThis(),
-          send: vi.fn(),
-        } as unknown as FastifyReply;
+      await authnz.handle(mockRequest, mockReply);
 
-        await authnz.handle(mockRequest, mockReply);
-
-        expect(mockReply.status).not.toHaveBeenCalled();
-        expect(mockReply.send).not.toHaveBeenCalled();
-      }
+      expect(mockReply.status).not.toHaveBeenCalled();
+      expect(mockReply.send).not.toHaveBeenCalled();
     });
 
     test("should skip auth for existing whitelisted paths", async () => {
@@ -95,6 +101,8 @@ describe("Authnz", () => {
         "/health",
         "/ready",
         "/metrics",
+        "/api/archestra-catalog/category",
+        "/api/archestra-catalog/search?q=foo",
       ];
 
       for (const url of whitelistedPaths) {
@@ -114,6 +122,47 @@ describe("Authnz", () => {
         expect(mockReply.status).not.toHaveBeenCalled();
         expect(mockReply.send).not.toHaveBeenCalled();
       }
+    });
+
+    test("skips auth for GET and HEAD of the archestra program download only", async () => {
+      const handle = (method: string) => {
+        const request = {
+          url: `${ARCHESTRA_CLI_DOWNLOAD_PREFIX}/darwin-arm64`,
+          method,
+          headers: {},
+        } as FastifyRequest;
+        const reply = {
+          status: vi.fn().mockReturnThis(),
+          send: vi.fn(),
+        } as unknown as FastifyReply;
+        return { done: authnz.handle(request, reply), reply };
+      };
+
+      for (const method of ["GET", "HEAD"]) {
+        const { done, reply } = handle(method);
+        await done;
+        expect(reply.status).not.toHaveBeenCalled();
+        expect(reply.send).not.toHaveBeenCalled();
+      }
+      await expect(handle("POST").done).rejects.toMatchObject({
+        statusCode: 401,
+      });
+    });
+
+    test("requires authentication for the MCP installation OAuth callback", async () => {
+      const request = {
+        url: OAUTH_CALLBACK_PATH,
+        method: "POST",
+        headers: {},
+      } as FastifyRequest;
+      const reply = {
+        status: vi.fn().mockReturnThis(),
+        send: vi.fn(),
+      } as unknown as FastifyReply;
+
+      await expect(authnz.handle(request, reply)).rejects.toMatchObject({
+        statusCode: 401,
+      });
     });
 
     test("should skip auth for all supported LLM provider routes", async () => {
@@ -146,17 +195,24 @@ describe("Authnz", () => {
       }
     });
 
-    test("should skip auth for model router proxy routes", async () => {
+    test("should skip session auth for both unified model API paths", async () => {
       const modelRouterPaths = [
         "/v1/model-router/models",
         "/v1/model-router/chat/completions",
         "/v1/model-router/responses",
+        "/v1/model-router/embeddings",
         "/v1/model-router/some-agent-id/models",
         "/v1/model-router/some-agent-id/chat/completions",
         "/v1/model-router/some-agent-id/responses",
+        "/v1/model-router/some-agent-id/embeddings",
       ];
 
-      for (const url of modelRouterPaths) {
+      for (const url of [
+        ...modelRouterPaths,
+        ...modelRouterPaths.map((path) =>
+          path.replace("model-router", "unified-model"),
+        ),
+      ]) {
         const mockRequest = {
           url,
           method: "POST",
@@ -472,87 +528,476 @@ describe("Authnz", () => {
     });
   });
 
+  describe("authMethod stamping", () => {
+    /**
+     * These tests verify that populateUserInfo stamps request.authMethod
+     * with "session" or "api_key" after successful authentication.
+     * We spy on betterAuth and UserModel to control the auth flow, and restore
+     * all spies in afterEach so other tests are unaffected.
+     */
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    test("sets authMethod=session when session auth succeeds", async () => {
+      const { auth: betterAuth } = await import("@/auth/better-auth");
+      const { UserModel } = await import("@/models");
+      const { requiredEndpointPermissionsMap } = await import(
+        "@archestra/shared/access-control"
+      );
+
+      const fakeOrgId = "org-session-test";
+      const fakeUserId = "user-session-test";
+
+      vi.spyOn(betterAuth.api, "getSession").mockResolvedValue({
+        response: {
+          user: { id: fakeUserId },
+          session: { id: "session-abc" },
+        },
+        headers: new Headers(),
+      } as unknown as Awaited<ReturnType<typeof betterAuth.api.getSession>>);
+
+      vi.spyOn(UserModel, "getById").mockResolvedValue({
+        id: fakeUserId,
+        organizationId: fakeOrgId,
+        name: "Test User",
+        email: "test@example.com",
+        emailVerified: true,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        image: null,
+        twoFactorEnabled: null,
+      } as Awaited<ReturnType<typeof UserModel.getById>>);
+
+      // Allow any authenticated user by giving the operationId empty permissions.
+      // biome-ignore lint/suspicious/noExplicitAny: test instrumentation
+      const testOpId = "__authMethodSessionTest__" as any;
+      // biome-ignore lint/suspicious/noExplicitAny: test instrumentation
+      (requiredEndpointPermissionsMap as any)[testOpId] = {};
+
+      const request = {
+        url: "/api/some-route",
+        method: "GET",
+        headers: { cookie: "session=abc" },
+        id: "req-session-test",
+        routeOptions: { schema: { operationId: testOpId } },
+      } as unknown as FastifyRequest;
+      const reply = {
+        status: vi.fn().mockReturnThis(),
+        send: vi.fn(),
+      } as unknown as FastifyReply;
+
+      await authnz.handle(request, reply);
+
+      expect((request as unknown as { authMethod: string }).authMethod).toBe(
+        "session",
+      );
+
+      // biome-ignore lint/suspicious/noExplicitAny: cleanup
+      delete (requiredEndpointPermissionsMap as any)[testOpId];
+    });
+
+    test("sets authMethod=api_key when API key auth succeeds", async () => {
+      const { auth: betterAuth } = await import("@/auth/better-auth");
+      const { UserModel } = await import("@/models");
+      const { requiredEndpointPermissionsMap } = await import(
+        "@archestra/shared/access-control"
+      );
+
+      const fakeOrgId = "org-apikey-test";
+      const fakeUserId = "user-apikey-test";
+      const fakeApiKey = "archestra_test_key";
+
+      // Session fails → falls through to API key
+      vi.spyOn(betterAuth.api, "getSession").mockRejectedValue(
+        new Error("No active organization"),
+      );
+      vi.spyOn(betterAuth.api, "verifyApiKey").mockResolvedValue({
+        valid: true,
+        key: { referenceId: fakeUserId },
+      } as Awaited<ReturnType<typeof betterAuth.api.verifyApiKey>>);
+
+      vi.spyOn(UserModel, "getById").mockResolvedValue({
+        id: fakeUserId,
+        organizationId: fakeOrgId,
+        name: "API User",
+        email: "api@example.com",
+        emailVerified: true,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        image: null,
+        twoFactorEnabled: null,
+      } as Awaited<ReturnType<typeof UserModel.getById>>);
+
+      // biome-ignore lint/suspicious/noExplicitAny: test instrumentation
+      const testOpId = "__authMethodApiKeyTest__" as any;
+      // biome-ignore lint/suspicious/noExplicitAny: test instrumentation
+      (requiredEndpointPermissionsMap as any)[testOpId] = {};
+
+      const request = {
+        url: "/api/some-route",
+        method: "GET",
+        headers: { authorization: fakeApiKey },
+        id: "req-apikey-test",
+        routeOptions: { schema: { operationId: testOpId } },
+      } as unknown as FastifyRequest;
+      const reply = {
+        status: vi.fn().mockReturnThis(),
+        send: vi.fn(),
+      } as unknown as FastifyReply;
+
+      await authnz.handle(request, reply);
+
+      expect((request as unknown as { authMethod: string }).authMethod).toBe(
+        "api_key",
+      );
+
+      // biome-ignore lint/suspicious/noExplicitAny: cleanup
+      delete (requiredEndpointPermissionsMap as any)[testOpId];
+    });
+  });
+
   describe("setSentryUserContext", () => {
-    test("should set Sentry user context with all available fields", () => {
-      const mockUser = {
+    test("attributes errors to the user id alone, without email, name or IP", () => {
+      authnz.setSentryUserContext({
         id: "user-123",
         email: "test@example.com",
         name: "Test User",
-      };
+      } as { id: string });
 
-      const mockRequest = {
-        headers: {
-          "x-forwarded-for": "192.168.1.1, 10.0.0.1",
-        },
-        ip: "127.0.0.1",
-        // biome-ignore lint/suspicious/noExplicitAny: test...
-      } as any;
-
-      authnz.setSentryUserContext(mockUser, mockRequest);
-
-      expect(Sentry.setUser).toHaveBeenCalledWith({
-        id: "user-123",
-        email: "test@example.com",
-        username: "Test User",
-        ip_address: "192.168.1.1",
-      });
-    });
-
-    test("should use email as username when name is not available", () => {
-      const mockUser = {
-        id: "user-456",
-        email: "another@example.com",
-      };
-
-      const mockRequest = {
-        headers: {},
-        ip: "127.0.0.1",
-      } as FastifyRequest;
-
-      authnz.setSentryUserContext(mockUser, mockRequest);
-
-      expect(Sentry.setUser).toHaveBeenCalledWith({
-        id: "user-456",
-        email: "another@example.com",
-        username: "another@example.com",
-        ip_address: "127.0.0.1",
-      });
-    });
-
-    test("should extract IP from x-real-ip header", () => {
-      const mockUser = { id: "user-789" };
-
-      const mockRequest = {
-        headers: {
-          "x-real-ip": "203.0.113.0",
-        },
-        ip: "127.0.0.1",
-        // biome-ignore lint/suspicious/noExplicitAny: test...
-      } as any;
-
-      authnz.setSentryUserContext(mockUser, mockRequest);
-
-      expect(Sentry.setUser).toHaveBeenCalledWith({
-        id: "user-789",
-        email: undefined,
-        username: undefined,
-        ip_address: "203.0.113.0",
-      });
+      expect(Sentry.setUser).toHaveBeenCalledWith({ id: "user-123" });
     });
 
     test("should handle errors silently", () => {
-      const mockUser = { id: "user-error" };
-      const mockRequest = {} as FastifyRequest;
-
-      // Mock Sentry.setUser to throw an error
       vi.mocked(Sentry.setUser).mockImplementationOnce(() => {
         throw new Error("Sentry error");
       });
 
-      // Should not throw
       expect(() => {
-        authnz.setSentryUserContext(mockUser, mockRequest);
+        authnz.setSentryUserContext({ id: "user-error" });
       }).not.toThrow();
+    });
+  });
+
+  describe("MCP App connector auth", () => {
+    const CONNECTOR_URL = "/api/mcp/app/11111111-1111-1111-1111-111111111111";
+    const makeReply = () =>
+      ({
+        status: vi.fn().mockReturnThis(),
+        send: vi.fn(),
+        header: vi.fn().mockReturnThis(),
+      }) as unknown as FastifyReply;
+
+    test("stands down for a Bearer connector request (validated in-route)", async () => {
+      const mockRequest = {
+        url: CONNECTOR_URL,
+        method: "POST",
+        headers: { authorization: "Bearer connector-token" },
+      } as FastifyRequest;
+      const mockReply = makeReply();
+
+      await authnz.handle(mockRequest, mockReply);
+
+      // Skipped here so the route validates the token; no auth failure, no challenge.
+      expect(mockReply.status).not.toHaveBeenCalled();
+      expect(mockReply.send).not.toHaveBeenCalled();
+      expect(mockReply.header).not.toHaveBeenCalled();
+    });
+
+    test("challenges a credential-less connector request (RFC 9728)", async () => {
+      const mockRequest = {
+        url: CONNECTOR_URL,
+        method: "POST",
+        headers: { host: "localhost:9000" },
+      } as FastifyRequest;
+      const mockReply = makeReply();
+
+      await expect(authnz.handle(mockRequest, mockReply)).rejects.toThrow(
+        "Unauthenticated",
+      );
+      expect(mockReply.header).toHaveBeenCalledWith(
+        "WWW-Authenticate",
+        expect.stringContaining("resource_metadata"),
+      );
+    });
+  });
+
+  describe("enforceOrganizationAuthPolicies", () => {
+    beforeEach(() => {
+      enterpriseTier.setUserCountForTesting(0); // licensed (small-team tier)
+    });
+
+    const enforce = (request: unknown) =>
+      // biome-ignore lint/complexity/useLiteralKeys: reaching a private method under test
+      authnz["enforceOrganizationAuthPolicies"](request as FastifyRequest);
+
+    const makeRequest = ({
+      organizationId,
+      user,
+      session,
+      routeId,
+      authMethod = "session",
+    }: {
+      organizationId: string;
+      user: { id: string; twoFactorEnabled: boolean | null };
+      session?: { id: string; createdAt: Date };
+      routeId?: RouteId;
+      authMethod?: string;
+    }) =>
+      ({
+        authMethod,
+        organizationId,
+        user,
+        sessionInfo: session,
+        routeOptions: { schema: routeId ? { operationId: routeId } : {} },
+      }) as unknown as FastifyRequest;
+
+    async function makePolicyFixtures(
+      {
+        makeOrganization,
+        makeUser,
+        makeMember,
+        makeSession,
+      }: {
+        makeOrganization: (o?: object) => Promise<{ id: string }>;
+        makeUser: (o?: object) => Promise<{
+          id: string;
+          twoFactorEnabled: boolean | null;
+        }>;
+        makeMember: (u: string, o: string, e?: object) => Promise<unknown>;
+        makeSession: (
+          u: string,
+          o?: object,
+        ) => Promise<{ id: string; createdAt: Date }>;
+      },
+      {
+        requireTwoFactor = false,
+        sessionMaxAgeSeconds = null as number | null,
+        twoFactorEnabled = false,
+        sessionCreatedAt = new Date(),
+      } = {},
+    ) {
+      const organization = await makeOrganization();
+      await OrganizationModel.patch(organization.id, {
+        requireTwoFactor,
+        sessionMaxAgeSeconds,
+      });
+      const user = await makeUser({ twoFactorEnabled });
+      await makeMember(user.id, organization.id, { role: "member" });
+      const session = await makeSession(user.id, {
+        createdAt: sessionCreatedAt,
+      });
+      return { organization, user, session };
+    }
+
+    test("revokes a session older than the organization's cap", async ({
+      makeOrganization,
+      makeUser,
+      makeMember,
+      makeSession,
+    }) => {
+      const { organization, user, session } = await makePolicyFixtures(
+        { makeOrganization, makeUser, makeMember, makeSession },
+        {
+          sessionMaxAgeSeconds: 3600,
+          sessionCreatedAt: new Date(Date.now() - 7200 * 1000),
+        },
+      );
+
+      const error = await enforce(
+        makeRequest({ organizationId: organization.id, user, session }),
+      ).then(
+        () => null,
+        (err: unknown) => err,
+      );
+      expect(error).toBeInstanceOf(ApiError);
+      expect((error as ApiError).statusCode).toBe(401);
+
+      const [row] = await db
+        .select()
+        .from(schema.sessionsTable)
+        .where(eq(schema.sessionsTable.id, session.id));
+      expect(row).toBeUndefined();
+    });
+
+    test("leaves a session younger than the cap alone", async ({
+      makeOrganization,
+      makeUser,
+      makeMember,
+      makeSession,
+    }) => {
+      const { organization, user, session } = await makePolicyFixtures(
+        { makeOrganization, makeUser, makeMember, makeSession },
+        {
+          sessionMaxAgeSeconds: 7200,
+          sessionCreatedAt: new Date(Date.now() - 60 * 1000),
+        },
+      );
+
+      await enforce(
+        makeRequest({ organizationId: organization.id, user, session }),
+      );
+
+      const [row] = await db
+        .select()
+        .from(schema.sessionsTable)
+        .where(eq(schema.sessionsTable.id, session.id));
+      expect(row).toBeDefined();
+    });
+
+    test("refuses non-enrolled members when the organization requires 2FA", async ({
+      makeOrganization,
+      makeUser,
+      makeMember,
+      makeSession,
+    }) => {
+      const { organization, user, session } = await makePolicyFixtures(
+        { makeOrganization, makeUser, makeMember, makeSession },
+        { requireTwoFactor: true, twoFactorEnabled: false },
+      );
+
+      const error = await enforce(
+        makeRequest({
+          organizationId: organization.id,
+          user,
+          session,
+          routeId: RouteId.GetAgents,
+        }),
+      ).then(
+        () => null,
+        (err: unknown) => err,
+      );
+      expect(error).toBeInstanceOf(ApiError);
+      expect((error as ApiError).statusCode).toBe(403);
+      expect((error as ApiError).internalCode).toBe(
+        "two_factor_setup_required",
+      );
+    });
+
+    test("lets non-enrolled members reach the enrollment-surface routes", async ({
+      makeOrganization,
+      makeUser,
+      makeMember,
+      makeSession,
+    }) => {
+      const { organization, user, session } = await makePolicyFixtures(
+        { makeOrganization, makeUser, makeMember, makeSession },
+        { requireTwoFactor: true, twoFactorEnabled: false },
+      );
+
+      for (const routeId of [
+        RouteId.GetConfig,
+        RouteId.GetUserPermissions,
+        RouteId.GetOrganization,
+        RouteId.GetAppearanceSettings,
+      ]) {
+        await enforce(
+          makeRequest({
+            organizationId: organization.id,
+            user,
+            session,
+            routeId,
+          }),
+        );
+      }
+    });
+
+    test("lets enrolled members through untouched", async ({
+      makeOrganization,
+      makeUser,
+      makeMember,
+      makeSession,
+    }) => {
+      const { organization, user, session } = await makePolicyFixtures(
+        { makeOrganization, makeUser, makeMember, makeSession },
+        { requireTwoFactor: true, twoFactorEnabled: true },
+      );
+
+      await enforce(
+        makeRequest({
+          organizationId: organization.id,
+          user,
+          session,
+          routeId: RouteId.GetAgents,
+        }),
+      );
+    });
+
+    test("stops enforcing entirely when the enterprise license lapses", async ({
+      makeOrganization,
+      makeUser,
+      makeMember,
+      makeSession,
+    }) => {
+      const { organization, user, session } = await makePolicyFixtures(
+        { makeOrganization, makeUser, makeMember, makeSession },
+        {
+          requireTwoFactor: true,
+          twoFactorEnabled: false,
+          sessionMaxAgeSeconds: 3600,
+          sessionCreatedAt: new Date(Date.now() - 7200 * 1000),
+        },
+      );
+
+      const originalEnvFlag = config.enterpriseFeatures.core;
+      Object.defineProperty(config.enterpriseFeatures, "core", {
+        value: false,
+        writable: true,
+        configurable: true,
+      });
+      enterpriseTier.setUserCountForTesting(9999); // over the free threshold
+      try {
+        // Enrollment is refused without a license, so enforcing would
+        // strand every non-enrolled member.
+        await enforce(
+          makeRequest({
+            organizationId: organization.id,
+            user,
+            session,
+            routeId: RouteId.GetAgents,
+          }),
+        );
+      } finally {
+        enterpriseTier.setUserCountForTesting(0);
+        Object.defineProperty(config.enterpriseFeatures, "core", {
+          value: originalEnvFlag,
+          writable: true,
+          configurable: true,
+        });
+      }
+    });
+
+    test("skips non-session auth methods entirely", async ({
+      makeOrganization,
+      makeUser,
+      makeMember,
+      makeSession,
+    }) => {
+      const { organization, user, session } = await makePolicyFixtures(
+        { makeOrganization, makeUser, makeMember, makeSession },
+        {
+          requireTwoFactor: true,
+          twoFactorEnabled: false,
+          sessionMaxAgeSeconds: 3600,
+          sessionCreatedAt: new Date(Date.now() - 7200 * 1000),
+        },
+      );
+
+      await enforce(
+        makeRequest({
+          organizationId: organization.id,
+          user,
+          session,
+          routeId: RouteId.GetAgents,
+          authMethod: "apiKey",
+        }),
+      );
+
+      const [row] = await db
+        .select()
+        .from(schema.sessionsTable)
+        .where(eq(schema.sessionsTable.id, session.id));
+      expect(row).toBeDefined();
     });
   });
 });

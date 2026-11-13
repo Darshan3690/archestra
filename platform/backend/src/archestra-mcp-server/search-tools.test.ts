@@ -1,21 +1,203 @@
 // biome-ignore-all lint/suspicious/noExplicitAny: test assertions inspect tool payloads dynamically
-import { TOOL_RUN_TOOL_FULL_NAME, TOOL_SEARCH_TOOLS_FULL_NAME } from "@shared";
+import {
+  AGENT_TOOL_PREFIX,
+  ARCHESTRA_MCP_CATALOG_ID,
+  slugify,
+  TOOL_CREATE_SKILL_FULL_NAME,
+  TOOL_DOWNLOAD_FILE_FULL_NAME,
+  TOOL_LIST_SKILLS_FULL_NAME,
+  TOOL_LOAD_SKILL_FULL_NAME,
+  TOOL_READ_FILE_FULL_NAME,
+  TOOL_RUN_COMMAND_FULL_NAME,
+  TOOL_RUN_TOOL_FULL_NAME,
+  TOOL_SEARCH_TOOLS_FULL_NAME,
+  TOOL_UPDATE_SKILL_FULL_NAME,
+  TOOL_UPLOAD_FILE_FULL_NAME,
+} from "@archestra/shared";
+import { beforeEach, vi } from "vitest";
+import config from "@/config";
+import {
+  ConversationEnabledToolModel,
+  ToolModel,
+  ToolSearchTextModel,
+} from "@/models";
+import GuardrailsDeploymentModel from "@/models/guardrails-deployment";
 import { describe, expect, test } from "@/test";
 import type { ArchestraContext } from ".";
 import { executeArchestraTool } from ".";
+import { hashToolDefinition } from "./search-text";
+import { __test } from "./search-tools";
+
+const {
+  makeRankingCandidate,
+  prepareSearchQuery,
+  rankCandidatesByKeyword,
+  findUnmatchedQueryTerms,
+} = __test;
+
+function rank(
+  candidates: Parameters<typeof makeRankingCandidate>[0][],
+  query: string,
+): string[] {
+  return rankCandidatesByKeyword(
+    candidates.map(makeRankingCandidate),
+    prepareSearchQuery(query),
+  ).map((candidate) => candidate.toolName);
+}
+
+function unmatched(
+  candidates: Parameters<typeof makeRankingCandidate>[0][],
+  query: string,
+): string[] {
+  return findUnmatchedQueryTerms(
+    candidates.map(makeRankingCandidate),
+    prepareSearchQuery(query),
+  );
+}
 
 type SearchToolsStructuredContent = {
   total: number;
+  matchCount: number;
+  truncated: boolean;
+  nextOffset: number | null;
+  hint: string | null;
   tools: Array<{
     toolName: string;
-    catalogName: string | null;
+    description: string | null;
+    source: "archestra" | "mcp" | "agent_delegation";
+    server: string | null;
+    available: boolean;
+    unavailableReason: string | null;
+    params: string;
   }>;
 };
 
 describe("search_tools", () => {
+  beforeEach(() => {
+    // Search ranking tests control their candidate set; OpenAPPA tests opt in.
+    config.openappa.enabled = false;
+  });
+
+  describe("generated search text", () => {
+    test("finds a tool through a term only its generated text contains", () => {
+      expect(
+        rank(
+          [
+            {
+              toolName: "calendar__check_slots",
+              description: "List open slots.",
+              generatedText: "Booking reservation",
+            },
+            { toolName: "calendar__delete", description: "Remove a slot." },
+          ],
+          "booking",
+        ),
+      ).toEqual(["calendar__check_slots"]);
+    });
+
+    test("adds no weight for terms the tool's own fields already contain", () => {
+      const plain = { toolName: "a__tool", description: "Send invoice." };
+      const padded = {
+        toolName: "b__tool",
+        description: "Send invoice.",
+        generatedText: "INVOICE invoice",
+      };
+
+      // Ties break by name, so an inflated b__tool would come first if reversed.
+      expect(rank([padded, plain], "invoice")).toEqual(["a__tool", "b__tool"]);
+    });
+
+    test("does not report a generated-only term as unmatched", () => {
+      expect(
+        findUnmatchedQueryTerms(
+          [
+            makeRankingCandidate({
+              toolName: "calendar__check_slots",
+              generatedText: "booking",
+            }),
+          ],
+          prepareSearchQuery("booking zebra"),
+        ),
+      ).toEqual(["zebra"]);
+    });
+
+    test("ranks stored text for a catalog tool and leaves others on source fields", async ({
+      makeAgent,
+      makeAgentTool,
+      makeInternalMcpCatalog,
+      makeMcpServer,
+      makeMember,
+      makeOrganization,
+      makeTool,
+      makeUser,
+      seedAndAssignArchestraTools,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({ organizationId: org.id });
+      await seedAndAssignArchestraTools(agent.id);
+      const catalog = await makeInternalMcpCatalog({ organizationId: org.id });
+      await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+      const parameters = { type: "object", properties: {} };
+      const enriched = await makeTool({
+        name: "calendar__check_slots",
+        description: "List open slots.",
+        catalogId: catalog.id,
+        parameters,
+      });
+      const stale = await makeTool({
+        name: "calendar__stale",
+        description: "Current description.",
+        catalogId: catalog.id,
+        parameters,
+      });
+      await makeAgentTool(agent.id, enriched.id);
+      await makeAgentTool(agent.id, stale.id);
+      await ToolSearchTextModel.recordAttempt({
+        definitionHash: hashToolDefinition({
+          name: "calendar__check_slots",
+          description: "List open slots.",
+          parameters,
+        }),
+        promptVersion: 1,
+        generator: "openai/test",
+        result: { status: "ready", searchText: "booking zebrafish" },
+      });
+      await ToolSearchTextModel.recordAttempt({
+        definitionHash: hashToolDefinition({
+          name: "calendar__stale",
+          description: "Previous description.",
+          parameters,
+        }),
+        promptVersion: 1,
+        generator: "openai/test",
+        result: { status: "ready", searchText: "zebrafish" },
+      });
+
+      const result = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "zebrafish" },
+        {
+          agent: { id: agent.id, name: agent.name },
+          agentId: agent.id,
+          organizationId: org.id,
+          userId: user.id,
+        },
+      );
+
+      expect(
+        (result.structuredContent as SearchToolsStructuredContent).tools.map(
+          ({ toolName }) => toolName,
+        ),
+      ).toEqual(["calendar__check_slots"]);
+    });
+  });
+
   test("returns ranked matching tools with compact parameter summaries", async ({
     makeAgent,
     makeInternalMcpCatalog,
+    makeMcpServer,
     makeMember,
     makeOrganization,
     makeTool,
@@ -56,6 +238,7 @@ describe("search_tools", () => {
       },
     });
     await makeAgentTool(agent.id, githubTool.id);
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
 
     const context: ArchestraContext = {
       agent: { id: agent.id, name: agent.name },
@@ -77,23 +260,13 @@ describe("search_tools", () => {
     expect(structuredContent.total).toBeGreaterThan(0);
     expect(firstResult).toEqual({
       toolName: "github__search_repositories",
-      title: null,
       description: "Search repositories by topic, language, or owner.",
       source: "mcp",
       server: "github",
-      catalogName: "GitHub MCP",
-      inputParameters: [
-        {
-          name: "query",
-          required: true,
-          description: "Repository search query string.",
-        },
-        {
-          name: "language",
-          required: false,
-          description: "Optional language filter.",
-        },
-      ],
+      available: true,
+      unavailableReason: null,
+      params:
+        "query!:string — Repository search query string.; language?:string — Optional language filter.",
     });
 
     const genericQueryResult = await executeArchestraTool(
@@ -110,6 +283,559 @@ describe("search_tools", () => {
     );
     expect(returnedToolNames).not.toContain(TOOL_SEARCH_TOOLS_FULL_NAME);
     expect(returnedToolNames).not.toContain(TOOL_RUN_TOOL_FULL_NAME);
+  });
+
+  test("finds OpenAPPA tools on an agent that was never assigned them", async ({
+    makeAgent,
+    makeMember,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const previous = config.openappa.enabled;
+    config.openappa.enabled = true;
+    await GuardrailsDeploymentModel.setEnabled(true);
+    try {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({
+        name: "Unassigned OpenAPPA Agent",
+        organizationId: org.id,
+      });
+      const context: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      };
+      const result = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "get_remedy_plans blocked call ruling", limit: 10 },
+        context,
+      );
+      expect(result.isError).toBe(false);
+      const names = (
+        result.structuredContent as SearchToolsStructuredContent
+      ).tools.map((tool) => tool.toolName);
+      expect(names.some((name) => name.endsWith("get_remedy_plans"))).toBe(
+        true,
+      );
+      expect(names.some((name) => name.endsWith("execute_remedy_plan"))).toBe(
+        true,
+      );
+      // The rendered signatures show only what the model writes, never the
+      // members the proxy stamps or their JWS prose.
+      const remedyTools = (
+        result.structuredContent as SearchToolsStructuredContent
+      ).tools.filter((tool) => /remedy_plan/.test(tool.toolName));
+      const execute = remedyTools.find((tool) =>
+        tool.toolName.endsWith("execute_remedy_plan"),
+      );
+      // Optional: a call without it declares a subagent's return.
+      expect(execute?.params).toContain("offer_id?:string");
+      for (const tool of remedyTools) {
+        expect(tool.params).not.toMatch(
+          /execution|protected|payload|signature|offers|JWS|RFC 7515/,
+        );
+      }
+    } finally {
+      config.openappa.enabled = previous;
+    }
+  });
+
+  test("search hides remedy tools while the deployment switch is off and still finds policy tools", async ({
+    makeAgent,
+    makeMember,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const previous = config.openappa.enabled;
+    config.openappa.enabled = true;
+    await GuardrailsDeploymentModel.setEnabled(false);
+    try {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({ organizationId: org.id });
+      const context: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      };
+      const remedies = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "get_remedy_plans execute_remedy_plan", limit: 10 },
+        context,
+      );
+      const remedyNames = (
+        remedies.structuredContent as SearchToolsStructuredContent
+      ).tools.map((tool) => tool.toolName);
+      expect(
+        remedyNames.some((name) => name.endsWith("get_remedy_plans")),
+      ).toBe(false);
+      expect(
+        remedyNames.some((name) => name.endsWith("execute_remedy_plan")),
+      ).toBe(false);
+      const policy = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "get_guardrails_policy", limit: 10 },
+        context,
+      );
+      const policyNames = (
+        policy.structuredContent as SearchToolsStructuredContent
+      ).tools.map((tool) => tool.toolName);
+      expect(
+        policyNames.some((name) => name.endsWith("get_guardrails_policy")),
+      ).toBe(true);
+    } finally {
+      config.openappa.enabled = previous;
+    }
+  });
+
+  test("a thrown switch read fails search instead of hiding remedy tools", async ({
+    makeAgent,
+    makeOrganization,
+  }) => {
+    const previous = config.openappa.enabled;
+    config.openappa.enabled = true;
+    const read = vi
+      .spyOn(GuardrailsDeploymentModel, "get")
+      .mockRejectedValue(new Error("deployment row unavailable"));
+    try {
+      const org = await makeOrganization();
+      const agent = await makeAgent({ organizationId: org.id });
+      await expect(
+        executeArchestraTool(
+          TOOL_SEARCH_TOOLS_FULL_NAME,
+          { query: "get_guardrails_policy", limit: 5 },
+          {
+            agent: { id: agent.id, name: agent.name },
+            agentId: agent.id,
+            organizationId: org.id,
+          },
+        ),
+      ).rejects.toThrow("deployment row unavailable");
+    } finally {
+      read.mockRestore();
+      config.openappa.enabled = previous;
+    }
+  });
+
+  test("derives an app launch tool's description from the catalog name, not the raw stored value", async ({
+    makeAgent,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeMember,
+    makeOrganization,
+    makeTool,
+    makeAgentTool,
+    makeUser,
+    seedAndAssignArchestraTools,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({ organizationId: org.id });
+    await seedAndAssignArchestraTools(agent.id);
+
+    const appCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "PizzaTracker",
+      serverType: "app",
+    });
+    // A pre-sanitization stored description: raw, injection-shaped. The handler
+    // must not surface it — it derives from the catalog name instead.
+    const launchTool = await makeTool({
+      name: "pizzatracker__open",
+      description: "INJECTED_SENTINEL ![x](http://evil/a.png)",
+      catalogId: appCatalog.id,
+      parameters: { type: "object", properties: {} },
+    });
+    await makeAgentTool(agent.id, launchTool.id);
+    await makeMcpServer({ catalogId: appCatalog.id, scope: "org" });
+
+    const context: ArchestraContext = {
+      agent: { id: agent.id, name: agent.name },
+      agentId: agent.id,
+      organizationId: org.id,
+      userId: user.id,
+    };
+    const result = await executeArchestraTool(
+      TOOL_SEARCH_TOOLS_FULL_NAME,
+      { query: "PizzaTracker open", limit: 5 },
+      context,
+    );
+
+    expect(result.isError).toBe(false);
+    const structuredContent =
+      result.structuredContent as SearchToolsStructuredContent;
+    const launch = structuredContent.tools.find(
+      (tool) => tool.toolName === "pizzatracker__open",
+    );
+    expect(launch).toBeDefined();
+    expect(launch?.description).toBe(
+      'Open the "PizzaTracker" app and render its UI.',
+    );
+    expect(launch?.description).not.toContain("INJECTED_SENTINEL");
+  });
+
+  test("neutralizes control/format characters in catalog names in the zero-match hint", async ({
+    makeAgent,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeMember,
+    makeOrganization,
+    makeTool,
+    makeAgentTool,
+    makeUser,
+    seedAndAssignArchestraTools,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({ organizationId: org.id });
+    await seedAndAssignArchestraTools(agent.id);
+
+    const bidi = String.fromCodePoint(0x202e);
+    const bel = String.fromCodePoint(0x07);
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: `Ev${bidi}il\n${bel}Corp`,
+    });
+    const tool = await makeTool({
+      name: "evilcorp__do_thing",
+      description: "Does a thing.",
+      catalogId: catalog.id,
+      parameters: { type: "object", properties: {} },
+    });
+    await makeAgentTool(agent.id, tool.id);
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+
+    const context: ArchestraContext = {
+      agent: { id: agent.id, name: agent.name },
+      agentId: agent.id,
+      organizationId: org.id,
+      userId: user.id,
+    };
+    const result = await executeArchestraTool(
+      TOOL_SEARCH_TOOLS_FULL_NAME,
+      { query: "zzzznomatchqqq", limit: 5 },
+      context,
+    );
+
+    const structuredContent =
+      result.structuredContent as SearchToolsStructuredContent;
+    expect(structuredContent.matchCount).toBe(0);
+    const hint = structuredContent.hint ?? "";
+    expect(hint).toContain("Available servers:");
+    // The collapsed, single-line name is present; the raw control/format
+    // characters that could reshape the model-facing hint are gone.
+    expect(hint).toContain("Ev il Corp");
+    expect(hint).not.toContain(bidi);
+    expect(hint).not.toContain(bel);
+    expect(hint).not.toContain("\n");
+  });
+
+  test("marks tools without an installed connection as unavailable and ranks them last", async ({
+    makeAgent,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeMember,
+    makeOrganization,
+    makeTool,
+    makeAgentTool,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      name: "Availability Agent",
+      organizationId: org.id,
+    });
+
+    const installedCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "Installed MCP",
+    });
+    const installedTool = await makeTool({
+      name: "installed__do_thing",
+      description: "widget action available now",
+      catalogId: installedCatalog.id,
+    });
+    await makeAgentTool(agent.id, installedTool.id);
+    await makeMcpServer({ catalogId: installedCatalog.id, scope: "org" });
+
+    // Same catalog shape but no installed connection -> retained, unavailable.
+    const removedCatalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "Removed MCP",
+    });
+    const removedTool = await makeTool({
+      name: "removed__do_thing",
+      description: "widget action pending reconnect",
+      catalogId: removedCatalog.id,
+    });
+    await makeAgentTool(agent.id, removedTool.id);
+
+    const context: ArchestraContext = {
+      agent: { id: agent.id, name: agent.name },
+      agentId: agent.id,
+      organizationId: org.id,
+      userId: user.id,
+    };
+
+    const result = await executeArchestraTool(
+      TOOL_SEARCH_TOOLS_FULL_NAME,
+      { query: "widget action", limit: 5 },
+      context,
+    );
+    expect(result.isError).toBe(false);
+    const content = result.structuredContent as SearchToolsStructuredContent;
+    const byName = new Map(content.tools.map((tool) => [tool.toolName, tool]));
+
+    expect(byName.get("installed__do_thing")).toMatchObject({
+      available: true,
+      unavailableReason: null,
+    });
+    expect(byName.get("removed__do_thing")?.available).toBe(false);
+    expect(byName.get("removed__do_thing")?.unavailableReason).toBeTruthy();
+
+    // Available ranks ahead of unavailable.
+    const names = content.tools.map((tool) => tool.toolName);
+    expect(names.indexOf("installed__do_thing")).toBeLessThan(
+      names.indexOf("removed__do_thing"),
+    );
+
+    // On truncation, the unavailable tool is dropped first.
+    const truncated = await executeArchestraTool(
+      TOOL_SEARCH_TOOLS_FULL_NAME,
+      { query: "widget action", limit: 1 },
+      context,
+    );
+    const truncatedContent =
+      truncated.structuredContent as SearchToolsStructuredContent;
+    expect(truncatedContent.tools).toHaveLength(1);
+    expect(truncatedContent.tools[0].toolName).toBe("installed__do_thing");
+  });
+
+  test("a desktop MCP tool is available only to a user who added the server to their own computer", async ({
+    makeAgent,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeMember,
+    makeOrganization,
+    makeTool,
+    makeAgentTool,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const anna = await makeUser();
+    const ben = await makeUser();
+    await makeMember(anna.id, org.id, { role: "admin" });
+    await makeMember(ben.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      name: "Desktop Agent",
+      organizationId: org.id,
+    });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "Desk",
+      serverType: "desktop_mcp",
+      desktopConfig: { command: "/opt/desk/mcp" },
+    });
+    const tool = await makeTool({
+      name: "desk__open_drawing",
+      description: "open a drawing on the desk",
+      catalogId: catalog.id,
+    });
+    await makeAgentTool(agent.id, tool.id);
+    // Only Anna added it: her installation runs on her computer, not on Ben's.
+    await makeMcpServer({
+      catalogId: catalog.id,
+      serverType: "desktop_mcp",
+      scope: "personal",
+      ownerId: anna.id,
+    });
+
+    const search = async (userId: string) => {
+      const result = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "open drawing", limit: 5 },
+        {
+          agent: { id: agent.id, name: agent.name },
+          agentId: agent.id,
+          organizationId: org.id,
+          userId,
+        },
+      );
+      const content = result.structuredContent as SearchToolsStructuredContent;
+      return content.tools.find(
+        (found) => found.toolName === "desk__open_drawing",
+      );
+    };
+
+    expect(await search(anna.id)).toMatchObject({
+      available: true,
+      unavailableReason: null,
+    });
+    const forBen = await search(ben.id);
+    expect(forBen?.available).toBe(false);
+    expect(forBen?.unavailableReason).toContain(
+      "has not added it to their computer",
+    );
+  });
+
+  test("includes unassigned tools from catalogs the user can access when the agent allows dynamic access", async ({
+    makeAgent,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeMember,
+    makeOrganization,
+    makeTool,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    const agent = await makeAgent({
+      name: "Search Agent",
+      organizationId: org.id,
+      accessAllTools: true,
+    });
+
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "GitHub MCP",
+    });
+    // intentionally not assigned to the agent
+    await makeTool({
+      name: "github__search_repositories",
+      description: "Search repositories by topic, language, or owner.",
+      catalogId: catalog.id,
+    });
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+
+    const context: ArchestraContext = {
+      agent: { id: agent.id, name: agent.name },
+      agentId: agent.id,
+      organizationId: org.id,
+      userId: user.id,
+    };
+
+    const result = await executeArchestraTool(
+      TOOL_SEARCH_TOOLS_FULL_NAME,
+      { query: "repository search" },
+      context,
+    );
+
+    expect(result.isError).toBe(false);
+    const structuredContent =
+      result.structuredContent as SearchToolsStructuredContent;
+    expect(structuredContent.tools.map((tool) => tool.toolName)).toContain(
+      "github__search_repositories",
+    );
+  });
+
+  test("hides unassigned tools when the agent's access-all-tools setting is off", async ({
+    makeAgent,
+    makeInternalMcpCatalog,
+    makeMember,
+    makeOrganization,
+    makeTool,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "admin" });
+    // default accessAllTools=false — discovery stays assigned-tools-only
+    const agent = await makeAgent({
+      name: "Search Agent",
+      organizationId: org.id,
+    });
+
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "GitHub MCP",
+    });
+    await makeTool({
+      name: "github__search_repositories",
+      description: "Search repositories by topic, language, or owner.",
+      catalogId: catalog.id,
+    });
+
+    const context: ArchestraContext = {
+      agent: { id: agent.id, name: agent.name },
+      agentId: agent.id,
+      organizationId: org.id,
+      userId: user.id,
+    };
+
+    const result = await executeArchestraTool(
+      TOOL_SEARCH_TOOLS_FULL_NAME,
+      { query: "repository search" },
+      context,
+    );
+
+    expect(result.isError).toBe(false);
+    const structuredContent =
+      result.structuredContent as SearchToolsStructuredContent;
+    expect(structuredContent.tools.map((tool) => tool.toolName)).not.toContain(
+      "github__search_repositories",
+    );
+  });
+
+  test("hides unassigned tools whose catalog the user cannot access", async ({
+    makeAgent,
+    makeInternalMcpCatalog,
+    makeMember,
+    makeOrganization,
+    makeTeam,
+    makeTool,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    await makeMember(user.id, org.id, { role: "member" });
+    const agent = await makeAgent({
+      name: "Search Agent",
+      organizationId: org.id,
+      accessAllTools: true,
+    });
+
+    // user creates the team but is not a member of it
+    const team = await makeTeam(org.id, user.id);
+    const catalog = await makeInternalMcpCatalog({
+      organizationId: org.id,
+      name: "GitHub MCP",
+      access: { teams: [team.id] },
+    });
+    await makeTool({
+      name: "github__search_repositories",
+      description: "Search repositories by topic, language, or owner.",
+      catalogId: catalog.id,
+    });
+
+    const context: ArchestraContext = {
+      agent: { id: agent.id, name: agent.name },
+      agentId: agent.id,
+      organizationId: org.id,
+      userId: user.id,
+    };
+
+    const result = await executeArchestraTool(
+      TOOL_SEARCH_TOOLS_FULL_NAME,
+      { query: "repository search" },
+      context,
+    );
+
+    expect(result.isError).toBe(false);
+    const structuredContent =
+      result.structuredContent as SearchToolsStructuredContent;
+    expect(structuredContent.tools.map((tool) => tool.toolName)).not.toContain(
+      "github__search_repositories",
+    );
   });
 
   test("filters Archestra tools by RBAC before ranking", async ({
@@ -140,16 +866,1053 @@ describe("search_tools", () => {
       userId: user.id,
     };
 
+    // "guardrails" matches only the guardrails tools, all of
+    // which require permissions this agent:read role lacks, so RBAC filters
+    // them all out before ranking.
     const result = await executeArchestraTool(
       TOOL_SEARCH_TOOLS_FULL_NAME,
-      { query: "trusted data policy", limit: 10 },
+      { query: "guardrails", limit: 10 },
       context,
     );
 
     expect(result.isError).toBe(false);
     expect(result.structuredContent).toEqual({
       total: 0,
+      matchCount: 0,
+      truncated: false,
+      nextOffset: null,
+      hint: "No tools matched. Try broader or different keywords, or switch mode. No tool text matches these query terms: guardrails.",
       tools: [],
+    });
+  });
+
+  test("on zero matches, hints the sandbox fallback when the sandbox is usable", async ({
+    makeAgent,
+    makeMember,
+    makeOrganization,
+    makeUser,
+    seedAndAssignArchestraTools,
+  }) => {
+    const config = (await import("@/config")).default;
+    const originalSandboxEnabled = config.skillsSandbox.enabled;
+    (config.skillsSandbox as { enabled: boolean }).enabled = true;
+
+    try {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({
+        name: "Sandbox Search Agent",
+        organizationId: org.id,
+      });
+      await seedAndAssignArchestraTools(agent.id);
+
+      const context: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      };
+
+      const result = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "zzqqxyzznomatch", limit: 10 },
+        context,
+      );
+
+      const structuredContent =
+        result.structuredContent as SearchToolsStructuredContent;
+      expect(structuredContent.matchCount).toBe(0);
+      expect(structuredContent.hint).toContain(TOOL_RUN_COMMAND_FULL_NAME);
+      expect(structuredContent.hint).toContain("fall back");
+    } finally {
+      (config.skillsSandbox as { enabled: boolean }).enabled =
+        originalSandboxEnabled;
+    }
+  });
+
+  test.for([
+    "agent",
+    "mcp_gateway",
+  ] as const)("%s can discover its deferred skill and runtime tools", async (agentType, {
+    makeAgent,
+    makeMember,
+    makeOrganization,
+    makeUser,
+    seedAndAssignArchestraTools,
+  }) => {
+    const config = (await import("@/config")).default;
+    const originalSandboxEnabled = config.skillsSandbox.enabled;
+    (config.skillsSandbox as { enabled: boolean }).enabled = true;
+
+    try {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({
+        name: "Skill Search Agent",
+        agentType,
+        organizationId: org.id,
+      });
+      await seedAndAssignArchestraTools(agent.id);
+
+      const context: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      };
+
+      const result = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "skill", limit: 20 },
+        context,
+      );
+
+      expect(result.isError).toBe(false);
+      const structuredContent =
+        result.structuredContent as SearchToolsStructuredContent;
+      const returnedToolNames = structuredContent.tools.map(
+        (tool) => tool.toolName,
+      );
+
+      // Only internal chat keeps these assigned tools top-level.
+      expect(returnedToolNames.includes(TOOL_LIST_SKILLS_FULL_NAME)).toBe(
+        agentType !== "agent",
+      );
+      expect(returnedToolNames.includes(TOOL_LOAD_SKILL_FULL_NAME)).toBe(
+        agentType !== "agent",
+      );
+      expect(returnedToolNames).not.toContain(TOOL_RUN_COMMAND_FULL_NAME);
+      expect(returnedToolNames).not.toContain(TOOL_DOWNLOAD_FILE_FULL_NAME);
+      expect(returnedToolNames).not.toContain(TOOL_UPLOAD_FILE_FULL_NAME);
+      // authoring tools stay search-gated, so they remain discoverable
+      expect(returnedToolNames).toContain(TOOL_CREATE_SKILL_FULL_NAME);
+      expect(returnedToolNames).toContain(TOOL_UPDATE_SKILL_FULL_NAME);
+
+      if (agentType === "mcp_gateway") {
+        const chatOnly = await executeArchestraTool(
+          TOOL_SEARCH_TOOLS_FULL_NAME,
+          { query: "^archestra__(copy_file|render_app)$", mode: "regex" },
+          context,
+        );
+        expect(chatOnly.isError).not.toBe(true);
+        expect(
+          (chatOnly.structuredContent as SearchToolsStructuredContent).tools,
+        ).toEqual([]);
+      }
+
+      const runtimeResult = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "download upload command sandbox file", limit: 20 },
+        context,
+      );
+
+      expect(runtimeResult.isError).toBe(false);
+      const runtimeStructuredContent =
+        runtimeResult.structuredContent as SearchToolsStructuredContent;
+      const runtimeReturnedToolNames = runtimeStructuredContent.tools.map(
+        (tool) => tool.toolName,
+      );
+      expect(
+        runtimeReturnedToolNames.includes(TOOL_RUN_COMMAND_FULL_NAME),
+      ).toBe(agentType !== "agent");
+      expect(
+        runtimeReturnedToolNames.includes(TOOL_DOWNLOAD_FILE_FULL_NAME),
+      ).toBe(agentType !== "agent");
+      expect(
+        runtimeReturnedToolNames.includes(TOOL_UPLOAD_FILE_FULL_NAME),
+      ).toBe(agentType !== "agent");
+    } finally {
+      (config.skillsSandbox as { enabled: boolean }).enabled =
+        originalSandboxEnabled;
+    }
+  });
+
+  // Unassigned Archestra built-ins surface in search for All-mode agents (so
+  // the model can discover and run them dynamically). Internal chat omits
+  // assigned runtime tools that it already lists top-level. Sandbox built-ins additionally
+  // require their feature flag, and every result is RBAC-filtered — so they
+  // only surface for callers who can actually run them (agent:read).
+  // Seeded but not assigned here to exercise that path.
+  describe("sandbox built-in discovery", () => {
+    async function searchSandboxTools(
+      context: ArchestraContext,
+    ): Promise<string[]> {
+      const result = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "run command upload download file shell execute", limit: 20 },
+        context,
+      );
+      expect(result.isError).toBe(false);
+      return (
+        result.structuredContent as SearchToolsStructuredContent
+      ).tools.map((tool) => tool.toolName);
+    }
+
+    test("surfaces an unassigned sandbox tool to a user with agent:read", async ({
+      makeAgent,
+      makeMember,
+      makeOrganization,
+      makeUser,
+    }) => {
+      const config = (await import("@/config")).default;
+      const originalSandboxEnabled = config.skillsSandbox.enabled;
+      (config.skillsSandbox as { enabled: boolean }).enabled = true;
+      try {
+        const org = await makeOrganization();
+        const user = await makeUser();
+        await makeMember(user.id, org.id, { role: "admin" });
+        const agent = await makeAgent({
+          name: "Sandbox Discovery Agent",
+          organizationId: org.id,
+          accessAllTools: true,
+        });
+        // seed (run_command exists in the org-accessible Archestra catalog) but
+        // do NOT assign it
+        await ToolModel.seedArchestraTools(ARCHESTRA_MCP_CATALOG_ID);
+
+        const names = await searchSandboxTools({
+          agent: { id: agent.id, name: agent.name },
+          agentId: agent.id,
+          organizationId: org.id,
+          userId: user.id,
+        });
+
+        expect(names).toContain(TOOL_RUN_COMMAND_FULL_NAME);
+        expect(names).toContain(TOOL_UPLOAD_FILE_FULL_NAME);
+        expect(names).toContain(TOOL_DOWNLOAD_FILE_FULL_NAME);
+        // Persistent-files tools surface too when the sandbox runtime is on.
+        expect(names).toContain(TOOL_READ_FILE_FULL_NAME);
+      } finally {
+        (config.skillsSandbox as { enabled: boolean }).enabled =
+          originalSandboxEnabled;
+      }
+    });
+
+    test("hides sandbox tools from a user without agent:read", async ({
+      makeAgent,
+      makeCustomRole,
+      makeMember,
+      makeOrganization,
+      makeUser,
+    }) => {
+      const config = (await import("@/config")).default;
+      const originalSandboxEnabled = config.skillsSandbox.enabled;
+      (config.skillsSandbox as { enabled: boolean }).enabled = true;
+      try {
+        const org = await makeOrganization();
+        const user = await makeUser();
+        const role = await makeCustomRole(org.id, {
+          permission: { chat: ["read", "create"] },
+        });
+        await makeMember(user.id, org.id, { role: role.role });
+        const agent = await makeAgent({
+          name: "Sandbox Discovery Agent",
+          organizationId: org.id,
+          accessAllTools: true,
+        });
+        await ToolModel.seedArchestraTools(ARCHESTRA_MCP_CATALOG_ID);
+
+        const names = await searchSandboxTools({
+          agent: { id: agent.id, name: agent.name },
+          agentId: agent.id,
+          organizationId: org.id,
+          userId: user.id,
+        });
+
+        expect(names).not.toContain(TOOL_RUN_COMMAND_FULL_NAME);
+      } finally {
+        (config.skillsSandbox as { enabled: boolean }).enabled =
+          originalSandboxEnabled;
+      }
+    });
+  });
+
+  // The same discovery widening covers the management built-ins: unassigned,
+  // they surface for an All-mode agent and drop out when excluded per-agent.
+  describe("management built-in discovery", () => {
+    test("surfaces an unassigned management built-in for an All-mode agent and hides it when excluded", async ({
+      makeAgent,
+      makeMember,
+      makeOrganization,
+      makeUser,
+    }) => {
+      const { agentToolExclusionsService } = await import(
+        "@/services/agent-tool-exclusions"
+      );
+      const { TOOL_LIST_AGENTS_FULL_NAME } = await import("@archestra/shared");
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({
+        name: "Management Discovery Agent",
+        organizationId: org.id,
+        accessAllTools: true,
+      });
+      // seed the built-in rows, do NOT assign them
+      await ToolModel.seedArchestraTools(ARCHESTRA_MCP_CATALOG_ID);
+
+      const context: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      };
+      const search = async () => {
+        const result = await executeArchestraTool(
+          TOOL_SEARCH_TOOLS_FULL_NAME,
+          { query: "list agents", limit: 20 },
+          context,
+        );
+        expect(result.isError).toBe(false);
+        return (
+          result.structuredContent as SearchToolsStructuredContent
+        ).tools.map((tool) => tool.toolName);
+      };
+
+      expect(await search()).toContain(TOOL_LIST_AGENTS_FULL_NAME);
+
+      const listAgents = await ToolModel.findByName(TOOL_LIST_AGENTS_FULL_NAME);
+      if (!listAgents) throw new Error("list_agents row missing");
+      await agentToolExclusionsService.replaceExclusions({
+        agentId: agent.id,
+        organizationId: org.id,
+        excludedToolIds: [listAgents.id],
+      });
+
+      expect(await search()).not.toContain(TOOL_LIST_AGENTS_FULL_NAME);
+    });
+  });
+
+  describe("knowledge-source discovery", () => {
+    test("surfaces query_knowledge_sources only when the user can access a connector", async ({
+      makeAgent,
+      makeMember,
+      makeOrganization,
+      makeUser,
+    }) => {
+      const { KnowledgeBaseConnectorModel } = await import("@/models");
+      const {
+        getArchestraToolFullName,
+        TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME,
+      } = await import("@archestra/shared");
+      const kbToolName = getArchestraToolFullName(
+        TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME,
+      );
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({
+        name: "Knowledge Discovery Agent",
+        organizationId: org.id,
+        accessAllTools: true,
+      });
+      await ToolModel.seedArchestraTools(ARCHESTRA_MCP_CATALOG_ID);
+
+      const context: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      };
+      const search = async () => {
+        const result = await executeArchestraTool(
+          TOOL_SEARCH_TOOLS_FULL_NAME,
+          { query: "query knowledge sources search", limit: 20 },
+          context,
+        );
+        expect(result.isError).toBe(false);
+        return (
+          result.structuredContent as SearchToolsStructuredContent
+        ).tools.map((tool) => tool.toolName);
+      };
+
+      // agent has no knowledge sources and the user has no connector yet
+      expect(await search()).not.toContain(kbToolName);
+
+      await KnowledgeBaseConnectorModel.create({
+        organizationId: org.id,
+        name: "Search Discovery Connector",
+        connectorType: "jira",
+        config: {
+          type: "jira",
+          jiraBaseUrl: "https://test.atlassian.net",
+          isCloud: true,
+          projectKey: "PROJ",
+        },
+      });
+
+      expect(await search()).toContain(kbToolName);
+    });
+  });
+
+  describe("BM25F ranking (golden cases)", () => {
+    test("aggregates multiple matching terms above a single-term near-miss", () => {
+      const ranked = rank(
+        [
+          {
+            toolName: "slack__post_message",
+            description: "Post a message to a channel",
+          },
+          { toolName: "twilio__send_sms", description: "Send an SMS text" },
+        ],
+        "send message channel",
+      );
+      expect(ranked[0]).toBe("slack__post_message");
+    });
+
+    test("weights a name hit above a description-only hit", () => {
+      const ranked = rank(
+        [
+          { toolName: "octokit__repository" },
+          {
+            toolName: "octokit__list",
+            description: "Lists every repository you own",
+          },
+        ],
+        "repository",
+      );
+      expect(ranked[0]).toBe("octokit__repository");
+    });
+
+    test("an exact tool-name query always wins over keyword spam", () => {
+      const ranked = rank(
+        [
+          { toolName: "github__search_repositories" },
+          {
+            toolName: "noise__tool",
+            description:
+              "github search repositories github search repositories github search",
+          },
+        ],
+        "github__search_repositories",
+      );
+      expect(ranked[0]).toBe("github__search_repositories");
+    });
+
+    test("breaks score ties deterministically by tool name", () => {
+      const ranked = rank(
+        [{ toolName: "z__alpha" }, { toolName: "a__alpha" }],
+        "alpha",
+      );
+      expect(ranked).toEqual(["a__alpha", "z__alpha"]);
+    });
+
+    test("returns nothing when no term matches", () => {
+      expect(
+        rank([{ toolName: "slack__post_message" }], "nonexistentcapability"),
+      ).toEqual([]);
+    });
+
+    test("splits snake/kebab names so subtokens match", () => {
+      const ranked = rank(
+        [{ toolName: "github__search_repositories" }],
+        "search repositories",
+      );
+      expect(ranked).toEqual(["github__search_repositories"]);
+    });
+
+    test("does not inflate ranking by repeating a query term", () => {
+      const candidates = [
+        { toolName: "a__search", description: "search things" },
+        { toolName: "b__find", description: "find things" },
+      ];
+      // repeated 'search' must not outrank via repetition (query tokens dedupe)
+      expect(rank(candidates, "search search search")).toEqual(
+        rank(candidates, "search"),
+      );
+    });
+
+    test("a term present in every tool still yields a positive, finite score", () => {
+      // df === docCount exercises the log(1 + …) IDF floor (no negative/NaN)
+      const ranked = rank(
+        [
+          { toolName: "a__list", description: "list things" },
+          { toolName: "b__list", description: "list things" },
+        ],
+        "list",
+      );
+      expect(ranked).toEqual(["a__list", "b__list"]);
+    });
+
+    test("ranks a single-candidate corpus without NaN from empty fields", () => {
+      // only a name, all other fields empty -> avgFieldLength 0 for those fields
+      expect(rank([{ toolName: "solo__tool" }], "solo")).toEqual([
+        "solo__tool",
+      ]);
+    });
+  });
+
+  describe("unmatched query terms (golden cases)", () => {
+    test("reports every term when the whole query is absent from the corpus", () => {
+      expect(
+        unmatched([{ toolName: "slack__post_message" }], "send carrier pigeon"),
+      ).toEqual(["send", "carrier", "pigeon"]);
+    });
+
+    test("reports only the absent term on a partial match", () => {
+      const candidates = [
+        {
+          toolName: "slack__post_message",
+          description: "Post a message to a channel",
+        },
+      ];
+      // 'message' hits the description; 'gif' appears nowhere -> only 'gif'.
+      expect(rank(candidates, "message gif")).toEqual(["slack__post_message"]);
+      expect(unmatched(candidates, "message gif")).toEqual(["gif"]);
+    });
+
+    test("does not report a term that only matches via substring boost", () => {
+      const candidates = [{ toolName: "github__search_repositories" }];
+      // 'repo' has no token match (indexed token is 'repositories') but drives a
+      // result through the whole-query name substring boost, so it is matched.
+      expect(rank(candidates, "repo")).toEqual(["github__search_repositories"]);
+      expect(unmatched(candidates, "repo")).toEqual([]);
+    });
+
+    test("reports nothing when every query term hits some tool text", () => {
+      expect(
+        unmatched(
+          [{ toolName: "github__search_repositories" }],
+          "search repositories",
+        ),
+      ).toEqual([]);
+    });
+
+    test("treats a term found in any field (e.g. argument names) as matched", () => {
+      const candidates = [
+        {
+          toolName: "x__tool",
+          parameters: {
+            properties: { channel: { type: "string" } },
+          },
+        },
+      ];
+      expect(unmatched(candidates, "channel")).toEqual([]);
+    });
+
+    test("reports a term that is only a substring of an unrelated word", () => {
+      // "gif" sits inside the description token "gift" but is neither an indexed
+      // token nor a name/title substring, so it contributes no ranking signal.
+      const candidates = [
+        { toolName: "store__redeem", description: "Redeem a gift card" },
+      ];
+      expect(unmatched(candidates, "gif")).toEqual(["gif"]);
+    });
+  });
+
+  describe("regex mode", () => {
+    test("matches tool names by anchored pattern", () => {
+      const result = __test.rankCandidatesByRegex(
+        [{ toolName: "github__create_issue" }, { toolName: "slack__post" }].map(
+          makeRankingCandidate,
+        ),
+        "^github__",
+      );
+      expect(result.ok && result.matches.map((m) => m.toolName)).toEqual([
+        "github__create_issue",
+      ]);
+    });
+
+    test("is case-insensitive and can match descriptions", () => {
+      const result = __test.rankCandidatesByRegex(
+        [
+          { toolName: "x__a", description: "Send a Slack message" },
+          { toolName: "x__b", description: "Open a GitHub issue" },
+        ].map(makeRankingCandidate),
+        "slack",
+      );
+      expect(result.ok && result.matches.map((m) => m.toolName)).toEqual([
+        "x__a",
+      ]);
+    });
+
+    test("rejects a catastrophic-backtracking pattern with guidance", () => {
+      const result = __test.rankCandidatesByRegex(
+        [{ toolName: "x__a" }].map(makeRankingCandidate),
+        "(a+)+$",
+      );
+      expect(result.ok).toBe(false);
+      expect(!result.ok && result.error).toContain("too complex");
+    });
+
+    test("rejects an invalid pattern with guidance", () => {
+      const result = __test.rankCandidatesByRegex(
+        [{ toolName: "x__a" }].map(makeRankingCandidate),
+        "[unterminated",
+      );
+      expect(result.ok).toBe(false);
+      expect(!result.ok && result.error).toContain(
+        "Invalid regular expression",
+      );
+    });
+  });
+
+  describe("parameter enrichment", () => {
+    test("surfaces type, enum, and nested properties", () => {
+      const summaries = __test.summarizeInputParameters({
+        type: "object",
+        properties: {
+          status: {
+            type: "string",
+            enum: ["open", "closed"],
+            description: "Issue state.",
+          },
+          payload: {
+            type: "object",
+            properties: {
+              id: { type: "number" },
+              note: { type: "string" },
+            },
+            required: ["id"],
+          },
+        },
+        required: ["status"],
+      });
+
+      expect(summaries).toEqual([
+        {
+          name: "status",
+          required: true,
+          type: "string",
+          enum: ["open", "closed"],
+          description: "Issue state.",
+          properties: null,
+          hasHiddenDetail: false,
+        },
+        {
+          name: "payload",
+          required: false,
+          type: "object",
+          enum: null,
+          description: null,
+          properties: [
+            { name: "id", type: "number", required: true, properties: null },
+            { name: "note", type: "string", required: false, properties: null },
+          ],
+          hasHiddenDetail: false,
+        },
+      ]);
+    });
+
+    test("expands a second nested level for object-of-object params", () => {
+      const [summary] = __test.summarizeInputParameters({
+        type: "object",
+        properties: {
+          config: {
+            type: "object",
+            properties: {
+              user: {
+                type: "object",
+                properties: { name: { type: "string" } },
+                required: ["name"],
+              },
+            },
+          },
+        },
+      });
+      expect(summary.properties).toEqual([
+        {
+          name: "user",
+          type: "object",
+          required: false,
+          properties: [
+            { name: "name", type: "string", required: true, properties: null },
+          ],
+        },
+      ]);
+    });
+
+    test("summarizes nested properties of array-of-object params", () => {
+      const [summary] = __test.summarizeInputParameters({
+        type: "object",
+        properties: {
+          todos: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: { content: { type: "string" } },
+              required: ["content"],
+            },
+          },
+        },
+      });
+      expect(summary.type).toBe("array");
+      expect(summary.properties).toEqual([
+        { name: "content", type: "string", required: true, properties: null },
+      ]);
+    });
+
+    test("collapses union types and falls back to null for missing/garbage types", () => {
+      const [union, missing] = __test.summarizeInputParameters({
+        type: "object",
+        properties: {
+          maybe: { type: ["string", "null"] },
+          weird: { type: { not: "a string" } },
+        },
+      });
+      expect(union.type).toBe("string|null");
+      expect(missing.type).toBeNull();
+    });
+  });
+
+  describe("formatParamsSignature", () => {
+    const signatureFor = (schema: Record<string, unknown>) =>
+      __test.formatParamsSignature(__test.summarizeInputParameters(schema));
+
+    test("renders required-first ordering with types and descriptions", () => {
+      expect(
+        signatureFor({
+          type: "object",
+          properties: {
+            language: {
+              type: "string",
+              description: "Optional language filter.",
+            },
+            query: {
+              type: "string",
+              description: "Repository search query string.",
+            },
+          },
+          required: ["query"],
+        }),
+      ).toBe(
+        "query!:string — Repository search query string.; language?:string — Optional language filter.",
+      );
+    });
+
+    test("renders type and enum together", () => {
+      expect(
+        signatureFor({
+          type: "object",
+          properties: { sort: { type: "string", enum: ["asc", "desc"] } },
+        }),
+      ).toBe('sort?:string enum("asc"|"desc")');
+    });
+
+    test("json-encodes non-string enum values and omits a null type", () => {
+      expect(
+        signatureFor({
+          type: "object",
+          properties: { level: { enum: [1, true, null] } },
+        }),
+      ).toBe("level?:enum(1|true|null)");
+    });
+
+    test("expands one-level object shape", () => {
+      expect(
+        signatureFor({
+          type: "object",
+          properties: {
+            payload: {
+              type: "object",
+              properties: { id: { type: "number" }, note: { type: "string" } },
+              required: ["id"],
+            },
+          },
+        }),
+      ).toBe("payload?:object{id!:number, note?:string}");
+    });
+
+    test("expands array-of-object items", () => {
+      expect(
+        signatureFor({
+          type: "object",
+          properties: {
+            todos: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { content: { type: "string" } },
+                required: ["content"],
+              },
+            },
+          },
+        }),
+      ).toBe("todos?:array{content!:string}");
+    });
+
+    test("expands a second object level inline", () => {
+      expect(
+        signatureFor({
+          type: "object",
+          properties: {
+            config: {
+              type: "object",
+              properties: {
+                user: {
+                  type: "object",
+                  properties: { name: { type: "string" } },
+                },
+              },
+            },
+          },
+        }),
+      ).toBe("config?:object{user?:object{name?:string}}");
+    });
+
+    test("expands a second level through array-of-object items", () => {
+      expect(
+        signatureFor({
+          type: "object",
+          properties: {
+            payload: {
+              type: "object",
+              properties: {
+                rows: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: { id: { type: "number" } },
+                  },
+                },
+              },
+            },
+          },
+        }),
+      ).toBe("payload?:object{rows?:array{id?:number}}");
+    });
+
+    test("renders type, object shape, and enum together", () => {
+      expect(
+        signatureFor({
+          type: "object",
+          properties: {
+            target: {
+              type: "object",
+              properties: { id: { type: "string" } },
+              enum: [{ id: "a" }],
+            },
+          },
+        }),
+      ).toBe('target?:object{id?:string} enum({"id":"a"})');
+    });
+
+    test("collapses whitespace in descriptions to keep the signature single-line", () => {
+      expect(
+        signatureFor({
+          type: "object",
+          properties: {
+            body: { type: "string", description: "Line one.\n  Line two." },
+          },
+        }),
+      ).toBe("body?:string — Line one. Line two.");
+    });
+
+    const enumSignatureFor = (count: number) =>
+      signatureFor({
+        type: "object",
+        properties: {
+          kind: {
+            type: "string",
+            enum: Array.from({ length: count }, (_, index) => `v${index}`),
+          },
+        },
+      });
+
+    test("renders every enum value at exactly the cap with no overflow marker", () => {
+      const signature = enumSignatureFor(20);
+      expect(signature.endsWith('"v19")')).toBe(true);
+      expect(signature).not.toContain("more");
+    });
+
+    test("caps long enums and reports the overflow count", () => {
+      expect(enumSignatureFor(21).endsWith('"v19"|…(+1 more))')).toBe(true);
+      expect(enumSignatureFor(25).endsWith('"v19"|…(+5 more))')).toBe(true);
+    });
+
+    test("returns an empty string when there are no parameters", () => {
+      expect(__test.formatParamsSignature([])).toBe("");
+      expect(signatureFor({ type: "object", properties: {} })).toBe("");
+    });
+
+    describe("hidden-detail marker", () => {
+      const hasHidden = (schema: Record<string, unknown>) =>
+        __test.summarizeInputParameters(schema)[0]?.hasHiddenDetail;
+
+      test("marks an explicit additionalProperties object (freeform)", () => {
+        const schema = {
+          type: "object",
+          properties: {
+            result: { type: "object", additionalProperties: true },
+          },
+          required: ["result"],
+        };
+        expect(hasHidden(schema)).toBe(true);
+        expect(signatureFor(schema)).toBe("result!:object…");
+      });
+
+      test("marks an opaque object with no listed properties", () => {
+        const schema = {
+          type: "object",
+          properties: { meta: { type: "object" } },
+        };
+        expect(hasHidden(schema)).toBe(true);
+        expect(signatureFor(schema)).toBe("meta?:object…");
+      });
+
+      test("fully shows an object nested two levels deep, no marker", () => {
+        const schema = {
+          type: "object",
+          properties: {
+            config: {
+              type: "object",
+              properties: {
+                user: { type: "object", properties: { name: {} } },
+              },
+            },
+          },
+        };
+        expect(hasHidden(schema)).toBe(false);
+        expect(signatureFor(schema)).toBe(
+          "config?:object{user?:object{name?}}",
+        );
+      });
+
+      test("marks an object nested deeper than the two levels shown", () => {
+        const schema = {
+          type: "object",
+          properties: {
+            config: {
+              type: "object",
+              properties: {
+                user: {
+                  type: "object",
+                  properties: {
+                    address: { type: "object", properties: { city: {} } },
+                  },
+                },
+              },
+            },
+          },
+        };
+        expect(hasHidden(schema)).toBe(true);
+        expect(signatureFor(schema)).toBe(
+          "config?:object{user?:object{address?:object}}…",
+        );
+      });
+
+      test("marks an opaque second-level object", () => {
+        const schema = {
+          type: "object",
+          properties: {
+            config: {
+              type: "object",
+              properties: { user: { type: "object" } },
+            },
+          },
+        };
+        expect(hasHidden(schema)).toBe(true);
+        expect(signatureFor(schema)).toBe("config?:object{user?:object}…");
+      });
+
+      // The render resolves array items only when they list properties, while the
+      // marker resolves any object-typed items; this pins that they still agree —
+      // opaque items collapse the array to a bare type and the marker fires.
+      test("marks a second-level array of opaque objects", () => {
+        const schema = {
+          type: "object",
+          properties: {
+            config: {
+              type: "object",
+              properties: {
+                rows: { type: "array", items: { type: "object" } },
+              },
+            },
+          },
+        };
+        expect(hasHidden(schema)).toBe(true);
+        expect(signatureFor(schema)).toBe("config?:object{rows?:array}…");
+      });
+
+      test("does not mark a closed second-level object", () => {
+        const schema = {
+          type: "object",
+          properties: {
+            config: {
+              type: "object",
+              properties: {
+                user: {
+                  type: "object",
+                  properties: { name: { type: "string" } },
+                  additionalProperties: false,
+                },
+              },
+            },
+          },
+        };
+        expect(hasHidden(schema)).toBe(false);
+        expect(signatureFor(schema)).toBe(
+          "config?:object{user?:object{name?:string}}",
+        );
+      });
+
+      test("marks an array of freeform objects", () => {
+        const schema = {
+          type: "object",
+          properties: {
+            rows: {
+              type: "array",
+              items: { type: "object", additionalProperties: true },
+            },
+          },
+        };
+        expect(hasHidden(schema)).toBe(true);
+        expect(signatureFor(schema)).toBe("rows?:array…");
+      });
+
+      test("does not mark an array of fully-shown objects", () => {
+        const schema = {
+          type: "object",
+          properties: {
+            todos: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { content: { type: "string" } },
+                required: ["content"],
+              },
+            },
+          },
+        };
+        expect(hasHidden(schema)).toBe(false);
+        expect(signatureFor(schema)).toBe("todos?:array{content!:string}");
+      });
+
+      test("does not mark scalars", () => {
+        expect(
+          hasHidden({ type: "object", properties: { q: { type: "string" } } }),
+        ).toBe(false);
+      });
+
+      test("does not mark a fully-shown object that merely omits additionalProperties", () => {
+        const schema = {
+          type: "object",
+          properties: {
+            payload: {
+              type: "object",
+              properties: { id: { type: "number" } },
+            },
+          },
+        };
+        expect(hasHidden(schema)).toBe(false);
+        expect(signatureFor(schema)).toBe("payload?:object{id?:number}");
+      });
+
+      test("does not mark a closed object with explicit additionalProperties:false", () => {
+        const schema = {
+          type: "object",
+          properties: {
+            payload: {
+              type: "object",
+              properties: { id: { type: "number" } },
+              additionalProperties: false,
+            },
+          },
+        };
+        expect(hasHidden(schema)).toBe(false);
+      });
     });
   });
 
@@ -166,5 +1929,648 @@ describe("search_tools", () => {
     expect((result.content[0] as any).text).toContain(
       "search_tools requires agent context",
     );
+  });
+
+  describe("signals", () => {
+    test("reports matchCount and truncated when results exceed the limit", async ({
+      makeAgent,
+      makeAgentTool,
+      makeInternalMcpCatalog,
+      makeMember,
+      makeOrganization,
+      makeTool,
+      makeUser,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({ name: "Trunc", organizationId: org.id });
+      const catalog = await makeInternalMcpCatalog({
+        organizationId: org.id,
+        name: "GitHub MCP",
+      });
+      for (const name of [
+        "github__search_repositories",
+        "github__search_issues",
+        "github__search_code",
+      ]) {
+        const tool = await makeTool({
+          name,
+          description: "github search",
+          catalogId: catalog.id,
+          parameters: {},
+        });
+        await makeAgentTool(agent.id, tool.id);
+      }
+
+      const context: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      };
+      const result = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "github search", limit: 1 },
+        context,
+      );
+      const structured =
+        result.structuredContent as SearchToolsStructuredContent;
+      expect(structured.total).toBe(1);
+      expect(structured.matchCount).toBe(3);
+      expect(structured.truncated).toBe(true);
+      expect(structured.nextOffset).toBe(1);
+      expect(structured.hint).toBe(
+        "Showing the top 1 of 3 matches. For the remaining 2, raise limit (max 20) or repeat the query with offset 1.",
+      );
+    });
+
+    test("caps a limit above the maximum instead of rejecting the call", async ({
+      makeAgent,
+      makeAgentTool,
+      makeInternalMcpCatalog,
+      makeMember,
+      makeOrganization,
+      makeTool,
+      makeUser,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({ name: "Cap", organizationId: org.id });
+      const catalog = await makeInternalMcpCatalog({
+        organizationId: org.id,
+        name: "Widgets MCP",
+      });
+      for (let index = 0; index < 21; index++) {
+        const tool = await makeTool({
+          name: `widgets__action_${index}`,
+          description: "widget action",
+          catalogId: catalog.id,
+          parameters: {},
+        });
+        await makeAgentTool(agent.id, tool.id);
+      }
+
+      const context: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      };
+      // The call a model makes to list a whole catalog.
+      const result = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "^widgets__", mode: "regex", limit: 100 },
+        context,
+      );
+      expect(result.isError).toBeFalsy();
+      const structured =
+        result.structuredContent as SearchToolsStructuredContent;
+      expect(structured.total).toBe(20);
+      expect(structured.matchCount).toBe(21);
+      expect(structured.truncated).toBe(true);
+      // Already at the cap: point at the next page, not at a larger limit.
+      expect(structured.hint).toBe(
+        "Showing the top 20 of 21 matches. For the remaining 1, repeat the query with offset 20.",
+      );
+      expect(structured.nextOffset).toBe(20);
+    });
+
+    test("pages through every match with offset", async ({
+      makeAgent,
+      makeAgentTool,
+      makeInternalMcpCatalog,
+      makeMember,
+      makeOrganization,
+      makeTool,
+      makeUser,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({ name: "Pages", organizationId: org.id });
+      const catalog = await makeInternalMcpCatalog({
+        organizationId: org.id,
+        name: "Widgets MCP",
+      });
+      const names = Array.from(
+        { length: 24 },
+        (_, index) => `widgets__action_${String(index).padStart(2, "0")}`,
+      );
+      for (const name of names) {
+        const tool = await makeTool({
+          name,
+          description: "widget action",
+          catalogId: catalog.id,
+          parameters: {},
+        });
+        await makeAgentTool(agent.id, tool.id);
+      }
+      const context: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      };
+      const search = async (args: Record<string, unknown>) => {
+        const result = await executeArchestraTool(
+          TOOL_SEARCH_TOOLS_FULL_NAME,
+          { query: "^widgets__", mode: "regex", ...args },
+          context,
+        );
+        expect(result.isError).toBeFalsy();
+        return result.structuredContent as SearchToolsStructuredContent;
+      };
+
+      // A model that wants the whole catalog asks for more than one page.
+      const first = await search({ limit: 100 });
+      expect(first.total).toBe(20);
+      expect(first.nextOffset).toBe(20);
+      expect(first.hint).toBe(
+        "Showing the top 20 of 24 matches. For the remaining 4, repeat the query with offset 20.",
+      );
+
+      const second = await search({ limit: 100, offset: first.nextOffset });
+      expect(second).toMatchObject({
+        total: 4,
+        matchCount: 24,
+        truncated: false,
+        nextOffset: null,
+        hint: null,
+      });
+      expect(
+        [...first.tools, ...second.tools].map((tool) => tool.toolName),
+      ).toEqual(names);
+
+      // A middle page names its range and the next offset.
+      const middle = await search({ limit: 5, offset: 10 });
+      expect(middle.tools.map((tool) => tool.toolName)).toEqual(
+        names.slice(10, 15),
+      );
+      expect(middle.hint).toBe(
+        "Showing matches 11 to 15 of 24. For the remaining 9, raise limit (max 20) or repeat the query with offset 15.",
+      );
+
+      const past = await search({ offset: 30 });
+      expect(past).toMatchObject({
+        total: 0,
+        matchCount: 24,
+        truncated: false,
+        nextOffset: null,
+        hint: "This query has 24 matches, so offset 30 returns none. Use an offset below 24.",
+      });
+    });
+
+    test("accepts a regex that lists the names of many tools", async ({
+      makeAgent,
+      makeAgentTool,
+      makeInternalMcpCatalog,
+      makeMember,
+      makeOrganization,
+      makeTool,
+      makeUser,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({ name: "Long", organizationId: org.id });
+      const catalog = await makeInternalMcpCatalog({
+        organizationId: org.id,
+        name: "Widgets MCP",
+      });
+      const names = Array.from(
+        { length: 21 },
+        (_, index) => `widgets__long_action_name_${index}`,
+      );
+      for (const name of names) {
+        const tool = await makeTool({
+          name,
+          description: "widget action",
+          catalogId: catalog.id,
+          parameters: {},
+        });
+        await makeAgentTool(agent.id, tool.id);
+      }
+      const context: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      };
+      // The shape a model writes to exclude the tools it has already seen.
+      const seen = names
+        .slice(0, 20)
+        .map((name) => name.replace("widgets__", ""));
+      const query = `^widgets__(?!(${seen.join("|")})$)`;
+      expect(query.length).toBeGreaterThan(400);
+
+      const result = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query, mode: "regex", limit: 20 },
+        context,
+      );
+      expect(result.isError).toBeFalsy();
+      const structured =
+        result.structuredContent as SearchToolsStructuredContent;
+      expect(structured.tools.map((tool) => tool.toolName)).toEqual([
+        "widgets__long_action_name_20",
+      ]);
+    });
+
+    test("zero results return an actionable hint naming available servers", async ({
+      makeAgent,
+      makeAgentTool,
+      makeInternalMcpCatalog,
+      makeMember,
+      makeOrganization,
+      makeTool,
+      makeUser,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({ name: "Zero", organizationId: org.id });
+      const catalog = await makeInternalMcpCatalog({
+        organizationId: org.id,
+        name: "GitHub MCP",
+      });
+      const tool = await makeTool({
+        name: "github__search_repositories",
+        description: "search",
+        catalogId: catalog.id,
+        parameters: {},
+      });
+      await makeAgentTool(agent.id, tool.id);
+
+      const context: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      };
+      const result = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "nonexistentcapabilityxyz", limit: 5 },
+        context,
+      );
+      const structured =
+        result.structuredContent as SearchToolsStructuredContent;
+      expect(structured.matchCount).toBe(0);
+      expect(structured.hint).toContain("No tools matched");
+      expect(structured.hint).toContain("GitHub MCP");
+    });
+
+    test("a successful search does not flag extra query terms that hit no tool text", async ({
+      makeAgent,
+      makeAgentTool,
+      makeInternalMcpCatalog,
+      makeMember,
+      makeOrganization,
+      makeTool,
+      makeUser,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({
+        name: "Partial",
+        organizationId: org.id,
+      });
+      const catalog = await makeInternalMcpCatalog({
+        organizationId: org.id,
+        name: "Slack MCP",
+      });
+      const tool = await makeTool({
+        name: "slack__post_message",
+        description: "Post a message to a channel",
+        catalogId: catalog.id,
+        parameters: {},
+      });
+      await makeAgentTool(agent.id, tool.id);
+
+      const context: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      };
+      const result = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "message gif", limit: 5 },
+        context,
+      );
+      const structured =
+        result.structuredContent as SearchToolsStructuredContent;
+      // 'message' matches slack__post_message; 'gif' matches nothing. The search still
+      // succeeded, so the unmatched 'gif' is suppressed rather than surfaced as noise.
+      expect(structured.matchCount).toBe(1);
+      expect(structured.hint).toBeNull();
+    });
+
+    test("a truncated search omits the unmatched-terms clause", async ({
+      makeAgent,
+      makeAgentTool,
+      makeInternalMcpCatalog,
+      makeMember,
+      makeOrganization,
+      makeTool,
+      makeUser,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({ name: "Both", organizationId: org.id });
+      const catalog = await makeInternalMcpCatalog({
+        organizationId: org.id,
+        name: "GitHub MCP",
+      });
+      for (const name of [
+        "github__search_repositories",
+        "github__search_issues",
+        "github__search_code",
+      ]) {
+        const tool = await makeTool({
+          name,
+          description: "github search",
+          catalogId: catalog.id,
+          parameters: {},
+        });
+        await makeAgentTool(agent.id, tool.id);
+      }
+
+      const context: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      };
+      // 'search' matches all three (-> truncated at limit 1); 'zzznope' matches
+      // nothing. The search succeeded, so only the truncation clause appears -- the
+      // unmatched 'zzznope' is suppressed.
+      const result = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "search zzznope", limit: 1 },
+        context,
+      );
+      const structured =
+        result.structuredContent as SearchToolsStructuredContent;
+      expect(structured.truncated).toBe(true);
+      expect(structured.hint).toContain("top 1 of 3");
+      expect(structured.hint).not.toContain("No tool text matches");
+      expect(structured.hint).not.toContain("zzznope");
+    });
+
+    test("regex mode never appends an unmatched-terms clause", async ({
+      makeAgent,
+      makeAgentTool,
+      makeInternalMcpCatalog,
+      makeMember,
+      makeOrganization,
+      makeTool,
+      makeUser,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({ name: "Regex", organizationId: org.id });
+      const catalog = await makeInternalMcpCatalog({
+        organizationId: org.id,
+        name: "GitHub MCP",
+      });
+      const tool = await makeTool({
+        name: "github__search_repositories",
+        description: "search",
+        catalogId: catalog.id,
+        parameters: {},
+      });
+      await makeAgentTool(agent.id, tool.id);
+
+      const context: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      };
+      const result = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "^github__", limit: 5, mode: "regex" },
+        context,
+      );
+      const structured =
+        result.structuredContent as SearchToolsStructuredContent;
+      expect(structured.matchCount).toBe(1);
+      expect(structured.hint).toBeNull();
+    });
+  });
+
+  describe("per-conversation tool filter", () => {
+    test("hides a third-party tool disabled for the conversation", async ({
+      makeAgent,
+      makeAgentTool,
+      makeConversation,
+      makeInternalMcpCatalog,
+      makeMember,
+      makeOrganization,
+      makeTool,
+      makeUser,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({ name: "Conv", organizationId: org.id });
+      const catalog = await makeInternalMcpCatalog({
+        organizationId: org.id,
+        name: "GitHub MCP",
+      });
+      const enabledTool = await makeTool({
+        name: "github__search_repositories",
+        description: "search",
+        catalogId: catalog.id,
+        parameters: {},
+      });
+      const disabledTool = await makeTool({
+        name: "github__create_issue",
+        description: "github create",
+        catalogId: catalog.id,
+        parameters: {},
+      });
+      await makeAgentTool(agent.id, enabledTool.id);
+      await makeAgentTool(agent.id, disabledTool.id);
+      const conversation = await makeConversation(agent.id, {
+        organizationId: org.id,
+        userId: user.id,
+      });
+      await ConversationEnabledToolModel.setEnabledTools(conversation.id, [
+        enabledTool.id,
+      ]);
+
+      const base: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      };
+
+      const filtered = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "github", limit: 20 },
+        { ...base, conversationId: conversation.id },
+      );
+      const filteredNames = (
+        filtered.structuredContent as SearchToolsStructuredContent
+      ).tools.map((t) => t.toolName);
+      expect(filteredNames).toContain("github__search_repositories");
+      expect(filteredNames).not.toContain("github__create_issue");
+
+      // no conversationId ⇒ no filter ⇒ both visible
+      const unfiltered = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "github", limit: 20 },
+        base,
+      );
+      const unfilteredNames = (
+        unfiltered.structuredContent as SearchToolsStructuredContent
+      ).tools.map((t) => t.toolName);
+      expect(unfilteredNames).toContain("github__search_repositories");
+      expect(unfilteredNames).toContain("github__create_issue");
+    });
+
+    test("keeps Archestra tools discoverable under an empty custom selection", async ({
+      makeAgent,
+      makeAgentTool,
+      makeConversation,
+      makeInternalMcpCatalog,
+      makeMember,
+      makeOrganization,
+      makeTool,
+      makeUser,
+      seedAndAssignArchestraTools,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({ name: "Empty", organizationId: org.id });
+      await seedAndAssignArchestraTools(agent.id);
+      const catalog = await makeInternalMcpCatalog({
+        organizationId: org.id,
+        name: "GitHub MCP",
+      });
+      const thirdParty = await makeTool({
+        name: "github__search_repositories",
+        description: "search",
+        catalogId: catalog.id,
+        parameters: {},
+      });
+      await makeAgentTool(agent.id, thirdParty.id);
+      const conversation = await makeConversation(agent.id, {
+        organizationId: org.id,
+        userId: user.id,
+      });
+      // custom selection enabling zero tools
+      await ConversationEnabledToolModel.setEnabledTools(conversation.id, []);
+
+      const context: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+        conversationId: conversation.id,
+      };
+
+      const skillResult = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "skill", limit: 20 },
+        context,
+      );
+      const skillNames = (
+        skillResult.structuredContent as SearchToolsStructuredContent
+      ).tools.map((t) => t.toolName);
+      // Archestra authoring tool stays discoverable (built-ins bypass the gate)
+      expect(skillNames).toContain(TOOL_CREATE_SKILL_FULL_NAME);
+
+      const githubResult = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "github", limit: 20 },
+        context,
+      );
+      const githubNames = (
+        githubResult.structuredContent as SearchToolsStructuredContent
+      ).tools.map((t) => t.toolName);
+      // third-party tool is filtered out by the empty selection
+      expect(githubNames).not.toContain("github__search_repositories");
+    });
+
+    test("hides an agent-delegation tool disabled for the conversation", async ({
+      makeAgent,
+      makeAgentTool,
+      makeConversation,
+      makeInternalMcpCatalog,
+      makeMember,
+      makeOrganization,
+      makeTool,
+      makeUser,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      await makeMember(user.id, org.id, { role: "admin" });
+      const agent = await makeAgent({ name: "Deleg", organizationId: org.id });
+      const targetAgent = await makeAgent({
+        name: "Research Agent",
+        organizationId: org.id,
+      });
+      const delegationTool = await ToolModel.findOrCreateDelegationTool(
+        targetAgent.id,
+      );
+      await makeAgentTool(agent.id, delegationTool.id);
+      const catalog = await makeInternalMcpCatalog({
+        organizationId: org.id,
+        name: "GitHub MCP",
+      });
+      const other = await makeTool({
+        name: "github__search_repositories",
+        description: "search",
+        catalogId: catalog.id,
+        parameters: {},
+      });
+      await makeAgentTool(agent.id, other.id);
+      const conversation = await makeConversation(agent.id, {
+        organizationId: org.id,
+        userId: user.id,
+      });
+      // custom selection enabling only the unrelated tool, excluding delegation
+      await ConversationEnabledToolModel.setEnabledTools(conversation.id, [
+        other.id,
+      ]);
+
+      const delegationName = `${AGENT_TOOL_PREFIX}${slugify(targetAgent.name)}`;
+      const base: ArchestraContext = {
+        agent: { id: agent.id, name: agent.name },
+        agentId: agent.id,
+        organizationId: org.id,
+        userId: user.id,
+      };
+
+      const filtered = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "research agent", limit: 20 },
+        { ...base, conversationId: conversation.id },
+      );
+      const filteredNames = (
+        filtered.structuredContent as SearchToolsStructuredContent
+      ).tools.map((t) => t.toolName);
+      expect(filteredNames).not.toContain(delegationName);
+
+      // no conversationId ⇒ no filter ⇒ delegation tool discoverable
+      const unfiltered = await executeArchestraTool(
+        TOOL_SEARCH_TOOLS_FULL_NAME,
+        { query: "research agent", limit: 20 },
+        base,
+      );
+      const unfilteredNames = (
+        unfiltered.structuredContent as SearchToolsStructuredContent
+      ).tools.map((t) => t.toolName);
+      expect(unfilteredNames).toContain(delegationName);
+    });
   });
 });

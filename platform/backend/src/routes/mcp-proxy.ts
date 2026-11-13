@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { RouteId } from "@archestra/shared";
 import type { McpUiToolMeta } from "@modelcontextprotocol/ext-apps";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { RouteId } from "@shared";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import QuickLRU from "quick-lru";
 import { z } from "zod";
@@ -13,7 +13,8 @@ import { type Agent, ApiError, UuidIdSchema } from "@/types";
 import {
   createAgentServer,
   createStatelessTransport,
-} from "./mcp-gateway.utils";
+  ensureRequestSocketDestroySoon,
+} from "./mcp-gateway/utils";
 
 /**
  * MCP Proxy routes for frontend AppRenderer
@@ -32,8 +33,9 @@ const mcpProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
     {
       schema: {
         operationId: RouteId.McpProxyPost,
-        tags: ["mcp-proxy"],
-        description: "Proxy MCP Gateway requests with session auth",
+        tags: ["MCP App Runtime"],
+        description:
+          "Handle MCP App JSON-RPC requests through an agent's MCP Gateway. The caller must have access to the agent.",
         params: z.object({
           agentId: UuidIdSchema,
         }),
@@ -69,7 +71,10 @@ const mcpProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
         }
       }
       if (!agent || agent.organizationId !== organizationId) {
-        throw new ApiError(403, "Forbidden");
+        throw new ApiError(
+          403,
+          "You don't have access to this agent, or it doesn't exist.",
+        );
       }
 
       const externalIdpToken = await resolveSessionExternalIdpToken({
@@ -130,7 +135,7 @@ const mcpProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
             jsonrpc: "2.0",
             error: {
               code: -32601,
-              message: `Tool "${toolName}" not found`,
+              message: `No tool named "${toolName}" is available here. Call tools/list to see the available tools and use an exact name from it. Do not guess tool names.`,
             },
             id: body.id ?? null,
           };
@@ -164,7 +169,10 @@ const mcpProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
         if (cachedServer) {
           server = cachedServer;
         } else {
-          ({ server } = await createAgentServer(agentId, sessionTokenAuth));
+          ({ server } = await createAgentServer({
+            agentId: agentId,
+            tokenAuth: sessionTokenAuth,
+          }));
         }
 
         const transport = createStatelessTransport(agentId);
@@ -173,7 +181,10 @@ const mcpProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
         } catch {
           // Server still bound to previous transport (rare concurrent request);
           // replace it with a fresh one.
-          ({ server } = await createAgentServer(agentId, sessionTokenAuth));
+          ({ server } = await createAgentServer({
+            agentId: agentId,
+            tokenAuth: sessionTokenAuth,
+          }));
           await server.connect(transport);
         }
         serverHealthy = true;
@@ -182,6 +193,7 @@ const mcpProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
         reply.hijack();
         hijacked = true;
 
+        ensureRequestSocketDestroySoon(request.raw);
         await transport.handleRequest(
           request.raw as IncomingMessage,
           reply.raw as ServerResponse,

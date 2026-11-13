@@ -16,29 +16,28 @@ if (isMainModule) {
   await import("./observability/tracing/sdk");
 }
 
+// Binds the ports of the layers below before any other module loads.
+import "@/server/composition";
+import { isWorker } from "node:cluster";
 import { readFileSync } from "node:fs";
-import fastifyCors from "@fastify/cors";
-import fastifyFormbody from "@fastify/formbody";
-import fastifySwagger from "@fastify/swagger";
-import type { McpUiResourceCsp } from "@modelcontextprotocol/ext-apps";
-import * as Sentry from "@sentry/node";
+import { createRequire } from "node:module";
+import path from "node:path";
 import {
   EmbeddingDimensionsSchema,
   LocalConfigEnvironmentDefaultSchema,
   SUPPORTED_EMBEDDING_DIMENSIONS,
-} from "@shared";
-import Fastify from "fastify";
-import metricsPlugin from "fastify-metrics";
+} from "@archestra/shared";
+import fastifyCors, { type FastifyCorsOptions } from "@fastify/cors";
+import fastifyFormbody from "@fastify/formbody";
+import fastifySwagger from "@fastify/swagger";
+import * as Sentry from "@sentry/node";
+import type { FastifyRequest } from "fastify";
 import {
   createJsonSchemaTransformObject,
-  hasZodFastifySchemaValidationErrors,
-  isResponseSerializationError,
   jsonSchemaTransform,
-  serializerCompiler,
-  validatorCompiler,
-  type ZodTypeProvider,
 } from "fastify-type-provider-zod";
 import { z } from "zod";
+import { a2aTaskRunService } from "@/agents/a2a/a2a-task-run-service";
 import { chatOpsManager } from "@/agents/chatops/chatops-manager";
 import {
   cleanupEmailProvider,
@@ -49,31 +48,110 @@ import {
   renewEmailSubscriptionIfNeeded,
 } from "@/agents/incoming-email";
 import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
-import { fastifyAuthPlugin } from "@/auth";
+import { revokeBasicAuthOnlySessions } from "@/auth/basic-auth-lockout";
+import { authPlugin as fastifyAuthPlugin } from "@/auth/fastify-plugin";
 import { cacheManager } from "@/cache-manager";
-import config, { shouldRunWebServer, shouldRunWorker } from "@/config";
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+import mcpClient, {
+  registerMcpClientHibernationInvalidation,
+} from "@/clients/mcp-client";
+// SPDX-SnippetEnd
+import config, {
+  resolveAllowedOrigins,
+  shouldRunWebServer,
+  shouldRunWorker,
+  validateShutdownPodGrace,
+} from "@/config";
+import { verifyEncryptedChatConfig } from "@/content-encryption/encrypted-chat-escrow";
+// biome-ignore lint/style/noRestrictedImports: dual-licensed, self-guards on the license flag
+import { verifyContentEncryptionKey } from "@/content-encryption/guard.ee";
+// biome-ignore lint/style/noRestrictedImports: dual-licensed, self-guards on the license flag
+import { assertRetentionConfigLicensed } from "@/data-retention/license-gate.ee";
 import { initializeDatabase, isDatabaseHealthy } from "@/database";
-import { seedRequiredStartingData } from "@/database/seed";
+import {
+  createAgentToolsIndexes,
+  createInteractionsIndexes,
+  createMcpServerIndexes,
+  dropContentTrgmIndexesUnderEncryption,
+  dropLegacyPayloadTrgmIndexes,
+} from "@/database/index-maintenance";
+import { enterpriseTier } from "@/enterprise-tier";
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+// biome-ignore lint/style/noRestrictedImports: runtime-gated image prefetch
+import { agentImagePrefetcher } from "@/k8s/agent-runtime/image-prefetch.ee";
+// SPDX-SnippetEnd
+import { agentSandboxApi } from "@/k8s/agent-runtime/sandbox-api";
+import { agentWarmPoolManager } from "@/k8s/agent-runtime/warm-pool";
+import { daggerEnvironmentRuntimeManager } from "@/k8s/dagger-environment-runtime/manager";
 import { McpServerRuntimeManager } from "@/k8s/mcp-server-runtime";
 import logger from "@/logging";
 import { enterpriseLicenseMiddleware } from "@/middleware";
+import { initAuditDecisions } from "@/middleware/audit-decisions";
+import { registerAuditLogHook } from "@/middleware/audit-log-hook";
+import { initAuditRegistry } from "@/middleware/audit-log-registry";
+import { PlaywrightRuntimeModel } from "@/models";
+import InteractionSessionHeadModel from "@/models/interaction-session-head";
 import OrganizationModel from "@/models/organization";
+import { ngrokTunnelManager } from "@/ngrok-tunnel-manager";
 import { initializeObservabilityMetrics } from "@/observability";
+import { activeUsersMetricCollector } from "@/observability/metrics/active-users";
+import { reportAbnormalPreviousTermination } from "@/observability/previous-termination-report";
+// biome-ignore lint/style/noRestrictedImports: dual-licensed, self-guards on the license flag
+import { rumExporter } from "@/observability/rum/exporter.ee";
+import { createCachedOpenApiRouteHandler } from "@/openapi/cached-openapi-route";
 import { enrichOpenApiWithRbac } from "@/openapi/enrich-openapi-with-rbac";
+import {
+  declareOpenappaInstalls,
+  openappaReadiness,
+  recompileAllOnStart,
+  startOpenappaRuntime,
+} from "@/openappa/service";
+import { initializeLlmProxyPlugins } from "@/proxy/plugins/registry";
+import guardrailsNoopAnnotatorRoutes from "@/routes/guardrails-policy/guardrails-noop-annotator.routes";
+import { captureClientRuntimeEvidence } from "@/routes/proxy/utils/client-runtime-evidence";
+import { activeChatRunService } from "@/services/active-chat-run";
+import { agentRunReconciler } from "@/services/agent-runtime/reconciler";
+import {
+  APP_BASE_CSS_PATH,
+  APP_SDK_PATH,
+} from "@/services/apps/app-sdk-injection";
+import { instanceAnalyticsService } from "@/services/instance-analytics";
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+// biome-ignore lint/style/noRestrictedImports: runtime-gated EE model import
+import { mcpActiveUseTracker } from "@/services/mcp-active-use.ee";
+// SPDX-SnippetEnd
+import { mcpGatewayTaskReaper } from "@/services/mcp-gateway-task-reaper";
+import { mcpImageUpdateChecker } from "@/services/mcp-image-update-checker";
+import { mcpToolsRefreshManager } from "@/services/mcp-tools-refresh";
+import { initializeManagedPlaywrightRuntime } from "@/services/playwright-runtime";
+import { ensureScopedResourcePermissionCutover } from "@/services/resource-permissions-cutover";
+import { seedRequiredStartingData } from "@/services/seed";
+import { sreAgentService } from "@/services/sre-agent";
 import { systemKeyManager } from "@/services/system-key-manager";
+import { skillSandboxRuntimeService } from "@/skills-sandbox/skill-sandbox-runtime-service";
+import { createStartupHealthServer } from "@/startup-health";
 import { taskQueueService } from "@/task-queue";
 import { registerTaskHandlers } from "@/task-queue/handlers";
 import {
   Anthropic,
-  ApiError,
+  Archestra,
   Cerebras,
   Cohere,
   DeepSeek,
   Gemini,
   Groq,
+  InteractionVirtualKeySchema,
+  Jev,
   Minimax,
   Mistral,
   Ollama,
+  OllamaNative,
   OpenAi,
   Openrouter,
   Perplexity,
@@ -82,27 +160,79 @@ import {
   Zhipuai,
 } from "@/types";
 import websocketService from "@/websocket";
-import * as routes from "./routes";
 import {
+  createFastifyInstance,
+  type FastifyInstanceWithZod,
+} from "./fastify-instance";
+import {
+  registerMetricsPlugin,
+  registerStandaloneMetricsEndpoint,
+} from "./metrics-registration";
+import * as routes from "./routes";
+import { msTeamsWebhookRoutes } from "./routes/chatops";
+import { publicConfigRoutes } from "./routes/config";
+import { createOAuthAwareCorsDelegate } from "./routes/oauth-cors";
+import {
+  CONNECTION_SETUP_SCRIPT_PREFIX,
   HEALTH_PATH,
   MCP_GATEWAY_PREFIX,
+  MS_TEAMS_SIGN_IN_PATH,
   READY_PATH,
+  SKILL_MARKETPLACE_PREFIX,
 } from "./routes/route-paths";
+import {
+  beginLlmProxyDrain,
+  drainLlmProxyRequests,
+} from "./server/llm-proxy-drain";
+import { drainBackgroundWork } from "./utils/background-work";
+
+async function flushShutdownTelemetry(): Promise<void> {
+  if (!isMainModule) return;
+  // Deliver queued error reports before exit; resolves at once without Sentry.
+  await Sentry.flush(SENTRY_SHUTDOWN_FLUSH_TIMEOUT_MS);
+  await (await import("./observability/tracing/sdk")).shutdownTelemetry();
+}
+
+const SENTRY_SHUTDOWN_FLUSH_TIMEOUT_MS = 3_000;
+
+function shutdownTimeoutMs(): number {
+  return (
+    (Math.max(
+      config.shutdown.drainSeconds,
+      config.kb.taskWorkerShutdownTimeoutSeconds,
+    ) +
+      config.shutdown.cleanupSeconds) *
+    1000
+  );
+}
+
 import {
   UserConfigFieldDefaultSchema,
   UserConfigFieldSchema,
 } from "./types/mcp-catalog";
 
+export type { FastifyInstanceWithZod } from "./fastify-instance";
+export { createFastifyInstance } from "./fastify-instance";
+export {
+  addMetricsAuthenticationHook,
+  registerMetricsPlugin,
+  registerStandaloneMetricsEndpoint,
+} from "./metrics-registration";
+
 /** Max time to wait for cleanup operations during graceful shutdown before exiting */
 const SHUTDOWN_CLEANUP_TIMEOUT_MS = 3000;
+const ACTIVE_CHAT_RUN_REAPER_INTERVAL_MS = 60 * 1000;
 
-// Load enterprise routes if license is activated OR if running in codegen mode
-// (codegen mode ensures OpenAPI spec always includes all enterprise routes)
-const eeRoutes =
-  config.enterpriseFeatures.core || config.codegenMode
-    ? // biome-ignore lint/style/noRestrictedImports: conditional schema
-      await import("./routes/index.ee")
-    : ({} as Record<string, never>);
+import { assertPortsBound } from "@/models/ports";
+// Enterprise routes are always loaded. Access is gated at request time by the
+// EnterpriseTierService, which auto-enables enterprise features for teams below
+// the small-team threshold even when no enterprise license env var is set.
+// biome-ignore lint/style/noRestrictedImports: dual-licensed at request time
+import * as eeRoutes from "./routes/index.ee";
+
+// The composition module, imported first, bound the ports of the layers
+// below; stop here if one is unbound.
+assertPortsBound();
 
 const {
   api: {
@@ -137,7 +267,7 @@ export function registerOpenApiSchemas() {
   z.globalRegistry.add(Anthropic.API.MessagesRequestSchema, {
     id: "AnthropicMessagesRequest",
   });
-  z.globalRegistry.add(Anthropic.API.MessagesResponseSchema, {
+  z.globalRegistry.add(Anthropic.API.MessagesResponseWireSchema, {
     id: "AnthropicMessagesResponse",
   });
   z.globalRegistry.add(Cerebras.API.ChatCompletionRequestSchema, {
@@ -176,6 +306,12 @@ export function registerOpenApiSchemas() {
   z.globalRegistry.add(Openrouter.API.ChatCompletionResponseSchema, {
     id: "OpenrouterChatCompletionResponse",
   });
+  z.globalRegistry.add(Jev.API.DecisionsRequestSchema, {
+    id: "JevDecisionsRequest",
+  });
+  z.globalRegistry.add(Jev.API.DecisionsResponseSchema, {
+    id: "JevDecisionsResponse",
+  });
   z.globalRegistry.add(Vllm.API.ChatCompletionRequestSchema, {
     id: "VllmChatCompletionRequest",
   });
@@ -188,6 +324,12 @@ export function registerOpenApiSchemas() {
   z.globalRegistry.add(Ollama.API.ChatCompletionResponseSchema, {
     id: "OllamaChatCompletionResponse",
   });
+  z.globalRegistry.add(OllamaNative.API.ChatRequestSchema, {
+    id: "OllamaNativeChatRequest",
+  });
+  z.globalRegistry.add(OllamaNative.API.ChatResponseSchema, {
+    id: "OllamaNativeChatResponse",
+  });
   z.globalRegistry.add(Zhipuai.API.ChatCompletionRequestSchema, {
     id: "ZhipuaiChatCompletionRequest",
   });
@@ -199,6 +341,14 @@ export function registerOpenApiSchemas() {
   });
   z.globalRegistry.add(DeepSeek.API.ChatCompletionResponseSchema, {
     id: "DeepSeekChatCompletionResponse",
+  });
+  z.globalRegistry.add(Archestra.API.ChatCompletionRequestSchema, {
+    // white-label-ok: wire identifier, not copy
+    id: "ArchestraChatCompletionRequest",
+  });
+  z.globalRegistry.add(Archestra.API.ChatCompletionResponseSchema, {
+    // white-label-ok: wire identifier, not copy
+    id: "ArchestraChatCompletionResponse",
   });
   z.globalRegistry.add(Minimax.API.ChatCompletionRequestSchema, {
     id: "MinimaxChatCompletionRequest",
@@ -225,13 +375,16 @@ export function registerOpenApiSchemas() {
     id: "EmbeddingDimensions",
     enum: [...SUPPORTED_EMBEDDING_DIMENSIONS],
   });
+  // Referenced from every interaction response variant (one per provider) and
+  // from the session summary. Registered so the spec emits a single component
+  // instead of inlining the same object at ~60 sites.
+  z.globalRegistry.add(InteractionVirtualKeySchema, {
+    id: "InteractionVirtualKey",
+  });
 }
 
 // Register schemas at module load time
 registerOpenApiSchemas();
-
-/** Type for the Fastify instance with Zod type provider */
-export type FastifyInstanceWithZod = ReturnType<typeof createFastifyInstance>;
 
 /**
  * Register the OpenAPI/Swagger plugin on a Fastify instance.
@@ -260,6 +413,10 @@ export async function registerSwaggerPlugin(fastify: FastifyInstanceWithZod) {
  * @param fastify - The Fastify instance to register routes on
  */
 export async function registerApiRoutes(fastify: FastifyInstanceWithZod) {
+  fastify.addHook("onRequest", async (request) => {
+    captureClientRuntimeEvidence(request);
+  });
+  await initializeLlmProxyPlugins();
   for (const route of Object.values(routes)) {
     fastify.register(route);
   }
@@ -269,13 +426,16 @@ export async function registerApiRoutes(fastify: FastifyInstanceWithZod) {
 }
 
 /**
- * Register only the routes needed by the worker for A2A / scheduled task execution.
+ * Register only the routes needed by the worker for A2A / scheduled task execution:
+ * the LLM proxy, the MCP gateway, and the APPA runtime's loopback endpoints.
  * These routes are called via localhost by executeA2AMessage and are not exposed
  * externally — the K8s Service only targets platform pods, not worker pods.
  */
 export async function registerWorkerRoutes(fastify: FastifyInstanceWithZod) {
+  await initializeLlmProxyPlugins();
   // LLM Proxy routes (all providers)
   fastify.register(routes.anthropicProxyRoutes);
+  fastify.register(routes.archestraProxyRoutes);
   fastify.register(routes.openAiProxyRoutes);
   fastify.register(routes.geminiProxyRoutes);
   fastify.register(routes.azureProxyRoutes);
@@ -284,11 +444,17 @@ export async function registerWorkerRoutes(fastify: FastifyInstanceWithZod) {
   fastify.register(routes.cerebrasProxyRoutes);
   fastify.register(routes.cohereProxyRoutes);
   fastify.register(routes.deepseekProxyRoutes);
+  fastify.register(routes.githubCopilotProxyRoutes);
   fastify.register(routes.groqProxyRoutes);
+  fastify.register(routes.jevProxyRoutes);
+  fastify.register(routes.kimiProxyRoutes);
+  fastify.register(routes.kimiCodeProxyRoutes);
+  fastify.register(routes.microsoft365CopilotProxyRoutes);
   fastify.register(routes.minimaxProxyRoutes);
   fastify.register(routes.modelRouterProxyRoutes);
   fastify.register(routes.mistralProxyRoutes);
   fastify.register(routes.ollamaProxyRoutes);
+  fastify.register(routes.ollamaNativeProxyRoutes);
   fastify.register(routes.openrouterProxyRoutes);
   fastify.register(routes.perplexityProxyRoutes);
   fastify.register(routes.vllmProxyRoutes);
@@ -296,198 +462,11 @@ export async function registerWorkerRoutes(fastify: FastifyInstanceWithZod) {
   fastify.register(routes.zhipuaiProxyRoutes);
   // MCP Gateway (tool listing + tool calls via JSON-RPC)
   fastify.register(routes.mcpGatewayRoutes);
+  // Loopback endpoints the in-process APPA runtime posts to
+  fastify.register(guardrailsNoopAnnotatorRoutes);
+  fastify.register(routes.openappaArchestraAnnotatorRoutes);
+  fastify.register(routes.openappaHelpersRoutes);
 }
-
-/**
- * Sets up logging and zod type provider + request validation & response serialization
- */
-export const createFastifyInstance = () =>
-  Fastify({
-    loggerInstance: logger,
-    disableRequestLogging: true,
-    trustProxy: config.api.trustProxy,
-    bodyLimit: config.api.bodyLimit,
-  })
-    .withTypeProvider<ZodTypeProvider>()
-    .setValidatorCompiler(validatorCompiler)
-    .setSerializerCompiler(serializerCompiler)
-    // https://fastify.dev/docs/latest/Reference/Server/#seterrorhandler
-    .setErrorHandler<ApiError | Error>(function (error, _request, reply) {
-      // Handle response serialization errors (when response doesn't match schema)
-      if (isResponseSerializationError(error)) {
-        const issues = error.cause?.issues ?? [];
-        const validationErrors = issues.map((issue) => ({
-          path: issue.path?.join("."),
-          code: issue.code,
-          message: issue.message,
-        }));
-
-        this.log.error(
-          {
-            statusCode: 500,
-            method: error.method,
-            url: error.url,
-            validationErrors,
-          },
-          `Response serialization error on ${error.method} ${error.url}: ${JSON.stringify(validationErrors)}`,
-        );
-
-        // Explicitly capture in Sentry with full validation details
-        Sentry.captureException(error, {
-          extra: {
-            method: error.method,
-            url: error.url,
-            validationErrors,
-          },
-          tags: {
-            error_type: "response_serialization",
-          },
-        });
-
-        return reply.status(500).send({
-          error: {
-            message: "Response doesn't match the schema",
-            type: "api_internal_server_error",
-          },
-        });
-      }
-
-      // Handle Zod validation errors (from fastify-type-provider-zod)
-      if (hasZodFastifySchemaValidationErrors(error)) {
-        const message = error.message || "Validation error";
-        this.log.info(
-          { error: message, statusCode: 400 },
-          "HTTP 400 validation error occurred",
-        );
-
-        return reply.status(400).send({
-          error: {
-            message,
-            type: "api_validation_error",
-          },
-        });
-      }
-
-      // Handle ApiError objects
-      if (error instanceof ApiError) {
-        const { statusCode, message, type, internalCode } = error;
-
-        if (statusCode >= 500) {
-          this.log.error(
-            { error: message, statusCode },
-            "HTTP 50x request error occurred",
-          );
-        } else if (statusCode >= 400) {
-          this.log.info(
-            { error: message, statusCode },
-            "HTTP 40x request error occurred",
-          );
-        } else {
-          this.log.error(
-            { error: message, statusCode },
-            "HTTP request error occurred",
-          );
-        }
-
-        return reply.status(statusCode).send({
-          error: {
-            message,
-            type,
-            ...(internalCode && { internal_code: internalCode }),
-          },
-        });
-      }
-
-      // Handle standard Error objects
-      const message = error.message || "Internal server error";
-      const statusCode = 500;
-
-      this.log.error(
-        { error: message, statusCode },
-        "HTTP 50x request error occurred",
-      );
-
-      return reply.status(statusCode).send({
-        error: {
-          message,
-          type: "api_internal_server_error",
-        },
-      });
-    });
-
-/**
- * Helper function to register the metrics plugin on a fastify instance.
- *
- * Basically we need to ensure that we are only registering "default" and "route" metrics ONCE
- * If we instantiate a fastify instance and start duplicating the collection of metrics, we will
- * get a fatal error as such:
- *
- * Error: A metric with the name http_request_duration_seconds has already been registered.
- * at Registry.registerMetric (/app/node_modules/.pnpm/prom-client@15.1.3/node_modules/prom-client/lib/registry.js:103:10)
- */
-export const registerMetricsPlugin = async (
-  fastify: ReturnType<typeof createFastifyInstance>,
-  endpointEnabled: boolean,
-): Promise<void> => {
-  const metricsEnabled = !endpointEnabled;
-
-  await fastify.register(metricsPlugin, {
-    endpoint: endpointEnabled ? observability.metrics.endpoint : null,
-    defaultMetrics: { enabled: metricsEnabled },
-    routeMetrics: {
-      enabled: metricsEnabled,
-      methodBlacklist: ["OPTIONS", "HEAD"],
-      routeBlacklist: [HEALTH_PATH, READY_PATH],
-    },
-  });
-};
-
-export const addMetricsAuthenticationHook = (
-  fastify: FastifyInstanceWithZod,
-): void => {
-  const { secret: metricsSecret } = observability.metrics;
-
-  if (!metricsSecret) {
-    return;
-  }
-
-  const metricsPath = observability.metrics.endpoint;
-
-  fastify.addHook("preHandler", async (request, reply) => {
-    if (
-      request.url !== metricsPath &&
-      !request.url.startsWith(`${metricsPath}?`)
-    ) {
-      return;
-    }
-
-    const authHeader = request.headers.authorization;
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      reply.code(401).send({ error: "Unauthorized: Bearer token required" });
-      return;
-    }
-
-    const token = authHeader.slice(7);
-    if (token !== metricsSecret) {
-      reply.code(401).send({ error: "Unauthorized: Invalid token" });
-      return;
-    }
-  });
-};
-
-export const registerStandaloneMetricsEndpoint = async (params: {
-  fastify: FastifyInstanceWithZod;
-  enableDefaultMetrics: boolean;
-}): Promise<void> => {
-  const { fastify, enableDefaultMetrics } = params;
-  addMetricsAuthenticationHook(fastify);
-
-  await fastify.register(metricsPlugin, {
-    endpoint: observability.metrics.endpoint,
-    defaultMetrics: { enabled: enableDefaultMetrics },
-    routeMetrics: { enabled: false },
-  });
-};
 
 /**
  * Create separate Fastify instance for metrics on a separate port
@@ -525,47 +504,44 @@ const startMetricsServer = async () => {
   );
 };
 
-// ============ MCP Sandbox Server ============
+// ============ Public-endpoints listener ============
 
 /**
- * Allowlist-validate CSP domain entries.
- * Only permits valid hostnames and wildcard-subdomain patterns (e.g. *.example.com).
- * Blocks dangerous CSP sources like *, data:, blob:, https: that a denylist would miss.
+ * Optional dedicated Fastify listener (ARCHESTRA_PUBLIC_ENDPOINTS_PORT) that
+ * aliases the publicly-exposable endpoints on their own port. Currently that
+ * is the MS Teams incoming webhook; other endpoints that must be reachable
+ * from the Internet may join it later.
+ *
+ * It registers the exact same route handler as the main server, and the main
+ * API port keeps serving the endpoint in every configuration. The dedicated
+ * port exists so a firewall can expose only the endpoints that must be
+ * publicly reachable without exposing the whole API.
+ *
+ * As on the main port, the webhook authenticates in-route (Bot Framework JWT
+ * validation), so the auth plugin is not registered here.
  */
-// Matches bare domains (esm.sh), wildcard subdomains (*.esm.sh),
-// scheme-prefixed domains (https://esm.sh, wss://esm.sh), and optional port (:8443).
-const VALID_CSP_DOMAIN =
-  /^(wss?:\/\/|https?:\/\/)?(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+(:\d{1,5})?$/;
+let publicEndpointsServerInstance: FastifyInstanceWithZod | null = null;
 
-export function sanitizeCspDomains(domains?: string[]): string[] {
-  if (!domains) return [];
-  return domains.filter(
-    (d) => typeof d === "string" && VALID_CSP_DOMAIN.test(d),
+const startPublicEndpointsServer = async () => {
+  const { publicEndpointsPort } = config.api;
+  if (!publicEndpointsPort) {
+    return;
+  }
+
+  const server = createFastifyInstance();
+  publicEndpointsServerInstance = server;
+
+  server.get(HEALTH_PATH, () => ({ status: "ok" }));
+
+  await server.register(msTeamsWebhookRoutes);
+
+  await server.listen({ port: publicEndpointsPort, host });
+  server.log.info(
+    `Public-endpoints listener started on port ${publicEndpointsPort} (aliasing the main API port's MS Teams webhook endpoint)`,
   );
-}
+};
 
-export function buildCspHeader(csp?: McpUiResourceCsp): string {
-  const resourceDomains = sanitizeCspDomains(csp?.resourceDomains).join(" ");
-  const connectDomains = sanitizeCspDomains(csp?.connectDomains).join(" ");
-  const frameDomains = sanitizeCspDomains(csp?.frameDomains).join(" ") || null;
-  const baseUriDomains =
-    sanitizeCspDomains(csp?.baseUriDomains).join(" ") || null;
-
-  const directives = [
-    "default-src 'none'",
-    `script-src 'self' 'unsafe-inline' blob: data: ${resourceDomains}`.trim(),
-    `style-src 'self' 'unsafe-inline' blob: data: ${resourceDomains}`.trim(),
-    `img-src 'self' data: blob: ${resourceDomains}`.trim(),
-    `font-src 'self' data: blob: ${resourceDomains}`.trim(),
-    `connect-src 'self' ${connectDomains}`.trim(),
-    `worker-src 'self' blob: ${resourceDomains}`.trim(),
-    frameDomains ? `frame-src ${frameDomains}` : "frame-src 'none'",
-    "object-src 'none'",
-    baseUriDomains ? `base-uri ${baseUriDomains}` : "base-uri 'none'",
-  ];
-
-  return directives.join("; ");
-}
+// ============ MCP Sandbox Server ============
 
 /**
  * Read and prepare the sandbox proxy HTML at startup.
@@ -594,6 +570,100 @@ const loadSandboxHtml = (): string | null => {
 const sandboxHtml = loadSandboxHtml();
 
 /**
+ * Load the ext-apps guest SDK bundle (the `App` client + its deps) so it can be
+ * served same-deployment under /_sandbox/. The Archestra Apps SDK imports it to
+ * connect to the host — apps never touch it directly. Resolved from
+ * node_modules at startup so it tracks the installed ext-apps version. Returns
+ * null (non-fatal) if it can't be read.
+ */
+const loadExtAppsSdk = (): string | null => {
+  try {
+    const sdkPath = createRequire(import.meta.url).resolve(
+      "@modelcontextprotocol/ext-apps/app-with-deps",
+    );
+    return readFileSync(sdkPath, "utf-8");
+  } catch (err) {
+    logger.warn(
+      { err },
+      "ext-apps guest SDK bundle not found — /_sandbox/ext-apps-app.js will not be registered",
+    );
+    return null;
+  }
+};
+
+const extAppsSdk = loadExtAppsSdk();
+
+/**
+ * Load the Archestra Apps SDK (the `window.archestra` microframework injected
+ * into owned apps — see services/apps/app-sdk-injection.ts) so it can be
+ * served same-deployment under /_sandbox/. Returns null (non-fatal) if it
+ * can't be read.
+ */
+const loadArchestraAppSdk = (): string | null => {
+  // co-located with the sandbox proxy HTML in the backend static dir
+  const staticDir = path.dirname(config.mcpSandbox.filePath);
+  const sdkPath = path.join(staticDir, "archestra-app-sdk.js");
+  try {
+    return readFileSync(sdkPath, "utf-8");
+  } catch (err) {
+    logger.warn(
+      { err, sdkPath },
+      "Archestra Apps SDK not found — /_sandbox/archestra-app-sdk.js will not be registered",
+    );
+    return null;
+  }
+};
+
+const archestraAppSdk = loadArchestraAppSdk();
+
+/**
+ * Load the platform baseline stylesheet injected into every owned app at serve
+ * time (see services/apps/app-sdk-injection.ts) so it can be served
+ * same-deployment under /_sandbox/. Returns null (non-fatal) if unreadable.
+ */
+const loadArchestraAppBaseCss = (): string | null => {
+  const cssPath = path.join(
+    path.dirname(config.mcpSandbox.filePath),
+    "archestra-app-base.css",
+  );
+  try {
+    return readFileSync(cssPath, "utf-8");
+  } catch (err) {
+    logger.warn(
+      { err, cssPath },
+      "Archestra app base stylesheet not found — /_sandbox/archestra-app-base.css will not be registered",
+    );
+    return null;
+  }
+};
+
+const archestraAppBaseCss = loadArchestraAppBaseCss();
+
+/**
+ * Build the `frame-ancestors` source list for the sandbox proxy response.
+ *
+ * Only origins the operator actually declared may restrict this policy —
+ * `ARCHESTRA_FRONTEND_URL` and friends (via `mcpSandbox.allowedOrigins`) and a
+ * configured `ARCHESTRA_MCP_SANDBOX_DOMAIN`. A deployment that declares none of
+ * them is an open one: the sandbox must stay embeddable wherever the platform is
+ * reached, so the policy stays `*`.
+ *
+ * @public — exercised by server.test.ts (knip --production ignores tests)
+ */
+export function buildSandboxFrameAncestors(params: {
+  allowedOrigins: readonly string[];
+  sandboxDomain: string | null | undefined;
+}): string {
+  const declared = [...params.allowedOrigins];
+  if (params.sandboxDomain) {
+    declared.push(`*.${params.sandboxDomain}`);
+  }
+  if (declared.length === 0) return "*";
+
+  return [...new Set(declared)].join(" ");
+}
+
+/**
  * Register the sandbox proxy route on the main Fastify instance.
  *
  * Serves the sandbox proxy HTML under /_sandbox/ with frame-ancestors header.
@@ -613,6 +683,24 @@ const registerSandboxRoute = (
     );
   }
 
+  // frame-ancestors restricts which origins can embed this sandbox iframe.
+  // This is the only CSP directive set via HTTP header — it cannot be set via meta tag.
+  // Guest content CSP is handled by the proxy HTML (meta tag injection from
+  // sandbox-resource-ready message). Purely config-derived, so resolve it once.
+  const frameAncestors = buildSandboxFrameAncestors({
+    allowedOrigins: config.mcpSandbox.allowedOrigins,
+    sandboxDomain: config.mcpSandbox.domain,
+  });
+  if (frameAncestors !== "*") {
+    // Reaching the platform on any other origin makes the browser refuse the
+    // sandbox iframe outright, and an app then renders as an empty box with no
+    // JS-visible error. Say so at startup so that is a one-line diagnosis.
+    logger.info(
+      { frameAncestors },
+      "MCP App sandbox may only be embedded by these origins (from ARCHESTRA_FRONTEND_URL / ARCHESTRA_AUTH_ADDITIONAL_TRUSTED_ORIGINS / ARCHESTRA_MCP_SANDBOX_DOMAIN)",
+    );
+  }
+
   fastify.get("/_sandbox/mcp-sandbox-proxy.html", async (request, reply) => {
     // When a sandbox domain is configured, validate the Host header matches
     // *.{domain} to prevent the sandbox route from being abused on the main origin.
@@ -623,15 +711,6 @@ const registerSandboxRoute = (
       }
     }
 
-    // frame-ancestors restricts which origins can embed this sandbox iframe.
-    // This is the only CSP directive set via HTTP header — it cannot be set via meta tag.
-    // Guest content CSP is handled by the proxy HTML (meta tag injection from sandbox-resource-ready message).
-    const frameAncestorsList = [...config.mcpSandbox.allowedOrigins];
-    if (config.mcpSandbox.domain) {
-      frameAncestorsList.push(`*.${config.mcpSandbox.domain}`);
-    }
-    const frameAncestors =
-      frameAncestorsList.length > 0 ? frameAncestorsList.join(" ") : "*";
     void reply.header(
       "Content-Security-Policy",
       `frame-ancestors ${frameAncestors}`,
@@ -645,17 +724,82 @@ const registerSandboxRoute = (
     void reply.type("text/html");
     return reply.send(sandboxHtml);
   });
+
+  // The ext-apps guest SDK, served same-deployment so app templates can import
+  // it (see loadExtAppsSdk). Module imports from an opaque-origin guest are
+  // cross-origin, so allow any origin — the bundle is a public, immutable asset.
+  if (extAppsSdk) {
+    fastify.get("/_sandbox/ext-apps-app.js", async (_request, reply) => {
+      void reply.header("Access-Control-Allow-Origin", "*");
+      // The URL is not content-hashed and the bundle tracks the installed
+      // ext-apps version, so cache briefly (not immutable) — an upgrade must
+      // reach clients without waiting out a year-long cache.
+      void reply.header("Cache-Control", "public, max-age=3600");
+      void reply.type("text/javascript");
+      return reply.send(extAppsSdk);
+    });
+  }
+
+  // The Archestra Apps SDK (window.archestra), loaded by the <script src>
+  // injected into every owned app at serve time. Cached only briefly: the
+  // session-recording half of this file evolves with the player it talks to,
+  // and a browser replaying yesterday's cached SDK against today's player
+  // drops replay messages on the floor in ways that read as a broken
+  // recording. Sixty seconds bounds that skew to the minute after a deploy
+  // while sparing every ordinary app load a re-fetch. Deliberately no
+  // stale-while-revalidate — it would serve the hour-stale copy exactly
+  // once, on the load where the skew bites.
+  if (archestraAppSdk) {
+    fastify.get(APP_SDK_PATH, async (_request, reply) => {
+      void reply.header("Access-Control-Allow-Origin", "*");
+      void reply.header("Cache-Control", "public, max-age=60");
+      void reply.type("text/javascript");
+      return reply.send(archestraAppSdk);
+    });
+  }
+
+  // The platform baseline stylesheet, loaded by the <link> injected into every
+  // owned app at serve time. Same delivery posture as the SDK above.
+  if (archestraAppBaseCss) {
+    fastify.get(APP_BASE_CSS_PATH, async (_request, reply) => {
+      void reply.header("Access-Control-Allow-Origin", "*");
+      void reply.header("Cache-Control", "public, max-age=3600");
+      void reply.type("text/css");
+      return reply.send(archestraAppBaseCss);
+    });
+  }
 };
 
 const startMcpServerRuntime = async (
   fastify: ReturnType<typeof createFastifyInstance>,
 ) => {
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  // Demand can be served while K8s initialization is still running or after it
+  // fails. Start protection first so long calls keep heartbeating either way.
+  mcpActiveUseTracker.start();
+  // SPDX-SnippetEnd
   // Initialize MCP Server Runtime (K8s-based)
   if (McpServerRuntimeManager.isEnabled) {
     try {
       // Set up callbacks for runtime initialization
       McpServerRuntimeManager.onRuntimeStartupSuccess = () => {
         fastify.log.info("MCP Server Runtime initialized successfully");
+        void initializeManagedPlaywrightRuntime().catch((error) =>
+          fastify.log.error(
+            { err: error },
+            "Failed to finalize managed Playwright runtime initialization",
+          ),
+        );
+        void sreAgentService
+          .finalize()
+          .catch((error) =>
+            fastify.log.error(
+              { err: error },
+              "Failed to finalize the SRE agent",
+            ),
+          );
       };
 
       McpServerRuntimeManager.onRuntimeStartupError = (error: Error) => {
@@ -682,23 +826,37 @@ const startMcpServerRuntime = async (
     fastify.log.info(
       "MCP Server Runtime is disabled as there is no K8s config available. Local MCP servers will not be available.",
     );
+    void PlaywrightRuntimeModel.retireLegacyInstallations().catch((error) =>
+      fastify.log.error(
+        { err: error },
+        "Failed to retire legacy Playwright installations",
+      ),
+    );
   }
 };
 
 const startWebServer = async () => {
   const fastify = createFastifyInstance();
+  const startupHealth = createStartupHealthServer();
 
   /**
    * Custom request logging hook that excludes noisy endpoints:
    * - /health: Kubernetes liveness probe
    * - /ready: Kubernetes readiness probe (checks database connectivity)
    * - GET /v1/mcp/*: MCP Gateway SSE polling (happens every second)
+   * - /skills/m/*: public marketplace git endpoint — URL contains raw share token
    */
   const shouldSkipRequestLogging = (url: string, method: string): boolean => {
     if (url === HEALTH_PATH || url === READY_PATH) return true;
     // Skip MCP Gateway SSE polling (GET requests to /v1/mcp/*)
     if (method === "GET" && url.startsWith(`${MCP_GATEWAY_PREFIX}/`))
       return true;
+    // token is embedded in the URL path; never log it
+    if (url.startsWith(`${SKILL_MARKETPLACE_PREFIX}/`)) return true;
+    // one-time setup token is embedded in the URL path; never log it
+    if (url.startsWith(`${CONNECTION_SETUP_SCRIPT_PREFIX}/`)) return true;
+    // Teams sign-in key and OAuth code are in the query string; never log them
+    if (url.startsWith(MS_TEAMS_SIGN_IN_PATH)) return true;
     return false;
   };
 
@@ -735,6 +893,14 @@ const startWebServer = async () => {
     Sentry.setupFastifyErrorHandler(fastify);
   }
 
+  if (config.maintenanceMode) {
+    await registerMaintenanceModeRoutes(fastify);
+    await fastify.listen({ port, host });
+    fastify.log.info(`${name} started in maintenance mode on port ${port}`);
+    registerWebServerShutdown(fastify);
+    return;
+  }
+
   /**
    * The auth plugin is responsible for authentication and authorization checks
    *
@@ -750,11 +916,57 @@ const startWebServer = async () => {
    */
   fastify.register(enterpriseLicenseMiddleware);
 
+  // Extend the audit registry and audit decisions with EE entries
+  // (identity providers) if applicable, then register the audit hooks.
+  // Done before routes so the hooks are active for all subsequent requests.
+  await initAuditRegistry();
+  await initAuditDecisions();
+  registerAuditLogHook(fastify);
+
   try {
+    // Large upgrades may outlast Kubernetes' startup probe budget. Serve only
+    // liveness until the real API is ready; /ready and every API return 503.
+    await startupHealth.listen({ port, host });
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Fails startup when retention windows are configured without a license —
+    // an operator relying on retention for compliance must never run with it
+    // silently disabled.
+    assertRetentionConfigLicensed();
+    // SPDX-SnippetEnd
+
     // Initialize database connection first
     await initializeDatabase();
 
+    // Start the cache manager before seeding: seeding invalidates cached
+    // entries, and against an unstarted manager those deletes are skipped.
+    cacheManager.start();
+
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Fail-closed content-key verification, before any write could encrypt
+    // (or silently plaintext) interaction/message content.
+    await verifyContentEncryptionKey();
+    verifyEncryptedChatConfig();
+    // SPDX-SnippetEnd
+
     await seedRequiredStartingData();
+
+    // Carry the legacy OpenAPPA battery installs into the policy text, before
+    // the runtime opens and before the periodic recompile is registered below:
+    // a recompose rewrites those rows from the text and deletes every row the
+    // text does not declare.
+    await declareOpenappaInstalls();
+    void recompileAllOnStart();
+    void startOpenappaRuntime();
+
+    // With basic auth disabled, a password session that predates the flag
+    // would otherwise stay valid until it expired. Runs after seeding so the
+    // bootstrap admin exists first (and is itself swept when it has no
+    // federated account, which is the intent).
+    await revokeBasicAuthOnlySessions();
 
     // Sync system API keys for keyless providers (Vertex AI, vLLM, Ollama, Bedrock)
     const defaultOrg = await OrganizationModel.getFirst();
@@ -767,8 +979,16 @@ const startWebServer = async () => {
       });
     }
 
-    // Start cache manager's background cleanup interval
-    cacheManager.start();
+    // Start the enterprise tier service so it has a fresh user count
+    // before the first request hits a license-gated route.
+    await enterpriseTier.start();
+
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Complete the one-time permission upgrade before admitting API traffic.
+    await ensureScopedResourcePermissionCutover();
+    // SPDX-SnippetEnd
 
     // Initialize metrics with keys of custom agent labels
     // Set OpenMetrics content type to enable exemplar support on histograms
@@ -783,15 +1003,47 @@ const startWebServer = async () => {
     // Start metrics server
     await startMetricsServer();
 
+    // Poll the org-wide active-user count for the `llm_active_users` gauge.
+    // Only the API process collects it: the value is derived from the shared
+    // database, so extra replicas would repeat the same query for the same
+    // answer.
+    activeUsersMetricCollector.start();
+
     // Register sandbox proxy route on the main server (single-port setup).
     // Iframe isolation comes from the sandbox attribute (no allow-same-origin → opaque origin).
     registerSandboxRoute(fastify);
 
-    logger.info(
+    logger.debug(
       `Observability initialized with ${labelKeys.length} agent label keys`,
     );
 
+    instanceAnalyticsService.start().catch((error) => {
+      logger.debug({ err: error }, "Failed to track instance analytics");
+    });
+
+    rumExporter.initialize();
+
     startMcpServerRuntime(fastify);
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Wire pooled-connection invalidation to hibernation events. Done here —
+    // not at mcp-client module scope — because the manager module sits in an
+    // import cycle with mcp-client.
+    registerMcpClientHibernationInvalidation();
+    // SPDX-SnippetEnd
+
+    // Start the sandboxed code runtime in the background (non-blocking pre-warm).
+    skillSandboxRuntimeService.init().catch((error) => {
+      logger.error(
+        { err: error },
+        "Failed to initialize skill sandbox runtime",
+      );
+    });
+
+    // Eagerly provision a Dagger engine + egress policy for every environment and
+    // every organization's default, so no agent routes to a non-existent pod.
+    void daggerEnvironmentRuntimeManager.reconcileAll();
 
     // Initialize incoming email provider (if configured)
     // This handles auto-setup of webhook subscription if ARCHESTRA_AGENTS_INCOMING_EMAIL_OUTLOOK_WEBHOOK_URL is set
@@ -801,12 +1053,48 @@ const startWebServer = async () => {
     // Seeds DB from env vars on first run, then loads config from DB.
     await chatOpsManager.initialize();
 
+    // Bring up the ngrok tunnel (if ARCHESTRA_NGROK_AUTH_TOKEN is set) so the
+    // instance is reachable from the Internet for inbound chatops webhooks.
+    await ngrokTunnelManager.initialize();
+
+    // Opt-in periodic re-discovery of installed MCP servers' tools
+    // (no-op unless ARCHESTRA_MCP_SERVER_TOOLS_REFRESH_INTERVAL_MINUTES is set).
+    mcpToolsRefreshManager.start();
+
+    // Roll local MCP servers whose `:latest` (or untagged) image moved in the
+    // registry (ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_UPDATE_CHECK_INTERVAL_MINUTES,
+    // 0 disables).
+    mcpImageUpdateChecker.start();
+
+    // Post-TTL lifecycle for gateway-minted MCP tasks: mark expired orphans
+    // failed, purge rows past the retention grace (the two steps the Tasks
+    // extension sanctions).
+    mcpGatewayTaskReaper.start();
+
     // Start task queue worker for knowledge base connector syncs and embeddings
     // In "web" mode, a separate worker Deployment handles background jobs
     if (shouldRunWorker) {
       registerTaskHandlers(taskQueueService);
       await taskQueueService.seedPeriodicTasks();
       taskQueueService.startWorker();
+      // Fire-and-forget index maintenance, all concurrent (non-write-blocking):
+      // drop the legacy interactions payload indexes on deployments upgrading
+      // from before migration 0116 stopped creating them, and build the
+      // agent_tools, mcp_server and interactions lookup indexes (the
+      // session-preview backfill and passthrough-key indexes). Idempotent;
+      // errors are logged inside and retried next boot.
+      void dropLegacyPayloadTrgmIndexes();
+      void createAgentToolsIndexes();
+      void createMcpServerIndexes();
+      // Fold pre-existing interactions into the session head table in
+      // bounded batches; the session list scans interactions until it is done.
+      void InteractionSessionHeadModel.backfill();
+      void createInteractionsIndexes();
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      void dropContentTrgmIndexesUnderEncryption();
+      // SPDX-SnippetEnd
     }
 
     // Background job to renew email subscriptions before they expire
@@ -829,6 +1117,30 @@ const startWebServer = async () => {
       });
     }, PROCESSED_EMAIL_CLEANUP_INTERVAL_MS);
 
+    // Safety net for chat runs orphaned 'running' by a hard kill that skipped
+    // graceful shutdown. Registered only on the web server (workers never create
+    // chat runs); every web replica runs it, which is safe because the underlying
+    // UPDATE is filtered on status='running' and is idempotent across pods.
+    const activeChatRunReaperIntervalId = setInterval(() => {
+      void activeChatRunService.reapStaleRuns();
+    }, ACTIVE_CHAT_RUN_REAPER_INTERVAL_MS);
+
+    // Same safety net for A2A task runs: the service owns its own interval
+    // (it also prunes terminal event logs), started here unconditionally so
+    // orphaned tasks get settled even on pods that never start a run.
+    a2aTaskRunService.startMaintenance();
+    // Agent Runtime is available once the cluster serves the Agent Sandbox
+    // API. The loops below start regardless and idle until it does, so
+    // installing the controller later needs no restart.
+    void agentSandboxApi.refresh();
+    agentRunReconciler.start();
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    agentImagePrefetcher.start();
+    // SPDX-SnippetEnd
+    agentWarmPoolManager.start();
+
     /**
      * Here we don't expose the metrics endpoint on the main API port, but we do collect metrics
      * inside of this server instance. Metrics are actually exposed on a different port
@@ -836,9 +1148,22 @@ const startWebServer = async () => {
      */
     await registerMetricsPlugin(fastify, false);
 
-    // Register CORS plugin to allow cross-origin requests
-    await fastify.register(fastifyCors, {
-      origin: corsOrigins,
+    // Register CORS plugin to allow cross-origin requests. The policy is
+    // resolved per request:
+    //   - the browser-facing OAuth `authorize` endpoint gets CORS disabled
+    //     (no Access-Control-Allow-Origin): it is only ever a top-level
+    //     navigation carrying the session cookie, so the browser blocks any
+    //     cross-origin fetch while navigation still works — and it needs no
+    //     configured-origin allow-list. See isOAuthAuthorizePath.
+    //   - the public OAuth authorization-server endpoints get a permissive,
+    //     credential-less policy (reflect any origin) so browser-based MCP
+    //     clients on arbitrary origins can complete the OAuth handshake.
+    //   - every other route keeps the restricted, credentialed policy bound to
+    //     the configured origins. See isPublicOAuthCorsPath for the rationale.
+    const restrictedCorsOptions = (
+      req: FastifyRequest,
+    ): FastifyCorsOptions => ({
+      origin: allowedOriginsFor(req),
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
       allowedHeaders: [
         "Content-Type",
@@ -849,12 +1174,31 @@ const startWebServer = async () => {
       exposedHeaders: ["Set-Cookie"],
       credentials: true,
     });
+    const publicOAuthCorsOptions: FastifyCorsOptions = {
+      origin: true,
+      methods: ["GET", "POST", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "Authorization"],
+      credentials: false,
+    };
+    // `origin: false` makes @fastify/cors emit no Access-Control-Allow-Origin,
+    // which disables CORS for the route: cross-origin fetches are blocked by the
+    // browser, while top-level navigation (how `authorize` is actually reached)
+    // is unaffected.
+    const authorizeDisabledCorsOptions: FastifyCorsOptions = {
+      origin: false,
+    };
+    await fastify.register(
+      fastifyCors,
+      createOAuthAwareCorsDelegate({
+        restricted: restrictedCorsOptions,
+        publicOAuth: publicOAuthCorsOptions,
+        authorizeDisabled: authorizeDisabledCorsOptions,
+      }),
+    );
 
-    logger.info(
+    logger.debug(
       {
-        corsOrigins: corsOrigins.map((o) =>
-          o instanceof RegExp ? o.toString() : o,
-        ),
+        corsOrigins,
         trustedOrigins: config.auth.trustedOrigins,
       },
       "CORS and trusted origins configured",
@@ -874,110 +1218,279 @@ const startWebServer = async () => {
     await registerSwaggerPlugin(fastify);
 
     // Register routes
-    fastify.get("/openapi.json", async () =>
-      enrichOpenApiWithRbac(fastify.swagger()),
+    fastify.get(
+      "/openapi.json",
+      createCachedOpenApiRouteHandler({
+        buildDocument: () => enrichOpenApiWithRbac(fastify.swagger()),
+        getCacheKey: () => JSON.stringify(archestraMcpBranding.identity),
+      }),
     );
 
     if (enableE2eTestEndpoints) {
       fastify.get("/test", async () => ({
         value: testValue,
+        mcpIdleHibernation: {
+          windowSeconds: config.orchestrator.mcpIdleHibernation.windowSeconds,
+          lastUsedRefreshIntervalMs:
+            config.orchestrator.mcpIdleHibernation.lastUsedRefreshIntervalMs,
+          demandHeartbeatIntervalMs:
+            config.orchestrator.mcpIdleHibernation.demandHeartbeatIntervalMs,
+          sweepIntervalMs:
+            Math.min(
+              config.orchestrator.mcpIdleHibernation.windowSeconds / 2,
+              60,
+            ) * 1000,
+        },
       }));
     }
 
     // Register all API routes (eeRoutes already loaded at module level)
     await registerApiRoutes(fastify);
 
+    await fastify.ready();
+    await startupHealth.close();
     await fastify.listen({ port, host });
     fastify.log.info(`${name} started on port ${port}`);
+    // Lets operators confirm an override without waiting for a reply to hit
+    // the limit.
+    logger.info(
+      { stdioMaxMessageBytes: config.mcpGateway.stdioMaxMessageBytes },
+      "Stdio MCP server replies larger than this are dropped (ARCHESTRA_MCP_GATEWAY_STDIO_MAX_MESSAGE_BYTES)",
+    );
+
+    // If the previous container instance died abnormally (e.g. OOMKilled),
+    // it could not report its own death — surface it now. Fire-and-forget.
+    void reportAbnormalPreviousTermination();
+
+    // Optional dedicated listener aliasing the MS Teams webhook on its own
+    // port (see startPublicEndpointsServer).
+    await startPublicEndpointsServer();
 
     // Start WebSocket server using the same HTTP server
     websocketService.start(fastify.server);
-    fastify.log.info("WebSocket service started");
+    fastify.log.debug("WebSocket service started");
 
-    // Graceful shutdown handling
-    const gracefulShutdown = async (signal: string) => {
-      fastify.log.info(`Received ${signal}, shutting down gracefully...`);
-
-      try {
-        // PRIORITY: Close servers FIRST to release ports immediately
-        // This prevents EADDRINUSE errors during hot-reload when the new server starts
-        // before cleanup operations complete
-
-        // Close metrics server (releases port 9050)
-        if (metricsServerInstance) {
-          await metricsServerInstance.close();
-          fastify.log.info("Metrics server closed");
-        }
-
-        // Close main server (releases port 9000)
-        await fastify.close();
-        fastify.log.info("Main server closed");
-
-        // Close WebSocket server
-        websocketService.stop();
-
-        // Clear email subscription renewal interval
-        clearInterval(emailRenewalIntervalId);
-        clearInterval(processedEmailCleanupIntervalId);
-        fastify.log.info("Email background job intervals cleared");
-
-        // Stop cache manager's background cleanup
-        cacheManager.shutdown();
-
-        // Stop task queue worker (waits for in-flight tasks to drain)
-        if (shouldRunWorker) {
-          await taskQueueService.stopWorker();
-        }
-
-        // Track which cleanup operations have completed
-        const completedCleanups = new Set<"emailProvider" | "chatOps">();
-
-        // Run remaining cleanup in parallel with a timeout to avoid blocking shutdown
-        const cleanupPromise = Promise.allSettled([
-          cleanupEmailProvider().then(() => {
-            completedCleanups.add("emailProvider");
-            fastify.log.info("Email provider cleanup completed");
-          }),
-          chatOpsManager.cleanup().then(() => {
-            completedCleanups.add("chatOps");
-            fastify.log.info("ChatOps provider cleanup completed");
-          }),
-        ]).then(() => "completed" as const);
-
-        // Wait for cleanup with timeout, then exit anyway
-        const allCleanupNames = ["emailProvider", "chatOps"] as const;
-        const result = await Promise.race([
-          cleanupPromise,
-          new Promise<"timeout">((resolve) =>
-            setTimeout(() => resolve("timeout"), SHUTDOWN_CLEANUP_TIMEOUT_MS),
-          ),
-        ]);
-
-        if (result === "timeout") {
-          const pendingCleanups = allCleanupNames.filter(
-            (name) => !completedCleanups.has(name),
-          );
-          fastify.log.warn(
-            { pendingCleanups },
-            "Cleanup timed out, proceeding with shutdown",
-          );
-        }
-
-        process.exit(0);
-      } catch (error) {
-        fastify.log.error({ error }, "Error during shutdown");
-        process.exit(1);
-      }
-    };
-
-    // Handle shutdown signals
-    process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-    process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+    registerWebServerShutdown(fastify, {
+      emailRenewalIntervalId,
+      processedEmailCleanupIntervalId,
+      activeChatRunReaperIntervalId,
+    });
+    // A cluster supervisor must wait for initialization, not the temporary
+    // startup-health listener that opens this same port before seeding.
+    if (isWorker) process.send?.({ type: "archestra.web.ready" });
   } catch (err) {
+    await startupHealth.close();
     fastify.log.error(err);
     process.exit(1);
   }
 };
+
+async function registerMaintenanceModeRoutes(
+  fastify: FastifyInstanceWithZod,
+): Promise<void> {
+  await fastify.register(
+    fastifyCors,
+    () =>
+      (
+        req: FastifyRequest,
+        callback: (err: Error | null, options: FastifyCorsOptions) => void,
+      ) => {
+        callback(null, {
+          origin: allowedOriginsFor(req),
+          methods: ["GET", "OPTIONS"],
+          allowedHeaders: [
+            "Content-Type",
+            "X-Requested-With",
+            "Cookie",
+            apiKeyAuthorizationHeaderName,
+          ],
+          exposedHeaders: ["Set-Cookie"],
+          credentials: true,
+        });
+      },
+  );
+  await fastify.register(routes.healthRoutes);
+  await fastify.register(publicConfigRoutes);
+}
+
+function allowedOriginsFor(req: FastifyRequest): string[] {
+  const forwardedHost = req.headers["x-forwarded-host"];
+  return resolveAllowedOrigins({
+    configuredOrigins: corsOrigins,
+    forwardedHost: Array.isArray(forwardedHost)
+      ? forwardedHost[0]
+      : forwardedHost,
+    host: req.headers.host,
+  });
+}
+
+function registerWebServerShutdown(
+  fastify: FastifyInstanceWithZod,
+  intervalIds: {
+    emailRenewalIntervalId?: NodeJS.Timeout;
+    processedEmailCleanupIntervalId?: NodeJS.Timeout;
+    activeChatRunReaperIntervalId?: NodeJS.Timeout;
+  } = {},
+): void {
+  let shuttingDown = false;
+  const gracefulShutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    fastify.log.info(`Received ${signal}, shutting down gracefully...`);
+    // Socket and polling events do not pass through Fastify's admission hook.
+    // Stop their intake synchronously before the loopback gateway starts draining.
+    const stoppedChatOps = chatOpsManager.beginShutdown();
+    beginLlmProxyDrain(fastify);
+    if (publicEndpointsServerInstance)
+      beginLlmProxyDrain(publicEndpointsServerInstance);
+    // Reserve cleanup time beyond HTTP draining and any worker task shutdown.
+    const shutdownDeadline = setTimeout(() => {
+      fastify.log.error("Graceful shutdown timed out");
+      process.exit(1);
+    }, shutdownTimeoutMs());
+    shutdownDeadline.unref();
+
+    // Stop accepting new runs before snapshotting, so nothing created after this
+    // point escapes the cleanup below.
+    const stoppedWorker = shouldRunWorker
+      ? taskQueueService.stopWorker()
+      : Promise.resolve();
+    activeChatRunService.beginShutdown();
+    agentRunReconciler.stop();
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    agentImagePrefetcher.stop();
+    // SPDX-SnippetEnd
+    agentWarmPoolManager.stop();
+
+    // Fail this pod's in-flight chat runs first: a long SSE stream keeps Fastify
+    // connections open, so waiting for fastify.close() risks SIGKILL before the
+    // runs are freed, leaving their conversations blocked until the reaper runs.
+    // This is a single fast UPDATE, bounded so a slow DB cannot stall shutdown.
+    await Promise.race([
+      Promise.all([
+        activeChatRunService.failInFlightRuns().catch((error) => {
+          fastify.log.error({ error }, "Failed to fail in-flight chat runs");
+        }),
+        // Same reasoning for A2A task runs: settle this pod's WORKING tasks
+        // to FAILED now, instead of leaving clients polling until the reaper.
+        a2aTaskRunService.failInFlightRuns().catch((error) => {
+          fastify.log.error(
+            { error },
+            "Failed to fail in-flight A2A task runs",
+          );
+        }),
+      ]),
+      new Promise<void>((resolve) =>
+        setTimeout(resolve, SHUTDOWN_CLEANUP_TIMEOUT_MS),
+      ),
+    ]);
+
+    try {
+      await Promise.all([
+        drainLlmProxyRequests(fastify),
+        publicEndpointsServerInstance
+          ? drainLlmProxyRequests(publicEndpointsServerInstance)
+          : Promise.resolve(),
+        stoppedWorker,
+        stoppedChatOps,
+      ]);
+      if (intervalIds.activeChatRunReaperIntervalId) {
+        clearInterval(intervalIds.activeChatRunReaperIntervalId);
+      }
+      if (metricsServerInstance) {
+        await metricsServerInstance.close();
+        fastify.log.info("Metrics server closed");
+      }
+
+      if (publicEndpointsServerInstance) {
+        await publicEndpointsServerInstance.close();
+        fastify.log.info("Public-endpoints listener closed");
+      }
+
+      await fastify.close();
+      fastify.log.info("Main server closed");
+      await drainBackgroundWork();
+
+      websocketService.stop();
+
+      if (intervalIds.emailRenewalIntervalId) {
+        clearInterval(intervalIds.emailRenewalIntervalId);
+      }
+      if (intervalIds.processedEmailCleanupIntervalId) {
+        clearInterval(intervalIds.processedEmailCleanupIntervalId);
+      }
+
+      // Stop accepting new skill-sandbox runs
+      await skillSandboxRuntimeService.shutdown();
+
+      mcpToolsRefreshManager.stop();
+
+      mcpImageUpdateChecker.stop();
+
+      mcpGatewayTaskReaper.stop();
+
+      instanceAnalyticsService.stop();
+
+      // Flush any buffered RUM events before the process exits.
+      await rumExporter.shutdown();
+
+      activeUsersMetricCollector.stop();
+
+      const completedCleanups = new Set<
+        "emailProvider" | "chatOps" | "ngrok"
+      >();
+      const cleanupPromise = Promise.allSettled([
+        cleanupEmailProvider().then(() => {
+          completedCleanups.add("emailProvider");
+          fastify.log.info("Email provider cleanup completed");
+        }),
+        chatOpsManager.cleanup().then(() => {
+          completedCleanups.add("chatOps");
+          fastify.log.info("ChatOps provider cleanup completed");
+        }),
+        ngrokTunnelManager.cleanup().then(() => {
+          completedCleanups.add("ngrok");
+          fastify.log.info("ngrok tunnel cleanup completed");
+        }),
+      ]).then(() => "completed" as const);
+
+      const allCleanupNames = ["emailProvider", "chatOps", "ngrok"] as const;
+      const result = await Promise.race([
+        cleanupPromise,
+        new Promise<"timeout">((resolve) =>
+          setTimeout(() => resolve("timeout"), SHUTDOWN_CLEANUP_TIMEOUT_MS),
+        ),
+      ]);
+
+      if (result === "timeout") {
+        const pendingCleanups = allCleanupNames.filter(
+          (cleanupName) => !completedCleanups.has(cleanupName),
+        );
+        fastify.log.warn(
+          { pendingCleanups },
+          "Cleanup timed out, proceeding with shutdown",
+        );
+      }
+
+      await drainBackgroundWork();
+      await mcpClient.disconnectAll();
+      await drainBackgroundWork();
+      cacheManager.shutdown();
+      await flushShutdownTelemetry();
+      clearTimeout(shutdownDeadline);
+      process.exit(0);
+    } catch (error) {
+      clearTimeout(shutdownDeadline);
+      fastify.log.error({ error }, "Error during shutdown");
+      process.exit(1);
+    }
+  };
+
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+}
 
 /**
  * Starts the process in worker-only mode.
@@ -988,13 +1501,30 @@ const startWorker = async () => {
   logger.info("Starting in worker-only mode (ARCHESTRA_PROCESS_TYPE=worker)");
 
   try {
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Same gate as `start` — the retention sweep runs on the worker.
+    assertRetentionConfigLicensed();
+    // SPDX-SnippetEnd
+
     await initializeDatabase();
+
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Workers write messages and interactions (scheduled runs, triggers), so
+    // the content-key guard must hold here too.
+    await verifyContentEncryptionKey();
+    verifyEncryptedChatConfig();
+    // SPDX-SnippetEnd
     cacheManager.start();
+    await enterpriseTier.start();
 
     // Sync Archestra MCP branding so the worker recognises branded tool names
-    // (e.g. "archestra_staging__artifact_write") when executing scheduled tasks.
+    // (e.g. "archestra_staging__todo_write") when executing scheduled tasks.
     // Without this, isToolName() only matches the default "archestra__" prefix
-    // and builtin tools fall through to mcpClient.executeToolCall() which fails
+    // and builtin tools fall through to mcpClient.executeToolCallForOwner() which fails
     // because they have credentialResolutionMode "static" with no mcpServerId.
     const organization = await OrganizationModel.getFirst();
     archestraMcpBranding.syncFromOrganization(organization);
@@ -1008,12 +1538,63 @@ const startWorker = async () => {
 
     const labelKeys = await initializeObservabilityMetrics({
       includeMcpMetrics: true,
-      includeAgentExecutionMetrics: false,
+      includeAgentRunMetrics: false,
     });
+
+    // The periodic recompile is one of the handlers registered below, and it
+    // deletes every install row the policy text does not declare: the worker
+    // carries the legacy rows into the text first, exactly as `start` does.
+    await declareOpenappaInstalls();
+    void recompileAllOnStart();
+    void startOpenappaRuntime();
 
     registerTaskHandlers(taskQueueService);
     await taskQueueService.seedPeriodicTasks();
     taskQueueService.startWorker();
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Worker task handlers call MCP servers through mcp-client too — wire its
+    // pooled-connection invalidation to hibernation events (see `start`).
+    registerMcpClientHibernationInvalidation();
+    // The idle sweeper runs on the web replicas, but it decides from a row
+    // THIS process's calls keep honest. Without the heartbeat, a worker-side
+    // call that outlives the idle window — an MCP Task makes that ordinary —
+    // ages out of its own protection: the worker's active counter is invisible
+    // cross-process, and the web sweeper hibernates the pod mid-call.
+    // Heartbeat only; a worker never sweeps. Keep this running across rolling
+    // configuration changes because web replicas with the previous flags can
+    // still be sweeping from the same database timestamp.
+    mcpActiveUseTracker.start();
+    // The mirror-image staleness: a web replica can hibernate a deployment this
+    // worker woke. Watchers therefore stay active across flag skew too;
+    // reconcile/sweep remain web-side.
+    McpServerRuntimeManager.startStateWatchersOnly();
+    // SPDX-SnippetEnd
+    // See the shouldRunWorker branch in `start` — same index maintenance,
+    // for the dedicated worker Deployment.
+    void dropLegacyPayloadTrgmIndexes();
+    void createAgentToolsIndexes();
+    void createMcpServerIndexes();
+    void InteractionSessionHeadModel.backfill();
+    void createInteractionsIndexes();
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    void dropContentTrgmIndexesUnderEncryption();
+    // SPDX-SnippetEnd
+
+    // Pre-warm the code runtime so scheduled agents avoid a cold first run.
+    skillSandboxRuntimeService.init().catch((error) => {
+      logger.error(
+        { err: error },
+        "Failed to initialize skill sandbox runtime",
+      );
+    });
+
+    // Eagerly provision per-environment and per-organization Dagger engines +
+    // egress policies.
+    void daggerEnvironmentRuntimeManager.reconcileAll();
 
     // Worker server for Kubernetes probes, Prometheus scraping,
     // and LLM Proxy / MCP Gateway routes for A2A and scheduled task execution.
@@ -1027,7 +1608,17 @@ const startWorker = async () => {
       if (!dbHealthy) {
         return reply.status(503).send({ status: "error", reason: "database" });
       }
-      return { status: "ok" };
+      const openappa = await openappaReadiness();
+      switch (openappa.state) {
+        case "disabled":
+        case "ready":
+          return { status: "ok" };
+        case "starting":
+        case "unavailable":
+          return reply
+            .status(503)
+            .send({ status: "error", reason: "openappa" });
+      }
     });
 
     // Auth plugin decorates request.user / request.organizationId which route
@@ -1049,23 +1640,33 @@ const startWorker = async () => {
       `Worker server started on port ${port} with ${labelKeys.length} agent label keys`,
     );
 
+    let shuttingDown = false;
     const gracefulShutdown = async (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
       logger.info(`Worker received ${signal}, shutting down...`);
-
-      // Force exit if cleanup takes too long (e.g., long-running task doesn't respect cancellation).
-      // Must exceed taskWorkerShutdownTimeoutSeconds so stopWorker() has time to drain
-      // in-flight tasks and release them back to the queue.
-      const forceExitTimeoutMs =
-        (config.kb.taskWorkerShutdownTimeoutSeconds + 5) * 1000;
+      beginLlmProxyDrain(healthServer);
       const forceExitTimeout = setTimeout(() => {
         logger.warn("Worker shutdown timed out, forcing exit");
         process.exit(1);
-      }, forceExitTimeoutMs);
+      }, shutdownTimeoutMs());
+      const stoppedWorker = taskQueueService.stopWorker();
 
       try {
+        await Promise.all([drainLlmProxyRequests(healthServer), stoppedWorker]);
         await healthServer.close();
+        await drainBackgroundWork();
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        mcpActiveUseTracker.stop();
+        // SPDX-SnippetEnd
+        await skillSandboxRuntimeService.shutdown();
+        await drainBackgroundWork();
+        await mcpClient.disconnectAll();
+        await drainBackgroundWork();
         cacheManager.shutdown();
-        await taskQueueService.stopWorker();
+        await flushShutdownTelemetry();
         clearTimeout(forceExitTimeout);
         process.exit(0);
       } catch (error) {
@@ -1083,14 +1684,34 @@ const startWorker = async () => {
   }
 };
 
+// Dagger SDK v0.20.8 has a bug in bin.js:198-201 where it throws inside a
+// .catch() callback, creating an unhandled rejection that is never awaited.
+// This handler logs those leaks and keeps the server alive.
+// Sentry reports the rejection itself, through the same filter as request
+// errors.
+process.on("unhandledRejection", (reason) => {
+  logger.error({ err: reason }, "Unhandled promise rejection");
+});
+
 /**
  * Only start the server if this file is being run directly (not imported)
  * This allows other scripts to import helper functions without starting the server
  */
 if (isMainModule) {
-  if (shouldRunWorker && !shouldRunWebServer) {
-    startWorker();
-  } else if (shouldRunWebServer) {
-    startWebServer();
+  try {
+    validateShutdownPodGrace(
+      config.shutdown.podGraceSeconds,
+      config.shutdown.drainSeconds,
+      config.shutdown.cleanupSeconds,
+      config.kb.taskWorkerShutdownTimeoutSeconds,
+    );
+    if (shouldRunWorker && !shouldRunWebServer) {
+      await startWorker();
+    } else if (shouldRunWebServer) {
+      await startWebServer();
+    }
+  } catch (error) {
+    logger.error({ err: error }, "Server failed to start");
+    process.exit(1);
   }
 }

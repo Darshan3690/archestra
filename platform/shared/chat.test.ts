@@ -1,55 +1,203 @@
 import { describe, expect, test } from "vitest";
 import {
-  getAcceptedFileTypes,
+  CONTEXT_WINDOW_BREAKDOWN_EVENT,
+  CONTEXT_WINDOW_CATEGORIES,
+  ContextWindowBreakdownSchema,
+  chatUploadRejectionReason,
   getMediaType,
-  getSupportedFileTypesDescription,
+  getModelReadableMimeTypes,
+  hasPersistableAssistantContent,
+  hasRenderableAssistantContent,
+  INLINE_TEXT_MAX_BYTES,
   INPUT_MODALITY_OPTIONS,
+  isInlineableTextMimeType,
   OUTPUT_MODALITY_OPTIONS,
-  supportsFileUploads,
+  parseSandboxCommand,
+  toConversationTitle,
+  toPlaceholderTitle,
 } from "./chat";
 
-describe("chat file upload helpers", () => {
-  test("treats text modality as supporting txt, md, and csv uploads", () => {
-    expect(getAcceptedFileTypes(["text"])).toBe(
-      [
-        "text/plain",
-        "text/markdown",
-        "text/csv",
-        "application/csv",
-        "application/vnd.ms-excel",
-      ].join(","),
-    );
-    expect(supportsFileUploads(["text"])).toBe(true);
-    expect(getSupportedFileTypesDescription(["text"])).toBe(
-      "chat prompts, .txt, .csv, and .md uploads",
-    );
-  });
+const VALID_BREAKDOWN = {
+  provider: "anthropic",
+  model: "claude-sonnet-4-6",
+  contextLength: 200_000,
+  usedTokens: 84_200,
+  freeTokens: 115_800,
+  usedPercent: 42.1,
+  estimatedInputCostUsd: 0.04,
+  segments: [
+    { category: "system_prompt", tokens: 2100, items: [] },
+    { category: "tools", tokens: 31_400 },
+    { category: "messages", tokens: 18_700 },
+    { category: "tool_results", tokens: 30_000 },
+    { category: "files", tokens: 2000 },
+  ],
+} as const;
 
-  test("deduplicates mime types across modalities", () => {
-    expect(getAcceptedFileTypes(["text", "text", "pdf"])).toBe(
-      [
-        "text/plain",
-        "text/markdown",
-        "text/csv",
-        "application/csv",
-        "application/vnd.ms-excel",
-        "application/pdf",
-      ].join(","),
-    );
-  });
-
-  test("returns no file types when modalities are missing", () => {
-    expect(getAcceptedFileTypes(null)).toBeUndefined();
-    expect(getAcceptedFileTypes(undefined)).toBeUndefined();
-    expect(getAcceptedFileTypes([])).toBeUndefined();
-    expect(supportsFileUploads(null)).toBe(false);
-    expect(getSupportedFileTypesDescription(undefined)).toBeNull();
-  });
-
-  test("builds a readable description for multiple upload modalities", () => {
+describe("ContextWindowBreakdownSchema", () => {
+  test("parses a valid breakdown", () => {
     expect(
-      getSupportedFileTypesDescription(["text", "image", "pdf", "audio"]),
-    ).toBe("chat prompts, .txt, .csv, and .md uploads, images, PDFs, audio");
+      ContextWindowBreakdownSchema.safeParse(VALID_BREAKDOWN).success,
+    ).toBe(true);
+  });
+
+  test("allows null contextLength, freeTokens, usedPercent, and estimatedInputCostUsd", () => {
+    const result = ContextWindowBreakdownSchema.safeParse({
+      ...VALID_BREAKDOWN,
+      contextLength: null,
+      freeTokens: null,
+      usedPercent: null,
+      estimatedInputCostUsd: null,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  test("rejects negative usedTokens", () => {
+    expect(
+      ContextWindowBreakdownSchema.safeParse({
+        ...VALID_BREAKDOWN,
+        usedTokens: -1,
+      }).success,
+    ).toBe(false);
+  });
+
+  test("rejects missing required fields", () => {
+    const { provider: _omit, ...withoutProvider } = VALID_BREAKDOWN;
+    expect(
+      ContextWindowBreakdownSchema.safeParse(withoutProvider).success,
+    ).toBe(false);
+  });
+
+  test("rejects unknown category in a segment", () => {
+    expect(
+      ContextWindowBreakdownSchema.safeParse({
+        ...VALID_BREAKDOWN,
+        segments: [{ category: "unknown_category", tokens: 100 }],
+      }).success,
+    ).toBe(false);
+  });
+
+  test("rejects usedPercent below 0", () => {
+    expect(
+      ContextWindowBreakdownSchema.safeParse({
+        ...VALID_BREAKDOWN,
+        usedPercent: -1,
+      }).success,
+    ).toBe(false);
+  });
+
+  test("rejects usedPercent above 100", () => {
+    expect(
+      ContextWindowBreakdownSchema.safeParse({
+        ...VALID_BREAKDOWN,
+        usedPercent: 101,
+      }).success,
+    ).toBe(false);
+  });
+
+  test("accepts usedPercent at boundary values 0 and 100", () => {
+    expect(
+      ContextWindowBreakdownSchema.safeParse({
+        ...VALID_BREAKDOWN,
+        usedPercent: 0,
+      }).success,
+    ).toBe(true);
+    expect(
+      ContextWindowBreakdownSchema.safeParse({
+        ...VALID_BREAKDOWN,
+        usedPercent: 100,
+      }).success,
+    ).toBe(true);
+  });
+
+  test("rejects negative segment token counts", () => {
+    expect(
+      ContextWindowBreakdownSchema.safeParse({
+        ...VALID_BREAKDOWN,
+        segments: [{ category: "messages", tokens: -5 }],
+      }).success,
+    ).toBe(false);
+  });
+
+  test("allows segments with no items array", () => {
+    const result = ContextWindowBreakdownSchema.safeParse({
+      ...VALID_BREAKDOWN,
+      segments: [{ category: "messages", tokens: 100 }],
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.segments[0].items).toBeUndefined();
+    }
+  });
+});
+
+describe("CONTEXT_WINDOW_BREAKDOWN_EVENT", () => {
+  test("is the canonical event name string", () => {
+    expect(CONTEXT_WINDOW_BREAKDOWN_EVENT).toBe(
+      "data-context-window-breakdown",
+    );
+  });
+});
+
+describe("CONTEXT_WINDOW_CATEGORIES", () => {
+  test("is in canonical stack order", () => {
+    expect(CONTEXT_WINDOW_CATEGORIES).toEqual([
+      "system_prompt",
+      "tools",
+      "messages",
+      "tool_results",
+      "files",
+    ]);
+  });
+});
+
+describe("chat file upload helpers", () => {
+  const TEXT_MODALITY_MIME_TYPES = [
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+    "text/tab-separated-values",
+    "application/json",
+    "text/xml",
+    "application/xml",
+    "application/x-yaml",
+    "application/yaml",
+    "text/yaml",
+    "application/toml",
+    "text/x-toml",
+    "application/csv",
+    "application/vnd.ms-excel",
+  ];
+
+  test("treats text modality as supporting the inlineable text document types", () => {
+    const readable = getModelReadableMimeTypes(["text"]);
+    for (const mimeType of TEXT_MODALITY_MIME_TYPES) {
+      expect(readable.has(mimeType)).toBe(true);
+    }
+  });
+
+  test("lets audio-capable Gemini models read M4A/AAC voice clips", () => {
+    const readable = getModelReadableMimeTypes(["text", "audio"], "gemini");
+    for (const mimeType of ["audio/mp4", "audio/m4a", "audio/aac"]) {
+      expect(readable.has(mimeType)).toBe(true);
+    }
+    expect(readable.has("audio/mpeg")).toBe(true);
+  });
+
+  test("keeps M4A/AAC off providers whose request conversion rejects them", () => {
+    // OpenAI's chat conversion throws on audio other than WAV/MP3, so these
+    // must be staged into the sandbox rather than sent inline.
+    for (const provider of ["openai", "anthropic", undefined] as const) {
+      const readable = getModelReadableMimeTypes(["text", "audio"], provider);
+      expect(readable.has("audio/mp4")).toBe(false);
+      expect(readable.has("audio/aac")).toBe(false);
+    }
+  });
+
+  test("does not add Gemini audio formats when the model has no audio input", () => {
+    const readable = getModelReadableMimeTypes(["text", "image"], "gemini");
+    expect(readable.has("audio/mp4")).toBe(false);
+    expect(readable.has("audio/mpeg")).toBe(false);
   });
 
   test("uses explicit file media types when present", () => {
@@ -63,8 +211,45 @@ describe("chat file upload helpers", () => {
       "application/pdf",
     );
     expect(getMediaType({ name: "table.csv", type: "" })).toBe("text/csv");
+    expect(getMediaType({ name: "data.tsv", type: "" })).toBe(
+      "text/tab-separated-values",
+    );
     expect(getMediaType({ name: "README.md", type: "" })).toBe("text/markdown");
+    expect(getMediaType({ name: "voice.m4a", type: "" })).toBe("audio/mp4");
+    expect(getMediaType({ name: "voice.aac", type: "" })).toBe("audio/aac");
     expect(getMediaType({ name: "readme.txt", type: "" })).toBe("text/plain");
+    expect(getMediaType({ name: "config.yaml", type: "" })).toBe(
+      "application/x-yaml",
+    );
+    expect(getMediaType({ name: "config.yml", type: "" })).toBe(
+      "application/x-yaml",
+    );
+    expect(getMediaType({ name: "Cargo.toml", type: "" })).toBe(
+      "application/toml",
+    );
+  });
+
+  test("recognizes inlineable text document mime types", () => {
+    for (const mimeType of [
+      "text/plain",
+      "text/markdown",
+      "text/csv",
+      "text/tab-separated-values",
+      "application/json",
+      "text/xml",
+      "application/xml",
+      "application/x-yaml",
+      "application/toml",
+    ]) {
+      expect(isInlineableTextMimeType(mimeType)).toBe(true);
+    }
+    for (const mimeType of [
+      "application/pdf",
+      "image/png",
+      "application/octet-stream",
+    ]) {
+      expect(isInlineableTextMimeType(mimeType)).toBe(false);
+    }
   });
 
   test("defaults unknown extensions to application/octet-stream", () => {
@@ -89,5 +274,378 @@ describe("chat file upload helpers", () => {
       "image",
       "audio",
     ]);
+  });
+});
+
+describe("chatUploadRejectionReason", () => {
+  const base = {
+    ingestibleMimeTypes: new Set(["image/png", "application/pdf"]),
+    sandboxAvailable: false,
+    sandboxByteLimit: 16 * 1024 * 1024,
+  };
+  // Deliberately above the sandbox limit — the two caps are independent.
+  const STORAGE_LIMIT = 50 * 1024 * 1024;
+
+  test("accepts a model-ingestible type at any size", () => {
+    expect(
+      chatUploadRejectionReason({
+        ...base,
+        mimeType: "image/png",
+        byteLength: 8_000_000,
+      }),
+    ).toBeNull();
+  });
+
+  test("accepts a small inlineable text file without a sandbox", () => {
+    expect(
+      chatUploadRejectionReason({
+        ...base,
+        mimeType: "application/toml",
+        byteLength: INLINE_TEXT_MAX_BYTES,
+      }),
+    ).toBeNull();
+  });
+
+  test("rejects oversized text without a sandbox, accepts it with one", () => {
+    expect(
+      chatUploadRejectionReason({
+        ...base,
+        mimeType: "text/csv",
+        byteLength: INLINE_TEXT_MAX_BYTES + 1,
+      }),
+    ).toBe("text_too_large");
+    expect(
+      chatUploadRejectionReason({
+        ...base,
+        sandboxAvailable: true,
+        mimeType: "text/csv",
+        byteLength: INLINE_TEXT_MAX_BYTES + 1,
+      }),
+    ).toBeNull();
+  });
+
+  test("rejects an unsupported type without a sandbox, accepts within the limit with one", () => {
+    expect(
+      chatUploadRejectionReason({
+        ...base,
+        mimeType: "application/zip",
+        byteLength: 1_000,
+      }),
+    ).toBe("unsupported_type");
+    expect(
+      chatUploadRejectionReason({
+        ...base,
+        sandboxAvailable: true,
+        mimeType: "application/zip",
+        byteLength: 1_000,
+      }),
+    ).toBeNull();
+  });
+
+  test("rejects a file over the sandbox limit even when available", () => {
+    expect(
+      chatUploadRejectionReason({
+        ...base,
+        sandboxAvailable: true,
+        mimeType: "application/zip",
+        byteLength: base.sandboxByteLimit + 1,
+      }),
+    ).toBe("too_large_for_sandbox");
+  });
+
+  test("file-storage fallback accepts an unsupported type without a sandbox", () => {
+    expect(
+      chatUploadRejectionReason({
+        ...base,
+        fileStorageByteLimit: STORAGE_LIMIT,
+        mimeType: "application/zip",
+        byteLength: 1_000,
+      }),
+    ).toBeNull();
+  });
+
+  test("file-storage fallback accepts oversized text without a sandbox", () => {
+    expect(
+      chatUploadRejectionReason({
+        ...base,
+        fileStorageByteLimit: STORAGE_LIMIT,
+        mimeType: "text/csv",
+        byteLength: INLINE_TEXT_MAX_BYTES + 1,
+      }),
+    ).toBeNull();
+  });
+
+  test("file-storage fallback accepts a file over the sandbox limit", () => {
+    // The sandbox is bypassed rather than made the gatekeeper: the file still
+    // lands in the Files panel, so acceptance answers only to the storage cap.
+    for (const sandboxAvailable of [true, false]) {
+      expect(
+        chatUploadRejectionReason({
+          ...base,
+          sandboxAvailable,
+          fileStorageByteLimit: STORAGE_LIMIT,
+          mimeType: "application/zip",
+          byteLength: base.sandboxByteLimit + 1,
+        }),
+      ).toBeNull();
+    }
+  });
+
+  test("file-storage fallback rejects a file over the storage cap", () => {
+    expect(
+      chatUploadRejectionReason({
+        ...base,
+        fileStorageByteLimit: STORAGE_LIMIT,
+        mimeType: "application/zip",
+        byteLength: STORAGE_LIMIT + 1,
+      }),
+    ).toBe("too_large_to_store");
+  });
+
+  test("the storage cap bounds even a model-ingestible type", () => {
+    // Bytes are persisted for every accepted upload, so the cap applies to
+    // types the model reads natively too — but only when the fallback is on.
+    expect(
+      chatUploadRejectionReason({
+        ...base,
+        fileStorageByteLimit: STORAGE_LIMIT,
+        mimeType: "image/png",
+        byteLength: STORAGE_LIMIT + 1,
+      }),
+    ).toBe("too_large_to_store");
+    expect(
+      chatUploadRejectionReason({
+        ...base,
+        mimeType: "image/png",
+        byteLength: STORAGE_LIMIT + 1,
+      }),
+    ).toBeNull();
+  });
+
+  test("size-gates inlineable text even when the model lists it as ingestible", () => {
+    // A text-capable model's readable set includes text MIMEs, so the generic
+    // ingestible check would otherwise accept an arbitrarily large text file.
+    const ingestibleMimeTypes = getModelReadableMimeTypes(["text"]);
+    expect(ingestibleMimeTypes.has("text/csv")).toBe(true);
+
+    expect(
+      chatUploadRejectionReason({
+        ...base,
+        ingestibleMimeTypes,
+        mimeType: "text/csv",
+        byteLength: INLINE_TEXT_MAX_BYTES,
+      }),
+    ).toBeNull();
+    expect(
+      chatUploadRejectionReason({
+        ...base,
+        ingestibleMimeTypes,
+        mimeType: "text/csv",
+        byteLength: INLINE_TEXT_MAX_BYTES + 1,
+      }),
+    ).toBe("text_too_large");
+  });
+});
+
+describe("hasPersistableAssistantContent", () => {
+  test("keeps assistant turns carrying renderable content", () => {
+    expect(
+      hasPersistableAssistantContent({
+        parts: [{ type: "text", text: "hello" }],
+      }),
+    ).toBe(true);
+  });
+
+  test("drops empty turns", () => {
+    expect(hasPersistableAssistantContent({})).toBe(false);
+    expect(hasPersistableAssistantContent({ parts: [] })).toBe(false);
+    expect(
+      hasPersistableAssistantContent({ parts: [{ type: "text", text: "  " }] }),
+    ).toBe(false);
+  });
+
+  // read-path callers pass historical JSON that is only cast, so malformed
+  // rows must be treated as empty rather than throwing and failing the load.
+  test("tolerates malformed persisted parts without throwing", () => {
+    const malformed = [
+      { parts: {} },
+      { parts: [{}] },
+      { parts: [null] },
+      { parts: [{ type: 42 }] },
+      { parts: "not-an-array" },
+    ];
+    for (const message of malformed) {
+      expect(
+        hasPersistableAssistantContent(
+          message as Parameters<typeof hasPersistableAssistantContent>[0],
+        ),
+      ).toBe(false);
+    }
+  });
+});
+
+describe("hasRenderableAssistantContent", () => {
+  test("returns true when a non-empty text part is present", () => {
+    expect(
+      hasRenderableAssistantContent({ parts: [{ type: "text", text: "hi" }] }),
+    ).toBe(true);
+  });
+
+  test("returns false for an empty text part alone", () => {
+    expect(
+      hasRenderableAssistantContent({ parts: [{ type: "text", text: "" }] }),
+    ).toBe(false);
+  });
+
+  test("returns false for a breakdown-only assistant turn", () => {
+    // data-context-window-breakdown must be in NON_RENDERABLE so a turn that
+    // contains only that telemetry part does not produce an empty assistant bubble.
+    expect(
+      hasRenderableAssistantContent({
+        parts: [{ type: "data-context-window-breakdown" }],
+      }),
+    ).toBe(false);
+  });
+
+  test("returns false when all parts are non-renderable telemetry", () => {
+    expect(
+      hasRenderableAssistantContent({
+        parts: [
+          { type: "step-start" },
+          { type: "data-token-usage" },
+          { type: "data-context-window-breakdown" },
+          { type: "data-context-window-estimate" },
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  test("returns true when a renderable part accompanies telemetry parts", () => {
+    expect(
+      hasRenderableAssistantContent({
+        parts: [
+          { type: "data-context-window-breakdown" },
+          { type: "text", text: "Here is the answer." },
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  test("returns false for no parts", () => {
+    expect(hasRenderableAssistantContent({ parts: [] })).toBe(false);
+    expect(hasRenderableAssistantContent({})).toBe(false);
+  });
+});
+
+describe("parseSandboxCommand", () => {
+  test("extracts the command after the bang", () => {
+    expect(parseSandboxCommand("! npx foo mcp add")).toEqual({
+      command: "npx foo mcp add",
+    });
+  });
+
+  test("accepts the bang glued to the command", () => {
+    expect(parseSandboxCommand("!echo hi")).toEqual({ command: "echo hi" });
+  });
+
+  test("ignores surrounding whitespace", () => {
+    expect(parseSandboxCommand("  ! ls -la  ")).toEqual({ command: "ls -la" });
+  });
+
+  test("rejects a bare bang", () => {
+    expect(parseSandboxCommand("!")).toBeNull();
+    expect(parseSandboxCommand("!   ")).toBeNull();
+  });
+
+  test("rejects ordinary messages", () => {
+    expect(parseSandboxCommand("hello world")).toBeNull();
+    expect(parseSandboxCommand("")).toBeNull();
+    expect(parseSandboxCommand("/compact")).toBeNull();
+    expect(parseSandboxCommand("what does ! mean in bash?")).toBeNull();
+  });
+});
+
+describe("toPlaceholderTitle", () => {
+  test("flattens a multi-line prompt onto one line", () => {
+    expect(toPlaceholderTitle("Review this\n\n- one\n- two")).toBe(
+      "Review this - one - two",
+    );
+  });
+
+  // A sentence terminator is not a title boundary: "1. Fix it" is a list
+  // marker, not a one-word sentence, and "3.5" is not a sentence at all.
+  test("does not stop at the first sentence or list marker", () => {
+    expect(toPlaceholderTitle("1. Fix it. Then test.")).toBe(
+      "1. Fix it. Then test.",
+    );
+    expect(toPlaceholderTitle("Round 3.5 up")).toBe("Round 3.5 up");
+  });
+
+  test("truncates a prompt that runs long", () => {
+    const title = toPlaceholderTitle(`${"word ".repeat(100)}end`);
+
+    // At most 30 characters plus the ellipsis; a trailing space is dropped
+    // before the ellipsis rather than being padded back out.
+    expect(title.length).toBeLessThanOrEqual(31);
+    expect(title.endsWith("…")).toBe(true);
+  });
+
+  test("does not cut an emoji in half", () => {
+    // The odd-length prefix puts the 30th UTF-16 unit inside a surrogate pair,
+    // so a raw slice would leave an unpaired surrogate in the stored title.
+    const title = toPlaceholderTitle(`Debug my ${"🐛".repeat(40)} now`);
+
+    expect(title).toBe(`Debug my ${"🐛".repeat(21)}…`);
+    expect(title).not.toMatch(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/,
+    );
+  });
+
+  test("leaves a short prompt whole, with no ellipsis", () => {
+    expect(toPlaceholderTitle("Short prompt")).toBe("Short prompt");
+  });
+
+  test("returns an empty string for an empty prompt", () => {
+    expect(toPlaceholderTitle("")).toBe("");
+    expect(toPlaceholderTitle("   \n  ")).toBe("");
+  });
+});
+
+describe("toConversationTitle", () => {
+  test("accepts a short line, normalizing quotes and line breaks", () => {
+    expect(toConversationTitle('"React\n  Component   Basics"')).toEqual({
+      title: "React Component Basics",
+    });
+  });
+
+  test("rejects a response with no visible text", () => {
+    expect(toConversationTitle("")).toEqual({
+      title: null,
+      reason: "empty_response",
+    });
+    // Quotes with nothing inside them are equally unusable.
+    expect(toConversationTitle(' " " ')).toEqual({
+      title: null,
+      reason: "empty_response",
+    });
+  });
+
+  test("rejects a paragraph the model wrote instead of a title", () => {
+    expect(toConversationTitle("word ".repeat(500))).toEqual({
+      title: null,
+      reason: "not_a_title",
+    });
+  });
+
+  test("measures the cap in characters, not UTF-16 units", () => {
+    // 80 emoji are 160 UTF-16 units. Capping by `.length` would reject a title
+    // that is exactly as long as the limit allows.
+    expect(toConversationTitle("🐛".repeat(80))).toEqual({
+      title: "🐛".repeat(80),
+    });
+    expect(toConversationTitle("🐛".repeat(81))).toEqual({
+      title: null,
+      reason: "not_a_title",
+    });
   });
 });

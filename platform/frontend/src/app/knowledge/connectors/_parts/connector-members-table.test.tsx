@@ -1,0 +1,336 @@
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+// SPDX-FileCopyrightText: 2026 Archestra Inc.
+
+import { archestraApiClient } from "@archestra/shared";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render as rtlRender, screen, within } from "@testing-library/react";
+import { HttpResponse, http } from "msw";
+import { setupServer } from "msw/node";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+import { useAppName } from "@/lib/hooks/use-app-name";
+import { ConnectorMembersTable } from "./connector-members-table";
+
+const mockUseConnectorUserGroups = vi.fn();
+const mockUpsertMutateAsync = vi.fn();
+const mockDeleteMutateAsync = vi.fn();
+
+vi.mock("@/lib/knowledge/connector.query", () => ({
+  useConnectorUserGroups: (args: unknown) => mockUseConnectorUserGroups(args),
+  useUpsertConnectorMemberOverride: () => ({
+    mutateAsync: mockUpsertMutateAsync,
+    isPending: false,
+  }),
+  useDeleteConnectorMemberOverride: () => ({
+    mutateAsync: mockDeleteMutateAsync,
+    isPending: false,
+  }),
+}));
+
+vi.mock("next/navigation");
+vi.mock("@/lib/hooks/use-app-name");
+
+vi.mock("@/components/ui/tooltip", () => ({
+  Tooltip: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  TooltipTrigger: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  TooltipContent: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+}));
+
+function mockGroups() {
+  mockUseConnectorUserGroups.mockReturnValue({
+    data: {
+      groups: [
+        {
+          groupId: "engineers",
+          token: "group:jira_engineers",
+          documentCount: 128,
+          lastSyncedAt: "2026-07-08T15:00:00.000Z",
+          members: [
+            {
+              accountId: "acc-alice",
+              displayName: "Alice A",
+              email: "alice@example.com",
+              accountType: "atlassian",
+              user: { id: "user-1", name: "Alice", email: "alice@corp.com" },
+              resolvedVia: "email",
+            },
+            // Hidden email, manually assigned by an admin.
+            {
+              accountId: "acc-dave",
+              displayName: "Dave D",
+              email: null,
+              accountType: null,
+              user: { id: "user-2", name: "Dave", email: "dave@corp.com" },
+              resolvedVia: "override",
+            },
+            // Hidden email, unresolved — the actionable row.
+            {
+              accountId: "acc-erin",
+              displayName: "Erin E",
+              email: null,
+              accountType: null,
+              user: null,
+              resolvedVia: null,
+            },
+            // Add-on/bot account: never resolvable, excluded from the table.
+            {
+              accountId: "acc-bot",
+              displayName: "Automation for Jira",
+              email: null,
+              accountType: "app",
+              user: null,
+              resolvedVia: null,
+            },
+          ],
+        },
+        {
+          groupId: "ops",
+          token: "group:jira_ops",
+          documentCount: 2,
+          lastSyncedAt: null,
+          members: [
+            {
+              accountId: "acc-alice",
+              displayName: "Alice A",
+              email: "alice@example.com",
+              accountType: "atlassian",
+              user: { id: "user-1", name: "Alice", email: "alice@corp.com" },
+              resolvedVia: "email",
+            },
+          ],
+        },
+      ],
+    },
+    isPending: false,
+    isError: false,
+  });
+}
+
+async function setupUserEvent() {
+  // Radix Select relies on pointer-capture + scrollIntoView, which jsdom
+  // does not implement.
+  window.HTMLElement.prototype.hasPointerCapture = vi.fn();
+  window.HTMLElement.prototype.setPointerCapture = vi.fn();
+  window.HTMLElement.prototype.releasePointerCapture = vi.fn();
+  window.HTMLElement.prototype.scrollIntoView = vi.fn();
+  const { default: userEvent } = await import("@testing-library/user-event");
+  return userEvent.setup();
+}
+
+beforeEach(() => {
+  vi.mocked(usePathname).mockReturnValue("/knowledge/connectors/connector-1");
+  vi.mocked(useSearchParams).mockReturnValue(
+    new URLSearchParams() as unknown as ReturnType<typeof useSearchParams>,
+  );
+  vi.mocked(useRouter).mockReturnValue({
+    push: vi.fn(),
+    replace: vi.fn(),
+  } as unknown as ReturnType<typeof useRouter>);
+  vi.mocked(useAppName).mockReturnValue("Archestra");
+  mockUpsertMutateAsync.mockResolvedValue({ success: true });
+  mockDeleteMutateAsync.mockResolvedValue({ success: true });
+});
+
+describe("ConnectorMembersTable", () => {
+  it("lists distinct human users with resolution state, unresolved first, bots excluded", () => {
+    mockGroups();
+
+    render(<ConnectorMembersTable connectorId="connector-1" />);
+
+    // alice appears in two groups but is ONE row.
+    expect(screen.getAllByText("Alice A")).toHaveLength(1);
+    // External identity: upstream account id and email.
+    expect(screen.getByText("acc-erin")).toBeInTheDocument();
+    expect(screen.getByText("alice@example.com")).toBeInTheDocument();
+    // Group memberships render as badges (one per group the user is in).
+    expect(screen.getAllByText("engineers")).toHaveLength(3);
+    expect(screen.getByText("ops")).toBeInTheDocument();
+    // The resolved org user shows name over email — for the manual
+    // assignment exactly as for the email match.
+    expect(screen.getByText("Alice")).toBeInTheDocument();
+    expect(screen.getByText("alice@corp.com")).toBeInTheDocument();
+    expect(screen.getByText("dave@corp.com")).toBeInTheDocument();
+    // The Assigned column distinguishes the three states.
+    expect(screen.getByText("Dave")).toBeInTheDocument();
+    expect(screen.getByText("Automatically")).toBeInTheDocument();
+    expect(screen.getByText("Manually")).toBeInTheDocument();
+    expect(screen.getByText("Unassigned")).toBeInTheDocument();
+    // Default order: automatically assigned (Alice), manually assigned
+    // (Dave), then unassigned (Erin).
+    const rows = screen.getAllByRole("row");
+    expect(rows[1]).toHaveTextContent("Alice A");
+    expect(rows[2]).toHaveTextContent("Dave D");
+    expect(rows[3]).toHaveTextContent("Erin E");
+    // The bot never shows: it cannot sign in, so it cannot be mapped.
+    expect(screen.queryByText("Automation for Jira")).not.toBeInTheDocument();
+    // An email match cannot be overridden: Alice's action is disabled
+    // (with the reason on hover), while the manually-assigned (Dave) and
+    // unassigned (Erin) rows stay editable.
+    expect(
+      within(rows[1]).getByRole("button", { name: /^Assign Archestra user/ }),
+    ).toBeDisabled();
+    expect(
+      screen.getByText(/Assigned automatically by email/),
+    ).toBeInTheDocument();
+    expect(
+      within(rows[2]).getByRole("button", { name: /^Assign Archestra user/ }),
+    ).toBeEnabled();
+    expect(
+      within(rows[3]).getByRole("button", { name: /^Assign Archestra user/ }),
+    ).toBeEnabled();
+  });
+
+  it("keeps the upstream account id out of the column and on the hover", () => {
+    mockGroups();
+
+    render(<ConnectorMembersTable connectorId="connector-1" />);
+
+    // The id is reachable (it is the only stable handle on an account with no
+    // email) but no longer a third line of every identity cell.
+    const idCell = screen.getByText("acc-alice");
+    expect(idCell).toBeInTheDocument();
+    // And no avatar column: these sources hand over no picture, so the
+    // circles were initials of the name already in the next column.
+    const [headerRow] = screen.getAllByRole("row");
+    expect(within(headerRow).getAllByRole("columnheader")).toHaveLength(5);
+  });
+
+  it("assigns an unresolved user to an org user from the dialog", async () => {
+    const user = await setupUserEvent();
+    mockGroups();
+
+    render(<ConnectorMembersTable connectorId="connector-1" />);
+
+    // Erin (unassigned) sorts last, after the assigned users.
+    const rows = screen.getAllByRole("row");
+    await user.click(
+      within(rows[3]).getByRole("button", { name: /^Assign Archestra user/ }),
+    );
+    expect(
+      screen.getByText(/source hides this user's email/),
+    ).toBeInTheDocument();
+    // The dialog recaps the full external identity, not just the name.
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("acc-erin")).toBeInTheDocument();
+    expect(within(dialog).getByText("Erin E")).toBeInTheDocument();
+    expect(within(dialog).getByText("hidden")).toBeInTheDocument();
+
+    // Nothing changed yet, so there is nothing to save.
+    expect(screen.getByRole("button", { name: "Save Changes" })).toBeDisabled();
+
+    // The org-user picker is the app-standard searchable select (the
+    // dialog's only combobox); it opens on the current state, "Unassigned".
+    await user.click(within(dialog).getByRole("combobox"));
+    await user.click(await screen.findByRole("option", { name: /Frank/ }));
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    expect(mockUpsertMutateAsync).toHaveBeenCalledWith({
+      externalAccountId: "acc-erin",
+      userId: "user-3",
+    });
+  });
+
+  it("removes a manual assignment by picking the pinned Unassigned option", async () => {
+    const user = await setupUserEvent();
+    mockGroups();
+
+    render(<ConnectorMembersTable connectorId="connector-1" />);
+
+    // Dave (manually assigned) sorts between auto-assigned Alice and unassigned Erin.
+    const rows = screen.getAllByRole("row");
+    await user.click(
+      within(rows[2]).getByRole("button", { name: /^Assign Archestra user/ }),
+    );
+    const dialog = screen.getByRole("dialog");
+    await user.click(within(dialog).getByRole("combobox"));
+    await user.click(await screen.findByRole("option", { name: "Unassigned" }));
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    expect(mockDeleteMutateAsync).toHaveBeenCalledWith("acc-dave");
+  });
+
+  it("filters users by group membership", async () => {
+    const user = await setupUserEvent();
+    mockGroups();
+
+    render(<ConnectorMembersTable connectorId="connector-1" />);
+
+    // Only alice is in "ops"; everyone is in "engineers".
+    await user.click(screen.getByRole("combobox", { name: "Filter by group" }));
+    await user.click(await screen.findByRole("option", { name: "ops" }));
+
+    expect(screen.getByText("Alice A")).toBeInTheDocument();
+    expect(screen.queryByText("Dave D")).not.toBeInTheDocument();
+    expect(screen.queryByText("Erin E")).not.toBeInTheDocument();
+  });
+
+  it("filters to manually assigned users", async () => {
+    const user = await setupUserEvent();
+    mockGroups();
+
+    render(<ConnectorMembersTable connectorId="connector-1" />);
+
+    await user.click(screen.getByRole("combobox", { name: "Filter users" }));
+    await user.click(
+      await screen.findByRole("option", { name: "Manually assigned" }),
+    );
+
+    expect(screen.getByText("Dave D")).toBeInTheDocument();
+    expect(screen.queryByText("Alice A")).not.toBeInTheDocument();
+    expect(screen.queryByText("Erin E")).not.toBeInTheDocument();
+  });
+});
+
+const memberServer = setupServer(
+  http.get(
+    "http://localhost:9000/api/organization/member-options",
+    ({ request }) => {
+      const params = new URL(request.url).searchParams;
+      const users = [
+        { id: "user-1", name: "Alice", email: "alice@corp.com" },
+        { id: "user-2", name: "Dave", email: "dave@corp.com" },
+        { id: "user-3", name: "Frank", email: "frank@corp.com" },
+      ];
+      const ids = params.get("ids")?.split(",");
+      return HttpResponse.json({
+        data: ids ? users.filter((user) => ids.includes(user.id)) : users,
+        pagination: { limit: 20, hasNext: false, nextCursor: null },
+      });
+    },
+  ),
+);
+const clients: QueryClient[] = [];
+beforeAll(() => {
+  archestraApiClient.setConfig({ baseUrl: "http://localhost:9000" });
+  memberServer.listen({ onUnhandledRequest: "error" });
+});
+afterEach(() => {
+  for (const client of clients) client.clear();
+  clients.length = 0;
+  memberServer.resetHandlers();
+});
+afterAll(() => memberServer.close());
+function render(element: React.ReactElement) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  clients.push(client);
+  return rtlRender(
+    <QueryClientProvider client={client}>{element}</QueryClientProvider>,
+  );
+}

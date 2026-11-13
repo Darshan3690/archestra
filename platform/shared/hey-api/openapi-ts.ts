@@ -3,17 +3,20 @@ import { createClient, defineConfig } from "@hey-api/openapi-ts";
 import { MCP_CATALOG_API_BASE_URL } from "../consts";
 
 /**
- * During `pnpm codegen` (CODEGEN=true), use the generated docs/openapi.json file
- * which includes all enterprise routes regardless of local .env settings.
- * For manual regeneration with a running dev server, use localhost.
+ * Always the generated `docs/openapi.json`, never a running server.
+ *
+ * Reading it off the loopback API used to be the fallback when `CODEGEN=true`
+ * was not set, and it produced a subtly wrong client two ways. The spec
+ * declares no `servers`, so generating from a URL makes hey-api infer one from
+ * the address it fetched — baking `baseUrl: 'http://127.0.0.1:9000'` into the
+ * shared client that ships to every deployment. It also omits enterprise routes
+ * whenever the local .env has no license, silently shrinking the client.
+ *
+ * Regenerate the spec first (`pnpm --dir backend codegen:openapi`) if it is
+ * stale; `pnpm codegen` from the root already does that in order.
  */
-const archestraApiInput =
-  process.env.CODEGEN === "true"
-    ? "../../docs/openapi.json"
-    : "http://localhost:9000/openapi.json";
-
 const archestraApiConfig = await defineConfig({
-  input: archestraApiInput,
+  input: "../../docs/openapi.json",
   output: {
     path: "./hey-api/clients/api",
     clean: false,
@@ -28,7 +31,7 @@ const archestraApiConfig = await defineConfig({
   plugins: [
     {
       name: "@hey-api/client-fetch",
-      runtimeConfigPath: "./custom-client",
+      runtimeConfigPath: "./hey-api/clients/api/custom-client",
     },
   ],
 });
@@ -45,7 +48,7 @@ const archestraCatalogConfig = await defineConfig({
   plugins: [
     {
       name: "@hey-api/client-fetch",
-      runtimeConfigPath: "./custom-client",
+      runtimeConfigPath: "./hey-api/clients/archestra-catalog/custom-client",
     },
   ],
 });

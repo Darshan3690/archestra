@@ -1,9 +1,14 @@
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
 import { randomUUID } from "node:crypto";
-import { OAUTH_TOKEN_TYPE } from "@shared";
+import { OAUTH_TOKEN_TYPE } from "@archestra/shared";
 import { vi } from "vitest";
 import db, { schema } from "@/database";
 import { describe, expect, test } from "@/test";
-import { resolveEnterpriseTransportCredential } from "./broker";
+import { agentOwner } from "@/types";
+import {
+  buildEnterpriseCredentialHeader,
+  resolveEnterpriseTransportCredential,
+} from "./broker";
 
 describe("resolveEnterpriseTransportCredential", () => {
   test("exchanges a session IdP token for a managed secret and builds an authorization header", async ({
@@ -56,7 +61,7 @@ describe("resolveEnterpriseTransportCredential", () => {
     );
 
     const result = await resolveEnterpriseTransportCredential({
-      agentId: agent.id,
+      owner: agentOwner(agent.id),
       tokenAuth: {
         tokenId: "session-token",
         teamId: null,
@@ -128,7 +133,7 @@ describe("resolveEnterpriseTransportCredential", () => {
     );
 
     const result = await resolveEnterpriseTransportCredential({
-      agentId: agent.id,
+      owner: agentOwner(agent.id),
       tokenAuth: {
         tokenId: "external-token",
         teamId: null,
@@ -179,7 +184,7 @@ describe("resolveEnterpriseTransportCredential", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch");
 
     const result = await resolveEnterpriseTransportCredential({
-      agentId: agent.id,
+      owner: agentOwner(agent.id),
       tokenAuth: {
         tokenId: "external-token",
         teamId: null,
@@ -275,7 +280,7 @@ describe("resolveEnterpriseTransportCredential", () => {
       });
 
     const result = await resolveEnterpriseTransportCredential({
-      agentId: agent.id,
+      owner: agentOwner(agent.id),
       tokenAuth: {
         tokenId: "external-id-jag",
         teamId: null,
@@ -297,6 +302,10 @@ describe("resolveEnterpriseTransportCredential", () => {
       headerName: "Authorization",
       headerValue: "Bearer mcp-server-access-token",
       expiresInSeconds: 300,
+      issuedTo: {
+        clientId: "resource-client",
+        clientType: "identity_provider",
+      },
     });
 
     const tokenRequest = fetchMock.mock.calls.find(
@@ -384,7 +393,7 @@ describe("resolveEnterpriseTransportCredential", () => {
       });
 
     const result = await resolveEnterpriseTransportCredential({
-      agentId: agent.id,
+      owner: agentOwner(agent.id),
       tokenAuth: {
         tokenId: "external-id-jag",
         teamId: null,
@@ -510,7 +519,7 @@ describe("resolveEnterpriseTransportCredential", () => {
       });
 
     const result = await resolveEnterpriseTransportCredential({
-      agentId: agent.id,
+      owner: agentOwner(agent.id),
       tokenAuth: {
         tokenId: "session-token",
         teamId: null,
@@ -530,6 +539,10 @@ describe("resolveEnterpriseTransportCredential", () => {
       headerName: "Authorization",
       headerValue: "Bearer mcp-server-access-token",
       expiresInSeconds: 300,
+      issuedTo: {
+        clientId: "resource-client",
+        clientType: "identity_provider",
+      },
     });
 
     fetchMock.mockRestore();
@@ -591,7 +604,7 @@ describe("resolveEnterpriseTransportCredential", () => {
     );
 
     const result = await resolveEnterpriseTransportCredential({
-      agentId: agent.id,
+      owner: agentOwner(agent.id),
       tokenAuth: {
         tokenId: "session-token",
         teamId: null,
@@ -673,7 +686,7 @@ describe("resolveEnterpriseTransportCredential", () => {
     );
 
     const result = await resolveEnterpriseTransportCredential({
-      agentId: agent.id,
+      owner: agentOwner(agent.id),
       tokenAuth: {
         tokenId: "session-token",
         teamId: null,
@@ -760,7 +773,7 @@ describe("resolveEnterpriseTransportCredential", () => {
     );
 
     const result = await resolveEnterpriseTransportCredential({
-      agentId: agent.id,
+      owner: agentOwner(agent.id),
       tokenAuth: {
         tokenId: "session-token",
         teamId: null,
@@ -778,6 +791,10 @@ describe("resolveEnterpriseTransportCredential", () => {
       headerName: "Authorization",
       headerValue: "Bearer downstream-graph-access-token",
       expiresInSeconds: 3599,
+      issuedTo: {
+        clientId: "middle-tier-client-id",
+        clientType: "identity_provider",
+      },
     });
 
     const [, requestInit] = fetchMock.mock.calls[0] ?? [];
@@ -850,7 +867,7 @@ describe("resolveEnterpriseTransportCredential", () => {
     );
 
     const result = await resolveEnterpriseTransportCredential({
-      agentId: agent.id,
+      owner: agentOwner(agent.id),
       tokenAuth: {
         tokenId: "session-token",
         teamId: null,
@@ -938,7 +955,7 @@ describe("resolveEnterpriseTransportCredential", () => {
 
     await expect(
       resolveEnterpriseTransportCredential({
-        agentId: agent.id,
+        owner: agentOwner(agent.id),
         tokenAuth: {
           tokenId: "session-token",
           teamId: null,
@@ -957,6 +974,76 @@ describe("resolveEnterpriseTransportCredential", () => {
     );
 
     fetchMock.mockRestore();
+  });
+});
+
+describe("buildEnterpriseCredentialHeader", () => {
+  test("sends the credential under the configured custom header, unprefixed", () => {
+    expect(
+      buildEnterpriseCredentialHeader({
+        config: {
+          tokenInjectionMode: "header",
+          headerName: "X-Provider-Token",
+        },
+        value: "downstream-token",
+      }),
+    ).toEqual({
+      headerName: "X-Provider-Token",
+      headerValue: "downstream-token",
+    });
+  });
+
+  test("does not fall back to Authorization when a custom header is configured", () => {
+    const { headerName } = buildEnterpriseCredentialHeader({
+      config: { tokenInjectionMode: "header", headerName: "X-Provider-Token" },
+      value: "downstream-token",
+    });
+
+    expect(headerName.toLowerCase()).not.toBe("authorization");
+  });
+
+  test("rejects custom-header mode that is missing a header name", () => {
+    expect(() =>
+      buildEnterpriseCredentialHeader({
+        config: { tokenInjectionMode: "header" },
+        value: "downstream-token",
+      }),
+    ).toThrow(
+      "Enterprise-managed credential injection mode 'header' requires headerName",
+    );
+  });
+
+  test.each([
+    "env",
+    "body_field",
+  ] as const)("refuses to smuggle a %s-mode credential into an Authorization header", (tokenInjectionMode) => {
+    expect(() =>
+      buildEnterpriseCredentialHeader({
+        config: { tokenInjectionMode },
+        value: "downstream-token",
+      }),
+    ).toThrow(/is not supported for HTTP MCP transports/);
+  });
+
+  test("sends the raw value for raw_authorization mode", () => {
+    expect(
+      buildEnterpriseCredentialHeader({
+        config: { tokenInjectionMode: "raw_authorization" },
+        value: "token abc123",
+      }),
+    ).toEqual({ headerName: "Authorization", headerValue: "token abc123" });
+  });
+
+  test("defaults to a bearer Authorization header", () => {
+    expect(
+      buildEnterpriseCredentialHeader({
+        config: {},
+        value: "downstream-token",
+      }),
+    ).toEqual({
+      headerName: "Authorization",
+      headerValue: "Bearer downstream-token",
+    });
   });
 });
 

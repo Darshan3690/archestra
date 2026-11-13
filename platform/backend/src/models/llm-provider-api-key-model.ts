@@ -1,13 +1,107 @@
-import { MODEL_MARKER_PATTERNS, type SupportedProvider } from "@shared";
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
-import db, { schema } from "@/database";
-import type { LlmProviderApiKey, Model } from "@/types";
+import {
+  type CompleteModelSelection,
+  findTierDefault,
+  PROVIDER_FAST_MODEL_PATTERNS,
+  type SupportedProvider,
+} from "@archestra/shared";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  inArray,
+  isNotNull,
+  notInArray,
+  or,
+  sql,
+} from "drizzle-orm";
+import { sanitizeOutputLimit } from "@/clients/models-dev-client";
+import db, { schema, withDbTransaction } from "@/database";
+import type { LinkedApiKey, LlmProviderApiKey, Model } from "@/types";
+import type {
+  ProviderModelPricing,
+  ProviderPricedModel,
+} from "@/types/provider-model-pricing";
+import { azureCapabilityConfigurationHash } from "@/utils/azure-capability-scope";
+import ModelModel from "./model";
 
 /**
  * Model class for the api_key_models join table.
  * Manages the many-to-many relationship between chat_api_keys and models.
  */
 class LlmProviderApiKeyModelLinkModel {
+  /** Resolve the selected connection's cap without borrowing another key's metadata. */
+  static async resolveOutputLength(
+    model: Model | null,
+    apiKeyId?: string | null,
+  ): Promise<number | null> {
+    if (!model) return null;
+    if (!apiKeyId) return ModelModel.resolveEffectiveOutputLength(model);
+    const links = schema.llmProviderApiKeyModelsTable;
+    const [link] = await db
+      .select({ outputLength: links.outputLength })
+      .from(links)
+      .where(and(eq(links.apiKeyId, apiKeyId), eq(links.modelId, model.id)))
+      .limit(1);
+    const endpoint = sanitizeOutputLimit(link?.outputLength);
+    if (endpoint === null)
+      return ModelModel.resolveEffectiveOutputLength(model);
+    const custom = sanitizeOutputLimit(model.customOutputLength);
+    return custom === null ? endpoint : Math.min(custom, endpoint);
+  }
+
+  static async findModelForPricing(params: {
+    provider: SupportedProvider;
+    modelId: string;
+    apiKeyId?: string;
+  }): Promise<ProviderPricedModel | null> {
+    const model = await ModelModel.findByProviderAndModelId(
+      params.provider,
+      params.modelId,
+    );
+    if (!model || !params.apiKeyId) return model;
+    const prices = await LlmProviderApiKeyModelLinkModel.findProviderPricing({
+      apiKeyId: params.apiKeyId,
+      modelIds: [model.id],
+    });
+    return ModelModel.withProviderPricing(model, [
+      prices.get(model.id) ?? null,
+    ]);
+  }
+
+  /**
+   * Whether any provider key publishes its own price for this model (a
+   * LiteLLM gateway prices per key). Recorded requests don't keep which key
+   * served them, so their cost can only be recomputed from a custom price.
+   */
+  static async hasProviderPricing(modelId: string): Promise<boolean> {
+    const links = schema.llmProviderApiKeyModelsTable;
+    const [row] = await db
+      .select({ modelId: links.modelId })
+      .from(links)
+      .where(and(eq(links.modelId, modelId), isNotNull(links.providerPricing)))
+      .limit(1);
+    return !!row;
+  }
+
+  static async findProviderPricing(params: {
+    apiKeyId?: string;
+    modelIds: string[];
+  }): Promise<Map<string, ProviderModelPricing | null>> {
+    if (!params.apiKeyId || !params.modelIds.length) return new Map();
+    const links = schema.llmProviderApiKeyModelsTable;
+    const rows = await db
+      .select({ modelId: links.modelId, pricing: links.providerPricing })
+      .from(links)
+      .where(
+        and(
+          eq(links.apiKeyId, params.apiKeyId),
+          inArray(links.modelId, params.modelIds),
+        ),
+      );
+    return new Map(rows.map((row) => [row.modelId, row.pricing]));
+  }
+
   /**
    * Link multiple models to an API key.
    * This performs a bulk insert, ignoring duplicates.
@@ -27,9 +121,11 @@ class LlmProviderApiKeyModelLinkModel {
 
     for (let i = 0; i < uniqueModelIds.length; i += BATCH_SIZE) {
       const batch = uniqueModelIds.slice(i, i + BATCH_SIZE);
+      const syncedAt = new Date();
       const values = batch.map((modelId) => ({
         apiKeyId,
         modelId,
+        syncedAt,
       }));
 
       await db
@@ -57,6 +153,36 @@ class LlmProviderApiKeyModelLinkModel {
     return results.map((r) => r.model);
   }
 
+  /** Internal batched evidence lookup; callers must pass authorized key IDs. */
+  static async findCapabilitiesForApiKeyModels(apiKeyIds: string[]) {
+    if (apiKeyIds.length === 0) return [];
+    const links = schema.llmProviderApiKeyModelsTable;
+    const keys = schema.llmProviderApiKeysTable;
+    return db
+      .select({
+        apiKeyId: links.apiKeyId,
+        model: schema.modelsTable,
+        evidence: links.azureCapabilities,
+        syncedAt: links.syncedAt,
+        configuration: {
+          baseUrl: keys.baseUrl,
+          inferenceBaseUrl: keys.inferenceBaseUrl,
+          extraHeaders: keys.extraHeaders,
+          secretId: keys.secretId,
+        },
+      })
+      .from(links)
+      .innerJoin(schema.modelsTable, eq(links.modelId, schema.modelsTable.id))
+      .innerJoin(keys, eq(links.apiKeyId, keys.id))
+      .where(
+        and(
+          inArray(links.apiKeyId, apiKeyIds),
+          eq(keys.provider, "azure"),
+          eq(schema.modelsTable.provider, "azure"),
+        ),
+      );
+  }
+
   /**
    * Get all API keys linked to a specific model.
    */
@@ -81,54 +207,122 @@ class LlmProviderApiKeyModelLinkModel {
   }
 
   /**
+   * Where a provider-facing model id is served, for providers whose keys are
+   * endpoints. Answers with the linked key ids, or null when the model is not
+   * in the catalog at all.
+   *
+   * The distinction matters to callers deciding whether an endpoint can run a
+   * model: an empty array is "synced and served nowhere", while null is "never
+   * seen" — for instance a model an operator has just deployed. Only the first
+   * justifies treating the endpoint as unable to serve it.
+   */
+  static async findApiKeyIdsServingModelId(params: {
+    provider: SupportedProvider;
+    modelId: string;
+  }): Promise<string[] | null> {
+    const model = await ModelModel.findByProviderAndModelId(
+      params.provider,
+      params.modelId,
+    );
+    if (!model) {
+      return null;
+    }
+
+    const rows = await db
+      .select({ apiKeyId: schema.llmProviderApiKeyModelsTable.apiKeyId })
+      .from(schema.llmProviderApiKeyModelsTable)
+      .where(eq(schema.llmProviderApiKeyModelsTable.modelId, model.id));
+
+    return rows.map((row) => row.apiKeyId);
+  }
+
+  /**
    * Sync models for an API key.
-   * This replaces all existing model links with the new set.
-   * Also detects and marks the "fastest" and "best" models for the provider.
+   * This replaces the set of model links with the new set (stale links are
+   * deleted, current ones updated in place). Also detects and marks the
+   * "best" model for the provider.
+   *
+   * `recommendedForAgents` is the endpoint-scoped agent-suitability verdict.
+   * By default a null verdict keeps the link's last known one (Ollama's
+   * `/api/show` is time-boxed and degrades to null per model, and a transient
+   * miss must not silently un-flag a 4B model). `overwriteRecommendedForAgents`
+   * writes the verdict verbatim: an Ollama tag is mutable (`ollama create` can
+   * repoint it), so a full refresh has to stay the way to correct a stale one.
    *
    * @param apiKeyId - The database ID of the API key
-   * @param models - Array of models with their database ID and modelId string
+   * @param models - Array of models with their database ID, modelId string, and verdict
    * @param provider - The provider for pattern matching
+   * @param options - `overwriteRecommendedForAgents` for the full-refresh path
    */
   static async syncModelsForApiKey(
     apiKeyId: string,
-    models: Array<{ id: string; modelId: string }>,
+    models: Array<{
+      id: string;
+      modelId: string;
+      outputLength?: number | null;
+      recommendedForAgents?: boolean | null;
+      providerPricing?: ProviderModelPricing | null;
+      azureCapabilities?: typeof schema.llmProviderApiKeyModelsTable.$inferInsert.azureCapabilities;
+    }>,
     provider: SupportedProvider,
+    options: {
+      overwriteRecommendedForAgents?: boolean;
+      azureConfiguration?: { hash: string; defaultBaseUrl: string };
+    } = {},
   ): Promise<void> {
     const uniqueModels = Array.from(
       new Map(models.map((model) => [model.id, model])).values(),
     );
 
-    await db.transaction(async (tx) => {
-      // Delete existing links for this API key
-      await tx
-        .delete(schema.llmProviderApiKeyModelsTable)
-        .where(eq(schema.llmProviderApiKeyModelsTable.apiKeyId, apiKeyId));
+    await withDbTransaction(async (tx) => {
+      // A discovery request may finish after the operator changes its endpoint.
+      // Lock the key through this write so stale evidence cannot overwrite a new configuration.
+      if (provider === "azure" && options.azureConfiguration) {
+        const [key] = await tx
+          .select()
+          .from(schema.llmProviderApiKeysTable)
+          .where(eq(schema.llmProviderApiKeysTable.id, apiKeyId))
+          .for("update");
+        if (
+          !key ||
+          azureCapabilityConfigurationHash({
+            ...key,
+            baseUrl: key.baseUrl || options.azureConfiguration.defaultBaseUrl,
+          }) !== options.azureConfiguration.hash
+        )
+          return;
+      }
+      // Delete links to models the provider no longer serves. Kept links are
+      // updated in place below so their last known verdict can survive a
+      // sync that learned nothing.
+      await tx.delete(schema.llmProviderApiKeyModelsTable).where(
+        uniqueModels.length > 0
+          ? and(
+              eq(schema.llmProviderApiKeyModelsTable.apiKeyId, apiKeyId),
+              notInArray(
+                schema.llmProviderApiKeyModelsTable.modelId,
+                uniqueModels.map((model) => model.id),
+              ),
+            )
+          : eq(schema.llmProviderApiKeyModelsTable.apiKeyId, apiKeyId),
+      );
 
       // Insert new links
       if (uniqueModels.length > 0) {
-        // Detect fastest and best models using pattern matching
-        // Patterns are checked in order (first pattern = highest priority)
-        const patterns = MODEL_MARKER_PATTERNS[provider];
-        const sorted = [...uniqueModels].sort((a, b) =>
-          a.modelId.localeCompare(b.modelId),
-        );
-
-        // Find first matching model respecting pattern priority order
-        const fastestModel = findFirstMatchByPatternPriority(
-          sorted,
-          patterns.fastest,
-        );
-        const bestModel = findFirstMatchByPatternPriority(
-          sorted,
-          patterns.best,
-        );
+        // `is_best` marks the provider's default-trio `normal` model.
+        const bestModel = findTierDefault(uniqueModels, provider, "normal");
 
         // Build values with markers
+        const syncedAt = new Date();
         const values = uniqueModels.map((model) => ({
           apiKeyId,
           modelId: model.id,
-          isFastest: model.id === fastestModel?.id,
+          outputLength: model.outputLength ?? null,
           isBest: model.id === bestModel?.id,
+          recommendedForAgents: model.recommendedForAgents ?? null,
+          syncedAt,
+          providerPricing: model.providerPricing ?? null,
+          azureCapabilities: model.azureCapabilities ?? null,
         }));
 
         // Batch insert
@@ -144,8 +338,14 @@ class LlmProviderApiKeyModelLinkModel {
                 schema.llmProviderApiKeyModelsTable.modelId,
               ],
               set: {
-                isFastest: sql`excluded.is_fastest`,
                 isBest: sql`excluded.is_best`,
+                syncedAt: sql`excluded.synced_at`,
+                outputLength: sql`excluded.output_length`,
+                providerPricing: sql`excluded.provider_pricing`,
+                azureCapabilities: sql`excluded.azure_capabilities`,
+                recommendedForAgents: options.overwriteRecommendedForAgents
+                  ? sql`excluded.recommended_for_agents`
+                  : sql`COALESCE(excluded.recommended_for_agents, ${schema.llmProviderApiKeyModelsTable.recommendedForAgents})`,
               },
             });
         }
@@ -154,101 +354,119 @@ class LlmProviderApiKeyModelLinkModel {
   }
 
   /**
-   * Get all models with their linked API keys.
-   * Only returns models that have at least one API key linked.
-   * Includes isFastest and isBest markers (true if ANY linked API key has the marker).
+   * Models linked to at least one provider key, with the visible keys that
+   * serve each one (a model with only hidden keys is listed with none).
+   * `isBest` counts every linked key. One statement.
    */
-  static async getAllModelsWithApiKeys(): Promise<
-    Array<{
-      model: Model;
-      isFastest: boolean;
-      isBest: boolean;
-      apiKeys: Array<{
-        id: string;
-        name: string;
-        provider: string;
-        scope: string;
-        isSystem: boolean;
-      }>;
-    }>
+  static async findLinkedModels(params: {
+    visibleKeyIds: string[];
+    /** Only models linked to one of these keys; keys not visible are ignored. */
+    apiKeyIds?: string[];
+    /** Only embedding models (those with known dimensions). */
+    embeddingOnly?: boolean;
+  }): Promise<
+    Array<{ model: Model; isBest: boolean; apiKeys: LinkedApiKey[] }>
   > {
-    // Get all relationships with model and API key data in a single query
-    // This only returns models that have at least one API key linked
-    // Order by provider and modelId for consistent display
-    const relationships = await db
+    const visibleKeyIds = new Set(params.visibleKeyIds);
+    const keyFilter = params.apiKeyIds?.filter((id) => visibleKeyIds.has(id));
+    if (keyFilter?.length === 0) return [];
+    const links = schema.llmProviderApiKeyModelsTable;
+    const keys = schema.llmProviderApiKeysTable;
+
+    const results = await db
       .select({
         model: schema.modelsTable,
-        isFastest: schema.llmProviderApiKeyModelsTable.isFastest,
-        isBest: schema.llmProviderApiKeyModelsTable.isBest,
-        apiKeyId: schema.llmProviderApiKeysTable.id,
-        apiKeyName: schema.llmProviderApiKeysTable.name,
-        apiKeyProvider: schema.llmProviderApiKeysTable.provider,
-        apiKeyScope: schema.llmProviderApiKeysTable.scope,
-        apiKeyIsSystem: schema.llmProviderApiKeysTable.isSystem,
+        pricing: sql<
+          Array<ProviderModelPricing | null>
+        >`coalesce(json_agg(${links.providerPricing}) FILTER (WHERE ${keys.id} IS NOT NULL ${keyFilter ? sql`AND ${inArray(keys.id, keyFilter)}` : sql``}), '[]'::json)`,
+        isBest: sql<boolean>`bool_or(${links.isBest})`,
+        apiKeys: sql<LinkedApiKey[]>`coalesce(
+          json_agg(
+            json_build_object(
+              'id', ${keys.id},
+              'name', ${keys.name},
+              'provider', ${keys.provider},
+              'scope', ${keys.scope},
+              'isSystem', ${keys.isSystem}
+            ) ORDER BY ${keys.createdAt}, ${keys.id}
+          ) FILTER (WHERE ${keys.id} IS NOT NULL),
+          '[]'::json
+        )`,
       })
-      .from(schema.llmProviderApiKeyModelsTable)
-      .innerJoin(
-        schema.modelsTable,
-        eq(schema.llmProviderApiKeyModelsTable.modelId, schema.modelsTable.id),
+      .from(links)
+      .innerJoin(schema.modelsTable, eq(links.modelId, schema.modelsTable.id))
+      .leftJoin(
+        keys,
+        and(eq(links.apiKeyId, keys.id), inArray(keys.id, [...visibleKeyIds])),
       )
-      .innerJoin(
-        schema.llmProviderApiKeysTable,
-        eq(
-          schema.llmProviderApiKeyModelsTable.apiKeyId,
-          schema.llmProviderApiKeysTable.id,
+      .where(
+        and(
+          keyFilter
+            ? inArray(
+                schema.modelsTable.id,
+                db
+                  .select({ id: links.modelId })
+                  .from(links)
+                  .where(inArray(links.apiKeyId, keyFilter)),
+              )
+            : undefined,
+          params.embeddingOnly
+            ? isNotNull(schema.modelsTable.embeddingDimensions)
+            : undefined,
         ),
       )
+      .groupBy(schema.modelsTable.id)
       .orderBy(
         asc(schema.modelsTable.provider),
         asc(schema.modelsTable.modelId),
       );
+    return results.map(({ pricing, ...row }) => ({
+      ...row,
+      model: ModelModel.withProviderPricing(row.model, pricing),
+    }));
+  }
 
-    // Group by model, collecting API keys for each
-    // isFastest/isBest are true if ANY linked API key has the marker
-    const modelMap = new Map<
-      string,
-      {
-        model: Model;
-        isFastest: boolean;
-        isBest: boolean;
-        apiKeys: Array<{
-          id: string;
-          name: string;
-          provider: string;
-          scope: string;
-          isSystem: boolean;
-        }>;
-      }
-    >();
+  /** Which of `modelIds` are linked to at least one of `apiKeyIds`. */
+  static async filterLinkedModelIds(params: {
+    apiKeyIds: string[];
+    modelIds: string[];
+  }): Promise<Set<string>> {
+    if (params.apiKeyIds.length === 0 || params.modelIds.length === 0)
+      return new Set();
+    const links = schema.llmProviderApiKeyModelsTable;
+    const rows = await db
+      .selectDistinct({ modelId: links.modelId })
+      .from(links)
+      .where(
+        and(
+          inArray(links.apiKeyId, params.apiKeyIds),
+          inArray(links.modelId, params.modelIds),
+        ),
+      );
+    return new Set(rows.map((row) => row.modelId));
+  }
 
-    for (const rel of relationships) {
-      const modelId = rel.model.id;
-      let entry = modelMap.get(modelId);
-
-      if (!entry) {
-        entry = {
-          model: rel.model,
-          isFastest: false,
-          isBest: false,
-          apiKeys: [],
-        };
-        modelMap.set(modelId, entry);
-      }
-
-      // Set markers if any relationship has them
-      if (rel.isFastest) entry.isFastest = true;
-      if (rel.isBest) entry.isBest = true;
-
-      entry.apiKeys.push({
-        id: rel.apiKeyId,
-        name: rel.apiKeyName,
-        provider: rel.apiKeyProvider,
-        scope: rel.apiKeyScope,
-        isSystem: rel.apiKeyIsSystem,
-      });
-    }
-
-    return Array.from(modelMap.values());
+  /** The non-ignored models each of the given keys serves. */
+  static async findModelsByKey(
+    apiKeyIds: string[],
+  ): Promise<Array<{ apiKeyId: string; id: string; modelId: string }>> {
+    if (apiKeyIds.length === 0) return [];
+    const links = schema.llmProviderApiKeyModelsTable;
+    return await db
+      .select({
+        apiKeyId: links.apiKeyId,
+        id: schema.modelsTable.id,
+        modelId: schema.modelsTable.modelId,
+      })
+      .from(links)
+      .innerJoin(schema.modelsTable, eq(links.modelId, schema.modelsTable.id))
+      .where(
+        and(
+          inArray(links.apiKeyId, apiKeyIds),
+          eq(schema.modelsTable.ignored, false),
+        ),
+      )
+      .orderBy(asc(schema.modelsTable.modelId));
   }
 
   /**
@@ -291,6 +509,34 @@ class LlmProviderApiKeyModelLinkModel {
   }
 
   /**
+   * Remove one model from an API key's synced list, e.g. after the provider
+   * rejected it for this credential. Returns whether a link was removed.
+   */
+  static async unlinkModelFromApiKey(params: {
+    apiKeyId: string;
+    provider: SupportedProvider;
+    modelId: string;
+  }): Promise<boolean> {
+    const model = await ModelModel.findByProviderAndModelId(
+      params.provider,
+      params.modelId,
+    );
+    if (!model) {
+      return false;
+    }
+    const removed = await db
+      .delete(schema.llmProviderApiKeyModelsTable)
+      .where(
+        and(
+          eq(schema.llmProviderApiKeyModelsTable.apiKeyId, params.apiKeyId),
+          eq(schema.llmProviderApiKeyModelsTable.modelId, model.id),
+        ),
+      )
+      .returning({ id: schema.llmProviderApiKeyModelsTable.id });
+    return removed.length > 0;
+  }
+
+  /**
    * Get count of linked models for an API key.
    */
   static async getModelCountForApiKey(apiKeyId: string): Promise<number> {
@@ -302,31 +548,82 @@ class LlmProviderApiKeyModelLinkModel {
     return result?.count ?? 0;
   }
 
+  static async getLinkedModelSelectionKeys(
+    selections: CompleteModelSelection[],
+  ): Promise<Set<string>> {
+    if (selections.length === 0) {
+      return new Set();
+    }
+
+    const uniqueSelections = Array.from(
+      new Map(
+        selections.map((selection) => [selectionKey(selection), selection]),
+      ).values(),
+    );
+
+    const conditions = uniqueSelections.map((selection) =>
+      and(
+        eq(schema.llmProviderApiKeyModelsTable.modelId, selection.modelId),
+        eq(schema.llmProviderApiKeyModelsTable.apiKeyId, selection.apiKeyId),
+      ),
+    );
+    const whereClause = or(...conditions);
+    if (!whereClause) {
+      return new Set();
+    }
+
+    const rows = await db
+      .select({
+        modelId: schema.llmProviderApiKeyModelsTable.modelId,
+        apiKeyId: schema.llmProviderApiKeyModelsTable.apiKeyId,
+      })
+      .from(schema.llmProviderApiKeyModelsTable)
+      .where(whereClause);
+
+    return new Set(rows.map(selectionKey));
+  }
+
   /**
    * Get unique models for a list of API key IDs.
-   * Returns models with their data and isBest/isFastest markers,
+   * Returns models with their data and isBest marker,
    * ordered by provider and modelId.
-   * A model is marked as best/fastest if ANY of the provided API keys marks it so.
+   * A model is marked as best if ANY of the provided API keys marks it so.
+   *
+   * `recommendedForAgents` aggregates pessimistically: the listing collapses
+   * the given keys' links into one row per model, so if ANY key's endpoint
+   * serves a build judged unfit, the merged row carries `false` — over-warning
+   * beats a key hiding another key's evidence. Keys with no evidence (null)
+   * don't vote; all-null stays null.
    */
-  static async getModelsForApiKeyIds(
-    apiKeyIds: string[],
-  ): Promise<Array<{ model: Model; isBest: boolean; isFastest: boolean }>> {
+  static async getModelsForApiKeyIds(apiKeyIds: string[]): Promise<
+    Array<{
+      model: Model;
+      isBest: boolean;
+      recommendedForAgents: boolean | null;
+    }>
+  > {
     if (apiKeyIds.length === 0) {
       return [];
     }
 
-    // Get models with aggregated markers (true if ANY linked key has the marker)
+    // Get models with aggregated best marker (true if ANY linked key has the marker)
     const results = await db
       .select({
         model: schema.modelsTable,
+        pricing: sql<
+          Array<ProviderModelPricing | null>
+        >`json_agg(${schema.llmProviderApiKeyModelsTable.providerPricing})`,
         isBest:
           sql<boolean>`bool_or(${schema.llmProviderApiKeyModelsTable.isBest})`.as(
             "is_best_agg",
           ),
-        isFastest:
-          sql<boolean>`bool_or(${schema.llmProviderApiKeyModelsTable.isFastest})`.as(
-            "is_fastest_agg",
-          ),
+        // bool_and skips NULLs: false if any key says false, true if every
+        // key with evidence says true, null when no key has evidence.
+        recommendedForAgents: sql<
+          boolean | null
+        >`bool_and(${schema.llmProviderApiKeyModelsTable.recommendedForAgents})`.as(
+          "recommended_for_agents_agg",
+        ),
       })
       .from(schema.llmProviderApiKeyModelsTable)
       .innerJoin(
@@ -341,15 +638,137 @@ class LlmProviderApiKeyModelLinkModel {
       );
 
     return results.map((r) => ({
-      model: r.model,
+      model: ModelModel.withProviderPricing(r.model, r.pricing),
       isBest: r.isBest,
-      isFastest: r.isFastest,
+      recommendedForAgents: r.recommendedForAgents,
     }));
   }
+  /**
+   * Get a per-user provider's models that have been synced by ANY member of the
+   * org (across every member's personal key for that provider).
+   *
+   * Per-user providers (GitHub Copilot) catalogue the same models for everyone —
+   * only the credential is resolved per-user at request time — so the picker for
+   * a member who hasn't connected should still list the provider's models
+   * (flagged "connect your account") rather than show an empty list. Scoping to
+   * org keys keeps it to models that have actually been connected in this org.
+   * A model is `isBest` if any linked key in the org marks it so.
+   */
+  static async getOrgModelsForPerUserProvider(
+    organizationId: string,
+    provider: SupportedProvider,
+  ): Promise<Array<{ model: Model; isBest: boolean }>> {
+    const results = await db
+      .select({
+        model: schema.modelsTable,
+        isBest:
+          sql<boolean>`bool_or(${schema.llmProviderApiKeyModelsTable.isBest})`.as(
+            "is_best_agg",
+          ),
+      })
+      .from(schema.llmProviderApiKeyModelsTable)
+      .innerJoin(
+        schema.modelsTable,
+        eq(schema.llmProviderApiKeyModelsTable.modelId, schema.modelsTable.id),
+      )
+      .innerJoin(
+        schema.llmProviderApiKeysTable,
+        eq(
+          schema.llmProviderApiKeyModelsTable.apiKeyId,
+          schema.llmProviderApiKeysTable.id,
+        ),
+      )
+      .where(
+        and(
+          eq(schema.llmProviderApiKeysTable.organizationId, organizationId),
+          eq(schema.llmProviderApiKeysTable.provider, provider),
+          eq(schema.modelsTable.provider, provider),
+          // Personal sign-ins only: a shared key on this provider (a GitHub
+          // App key) lists its models as that key's own, not here.
+          isNotNull(schema.llmProviderApiKeysTable.userId),
+        ),
+      )
+      .groupBy(schema.modelsTable.id)
+      .orderBy(
+        asc(schema.modelsTable.provider),
+        asc(schema.modelsTable.modelId),
+      );
+
+    return results.map((r) => ({
+      model: r.model,
+      isBest: r.isBest,
+    }));
+  }
+
   /**
    * Get the "best" model for a specific API key.
    * Returns the model marked with is_best=true, or falls back to the first model.
    */
+  /**
+   * Ranked (model, key) pairs across the given API keys — the "best available
+   * model" fallback for resolution. Rows are ordered is_best first, then by
+   * provider and model id, so the first row is a deterministic best pick.
+   * `modelId` is the models.id UUID (matches the model_id FK columns).
+   *
+   * Only chat-capable, non-ignored models are returned, matching the model
+   * picker (`supportsTextChat`), so resolution never auto-selects a model the
+   * UI hides or that cannot serve chat.
+   */
+  static async getRankedModelsForApiKeys(
+    apiKeyIds: string[],
+  ): Promise<Array<{ modelId: string; apiKeyId: string; isBest: boolean }>> {
+    if (apiKeyIds.length === 0) {
+      return [];
+    }
+    const rows = await db
+      .select({
+        model: schema.modelsTable,
+        apiKeyId: schema.llmProviderApiKeyModelsTable.apiKeyId,
+        isBest: schema.llmProviderApiKeyModelsTable.isBest,
+      })
+      .from(schema.llmProviderApiKeyModelsTable)
+      .innerJoin(
+        schema.modelsTable,
+        eq(schema.llmProviderApiKeyModelsTable.modelId, schema.modelsTable.id),
+      )
+      .where(inArray(schema.llmProviderApiKeyModelsTable.apiKeyId, apiKeyIds))
+      .orderBy(
+        desc(schema.llmProviderApiKeyModelsTable.isBest),
+        asc(schema.modelsTable.provider),
+        asc(schema.modelsTable.modelId),
+      );
+
+    return rows
+      .filter((row) => ModelModel.supportsTextChat(row.model))
+      .map((row) => ({
+        modelId: row.model.id,
+        apiKeyId: row.apiKeyId,
+        isBest: row.isBest,
+      }));
+  }
+
+  /**
+   * The key's preferred fast-tier chat model (`PROVIDER_FAST_MODEL_PATTERNS`),
+   * or null when its provider has no fast tier or the key serves none of it.
+   */
+  static async getFastModel(params: {
+    apiKeyId: string;
+    provider: SupportedProvider;
+  }): Promise<Model | null> {
+    const patterns = PROVIDER_FAST_MODEL_PATTERNS[params.provider];
+    if (!patterns) return null;
+    const models = (
+      await LlmProviderApiKeyModelLinkModel.getModelsForApiKey(params.apiKeyId)
+    )
+      .filter(
+        (model) =>
+          ModelModel.supportsTextChat(model) &&
+          !PRO_TIER_MODEL_ID.test(model.modelId),
+      )
+      .sort((a, b) => a.modelId.localeCompare(b.modelId));
+    return findFirstMatchByPatternPriority(models, patterns) ?? null;
+  }
+
   static async getBestModel(apiKeyId: string): Promise<Model | null> {
     const [result] = await db
       .select({ model: schema.modelsTable })
@@ -366,7 +785,7 @@ class LlmProviderApiKeyModelLinkModel {
       )
       .limit(1);
 
-    if (result?.model) {
+    if (result?.model && ModelModel.supportsTextChat(result.model)) {
       return result.model;
     }
 
@@ -375,7 +794,9 @@ class LlmProviderApiKeyModelLinkModel {
 
   /**
    * Get the "best" model for multiple API keys in two batched queries.
-   * Returns the model marked with is_best=true, or falls back to the first model.
+   * Returns the model marked with is_best=true, or falls back to the first
+   * model. Both candidates are filtered through `supportsTextChat`, so a hidden
+   * or non-chat model is never returned as a key's best.
    */
   static async getBestModelsForApiKeys(
     apiKeyIds: string[],
@@ -407,7 +828,9 @@ class LlmProviderApiKeyModelLinkModel {
 
     const modelsByApiKeyId = new Map<string, Model>();
     for (const result of bestModels) {
-      modelsByApiKeyId.set(result.apiKeyId, result.model);
+      if (ModelModel.supportsTextChat(result.model)) {
+        modelsByApiKeyId.set(result.apiKeyId, result.model);
+      }
     }
 
     const missingApiKeyIds = apiKeyIds.filter(
@@ -437,7 +860,10 @@ class LlmProviderApiKeyModelLinkModel {
       );
 
     for (const result of fallbackModels) {
-      if (!modelsByApiKeyId.has(result.apiKeyId)) {
+      if (
+        !modelsByApiKeyId.has(result.apiKeyId) &&
+        ModelModel.supportsTextChat(result.model)
+      ) {
         modelsByApiKeyId.set(result.apiKeyId, result.model);
       }
     }
@@ -446,37 +872,12 @@ class LlmProviderApiKeyModelLinkModel {
   }
 
   /**
-   * Get the "fastest" model for a specific API key.
-   * Returns the model marked with is_fastest=true, or falls back to the first model.
-   */
-  static async getFastestModel(apiKeyId: string): Promise<Model | null> {
-    const [result] = await db
-      .select({ model: schema.modelsTable })
-      .from(schema.llmProviderApiKeyModelsTable)
-      .innerJoin(
-        schema.modelsTable,
-        eq(schema.llmProviderApiKeyModelsTable.modelId, schema.modelsTable.id),
-      )
-      .where(
-        and(
-          eq(schema.llmProviderApiKeyModelsTable.apiKeyId, apiKeyId),
-          eq(schema.llmProviderApiKeyModelsTable.isFastest, true),
-        ),
-      )
-      .limit(1);
-
-    if (result?.model) {
-      return result.model;
-    }
-
-    return LlmProviderApiKeyModelLinkModel.getFirstModelForApiKey(apiKeyId);
-  }
-
-  /**
-   * Get the first model linked to an API key (used as fallback).
+   * Get the first chat-capable, non-ignored model linked to an API key (used as
+   * fallback). Honors `supportsTextChat` so a hidden or non-chat model — e.g. a
+   * legacy completions-only model that sorts first alphabetically — is skipped.
    */
   static async getFirstModelForApiKey(apiKeyId: string): Promise<Model | null> {
-    const [result] = await db
+    const rows = await db
       .select({ model: schema.modelsTable })
       .from(schema.llmProviderApiKeyModelsTable)
       .innerJoin(
@@ -484,10 +885,11 @@ class LlmProviderApiKeyModelLinkModel {
         eq(schema.llmProviderApiKeyModelsTable.modelId, schema.modelsTable.id),
       )
       .where(eq(schema.llmProviderApiKeyModelsTable.apiKeyId, apiKeyId))
-      .orderBy(asc(schema.modelsTable.modelId))
-      .limit(1);
+      .orderBy(asc(schema.modelsTable.modelId));
 
-    return result?.model ?? null;
+    return (
+      rows.find((row) => ModelModel.supportsTextChat(row.model))?.model ?? null
+    );
   }
 }
 
@@ -497,15 +899,22 @@ export default LlmProviderApiKeyModelLinkModel;
 // Helper functions
 // ============================================================================
 
+export function selectionKey(selection: CompleteModelSelection): string {
+  return `${selection.apiKeyId}:${selection.modelId}`;
+}
+
+/** A `pro` token: the reasoning tier above a fast model of the same name. */
+const PRO_TIER_MODEL_ID = /(?:^|[-/])pro(?:[-/:]|$)/i;
+
 /**
  * Find the first model matching patterns, respecting pattern priority order.
  * Patterns are checked in order (first pattern = highest priority).
  * For each pattern, returns the first alphabetically sorted match.
  */
-function findFirstMatchByPatternPriority(
-  sortedModels: Array<{ id: string; modelId: string }>,
+function findFirstMatchByPatternPriority<T extends { modelId: string }>(
+  sortedModels: T[],
   patterns: string[],
-): { id: string; modelId: string } | undefined {
+): T | undefined {
   for (const pattern of patterns) {
     const match = sortedModels.find((m) =>
       m.modelId.toLowerCase().includes(pattern.toLowerCase()),

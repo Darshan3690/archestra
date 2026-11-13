@@ -1,0 +1,2453 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import type { Readable, Writable } from "node:stream";
+import { Readable as NodeReadable } from "node:stream";
+import { followAgentCatalogImage } from "@archestra/shared";
+import type * as k8s from "@kubernetes/client-node";
+import { PatchStrategy, setHeaderOptions } from "@kubernetes/client-node";
+import type WebSocket from "ws";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
+import config from "@/config";
+import { getK8sCapabilities } from "@/k8s/capabilities";
+import { clusterDnsResolver } from "@/k8s/cluster-dns";
+import { clusterIpFamilyResolver } from "@/k8s/cluster-ip-families";
+import { resolveRuntimeOwnerReferences } from "@/k8s/mcp-server-runtime/runtime-owner";
+import {
+  createK8sClients,
+  getK8sNamespace,
+  isK8sConflictError,
+  isK8sNotFoundError,
+  isTransientK8sApiError,
+  loadKubeConfig,
+  withK8sApiRetry,
+} from "@/k8s/shared";
+import logger from "@/logging";
+import {
+  AgentModel,
+  AgentRunInputModel,
+  AgentRunModel,
+  AgentWorkspaceModel,
+  OAuthAccessTokenModel,
+  OrganizationModel,
+  VirtualApiKeyModel,
+} from "@/models";
+import McpDeploymentLeaseModel, {
+  ClusterLeaseHeldError,
+} from "@/models/mcp-deployment-lease";
+import ServiceAccountModel from "@/models/service-account";
+import { reportAgentRuntimeSteer } from "@/observability/metrics/agent-runtime";
+import type { AgentRunLaunchSpec } from "@/services/agent-runtime/backends/types";
+import {
+  agentRuntimeFailureReason,
+  agentRuntimeTurnFailure,
+} from "@/services/agent-runtime/failure-reason";
+import {
+  type AgentRunFailureCode,
+  agentRunFailure,
+  tagAgentRunFailure,
+} from "@/services/agent-runtime/run-failure";
+import {
+  AGENT_RUNTIME_ATTACH_SCRIPT,
+  AGENT_RUNTIME_ATTACHMENTS_MANIFEST,
+  AGENT_RUNTIME_CREDENTIALS_SECRET_KEY,
+  AGENT_RUNTIME_INPUTS_READY_FILE,
+  agentRunGatewayTokenId,
+} from "@/services/agent-runtime/runtime-contract";
+import { resolveCredential } from "@/services/credentials";
+import { resolveEffectiveNetworkPolicy } from "@/services/environments/network-policy";
+import type {
+  AgentRunInput,
+  AgentRunRecord,
+  AgentRuntimeSteerMode,
+} from "@/types";
+import { ApiError } from "@/types";
+import type { A2ATaskFailure } from "@/types/a2a-task";
+import {
+  type AgentWorkspaceFileRequest,
+  AgentWorkspaceFileRequestSchema,
+  AgentWorkspaceFileResultSchema,
+} from "@/types/agent-workspace-file";
+import { RenewableCredentialBundleSchema } from "@/types/renewable-credential";
+import { buildAtomicFileWriteCommand } from "./atomic-file-write";
+import {
+  AgentRuntimeCommandFailedError,
+  AgentRuntimeCommandTransportError,
+  AgentRuntimeExecConnectionError,
+  execAgentRuntimeCommand,
+  streamAgentRuntimeCommand,
+} from "./exec";
+import { usesFloatingAgentImageTag } from "./image-pull-policy";
+import {
+  AGENT_RUNTIME_CONTAINER_NAME,
+  AGENT_RUNTIME_TMUX_SESSION,
+  AGENT_SANDBOX_API,
+  type AgentSandbox,
+  buildAgentRuntimePlatformEgressPolicy,
+  buildAgentRuntimeSandbox,
+  buildAgentRuntimeSecret,
+  buildAgentRuntimeTerminalIntegrationScript,
+  buildAgentRuntimeTurnScript,
+  type KubernetesAgentRunLaunchSpec,
+} from "./manifests";
+import {
+  describeMemoryKill,
+  MEMORY_EVENTS_AFTER_RESULT_SCRIPT,
+  type MemoryEvents,
+  type MemoryKill,
+  memoryKillBetween,
+  parseMemoryEvents,
+  READ_MEMORY_EVENTS_COMMAND,
+  splitTurnPoll,
+  turnEndingKill,
+} from "./memory-kill";
+import {
+  AGENT_RUNTIME_LEASE_SCOPE,
+  AGENT_RUNTIME_TASK_LABEL,
+  AGENT_RUNTIME_WORKSPACE_LABEL,
+  agentRuntimeNames,
+} from "./naming";
+import {
+  AGENT_RUNTIME_EGRESS_POLICY_CRDS,
+  type AgentRuntimeEgressPolicyObject,
+  buildAgentRuntimeEnvironmentEgressPolicies,
+} from "./network-policy";
+import { resolvePlatformServiceDestination } from "./platform-service";
+import {
+  agentRuntimePodTier,
+  classifyAgentRuntimePodFailure,
+  describeAgentRuntimePodFailure,
+} from "./pod-failure";
+import { agentSandboxApi } from "./sandbox-api";
+import {
+  type AgentRuntimeStartupProgress,
+  type AgentRuntimeStartupProgressReporter,
+  attachingProgress,
+  describeAgentRuntimeStartupProgress,
+  hasAgentRuntimeImagePullFailure,
+  isSameAgentRuntimeStartupProgress,
+} from "./startup-phase";
+import { buildTmuxSteerCommand } from "./steering";
+import { withTranscriptRecoveryPod } from "./transcript-recovery";
+import {
+  agentWarmPoolManager,
+  readWorkspaceSandbox,
+  SANDBOX_CLAIM_API,
+  servedLaunchSpec,
+} from "./warm-pool";
+
+/** `K8sClients` is internal to the shared module, so it is derived here. */
+type K8sClients = ReturnType<typeof createK8sClients>;
+
+/**
+ * The Kubernetes side of an Agent Runtime run session: create the pod carrying a task,
+ * deliver steer messages into it, attach to it, and tear it down.
+ *
+ * Deliberately holds no lifecycle state. Whether the work is going well is the
+ * A2A task's business — this manager only answers for the pod, so the two can
+ * never disagree about what is happening.
+ */
+class AgentRuntimeManager {
+  private clients: K8sClients | null = null;
+  private readonly terminatingSandboxes = new Set<string>();
+
+  /** Whether the cluster serves the Agent Sandbox API; see `agentSandboxApi`. */
+  get isEnabled(): boolean {
+    return agentSandboxApi.isInstalled;
+  }
+
+  /**
+   * Reject a run on a cluster without the upstream Agent Sandbox controller.
+   * Every run is a `Sandbox` custom resource; without its CRD the create
+   * returns a bare 404 and the run fails before writing any output.
+   */
+  async assertSandboxApiInstalled(): Promise<void> {
+    if (!(await agentSandboxApi.refresh())) {
+      throw tagAgentRunFailure(
+        new ApiError(503, AGENT_SANDBOX_CONTROLLER_MISSING_MESSAGE),
+        "launch.controller_missing",
+      );
+    }
+  }
+
+  /**
+   * Create the Kubernetes objects for one session. The Secret is written
+   * before the Job so the pod cannot start against a half-populated
+   * environment, and the network policy before both so a pod is never
+   * schedulable without its egress isolation in force.
+   */
+  async launch(spec: AgentRunLaunchSpec): Promise<void> {
+    await this.assertSandboxApiInstalled();
+    const clients = this.requireClients();
+    const names = agentRuntimeNames(spec.frozenName);
+    const { runtimeScope, ...runtimeSpec } = spec;
+    const withOwner: KubernetesAgentRunLaunchSpec = {
+      ...runtimeSpec,
+      namespace: runtimeScope,
+      ownerReferences: await resolveRuntimeOwnerReferences(
+        clients.rbacApi,
+        runtimeScope,
+      ).catch((error) => {
+        logger.warn(
+          { error },
+          "Could not resolve runtime owner references for an Agent run",
+        );
+        return undefined;
+      }),
+    };
+
+    const sandboxKey = `${withOwner.namespace}/${names.sandbox}`;
+    let awaitingPriorDeletion =
+      Boolean(spec.replacePriorAttempt) ||
+      this.terminatingSandboxes.has(sandboxKey);
+    const startupDeadline =
+      Date.now() + config.agentRuntime.podStartTimeoutSeconds * 1000;
+    let deletionPollDelayMs = 250;
+    while (true) {
+      const existingSandbox = await readWorkspaceSandbox({
+        api: clients.customObjectsApi,
+        name: names.sandbox,
+        namespace: withOwner.namespace,
+        includeDeletingClaim: true,
+        bypassCache: true,
+      }).catch((error) => {
+        if (isK8sNotFoundError(error)) return null;
+        throw error;
+      });
+      if (!existingSandbox) {
+        this.terminatingSandboxes.delete(sandboxKey);
+        break;
+      }
+      if (existingSandbox.metadata.deletionTimestamp) {
+        awaitingPriorDeletion = true;
+      }
+      if (!awaitingPriorDeletion) {
+        logger.info(
+          { taskId: withOwner.taskId, sandbox: names.sandbox },
+          "Adopting an existing Agent Sandbox with the same frozen name",
+        );
+        return;
+      }
+      this.terminatingSandboxes.add(sandboxKey);
+      if (Date.now() >= startupDeadline) {
+        throw tagAgentRunFailure(
+          new Error(
+            `Timed out waiting for previous Agent Sandbox ${names.sandbox} deletion to finish`,
+          ),
+          "launch.capacity_timeout",
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, deletionPollDelayMs));
+      deletionPollDelayMs = Math.min(deletionPollDelayMs * 2, 1000);
+    }
+
+    await withK8sApiRetry(
+      () =>
+        clients.coreApi.createNamespacedSecret({
+          namespace: withOwner.namespace,
+          body: buildAgentRuntimeSecret(withOwner),
+        }),
+      { label: "create Agent Runtime secret" },
+    );
+
+    const capabilities = (await getK8sCapabilities()).networkPolicy;
+    const clusterDnsIps = await clusterDnsResolver.getClusterDnsIps(
+      clients.coreApi,
+    );
+    await this.applyEgressPolicies(
+      buildAgentRuntimeEnvironmentEgressPolicies({
+        spec: withOwner,
+        capabilities,
+        clusterDnsIps,
+        clusterIpFamilies: await clusterIpFamilyResolver.getIpFamilies({
+          coreApi: clients.coreApi,
+          namespace: withOwner.namespace,
+          clusterDnsIps,
+        }),
+      }),
+    );
+    await this.applyNetworkPolicy(
+      buildAgentRuntimePlatformEgressPolicy({
+        spec: withOwner,
+        clusterDnsIps,
+        platformNamespace: process.env.POD_NAMESPACE || getK8sNamespace(),
+        platformPodLabels: config.agentRuntime.platformPodSelector,
+        platformPorts: [config.api.port],
+        platformService: await resolvePlatformServiceDestination({
+          coreApi: clients.coreApi,
+          baseUrl: config.agentRuntime.platformBaseUrl,
+          runtimeNamespace: withOwner.namespace,
+          platformNamespace: process.env.POD_NAMESPACE || getK8sNamespace(),
+        }),
+      }),
+    );
+
+    const claimed = await agentWarmPoolManager.claim({
+      api: clients.customObjectsApi,
+      spec: withOwner,
+    });
+    if (claimed) {
+      if (claimed.tier !== withOwner.tier)
+        await AgentRunModel.updateRuntimeLimitsTier({
+          taskId: spec.taskId,
+          tier: claimed.tier,
+          workspaceGiB: withOwner.warmTiers.find(
+            (candidate) => candidate.tier === claimed.tier,
+          )?.workspaceGiB,
+        });
+      const deadline =
+        Date.now() + config.agentRuntime.podStartTimeoutSeconds * 1000;
+      let pollDelayMs = 250;
+      while (true) {
+        try {
+          const sandbox = await readWorkspaceSandbox({
+            api: clients.customObjectsApi,
+            namespace: withOwner.namespace,
+            name: spec.frozenName,
+          });
+          if (!sandbox.metadata.deletionTimestamp) break;
+          if (Date.now() >= deadline) {
+            throw tagAgentRunFailure(
+              new Error(
+                `Timed out waiting for Agent Sandbox ${spec.frozenName} allocation`,
+              ),
+              "launch.capacity_timeout",
+            );
+          }
+        } catch (error) {
+          if (!isK8sNotFoundError(error) || Date.now() >= deadline) throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, pollDelayMs));
+        pollDelayMs = Math.min(pollDelayMs * 2, 1000);
+      }
+      const session = await AgentRunModel.findByTaskId(spec.taskId);
+      if (!session) throw new Error("This run no longer exists");
+      // A larger pool may have served it: tell the run the size it has.
+      await this.continueRun({
+        session,
+        spec: servedLaunchSpec(spec, claimed.tier),
+        initial: true,
+      });
+      return;
+    }
+
+    await withK8sApiRetry(
+      () =>
+        clients.customObjectsApi.createNamespacedCustomObject({
+          ...AGENT_SANDBOX_API,
+          namespace: withOwner.namespace,
+          body: buildAgentRuntimeSandbox(withOwner),
+        }),
+      { label: "create Agent Sandbox" },
+    ).catch((error) => {
+      if (!isK8sConflictError(error)) throw error;
+      logger.info(
+        { taskId: withOwner.taskId, sandbox: names.sandbox },
+        "Adopting an existing Agent Sandbox with the same frozen name",
+      );
+    });
+  }
+
+  /** Read or atomically replace a bounded file in the owning workspace. */
+  async accessWorkspaceFile(params: {
+    session: AgentRunRecord;
+    request: AgentWorkspaceFileRequest;
+  }) {
+    const request = AgentWorkspaceFileRequestSchema.parse(params.request);
+    const result = await this.execWorkspaceFilesHelper({
+      session: params.session,
+      args: [],
+      stdin: NodeReadable.from([JSON.stringify(request)]),
+    });
+    const response = JSON.parse(result);
+    if (response.ok !== true)
+      throw new ApiError(400, response.error || "File operation failed");
+    return AgentWorkspaceFileResultSchema.parse(response);
+  }
+
+  /** Send the workspace-files program to the Pod and run one of its commands. */
+  private async execWorkspaceFilesHelper(params: {
+    session: AgentRunRecord;
+    args: string[];
+    stdin?: Readable;
+    timeoutMs?: number;
+  }): Promise<string> {
+    try {
+      return await this.execInPod({
+        session: params.session,
+        podName: await this.requireRunningPodName(params.session),
+        command: [...workspaceFilesCommand(), ...params.args],
+        stdin: params.stdin,
+        timeoutMs: params.timeoutMs,
+      });
+    } catch (error) {
+      throw describeWorkspaceHelperFailure(error) ?? error;
+    }
+  }
+
+  /** Run one transfer control operation and return its parsed reply. */
+  async runWorkspaceTransferCommand(params: {
+    session: AgentRunRecord;
+    args: string[];
+    stdin?: Readable;
+    timeoutMs: number;
+  }): Promise<unknown> {
+    const result = await this.execWorkspaceFilesHelper({
+      session: params.session,
+      args: params.args,
+      stdin: params.stdin,
+      timeoutMs: params.timeoutMs,
+    });
+    const response = JSON.parse(result);
+    if (response.ok !== true) {
+      throw new ApiError(400, response.error || "File transfer failed");
+    }
+    return response;
+  }
+
+  /** Stream a snapshot's bytes. The reply body is the file, so it never
+   * passes through a string or a tool payload. */
+  async readWorkspaceTransferRange(params: {
+    session: AgentRunRecord;
+    transferId: string;
+    offset: number;
+    length: number;
+    timeoutMs: number;
+  }): Promise<{ stdout: Readable; completed: Promise<void> }> {
+    return streamAgentRuntimeCommand({
+      exec: this.requireClients().exec,
+      namespace: params.session.runtimeScope,
+      podName: await this.requireRunningPodName(params.session),
+      container: AGENT_RUNTIME_CONTAINER_NAME,
+      command: [
+        ...workspaceFilesCommand(),
+        "read-range",
+        params.transferId,
+        String(params.offset),
+        String(params.length),
+      ],
+      timeoutMs: params.timeoutMs,
+    });
+  }
+
+  /**
+   * Copy durable inputs into the shared runtime volume, then atomically release
+   * the bootstrap. The ready marker makes retries and reconciler adoption
+   * idempotent: a control-plane restart cannot launch the Agent against a
+   * half-written file set.
+   */
+  async stageInputs(params: {
+    session: AgentRunRecord;
+    inputs: AgentRunInput[];
+  }): Promise<void> {
+    if (params.inputs.length === 0) return;
+    const pod = await this.waitForRunningPod({
+      session: params.session,
+      timeoutMessage:
+        "Timed out waiting for the Agent pod to accept input files",
+    });
+    if (!pod) {
+      throw new Error("This session ended before its input files were staged");
+    }
+    const readyFile = `/var/run/archestra/turns/${params.session.taskId}.inputs-ready`;
+    const alreadyReady = await this.execInPod({
+      session: params.session,
+      podName: pod,
+      command: ["/bin/sh", "-c", 'test -f "$1"', "check-inputs", readyFile],
+    })
+      .then(() => true)
+      .catch(() => false);
+    if (alreadyReady) return;
+
+    for (const input of params.inputs) {
+      await this.execInPod({
+        session: params.session,
+        podName: pod,
+        command: [
+          "/bin/sh",
+          "-c",
+          'umask 077; mkdir -p "$1"; cat > "$2"',
+          "archestra-stage-input",
+          path.posix.dirname(input.runtimePath),
+          input.runtimePath,
+        ],
+        stdin: NodeReadable.from([input.fileData]),
+      });
+    }
+
+    const manifest = Buffer.from(
+      JSON.stringify(
+        params.inputs.map((input) => ({
+          name: input.originalName,
+          path: input.runtimePath,
+          mediaType: input.mimeType,
+          size: input.fileSize,
+        })),
+      ),
+      "utf8",
+    );
+    await this.execInPod({
+      session: params.session,
+      podName: pod,
+      command: [
+        "/bin/sh",
+        "-c",
+        'umask 077; cat > "$1" && mkdir -p /var/run/archestra/turns && touch "$2" "$3"',
+        "archestra-stage-input",
+        AGENT_RUNTIME_ATTACHMENTS_MANIFEST,
+        AGENT_RUNTIME_INPUTS_READY_FILE,
+        readyFile,
+      ],
+      stdin: NodeReadable.from([manifest]),
+    });
+  }
+
+  async continueRun(params: {
+    session: AgentRunRecord;
+    spec: AgentRunLaunchSpec;
+    initial?: boolean;
+  }): Promise<void> {
+    const clients = this.requireClients();
+    let sandbox = await readWorkspaceSandbox({
+      api: clients.customObjectsApi,
+      namespace: params.session.runtimeScope,
+      name: params.session.workloadName,
+    });
+    let container = findAgentRuntimeContainer(sandbox);
+    // A platform upgrade moves the maintained image tag under a retained
+    // workspace. Its old wrapper may no longer speak to this backend, so the
+    // next turn starts on the current image rather than refusing the workspace.
+    if (
+      container &&
+      container.image !== params.spec.image &&
+      followAgentCatalogImage({
+        image: container.image ?? "",
+        catalogImages: config.agentRuntime.catalogImages,
+      }) === params.spec.image &&
+      Boolean(container.securityContext?.privileged) === params.spec.privileged
+    ) {
+      sandbox = await this.moveWorkspaceToImage({
+        session: params.session,
+        sandbox,
+        image: params.spec.image,
+      });
+      container = findAgentRuntimeContainer(sandbox);
+    }
+    if (
+      container?.image !== params.spec.image ||
+      Boolean(container.securityContext?.privileged) !== params.spec.privileged
+    ) {
+      const changed = [
+        ...(container?.image !== params.spec.image ? ["software image"] : []),
+        ...(Boolean(container?.securityContext?.privileged) !==
+        params.spec.privileged
+          ? ["access to the host system"]
+          : []),
+      ].join(" and ");
+      throw tagAgentRunFailure(
+        new Error(
+          `This run cannot resume because these Agent settings changed: ${changed}. Start a new run from the Agent page to use the updated settings. Saved files are kept until their retention deadline.`,
+        ),
+        "run.settings_changed",
+      );
+    }
+    await this.refreshWorkspaceEgress({ sandbox, spec: params.spec });
+    await clients.coreApi.patchNamespacedSecret(
+      {
+        namespace: params.session.runtimeScope,
+        name: agentRuntimeNames(params.session.workloadName).secret,
+        body: {
+          stringData: {
+            [AGENT_RUNTIME_CREDENTIALS_SECRET_KEY]: JSON.stringify({
+              taskId: params.spec.taskId,
+              credentials: params.spec.renewableCredentials ?? {},
+            }),
+          },
+        },
+      },
+      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+    );
+    // Keep the pending handoff outside this process before waiting for compute.
+    // It contains credentials, so use a Secret, not annotations or task logs.
+    const initialSecretName = agentRuntimeNames(
+      params.session.workloadName,
+    ).secret;
+    const initialSecret = container.envFrom?.some(
+      ({ secretRef }) => secretRef?.name === initialSecretName,
+    )
+      ? await clients.coreApi.readNamespacedSecret({
+          namespace: params.session.runtimeScope,
+          name: initialSecretName,
+        })
+      : null;
+    const inheritedVariableNames = [
+      ...(container.env ?? []).map(({ name }) => name),
+      ...Object.keys(initialSecret?.data ?? {}),
+    ];
+    await clients.coreApi
+      .createNamespacedSecret({
+        namespace: params.session.runtimeScope,
+        body: {
+          metadata: {
+            name: pendingTurnSecretName(params.session),
+            labels: {
+              [AGENT_RUNTIME_WORKSPACE_LABEL]: params.session.workloadName,
+            },
+            ownerReferences: sandbox.metadata.uid
+              ? [
+                  {
+                    apiVersion: sandbox.apiVersion,
+                    kind: sandbox.kind,
+                    name: sandbox.metadata.name ?? params.session.workloadName,
+                    uid: sandbox.metadata.uid,
+                  },
+                ]
+              : undefined,
+          },
+          type: "Opaque",
+          stringData: {
+            request: buildAgentRuntimeTurnScript(params.spec, {
+              inheritedVariableNames,
+              initial: params.initial,
+            }),
+          },
+        },
+      })
+      .catch((error) => {
+        if (!isK8sConflictError(error)) throw error;
+      });
+    await this.recoverRun(params.session);
+  }
+
+  async recoverRun(session: AgentRunRecord): Promise<void> {
+    const clients = this.requireClients();
+    const pending = await clients.coreApi
+      .readNamespacedSecret({
+        namespace: session.runtimeScope,
+        name: pendingTurnSecretName(session),
+      })
+      .catch((error) => {
+        if (isK8sNotFoundError(error)) return null;
+        throw error;
+      });
+    const sandbox = await readWorkspaceSandbox({
+      api: clients.customObjectsApi,
+      namespace: session.runtimeScope,
+      name: session.workloadName,
+    });
+    if (
+      sandbox.spec.shutdownTime &&
+      Date.parse(sandbox.spec.shutdownTime) <= Date.now()
+    ) {
+      throw tagAgentRunFailure(
+        new ApiError(
+          409,
+          "The saved files have reached their retention deadline",
+        ),
+        "run.resume_refused",
+      );
+    }
+    if (
+      pending &&
+      pending.metadata?.labels?.[AGENT_RUNTIME_WORKSPACE_LABEL] !==
+        session.workloadName
+    ) {
+      throw tagAgentRunFailure(
+        new ApiError(409, "The saved conversation belongs to a different run"),
+        "run.resume_refused",
+      );
+    }
+    // The initial turn is already part of the Sandbox's bootstrap contract.
+    if (
+      !pending &&
+      sandbox.metadata.labels?.[AGENT_RUNTIME_TASK_LABEL] === session.taskId
+    )
+      return;
+    await clients.customObjectsApi.patchNamespacedCustomObject(
+      {
+        ...AGENT_SANDBOX_API,
+        namespace: session.runtimeScope,
+        name: sandbox.metadata.name ?? session.workloadName,
+        body: { spec: { operatingMode: "Running" } },
+      },
+      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+    );
+    const podName = await this.waitForRunningPod({
+      session,
+      timeoutMessage: "The run could not be resumed",
+    });
+    if (!podName) throw new Error("The Agent is not running");
+    await this.projectWarmCredentials(session, podName);
+    const script = pending?.data?.request;
+    if (!script) {
+      const published = await this.execInPod({
+        session,
+        podName,
+        command: [
+          "/bin/sh",
+          "-c",
+          'base="/var/run/archestra/turns/$1"; if [ -f "$base.request" ] || [ -f "$base.started" ] || [ -f "$base.exit" ]; then printf present; fi',
+          "check-turn",
+          session.taskId,
+        ],
+      });
+      if (published !== "present")
+        throw tagAgentRunFailure(
+          new ApiError(
+            502,
+            "The run was interrupted before its command was saved. Select Resume to try again.",
+          ),
+          "turn.interrupted",
+        );
+      return;
+    }
+    // Inputs are database-backed so another process can finish this handoff.
+    // Publish the executable request only after this turn's files are durable.
+    await this.stageInputs({
+      session,
+      inputs: await AgentRunInputModel.findByTaskId(session.taskId),
+    });
+    await this.execInPod({
+      session,
+      podName,
+      command: [
+        "/bin/sh",
+        "-c",
+        [
+          "set -eu; umask 077",
+          'request="/var/run/archestra/turns/$1.request"',
+          'if [ -f "$request" ] || [ -f "/var/run/archestra/turns/$1.started" ] || [ -f "/var/run/archestra/turns/$1.exit" ]; then exit 0; fi',
+          'cat > "$request.tmp"',
+          'mv "$request.tmp" "$request"',
+        ].join("\n"),
+        "enqueue-turn",
+        session.taskId,
+      ],
+      stdin: NodeReadable.from([Buffer.from(script, "base64")]),
+    });
+  }
+
+  /** CAS against release/continuation: a stale refresher cannot restore revoked values. */
+  async refreshCredentials(session: AgentRunRecord): Promise<void> {
+    const clients = this.requireClients();
+    const name = agentRuntimeNames(session.workloadName).secret;
+    const secret = await clients.coreApi
+      .readNamespacedSecret({ namespace: session.runtimeScope, name })
+      .catch((error) => {
+        if (isK8sNotFoundError(error)) return null;
+        throw error;
+      });
+    const encoded = secret?.data?.[AGENT_RUNTIME_CREDENTIALS_SECRET_KEY];
+    if (!encoded) return;
+    const parsed = RenewableCredentialBundleSchema.safeParse(
+      JSON.parse(Buffer.from(encoded, "base64").toString("utf8")),
+    );
+    if (!parsed.success || parsed.data.taskId !== session.taskId) return;
+    const bundle = parsed.data;
+    let changed = false;
+    for (const [key, current] of Object.entries(bundle.credentials)) {
+      if (current.expiresAt - Date.now() > 15 * 60_000) continue;
+      const next = await resolveCredential({
+        organizationId: session.organizationId,
+        credentialId: current.credentialId,
+        scope: current.scope ?? "organization",
+        userId: session.actorUserId,
+        minimumValidityMs: 55 * 60_000,
+      });
+      bundle.credentials[key] = {
+        ...current,
+        credentialId: current.credentialId,
+        value: next?.value ?? "",
+        expiresAt: next?.expiresAt ?? 0,
+      };
+      changed = true;
+    }
+    if (!changed) {
+      await this.projectWarmCredentials(session);
+      return;
+    }
+    await clients.coreApi
+      .patchNamespacedSecret(
+        {
+          namespace: session.runtimeScope,
+          name,
+          body: {
+            metadata: { resourceVersion: secret?.metadata?.resourceVersion },
+            stringData: {
+              [AGENT_RUNTIME_CREDENTIALS_SECRET_KEY]: JSON.stringify(bundle),
+            },
+          },
+        },
+        setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+      )
+      .catch((error) => {
+        if (!isK8sConflictError(error) && !isK8sNotFoundError(error))
+          throw error;
+      });
+    await this.projectWarmCredentials(session);
+  }
+
+  async hasRetainedTerminal(
+    session: Pick<AgentRunRecord, "taskId" | "runtimeScope" | "workloadName">,
+  ): Promise<boolean> {
+    const pod = await this.findPod(session);
+    if (pod?.status?.phase !== "Running" || !pod.metadata?.name) return false;
+    const output = await execAgentRuntimeCommand({
+      exec: this.requireClients().exec,
+      namespace: session.runtimeScope,
+      podName: pod.metadata.name,
+      container: AGENT_RUNTIME_CONTAINER_NAME,
+      command: [
+        "tmux",
+        "display-message",
+        "-p",
+        "-t",
+        "agent",
+        "#{pane_dead}:#{@archestra_retained_task}",
+      ],
+    }).catch(() => "");
+    return output.trim() === `0:${session.taskId}`;
+  }
+
+  async releaseRun(
+    session: AgentRunRecord,
+    options?: { retainInteractiveSession?: boolean },
+  ): Promise<void> {
+    const retainCredentials = Boolean(
+      options?.retainInteractiveSession &&
+        (await this.hasRetainedTerminal(session)),
+    );
+    if (!retainCredentials) {
+      await this.revokeRunCredentials(session);
+    }
+    const clients = this.requireClients();
+    // Keep the names for continuation's inherited-env unset list, but prevent
+    // replacement Pods and their exec shells from receiving stale credentials.
+    const name = agentRuntimeNames(session.workloadName).secret;
+    await withK8sApiRetry(
+      async () => {
+        const secret = await clients.coreApi.readNamespacedSecret({
+          namespace: session.runtimeScope,
+          name,
+        });
+        if (!Object.values(secret.data ?? {}).some(Boolean)) return;
+        await clients.coreApi.patchNamespacedSecret(
+          {
+            namespace: session.runtimeScope,
+            name,
+            body: {
+              metadata: { resourceVersion: secret.metadata?.resourceVersion },
+              data: Object.fromEntries(
+                Object.entries(secret.data ?? {}).map(([key, value]) => [
+                  key,
+                  retainCredentials &&
+                  key === AGENT_RUNTIME_CREDENTIALS_SECRET_KEY
+                    ? value
+                    : "",
+                ]),
+              ),
+            },
+          },
+          setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+        );
+      },
+      { label: "clear retained Agent Runtime credentials" },
+    ).catch((error) => {
+      if (!isK8sNotFoundError(error)) throw error;
+    });
+    if (!retainCredentials) await this.projectWarmCredentials(session);
+    await clients.coreApi
+      .deleteNamespacedSecret({
+        namespace: session.runtimeScope,
+        name: pendingTurnSecretName(session),
+      })
+      .catch((error) => {
+        if (!isK8sNotFoundError(error)) throw error;
+      });
+  }
+
+  async stopRun(session: AgentRunRecord): Promise<"suspended" | undefined> {
+    await this.revokeRunCredentials(session);
+    const pod = await this.findPod(session);
+    if (pod?.status?.phase !== "Running" || !pod.metadata?.name) {
+      await this.suspendWorkspace(session);
+      return "suspended";
+    }
+    await this.execInPod({
+      session,
+      podName: pod.metadata.name,
+      command: [
+        "/bin/sh",
+        "-c",
+        [
+          'set -eu; base="/var/run/archestra/turns/$1"',
+          '[ ! -f "$base.exit" ] || exit 0',
+          'touch "$base.cancel"',
+          'if [ ! -f "$base.request" ] && [ ! -f "$base.started" ]; then printf "130\\n" > "$base.exit.tmp"; mv "$base.exit.tmp" "$base.exit"; fi',
+          'attempt=0; while [ ! -f "$base.exit" ]; do attempt=$((attempt + 1)); [ "$attempt" -lt 15 ] || exit 1; sleep 1; done',
+        ].join("\n"),
+        "stop-turn",
+        session.taskId,
+      ],
+    });
+  }
+
+  async suspendWorkspace(
+    session: Pick<AgentRunRecord, "id" | "runtimeScope" | "workloadName">,
+  ): Promise<void> {
+    const sandbox = await readWorkspaceSandbox({
+      api: this.requireClients().customObjectsApi,
+      namespace: session.runtimeScope,
+      name: session.workloadName,
+    });
+    await this.requireClients().customObjectsApi.patchNamespacedCustomObject(
+      {
+        ...AGENT_SANDBOX_API,
+        namespace: session.runtimeScope,
+        name: sandbox.metadata.name ?? session.workloadName,
+        body: { spec: { operatingMode: "Suspended" } },
+      },
+      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+    );
+  }
+
+  async getLastWorkspaceActivity(
+    session: AgentRunRecord,
+  ): Promise<Date | null> {
+    const podName = await this.findPodName(session);
+    if (!podName) return null;
+    const output = await this.execInPod({
+      session,
+      podName,
+      command: [
+        "/bin/sh",
+        "-c",
+        "{ cat /var/run/archestra/development-activity 2>/dev/null; tmux list-clients -F '#{client_activity}' 2>/dev/null; } | sort -nr | head -1",
+      ],
+    });
+    if (!/^\d+$/.test(output.trim())) return null;
+    const timestamp = Number(output.trim()) * 1000;
+    if (!Number.isSafeInteger(timestamp) || timestamp <= 0) return null;
+    return new Date(Math.min(timestamp, Date.now()));
+  }
+
+  async getWorkspaceConnection(
+    session: Pick<AgentRunRecord, "workloadName" | "runtimeScope" | "taskId">,
+  ) {
+    // Connection hints are optional; retained run history must remain readable
+    // when Kubernetes is disabled, unreachable, or the workspace has disappeared.
+    let sandbox: AgentSandbox;
+    try {
+      sandbox = await readWorkspaceSandbox({
+        api: this.requireClients().customObjectsApi,
+        namespace: session.runtimeScope,
+        name: session.workloadName,
+      });
+    } catch (error) {
+      if (!isK8sNotFoundError(error))
+        logger.debug(
+          { error, workloadName: session.workloadName },
+          "Terminal connection details are unavailable",
+        );
+      return null;
+    }
+    const name = sandbox.metadata.name ?? session.workloadName;
+    return {
+      hostname: `${name}.${session.runtimeScope}`,
+      shellCommand: [
+        "kubectl",
+        "exec",
+        "-it",
+        "-n",
+        session.runtimeScope,
+        name,
+        "-c",
+        AGENT_RUNTIME_CONTAINER_NAME,
+        "--",
+        "env",
+        "ARCHESTRA_AGENT_RUNTIME_AUTO_ATTACH=0",
+        `ARCHESTRA_AGENT_RUNTIME_TASK_ID=${session.taskId}`,
+        "/bin/sh",
+      ]
+        .map(shellDisplayArgument)
+        .join(" "),
+    };
+  }
+
+  async resumeWorkspace(session: AgentRunRecord): Promise<void> {
+    const clients = this.requireClients();
+    const sandbox = await readWorkspaceSandbox({
+      api: clients.customObjectsApi,
+      namespace: session.runtimeScope,
+      name: session.workloadName,
+    });
+    if (
+      sandbox.spec.shutdownTime &&
+      Date.parse(sandbox.spec.shutdownTime) <= Date.now()
+    ) {
+      throw tagAgentRunFailure(
+        new ApiError(
+          409,
+          "The saved files have reached their retention deadline",
+        ),
+        "run.resume_refused",
+      );
+    }
+    const agent = await AgentModel.findById(session.agentId);
+    if (!agent || agent.organizationId !== session.organizationId) {
+      throw new ApiError(404, "Agent not found");
+    }
+    const organization = await OrganizationModel.getById(
+      session.organizationId,
+    );
+    const effectiveNetworkPolicy = await resolveEffectiveNetworkPolicy({
+      organizationId: session.organizationId,
+      agentNetworkPolicy: agent.networkPolicy,
+      environmentId: agent.environmentId,
+      defaultNetworkPolicy: organization?.defaultNetworkPolicy,
+    });
+    await this.refreshWorkspaceEgress({
+      sandbox,
+      spec: {
+        taskId: session.taskId,
+        agentRuntimeId: session.agentId,
+        frozenName: session.workloadName,
+        runtimeScope: session.runtimeScope,
+        effectiveNetworkPolicy,
+      },
+    });
+    await clients.customObjectsApi.patchNamespacedCustomObject(
+      {
+        ...AGENT_SANDBOX_API,
+        namespace: session.runtimeScope,
+        name: sandbox.metadata.name ?? session.workloadName,
+        body: { spec: { operatingMode: "Running" } },
+      },
+      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+    );
+    if (
+      !(await this.waitForRunningPod({
+        session,
+        timeoutMessage: "The run could not be resumed",
+      }))
+    ) {
+      throw tagAgentRunFailure(
+        new ApiError(409, "The run could not be resumed"),
+        "run.resume_refused",
+      );
+    }
+  }
+
+  /**
+   * Deliver a message into a live session.
+   *
+   * `pipe` writes to the FIFO a turn-based client reads, so the message lands at a
+   * turn boundary and can never interleave with a tool call in flight.
+   * `tmux_keys` types into the session, the only option for a CLI that owns its
+   * own input loop.
+   */
+  /**
+   * Re-apply the egress policy of every running workspace of one Agent after
+   * its own policy or environment changed. Suspended workspaces pick the new
+   * policy up when they resume, and every new turn refreshes it too, so this
+   * only closes the window until the next turn. Best-effort per workspace.
+   */
+  async refreshAgentWorkspacesEgress(params: {
+    agentId: string;
+    organizationId: string;
+  }): Promise<void> {
+    if (!this.isEnabled) return;
+    const workspaces = await AgentWorkspaceModel.listRunningForAgent(params);
+    if (workspaces.length === 0) return;
+    const agent = await AgentModel.findById(params.agentId);
+    if (!agent || agent.organizationId !== params.organizationId) return;
+    const organization = await OrganizationModel.getById(params.organizationId);
+    const effectiveNetworkPolicy = await resolveEffectiveNetworkPolicy({
+      organizationId: params.organizationId,
+      agentNetworkPolicy: agent.networkPolicy,
+      environmentId: agent.environmentId,
+      defaultNetworkPolicy: organization?.defaultNetworkPolicy,
+    });
+    const clients = this.requireClients();
+    for (const workspace of workspaces) {
+      try {
+        const sandbox = await readWorkspaceSandbox({
+          api: clients.customObjectsApi,
+          namespace: workspace.runtimeScope,
+          name: workspace.workloadName,
+        });
+        await this.refreshWorkspaceEgress({
+          sandbox,
+          spec: {
+            taskId: workspace.lastTaskId,
+            agentRuntimeId: workspace.agentId,
+            frozenName: workspace.workloadName,
+            runtimeScope: workspace.runtimeScope,
+            effectiveNetworkPolicy,
+          },
+        });
+      } catch (err) {
+        logger.warn(
+          { err, agentId: params.agentId, workspaceId: workspace.id },
+          "[AgentRuntime] failed to refresh workspace egress",
+        );
+      }
+    }
+  }
+
+  async steer(params: {
+    session: AgentRunRecord;
+    steerMode: AgentRuntimeSteerMode;
+    message: string;
+  }): Promise<void> {
+    const podName = await this.findPodName(params.session);
+    if (!podName) {
+      throw new Error("This session has no running pod to steer");
+    }
+    // A steer is one message. Newlines are stripped rather than escaped because
+    // both delivery paths treat them as submit: send-keys passes them to the
+    // pty as Enter, and the FIFO reader takes a line at a time.
+    const message = params.message.replace(/[\r\n]+/g, " ").trim();
+    if (!message) {
+      throw new Error("A steer message cannot be only whitespace");
+    }
+
+    const command =
+      params.steerMode === "tmux_keys"
+        ? [
+            "/bin/sh",
+            "-c",
+            // `--` stops tmux reading a message beginning with a dash as its
+            // own options; Enter is sent separately as the submit.
+            buildTmuxSteerCommand({
+              session: AGENT_RUNTIME_TMUX_SESSION,
+              message,
+            }),
+          ]
+        : [
+            "/bin/sh",
+            "-c",
+            `printf '%s\\n' ${shellQuote(message)} > "$ARCHESTRA_AGENT_RUNTIME_STEER_FIFO"`,
+          ];
+
+    await this.execInPod({ session: params.session, podName, command });
+    reportAgentRuntimeSteer(params.steerMode);
+  }
+
+  /**
+   * Attach a caller's streams to the live tmux session.
+   *
+   * `tmux attach` rather than a fresh shell: the point is to land in the pane
+   * the agent is already working in. Detaching leaves it running, so closing a
+   * browser tab never ends a session mid-task.
+   */
+  async attach(params: {
+    session: AgentRunRecord;
+    stdin: Readable;
+    stdout: Writable;
+    stderr: Writable;
+    onStatus?: (status: k8s.V1Status) => void;
+    /** Called as the attach moves through its waits; see `startup-phase`. */
+    onProgress?: AgentRuntimeStartupProgressReporter;
+  }): Promise<{ podName: string; command: string; socket: WebSocket }> {
+    if (params.session.endedAt) {
+      const workspace = await AgentWorkspaceModel.findByWorkloadName(
+        params.session.workloadName,
+      );
+      if (
+        !workspace ||
+        workspace.state !== "idle" ||
+        workspace.lastTaskId !== params.session.taskId ||
+        workspace.expiresAt.getTime() <= Date.now() ||
+        !(await this.hasRetainedTerminal(params.session))
+      ) {
+        throw new ApiError(
+          409,
+          "The original terminal is no longer running. Resume the saved conversation instead.",
+        );
+      }
+      await AgentWorkspaceModel.recordActivity(workspace.id, new Date());
+    }
+    const clients = this.requireClients();
+    // A2A marks the durable task working before Kubernetes necessarily has a
+    // Running pod. Chat can therefore open the terminal during image pull or
+    // scheduling; wait for that normal transition instead of turning it into
+    // a sticky attach error that requires the user to reload.
+    const podName = await this.waitForRunningPod({
+      session: params.session,
+      timeoutMessage:
+        "Timed out waiting for the Agent pod to accept a terminal",
+      onProgress: params.onProgress,
+    });
+    if (!podName) {
+      throw new Error("This session has no running pod to attach to");
+    }
+    await this.waitForTmuxSession({
+      session: params.session,
+      podName,
+      onProgress: params.onProgress,
+    });
+    params.onProgress?.({ ...attachingProgress(), resourceName: podName });
+    // Live pods created before an upgrade do not have the stable helper yet.
+    // Installing it here keeps the displayed command truthful for them too.
+    await this.execInPod({
+      session: params.session,
+      podName,
+      command: ["/bin/sh", "-c", buildAgentRuntimeTerminalIntegrationScript()],
+    });
+    const namespace = params.session.runtimeScope;
+    const socket = await clients.exec.exec(
+      namespace,
+      podName,
+      AGENT_RUNTIME_CONTAINER_NAME,
+      agentRuntimeTerminalAttachCommand(),
+      params.stdout,
+      params.stderr,
+      params.stdin,
+      true,
+      params.onStatus,
+    );
+    return {
+      podName,
+      command: [
+        "kubectl",
+        "exec",
+        "-it",
+        "-n",
+        namespace,
+        podName,
+        "-c",
+        AGENT_RUNTIME_CONTAINER_NAME,
+        "--",
+        ...agentRuntimeTerminalAttachCommand(),
+      ]
+        .map(shellDisplayArgument)
+        .join(" "),
+      socket,
+    };
+  }
+
+  /** Follow this turn's output, not earlier turns in the same Pod. */
+  async streamLogs(params: {
+    session: AgentRunRecord;
+    destination: Writable;
+    lines: number;
+    abortSignal?: AbortSignal;
+  }): Promise<void> {
+    await this.readTurnOutput({ ...params, follow: true });
+  }
+
+  /**
+   * Recover the turn's full output from its PVC, independently of container log
+   * rotation and Pod replacement, before committing the transcript to storage.
+   */
+  async snapshotLogs(params: {
+    session: AgentRunRecord;
+    destination: Writable;
+    lines: number;
+    abortSignal?: AbortSignal;
+  }): Promise<void> {
+    await this.readTurnOutput({ ...params, follow: false });
+  }
+
+  /** Pod carrying a session, or null when nothing is scheduled. */
+  async findPodName(session: AgentRunRecord): Promise<string | null> {
+    const clients = this.requireClients();
+    const pods = await clients.coreApi.listNamespacedPod({
+      namespace: session.runtimeScope,
+      labelSelector: `${AGENT_RUNTIME_WORKSPACE_LABEL}=${session.workloadName}`,
+    });
+    const running = pods.items.find(
+      (pod) =>
+        pod.status?.phase === "Running" &&
+        pod.metadata?.name &&
+        !pod.metadata.deletionTimestamp,
+    );
+    return running?.metadata?.name ?? null;
+  }
+
+  /**
+   * The pod carrying a session, in any phase — including one that has already
+   * terminated. `findPodName` deliberately only returns a Running pod (attach
+   * and steer need a live one); waiting for an outcome needs to see the
+   * Succeeded and Failed phases too, and a pod that finished before the first
+   * poll would otherwise look like a pod that never scheduled.
+   */
+  async findPodPhase(
+    session: AgentRunRecord,
+  ): Promise<{ name: string; phase: string } | null> {
+    const pod = await this.findPod(session);
+    if (!pod?.metadata?.name) return null;
+    return { name: pod.metadata.name, phase: pod.status?.phase ?? "Unknown" };
+  }
+
+  /** Point-in-time startup state used to seed a newly loaded run page. */
+  async getStartupProgress(
+    session: Pick<AgentRunRecord, "taskId" | "runtimeScope" | "workloadName">,
+  ): Promise<AgentRuntimeStartupProgress & { resourceName: string | null }> {
+    const pod = await this.findPod(session);
+    return {
+      ...describeAgentRuntimeStartupProgress(pod),
+      resourceName: pod?.metadata?.name ?? null,
+    };
+  }
+
+  /**
+   * The whole pod object behind `findPodPhase`.
+   *
+   * A phase alone cannot say *why* a pod is Pending, and that reason — no node
+   * has room, the image will not pull — is the only thing worth telling
+   * someone watching a run start.
+   */
+  async findPod(
+    session: Pick<AgentRunRecord, "taskId" | "runtimeScope" | "workloadName">,
+  ): Promise<k8s.V1Pod | null> {
+    const clients = this.requireClients();
+    const pods = await clients.coreApi.listNamespacedPod({
+      namespace: session.runtimeScope,
+      labelSelector: `${AGENT_RUNTIME_WORKSPACE_LABEL}=${session.workloadName}`,
+    });
+    return (
+      pods.items.find(
+        (candidate) =>
+          candidate.metadata?.name && !candidate.metadata.deletionTimestamp,
+      ) ?? null
+    );
+  }
+
+  /**
+   * Wait for the supervisor's durable turn result, not workspace termination.
+   * Sandbox failure/expiry is a failure when no turn result was published.
+   *
+   * Resolves `{ outcome: "aborted" }` rather than throwing when the caller's
+   * signal fires, so cancellation and failure stay distinguishable to the
+   * lifecycle above.
+   */
+  async waitForCompletion(params: {
+    session: AgentRunRecord;
+    abortSignal?: AbortSignal;
+    pollIntervalMs?: number;
+  }): Promise<{
+    outcome: "succeeded" | "failed" | "aborted";
+    reason?: string;
+    failure?: A2ATaskFailure;
+  }> {
+    const clients = this.requireClients();
+    const { sandbox: sandboxName } = agentRuntimeNames(
+      params.session.workloadName,
+    );
+    const interval = params.pollIntervalMs ?? AGENT_RUNTIME_COMPLETION_POLL_MS;
+
+    let retryDelayMs = interval;
+    // The container last seen running, its tier and its memory counters: the
+    // turn's first reading and the latest. Each poll reads the counters with
+    // the turn's result, so a process the kernel kills for memory is seen as
+    // the turn goes on, and a turn that fails after one is told why.
+    let running: RunningContainer | null = null;
+    while (!params.abortSignal?.aborted) {
+      try {
+        const sandbox = await readWorkspaceSandbox({
+          api: clients.customObjectsApi,
+          name: sandboxName,
+          namespace: params.session.runtimeScope,
+        }).catch((error) => {
+          if (isK8sNotFoundError(error)) return null;
+          throw error;
+        });
+
+        if (params.abortSignal?.aborted) break;
+        if (!sandbox) {
+          // The workspace is gone: either torn down under us, or it never landed.
+          // Either way there is no outcome left to wait for.
+          return {
+            outcome: "failed",
+            reason: "The Agent Sandbox no longer exists",
+            failure: agentRunFailure("run.workspace_missing"),
+          };
+        }
+        const pod = await this.findPod(params.session);
+        if (params.abortSignal?.aborted) break;
+        if (pod?.status?.phase === "Running" && pod.metadata?.name) {
+          const container = agentRuntimeContainerKey(pod);
+          if (running === null || running.container !== container) {
+            running = {
+              podName: pod.metadata.name,
+              container,
+              tier: agentRuntimePodTier(pod),
+              atStart: null,
+              latest: null,
+              unanswered: 0,
+            };
+          }
+          const poll = splitTurnPoll(
+            await this.execInPod({
+              session: params.session,
+              podName: pod.metadata.name,
+              command: [
+                "/bin/sh",
+                "-c",
+                `file="/var/run/archestra/turns/$1"; if [ -f "$file.exit" ]; then status="$(cat "$file.exit")"; printf "%s\\n" "$status"; if [ -f "$file.failure" ]; then head -c 4097 "$file.failure" 2>/dev/null || true; fi; fi; ${MEMORY_EVENTS_AFTER_RESULT_SCRIPT}`,
+                "read-turn-result",
+                params.session.taskId,
+              ],
+            }),
+          );
+          if (params.abortSignal?.aborted) break;
+          running.unanswered = 0;
+          if (poll.memory) {
+            const sincePrevious = memoryKillBetween(
+              running.latest,
+              poll.memory,
+            );
+            running.atStart ??= poll.memory;
+            running.latest = poll.memory;
+            if (sincePrevious) {
+              this.reportMemoryKill(params.session, running, sincePrevious);
+            }
+          }
+          const result = poll.result;
+          if (result.trim()) {
+            if (result.trim().split("\n")[0] === "0") {
+              return { outcome: "succeeded" };
+            }
+            const turnFailure = agentRuntimeTurnFailure(result);
+            const turnReason = agentRuntimeFailureReason(result);
+            const killed = turnEndingKill(
+              memoryKillBetween(running.atStart, poll.memory),
+            );
+            if (!killed) {
+              return {
+                outcome: "failed",
+                reason: turnReason,
+                failure: turnFailure,
+              };
+            }
+            // A memory kill explains a process that died without a word; an
+            // image's own diagnosis (a provider error it reported itself)
+            // stands, with the kill noted after it. Only a container that hit
+            // its own limit is pod.oom_killed: a node that ran out of memory
+            // says nothing about the run's size.
+            const killNote = describeMemoryKill(killed, {
+              container: AGENT_RUNTIME_CONTAINER_NAME,
+              tier: running.tier,
+            });
+            const explained = MEMORY_KILL_EXPLAINS.has(turnFailure.code);
+            return {
+              outcome: "failed",
+              reason: explained
+                ? `${killNote}\n${turnReason}`
+                : `${turnReason}\n${killNote}`,
+              failure:
+                explained && killed.atLimit
+                  ? agentRunFailure("pod.oom_killed")
+                  : turnFailure,
+            };
+          }
+        }
+        const finished = sandbox.status?.conditions?.find(
+          (entry) => entry.type === "Finished" && entry.status === "True",
+        );
+        const expired = sandbox.status?.conditions?.find(
+          (entry) => entry.reason === "SandboxExpired",
+        );
+        const condition = finished ?? expired;
+        const podFailure = describeAgentRuntimePodFailure(
+          pod,
+          params.session.runtimeScope,
+          condition,
+        );
+        if (finished || expired || podFailure) {
+          const reason =
+            podFailure ??
+            condition?.message ??
+            condition?.reason ??
+            "The Agent Runtime run exited without completing";
+          // A workspace that finished or expired while its pod still runs: a
+          // supervisor whose tmux server the kernel killed never publishes a
+          // result, and the kill is what ended the turn. This iteration's poll
+          // read the counters.
+          const killed =
+            pod?.status?.phase === "Running" && running
+              ? turnEndingKill(
+                  memoryKillBetween(running.atStart, running.latest),
+                )
+              : null;
+          const failure = agentRunFailure(
+            podFailure && pod
+              ? classifyAgentRuntimePodFailure(pod)
+              : expired
+                ? "run.deadline_exceeded"
+                : "pod.failed",
+          );
+          if (killed && running) {
+            return {
+              outcome: "failed",
+              reason: `${describeMemoryKill(killed, { container: AGENT_RUNTIME_CONTAINER_NAME, tier: running.tier })}\n${reason}`,
+              failure: killed.atLimit
+                ? agentRunFailure("pod.oom_killed")
+                : failure,
+            };
+          }
+          return { outcome: "failed", reason, failure };
+        }
+        retryDelayMs = interval;
+      } catch (error) {
+        if (params.abortSignal?.aborted) break;
+        if (running && mayMeanContainerExit(error)) {
+          // The poll's command failed. A container that lives on answers with
+          // its counters: a kill since the turn's first reading ended the
+          // turn's processes and the poll's shell with them.
+          const now = await this.readMemoryEvents(
+            params.session,
+            running.podName,
+          ).catch(() => undefined);
+          if (params.abortSignal?.aborted) break;
+          const killed =
+            now === undefined
+              ? null
+              : turnEndingKill(memoryKillBetween(running.atStart, now));
+          if (killed) {
+            // A container that hit its limit ran out of memory; a node that
+            // did took the process with it, which says nothing about the
+            // run's size.
+            return {
+              outcome: "failed",
+              reason: describeMemoryKill(killed, {
+                container: AGENT_RUNTIME_CONTAINER_NAME,
+                tier: running.tier,
+              }),
+              failure: agentRunFailure(
+                killed.atLimit ? "pod.oom_killed" : "turn.process_exited",
+              ),
+            };
+          }
+          // A container that does not answer at all may have exited: a
+          // memory kill of the whole container (the kubelet's default on
+          // cgroup v2, `memory.oom.group`) takes PID 1 with it. The pod still
+          // reads Running until the kubelet reports the exit, up to half a
+          // minute later; the next polls then report the pod's failure,
+          // OOMKilled.
+          if (
+            now === undefined &&
+            running.unanswered < CONTAINER_EXIT_REPORT_POLLS
+          ) {
+            running.unanswered++;
+            await delay(interval, params.abortSignal);
+            continue;
+          }
+        }
+        if (!isTransientObservationError(error)) throw error;
+        // A failed read says nothing about the worker's outcome. Keep ownership
+        // and heartbeats alive until we can observe it again or are canceled.
+        // Do not apply this policy to launch/steer or other mutating commands.
+        logger.warn(
+          { error, taskId: params.session.taskId, retryDelayMs },
+          "Could not observe Agent Runtime completion; retrying",
+        );
+        await delay(retryDelayMs, params.abortSignal);
+        retryDelayMs = Math.min(retryDelayMs * 2, 30_000);
+        continue;
+      }
+      await delay(interval, params.abortSignal);
+    }
+
+    return { outcome: "aborted" };
+  }
+
+  /**
+   * Remove every Kubernetes object belonging to a session and revoke its key.
+   * Safe to retry, including after a partial failure — an object already gone
+   * is a success, and everything else is retried like the create path.
+   */
+  async teardown(session: AgentRunRecord): Promise<void> {
+    // The key outlives the pod otherwise: a finished session's API key would
+    // keep working, still charging the person it acted as.
+    await this.revokeRunCredentials(session);
+    await this.deleteWorkspace(session);
+  }
+
+  async deleteWorkspace(
+    session: Pick<AgentRunRecord, "id" | "runtimeScope" | "workloadName">,
+  ): Promise<void> {
+    if (!this.isEnabled) return;
+
+    const clients = this.requireClients();
+    const names = agentRuntimeNames(session.workloadName);
+    const namespace = session.runtimeScope;
+    this.terminatingSandboxes.add(`${namespace}/${names.sandbox}`);
+
+    const deletions: Array<[string, () => Promise<unknown>]> = [
+      [
+        "claim",
+        () =>
+          clients.customObjectsApi.deleteNamespacedCustomObject({
+            ...SANDBOX_CLAIM_API,
+            namespace,
+            name: names.sandbox,
+            propagationPolicy: "Foreground",
+          }),
+      ],
+      [
+        "sandbox",
+        () =>
+          clients.customObjectsApi.deleteNamespacedCustomObject({
+            ...AGENT_SANDBOX_API,
+            name: names.sandbox,
+            namespace,
+            // Without Foreground the Job's pod outlives the Job object.
+            propagationPolicy: "Foreground",
+          }),
+      ],
+      [
+        "secret",
+        () =>
+          clients.coreApi.deleteNamespacedSecret({
+            name: names.secret,
+            namespace,
+          }),
+      ],
+      [
+        "networkPolicy",
+        () =>
+          clients.networkingApi.deleteNamespacedNetworkPolicy({
+            name: names.networkPolicy,
+            namespace,
+          }),
+      ],
+      [
+        "environmentNetworkPolicy",
+        () =>
+          clients.networkingApi.deleteNamespacedNetworkPolicy({
+            name: names.environmentNetworkPolicy,
+            namespace,
+          }),
+      ],
+      ...(Object.entries(AGENT_RUNTIME_EGRESS_POLICY_CRDS).map(
+        ([kind, coordinates]) => [
+          `environment${kind}`,
+          () =>
+            clients.customObjectsApi.deleteNamespacedCustomObject({
+              ...coordinates,
+              name: names.environmentNetworkPolicy,
+              namespace,
+            }),
+        ],
+      ) as Array<[string, () => Promise<unknown>]>),
+    ];
+
+    const errors: unknown[] = [];
+    for (const [kind, remove] of deletions) {
+      try {
+        await withK8sApiRetry(remove, {
+          label: `delete Agent Runtime ${kind}`,
+        });
+      } catch (error) {
+        if (isK8sNotFoundError(error)) continue;
+        errors.push(error);
+        logger.warn(
+          { error, sessionId: session.id, kind },
+          "Failed to delete an Agent Runtime run object during teardown",
+        );
+      }
+    }
+    if (errors.length)
+      throw new AggregateError(errors, "Saved file cleanup did not complete");
+  }
+
+  /**
+   * Serialize a session's cluster mutations across replicas. A lease held
+   * elsewhere means another replica is doing this work, so we skip rather than
+   * duplicate it — the caller learns nothing ran.
+   */
+  async withSessionLease(
+    session: AgentRunRecord,
+    operation: () => Promise<void>,
+  ): Promise<boolean> {
+    try {
+      await McpDeploymentLeaseModel.withLease(
+        { scope: AGENT_RUNTIME_LEASE_SCOPE, key: session.id },
+        async (lease) => {
+          await operation();
+          await lease.assertOwned();
+        },
+      );
+      return true;
+    } catch (error) {
+      if (error instanceof ClusterLeaseHeldError) return false;
+      throw error;
+    }
+  }
+
+  // ===================== internals =====================
+
+  /**
+   * Restart an idle workspace on the deployment's current maintained image.
+   * The workspace PVC holds HOME and the saved conversation, so the next turn
+   * resumes there exactly as it does after an idle suspension.
+   */
+  private async moveWorkspaceToImage(params: {
+    session: AgentRunRecord;
+    sandbox: AgentSandbox;
+    image: string;
+  }): Promise<AgentSandbox> {
+    const clients = this.requireClients();
+    const previous = findAgentRuntimeContainer(params.sandbox)?.image;
+    logger.info(
+      {
+        taskId: params.session.taskId,
+        workloadName: params.session.workloadName,
+        previousImage: previous,
+        image: params.image,
+      },
+      "Moving an Agent Runtime workspace to the current maintained image",
+    );
+    await this.suspendWorkspace(params.session);
+    await this.waitForPodRemoval(params.session);
+    const imagePullPolicy = usesFloatingAgentImageTag(params.image)
+      ? ("Always" as const)
+      : undefined;
+    const withImage = (entries: k8s.V1Container[] | undefined) =>
+      entries?.map((entry) => {
+        if (entry.image !== previous) return entry;
+        const { imagePullPolicy: _previousPolicy, ...rest } = entry;
+        return {
+          ...rest,
+          image: params.image,
+          ...(imagePullPolicy ? { imagePullPolicy } : {}),
+        };
+      });
+    const podSpec = params.sandbox.spec.podTemplate.spec;
+    await clients.customObjectsApi.patchNamespacedCustomObject(
+      {
+        ...AGENT_SANDBOX_API,
+        namespace: params.session.runtimeScope,
+        name: params.sandbox.metadata.name ?? params.session.workloadName,
+        // A merge patch replaces arrays whole, so send every container back.
+        body: {
+          spec: {
+            podTemplate: {
+              spec: {
+                containers: withImage(podSpec?.containers),
+                ...(podSpec?.initContainers
+                  ? { initContainers: withImage(podSpec.initContainers) }
+                  : {}),
+              },
+            },
+          },
+        },
+      },
+      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+    );
+    return readWorkspaceSandbox({
+      api: clients.customObjectsApi,
+      namespace: params.session.runtimeScope,
+      name: params.session.workloadName,
+    });
+  }
+
+  /**
+   * A terminating Pod still holds the workspace volume, so wait until none
+   * is left, not merely until none is live.
+   */
+  private async waitForPodRemoval(
+    session: Pick<AgentRunRecord, "runtimeScope" | "workloadName">,
+  ): Promise<void> {
+    const clients = this.requireClients();
+    const deadline = Date.now() + AGENT_RUNTIME_POD_REMOVAL_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      const pods = await clients.coreApi.listNamespacedPod({
+        namespace: session.runtimeScope,
+        labelSelector: `${AGENT_RUNTIME_WORKSPACE_LABEL}=${session.workloadName}`,
+      });
+      if (pods.items.length === 0) return;
+      await delay(AGENT_RUNTIME_INPUT_STAGING_POLL_MS);
+    }
+    throw new Error(
+      "The Agent did not stop in time to update its software image",
+    );
+  }
+
+  private async projectWarmCredentials(
+    session: AgentRunRecord,
+    podName?: string,
+  ): Promise<void> {
+    const pod = await this.findPod(session);
+    if (
+      !pod?.metadata?.labels?.["archestra.io/warm-pool"] ||
+      pod.status?.phase !== "Running" ||
+      !pod.metadata.name
+    )
+      return;
+    const secret = await this.requireClients().coreApi.readNamespacedSecret({
+      namespace: session.runtimeScope,
+      name: agentRuntimeNames(session.workloadName).secret,
+    });
+    const data = secret.data?.[AGENT_RUNTIME_CREDENTIALS_SECRET_KEY];
+    await this.execInPod({
+      session,
+      podName: podName ?? pod.metadata.name,
+      command: buildAtomicFileWriteCommand(
+        "/var/run/archestra/credentials/current.json",
+      ),
+      stdin: NodeReadable.from([
+        data ? Buffer.from(data, "base64") : Buffer.from("{}"),
+      ]),
+    });
+  }
+
+  private async refreshWorkspaceEgress(params: {
+    sandbox: AgentSandbox;
+    spec: Pick<
+      AgentRunLaunchSpec,
+      | "taskId"
+      | "agentRuntimeId"
+      | "frozenName"
+      | "runtimeScope"
+      | "effectiveNetworkPolicy"
+    >;
+  }): Promise<void> {
+    const clients = this.requireClients();
+    // The retained Pod keeps its original selector even though this turn has
+    // a new task ID. Policies must continue selecting that Pod after a wake-up.
+    const taskId =
+      params.sandbox.spec.podTemplate.metadata?.labels?.[
+        AGENT_RUNTIME_TASK_LABEL
+      ];
+    if (!taskId)
+      throw new Error("The Agent is missing its network policy selector");
+    const spec = {
+      ...params.spec,
+      taskId,
+      frozenName: params.spec.frozenName,
+      namespace: params.spec.runtimeScope,
+      ownerReferences: params.sandbox.metadata.ownerReferences,
+    };
+    const clusterDnsIps = await clusterDnsResolver.getClusterDnsIps(
+      clients.coreApi,
+    );
+    const policies = buildAgentRuntimeEnvironmentEgressPolicies({
+      spec,
+      capabilities: (await getK8sCapabilities()).networkPolicy,
+      clusterDnsIps,
+      clusterIpFamilies: await clusterIpFamilyResolver.getIpFamilies({
+        coreApi: clients.coreApi,
+        namespace: spec.namespace,
+        clusterDnsIps,
+      }),
+    });
+    await this.applyEgressPolicies(policies);
+    await this.applyNetworkPolicy(
+      buildAgentRuntimePlatformEgressPolicy({
+        spec,
+        clusterDnsIps,
+        platformNamespace: process.env.POD_NAMESPACE || getK8sNamespace(),
+        platformPodLabels: config.agentRuntime.platformPodSelector,
+        platformPorts: [config.api.port],
+        platformService: await resolvePlatformServiceDestination({
+          coreApi: clients.coreApi,
+          baseUrl: config.agentRuntime.platformBaseUrl,
+          runtimeNamespace: spec.namespace,
+          platformNamespace: process.env.POD_NAMESPACE || getK8sNamespace(),
+        }),
+      }),
+    );
+    // Policies are additive. Leaving an old allow policy of a different kind
+    // would defeat a tightened Environment policy. Finish pruning before the
+    // continuation request is published or a suspended Pod is woken.
+    const name = agentRuntimeNames(spec.frozenName).environmentNetworkPolicy;
+    const desiredKinds = new Set(policies.map(({ kind }) => kind));
+    const removals: Array<
+      [AgentRuntimeEgressPolicyObject["kind"], () => Promise<unknown>]
+    > = [
+      [
+        "NetworkPolicy",
+        () =>
+          clients.networkingApi.deleteNamespacedNetworkPolicy({
+            name,
+            namespace: spec.namespace,
+          }),
+      ],
+      ...Object.entries(AGENT_RUNTIME_EGRESS_POLICY_CRDS).map(
+        ([kind, coordinates]) =>
+          [
+            kind as AgentRuntimeEgressPolicyObject["kind"],
+            () =>
+              clients.customObjectsApi.deleteNamespacedCustomObject({
+                ...coordinates,
+                name,
+                namespace: spec.namespace,
+              }),
+          ] as [AgentRuntimeEgressPolicyObject["kind"], () => Promise<unknown>],
+      ),
+    ];
+    for (const [kind, remove] of removals) {
+      if (desiredKinds.has(kind)) continue;
+      try {
+        await remove();
+      } catch (error) {
+        if (!isK8sNotFoundError(error)) throw error;
+      }
+    }
+  }
+
+  private async applyNetworkPolicy(body: k8s.V1NetworkPolicy): Promise<void> {
+    const clients = this.requireClients();
+    const namespace = body.metadata?.namespace;
+    const name = body.metadata?.name;
+    if (!namespace || !name) {
+      throw new Error(
+        "AgentRuntime NetworkPolicy requires a name and namespace",
+      );
+    }
+    try {
+      await clients.networkingApi.createNamespacedNetworkPolicy({
+        namespace,
+        body,
+      });
+    } catch (error) {
+      if (!isK8sConflictError(error)) throw error;
+      await clients.networkingApi.replaceNamespacedNetworkPolicy({
+        name,
+        namespace,
+        body,
+      });
+    }
+  }
+
+  private async applyEgressPolicies(
+    policies: AgentRuntimeEgressPolicyObject[],
+  ): Promise<void> {
+    for (const policy of policies) {
+      if (policy.kind === "NetworkPolicy") {
+        await this.applyNetworkPolicy(policy.object);
+        continue;
+      }
+      await this.applyCustomEgressPolicy(policy);
+    }
+  }
+
+  private async applyCustomEgressPolicy(
+    policy: Exclude<AgentRuntimeEgressPolicyObject, { kind: "NetworkPolicy" }>,
+  ): Promise<void> {
+    const clients = this.requireClients();
+    const metadata = policy.object.metadata as
+      | { name?: string; namespace?: string }
+      | undefined;
+    if (!metadata?.name || !metadata.namespace) {
+      throw new Error(
+        `AgentRuntime ${policy.kind} requires a name and namespace`,
+      );
+    }
+    const coordinates = AGENT_RUNTIME_EGRESS_POLICY_CRDS[policy.kind];
+    try {
+      await clients.customObjectsApi.createNamespacedCustomObject({
+        ...coordinates,
+        namespace: metadata.namespace,
+        body: policy.object,
+      });
+    } catch (error) {
+      if (!isK8sConflictError(error)) throw error;
+      await clients.customObjectsApi.patchNamespacedCustomObject(
+        {
+          ...coordinates,
+          namespace: metadata.namespace,
+          name: metadata.name,
+          body: [{ op: "replace", path: "/spec", value: policy.object.spec }],
+        },
+        setHeaderOptions("Content-Type", PatchStrategy.JsonPatch),
+      );
+    }
+  }
+
+  private async revokeRunCredentials(session: AgentRunRecord): Promise<void> {
+    if (session.actorKind === "serviceAccount" && session.gatewayTokenId) {
+      await ServiceAccountModel.deleteToken({
+        serviceAccountId: session.actorId,
+        organizationId: session.organizationId,
+        tokenId: session.gatewayTokenId,
+      });
+    } else if (session.actorKind === "user") {
+      await OAuthAccessTokenModel.deleteById(
+        agentRunGatewayTokenId(session.id),
+      );
+    }
+    if (!session.virtualApiKeyId) return;
+    try {
+      await VirtualApiKeyModel.delete(session.virtualApiKeyId);
+    } catch (error) {
+      logger.warn(
+        { error, sessionId: session.id },
+        "Failed to revoke an Agent Runtime run session's virtual key",
+      );
+      return;
+    }
+    await AgentRunModel.clearVirtualApiKey(session.id);
+  }
+
+  private async readTurnOutput(params: {
+    session: AgentRunRecord;
+    destination: Writable;
+    follow: boolean;
+    abortSignal?: AbortSignal;
+    podName?: string;
+  }): Promise<void> {
+    if (params.abortSignal?.aborted) {
+      params.destination.end();
+      if (!params.follow)
+        throw new Error("Agent Runtime transcript snapshot aborted");
+      return;
+    }
+    if (!/^[a-zA-Z0-9-]+$/.test(params.session.taskId))
+      throw new Error("Invalid Agent Runtime turn identifier");
+    const pod = params.podName
+      ? { name: params.podName, phase: "Running" }
+      : await this.findPodPhase(params.session);
+    if (!pod || pod.phase !== "Running") {
+      if (params.follow)
+        throw new Error("This session has no running pod to read output from");
+      return withTranscriptRecoveryPod({
+        clients: this.requireClients(),
+        session: params.session,
+        abortSignal: params.abortSignal,
+        read: (podName) => this.readTurnOutput({ ...params, podName }),
+      });
+    }
+    const path = `/var/run/archestra/turns/${params.session.taskId}`;
+    // Read fixed byte ranges so growing output cannot duplicate bytes between
+    // polls. The exit marker ends the remote process even after a disconnect.
+    const script = params.follow
+      ? `offset=0; while :; do
+done_turn=0; [ ! -f '${path}.exit' ] || done_turn=1
+if [ -f '${path}.log' ]; then
+size=$(wc -c < '${path}.log'); count=$((size - offset))
+if [ "$count" -gt 0 ]; then tail -c +$((offset + 1)) '${path}.log' | head -c "$count"; offset=$size; fi
+fi
+[ "$done_turn" = 0 ] || break
+sleep 1
+done`
+      : `cat '${path}.log'`;
+    const clients = this.requireClients();
+    await new Promise<void>((resolve, reject) => {
+      let socket: WebSocket | undefined;
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        params.abortSignal?.removeEventListener("abort", abort);
+        params.destination.removeListener("error", finish);
+        socket?.close();
+        params.destination.end();
+        if (error) reject(error);
+        else resolve();
+      };
+      const timer = params.follow
+        ? undefined
+        : setTimeout(
+            () =>
+              finish(new Error("Agent Runtime transcript snapshot timed out")),
+            30_000,
+          );
+      const abort = () =>
+        finish(
+          params.follow
+            ? undefined
+            : new Error("Agent Runtime transcript snapshot aborted"),
+        );
+      params.abortSignal?.addEventListener("abort", abort, { once: true });
+      params.destination.on("error", finish);
+      clients.exec
+        .exec(
+          params.session.runtimeScope,
+          pod.name,
+          AGENT_RUNTIME_CONTAINER_NAME,
+          ["/bin/sh", "-c", script],
+          params.destination,
+          null,
+          null,
+          false,
+          (status) =>
+            finish(
+              status.status === "Success"
+                ? undefined
+                : new Error("Could not read turn output"),
+            ),
+        )
+        .then((connected) => {
+          socket = connected;
+          if (settled || params.abortSignal?.aborted) {
+            connected.close();
+            finish();
+            return;
+          }
+          connected.on("error", finish);
+          connected.on("close", () =>
+            finish(
+              new Error(
+                "Agent Runtime transcript disconnected before completion",
+              ),
+            ),
+          );
+        })
+        .catch(finish);
+    });
+  }
+
+  /**
+   * A process of a running turn the kernel killed for memory. With
+   * single-process OOM kills the container lives on and the turn goes on: the
+   * agent sees its command die, and this says why, for whoever looks into the
+   * run later. A turn that fails after it says so in its failure reason.
+   */
+  private reportMemoryKill(
+    session: AgentRunRecord,
+    running: RunningContainer,
+    kill: MemoryKill,
+  ): void {
+    logger.warn(
+      {
+        taskId: session.taskId,
+        podName: running.podName,
+        tier: running.tier,
+        killed: kill.killed,
+        stopped: kill.stopped,
+        atLimit: kill.atLimit,
+        memoryLimitBytes: kill.events.limitBytes,
+        memoryPeakBytes: kill.events.peakBytes,
+        reason: describeMemoryKill(kill, {
+          container: AGENT_RUNTIME_CONTAINER_NAME,
+          tier: running.tier,
+        }),
+      },
+      kill.killed > 0
+        ? "The kernel killed a process of an Agent Runtime run for memory"
+        : "The memory warden stopped a command of an Agent Runtime run near its memory limit",
+    );
+  }
+
+  /** The container cgroup's memory counters; null without them; throws when the pod cannot run the read. */
+  private async readMemoryEvents(
+    session: AgentRunRecord,
+    podName: string,
+  ): Promise<MemoryEvents | null> {
+    return parseMemoryEvents(
+      await this.execInPod({
+        session,
+        podName,
+        command: READ_MEMORY_EVENTS_COMMAND,
+        timeoutMs: MEMORY_EVENTS_READ_TIMEOUT_MS,
+      }),
+    );
+  }
+
+  private async execInPod(params: {
+    session: AgentRunRecord;
+    podName: string;
+    command: string[];
+    stdin?: Readable;
+    timeoutMs?: number;
+  }): Promise<string> {
+    return execAgentRuntimeCommand({
+      exec: this.requireClients().exec,
+      namespace: params.session.runtimeScope,
+      podName: params.podName,
+      container: AGENT_RUNTIME_CONTAINER_NAME,
+      command: params.command,
+      stdin: params.stdin,
+      timeoutMs: params.timeoutMs,
+    });
+  }
+
+  /** Resolve the Pod backing a workspace, or explain that it must be resumed. */
+  private async requireRunningPodName(
+    session: AgentRunRecord,
+  ): Promise<string> {
+    const pod = await this.findPod(session);
+    if (pod?.status?.phase !== "Running" || !pod.metadata?.name) {
+      throw new ApiError(409, "Resume this run before accessing its files");
+    }
+    return pod.metadata.name;
+  }
+
+  private async waitForRunningPod(params: {
+    session: AgentRunRecord;
+    timeoutMessage: string;
+    onProgress?: AgentRuntimeStartupProgressReporter;
+  }): Promise<string | null> {
+    // A claimed warm workspace can still need scheduling and an image pull.
+    // Give it the same startup budget as a workspace created on demand.
+    const deadline =
+      Date.now() + config.agentRuntime.podStartTimeoutSeconds * 1000;
+    let lastProgress: AgentRuntimeStartupProgress | null = null;
+    let lastPod: k8s.V1Pod | null = null;
+    while (Date.now() < deadline) {
+      const pod = await this.findPod(params.session);
+      lastPod = pod;
+      const phase = pod?.status?.phase;
+      if (phase === "Running" && pod?.metadata?.name) return pod.metadata.name;
+      const podFailure = describeAgentRuntimePodFailure(
+        pod,
+        params.session.runtimeScope,
+      );
+      if (podFailure && pod)
+        throw tagAgentRunFailure(
+          new Error(podFailure),
+          classifyAgentRuntimePodFailure(pod),
+        );
+      if (phase === "Succeeded") return null;
+
+      const progress = describeAgentRuntimeStartupProgress(pod);
+      if (params.onProgress) {
+        if (!isSameAgentRuntimeStartupProgress(lastProgress, progress)) {
+          params.onProgress({
+            ...progress,
+            resourceName: pod?.metadata?.name ?? null,
+          });
+        }
+      }
+      lastProgress = progress;
+      await delay(AGENT_RUNTIME_INPUT_STAGING_POLL_MS);
+    }
+    throw tagAgentRunFailure(
+      new Error(
+        `${params.timeoutMessage} within ${config.agentRuntime.podStartTimeoutSeconds} seconds.${lastProgress ? ` Last observed startup step: ${lastProgress.message}.` : ""}`,
+      ),
+      hasAgentRuntimeImagePullFailure(lastPod)
+        ? "pod.image_pull"
+        : "launch.capacity_timeout",
+    );
+  }
+
+  /**
+   * Pod Running only means the container process was accepted by Kubernetes;
+   * its bootstrap may still be creating tmux. Wait for the actual attachable
+   * session so the first browser connection is as reliable as a refresh.
+   */
+  private async waitForTmuxSession(params: {
+    session: AgentRunRecord;
+    podName: string;
+    onProgress?: AgentRuntimeStartupProgressReporter;
+  }): Promise<void> {
+    const deadline = Date.now() + AGENT_RUNTIME_ATTACH_TIMEOUT_MS;
+    params.onProgress?.({
+      phase: "starting",
+      message: "Waiting for the agent session",
+      detail: null,
+      resourceName: params.podName,
+    });
+    while (Date.now() < deadline) {
+      const ready = await this.execInPod({
+        session: params.session,
+        podName: params.podName,
+        command: [
+          "/bin/sh",
+          "-c",
+          `tmux has-session -t ${AGENT_RUNTIME_TMUX_SESSION} 2>/dev/null`,
+        ],
+      })
+        .then(() => true)
+        .catch(() => false);
+      if (ready) return;
+
+      const pod = await this.findPodPhase(params.session);
+      if (!pod || pod.phase === "Succeeded" || pod.phase === "Failed") {
+        throw new Error("This run ended before its terminal was ready");
+      }
+      await delay(AGENT_RUNTIME_INPUT_STAGING_POLL_MS);
+    }
+    throw new Error("Timed out waiting for the Agent terminal");
+  }
+
+  private requireClients(): K8sClients {
+    if (!this.isEnabled) {
+      throw new Error("Agent Runtime is not enabled");
+    }
+    if (!this.clients) {
+      this.clients = createK8sClients(
+        loadKubeConfig().kubeConfig,
+        getK8sNamespace(),
+      );
+    }
+    return this.clients;
+  }
+}
+
+export default new AgentRuntimeManager();
+
+// ===================== helpers =====================
+
+/** The container a turn's completion is read from, and what its cgroup said. */
+interface RunningContainer {
+  podName: string;
+  /** The pod and container ID: a restarted container is a new cgroup. */
+  container: string;
+  /** The runtime tier the pod runs at, for the reader of a memory kill. */
+  tier: string | null;
+  /** The counters when the turn was first seen running. */
+  atStart: MemoryEvents | null;
+  /** The counters at the latest poll. */
+  latest: MemoryEvents | null;
+  /** Polls in a row whose command failed and that no command could explain. */
+  unanswered: number;
+}
+
+/**
+ * A poll's command failed in a way that a container that is no longer running
+ * also causes: the command failed in the pod, or the exec handshake was
+ * refused with 400 (the API server: a completed pod), 404 or 500 (the
+ * kubelet: no running container). Denied access, throttling and an
+ * unreachable API server are not.
+ */
+function mayMeanContainerExit(error: unknown): boolean {
+  if (error instanceof AgentRuntimeCommandFailedError) return true;
+  return (
+    error instanceof AgentRuntimeExecConnectionError &&
+    [400, 404, 500].includes(error.httpStatus ?? 0)
+  );
+}
+
+/**
+ * The pod and its agent-runtime container: a restarted container is a new
+ * cgroup with fresh memory counters, so the first reading is taken again.
+ */
+function agentRuntimeContainerKey(pod: k8s.V1Pod): string {
+  const status = pod.status?.containerStatuses?.find(
+    (candidate) => candidate.name === AGENT_RUNTIME_CONTAINER_NAME,
+  );
+  return `${pod.metadata?.name ?? ""}/${status?.containerID ?? ""}`;
+}
+
+/** Only used for read-only completion observations, never workload mutations. */
+function isTransientObservationError(error: unknown): boolean {
+  if (isTransientK8sApiError(error)) return true;
+  if (error instanceof AgentRuntimeCommandTransportError) return true;
+  if (!error || typeof error !== "object") return false;
+  if (
+    "name" in error &&
+    ["AbortError", "TimeoutError"].includes(String(error.name))
+  ) {
+    return true;
+  }
+  return (
+    "code" in error &&
+    [
+      "ECONNRESET",
+      "ECONNREFUSED",
+      "ETIMEDOUT",
+      "EPIPE",
+      "EAI_AGAIN",
+      "ENETUNREACH",
+      "EHOSTUNREACH",
+    ].includes(String(error.code))
+  );
+}
+
+function findAgentRuntimeContainer(
+  sandbox: AgentSandbox,
+): k8s.V1Container | undefined {
+  return sandbox.spec.podTemplate.spec?.containers.find(
+    (entry) => entry.name === AGENT_RUNTIME_CONTAINER_NAME,
+  );
+}
+
+function pendingTurnSecretName(
+  session: Pick<AgentRunRecord, "taskId">,
+): string {
+  return `agent-turn-${session.taskId}`;
+}
+
+/**
+ * How often a waiting run re-reads its Job. Long enough that a task running
+ * for hours is not a steady stream of API calls, short enough that a finished
+ * task does not sit idle before the lifecycle settles it.
+ */
+const AGENT_RUNTIME_COMPLETION_POLL_MS = 5_000;
+/** Reading the cgroup's memory counters is a short exec; a pod under memory pressure may be slow to answer. */
+const MEMORY_EVENTS_READ_TIMEOUT_MS = 15_000;
+/**
+ * Polls a container that stopped answering is given to show up as ended in
+ * its pod's status: about a minute at the usual interval. On staging a pod
+ * whose container the kernel killed for memory read Failed 22 seconds after
+ * the kill.
+ */
+const CONTAINER_EXIT_REPORT_POLLS = 12;
+/**
+ * Turn failures a memory kill explains: the process died without a word of
+ * its own. An image's envelope code (a provider error it reported itself)
+ * keeps its classification.
+ */
+const MEMORY_KILL_EXPLAINS: ReadonlySet<string> = new Set<AgentRunFailureCode>([
+  "turn.exit_status",
+  "turn.process_exited",
+  "turn.recording_failed",
+]);
+const AGENT_RUNTIME_INPUT_STAGING_POLL_MS = 500;
+const AGENT_RUNTIME_POD_REMOVAL_TIMEOUT_MS = 5 * 60_000;
+const AGENT_RUNTIME_ATTACH_TIMEOUT_MS = 60_000;
+const AGENT_SANDBOX_CONTROLLER_MISSING_MESSAGE =
+  "Agent Runtime needs the Agent Sandbox controller, and this cluster does not have it installed. Ask an administrator to install it.";
+
+function agentRuntimeTerminalAttachCommand(): string[] {
+  return [AGENT_RUNTIME_ATTACH_SCRIPT];
+}
+
+/** Sleep that wakes early on abort, so cancellation is not delayed a full poll. */
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(finish, ms);
+    function finish() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    }
+    signal?.addEventListener("abort", finish, { once: true });
+  });
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function shellDisplayArgument(value: string): string {
+  return /^[A-Za-z0-9_./:=+-]+$/.test(value) ? value : shellQuote(value);
+}
+
+/** The in-Pod helper owns path validation for both the bounded JSON path and
+ * streaming transfers, so every caller reaches the workspace the same way.
+ *
+ * The program is sent with every call rather than run from a path inside the
+ * image. An image ships whatever helper it was built with, so calling an
+ * installed copy breaks whenever the two drift — a workspace served by an
+ * image older than the transfer protocol answered with a JSON parse error
+ * from an empty stdin read. Sending the source keeps the helper and the code
+ * that speaks to it on the same version, and lets a custom image that never
+ * bundled it serve workspace files too. `python3 -c` leaves argv, stdin and
+ * stdout free, which the transfer commands stream through.
+ */
+function workspaceFilesCommand(): string[] {
+  workspaceFilesProgram ??= readFileSync(
+    // Same static dir the sandbox proxy is served from, so it resolves in src
+    // under tsx/vitest and in dist in a production build.
+    path.join(path.dirname(config.mcpSandbox.filePath), "workspace-files.py"),
+    "utf-8",
+  );
+  return ["python3", "-c", workspaceFilesProgram];
+}
+
+let workspaceFilesProgram: string | undefined;
+
+/**
+ * A runtime image without `python3`. The bootstrap only requires a shell and
+ * tmux, so this is a legitimate image that simply cannot serve workspace
+ * files; say so instead of surfacing the exec failure.
+ */
+function describeWorkspaceHelperFailure(error: unknown): ApiError | null {
+  const text = error instanceof Error ? error.message : String(error);
+  if (!/python3.*(not found|no such file)|exec.*python3/i.test(text)) {
+    return null;
+  }
+  return new ApiError(
+    400,
+    `This Agent's image has no python3, which ${archestraMcpBranding.appName} needs to read, write and transfer saved files. Add python3 to the image, or use a maintained one.`,
+  );
+}

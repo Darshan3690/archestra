@@ -1,16 +1,20 @@
 import AnthropicProvider from "@anthropic-ai/sdk";
-import { ArchestraInternalErrorCode } from "@shared";
-import { encode as toonEncode } from "@toon-format/toon";
+import { _iterSSEMessages } from "@anthropic-ai/sdk/core/streaming";
+import {
+  ArchestraInternalErrorCode,
+  PROVIDER_BILLING_BLOCK_BODY,
+  PROVIDER_BILLING_BLOCK_TITLE,
+} from "@archestra/shared";
 import { get } from "lodash-es";
+import { anthropicVertexClient } from "@/clients/anthropic-vertex";
+import { anthropicWorkloadIdentity } from "@/clients/anthropic-workload-identity";
 import {
   getAzureAiFoundryBearerTokenProvider,
   isAnthropicAzureFoundryEntraIdEnabled,
 } from "@/clients/azure-openai-credentials";
 import config from "@/config";
 import logger from "@/logging";
-import { ModelModel } from "@/models";
 import { metrics } from "@/observability";
-import { getTokenizer } from "@/tokenizers";
 import type {
   Anthropic,
   ChunkProcessingResult,
@@ -24,16 +28,33 @@ import type {
   LLMResponseAdapter,
   LLMStreamAdapter,
   StreamAccumulatorState,
-  ToolCompressionStats,
   UsageView,
 } from "@/types";
-import { extractCommonMessageText } from "@/types";
+import {
+  extractCommonMessageText,
+  extractCommonToolCallArguments,
+} from "@/types";
+import { isAnthropicBillingBlock } from "@/utils/anthropic-billing-error";
+import {
+  mergeAnthropicUsage,
+  normalizeAnthropicUsage,
+  primaryBillingUsage,
+} from "@/utils/billable-usage";
+import { fetchWithAbortSignal } from "@/utils/client-disconnect-signal";
+import { ObservedProviderUsageError } from "@/utils/observed-provider-usage-error";
+import { ANTHROPIC_SUBSCRIPTION_UPSTREAM } from "../common";
+import { isApprovedAsSent } from "../utils/approved-as-sent";
 import {
   hasImageContent,
   isImageTooLarge,
   isMcpImageBlock,
 } from "../utils/mcp-image";
-import { unwrapToolContent } from "../utils/unwrap-tool-content";
+import { wordToolCallId } from "../utils/tool-call-ids";
+import {
+  type SamplingParam,
+  withSamplingParamFallback,
+} from "./sampling-param-fallback";
+import { PROXY_SDK_MAX_RETRIES } from "./sdk-retry-policy";
 
 // =============================================================================
 // TYPE ALIASES
@@ -102,8 +123,11 @@ class AnthropicRequestAdapter
       if (message.role === "user" && Array.isArray(message.content)) {
         for (const contentBlock of message.content) {
           if (contentBlock.type === "tool_result") {
-            // Find tool name from previous assistant messages
-            const toolName = this.findToolName(contentBlock.tool_use_id);
+            // Find the paired tool_use from previous assistant messages
+            const toolUse = this.findToolUse(
+              this.request.messages,
+              contentBlock.tool_use_id,
+            );
 
             let content: unknown;
             if (typeof contentBlock.content === "string") {
@@ -118,8 +142,10 @@ class AnthropicRequestAdapter
 
             results.push({
               id: contentBlock.tool_use_id,
-              name: toolName ?? "unknown",
+              name: toolUse?.name ?? "unknown",
+              arguments: toolUse?.arguments,
               content,
+              structured: typeof contentBlock.content !== "string",
               isError: contentBlock.is_error ?? false,
             });
           }
@@ -185,17 +211,6 @@ class AnthropicRequestAdapter
     Object.assign(this.toolResultUpdates, updates);
   }
 
-  async applyToonCompression(model: string): Promise<ToolCompressionStats> {
-    const { messages: compressedMessages, stats } =
-      await convertToolResultsToToon(this.request.messages, model);
-    // Update internal messages state
-    this.request = {
-      ...this.request,
-      messages: compressedMessages,
-    };
-    return stats;
-  }
-
   convertToolResultContent(messages: AnthropicMessages): AnthropicMessages {
     return messages.map((message) => {
       if (message.role !== "user" || !Array.isArray(message.content)) {
@@ -237,7 +252,9 @@ class AnthropicRequestAdapter
   // Build Modified Request
   // ---------------------------------------------------------------------------
 
-  toProviderRequest(): AnthropicRequest {
+  toProviderRequest(options?: {
+    preserveToolCallIds?: boolean;
+  }): AnthropicRequest {
     let messages = this.request.messages;
 
     // Apply tool result updates if any
@@ -246,6 +263,11 @@ class AnthropicRequestAdapter
     }
 
     messages = this.convertToolResultContent(messages);
+    messages = stripEmptyTextBlocks(messages);
+    // After the result updates above, which look up the client's call ids.
+    if (!options?.preserveToolCallIds) {
+      messages = withAnthropicToolCallIds(messages);
+    }
 
     return {
       ...this.request,
@@ -258,9 +280,12 @@ class AnthropicRequestAdapter
   // Private Helpers
   // ---------------------------------------------------------------------------
 
-  private findToolName(toolUseId: string): string | null {
-    for (let i = this.request.messages.length - 1; i >= 0; i--) {
-      const message = this.request.messages[i];
+  private findToolUse(
+    messages: AnthropicMessages,
+    toolUseId: string,
+  ): { name: string; arguments?: Record<string, unknown> } | null {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
       if (
         message.role === "assistant" &&
         Array.isArray(message.content) &&
@@ -268,7 +293,10 @@ class AnthropicRequestAdapter
       ) {
         for (const content of message.content) {
           if (content.type === "tool_use" && content.id === toolUseId) {
-            return content.name;
+            return {
+              name: content.name,
+              arguments: extractCommonToolCallArguments(content.input),
+            };
           }
         }
       }
@@ -298,15 +326,15 @@ class AnthropicRequestAdapter
 
         for (const contentBlock of message.content) {
           if (contentBlock.type === "tool_result") {
-            // Find the tool name from previous assistant messages
-            const toolName = this.findToolNameInMessages(
+            // Find the paired tool_use from previous assistant messages
+            const toolUse = this.findToolUse(
               messages,
               contentBlock.tool_use_id,
             );
 
-            if (toolName) {
+            if (toolUse) {
               logger.debug(
-                { toolUseId: contentBlock.tool_use_id, toolName },
+                { toolUseId: contentBlock.tool_use_id, toolName: toolUse.name },
                 "[AnthropicAdapter] toCommonFormat: found tool result",
               );
               // Parse the tool result
@@ -323,9 +351,11 @@ class AnthropicRequestAdapter
 
               toolCalls.push({
                 id: contentBlock.tool_use_id,
-                name: toolName,
+                name: toolUse.name,
+                arguments: toolUse.arguments,
                 content: toolResult,
-                isError: false,
+                structured: typeof contentBlock.content !== "string",
+                isError: contentBlock.is_error ?? false,
               });
             }
           }
@@ -348,31 +378,6 @@ class AnthropicRequestAdapter
       "[AnthropicAdapter] toCommonFormat: conversion complete",
     );
     return commonMessages;
-  }
-
-  /**
-   * Extract tool name from messages by finding the assistant message
-   * that contains the tool_use_id
-   */
-  private findToolNameInMessages(
-    messages: AnthropicMessages,
-    toolUseId: string,
-  ): string | null {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i];
-      if (
-        message.role === "assistant" &&
-        Array.isArray(message.content) &&
-        message.content.length > 0
-      ) {
-        for (const content of message.content) {
-          if (content.type === "tool_use" && content.id === toolUseId) {
-            return content.name;
-          }
-        }
-      }
-    }
-    return null;
   }
 
   /**
@@ -400,8 +405,21 @@ class AnthropicRequestAdapter
         const updatedContent = message.content.map((contentBlock) => {
           if (
             contentBlock.type === "tool_result" &&
-            updates[contentBlock.tool_use_id]
+            Object.hasOwn(updates, contentBlock.tool_use_id)
           ) {
+            // OpenAPPA reads the result as the JSON text of its blocks. When
+            // the approved output is those blocks as sent, the blocks stay:
+            // an image must reach the provider as an image, and a tool search
+            // answers with `tool_reference` blocks the provider reads to load
+            // the referenced tools. A changed output replaces them with its text.
+            if (
+              isApprovedAsSent({
+                sent: contentBlock.content,
+                approved: updates[contentBlock.tool_use_id],
+              })
+            ) {
+              return contentBlock;
+            }
             appliedCount++;
             logger.debug(
               { toolUseId: contentBlock.tool_use_id },
@@ -555,8 +573,7 @@ class AnthropicResponseAdapter
   }
 
   getUsage(): UsageView {
-    const { input, output } = getUsageTokens(this.response.usage);
-    return { inputTokens: input, outputTokens: output };
+    return normalizeAnthropicUsage(this.response.usage, this.response.model);
   }
 
   getOriginalResponse(): AnthropicResponse {
@@ -566,6 +583,59 @@ class AnthropicResponseAdapter
   getFinishReasons(): string[] {
     const reason = this.response.stop_reason;
     return reason ? [reason] : [];
+  }
+
+  readonly supportsToolCallReview = true;
+
+  withRewrittenToolCalls(
+    toolCalls: Array<{
+      id: string;
+      name: string;
+      arguments: string;
+      wireId?: string;
+      reviewDetails?: string;
+    }>,
+  ): AnthropicResponse {
+    // Positional: one rewritten entry per call this response carries, in
+    // order. The id the client correlates by is the provider's unless the
+    // call carries the one it is given instead.
+    let next = 0;
+    const wireIdByProviderId = new Map<string, string>();
+    const content = this.response.content.flatMap(
+      (block): AnthropicResponse["content"] => {
+        if (block.type !== "tool_use") return [block];
+        const rewritten = toolCalls[next++];
+        if (!rewritten) return [block];
+        if (rewritten.wireId && rewritten.wireId !== block.id) {
+          wireIdByProviderId.set(block.id, rewritten.wireId);
+        }
+        return [
+          // A server-held review precedes its card as plain assistant text.
+          ...(rewritten.reviewDetails
+            ? [
+                {
+                  type: "text" as const,
+                  text: rewritten.reviewDetails,
+                  citations: null,
+                },
+              ]
+            : []),
+          {
+            ...block,
+            id: rewritten.wireId ?? block.id,
+            name: rewritten.name,
+            input: parseArgs(rewritten.arguments),
+          },
+        ];
+      },
+    );
+    // Response keys outside `content` (for example `safeguard_results`, keyed
+    // by tool-use id) must name the calls the way the client now knows them.
+    const { content: _content, ...rest } = this.response;
+    return {
+      ...(replaceToolUseIds(rest, wireIdByProviderId) as typeof rest),
+      content,
+    };
   }
 
   toRefusalResponse(
@@ -578,9 +648,17 @@ class AnthropicResponseAdapter
         {
           type: "text",
           text: contentMessage,
-          citations: null,
+          citations: [],
         },
       ],
+      stop_reason: "end_turn",
+    };
+  }
+
+  withReplacedText(text: string): AnthropicResponse {
+    return {
+      ...this.response,
+      content: [{ type: "text", text, citations: [] }],
       stop_reason: "end_turn",
     };
   }
@@ -595,8 +673,127 @@ class AnthropicStreamAdapter
 {
   readonly provider = "anthropic" as const;
   readonly state: StreamAccumulatorState;
-  private toolUseBlockIndices = new Set<number>();
-  private currentToolCallIndex = -1;
+  /** Upstream content-block index → position in `state.toolCalls`. */
+  private toolCallByBlockIndex = new Map<number, number>();
+  // Upstream content-block index -> the index the client is given, assigned in
+  // the order blocks are actually emitted. Withholding a tool block, or holding
+  // it back and releasing it after later text, would otherwise leave the client
+  // a gap or a rewind: it applies deltas by index but appends blocks in arrival
+  // order, so either one silently mis-assigns every block that follows.
+  private outIndexByUpstream = new Map<number, number>();
+  private nextOutIndex = 0;
+  // Whether the buffered tool-call events were actually written to the client.
+  // They are held until the gate decides, so a turn that ends before that — an
+  // upstream drop, an abort — delivered none of them.
+  private toolCallsReleased = false;
+  // Set to the refusal text when the streamed response was replaced by a policy
+  // refusal. formatEndSSE then closes the turn as end_turn instead of replaying
+  // the upstream tool_use stop reason (which would leave a text-only turn ending
+  // in a tool-use stop reason and no tool_use blocks — an inconsistent state
+  // that makes agent harnesses treat the turn as a malformed tool call and
+  // retry), and toProviderResponse persists the refusal rather than the blocked
+  // tool calls so the interaction log matches what the client received.
+  /**
+   * Reasoning blocks the model produced, in order, keyed by their upstream
+   * content-block index.
+   *
+   * These stream straight through to the client but were never accumulated, so
+   * the reconstructed turn — the one persisted as the interaction — omitted
+   * them entirely. A reasoning turn was therefore recorded as if the model had
+   * gone straight to its answer, which is the same erasure as dropping the
+   * answer text, and it is what makes a thinking turn impossible to review
+   * after the fact.
+   *
+   * Signatures are kept with their block: they are what makes a thinking block
+   * replayable, and a record that dropped them would describe something the
+   * upstream API would reject.
+   */
+  private reasoningBlocks = new Map<
+    number,
+    | { type: "thinking"; thinking: string; signature: string }
+    | {
+        type: "redacted_thinking";
+        data: string;
+      }
+  >();
+  private getTextPrefix: ((firstText: string) => string) | null = null;
+  private textPrefixIssued = false;
+
+  private startReasoningBlock(
+    index: number,
+    block: {
+      type?: string;
+      thinking?: string;
+      signature?: string;
+      data?: string;
+    },
+  ): void {
+    if (block.type === "thinking") {
+      this.reasoningBlocks.set(index, {
+        type: "thinking",
+        thinking: block.thinking ?? "",
+        signature: block.signature ?? "",
+      });
+      return;
+    }
+    if (block.type === "redacted_thinking") {
+      this.reasoningBlocks.set(index, {
+        type: "redacted_thinking",
+        data: block.data ?? "",
+      });
+    }
+  }
+
+  private appendReasoningDelta(
+    index: number,
+    delta: { type?: string; thinking?: string; signature?: string },
+  ): void {
+    const block = this.reasoningBlocks.get(index);
+    if (!block || block.type !== "thinking") {
+      return;
+    }
+    if (delta.type === "thinking_delta" && delta.thinking) {
+      block.thinking += delta.thinking;
+    } else if (delta.type === "signature_delta" && delta.signature) {
+      block.signature += delta.signature;
+    }
+  }
+
+  /** Accumulated reasoning blocks in upstream content-block order. */
+  private orderedReasoningBlocks(): AnthropicResponse["content"] {
+    return [...this.reasoningBlocks.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([, block]) =>
+        block.type === "thinking"
+          ? {
+              type: "thinking" as const,
+              thinking: block.thinking,
+              signature: block.signature,
+            }
+          : { type: "redacted_thinking" as const, data: block.data },
+      ) as AnthropicResponse["content"];
+  }
+
+  // The upstream's own `message_delta` and `message_stop`. The proxy holds
+  // both back and writes them in formatEndSSE, after the policy gate, so the
+  // keys it does not set itself (for example `safeguard_results`, the server's
+  // auto mode verdicts) would otherwise never reach the client.
+  private upstreamMessageDelta: Record<string, unknown> | null = null;
+  private upstreamMessageStop: Record<string, unknown> | null = null;
+  // Upstream events of a type this adapter does not know, held while tool
+  // calls are buffered so they do not reach the client ahead of the calls
+  // they may describe.
+  private heldPassthroughEvents: Array<Record<string, unknown>> = [];
+  private providerUsage: Record<string, unknown> = {};
+  // Provider tool-use id -> the id the client is given, for calls released
+  // with a rewritten id. Upstream data passed through verbatim (verdicts keyed
+  // by tool-use id) must name the calls the way the client knows them.
+  private wireIdByProviderId = new Map<string, string>();
+
+  private replacedText: string | null = null;
+  private get responseReplacedWithText(): boolean {
+    return this.replacedText !== null;
+  }
 
   constructor() {
     this.state = {
@@ -614,6 +811,10 @@ class AnthropicStreamAdapter
     };
   }
 
+  setTextSuffix(getPrefix: (firstText: string) => string): void {
+    this.getTextPrefix = getPrefix;
+  }
+
   processChunk(chunk: AnthropicStreamChunk): ChunkProcessingResult {
     // Track first chunk time
     if (this.state.timing.firstChunkTime === null) {
@@ -623,26 +824,50 @@ class AnthropicStreamAdapter
     let sseData: string | null = null;
     let isToolCallChunk = false;
     let isFinal = false;
+    let isResponsePreamble = false;
 
     switch (chunk.type) {
       case "message_start":
         this.state.responseId = chunk.message.id;
         this.state.model = chunk.message.model;
         if (chunk.message.usage) {
-          this.state.usage = {
-            inputTokens: chunk.message.usage.input_tokens,
-            outputTokens: chunk.message.usage.output_tokens,
-          };
+          this.providerUsage = mergeAnthropicUsage({}, chunk.message.usage);
+          this.state.usage = normalizeAnthropicUsage(
+            this.providerUsage,
+            this.state.model,
+          );
         }
         sseData = `event: message_start\ndata: ${JSON.stringify(chunk)}\n\n`;
+        isResponsePreamble = true;
         break;
 
       case "content_block_start":
-        if (chunk.content_block.type === "text") {
-          sseData = `event: content_block_start\ndata: ${JSON.stringify(chunk)}\n\n`;
-        } else if (chunk.content_block.type === "tool_use") {
-          this.toolUseBlockIndices.add(chunk.index);
-          this.currentToolCallIndex = this.state.toolCalls.length;
+        if (chunk.content_block.type === "tool_use") {
+          let prefixSse = "";
+          if (!this.textPrefixIssued && this.getTextPrefix) {
+            const prefix = this.resolveTextPrefix("");
+            if (prefix) {
+              this.textPrefixIssued = true;
+              this.state.text = prefix;
+              const textIndex = this.nextOutIndex++;
+              prefixSse = `event: content_block_start\ndata: ${JSON.stringify({
+                type: "content_block_start",
+                index: textIndex,
+                content_block: { type: "text", text: "" },
+              })}\n\nevent: content_block_delta\ndata: ${JSON.stringify({
+                type: "content_block_delta",
+                index: textIndex,
+                delta: { type: "text_delta", text: prefix },
+              })}\n\nevent: content_block_stop\ndata: ${JSON.stringify({
+                type: "content_block_stop",
+                index: textIndex,
+              })}\n\n`;
+            }
+          }
+          this.toolCallByBlockIndex.set(
+            chunk.index,
+            this.state.toolCalls.length,
+          );
           this.state.toolCalls.push({
             id: chunk.content_block.id,
             name: chunk.content_block.name,
@@ -651,28 +876,81 @@ class AnthropicStreamAdapter
           // Store raw event for replay after policy approval
           this.state.rawToolCallEvents.push(chunk);
           isToolCallChunk = true;
+          if (prefixSse) {
+            sseData = prefixSse;
+          }
+        } else {
+          this.startReasoningBlock(chunk.index, chunk.content_block);
+          // Everything except client tool calls (text, thinking,
+          // redacted_thinking, server_tool_use, ...) streams through
+          // unmodified. Thinking blocks in particular must reach the client:
+          // it has to replay them (with signature) on the next turn or the
+          // upstream API rejects the conversation.
+          sseData = `event: content_block_start\ndata: ${JSON.stringify(
+            this.withOutIndex(chunk),
+          )}\n\n`;
         }
         break;
 
       case "content_block_delta":
-        if (chunk.delta.type === "text_delta") {
-          this.state.text += chunk.delta.text;
-          sseData = `event: content_block_delta\ndata: ${JSON.stringify(chunk)}\n\n`;
-        } else if (chunk.delta.type === "input_json_delta") {
-          if (this.currentToolCallIndex >= 0) {
-            this.state.toolCalls[this.currentToolCallIndex].arguments +=
+        if (
+          chunk.delta.type === "input_json_delta" &&
+          this.toolCallByBlockIndex.has(chunk.index)
+        ) {
+          const position = this.toolCallByBlockIndex.get(chunk.index);
+          if (position !== undefined) {
+            this.state.toolCalls[position].arguments +=
               chunk.delta.partial_json;
           }
           // Store raw event for replay after policy approval
           this.state.rawToolCallEvents.push(chunk);
           isToolCallChunk = true;
+        } else {
+          // input_json_delta outside a tool_use block belongs to a
+          // server-side tool and is not subject to tool-call rulings.
+          let prefixSse = "";
+          if (chunk.delta.type === "text_delta") {
+            this.state.text += chunk.delta.text;
+            if (!this.textPrefixIssued && this.getTextPrefix) {
+              const prefix = this.resolveTextPrefix(chunk.delta.text);
+              this.textPrefixIssued = true;
+              if (prefix) {
+                prefixSse = `event: content_block_delta\ndata: ${JSON.stringify(
+                  this.withOutIndex({
+                    ...chunk,
+                    delta: { ...chunk.delta, text: prefix },
+                  }),
+                )}\n\n`;
+                chunk = {
+                  ...chunk,
+                  delta: {
+                    ...chunk.delta,
+                    text: `\n\n${chunk.delta.text}`,
+                  },
+                };
+              }
+            }
+          }
+          this.appendReasoningDelta(chunk.index, chunk.delta);
+          sseData = `${prefixSse}event: content_block_delta\ndata: ${JSON.stringify(
+            this.withOutIndex(chunk),
+          )}\n\n`;
         }
         break;
 
       case "content_block_stop":
-        if (!this.toolUseBlockIndices.has(chunk.index)) {
-          sseData = `event: content_block_stop\ndata: ${JSON.stringify(chunk)}\n\n`;
+        if (!this.toolCallByBlockIndex.has(chunk.index)) {
+          const event = `event: content_block_stop\ndata: ${JSON.stringify(
+            this.withOutIndex(chunk),
+          )}\n\n`;
+          sseData = event;
         } else {
+          // A tool called with no input streams no `partial_json`; its input
+          // is `{}`, not the empty string policy evaluation would reject.
+          const position = this.toolCallByBlockIndex.get(chunk.index);
+          const call =
+            position === undefined ? undefined : this.state.toolCalls[position];
+          if (call?.arguments === "") call.arguments = "{}";
           // Store raw event for replay after policy approval
           this.state.rawToolCallEvents.push(chunk);
           isToolCallChunk = true;
@@ -683,21 +961,41 @@ class AnthropicStreamAdapter
         if (chunk.delta.stop_reason) {
           this.state.stopReason = chunk.delta.stop_reason;
         }
-        if (chunk.usage?.output_tokens !== undefined) {
-          if (this.state.usage) {
-            this.state.usage.outputTokens = chunk.usage.output_tokens;
-          }
+        if (chunk.usage) {
+          this.providerUsage = mergeAnthropicUsage(
+            this.providerUsage,
+            chunk.usage,
+          );
+          this.state.usage = normalizeAnthropicUsage(
+            this.providerUsage,
+            this.state.model,
+          );
         }
+        this.upstreamMessageDelta = chunk as unknown as Record<string, unknown>;
         // Don't send message_delta yet - we'll send it after policy evaluation
         break;
 
       case "message_stop":
+        this.upstreamMessageStop = chunk as unknown as Record<string, unknown>;
         isFinal = true;
         // Don't send message_stop yet - we'll send it after policy evaluation
         break;
+
+      default: {
+        // An event type this adapter does not know goes to the client
+        // unchanged: clients add stream events over releases and expect a
+        // gateway to relay what it does not recognize.
+        const event = chunk as unknown as Record<string, unknown>;
+        if (this.state.rawToolCallEvents.length > 0) {
+          this.heldPassthroughEvents.push(event);
+        } else {
+          sseData = this.formatPassthroughEvent(event);
+        }
+        break;
+      }
     }
 
-    return { sseData, isToolCallChunk, isFinal };
+    return { sseData, isToolCallChunk, isFinal, isResponsePreamble };
   }
 
   getSSEHeaders(): Record<string, string> {
@@ -732,51 +1030,196 @@ class AnthropicStreamAdapter
   }
 
   getRawToolCallEvents(): string[] {
-    return this.state.rawToolCallEvents.map(
-      (event) =>
-        `event: ${(event as { type: string }).type}\ndata: ${JSON.stringify(event)}\n\n`,
-    );
+    // Reached only when the gate allowed the calls, which is the moment these
+    // blocks become the client's: they earn an index, and the reconstructed
+    // turn may name them. Idempotent — the mapping is memoised, so the
+    // handler's repeated reads stay stable.
+    this.toolCallsReleased = true;
+    return this.state.rawToolCallEvents.map((event) => {
+      const renumbered = this.withOutIndex(
+        event as { type: string; index: number },
+      );
+      return `event: ${renumbered.type}\ndata: ${JSON.stringify(renumbered)}\n\n`;
+    });
+  }
+
+  readonly supportsToolCallReview = true;
+
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]): string[] {
+    // Same release semantics as getRawToolCallEvents: these blocks are becoming
+    // the client's, so toProviderResponse must name them. The buffered raw
+    // events are deliberately NOT replayed — they carry the tool the model
+    // named directly, which is the call being repaired — so these blocks get
+    // freshly allocated output indices instead of going through the upstream
+    // index mapping.
+    this.toolCallsReleased = true;
+    const events: string[] = [];
+    for (const toolCall of toolCalls) {
+      // A server-held review precedes its card, in one short-lived text block
+      // with its own output index, so every later block keeps its index.
+      if (toolCall.reviewDetails) {
+        const reviewIndex = this.nextOutIndex++;
+        const reviewEvents: Array<Record<string, unknown>> = [
+          {
+            type: "content_block_start",
+            index: reviewIndex,
+            content_block: { type: "text", text: "" },
+          },
+        ];
+        // Bound individual SSE frames without splitting a UTF-16 surrogate pair.
+        let offset = 0;
+        while (offset < toolCall.reviewDetails.length) {
+          let end = Math.min(offset + 4096, toolCall.reviewDetails.length);
+          const lastUnit = toolCall.reviewDetails.charCodeAt(end - 1);
+          if (
+            end < toolCall.reviewDetails.length &&
+            lastUnit >= 0xd800 &&
+            lastUnit <= 0xdbff
+          )
+            end--;
+          reviewEvents.push({
+            type: "content_block_delta",
+            index: reviewIndex,
+            delta: {
+              type: "text_delta",
+              text: toolCall.reviewDetails.slice(offset, end),
+            },
+          });
+          offset = end;
+        }
+        reviewEvents.push({ type: "content_block_stop", index: reviewIndex });
+        for (const event of reviewEvents) {
+          events.push(
+            `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+          );
+        }
+      }
+      if (toolCall.wireId && toolCall.wireId !== toolCall.id) {
+        this.wireIdByProviderId.set(toolCall.id, toolCall.wireId);
+      }
+      const index = this.nextOutIndex++;
+      let input: Record<string, unknown> = {};
+      try {
+        input = JSON.parse(toolCall.arguments);
+      } catch {
+        // A call whose arguments do not parse is never rewritten upstream of
+        // here; keep the block well-formed rather than emitting invalid JSON.
+      }
+      events.push(
+        `event: content_block_start\ndata: ${JSON.stringify({
+          type: "content_block_start",
+          index,
+          content_block: {
+            type: "tool_use",
+            id: toolCall.wireId ?? toolCall.id,
+            name: toolCall.name,
+            input: {},
+          },
+        })}\n\n`,
+      );
+      // Anthropic streams tool input as `partial_json` fragments that the
+      // client concatenates and parses; one fragment carrying the whole object
+      // is the valid degenerate case.
+      events.push(
+        `event: content_block_delta\ndata: ${JSON.stringify({
+          type: "content_block_delta",
+          index,
+          delta: {
+            type: "input_json_delta",
+            partial_json: JSON.stringify(input),
+          },
+        })}\n\n`,
+      );
+      events.push(
+        `event: content_block_stop\ndata: ${JSON.stringify({
+          type: "content_block_stop",
+          index,
+        })}\n\n`,
+      );
+    }
+    return events;
   }
 
   formatCompleteTextSSE(text: string): string[] {
+    this.replacedText = text;
+    const index = this.nextOutIndex++;
     return [
       `event: content_block_start\ndata: ${JSON.stringify({
         type: "content_block_start",
-        index: 0,
+        index,
         content_block: { type: "text", text: "" },
       })}\n\n`,
       `event: content_block_delta\ndata: ${JSON.stringify({
         type: "content_block_delta",
-        index: 0,
+        index,
         delta: { type: "text_delta", text },
       })}\n\n`,
       `event: content_block_stop\ndata: ${JSON.stringify({
         type: "content_block_stop",
-        index: 0,
+        index,
       })}\n\n`,
     ];
+  }
+
+  prepareResponseReplacement(): void {
+    this.outIndexByUpstream.clear();
+    this.nextOutIndex = 0;
+    // A governed replacement is the only assistant content for this turn.
+    // Clears raw output, tool calls, block state, and stop reason.
+    // Unadmitted content must not cross the child return boundary.
+    this.reasoningBlocks.clear();
+    this.state.text = "";
+    this.state.toolCalls = [];
+    this.state.rawToolCallEvents = [];
+    this.state.stopReason = "end_turn";
+    this.toolCallsReleased = false;
+    this.toolCallByBlockIndex.clear();
+    // Upstream data about the replaced turn (verdicts on its tool calls) does
+    // not describe what the client receives.
+    this.upstreamMessageDelta = null;
+    this.upstreamMessageStop = null;
+    this.heldPassthroughEvents = [];
   }
 
   formatEndSSE(): string {
     const events: string[] = [];
 
+    for (const event of this.heldPassthroughEvents) {
+      events.push(this.formatPassthroughEvent(event));
+    }
+    this.heldPassthroughEvents = [];
+
+    // The upstream's own end events, with the fields the proxy owns set over
+    // them. A text replacement keeps none of them: they describe the turn it
+    // replaced.
+    const upstreamDelta = this.responseReplacedWithText
+      ? {}
+      : this.withWireToolIds(this.upstreamMessageDelta ?? {});
+    const upstreamStop = this.responseReplacedWithText
+      ? {}
+      : this.withWireToolIds(this.upstreamMessageStop ?? {});
+    const upstreamDeltaBody = asRecord(upstreamDelta.delta);
+
     // message_delta with stop_reason
     events.push(
       `event: message_delta\ndata: ${JSON.stringify({
+        ...upstreamDelta,
         type: "message_delta",
         delta: {
-          stop_reason: this.state.stopReason ?? "end_turn",
-          stop_sequence: null,
+          ...upstreamDeltaBody,
+          stop_reason: this.responseReplacedWithText
+            ? "end_turn"
+            : (this.state.stopReason ?? "end_turn"),
+          stop_sequence: upstreamDeltaBody.stop_sequence ?? null,
         },
-        usage: {
-          output_tokens: this.state.usage?.outputTokens ?? 0,
-        },
+        usage: { ...asRecord(upstreamDelta.usage), ...this.deltaUsage() },
       })}\n\n`,
     );
 
     // message_stop
     events.push(
       `event: message_stop\ndata: ${JSON.stringify({
+        ...upstreamStop,
         type: "message_stop",
       })}\n\n`,
     );
@@ -787,6 +1230,11 @@ class AnthropicStreamAdapter
   toProviderResponse(): AnthropicResponse {
     const content: AnthropicResponse["content"] = [];
 
+    // Reasoning first, matching the order upstream emits it: a thinking block
+    // precedes the answer it produced, and a record that reordered them would
+    // not describe the turn the client saw.
+    content.push(...this.orderedReasoningBlocks());
+
     // Add text block if we have text
     if (this.state.text) {
       content.push({
@@ -796,8 +1244,11 @@ class AnthropicStreamAdapter
       });
     }
 
-    // Add tool use blocks
-    for (const toolCall of this.state.toolCalls) {
+    // Only tool calls the client actually received.
+    for (const toolCall of !this.responseReplacedWithText &&
+    this.toolCallsReleased
+      ? this.state.toolCalls
+      : []) {
       let parsedInput: Record<string, unknown> = {};
       try {
         parsedInput = JSON.parse(toolCall.arguments);
@@ -805,6 +1256,17 @@ class AnthropicStreamAdapter
         // Keep empty object if parse fails
       }
 
+      content.push(
+        ...(toolCall.reviewDetails
+          ? [
+              {
+                type: "text" as const,
+                text: toolCall.reviewDetails,
+                citations: null,
+              },
+            ]
+          : []),
+      );
       content.push({
         type: "tool_use",
         id: toolCall.id,
@@ -813,280 +1275,169 @@ class AnthropicStreamAdapter
       });
     }
 
+    // A refusal does not erase what the model already said. Its text streamed as
+    // it arrived and the refusal was appended after it as a further content
+    // block, so the client holds both — and the reconstructed turn has to say
+    // the same thing. Returning the refusal alone drops the model's own answer
+    // from the record, and whatever reads the turn back later (conversation
+    // history, a summarizer, a human debugging a failed run) then sees a turn
+    // in which the model never spoke. The withheld tool calls stay withheld:
+    // `toolCallsReleased` is false on this path, so the loop above skipped
+    // them, which is right — the client never received them.
+    if (this.replacedText !== null) {
+      content.push({ type: "text", text: this.replacedText, citations: null });
+    }
+
+    const upstreamStopReason = this.state
+      .stopReason as AnthropicResponse["stop_reason"];
+    // A turn that delivered no tool call cannot owe a tool result. Upstream may
+    // still have said `tool_use` — it emitted calls that were withheld, or the
+    // stream died after the stop reason — and keeping it would leave a record
+    // that contradicts its own content.
+    const hasToolUse = content.some((block) => block.type === "tool_use");
+    const stopReason =
+      this.responseReplacedWithText ||
+      (upstreamStopReason === "tool_use" && !hasToolUse)
+        ? "end_turn"
+        : (upstreamStopReason ?? "end_turn");
+
     return {
       id: this.state.responseId,
       type: "message",
       role: "assistant",
       content,
       model: this.state.model,
-      stop_reason:
-        (this.state.stopReason as AnthropicResponse["stop_reason"]) ??
-        "end_turn",
+      stop_reason: stopReason,
       stop_sequence: null,
-      usage: {
-        input_tokens: this.state.usage?.inputTokens ?? 0,
-        output_tokens: this.state.usage?.outputTokens ?? 0,
-      },
+      usage: this.responseUsage(),
     };
   }
-}
 
-// =============================================================================
-// TOON COMPRESSION
-// =============================================================================
-
-/**
- * Convert tool results in messages to TOON format
- * Returns both the converted messages and compression stats (tokens and cost savings)
- */
-export async function convertToolResultsToToon(
-  messages: AnthropicMessages,
-  model: string,
-): Promise<{
-  messages: AnthropicMessages;
-  stats: ToolCompressionStats;
-}> {
-  const tokenizer = getTokenizer("anthropic");
-  let toolResultCount = 0;
-  let totalTokensBefore = 0;
-  let totalTokensAfter = 0;
-
-  const result = messages.map((message) => {
-    // Only process user messages with content arrays that contain tool_result blocks
-    if (message.role === "user" && Array.isArray(message.content)) {
-      const updatedContent = message.content.map((contentBlock) => {
-        if (contentBlock.type === "tool_result" && !contentBlock.is_error) {
-          toolResultCount++;
-          logger.info(
-            {
-              toolCallId: contentBlock.tool_use_id,
-              contentType: typeof contentBlock.content,
-              isArray: Array.isArray(contentBlock.content),
-            },
-            "Processing tool_result for TOON conversion",
-          );
-
-          // Handle string content
-          if (typeof contentBlock.content === "string") {
-            try {
-              // Unwrap any extra text block wrapping from clients
-              const unwrapped = unwrapToolContent(contentBlock.content);
-              const parsed = JSON.parse(unwrapped);
-              const noncompressed = unwrapped;
-              const compressed = toonEncode(parsed);
-
-              // Count tokens for before and after
-              const tokensBefore = tokenizer.countTokens([
-                { role: "user", content: noncompressed },
-              ]);
-              const tokensAfter = tokenizer.countTokens([
-                { role: "user", content: compressed },
-              ]);
-
-              // Always count tokens
-              totalTokensBefore += tokensBefore;
-
-              // Only apply compression if it actually saves tokens
-              if (tokensAfter < tokensBefore) {
-                totalTokensAfter += tokensAfter;
-
-                logger.info(
-                  {
-                    toolCallId: contentBlock.tool_use_id,
-                    beforeLength: noncompressed.length,
-                    afterLength: compressed.length,
-                    tokensBefore,
-                    tokensAfter,
-                    toonPreview: compressed.substring(0, 150),
-                    provider: "anthropic",
-                  },
-                  "convertToolResultsToToon: compressed (string content)",
-                );
-                logger.trace(
-                  {
-                    toolCallId: contentBlock.tool_use_id,
-                    before: noncompressed,
-                    after: compressed,
-                    provider: "anthropic",
-                    supposedToBeJson: parsed,
-                  },
-                  "convertToolResultsToToon: before/after",
-                );
-
-                return {
-                  ...contentBlock,
-                  content: compressed,
-                };
-              }
-
-              // Compression not applied - count non-compressed tokens to track total tokens anyway
-              totalTokensAfter += tokensBefore;
-              logger.info(
-                {
-                  toolCallId: contentBlock.tool_use_id,
-                  tokensBefore,
-                  tokensAfter,
-                  provider: "anthropic",
-                },
-                "Skipping TOON compression - compressed output has more tokens",
-              );
-              return contentBlock;
-            } catch {
-              logger.info(
-                {
-                  toolCallId: contentBlock.tool_use_id,
-                  contentPreview:
-                    typeof contentBlock.content === "string"
-                      ? contentBlock.content.substring(0, 100)
-                      : "non-string",
-                },
-                "convertToolResultsToToon: skipping - string content is not JSON",
-              );
-              return contentBlock;
-            }
-          }
-
-          // Handle array content (content blocks format)
-          if (Array.isArray(contentBlock.content)) {
-            const updatedBlocks = contentBlock.content.map((block) => {
-              if (block.type === "text" && typeof block.text === "string") {
-                try {
-                  // Unwrap any extra text block wrapping from clients
-                  const unwrapped = unwrapToolContent(block.text);
-                  // Try to parse as JSON
-                  const parsed = JSON.parse(unwrapped);
-                  const noncompressed = unwrapped;
-                  const compressed = toonEncode(parsed);
-
-                  // Count tokens for before and after
-                  const tokensBefore = tokenizer.countTokens([
-                    { role: "user", content: noncompressed },
-                  ]);
-                  const tokensAfter = tokenizer.countTokens([
-                    { role: "user", content: compressed },
-                  ]);
-
-                  // Always count tokens
-                  totalTokensBefore += tokensBefore;
-
-                  // Only apply compression if it actually saves tokens
-                  if (tokensAfter < tokensBefore) {
-                    totalTokensAfter += tokensAfter;
-
-                    logger.info(
-                      {
-                        toolCallId: contentBlock.tool_use_id,
-                        beforeLength: noncompressed.length,
-                        afterLength: compressed.length,
-                        tokensBefore,
-                        tokensAfter,
-                        toonPreview: compressed.substring(0, 150),
-                      },
-                      "convertToolResultsToToon: compressed (array content)",
-                    );
-                    logger.trace(
-                      {
-                        toolCallId: contentBlock.tool_use_id,
-                        before: noncompressed,
-                        after: compressed,
-                        provider: "anthropic",
-                        supposedToBeJson: parsed,
-                      },
-                      "convertToolResultsToToon: before/after",
-                    );
-
-                    return {
-                      ...block,
-                      text: compressed,
-                    };
-                  }
-
-                  // Compression not applied - count non-compressed tokens to track total tokens anyway
-                  totalTokensAfter += tokensBefore;
-                  logger.info(
-                    {
-                      toolCallId: contentBlock.tool_use_id,
-                      tokensBefore,
-                      tokensAfter,
-                      provider: "anthropic",
-                    },
-                    "Skipping TOON compression - compressed output has more tokens",
-                  );
-                  return block;
-                } catch {
-                  // Not JSON, keep as-is
-                  logger.info(
-                    {
-                      toolCallId: contentBlock.tool_use_id,
-                      blockType: block.type,
-                      textPreview: block.text?.substring(0, 100),
-                    },
-                    "convertToolResultsToToon: skipping - content is not JSON",
-                  );
-                  return block;
-                }
-              }
-              return block;
-            });
-
-            return {
-              ...contentBlock,
-              content: updatedBlocks,
-            };
-          }
-        }
-        return contentBlock;
-      });
-
-      return {
-        ...message,
-        content: updatedContent,
-      };
-    }
-
-    return message;
-  });
-
-  logger.info(
-    { messageCount: messages.length, toolResultCount },
-    "convertToolResultsToToon completed",
-  );
-
-  // Calculate cost savings (always a number, 0 if no savings)
-  let toonCostSavings = 0;
-  const tokensSaved = totalTokensBefore - totalTokensAfter;
-  if (tokensSaved > 0) {
-    toonCostSavings = await ModelModel.calculateCostSavings(
-      model,
-      tokensSaved,
-      "anthropic",
-    );
+  /**
+   * The turn's usage in the `message_delta` wire shape.
+   *
+   * Anthropic documents `message_delta.usage` as the turn's CUMULATIVE usage —
+   * input, output and both cache directions — not an output-only tail. Emitting
+   * `output_tokens` alone forces every consumer to have kept `message_start`'s
+   * numbers, and any consumer that treats the final event as authoritative (the
+   * usual reading of "cumulative") records the turn with no prompt and no cache
+   * reads at all.
+   */
+  private deltaUsage(): Record<string, unknown> {
+    const usage = this.state.usage;
+    return {
+      ...this.providerUsage,
+      input_tokens: usage?.inputTokens ?? 0,
+      output_tokens: usage?.outputTokens ?? 0,
+      cache_read_input_tokens: usage?.cacheReadTokens ?? 0,
+      cache_creation_input_tokens: usage?.cacheWriteTokens ?? 0,
+    };
   }
 
-  return {
-    messages: result,
-    stats: {
-      tokensBefore: totalTokensBefore,
-      tokensAfter: totalTokensAfter,
-      costSavings: toonCostSavings,
-      wasEffective: totalTokensAfter < totalTokensBefore,
-      hadToolResults: toolResultCount > 0,
-    },
-  };
+  /**
+   * The turn's usage in the `MessagesResponse` shape, for the reconstructed
+   * response the interaction log persists.
+   *
+   * The cache counts belong here for the same reason they belong on the wire:
+   * without them the stored body reports a prompt of only the tokens that missed
+   * the cache, contradicting the row's own `cache_read_tokens` column and making
+   * any usage re-derived from the stored response (`anthropicUsageTokens`) silently
+   * cache-free.
+   */
+  private responseUsage(): AnthropicResponse["usage"] {
+    const usage = this.state.usage;
+    const cacheWrite = usage?.cacheWriteTokens ?? 0;
+    const cacheWrite1h = Math.min(
+      Math.max(usage?.cacheWrite1hTokens ?? 0, 0),
+      cacheWrite,
+    );
+    return {
+      ...this.providerUsage,
+      input_tokens: usage?.inputTokens ?? 0,
+      output_tokens: usage?.outputTokens ?? 0,
+      cache_read_input_tokens: usage?.cacheReadTokens ?? 0,
+      cache_creation_input_tokens: cacheWrite,
+      // Only meaningful when something was written; the per-TTL split is what
+      // separates a 1.25x write from a 2x one in the cost calc.
+      ...(cacheWrite > 0
+        ? {
+            cache_creation: {
+              ...asRecord(this.providerUsage.cache_creation),
+              ephemeral_1h_input_tokens: cacheWrite1h,
+              ephemeral_5m_input_tokens: cacheWrite - cacheWrite1h,
+            },
+          }
+        : {}),
+    };
+  }
+
+  private resolveTextPrefix(firstText: string): string {
+    if (!this.getTextPrefix || this.responseReplacedWithText) {
+      return "";
+    }
+    return this.getTextPrefix(firstText);
+  }
+
+  private formatPassthroughEvent(event: Record<string, unknown>): string {
+    const indexed =
+      typeof event.index === "number"
+        ? this.withOutIndex(
+            event as Record<string, unknown> & { index: number },
+          )
+        : event;
+    const out = this.withWireToolIds(indexed);
+    return `event: ${String(out.type)}\ndata: ${JSON.stringify(out)}\n\n`;
+  }
+
+  private withWireToolIds(
+    value: Record<string, unknown>,
+  ): Record<string, unknown> {
+    return replaceToolUseIds(value, this.wireIdByProviderId);
+  }
+
+  /** Rewrite a block event's index to the one the client knows it by. */
+  private withOutIndex<T extends { index: number }>(event: T): T {
+    return { ...event, index: this.outIndexFor(event.index) };
+  }
+
+  private outIndexFor(upstreamIndex: number): number {
+    const existing = this.outIndexByUpstream.get(upstreamIndex);
+    if (existing !== undefined) return existing;
+    const assigned = this.nextOutIndex++;
+    this.outIndexByUpstream.set(upstreamIndex, assigned);
+    return assigned;
+  }
 }
 
 // =============================================================================
 // ADAPTER FACTORY
 // =============================================================================
 
-// =============================================================================
-// USAGE TOKEN HELPERS
-// =============================================================================
+// Same value as the SDK default, but passing it explicitly opts out of the
+// SDK's client-side guard that throws "Streaming is required for operations
+// that may take longer than 10 minutes" on non-streaming requests with large
+// max_tokens (Claude Code sends max_tokens=32000 non-streaming). The proxy
+// must forward such requests — the upstream API is the authority on whether
+// they need streaming.
+const ANTHROPIC_CLIENT_TIMEOUT_MS = 10 * 60 * 1000;
+const CLAUDE_OAUTH_BETA_HEADER = "oauth-2025-04-20";
 
-export function getUsageTokens(usage: Anthropic.Types.Usage) {
+function withClaudeOAuthBetaHeader(
+  defaultHeaders: Record<string, string> | undefined,
+): Record<string, string> {
+  const existing = defaultHeaders?.["anthropic-beta"]
+    ?.split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (existing?.includes(CLAUDE_OAUTH_BETA_HEADER)) {
+    return { ...defaultHeaders };
+  }
   return {
-    input: usage.input_tokens,
-    output: usage.output_tokens,
+    ...defaultHeaders,
+    "anthropic-beta":
+      existing && existing.length > 0
+        ? `${existing.join(",")},${CLAUDE_OAUTH_BETA_HEADER}`
+        : CLAUDE_OAUTH_BETA_HEADER,
   };
 }
 
@@ -1133,6 +1484,19 @@ export const anthropicAdapterFactory: LLMProvider<
     return undefined;
   },
 
+  isSubscriptionCredential(apiKey: string | undefined): boolean {
+    // Anthropic credentials are format-distinguishable: OAuth access tokens
+    // (Claude Pro/Max subscriptions — what Claude Code sends as
+    // `Authorization: Bearer`) are `sk-ant-oat…`, while metered API keys are
+    // `sk-ant-api…`. Checking the token itself (not just the Bearer transport)
+    // keeps other Bearer-shaped credentials (e.g. Workload Identity Federation
+    // access tokens) classified as metered. `extractApiKey` tags forwarded
+    // Bearer tokens with a `Bearer:` sentinel; strip it before the check so
+    // both forwarded and stored credentials are classified uniformly.
+    const token = apiKey?.startsWith("Bearer:") ? apiKey.slice(7) : apiKey;
+    return token?.startsWith("sk-ant-oat") ?? false;
+  },
+
   getBaseUrl(): string | undefined {
     return config.llm.anthropic.baseUrl;
   },
@@ -1144,26 +1508,53 @@ export const anthropicAdapterFactory: LLMProvider<
     options: CreateClientOptions,
   ): AnthropicProvider {
     // Use observable fetch for request duration metrics if agent is provided
-    const customFetch = options.agent
+    const observableFetch = options.agent
       ? metrics.llm.getObservableFetch(
           "anthropic",
           options.agent,
           options.source,
-          options.externalAgentId,
+          { reportTokens: false },
         )
       : undefined;
+    const customFetch = observeResponseHeaders(
+      fetchWithAbortSignal(observableFetch, options.abortSignal),
+      options.onResponseHeaders,
+    );
 
     // Check if this is a Bearer token (OAuth) or regular API key
     const isAuthToken = apiKey?.startsWith("Bearer:") ?? false;
     const token = isAuthToken && apiKey ? apiKey.slice(7) : undefined;
-    const regularApiKey = isAuthToken ? undefined : apiKey;
+    // Null prevents the SDK from adding an ambient API key to bearer requests.
+    const regularApiKey = isAuthToken ? null : apiKey;
+    const isClaudeSubscriptionToken = token?.startsWith("sk-ant-oat") ?? false;
+
+    // A Claude subscription bearer belongs to Anthropic even when this
+    // deployment uses Vertex for its provider-billed Anthropic traffic.
+    if (anthropicVertexClient.isEnabled() && !isClaudeSubscriptionToken) {
+      return new AnthropicProvider({
+        maxRetries: PROXY_SDK_MAX_RETRIES,
+        apiKey: null,
+        authToken: null,
+        baseURL: anthropicVertexClient.getApiRoot(),
+        fetch: anthropicVertexClient.createFetch(customFetch),
+        timeout: ANTHROPIC_CLIENT_TIMEOUT_MS,
+        defaultHeaders: {
+          ...options.defaultHeaders,
+          // The fetch wrapper replaces this sentinel with a fresh Google OAuth
+          // token and removes Anthropic-only authentication headers.
+          Authorization: "Bearer <vertex-ai-managed>",
+        },
+      });
+    }
 
     if (!apiKey && isAnthropicAzureFoundryEntraIdEnabled()) {
       return new AnthropicProvider({
+        maxRetries: PROXY_SDK_MAX_RETRIES,
         apiKey: null,
         authToken: null,
         baseURL: options.baseUrl,
         fetch: createAnthropicAzureFoundryFetch(customFetch),
+        timeout: ANTHROPIC_CLIENT_TIMEOUT_MS,
         defaultHeaders: {
           ...options.defaultHeaders,
           // The fetch wrapper replaces this sentinel with a fresh Entra ID token on every request.
@@ -1172,12 +1563,38 @@ export const anthropicAdapterFactory: LLMProvider<
       });
     }
 
+    if (!apiKey && anthropicWorkloadIdentity.isEnabled()) {
+      return new AnthropicProvider({
+        maxRetries: PROXY_SDK_MAX_RETRIES,
+        apiKey: null,
+        authToken: null,
+        baseURL: options.baseUrl,
+        fetch: anthropicWorkloadIdentity.createFetch(customFetch),
+        timeout: ANTHROPIC_CLIENT_TIMEOUT_MS,
+        defaultHeaders: {
+          ...options.defaultHeaders,
+          // The fetch wrapper replaces this sentinel with a fresh WIF access token on every request.
+          Authorization: "Bearer <workload-identity-managed>",
+        },
+      });
+    }
+
+    const defaultHeaders = isClaudeSubscriptionToken
+      ? withClaudeOAuthBetaHeader(options.defaultHeaders)
+      : options.defaultHeaders;
+
     return new AnthropicProvider({
+      maxRetries: PROXY_SDK_MAX_RETRIES,
       apiKey: regularApiKey,
       authToken: token,
-      baseURL: options.baseUrl,
+      // A personal OAuth token must never be forwarded to a deployment's
+      // configured custom Anthropic upstream.
+      baseURL: isClaudeSubscriptionToken
+        ? ANTHROPIC_SUBSCRIPTION_UPSTREAM
+        : options.baseUrl,
       fetch: customFetch,
-      defaultHeaders: options.defaultHeaders,
+      timeout: ANTHROPIC_CLIENT_TIMEOUT_MS,
+      defaultHeaders,
     });
   },
 
@@ -1186,48 +1603,136 @@ export const anthropicAdapterFactory: LLMProvider<
     request: AnthropicRequest,
   ): Promise<AnthropicResponse> {
     const anthropicClient = client as AnthropicProvider;
-    return anthropicClient.messages.create({
-      ...request,
-      stream: false,
-    } as AnthropicProvider.Messages.MessageCreateParamsNonStreaming);
+    return withSamplingParamFallback({
+      input: request,
+      strip: stripAnthropicSamplingParams,
+      logContext: { provider: "anthropic", model: request.model },
+      run: async (req) => {
+        const params = {
+          ...req,
+          messages: stripEmptyTextBlocks(req.messages),
+          stream: false,
+        } as AnthropicProvider.Messages.MessageCreateParamsNonStreaming;
+
+        // A non-streaming request whose `max_tokens` implies a completion that
+        // could exceed ~10 minutes can't be served reliably: our client is
+        // built with an explicit timeout, so the SDK skips its own "streaming
+        // required" guard and instead sends the request and lets it hit that
+        // timeout, and networks may drop the idle connection before the single
+        // response arrives. The SSE body of a *streaming* request is not bounded
+        // by the client timeout (only its initial connection is), so — per
+        // Anthropic's guidance — consume such requests over the streaming
+        // Messages API and return the accumulated final Message, which is
+        // identical in shape to a non-streaming response.
+        // https://platform.claude.com/docs/en/api/errors#long-requests
+        if (exceedsNonStreamingLimit(anthropicClient, req.max_tokens)) {
+          const stream = anthropicClient.messages.stream(
+            params as unknown as AnthropicProvider.Messages.MessageStreamParams,
+          );
+          // The stable SDK's finalMessage does not retain every beta usage
+          // field. Capture raw cumulative usage before its accumulator drops it.
+          let usage: Record<string, unknown> = {};
+          if (typeof stream.on === "function") {
+            stream.on("streamEvent", (event) => {
+              if (event.type === "message_start") {
+                usage = mergeAnthropicUsage(usage, event.message.usage);
+              } else if (event.type === "message_delta") {
+                usage = mergeAnthropicUsage(usage, event.usage);
+              }
+            });
+          }
+          let response: AnthropicProvider.Messages.Message;
+          try {
+            response = await stream.finalMessage();
+          } catch (error) {
+            if (Object.keys(usage).length) {
+              const observed = normalizeAnthropicUsage(usage, req.model);
+              const breakdown =
+                observed.billingUsage ??
+                primaryBillingUsage(observed, req.model);
+              throw new ObservedProviderUsageError({
+                original: error,
+                usage: {
+                  ...observed,
+                  billingUsage: {
+                    ...breakdown,
+                    status: "incomplete",
+                    issues: [...breakdown.issues, "partial_stream"],
+                  },
+                },
+                response: {
+                  ...stream.currentMessage,
+                  usage,
+                  error: "Provider generation did not complete",
+                },
+              });
+            }
+            throw error;
+          }
+          return Object.keys(usage).length
+            ? {
+                ...response,
+                usage: { ...response.usage, ...usage },
+              }
+            : response;
+        }
+        return anthropicClient.messages.create(params);
+      },
+    });
   },
 
   async executeStream(
     client: unknown,
     request: AnthropicRequest,
+    onAccepted?: () => void,
   ): Promise<AsyncIterable<AnthropicStreamChunk>> {
     const anthropicClient = client as AnthropicProvider;
-    const stream = anthropicClient.messages.stream({
-      ...request,
-    } as AnthropicProvider.Messages.MessageCreateParamsStreaming);
-
-    // Return async iterable that yields stream events
-    return {
-      [Symbol.asyncIterator]: async function* () {
-        for await (const event of stream) {
-          yield event;
-        }
+    return withSamplingParamFallback({
+      input: request,
+      strip: stripAnthropicSamplingParams,
+      logContext: { provider: "anthropic", model: request.model },
+      // use the raw create() stream rather than the messages.stream() helper:
+      // the helper eagerly partial-parses accumulated input_json_delta fragments
+      // and throws (unguarded) when a non-conformant upstream emits deltas that
+      // concatenate into more than one JSON value. we do our own guarded
+      // tool-call accumulation in processChunk, so the raw event stream is all
+      // we need.
+      //
+      // The SDK's own Stream yields only the event types it knows and drops
+      // the rest, so read the raw response and parse every event instead. A
+      // client without raw responses (not the SDK) keeps its parsed events.
+      run: async (req) => {
+        const pending = anthropicClient.messages.create({
+          ...req,
+          messages: stripEmptyTextBlocks(req.messages),
+          stream: true,
+        } as AnthropicProvider.Messages.MessageCreateParamsStreaming);
+        if (typeof pending.asResponse !== "function") return pending;
+        const response = await pending.asResponse();
+        onAccepted?.();
+        return iterateAnthropicStreamEvents(response);
       },
-    };
+    });
   },
 
   extractInternalCode(error: unknown): ArchestraInternalErrorCode | undefined {
-    // Anthropic returns 400 invalid_request_error when the prompt exceeds
-    // the model's context window, with a message like "prompt is too long:
-    // X tokens > Y maximum". There is no structured code — message sniffing
-    // is the only signal.
-    const message: unknown =
-      get(error, "error.error.message") ?? get(error, "error.message");
-    if (
-      typeof message === "string" &&
-      message.toLowerCase().includes("prompt is too long")
-    ) {
-      return ArchestraInternalErrorCode.ContextLengthExceeded;
+    // A structured code so the chat mapper (and any client) can name the real
+    // cause instead of a generic "invalid request". Context overflow, by
+    // contrast, has no structured signal, so we don't emit a code for it.
+    if (isAnthropicBalanceTooLow(error)) {
+      return ArchestraInternalErrorCode.ProviderInsufficientBalance;
     }
     return undefined;
   },
 
   extractErrorMessage(error: unknown): string {
+    // When the key's remaining usage balance is too low, show the same unified
+    // message as the connection page instead of Anthropic's raw text (which
+    // steers the reader into the Console).
+    if (isAnthropicBalanceTooLow(error)) {
+      return `${PROVIDER_BILLING_BLOCK_TITLE}. ${PROVIDER_BILLING_BLOCK_BODY}`;
+    }
+
     // Anthropic SDK wraps errors as: { error: { error: { message: "..." } } }
     const anthropicMessage = get(error, "error.error.message");
     if (typeof anthropicMessage === "string") {
@@ -1241,6 +1746,80 @@ export const anthropicAdapterFactory: LLMProvider<
     return "Internal server error";
   },
 };
+
+function observeResponseHeaders(
+  baseFetch: typeof fetch | undefined,
+  onResponseHeaders: CreateClientOptions["onResponseHeaders"],
+): typeof fetch | undefined {
+  if (!onResponseHeaders) {
+    return baseFetch;
+  }
+
+  return async (input, init) => {
+    const response = await (baseFetch ?? fetch)(input, init);
+    // Billing mode describes the interaction we persist. Failed attempts may
+    // be retried and are not themselves billed interactions, so only the
+    // successful response can refine it.
+    if (response.ok) {
+      onResponseHeaders(response.headers);
+    }
+    return response;
+  };
+}
+
+/**
+ * Whether a non-streaming request with this `max_tokens` would exceed the SDK's
+ * ~10-minute non-streaming limit (i.e. should be served over the streaming API
+ * instead). Delegates to the SDK's own estimate — which throws exactly when
+ * streaming is required — so the threshold stays in sync with the SDK rather
+ * than being duplicated here. `maxNonstreamingTokens` is left unset so only the
+ * general 10-minute estimate applies, not any per-model cap.
+ * https://platform.claude.com/docs/en/api/errors#long-requests
+ */
+function exceedsNonStreamingLimit(
+  client: AnthropicProvider,
+  maxTokens: number,
+): boolean {
+  // Defensive: a real AnthropicProvider always exposes this, but partial/mock
+  // clients may not. If we can't obtain the estimate, don't force streaming.
+  if (typeof client.calculateNonstreamingTimeout !== "function") {
+    return false;
+  }
+  try {
+    client.calculateNonstreamingTimeout(maxTokens);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Strip the rejected sampling params from an Anthropic request (they live at the
+ * top level, so the canonical param names match directly). Returns null when
+ * none were set. Passed to the shared {@link withSamplingParamFallback}.
+ */
+function stripAnthropicSamplingParams(
+  request: AnthropicRequest,
+  rejected: SamplingParam[],
+): AnthropicRequest | null {
+  const record = request as Record<string, unknown>;
+  const present = rejected.filter((p) => record[p] !== undefined);
+  if (present.length === 0) return null;
+  const next: Record<string, unknown> = { ...record };
+  for (const p of present) delete next[p];
+  return next as AnthropicRequest;
+}
+
+/** The SDK nests the provider body as `error.error.{type,message}`. */
+function isAnthropicBalanceTooLow(error: unknown): boolean {
+  return isAnthropicBillingBlock({
+    status: (get(error, "status") ?? get(error, "statusCode")) as
+      | number
+      | undefined,
+    type: get(error, "error.error.type") as string | undefined,
+    message: get(error, "error.error.message") as string | undefined,
+  });
+}
 
 function createAnthropicAzureFoundryFetch(
   baseFetch: typeof globalThis.fetch | undefined,
@@ -1256,4 +1835,159 @@ function createAnthropicAzureFoundryFetch(
       headers,
     });
   };
+}
+
+/** Rewritten arguments arrive as the JSON string the model emitted; this wire
+ * shape carries them as an object. A repaired call always parses (the planner
+ * refuses to rewrite otherwise), so the fallback is defensive only. */
+function parseArgs(argumentsJson: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(argumentsJson);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Tool-use ids Anthropic accepts; see `wordToolCallId`. */
+export function withAnthropicToolCallIds(
+  messages: AnthropicMessages,
+): AnthropicMessages {
+  return messages.map((message) => {
+    if (!Array.isArray(message.content)) return message;
+    let changed = false;
+    const content = message.content.map((block) => {
+      if (block.type === "tool_use") {
+        const id = wordToolCallId(block.id);
+        if (id === block.id) return block;
+        changed = true;
+        return { ...block, id };
+      }
+      if (block.type === "tool_result") {
+        const toolUseId = wordToolCallId(block.tool_use_id);
+        if (toolUseId === block.tool_use_id) return block;
+        changed = true;
+        return { ...block, tool_use_id: toolUseId };
+      }
+      return block;
+    });
+    return changed ? ({ ...message, content } as typeof message) : message;
+  });
+}
+
+/**
+ * Removes empty text blocks so Anthropic API does not reject the request
+ * with "messages: text content blocks must be non-empty" (HTTP 400).
+ */
+function stripEmptyTextBlocks(messages: AnthropicMessages): AnthropicMessages {
+  if (!Array.isArray(messages)) return messages;
+  return messages.flatMap((message) => {
+    if (!Array.isArray(message.content)) {
+      return message.role === "system" &&
+        typeof message.content === "string" &&
+        !message.content.trim()
+        ? []
+        : [message];
+    }
+    const filtered = message.content.filter((part) => {
+      const record = part as Record<string, unknown>;
+      if (
+        record.type === "text" &&
+        typeof record.text === "string" &&
+        record.text.trim().length === 0
+      ) {
+        return false;
+      }
+      return true;
+    });
+    // Compaction can leave an empty system placeholder. A whitespace filler is
+    // valid for some conversational turns, but never for a system text block.
+    if (message.role === "system" && filtered.length === 0) return [];
+    return [
+      {
+        ...message,
+        content: filtered.length > 0 ? filtered : [{ type: "text", text: " " }],
+      },
+    ];
+  });
+}
+
+/**
+ * Every event of an Anthropic Messages SSE response, including types this
+ * proxy does not know. Clients add stream events over releases and expect a
+ * gateway to relay them, while the SDK's Stream silently drops any type
+ * outside its fixed list. `ping` and `error` keep the SDK's handling.
+ * https://code.claude.com/docs/en/llm-gateway-protocol#forward-as-open-lists
+ */
+async function* iterateAnthropicStreamEvents(
+  response: Response,
+): AsyncGenerator<AnthropicStreamChunk> {
+  for await (const sse of _iterSSEMessages(response, new AbortController())) {
+    if (sse.event === "ping") continue;
+    if (sse.event === "error") {
+      throw new AnthropicProvider.APIError(
+        undefined,
+        safeParseJson(sse.data) ?? sse.data,
+        undefined,
+        response.headers,
+      );
+    }
+    const event = safeParseJson(sse.data);
+    if (!event || typeof event !== "object" || Array.isArray(event)) {
+      logger.warn(
+        { event: sse.event },
+        "[AnthropicAdapter] Skipping stream event without a JSON object body",
+      );
+      continue;
+    }
+    const record = event as Record<string, unknown>;
+    yield (typeof record.type === "string" || !sse.event
+      ? record
+      : { ...record, type: sse.event }) as unknown as AnthropicStreamChunk;
+  }
+}
+
+function safeParseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+/**
+ * Replace every string equal to a provider tool-use id with the id the client
+ * was given. Used on upstream data the proxy passes through without knowing
+ * its shape, so a value keyed by tool-use id still names a call the client has.
+ */
+function replaceToolUseIds<T>(
+  value: T,
+  wireIdByProviderId: Map<string, string>,
+): T {
+  if (wireIdByProviderId.size === 0) return value;
+  if (typeof value === "string") {
+    return (wireIdByProviderId.get(value) ?? value) as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) =>
+      replaceToolUseIds(item, wireIdByProviderId),
+    ) as T;
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        wireIdByProviderId.get(key) ?? key,
+        replaceToolUseIds(item, wireIdByProviderId),
+      ]),
+    ) as T;
+  }
+  return value;
 }

@@ -1,0 +1,48 @@
+import type { HttpHandler } from "msw";
+
+type HttpMethod = "get" | "post" | "put" | "patch" | "delete";
+
+export type HandlerOverride = {
+  method: HttpMethod;
+  url: string;
+  query?: Record<string, string>;
+  status?: number;
+  body?: unknown;
+  once?: boolean;
+  delayMs?: number;
+};
+
+// Explicit switch (not `msw.http[o.method]`) so the static analyzer can see
+// the method whitelist that isValidOverride enforces at runtime.
+export function buildHandler(
+  msw: typeof import("msw"),
+  url: string,
+  o: HandlerOverride,
+): HttpHandler {
+  const responder = async ({ request }: { request: Request }) => {
+    const searchParams = new URL(request.url).searchParams;
+    if (
+      o.query &&
+      Object.entries(o.query).some(
+        ([key, value]) => searchParams.get(key) !== value,
+      )
+    ) {
+      return;
+    }
+    if (o.delayMs) await msw.delay(o.delayMs);
+    return msw.HttpResponse.json(o.body ?? null, { status: o.status ?? 200 });
+  };
+  const options = { once: o.once === true };
+  switch (o.method) {
+    case "get":
+      return msw.http.get(url, responder, options);
+    case "post":
+      return msw.http.post(url, responder, options);
+    case "put":
+      return msw.http.put(url, responder, options);
+    case "patch":
+      return msw.http.patch(url, responder, options);
+    case "delete":
+      return msw.http.delete(url, responder, options);
+  }
+}

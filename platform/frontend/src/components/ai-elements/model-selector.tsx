@@ -16,7 +16,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/utils/tailwind";
 
 export type ModelSelectorProps = ComponentProps<typeof Dialog>;
 
@@ -175,7 +175,7 @@ export const ModelSelectorLogo = ({
     alt={`${provider} logo`}
     className={cn("size-4 dark:invert", className)}
     height={12}
-    src={`https://models.dev/logos/${provider}.svg`}
+    src={`/model-logos/${provider}.svg`}
     width={12}
   />
 );

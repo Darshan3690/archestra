@@ -1,20 +1,25 @@
-import { RouteId } from "@shared";
+import { RouteId, redactIdentityProviderSecrets } from "@archestra/shared";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { jwtDecode } from "jwt-decode";
 import { z } from "zod";
 import { auth } from "@/auth/better-auth";
 import config from "@/config";
-import { IDENTITY_PROVIDERS_API_PREFIX } from "@/constants";
+import {
+  CREDENTIAL_PROVIDER_ID,
+  IDENTITY_PROVIDERS_API_PREFIX,
+} from "@/constants";
 import logger from "@/logging";
 import AccountModel from "@/models/account";
 import IdentityProviderModel from "@/models/identity-provider.ee";
+import { resolveSessionExternalIdpToken } from "@/services/identity-providers/session-token";
 import {
   ApiError,
   constructResponseSchema,
   IdentityProviderLatestIdTokenClaimsSchema,
   InsertIdentityProviderSchema,
   PublicIdentityProviderSchema,
-  SelectIdentityProviderSchema,
+  RedactedIdentityProviderSchema,
+  TeamSyncIdentityProviderOptionSchema,
   UpdateIdentityProviderSchema,
 } from "@/types";
 
@@ -43,7 +48,7 @@ const identityProviderRoutes: FastifyPluginAsyncZod = async (fastify) => {
   );
 
   /**
-   * Admin endpoint - returns full provider config including secrets.
+   * Admin endpoint - returns provider config with every credential redacted.
    * Requires authentication and identityProvider:read permission.
    */
   fastify.get(
@@ -52,15 +57,48 @@ const identityProviderRoutes: FastifyPluginAsyncZod = async (fastify) => {
       schema: {
         operationId: RouteId.GetIdentityProviders,
         description:
-          "Get all identity providers with full configuration (admin only)",
+          "Get all identity providers with configuration (admin only, secrets redacted)",
         tags: ["Identity Providers"],
         response: constructResponseSchema(
-          z.array(SelectIdentityProviderSchema),
+          z.array(RedactedIdentityProviderSchema),
         ),
       },
     },
     async ({ organizationId }, reply) => {
-      return reply.send(await IdentityProviderModel.findAll(organizationId));
+      const providers = await IdentityProviderModel.findAll(organizationId);
+      return reply.send(providers.map(redactIdentityProviderSecrets));
+    },
+  );
+
+  /**
+   * Minimal provider projection for the team Team Sync section:
+   * lets team admins pick a provider and see how group identifiers are
+   * extracted without holding identityProvider:read. Exposes no provider
+   * configuration or secrets (gated on team:read in the permission map).
+   */
+  fastify.get(
+    `${IDENTITY_PROVIDERS_API_PREFIX}/team-sync-options`,
+    {
+      schema: {
+        operationId: RouteId.GetIdentityProviderTeamSyncOptions,
+        description:
+          "Get identity providers as minimal team-sync options (id, name, and " +
+          "groups extraction template) for linking external groups to teams",
+        tags: ["Identity Providers"],
+        response: constructResponseSchema(
+          z.array(TeamSyncIdentityProviderOptionSchema),
+        ),
+      },
+    },
+    async ({ organizationId }, reply) => {
+      const providers = await IdentityProviderModel.findAll(organizationId);
+      return reply.send(
+        providers.map((provider) => ({
+          id: provider.id,
+          providerId: provider.providerId,
+          groupsExpression: provider.teamSyncConfig?.groupsExpression ?? null,
+        })),
+      );
     },
   );
 
@@ -88,12 +126,54 @@ const identityProviderRoutes: FastifyPluginAsyncZod = async (fastify) => {
   );
 
   fastify.get(
+    `${IDENTITY_PROVIDERS_API_PREFIX}/:id/link-status`,
+    {
+      schema: {
+        operationId: RouteId.GetIdentityProviderLinkStatus,
+        description:
+          "Get whether the current user has a usable token for this identity provider",
+        tags: ["Identity Providers"],
+        params: z.object({
+          id: z.string(),
+        }),
+        response: constructResponseSchema(
+          z.object({
+            providerId: z.string(),
+            connected: z.boolean(),
+          }),
+        ),
+      },
+    },
+    async ({ params: { id }, organizationId, user }, reply) => {
+      const provider = await IdentityProviderModel.findById(id, organizationId);
+      if (!provider) {
+        throw new ApiError(404, "Identity provider not found");
+      }
+
+      const token = await resolveSessionExternalIdpToken({
+        identityProviderId: provider.id,
+        userId: user.id,
+      });
+
+      return reply.send({
+        providerId: provider.providerId,
+        connected:
+          token !== null &&
+          isUsableEnterpriseSubjectToken({
+            provider,
+            rawToken: token.rawToken,
+          }),
+      });
+    },
+  );
+
+  fastify.get(
     `${IDENTITY_PROVIDERS_API_PREFIX}/:id/latest-id-token-claims`,
     {
       schema: {
         operationId: RouteId.GetIdentityProviderLatestIdTokenClaims,
         description:
-          "Get decoded claims from the current user's latest ID token for an identity provider",
+          "Get decoded claims from the current user's latest identity-provider tokens",
         tags: ["Identity Providers"],
         params: z.object({
           id: z.string(),
@@ -114,31 +194,33 @@ const identityProviderRoutes: FastifyPluginAsyncZod = async (fastify) => {
           user.id,
           provider.providerId,
         );
-      if (!account?.idToken) {
+      if (!account) {
         return reply.send({
           providerId: provider.providerId,
           claims: null,
-          updatedAt: account?.updatedAt ?? null,
+          accessTokenClaims: null,
+          accessTokenExpiresAt: null,
+          updatedAt: null,
         });
       }
 
-      try {
-        return reply.send({
+      return reply.send({
+        providerId: provider.providerId,
+        claims: decodeStoredTokenClaims({
+          rawToken: account.idToken,
+          tokenName: "id_token",
           providerId: provider.providerId,
-          claims: jwtDecode<Record<string, unknown>>(account.idToken),
-          updatedAt: account.updatedAt,
-        });
-      } catch (error) {
-        logger.warn(
-          { err: error, providerId: provider.providerId, userId: user.id },
-          "Failed to decode latest IdP id_token claims",
-        );
-        return reply.send({
+          userId: user.id,
+        }),
+        accessTokenClaims: decodeStoredTokenClaims({
+          rawToken: account.accessToken,
+          tokenName: "access_token",
           providerId: provider.providerId,
-          claims: null,
-          updatedAt: account.updatedAt,
-        });
-      }
+          userId: user.id,
+        }),
+        accessTokenExpiresAt: account.accessTokenExpiresAt ?? null,
+        updatedAt: account.updatedAt,
+      });
     },
   );
 
@@ -147,12 +229,12 @@ const identityProviderRoutes: FastifyPluginAsyncZod = async (fastify) => {
     {
       schema: {
         operationId: RouteId.GetIdentityProvider,
-        description: "Get identity provider by ID",
+        description: "Get identity provider by ID (secrets redacted)",
         tags: ["Identity Providers"],
         params: z.object({
           id: z.string(),
         }),
-        response: constructResponseSchema(SelectIdentityProviderSchema),
+        response: constructResponseSchema(RedactedIdentityProviderSchema),
       },
     },
     async ({ params, organizationId }, reply) => {
@@ -163,7 +245,7 @@ const identityProviderRoutes: FastifyPluginAsyncZod = async (fastify) => {
       if (!provider) {
         throw new ApiError(404, "Identity provider not found");
       }
-      return reply.send(provider);
+      return reply.send(redactIdentityProviderSecrets(provider));
     },
   );
 
@@ -172,24 +254,23 @@ const identityProviderRoutes: FastifyPluginAsyncZod = async (fastify) => {
     {
       schema: {
         operationId: RouteId.CreateIdentityProvider,
-        description: "Create a new identity provider",
+        description: "Create a new identity provider (secrets redacted)",
         tags: ["Identity Providers"],
         body: InsertIdentityProviderSchema,
-        response: constructResponseSchema(SelectIdentityProviderSchema),
+        response: constructResponseSchema(RedactedIdentityProviderSchema),
       },
     },
     async ({ body, organizationId, user, headers }, reply) => {
-      return reply.send(
-        await IdentityProviderModel.create(
-          {
-            ...body,
-            userId: user.id,
-          },
-          organizationId,
-          headers as HeadersInit,
-          auth,
-        ),
+      const provider = await IdentityProviderModel.create(
+        {
+          ...body,
+          userId: user.id,
+        },
+        organizationId,
+        headers as HeadersInit,
+        auth,
       );
+      return reply.send(redactIdentityProviderSecrets(provider));
     },
   );
 
@@ -198,13 +279,13 @@ const identityProviderRoutes: FastifyPluginAsyncZod = async (fastify) => {
     {
       schema: {
         operationId: RouteId.UpdateIdentityProvider,
-        description: "Update identity provider",
+        description: "Update identity provider (secrets redacted)",
         tags: ["Identity Providers"],
         params: z.object({
           id: z.string(),
         }),
         body: UpdateIdentityProviderSchema,
-        response: constructResponseSchema(SelectIdentityProviderSchema),
+        response: constructResponseSchema(RedactedIdentityProviderSchema),
       },
     },
     async ({ params: { id }, body, organizationId }, reply) => {
@@ -216,7 +297,7 @@ const identityProviderRoutes: FastifyPluginAsyncZod = async (fastify) => {
       if (!provider) {
         throw new ApiError(404, "Identity provider not found");
       }
-      return reply.send(provider);
+      return reply.send(redactIdentityProviderSecrets(provider));
     },
   );
 
@@ -253,7 +334,9 @@ export default identityProviderRoutes;
 export async function getIdpLogoutUrl(userId: string): Promise<string | null> {
   // Find the user's SSO account (non-credential provider)
   const accounts = await AccountModel.getAllByUserId(userId);
-  const ssoAccount = accounts.find((a) => a.providerId !== "credential");
+  const ssoAccount = accounts.find(
+    (a) => a.providerId !== CREDENTIAL_PROVIDER_ID,
+  );
   if (!ssoAccount) {
     return null;
   }
@@ -313,4 +396,80 @@ export async function getIdpLogoutUrl(userId: string): Promise<string | null> {
     );
   }
   return logoutUrl.toString();
+}
+
+// Audiences Entra uses for Microsoft Graph access tokens (public + national
+// clouds). Graph tokens carry a proprietary nonce-transformed signature, so
+// they can never pass signature validation as an Entra OBO assertion
+// (AADSTS50013). Report such links as not connected so the install preflight
+// sends the user back through the link flow with the provider's current
+// scopes instead of letting the exchange fail.
+const MICROSOFT_GRAPH_AUDIENCES = new Set([
+  "00000003-0000-0000-c000-000000000000",
+  "https://graph.microsoft.com",
+  "https://graph.microsoft.us",
+  "https://dod-graph.microsoft.us",
+  "https://graph.microsoft.de",
+  "https://microsoftgraph.chinacloudapi.cn",
+]);
+
+function isUsableEnterpriseSubjectToken(params: {
+  provider: {
+    oidcConfig?: {
+      enterpriseManagedCredentials?: {
+        exchangeStrategy?: string;
+      };
+    } | null;
+  };
+  rawToken: string;
+}): boolean {
+  const exchangeStrategy =
+    params.provider.oidcConfig?.enterpriseManagedCredentials?.exchangeStrategy;
+  if (exchangeStrategy !== "entra_obo") {
+    return true;
+  }
+
+  let audiences: string[];
+  try {
+    const claims = jwtDecode<{ aud?: string | string[] }>(params.rawToken);
+    audiences = Array.isArray(claims.aud)
+      ? claims.aud
+      : claims.aud
+        ? [claims.aud]
+        : [];
+  } catch {
+    // Not a decodable JWT — keep prior behavior and let the exchange surface
+    // its own error rather than forcing a reconnect loop.
+    return true;
+  }
+
+  return !audiences.some((audience) =>
+    MICROSOFT_GRAPH_AUDIENCES.has(audience.replace(/\/$/, "")),
+  );
+}
+
+function decodeStoredTokenClaims(params: {
+  rawToken: string | null;
+  tokenName: "access_token" | "id_token";
+  providerId: string;
+  userId: string;
+}): Record<string, unknown> | null {
+  if (!params.rawToken) {
+    return null;
+  }
+
+  try {
+    return jwtDecode<Record<string, unknown>>(params.rawToken);
+  } catch (error) {
+    logger.warn(
+      {
+        err: error,
+        providerId: params.providerId,
+        tokenName: params.tokenName,
+        userId: params.userId,
+      },
+      "Failed to decode latest IdP token claims",
+    );
+    return null;
+  }
 }

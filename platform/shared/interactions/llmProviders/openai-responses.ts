@@ -1,11 +1,38 @@
-import { parseArchestraToolRefusal } from "../../tool-refusal";
+import type { WithoutEncryptedChatUnavailable } from "../../encrypted-chat-content";
 import type { PartialUIMessage } from "../types";
-import type { Interaction, InteractionUtils } from "./common";
-
-type OpenAiResponsesInteractionRecord = Extract<
+import type {
   Interaction,
-  { type: "azure:responses" | "openai:responses" }
+  InteractionUtils,
+  RequestedToolCall,
+} from "./common";
+import { tryParseJson } from "./json";
+
+type OpenAiResponsesArm = Extract<
+  Interaction,
+  {
+    type:
+      | "azure:responses"
+      | "github-copilot:responses"
+      | "openai:responses"
+      | "perplexity:responses";
+  }
 >;
+
+// Failed interactions persist `{ error }` in place of a provider response;
+// DynamicInteraction handles those before delegating here, so this mapper only
+// ever sees a real provider response. The request side of the API type also
+// carries a loose read-back arm (a drifted persisted row serializes raw
+// instead of 500-ing the list) — narrow to the canonical request shape here;
+// every access below is already defensive about the runtime payload.
+type OpenAiResponsesInteractionRecord = Omit<
+  OpenAiResponsesArm,
+  "request" | "response"
+> & {
+  request: Extract<OpenAiResponsesArm["request"], { model: string }>;
+  response: WithoutEncryptedChatUnavailable<
+    Exclude<OpenAiResponsesArm["response"], { error: string }>
+  >;
+};
 
 type OpenAiResponsesOutputItem =
   OpenAiResponsesInteractionRecord["response"]["output"][number];
@@ -43,37 +70,28 @@ class OpenAiResponsesInteraction implements InteractionUtils {
       .flatMap((item) => requestedToolNamesByCallId.get(item.call_id) ?? []);
   }
 
-  getToolNamesRefused(): string[] {
-    const toolNames = new Set<string>();
-
-    for (const item of this.interaction.response.output) {
-      if (!isResponseMessage(item)) {
-        continue;
-      }
-
-      for (const part of item.content) {
-        if (part.type !== "refusal") {
-          continue;
-        }
-
-        const toolName = parseArchestraToolRefusal(part.refusal).toolName;
-        if (toolName) {
-          toolNames.add(toolName);
-        }
-      }
-    }
-
-    return Array.from(toolNames);
+  getToolCallsRequested(): RequestedToolCall[] {
+    // Function calls and custom (freeform) tool calls, such as apply_patch,
+    // both carry the call id the tool's result comes back under.
+    return this.interaction.response.output.flatMap((item) => {
+      const call = item as {
+        type?: unknown;
+        call_id?: unknown;
+        name?: unknown;
+      };
+      return (call.type === "function_call" ||
+        call.type === "custom_tool_call") &&
+        typeof call.call_id === "string" &&
+        typeof call.name === "string"
+        ? [{ id: call.call_id, name: call.name }]
+        : [];
+    });
   }
 
   getToolNamesRequested(): string[] {
     return this.interaction.response.output
       .filter(isResponseFunctionCall)
       .map((item) => item.name);
-  }
-
-  getToolRefusedCount(): number {
-    return this.getToolNamesRefused().length;
   }
 
   getLastUserMessage(): string {
@@ -118,7 +136,7 @@ class OpenAiResponsesInteraction implements InteractionUtils {
       }
 
       messages.push({
-        role: item.role === "assistant" ? "assistant" : "user",
+        role: responsesRoleToUiMessageRole(item.role),
         parts: [{ type: "text", text: extractInputMessageText(item.content) }],
       });
     }
@@ -164,24 +182,46 @@ class OpenAiResponsesInteraction implements InteractionUtils {
     return messages;
   }
 
+  /**
+   * The request's input items. A plain-string `input` (what most SDK calls
+   * and curl send) is one user message.
+   */
   private getInputItems(): unknown[] {
-    return Array.isArray(this.interaction.request.input)
-      ? this.interaction.request.input
-      : [];
+    const input = this.interaction.request.input as unknown;
+    if (typeof input === "string")
+      return input ? [{ role: "user", content: input }] : [];
+    return Array.isArray(input) ? input : [];
   }
 }
 
 export default OpenAiResponsesInteraction;
 
+// `type` is optional on Responses input messages — it defaults to "message" —
+// and the AI SDK omits it, serializing plain turns as bare `{role, content}`.
+// Requiring the tag dropped every SDK-sent message on the floor, so the logs
+// rendered "No message" with an empty conversation. Key off `role` instead and
+// only reject items that tag themselves as something else (function_call,
+// function_call_output, reasoning).
 function isRequestMessage(
   item: unknown,
-): item is { type: "message"; role: "user" | "assistant"; content: unknown } {
-  return (
-    !!item &&
-    typeof item === "object" &&
-    "type" in item &&
-    item.type === "message"
-  );
+): item is { type?: "message"; role: string; content: unknown } {
+  if (!item || typeof item !== "object" || !("role" in item)) {
+    return false;
+  }
+  const type = (item as { type?: unknown }).type;
+  return type === undefined || type === "message";
+}
+
+// Mirrors the chat-completions mapper: instruction turns render as the "System
+// Prompt" block rather than as a user message.
+function responsesRoleToUiMessageRole(role: string): PartialUIMessage["role"] {
+  if (role === "assistant") {
+    return "assistant";
+  }
+  if (role === "system" || role === "developer") {
+    return "system";
+  }
+  return "user";
 }
 
 function isFunctionCallOutputItem(
@@ -233,12 +273,4 @@ function extractInputMessageText(content: unknown): string {
       return [];
     })
     .join("\n");
-}
-
-function tryParseJson(value: string): unknown {
-  try {
-    return JSON.parse(value);
-  } catch {
-    return value;
-  }
 }

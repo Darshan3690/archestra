@@ -1,0 +1,119 @@
+import { sql } from "drizzle-orm";
+import {
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from "drizzle-orm/pg-core";
+import type {
+  AgentRunActorKind,
+  AgentRunAttentionState,
+  AgentRunCompletionTarget,
+  AgentRunLimits,
+  AgentRuntimeBackend,
+} from "@/types/agent-runtime";
+import a2aTasksTable from "./a2a-task";
+import agentsTable from "./agent";
+import projectsTable from "./project";
+import serviceAccountTokensTable from "./service-account-token";
+import usersTable from "./user";
+import virtualApiKeysTable from "./virtual-api-key";
+
+/**
+ * The isolated runtime carrying one A2A task.
+ *
+ * Deliberately holds no state of its own: the task's own state machine is the
+ * record of how the work is going, and a second one would only be a source of
+ * disagreement. This row freezes which runtime backend owns the task and
+ * whose credentials it uses, so reconciliation never depends on mutable Agent
+ * configuration.
+ */
+const agentRunsTable = pgTable(
+  "agent_runs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: text("organization_id").notNull(),
+    /** One isolated run per task. */
+    taskId: uuid("task_id")
+      .notNull()
+      .references(() => a2aTasksTable.id, { onDelete: "cascade" }),
+    agentId: uuid("agent_id")
+      .notNull()
+      .references(() => agentsTable.id, { onDelete: "cascade" }),
+    /** Actor whose access and credentials the session uses. */
+    actorKind: text("actor_kind").$type<AgentRunActorKind>().notNull(),
+    actorId: text("actor_id").notNull(),
+    /** User FK for personal sessions; null for team/org/system automation. */
+    actorUserId: text("actor_user_id").references(() => usersTable.id, {
+      onDelete: "cascade",
+    }),
+    /** Concise, user-editable label shown beside foreground conversations. */
+    title: text("title").notNull().default("Run"),
+    /** Personal sidebar pin; the run is already owned by one initiating user. */
+    pinnedAt: timestamp("pinned_at", { mode: "date" }),
+    /** Project this session belongs to. It becomes ordinary work when detached. */
+    projectId: uuid("project_id").references(() => projectsTable.id, {
+      onDelete: "set null",
+    }),
+    /** Frozen at creation so a rename can never orphan the workload. */
+    workloadName: text("workload_name").notNull(),
+    /** Frozen because a restart must re-adopt through the original backend. */
+    backend: text("backend").$type<AgentRuntimeBackend>().notNull(),
+    /** Backend-owned placement scope, intentionally not Kubernetes-specific. */
+    runtimeScope: text("runtime_scope").notNull(),
+    /** Frozen Kubernetes Job lifetime so the UI shows the actual deadline. */
+    activeDeadlineSeconds: integer("active_deadline_seconds"),
+    /** The tier and the idle, duration and spend limits this run got. */
+    runtimeLimits: jsonb("runtime_limits").$type<AgentRunLimits>(),
+    /** Native-client signal that the live process needs a person's attention. */
+    attentionState: text("attention_state").$type<AgentRunAttentionState>(),
+    /** Revoked when the session ends; a live key outliving its runtime keeps billing. */
+    virtualApiKeyId: uuid("virtual_api_key_id").references(
+      () => virtualApiKeysTable.id,
+      { onDelete: "set null" },
+    ),
+    /** Expiring service-account gateway credential minted for this run. */
+    gatewayTokenId: uuid("gateway_token_id").references(
+      () => serviceAccountTokensTable.id,
+      { onDelete: "set null" },
+    ),
+    /** Optional channel callback for a detached run's terminal result. */
+    completionTarget:
+      jsonb("completion_target").$type<AgentRunCompletionTarget>(),
+    /** Reclaimable delivery lease; a crashed sender cannot strand the reply. */
+    completionNotificationClaimedAt: timestamp(
+      "completion_notification_claimed_at",
+      { mode: "date" },
+    ),
+    /** Set after the provider accepts the terminal reply. */
+    completionNotifiedAt: timestamp("completion_notified_at", { mode: "date" }),
+    /**
+     * The LLM session that handed this run its work (the caller's session when
+     * a client started it through start_agent_run). It links a local client's
+     * session trace to the run's own session, keyed by its workload name.
+     */
+    originLlmSessionId: text("origin_llm_session_id"),
+    /** Bounded tail of runtime output retained after the run is removed. */
+    logs: text("logs"),
+    startedAt: timestamp("started_at", { mode: "date" }).notNull().defaultNow(),
+    endedAt: timestamp("ended_at", { mode: "date" }),
+  },
+  (table) => [
+    uniqueIndex("agent_runs_task_id_uidx").on(table.taskId),
+    index("agent_runs_workload_name_idx").on(table.workloadName),
+    index("agent_runs_agent_id_idx").on(table.agentId),
+    index("agent_runs_organization_id_idx").on(table.organizationId),
+    index("agent_runs_actor_user_id_idx").on(table.actorUserId),
+    index("agent_runs_actor_idx").on(table.actorKind, table.actorId),
+    index("agent_runs_project_id_idx").on(table.projectId),
+    index("agent_runs_org_origin_llm_session_idx")
+      .on(table.organizationId, table.originLlmSessionId)
+      .where(sql`${table.originLlmSessionId} IS NOT NULL`),
+  ],
+);
+
+export default agentRunsTable;

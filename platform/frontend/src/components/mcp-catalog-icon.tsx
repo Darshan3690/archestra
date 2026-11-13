@@ -1,16 +1,24 @@
 "use client";
 
-import { ARCHESTRA_MCP_CATALOG_ID, DEFAULT_APP_NAME } from "@shared";
+import { ARCHESTRA_MCP_CATALOG_ID } from "@archestra/shared";
+import type { LucideIcon } from "lucide-react";
 import { Server } from "lucide-react";
 import Image from "next/image";
 import { useAppIconLogo } from "@/lib/hooks/use-app-name";
-import { cn } from "@/lib/utils";
+import { imageToneClassName, useImageTone } from "@/lib/hooks/use-image-tone";
+import { cn } from "@/lib/utils/tailwind";
 
 interface McpCatalogIconProps {
   icon?: string | null;
   catalogId?: string;
   size?: number;
   className?: string;
+  /**
+   * Glyph shown when no icon is set. Defaults to the server glyph; an Apps
+   * surface passes `AppWindow` so an app without an icon keeps reading as an
+   * app rather than as a server.
+   */
+  fallback?: LucideIcon;
 }
 
 export function McpCatalogIcon({
@@ -18,44 +26,67 @@ export function McpCatalogIcon({
   catalogId,
   size = 20,
   className,
+  fallback: Fallback = Server,
 }: McpCatalogIconProps) {
   const appIconLogo = useAppIconLogo();
+  const {
+    tone: imageTone,
+    ref: imageRef,
+    onLoad: onImageLoad,
+  } = useImageTone(
+    icon?.startsWith("data:") || icon?.startsWith("/api/") ? icon : null,
+  );
 
+  // All variants are decorative: the icon always sits next to the server's
+  // visible name, so it is hidden from assistive technologies.
   if (!icon && catalogId === ARCHESTRA_MCP_CATALOG_ID) {
     return (
       <Image
         src={appIconLogo}
-        alt={DEFAULT_APP_NAME}
+        alt=""
         width={size}
         height={size}
         className={cn("shrink-0 rounded-sm object-contain", className)}
+        style={{ width: size, height: size }}
       />
     );
   }
 
   if (!icon) {
     return (
-      <Server
+      <Fallback
         className={cn("shrink-0 text-muted-foreground", className)}
         style={{ width: size, height: size }}
       />
     );
   }
 
-  if (icon.startsWith("data:")) {
+  // Inline data, or a registry list row's link to the item's icon route. The
+  // route needs the viewer's session cookie, so the image is not optimized
+  // (the optimizer would fetch it without one).
+  if (icon.startsWith("data:") || icon.startsWith("/api/")) {
     return (
       <Image
+        ref={imageRef}
+        onLoad={onImageLoad}
         src={icon}
-        alt="MCP server icon"
+        alt=""
+        unoptimized
         width={size}
         height={size}
-        className={cn("shrink-0 rounded-sm object-contain", className)}
+        className={cn(
+          "shrink-0 rounded-sm object-contain",
+          imageToneClassName(imageTone),
+          className,
+        )}
+        style={{ width: size, height: size }}
       />
     );
   }
 
   return (
     <span
+      aria-hidden
       className={cn("shrink-0 leading-none", className)}
       style={{ fontSize: size }}
     >

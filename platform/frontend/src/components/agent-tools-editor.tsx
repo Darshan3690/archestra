@@ -3,14 +3,23 @@
 import {
   type AgentScope,
   ARCHESTRA_MCP_CATALOG_ID,
+  ARCHESTRA_TOOL_GROUPS,
   type archestraApiTypes,
   E2eTestId,
   getAgentToolCatalogPillTestId,
   isPlaywrightCatalogItem,
+  isRequiredOpenAppaToolShortName,
   parseFullToolName,
-} from "@shared";
-import { useQueries } from "@tanstack/react-query";
-import { Loader2, Pencil, Search, X } from "lucide-react";
+} from "@archestra/shared";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  ChevronDown,
+  ChevronRight,
+  Loader2,
+  Search,
+  Server,
+} from "lucide-react";
+import Link from "next/link";
 import {
   forwardRef,
   useCallback,
@@ -20,43 +29,82 @@ import {
   useRef,
   useState,
 } from "react";
+import { EmptyState } from "@/components/empty-state";
+import { QueryLoadError } from "@/components/query-load-error";
 import {
   AssignmentCombobox,
   type AssignmentComboboxItem,
 } from "@/components/ui/assignment-combobox";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
-import { useInvalidateToolAssignmentQueries } from "@/lib/agent-tools.hook";
-import { useAssignTool, useUnassignTool } from "@/lib/agent-tools.query";
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { UnstyledButton } from "@/components/ui/unstyled-button";
+import { useBulkUpdateAgentTools } from "@/lib/agent-tools.query";
 import { useProfileToolsWithIds } from "@/lib/chat/chat.query";
+import { useFeature } from "@/lib/config/config.query";
+import { useDebouncedValue } from "@/lib/hooks/use-debounced-value";
 import { useArchestraMcpIdentity } from "@/lib/mcp/archestra-mcp-server";
+import { useCatalogTools } from "@/lib/mcp/internal-mcp-catalog.query";
 import {
-  fetchCatalogTools,
-  useCatalogTools,
-  useInternalMcpCatalog,
-} from "@/lib/mcp/internal-mcp-catalog.query";
+  type McpRegistryRow,
+  REGISTRY_PICKER_PAGE_SIZE,
+  useMcpRegistryPage,
+} from "@/lib/mcp/mcp-registry.query";
 import { useMcpServersGroupedByCatalog } from "@/lib/mcp/mcp-server.query";
-import { cn } from "@/lib/utils";
+import { useMcpRegistryRowsByIds } from "@/lib/mcp/use-mcp-registry-rows-by-ids";
+import { useOrganization } from "@/lib/organization.query";
+import { useInvalidateToolAssignmentQueries } from "@/lib/use-invalidate-tool-assignment-queries";
+import { cn } from "@/lib/utils/tailwind";
 import {
-  getDefaultArchestraToolIds,
+  buildBulkToolUpdate,
+  computeMcpEnvConflicts,
+  credentialSourceOfAssignments,
+  desktopToolsRunNote,
+  filterDefaultArchestraToolIds,
+  getCatalogAssignmentGate,
+  isCatalogInEnvironment,
+  setsEqual,
+  shouldResetCredentialPin,
   sortAndFilterTools,
   sortCatalogItems,
+  summarizeBulkFailure,
 } from "./agent-tools-editor.utils";
-import { CatalogDocsLink } from "./catalog-docs-link";
 import { McpCatalogIcon } from "./mcp-catalog-icon";
+import { McpServerPillShell } from "./mcp-server-pill-shell";
 import { DYNAMIC_CREDENTIAL_VALUE, TokenSelect } from "./token-select";
 
-type InternalMcpCatalogItem =
-  archestraApiTypes.GetInternalMcpCatalogResponses["200"][number];
-type CatalogTool =
-  archestraApiTypes.GetInternalMcpCatalogToolsResponses["200"][number];
+/** A catalog item as the picker reads it: its registry row. */
+type InternalMcpCatalogItem = McpRegistryRow;
+type CatalogTool = Pick<
+  archestraApiTypes.GetInternalMcpCatalogToolsResponses["200"][number],
+  "id" | "name" | "description" | "createdAt" | "group"
+>;
+
+/**
+ * Apps and built-in servers run in-process with no installed MCP server or stored
+ * credentials, so the picker neither gates their assignment on an installed
+ * server nor offers a credential selector for them.
+ */
+const isCredentialLessCatalogType = (
+  serverType: InternalMcpCatalogItem["serverType"],
+) => serverType === "builtin" || serverType === "app";
+
+/**
+ * A desktop MCP server runs on the computer of the person who makes the call,
+ * through their own installation. The picker has no connection to choose for
+ * it, and the assigning caller's installations say nothing about whether it
+ * is "connected".
+ */
+const isDesktopCatalogType = (
+  serverType: InternalMcpCatalogItem["serverType"],
+) => serverType === "desktop_mcp";
 type ResourceTool = archestraApiTypes.GetAgentToolsResponses["200"][number];
 type AssignedTool = {
   tool: ResourceTool;
@@ -71,26 +119,84 @@ interface PendingCatalogChanges {
   catalogItem: InternalMcpCatalogItem;
   /** When true, all tools should be selected once they load */
   selectAll?: boolean;
+  /**
+   * When true, the creation-default subset should be selected once tools load.
+   * Used when re-adding the built-in Archestra catalog so it lands on its
+   * default tools (what a new agent gets), not all ~100+ tools.
+   */
+  selectDefaults?: boolean;
   /** Whether the catalog pill should remain visible. Only set to false when explicitly toggled off via combobox. */
   isActive?: boolean;
 }
+
+export type McpEnvConflict = { catalogId: string; name: string };
 
 export interface AgentToolsEditorRef {
   saveChanges: (params?: {
     agentId?: string;
     resourceLabel?: string;
   }) => Promise<void>;
+  /** Unselect every MCP catalog flagged as not belonging to the agent's environment. */
+  removeIncompatibleTools: () => void;
 }
 
 interface AgentToolsEditorProps {
+  /**
+   * Show the assignment without offering to change it: pills lose their pencil
+   * and remove control, and the Add combobox is not rendered.
+   *
+   * The form has always taken a `readOnly`, but it stopped at the fields it
+   * owns — this picker kept working for a reader who could not save, and the
+   * Connect page needs the same list purely as a statement of fact.
+   */
+  readOnly?: boolean;
   agentId?: string;
   assignmentScope?: AgentScope;
   assignmentTeamIds?: string[];
   onSelectedCountChange?: (count: number) => void;
+  /**
+   * Reports the effective set of currently-selected tool ids (pending edits
+   * included, server assignments for untouched catalogs). The exclusions editor
+   * uses it so a built-in the user just checked here — but hasn't saved — is
+   * treated as assigned and not seeded as disabled. Pass a referentially-stable
+   * callback (e.g. a `useState` setter).
+   */
+  onSelectedToolIdsChange?: (toolIds: ReadonlySet<string>) => void;
+  /**
+   * When true (the agent-environments feature is on), scope the MCP list to
+   * `agentEnvironmentId` and report cross-environment selections via
+   * `onConflictsChange`. When false, all catalogs are shown and no conflicts
+   * are computed.
+   */
+  environmentScopingEnabled?: boolean;
+  /** The agent's environment id; `null` = the Default runtime bucket. */
+  agentEnvironmentId?: string | null;
+  /** Display name of the agent's environment for the filter hint (null = Default runtime). */
+  agentEnvironmentName?: string | null;
+  /**
+   * Reports MCP catalogs that are selected but don't belong to the agent's
+   * environment. Pass a referentially-stable callback (e.g. a `useState`
+   * setter) to avoid effect loops.
+   */
+  onConflictsChange?: (conflicts: McpEnvConflict[]) => void;
+  /**
+   * Reports whether the editor holds tool or credential edits that a save
+   * would write — the same diff `saveChanges` runs — so the host form can
+   * count them as unsaved changes. Pass a referentially-stable callback (e.g.
+   * a `useState` setter).
+   */
+  onPendingChangesChange?: (hasPendingChanges: boolean) => void;
   /** "pills" (default): compact pills + dropdown combobox. "cards": inline grid of MCP server cards. */
   layout?: "pills" | "cards";
   /** When true, the "Add MCP server" combobox starts open. */
   openComboboxOnMount?: boolean;
+  /**
+   * Include assignable App backing catalogs in the picker. Chat agents, MCP
+   * gateways, and legacy profiles set this — a chat agent renders an app inline
+   * from its `__open` tool, a gateway/profile exposes that tool to a connected
+   * MCP client. The backend still gates their inclusion on `app:read`.
+   */
+  includeAppCatalogs?: boolean;
 }
 
 export const AgentToolsEditor = forwardRef<
@@ -98,23 +204,39 @@ export const AgentToolsEditor = forwardRef<
   AgentToolsEditorProps
 >(function AgentToolsEditor(
   {
+    readOnly = false,
     agentId,
     assignmentScope,
     assignmentTeamIds,
     onSelectedCountChange,
+    onSelectedToolIdsChange,
+    environmentScopingEnabled,
+    agentEnvironmentId,
+    agentEnvironmentName,
+    onConflictsChange,
+    onPendingChangesChange,
     layout = "pills",
     openComboboxOnMount,
+    includeAppCatalogs,
   },
   ref,
 ) {
   return (
     <AgentToolsEditorContent
+      readOnly={readOnly}
       agentId={agentId}
       assignmentScope={assignmentScope}
       assignmentTeamIds={assignmentTeamIds}
       onSelectedCountChange={onSelectedCountChange}
+      onSelectedToolIdsChange={onSelectedToolIdsChange}
+      environmentScopingEnabled={environmentScopingEnabled}
+      agentEnvironmentId={agentEnvironmentId}
+      agentEnvironmentName={agentEnvironmentName}
+      onConflictsChange={onConflictsChange}
+      onPendingChangesChange={onPendingChangesChange}
       layout={layout}
       openComboboxOnMount={openComboboxOnMount}
+      includeAppCatalogs={includeAppCatalogs}
       ref={ref}
     />
   );
@@ -125,55 +247,33 @@ const AgentToolsEditorContent = forwardRef<
   AgentToolsEditorProps
 >(function AgentToolsEditorContent(
   {
+    readOnly = false,
     agentId,
     assignmentScope,
     assignmentTeamIds,
     onSelectedCountChange,
+    onSelectedToolIdsChange,
+    environmentScopingEnabled = false,
+    agentEnvironmentId = null,
+    agentEnvironmentName,
+    onConflictsChange,
+    onPendingChangesChange,
     layout = "pills",
     openComboboxOnMount,
+    includeAppCatalogs = false,
   },
   ref,
 ) {
   const { catalogName } = useArchestraMcpIdentity();
+  const queryClient = useQueryClient();
   const invalidateAllQueries = useInvalidateToolAssignmentQueries();
-  const assignTool = useAssignTool();
-  const unassignTool = useUnassignTool();
-
-  // Fetch catalog items (MCP servers in registry)
-  const { data: catalogItems = [], isPending } = useInternalMcpCatalog();
-
-  // Fetch all credentials grouped by catalog (for default credential on toggle)
-  const allCredentials = useMcpServersGroupedByCatalog({
-    assignmentScope,
-    assignmentTeamIds,
-  });
-
-  // Fetch tool counts for all catalog items to enable sorting
-  const toolCountQueries = useQueries({
-    queries: catalogItems.map((catalog) => ({
-      queryKey: ["mcp-catalog", catalog.id, "tools"] as const,
-      queryFn: () => fetchCatalogTools(catalog.id),
-    })),
-  });
-
-  // Create a map of catalog ID to tool count
-  const toolCountByCatalog = useMemo(() => {
-    const map = new Map<string, number>();
-    for (let i = 0; i < catalogItems.length; i++) {
-      const query = toolCountQueries[i];
-      const catalog = catalogItems[i];
-      if (catalog) {
-        const tools = query?.data as CatalogTool[] | undefined;
-        map.set(catalog.id, tools?.length ?? 0);
-      }
-    }
-    return map;
-  }, [catalogItems, toolCountQueries]);
+  const bulkUpdateTools = useBulkUpdateAgentTools();
 
   // Fetch assigned tools for this resource (only when editing an existing one).
   // Use the resource-scoped endpoint so MCP gateway members do not need the
   // broader tool-policy table permission just to edit their gateway tools.
-  const { data: assignedToolsData = [] } = useProfileToolsWithIds(agentId);
+  const { data: assignedToolsData = [], isLoading: isAssignedToolsLoading } =
+    useProfileToolsWithIds(agentId);
 
   // Group assigned tools by catalogId
   const assignedToolsByCatalog = useMemo(() => {
@@ -191,6 +291,111 @@ const AgentToolsEditorContent = forwardRef<
     return map;
   }, [assignedToolsData]);
 
+  // The rows this picker shows, without loading the whole registry: the
+  // catalogs the record already uses, fetched by id (with the built-in one
+  // while creating, for its default tools), plus one page of the registry for
+  // the Add list, searched on the server as the reader types. A catalog picked
+  // from that page travels in its pending change, so it stays on screen when
+  // the search moves on. The built-in entry and (where offered) App backings
+  // are opted in, as the full list used to include them.
+  const catalogOptions = {
+    includeBuiltIn: true,
+    includeApps: includeAppCatalogs,
+  } as const;
+  const assignedCatalogIds = useMemo(() => {
+    const ids = [...assignedToolsByCatalog.keys()];
+    if (!agentId) ids.push(ARCHESTRA_MCP_CATALOG_ID);
+    return ids;
+  }, [assignedToolsByCatalog, agentId]);
+  const assignedCatalogs = useMcpRegistryRowsByIds(
+    assignedCatalogIds,
+    catalogOptions,
+  );
+  const [catalogSearch, setCatalogSearch] = useState("");
+  const debouncedCatalogSearch = useDebouncedValue(catalogSearch.trim(), 250);
+  const catalogPage = useMcpRegistryPage(
+    {
+      ...catalogOptions,
+      ...(debouncedCatalogSearch
+        ? { search: debouncedCatalogSearch, searchDescriptions: true }
+        : {}),
+      sortBy: "name",
+      sortDirection: "asc",
+      limit: REGISTRY_PICKER_PAGE_SIZE,
+      offset: 0,
+    },
+    { placeholderScope: "agent-tools-editor" },
+  );
+  const isCatalogSearching =
+    catalogSearch.trim() !== debouncedCatalogSearch ||
+    (!!debouncedCatalogSearch && catalogPage.isFetching);
+
+  // State counter to force re-renders when pendingChangesRef updates
+  const [pendingVersion, setPendingVersion] = useState(0);
+
+  // Track pending changes for all catalogs
+  const pendingChangesRef = useRef<Map<string, PendingCatalogChanges>>(
+    new Map(),
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: pendingVersion triggers re-computation when pendingChangesRef updates
+  const catalogItems = useMemo(() => {
+    const byId = new Map<string, InternalMcpCatalogItem>();
+    for (const row of assignedCatalogs.data) byId.set(row.id, row);
+    for (const [id, pending] of pendingChangesRef.current) {
+      if (!byId.has(id)) byId.set(id, pending.catalogItem);
+    }
+    for (const row of catalogPage.data?.data ?? []) {
+      if (!byId.has(row.id)) byId.set(row.id, row);
+    }
+    return [...byId.values()];
+  }, [assignedCatalogs.data, catalogPage.data, pendingVersion]);
+  // Only the first load: a later change of the assigned catalogs keeps the
+  // rows already known on screen while it loads.
+  const isPending =
+    (!!agentId && isAssignedToolsLoading) ||
+    (assignedCatalogIds.length > 0 && !assignedCatalogs.hasLoaded) ||
+    catalogPage.isPending;
+  const catalogFailed = assignedCatalogs.isError || catalogPage.isLoadingError;
+  const refetchCatalog = () => {
+    void assignedCatalogs.refetch();
+    void catalogPage.refetch();
+  };
+  // Nothing at all to offer: no search narrowing the page, and neither the
+  // registry nor the record has a single catalog.
+  const isRegistryEmpty =
+    !debouncedCatalogSearch &&
+    catalogPage.data?.pagination.total === 0 &&
+    catalogItems.length === 0;
+
+  // The installs this record could use, for the "Not connected" gate — only
+  // for the catalogs on screen, and only those that need an install at all.
+  const allCredentials = useMcpServersGroupedByCatalog({
+    assignmentScope,
+    assignmentTeamIds,
+    catalogIdsIn: catalogItems
+      .filter(
+        (catalog) =>
+          !isCredentialLessCatalogType(catalog.serverType) &&
+          !isDesktopCatalogType(catalog.serverType),
+      )
+      .map((catalog) => catalog.id),
+  });
+
+  // Tool counts come from the registry rows themselves (`toolCount`, one
+  // grouped COUNT server-side). This used to be a per-catalog `useQueries`
+  // fan-out — one request per catalog item, each returning full tool rows with
+  // their assigned-agent lists, purely to read `.length` — which on a real
+  // registry queued behind itself in the browser's connection pool and held
+  // this component on "Loading tools...".
+  const toolCountByCatalog = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const catalog of catalogItems) {
+      map.set(catalog.id, catalog.toolCount ?? 0);
+    }
+    return map;
+  }, [catalogItems]);
+
   // Sort catalog items: assigned tools first (by count desc), then servers with tools, then 0 tools
   const sortedCatalogItems = useMemo(() => {
     return sortCatalogItems(
@@ -200,49 +405,90 @@ const AgentToolsEditorContent = forwardRef<
     );
   }, [catalogItems, assignedToolsByCatalog, toolCountByCatalog]);
 
-  // State counter to force re-renders when pendingChangesRef updates
-  const [pendingVersion, setPendingVersion] = useState(0);
+  // A catalog belongs to the agent's environment when it's a builtin (always
+  // available everywhere, e.g. the Archestra platform tools) or its environment
+  // matches — `null` (Default runtime) is its own bucket.
+  const isEnvCompatible = useCallback(
+    (catalog: InternalMcpCatalogItem) =>
+      isCatalogInEnvironment(catalog, agentEnvironmentId ?? null),
+    [agentEnvironmentId],
+  );
+
+  // All catalogs are offered; when environment scoping is on, catalogs outside
+  // the agent's environment are shown disabled (grayed) in the combobox rather
+  // than hidden, so it's clear why they can't be selected. Already-selected
+  // incompatible ones still render as pills so they can be removed.
+  const visibleCatalogItems = sortedCatalogItems;
 
   // Track which catalog pill should auto-open its popover after being added
   const [autoOpenCatalogId, setAutoOpenCatalogId] = useState<string | null>(
     null,
   );
 
-  // Track pending changes for all catalogs
-  const pendingChangesRef = useRef<Map<string, PendingCatalogChanges>>(
-    new Map(),
-  );
-
   // Track whether default tools have been pre-selected for new agent creation
   const defaultToolsInitializedRef = useRef(false);
 
-  // Pre-select default Archestra tools when creating a new agent (no agentId)
+  // Latest cross-environment conflicts, mirrored to a ref so the imperative
+  // `removeIncompatibleTools()` can read them without a render dependency.
+  const conflictsRef = useRef<McpEnvConflict[]>([]);
+
+  const { data: organization } = useOrganization();
+  const skillToolsEnabled = organization?.skillToolsEnabled === true;
+  const sandboxEnabled = useFeature("sandbox") === true;
+  const openappaEnabled = useFeature("openappaEnabled") === true;
+
+  // The built-in catalog's tools, fetched only while creating an agent — the
+  // one place this component still needs a tool list rather than a count, to
+  // pre-select the creation defaults. Every other catalog's list stays lazy,
+  // loaded by a pill when its popover opens.
+  const { data: builtInCatalogTools } = useCatalogTools(
+    agentId ? null : ARCHESTRA_MCP_CATALOG_ID,
+  );
+
+  // The creation-default built-in set, composed by the shared
+  // getCreationDefaultArchestraToolShortNames from the same org/deployment
+  // flags AgentModel.create reads server-side. Null while editing an existing
+  // agent. Used twice: to pre-select the new-agent form, and as the
+  // saveChanges baseline for the built-in catalog right after create.
+  const creationDefaultTools = useMemo(() => {
+    if (agentId) return null; // Only for new agent creation
+    if (!builtInCatalogTools?.length) return null;
+    const toolIds = filterDefaultArchestraToolIds(builtInCatalogTools, {
+      skillsEnabled: skillToolsEnabled,
+      sandboxEnabled,
+      openappaEnabled,
+    });
+    return toolIds.size > 0 ? toolIds : null;
+  }, [
+    agentId,
+    builtInCatalogTools,
+    skillToolsEnabled,
+    sandboxEnabled,
+    openappaEnabled,
+  ]);
+
+  // Pre-select the creation-default Archestra tools when creating a new agent
+  // (no agentId), so the form shows exactly what AgentModel.create will assign
+  // server-side.
   useEffect(() => {
-    if (agentId) return; // Only for new agent creation
     if (defaultToolsInitializedRef.current) return; // Only initialize once
+    if (!creationDefaultTools) return;
 
-    const toolsByCatalogIndex = toolCountQueries.map(
-      (q) => (q?.data as CatalogTool[] | undefined) ?? undefined,
+    const archestraCatalog = catalogItems.find(
+      (catalog) => catalog.id === ARCHESTRA_MCP_CATALOG_ID,
     );
-    const result = getDefaultArchestraToolIds(
-      catalogItems,
-      toolsByCatalogIndex,
-    );
-    if (!result) return;
-
-    const archestraCatalog = catalogItems[result.catalogIndex];
     if (!archestraCatalog) return;
 
     defaultToolsInitializedRef.current = true;
     pendingChangesRef.current.set(ARCHESTRA_MCP_CATALOG_ID, {
-      selectedToolIds: result.toolIds,
+      selectedToolIds: creationDefaultTools,
       credentialSourceId: null,
       catalogItem: archestraCatalog,
       selectAll: false,
     });
-    onSelectedCountChange?.(result.toolIds.size);
+    onSelectedCountChange?.(creationDefaultTools.size);
     setPendingVersion((v) => v + 1);
-  }, [agentId, catalogItems, toolCountQueries, onSelectedCountChange]);
+  }, [creationDefaultTools, catalogItems, onSelectedCountChange]);
 
   // Calculate total selected count from pending changes
   const calculateTotalSelectedCount = useCallback(() => {
@@ -273,6 +519,57 @@ const AgentToolsEditorContent = forwardRef<
     [calculateTotalSelectedCount, onSelectedCountChange],
   );
 
+  // Effective current selection across every catalog: the pending edit when the
+  // user has touched a catalog, otherwise its saved assignments. Reported to the
+  // dialog so the exclusions editor's seed reflects unsaved Custom-tab edits.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: pendingVersion triggers re-computation when pendingChangesRef updates
+  const effectiveSelectedToolIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const catalog of catalogItems) {
+      const pending = pendingChangesRef.current.get(catalog.id);
+      if (pending) {
+        for (const id of pending.selectedToolIds) ids.add(id);
+      } else {
+        for (const at of assignedToolsByCatalog.get(catalog.id) ?? [])
+          ids.add(at.tool.id);
+      }
+    }
+    return ids;
+  }, [catalogItems, assignedToolsByCatalog, pendingVersion]);
+
+  // Report only when the CONTENT changes. The memo's inputs get fresh
+  // identities on every render while the queries are loading (`data = []`
+  // defaults), so keying the parent's setState off the Set's identity would
+  // loop render → new Set → setState → render forever and crash the dialog.
+  const lastReportedSelectionKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!onSelectedToolIdsChange) return;
+    const key = [...effectiveSelectedToolIds].sort().join(",");
+    if (lastReportedSelectionKeyRef.current === key) return;
+    lastReportedSelectionKeyRef.current = key;
+    onSelectedToolIdsChange(effectiveSelectedToolIds);
+  }, [effectiveSelectedToolIds, onSelectedToolIdsChange]);
+
+  // Whether a save would write anything — the very diff `saveChanges` runs,
+  // so the host's unsaved-changes state agrees with what Save does. Every
+  // mounted pill registers its (unchanged) state as a pending entry, so the
+  // map's size alone says nothing; only the diff does.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: pendingVersion triggers re-computation when pendingChangesRef updates
+  const hasPendingChanges = useMemo(
+    () =>
+      buildBulkToolUpdate({
+        targetAgentId: agentId ?? "",
+        pendingChanges: pendingChangesRef.current,
+        assignedToolsByCatalog,
+        isNewAgent: !agentId,
+        creationDefaultToolIds: creationDefaultTools ?? undefined,
+      }).hasChanges,
+    [agentId, assignedToolsByCatalog, creationDefaultTools, pendingVersion],
+  );
+  useEffect(() => {
+    onPendingChangesChange?.(hasPendingChanges);
+  }, [hasPendingChanges, onPendingChangesChange]);
+
   // Expose saveChanges method to parent
   useImperativeHandle(ref, () => ({
     saveChanges: async (params) => {
@@ -280,112 +577,59 @@ const AgentToolsEditorContent = forwardRef<
       const resourceLabel = params?.resourceLabel ?? "resource";
       if (!targetAgentId) return;
 
-      const allChanges = Array.from(pendingChangesRef.current.entries());
-      let hasChanges = false;
+      // Every catalog's edits are accumulated and sent as ONE request. Looping
+      // per tool (the previous shape) forked an agent config version per
+      // request, so adding a 30-tool server burned 30 of the 100 retained
+      // versions and an add-then-remove cycle evicted the edits a human made.
+      const { assignments, removals, hasChanges } = buildBulkToolUpdate({
+        targetAgentId,
+        pendingChanges: pendingChangesRef.current,
+        assignedToolsByCatalog,
+        isNewAgent: !agentId,
+        creationDefaultToolIds: creationDefaultTools ?? undefined,
+      });
 
-      for (const [catalogId, changes] of allChanges) {
-        const currentAssigned = assignedToolsByCatalog.get(catalogId) ?? [];
-        const currentAssignedIds = new Set(
-          currentAssigned.map((at) => at.tool.id),
-        );
-
-        const toAdd = [...changes.selectedToolIds].filter(
-          (id) => !currentAssignedIds.has(id),
-        );
-        const toRemove = [...currentAssignedIds].filter(
-          (id) => !changes.selectedToolIds.has(id),
-        );
-
-        if (toAdd.length > 0 || toRemove.length > 0) {
-          hasChanges = true;
-        }
-
-        const _isLocal = changes.catalogItem.serverType === "local";
-        const prefersEnterpriseManaged =
-          changes.catalogItem.enterpriseManagedConfig != null;
-
-        // Remove and add tools in parallel (skip invalidation, will do it once at the end)
-        const useDynamicCredential =
-          isPlaywrightCatalogItem(changes.catalogItem.id) ||
-          changes.credentialSourceId === DYNAMIC_CREDENTIAL_VALUE;
-        const useEnterpriseManagedCredential =
-          prefersEnterpriseManaged && useDynamicCredential;
-
-        const results = await Promise.allSettled([
-          ...toRemove.map((toolId) =>
-            unassignTool.mutateAsync({
-              agentId: targetAgentId,
-              toolId,
-              skipInvalidation: true,
-            }),
-          ),
-          ...toAdd.map((toolId) =>
-            assignTool.mutateAsync({
-              agentId: targetAgentId,
-              toolId,
-              mcpServerId:
-                !useDynamicCredential && !useEnterpriseManagedCredential
-                  ? changes.credentialSourceId
-                  : undefined,
-              resolveAtCallTime: useDynamicCredential,
-              credentialResolutionMode: useEnterpriseManagedCredential
-                ? "enterprise_managed"
-                : useDynamicCredential
-                  ? "dynamic"
-                  : "static",
-              skipInvalidation: true,
-            }),
-          ),
-        ]);
-
-        const failures = results.filter((r) => r.status === "rejected");
-        if (failures.length > 0) {
-          throw new Error(
-            formatToolAssignmentErrorMessage(
-              resourceLabel,
-              (failures[0] as PromiseRejectedResult).reason,
-            ),
-          );
-        }
-
-        // Update credential on tools that remain assigned but whose credential changed
-        const toKeep = currentAssigned.filter((at) =>
-          changes.selectedToolIds.has(at.tool.id),
-        );
-        for (const agentTool of toKeep) {
-          const currentCred =
-            agentTool.credentialResolutionMode === "dynamic"
-              ? DYNAMIC_CREDENTIAL_VALUE
-              : agentTool.credentialResolutionMode === "enterprise_managed"
-                ? DYNAMIC_CREDENTIAL_VALUE
-                : (agentTool.mcpServerId ?? null);
-          if (currentCred !== changes.credentialSourceId) {
-            hasChanges = true;
-            await assignTool.mutateAsync({
-              agentId: targetAgentId,
-              toolId: agentTool.tool.id,
-              mcpServerId:
-                !useDynamicCredential && !useEnterpriseManagedCredential
-                  ? (changes.credentialSourceId ?? undefined)
-                  : null,
-              credentialResolutionMode: useEnterpriseManagedCredential
-                ? "enterprise_managed"
-                : useDynamicCredential
-                  ? "dynamic"
-                  : "static",
-              skipInvalidation: true,
-            });
-          }
-        }
+      // `failed` is the only part of the response that is an error — see
+      // summarizeBulkFailure, which is deliberately the only thing read off it.
+      let failure: string | undefined;
+      if (assignments.length > 0 || removals.length > 0) {
+        const result = await bulkUpdateTools.mutateAsync({
+          assignments,
+          removals,
+          skipInvalidation: true,
+        });
+        failure = summarizeBulkFailure(result?.failed);
       }
 
-      // Invalidate all queries once at the end
+      // Invalidate once at the end — before any throw, because a partial
+      // failure still applied the removals and the assignments that validated,
+      // and the cached tool lists would otherwise stay stale.
       if (hasChanges) {
         invalidateAllQueries(targetAgentId);
       }
 
+      if (failure) {
+        throw new Error(
+          formatToolAssignmentErrorMessage(resourceLabel, new Error(failure)),
+        );
+      }
+
       // Clear all pending changes after save
       pendingChangesRef.current.clear();
+    },
+    removeIncompatibleTools: () => {
+      for (const { catalogId } of conflictsRef.current) {
+        const catalog = catalogItems.find((c) => c.id === catalogId);
+        if (!catalog) continue;
+        const pending = pendingChangesRef.current.get(catalogId);
+        registerPendingChanges(catalogId, {
+          selectedToolIds: new Set(),
+          credentialSourceId: pending?.credentialSourceId ?? null,
+          catalogItem: catalog,
+          selectAll: false,
+          isActive: false,
+        });
+      }
     },
   }));
 
@@ -407,6 +651,39 @@ const AgentToolsEditorContent = forwardRef<
     return ids;
   }, [sortedCatalogItems, assignedToolsByCatalog, pendingVersion]);
 
+  // Catalogs that are selected but don't belong to the agent's environment.
+  // Builtins are exempt. Empty when scoping is off.
+  const mcpEnvConflicts = useMemo<McpEnvConflict[]>(
+    () =>
+      environmentScopingEnabled
+        ? computeMcpEnvConflicts(
+            catalogItems,
+            selectedCatalogIds,
+            agentEnvironmentId ?? null,
+          )
+        : [],
+    [
+      environmentScopingEnabled,
+      selectedCatalogIds,
+      catalogItems,
+      agentEnvironmentId,
+    ],
+  );
+
+  // Mirror conflicts to a ref for the imperative remove, and report upward.
+  // `mcpEnvConflicts` is recomputed (new array) on every render because its
+  // dependency chain bottoms out in non-stable query results, so we diff by
+  // content and only call up on a real change — otherwise the parent's setState
+  // would re-render us in an infinite loop.
+  useEffect(() => {
+    const prev = conflictsRef.current;
+    const changed =
+      prev.length !== mcpEnvConflicts.length ||
+      mcpEnvConflicts.some((c, i) => prev[i]?.catalogId !== c.catalogId);
+    conflictsRef.current = mcpEnvConflicts;
+    if (changed) onConflictsChange?.(mcpEnvConflicts);
+  }, [mcpEnvConflicts, onConflictsChange]);
+
   // Handle toggling a catalog on/off from the combobox
   const handleCatalogToggle = useCallback(
     (catalogId: string) => {
@@ -419,6 +696,8 @@ const AgentToolsEditorContent = forwardRef<
         ? pending.isActive !== false
         : assigned.length > 0;
 
+      if (currentlySelected && catalogId === ARCHESTRA_MCP_CATALOG_ID) return;
+
       if (currentlySelected) {
         // Toggle OFF: clear all tools and hide the pill
         registerPendingChanges(catalogId, {
@@ -429,21 +708,42 @@ const AgentToolsEditorContent = forwardRef<
           isActive: false,
         });
       } else {
-        // Toggle ON: pre-select all tools using cached data
-        const toolIdx = catalogItems.findIndex((c) => c.id === catalogId);
-        const toolQuery = toolCountQueries[toolIdx];
-        const tools = (toolQuery?.data as CatalogTool[] | undefined) ?? [];
+        // Toggle ON: pre-select the catalog's tools using cached data — a pill
+        // that has already been opened leaves its list in the query cache.
+        const tools =
+          queryClient.getQueryData<CatalogTool[]>([
+            "mcp-catalog",
+            catalogId,
+            "tools",
+            "picker",
+          ]) ?? [];
         const allToolIds = new Set(tools.map((t) => t.id));
 
-        // Get default credential
-        const credentials = allCredentials?.[catalogId] ?? [];
-        const defaultCredential = credentials[0]?.id ?? null;
+        // The built-in Archestra catalog re-adds to its creation-default subset
+        // (what a new agent gets), not all its tools; every other server has no
+        // default subset, so it still selects all. When the tool cache is cold
+        // `tools` is empty and the parent can't pre-compute — the pill fills the
+        // selection reactively from its own authoritative list via the
+        // selectAll / selectDefaults flags. We never set selectAll for
+        // Archestra, since that backstop would expand to all tools.
+        const isArchestra = catalogId === ARCHESTRA_MCP_CATALOG_ID;
 
         registerPendingChanges(catalogId, {
-          selectedToolIds: allToolIds,
-          credentialSourceId: pending?.credentialSourceId ?? defaultCredential,
+          selectedToolIds: isArchestra
+            ? filterDefaultArchestraToolIds(tools, {
+                skillsEnabled: skillToolsEnabled,
+                sandboxEnabled,
+                openappaEnabled,
+              })
+            : allToolIds,
+          // Newly assigned tools default to resolve-at-call-time, which follows
+          // the server's default credential setting; pinning a static
+          // credential is an explicit per-assignment choice.
+          credentialSourceId:
+            pending?.credentialSourceId ?? DYNAMIC_CREDENTIAL_VALUE,
           catalogItem: catalog,
-          selectAll: true,
+          selectAll: !isArchestra,
+          selectDefaults: isArchestra,
           isActive: true,
         });
       }
@@ -451,26 +751,36 @@ const AgentToolsEditorContent = forwardRef<
     [
       catalogItems,
       assignedToolsByCatalog,
-      toolCountQueries,
-      allCredentials,
+      queryClient,
       registerPendingChanges,
+      skillToolsEnabled,
+      sandboxEnabled,
+      openappaEnabled,
     ],
   );
 
   // Build combobox items
   // biome-ignore lint/correctness/useExhaustiveDependencies: pendingVersion triggers re-computation when pendingChangesRef updates
   const comboboxItems: AssignmentComboboxItem[] = useMemo(() => {
-    return sortedCatalogItems.map((catalog) => {
+    return visibleCatalogItems.map((catalog) => {
       const pending = pendingChangesRef.current.get(catalog.id);
       const assignedCount = pending
         ? pending.selectedToolIds.size
         : (assignedToolsByCatalog.get(catalog.id)?.length ?? 0);
       const totalCount = toolCountByCatalog.get(catalog.id) ?? 0;
-      const hasNoTools = totalCount === 0;
-      const hasNoCredentials =
-        catalog.serverType !== "builtin" &&
-        !allCredentials?.[catalog.id]?.length;
-      const isDisabled = hasNoTools || hasNoCredentials;
+      const hasResolvableInstall =
+        isCredentialLessCatalogType(catalog.serverType) ||
+        !!allCredentials?.[catalog.id]?.length;
+      const gate = getCatalogAssignmentGate({
+        hasDiscoveredTools: totalCount > 0,
+        hasResolvableInstall,
+        isEnvIncompatible:
+          environmentScopingEnabled && !isEnvCompatible(catalog),
+        environmentName: agentEnvironmentName,
+        isDisabledApp:
+          catalog.serverType === "app" && catalog.appEnabled === false,
+        isDesktop: isDesktopCatalogType(catalog.serverType),
+      });
       const displayName =
         catalog.id === ARCHESTRA_MCP_CATALOG_ID ? catalogName : catalog.name;
       return {
@@ -480,30 +790,36 @@ const AgentToolsEditorContent = forwardRef<
         sortRank: catalog.id === ARCHESTRA_MCP_CATALOG_ID ? 1 : 0,
         icon: (
           <McpCatalogIcon
-            icon={catalog.icon}
+            icon={catalog.iconUrl ?? catalog.icon}
             catalogId={catalog.id}
             size={16}
           />
         ),
-        badge: isDisabled
+        badge: gate.disabled
           ? undefined
-          : assignedCount > 0
-            ? `${assignedCount}/${totalCount}`
-            : `${totalCount} tools`,
-        disabled: isDisabled,
-        disabledReason: hasNoTools
-          ? "Not installed"
-          : hasNoCredentials
-            ? "Not installed"
-            : undefined,
+          : gate.unavailable
+            ? "Not connected"
+            : assignedCount > 0
+              ? `${assignedCount}/${totalCount}`
+              : `${totalCount} ${totalCount === 1 ? "tool" : "tools"}`,
+        disabled:
+          gate.disabled ||
+          (catalog.id === ARCHESTRA_MCP_CATALOG_ID && assignedCount > 0),
+        disabledReason:
+          catalog.id === ARCHESTRA_MCP_CATALOG_ID && assignedCount > 0
+            ? "Required recovery tools cannot be unassigned"
+            : gate.disabledReason,
       };
     });
   }, [
-    sortedCatalogItems,
+    visibleCatalogItems,
     assignedToolsByCatalog,
     toolCountByCatalog,
     allCredentials,
     pendingVersion,
+    environmentScopingEnabled,
+    isEnvCompatible,
+    agentEnvironmentName,
   ]);
 
   // Filter to only selected catalogs for pills
@@ -521,29 +837,70 @@ const AgentToolsEditorContent = forwardRef<
     );
   }
 
-  if (catalogItems.length === 0) {
+  // The catalog list is the one request this picker cannot render without, and
+  // a failed one leaves `catalogItems` empty — which the gate below reports as
+  // "No MCP servers available in the catalog.", indistinguishable from an
+  // organization that genuinely has none. That reads as "your registry is
+  // empty" rather than "we couldn't reach it", and the query is silent
+  // (`toastOnError: false`), so nothing else on screen says otherwise.
+  //
+  // Now that tool counts come from this list, it carries the whole picker: the
+  // per-catalog fan-out that used to fill in around it is gone, so there is no
+  // second request left to hint that anything was attempted.
+  if (catalogFailed) {
     return (
-      <p className="text-sm text-muted-foreground">
-        No MCP servers available in the catalog.
-      </p>
+      <QueryLoadError
+        className="py-6"
+        title="Couldn't load the MCP server catalog"
+        description="The list of servers whose tools can be assigned failed to load."
+        onRetry={() => {
+          void refetchCatalog();
+        }}
+        retryTestId="retry-tools-catalog"
+      />
+    );
+  }
+
+  if (isRegistryEmpty) {
+    // Installing one is an organization-wide job, not this record's, so the
+    // panel says whose it is and points there rather than stopping at the fact.
+    return (
+      <EmptyState
+        className="py-6"
+        icon={Server}
+        title="No MCP servers are installed"
+        description="Servers are installed once for the whole organization. Until one is, there is nothing to assign here."
+        action={
+          <Button type="button" variant="outline" size="sm" asChild>
+            <Link href="/mcp/registry">Browse the MCP Registry</Link>
+          </Button>
+        }
+      />
     );
   }
 
   if (layout === "cards") {
     return (
       <div className="grid grid-cols-3 gap-2">
-        {sortedCatalogItems.map((catalog) => {
+        {visibleCatalogItems.map((catalog) => {
           const isSelected = selectedCatalogIds.includes(catalog.id);
           const pending = pendingChangesRef.current.get(catalog.id);
           const assignedCount = pending
             ? pending.selectedToolIds.size
             : (assignedToolsByCatalog.get(catalog.id)?.length ?? 0);
           const totalCount = toolCountByCatalog.get(catalog.id) ?? 0;
-          const hasNoTools = totalCount === 0;
-          const hasNoCredentials =
-            catalog.serverType !== "builtin" &&
-            !allCredentials?.[catalog.id]?.length;
-          const isDisabled = hasNoTools || hasNoCredentials;
+          // The cards layout is not environment-scoped (McpServerCard has no
+          // reason slot), so tool discovery is the only assignability gate here.
+          const gate = getCatalogAssignmentGate({
+            hasDiscoveredTools: totalCount > 0,
+            hasResolvableInstall:
+              isCredentialLessCatalogType(catalog.serverType) ||
+              !!allCredentials?.[catalog.id]?.length,
+            isEnvIncompatible: false,
+            isDisabledApp:
+              catalog.serverType === "app" && catalog.appEnabled === false,
+            isDesktop: isDesktopCatalogType(catalog.serverType),
+          });
 
           return (
             <McpServerCard
@@ -555,7 +912,8 @@ const AgentToolsEditorContent = forwardRef<
                   : catalog.name
               }
               isSelected={isSelected}
-              isDisabled={isDisabled}
+              isDisabled={gate.disabled}
+              unavailable={gate.unavailable}
               assignedCount={assignedCount}
               totalCount={totalCount}
               onToggle={() => handleCatalogToggle(catalog.id)}
@@ -566,40 +924,77 @@ const AgentToolsEditorContent = forwardRef<
     );
   }
 
+  // Nothing assigned yet, but there is something to assign: say what that costs
+  // the record rather than leaving a lone Add button to imply it.
+  const isEmpty = selectedCatalogs.length === 0;
+
   return (
-    <div className="flex flex-wrap gap-2">
-      {selectedCatalogs.map((catalog) => (
-        <McpServerPill
-          key={catalog.id}
-          catalogItem={catalog}
-          displayName={
-            catalog.id === ARCHESTRA_MCP_CATALOG_ID ? catalogName : catalog.name
-          }
-          assignedTools={assignedToolsByCatalog.get(catalog.id) ?? []}
-          assignmentScope={assignmentScope}
-          assignmentTeamIds={assignmentTeamIds}
-          initialPendingChanges={pendingChangesRef.current.get(catalog.id)}
-          onPendingChanges={registerPendingChanges}
-          onClearPendingChanges={clearPendingChanges}
-          onRemove={handleCatalogToggle}
-          autoOpen={catalog.id === autoOpenCatalogId}
-          onAutoOpened={() => setAutoOpenCatalogId(null)}
-        />
-      ))}
-      <AssignmentCombobox
-        items={comboboxItems}
-        selectedIds={selectedCatalogIds}
-        onToggle={handleCatalogToggle}
-        onItemAdded={setAutoOpenCatalogId}
-        placeholder="Search MCP servers..."
-        emptyMessage="No MCP servers found."
-        testId={E2eTestId.AgentToolsAddButton}
-        defaultOpen={openComboboxOnMount}
-        createAction={{
-          label: "Install New MCP Server",
-          href: "/mcp/registry",
-        }}
-      />
+    <div className="space-y-2">
+      <div
+        className={cn(
+          "flex flex-wrap gap-2",
+          isEmpty &&
+            "flex-col items-center rounded-md border border-dashed px-4 py-6 text-center",
+        )}
+      >
+        {isEmpty && (
+          <div className="space-y-0.5">
+            <p className="text-sm font-medium">No tools assigned yet</p>
+            {/* No record noun: this editor serves agents, gateways and
+                proxies, and naming one of them here is how the connection
+                strings drifted apart before. */}
+            <p className="text-xs text-muted-foreground">
+              Add an MCP server to choose tools from.
+            </p>
+          </div>
+        )}
+        {selectedCatalogs.map((catalog) => (
+          <McpServerPill
+            key={catalog.id}
+            catalogItem={catalog}
+            displayName={
+              catalog.id === ARCHESTRA_MCP_CATALOG_ID
+                ? catalogName
+                : catalog.name
+            }
+            assignedTools={assignedToolsByCatalog.get(catalog.id) ?? []}
+            assignmentScope={assignmentScope}
+            assignmentTeamIds={assignmentTeamIds}
+            initialPendingChanges={pendingChangesRef.current.get(catalog.id)}
+            onPendingChanges={registerPendingChanges}
+            onClearPendingChanges={clearPendingChanges}
+            readOnly={readOnly}
+            onRemove={handleCatalogToggle}
+            autoOpen={catalog.id === autoOpenCatalogId}
+            onAutoOpened={() => setAutoOpenCatalogId(null)}
+          />
+        ))}
+        {/* Nothing to add when the list is a statement of fact. */}
+        {!readOnly && (
+          <AssignmentCombobox
+            items={comboboxItems}
+            selectedIds={selectedCatalogIds}
+            onToggle={handleCatalogToggle}
+            onItemAdded={setAutoOpenCatalogId}
+            onSearchChange={setCatalogSearch}
+            isSearching={isCatalogSearching}
+            placeholder="Search MCP servers..."
+            emptyMessage="No MCP servers found."
+            // The scope belongs to this list, not to the pills a pick produces.
+            note={
+              environmentScopingEnabled
+                ? `Filtered to the ${agentEnvironmentName ?? "Default"} environment.`
+                : undefined
+            }
+            testId={E2eTestId.AgentToolsAddButton}
+            defaultOpen={openComboboxOnMount}
+            createAction={{
+              label: "Install New MCP Server",
+              href: "/mcp/registry",
+            }}
+          />
+        )}
+      </div>
     </div>
   );
 });
@@ -609,6 +1004,7 @@ function McpServerCard({
   displayName,
   isSelected,
   isDisabled,
+  unavailable,
   assignedCount,
   totalCount,
   onToggle,
@@ -617,12 +1013,13 @@ function McpServerCard({
   displayName: string;
   isSelected: boolean;
   isDisabled: boolean;
+  unavailable: boolean;
   assignedCount: number;
   totalCount: number;
   onToggle: () => void;
 }) {
   return (
-    <button
+    <UnstyledButton
       type="button"
       onClick={isDisabled ? undefined : onToggle}
       disabled={isDisabled}
@@ -633,20 +1030,30 @@ function McpServerCard({
         !isSelected && !isDisabled && "hover:bg-accent",
       )}
     >
-      <McpCatalogIcon icon={catalog.icon} catalogId={catalog.id} size={24} />
+      <McpCatalogIcon
+        icon={catalog.iconUrl ?? catalog.icon}
+        catalogId={catalog.id}
+        size={24}
+      />
       <span className="text-xs font-medium truncate w-full">{displayName}</span>
       <span className="text-[10px] text-muted-foreground">
         {isDisabled
-          ? "Not installed"
-          : isSelected
-            ? `${assignedCount}/${totalCount} tools`
-            : `${totalCount} tools`}
+          ? isDesktopCatalogType(catalog.serverType)
+            ? "Not connected from a device yet"
+            : "Not installed"
+          : unavailable
+            ? "Not connected"
+            : isSelected
+              ? `${assignedCount}/${totalCount} ${totalCount === 1 ? "tool" : "tools"}`
+              : `${totalCount} ${totalCount === 1 ? "tool" : "tools"}`}
       </span>
-    </button>
+    </UnstyledButton>
   );
 }
 
 interface McpServerPillProps {
+  /** Show the assignment without offering to change it. */
+  readOnly?: boolean;
   catalogItem: InternalMcpCatalogItem;
   displayName: string;
   assignedTools: AssignedTool[];
@@ -664,6 +1071,7 @@ interface McpServerPillProps {
 }
 
 function McpServerPill({
+  readOnly = false,
   catalogItem,
   displayName,
   assignedTools,
@@ -689,7 +1097,42 @@ function McpServerPill({
 
   // Fetch tools for this catalog item
   const { data: allTools = [], isLoading: isLoadingTools } = useCatalogTools(
-    catalogItem.id,
+    open ||
+      initialPendingChanges?.selectAll ||
+      initialPendingChanges?.selectDefaults
+      ? catalogItem.id
+      : null,
+  );
+
+  // Org/deployment flags that compose the Archestra creation-default set. Read
+  // here (not prop-drilled) so the selectDefaults backstop below can compute
+  // defaults from this pill's own authoritative tool list. Cached by TanStack
+  // Query, so this shares the parent's fetch.
+  const { data: organization } = useOrganization();
+  const skillToolsEnabled = organization?.skillToolsEnabled === true;
+  const sandboxEnabled = useFeature("sandbox") === true;
+  const openappaEnabled = useFeature("openappaEnabled") === true;
+
+  // Creation-default subset for the built-in catalog: powers the checklist's
+  // "Reset to defaults" action, so restoring a drifted selection no longer
+  // requires removing and re-adding the server. Undefined for every other
+  // server — they have no default subset, so the action is hidden.
+  const defaultToolIds = useMemo(
+    () =>
+      catalogItem.id === ARCHESTRA_MCP_CATALOG_ID
+        ? filterDefaultArchestraToolIds(allTools, {
+            skillsEnabled: skillToolsEnabled,
+            sandboxEnabled,
+            openappaEnabled,
+          })
+        : undefined,
+    [
+      catalogItem.id,
+      allTools,
+      skillToolsEnabled,
+      sandboxEnabled,
+      openappaEnabled,
+    ],
   );
 
   // Fetch available credentials for this catalog
@@ -699,14 +1142,13 @@ function McpServerPill({
     assignmentTeamIds,
   });
   const mcpServers = credentials?.[catalogItem.id] ?? [];
-  const prefersEnterpriseManaged = catalogItem.enterpriseManagedConfig != null;
+  const prefersEnterpriseManaged = catalogItem.enterpriseManaged;
 
-  const currentCredentialSource =
-    assignedTools[0]?.credentialResolutionMode === "dynamic"
-      ? DYNAMIC_CREDENTIAL_VALUE
-      : assignedTools[0]?.credentialResolutionMode === "enterprise_managed"
-        ? DYNAMIC_CREDENTIAL_VALUE
-        : (assignedTools[0]?.mcpServerId ?? mcpServers[0]?.id ?? null);
+  // Static assignments show their pinned connection; everything else —
+  // dynamic, enterprise-managed, or a brand-new assignment — defaults to
+  // resolve-at-call-time. Shared with the bulk-save diff, so an untouched
+  // pick never reads as a change.
+  const currentCredentialSource = credentialSourceOfAssignments(assignedTools);
 
   // Currently assigned tool IDs - use sorted string for stable comparison
   const currentAssignedToolIds = useMemo(
@@ -744,26 +1186,20 @@ function McpServerPill({
   }, [currentAssignedToolIdsKey]);
 
   useEffect(() => {
-    if (selectedCredential === DYNAMIC_CREDENTIAL_VALUE) {
-      return;
-    }
-
     if (
-      selectedCredential &&
-      mcpServers.some((server) => server.id === selectedCredential)
+      shouldResetCredentialPin({
+        credentialsLoaded: !!credentials,
+        selectionIsDynamic: selectedCredential === DYNAMIC_CREDENTIAL_VALUE,
+        pinnedServerId:
+          selectedCredential && selectedCredential !== DYNAMIC_CREDENTIAL_VALUE
+            ? selectedCredential
+            : null,
+        resolvableServerIds: mcpServers.map((server) => server.id),
+      })
     ) {
-      return;
-    }
-
-    if (prefersEnterpriseManaged) {
       setSelectedCredential(DYNAMIC_CREDENTIAL_VALUE);
-      return;
     }
-
-    if (mcpServers.length > 0) {
-      setSelectedCredential(mcpServers[0].id);
-    }
-  }, [mcpServers, prefersEnterpriseManaged, selectedCredential]);
+  }, [credentials, mcpServers, selectedCredential]);
 
   // Auto-select all tools when selectAll flag is set and tools finish loading.
   // Use a ref so auto-select only fires once (at mount) and doesn't fight user deselections.
@@ -780,6 +1216,39 @@ function McpServerPill({
     // Depend on .size (not the full set) intentionally — the effect only cares
     // whether the selection is empty, and the ref guard prevents re-firing anyway.
   }, [selectedToolIds.size, allTools]);
+
+  // Auto-select the creation-default subset when selectDefaults is set and tools
+  // finish loading. Mirrors pendingSelectAllRef, but pre-selects only the
+  // default Archestra tools — the backstop for re-adding the built-in catalog
+  // when the parent's tool cache was cold at click time. Fires once at mount.
+  const pendingSelectDefaultsRef = useRef(
+    initialPendingChanges?.selectDefaults ?? false,
+  );
+  useEffect(() => {
+    if (!pendingSelectDefaultsRef.current || allTools.length === 0) return;
+
+    if (selectedToolIds.size === 0) {
+      const defaults = filterDefaultArchestraToolIds(allTools, {
+        skillsEnabled: skillToolsEnabled,
+        sandboxEnabled,
+        openappaEnabled,
+      });
+      // Fall back to all tools only if nothing matched, so a naming mismatch
+      // never strands the user on zero tools.
+      setSelectedToolIds(
+        defaults.size > 0 ? defaults : new Set(allTools.map((t) => t.id)),
+      );
+    }
+    // Clear the flag regardless so we don't fight user deselections.
+    pendingSelectDefaultsRef.current = false;
+    // Depend on .size (not the full set) — see pendingSelectAllRef above.
+  }, [
+    selectedToolIds.size,
+    allTools,
+    skillToolsEnabled,
+    sandboxEnabled,
+    openappaEnabled,
+  ]);
 
   // Report pending changes to parent whenever local state changes.
   // The pill can only be rendered when isActive !== false, so always report as active
@@ -802,11 +1271,6 @@ function McpServerPill({
     return false;
   }, [selectedToolIds, currentAssignedToolIds]);
 
-  // Don't show MCP server if no credentials are available (except for builtin servers)
-  if (catalogItem.serverType !== "builtin" && mcpServers.length === 0) {
-    return null;
-  }
-
   const assignedCount = assignedTools.length;
   const totalCount = allTools.length;
   const displayedCount = hasPendingChanges
@@ -814,154 +1278,119 @@ function McpServerPill({
     : assignedCount;
   const isEmpty = displayedCount === 0;
 
-  // Show credential selector for non-builtin, non-Playwright servers that have credentials available
+  // Show the connection selector for non-builtin, non-App, non-Playwright
+  // servers. It always offers resolve-at-call-time, so a server with no
+  // connection that resolves for the caller still shows it — that is how the
+  // dynamic per-caller resolution (and any pinned-but-unavailable connection)
+  // stays visible for an assignment made without a local install.
   const isPlaywright = isPlaywrightCatalogItem(catalogItem.id);
+  // A desktop MCP server has nothing to choose: one plain line says where
+  // its tools run.
+  const isDesktop = isDesktopCatalogType(catalogItem.serverType);
   const showCredentialSelector =
-    catalogItem.serverType !== "builtin" &&
+    !isCredentialLessCatalogType(catalogItem.serverType) &&
     !isPlaywright &&
-    mcpServers.length > 0;
+    !isDesktop;
   return (
-    <Popover
+    <McpServerPillShell
+      icon={
+        <McpCatalogIcon
+          icon={catalogItem.iconUrl ?? catalogItem.icon}
+          catalogId={catalogItem.id}
+          size={14}
+        />
+      }
+      readOnly={readOnly}
+      displayName={displayName}
+      count={displayedCount}
+      isEmpty={isEmpty}
+      highlighted={hasPendingChanges}
+      description={catalogItem.description}
+      docsUrl={catalogItem.docsUrl}
       open={open}
       onOpenChange={(v) => {
         setOpen(v);
         if (v) setChangedInSession(false);
       }}
-      modal
+      onRemove={() => onRemove(catalogItem.id)}
+      removeAriaLabel={`Remove ${catalogItem.name}`}
+      triggerTestId={getAgentToolCatalogPillTestId(catalogItem.name)}
     >
-      <div className="flex items-center">
-        <PopoverTrigger asChild>
-          <Button
-            variant="outline"
-            size="sm"
-            className={cn(
-              "h-8 px-3 gap-1.5 text-xs",
-              isEmpty && "border-dashed opacity-50",
-              isEmpty && "rounded-r-none border-r-0",
-              hasPendingChanges && "border-primary opacity-100",
-            )}
-            data-testid={getAgentToolCatalogPillTestId(catalogItem.name)}
-          >
-            <McpCatalogIcon
-              icon={catalogItem.icon}
-              catalogId={catalogItem.id}
-              size={14}
-            />
-            <span className="font-medium">{displayName}</span>
-            <span className="text-muted-foreground">({displayedCount})</span>
-            <Pencil className="h-3 w-3 shrink-0 text-muted-foreground" />
-          </Button>
-        </PopoverTrigger>
-        {isEmpty && (
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-8 w-8 p-0 rounded-l-none border-dashed opacity-50 hover:opacity-100"
-            onClick={(e) => {
-              e.stopPropagation();
-              onRemove(catalogItem.id);
+      {isDesktop && (
+        <p className="shrink-0 border-b p-4 text-sm text-pretty text-muted-foreground">
+          {desktopToolsRunNote(displayName)}
+        </p>
+      )}
+      {showCredentialSelector && (
+        <div className="p-4 border-b space-y-2 shrink-0">
+          <Label className="text-sm font-medium">Connect on behalf of</Label>
+          <TokenSelect
+            catalogId={catalogItem.id}
+            assignmentScope={assignmentScope}
+            assignmentTeamIds={assignmentTeamIds}
+            value={selectedCredential}
+            onValueChange={setSelectedCredential}
+            shouldSetDefaultValue={false}
+            prefersEnterpriseManaged={prefersEnterpriseManaged}
+          />
+        </div>
+      )}
+
+      {isLoadingTools ? (
+        <div className="p-4 flex items-center gap-2 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          <span>Loading tools...</span>
+        </div>
+      ) : totalCount === 0 ? (
+        <div className="p-4 text-sm text-muted-foreground">
+          <span>No tools available for this server.</span>
+        </div>
+      ) : (
+        <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+          <ToolChecklist
+            tools={allTools}
+            catalogId={catalogItem.id}
+            selectedToolIds={selectedToolIds}
+            onSelectionChange={(ids) => {
+              setSelectedToolIds(ids);
+              setChangedInSession(true);
             }}
-            aria-label={`Remove ${catalogItem.name}`}
-          >
-            <X className="h-3 w-3" />
-          </Button>
-        )}
-      </div>
-      <PopoverContent
-        className="w-[420px] max-h-[min(500px,var(--radix-popover-content-available-height))] p-0 flex flex-col overflow-hidden"
-        side="bottom"
-        align="start"
-        sideOffset={8}
-        avoidCollisions
-        collisionPadding={16}
-      >
-        <div className="p-4 border-b flex items-start justify-between gap-2 shrink-0">
-          <div>
-            <h4 className="font-semibold">{displayName}</h4>
-            {catalogItem.description && (
-              <p className="text-sm text-muted-foreground mt-1">
-                {catalogItem.description}
-                {catalogItem.docsUrl ? (
-                  <>
-                    {" "}
-                    <CatalogDocsLink
-                      url={catalogItem.docsUrl}
-                      className="inline-flex items-center gap-1 text-primary hover:underline"
-                    />
-                  </>
-                ) : null}
-              </p>
-            )}
-          </div>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-6 w-6 p-0 shrink-0"
-            onClick={() => setOpen(false)}
-          >
-            <X className="h-4 w-4" />
+            defaultToolIds={defaultToolIds}
+          />
+        </div>
+      )}
+
+      {changedInSession && (
+        <div className="p-2 border-t shrink-0">
+          <Button size="sm" className="w-full" onClick={() => setOpen(false)}>
+            OK
           </Button>
         </div>
-
-        {/* Credential Selector */}
-        {showCredentialSelector && (
-          <div className="p-4 border-b space-y-2 shrink-0">
-            <Label className="text-sm font-medium">Connect on behalf of</Label>
-            <p className="text-xs text-muted-foreground">
-              Choose whether this tool uses a fixed server connection or
-              resolves credentials for the current caller at runtime.
-            </p>
-            <TokenSelect
-              catalogId={catalogItem.id}
-              assignmentScope={assignmentScope}
-              assignmentTeamIds={assignmentTeamIds}
-              value={selectedCredential}
-              onValueChange={setSelectedCredential}
-              shouldSetDefaultValue={false}
-              prefersEnterpriseManaged={prefersEnterpriseManaged}
-            />
-          </div>
-        )}
-
-        {/* Tool Checklist */}
-        {isLoadingTools ? (
-          <div className="p-4 flex items-center gap-2 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            <span>Loading tools...</span>
-          </div>
-        ) : totalCount === 0 ? (
-          <div className="p-4 text-sm text-muted-foreground">
-            No tools available for this server.
-          </div>
-        ) : (
-          <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
-            <ToolChecklist
-              tools={allTools}
-              selectedToolIds={selectedToolIds}
-              onSelectionChange={(ids) => {
-                setSelectedToolIds(ids);
-                setChangedInSession(true);
-              }}
-            />
-          </div>
-        )}
-
-        {changedInSession && (
-          <div className="p-2 border-t shrink-0">
-            <Button size="sm" className="w-full" onClick={() => setOpen(false)}>
-              OK
-            </Button>
-          </div>
-        )}
-      </PopoverContent>
-    </Popover>
+      )}
+    </McpServerPillShell>
   );
 }
 
 export interface ToolChecklistProps {
   tools: CatalogTool[];
+  catalogId?: string;
   selectedToolIds: Set<string>;
   onSelectionChange: (selectedIds: Set<string>) => void;
+  /**
+   * What a checked row means. "assign" (default) keeps the neutral
+   * selection language; "disable" is the exclusions editor, where checked
+   * tools are disabled for the agent — counts, bulk buttons, and row
+   * styling all say so.
+   */
+  variant?: "assign" | "disable";
+  /**
+   * The creation-default tool IDs for servers that have such a subset (the
+   * built-in Archestra catalog). When provided and non-empty, the header gains
+   * a "Reset to defaults" action that replaces the whole selection with
+   * exactly this set — unlike Select All/Deselect All it ignores any active
+   * search filter, since a partial reset is not a reset.
+   */
+  defaultToolIds?: Set<string>;
 }
 
 function formatToolName(toolName: string) {
@@ -1015,7 +1444,7 @@ function ExpandableDescription({ description }: { description: string }) {
         {description}
       </div>
       {isTruncated && !expanded && (
-        <button
+        <UnstyledButton
           type="button"
           className="text-primary hover:underline mt-0.5"
           onClick={(e) => {
@@ -1025,10 +1454,10 @@ function ExpandableDescription({ description }: { description: string }) {
           }}
         >
           Show more...
-        </button>
+        </UnstyledButton>
       )}
       {expanded && (
-        <button
+        <UnstyledButton
           type="button"
           className="text-primary hover:underline mt-0.5"
           onClick={(e) => {
@@ -1038,18 +1467,173 @@ function ExpandableDescription({ description }: { description: string }) {
           }}
         >
           Show less
-        </button>
+        </UnstyledButton>
       )}
     </div>
   );
 }
 
+function ToolRow({
+  tool,
+  isSelected,
+  disableVariant,
+  onToggle,
+  locked = false,
+}: {
+  tool: CatalogTool;
+  isSelected: boolean;
+  disableVariant: boolean;
+  onToggle: (toolId: string) => void;
+  locked?: boolean;
+}) {
+  const toolName = formatToolName(tool.name);
+  return (
+    <label
+      htmlFor={`tool-${tool.id}`}
+      className={cn(
+        "flex items-start gap-3 p-2 rounded-md transition-colors",
+        locked ? "cursor-default" : "cursor-pointer",
+        !isSelected && "hover:bg-muted/50",
+        isSelected && (disableVariant ? "bg-destructive/10" : "bg-primary/10"),
+      )}
+    >
+      <Checkbox
+        id={`tool-${tool.id}`}
+        checked={isSelected}
+        disabled={locked}
+        onCheckedChange={() => onToggle(tool.id)}
+        className="mt-0.5"
+      />
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <div className="text-sm font-medium">{toolName}</div>
+          {disableVariant && isSelected && (
+            <Badge
+              variant="outline"
+              className="border-destructive/40 text-destructive px-1.5 py-0"
+            >
+              Disabled
+            </Badge>
+          )}
+          {locked && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Badge
+                  variant="secondary"
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Required: ${requiredToolReason(toolName)}`}
+                >
+                  Required
+                </Badge>
+              </TooltipTrigger>
+              <TooltipContent>{requiredToolReason(toolName)}</TooltipContent>
+            </Tooltip>
+          )}
+        </div>
+        {tool.description && (
+          <ExpandableDescription description={tool.description} />
+        )}
+      </div>
+    </label>
+  );
+}
+
+function requiredToolReason(toolName: string) {
+  switch (toolName) {
+    case "get_remedy_plans":
+      return "Always available so agents can find remedies for blocked calls.";
+    case "execute_remedy_plan":
+      return "Always available so agents can apply an offered remedy.";
+    case "yell":
+      return "Always available so agents can report confusing OpenAPPA decisions.";
+    default:
+      return "Always available for OpenAPPA recovery.";
+  }
+}
+
+const OTHER_GROUP_ID = "__other__";
+const KNOWN_GROUP_IDS = new Set<string>(
+  ARCHESTRA_TOOL_GROUPS.map((group) => group.id),
+);
+
+/**
+ * Section id a tool renders under. A tool with no group or an unrecognized one
+ * (an external MCP tool, or a newer server group id this build doesn't know
+ * yet) maps to "Other" — never dropped, since only rendered sections are
+ * reachable. Single source for both bucketing and header counts so a body and
+ * its count can't diverge.
+ */
+function toolGroupKey(tool: CatalogTool): string {
+  return tool.group && KNOWN_GROUP_IDS.has(tool.group)
+    ? tool.group
+    : OTHER_GROUP_ID;
+}
+
+/**
+ * Buckets tools into domain sections in canonical `ARCHESTRA_TOOL_GROUPS`
+ * order. Empty groups are omitted; the "Other" section is appended last when
+ * non-empty.
+ */
+function bucketToolsByGroup(
+  tools: CatalogTool[],
+): { id: string; label: string; tools: CatalogTool[] }[] {
+  const byGroup = new Map<string, CatalogTool[]>();
+  for (const tool of tools) {
+    const key = toolGroupKey(tool);
+    const bucket = byGroup.get(key);
+    if (bucket) {
+      bucket.push(tool);
+    } else {
+      byGroup.set(key, [tool]);
+    }
+  }
+
+  const sections: { id: string; label: string; tools: CatalogTool[] }[] = [];
+  for (const group of ARCHESTRA_TOOL_GROUPS) {
+    const groupTools = byGroup.get(group.id);
+    if (groupTools && groupTools.length > 0) {
+      sections.push({ id: group.id, label: group.label, tools: groupTools });
+    }
+  }
+  const otherTools = byGroup.get(OTHER_GROUP_ID);
+  if (otherTools && otherTools.length > 0) {
+    sections.push({ id: OTHER_GROUP_ID, label: "Other", tools: otherTools });
+  }
+  return sections;
+}
+
 export function ToolChecklist({
   tools,
+  catalogId,
   selectedToolIds,
   onSelectionChange,
+  variant = "assign",
+  defaultToolIds,
 }: ToolChecklistProps) {
   const [searchQuery, setSearchQuery] = useState("");
+  const disableVariant = variant === "disable";
+  const protectedToolIds = new Set(
+    catalogId === ARCHESTRA_MCP_CATALOG_ID && !disableVariant
+      ? tools
+          .filter((tool) =>
+            isRequiredOpenAppaToolShortName(
+              parseFullToolName(tool.name).toolName,
+            ),
+          )
+          .map((tool) => tool.id)
+      : [],
+  );
+
+  // Hidden when the set is empty so the action can never reset to zero tools.
+  const effectiveDefaultToolIds = new Set([
+    ...(defaultToolIds ?? []),
+    ...protectedToolIds,
+  ]);
+  const showResetToDefaults = defaultToolIds != null && defaultToolIds.size > 0;
+  const selectionAtDefaults =
+    defaultToolIds != null &&
+    setsEqual(selectedToolIds, effectiveDefaultToolIds);
 
   // Snapshot the initial selection for sort order so tools don't jump
   // around as the user toggles checkboxes. Updates synchronously during
@@ -1069,11 +1653,12 @@ export function ToolChecklist({
     selectedToolIds.has(tool.id),
   );
   const noneSelected = filteredTools.every(
-    (tool) => !selectedToolIds.has(tool.id),
+    (tool) => !selectedToolIds.has(tool.id) || protectedToolIds.has(tool.id),
   );
   const selectedCount = tools.filter((t) => selectedToolIds.has(t.id)).length;
 
   const handleToggle = (toolId: string) => {
+    if (protectedToolIds.has(toolId)) return;
     const newSet = new Set(selectedToolIds);
     if (newSet.has(toolId)) {
       newSet.delete(toolId);
@@ -1094,36 +1679,103 @@ export function ToolChecklist({
   const handleDeselectAll = () => {
     const newSet = new Set(selectedToolIds);
     for (const tool of filteredTools) {
+      if (protectedToolIds.has(tool.id)) continue;
       newSet.delete(tool.id);
     }
     onSelectionChange(newSet);
+  };
+
+  const setToolsSelected = (groupTools: CatalogTool[], selected: boolean) => {
+    const newSet = new Set(selectedToolIds);
+    for (const tool of groupTools) {
+      if (!selected && protectedToolIds.has(tool.id)) continue;
+      if (selected) {
+        newSet.add(tool.id);
+      } else {
+        newSet.delete(tool.id);
+      }
+    }
+    onSelectionChange(newSet);
+  };
+
+  // Built-in Archestra tools carry a domain group; render collapsible sections
+  // when at least one does. External MCP tools have none, so the flat list
+  // stays the fallback. Counts use the full group (stable while searching);
+  // section select-all/clear act on the group's currently visible tools.
+  const grouped = tools.some((tool) => tool.group);
+  const sections = useMemo(
+    () => (grouped ? bucketToolsByGroup(filteredTools) : []),
+    [grouped, filteredTools],
+  );
+  const fullGroupTotals = useMemo(() => {
+    const totals = new Map<string, { total: number; selected: number }>();
+    if (!grouped) return totals;
+    for (const tool of tools) {
+      const key = toolGroupKey(tool);
+      const entry = totals.get(key) ?? { total: 0, selected: 0 };
+      entry.total += 1;
+      if (selectedToolIds.has(tool.id)) entry.selected += 1;
+      totals.set(key, entry);
+    }
+    return totals;
+  }, [grouped, tools, selectedToolIds]);
+
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(
+    // Collapsed by default: the per-section count is the scannable summary.
+    () =>
+      new Set([
+        ...ARCHESTRA_TOOL_GROUPS.map((group) => group.id),
+        OTHER_GROUP_ID,
+      ]),
+  );
+  const isSearching = searchQuery.trim().length > 0;
+  const toggleGroup = (groupId: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupId)) {
+        next.delete(groupId);
+      } else {
+        next.add(groupId);
+      }
+      return next;
+    });
   };
 
   return (
     <div className="flex flex-col min-h-0 flex-1">
       <div className="px-4 py-2 border-b flex items-center justify-between bg-muted/30 shrink-0">
         <span className="text-xs text-muted-foreground">
-          {selectedCount} of {tools.length} selected
+          {selectedCount} of {tools.length}{" "}
+          {disableVariant ? "disabled" : "selected"}
         </span>
         <div className="flex gap-1">
           <Button
             variant="ghost"
-            size="sm"
-            className="text-xs h-6 px-2"
+            size="xs"
             onClick={handleSelectAll}
             disabled={allSelected}
           >
-            Select All
+            {disableVariant ? "Disable all" : "Select All"}
           </Button>
           <Button
             variant="ghost"
-            size="sm"
-            className="text-xs h-6 px-2"
+            size="xs"
             onClick={handleDeselectAll}
             disabled={noneSelected}
           >
-            Deselect All
+            {disableVariant ? "Enable all" : "Deselect All"}
           </Button>
+          {showResetToDefaults && (
+            <Button
+              variant="ghost"
+              size="xs"
+              onClick={() => onSelectionChange(effectiveDefaultToolIds)}
+              disabled={selectionAtDefaults}
+              title="Replace the selection with the default set assigned at creation"
+            >
+              Reset to defaults
+            </Button>
+          )}
         </div>
       </div>
       {tools.length > 5 && (
@@ -1135,47 +1787,120 @@ export function ToolChecklist({
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="h-7 pl-7 text-xs"
+              aria-label="Search tools"
             />
           </div>
         </div>
       )}
       <div className="flex-1 min-h-0 overflow-y-auto">
-        <div className="p-2 space-y-0.5">
-          {filteredTools.length === 0 ? (
-            <div className="text-center py-4 text-sm text-muted-foreground">
-              No tools match your search
-            </div>
-          ) : (
-            filteredTools.map((tool) => {
-              const toolName = formatToolName(tool.name);
-              const isSelected = selectedToolIds.has(tool.id);
-
-              return (
-                <label
-                  key={tool.id}
-                  htmlFor={`tool-${tool.id}`}
-                  className={cn(
-                    "flex items-start gap-3 p-2 rounded-md transition-colors cursor-pointer",
-                    isSelected ? "bg-primary/10" : "hover:bg-muted/50",
-                  )}
-                >
-                  <Checkbox
-                    id={`tool-${tool.id}`}
-                    checked={isSelected}
-                    onCheckedChange={() => handleToggle(tool.id)}
-                    className="mt-0.5"
-                  />
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium">{toolName}</div>
-                    {tool.description && (
-                      <ExpandableDescription description={tool.description} />
+        {grouped ? (
+          <div className="p-2 space-y-1">
+            {sections.length === 0 ? (
+              <div className="text-center py-4 text-sm text-muted-foreground">
+                No tools match your search
+              </div>
+            ) : (
+              sections.map((section) => {
+                const totals = fullGroupTotals.get(section.id) ?? {
+                  total: section.tools.length,
+                  selected: 0,
+                };
+                // While searching, keep matching sections open so results show.
+                const expanded =
+                  isSearching || !collapsedGroups.has(section.id);
+                const allGroupSelected = section.tools.every((tool) =>
+                  selectedToolIds.has(tool.id),
+                );
+                const noneGroupSelected = section.tools.every(
+                  (tool) =>
+                    !selectedToolIds.has(tool.id) ||
+                    protectedToolIds.has(tool.id),
+                );
+                return (
+                  <div
+                    key={section.id}
+                    className="rounded-md border overflow-hidden"
+                  >
+                    <div className="flex items-center justify-between gap-2 px-2 py-1.5 bg-muted/40">
+                      <UnstyledButton
+                        type="button"
+                        onClick={() => toggleGroup(section.id)}
+                        disabled={isSearching}
+                        aria-expanded={expanded}
+                        className="flex items-center gap-1.5 min-w-0 disabled:cursor-default"
+                      >
+                        {expanded ? (
+                          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                        ) : (
+                          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                        )}
+                        <span className="text-xs font-semibold truncate">
+                          {section.label}
+                        </span>
+                        <span className="text-xs text-muted-foreground shrink-0">
+                          {totals.selected}/{totals.total}
+                        </span>
+                      </UnstyledButton>
+                      <div className="flex gap-1 shrink-0">
+                        <Button
+                          variant="ghost"
+                          size="xs"
+                          onClick={() => setToolsSelected(section.tools, true)}
+                          disabled={allGroupSelected}
+                          aria-label={`${disableVariant ? "Disable all" : "Select all"} ${section.label} tools`}
+                        >
+                          {disableVariant ? "Disable all" : "Select all"}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="xs"
+                          onClick={() => setToolsSelected(section.tools, false)}
+                          disabled={noneGroupSelected}
+                          aria-label={`${disableVariant ? "Enable all" : "Clear"} ${section.label} tools`}
+                        >
+                          {disableVariant ? "Enable all" : "Clear"}
+                        </Button>
+                      </div>
+                    </div>
+                    {expanded && (
+                      <div className="p-1 space-y-0.5">
+                        {section.tools.map((tool) => (
+                          <ToolRow
+                            key={tool.id}
+                            tool={tool}
+                            isSelected={selectedToolIds.has(tool.id)}
+                            disableVariant={disableVariant}
+                            locked={protectedToolIds.has(tool.id)}
+                            onToggle={handleToggle}
+                          />
+                        ))}
+                      </div>
                     )}
                   </div>
-                </label>
-              );
-            })
-          )}
-        </div>
+                );
+              })
+            )}
+          </div>
+        ) : (
+          <div className="p-2 space-y-0.5">
+            {filteredTools.length === 0 ? (
+              <div className="text-center py-4 text-sm text-muted-foreground">
+                No tools match your search
+              </div>
+            ) : (
+              filteredTools.map((tool) => (
+                <ToolRow
+                  key={tool.id}
+                  tool={tool}
+                  isSelected={selectedToolIds.has(tool.id)}
+                  disableVariant={disableVariant}
+                  locked={protectedToolIds.has(tool.id)}
+                  onToggle={handleToggle}
+                />
+              ))
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

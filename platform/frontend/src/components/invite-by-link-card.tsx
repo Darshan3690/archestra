@@ -1,18 +1,26 @@
 "use client";
 
-import { type AnyRoleName, E2eTestId, MEMBER_ROLE_NAME } from "@shared";
+import {
+  type AnyRoleName,
+  E2eTestId,
+  MEMBER_ROLE_NAME,
+} from "@archestra/shared";
 import { QueryErrorResetBoundary } from "@tanstack/react-query";
 import { Check, Copy, Loader2 } from "lucide-react";
 import { useCallback, useState } from "react";
 import { ErrorBoundary } from "react-error-boundary";
 import { toast } from "sonner";
+import { RoleAssignmentBlockedNotice } from "@/components/role-assignment-blocked-notice";
 import { Button } from "@/components/ui/button";
 import { DialogForm, DialogStickyFooter } from "@/components/ui/dialog";
+import { FieldDescription } from "@/components/ui/field-description";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { PermissionButton } from "@/components/ui/permission-button";
 import { RoleSelect } from "@/components/ui/role-select";
+import { copyToClipboard } from "@/lib/clipboard";
 import { useCreateInvitation } from "@/lib/organization.query";
+import { formatRoleName } from "@/lib/utils/role";
 
 interface InviteByLinkCardProps {
   organizationId?: string;
@@ -34,7 +42,10 @@ function InviteByLinkCardContent({
   const isValidEmail = email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 
   const handleGenerateLink = useCallback(async () => {
-    const data = await createMutation.mutateAsync({ email, role });
+    // A refused role shows as a notice under the Roles field.
+    const data = await createMutation
+      .mutateAsync({ email, role })
+      .catch(() => null);
     const initialName = email
       .split("@")[0]
       .split(".")
@@ -51,7 +62,7 @@ function InviteByLinkCardContent({
   const handleCopyLink = useCallback(async () => {
     if (!invitationLink) return;
 
-    await navigator.clipboard.writeText(invitationLink);
+    await copyToClipboard(invitationLink);
     setIsCopied(true);
     toast.success("Link copied", {
       description: "Invitation link copied to clipboard",
@@ -74,6 +85,9 @@ function InviteByLinkCardContent({
           <>
             <div className="space-y-2">
               <Label htmlFor="email">Email Address</Label>
+              <FieldDescription>
+                The email of the person you want to invite
+              </FieldDescription>
               <Input
                 id="email"
                 type="email"
@@ -83,38 +97,43 @@ function InviteByLinkCardContent({
                 disabled={createMutation.isPending}
                 data-testid={E2eTestId.InviteEmailInput}
               />
-              {email && !isValidEmail ? (
+              {email && !isValidEmail && (
                 <p className="text-xs text-destructive">
                   Please enter a valid email address
-                </p>
-              ) : (
-                <p className="text-xs text-muted-foreground">
-                  The email of the person you want to invite
                 </p>
               )}
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="role">Role</Label>
+              <Label htmlFor="role">Roles</Label>
               <RoleSelect
+                multiple
                 id="role"
                 value={role}
-                onValueChange={(value) => setRole(value as AnyRoleName)}
+                onValueChange={(value) => {
+                  setRole(value as AnyRoleName);
+                  createMutation.reset();
+                }}
                 disabled={createMutation.isPending}
                 placeholder="Select a role"
                 data-testid={E2eTestId.InviteRoleSelect}
                 className="w-full"
               />
-              <p className="text-xs text-muted-foreground">
-                The role this person will have in your organization
-              </p>
+              <FieldDescription>
+                The roles this person will have in your organization
+              </FieldDescription>
             </div>
+            <RoleAssignmentBlockedNotice
+              error={createMutation.error}
+              name={formatRoleName(role)}
+            />
           </>
         ) : (
           <div className="space-y-2">
             <Label>Invitation Link</Label>
             <div className="flex items-center gap-2">
               <Input
+                aria-label="Invitation link"
                 value={invitationLink}
                 readOnly
                 className="flex-1"
@@ -125,6 +144,7 @@ function InviteByLinkCardContent({
                 size="icon"
                 variant="outline"
                 onClick={handleCopyLink}
+                aria-label="Copy invitation link"
                 data-testid={E2eTestId.InvitationLinkCopyButton}
               >
                 {isCopied ? (
@@ -134,10 +154,11 @@ function InviteByLinkCardContent({
                 )}
               </Button>
             </div>
-            <p className="text-xs text-muted-foreground">
+            <FieldDescription>
               Share this link with <span className="font-medium">{email}</span>{" "}
-              to invite them as a <span className="font-medium">{role}</span>
-            </p>
+              with these roles:{" "}
+              <span className="font-medium">{formatRoleName(role)}</span>
+            </FieldDescription>
           </div>
         )}
       </div>
@@ -153,7 +174,7 @@ function InviteByLinkCardContent({
               ) : (
                 <Copy className="h-4 w-4" />
               )}
-              Copy Link
+              <span>Copy Link</span>
             </Button>
           </>
         ) : (
@@ -168,7 +189,7 @@ function InviteByLinkCardContent({
               {createMutation.isPending && (
                 <Loader2 className="h-4 w-4 animate-spin" />
               )}
-              Generate Invitation Link
+              <span>Generate Invitation Link</span>
             </PermissionButton>
           </>
         )}

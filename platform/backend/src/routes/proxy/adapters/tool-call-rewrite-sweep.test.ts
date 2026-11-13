@@ -1,0 +1,1157 @@
+/**
+ * `formatToolCallsSSE` / `withRewrittenToolCalls` across every remaining wire
+ * format — the adapter halves of the proxy's dispatch-mode repair (see
+ * `planDispatchModeToolCallRewrites`). tool-call-rewrite.test.ts covers the
+ * OpenAI chat, Anthropic and ZhipuAI shapes; this file covers the rest.
+ *
+ * Each case pins the frame a real client of that wire format needs in order to
+ * accumulate the rewritten call — because a malformed stream here fails
+ * silently (the client drops it or reconstructs the wrong turn) rather than
+ * throwing anywhere a test would notice.
+ */
+
+import type { GenerateContentResponse } from "@google/genai";
+import { EventStreamCodec } from "@smithy/eventstream-codec";
+import { fromUtf8, toUtf8 } from "@smithy/util-utf8";
+import { describe, expect, test } from "vitest";
+import type { Anthropic, Bedrock, Gemini, OpenAi } from "@/types";
+import { anthropicAdapterFactory } from "./anthropic";
+import { azureResponsesAdapterFactory } from "./azure-responses";
+import { bedrockAdapterFactory } from "./bedrock";
+import { makeBedrockOpenaiAdapterFactory } from "./bedrock-openai";
+import { cohereAdapterFactory } from "./cohere";
+import { geminiAdapterFactory } from "./gemini";
+import { minimaxAdapterFactory } from "./minimax";
+import { ollamaNativeAdapterFactory } from "./ollama-native";
+import { openaiAdapterFactory } from "./openai";
+import { openAiResponsesAdapterFactory } from "./openai-responses";
+import { makeResponsesFromChatAdapterFactory } from "./openai-responses-from-chat";
+
+const eventStreamCodec = new EventStreamCodec(toUtf8, fromUtf8);
+
+const REWRITTEN = [
+  {
+    id: "call_0",
+    name: "archestra__run_tool",
+    arguments: JSON.stringify({
+      tool_name: "gh-developer-agent__pull_request_read",
+      tool_args: { pullNumber: 7 },
+    }),
+  },
+];
+const REWRITTEN_ARGS_OBJECT = JSON.parse(REWRITTEN[0].arguments);
+
+/** `data: {...}` payloads out of SSE frames (strings or UTF-8 bytes). */
+function sseData<TFrame>(frames: (string | Uint8Array)[]): TFrame[] {
+  return frames
+    .map((frame) =>
+      typeof frame === "string" ? frame : new TextDecoder().decode(frame),
+    )
+    .flatMap((frame) => frame.split("\n"))
+    .filter((line) => line.startsWith("data: "))
+    .map((line) => line.slice("data: ".length))
+    .filter((payload) => payload !== "[DONE]")
+    .map((payload) => JSON.parse(payload) as TFrame);
+}
+
+/** One NDJSON line per element. */
+function ndjson<TFrame>(frames: (string | Uint8Array)[]): TFrame[] {
+  return frames
+    .map(String)
+    .flatMap((frame) => frame.split("\n"))
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as TFrame);
+}
+
+type ResponsesFrame = {
+  type: string;
+  item_id?: string;
+  output_index?: number;
+  item?: {
+    id?: string;
+    type: string;
+    call_id?: string;
+    name?: string;
+    arguments?: string;
+    input?: string;
+  };
+  delta?: string;
+  input?: string;
+  name?: string;
+  arguments?: string;
+  response?: {
+    output: Array<{
+      id?: string;
+      type: string;
+      name?: string;
+      call_id?: string;
+      arguments?: string;
+      input?: string;
+    }>;
+  };
+};
+
+// ---------------------------------------------------------------------------
+// Responses API — native OpenAI and Azure (same code path), plus the
+// Responses-from-chat translator.
+// ---------------------------------------------------------------------------
+describe.each([
+  ["OpenAI Responses", openAiResponsesAdapterFactory],
+  ["Azure Responses", azureResponsesAdapterFactory],
+] as const)("%s formatToolCallsSSE", (_label, factory) => {
+  test("emits the four call frames and a trailing completed envelope naming the rewrite", () => {
+    const adapter = factory.createStreamAdapter();
+    // What the upstream already streamed: a completed envelope naming the
+    // ORIGINAL call. The client keeps the last completed envelope it sees.
+    adapter.processChunk({
+      type: "response.completed",
+      sequence_number: 1,
+      response: {
+        id: "resp_1",
+        object: "response",
+        created_at: 0,
+        model: "gpt-x",
+        status: "completed",
+        output: [
+          {
+            id: "fc_orig",
+            call_id: "call_0",
+            type: "function_call",
+            name: "gh-developer-agent__pull_request_read",
+            arguments: '{"pullNumber":7}',
+            status: "completed",
+          },
+        ],
+      },
+    } as never);
+
+    const events = sseData<ResponsesFrame>(
+      adapter.formatToolCallsSSE?.(REWRITTEN) ?? [],
+    );
+
+    expect(events.map((e) => e.type)).toEqual([
+      "response.output_item.added",
+      "response.function_call_arguments.delta",
+      "response.function_call_arguments.done",
+      "response.output_item.done",
+      "response.completed",
+    ]);
+    expect(events[0].item).toMatchObject({
+      type: "function_call",
+      call_id: "call_0",
+      name: "archestra__run_tool",
+    });
+    expect(events[1].delta).toBe(REWRITTEN[0].arguments);
+    expect(events[3].item?.arguments).toBe(REWRITTEN[0].arguments);
+
+    // The envelope the client reconstructs from must name the rewrite — and
+    // keep the call id, which the client's tool result is correlated by.
+    const completed = events[4].response?.output ?? [];
+    expect(completed).toHaveLength(1);
+    expect(completed[0]).toMatchObject({
+      type: "function_call",
+      call_id: "call_0",
+      name: "archestra__run_tool",
+    });
+
+    // And the persisted turn matches the client's view.
+    const persisted = adapter.toProviderResponse() as {
+      output: Array<{ name?: string }>;
+    };
+    expect(persisted.output[0].name).toBe("archestra__run_tool");
+  });
+
+  test.each([
+    ["the completed envelope", true],
+    ["what was streamed", false],
+  ] as const)("re-emits a namespaced call under its namespace, known from %s", (_source, withEnvelope) => {
+    // Codex declares its MCP servers' tools in namespaces and routes a call by
+    // the namespace the streamed item names; without it the call reaches no
+    // tool ("unsupported call").
+    const adapter = factory.createStreamAdapter();
+    const upstreamCall = {
+      id: "fc_orig",
+      call_id: "call_0",
+      type: "function_call",
+      name: "archestra__execute_remedy_plan",
+      arguments: '{"offer_id":"offer-1"}',
+      namespace: "mcp__my_gateway",
+    };
+    adapter.processChunk({
+      type: "response.output_item.added",
+      output_index: 0,
+      sequence_number: 1,
+      item: { ...upstreamCall, arguments: "", status: "in_progress" },
+    } as never);
+    if (withEnvelope) {
+      adapter.processChunk({
+        type: "response.completed",
+        sequence_number: 2,
+        response: {
+          id: "resp_1",
+          object: "response",
+          created_at: 0,
+          model: "gpt-x",
+          status: "completed",
+          output: [{ ...upstreamCall, status: "completed" }],
+        },
+      } as never);
+    }
+    const rewritten = [
+      {
+        id: "call_0",
+        name: "archestra__execute_remedy_plan",
+        arguments: '{"offer_id":"offer-1","execution":{"v":1}}',
+      },
+    ];
+
+    const events = sseData<ResponsesFrame & { item?: { namespace?: string } }>(
+      adapter.formatToolCallsSSE?.(rewritten) ?? [],
+    );
+
+    const items = events.filter((event) => event.item);
+    expect(items.map((event) => event.type)).toEqual([
+      "response.output_item.added",
+      "response.output_item.done",
+    ]);
+    for (const event of items) {
+      expect(event.item).toMatchObject({
+        call_id: "call_0",
+        namespace: "mcp__my_gateway",
+      });
+    }
+  });
+
+  test("non-streaming: rewrites the function_call item in place by call_id", () => {
+    const adapter = factory.createResponseAdapter({
+      id: "resp_1",
+      object: "response",
+      created_at: 0,
+      model: "gpt-x",
+      status: "completed",
+      output: [
+        {
+          id: "msg_1",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "On it.", annotations: [] }],
+        },
+        {
+          id: "fc_orig",
+          call_id: "call_0",
+          type: "function_call",
+          name: "gh-developer-agent__pull_request_read",
+          arguments: '{"pullNumber":7}',
+          status: "completed",
+        },
+      ],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    } as never);
+
+    const rewritten = adapter.withRewrittenToolCalls?.(REWRITTEN) as {
+      output: Array<{ type: string; name?: string; call_id?: string }>;
+    };
+
+    expect(rewritten.output.map((item) => item.type)).toEqual([
+      "message",
+      "function_call",
+    ]);
+    expect(rewritten.output[1]).toMatchObject({
+      call_id: "call_0",
+      name: "archestra__run_tool",
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Responses API — a batch mixing a DENIED custom tool call with an ALLOWED one.
+//
+// A custom tool is called with free-form text; the denial notice that replaces
+// a refused call is an ordinary function tool. So a rewritten custom call has
+// to change shape on the wire, and an untouched one must not — a client that
+// registered `shell` as a custom tool cannot execute it as a function call.
+// ---------------------------------------------------------------------------
+
+/** The notice's own arguments: JSON, because the notice tool is a function. */
+const NOTICE_ARGUMENTS = JSON.stringify({
+  tool: "apply_patch",
+  arguments: { input: "*** Begin Patch" },
+  ruling: "[appa] Blocked: this call cannot run yet.",
+  notice: { v: 1, call_id: "call_denied", custom: true },
+});
+const MIXED_REWRITE = [
+  {
+    id: "call_denied",
+    name: "archestra__get_remedy_plans",
+    arguments: NOTICE_ARGUMENTS,
+  },
+  // Untouched: the proxy carries a custom call's one argument as `input`.
+  {
+    id: "call_allowed",
+    name: "shell",
+    arguments: JSON.stringify({ input: "ls -la" }),
+  },
+];
+const MIXED_UPSTREAM_OUTPUT = [
+  {
+    id: "msg_1",
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text: "Working.", annotations: [] }],
+  },
+  {
+    id: "ctc_denied",
+    call_id: "call_denied",
+    type: "custom_tool_call",
+    name: "apply_patch",
+    input: "*** Begin Patch",
+    status: "completed",
+  },
+  {
+    id: "ctc_allowed",
+    call_id: "call_allowed",
+    type: "custom_tool_call",
+    name: "shell",
+    input: "ls -la",
+    status: "completed",
+  },
+];
+
+describe.each([
+  ["OpenAI Responses", openAiResponsesAdapterFactory],
+] as const)("%s custom tool call rewrites", (_label, factory) => {
+  test("holds a streamed custom call for policy and keeps it a custom call when no completed envelope arrives", () => {
+    const adapter = factory.createStreamAdapter();
+    // The call is held, not forwarded live, from its first frame on.
+    const added = adapter.processChunk({
+      type: "response.output_item.added",
+      output_index: 0,
+      sequence_number: 1,
+      item: {
+        id: "ctc_1",
+        call_id: "call_1",
+        type: "custom_tool_call",
+        name: "apply_patch",
+        input: "",
+        status: "in_progress",
+      },
+    } as never);
+    expect(added).toMatchObject({ isToolCallChunk: true, sseData: null });
+    // Its input streams as text, piece by piece.
+    for (const delta of ["*** Begin", " Patch"]) {
+      const held = adapter.processChunk({
+        type: "response.custom_tool_call_input.delta",
+        item_id: "ctc_1",
+        output_index: 0,
+        sequence_number: 2,
+        delta,
+      } as never);
+      expect(held).toMatchObject({ isToolCallChunk: true, sseData: null });
+    }
+    // Upstream ends without a completed envelope: what was streamed is still
+    // a custom call, in the persisted response and in the frames alike.
+    const response = adapter.toProviderResponse();
+    expect(response.output).toContainEqual(
+      expect.objectContaining({
+        type: "custom_tool_call",
+        call_id: "call_1",
+        name: "apply_patch",
+        input: "*** Begin Patch",
+      }),
+    );
+    const events = sseData<ResponsesFrame>(
+      adapter.formatToolCallsSSE?.([
+        {
+          id: "call_1",
+          name: "apply_patch",
+          arguments: JSON.stringify({ input: "*** Begin Patch" }),
+        },
+      ]) ?? [],
+    );
+    expect(events[0]).toMatchObject({
+      type: "response.output_item.added",
+      item: { type: "custom_tool_call", call_id: "call_1" },
+    });
+  });
+
+  test("re-emits each call in the namespace it names, in the frames and the completed envelope", () => {
+    const adapter = factory.createStreamAdapter();
+    adapter.processChunk({
+      type: "response.output_item.added",
+      output_index: 0,
+      sequence_number: 1,
+      item: {
+        id: "fc_1",
+        call_id: "call_1",
+        type: "function_call",
+        name: "archestra__run_tool",
+        namespace: "mcp__archestra",
+        arguments: "{}",
+        status: "completed",
+      },
+    } as never);
+    adapter.processChunk({
+      type: "response.completed",
+      sequence_number: 2,
+      response: {
+        id: "resp_1",
+        model: "gpt-4.1",
+        status: "completed",
+        output: [
+          {
+            id: "fc_1",
+            call_id: "call_1",
+            type: "function_call",
+            name: "archestra__run_tool",
+            namespace: "mcp__archestra",
+            arguments: "{}",
+            status: "completed",
+          },
+        ],
+      },
+    } as never);
+
+    const events = sseData<ResponsesFrame>(
+      adapter.formatToolCallsSSE?.([
+        {
+          id: "call_1",
+          name: "archestra__get_remedy_plans",
+          arguments: "{}",
+          namespace: "mcp__archestra",
+        } as never,
+      ]) ?? [],
+    );
+    const done = events.find(
+      (event) => event.type === "response.output_item.done",
+    );
+    expect(done).toMatchObject({
+      item: {
+        name: "archestra__get_remedy_plans",
+        namespace: "mcp__archestra",
+      },
+    });
+    expect(adapter.toProviderResponse().output).toContainEqual(
+      expect.objectContaining({
+        call_id: "call_1",
+        name: "archestra__get_remedy_plans",
+        namespace: "mcp__archestra",
+      }),
+    );
+  });
+
+  test("streams the denial as a function call, the allowed call as a custom call, and a completed envelope that agrees with both", () => {
+    const adapter = factory.createStreamAdapter();
+    for (const item of MIXED_UPSTREAM_OUTPUT.slice(1)) {
+      adapter.processChunk({
+        type: "response.output_item.added",
+        output_index: MIXED_UPSTREAM_OUTPUT.indexOf(item),
+        sequence_number: 1,
+        item: { ...item, input: "", status: "in_progress" },
+      } as never);
+      adapter.processChunk({
+        type: "response.custom_tool_call_input.done",
+        item_id: item.id,
+        output_index: MIXED_UPSTREAM_OUTPUT.indexOf(item),
+        sequence_number: 2,
+        input: item.input,
+      } as never);
+    }
+    adapter.processChunk({
+      type: "response.completed",
+      sequence_number: 3,
+      response: {
+        id: "resp_mixed",
+        object: "response",
+        created_at: 0,
+        model: "gpt-x",
+        status: "completed",
+        output: MIXED_UPSTREAM_OUTPUT,
+      },
+    } as never);
+
+    const events = sseData<ResponsesFrame>(
+      adapter.formatToolCallsSSE?.(MIXED_REWRITE) ?? [],
+    );
+
+    expect(events.map((e) => e.type)).toEqual([
+      "response.output_item.added",
+      "response.function_call_arguments.delta",
+      "response.function_call_arguments.done",
+      "response.output_item.done",
+      "response.output_item.added",
+      "response.custom_tool_call_input.delta",
+      "response.custom_tool_call_input.done",
+      "response.output_item.done",
+      "response.completed",
+    ]);
+
+    // The denied call: a function call the client can actually run, under the
+    // item id upstream produced — a synthesized id would name an item the
+    // provider never sent, and the client echoes the item back next request.
+    expect(events.slice(0, 4).map((e) => e.item_id ?? e.item?.id)).toEqual([
+      "ctc_denied",
+      "ctc_denied",
+      "ctc_denied",
+      "ctc_denied",
+    ]);
+    expect(events[0].item).toMatchObject({
+      type: "function_call",
+      call_id: "call_denied",
+      name: "archestra__get_remedy_plans",
+    });
+    expect(events[1].delta).toBe(NOTICE_ARGUMENTS);
+    expect(events[3].item).toMatchObject({
+      type: "function_call",
+      arguments: NOTICE_ARGUMENTS,
+    });
+
+    // The allowed call stays a custom tool call, and its free-form input is
+    // sent as text rather than as the proxy's `{input: ...}` wrapper.
+    expect(events.slice(4, 8).map((e) => e.item_id ?? e.item?.id)).toEqual([
+      "ctc_allowed",
+      "ctc_allowed",
+      "ctc_allowed",
+      "ctc_allowed",
+    ]);
+    expect(events[4].item).toMatchObject({
+      type: "custom_tool_call",
+      call_id: "call_allowed",
+      name: "shell",
+    });
+    expect(events[5].delta).toBe("ls -la");
+    expect(events[6].input).toBe("ls -la");
+    expect(events[7].item).toMatchObject({
+      type: "custom_tool_call",
+      input: "ls -la",
+    });
+
+    // The client keeps the LAST completed envelope and reconstructs the turn
+    // from it, indexing by output_index. Every item it streamed must sit at the
+    // index the frames claimed, or the reconstruction names the wrong call.
+    const completedOutput = events[8].response?.output ?? [];
+    expect(completedOutput.map((item) => item.type)).toEqual([
+      "message",
+      "function_call",
+      "custom_tool_call",
+    ]);
+    for (const done of events.filter(
+      (event) => event.type === "response.output_item.done",
+    )) {
+      expect(completedOutput[done.output_index ?? -1]).toEqual(done.item);
+    }
+  });
+
+  test("non-streaming: the denial replaces the custom call in place, the allowed call is untouched", () => {
+    const adapter = factory.createResponseAdapter({
+      id: "resp_mixed",
+      object: "response",
+      created_at: 0,
+      model: "gpt-x",
+      status: "completed",
+      output: MIXED_UPSTREAM_OUTPUT,
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    } as never);
+
+    const rewritten = adapter.withRewrittenToolCalls?.(MIXED_REWRITE) as {
+      output: Array<{ id?: string; type: string; name?: string }>;
+    };
+
+    expect(rewritten.output.map((item) => [item.type, item.name])).toEqual([
+      ["message", undefined],
+      ["function_call", "archestra__get_remedy_plans"],
+      ["custom_tool_call", "shell"],
+    ]);
+    expect(rewritten.output[1]).toMatchObject({
+      id: "ctc_denied",
+      call_id: "call_denied",
+      arguments: NOTICE_ARGUMENTS,
+    });
+    expect(rewritten.output[2]).toEqual(MIXED_UPSTREAM_OUTPUT[2]);
+  });
+});
+
+describe("Responses-from-chat translator formatToolCallsSSE", () => {
+  const ctx = { responseId: "resp_t", createdUnix: 0, requestedModel: "gpt-x" };
+
+  test("emits the call frames then a completed envelope naming the rewrite", () => {
+    const factory = makeResponsesFromChatAdapterFactory(
+      openaiAdapterFactory,
+      ctx,
+    );
+    const adapter = factory.createStreamAdapter();
+
+    const events = sseData<ResponsesFrame>(
+      adapter.formatToolCallsSSE?.(REWRITTEN) ?? [],
+    );
+
+    expect(events.map((e) => e.type)).toEqual([
+      "response.output_item.added",
+      "response.function_call_arguments.delta",
+      "response.function_call_arguments.done",
+      "response.output_item.done",
+      "response.completed",
+    ]);
+    // Text owns output index 0 on this surface; calls start at 1.
+    expect(events[0].output_index).toBe(1);
+    expect(events[4].response?.output).toContainEqual(
+      expect.objectContaining({
+        type: "function_call",
+        call_id: "call_0",
+        name: "archestra__run_tool",
+      }),
+    );
+  });
+
+  test("non-streaming: translates the inner rewrite and logs the inner shape", () => {
+    const factory = makeResponsesFromChatAdapterFactory(
+      openaiAdapterFactory,
+      ctx,
+    );
+    const chat: OpenAi.Types.ChatCompletionsResponse = {
+      id: "chatcmpl-1",
+      object: "chat.completion",
+      created: 0,
+      model: "gpt-x",
+      choices: [
+        {
+          index: 0,
+          logprobs: null,
+          finish_reason: "tool_calls",
+          message: {
+            role: "assistant",
+            content: null,
+            refusal: null,
+            tool_calls: [
+              {
+                id: "call_0",
+                type: "function",
+                function: {
+                  name: "gh-developer-agent__pull_request_read",
+                  arguments: '{"pullNumber":7}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    };
+    const adapter = factory.createResponseAdapter(chat);
+
+    const wire = adapter.withRewrittenToolCalls?.(REWRITTEN) as unknown as {
+      output: Array<{ type: string; name?: string }>;
+    };
+    expect(wire.output).toContainEqual(
+      expect.objectContaining({
+        type: "function_call",
+        name: "archestra__run_tool",
+      }),
+    );
+
+    // The interaction log stores the inner (chat) shape — and it must be the
+    // rewritten one, not the original the provider sent.
+    const logged = adapter.getLoggedResponse?.() as typeof chat;
+    const [loggedCall] = logged.choices[0].message.tool_calls ?? [];
+    expect(loggedCall?.type === "function" && loggedCall.function.name).toBe(
+      "archestra__run_tool",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gemini
+// ---------------------------------------------------------------------------
+describe("Gemini formatToolCallsSSE / withRewrittenToolCalls", () => {
+  type GeminiFrame = {
+    candidates: Array<{
+      content: {
+        parts: Array<{ functionCall?: { name: string; args: unknown } }>;
+      };
+      finishReason?: string;
+    }>;
+  };
+
+  test("emits one chunk with a functionCall part per call and no finishReason", () => {
+    const adapter = geminiAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      candidates: [
+        {
+          index: 0,
+          content: {
+            role: "model",
+            parts: [
+              {
+                functionCall: {
+                  id: "call_0",
+                  name: "gh-developer-agent__pull_request_read",
+                  args: { pullNumber: 7 },
+                },
+              },
+            ],
+          },
+        },
+      ],
+    } as unknown as GenerateContentResponse);
+    const [event] = sseData<GeminiFrame>(
+      adapter.formatToolCallsSSE?.(REWRITTEN) ?? [],
+    );
+
+    expect(event.candidates[0].content.parts).toEqual([
+      {
+        functionCall: {
+          id: "call_0",
+          name: "archestra__run_tool",
+          args: REWRITTEN_ARGS_OBJECT,
+        },
+      },
+    ]);
+    expect(event.candidates[0].finishReason).toBeUndefined();
+  });
+
+  test("non-streaming: rewrites functionCall parts by provider identity", () => {
+    const adapter = geminiAdapterFactory.createResponseAdapter({
+      candidates: [
+        {
+          content: {
+            role: "model",
+            parts: [
+              { text: "On it." },
+              {
+                functionCall: {
+                  id: "call_0",
+                  name: "gh-developer-agent__pull_request_read",
+                  args: { pullNumber: 7 },
+                },
+              },
+            ],
+          },
+          finishReason: "STOP",
+          index: 0,
+        },
+      ],
+    } as unknown as Gemini.Types.GenerateContentResponse);
+
+    const rewritten = adapter.withRewrittenToolCalls?.(
+      REWRITTEN,
+    ) as unknown as GeminiFrame;
+    const parts = rewritten.candidates[0].content.parts;
+    expect(parts[0]).toEqual({ text: "On it." });
+    expect(parts[1].functionCall).toMatchObject({
+      id: "call_0",
+      name: "archestra__run_tool",
+      args: REWRITTEN_ARGS_OBJECT,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cohere v2
+// ---------------------------------------------------------------------------
+describe("Cohere formatToolCallsSSE / withRewrittenToolCalls", () => {
+  type CohereFrame = {
+    type: string;
+    delta?: {
+      message?: {
+        tool_calls?: {
+          id?: string;
+          function?: { name?: string; arguments?: string };
+        };
+      };
+    };
+  };
+
+  test("emits start/delta/end in the shape @ai-sdk/cohere accumulates", () => {
+    const adapter = cohereAdapterFactory.createStreamAdapter();
+    const events = sseData<CohereFrame>(
+      adapter.formatToolCallsSSE?.(REWRITTEN) ?? [],
+    );
+
+    expect(events.map((e) => e.type)).toEqual([
+      "tool-call-start",
+      "tool-call-delta",
+      "tool-call-end",
+    ]);
+    expect(events[0].delta?.message?.tool_calls).toMatchObject({
+      id: "call_0",
+      function: { name: "archestra__run_tool" },
+    });
+    expect(events[1].delta?.message?.tool_calls?.function?.arguments).toBe(
+      REWRITTEN[0].arguments,
+    );
+  });
+
+  test("non-streaming: rewrites message.tool_calls positionally", () => {
+    const adapter = cohereAdapterFactory.createResponseAdapter({
+      id: "c1",
+      finish_reason: "TOOL_CALL",
+      message: {
+        role: "assistant",
+        tool_calls: [
+          {
+            id: "call_0",
+            type: "function",
+            function: {
+              name: "gh-developer-agent__pull_request_read",
+              arguments: '{"pullNumber":7}',
+            },
+          },
+        ],
+      },
+    } as never);
+    const rewritten = adapter.withRewrittenToolCalls?.(REWRITTEN) as {
+      message: {
+        tool_calls: Array<{ id: string; function: { name: string } }>;
+      };
+    };
+    expect(rewritten.message.tool_calls[0]).toMatchObject({
+      id: "call_0",
+      function: { name: "archestra__run_tool" },
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ollama native (NDJSON)
+// ---------------------------------------------------------------------------
+describe("Ollama native formatToolCallsSSE / withRewrittenToolCalls", () => {
+  type OllamaFrame = {
+    done: boolean;
+    message: {
+      tool_calls?: Array<{ function: { name: string; arguments: unknown } }>;
+    };
+  };
+
+  test("emits one non-final line with the calls whole", () => {
+    const adapter = ollamaNativeAdapterFactory.createStreamAdapter();
+    const [line] = ndjson<OllamaFrame>(
+      adapter.formatToolCallsSSE?.(REWRITTEN) ?? [],
+    );
+
+    expect(line.done).toBe(false);
+    expect(line.message.tool_calls).toEqual([
+      {
+        id: "call_0",
+        function: {
+          name: "archestra__run_tool",
+          arguments: REWRITTEN_ARGS_OBJECT,
+        },
+      },
+    ]);
+  });
+
+  test("non-streaming: rewrites message.tool_calls positionally", () => {
+    const adapter = ollamaNativeAdapterFactory.createResponseAdapter({
+      model: "llama",
+      created_at: "0",
+      done: true,
+      message: {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          {
+            function: {
+              name: "gh-developer-agent__pull_request_read",
+              arguments: { pullNumber: 7 },
+            },
+          },
+        ],
+      },
+    } as never);
+    const rewritten = adapter.withRewrittenToolCalls?.(
+      REWRITTEN,
+    ) as unknown as OllamaFrame;
+    expect(rewritten.message.tool_calls?.[0].function).toEqual({
+      name: "archestra__run_tool",
+      arguments: REWRITTEN_ARGS_OBJECT,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Minimax (OpenAI-chat-shaped)
+// ---------------------------------------------------------------------------
+describe("Minimax formatToolCallsSSE", () => {
+  test("emits one complete tool_calls delta chunk", () => {
+    const adapter = minimaxAdapterFactory.createStreamAdapter();
+    const [event] = sseData<{
+      choices: Array<{
+        delta: {
+          tool_calls?: Array<{ id: string; function: { name: string } }>;
+        };
+        finish_reason: string | null;
+      }>;
+    }>(adapter.formatToolCallsSSE?.(REWRITTEN) ?? []);
+
+    expect(event.choices[0].delta.tool_calls?.[0]).toMatchObject({
+      id: "call_0",
+      function: { name: "archestra__run_tool" },
+    });
+    expect(event.choices[0].finish_reason).toBeNull();
+  });
+
+  test("streams the text of a chunk that also carries a call, and holds only the call", () => {
+    // Forwarding the whole chunk would hand the client a fragment of the call
+    // before the policies ruled on it, and a second copy on re-emit.
+    const adapter = minimaxAdapterFactory.createStreamAdapter();
+    const result = adapter.processChunk({
+      id: "chatcmpl-mixed",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "MiniMax-M2",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            role: "assistant",
+            content: "Delegating.",
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_0",
+                type: "function",
+                function: { name: "task", arguments: '{"prompt":"go"}' },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+    } as never);
+
+    const [forwarded] = sseData<{
+      choices: Array<{ delta: Record<string, unknown> }>;
+    }>(result.sseData ? [result.sseData] : []);
+    expect(forwarded.choices[0].delta).toEqual({
+      role: "assistant",
+      content: "Delegating.",
+    });
+    expect(result.isToolCallChunk).toBe(true);
+    const held = sseData<{
+      choices: Array<{ delta: Record<string, unknown> }>;
+    }>(adapter.getRawToolCallEvents());
+    expect(held).toHaveLength(1);
+    expect(held[0].choices[0].delta).not.toHaveProperty("content");
+    expect(held[0].choices[0].delta.tool_calls).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Anthropic — non-streaming half (streaming is in tool-call-rewrite.test.ts)
+// ---------------------------------------------------------------------------
+describe("Anthropic withRewrittenToolCalls", () => {
+  test("rewrites tool_use blocks positionally, keeping ids and text", () => {
+    const adapter = anthropicAdapterFactory.createResponseAdapter({
+      id: "msg_1",
+      type: "message",
+      role: "assistant",
+      model: "claude",
+      stop_reason: "tool_use",
+      stop_sequence: null,
+      content: [
+        { type: "text", text: "On it." },
+        {
+          type: "tool_use",
+          id: "call_0",
+          name: "gh-developer-agent__pull_request_read",
+          input: { pullNumber: 7 },
+        },
+      ],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    } as unknown as Anthropic.Types.MessagesResponse);
+
+    const rewritten = adapter.withRewrittenToolCalls?.(REWRITTEN) as {
+      content: Array<{
+        type: string;
+        id?: string;
+        name?: string;
+        input?: unknown;
+      }>;
+    };
+    expect(rewritten.content[0]).toEqual({ type: "text", text: "On it." });
+    expect(rewritten.content[1]).toMatchObject({
+      type: "tool_use",
+      id: "call_0",
+      name: "archestra__run_tool",
+      input: REWRITTEN_ARGS_OBJECT,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bedrock — Converse binary event stream, and the Converse→OpenAI translator
+// ---------------------------------------------------------------------------
+function decodeBedrockFrames(frames: (string | Uint8Array)[]) {
+  return frames.map((frame) => {
+    const decoded = eventStreamCodec.decode(frame as Uint8Array);
+    const eventType = (decoded.headers[":event-type"] as { value: string })
+      .value;
+    const bodyText =
+      typeof decoded.body === "string" ? decoded.body : toUtf8(decoded.body);
+    return { eventType, body: JSON.parse(bodyText) as Record<string, unknown> };
+  });
+}
+
+describe("Bedrock formatToolCallsSSE / withRewrittenToolCalls", () => {
+  test("emits a tool_use block per call, reusing the held block index, then the terminal events", () => {
+    const adapter = bedrockAdapterFactory.createStreamAdapter();
+    // Live turn: a held tool_use block at contentBlockIndex 1 (index 0 was
+    // text), then the terminal events the adapter buffers behind the gate.
+    adapter.processChunk({
+      contentBlockStart: {
+        contentBlockIndex: 1,
+        start: {
+          toolUse: {
+            toolUseId: "call_0",
+            name: "gh-developer-agent__pull_request_read",
+          },
+        },
+      },
+    } as never);
+    adapter.processChunk({
+      contentBlockDelta: {
+        contentBlockIndex: 1,
+        delta: { toolUse: { input: '{"pullNumber":7}' } },
+      },
+    } as never);
+    adapter.processChunk({
+      contentBlockStop: { contentBlockIndex: 1 },
+    } as never);
+    adapter.processChunk({ messageStop: { stopReason: "tool_use" } } as never);
+    adapter.processChunk({
+      metadata: { usage: { inputTokens: 1, outputTokens: 1 } },
+    } as never);
+
+    const frames = decodeBedrockFrames(
+      adapter.formatToolCallsSSE?.(REWRITTEN) ?? [],
+    );
+
+    expect(frames.map((f) => f.eventType)).toEqual([
+      "contentBlockStart",
+      "contentBlockDelta",
+      "contentBlockStop",
+      "messageStop",
+      "metadata",
+    ]);
+    // toMatchObject: the encoder adds Bedrock's `p` padding field to every
+    // event, exactly as it does for the live and refusal frames.
+    expect(frames[0].body).toMatchObject({
+      contentBlockIndex: 1,
+      start: { toolUse: { toolUseId: "call_0", name: "archestra__run_tool" } },
+    });
+    expect(frames[1].body).toMatchObject({
+      contentBlockIndex: 1,
+      delta: { toolUse: { input: REWRITTEN[0].arguments } },
+    });
+  });
+
+  test("non-streaming: rewrites toolUse blocks positionally", () => {
+    const adapter = bedrockAdapterFactory.createResponseAdapter({
+      output: {
+        message: {
+          role: "assistant",
+          content: [
+            { text: "On it." },
+            {
+              toolUse: {
+                toolUseId: "call_0",
+                name: "gh-developer-agent__pull_request_read",
+                input: { pullNumber: 7 },
+              },
+            },
+          ],
+        },
+      },
+      stopReason: "tool_use",
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    } as unknown as Bedrock.Types.ConverseResponse);
+
+    const rewritten = adapter.withRewrittenToolCalls?.(REWRITTEN) as {
+      output: {
+        message: {
+          content: Array<{
+            text?: string;
+            toolUse?: { toolUseId: string; name: string; input: unknown };
+          }>;
+        };
+      };
+    };
+    const content = rewritten.output.message.content;
+    expect(content[0]).toEqual({ text: "On it." });
+    expect(content[1].toolUse).toEqual({
+      toolUseId: "call_0",
+      name: "archestra__run_tool",
+      input: REWRITTEN_ARGS_OBJECT,
+    });
+  });
+});
+
+describe("Bedrock→OpenAI translator formatToolCallsSSE / withRewrittenToolCalls", () => {
+  const ctx = {
+    chatcmplId: "chatcmpl-b",
+    createdUnix: 0,
+    requestedModel: "m",
+    includeUsageInStream: false,
+  };
+
+  test("emits an OpenAI tool_calls delta and holds the finish reason", () => {
+    const factory = makeBedrockOpenaiAdapterFactory(ctx);
+    const adapter = factory.createStreamAdapter(undefined);
+    const events = sseData<{
+      choices: Array<{
+        delta: {
+          role?: string;
+          tool_calls?: Array<{ id: string; function: { name: string } }>;
+        };
+        finish_reason: string | null;
+      }>;
+    }>(adapter.formatToolCallsSSE?.(REWRITTEN) ?? []);
+
+    const toolCallChunk = events.find((e) => e.choices[0].delta.tool_calls);
+    expect(toolCallChunk?.choices[0].delta.tool_calls?.[0]).toMatchObject({
+      id: "call_0",
+      function: { name: "archestra__run_tool" },
+    });
+    for (const event of events) {
+      expect(event.choices[0].finish_reason).toBeNull();
+    }
+  });
+
+  test("non-streaming: client gets OpenAI shape, log gets rewritten Converse shape", () => {
+    const factory = makeBedrockOpenaiAdapterFactory(ctx);
+    const adapter = factory.createResponseAdapter({
+      output: {
+        message: {
+          role: "assistant",
+          content: [
+            {
+              toolUse: {
+                toolUseId: "call_0",
+                name: "gh-developer-agent__pull_request_read",
+                input: { pullNumber: 7 },
+              },
+            },
+          ],
+        },
+      },
+      stopReason: "tool_use",
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    } as unknown as Bedrock.Types.ConverseResponse);
+
+    const wire = adapter.withRewrittenToolCalls?.(
+      REWRITTEN,
+    ) as unknown as OpenAi.Types.ChatCompletionsResponse;
+    const [wireCall] = wire.choices[0].message.tool_calls ?? [];
+    expect(wireCall?.type === "function" && wireCall.function.name).toBe(
+      "archestra__run_tool",
+    );
+
+    const logged = adapter.getLoggedResponse?.() as unknown as {
+      output: { message: { content: Array<{ toolUse?: { name: string } }> } };
+    };
+    expect(logged.output.message.content[0].toolUse?.name).toBe(
+      "archestra__run_tool",
+    );
+  });
+});

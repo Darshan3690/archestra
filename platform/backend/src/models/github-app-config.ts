@@ -1,0 +1,97 @@
+import type { ResourcePermissionGrant } from "@archestra/shared";
+import type {
+  GithubAppConfig,
+  InsertGithubAppConfig,
+  UpdateGithubAppConfig,
+} from "@/types";
+import {
+  createSharedCredential,
+  deleteSharedCredential,
+  listSharedCredentials,
+  updateSharedCredential,
+} from "./_shared/credential-store";
+
+/** Typed GitHub access to the shared credential store. */
+export default class GithubAppConfigModel {
+  static async findByOrganization(
+    organizationId: string,
+  ): Promise<GithubAppConfig[]> {
+    return GithubAppConfigModel.findShared({ organizationId });
+  }
+  static async findByIdForOrganization(params: {
+    id: string;
+    organizationId: string;
+  }): Promise<GithubAppConfig | null> {
+    const [credential] = await GithubAppConfigModel.findShared(params);
+    return credential ?? null;
+  }
+  static async create(
+    data: InsertGithubAppConfig & {
+      /** Who reaches it besides its author; omitted, the organization does. */
+      initialPermissionGrants?: ResourcePermissionGrant[];
+    },
+    /** The user or `service-account:` actor creating it; becomes its author. */
+    createdBy: string | null = null,
+  ): Promise<GithubAppConfig> {
+    const definition = await createSharedCredential({
+      ...data,
+      kind: "github_app",
+      createdBy,
+    });
+    return {
+      id: definition.id,
+      organizationId: definition.organizationId,
+      name: definition.name,
+      secretId: data.secretId ?? null,
+      createdAt: definition.createdAt,
+      updatedAt: definition.updatedAt,
+      githubUrl: definition.githubUrl ?? "https://api.github.com",
+      appId: definition.appId ?? "",
+      installationId: definition.installationId ?? "",
+    };
+  }
+  static async update(
+    id: string,
+    data: Partial<UpdateGithubAppConfig>,
+  ): Promise<GithubAppConfig | null> {
+    const definition = await updateSharedCredential(id, data);
+    return definition
+      ? GithubAppConfigModel.findByIdForOrganization({
+          id,
+          organizationId: definition.organizationId,
+        })
+      : null;
+  }
+  static async findByIdForAudit(
+    id: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const record = await GithubAppConfigModel.findByIdForOrganization({
+      id,
+      organizationId,
+    });
+    if (!record) return null;
+    const { secretId: _secretId, ...snapshot } = record;
+    return snapshot;
+  }
+  static async delete(id: string): Promise<boolean> {
+    return deleteSharedCredential(id);
+  }
+  private static async findShared(params: {
+    organizationId: string;
+    id?: string;
+  }): Promise<GithubAppConfig[]> {
+    const rows = await listSharedCredentials({ ...params, kind: "github_app" });
+    return rows.map(({ definition, secretId }) => ({
+      id: definition.id,
+      organizationId: definition.organizationId,
+      name: definition.name,
+      secretId,
+      createdAt: definition.createdAt,
+      updatedAt: definition.updatedAt,
+      githubUrl: definition.githubUrl ?? "https://api.github.com",
+      appId: definition.appId ?? "",
+      installationId: definition.installationId ?? "",
+    }));
+  }
+}

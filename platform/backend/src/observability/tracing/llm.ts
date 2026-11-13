@@ -1,3 +1,4 @@
+import type { InteractionSource, SupportedProvider } from "@archestra/shared";
 import {
   type Context,
   context,
@@ -6,18 +7,23 @@ import {
   SpanStatusCode,
   trace,
 } from "@opentelemetry/api";
-import type { InteractionSource, SupportedProvider } from "@shared";
 import config from "@/config";
 import logger from "@/logging";
 import { SESSION_ID_KEY } from "@/observability/request-context";
-import type { Agent, GenAiOperationName, InteractionAuthMethod } from "@/types";
+import type {
+  GatewayAgent,
+  GenAiOperationName,
+  InteractionAuthMethod,
+} from "@/types";
 import {
   ATTR_ARCHESTRA_APP_ID,
   ATTR_ARCHESTRA_APP_NAME,
   ATTR_ARCHESTRA_AUTH_METHOD,
-  ATTR_ARCHESTRA_EXECUTION_ID,
   ATTR_ARCHESTRA_EXTERNAL_AGENT_ID,
+  ATTR_ARCHESTRA_PASSTHROUGH_VIRTUAL_KEY_ID,
+  ATTR_ARCHESTRA_RUN_ID,
   ATTR_ARCHESTRA_TRIGGER_SOURCE,
+  ATTR_ARCHESTRA_VIRTUAL_KEY_ID,
   ATTR_GENAI_OPERATION_NAME,
   ATTR_GENAI_PROMPT,
   ATTR_GENAI_PROVIDER_NAME,
@@ -27,13 +33,16 @@ import {
   ATTR_SERVER_ADDRESS,
   EVENT_GENAI_CONTENT_PROMPT,
   RouteCategory,
+  type SpanTeamInfo,
   type SpanUserInfo,
   setAgentAttributes,
   setSessionId,
   setSpanError,
+  setTeamAttributes,
   setUserAttributes,
   truncateContent,
 } from "./attributes";
+import { sessionContext } from "./session";
 
 const { captureContent } = config.observability.otel;
 
@@ -55,7 +64,7 @@ const { captureContent } = config.observability.otel;
  * @param params.stream - Whether this is a streaming request
  * @param params.agent - The agent/profile object (optional)
  * @param params.sessionId - Conversation/session ID (optional)
- * @param params.executionId - Execution ID for tracking agent executions (optional)
+ * @param params.runId - Run ID for tracking Agent Runtime runs (optional)
  * @param params.externalAgentId - External agent ID from X-Archestra-Agent-Id header (optional)
  * @param params.source - The interaction source for trace filtering (optional)
  * @param params.serverAddress - The server address (base URL) of the LLM provider (optional)
@@ -68,15 +77,27 @@ export async function startActiveLlmSpan<T>(params: {
   provider: SupportedProvider;
   model: string;
   stream: boolean;
-  agent?: Agent;
+  agent?: GatewayAgent;
+  teams?: SpanTeamInfo[];
+  userTeams?: SpanTeamInfo[];
   sessionId?: string | null;
-  executionId?: string;
+  runId?: string;
   externalAgentId?: string;
   authMethod?: InteractionAuthMethod;
+  virtualKeyId?: string;
+  passthroughVirtualKeyId?: string;
   authenticatedApp?: { id: string; name: string; clientId: string };
   source?: InteractionSource;
   serverAddress?: string;
   promptMessages?: unknown;
+  /** Materialize provider messages only when this span records content. */
+  getPromptMessages?: () => unknown;
+  /**
+   * Suppress prompt/completion content capture for this span even when
+   * ARCHESTRA_OTEL_CAPTURE_CONTENT is on (encrypted chat sessions). Metadata
+   * attributes (model, usage, cost) are unaffected.
+   */
+  suppressContent?: boolean;
   parentContext?: Context;
   user?: SpanUserInfo | null;
   callback: (span: Span) => Promise<T>;
@@ -106,49 +127,69 @@ export async function startActiveLlmSpan<T>(params: {
   };
 
   const spanCallback = async (span: Span) => {
-    if (params.agent) {
-      logger.debug(
-        {
-          agentId: params.agent.id,
-          agentName: params.agent.name,
-          labelCount: params.agent.labels?.length || 0,
-        },
-        "[tracing] startActiveLlmSpan: setting agent attributes",
-      );
-      setAgentAttributes(span, params.agent);
-    }
+    if (span.isRecording()) {
+      if (params.agent) {
+        logger.debug(
+          {
+            agentId: params.agent.id,
+            agentName: params.agent.name,
+            labelCount: params.agent.labels?.length || 0,
+          },
+          "[tracing] startActiveLlmSpan: setting agent attributes",
+        );
+        setAgentAttributes(span, params.agent);
+      }
 
-    setSessionId(span, params.sessionId);
+      setTeamAttributes(span, params.teams, "agent");
+      setTeamAttributes(span, params.userTeams, "user");
+      setSessionId(span, params.sessionId);
 
-    if (params.executionId) {
-      span.setAttribute(ATTR_ARCHESTRA_EXECUTION_ID, params.executionId);
-    }
-    if (params.externalAgentId) {
-      span.setAttribute(
-        ATTR_ARCHESTRA_EXTERNAL_AGENT_ID,
-        params.externalAgentId,
-      );
-    }
-    if (params.authMethod) {
-      span.setAttribute(ATTR_ARCHESTRA_AUTH_METHOD, params.authMethod);
-    }
-    if (params.authenticatedApp) {
-      span.setAttribute(ATTR_ARCHESTRA_APP_ID, params.authenticatedApp.id);
-      span.setAttribute(ATTR_ARCHESTRA_APP_NAME, params.authenticatedApp.name);
-    }
-    if (params.source) {
-      span.setAttribute(ATTR_ARCHESTRA_TRIGGER_SOURCE, params.source);
-    }
-    if (params.serverAddress) {
-      span.setAttribute(ATTR_SERVER_ADDRESS, params.serverAddress);
-    }
+      if (params.runId) {
+        span.setAttribute(ATTR_ARCHESTRA_RUN_ID, params.runId);
+      }
+      if (params.externalAgentId) {
+        span.setAttribute(
+          ATTR_ARCHESTRA_EXTERNAL_AGENT_ID,
+          params.externalAgentId,
+        );
+      }
+      if (params.authMethod) {
+        span.setAttribute(ATTR_ARCHESTRA_AUTH_METHOD, params.authMethod);
+      }
+      if (params.virtualKeyId) {
+        span.setAttribute(ATTR_ARCHESTRA_VIRTUAL_KEY_ID, params.virtualKeyId);
+      }
+      if (params.passthroughVirtualKeyId) {
+        span.setAttribute(
+          ATTR_ARCHESTRA_PASSTHROUGH_VIRTUAL_KEY_ID,
+          params.passthroughVirtualKeyId,
+        );
+      }
+      if (params.authenticatedApp) {
+        span.setAttribute(ATTR_ARCHESTRA_APP_ID, params.authenticatedApp.id);
+        span.setAttribute(
+          ATTR_ARCHESTRA_APP_NAME,
+          params.authenticatedApp.name,
+        );
+      }
+      if (params.source) {
+        span.setAttribute(ATTR_ARCHESTRA_TRIGGER_SOURCE, params.source);
+      }
+      if (params.serverAddress) {
+        span.setAttribute(ATTR_SERVER_ADDRESS, params.serverAddress);
+      }
 
-    setUserAttributes(span, params.user);
+      setUserAttributes(span, params.user);
 
-    if (captureContent && params.promptMessages) {
-      span.addEvent(EVENT_GENAI_CONTENT_PROMPT, {
-        [ATTR_GENAI_PROMPT]: truncateContent(params.promptMessages),
-      });
+      if (captureContent && !params.suppressContent) {
+        const messages = params.getPromptMessages
+          ? params.getPromptMessages()
+          : params.promptMessages;
+        if (messages)
+          span.addEvent(EVENT_GENAI_CONTENT_PROMPT, {
+            [ATTR_GENAI_PROMPT]: truncateContent(messages),
+          });
+      }
     }
 
     logger.debug(
@@ -161,7 +202,12 @@ export async function startActiveLlmSpan<T>(params: {
       span.setStatus({ code: SpanStatusCode.OK });
       return result;
     } catch (error) {
-      setSpanError(span, error);
+      // Provider error messages can echo prompts, including for encrypted sessions.
+      setSpanError({
+        span,
+        error,
+        includeMessage: captureContent && !params.suppressContent,
+      });
       throw error;
     } finally {
       span.end();
@@ -170,10 +216,15 @@ export async function startActiveLlmSpan<T>(params: {
 
   // Build the context: start from parentContext (if provided) or current context,
   // then inject the session ID so it's available to the pino mixin for log correlation.
-  let ctx = params.parentContext ?? context.active();
+  let ctx = sessionContext(
+    params.parentContext ?? context.active(),
+    params.sessionId,
+  );
   if (params.sessionId) {
     ctx = ctx.setValue(SESSION_ID_KEY, params.sessionId);
   }
 
-  return tracer.startActiveSpan(spanName, spanOptions, ctx, spanCallback);
+  return context.with(ctx, () =>
+    tracer.startActiveSpan(spanName, spanOptions, ctx, spanCallback),
+  );
 }

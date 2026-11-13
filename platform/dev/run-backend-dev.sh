@@ -1,0 +1,268 @@
+#!/usr/bin/env sh
+set -u
+
+cd "$(dirname "$0")/.."
+
+export ARCHESTRA_LOGGING_LEVEL=debug
+export ARCHESTRA_ANALYTICS=disabled
+
+# tilt (default outside an Agent Runtime): Tilt watches the sources and
+# rebuilds; false (default inside one): manual `tilt trigger`; true: the
+# resident `tsdown --watch`. Tiltfile.dev applies the same defaults.
+backend_watch_mode() {
+  mode="${ARCHESTRA_DEV_BACKEND_WATCH:-}"
+  if [ -z "$mode" ]; then
+    if [ -n "${ARCHESTRA_AGENT_RUNTIME_TASK_ID:-}" ]; then mode=false; else mode=tilt; fi
+  fi
+  echo "$mode"
+}
+
+# One build into a backend/.dist-next.* directory, moved over backend/dist only once it
+# succeeds. A failed build therefore leaves the previous dist/ in place, and
+# Tilt, which runs this as the resource's update command, keeps the previous
+# server running. The staging directory sits next to dist/ so the relative
+# source paths in the source maps stay valid after the move.
+build_backend() {
+  (
+    cd backend || exit 1
+    # Per-build names, so a manual build and a Tilt build cannot remove each
+    # other's staging directory.
+    next=".dist-next.$$"
+    old=".dist-old.$$"
+    rm -rf "$next" "$old"
+    if ! ./node_modules/.bin/tsdown --out-dir "$next"; then
+      rm -rf "$next"
+      echo "backend build failed; the previous build keeps running until the next successful build" >&2
+      exit 1
+    fi
+    # Builds share dist/, so the swap runs one at a time under a lock that
+    # names its owner. A lock whose owner is gone (a build killed mid-swap)
+    # is reclaimed under a second lock, re-checking the owner there, so two
+    # waiters cannot both reclaim it or remove a live replacement.
+    lock=.dist-swap.lock
+    until mkdir "$lock" 2>/dev/null; do
+      owner="$(cat "$lock/pid" 2>/dev/null || true)"
+      if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null && mkdir "$lock.reap" 2>/dev/null; then
+        if [ "$(cat "$lock/pid" 2>/dev/null || true)" = "$owner" ]; then
+          rm -rf "$lock"
+        fi
+        rmdir "$lock.reap"
+        continue
+      fi
+      sleep 0.2
+    done
+    echo $$ > "$lock/pid"
+    trap 'rm -rf "$lock"' EXIT
+    if [ -d dist ] && ! mv dist "$old"; then
+      rm -rf "$next"
+      echo "backend build: could not move the previous dist/ aside; keeping it" >&2
+      exit 1
+    fi
+    # mv into an existing directory would nest the build inside it.
+    if [ -e dist ] || ! mv "$next" dist; then
+      [ -d "$old" ] && mv "$old" dist
+      rm -rf "$next"
+      echo "backend build: could not install the new dist/; restored the previous one" >&2
+      exit 1
+    fi
+    rm -rf "$old"
+  )
+}
+
+if [ "${1:-}" = "build" ]; then
+  [ "${DEBUG:-}" = "1" ] || unset DEBUG
+  build_backend
+  exit $?
+fi
+
+# A Tilt killed outright never stops this script, which would keep the server
+# and its ports. Once the Tilt that started it ($PPID; Tiltfile.dev execs this
+# script) is gone, TERM ourselves so the trap below stops the server. It is
+# armed before any setup, which can take minutes (the Dagger CLI download), so
+# the parent it watches is still Tilt. The watchdog exits once this script has.
+tilt_pid=$PPID
+(
+  while kill -0 "$tilt_pid" 2>/dev/null; do
+    sleep 5
+    kill -0 $$ 2>/dev/null || exit 0
+  done
+  kill -TERM $$ 2>/dev/null
+) &
+
+backend_pid=""
+backend_ports="$(node --env-file-if-exists=.env -e 'let port = "9000"; try { port = new URL(process.env.ARCHESTRA_INTERNAL_API_BASE_URL).port || port; } catch {} process.stdout.write(port + " " + (process.env.ARCHESTRA_METRICS_PORT || "9050"));')"
+
+# The node server is a child of $backend_pid (tsdown --watch → node), and the
+# TERM to $backend_pid and its direct children can still miss it. A survivor
+# keeps 9000/9050 bound and the next serve dies with EADDRINUSE, which is why
+# `tilt trigger pnpm-dev-backend` used to leave the old server running. Sweep
+# the dev ports on both stop and start.
+free_backend_ports() {
+  for port in $backend_ports; do
+    pids="$(lsof -t -i "tcp:$port" -s tcp:LISTEN 2>/dev/null || true)"
+    [ -n "$pids" ] || continue
+    echo "killing stale backend listener(s) on port $port: $pids" >&2
+    kill -TERM $pids 2>/dev/null || true
+    i=0
+    while [ -n "$(lsof -t -i "tcp:$port" -s tcp:LISTEN 2>/dev/null || true)" ] && [ "$i" -lt 20 ]; do
+      i=$((i + 1))
+      sleep 0.25
+    done
+    pids="$(lsof -t -i "tcp:$port" -s tcp:LISTEN 2>/dev/null || true)"
+    [ -n "$pids" ] && kill -KILL $pids 2>/dev/null || true
+  done
+}
+
+stop_backend() {
+  if [ -n "$backend_pid" ] && kill -0 "$backend_pid" 2>/dev/null; then
+    kill -TERM "$backend_pid" 2>/dev/null || true
+    pkill -TERM -P "$backend_pid" 2>/dev/null || true
+    wait "$backend_pid" 2>/dev/null || true
+  fi
+  backend_pid=""
+  free_backend_ports
+}
+
+start_backend() {
+  free_backend_ports
+  # Run tsdown directly. `pnpm dev --filter @backend` wraps the same command in
+  # pnpm → turbo → pnpm → sh: four extra Node processes and about 0.35 GB of
+  # RSS that only forward signals. Tilt already loaded .env into this
+  # environment.
+  #
+  # Only ARCHESTRA_DEV_BACKEND_WATCH=true keeps `tsdown --watch` resident. That
+  # watcher is the build kept in memory: about 1.3 GB for a build that takes
+  # 2 s and then exits. In the default mode Tilt watches the sources itself
+  # (see Tiltfile.dev), runs `run-backend-dev.sh build` on a change and then
+  # restarts this script, which only runs the server. With
+  # ARCHESTRA_DEV_BACKEND_WATCH=false (the default inside an Agent Runtime,
+  # where the pod sets ARCHESTRA_AGENT_RUNTIME_TASK_ID) nothing watches: the
+  # agent rebuilds with `tilt trigger pnpm-dev-backend`.
+  #
+  # Without turbo in between, the shell's environment reaches tsdown and the
+  # server. tsdown.config.ts treats any DEBUG value as "start the server with
+  # --inspect", and shells often export DEBUG=* for the debug package, so only
+  # the documented DEBUG=1 passes through.
+  [ "${DEBUG:-}" = "1" ] || unset DEBUG
+  watch="$(backend_watch_mode)"
+  if [ "$watch" != "true" ]; then
+    if [ "$watch" = "false" ]; then
+      echo "backend watcher off: run 'tilt trigger pnpm-dev-backend' after backend changes" >&2
+    fi
+    inspect=""
+    [ "${DEBUG:-}" = "1" ] && inspect="--inspect"
+    # Tilt runs `run-backend-dev.sh build` as the resource's update command
+    # before it (re)starts this serve command, so dist/ is already current.
+    # Build here only when nothing has built yet.
+    if [ ! -f backend/dist/server.mjs ]; then
+      build_backend || exit 1
+    fi
+    # Once the server has started, restart it when it exits: unlike
+    # tsdown --watch, this process is the server, and Tilt does not restart a
+    # serve_cmd that exits.
+    # Five exits in a row within 60 s of starting end the loop (startup takes
+    # about 15 s), so a server that cannot start does not spin. The loop runs
+    # its child in the background and passes TERM and INT on to it, so
+    # stop_backend also stops a server that is still starting. dash starts a
+    # background subshell with INT ignored, so there only TERM reaches the
+    # trap; bash (macOS sh) runs it for INT as well.
+    (
+      cd backend || exit 1
+      child=""
+      trap 'if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; wait "$child"; fi; exit 143' TERM INT
+      quick_exits=0
+      while :; do
+        started=$(date +%s)
+        node --enable-source-maps $inspect dist/server.mjs &
+        child=$!
+        wait "$child"
+        status=$?
+        child=""
+        if [ $(( $(date +%s) - started )) -ge 60 ]; then quick_exits=0; else quick_exits=$((quick_exits + 1)); fi
+        if [ "$quick_exits" -ge 5 ]; then
+          echo "backend exited ($status) five times right after starting; giving up until the next 'tilt trigger pnpm-dev-backend'" >&2
+          exit "$status"
+        fi
+        echo "backend exited ($status); restarting in 1 s" >&2
+        sleep 1
+        free_backend_ports
+      done
+    ) &
+  else
+    (cd backend && exec ./node_modules/.bin/tsdown --watch) &
+  fi
+  backend_pid=$!
+}
+
+cleanup() {
+  stop_backend
+}
+
+# A signal ends the script: cleanup alone would fall through to
+# start_backend during setup. EXIT runs cleanup again, which is harmless.
+trap cleanup EXIT
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 130' INT
+
+if [ "${ARCHESTRA_CODE_RUNTIME_ENABLED:-}" = "true" ]; then
+  # Without an explicit runner host, the backend provisions per-organization
+  # Dagger engines in-cluster, so it needs the orchestrator wired to the local
+  # cluster and engine resources small enough to fit a local VM (the shipped
+  # defaults reserve room for concurrent sandbox load and a large build cache).
+  # An explicit ARCHESTRA_CODE_RUNTIME_DAGGER_RUNNER_HOST points the backend at
+  # a pre-existing engine instead and skips all of this.
+  if [ -z "${ARCHESTRA_CODE_RUNTIME_DAGGER_RUNNER_HOST:-}" ]; then
+    # This backend runs on the developer's machine, not in a pod, so it reaches
+    # the cluster through a kubeconfig file. ARCHESTRA_ORCHESTRATOR_LOAD_KUBECONFIG
+    # _FROM_CURRENT_CLUSTER would call loadFromCluster(), which only resolves an
+    # API server address from the in-pod service-account environment.
+    if [ -z "${ARCHESTRA_ORCHESTRATOR_KUBECONFIG:-}" ] && \
+       [ "${ARCHESTRA_ORCHESTRATOR_LOAD_KUBECONFIG_FROM_CURRENT_CLUSTER:-}" != "true" ]; then
+      export ARCHESTRA_ORCHESTRATOR_KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
+    fi
+    : "${ARCHESTRA_DAGGER_RUNTIME_ENGINE_CPU_REQUEST:=500m}"
+    # Request covers the sandbox ceiling below plus the daemon's own footprint,
+    # the same relationship the shipped defaults keep.
+    : "${ARCHESTRA_DAGGER_RUNTIME_ENGINE_MEMORY_REQUEST:=2Gi}"
+    : "${ARCHESTRA_DAGGER_RUNTIME_ENGINE_MEMORY_LIMIT:=2Gi}"
+    : "${ARCHESTRA_DAGGER_RUNTIME_ENGINE_CACHE_STORAGE:=10Gi}"
+    : "${ARCHESTRA_DAGGER_RUNTIME_ENGINE_SANDBOX_MEMORY_MAX:=1Gi}"
+    export ARCHESTRA_DAGGER_RUNTIME_ENGINE_CPU_REQUEST \
+      ARCHESTRA_DAGGER_RUNTIME_ENGINE_MEMORY_REQUEST \
+      ARCHESTRA_DAGGER_RUNTIME_ENGINE_MEMORY_LIMIT \
+      ARCHESTRA_DAGGER_RUNTIME_ENGINE_CACHE_STORAGE \
+      ARCHESTRA_DAGGER_RUNTIME_ENGINE_SANDBOX_MEMORY_MAX
+  fi
+
+  # the Dagger SDK shells out to the `dagger` CLI to open engine sessions
+  # even when the runner host is set. prod bakes the binary into the image
+  # (see ../Dockerfile), so for local dev we mirror that by bootstrapping one
+  # copy shared by all git worktrees for this clone.
+  DAGGER_VERSION="$(sed -n 's/^ARG DAGGER_VERSION=v\{0,1\}\([0-9][^[:space:]]*\)$/\1/p' Dockerfile)"
+  DAGGER_BIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.dev-bin/dagger"
+  if [ -z "$DAGGER_VERSION" ]; then
+    echo "failed to read DAGGER_VERSION from Dockerfile" >&2
+    exit 1
+  fi
+  if [ ! -x "$DAGGER_BIN" ] || ! "$DAGGER_BIN" version 2>/dev/null | grep -q "v${DAGGER_VERSION}"; then
+    OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+    ARCH="$(uname -m)"
+    case "$ARCH" in
+      x86_64) ARCH=amd64 ;;
+      aarch64) ARCH=arm64 ;;
+    esac
+    mkdir -p "$(dirname "$DAGGER_BIN")"
+    echo "bootstrapping dagger CLI v${DAGGER_VERSION} for ${OS}/${ARCH} into ${DAGGER_BIN}" >&2
+    curl -fsSL "https://dl.dagger.io/dagger/releases/${DAGGER_VERSION}/dagger_v${DAGGER_VERSION}_${OS}_${ARCH}.tar.gz" \
+      | tar -xz -C "$(dirname "$DAGGER_BIN")" dagger
+    chmod +x "$DAGGER_BIN"
+  fi
+  if [ -z "${ARCHESTRA_DAGGER_RUNTIME_CLI_BIN:-}" ] && [ -z "${ARCHESTRA_CODE_RUNTIME_DAGGER_CLI_BIN:-}" ]; then
+    export ARCHESTRA_DAGGER_RUNTIME_CLI_BIN="$DAGGER_BIN"
+    export ARCHESTRA_CODE_RUNTIME_DAGGER_CLI_BIN="$DAGGER_BIN"
+  fi
+fi
+
+start_backend
+
+wait "$backend_pid"

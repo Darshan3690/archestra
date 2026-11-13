@@ -1,24 +1,31 @@
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
 import {
   type Action,
   ADMIN_ROLE_NAME,
   EDITOR_ROLE_NAME,
   MEMBER_ROLE_NAME,
+  OWNER_ROLE_NAME,
   type Permissions,
+  PLATFORM_ADMIN_ROLE_NAME,
   type PredefinedRoleName,
   PredefinedRoleNameSchema,
   type Resource,
   roleDescriptions,
+  roleDisplayNames,
   TimeInMs,
-} from "@shared";
+} from "@archestra/shared";
 import {
   allAvailableActions,
+  findUngrantablePermissions,
   predefinedPermissionsMap,
-} from "@shared/access-control";
-import { and, eq, getTableColumns, ilike, sql } from "drizzle-orm";
+  withDerivedPermissions,
+} from "@archestra/shared/access-control";
+import { and, eq, getTableColumns, ilike, inArray, sql } from "drizzle-orm";
 import { LRUCacheManager } from "@/cache-manager";
 import db, { schema } from "@/database";
 import logger from "@/logging";
 import type { OrganizationRole } from "@/types";
+import RoleCompositionModel from "./role-composition";
 
 const ROLE_PERMISSIONS_CACHE_TTL_MS = 5 * TimeInMs.Minute;
 const rolePermissionsCache = new LRUCacheManager<Permissions>({
@@ -32,7 +39,7 @@ const generatePredefinedRole = (
 ): OrganizationRole => ({
   id: role,
   role: role,
-  name: role,
+  name: roleDisplayNames[role],
   description: roleDescriptions[role],
   organizationId,
   permission: OrganizationRoleModel.getPredefinedRolePermissions(role),
@@ -43,6 +50,59 @@ const generatePredefinedRole = (
 });
 
 class OrganizationRoleModel {
+  static async getPermissionsBatch(params: {
+    identifiers: string[];
+    organizationId: string;
+  }): Promise<Record<string, Permissions>> {
+    const permissions: Record<string, Permissions> = Object.create(null);
+    const missing: string[] = [];
+    for (const identifier of new Set(params.identifiers)) {
+      if (identifier === OWNER_ROLE_NAME) {
+        permissions[identifier] =
+          OrganizationRoleModel.getPredefinedRolePermissions(ADMIN_ROLE_NAME);
+      } else if (OrganizationRoleModel.isPredefinedRole(identifier)) {
+        permissions[identifier] =
+          OrganizationRoleModel.getPredefinedRolePermissions(identifier);
+      } else {
+        const cached = rolePermissionsCache.get(
+          OrganizationRoleModel.getPermissionsCacheKey(
+            params.organizationId,
+            identifier,
+          ),
+        );
+        if (cached) permissions[identifier] = cached;
+        else missing.push(identifier);
+      }
+    }
+    if (missing.length) {
+      const roles = await db
+        .select()
+        .from(schema.organizationRolesTable)
+        .where(
+          and(
+            eq(
+              schema.organizationRolesTable.organizationId,
+              params.organizationId,
+            ),
+            inArray(schema.organizationRolesTable.role, missing),
+          ),
+        );
+      for (const role of roles) {
+        permissions[role.role] = OrganizationRoleModel.sanitizePermissions(
+          role.permission,
+        );
+        rolePermissionsCache.set(
+          OrganizationRoleModel.getPermissionsCacheKey(
+            params.organizationId,
+            role.role,
+          ),
+          permissions[role.role],
+        );
+      }
+    }
+    return permissions;
+  }
+
   static sanitizePermissions(value: unknown): Permissions {
     const parsedPermissions = parseRolePermissionsValue(value);
     if (!parsedPermissions) {
@@ -68,7 +128,7 @@ class OrganizationRoleModel {
       }
     }
 
-    return sanitizedPermissions;
+    return withDerivedPermissions(sanitizedPermissions);
   }
 
   static invalidatePermissionsCacheForRole(
@@ -137,40 +197,11 @@ class OrganizationRoleModel {
     userPermissions: Permissions,
     rolePermissions: Permissions,
   ): { valid: boolean; missingPermissions: string[] } {
-    logger.debug(
-      "OrganizationRoleModel.validateRolePermissions: validating permissions",
+    const missingPermissions = findUngrantablePermissions(
+      userPermissions,
+      rolePermissions,
     );
-    const missingPermissions: string[] = [];
-
-    const resourcesToSkipValidation: Resource[] = [
-      "simpleView",
-      "chatAgentPicker",
-      "chatProviderSettings",
-    ];
-
-    for (const [resource, actions] of Object.entries(rolePermissions)) {
-      if (resourcesToSkipValidation.includes(resource as Resource)) continue;
-
-      const userResourceActions = userPermissions[resource as Resource] || [];
-
-      for (const action of actions) {
-        if (!userResourceActions.includes(action)) {
-          missingPermissions.push(`${resource}:${action}`);
-        }
-      }
-    }
-
-    logger.debug(
-      {
-        valid: missingPermissions.length === 0,
-        missingCount: missingPermissions.length,
-      },
-      "OrganizationRoleModel.validateRolePermissions: completed",
-    );
-    return {
-      valid: missingPermissions.length === 0,
-      missingPermissions,
-    };
+    return { valid: missingPermissions.length === 0, missingPermissions };
   }
 
   /**
@@ -211,7 +242,7 @@ class OrganizationRoleModel {
       .where(
         and(
           eq(schema.membersTable.organizationId, organizationId),
-          eq(schema.membersTable.role, role.role),
+          sql`${role.role} = ANY(string_to_array(${schema.membersTable.role}, ','))`,
         ),
       )
       .limit(1);
@@ -234,7 +265,7 @@ class OrganizationRoleModel {
       .where(
         and(
           eq(schema.invitationsTable.organizationId, organizationId),
-          eq(schema.invitationsTable.role, role.role),
+          sql`${role.role} = ANY(string_to_array(${schema.invitationsTable.role}, ','))`,
           eq(schema.invitationsTable.status, "pending"),
         ),
       )
@@ -250,6 +281,32 @@ class OrganizationRoleModel {
         reason: "Cannot delete role that is used in pending invitations",
       };
     }
+
+    const [teamAssignment] = await db
+      .select({ id: schema.teamsTable.id })
+      .from(schema.teamsTable)
+      .where(
+        and(
+          eq(schema.teamsTable.organizationId, organizationId),
+          sql`${role.role} = ANY(${schema.teamsTable.roles})`,
+        ),
+      )
+      .limit(1);
+    const [accountAssignment] = await db
+      .select({ id: schema.serviceAccountsTable.id })
+      .from(schema.serviceAccountsTable)
+      .where(
+        and(
+          eq(schema.serviceAccountsTable.organizationId, organizationId),
+          sql`${role.role} = ANY(string_to_array(${schema.serviceAccountsTable.role}, ','))`,
+        ),
+      )
+      .limit(1);
+    if (teamAssignment || accountAssignment)
+      return {
+        canDelete: false,
+        reason: "Cannot delete role assigned to teams or service accounts",
+      };
 
     logger.debug({ roleId }, "OrganizationRoleModel.canDelete: can delete");
     return { canDelete: true };
@@ -361,10 +418,27 @@ class OrganizationRoleModel {
     identifier: string,
     organizationId: string,
   ): Promise<Permissions> {
-    // logger.debug(
-    //   { identifier, organizationId },
-    //   "OrganizationRoleModel.getPermissions: fetching",
-    // );
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    if (identifier.includes(",")) {
+      const roles = [
+        ...new Set(
+          identifier
+            .split(",")
+            .map((role) => role.trim())
+            .filter(Boolean),
+        ),
+      ];
+      return RoleCompositionModel.mergePermissions(
+        await Promise.all(
+          roles.map((role) =>
+            OrganizationRoleModel.getPermissions(role, organizationId),
+          ),
+        ),
+      );
+    }
+    // SPDX-SnippetEnd
     if (OrganizationRoleModel.isPredefinedRole(identifier)) {
       return OrganizationRoleModel.getPredefinedRolePermissions(identifier);
     }
@@ -384,6 +458,15 @@ class OrganizationRoleModel {
     );
 
     if (!role) {
+      // better-auth assigns "owner" to the organization creator by default.
+      // That identifier is not one of our predefined roles and has no
+      // organization_roles row, so RBAC resolved to {} and impersonation
+      // (among everything else) failed for those members.
+      if (identifier === OWNER_ROLE_NAME) {
+        return OrganizationRoleModel.getPredefinedRolePermissions(
+          ADMIN_ROLE_NAME,
+        );
+      }
       logger.debug(
         { identifier },
         "OrganizationRoleModel.getPermissions: role not found, returning empty",
@@ -406,6 +489,7 @@ class OrganizationRoleModel {
   static getPredefinedOnly(organizationId: string): Array<OrganizationRole> {
     return [
       generatePredefinedRole(ADMIN_ROLE_NAME, organizationId),
+      generatePredefinedRole(PLATFORM_ADMIN_ROLE_NAME, organizationId),
       generatePredefinedRole(EDITOR_ROLE_NAME, organizationId),
       generatePredefinedRole(MEMBER_ROLE_NAME, organizationId),
     ];
@@ -545,33 +629,159 @@ class OrganizationRoleModel {
   }
 
   /**
-   * @deprecated Do not use directly. Routes should use betterAuth.api.createOrgRole() instead.
-   * This method exists only for test fixtures.
+   * Create a custom role.
+   *
+   * Authorization (the no-privilege-escalation rule), the enterprise licence
+   * gate, and name validation belong to the route; this only writes the row.
+   * Permissions are sanitized on the way in so the stored set never carries a
+   * resource or action outside the permission universe — reads sanitize too,
+   * so an unsanitized write would silently vanish on the way back out.
    */
-  static async create(): Promise<OrganizationRole> {
-    throw new Error(
-      "OrganizationRoleModel.create() should not be called directly. Use betterAuth.api.createOrgRole() in routes, or direct DB operations in test fixtures.",
+  static async create(params: {
+    organizationId: string;
+    role: string;
+    name: string;
+    description?: string | null;
+    permission: Permissions;
+  }): Promise<OrganizationRole> {
+    const permission = OrganizationRoleModel.sanitizePermissions(
+      params.permission,
     );
+    logger.debug(
+      { role: params.role, organizationId: params.organizationId },
+      "OrganizationRoleModel.create: inserting",
+    );
+
+    const [result] = await db
+      .insert(schema.organizationRolesTable)
+      .values({
+        id: crypto.randomUUID(),
+        organizationId: params.organizationId,
+        role: params.role,
+        name: params.name,
+        description: params.description ?? null,
+        permission: JSON.stringify(permission),
+      })
+      .returning();
+
+    return { ...result, permission, predefined: false };
   }
 
   /**
-   * @deprecated Do not use directly. Routes should use betterAuth.api.updateOrgRole() instead.
-   * This method exists only for test fixtures.
+   * Update a custom role's display name, description, and/or permissions.
+   * The `role` identifier is immutable. Returns null when no row matches.
    */
-  static async update(): Promise<OrganizationRole> {
-    throw new Error(
-      "OrganizationRoleModel.update() should not be called directly. Use betterAuth.api.updateOrgRole() in routes, or direct DB operations in test fixtures.",
+  static async update(params: {
+    id: string;
+    organizationId: string;
+    name?: string;
+    description?: string | null;
+    permission?: Permissions;
+  }): Promise<OrganizationRole | null> {
+    const updates: Partial<typeof schema.organizationRolesTable.$inferInsert> =
+      {};
+    if (params.name !== undefined) updates.name = params.name;
+    if (params.description !== undefined)
+      updates.description = params.description;
+    if (params.permission !== undefined) {
+      updates.permission = JSON.stringify(
+        OrganizationRoleModel.sanitizePermissions(params.permission),
+      );
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return OrganizationRoleModel.getById(params.id, params.organizationId);
+    }
+
+    logger.debug(
+      { roleId: params.id, organizationId: params.organizationId },
+      "OrganizationRoleModel.update: updating",
     );
+
+    const [result] = await db
+      .update(schema.organizationRolesTable)
+      .set(updates)
+      .where(
+        and(
+          eq(schema.organizationRolesTable.id, params.id),
+          eq(
+            schema.organizationRolesTable.organizationId,
+            params.organizationId,
+          ),
+        ),
+      )
+      .returning();
+
+    if (!result) return null;
+
+    return {
+      ...result,
+      permission: OrganizationRoleModel.sanitizePermissions(result.permission),
+      predefined: false,
+    };
   }
 
   /**
-   * @deprecated Do not use directly. Routes should use betterAuth.api.deleteOrgRole() instead.
-   * This method exists only for test fixtures.
+   * Delete a custom role. Returns false when no row matched.
    */
-  static async delete(): Promise<boolean> {
-    throw new Error(
-      "OrganizationRoleModel.delete() should not be called directly. Use betterAuth.api.deleteOrgRole() in routes, or direct DB operations in test fixtures.",
+  static async delete(id: string, organizationId: string): Promise<boolean> {
+    logger.debug(
+      { roleId: id, organizationId },
+      "OrganizationRoleModel.delete: deleting",
     );
+    return db.transaction(async (tx) => {
+      const deleted = await tx
+        .delete(schema.organizationRolesTable)
+        .where(
+          and(
+            eq(schema.organizationRolesTable.id, id),
+            eq(schema.organizationRolesTable.organizationId, organizationId),
+          ),
+        )
+        .returning({ id: schema.organizationRolesTable.id });
+      if (deleted.length === 0) return false;
+
+      const policies = schema.resourcePermissionPoliciesTable;
+      const roleGrant = JSON.stringify([{ subject: { type: "role", id } }]);
+      await tx
+        .update(policies)
+        .set({
+          grants: sql`coalesce((
+            select jsonb_agg(grant_entry)
+            from jsonb_array_elements(${policies.grants}) grant_entry
+            where grant_entry->'subject'->>'type' <> 'role'
+              or grant_entry->'subject'->>'id' <> ${id}
+          ), '[]'::jsonb)`,
+          revision: sql`${policies.revision} + 1`,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(policies.organizationId, organizationId),
+            sql`${policies.grants} @> ${roleGrant}::jsonb`,
+          ),
+        );
+      return true;
+    });
+  }
+
+  static async findByIdForAudit(
+    id: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const role = await OrganizationRoleModel.getById(id, organizationId);
+    if (!role) return null;
+
+    return {
+      id: role.id,
+      organizationId: role.organizationId,
+      role: role.role,
+      name: role.name,
+      description: role.description ?? null,
+      permission: role.permission,
+      predefined: role.predefined,
+      createdAt: role.createdAt?.toISOString() ?? null,
+    };
   }
 
   private static getPermissionsCacheKey(

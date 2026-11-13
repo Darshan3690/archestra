@@ -2,13 +2,25 @@ import {
   archestraApiSdk,
   type archestraApiTypes,
   calculatePaginationMeta,
-} from "@shared";
+} from "@archestra/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
+import type { UserSelectOption } from "@/components/user-select-option";
 import { authClient } from "@/lib/clients/auth/auth-client";
-import { useActiveOrganization } from "./organization.query";
+import { useAllMatching } from "@/lib/hooks/use-all-matching";
+import { useDebouncedValue } from "@/lib/hooks/use-debounced-value";
+import { handleApiError, throwOnApiError, toApiError } from "@/lib/utils/api";
+import {
+  organizationKeys,
+  useActiveOrganizationId,
+} from "./organization.query";
+import {
+  parseRoleAssignmentBlocked,
+  RoleAssignmentBlockedError,
+} from "./role-assignment-blocked";
 
-const { getMembers } = archestraApiSdk;
+const { bulkDeleteMembers, getMembers } = archestraApiSdk;
 
 /**
  * Query keys for member/invitation queries
@@ -30,6 +42,10 @@ export const invitationKeys = {
 type MembersQuery = NonNullable<archestraApiTypes.GetMembersData["query"]>;
 type MembersResponse = archestraApiTypes.GetMembersResponses["200"];
 export type Member = MembersResponse["data"][number];
+export type MemberBulkTarget =
+  archestraApiTypes.BulkDeleteMembersData["body"]["targets"][number];
+export type MemberBulkOutcome =
+  archestraApiTypes.BulkDeleteMembersResponses["200"];
 
 type InvitationsQuery = NonNullable<{ limit: number; offset: number }>;
 export type Invitation = {
@@ -57,14 +73,39 @@ type RawInvitation = NonNullable<
 /**
  * Paginated members hook with search and role filter support
  */
+/**
+ * Every member matching the table's filters, not just the page in view.
+ *
+ * This is the whole roster the table paginates over — users who have not
+ * completed signup are members too, so "every user matching these filters"
+ * covers them as well.
+ */
+export function useAllMatchingMembers(
+  query: Pick<MembersQuery, "name" | "role">,
+  options?: { enabled?: boolean },
+) {
+  return useAllMatching({
+    queryKey: [...memberKeys.all, "all-matching", query],
+    enabled: options?.enabled,
+    fetchPage: async ({ limit, offset }) => {
+      const response = await getMembers({ query: { ...query, limit, offset } });
+      throwOnApiError(response.error, { toastOnError: false });
+      return response.data?.data ?? [];
+    },
+  });
+}
+
 export function useMembersPaginated(
   query: Required<Pick<MembersQuery, "limit" | "offset">> &
     Pick<MembersQuery, "name" | "role">,
+  options?: { enabled?: boolean },
 ) {
   return useQuery({
+    enabled: options?.enabled ?? true,
     queryKey: memberKeys.paginated(query),
     queryFn: async () => {
       const response = await getMembers({ query });
+      throwOnApiError(response.error, { toastOnError: false });
       return (
         response.data ?? {
           data: [] as Member[],
@@ -83,25 +124,92 @@ export function useMembersPaginated(
 }
 
 /**
+ * Server-side member search for the user pickers.
+ *
+ * Every picker needs the same three things — debounce the keystrokes, ask the
+ * API instead of filtering a locally-held roster, and keep the currently
+ * selected user in the list even when the active query no longer matches them
+ * (otherwise the trigger falls back to a bare id or an empty label). Owning
+ * that here keeps the pickers from re-deriving it, each slightly differently.
+ *
+ * Pass `selectedUserIds` so the selection is retained; pass `enabled: false`
+ * to hold the request back until a dialog is actually open.
+ */
+export function useMemberSearch({
+  selectedUserIds = [],
+  limit = 50,
+  enabled = true,
+}: {
+  selectedUserIds?: string[];
+  limit?: number;
+  enabled?: boolean;
+} = {}) {
+  const [searchQuery, setSearchQuery] = useState("");
+  const debouncedSearch = useDebouncedValue(searchQuery, 250);
+  const { data, isFetching } = useMembersPaginated(
+    { limit, offset: 0, name: debouncedSearch || undefined },
+    { enabled },
+  );
+
+  const results = useMemo(
+    () =>
+      (data?.data ?? []).map((member) => ({
+        userId: member.userId,
+        name: member.name,
+        email: member.email,
+      })),
+    [data],
+  );
+
+  // Remember everyone we've rendered so a selection made under an earlier
+  // query can still be labelled under the current one.
+  const seenUsers = useRef<Record<string, UserSelectOption>>({});
+  for (const user of results) {
+    seenUsers.current[user.userId] = user;
+  }
+
+  // Cheap enough to redo each render, and no consumer keys an effect off this
+  // list — so it stays plain rather than memoised on a hand-rolled key derived
+  // from the (freshly allocated every render) selectedUserIds array.
+  const present = new Set(results.map((user) => user.userId));
+  const retained = selectedUserIds
+    .filter((userId) => !present.has(userId))
+    .map((userId) => seenUsers.current[userId])
+    .filter((user): user is UserSelectOption => Boolean(user));
+  const users = [...retained, ...results];
+
+  // True while the typed query is still debouncing or its fetch is in flight,
+  // so a picker can say "Searching…" instead of a premature "no results".
+  const isSearching = searchQuery !== debouncedSearch || isFetching;
+
+  return {
+    users,
+    isSearching,
+    onSearchQueryChange: setSearchQuery,
+    emptyMessage: isSearching ? "Searching…" : "No matching users found.",
+  };
+}
+
+/**
  * Paginated invitations hook (pending invitations only)
  */
 export function useInvitationsPaginated(
   query: Required<Pick<InvitationsQuery, "limit" | "offset">>,
 ) {
-  const { data: activeOrganization } = useActiveOrganization();
+  const { data: activeOrganizationId } = useActiveOrganizationId();
 
   return useQuery<PaginatedInvitationsResponse>({
     queryKey: invitationKeys.paginated({
       ...query,
-      organizationId: activeOrganization?.id,
+      organizationId: activeOrganizationId,
     }),
     queryFn: async () => {
-      if (!activeOrganization?.id) {
+      if (!activeOrganizationId) {
         return buildEmptyPaginatedInvitations(query);
       }
 
       const response = await authClient.organization.listInvitations({
-        query: { organizationId: activeOrganization.id },
+        query: { organizationId: activeOrganizationId },
       });
       const allInvitations: Invitation[] =
         response.data
@@ -130,7 +238,7 @@ export function useInvitationsPaginated(
         }),
       };
     },
-    enabled: !!activeOrganization?.id,
+    enabled: !!activeOrganizationId,
   });
 }
 
@@ -149,18 +257,28 @@ export function useUpdateMemberRole() {
     }) => {
       const response = await authClient.organization.updateMemberRole({
         memberId,
-        role: role as "admin" | "member",
+        // better-auth's client types only admit its built-in role names;
+        // custom and platform-defined roles pass through as plain strings.
+        role: role as Parameters<
+          typeof authClient.organization.updateMemberRole
+        >[0]["role"],
       });
       if (response.error) {
-        throw new Error(response.error.message ?? "Failed to update role");
+        // A refused role is explained in the dialog, not a toast.
+        throw (
+          parseRoleAssignmentBlocked(response.error) ??
+          new Error(response.error.message ?? "Failed to update role")
+        );
       }
       return response.data;
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: memberKeys.lists() });
-      toast.success("Member role updated");
+      queryClient.invalidateQueries({ queryKey: memberKeys.all });
+      queryClient.invalidateQueries({ queryKey: ["auth"] });
+      toast.success("Member roles updated");
     },
     onError: (error: Error) => {
+      if (error instanceof RoleAssignmentBlockedError) return;
       toast.error("Failed to update role", { description: error.message });
     },
   });
@@ -182,11 +300,34 @@ export function useRemoveMember() {
       return response.data;
     },
     onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["auth"] });
       queryClient.invalidateQueries({ queryKey: memberKeys.lists() });
       toast.success("Member removed");
     },
     onError: (error: Error) => {
       toast.error("Failed to remove member", { description: error.message });
+    },
+  });
+}
+
+/** Removes accepted and pending-signup members in one typed backend batch. */
+export function useBulkDeleteMembers() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (targets: MemberBulkTarget[]) => {
+      const response = await bulkDeleteMembers({ body: { targets } });
+      if (response.error) {
+        handleApiError(response.error);
+        throw toApiError(response.error);
+      }
+      return response.data as MemberBulkOutcome;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["auth"] });
+      queryClient.invalidateQueries({ queryKey: memberKeys.lists() });
+      queryClient.invalidateQueries({
+        queryKey: organizationKeys.memberSignupStatus(),
+      });
     },
   });
 }

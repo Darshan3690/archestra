@@ -1,169 +1,1181 @@
-import type { StatisticsTimeFrame } from "@shared";
-import { render, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import StatisticsPage from "./page";
+import { archestraApiClient } from "@archestra/shared";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { delay, HttpResponse, http } from "msw";
+import { setupServer } from "msw/node";
+import { useRouter, useSearchParams } from "next/navigation";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+import { useHasPermissions } from "@/lib/auth/auth.query";
+import { useAppName } from "@/lib/hooks/use-app-name";
+import { useTeamLimitAccess } from "@/lib/limits-access";
+import OrganizationCostsPage from "./page";
 
-const mockRouterPush = vi.fn();
-let mockSearchParams = new URLSearchParams();
-const mockSetCostsAction = vi.fn();
-
-const mockUseTeamStatistics = vi.fn();
-const mockUseProfileStatistics = vi.fn();
-const mockUseModelStatistics = vi.fn();
-const mockUseCostSavingsStatistics = vi.fn();
-
-vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: mockRouterPush }),
-  useSearchParams: () => mockSearchParams,
+vi.mock("next/navigation");
+vi.mock("@/lib/limits-access");
+vi.mock("@/lib/hooks/use-app-name");
+vi.mock("@/lib/auth/auth.query");
+vi.mock("@/lib/config/config.query", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/config/config.query")>()),
+  useFeature: () => false,
 }));
-
-vi.mock("@/app/llm/(costs)/layout", () => ({
-  useSetCostsAction: () => mockSetCostsAction,
+vi.mock("@/lib/integration-overrides", () => ({
+  useModelProviderCatalog: () => ({ label: (provider: string) => provider }),
 }));
+vi.mock("sonner");
+const origin = "http://localhost:9000";
+const server = setupServer();
+let search = new URLSearchParams();
+let models: Record<string, unknown>[];
+let users: Record<string, unknown>[];
+let teams: Record<string, unknown>[];
+let agents: Record<string, unknown>[];
+let apps: Record<string, unknown>[];
+let skills: Record<string, unknown>[];
+let skillsUsage: Record<string, unknown>[];
+let llmUsage: Record<string, unknown>[];
+let savings: Record<string, unknown>;
+let requests: URL[];
+let pending = false;
+let client: QueryClient;
+const paginated = (data: unknown[]) => ({
+  data,
+  pagination: {
+    currentPage: 1,
+    limit: 100,
+    total: data.length,
+    totalPages: 1,
+    hasNext: false,
+    hasPrev: false,
+  },
+});
+const model = (name = "example/model-a", cost = 8.25) => ({
+  model: name,
+  requests: 10,
+  inputTokens: 1000,
+  outputTokens: 200,
+  cacheReadTokens: 4000,
+  cacheWriteTokens: 0,
+  totalTokens: 5200,
+  cost,
+  percentage: 100,
+  timeSeries: [],
+});
+const usage = (
+  values: Partial<Record<"requests" | "billedCost", number>> = {},
+) => ({
+  requests: values.requests ?? 0,
+  inputTokens: (values.requests ?? 0) * 100,
+  outputTokens: (values.requests ?? 0) * 10,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+  totalTokens: (values.requests ?? 0) * 110,
+  billedCost: values.billedCost ?? 0,
+  subscriptionCost: 0,
+});
+function show() {
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={client}>
+      <OrganizationCostsPage />
+    </QueryClientProvider>,
+  );
+}
+async function view(name: string) {
+  fireEvent.keyDown(screen.getByRole("button", { name: /^View / }), {
+    key: "Enter",
+  });
+  fireEvent.click(await screen.findByRole("menuitem", { name }));
+}
+async function group(name: string) {
+  fireEvent.keyDown(screen.getByRole("button", { name: /^by / }), {
+    key: "Enter",
+  });
+  fireEvent.click(await screen.findByRole("menuitem", { name }));
+}
+async function metric(name: string) {
+  fireEvent.keyDown(screen.getByRole("button", { name: /^Show / }), {
+    key: "Enter",
+  });
+  fireEvent.click(await screen.findByRole("menuitem", { name }));
+}
+async function split(name: string) {
+  fireEvent.keyDown(screen.getByRole("button", { name: /^split by / }), {
+    key: "Enter",
+  });
+  fireEvent.click(await screen.findByRole("menuitem", { name }));
+}
+beforeAll(() => {
+  server.listen({ onUnhandledRequest: "error" });
+  archestraApiClient.setConfig({ baseUrl: origin });
+});
+afterAll(() => {
+  server.close();
+  archestraApiClient.setConfig({ baseUrl: "" });
+});
+afterEach(() => {
+  cleanup();
+  client?.clear();
+  server.resetHandlers();
+  vi.restoreAllMocks();
+});
+beforeEach(() => {
+  localStorage.clear();
+  search = new URLSearchParams();
+  pending = false;
+  requests = [];
+  models = [model()];
+  users = [];
+  teams = [];
+  agents = [];
+  apps = [];
+  skills = [];
+  skillsUsage = [];
+  llmUsage = [];
+  savings = {
+    totalActualCost: 8.25,
+    totalSubscriptionCost: 14.5,
+    timeSeries: [],
+  };
+  vi.mocked(useRouter).mockReturnValue({
+    push: vi.fn(),
+    replace: vi.fn(),
+  } as unknown as ReturnType<typeof useRouter>);
+  vi.mocked(useSearchParams).mockImplementation(
+    () => search as unknown as ReturnType<typeof useSearchParams>,
+  );
+  vi.mocked(useAppName).mockReturnValue("Example Platform");
+  vi.mocked(useHasPermissions).mockReturnValue({
+    data: true,
+    isPending: false,
+    isLoading: false,
+  } as ReturnType<typeof useHasPermissions>);
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+    width: 1000,
+    height: 260,
+    x: 0,
+    y: 0,
+    top: 0,
+    bottom: 260,
+    left: 0,
+    right: 1000,
+    toJSON: () => ({}),
+  });
+  server.use(
+    http.get(`${origin}/api/statistics/:kind`, async ({ request, params }) => {
+      requests.push(new URL(request.url));
+      if (pending) await delay("infinite");
+      switch (params.kind) {
+        case "costs":
+          return HttpResponse.json({
+            models,
+            costSavings: savings,
+            activeUsers: users.length,
+          });
+        case "models":
+          return HttpResponse.json(models);
+        case "teams":
+          return HttpResponse.json(teams);
+        case "agents":
+          return HttpResponse.json(agents);
+        case "users":
+          return HttpResponse.json(paginated(users));
+        case "apps":
+          return HttpResponse.json({
+            ...paginated(apps),
+            chatBaselineCostPerSession: 0.75,
+            chatBaselineSessions: 12,
+          });
+        case "skills":
+          return HttpResponse.json(paginated(skills));
+        case "skill-usage":
+          return HttpResponse.json({
+            ...paginated(skillsUsage),
+            totals: { activations: 5, contextTokens: 6420, users: 3 },
+          });
+        case "app-usage":
+          return HttpResponse.json({
+            ...paginated([]),
+            totals: {
+              runs: 0,
+              toolCalls: 0,
+              llmRequests: 0,
+              inputTokens: 0,
+              outputTokens: 0,
+              billedCost: 0,
+              subscriptionCost: 0,
+            },
+          });
+        case "llm-proxy":
+          return HttpResponse.json({
+            totals: { requests: 0 },
+            timeSeries: [],
+            methods: [],
+            credentials: [],
+            pagination: { total: 0, limit: 100, offset: 0 },
+          });
+        case "cost-savings":
+          return HttpResponse.json(savings);
+        case "llm-usage":
+          return HttpResponse.json({
+            ...paginated(llmUsage),
+            totals: usage(),
+          });
+        default:
+          return HttpResponse.json(
+            { error: { message: "Unexpected endpoint" } },
+            { status: 500 },
+          );
+      }
+    }),
+  );
+});
 
-vi.mock("@/lib/statistics.query", () => ({
-  useTeamStatistics: (params: { timeframe: StatisticsTimeFrame }) =>
-    mockUseTeamStatistics(params),
-  useProfileStatistics: (params: { timeframe: StatisticsTimeFrame }) =>
-    mockUseProfileStatistics(params),
-  useModelStatistics: (params: { timeframe: StatisticsTimeFrame }) =>
-    mockUseModelStatistics(params),
-  useCostSavingsStatistics: (params: { timeframe: StatisticsTimeFrame }) =>
-    mockUseCostSavingsStatistics(params),
-}));
-
-vi.mock("recharts", () => ({
-  CartesianGrid: () => null,
-  Line: () => null,
-  LineChart: ({ children }: { children: React.ReactNode }) => (
-    <div>{children}</div>
-  ),
-  XAxis: () => null,
-  YAxis: () => null,
-}));
-
-vi.mock("@/components/ui/chart", () => ({
-  ChartContainer: ({ children }: { children: React.ReactNode }) => (
-    <div>{children}</div>
-  ),
-  ChartLegend: () => null,
-  ChartLegendContent: () => null,
-  ChartTooltip: () => null,
-  ChartTooltipContent: () => null,
-}));
-
-vi.mock("@/components/ui/custom-date-time-range-dialog", () => ({
-  CustomDateTimeRangeDialog: () => null,
-}));
-
-describe("StatisticsPage", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    localStorage.clear();
-    mockSearchParams = new URLSearchParams();
-    mockUseTeamStatistics.mockReturnValue({ data: [] });
-    mockUseProfileStatistics.mockReturnValue({ data: [] });
-    mockUseModelStatistics.mockReturnValue({ data: [] });
-    mockUseCostSavingsStatistics.mockReturnValue({
-      data: { timeSeries: [] },
-    });
+describe("OrganizationCostsPage", () => {
+  it("explores cache reads and writes by model without another summary panel", async () => {
+    models = [
+      model(),
+      {
+        ...model("example/model-b"),
+        cacheReadTokens: 6000,
+        cacheWriteTokens: 500,
+      },
+    ];
+    show();
+    await view("Cache reads by model");
+    const explorer = screen.getByRole("region", { name: "Cost explorer" });
+    expect(await within(explorer).findByText("10,000")).toBeVisible();
+    expect(
+      within(explorer).getByRole("button", { name: "Show Cache reads" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("region", { name: "Prompt caching" }),
+    ).not.toBeInTheDocument();
+    await metric("Cache writes");
+    expect(within(explorer).getAllByText("500").length).toBeGreaterThan(0);
+    expect(
+      requests.some((url) => url.pathname === "/api/statistics/costs"),
+    ).toBe(true);
+  });
+  it.each([
+    [3.75, "$3.75"],
+    [-1.25, "-$1.25"],
+    [0, "$0.00"],
+    [0.000125, "$0.000125"],
+  ])("explores net cache savings over time, preserving %s", async (net, formatted) => {
+    savings = {
+      ...savings,
+      totalCacheSavings: net,
+      totalSavings: 999,
+      timeSeries: [
+        {
+          timestamp: "2026-01-01T00:00:00Z",
+          cacheSavings: net,
+          actualCost: 8.25,
+        },
+      ],
+    };
+    show();
+    await metric("Net cache savings");
+    const explorer = screen.getByRole("region", { name: "Cost explorer" });
+    await waitFor(() =>
+      expect(within(explorer).getAllByText(formatted).length).toBeGreaterThan(
+        0,
+      ),
+    );
+    expect(
+      within(explorer).getByRole("button", { name: "by Time" }),
+    ).toBeVisible();
+    expect(
+      within(explorer).getByText(/subscription usage is excluded/),
+    ).toBeVisible();
+    expect(within(explorer).queryByText("$999.00")).not.toBeInTheDocument();
   });
 
-  it("queries statistics with the selected custom timeframe", async () => {
-    const customTimeframe =
+  it("holds placeholders rather than zeros until statistics arrive", async () => {
+    pending = true;
+    const { container } = show();
+    await waitFor(() => expect(requests.length).toBeGreaterThan(0));
+    expect(
+      container.querySelectorAll('[data-slot="skeleton"]').length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText("$0.00")).not.toBeInTheDocument();
+    expect(screen.queryByText("Nothing to tabulate.")).not.toBeInTheDocument();
+    expect(screen.getByText("Metered API-key charges")).toBeInTheDocument();
+  });
+  it("shows organization analytics and all supported entity choices", async () => {
+    show();
+    await screen.findAllByText("$8.25");
+    fireEvent.keyDown(screen.getByRole("button", { name: "by Model" }), {
+      key: "Enter",
+    });
+    for (const name of [
+      "Team",
+      "Agent",
+      "Model",
+      "Person",
+      "App",
+      "Credential",
+    ])
+      expect(await screen.findByRole("menuitem", { name })).toBeVisible();
+    expect(screen.queryByTestId("my-usage-summary")).not.toBeInTheDocument();
+  });
+  it("summarizes metered, subscription, request, token and active-person totals", async () => {
+    users = [
+      {
+        userId: "one",
+        userName: "Example",
+        userEmail: "one@example.test",
+        requests: 10,
+      },
+    ];
+    show();
+    await screen.findAllByText("$8.25");
+    expect(screen.getByText("$14.50")).toBeInTheDocument();
+    expect(screen.getByText("5.2K")).toBeInTheDocument();
+    expect(
+      screen.getByText("Usage at API rates, not a bill"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Active people").parentElement?.parentElement,
+    ).toHaveTextContent(/^Active people1/);
+    // The totals only summarize; the explorer's controls pick what it shows.
+    expect(
+      screen.queryByRole("button", { name: /API spend/ }),
+    ).not.toBeInTheDocument();
+  });
+  it("uses the selected custom timeframe for all requested data", async () => {
+    const timeframe =
       "custom:2026-07-01T00:00:00.000Z_2026-07-31T23:59:59.999Z";
-    mockSearchParams = new URLSearchParams([["timeframe", customTimeframe]]);
-
-    render(<StatisticsPage />);
-
+    search = new URLSearchParams({ timeframe });
+    show();
+    await screen.findAllByText("$8.25");
+    await group("Team");
+    await waitFor(() =>
+      expect(requests.some((url) => url.pathname.endsWith("/teams"))).toBe(
+        true,
+      ),
+    );
+    expect(
+      requests.every((url) => url.searchParams.get("timeframe") === timeframe),
+    ).toBe(true);
+  });
+  it("never requests a default timeframe before resolving the persisted timeframe", async () => {
+    localStorage.setItem("cost-statistics-timeframe", "30d");
+    show();
+    await screen.findAllByText("$8.25");
+    expect(
+      requests.every((url) => url.searchParams.get("timeframe") === "30d"),
+    ).toBe(true);
+  });
+  it("shows a subscription user's identity, usage and model mix without calling it billed spend", async () => {
+    users = [
+      {
+        userId: "one",
+        userName: "Example User A",
+        userEmail: "user-a@example.test",
+        requests: 42,
+        inputTokens: 900,
+        outputTokens: 100,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        totalTokens: 1000,
+        billedCost: 0,
+        subscriptionCost: 12.5,
+        models: [
+          {
+            model: "claude-sonnet-4",
+            requests: 40,
+            inputTokens: 880,
+            outputTokens: 100,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            totalTokens: 980,
+          },
+          {
+            model: "gpt-5",
+            requests: 2,
+            inputTokens: 20,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            totalTokens: 20,
+          },
+        ],
+      },
+    ];
+    show();
+    await screen.findAllByText("$8.25");
+    await view("Tokens by person");
+    await within(await screen.findByRole("table")).findByText("Example User A");
+    await split("Model");
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Expand by Model" }),
+    );
+    expect(
+      await within(screen.getByRole("table")).findByText("claude-sonnet-4"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("user-a@example.test")).toBeInTheDocument();
+    expect(screen.getByText("Subscription usage")).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("table")).getByText("1,000"),
+    ).toBeInTheDocument();
+  });
+  it("renders a malformed custom timeframe without throwing", async () => {
+    search = new URLSearchParams({
+      timeframe: "custom:not-a-date_also-not-a-date",
+    });
+    show();
+    expect((await screen.findAllByText("$8.25")).length).toBeGreaterThan(0);
+  });
+  it("labels subdaily buckets distinctly on a multi-day chart", async () => {
+    search = new URLSearchParams({ timeframe: "7d" });
+    models = [
+      {
+        ...model(),
+        timeSeries: [
+          "2026-07-01T00:00:00Z",
+          "2026-07-01T06:00:00Z",
+          "2026-07-01T12:00:00Z",
+          "2026-07-01T18:00:00Z",
+          "2026-07-02T00:00:00Z",
+        ].map((timestamp) => ({ timestamp, value: 1 })),
+      },
+    ];
+    show();
+    await screen.findAllByText("$8.25");
+    fireEvent.click(screen.getByRole("button", { name: "Pivot" }));
     await waitFor(() => {
-      expect(mockUseTeamStatistics).toHaveBeenLastCalledWith({
-        timeframe: customTimeframe,
-      });
+      const headers = within(screen.getByRole("table"))
+        .getAllByRole("columnheader")
+        .slice(1, -1)
+        .map((node) => node.textContent);
+      expect(headers).toHaveLength(5);
+      expect(new Set(headers).size).toBe(5);
     });
-
-    expect(mockUseProfileStatistics).toHaveBeenLastCalledWith({
-      timeframe: customTimeframe,
-    });
-    expect(mockUseModelStatistics).toHaveBeenLastCalledWith({
-      timeframe: customTimeframe,
-    });
-    expect(mockUseCostSavingsStatistics).toHaveBeenLastCalledWith({
-      timeframe: customTimeframe,
+  });
+  it("shows a metered person's spend as money rather than savings percent", async () => {
+    users = [
+      {
+        userId: "one",
+        userName: "Example User B",
+        userEmail: "user-b@example.test",
+        requests: 15260,
+        inputTokens: 19000000,
+        outputTokens: 572756,
+        cacheReadTokens: 0,
+        billedCost: 41.4405,
+        subscriptionCost: 0,
+      },
+    ];
+    show();
+    await screen.findAllByText("$8.25");
+    await group("Person");
+    expect(
+      await within(await screen.findByRole("table")).findByText("$41.44"),
+    ).toBeInTheDocument();
+    const row = within(screen.getByRole("table"))
+      .getByText("Example User B")
+      .closest("tr");
+    expect(
+      within(row as HTMLElement).queryByText("0%", { exact: true }),
+    ).not.toBeInTheDocument();
+  });
+  it("keeps full person identities and subscription badges in the summary row", async () => {
+    users = [
+      {
+        userId: "one",
+        userName: "Example User C with a long identity",
+        userEmail: "long-identity@example.test",
+        requests: 118,
+        inputTokens: 3000000,
+        outputTokens: 883994,
+        billedCost: 0,
+        subscriptionCost: 4,
+      },
+    ];
+    show();
+    await screen.findAllByText("$8.25");
+    await view("Tokens by person");
+    const identity = await within(await screen.findByRole("table")).findByText(
+      "Example User C with a long identity",
+    );
+    expect(identity.closest("tr")).toHaveTextContent(
+      "long-identity@example.test",
+    );
+    expect(identity.closest("tr")).toHaveTextContent("Subscription usage");
+  });
+  it("ranks costliest model series and uses CSS-safe chart keys", async () => {
+    models = [
+      model("google/gemini-3-pro-preview", 0.1),
+      model("anthropic/claude-opus-4.8", 46),
+      model("moonshotai/kimi-k2-thinking", 0.64),
+      model("openrouter/auto", 4.21),
+      model("deepseek/deepseek-v3.1-terminus", 5),
+      model("z-ai/glm-4.6", 1.64),
+    ].map((row) => ({
+      ...row,
+      timeSeries: [{ timestamp: "2026-01-01T00:00:00Z", value: row.cost }],
+    }));
+    const { container } = show();
+    const legend = await screen.findByRole("list", {
+      name: "Usage chart legend",
     });
     expect(
-      mockUseTeamStatistics.mock.calls.some(
-        ([params]) => params.timeframe === "all",
-      ),
-    ).toBe(false);
+      within(legend)
+        .getAllByRole("listitem")
+        .map((node) => node.textContent),
+    ).toEqual([
+      "anthropic/claude-opus-4.8",
+      "deepseek/deepseek-v3.1-terminus",
+      "openrouter/auto",
+      "z-ai/glm-4.6",
+      "moonshotai/kimi-k2-thinking",
+      "google/gemini-3-pro-preview",
+    ]);
+    const css = [...container.querySelectorAll("style")]
+      .map((node) => node.textContent)
+      .join(" ");
+    const keys = [...css.matchAll(/--color-([^:]+):/g)].map(
+      (match) => match[1],
+    );
+    expect(keys.length).toBeGreaterThan(0);
+    expect(keys.every((key) => /^[A-Za-z0-9_-]+$/.test(key))).toBe(true);
+  });
+  it("breaks team spend down by model and exports every metric", async () => {
+    const files: { name: string; blob: Blob }[] = [];
+    let blob = new Blob();
+    Object.assign(URL, {
+      createObjectURL: (value: Blob) => {
+        blob = value;
+        return "blob:export";
+      },
+      revokeObjectURL: () => undefined,
+    });
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      files.push({ name: this.download, blob });
+    });
+    llmUsage = [
+      {
+        day: "2026-01-01",
+        teamId: "team-research",
+        teamName: "Research",
+        model: "model-large",
+        ...usage({ requests: 3, billedCost: 6 }),
+      },
+      {
+        day: "2026-01-02",
+        teamId: "team-research",
+        teamName: "Research",
+        model: "model-large",
+        ...usage({ requests: 1, billedCost: 2 }),
+      },
+      {
+        day: "2026-01-01",
+        teamId: "team-research",
+        teamName: "Research",
+        model: "model-small",
+        ...usage({ requests: 2, billedCost: 0.5 }),
+      },
+      {
+        day: "2026-01-01",
+        teamId: "team-platform",
+        teamName: "Platform",
+        model: "model-small",
+        ...usage({ requests: 4, billedCost: 1 }),
+      },
+    ];
+    search = new URLSearchParams({ chart: "table" });
+    show();
+    await group("Team");
+    await split("Model");
+
+    const table = await screen.findByRole("table");
+    await waitFor(() =>
+      expect(within(table).getByText("Research")).toBeInTheDocument(),
+    );
+    expect(
+      within(
+        within(table).getByText("Research").closest("tr") as HTMLElement,
+      ).getByText("$8.50"),
+    ).toBeInTheDocument();
+    expect(
+      requests
+        .find((url) => url.pathname.endsWith("/llm-usage"))
+        ?.searchParams.get("groupBy"),
+    ).toBe("day,teamId,model");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Export" }));
+    await user.click(screen.getByRole("menuitem", { name: "CSV" }));
+    expect(files[0]?.name).toMatch(
+      /^costs-by-team-and-model-last-hour-\d{4}-\d{2}-\d{2}\.csv$/,
+    );
+    expect((await files[0]?.blob.text())?.split("\n")).toEqual([
+      "Team,Model,Requests,Input tokens,Output tokens,Cache read tokens,Cache write tokens,Total tokens,Billed spend (USD),Subscription estimate (USD)",
+      "Research,model-large,4,400,40,0,0,440,8,0",
+      "Platform,model-small,4,400,40,0,0,440,1,0",
+      "Research,model-small,2,200,20,0,0,220,0.5000,0",
+    ]);
+
+    await user.click(screen.getByRole("button", { name: "Export" }));
+    await user.click(screen.getByRole("menuitem", { name: "JSON" }));
+    expect(files[1]?.name).toMatch(
+      /^costs-by-team-and-model-last-hour-\d{4}-\d{2}-\d{2}\.json$/,
+    );
+    expect(JSON.parse((await files[1]?.blob.text()) ?? "")).toEqual([
+      expect.objectContaining({
+        Team: "Research",
+        Model: "model-large",
+        Requests: 4,
+        "Billed spend (USD)": 8,
+      }),
+      expect.objectContaining({ Team: "Platform", Model: "model-small" }),
+      expect.objectContaining({
+        Team: "Research",
+        Model: "model-small",
+        "Billed spend (USD)": 0.5,
+      }),
+    ]);
   });
 
-  it("renders statistics tables inside capped scroll containers", () => {
-    mockUseTeamStatistics.mockReturnValue({
-      data: [
-        {
-          teamId: "team-1",
-          teamName: "Platform",
-          members: 3,
-          agents: 2,
-          requests: 12,
-          inputTokens: 100,
-          outputTokens: 50,
-          cost: 42,
-          timeSeries: [],
-        },
-      ],
-    });
-    mockUseProfileStatistics.mockReturnValue({
-      data: [
-        {
-          agentId: "agent-1",
-          agentName: "My Assistant",
-          teamName: "Platform",
-          agentType: "agent",
-          requests: 9,
-          inputTokens: 80,
-          outputTokens: 20,
-          cost: 15,
-          timeSeries: [],
-        },
-        {
-          agentId: "proxy-1",
-          agentName: "Default Proxy",
-          teamName: "Platform",
-          agentType: "llm_proxy",
-          requests: 4,
-          inputTokens: 20,
-          outputTokens: 10,
-          cost: 5,
-          timeSeries: [],
-        },
-      ],
-    });
-    mockUseModelStatistics.mockReturnValue({
-      data: [
-        {
-          model: "gpt-5",
-          requests: 7,
-          inputTokens: 70,
-          outputTokens: 30,
-          cost: 9,
-          percentage: 100,
-          timeSeries: [],
-        },
-      ],
-    });
-
-    const { container } = render(<StatisticsPage />);
-
-    const tablePanels = Array.from(
-      container.querySelectorAll(".max-h-\\[280px\\]"),
+  it("breaks each agent's usage down by person, keeping requests without a person", async () => {
+    llmUsage = [
+      {
+        day: "2026-01-01",
+        agentId: "agent-triage",
+        agentName: "Support triage",
+        userId: "user-ada",
+        userName: "Ada Lovelace",
+        ...usage({ requests: 3 }),
+      },
+      {
+        day: "2026-01-01",
+        agentId: "agent-triage",
+        agentName: "Support triage",
+        userId: null,
+        userName: null,
+        ...usage({ requests: 1 }),
+      },
+      {
+        day: "2026-01-01",
+        agentId: "agent-review",
+        agentName: "Code review",
+        userId: "user-ada",
+        userName: "Ada Lovelace",
+        ...usage({ requests: 2 }),
+      },
+    ];
+    search = new URLSearchParams({ chart: "table" });
+    show();
+    await view("Tokens by agent and person");
+    await waitFor(() =>
+      expect(
+        requests
+          .find((url) => url.pathname.endsWith("/llm-usage"))
+          ?.searchParams.get("groupBy"),
+      ).toBe("day,agentId,userId"),
     );
+    expect(
+      screen.getByRole("button", { name: /^split by Person/ }),
+    ).toBeInTheDocument();
+    expect(await screen.findAllByText("Ada Lovelace")).not.toHaveLength(0);
+    expect(screen.getAllByText("No person recorded")).not.toHaveLength(0);
+    expect(screen.getAllByText("Support triage")).not.toHaveLength(0);
+  });
 
-    expect(tablePanels).toHaveLength(4);
-    for (const tablePanel of tablePanels) {
-      expect(tablePanel.className).toContain("max-h-[280px]");
-      expect(tablePanel.className).toContain("overflow-auto");
-    }
+  it("renders each selected entity in one reusable table", async () => {
+    teams = [
+      {
+        teamId: "team",
+        teamName: "Platform",
+        members: 3,
+        agents: 2,
+        requests: 12,
+        inputTokens: 100,
+        outputTokens: 50,
+        cost: 42,
+        timeSeries: [],
+      },
+    ];
+    agents = [
+      {
+        agentId: "agent",
+        agentName: "My Assistant",
+        teamName: "Platform",
+        requests: 9,
+        inputTokens: 80,
+        outputTokens: 20,
+        cost: 15,
+        timeSeries: [],
+      },
+    ];
+    show();
+    await screen.findAllByText("$8.25");
+    await group("Team");
+    expect(
+      await within(await screen.findByRole("table")).findByText("Platform"),
+    ).toBeInTheDocument();
+    expect(screen.getAllByRole("table")).toHaveLength(1);
+    await group("Agent");
+    expect(
+      await within(await screen.findByRole("table")).findByText("My Assistant"),
+    ).toBeInTheDocument();
+    expect(screen.getAllByRole("table")).toHaveLength(1);
+  });
+  it("splits app build/runtime spend and discloses a shared build session and baseline", async () => {
+    apps = [
+      {
+        appId: "app",
+        appName: "Sales Dashboard",
+        authorName: "Example",
+        buildCost: 1.5,
+        runtimeCost: 0.25,
+        hasBuildSession: true,
+        buildSessionAppCount: 2,
+        estimatedChatEquivalentCost: 22.5,
+        estimatedNetSavings: 20.75,
+      },
+    ];
+    show();
+    await screen.findAllByText("$8.25");
+    await group("App");
+    expect(
+      await within(await screen.findByRole("table")).findByText(
+        "Sales Dashboard",
+      ),
+    ).toBeInTheDocument();
+    for (const value of ["$1.50", "$0.25", "$20.75"])
+      expect(screen.getByText(value)).toBeInTheDocument();
+    expect(
+      screen.getByText("Shared build session · 2 apps"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/measured average of \$0.75 across 12 chat sessions/),
+    ).toBeInTheDocument();
+  });
+  it("reports missing app build attribution as unknown rather than zero", async () => {
+    apps = [
+      {
+        appId: "app",
+        appName: "Made In The UI",
+        authorName: null,
+        buildCost: 0,
+        runtimeCost: 0,
+        hasBuildSession: false,
+        buildSessionAppCount: 0,
+        estimatedChatEquivalentCost: 1.5,
+        estimatedNetSavings: 1.5,
+      },
+    ];
+    show();
+    await screen.findAllByText("$8.25");
+    await group("App");
+    const row = (
+      await within(await screen.findByRole("table")).findByText(
+        "Made In The UI",
+      )
+    ).closest("tr");
+    expect(row).toHaveTextContent("No recorded build session");
+    const buildIndex = within(screen.getByRole("table"))
+      .getAllByRole("columnheader")
+      .findIndex((header) => header.textContent === "Build spend");
+    expect(
+      within(row as HTMLElement).getAllByRole("cell")[buildIndex],
+    ).toHaveTextContent(/^—$/);
+  });
+  it("shows skill context footprint alongside overlapping turn spend and measurement coverage", async () => {
+    skillsUsage = [
+      {
+        skillId: "skill",
+        skillName: "PDF Extraction",
+        activations: 5,
+        contextTokens: 6420,
+        users: 3,
+      },
+    ];
+    skills = [
+      {
+        skillId: "skill",
+        skillName: "PDF Extraction",
+        activations: 5,
+        measuredActivations: 3,
+        attributedCost: 1.68,
+        attributedRequests: 12,
+      },
+    ];
+    show();
+    await screen.findAllByText("$8.25");
+    await view("Skill activations by skill");
+    expect(
+      await within(await screen.findByRole("table")).findByText(
+        "PDF Extraction",
+      ),
+    ).toBeInTheDocument();
+    await metric("Tokens");
+    expect(
+      await within(await screen.findByRole("table")).findByText("6,420"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("$1.68")).toBeInTheDocument();
+    expect(screen.getByText("3 of 5 context measurements")).toBeInTheDocument();
+    expect(screen.getByText(/not an exclusive skill cost/)).toBeInTheDocument();
+  });
+  it("pins a model across people, keys, agents and metric changes, and clears back to models", async () => {
+    search = new URLSearchParams({ timeframe: "24h" });
+    models = [model("example/model+a")];
+    const selected: URL[] = [];
+    server.use(
+      http.get(`${origin}/api/statistics/model-usage`, ({ request }) => {
+        const url = new URL(request.url);
+        selected.push(url);
+        const group = url.searchParams.get("groupBy");
+        const name =
+          group === "person"
+            ? "Example person"
+            : group === "key"
+              ? "Pipeline key"
+              : "Research agent";
+        return HttpResponse.json(
+          paginated([
+            {
+              id: group,
+              name,
+              requests: 7,
+              totalTokens: 120,
+              cacheReadTokens: 40,
+              cacheWriteTokens: 10,
+              billedCost: 2,
+              subscriptionCost: 0,
+              timeSeries: [
+                {
+                  timestamp: "2026-10-30T00:00:00Z",
+                  requests: 7,
+                  totalTokens: 120,
+                  cacheReadTokens: 40,
+                  cacheWriteTokens: 10,
+                  billedCost: 2,
+                  subscriptionCost: 0,
+                },
+              ],
+            },
+          ]),
+        );
+      }),
+    );
+    show();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Explore example/model+a" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("table")).toHaveTextContent("Example person"),
+    );
+    await group("Credential");
+    await waitFor(() =>
+      expect(screen.getByRole("table")).toHaveTextContent("Pipeline key"),
+    );
+    await group("Agent");
+    await waitFor(() =>
+      expect(screen.getByRole("table")).toHaveTextContent("Research agent"),
+    );
+    await metric("Requests");
+    expect(screen.getByRole("table")).toHaveTextContent("7");
+    expect(selected.map((url) => url.searchParams.get("groupBy"))).toEqual([
+      "person",
+      "key",
+      "agent",
+    ]);
+    expect(
+      selected.every(
+        (url) =>
+          url.searchParams.get("model") === "example/model+a" &&
+          url.searchParams.get("timeframe") === "24h",
+      ),
+    ).toBe(true);
+    // The drill-down cannot split, so presets with a split are not offered.
+    fireEvent.keyDown(screen.getByRole("button", { name: /^View / }), {
+      key: "Enter",
+    });
+    expect(
+      await screen.findByRole("menuitem", { name: "Tokens by person" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("menuitem", { name: "Tokens by agent and person" }),
+    ).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: "Clear model filter" }));
+    expect(
+      await screen.findByRole("button", { name: "Explore example/model+a" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Research agent")).not.toBeInTheDocument();
+  });
+  it("reports a failed scope total instead of a team admin's overlapping row sum", async () => {
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions) =>
+        ({
+          data: !permissions.llmCost,
+          isPending: false,
+        }) as ReturnType<typeof useHasPermissions>,
+    );
+    vi.mocked(useTeamLimitAccess).mockReturnValue({
+      isTeamAdmin: true,
+      canRead: true,
+      teams: [{ id: "parent", name: "Platform" }],
+    } as ReturnType<typeof useTeamLimitAccess>);
+    const row = (teamId: string, teamName: string, cost: number) => ({
+      teamId,
+      teamName,
+      members: 1,
+      agents: 1,
+      requests: 1,
+      inputTokens: 0,
+      outputTokens: 0,
+      cost,
+      timeSeries: [],
+    });
+    teams = [
+      row("parent", "Platform", 100),
+      row("child", "Platform Search", 40),
+    ];
+    server.use(
+      http.get(`${origin}/api/statistics/costs`, () =>
+        HttpResponse.json(
+          { error: { message: "Unavailable" } },
+          { status: 500 },
+        ),
+      ),
+    );
+    search = new URLSearchParams("group=team&metric=billed");
+    show();
+    expect(
+      await screen.findByText("Could not load usage statistics"),
+    ).toBeVisible();
+    expect(screen.queryByText("$140.00")).not.toBeInTheDocument();
+  });
+  it("lets a team admin leave the model view a drill-down link falls back to", async () => {
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions) =>
+        ({
+          data: !permissions.llmCost,
+          isPending: false,
+        }) as ReturnType<typeof useHasPermissions>,
+    );
+    vi.mocked(useTeamLimitAccess).mockReturnValue({
+      isTeamAdmin: true,
+      canRead: true,
+      teams: [{ id: "parent", name: "Platform" }],
+    } as ReturnType<typeof useTeamLimitAccess>);
+    teams = [
+      {
+        teamId: "parent",
+        teamName: "Platform",
+        members: 1,
+        agents: 1,
+        requests: 3,
+        inputTokens: 0,
+        outputTokens: 0,
+        cost: 4,
+        timeSeries: [],
+      },
+    ];
+    search = new URLSearchParams("group=person&model=example/model-a");
+    show();
+    expect(
+      await screen.findByRole("button", { name: "by Model" }),
+    ).toBeVisible();
+    await group("Team");
+    expect(
+      await within(await screen.findByRole("table")).findByText("Platform"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "by Team" })).toBeVisible();
+  });
+  it("explores billed spend for a team admin's subscription link", async () => {
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions) =>
+        ({
+          data: !permissions.llmCost,
+          isPending: false,
+        }) as ReturnType<typeof useHasPermissions>,
+    );
+    vi.mocked(useTeamLimitAccess).mockReturnValue({
+      isTeamAdmin: true,
+      canRead: true,
+      teams: [{ id: "parent", name: "Platform" }],
+    } as ReturnType<typeof useTeamLimitAccess>);
+    search = new URLSearchParams("group=model&metric=subscription");
+    show();
+    const metricButton = await screen.findByRole("button", { name: /^Show / });
+    expect(metricButton).toHaveTextContent("Billed spend");
+    fireEvent.keyDown(metricButton, { key: "Enter" });
+    const options = (await screen.findAllByRole("menuitem")).map(
+      (item) => item.textContent,
+    );
+    expect(options).toContain("Billed spend");
+    expect(options.some((o) => /subscription/i.test(o ?? ""))).toBe(false);
+  });
+  it("drops a breakdown a team admin's shared link asks for", async () => {
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions) =>
+        ({
+          data: !permissions.llmCost,
+          isPending: false,
+        }) as ReturnType<typeof useHasPermissions>,
+    );
+    vi.mocked(useTeamLimitAccess).mockReturnValue({
+      isTeamAdmin: true,
+      canRead: true,
+      teams: [{ id: "parent", name: "Platform" }],
+    } as ReturnType<typeof useTeamLimitAccess>);
+    teams = [
+      {
+        teamId: "parent",
+        teamName: "Platform",
+        members: 1,
+        agents: 1,
+        requests: 3,
+        inputTokens: 0,
+        outputTokens: 0,
+        cost: 4,
+        timeSeries: [],
+      },
+    ];
+    search = new URLSearchParams("group=team&split=model&metric=billed");
+    show();
+    await within(await screen.findByRole("table")).findByText("Platform");
+    // Breakdowns come from the organization-wide usage endpoint.
+    expect(
+      new Set(requests.map((url) => url.pathname.split("/").pop())),
+    ).toEqual(new Set(["costs", "teams"]));
+  });
+  it("counts a team admin's overlapping team rows once in totals, trend and pivot", async () => {
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions) =>
+        ({
+          data: !permissions.llmCost,
+          isPending: false,
+        }) as ReturnType<typeof useHasPermissions>,
+    );
+    vi.mocked(useTeamLimitAccess).mockReturnValue({
+      isTeamAdmin: true,
+      canRead: true,
+      teams: [
+        { id: "parent", name: "Platform" },
+        { id: "child", name: "Platform Search" },
+      ],
+    } as ReturnType<typeof useTeamLimitAccess>);
+    const days = ["2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04"];
+    const series = (cacheReads: number[]) =>
+      days.map((day, i) => ({
+        timestamp: `${day}T00:00:00.000Z`,
+        value: 0,
+        cacheReadTokens: cacheReads[i],
+      }));
+    const row = (teamId: string, teamName: string, cacheReads: number[]) => ({
+      teamId,
+      teamName,
+      members: 1,
+      agents: 1,
+      requests: 1,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: cacheReads.reduce((a, b) => a + b, 0),
+      cost: 0,
+      timeSeries: series(cacheReads),
+    });
+    // The parent's rows already include its sub-team's usage, so the rows
+    // sum to 140, 140, 360, 360 while the scope used 100, 100, 200, 200.
+    teams = [
+      row("parent", "Platform", [100, 100, 200, 200]),
+      row("child", "Platform Search", [40, 40, 160, 160]),
+    ];
+    models = [
+      {
+        ...model(),
+        cacheReadTokens: 600,
+        timeSeries: series([100, 100, 200, 200]),
+      },
+    ];
+    search = new URLSearchParams("group=team&metric=cacheRead");
+    show();
+    await within(await screen.findByRole("table")).findByText(
+      "Platform Search",
+    );
+    // The headline (and the parent's row) read 600; the rows' sum, 1,000,
+    // never appears.
+    expect((await screen.findAllByText("600")).length).toBeGreaterThan(0);
+    expect(screen.queryByText("1,000")).not.toBeInTheDocument();
+    expect(screen.getByText("+100%")).toBeVisible();
+    expect(
+      screen.getByText(/rows can add up to more than the total/),
+    ).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Pivot" }));
+    const all = (await screen.findAllByRole("row")).find(
+      (r) => r.firstElementChild?.textContent === "All",
+    );
+    expect(all).toBeDefined();
+    const cells = [...(all?.children ?? [])].map((cell) => cell.textContent);
+    expect(cells.slice(1, 5)).toEqual(["100", "100", "200", "200"]);
+  });
+  it("limits a team admin without organization cost access to their teams' groupings", async () => {
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions) =>
+        ({
+          data: !permissions.llmCost,
+          isPending: false,
+        }) as ReturnType<typeof useHasPermissions>,
+    );
+    vi.mocked(useTeamLimitAccess).mockReturnValue({
+      isTeamAdmin: true,
+      canRead: true,
+      teams: [
+        { id: "parent", name: "Platform" },
+        { id: "child", name: "Platform Search" },
+      ],
+    } as ReturnType<typeof useTeamLimitAccess>);
+    search = new URLSearchParams("group=person&metric=tokens");
+    show();
+    expect(
+      await screen.findByRole("button", { name: "by Model" }),
+    ).toBeVisible();
+    fireEvent.keyDown(screen.getByRole("button", { name: /^by / }), {
+      key: "Enter",
+    });
+    expect(
+      (await screen.findAllByRole("menuitem")).map((item) => item.textContent),
+    ).toEqual(["Time", "Team", "Model"]);
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    fireEvent.keyDown(
+      screen.getByRole("button", { name: "Team All my teams" }),
+      { key: "Enter" },
+    );
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: "Platform Search" }),
+    );
+    await waitFor(() =>
+      expect(
+        requests.some((url) => url.searchParams.get("teamId") === "child"),
+      ).toBe(true),
+    );
+    expect(
+      new Set(requests.map((url) => url.pathname.split("/").pop())),
+    ).toEqual(new Set(["costs"]));
   });
 });

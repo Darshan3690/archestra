@@ -1,8 +1,10 @@
-import { describe, expect, it } from "vitest";
+// @vitest-environment node
+import { describe, expect, it, vi } from "vitest";
 import {
   getCompactToolState,
   getCurrentEnabledToolIds,
   getDefaultEnabledToolIds,
+  getHumanRulingDisplay,
   getToolErrorText,
   getToolNameFromPart,
   isCompactEligible,
@@ -21,7 +23,7 @@ describe("getDefaultEnabledToolIds", () => {
   it("includes archestra tools (they are not filtered out)", () => {
     const tools = [
       { id: "a1", name: "archestra__web_search" },
-      { id: "a2", name: "archestra__artifact_write" },
+      { id: "a2", name: "archestra__todo_write" },
       { id: "a3", name: "archestra__some_custom_tool" },
       { id: "m1", name: "other_server__some_tool" },
     ];
@@ -193,6 +195,42 @@ describe("tool display helpers", () => {
     ).toContain('Expired or invalid authentication for "id-jag test"');
   });
 
+  it("keeps a proposed policy change as a full card", () => {
+    expect(
+      isCompactEligible({
+        toolName: "archestra__preview_guardrails_policy_change",
+        getToolShortName: (name) =>
+          name === "archestra__preview_guardrails_policy_change"
+            ? "preview_guardrails_policy_change"
+            : null,
+        part: {
+          type: "tool-archestra__preview_guardrails_policy_change",
+          state: "output-available",
+          output: { structuredContent: { stage: "preview" } },
+        } as never,
+        toolResultPart: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("folds a saved policy change into a circle like other calls", () => {
+    expect(
+      isCompactEligible({
+        toolName: "archestra__update_guardrails_policy",
+        getToolShortName: (name) =>
+          name === "archestra__update_guardrails_policy"
+            ? "update_guardrails_policy"
+            : null,
+        part: {
+          type: "tool-archestra__update_guardrails_policy",
+          state: "output-available",
+          output: { structuredContent: { delivery: "revision" } },
+        } as never,
+        toolResultPart: null,
+      }),
+    ).toBe(true);
+  });
+
   it("marks generic tool failures as compact-eligible", () => {
     expect(
       isCompactEligible({
@@ -205,21 +243,6 @@ describe("tool display helpers", () => {
         toolResultPart: null,
       }),
     ).toBe(true);
-  });
-
-  it("keeps policy denials as full cards", () => {
-    expect(
-      isCompactEligible({
-        toolName: "linear__create_issue",
-        part: {
-          type: "tool-linear__create_issue",
-          state: "input-available",
-          errorText:
-            'I tried to invoke the linear__create_issue tool with the following arguments: {"title":"Blocked"}.\n\nHowever, I was denied by a tool invocation policy:\n\nTool invocation blocked: sensitive data detected',
-        } as never,
-        toolResultPart: null,
-      }),
-    ).toBe(false);
   });
 
   it("keeps auth-required responses as full cards", () => {
@@ -321,5 +344,141 @@ describe("tool display helpers", () => {
         toolResultPart: null,
       }),
     ).toBe("completed");
+
+    // A declined approval is terminal: it must map to "denied" (orange dot), not
+    // fall through to "running" (a blue pulsing dot that never resolves).
+    expect(
+      getCompactToolState({
+        part: {
+          type: "tool-github__create_issue",
+          state: "output-denied",
+        } as never,
+        toolResultPart: null,
+      }),
+    ).toBe("denied");
+  });
+});
+
+describe("reviewed remedy rulings", () => {
+  function remedyPart(output: unknown) {
+    return {
+      type: "tool-archestra__execute_remedy_plan",
+      toolCallId: "call-remedy",
+      state: "output-available",
+      input: { offer_id: "offer-1" },
+      output,
+    } as never;
+  }
+
+  it("shows a remedy the viewer denied as denied, not completed", () => {
+    const part = remedyPart({
+      content: "[appa] Denied: the human reviewer refused this call.",
+      _meta: { archestraHumanRuling: "deny" },
+    });
+
+    expect(getCompactToolState({ part, toolResultPart: null })).toBe("denied");
+    expect(getHumanRulingDisplay({ part, toolResultPart: null })).toEqual({
+      ruling: "deny",
+      label: "Denied by you",
+    });
+  });
+
+  it("reads the ruling off the result part when the call and result are split", () => {
+    const toolResultPart = remedyPart({
+      content: "[appa] Denied: the human reviewer refused this call.",
+      _meta: { archestraHumanRuling: "deny" },
+    });
+    const part = {
+      type: "tool-archestra__execute_remedy_plan",
+      toolCallId: "call-remedy",
+      state: "input-available",
+      input: { offer_id: "offer-1" },
+    } as never;
+
+    expect(getCompactToolState({ part, toolResultPart })).toBe("denied");
+  });
+
+  it("keeps an approved remedy completed, labelled as the viewer's approval", () => {
+    const part = remedyPart({
+      content: "[appa] Authorized.",
+      _meta: { archestraHumanRuling: "approve" },
+    });
+
+    expect(getCompactToolState({ part, toolResultPart: null })).toBe(
+      "completed",
+    );
+    expect(getHumanRulingDisplay({ part, toolResultPart: null })?.label).toBe(
+      "Approved by you",
+    );
+  });
+
+  it("lets an error outrank the ruling it answered", () => {
+    const part = remedyPart({
+      content: "[appa] offer invalidated",
+      _meta: {
+        archestraError: { type: "generic", message: "offer invalidated" },
+        archestraHumanRuling: "deny",
+      },
+    });
+
+    expect(getCompactToolState({ part, toolResultPart: null })).toBe("error");
+    expect(getHumanRulingDisplay({ part, toolResultPart: null })).toBeNull();
+  });
+});
+
+describe("isCompactEligible auth check", () => {
+  it("parses a part's output once across renders, and again when it changes", () => {
+    const part = {
+      type: "tool-github__search",
+      state: "output-available",
+      output:
+        'Authentication required for "GitHub". To authenticate, visit: https://example.com/connect/github',
+    };
+    const check = () =>
+      isCompactEligible({
+        toolName: "github__search",
+        part: part as never,
+        toolResultPart: null,
+      });
+    // The auth parsers JSON.parse text that carries their marker; count those.
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      expect(check()).toBe(false);
+      const parsesForFirstRender = parse.mock.calls.length;
+      expect(parsesForFirstRender).toBeGreaterThan(0);
+      expect(check()).toBe(false);
+      // Other readers of the output parse it every time; the auth check's
+      // parse is the one the second render no longer pays for.
+      expect(parse.mock.calls.length - parsesForFirstRender).toBe(
+        parsesForFirstRender - 1,
+      );
+
+      part.output = "plain result";
+      expect(check()).toBe(true);
+    } finally {
+      parse.mockRestore();
+    }
+  });
+});
+
+describe("isCompactEligible for a tool call that found no device", () => {
+  it("keeps the call open, so its MCP bridge setup card shows", () => {
+    const failed = (errorText: string) =>
+      isCompactEligible({
+        toolName: "archestra__run_tool",
+        part: {
+          type: "tool-archestra__run_tool",
+          state: "output-error",
+          errorText,
+        } as never,
+        toolResultPart: null,
+      });
+    expect(
+      failed(
+        "MCP error -32603: No device is linked. Set up the MCP bridge on your device from the Device tab of Personal Settings and try again.",
+      ),
+    ).toBe(false);
+    // Any other failure folds into the row as before.
+    expect(failed("MCP error -32603: Request failed")).toBe(true);
   });
 });

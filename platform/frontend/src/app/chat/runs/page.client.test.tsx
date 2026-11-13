@@ -1,0 +1,503 @@
+import { act, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { useRouter } from "next/navigation";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useHasPermissions } from "@/lib/auth/auth.query";
+
+const queryState = vi.hoisted(() => ({
+  value: {
+    data: undefined as Record<string, unknown> | undefined,
+    isPending: false,
+    isError: false,
+    error: undefined as Error | undefined,
+    refetch: vi.fn(),
+  },
+}));
+
+const cancelState = vi.hoisted(() => ({
+  isPending: false,
+  mutate: vi.fn(),
+}));
+
+const deleteRunState = vi.hoisted(() => ({
+  isPending: false,
+  mutate: vi.fn(),
+}));
+
+const terminalState = vi.hoisted(() => ({
+  props: null as {
+    taskId: string;
+    title?: string;
+    showManualCommand?: boolean;
+    showDisconnectedStatus?: boolean;
+    onCommandChange?: (command: string | null) => void;
+    onError?: () => void;
+  } | null,
+}));
+
+vi.mock("@/lib/auth/auth.query");
+
+vi.mock("next/navigation");
+
+vi.mock("@/lib/agent-runtime.query", () => ({
+  useCancelAgentRun: () => cancelState,
+  useDeleteAgentRun: () => deleteRunState,
+  useDeleteAgentWorkspace: () => ({ isPending: false, mutate: vi.fn() }),
+  useContinueAgentRun: () => ({ isPending: false, mutate: vi.fn() }),
+  useMyAgentRun: () => queryState.value,
+}));
+
+vi.mock("@/components/agent-run-terminal", () => ({
+  AgentRunTerminal: (props: NonNullable<typeof terminalState.props>) => {
+    terminalState.props = props;
+    return <div>Live terminal {props.taskId}</div>;
+  },
+}));
+
+vi.mock("@/components/agent-run-logs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/components/agent-run-logs")>()),
+  AgentRunLogs: () => <div>Retained run output</div>,
+}));
+
+const shareDialogState = vi.hoisted(() => ({ open: false }));
+
+// The share dialog owns its own data hooks and tests, so stub it to a marker
+// that just reflects its open state — enough to prove the menu item opens it.
+vi.mock("@/components/chat/share-agent-run-dialog", () => ({
+  ShareAgentRunDialog: ({ open }: { open: boolean }) => {
+    shareDialogState.open = open;
+    return open ? <div>Share run dialog</div> : null;
+  },
+}));
+
+import { AgentRunChatSession } from "./page.client";
+
+describe("AgentRunChatSession", () => {
+  beforeEach(() => {
+    cancelState.isPending = false;
+    cancelState.mutate.mockReset();
+    deleteRunState.mutate.mockReset();
+    terminalState.props = null;
+    shareDialogState.open = false;
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+    } as ReturnType<typeof useHasPermissions>);
+    queryState.value = {
+      data: undefined,
+      isPending: false,
+      isError: false,
+      error: undefined,
+      refetch: vi.fn(),
+    };
+  });
+
+  it("reattaches to a completed live session and detaches back to its recording", async () => {
+    const user = userEvent.setup();
+    queryState.value.data = run({
+      endedAt: new Date().toISOString(),
+      state: "TASK_STATE_COMPLETED",
+      terminalRetained: true,
+      workspace: {
+        state: "idle",
+        expiresAt: new Date(Date.now() + 3600000).toISOString(),
+        idleAt: null,
+        connection: null,
+      },
+    });
+    const { rerender } = render(<AgentRunChatSession taskId="task-1" />);
+    await user.click(screen.getAllByRole("button", { name: "Resume" })[0]);
+    expect(screen.getByText("Live terminal task-1")).toBeInTheDocument();
+    expect(screen.queryByText("Retained run output")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "More run actions" }));
+    await user.click(screen.getByRole("menuitem", { name: "Detach" }));
+    expect(screen.getByText("Retained run output")).toBeInTheDocument();
+    queryState.value.data = {
+      ...queryState.value.data,
+      terminalRetained: false,
+      workspace: {
+        state: "suspended",
+        expiresAt: new Date(Date.now() + 3600000).toISOString(),
+        idleAt: null,
+        connection: null,
+      },
+    };
+    rerender(<AgentRunChatSession taskId="task-1" />);
+    expect(
+      screen.getAllByRole("button", { name: "Resume" })[0],
+    ).toBeInTheDocument();
+  });
+
+  it("opens the shared terminal while the session is being created", () => {
+    queryState.value.isPending = true;
+
+    render(<AgentRunChatSession taskId="task-1" />);
+
+    expect(screen.getByText("Live terminal task-1")).toBeInTheDocument();
+    expect(screen.queryByText("Starting run…")).not.toBeInTheDocument();
+    expect(terminalState.props).toMatchObject({
+      showManualCommand: false,
+      showDisconnectedStatus: false,
+    });
+  });
+
+  it("keeps the last run visible when a background refresh fails", () => {
+    queryState.value.data = run({
+      state: "TASK_STATE_SUBMITTED",
+      endedAt: null,
+    });
+    queryState.value.isError = true;
+
+    render(<AgentRunChatSession taskId="task-1" />);
+
+    expect(screen.getByText("Live terminal task-1")).toBeInTheDocument();
+    expect(screen.getByText("Starting")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Couldn't load this run"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not blame ownership when the run cannot be loaded", () => {
+    queryState.value.isError = true;
+    queryState.value.error = new Error("Run not found");
+
+    render(<AgentRunChatSession taskId="task-1" />);
+
+    // Rendered as an informational terminal state, not a generic error card.
+    expect(screen.getByRole("status")).toBeInTheDocument();
+    expect(screen.getByText("Terminal unavailable")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "This run could not be loaded. It may have failed to start, been removed, or you may not have access.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "Only the person who started this run can attach to it.",
+      ),
+    ).not.toBeInTheDocument();
+    // The old full-page error card is gone.
+    expect(
+      screen.queryByText("Couldn't load this run"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("opens the shared live terminal once the run is running", () => {
+    queryState.value.data = run({
+      state: "TASK_STATE_WORKING",
+      endedAt: null,
+    });
+
+    render(<AgentRunChatSession taskId="task-1" />);
+
+    expect(screen.getByText("Live terminal task-1")).toBeInTheDocument();
+    expect(screen.getByText("Running")).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("button", { name: "Stop" })[0],
+    ).toBeInTheDocument();
+    expect(terminalState.props).toMatchObject({
+      showManualCommand: false,
+      showDisconnectedStatus: false,
+    });
+  });
+
+  it("refreshes run state when completion wins the terminal attach race", () => {
+    queryState.value.data = run({
+      state: "TASK_STATE_WORKING",
+      endedAt: null,
+    });
+
+    render(<AgentRunChatSession taskId="task-1" />);
+    act(() => terminalState.props?.onError?.());
+
+    expect(queryState.value.refetch).toHaveBeenCalledOnce();
+  });
+
+  it("moves agent and terminal details into the run actions menu", async () => {
+    const user = userEvent.setup();
+    queryState.value.data = run({
+      state: "TASK_STATE_WORKING",
+      endedAt: null,
+    });
+
+    render(<AgentRunChatSession taskId="task-1" />);
+    act(() => terminalState.props?.onCommandChange?.("kubectl exec example"));
+
+    await user.click(screen.getByRole("button", { name: "More run actions" }));
+
+    expect(
+      screen.getByRole("menuitem", { name: "View Agent" }),
+    ).toHaveAttribute(
+      "href",
+      "/agents/00000000-0000-4000-8000-000000000001?section=runs",
+    );
+
+    await user.click(
+      screen.getByRole("menuitem", { name: "View connection details" }),
+    );
+
+    expect(
+      screen.getByRole("heading", { name: "Terminal connection details" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("kubectl exec example")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Port forwarding command"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("links the owner to the run's LLM trace when they may read logs", async () => {
+    const user = userEvent.setup();
+    // The trace is keyed by the session id the runtime sends, not by the
+    // run's own session (workspace) id.
+    queryState.value.data = run({
+      sessionId: "workspace-1",
+      llmSessionId: "agent-run-codex-task1234",
+    });
+
+    render(<AgentRunChatSession taskId="task-1" />);
+    await user.click(screen.getByRole("button", { name: "More run actions" }));
+
+    expect(
+      screen.getByRole("menuitem", { name: "View trace" }),
+    ).toHaveAttribute("href", "/llm/logs/agent-run-codex-task1234");
+  });
+
+  it("leaves the trace out without log:read", async () => {
+    const user = userEvent.setup();
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: false,
+    } as ReturnType<typeof useHasPermissions>);
+    queryState.value.data = run({
+      sessionId: "workspace-1",
+      llmSessionId: "agent-run-codex-task1234",
+    });
+
+    render(<AgentRunChatSession taskId="task-1" />);
+    await user.click(screen.getByRole("button", { name: "More run actions" }));
+
+    expect(screen.getByRole("menuitem", { name: "View Agent" })).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "View trace" })).toBeNull();
+  });
+
+  it("shows a copyable port forwarding command for a configured workspace", async () => {
+    const user = userEvent.setup();
+    const command =
+      "kubectl port-forward -n archestra-dev pod/active-pod :3000 :9000";
+    queryState.value.data = run({
+      state: "TASK_STATE_WORKING",
+      endedAt: null,
+      portForwardCommand: command,
+    });
+    render(<AgentRunChatSession taskId="task-1" />);
+    act(() => terminalState.props?.onCommandChange?.("kubectl exec example"));
+
+    await user.click(screen.getByRole("button", { name: "More run actions" }));
+    await user.click(
+      screen.getByRole("menuitem", { name: "View connection details" }),
+    );
+
+    expect(screen.getByText(command)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Copy port forwarding command" }),
+    ).toBeEnabled();
+  });
+
+  it("exposes Share from the actions menu instead of a separate button", async () => {
+    const user = userEvent.setup();
+    queryState.value.data = run({
+      state: "TASK_STATE_WORKING",
+      endedAt: null,
+    });
+
+    render(<AgentRunChatSession taskId="task-1" />);
+
+    // No standalone Share button in the header anymore.
+    expect(
+      screen.queryByRole("button", { name: "Share" }),
+    ).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "More run actions" }));
+    await user.click(screen.getByRole("menuitem", { name: "Share" }));
+
+    // Selecting it opens the share dialog.
+    expect(screen.getByText("Share run dialog")).toBeInTheDocument();
+  });
+
+  it("restores retained output after the run has ended", () => {
+    queryState.value.data = run({
+      state: "TASK_STATE_COMPLETED",
+      lastModelActivityAt: "2026-08-28T17:30:00.000Z",
+      endedAt: "2026-08-28T18:00:00.000Z",
+    });
+
+    render(<AgentRunChatSession taskId="task-1" />);
+
+    expect(screen.getByText("Retained run output")).toBeInTheDocument();
+    expect(screen.getByText("Completed")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Stop" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("switches an attached terminal to retained history when the run completes", () => {
+    queryState.value.data = run({
+      state: "TASK_STATE_WORKING",
+      endedAt: null,
+    });
+    const { rerender } = render(<AgentRunChatSession taskId="task-1" />);
+    act(() => terminalState.props?.onCommandChange?.("kubectl exec example"));
+
+    queryState.value.data = run({
+      state: "TASK_STATE_COMPLETED",
+      lastModelActivityAt: "2026-08-28T17:30:00.000Z",
+      endedAt: "2026-08-28T18:00:00.000Z",
+    });
+    rerender(<AgentRunChatSession taskId="task-1" />);
+
+    expect(screen.queryByText("Live terminal task-1")).not.toBeInTheDocument();
+    expect(screen.getByText("Retained run output")).toBeInTheDocument();
+  });
+
+  it("connects a service-account manager while keeping run mutations owner-only", async () => {
+    queryState.value.data = run({
+      viewerRole: "shared",
+      canAttach: true,
+      actorKind: "serviceAccount",
+      actorUserId: null,
+    });
+    render(<AgentRunChatSession taskId="task-1" />);
+    expect(screen.getByText("Live terminal task-1")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "More run actions" }));
+    expect(screen.queryByRole("menuitem", { name: "Share" })).toBeNull();
+    await user.click(screen.getByRole("menuitem", { name: "Run history" }));
+    expect(screen.getByText("Retained run output")).toBeVisible();
+    expect(screen.queryByText("Read-only terminal")).toBeNull();
+  });
+
+  it("gives a shared viewer read-only output without owner controls on a live run", async () => {
+    queryState.value.data = run({
+      state: "TASK_STATE_WORKING",
+      endedAt: null,
+      viewerRole: "shared",
+    });
+
+    render(<AgentRunChatSession taskId="task-1" />);
+
+    // Read-only log stream instead of the interactive terminal.
+    expect(screen.getByText("Retained run output")).toBeInTheDocument();
+    expect(screen.queryByText("Live terminal task-1")).not.toBeInTheDocument();
+    // While the run is live, the shared viewer is told why the terminal is read-only.
+    expect(
+      screen.getByText(/viewing its terminal output in read-only mode/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Read-only terminal").closest("[role=status]"),
+    ).toHaveTextContent("Read-only terminal");
+    // None of the owner-only controls are rendered.
+    expect(
+      screen.queryByRole("button", { name: "Stop" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Share" }),
+    ).not.toBeInTheDocument();
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "More run actions" }));
+    expect(
+      screen.getByRole("menuitem", { name: "Download logs" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("menuitem", { name: "Download trajectory" }),
+    ).toHaveAttribute("aria-disabled", "true");
+    expect(screen.queryByRole("menuitem", { name: "Share" })).toBeNull();
+    expect(
+      screen.queryByRole("menuitem", { name: "Delete saved files" }),
+    ).toBeNull();
+  });
+
+  it("deletes an ended run from its actions menu and leaves for a new chat", async () => {
+    const user = userEvent.setup();
+    const push = vi.fn();
+    vi.mocked(useRouter).mockReturnValue({ push } as unknown as ReturnType<
+      typeof useRouter
+    >);
+    queryState.value.data = run({ state: "TASK_STATE_WORKING" });
+    const { rerender } = render(<AgentRunChatSession taskId="task-1" />);
+    await user.click(screen.getByRole("button", { name: "More run actions" }));
+    // A live run is stopped first; the server refuses to delete it.
+    expect(screen.queryByRole("menuitem", { name: "Delete run" })).toBeNull();
+    await user.keyboard("{Escape}");
+
+    queryState.value.data = run({
+      state: "TASK_STATE_COMPLETED",
+      endedAt: "2099-08-28T18:00:00.000Z",
+    });
+    rerender(<AgentRunChatSession taskId="task-1" />);
+    await user.click(screen.getByRole("button", { name: "More run actions" }));
+    await user.click(screen.getByRole("menuitem", { name: "Delete run" }));
+    await user.click(screen.getByRole("button", { name: "Delete run" }));
+
+    expect(deleteRunState.mutate).toHaveBeenCalledWith(
+      "task-1",
+      expect.anything(),
+    );
+    expect(push).not.toHaveBeenCalled();
+    act(() => deleteRunState.mutate.mock.calls[0][1].onSuccess());
+    expect(push).toHaveBeenCalledWith("/chat");
+  });
+
+  it("shows a shared viewer retained output for an ended run without owner controls", async () => {
+    queryState.value.data = run({
+      state: "TASK_STATE_COMPLETED",
+      lastModelActivityAt: "2026-08-28T17:30:00.000Z",
+      endedAt: "2026-08-28T18:00:00.000Z",
+      viewerRole: "shared",
+    });
+
+    render(<AgentRunChatSession taskId="task-1" />);
+
+    expect(screen.getByText("Retained run output")).toBeInTheDocument();
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "More run actions" }));
+    expect(
+      screen.getByRole("menuitem", { name: "Download logs" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("menuitem", { name: "Download trajectory" }),
+    ).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "Share" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Delete run" })).toBeNull();
+    // No live terminal to contrast, so no read-only banner once the run has ended.
+    expect(screen.queryByText(/read-only mode/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Share" }),
+    ).not.toBeInTheDocument();
+  });
+});
+
+function run(overrides: Record<string, unknown>) {
+  return {
+    taskId: "task-1",
+    title: "Nightly dependency audit",
+    workloadName: "agent-task-1",
+    llmSessionId: "agent-task-1",
+    prompt: "Implement the small feature",
+    state: "TASK_STATE_SUBMITTED",
+    statusReason: null,
+    startedAt: "2099-08-28T17:00:00.000Z",
+    hardDeadlineAt: "2100-08-31T17:00:00.000Z",
+    lastModelActivityAt: "2099-08-28T17:00:00.000Z",
+    endedAt: null,
+    // The viewer is the run's owner unless a test overrides this — owners get
+    // the interactive terminal and the Stop/Share/actions controls.
+    viewerRole: "owner",
+    agent: {
+      id: "00000000-0000-4000-8000-000000000001",
+      name: "Codex",
+      icon: null,
+    },
+    ...overrides,
+  };
+}

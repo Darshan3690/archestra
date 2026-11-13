@@ -1,3 +1,4 @@
+import { withoutLoggedMedia } from "@archestra/shared";
 import type { Span } from "@opentelemetry/api";
 import { SpanStatusCode } from "@opentelemetry/api";
 import config from "@/config";
@@ -53,6 +54,26 @@ export const ATTR_GENAI_RESPONSE_FINISH_REASONS =
 export const ATTR_GENAI_USAGE_INPUT_TOKENS = "gen_ai.usage.input_tokens";
 export const ATTR_GENAI_USAGE_OUTPUT_TOKENS = "gen_ai.usage.output_tokens";
 export const ATTR_GENAI_USAGE_TOTAL_TOKENS = "gen_ai.usage.total_tokens";
+// Prompt-cache token counts, per the GenAI semconv. Read = served from a
+// provider cache, creation = written to it. Both are a subset of
+// gen_ai.usage.input_tokens (the span attribute adds cache read/write back onto
+// our internally-uncached input count, so the spec's subset relationship holds).
+export const ATTR_GENAI_USAGE_CACHE_READ_INPUT_TOKENS =
+  "gen_ai.usage.cache_read.input_tokens";
+export const ATTR_GENAI_USAGE_CACHE_CREATION_INPUT_TOKENS =
+  "gen_ai.usage.cache_creation.input_tokens";
+// Portion of cache-creation tokens written at the 1-hour TTL (Anthropic/Bedrock),
+// billed at a higher surcharge than the 5-minute default. The GenAI semconv has no
+// per-TTL breakdown of cache_creation tokens, so this uses the archestra.* namespace.
+// The rest of gen_ai.usage.cache_creation.input_tokens is the 5m-TTL remainder.
+export const ATTR_ARCHESTRA_USAGE_CACHE_CREATION_1H_INPUT_TOKENS =
+  "archestra.usage.cache_creation.1h_input_tokens";
+// Output tokens spent on reasoning / extended thinking. Per the GenAI semconv this
+// value is a subset of gen_ai.usage.output_tokens. Reported by OpenAI-wire
+// providers (reasoning_tokens) and Gemini (thoughtsTokenCount); unset for
+// providers that do not break reasoning tokens out separately.
+export const ATTR_GENAI_USAGE_REASONING_OUTPUT_TOKENS =
+  "gen_ai.usage.reasoning.output_tokens";
 
 // --- gen_ai content events ---
 export const EVENT_GENAI_CONTENT_PROMPT = "gen_ai.content.prompt";
@@ -67,7 +88,13 @@ export const ATTR_GENAI_COMPLETION = "gen_ai.completion";
 // --- archestra custom ---
 export const ATTR_ARCHESTRA_AGENT_TYPE = "archestra.agent.type";
 export const ATTR_ARCHESTRA_COST = "archestra.cost";
-export const ATTR_ARCHESTRA_EXECUTION_ID = "archestra.execution.id";
+// The OTEL attribute registry has no equivalent for gateway virtual keys or
+// credential-derived billing coverage. IDs belong on spans, never metric labels.
+export const ATTR_ARCHESTRA_BILLING_MODE = "archestra.billing.mode";
+export const ATTR_ARCHESTRA_VIRTUAL_KEY_ID = "archestra.virtual_key.id";
+export const ATTR_ARCHESTRA_PASSTHROUGH_VIRTUAL_KEY_ID =
+  "archestra.passthrough_virtual_key.id";
+export const ATTR_ARCHESTRA_RUN_ID = "archestra.run.id";
 export const ATTR_ARCHESTRA_EXTERNAL_AGENT_ID = "archestra.external_agent_id";
 export const ATTR_ARCHESTRA_TRIGGER_SOURCE = "archestra.trigger.source";
 export const ATTR_ARCHESTRA_AUTH_METHOD = "archestra.auth.method";
@@ -76,7 +103,26 @@ export const ATTR_ARCHESTRA_APP_NAME = "archestra.app.name";
 export const ATTR_ARCHESTRA_USER_ID = "archestra.user.id";
 export const ATTR_ARCHESTRA_USER_EMAIL = "archestra.user.email";
 export const ATTR_ARCHESTRA_USER_NAME = "archestra.user.name";
-export const ATTR_ARCHESTRA_LABEL_PREFIX = "archestra.label.";
+export const ATTR_ARCHESTRA_AGENT_LABEL_PREFIX = "archestra.agent.label.";
+// Subagent failover provenance on chat spans when in-place runtime failover
+// switches a detached run from its initially claimed primary subagent to a
+// fallback subagent. The OTEL semantic-convention registry has no failover
+// provenance attributes, so these live under `archestra.subagent.*`.
+export const ATTR_ARCHESTRA_SUBAGENT_INITIAL_AGENT_ID =
+  "archestra.subagent.initial_agent_id";
+export const ATTR_ARCHESTRA_SUBAGENT_INITIAL_AGENT_NAME =
+  "archestra.subagent.initial_agent_name";
+export const ATTR_ARCHESTRA_SUBAGENT_FAILOVER_COUNT =
+  "archestra.subagent.failover_count";
+// Team metadata. Teams are an Archestra concept with no OTEL semantic-convention
+// registry equivalent, so the custom `archestra.<scope>.team.*` namespace is
+// used, where scope is the principal the teams belong to (`agent` or `user`). A
+// principal can belong to multiple teams, so ids/names are array-valued and team
+// label values are merged per key across all of the principal's teams.
+
+// --- MCP ---
+// The JSON-RPC method of an MCP request, per the MCP semantic conventions.
+export const ATTR_MCP_METHOD_NAME = "mcp.method.name";
 
 // --- MCP custom ---
 export const ATTR_MCP_SERVER_NAME = "mcp.server.name";
@@ -94,6 +140,15 @@ export interface SpanAgentInfo {
   agentType?: string;
   labels?: { key: string; value: string }[];
 }
+
+export interface SpanTeamInfo {
+  id: string;
+  name: string;
+  labels?: { key: string; value: string }[];
+}
+
+/** The principal a set of teams belongs to, used to namespace team span attributes. */
+type TeamScope = "agent" | "user";
 
 export interface SpanUserInfo {
   id: string;
@@ -116,10 +171,60 @@ export function setAgentAttributes(span: Span, agent: SpanAgentInfo): void {
   if (agent.labels && agent.labels.length > 0) {
     for (const label of agent.labels) {
       span.setAttribute(
-        `${ATTR_ARCHESTRA_LABEL_PREFIX}${label.key}`,
+        `${ATTR_ARCHESTRA_AGENT_LABEL_PREFIX}${label.key}`,
         label.value,
       );
     }
+  }
+}
+
+export function teamLabelKeyPrefix(scope: TeamScope): string {
+  return `archestra.${scope}.team.label.`;
+}
+
+/**
+ * Set team span attributes for a principal under `archestra.<scope>.team.*`:
+ * `.ids` and `.names` (array-valued, since a principal can belong to multiple
+ * teams) and `.label.<key>` (label values merged per key across the principal's
+ * teams). `scope` distinguishes the agent's teams from the requesting user's.
+ */
+export function setTeamAttributes(
+  span: Span,
+  teams: SpanTeamInfo[] | null | undefined,
+  scope: TeamScope,
+  options?: { writeEmpty?: boolean },
+): void {
+  const base = `archestra.${scope}.team`;
+  if (!teams || teams.length === 0) {
+    if (options?.writeEmpty) {
+      span.setAttribute(`${base}.ids`, []);
+      span.setAttribute(`${base}.names`, []);
+    }
+    return;
+  }
+
+  span.setAttribute(
+    `${base}.ids`,
+    teams.map((team) => team.id),
+  );
+  span.setAttribute(
+    `${base}.names`,
+    teams.map((team) => team.name),
+  );
+
+  // Merge label values per key across the principal's teams. A key can carry
+  // different values on different teams, so each attribute is array-valued.
+  const valuesByKey = new Map<string, Set<string>>();
+  for (const team of teams) {
+    for (const label of team.labels ?? []) {
+      const values = valuesByKey.get(label.key) ?? new Set<string>();
+      values.add(label.value);
+      valuesByKey.set(label.key, values);
+    }
+  }
+  const labelPrefix = teamLabelKeyPrefix(scope);
+  for (const [key, values] of valuesByKey) {
+    span.setAttribute(`${labelPrefix}${key}`, [...values]);
   }
 }
 
@@ -142,10 +247,20 @@ export function setSessionId(
   }
 }
 
-export function setSpanError(span: Span, error: unknown): void {
+export function setSpanError({
+  span,
+  error,
+  includeMessage = true,
+}: {
+  span: Span;
+  error: unknown;
+  includeMessage?: boolean;
+}): void {
   span.setStatus({
     code: SpanStatusCode.ERROR,
-    message: error instanceof Error ? error.message : "Unknown error",
+    ...(includeMessage
+      ? { message: error instanceof Error ? error.message : "Unknown error" }
+      : {}),
   });
   span.setAttribute(
     ATTR_ERROR_TYPE,
@@ -153,8 +268,14 @@ export function setSpanError(span: Span, error: unknown): void {
   );
 }
 
+/**
+ * Content for a span attribute: without media bytes, which a trace has no use
+ * for (an image's base64 would fill the attribute's budget), then cut to the
+ * configured length.
+ */
 export function truncateContent(content: unknown): string {
-  const str = typeof content === "string" ? content : JSON.stringify(content);
+  const kept = withoutLoggedMedia(content);
+  const str = typeof kept === "string" ? kept : JSON.stringify(kept);
   if (str.length <= contentMaxLength) {
     return str;
   }

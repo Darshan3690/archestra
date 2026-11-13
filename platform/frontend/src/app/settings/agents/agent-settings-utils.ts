@@ -1,3 +1,5 @@
+import type { ModelTierSelection } from "@/components/model-tier-pickers";
+
 interface ApiKey {
   id: string;
   provider: string;
@@ -6,15 +8,25 @@ interface ApiKey {
 }
 
 interface OrganizationData {
-  defaultLlmModel?: string | null;
-  defaultLlmProvider?: string | null;
+  /** FK to models(id) — the organization's default model. */
+  defaultModelId?: string | null;
   defaultLlmApiKeyId?: string | null;
+  defaultFastModelId?: string | null;
+  defaultSmartModelId?: string | null;
+  defaultAutoRouterId?: string | null;
   defaultAgentId?: string | null;
 }
 
 export interface AgentSettingsState {
   selectedApiKeyId: string;
+  /** The models.id UUID of the selected default model. */
   defaultModel: string;
+  tiers: ModelTierSelection;
+  /**
+   * The auto router chats and agents on the default use, or null. The default
+   * model and key stay what built-in agents (titles, compaction) run on.
+   */
+  defaultAutoRouterId: string | null;
   defaultAgentId: string;
 }
 
@@ -24,7 +36,6 @@ export function resolveInitialState(
 ): AgentSettingsState {
   let selectedApiKeyId = "";
 
-  // Prefer exact API key ID when available; fall back to provider-based lookup
   if (organization.defaultLlmApiKeyId) {
     const exactKey = apiKeys.find(
       (k) => k.id === organization.defaultLlmApiKeyId,
@@ -33,18 +44,15 @@ export function resolveInitialState(
       selectedApiKeyId = exactKey.id;
     }
   }
-  if (!selectedApiKeyId && organization.defaultLlmProvider) {
-    const matchingKey = apiKeys.find(
-      (k) => k.provider === organization.defaultLlmProvider,
-    );
-    if (matchingKey) {
-      selectedApiKeyId = matchingKey.id;
-    }
-  }
 
   return {
     selectedApiKeyId,
-    defaultModel: organization.defaultLlmModel ?? "",
+    defaultModel: organization.defaultModelId ?? "",
+    tiers: {
+      fast: organization.defaultFastModelId ?? null,
+      smart: organization.defaultSmartModelId ?? null,
+    },
+    defaultAutoRouterId: organization.defaultAutoRouterId ?? null,
     defaultAgentId: organization.defaultAgentId ?? "",
   };
 }
@@ -52,45 +60,55 @@ export function resolveInitialState(
 export function detectChanges(
   localState: AgentSettingsState,
   savedState: AgentSettingsState,
-): { hasModelChanges: boolean; hasAgentChanges: boolean; hasChanges: boolean } {
-  const hasModelChanges = localState.defaultModel !== savedState.defaultModel;
+): {
+  hasModelChanges: boolean;
+  hasAutoChanges: boolean;
+  hasAgentChanges: boolean;
+  hasChanges: boolean;
+} {
+  const hasModelChanges =
+    localState.defaultModel !== savedState.defaultModel ||
+    localState.tiers.fast !== savedState.tiers.fast ||
+    localState.tiers.smart !== savedState.tiers.smart;
   const hasApiKeyChanges =
     localState.selectedApiKeyId !== savedState.selectedApiKeyId;
+  const hasAutoChanges =
+    localState.defaultAutoRouterId !== savedState.defaultAutoRouterId;
   const hasAgentChanges =
     localState.defaultAgentId !== savedState.defaultAgentId;
 
   return {
     hasModelChanges: hasModelChanges || hasApiKeyChanges,
+    hasAutoChanges,
     hasAgentChanges,
-    hasChanges: hasModelChanges || hasApiKeyChanges || hasAgentChanges,
+    hasChanges:
+      hasModelChanges || hasApiKeyChanges || hasAutoChanges || hasAgentChanges,
   };
 }
 
 export function buildSavePayload(
   localState: AgentSettingsState,
   savedState: AgentSettingsState,
-  apiKeys: ApiKey[],
 ): Record<string, unknown> {
-  const { hasModelChanges, hasAgentChanges } = detectChanges(
+  const { hasModelChanges, hasAutoChanges, hasAgentChanges } = detectChanges(
     localState,
     savedState,
   );
   const payload: Record<string, unknown> = {};
 
   if (hasModelChanges) {
-    let resolvedProvider: string | null = null;
-    if (localState.defaultModel && localState.selectedApiKeyId) {
-      const key = apiKeys.find((k) => k.id === localState.selectedApiKeyId);
-      if (key) {
-        resolvedProvider = key.provider;
-      }
-    }
-    payload.defaultLlmModel = localState.defaultModel || null;
-    payload.defaultLlmProvider = resolvedProvider;
-    payload.defaultLlmApiKeyId =
-      localState.defaultModel && localState.selectedApiKeyId
-        ? localState.selectedApiKeyId
-        : null;
+    // The default trio and its API key go together: persist all or nothing.
+    const complete = Boolean(
+      localState.defaultModel && localState.selectedApiKeyId,
+    );
+    payload.defaultModelId = complete ? localState.defaultModel : null;
+    payload.defaultLlmApiKeyId = complete ? localState.selectedApiKeyId : null;
+    payload.defaultFastModelId = complete ? localState.tiers.fast : null;
+    payload.defaultSmartModelId = complete ? localState.tiers.smart : null;
+  }
+
+  if (hasAutoChanges) {
+    payload.defaultAutoRouterId = localState.defaultAutoRouterId;
   }
 
   if (hasAgentChanges) {

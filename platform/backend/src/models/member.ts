@@ -1,8 +1,30 @@
-import type { AnyRoleName } from "@shared";
-import { and, count, eq, ilike, inArray, or } from "drizzle-orm";
+import type { AnyRoleName, CursorQuery } from "@archestra/shared";
+import {
+  and,
+  count,
+  eq,
+  exists,
+  gte,
+  inArray,
+  ne,
+  notExists,
+  notInArray,
+  or,
+  sql,
+} from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
+import { requestScope } from "@/auth/request-scope";
+import { syncSystemRoleWithOrgPermissions } from "@/auth/system-role-sync";
 import db, { schema, type Transaction } from "@/database";
-import { createPaginatedResult } from "@/database/utils/pagination";
+import { PreparedQuery } from "@/database/prepared-query";
+import {
+  createCursorPaginatedResult,
+  createPaginatedResult,
+  decodeCursor,
+} from "@/database/utils/pagination";
+import { buildTokenizedSearchFilter } from "@/database/utils/text-search";
 import logger from "@/logging";
+import TeamModel from "./team";
 
 class MemberModel {
   /**
@@ -31,7 +53,32 @@ class MemberModel {
       { userId, organizationId, memberId: result[0]?.id },
       "MemberModel.create: completed",
     );
+    await syncSystemRoleWithOrgPermissions(userId, organizationId);
     return result;
+  }
+
+  static async findOrganizationIdsByUserId(userId: string): Promise<string[]> {
+    const rows = await db
+      .selectDistinct({ organizationId: schema.membersTable.organizationId })
+      .from(schema.membersTable)
+      .where(eq(schema.membersTable.userId, userId));
+    return rows.map((row) => row.organizationId);
+  }
+
+  static async findOrganizationIdsJoinedSince(params: {
+    userId: string;
+    since: Date;
+  }): Promise<string[]> {
+    const rows = await db
+      .selectDistinct({ organizationId: schema.membersTable.organizationId })
+      .from(schema.membersTable)
+      .where(
+        and(
+          eq(schema.membersTable.userId, params.userId),
+          gte(schema.membersTable.createdAt, params.since),
+        ),
+      );
+    return rows.map((row) => row.organizationId);
   }
 
   /**
@@ -53,27 +100,36 @@ class MemberModel {
 
   /**
    * Get a member by user ID and organization ID.
+   *
+   * The member table has no unique constraint on (userId, organizationId).
+   * Order by createdAt so a stale duplicate row can't shadow the seeded one:
+   * the original membership is always older than any later duplicate created
+   * (e.g. by an auto-accepted invitation), so it wins.
    */
   static async getByUserId(userId: string, organizationId: string) {
-    // logger.debug(
-    //   { userId, organizationId },
-    //   "MemberModel.getByUserId: fetching member",
-    // );
-    const [member] = await db
-      .select()
-      .from(schema.membersTable)
-      .where(
-        and(
-          eq(schema.membersTable.userId, userId),
-          eq(schema.membersTable.organizationId, organizationId),
-        ),
-      )
-      .limit(1);
-    // logger.debug(
-    //   { userId, organizationId, found: !!member },
-    //   "MemberModel.getByUserId: completed",
-    // );
-    return member;
+    // A read request's auth, permission and grant lookups all start here;
+    // its scope reads the row once. Each caller gets its own copy.
+    const member = await requestScope.memo(
+      `member\0${organizationId}\0${userId}`,
+      async () => {
+        const [row] = await MemberModel.byUserAndOrganization
+          .get()
+          .execute({ userId, organizationId });
+        return row;
+      },
+    );
+    return member && { ...member };
+  }
+
+  /**
+   * Hand {@link getByUserId} a member row this read request already read, the
+   * one it would return for the row's user and organization.
+   */
+  static remember(member: typeof schema.membersTable.$inferSelect): void {
+    void requestScope.memo(
+      `member\0${member.organizationId}\0${member.userId}`,
+      async () => member,
+    );
   }
 
   /**
@@ -89,6 +145,7 @@ class MemberModel {
       .select()
       .from(schema.membersTable)
       .where(eq(schema.membersTable.userId, userId))
+      .orderBy(schema.membersTable.createdAt, schema.membersTable.id)
       .limit(1);
     logger.debug(
       { userId, found: !!member, organizationId: member?.organizationId },
@@ -182,48 +239,184 @@ class MemberModel {
       { userId, organizationId, updated: !!result[0], newRole },
       "MemberModel.updateRole: completed",
     );
+    if (result[0]) {
+      await syncSystemRoleWithOrgPermissions(userId, organizationId);
+    }
     return result[0];
   }
 
-  /**
-   * Get all members of an organization with user details
-   */
-  static async findAllByOrganization(organizationId: string) {
-    logger.debug(
-      { organizationId },
-      "MemberModel.findAllByOrganization: fetching members",
+  /** Bounded identity-only picker with the same visibility as the full directory. */
+  static async findOptions(params: {
+    organizationId: string;
+    viewerId: string;
+    canSeeAllMembers: boolean;
+    pagination: CursorQuery;
+    search?: string;
+    searchMode: "name" | "name_or_email";
+    ids?: string[];
+    emails?: string[];
+  }) {
+    const viewerMembership = alias(
+      schema.teamMembersTable,
+      "viewer_membership",
     );
-    const results = await db
+    const table = schema.usersTable;
+    const cursor = decodeCursor(params.pagination.cursor);
+    const visible = params.canSeeAllMembers
+      ? undefined
+      : and(
+          sql`${table.id} <> ${params.viewerId}`,
+          or(
+            sql`EXISTS (SELECT 1 FROM team_member lead_membership
+            INNER JOIN team lead_team ON lead_team.id = lead_membership.team_id
+            WHERE lead_membership.user_id = ${params.viewerId}
+              AND lead_membership.role = 'admin'
+              AND lead_team.organization_id = ${params.organizationId}
+              AND ${TeamModel.effectiveMembershipCondition({ userId: table.id, teamIdColumn: sql`lead_membership.team_id` })})`,
+            exists(
+              db
+                .select({ one: sql`1` })
+                .from(viewerMembership)
+                .innerJoin(
+                  schema.teamMembersTable,
+                  eq(viewerMembership.teamId, schema.teamMembersTable.teamId),
+                )
+                .innerJoin(
+                  schema.teamsTable,
+                  eq(schema.teamsTable.id, viewerMembership.teamId),
+                )
+                .where(
+                  and(
+                    eq(viewerMembership.userId, params.viewerId),
+                    eq(schema.teamMembersTable.userId, table.id),
+                    eq(schema.teamsTable.organizationId, params.organizationId),
+                  ),
+                ),
+            ),
+          ),
+        );
+    const rows = await db
+      .select({ id: table.id, name: table.name, email: table.email })
+      .from(schema.membersTable)
+      .innerJoin(table, eq(schema.membersTable.userId, table.id))
+      .where(
+        and(
+          eq(schema.membersTable.organizationId, params.organizationId),
+          visible,
+          params.ids
+            ? sql`${table.id} = ANY(${sql.param(params.ids)}::text[])`
+            : undefined,
+          params.emails
+            ? sql`lower(${table.email}) = ANY(${sql.param(params.emails.map((email) => email.toLowerCase()))}::text[])`
+            : undefined,
+          params.search?.trim()
+            ? params.searchMode === "name"
+              ? or(
+                  buildTokenizedSearchFilter({
+                    query: params.search,
+                    columns: [table.name],
+                  }),
+                  and(
+                    eq(table.name, ""),
+                    buildTokenizedSearchFilter({
+                      query: params.search,
+                      columns: [table.id],
+                    }),
+                  ),
+                )
+              : buildTokenizedSearchFilter({
+                  query: params.search,
+                  columns: [table.name, table.email],
+                })
+            : undefined,
+          cursor
+            ? sql`(${table.name} COLLATE "C", ${table.id} COLLATE "C") > (${cursor.value} COLLATE "C", ${cursor.id} COLLATE "C")`
+            : undefined,
+        ),
+      )
+      .orderBy(sql`${table.name} COLLATE "C"`, sql`${table.id} COLLATE "C"`)
+      .limit(params.pagination.limit + 1);
+    return createCursorPaginatedResult(rows, params.pagination, (row) => ({
+      value: row.name,
+      id: row.id,
+    }));
+  }
+
+  /**
+   * One page of the organization's members other than `excludeUserId`, with
+   * their org role, ordered by name. `search` matches name or email.
+   */
+  static async findImpersonationCandidates(params: {
+    organizationId: string;
+    excludeUserId: string;
+    pagination: CursorQuery;
+    search?: string;
+  }) {
+    const table = schema.usersTable;
+    const cursor = decodeCursor(params.pagination.cursor);
+    const rows = await db
       .select({
-        id: schema.usersTable.id,
-        name: schema.usersTable.name,
-        email: schema.usersTable.email,
+        id: table.id,
+        name: table.name,
+        email: table.email,
+        role: schema.membersTable.role,
       })
+      .from(schema.membersTable)
+      .innerJoin(table, eq(schema.membersTable.userId, table.id))
+      .where(
+        and(
+          eq(schema.membersTable.organizationId, params.organizationId),
+          ne(table.id, params.excludeUserId),
+          params.search?.trim()
+            ? buildTokenizedSearchFilter({
+                query: params.search,
+                columns: [table.name, table.email],
+              })
+            : undefined,
+          cursor
+            ? sql`(${table.name} COLLATE "C", ${table.id} COLLATE "C") > (${cursor.value} COLLATE "C", ${cursor.id} COLLATE "C")`
+            : undefined,
+        ),
+      )
+      .orderBy(sql`${table.name} COLLATE "C"`, sql`${table.id} COLLATE "C"`)
+      .limit(params.pagination.limit + 1);
+    return createCursorPaginatedResult(rows, params.pagination, (row) => ({
+      value: row.name,
+      id: row.id,
+    }));
+  }
+
+  /** At most `limit` member emails of the organization. */
+  static async findEmailsByOrganization(params: {
+    organizationId: string;
+    limit: number;
+  }): Promise<string[]> {
+    const rows = await db
+      .select({ email: schema.usersTable.email })
       .from(schema.membersTable)
       .innerJoin(
         schema.usersTable,
         eq(schema.membersTable.userId, schema.usersTable.id),
       )
-      .where(eq(schema.membersTable.organizationId, organizationId))
-      .orderBy(schema.usersTable.name);
-    logger.debug(
-      { organizationId, count: results.length },
-      "MemberModel.findAllByOrganization: completed",
-    );
-    return results;
+      .where(eq(schema.membersTable.organizationId, params.organizationId))
+      .limit(params.limit);
+    return rows.map((row) => row.email);
   }
 
   /**
-   * List org members eligible to be impersonated by an admin: excludes a
-   * given user (typically the caller) and excludes anyone whose system-level
-   * `user.role` is "admin" (better-auth's adminRoles guard would reject
-   * those at impersonation time anyway).
+   * Members of the organization whose user id is in `userIds`, with user
+   * details. Lets a caller resolve a known subset without scanning the full
+   * roster.
    */
-  static async findImpersonationCandidates(params: {
+  static async findByUserIdsInOrganization(params: {
     organizationId: string;
-    excludeUserId: string;
+    userIds: string[];
   }) {
-    const rows = await db
+    const { organizationId, userIds } = params;
+    if (userIds.length === 0) {
+      return [];
+    }
+    return db
       .select({
         id: schema.usersTable.id,
         name: schema.usersTable.name,
@@ -236,14 +429,13 @@ class MemberModel {
         schema.usersTable,
         eq(schema.membersTable.userId, schema.usersTable.id),
       )
-      .where(eq(schema.membersTable.organizationId, params.organizationId))
-      .orderBy(schema.usersTable.name);
-
-    return rows
-      .filter(
-        (row) => row.id !== params.excludeUserId && row.systemRole !== "admin",
+      .where(
+        and(
+          eq(schema.membersTable.organizationId, organizationId),
+          inArray(schema.usersTable.id, userIds),
+        ),
       )
-      .map(({ systemRole: _systemRole, ...rest }) => rest);
+      .orderBy(schema.usersTable.name);
   }
 
   static async findUserIdsInOrganization(params: {
@@ -268,6 +460,86 @@ class MemberModel {
   }
 
   /**
+   * The given users' details, limited to members of the organization that
+   * match `search` against name or email. Unordered.
+   */
+  static async findUsersInOrganization(params: {
+    organizationId: string;
+    userIds: string[];
+    search?: string;
+  }): Promise<MemberUser[]> {
+    if (params.userIds.length === 0) return [];
+    return db
+      .select(memberUserSelection)
+      .from(schema.membersTable)
+      .innerJoin(
+        schema.usersTable,
+        eq(schema.membersTable.userId, schema.usersTable.id),
+      )
+      .where(
+        and(
+          eq(schema.membersTable.organizationId, params.organizationId),
+          inArray(schema.membersTable.userId, params.userIds),
+          memberUserSearchFilter(params.search),
+        ),
+      );
+  }
+
+  /** How many members of the organization match `search` on name or email. */
+  static async countUsersInOrganization(params: {
+    organizationId: string;
+    search?: string;
+  }): Promise<number> {
+    const [row] = await db
+      .select({ count: count() })
+      .from(schema.membersTable)
+      .innerJoin(
+        schema.usersTable,
+        eq(schema.membersTable.userId, schema.usersTable.id),
+      )
+      .where(
+        and(
+          eq(schema.membersTable.organizationId, params.organizationId),
+          memberUserSearchFilter(params.search),
+        ),
+      );
+    return row?.count ?? 0;
+  }
+
+  /**
+   * A name-ordered page of the organization's members matching `search`,
+   * skipping `excludeUserIds`. Ordered by the `user_name_idx` btree so a page
+   * never sorts the whole roster.
+   */
+  static async findUsersInOrganizationPage(params: {
+    organizationId: string;
+    search?: string;
+    excludeUserIds: string[];
+    limit: number;
+    offset: number;
+  }): Promise<MemberUser[]> {
+    return db
+      .select(memberUserSelection)
+      .from(schema.membersTable)
+      .innerJoin(
+        schema.usersTable,
+        eq(schema.membersTable.userId, schema.usersTable.id),
+      )
+      .where(
+        and(
+          eq(schema.membersTable.organizationId, params.organizationId),
+          memberUserSearchFilter(params.search),
+          params.excludeUserIds.length > 0
+            ? notInArray(schema.membersTable.userId, params.excludeUserIds)
+            : undefined,
+        ),
+      )
+      .orderBy(schema.usersTable.name, schema.usersTable.id)
+      .limit(params.limit)
+      .offset(params.offset);
+  }
+
+  /**
    * Get paginated members of an organization with optional filters
    */
   static async findAllPaginated(params: {
@@ -277,19 +549,22 @@ class MemberModel {
     role?: string;
   }) {
     const { organizationId, pagination, name, role } = params;
-    const searchPattern = name ? `%${name}%` : null;
+    // Every token has to land somewhere, but not necessarily in the same
+    // field or the order it was typed — so "Ada Lovelace" still finds a
+    // directory-synced "Lovelace, Ada M.".
+    const searchFilter = buildTokenizedSearchFilter({
+      query: name,
+      columns: [schema.usersTable.name, schema.usersTable.email],
+    });
 
     const filters = [
       eq(schema.membersTable.organizationId, organizationId),
-      ...(role ? [eq(schema.membersTable.role, role)] : []),
-      ...(searchPattern
+      ...(role
         ? [
-            or(
-              ilike(schema.usersTable.name, searchPattern),
-              ilike(schema.usersTable.email, searchPattern),
-            ),
+            sql`${role} = ANY(string_to_array(${schema.membersTable.role}, ','))`,
           ]
         : []),
+      ...(searchFilter ? [searchFilter] : []),
     ];
 
     const [data, totalResult] = await Promise.all([
@@ -302,6 +577,8 @@ class MemberModel {
           name: schema.usersTable.name,
           email: schema.usersTable.email,
           image: schema.usersTable.image,
+          // Nullable in the schema despite the default; coalesced below.
+          twoFactorEnabled: schema.usersTable.twoFactorEnabled,
         })
         .from(schema.membersTable)
         .innerJoin(
@@ -323,7 +600,14 @@ class MemberModel {
     ]);
 
     const total = totalResult[0]?.count ?? 0;
-    return createPaginatedResult(data, total, pagination);
+    return createPaginatedResult(
+      data.map((row) => ({
+        ...row,
+        twoFactorEnabled: row.twoFactorEnabled ?? false,
+      })),
+      total,
+      pagination,
+    );
   }
 
   /**
@@ -401,6 +685,61 @@ class MemberModel {
     );
     return deleted[0];
   }
+
+  static async findByIdInOrganization(
+    memberId: string,
+    organizationId: string,
+  ) {
+    const [member] = await db
+      .select()
+      .from(schema.membersTable)
+      .where(
+        and(
+          eq(schema.membersTable.id, memberId),
+          eq(schema.membersTable.organizationId, organizationId),
+        ),
+      )
+      .limit(1);
+    return member;
+  }
+
+  static async deleteByIdInOrganization(
+    memberId: string,
+    organizationId: string,
+  ) {
+    const [deleted] = await db
+      .delete(schema.membersTable)
+      .where(
+        and(
+          eq(schema.membersTable.id, memberId),
+          eq(schema.membersTable.organizationId, organizationId),
+        ),
+      )
+      .returning();
+    return deleted;
+  }
+
+  /** Deletes only while the member still has the expected signup state. */
+  static async deleteClassifiedByUserInOrganization(params: {
+    userId: string;
+    organizationId: string;
+    accepted: boolean;
+  }) {
+    const accountQuery = db
+      .select({ one: sql`1` })
+      .from(schema.accountsTable)
+      .where(eq(schema.accountsTable.userId, schema.membersTable.userId));
+    return db
+      .delete(schema.membersTable)
+      .where(
+        and(
+          eq(schema.membersTable.userId, params.userId),
+          eq(schema.membersTable.organizationId, params.organizationId),
+          params.accepted ? exists(accountQuery) : notExists(accountQuery),
+        ),
+      )
+      .returning();
+  }
   /**
    * Set the default agent for a member
    */
@@ -440,16 +779,118 @@ class MemberModel {
     return member?.defaultAgentId ?? null;
   }
 
-  /**
-   * Check if any member references the given agent as their default
-   */
-  static async isAgentDefault(agentId: string): Promise<boolean> {
-    const [result] = await db
-      .select({ count: count() })
+  static async findByIdForAudit(
+    id: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [row] = await db
+      .select()
       .from(schema.membersTable)
-      .where(eq(schema.membersTable.defaultAgentId, agentId));
-    return (result?.count ?? 0) > 0;
+      .where(
+        and(
+          eq(schema.membersTable.id, id),
+          eq(schema.membersTable.organizationId, organizationId),
+        ),
+      )
+      .limit(1);
+
+    if (!row) return null;
+
+    return {
+      id: row.id,
+      organizationId: row.organizationId,
+      userId: row.userId,
+      role: row.role,
+      createdAt: row.createdAt.toISOString(),
+    };
   }
+
+  static async findByUserIdForAudit(
+    userId: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [row] = await db
+      .select()
+      .from(schema.membersTable)
+      .where(
+        and(
+          eq(schema.membersTable.userId, userId),
+          eq(schema.membersTable.organizationId, organizationId),
+        ),
+      )
+      .limit(1);
+
+    if (!row) return null;
+
+    return {
+      id: row.id,
+      organizationId: row.organizationId,
+      userId: row.userId,
+      role: row.role,
+      defaultAgentId: row.defaultAgentId ?? null,
+      createdAt: row.createdAt.toISOString(),
+    };
+  }
+
+  /**
+   * Drop `agentId` as anyone's personal default. Called when the agent is
+   * deleted: the pointer records a deliberate choice, and the choice is no
+   * longer available. Those members fall back to the organization default (or
+   * their own personal chat agent) until they pick again.
+   *
+   * Mirrors {@link ProjectModel.clearDefaultAgent}: a restore does NOT bring
+   * the pointer back, for the same reason projects do not silently re-pin.
+   */
+  static async clearDefaultAgent(
+    agentId: string,
+    tx?: Transaction,
+  ): Promise<void> {
+    const executor = tx ?? db;
+    await executor
+      .update(schema.membersTable)
+      .set({ defaultAgentId: null })
+      .where(eq(schema.membersTable.defaultAgentId, agentId));
+  }
+
+  private static readonly byUserAndOrganization = new PreparedQuery(
+    (database) =>
+      database
+        .select()
+        .from(schema.membersTable)
+        .where(
+          and(
+            eq(schema.membersTable.userId, sql.placeholder("userId")),
+            eq(
+              schema.membersTable.organizationId,
+              sql.placeholder("organizationId"),
+            ),
+          ),
+        )
+        .orderBy(schema.membersTable.createdAt, schema.membersTable.id)
+        .limit(1)
+        .prepare("archestra_member_by_user_and_organization"),
+  );
+}
+
+type MemberUser = {
+  userId: string;
+  name: string;
+  email: string;
+  image: string | null;
+};
+
+const memberUserSelection = {
+  userId: schema.membersTable.userId,
+  name: schema.usersTable.name,
+  email: schema.usersTable.email,
+  image: schema.usersTable.image,
+};
+
+function memberUserSearchFilter(search: string | undefined) {
+  return buildTokenizedSearchFilter({
+    query: search,
+    columns: [schema.usersTable.name, schema.usersTable.email],
+  });
 }
 
 export default MemberModel;

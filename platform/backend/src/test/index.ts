@@ -1,2 +1,4 @@
 export * from "vitest";
-export { beforeEach, test } from "./fixtures";
+export { accessGrants, type TestAccess } from "./access-grants";
+export { beforeEach, type TestFixtures, test } from "./fixtures";
+export { mustExist } from "./must-exist";

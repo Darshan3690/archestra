@@ -1,6 +1,13 @@
 // biome-ignore-all lint/suspicious/noExplicitAny: test
 
-import { ARCHESTRA_TOOL_SHORT_NAMES, getArchestraToolFullName } from "@shared";
+import {
+  type ARCHESTRA_TOOL_SHORT_NAMES,
+  getArchestraToolFullName,
+} from "@archestra/shared";
+import {
+  allAvailableActions,
+  roleActionResourceFor,
+} from "@archestra/shared/access-control";
 import { vi } from "vitest";
 import { archestraMcpBranding } from "@/archestra-mcp-server";
 import { UserModel } from "@/models";
@@ -9,6 +16,7 @@ import type { ArchestraContext } from ".";
 import {
   checkToolPermission,
   filterToolNamesByPermission,
+  isToolGrantGated,
   TOOL_PERMISSIONS,
 } from "./rbac";
 
@@ -30,20 +38,29 @@ afterEach(() => {
 // === Permission map completeness ===
 
 describe("TOOL_PERMISSIONS map", () => {
-  test("has an entry for every registered tool", () => {
-    for (const shortName of ARCHESTRA_TOOL_SHORT_NAMES) {
-      expect(TOOL_PERMISSIONS).toHaveProperty(shortName);
-    }
+  test("every tool is reachable through a role action or a per-object grant", () => {
+    // A tool gated on an action no role holds, with no grant path, is dead.
+    const unreachable = Object.entries(TOOL_PERMISSIONS)
+      .filter(([, perm]) => perm !== null)
+      .filter(
+        ([name, perm]) =>
+          !allAvailableActions[roleActionResourceFor(perm!.resource)]?.includes(
+            perm!.action as never,
+          ) && !isToolGrantGated(name as keyof typeof TOOL_PERMISSIONS),
+      )
+      .map(([name, perm]) => `${name}: ${perm!.resource}:${perm!.action}`);
+    expect(unreachable).toEqual([]);
   });
 
-  test("every entry has valid resource and action or is null", () => {
-    for (const [name, perm] of Object.entries(TOOL_PERMISSIONS)) {
-      if (perm === null) continue;
-      expect(perm, `${name} should have resource`).toHaveProperty("resource");
-      expect(perm, `${name} should have action`).toHaveProperty("action");
-      expect(typeof perm.resource).toBe("string");
-      expect(typeof perm.action).toBe("string");
-    }
+  test("read_app reads and edit_app updates", () => {
+    expect(TOOL_PERMISSIONS.read_app).toEqual({
+      resource: "app",
+      action: "read",
+    });
+    expect(TOOL_PERMISSIONS.edit_app).toEqual({
+      resource: "app",
+      action: "update",
+    });
   });
 });
 
@@ -76,6 +93,63 @@ describe("checkToolPermission", () => {
   test("allows tool with null permission for any user", async () => {
     const result = await checkToolPermission(t("whoami"), memberContext);
     expect(result).toBeNull();
+  });
+
+  test("runtime reporting and remediation remain available without management access", async ({
+    makeUser,
+    makeMember,
+    makeCustomRole,
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const role = await makeCustomRole(org.id, {
+      permission: {},
+    });
+    const user = await makeUser();
+    await makeMember(user.id, org.id, {
+      role: role.role,
+    });
+    const context = {
+      ...memberContext,
+      organizationId: org.id,
+      userId: user.id,
+    };
+    for (const tool of ["yell", "execute_remedy_plan", "get_remedy_plans"]) {
+      expect(await checkToolPermission(t(tool), context)).toBeNull();
+    }
+    expect(
+      await checkToolPermission(t("get_guardrails_policy"), context),
+    ).not.toBeNull();
+    expect(
+      await checkToolPermission(t("get_openappa_yell"), context),
+    ).not.toBeNull();
+  });
+
+  test("log readers can retrieve yells without policy permissions", async ({
+    makeUser,
+    makeMember,
+    makeCustomRole,
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const role = await makeCustomRole(org.id, {
+      permission: { log: ["read"] },
+    });
+    const user = await makeUser();
+    await makeMember(user.id, org.id, {
+      role: role.role,
+    });
+    const context = {
+      ...memberContext,
+      organizationId: org.id,
+      userId: user.id,
+    };
+    expect(
+      await checkToolPermission(t("get_openappa_yell"), context),
+    ).toBeNull();
+    expect(
+      await checkToolPermission(t("get_guardrails_policy"), context),
+    ).not.toBeNull();
   });
 
   test("allows admin to use any tool", async () => {
@@ -137,9 +211,108 @@ describe("checkToolPermission", () => {
       noUserCtx,
     );
     expect(result).not.toBeNull();
+    // The message must name the cause (an application-scoped credential) and
+    // the way out, not read as an internal fault.
     expect((result?.content[0] as any).text).toContain(
-      "User context not available",
+      "requires an acting user",
     );
+    expect((result?.content[0] as any).text).toContain("personal token");
+  });
+
+  test("agent:read gates the sandbox tools — admin allowed", async () => {
+    const result = await checkToolPermission(t("run_command"), adminContext);
+    expect(result).toBeNull();
+  });
+
+  test("agent:read gates the sandbox tools — skill:read alone does not grant run_command", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeCustomRole,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const role = await makeCustomRole(org.id, {
+      permission: { skill: ["read"] },
+    });
+    await makeMember(user.id, org.id, { role: role.role });
+    const agent = await makeAgent({ name: "Skill Agent" });
+
+    const ctx: ArchestraContext = {
+      agent: { id: agent.id, name: agent.name },
+      organizationId: org.id,
+      userId: user.id,
+    };
+
+    // skill:read allows load_skill...
+    expect(await checkToolPermission(t("load_skill"), ctx)).toBeNull();
+    // ...but does NOT allow run_command (needs agent:read)
+    const denied = await checkToolPermission(t("run_command"), ctx);
+    expect(denied).not.toBeNull();
+    expect((denied?.content[0] as any).text).toContain(
+      "do not have permission",
+    );
+  });
+
+  test("agent:read allows the sandbox tools", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeCustomRole,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const role = await makeCustomRole(org.id, {
+      permission: { agent: ["read"] },
+    });
+    await makeMember(user.id, org.id, { role: role.role });
+    const agent = await makeAgent({ name: "Sandbox Agent" });
+
+    const ctx: ArchestraContext = {
+      agent: { id: agent.id, name: agent.name },
+      organizationId: org.id,
+      userId: user.id,
+    };
+
+    expect(await checkToolPermission(t("run_command"), ctx)).toBeNull();
+    expect(await checkToolPermission(t("upload_file"), ctx)).toBeNull();
+    expect(await checkToolPermission(t("download_file"), ctx)).toBeNull();
+  });
+
+  test("the file-store tools follow agent:read", async ({
+    makeOrganization,
+    makeUser,
+    makeMember,
+    makeCustomRole,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const agent = await makeAgent({ name: "Files Agent" });
+    const contextFor = async (permission: Record<string, string[]>) => {
+      const user = await makeUser();
+      const role = await makeCustomRole(org.id, { permission });
+      await makeMember(user.id, org.id, { role: role.role });
+      return {
+        agent: { id: agent.id, name: agent.name },
+        organizationId: org.id,
+        userId: user.id,
+      } satisfies ArchestraContext;
+    };
+    const agentUser = await contextFor({ agent: ["read"] });
+    const chatOnly = await contextFor({ chat: ["read"] });
+
+    for (const tool of [
+      "search_files",
+      "read_file",
+      "save_file",
+      "edit_file",
+      "delete_file",
+    ]) {
+      expect(await checkToolPermission(t(tool), agentUser), tool).toBeNull();
+      expect(await checkToolPermission(t(tool), chatOnly), tool).not.toBeNull();
+    }
   });
 
   test("returns null for non-Archestra tool names", async () => {
@@ -229,7 +402,6 @@ describe("filterToolNamesByPermission", () => {
       t("create_agent"),
       t("create_knowledge_base"),
       t("delete_limit"),
-      t("create_tool_invocation_policy"),
     ];
 
     const result = await filterToolNamesByPermission(

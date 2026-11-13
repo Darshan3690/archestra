@@ -1,0 +1,159 @@
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useHasPermissions, useSession } from "@/lib/auth/auth.query";
+import { useIsGlobalAdmin } from "@/lib/organization.query";
+import { McpGatewayActions } from "./mcp-gateway-actions";
+
+vi.mock("@/lib/organization.query");
+vi.mock("@/lib/auth/auth.query");
+
+type GatewayProp = Parameters<typeof McpGatewayActions>[0]["agent"];
+
+function gateway(overrides: Partial<GatewayProp> = {}): GatewayProp {
+  return {
+    id: "gw-1",
+    name: "billing-gateway",
+    agentType: "mcp_gateway",
+    slug: "billing-gateway",
+    scope: "personal",
+    deletedAt: null,
+    ...overrides,
+  } as GatewayProp;
+}
+
+function renderActions(agent: GatewayProp, canModify = true) {
+  const onPermanentlyDelete = vi.fn();
+  const onTogglePin = vi.fn();
+  render(
+    <McpGatewayActions
+      agent={agent}
+      canModify={canModify}
+      onEdit={vi.fn()}
+      onDelete={vi.fn()}
+      onRestore={vi.fn()}
+      onPermanentlyDelete={onPermanentlyDelete}
+      onClone={vi.fn()}
+      onTogglePin={onTogglePin}
+      onHistory={vi.fn()}
+    />,
+  );
+  return { onPermanentlyDelete, onTogglePin };
+}
+
+const openRowMenu = () =>
+  userEvent.click(
+    screen.getByRole("button", { name: "More actions billing-gateway" }),
+  );
+
+describe("McpGatewayActions", () => {
+  beforeEach(() => {
+    vi.mocked(useSession).mockReturnValue({
+      data: { user: { id: "user-1" } },
+    } as ReturnType<typeof useSession>);
+    vi.clearAllMocks();
+    vi.mocked(useIsGlobalAdmin).mockReturnValue({
+      isGlobalAdmin: true,
+      isLoading: false,
+    });
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+    } as ReturnType<typeof useHasPermissions>);
+  });
+
+  it.each([
+    null,
+    "2026-01-02T00:00:00.000Z",
+  ])("allows readers to toggle a personal pin from the row (pinnedAt=%s)", async (pinnedAt) => {
+    const agent = gateway({ pinnedAt });
+    const { onTogglePin } = renderActions(agent, false);
+    const pin = screen.getByRole("button", {
+      name: `${pinnedAt ? "Unpin" : "Pin"} billing-gateway`,
+    });
+    expect(pin).toHaveAttribute("aria-pressed", pinnedAt ? "true" : "false");
+    await userEvent.click(pin);
+    expect(onTogglePin).toHaveBeenCalledWith(agent);
+  });
+
+  it("offers permanent delete on a gateway already in the trash", async () => {
+    // Gateways are agent rows with their own trash view, and the permanent
+    // delete route accepts every agent type — this is where an admin reaches it.
+    renderActions(gateway({ deletedAt: "2026-01-02T00:00:00.000Z" }));
+
+    expect(
+      screen.getByLabelText("Restore billing-gateway"),
+    ).toBeInTheDocument();
+    await openRowMenu();
+    expect(
+      screen.queryByRole("menuitem", { name: /^(Unpin|Pin)$/ }),
+    ).toBeNull();
+    // Named after the row: a trash list is a column of these buttons, and the
+    // accessible name is the only thing telling them apart.
+    expect(
+      screen.getByRole("menuitem", { name: /Delete permanently/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps permanent delete out of the active list", async () => {
+    // It is a trash action, never a shortcut past soft-delete: the route 404s
+    // on a live row, so offering it here would only ever fail.
+    renderActions(gateway());
+
+    await openRowMenu();
+    expect(
+      screen.getByRole("menuitem", { name: "Delete" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("menuitem", { name: /Delete permanently/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  /**
+   * The row used to be five bare icon buttons in a `ButtonGroup` with no
+   * `tooltip` passed to any of them, so hovering Delete told a permitted user
+   * nothing. The shared dialect is two labelled icon buttons plus the menu.
+   */
+  it("labels the visible row buttons and folds the rest into the row menu", async () => {
+    renderActions(gateway());
+
+    expect(screen.getByLabelText("Edit billing-gateway")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Pin billing-gateway" }),
+    ).toBeInTheDocument();
+    // Connect, Clone, Version history and Delete are not competing for the
+    // row's width.
+    expect(screen.queryByLabelText("Connect billing-gateway")).toBeNull();
+    expect(screen.queryByLabelText("Clone billing-gateway")).toBeNull();
+
+    await openRowMenu();
+
+    expect(
+      screen.getByRole("menuitem", { name: "Connect" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Clone" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("menuitem", { name: "Version history" }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps a row the user cannot modify visible, disabled, with the reason", async () => {
+    // Removing the control would leave no way to learn the record simply is
+    // not this user's to change.
+    renderActions(gateway(), false);
+
+    expect(screen.getByLabelText("Edit billing-gateway")).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    await openRowMenu();
+    expect(screen.getByRole("menuitem", { name: /Delete/ })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    // Once per refused control: the row's Edit and the menu's Delete each carry
+    // their own description, so focusing either one states the reason.
+    expect(screen.getAllByText(/Only this MCP gateway's author/)).toHaveLength(
+      2,
+    );
+  });
+});

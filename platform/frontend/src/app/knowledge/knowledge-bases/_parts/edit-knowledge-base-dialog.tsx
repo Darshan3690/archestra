@@ -1,11 +1,16 @@
 "use client";
 
-import type { archestraApiTypes } from "@shared";
-import { useEffect } from "react";
+import type { archestraApiTypes } from "@archestra/shared";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
-import { FormDialog } from "@/components/form-dialog";
+import { AdvancedLabelsSection } from "@/components/advanced-labels-section";
+import type { ProfileLabel, ProfileLabelsRef } from "@/components/agent-labels";
+import { createdByFact } from "@/components/created-by-cell";
+import { DetailFacts } from "@/components/detail-facts";
+import { EnvironmentSelector } from "@/components/environment-selector";
+import { ResourceAccessSection } from "@/components/resource-access-section";
+import { StandardFormDialog } from "@/components/standard-dialog";
 import { Button } from "@/components/ui/button";
-import { DialogForm, DialogStickyFooter } from "@/components/ui/dialog";
 import {
   Form,
   FormControl,
@@ -17,13 +22,20 @@ import {
 import { Input } from "@/components/ui/input";
 import { useUpdateKnowledgeBase } from "@/lib/knowledge/knowledge-base.query";
 
-type KnowledgeBaseItem =
-  archestraApiTypes.GetKnowledgeBasesResponses["200"]["data"][number];
+type KnowledgeBaseItem = Pick<
+  archestraApiTypes.GetKnowledgeBasesResponses["200"]["data"][number],
+  "id" | "name" | "description"
+> & {
+  createdBy?: archestraApiTypes.GetKnowledgeBasesResponses["200"]["data"][number]["createdBy"];
+  labels?: archestraApiTypes.GetKnowledgeBasesResponses["200"]["data"][number]["labels"];
+  uploadedFilesEnvironmentId?: string | null;
+};
 
-interface EditKnowledgeBaseFormValues {
+type EditKnowledgeBaseFormValues = {
   name: string;
   description: string;
-}
+  uploadedFilesEnvironmentId: string | null;
+};
 
 export function EditKnowledgeBaseDialog({
   knowledgeBase,
@@ -35,11 +47,27 @@ export function EditKnowledgeBaseDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const updateKnowledgeBase = useUpdateKnowledgeBase();
+  const [labels, setLabels] = useState<ProfileLabel[]>(
+    knowledgeBase.labels ?? [],
+  );
+  const labelsRef = useRef<ProfileLabelsRef>(null);
+  // The permissions block keeps its edits in its own form. This dialog's
+  // Save Changes is the only Save on screen, so it commits them too.
+  const permissionsSave = useRef<(() => Promise<void>) | null>(null);
+  const registerPermissionsSave = useCallback(
+    (save: (() => Promise<void>) | null) => {
+      permissionsSave.current = save;
+    },
+    [],
+  );
+  const [permissionsDirty, setPermissionsDirty] = useState(false);
 
   const form = useForm<EditKnowledgeBaseFormValues>({
     defaultValues: {
       name: knowledgeBase.name,
       description: knowledgeBase.description ?? "",
+      uploadedFilesEnvironmentId:
+        knowledgeBase.uploadedFilesEnvironmentId ?? null,
     },
   });
 
@@ -48,16 +76,27 @@ export function EditKnowledgeBaseDialog({
       form.reset({
         name: knowledgeBase.name,
         description: knowledgeBase.description ?? "",
+        uploadedFilesEnvironmentId:
+          knowledgeBase.uploadedFilesEnvironmentId ?? null,
       });
+      setLabels(knowledgeBase.labels ?? []);
     }
   }, [open, knowledgeBase, form]);
 
   const handleSubmit = async (values: EditKnowledgeBaseFormValues) => {
+    const finalLabels = labelsRef.current?.saveUnsavedLabel() ?? labels;
+    await permissionsSave.current?.();
     const result = await updateKnowledgeBase.mutateAsync({
       id: knowledgeBase.id,
       body: {
         name: values.name,
         description: values.description || null,
+        labels: finalLabels,
+        ...(knowledgeBase.uploadedFilesEnvironmentId !== undefined &&
+          values.uploadedFilesEnvironmentId !==
+            knowledgeBase.uploadedFilesEnvironmentId && {
+            uploadedFilesEnvironmentId: values.uploadedFilesEnvironmentId,
+          }),
       },
     });
     if (result) {
@@ -66,54 +105,17 @@ export function EditKnowledgeBaseDialog({
   };
 
   return (
-    <FormDialog
-      open={open}
-      onOpenChange={onOpenChange}
-      title="Edit Knowledge Base"
-      description="Update the knowledge base settings."
-      size="medium"
-      className="max-w-lg"
-    >
-      <Form {...form}>
-        <DialogForm
-          onSubmit={form.handleSubmit(handleSubmit)}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4">
-            <FormField
-              control={form.control}
-              name="name"
-              rules={{ required: "Name is required" }}
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Name</FormLabel>
-                  <FormControl>
-                    <Input placeholder="My Knowledge Base" {...field} />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name="description"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Description (optional)</FormLabel>
-                  <FormControl>
-                    <Input
-                      placeholder="A short description of this knowledge base"
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-          </div>
-
-          <DialogStickyFooter>
+    <Form {...form}>
+      <StandardFormDialog
+        open={open}
+        onOpenChange={onOpenChange}
+        title="Edit Knowledge Base"
+        description="Update the knowledge base settings."
+        isDirty={permissionsDirty}
+        onSubmit={form.handleSubmit(handleSubmit)}
+        bodyClassName="space-y-4"
+        footer={
+          <>
             <Button
               type="button"
               variant="outline"
@@ -124,9 +126,70 @@ export function EditKnowledgeBaseDialog({
             <Button type="submit" disabled={updateKnowledgeBase.isPending}>
               {updateKnowledgeBase.isPending ? "Saving..." : "Save Changes"}
             </Button>
-          </DialogStickyFooter>
-        </DialogForm>
-      </Form>
-    </FormDialog>
+          </>
+        }
+      >
+        <DetailFacts facts={[createdByFact(knowledgeBase.createdBy)]} />
+        <FormField
+          control={form.control}
+          name="name"
+          rules={{ required: "Name is required" }}
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>Name</FormLabel>
+              <FormControl>
+                <Input placeholder="My Knowledge Base" {...field} />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+
+        <FormField
+          control={form.control}
+          name="description"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>Description (optional)</FormLabel>
+              <FormControl>
+                <Input
+                  placeholder="A short description of this knowledge base"
+                  {...field}
+                />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+
+        {knowledgeBase.uploadedFilesEnvironmentId !== undefined && (
+          <FormField
+            control={form.control}
+            name="uploadedFilesEnvironmentId"
+            render={({ field }) => (
+              <EnvironmentSelector
+                label="Uploaded files environment"
+                value={field.value}
+                onChange={field.onChange}
+                resource="knowledgeSource"
+                helpText="Applies to all uploaded documents indexed into this knowledge base. Only agents and gateways in this environment can retrieve them. File sharing permissions still apply."
+              />
+            )}
+          />
+        )}
+
+        <ResourceAccessSection
+          resource="knowledgeBase"
+          id={knowledgeBase.id}
+          registerSave={registerPermissionsSave}
+          onDirtyChange={setPermissionsDirty}
+        />
+        <AdvancedLabelsSection
+          ref={labelsRef}
+          labels={labels}
+          onLabelsChange={setLabels}
+        />
+      </StandardFormDialog>
+    </Form>
   );
 }

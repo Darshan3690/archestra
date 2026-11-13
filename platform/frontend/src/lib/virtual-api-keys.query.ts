@@ -1,18 +1,44 @@
-import { archestraApiSdk, type archestraApiTypes } from "@shared";
+import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { handleApiError, toApiError } from "@/lib/utils";
+import { authQueryKeys } from "@/lib/auth/auth.query";
+import { toBulkOutcome } from "@/lib/bulk-action";
+import { handleApiError, throwOnApiError, toApiError } from "@/lib/utils/api";
 
 type AllVirtualApiKeysQuery = NonNullable<
   archestraApiTypes.GetAllVirtualApiKeysData["query"]
 >;
+type AllVirtualApiKeysParams = Partial<AllVirtualApiKeysQuery> & {
+  enabled?: boolean;
+  toastOnError?: boolean;
+};
 
 const {
   getAllVirtualApiKeys,
+  getVirtualApiKey,
+  getVirtualApiKeyValue,
   createVirtualApiKey,
   updateVirtualApiKey,
   deleteVirtualApiKey,
+  bulkDeleteVirtualApiKeys,
 } = archestraApiSdk;
+
+/**
+ * Fetch a virtual key's raw value on demand (reveal/copy). Author-only —
+ * the backend 403s for keys created by someone else.
+ */
+export function useFetchVirtualApiKeyValue() {
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const { data, error } = await getVirtualApiKeyValue({ path: { id } });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data?.value ?? null;
+    },
+  });
+}
 
 export function useVirtualApiKeys(providerApiKeyId: string | null) {
   return useQuery({
@@ -26,10 +52,7 @@ export function useVirtualApiKeys(providerApiKeyId: string | null) {
           offset: 0,
         },
       });
-      if (error) {
-        handleApiError(error);
-        return [];
-      }
+      throwOnApiError(error);
       return data?.data ?? [];
     },
     enabled: !!providerApiKeyId,
@@ -56,11 +79,16 @@ export function useCreateVirtualApiKey() {
     onSuccess: () => {
       toast.success("Virtual API key created");
       queryClient.invalidateQueries({
+        queryKey: authQueryKeys.scopedCapabilities(),
+      });
+      queryClient.invalidateQueries({
         queryKey: ["all-virtual-api-keys"],
       });
       queryClient.invalidateQueries({
         queryKey: ["virtual-api-keys"],
       });
+      // A key's pools are read from each pool's list of keys.
+      queryClient.invalidateQueries({ queryKey: ["model-pools"] });
     },
   });
 }
@@ -113,22 +141,43 @@ export function useUpdateVirtualApiKey() {
     onSuccess: () => {
       toast.success("Virtual API key updated");
       queryClient.invalidateQueries({
+        queryKey: authQueryKeys.scopedCapabilities(),
+      });
+      queryClient.invalidateQueries({
         queryKey: ["all-virtual-api-keys"],
       });
       queryClient.invalidateQueries({
         queryKey: ["virtual-api-keys"],
       });
+      // A key's pools are read from each pool's list of keys.
+      queryClient.invalidateQueries({ queryKey: ["model-pools"] });
     },
   });
 }
 
-export function useAllVirtualApiKeys(params?: Partial<AllVirtualApiKeysQuery>) {
+export function useAllVirtualApiKeys(params?: AllVirtualApiKeysParams) {
   const limit = params?.limit ?? 20;
   const offset = params?.offset ?? 0;
   const search = params?.search;
   const providerApiKeyId = params?.providerApiKeyId;
+  const keyType = params?.keyType;
+  const scope = params?.scope;
+  const labels = params?.labels;
+  const access = params?.access;
+  const sharedWith = params?.sharedWith;
+  const owner = params?.owner;
+  const toastOnError = params?.toastOnError;
   return useQuery({
-    queryKey: ["all-virtual-api-keys", limit, offset, search, providerApiKeyId],
+    queryKey: [
+      "all-virtual-api-keys",
+      limit,
+      offset,
+      search,
+      providerApiKeyId,
+      keyType,
+      scope,
+      { labels, access, sharedWith, owner },
+    ],
     queryFn: async () => {
       const { data, error } = await getAllVirtualApiKeys({
         query: {
@@ -136,22 +185,15 @@ export function useAllVirtualApiKeys(params?: Partial<AllVirtualApiKeysQuery>) {
           offset,
           search: search || undefined,
           providerApiKeyId: providerApiKeyId || undefined,
+          keyType: keyType || undefined,
+          scope: scope || undefined,
+          labels: labels || undefined,
+          access,
+          sharedWith,
+          owner,
         },
       });
-      if (error) {
-        handleApiError(error);
-        return {
-          data: [],
-          pagination: {
-            currentPage: 1,
-            limit,
-            total: 0,
-            totalPages: 0,
-            hasNext: false,
-            hasPrev: false,
-          },
-        };
-      }
+      throwOnApiError(error, { toastOnError });
       return (
         data ?? {
           data: [],
@@ -166,5 +208,41 @@ export function useAllVirtualApiKeys(params?: Partial<AllVirtualApiKeysQuery>) {
         }
       );
     },
+    enabled: params?.enabled,
+  });
+}
+
+/**
+ * Deletes a selection of virtual keys in one request. The caller reports the
+ * batch once via `reportBulkOutcome` rather than a toast per row.
+ */
+export function useBulkDeleteVirtualApiKeys() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (keys: readonly { id: string }[]) =>
+      bulkDeleteVirtualApiKeys({
+        body: { ids: keys.map((key) => key.id) },
+      }).then(({ data, error }) => {
+        throwOnApiError(error, { toastOnError: false });
+        return toBulkOutcome(data ?? { succeeded: [], failed: [] });
+      }),
+    // Settled rather than success: a partly applied batch still moved rows.
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ["all-virtual-api-keys"] });
+      queryClient.invalidateQueries({ queryKey: ["virtual-api-keys"] });
+    },
+  });
+}
+
+export function useVirtualKey(id: string | undefined) {
+  return useQuery({
+    queryKey: ["virtual-api-keys", "detail", id],
+    queryFn: async () => {
+      if (!id) return null;
+      const { data, error } = await getVirtualApiKey({ path: { id } });
+      throwOnApiError(error, { allowNotFound: true, toastOnError: false });
+      return data ?? null;
+    },
+    enabled: !!id,
   });
 }

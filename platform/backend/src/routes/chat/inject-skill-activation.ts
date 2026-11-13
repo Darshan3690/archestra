@@ -1,0 +1,509 @@
+import {
+  type ChatMessage,
+  ChatMessageMetadataSchema,
+  SKILL_TOOL_PREFIX,
+  type SupportedProvider,
+  slugify,
+} from "@archestra/shared";
+import { getMcpCatalogPermissionChecker } from "@/auth/mcp-catalog-permissions";
+import { getSkillPermissionChecker } from "@/auth/skill-permissions";
+import { selectMCPGatewayToken } from "@/clients/chat-mcp-client";
+import config from "@/config";
+import logger from "@/logging";
+import {
+  AgentModel,
+  ExternalMcpSkillUsageEventModel,
+  PluginSkillUsageEventModel,
+  SkillEnvironmentModel,
+  SkillModel,
+  SkillTeamModel,
+  SkillVersionModel,
+} from "@/models";
+import { reportSkillActivation } from "@/observability/metrics/skill";
+import { getPluginSkill } from "@/plugins/plugin-skills";
+import { agentActivationSkillPolicyService } from "@/services/agent-activation-skill-policy";
+import { skillVisibleInEnvironment } from "@/services/environments/environment-isolation";
+import { getExternalMcpSkill } from "@/services/external-mcp-skills";
+import { ResourcePermissions } from "@/services/resource-permissions";
+import { formatExternalSkillActivation } from "@/skills/external-skill-activation";
+import { formatPluginSkillActivation } from "@/skills/plugin-skill-activation";
+import {
+  buildSkillActivationPromptContext,
+  escapeXmlAttr,
+  formatSkillActivation,
+  neutralizeFrameTags,
+} from "@/skills/skill-activation";
+import { measureSkillContextTokens } from "@/skills/skill-context-tokens";
+import { isSkillSandboxAvailableForAgent } from "@/skills/skill-sandbox-availability";
+import { resolveActivationVersion } from "@/skills/skill-version-resolution";
+import { agentOwner } from "@/types";
+import { spliceText } from "./augment-last-user-message";
+
+type SkillInjectionParams = Parameters<
+  typeof injectSkillActivationForLastMessage
+>[0];
+
+// A queue interruption may submit several consecutive user messages in one
+// request. Activate each explicit skill with its own metadata and access checks.
+export function injectSkillActivation(
+  params: SkillInjectionParams,
+): Promise<ChatMessage[]> {
+  return injectPendingUserMessages(params, injectSkillActivationForLastMessage);
+}
+
+export function injectExternalMcpSkillActivation(
+  params: SkillInjectionParams,
+): Promise<ChatMessage[]> {
+  return injectPendingUserMessages(
+    params,
+    injectExternalMcpSkillActivationForLastMessage,
+  );
+}
+
+export function injectPluginSkillActivation(
+  params: SkillInjectionParams,
+): Promise<ChatMessage[]> {
+  return injectPendingUserMessages(
+    params,
+    injectPluginSkillActivationForLastMessage,
+  );
+}
+
+async function injectPendingUserMessages(
+  params: SkillInjectionParams,
+  inject: (
+    params: SkillInjectionParams & { agentId: string | undefined },
+  ) => Promise<ChatMessage[]>,
+): Promise<ChatMessage[]> {
+  if (params.messages.at(-1)?.role !== "user")
+    return inject({ ...params, agentId: params.agentId });
+  const start =
+    params.messages.findLastIndex((message) => message.role !== "user") + 1;
+  let messages = params.messages;
+  for (let index = start; index < messages.length; index++) {
+    const activated = await inject({
+      ...params,
+      agentId: params.agentId,
+      messages: messages.slice(0, index + 1),
+    });
+    if (activated[index] !== messages[index]) {
+      messages = [...messages];
+      messages[index] = activated[index];
+    }
+  }
+  return messages;
+}
+
+/**
+ * When the last user message was sent via a skill slash command, prepend the
+ * skill's activation block to its text so the model receives the skill's
+ * instructions directly — no reliance on the model calling `load_skill`.
+ * An agent-designated skill (SKILL.md `agent`) gets a delegation directive
+ * instead: the model is told to run it via its `skill__<slug>` tool.
+ *
+ * Returns a shallow copy with the block applied; the original `messages` (used
+ * for persistence and the visible bubble) are left untouched. If the org flag
+ * is off, the metadata is absent, the user lacks `skill:read`, or the skill
+ * cannot be resolved or accessed by the user (per its scope), the input is
+ * returned unchanged.
+ */
+async function injectSkillActivationForLastMessage({
+  messages,
+  organizationId,
+  userId,
+  agentId,
+  conversationId,
+  provider,
+  model,
+}: {
+  messages: ChatMessage[];
+  organizationId: string;
+  userId: string;
+  /** The conversation's agent — gates the sandbox hint on tool assignment. */
+  agentId?: string;
+  /** Conversation the skill is activated in — pins/reads the mounted version. */
+  conversationId: string | undefined;
+  /** Resolved turn provider/model, so the injected block is measured on this model's tokenizer. */
+  provider: SupportedProvider;
+  model: string;
+}): Promise<ChatMessage[]> {
+  const lastUserIndex = messages.findLastIndex(
+    (message) => message.role === "user",
+  );
+  if (lastUserIndex === -1) {
+    return messages;
+  }
+
+  const userMessage = messages[lastUserIndex];
+  const skillRef = ChatMessageMetadataSchema.safeParse(userMessage.metadata)
+    .data?.skill;
+  if (!skillRef) {
+    return messages;
+  }
+
+  const skill = await SkillModel.findById(skillRef.id);
+  if (!skill || skill.organizationId !== organizationId) {
+    logger.warn(
+      { organizationId, skillId: skillRef.id },
+      "[Skills] Slash-command skill not found for org; sending message unchanged",
+    );
+    return messages;
+  }
+
+  // Enforce RBAC — a slash command must not bypass the `skill:read` gate that
+  // guards the skills API and the MCP skill tools.
+  const checker = await getSkillPermissionChecker({ userId, organizationId });
+  if (!checker.canRead) {
+    logger.warn(
+      { organizationId, userId, skillId: skill.id },
+      "[Skills] User lacks skill:read for slash-command skill; sending message unchanged",
+    );
+    return messages;
+  }
+
+  // Enforce the skill's scope on top of the read gate.
+  const hasAccess = await SkillTeamModel.userHasSkillAccess({
+    organizationId,
+    userId,
+    skill,
+  });
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  const effective = await ResourcePermissions.getEffective({
+    organizationId,
+    userId,
+    resource: "skill",
+    scope: skill.id,
+  });
+  // SPDX-SnippetEnd
+  const canUse = effective.grants.some(
+    (grant) =>
+      grant.action === "use" &&
+      (grant.scope === "*" || grant.scope === skill.id),
+  );
+  if (!hasAccess || !canUse) {
+    logger.warn(
+      { organizationId, userId, skillId: skill.id },
+      "[Skills] User lacks access to slash-command skill; sending message unchanged",
+    );
+    return messages;
+  }
+
+  // Skills are environment-scoped like tools and connectors: a slash command
+  // must not activate a skill from another environment (skills with no
+  // environment assignments and built-in skills are visible everywhere).
+  if (agentId !== undefined) {
+    const [environmentId, environmentIdsBySkill] = await Promise.all([
+      AgentModel.findEnvironmentId(agentId),
+      SkillEnvironmentModel.getEnvironmentIdsForSkills([skill.id]),
+    ]);
+    const skillEnvironments = {
+      sourceType: skill.sourceType,
+      environmentIds: environmentIdsBySkill.get(skill.id) ?? [],
+    };
+    if (!skillVisibleInEnvironment(skillEnvironments, environmentId)) {
+      logger.warn(
+        { organizationId, agentId, skillId: skill.id },
+        "[Skills] Slash-command skill is outside the agent's environment; sending message unchanged",
+      );
+      return messages;
+    }
+    if (
+      !(await agentActivationSkillPolicyService.isReferenceAllowed({
+        agentId,
+        reference: { source: "native", skillId: skill.id },
+      }))
+    ) {
+      return messages;
+    }
+  }
+
+  // An agent-designated skill runs in its subagent, not inline: instead of the
+  // instructions, prepend a directive to call the skill's `skill__<slug>`
+  // delegation tool (advertised whenever the designated agent resolves for
+  // this caller). The dispatch path renders the instructions for the subagent.
+  if (skill.agentName !== null) {
+    const toolName = `${SKILL_TOOL_PREFIX}${slugify(skill.name)}`;
+    logger.info(
+      { organizationId, skillName: skill.name, agentName: skill.agentName },
+      "[Skills] Agent-designated skill activated via slash command; injecting delegation directive",
+    );
+    const next = [...messages];
+    next[lastUserIndex] = spliceText(
+      userMessage,
+      `<skill_delegation skill="${escapeXmlAttr(skill.name)}" agent="${escapeXmlAttr(skill.agentName)}">\n` +
+        `This skill runs in the "${neutralizeFrameTags(skill.agentName)}" subagent. Call the \`${toolName}\` ` +
+        "tool now, passing the user's request below as `message` — the " +
+        "subagent receives the skill's instructions automatically and " +
+        "returns the result. Do not attempt the skill's task yourself. If " +
+        `\`${toolName}\` is not in your tools list, tell the user the ` +
+        "skill's designated agent is not available to them.\n" +
+        "</skill_delegation>",
+      "prepend",
+    );
+    return next;
+  }
+
+  const canRunSandbox = await isSkillSandboxAvailableForAgent({
+    userId,
+    organizationId,
+    agentId,
+  });
+
+  // resolve the effective version and pin it by mounting (shared with
+  // load_skill), so the injected block, the mounted bytes, and a later
+  // load_skill file read all expose the same version.
+  const activation = await resolveActivationVersion({
+    skill,
+    organizationId,
+    userId,
+    conversationId,
+    canRunSandbox,
+  });
+  if (!activation) {
+    return messages;
+  }
+  const { version, mounted } = activation;
+  const files = await SkillVersionModel.findFiles(version.id);
+
+  const activationBlock = formatSkillActivation({
+    skill: {
+      name: skill.name,
+      content: version.content,
+      compatibility: skill.compatibility,
+      allowedTools: skill.allowedTools,
+      templated: skill.templated,
+    },
+    version: version.version,
+    files,
+    // only claim sandbox runnability when this skill actually holds the mount.
+    canRunSandbox: mounted,
+    promptContext: skill.templated
+      ? await buildSkillActivationPromptContext({ userId, organizationId })
+      : null,
+  });
+
+  // an inline slash-command activation counts one use; the agent-designated
+  // branch above doesn't — its use is counted at delegation dispatch. The
+  // conversation id is also the interaction session id every turn of this chat
+  // is recorded under, which is what makes the activation's spend attributable.
+  const contextTokens = measureSkillContextTokens({
+    block: activationBlock,
+    provider,
+    model,
+  });
+  SkillModel.recordUsage({
+    skillId: skill.id,
+    userId,
+    sessionId: conversationId ?? null,
+    contextTokens,
+  });
+  reportSkillActivation({ activationType: "slash_command", contextTokens });
+  logger.info(
+    {
+      organizationId,
+      skillName: skill.name,
+      version: version.version,
+      mounted,
+      fileCount: files.length,
+      contextTokens,
+    },
+    "[Skills] Skill activated via slash command",
+  );
+
+  const next = [...messages];
+  next[lastUserIndex] = spliceText(userMessage, activationBlock, "prepend");
+  return next;
+}
+
+async function injectExternalMcpSkillActivationForLastMessage({
+  messages,
+  organizationId,
+  userId,
+  agentId,
+  conversationId,
+  provider,
+  model,
+}: {
+  messages: ChatMessage[];
+  organizationId: string;
+  userId: string;
+  agentId: string | undefined;
+  conversationId: string | undefined;
+  provider: SupportedProvider;
+  model: string;
+}): Promise<ChatMessage[]> {
+  if (!config.mcpGateway.skillsEnabled || agentId === undefined)
+    return messages;
+  const lastUserIndex = messages.findLastIndex(
+    (message) => message.role === "user",
+  );
+  if (lastUserIndex === -1) return messages;
+
+  const userMessage = messages[lastUserIndex];
+  const metadata = ChatMessageMetadataSchema.safeParse(
+    userMessage.metadata,
+  ).data;
+  const skillRef = metadata?.externalMcpSkill;
+  if (!skillRef || metadata.skill) return messages;
+
+  const skillChecker = await getSkillPermissionChecker({
+    userId,
+    organizationId,
+  });
+  if (!skillChecker.canRead) return messages;
+
+  const [{ isAdmin: isMcpServerAdmin }, environmentId, gatewayToken] =
+    await Promise.all([
+      getMcpCatalogPermissionChecker({ userId, organizationId }),
+      AgentModel.findEnvironmentId(agentId),
+      selectMCPGatewayToken(agentId, userId, organizationId),
+    ]);
+
+  try {
+    const live = await getExternalMcpSkill({
+      id: skillRef.id,
+      mcpServerId: skillRef.mcpServerId,
+      userId,
+      organizationId,
+      isMcpServerAdmin,
+      environmentId,
+      owner: agentOwner(agentId),
+      tokenAuth: gatewayToken
+        ? {
+            tokenId: gatewayToken.tokenId,
+            teamId: gatewayToken.teamId,
+            isOrganizationToken: gatewayToken.isOrganizationToken,
+            serviceAccountId: gatewayToken.serviceAccountId,
+            organizationId,
+            isUserToken: gatewayToken.isUserToken,
+            userId,
+          }
+        : undefined,
+    });
+    if (!live || live.uri !== skillRef.uri) return messages;
+    if (
+      !(await agentActivationSkillPolicyService.isReferenceAllowed({
+        agentId,
+        reference: {
+          source: "external_mcp",
+          mcpServerId: live.mcpServerId,
+          uri: live.uri,
+        },
+      }))
+    ) {
+      return messages;
+    }
+
+    const activationBlock = formatExternalSkillActivation(live);
+    const contextTokens = measureSkillContextTokens({
+      block: activationBlock,
+      provider,
+      model,
+    });
+    ExternalMcpSkillUsageEventModel.recordUsage({
+      mcpServerId: live.mcpServerId,
+      uri: live.uri,
+      userId,
+      sessionId: conversationId ?? null,
+      contextTokens,
+    });
+    reportSkillActivation({
+      activationType: "chat_attachment",
+      contextTokens,
+    });
+
+    const next = [...messages];
+    next[lastUserIndex] = spliceText(userMessage, activationBlock, "prepend");
+    return next;
+  } catch (error) {
+    logger.warn(
+      { error, organizationId, mcpServerId: skillRef.mcpServerId },
+      "[Skills] External MCP Skill attachment could not be activated",
+    );
+    return messages;
+  }
+}
+
+async function injectPluginSkillActivationForLastMessage({
+  messages,
+  organizationId,
+  userId,
+  agentId,
+  conversationId,
+  provider,
+  model,
+}: {
+  messages: ChatMessage[];
+  organizationId: string;
+  userId: string;
+  agentId?: string;
+  conversationId: string | undefined;
+  provider: SupportedProvider;
+  model: string;
+}): Promise<ChatMessage[]> {
+  const lastUserIndex = messages.findLastIndex(
+    (message) => message.role === "user",
+  );
+  if (lastUserIndex === -1) return messages;
+  const userMessage = messages[lastUserIndex];
+  const metadata = ChatMessageMetadataSchema.safeParse(
+    userMessage.metadata,
+  ).data;
+  const skillRef = metadata?.pluginSkill;
+  if (!skillRef || metadata.skill || metadata.externalMcpSkill) return messages;
+  const skillChecker = await getSkillPermissionChecker({
+    userId,
+    organizationId,
+  });
+  if (!skillChecker.canRead) return messages;
+  try {
+    const live = await getPluginSkill({
+      pluginId: skillRef.pluginId,
+      skillPath: skillRef.skillPath,
+      userId,
+      organizationId,
+    });
+    if (!live || live.name !== skillRef.name) return messages;
+    if (
+      agentId !== undefined &&
+      !(await agentActivationSkillPolicyService.isReferenceAllowed({
+        agentId,
+        reference: {
+          source: "plugin",
+          pluginId: live.pluginId,
+          skillPath: live.skillPath,
+        },
+      }))
+    ) {
+      return messages;
+    }
+    const activationBlock = formatPluginSkillActivation(live);
+    const contextTokens = measureSkillContextTokens({
+      block: activationBlock,
+      provider,
+      model,
+    });
+    PluginSkillUsageEventModel.recordUsage({
+      pluginId: live.pluginId,
+      skillPath: live.skillPath,
+      userId,
+      sessionId: conversationId ?? null,
+      contextTokens,
+    });
+    reportSkillActivation({
+      activationType: "chat_attachment",
+      contextTokens,
+    });
+    const next = [...messages];
+    next[lastUserIndex] = spliceText(userMessage, activationBlock, "prepend");
+    return next;
+  } catch (error) {
+    logger.warn(
+      { error, organizationId, pluginId: skillRef.pluginId },
+      "[Skills] Plugin Skill attachment could not be activated",
+    );
+    return messages;
+  }
+}

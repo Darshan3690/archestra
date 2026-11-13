@@ -1,47 +1,39 @@
 "use client";
 
-import { type archestraApiTypes, isPlaywrightCatalogItem } from "@shared";
-import { AlertTriangle } from "lucide-react";
 import {
-  lazy,
-  Suspense,
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-} from "react";
+  type archestraApiTypes,
+  isPlaywrightCatalogItem,
+} from "@archestra/shared";
+import { KeyRound } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Components } from "react-markdown";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import { StandardFormDialog } from "@/components/standard-dialog";
-import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { InlineNotice, InlineNoticeText } from "@/components/ui/inline-notice";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { SecretInput, SecretTextarea } from "@/components/ui/secret-input";
 import { Separator } from "@/components/ui/separator";
-import { Textarea } from "@/components/ui/textarea";
-import { useFeature } from "@/lib/config/config.query";
-import { useTeamsWithVaultFolders } from "@/lib/teams/team.query";
+import { useEnvironments } from "@/lib/environment.query";
+import { useMcpCatalogCredentialPreflight } from "@/lib/mcp/internal-mcp-catalog.query";
+import { MCP_CONFIG_AUTOCOMPLETE } from "@/lib/mcp/mcp-form-autocomplete";
+import { useDefaultEnvironment } from "@/lib/organization.query";
+import {
+  compileValidationRegex,
+  toFieldValueType,
+  validateFieldAgainstRegex,
+} from "./environment-validation-helpers";
+import { InlineCredentialFormShell } from "./inline-credential-form-shell";
+import { getLocalInstallationCopy } from "./local-installation-copy";
+import { McpCredentialBlockers } from "./mcp-credential-blockers";
 import {
   type McpServerInstallScope,
   SelectMcpServerCredentialTypeAndTeams,
 } from "./select-mcp-server-credential-type-and-teams";
-import { ServiceAccountField } from "./service-account-field";
-
-const InlineVaultSecretSelector = lazy(
-  () =>
-    // biome-ignore lint/style/noRestrictedImports: lazy loading
-    import("@/components/inline-vault-secret-selector.ee"),
-);
 
 type CatalogItem =
   archestraApiTypes.GetInternalMcpCatalogResponses["200"][number];
@@ -69,19 +61,44 @@ const markdownComponents: Components = {
       {...props}
     />
   ),
+  ul: (props) => <ul className="my-2 list-disc space-y-1 pl-5" {...props} />,
+  ol: (props) => <ol className="my-2 list-decimal space-y-1 pl-5" {...props} />,
+  li: (props) => <li className="text-muted-foreground" {...props} />,
+  h1: (props) => (
+    <h1
+      className="mt-3 mb-1 font-semibold text-foreground text-sm"
+      {...props}
+    />
+  ),
+  h2: (props) => (
+    <h2
+      className="mt-3 mb-1 font-semibold text-foreground text-sm"
+      {...props}
+    />
+  ),
+  h3: (props) => (
+    <h3
+      className="mt-3 mb-1 font-semibold text-foreground text-sm"
+      {...props}
+    />
+  ),
+  h4: (props) => (
+    <h4
+      className="mt-3 mb-1 font-semibold text-foreground text-sm"
+      {...props}
+    />
+  ),
 };
 
 export interface LocalServerInstallResult {
+  /** Catalog id to install from. */
+  catalogId: string;
   environmentValues: Record<string, string>;
   userConfigValues?: Record<string, string>;
   /** Installation scope (personal, team, org) */
   scope: McpServerInstallScope;
   /** Team ID to assign the MCP server to (only when scope is "team") */
   teamId?: string | null;
-  /** Whether environmentValues contains BYOS vault references in path#key format */
-  isByosVault?: boolean;
-  /** Kubernetes service account for the MCP server pod */
-  serviceAccount?: string;
 }
 
 interface LocalServerInstallDialogProps {
@@ -104,6 +121,7 @@ interface LocalServerInstallDialogProps {
   personalOnly?: boolean;
   /** When true, only organization-wide installation is allowed */
   orgOnly?: boolean;
+  presentation?: "dialog" | "inline";
 }
 
 export function LocalServerInstallDialog({
@@ -119,21 +137,20 @@ export function LocalServerInstallDialog({
   preselectedTeamId,
   personalOnly: personalOnlyProp = false,
   orgOnly = false,
+  presentation = "dialog",
 }: LocalServerInstallDialogProps) {
+  const lockToExistingScope = isReinstall || isReauth;
   const [selectedTeamId, setSelectedTeamId] = useState<string | null>(
-    isReinstall ? (existingTeamId ?? null) : null,
+    lockToExistingScope ? (existingTeamId ?? null) : null,
   );
   const [scope, setScope] = useState<McpServerInstallScope>(
-    isReinstall
+    lockToExistingScope
       ? (existingScope ?? (existingTeamId ? "team" : "personal"))
       : orgOnly
         ? "org"
         : "personal",
   );
   const [canInstall, setCanInstall] = useState(true);
-  const [serviceAccount, setServiceAccount] = useState<string | undefined>(
-    catalogItem?.localConfig?.serviceAccount,
-  );
   const userConfig =
     (catalogItem?.userConfig as UserConfigType | null | undefined) || {};
   const promptableUserConfig = Object.fromEntries(
@@ -165,14 +182,28 @@ export function LocalServerInstallDialog({
       env.promptOnInstallation !== false &&
       (env as { mounted?: boolean }).mounted === true,
   );
+  const personalOnly =
+    personalOnlyProp ||
+    (catalogItem ? isPlaywrightCatalogItem(catalogItem.id) : false);
+  // Saved credentials the server is configured with and this person cannot
+  // supply. Install would fail on them, so the dialog says why up front.
+  const credentialBlockers =
+    useMcpCatalogCredentialPreflight({
+      catalogId: catalogItem?.id,
+      scope: personalOnly ? "personal" : scope,
+      enabled: isOpen && !isReauth,
+    }).data ?? [];
+  // Only a personal-only credential is cured by picking another owner; any
+  // other blocker stands at every scope, so the owner picker and the config
+  // fields have nothing to offer.
+  const blockedAtEveryScope = credentialBlockers.some(
+    (blocker) => blocker.reason !== "personal_only",
+  );
+  const hasPromptedConfiguration =
+    promptedEnvVars.length > 0 || Object.keys(promptableUserConfig).length > 0;
   const nonSecretEnvVars = promptedEnvVars.filter(
     (env) => env.type !== "secret",
   );
-  const hasPromptedSecretFields =
-    secretEnvVars.length > 0 || secretFileVars.length > 0;
-  const hasPromptedSensitiveUserConfig = Object.values(
-    promptableUserConfig,
-  ).some((field) => field.sensitive && field.promptOnInstallation !== false);
 
   const [environmentValues, setEnvironmentValues] = useState<
     Record<string, string>
@@ -203,58 +234,7 @@ export function LocalServerInstallDialog({
     ),
   );
 
-  // Vault team selection (separate from install team for personal + BYOS)
-  const [vaultTeamId, setVaultTeamId] = useState<string | null>(null);
-
-  // BYOS (Bring Your Own Secrets) state - per-field vault references
-  const [vaultSecrets, setVaultSecrets] = useState<
-    Record<string, { path: string | null; key: string | null }>
-  >({});
-  const [userConfigVaultSecrets, setUserConfigVaultSecrets] = useState<
-    Record<string, { path: string | null; key: string | null }>
-  >({});
-
-  const byosEnabled = useFeature("byosEnabled");
-  const { data: teamsWithVault } = useTeamsWithVaultFolders();
-  const vaultTeams = teamsWithVault?.filter((t) => t.vaultPath);
-
   // Sync vaultTeamId from selectedTeamId when in team mode, reset when switching to personal
-  useEffect(() => {
-    if (scope === "team") {
-      setVaultTeamId(selectedTeamId);
-    } else {
-      setVaultTeamId(null);
-    }
-    setVaultSecrets({});
-    setUserConfigVaultSecrets({});
-  }, [scope, selectedTeamId]);
-
-  const handleVaultTeamChange = (teamId: string) => {
-    setVaultTeamId(teamId);
-    setVaultSecrets({});
-    setUserConfigVaultSecrets({});
-  };
-
-  // Show vault selector when BYOS is enabled and any prompt-time sensitive input needs Vault.
-  const useVaultSecrets =
-    byosEnabled && (hasPromptedSecretFields || hasPromptedSensitiveUserConfig);
-
-  // Helper to update vault secret for a specific field
-  const updateVaultSecret = (
-    fieldName: string,
-    prop: "path" | "key",
-    value: string | null,
-  ) => {
-    setVaultSecrets((prev) => ({
-      ...prev,
-      [fieldName]: {
-        ...prev[fieldName],
-        [prop]: value,
-        // Reset key when path changes
-        ...(prop === "path" ? { key: null } : {}),
-      },
-    }));
-  };
 
   const handleEnvVarChange = (key: string, value: string) => {
     setEnvironmentValues((prev) => ({ ...prev, [key]: value }));
@@ -267,6 +247,10 @@ export function LocalServerInstallDialog({
   const handleInstall = async () => {
     if (!catalogItem) return;
 
+    // personalOnly is a security/product invariant, not merely selector UI.
+    // Enforce it again at the payload boundary so async dialog state cannot
+    // submit a stale team/org scope (notably for the Playwright preview).
+    const submittedScope = personalOnly ? "personal" : scope;
     const finalEnvironmentValues: Record<string, string> = {};
     const finalUserConfigValues: Record<string, string> = {};
 
@@ -279,47 +263,19 @@ export function LocalServerInstallDialog({
 
     // Add secret env var values
     for (const env of secretEnvVars) {
-      if (useVaultSecrets) {
-        // BYOS mode: use vault reference in path#key format
-        const vaultRef = vaultSecrets[env.key];
-        if (vaultRef?.path && vaultRef?.key) {
-          finalEnvironmentValues[env.key] = `${vaultRef.path}#${vaultRef.key}`;
-        }
-      } else {
-        // Non-BYOS mode: use manual value
-        if (environmentValues[env.key]) {
-          finalEnvironmentValues[env.key] = environmentValues[env.key];
-        }
+      if (environmentValues[env.key]) {
+        finalEnvironmentValues[env.key] = environmentValues[env.key];
       }
     }
 
     // Add secret file values
     for (const env of secretFileVars) {
-      if (useVaultSecrets) {
-        // BYOS mode: use vault reference in path#key format
-        const vaultRef = vaultSecrets[env.key];
-        if (vaultRef?.path && vaultRef?.key) {
-          finalEnvironmentValues[env.key] = `${vaultRef.path}#${vaultRef.key}`;
-        }
-      } else {
-        // Non-BYOS mode: use manual value
-        if (environmentValues[env.key]) {
-          finalEnvironmentValues[env.key] = environmentValues[env.key];
-        }
+      if (environmentValues[env.key]) {
+        finalEnvironmentValues[env.key] = environmentValues[env.key];
       }
     }
 
-    for (const [fieldName, fieldConfig] of Object.entries(
-      promptableUserConfig,
-    )) {
-      if (useVaultSecrets && fieldConfig.sensitive) {
-        const vaultRef = userConfigVaultSecrets[fieldName];
-        if (vaultRef?.path && vaultRef?.key) {
-          finalUserConfigValues[fieldName] = `${vaultRef.path}#${vaultRef.key}`;
-        }
-        continue;
-      }
-
+    for (const fieldName of Object.keys(promptableUserConfig)) {
       const value = userConfigValues[fieldName];
       if (value !== undefined && value !== "") {
         finalUserConfigValues[fieldName] = value;
@@ -327,16 +283,11 @@ export function LocalServerInstallDialog({
     }
 
     await onConfirm({
+      catalogId: catalogItem.id,
       environmentValues: finalEnvironmentValues,
       userConfigValues: finalUserConfigValues,
-      scope,
-      teamId: selectedTeamId,
-      isByosVault:
-        useVaultSecrets &&
-        (secretEnvVars.length > 0 ||
-          secretFileVars.length > 0 ||
-          hasPromptedSensitiveUserConfig),
-      serviceAccount: serviceAccount || undefined,
+      scope: submittedScope,
+      teamId: submittedScope === "team" ? selectedTeamId : null,
     });
 
     // Reset form
@@ -375,10 +326,6 @@ export function LocalServerInstallDialog({
           ? "org"
           : "personal",
     );
-    setVaultTeamId(null);
-    setVaultSecrets({});
-    setUserConfigVaultSecrets({});
-    setServiceAccount(catalogItem?.localConfig?.serviceAccount);
   };
 
   const handleClose = () => {
@@ -397,22 +344,14 @@ export function LocalServerInstallDialog({
   });
 
   // Check if secrets are valid:
-  // - Vault mode (team + BYOS): each required secret field must have vault path AND key selected
-  // - Manual mode (personal or BYOS disabled): manual secret values must be filled
   const allSecrets = [...secretEnvVars, ...secretFileVars];
   const isSecretsValid =
     allSecrets.length === 0 ||
-    (useVaultSecrets
-      ? allSecrets.every((env) => {
-          if (!env.required) return true;
-          const vaultRef = vaultSecrets[env.key];
-          return vaultRef?.path && vaultRef?.key;
-        })
-      : allSecrets.every((env) => {
-          if (!env.required) return true;
-          const value = environmentValues[env.key];
-          return !!value?.trim();
-        }));
+    allSecrets.every((env) => {
+      if (!env.required) return true;
+      const value = environmentValues[env.key];
+      return !!value?.trim();
+    });
 
   const isValid = isNonSecretValid && isSecretsValid;
   const sensitiveRequiredUserConfig = Object.entries(
@@ -430,21 +369,58 @@ export function LocalServerInstallDialog({
       return !!value?.trim();
     },
   );
-  const isSensitiveUserConfigValid = useVaultSecrets
-    ? sensitiveRequiredUserConfig.every(
-        ([fieldName]) =>
-          userConfigVaultSecrets[fieldName]?.path &&
-          userConfigVaultSecrets[fieldName]?.key,
-      )
-    : sensitiveRequiredUserConfig.every(([fieldName]) =>
-        userConfigValues[fieldName]?.trim(),
-      );
+  const isSensitiveUserConfigValid = sensitiveRequiredUserConfig.every(
+    ([fieldName]) => userConfigValues[fieldName]?.trim(),
+  );
   const hasPromptedUserConfig = Object.keys(promptableUserConfig).length > 0;
   const isUserConfigValid =
     isNonSensitiveUserConfigValid && isSensitiveUserConfigValid;
 
+  // Resolve the governing environment's allowlist regex (the env the catalog
+  // item is bound to, or the org default when unbound) and compile it once.
+  const { data: environmentList } = useEnvironments();
+  const defaultEnvironment = useDefaultEnvironment();
+  const boundEnvironment = catalogItem?.environmentId
+    ? environmentList?.environments.find(
+        (e) => e.id === catalogItem.environmentId,
+      )
+    : null;
+  const environmentName = boundEnvironment?.name ?? defaultEnvironment.name;
+  const validationRegex = compileValidationRegex(
+    boundEnvironment
+      ? boundEnvironment.validationRegex
+      : defaultEnvironment.validationRegex,
+  );
+  const envVarRegexError = (key: string, type: string): string | null =>
+    validateFieldAgainstRegex({
+      value: environmentValues[key] ?? "",
+      regex: validationRegex,
+      valueType: toFieldValueType(type),
+      environmentName,
+    });
+  const userConfigRegexError = (
+    key: string,
+    type: string | undefined,
+  ): string | null =>
+    validateFieldAgainstRegex({
+      value: userConfigValues[key] ?? "",
+      regex: validationRegex,
+      valueType: toFieldValueType(type),
+      environmentName,
+    });
+  const hasRegexErrors =
+    nonSecretEnvVars.some(
+      (env) => envVarRegexError(env.key, env.type) !== null,
+    ) ||
+    Object.entries(promptableUserConfig).some(
+      ([fieldName, cfg]) =>
+        !cfg.sensitive && userConfigRegexError(fieldName, cfg.type) !== null,
+    );
+  const FormShell =
+    presentation === "inline" ? InlineCredentialFormShell : StandardFormDialog;
+
   return (
-    <StandardFormDialog
+    <FormShell
       open={isOpen}
       onOpenChange={handleClose}
       title={
@@ -455,7 +431,7 @@ export function LocalServerInstallDialog({
       }
       description={
         catalogItem?.instructions ? (
-          <div className="prose prose-sm max-w-none text-sm text-muted-foreground">
+          <div className="text-sm text-muted-foreground">
             <ReactMarkdown
               remarkPlugins={[remarkGfm, remarkBreaks]}
               components={markdownComponents}
@@ -465,9 +441,10 @@ export function LocalServerInstallDialog({
           </div>
         ) : undefined
       }
-      size="medium"
-      className="max-w-2xl max-h-[80vh]"
-      bodyClassName="space-y-6 px-6"
+      size={
+        blockedAtEveryScope || !hasPromptedConfiguration ? "small" : "medium"
+      }
+      bodyClassName="space-y-4"
       onSubmit={handleInstall}
       footer={
         canInstall ? (
@@ -482,7 +459,12 @@ export function LocalServerInstallDialog({
             </Button>
             <Button
               type="submit"
-              disabled={!(isValid && isUserConfigValid) || isInstalling}
+              disabled={
+                !(isValid && isUserConfigValid) ||
+                hasRegexErrors ||
+                credentialBlockers.length > 0 ||
+                isInstalling
+              }
             >
               {isInstalling
                 ? isReauth
@@ -501,65 +483,48 @@ export function LocalServerInstallDialog({
       }
     >
       {isReauth && (
-        <Alert className="border-amber-500/50 bg-amber-500/10">
-          <AlertTriangle className="h-4 w-4 text-amber-500" />
-          <AlertDescription>
-            Your existing credentials are expired or invalid. Submitting new
-            credentials here will replace them while preserving your tool
-            assignments.
-          </AlertDescription>
-        </Alert>
+        <InlineNotice variant="neutral">
+          <KeyRound />
+          <InlineNoticeText>
+            Replace credentials for this existing connection only. Tool
+            assignments and policies stay unchanged. Use Manage credentials to
+            add or remove connections.
+          </InlineNoticeText>
+        </InlineNotice>
       )}
 
-      <SelectMcpServerCredentialTypeAndTeams
-        onTeamChange={setSelectedTeamId}
-        catalogId={isReinstall ? undefined : catalogItem?.id}
-        onScopeChange={setScope}
-        onCanInstallChange={setCanInstall}
-        isReinstall={isReinstall}
-        existingTeamId={existingTeamId}
-        existingScope={existingScope}
-        personalOnly={
-          personalOnlyProp ||
-          (catalogItem ? isPlaywrightCatalogItem(catalogItem.id) : false)
-        }
-        orgOnly={orgOnly}
-        preselectedTeamId={preselectedTeamId}
-      />
-
-      {useVaultSecrets && scope !== "team" && (
-        <div className="space-y-2">
-          <Label>Pull Vault secrets from:</Label>
-          <p className="text-xs text-muted-foreground">
-            Only folders associated with your teams are shown.
+      {!isReauth &&
+        personalOnly &&
+        !hasPromptedConfiguration &&
+        credentialBlockers.length === 0 && (
+          <p className="text-sm text-muted-foreground">
+            This server needs no credentials or configuration.{" "}
+            {
+              getLocalInstallationCopy(catalogItem?.multitenant === true)
+                .installForMe
+            }
           </p>
-          <Select
-            value={vaultTeamId ?? ""}
-            onValueChange={handleVaultTeamChange}
-          >
-            <SelectTrigger>
-              <SelectValue placeholder="-- Select Vault folder --" />
-            </SelectTrigger>
-            <SelectContent>
-              {vaultTeams?.map((team) => (
-                <SelectItem key={team.id} value={team.id}>
-                  {team.vaultPath}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-      )}
+        )}
 
-      {canInstall && catalogItem?.localConfig?.serviceAccount !== undefined && (
-        <ServiceAccountField
-          value={serviceAccount}
-          onChange={setServiceAccount}
-          disabled={isInstalling}
+      {!isReauth && <McpCredentialBlockers blockers={credentialBlockers} />}
+
+      {!blockedAtEveryScope && (
+        <SelectMcpServerCredentialTypeAndTeams
+          onTeamChange={setSelectedTeamId}
+          catalogId={isReinstall || isReauth ? undefined : catalogItem?.id}
+          onScopeChange={setScope}
+          onCanInstallChange={setCanInstall}
+          isReinstall={isReinstall}
+          isReauth={isReauth}
+          existingTeamId={existingTeamId}
+          existingScope={existingScope}
+          personalOnly={personalOnly}
+          orgOnly={orgOnly}
+          preselectedTeamId={preselectedTeamId}
         />
       )}
 
-      {canInstall && (
+      {canInstall && !blockedAtEveryScope && (
         <div className="space-y-6">
           {/* Non-secret Environment Variables (always editable) */}
           {nonSecretEnvVars.length > 0 && (
@@ -599,7 +564,7 @@ export function LocalServerInstallDialog({
                     </Label>
                   )}
                   {env.description && (
-                    <div className="text-xs text-muted-foreground prose prose-sm max-w-none">
+                    <div className="text-xs text-muted-foreground">
                       <ReactMarkdown
                         remarkPlugins={[remarkGfm, remarkBreaks]}
                         components={markdownComponents}
@@ -621,6 +586,7 @@ export function LocalServerInstallDialog({
                         env.default !== undefined ? String(env.default) : "0"
                       }
                       className="font-mono"
+                      autoComplete={MCP_CONFIG_AUTOCOMPLETE}
                       disabled={isInstalling}
                     />
                   ) : (
@@ -633,8 +599,17 @@ export function LocalServerInstallDialog({
                       }
                       placeholder={`Enter value for ${env.key}`}
                       className="font-mono"
+                      autoComplete={MCP_CONFIG_AUTOCOMPLETE}
                       disabled={isInstalling}
+                      aria-invalid={
+                        envVarRegexError(env.key, env.type) ? true : undefined
+                      }
                     />
+                  )}
+                  {envVarRegexError(env.key, env.type) && (
+                    <p className="text-xs text-destructive">
+                      {envVarRegexError(env.key, env.type)}
+                    </p>
                   )}
                 </div>
               ))}
@@ -664,7 +639,7 @@ export function LocalServerInstallDialog({
                           )}
                         </Label>
                         {env.description && (
-                          <div className="text-xs text-muted-foreground prose prose-sm max-w-none">
+                          <div className="text-xs text-muted-foreground">
                             <ReactMarkdown
                               remarkPlugins={[remarkGfm, remarkBreaks]}
                               components={markdownComponents}
@@ -674,41 +649,9 @@ export function LocalServerInstallDialog({
                           </div>
                         )}
 
-                        {/* BYOS mode: vault selector for each secret field */}
-                        {useVaultSecrets ? (
-                          <Suspense
-                            fallback={
-                              <div className="text-sm text-muted-foreground">
-                                Loading...
-                              </div>
-                            }
-                          >
-                            <InlineVaultSecretSelector
-                              teamId={vaultTeamId}
-                              selectedSecretPath={
-                                vaultSecrets[env.key]?.path ?? null
-                              }
-                              selectedSecretKey={
-                                vaultSecrets[env.key]?.key ?? null
-                              }
-                              onSecretPathChange={(path) =>
-                                updateVaultSecret(env.key, "path", path)
-                              }
-                              onSecretKeyChange={(key) =>
-                                updateVaultSecret(env.key, "key", key)
-                              }
-                              disabled={isInstalling}
-                              noTeamMessage={
-                                scope !== "team"
-                                  ? "Select a vault folder to pull secrets from"
-                                  : undefined
-                              }
-                            />
-                          </Suspense>
-                        ) : (
-                          <Input
+                        {
+                          <SecretInput
                             id={`env-${env.key}`}
-                            type="password"
                             value={environmentValues[env.key] || ""}
                             onChange={(e) =>
                               handleEnvVarChange(env.key, e.target.value)
@@ -717,7 +660,7 @@ export function LocalServerInstallDialog({
                             className="font-mono"
                             disabled={isInstalling}
                           />
-                        )}
+                        }
                       </div>
                     ))}
                   </div>
@@ -740,7 +683,7 @@ export function LocalServerInstallDialog({
                           )}
                         </Label>
                         {env.description && (
-                          <div className="text-xs text-muted-foreground prose prose-sm max-w-none">
+                          <div className="text-xs text-muted-foreground">
                             <ReactMarkdown
                               remarkPlugins={[remarkGfm, remarkBreaks]}
                               components={markdownComponents}
@@ -750,38 +693,7 @@ export function LocalServerInstallDialog({
                           </div>
                         )}
 
-                        {/* BYOS mode: vault selector for each secret field */}
-                        {useVaultSecrets ? (
-                          <Suspense
-                            fallback={
-                              <div className="text-sm text-muted-foreground">
-                                Loading...
-                              </div>
-                            }
-                          >
-                            <InlineVaultSecretSelector
-                              teamId={vaultTeamId}
-                              selectedSecretPath={
-                                vaultSecrets[env.key]?.path ?? null
-                              }
-                              selectedSecretKey={
-                                vaultSecrets[env.key]?.key ?? null
-                              }
-                              onSecretPathChange={(path) =>
-                                updateVaultSecret(env.key, "path", path)
-                              }
-                              onSecretKeyChange={(key) =>
-                                updateVaultSecret(env.key, "key", key)
-                              }
-                              disabled={isInstalling}
-                              noTeamMessage={
-                                scope !== "team"
-                                  ? "Select a vault folder to pull secrets from"
-                                  : undefined
-                              }
-                            />
-                          </Suspense>
-                        ) : (
+                        {
                           <AutoResizeTextarea
                             id={`env-${env.key}`}
                             value={environmentValues[env.key] || ""}
@@ -790,7 +702,7 @@ export function LocalServerInstallDialog({
                             }
                             disabled={isInstalling}
                           />
-                        )}
+                        }
                       </div>
                     ))}
                   </div>
@@ -824,7 +736,7 @@ export function LocalServerInstallDialog({
                         )}
                       </Label>
                       {fieldConfig.description && (
-                        <div className="text-xs text-muted-foreground prose prose-sm max-w-none">
+                        <div className="text-xs text-muted-foreground">
                           <ReactMarkdown
                             remarkPlugins={[remarkGfm, remarkBreaks]}
                             components={markdownComponents}
@@ -834,46 +746,7 @@ export function LocalServerInstallDialog({
                         </div>
                       )}
 
-                      {useVaultSecrets && fieldConfig.sensitive ? (
-                        <Suspense
-                          fallback={
-                            <div className="text-sm text-muted-foreground">
-                              Loading...
-                            </div>
-                          }
-                        >
-                          <InlineVaultSecretSelector
-                            teamId={vaultTeamId}
-                            selectedSecretPath={
-                              userConfigVaultSecrets[fieldName]?.path ?? null
-                            }
-                            selectedSecretKey={
-                              userConfigVaultSecrets[fieldName]?.key ?? null
-                            }
-                            onSecretPathChange={(path) =>
-                              setUserConfigVaultSecrets((prev) => ({
-                                ...prev,
-                                [fieldName]: { path, key: null },
-                              }))
-                            }
-                            onSecretKeyChange={(key) =>
-                              setUserConfigVaultSecrets((prev) => ({
-                                ...prev,
-                                [fieldName]: {
-                                  path: prev[fieldName]?.path ?? null,
-                                  key,
-                                },
-                              }))
-                            }
-                            disabled={isInstalling}
-                            noTeamMessage={
-                              scope !== "team"
-                                ? "Select a vault folder to pull secrets from"
-                                : undefined
-                            }
-                          />
-                        </Suspense>
-                      ) : fieldConfig.type === "boolean" ? (
+                      {fieldConfig.type === "boolean" ? (
                         <div className="flex items-center gap-2">
                           <Checkbox
                             id={`user-config-${fieldName}`}
@@ -907,12 +780,12 @@ export function LocalServerInstallDialog({
                               : "0"
                           }
                           className="font-mono"
+                          autoComplete={MCP_CONFIG_AUTOCOMPLETE}
                           disabled={isInstalling}
                         />
                       ) : fieldConfig.sensitive ? (
-                        <Input
+                        <SecretInput
                           id={`user-config-${fieldName}`}
-                          type="password"
                           value={userConfigValues[fieldName] || ""}
                           onChange={(e) =>
                             handleUserConfigChange(fieldName, e.target.value)
@@ -931,9 +804,22 @@ export function LocalServerInstallDialog({
                           }
                           placeholder={`Enter value for ${fieldConfig.title || fieldName}`}
                           className="font-mono"
+                          autoComplete={MCP_CONFIG_AUTOCOMPLETE}
                           disabled={isInstalling}
+                          aria-invalid={
+                            !fieldConfig.sensitive &&
+                            userConfigRegexError(fieldName, fieldConfig.type)
+                              ? true
+                              : undefined
+                          }
                         />
                       )}
+                      {!fieldConfig.sensitive &&
+                        userConfigRegexError(fieldName, fieldConfig.type) && (
+                          <p className="text-xs text-destructive">
+                            {userConfigRegexError(fieldName, fieldConfig.type)}
+                          </p>
+                        )}
                     </div>
                   ),
                 )}
@@ -942,7 +828,7 @@ export function LocalServerInstallDialog({
           )}
         </div>
       )}
-    </StandardFormDialog>
+    </FormShell>
   );
 }
 
@@ -975,7 +861,7 @@ function AutoResizeTextarea({
   }, [value, adjustHeight]);
 
   return (
-    <Textarea
+    <SecretTextarea
       ref={textareaRef}
       id={id}
       value={value}

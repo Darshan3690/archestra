@@ -1,13 +1,41 @@
-import { index, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { index, jsonb, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import type { KnowledgeBaseVisibility } from "@/types/knowledge-base";
+import serviceAccountsTable from "./service-account";
+import { softDeletablePgTable } from "./soft-deletable-table";
+import usersTable from "./user";
 
-const knowledgeBasesTable = pgTable(
+const knowledgeBasesTable = softDeletablePgTable(
   "knowledge_bases",
   {
     id: uuid("id").primaryKey().defaultRandom(),
     organizationId: text("organization_id").notNull(),
     name: text("name").notNull(),
     description: text("description"),
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    visibility: text("visibility")
+      .$type<KnowledgeBaseVisibility>()
+      .notNull()
+      .default("org-wide"),
+    teamIds: jsonb("team_ids").$type<string[]>().notNull().default([]),
+    // SPDX-SnippetEnd
     status: text("status").notNull().default("active"),
+    /**
+     * Who created this. Nullable: rows predating creator tracking have no
+     * answer, and `ON DELETE SET NULL` gives the column back to "unknown" when
+     * the account is deleted rather than taking the knowledge base with it — the
+     * organization owns knowledge bases, not the person who happened to make it.
+     */
+    createdBy: text("created_by").references(() => usersTable.id, {
+      onDelete: "set null",
+    }),
+    /** Service account creator; separate from human ownership. */
+    createdByServiceAccountId: uuid("created_by_service_account_id").references(
+      () => serviceAccountsTable.id,
+      { onDelete: "set null" },
+    ),
     createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { mode: "date" })
       .notNull()
@@ -15,7 +43,13 @@ const knowledgeBasesTable = pgTable(
       .$onUpdate(() => new Date()),
   },
   (table) => [
-    index("knowledge_bases_organization_id_idx").on(table.organizationId),
+    // Partial: every read of this table but the trash listing filters
+    // `deleted_at IS NULL`, so the index only ever needs the active rows.
+    // The trash's `status=deleted` slice scans instead — deliberately
+    // unindexed, since soft-deleted rows are a small tail of a small table.
+    index("knowledge_bases_organization_id_idx")
+      .on(table.organizationId)
+      .where(sql`deleted_at IS NULL`),
   ],
 );
 

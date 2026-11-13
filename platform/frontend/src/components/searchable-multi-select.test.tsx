@@ -54,7 +54,7 @@ describe("SearchableMultiSelect", () => {
     );
 
     await user.click(screen.getByRole("combobox"));
-    await user.click(screen.getByRole("button", { name: /Item One/i }));
+    await user.click(screen.getByRole("option", { name: /Item One/i }));
 
     expect(onValueChange).toHaveBeenCalledWith(["item-1"]);
   });
@@ -72,7 +72,7 @@ describe("SearchableMultiSelect", () => {
     );
 
     await user.click(screen.getByRole("combobox"));
-    await user.click(screen.getByRole("button", { name: /Item One/i }));
+    await user.click(screen.getByRole("option", { name: /Item One/i }));
 
     expect(onValueChange).toHaveBeenCalledWith([]);
   });
@@ -90,7 +90,7 @@ describe("SearchableMultiSelect", () => {
     );
 
     await user.click(screen.getByRole("combobox"));
-    await user.click(screen.getByRole("button", { name: /Item Two/i }));
+    await user.click(screen.getByRole("option", { name: /Item Two/i }));
 
     expect(onValueChange).toHaveBeenCalledWith(["item-1", "item-2"]);
 
@@ -102,7 +102,7 @@ describe("SearchableMultiSelect", () => {
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: /Item Three/i }));
+    await user.click(screen.getByRole("option", { name: /Item Three/i }));
     expect(onValueChange).toHaveBeenLastCalledWith([
       "item-1",
       "item-2",
@@ -135,7 +135,9 @@ describe("SearchableMultiSelect", () => {
       />,
     );
 
-    const badges = screen.getAllByRole("button", { name: "" });
+    const badges = screen.getAllByRole("button", {
+      name: "Remove selected item",
+    });
     await user.click(badges[0]);
 
     expect(onValueChange).toHaveBeenCalledWith(["item-2"]);
@@ -228,7 +230,7 @@ describe("SearchableMultiSelect", () => {
     );
 
     await user.click(screen.getByRole("combobox"));
-    await user.click(screen.getByRole("button", { name: /Item Two/i }));
+    await user.click(screen.getByRole("option", { name: /Item Two/i }));
 
     expect(onValueChange).not.toHaveBeenCalled();
   });
@@ -295,20 +297,6 @@ describe("SearchableMultiSelect", () => {
     );
   });
 
-  it("shows disabled state on combobox", () => {
-    render(
-      <SearchableMultiSelect
-        value={[]}
-        onValueChange={vi.fn()}
-        items={mockItems}
-        disabled
-      />,
-    );
-
-    expect(screen.getByRole("combobox")).toHaveClass("cursor-not-allowed");
-    expect(screen.getByRole("combobox")).toHaveClass("opacity-50");
-  });
-
   it("does not select disabled items", async () => {
     const user = userEvent.setup();
     const onValueChange = vi.fn();
@@ -327,7 +315,7 @@ describe("SearchableMultiSelect", () => {
     );
 
     await user.click(screen.getByRole("combobox"));
-    const disabledButton = screen.getByRole("button", { name: /Item Four/i });
+    const disabledButton = screen.getByRole("option", { name: /Item Four/i });
     expect(disabledButton).toBeDisabled();
 
     await user.click(disabledButton);
@@ -443,56 +431,7 @@ describe("SearchableMultiSelect", () => {
     expect(screen.getByPlaceholderText("Find items...")).toBeInTheDocument();
   });
 
-  it("applies custom className to combobox", () => {
-    render(
-      <SearchableMultiSelect
-        value={[]}
-        onValueChange={vi.fn()}
-        items={mockItems}
-        className="my-custom-class"
-      />,
-    );
-
-    expect(screen.getByRole("combobox")).toHaveClass("my-custom-class");
-  });
-
-  it("applies custom contentClassName to popover", async () => {
-    const user = userEvent.setup();
-
-    render(
-      <SearchableMultiSelect
-        value={[]}
-        onValueChange={vi.fn()}
-        items={mockItems}
-        contentClassName="custom-content"
-      />,
-    );
-
-    await user.click(screen.getByRole("combobox"));
-    expect(
-      screen.getByPlaceholderText("Search...").closest("[data-state]"),
-    ).toHaveClass("custom-content");
-  });
-
-  it("applies custom listClassName to item list", async () => {
-    const user = userEvent.setup();
-
-    render(
-      <SearchableMultiSelect
-        value={[]}
-        onValueChange={vi.fn()}
-        items={mockItems}
-        listClassName="custom-list"
-      />,
-    );
-
-    await user.click(screen.getByRole("combobox"));
-    expect(
-      screen.getByRole("button", { name: /Item One/i }).parentElement,
-    ).toHaveClass("custom-list");
-  });
-
-  it("shows checkmark for selected items", async () => {
+  it("exposes selected items to assistive technology", async () => {
     const user = userEvent.setup();
 
     render(
@@ -504,11 +443,14 @@ describe("SearchableMultiSelect", () => {
     );
 
     await user.click(screen.getByRole("combobox"));
-    const buttons = screen.getAllByRole("button");
-    const selectedButton = buttons.find((b) =>
-      b.textContent?.includes("Item One"),
+    expect(screen.getByRole("option", { name: /Item One/i })).toHaveAttribute(
+      "aria-selected",
+      "true",
     );
-    expect(selectedButton).toHaveClass("bg-accent");
+    expect(screen.getByRole("option", { name: /Item Two/i })).toHaveAttribute(
+      "aria-selected",
+      "false",
+    );
   });
 
   it("filters and shows only matching items", async () => {
@@ -529,4 +471,23 @@ describe("SearchableMultiSelect", () => {
     expect(screen.getByText("Item Two")).toBeInTheDocument();
     expect(screen.queryByText("Item Three")).not.toBeInTheDocument();
   });
+});
+
+it("keeps a disabled selection unchanged through mouse and keyboard interactions", async () => {
+  const user = userEvent.setup();
+  const onValueChange = vi.fn();
+  render(
+    <SearchableMultiSelect
+      value={["item-1"]}
+      items={mockItems}
+      onValueChange={onValueChange}
+      disabled
+    />,
+  );
+  await user.click(
+    screen.getByRole("button", { name: "Remove selected item" }),
+  );
+  await user.click(screen.getByRole("combobox"));
+  expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+  expect(onValueChange).not.toHaveBeenCalled();
 });

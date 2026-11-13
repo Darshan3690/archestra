@@ -1,20 +1,26 @@
+import { DEFAULT_INTERNAL_API_BASE_URL } from "@archestra/shared/consts";
 import { env } from "next-runtime-env";
 import type { PostHogConfig } from "posthog-js";
+import {
+  REPLAY_BLOCK_SELECTOR,
+  sanitizeReplaySnapshots,
+  stripTelemetryUrlContent,
+} from "@/lib/telemetry-privacy";
 
 const environment: "development" | "production" =
   (process.env.NODE_ENV?.toLowerCase() as "development" | "production") ??
   "development";
 
-export const DEFAULT_BACKEND_URL = "http://localhost:9000";
+export const DEFAULT_BACKEND_URL = DEFAULT_INTERNAL_API_BASE_URL;
 
 /**
  * Get the backend API base URL.
- * Returns the configured URL or defaults to localhost:9000 for development.
+ * Returns the configured URL or defaults to the loopback API for development.
  *
  * Priority:
  * 1. NEXT_PUBLIC_ARCHESTRA_INTERNAL_API_BASE_URL (runtime env var for client/server)
  * 2. ARCHESTRA_INTERNAL_API_BASE_URL (server-side only, for SSR/API routes)
- * 3. Default: http://localhost:9000
+ * 3. Default: {@link DEFAULT_INTERNAL_API_BASE_URL}
  */
 export const getBackendBaseUrl = (): string => {
   // Try runtime env var first (works in both client and server)
@@ -70,18 +76,25 @@ const appendProxySuffix = (baseUrl: string): string => {
  * Returns array of URLs for UI display when multiple URLs are configured.
  */
 export const getExternalProxyUrls = (): string[] => {
-  const externalUrl = env("NEXT_PUBLIC_ARCHESTRA_API_BASE_URL");
-  if (!externalUrl) {
+  const configured = getConfiguredExternalProxyUrls();
+  if (configured.length === 0) {
     return typeof window !== "undefined"
       ? [appendProxySuffix(window.location.origin)]
       : [];
   }
-  return externalUrl
+  return configured;
+};
+
+/**
+ * The external proxy URLs the deployment configures, without the page-origin
+ * fallback. A server render that knows the document's origin adds that itself.
+ */
+export const getConfiguredExternalProxyUrls = (): string[] =>
+  (env("NEXT_PUBLIC_ARCHESTRA_API_BASE_URL") ?? "")
     .split(",")
     .map((url) => url.trim())
     .filter((url) => url.length > 0)
     .map(appendProxySuffix);
-};
 
 /**
  * Get the WebSocket URL for general communication.
@@ -99,11 +112,7 @@ export const getWebSocketUrl = (): string => {
   }
 
   // Server-side: use absolute URL
-  const backendBaseUrl = getBackendBaseUrl();
-  const wsBaseUrl = backendBaseUrl
-    ? backendBaseUrl.replace(/^http/, "ws")
-    : "ws://localhost:9000";
-  return `${wsBaseUrl}/ws`;
+  return `${getBackendBaseUrl().replace(/^http/, "ws")}/ws`;
 };
 
 /**
@@ -164,11 +173,13 @@ export const getMcpSandboxBaseUrl = (
   if (typeof window !== "undefined") {
     const browserHost = window.location.hostname;
 
-    // Mode 2: localhost ↔ 127.0.0.1 swap (dev/quickstart, zero-config cross-origin)
-    // Only when the user is actually on localhost — not in production where the
-    // internal backend URL happens to be localhost but the browser isn't.
+    // Mode 2: localhost ↔ 127.0.0.1 swap (dev/quickstart, zero-config cross-origin).
+    // Swap the page's OWN origin, not the backend URL, so the sandbox stays on the
+    // port the browser actually reached us on — otherwise it points at the backend
+    // port (e.g. :9000), which is dead behind a tunnel that only forwards the
+    // frontend port (e.g. ssh -L 13000:localhost:3000 → browse localhost:13000).
     if (browserHost === "localhost" || browserHost === "127.0.0.1") {
-      const swapped = swapLocalhostOrigin(getBackendBaseUrl());
+      const swapped = swapLocalhostOrigin(window.location.origin);
       if (swapped) {
         return { baseUrl: swapped, hasCrossOrigin: true };
       }
@@ -222,27 +233,54 @@ export default {
   posthog: {
     config: {
       person_profiles: "identified_only",
+      // Errors go to Sentry only. Set explicitly: when unset, the PostHog
+      // project's remote setting can turn exception autocapture on.
+      capture_exceptions: false,
+      // Keep interaction analytics without collecting page content.
+      autocapture: false,
+      enable_recording_console_log: false,
+      before_send: (event) => {
+        if (!event) return event;
+        if (
+          event.event === "$snapshot" &&
+          !sanitizeReplaySnapshots(event.properties.$snapshot_data)
+        ) {
+          return null;
+        }
+        for (const properties of [
+          event.properties,
+          event.properties.$set,
+          event.properties.$set_once,
+        ]) {
+          if (!properties || typeof properties !== "object") continue;
+          for (const key of [
+            "$current_url",
+            "$referrer",
+            "$initial_current_url",
+            "$initial_referrer",
+          ]) {
+            const value = properties[key];
+            if (typeof value === "string") {
+              properties[key] = stripTelemetryUrlContent(value);
+            }
+          }
+        }
+        return event;
+      },
       session_recording: {
-        recordHeaders: true,
-        recordBody: true,
-        maskCapturedNetworkRequestFn: (data) => {
-          const sensitiveHeaders = ["authorization", "cookie", "set-cookie"];
-          if (data.requestHeaders) {
-            for (const header of sensitiveHeaders) {
-              if (header in data.requestHeaders) {
-                data.requestHeaders[header] = "***REDACTED***";
-              }
-            }
-          }
-          if (data.responseHeaders) {
-            for (const header of sensitiveHeaders) {
-              if (header in data.responseHeaders) {
-                data.responseHeaders[header] = "***REDACTED***";
-              }
-            }
-          }
-          return data;
-        },
+        // Sanitize raw events in before_send; transport compression still applies.
+        compress_events: false,
+        maskAllInputs: true,
+        maskTextSelector: "*",
+        blockSelector: REPLAY_BLOCK_SELECTOR,
+        captureCanvas: { recordCanvas: false },
+        recordHeaders: false,
+        recordBody: false,
+        // This callback also masks replay page URLs and navigation metadata.
+        maskCapturedNetworkRequestFn: (data) => ({
+          ...data,
+          name: stripTelemetryUrlContent(data.name),
+        }),
       },
     } satisfies Partial<PostHogConfig>,
   },
@@ -263,14 +301,12 @@ export default {
     },
   },
   sentry: {
-    get dsn() {
-      return env("NEXT_PUBLIC_ARCHESTRA_SENTRY_FRONTEND_DSN") || "";
+    /** The deployment's own Sentry project, when it set one. */
+    get dsnOverride() {
+      return env("NEXT_PUBLIC_ARCHESTRA_SENTRY_FRONTEND_DSN");
     },
-    get environment() {
-      return (
-        env("NEXT_PUBLIC_ARCHESTRA_SENTRY_ENVIRONMENT")?.toLowerCase() ||
-        environment
-      );
+    get environmentOverride() {
+      return env("NEXT_PUBLIC_ARCHESTRA_SENTRY_ENVIRONMENT");
     },
   },
 };

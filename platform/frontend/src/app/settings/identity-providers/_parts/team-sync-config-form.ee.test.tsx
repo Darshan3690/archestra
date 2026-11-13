@@ -1,22 +1,17 @@
-import { zodResolver } from "@hookform/resolvers/zod";
 import {
   IdentityProviderFormSchema,
   type IdentityProviderFormValues,
-} from "@shared";
+} from "@archestra/shared";
+import { zodResolver } from "@hookform/resolvers/zod";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useForm } from "react-hook-form";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Form } from "@/components/ui/form";
+import { useAppearanceSettings } from "@/lib/organization.query";
 import { TeamSyncConfigForm } from "./team-sync-config-form.ee";
 
-vi.mock("@/lib/organization.query", () => ({
-  useAppearanceSettings: () => ({
-    data: {
-      appName: "Spark",
-    },
-  }),
-}));
+vi.mock("@/lib/organization.query");
 
 vi.mock("@/lib/auth/identity-provider.query.ee", () => ({
   useIdentityProviderLatestIdTokenClaims: () => ({
@@ -71,50 +66,32 @@ function TestWrapper({
   );
 }
 
+beforeEach(() => {
+  vi.mocked(useAppearanceSettings).mockReturnValue({
+    data: { appName: "Spark" },
+  } as unknown as ReturnType<typeof useAppearanceSettings>);
+});
+
 describe("TeamSyncConfigForm", () => {
-  it("shows latest ID token claims when editing an existing provider", async () => {
-    render(<TestWrapper providerId="Okta" identityProviderId="idp-1" />);
-    expect(screen.getAllByText(/engineering/i).length).toBeGreaterThan(0);
-  });
-
-  it("shows a live template test result for team sync extraction", async () => {
+  it("extracts groups automatically and updates as the template changes", async () => {
     const user = userEvent.setup();
-
     render(<TestWrapper providerId="Okta" identityProviderId="idp-1" />);
-    await user.type(
-      screen.getByLabelText("Groups Handlebars Template"),
-      "{{#each groups}}{{this}},{{/each}}",
+    expect(await screen.findByText("1 groups extracted")).toBeInTheDocument();
+    const template = screen.getByLabelText("Groups Handlebars Template");
+    // Assert evaluated output, not the same text in the template code sample.
+    await user.click(template);
+    await user.paste("custom-{{groups.[0]}}");
+    expect(
+      await screen.findByText("custom-engineering", { selector: "span" }),
+    ).toBeInTheDocument();
+    await user.clear(template);
+    expect(
+      await screen.findByText("Default extraction from the sign-in data."),
+    ).toBeInTheDocument();
+    await user.click(
+      screen.getByRole("checkbox", { name: "Enable Team Sync" }),
     );
-
-    expect(screen.getByText("Live Template Test")).toBeInTheDocument();
-    expect(await screen.findByText("Groups extracted")).toBeInTheDocument();
-    expect(
-      screen.getByText(/group identifier.*extracted/i),
-    ).toBeInTheDocument();
-  });
-
-  it("tests default team sync extraction when the template is empty", async () => {
-    render(<TestWrapper providerId="Okta" identityProviderId="idp-1" />);
-    expect(screen.getByText("Live Template Test")).toBeInTheDocument();
-    expect(await screen.findByText("Groups extracted")).toBeInTheDocument();
-    expect(screen.getByText(/using default extraction/i)).toBeInTheDocument();
-    expect(screen.queryByText("Enter a template to test.")).toBeNull();
-  });
-
-  it("shows the Okta groups claim hint", async () => {
-    render(<TestWrapper providerId="Okta" />);
-    expect(
-      screen.getByText(/Okta team sync commonly reads group names/i),
-    ).toBeInTheDocument();
-  });
-
-  it("shows the Entra groups and roles claim hint", async () => {
-    render(<TestWrapper providerId="EntraID" />);
-    expect(
-      screen.getByText(/Microsoft Entra ID team sync commonly reads/i),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/sync teams from Entra App roles/i),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Team Sync is off")).toBeInTheDocument();
+    expect(screen.queryByText("1 groups extracted")).not.toBeInTheDocument();
   });
 });

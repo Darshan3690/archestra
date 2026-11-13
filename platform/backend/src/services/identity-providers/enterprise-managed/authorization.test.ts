@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
 import { createHash } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { vi } from "vitest";
@@ -202,6 +203,16 @@ describe("exchangeIdentityAssertionForAccessToken", () => {
     expect(storedToken?.clientId).toBe(client.clientId);
     expect(storedToken?.referenceId).toBe(
       `${MCP_RESOURCE_REFERENCE_PREFIX}${agent.id}`,
+    );
+
+    // The issuer identifier clients copy into the assertion audience is
+    // slash-free (it must byte-match the advertised metadata issuer and the
+    // RFC 9207 `iss` parameter), but assertions minted against the previously
+    // advertised slashed issuer must stay valid during the transition.
+    const issuer = buildOAuthIssuer();
+    expect(issuer).not.toMatch(/\/$/);
+    expect(mockValidateJwt).toHaveBeenCalledWith(
+      expect.objectContaining({ audience: [issuer, `${issuer}/`] }),
     );
   });
 

@@ -1,5 +1,9 @@
 import type { PartialUIMessage } from "../types";
-import type { DualLlmAnalysis, Interaction, InteractionUtils } from "./common";
+import type {
+  Interaction,
+  InteractionUtils,
+  RequestedToolCall,
+} from "./common";
 
 /**
  * Bedrock Converse API request/response types
@@ -98,7 +102,8 @@ class BedrockConverseInteraction implements InteractionUtils {
     for (let i = messages.length - 1; i >= 0; i--) {
       const message = messages[i];
       if (message.role === "user" && Array.isArray(message.content)) {
-        for (const block of message.content) {
+        for (let j = message.content.length - 1; j >= 0; j--) {
+          const block = message.content[j];
           if (block.toolResult?.toolUseId) {
             return block.toolResult.toolUseId;
           }
@@ -129,8 +134,14 @@ class BedrockConverseInteraction implements InteractionUtils {
     return Array.from(toolsUsed);
   }
 
-  getToolNamesRefused(): string[] {
-    return [];
+  getToolCallsRequested(): RequestedToolCall[] {
+    const responseContent = this.response.output?.message?.content;
+    if (!Array.isArray(responseContent)) return [];
+    return responseContent.flatMap((block) =>
+      block.toolUse?.name && block.toolUse.toolUseId
+        ? [{ id: block.toolUse.toolUseId, name: block.toolUse.name }]
+        : [],
+    );
   }
 
   getToolNamesRequested(): string[] {
@@ -147,10 +158,6 @@ class BedrockConverseInteraction implements InteractionUtils {
     }
 
     return Array.from(toolsRequested);
-  }
-
-  getToolRefusedCount(): number {
-    return 0;
   }
 
   getLastUserMessage(): string {
@@ -196,7 +203,6 @@ class BedrockConverseInteraction implements InteractionUtils {
     message:
       | BedrockMessage
       | { role: "assistant"; content: BedrockResponseContentBlock[] },
-    _dualLlmAnalyses?: DualLlmAnalysis[],
   ): PartialUIMessage {
     const parts: PartialUIMessage["parts"] = [];
     const { content, role } = message;
@@ -228,7 +234,7 @@ class BedrockConverseInteraction implements InteractionUtils {
     };
   }
 
-  mapToUiMessages(dualLlmAnalyses?: DualLlmAnalysis[]): PartialUIMessage[] {
+  mapToUiMessages(): PartialUIMessage[] {
     const uiMessages: PartialUIMessage[] = [];
     const messages = this.request.messages;
 
@@ -259,7 +265,7 @@ class BedrockConverseInteraction implements InteractionUtils {
         continue;
       }
 
-      const uiMessage = this.mapToUiMessage(msg, dualLlmAnalyses);
+      const uiMessage = this.mapToUiMessage(msg);
 
       // If this is an assistant message with toolUse blocks, look ahead for tool results
       if (msg.role === "assistant" && Array.isArray(msg.content)) {
@@ -331,27 +337,6 @@ class BedrockConverseInteraction implements InteractionUtils {
                   } else {
                     toolCallParts.push(outputPart);
                   }
-
-                  // Check for dual LLM result
-                  const dualLlmResultForTool = dualLlmAnalyses?.find(
-                    (result) => result.toolCallId === block.toolUse?.toolUseId,
-                  );
-
-                  if (dualLlmResultForTool) {
-                    toolCallParts.push({
-                      type: "dual-llm-analysis",
-                      toolCallId: dualLlmResultForTool.toolCallId,
-                      safeResult: dualLlmResultForTool.result,
-                      conversations: Array.isArray(
-                        dualLlmResultForTool.conversations,
-                      )
-                        ? (dualLlmResultForTool.conversations as Array<{
-                            role: "user" | "assistant";
-                            content: string | unknown;
-                          }>)
-                        : [],
-                    });
-                  }
                 }
               }
             }
@@ -373,10 +358,7 @@ class BedrockConverseInteraction implements InteractionUtils {
     const responseContent = this.response.output?.message?.content;
     if (responseContent) {
       uiMessages.push(
-        this.mapToUiMessage(
-          { role: "assistant", content: responseContent },
-          dualLlmAnalyses,
-        ),
+        this.mapToUiMessage({ role: "assistant", content: responseContent }),
       );
     }
 

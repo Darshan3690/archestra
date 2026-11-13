@@ -1,0 +1,47 @@
+import type { archestraApiTypes } from "@archestra/shared";
+
+type InstalledServer = archestraApiTypes.GetMcpServersResponses["200"][number];
+
+/** Installed MCP server in `success` state; override `localInstallationStatus` for error UI. */
+export function makeInstalledServer(
+  overrides: Partial<InstalledServer> = {},
+): InstalledServer {
+  return {
+    id: "test-server",
+    name: "test-server",
+    deploymentName: null,
+    catalogId: "test-catalog",
+    serverType: "local",
+    secretId: null,
+    environmentValues: null,
+    ownerId: "test-user-admin",
+    createdByServiceAccountId: null,
+    teamId: null,
+    scope: "personal",
+    alertMutes: [],
+    canUseCredential: true,
+    reinstallRequired: false,
+    reinstallReason: "restart",
+    localInstallationStatus: "success",
+    localInstallationError: null,
+    oauthRefreshError: "refresh_failed",
+    oauthRefreshErrorMessage: "invalid_grant",
+    oauthRefreshErrorDescription: "The refresh token is invalid or has expired",
+    oauthRefreshFailedAt: "2026-01-01T00:00:00.000Z",
+    lastUsedAt: null,
+    hibernationMode: "inherit",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    deletedAt: null,
+    ...overrides,
+  };
+}
+
+export const installedServersSeed: archestraApiTypes.GetMcpServersResponses["200"] =
+  [
+    makeInstalledServer({
+      id: "test-server-filesystem",
+      name: "filesystem",
+      catalogId: "test-catalog-filesystem",
+    }),
+  ];

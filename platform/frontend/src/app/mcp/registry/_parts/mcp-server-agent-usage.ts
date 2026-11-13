@@ -1,0 +1,131 @@
+import type { archestraApiTypes } from "@archestra/shared";
+
+type McpServerFromApi = archestraApiTypes.GetMcpServersResponses["200"][number];
+
+/**
+ * An agent as the API reports it against one MCP server install. `pinned`
+ * only describes an explicit assignment to one install, so the catalog-wide
+ * usage (which also lists auto-mode agents) leaves it out.
+ */
+type ApiAgentUsage = Omit<
+  NonNullable<McpServerFromApi["assignedAgents"]>[number],
+  "pinned"
+>;
+
+/**
+ * How an agent reaches the server: through an explicit tool assignment, or
+ * implicitly because it is in auto mode (access to all tools).
+ */
+export type AgentUsageAccess = "assigned" | "auto";
+
+export type AgentUsage = ApiAgentUsage & { access: AgentUsageAccess };
+
+/**
+ * Collapse every install of one catalog item into the distinct set of agents
+ * that can reach it.
+ *
+ * `autoModeAgents` is the org-wide roster from `useAutoModeAgents` (implicit
+ * access to all tools reaches every server), fetched once instead of being
+ * embedded on every server row.
+ *
+ * Two things are deduped. Installs: the same agent can be assigned tools from
+ * several installs of the catalog. Sections: an auto-mode agent may also
+ * carry an explicit assignment (a legacy pin, or "auto except some"), which
+ * would list it twice — the explicit assignment is the more specific fact, so
+ * it wins and the agent drops out of the auto-mode list.
+ */
+export function deriveAgentUsage(params: {
+  serversForCatalog: Array<Pick<McpServerFromApi, "assignedAgents">>;
+  autoModeAgents: ApiAgentUsage[] | undefined;
+}): {
+  assigned: AgentUsage[];
+  autoOnly: AgentUsage[];
+  all: AgentUsage[];
+  total: number;
+} {
+  const assigned = dedupeById(
+    params.serversForCatalog.flatMap((server) => server.assignedAgents ?? []),
+    "assigned",
+  );
+  const autoMode = dedupeById(params.autoModeAgents ?? [], "auto");
+
+  const assignedIds = new Set(assigned.map((agent) => agent.id));
+  const autoOnly = autoMode.filter((agent) => !assignedIds.has(agent.id));
+
+  return {
+    assigned,
+    autoOnly,
+    all: [...assigned, ...autoOnly].sort(compareByName),
+    total: assigned.length + autoOnly.length,
+  };
+}
+
+/** Same bytewise Unicode ordering as the bounded API's C collation. */
+export function compareAgentUsage(
+  a: Pick<AgentUsage, "name" | "ownerEmail" | "id">,
+  b: Pick<AgentUsage, "name" | "ownerEmail" | "id">,
+): number {
+  return (
+    compareCodePoints(a.name, b.name) ||
+    compareCodePoints(a.ownerEmail ?? "", b.ownerEmail ?? "") ||
+    compareCodePoints(a.id, b.id)
+  );
+}
+
+/**
+ * Re-exported for this route's existing callers. It moved to `@/lib` once the
+ * guardrails table needed the same owner qualifier for delegation tools.
+ */
+export { agentOwnerLabel } from "@/lib/agent-owner-label";
+
+/** Human-readable kind, for the usage table's Type column. */
+export function agentTypeLabel(agentType: string): string {
+  switch (agentType) {
+    case "mcp_gateway":
+      return "MCP Gateway";
+    case "llm_proxy":
+      return "LLM Proxy";
+    case "agent":
+      return "Agent";
+    default:
+      // `profile` is the legacy type that served both gateway and proxy.
+      return "Agent";
+  }
+}
+
+function dedupeById(
+  agents: ApiAgentUsage[],
+  access: AgentUsageAccess,
+): AgentUsage[] {
+  const byId = new Map<string, AgentUsage>();
+  for (const agent of agents) {
+    if (!byId.has(agent.id)) byId.set(agent.id, { ...agent, access });
+  }
+  return [...byId.values()].sort(compareByName);
+}
+
+/**
+ * Same-named personal agents are only distinguishable by owner, so the owner
+ * is the tiebreaker — otherwise their relative order is undefined and the list
+ * reshuffles between renders.
+ */
+function compareByName(a: AgentUsage, b: AgentUsage): number {
+  return (
+    a.name.localeCompare(b.name) ||
+    (a.ownerEmail ?? "").localeCompare(b.ownerEmail ?? "") ||
+    a.id.localeCompare(b.id)
+  );
+}
+
+function compareCodePoints(left: string, right: string): number {
+  let a = 0,
+    b = 0;
+  while (a < left.length && b < right.length) {
+    const l = left.codePointAt(a) ?? 0,
+      r = right.codePointAt(b) ?? 0;
+    if (l !== r) return l - r;
+    a += l > 0xffff ? 2 : 1;
+    b += r > 0xffff ? 2 : 1;
+  }
+  return a < left.length ? 1 : b < right.length ? -1 : 0;
+}

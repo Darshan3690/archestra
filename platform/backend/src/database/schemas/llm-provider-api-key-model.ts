@@ -1,11 +1,15 @@
+import type { AzureModelEvidence } from "@archestra/shared/azure-models";
 import {
   boolean,
   index,
+  integer,
+  jsonb,
   pgTable,
   timestamp,
   unique,
   uuid,
 } from "drizzle-orm/pg-core";
+import type { ProviderModelPricing } from "@/types/provider-model-pricing";
 import llmProviderApiKeysTable from "./llm-provider-api-key";
 import modelsTable from "./model";
 
@@ -30,10 +34,50 @@ const llmProviderApiKeyModelsTable = pgTable(
     modelId: uuid("model_id")
       .notNull()
       .references(() => modelsTable.id, { onDelete: "cascade" }),
-    /** Whether this model is marked as the fastest (lowest latency) for this API key */
-    isFastest: boolean("is_fastest").notNull().default(false),
+    /** Output cap advertised by this connection, never by another gateway. */
+    outputLength: integer("output_length"),
     /** Whether this model is marked as the best (highest quality) for this API key */
+    /** USD/token rates published by this endpoint, isolated from other instances. */
+    providerPricing: jsonb("provider_pricing").$type<ProviderModelPricing>(),
+    /** Resource-local transport evidence. Null means discovery could not classify it. */
+    azureCapabilities: jsonb("azure_capabilities").$type<
+      AzureModelEvidence & {
+        configurationHash: string;
+      }
+    >(),
     isBest: boolean("is_best").notNull().default(false),
+    /**
+     * Whether this model is worth pointing an agent at, as judged from what
+     * THIS key's endpoint serves. Tri-state: an explicit `false` is a claim
+     * backed by evidence, `true` means the evidence says the model is fine, and
+     * null means the sync learned nothing (every provider but Ollama). Only
+     * `false` is ever surfaced — `true` cannot distinguish "known good" from
+     * "no evidence", so it stays silent.
+     *
+     * Lives on the link, not on `models`: an Ollama tag is endpoint-local
+     * (`custom:latest` can name a 4B build on one server and a 70B build on
+     * another), so a verdict written to the globally unique (provider,
+     * model_id) row would let whichever endpoint synced last speak for all of
+     * them. Today the only evidence is Ollama's parameter count (`/api/show`,
+     * GGUF `general.parameter_count`) against `SMALL_MODEL_MAX_PARAMETERS`;
+     * every other provider reports nothing usable, vLLM included — its
+     * OpenAI-compatible `ModelCard` carries no size field and there is no
+     * second endpoint to ask.
+     *
+     * Nullable because `/api/show` is time-boxed and degrades to null per
+     * model, so the sync needs a value that means "no evidence this round" and
+     * can be COALESCEd away instead of silently un-flagging a 4B model.
+     */
+    recommendedForAgents: boolean("recommended_for_agents"),
+    /**
+     * When this key's own sync last confirmed the link; drives the key's lazy
+     * re-sync. `models.last_synced_at` cannot: it is shared by every key that
+     * serves the model, so any key's sync makes it look fresh. A ChatGPT
+     * subscription key whose models a metered key also serves would then never
+     * re-sync, and a model dropped from the plan would stay selectable.
+     * Null on links that predate this column, which counts as stale.
+     */
+    syncedAt: timestamp("synced_at", { mode: "date" }),
     createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
   },
   (table) => ({
@@ -44,6 +88,14 @@ const llmProviderApiKeyModelsTable = pgTable(
     ),
     /** Index for efficient lookups by API key */
     apiKeyIdIdx: index("api_key_models_api_key_id_idx").on(table.apiKeyId),
+    /**
+     * The model sync's "least recently synced link of this key" probe
+     * (never-synced links first).
+     */
+    apiKeyIdSyncedAtIdx: index("api_key_models_api_key_id_synced_at_idx").on(
+      table.apiKeyId,
+      table.syncedAt.asc().nullsFirst(),
+    ),
     /** Index for efficient lookups by model */
     modelIdIdx: index("api_key_models_model_id_idx").on(table.modelId),
   }),

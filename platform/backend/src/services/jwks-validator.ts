@@ -40,9 +40,17 @@ class JwksValidator {
     token: string;
     issuerUrl: string;
     jwksUrl: string;
-    audience: string | null;
+    /** Accepted `aud` value(s); an array accepts any listed value (jose semantics). */
+    audience: string | string[] | null;
+    /**
+     * Claim holding the caller's email, taken from the IdP's attribute mapping.
+     * IdPs that namespace custom claims (`https://example.com/email`) never
+     * populate the standard `email` claim, so the mapped claim is read first
+     * and `email` remains the fallback.
+     */
+    emailClaim?: string | null;
   }): Promise<JwksValidationResult | null> {
-    const { token, issuerUrl, jwksUrl, audience } = params;
+    const { token, issuerUrl, jwksUrl, audience, emailClaim } = params;
 
     try {
       const jwks = this.getOrCreateJwks(jwksUrl);
@@ -61,7 +69,9 @@ class JwksValidator {
 
       return {
         sub,
-        email: extractStringClaim(payload, "email"),
+        email:
+          (emailClaim ? extractStringClaim(payload, emailClaim) : null) ??
+          extractStringClaim(payload, "email"),
         name:
           extractStringClaim(payload, "name") ??
           extractStringClaim(payload, "preferred_username"),
@@ -70,7 +80,9 @@ class JwksValidator {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       // Expected validation failures (expired, bad signature) log at debug;
-      // unexpected errors (network, malformed key) log at warn.
+      // unexpected errors (network, malformed key) log at warn. Include jwksUrl
+      // so a real auth failure shows which endpoint was used, not just the
+      // issuer.
       const isExpected =
         message.includes("expired") ||
         message.includes("signature") ||
@@ -78,7 +90,7 @@ class JwksValidator {
         message.includes("JWT");
       const level = isExpected ? "debug" : "warn";
       logger[level](
-        { issuerUrl, error: message },
+        { issuerUrl, jwksUrl, error: message },
         "JWKS JWT validation failed",
       );
       return null;

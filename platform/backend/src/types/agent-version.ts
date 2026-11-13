@@ -1,0 +1,161 @@
+import { StoredSubagentLoadBalancingConfigSchema } from "@archestra/shared";
+import { createSelectSchema } from "drizzle-zod";
+import { z } from "zod";
+import { schema } from "@/database/schema";
+import { AgentActivationSkillReferenceSchema } from "./agent-activation-skill";
+import {
+  AgentActivationSkillModeSchema,
+  AgentActivationSkillRuleDispositionSchema,
+} from "./agent-activation-skill-policy";
+import { NetworkPolicySchema } from "./environment";
+
+/**
+ * Canonical, hashable payload of an agent version — the agent's *config only*.
+ *
+ * Deliberately excluded (live-only state, never part of history):
+ * - sharing: scope, teams, labels
+ * - identity/singletons: slug, isDefault, isPersonalGateway, isPersonalProxy
+ * - ownership/lifecycle: organizationId, authorId, timestamps, deletedAt
+ * - limits (separate entities keyed by agent id, not owned by the agent's
+ *   config surface)
+ *
+ * Enum-ish fields are plain strings on purpose: snapshots are immutable
+ * historical data and must keep parsing after an enum gains or loses values.
+ * For the same reason, any field added later must accept absence (for example
+ * with `.optional()`, `.nullable()`, or a compatibility default) so legacy rows
+ * still validate.
+ *
+ * Referenced entities are captured as id + human-readable name so history
+ * stays legible after the referent is renamed or deleted.
+ */
+const ModelIdentitySchema = z.object({
+  id: z.string(),
+  externalId: z.string(),
+});
+
+export const AgentConfigSnapshotSchema = z.object({
+  agentType: z.string(),
+  name: z.string(),
+  description: z.string().nullable(),
+  icon: z.string().nullable(),
+  systemPrompt: z.string().nullable(),
+  toolExposureMode: z.string(),
+  // Snapshots created before credential-readiness controls preserve the
+  // historical behavior: missing credentials did not block execution.
+  missingCredentialBehavior: z.string().default("allow"),
+  accessAllTools: z.boolean(),
+  accessAllSubagents: z.boolean(),
+  activationSkillMode: AgentActivationSkillModeSchema.default("all"),
+  activationSkillRules: z
+    .array(
+      z.object({
+        disposition: AgentActivationSkillRuleDispositionSchema,
+        reference: AgentActivationSkillReferenceSchema,
+      }),
+    )
+    .default([]),
+  /** Header NAMES only (no values) — safe to capture verbatim. */
+  passthroughHeaders: z.array(z.string()),
+  incomingEmailEnabled: z.boolean(),
+  incomingEmailSecurityMode: z.string(),
+  incomingEmailAllowedDomain: z.string().nullable(),
+  builtInAgentConfig: z.unknown(),
+  /** Resolved model identity (modelId FK + human-readable externalId). */
+  model: ModelIdentitySchema.nullable(),
+  /** Redacted key identity — never key material (secret ids are excluded). */
+  llmApiKey: z
+    .object({ id: z.string(), name: z.string(), provider: z.string() })
+    .nullable(),
+  identityProviderId: z.string().nullable(),
+  environmentId: z.string().nullable(),
+  networkPolicy: NetworkPolicySchema.nullable().default(null),
+  subagentLoadBalancing:
+    StoredSubagentLoadBalancingConfigSchema.nullable().default(null),
+  tools: z.array(
+    z.object({
+      toolId: z.string(),
+      name: z.string(),
+      mcpServerId: z.string().nullable(),
+      credentialResolutionMode: z.string(),
+    }),
+  ),
+  excludedTools: z.array(z.object({ toolId: z.string(), name: z.string() })),
+  excludedSubagents: z.array(
+    z.object({ agentId: z.string(), name: z.string() }),
+  ),
+  suggestedPrompts: z.array(
+    z.object({ summaryTitle: z.string(), prompt: z.string() }),
+  ),
+  hooks: z.array(
+    z.object({
+      event: z.string(),
+      fileName: z.string(),
+      content: z.string(),
+      requirements: z.array(z.string()),
+      enabled: z.boolean(),
+    }),
+  ),
+  knowledgeBases: z.array(z.object({ id: z.string(), name: z.string() })),
+  connectors: z.array(z.object({ id: z.string(), name: z.string() })),
+  /**
+   * Auto-mode knowledge-source exclusions. Defaulted because snapshots taken
+   * before the setting existed have no field to read, and an agent that
+   * predates it excluded nothing.
+   */
+  excludedConnectors: z
+    .array(z.object({ id: z.string(), name: z.string() }))
+    .default([]),
+});
+
+export type AgentConfigSnapshot = z.infer<typeof AgentConfigSnapshotSchema>;
+
+export const SelectAgentVersionSchema = createSelectSchema(
+  schema.agentVersionsTable,
+  { snapshot: AgentConfigSnapshotSchema },
+);
+
+export type AgentVersion = z.infer<typeof SelectAgentVersionSchema>;
+
+/**
+ * Read projection for version history. Exact activation-skill references stay
+ * in the private snapshot because restore needs them, but are not part of the
+ * agent-read API: some may name skills the current reader cannot see.
+ */
+export const PublicAgentConfigSnapshotSchema = AgentConfigSnapshotSchema.omit({
+  activationSkillRules: true,
+}).extend({
+  activationSkillRuleCounts: z.object({
+    allowed: z.number().int().nonnegative(),
+    excluded: z.number().int().nonnegative(),
+  }),
+  /** Server-keyed marker that prevents offline testing of guessed rule sets. */
+  activationSkillRuleDigest: z.string().length(64),
+});
+
+export const SelectPublicAgentVersionSchema = createSelectSchema(
+  schema.agentVersionsTable,
+  { snapshot: PublicAgentConfigSnapshotSchema },
+);
+
+export type PublicAgentVersion = z.infer<typeof SelectPublicAgentVersionSchema>;
+
+/**
+ * List projection of a version: everything but the heavy `snapshot` payload,
+ * so history lists stay cheap while get-one carries the full config.
+ */
+export const AgentVersionMetadataSchema = SelectAgentVersionSchema.omit({
+  snapshot: true,
+});
+
+export type AgentVersionMetadata = z.infer<typeof AgentVersionMetadataSchema>;
+
+export const RestoreAgentVersionBodySchema = z.object({
+  /**
+   * The agent's `latestVersion` at the moment the restore was composed. When
+   * present the restore is a compare-and-set: a head that has moved since is
+   * rejected with 409 (`agent_version_conflict`) instead of burying whoever
+   * wrote in between. Omitted keeps last-write-wins, matching the rest of the
+   * agent write surface. Named to match `PUT /api/skills/:id`.
+   */
+  baseVersion: z.number().int().positive().optional(),
+});

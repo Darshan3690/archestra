@@ -1,25 +1,33 @@
 "use client";
 import { useDebounce } from "@uidotdev/usehooks";
-import { isToday, isWithinInterval, isYesterday, subDays } from "date-fns";
 import {
+  AppWindow,
   Bot,
-  Cable,
-  Home,
-  Key,
+  Boxes,
+  Database,
+  FolderKanban,
+  type LucideIcon,
   MessageCircle,
-  MessagesSquare,
-  Network,
   Pencil,
   Pin,
-  Router,
-  Settings,
-  Shield,
+  Puzzle,
+  Route,
+  Sparkles,
   UsersRound,
-  Wrench,
-  Zap,
 } from "lucide-react";
 import { usePathname, useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  AUTO_ROUTING_URL,
+  chatsNavItems,
+  contentNavGroups,
+  isNavItemPermitted,
+} from "@/app/_parts/studio-nav";
+import { useNavPermissionMap } from "@/app/_parts/use-settings-area-access";
+import { useSettingsTabs } from "@/app/settings/settings-tabs";
+import { EncryptedChatIcon } from "@/components/chat/encrypted-chat-icon";
+import { RunStateIcon } from "@/components/chat/run-state-icon";
+import { ProjectBadgeButton } from "@/components/project-badge-button";
 import { Badge } from "@/components/ui/badge";
 import {
   CommandDialog,
@@ -37,14 +45,19 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import {
+  NEW_ENCRYPTED_CHAT_HREF,
   SHORTCUT_DELETE,
   SHORTCUT_NEW_CHAT,
+  SHORTCUT_NEW_ENCRYPTED_CHAT,
   SHORTCUT_PIN,
   SHORTCUT_SEARCH,
   SHORTCUT_SIDEBAR,
 } from "@/consts";
-import { useIsAuthenticated } from "@/lib/auth/auth.hook";
+import { useAgentOptionsPage } from "@/lib/agent-options.query";
+import { useMyAgentRuns } from "@/lib/agent-runtime.query";
+import { useApps } from "@/lib/app.query";
 import { useHasPermissions } from "@/lib/auth/auth.query";
+import { useIsAuthenticated } from "@/lib/auth/use-is-authenticated";
 import {
   useConversations,
   useDeleteConversation,
@@ -54,7 +67,19 @@ import {
   getConversationDisplayTitle,
   getConversationShareTooltip,
 } from "@/lib/chat/chat-utils";
+import { conversationHref } from "@/lib/chat/conversation-href";
+import { getDateBucketLabel } from "@/lib/chat/group-conversations-by-date";
+import { buildPinnedSidebarItems } from "@/lib/chat/pinned-sidebar-items";
+import { useFeature } from "@/lib/config/config.query";
+import { useEnvironments } from "@/lib/environment.query";
+import { useConnectNavigation } from "@/lib/hooks/use-connect-navigation";
 import { usePlatform } from "@/lib/hooks/use-platform";
+import { useKnowledgeBases } from "@/lib/knowledge/knowledge-base.query";
+import { useMcpRegistryPage } from "@/lib/mcp/mcp-registry.query";
+import { usePlugins } from "@/lib/plugins/plugin.query";
+import { useProjects } from "@/lib/projects/projects.query";
+import { useSkillsPaginated } from "@/lib/skills/skill.query";
+import { useTeams } from "@/lib/teams/team.query";
 
 /**
  * Extracts all text content from messages for preview purposes.
@@ -79,137 +104,95 @@ function extractTextFromMessages(
   return textParts.join(" ");
 }
 
-/** Groups conversations into time-based buckets for organized display */
-function groupConversationsByDate<
-  T extends { updatedAt: string | Date; pinnedAt?: string | Date | null },
->(conversations: T[]) {
-  const pinned: T[] = [];
-  const today: T[] = [];
-  const yesterday: T[] = [];
-  const previous7Days: T[] = [];
-  const older: T[] = [];
+/** A row in one of the search-only groups: a settings tab or a named entity. */
+type SearchLink = {
+  key: string;
+  href: string;
+  label: string;
+  icon: LucideIcon | React.ComponentType<{ className?: string }>;
+};
 
-  const now = new Date();
-  const sevenDaysAgo = subDays(now, 7);
+/**
+ * Search synonyms, for words a reader might type that the destination's own
+ * name does not contain. Keyed by URL so a rename cannot strand them, and
+ * optional: a page without an entry is still found by its name.
+ */
+const NAVIGATION_KEYWORDS: Record<string, string> = {
+  "/agents": "agent bot ai a2a api invocation",
+  "/skills": "skills abilities",
+  "/plugins": "plugins extensions",
+  "/settings/messaging-channels":
+    "messaging channels triggers automation webhooks slack ms teams email",
+  "/mcp/registry": "mcp catalog registry servers",
+  "/mcp/gateways": "gateways security mcp",
+  "/openappa": "openappa guardrails v2 policy toml",
+  "/llm/proxy": "proxy llm network",
+  "/llm/proxy/virtual-keys": "virtual keys credentials",
+  "/llm/model-providers": "provider api keys models llm",
+  "/llm/models": "models catalog",
+  "/llm/costs": "usage cost dashboard limits budget spend",
+  "/knowledge/connectors": "knowledge connectors sources sync",
+  "/knowledge/files": "knowledge files documents uploads",
+  "/knowledge/knowledge-bases": "knowledge bases embeddings retrieval rag",
+  "/llm/logs": "logs llm proxy requests",
+  "/settings": "settings configuration preferences",
+  "/connection": "connect integration api",
+  "/projects": "projects workspaces",
+  "/apps": "apps",
+};
 
-  for (const conv of conversations) {
-    if (conv.pinnedAt) {
-      pinned.push(conv);
-      continue;
-    }
-    const updatedAt = new Date(conv.updatedAt);
-    if (isToday(updatedAt)) {
-      today.push(conv);
-    } else if (isYesterday(updatedAt)) {
-      yesterday.push(conv);
-    } else if (isWithinInterval(updatedAt, { start: sevenDaysAgo, end: now })) {
-      previous7Days.push(conv);
-    } else {
-      older.push(conv);
-    }
-  }
+/**
+ * The destinations this palette can jump to, taken from the same definition
+ * the sidebar renders and filtered by the same permission rule — so a page
+ * the reader may not open is not offered here, and a page named or moved in
+ * one surface cannot go stale in the other.
+ */
+function useNavigationDestinations(
+  permissionMap: Record<string, boolean> | null,
+) {
+  const openappaEnabled = useFeature("openappaEnabled");
+  const autoRoutingEnabled = useFeature("autoRoutingEnabled");
+  const { visible: showConnect } = useConnectNavigation();
 
-  return { pinned, today, yesterday, previous7Days, older };
+  return useMemo(() => {
+    // null, not an empty list: an empty list would read as "no pages", when
+    // the permissions simply have not arrived yet.
+    if (!permissionMap) return null;
+    const items = [
+      // New Chat is the palette's own first row, so listing it again here
+      // would offer the same destination twice.
+      ...chatsNavItems.filter((item) => item.url !== "/chat"),
+      ...contentNavGroups.flatMap((group) => group.items),
+    ];
+    return items
+      .filter((item) => {
+        if (item.url === "/connection") {
+          return showConnect;
+        }
+        if (item.url === "/openappa" && openappaEnabled !== true) return false;
+        if (item.url === AUTO_ROUTING_URL && autoRoutingEnabled !== true) {
+          return false;
+        }
+        return isNavItemPermitted(item, permissionMap);
+      })
+      .map((item) => ({
+        icon: item.icon,
+        label: item.tooltipLabel ?? item.title,
+        value: item.url,
+        keywords: NAVIGATION_KEYWORDS[item.url] ?? "",
+        href: item.url,
+      }));
+  }, [permissionMap, openappaEnabled, autoRoutingEnabled, showConnect]);
 }
-
-// Product navigation items matching sidebar names
-const navigationItems = [
-  {
-    icon: Bot,
-    label: "Agents",
-    value: "agents",
-    keywords: "agent bot ai",
-    href: "/agents",
-  },
-  {
-    icon: Zap,
-    label: "Agent Triggers",
-    value: "agent-triggers",
-    keywords: "triggers automation webhooks ms teams",
-    href: "/agents/triggers/ms-teams",
-  },
-  {
-    icon: Shield,
-    label: "MCP Gateways",
-    value: "mcp-gateways",
-    keywords: "gateways security mcp",
-    href: "/mcp/gateways",
-  },
-  {
-    icon: Network,
-    label: "LLM Proxies",
-    value: "llm-proxies",
-    keywords: "proxies llm network",
-    href: "/llm/proxies",
-  },
-  {
-    icon: Key,
-    label: "Model Providers",
-    value: "model-providers",
-    keywords: "provider settings api keys models llm",
-    href: "/llm/model-providers/api-keys",
-  },
-  {
-    icon: Key,
-    label: "Credentials",
-    value: "credentials",
-    keywords: "virtual keys oauth clients client credentials llm",
-    href: "/llm/credentials/virtual-keys",
-  },
-  {
-    icon: MessagesSquare,
-    label: "Logs",
-    value: "logs",
-    keywords: "logs llm proxy requests",
-    href: "/llm/logs",
-  },
-  {
-    icon: Wrench,
-    label: "Tool Guardrails",
-    value: "tool-guardrails",
-    keywords: "tools guardrails policies permissions security",
-    href: "/mcp/tool-guardrails",
-  },
-  {
-    icon: Router,
-    label: "MCP Registry",
-    value: "mcp-registry",
-    keywords: "mcp catalog registry servers",
-    href: "/mcp/registry",
-  },
-  {
-    icon: Home,
-    label: "Cost & Limits",
-    value: "cost-limits",
-    keywords: "cost dashboard limits budget",
-    href: "/llm/costs",
-  },
-  {
-    icon: Cable,
-    label: "Connect",
-    value: "connect",
-    keywords: "connect integration api",
-    href: "/connection",
-  },
-  {
-    icon: Settings,
-    label: "Settings",
-    value: "settings",
-    keywords: "settings configuration preferences",
-    href: "/settings",
-  },
-];
 
 interface ConversationSearchPaletteProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  recentChatsView?: boolean;
 }
 
 export function ConversationSearchPalette({
   open,
   onOpenChange,
-  recentChatsView = false,
 }: ConversationSearchPaletteProps) {
   const router = useRouter();
   const pathname = usePathname();
@@ -223,6 +206,7 @@ export function ConversationSearchPalette({
     chat: ["read"],
   });
   const { modKey, altKey } = usePlatform();
+  const encryptedChatEnabled = useFeature("encryptedChatEnabled") ?? false;
 
   const deleteMutation = useDeleteConversation();
   const pinMutation = usePinConversation();
@@ -242,19 +226,337 @@ export function ConversationSearchPalette({
   } = useConversations({
     enabled: open && isAuthenticated && canReadConversation === true,
     search: debouncedSearch,
+    limit: PALETTE_CONVERSATION_LIMIT,
   });
+
+  // Agent Runtime sessions live in the same sidebar timeline as chats,
+  // so the palette lists them too. Server-side title search reaches older
+  // pages without loading the entire history.
+  const runtimeEnabled = useFeature("agentRuntime") === true;
+  const runsEnabled =
+    open && isAuthenticated && canReadConversation === true && runtimeEnabled;
+  const runsQuery = useMyAgentRuns(
+    runsEnabled,
+    debouncedSearch.trim()
+      ? { search: debouncedSearch.trim() }
+      : { pinned: false },
+  );
+  const pinnedRunsQuery = useMyAgentRuns(
+    runsEnabled && !debouncedSearch.trim(),
+    { pinned: true },
+  );
+  const runs = useMemo(
+    () => [
+      ...new Map(
+        [...(runsQuery.data ?? []), ...(pinnedRunsQuery.data ?? [])].map(
+          (run) => [run.taskId, run],
+        ),
+      ).values(),
+    ],
+    [runsQuery.data, pinnedRunsQuery.data],
+  );
+
+  const permissionMap = useNavPermissionMap();
+  const navigationDestinations = useNavigationDestinations(permissionMap);
+  const isNavigationPending = navigationDestinations === null;
+
+  // Entity groups appear only while typing, so nothing is fetched before
+  // then. Each group follows the gate of the page its rows open, including
+  // the Settings-area rule for pages under /settings, so the palette never
+  // lists something the reader's own navigation hides.
+  const canSeeSettingsArea = permissionMap?.["/settings"] === true;
+  const canOpenPage = (href: string) =>
+    permissionMap?.[href] === true &&
+    (!href.startsWith("/settings/") || canSeeSettingsArea);
+  const entitySearch = debouncedSearch.trim();
+  const canSearchEntities = open && isAuthenticated && entitySearch.length > 0;
+  const settingsTabs = useSettingsTabs({ enabled: open });
+  const agentOptions = useAgentOptionsPage({
+    // The /agents page lists internal agents only; gateways and proxies
+    // have their own pages.
+    filters: { agentType: "agent", searchMode: "name" },
+    search: entitySearch,
+    limit: ENTITY_RESULTS_LIMIT,
+    enabled: canSearchEntities && canOpenPage("/agents"),
+  });
+  const skillsPage = useSkillsPaginated(
+    {
+      search: entitySearch,
+      limit: ENTITY_RESULTS_LIMIT,
+      offset: 0,
+      includeContent: false,
+    },
+    {
+      enabled: canSearchEntities && canOpenPage("/skills"),
+      toastOnError: false,
+    },
+  );
+  const appsPage = useApps(
+    { search: entitySearch, limit: ENTITY_RESULTS_LIMIT, offset: 0 },
+    {
+      enabled: canSearchEntities && canOpenPage("/apps"),
+      toastOnError: false,
+    },
+  );
+  const projectsPage = useProjects({
+    search: entitySearch,
+    limit: ENTITY_RESULTS_LIMIT,
+    offset: 0,
+    enabled: canSearchEntities && canOpenPage("/projects"),
+    toastOnError: false,
+  });
+  const { data: knowledgeBases = [] } = useKnowledgeBases({
+    query: { search: entitySearch, limit: ENTITY_RESULTS_LIMIT },
+    enabled: canSearchEntities && canOpenPage("/knowledge/knowledge-bases"),
+  });
+  const { data: teams = [] } = useTeams({
+    includeRelations: false,
+    name: entitySearch,
+    enabled: canSearchEntities && canOpenPage("/settings/teams"),
+  });
+  // MCP servers are searched by the server like skills: the first name
+  // matches from the registry's paged list, the built-in entry included.
+  const mcpPage = useMcpRegistryPage(
+    {
+      search: entitySearch,
+      includeBuiltIn: true,
+      sortBy: "name",
+      sortDirection: "asc",
+      limit: ENTITY_RESULTS_LIMIT,
+      offset: 0,
+    },
+    {
+      enabled: canSearchEntities && canOpenPage("/mcp/registry"),
+      placeholderScope: "search-palette",
+    },
+  );
+  // No server-side name search for these; their pages also hold the whole
+  // list and filter it in the browser.
+  const { data: plugins = [] } = usePlugins(
+    canSearchEntities && canOpenPage("/plugins"),
+  );
+  const { data: environmentList } = useEnvironments(
+    canSearchEntities && canOpenPage("/settings/environments"),
+  );
 
   // Show skeleton during typing or initial fetch
   const isSearching = searchQuery.trim().length > 0;
   const isTyping = searchQuery !== debouncedSearch;
-  const isSearchingAndFetching = isSearching && (isTyping || isFetching);
+  const isSearchingAndFetching =
+    isSearching && (isTyping || isFetching || runsQuery.isLoading);
+  // Until chats and permissions arrive, the browse view holds a skeleton in
+  // place of its lists, so the palette opens at its final height and does not
+  // swap rows in one at a time.
+  const isBrowseLoading = isLoading || isNavigationPending;
 
-  const groupedConversations = useMemo(() => {
+  const matchingNavigationItems = useMemo(() => {
+    const normalizedQuery = searchQuery.trim().toLocaleLowerCase();
+    const destinations = navigationDestinations ?? [];
+    if (!normalizedQuery) return destinations;
+
+    return destinations.filter((item) =>
+      `${item.label} ${item.value} ${item.keywords}`
+        .toLocaleLowerCase()
+        .includes(normalizedQuery),
+    );
+  }, [searchQuery, navigationDestinations]);
+
+  // Server-searched rows are shown only for the current search: the skills
+  // and apps hooks keep the previous search's rows as placeholder data, which
+  // would list them under a query they do not match.
+  const serverResults = <T,>(rows: T[] | undefined, isPlaceholder = false) =>
+    entitySearch && !isPlaceholder
+      ? (rows ?? []).slice(0, ENTITY_RESULTS_LIMIT)
+      : [];
+  const typedQuery = searchQuery.trim().toLocaleLowerCase();
+  const nameMatches = <T,>(rows: T[], name: (row: T) => string) =>
+    typedQuery
+      ? rows
+          .filter((row) => name(row).toLocaleLowerCase().includes(typedQuery))
+          .slice(0, ENTITY_RESULTS_LIMIT)
+      : [];
+
+  const searchGroups: { heading: string; links: SearchLink[] }[] = [
+    {
+      heading: "Settings",
+      // Matched on the label and on the path under /settings, so
+      // "oauth-clients" finds its tab while "settings" stays on the Settings
+      // page rather than pulling in every tab.
+      links: (canSeeSettingsArea
+        ? nameMatches(
+            settingsTabs,
+            (tab) => `${tab.label} ${tab.href.replace("/settings/", "")}`,
+          )
+        : []
+      ).map((tab) => ({
+        key: `settings-${tab.href}`,
+        href: tab.href,
+        label: tab.label,
+        icon: tab.Icon,
+      })),
+    },
+    {
+      heading: "Agents",
+      links: serverResults(
+        agentOptions.data?.pages.flatMap((page) => page.data),
+      ).map((agent) => ({
+        key: `agent-${agent.id}`,
+        href: `/agents/${agent.id}`,
+        label: agent.name,
+        icon: Bot,
+      })),
+    },
+    {
+      heading: "Skills",
+      links: serverResults(
+        skillsPage.data?.data,
+        skillsPage.isPlaceholderData,
+      ).map((skill) => ({
+        key: `skill-${skill.id}`,
+        href: `/skills/${skill.id}`,
+        label: skill.name,
+        icon: Sparkles,
+      })),
+    },
+    {
+      heading: "Apps",
+      links: serverResults(appsPage.data?.data, appsPage.isPlaceholderData).map(
+        (app) => ({
+          key:
+            app.source === "owned"
+              ? `app-${app.id}`
+              : `app-${app.mcpServerId}-${app.toolName}`,
+          // Opens the Apps page filtered to the app, where its row offers
+          // every way to open it.
+          href: `/apps?search=${encodeURIComponent(app.name)}`,
+          label: app.name,
+          icon: AppWindow,
+        }),
+      ),
+    },
+    {
+      heading: "Projects",
+      links: serverResults(
+        projectsPage.data?.data,
+        projectsPage.isPlaceholderData,
+      ).map((project) => ({
+        key: `project-${project.id}`,
+        href: `/projects/${project.id}`,
+        label: project.name,
+        icon: FolderKanban,
+      })),
+    },
+    {
+      heading: "Knowledge Bases",
+      links: serverResults(knowledgeBases).map((knowledgeBase) => ({
+        key: `knowledge-base-${knowledgeBase.id}`,
+        // No per-base page exists; the list opens filtered to it.
+        href: `/knowledge/knowledge-bases?search=${encodeURIComponent(knowledgeBase.name)}`,
+        label: knowledgeBase.name,
+        icon: Database,
+      })),
+    },
+    {
+      heading: "Plugins",
+      links: nameMatches(plugins, (plugin) => plugin.displayName).map(
+        (plugin) => ({
+          key: `plugin-${plugin.id}`,
+          href: `/plugins/${plugin.id}`,
+          label: plugin.displayName,
+          icon: Puzzle,
+        }),
+      ),
+    },
+    {
+      heading: "Environments",
+      links: nameMatches(
+        environmentList?.environments ?? [],
+        (environment) => environment.name,
+      ).map((environment) => ({
+        key: `environment-${environment.id}`,
+        href: "/settings/environments",
+        label: environment.name,
+        icon: Boxes,
+      })),
+    },
+    {
+      heading: "Teams",
+      links: serverResults(teams).map((team) => ({
+        key: `team-${team.id}`,
+        href: `/settings/teams?search=${encodeURIComponent(team.name)}`,
+        label: team.name,
+        icon: UsersRound,
+      })),
+    },
+    {
+      heading: "MCP Servers",
+      links: serverResults(mcpPage.data?.data, mcpPage.isPlaceholderData).map(
+        (item) => ({
+          key: `mcp-${item.id}`,
+          href: `/mcp/registry/${item.id}`,
+          label: item.name,
+          icon: Route,
+        }),
+      ),
+    },
+  ];
+  const hasEntityMatches = searchGroups.some((group) => group.links.length > 0);
+
+  // The server searches run titles. Filter cached pins too while their
+  // independent browse feed is disabled during search.
+  const matchingRuns = useMemo(() => {
+    const normalizedQuery = debouncedSearch.trim().toLocaleLowerCase();
+    if (!normalizedQuery) return [];
+    return runs.filter((run) =>
+      run.title.toLocaleLowerCase().includes(normalizedQuery),
+    );
+  }, [runs, debouncedSearch]);
+
+  const browseItems = useMemo(() => {
     if (debouncedSearch.trim()) {
       return null;
     }
-    return groupConversationsByDate(conversations);
-  }, [conversations, debouncedSearch]);
+    return {
+      // Keep the palette's Pinned group aligned with the sidebar: chats and
+      // Agent Runtime runs share one newest-pin-first list.
+      pinned: buildPinnedSidebarItems({
+        chats: conversations,
+        projects: [],
+        runs,
+      }),
+      // Runs sort into the same timeline as chats, mirroring the
+      // sidebar's merged recents list.
+      recent: [
+        ...conversations
+          .filter((c) => !c.pinnedAt)
+          .map((item) => ({
+            kind: "conversation" as const,
+            item,
+            timestamp: item.lastMessageAt,
+          })),
+        ...runs
+          .filter((run) => !run.pinnedAt)
+          .map((item) => ({
+            kind: "run" as const,
+            item,
+            timestamp: item.stateChangedAt ?? item.startedAt,
+          })),
+      ].sort(
+        (left, right) =>
+          new Date(right.timestamp).getTime() -
+          new Date(left.timestamp).getTime(),
+      ),
+    };
+  }, [conversations, runs, debouncedSearch]);
+
+  // The browse view keeps recents short so pages stay in reach; older chats
+  // are still found by typing.
+  const visibleRecent = browseItems
+    ? browseItems.recent.slice(0, RECENT_CHATS_LIMIT)
+    : [];
+  const hiddenRecentCount = browseItems
+    ? browseItems.recent.length - visibleRecent.length
+    : 0;
 
   // Reset state on every open/close transition.
   // Clearing on open handles stale chars from macOS dead keys (e.g. Option+N inserts ˜
@@ -273,13 +575,29 @@ export function ConversationSearchPalette({
     setIsPendingDeletion(null);
   }, [selectedValue, searchQuery]);
 
-  const handleSelectConversation = (conversationId: string) => {
-    router.push(`/chat/${conversationId}`);
+  // Search replaces and filters the item set. With a controlled value, cmdk
+  // only auto-selects the first item when the value is falsy — a stale
+  // selection leaves the fresh list with no selected option, so ArrowUp and
+  // Enter dead-end (WCAG 2.1.1). Clear it as soon as the query changes.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally reacting to searchQuery changes to reset the selection
+  useEffect(() => {
+    setSelectedValue("");
+  }, [searchQuery]);
+
+  const handleSelectConversation = (
+    conversation: (typeof conversations)[number],
+  ) => {
+    router.push(conversationHref(conversation));
     onOpenChange(false);
   };
 
   const handleNewChat = useCallback(() => {
     router.push("/chat");
+    onOpenChange(false);
+  }, [router, onOpenChange]);
+
+  const handleNewEncryptedChat = useCallback(() => {
+    router.push(NEW_ENCRYPTED_CHAT_HREF);
     onOpenChange(false);
   }, [router, onOpenChange]);
 
@@ -306,7 +624,13 @@ export function ConversationSearchPalette({
       setIsPendingDeletion(null);
 
       // Redirect to new chat if the deleted conversation is currently open
-      if (pathname === `/chat/${conversationId}`) {
+      const deletedConversation = conversations.find(
+        (conversation) => conversation.id === conversationId,
+      );
+      if (
+        deletedConversation &&
+        pathname === conversationHref(deletedConversation).split("?")[0]
+      ) {
         router.push("/chat");
       }
     },
@@ -327,13 +651,16 @@ export function ConversationSearchPalette({
     if (!open) return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
-      // In cmdk, the input always retains focus even during arrow-key navigation.
-      // Only intercept shortcuts when the search input is empty (browse mode).
-      // When the user is typing a search query, let keys pass through normally.
-      if (searchQuery) return;
+      // Alt-qualified shortcuts (WCAG 2.1.4 forbids bare character keys) that
+      // also work while a search query is being typed. Matching on e.code
+      // sidesteps macOS Option dead-key characters, like SHORTCUT_NEW_CHAT.
+      if (!e.altKey || e.metaKey || e.ctrlKey) return;
 
-      // 'd' for delete when conversation is selected
-      if (e.key === SHORTCUT_DELETE.key && selectedValue?.startsWith("conv-")) {
+      // Alt+D deletes the selected conversation (press twice to confirm)
+      if (
+        e.code === SHORTCUT_DELETE.code &&
+        selectedValue?.startsWith("conv-")
+      ) {
         e.preventDefault();
         e.stopPropagation();
         const conversationId = selectedValue.substring(5);
@@ -345,12 +672,20 @@ export function ConversationSearchPalette({
         }
       }
 
-      // 'p' for pin/unpin when conversation is selected
-      if (e.key === SHORTCUT_PIN.key && selectedValue?.startsWith("conv-")) {
+      // Alt+P pins/unpins the selected conversation
+      if (e.code === SHORTCUT_PIN.code && selectedValue?.startsWith("conv-")) {
         e.preventDefault();
         e.stopPropagation();
         const conversationId = selectedValue.substring(5);
         handlePinConversation(conversationId);
+      }
+
+      // Alt+I starts a new encrypted chat (mirrors the global shortcut, so it
+      // also works with the palette open).
+      if (encryptedChatEnabled && e.code === SHORTCUT_NEW_ENCRYPTED_CHAT.code) {
+        e.preventDefault();
+        e.stopPropagation();
+        handleNewEncryptedChat();
       }
     };
 
@@ -360,10 +695,11 @@ export function ConversationSearchPalette({
   }, [
     open,
     selectedValue,
-    searchQuery,
     isPendingDeletion,
     handleDeleteConversation,
     handlePinConversation,
+    encryptedChatEnabled,
+    handleNewEncryptedChat,
   ]);
 
   /** Generates a contextual preview snippet with search term context */
@@ -441,10 +777,22 @@ export function ConversationSearchPalette({
     </div>
   );
 
+  const BrowseSkeleton = () => (
+    <div aria-hidden="true" className="space-y-2.5 px-3 py-3">
+      {SKELETON_IDS.slice(0, 4).map((id) => (
+        <div key={id} className="flex items-center gap-2 h-4">
+          <div className="h-4 w-4 shrink-0 rounded bg-muted animate-pulse" />
+          <div className="h-3.5 flex-1 rounded bg-muted animate-pulse" />
+        </div>
+      ))}
+    </div>
+  );
+
   const renderConversationItem = (
     conv: (typeof conversations)[number],
-    showPinIcon = false,
+    opts?: { showPinIcon?: boolean; dateLabel?: string },
   ) => {
+    const { showPinIcon = false, dateLabel } = opts ?? {};
     const isSearchActive = debouncedSearch.trim().length > 0;
     const displayTitle = getConversationDisplayTitle(conv.title, conv.messages);
     const preview = isSearchActive
@@ -457,11 +805,25 @@ export function ConversationSearchPalette({
       <CommandItem
         key={conv.id}
         value={`conv-${conv.id}`}
-        onSelect={() => handleSelectConversation(conv.id)}
+        onSelect={() => handleSelectConversation(conv)}
         className="flex flex-col items-start gap-1.5 px-3 py-2.5 cursor-pointer aria-selected:bg-accent rounded-sm w-full relative"
       >
-        <div className="flex items-start gap-2 w-full min-w-0">
-          <IconComponent className="h-4 w-4 shrink-0 text-muted-foreground" />
+        <div className="flex items-center gap-2 w-full min-w-0">
+          {/* One leading icon per row: the lock replaces the chat/pin glyph
+              for encrypted chats, at the same size and color, so the icon
+              column stays aligned. */}
+          {conv.encryptedChat ? (
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <EncryptedChatIcon className="h-4 w-4 text-muted-foreground" />
+                </TooltipTrigger>
+                <TooltipContent side="top">Encrypted chat</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          ) : (
+            <IconComponent className="h-4 w-4 shrink-0 text-muted-foreground" />
+          )}
           {conv.share && (
             <TooltipProvider>
               <Tooltip>
@@ -474,15 +836,31 @@ export function ConversationSearchPalette({
               </Tooltip>
             </TooltipProvider>
           )}
-          <span className="text-sm flex-1 min-w-0 break-words leading-snug line-clamp-2">
+          <span className="text-sm flex-1 min-w-0 truncate leading-snug">
             {displayTitle}
           </span>
+          {conv.projectId && conv.projectName && (
+            <ProjectBadgeButton
+              projectId={conv.projectId}
+              projectName={conv.projectName}
+              projectIcon={conv.projectIcon}
+              onNavigate={(projectId) => {
+                router.push(`/projects/${projectId}`);
+                onOpenChange(false);
+              }}
+            />
+          )}
+          {dateLabel && !isPending && (
+            <span className="shrink-0 text-xs text-muted-foreground">
+              {dateLabel}
+            </span>
+          )}
           {isPending && (
             <Badge
               variant="destructive"
               className="absolute right-3 top-2.5 text-[10px] shadow-sm animate-in fade-in zoom-in duration-200"
             >
-              Press "{SHORTCUT_DELETE.label}" to confirm
+              Press "{altKey} {SHORTCUT_DELETE.label}" to confirm
             </Badge>
           )}
         </div>
@@ -495,12 +873,93 @@ export function ConversationSearchPalette({
     );
   };
 
+  const renderRunItem = (
+    run: (typeof runs)[number],
+    opts?: { dateLabel?: string },
+  ) => (
+    <CommandItem
+      key={`exec-${run.taskId}`}
+      value={`exec-${run.taskId}`}
+      onSelect={() => {
+        router.push(`/chat/runs/${run.sessionId ?? run.taskId}`);
+        onOpenChange(false);
+      }}
+      className="flex items-center gap-2 px-3 py-2.5 cursor-pointer aria-selected:bg-accent rounded-sm w-full"
+    >
+      <RunStateIcon
+        state={run.state}
+        attentionState={run.attentionState}
+        startedAt={run.startedAt}
+        endedAt={run.endedAt}
+        hardDeadlineAt={run.hardDeadlineAt}
+        lastModelActivityAt={run.lastModelActivityAt}
+        className="size-4"
+      />
+      <span className="text-sm flex-1 min-w-0 truncate leading-snug">
+        {run.title}
+      </span>
+      {run.projectId && run.projectName && (
+        <ProjectBadgeButton
+          projectId={run.projectId}
+          projectName={run.projectName}
+          projectIcon={run.projectIcon}
+          onNavigate={(projectId) => {
+            router.push(`/projects/${projectId}`);
+            onOpenChange(false);
+          }}
+        />
+      )}
+      {opts?.dateLabel && (
+        <span className="shrink-0 text-xs text-muted-foreground">
+          {opts.dateLabel}
+        </span>
+      )}
+    </CommandItem>
+  );
+
+  const renderLinkItem = (link: SearchLink) => {
+    const Icon = link.icon;
+    return (
+      <CommandItem
+        key={link.key}
+        value={link.key}
+        onSelect={() => {
+          router.push(link.href);
+          onOpenChange(false);
+        }}
+        className="flex min-w-0 items-center gap-2 px-3 py-2! cursor-pointer aria-selected:bg-accent rounded-sm"
+      >
+        <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />
+        <span className="truncate text-sm">{link.label}</span>
+      </CommandItem>
+    );
+  };
+
+  const renderNavigationItems = () =>
+    matchingNavigationItems.map((item) => {
+      const Icon = item.icon;
+      return (
+        <CommandItem
+          key={item.value}
+          value={`${item.value} ${item.keywords} ${item.label}`}
+          onSelect={() => {
+            router.push(item.href);
+            onOpenChange(false);
+          }}
+          className="flex min-w-0 items-center gap-2 px-3 py-2! cursor-pointer aria-selected:bg-accent rounded-sm"
+        >
+          <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />
+          <span className="truncate text-sm">{item.label}</span>
+        </CommandItem>
+      );
+    });
+
   return (
     <CommandDialog
       open={open}
       onOpenChange={onOpenChange}
-      title="Search conversations"
-      description="Search through your conversation history"
+      title="Search or navigate"
+      description="Search chats, pages, and the names of your agents, apps, projects and more"
       className="max-w-2xl"
       shouldFilter={false}
       value={selectedValue}
@@ -511,183 +970,239 @@ export function ConversationSearchPalette({
         value={searchQuery}
         onValueChange={setSearchQuery}
       />
-      <CommandList className="max-h-[500px]">
-        {isLoading && !isSearching ? (
-          <div className="py-6 text-center text-sm text-muted-foreground">
-            Loading conversations...
-          </div>
-        ) : isSearchingAndFetching ? (
-          <SearchSkeleton />
-        ) : (
+      {/* Persistent live region: mounting the visual confirm badge together
+          with its text is not reliably announced, so the delete-confirmation
+          prompt is mirrored here (WCAG 4.1.3). */}
+      <output aria-live="polite" className="sr-only">
+        {isPendingDeletion && (
+          <span>
+            Press {altKey} {SHORTCUT_DELETE.label} again to confirm deleting the
+            selected conversation.
+          </span>
+        )}
+      </output>
+      {/* A fixed height, not a cap: typing and late-loading results would
+          otherwise resize the dialog under the pointer. */}
+      <CommandList className="h-[min(640px,70vh)] max-h-none">
+        {isSearching ? (
           <>
-            {!searchQuery.trim() && (
-              <>
-                <CommandGroup>
-                  <CommandItem
-                    value="new-chat"
-                    onSelect={handleNewChat}
-                    className="flex items-center gap-2 px-3 py-2.5 cursor-pointer aria-selected:bg-accent"
-                  >
-                    <Pencil className="h-4 w-4 shrink-0 text-muted-foreground" />
-                    <span className="font-medium">New chat</span>
-                  </CommandItem>
-                </CommandGroup>
-
-                {!recentChatsView && (
-                  <>
-                    <CommandSeparator className="my-2" />
-
-                    <div className="px-2 pb-1.5">
-                      <div className="flex items-center justify-between px-1">
-                        <span className="text-xs font-medium text-muted-foreground">
-                          Pages
-                        </span>
-                        <span className="text-xs text-muted-foreground">
-                          Jump to
-                        </span>
-                      </div>
-                    </div>
-                    <CommandGroup>
-                      {navigationItems.map((item) => {
-                        const Icon = item.icon;
-                        return (
-                          <CommandItem
-                            key={item.value}
-                            value={`${item.value} ${item.keywords} ${item.label}`}
-                            onSelect={() => {
-                              router.push(item.href);
-                              onOpenChange(false);
-                            }}
-                            className="flex items-center gap-3 px-3 py-2.5 cursor-pointer aria-selected:bg-accent rounded-sm"
-                          >
-                            <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />
-                            <span className="text-sm font-medium">
-                              {item.label}
-                            </span>
-                          </CommandItem>
-                        );
-                      })}
-                    </CommandGroup>
-
-                    <CommandSeparator className="my-2" />
-
-                    <div className="px-2 pb-1.5">
-                      <div className="flex items-center justify-between px-1">
-                        <span className="text-xs font-medium text-muted-foreground">
-                          Chats
-                        </span>
-                      </div>
-                    </div>
-                  </>
-                )}
-              </>
+            {matchingNavigationItems.length > 0 && (
+              <CommandGroup heading="Pages">
+                {renderNavigationItems()}
+              </CommandGroup>
             )}
 
-            {debouncedSearch.trim() ? (
-              conversations.length === 0 ? (
-                <CommandEmpty>No conversations found.</CommandEmpty>
-              ) : (
-                <CommandGroup heading="Search Results">
-                  {conversations.map((conv) => renderConversationItem(conv))}
-                </CommandGroup>
-              )
-            ) : groupedConversations ? (
-              <>
-                {groupedConversations.pinned.length > 0 && (
-                  <CommandGroup heading="Pinned">
-                    {groupedConversations.pinned.map((conv) =>
-                      renderConversationItem(conv, true),
-                    )}
+            {searchGroups.map(
+              (group) =>
+                group.links.length > 0 && (
+                  <CommandGroup key={group.heading} heading={group.heading}>
+                    {group.links.map(renderLinkItem)}
                   </CommandGroup>
-                )}
-                {groupedConversations.today.length > 0 && (
-                  <CommandGroup heading="Today">
-                    {groupedConversations.today.map((conv) =>
-                      renderConversationItem(conv),
-                    )}
-                  </CommandGroup>
-                )}
-                {groupedConversations.yesterday.length > 0 && (
-                  <CommandGroup heading="Yesterday">
-                    {groupedConversations.yesterday.map((conv) =>
-                      renderConversationItem(conv),
-                    )}
-                  </CommandGroup>
-                )}
-                {groupedConversations.previous7Days.length > 0 && (
-                  <CommandGroup heading="Previous 7 Days">
-                    {groupedConversations.previous7Days.map((conv) =>
-                      renderConversationItem(conv),
-                    )}
-                  </CommandGroup>
-                )}
-                {groupedConversations.older.length > 0 && (
-                  <CommandGroup heading="Previous 30 Days">
-                    {groupedConversations.older.map((conv) =>
-                      renderConversationItem(conv),
-                    )}
-                  </CommandGroup>
-                )}
-                {conversations.length === 0 && (
-                  <div className="py-4 text-center text-sm text-muted-foreground">
-                    No recent chats
-                  </div>
-                )}
-              </>
+                ),
+            )}
+
+            {isSearchingAndFetching ? (
+              <CommandGroup heading="Chats">
+                <SearchSkeleton />
+              </CommandGroup>
+            ) : conversations.length > 0 || matchingRuns.length > 0 ? (
+              <CommandGroup heading="Chats">
+                {conversations.map((conv) => renderConversationItem(conv))}
+                {matchingRuns.map((run) => renderRunItem(run))}
+              </CommandGroup>
+            ) : matchingNavigationItems.length === 0 && !hasEntityMatches ? (
+              <CommandEmpty>No results found.</CommandEmpty>
             ) : null}
           </>
+        ) : (
+          <>
+            <CommandGroup
+              className={
+                encryptedChatEnabled ? GRID_GROUP_CLASS_NAME : undefined
+              }
+            >
+              <CommandItem
+                value="new-chat"
+                onSelect={handleNewChat}
+                className="flex items-center gap-2 px-3 py-2.5 cursor-pointer aria-selected:bg-accent"
+              >
+                <Pencil className="h-4 w-4 shrink-0 text-muted-foreground" />
+                <span className="text-sm font-medium">New chat</span>
+              </CommandItem>
+              {encryptedChatEnabled && (
+                <CommandItem
+                  value="new-encrypted-chat private locked"
+                  onSelect={handleNewEncryptedChat}
+                  className="flex items-center gap-2 px-3 py-2.5 cursor-pointer aria-selected:bg-accent"
+                >
+                  <EncryptedChatIcon className="h-4 w-4 shrink-0" />
+                  <span className="text-sm font-medium">
+                    New encrypted chat
+                  </span>
+                </CommandItem>
+              )}
+            </CommandGroup>
+
+            {/* Only when there is something under it. A reader who has never
+                started a chat was shown a separator over empty space, between
+                the New chat row and Pages. The groups below carry their own
+                headings (Pinned / Recent), so no standalone label here — a
+                "Chats" label stacked on "Pinned" read as a double heading. */}
+            {isBrowseLoading ? (
+              <BrowseSkeleton />
+            ) : (
+              <>
+                {(conversations.length > 0 || runs.length > 0) && (
+                  <CommandSeparator className="my-2" />
+                )}
+
+                {browseItems ? (
+                  <>
+                    {browseItems.pinned.length > 0 && (
+                      <CommandGroup heading="Pinned">
+                        {browseItems.pinned.map((entry) =>
+                          entry.type === "chat"
+                            ? renderConversationItem(entry.item, {
+                                showPinIcon: true,
+                                dateLabel: getDateBucketLabel(
+                                  entry.item.lastMessageAt,
+                                ),
+                              })
+                            : renderRunItem(entry.item, {
+                                dateLabel: getDateBucketLabel(
+                                  entry.item.stateChangedAt ??
+                                    entry.item.startedAt,
+                                ),
+                              }),
+                        )}
+                      </CommandGroup>
+                    )}
+                    {visibleRecent.length > 0 && (
+                      <CommandGroup heading="Recent">
+                        {visibleRecent.map((entry) =>
+                          entry.kind === "conversation"
+                            ? renderConversationItem(entry.item, {
+                                dateLabel: getDateBucketLabel(entry.timestamp),
+                              })
+                            : renderRunItem(entry.item, {
+                                dateLabel: getDateBucketLabel(entry.timestamp),
+                              }),
+                        )}
+                        {hiddenRecentCount > 0 && (
+                          // Indented to the title column so it reads as part of the list.
+                          <p className="py-1 pl-9 text-xs text-muted-foreground">
+                            Type to search older chats
+                          </p>
+                        )}
+                      </CommandGroup>
+                    )}
+                  </>
+                ) : null}
+
+                <CommandSeparator className="my-2" />
+                <CommandGroup heading="Pages" className={PAGES_GRID_CLASS_NAME}>
+                  {renderNavigationItems()}
+                </CommandGroup>
+              </>
+            )}
+          </>
+        )}
+        {isSearching && runsQuery.hasNextPage && (
+          <CommandGroup heading="Runs">
+            <CommandItem
+              value="load-more-runs"
+              disabled={runsQuery.isFetchingNextPage}
+              onSelect={() => void runsQuery.fetchNextPage()}
+            >
+              More runs
+            </CommandItem>
+          </CommandGroup>
+        )}
+        {pinnedRunsQuery.hasNextPage && !isSearching && (
+          <CommandGroup heading="Pinned runs">
+            <CommandItem
+              value="load-more-pinned-runs"
+              disabled={pinnedRunsQuery.isFetchingNextPage}
+              onSelect={() => void pinnedRunsQuery.fetchNextPage()}
+            >
+              More pinned runs
+            </CommandItem>
+          </CommandGroup>
         )}
       </CommandList>
 
-      <div className="border-t bg-muted/30 px-4 py-3">
-        <div className="flex items-center justify-center gap-6 flex-wrap text-xs">
-          <div className="flex items-center gap-2">
-            <div className="flex items-center gap-1">
-              <kbd className="inline-flex h-5 min-w-[20px] items-center justify-center rounded bg-muted px-1.5 font-sans text-[10px] font-medium text-muted-foreground border border-border/50">
-                {modKey}
-              </kbd>
-              <kbd className="inline-flex h-5 min-w-[20px] items-center justify-center rounded bg-muted px-1.5 font-sans text-[10px] font-medium text-muted-foreground border border-border/50">
-                {SHORTCUT_SEARCH.label}
-              </kbd>
-            </div>
-            <span className="text-muted-foreground/70">Search</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <div className="flex items-center gap-1">
-              <kbd className="inline-flex h-5 min-w-[20px] items-center justify-center rounded bg-muted px-1.5 font-sans text-[10px] font-medium text-muted-foreground border border-border/50">
-                {altKey}
-              </kbd>
-              <kbd className="inline-flex h-5 min-w-[20px] items-center justify-center rounded bg-muted px-1.5 font-sans text-[10px] font-medium text-muted-foreground border border-border/50">
-                {SHORTCUT_NEW_CHAT.label}
-              </kbd>
-            </div>
-            <span className="text-muted-foreground/70">New Chat</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <kbd className="inline-flex h-5 min-w-[20px] items-center justify-center rounded bg-muted px-1.5 font-sans text-[10px] font-medium text-muted-foreground border border-border/50">
-              {SHORTCUT_PIN.label}
-            </kbd>
-            <span className="text-muted-foreground/70">Pin / Unpin Chat</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <kbd className="inline-flex h-5 min-w-[20px] items-center justify-center rounded bg-muted px-1.5 font-sans text-[10px] font-medium text-muted-foreground border border-border/50">
-              {SHORTCUT_DELETE.label}
-            </kbd>
-            <span className="text-muted-foreground/70">Delete Chat</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <div className="flex items-center gap-1">
-              <kbd className="inline-flex h-5 min-w-[20px] items-center justify-center rounded bg-muted px-1.5 font-sans text-[10px] font-medium text-muted-foreground border border-border/50">
-                {modKey}
-              </kbd>
-              <kbd className="inline-flex h-5 min-w-[20px] items-center justify-center rounded bg-muted px-1.5 font-sans text-[10px] font-medium text-muted-foreground border border-border/50">
-                {SHORTCUT_SIDEBAR.label}
-              </kbd>
-            </div>
-            <span className="text-muted-foreground/70">Sidebar</span>
-          </div>
+      <div className="border-t bg-muted/30 px-4 py-2.5">
+        {/* Wraps instead of a fixed grid: the shortcut count changes with
+            encrypted chat, and a grid left an empty cell in its last row. */}
+        <div className="flex flex-wrap justify-center gap-x-5 gap-y-1.5">
+          <FooterShortcut
+            keys={[modKey, SHORTCUT_SEARCH.label]}
+            label="Search"
+          />
+          <FooterShortcut
+            keys={[altKey, SHORTCUT_NEW_CHAT.label]}
+            label="New Chat"
+          />
+          {encryptedChatEnabled && (
+            <FooterShortcut
+              keys={[altKey, SHORTCUT_NEW_ENCRYPTED_CHAT.label]}
+              label="New Encrypted Chat"
+            />
+          )}
+          <FooterShortcut
+            keys={[altKey, SHORTCUT_PIN.label]}
+            label="Pin / Unpin Chat"
+          />
+          <FooterShortcut
+            keys={[altKey, SHORTCUT_DELETE.label]}
+            label="Delete Chat"
+          />
+          <FooterShortcut
+            keys={[modKey, SHORTCUT_SIDEBAR.label]}
+            label="Sidebar"
+          />
         </div>
       </div>
     </CommandDialog>
   );
 }
+
+/** One footer hint: its key caps followed by the action label. */
+function FooterShortcut({ keys, label }: { keys: string[]; label: string }) {
+  return (
+    <div className="flex min-w-0 items-center justify-center gap-1.5">
+      <span className="flex shrink-0 items-center gap-1">
+        {keys.map((key) => (
+          <kbd
+            key={key}
+            className="inline-flex h-4 min-w-[18px] items-center justify-center rounded border border-border/50 bg-muted px-1 font-sans text-[9px] font-medium text-muted-foreground"
+          >
+            {key}
+          </kbd>
+        ))}
+      </span>
+      <span className="truncate text-[11px] text-muted-foreground">
+        {label}
+      </span>
+    </div>
+  );
+}
+
+/** Recent chats shown before a search; older ones are found by typing. */
+const RECENT_CHATS_LIMIT = 5;
+
+/** Rows per entity group; a longer list pushes the chat matches out of view. */
+const ENTITY_RESULTS_LIMIT = 5;
+
+// cmdk moves the selection in DOM order, so a grid of items keeps arrow-key
+// navigation reaching every option while using the dialog's width.
+const GRID_GROUP_CLASS_NAME =
+  "[&_[cmdk-group-items]]:grid [&_[cmdk-group-items]]:grid-cols-2 [&_[cmdk-group-items]]:gap-1";
+const PAGES_GRID_CLASS_NAME =
+  "[&_[cmdk-group-items]]:grid [&_[cmdk-group-items]]:grid-cols-2 sm:[&_[cmdk-group-items]]:grid-cols-3 [&_[cmdk-group-items]]:gap-x-1";
+
+/**
+ * The palette's recent list before a query is typed: the server's maximum, as
+ * this is where the sidebar's "More" leads.
+ */
+const PALETTE_CONVERSATION_LIMIT = 250;

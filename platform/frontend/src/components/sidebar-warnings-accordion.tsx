@@ -1,8 +1,10 @@
 "use client";
 
-import { DEFAULT_ADMIN_EMAIL } from "@shared";
+import { DEFAULT_ADMIN_EMAIL, DocsPage } from "@archestra/shared";
 import { AlertTriangle } from "lucide-react";
 import Link from "next/link";
+import { GuardrailsDisabledWarning } from "@/app/openappa/_parts/guardrails-deployment-toggle";
+import { IntentPrefetchLink } from "@/components/intent-prefetch-link";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -23,47 +25,98 @@ import {
   useSession,
 } from "@/lib/auth/auth.query";
 import { useDisableBasicAuth, useFeature } from "@/lib/config/config.query";
-import { cn } from "@/lib/utils";
+import { getFrontendDocsUrl } from "@/lib/docs/docs";
+import { useK8sCapabilities } from "@/lib/environment.query";
+import { useGuardrailsDeployment } from "@/lib/guardrails-deployment.query";
+import { useShellReady } from "@/lib/shell-deferral";
+import { cn } from "@/lib/utils/tailwind";
 
-export function SidebarWarningsAccordion() {
+interface Warning {
+  label: string;
+  href: string;
+  external: boolean;
+}
+
+export function SidebarWarningsAccordion({
+  showGuardrailsStatus = true,
+}: {
+  /** False where the navigation already shows the Guardrails row. */
+  showGuardrailsStatus?: boolean;
+}) {
   const { data: session } = useSession();
   const userEmail = session?.user?.email;
-  const { data: defaultCredentialsEnabled, isLoading: isLoadingCreds } =
-    useDefaultCredentialsEnabled();
-  const globalToolPolicy = useFeature("globalToolPolicy");
+  // The default-credentials and network-policy checks wait for the page's
+  // first data (see useShellReady).
+  const shellReady = useShellReady();
   const disableBasicAuth = useDisableBasicAuth();
+  const openappaEnabled = useFeature("openappaEnabled");
+  const guardrailsDeployment = useGuardrailsDeployment();
   const { data: canUpdateOrg } = useHasPermissions({
     organization: ["update"],
   });
-  const { data: canUpdateAgentSettings } = useHasPermissions({
-    agentSettings: ["update"],
-  });
-  const { state: sidebarState } = useSidebar();
-
-  const isPermissive = globalToolPolicy === "permissive";
-
-  const showSecurityEngineWarning =
-    !!session && canUpdateAgentSettings === true && isPermissive;
-  const showDefaultCredsWarning =
+  // Only the default admin with organization:update sees this warning, and
+  // only while password sign-in is on.
+  const canSeeDefaultCredsWarning =
     canUpdateOrg === true &&
     disableBasicAuth === false &&
-    !isLoadingCreds &&
-    defaultCredentialsEnabled !== undefined &&
-    defaultCredentialsEnabled &&
     userEmail === DEFAULT_ADMIN_EMAIL;
+  const { data: defaultCredentialsEnabled, isLoading: isLoadingCreds } =
+    useDefaultCredentialsEnabled({
+      enabled: shellReady && canSeeDefaultCredsWarning,
+    });
+  // Reading capabilities needs environment:update, so gating the query on the
+  // same permission keeps it from 403-ing for everyone else on every page.
+  const { data: canUpdateEnvironment } = useHasPermissions({
+    environment: ["update"],
+  });
+  const { data: capabilities } = useK8sCapabilities(
+    shellReady && canUpdateEnvironment === true,
+  );
+  const { state: sidebarState } = useSidebar();
+
+  const showDefaultCredsWarning =
+    canSeeDefaultCredsWarning &&
+    !isLoadingCreds &&
+    defaultCredentialsEnabled === true;
+
+  // Only a measured verdict warns. "unknown" means nothing tested the cluster,
+  // which is not evidence that egress rules are inert.
+  //
+  // networkPolicy is optional-chained despite being required in the response
+  // type: a payload that does not match — an error envelope, an older backend —
+  // would otherwise throw here and blank every page, since this renders in the
+  // layout rather than on one screen.
+  const showNetworkPolicyWarning =
+    capabilities?.networkPolicy?.enforcementStatus === "verified-not-enforced";
+
+  // Null under full white-labeling, where the environments screen carries the
+  // same explanation and stays reachable.
+  const networkPolicyDocsUrl = getFrontendDocsUrl(
+    DocsPage.PlatformDeploymentNetworking,
+    "enforce-workload-egress",
+  );
 
   const warnings = [
     showDefaultCredsWarning && {
       label: "Change default credentials",
-      href: "/settings/account?highlight=change-password",
+      href: "/account?highlight=change-password",
+      external: false,
     },
-    showSecurityEngineWarning && {
-      label: "Enable security engine",
-      href: "/mcp/tool-guardrails",
+    showNetworkPolicyWarning && {
+      label: "Network policy not enforced",
+      href: networkPolicyDocsUrl ?? "/settings/environments",
+      external: networkPolicyDocsUrl !== null,
     },
-  ].filter((w): w is { label: string; href: string } => Boolean(w));
+  ].filter((w): w is Warning => Boolean(w));
 
-  if (warnings.length === 0) {
+  // Only while enforcement is off: the row is a warning, and there is nothing
+  // to warn about once the guardrail is doing its job. Checked here too, not
+  // just inside the row, so the group does not render as an empty strip.
+  const showGuardrails =
+    openappaEnabled === true &&
+    showGuardrailsStatus &&
+    guardrailsDeployment.data?.enabled === false;
+  if (warnings.length === 0 && !showGuardrails) {
     return null;
   }
 
@@ -73,7 +126,7 @@ export function SidebarWarningsAccordion() {
     <SidebarGroup className="p-0 ">
       <SidebarGroupContent>
         <SidebarMenu>
-          {isCollapsed ? (
+          {isCollapsed && warnings.length > 0 ? (
             <SidebarMenuItem>
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
@@ -89,7 +142,14 @@ export function SidebarWarningsAccordion() {
                       key={w.label}
                       className="cursor-pointer"
                     >
-                      <Link href={w.href}>{w.label}</Link>
+                      {/* A plain Link: menu items exist only once the menu is
+                          opened, which is already intent. */}
+                      <Link
+                        href={w.href}
+                        {...externalLinkProps(w.label, w.external)}
+                      >
+                        <span>{w.label}</span>
+                      </Link>
                     </DropdownMenuItem>
                   ))}
                 </DropdownMenuContent>
@@ -120,13 +180,14 @@ export function SidebarWarningsAccordion() {
           ) : (
             warnings.map((w) => <WarningItem key={w.label} {...w} />)
           )}
+          {showGuardrails && <GuardrailsDisabledWarning />}
         </SidebarMenu>
       </SidebarGroupContent>
     </SidebarGroup>
   );
 }
 
-function WarningItem({ label, href }: { label: string; href: string }) {
+function WarningItem({ label, href, external }: Warning) {
   return (
     <SidebarMenuItem>
       <SidebarMenuButton
@@ -134,11 +195,24 @@ function WarningItem({ label, href }: { label: string; href: string }) {
         tooltip={label}
         className="text-destructive hover:text-destructive"
       >
-        <Link href={href}>
+        <IntentPrefetchLink href={href} {...externalLinkProps(label, external)}>
           <AlertTriangle className="shrink-0" />
           <span>{label}</span>
-        </Link>
+        </IntentPrefetchLink>
       </SidebarMenuButton>
     </SidebarMenuItem>
   );
+}
+
+// The new-tab hint rides on aria-label rather than an sr-only sibling, because
+// SidebarMenuButton truncates its last span child and a second span would take
+// that rule off the label, wrapping it to two lines.
+function externalLinkProps(label: string, external: boolean) {
+  return external
+    ? ({
+        target: "_blank",
+        rel: "noopener noreferrer",
+        "aria-label": `${label} (opens in new tab)`,
+      } as const)
+    : {};
 }

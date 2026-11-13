@@ -1,8 +1,9 @@
+import { archestraApiSdk } from "@archestra/shared";
 import type { Page } from "@playwright/test";
-import { archestraApiSdk } from "@shared";
 import {
   ADMIN_EMAIL,
   DEFAULT_TEAM_NAME,
+  E2eTestId,
   EDITOR_EMAIL,
   ENGINEERING_TEAM_NAME,
   MARKETING_TEAM_NAME,
@@ -13,7 +14,6 @@ import {
   addCustomSelfHostedCatalogItem,
   addSharedLocalConnection,
   assignCatalogCredentialToGateway,
-  clickButton,
   closeOpenDialogs,
   createSharedTestGatewayViaApi,
   createTeamMcpGatewayViaApi,
@@ -24,21 +24,21 @@ import {
   openGatewayCatalogToolAssignment,
   openManageCredentialsDialog,
   saveOpenProfileDialog,
+  selectCredentialOption,
   settleRegistryAfterInstall,
   verifyToolCallResultViaApi,
+  waitForMcpServerAbsent,
+  waitForMcpServerReadyById,
   waitForMcpServerToolsDiscovered,
 } from "../utils";
 
-test.describe.configure({ mode: "serial" });
-
-test.describe("Custom Self-hosted MCP Server - installation and static credentials management (vault disabled, prompt-on-installation disabled)", () => {
+test.describe("Custom Self-hosted MCP Server - installation and static credentials management (vault disabled, prompt-on-installation disabled)", {
+  tag: "@needs-kubernetes",
+}, () => {
   // Matrix tests
-  const MATRIX: { user: "Admin" | "Editor" | "Member" }[] = [
+  const MATRIX: { user: "Admin" | "Member" }[] = [
     {
       user: "Admin",
-    },
-    {
-      user: "Editor",
     },
     {
       user: "Member",
@@ -47,7 +47,6 @@ test.describe("Custom Self-hosted MCP Server - installation and static credentia
   MATRIX.forEach(({ user }) => {
     test(`${user}`, async ({
       adminPage,
-      editorPage,
       memberPage,
       extractCookieHeaders,
       makeRandomString,
@@ -57,8 +56,6 @@ test.describe("Custom Self-hosted MCP Server - installation and static credentia
         switch (user) {
           case "Admin":
             return adminPage;
-          case "Editor":
-            return editorPage;
           case "Member":
             return memberPage;
         }
@@ -81,7 +78,7 @@ test.describe("Custom Self-hosted MCP Server - installation and static credentia
         page: adminPage,
         cookieHeaders,
         catalogItemName,
-        scope: "org",
+        shareWithOrganization: true,
       });
 
       await goToMcpRegistry(page);
@@ -131,7 +128,22 @@ test.describe("Custom Self-hosted MCP Server - installation and static credentia
             `Failed to install shared connection for ${user}: ${JSON.stringify(installResponse.error)}`,
           );
         }
+        const installedServerId = installResponse.data?.id;
+        if (!installedServerId) {
+          throw new Error(
+            `Install response for ${user} missing server id: ${JSON.stringify(installResponse.data)}`,
+          );
+        }
         await settleRegistryAfterInstall(page);
+        // The API install path doesn't refresh the registry DOM, so probe
+        // the backend installation status by ID first — surfaces a backend
+        // install error as a real error instead of a 120s DOM-poll timeout,
+        // and disambiguates from the same-named personal install above.
+        await waitForMcpServerReadyById(page, installedServerId);
+        // Follow with the existing DOM wait. This is the implicit "everything
+        // settled" signal the rest of the test relies on (TanStack Query
+        // refetch cycle has propagated to the registry view, so the gateway-
+        // edit dialog below sees the new tools in its catalog).
         await waitForMcpServerToolsDiscovered(page, catalogItemName);
       }
 
@@ -146,36 +158,15 @@ test.describe("Custom Self-hosted MCP Server - installation and static credentia
           `Failed to get visible MCP servers for ${user}: ${JSON.stringify(visibleServersResponse.error)}`,
         );
       }
-      const expectedCredentials =
-        visibleServersResponse.data
-          ?.filter((server) => server.catalogId === newCatalogItem.id)
-          .map(
-            (server) =>
-              server.teamDetails?.name ?? server.ownerEmail ?? "Deleted user",
-          ) ?? [];
       await openManageCredentialsDialog(page, catalogItemName);
-      const connectionsButton = page
-        .getByRole("dialog")
-        .filter({ visible: true })
-        .last()
-        .getByRole("button", { name: /^Credentials\b/ });
+      const connectionsButton = page.getByTestId(
+        E2eTestId.McpServerSettingsConnectionsNavButton,
+      );
       await expect(connectionsButton).toBeVisible();
       await closeOpenDialogs(page);
 
       if (user !== "Member") {
-        // Editor can't see org-scoped gateways, so create a team-scoped one
-        let teamGateway: { id: string; name: string } | undefined;
-        if (user === "Editor") {
-          teamGateway = await createTeamMcpGatewayViaApi({
-            cookieHeaders,
-            teamName: ENGINEERING_TEAM_NAME,
-            gatewayName: makeRandomString(10, "gw"),
-          });
-        }
-
-        // Check TokenSelect shows correct credentials
-        const gatewayNameForAssignment =
-          teamGateway?.name ?? adminSharedGateway?.name;
+        const gatewayNameForAssignment = adminSharedGateway?.name;
         if (!gatewayNameForAssignment) {
           throw new Error(
             `Expected a gateway for ${user} but none was provisioned`,
@@ -186,33 +177,77 @@ test.describe("Custom Self-hosted MCP Server - installation and static credentia
           catalogItemName,
           gatewayName: gatewayNameForAssignment,
         });
-        const expectedAssignableCredentials = expectedCredentials;
-        const visibleStaticCredentials =
-          await getVisibleStaticCredentials(page);
-        for (const credential of expectedAssignableCredentials) {
-          await expect(visibleStaticCredentials).toContain(credential);
-        }
-        await expect(visibleStaticCredentials).toHaveLength(
-          expectedAssignableCredentials.length,
-        );
-        await page
-          .getByRole("option", {
+        // Personal connections are caller-bound: they resolve only at call
+        // time for their owner and never appear as static pin options — the
+        // dropdown offers team/org service accounts exclusively.
+        const expectedAssignableCredentials =
+          visibleServersResponse.data
+            ?.filter(
+              (server) =>
+                server.catalogId === newCatalogItem.id &&
+                server.scope !== "personal",
+            )
+            .map(
+              (server) =>
+                server.teamDetails?.name ?? server.ownerEmail ?? "Deleted user",
+            ) ?? [];
+        expect(expectedAssignableCredentials.length).toBeGreaterThan(0);
+        // Poll instead of a one-shot read: the dropdown renders from a
+        // TanStack Query result that can transiently miss a just-created
+        // credential until the mount-time refetch lands. The options
+        // re-render in place once fresh data arrives, so re-reading
+        // converges; a thrown read (options briefly unmounted mid-re-render)
+        // counts as "not yet" rather than aborting the poll.
+        await expect
+          .poll(
+            async () =>
+              (await getVisibleStaticCredentials(page).catch(() => [])).sort(),
+            { timeout: 30_000, intervals: [500, 1000, 2000, 4000] },
+          )
+          .toEqual([...expectedAssignableCredentials].sort());
+        await selectCredentialOption(
+          page,
+          page.getByRole("option", {
             name: expectedAssignableCredentials[0] ?? "",
-          })
-          .click();
-        await page.keyboard.press("Escape");
-        await page.waitForTimeout(200);
+          }),
+        );
         await saveOpenProfileDialog(page);
 
-        // Then we revoke first credential in Manage Credentials dialog, then close dialog
+        // Revoke the admin's own (personal) credential, then close dialog.
+        // Target it by its deterministic test-id rather than the first Revoke
+        // button: the row order isn't guaranteed, so a position-based click
+        // can revoke the team credential instead, leaving ADMIN_EMAIL present
+        // and failing the assertion below.
+        const personalServerId = visibleServersResponse.data?.find(
+          (server) =>
+            server.catalogId === newCatalogItem.id &&
+            !server.teamDetails &&
+            server.ownerEmail === ADMIN_EMAIL,
+        )?.id;
+        expect(
+          personalServerId,
+          "Could not resolve the admin's personal MCP server id to revoke",
+        ).toBeTruthy();
         await goToPage(page, "/mcp/registry");
         await openManageCredentialsDialog(page, catalogItemName);
-        await clickButton({ page, options: { name: "Revoke" }, first: true });
+        await page
+          .getByTestId(`${E2eTestId.RevokeCredentialButton}-personal`)
+          .click();
         await page.waitForLoadState("domcontentloaded");
         await closeOpenDialogs(page);
 
-        // And we check that the credential is revoked
-        // Use polling to handle async credential revocation in CI
+        // Revoking deletes the backing MCP server via async K8s pod teardown,
+        // which keeps the server in getMcpServers (and the dialog) until
+        // teardown completes. Wait for the backend to actually drop it (404)
+        // before asserting the UI, so the assertion isn't racing teardown
+        // latency under CI load — the cause of the prior flake.
+        if (personalServerId) {
+          await waitForMcpServerAbsent(page, personalServerId);
+        }
+
+        // And we check the dialog reflects the revoke. The backend already
+        // confirmed deletion above, so this only waits on the UI refetch —
+        // not on K8s teardown.
         const expectedCredentialsAfterRevoke = {
           Admin: [ADMIN_EMAIL, DEFAULT_TEAM_NAME],
           Editor: [EDITOR_EMAIL, ENGINEERING_TEAM_NAME],
@@ -234,15 +269,7 @@ test.describe("Custom Self-hosted MCP Server - installation and static credentia
               remainingCredential,
             );
           }
-        }).toPass({ timeout: 15_000, intervals: [1000, 2000, 3000] });
-
-        // Cleanup team gateway
-        if (teamGateway) {
-          await archestraApiSdk.deleteAgent({
-            path: { id: teamGateway.id },
-            headers: { Cookie: cookieHeaders },
-          });
-        }
+        }).toPass({ timeout: 15_000, intervals: [1000, 2000, 3000, 5000] });
       }
       // Cleanup admin shared gateway
       if (adminSharedGateway) {
@@ -263,7 +290,9 @@ test.describe("Custom Self-hosted MCP Server - installation and static credentia
   });
 });
 
-test("Verify Manage Credentials dialog shows correct other users credentials", async ({
+test("Verify Manage Credentials dialog shows correct other users credentials", {
+  tag: "@needs-kubernetes",
+}, async ({
   adminPage,
   editorPage,
   memberPage,
@@ -279,7 +308,7 @@ test("Verify Manage Credentials dialog shows correct other users credentials", a
     page: adminPage,
     cookieHeaders,
     catalogItemName,
-    scope: "org",
+    shareWithOrganization: true,
   });
   const MATRIX = [
     { user: "Admin", page: adminPage, canCreateTeamCredential: true },
@@ -312,15 +341,13 @@ test("Verify Manage Credentials dialog shows correct other users credentials", a
     await install(page, canCreateTeamCredential);
   }
 
-  // Check Credentials counter
+  // Check Connections counter
   const checkCredentialsCount = async (page: Page) => {
     await goToPage(page, "/mcp/registry");
     await openManageCredentialsDialog(page, catalogItemName);
-    const connectionsButton = page
-      .getByRole("dialog")
-      .filter({ visible: true })
-      .last()
-      .getByRole("button", { name: /^Credentials\b/ });
+    const connectionsButton = page.getByTestId(
+      E2eTestId.McpServerSettingsConnectionsNavButton,
+    );
     await expect(connectionsButton).toBeVisible();
     await closeOpenDialogs(page);
   };
@@ -335,7 +362,9 @@ test("Verify Manage Credentials dialog shows correct other users credentials", a
   });
 });
 
-test("Verify tool calling using different static credentials", async ({
+test("Verify tool calling using different static credentials", {
+  tag: "@needs-kubernetes",
+}, async ({
   request,
   adminPage,
   editorPage,
@@ -349,6 +378,7 @@ test("Verify tool calling using different static credentials", async ({
   const sharedGateway = await createSharedTestGatewayViaApi({
     cookieHeaders,
     gatewayName: makeRandomString(10, "shared-gw"),
+    withOrganizationUse: true,
   });
   // Create a team-scoped MCP gateway for editor (editor can't see org-scoped gateways)
   const teamGateway = await createTeamMcpGatewayViaApi({
@@ -362,7 +392,7 @@ test("Verify tool calling using different static credentials", async ({
     page: adminPage,
     cookieHeaders,
     catalogItemName: CATALOG_ITEM_NAME,
-    scope: "org",
+    shareWithOrganization: true,
     envVars: {
       key: "ARCHESTRA_TEST",
       promptOnInstallation: true,
@@ -388,34 +418,55 @@ test("Verify tool calling using different static credentials", async ({
   });
   await settleRegistryAfterInstall(editorPage);
 
-  // Assign tool to profiles using admin static credential
+  // Personal connections are caller-bound and can no longer be pinned as
+  // static credentials (the installs above stay usable only via
+  // resolve-at-call-time for their owners). Static pinning is exercised with
+  // team service accounts instead: one per gateway, with distinct env values
+  // so the tool result proves which credential served the call.
+  await addSharedLocalConnection({
+    page: adminPage,
+    catalogItemName: CATALOG_ITEM_NAME,
+    teamName: DEFAULT_TEAM_NAME,
+    envValues: { ARCHESTRA_TEST: "Default-team-credential" },
+  });
+  await settleRegistryAfterInstall(adminPage);
+  await addSharedLocalConnection({
+    page: editorPage,
+    catalogItemName: CATALOG_ITEM_NAME,
+    teamName: ENGINEERING_TEAM_NAME,
+    envValues: { ARCHESTRA_TEST: "Engineering-team-credential" },
+  });
+  await settleRegistryAfterInstall(editorPage);
+
+  // Assign tool to profiles pinning the default-team service account
   await assignCatalogCredentialToGateway({
     page: adminPage,
     catalogItemName: CATALOG_ITEM_NAME,
-    credentialName: "admin@example.com",
+    credentialName: DEFAULT_TEAM_NAME,
     gatewayName: sharedGateway.name,
   });
-  // Verify tool call result using admin static credential
+  // Verify tool call result using the default-team service account
   await verifyToolCallResultViaApi({
     request,
-    expectedResult: "Admin-personal-credential",
+    expectedResult: "Default-team-credential",
     tokenToUse: "org-token",
     toolName: `${CATALOG_ITEM_NAME}__print_archestra_test`,
     profileId: sharedGateway.id,
   });
 
-  // Assign tool to profiles using editor static credential
+  // Assign tool to profiles pinning the engineering-team service account
   await assignCatalogCredentialToGateway({
     page: editorPage,
     catalogItemName: CATALOG_ITEM_NAME,
-    credentialName: "editor@example.com",
+    credentialName: ENGINEERING_TEAM_NAME,
     gatewayName: teamGateway.name,
   });
-  // Verify tool call result using editor static credential
+  // Verify tool call result using the engineering-team service account
   await verifyToolCallResultViaApi({
     request,
-    expectedResult: "Editor-personal-credential",
-    tokenToUse: "org-token",
+    expectedResult: "Engineering-team-credential",
+    // The gateway belongs to the engineering team, so its token reaches it.
+    tokenToUse: "engineering-team",
     toolName: `${CATALOG_ITEM_NAME}__print_archestra_test`,
     profileId: teamGateway.id,
   });

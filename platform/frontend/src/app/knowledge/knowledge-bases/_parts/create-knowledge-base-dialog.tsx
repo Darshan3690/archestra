@@ -1,9 +1,12 @@
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
 "use client";
 
+import { useRef, useState } from "react";
 import { useForm } from "react-hook-form";
-import { FormDialog } from "@/components/form-dialog";
+import { AdvancedLabelsSection } from "@/components/advanced-labels-section";
+import type { ProfileLabel, ProfileLabelsRef } from "@/components/agent-labels";
+import { StandardFormDialog } from "@/components/standard-dialog";
 import { Button } from "@/components/ui/button";
-import { DialogForm, DialogStickyFooter } from "@/components/ui/dialog";
 import {
   Form,
   FormControl,
@@ -14,11 +17,10 @@ import {
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { useCreateKnowledgeBase } from "@/lib/knowledge/knowledge-base.query";
-
-interface CreateKnowledgeBaseFormValues {
-  name: string;
-  description: string;
-}
+import {
+  KnowledgeBaseAccessFields,
+  type KnowledgeBaseFormValues,
+} from "./knowledge-base-access-fields";
 
 export function CreateKnowledgeBaseDialog({
   open,
@@ -28,73 +30,46 @@ export function CreateKnowledgeBaseDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const createKnowledgeBase = useCreateKnowledgeBase();
+  const [labels, setLabels] = useState<ProfileLabel[]>([]);
+  const labelsRef = useRef<ProfileLabelsRef>(null);
 
-  const form = useForm<CreateKnowledgeBaseFormValues>({
+  const form = useForm<KnowledgeBaseFormValues>({
     defaultValues: {
       name: "",
       description: "",
+      initialGrants: [],
     },
   });
 
-  const handleSubmit = async (values: CreateKnowledgeBaseFormValues) => {
+  const handleSubmit = async (values: KnowledgeBaseFormValues) => {
+    const finalLabels = labelsRef.current?.saveUnsavedLabel() ?? labels;
     const result = await createKnowledgeBase.mutateAsync({
       name: values.name,
       ...(values.description && { description: values.description }),
+      labels: finalLabels,
+      initialGrants: values.initialGrants.map(({ subject, actions }) => ({
+        subject,
+        actions,
+      })),
     });
     if (result) {
       form.reset();
+      setLabels([]);
       onOpenChange(false);
     }
   };
 
   return (
-    <FormDialog
-      open={open}
-      onOpenChange={onOpenChange}
-      title="Create Knowledge Base"
-      size="medium"
-      className="max-w-lg"
-    >
-      <Form {...form}>
-        <DialogForm
-          onSubmit={form.handleSubmit(handleSubmit)}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4">
-            <FormField
-              control={form.control}
-              name="name"
-              rules={{ required: "Name is required" }}
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Name</FormLabel>
-                  <FormControl>
-                    <Input placeholder="My Knowledge Base" {...field} />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name="description"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Description (optional)</FormLabel>
-                  <FormControl>
-                    <Input
-                      placeholder="A short description of this knowledge base"
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-          </div>
-
-          <DialogStickyFooter>
+    <Form {...form}>
+      <StandardFormDialog
+        open={open}
+        onOpenChange={onOpenChange}
+        title="Create Knowledge Base"
+        description="Create a searchable collection of content."
+        onSubmit={form.handleSubmit(handleSubmit)}
+        bodyClassName="space-y-4"
+        footer={
+          <>
             <Button
               type="button"
               variant="outline"
@@ -107,9 +82,48 @@ export function CreateKnowledgeBaseDialog({
                 ? "Creating..."
                 : "Create Knowledge Base"}
             </Button>
-          </DialogStickyFooter>
-        </DialogForm>
-      </Form>
-    </FormDialog>
+          </>
+        }
+      >
+        <FormField
+          control={form.control}
+          name="name"
+          rules={{ required: "Name is required" }}
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>Name</FormLabel>
+              <FormControl>
+                <Input placeholder="My Knowledge Base" {...field} />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+
+        <FormField
+          control={form.control}
+          name="description"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>Description (optional)</FormLabel>
+              <FormControl>
+                <Input
+                  placeholder="A short description of this knowledge base"
+                  {...field}
+                />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+
+        <KnowledgeBaseAccessFields form={form} />
+        <AdvancedLabelsSection
+          ref={labelsRef}
+          labels={labels}
+          onLabelsChange={setLabels}
+        />
+      </StandardFormDialog>
+    </Form>
   );
 }

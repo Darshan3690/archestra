@@ -6,8 +6,9 @@
  *
  * @see https://inference-docs.cerebras.ai/
  */
+
+import { RouteId } from "@archestra/shared";
 import fastifyHttpProxy from "@fastify/http-proxy";
-import { RouteId } from "@shared";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
 import config from "@/config";
@@ -15,6 +16,7 @@ import logger from "@/logging";
 import { Cerebras, constructResponseSchema, UuidIdSchema } from "@/types";
 import { cerebrasAdapterFactory } from "../adapters";
 import { PROXY_API_PREFIX, PROXY_BODY_LIMIT } from "../common";
+import { createPassthroughAuthenticator } from "../llm-proxy-auth";
 import { handleLLMProxy } from "../llm-proxy-handler";
 import { createProxyPreHandler } from "./proxy-prehandler";
 
@@ -22,7 +24,7 @@ const cerebrasProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
   const API_PREFIX = `${PROXY_API_PREFIX}/cerebras`;
   const CHAT_COMPLETIONS_SUFFIX = "/chat/completions";
 
-  logger.info("[UnifiedProxy] Registering unified Cerebras routes");
+  logger.debug("[UnifiedProxy] Registering unified Cerebras routes");
 
   await fastify.register(fastifyHttpProxy, {
     upstream: config.llm.cerebras.baseUrl,
@@ -33,6 +35,7 @@ const cerebrasProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
       endpointSuffix: CHAT_COMPLETIONS_SUFFIX,
       upstream: config.llm.cerebras.baseUrl,
       providerName: "Cerebras",
+      authenticate: createPassthroughAuthenticator("cerebras"),
     }),
   });
 

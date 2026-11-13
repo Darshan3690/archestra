@@ -1,4 +1,12 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { archestraApiSdk } from "@archestra/shared";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock ResizeObserver which is used by Radix UI components
@@ -10,20 +18,44 @@ global.ResizeObserver = vi.fn().mockImplementation(() => ({
 
 const {
   mockRouterPush,
-  mockUsePathname,
   mockDeleteMutate,
   mockUseConversations,
+  mockUseMyAgentRuns,
+  mockUseAgentOptions,
+  mockUseMcpRegistryPage,
+  mockUseSkillsPaginated,
+  mockUseApps,
+  mockUseProjects,
+  mockUseKnowledgeBases,
+  mockUsePlugins,
+  mockUseEnvironments,
+  mockUseTeams,
 } = vi.hoisted(() => ({
   mockRouterPush: vi.fn(),
-  mockUsePathname: vi.fn(),
   mockDeleteMutate: vi.fn(),
   mockUseConversations: vi.fn(),
+  mockUseMyAgentRuns: vi.fn(),
+  mockUseAgentOptions: vi.fn(),
+  mockUseMcpRegistryPage: vi.fn(),
+  mockUseSkillsPaginated: vi.fn(),
+  mockUseApps: vi.fn(),
+  mockUseProjects: vi.fn(),
+  mockUseKnowledgeBases: vi.fn(),
+  mockUsePlugins: vi.fn(),
+  mockUseEnvironments: vi.fn(),
+  mockUseTeams: vi.fn(),
 }));
 
-vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: mockRouterPush }),
-  usePathname: () => mockUsePathname(),
+// The server applies the search; a disabled query has no rows, like the real
+// hook's.
+vi.mock("@/lib/agent-options.query", () => ({
+  useAgentOptionsPage: (params: { enabled?: boolean }) => {
+    const rows = params.enabled ? (mockUseAgentOptions(params).data ?? []) : [];
+    return { data: { pages: [{ data: rows }] } };
+  },
 }));
+
+vi.mock("next/navigation");
 
 vi.mock("@uidotdev/usehooks", () => ({
   useDebounce: (value: string) => value,
@@ -33,17 +65,19 @@ vi.mock("@/lib/hooks/use-platform", () => ({
   usePlatform: () => ({ modKey: "⌘", altKey: "⌥", isMac: true }),
 }));
 
-vi.mock("@/lib/auth/auth.hook", () => ({
+vi.mock("@/lib/auth/use-is-authenticated", () => ({
   useIsAuthenticated: () => true,
 }));
 
-vi.mock("@/lib/auth/auth.query", () => ({
-  useHasPermissions: () => ({
-    data: true,
-    isPending: false,
-    isLoading: false,
-  }),
+vi.mock("@/lib/auth/auth.query");
+vi.mock("@/lib/organization.query");
+vi.mock("@/lib/limits-access");
+// Read only when a grant on one credential might open Settings.
+vi.mock("@/lib/runtime-credentials.query", () => ({
+  useRuntimeCredentials: () => ({ data: [], isPending: false }),
 }));
+
+vi.mock("@/lib/config/config.query");
 
 vi.mock("@/lib/chat/chat-utils", () => ({
   getConversationDisplayTitle: (title: string | null) =>
@@ -58,6 +92,59 @@ vi.mock("@/lib/chat/chat.query", () => ({
   usePinConversation: () => ({
     mutate: vi.fn(),
   }),
+}));
+
+let useRealRunsQuery = false;
+vi.mock("@archestra/shared/api-sdk", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@archestra/shared/api-sdk")>()),
+  getMyAgentRuns: vi.fn(),
+}));
+vi.mock("@/lib/agent-runtime.query", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/lib/agent-runtime.query")>();
+  return {
+    useMyAgentRuns: (...args: Parameters<typeof actual.useMyAgentRuns>) =>
+      useRealRunsQuery
+        ? // biome-ignore lint/correctness/useHookAtTopLevel: Test implementation is selected before mounting.
+          actual.useMyAgentRuns(...args)
+        : mockUseMyAgentRuns(...args),
+  };
+});
+
+vi.mock("@/lib/mcp/mcp-registry.query", () => ({
+  useMcpRegistryPage: mockUseMcpRegistryPage,
+}));
+
+vi.mock("@/lib/skills/skill.query", () => ({
+  useSkillsPaginated: mockUseSkillsPaginated,
+}));
+
+vi.mock("@/lib/app.query", () => ({
+  useApps: mockUseApps,
+}));
+
+vi.mock("@/lib/projects/projects.query", () => ({
+  useProjects: mockUseProjects,
+}));
+
+vi.mock("@/lib/knowledge/knowledge-base.query", () => ({
+  useKnowledgeBases: mockUseKnowledgeBases,
+}));
+
+vi.mock("@/lib/plugins/plugin.query", () => ({
+  usePlugins: mockUsePlugins,
+}));
+
+vi.mock("@/lib/environment.query", () => ({
+  useEnvironments: mockUseEnvironments,
+}));
+
+vi.mock("@/lib/teams/team.query", () => ({
+  useTeams: mockUseTeams,
+}));
+
+vi.mock("@/lib/secrets.query", () => ({
+  useSecretsType: () => ({ data: undefined }),
 }));
 
 // Store the onValueChange callback so tests can control selectedValue
@@ -120,9 +207,17 @@ vi.mock("@/components/ui/command", () => ({
     onSelect: () => void;
     value: string;
   }) => (
-    <button type="button" data-testid={`cmd-item-${value}`} onClick={onSelect}>
+    <div
+      role="option"
+      tabIndex={0}
+      data-testid={`cmd-item-${value}`}
+      onClick={onSelect}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") onSelect();
+      }}
+    >
       {children}
-    </button>
+    </div>
   ),
   CommandSeparator: () => <hr />,
 }));
@@ -133,8 +228,17 @@ vi.mock("@/components/ui/badge", () => ({
   ),
 }));
 
+import {
+  predefinedPermissionsMap,
+  requiredPagePermissionsMap,
+} from "@archestra/shared/access-control";
+import { usePathname, useRouter } from "next/navigation";
 // Import component after mocks
 import { act } from "react";
+import { useHasPermissions, usePermissionMap } from "@/lib/auth/auth.query";
+import { hasPagePermissions } from "@/lib/auth/auth.utils";
+import { useFeature } from "@/lib/config/config.query";
+import { useOrganization } from "@/lib/organization.query";
 import { ConversationSearchPalette } from "./conversation-search-palette";
 
 describe("ConversationSearchPalette", () => {
@@ -145,25 +249,61 @@ describe("ConversationSearchPalette", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    mockUsePathname.mockReturnValue("/chat");
+    vi.mocked(useOrganization).mockReturnValue({
+      data: { connectionPageHidden: false },
+    } as ReturnType<typeof useOrganization>);
+    vi.mocked(useRouter).mockReturnValue({
+      push: mockRouterPush,
+    } as unknown as ReturnType<typeof useRouter>);
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+      isLoading: false,
+    } as ReturnType<typeof useHasPermissions>);
+    // The palette lists only pages the reader may open, so without a
+    // permission answer it lists none. Grant everything by default; the
+    // gating itself is covered by its own test below.
+    vi.mocked(usePermissionMap).mockReturnValue(
+      Object.fromEntries(
+        Object.keys(requiredPagePermissionsMap).map((url) => [url, true]),
+      ),
+    );
+    vi.mocked(useFeature).mockReturnValue(false);
+    vi.mocked(usePathname).mockReturnValue("/chat");
     mockUseConversations.mockReturnValue({
       data: [
         {
           id: "conv-1",
           title: "First conversation",
           updatedAt: new Date().toISOString(),
+          lastMessageAt: new Date().toISOString(),
           messages: [],
         },
         {
           id: "conv-2",
           title: "Second conversation",
           updatedAt: new Date().toISOString(),
+          lastMessageAt: new Date().toISOString(),
           messages: [],
         },
       ],
       isLoading: false,
       isFetching: false,
     });
+    useRealRunsQuery = false;
+    mockUseMyAgentRuns.mockReturnValue({
+      data: [],
+      isLoading: false,
+    });
+    mockUseAgentOptions.mockReturnValue({ data: [] });
+    mockUseMcpRegistryPage.mockReturnValue({ data: undefined });
+    mockUseSkillsPaginated.mockReturnValue({ data: { data: [] } });
+    mockUseApps.mockReturnValue({ data: { data: [] } });
+    mockUseProjects.mockReturnValue({ data: { data: [] } });
+    mockUseKnowledgeBases.mockReturnValue({ data: [] });
+    mockUsePlugins.mockReturnValue({ data: [] });
+    mockUseEnvironments.mockReturnValue({ data: { environments: [] } });
+    mockUseTeams.mockReturnValue({ data: [] });
     capturedOnValueChange = null;
   });
 
@@ -190,8 +330,801 @@ describe("ConversationSearchPalette", () => {
     expect(screen.getByText("Second conversation")).toBeInTheDocument();
   });
 
+  it("shows a date bucket label on each row instead of date group headings", () => {
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    // Both mock conversations have lastMessageAt = now → one "Today" label per
+    // row. With date headings there would be a single "Today" for the group.
+    expect(screen.getAllByText("Today")).toHaveLength(2);
+    expect(screen.queryByText("Previous 7 Days")).not.toBeInTheDocument();
+    expect(screen.queryByText("Previous 30 Days")).not.toBeInTheDocument();
+  });
+
+  it("keeps New chat in place while chats load, then shows the lists", () => {
+    mockUseConversations.mockReturnValue({
+      data: [],
+      isLoading: true,
+      isFetching: true,
+    });
+    const { rerender } = render(
+      <ConversationSearchPalette {...defaultProps} />,
+    );
+
+    expect(screen.getByText("New chat")).toBeInTheDocument();
+    expect(screen.queryByText("First conversation")).not.toBeInTheDocument();
+    expect(screen.queryByText("Pages")).not.toBeInTheDocument();
+
+    mockUseConversations.mockReturnValue({
+      data: [
+        {
+          id: "conv-1",
+          title: "First conversation",
+          updatedAt: new Date().toISOString(),
+          lastMessageAt: new Date().toISOString(),
+          messages: [],
+        },
+      ],
+      isLoading: false,
+      isFetching: false,
+    });
+    rerender(<ConversationSearchPalette {...defaultProps} />);
+
+    expect(screen.getByText("First conversation")).toBeInTheDocument();
+    expect(screen.getByText("Pages")).toBeInTheDocument();
+  });
+
+  it("drops the Chats heading when there are no chats under it", () => {
+    mockUseConversations.mockReturnValue({
+      data: [],
+      isLoading: false,
+      isFetching: false,
+    });
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    expect(screen.queryByText("Chats")).not.toBeInTheDocument();
+    // The rest of the idle view is untouched.
+    expect(screen.getByText("Pages")).toBeInTheDocument();
+    expect(screen.getByText("New chat")).toBeInTheDocument();
+  });
+
+  it("offers New Chat once, as its own row rather than also as a page", () => {
+    mockUseConversations.mockReturnValue({
+      data: [],
+      isLoading: false,
+      isFetching: false,
+    });
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    // The action row stays; the Pages list must not repeat it as a
+    // destination. (A bare text count would also catch the footer's
+    // keyboard-shortcut legend, which is neither.)
+    expect(screen.getByTestId("cmd-item-new-chat")).toBeInTheDocument();
+    expect(screen.queryAllByTestId(/^cmd-item-\/chat\b/)).toHaveLength(0);
+  });
+
+  it("keeps the Pinned heading for pinned conversations", () => {
+    mockUseConversations.mockReturnValue({
+      data: [
+        {
+          id: "conv-1",
+          title: "Pinned conversation",
+          updatedAt: new Date().toISOString(),
+          lastMessageAt: new Date().toISOString(),
+          pinnedAt: new Date().toISOString(),
+          messages: [],
+        },
+      ],
+      isLoading: false,
+      isFetching: false,
+    });
+
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+    expect(screen.getByText("Pinned conversation")).toBeInTheDocument();
+    // Pinned rows show their date bucket too.
+    expect(screen.getByText("Today")).toBeInTheDocument();
+  });
+
+  it("shows the lock as the only leading icon on encrypted chat rows", () => {
+    mockUseConversations.mockReturnValue({
+      data: [
+        {
+          id: "conv-locked",
+          title: "Locked conversation",
+          updatedAt: new Date().toISOString(),
+          lastMessageAt: new Date().toISOString(),
+          encryptedChat: true,
+          messages: [],
+        },
+      ],
+      isLoading: false,
+      isFetching: false,
+    });
+
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    const row = screen.getByTestId("cmd-item-conv-conv-locked");
+    expect(screen.getByLabelText("Encrypted chat")).toBeInTheDocument();
+    // The lock replaces the chat-bubble glyph rather than sitting next to it.
+    expect(row.querySelector(".lucide-message-circle")).toBeNull();
+  });
+
+  it("loads more matching runs during search without a misleading browse paging action", async () => {
+    useRealRunsQuery = true;
+    vi.mocked(useFeature).mockImplementation(
+      (feature) => feature === "agentRuntime",
+    );
+    const makeRun = (taskId: string, title: string) => ({
+      taskId,
+      title,
+      state: "TASK_STATE_COMPLETED",
+      startedAt: "2020-01-01T00:00:00Z",
+      stateChangedAt: "2020-01-01T00:00:00Z",
+      endedAt: "2020-01-01T00:00:00Z",
+    });
+    vi.mocked(archestraApiSdk.getMyAgentRuns).mockImplementation(
+      async ({ query } = {}) =>
+        ({
+          data: {
+            data: query?.pinned
+              ? []
+              : [
+                  query?.offset
+                    ? makeRun("older", "Report older")
+                    : makeRun("current", "Report current"),
+                ],
+            pagination: { hasNext: !query?.pinned && !query?.offset },
+          },
+          error: undefined,
+        }) as never,
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ConversationSearchPalette {...defaultProps} />
+      </QueryClientProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByText("Report current")).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("More runs")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("command-input"), {
+      target: { value: "Report" },
+    });
+    await waitFor(() =>
+      expect(screen.getByText("More runs")).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("Report older")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText("More runs"));
+    await waitFor(() =>
+      expect(screen.getByText("Report older")).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByText("Report older"));
+    expect(mockRouterPush).toHaveBeenCalledWith("/chat/runs/older");
+    queryClient.clear();
+  });
+
+  it("lists Agent Runtime sessions in the browse view and opens one", () => {
+    mockUseMyAgentRuns.mockReturnValue({
+      data: [
+        {
+          taskId: "task-1",
+          title: "Nightly report run",
+          state: "TASK_STATE_WORKING",
+          startedAt: new Date(Date.now() - 30 * 60_000).toISOString(),
+          stateChangedAt: new Date().toISOString(),
+          endedAt: null,
+          hardDeadlineAt: new Date(Date.now() + 24 * 60 * 60_000).toISOString(),
+          lastModelActivityAt: new Date(Date.now() - 20 * 60_000).toISOString(),
+          projectId: "project-1",
+          projectName: "Release work",
+        },
+      ],
+      isLoading: false,
+    });
+
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    expect(screen.getByText("Nightly report run")).toBeInTheDocument();
+    // The row carries the same liveness-aware run mark as the sidebar.
+    expect(
+      screen.getByLabelText("Running · quiet for 20m"),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Open project Release work" }),
+    );
+    expect(mockRouterPush).toHaveBeenCalledWith("/projects/project-1");
+    mockRouterPush.mockClear();
+
+    fireEvent.click(screen.getByTestId("cmd-item-exec-task-1"));
+    expect(mockRouterPush).toHaveBeenCalledWith("/chat/runs/task-1");
+  });
+
+  it("shows pinned run sessions under Pinned instead of Recent", () => {
+    mockUseMyAgentRuns.mockReturnValue({
+      data: [
+        {
+          taskId: "task-pinned",
+          title: "Pinned report run",
+          state: "TASK_STATE_WORKING",
+          startedAt: new Date().toISOString(),
+          stateChangedAt: new Date().toISOString(),
+          endedAt: null,
+          pinnedAt: new Date().toISOString(),
+        },
+      ],
+      isLoading: false,
+    });
+
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    const pinnedGroup = screen.getByText("Pinned").parentElement;
+    const recentGroup = screen.getByText("Recent").parentElement;
+    expect(pinnedGroup).not.toBeNull();
+    expect(recentGroup).not.toBeNull();
+    expect(
+      within(pinnedGroup as HTMLElement).getByText("Pinned report run"),
+    ).toBeInTheDocument();
+    expect(
+      within(recentGroup as HTMLElement).queryByText("Pinned report run"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("matches run sessions by title during search", () => {
+    mockUseConversations.mockReturnValue({
+      data: [],
+      isLoading: false,
+      isFetching: false,
+    });
+    mockUseMyAgentRuns.mockReturnValue({
+      data: [
+        {
+          taskId: "task-1",
+          title: "Nightly report run",
+          state: "TASK_STATE_COMPLETED",
+          startedAt: new Date().toISOString(),
+          stateChangedAt: new Date().toISOString(),
+          endedAt: new Date().toISOString(),
+        },
+      ],
+      isLoading: false,
+    });
+
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    fireEvent.change(screen.getByTestId("command-input"), {
+      target: { value: "nightly" },
+    });
+    expect(screen.getByText("Nightly report run")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByTestId("command-input"), {
+      target: { value: "does-not-match" },
+    });
+    expect(screen.queryByText("Nightly report run")).not.toBeInTheDocument();
+    expect(screen.getByText("No results found.")).toBeInTheDocument();
+  });
+
+  describe("searching by name", () => {
+    const search = (value: string) =>
+      fireEvent.change(screen.getByTestId("command-input"), {
+        target: { value },
+      });
+
+    it("finds an internal agent by its name and opens it", () => {
+      mockUseAgentOptions.mockReturnValue({
+        data: [{ id: "agent-1", name: "Support Triage" }],
+      });
+      render(<ConversationSearchPalette {...defaultProps} />);
+
+      search("triage");
+
+      // The Agents group links to /agents/<id>, which only opens internal
+      // agents, so gateways and proxies must not be requested.
+      expect(mockUseAgentOptions).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          filters: expect.objectContaining({ agentType: "agent" }),
+        }),
+      );
+      expect(screen.getByText("Agents")).toBeInTheDocument();
+      expect(screen.queryByText("No results found.")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByText("Support Triage"));
+      expect(mockRouterPush).toHaveBeenCalledWith("/agents/agent-1");
+    });
+
+    it("finds an MCP server in the registry by its name", () => {
+      mockUseMcpRegistryPage.mockReturnValue({
+        data: { data: [{ id: "cat-1", name: "GitHub MCP" }] },
+      });
+      render(<ConversationSearchPalette {...defaultProps} />);
+
+      search("github");
+
+      // Searched by the server, by name, including the built-in Archestra
+      // entry the registry page leaves out.
+      expect(mockUseMcpRegistryPage).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          search: "github",
+          limit: 5,
+          includeBuiltIn: true,
+        }),
+        expect.objectContaining({ enabled: true }),
+      );
+      expect(screen.getByText("MCP Servers")).toBeInTheDocument();
+      fireEvent.click(screen.getByText("GitHub MCP"));
+      expect(mockRouterPush).toHaveBeenCalledWith("/mcp/registry/cat-1");
+    });
+
+    it("offers the built-in Archestra entry when it matches", () => {
+      mockUseMcpRegistryPage.mockReturnValue({
+        data: {
+          data: [
+            { id: "00000000-0000-4000-8000-000000000001", name: "Archestra" },
+          ],
+        },
+      });
+      render(<ConversationSearchPalette {...defaultProps} />);
+
+      fireEvent.change(screen.getByTestId("command-input"), {
+        target: { value: "arch" },
+      });
+
+      expect(screen.getByText("MCP Servers")).toBeInTheDocument();
+      fireEvent.click(screen.getByText("Archestra"));
+      expect(mockRouterPush).toHaveBeenCalledWith(
+        "/mcp/registry/00000000-0000-4000-8000-000000000001",
+      );
+    });
+
+    it("offers the built-in Archestra entry when it matches", () => {
+      mockUseMcpRegistryPage.mockReturnValue({
+        data: {
+          data: [
+            { id: "00000000-0000-4000-8000-000000000001", name: "Archestra" },
+          ],
+        },
+      });
+      render(<ConversationSearchPalette {...defaultProps} />);
+
+      search("arch");
+
+      expect(screen.getByText("MCP Servers")).toBeInTheDocument();
+      fireEvent.click(screen.getByText("Archestra"));
+      expect(mockRouterPush).toHaveBeenCalledWith(
+        "/mcp/registry/00000000-0000-4000-8000-000000000001",
+      );
+    });
+
+    it("finds a skill through the server search and opens it", () => {
+      mockUseSkillsPaginated.mockReturnValue({
+        data: { data: [{ id: "skill-1", name: "Invoice Parser" }] },
+      });
+      render(<ConversationSearchPalette {...defaultProps} />);
+
+      search("invoice");
+
+      fireEvent.click(screen.getByText("Invoice Parser"));
+      expect(mockRouterPush).toHaveBeenCalledWith("/skills/skill-1");
+    });
+
+    it("does not list the previous search's rows while the new one loads", () => {
+      mockUseApps.mockReturnValue({
+        data: {
+          data: [{ source: "owned", id: "app-1", name: "Expense Tracker" }],
+        },
+        isPlaceholderData: true,
+      });
+      render(<ConversationSearchPalette {...defaultProps} />);
+
+      search("weather");
+
+      expect(screen.queryByText("Expense Tracker")).not.toBeInTheDocument();
+    });
+
+    it("finds an app and opens the Apps page filtered to it", () => {
+      mockUseApps.mockReturnValue({
+        data: {
+          data: [{ source: "owned", id: "app-1", name: "Expense Tracker" }],
+        },
+      });
+      render(<ConversationSearchPalette {...defaultProps} />);
+
+      search("expense");
+
+      fireEvent.click(screen.getByText("Expense Tracker"));
+      expect(mockRouterPush).toHaveBeenCalledWith(
+        "/apps?search=Expense%20Tracker",
+      );
+    });
+
+    it("finds a project by its name and opens it", () => {
+      mockUseProjects.mockReturnValue({
+        data: { data: [{ id: "proj-1", name: "Quarterly Review" }] },
+      });
+      render(<ConversationSearchPalette {...defaultProps} />);
+
+      search("quarterly");
+
+      fireEvent.click(screen.getByText("Quarterly Review"));
+      expect(mockRouterPush).toHaveBeenCalledWith("/projects/proj-1");
+      // The server searches; the palette asks for a bounded page of matches.
+      expect(mockUseProjects).toHaveBeenLastCalledWith(
+        expect.objectContaining({ search: "quarterly", limit: 5, offset: 0 }),
+      );
+    });
+
+    it("finds a plugin by its display name and opens it", () => {
+      mockUsePlugins.mockReturnValue({
+        data: [{ id: "plug-1", displayName: "Jira Helper" }],
+      });
+      render(<ConversationSearchPalette {...defaultProps} />);
+
+      search("jira");
+
+      fireEvent.click(screen.getByText("Jira Helper"));
+      expect(mockRouterPush).toHaveBeenCalledWith("/plugins/plug-1");
+    });
+
+    it("keeps each group short so chat matches stay in view", () => {
+      mockUseMcpRegistryPage.mockReturnValue({
+        data: {
+          data: Array.from({ length: 8 }, (_, index) => ({
+            id: `cat-${index}`,
+            name: `GitHub MCP ${index}`,
+          })),
+        },
+      });
+      render(<ConversationSearchPalette {...defaultProps} />);
+
+      search("github");
+
+      expect(screen.getAllByText(/^GitHub MCP \d$/)).toHaveLength(5);
+    });
+
+    it("finds a settings tab by its label and by its path", () => {
+      render(<ConversationSearchPalette {...defaultProps} />);
+
+      search("service accounts");
+
+      expect(screen.getByText("Settings")).toBeInTheDocument();
+      fireEvent.click(screen.getByText("Service Accounts"));
+      expect(mockRouterPush).toHaveBeenCalledWith("/settings/service-accounts");
+    });
+
+    it("does not offer agents when the reader may not open the Agents page", () => {
+      vi.mocked(usePermissionMap).mockReturnValue(
+        Object.fromEntries(
+          Object.keys(requiredPagePermissionsMap).map((url) => [
+            url,
+            url !== "/agents",
+          ]),
+        ),
+      );
+      mockUseAgentOptions.mockReturnValue({
+        data: [{ id: "agent-1", name: "Support Triage" }],
+      });
+      render(<ConversationSearchPalette {...defaultProps} />);
+
+      search("triage");
+
+      expect(screen.queryByText("Support Triage")).not.toBeInTheDocument();
+    });
+
+    it.each([
+      { role: "member", offered: false },
+      { role: "admin", offered: true },
+    ] as const)("offers teams only to a reader who can see the Settings area: $role", ({
+      role,
+      offered,
+    }) => {
+      // The member baseline can read teams but has no Settings area, so the
+      // Teams page would send them away.
+      vi.mocked(usePermissionMap).mockImplementation((map) =>
+        Object.fromEntries(
+          Object.entries(map).map(([key, required]) => [
+            key,
+            hasPagePermissions({
+              userPermissions: predefinedPermissionsMap[role],
+              required,
+              capabilities: [],
+            }),
+          ]),
+        ),
+      );
+      mockUseTeams.mockImplementation(({ enabled }: { enabled: boolean }) => ({
+        data: enabled ? [{ id: "team-1", name: "Platform team" }] : [],
+      }));
+      render(<ConversationSearchPalette {...defaultProps} />);
+
+      search("team");
+
+      if (offered) {
+        expect(screen.getByText("Platform team")).toBeInTheDocument();
+        expect(
+          screen.getByTestId("cmd-item-settings-/settings/teams"),
+        ).toBeInTheDocument();
+      } else {
+        expect(screen.queryByText("Platform team")).not.toBeInTheDocument();
+        expect(
+          screen.queryByTestId("cmd-item-settings-/settings/teams"),
+        ).not.toBeInTheDocument();
+      }
+    });
+  });
+
+  it("removes the Connect destination when the saved setting hides it", () => {
+    mockUseConversations.mockReturnValue({
+      data: [],
+      isLoading: false,
+      isFetching: false,
+    });
+    const view = render(<ConversationSearchPalette {...defaultProps} />);
+    expect(screen.getByText("Connect")).toBeInTheDocument();
+    vi.mocked(useOrganization).mockReturnValue({
+      data: { connectionPageHidden: true },
+    } as ReturnType<typeof useOrganization>);
+    view.rerender(<ConversationSearchPalette {...defaultProps} />);
+    expect(screen.queryByText("Connect")).not.toBeInTheDocument();
+    expect(screen.getByText("MCP Registry")).toBeInTheDocument();
+  });
+
+  it("routes Connect to the connection page", () => {
+    // The Pages nav group (incl. Connect) renders when there are no conversations.
+    mockUseConversations.mockReturnValue({
+      data: [],
+      isLoading: false,
+      isFetching: false,
+    });
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    fireEvent.click(screen.getByText("Connect"));
+
+    expect(mockRouterPush).toHaveBeenCalledWith("/connection");
+  });
+
+  it("routes MCP Registry to the registry", () => {
+    mockUseConversations.mockReturnValue({
+      data: [],
+      isLoading: false,
+      isFetching: false,
+    });
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    fireEvent.click(screen.getByText("MCP Registry"));
+
+    expect(mockRouterPush).toHaveBeenCalledWith("/mcp/registry");
+  });
+
+  it.each([
+    { enabled: true, permitted: true },
+    { enabled: false, permitted: true },
+    { enabled: true, permitted: false },
+  ])("offers OpenAPPA Guardrails only when enabled and permitted: %j", ({
+    enabled,
+    permitted,
+  }) => {
+    vi.mocked(useFeature).mockImplementation(
+      (feature) => feature === "openappaEnabled" && enabled,
+    );
+    vi.mocked(usePermissionMap).mockReturnValue({ "/openappa": permitted });
+    mockUseConversations.mockReturnValue({
+      data: [],
+      isLoading: false,
+      isFetching: false,
+    });
+    render(<ConversationSearchPalette {...defaultProps} />);
+    fireEvent.change(screen.getByTestId("command-input"), {
+      target: { value: "openappa" },
+    });
+    if (enabled && permitted) {
+      fireEvent.click(screen.getByText("Guardrails"));
+      expect(mockRouterPush).toHaveBeenCalledWith("/openappa");
+    } else {
+      expect(screen.queryByText("Guardrails")).not.toBeInTheDocument();
+    }
+  });
+
+  it.each([
+    true,
+    false,
+  ])("offers Auto Routing only while the alpha is enabled: %s", (enabled) => {
+    vi.mocked(useFeature).mockImplementation(
+      (feature) => feature === "autoRoutingEnabled" && enabled,
+    );
+    mockUseConversations.mockReturnValue({
+      data: [],
+      isLoading: false,
+      isFetching: false,
+    });
+    render(<ConversationSearchPalette {...defaultProps} />);
+    fireEvent.change(screen.getByTestId("command-input"), {
+      target: { value: "auto routing" },
+    });
+    if (enabled) {
+      fireEvent.click(screen.getByText("Auto Routing"));
+      expect(mockRouterPush).toHaveBeenCalledWith("/llm/auto-routing");
+    } else {
+      expect(screen.queryByText("Auto Routing")).not.toBeInTheDocument();
+    }
+  });
+
+  it("searches pages by their visible labels and navigates to a match", () => {
+    mockUseConversations.mockReturnValue({
+      data: [],
+      isLoading: false,
+      isFetching: true,
+    });
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    fireEvent.change(screen.getByTestId("command-input"), {
+      target: { value: "registry" },
+    });
+
+    expect(screen.getByText("Pages")).toBeInTheDocument();
+    expect(screen.getByText("MCP Registry")).toBeInTheDocument();
+    expect(screen.queryByText("Agents")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("MCP Registry"));
+    expect(mockRouterPush).toHaveBeenCalledWith("/mcp/registry");
+  });
+
+  it("searches pages by navigation keywords", () => {
+    mockUseConversations.mockReturnValue({
+      data: [],
+      isLoading: false,
+      isFetching: false,
+    });
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    fireEvent.change(screen.getByTestId("command-input"), {
+      target: { value: "catalog" },
+    });
+
+    expect(screen.getByText("MCP Registry")).toBeInTheDocument();
+    expect(screen.queryByText("Agents")).not.toBeInTheDocument();
+  });
+
+  it("leaves out a page the reader may not open", () => {
+    mockUseConversations.mockReturnValue({
+      data: [],
+      isLoading: false,
+      isFetching: false,
+    });
+    vi.mocked(usePermissionMap).mockReturnValue(
+      Object.fromEntries(
+        Object.keys(requiredPagePermissionsMap).map((url) => [
+          url,
+          url !== "/mcp/registry",
+        ]),
+      ),
+    );
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    // Its siblings are gated separately and stay, so this is the permission
+    // check and not an empty list.
+    expect(screen.getByText("MCP Gateways")).toBeInTheDocument();
+    expect(screen.queryByText("MCP Registry")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    { role: "member", offered: false },
+    { role: "editor", offered: true },
+  ] as const)("offers Settings only to a reader who can see the Settings area: $role", ({
+    role,
+    offered,
+  }) => {
+    // Both of the hook's permission maps resolved from the role itself.
+    vi.mocked(usePermissionMap).mockImplementation((map) =>
+      Object.fromEntries(
+        Object.entries(map).map(([key, required]) => [
+          key,
+          hasPagePermissions({
+            userPermissions: predefinedPermissionsMap[role],
+            required,
+            capabilities: [],
+          }),
+        ]),
+      ),
+    );
+    mockUseConversations.mockReturnValue({
+      data: [],
+      isLoading: false,
+      isFetching: false,
+    });
+    render(<ConversationSearchPalette {...defaultProps} />);
+    fireEvent.change(screen.getByTestId("command-input"), {
+      target: { value: "settings" },
+    });
+
+    if (offered) {
+      expect(screen.getByText("Settings")).toBeInTheDocument();
+    } else {
+      expect(screen.queryByText("Settings")).not.toBeInTheDocument();
+    }
+  });
+
+  it("shows page matches alongside matching chats", () => {
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    fireEvent.change(screen.getByTestId("command-input"), {
+      target: { value: "agent" },
+    });
+
+    expect(screen.getByText("Pages")).toBeInTheDocument();
+    expect(screen.getByText("First conversation")).toBeInTheDocument();
+    expect(screen.getByText("Second conversation")).toBeInTheDocument();
+    expect(screen.getByText("Chats")).toBeInTheDocument();
+  });
+
+  it("reports an empty unified search only when no chat or page matches", () => {
+    mockUseConversations.mockReturnValue({
+      data: [],
+      isLoading: false,
+      isFetching: false,
+    });
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    fireEvent.change(screen.getByTestId("command-input"), {
+      target: { value: "nothing-matches-this" },
+    });
+
+    expect(screen.getByText("No results found.")).toBeInTheDocument();
+  });
+
+  it("does not show the recent chats empty state in the full search palette", () => {
+    mockUseConversations.mockReturnValue({
+      data: [],
+      isLoading: false,
+      isFetching: false,
+    });
+
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    expect(screen.getByText("New chat")).toBeInTheDocument();
+    expect(screen.getByText("Pages")).toBeInTheDocument();
+  });
+
+  describe("with more recent chats than fit before the pages", () => {
+    beforeEach(() => {
+      mockUseConversations.mockReturnValue({
+        data: Array.from({ length: 8 }, (_, index) => ({
+          id: `recent-${index}`,
+          title: `Recent chat ${index}`,
+          updatedAt: new Date(Date.now() - index * 60_000).toISOString(),
+          lastMessageAt: new Date(Date.now() - index * 60_000).toISOString(),
+          messages: [],
+        })),
+        isLoading: false,
+        isFetching: false,
+      });
+    });
+
+    it("lists the five newest and points to search for the rest", () => {
+      render(<ConversationSearchPalette {...defaultProps} />);
+
+      expect(screen.getByText("Recent chat 4")).toBeInTheDocument();
+      expect(screen.queryByText("Recent chat 5")).not.toBeInTheDocument();
+      expect(
+        screen.getByText("Type to search older chats"),
+      ).toBeInTheDocument();
+      expect(screen.getByText("Pages")).toBeInTheDocument();
+    });
+
+    it("finds an older chat by typing", () => {
+      render(<ConversationSearchPalette {...defaultProps} />);
+
+      fireEvent.change(screen.getByTestId("command-input"), {
+        target: { value: "Recent chat" },
+      });
+
+      expect(screen.getByText("Recent chat 7")).toBeInTheDocument();
+    });
+  });
+
   it("redirects to /chat when deleting the currently viewed conversation", () => {
-    mockUsePathname.mockReturnValue("/chat/conv-1");
+    vi.mocked(usePathname).mockReturnValue("/chat/conv-1");
 
     render(<ConversationSearchPalette {...defaultProps} />);
 
@@ -201,10 +1134,10 @@ describe("ConversationSearchPalette", () => {
     });
 
     // Press 'd' once to enter pending deletion state
-    fireEvent.keyDown(window, { key: "d", code: "KeyD" });
+    fireEvent.keyDown(window, { key: "d", code: "KeyD", altKey: true });
 
     // Press 'd' again to confirm deletion
-    fireEvent.keyDown(window, { key: "d", code: "KeyD" });
+    fireEvent.keyDown(window, { key: "d", code: "KeyD", altKey: true });
 
     // Should have called deleteMutation.mutate with the conversation ID
     expect(mockDeleteMutate).toHaveBeenCalledWith(
@@ -217,7 +1150,7 @@ describe("ConversationSearchPalette", () => {
   });
 
   it("does not redirect when deleting a conversation that is not currently viewed", () => {
-    mockUsePathname.mockReturnValue("/chat/conv-2");
+    vi.mocked(usePathname).mockReturnValue("/chat/conv-2");
 
     render(<ConversationSearchPalette {...defaultProps} />);
 
@@ -227,10 +1160,10 @@ describe("ConversationSearchPalette", () => {
     });
 
     // Press 'd' once to enter pending deletion state
-    fireEvent.keyDown(window, { key: "d", code: "KeyD" });
+    fireEvent.keyDown(window, { key: "d", code: "KeyD", altKey: true });
 
     // Press 'd' again to confirm deletion
-    fireEvent.keyDown(window, { key: "d", code: "KeyD" });
+    fireEvent.keyDown(window, { key: "d", code: "KeyD", altKey: true });
 
     // Should have called deleteMutation.mutate
     expect(mockDeleteMutate).toHaveBeenCalledWith(
@@ -251,8 +1184,8 @@ describe("ConversationSearchPalette", () => {
     });
 
     // Press 'd' twice to delete
-    fireEvent.keyDown(window, { key: "d", code: "KeyD" });
-    fireEvent.keyDown(window, { key: "d", code: "KeyD" });
+    fireEvent.keyDown(window, { key: "d", code: "KeyD", altKey: true });
+    fireEvent.keyDown(window, { key: "d", code: "KeyD", altKey: true });
 
     expect(mockDeleteMutate).toHaveBeenCalledWith(
       "conv-1",
@@ -270,17 +1203,43 @@ describe("ConversationSearchPalette", () => {
     });
 
     // Press 'd' once → pending state
-    fireEvent.keyDown(window, { key: "d", code: "KeyD" });
+    fireEvent.keyDown(window, { key: "d", code: "KeyD", altKey: true });
     // Press 'd' again → confirms deletion
-    fireEvent.keyDown(window, { key: "d", code: "KeyD" });
+    fireEvent.keyDown(window, { key: "d", code: "KeyD", altKey: true });
 
     expect(mockDeleteMutate).toHaveBeenCalledTimes(1);
 
     // Rapid third 'd' press in the same frame — should be ignored
     // because the ref guard prevents double-deletion before React re-renders
-    fireEvent.keyDown(window, { key: "d", code: "KeyD" });
+    fireEvent.keyDown(window, { key: "d", code: "KeyD", altKey: true });
 
     expect(mockDeleteMutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores bare character keys — shortcuts require the Alt modifier", () => {
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    act(() => {
+      capturedOnValueChange?.("conv-conv-1");
+    });
+
+    // Bare "d" (no modifier) must not trigger deletion (WCAG 2.1.4)
+    fireEvent.keyDown(window, { key: "d", code: "KeyD" });
+    fireEvent.keyDown(window, { key: "d", code: "KeyD" });
+
+    expect(mockDeleteMutate).not.toHaveBeenCalled();
+  });
+
+  it("announces the delete confirmation prompt via a live region", () => {
+    render(<ConversationSearchPalette {...defaultProps} />);
+
+    act(() => {
+      capturedOnValueChange?.("conv-conv-1");
+    });
+
+    fireEvent.keyDown(window, { key: "d", code: "KeyD", altKey: true });
+
+    expect(screen.getByRole("status")).toHaveTextContent("again to confirm");
   });
 
   it("navigates to conversation when selecting it", () => {
@@ -292,6 +1251,26 @@ describe("ConversationSearchPalette", () => {
     expect(mockRouterPush).toHaveBeenCalledWith("/chat/conv-1");
   });
 
+  it("reopens a policy conversation in chat", () => {
+    mockUseConversations.mockReturnValue({
+      data: [
+        {
+          id: "policy-1",
+          title: "Review policy",
+          origin: "user",
+          updatedAt: new Date().toISOString(),
+          lastMessageAt: new Date().toISOString(),
+          messages: [],
+        },
+      ],
+      isLoading: false,
+      isFetching: false,
+    });
+    render(<ConversationSearchPalette {...defaultProps} />);
+    fireEvent.click(screen.getByTestId("cmd-item-conv-policy-1"));
+    expect(mockRouterPush).toHaveBeenCalledWith("/chat/policy-1");
+  });
+
   it("navigates to /chat when selecting new chat", () => {
     render(<ConversationSearchPalette {...defaultProps} />);
 
@@ -300,13 +1279,51 @@ describe("ConversationSearchPalette", () => {
     expect(mockRouterPush).toHaveBeenCalledWith("/chat");
   });
 
-  it("navigates to LLM credentials when selecting Credentials", () => {
+  it("offers a new encrypted chat only when the feature is enabled", () => {
+    const { rerender } = render(
+      <ConversationSearchPalette {...defaultProps} />,
+    );
+    expect(screen.queryByText("New encrypted chat")).not.toBeInTheDocument();
+
+    vi.mocked(useFeature).mockReturnValue(true);
+    rerender(<ConversationSearchPalette {...defaultProps} />);
+
+    fireEvent.click(screen.getByText("New encrypted chat"));
+    expect(mockRouterPush).toHaveBeenCalledWith("/chat?encryptedChat=1");
+  });
+
+  it("shows the project a chat belongs to, like the sidebar does", () => {
+    mockUseConversations.mockReturnValue({
+      data: [
+        {
+          id: "conv-1",
+          title: "First conversation",
+          updatedAt: new Date().toISOString(),
+          lastMessageAt: new Date().toISOString(),
+          messages: [],
+          projectId: "project-1",
+          projectName: "Acme Redesign",
+        },
+      ],
+      isLoading: false,
+      isFetching: false,
+    });
+
     render(<ConversationSearchPalette {...defaultProps} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Credentials" }));
-
-    expect(mockRouterPush).toHaveBeenCalledWith(
-      "/llm/credentials/virtual-keys",
+    expect(screen.getByText("Acme Redesign")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Open project Acme Redesign" }),
     );
+    expect(mockRouterPush).toHaveBeenCalledWith("/projects/project-1");
+    expect(defaultProps.onOpenChange).toHaveBeenCalledWith(false);
+    expect(mockRouterPush).not.toHaveBeenCalledWith("/chat/conv-1");
+  });
+
+  it("does not offer the removed Client Credentials destination", () => {
+    render(<ConversationSearchPalette {...defaultProps} />);
+    expect(
+      screen.queryByRole("button", { name: "Client Credentials" }),
+    ).not.toBeInTheDocument();
   });
 });

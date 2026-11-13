@@ -1,11 +1,11 @@
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
 import {
   type archestraApiTypes,
-  IDENTITY_PROVIDER_ID,
   type IdentityProviderFormValues,
   isEntraHostname,
   isOktaHostname,
   OAUTH_TOKEN_TYPE,
-} from "@shared";
+} from "@archestra/shared";
 
 export type EnterpriseSubjectTokenType = NonNullable<
   NonNullable<
@@ -19,22 +19,27 @@ export function normalizeIdentityProviderFormValues(
   data: IdentityProviderFormValues,
 ): IdentityProviderFormValues {
   if (data.providerType !== "oidc" || !data.oidcConfig) {
-    return normalizeAllowedEmailDomains(data);
+    return data;
   }
 
-  const normalizedData = normalizeAllowedEmailDomains(data);
-  const oidcConfig = normalizeOidcIssuerFields(normalizedData);
-  const enterpriseManagedCredentials = oidcConfig.enterpriseManagedCredentials;
+  const issuerNormalizedConfig = normalizeOidcIssuerFields(data);
+  const enterpriseManagedCredentials = withoutBlankEntraAgentId(
+    issuerNormalizedConfig.enterpriseManagedCredentials,
+  );
+  const oidcConfig = {
+    ...issuerNormalizedConfig,
+    enterpriseManagedCredentials,
+  };
   if (!enterpriseManagedCredentials) {
     return {
-      ...normalizedData,
+      ...data,
       oidcConfig,
     };
   }
 
   const inferredExchangeType = inferEnterpriseExchangeType({
-    issuer: normalizedData.issuer,
-    providerId: normalizedData.providerId,
+    issuer: data.issuer,
+    providerId: data.providerId,
   });
 
   const hasConfiguredEnterpriseManagedFields = Object.values(
@@ -49,7 +54,7 @@ export function normalizeIdentityProviderFormValues(
 
   if (!hasConfiguredEnterpriseManagedFields) {
     return {
-      ...normalizedData,
+      ...data,
       oidcConfig,
     };
   }
@@ -58,7 +63,7 @@ export function normalizeIdentityProviderFormValues(
     enterpriseManagedCredentials.exchangeStrategy || inferredExchangeType;
 
   return {
-    ...normalizedData,
+    ...data,
     oidcConfig: normalizeOidcConfigForEnterpriseExchange({
       oidcConfig,
       exchangeStrategy,
@@ -78,19 +83,6 @@ export function normalizeIdentityProviderFormValues(
   };
 }
 
-export function normalizeAllowedEmailDomains(
-  data: IdentityProviderFormValues,
-): IdentityProviderFormValues {
-  if (data.providerId === IDENTITY_PROVIDER_ID.GOOGLE) {
-    return data;
-  }
-
-  return {
-    ...data,
-    domain: "",
-  };
-}
-
 export function normalizeOidcIssuerFields(
   data: IdentityProviderFormValues,
 ): NonNullable<IdentityProviderFormValues["oidcConfig"]> {
@@ -100,20 +92,11 @@ export function normalizeOidcIssuerFields(
   }
 
   const issuer = data.issuer.trim();
-  const previousIssuer = oidcConfig.issuer?.trim() ?? "";
-  const discoveryEndpoint = oidcConfig.discoveryEndpoint?.trim() ?? "";
-  const defaultPreviousDiscoveryEndpoint = previousIssuer
-    ? getDefaultDiscoveryEndpoint(previousIssuer)
-    : "";
 
   return {
     ...oidcConfig,
     issuer,
-    discoveryEndpoint:
-      !discoveryEndpoint ||
-      discoveryEndpoint === defaultPreviousDiscoveryEndpoint
-        ? getDefaultDiscoveryEndpoint(issuer)
-        : discoveryEndpoint,
+    discoveryEndpoint: resolveDiscoveryEndpoint({ oidcConfig, issuer }),
   };
 }
 
@@ -155,6 +138,39 @@ function tryParseIssuerUrl(issuer: string): URL | null {
   }
 }
 
+/**
+ * Keeps the discovery endpoint in step with the issuer the admin typed.
+ *
+ * A blank field, or one still holding the previous issuer's default, is
+ * re-derived from the new issuer so renaming the issuer doesn't leave a stale
+ * URL behind; anything the admin typed themselves is left alone.
+ *
+ * The exception is a provider registered with `skipDiscovery`: it has no
+ * discovery document to point at, so a blank field means "there isn't one" and
+ * must stay blank. Deriving `${issuer}/.well-known/openid-configuration` there
+ * produces a URL the IdP does not serve — GitHub answers 404 — and registration
+ * fails before any of the manually configured endpoints are reached.
+ */
+function resolveDiscoveryEndpoint(params: {
+  oidcConfig: NonNullable<IdentityProviderFormValues["oidcConfig"]>;
+  issuer: string;
+}): string {
+  const discoveryEndpoint = params.oidcConfig.discoveryEndpoint?.trim() ?? "";
+  if (!discoveryEndpoint && params.oidcConfig.skipDiscovery) {
+    return "";
+  }
+
+  const previousIssuer = params.oidcConfig.issuer?.trim() ?? "";
+  const defaultPreviousDiscoveryEndpoint = previousIssuer
+    ? getDefaultDiscoveryEndpoint(previousIssuer)
+    : "";
+
+  return !discoveryEndpoint ||
+    discoveryEndpoint === defaultPreviousDiscoveryEndpoint
+    ? getDefaultDiscoveryEndpoint(params.issuer)
+    : discoveryEndpoint;
+}
+
 function getDefaultDiscoveryEndpoint(issuer: string): string {
   return `${issuer.replace(/\/$/, "")}/.well-known/openid-configuration`;
 }
@@ -173,6 +189,38 @@ export function getDefaultSubjectTokenType(
   return exchangeStrategy === "rfc8693" || exchangeStrategy === "entra_obo"
     ? OAUTH_TOKEN_TYPE.AccessToken
     : OAUTH_TOKEN_TYPE.IdToken;
+}
+
+type EnterpriseManagedCredentialsFormValues = NonNullable<
+  NonNullable<
+    IdentityProviderFormValues["oidcConfig"]
+  >["enterpriseManagedCredentials"]
+>;
+
+/**
+ * Drops an Entra Agent ID block without a blueprint client ID (the section was
+ * left empty), and its blank optional fields, so an untouched section neither
+ * fails validation nor turns enterprise-managed credentials on by itself.
+ */
+function withoutBlankEntraAgentId(
+  credentials: EnterpriseManagedCredentialsFormValues | undefined,
+): EnterpriseManagedCredentialsFormValues | undefined {
+  if (!credentials?.entraAgentId) return credentials;
+  const { entraAgentId, ...rest } = credentials;
+  const blueprintClientId = entraAgentId.blueprintClientId?.trim() ?? "";
+  if (!blueprintClientId) {
+    return Object.keys(rest).length > 0 ? rest : undefined;
+  }
+
+  const cleaned = Object.fromEntries(
+    Object.entries(entraAgentId)
+      .map(([key, value]) => [
+        key,
+        typeof value === "string" ? value.trim() : value,
+      ])
+      .filter(([, value]) => value !== "" && value !== undefined),
+  ) as typeof entraAgentId;
+  return { ...rest, entraAgentId: { ...cleaned, blueprintClientId } };
 }
 
 function normalizeOidcConfigForEnterpriseExchange(params: {
@@ -199,10 +247,9 @@ function normalizeOidcConfigForEnterpriseExchange(params: {
     mapping: {
       ...oidcConfig.mapping,
       id: oidcConfig.mapping?.id ?? "sub",
-      email:
-        !oidcConfig.mapping?.email || oidcConfig.mapping.email === "email"
-          ? "preferred_username"
-          : oidcConfig.mapping.email,
+      email: !oidcConfig.mapping?.email
+        ? "preferred_username"
+        : oidcConfig.mapping.email,
       name: oidcConfig.mapping?.name ?? "name",
     },
     enterpriseManagedCredentials: params.enterpriseManagedCredentials,

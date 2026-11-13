@@ -1,10 +1,12 @@
-import { isEntraHostname, isOktaHostname } from "@shared";
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+import { isEntraHostname, isOktaHostname } from "@archestra/shared";
 import logger from "@/logging";
 import {
   type ExternalIdentityProviderConfig,
   findExternalIdentityProviderById,
 } from "@/services/identity-providers/oidc";
 import type {
+  EnterpriseCredentialClientType,
   EnterpriseManagedCredentialConfig,
   EnterpriseManagedCredentialType,
 } from "@/types";
@@ -16,6 +18,14 @@ export interface EnterpriseCredentialExchangeParams {
   identityProvider: ExternalIdentityProviderConfig;
   assertion: string;
   enterpriseManagedConfig: EnterpriseManagedCredentialConfig;
+  /**
+   * The calling agent's Entra agent identity (its app ID). `null` for a caller
+   * (agent or app) with none; `undefined` when no agent is calling, such as
+   * install-time tool discovery, which the blueprint's "require an agent
+   * identity" setting does not apply to. Only the Entra On-Behalf-Of strategy
+   * acts on it.
+   */
+  entraAgentIdentityId?: string | null;
 }
 
 export type EnterpriseManagedCredentialResult = {
@@ -23,6 +33,13 @@ export type EnterpriseManagedCredentialResult = {
   expiresInSeconds: number | null;
   value: string | Record<string, unknown>;
   issuedTokenType: string | null;
+  /** The client the credential was issued to, when the strategy knows it. */
+  issuedTo?: EnterpriseCredentialIssuedTo;
+};
+
+export type EnterpriseCredentialIssuedTo = {
+  clientId: string;
+  clientType: EnterpriseCredentialClientType;
 };
 
 export interface EnterpriseCredentialExchangeStrategy {
@@ -35,6 +52,7 @@ export async function exchangeEnterpriseManagedCredential(params: {
   identityProviderId: string;
   assertion: string;
   enterpriseManagedConfig: EnterpriseManagedCredentialConfig;
+  entraAgentIdentityId?: string | null;
 }): Promise<EnterpriseManagedCredentialResult> {
   const identityProvider = await findExternalIdentityProviderById(
     params.identityProviderId,
@@ -61,6 +79,7 @@ export async function exchangeEnterpriseManagedCredential(params: {
     identityProvider,
     assertion: params.assertion,
     enterpriseManagedConfig: params.enterpriseManagedConfig,
+    entraAgentIdentityId: params.entraAgentIdentityId,
   });
 }
 

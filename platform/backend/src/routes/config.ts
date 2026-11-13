@@ -1,19 +1,41 @@
-import { readFileSync } from "node:fs";
-import { RouteId, SupportedProvidersSchema } from "@shared";
+import {
+  ContextualRetrievalModeSchema,
+  RouteId,
+  SupportedProvidersSchema,
+} from "@archestra/shared";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
 import { getEmailProviderInfo } from "@/agents/incoming-email";
+import { isAnthropicKeylessAuthEnabled } from "@/clients/anthropic-keyless-auth";
+import { anthropicWorkloadIdentity } from "@/clients/anthropic-workload-identity";
 import { isAzureOpenAiEntraIdEnabled } from "@/clients/azure-openai-credentials";
 import { isBedrockIamAuthEnabled } from "@/clients/bedrock-credentials";
-import { isVertexAiEnabled } from "@/clients/gemini-client";
+import { isVertexAiEnabled } from "@/clients/gemini-vertex-ai";
 import config from "@/config";
+import { isEncryptedChatEnabled } from "@/content-encryption/encrypted-chat";
+import { enterpriseTier } from "@/enterprise-tier";
 import { McpServerRuntimeManager } from "@/k8s/mcp-server-runtime";
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+// biome-ignore lint/style/noRestrictedImports: runtime-gated EE model import
+import { isIdleHibernationOffered } from "@/k8s/mcp-server-runtime/hibernation.ee";
+// SPDX-SnippetEnd
+import {
+  getGoogleDriveOAuthRedirectUri,
+  isGoogleDriveOAuthConfigured,
+} from "@/knowledge-base/connectors/gdrive/gdrive-oauth";
+import logger from "@/logging";
 import { OrganizationModel } from "@/models";
-import { getByosVaultKvVersion, isByosEnabled } from "@/secrets-manager";
-import { EmailProviderTypeSchema, type GlobalToolPolicy } from "@/types";
+import { ngrokTunnelManager } from "@/ngrok-tunnel-manager";
+import { registerProcessLocalCache } from "@/process-local-cache-registry";
+import { isAnyAgentRuntimeBackendDriverEnabled } from "@/services/agent-runtime/backends";
+import { devFeedbackService } from "@/services/dev-feedback";
+import { skillSandboxRuntimeService } from "@/skills-sandbox/skill-sandbox-runtime-service";
+import { EmailProviderTypeSchema } from "@/types";
 import { PUBLIC_CONFIG_PATH } from "./route-paths";
 
-const configRoutes: FastifyPluginAsyncZod = async (fastify) => {
+export const publicConfigRoutes: FastifyPluginAsyncZod = async (fastify) => {
   fastify.get(
     PUBLIC_CONFIG_PATH,
     {
@@ -22,28 +44,18 @@ const configRoutes: FastifyPluginAsyncZod = async (fastify) => {
         description: "Get public config",
         tags: ["Config"],
         response: {
-          200: z.strictObject({
-            disableBasicAuth: z.boolean(),
-            disableInvitations: z.boolean(),
-            analytics: z.strictObject({
-              enabled: z.boolean(),
-              posthog: z.strictObject({
-                key: z.string(),
-                host: z.string(),
-              }),
-            }),
-          }),
+          200: PublicConfigResponseSchema,
         },
       },
     },
     async (_request, reply) => {
-      return reply.send({
-        disableBasicAuth: config.auth.disableBasicAuth,
-        disableInvitations: config.auth.disableInvitations,
-        analytics: config.analytics,
-      });
+      return reply.send(await getPublicConfigResponse());
     },
   );
+};
+
+const configRoutes: FastifyPluginAsyncZod = async (fastify) => {
+  await fastify.register(publicConfigRoutes);
 
   fastify.get(
     "/api/config",
@@ -53,108 +65,348 @@ const configRoutes: FastifyPluginAsyncZod = async (fastify) => {
         description: "Get platform configuration and feature flags",
         tags: ["Config"],
         response: {
-          200: z.strictObject({
-            enterpriseFeatures: z.strictObject({
-              core: z.boolean(),
-              knowledgeBase: z.boolean(),
-              fullWhiteLabeling: z.boolean(),
-            }),
-            features: z.strictObject({
-              orchestratorK8sRuntime: z.boolean(),
-              advancedToolFeaturesEnabled: z.boolean(),
-              byosEnabled: z.boolean(),
-              byosVaultKvVersion: z.enum(["1", "2"]).nullable(),
-              azureOpenAiEntraIdEnabled: z.boolean(),
-              bedrockIamAuthEnabled: z.boolean(),
-              geminiVertexAiEnabled: z.boolean(),
-              globalToolPolicy: z.enum(["permissive", "restrictive"]),
-              incomingEmail: z.object({
-                enabled: z.boolean(),
-                provider: EmailProviderTypeSchema.optional(),
-                displayName: z.string().optional(),
-                emailDomain: z.string().optional(),
-              }),
-              mcpServerBaseImage: z.string(),
-              orchestratorK8sNamespace: z.string(),
-              isQuickstart: z.boolean(),
-              ngrokDomain: z.string(),
-              virtualKeyDefaultExpirationSeconds: z.number(),
-              mcpSandboxDomain: z.string().nullable(),
-            }),
-            providerBaseUrls: z.record(
-              SupportedProvidersSchema,
-              z.string().nullable(),
-            ),
-          }),
+          200: ConfigResponseSchema,
         },
       },
     },
-    async (_request, reply) => {
-      // Get global tool policy from first organization (fallback to permissive)
-      const org = await OrganizationModel.getFirst();
-      const globalToolPolicy: GlobalToolPolicy =
-        org?.globalToolPolicy ?? "permissive";
-
-      return reply.send({
-        enterpriseFeatures: {
-          core: config.enterpriseFeatures.core,
-          knowledgeBase: config.enterpriseFeatures.knowledgeBase,
-          fullWhiteLabeling: config.enterpriseFeatures.fullWhiteLabeling,
-        },
-        features: {
-          orchestratorK8sRuntime: McpServerRuntimeManager.isEnabled,
-          advancedToolFeaturesEnabled:
-            config.agents.advancedToolFeaturesEnabled,
-          byosEnabled: isByosEnabled(),
-          byosVaultKvVersion: getByosVaultKvVersion(),
-          azureOpenAiEntraIdEnabled: isAzureOpenAiEntraIdEnabled(),
-          bedrockIamAuthEnabled: isBedrockIamAuthEnabled(),
-          geminiVertexAiEnabled: isVertexAiEnabled(),
-          globalToolPolicy,
-          incomingEmail: getEmailProviderInfo(),
-          mcpServerBaseImage: config.orchestrator.mcpServerBaseImage,
-          orchestratorK8sNamespace: config.orchestrator.kubernetes.namespace,
-          isQuickstart: config.isQuickstart,
-          ngrokDomain: getNgrokDomain(),
-          virtualKeyDefaultExpirationSeconds:
-            config.llmProxy.virtualKeyDefaultExpirationSeconds,
-          mcpSandboxDomain: config.mcpSandbox.domain,
-        },
-        providerBaseUrls: {
-          openai: config.llm.openai.baseUrl || null,
-          openrouter: config.llm.openrouter.baseUrl || null,
-          anthropic: config.llm.anthropic.baseUrl || null,
-          gemini: config.llm.gemini.baseUrl || null,
-          bedrock: config.llm.bedrock.baseUrl || null,
-          cohere: config.llm.cohere.baseUrl || null,
-          cerebras: config.llm.cerebras.baseUrl || null,
-          mistral: config.llm.mistral.baseUrl || null,
-          perplexity: config.llm.perplexity.baseUrl || null,
-          groq: config.llm.groq.baseUrl || null,
-          xai: config.llm.xai.baseUrl || null,
-          vllm: config.llm.vllm.baseUrl || null,
-          ollama: config.llm.ollama.baseUrl || null,
-          zhipuai: config.llm.zhipuai.baseUrl || null,
-          minimax: config.llm.minimax.baseUrl || null,
-          deepseek: config.llm.deepseek.baseUrl || null,
-          azure: config.llm.azure.baseUrl || null,
-        },
-      });
-    },
+    async (_request, reply) => reply.send(getConfigResponse()),
   );
 };
 
 export default configRoutes;
 
-/**
- * Get the ngrok domain from env var or from the file written by the
- * detect-ngrok-domain.sh script (for dynamically assigned domains).
- */
-function getNgrokDomain(): string {
-  if (config.ngrokDomain) return config.ngrokDomain;
+export const ConfigResponseSchema = z.strictObject({
+  /** The running platform version, as `/health` reports it. */
+  version: z.string(),
+  enterpriseFeatures: z.strictObject({
+    core: z.boolean(),
+    knowledgeBase: z.boolean(),
+    fullWhiteLabeling: z.boolean(),
+  }),
+  smallTeamTier: z.strictObject({
+    threshold: z.number(),
+    userCount: z.number(),
+    smallTeam: z.boolean(),
+    envFlag: z.boolean(),
+    communicate: z.boolean(),
+  }),
+  features: z.strictObject({
+    betaEnabled: z.boolean(),
+    orchestratorK8sRuntime: z.boolean(),
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Deployment-level gate for MCP idle hibernation (the beta flag
+    // AND the operator kill switch); the licence and the
+    // organization toggle sit behind it.
+    mcpIdleHibernationBetaEnabled: z.boolean(),
+    /** BETA: MCP registry attention and alert dismissal surfaces. */
+    // SPDX-SnippetEnd
+    sandbox: z.boolean(),
+    /**
+     * Delegated Agent tasks in dedicated runtimes.
+     * True only when the cluster serves the Agent Sandbox API — the
+     * UI must not offer to start a runtime nothing can schedule.
+     */
+    agentRuntime: z.boolean(),
+    /** Maintained catalog image per template, as this deployment pulls it. */
+    agentRuntimeCatalogImages: z.record(z.string(), z.string()),
+    /** Operator-owned defaults and health for the runtime backend. */
+    agentRuntimeBackend: z.object({
+      name: z.literal("kubernetes"),
+      available: z.boolean(),
+      defaultTtlHours: z.number(),
+      defaultIdleTimeoutMinutes: z.number(),
+      allowPrivileged: z.boolean(),
+    }),
+    plugins: z.boolean(),
+    // Max size of a file the sandbox can stage. The chat composer caps
+    // sandbox-routed uploads at this instead of guessing.
+    sandboxArtifactBytesLimit: z.number(),
+    // Max size of a chat upload the conversation can store (Files
+    // panel). Bounds the composer's file picker and its per-file
+    // policy; independent of what the sandbox can stage.
+    chatAttachmentStorageBytesLimit: z.number(),
+    // Request body ceiling. A turn's attachments travel base64-encoded
+    // in one request, so the composer needs this to stop a send that
+    // the body parser would reject with an opaque 413.
+    apiBodyLimitBytes: z.number(),
+
+    azureOpenAiEntraIdEnabled: z.boolean(),
+    anthropicWifEnabled: z.boolean(),
+    anthropicKeylessAuthEnabled: z.boolean(),
+    anthropicVertexAiEnabled: z.boolean(),
+    bedrockIamAuthEnabled: z.boolean(),
+    geminiVertexAiEnabled: z.boolean(),
+    incomingEmail: z.object({
+      enabled: z.boolean(),
+      provider: EmailProviderTypeSchema.optional(),
+      displayName: z.string().optional(),
+      emailDomain: z.string().optional(),
+    }),
+    mcpServerBaseImage: z.string(),
+    orchestratorK8sNamespace: z.string(),
+    environmentNamespaces: z.array(z.string()),
+    isQuickstart: z.boolean(),
+    ngrokDomain: z.string(),
+    virtualKeyDefaultExpirationSeconds: z.number(),
+    mcpSandboxDomain: z.string().nullable(),
+    maintenanceMode: z.string().nullable(),
+    chatSecretScanEnabled: z.boolean(),
+    encryptedChatEnabled: z.boolean(),
+    openappaEnabled: z.boolean(),
+    agentHooksEnabled: z.boolean(),
+    chatopsTelegramEnabled: z.boolean(),
+    /** BETA: auto-sync-permissions connector visibility and its Permissions tab UI. */
+    kbMfilesConnectorEnabled: z.boolean(),
+    /** BETA: the Model Pools page and pool routing. */
+    llmModelPoolsEnabled: z.boolean(),
+    kbMfilesOauthEnabled: z.boolean(),
+    /**
+     * The BM25 tuning constants an organization inherits until it
+     * sets its own in Knowledge settings; the settings tab shows them
+     * as the effective values wherever the organization has not.
+     */
+    kbBm25DefaultK1: z.number(),
+    kbBm25DefaultB: z.number(),
+    /**
+     * Effective fallback for organizations that have not selected a
+     * contextual retrieval mode in Knowledge settings.
+     */
+    kbContextualRetrievalDefaultMode: ContextualRetrievalModeSchema,
+    /**
+     * Individual ("connect my own Drive") auth for the Google Drive
+     * knowledge connector. `redirectUri` is the exact string that
+     * has to be registered on the Google OAuth client, so the setup
+     * UI can state it instead of leaving an admin to work out how
+     * this deployment composes its own URL.
+     */
+    kbGoogleDriveOAuth: z.object({
+      configured: z.boolean(),
+      redirectUri: z.string(),
+    }),
+    /**
+     * BETA: publish local Skills over gateways and project Skills
+     * discovered from installed MCP servers.
+     */
+    mcpGatewaySkillsEnabled: z.boolean(),
+    /** Internal UI feedback overlay; on only where its Slack channel is set. */
+    devFeedbackEnabled: z.boolean(),
+    /** ALPHA: the Unified Model API's "auto" model and its settings. */
+    autoRoutingEnabled: z.boolean(),
+  }),
+  providerBaseUrls: z.record(SupportedProvidersSchema, z.string().nullable()),
+});
+
+export function getConfigResponse(): z.infer<typeof ConfigResponseSchema> {
+  const tier = enterpriseTier.getState();
+
+  return {
+    version: config.api.version,
+    enterpriseFeatures: {
+      core: tier.coreActive,
+      knowledgeBase: tier.knowledgeBaseActive,
+      fullWhiteLabeling: config.enterpriseFeatures.fullWhiteLabeling,
+    },
+    smallTeamTier: {
+      threshold: tier.threshold,
+      userCount: tier.userCount,
+      smallTeam: tier.smallTeam,
+      envFlag: tier.envFlag,
+      communicate: tier.communicate,
+    },
+    features: {
+      betaEnabled: config.beta,
+      orchestratorK8sRuntime: McpServerRuntimeManager.isEnabled,
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      // The whole deployment-level gate, not the beta flag alone: an
+      // operator's hard kill switch must take the settings toggle and the
+      // per-server control with it, or the UI renders an operational
+      // feature nothing behind it will ever run.
+      mcpIdleHibernationBetaEnabled: isIdleHibernationOffered(),
+      // SPDX-SnippetEnd
+      sandbox: skillSandboxRuntimeService.isEnabled,
+      agentRuntime: isAnyAgentRuntimeBackendDriverEnabled(),
+      agentRuntimeCatalogImages: config.agentRuntime.catalogImages,
+      agentRuntimeBackend: {
+        name: "kubernetes" as const,
+        available: isAnyAgentRuntimeBackendDriverEnabled(),
+        defaultTtlHours: config.agentRuntime.defaultTtlHours,
+        defaultIdleTimeoutMinutes:
+          config.agentRuntime.defaultIdleTimeoutMinutes,
+        allowPrivileged: config.agentRuntime.allowPrivileged,
+      },
+      plugins: true,
+      sandboxArtifactBytesLimit: config.skillsSandbox.artifactBytesLimit,
+      chatAttachmentStorageBytesLimit: config.chat.attachmentStorageBytesLimit,
+      apiBodyLimitBytes: config.api.bodyLimit,
+
+      azureOpenAiEntraIdEnabled: isAzureOpenAiEntraIdEnabled(),
+      anthropicWifEnabled: anthropicWorkloadIdentity.isEnabled(),
+      anthropicKeylessAuthEnabled: isAnthropicKeylessAuthEnabled(),
+      anthropicVertexAiEnabled: config.llm.anthropic.vertexAi.enabled,
+      bedrockIamAuthEnabled: isBedrockIamAuthEnabled(),
+      geminiVertexAiEnabled: isVertexAiEnabled(),
+      incomingEmail: getEmailProviderInfo(),
+      mcpServerBaseImage: config.orchestrator.mcpServerBaseImage,
+      orchestratorK8sNamespace: config.orchestrator.kubernetes.namespace,
+      environmentNamespaces:
+        config.orchestrator.kubernetes.environmentNamespaces,
+      isQuickstart: config.isQuickstart,
+      ngrokDomain: ngrokTunnelManager.getPublicDomain(),
+      virtualKeyDefaultExpirationSeconds:
+        config.llmProxy.virtualKeyDefaultExpirationSeconds,
+      mcpSandboxDomain: config.mcpSandbox.domain,
+      maintenanceMode: config.maintenanceMode,
+      chatSecretScanEnabled: config.chat.secretScanEnabled,
+      encryptedChatEnabled: isEncryptedChatEnabled(),
+      openappaEnabled: enterpriseTier.isOpenappaActive(),
+      agentHooksEnabled: config.hooks.enabled,
+      chatopsTelegramEnabled: config.chatops.telegramEnabled,
+      kbMfilesConnectorEnabled: config.kb.mfilesConnectorEnabled,
+      llmModelPoolsEnabled: config.llmProxy.modelPoolsEnabled,
+      kbMfilesOauthEnabled: config.kb.mfilesOauthEnabled,
+      kbBm25DefaultK1: config.kb.bm25K1,
+      kbBm25DefaultB: config.kb.bm25B,
+      kbContextualRetrievalDefaultMode: config.kb.contextualRetrievalEnabled
+        ? "document"
+        : "disabled",
+      kbGoogleDriveOAuth: {
+        configured: isGoogleDriveOAuthConfigured(),
+        redirectUri: getGoogleDriveOAuthRedirectUri(),
+      },
+      mcpGatewaySkillsEnabled: config.mcpGateway.skillsEnabled,
+      devFeedbackEnabled: devFeedbackService.isAvailable,
+      autoRoutingEnabled: config.autoRouting.enabled,
+    },
+    providerBaseUrls: {
+      openai: config.llm.openai.baseUrl || null,
+      openrouter: config.llm.openrouter.baseUrl || null,
+      anthropic: config.llm.anthropic.baseUrl || null,
+      gemini: config.llm.gemini.baseUrl || null,
+      bedrock: config.llm.bedrock.baseUrl || null,
+      cohere: config.llm.cohere.baseUrl || null,
+      voyage: config.llm.voyage.baseUrl || null,
+      jev: config.llm.jev.baseUrl || null,
+      cerebras: config.llm.cerebras.baseUrl || null,
+      mistral: config.llm.mistral.baseUrl || null,
+      perplexity: config.llm.perplexity.baseUrl || null,
+      groq: config.llm.groq.baseUrl || null,
+      xai: config.llm.xai.baseUrl || null,
+      vllm: config.llm.vllm.baseUrl || null,
+      ollama: config.llm.ollama.baseUrl || null,
+      "ollama-native": config.llm["ollama-native"].baseUrl || null,
+      zhipuai: config.llm.zhipuai.baseUrl || null,
+      minimax: config.llm.minimax.baseUrl || null,
+      deepseek: config.llm.deepseek.baseUrl || null,
+      archestra: config.llm.archestra.baseUrl || null,
+      kimi: config.llm.kimi.baseUrl || null,
+      "kimi-code": config.llm["kimi-code"].baseUrl || null,
+      "github-copilot": config.llm["github-copilot"].baseUrl || null,
+      "microsoft-365-copilot":
+        config.llm["microsoft-365-copilot"].baseUrl || null,
+      azure: config.llm.azure.baseUrl || null,
+    },
+  };
+}
+
+export const PublicConfigResponseSchema = z.strictObject({
+  disableBasicAuth: z.boolean(),
+  disableInvitations: z.boolean(),
+  disableImpersonation: z.boolean(),
+  // Developer-only: when true, the login page auto-mints a session via
+  // POST /api/auth/dev-auto-login instead of showing the sign-in form. Always
+  // false in production (the driving env var is ignored there).
+  devAutoLoginEnabled: z.boolean(),
+  maintenanceMode: z.string().nullable(),
+  // Instance-wide banner (markdown) rendered at the top of the UI. Exposed
+  // pre-auth so operators can label an instance on the login screen too.
+  siteNotificationMessage: z.string().nullable(),
+  // Effective enterprise core flag (env var OR small-team free tier). Exposed
+  // pre-auth so the login screen can decide whether to render the SSO picker.
+  enterpriseCoreActive: z.boolean(),
+  analytics: z.strictObject({
+    enabled: z.boolean(),
+    instanceId: z.string().uuid().nullable(),
+    posthog: z.strictObject({
+      key: z.string(),
+      host: z.string(),
+    }),
+  }),
+  // Product-usage telemetry (RUM): when enabled, the frontend loads its RUM
+  // module and posts usage events to /api/rum/events for OTLP export.
+  rum: z.strictObject({
+    enabled: z.boolean(),
+    sampleRate: z.number(),
+  }),
+});
+
+let cachedAnalyticsInstanceId: string | null = null;
+let pendingAnalyticsInstanceId: Promise<string | null> | null = null;
+let hasLoggedAnalyticsInstanceIdError = false;
+
+// Shared test workers replace their database between cases; the cached
+// installation identity must not survive that database reset.
+registerProcessLocalCache({
+  clear() {
+    cachedAnalyticsInstanceId = null;
+    pendingAnalyticsInstanceId = null;
+    hasLoggedAnalyticsInstanceIdError = false;
+  },
+});
+
+export async function getPublicConfigResponse(): Promise<
+  z.infer<typeof PublicConfigResponseSchema>
+> {
+  return {
+    disableBasicAuth: config.auth.disableBasicAuth,
+    disableInvitations: config.auth.disableInvitations,
+    disableImpersonation: config.auth.disableImpersonation,
+    devAutoLoginEnabled: !!config.auth.devAutoAuthenticateEmail,
+    maintenanceMode: config.maintenanceMode,
+    siteNotificationMessage: config.siteNotificationMessage,
+    enterpriseCoreActive: enterpriseTier.isCoreActive(),
+    analytics: {
+      enabled: config.analytics.enabled,
+      instanceId: await getAnalyticsInstanceId(),
+      posthog: config.analytics.posthog,
+    },
+    rum: {
+      enabled: config.observability.rum.enabled,
+      sampleRate: config.observability.rum.sampleRate,
+    },
+  };
+}
+
+async function getAnalyticsInstanceId(): Promise<string | null> {
+  if (config.maintenanceMode) return null;
+  if (cachedAnalyticsInstanceId) return cachedAnalyticsInstanceId;
+
+  pendingAnalyticsInstanceId ??= loadAnalyticsInstanceId();
   try {
-    return readFileSync("/app/data/.ngrok_domain", "utf-8").trim();
-  } catch {
-    return "";
+    return await pendingAnalyticsInstanceId;
+  } finally {
+    pendingAnalyticsInstanceId = null;
+  }
+}
+
+async function loadAnalyticsInstanceId(): Promise<string | null> {
+  try {
+    const instanceId = (await OrganizationModel.getAnalyticsState())
+      .analyticsInstanceId;
+    cachedAnalyticsInstanceId = instanceId;
+    hasLoggedAnalyticsInstanceIdError = false;
+    return instanceId;
+  } catch (error) {
+    if (!hasLoggedAnalyticsInstanceIdError) {
+      logger.warn(
+        { err: error },
+        "Failed to load analytics instance ID for public config",
+      );
+      hasLoggedAnalyticsInstanceIdError = true;
+    }
+    return null;
   }
 }

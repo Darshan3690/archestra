@@ -15,9 +15,10 @@
 import {
   isLargeResultBrowserMcpTool,
   MCP_SERVER_TOOL_NAME_SEPARATOR,
-} from "@shared";
+} from "@archestra/shared";
 import logger from "@/logging";
 import type { ChatMessage, ChatMessagePart } from "@/types";
+import { readCappedToolResult } from "@/utils/tool-result-cap";
 import {
   estimateToolResultContentLength,
   previewToolResultContent,
@@ -27,6 +28,67 @@ const IMAGE_STRIPPED_PLACEHOLDER = "[Image data stripped to save context]";
 
 // Size threshold - results larger than this will be stripped
 const BROWSER_RESULT_SIZE_THRESHOLD = 2000;
+
+/**
+ * A retrieved image IS the answer, not context ballast — an indexed picture
+ * returned by knowledge search, or an app's own screenshot — so the chat has to
+ * be able to show it. Bounded copies are therefore kept in the PERSISTED
+ * message only; the model-bound history is a separate copy that still strips
+ * everything (see the `normalizeChatMessages` call on the replay path), so no
+ * base64 re-enters a prompt. The bytes come from whatever a connector indexed,
+ * i.e. they are untrusted, hence the mime allowlist, base64-alphabet check and
+ * hard caps below.
+ */
+const MAX_DISPLAYABLE_IMAGE_BASE64_LENGTH = 2_000_000;
+const MAX_DISPLAYABLE_IMAGES_PER_RESULT = 2;
+const DISPLAYABLE_IMAGE_MIME_TYPE = /^image\/(png|jpe?g|webp|gif)$/;
+const BASE64_PAYLOAD = /^[A-Za-z0-9+/]+={0,2}$/;
+
+function isDisplayableImageBlock(block: unknown): boolean {
+  if (typeof block !== "object" || block === null || Array.isArray(block)) {
+    return false;
+  }
+  const { type, data, mimeType } = block as Record<string, unknown>;
+  return (
+    type === "image" &&
+    typeof data === "string" &&
+    typeof mimeType === "string" &&
+    DISPLAYABLE_IMAGE_MIME_TYPE.test(mimeType) &&
+    data.length <= MAX_DISPLAYABLE_IMAGE_BASE64_LENGTH &&
+    BASE64_PAYLOAD.test(data)
+  );
+}
+
+/**
+ * Re-attach the bounded `rawContent` image blocks the strip just blanked.
+ * `stripImagesFromObject` rebuilds arrays index-for-index, so positions align.
+ */
+function restoreDisplayableImages(
+  original: unknown,
+  stripped: unknown,
+): unknown {
+  const isRecord = (v: unknown): v is Record<string, unknown> =>
+    typeof v === "object" && v !== null && !Array.isArray(v);
+  if (!isRecord(original) || !isRecord(stripped)) return stripped;
+  const originalRaw = original.rawContent;
+  const strippedRaw = stripped.rawContent;
+  if (!Array.isArray(originalRaw) || !Array.isArray(strippedRaw))
+    return stripped;
+  let kept = 0;
+  const merged = strippedRaw.map((block, index) => {
+    if (kept >= MAX_DISPLAYABLE_IMAGES_PER_RESULT) return block;
+    const source = originalRaw[index];
+    if (!isDisplayableImageBlock(source)) return block;
+    kept++;
+    return source;
+  });
+  return kept === 0 ? stripped : { ...stripped, rawContent: merged };
+}
+
+function stripToolOutput(output: unknown, preserveImages: boolean): unknown {
+  const stripped = convertImageBlocksToText(output);
+  return preserveImages ? restoreDisplayableImages(output, stripped) : stripped;
+}
 
 /**
  * Check if a tool name is a browser tool that should have large results stripped
@@ -68,7 +130,11 @@ function createBrowserToolPlaceholder(
   const shortName =
     toolName.split(MCP_SERVER_TOOL_NAME_SEPARATOR).pop() || toolName;
   const url = extractPageUrl(content);
-  return `[Page ${url} ${shortName} was here]`;
+  // A capped result was saved to the sandbox; keep that pointer reachable.
+  const savedPath = readCappedToolResult(content)?.path;
+  return savedPath
+    ? `[Page ${url} ${shortName} was here; full result saved in the sandbox at ${savedPath}]`
+    : `[Page ${url} ${shortName} was here]`;
 }
 
 function getBrowserResultSize(content: unknown): {
@@ -178,6 +244,7 @@ function convertImageBlocksToText(content: unknown): unknown {
 function stripImagesFromParts(
   parts: ChatMessagePart[],
   preserveDirectImages = false,
+  preserveToolResultImages = false,
 ): ChatMessagePart[] {
   return parts.map((part) => {
     const partType = part.type;
@@ -209,7 +276,27 @@ function stripImagesFromParts(
       // Strip images from tool output
       return {
         ...part,
-        output: convertImageBlocksToText(part.output),
+        output: stripToolOutput(part.output, preserveToolResultImages),
+      };
+    }
+
+    // MCP/Archestra tools deserialize to `dynamic-tool` parts (not `tool-<name>`),
+    // so strip images from their output too — otherwise a get_app_diagnostics
+    // render screenshot stays base64 in history and reloads into context.
+    if (partType === "dynamic-tool" && part.output !== undefined) {
+      const toolName = typeof part.toolName === "string" ? part.toolName : "";
+      if (isBrowserToolToStrip(toolName)) {
+        const outputSize = getBrowserResultSize(part.output);
+        if (outputSize.isLarge) {
+          return {
+            ...part,
+            output: createBrowserToolPlaceholder(toolName, part.output),
+          };
+        }
+      }
+      return {
+        ...part,
+        output: stripToolOutput(part.output, preserveToolResultImages),
       };
     }
 
@@ -255,6 +342,7 @@ function stripImagesFromParts(
  */
 export function stripImagesFromMessages(
   messages: ChatMessage[],
+  options?: { preserveToolResultImages?: boolean },
 ): ChatMessage[] {
   logger.info(
     { messageCount: messages.length },
@@ -278,7 +366,11 @@ export function stripImagesFromMessages(
 
     return {
       ...msg,
-      parts: stripImagesFromParts(msg.parts, preserveDirectImages),
+      parts: stripImagesFromParts(
+        msg.parts,
+        preserveDirectImages,
+        options?.preserveToolResultImages ?? false,
+      ),
     };
   });
 }

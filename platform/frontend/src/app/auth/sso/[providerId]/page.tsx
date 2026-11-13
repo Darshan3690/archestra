@@ -1,11 +1,12 @@
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
 "use client";
 
-import { LINKED_IDP_SSO_MODE } from "@shared";
+import { LINKED_IDP_SSO_MODE } from "@archestra/shared";
 import { useParams, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { AppLogo } from "@/components/app-logo";
-import { LoadingSpinner } from "@/components/loading";
+import { LoadingState } from "@/components/loading";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -56,11 +57,12 @@ export default function IdpInitiatedSsoPage() {
         recordSsoSignInAttempt(redirectPath);
       }
 
-      await authClient.signIn.sso({
+      const result = await authClient.signIn.sso({
         providerId,
         callbackURL,
         errorCallbackURL: `${window.location.origin}/auth/sign-in`,
       });
+      if (result?.error) throw new Error(result.error.message);
     } catch {
       setFailed(true);
       toast.error("Failed to initiate SSO sign-in");
@@ -93,7 +95,7 @@ export default function IdpInitiatedSsoPage() {
                 Try Again
               </Button>
             ) : (
-              <LoadingSpinner />
+              <LoadingState />
             )}
           </CardContent>
         </Card>

@@ -4,7 +4,7 @@ import {
   createUpdateSchema,
 } from "drizzle-zod";
 import { z } from "zod";
-import { schema } from "@/database";
+import { schema } from "@/database/schema";
 
 export const MemberSchema = createSelectSchema(schema.membersTable);
 
@@ -16,6 +16,8 @@ export const MemberListItemSchema = z.object({
   image: z.string().nullable(),
   role: z.string(),
   createdAt: z.date(),
+  /** Whether the account has two-factor authentication enrolled. */
+  twoFactorEnabled: z.boolean(),
 });
 
 const UpdateMemberSchema = createUpdateSchema(schema.membersTable);

@@ -1,25 +1,69 @@
-import { OAUTH_GRANT_TYPE, OAUTH_TOKEN_TYPE } from "@shared";
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+import { OAUTH_GRANT_TYPE, OAUTH_TOKEN_TYPE } from "@archestra/shared";
 import type { TokenAuthContext } from "@/clients/mcp-client";
 import logger from "@/logging";
 import { resolveEnterpriseAssertion } from "@/services/identity-providers/enterprise-managed/assertion-resolver";
 import {
+  type EnterpriseCredentialIssuedTo,
   type EnterpriseManagedCredentialResult,
   exchangeEnterpriseManagedCredential,
   extractProviderErrorMessage,
 } from "@/services/identity-providers/enterprise-managed/exchange";
 import { findExternalIdentityProviderById } from "@/services/identity-providers/oidc";
-import type { EnterpriseManagedCredentialConfig } from "@/types";
+import type { EnterpriseManagedCredentialConfig, ToolOwner } from "@/types";
 
 export type ResolvedEnterpriseTransportCredential = {
   headerName: string;
   headerValue: string;
   expiresInSeconds: number | null;
+  /** The client the exchanged credential was issued to, when known. */
+  issuedTo?: EnterpriseCredentialIssuedTo;
 };
 
+/**
+ * Map an already-resolved credential value onto the outbound header the
+ * catalog's injection mode asks for.
+ *
+ * Exported so every caller that obtains an enterprise-managed credential
+ * injects it the same way. Handing the value to the transport as a static
+ * `access_token` secret instead would silently force `Authorization: Bearer`
+ * and ignore a configured custom header.
+ */
+export function buildEnterpriseCredentialHeader(params: {
+  config: EnterpriseManagedCredentialConfig;
+  value: string;
+}): { headerName: string; headerValue: string } {
+  const { config, value } = params;
+
+  switch (config.tokenInjectionMode) {
+    case "header":
+      if (!config.headerName) {
+        throw new Error(
+          "Enterprise-managed credential injection mode 'header' requires headerName",
+        );
+      }
+      return { headerName: config.headerName, headerValue: value };
+    case "raw_authorization":
+      return { headerName: "Authorization", headerValue: value };
+    case "env":
+    case "body_field":
+      // Both describe a non-header carrier that an HTTP MCP transport cannot
+      // express. Falling through to `Authorization: Bearer` would put the
+      // credential somewhere the operator never asked for, so refuse instead.
+      throw new Error(
+        `Enterprise-managed credential injection mode '${config.tokenInjectionMode}' is not supported for HTTP MCP transports`,
+      );
+    default:
+      return { headerName: "Authorization", headerValue: `Bearer ${value}` };
+  }
+}
+
 export async function resolveEnterpriseTransportCredential(params: {
-  agentId: string;
+  owner: ToolOwner;
   tokenAuth?: TokenAuthContext;
   enterpriseManagedConfig: EnterpriseManagedCredentialConfig | null;
+  /** The calling agent's Entra agent identity, when it is bound to one. */
+  entraAgentIdentityId?: string | null;
 }): Promise<ResolvedEnterpriseTransportCredential | null> {
   const config = params.enterpriseManagedConfig;
   if (!config) {
@@ -27,14 +71,15 @@ export async function resolveEnterpriseTransportCredential(params: {
   }
 
   const assertion = await resolveEnterpriseAssertion({
-    agentId: params.agentId,
+    owner: params.owner,
     identityProviderId: config.identityProviderId,
     tokenAuth: params.tokenAuth,
   });
   if (!assertion) {
     logger.warn(
       {
-        agentId: params.agentId,
+        ownerType: params.owner.type,
+        ownerId: params.owner.id,
         identityProviderId: config.identityProviderId,
         userId: params.tokenAuth?.userId,
       },
@@ -74,6 +119,7 @@ export async function resolveEnterpriseTransportCredential(params: {
     identityProviderId: assertion.identityProviderId,
     assertion: assertion.assertion,
     enterpriseManagedConfig: config,
+    entraAgentIdentityId: params.entraAgentIdentityId,
   });
 
   return normalizeEnterpriseTransportCredential({
@@ -185,6 +231,12 @@ export async function exchangeIdJagAtProtectedResource(params: {
       typeof responseBody.issued_token_type === "string"
         ? responseBody.issued_token_type
         : OAUTH_TOKEN_TYPE.AccessToken,
+    issuedTo: {
+      clientId,
+      clientType: params.enterpriseManagedConfig.clientIdOverride
+        ? "mcp_server"
+        : "identity_provider",
+    },
   };
 }
 
@@ -301,62 +353,24 @@ function normalizeEnterpriseTransportCredential(params: {
     responseFieldPath: config.responseFieldPath,
   });
 
-  switch (config.tokenInjectionMode) {
-    case "header":
-      if (!config.headerName) {
-        throw new Error(
-          "Enterprise-managed credential injection mode 'header' requires headerName",
-        );
-      }
-      return {
-        headerName: config.headerName,
-        headerValue: scalarValue,
-        expiresInSeconds: credential.expiresInSeconds,
-      };
-    case "raw_authorization":
-      return {
-        headerName: "Authorization",
-        headerValue: scalarValue,
-        expiresInSeconds: credential.expiresInSeconds,
-      };
-    default:
-      return {
-        headerName: "Authorization",
-        headerValue: `Bearer ${scalarValue}`,
-        expiresInSeconds: credential.expiresInSeconds,
-      };
-  }
+  return {
+    ...buildEnterpriseCredentialHeader({ config, value: scalarValue }),
+    expiresInSeconds: credential.expiresInSeconds,
+    ...(credential.issuedTo ? { issuedTo: credential.issuedTo } : {}),
+  };
 }
 
 function normalizeEnterprisePassthroughCredential(params: {
   config: EnterpriseManagedCredentialConfig;
   assertion: string;
 }): ResolvedEnterpriseTransportCredential {
-  switch (params.config.tokenInjectionMode) {
-    case "header":
-      if (!params.config.headerName) {
-        throw new Error(
-          "Enterprise-managed credential injection mode 'header' requires headerName",
-        );
-      }
-      return {
-        headerName: params.config.headerName,
-        headerValue: params.assertion,
-        expiresInSeconds: null,
-      };
-    case "raw_authorization":
-      return {
-        headerName: "Authorization",
-        headerValue: params.assertion,
-        expiresInSeconds: null,
-      };
-    default:
-      return {
-        headerName: "Authorization",
-        headerValue: `Bearer ${params.assertion}`,
-        expiresInSeconds: null,
-      };
-  }
+  return {
+    ...buildEnterpriseCredentialHeader({
+      config: params.config,
+      value: params.assertion,
+    }),
+    expiresInSeconds: null,
+  };
 }
 
 function extractInjectionValue(params: {

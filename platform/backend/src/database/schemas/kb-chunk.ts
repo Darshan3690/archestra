@@ -1,4 +1,9 @@
 import {
+  DEFAULT_TEXT_SEARCH_LANGUAGE,
+  type TextSearchLanguage,
+} from "@archestra/shared";
+import { sql } from "drizzle-orm";
+import {
   customType,
   index,
   integer,
@@ -26,12 +31,31 @@ function createVectorType(dimensions: number) {
 }
 
 const vector1536 = createVectorType(1536);
+const vector1024 = createVectorType(1024);
 const vector768 = createVectorType(768);
+const vector384 = createVectorType(384);
 const vector3072 = createVectorType(3072);
+const vector1408 = createVectorType(1408);
 
 const tsvector = customType<{ data: string; driverParam: string }>({
   dataType() {
     return "tsvector";
+  },
+});
+
+/**
+ * A PostgreSQL text-search configuration name (`english`, `german`, `simple`,
+ * ...). Typed as `regconfig` rather than `text` so the generated
+ * `search_vector` column can pass it straight to `to_tsvector` — that function
+ * is IMMUTABLE over `(regconfig, text)`, which a generated column requires,
+ * while a `text::regconfig` cast is only STABLE and would be rejected.
+ */
+const regconfig = customType<{
+  data: TextSearchLanguage;
+  driverParam: string;
+}>({
+  dataType() {
+    return "regconfig";
   },
 });
 
@@ -45,15 +69,74 @@ const kbChunksTable = pgTable(
     content: text("content").notNull(),
     chunkIndex: integer("chunk_index").notNull(),
     embedding: vector1536("embedding"),
+    embedding1024: vector1024("embedding_1024"),
     embedding768: vector768("embedding_768"),
+    embedding384: vector384("embedding_384"),
     embedding3072: vector3072("embedding_3072"),
+    embedding1408: vector1408("embedding_1408"),
     searchVector: tsvector("search_vector"),
+    /**
+     * Chunk length in tokens — BM25's document-length normalization term.
+     *
+     * Not the same as `length(search_vector)`, which counts DISTINCT lexemes;
+     * BM25 needs total token count, so this sums the position arrays a
+     * `tsvector` already stores. Declared here as a plain column and made
+     * `GENERATED ALWAYS AS ... STORED` in SQL, exactly as `search_vector` is:
+     * Drizzle cannot express the generation expression, and a generated column
+     * may not reference another generated column, so the migration repeats
+     * `search_vector`'s expression rather than reusing it.
+     *
+     * Nullable because the column is only populated where the portable BM25
+     * ranker is in use; the `ts_rank` path never reads it.
+     */
+    tokLen: integer("tok_len"),
+    /**
+     * Which parent passage this chunk is a slice of, or NULL when the chunk IS
+     * the passage (single-pass indexing, and every chunk written before
+     * parent/child indexing existed).
+     *
+     * An ordinal within the document rather than a foreign key to a parent row,
+     * because no parent row exists: storing one would put a second copy of every
+     * document in `content`, in the same keyword index its own children compete
+     * in, and in the same `chunk_index` space that citation refs and context
+     * expansion's adjacency walk depend on. The passage is instead reassembled
+     * from the children that share this ordinal — they partition the parent's
+     * text and are contiguous in `chunk_index`, so the stitch is exact.
+     */
+    parentIndex: integer("parent_index"),
     metadataSuffixSemantic: text("metadata_suffix_semantic"),
     metadataSuffixKeyword: text("metadata_suffix_keyword"),
+    /**
+     * Search-only context produced at ingest. Depending on organization
+     * settings, it is either shared by the document's chunks or specific to
+     * this chunk. Denormalized rather than joined from `kb_documents` because
+     * the generated `search_vector` column can only reference its own row.
+     *
+     * Prepended to the chunk's embedding input and folded into `search_vector`,
+     * but deliberately NOT part of `content` — it is an indexing-time retrieval
+     * signal, not text the model needs repeated on every returned chunk.
+     */
+    contextualHeader: text("contextual_header"),
+    /**
+     * Text-search configuration for this chunk's keyword index, inherited from
+     * its connector at ingest. Stored per chunk so one deployment can index an
+     * English wiki and a German one correctly at the same time.
+     */
+    ftsLanguage: regconfig("fts_language")
+      .notNull()
+      .default(DEFAULT_TEXT_SEARCH_LANGUAGE),
     acl: jsonb("acl").$type<string[]>().notNull().default([]),
     createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
   },
-  (table) => [index("kb_chunks_document_id_idx").on(table.documentId)],
+  (table) => [
+    index("kb_chunks_document_id_idx").on(table.documentId),
+    // Parent-passage resolution looks up every child of one (document, parent)
+    // pair. Partial: only parent/child corpora have a non-NULL parent_index, so
+    // a deployment that never enables it pays nothing for this index.
+    index("kb_chunks_document_id_parent_index_idx")
+      .on(table.documentId, table.parentIndex)
+      .where(sql`${table.parentIndex} IS NOT NULL`),
+  ],
 );
 
 export default kbChunksTable;

@@ -13,33 +13,81 @@ export type CommonMcpToolDefinition = {
   inputSchema: Record<string, unknown>;
   _meta?: Record<string, unknown>;
   annotations?: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
 };
 
-export const CommonToolCallSchema = z
-  .object({
-    id: z.string(),
-    name: z.string(),
-    arguments: z.record(z.string(), z.unknown()),
+const CommonToolCallBaseSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  /** The namespace the model called the tool in, on a wire that has them. */
+  namespace: z.string().optional(),
+});
+
+const CommonFunctionToolCallSchema = CommonToolCallBaseSchema.extend({
+  arguments: z.record(z.string(), z.unknown()),
+  // Older adapters have only function-style calls and do not carry a kind.
+  kind: z.literal("function").optional(),
+});
+
+const CommonCustomToolCallSchema = CommonToolCallBaseSchema.extend({
+  arguments: z.object({ input: z.string() }),
+  kind: z.literal("custom"),
+});
+
+/**
+ * This stays an object schema because MCP select/insert/response schemas and
+ * redaction consumers require one mutable record shape. The refinement is the
+ * validated conversion boundary: `kind: custom` is accepted only with its
+ * typed `{ input: string }` arguments before that broad shape reaches them.
+ */
+export const CommonToolCallSchema = CommonToolCallBaseSchema.extend({
+  arguments: z.record(z.string(), z.unknown()),
+  kind: z.enum(["function", "custom"]).optional(),
+})
+  .superRefine((call, context) => {
+    if (call.kind !== "custom") return;
+    if (
+      Object.keys(call.arguments).length !== 1 ||
+      typeof call.arguments.input !== "string"
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["arguments", "input"],
+        message: "a custom tool call requires a string input",
+      });
+    }
   })
   .describe("Represents a tool call in a provider-agnostic way");
 
 export type CommonToolCall = z.infer<typeof CommonToolCallSchema>;
+export type CommonFunctionToolCall = z.infer<
+  typeof CommonFunctionToolCallSchema
+>;
+export type CommonCustomToolCall = z.infer<typeof CommonCustomToolCallSchema>;
 
 export type CommonToolResult = {
   id: string;
   name: string;
+  /** The namespace the paired call named (Codex Responses history). */
+  namespace?: string;
+  /**
+   * The arguments of the paired tool call, when the source format carries
+   * them, so a `run_tool` dispatch can be resolved to the target tool that
+   * actually produced the result instead of the built-in wrapper.
+   */
+  arguments?: Record<string, unknown>;
   content: unknown;
+  /**
+   * `content` is the structure the client sent (blocks, parts, a JSON object),
+   * not a JSON string the adapter parsed. Only then are binary parts replaced
+   * by markers in the body handed to the policy runtime.
+   */
+  structured?: boolean;
   isError: boolean;
   error?: string;
   _meta?: Record<string, unknown>;
   structuredContent?: Record<string, unknown>;
 };
-
-/**
- * Result of evaluating trusted data policies
- * Maps tool call IDs to their updated content (if modified)
- */
-export type ToolResultUpdates = Record<string, string>;
 
 export interface CommonMessage {
   /** Message role */
@@ -48,6 +96,30 @@ export interface CommonMessage {
   content?: string;
   /** Tool calls if this message contains them */
   toolCalls?: CommonToolResult[];
+}
+
+/**
+ * Normalize a provider-format tool-call arguments value to the record shape
+ * `CommonToolResult.arguments` carries. Providers carry arguments either as an
+ * object (Anthropic `input`, Gemini `args`) or as a JSON string (OpenAI-family
+ * `function.arguments`); anything unparsable yields undefined so a malformed
+ * value is indistinguishable from an uncaptured one (both fail closed where it
+ * matters — run_tool dispatch resolution).
+ */
+export function extractCommonToolCallArguments(
+  value: unknown,
+): Record<string, unknown> | undefined {
+  if (typeof value === "string") {
+    try {
+      return extractCommonToolCallArguments(JSON.parse(value));
+    } catch {
+      return undefined;
+    }
+  }
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return undefined;
 }
 
 export function extractCommonMessageText(message: unknown): string | undefined {

@@ -1,5 +1,11 @@
+import { DEFAULT_INTERNAL_API_BASE_URL } from "@archestra/shared/consts";
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
+import {
+  isShellSeedRoute,
+  SHELL_SEED_HEADER,
+  SHELL_SEED_SEARCH_HEADER,
+} from "@/lib/auth/shell-seed";
 
 export function proxy(req: NextRequest) {
   // Redirect root to /chat before any client components render
@@ -27,12 +33,13 @@ export function proxy(req: NextRequest) {
         process.env.ARCHESTRA_FRONTEND_URL || "http://localhost:3000";
 
       // Create new headers with the replaced Origin
-      const newHeaders = new Headers(req.headers);
+      const newHeaders = withForwardedOrigin(req);
       newHeaders.set("Origin", frontendOrigin);
 
       // Create the rewritten request with modified headers
       const backendUrl =
-        process.env.ARCHESTRA_INTERNAL_API_BASE_URL || "http://localhost:9000";
+        process.env.ARCHESTRA_INTERNAL_API_BASE_URL ||
+        DEFAULT_INTERNAL_API_BASE_URL;
       const backendRequestUrl = new URL(req.nextUrl.pathname, backendUrl);
       backendRequestUrl.search = req.nextUrl.search;
 
@@ -45,8 +52,73 @@ export function proxy(req: NextRequest) {
     }
   }
 
-  return NextResponse.next();
+  // For requests proxied to the backend, preserve the public host/proto the
+  // client used so the backend's getPublicRequestOrigin() advertises the right
+  // OAuth protected-resource / token / jwks origin. Without this it falls back
+  // to its own origin (e.g. localhost:9000) and MCP clients connecting via the
+  // frontend origin (localhost:3000) fail with a resource mismatch.
+  if (needsForwardedOrigin(req.nextUrl.pathname)) {
+    return NextResponse.next({
+      request: { headers: withForwardedOrigin(req) },
+    });
+  }
+
+  // Tell the root layout which documents render their first page on the
+  // server, so it resolves the signed-in shell there too. Never trusted from
+  // the client: the header is always set or removed here.
+  const headers = new Headers(req.headers);
+  if (rendersFirstPageOnServer(req)) {
+    headers.set(SHELL_SEED_HEADER, req.nextUrl.pathname);
+    headers.set(SHELL_SEED_SEARCH_HEADER, req.nextUrl.search);
+  } else {
+    headers.delete(SHELL_SEED_HEADER);
+    headers.delete(SHELL_SEED_SEARCH_HEADER);
+  }
+  return NextResponse.next({ request: { headers } });
 }
+
+/**
+ * A full document load (or refresh) of a page whose rows are server-rendered.
+ * Next removes the router's flight headers (`rsc` and the like) before the
+ * proxy runs, so a client navigation or route prefetch looks like any other
+ * GET here. Fetch Metadata tells them apart: the browser sends
+ * `Sec-Fetch-Dest: document` only for top-level document loads (router
+ * fetches carry `empty`), and page scripts cannot set it. A browser without
+ * Fetch Metadata gets no seed and loads its first page itself.
+ */
+function rendersFirstPageOnServer(req: NextRequest) {
+  return (
+    req.method === "GET" &&
+    isShellSeedRoute(req.nextUrl.pathname, req.nextUrl.search) &&
+    req.headers.get("sec-fetch-dest") === "document"
+  );
+}
+
+/**
+ * Clone the request headers, injecting `X-Forwarded-Host`/`X-Forwarded-Proto`
+ * from the incoming request when not already set. Values set by a real
+ * proxy/ingress in front of the frontend (e.g. an ngrok tunnel) are preserved,
+ * so this is a no-op when the public origin is terminated upstream.
+ */
+const withForwardedOrigin = (req: NextRequest) => {
+  const headers = new Headers(req.headers);
+
+  const host = req.headers.get("host");
+  if (host && !headers.has("x-forwarded-host")) {
+    headers.set("x-forwarded-host", host);
+  }
+
+  if (!headers.has("x-forwarded-proto")) {
+    headers.set("x-forwarded-proto", req.nextUrl.protocol.replace(/:$/, ""));
+  }
+
+  return headers;
+};
+
+const needsForwardedOrigin = (pathname: string) =>
+  pathname.startsWith("/v1/") ||
+  pathname.startsWith("/.well-known/") ||
+  pathname.startsWith("/api/");
 
 const shouldLogApiRequest = (req: NextRequest) => {
   const { pathname } = req.nextUrl;
@@ -60,7 +132,11 @@ const shouldLogApiRequest = (req: NextRequest) => {
   }
   // log request before it is proxied via nextjs rewrites
   // see rewrites() config in next.config.ts
-  return pathname.startsWith("/api") || pathname.startsWith("/v1");
+  return (
+    pathname.startsWith("/api") ||
+    pathname.startsWith("/v1") ||
+    pathname.startsWith("/v2")
+  );
 };
 
 const isSamlCallback = (req: NextRequest) => {

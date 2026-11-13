@@ -1,0 +1,75 @@
+"use client";
+
+import { Loader2, Play } from "lucide-react";
+import { useParams } from "next/navigation";
+import { PageBackLink } from "@/components/page-back-link";
+import { PageLayout } from "@/components/page-layout";
+import { ScheduleRunsList } from "@/components/scheduled-tasks/schedule-runs-list";
+import { useStartScheduleRun } from "@/components/scheduled-tasks/use-start-schedule-run";
+import { Button } from "@/components/ui/button";
+import { useProject } from "@/lib/projects/projects.query";
+import { useScheduleTrigger } from "@/lib/schedule-trigger.query";
+import { formatCronSchedule } from "@/lib/utils/format-cron";
+
+export function ProjectScheduleRunsClient() {
+  const { id: projectId, triggerId } = useParams<{
+    id: string;
+    triggerId: string;
+  }>();
+
+  const { data: project } = useProject(projectId);
+  const { data: trigger, isLoading: triggerLoading } =
+    useScheduleTrigger(triggerId);
+  const runNowMutation = useStartScheduleRun(triggerId);
+
+  const projectName = project?.name ?? "Project";
+  const triggerName = trigger?.name ?? "Schedule";
+
+  const onRunNow = () => {
+    runNowMutation.start();
+  };
+
+  if (triggerLoading) {
+    return null;
+  }
+
+  return (
+    <PageLayout
+      title={`${triggerName} — Runs`}
+      description={
+        trigger ? (
+          <>
+            {trigger.agent?.name ?? "Default agent"} ·{" "}
+            {trigger.enabled === false
+              ? "Paused — runs only when started manually"
+              : `${formatCronSchedule(trigger.cronExpression)} · ${trigger.timezone}`}
+          </>
+        ) : undefined
+      }
+      backLink={
+        <PageBackLink href={`/projects/${projectId}`}>
+          {projectName}
+        </PageBackLink>
+      }
+      actionButton={
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={onRunNow}
+          disabled={runNowMutation.isPending}
+        >
+          {runNowMutation.isPending ? (
+            <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <Play className="mr-1.5 h-3.5 w-3.5" />
+          )}
+          <span>Start New Run</span>
+        </Button>
+      }
+      maxWidth="wizard"
+      stackHeaderOnMobile
+    >
+      <ScheduleRunsList triggerId={triggerId} />
+    </PageLayout>
+  );
+}

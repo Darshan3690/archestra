@@ -1,11 +1,12 @@
-import { MEMBER_ROLE_NAME } from "@shared";
+import { MEMBER_ROLE_NAME } from "@archestra/shared";
 import { APIError } from "better-auth";
 import { jwtDecode } from "jwt-decode";
 import {
   extractGroupsFromClaims,
   retrieveIdpGroups,
 } from "@/auth/idp-team-sync-cache.ee";
-import config from "@/config";
+import { CREDENTIAL_PROVIDER_ID } from "@/constants";
+import { enterpriseTier } from "@/enterprise-tier";
 import logger from "@/logging";
 // Direct imports to avoid circular dependencies when importing from barrel files
 import AccountModel from "@/models/account";
@@ -55,8 +56,8 @@ export const ssoConfig = {
   disableImplicitSignUp: false,
   providersLimit: 10,
   trustEmailVerified: true, // Trust email verification from SSO providers
-  // Enable domain verification to allow SAML account linking for non-trusted providers
-  // When enabled, providers with domainVerified: true can link accounts by email domain
+  // Enable configured-domain trust for implicit OIDC and SAML account linking.
+  // Better Auth also requires domainVerified: true, which the provider model sets.
   domainVerification: {
     enabled: true,
   },
@@ -103,6 +104,18 @@ export async function syncSsoRole(
     logger.debug(
       { providerId, userEmail },
       "[syncSsoRole] SSO provider not found or has no organization, skipping role sync",
+    );
+    return;
+  }
+
+  // Providers with SSO login disabled exist only to supply linked tokens for
+  // downstream authentication (e.g. enterprise-managed MCP token exchange).
+  // Their claims say nothing about the user's Archestra role, so completing
+  // a link flow against them must never rewrite the membership role.
+  if (idpProvider.ssoLoginEnabled === false) {
+    logger.info(
+      { providerId, userEmail },
+      "[syncSsoRole] Provider is not used for SSO login, skipping role sync",
     );
     return;
   }
@@ -164,7 +177,11 @@ export async function syncSsoRole(
         providerId: idpProvider.providerId,
       },
     },
-    "member",
+    // Only consulted when no rule matched, and this function returns early in
+    // that case rather than rewriting an established member's role — so this
+    // fallback never reaches a membership. New memberships get the org default
+    // via ssoConfig.organizationProvisioning → resolveSsoRole.
+    MEMBER_ROLE_NAME,
   );
   const extractedGroups = extractGroupsFromClaims(
     tokenClaims,
@@ -218,6 +235,26 @@ export async function syncSsoRole(
     return;
   }
 
+  // Only apply the resolved role when a mapping rule explicitly matched.
+  // When no rule matched, evaluateRoleMapping falls back to defaultRole (or
+  // the function-level fallback), which would silently overwrite an existing
+  // member's role on every SSO callback — e.g. demoting an admin to "member"
+  // just because the IdP has no role-mapping rules configured. Provisioning
+  // of brand-new memberships is handled by ssoConfig.organizationProvisioning,
+  // so here we only sync established members when there is an actual match.
+  if (!result.matched) {
+    logger.debug(
+      {
+        providerId,
+        userEmail,
+        currentRole: existingMember.role,
+        fallbackRole: result.role,
+      },
+      "[syncSsoRole] No role mapping rule matched - leaving existing role unchanged",
+    );
+    return;
+  }
+
   // Update role if it changed
   if (existingMember.role !== result.role) {
     await MemberModel.updateRole(
@@ -265,10 +302,10 @@ export async function syncSsoTeams(
 ): Promise<void> {
   logger.info({ userId, userEmail }, "[syncSsoTeams] Starting SSO team sync");
 
-  // Only sync if enterprise license is activated
-  if (!config.enterpriseFeatures.core) {
+  // Only sync if enterprise features are active (license env var or small-team tier)
+  if (!enterpriseTier.isCoreActive()) {
     logger.info(
-      "[syncSsoTeams] Enterprise license not activated, skipping team sync",
+      "[syncSsoTeams] Enterprise features not active, skipping team sync",
     );
     return;
   }
@@ -305,6 +342,16 @@ export async function syncSsoTeams(
     logger.debug(
       { providerId, userEmail },
       "[syncSsoTeams] SSO provider not found or has no organization, skipping team sync",
+    );
+    return;
+  }
+
+  // Mirrors syncSsoRole: linked-token-only providers (SSO login disabled)
+  // must never rewrite team memberships from their group claims.
+  if (idpProvider.ssoLoginEnabled === false) {
+    logger.info(
+      { providerId, userEmail },
+      "[syncSsoTeams] Provider is not used for SSO login, skipping team sync",
     );
     return;
   }
@@ -386,11 +433,17 @@ export async function syncSsoTeams(
   try {
     const {
       added,
+      roleChanged,
       removed,
       matchedExternalGroupCount,
       matchedTeamCount,
       unmappedGroupCount,
-    } = await TeamModel.syncUserTeams(userId, organizationId, groups);
+    } = await TeamModel.syncUserTeams({
+      userId,
+      organizationId,
+      ssoGroups: groups,
+      identityProviderId: idpProvider.id,
+    });
 
     logger.info(
       {
@@ -404,12 +457,13 @@ export async function syncSsoTeams(
         matchedTeamCount,
         unmappedGroupCount,
         teamsAdded: added.length,
+        teamRolesChanged: roleChanged.length,
         teamsRemoved: removed.length,
       },
       "[syncSsoTeams] Evaluated IdP groups for team sync",
     );
 
-    if (added.length > 0 || removed.length > 0) {
+    if (added.length > 0 || roleChanged.length > 0 || removed.length > 0) {
       logger.info(
         {
           userId,
@@ -418,6 +472,7 @@ export async function syncSsoTeams(
           organizationId,
           groupCount: groups.length,
           teamsAdded: added.length,
+          teamRolesChanged: roleChanged.length,
           teamsRemoved: removed.length,
         },
         "[syncSsoTeams] SSO team sync completed - memberships changed",
@@ -446,7 +501,7 @@ async function getRecentSsoAccount(params: {
   const allAccounts = await AccountModel.getAllByUserId(params.userId);
 
   const matchingAccounts = allAccounts.filter((account) => {
-    if (account.providerId === "credential") {
+    if (account.providerId === CREDENTIAL_PROVIDER_ID) {
       return false;
     }
 

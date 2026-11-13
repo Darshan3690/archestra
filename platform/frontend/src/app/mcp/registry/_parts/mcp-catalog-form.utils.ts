@@ -1,29 +1,117 @@
+import type {
+  AgentScope,
+  archestraApiTypes,
+  archestraCatalogTypes,
+  ImagePullPolicy,
+  ImagePullSecretConfig,
+} from "@archestra/shared";
 import {
-  type AgentScope,
-  type archestraApiTypes,
-  type archestraCatalogTypes,
-  type ImagePullSecretConfig,
-  isVaultReference,
-  parseVaultReference,
-} from "@shared";
+  desktopMcpTargetOf,
+  desktopMcpTargetToApi,
+} from "@/lib/mcp/desktop-mcp";
 import { parseDockerArgsToLocalConfig } from "./docker-args-parser";
 import type { McpCatalogFormValues } from "./mcp-catalog-form.types";
 
 type McpCatalogApiData =
   archestraApiTypes.CreateInternalMcpCatalogItemData["body"];
 
+/**
+ * The starting point for an OAuth section the user has not filled in yet.
+ * Credentials, endpoints and the Scopes field start blank, so
+ * `transformFormToApiData` sends exactly what is on screen rather than
+ * inventing values; the remaining fields carry the defaults a new entry wants
+ * anyway. Shared by the new-entry form and by external-catalog import, which
+ * must not drift apart.
+ */
+export function emptyOauthFormConfig(): NonNullable<
+  McpCatalogFormValues["oauthConfig"]
+> {
+  return {
+    client_id: "",
+    client_secret: "",
+    audience: "",
+    resource: "",
+    redirect_uris:
+      typeof window !== "undefined"
+        ? `${window.location.origin}/oauth-callback`
+        : "",
+    scopes: "",
+    // offline_access is a behavioral scope, not an API one: it is appended to
+    // a configured or discovered scope set so the provider returns a refresh
+    // token, and is dropped along with everything else when there is no such
+    // set to append it to.
+    additional_scopes: "offline_access",
+    supports_resource_metadata: true,
+    grantType: "authorization_code",
+    authServerUrl: "",
+    authorizationEndpoint: "",
+    wellKnownUrl: "",
+    resourceMetadataUrl: "",
+    tokenEndpoint: "",
+  };
+}
+
 // Transform function to convert form values to API format
 export function transformFormToApiData(
   values: McpCatalogFormValues,
+  originalAuthFields?: McpCatalogApiData["authFields"],
 ): McpCatalogApiData {
-  const data: McpCatalogApiData = {
+  const common = {
+    ...(values.initialGrants !== undefined && {
+      initialGrants: values.initialGrants.map(({ subject, actions }) => ({
+        subject,
+        actions,
+      })),
+    }),
     name: values.name,
     description: values.description || null,
+    icon: values.icon ?? null,
+  };
+
+  // A desktop MCP server runs on each user's own computer, so it has no server
+  // URL, no deployment and no authentication to send, whatever the form still
+  // holds from another hosting choice. It sends what each computer needs: the
+  // command or the URL.
+  if (values.serverType === "desktop_mcp") {
+    return {
+      ...common,
+      serverType: "desktop_mcp",
+      labels: values.labels ?? [],
+      environmentId: values.environmentId ?? null,
+      desktopConfig: desktopMcpTargetToApi({
+        kind: values.desktopConfig?.kind ?? "command",
+        value: values.desktopConfig?.value ?? "",
+      }),
+    };
+  }
+
+  const data: McpCatalogApiData = {
+    ...common,
     serverType: values.serverType,
     multitenant:
       values.serverType === "local" ? Boolean(values.multitenant) : false,
-    icon: values.icon ?? null,
+    ...(values.requiresAuth !== undefined && {
+      requiresAuth: values.requiresAuth,
+    }),
   };
+
+  // Keep imported declarations in sync with the editable header rows. Otherwise
+  // a renamed or deleted header would be imported again on the next load.
+  if (values.managesAuthFields) {
+    data.authFields = [
+      ...(originalAuthFields ?? []).filter(
+        (field) => field.type.toLowerCase() !== "header",
+      ),
+      ...(values.additionalHeaders ?? [])
+        .filter((header) => header.sourceAuthFieldName)
+        .map((header) => ({
+          name: header.headerName,
+          label: header.description || header.headerName,
+          type: "header",
+          required: header.required,
+        })),
+    ];
+  }
 
   if (values.serverUrl) {
     data.serverUrl = values.serverUrl;
@@ -56,6 +144,7 @@ export function transformFormToApiData(
         : undefined,
       httpPath: values.localConfig.httpPath || undefined,
       serviceAccount: values.localConfig.serviceAccount || undefined,
+      imagePullPolicy: values.localConfig.imagePullPolicy || undefined,
       imagePullSecrets:
         values.localConfig.imagePullSecrets?.filter((s) => {
           if (s.source === "existing") return s.name.trim().length > 0;
@@ -63,12 +152,6 @@ export function transformFormToApiData(
           return false;
         }) || undefined,
     };
-
-    // BYOS: Include local config vault path and key if set
-    if (values.localConfigVaultPath && values.localConfigVaultKey) {
-      data.localConfigVaultPath = values.localConfigVaultPath;
-      data.localConfigVaultKey = values.localConfigVaultKey;
-    }
   }
 
   // Handle OAuth configuration
@@ -85,12 +168,14 @@ export function transformFormToApiData(
           .split(",")
           .map((uri) => uri.trim())
           .filter((uri) => uri.length > 0);
-    const explicitScopes = values.oauthConfig.scopes?.trim() ?? "";
-    const parsedScopes = explicitScopes
+    const scopesList = (values.oauthConfig.scopes ?? "")
       .split(",")
       .map((scope) => scope.trim())
       .filter((scope) => scope.length > 0);
-    const scopesList = parsedScopes;
+    const additionalScopesList = (values.oauthConfig.additional_scopes ?? "")
+      .split(",")
+      .map((scope) => scope.trim())
+      .filter((scope) => scope.length > 0);
 
     // For local servers, use oauthServerUrl; for remote servers, use serverUrl
     const oauthServerUrl =
@@ -113,13 +198,13 @@ export function transformFormToApiData(
         values.oauthConfig.resourceMetadataUrl || undefined,
       token_endpoint: values.oauthConfig.tokenEndpoint || undefined,
       client_id: isClientCredentials ? "" : values.oauthConfig.client_id || "",
-      // Only include client_secret if no BYOS vault path is set
-      client_secret: values.oauthClientSecretVaultPath
+      client_secret: isClientCredentials
         ? undefined
-        : isClientCredentials
-          ? undefined
-          : values.oauthConfig.client_secret || undefined,
+        : values.oauthConfig.client_secret || undefined,
       audience: values.oauthConfig.audience || undefined,
+      resource: isClientCredentials
+        ? undefined
+        : values.oauthConfig.resource || undefined,
       redirect_uris: redirectUrisList,
       scopes: scopesList,
       // default_scopes is the fallback used by the backend's scope resolution:
@@ -127,24 +212,17 @@ export function transformFormToApiData(
       //   2. If `scopes` is empty, backend tries .well-known discovery
       //      (oauth-protected-resource, then oauth-authorization-server).
       //   3. If discovery yields nothing, backend falls back to `default_scopes`.
-      // When the user configures explicit scopes, mirror them into default_scopes so
-      // the fallback matches intent. When the field is blank, keep the generic
-      // ["read","write"] fallback — some proxy MCP servers (e.g. Atlassian) accept
-      // those literal values and translate them to real provider scopes.
-      default_scopes:
-        scopesList.length > 0
-          ? scopesList
-          : isClientCredentials
-            ? []
-            : ["read", "write"],
+      // The Scopes field is the sole source of both, so a blank field stays
+      // blank the whole way down and the authorization request omits `scope`
+      // altogether — `scope` is optional, and a server that advertises nothing
+      // applies its own default set. Never synthesize scope values here: a
+      // server that wants literal values such as "read, write" (some proxy MCP
+      // servers translate those into real provider scopes) gets them by having
+      // them typed into the field, where they are visible and editable.
+      default_scopes: scopesList,
       supports_resource_metadata: values.oauthConfig.supports_resource_metadata,
+      additional_scopes: isClientCredentials ? undefined : additionalScopesList,
     };
-
-    // BYOS: Include OAuth client secret vault path and key if set
-    if (values.oauthClientSecretVaultPath && values.oauthClientSecretVaultKey) {
-      data.oauthClientSecretVaultPath = values.oauthClientSecretVaultPath;
-      data.oauthClientSecretVaultKey = values.oauthClientSecretVaultKey;
-    }
 
     data.userConfig = isClientCredentials
       ? {
@@ -228,30 +306,52 @@ export function transformFormToApiData(
     data.labels = [];
   }
 
-  // Handle scope
-  if (values.scope) {
-    data.scope = values.scope;
-  }
-
-  // Handle teams for team scope
-  if (values.scope === "team" && values.teams) {
-    data.teams = values.teams;
-  }
+  // Deployment environment assignment (null = the default environment)
+  data.environmentId = values.environmentId ?? null;
 
   return data;
+}
+
+// Build create-form values from an existing catalog item for cloning. A clone
+// is a full copy of the source's configuration (secrets included); only the
+// name is suffixed with "-copy" so the create form is valid out of the box and
+// catalog name-uniqueness validation handles collisions on submit.
+export function buildCloneFormValues(
+  item: archestraApiTypes.GetInternalMcpCatalogResponses["200"][number],
+): McpCatalogFormValues {
+  const values = transformCatalogItemToFormValues(item);
+  return { ...values, name: `${values.name}-copy` };
 }
 
 // Transform catalog item to form values
 export function transformCatalogItemToFormValues(
   item: archestraApiTypes.GetInternalMcpCatalogResponses["200"][number],
-  localConfigSecret?: {
-    secret: Record<string, unknown>;
-  } | null,
 ): McpCatalogFormValues {
+  const staticHeaderFields = getHeaderMappedUserConfigEntries(item.userConfig);
+  // Entries written through the API, the built-in MCP tool or Terraform can
+  // declare their credentials as `requiresAuth` plus header `authFields`
+  // instead of header-mapped userConfig. Until a save writes them into
+  // userConfig, the form shows them as the install-time headers they describe.
+  const configuredHeaderNames = new Set(
+    Object.values(staticHeaderFields).map((field) =>
+      field.headerName.trim().toLowerCase(),
+    ),
+  );
+  const importedAuthHeaders = getAuthFieldHeaders(item);
+  const managedAuthFieldNames = importedAuthHeaders.map((field) =>
+    field.headerName.toLowerCase(),
+  );
+  const authFieldHeaders = importedAuthHeaders.filter(
+    (field) => !configuredHeaderNames.has(field.headerName.toLowerCase()),
+  );
+
   // Determine auth method
   let authMethod: McpCatalogFormValues["authMethod"] = "none";
   let includeBearerPrefix = true;
-  if (item.enterpriseManagedConfig) {
+  if (item.serverType === "desktop_mcp") {
+    // A desktop MCP server has no authentication, whatever its name suggests.
+    authMethod = "none";
+  } else if (item.enterpriseManagedConfig) {
     authMethod =
       item.enterpriseManagedConfig.assertionMode === "passthrough"
         ? "idp_jwt"
@@ -267,9 +367,17 @@ export function transformCatalogItemToFormValues(
   } else if (item.userConfig?.access_token) {
     authMethod = "bearer";
   } else if (
+    item.requiresAuth &&
+    (authFieldHeaders.length > 0 ||
+      Object.values(staticHeaderFields).some(
+        (config) => config.promptOnInstallation !== false,
+      ))
+  ) {
+    authMethod = "auth_header";
+  } else if (
     // Special case: GitHub server uses Bearer Token but external catalog doesn't define userConfig
-    item.name.includes("githubcopilot") ||
-    item.name.includes("github")
+    item.requiresAuth !== false &&
+    (item.name.includes("githubcopilot") || item.name.includes("github"))
   ) {
     authMethod = "bearer";
   } else if (
@@ -284,24 +392,16 @@ export function transformCatalogItemToFormValues(
     authMethod = "auth_header";
   }
 
-  // Check if OAuth client_secret is a BYOS vault reference
-  let oauthClientSecretVaultPath: string | undefined;
-  let oauthClientSecretVaultKey: string | undefined;
-  const clientSecretValue = item.oauthConfig?.client_secret;
-  if (isVaultReference(clientSecretValue)) {
-    const parsed = parseVaultReference(clientSecretValue);
-    oauthClientSecretVaultPath = parsed.path;
-    oauthClientSecretVaultKey = parsed.key;
-  }
-
   // Extract OAuth config if present
   let oauthConfig:
     | {
         client_id: string;
         client_secret: string;
         audience: string;
+        resource: string;
         redirect_uris: string;
         scopes: string;
+        additional_scopes: string;
         supports_resource_metadata: boolean;
         grantType: "authorization_code" | "client_credentials";
         authServerUrl?: string;
@@ -315,16 +415,20 @@ export function transformCatalogItemToFormValues(
   if (item.oauthConfig) {
     oauthConfig = {
       client_id: item.oauthConfig.client_id || "",
-      // Don't include vault reference as client_secret - it will be handled via BYOS fields
-      client_secret: oauthClientSecretVaultPath
-        ? ""
-        : item.oauthConfig.client_secret || "",
+      client_secret: item.oauthConfig.client_secret || "",
       audience:
         typeof item.userConfig?.audience?.default === "string"
           ? item.userConfig.audience.default
           : item.oauthConfig.audience || "",
+      resource: item.oauthConfig.resource || "",
       redirect_uris: item.oauthConfig.redirect_uris?.join(", ") || "",
       scopes: item.oauthConfig.scopes?.join(", ") || "",
+      // Undefined means the item predates this field, so show the default
+      // offline_access; an explicit empty array means the user cleared it.
+      additional_scopes:
+        item.oauthConfig.additional_scopes !== undefined
+          ? item.oauthConfig.additional_scopes.join(", ")
+          : "offline_access",
       supports_resource_metadata:
         item.oauthConfig.supports_resource_metadata ?? true,
       grantType: item.oauthConfig.grant_type ?? "authorization_code",
@@ -365,6 +469,7 @@ export function transformCatalogItemToFormValues(
         httpPath?: string;
         serviceAccount?: string;
         imagePullSecrets?: ImagePullSecretConfig[];
+        imagePullPolicy?: ImagePullPolicy;
       }
     | undefined;
   if (item.localConfig) {
@@ -385,16 +490,6 @@ export function transformCatalogItemToFormValues(
           description: env.description ?? "",
         };
 
-        // If we have a secret and the secret contains a value for this env var key, use it
-        if (localConfigSecret?.secret && env.key in localConfigSecret.secret) {
-          const secretValue = localConfigSecret.secret[env.key];
-          // Convert the value to string if it's not already
-          envVar.value =
-            secretValue !== null && secretValue !== undefined
-              ? String(secretValue)
-              : undefined;
-        }
-
         return envVar;
       }) || [];
 
@@ -408,20 +503,12 @@ export function transformCatalogItemToFormValues(
       httpPort: config.httpPort?.toString() || undefined,
       httpPath: config.httpPath || undefined,
       serviceAccount: config.serviceAccount || undefined,
+      imagePullPolicy: config.imagePullPolicy || undefined,
       // Normalize imagePullSecrets: legacy { name } → { source: "existing", name }
-      // Also hydrate passwords from localConfigSecret for credentials entries
       imagePullSecrets: (item.localConfig.imagePullSecrets || []).map(
         (s: ImagePullSecretConfig | { name: string }) => {
           if (!("source" in s)) {
             return { source: "existing" as const, name: s.name };
-          }
-          if (s.source === "credentials" && localConfigSecret?.secret) {
-            const passwordKey = `__regcred_password:${s.server}:${s.username}`;
-            const password = localConfigSecret.secret[passwordKey];
-            return {
-              ...s,
-              password: password != null ? String(password) : undefined,
-            };
           }
           return s;
         },
@@ -429,30 +516,38 @@ export function transformCatalogItemToFormValues(
     };
   }
 
-  const staticHeaderFields = getHeaderMappedUserConfigEntries(item.userConfig);
   const authHeaderConfig =
     staticHeaderFields.access_token ?? staticHeaderFields.raw_access_token;
-  const additionalHeaders = Object.entries(staticHeaderFields)
+  const headersFromUserConfig = Object.entries(staticHeaderFields)
     .filter(([fieldName]) => {
       return fieldName !== "access_token" && fieldName !== "raw_access_token";
     })
     .map(([fieldName, config]) => ({
       fieldName,
       headerName: config.headerName,
+      sourceAuthFieldName: managedAuthFieldNames.includes(
+        config.headerName.trim().toLowerCase(),
+      )
+        ? config.headerName.trim().toLowerCase()
+        : undefined,
       promptOnInstallation: config.promptOnInstallation ?? true,
       required: config.required ?? false,
       value: typeof config.default === "string" ? config.default : undefined,
       description: config.description ?? "",
       includeBearerPrefix: config.valuePrefix === "Bearer ",
+      sensitive: config.sensitive ?? false,
     }));
+  const additionalHeaders = [...headersFromUserConfig, ...authFieldHeaders];
 
   return {
     name: item.name,
     description: item.description || "",
     icon: item.icon ?? null,
-    serverType: item.serverType as "remote" | "local",
+    serverType: item.serverType as McpCatalogFormValues["serverType"],
     multitenant: item.serverType === "local" && Boolean(item.multitenant),
     serverUrl: item.serverUrl || "",
+    requiresAuth: item.requiresAuth,
+    managesAuthFields: managedAuthFieldNames.length > 0,
     authMethod,
     includeBearerPrefix,
     authHeaderName:
@@ -464,19 +559,23 @@ export function transformCatalogItemToFormValues(
     enterpriseManagedConfig: item.enterpriseManagedConfig ?? null,
     oauthConfig,
     localConfig,
+    desktopConfig:
+      item.serverType === "desktop_mcp"
+        ? desktopMcpTargetOf(item.desktopConfig ?? {})
+        : undefined,
     // Top-level deploymentSpecYaml from API (generated by backend if not saved)
     deploymentSpecYaml: item.deploymentSpecYaml || undefined,
     // Store original to detect user modifications
     originalDeploymentSpecYaml: item.deploymentSpecYaml || undefined,
-    // BYOS: Include parsed vault path and key if OAuth secret is a vault reference
-    oauthClientSecretVaultPath,
-    oauthClientSecretVaultKey,
+
     // Labels
     labels: item.labels ?? [],
     // Scope
     scope: (item.scope as AgentScope) ?? "org",
-    // Teams
-    teams: item.teams?.map((t) => t.id) ?? [],
+    // Teams, each with the access level it holds on this item
+    teams: item.teams?.map((t) => ({ id: t.id, level: t.level })) ?? [],
+    // Deployment environment (null = the default environment)
+    environmentId: item.environmentId ?? null,
   } as McpCatalogFormValues;
 }
 
@@ -555,12 +654,17 @@ export function transformExternalCatalogToFormValues(
       client_id: server.oauth_config.client_id || "",
       client_secret: server.oauth_config.client_secret || "",
       audience: "",
+      resource:
+        getOptionalStringProperty(server.oauth_config, "resource") || "",
       redirect_uris:
         redirectUris ||
         (typeof window !== "undefined"
           ? `${window.location.origin}/oauth-callback`
           : ""),
       scopes: server.oauth_config.scopes?.join(", ") ?? "",
+      // The external catalog manifest does not carry additional_scopes, so
+      // start from the default that requests a refresh token.
+      additional_scopes: "offline_access",
       supports_resource_metadata:
         server.oauth_config.supports_resource_metadata ?? true,
       grantType:
@@ -702,6 +806,7 @@ export function transformExternalCatalogToFormValues(
   return {
     name: server.display_name || server.name,
     description: server.description || "",
+    instructions: server.instructions ?? undefined,
     icon: server.icon ?? null,
     serverType: server.server.type as "remote" | "local",
     multitenant: server.server.type === "local" && authMethod !== "none",
@@ -725,24 +830,9 @@ export function transformExternalCatalogToFormValues(
         value: typeof config.default === "string" ? config.default : undefined,
         description: config.description ?? "",
         includeBearerPrefix: config.valuePrefix === "Bearer ",
+        sensitive: config.sensitive ?? false,
       })),
-    oauthConfig: oauthConfig ?? {
-      client_id: "",
-      client_secret: "",
-      audience: "",
-      redirect_uris:
-        typeof window !== "undefined"
-          ? `${window.location.origin}/oauth-callback`
-          : "",
-      scopes: "read, write",
-      supports_resource_metadata: true,
-      grantType: "authorization_code",
-      authServerUrl: "",
-      authorizationEndpoint: "",
-      wellKnownUrl: "",
-      resourceMetadataUrl: "",
-      tokenEndpoint: "",
-    },
+    oauthConfig: oauthConfig ?? emptyOauthFormConfig(),
     localConfig: localConfig ?? {
       command: "",
       arguments: "",
@@ -790,6 +880,11 @@ function buildStaticHeaderUserConfig(
     });
 
     usedFieldNames.add(fieldName);
+    // Static header fields cannot be sensitive (server validator rejects
+    // the combination, because `default` lives in plaintext jsonb on the
+    // catalog row). Fall back to non-sensitive for static regardless of
+    // what the form carries.
+    const isStaticHeader = !header.promptOnInstallation;
     userConfig[fieldName] = {
       type: "string",
       title: header.headerName,
@@ -802,7 +897,7 @@ function buildStaticHeaderUserConfig(
         (header.includeBearerPrefix
           ? `Sent as ${header.headerName} with a "Bearer " prefix`
           : `Sent as ${header.headerName}`),
-      sensitive: false,
+      sensitive: isStaticHeader ? false : (header.sensitive ?? false),
       headerName: header.headerName,
       valuePrefix: header.includeBearerPrefix ? "Bearer " : undefined,
     };
@@ -852,6 +947,7 @@ function getHeaderMappedUserConfigEntries(
     default?: string | number | boolean | Array<string>;
     description?: string;
     valuePrefix?: string;
+    sensitive?: boolean;
   }
 > {
   return Object.fromEntries(
@@ -870,6 +966,7 @@ function getHeaderMappedUserConfigEntries(
           default?: string | number | boolean | Array<string>;
           description?: string;
           valuePrefix?: string;
+          sensitive?: boolean;
         };
         return [
           fieldName,
@@ -881,10 +978,39 @@ function getHeaderMappedUserConfigEntries(
             default: userConfigField.default,
             description: userConfigField.description,
             valuePrefix: userConfigField.valuePrefix,
+            sensitive: userConfigField.sensitive,
           },
         ];
       }),
   );
+}
+
+function getAuthFieldHeaders(
+  item: archestraApiTypes.GetInternalMcpCatalogResponses["200"][number],
+): NonNullable<McpCatalogFormValues["additionalHeaders"]> {
+  const sendsHeaders =
+    item.serverType === "remote" ||
+    (item.serverType === "local" &&
+      item.localConfig?.transportType === "streamable-http");
+  if (!item.requiresAuth || !sendsHeaders) {
+    return [];
+  }
+  return (item.authFields ?? [])
+    .filter(
+      (field) =>
+        field.type.toLowerCase() === "header" && field.name.trim().length > 0,
+    )
+    .map((field) => ({
+      fieldName: undefined,
+      headerName: field.name.trim(),
+      sourceAuthFieldName: field.name.trim().toLowerCase(),
+      promptOnInstallation: true,
+      required: field.required,
+      value: undefined,
+      description: field.description || field.label,
+      includeBearerPrefix: false,
+      sensitive: true,
+    }));
 }
 
 function isDefaultAuthorizationHeader(headerName: string): boolean {

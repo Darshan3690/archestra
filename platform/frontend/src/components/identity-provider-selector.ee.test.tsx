@@ -1,41 +1,32 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useSearchParams } from "next/navigation";
+import { toast } from "sonner";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { usePublicIdentityProviders } from "@/lib/auth/identity-provider.query.ee";
 import { hasSsoSignInAttempt } from "@/lib/auth/sso-sign-in-attempt";
 import { authClient } from "@/lib/clients/auth/auth-client";
-import config from "@/lib/config/config";
+import { usePublicEnterpriseCoreActive } from "@/lib/config/config.query";
 import { IdentityProviderSelector } from "./identity-provider-selector.ee";
 
+vi.mock("sonner");
+
 // Mock next/navigation
-vi.mock("next/navigation", () => ({
-  useSearchParams: vi.fn(),
-}));
+vi.mock("next/navigation");
 
 // Mock auth client
-vi.mock("@/lib/clients/auth/auth-client", () => ({
-  authClient: {
-    signIn: {
-      sso: vi.fn(),
-    },
-  },
-}));
+vi.mock("@/lib/clients/auth/auth-client");
 
 // Mock identity providers query
 vi.mock("@/lib/auth/identity-provider.query.ee", () => ({
   usePublicIdentityProviders: vi.fn(),
 }));
 
-// Mock config
-vi.mock("@/lib/config/config", () => ({
-  default: {
-    enterpriseFeatures: { core: true },
-  },
-}));
+// Mock the runtime public-config hook the selector now reads from.
+vi.mock("@/lib/config/config.query");
 
 // Mock identity provider icons to avoid Next.js Image issues
-vi.mock("./identity-provider-icons.ee", () => ({
+vi.mock("./identity-provider-icons", () => ({
   IdentityProviderIcon: () => <span data-testid="idp-icon" />,
 }));
 
@@ -61,6 +52,23 @@ describe("IdentityProviderSelector", () => {
       data: [{ id: "1", providerId: "google" }],
       isLoading: false,
     } as ReturnType<typeof usePublicIdentityProviders>);
+    vi.mocked(usePublicEnterpriseCoreActive).mockReturnValue(true);
+  });
+
+  it("shows an error when SSO returns an HTTP error", async () => {
+    vi.mocked(authClient.signIn.sso).mockResolvedValueOnce({
+      data: null,
+      error: {
+        status: 400,
+        statusText: "Bad Request",
+        message: "Discovery failed",
+      },
+    });
+    render(<IdentityProviderSelector />);
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: /sign in with/i }));
+    expect(toast.error).toHaveBeenCalledWith("Failed to initiate SSO sign-in");
   });
 
   describe("callbackURL handling", () => {
@@ -272,14 +280,11 @@ describe("IdentityProviderSelector", () => {
 
   describe("rendering conditions", () => {
     it("should not render when enterprise license is not activated", () => {
-      (vi.mocked(config).enterpriseFeatures as { core: boolean }).core = false;
+      vi.mocked(usePublicEnterpriseCoreActive).mockReturnValue(false);
 
       const { container } = render(<IdentityProviderSelector />);
 
       expect(container.firstChild).toBeNull();
-
-      // Reset for other tests
-      (vi.mocked(config).enterpriseFeatures as { core: boolean }).core = true;
     });
 
     it("should not render when loading", () => {

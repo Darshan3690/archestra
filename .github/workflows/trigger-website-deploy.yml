@@ -1,11 +1,19 @@
-name: Trigger Website Deploy
+name: Publish Docs to archestra.ai
+
+# Refresh production docs from main independently of platform releases.
 
 on:
   workflow_call:
+    # The values live in the website-deploy environment (main only). A called
+    # workflow sees an environment secret only when its caller passes it by
+    # name; otherwise it resolves to an empty string.
     secrets:
-      WEBSITE_VERCEL_DEPLOY_HOOK_URL:
+      ARCHESTRA_WEBSITE_DEPLOY_GITHUB_APP_ID:
         required: true
-        description: Vercel deploy hook URL for the website
+        description: App ID for the Archestra Website Deploy GitHub App
+      ARCHESTRA_WEBSITE_DEPLOY_GITHUB_APP_PRIVATE_KEY:
+        required: true
+        description: Private key for the Archestra Website Deploy GitHub App
   workflow_dispatch:
 
 permissions: {}
@@ -16,11 +24,37 @@ concurrency:
 
 jobs:
   trigger-website-deploy:
-    name: Trigger Website Vercel Deploy
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    name: Refresh archestra.ai Docs
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: website-deploy
+      deployment: false # A secrets and branch gate; nothing is deployed.
+    permissions:
+      contents: read
     steps:
-      - name: Trigger Vercel Deploy Hook
+      - name: Checkout GitHub App token action
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions/github-app-token
+
+      - name: Generate website deployment token
+        id: generate-token
+        uses: archestra-ai/.github/actions/github-app-token@c3001f82a468e05482bd7c8cd08ff97f94e80d2e # v1.14.0
+        with:
+          app-id: ${{ secrets.ARCHESTRA_WEBSITE_DEPLOY_GITHUB_APP_ID }}
+          private-key: ${{ secrets.ARCHESTRA_WEBSITE_DEPLOY_GITHUB_APP_PRIVATE_KEY }}
+          owner: archestra-ai
+          repositories: website
+          permission-actions: write
+
+      - name: Dispatch website deploy workflow
         env:
-          VERCEL_DEPLOY_HOOK_URL: ${{ secrets.WEBSITE_VERCEL_DEPLOY_HOOK_URL }}
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          DOCS_REF: ${{ github.sha }}
         run: |
-          curl -X POST "$VERCEL_DEPLOY_HOOK_URL"
+          gh workflow run deploy-docs.yml \
+            --repo archestra-ai/website \
+            --ref main \
+            -f "docs_ref=$DOCS_REF"

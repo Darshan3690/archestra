@@ -1,20 +1,23 @@
 import {
   type ArchestraToolShortName,
+  extractMcpHumanRuling,
   extractMcpToolError,
-  TOOL_SWAP_AGENT_SHORT_NAME,
-  TOOL_SWAP_TO_DEFAULT_AGENT_SHORT_NAME,
+  type McpHumanRuling,
   TOOL_TODO_WRITE_SHORT_NAME,
-} from "@shared";
+} from "@archestra/shared";
 import type { DynamicToolUIPart, ToolUIPart } from "ai";
+import { resolveEnabledToolIds } from "@/lib/chat/enabled-tools-selection";
 import {
+  isNoDeviceError,
   parseAuthRequired,
   parseExpiredAuth,
-  parsePolicyDenied,
 } from "@/lib/chat/mcp-error-ui";
-import {
-  applyPendingActions,
-  type PendingToolAction,
-} from "@/lib/chat/pending-tool-state";
+import type { PendingToolAction } from "@/lib/chat/pending-tool-state";
+
+const POLICY_PREVIEW_TOOL_SHORT_NAMES: ReadonlySet<string> = new Set([
+  "preview_guardrails_policy_change",
+  "preview_guardrails_validation_change",
+]);
 
 /**
  * Compute the default set of enabled tool IDs for a conversation.
@@ -48,17 +51,14 @@ export function getCurrentEnabledToolIds({
   defaultEnabledToolIds: string[];
   pendingActions: PendingToolAction[];
 }): string[] {
-  if (conversationId && hasCustomSelection) {
-    return enabledToolIds;
-  }
-
-  const baseIds = defaultEnabledToolIds;
-
-  if (!conversationId && pendingActions.length > 0) {
-    return applyPendingActions(baseIds, pendingActions);
-  }
-
-  return baseIds;
+  return resolveEnabledToolIds({
+    hasCustomSelection: Boolean(conversationId && hasCustomSelection),
+    enabledToolIds,
+    allToolIds: defaultEnabledToolIds,
+    // Pending actions are a pre-conversation concept; once a conversation
+    // exists its stored selection is authoritative.
+    pendingActions: conversationId ? [] : pendingActions,
+  });
 }
 
 export function getToolErrorText({
@@ -112,16 +112,45 @@ export function getCompactToolState({
 }: {
   part: ToolUIPart | DynamicToolUIPart;
   toolResultPart: ToolUIPart | DynamicToolUIPart | null;
-}): "running" | "completed" | "error" {
+}): "running" | "completed" | "error" | "denied" {
   if (getToolErrorText({ part, toolResultPart })) {
     return "error";
+  }
+
+  // The remedy executed, but the user denied the reviewed tool call.
+  // Mark the tool as denied instead of completed.
+  if (extractMcpHumanRuling(toolResultPart?.output ?? part.output) === "deny") {
+    return "denied";
   }
 
   if (toolResultPart || part.state === "output-available") {
     return "completed";
   }
 
+  // A declined approval is terminal — without this it would fall through to
+  // "running" and render a blue pulsing dot forever. Surface it as "denied".
+  if (part.state === "output-denied") {
+    return "denied";
+  }
+
   return "running";
+}
+
+/**
+ * Returns display text for a reviewed remedy decision.
+ * Returns null if the result contains an error or lacks a human ruling.
+ */
+export function getHumanRulingDisplay({
+  part,
+  toolResultPart,
+}: {
+  part: ToolUIPart | DynamicToolUIPart;
+  toolResultPart: ToolUIPart | DynamicToolUIPart | null;
+}): { ruling: McpHumanRuling; label: string } | null {
+  if (getToolErrorText({ part, toolResultPart })) return null;
+  const ruling = extractMcpHumanRuling(toolResultPart?.output ?? part.output);
+  if (!ruling) return null;
+  return { ruling, label: HUMAN_RULING_LABELS[ruling] };
 }
 
 export function isCompactEligible(params: {
@@ -133,11 +162,7 @@ export function isCompactEligible(params: {
   const { part, toolResultPart, toolName, getToolShortName } = params;
 
   const shortName = getToolShortName?.(toolName);
-  if (
-    shortName === TOOL_SWAP_AGENT_SHORT_NAME ||
-    shortName === TOOL_SWAP_TO_DEFAULT_AGENT_SHORT_NAME ||
-    shortName === TOOL_TODO_WRITE_SHORT_NAME
-  ) {
+  if (shortName === TOOL_TODO_WRITE_SHORT_NAME) {
     return false;
   }
 
@@ -158,23 +183,75 @@ export function isCompactEligible(params: {
       return false;
     }
 
-    if (
-      parsePolicyDenied(errorText) ||
-      parseExpiredAuth(errorText) ||
-      parseAuthRequired(errorText)
-    ) {
+    if (isAuthErrorText(errorText, toolResultPart ?? part)) {
+      return false;
+    }
+
+    // No device runs the MCP bridge: the card that sets it up stays open.
+    if (isNoDeviceError({ errorText })) {
       return false;
     }
 
     return true;
   }
 
+  // A proposed policy is what the operator is asked to approve: its preview
+  // stays open in the reply instead of folding into a circle. A saved change
+  // folds as usual; its banner reports the save.
+  if (shortName && POLICY_PREVIEW_TOOL_SHORT_NAMES.has(shortName)) {
+    return false;
+  }
+
   const rawOutput = toolResultPart?.output ?? part.output;
   if (typeof rawOutput === "string") {
-    if (parseExpiredAuth(rawOutput) || parseAuthRequired(rawOutput)) {
+    if (isAuthErrorText(rawOutput, toolResultPart ?? part)) {
       return false;
     }
   }
 
   return true;
 }
+
+/**
+ * A denial notice carries the blocked call's arguments in their wire form.
+ * When that form is a JSON string, show the object it holds.
+ */
+export function withParsedArguments(
+  input: ToolUIPart["input"],
+): ToolUIPart["input"] {
+  if (typeof input !== "object" || input === null) return input;
+  const { arguments: args } = input as { arguments?: unknown };
+  if (typeof args !== "string") return input;
+  try {
+    return {
+      ...(input as Record<string, unknown>),
+      arguments: JSON.parse(args),
+    };
+  } catch {
+    return input;
+  }
+}
+
+const HUMAN_RULING_LABELS: Record<McpHumanRuling, string> = {
+  approve: "Approved by you",
+  deny: "Denied by you",
+  superseded: "Policy changed, the agent will ask again",
+};
+
+/**
+ * Whether a tool's error or output text asks the user to (re)authenticate.
+ * Memoized per message part: the transcript re-checks every tool part on
+ * every render, and parts are stable objects while their text is unchanged.
+ */
+function isAuthErrorText(text: string, source: object): boolean {
+  const cached = authErrorTextCache.get(source);
+  if (cached && cached.text === text) return cached.result;
+  const result = !!(parseExpiredAuth(text) || parseAuthRequired(text));
+  authErrorTextCache.set(source, { text, result });
+  return result;
+}
+
+const authErrorTextCache = new WeakMap<
+  object,
+  { text: string; result: boolean }
+>();

@@ -25,25 +25,31 @@ export const ChatCompletionUsageSchema = z
     `https://github.com/openai/openai-node/blob/master/src/resources/completions.ts#L113`,
   );
 
-export const FinishReasonSchema = z.enum([
-  "stop",
-  "length",
-  "tool_calls",
-  "content_filter",
-  "function_call",
-]);
+// Persisted interactions are re-validated on read-back, so this must tolerate any
+// finish_reason an upstream provider (e.g. OpenRouter-fronted models) actually emits;
+// one nonconforming row would otherwise 500 the entire GET /api/interactions response.
+export const FinishReasonSchema = z
+  .enum(["stop", "length", "tool_calls", "content_filter", "function_call"])
+  .or(z.string());
 
 const ChoiceSchema = z
   .object({
     finish_reason: FinishReasonSchema,
-    index: z.number(),
-    logprobs: z.any().nullable(),
+    // Some OpenAI-compatible upstreams omit `index` on choices; without
+    // optional() the response fails serialization (500).
+    index: z.number().optional(),
+    // Log probabilities may be omitted when the upstream did not request them.
+    logprobs: z.any().nullable().optional(),
     message: z
       .object({
-        content: z.string().nullable(),
+        // Tool-call-only replies often omit `content` entirely; requiring the
+        // key fails Fastify response serialization (500). Match Cerebras.
+        content: z.string().nullable().optional(),
         refusal: z.string().nullable().optional(),
         role: z.enum(["assistant"]),
-        annotations: z.array(z.any()).optional(),
+        // Some OpenAI-compatible upstreams return `annotations: null` instead of
+        // omitting it; without nullable() the response fails serialization (500).
+        annotations: z.array(z.any()).nullable().optional(),
         audio: z.any().nullable().optional(),
         function_call: z
           .object({
@@ -55,6 +61,10 @@ const ChoiceSchema = z
           .describe(
             `https://github.com/openai/openai-node/blob/v6.0.0/src/resources/chat/completions/completions.ts#L431`,
           ),
+        // DeepSeek-style reasoning models return thinking in `reasoning_content`
+        // and require it passed back on tool-call turns; response serialization
+        // must preserve it or clients can never satisfy that contract.
+        reasoning_content: z.string().nullable().optional(),
         tool_calls: z.array(ToolCallSchema).nullable().optional(),
       })
       .describe(
@@ -65,15 +75,75 @@ const ChoiceSchema = z
     `https://github.com/openai/openai-node/blob/v6.0.0/src/resources/chat/completions/completions.ts#L311`,
   );
 
+// Declare the envelope so Fastify preserves and validates output constraints.
+// JSON Schema itself is provider-validated; keep its keywords and nested values.
+const ResponseFormatSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("text") }),
+  z.object({ type: z.literal("json_object") }),
+  z.object({
+    type: z.literal("json_schema"),
+    json_schema: z.object({
+      name: z.string(),
+      description: z.string().optional(),
+      schema: z.record(z.string(), z.unknown()).optional(),
+      strict: z.boolean().nullable().optional(),
+    }),
+  }),
+]);
+
 export const ChatCompletionRequestSchema = z
   .object({
     model: z.string(),
     messages: z.array(MessageParamSchema),
     tools: z.array(ToolSchema).optional(),
     tool_choice: ToolChoiceOptionSchema.optional(),
+    response_format: ResponseFormatSchema.optional(),
     temperature: z.number().nullable().optional(),
     max_tokens: z.number().nullable().optional(),
+    // Fastify's zod validation replaces the body with the parsed value, so a
+    // field must be declared here to reach the adapter. Reasoning models
+    // reject `max_tokens` and take `max_completion_tokens` instead (the
+    // AI-SDK converts automatically), and `reasoning_effort` is how callers
+    // bound or disable reasoning — both have to survive this schema.
+    max_completion_tokens: z.number().int().positive().nullable().optional(),
+    prompt_cache_key: z.string().nullable().optional(),
+    prompt_cache_retention: z.enum(["in-memory", "24h"]).nullable().optional(),
+    prompt_cache_options: z
+      .object({
+        mode: z.enum(["implicit", "explicit"]).optional(),
+        ttl: z.string().optional(),
+      })
+      .passthrough()
+      .optional(),
+    // Some OpenAI-compatible providers accept "max" reasoning effort.
+    // Forward it unchanged; the upstream model decides which efforts it supports.
+    reasoning_effort: z
+      .enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+      .nullable()
+      .optional(),
+    // Audio generation is opt-in. Preserve these fields through validation so
+    // audio-capable Chat Completions deployments receive the requested modality.
+    modalities: z
+      .array(z.enum(["text", "audio"]))
+      .nullable()
+      .optional(),
+    audio: z
+      .object({
+        voice: z.string(),
+        format: z.enum(["wav", "aac", "mp3", "flac", "opus", "pcm16"]),
+      })
+      .nullable()
+      .optional(),
     stream: z.boolean().nullable().optional(),
+    stream_options: z
+      .object({ include_usage: z.boolean().optional() })
+      .nullable()
+      .optional(),
+    // A stable end-user identifier some clients send for abuse detection and
+    // request grouping. Cursor stamps it on every BYOK request; session
+    // extraction reads it as the lowest-priority session-id signal
+    // (sessionSource "openai_user"), so it must survive validation.
+    user: z.string().optional(),
   })
   .describe(
     `https://github.com/openai/openai-node/blob/v6.0.0/src/resources/chat/completions/completions.ts#L1487`,
@@ -98,7 +168,9 @@ export const ChatCompletionResponseSchema = z
 
 const ResponsesInputItemSchema = z
   .object({
-    type: z.string(),
+    // Optional: Responses "easy input message" items carry only role/content
+    // and omit `type` (it defaults to "message"); the AI SDK emits this shape.
+    type: z.string().optional(),
   })
   .passthrough()
   .describe(
@@ -149,6 +221,14 @@ export const ResponsesRequestSchema = z
   .describe(
     "https://developers.openai.com/api/reference/resources/responses/methods/create",
   );
+
+export const ResponsesCompactRequestSchema = z.object({
+  model: z.string(),
+  input: z.union([z.string(), z.array(ResponsesInputItemSchema)]).optional(),
+  instructions: z.string().nullable().optional(),
+  previous_response_id: z.string().nullable().optional(),
+  prompt_cache_key: z.string().nullable().optional(),
+});
 
 export const ResponsesUsageSchema = z
   .object({
@@ -210,26 +290,36 @@ const ResponsesFunctionCallSchema = z
     "https://developers.openai.com/api/reference/resources/responses#(resource)%20responses%20%3E%20(model)%20response%20%3E%20(schema)",
   );
 
+const ResponsesOutputItemSchema = z.union([
+  ResponsesOutputMessageSchema,
+  ResponsesFunctionCallSchema,
+  z.object({ type: z.string() }).passthrough(),
+]);
+
 export const ResponsesResponseSchema = z
   .object({
     id: z.string(),
     object: z.literal("response"),
     created_at: z.number(),
     model: z.string(),
-    output: z.array(
-      z.union([
-        ResponsesOutputMessageSchema,
-        ResponsesFunctionCallSchema,
-        z.object({ type: z.string() }).passthrough(),
-      ]),
-    ),
+    output: z.array(ResponsesOutputItemSchema),
     status: z.string(),
-    usage: ResponsesUsageSchema.optional(),
+    usage: ResponsesUsageSchema.nullable().optional(),
   })
   .passthrough()
   .describe(
     "https://developers.openai.com/api/reference/resources/responses#(resource)%20responses%20%3E%20(model)%20response%20%3E%20(schema)",
   );
+
+export const ResponsesCompactedResponseSchema = z
+  .object({
+    id: z.string(),
+    object: z.literal("response.compaction"),
+    created_at: z.number(),
+    output: z.array(ResponsesOutputItemSchema),
+    usage: ResponsesUsageSchema,
+  })
+  .passthrough();
 
 // ===== Embeddings API =====
 
@@ -251,7 +341,11 @@ export const EmbeddingResponseSchema = z.object({
     z.object({
       object: z.literal("embedding"),
       embedding: z.array(z.number()),
-      index: z.number(),
+      // OpenAI itself always sends `index`, but the openai routes also front
+      // arbitrary OpenAI-compatible upstreams via custom base URLs, and a
+      // deviating upstream that omits it would fail response serialization
+      // (500). Tolerated like ChoiceSchema.index above.
+      index: z.number().optional(),
     }),
   ),
   model: z.string(),

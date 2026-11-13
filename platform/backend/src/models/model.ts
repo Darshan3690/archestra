@@ -1,22 +1,69 @@
-import type { SupportedProvider } from "@shared";
-import { and, eq, ilike, inArray, notInArray, or, sql } from "drizzle-orm";
-import db, { schema } from "@/database";
+import {
+  CACHE_PRICE_MULTIPLIERS,
+  PROVIDERS_BILLING_NO_TOKEN_RATE,
+  type SupportedProvider,
+  stripClaudeContextVariantSuffix,
+} from "@archestra/shared";
+import type { AzureModelEvidence } from "@archestra/shared/azure-models";
+import {
+  and,
+  count,
+  eq,
+  ilike,
+  inArray,
+  notInArray,
+  or,
+  sql,
+} from "drizzle-orm";
+import { sanitizeOutputLimit } from "@/clients/models-dev-client";
+import db, { schema, type Transaction, withDbTransaction } from "@/database";
+import { PreparedQuery } from "@/database/prepared-query";
 import logger from "@/logging";
+import { resolveBedrockAwsPrices } from "@/services/bedrock-aws-pricing";
+import { mediaPricingFor } from "@/services/media-pricing";
+import { resolveVendorPublishedPriceSchedule } from "@/services/vendor-published-pricing";
 import type {
   CreateModel,
   Model,
   ModelCapabilities,
+  ModelDefaultParameters,
   PatchModelBody,
   PriceSource,
 } from "@/types";
+import { ApiError } from "@/types";
+import type {
+  ProviderModelPricing,
+  ProviderPricedModel,
+} from "@/types/provider-model-pricing";
+import ModelTeamModel from "./model-team";
+import ResourcePermissionPolicyModel from "./resource-permission-policy";
+import type { ResourceAccessFilter } from "./resource-permission-subject";
 
 /**
- * Effective pricing result with source tracking.
+ * Effective pricing result with source tracking. All prices are per-million
+ * tokens as decimal strings. Cache prices are null when the model's provider has
+ * no cache pricing model (neither explicit nor multiplier-derivable).
  */
 interface EffectivePricing {
-  pricePerMillionInput: string;
-  pricePerMillionOutput: string;
+  pricePerMillionInput: string | null;
+  pricePerMillionOutput: string | null;
   source: PriceSource;
+  /** Cache-read price per million tokens, or null when unpriced. */
+  pricePerMillionCacheRead: string | null;
+  /** Cache-write price per million tokens at the default (5m) TTL, or null when unpriced. */
+  pricePerMillionCacheWrite: string | null;
+  /** Source of the cache price, or null when unpriced. */
+  cacheSource: PriceSource | null;
+}
+
+/** Whether a prompt of `promptTokens` is priced at a long-context tier starting above `threshold`. */
+export function isLongContextPrompt(
+  threshold: number | null,
+  promptTokens: number | undefined,
+): boolean {
+  return (
+    threshold !== null && promptTokens !== undefined && promptTokens > threshold
+  );
 }
 
 /**
@@ -29,7 +76,7 @@ interface EffectivePricing {
  *    that the value should be updated later with the correct pricing.
  * 2. Companies may have custom pricing. If we used the “official” model prices here,
  *    it would be harder to notice when the pricing is incorrect.
- * 3. Smaller models may be used in Optimization Rules. Even if pricing isn’t configured,
+ * 3. Cheaper models are still worth pricing distinctly. Even if pricing isn’t configured,
  *    we still want to surface potential cost savings.
  */
 function getDefaultModelPrice(model: string): {
@@ -48,7 +95,253 @@ function getDefaultModelPrice(model: string): {
   };
 }
 
+/**
+ * Resolve one cache direction (read or write) with per-field precedence:
+ * custom override → registry-synced → multiplier-derived from the input price.
+ * Returns a null price + null source when none of those apply.
+ */
+function resolveCacheDirection(params: {
+  custom: string | null | undefined;
+  syncedPerToken: string | null | undefined;
+  multiplierFactor: number | undefined;
+  effectivePricePerMillionInput: number;
+}): { price: string | null; source: PriceSource | null } {
+  const {
+    custom,
+    syncedPerToken,
+    multiplierFactor,
+    effectivePricePerMillionInput,
+  } = params;
+  if (custom != null) {
+    return { price: custom, source: "custom" };
+  }
+  if (syncedPerToken != null) {
+    return {
+      price: formatPerMillionPrice(
+        Number.parseFloat(syncedPerToken) * 1_000_000,
+      ),
+      source: "models_dev",
+    };
+  }
+  if (multiplierFactor !== undefined) {
+    return {
+      price: formatPerMillionPrice(
+        effectivePricePerMillionInput * multiplierFactor,
+      ),
+      source: "derived_multiplier",
+    };
+  }
+  return { price: null, source: null };
+}
+
+/**
+ * Collapse the read/write cache-price sources into one label for display,
+ * favouring the most authoritative direction: custom → models.dev → derived.
+ *
+ * It reads `derived_multiplier` (the "estimated" signal) only when BOTH
+ * directions are derived. This matters because providers that don't charge for
+ * cache writes (OpenAI/Gemini/DeepSeek) always derive a structurally-zero write;
+ * that known-zero must not make a model with a real synced cache-read price
+ * appear estimated. (Synced-read + non-zero-derived-write does not occur in
+ * practice — the providers with a non-zero write surcharge publish both prices.)
+ */
+function combineCacheSource(
+  readSource: PriceSource | null,
+  writeSource: PriceSource | null,
+): PriceSource {
+  const sources = [readSource, writeSource].filter(
+    (s): s is PriceSource => s != null,
+  );
+  if (sources.includes("custom")) return "custom";
+  if (sources.includes("models_dev")) return "models_dev";
+  return "derived_multiplier";
+}
+
+/**
+ * Format a per-million price as a precise, trailing-zero-free string.
+ *
+ * Callers compute cost by parsing this back, so rounding it to the cent quietly
+ * becomes a billing error: $0.035/M reads as $0.04, a 14% overstatement, and
+ * anything under $0.005/M reads as free. Padding for display is the reading
+ * end's job.
+ */
+function formatPerMillionPrice(perMillion: number): string {
+  return perMillion.toFixed(8).replace(/\.?0+$/, "");
+}
+
+/**
+ * Read the Modelfile `num_ctx` out of the provider-reported defaults.
+ *
+ * `defaultParameters` is parsed from Ollama's free-form `parameters` text block,
+ * so the value arrives as a string as often as a number, and an unrecognised
+ * block can put anything here. Coerce narrowly and let the caller's
+ * `sanitizeOutputLimit` reject whatever is left — this feeds the context ring
+ * and the compaction threshold, so a bad parse must fall back rather than
+ * propagate.
+ */
+function readOllamaDefaultNumCtx(
+  defaultParameters: ModelDefaultParameters | null | undefined,
+): number | null {
+  // A Modelfile may set the same PARAMETER twice, which the fetcher collects
+  // into an array. Ollama itself is last-wins, so take the final entry rather
+  // than rejecting the whole value and falling back to the architectural
+  // window — that fallback is the very overstatement this resolution exists
+  // to prevent.
+  const collected = defaultParameters?.num_ctx;
+  const raw = Array.isArray(collected) ? collected.at(-1) : collected;
+  if (typeof raw === "number") return raw;
+  if (typeof raw !== "string") return null;
+  const parsed = Number(raw.trim());
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** Ollama's local model name: default host/library/latest and case-insensitive parts.
+ * This is availability matching only; never rewrite the provider-bound model ID.
+ */
+function ollamaAvailabilityName(id: string): string | undefined {
+  // ParseRef trims Unicode White_Space, then separates explicit local/cloud
+  // source selection from the model tag.
+  const trim = (value: string) => {
+    let from = 0;
+    let to = value.length;
+    // Scan only the ends: a trailing-whitespace regex can backtrack across a
+    // long invalid interior run before the provider rejects the model name.
+    while (from < to && /\p{White_Space}/u.test(value.charAt(from))) from++;
+    while (to > from && /\p{White_Space}/u.test(value.charAt(to - 1))) to--;
+    return value.slice(from, to);
+  };
+  const sourceOf = (value: string) => {
+    const separator = value.lastIndexOf(":");
+    if (separator < 0) return undefined;
+    const suffix = trim(value.slice(separator + 1));
+    const lower = suffix.toLowerCase();
+    if (lower === "local" || lower === "cloud")
+      return { base: value.slice(0, separator), cloud: lower === "cloud" };
+    if (!suffix.includes("/") && lower.endsWith("-cloud"))
+      return {
+        base: value.slice(0, separator + 1) + suffix.slice(0, -6),
+        cloud: true,
+      };
+    return undefined;
+  };
+  id = trim(id);
+  const source = sourceOf(id);
+  if (source && sourceOf(source.base)) return undefined;
+  id = source?.base ?? id;
+  // ParseName ignores the scheme for local identity; it does not validate it as
+  // a URL scheme. Registry, namespace, model and tag remain distinct.
+  const scheme = id.indexOf("://");
+  const parts = id.slice(scheme < 0 ? 0 : scheme + 3).split("/");
+  if (parts.length > 3 || (scheme >= 0 && parts.length !== 3)) return undefined;
+  const leaf = parts.at(-1) ?? "";
+  const separator = leaf.lastIndexOf(":");
+  const model = separator < 0 ? leaf : leaf.slice(0, separator);
+  const tag = separator < 0 ? "latest" : leaf.slice(separator + 1);
+  const namespace = parts.length > 1 ? parts.at(-2) : "library";
+  const host = parts.length === 3 ? parts[0] : "registry.ollama.ai";
+  if (
+    !/^[a-z0-9_][a-z0-9_.-]{0,79}$/i.test(model) ||
+    !/^[a-z0-9_][a-z0-9_.-]{0,79}$/i.test(tag) ||
+    !namespace ||
+    !/^[a-z0-9_][a-z0-9_-]{0,79}$/i.test(namespace) ||
+    !/^[a-z0-9_][a-z0-9_.:-]{0,349}$/i.test(host)
+  )
+    return undefined;
+  return `${source?.cloud ? "cloud" : "local"}:${host}/${namespace}/${model}:${tag}`.toLowerCase();
+}
+
 class ModelModel {
+  /** Check the resolved provider/model immediately before starting an execution. */
+  static async assertAvailable(params: {
+    provider: SupportedProvider;
+    modelId: string;
+    /** Equivalent spellings supplied only by a trusted endpoint resolver. */
+    aliases?: string[];
+  }): Promise<void> {
+    const modelId = stripClaudeContextVariantSuffix(params.modelId);
+    // Read current state, not a cached catalog or the request's admission snapshot:
+    // a request may have waited for throughput or for another pool member.
+    // Gemini's native and OpenAI-compatible adapters accept both spellings.
+    const providerAliases =
+      params.provider === "gemini"
+        ? [
+            modelId.replace(/^models\//, ""),
+            `models/${modelId.replace(/^models\//, "")}`,
+          ]
+        : [];
+    let hidden: Pick<Model, "modelId"> | undefined;
+    if (params.provider === "ollama" || params.provider === "ollama-native") {
+      const ids = new Set([modelId, ...(params.aliases ?? [])]);
+      const canonicalNames = new Set(
+        [...ids]
+          .map(ollamaAvailabilityName)
+          .filter((name) => name !== undefined),
+      );
+      // Only hidden IDs are needed. Compare both names using Ollama's defaults;
+      // exact-only lookup lets omitted tags/default registries bypass Hidden.
+      const hiddenModels = await db
+        .select({ modelId: schema.modelsTable.modelId })
+        .from(schema.modelsTable)
+        .where(
+          and(
+            eq(schema.modelsTable.provider, params.provider),
+            eq(schema.modelsTable.ignored, true),
+          ),
+        );
+      hidden = hiddenModels.find(
+        (model) =>
+          ids.has(model.modelId) ||
+          canonicalNames.has(ollamaAvailabilityName(model.modelId) ?? ""),
+      );
+    } else {
+      const models = await ModelModel.findByProviderModelIds(
+        [
+          ...new Set([modelId, ...providerAliases, ...(params.aliases ?? [])]),
+        ].map((id) => ({
+          provider: params.provider,
+          modelId: id,
+        })),
+      );
+      hidden = [...models.values()].find((model) => model.ignored);
+    }
+    if (hidden) {
+      throw new ApiError(
+        403,
+        `Model ${hidden.modelId} is hidden and cannot be used. Show the model in the model catalog to enable it.`,
+        "model_hidden",
+      );
+    }
+  }
+
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  /**
+   * The ids among `ids` that pass a list's `access` and `sharedWith`
+   * filters. Models are synced, not authored, so none is "mine" and an
+   * owner filter matches nothing.
+   */
+  static async idsMatchingAccess(params: {
+    organizationId: string;
+    ids: string[];
+    access: ResourceAccessFilter;
+  }): Promise<Set<string>> {
+    if (params.ids.length === 0) return new Set();
+    const condition = ResourcePermissionPolicyModel.accessRelationCondition({
+      ...params.access,
+      organizationId: params.organizationId,
+      resource: "llmModel",
+      scopeColumn: schema.modelsTable.id,
+      ownerColumn: sql`NULL`,
+    });
+    const rows = await db
+      .select({ id: schema.modelsTable.id })
+      .from(schema.modelsTable)
+      .where(and(inArray(schema.modelsTable.id, params.ids), condition));
+    return new Set(rows.map((row) => row.id));
+  }
+  // SPDX-SnippetEnd
+
   /**
    * Find all models discovered via LLM Proxy requests.
    */
@@ -96,6 +389,59 @@ class ModelModel {
     return result || null;
   }
 
+  /** The model row, locked against concurrent edits until `tx` ends. */
+  static async findByIdForUpdate(
+    id: string,
+    tx: Transaction,
+  ): Promise<Model | null> {
+    const [result] = await tx
+      .select()
+      .from(schema.modelsTable)
+      .where(eq(schema.modelsTable.id, id))
+      .for("update");
+
+    return result || null;
+  }
+
+  /**
+   * The models a bulk route was asked to act on, read in one query rather than
+   * one per id. Model rows are global rather than per organization, so unlike
+   * the other bulk loaders there is no tenancy fence to apply here — the route
+   * gate (`llmModel:update`) is the whole permission story.
+   */
+  static async findByIds(ids: string[], tx?: Transaction): Promise<Model[]> {
+    if (ids.length === 0) {
+      return [];
+    }
+    return await (tx ?? db)
+      .select()
+      .from(schema.modelsTable)
+      .where(inArray(schema.modelsTable.id, ids));
+  }
+
+  /**
+   * Ids, names and visibility for a bulk route's audit record, on both sides of
+   * the write. Nothing but what the batch can change.
+   */
+  static async findVisibilityForBulkAudit(
+    ids: string[],
+  ): Promise<Array<{ id: string; modelId: string; ignored: boolean }>> {
+    if (ids.length === 0) {
+      return [];
+    }
+    const rows = await db
+      .select({
+        id: schema.modelsTable.id,
+        modelId: schema.modelsTable.modelId,
+        ignored: schema.modelsTable.ignored,
+      })
+      .from(schema.modelsTable)
+      .where(inArray(schema.modelsTable.id, ids))
+      // Sorted so an unchanged batch snapshots identically on both sides.
+      .orderBy(schema.modelsTable.id);
+    return rows.map((row) => ({ ...row, ignored: row.ignored === true }));
+  }
+
   /**
    * Find model by provider and model ID
    */
@@ -103,17 +449,22 @@ class ModelModel {
     provider: SupportedProvider,
     modelId: string,
   ): Promise<Model | null> {
-    const [result] = await db
-      .select()
-      .from(schema.modelsTable)
-      .where(
-        and(
-          eq(schema.modelsTable.provider, provider),
-          eq(schema.modelsTable.modelId, modelId),
-        ),
-      );
+    const [result] = await ModelModel.byProviderAndModel
+      .get()
+      .execute({ provider, modelId });
 
     return result || null;
+  }
+
+  /** Proxy discovery and authorization need identity, not pricing/capability payloads. */
+  static async findIdentityByProviderAndModelId(
+    provider: SupportedProvider,
+    modelId: string,
+  ) {
+    const [model] = await ModelModel.identityByProviderAndModel
+      .get()
+      .execute({ provider, modelId });
+    return model ?? null;
   }
 
   /**
@@ -150,7 +501,7 @@ class ModelModel {
 
   /**
    * Find text chat models by exact model ID across providers.
-   * Used by the OpenAI-compatible model router to resolve a client-supplied
+   * Used by the OpenAI-compatible unified model API to resolve a client-supplied
    * model name to the provider that owns it.
    */
   static async findTextChatModelsByModelId(params: {
@@ -172,15 +523,46 @@ class ModelModel {
   }
 
   /**
+   * Find embedding models by exact model ID across providers.
+   */
+  static async findEmbeddingModelsByModelId(params: {
+    modelId: string;
+    provider?: SupportedProvider;
+  }): Promise<Model[]> {
+    const conditions = [eq(schema.modelsTable.modelId, params.modelId)];
+
+    if (params.provider) {
+      conditions.push(eq(schema.modelsTable.provider, params.provider));
+    }
+
+    const results = await db
+      .select()
+      .from(schema.modelsTable)
+      .where(and(...conditions));
+
+    return results.filter((model) => ModelModel.supportsEmbeddings(model));
+  }
+
+  /**
    * Create new model
    */
   static async create(data: CreateModel): Promise<Model> {
-    const [result] = await db
-      .insert(schema.modelsTable)
-      .values(data)
-      .returning();
+    return withDbTransaction(async (tx) => {
+      const [result] = await tx
+        .insert(schema.modelsTable)
+        .values(data)
+        .returning();
 
-    return result;
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      await ResourcePermissionPolicyModel.initializeModels({
+        tx,
+        modelIds: [result.id],
+      });
+      // SPDX-SnippetEnd
+      return result;
+    });
   }
 
   /**
@@ -188,31 +570,52 @@ class ModelModel {
    * Does NOT overwrite customPricePerMillionInput/Output on conflict.
    */
   static async upsert(data: CreateModel): Promise<Model> {
-    const [result] = await db
-      .insert(schema.modelsTable)
-      .values(data)
-      .onConflictDoUpdate({
-        target: [schema.modelsTable.provider, schema.modelsTable.modelId],
-        set: {
-          externalId: data.externalId,
-          description: data.description,
-          contextLength: sql`COALESCE(${schema.modelsTable.contextLength}, excluded.context_length)`,
-          inputModalities: sql`COALESCE(${schema.modelsTable.inputModalities}, excluded.input_modalities)`,
-          outputModalities: sql`COALESCE(${schema.modelsTable.outputModalities}, excluded.output_modalities)`,
-          supportsToolCalling: sql`COALESCE(${schema.modelsTable.supportsToolCalling}, excluded.supports_tool_calling)`,
-          promptPricePerToken: data.promptPricePerToken,
-          completionPricePerToken: data.completionPricePerToken,
-          embeddingDimensions: sql`COALESCE(${schema.modelsTable.embeddingDimensions}, excluded.embedding_dimensions)`,
-          lastSyncedAt: new Date(),
-          updatedAt: new Date(),
-          // NOTE: customPricePerMillionInput/Output intentionally NOT updated
-          // NOTE: capability fields only backfill when the existing DB value is null
-          // to preserve user-edited values while still populating missing metadata
-        },
-      })
-      .returning();
+    return withDbTransaction(async (tx) => {
+      const [result] = await tx
+        .insert(schema.modelsTable)
+        .values(data)
+        .onConflictDoUpdate({
+          target: [schema.modelsTable.provider, schema.modelsTable.modelId],
+          set: {
+            externalId: data.externalId,
+            description: data.description,
+            contextLength: sql`COALESCE(${schema.modelsTable.contextLength}, excluded.context_length)`,
+            // Unlike the other capability fields, outputLength has no admin editor
+            // and is used as an output-token safety cap, so prefer the freshly
+            // synced value (keeping the last known value only when the sync omits it)
+            // — a lowered provider cap must propagate, not be pinned forever.
+            outputLength: sql`COALESCE(excluded.output_length, ${schema.modelsTable.outputLength})`,
+            inputModalities: sql`COALESCE(${schema.modelsTable.inputModalities}, excluded.input_modalities)`,
+            outputModalities: sql`COALESCE(${schema.modelsTable.outputModalities}, excluded.output_modalities)`,
+            supportsToolCalling: sql`COALESCE(${schema.modelsTable.supportsToolCalling}, excluded.supports_tool_calling)`,
+            promptPricePerToken: data.promptPricePerToken,
+            completionPricePerToken: data.completionPricePerToken,
+            cacheReadPricePerToken: data.cacheReadPricePerToken,
+            cacheWritePricePerToken: data.cacheWritePricePerToken,
+            embeddingDimensions: sql`COALESCE(${schema.modelsTable.embeddingDimensions}, excluded.embedding_dimensions)`,
+            // Display-only provider metadata (not user-editable): prefer the fresh
+            // synced value so changed Ollama defaults show up, keeping the last
+            // known value only when a sync omits it (e.g. a transient /api/show miss).
+            defaultParameters: sql`COALESCE(excluded.default_parameters, ${schema.modelsTable.defaultParameters})`,
+            lastSyncedAt: new Date(),
+            updatedAt: new Date(),
+            // NOTE: custom price overrides (input/output/cache) intentionally NOT updated
+            // NOTE: capability fields only backfill when the existing DB value is null
+            // to preserve user-edited values while still populating missing metadata
+          },
+        })
+        .returning();
 
-    return result;
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      await ResourcePermissionPolicyModel.initializeModels({
+        tx,
+        modelIds: [result.id],
+      });
+      // SPDX-SnippetEnd
+      return result;
+    });
   }
 
   /**
@@ -221,8 +624,17 @@ class ModelModel {
    * PostgreSQL has a 65535 parameter limit, so we batch to stay well under.
    * All batches are wrapped in a transaction to ensure atomicity.
    * NOTE: Does NOT overwrite customPricePerMillionInput/Output on conflict.
+   *
+   * `fromProviderCatalog` marks the rows as models a configured provider's own
+   * catalog returned, which clears `discoveredViaLlmProxy`. The models.dev
+   * registry import must leave it unset: it upserts the whole registry
+   * regardless of which providers are configured, so a row appearing there is
+   * no evidence anyone can reach the model.
    */
-  static async bulkUpsert(dataArray: CreateModel[]): Promise<Model[]> {
+  static async bulkUpsert(
+    dataArray: CreateModel[],
+    { fromProviderCatalog = false }: { fromProviderCatalog?: boolean } = {},
+  ): Promise<Model[]> {
     if (dataArray.length === 0) {
       return [];
     }
@@ -238,7 +650,7 @@ class ModelModel {
     );
 
     // Wrap all batches in a transaction to ensure atomicity
-    const results = await db.transaction(async (tx) => {
+    const results = await withDbTransaction(async (tx) => {
       const batchResults: Model[] = [];
 
       for (let i = 0; i < dataArray.length; i += BATCH_SIZE) {
@@ -259,21 +671,53 @@ class ModelModel {
               externalId: sql`excluded.external_id`,
               description: sql`excluded.description`,
               contextLength: sql`COALESCE(${schema.modelsTable.contextLength}, excluded.context_length)`,
+              // See upsert(): outputLength prefers the fresh synced value so a
+              // lowered provider cap propagates instead of being pinned forever.
+              outputLength: sql`COALESCE(excluded.output_length, ${schema.modelsTable.outputLength})`,
               inputModalities: sql`COALESCE(${schema.modelsTable.inputModalities}, excluded.input_modalities)`,
               outputModalities: sql`COALESCE(${schema.modelsTable.outputModalities}, excluded.output_modalities)`,
               supportsToolCalling: sql`COALESCE(${schema.modelsTable.supportsToolCalling}, excluded.supports_tool_calling)`,
+              // Prefers the fresh value rather than backfilling like the row
+              // above: nothing user-editable writes this column, and an Ollama
+              // tag can be repointed at a model that thinks (or stops
+              // thinking), so a stale `true` would leave the composer offering
+              // a depth the server now rejects. The last known value survives a
+              // sync that says nothing.
+              supportsReasoningEffort: sql`COALESCE(excluded.supports_reasoning_effort, ${schema.modelsTable.supportsReasoningEffort})`,
               promptPricePerToken: sql`excluded.prompt_price_per_token`,
               completionPricePerToken: sql`excluded.completion_price_per_token`,
+              cacheReadPricePerToken: sql`excluded.cache_read_price_per_token`,
+              cacheWritePricePerToken: sql`excluded.cache_write_price_per_token`,
               embeddingDimensions: sql`COALESCE(${schema.modelsTable.embeddingDimensions}, excluded.embedding_dimensions)`,
+              // Display-only provider metadata (not user-editable): prefer the
+              // fresh synced value so changed Ollama defaults show up, keeping
+              // the last known value only when a sync omits it.
+              defaultParameters: sql`COALESCE(excluded.default_parameters, ${schema.modelsTable.defaultParameters})`,
               lastSyncedAt: sql`excluded.last_synced_at`,
               updatedAt: sql`NOW()`,
-              // NOTE: customPricePerMillionInput/Output intentionally NOT updated
+              // The proxy marks a row it creates for an id no catalog had
+              // listed, which exempts it from deleteOrphanedModels so a custom
+              // price survives having no API key link. A configured provider's
+              // catalog returning the id makes it an ordinary synced model, and
+              // leaving the mark set would exempt it from that cleanup forever.
+              ...(fromProviderCatalog
+                ? { discoveredViaLlmProxy: sql`false` }
+                : {}),
+              // NOTE: custom price overrides (input/output/cache) intentionally NOT updated
               // NOTE: capability fields only backfill when the existing DB value is null
               // to preserve user-edited values while still populating missing metadata
             },
           })
           .returning();
 
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        await ResourcePermissionPolicyModel.initializeModels({
+          tx,
+          modelIds: insertedBatch.map((model) => model.id),
+        });
+        // SPDX-SnippetEnd
         batchResults.push(...insertedBatch);
       }
 
@@ -291,6 +735,11 @@ class ModelModel {
   /**
    * Bulk upsert models, overwriting ALL fields including user-edited values.
    * Used by the "full refresh" flow to reset models to provider defaults.
+   *
+   * Resetting a row to provider defaults is only meaningful for a model the
+   * provider actually serves, so this path is always a provider-catalog sync
+   * and clears `discoveredViaLlmProxy` unconditionally — unlike
+   * {@link ModelModel.bulkUpsert}, which the registry import also uses.
    */
   static async bulkUpsertFull(dataArray: CreateModel[]): Promise<Model[]> {
     if (dataArray.length === 0) {
@@ -305,7 +754,7 @@ class ModelModel {
       "Starting batched full model upsert",
     );
 
-    const results = await db.transaction(async (tx) => {
+    const results = await withDbTransaction(async (tx) => {
       const batchResults: Model[] = [];
 
       for (let i = 0; i < dataArray.length; i += BATCH_SIZE) {
@@ -326,20 +775,42 @@ class ModelModel {
               externalId: sql`excluded.external_id`,
               description: sql`excluded.description`,
               contextLength: sql`excluded.context_length`,
+              outputLength: sql`excluded.output_length`,
               inputModalities: sql`excluded.input_modalities`,
               outputModalities: sql`excluded.output_modalities`,
               supportsToolCalling: sql`excluded.supports_tool_calling`,
+              supportsReasoningEffort: sql`excluded.supports_reasoning_effort`,
               promptPricePerToken: sql`excluded.prompt_price_per_token`,
               completionPricePerToken: sql`excluded.completion_price_per_token`,
+              cacheReadPricePerToken: sql`excluded.cache_read_price_per_token`,
+              cacheWritePricePerToken: sql`excluded.cache_write_price_per_token`,
               embeddingDimensions: sql`excluded.embedding_dimensions`,
+              defaultParameters: sql`excluded.default_parameters`,
               customPricePerMillionInput: sql`NULL`,
               customPricePerMillionOutput: sql`NULL`,
+              customPricePerMillionCacheRead: sql`NULL`,
+              customPricePerMillionCacheWrite: sql`NULL`,
+              // Reset with the custom prices beside them: this path exists to
+              // put a row back to what the provider says, and leaving an
+              // admin-set window in place would keep overriding exactly the
+              // column the refresh just replaced.
+              customContextLength: sql`NULL`,
+              customOutputLength: sql`NULL`,
+              discoveredViaLlmProxy: sql`false`,
               lastSyncedAt: sql`excluded.last_synced_at`,
               updatedAt: sql`NOW()`,
             },
           })
           .returning();
 
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        await ResourcePermissionPolicyModel.initializeModels({
+          tx,
+          modelIds: insertedBatch.map((model) => model.id),
+        });
+        // SPDX-SnippetEnd
         batchResults.push(...insertedBatch);
       }
 
@@ -352,6 +823,189 @@ class ModelModel {
     );
 
     return results;
+  }
+
+  /**
+   * Overwrite the modalities and tool support of rows a catalog sync already
+   * wrote. These are the classification columns {@link ModelModel.bulkUpsert}
+   * keeps once set; a model the fetcher classified from its id needs them
+   * replaced, but none of the administrator's overrides (custom prices and
+   * limits) that only {@link ModelModel.bulkUpsertFull} resets. An entry with no
+   * stored row for its provider and model id is skipped, not inserted.
+   */
+  static async applyAuthoritativeCapabilities(
+    rows: Pick<
+      CreateModel,
+      | "provider"
+      | "modelId"
+      | "inputModalities"
+      | "outputModalities"
+      | "supportsToolCalling"
+    >[],
+  ): Promise<void> {
+    if (rows.length === 0) return;
+
+    const BATCH_SIZE = 50;
+    await withDbTransaction(async (tx) => {
+      for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+        const values = sql.join(
+          rows
+            .slice(i, i + BATCH_SIZE)
+            .map(
+              (row) =>
+                sql`(${row.provider}::text, ${row.modelId}::text, ${jsonbOrNull(row.inputModalities)}::jsonb, ${jsonbOrNull(row.outputModalities)}::jsonb, ${row.supportsToolCalling ?? null}::boolean)`,
+            ),
+          sql`, `,
+        );
+        await tx
+          .update(schema.modelsTable)
+          .set({
+            inputModalities: sql`fresh.input_modalities`,
+            outputModalities: sql`fresh.output_modalities`,
+            supportsToolCalling: sql`fresh.supports_tool_calling`,
+            updatedAt: sql`NOW()`,
+          })
+          .from(
+            sql`(VALUES ${values}) AS fresh(provider, model_id, input_modalities, output_modalities, supports_tool_calling)`,
+          )
+          .where(
+            and(
+              eq(schema.modelsTable.provider, sql`fresh.provider`),
+              eq(schema.modelsTable.modelId, sql`fresh.model_id`),
+            ),
+          );
+      }
+    });
+  }
+
+  /** Remove an unconfigured proxy-discovered entry, retaining request history. */
+  static async deleteUnused(id: string) {
+    return withDbTransaction(async (tx) => {
+      // Serialize catalog writes first: refreshes write models before their
+      // policies, so taking the policy lock first can deadlock with a refresh.
+      // Name references and policy scopes have no model FK; keep their writers
+      // out until eligibility checks and this rare cleanup commit together.
+      await tx.execute(sql`LOCK TABLE ${schema.modelsTable},
+        ${schema.organizationsTable}, ${schema.modelPoolMembersTable}
+        IN SHARE ROW EXCLUSIVE MODE`);
+      const [model] = await tx
+        .select()
+        .from(schema.modelsTable)
+        .where(eq(schema.modelsTable.id, id))
+        .for("update");
+      if (!model) return { status: "not_found" } as const;
+      // Chats and agents acquire the model FK row lock before creating their
+      // policy. Let those transactions finish before locking the policy table.
+      await tx.execute(sql`LOCK TABLE ${schema.resourcePermissionPoliciesTable}
+        IN SHARE ROW EXCLUSIVE MODE`);
+
+      // Unknown prices are null, even when the UI displays a fallback. An explicit
+      // zero is still saved pricing and must survive this cleanup operation.
+      const configuredValues = [
+        model.promptPricePerToken,
+        model.completionPricePerToken,
+        model.cacheReadPricePerToken,
+        model.cacheWritePricePerToken,
+        model.customPricePerMillionInput,
+        model.customPricePerMillionOutput,
+        model.customPricePerMillionCacheRead,
+        model.customPricePerMillionCacheWrite,
+        model.longContextThreshold,
+        model.customContextLength,
+        model.customOutputLength,
+        model.configuredParameters,
+        model.inputModalities,
+        model.outputModalities,
+        model.embeddingDimensions,
+      ];
+      if (
+        !model.discoveredViaLlmProxy ||
+        model.ignored ||
+        configuredValues.some((value) => value !== null)
+      ) {
+        return { status: "ineligible" } as const;
+      }
+      const configuredLinks = await tx.execute(sql`
+        SELECT 1 FROM ${schema.llmProviderApiKeyModelsTable} WHERE model_id = ${id}
+        UNION ALL SELECT 1 FROM ${schema.modelLabelsTable} WHERE model_id = ${id}
+        UNION ALL SELECT 1 FROM ${schema.modelTeamsTable} WHERE model_id = ${id}
+        UNION ALL SELECT 1 FROM ${schema.modelUsersTable} WHERE model_id = ${id}
+      `);
+      if (configuredLinks.rows.length) return { status: "ineligible" } as const;
+
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      // Only untouched discovery defaults may be cleaned up with the row.
+      const editedPolicies = await tx.execute(sql`
+        SELECT 1 FROM ${schema.resourcePermissionPoliciesTable}
+        WHERE resource = 'llmModel' AND scope = ${id}
+          AND (revision <> 1 OR NOT legacy_sharing_migrated
+            OR legacy_organization_audience
+            OR grants <> '[{"subject":{"type":"organization","id":"*"},"actions":["read","use"]}]'::jsonb)
+      `);
+      if (editedPolicies.rows.length) return { status: "ineligible" } as const;
+      // SPDX-SnippetEnd
+
+      // The row lock also serializes new FK references (defaults/backfills)
+      // with deletion. Check all organizations: model metadata is global.
+      const references = await tx.execute<{ reason: string }>(sql`
+        SELECT 'a default model or knowledge setting' AS reason
+        WHERE EXISTS (
+          SELECT 1 FROM ${schema.organizationsTable} o
+          WHERE o.default_model_id = ${id} OR o.default_fast_model_id = ${id}
+            OR o.default_smart_model_id = ${id}
+            OR EXISTS (
+              SELECT 1 FROM ${schema.llmProviderApiKeysTable} k
+              WHERE k.provider = ${model.provider} AND (
+                (o.embedding_chat_api_key_id = k.id AND o.embedding_model = ${model.modelId})
+                OR (o.reranker_chat_api_key_id = k.id AND o.reranker_model = ${model.modelId})
+                OR (o.ocr_chat_api_key_id = k.id AND o.ocr_model = ${model.modelId})
+              )
+            )
+        )
+        UNION ALL SELECT 'a member default' WHERE EXISTS (
+          SELECT 1 FROM ${schema.membersTable} WHERE default_model_id = ${id}
+        )
+        UNION ALL SELECT 'an agent' WHERE EXISTS (
+          SELECT 1 FROM ${schema.agentsTable} WHERE model_id = ${id}
+        )
+        UNION ALL SELECT 'an existing chat' WHERE EXISTS (
+          SELECT 1 FROM ${schema.conversationsTable}
+          WHERE model_id = ${id}
+        )
+        UNION ALL SELECT 'a routing decision' WHERE EXISTS (
+          SELECT 1 FROM ${schema.routingDecisionsTable} WHERE model_id = ${id}
+        )
+        UNION ALL SELECT 'guardrails' WHERE EXISTS (
+          SELECT 1 FROM ${schema.guardrailsDeploymentTable} WHERE annotator_model_id = ${id}
+        )
+        UNION ALL SELECT 'a model pool' WHERE EXISTS (
+          SELECT 1 FROM ${schema.modelPoolMembersTable} m
+          JOIN ${schema.llmProviderApiKeysTable} k ON k.id = m.provider_api_key_id
+          WHERE m.model_id = ${model.modelId} AND k.provider = ${model.provider}
+        )
+        UNION ALL SELECT 'cost recompute history' WHERE EXISTS (
+          SELECT 1 FROM ${schema.modelCostBackfillsTable}
+          WHERE model_id = ${id}
+        )
+      `);
+      if (references.rows.length) {
+        return { status: "in_use", reason: references.rows[0].reason } as const;
+      }
+
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      await ResourcePermissionPolicyModel.deleteForTarget({
+        tx,
+        resources: ["llmModel"],
+        scope: id,
+      });
+      // SPDX-SnippetEnd
+      await tx.delete(schema.modelsTable).where(eq(schema.modelsTable.id, id));
+      return { status: "deleted" } as const;
+    });
   }
 
   /**
@@ -426,6 +1080,22 @@ class ModelModel {
     if (data.customPricePerMillionOutput !== undefined) {
       set.customPricePerMillionOutput = data.customPricePerMillionOutput;
     }
+    if (data.customPricePerMillionCacheRead !== undefined) {
+      set.customPricePerMillionCacheRead = data.customPricePerMillionCacheRead;
+    }
+    if (data.customPricePerMillionCacheWrite !== undefined) {
+      set.customPricePerMillionCacheWrite =
+        data.customPricePerMillionCacheWrite;
+    }
+    for (const field of [
+      "longContextThreshold",
+      "longContextPricePerMillionInput",
+      "longContextPricePerMillionOutput",
+      "longContextPricePerMillionCacheRead",
+      "longContextPricePerMillionCacheWrite",
+    ] as const) {
+      if (data[field] !== undefined) set[field] = data[field];
+    }
     if (data.ignored !== undefined) {
       set.ignored = data.ignored;
     }
@@ -437,6 +1107,15 @@ class ModelModel {
     }
     if (data.embeddingDimensions !== undefined) {
       set.embeddingDimensions = data.embeddingDimensions;
+    }
+    if (data.configuredParameters !== undefined) {
+      set.configuredParameters = data.configuredParameters;
+    }
+    if (data.customContextLength !== undefined) {
+      set.customContextLength = data.customContextLength;
+    }
+    if (data.customOutputLength !== undefined) {
+      set.customOutputLength = data.customOutputLength;
     }
 
     const [result] = await db
@@ -450,41 +1129,244 @@ class ModelModel {
 
   /**
    * Ensure a model entry exists for the given modelId and provider.
-   * Marks the model as discovered via LLM Proxy so it's preserved even
-   * without API key links (users can set custom pricing for metrics).
-   * Used by LLM proxy to ensure models are tracked even before models.dev sync.
+   * Newly inserted rows are marked as discovered via LLM Proxy so custom
+   * models can be priced for metrics. Existing synced provider models keep
+   * their source classification so deleting the provider key can clean them up.
    */
   static async ensureModelExists(
     modelId: string,
     provider: SupportedProvider,
-  ): Promise<void> {
-    await db
-      .insert(schema.modelsTable)
-      .values({
-        externalId: `${provider}/${modelId}`,
-        provider,
-        modelId,
-        discoveredViaLlmProxy: true,
-        lastSyncedAt: new Date(),
-      })
-      .onConflictDoUpdate({
-        target: [schema.modelsTable.provider, schema.modelsTable.modelId],
-        set: {
+  ): Promise<Model | null> {
+    // Most calls refer to a catalogued model. Read it without opening a
+    // transaction or attempting a conflicting INSERT on every request.
+    if (await ModelModel.findByProviderAndModelId(provider, modelId))
+      return null;
+    return withDbTransaction(async (tx) => {
+      // RETURNING yields a row only when this call did the insert, which is what
+      // tells the caller a model was seen for the first time and still needs its
+      // registry data. On conflict it yields nothing, so a repeat sighting costs
+      // one statement and leaves the existing row untouched.
+      const [inserted] = await tx
+        .insert(schema.modelsTable)
+        .values({
+          externalId: `${provider}/${modelId}`,
+          provider,
+          modelId,
           discoveredViaLlmProxy: true,
-        },
-      });
+          lastSyncedAt: new Date(),
+        })
+        .onConflictDoNothing()
+        .returning();
+
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      // A model the proxy meets mid-request needs its default policy in the
+      // same breath: the request's own access check runs right after this, and
+      // a catalogued model with no policy of its own is reachable by nobody.
+      if (inserted)
+        await ResourcePermissionPolicyModel.initializeModels({
+          tx,
+          modelIds: [inserted.id],
+        });
+      // SPDX-SnippetEnd
+      return inserted ?? null;
+    });
   }
 
   /**
-   * Get effective pricing for a model using 3-tier priority:
+   * Write registry-sourced price and limits onto a model, leaving every other
+   * column (custom prices, team links, provenance) as it is.
+   */
+  static async applyRegistryCapabilities(
+    id: string,
+    capabilities: {
+      promptPricePerToken: string | null;
+      completionPricePerToken: string | null;
+      cacheReadPricePerToken: string | null;
+      cacheWritePricePerToken: string | null;
+      contextLength: number | null;
+      outputLength: number | null;
+      supportsToolCalling: boolean | null;
+      supportsReasoningEffort: boolean | null;
+    },
+  ): Promise<void> {
+    await db
+      .update(schema.modelsTable)
+      .set({ ...capabilities, lastSyncedAt: new Date() })
+      .where(eq(schema.modelsTable.id, id));
+  }
+
+  /** Attach rates for a selected instance, without mutating the shared catalog.
+   * A merged listing with different rates has no single price to display. */
+  static withProviderPricing(
+    model: Model,
+    prices: Array<ProviderModelPricing | null>,
+  ): ProviderPricedModel {
+    if (!prices.length || prices.every((price) => price === null)) return model;
+    const distinct = new Set(prices.map((price) => JSON.stringify(price)));
+    if (distinct.size > 1)
+      return {
+        ...model,
+        providerPricing: "conflicting",
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        cacheReadPricePerToken: null,
+        cacheWritePricePerToken: null,
+      };
+    return { ...model, ...prices[0], providerPricing: prices[0] ?? undefined };
+  }
+
+  /** The effective threshold used by both routing plans and request pricing. */
+  static getLongContextThreshold(model: ProviderPricedModel): number | null {
+    if (model.longContextThreshold !== null) return model.longContextThreshold;
+    if (model.providerPricing) return null;
+    const schedule = resolveVendorPublishedPriceSchedule(model);
+    if (!schedule) return null;
+    const short = ModelModel.getEffectivePricing(
+      model,
+      undefined,
+      undefined,
+      schedule.threshold,
+    );
+    const long = ModelModel.getEffectivePricing(
+      model,
+      undefined,
+      undefined,
+      schedule.threshold + 1,
+    );
+    // Custom prices can make the published tier irrelevant, including a model
+    // with an unpublished cache direction. Do not constrain routing in that case.
+    return short.pricePerMillionInput !== long.pricePerMillionInput ||
+      short.pricePerMillionOutput !== long.pricePerMillionOutput ||
+      short.pricePerMillionCacheRead !== long.pricePerMillionCacheRead ||
+      short.pricePerMillionCacheWrite !== long.pricePerMillionCacheWrite
+      ? schedule.threshold
+      : null;
+  }
+
+  /**
+   * Get effective pricing for a model.
+   *
+   * Input/output price uses 3-tier priority:
    * 1. Custom admin-set price (customPricePerMillionInput/Output) — if non-null
-   * 2. models.dev synced price (promptPricePerToken/completionPricePerToken × 1M) — if non-null
-   * 3. Default fallback ($30 for mini/haiku/nano models, $50 for others)
+   * 2. Selected instance price (USD/token × 1M), preserving unknown directions
+   * 3. Registry price, then the existing default estimate when no instance metadata exists
+   *
+   * Cache read/write price uses its own 3-tier priority:
+   * 1. Custom admin-set cache price — if non-null
+   * 2. models.dev synced cache price — if non-null
+   * 3. Derived from the effective input price via the provider's cache multiplier
+   *
+   * Cache prices are null when the provider has no cache pricing model and none
+   * was synced/set (so cache cost is not fabricated for non-caching providers).
+   *
+   * Published context schedules replace incomplete flat catalogs, below custom
+   * overrides and selected-instance pricing. An explicit custom schedule
+   * replaces the published threshold and long rates.
    */
   static getEffectivePricing(
+    model: ProviderPricedModel | null,
+    modelId?: string,
+    /** Provider hint used for cache-price derivation when `model` is null (default tier). */
+    provider?: SupportedProvider,
+    /** Input + cache read + cache write tokens of the priced request. */
+    promptTokens?: number,
+  ): EffectivePricing {
+    if (model?.providerPricing && model.providerPricing !== "conflicting") {
+      model = { ...model, ...model.providerPricing };
+    }
+    const resolvedProvider = model?.provider ?? provider;
+    const schedule =
+      resolvedProvider && !model?.providerPricing
+        ? resolveVendorPublishedPriceSchedule({
+            provider: resolvedProvider,
+            modelId: model?.modelId ?? modelId ?? "",
+          })
+        : null;
+    const published = schedule
+      ? isLongContextPrompt(
+          model?.longContextThreshold == null ? schedule.threshold : null,
+          promptTokens,
+        )
+        ? schedule.long
+        : schedule.short
+      : undefined;
+    const base = ModelModel.getEffectiveBasePricing(
+      model,
+      modelId,
+      provider,
+      published,
+    );
+    const instance = model?.providerPricing;
+    const useInstance = instance && base.source !== "custom";
+    const pricePerMillionInput = useInstance
+      ? instance === "conflicting" || instance.promptPricePerToken === null
+        ? null
+        : formatPerMillionPrice(
+            Number(instance.promptPricePerToken) * 1_000_000,
+          )
+      : base.pricePerMillionInput;
+    const pricePerMillionOutput = useInstance
+      ? instance === "conflicting" || instance.completionPricePerToken === null
+        ? null
+        : formatPerMillionPrice(
+            Number(instance.completionPricePerToken) * 1_000_000,
+          )
+      : base.pricePerMillionOutput;
+    const source = useInstance ? "provider" : base.source;
+    const cache = ModelModel.getEffectiveCachePricing(
+      model,
+      pricePerMillionInput,
+      provider,
+      published,
+    );
+
+    const cacheSource =
+      cache.cacheSource === "models_dev" &&
+      (model?.providerPricing || published)
+        ? "provider"
+        : cache.cacheSource;
+    if (
+      model &&
+      isLongContextPrompt(model.longContextThreshold, promptTokens)
+    ) {
+      // The CHECK constraint makes the threshold and all four prices all-or-none.
+      // They are configured on the model, so they are no estimate even when
+      // the base rates fell back to the default.
+      const longSource = "custom";
+      return {
+        pricePerMillionInput: model.longContextPricePerMillionInput,
+        pricePerMillionOutput: model.longContextPricePerMillionOutput,
+        pricePerMillionCacheRead: model.longContextPricePerMillionCacheRead,
+        pricePerMillionCacheWrite: model.longContextPricePerMillionCacheWrite,
+        source: longSource,
+        cacheSource: longSource,
+      };
+    }
+
+    return {
+      pricePerMillionInput,
+      pricePerMillionOutput,
+      source,
+      ...cache,
+      cacheSource,
+    };
+  }
+
+  /**
+   * Resolve the effective input/output price (per million) and its source.
+   */
+  private static getEffectiveBasePricing(
     model: Model | null,
     modelId?: string,
-  ): EffectivePricing {
+    provider?: SupportedProvider,
+    published?: ProviderModelPricing,
+  ): {
+    pricePerMillionInput: string | null;
+    pricePerMillionOutput: string | null;
+    source: PriceSource;
+  } {
     // Tier 1: Custom admin-set price
     if (
       model?.customPricePerMillionInput != null &&
@@ -497,47 +1379,148 @@ class ModelModel {
       };
     }
 
-    // Tier 2: models.dev synced price (convert per-token to per-million)
+    if (
+      published?.promptPricePerToken != null &&
+      published.completionPricePerToken != null
+    ) {
+      return {
+        pricePerMillionInput: formatPerMillionPrice(
+          Number(published.promptPricePerToken) * 1_000_000,
+        ),
+        pricePerMillionOutput: formatPerMillionPrice(
+          Number(published.completionPricePerToken) * 1_000_000,
+        ),
+        source: "provider",
+      };
+    }
+
+    // Tier 2: registry-synced price (convert per-token to per-million). The
+    // stored columns do not record which registry supplied them, so the source
+    // is re-derived by re-running the AWS snapshot lookup. AWS only fills what
+    // models.dev omits, so matching the stored value is what identifies it as
+    // the source; a mismatch means the registry won. When both agree the
+    // attribution is ambiguous and either label describes the same number.
     if (
       model?.promptPricePerToken != null &&
       model?.completionPricePerToken != null
     ) {
+      const awsPrices = resolveBedrockAwsPrices({
+        provider: model.provider,
+        modelId: model.modelId,
+      });
+      // Compared as numbers: both sides are decimal strings, but the stored one
+      // has been through Postgres numeric and carries its scale's trailing
+      // zeros, so "0.0000033" and "0.00000330" are the same price.
+      const samePrice = (a: string | null, b: string) =>
+        a != null && Number.parseFloat(a) === Number.parseFloat(b);
+      const syncedSource: PriceSource =
+        samePrice(
+          awsPrices?.promptPricePerToken ?? null,
+          model.promptPricePerToken,
+        ) &&
+        samePrice(
+          awsPrices?.completionPricePerToken ?? null,
+          model.completionPricePerToken,
+        )
+          ? "aws"
+          : "models_dev";
       return {
-        pricePerMillionInput: (
-          Number.parseFloat(model.promptPricePerToken) * 1_000_000
-        ).toFixed(2),
-        pricePerMillionOutput: (
-          Number.parseFloat(model.completionPricePerToken) * 1_000_000
-        ).toFixed(2),
-        source: "models_dev",
+        pricePerMillionInput: formatPerMillionPrice(
+          Number.parseFloat(model.promptPricePerToken) * 1_000_000,
+        ),
+        pricePerMillionOutput: formatPerMillionPrice(
+          Number.parseFloat(model.completionPricePerToken) * 1_000_000,
+        ),
+        source: syncedSource,
       };
     }
 
-    // Tier 3: Default fallback
+    // vLLM deployment costs are operator-defined. Missing rates are unknown,
+    // while explicit custom or instance zeroes have already resolved above.
+    const resolvedProvider = model?.provider ?? provider;
+    if (resolvedProvider === "vllm") {
+      return {
+        pricePerMillionInput: null,
+        pricePerMillionOutput: null,
+        source: "default",
+      };
+    }
+
+    // Ollama retains its zero fallback; other providers keep the estimate.
+    if (
+      resolvedProvider &&
+      PROVIDERS_BILLING_NO_TOKEN_RATE.has(resolvedProvider)
+    ) {
+      return {
+        pricePerMillionInput: "0.00",
+        pricePerMillionOutput: "0.00",
+        source: "default",
+      };
+    }
+
     const nameForDefault = model?.modelId ?? modelId ?? "";
-    const defaults = getDefaultModelPrice(nameForDefault);
     return {
-      ...defaults,
+      ...getDefaultModelPrice(nameForDefault),
       source: "default",
     };
   }
 
   /**
-   * Calculate TOON cost savings for a model based on tokens saved.
-   * Looks up the model and its effective pricing, then computes savings.
+   * Resolve the effective cache read/write price (per million) and its source.
+   * `effectivePricePerMillionInput` is the already-resolved input price used for
+   * the multiplier-derived fallback tier.
    */
-  static async calculateCostSavings(
-    modelId: string,
-    tokensSaved: number,
-    provider: SupportedProvider,
-  ): Promise<number> {
-    const modelEntry = await ModelModel.findByProviderAndModelId(
-      provider,
-      modelId,
-    );
-    const pricing = ModelModel.getEffectivePricing(modelEntry, modelId);
-    const inputPricePerToken = Number(pricing.pricePerMillionInput) / 1_000_000;
-    return tokensSaved * inputPricePerToken;
+  private static getEffectiveCachePricing(
+    model: ProviderPricedModel | null,
+    effectivePricePerMillionInput: string | null,
+    providerHint?: SupportedProvider,
+    published?: ProviderModelPricing,
+  ): {
+    pricePerMillionCacheRead: string | null;
+    pricePerMillionCacheWrite: string | null;
+    cacheSource: PriceSource | null;
+  } {
+    // Read and write are resolved independently: a registry may price one
+    // direction and not the other (e.g. OpenAI/Gemini publish a cache-read
+    // price but no cache-write price), so we must not discard a known price
+    // just because its counterpart is missing.
+    const provider = model?.provider ?? providerHint;
+    const multiplier = provider ? CACHE_PRICE_MULTIPLIERS[provider] : undefined;
+    const priceIn = Number.parseFloat(effectivePricePerMillionInput ?? "0");
+
+    const read = resolveCacheDirection({
+      custom: model?.customPricePerMillionCacheRead,
+      syncedPerToken: published
+        ? published.cacheReadPricePerToken
+        : model?.cacheReadPricePerToken,
+      multiplierFactor:
+        model?.providerPricing || published ? undefined : multiplier?.read,
+      effectivePricePerMillionInput: priceIn,
+    });
+    const write = resolveCacheDirection({
+      custom: model?.customPricePerMillionCacheWrite,
+      syncedPerToken: published
+        ? published.cacheWritePricePerToken
+        : model?.cacheWritePricePerToken,
+      multiplierFactor:
+        model?.providerPricing || published ? undefined : multiplier?.write,
+      effectivePricePerMillionInput: priceIn,
+    });
+
+    if (read.price === null && write.price === null) {
+      // Provider has no cache pricing model; leave cache unpriced.
+      return {
+        pricePerMillionCacheRead: null,
+        pricePerMillionCacheWrite: null,
+        cacheSource: null,
+      };
+    }
+
+    return {
+      pricePerMillionCacheRead: read.price,
+      pricePerMillionCacheWrite: write.price,
+      cacheSource: combineCacheSource(read.source, write.source),
+    };
   }
 
   /**
@@ -556,49 +1539,229 @@ class ModelModel {
     return result || null;
   }
 
+  static async findByModelIdsOnly(
+    modelIds: string[],
+  ): Promise<Map<string, Model>> {
+    if (modelIds.length === 0) {
+      return new Map();
+    }
+
+    const results = await db
+      .select()
+      .from(schema.modelsTable)
+      .where(inArray(schema.modelsTable.modelId, modelIds));
+
+    const map = new Map<string, Model>();
+    for (const result of results) {
+      if (!map.has(result.modelId)) {
+        map.set(result.modelId, result);
+      }
+    }
+
+    return map;
+  }
+
+  static async findByProviderAndModelIds(
+    provider: SupportedProvider,
+    modelIds: string[],
+  ): Promise<Map<string, Model>> {
+    if (!modelIds.length) return new Map();
+    const rows = await db
+      .select()
+      .from(schema.modelsTable)
+      .where(
+        and(
+          eq(schema.modelsTable.provider, provider),
+          inArray(schema.modelsTable.modelId, modelIds),
+        ),
+      );
+    return new Map(rows.map((row) => [row.modelId, row]));
+  }
+
+  /**
+   * The model's architectural context window: the admin-set override when one
+   * exists, otherwise whatever the provider reported. This is the ceiling
+   * `num_ctx` is validated against and the input to
+   * {@link ModelModel.resolveEffectiveContextLength} — not what to display,
+   * since an Ollama Modelfile can still cap the window below it.
+   */
+  static resolveArchitecturalContextLength(
+    model: Pick<Model, "contextLength" | "customContextLength">,
+  ): number | null {
+    return (
+      sanitizeOutputLimit(model.customContextLength) ??
+      sanitizeOutputLimit(model.contextLength)
+    );
+  }
+
+  /**
+   * The model's maximum output tokens: the admin-set override when one exists,
+   * otherwise the synced limit. Null when neither is known, which callers read
+   * as "unknown" and answer with their own fallback budget.
+   */
+  static resolveEffectiveOutputLength(
+    model: Pick<Model, "outputLength" | "customOutputLength">,
+  ): number | null {
+    return (
+      sanitizeOutputLimit(model.customOutputLength) ??
+      sanitizeOutputLimit(model.outputLength)
+    );
+  }
+
   /**
    * Get model capabilities for API response.
    * Uses getEffectivePricing for pricing resolution.
    */
-  static toCapabilities(model: Model | null): ModelCapabilities {
+  /**
+   * The context window to DISPLAY and gate on, resolved in three tiers:
+   *
+   * 1. A native-Ollama model with a configured `num_ctx` enforces exactly that
+   *    window, because Archestra sends it on every turn.
+   * 2. Otherwise, a Modelfile `num_ctx` reported by `/api/show` — Ollama applies
+   *    it whether or not we send anything, and it is what actually truncates.
+   * 3. Otherwise the architectural `context_length`.
+   *
+   * `context_length` alone overstates the window whenever Ollama is capped,
+   * producing the "ring shows 262K while Ollama truncates at 8K" symptom: no
+   * compaction fires, the model loses its system prompt, and nothing errors.
+   * Tier 2 costs nothing — `parseOllamaParameters` already stores the value and
+   * it was simply never read.
+   *
+   * Clamped to the architectural window, and tier 1 is gated on `ollama-native`
+   * since `/v1` cannot carry `num_ctx`. Both are defence in depth for the update
+   * route, which already rejects those cases: this drives the context ring, the
+   * A2A step-context guard and the output-token budget, so an inflated value
+   * pushes auto-compaction past the point where the conversation still fits.
+   *
+   * A server-level `OLLAMA_CONTEXT_LENGTH` cap remains invisible here — it is
+   * absent from `/api/show` and readable only from `/api/ps` while the model is
+   * loaded. Setting `num_ctx` explicitly is the escape hatch for that case.
+   */
+  static resolveEffectiveContextLength(model: Model): number | null {
+    const architectural = ModelModel.resolveArchitecturalContextLength(model);
+    const isOllama =
+      model.provider === "ollama" || model.provider === "ollama-native";
+
+    const configured =
+      model.provider === "ollama-native"
+        ? sanitizeOutputLimit(model.configuredParameters?.num_ctx)
+        : null;
+    // Only Ollama's fetcher writes `defaultParameters` today, but gate it
+    // anyway: `num_ctx` means "the window Ollama enforces" and would be
+    // meaningless — and silently shrink the window — coming from anywhere else.
+    const modelfile = isOllama
+      ? sanitizeOutputLimit(readOllamaDefaultNumCtx(model.defaultParameters))
+      : null;
+
+    const resolved = configured ?? modelfile;
+    if (resolved === null) {
+      return architectural;
+    }
+    return architectural === null
+      ? resolved
+      : Math.min(resolved, architectural);
+  }
+
+  /**
+   * `recommendedForAgents` is not a `models` column: the verdict is
+   * endpoint-scoped and lives on the `api_key_models` link, so callers that
+   * list models per key pass the aggregate along. Callers with no link in
+   * hand omit it, which reads as "no evidence" and surfaces nothing.
+   */
+  static toCapabilities(
+    model: ProviderPricedModel | null,
+    recommendedForAgents: boolean | null = null,
+  ): ModelCapabilities {
     if (!model) {
       return {
         contextLength: null,
         inputModalities: null,
         outputModalities: null,
         supportsToolCalling: null,
+        supportsReasoningEffort: null,
+        supportedEndpoints: null,
+        recommendedForAgents: null,
         pricePerMillionInput: null,
         pricePerMillionOutput: null,
         isCustomPrice: false,
         priceSource: "default",
+        pricePerMillionCacheRead: null,
+        pricePerMillionCacheWrite: null,
+        cachePriceSource: null,
+        mediaPricing: null,
       };
     }
 
     const pricing = ModelModel.getEffectivePricing(model);
 
     return {
-      contextLength: model.contextLength,
-      inputModalities: model.inputModalities,
-      outputModalities: model.outputModalities,
-      supportsToolCalling: model.supportsToolCalling,
+      contextLength: ModelModel.resolveEffectiveContextLength(model),
+      inputModalities: model.azureCapabilities
+        ? (model.azureCapabilities.inputModalities ?? null)
+        : model.inputModalities,
+      outputModalities: model.azureCapabilities
+        ? (model.azureCapabilities.outputModalities ?? null)
+        : model.outputModalities,
+      // Chat's Azure media bridge produces files without running agent tools,
+      // even when the upstream model registry advertises native tool support.
+      supportsToolCalling:
+        model.provider === "azure" &&
+        ["image", "audio", "realtime", "translation"].includes(
+          model.azureCapabilities?.kind ?? "text",
+        )
+          ? false
+          : model.azureCapabilities
+            ? (model.azureCapabilities.supportsToolCalling ?? null)
+            : model.supportsToolCalling,
+      supportsReasoningEffort: model.supportsReasoningEffort,
+      supportedEndpoints: model.supportedEndpoints,
+      recommendedForAgents,
       pricePerMillionInput: pricing.pricePerMillionInput,
       pricePerMillionOutput: pricing.pricePerMillionOutput,
       isCustomPrice: pricing.source === "custom",
       priceSource: pricing.source,
+      pricePerMillionCacheRead: pricing.pricePerMillionCacheRead,
+      pricePerMillionCacheWrite: pricing.pricePerMillionCacheWrite,
+      cachePriceSource: pricing.cacheSource,
+      mediaPricing: mediaPricingFor(model.provider, model.modelId),
     };
   }
 
-  static supportsTextChat(model: Model): boolean {
+  static supportsTextChat(
+    model: Model & { azureCapabilities?: AzureModelEvidence | null },
+  ): boolean {
     if (model.ignored) {
       return false;
+    }
+
+    if (model.provider === "azure" && model.azureCapabilities) {
+      return model.azureCapabilities.operations.some((operation) =>
+        ["chat", "responses", "image-generation", "realtime-turn"].includes(
+          operation,
+        ),
+      );
     }
 
     if (model.embeddingDimensions !== null) {
       return false;
     }
 
+    // Translation uses typed text as a language setting and a WAV upload as input.
+    if (
+      model.provider === "azure" &&
+      model.azureCapabilities?.kind === "translation"
+    )
+      return true;
+
     if (model.inputModalities && !model.inputModalities.includes("text")) {
       return false;
+    }
+
+    if (
+      model.provider === "azure" &&
+      model.azureCapabilities?.kind === "image"
+    ) {
+      return true;
     }
 
     if (model.outputModalities && !model.outputModalities.includes("text")) {
@@ -607,6 +1770,119 @@ class ModelModel {
 
     return true;
   }
+
+  static supportsEmbeddings(model: ProviderPricedModel): boolean {
+    if (model.ignored) {
+      return false;
+    }
+
+    if (model.provider === "azure" && model.azureCapabilities)
+      return model.azureCapabilities.kind === "embedding";
+
+    return model.embeddingDimensions !== null;
+  }
+
+  static async countAll(): Promise<number> {
+    const [row] = await db.select({ c: count() }).from(schema.modelsTable);
+    return Number(row?.c ?? 0);
+  }
+
+  /**
+   * Snapshot for audit logs (global model row — `organizationId` is unused).
+   */
+  // Globally scoped audit snapshot: LLM model catalog entries are platform-wide;
+  // the modelsTable has no organizationId column, and the admin-only route
+  // handler is likewise unscoped. Intentional match.
+  static async findByIdForAudit(
+    id: string,
+    _organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const row = await ModelModel.findById(id);
+    if (!row) return null;
+
+    const caps = ModelModel.toCapabilities(row);
+    const teamsByModelId = await ModelTeamModel.getTeamDetailsForModels([
+      row.id,
+    ]);
+    return {
+      id: row.id,
+      modelId: row.modelId,
+      provider: row.provider,
+      description: row.description ?? null,
+      ignored: row.ignored,
+      restrictedToTeams: (teamsByModelId.get(row.id) ?? []).map(
+        (team) => team.name,
+      ),
+      embeddingDimensions: row.embeddingDimensions,
+      inputModalities: row.inputModalities ?? null,
+      outputModalities: row.outputModalities ?? null,
+      discoveredViaLlmProxy: row.discoveredViaLlmProxy,
+      // The generation parameters Archestra SENDS on every turn. Without them
+      // a parameters-only save produces an empty before/after diff — the only
+      // other field it moves is `updatedAt`, which the audit hook strips — so
+      // "who set num_predict: 1 on a globally shared model row, and when" would
+      // be unanswerable. `contextLength` below only reflects `num_ctx`.
+      configuredParameters: row.configuredParameters ?? null,
+      contextLength: caps.contextLength,
+      // Both limits are the *resolved* numbers, so an override shows up here as
+      // the value it actually changes. Without `outputLength` a save that only
+      // sets the max-output override moves nothing but `updatedAt` (which the
+      // audit hook strips), leaving an empty before/after diff.
+      outputLength: ModelModel.resolveEffectiveOutputLength(row),
+      pricePerMillionInput: caps.pricePerMillionInput,
+      pricePerMillionOutput: caps.pricePerMillionOutput,
+      isCustomPrice: caps.isCustomPrice,
+      priceSource: caps.priceSource,
+      pricePerMillionCacheRead: caps.pricePerMillionCacheRead,
+      pricePerMillionCacheWrite: caps.pricePerMillionCacheWrite,
+      cachePriceSource: caps.cachePriceSource,
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+    };
+  }
+
+  static async snapshotModelCatalogForAudit(): Promise<
+    Record<string, unknown>
+  > {
+    return { llmModelRowCount: await ModelModel.countAll() };
+  }
+
+  private static readonly byProviderAndModel = new PreparedQuery((database) =>
+    database
+      .select()
+      .from(schema.modelsTable)
+      .where(
+        and(
+          eq(schema.modelsTable.provider, sql.placeholder("provider")),
+          eq(schema.modelsTable.modelId, sql.placeholder("modelId")),
+        ),
+      )
+      .prepare("archestra_model_by_provider_and_model"),
+  );
+
+  private static readonly identityByProviderAndModel = new PreparedQuery(
+    (database) =>
+      database
+        .select({
+          id: schema.modelsTable.id,
+          provider: schema.modelsTable.provider,
+          modelId: schema.modelsTable.modelId,
+        })
+        .from(schema.modelsTable)
+        .where(
+          and(
+            eq(schema.modelsTable.provider, sql.placeholder("provider")),
+            eq(schema.modelsTable.modelId, sql.placeholder("modelId")),
+          ),
+        )
+        .prepare("archestra_proxy_model_identity"),
+  );
 }
 
 export default ModelModel;
+
+// A JSON-encoded `null` would be stored as the jsonb value `null` rather than
+// SQL NULL, which is what every other write leaves for an unknown modality.
+function jsonbOrNull(value: unknown[] | null | undefined): string | null {
+  return value == null ? null : JSON.stringify(value);
+}

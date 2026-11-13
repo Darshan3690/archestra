@@ -1,32 +1,78 @@
+import {
+  AGENT_CATALOG_IDS,
+  AGENT_CATALOG_NAMES,
+  type AgentCatalogId,
+  buildAgentCatalogRuntime,
+  buildAgentCatalogSystemPrompt,
+  buildCustomAgentRuntime,
+  isIntegrationHidden,
+  type ResourcePermissionGrant,
+  ResourcePermissionGrantSchema,
+  resolveAgentCatalogId,
+  StoredSubagentLoadBalancingConfigSchema,
+  type SubagentLoadBalancingConfig,
+  SubagentLoadBalancingConfigSchema,
+  TOOL_LIST_AGENTS_SHORT_NAME,
+  TOOL_LIST_LLM_MODELS_SHORT_NAME,
+  TOOL_LOAD_SKILL_SHORT_NAME,
+  TOOL_TRANSFER_CREDENTIAL_SHORT_NAME,
+} from "@archestra/shared";
 import { z } from "zod";
+import { slackAppFactory } from "@/agents/chatops/slack-app-factory";
 import {
   getAgentTypePermissionChecker,
   isAgentTypeAdmin,
   requireAgentModifyPermission,
 } from "@/auth/agent-type-permissions";
+import { getSkillPermissionChecker } from "@/auth/skill-permissions";
 import config from "@/config";
+import { knowledgeSourceAccessControlService } from "@/knowledge-base/source-access-control";
 import logger from "@/logging";
 import {
   AgentModel,
   KnowledgeBaseConnectorModel,
   KnowledgeBaseModel,
-  TeamModel,
+  OrganizationModel,
 } from "@/models";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import { getAgentActivationSkills } from "@/services/agent-activation-skills";
+import {
+  agentNetworkRuntimeChanged,
+  assertCanWriteAgentNetworkPolicy,
+  syncAgentNetworkRuntimes,
+} from "@/services/agent-network-policy";
+import {
+  assertAgentModelSelectionAvailable,
+  assertAgentRuntimeModelCompatibility,
+  assertAgentRuntimeTiersExist,
+  assertCanBindRuntimeCredentials,
+  requireAgentRuntimePermission,
+} from "@/services/agent-runtime/agent-config-validation";
+import { resolveDefaultEnvironmentForNewResource } from "@/services/environments/environment";
+import { ResourcePermissions } from "@/services/resource-permissions";
+import { SKILL_CATALOG_UNTRUSTED_NOTE } from "@/skills/skill-catalog-prompt";
 import type {
   Agent,
-  AgentScope,
-  ToolAssignmentMode,
+  AgentRuntime,
+  NetworkPolicy,
+  NetworkPolicyInput,
   ToolExposureMode,
 } from "@/types";
 import {
-  AgentLabelWithDetailsSchema,
+  AgentActivationSkillSchema,
+  AgentRuntimeSchema,
   AgentScopeSchema,
   AgentToolAssignmentInputSchema,
+  ApiError,
   InsertAgentSchemaBase,
+  LabelWithDetailsSchema,
+  NetworkPolicyInputSchema,
   SuggestedPromptInputSchema,
   ToolExposureModeSchema,
   UuidIdSchema,
 } from "@/types";
+import { archestraMcpBranding } from "./branding";
+import { isArchestraToolAvailableToAgent } from "./dynamic-tools";
 import {
   assignSubAgentDelegations,
   assignToolAssignments,
@@ -42,7 +88,7 @@ import type { ArchestraContext } from "./types";
 
 // === Shared schemas ===
 
-export const LabelInputSchema = AgentLabelWithDetailsSchema.pick({
+export const LabelInputSchema = LabelWithDetailsSchema.pick({
   key: true,
   value: true,
 })
@@ -86,11 +132,9 @@ export const ConnectorIdsToolInputSchema =
 
 export const CreateBaseToolArgsSchema = z
   .object({
+    initialGrants: z.array(ResourcePermissionGrantSchema).max(200).optional(),
     name: InsertAgentSchemaBase.shape.name.describe(
       "Name for the new resource.",
-    ),
-    scope: AgentScopeSchema.optional().describe(
-      "Visibility scope. Defaults to personal for agents and org for LLM proxies/MCP gateways unless teams are provided.",
     ),
     labels: z
       .array(LabelInputSchema)
@@ -98,15 +142,75 @@ export const CreateBaseToolArgsSchema = z
       .describe(
         "Optional key-value labels for organization and categorization.",
       ),
-    teams: z
-      .array(UuidIdSchema)
-      .optional()
-      .describe("Team IDs to attach when creating a team-scoped resource."),
     toolExposureMode: ToolExposureModeSchema.optional().describe(
-      "How tools should be exposed to MCP clients and models. Use 'search_and_run_only' to expose only search_tools and run_tool while keeping the full assigned tool set searchable and runnable.",
+      "How tools should be loaded for MCP clients and models. Use 'search_and_run_only' to keep the initial tool list small while letting search_tools find assigned tools and run_tool execute them. MCP gateways defer skill, file, sandbox, run lifecycle and policy-management capabilities in this mode; questions and guardrails session/peer-message controls remain directly available. search_tools summarizes the caller's available built-in capability groups as well as connected MCP servers. Manual gateways also keep explicitly assigned MCP App UI tools available for client rendering. Internal chat keeps assigned skill discovery/loading, file, sandbox and run lifecycle tools directly available for its skill activation and file guidance. App tools (scaffold_app, edit_app, read_app, render_app, list_apps, and the rest of the app surface) are reached through search_tools/run_tool in 'search_and_run_only' mode.",
     ),
+    accessAllTools: z
+      .boolean()
+      .optional()
+      .describe(
+        "Allow dynamic tool access: search_tools/run_tool may discover and run any tool the calling user can access (MCP catalog tools and knowledge sources) without assigning it to the agent. Enabling this forces toolExposureMode to 'search_and_run_only', since dynamic access only works through the search/run dispatch surface. Defaults to false. Also gated by the organization's security settings.",
+      ),
+    accessAllSubagents: z
+      .boolean()
+      .optional()
+      .describe(
+        "Allow dynamic subagent delegation: the agent may delegate to any internal agent the calling user can access, beyond explicitly-configured delegation targets (minus subagent exclusions). Defaults to false.",
+      ),
+    subagentLoadBalancing: SubagentLoadBalancingConfigSchema.nullable()
+      .optional()
+      .describe(
+        "Optional subagent load-balancing and automatic failover policy across assigned runtime subagents.",
+      ),
   })
   .strict();
+
+/**
+ * An Agent Runtime, as the agent create and edit pages offer it: one of the
+ * maintained CLI templates (the catalog cards), or a custom image. Fields left
+ * out take the value the page would start from.
+ */
+export const AgentRuntimeToolInputSchema = z
+  .union([
+    AgentRuntimeSchema.omit({
+      image: true,
+      command: true,
+      inferenceProtocol: true,
+    })
+      .partial()
+      .extend({
+        template: z
+          .enum(AGENT_CATALOG_IDS as [AgentCatalogId, ...AgentCatalogId[]])
+          .describe(
+            `Maintained CLI to run: ${AGENT_CATALOG_IDS.map((id) => `'${id}' (${AGENT_CATALOG_NAMES[id]})`).join(", ")}. The image, launch command, and model protocol come from the template.`,
+          ),
+      })
+      .strict(),
+    AgentRuntimeSchema.partial()
+      .required({ image: true })
+      .strict()
+      .describe(
+        "A custom container image. Set inferenceProtocol to the wire protocol the image speaks to the unified model API.",
+      ),
+  ])
+  .describe(
+    "Run this agent in its own container (Agent Runtime) instead of the built-in chat harness. " +
+      "Pass { template } for a maintained CLI, or { image } for a custom image. Other fields override the defaults: " +
+      "claudeCode.authentication is 'subscription' (each user signs in with their own Claude account, the default) or 'provider' (bill through llmApiKeyId/modelId); " +
+      "credentials declares environment variables a run needs (users supply values later, or use " +
+      `${TOOL_TRANSFER_CREDENTIAL_SHORT_NAME}); ttlHours, idleTimeoutMinutes, and maxCostUsd bound each run; privileged requires an agent administrator.`,
+  );
+
+type AgentRuntimeToolInput = z.infer<typeof AgentRuntimeToolInputSchema>;
+
+export const AgentModelToolInputSchemas = {
+  llmApiKeyId: UuidIdSchema.describe(
+    `Provider API key the agent uses. Set together with modelId. Use ${TOOL_LIST_LLM_MODELS_SHORT_NAME} to find both.`,
+  ),
+  modelId: UuidIdSchema.describe(
+    `Model the agent uses: the model's id from ${TOOL_LIST_LLM_MODELS_SHORT_NAME}, not its provider name. Set together with llmApiKeyId.`,
+  ),
+};
 
 export const GetResourceToolArgsSchema = z
   .object({
@@ -140,7 +244,7 @@ const AgentSuggestedPromptOutputSchema = z.object({
   prompt: z.string().describe("The suggested prompt text."),
 });
 
-export const AgentDetailOutputSchema = z.object({
+const ResourceDetailOutputSchema = z.object({
   id: z.string().describe("The resource ID."),
   name: z.string().describe("The resource name."),
   description: z
@@ -150,8 +254,23 @@ export const AgentDetailOutputSchema = z.object({
   icon: z.string().nullable().describe("The emoji icon, if configured."),
   scope: AgentScopeSchema.describe("The visibility scope."),
   toolExposureMode: ToolExposureModeSchema.describe(
-    "How tools are exposed to MCP clients and models.",
+    "How tools are loaded for MCP clients and models.",
   ),
+  accessAllTools: z
+    .boolean()
+    .describe(
+      "Whether search_tools/run_tool may dynamically access every tool the calling user can access.",
+    ),
+  accessAllSubagents: z
+    .boolean()
+    .describe(
+      "Whether the agent may delegate to every internal agent the calling user can access.",
+    ),
+  subagentLoadBalancing: StoredSubagentLoadBalancingConfigSchema.nullable()
+    .optional()
+    .describe(
+      "Configured subagent load-balancing and failover policy across assigned runtime subagents, or null when unconfigured.",
+    ),
   agentType: z
     .enum(["agent", "llm_proxy", "mcp_gateway", "profile"])
     .describe("The resource type."),
@@ -170,6 +289,44 @@ export const AgentDetailOutputSchema = z.object({
     .describe("Configured suggested prompts."),
 });
 
+export const McpGatewayDetailOutputSchema = ResourceDetailOutputSchema;
+
+export const AgentDetailOutputSchema = ResourceDetailOutputSchema.extend({
+  runtime: AgentRuntimeSchema.nullable()
+    .optional()
+    .describe(
+      "The Agent Runtime container this agent runs in, or null for the built-in chat harness.",
+    ),
+  llmApiKeyId: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("The pinned provider API key ID, or null for the default."),
+  modelId: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("The pinned model ID, or null for the default."),
+  skillsEnabled: z
+    .boolean()
+    .optional()
+    .describe(
+      "Present for an internal agent when the current user has skill:read; whether load_skill is executable for it.",
+    ),
+  skillsNotice: z
+    .string()
+    .optional()
+    .describe(
+      "Trust boundary for the catalog-supplied skill names and descriptions in skills.",
+    ),
+  skills: z
+    .array(AgentActivationSkillSchema)
+    .optional()
+    .describe(
+      "Present for an internal agent when the current user has skill:read; caller-relative skills it can activate.",
+    ),
+});
+
 export const KnowledgeSourceOutputSchema = z.object({
   name: z.string().describe("The knowledge source name."),
   description: z
@@ -183,12 +340,29 @@ export const KnowledgeSourceOutputSchema = z.object({
 
 // === Exports ===
 
+/**
+ * Where a record's edit page lives, per family. Every family used to be linked
+ * as `/agents?edit=<id>`: a link only the internal-agent list could resolve, so
+ * an MCP gateway sent the reader to a page that does not know the
+ * id. Each family now has its own routed edit page.
+ */
+const EDIT_PATH_BUILDERS: Record<
+  "agent" | "mcp_gateway",
+  (id: string) => string
+> = {
+  agent: (id) => `/agents/${id}/edit`,
+  mcp_gateway: (id) => `/mcp/gateways/${id}/edit`,
+};
+
+function buildEditLink(agentType: "agent" | "mcp_gateway", id: string): string {
+  return `${config.frontendBaseUrl}${EDIT_PATH_BUILDERS[agentType](id)}`;
+}
+
 export async function handleCreateResource<
   TArgs extends {
     name: string;
-    scope?: AgentScope;
+    initialGrants?: ResourcePermissionGrant[];
     labels?: Array<{ key: string; value: string }>;
-    teams?: string[];
     description?: string | null;
     icon?: string | null;
     knowledgeBaseIds?: string[];
@@ -198,12 +372,18 @@ export async function handleCreateResource<
     subAgentIds?: string[];
     toolAssignments?: ToolAssignmentInput[];
     toolExposureMode?: ToolExposureMode;
-    toolAssignmentMode?: ToolAssignmentMode;
+    accessAllTools?: boolean;
+    accessAllSubagents?: boolean;
+    subagentLoadBalancing?: SubagentLoadBalancingConfig | null;
+    runtime?: AgentRuntimeToolInput;
+    networkPolicy?: NetworkPolicyInput;
+    llmApiKeyId?: string;
+    modelId?: string;
   },
 >(params: {
   args: TArgs;
   context: ArchestraContext;
-  targetAgentType: "agent" | "llm_proxy" | "mcp_gateway";
+  targetAgentType: "agent" | "mcp_gateway";
 }) {
   const { args, context, targetAgentType } = params;
   const toolLabel = targetAgentType.replace("_", " ");
@@ -211,77 +391,89 @@ export async function handleCreateResource<
   logger.info(
     {
       agentId: context.agent.id,
-      createArgs: args,
+      argumentKeys: Object.keys(args),
+      argumentsSize: JSON.stringify(args).length,
       agentType: targetAgentType,
     },
     `create_${targetAgentType} tool called`,
   );
 
   try {
-    const teams = args.teams ?? [];
     const labels = args.labels ? deduplicateLabels(args.labels) : undefined;
 
     if (!args.name || args.name.trim() === "") {
       return errorResult(`${toolLabel} name is required and cannot be empty.`);
     }
 
-    const scope =
-      args.scope ??
-      (teams.length > 0
-        ? "team"
-        : targetAgentType === "agent"
-          ? "personal"
-          : "org");
-
-    // Scope-based authorization — mirrors the REST endpoint (routes/agent.ts)
+    let isAgentAdmin = false;
     if (context.userId && context.organizationId) {
       const checker = await getAgentTypePermissionChecker({
         userId: context.userId,
         organizationId: context.organizationId,
       });
-
-      if (!checker.isAdmin(targetAgentType)) {
-        if (scope === "org") {
-          return errorResult(
-            `Only admins can create org-scoped ${toolLabel}s.`,
-          );
-        }
-        if (scope === "team" || teams.length > 0) {
-          if (!checker.isTeamAdmin(targetAgentType)) {
-            return errorResult(
-              `You need team-admin permission to create team-scoped ${toolLabel}s.`,
-            );
-          }
-
-          const userTeamIds = await TeamModel.getUserTeamIds(context.userId);
-          const userTeamIdSet = new Set(userTeamIds);
-          const invalidTeams = teams.filter((id) => !userTeamIdSet.has(id));
-          if (invalidTeams.length > 0) {
-            return errorResult(
-              "You can only assign teams you are a member of.",
-            );
-          }
-        }
-      }
+      checker.require(targetAgentType, "create");
+      isAgentAdmin = checker.isAdmin(targetAgentType);
     }
+
+    const runtimeAndModel = await resolveRuntimeAndModelForWrite({
+      context,
+      agentType: targetAgentType,
+      isAgentAdmin,
+      runtimeInput: args.runtime,
+      llmApiKeyId: args.llmApiKeyId,
+      modelId: args.modelId,
+      existing: null,
+    });
 
     const createParams: Parameters<typeof AgentModel.create>[0] = {
       name: args.name,
-      scope,
-      teams,
+      // The retired visibility column is NOT NULL; nothing reads it. Who can
+      // reach the agent is its initial grants alone.
+      scope: "personal",
       labels,
       agentType: targetAgentType,
+      environmentId: await resolveNewAgentEnvironmentId({
+        context,
+        agentType: targetAgentType,
+      }),
     };
     if (args.toolExposureMode !== undefined) {
       createParams.toolExposureMode = args.toolExposureMode;
     }
-    if (args.toolAssignmentMode !== undefined) {
-      createParams.toolAssignmentMode = args.toolAssignmentMode;
+    if (args.accessAllTools !== undefined) {
+      createParams.accessAllTools = args.accessAllTools;
+    }
+    if (args.accessAllSubagents !== undefined) {
+      createParams.accessAllSubagents = args.accessAllSubagents;
+    }
+    if (args.subagentLoadBalancing !== undefined) {
+      createParams.subagentLoadBalancing = args.subagentLoadBalancing;
+    }
+    Object.assign(createParams, runtimeAndModel);
+    if (args.networkPolicy !== undefined) {
+      createParams.networkPolicy = await resolveNetworkPolicyForWrite({
+        context,
+        input: args.networkPolicy,
+        existing: null,
+      });
+    }
+
+    // A template-backed agent starts with what the catalog card would give
+    // it: a coding-agent prompt and dynamic tool access.
+    const template =
+      args.runtime && "template" in args.runtime ? args.runtime.template : null;
+    if (template && args.accessAllTools === undefined) {
+      createParams.accessAllTools = true;
     }
 
     if (targetAgentType === "agent" || targetAgentType === "mcp_gateway") {
       if (targetAgentType === "agent" && args.systemPrompt) {
         createParams.systemPrompt = args.systemPrompt;
+      } else if (targetAgentType === "agent" && template) {
+        createParams.systemPrompt = buildAgentCatalogSystemPrompt({
+          name: AGENT_CATALOG_NAMES[template],
+          platformName: archestraMcpBranding.appName,
+        });
       }
       if (args.description) createParams.description = args.description;
       if (args.icon) createParams.icon = args.icon;
@@ -293,10 +485,10 @@ export async function handleCreateResource<
         args.connectorIds !== undefined
       ) {
         await validateKnowledgeAssignments({
+          userId: context.userId,
           organizationId: context.organizationId,
           knowledgeBaseIds: args.knowledgeBaseIds,
           connectorIds: args.connectorIds,
-          targetAgentType,
         });
       }
       if (args.knowledgeBaseIds) {
@@ -310,27 +502,55 @@ export async function handleCreateResource<
       if (args.icon) createParams.icon = args.icon;
     }
 
-    const created = await AgentModel.create(
-      createParams,
-      scope === "personal" ? context.userId : undefined,
-    );
+    if (args.initialGrants !== undefined) {
+      if (!context.userId || !context.organizationId)
+        return errorResult(
+          "User and organization context are required to assign grants.",
+        );
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      await ResourcePermissions.validateInitialGrants({
+        organizationId: context.organizationId,
+        userId: context.userId,
+        resource: targetAgentType === "mcp_gateway" ? "mcpGateway" : "agent",
+        grants: args.initialGrants,
+        target: {
+          id: crypto.randomUUID(),
+          name: args.name,
+          authorId: context.userId,
+        },
+      });
+      // SPDX-SnippetEnd
+    }
+    const created = await AgentModel.create(createParams, context.userId, {
+      initialPermissionGrants: args.initialGrants ?? [],
+    });
+    if (created.networkPolicy) {
+      syncAgentNetworkRuntimes({
+        agentId: created.id,
+        organizationId: created.organizationId,
+      });
+    }
 
     const toolAssignmentResults =
       targetAgentType === "agent" && (args.toolAssignments?.length ?? 0) > 0
         ? await assignToolAssignments(created.id, args.toolAssignments ?? [])
         : [];
     const subAgentResults =
-      targetAgentType === "agent" && (args.subAgentIds?.length ?? 0) > 0
+      (targetAgentType === "agent" || targetAgentType === "mcp_gateway") &&
+      (args.subAgentIds?.length ?? 0) > 0
         ? await assignSubAgentDelegations(created.id, args.subAgentIds ?? [])
         : [];
 
-    const editLink = `${config.frontendBaseUrl}/agents?edit=${created.id}`;
+    const editLink = buildEditLink(targetAgentType, created.id);
     const lines = [
       `Successfully created ${toolLabel}.`,
       "",
       `Name: ${created.name}`,
       `ID: ${created.id}`,
       `Type: ${targetAgentType}`,
+      `Runtime: ${describeRuntime(created.runtime)}`,
       `Edit: ${editLink}`,
       `Teams: ${created.teams.length > 0 ? created.teams.map((team) => team.name).join(", ") : "None"}`,
       `Labels: ${created.labels.length > 0 ? created.labels.map((label) => `${label.key}: ${label.value}`).join(", ") : "None"}`,
@@ -339,6 +559,7 @@ export async function handleCreateResource<
 
     return successResult(lines.join("\n"));
   } catch (error) {
+    if (error instanceof ApiError) return errorResult(error.message);
     return catchError(error, `creating ${toolLabel}`);
   }
 }
@@ -348,7 +569,7 @@ export async function handleGetResource<
 >(params: {
   args: TArgs;
   context: ArchestraContext;
-  expectedType: "agent" | "llm_proxy" | "mcp_gateway";
+  expectedType: "agent" | "mcp_gateway";
   getLabel: string;
 }) {
   const { args, context, expectedType, getLabel } = params;
@@ -379,17 +600,40 @@ export async function handleGetResource<
           })
         : false;
 
+    const checker =
+      context.userId && context.organizationId
+        ? await getAgentTypePermissionChecker({
+            userId: context.userId,
+            organizationId: context.organizationId,
+          })
+        : null;
+
     if (args.id) {
       record = await AgentModel.findById(args.id, context.userId, isAdmin);
       // findById doesn't support excludeOtherPersonalAgents, so we guard here.
-      // swap_agent is the primary Archestra MCP use-case and requires only the
-      // caller's own personal agents to be visible, even though admins can see
-      // all personal agents in the UI.
+      // MCP tools only need the caller's own personal agents to be visible,
+      // even though admins can see all personal agents in the UI.
       if (
         record &&
-        record.scope === "personal" &&
         context.userId &&
-        record.authorId !== context.userId
+        record.authorId !== context.userId &&
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        (
+          await ResourcePermissionPolicyModel.findAudience({
+            organizationId: record.organizationId,
+            resource:
+              record.agentType === "mcp_gateway" ? "mcpGateway" : "agent",
+            scope: record.id,
+          })
+        ).audience === "personal" &&
+        // SPDX-SnippetEnd
+        !checker?.allowsScoped?.({
+          agentType: expectedType,
+          agentId: record.id,
+          action: "read",
+        })
       ) {
         record = null;
       }
@@ -398,12 +642,22 @@ export async function handleGetResource<
         { limit: 1, offset: 0 },
         undefined,
         {
+          organizationId: context.organizationId,
           name: args.name,
           agentType: expectedType,
-          // Hide other users' personal agents from MCP tools. swap_agent is
-          // the primary Archestra MCP use-case and requires only the caller's
-          // own personal agents to be visible, even though admins can see all
-          // personal agents in the UI.
+          ...(checker && context.organizationId
+            ? {
+                authorization: {
+                  organizationId: context.organizationId,
+                  baseReadTypes: checker.hasBaseAction?.(expectedType, "read")
+                    ? [expectedType]
+                    : [],
+                },
+              }
+            : {}),
+          // Hide other users' personal agents from MCP tools. Only the
+          // caller's own personal agents need to be visible, even though
+          // admins can see all personal agents in the UI.
           excludeOtherPersonalAgents: true,
         },
         context.userId,
@@ -415,13 +669,74 @@ export async function handleGetResource<
       }
     }
 
+    if (
+      record &&
+      (!context.organizationId ||
+        record.organizationId !== context.organizationId)
+    ) {
+      record = null;
+    }
+
     if (!record) {
-      return errorResult(`${getLabel} not found`);
+      // only agents have a discovery tool; proxies/gateways have no list tool.
+      const steer =
+        expectedType === "agent"
+          ? ` Call ${archestraMcpBranding.getToolName(TOOL_LIST_AGENTS_SHORT_NAME)} to find the exact id or name.`
+          : "";
+      return errorResult(`${getLabel} not found.${steer}`);
     }
 
     if (record.agentType !== expectedType) {
       return errorResult(
         `The requested entity is a ${record.agentType}, not a ${expectedType}.`,
+      );
+    }
+
+    if (context.userId && context.organizationId) {
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      await ResourcePermissions.require({
+        organizationId: context.organizationId,
+        userId: context.userId,
+        resource: expectedType === "agent" ? "agent" : "mcpGateway",
+        scope: record.id,
+        action: "read",
+      });
+      // SPDX-SnippetEnd
+    }
+    const canReadSkills =
+      expectedType === "agent" && context.organizationId && context.userId
+        ? (
+            await getSkillPermissionChecker({
+              organizationId: context.organizationId,
+              userId: context.userId,
+            })
+          ).canRead
+        : false;
+    if (expectedType === "agent" && context.organizationId && canReadSkills) {
+      const activationSkills = await getAgentActivationSkills({
+        enabled: await isArchestraToolAvailableToAgent({
+          toolName: archestraMcpBranding.getToolName(
+            TOOL_LOAD_SKILL_SHORT_NAME,
+          ),
+          agentId: record.id,
+          organizationId: context.organizationId,
+          userId: context.userId,
+        }),
+        organizationId: context.organizationId,
+        userId: context.userId,
+        agentId: record.id,
+      });
+      const agentWithSkills = {
+        ...record,
+        skillsEnabled: activationSkills.enabled,
+        skillsNotice: SKILL_CATALOG_UNTRUSTED_NOTE,
+        skills: activationSkills.skills,
+      };
+      return structuredSuccessResult(
+        agentWithSkills,
+        JSON.stringify(agentWithSkills, null, 2),
       );
     }
 
@@ -437,8 +752,6 @@ export async function handleEditResource<
     name?: string;
     description?: string | null;
     icon?: string | null;
-    scope?: AgentScope;
-    teams?: string[];
     labels?: Array<{ key: string; value: string }>;
     knowledgeBaseIds?: string[];
     connectorIds?: string[];
@@ -447,18 +760,30 @@ export async function handleEditResource<
     subAgentIds?: string[];
     toolAssignments?: ToolAssignmentInput[];
     toolExposureMode?: ToolExposureMode;
-    toolAssignmentMode?: ToolAssignmentMode;
+    accessAllTools?: boolean;
+    accessAllSubagents?: boolean;
+    subagentLoadBalancing?: SubagentLoadBalancingConfig | null;
+    runtime?: AgentRuntimeToolInput | null;
+    networkPolicy?: NetworkPolicyInput | null;
+    llmApiKeyId?: string | null;
+    modelId?: string | null;
   },
 >(params: {
   args: TArgs;
   context: ArchestraContext;
-  expectedType: "agent" | "llm_proxy" | "mcp_gateway";
+  expectedType: "agent" | "mcp_gateway";
 }) {
   const { args, context, expectedType } = params;
   const toolLabel = expectedType.replace("_", " ");
 
   logger.info(
-    { agentId: context.agent.id, editArgs: args, agentType: expectedType },
+    {
+      agentId: context.agent.id,
+      requestedId: args.id,
+      argumentKeys: Object.keys(args),
+      argumentsSize: JSON.stringify(args).length,
+      agentType: expectedType,
+    },
     `edit_${expectedType} tool called`,
   );
 
@@ -468,7 +793,10 @@ export async function handleEditResource<
     }
 
     const existingAgent = await AgentModel.findById(args.id);
-    if (!existingAgent) {
+    if (
+      !existingAgent ||
+      existingAgent.organizationId !== context.organizationId
+    ) {
       return errorResult(`${toolLabel} not found.`);
     }
 
@@ -482,34 +810,56 @@ export async function handleEditResource<
       userId: context.userId,
       organizationId: context.organizationId,
     });
-    checker.require(existingAgent.agentType, "update");
-
-    const userTeamIds = await TeamModel.getUserTeamIds(context.userId);
-    requireAgentModifyPermission({
-      checker,
-      agentType: existingAgent.agentType,
-      agentScope: existingAgent.scope,
-      agentAuthorId: existingAgent.authorId,
-      agentTeamIds: existingAgent.teams.map((team) => team.id),
-      userTeamIds,
-      userId: context.userId,
+    checker.require(existingAgent.agentType, {
+      action: "update",
+      scope: existingAgent.id,
     });
 
-    const updateData: Record<string, unknown> = {};
+    // Who can reach the record is not editable here: access lives in its
+    // permission policy, which the resource permissions API writes on its own.
+    requireAgentModifyPermission({
+      agentId: existingAgent.id,
+      action: "update",
+      checker,
+      agentType: existingAgent.agentType,
+    });
+
+    const runtimeAndModel = await resolveRuntimeAndModelForWrite({
+      context,
+      agentType: existingAgent.agentType,
+      isAgentAdmin: checker.isAdmin(existingAgent.agentType),
+      runtimeInput: args.runtime,
+      llmApiKeyId: args.llmApiKeyId,
+      modelId: args.modelId,
+      existing: existingAgent,
+    });
+
+    const updateData: Record<string, unknown> = { ...runtimeAndModel };
     if (args.name !== undefined) updateData.name = args.name;
     if (args.description !== undefined)
       updateData.description = args.description;
     if (args.icon !== undefined) updateData.icon = args.icon;
-    if (args.scope !== undefined) updateData.scope = args.scope;
-    if (args.teams !== undefined) updateData.teams = args.teams;
     if (args.toolExposureMode !== undefined) {
       updateData.toolExposureMode = args.toolExposureMode;
     }
-    if (args.toolAssignmentMode !== undefined) {
-      updateData.toolAssignmentMode = args.toolAssignmentMode;
+    if (args.accessAllTools !== undefined) {
+      updateData.accessAllTools = args.accessAllTools;
+    }
+    if (args.accessAllSubagents !== undefined) {
+      updateData.accessAllSubagents = args.accessAllSubagents;
+    }
+    if (args.subagentLoadBalancing !== undefined) {
+      updateData.subagentLoadBalancing = args.subagentLoadBalancing;
     }
     if (args.labels !== undefined) {
       updateData.labels = deduplicateLabels(args.labels);
+    }
+    if (args.networkPolicy !== undefined) {
+      updateData.networkPolicy = await resolveNetworkPolicyForWrite({
+        context,
+        input: args.networkPolicy,
+        existing: existingAgent.networkPolicy,
+      });
     }
 
     if (expectedType === "agent" || expectedType === "mcp_gateway") {
@@ -524,10 +874,10 @@ export async function handleEditResource<
         args.connectorIds !== undefined
       ) {
         await validateKnowledgeAssignments({
+          userId: context.userId,
           organizationId: context.organizationId,
           knowledgeBaseIds: args.knowledgeBaseIds,
           connectorIds: args.connectorIds,
-          targetAgentType: expectedType,
         });
       }
       if (args.knowledgeBaseIds !== undefined) {
@@ -546,22 +896,33 @@ export async function handleEditResource<
     if (!updated) {
       return errorResult(`failed to update ${toolLabel}.`);
     }
+    // A Slack bot of this agent follows its name and icon (best effort).
+    void slackAppFactory.syncAgentIdentity(args.id);
+    if (agentNetworkRuntimeChanged({ before: existingAgent, after: updated })) {
+      syncAgentNetworkRuntimes({
+        agentId: updated.id,
+        organizationId: updated.organizationId,
+        engine: !!(existingAgent.networkPolicy || updated.networkPolicy),
+      });
+    }
 
     const toolAssignmentResults =
       expectedType === "agent" && (args.toolAssignments?.length ?? 0) > 0
         ? await assignToolAssignments(args.id, args.toolAssignments ?? [])
         : [];
     const subAgentResults =
-      expectedType === "agent" && (args.subAgentIds?.length ?? 0) > 0
+      (expectedType === "agent" || expectedType === "mcp_gateway") &&
+      (args.subAgentIds?.length ?? 0) > 0
         ? await assignSubAgentDelegations(args.id, args.subAgentIds ?? [])
         : [];
 
-    const editLink = `${config.frontendBaseUrl}/agents?edit=${updated.id}`;
+    const editLink = buildEditLink(expectedType, updated.id);
     const lines = [
       `Successfully updated ${toolLabel}.`,
       "",
       `Name: ${updated.name}`,
       `ID: ${updated.id}`,
+      `Runtime: ${describeRuntime(updated.runtime)}`,
       `Edit: ${editLink}`,
       `Scope: ${updated.scope}`,
       `Teams: ${updated.teams.length > 0 ? updated.teams.map((team) => team.name).join(", ") : "None"}`,
@@ -571,18 +932,211 @@ export async function handleEditResource<
 
     return successResult(lines.join("\n"));
   } catch (error) {
+    if (error instanceof ApiError) return errorResult(error.message);
     return catchError(error, `editing ${toolLabel}`);
   }
 }
 
+/**
+ * These tools take no environment, so a new agent lands wherever the org says
+ * new agents of its type go (the Default environment until an admin configures
+ * otherwise). A restricted target the caller may not deploy to resolves back to
+ * Default rather than failing the create.
+ */
+async function resolveNewAgentEnvironmentId(params: {
+  context: ArchestraContext;
+  agentType: "agent" | "mcp_gateway";
+}): Promise<string | null> {
+  const { context, agentType } = params;
+  const { userId, organizationId } = context;
+  if (!userId || !organizationId) return null;
+
+  const resource = agentType === "mcp_gateway" ? "mcpGateway" : "agent";
+  return resolveDefaultEnvironmentForNewResource({
+    organizationId,
+    resource,
+    userId,
+  });
+}
+
+/**
+ * Validate a network policy argument with the API's own schema and the same
+ * permission the agents REST routes require. Returns the normalized policy, or
+ * null to inherit the environment's policy.
+ */
+async function resolveNetworkPolicyForWrite(params: {
+  context: ArchestraContext;
+  input: NetworkPolicyInput | null;
+  existing: NetworkPolicy | null | undefined;
+}): Promise<NetworkPolicy | null> {
+  const { context, input, existing } = params;
+  let policy: NetworkPolicy | null = null;
+  if (input !== null) {
+    const parsed = NetworkPolicyInputSchema.safeParse(input);
+    if (!parsed.success) {
+      throw new ApiError(
+        400,
+        `Invalid networkPolicy: ${parsed.error.issues.map((issue) => issue.message).join("; ")}`,
+      );
+    }
+    policy = parsed.data;
+  }
+  if (!context.userId || !context.organizationId) {
+    throw new ApiError(
+      403,
+      "User and organization context are required to set a network policy.",
+    );
+  }
+  await assertCanWriteAgentNetworkPolicy({
+    userId: context.userId,
+    organizationId: context.organizationId,
+    before: existing,
+    after: policy,
+  });
+  return policy;
+}
+
+/**
+ * Validate a runtime and model change the way the agents REST routes do, and
+ * return only the fields to write. `existing` is the stored agent on an edit,
+ * so a change to one field is checked against the other's current value.
+ */
+async function resolveRuntimeAndModelForWrite(params: {
+  context: ArchestraContext;
+  agentType: Agent["agentType"];
+  isAgentAdmin: boolean;
+  runtimeInput: AgentRuntimeToolInput | null | undefined;
+  llmApiKeyId: string | null | undefined;
+  modelId: string | null | undefined;
+  existing: Pick<Agent, AgentModelField> | null;
+}): Promise<Partial<Pick<Agent, AgentModelField>>> {
+  const { context, runtimeInput, llmApiKeyId, modelId, existing } = params;
+  const touchesModel = llmApiKeyId !== undefined || modelId !== undefined;
+  if (runtimeInput === undefined && !touchesModel) return {};
+  if (params.agentType !== "agent") {
+    throw new ApiError(
+      400,
+      "runtime, llmApiKeyId, and modelId apply only to agents.",
+    );
+  }
+  if (!context.userId || !context.organizationId) {
+    throw new ApiError(400, "user/organization context not available.");
+  }
+
+  const runtime =
+    runtimeInput == null
+      ? runtimeInput
+      : await resolveAgentRuntimeToolInput({
+          input: runtimeInput,
+          organizationId: context.organizationId,
+        });
+  await requireAgentRuntimePermission({
+    agentType: params.agentType,
+    runtime,
+    isAdmin: params.isAgentAdmin,
+    userId: context.userId,
+    organizationId: context.organizationId,
+    previous: existing?.runtime,
+  });
+  await assertAgentRuntimeTiersExist({
+    runtime,
+    organizationId: context.organizationId,
+  });
+  await assertCanBindRuntimeCredentials({
+    organizationId: context.organizationId,
+    userId: context.userId,
+    previous: existing?.runtime,
+    next: runtime,
+  });
+
+  const merged = {
+    runtime: runtime !== undefined ? runtime : (existing?.runtime ?? null),
+    llmApiKeyId:
+      llmApiKeyId !== undefined ? llmApiKeyId : (existing?.llmApiKeyId ?? null),
+    modelId: modelId !== undefined ? modelId : (existing?.modelId ?? null),
+  };
+  const scope = {
+    organizationId: context.organizationId,
+    userId: context.userId,
+  };
+  // Stricter than the REST routes on purpose: a model is checked against the
+  // caller's keys even for a chat agent, so the tool never stores a pairing
+  // the caller could not have picked in the UI.
+  if (touchesModel) {
+    await assertAgentModelSelectionAvailable({ ...scope, agent: merged });
+  }
+  await assertAgentRuntimeModelCompatibility({
+    ...scope,
+    runtime: merged.runtime,
+    agent: merged,
+    selectsModel: touchesModel,
+  });
+
+  return {
+    ...(runtime !== undefined && { runtime }),
+    ...(llmApiKeyId !== undefined && { llmApiKeyId }),
+    ...(modelId !== undefined && { modelId }),
+  };
+}
+
+type AgentModelField = "runtime" | "llmApiKeyId" | "modelId";
+
+function describeRuntime(runtime: AgentRuntime | null): string {
+  if (!runtime) return "built-in chat harness";
+  const template = resolveAgentCatalogId(runtime);
+  return template
+    ? `${AGENT_CATALOG_NAMES[template]} (${runtime.image})`
+    : `custom image ${runtime.image}`;
+}
+
+/**
+ * Expand a runtime tool argument into the stored runtime the create and edit
+ * pages would save: a template's image and launch settings, or a custom
+ * image's starting values, under any fields the caller set.
+ */
+async function resolveAgentRuntimeToolInput(params: {
+  input: AgentRuntimeToolInput;
+  organizationId: string;
+}): Promise<AgentRuntime> {
+  const { input } = params;
+  if (!("template" in input)) {
+    return AgentRuntimeSchema.parse({
+      ...buildCustomAgentRuntime({ image: input.image }),
+      ...input,
+    });
+  }
+  const { template, ...overrides } = input;
+  const organization = await OrganizationModel.getById(params.organizationId);
+  if (
+    isIntegrationHidden(organization?.popularAgentOverrides ?? null, template)
+  ) {
+    throw new ApiError(
+      400,
+      `The ${AGENT_CATALOG_NAMES[template]} template is turned off for this organization.`,
+    );
+  }
+  if (overrides.claudeCode && template !== "claude-code") {
+    throw new ApiError(
+      400,
+      "claudeCode settings apply only to the claude-code template.",
+    );
+  }
+  return AgentRuntimeSchema.parse({
+    ...buildAgentCatalogRuntime({
+      id: template,
+      image: config.agentRuntime.catalogImages[template],
+    }),
+    ...overrides,
+  });
+}
+
 async function validateKnowledgeAssignments(params: {
+  userId?: string;
   organizationId?: string;
   knowledgeBaseIds?: string[];
   connectorIds?: string[];
-  targetAgentType: "agent" | "llm_proxy" | "mcp_gateway";
 }) {
-  const { organizationId, knowledgeBaseIds, connectorIds, targetAgentType } =
-    params;
+  const { organizationId, knowledgeBaseIds, connectorIds } = params;
 
   if (!organizationId) {
     throw new Error(
@@ -590,25 +1144,34 @@ async function validateKnowledgeAssignments(params: {
     );
   }
 
-  if (targetAgentType === "llm_proxy") {
-    if ((knowledgeBaseIds?.length ?? 0) > 0) {
-      throw createValidationError(
-        ["knowledgeBaseIds"],
-        "Knowledge bases cannot be assigned to LLM proxy resources.",
-      );
-    }
-    if ((connectorIds?.length ?? 0) > 0) {
-      throw createValidationError(
-        ["connectorIds"],
-        "Knowledge connectors cannot be assigned to LLM proxy resources.",
-      );
-    }
-  }
-
   if (knowledgeBaseIds) {
+    const access = params.userId
+      ? await knowledgeSourceAccessControlService.buildAccessControlContext({
+          userId: params.userId,
+          organizationId,
+        })
+      : null;
     for (const kbId of knowledgeBaseIds) {
       const knowledgeBase = await KnowledgeBaseModel.findById(kbId);
-      if (!knowledgeBase || knowledgeBase.organizationId !== organizationId) {
+      if (
+        !knowledgeBase ||
+        knowledgeBase.organizationId !== organizationId ||
+        !(access
+          ? knowledgeSourceAccessControlService.canAccessKnowledgeBase(
+              access,
+              knowledgeBase,
+            )
+          : (
+              await knowledgeSourceAccessControlService.filterPublishedToOrganization(
+                {
+                  organizationId,
+                  resource: "knowledgeBase",
+                  sources: [knowledgeBase],
+                  action: "read",
+                },
+              )
+            ).length > 0)
+      ) {
         throw createValidationError(
           ["knowledgeBaseIds"],
           `Knowledge base not found for this organization: ${kbId}`,

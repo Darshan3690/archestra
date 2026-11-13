@@ -1,3 +1,4 @@
+import { ArchestraInternalErrorCode } from "@archestra/shared";
 import {
   Behavior,
   type Candidate,
@@ -8,16 +9,14 @@ import {
   type HarmCategory,
   type HarmProbability,
   type Part,
+  type TrafficType,
 } from "@google/genai";
-import { ArchestraInternalErrorCode } from "@shared";
-import { encode as toonEncode } from "@toon-format/toon";
 import { get } from "lodash-es";
 import { createGoogleGenAIClient } from "@/clients/gemini-client";
 import config from "@/config";
 import logger from "@/logging";
-import { ModelModel } from "@/models";
 import { metrics } from "@/observability";
-import { getTokenizer } from "@/tokenizers";
+import { geminiUsageTokens } from "@/observability/metrics/llm-usage";
 import type {
   ChunkProcessingResult,
   CommonMcpToolDefinition,
@@ -31,16 +30,20 @@ import type {
   LLMResponseAdapter,
   LLMStreamAdapter,
   StreamAccumulatorState,
-  ToolCompressionStats,
   UsageView,
 } from "@/types";
-import { extractCommonMessageText } from "@/types";
+import {
+  extractCommonMessageText,
+  extractCommonToolCallArguments,
+} from "@/types";
+import { isApprovedAsSent } from "../utils/approved-as-sent";
 import {
   hasImageContent,
   isImageTooLarge,
   isMcpImageBlock,
 } from "../utils/mcp-image";
-import { unwrapToolContent } from "../utils/unwrap-tool-content";
+import { sanitizeGeminiToolSchema } from "./gemini-schema";
+import { GeminiToolNameCodec } from "./gemini-tool-names";
 
 // =============================================================================
 // TYPE ALIASES
@@ -99,7 +102,7 @@ class GeminiRequestAdapter
     );
     const commonMessages: CommonMessage[] = [];
 
-    for (const content of contents) {
+    for (const [contentIndex, content] of contents.entries()) {
       const commonMessage: CommonMessage = {
         role: content.role as CommonMessage["role"],
         content: extractCommonMessageText(content),
@@ -109,7 +112,7 @@ class GeminiRequestAdapter
       if (content.parts) {
         const toolCalls: CommonToolResult[] = [];
 
-        for (const part of content.parts) {
+        for (const [partIndex, part] of content.parts.entries()) {
           // Check if this part has the functionResponse property
           if (
             "functionResponse" in part &&
@@ -123,12 +126,20 @@ class GeminiRequestAdapter
               "id" in functionResponse &&
               typeof functionResponse.id === "string"
                 ? functionResponse.id
-                : generateToolCallId(functionResponse.name as string);
+                : syntheticToolCallId(contentIndex, partIndex);
 
             toolCalls.push({
               id,
               name: functionResponse.name as string,
+              arguments: this.findFunctionCallArguments(
+                functionResponse.name as string,
+                "id" in functionResponse &&
+                  typeof functionResponse.id === "string"
+                  ? functionResponse.id
+                  : undefined,
+              ),
               content: functionResponse.response,
+              structured: true,
               isError: false,
             });
           }
@@ -152,9 +163,11 @@ class GeminiRequestAdapter
   getToolResults(): CommonToolResult[] {
     const results: CommonToolResult[] = [];
 
-    for (const content of this.request.contents || []) {
+    for (const [contentIndex, content] of (
+      this.request.contents || []
+    ).entries()) {
       if (content.parts) {
-        for (const part of content.parts) {
+        for (const [partIndex, part] of content.parts.entries()) {
           if (
             "functionResponse" in part &&
             part.functionResponse &&
@@ -167,11 +180,18 @@ class GeminiRequestAdapter
               "id" in functionResponse &&
               typeof functionResponse.id === "string"
                 ? functionResponse.id
-                : generateToolCallId(functionResponse.name as string);
+                : syntheticToolCallId(contentIndex, partIndex);
 
             results.push({
               id,
               name: functionResponse.name as string,
+              arguments: this.findFunctionCallArguments(
+                functionResponse.name as string,
+                "id" in functionResponse &&
+                  typeof functionResponse.id === "string"
+                  ? functionResponse.id
+                  : undefined,
+              ),
               content: functionResponse.response,
               isError: false,
             });
@@ -181,6 +201,43 @@ class GeminiRequestAdapter
     }
 
     return results;
+  }
+
+  /**
+   * Arguments of the functionCall paired with a functionResponse. Gemini
+   * correlates by `id` when the caller supplies ids, and by function name
+   * otherwise (the wire format's own convention), so the lookup prefers an
+   * exact id match and falls back to the nearest preceding call of that name.
+   */
+  private findFunctionCallArguments(
+    name: string,
+    id: string | undefined,
+  ): Record<string, unknown> | undefined {
+    const contents = this.request.contents || [];
+    let nameMatch: Record<string, unknown> | undefined;
+    for (let i = contents.length - 1; i >= 0; i--) {
+      for (const part of contents[i].parts || []) {
+        if (
+          !("functionCall" in part) ||
+          !part.functionCall ||
+          typeof part.functionCall !== "object"
+        ) {
+          continue;
+        }
+        const functionCall = part.functionCall as {
+          id?: string;
+          name?: string;
+          args?: unknown;
+        };
+        if (id && functionCall.id === id) {
+          return extractCommonToolCallArguments(functionCall.args);
+        }
+        if (functionCall.name === name) {
+          nameMatch ??= extractCommonToolCallArguments(functionCall.args);
+        }
+      }
+    }
+    return id ? undefined : nameMatch;
   }
 
   getTools(): CommonMcpToolDefinition[] {
@@ -238,16 +295,6 @@ class GeminiRequestAdapter
     Object.assign(this.toolResultUpdates, updates);
   }
 
-  async applyToonCompression(model: string): Promise<ToolCompressionStats> {
-    const { contents: compressedContents, stats } =
-      await convertToolResultsToToon(this.request.contents || [], model);
-    this.request = {
-      ...this.request,
-      contents: compressedContents,
-    };
-    return stats;
-  }
-
   convertToolResultContent(contents: GeminiContents): GeminiContents {
     return contents.map((content) => {
       if (content.role !== "user" || !content.parts) {
@@ -298,10 +345,10 @@ class GeminiRequestAdapter
         "[adapters/gemini] toProviderRequest: applying updates",
       );
 
-      contents = contents.map((content) => {
+      contents = contents.map((content, contentIndex) => {
         // Only process user messages with parts
         if (content.role === "user" && content.parts) {
-          const updatedParts = content.parts.map((part) => {
+          const updatedParts = content.parts.map((part, partIndex) => {
             // Check if this part is a function response
             if (
               "functionResponse" in part &&
@@ -314,9 +361,15 @@ class GeminiRequestAdapter
                 "id" in functionResponse &&
                 typeof functionResponse.id === "string"
                   ? functionResponse.id
-                  : generateToolCallId(functionResponse.name as string);
+                  : syntheticToolCallId(contentIndex, partIndex);
 
-              if (this.toolResultUpdates[id]) {
+              if (
+                Object.hasOwn(this.toolResultUpdates, id) &&
+                !isApprovedAsSent({
+                  sent: functionResponse.response,
+                  approved: this.toolResultUpdates[id],
+                })
+              ) {
                 // Update the function response with sanitized content
                 // Spread the original part to preserve top-level fields like
                 // thought and thoughtSignature which Gemini 3 requires
@@ -440,9 +493,63 @@ function convertMcpImageBlocksToGeminiResponse(
 // RESPONSE ADAPTER
 // =============================================================================
 
+// Policy may remove or reorder calls, but cannot invent a provider call or
+// change the candidate/signature to which it belongs.
+function approvedGeminiCalls(
+  originals: readonly { id: string }[],
+  approved: StreamAccumulatorState["toolCalls"],
+): Map<string, StreamAccumulatorState["toolCalls"][number]> {
+  // An empty approved batch needs no association, including during cleanup
+  // of a provider response whose own ids were ambiguous.
+  if (approved.length === 0) return new Map();
+  const originalIds = new Set(originals.map((call) => call.id));
+  const result = new Map(approved.map((call) => [call.id, call]));
+  if (
+    originalIds.size !== originals.length ||
+    result.size !== approved.length ||
+    approved.some((call) => !originalIds.has(call.id))
+  )
+    throw new Error(
+      "Cannot associate approved Gemini tool calls with provider calls",
+    );
+  return result;
+}
+
+function rewriteGeminiCalls(
+  response: GeminiResponse,
+  originals: readonly { id: string }[],
+  approved: Map<string, StreamAccumulatorState["toolCalls"][number]>,
+): GeminiResponse {
+  let next = 0;
+  return {
+    ...response,
+    candidates: response.candidates?.map((candidate) => {
+      if (!candidate.content?.parts) return candidate;
+      const parts = candidate.content.parts.flatMap((part) => {
+        if (!("functionCall" in part) || !part.functionCall) return [part];
+        const original = originals[next++];
+        const rewritten = original && approved.get(original.id);
+        if (!rewritten) return [];
+        return [
+          {
+            ...part,
+            functionCall: {
+              ...part.functionCall,
+              name: rewritten.name,
+              args: parseArgs(rewritten.arguments),
+            },
+          },
+        ];
+      });
+      return { ...candidate, content: { ...candidate.content, parts } };
+    }),
+  };
+}
+
 class GeminiResponseAdapter implements LLMResponseAdapter<GeminiResponse> {
   readonly provider = "gemini" as const;
   private response: GeminiResponse;
+  private readonly callIdSeed = Date.now();
 
   constructor(response: GeminiResponse) {
     this.response = response;
@@ -468,12 +575,10 @@ class GeminiResponseAdapter implements LLMResponseAdapter<GeminiResponse> {
   }
 
   getToolCalls(): CommonToolCall[] {
-    const candidate = this.response.candidates?.[0];
-    if (!candidate?.content?.parts) return [];
-
-    return candidate.content.parts
+    return (this.response.candidates ?? [])
+      .flatMap((candidate) => candidate.content?.parts ?? [])
       .filter((part) => "functionCall" in part && part.functionCall)
-      .map((part) => {
+      .map((part, index) => {
         const functionCall = (
           part as {
             functionCall: {
@@ -485,7 +590,8 @@ class GeminiResponseAdapter implements LLMResponseAdapter<GeminiResponse> {
         ).functionCall;
         return {
           id:
-            functionCall.id ?? `gemini-call-${functionCall.name}-${Date.now()}`,
+            functionCall.id ??
+            `gemini-call-${functionCall.name}-${this.callIdSeed + index}`,
           name: functionCall.name,
           arguments: functionCall.args ?? {},
         };
@@ -493,20 +599,31 @@ class GeminiResponseAdapter implements LLMResponseAdapter<GeminiResponse> {
   }
 
   hasToolCalls(): boolean {
-    const candidate = this.response.candidates?.[0];
-    if (!candidate?.content?.parts) return false;
-
-    return candidate.content.parts.some(
-      (part) => "functionCall" in part && part.functionCall,
+    return (this.response.candidates ?? []).some((candidate) =>
+      candidate.content?.parts?.some(
+        (part) => "functionCall" in part && part.functionCall,
+      ),
     );
   }
 
   getUsage(): UsageView {
     if (!this.response.usageMetadata) {
-      return { inputTokens: 0, outputTokens: 0 };
+      return {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+      };
     }
-    const { input, output } = getUsageTokens(this.response.usageMetadata);
-    return { inputTokens: input ?? 0, outputTokens: output ?? 0 };
+    const { input, output, cacheRead, cacheWrite, reasoning } =
+      geminiUsageTokens(this.response.usageMetadata);
+    return {
+      inputTokens: input,
+      outputTokens: output,
+      cacheReadTokens: cacheRead,
+      cacheWriteTokens: cacheWrite,
+      reasoningTokens: reasoning,
+    };
   }
 
   getOriginalResponse(): GeminiResponse {
@@ -516,6 +633,17 @@ class GeminiResponseAdapter implements LLMResponseAdapter<GeminiResponse> {
   getFinishReasons(): string[] {
     const reason = this.response.candidates?.[0]?.finishReason;
     return reason ? [reason] : [];
+  }
+
+  withRewrittenToolCalls(
+    toolCalls: Array<{ id: string; name: string; arguments: string }>,
+  ): GeminiResponse {
+    const originals = this.getToolCalls();
+    return rewriteGeminiCalls(
+      this.response,
+      originals,
+      approvedGeminiCalls(originals, toolCalls),
+    );
   }
 
   toRefusalResponse(
@@ -536,6 +664,11 @@ class GeminiResponseAdapter implements LLMResponseAdapter<GeminiResponse> {
       ],
     };
   }
+
+  /** The response as one text answer, as a governed child's turn ends. */
+  withReplacedText(text: string): GeminiResponse {
+    return this.toRefusalResponse("", text);
+  }
 }
 
 // =============================================================================
@@ -547,8 +680,23 @@ class GeminiStreamAdapter
 {
   readonly provider = "gemini" as const;
   readonly state: StreamAccumulatorState;
+  private readonly toolNameCodec: GeminiToolNameCodec;
   private model: string = "";
+  private trafficType: TrafficType | undefined;
   private inlineDataParts: Gemini.Types.MessagePart[] = [];
+  private candidateParts = new Map<
+    number,
+    {
+      candidate: NonNullable<GeminiResponse["candidates"]>[number];
+      parts: Array<{ part: Gemini.Types.MessagePart; toolCallIndex?: number }>;
+    }
+  >();
+  // Set to the refusal text when the streamed response was replaced by a policy
+  // refusal, so toProviderResponse persists the refusal (finishReason STOP, no
+  // function calls) instead of the blocked tool calls.
+  private replacedText: string | null = null;
+  private readonly originalToolCalls: StreamAccumulatorState["toolCalls"] = [];
+  private readonly callIdSeed = Date.now();
 
   // Gemini 3 requires thoughtSignature on all model parts when they are
   // sent back as conversation history. Track signatures during streaming
@@ -558,7 +706,8 @@ class GeminiStreamAdapter
   private outputTextSignature: string | undefined;
   private toolCallSignatures: Map<number, string> = new Map();
 
-  constructor() {
+  constructor(request?: GeminiRequestWithModel) {
+    this.toolNameCodec = new GeminiToolNameCodec(request);
     this.state = {
       responseId: "",
       model: "",
@@ -575,6 +724,16 @@ class GeminiStreamAdapter
   }
 
   processChunk(chunk: GeminiStreamChunk): ChunkProcessingResult {
+    chunk = this.toolNameCodec.decodeResponse(chunk);
+    // Assign fallback indexes before splitting a chunk into visible/held
+    // subsets, so a candidate keeps its original position in both frames.
+    chunk = {
+      ...chunk,
+      candidates: chunk.candidates?.map((candidate, index) => ({
+        ...candidate,
+        index: candidate.index ?? index,
+      })),
+    } as GeminiStreamChunk;
     if (this.state.timing.firstChunkTime === null) {
       this.state.timing.firstChunkTime = Date.now();
     }
@@ -595,19 +754,60 @@ class GeminiStreamAdapter
 
     // Handle usage metadata
     if (chunk.usageMetadata) {
+      this.trafficType = chunk.usageMetadata.trafficType ?? this.trafficType;
+      const { input, output, cacheRead, cacheWrite, reasoning } =
+        geminiUsageTokens(chunk.usageMetadata);
       this.state.usage = {
-        inputTokens: chunk.usageMetadata.promptTokenCount ?? 0,
-        outputTokens: chunk.usageMetadata.candidatesTokenCount ?? 0,
+        inputTokens: input,
+        outputTokens: output,
+        cacheReadTokens: cacheRead,
+        cacheWriteTokens: cacheWrite,
+        reasoningTokens: reasoning,
       };
     }
 
-    const candidate = chunk.candidates?.[0];
-    if (!candidate?.content?.parts) {
-      return { sseData: null, isToolCallChunk: false, isFinal: false };
+    const candidates = chunk.candidates ?? [];
+    if (candidates.length === 0) {
+      const hasProtocolMetadata = Boolean(
+        chunk.promptFeedback || chunk.usageMetadata,
+      );
+      return {
+        sseData: hasProtocolMetadata
+          ? `data: ${JSON.stringify(sdkResponseToRestResponse(chunk, this.model))}\n\n`
+          : null,
+        isToolCallChunk: false,
+        isFinal: false,
+      };
     }
 
-    // Process parts
-    for (const part of candidate.content.parts) {
+    // Keep the signed parts associated with their candidate for audit records.
+    // Tool indexes follow arrival order, just like the shared policy batch.
+    let toolCallIndex = this.state.toolCalls.length;
+    for (const [position, candidate] of (
+      sdkResponseToRestResponse(chunk, this.model).candidates ?? []
+    ).entries()) {
+      const index = candidate.index ?? position;
+      const previous = this.candidateParts.get(index);
+      const parts = previous?.parts ?? [];
+      for (const part of candidate.content?.parts ?? []) {
+        parts.push({
+          part,
+          ...("functionCall" in part && part.functionCall
+            ? { toolCallIndex: toolCallIndex++ }
+            : {}),
+        });
+      }
+      this.candidateParts.set(index, {
+        candidate: { ...previous?.candidate, ...candidate, index },
+        parts,
+      });
+    }
+
+    // Every candidate must participate in policy evaluation before its calls
+    // can reach the client.
+    for (const part of candidates.flatMap(
+      (candidate) => candidate.content?.parts ?? [],
+    )) {
       // Handle text content
       if (part.text) {
         // Track thought vs output text separately for proper signature preservation.
@@ -647,26 +847,73 @@ class GeminiStreamAdapter
         const toolCallIndex = this.state.toolCalls.length;
         this.state.toolCalls.push({
           id:
-            functionCall.id ?? `gemini-call-${functionCall.name}-${Date.now()}`,
+            functionCall.id ??
+            `gemini-call-${functionCall.name}-${this.callIdSeed + toolCallIndex}`,
           name: functionCall.name ?? "",
           arguments: JSON.stringify(functionCall.args ?? {}),
         });
+        this.originalToolCalls.push({ ...this.state.toolCalls[toolCallIndex] });
         // Track thoughtSignature for function call parts (required by Gemini 3)
         if (part.thoughtSignature) {
           this.toolCallSignatures.set(toolCallIndex, part.thoughtSignature);
         }
-        this.state.rawToolCallEvents.push(chunk);
         isToolCallChunk = true;
       }
     }
 
-    // Check finish reason
-    if (
-      candidate.finishReason &&
-      candidate.finishReason !== "FINISH_REASON_UNSPECIFIED"
-    ) {
-      this.state.stopReason = candidate.finishReason;
-      isFinal = true;
+    if (isToolCallChunk) {
+      sseData = null;
+      // Split every candidate, preserving its index and signed parts. A frame
+      // is held once regardless of how many calls or candidates it contains.
+      const heldCandidates = candidates.flatMap((candidate) => {
+        const parts =
+          candidate.content?.parts?.filter((part) => part.functionCall) ?? [];
+        return parts.length
+          ? [{ ...candidate, content: { ...candidate.content, parts } }]
+          : [];
+      });
+      this.state.rawToolCallEvents.push({
+        ...chunk,
+        candidates: heldCandidates,
+      });
+      const visibleCandidates = candidates.flatMap((candidate) => {
+        const parts =
+          candidate.content?.parts?.filter((part) => !part.functionCall) ?? [];
+        const hasCalls = candidate.content?.parts?.some(
+          (part) => part.functionCall,
+        );
+        if (!hasCalls) return [candidate];
+        return parts.length
+          ? [
+              {
+                ...candidate,
+                content: { ...candidate.content, parts },
+                finishReason: undefined,
+              },
+            ]
+          : [];
+      });
+      if (visibleCandidates.length > 0) {
+        const visibleChunk = {
+          ...chunk,
+          candidates: visibleCandidates,
+        } as GeminiStreamChunk;
+        sseData = `data: ${JSON.stringify(sdkResponseToRestResponse(visibleChunk, this.model))}\n\n`;
+      }
+    }
+
+    for (const candidate of candidates) {
+      if (
+        candidate.finishReason &&
+        candidate.finishReason !== "FINISH_REASON_UNSPECIFIED"
+      ) {
+        this.state.stopReason = candidate.finishReason;
+        isFinal = true;
+      }
+    }
+    // Gemini can send terminal metadata without a renderable content part.
+    if (isFinal && !sseData && !isToolCallChunk) {
+      sseData = `data: ${JSON.stringify(sdkResponseToRestResponse(chunk, this.model))}\n\n`;
     }
 
     return { sseData, isToolCallChunk, isFinal };
@@ -707,7 +954,35 @@ class GeminiStreamAdapter
     });
   }
 
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]): string[] {
+    const approved = approvedGeminiCalls(this.originalToolCalls, toolCalls);
+    let offset = 0;
+    return this.state.rawToolCallEvents.map((event) => {
+      const response = sdkResponseToRestResponse(
+        event as GeminiStreamChunk,
+        this.model,
+      );
+      const count =
+        response.candidates?.reduce(
+          (total, candidate) =>
+            total +
+            (candidate.content?.parts?.filter(
+              (part) => "functionCall" in part && part.functionCall,
+            ).length ?? 0),
+          0,
+        ) ?? 0;
+      const rewritten = rewriteGeminiCalls(
+        response,
+        this.originalToolCalls.slice(offset, offset + count),
+        approved,
+      );
+      offset += count;
+      return `data: ${JSON.stringify(rewritten)}\n\n`;
+    });
+  }
+
   formatCompleteTextSSE(text: string): string[] {
+    this.replacedText = text;
     const chunk: GeminiResponse = {
       candidates: [
         {
@@ -761,9 +1036,26 @@ class GeminiStreamAdapter
       parts.push(inlineDataPart);
     }
 
-    // Add function calls with thoughtSignature preserved
-    for (let i = 0; i < this.state.toolCalls.length; i++) {
-      const toolCall = this.state.toolCalls[i];
+    // Add function calls with thoughtSignature preserved.
+    //
+    // Skipped entirely when a refusal replaced the response: those calls were
+    // held back and never reached the client, so recording them would describe
+    // a turn that did not happen — and would leave a record owing function
+    // responses that nothing will ever send.
+    const approved = approvedGeminiCalls(
+      this.originalToolCalls,
+      this.state.toolCalls,
+    );
+    // Native frames retain provider order even when policy reorders its batch.
+    const emittedToolCalls =
+      this.replacedText === null
+        ? this.originalToolCalls.flatMap((original) => {
+            const call = approved.get(original.id);
+            return call ? [call] : [];
+          })
+        : [];
+    for (let i = 0; i < emittedToolCalls.length; i++) {
+      const toolCall = emittedToolCalls[i];
       let parsedArgs: Record<string, unknown> = {};
       try {
         parsedArgs = JSON.parse(toolCall.arguments);
@@ -771,7 +1063,11 @@ class GeminiStreamAdapter
         // Keep empty object if parse fails
       }
 
-      const signature = this.toolCallSignatures.get(i);
+      const signature = this.toolCallSignatures.get(
+        this.originalToolCalls.findIndex(
+          (original) => original.id === toolCall.id,
+        ),
+      );
       parts.push({
         functionCall: {
           id: toolCall.id,
@@ -782,24 +1078,111 @@ class GeminiStreamAdapter
       });
     }
 
+    // A refusal does not erase what the model already said — its thought and
+    // answer text streamed as they arrived, and the refusal was appended after
+    // them, so the client holds all of it. Recording the refusal alone drops
+    // the model's own output from the record, and whatever reads the turn back
+    // later then sees a turn in which the model never spoke.
+    if (this.replacedText !== null) {
+      parts.push({ text: this.replacedText });
+    }
+
+    const separateCandidates =
+      this.candidateParts.size > 1 ||
+      (this.candidateParts.size === 1 && !this.candidateParts.has(0))
+        ? [...this.candidateParts.entries()].map(
+            ([index, { candidate, parts }]) => {
+              const candidateParts = parts.flatMap(
+                ({ part, toolCallIndex }) => {
+                  if (toolCallIndex === undefined) return [part];
+                  if (this.replacedText !== null) return [];
+                  const call = approved.get(
+                    this.originalToolCalls[toolCallIndex].id,
+                  );
+                  if (!call) return []; // Disconnect cleanup discarded this held call.
+                  return [
+                    {
+                      ...part,
+                      functionCall: {
+                        ...("functionCall" in part ? part.functionCall : {}),
+                        name: call.name,
+                        args: parseArgs(call.arguments),
+                      },
+                    },
+                  ];
+                },
+              );
+              if (index === 0 && this.replacedText !== null)
+                candidateParts.push({ text: this.replacedText });
+              return {
+                ...candidate,
+                content: {
+                  ...candidate.content,
+                  role: "model",
+                  parts: candidateParts,
+                },
+                ...(this.replacedText !== null
+                  ? { finishReason: "STOP" as const }
+                  : {}),
+              };
+            },
+          )
+        : null;
+    if (
+      separateCandidates &&
+      this.replacedText !== null &&
+      !this.candidateParts.has(0)
+    ) {
+      separateCandidates.unshift({
+        index: 0,
+        content: { role: "model", parts: [{ text: this.replacedText }] },
+        finishReason: "STOP",
+      });
+    }
+
     return {
-      candidates: [
+      candidates: separateCandidates ?? [
         {
           content: {
             parts,
             role: "model",
           },
           finishReason:
-            (this.state.stopReason as Gemini.Types.FinishReason) ?? "STOP",
+            this.replacedText !== null
+              ? "STOP"
+              : ((this.state.stopReason as Gemini.Types.FinishReason) ??
+                "STOP"),
           index: 0,
         },
       ],
+      // `state.usage.inputTokens` is net of the cache read (see processChunk
+      // above, which subtracts `cachedContentTokenCount`), so this recombines
+      // it into a gross `promptTokenCount` and republishes the cache read via
+      // `cachedContentTokenCount` — otherwise a heavily cached turn reports
+      // only the uncached remainder as its entire prompt. Built-in tool
+      // tokens (`toolUsePromptTokenCount`) are folded into the input too, so
+      // they land in `promptTokenCount` here and `totalTokenCount` stays whole.
       usageMetadata: this.state.usage
         ? {
-            promptTokenCount: this.state.usage.inputTokens,
-            candidatesTokenCount: this.state.usage.outputTokens,
+            ...(this.trafficType ? { trafficType: this.trafficType } : {}),
+            promptTokenCount:
+              this.state.usage.inputTokens +
+              (this.state.usage.cacheReadTokens ?? 0),
+            // `outputTokens` includes thinking (see geminiUsageTokens); split
+            // it back into Gemini's two fields.
+            candidatesTokenCount:
+              this.state.usage.outputTokens -
+              (this.state.usage.reasoningTokens ?? 0),
+            ...(this.state.usage.reasoningTokens
+              ? { thoughtsTokenCount: this.state.usage.reasoningTokens }
+              : {}),
             totalTokenCount:
-              this.state.usage.inputTokens + this.state.usage.outputTokens,
+              this.state.usage.inputTokens +
+              (this.state.usage.cacheReadTokens ?? 0) +
+              this.state.usage.outputTokens,
+            ...(this.state.usage.cacheReadTokens
+              ? { cachedContentTokenCount: this.state.usage.cacheReadTokens }
+              : {}),
           }
         : undefined,
       modelVersion: this.state.model,
@@ -809,207 +1192,22 @@ class GeminiStreamAdapter
 }
 
 // =============================================================================
-// TOON COMPRESSION
-// =============================================================================
-
-async function convertToolResultsToToon(
-  contents: GeminiContents,
-  model: string,
-): Promise<{
-  contents: GeminiContents;
-  stats: ToolCompressionStats;
-}> {
-  const tokenizer = getTokenizer("gemini");
-  let toolResultCount = 0;
-  let totalTokensBefore = 0;
-  let totalTokensAfter = 0;
-
-  const result = contents.map((content) => {
-    // Only process user messages with parts containing functionResponse
-    if (content.role === "user" && content.parts) {
-      const updatedParts = content.parts.map((part) => {
-        // Check if this part has a functionResponse
-        if (
-          "functionResponse" in part &&
-          part.functionResponse &&
-          typeof part.functionResponse === "object" &&
-          "response" in part.functionResponse
-        ) {
-          const { functionResponse } = part;
-          toolResultCount++;
-
-          logger.info(
-            {
-              functionName:
-                "name" in functionResponse ? functionResponse.name : "unknown",
-              responseType: typeof functionResponse.response,
-            },
-            "Processing functionResponse for TOON conversion",
-          );
-
-          // Handle response object - try to compress it
-          const response = functionResponse.response;
-          if (response && typeof response === "object") {
-            try {
-              const noncompressed = JSON.stringify(response);
-              const unwrapped = unwrapToolContent(noncompressed);
-              const parsed = JSON.parse(unwrapped);
-              const compressed = toonEncode(parsed);
-
-              // Count tokens for before and after
-              const tokensBefore = tokenizer.countTokens([
-                { role: "user", content: noncompressed },
-              ]);
-              const tokensAfter = tokenizer.countTokens([
-                { role: "user", content: compressed },
-              ]);
-
-              // Always count tokens
-              totalTokensBefore += tokensBefore;
-
-              // Only apply compression if it actually saves tokens
-              if (tokensAfter < tokensBefore) {
-                totalTokensAfter += tokensAfter;
-
-                logger.info(
-                  {
-                    functionName:
-                      "name" in functionResponse
-                        ? functionResponse.name
-                        : "unknown",
-                    beforeLength: noncompressed.length,
-                    afterLength: compressed.length,
-                    tokensBefore,
-                    tokensAfter,
-                    toonPreview: compressed.substring(0, 150),
-                    provider: "gemini",
-                  },
-                  "convertToolResultsToToon: compressed",
-                );
-                logger.trace(
-                  {
-                    functionName:
-                      "name" in functionResponse
-                        ? functionResponse.name
-                        : "unknown",
-                    before: noncompressed,
-                    after: compressed,
-                    provider: "gemini",
-                  },
-                  "convertToolResultsToToon: before/after",
-                );
-
-                // Return updated part with compressed response
-                return {
-                  functionResponse: {
-                    ...functionResponse,
-                    // Gemini expects response as Record<string, unknown>, but we now have a TOON string
-                    // We wrap it in a {"tool_result": "<TOON string>"} object to match the expected format
-                    response: { tool_result: compressed } as Record<
-                      string,
-                      unknown
-                    >,
-                  },
-                };
-              }
-
-              // Compression not applied - count non-compressed tokens to track total tokens anyway
-              totalTokensAfter += tokensBefore;
-              logger.info(
-                {
-                  functionName:
-                    "name" in functionResponse
-                      ? functionResponse.name
-                      : "unknown",
-                  tokensBefore,
-                  tokensAfter,
-                  provider: "gemini",
-                },
-                "Skipping TOON compression - compressed output has more tokens",
-              );
-              return part;
-            } catch {
-              logger.info(
-                {
-                  functionName:
-                    "name" in functionResponse
-                      ? functionResponse.name
-                      : "unknown",
-                },
-                "convertToolResultsToToon: skipping - response cannot be compressed",
-              );
-              return part;
-            }
-          }
-        }
-        return part;
-      });
-
-      return {
-        ...content,
-        parts: updatedParts,
-      };
-    }
-
-    return content;
-  });
-
-  logger.info(
-    { contentsCount: contents.length, toolResultCount },
-    "convertToolResultsToToon completed",
-  );
-
-  // Calculate cost savings (always a number, 0 if no savings)
-  let toonCostSavings = 0;
-  const tokensSaved = totalTokensBefore - totalTokensAfter;
-  if (tokensSaved > 0) {
-    toonCostSavings = await ModelModel.calculateCostSavings(
-      model,
-      tokensSaved,
-      "gemini",
-    );
-  }
-
-  return {
-    contents: result,
-    stats: {
-      tokensBefore: totalTokensBefore,
-      tokensAfter: totalTokensAfter,
-      costSavings: toonCostSavings,
-      wasEffective: totalTokensAfter < totalTokensBefore,
-      hadToolResults: toolResultCount > 0,
-    },
-  };
-}
-
-// =============================================================================
 // ADAPTER FACTORY
 // =============================================================================
-
-// =============================================================================
-// USAGE TOKEN HELPERS
-// =============================================================================
-
-export function getUsageTokens(usage: {
-  promptTokenCount?: number;
-  candidatesTokenCount?: number;
-}) {
-  return {
-    input: usage.promptTokenCount,
-    output: usage.candidatesTokenCount,
-  };
-}
 
 // =============================================================================
 // GEMINI FORMAT CONVERSION UTILITIES
 // =============================================================================
 
 /**
- * Generate a consistent tool call ID for function responses that don't have one
- * This is needed because Gemini's function responses may not always have an ID
+ * Identifier for a `functionResponse` the client sent without one — optional in
+ * Gemini's API and omitted by the AI SDK, so most requests need it. Tool results
+ * are read in one pass over the request and their replacements written back in
+ * another, so this has to be derived from something both passes
+ * observe: the response's position in the request.
  */
-function generateToolCallId(functionName: string): string {
-  return `gemini-tool-${functionName}-${Date.now()}`;
+function syntheticToolCallId(contentIndex: number, partIndex: number): string {
+  return `gemini-tool-${contentIndex}-${partIndex}`;
 }
 
 /**
@@ -1122,6 +1320,7 @@ function sdkPartToRestPart(sdkPart: Part): Gemini.Types.MessagePart {
  */
 function sdkCandidateToRestCandidate(
   sdkCandidate: Candidate,
+  position = 0,
 ): Gemini.Types.Candidate {
   return {
     content: {
@@ -1160,7 +1359,7 @@ function sdkCandidateToRestCandidate(
     groundingMetadata: sdkCandidate.groundingMetadata,
     avgLogprobs: sdkCandidate.avgLogprobs,
     logprobsResult: sdkCandidate.logprobsResult,
-    index: sdkCandidate.index ?? 0,
+    index: sdkCandidate.index ?? position,
     finishMessage: sdkCandidate.finishMessage,
   } as Gemini.Types.Candidate;
 }
@@ -1203,6 +1402,14 @@ function sdkResponseToRestResponse(
   } as Gemini.Types.GenerateContentResponse;
 }
 
+// Strip Gemini-incompatible JSON-schema constructs (non-string enums) from a
+// function declaration schema field before handing it to the SDK. Returns the
+// input untouched when absent.
+function sanitizeFdSchema<T>(schema: T): T {
+  if (schema === undefined || schema === null) return schema;
+  return sanitizeGeminiToolSchema(schema) as T;
+}
+
 /**
  * Convert a Gemini REST-style GenerateContentRequest body into the SDK's
  * GenerateContentParameters shape. The SDK and REST shapes differ significantly:
@@ -1212,8 +1419,11 @@ function sdkResponseToRestResponse(
  *
  * Note: Gemini SDK and REST API have different schemas. See:
  * https://ai.google.dev/api/generate-content
+ *
+ * @public — exercised by gemini.test.ts to verify tool-schema sanitization on
+ * the outbound path.
  */
-function restToSdkGenerateContentParams(
+export function restToSdkGenerateContentParams(
   body: Partial<Gemini.Types.GenerateContentRequest>,
   model: string,
   mergedTools?: Gemini.Types.Tool[] | undefined,
@@ -1233,8 +1443,11 @@ function restToSdkGenerateContentParams(
   }
 
   if (body.generationConfig) {
-    params.config =
-      body.generationConfig as GenerateContentParameters["config"];
+    // Copied: the SDK config gains tools and systemInstruction below, which
+    // must not leak back into the request the interaction log records.
+    params.config = {
+      ...body.generationConfig,
+    } as GenerateContentParameters["config"];
   } else {
     const generationConfig: Record<string, unknown> = {};
     const configKeys = [
@@ -1266,10 +1479,10 @@ function restToSdkGenerateContentParams(
           name: fd.name,
           description: fd.description,
           behavior: mappedBehavior,
-          parameters: fd.parameters,
-          parametersJsonSchema: fd.parametersJsonSchema,
-          response: fd.response,
-          responseJsonSchema: fd.responseJsonSchema,
+          parameters: sanitizeFdSchema(fd.parameters),
+          parametersJsonSchema: sanitizeFdSchema(fd.parametersJsonSchema),
+          response: sanitizeFdSchema(fd.response),
+          responseJsonSchema: sanitizeFdSchema(fd.responseJsonSchema),
         };
       });
 
@@ -1282,8 +1495,17 @@ function restToSdkGenerateContentParams(
     params.config.tools = sdkTools;
   }
 
+  if (body.toolConfig) {
+    params.config.toolConfig =
+      body.toolConfig as GenerateContentConfig["toolConfig"];
+  }
+
   if (body.systemInstruction) {
     params.config.systemInstruction = { ...body.systemInstruction };
+  }
+
+  if (body.cachedContent !== undefined) {
+    params.config.cachedContent = body.cachedContent;
   }
 
   return params as GenerateContentParameters;
@@ -1311,11 +1533,18 @@ export const geminiAdapterFactory: LLMProvider<
     return new GeminiResponseAdapter(response);
   },
 
-  createStreamAdapter(): LLMStreamAdapter<GeminiStreamChunk, GeminiResponse> {
-    return new GeminiStreamAdapter();
+  createStreamAdapter(
+    request?: GeminiRequestWithModel,
+  ): LLMStreamAdapter<GeminiStreamChunk, GeminiResponse> {
+    return new GeminiStreamAdapter(request);
   },
 
   extractApiKey(headers: GeminiHeaders): string | undefined {
+    const authorization = headers.authorization;
+    if (authorization?.startsWith("Bearer ")) {
+      // Keep OAuth distinct from an API key through virtual-key resolution.
+      return `Bearer:${authorization.slice(7)}`;
+    }
     return headers["x-goog-api-key"];
   },
 
@@ -1325,26 +1554,42 @@ export const geminiAdapterFactory: LLMProvider<
 
   spanName: "generate_content",
 
-  createClient(
-    apiKey: string | undefined,
-    options: CreateClientOptions,
-  ): GoogleGenAI {
+  createClient(apiKey: string | undefined, options: CreateClientOptions) {
     const client = createGoogleGenAIClient(
       apiKey,
       "[GeminiProxyV2]",
       options.baseUrl,
+      options.model,
+      options.googleUserProject,
+      options.defaultHeaders,
     );
 
-    // Wrap with observability for request duration metrics
-    if (options.agent) {
-      return metrics.llm.getObservableGenAI(
-        client,
-        options.agent,
-        options.source,
-        options.externalAgentId,
-      );
-    }
-    return client;
+    const observed = options.agent
+      ? metrics.llm.getObservableGenAI(client, options.agent, options.source)
+      : client;
+    const withSignal = (
+      params: GenerateContentParameters,
+    ): GenerateContentParameters => ({
+      ...params,
+      config: {
+        ...params.config,
+        abortSignal:
+          options.abortSignal && params.config?.abortSignal
+            ? AbortSignal.any([options.abortSignal, params.config.abortSignal])
+            : (options.abortSignal ?? params.config?.abortSignal),
+      },
+    });
+    const generateContent = observed.models.generateContent.bind(
+      observed.models,
+    );
+    const generateContentStream = observed.models.generateContentStream.bind(
+      observed.models,
+    );
+    observed.models.generateContent = (params) =>
+      generateContent(withSignal(params));
+    observed.models.generateContentStream = (params) =>
+      generateContentStream(withSignal(params));
+    return observed;
   },
 
   async execute(
@@ -1352,18 +1597,20 @@ export const geminiAdapterFactory: LLMProvider<
     request: GeminiRequestWithModel,
   ): Promise<GeminiResponse> {
     const genAI = client as GoogleGenAI;
-    const model = request._model ?? "gemini-2.5-pro";
+    const { providerRequest, toolNameCodec } =
+      prepareGeminiProviderRequest(request);
+    const model = providerRequest._model ?? "gemini-2.5-pro";
 
     // Normalize tools to array
-    const tools = request.tools
-      ? Array.isArray(request.tools)
-        ? request.tools
-        : [request.tools]
+    const tools = providerRequest.tools
+      ? Array.isArray(providerRequest.tools)
+        ? providerRequest.tools
+        : [providerRequest.tools]
       : undefined;
 
     // Convert REST body to SDK params
     const sdkParams = restToSdkGenerateContentParams(
-      { ...request, contents: request.contents || [] },
+      { ...providerRequest, contents: providerRequest.contents || [] },
       model,
       tools,
     );
@@ -1373,7 +1620,9 @@ export const geminiAdapterFactory: LLMProvider<
     );
 
     // Convert SDK response to REST format
-    return sdkResponseToRestResponse(response, model);
+    return toolNameCodec.decodeResponse(
+      sdkResponseToRestResponse(response, model),
+    );
   },
 
   async executeStream(
@@ -1381,18 +1630,19 @@ export const geminiAdapterFactory: LLMProvider<
     request: GeminiRequestWithModel,
   ): Promise<AsyncIterable<GeminiStreamChunk>> {
     const genAI = client as GoogleGenAI;
-    const model = request._model ?? "gemini-2.5-pro";
+    const { providerRequest } = prepareGeminiProviderRequest(request);
+    const model = providerRequest._model ?? "gemini-2.5-pro";
 
     // Normalize tools to array
-    const tools = request.tools
-      ? Array.isArray(request.tools)
-        ? request.tools
-        : [request.tools]
+    const tools = providerRequest.tools
+      ? Array.isArray(providerRequest.tools)
+        ? providerRequest.tools
+        : [providerRequest.tools]
       : undefined;
 
     // Convert REST body to SDK params
     const sdkParams = restToSdkGenerateContentParams(
-      { ...request, contents: request.contents || [] },
+      { ...providerRequest, contents: providerRequest.contents || [] },
       model,
       tools,
     );
@@ -1416,13 +1666,9 @@ export const geminiAdapterFactory: LLMProvider<
     // like "The input token count (X) exceeds the maximum number of tokens
     // allowed (Y)". The ErrorInfo details array does not carry a structured
     // reason for this case, so message sniffing is the only signal. The
-    // status and message can appear at the top level or nested under
-    // `error`.
-    const status: unknown = get(error, "error.status") ?? get(error, "status");
+    // SDK errors serialize the provider body into their message.
+    const { status, message } = extractGeminiError(error);
     if (status !== "INVALID_ARGUMENT") return undefined;
-    const message: unknown =
-      get(error, "error.message") ?? get(error, "message");
-    if (typeof message !== "string") return undefined;
     const msg = message.toLowerCase();
     if (
       msg.includes("input token count") ||
@@ -1434,21 +1680,117 @@ export const geminiAdapterFactory: LLMProvider<
   },
 
   extractErrorMessage(error: unknown): string {
-    // Gemini SDK error structure
-    const geminiMessage = get(error, "message");
-    if (typeof geminiMessage === "string") {
-      return geminiMessage;
+    const { message, httpStatus } = extractGeminiError(error);
+    if (
+      httpStatus === 403 &&
+      /^Lightning dunning decision is deny for project:/i.test(message)
+    ) {
+      // This project-level block can persist with an active billing account.
+      // Do not claim that the API key is invalid or the balance is too low.
+      return "Google denied access to the configured project (Lightning dunning). Ask your administrator to check project restrictions and billing in Google AI Studio or Google Cloud Console. Contact Google support if access remains blocked.";
     }
 
-    const nestedMessage = get(error, "error.message");
-    if (typeof nestedMessage === "string") {
-      return nestedMessage;
-    }
-
-    if (error instanceof Error) {
-      return error.message;
-    }
-
-    return "Internal server error";
+    return message;
   },
 };
+
+/**
+ * The SDK puts the provider body in Error.message. An upstream proxy can add
+ * another error envelope, including when it returns JSON as text. Unwrap only
+ * error/message fields, with a fixed bound for malformed or cyclic payloads.
+ * Keep ordinary text and unrecognized JSON unchanged.
+ */
+function extractGeminiError(error: unknown): {
+  message: string;
+  status?: string;
+  httpStatus?: number;
+} {
+  let current = error;
+  let message = "Internal server error";
+  let status: string | undefined;
+  let httpStatus: number | undefined;
+
+  for (let depth = 0; depth < 16; depth++) {
+    if (typeof current === "string") {
+      message = current;
+      try {
+        const parsed: unknown = JSON.parse(current);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          break;
+        }
+        current = parsed;
+        continue;
+      } catch {
+        break;
+      }
+    }
+    if (!current || typeof current !== "object" || Array.isArray(current)) {
+      break;
+    }
+
+    const candidateStatus: unknown = get(current, "status");
+    if (typeof candidateStatus === "string") status = candidateStatus;
+    const candidateHttpStatus: unknown =
+      typeof candidateStatus === "number"
+        ? candidateStatus
+        : get(current, "code");
+    if (typeof candidateHttpStatus === "number") {
+      httpStatus = candidateHttpStatus;
+    }
+    const candidateMessage: unknown = get(current, "message");
+    if (typeof candidateMessage === "string") message = candidateMessage;
+    const nestedError: unknown = get(current, "error");
+    if (
+      (typeof nestedError === "string" && nestedError.length > 0) ||
+      (nestedError &&
+        typeof nestedError === "object" &&
+        !Array.isArray(nestedError))
+    ) {
+      current = nestedError;
+    } else if (typeof candidateMessage === "string") {
+      current = candidateMessage;
+    } else {
+      break;
+    }
+  }
+
+  return { message, status, httpStatus };
+}
+
+type GeminiProviderRequestContext = {
+  providerRequest: GeminiRequestWithModel;
+  toolNameCodec: GeminiToolNameCodec;
+};
+
+const geminiProviderRequestContexts = new WeakMap<
+  GeminiRequestWithModel,
+  GeminiProviderRequestContext
+>();
+
+function prepareGeminiProviderRequest(
+  request: GeminiRequestWithModel,
+): GeminiProviderRequestContext {
+  const cached = geminiProviderRequestContexts.get(request);
+  if (cached) return cached;
+
+  const toolNameCodec = new GeminiToolNameCodec(request);
+  const providerRequest = toolNameCodec.encodeRequest(request);
+  const context = { providerRequest, toolNameCodec };
+  geminiProviderRequestContexts.set(request, context);
+  geminiProviderRequestContexts.set(providerRequest, context);
+  return context;
+}
+
+/** Rewritten arguments arrive as the JSON string the model emitted; this wire
+ * shape carries them as an object. A repaired call always parses (the planner
+ * refuses to rewrite otherwise), so the fallback is defensive only. */
+function parseArgs(argumentsJson: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(argumentsJson);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed
+      : {};
+  } catch {
+    return {};
+  }
+}

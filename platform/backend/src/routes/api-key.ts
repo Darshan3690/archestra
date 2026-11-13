@@ -1,4 +1,9 @@
-import { RouteId } from "@shared";
+import {
+  API_KEY_MAX_EXPIRATION_DAYS,
+  API_KEY_MAX_NAME_LENGTH,
+  API_KEY_MIN_EXPIRATION_DAYS,
+  RouteId,
+} from "@archestra/shared";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { auth as betterAuth } from "@/auth/better-auth";
 import ApiKeyModel from "@/models/api-key";
@@ -11,6 +16,7 @@ import {
   constructResponseSchema,
   DeleteApiKeyResponseSchema,
 } from "@/types";
+import { BulkDeleteBodySchema, BulkOutcomeSchema, runBulk } from "./bulk-route";
 
 const apiKeyRoutes: FastifyPluginAsyncZod = async (fastify) => {
   fastify.get(
@@ -18,6 +24,7 @@ const apiKeyRoutes: FastifyPluginAsyncZod = async (fastify) => {
     {
       schema: {
         operationId: RouteId.GetApiKeys,
+        // white-label-ok: OpenAPI prose; branded per request by enrichOpenApiWithRbac (route schemas register before the branding singleton syncs)
         description: "List the authenticated user's Archestra API keys",
         tags: ["API Keys"],
         response: constructResponseSchema(ApiKeyResponseSchema.array()),
@@ -34,6 +41,7 @@ const apiKeyRoutes: FastifyPluginAsyncZod = async (fastify) => {
     {
       schema: {
         operationId: RouteId.GetApiKey,
+        // white-label-ok: OpenAPI prose; branded per request by enrichOpenApiWithRbac (route schemas register before the branding singleton syncs)
         description: "Get one authenticated user's Archestra API key",
         tags: ["API Keys"],
         params: ApiKeyIdParamsSchema,
@@ -55,6 +63,7 @@ const apiKeyRoutes: FastifyPluginAsyncZod = async (fastify) => {
     {
       schema: {
         operationId: RouteId.CreateApiKey,
+        // white-label-ok: OpenAPI prose; branded per request by enrichOpenApiWithRbac (route schemas register before the branding singleton syncs)
         description: "Create an Archestra API key for the authenticated user",
         tags: ["API Keys"],
         body: CreateApiKeyBodySchema,
@@ -79,10 +88,70 @@ const apiKeyRoutes: FastifyPluginAsyncZod = async (fastify) => {
   );
 
   fastify.delete(
+    "/api/api-keys/bulk",
+    {
+      schema: {
+        operationId: RouteId.BulkDeleteApiKeys,
+        // white-label-ok: OpenAPI prose; branded per request by enrichOpenApiWithRbac (route schemas register before the branding singleton syncs)
+        description:
+          "Delete several of the authenticated user's Archestra API keys in " +
+          "one request. Keys are personal, so an id belonging to anyone else " +
+          "is reported in `failed` as not found and the rest of the batch " +
+          "still applies.",
+        tags: ["API Keys"],
+        body: BulkDeleteBodySchema,
+        response: constructResponseSchema(BulkOutcomeSchema),
+      },
+    },
+    async (request, reply) => {
+      const userId = request.user.id;
+      const snapshot = async (ids: string[]) => {
+        const wanted = new Set(ids);
+        const keys = await ApiKeyModel.listByUserId(userId);
+        return {
+          apiKeys: keys
+            .filter((key) => wanted.has(key.id))
+            .map(({ id, name }) => ({ id, name }))
+            .sort((a, b) => a.id.localeCompare(b.id)),
+        };
+      };
+
+      const outcome = await runBulk({
+        ids: request.body.ids,
+        logLabel: "api keys bulk delete",
+        notFoundMessage: "API key not found",
+        unexpectedMessage: "Could not delete this API key",
+        // Keys are addressed by their owner, not by organization, so listing
+        // the caller's own is the fence: another user's id simply is not here.
+        load: async (ids) => {
+          const wanted = new Set(ids);
+          const keys = await ApiKeyModel.listByUserId(userId);
+          return new Map(
+            keys
+              .filter((key) => wanted.has(key.id))
+              .map((key) => [key.id, key] as const),
+          );
+        },
+        describe: (key) => key.name ?? "Unnamed key",
+        applyEach: async (key) => {
+          await betterAuth.api.deleteApiKey({
+            headers: new Headers(request.headers as HeadersInit),
+            body: { keyId: key.id },
+          });
+        },
+        audit: { target: request, snapshot },
+      });
+
+      return reply.send(outcome);
+    },
+  );
+
+  fastify.delete(
     "/api/api-keys/:id",
     {
       schema: {
         operationId: RouteId.DeleteApiKey,
+        // white-label-ok: OpenAPI prose; branded per request by enrichOpenApiWithRbac (route schemas register before the branding singleton syncs)
         description: "Delete an Archestra API key for the authenticated user",
         tags: ["API Keys"],
         params: ApiKeyIdParamsSchema,
@@ -119,6 +188,18 @@ export default apiKeyRoutes;
 
 // === Internal helpers
 
+/**
+ * Better Auth api-key validation error codes mapped to user-facing messages.
+ * Codes not listed here keep the generic fallback so arbitrary upstream
+ * internals are never exposed.
+ */
+const KNOWN_VALIDATION_ERROR_MESSAGES: Record<string, string> = {
+  EXPIRES_IN_IS_TOO_SMALL: `Expiration must be at least ${API_KEY_MIN_EXPIRATION_DAYS} day from now`,
+  EXPIRES_IN_IS_TOO_LARGE: `Expiration cannot be more than ${API_KEY_MAX_EXPIRATION_DAYS} days from now`,
+  INVALID_NAME_LENGTH: `Name must be at most ${API_KEY_MAX_NAME_LENGTH} characters`,
+  NAME_REQUIRED: "API key name is required",
+};
+
 function toApiError(
   error: unknown,
   params: { fallbackStatusCode: number; fallbackMessage: string },
@@ -128,13 +209,21 @@ function toApiError(
   }
 
   const statusCode = getStatusCode(error, params.fallbackStatusCode);
-  const message = getApiKeyErrorMessage(statusCode, params.fallbackMessage);
-
-  if (error instanceof Error) {
-    return new ApiError(statusCode, message);
-  }
+  const message =
+    getKnownValidationErrorMessage(error) ??
+    getApiKeyErrorMessage(statusCode, params.fallbackMessage);
 
   return new ApiError(statusCode, message);
+}
+
+function getKnownValidationErrorMessage(error: unknown): string | null {
+  const body = (error as { body?: { code?: unknown } }).body;
+  const code = body?.code;
+  if (typeof code !== "string") {
+    return null;
+  }
+
+  return KNOWN_VALIDATION_ERROR_MESSAGES[code] ?? null;
 }
 
 function getStatusCode(error: unknown, fallbackStatusCode: number): number {

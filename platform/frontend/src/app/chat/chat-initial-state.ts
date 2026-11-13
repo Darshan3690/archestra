@@ -1,5 +1,9 @@
 import {
-  type ModelSource,
+  BUILT_IN_AGENT_IDS,
+  type ThinkingEffortSetting,
+} from "@archestra/shared";
+import { autoRouterIdOfChoice } from "@/lib/chat/auto-model";
+import {
   resolveInitialModel,
   resolveModelForAgent,
 } from "@/lib/chat/use-chat-preferences";
@@ -8,7 +12,10 @@ import type { SupportedProvider } from "@/lib/llm-provider-api-keys.query";
 
 type AgentInfo = {
   id: string;
-  llmModel?: string | null;
+  builtIn?: boolean | null;
+  builtInAgentConfig?: { name: string } | null;
+  scope?: string;
+  modelId?: string | null;
   llmApiKeyId?: string | null;
 };
 
@@ -18,65 +25,118 @@ type ChatApiKeyInfo = {
 };
 
 type OrganizationInfo = {
-  defaultLlmModel?: string | null;
+  defaultModelId?: string | null;
   defaultLlmApiKeyId?: string | null;
 } | null;
 
+/** A model identifier is the models.id UUID throughout the chat model flow. */
 export type ResolvedInitialAgentState = {
   agentId: string;
   modelId: string;
   apiKeyId: string | null;
-  modelSource: ModelSource | null;
 };
 
 export type ResolvedChatModelState = {
   modelId: string;
   apiKeyId: string | null;
-  modelSource: ModelSource | null;
-  provider: SupportedProvider | undefined;
 };
 
 export type CreateConversationInput = {
   agentId: string;
-  selectedModel?: string;
-  selectedProvider?: SupportedProvider;
+  modelId?: string;
   chatApiKeyId?: string | null;
+  /** A model pool picked in place of the key and model. */
+  modelPoolId?: string | null;
+  /** An auto router picked in place of the key and model. */
+  autoRouterId?: string;
+  title?: string;
+  /** Project the chat is started in (carried from /chat?project=...). */
+  projectId?: string;
+  thinkingEffort?: ThinkingEffortSetting;
+};
+
+/**
+ * Which agent a new chat starts on. `fromProjectDefault` tells the caller the
+ * winner came from the project rather than a user-level preference, so it can
+ * be kept out of the (global) saved-agent store.
+ */
+export type InitialAgentSelection<TAgent> = {
+  agent: TAgent;
+  /** The rule that chose the agent, in the order they are tried below. */
+  source: "project" | "member" | "organization" | "saved" | "fallback";
+  fromProjectDefault: boolean;
 };
 
 export function resolveInitialAgentSelection<TAgent extends AgentInfo>(params: {
   agents: TAgent[];
+  /** The project's pinned agent, when the chat is being started in one. */
+  projectDefaultAgentId?: string | null;
   organizationDefaultAgentId?: string | null;
   savedAgentId?: string | null;
   memberDefaultAgentId?: string | null;
   canUseSavedAgent: boolean;
-}): TAgent | null {
-  const { agents } = params;
+}): InitialAgentSelection<TAgent> | null {
+  const agents = params.agents.filter(
+    (agent) =>
+      !agent.builtIn ||
+      agent.builtInAgentConfig?.name === BUILT_IN_AGENT_IDS.SRE,
+  );
   if (agents.length === 0) {
     return null;
+  }
+
+  // Outranks everything: a project is the narrower workspace, and its agent
+  // is chosen for the work the project's chats do.
+  const projectDefaultAgent = agents.find(
+    (agent) => agent.id === params.projectDefaultAgentId,
+  );
+  if (projectDefaultAgent) {
+    return {
+      agent: projectDefaultAgent,
+      source: "project",
+      fromProjectDefault: true,
+    };
+  }
+
+  // The member's own personal default beats the org-wide default: it is set
+  // only by a deliberate pick (PUT /api/members/default-agent), so it speaks
+  // for the member the way the org default speaks for the admin. A member who
+  // never picked one, or who cleared theirs, falls through to the org default —
+  // nothing adopts an agent into this slot on their behalf.
+  const memberDefaultAgent = agents.find(
+    (agent) => agent.id === params.memberDefaultAgentId,
+  );
+  if (memberDefaultAgent) {
+    return {
+      agent: memberDefaultAgent,
+      source: "member",
+      fromProjectDefault: false,
+    };
   }
 
   const organizationDefaultAgent = agents.find(
     (agent) => agent.id === params.organizationDefaultAgentId,
   );
   if (organizationDefaultAgent) {
-    return organizationDefaultAgent;
+    return {
+      agent: organizationDefaultAgent,
+      source: "organization",
+      fromProjectDefault: false,
+    };
   }
 
   if (params.canUseSavedAgent) {
     const savedAgent = agents.find((agent) => agent.id === params.savedAgentId);
     if (savedAgent) {
-      return savedAgent;
+      return { agent: savedAgent, source: "saved", fromProjectDefault: false };
     }
   }
 
-  const memberDefaultAgent = agents.find(
-    (agent) => agent.id === params.memberDefaultAgentId,
-  );
-  if (memberDefaultAgent) {
-    return memberDefaultAgent;
-  }
-
-  return agents[0];
+  return {
+    agent: agents.find((agent) => agent.scope === "personal") ?? agents[0],
+    source: "fallback",
+    fromProjectDefault: false,
+  };
 }
 
 export function resolveInitialAgentState(params: {
@@ -100,16 +160,7 @@ export function resolveInitialAgentState(params: {
     agentId: params.agent.id,
     modelId: resolved.modelId,
     apiKeyId: resolved.apiKeyId,
-    modelSource: resolved.modelSource,
   };
-}
-
-export function getProviderForModelId(params: {
-  modelId: string;
-  chatModels: LlmModel[];
-}): SupportedProvider | undefined {
-  return params.chatModels.find((model) => model.id === params.modelId)
-    ?.provider;
 }
 
 export function resolveChatModelState(params: {
@@ -117,19 +168,26 @@ export function resolveChatModelState(params: {
   modelsByProvider: Record<string, LlmModel[]>;
   chatApiKeys: ChatApiKeyInfo[];
   organization: OrganizationInfo;
-  chatModels?: LlmModel[];
 }): ResolvedChatModelState | null {
+  // The resolver identifies models by their models.id UUID.
+  const modelsByProvider = Object.fromEntries(
+    Object.entries(params.modelsByProvider).map(([provider, models]) => [
+      provider,
+      models.map((m) => ({ id: m.dbId, isBest: m.isBest })),
+    ]),
+  );
+
   const resolved = params.agent
     ? resolveModelForAgent({
         agent: params.agent,
         context: {
-          modelsByProvider: params.modelsByProvider,
+          modelsByProvider,
           chatApiKeys: params.chatApiKeys,
           organization: params.organization,
         },
       })
     : resolveInitialModel({
-        modelsByProvider: params.modelsByProvider,
+        modelsByProvider,
         chatApiKeys: params.chatApiKeys,
         organization: params.organization,
         agent: null,
@@ -142,14 +200,6 @@ export function resolveChatModelState(params: {
   return {
     modelId: resolved.modelId,
     apiKeyId: resolved.apiKeyId,
-    modelSource: resolved.source === "fallback" ? null : resolved.source,
-    provider:
-      params.chatModels && params.chatModels.length > 0
-        ? getProviderForModelId({
-            modelId: resolved.modelId,
-            chatModels: params.chatModels,
-          })
-        : undefined,
   };
 }
 
@@ -165,7 +215,7 @@ export function resolvePreferredModelForProvider(params: {
   const bestModel = providerModels.find((model) => model.isBest);
 
   return {
-    modelId: bestModel?.id ?? providerModels[0].id,
+    modelId: bestModel?.dbId ?? providerModels[0].dbId,
     provider: params.provider,
   };
 }
@@ -174,24 +224,33 @@ export function buildCreateConversationInput(params: {
   agentId: string | null;
   modelId: string;
   chatApiKeyId: string | null;
-  chatModels: LlmModel[];
+  modelPoolId?: string | null;
+  title?: string;
+  projectId?: string | null;
+  thinkingEffort?: ThinkingEffortSetting;
 }): CreateConversationInput | null {
   if (!params.agentId) {
     return null;
   }
 
-  const selectedProvider = params.modelId
-    ? getProviderForModelId({
-        modelId: params.modelId,
-        chatModels: params.chatModels,
-      })
-    : undefined;
-
+  const autoRouterId = autoRouterIdOfChoice(params.modelPoolId);
+  if (autoRouterId) {
+    return {
+      agentId: params.agentId,
+      autoRouterId,
+      title: params.title,
+      projectId: params.projectId ?? undefined,
+      thinkingEffort: params.thinkingEffort,
+    };
+  }
   return {
     agentId: params.agentId,
-    selectedModel: params.modelId || undefined,
-    selectedProvider,
+    modelId: params.modelId || undefined,
     chatApiKeyId: params.chatApiKeyId ?? undefined,
+    modelPoolId: params.modelPoolId ?? undefined,
+    title: params.title,
+    projectId: params.projectId ?? undefined,
+    thinkingEffort: params.thinkingEffort,
   };
 }
 
@@ -200,4 +259,42 @@ export function shouldResetInitialChatState(params: {
   routeConversationId?: string;
 }): boolean {
   return !params.routeConversationId && !!params.previousRouteConversationId;
+}
+
+/**
+ * Whether `/chat` is mid-handoff: it arrived carrying a `user_prompt` (or a
+ * stashed-attachments marker whose files are still in memory) and is about to —
+ * or already is — auto-creating a conversation before navigating to
+ * `/chat/<id>`. During this window the centered New Chat splash must not render,
+ * or the empty home flashes before the conversation view mounts.
+ *
+ * Mirrors the auto-send effect's trigger conditions. `autoSendTriggered` (the
+ * effect's ref, set synchronously before the create fires) keeps it true from
+ * the frame where `user_prompt` is stripped from the URL through the whole
+ * create request. A files-only handoff whose stashed files were lost (e.g. a
+ * hard reload) has no prompt and no pending files, so this stays false and the
+ * composer shows.
+ *
+ * Deliberately NOT keyed on the create mutation being pending: an interactive
+ * submit from the splash also runs that mutation, and the splash must stay on
+ * screen during it — the composer keeps focus and is the "old" half of the
+ * shared-element morph into the conversation view. Only true handoffs (which
+ * always set one of the signals below) suppress the splash.
+ */
+export function isAutoSendHandoffInProgress(params: {
+  conversationId?: string;
+  initialUserPrompt?: string;
+  hasAttachmentsMarker: boolean;
+  hasPendingHandoffFiles: boolean;
+  autoSendTriggered: boolean;
+}): boolean {
+  if (params.conversationId) {
+    return false;
+  }
+
+  return (
+    Boolean(params.initialUserPrompt) ||
+    (params.hasAttachmentsMarker && params.hasPendingHandoffFiles) ||
+    params.autoSendTriggered
+  );
 }

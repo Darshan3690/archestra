@@ -1,0 +1,818 @@
+import { ADMIN_ROLE_NAME } from "@archestra/shared";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  type TestAccess,
+  test,
+} from "@/test";
+import type { AppListItem, User } from "@/types";
+
+// A 1x1 transparent PNG.
+const PNG_ICON_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+const PNG_ICON = `data:image/png;base64,${PNG_ICON_BASE64}`;
+
+type AppListResponse = {
+  data: AppListItem[];
+  pagination: { total: number };
+};
+
+describe("GET /api/apps", () => {
+  let app: FastifyInstanceWithZod;
+  let organizationId: string;
+  let user: User;
+
+  beforeEach(async ({ makeOrganization, makeUser, makeMember }) => {
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    user = await makeUser();
+    await makeMember(user.id, organizationId, { role: ADMIN_ROLE_NAME });
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (
+        request as typeof request & {
+          organizationId: string;
+          user: User;
+        }
+      ).organizationId = organizationId;
+      (request as typeof request & { user: User }).user = user;
+    });
+
+    const { default: appRoutes } = await import("./app.routes");
+    await app.register(appRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  test("returns owned apps with pagination metadata", async ({ makeApp }) => {
+    const owned = await makeApp({
+      organizationId,
+      name: "Owned One",
+    });
+
+    const response = await app.inject({ method: "GET", url: "/api/apps" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().data.map((a: { id: string }) => a.id)).toContain(
+      owned.id,
+    );
+    expect(response.json().pagination.total).toBeGreaterThanOrEqual(1);
+  });
+
+  test("treats wildcard characters literally in owned app search", async ({
+    makeApp,
+  }) => {
+    const percentName = await makeApp({
+      organizationId,
+      name: "100% Ready",
+    });
+    const percentDescription = await makeApp({
+      organizationId,
+      name: "Percent Description",
+      description: "Contains a % marker",
+    });
+    const underscoreName = await makeApp({
+      organizationId,
+      name: "Under_score Name",
+    });
+    const underscoreDescription = await makeApp({
+      organizationId,
+      name: "Underscore Description",
+      description: "Contains an _ marker",
+    });
+    const backslashName = await makeApp({
+      organizationId,
+      name: "Back\\slash Name",
+    });
+    const backslashDescription = await makeApp({
+      organizationId,
+      name: "Backslash Description",
+      description: "Contains a \\ marker",
+    });
+    await makeApp({
+      organizationId,
+      name: "Plain App",
+      description: "Contains no special marker",
+    });
+
+    const searchOwned = async (search: string) => {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/apps?limit=100&offset=0&search=${encodeURIComponent(search)}`,
+      });
+      expect(response.statusCode).toBe(200);
+      const body = response.json<AppListResponse>();
+      const ids = body.data
+        .filter((item) => item.source === "owned")
+        .map((item) => item.id)
+        .sort();
+      return { ids, total: body.pagination.total };
+    };
+
+    expect(await searchOwned("%")).toEqual({
+      ids: [percentName.id, percentDescription.id].sort(),
+      total: 2,
+    });
+    expect(await searchOwned("_")).toEqual({
+      ids: [underscoreName.id, underscoreDescription.id].sort(),
+      total: 2,
+    });
+    expect(await searchOwned("\\")).toEqual({
+      ids: [backslashName.id, backslashDescription.id].sort(),
+      total: 2,
+    });
+    expect(await searchOwned("READY")).toEqual({
+      ids: [percentName.id],
+      total: 1,
+    });
+  });
+
+  test("treats wildcard characters literally in external app search", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeTool,
+  }) => {
+    const makeExternalApp = async (params: {
+      catalogName: string;
+      catalogDescription: string;
+      toolName: string;
+      toolDescription: string;
+    }) => {
+      const catalog = await makeInternalMcpCatalog({
+        organizationId,
+        name: params.catalogName,
+        description: params.catalogDescription,
+        serverType: "remote",
+        serverUrl: "https://example.com/mcp",
+      });
+      await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+      await makeTool({
+        catalogId: catalog.id,
+        name: params.toolName,
+        description: params.toolDescription,
+        meta: {
+          _meta: { ui: { resourceUri: `ui://${catalog.id}/app.html` } },
+        },
+      });
+      return catalog;
+    };
+
+    const percentName = await makeExternalApp({
+      catalogName: "100% External",
+      catalogDescription: "Catalog name marker",
+      toolName: "percentname",
+      toolDescription: "Ordinary description",
+    });
+    const underscoreDescription = await makeExternalApp({
+      catalogName: "Underscore Description",
+      catalogDescription: "Contains an _ marker",
+      toolName: "underscoredescription",
+      toolDescription: "Ordinary description",
+    });
+    const backslashToolName = await makeExternalApp({
+      catalogName: "Backslash Tool Name",
+      catalogDescription: "Tool name marker",
+      toolName: "back\\slash",
+      toolDescription: "Ordinary description",
+    });
+    const percentToolDescription = await makeExternalApp({
+      catalogName: "Tool Description Marker",
+      catalogDescription: "Ordinary catalog description",
+      toolName: "percentdescription",
+      toolDescription: "MiXeD needle with a % marker",
+    });
+
+    const searchExternal = async (search: string) => {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/apps?limit=100&offset=0&search=${encodeURIComponent(search)}`,
+      });
+      expect(response.statusCode).toBe(200);
+      const body = response.json<AppListResponse>();
+      const catalogIds = body.data
+        .filter((item) => item.source === "external")
+        .map((item) => item.catalogId)
+        .sort();
+      return { catalogIds, total: body.pagination.total };
+    };
+
+    expect(await searchExternal("%")).toEqual({
+      catalogIds: [percentName.id, percentToolDescription.id].sort(),
+      total: 2,
+    });
+    expect(await searchExternal("_")).toEqual({
+      catalogIds: [underscoreDescription.id],
+      total: 1,
+    });
+    expect(await searchExternal("\\")).toEqual({
+      catalogIds: [backslashToolName.id],
+      total: 1,
+    });
+    expect(await searchExternal("mixed NEEDLE")).toEqual({
+      catalogIds: [percentToolDescription.id],
+      total: 1,
+    });
+  });
+
+  test("includes assigned team names for a team-scoped owned app", async ({
+    makeApp,
+    makeTeam,
+    makeTeamMember,
+  }) => {
+    const team = await makeTeam(organizationId, user.id, { name: "London HQ" });
+    await makeTeamMember(team.id, user.id);
+    const owned = await makeApp({
+      organizationId,
+      access: { teams: [team.id] },
+      // The response's team list still reads the retired backing-catalog rows.
+      legacy: { scope: "team", teams: [team.id] },
+      authorId: user.id,
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/apps?limit=100&offset=0",
+    });
+    expect(res.statusCode).toBe(200);
+    const item = (res.json().data as Array<Record<string, unknown>>).find(
+      (i) => i.source === "owned" && i.id === owned.id,
+    );
+    expect(item?.teams).toEqual([{ id: team.id, name: "London HQ" }]);
+  });
+
+  test("carries an owned app's icon so the card renders it like an external one", async ({
+    makeApp,
+  }) => {
+    const withIcon = await makeApp({
+      organizationId,
+      authorId: user.id,
+      icon: "🚀",
+    });
+    const withoutIcon = await makeApp({
+      organizationId,
+      authorId: user.id,
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/apps?limit=100&offset=0",
+    });
+    expect(res.statusCode).toBe(200);
+    const items = res.json().data as Array<Record<string, unknown>>;
+    expect(items.find((i) => i.id === withIcon.id)?.icon).toBe("🚀");
+    // Null rather than absent, so the card can fall back deliberately.
+    expect(items.find((i) => i.id === withoutIcon.id)?.icon).toBeNull();
+  });
+
+  test("links an image icon instead of inlining it, and serves it from the link", async ({
+    makeApp,
+  }) => {
+    const owned = await makeApp({
+      organizationId,
+      authorId: user.id,
+      icon: PNG_ICON,
+    });
+
+    const list = await app.inject({ method: "GET", url: "/api/apps" });
+    const item = (list.json() as AppListResponse).data.find(
+      (i) => i.source === "owned" && i.id === owned.id,
+    );
+    expect(item?.icon).toBeNull();
+    expect(item?.iconUrl).toMatch(
+      new RegExp(`^/api/apps/${owned.id}/icon\\?v=`),
+    );
+    expect(list.body).not.toContain(PNG_ICON_BASE64);
+
+    const image = await app.inject({ method: "GET", url: item?.iconUrl ?? "" });
+    expect(image.statusCode).toBe(200);
+    expect(image.headers["content-type"]).toBe("image/png");
+    expect(image.rawPayload).toEqual(Buffer.from(PNG_ICON_BASE64, "base64"));
+
+    // The link is content-versioned, so a revalidation is answered without
+    // the bytes.
+    const revalidated = await app.inject({
+      method: "GET",
+      url: item?.iconUrl ?? "",
+      headers: { "if-none-match": image.headers.etag as string },
+    });
+    expect(revalidated.statusCode).toBe(304);
+  });
+
+  test("does not serve an app's icon to someone who may not view the app", async ({
+    makeApp,
+    makeUser,
+    makeMember,
+  }) => {
+    const personal = await makeApp({
+      organizationId,
+      authorId: user.id,
+      access: "personal",
+      icon: PNG_ICON,
+    });
+    const member = await makeUser();
+    await makeMember(member.id, organizationId, { role: "member" });
+    user = member;
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/apps/${personal.id}/icon`,
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  test("links an external app's image icon to the external app icon route", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeTool,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Board",
+      icon: PNG_ICON,
+      serverType: "remote",
+      serverUrl: "https://example.com/mcp",
+    });
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "show-board",
+      meta: { _meta: { ui: { resourceUri: "ui://board/app.html" } } },
+    });
+
+    const list = await app.inject({ method: "GET", url: "/api/apps" });
+    const item = (list.json() as AppListResponse).data.find(
+      (i) => i.source === "external" && i.catalogId === catalog.id,
+    );
+    expect(item?.icon).toBeNull();
+    expect(item?.iconUrl).toMatch(
+      new RegExp(`^/api/apps/external/${catalog.id}/icon\\?v=`),
+    );
+
+    const image = await app.inject({ method: "GET", url: item?.iconUrl ?? "" });
+    expect(image.statusCode).toBe(200);
+    expect(image.rawPayload).toEqual(Buffer.from(PNG_ICON_BASE64, "base64"));
+  });
+
+  test("serves no icon for a catalog that is not an app", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const plain = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Plain",
+      icon: PNG_ICON,
+      serverType: "remote",
+      serverUrl: "https://example.com/mcp",
+    });
+    await makeMcpServer({ catalogId: plain.id, scope: "org" });
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/apps/external/${plain.id}/icon`,
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  test("lists external UI-providing servers alongside owned apps, with trust disclosure", async ({
+    makeApp,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeTool,
+  }) => {
+    const owned = await makeApp({
+      organizationId,
+      name: "My Owned App",
+    });
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Get Time",
+      icon: "🕒",
+      serverType: "remote",
+      serverUrl: "https://example.com/mcp",
+    });
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "get-time",
+      description: "Tells the current time",
+      meta: { _meta: { ui: { resourceUri: "ui://get-time/app.html" } } },
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/apps?limit=100&offset=0",
+    });
+    expect(res.statusCode).toBe(200);
+    const items = res.json().data as Array<Record<string, unknown>>;
+
+    expect(
+      items.find((i) => i.source === "owned" && i.id === owned.id),
+    ).toMatchObject({
+      source: "owned",
+      executionModel: "viewer-scoped",
+      cspOrigin: "platform-pinned",
+    });
+    expect(
+      items.find((i) => i.source === "external" && i.catalogId === catalog.id),
+    ).toMatchObject({
+      source: "external",
+      catalogId: catalog.id,
+      scope: "org",
+      // A single-UI-tool server titles as just the server name (no "/ <tool>"
+      // suffix), tool description as subtitle.
+      name: "Get Time",
+      description: "Tells the current time",
+      resourceUri: "ui://get-time/app.html",
+      executionModel: "server-scoped",
+      cspOrigin: "author-declared",
+      // The catalog's registry icon rides along so the card can show it.
+      icon: "🕒",
+      // No required inputs → runnable standalone.
+      requiresInput: false,
+    });
+  });
+
+  test("flags external apps whose tool has required inputs (requiresInput)", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeTool,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Archestra PM",
+      serverType: "remote",
+      serverUrl: "https://example.com/mcp",
+    });
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "show_board",
+      parameters: {
+        type: "object",
+        properties: { boardId: { type: "string" } },
+        required: ["boardId"],
+      },
+      meta: { _meta: { ui: { resourceUri: "ui://pm/board.html" } } },
+    });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "show_backlog",
+      parameters: {
+        type: "object",
+        properties: { boardId: { type: "string" } },
+      },
+      meta: { _meta: { ui: { resourceUri: "ui://pm/backlog.html" } } },
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/apps?limit=100&offset=0",
+    });
+    const items = res.json().data as Array<Record<string, unknown>>;
+    const byResource = (uri: string) =>
+      items.find((i) => i.source === "external" && i.resourceUri === uri);
+    // Required inputs → prompt-mode only, no standalone render.
+    expect(byResource("ui://pm/board.html")).toMatchObject({
+      requiresInput: true,
+    });
+    // Optional-only inputs render fine with `{}`.
+    expect(byResource("ui://pm/backlog.html")).toMatchObject({
+      requiresInput: false,
+    });
+  });
+
+  test("lists a UI catalog's tool once per accessible install", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeTool,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Archestra PM",
+      serverType: "remote",
+      serverUrl: "https://example.com/mcp",
+    });
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "open",
+      meta: { _meta: { ui: { resourceUri: "ui://pm/app.html" } } },
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/apps?limit=100&offset=0",
+    });
+    const items = res.json().data as Array<Record<string, unknown>>;
+    const external = items.filter(
+      (i) => i.source === "external" && i.catalogId === catalog.id,
+    );
+    // One card per concrete install, each carrying a distinct mcpServerId.
+    expect(external).toHaveLength(3);
+    expect(new Set(external.map((i) => i.mcpServerId)).size).toBe(3);
+  });
+
+  test("lists each ui:// tool of one server as its own card (server title, tool subtitle)", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeTool,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Archestra PM",
+      serverType: "remote",
+      serverUrl: "https://example.com/mcp",
+    });
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "show_board",
+      meta: { _meta: { ui: { resourceUri: "ui://pm/board.html" } } },
+    });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "show_backlog",
+      meta: { _meta: { ui: { resourceUri: "ui://pm/backlog.html" } } },
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/apps?limit=100&offset=0",
+    });
+    const items = res.json().data as Array<Record<string, unknown>>;
+    const external = items.filter(
+      (i) => i.source === "external" && i.catalogId === catalog.id,
+    );
+    // Each tool is its own card; with several UI tools on one server the
+    // titles carry the "/ <tool>" suffix to disambiguate.
+    expect(external.map((i) => i.name).sort()).toEqual([
+      "Archestra PM / show_backlog",
+      "Archestra PM / show_board",
+    ]);
+  });
+
+  test("a search matching one of a multi-tool server's tools keeps the suffixed title", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeTool,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Archestra PM",
+      serverType: "remote",
+      serverUrl: "https://example.com/mcp",
+    });
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "show_board",
+      meta: { _meta: { ui: { resourceUri: "ui://pm/board.html" } } },
+    });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "show_backlog",
+      meta: { _meta: { ui: { resourceUri: "ui://pm/backlog.html" } } },
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/apps?limit=100&offset=0&search=show_board",
+    });
+    const items = res.json().data as Array<Record<string, unknown>>;
+    const external = items.filter(
+      (i) => i.source === "external" && i.catalogId === catalog.id,
+    );
+    // The search narrowed the server's cards down to one, but the server still
+    // exposes two UI tools — the surviving card must not be retitled as if the
+    // server were single-tool.
+    expect(external.map((i) => i.name)).toEqual(["Archestra PM / show_board"]);
+  });
+
+  test("excludes catalogs without a ui:// tool from the unified listing", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeTool,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: "Plain",
+      serverType: "remote",
+      serverUrl: "https://example.com/mcp",
+    });
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    await makeTool({
+      catalogId: catalog.id,
+      name: "noop",
+      meta: { _meta: {} },
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/apps?limit=100&offset=0",
+    });
+    const items = res.json().data as Array<Record<string, unknown>>;
+    expect(
+      items.some((i) => i.source === "external" && i.catalogId === catalog.id),
+    ).toBe(false);
+  });
+
+  test("wildcard read grants include every creator’s apps in the default listing", async ({
+    makeUser,
+    makeMember,
+    makeApp,
+  }) => {
+    // Mirroring the Projects list: the default "All apps" view shows only what
+    // the admin genuinely accesses (their own apps, plus org/team apps) — NOT
+    // every member's personal app. Oversight-only apps surface under Personal →
+    // Other users, so they can't read as apps that appear then vanish.
+    const otherAuthor = await makeUser({ name: "Grace Hopper" });
+    await makeMember(otherAuthor.id, organizationId);
+    const foreignPersonal = await makeApp({
+      organizationId,
+      access: "personal",
+      authorId: otherAuthor.id,
+      name: "Someone Else's Personal App",
+    });
+    const ownPersonal = await makeApp({
+      organizationId,
+      access: "personal",
+      authorId: user.id,
+      name: "My Personal App",
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/apps?limit=100&offset=0",
+    });
+    expect(res.statusCode).toBe(200);
+    const items = res.json().data as Array<Record<string, unknown>>;
+    const ids = items.map((a) => a.id as string);
+    expect(ids).toContain(ownPersonal.id);
+    expect(ids).toContain(foreignPersonal.id);
+    expect(items.find((i) => i.id === ownPersonal.id)?.viewerRole).toBe(
+      "owner",
+    );
+  });
+
+  test("access filter splits rows by how the caller reaches them, ignoring wildcard grants", async ({
+    makeApp,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeMember,
+    makeTeam,
+    makeTeamMember,
+    makeTool,
+    makeUser,
+  }) => {
+    const suffix = crypto.randomUUID().slice(0, 8);
+    const otherUser = await makeUser();
+    await makeMember(otherUser.id, organizationId);
+    const myTeam = await makeTeam(organizationId, user.id);
+    await makeTeamMember(myTeam.id, user.id);
+    const otherTeam = await makeTeam(organizationId, otherUser.id);
+
+    const seed = (name: string, access: TestAccess, authorId = otherUser.id) =>
+      makeApp({ organizationId, name: `${name} ${suffix}`, authorId, access });
+    await seed("Mine", "personal", user.id);
+    await seed("Other Personal", "personal");
+    await seed("Org", "org");
+    await seed("My Team", { teams: [myTeam.id] });
+    await seed("Other Team", { teams: [otherTeam.id] });
+    await seed("Shared With Me", { users: [user.id] });
+    // An external app reaches the caller through its install's scope.
+    const catalog = await makeInternalMcpCatalog({
+      organizationId,
+      name: `External ${suffix}`,
+      serverType: "remote",
+      serverUrl: "https://example.com/mcp",
+    });
+    await makeMcpServer({ catalogId: catalog.id, scope: "org" });
+    await makeTool({
+      catalogId: catalog.id,
+      name: `external-${suffix}`,
+      meta: { _meta: { ui: { resourceUri: "ui://external/app.html" } } },
+    });
+
+    const list = async (access?: string) => {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/apps?limit=100&offset=0&search=${suffix}${access ? `&access=${access}` : ""}`,
+      });
+      expect(response.statusCode, response.body).toBe(200);
+      const body = response.json() as AppListResponse;
+      expect(body.pagination.total).toBe(body.data.length);
+      return body.data
+        .map((item) => item.name.replace(` ${suffix}`, ""))
+        .sort();
+    };
+
+    // The admin reads every app through a `*` grant, which the filter must
+    // not count as "shared".
+    expect(await list()).toEqual([
+      "External",
+      "Mine",
+      "My Team",
+      "Org",
+      "Other Personal",
+      "Other Team",
+      "Shared With Me",
+    ]);
+    expect(await list("mine,shared,org")).toEqual([
+      "External",
+      "Mine",
+      "My Team",
+      "Org",
+      "Shared With Me",
+    ]);
+    expect(await list("others")).toEqual(["Other Personal", "Other Team"]);
+    expect(await list("mine")).toEqual(["Mine"]);
+    expect(await list("shared")).toEqual(["My Team", "Shared With Me"]);
+    expect(await list("org")).toEqual(["External", "Org"]);
+  });
+
+  test("Personal → Other users surfaces another author's personal app tagged as oversight (viewerRole admin + authorName)", async ({
+    makeUser,
+    makeMember,
+    makeApp,
+  }) => {
+    // `user` is an app admin. The "Other users" toolbar option lists every
+    // personal app except the caller's own (excludeAuthorIds = self), so an
+    // admin can find and oversee other members' personal apps like projects.
+    const otherAuthor = await makeUser({ name: "Grace Hopper" });
+    await makeMember(otherAuthor.id, organizationId);
+    const foreignPersonal = await makeApp({
+      organizationId,
+      access: "personal",
+      authorId: otherAuthor.id,
+      name: "Someone Else's Personal App",
+    });
+    const ownPersonal = await makeApp({
+      organizationId,
+      access: "personal",
+      authorId: user.id,
+      name: "My Personal App",
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/apps?limit=100&offset=0&scope=personal&excludeAuthorIds=${user.id}`,
+    });
+    expect(res.statusCode).toBe(200);
+    const items = res.json().data as Array<Record<string, unknown>>;
+    const ids = items.map((a) => a.id as string);
+    expect(ids).toContain(foreignPersonal.id);
+    expect(ids).not.toContain(ownPersonal.id);
+
+    const foreignItem = items.find((i) => i.id === foreignPersonal.id);
+    expect(foreignItem?.viewerRole).toBe("shared");
+    expect(foreignItem?.authorName).toBe("Grace Hopper");
+  });
+
+  test("Personal → a specific author (authorIds) narrows to that user's personal apps", async ({
+    makeUser,
+    makeMember,
+    makeApp,
+  }) => {
+    const grace = await makeUser({ name: "Grace Hopper" });
+    await makeMember(grace.id, organizationId);
+    const ada = await makeUser({ name: "Ada Lovelace" });
+    await makeMember(ada.id, organizationId);
+    const gracesApp = await makeApp({
+      organizationId,
+      access: "personal",
+      authorId: grace.id,
+      name: "Grace App",
+    });
+    const adasApp = await makeApp({
+      organizationId,
+      access: "personal",
+      authorId: ada.id,
+      name: "Ada App",
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/apps?limit=100&offset=0&scope=personal&authorIds=${grace.id}`,
+    });
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json().data as Array<{ id: string }>).map((a) => a.id);
+    expect(ids).toContain(gracesApp.id);
+    expect(ids).not.toContain(adasApp.id);
+  });
+
+  test("responds with Cache-Control: no-store so intermediaries never cache per-user data", async () => {
+    // The list carries the caller's own pins; a CDN/reverse proxy caching it
+    // would replay stale pin state after a pin/unpin until a hard refresh.
+    const res = await app.inject({ method: "GET", url: "/api/apps" });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["cache-control"]).toBe("no-store");
+  });
+});

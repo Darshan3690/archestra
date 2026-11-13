@@ -1,0 +1,104 @@
+import { WEBSITE_URL } from "@archestra/shared";
+
+/**
+ * Builds the Microsoft Teams app manifest for the Archestra bot.
+ *
+ * This is the single source of truth for the manifest downloaded from the
+ * MS Teams setup wizard.
+ */
+export function buildTeamsManifest(params: {
+  botAppId: string;
+  nameShort: string;
+  nameFull: string;
+  version: string;
+}) {
+  const { botAppId, nameShort, nameFull, version } = params;
+  // Every Teams conversation that can install the bot must also discover its
+  // commands, including group chats. Copilot is a separate installation scope.
+  const conversationScopes = ["team", "groupChat", "personal"];
+  return {
+    $schema:
+      "https://developer.microsoft.com/json-schemas/teams/v1.30/MicrosoftTeams.schema.json",
+    manifestVersion: "1.30",
+    version: version || "1.0.0",
+    id: botAppId || "{{BOT_MS_APP_ID}}",
+    developer: {
+      name: nameShort,
+      websiteUrl: WEBSITE_URL,
+      privacyUrl: `${WEBSITE_URL}/privacy`,
+      termsOfUseUrl: `${WEBSITE_URL}/terms`,
+    },
+    name: { short: nameShort, full: nameFull },
+    description: {
+      short: `Ask ${nameShort}`,
+      full: `Chat with ${nameShort} agents`,
+    },
+    icons: { outline: "outline.png", color: "color.png" },
+    accentColor: "#FFFFFF",
+    supportsChannelFeatures: "tier1",
+    bots: [
+      {
+        botId: botAppId || "{{BOT_MS_APP_ID}}",
+        scopes: [...conversationScopes, "copilot"],
+        // Enables the bot to receive file/image attachments in 1:1 personal
+        // chats. Channel and group-chat attachments already arrive regardless
+        // of this flag; it specifically unlocks the personal-chat file flow.
+        supportsFiles: true,
+        isNotificationOnly: false,
+        commandLists: [
+          {
+            scopes: conversationScopes,
+            // Keep menu descriptions readable while inserting executable commands.
+            commands: [
+              {
+                title: "/select-agent",
+                description: "Change which agent handles this conversation",
+                type: "prompt",
+                prompt: "/select-agent",
+              },
+              {
+                title: "/status",
+                description: "Show current agent for this conversation",
+                type: "prompt",
+                prompt: "/status",
+              },
+              {
+                title: "/help",
+                description: "Show available commands",
+                type: "prompt",
+                prompt: "/help",
+              },
+              {
+                title: "/sign-out",
+                description: "Stop the bot reading your files",
+                type: "prompt",
+                prompt: "/sign-out",
+              },
+            ],
+          },
+        ],
+      },
+    ],
+    copilotAgents: {
+      customEngineAgents: [
+        { type: "bot", id: botAppId || "{{BOT_MS_APP_ID}}" },
+      ],
+    },
+    permissions: ["identity", "messageTeamMembers"],
+    validDomains: [],
+    webApplicationInfo: {
+      id: botAppId || "{{BOT_MS_APP_ID}}",
+      resource: "https://graph.microsoft.com",
+    },
+    authorization: {
+      permissions: {
+        resourceSpecific: [
+          { name: "ChannelMessage.Read.Group", type: "Application" },
+          { name: "ChatMessage.Read.Chat", type: "Application" },
+          { name: "TeamMember.Read.Group", type: "Application" },
+          { name: "ChatMember.Read.Chat", type: "Application" },
+        ],
+      },
+    },
+  };
+}

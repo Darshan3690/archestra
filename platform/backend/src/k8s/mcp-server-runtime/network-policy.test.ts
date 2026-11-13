@@ -1,0 +1,994 @@
+import type * as k8s from "@kubernetes/client-node";
+import { describe, expect, test } from "vitest";
+import type { ClusterIpFamily } from "@/k8s/cluster-ip-families";
+import { sanitizeMetadataLabels } from "@/k8s/shared";
+import type { EffectiveNetworkPolicy } from "@/types";
+import {
+  buildEgressBaselineAwsApplicationNetworkPolicy,
+  buildEgressBaselineNetworkPolicy,
+  buildManagedAwsApplicationNetworkPolicy,
+  buildManagedCiliumNetworkPolicy,
+  buildManagedGkeFqdnNetworkPolicy,
+  buildManagedNetworkPolicy,
+  buildUnrestrictedFloorAwsApplicationNetworkPolicy,
+  buildUnrestrictedFloorPolicy,
+  constructManagedNetworkPolicyName,
+  isAwsApplicationNetworkPolicyProvider,
+  shouldManageK8sNetworkPolicy,
+  shouldUseAwsApplicationNetworkPolicy,
+  shouldUseCiliumNetworkPolicy,
+  shouldUseGkeFqdnNetworkPolicy,
+} from "./network-policy";
+
+describe("managed MCP Kubernetes NetworkPolicy", () => {
+  test("builds a deny-all egress policy for egress off", () => {
+    const manifest = buildManagedNetworkPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels: {
+        app: "mcp-server",
+        "mcp-server-id": "server-id",
+      },
+      effectivePolicy: makeEffectivePolicy({ egressMode: "off" }),
+    });
+
+    expect(manifest).toMatchObject({
+      apiVersion: "networking.k8s.io/v1",
+      kind: "NetworkPolicy",
+      metadata: {
+        name: "mcp-egress-test",
+        annotations: {
+          "archestra.io/network-policy-egress-mode": "off",
+          "archestra.io/network-policy-domain-enforcement": "ip-only",
+        },
+      },
+      spec: {
+        podSelector: {
+          matchLabels: {
+            app: "mcp-server",
+            "mcp-server-id": "server-id",
+          },
+        },
+        policyTypes: ["Egress"],
+        egress: [],
+      },
+    });
+  });
+
+  test("builds a restricted Kubernetes policy with DNS and CIDR egress", () => {
+    const manifest = buildManagedNetworkPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels: {
+        app: "mcp-server",
+        "mcp-server-id": "server-id",
+      },
+      effectivePolicy: makeEffectivePolicy({
+        egressMode: "restricted",
+        allowedDomains: ["registry.npmjs.org"],
+        allowedCidrs: ["203.0.113.0/24"],
+      }),
+    });
+
+    expect(manifest.spec?.egress).toEqual([
+      {
+        to: [
+          {
+            namespaceSelector: {
+              matchLabels: {
+                "kubernetes.io/metadata.name": "kube-system",
+              },
+            },
+            podSelector: {
+              matchLabels: {
+                "k8s-app": "kube-dns",
+              },
+            },
+          },
+        ],
+        ports: [
+          { protocol: "UDP", port: 53 },
+          { protocol: "TCP", port: 53 },
+        ],
+      },
+      {
+        to: [{ ipBlock: { cidr: "203.0.113.0/24" } }],
+      },
+    ]);
+    expect(manifest.metadata?.annotations).toMatchObject({
+      "archestra.io/network-policy-allowed-domains": "registry.npmjs.org",
+      "archestra.io/network-policy-allowed-cidrs": "203.0.113.0/24",
+      "archestra.io/network-policy-domain-enforcement":
+        "requires-fqdn-policy-provider",
+    });
+  });
+
+  test("summarizes large annotation lists", () => {
+    const domains = Array.from({ length: 52 }, (_, i) => `d${i}.example.com`);
+    const cidrs = Array.from({ length: 52 }, (_, i) => `203.0.${i}.0/24`);
+    const manifest = buildManagedNetworkPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels: {
+        app: "mcp-server",
+        "mcp-server-id": "server-id",
+      },
+      effectivePolicy: makeEffectivePolicy({
+        egressMode: "restricted",
+        allowedDomains: domains,
+        allowedCidrs: cidrs,
+      }),
+    });
+
+    expect(
+      manifest.metadata?.annotations?.[
+        "archestra.io/network-policy-allowed-domains"
+      ],
+    ).toContain("...and 2 more");
+    expect(
+      manifest.metadata?.annotations?.[
+        "archestra.io/network-policy-allowed-cidrs"
+      ],
+    ).toContain("...and 2 more");
+  });
+
+  test("builds a Cilium policy with FQDN and CIDR egress", () => {
+    const manifest = buildManagedCiliumNetworkPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels: {
+        app: "mcp-server",
+        "mcp-server-id": "server-id",
+      },
+      effectivePolicy: makeEffectivePolicy({
+        egressMode: "restricted",
+        domainPreset: "package_managers",
+        allowedDomains: ["api.example.com", "*.example.org"],
+        allowedCidrs: ["203.0.113.0/24"],
+      }),
+    });
+
+    expect(manifest).toMatchObject({
+      apiVersion: "cilium.io/v2",
+      kind: "CiliumNetworkPolicy",
+      metadata: {
+        annotations: {
+          "archestra.io/network-policy-domain-enforcement": "active",
+        },
+      },
+      spec: {
+        endpointSelector: {
+          matchLabels: {
+            app: "mcp-server",
+            "mcp-server-id": "server-id",
+          },
+        },
+        egress: [
+          {
+            toEndpoints: [
+              {
+                matchLabels: {
+                  "k8s:io.kubernetes.pod.namespace": "kube-system",
+                  "k8s:k8s-app": "kube-dns",
+                },
+              },
+            ],
+            toPorts: [
+              {
+                ports: [{ port: "53", protocol: "ANY" }],
+                rules: {
+                  dns: [{ matchPattern: "*" }],
+                },
+              },
+            ],
+          },
+          {
+            toCIDRSet: [{ cidr: "203.0.113.0/24" }],
+          },
+          {
+            toFQDNs: expect.arrayContaining([
+              { matchName: "registry.npmjs.org" },
+              { matchName: "api.example.com" },
+              { matchPattern: "*.example.org" },
+            ]),
+          },
+        ],
+      },
+    });
+  });
+
+  test("builds a GKE FQDN policy with exact and wildcard domains", () => {
+    const manifest = buildManagedGkeFqdnNetworkPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels: {
+        app: "mcp-server",
+        "mcp-server-id": "server-id",
+      },
+      effectivePolicy: makeEffectivePolicy({
+        egressMode: "restricted",
+        allowedDomains: ["api.example.com", "*.example.org"],
+      }),
+    });
+
+    expect(manifest).toMatchObject({
+      apiVersion: "networking.gke.io/v1alpha1",
+      kind: "FQDNNetworkPolicy",
+      spec: {
+        podSelector: {
+          matchLabels: {
+            app: "mcp-server",
+            "mcp-server-id": "server-id",
+          },
+        },
+        egress: [
+          {
+            matches: [
+              { name: "api.example.com" },
+              { pattern: "*.example.org" },
+            ],
+          },
+        ],
+      },
+    });
+  });
+
+  test("rejects a GKE FQDN policy without domain rules", () => {
+    expect(() =>
+      buildManagedGkeFqdnNetworkPolicy({
+        name: "mcp-egress-test",
+        podSelectorLabels: {
+          app: "mcp-server",
+          "mcp-server-id": "server-id",
+        },
+        effectivePolicy: makeEffectivePolicy({
+          egressMode: "restricted",
+          allowedDomains: [],
+          domainPreset: "none",
+        }),
+      }),
+    ).toThrow("Cannot build FQDNNetworkPolicy with empty domain list");
+  });
+
+  test("builds an AWS ApplicationNetworkPolicy with DNS bootstrap, FQDN and CIDR egress", () => {
+    const manifest = buildManagedAwsApplicationNetworkPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels: {
+        app: "mcp-server",
+        "mcp-server-id": "server-id",
+      },
+      effectivePolicy: makeEffectivePolicy({
+        egressMode: "restricted",
+        allowedDomains: ["api.example.com", "*.example.org"],
+        allowedCidrs: ["203.0.113.0/24"],
+      }),
+      clusterDnsIps: ["172.20.0.10"],
+    });
+
+    expect(manifest).toMatchObject({
+      apiVersion: "networking.k8s.aws/v1alpha1",
+      kind: "ApplicationNetworkPolicy",
+      metadata: {
+        annotations: {
+          "archestra.io/network-policy-cluster-dns": "172.20.0.10",
+        },
+      },
+      spec: {
+        podSelector: {
+          matchLabels: {
+            app: "mcp-server",
+            "mcp-server-id": "server-id",
+          },
+        },
+        policyTypes: ["Egress"],
+        egress: [
+          // ApplicationNetworkPolicy has no pod/namespace selector peers, so
+          // DNS must be allowlisted by the cluster DNS ClusterIP — without it
+          // the policy blocks all lookups and domainNames rules never match.
+          {
+            to: [{ ipBlock: { cidr: "172.20.0.10/32" } }],
+            ports: [
+              { protocol: "UDP", port: 53 },
+              { protocol: "TCP", port: 53 },
+            ],
+          },
+          {
+            to: [{ ipBlock: { cidr: "203.0.113.0/24" } }],
+          },
+          {
+            to: [{ domainNames: ["api.example.com", "*.example.org"] }],
+          },
+        ],
+      },
+    });
+  });
+
+  test("deduplicates preset and custom domains without collapsing exact and wildcard rules", () => {
+    const options = {
+      name: "mcp-egress-test",
+      podSelectorLabels: { app: "mcp-server", "mcp-server-id": "server-id" },
+      effectivePolicy: makeEffectivePolicy({
+        egressMode: "restricted",
+        domainPreset: "package_managers",
+        allowedDomains: [
+          "registry.npmjs.org",
+          "api.example.com",
+          "api.example.com",
+          "example.com",
+          "*.example.com",
+        ],
+      }),
+    };
+    const aws = buildManagedAwsApplicationNetworkPolicy({
+      ...options,
+      clusterDnsIps: ["10.96.0.10"],
+    });
+    const domains = (
+      aws.spec as { egress: { to?: { domainNames?: string[] }[] }[] }
+    ).egress.flatMap(
+      (rule) => rule.to?.flatMap((peer) => peer.domainNames ?? []) ?? [],
+    );
+    expect(
+      domains.filter((domain) => domain === "registry.npmjs.org"),
+    ).toHaveLength(1);
+    expect(
+      domains.filter((domain) => domain === "api.example.com"),
+    ).toHaveLength(1);
+    expect(domains.slice(-3)).toEqual([
+      "api.example.com",
+      "example.com",
+      "*.example.com",
+    ]);
+    expect(new Set(domains).size).toBe(domains.length);
+
+    const cilium = buildManagedCiliumNetworkPolicy(options);
+    const ciliumRules = (
+      cilium.spec as { egress: { toFQDNs?: unknown[] }[] }
+    ).egress.flatMap((rule) => rule.toFQDNs ?? []);
+    expect(ciliumRules).toHaveLength(domains.length);
+    const gke = buildManagedGkeFqdnNetworkPolicy(options);
+    const gkeRules = (
+      gke.spec as { egress: { matches: unknown[] }[] }
+    ).egress.flatMap((rule) => rule.matches);
+    expect(gkeRules).toHaveLength(domains.length);
+  });
+
+  test("omits DNS bootstrap access when the cluster resolver is unknown", () => {
+    const manifest = buildManagedAwsApplicationNetworkPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels: { app: "mcp-server", "mcp-server-id": "server-id" },
+      effectivePolicy: makeEffectivePolicy({
+        egressMode: "restricted",
+        allowedDomains: ["api.example.com"],
+        allowedCidrs: ["203.0.113.0/24"],
+      }),
+      clusterDnsIps: [],
+    });
+
+    expect(manifest.metadata).toMatchObject({
+      annotations: { "archestra.io/network-policy-cluster-dns": "unresolved" },
+    });
+    // No port-only or private-range escape; explicit operator rules remain.
+    expect((manifest.spec as { egress: unknown[] }).egress).toEqual([
+      { to: [{ ipBlock: { cidr: "203.0.113.0/24" } }] },
+      { to: [{ domainNames: ["api.example.com"] }] },
+    ]);
+  });
+
+  test("never allows DNS to a public address on either policy kind", () => {
+    const effectivePolicy = makeEffectivePolicy({
+      egressMode: "restricted",
+      allowedDomains: ["api.example.com"],
+    });
+    const podSelectorLabels = { app: "mcp-server", "mcp-server-id": "id" };
+    const policies = [
+      buildManagedNetworkPolicy({
+        name: "mcp-egress-test",
+        podSelectorLabels,
+        effectivePolicy,
+      }).spec?.egress ?? [],
+      (
+        buildManagedAwsApplicationNetworkPolicy({
+          name: "mcp-egress-test",
+          podSelectorLabels,
+          effectivePolicy,
+          clusterDnsIps: ["172.20.0.10"],
+        }).spec as { egress: k8s.V1NetworkPolicyEgressRule[] }
+      ).egress,
+      (
+        buildUnrestrictedFloorAwsApplicationNetworkPolicy({
+          name: "mcp-egress-test",
+          podSelectorLabels,
+          labels: { app: "mcp-server" },
+          clusterDnsIps: ["172.20.0.10"],
+        }).spec as { egress: k8s.V1NetworkPolicyEgressRule[] }
+      ).egress,
+    ];
+
+    for (const egress of policies) {
+      const dnsPeers = egress
+        .filter((rule) => rule.ports?.some((port) => Number(port.port) === 53))
+        .flatMap((rule) => rule.to ?? []);
+      expect(dnsPeers.length).toBeGreaterThan(0);
+      for (const peer of dnsPeers) {
+        expect(["0.0.0.0/0", "::/0"]).not.toContain(peer.ipBlock?.cidr);
+      }
+    }
+  });
+
+  test("uses Cilium only when Cilium is available and domain rules exist", () => {
+    const policy = makeEffectivePolicy({
+      egressMode: "restricted",
+      allowedDomains: ["api.example.com"],
+    });
+
+    expect(
+      shouldUseCiliumNetworkPolicy({
+        effectivePolicy: policy,
+        capabilities: {
+          kubernetesNetworkPolicy: true,
+          ciliumNetworkPolicy: true,
+          gkeFqdnNetworkPolicy: false,
+          awsApplicationNetworkPolicy: false,
+          provider: "cilium",
+          supportsFqdn: true,
+          supportsHttpMethods: false,
+          message: null,
+          enforcementSource: "api-discovery",
+          enforcementStatus: "unknown",
+          probe: "absent",
+          probedAt: null,
+        },
+      }),
+    ).toBe(true);
+    expect(
+      shouldUseCiliumNetworkPolicy({
+        effectivePolicy: policy,
+        capabilities: {
+          kubernetesNetworkPolicy: true,
+          ciliumNetworkPolicy: false,
+          gkeFqdnNetworkPolicy: false,
+          awsApplicationNetworkPolicy: false,
+          provider: "kubernetes",
+          supportsFqdn: false,
+          supportsHttpMethods: false,
+          message: null,
+          enforcementSource: "api-discovery",
+          enforcementStatus: "unknown",
+          probe: "absent",
+          probedAt: null,
+        },
+      }),
+    ).toBe(false);
+  });
+
+  test("uses GKE FQDN policy when GKE is available and Cilium is not", () => {
+    const policy = makeEffectivePolicy({
+      egressMode: "restricted",
+      allowedDomains: ["api.example.com"],
+    });
+
+    expect(
+      shouldUseGkeFqdnNetworkPolicy({
+        effectivePolicy: policy,
+        capabilities: {
+          kubernetesNetworkPolicy: true,
+          ciliumNetworkPolicy: false,
+          gkeFqdnNetworkPolicy: true,
+          awsApplicationNetworkPolicy: false,
+          provider: "gke-fqdn",
+          supportsFqdn: true,
+          supportsHttpMethods: false,
+          message: null,
+          enforcementSource: "api-discovery",
+          enforcementStatus: "unknown",
+          probe: "absent",
+          probedAt: null,
+        },
+      }),
+    ).toBe(true);
+    expect(
+      shouldUseGkeFqdnNetworkPolicy({
+        effectivePolicy: policy,
+        capabilities: {
+          kubernetesNetworkPolicy: true,
+          ciliumNetworkPolicy: true,
+          gkeFqdnNetworkPolicy: true,
+          awsApplicationNetworkPolicy: false,
+          provider: "cilium",
+          supportsFqdn: true,
+          supportsHttpMethods: false,
+          message: null,
+          enforcementSource: "api-discovery",
+          enforcementStatus: "unknown",
+          probe: "absent",
+          probedAt: null,
+        },
+      }),
+    ).toBe(false);
+  });
+
+  test("uses AWS ApplicationNetworkPolicy when AWS FQDN support is available and higher-priority providers are not", () => {
+    const policy = makeEffectivePolicy({
+      egressMode: "restricted",
+      allowedDomains: ["api.example.com"],
+    });
+
+    expect(
+      shouldUseAwsApplicationNetworkPolicy({
+        effectivePolicy: policy,
+        capabilities: {
+          kubernetesNetworkPolicy: true,
+          ciliumNetworkPolicy: false,
+          gkeFqdnNetworkPolicy: false,
+          awsApplicationNetworkPolicy: true,
+          provider: "aws-application-network-policy",
+          supportsFqdn: true,
+          supportsHttpMethods: false,
+          message: null,
+          enforcementSource: "api-discovery",
+          enforcementStatus: "unknown",
+          probe: "absent",
+          probedAt: null,
+        },
+      }),
+    ).toBe(true);
+    expect(
+      shouldUseAwsApplicationNetworkPolicy({
+        effectivePolicy: policy,
+        capabilities: {
+          kubernetesNetworkPolicy: true,
+          ciliumNetworkPolicy: false,
+          gkeFqdnNetworkPolicy: true,
+          awsApplicationNetworkPolicy: true,
+          provider: "gke-fqdn",
+          supportsFqdn: true,
+          supportsHttpMethods: false,
+          message: null,
+          enforcementSource: "api-discovery",
+          enforcementStatus: "unknown",
+          probe: "absent",
+          probedAt: null,
+        },
+      }),
+    ).toBe(false);
+  });
+
+  test("uses AWS ApplicationNetworkPolicy for off too, since a plain NetworkPolicy is unenforced on AWS", () => {
+    const capabilities = {
+      kubernetesNetworkPolicy: true,
+      ciliumNetworkPolicy: false,
+      gkeFqdnNetworkPolicy: false,
+      awsApplicationNetworkPolicy: true,
+      provider: "aws-application-network-policy" as const,
+      supportsFqdn: true,
+      supportsHttpMethods: false,
+      message: null,
+      enforcementSource: "api-discovery" as const,
+      enforcementStatus: "unknown" as const,
+      probe: "absent" as const,
+      probedAt: null,
+    };
+    expect(
+      shouldUseAwsApplicationNetworkPolicy({
+        effectivePolicy: makeEffectivePolicy({ egressMode: "off" }),
+        capabilities,
+      }),
+    ).toBe(true);
+    // unrestricted is handled by the floor branch, not this predicate.
+    expect(
+      shouldUseAwsApplicationNetworkPolicy({
+        effectivePolicy: makeEffectivePolicy({ egressMode: "unrestricted" }),
+        capabilities,
+      }),
+    ).toBe(false);
+  });
+
+  test("does not manage a Kubernetes NetworkPolicy for unrestricted or built-in policy", () => {
+    expect(
+      shouldManageK8sNetworkPolicy(makeEffectivePolicy({ egressMode: "off" })),
+    ).toBe(true);
+    expect(
+      shouldManageK8sNetworkPolicy(
+        makeEffectivePolicy({ egressMode: "restricted" }),
+      ),
+    ).toBe(true);
+    expect(
+      shouldManageK8sNetworkPolicy(
+        makeEffectivePolicy({ egressMode: "unrestricted" }),
+      ),
+    ).toBe(false);
+    expect(
+      shouldManageK8sNetworkPolicy({ source: "built_in", policy: null }),
+    ).toBe(false);
+  });
+
+  test("constructs a DNS-safe managed policy name", () => {
+    expect(constructManagedNetworkPolicyName("mcp.Test.Server")).toBe(
+      "mcp-egress-mcp-Test-Server".toLowerCase(),
+    );
+  });
+
+  test("constructs a non-empty managed policy name for punctuation-only input", () => {
+    expect(constructManagedNetworkPolicyName("...")).toBe("mcp-egress");
+  });
+});
+
+describe("MCP egress floor and default-deny baseline builders", () => {
+  const MANAGED_LABELS = {
+    app: "mcp-server",
+    "app.kubernetes.io/managed-by": "archestra",
+    "archestra.io/resource": "mcp-network-policy",
+  };
+  const BASELINE_LABELS = {
+    "app.kubernetes.io/managed-by": "archestra",
+    "archestra.io/resource": "mcp-egress-baseline",
+  };
+  const podSelectorLabels = { app: "mcp-server", "mcp-server-id": "server-id" };
+
+  const SELECTOR_DNS_RULE = {
+    to: [
+      {
+        namespaceSelector: {
+          matchLabels: { "kubernetes.io/metadata.name": "kube-system" },
+        },
+        podSelector: { matchLabels: { "k8s-app": "kube-dns" } },
+      },
+    ],
+    ports: [
+      { protocol: "UDP", port: 53 },
+      { protocol: "TCP", port: 53 },
+    ],
+  };
+
+  test("builds a plain NetworkPolicy floor: selector-based DNS + public egress, reserved ranges blocked", () => {
+    const manifest = buildUnrestrictedFloorPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels,
+      labels: MANAGED_LABELS,
+    });
+
+    expect(manifest).toMatchObject({
+      apiVersion: "networking.k8s.io/v1",
+      kind: "NetworkPolicy",
+      metadata: {
+        name: "mcp-egress-test",
+        labels: sanitizeMetadataLabels(MANAGED_LABELS),
+      },
+      spec: {
+        podSelector: { matchLabels: podSelectorLabels },
+        policyTypes: ["Egress"],
+        egress: [
+          SELECTOR_DNS_RULE,
+          {
+            to: [
+              {
+                ipBlock: {
+                  cidr: "0.0.0.0/0",
+                  except: [
+                    "10.0.0.0/8",
+                    "172.16.0.0/12",
+                    "192.168.0.0/16",
+                    "169.254.0.0/16",
+                    "100.64.0.0/10",
+                    "127.0.0.0/8",
+                    "0.0.0.0/8",
+                    "168.63.129.16/32",
+                  ],
+                },
+              },
+            ],
+          },
+          {
+            to: [
+              {
+                ipBlock: {
+                  cidr: "::/0",
+                  except: ["::1/128", "fc00::/7", "fe80::/10", "64:ff9b::/96"],
+                },
+              },
+            ],
+          },
+        ],
+      },
+    });
+    // DNS targets the kube-dns pods by label, not the resolver ClusterIP:
+    // kube-proxy DNATs the ClusterIP to a pod IP the public rule would block.
+    expect(manifest.spec?.egress?.[0]?.to?.[0]).not.toHaveProperty("ipBlock");
+    expect(manifest.spec?.egress?.[1]).not.toHaveProperty("ports");
+  });
+
+  test("AWS ANP floor pins DNS to the cluster resolver IPs; the plain floor stays selector-based", () => {
+    const clusterDnsIps = ["10.100.0.10", "fd00:ec2::10"];
+    const anp = buildUnrestrictedFloorAwsApplicationNetworkPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels,
+      labels: MANAGED_LABELS,
+      clusterDnsIps,
+    });
+    const anpEgress = (anp.spec as { egress: Array<Record<string, unknown>> })
+      .egress;
+
+    // ApplicationNetworkPolicy cannot express a selector peer, so DNS is pinned to
+    // the resolver IPs explicitly on :53 (family-aware CIDR).
+    expect(anpEgress[0]).toEqual({
+      to: [
+        { ipBlock: { cidr: "10.100.0.10/32" } },
+        { ipBlock: { cidr: "fd00:ec2::10/128" } },
+      ],
+      ports: [
+        { protocol: "UDP", port: 53 },
+        { protocol: "TCP", port: 53 },
+      ],
+    });
+
+    // The plain floor ignores resolver IPs entirely and uses selector-based DNS.
+    const plain = buildUnrestrictedFloorPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels,
+      labels: MANAGED_LABELS,
+    });
+    expect(plain.spec?.egress?.[0]).toEqual(SELECTOR_DNS_RULE);
+
+    // Both variants share the identical public-egress rules.
+    expect(anpEgress.slice(1)).toEqual(plain.spec?.egress?.slice(1));
+  });
+
+  test("public internet keeps its floor while allowing explicit CIDR exceptions", () => {
+    const allowedCidrs = ["10.20.0.0/16", "fd00:1234::/64"];
+    const plain = buildUnrestrictedFloorPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels,
+      labels: MANAGED_LABELS,
+      allowedCidrs,
+    });
+    const aws = buildUnrestrictedFloorAwsApplicationNetworkPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels,
+      labels: MANAGED_LABELS,
+      allowedCidrs,
+    });
+
+    for (const egress of [
+      plain.spec?.egress ?? [],
+      (aws.spec as { egress: k8s.V1NetworkPolicyEgressRule[] }).egress,
+    ]) {
+      const publicRule = egress.find(
+        (rule) =>
+          rule.to?.[0]?.ipBlock?.cidr === "0.0.0.0/0" &&
+          rule.ports === undefined,
+      );
+      expect(publicRule?.to?.[0]?.ipBlock?.except).toContain("10.0.0.0/8");
+      expect(egress).toEqual(
+        expect.arrayContaining([
+          { to: [{ ipBlock: { cidr: "10.20.0.0/16" } }] },
+          { to: [{ ipBlock: { cidr: "fd00:1234::/64" } }] },
+        ]),
+      );
+    }
+  });
+
+  test("plain floor adds a resolver-IP DNS allow alongside the selector rule (NodeLocal DNSCache / custom DNS)", () => {
+    const plain = buildUnrestrictedFloorPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels,
+      labels: MANAGED_LABELS,
+      clusterDnsIps: ["169.254.20.10", "fd00::10"],
+    });
+
+    // Selector rule first (DNAT-proof standard kube-dns path)...
+    expect(plain.spec?.egress?.[0]).toEqual(SELECTOR_DNS_RULE);
+    // ...then an explicit :53 allow to the resolved nameserver IPs, so a
+    // link-local/private resolver the public rule would block stays reachable.
+    expect(plain.spec?.egress?.[1]).toEqual({
+      to: [
+        { ipBlock: { cidr: "169.254.20.10/32" } },
+        { ipBlock: { cidr: "fd00::10/128" } },
+      ],
+      ports: [
+        { protocol: "UDP", port: 53 },
+        { protocol: "TCP", port: 53 },
+      ],
+    });
+    expect(plain.spec?.egress?.[2]?.to?.[0]?.ipBlock?.cidr).toBe("0.0.0.0/0");
+    expect(plain.spec?.egress?.[3]?.to?.[0]?.ipBlock?.cidr).toBe("::/0");
+
+    // With no resolved resolver IP the supplementary rule is omitted; the
+    // selector rule alone covers the standard kube-dns case.
+    const noResolver = buildUnrestrictedFloorPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels,
+      labels: MANAGED_LABELS,
+    });
+    expect(noResolver.spec?.egress).toHaveLength(3);
+    expect(noResolver.spec?.egress?.[0]).toEqual(SELECTOR_DNS_RULE);
+  });
+
+  test("additionalDeniedCidrs extend the public IPv4 except-list, IPv6 untouched", () => {
+    const floor = buildUnrestrictedFloorPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels,
+      labels: MANAGED_LABELS,
+      additionalDeniedCidrs: ["100.68.0.0/16", "34.118.224.0/20"],
+    });
+    const v4 = floor.spec?.egress?.find(
+      (r) => r.to?.[0]?.ipBlock?.cidr === "0.0.0.0/0",
+    );
+    const except = v4?.to?.[0]?.ipBlock?.except ?? [];
+    // Built-in reserved ranges still present, operator ranges appended.
+    expect(except).toContain("169.254.0.0/16");
+    expect(except).toContain("100.68.0.0/16");
+    expect(except).toContain("34.118.224.0/20");
+    // The operator list is IPv4-only: the ::/0 rule keeps its own reserved set.
+    const v6 = floor.spec?.egress?.find(
+      (r) => r.to?.[0]?.ipBlock?.cidr === "::/0",
+    );
+    expect(v6?.to?.[0]?.ipBlock?.except).not.toContain("100.68.0.0/16");
+
+    // Omitting the param leaves the except-list at the built-in ranges only.
+    const bare = buildUnrestrictedFloorPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels,
+      labels: MANAGED_LABELS,
+    });
+    const bareExcept =
+      bare.spec?.egress?.find((r) => r.to?.[0]?.ipBlock?.cidr === "0.0.0.0/0")
+        ?.to?.[0]?.ipBlock?.except ?? [];
+    expect(bareExcept).not.toContain("100.68.0.0/16");
+  });
+
+  describe("public egress follows the cluster's IP families", () => {
+    const publicCidrs = (clusterIpFamilies?: ClusterIpFamily[]) => {
+      const plain = buildUnrestrictedFloorPolicy({
+        name: "mcp-egress-test",
+        podSelectorLabels,
+        labels: MANAGED_LABELS,
+        clusterIpFamilies,
+      });
+      const aws = buildUnrestrictedFloorAwsApplicationNetworkPolicy({
+        name: "mcp-egress-test",
+        podSelectorLabels,
+        labels: MANAGED_LABELS,
+        clusterDnsIps: ["10.100.0.10"],
+        clusterIpFamilies,
+      });
+      const cidrsOf = (egress: k8s.V1NetworkPolicyEgressRule[]) =>
+        egress
+          .filter((rule) => rule.ports === undefined)
+          .map((rule) => rule.to?.[0]?.ipBlock?.cidr);
+      return {
+        plain: cidrsOf(plain.spec?.egress ?? []),
+        aws: cidrsOf(
+          (aws.spec as { egress: k8s.V1NetworkPolicyEgressRule[] }).egress,
+        ),
+      };
+    };
+
+    test("IPv4-only cluster: no ::/0 rule, so no orphaned IPv6 excepts", () => {
+      expect(publicCidrs(["IPv4"])).toEqual({
+        plain: ["0.0.0.0/0"],
+        aws: ["0.0.0.0/0"],
+      });
+    });
+
+    test("IPv6-only cluster: keeps ::/0 and the IPv4 rule pods reach IPv4 hosts through", () => {
+      expect(publicCidrs(["IPv6"])).toEqual({
+        plain: ["0.0.0.0/0", "::/0"],
+        aws: ["0.0.0.0/0", "::/0"],
+      });
+    });
+
+    test("dual-stack cluster: both families", () => {
+      expect(publicCidrs(["IPv4", "IPv6"])).toEqual({
+        plain: ["0.0.0.0/0", "::/0"],
+        aws: ["0.0.0.0/0", "::/0"],
+      });
+    });
+
+    test("unknown families keep both rules", () => {
+      expect(publicCidrs(undefined)).toEqual({
+        plain: ["0.0.0.0/0", "::/0"],
+        aws: ["0.0.0.0/0", "::/0"],
+      });
+      expect(publicCidrs([])).toEqual(publicCidrs(undefined));
+    });
+  });
+
+  test("AWS ANP floor keeps private destinations blocked when the resolver is unknown", () => {
+    const anp = buildUnrestrictedFloorAwsApplicationNetworkPolicy({
+      name: "mcp-egress-test",
+      podSelectorLabels,
+      labels: MANAGED_LABELS,
+    });
+
+    expect(anp).toMatchObject({
+      apiVersion: "networking.k8s.aws/v1alpha1",
+      kind: "ApplicationNetworkPolicy",
+      metadata: {
+        name: "mcp-egress-test",
+        labels: sanitizeMetadataLabels(MANAGED_LABELS),
+      },
+      spec: {
+        podSelector: { matchLabels: podSelectorLabels },
+        policyTypes: ["Egress"],
+      },
+    });
+    // Unknown DNS must not override the floor's private-destination denial.
+    const egress = (anp.spec as { egress: k8s.V1NetworkPolicyEgressRule[] })
+      .egress;
+    expect(egress).toHaveLength(2);
+    expect(egress.every((rule) => rule.ports === undefined)).toBe(true);
+    expect(egress[0].to?.[0]?.ipBlock?.except).toContain("172.16.0.0/12");
+    expect(egress[1].to?.[0]?.ipBlock?.except).toContain("fc00::/7");
+  });
+
+  test("builds a plain default-deny baseline over all app=mcp-server pods", () => {
+    expect(
+      buildEgressBaselineNetworkPolicy({
+        name: "mcp-server-egress-baseline",
+        labels: BASELINE_LABELS,
+      }),
+    ).toMatchObject({
+      apiVersion: "networking.k8s.io/v1",
+      kind: "NetworkPolicy",
+      metadata: {
+        name: "mcp-server-egress-baseline",
+        labels: sanitizeMetadataLabels(BASELINE_LABELS),
+      },
+      spec: {
+        podSelector: { matchLabels: { app: "mcp-server" } },
+        policyTypes: ["Egress"],
+        egress: [],
+      },
+    });
+  });
+
+  test("builds an AWS ApplicationNetworkPolicy default-deny baseline", () => {
+    expect(
+      buildEgressBaselineAwsApplicationNetworkPolicy({
+        name: "mcp-server-egress-baseline",
+        labels: BASELINE_LABELS,
+      }),
+    ).toMatchObject({
+      apiVersion: "networking.k8s.aws/v1alpha1",
+      kind: "ApplicationNetworkPolicy",
+      metadata: {
+        name: "mcp-server-egress-baseline",
+        labels: sanitizeMetadataLabels(BASELINE_LABELS),
+      },
+      spec: {
+        podSelector: { matchLabels: { app: "mcp-server" } },
+        policyTypes: ["Egress"],
+        egress: [],
+      },
+    });
+  });
+
+  test("isAwsApplicationNetworkPolicyProvider only matches the AWS provider", () => {
+    const caps = (provider: string) =>
+      ({ provider }) as unknown as Parameters<
+        typeof isAwsApplicationNetworkPolicyProvider
+      >[0];
+    expect(
+      isAwsApplicationNetworkPolicyProvider(
+        caps("aws-application-network-policy"),
+      ),
+    ).toBe(true);
+    expect(isAwsApplicationNetworkPolicyProvider(caps("cilium"))).toBe(false);
+    expect(isAwsApplicationNetworkPolicyProvider(caps("kubernetes"))).toBe(
+      false,
+    );
+    expect(isAwsApplicationNetworkPolicyProvider(caps("none"))).toBe(false);
+    expect(isAwsApplicationNetworkPolicyProvider(null)).toBe(false);
+  });
+});
+
+function makeEffectivePolicy(
+  overrides: Partial<NonNullable<EffectiveNetworkPolicy["policy"]>>,
+): EffectiveNetworkPolicy {
+  return {
+    source: "environment",
+    policy: {
+      egressMode: "restricted",
+      domainPreset: "none",
+      allowedDomains: [],
+      allowedCidrs: [],
+      ...overrides,
+    },
+  };
+}

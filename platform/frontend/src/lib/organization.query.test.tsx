@@ -1,0 +1,527 @@
+import {
+  archestraApiClient,
+  ROLE_ASSIGNMENT_BLOCKED_CODE,
+} from "@archestra/shared";
+import {
+  focusManager,
+  QueryClient,
+  QueryClientProvider,
+} from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { HttpResponse, http } from "msw";
+import { setupServer } from "msw/node";
+import type { ReactNode } from "react";
+import { toast } from "sonner";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+import { authQueryKeys } from "@/lib/auth/auth.query";
+import { authClient } from "@/lib/clients/auth/auth-client";
+import {
+  organizationKeys,
+  useActiveMemberRole,
+  useActiveOrganizationId,
+  useAgentRuntimeTiers,
+  useIsGlobalAdmin,
+  useOrganization,
+  useUpdateAgentSettings,
+  useUpdateAuthSettings,
+} from "@/lib/organization.query";
+
+vi.mock("@/lib/clients/auth/auth-client");
+vi.mock("sonner");
+
+const API_ORIGIN = "http://localhost:9000";
+const server = setupServer();
+
+beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
+beforeEach(() => {
+  archestraApiClient.setConfig({ baseUrl: API_ORIGIN });
+});
+
+afterEach(() => server.resetHandlers());
+afterAll(() => {
+  server.close();
+  archestraApiClient.setConfig({ baseUrl: "" });
+});
+
+function renderWithClient<T>(hook: () => T) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
+
+  return { ...renderHook(hook, { wrapper }), queryClient };
+}
+
+function renderActiveMemberRole() {
+  return renderWithClient(() => useActiveMemberRole());
+}
+
+function sessionWith(activeOrganizationId: string | null) {
+  return {
+    data: {
+      user: { id: "user-1", email: "user@example.com" },
+      session: { id: "session-1", activeOrganizationId },
+    },
+    error: null,
+  };
+}
+
+describe("useActiveOrganizationId", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("reads the id from the session without fetching the full organization", async () => {
+    vi.mocked(authClient.getSession).mockResolvedValue(sessionWith("org-1"));
+
+    const { result } = renderWithClient(() => useActiveOrganizationId());
+
+    await waitFor(() => expect(result.current.data).toBe("org-1"));
+    expect(authClient.useActiveOrganization).not.toHaveBeenCalled();
+    expect(authClient.organization.getFullOrganization).not.toHaveBeenCalled();
+  });
+});
+
+describe("useActiveMemberRole", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(authClient.organization.getActiveMemberRole).mockResolvedValue({
+      data: { role: "admin" },
+      error: null,
+    });
+  });
+
+  it("fetches the role from the session alone, without an organization fetch in front", async () => {
+    vi.mocked(authClient.getSession).mockResolvedValue(sessionWith("org-1"));
+
+    const { result } = renderActiveMemberRole();
+
+    await waitFor(() => {
+      expect(result.current.data).toBe("admin");
+    });
+    // The endpoint derives the organization from the session, so the hook must
+    // not consult the organization store (whose fetch would then gate the role).
+    expect(authClient.useActiveOrganization).not.toHaveBeenCalled();
+  });
+
+  it("does not fire while the session is still resolving", async () => {
+    let resolveSession: (value: unknown) => void = () => {};
+    vi.mocked(authClient.getSession).mockReturnValue(
+      new Promise((resolve) => {
+        resolveSession = resolve;
+      }),
+    );
+
+    const { result } = renderActiveMemberRole();
+
+    expect(authClient.organization.getActiveMemberRole).not.toHaveBeenCalled();
+
+    resolveSession(sessionWith("org-1"));
+
+    await waitFor(() => {
+      expect(result.current.data).toBe("admin");
+    });
+  });
+
+  it("resolves to null, not undefined, when the endpoint reports no role", async () => {
+    vi.mocked(authClient.getSession).mockResolvedValue(sessionWith("org-1"));
+    vi.mocked(authClient.organization.getActiveMemberRole).mockResolvedValue({
+      data: undefined,
+      error: null,
+    });
+
+    const { result } = renderActiveMemberRole();
+
+    // null is the settled "no role" answer; undefined would be
+    // indistinguishable from a query that has not resolved yet.
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+    });
+    expect(result.current.data).toBeNull();
+  });
+
+  it("does not serve one organization's cached role after a switch of the active org", async () => {
+    vi.mocked(authClient.getSession).mockResolvedValue(sessionWith("org-1"));
+
+    const { result, queryClient } = renderActiveMemberRole();
+    await waitFor(() => {
+      expect(result.current.data).toBe("admin");
+    });
+
+    vi.mocked(authClient.organization.getActiveMemberRole).mockResolvedValue({
+      data: { role: "member" },
+      error: null,
+    });
+    act(() => {
+      queryClient.setQueryData(
+        authQueryKeys.session(),
+        sessionWith("org-2").data,
+      );
+    });
+
+    await waitFor(() => {
+      expect(result.current.data).toBe("member");
+    });
+    // Each organization keeps its own cache entry; org-1's was not overwritten.
+    expect(
+      queryClient.getQueryData(organizationKeys.activeMemberRole("org-1")),
+    ).toBe("admin");
+  });
+
+  it("never fires for a session with no active organization", async () => {
+    vi.mocked(authClient.getSession).mockResolvedValue(sessionWith(null));
+
+    const { result } = renderActiveMemberRole();
+
+    // The session settling is the last thing that could enable the query.
+    await waitFor(() => {
+      expect(authClient.getSession).toHaveBeenCalled();
+    });
+    expect(result.current.isPending).toBe(true);
+    expect(authClient.organization.getActiveMemberRole).not.toHaveBeenCalled();
+  });
+});
+
+describe("useOrganization", () => {
+  it("keeps cached chat settings on mount but refreshes them on focus", async () => {
+    vi.mocked(authClient.getSession).mockResolvedValue(sessionWith("org-1"));
+    const fetchOrganization = vi.fn(() =>
+      HttpResponse.json({ playwrightMcpEnabled: false }),
+    );
+    server.use(http.get(`${API_ORIGIN}/api/organization`, fetchOrganization));
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    queryClient.setQueryData(
+      authQueryKeys.session(),
+      sessionWith("org-1").data,
+    );
+    queryClient.setQueryData(organizationKeys.details(), {
+      playwrightMcpEnabled: true,
+    });
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(
+      () =>
+        useOrganization(true, {
+          refetchInterval: 5000,
+          refetchOnWindowFocus: "always",
+        }),
+      { wrapper },
+    );
+
+    expect(result.current.data?.playwrightMcpEnabled).toBe(true);
+    expect(fetchOrganization).not.toHaveBeenCalled();
+
+    act(() => focusManager.setFocused(false));
+    act(() => focusManager.setFocused(true));
+    await waitFor(() => {
+      expect(result.current.data?.playwrightMcpEnabled).toBe(false);
+    });
+  });
+
+  it("refetches Connect settings on mount despite a persisted fresh cache entry", async () => {
+    vi.mocked(authClient.getSession).mockResolvedValue(sessionWith("org-1"));
+    server.use(
+      http.get(`${API_ORIGIN}/api/organization`, () =>
+        HttpResponse.json({
+          connectionSkillsEnabled: false,
+          connectionLlmProxyEnabled: false,
+        }),
+      ),
+    );
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    queryClient.setQueryData(organizationKeys.details(), {
+      connectionSkillsEnabled: true,
+      connectionLlmProxyEnabled: true,
+    });
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+
+    const { result } = renderHook(
+      () => useOrganization(true, { fresh: true }),
+      { wrapper },
+    );
+
+    await waitFor(() => {
+      expect(result.current.data?.connectionSkillsEnabled).toBe(false);
+    });
+    expect(result.current.data?.connectionLlmProxyEnabled).toBe(false);
+  });
+
+  it("refetches Connect settings when the window regains focus", async () => {
+    vi.mocked(authClient.getSession).mockResolvedValue(sessionWith("org-1"));
+    let skillsEnabled = true;
+    server.use(
+      http.get(`${API_ORIGIN}/api/organization`, () =>
+        HttpResponse.json({
+          connectionSkillsEnabled: skillsEnabled,
+          connectionLlmProxyEnabled: true,
+        }),
+      ),
+    );
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(
+      () => useOrganization(true, { fresh: true }),
+      { wrapper },
+    );
+
+    await waitFor(() => {
+      expect(result.current.data?.connectionSkillsEnabled).toBe(true);
+    });
+
+    skillsEnabled = false;
+    act(() => focusManager.setFocused(false));
+    act(() => focusManager.setFocused(true));
+
+    await waitFor(() => {
+      expect(result.current.data?.connectionSkillsEnabled).toBe(false);
+    });
+  });
+});
+
+describe("useIsGlobalAdmin", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server.use(
+      http.get(`${API_ORIGIN}/api/user/permission-sources`, () =>
+        HttpResponse.json([
+          {
+            role: "admin",
+            team: { id: "team-1", name: "Admins" },
+            permissions: {},
+          },
+        ]),
+      ),
+    );
+    vi.mocked(authClient.organization.getActiveMemberRole).mockResolvedValue({
+      data: { role: "admin" },
+      error: null,
+    });
+  });
+
+  it("reports loading — not 'not an admin' — while the session is still resolving", async () => {
+    let resolveSession: (value: unknown) => void = () => {};
+    vi.mocked(authClient.getSession).mockReturnValue(
+      new Promise((resolve) => {
+        resolveSession = resolve;
+      }),
+    );
+
+    const { result } = renderWithClient(() => useIsGlobalAdmin());
+
+    // The role query is disabled until the session names an organization, so
+    // its own isLoading is false here. Reading that as a settled answer would
+    // tell a real admin they lack the role for as long as the session takes.
+    expect(result.current.isGlobalAdmin).toBe(false);
+    expect(result.current.isLoading).toBe(true);
+
+    resolveSession(sessionWith("org-1"));
+
+    await waitFor(() => {
+      expect(result.current.isGlobalAdmin).toBe(true);
+    });
+    expect(result.current.isLoading).toBe(false);
+  });
+
+  it("settles on 'not an admin' for a session with no active organization", async () => {
+    vi.mocked(authClient.getSession).mockResolvedValue(sessionWith(null));
+
+    const { result } = renderWithClient(() => useIsGlobalAdmin());
+
+    // Nothing further can resolve a role, and the API answers such a caller
+    // the same way, so this is an answer rather than a request in flight.
+    await waitFor(() => {
+      expect(result.current.isLoading).toBe(false);
+    });
+    expect(result.current.isGlobalAdmin).toBe(false);
+  });
+
+  it("is not an admin for a custom role, however broad", async () => {
+    server.use(
+      http.get(`${API_ORIGIN}/api/user/permission-sources`, () =>
+        HttpResponse.json([
+          { role: "project-auditor", team: null, permissions: {} },
+        ]),
+      ),
+    );
+    vi.mocked(authClient.getSession).mockResolvedValue(sessionWith("org-1"));
+    vi.mocked(authClient.organization.getActiveMemberRole).mockResolvedValue({
+      data: { role: "project-auditor" },
+      error: null,
+    });
+
+    const { result } = renderWithClient(() => useIsGlobalAdmin());
+
+    await waitFor(() => {
+      expect(result.current.isLoading).toBe(false);
+    });
+    expect(result.current.isGlobalAdmin).toBe(false);
+  });
+});
+
+describe("useUpdateAuthSettings", () => {
+  it("preserves a refused default role for the inline notice without toasting or replacing cached settings", async () => {
+    vi.clearAllMocks();
+    const details = {
+      subjectType: "role",
+      total: 1,
+      items: [
+        {
+          resource: "agent",
+          scope: "00000000-0000-4000-8000-000000000001",
+          name: "Release helper",
+          missing: ["manage-permissions"],
+        },
+      ],
+    };
+    server.use(
+      http.patch(`${API_ORIGIN}/api/organization/auth-settings`, () =>
+        HttpResponse.json(
+          {
+            error: {
+              message: "Cannot share this role's items",
+              type: "api_authorization_error",
+              internal_code: ROLE_ASSIGNMENT_BLOCKED_CODE,
+              details,
+            },
+          },
+          { status: 403 },
+        ),
+      ),
+    );
+    const { result, queryClient } = renderWithClient(() =>
+      useUpdateAuthSettings("Saved", "Failed"),
+    );
+    const original = { defaultMemberRole: "member" };
+    queryClient.setQueryData(organizationKeys.details(), original);
+
+    await act(async () => {
+      await expect(
+        result.current.mutateAsync({ defaultMemberRole: "editor" }),
+      ).rejects.toMatchObject({ details });
+    });
+
+    await waitFor(() =>
+      expect(result.current.error).toMatchObject({ details }),
+    );
+    expect(queryClient.getQueryData(organizationKeys.details())).toEqual(
+      original,
+    );
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+});
+
+describe("useUpdateAgentSettings", () => {
+  it("refetches the tiers in effect after a save, so a renamed tier's new name is the form's original name", async () => {
+    const inEffect = (name: string) => ({
+      defaultTier: name,
+      tiers: [
+        {
+          name,
+          cpuRequest: 4,
+          cpuLimit: null,
+          warmSpares: 1,
+          pooled: true,
+          memoryRequestMiB: 8192,
+          memoryLimitMiB: 16384,
+          workspaceGiB: null,
+        },
+      ],
+      defaultWorkspaceGiB: 20,
+    });
+    const reads: string[] = [];
+    server.use(
+      http.get(`${API_ORIGIN}/api/organization/agent-runtime-tiers`, () => {
+        reads.push("read");
+        return HttpResponse.json(inEffect(reads.length === 1 ? "M" : "Medium"));
+      }),
+      http.patch(`${API_ORIGIN}/api/organization/agent-settings`, () =>
+        HttpResponse.json({ id: "org-1" }),
+      ),
+    );
+    const { result, queryClient } = renderWithClient(() => ({
+      tiers: useAgentRuntimeTiers(),
+      save: useUpdateAgentSettings("saved", "failed"),
+    }));
+    await waitFor(() =>
+      expect(result.current.tiers.data?.defaultTier).toBe("M"),
+    );
+
+    await act(() =>
+      result.current.save.mutateAsync({
+        agentRuntimeTiers: {
+          tiers: [
+            {
+              name: "Medium",
+              cpuRequest: 4,
+              cpuLimit: null,
+              pooled: true,
+              previousName: "M",
+            },
+          ],
+          defaultTier: "Medium",
+        },
+      }),
+    );
+    // The save invalidates the tiers query: the second read brings the new
+    // name, which the settings form then treats as the original name.
+    await waitFor(() =>
+      expect(result.current.tiers.data?.defaultTier).toBe("Medium"),
+    );
+    expect(reads).toHaveLength(2);
+    expect(toast.success).toHaveBeenCalledWith("saved");
+    queryClient.clear();
+  });
+  it("shows the server's reason when a save is refused, such as the agents a default model would break", async () => {
+    const reason =
+      'Can\'t use "gpt-4o" as the default model. Agent Runtime agent "PR Reviewer" has no model of its own.';
+    server.use(
+      http.patch(`${API_ORIGIN}/api/organization/agent-settings`, () =>
+        HttpResponse.json(
+          { error: { message: reason, type: "api_conflict_error" } },
+          { status: 409 },
+        ),
+      ),
+    );
+    const { result, queryClient } = renderWithClient(() =>
+      useUpdateAgentSettings("saved", "Failed to update agent settings"),
+    );
+
+    await act(() =>
+      result.current.mutateAsync({
+        defaultModelId: "model-1",
+        defaultLlmApiKeyId: "key-1",
+      }),
+    );
+
+    expect(toast.error).toHaveBeenCalledWith(
+      "Failed to update agent settings",
+      {
+        description: reason,
+      },
+    );
+    queryClient.clear();
+  });
+});

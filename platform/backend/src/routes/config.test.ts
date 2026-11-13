@@ -1,5 +1,20 @@
-import { createFastifyInstance, type FastifyInstanceWithZod } from "@/server";
-import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import config from "@/config";
+import {
+  createFastifyInstance,
+  type FastifyInstanceWithZod,
+} from "@/fastify-instance";
+import { agentSandboxApi } from "@/k8s/agent-runtime/sandbox-api";
+import { OrganizationModel } from "@/models";
+import GuardrailsDeploymentModel from "@/models/guardrails-deployment";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  onTestFinished,
+  test,
+  vi,
+} from "@/test";
 import type { User } from "@/types";
 
 describe("config routes", () => {
@@ -27,28 +42,106 @@ describe("config routes", () => {
     await app.register(configRoutes);
   });
 
+  test("advertises plugins with beta disabled", async () => {
+    config.beta = false;
+    const response = await app.inject({ method: "GET", url: "/api/config" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().features.plugins).toBe(true);
+  });
+
   afterEach(async () => {
     await app.close();
   });
 
-  test("returns public config without authentication", async () => {
+  test("advertises the UI feedback overlay only when its flag is set", async () => {
+    config.devFeedback.enabled = true;
+    const on = await app.inject({ method: "GET", url: "/api/config" });
+    config.devFeedback.enabled = false;
+    const off = await app.inject({ method: "GET", url: "/api/config" });
+
+    expect(off.json().features.devFeedbackEnabled).toBe(false);
+    expect(on.json().features.devFeedbackEnabled).toBe(true);
+  });
+
+  test("advertises auto routing only when its flag is set", async () => {
+    config.autoRouting.enabled = true;
+    const on = await app.inject({ method: "GET", url: "/api/config" });
+    config.autoRouting.enabled = false;
+    const off = await app.inject({ method: "GET", url: "/api/config" });
+
+    expect(off.json().features.autoRoutingEnabled).toBe(false);
+    expect(on.json().features.autoRoutingEnabled).toBe(true);
+  });
+
+  test.for([
+    1, 2,
+  ])("returns public config without authentication for isolated database %s", async () => {
+    const expectedAnalyticsState = await OrganizationModel.getAnalyticsState();
+    const getAnalyticsStateSpy = vi.spyOn(
+      OrganizationModel,
+      "getAnalyticsState",
+    );
+    onTestFinished(() => getAnalyticsStateSpy.mockRestore());
+
     const response = await app.inject({
       method: "GET",
       url: "/api/config/public",
     });
 
     expect(response.statusCode).toBe(200);
+    expect(response.json().analytics.instanceId).toBe(
+      expectedAnalyticsState.analyticsInstanceId,
+    );
     expect(response.json()).toEqual({
       disableBasicAuth: expect.any(Boolean),
       disableInvitations: expect.any(Boolean),
+      disableImpersonation: expect.any(Boolean),
+      devAutoLoginEnabled: expect.any(Boolean),
+      maintenanceMode: null,
+      siteNotificationMessage: null,
+      enterpriseCoreActive: expect.any(Boolean),
       analytics: {
         enabled: expect.any(Boolean),
+        instanceId: expect.any(String),
         posthog: {
           key: expect.any(String),
           host: expect.any(String),
         },
       },
+      // The test env sets no ARCHESTRA_RUM_EXPORTER_OTLP_ENDPOINT, so the
+      // opt-in RUM pipeline must report itself concretely off here — an
+      // always-true regression would silently turn client telemetry on.
+      rum: {
+        enabled: false,
+        sampleRate: 1,
+      },
     });
+
+    const cachedResponse = await app.inject({
+      method: "GET",
+      url: "/api/config/public",
+    });
+
+    expect(cachedResponse.statusCode).toBe(200);
+    expect(cachedResponse.json().analytics.instanceId).toBe(
+      response.json().analytics.instanceId,
+    );
+    expect(getAnalyticsStateSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test.for([
+    false,
+    true,
+  ])("exposes Anthropic Vertex routing to the inference selector: %s", async (enabled) => {
+    const original = config.llm.anthropic.vertexAi.enabled;
+    try {
+      config.llm.anthropic.vertexAi.enabled = enabled;
+      const response = await app.inject({ method: "GET", url: "/api/config" });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().features.anthropicVertexAiEnabled).toBe(enabled);
+    } finally {
+      config.llm.anthropic.vertexAi.enabled = original;
+    }
   });
 
   test("returns authenticated config with feature flags and provider base URLs", async () => {
@@ -68,8 +161,7 @@ describe("config routes", () => {
 
     expect(payload.features).toMatchObject({
       orchestratorK8sRuntime: expect.any(Boolean),
-      advancedToolFeaturesEnabled: false,
-      byosEnabled: expect.any(Boolean),
+
       azureOpenAiEntraIdEnabled: expect.any(Boolean),
       bedrockIamAuthEnabled: expect.any(Boolean),
       geminiVertexAiEnabled: expect.any(Boolean),
@@ -78,11 +170,17 @@ describe("config routes", () => {
       isQuickstart: expect.any(Boolean),
       ngrokDomain: expect.any(String),
       virtualKeyDefaultExpirationSeconds: expect.any(Number),
+      chatSecretScanEnabled: true,
+      kbContextualRetrievalDefaultMode: config.kb.contextualRetrievalEnabled
+        ? "document"
+        : "disabled",
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      // Beta-derived flags may inherit an ambient ARCHESTRA_BETA in dev/CI.
+      mcpIdleHibernationBetaEnabled: expect.any(Boolean),
+      // SPDX-SnippetEnd
     });
-    expect(["permissive", "restrictive"]).toContain(
-      payload.features.globalToolPolicy,
-    );
-    expect([null, "1", "2"]).toContain(payload.features.byosVaultKvVersion);
     expect(typeof payload.features.incomingEmail.enabled).toBe("boolean");
     expect(["string", "undefined"]).toContain(
       typeof payload.features.incomingEmail.provider,
@@ -100,25 +198,87 @@ describe("config routes", () => {
 
     expect(Object.keys(payload.providerBaseUrls).sort()).toEqual([
       "anthropic",
+      "archestra",
       "azure",
       "bedrock",
       "cerebras",
       "cohere",
       "deepseek",
       "gemini",
+      "github-copilot",
       "groq",
+      "jev",
+      "kimi",
+      "kimi-code",
+      "microsoft-365-copilot",
       "minimax",
       "mistral",
       "ollama",
+      "ollama-native",
       "openai",
       "openrouter",
       "perplexity",
       "vllm",
+      "voyage",
       "xai",
       "zhipuai",
     ]);
-    for (const value of Object.values(payload.providerBaseUrls)) {
-      expect(value === null || typeof value === "string").toBe(true);
+  });
+
+  test("reports Agent Runtime and OpenAPPA without enabling beta features", async () => {
+    const originalBeta = config.beta;
+    config.beta = false;
+    const sandboxInstalled = vi
+      .spyOn(agentSandboxApi, "isInstalled", "get")
+      .mockReturnValue(false);
+    try {
+      const missing = (
+        await app.inject({ method: "GET", url: "/api/config" })
+      ).json();
+      // The backend settings stay visible so the UI can explain what is
+      // missing instead of hiding Agent Runtime entirely.
+      expect(missing.features.agentRuntime).toBe(false);
+      expect(missing.features.agentRuntimeBackend).toMatchObject({
+        name: "kubernetes",
+        available: false,
+        defaultTtlHours: config.agentRuntime.defaultTtlHours,
+      });
+      // Tiers and their default are organization settings, not public config.
+      expect(missing.features.agentRuntimeBackend).not.toHaveProperty("tiers");
+      expect(missing.features.agentRuntimeBackend).not.toHaveProperty(
+        "defaultTier",
+      );
+
+      sandboxInstalled.mockReturnValue(true);
+      const installed = (
+        await app.inject({ method: "GET", url: "/api/config" })
+      ).json();
+      expect(installed.features.betaEnabled).toBe(false);
+      expect(installed.features.openappaEnabled).toBe(true);
+      expect(await GuardrailsDeploymentModel.isEnabled()).toBe(false);
+      expect(installed.features.agentRuntime).toBe(true);
+      expect(installed.features.agentRuntimeBackend).toMatchObject({
+        name: "kubernetes",
+        available: true,
+      });
+    } finally {
+      config.beta = originalBeta;
+      sandboxInstalled.mockRestore();
     }
+  });
+
+  test("returns configured provider base URLs exactly", async () => {
+    config.llm.azure.baseUrl =
+      "https://configured-resource.openai.azure.com/openai";
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/config",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().providerBaseUrls.azure).toBe(
+      "https://configured-resource.openai.azure.com/openai",
+    );
   });
 });

@@ -1,3 +1,4 @@
+import { fetchWithAbortSignal } from "@/utils/client-disconnect-signal";
 /**
  * Mistral LLM Proxy Adapter - OpenAI-compatible
  *
@@ -9,7 +10,8 @@
  *
  * @see https://docs.mistral.ai/api
  */
-import { ArchestraInternalErrorCode } from "@shared";
+
+import { ArchestraInternalErrorCode } from "@archestra/shared";
 import { get } from "lodash-es";
 import OpenAIProvider from "openai";
 import type {
@@ -25,12 +27,15 @@ import type {
   LLMResponseAdapter,
   LLMStreamAdapter,
   Mistral,
+  StreamAccumulatorState,
 } from "@/types";
+import { streamChatCompletionChunks } from "./chat-completions-stream";
 import {
   OpenAIRequestAdapter,
   OpenAIResponseAdapter,
   OpenAIStreamAdapter,
 } from "./openai";
+import { PROXY_SDK_MAX_RETRIES } from "./sdk-retry-policy";
 
 // =============================================================================
 // TYPE ALIASES (reuse OpenAI types since Mistral is OpenAI-compatible)
@@ -93,14 +98,11 @@ class MistralRequestAdapter
   applyToolResultUpdates(updates: Record<string, string>) {
     return this.delegate.applyToolResultUpdates(updates);
   }
-  applyToonCompression(model: string) {
-    return this.delegate.applyToonCompression(model);
-  }
   convertToolResultContent(messages: MistralMessages) {
     return this.delegate.convertToolResultContent(messages);
   }
-  toProviderRequest() {
-    return this.delegate.toProviderRequest();
+  toProviderRequest(options?: { preserveToolCallIds?: boolean }) {
+    return this.delegate.toProviderRequest(options);
   }
 }
 
@@ -142,6 +144,11 @@ class MistralResponseAdapter implements LLMResponseAdapter<MistralResponse> {
   toRefusalResponse(refusalMessage: string, contentMessage: string) {
     return this.delegate.toRefusalResponse(refusalMessage, contentMessage);
   }
+  withRewrittenToolCalls(
+    toolCalls: Array<{ id: string; name: string; arguments: string }>,
+  ) {
+    return this.delegate.withRewrittenToolCalls(toolCalls);
+  }
 }
 
 /**
@@ -153,8 +160,8 @@ class MistralStreamAdapter
   readonly provider = "mistral" as const;
   private delegate: OpenAIStreamAdapter;
 
-  constructor() {
-    this.delegate = new OpenAIStreamAdapter();
+  constructor(request?: MistralRequest) {
+    this.delegate = new OpenAIStreamAdapter({ clientRequest: request });
   }
 
   get state() {
@@ -170,11 +177,17 @@ class MistralStreamAdapter
   formatTextDeltaSSE(text: string) {
     return this.delegate.formatTextDeltaSSE(text);
   }
+  setTextSuffix(getSuffix: (completedText: string) => string) {
+    this.delegate.setTextSuffix(getSuffix);
+  }
   getRawToolCallEvents() {
     return this.delegate.getRawToolCallEvents();
   }
   formatCompleteTextSSE(text: string) {
     return this.delegate.formatCompleteTextSSE(text);
+  }
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]) {
+    return this.delegate.formatToolCallsSSE(toolCalls);
   }
   formatEndSSE() {
     return this.delegate.formatEndSSE();
@@ -210,8 +223,10 @@ export const mistralAdapterFactory: LLMProvider<
     return new MistralResponseAdapter(response);
   },
 
-  createStreamAdapter(): LLMStreamAdapter<MistralStreamChunk, MistralResponse> {
-    return new MistralStreamAdapter();
+  createStreamAdapter(
+    request?: MistralRequest,
+  ): LLMStreamAdapter<MistralStreamChunk, MistralResponse> {
+    return new MistralStreamAdapter(request);
   },
 
   extractApiKey(headers: MistralHeaders): string | undefined {
@@ -229,18 +244,14 @@ export const mistralAdapterFactory: LLMProvider<
     options: CreateClientOptions,
   ): OpenAIProvider {
     const customFetch = options.agent
-      ? metrics.llm.getObservableFetch(
-          "mistral",
-          options.agent,
-          options.source,
-          options.externalAgentId,
-        )
+      ? metrics.llm.getObservableFetch("mistral", options.agent, options.source)
       : undefined;
 
     return new OpenAIProvider({
+      maxRetries: PROXY_SDK_MAX_RETRIES,
       apiKey,
       baseURL: options.baseUrl ?? config.llm.mistral.baseUrl,
-      fetch: customFetch,
+      fetch: fetchWithAbortSignal(customFetch, options.abortSignal),
       defaultHeaders: options.defaultHeaders,
     });
   },
@@ -270,15 +281,9 @@ export const mistralAdapterFactory: LLMProvider<
       stream: true,
       stream_options: { include_usage: true },
     } as unknown as ChatCompletionCreateParamsStreaming;
-    const stream = await mistralClient.chat.completions.create(mistralRequest);
-
-    return {
-      [Symbol.asyncIterator]: async function* () {
-        for await (const chunk of stream) {
-          yield chunk as MistralStreamChunk;
-        }
-      },
-    };
+    return streamChatCompletionChunks<MistralStreamChunk>(
+      mistralClient.chat.completions.create(mistralRequest),
+    );
   },
 
   extractInternalCode(error: unknown): ArchestraInternalErrorCode | undefined {

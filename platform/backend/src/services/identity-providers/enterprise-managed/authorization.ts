@@ -1,9 +1,11 @@
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   DEFAULT_OAUTH_ACCESS_TOKEN_LIFETIME_SECONDS,
   OAUTH_SCOPES,
-} from "@shared";
+} from "@archestra/shared";
 import { decodeProtectedHeader } from "jose";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
 import config from "@/config";
 import {
   AgentModel,
@@ -122,11 +124,16 @@ export async function exchangeIdentityAssertionForAccessToken(params: {
     return invalidGrant("Unable to determine the identity provider JWKS URL.");
   }
 
+  // The assertion's audience is our issuer identifier, which clients copy
+  // from the advertised AS metadata. That metadata historically carried a
+  // trailing slash, so accept the slashed form too — IdP integrations and
+  // cached metadata configured against the old value keep working.
+  const expectedIssuer = buildOAuthIssuer();
   const validationResult = await jwksValidator.validateJwt({
     token: params.assertion,
     issuerUrl: identityProvider.issuer,
     jwksUrl,
-    audience: buildOAuthIssuer(),
+    audience: [expectedIssuer, `${expectedIssuer}/`],
   });
   if (!validationResult) {
     return invalidGrant("Assertion JWT validation failed.");
@@ -134,14 +141,14 @@ export async function exchangeIdentityAssertionForAccessToken(params: {
 
   if (!validationResult.email) {
     return invalidGrant(
-      "Assertion JWT must include an email claim to link to an Archestra user.",
+      `Assertion JWT must include an email claim to link to an ${archestraMcpBranding.appName} user.`,
     );
   }
 
   const user = await UserModel.findByEmail(validationResult.email);
   if (!user) {
     return invalidGrant(
-      "Assertion JWT email does not match any Archestra user.",
+      `Assertion JWT email does not match any ${archestraMcpBranding.appName} user.`,
     );
   }
 
@@ -180,9 +187,10 @@ export async function exchangeIdentityAssertionForAccessToken(params: {
 }
 
 export function buildOAuthIssuer(): string {
-  return config.frontendBaseUrl.endsWith("/")
-    ? config.frontendBaseUrl
-    : `${config.frontendBaseUrl}/`;
+  // The canonical issuer identifier: frontendBaseUrl is normalized slash-free
+  // in config, and must stay byte-identical to the metadata issuer, the JWT
+  // "iss" claim, and the RFC 9207 `iss` authorization-response parameter.
+  return config.frontendBaseUrl;
 }
 
 function extractProfileIdFromMcpResource(resource: string): string | null {

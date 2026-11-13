@@ -1,17 +1,23 @@
-import { type DocsPage, getDocsUrl, WEBSITE_URL } from "@shared";
+// This file contains Enterprise regions licensed under LICENSE_ENTERPRISE.
+import { type DocsPage, getDocsUrl, WEBSITE_URL } from "@archestra/shared";
 import appConfig from "@/lib/config/config";
 
 /**
  * Returns an Archestra docs URL unless full white-labeling is enabled, in
- * which case built-in docs links should be hidden from the frontend.
+ * which case built-in docs links should be hidden from the frontend. `page`
+ * may name a subpage of a registered page, such as one connector's page.
  */
 export function getFrontendDocsUrl(
-  page: DocsPage,
+  page: DocsPage | `${DocsPage}/${string}`,
   anchor?: string,
 ): string | null {
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
   if (appConfig.enterpriseFeatures.fullWhiteLabeling) {
     return null;
   }
+  // SPDX-SnippetEnd
 
   return getDocsUrl(page, anchor);
 }
@@ -27,12 +33,16 @@ export function getVisibleDocsUrl(
     return null;
   }
 
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
   if (
     appConfig.enterpriseFeatures.fullWhiteLabeling &&
     url.startsWith(WEBSITE_URL)
   ) {
     return null;
   }
+  // SPDX-SnippetEnd
 
   return url;
 }

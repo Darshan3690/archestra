@@ -1,0 +1,150 @@
+import type { SupportedProvider } from "@archestra/shared";
+import {
+  boolean,
+  index,
+  integer,
+  pgTable,
+  primaryKey,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+  varchar,
+} from "drizzle-orm/pg-core";
+import type {
+  ConnectionSetupClientId,
+  ConnectionSetupPlatform,
+  ConnectionSetupProxyAuth,
+} from "@/types/connection-setup";
+import agentsTable from "./agent";
+import organizationsTable from "./organization";
+import pluginsTable from "./plugin";
+import skillsTable from "./skill";
+import skillShareLinksTable from "./skill-share-link";
+import usersTable from "./user";
+import virtualApiKeysTable from "./virtual-api-key";
+
+/**
+ * Short-lived "render tickets" for the /connection one-command setup flow.
+ * A row stores wizard selections only — never rendered script text or raw
+ * secrets. The raw setup token never lands on disk: we persist sha256(token)
+ * in `tokenHash` and the first 22 characters in `tokenStart` for display.
+ *
+ * The script endpoint consumes a row exactly once (`consumedAt` is an atomic
+ * claim); render tickets expire via `expiresAt`. Consumed rows also anchor
+ * installation-scoped read-only instruction credentials, which recheck live access.
+ */
+const connectionSetupsTable = pgTable(
+  "connection_setups",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organizationsTable.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => usersTable.id, { onDelete: "cascade" }),
+    clientId: text("client_id").$type<ConnectionSetupClientId>().notNull(),
+    /** Target OS: "macos"/"linux" render bash, "windows" renders PowerShell. */
+    platform: text("platform")
+      .$type<ConnectionSetupPlatform>()
+      .notNull()
+      .default("macos"),
+    baseUrl: text("base_url").notNull(),
+    mcpGatewayId: uuid("mcp_gateway_id").references(() => agentsTable.id, {
+      onDelete: "cascade",
+    }),
+    llmProxyId: uuid("llm_proxy_id").references(() => agentsTable.id, {
+      onDelete: "cascade",
+    }),
+    provider: text("provider").$type<SupportedProvider>(),
+    /** "provider-key" = passthrough (base URL only); "virtual-key" = injected key. */
+    proxyAuth: text("proxy_auth")
+      .$type<ConnectionSetupProxyAuth>()
+      .notNull()
+      .default("provider-key"),
+    /**
+     * Model the wizard's review step selected for clients whose setup wires
+     * a specific model into the client config. Currently rendered by the
+     * Copilot CLI scripts (applied as COPILOT_MODEL — the CLI refuses to
+     * launch a BYOK provider without one); deliberately client-agnostic so
+     * other clients can adopt it. Null (API callers that omit it): the
+     * script falls back to the provider default only when the machine has
+     * none set.
+     */
+    model: text("model"),
+    /** Personal virtual key provisioned at create time; value injected at render. */
+    virtualApiKeyId: uuid("virtual_api_key_id").references(
+      () => virtualApiKeysTable.id,
+      { onDelete: "set null" },
+    ),
+    includeSkills: boolean("include_skills").notNull().default(false),
+    /** TTL in days for the lazily-created skill share link; null = never expires. */
+    skillLinkTtlDays: integer("skill_link_ttl_days"),
+    /** Set after the script fetch lazily creates the share link (audit/revocation). */
+    skillShareLinkId: uuid("skill_share_link_id").references(
+      () => skillShareLinksTable.id,
+      { onDelete: "set null" },
+    ),
+    /** sha256 hex of the raw setup token; raw token is never stored. */
+    tokenHash: text("token_hash").notNull(),
+    /** First 22 characters of the raw token, for UI display. */
+    tokenStart: varchar("token_start", { length: 22 }).notNull(),
+    expiresAt: timestamp("expires_at", { mode: "date" }).notNull(),
+    consumedAt: timestamp("consumed_at", { mode: "date" }),
+    /** Set when the user (or an admin) disconnects this setup's client. */
+    revokedAt: timestamp("revoked_at", { mode: "date" }),
+    /** Hostname the installer reported, so the user can tell machines apart. */
+    deviceName: text("device_name"),
+    revokedByUserId: text("revoked_by_user_id").references(
+      () => usersTable.id,
+      {
+        onDelete: "set null",
+      },
+    ),
+    createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("connection_setups_token_hash_idx").on(table.tokenHash),
+    index("connection_setups_org_id_idx").on(table.organizationId),
+    // The Connect page lists one user's setups.
+    index("connection_setups_user_id_idx").on(table.userId),
+    index("connection_setups_token_start_idx").on(table.tokenStart),
+  ],
+);
+
+/** Skills the lazily-created share link should expose (when `includeSkills`). */
+export const connectionSetupSkillsTable = pgTable(
+  "connection_setup_skills",
+  {
+    connectionSetupId: uuid("connection_setup_id")
+      .notNull()
+      .references(() => connectionSetupsTable.id, { onDelete: "cascade" }),
+    skillId: uuid("skill_id")
+      .notNull()
+      .references(() => skillsTable.id, { onDelete: "cascade" }),
+  },
+  (table) => [
+    primaryKey({ columns: [table.connectionSetupId, table.skillId] }),
+    index("connection_setup_skills_skill_id_idx").on(table.skillId),
+  ],
+);
+
+/** Plugins frozen into the setup before its one-time command is minted. */
+export const connectionSetupPluginsTable = pgTable(
+  "connection_setup_plugins",
+  {
+    connectionSetupId: uuid("connection_setup_id")
+      .notNull()
+      .references(() => connectionSetupsTable.id, { onDelete: "cascade" }),
+    pluginId: uuid("plugin_id")
+      .notNull()
+      .references(() => pluginsTable.id, { onDelete: "cascade" }),
+  },
+  (table) => [
+    primaryKey({ columns: [table.connectionSetupId, table.pluginId] }),
+    index("connection_setup_plugins_plugin_id_idx").on(table.pluginId),
+  ],
+);
+
+export default connectionSetupsTable;

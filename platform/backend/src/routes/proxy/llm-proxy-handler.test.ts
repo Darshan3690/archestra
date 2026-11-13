@@ -3,10 +3,21 @@
  *
  * Tests that verify:
  * 1. Prometheus metrics are correctly incremented for all LLM providers
- * 2. recordBlockedToolSpans is called when tool invocation policies block tool calls
+ * 2. recordBlockedToolSpans is called when a proxy plugin refuses tool calls
  */
 
-import { CHAT_API_KEY_ID_HEADER } from "@shared";
+import { MessageStream } from "@anthropic-ai/sdk/lib/MessageStream";
+import {
+  CHAT_API_KEY_ID_HEADER,
+  EXTERNAL_AGENT_ID_HEADER,
+  OPENCODE_AGENT_HEADER,
+  OPENCODE_CLIENT_ID,
+  PROVIDER_BASE_URL_HEADER,
+  SESSION_ID_HEADER,
+  SOURCE_HEADER,
+} from "@archestra/shared";
+import { logs } from "@opentelemetry/api-logs";
+import { eq } from "drizzle-orm";
 import Fastify, { type FastifyInstance } from "fastify";
 import {
   serializerCompiler,
@@ -14,15 +25,31 @@ import {
   type ZodTypeProvider,
 } from "fastify-type-provider-zod";
 import { vi } from "vitest";
-import type { PolicyBlockResult } from "@/guardrails/tool-invocation";
-import { LlmProviderApiKeyModel, ModelModel } from "@/models";
+import { serviceAccountUserId } from "@/auth/service-account-user-id";
+import {
+  guardrailCallHeader,
+  internalCallHeader,
+} from "@/clients/internal-call";
+import db, { schema } from "@/database";
+import {
+  InteractionModel,
+  LlmProviderApiKeyModel,
+  ModelModel,
+  OrganizationModel,
+  VirtualApiKeyModel,
+} from "@/models";
+import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
 import { afterEach, beforeEach, describe, expect, test } from "@/test";
 import {
+  type AnthropicStubOptions,
   createAnthropicTestClient,
   createGeminiTestClient,
   createOpenAiTestClient,
+  type OpenAiStubOptions,
 } from "@/test/llm-provider-stubs";
+import { makePassthroughCredential } from "@/test/llm-proxy-credentials";
 import type { Agent } from "@/types";
+import { ApiError } from "@/types";
 
 // Mock prom-client at module level (like llm-metrics.test.ts)
 const counterInc = vi.fn();
@@ -46,22 +73,6 @@ vi.mock("prom-client", () => ({
   },
 }));
 
-// Mock tool-invocation to control policy evaluation results.
-// Defaults: evaluatePolicies → null (allow), getGlobalToolPolicy → "permissive".
-// These defaults match the real behavior when no policies exist in the DB.
-const mockEvaluatePolicies = vi.fn<() => Promise<PolicyBlockResult | null>>();
-const mockGetGlobalToolPolicy = vi.fn<() => Promise<string>>();
-
-vi.mock("@/guardrails/tool-invocation", async (importOriginal) => {
-  const original =
-    await importOriginal<typeof import("@/guardrails/tool-invocation")>();
-  return {
-    ...original,
-    evaluatePolicies: (..._args: unknown[]) => mockEvaluatePolicies(),
-    getGlobalToolPolicy: (..._args: unknown[]) => mockGetGlobalToolPolicy(),
-  };
-});
-
 // Spy on recordBlockedToolSpans to verify it's called with the right args
 const mockRecordBlockedToolSpans = vi.fn();
 vi.mock("@/observability/tracing", async (importOriginal) => {
@@ -74,28 +85,73 @@ vi.mock("@/observability/tracing", async (importOriginal) => {
   };
 });
 
+vi.mock("@/clients/azure-openai-credentials", async (importOriginal) => {
+  const original =
+    await importOriginal<typeof import("@/clients/azure-openai-credentials")>();
+  return {
+    ...original,
+    isAzureOpenAiEntraIdEnabled: () => true,
+  };
+});
+
 // Import after mocks to ensure mocks are applied
 import { metrics } from "@/observability";
 import {
+  type LlmProxyToolCallRefusal,
+  registerLlmProxyPlugin,
+} from "@/proxy/plugins/registry";
+import {
   anthropicAdapterFactory,
+  azureAdapterFactory,
+  bedrockAdapterFactory,
   geminiAdapterFactory,
   openaiAdapterFactory,
 } from "./adapters";
+import { virtualKeyRateLimiter } from "./llm-proxy-auth";
 import anthropicProxyRoutes from "./routes/anthropic";
+import azureProxyRoutes from "./routes/azure";
+import bedrockProxyRoutes from "./routes/bedrock";
 import geminiProxyRoutes from "./routes/gemini";
+import githubCopilotProxyRoutes from "./routes/github-copilot";
 import openAiProxyRoutes from "./routes/openai";
+
+/**
+ * Reconstruct a streamed turn the way a client does, using the SDK's own
+ * accumulator rather than a model of it: it appends content blocks in arrival
+ * order while applying deltas by index, so anything that disturbs the index
+ * sequence shows up here and nowhere in the raw SSE.
+ *
+ * `fromReadableStream` consumes newline-delimited events, so the SSE `data:`
+ * payloads are lifted out and handed over — the framing is not under test.
+ */
+async function reconstructWithSdk(sseBody: string) {
+  const events = sseBody
+    .split("\n")
+    .filter((line) => line.startsWith("data: "))
+    .map((line) => line.slice("data: ".length))
+    .join("\n");
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(events));
+      controller.close();
+    },
+  });
+  return MessageStream.fromReadableStream(stream).finalMessage();
+}
+
+let platformCredential: string;
 
 describe("LLM Proxy Handler Prometheus Metrics", () => {
   let app: FastifyInstance;
   let testAgent: Agent;
-  let openAiStubOptions: { interruptAtChunk?: number };
+  let openAiStubOptions: OpenAiStubOptions;
   let anthropicStubOptions: {
     includeToolUse?: boolean;
     interruptAtChunk?: number;
   };
   let geminiStubOptions: { interruptAtChunk?: number };
 
-  beforeEach(async ({ makeAgent }) => {
+  beforeEach(async ({ makeAgent, makeMember, makeUser }) => {
     vi.clearAllMocks();
 
     // Create Fastify app
@@ -119,13 +175,17 @@ describe("LLM Proxy Handler Prometheus Metrics", () => {
 
     // Create test agent
     testAgent = await makeAgent({ name: "Test Metrics Agent" });
+    const owner = await makeUser();
+    await makeMember(owner.id, testAgent.organizationId);
+    platformCredential = await makePassthroughCredential({
+      organizationId: testAgent.organizationId,
+      ownerId: owner.id,
+    });
 
     // Initialize metrics
     metrics.llm.initializeMetrics([]);
 
     // Default: policies allow everything (matches real behavior when no policies exist)
-    mockEvaluatePolicies.mockResolvedValue(null);
-    mockGetGlobalToolPolicy.mockResolvedValue("permissive");
   });
 
   afterEach(async () => {
@@ -150,6 +210,168 @@ describe("LLM Proxy Handler Prometheus Metrics", () => {
       });
     });
 
+    test.each([
+      {
+        stream: false,
+        failure: "none",
+        outcome: "success",
+        origin: "none",
+        status: 200,
+      },
+      {
+        stream: true,
+        failure: "none",
+        outcome: "success",
+        origin: "none",
+        status: 200,
+      },
+      {
+        stream: false,
+        failure: "provider",
+        outcome: "throttled",
+        origin: "provider",
+        status: 429,
+      },
+      {
+        stream: true,
+        failure: "provider",
+        outcome: "throttled",
+        origin: "provider",
+        status: 200,
+      },
+      {
+        stream: true,
+        failure: "internal",
+        outcome: "throttled",
+        origin: "archestra",
+        status: 429,
+      },
+    ])("exports one final outcome ($failure, stream=$stream)", async ({
+      stream,
+      failure,
+      outcome,
+      origin,
+      status,
+    }) => {
+      const emit = vi.fn();
+      vi.spyOn(logs, "getLogger").mockReturnValue({
+        emit,
+        enabled: () => true,
+      });
+      const error = Object.assign(new Error("private provider error detail"), {
+        status: 429,
+        headers: new Headers(),
+        error: { type: "rate_limit_error" },
+      });
+      if (failure === "internal") {
+        vi.spyOn(virtualKeyRateLimiter, "check").mockRejectedValue(
+          new ApiError(429, "private throttle detail"),
+        );
+      } else if (failure === "provider") {
+        const client = createOpenAiTestClient();
+        const create = client.chat.completions.create;
+        client.chat.completions.create = async (params) => {
+          if (!params.stream) throw error;
+          const chunks = (await create(params)) as AsyncIterable<unknown>;
+          return {
+            async *[Symbol.asyncIterator]() {
+              for await (const chunk of chunks) {
+                yield chunk;
+                throw error;
+              }
+            },
+          } as never;
+        };
+        vi.mocked(openaiAdapterFactory.createClient).mockReturnValue(
+          client as never,
+        );
+      }
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/openai/${testAgent.id}/chat/completions`,
+        headers: {
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "private prompt" }],
+          stream,
+        },
+      });
+      expect(response.statusCode).toBe(status);
+      const events = emit.mock.calls
+        .map(([record]) => record)
+        .filter((record) => record.eventName === "archestra.llm_proxy.request");
+      expect(events).toHaveLength(1);
+      expect(events[0].attributes).toMatchObject({
+        "archestra.proxy.outcome": outcome,
+        "archestra.proxy.error_origin": origin,
+        "http.response.status_code": status,
+        "gen_ai.request.streaming": stream,
+      });
+      expect(JSON.stringify(events[0])).not.toMatch(/private|test-key/);
+    });
+
+    test.each([
+      { stream: false, fail: false },
+      { stream: true, fail: false },
+      { stream: false, fail: true },
+      { stream: true, fail: true },
+    ])("persists total latency (stream=$stream, fail=$fail)", async ({
+      stream,
+      fail,
+    }) => {
+      let now = Date.now();
+      vi.spyOn(Date, "now").mockImplementation(() => now);
+      const client = createOpenAiTestClient();
+      const create = client.chat.completions.create;
+      client.chat.completions.create = async (params) => {
+        now += 250;
+        if (!params.stream) {
+          if (fail) throw new Error("Upstream request failed");
+          return create(params);
+        }
+        const result = await create(params);
+        const chunks = result as AsyncIterable<unknown>;
+        return {
+          async *[Symbol.asyncIterator]() {
+            for await (const chunk of chunks) {
+              yield chunk;
+              now += 100;
+              if (fail) throw new Error("Upstream stream failed");
+            }
+          },
+        } as typeof result;
+      };
+      vi.mocked(openaiAdapterFactory.createClient).mockReturnValue(
+        client as never,
+      );
+
+      await app.inject({
+        method: "POST",
+        url: `/v1/openai/${testAgent.id}/chat/completions`,
+        headers: {
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
+          "content-type": "application/json",
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "Hello" }],
+          stream,
+        },
+      });
+
+      const rows = await InteractionModel.getAllInteractionsForProfile(
+        testAgent.id,
+      );
+      expect(rows).toHaveLength(1);
+      // Four streamed chunks each add 100 ms after yielding; normal EOF
+      // includes the final interval while a failure stops after the first.
+      expect(rows[0].durationMs).toBe(stream ? (fail ? 350 : 650) : 250);
+    });
+
     test("streaming request increments token and cost metrics", async () => {
       const response = await app.inject({
         method: "POST",
@@ -157,6 +379,7 @@ describe("LLM Proxy Handler Prometheus Metrics", () => {
         headers: {
           "content-type": "application/json",
           authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
           "user-agent": "test-client",
         },
         payload: {
@@ -215,6 +438,51 @@ describe("LLM Proxy Handler Prometheus Metrics", () => {
       // returns data immediately (TTFT = 0, which is invalid).
     });
 
+    test("service-account virtual keys attribute both streaming and nonstreaming requests to the account", async ({
+      makeServiceAccount,
+      makeSecret,
+      makeLlmProviderApiKey,
+    }) => {
+      const account = await makeServiceAccount(testAgent.organizationId);
+      const secret = await makeSecret({ secret: { apiKey: "sk-test" } });
+      const providerKey = await makeLlmProviderApiKey(
+        testAgent.organizationId,
+        secret.id,
+        { provider: "openai" },
+      );
+      const { value, virtualKey } = await VirtualApiKeyModel.create({
+        organizationId: testAgent.organizationId,
+        name: "worker key",
+        authorId: serviceAccountUserId(account.id),
+        providerApiKeys: [
+          { provider: "openai", providerApiKeyId: providerKey.id },
+        ],
+      });
+      expect(virtualKey.createdByServiceAccountId).toBe(account.id);
+      for (const stream of [false, true]) {
+        const response = await app.inject({
+          method: "POST",
+          url: `/v1/openai/${testAgent.id}/chat/completions`,
+          headers: { authorization: `Bearer ${value}` },
+          payload: {
+            model: "gpt-4o",
+            messages: [{ role: "user", content: "Hello" }],
+            stream,
+          },
+        });
+        expect(response.statusCode, response.body).toBe(200);
+      }
+      const interactions = await db
+        .select()
+        .from(schema.interactionsTable)
+        .where(eq(schema.interactionsTable.virtualKeyId, virtualKey.id));
+      expect(interactions).toHaveLength(2);
+      expect(
+        interactions.every(
+          (row) => row.serviceAccountId === account.id && row.userId === null,
+        ),
+      ).toBe(true);
+    });
     test("non-streaming request increments cost metrics", async () => {
       // Token metrics are NOT reported for these non-streaming stubbed requests
       // because the test clients don't use getObservableFetch(). In production,
@@ -225,6 +493,7 @@ describe("LLM Proxy Handler Prometheus Metrics", () => {
         headers: {
           "content-type": "application/json",
           authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
           "user-agent": "test-client",
         },
         payload: {
@@ -253,19 +522,32 @@ describe("LLM Proxy Handler Prometheus Metrics", () => {
       );
     });
 
-    test.skip("non-streaming request increments token metrics", async () => {
-      // SKIPPED: Mock clients don't use getObservableFetch(), so token metrics
-      // are not reported in mock mode. To properly test this, we need to either:
-      // 1. Mock globalThis.fetch so getObservableFetch wraps it and reports tokens
-      // 2. Modify mock clients to accept and call an observable fetch
-      // See TODO in llm-proxy-handler.ts handleNonStreaming()
+    test("passthrough virtual key attributes the interaction to its owner", async ({
+      makeUser,
+      makeMember,
+    }) => {
+      const owner = await makeUser();
+      await makeMember(owner.id, testAgent.organizationId);
+      const { value: passthroughToken, virtualKey } =
+        await VirtualApiKeyModel.create({
+          organizationId: testAgent.organizationId,
+          name: "pt-attribution",
+          keyType: "passthrough",
+          scope: "personal",
+          authorId: owner.id,
+        });
+
       const response = await app.inject({
         method: "POST",
         url: `/v1/openai/${testAgent.id}/chat/completions`,
+        // Non-loopback: the passthrough key plus the caller's provider key is
+        // enough on its own for an external client.
+        remoteAddress: "203.0.113.5",
         headers: {
           "content-type": "application/json",
+          // Raw provider key forwarded upstream; passthrough key attributes the user.
           authorization: "Bearer test-key",
-          "user-agent": "test-client",
+          "x-archestra-virtual-key": passthroughToken,
         },
         payload: {
           model: "gpt-4o",
@@ -274,36 +556,409 @@ describe("LLM Proxy Handler Prometheus Metrics", () => {
         },
       });
 
+      expect(response.statusCode, response.body).toBe(200);
+
+      const [interaction] = await db
+        .select()
+        .from(schema.interactionsTable)
+        .where(eq(schema.interactionsTable.profileId, testAgent.id));
+
+      expect(interaction.userId).toBe(owner.id);
+      expect(interaction.passthroughVirtualKeyId).toBe(virtualKey.id);
+      expect(interaction.virtualKeyId).toBeNull();
+      expect(interaction.authMethod).toBe("passthrough_virtual_key");
+    });
+
+    test("personal standard virtual key attributes the interaction to its owner", async ({
+      makeUser,
+      makeMember,
+      makeSecret,
+      makeLlmProviderApiKey,
+    }) => {
+      // Virtual-key connection mode: the connect flow mints a personal virtual
+      // key whose author is the acting user (Codex ChatGPT subscription, Claude
+      // Code virtual key). The key is the sole identity signal, so its owner
+      // must attribute the request even though no X-Archestra-User-Id header or
+      // passthrough key is present.
+      const owner = await makeUser();
+      await makeMember(owner.id, testAgent.organizationId);
+      const secret = await makeSecret({ secret: { apiKey: "sk-owned-key" } });
+      const providerKey = await makeLlmProviderApiKey(
+        testAgent.organizationId,
+        secret.id,
+        { provider: "openai" },
+      );
+      const { value: virtualKey, virtualKey: virtualKeyRow } =
+        await VirtualApiKeyModel.create({
+          organizationId: testAgent.organizationId,
+          name: "vk-attribution",
+          scope: "personal",
+          authorId: owner.id,
+          providerApiKeys: [
+            { provider: "openai", providerApiKeyId: providerKey.id },
+          ],
+        });
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/openai/${testAgent.id}/chat/completions`,
+        // Non-loopback: attribution comes from the virtual key, not a localhost bypass.
+        remoteAddress: "203.0.113.5",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${virtualKey}`,
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "Hello!" }],
+          stream: false,
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(200);
+
+      const [interaction] = await db
+        .select()
+        .from(schema.interactionsTable)
+        .where(eq(schema.interactionsTable.profileId, testAgent.id));
+
+      expect(interaction.userId).toBe(owner.id);
+      expect(interaction.virtualKeyId).toBe(virtualKeyRow.id);
+      expect(interaction.authMethod).toBe("virtual_key");
+    });
+
+    // Not covered here: non-streaming token metrics. The mock LLM clients do
+    // not route through getObservableFetch(), so no token counters are
+    // reported in mock mode. Covering it needs either a stubbed
+    // globalThis.fetch that getObservableFetch can wrap, or mock clients that
+    // accept an observable fetch — see the TODO in
+    // llm-proxy-handler.ts handleNonStreaming().
+
+    test("streaming failure before any usage persists an error interaction", async () => {
+      // A provider 400 (e.g. context length exceeded) rejects the stream before
+      // any chunk — the failure must still land in the interactions log so it
+      // shows up in LLM logs / session history.
+      openAiStubOptions.failStreamWithError =
+        "This endpoint's maximum context length is 262144 tokens. However, you requested about 285869 tokens";
+
+      await app.inject({
+        method: "POST",
+        url: `/v1/openai/${testAgent.id}/chat/completions`,
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
+          "user-agent": "test-client",
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "Hello!" }],
+          stream: true,
+        },
+      });
+
+      const rows = await db
+        .select()
+        .from(schema.interactionsTable)
+        .where(eq(schema.interactionsTable.profileId, testAgent.id));
+      expect(rows).toHaveLength(1);
+      expect(rows[0].response).toMatchObject({
+        error: expect.stringContaining("maximum context length"),
+      });
+      expect(rows[0].inputTokens).toBeNull();
+      expect(rows[0].outputTokens).toBeNull();
+    });
+
+    test("streaming failure after SSE headers and content persists an error interaction", async () => {
+      // The provider fails mid-stream: SSE headers and content chunks are already
+      // on the wire, but the usage-bearing final chunk never arrives. The
+      // finally-block persist is gated on usage, so this must be covered by the
+      // catch path or the failure leaves no trace in LLM logs / session history.
+      openAiStubOptions.throwAtChunk = 2;
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/openai/${testAgent.id}/chat/completions`,
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
+          "user-agent": "test-client",
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "Hello!" }],
+          stream: true,
+        },
+      });
+
+      // Headers were already committed, so the failure surfaces as an SSE error
+      // event on a 200 response rather than an HTTP error status.
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain("event: error");
+
+      const rows = await db
+        .select()
+        .from(schema.interactionsTable)
+        .where(eq(schema.interactionsTable.profileId, testAgent.id));
+      expect(rows).toHaveLength(1);
+      expect(rows[0].response).toMatchObject({
+        error: expect.stringContaining("Simulated OpenAI stream failure"),
+      });
+      expect(rows[0].inputTokens).toBeNull();
+      expect(rows[0].outputTokens).toBeNull();
+    });
+
+    test("stream ending early without usage persists a partial interaction", async () => {
+      // The provider closes the stream cleanly mid-way (no throw) before the
+      // usage chunk. Nothing raises, so the catch path never runs and the
+      // finally-block persist is gated on usage — the call must still be
+      // recorded rather than vanishing from interaction history.
+      openAiStubOptions.interruptAtChunk = 2;
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/openai/${testAgent.id}/chat/completions`,
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
+          "user-agent": "test-client",
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "Hello!" }],
+          stream: true,
+        },
+      });
+
       expect(response.statusCode).toBe(200);
 
-      // Wait for async processing
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      const rows = await db
+        .select()
+        .from(schema.interactionsTable)
+        .where(eq(schema.interactionsTable.profileId, testAgent.id));
+      expect(rows).toHaveLength(1);
+      expect(rows[0].inputTokens).toBeNull();
+      expect(rows[0].outputTokens).toBeNull();
+      expect(JSON.stringify(rows[0].response)).toContain("How can");
+    });
 
-      // Verify token metrics (input: 82, output: 17 from the non-streaming test stub)
-      expect(counterInc).toHaveBeenCalledWith(
-        expect.objectContaining({
-          labels: expect.objectContaining({
-            provider: "openai",
-            type: "input",
-            model: "gpt-4o",
-            agent_id: testAgent.id,
-            agent_name: testAgent.name,
-          }),
-          value: 82,
-        }),
+    test("a Slack ChatOps stream without usage keeps its source and shows up in the sessions listing", async () => {
+      // T-953: Slack ChatOps runs reach the proxy as streams tagged
+      // `chatops:slack`, and their upstream (frequently another Archestra,
+      // whose own SSE omits the trailing usage chunk) reports no usage. The
+      // usage-gated persist made those runs vanish from LLM Logs entirely.
+      // Recording the row is not enough — it has to keep `source`, or the
+      // "Slack" entry of the Source filter can never find it again.
+      openAiStubOptions.interruptAtChunk = 2;
+
+      const sessionId = "slack-C0B2AGC0AFQ-1784887557";
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/openai/${testAgent.id}/chat/completions`,
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
+          [SOURCE_HEADER]: "chatops:slack",
+          [SESSION_ID_HEADER]: sessionId,
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "Hello from Slack!" }],
+          stream: true,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+
+      const rows = await db
+        .select()
+        .from(schema.interactionsTable)
+        .where(eq(schema.interactionsTable.profileId, testAgent.id));
+      expect(rows).toHaveLength(1);
+      expect(rows[0].source).toBe("chatops:slack");
+      expect(rows[0].sessionId).toBe(sessionId);
+
+      // The unfiltered listing is the view the bug report screenshotted.
+      const unfiltered = await InteractionModel.getSessions(
+        { limit: 10, offset: 0 },
+        undefined,
+        true,
+        { sessionId },
       );
+      expect(unfiltered.pagination.total).toBe(1);
+      expect(unfiltered.data[0].source).toBe("chatops:slack");
+      expect(unfiltered.data[0].sources).toContain("chatops:slack");
 
-      expect(counterInc).toHaveBeenCalledWith(
-        expect.objectContaining({
-          labels: expect.objectContaining({
-            provider: "openai",
-            type: "output",
+      // ...and the Source filter's "Slack" entry must keep it.
+      const filtered = await InteractionModel.getSessions(
+        { limit: 10, offset: 0 },
+        undefined,
+        true,
+        { sessionId, source: "chatops:slack" },
+      );
+      expect(filtered.pagination.total).toBe(1);
+    });
+
+    test.each([
+      ["an external client", "api", () => ({}), true],
+      ["another in-process caller", "api", () => internalCallHeader(), true],
+      [
+        "the platform's guardrail call",
+        "guardrail:sanitizer",
+        () => guardrailCallHeader(),
+        false,
+      ],
+    ] as const)("the sanitizer source from %s is logged as %s", async (_caller, source, proof, storesContent) => {
+      // A guardrail sanitizer's rows keep no content, so only the guardrail
+      // call may claim that source; anyone else is logged as api, with content.
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/openai/${testAgent.id}/chat/completions`,
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
+          [SOURCE_HEADER]: "guardrail:sanitizer",
+          ...proof(),
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "the-sanitizer-source-prompt" }],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const rows = await db
+        .select()
+        .from(schema.interactionsTable)
+        .where(eq(schema.interactionsTable.profileId, testAgent.id));
+      expect(rows).toHaveLength(1);
+      expect(rows[0].source).toBe(source);
+      expect(
+        JSON.stringify(rows[0].request).includes("the-sanitizer-source-prompt"),
+      ).toBe(storesContent);
+    });
+
+    test("persists OpenCode main, title, and child-session sources", async () => {
+      const run = (params: {
+        sessionId: string;
+        agent: string;
+        parentSessionId?: string;
+      }) =>
+        app.inject({
+          method: "POST",
+          url: `/v1/openai/${testAgent.id}/chat/completions`,
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer test-key",
+            "x-archestra-virtual-key": platformCredential,
+            [EXTERNAL_AGENT_ID_HEADER]: OPENCODE_CLIENT_ID,
+            [OPENCODE_AGENT_HEADER]: params.agent,
+            "x-opencode-session": params.sessionId,
+            ...(params.parentSessionId
+              ? { "x-parent-session-id": params.parentSessionId }
+              : {}),
+          },
+          payload: {
             model: "gpt-4o",
-            agent_id: testAgent.id,
-            agent_name: testAgent.name,
-          }),
-          value: 17,
-        }),
+            messages: [{ role: "user", content: "Hello" }],
+          },
+        });
+
+      expect(
+        (await run({ sessionId: "ses_root_title", agent: "title" })).statusCode,
+      ).toBe(200);
+      expect(
+        (await run({ sessionId: "ses_root_compaction", agent: "compaction" }))
+          .statusCode,
+      ).toBe(200);
+      expect(
+        (await run({ sessionId: "ses_root_main", agent: "build" })).statusCode,
+      ).toBe(200);
+      expect(
+        (
+          await run({
+            sessionId: "ses_child",
+            agent: "explore",
+            parentSessionId: "ses_root_main",
+          })
+        ).statusCode,
+      ).toBe(200);
+
+      const rows = await db
+        .select({
+          sessionId: schema.interactionsTable.sessionId,
+          source: schema.interactionsTable.source,
+        })
+        .from(schema.interactionsTable)
+        .where(eq(schema.interactionsTable.profileId, testAgent.id));
+      expect(new Map(rows.map((row) => [row.sessionId, row.source]))).toEqual(
+        new Map([
+          ["ses_root_title", "opencode:title"],
+          ["ses_root_compaction", "opencode:compaction"],
+          ["ses_root_main", "opencode:main"],
+          ["ses_child", "opencode:subagent"],
+        ]),
+      );
+    });
+    test("persists Kilo Code main, title, and child-session sources under its own prefix", async () => {
+      const run = (params: {
+        sessionId: string;
+        agent: string;
+        parentSessionId?: string;
+      }) =>
+        app.inject({
+          method: "POST",
+          url: `/v1/openai/${testAgent.id}/chat/completions`,
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer test-key",
+            "x-archestra-virtual-key": platformCredential,
+            [EXTERNAL_AGENT_ID_HEADER]: "kilo",
+            [OPENCODE_AGENT_HEADER]: params.agent,
+            "x-opencode-session": params.sessionId,
+            ...(params.parentSessionId
+              ? { "x-parent-session-id": params.parentSessionId }
+              : {}),
+          },
+          payload: {
+            model: "gpt-4o",
+            messages: [{ role: "user", content: "Hello" }],
+          },
+        });
+
+      for (const params of [
+        { sessionId: "ses_kilo_title", agent: "title" },
+        { sessionId: "ses_kilo_main", agent: "build" },
+        {
+          sessionId: "ses_kilo_child",
+          agent: "explore",
+          parentSessionId: "ses_kilo_main",
+        },
+      ]) {
+        expect((await run(params)).statusCode).toBe(200);
+      }
+
+      const rows = await db
+        .select({
+          sessionId: schema.interactionsTable.sessionId,
+          sessionSource: schema.interactionsTable.sessionSource,
+          source: schema.interactionsTable.source,
+        })
+        .from(schema.interactionsTable)
+        .where(eq(schema.interactionsTable.profileId, testAgent.id));
+      expect(new Map(rows.map((row) => [row.sessionId, row.source]))).toEqual(
+        new Map([
+          ["ses_kilo_title", "kilo:title"],
+          ["ses_kilo_main", "kilo:main"],
+          ["ses_kilo_child", "kilo:subagent"],
+        ]),
+      );
+      expect(new Set(rows.map((row) => row.sessionSource))).toEqual(
+        new Set(["kilo_session"]),
       );
     });
   });
@@ -332,6 +987,7 @@ describe("LLM Proxy Handler Prometheus Metrics", () => {
         headers: {
           "content-type": "application/json",
           "x-api-key": "test-key",
+          "x-archestra-virtual-key": platformCredential,
           "anthropic-version": "2023-06-01",
         },
         payload: {
@@ -401,6 +1057,7 @@ describe("LLM Proxy Handler Prometheus Metrics", () => {
         headers: {
           "content-type": "application/json",
           "x-api-key": "test-key",
+          "x-archestra-virtual-key": platformCredential,
           "anthropic-version": "2023-06-01",
         },
         payload: {
@@ -429,6 +1086,66 @@ describe("LLM Proxy Handler Prometheus Metrics", () => {
         }),
       );
     });
+
+    test("records a context-variant id as the model it names, and forwards it unchanged", async () => {
+      const forwarded: string[] = [];
+      vi.spyOn(anthropicAdapterFactory, "createClient").mockImplementation(
+        () =>
+          ({
+            messages: {
+              create: async (...args: unknown[]) => {
+                const [params] = args as [{ model: string }];
+                forwarded.push(params.model);
+                return (
+                  createAnthropicTestClient(anthropicStubOptions).messages
+                    .create as (...a: unknown[]) => unknown
+                )(...args);
+              },
+            },
+          }) as never,
+      );
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${testAgent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "test-key",
+          "x-archestra-virtual-key": platformCredential,
+          "anthropic-version": "2023-06-01",
+        },
+        payload: {
+          // A client asking for the long-context variant of a model that is
+          // already priced under its plain id.
+          model: "claude-3-5-sonnet-20241022[1m]",
+          max_tokens: 1024,
+          messages: [{ role: "user", content: "Hello!" }],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // The marker names the same model, so usage is attributed to the priced
+      // record rather than to a second one no catalog can describe.
+      expect(counterInc).toHaveBeenCalledWith(
+        expect.objectContaining({
+          labels: expect.objectContaining({
+            provider: "anthropic",
+            model: "claude-3-5-sonnet-20241022",
+          }),
+        }),
+      );
+      await expect(
+        ModelModel.findByProviderAndModelId(
+          "anthropic",
+          "claude-3-5-sonnet-20241022[1m]",
+        ),
+      ).resolves.toBeNull();
+
+      // The provider still receives the id the client asked for.
+      expect(forwarded).toEqual(["claude-3-5-sonnet-20241022[1m]"]);
+    });
   });
 
   describe("Gemini", () => {
@@ -455,6 +1172,7 @@ describe("LLM Proxy Handler Prometheus Metrics", () => {
         headers: {
           "content-type": "application/json",
           "x-goog-api-key": "test-key",
+          "x-archestra-virtual-key": platformCredential,
         },
         payload: {
           contents: [
@@ -525,6 +1243,7 @@ describe("LLM Proxy Handler Prometheus Metrics", () => {
         headers: {
           "content-type": "application/json",
           "x-goog-api-key": "test-key",
+          "x-archestra-virtual-key": platformCredential,
         },
         payload: {
           contents: [
@@ -555,18 +1274,133 @@ describe("LLM Proxy Handler Prometheus Metrics", () => {
       );
     });
   });
+
+  // Bedrock uses a custom SigV4 client instead of getObservableFetch, so unlike
+  // fetch-based providers it can't self-instrument llm_request_duration_seconds.
+  // The handler records it on Bedrock's behalf; these tests pin that behavior.
+  // The duration histogram is the only LLM metric carrying a `status_code`
+  // label, which is what distinguishes it from TTFT/tokens-per-second here.
+  describe("Bedrock", () => {
+    const BEDROCK_MODEL = "anthropic.claude-3-5-sonnet-20241022-v2:0";
+
+    beforeEach(async () => {
+      await app.register(bedrockProxyRoutes);
+
+      vi.spyOn(bedrockAdapterFactory, "createClient").mockReturnValue({
+        converse: async () => ({
+          $metadata: { requestId: "req_bedrock_test" },
+          output: {
+            message: { role: "assistant", content: [{ text: "Hi there" }] },
+          },
+          stopReason: "end_turn",
+          usage: { inputTokens: 12, outputTokens: 10 },
+        }),
+        converseStream: async () =>
+          (async function* () {
+            yield { messageStart: { role: "assistant" } };
+            yield {
+              contentBlockDelta: {
+                contentBlockIndex: 0,
+                delta: { text: "Hi there" },
+              },
+            };
+            yield { contentBlockStop: { contentBlockIndex: 0 } };
+            yield { messageStop: { stopReason: "end_turn" } };
+            yield {
+              metadata: { usage: { inputTokens: 12, outputTokens: 10 } },
+            };
+          })(),
+      } as never);
+
+      await ModelModel.upsert({
+        externalId: `bedrock/${BEDROCK_MODEL}`,
+        provider: "bedrock",
+        modelId: BEDROCK_MODEL,
+        inputModalities: null,
+        outputModalities: null,
+        customPricePerMillionInput: "3.00",
+        customPricePerMillionOutput: "15.00",
+        lastSyncedAt: new Date(),
+      });
+    });
+
+    test("streaming request records the request-duration metric", async () => {
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/bedrock/${testAgent.id}/converse-stream`,
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
+        },
+        payload: {
+          modelId: BEDROCK_MODEL,
+          messages: [{ role: "user", content: [{ text: "Hello!" }] }],
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(200);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(histogramObserve).toHaveBeenCalledWith(
+        expect.objectContaining({
+          labels: expect.objectContaining({
+            provider: "bedrock",
+            model: BEDROCK_MODEL,
+            agent_id: testAgent.id,
+            status_code: "200",
+          }),
+          value: expect.any(Number),
+        }),
+      );
+    });
+
+    test("non-streaming request records the request-duration metric", async () => {
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/bedrock/${testAgent.id}/converse`,
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
+        },
+        payload: {
+          modelId: BEDROCK_MODEL,
+          messages: [{ role: "user", content: [{ text: "Hello!" }] }],
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(200);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(histogramObserve).toHaveBeenCalledWith(
+        expect.objectContaining({
+          labels: expect.objectContaining({
+            provider: "bedrock",
+            model: BEDROCK_MODEL,
+            agent_id: testAgent.id,
+            status_code: "200",
+          }),
+          value: expect.any(Number),
+        }),
+      );
+    });
+  });
 });
 
 describe("LLM Proxy Handler — recordBlockedToolSpans", () => {
+  // A proxy plugin whose ruling each test sets: a refusal ends the turn the
+  // way an OpenAPPA refusal does, null releases the calls untouched.
+  const mockToolCallRuling =
+    vi.fn<() => Promise<LlmProxyToolCallRefusal | null>>();
+  let unregisterRulingPlugin: () => void;
   let app: FastifyInstance;
   let testAgent: Agent;
-  let openAiStubOptions: { interruptAtChunk?: number };
-  let anthropicStubOptions: {
-    includeToolUse?: boolean;
-    interruptAtChunk?: number;
-  };
+  let openAiStubOptions: OpenAiStubOptions;
+  let anthropicStubOptions: AnthropicStubOptions;
+  let anthropicResponseHeaders: Headers | undefined;
 
-  beforeEach(async ({ makeAgent }) => {
+  beforeEach(async ({ makeAgent, makeMember, makeUser }) => {
     vi.clearAllMocks();
 
     app = Fastify().withTypeProvider<ZodTypeProvider>();
@@ -575,24 +1409,47 @@ describe("LLM Proxy Handler — recordBlockedToolSpans", () => {
 
     openAiStubOptions = {};
     anthropicStubOptions = {};
+    anthropicResponseHeaders = undefined;
 
     vi.spyOn(openaiAdapterFactory, "createClient").mockImplementation(
       () => createOpenAiTestClient(openAiStubOptions) as never,
     );
     vi.spyOn(anthropicAdapterFactory, "createClient").mockImplementation(
-      () => createAnthropicTestClient(anthropicStubOptions) as never,
+      (_apiKey, options) => {
+        if (anthropicResponseHeaders) {
+          options.onResponseHeaders?.(anthropicResponseHeaders);
+        }
+        return createAnthropicTestClient(anthropicStubOptions) as never;
+      },
     );
 
     testAgent = await makeAgent({ name: "Blocked Tools Agent" });
 
+    const owner = await makeUser();
+
+    await makeMember(owner.id, testAgent.organizationId);
+
+    platformCredential = await makePassthroughCredential({
+      organizationId: testAgent.organizationId,
+
+      ownerId: owner.id,
+    });
+
     metrics.llm.initializeMetrics([]);
 
-    // Default: policies allow everything
-    mockEvaluatePolicies.mockResolvedValue(null);
-    mockGetGlobalToolPolicy.mockResolvedValue("permissive");
+    // Default: the plugin allows everything
+    mockToolCallRuling.mockResolvedValue(null);
+    unregisterRulingPlugin = registerLlmProxyPlugin({
+      id: `test-ruling-${crypto.randomUUID()}`,
+      async onToolCalls() {
+        const refusal = await mockToolCallRuling();
+        return refusal ? { decision: "refuse", refusal } : undefined;
+      },
+    });
   });
 
   afterEach(async () => {
+    unregisterRulingPlugin();
     vi.restoreAllMocks();
     await app.close();
   });
@@ -614,15 +1471,20 @@ describe("LLM Proxy Handler — recordBlockedToolSpans", () => {
       });
     });
 
-    test("calls recordBlockedToolSpans when policy blocks tool calls", async () => {
-      const blockResult: PolicyBlockResult = {
-        refusalMessage: "Tool blocked by policy",
-        contentMessage: "Tool list_files was blocked",
-        reason: "Tool invocation blocked: policy is configured to always block",
-        blockedToolName: "list_files",
-        allToolCallNames: ["list_files"],
-      };
-      mockEvaluatePolicies.mockResolvedValue(blockResult);
+    // Same refusal condition as the Anthropic streaming case, on the other axis
+    // of the matrix: OpenAI forces `stop` through the same replaced-response
+    // path, so the turn reads as finished while a tool_call is on the wire.
+    test("a refusal leaves no tool call on the wire", async () => {
+      openAiStubOptions.includeToolCalls = true;
+
+      mockToolCallRuling.mockResolvedValue({
+        refusalMessage: "Tool get_weather is not enabled here",
+        contentMessage: "Tool get_weather is not enabled here",
+        reason: "Tool invocation blocked: disabled for conversation",
+        blockedToolName: "get_weather",
+        toolInput: {},
+        allToolCallNames: ["get_weather"],
+      } satisfies LlmProxyToolCallRefusal);
 
       const response = await app.inject({
         method: "POST",
@@ -630,6 +1492,163 @@ describe("LLM Proxy Handler — recordBlockedToolSpans", () => {
         headers: {
           "content-type": "application/json",
           authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "What's the weather?" }],
+          stream: true,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      // Nothing is released before the gate, so a refusal leaves no call on the
+      // wire and the turn is genuinely finished.
+      expect(response.body).not.toContain("call_test_weather");
+      expect(response.body).toContain("Tool get_weather is not enabled here");
+      expect(response.body).toContain('"finish_reason":"stop"');
+      expect(response.body).not.toContain('"finish_reason":"tool_calls"');
+    });
+
+    // An undeclared name is handed back rather than refused: refusing would
+    // drop the call and end the turn, which reads to an agent loop as "the
+    // assistant is finished" and strands an unattended run. Nothing executes
+    // either way, because the caller cannot run a tool it never declared.
+    // Per-conversation tool selection is enforced where the tool would
+    // actually run — chat's AI SDK raises NoSuchToolError for anything
+    // unregistered, and run_tool applies the conversation gate on the
+    // dispatch path.
+    test("a tool the caller never declared is handed back, not refused", async () => {
+      openAiStubOptions.includeToolCalls = true;
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/openai/${testAgent.id}/chat/completions`,
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "What's the weather?" }],
+          stream: true,
+          // The stub calls `get_weather`, which this request never declares.
+          tools: [{ type: "custom", custom: { name: "something_else" } }],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).not.toContain("are not enabled for this");
+      // The turn still ends on the tool call, so the loop keeps going and the
+      // caller is the one that rejects the name.
+      expect(response.body).toContain("get_weather");
+      expect(response.body).toContain('"finish_reason":"tool_calls"');
+    });
+
+    // The refusal sibling above only pins that a refused call is absent, which
+    // stays true if allowed calls are dropped too, so the release needs its own
+    // test: id, arguments and finish_reason all have to survive the wait, or a
+    // client can neither run the tool nor know one is owed.
+    test("an allowed tool call still reaches the client after the gate", async () => {
+      openAiStubOptions.includeToolCalls = true;
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/openai/${testAgent.id}/chat/completions`,
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "What's the weather?" }],
+          stream: true,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+
+      // Reassemble the way a client does: ids and argument fragments arrive as
+      // separate deltas keyed by index.
+      const deltas = response.body
+        .split("\n")
+        .filter((line) => line.startsWith("data: ") && !line.includes("[DONE]"))
+        .map((line) => JSON.parse(line.slice("data: ".length)));
+      const call = deltas.reduce<{ id?: string; name?: string; args: string }>(
+        (acc, chunk) => {
+          for (const tc of chunk.choices?.[0]?.delta?.tool_calls ?? []) {
+            if (tc.id) acc.id = tc.id;
+            if (tc.function?.name) acc.name = tc.function.name;
+            if (tc.function?.arguments) acc.args += tc.function.arguments;
+          }
+          return acc;
+        },
+        { args: "" },
+      );
+
+      expect(call).toEqual({
+        id: "call_test_weather",
+        name: "get_weather",
+        args: '{"location":"SF"}',
+      });
+      expect(response.body).toContain('"finish_reason":"tool_calls"');
+    });
+
+    // Buffered turns can still be edited when the refusal lands, and the whole
+    // message is replaced: the model's text and every tool call go with it.
+    test("a refusal replaces the entire buffered message", async () => {
+      mockToolCallRuling.mockResolvedValue({
+        refusalMessage: "Tool list_files is not enabled here",
+        contentMessage: "Tool list_files is not enabled here",
+        reason: "Tool invocation blocked: disabled for conversation",
+        blockedToolName: "list_files",
+        toolInput: {},
+        allToolCallNames: ["list_files"],
+      } satisfies LlmProxyToolCallRefusal);
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/openai/${testAgent.id}/chat/completions`,
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
+        },
+        payload: {
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "List the files" }],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const choice = response.json().choices[0];
+      expect(choice.message.content).toBe(
+        "Tool list_files is not enabled here",
+      );
+      expect(choice.message.tool_calls).toBeUndefined();
+      expect(choice.finish_reason).toBe("stop");
+    });
+
+    test("calls recordBlockedToolSpans when policy blocks tool calls", async () => {
+      const blockResult: LlmProxyToolCallRefusal = {
+        refusalMessage: "Tool blocked by policy",
+        contentMessage: "Tool list_files was blocked",
+        reason: "Tool invocation blocked: policy is configured to always block",
+        blockedToolName: "list_files",
+        toolInput: {},
+        allToolCallNames: ["list_files"],
+      };
+      mockToolCallRuling.mockResolvedValue(blockResult);
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/openai/${testAgent.id}/chat/completions`,
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
           "user-agent": "test-client",
         },
         payload: {
@@ -656,14 +1675,13 @@ describe("LLM Proxy Handler — recordBlockedToolSpans", () => {
     });
 
     test("does not call recordBlockedToolSpans when policy allows tool calls", async () => {
-      mockEvaluatePolicies.mockResolvedValue(null);
-
       const response = await app.inject({
         method: "POST",
         url: `/v1/openai/${testAgent.id}/chat/completions`,
         headers: {
           "content-type": "application/json",
           authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
           "user-agent": "test-client",
         },
         payload: {
@@ -678,14 +1696,15 @@ describe("LLM Proxy Handler — recordBlockedToolSpans", () => {
     });
 
     test("passes agentType to recordBlockedToolSpans", async () => {
-      const blockResult: PolicyBlockResult = {
+      const blockResult: LlmProxyToolCallRefusal = {
         refusalMessage: "Tool blocked",
         contentMessage: "Tool list_files was blocked",
         reason: "blocked by policy",
         blockedToolName: "list_files",
+        toolInput: {},
         allToolCallNames: ["list_files"],
       };
-      mockEvaluatePolicies.mockResolvedValue(blockResult);
+      mockToolCallRuling.mockResolvedValue(blockResult);
 
       const response = await app.inject({
         method: "POST",
@@ -693,6 +1712,7 @@ describe("LLM Proxy Handler — recordBlockedToolSpans", () => {
         headers: {
           "content-type": "application/json",
           authorization: "Bearer test-key",
+          "x-archestra-virtual-key": platformCredential,
           "user-agent": "test-client",
         },
         payload: {
@@ -727,17 +1747,22 @@ describe("LLM Proxy Handler — recordBlockedToolSpans", () => {
       });
     });
 
-    test("calls recordBlockedToolSpans when streaming response contains blocked tool calls", async () => {
-      anthropicStubOptions.includeToolUse = true;
+    // Driven through the real SDK accumulator, not a hand-rolled one: it pushes
+    // content blocks in arrival order while applying deltas by index, so a gap
+    // in the indices silently empties every block after it — invisible in the
+    // raw SSE.
+    test("the SDK reconstructs every block when a tool call is withheld", async () => {
+      anthropicStubOptions.toolUseBetweenText = true;
+      anthropicStubOptions.streamStopReason = "tool_use";
 
-      const blockResult: PolicyBlockResult = {
-        refusalMessage: "Tool blocked by policy",
-        contentMessage: "Tool get_weather was blocked",
-        reason: "Tool invocation blocked: always block",
+      mockToolCallRuling.mockResolvedValue({
+        refusalMessage: "Tool get_weather is not enabled here",
+        contentMessage: "Tool get_weather is not enabled here",
+        reason: "Tool invocation blocked: disabled for conversation",
         blockedToolName: "get_weather",
+        toolInput: {},
         allToolCallNames: ["get_weather"],
-      };
-      mockEvaluatePolicies.mockResolvedValue(blockResult);
+      } satisfies LlmProxyToolCallRefusal);
 
       const response = await app.inject({
         method: "POST",
@@ -745,6 +1770,439 @@ describe("LLM Proxy Handler — recordBlockedToolSpans", () => {
         headers: {
           "content-type": "application/json",
           "x-api-key": "test-key",
+          "x-archestra-virtual-key": platformCredential,
+          "anthropic-version": "2023-06-01",
+        },
+        payload: {
+          model: "claude-3-5-sonnet-20241022",
+          max_tokens: 1024,
+          messages: [{ role: "user", content: "What's the weather?" }],
+          stream: true,
+        },
+      });
+
+      const final = await reconstructWithSdk(response.body);
+
+      const texts = final.content.flatMap((block) =>
+        block.type === "text" ? [block.text] : [],
+      );
+
+      // The withheld call must not cost the client the blocks around it.
+      expect(texts).toEqual([
+        "Let me check.",
+        "Then I will summarise.",
+        "\n\nTool get_weather is not enabled here",
+      ]);
+      expect(final.content.some((block) => block.type === "tool_use")).toBe(
+        false,
+      );
+    });
+
+    // The streaming path decides the refusal inside a try and writes the
+    // interaction in the finally, so the marker has to survive that hop — a row
+    // that does not say it was refused is indistinguishable from a healthy one.
+    test("a streamed refusal marks the interaction row", async () => {
+      anthropicStubOptions.toolUseBetweenText = true;
+      anthropicStubOptions.streamStopReason = "tool_use";
+
+      mockToolCallRuling.mockResolvedValue({
+        refusalMessage: "Tool get_weather is not enabled here",
+        contentMessage: "Tool get_weather is not enabled here",
+        reason: "Tool invocation blocked: disabled for conversation",
+        blockedToolName: "get_weather",
+        toolInput: {},
+        allToolCallNames: ["get_weather"],
+      } satisfies LlmProxyToolCallRefusal);
+
+      await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${testAgent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "test-key",
+          "x-archestra-virtual-key": platformCredential,
+          "anthropic-version": "2023-06-01",
+        },
+        payload: {
+          model: "claude-3-5-sonnet-20241022",
+          max_tokens: 1024,
+          messages: [{ role: "user", content: "What's the weather?" }],
+          stream: true,
+        },
+      });
+
+      const [interaction] = await InteractionModel.getAllInteractionsForProfile(
+        testAgent.id,
+      );
+      expect(interaction.toolCallBlock).toEqual({
+        reason: "Tool invocation blocked: disabled for conversation",
+        blockedToolCallCount: 1,
+      });
+    });
+
+    // A refusal replaces the recorded turn with the refusal text alone, so the
+    // text the client already saw streaming is not in the record. Pinned as the
+    // existing behaviour: withholding tool calls does not change it either way.
+    // Both text blocks streamed live to the client before the gate refused the
+    // call between them, so the record has to carry them and then the refusal.
+    // Recording the refusal alone erased the model's own answer from history.
+    test("a streamed refusal keeps the text the client already received", async () => {
+      anthropicStubOptions.toolUseBetweenText = true;
+      anthropicStubOptions.streamStopReason = "tool_use";
+
+      mockToolCallRuling.mockResolvedValue({
+        refusalMessage: "Tool get_weather is not enabled here",
+        contentMessage: "Tool get_weather is not enabled here",
+        reason: "Tool invocation blocked: disabled for conversation",
+        blockedToolName: "get_weather",
+        toolInput: {},
+        allToolCallNames: ["get_weather"],
+      } satisfies LlmProxyToolCallRefusal);
+
+      await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${testAgent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "test-key",
+          "x-archestra-virtual-key": platformCredential,
+          "anthropic-version": "2023-06-01",
+        },
+        payload: {
+          model: "claude-3-5-sonnet-20241022",
+          max_tokens: 1024,
+          messages: [{ role: "user", content: "What's the weather?" }],
+          stream: true,
+        },
+      });
+
+      const [interaction] = await InteractionModel.getAllInteractionsForProfile(
+        testAgent.id,
+      );
+      const logged = interaction.response as {
+        content: { type: string; text?: string }[];
+      };
+      expect(logged.content.map((block) => block.text)).toEqual([
+        "Let me check.Then I will summarise.",
+        "\n\nTool get_weather is not enabled here",
+      ]);
+      // The blocked call was never delivered, so it stays out of the record.
+      expect(logged.content.some((block) => block.type === "tool_use")).toBe(
+        false,
+      );
+    });
+
+    // Holding tool calls until the gate decides moves them behind any text that
+    // streamed while they waited, so the client sees them in a different order
+    // than the model produced. Pinned because it is a real, deliberate cost of
+    // the design, not an accident to be silently changed back.
+    test("the SDK sees released tool calls after the text they were interleaved with", async () => {
+      anthropicStubOptions.toolUseBetweenText = true;
+      anthropicStubOptions.streamStopReason = "tool_use";
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${testAgent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "test-key",
+          "x-archestra-virtual-key": platformCredential,
+          "anthropic-version": "2023-06-01",
+        },
+        payload: {
+          model: "claude-3-5-sonnet-20241022",
+          max_tokens: 1024,
+          messages: [{ role: "user", content: "What's the weather?" }],
+          stream: true,
+        },
+      });
+
+      const final = await reconstructWithSdk(response.body);
+
+      // Upstream order was text, tool_use, text.
+      expect(final.content.map((block) => block.type)).toEqual([
+        "text",
+        "text",
+        "tool_use",
+      ]);
+    });
+
+    // A released call has to survive reassembly whole: the id the client answers
+    // with, and the arguments it runs. Those arrive as deltas keyed by index, so
+    // they are exactly what a disturbed index sequence corrupts.
+    test("the SDK reconstructs a released tool call's id and arguments intact", async () => {
+      anthropicStubOptions.toolUseBetweenText = true;
+      anthropicStubOptions.streamStopReason = "tool_use";
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${testAgent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "test-key",
+          "x-archestra-virtual-key": platformCredential,
+          "anthropic-version": "2023-06-01",
+        },
+        payload: {
+          model: "claude-3-5-sonnet-20241022",
+          max_tokens: 1024,
+          messages: [{ role: "user", content: "What's the weather?" }],
+          stream: true,
+        },
+      });
+
+      const final = await reconstructWithSdk(response.body);
+      const toolUse = final.content.find((block) => block.type === "tool_use");
+
+      expect(toolUse).toMatchObject({
+        id: "toolu_test_weather",
+        name: "get_weather",
+        input: { location: "SF" },
+      });
+      // The client owes a tool_result, and the turn has to say so.
+      expect(final.stop_reason).toBe("tool_use");
+    });
+
+    // Billed spend is derived by filtering on billing_mode, so the value the
+    // handler stamps on the interaction decides whether a call is charged.
+    // It is classified from the credential format alone.
+    test.for([
+      ["sk-ant-oat-token", "subscription", false],
+      ["sk-ant-oat-token", "subscription", true],
+      ["sk-ant-api-token", "metered", false],
+      ["sk-ant-api-token", "metered", true],
+    ] as const)("a %s credential persists and exports billing_mode %s (stream=%s)", async ([
+      key,
+      expected,
+      stream,
+    ]) => {
+      await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${testAgent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": key,
+          "x-archestra-virtual-key": platformCredential,
+          "anthropic-version": "2023-06-01",
+        },
+        payload: {
+          model: "claude-3-5-sonnet-20241022",
+          max_tokens: 1024,
+          stream,
+          messages: [{ role: "user", content: "Hello" }],
+        },
+      });
+
+      const interactions = await InteractionModel.getAllInteractionsForProfile(
+        testAgent.id,
+      );
+      expect(interactions).toHaveLength(1);
+      expect(interactions[0].billingMode).toBe(expected);
+      expect(counterInc).toHaveBeenCalledWith(
+        expect.objectContaining({
+          labels: expect.objectContaining({
+            billing_mode: expected,
+            auth_method: interactions[0].authMethod,
+          }),
+          value: expect.closeTo(Number(interactions[0].cost), 10),
+        }),
+      );
+    });
+
+    test("attributes a Claude subscription request and its usage to the run", async ({
+      makeUser,
+      makeMember,
+    }) => {
+      const owner = await makeUser();
+      await makeMember(owner.id, testAgent.organizationId);
+      const { value: passthroughToken, virtualKey } =
+        await VirtualApiKeyModel.create({
+          organizationId: testAgent.organizationId,
+          name: "claude-runtime-usage",
+          keyType: "passthrough",
+          scope: "personal",
+          authorId: owner.id,
+        });
+      const runId = crypto.randomUUID();
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${testAgent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer sk-ant-oat01-test-subscription",
+          "anthropic-version": "2023-06-01",
+          "anthropic-beta": "oauth-2025-04-20",
+          "x-archestra-virtual-key": passthroughToken,
+          "x-archestra-run-id": runId,
+          "x-archestra-session-id": runId,
+        },
+        payload: {
+          model: "claude-3-5-sonnet-20241022",
+          max_tokens: 64,
+          messages: [{ role: "user", content: "Hello" }],
+          stream: true,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const interactions = await InteractionModel.getAllInteractionsForProfile(
+        testAgent.id,
+      );
+      expect(interactions).toHaveLength(1);
+      expect(interactions[0]).toMatchObject({
+        userId: owner.id,
+        runId,
+        sessionId: runId,
+        passthroughVirtualKeyId: virtualKey.id,
+        billingMode: "subscription",
+        inputTokens: 12,
+        outputTokens: 10,
+      });
+    });
+
+    test("persists OAuth traffic fulfilled from usage credits as metered", async () => {
+      anthropicResponseHeaders = new Headers({
+        "anthropic-ratelimit-unified-status": "rejected",
+        "anthropic-ratelimit-unified-overage-status": "allowed",
+      });
+
+      await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${testAgent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "sk-ant-oat-token",
+          "x-archestra-virtual-key": platformCredential,
+          "anthropic-version": "2023-06-01",
+        },
+        payload: {
+          model: "claude-3-5-sonnet-20241022",
+          max_tokens: 1024,
+          messages: [{ role: "user", content: "Hello" }],
+        },
+      });
+
+      const interactions = await InteractionModel.getAllInteractionsForProfile(
+        testAgent.id,
+      );
+      expect(interactions).toHaveLength(1);
+      expect(interactions[0].billingMode).toBe("metered");
+    });
+
+    test("a refusal replaces the entire buffered message", async () => {
+      anthropicStubOptions.includeToolUseNonStreaming = true;
+
+      mockToolCallRuling.mockResolvedValue({
+        refusalMessage: "Tool get_weather is not enabled here",
+        contentMessage: "Tool get_weather is not enabled here",
+        reason: "Tool invocation blocked: disabled for conversation",
+        blockedToolName: "get_weather",
+        toolInput: {},
+        allToolCallNames: ["get_weather"],
+      } satisfies LlmProxyToolCallRefusal);
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${testAgent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "test-key",
+          "x-archestra-virtual-key": platformCredential,
+          "anthropic-version": "2023-06-01",
+        },
+        payload: {
+          model: "claude-3-5-sonnet-20241022",
+          max_tokens: 1024,
+          messages: [{ role: "user", content: "What's the weather?" }],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.content).toEqual([
+        {
+          type: "text",
+          text: "Tool get_weather is not enabled here",
+          citations: [],
+        },
+      ]);
+      expect(
+        body.content.some((b: { type: string }) => b.type === "tool_use"),
+      ).toBe(false);
+      expect(body.stop_reason).toBe("end_turn");
+    });
+
+    // No tool call is released before the gate decides, so a refusal cannot
+    // leave one stranded: there is nothing on the wire to owe a tool_result
+    // for, and the turn is genuinely finished.
+    test("a refusal leaves no tool call on the wire", async () => {
+      anthropicStubOptions.includeToolUse = true;
+      anthropicStubOptions.streamStopReason = "tool_use";
+
+      mockToolCallRuling.mockResolvedValue({
+        refusalMessage: "Tool get_weather is not enabled here",
+        contentMessage: "Tool get_weather is not enabled here",
+        reason: "Tool invocation blocked: disabled for conversation",
+        blockedToolName: "get_weather",
+        toolInput: {},
+        allToolCallNames: ["get_weather"],
+      } satisfies LlmProxyToolCallRefusal);
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${testAgent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "test-key",
+          "x-archestra-virtual-key": platformCredential,
+          "anthropic-version": "2023-06-01",
+        },
+        payload: {
+          model: "claude-3-5-sonnet-20241022",
+          max_tokens: 1024,
+          messages: [{ role: "user", content: "What's the weather?" }],
+          stream: true,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).not.toContain("toolu_test_weather");
+      expect(response.body).toContain("Tool get_weather is not enabled here");
+      expect(response.body).toContain('"stop_reason":"end_turn"');
+      expect(response.body).not.toContain('"stop_reason":"tool_use"');
+
+      const [interaction] = await InteractionModel.getAllInteractionsForProfile(
+        testAgent.id,
+      );
+      const logged = interaction.response as {
+        content: { type: string }[];
+        stop_reason: string;
+      };
+      expect(logged.stop_reason).toBe("end_turn");
+      expect(logged.content.some((b) => b.type === "tool_use")).toBe(false);
+    });
+
+    test("calls recordBlockedToolSpans when streaming response contains blocked tool calls", async () => {
+      anthropicStubOptions.includeToolUse = true;
+
+      const blockResult: LlmProxyToolCallRefusal = {
+        refusalMessage: "Tool blocked by policy",
+        contentMessage: "Tool get_weather was blocked",
+        reason: "Tool invocation blocked: always block",
+        blockedToolName: "get_weather",
+        toolInput: {},
+        allToolCallNames: ["get_weather"],
+      };
+      mockToolCallRuling.mockResolvedValue(blockResult);
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/anthropic/${testAgent.id}/v1/messages`,
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "test-key",
+          "x-archestra-virtual-key": platformCredential,
           "anthropic-version": "2023-06-01",
         },
         payload: {
@@ -775,7 +2233,6 @@ describe("LLM Proxy Handler — recordBlockedToolSpans", () => {
 
     test("does not call recordBlockedToolSpans when streaming has no tool calls", async () => {
       anthropicStubOptions.includeToolUse = false;
-      mockEvaluatePolicies.mockResolvedValue(null);
 
       const response = await app.inject({
         method: "POST",
@@ -783,6 +2240,7 @@ describe("LLM Proxy Handler — recordBlockedToolSpans", () => {
         headers: {
           "content-type": "application/json",
           "x-api-key": "test-key",
+          "x-archestra-virtual-key": platformCredential,
           "anthropic-version": "2023-06-01",
         },
         payload: {
@@ -802,7 +2260,6 @@ describe("LLM Proxy Handler — recordBlockedToolSpans", () => {
 
     test("does not call recordBlockedToolSpans when streaming tool calls are allowed", async () => {
       anthropicStubOptions.includeToolUse = true;
-      mockEvaluatePolicies.mockResolvedValue(null);
 
       const response = await app.inject({
         method: "POST",
@@ -810,6 +2267,7 @@ describe("LLM Proxy Handler — recordBlockedToolSpans", () => {
         headers: {
           "content-type": "application/json",
           "x-api-key": "test-key",
+          "x-archestra-virtual-key": platformCredential,
           "anthropic-version": "2023-06-01",
         },
         payload: {
@@ -834,13 +2292,26 @@ describe("LLM Proxy Handler — CHAT_API_KEY_ID_HEADER fallback", () => {
   let testAgent: Agent;
   const createClientSpy = vi.fn();
 
-  beforeEach(async ({ makeAgent }) => {
+  beforeEach(async ({ makeAgent, makeMember, makeUser }) => {
     vi.clearAllMocks();
     createClientSpy.mockReset();
 
     app = Fastify().withTypeProvider<ZodTypeProvider>();
     app.setValidatorCompiler(validatorCompiler);
     app.setSerializerCompiler(serializerCompiler);
+    app.setErrorHandler((error, _request, reply) => {
+      if (error instanceof ApiError) {
+        return reply
+          .status(error.statusCode)
+          .send({ error: { message: error.message, type: error.type } });
+      }
+      return reply.status(500).send({
+        error: {
+          message: error instanceof Error ? error.message : String(error),
+          type: "api_internal_server_error",
+        },
+      });
+    });
 
     vi.spyOn(openaiAdapterFactory, "createClient").mockImplementation(
       (apiKey, options) => {
@@ -848,11 +2319,25 @@ describe("LLM Proxy Handler — CHAT_API_KEY_ID_HEADER fallback", () => {
         return createOpenAiTestClient({}) as never;
       },
     );
+    // The cache-backed rate limiter isn't started under PGLite tests; stub it
+    // so the virtual-key validation path exercises auth, not cache I/O.
+    vi.spyOn(virtualKeyRateLimiter, "check").mockResolvedValue(undefined);
+    vi.spyOn(virtualKeyRateLimiter, "recordFailure").mockResolvedValue(
+      undefined,
+    );
 
     testAgent = await makeAgent({ name: "Test Extra Headers Agent" });
+
+    const owner = await makeUser();
+
+    await makeMember(owner.id, testAgent.organizationId);
+
+    platformCredential = await makePassthroughCredential({
+      organizationId: testAgent.organizationId,
+
+      ownerId: owner.id,
+    });
     metrics.llm.initializeMetrics([]);
-    mockEvaluatePolicies.mockResolvedValue(null);
-    mockGetGlobalToolPolicy.mockResolvedValue("permissive");
 
     await app.register(openAiProxyRoutes);
     await ModelModel.upsert({
@@ -892,8 +2377,10 @@ describe("LLM Proxy Handler — CHAT_API_KEY_ID_HEADER fallback", () => {
       url: `/v1/openai/${testAgent.id}/chat/completions`,
       remoteAddress: "127.0.0.1",
       headers: {
+        ...internalCallHeader(),
         "content-type": "application/json",
         authorization: "Bearer test-key",
+        "x-archestra-virtual-key": platformCredential,
         [CHAT_API_KEY_ID_HEADER]: apiKey.id,
       },
       payload: {
@@ -903,7 +2390,7 @@ describe("LLM Proxy Handler — CHAT_API_KEY_ID_HEADER fallback", () => {
       },
     });
 
-    expect(response.statusCode).toBe(200);
+    expect(response.statusCode, response.body).toBe(200);
     expect(createClientSpy).toHaveBeenCalledWith(
       expect.any(String),
       expect.objectContaining({
@@ -934,6 +2421,7 @@ describe("LLM Proxy Handler — CHAT_API_KEY_ID_HEADER fallback", () => {
       headers: {
         "content-type": "application/json",
         authorization: "Bearer test-key",
+        "x-archestra-virtual-key": platformCredential,
         [CHAT_API_KEY_ID_HEADER]: apiKey.id,
       },
       payload: {
@@ -943,9 +2431,490 @@ describe("LLM Proxy Handler — CHAT_API_KEY_ID_HEADER fallback", () => {
       },
     });
 
-    expect(response.statusCode).toBe(200);
+    expect(response.statusCode, response.body).toBe(200);
     expect(createClientSpy).toHaveBeenCalled();
     const [, options] = createClientSpy.mock.calls[0];
     expect(options.defaultHeaders).toBeUndefined();
+  });
+
+  test("rejects a non-loopback chat completion that carries only a provider key", async () => {
+    const response = await sendWithProviderKeyOnly();
+
+    expect(response.statusCode, response.body).toBe(401);
+    expect(response.json().error.message).toContain("Authentication required");
+    expect(createClientSpy).not.toHaveBeenCalled();
+  });
+
+  test("forwards a non-loopback chat completion with only a provider key once the organization allows unauthenticated requests", async () => {
+    await OrganizationModel.patch(testAgent.organizationId, {
+      allowUnauthenticatedLlmProxyRequests: true,
+    });
+
+    const response = await sendWithProviderKeyOnly();
+
+    expect(response.statusCode, response.body).toBe(200);
+    expect(createClientSpy).toHaveBeenCalledWith("test-key", expect.anything());
+  });
+
+  /** An external client's chat completion with no platform credential. */
+  function sendWithProviderKeyOnly() {
+    return app.inject({
+      method: "POST",
+      url: `/v1/openai/${testAgent.id}/chat/completions`,
+      remoteAddress: "203.0.113.5",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-key",
+      },
+      payload: {
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello!" }],
+        stream: false,
+      },
+    });
+  }
+
+  test("loopback request with keyless Azure provider key ignores extracted auth and uses inference URL", async ({
+    makeOrganization,
+  }) => {
+    vi.spyOn(azureAdapterFactory, "createClient").mockImplementation(
+      (apiKey, options) => {
+        createClientSpy(apiKey, options);
+        return {
+          apiKey,
+          baseUrl: options.baseUrl,
+          openai: createOpenAiTestClient({}),
+        } as never;
+      },
+    );
+
+    await app.register(azureProxyRoutes);
+
+    await ModelModel.upsert({
+      externalId: "azure/gpt-4o",
+      provider: "azure",
+      modelId: "gpt-4o",
+      inputModalities: null,
+      outputModalities: null,
+      customPricePerMillionInput: "2.50",
+      customPricePerMillionOutput: "10.00",
+      lastSyncedAt: new Date(),
+    });
+
+    const org = await makeOrganization();
+    const apiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      secretId: null,
+      name: "Keyless Azure split endpoint",
+      provider: "azure",
+      scope: "org",
+      userId: null,
+      teamId: null,
+      baseUrl: "https://discovery.example.com/openai",
+      inferenceBaseUrl: "https://runtime.example.com/openai/v1",
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/azure/${testAgent.id}/chat/completions`,
+      remoteAddress: "127.0.0.1",
+      headers: {
+        ...internalCallHeader(),
+        "content-type": "application/json",
+        authorization: "Bearer synthetic-internal-key",
+        [CHAT_API_KEY_ID_HEADER]: apiKey.id,
+      },
+      payload: {
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello!" }],
+        stream: false,
+      },
+    });
+
+    expect(response.statusCode, response.body).toBe(200);
+    expect(createClientSpy).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({
+        baseUrl: "https://runtime.example.com/openai/v1",
+      }),
+    );
+  });
+
+  test("loopback chat forward of a non-local arch_ secret forwards it to the provider base URL", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const apiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      secretId: null,
+      name: "Downstream Archestra proxy key",
+      provider: "openai",
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+    const foreignVirtualKey = `arch_${"f".repeat(64)}`;
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/openai/${testAgent.id}/chat/completions`,
+      remoteAddress: "127.0.0.1",
+      headers: {
+        ...internalCallHeader(),
+        "content-type": "application/json",
+        authorization: `Bearer ${foreignVirtualKey}`,
+        [CHAT_API_KEY_ID_HEADER]: apiKey.id,
+        [PROVIDER_BASE_URL_HEADER]: "https://downstream.example.com/v1/openai",
+      },
+      payload: {
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello!" }],
+        stream: false,
+      },
+    });
+
+    expect(response.statusCode, response.body).toBe(200);
+    expect(createClientSpy).toHaveBeenCalledWith(
+      foreignVirtualKey,
+      expect.objectContaining({
+        baseUrl: "https://downstream.example.com/v1/openai",
+      }),
+    );
+  });
+
+  test("non-loopback request with a non-local arch_ secret is still rejected with 401", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const apiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      secretId: null,
+      name: "Downstream Archestra proxy key",
+      provider: "openai",
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/openai/${testAgent.id}/chat/completions`,
+      remoteAddress: "203.0.113.5",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer arch_${"f".repeat(64)}`,
+        [CHAT_API_KEY_ID_HEADER]: apiKey.id,
+        [PROVIDER_BASE_URL_HEADER]: "https://downstream.example.com/v1/openai",
+      },
+      payload: {
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello!" }],
+        stream: false,
+      },
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(createClientSpy).not.toHaveBeenCalled();
+  });
+
+  test("loopback chat forward of a non-local arch_ secret WITHOUT a provider base URL is still rejected with 401", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const apiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      secretId: null,
+      name: "Downstream Archestra proxy key",
+      provider: "openai",
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/openai/${testAgent.id}/chat/completions`,
+      remoteAddress: "127.0.0.1",
+      headers: {
+        ...internalCallHeader(),
+        "content-type": "application/json",
+        authorization: `Bearer arch_${"f".repeat(64)}`,
+        [CHAT_API_KEY_ID_HEADER]: apiKey.id,
+      },
+      payload: {
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello!" }],
+        stream: false,
+      },
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(createClientSpy).not.toHaveBeenCalled();
+  });
+
+  test("loopback chat forward of a VALID local virtual key still resolves it locally", async ({
+    makeSecret,
+  }) => {
+    const secret = await makeSecret({ secret: { apiKey: "sk-resolved-real" } });
+    // Same organization as the proxy agent: a key from another organization
+    // is rejected by the proxy's organization guard.
+    const providerKey = await LlmProviderApiKeyModel.create({
+      organizationId: testAgent.organizationId,
+      secretId: secret.id,
+      name: "Local OpenAI key behind a virtual key",
+      provider: "openai",
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+    const { value: localVirtualKey } = await VirtualApiKeyModel.create({
+      organizationId: testAgent.organizationId,
+      name: "local-vk",
+      providerApiKeys: [
+        { provider: "openai", providerApiKeyId: providerKey.id },
+      ],
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/openai/${testAgent.id}/chat/completions`,
+      remoteAddress: "127.0.0.1",
+      headers: {
+        ...internalCallHeader(),
+        "content-type": "application/json",
+        authorization: `Bearer ${localVirtualKey}`,
+        [CHAT_API_KEY_ID_HEADER]: providerKey.id,
+      },
+      payload: {
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello!" }],
+        stream: false,
+      },
+    });
+
+    expect(response.statusCode, response.body).toBe(200);
+    // Resolved to the real provider secret, NOT forwarded as the arch_ token.
+    expect(createClientSpy).toHaveBeenCalledWith(
+      "sk-resolved-real",
+      expect.any(Object),
+    );
+  });
+});
+
+describe("LLM Proxy Handler — per-user provider connect required", () => {
+  let app: FastifyInstance;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+
+    app = Fastify().withTypeProvider<ZodTypeProvider>();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    app.setErrorHandler((error, _request, reply) => {
+      if (error instanceof ApiError) {
+        return reply
+          .status(error.statusCode)
+          .send({ error: { message: error.message, type: error.type } });
+      }
+      return reply.status(500).send({
+        error: {
+          message: error instanceof Error ? error.message : String(error),
+          type: "api_internal_server_error",
+        },
+      });
+    });
+
+    vi.spyOn(virtualKeyRateLimiter, "check").mockResolvedValue(undefined);
+    vi.spyOn(virtualKeyRateLimiter, "recordFailure").mockResolvedValue(
+      undefined,
+    );
+    metrics.llm.initializeMetrics([]);
+
+    await app.register(githubCopilotProxyRoutes);
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await app.close();
+  });
+
+  test("returns an actionable provider_auth_required 401 when the acting user's Copilot credential is missing", async ({
+    makeOrganization,
+    makeUser,
+    makeAgent,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const agent = await makeAgent({
+      name: "Copilot Proxy Agent",
+      organizationId: org.id,
+    });
+
+    // Personal Copilot key whose secret is gone (revoked / orphaned): the
+    // virtual key authenticates but resolves no usable upstream token.
+    const copilotKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      secretId: null,
+      name: "Copilot (orphaned secret)",
+      provider: "github-copilot",
+      scope: "personal",
+      userId: user.id,
+      teamId: null,
+    });
+
+    const { value: virtualKey } = await VirtualApiKeyModel.create({
+      organizationId: org.id,
+      name: "my-copilot-vk",
+      scope: "personal",
+      authorId: user.id,
+      providerApiKeys: [
+        { provider: "github-copilot", providerApiKeyId: copilotKey.id },
+      ],
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/github-copilot/${agent.id}/chat/completions`,
+      remoteAddress: "203.0.113.5",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${virtualKey}`,
+      },
+      payload: {
+        model: "gpt-4",
+        messages: [{ role: "user", content: "Hello!" }],
+        stream: false,
+      },
+    });
+
+    expect(response.statusCode, response.body).toBe(401);
+    const body = response.json();
+    expect(body.error.type).toBe("api_authentication_error");
+    expect(body.error.internal_code).toBe("provider_auth_required");
+    expect(body.error.message).toContain("GitHub Copilot");
+    expect(body.error.message).toContain("/settings");
+  });
+});
+
+describe("LLM Proxy Handler — team-restricted models", () => {
+  let app: FastifyInstance;
+  let testAgent: Agent;
+
+  beforeEach(async ({ makeAgent, makeMember, makeUser }) => {
+    vi.clearAllMocks();
+
+    app = Fastify().withTypeProvider<ZodTypeProvider>();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+
+    vi.spyOn(openaiAdapterFactory, "createClient").mockImplementation(
+      () => createOpenAiTestClient({}) as never,
+    );
+    vi.spyOn(virtualKeyRateLimiter, "check").mockResolvedValue(undefined);
+    vi.spyOn(virtualKeyRateLimiter, "recordFailure").mockResolvedValue(
+      undefined,
+    );
+
+    testAgent = await makeAgent({ name: "Test Restricted Models Agent" });
+
+    const owner = await makeUser();
+
+    await makeMember(owner.id, testAgent.organizationId);
+
+    platformCredential = await makePassthroughCredential({
+      organizationId: testAgent.organizationId,
+
+      ownerId: owner.id,
+    });
+    metrics.llm.initializeMetrics([]);
+
+    await app.register(openAiProxyRoutes);
+    await ModelModel.upsert({
+      externalId: "openai/gpt-4o",
+      provider: "openai",
+      modelId: "gpt-4o",
+      inputModalities: null,
+      outputModalities: null,
+      customPricePerMillionInput: "2.50",
+      customPricePerMillionOutput: "10.00",
+      lastSyncedAt: new Date(),
+    });
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await app.close();
+  });
+
+  async function injectChatCompletionAs(passthroughToken: string) {
+    return await app.inject({
+      method: "POST",
+      url: `/v1/openai/${testAgent.id}/chat/completions`,
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-key",
+        "x-archestra-virtual-key": passthroughToken,
+      },
+      payload: {
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello!" }],
+        stream: false,
+      },
+    });
+  }
+
+  test("blocks a restricted model for users outside its teams and allows team members", async ({
+    makeUser,
+    makeMember,
+    makeTeam,
+    makeTeamMember,
+  }) => {
+    const model = await ModelModel.findByProviderAndModelId("openai", "gpt-4o");
+    if (!model) throw new Error("expected gpt-4o model row");
+
+    const insider = await makeUser();
+    await makeMember(insider.id, testAgent.organizationId);
+    const outsider = await makeUser();
+    await makeMember(outsider.id, testAgent.organizationId);
+
+    const devTeam = await makeTeam(testAgent.organizationId, insider.id);
+    await makeTeamMember(devTeam.id, insider.id);
+    const key = {
+      organizationId: testAgent.organizationId,
+      resource: "llmModel" as const,
+      scope: model.id,
+    };
+    const policy = await ResourcePermissionPolicyModel.find(key);
+    await ResourcePermissionPolicyModel.replace({
+      ...key,
+      revision: policy?.revision ?? 0,
+      grants: [
+        { subject: { type: "team", id: devTeam.id }, actions: ["read", "use"] },
+      ],
+    });
+
+    const { value: outsiderToken } = await VirtualApiKeyModel.create({
+      organizationId: testAgent.organizationId,
+      name: "outsider-pt",
+      keyType: "passthrough",
+      scope: "personal",
+      authorId: outsider.id,
+    });
+    const blocked = await injectChatCompletionAs(outsiderToken);
+    expect(blocked.statusCode).toBe(403);
+    expect(blocked.json().error).toMatchObject({
+      type: "api_authorization_error",
+      internal_code: "model_restricted_to_teams",
+    });
+
+    const { value: insiderToken } = await VirtualApiKeyModel.create({
+      organizationId: testAgent.organizationId,
+      name: "insider-pt",
+      keyType: "passthrough",
+      scope: "personal",
+      authorId: insider.id,
+    });
+    const allowed = await injectChatCompletionAs(insiderToken);
+    expect(allowed.statusCode).toBe(200);
   });
 });

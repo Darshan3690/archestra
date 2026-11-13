@@ -1,0 +1,314 @@
+import { isPermissionActionGranted } from "@archestra/shared";
+import { userHasPermission } from "@/auth";
+import type { RequestLookups } from "@/auth/request-lookups";
+import {
+  PluginModel,
+  PluginSkillUsageEventModel,
+  PluginTeamModel,
+} from "@/models";
+import { ResourcePermissions } from "@/services/resource-permissions";
+import {
+  deriveSkillFileKind,
+  parseSkillManifest,
+  SKILL_MANIFEST_FILENAME,
+  SkillParseError,
+} from "@/skills/parser";
+import type {
+  PluginSkillCatalogItem,
+  PluginSkillDetail,
+  PluginSkillListItem,
+} from "@/types";
+
+/**
+ * Read-only projection of the SKILL.md trees embedded in plugins. Skills are
+ * portable by design — a SKILL.md written for one coding client reads the
+ * same in another — so a plugin shipped for a different client or platform
+ * can still lend its skills. The projection derives everything from the
+ * approved plugin bytes; nothing is stored, and plugin grants decide who
+ * sees what. Usage summaries aggregate every recorded activation of the
+ * listed skills, so they are opt-in (`includeUsage`): only the Skills page
+ * shows them, and activation and count paths issue no usage query.
+ */
+export async function listPluginSkills(
+  params: PluginSkillListParams & { includeUsage: true },
+): Promise<PluginSkillListItem[]>;
+export async function listPluginSkills(
+  params: PluginSkillListParams & { includeUsage?: false },
+): Promise<PluginSkillCatalogItem[]>;
+export async function listPluginSkills(
+  params: PluginSkillListParams & { includeUsage?: boolean },
+): Promise<PluginSkillCatalogItem[] | PluginSkillListItem[]> {
+  const accessiblePluginIds = await resolvePluginAccess(params);
+  const candidates = await PluginModel.findSkillManifestCandidates({
+    organizationId: params.organizationId,
+    accessiblePluginIds,
+  });
+  const items: PluginSkillCatalogItem[] = [];
+  for (const { plugin, manifests, filePaths } of candidates) {
+    const roots = manifests.map((manifest) => skillRootOf(manifest.path));
+    for (const manifest of manifests) {
+      if (manifest.encoding !== "utf8") continue;
+      const parsed = tryParse(manifest.content);
+      if (!parsed) continue;
+      const root = skillRootOf(manifest.path);
+      items.push({
+        source: "plugin",
+        pluginId: plugin.id,
+        pluginName: plugin.displayName,
+        pluginSlug: plugin.pluginSlug,
+        sourceRepo: plugin.sourceRepo,
+        sourceMarketplaceRepo: plugin.sourceMarketplaceRepo,
+        pluginEnabled: plugin.enabled,
+        scope: plugin.scope,
+        clientType: plugin.clientType,
+        supportedPlatforms: plugin.supportedPlatforms,
+        skillPath: root,
+        name: parsed.name,
+        description: parsed.description,
+        compatibility: parsed.compatibility,
+        fileCount: resourcePathsOf(filePaths, manifest.path, root, roots)
+          .length,
+      });
+    }
+  }
+  if (!params.includeUsage) return items;
+  const usage = await PluginSkillUsageEventModel.getSummaries(
+    items.map(({ pluginId, skillPath }) => ({ pluginId, skillPath })),
+  );
+  return items.map((item) => ({
+    ...item,
+    usageCount: usage.get(item.pluginId)?.get(item.skillPath)?.usageCount ?? 0,
+    usageUserCount:
+      usage.get(item.pluginId)?.get(item.skillPath)?.usageUserCount ?? 0,
+    lastUsedAt:
+      usage.get(item.pluginId)?.get(item.skillPath)?.lastUsedAt ?? null,
+  }));
+}
+
+export async function getPluginSkill(params: {
+  pluginId: string;
+  skillPath: string;
+  organizationId: string;
+  userId?: string;
+  lookups?: RequestLookups;
+}): Promise<PluginSkillDetail | null> {
+  const accessiblePluginIds = await resolvePluginAccess(params);
+  if (
+    accessiblePluginIds !== undefined &&
+    !accessiblePluginIds.includes(params.pluginId)
+  ) {
+    return null;
+  }
+  const plugin = await PluginModel.findById({
+    id: params.pluginId,
+    organizationId: params.organizationId,
+  });
+  if (!plugin) return null;
+
+  const manifestPath =
+    params.skillPath === ""
+      ? SKILL_MANIFEST_FILENAME
+      : `${params.skillPath}/${SKILL_MANIFEST_FILENAME}`;
+  const manifest = plugin.files.find((file) => file.path === manifestPath);
+  if (!manifest || manifest.encoding !== "utf8") return null;
+  const parsed = tryParse(manifest.content);
+  if (!parsed) return null;
+
+  const root = params.skillPath;
+  const roots = plugin.files
+    .filter(
+      (file) =>
+        file.path === SKILL_MANIFEST_FILENAME ||
+        file.path.endsWith(`/${SKILL_MANIFEST_FILENAME}`),
+    )
+    .map((file) => skillRootOf(file.path));
+  const filePaths = plugin.files.map((file) => file.path);
+  const resources = resourcePathsOf(filePaths, manifestPath, root, roots);
+  const filesByPath = new Map(plugin.files.map((file) => [file.path, file]));
+
+  const usage = await PluginSkillUsageEventModel.getSummaries([
+    { pluginId: plugin.id, skillPath: root },
+  ]);
+  const summary = usage.get(plugin.id)?.get(root);
+  return {
+    source: "plugin",
+    pluginId: plugin.id,
+    pluginName: plugin.displayName,
+    pluginSlug: plugin.pluginSlug,
+    sourceRepo: plugin.sourceRepo,
+    sourceMarketplaceRepo: plugin.sourceMarketplaceRepo,
+    pluginEnabled: plugin.enabled,
+    scope: plugin.scope,
+    clientType: plugin.clientType,
+    supportedPlatforms: plugin.supportedPlatforms,
+    skillPath: root,
+    name: parsed.name,
+    description: parsed.description,
+    compatibility: parsed.compatibility,
+    fileCount: resources.length,
+    usageCount: summary?.usageCount ?? 0,
+    usageUserCount: summary?.usageUserCount ?? 0,
+    lastUsedAt: summary?.lastUsedAt ?? null,
+    manifest: manifest.content,
+    content: parsed.content,
+    allowedTools: parsed.allowedTools,
+    files: resources.flatMap((path) => {
+      const file = filesByPath.get(path);
+      if (!file) return [];
+      const relativePath = root === "" ? path : path.slice(root.length + 1);
+      return [
+        {
+          path: relativePath,
+          content: file.content,
+          encoding: file.encoding,
+          kind: deriveSkillFileKind(relativePath),
+        },
+      ];
+    }),
+  };
+}
+
+// ===== Internal helpers =====
+
+type PluginSkillListParams = {
+  organizationId: string;
+  userId?: string;
+  lookups?: RequestLookups;
+};
+
+/** undefined = plugin admin (all plugins); otherwise the visible id set. */
+async function resolvePluginAccess(params: {
+  organizationId: string;
+  userId?: string;
+  lookups?: RequestLookups;
+}): Promise<string[] | undefined> {
+  if (!params.userId) {
+    return PluginTeamModel.getUserAccessiblePluginIds({
+      organizationId: params.organizationId,
+    });
+  }
+  const canRead = params.lookups
+    ? isPermissionActionGranted({
+        resource: "plugin",
+        grantedActions:
+          (
+            await params.lookups.permissions({
+              userId: params.userId,
+              organizationId: params.organizationId,
+            })
+          ).plugin ?? [],
+        requiredAction: "read",
+      })
+    : await userHasPermission(
+        params.userId,
+        params.organizationId,
+        "plugin",
+        "read",
+      );
+  if (!canRead) return [];
+  const isAdmin = await ResourcePermissions.allows({
+    userId: params.userId,
+    organizationId: params.organizationId,
+    resource: "plugin",
+    scope: "*",
+    action: "update",
+    lookups: params.lookups,
+  });
+  return isAdmin
+    ? undefined
+    : PluginTeamModel.getUserAccessiblePluginIds({
+        organizationId: params.organizationId,
+        userId: params.userId,
+        lookups: params.lookups,
+      });
+}
+
+function tryParse(content: string) {
+  try {
+    return parseSkillManifest(content);
+  } catch (error) {
+    if (error instanceof SkillParseError) return null;
+    throw error;
+  }
+}
+
+function skillRootOf(manifestPath: string): string {
+  const index = manifestPath.lastIndexOf("/");
+  return index === -1 ? "" : manifestPath.slice(0, index);
+}
+
+const PLUGIN_METADATA_DIRECTORY_NAMES = new Set([
+  ".claude-plugin",
+  ".codex-plugin",
+  ".cursor-plugin",
+  ".plugin",
+]);
+
+const PLUGIN_METADATA_DIRECTORY_PATHS = [".agents/plugins", ".github/plugin"];
+
+const INSTALLATION_DIRECTORY_NAMES = new Set([
+  "bootstrap",
+  "install",
+  "installation",
+  "installer",
+  "setup",
+  "uninstall",
+]);
+
+/** Keep Skill-owned resources and explicitly adoptable plugin context. */
+function resourcePathsOf(
+  filePaths: string[],
+  manifestPath: string,
+  root: string,
+  allRoots: string[],
+): string[] {
+  const deeperRoots = allRoots.filter(
+    (candidate) =>
+      candidate !== root && (root === "" || candidate.startsWith(`${root}/`)),
+  );
+  return filePaths.filter((path) => {
+    if (path === manifestPath) return false;
+    if (root !== "" && !path.startsWith(`${root}/`)) return false;
+    if (
+      deeperRoots.some(
+        (deeper) => deeper !== "" && path.startsWith(`${deeper}/`),
+      )
+    ) {
+      return false;
+    }
+    const relativePath = root === "" ? path : path.slice(root.length + 1);
+    return !isPluginOnlyArtifact(relativePath);
+  });
+}
+
+function isPluginOnlyArtifact(relativePath: string): boolean {
+  const lowerPath = relativePath.toLowerCase();
+  const segments = lowerPath.split("/");
+  const filename = segments.at(-1) ?? "";
+  if (segments.includes("hooks") || /^hooks?\.json$/.test(filename)) {
+    return true;
+  }
+  if (
+    segments.some((segment) => PLUGIN_METADATA_DIRECTORY_NAMES.has(segment)) ||
+    PLUGIN_METADATA_DIRECTORY_PATHS.some(
+      (path) =>
+        lowerPath === path ||
+        lowerPath.startsWith(`${path}/`) ||
+        lowerPath.includes(`/${path}/`),
+    ) ||
+    (segments.length === 1 && /^(?:plugin|marketplace)\.json$/.test(filename))
+  ) {
+    return true;
+  }
+  if (segments.some((segment) => INSTALLATION_DIRECTORY_NAMES.has(segment))) {
+    return true;
+  }
+  if (
+    /^(?:(?:pre|post)?install(?:er|ation)?|bootstrap(?:per)?|setup|uninstall)(?:[._-].+)?$/.test(
+      filename,
+    )
+  ) {
+    return !/\.(?:md|txt)$/i.test(filename);
+  }
+  return false;
+}

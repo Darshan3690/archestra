@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import db, { schema, type Transaction } from "@/database";
 import logger from "@/logging";
 import type { InsertSession, UpdateSession } from "@/types";
@@ -61,6 +61,32 @@ class SessionModel {
   }
 
   /**
+   * Find sessions from a requested set that belong to one user. The caller owns
+   * authorization; this model keeps the ownership fence in the query itself.
+   */
+  static async findByIdsForUser(params: { ids: string[]; userId: string }) {
+    const { ids, userId } = params;
+    logger.debug(
+      { userId, count: ids.length },
+      "SessionModel.findByIdsForUser: fetching sessions",
+    );
+    const sessions = await db
+      .select({ id: schema.sessionsTable.id })
+      .from(schema.sessionsTable)
+      .where(
+        and(
+          eq(schema.sessionsTable.userId, userId),
+          inArray(schema.sessionsTable.id, ids),
+        ),
+      );
+    logger.debug(
+      { userId, count: sessions.length },
+      "SessionModel.findByIdsForUser: completed",
+    );
+    return sessions;
+  }
+
+  /**
    * Create a new session
    */
   static async create(data: InsertSession) {
@@ -105,19 +131,82 @@ class SessionModel {
     return result;
   }
 
+  /** Delete requested sessions only when they belong to the given user. */
+  static async deleteByIdsForUser(params: { ids: string[]; userId: string }) {
+    const { ids, userId } = params;
+    logger.debug(
+      { userId, count: ids.length },
+      "SessionModel.deleteByIdsForUser: deleting sessions",
+    );
+    const deleted = await db
+      .delete(schema.sessionsTable)
+      .where(
+        and(
+          eq(schema.sessionsTable.userId, userId),
+          inArray(schema.sessionsTable.id, ids),
+        ),
+      )
+      .returning({ id: schema.sessionsTable.id });
+    logger.debug(
+      { userId, count: deleted.length },
+      "SessionModel.deleteByIdsForUser: completed",
+    );
+    return deleted;
+  }
+
   /**
    * Delete all sessions for a user
    */
-  static async deleteAllByUserId(userId: string) {
+  static async deleteAllByUserId(userId: string, tx?: Transaction) {
     logger.debug(
       { userId },
       "SessionModel.deleteAllByUserId: deleting sessions",
     );
-    const result = await db
+    const dbOrTx = tx ?? db;
+    const result = await dbOrTx
       .delete(schema.sessionsTable)
       .where(eq(schema.sessionsTable.userId, userId));
     logger.debug({ userId }, "SessionModel.deleteAllByUserId: completed");
     return result;
+  }
+
+  /**
+   * Revoke every session belonging to a member of the organization whose
+   * account has NOT enrolled in two-factor authentication. Used when an org
+   * turns require-2FA on: those members must sign in again and land in
+   * mandatory enrollment. Matching is by org MEMBERSHIP (not the session's
+   * activeOrganizationId, which can be null before the create-hook stamps
+   * it). Returns the number of revoked sessions.
+   */
+  static async deleteAllForOrganizationMembersWithoutTwoFactor(
+    organizationId: string,
+  ): Promise<number> {
+    const memberUserIdsWithoutTwoFactor = db
+      .select({ userId: schema.membersTable.userId })
+      .from(schema.membersTable)
+      .innerJoin(
+        schema.usersTable,
+        eq(schema.membersTable.userId, schema.usersTable.id),
+      )
+      .where(
+        and(
+          eq(schema.membersTable.organizationId, organizationId),
+          // The column is nullable with default false — null means not enrolled.
+          ne(sql`COALESCE(${schema.usersTable.twoFactorEnabled}, false)`, true),
+        ),
+      );
+
+    const deleted = await db
+      .delete(schema.sessionsTable)
+      .where(
+        inArray(schema.sessionsTable.userId, memberUserIdsWithoutTwoFactor),
+      )
+      .returning({ id: schema.sessionsTable.id });
+    logger.info(
+      { organizationId, revoked: deleted.length },
+      "SessionModel: revoked sessions of members without two-factor",
+    );
+    return deleted.length;
   }
 }
 

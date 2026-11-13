@@ -11,7 +11,7 @@ describe("ConversationEnabledToolModel", () => {
   }) => {
     const user = await makeUser();
     const org = await makeOrganization();
-    const agent = await makeAgent({ name: "Test Agent", teams: [] });
+    const agent = await makeAgent({ name: "Test Agent" });
 
     // Seed and assign Archestra tools to the agent
     await seedAndAssignArchestraTools(agent.id);
@@ -21,7 +21,6 @@ describe("ConversationEnabledToolModel", () => {
       organizationId: org.id,
       agentId: agent.id,
       title: "Test Conversation",
-      selectedModel: "claude-3-haiku-20240307",
     });
 
     const enabledTools = await ConversationEnabledToolModel.findByConversation(
@@ -47,7 +46,7 @@ describe("ConversationEnabledToolModel", () => {
   }) => {
     const user = await makeUser();
     const org = await makeOrganization();
-    const agent = await makeAgent({ name: "Test Agent", teams: [] });
+    const agent = await makeAgent({ name: "Test Agent" });
     const tool1 = await makeTool({ name: "tool1" });
     const tool2 = await makeTool({ name: "tool2" });
 
@@ -56,7 +55,6 @@ describe("ConversationEnabledToolModel", () => {
       organizationId: org.id,
       agentId: agent.id,
       title: "Test Conversation",
-      selectedModel: "claude-3-haiku-20240307",
     });
 
     await ConversationEnabledToolModel.setEnabledTools(conversation.id, [
@@ -81,7 +79,7 @@ describe("ConversationEnabledToolModel", () => {
   }) => {
     const user = await makeUser();
     const org = await makeOrganization();
-    const agent = await makeAgent({ name: "Test Agent", teams: [] });
+    const agent = await makeAgent({ name: "Test Agent" });
     const tool = await makeTool({ name: "tool1" });
 
     const conversation = await ConversationModel.create({
@@ -89,7 +87,6 @@ describe("ConversationEnabledToolModel", () => {
       organizationId: org.id,
       agentId: agent.id,
       title: "Test Conversation",
-      selectedModel: "claude-3-haiku-20240307",
     });
 
     await ConversationEnabledToolModel.setEnabledTools(conversation.id, [
@@ -111,7 +108,7 @@ describe("ConversationEnabledToolModel", () => {
   }) => {
     const user = await makeUser();
     const org = await makeOrganization();
-    const agent = await makeAgent({ name: "Test Agent", teams: [] });
+    const agent = await makeAgent({ name: "Test Agent" });
     const tool1 = await makeTool({ name: "tool1" });
     const tool2 = await makeTool({ name: "tool2" });
     const tool3 = await makeTool({ name: "tool3" });
@@ -121,7 +118,6 @@ describe("ConversationEnabledToolModel", () => {
       organizationId: org.id,
       agentId: agent.id,
       title: "Test Conversation",
-      selectedModel: "claude-3-haiku-20240307",
     });
 
     // First set
@@ -154,7 +150,7 @@ describe("ConversationEnabledToolModel", () => {
   }) => {
     const user = await makeUser();
     const org = await makeOrganization();
-    const agent = await makeAgent({ name: "Test Agent", teams: [] });
+    const agent = await makeAgent({ name: "Test Agent" });
     const tool = await makeTool({ name: "tool1" });
 
     const conversation = await ConversationModel.create({
@@ -162,7 +158,6 @@ describe("ConversationEnabledToolModel", () => {
       organizationId: org.id,
       agentId: agent.id,
       title: "Test Conversation",
-      selectedModel: "claude-3-haiku-20240307",
     });
 
     await ConversationEnabledToolModel.setEnabledTools(conversation.id, [
@@ -198,7 +193,7 @@ describe("ConversationEnabledToolModel", () => {
   }) => {
     const user = await makeUser();
     const org = await makeOrganization();
-    const agent = await makeAgent({ name: "Test Agent", teams: [] });
+    const agent = await makeAgent({ name: "Test Agent" });
     const tool = await makeTool({ name: "tool1" });
 
     const conversation = await ConversationModel.create({
@@ -206,7 +201,6 @@ describe("ConversationEnabledToolModel", () => {
       organizationId: org.id,
       agentId: agent.id,
       title: "Test Conversation",
-      selectedModel: "claude-3-haiku-20240307",
     });
 
     await ConversationEnabledToolModel.setEnabledTools(conversation.id, [
@@ -231,7 +225,7 @@ describe("ConversationEnabledToolModel", () => {
   }) => {
     const user = await makeUser();
     const org = await makeOrganization();
-    const agent = await makeAgent({ name: "Test Agent", teams: [] });
+    const agent = await makeAgent({ name: "Test Agent" });
     const tool1 = await makeTool({ name: "tool1" });
     const tool2 = await makeTool({ name: "tool2" });
 
@@ -240,7 +234,6 @@ describe("ConversationEnabledToolModel", () => {
       organizationId: org.id,
       agentId: agent.id,
       title: "Conversation 1",
-      selectedModel: "claude-3-haiku-20240307",
     });
 
     const conversation2 = await ConversationModel.create({
@@ -248,7 +241,6 @@ describe("ConversationEnabledToolModel", () => {
       organizationId: org.id,
       agentId: agent.id,
       title: "Conversation 2",
-      selectedModel: "claude-3-haiku-20240307",
     });
 
     // Set different tools for each conversation
@@ -278,7 +270,7 @@ describe("ConversationEnabledToolModel", () => {
   }) => {
     const user = await makeUser();
     const org = await makeOrganization();
-    const agent = await makeAgent({ name: "Test Agent", teams: [] });
+    const agent = await makeAgent({ name: "Test Agent" });
 
     // Seed and assign Archestra tools to the agent
     await seedAndAssignArchestraTools(agent.id);
@@ -288,7 +280,6 @@ describe("ConversationEnabledToolModel", () => {
       organizationId: org.id,
       agentId: agent.id,
       title: "Conversation 1",
-      selectedModel: "claude-3-haiku-20240307",
     });
 
     const conversation2 = await ConversationModel.create({
@@ -296,7 +287,6 @@ describe("ConversationEnabledToolModel", () => {
       organizationId: org.id,
       agentId: agent.id,
       title: "Conversation 2",
-      selectedModel: "claude-3-haiku-20240307",
     });
 
     const toolsMap = await ConversationEnabledToolModel.findByConversations([
@@ -324,7 +314,7 @@ describe("ConversationEnabledToolModel", () => {
   }) => {
     const user = await makeUser();
     const org = await makeOrganization();
-    const agent = await makeAgent({ name: "Test Agent", teams: [] });
+    const agent = await makeAgent({ name: "Test Agent" });
     const tool1 = await makeTool({ name: "tool1" });
     const tool2 = await makeTool({ name: "tool2" });
 
@@ -336,7 +326,6 @@ describe("ConversationEnabledToolModel", () => {
       organizationId: org.id,
       agentId: agent.id,
       title: "Conversation 1",
-      selectedModel: "claude-3-haiku-20240307",
     });
 
     const conversation2 = await ConversationModel.create({
@@ -344,7 +333,6 @@ describe("ConversationEnabledToolModel", () => {
       organizationId: org.id,
       agentId: agent.id,
       title: "Conversation 2",
-      selectedModel: "claude-3-haiku-20240307",
     });
 
     // Set tools for conversation 1 only

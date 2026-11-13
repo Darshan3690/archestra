@@ -1,50 +1,149 @@
-import { SupportedProvidersSchema } from "@shared";
+import { SupportedProvidersSchema, THINKING_EFFORTS } from "@archestra/shared";
 import {
   createInsertSchema,
   createSelectSchema,
   createUpdateSchema,
 } from "drizzle-zod";
 import { z } from "zod";
-import { schema } from "@/database";
+import { schema } from "@/database/schema";
+import { ToolExposureModeSchema } from "./agent";
 import { SelectConversationChatErrorSchema } from "./conversation-chat-error";
-import { ConversationShareVisibilitySchema } from "./conversation-share";
+import { SelectConversationCompactionSchema } from "./conversation-compaction";
 
+/**
+ * Who a chat is shared with, derived from its permission policy: the broadest
+ * audience holding read besides the owner. Null means the owner alone.
+ */
 const ConversationShareSummarySchema = z
   .object({
-    id: z.string().uuid(),
-    visibility: ConversationShareVisibilitySchema,
+    visibility: z.enum(["organization", "team", "user"]),
   })
   .nullable();
+
+/**
+ * How a conversation was started: a person, a scheduled trigger run, or
+ * opening an app from the apps page. `app_open` chats are drafts — hidden from
+ * the conversations list until the user writes a message (see
+ * `ConversationModel.findAll`).
+ */
+export const ConversationOriginSchema = z.enum([
+  "user",
+  "schedule_trigger",
+  "app_open",
+]);
+export type ConversationOrigin = z.infer<typeof ConversationOriginSchema>;
+
+/**
+ * Versioned escrow record stored on encrypted chats (enterprise
+ * break-glass recovery — see content-encryption/encrypted-chat-escrow.ts).
+ * Union of the two escrow sinks:
+ * The conversation key wrapped to the operator's RSA escrow public key, stored
+ * inline on the row. Safe there: without the offline private half the blob is
+ * useless, so the database holds ciphertext under two different keys and can
+ * open neither.
+ *
+ * Null only on a row written before escrow became mandatory.
+ */
+export const EncryptedChatEscrowBlobSchema = z.object({
+  v: z.literal(1),
+  alg: z.literal("RSA-OAEP-256"),
+  escrowKeyFingerprint: z.string(),
+  wrappedDek: z.string(),
+});
+export type EncryptedChatEscrowBlob = z.infer<
+  typeof EncryptedChatEscrowBlobSchema
+>;
+
+/**
+ * Per-conversation content key for encrypted chats: the browser-held
+ * DEK presented on the current request plus the conversation it belongs to
+ * (the AAD binds ciphertext to the conversation). Threaded explicitly through
+ * every message read/write — never stored, never global.
+ */
+export type ConversationContentKey = {
+  dek: Buffer;
+  conversationId: string;
+};
+
+/**
+ * How hard the model should reason before answering. Null is the model's own
+ * default — no depth chosen, so the request carries no reasoning field.
+ */
+export const ThinkingEffortSchema = z.enum(THINKING_EFFORTS);
+const ThinkingEffortSettingSchema = ThinkingEffortSchema.nullable();
 
 // Override selectedProvider to use the proper enum type
 // For select schema, it's nullable (matches DB schema)
 const selectExtendedFields = {
   selectedProvider: SupportedProvidersSchema.nullable(),
+  origin: ConversationOriginSchema,
+  thinkingEffort: ThinkingEffortSettingSchema,
 };
 
 // For insert/update schema, selectedProvider is optional
 const insertUpdateExtendedFields = {
   selectedProvider: SupportedProvidersSchema.optional(),
+  origin: ConversationOriginSchema.optional(),
+  // Nullable as well as optional: null is the caller choosing the model's own
+  // default, which is a different instruction from omitting the field.
+  thinkingEffort: ThinkingEffortSettingSchema.optional(),
 };
 
 export const SelectConversationSchema = createSelectSchema(
   schema.conversationsTable,
-).extend({
-  // Agent is nullable when the associated profile has been deleted
-  agent: z
-    .object({
-      id: z.string(),
-      name: z.string(),
-      systemPrompt: z.string().nullable(),
-      agentType: z.enum(["profile", "mcp_gateway", "llm_proxy", "agent"]),
-      llmApiKeyId: z.string().nullable(),
-    })
-    .nullable(),
-  share: ConversationShareSummarySchema,
-  messages: z.array(z.any()), // UIMessage[] from AI SDK
-  chatErrors: z.array(SelectConversationChatErrorSchema),
-  ...selectExtendedFields,
-});
+)
+  // lastReadAt is the owner's private read marker; it must never reach a
+  // shared/project viewer. Keep it out of the response shape entirely — the
+  // client only needs the derived `unread` flag — so it is stripped from every
+  // response, while the model still reads the raw column to compute `unread`.
+  // The encrypted-chat escrow blob and key fingerprint are server-side bookkeeping
+  // (break-glass recovery / wrong-key rejection) — clients only need the flag.
+  .omit({
+    lastReadAt: true,
+    encryptedChatDekFingerprint: true,
+    encryptedChatEscrow: true,
+  })
+  .extend({
+    /**
+     * Encrypted chats only: true when the response omits message
+     * content because no (valid) conversation key accompanied the request —
+     * the client renders the key-lost tombstone instead of a thread.
+     */
+    contentLocked: z.boolean().optional(),
+    // Agent is nullable when the associated profile has been deleted
+    agent: z
+      .object({
+        id: z.string(),
+        name: z.string(),
+        /**
+         * Only populated on detail reads (findById); list rows omit it so a
+         * roster of large custom prompts doesn't ride along on every sidebar
+         * refresh.
+         */
+        systemPrompt: z.string().nullable().optional(),
+        agentType: z.enum(["profile", "mcp_gateway", "llm_proxy", "agent"]),
+        toolExposureMode: ToolExposureModeSchema,
+        llmApiKeyId: z.string().nullable(),
+      })
+      .nullable(),
+    share: ConversationShareSummarySchema,
+    /** Project name when the chat belongs to one; populated by list queries only. */
+    projectName: z.string().nullable().optional(),
+    /** Project icon (emoji or data URL) for the chat's project; list queries only. */
+    projectIcon: z.string().nullable().optional(),
+    /** Has a message landed since the owner last read it; populated by list queries only. */
+    unread: z.boolean().optional(),
+    messages: z.array(z.any()), // UIMessage[] from AI SDK
+    /**
+     * Set only on a tail read: how many earlier messages were left out.
+     */
+    olderMessageCount: z.number().int().nonnegative().optional(),
+    chatErrors: z.array(SelectConversationChatErrorSchema),
+    compactions: z.array(SelectConversationCompactionSchema),
+    /** Prompt size of the latest turn (or a later compaction); single-chat reads only. */
+    contextTokensUsed: z.number().int().nullable().optional(),
+    ...selectExtendedFields,
+  });
 
 export const InsertConversationSchema = createInsertSchema(
   schema.conversationsTable,
@@ -67,12 +166,15 @@ export const UpdateConversationSchema = createUpdateSchema(
 )
   .pick({
     title: true,
-    selectedModel: true,
-    selectedProvider: true,
+    modelId: true,
     chatApiKeyId: true,
+    modelPoolId: true,
+    autoRouterId: true,
     agentId: true,
     artifact: true,
+    projectId: true,
     pinnedAt: true,
+    thinkingEffort: true,
   })
   .extend({
     // Override pinnedAt to accept ISO date strings from the frontend.

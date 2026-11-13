@@ -17,22 +17,23 @@ export const ChatCompletionUsageSchema = z
   })
   .describe(`https://docs.z.ai/api-reference/llm/chat-completion#response`);
 
-export const FinishReasonSchema = z.enum([
-  "stop",
-  "length",
-  "tool_calls",
-  "sensitive",
-  "network_error",
-]);
+// Persist/read-back must tolerate nonconforming finish_reasons (same as OpenAI).
+export const FinishReasonSchema = z
+  .enum(["stop", "length", "tool_calls", "sensitive", "network_error"])
+  .or(z.string());
 
 const ChoiceSchema = z
   .object({
     finish_reason: FinishReasonSchema,
-    index: z.number(),
-    logprobs: z.any().nullable(),
+    // Some OpenAI-compatible upstreams omit `index` on choices; without
+    // optional() the response fails serialization (500).
+    index: z.number().optional(),
+    // Log probabilities may be omitted when the upstream did not request them.
+    logprobs: z.any().nullable().optional(),
     message: z
       .object({
-        content: z.string().nullable(),
+        // Tool-call-only replies often omit `content` entirely.
+        content: z.string().nullable().optional(),
         role: z.enum(["assistant"]),
         reasoning_content: z.string().optional(),
         tool_calls: z.array(ToolCallSchema).optional(),

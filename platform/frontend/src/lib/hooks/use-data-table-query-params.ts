@@ -3,33 +3,54 @@
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useCallback } from "react";
 import { DEFAULT_TABLE_LIMIT } from "@/consts";
-
-type QueryParamUpdates = Record<string, string | null | undefined>;
+import type {
+  QueryParamsAdapter,
+  QueryParamUpdates,
+} from "@/lib/hooks/use-query-params-adapter";
 
 /**
  * Use URL-backed table state for server-paginated or shareable table views.
  * Simple client-only filtering can stay in local component state when deep
  * linking is not valuable.
  */
-export function useDataTableQueryParams(params?: { defaultPageSize?: number }) {
+export function useDataTableQueryParams(params?: {
+  defaultPageSize?: number;
+  queryParamsAdapter?: QueryParamsAdapter;
+}) {
   const searchParams = useSearchParams();
   const router = useRouter();
   const pathname = usePathname();
+  const activeSearchParams =
+    params?.queryParamsAdapter?.searchParams ?? searchParams;
 
   const defaultPageSize = params?.defaultPageSize ?? DEFAULT_TABLE_LIMIT;
   const pageIndex = Math.max(
     0,
-    Number.parseInt(searchParams.get("page") || "1", 10) - 1,
+    Number.parseInt(activeSearchParams.get("page") || "1", 10) - 1,
   );
   const pageSize = Math.max(
     1,
-    Number.parseInt(searchParams.get("pageSize") || `${defaultPageSize}`, 10),
+    Number.parseInt(
+      activeSearchParams.get("pageSize") || `${defaultPageSize}`,
+      10,
+    ),
   );
   const offset = pageIndex * pageSize;
 
   const updateQueryParams = useCallback(
     (updates: QueryParamUpdates) => {
+      if (params?.queryParamsAdapter) {
+        params.queryParamsAdapter.updateQueryParams(updates);
+        return;
+      }
+
       const nextParams = new URLSearchParams(searchParams.toString());
+      // A keyset cursor belongs to the listing it was issued for, so any
+      // other change starts that listing over from the newest page.
+      if (!("cursor" in updates) && nextParams.has("cursor")) {
+        nextParams.delete("cursor");
+        nextParams.delete("page");
+      }
       for (const [key, value] of Object.entries(updates)) {
         if (value === null || value === undefined || value === "") {
           nextParams.delete(key);
@@ -43,7 +64,7 @@ export function useDataTableQueryParams(params?: { defaultPageSize?: number }) {
         { scroll: false },
       );
     },
-    [pathname, router, searchParams],
+    [pathname, router, searchParams, params?.queryParamsAdapter],
   );
 
   const setPagination = useCallback(
@@ -57,7 +78,7 @@ export function useDataTableQueryParams(params?: { defaultPageSize?: number }) {
   );
 
   return {
-    searchParams,
+    searchParams: activeSearchParams,
     pathname,
     pageIndex,
     pageSize,

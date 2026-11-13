@@ -1,7 +1,6 @@
-import { ApiError } from "@shared";
-import { vi } from "vitest";
+import { ApiError } from "@archestra/shared";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { ModelModel } from "@/models";
-import { afterEach, describe, expect, test } from "@/test";
 import {
   buildRoutableModelId,
   parseProviderQualifiedModel,
@@ -45,6 +44,8 @@ describe("model-router-resolver", () => {
         provider: "anthropic",
         modelId: "claude-haiku-resolver-test",
         requestedModel: "anthropic:claude-haiku-resolver-test",
+        // Single-surface provider: nothing for the router to choose between.
+        supportedEndpoints: null,
       });
     });
 
@@ -64,7 +65,7 @@ describe("model-router-resolver", () => {
       });
     });
 
-    test("rejects a provider not mapped to the Model Router virtual key", async () => {
+    test("rejects a provider not mapped to the Unified Model API virtual key", async () => {
       await createTextModel({
         provider: "anthropic",
         modelId: "claude-unmapped-resolver-test",
@@ -78,12 +79,30 @@ describe("model-router-resolver", () => {
         {
           statusCode: 400,
           message:
-            'Model "anthropic:claude-unmapped-resolver-test" is scoped to provider "anthropic", but the Model Router virtual key is not mapped to that provider.',
+            'Model "anthropic:claude-unmapped-resolver-test" is scoped to provider "anthropic", but the Unified Model API virtual key is not mapped to that provider.',
         },
       );
     });
 
-    test("returns 404 for unqualified, unknown, and non-text models", async () => {
+    test("resolves an unqualified model when the key maps one provider", async () => {
+      await createTextModel({
+        provider: "openai",
+        modelId: "known-resolver-test",
+      });
+
+      await expect(
+        resolveModelRoute({
+          requestedModel: "known-resolver-test",
+          allowedProviders: new Set(["openai"]),
+        }),
+      ).resolves.toMatchObject({
+        provider: "openai",
+        modelId: "known-resolver-test",
+        requestedModel: "known-resolver-test",
+      });
+    });
+
+    test("returns 404 for ambiguous unqualified, unknown, and non-text models", async () => {
       await createTextModel({
         provider: "openai",
         modelId: "known-resolver-test",
@@ -105,6 +124,56 @@ describe("model-router-resolver", () => {
           message: `Model "${requestedModel}" is not available. Use a provider-qualified model id such as "anthropic:claude-opus-4-6-20250918".`,
         });
       }
+    });
+
+    test("does not infer a provider when a key maps multiple providers", async () => {
+      await createTextModel({
+        provider: "openai",
+        modelId: "shared-resolver-test",
+      });
+      await createTextModel({
+        provider: "gemini",
+        modelId: "shared-resolver-test",
+      });
+
+      await expectApiError(
+        resolveModelRoute({
+          requestedModel: "shared-resolver-test",
+          allowedProviders: new Set(["openai", "gemini"]),
+        }),
+        {
+          statusCode: 404,
+          message:
+            'Model "shared-resolver-test" is not available. Use a provider-qualified model id such as "anthropic:claude-opus-4-6-20250918".',
+        },
+      );
+    });
+
+    test("resolves embedding models only when embedding capability is requested", async () => {
+      await createEmbeddingModel({
+        provider: "openai",
+        modelId: "text-embedding-resolver-test",
+      });
+
+      await expect(
+        resolveModelRoute({
+          requestedModel: "openai:text-embedding-resolver-test",
+          capability: "embeddings",
+        }),
+      ).resolves.toMatchObject({
+        provider: "openai",
+        modelId: "text-embedding-resolver-test",
+      });
+      await expectApiError(
+        resolveModelRoute({
+          requestedModel: "openai:text-embedding-resolver-test",
+        }),
+        {
+          statusCode: 404,
+          message:
+            'Model "openai:text-embedding-resolver-test" is not available. Use a provider-qualified model id such as "anthropic:claude-opus-4-6-20250918".',
+        },
+      );
     });
 
     test("returns 500 when a provider-qualified model resolves ambiguously", async () => {
@@ -192,6 +261,23 @@ async function createTextModel(params: {
     ...params,
     inputModalities: ["text"],
     outputModalities: ["text"],
+  });
+}
+
+async function createEmbeddingModel(params: {
+  provider: "openai";
+  modelId: string;
+}) {
+  return await ModelModel.create({
+    externalId: `${params.provider}/${params.modelId}`,
+    provider: params.provider,
+    modelId: params.modelId,
+    inputModalities: ["text"],
+    outputModalities: ["text"],
+    embeddingDimensions: 1536,
+    promptPricePerToken: "0.000001",
+    completionPricePerToken: "0.000000",
+    lastSyncedAt: new Date(),
   });
 }
 

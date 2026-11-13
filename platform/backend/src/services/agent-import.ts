@@ -5,6 +5,7 @@ import logger from "@/logging";
 import {
   AgentModel,
   AgentToolModel,
+  AgentVersionModel,
   KnowledgeBaseConnectorModel,
   KnowledgeBaseModel,
 } from "@/models";
@@ -70,11 +71,12 @@ export async function importAgentFromPayload(
   const labels = data.labels.map((l) => ({ key: l.key, value: l.value }));
 
   // 5. Resolve knowledge bases (by name)
-  const knowledgeBaseIds = await resolveKnowledgeBases(
-    data.knowledgeBases,
+  const knowledgeBaseIds = await resolveKnowledgeBases({
+    kbRefs: data.knowledgeBases,
     organizationId,
+    userId,
     warnings,
-  );
+  });
 
   // 6. Resolve connectors (by name + type + user visibility)
   const knowledgeSourceAccess =
@@ -89,7 +91,12 @@ export async function importAgentFromPayload(
     warnings,
   );
 
-  // 7. Create the agent
+  // 7. Create the agent. An All-tools agent is created in Custom mode first
+  // and flipped in step 8b: the flip's exclusion pre-fill must see the
+  // payload's tool assignments (step 8) so an assigned built-in is not
+  // pre-excluded, and creating Custom-first keeps the agent fail-closed
+  // (assigned-tools-only) if import aborts before the flip.
+  const enableAllToolsAfterImport = data.agent.accessAllTools === true;
   const agent = await AgentModel.create(
     {
       name: agentName,
@@ -98,10 +105,12 @@ export async function importAgentFromPayload(
       systemPrompt: data.agent.systemPrompt,
       icon: data.agent.icon,
       scope: "personal", // Always personal on import
-      considerContextUntrusted: data.agent.considerContextUntrusted,
-      toolAssignmentMode: data.agent.toolAssignmentMode,
       toolExposureMode: data.agent.toolExposureMode,
-      llmModel: data.agent.llmModel,
+      missingCredentialBehavior:
+        data.agent.missingCredentialBehavior ?? "allow",
+      accessAllTools: enableAllToolsAfterImport
+        ? false
+        : data.agent.accessAllTools,
       llmApiKeyId: null,
       identityProviderId: null,
       incomingEmailEnabled: data.agent.incomingEmailEnabled,
@@ -116,10 +125,23 @@ export async function importAgentFromPayload(
       suggestedPrompts: data.suggestedPrompts,
     },
     userId,
+    // The payload's tools (step 8) are the imported agent's authoritative
+    // assignment set; don't let create's default assignment force built-ins the
+    // payload lacked onto the imported agent.
+    { skipCreationDefaultTools: true },
   );
 
   // 8. Resolve and assign tools (after agent creation)
   await resolveAndAssignTools(data.tools, agent.id, warnings);
+
+  // 8b. Flip an All-tools agent on now that its assignments exist. The switch
+  // pre-fills the exclusion list (unassigned built-ins get pre-excluded,
+  // assigned ones stay reachable) and commits the flip + pre-fill in one
+  // transaction. Exclusions are not part of the export format, so the pre-fill
+  // is the imported agent's entire starting set.
+  if (enableAllToolsAfterImport) {
+    await AgentModel.update(agent.id, { accessAllTools: true });
+  }
 
   // 9. Resolve and assign delegations (after agent creation)
   await resolveAndAssignDelegations(
@@ -152,18 +174,12 @@ async function resolveAgentName(
   requestedName: string,
   organizationId: string,
 ): Promise<string> {
-  const existing = await db
-    .select({ id: schema.agentsTable.id })
-    .from(schema.agentsTable)
-    .where(
-      and(
-        eq(schema.agentsTable.name, requestedName),
-        eq(schema.agentsTable.organizationId, organizationId),
-      ),
-    )
-    .limit(1);
+  const existing = await AgentModel.activeNameExistsInOrganization({
+    name: requestedName,
+    organizationId,
+  });
 
-  if (existing.length === 0) {
+  if (!existing) {
     return requestedName;
   }
 
@@ -171,18 +187,12 @@ async function resolveAgentName(
   let candidate = `${requestedName} (imported)`;
 
   for (let counter = 2; counter <= 100; counter++) {
-    const dup = await db
-      .select({ id: schema.agentsTable.id })
-      .from(schema.agentsTable)
-      .where(
-        and(
-          eq(schema.agentsTable.name, candidate),
-          eq(schema.agentsTable.organizationId, organizationId),
-        ),
-      )
-      .limit(1);
+    const dup = await AgentModel.activeNameExistsInOrganization({
+      name: candidate,
+      organizationId,
+    });
 
-    if (dup.length === 0) {
+    if (!dup) {
       return candidate;
     }
 
@@ -240,6 +250,9 @@ async function resolveAndAssignTools(
         agentId,
         toolId: tool.id,
         credentialResolutionMode: ref.credentialResolutionMode,
+        // An import is one action; it forks once after the whole tool set
+        // lands rather than once per tool.
+        deferVersionFork: true,
       });
 
       if (result && result !== "duplicate" && result !== "updated") {
@@ -261,6 +274,8 @@ async function resolveAndAssignTools(
       });
     }
   }
+
+  await AgentVersionModel.forkIfChangedBestEffort(agentId);
 }
 
 /**
@@ -300,6 +315,7 @@ async function findToolByReference(ref: {
       and(
         eq(schema.toolsTable.name, ref.toolName),
         isNull(schema.toolsTable.delegateToAgentId),
+        isNull(schema.toolsTable.delegateToA2aConnectionId),
       ),
     )
     .limit(1);
@@ -321,19 +337,13 @@ async function resolveAndAssignDelegations(
   if (delegationRefs.length === 0) return;
 
   for (const ref of delegationRefs) {
-    const [targetAgent] = await db
-      .select({ id: schema.agentsTable.id })
-      .from(schema.agentsTable)
-      .where(
-        and(
-          eq(schema.agentsTable.name, ref.targetAgentName),
-          eq(schema.agentsTable.organizationId, organizationId),
-          eq(schema.agentsTable.agentType, "agent"),
-        ),
-      )
-      .limit(1);
+    const targetAgentId = await AgentModel.findActiveIdByNameInOrganization({
+      name: ref.targetAgentName,
+      organizationId,
+      agentType: "agent",
+    });
 
-    if (!targetAgent) {
+    if (!targetAgentId) {
       warnings.push({
         type: "delegation",
         name: ref.targetAgentName,
@@ -345,7 +355,7 @@ async function resolveAndAssignDelegations(
     // Enforce delegation visibility for non-admin users by using the same
     // team-filtered agent lookup pattern used in other routes.
     const accessibleTarget = await AgentModel.findById(
-      targetAgent.id,
+      targetAgentId,
       userId,
       false,
     );
@@ -359,7 +369,10 @@ async function resolveAndAssignDelegations(
     }
 
     try {
-      await AgentToolModel.assignDelegation(agentId, targetAgent.id);
+      await AgentToolModel.assignDelegation({
+        agentId: agentId,
+        targetAgentId: targetAgentId,
+      });
     } catch (error) {
       logger.warn(
         { agentId, targetAgentName: ref.targetAgentName, error: String(error) },
@@ -373,19 +386,33 @@ async function resolveAndAssignDelegations(
  * Resolve knowledge bases by name in the organization.
  * Returns the IDs of found KBs and adds warnings for missing ones.
  */
-async function resolveKnowledgeBases(
-  kbRefs: AgentExportPayload["knowledgeBases"],
-  organizationId: string,
-  warnings: ImportWarning[],
-): Promise<string[]> {
+async function resolveKnowledgeBases({
+  kbRefs,
+  organizationId,
+  userId,
+  warnings,
+}: {
+  kbRefs: AgentExportPayload["knowledgeBases"];
+  organizationId: string;
+  userId: string;
+  warnings: ImportWarning[];
+}): Promise<string[]> {
   if (kbRefs.length === 0) return [];
 
   const resolvedIds: string[] = [];
+  const access =
+    await knowledgeSourceAccessControlService.buildAccessControlContext({
+      userId,
+      organizationId,
+    });
 
   for (const ref of kbRefs) {
     const kb = await KnowledgeBaseModel.findByName(ref.name, organizationId);
 
-    if (!kb) {
+    if (
+      !kb ||
+      !knowledgeSourceAccessControlService.canAccessKnowledgeBase(access, kb)
+    ) {
       warnings.push({
         type: "knowledgeBase",
         name: ref.name,

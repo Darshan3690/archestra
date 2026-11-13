@@ -1,0 +1,325 @@
+import { E2eTestId } from "@archestra/shared";
+import { WIREMOCK_BASE_URL } from "../consts";
+import {
+  ensureWireMockAnthropicChatProvider,
+  expectChatReady,
+  goToChat,
+  selectApiKeyById,
+  selectRuntimeModelFromDialog,
+} from "../utils";
+import { expect, test } from "./api-fixtures";
+
+test.describe.configure({ retries: 2 });
+
+const MOCK_RESPONSE = "This is a mocked response for the chat UI e2e test.";
+const COMPACT_ROUTE = "**/api/chat/conversations/*/compact";
+const ONE_PIXEL_PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+test.describe("Chat message queue", () => {
+  test.setTimeout(120_000);
+
+  for (const queueTiming of ["before", "during"] as const) {
+    test(`interrupts once and delivers messages queued ${queueTiming} the stop request in order`, async ({
+      page,
+      request,
+      makeApiRequest,
+      syncModels,
+    }) => {
+      await expectWireMockReady();
+
+      const { apiKeyId, runtimeModel } =
+        await ensureWireMockAnthropicChatProvider({
+          request,
+          makeApiRequest,
+          syncModels,
+        });
+
+      await goToChat(page);
+      await expectChatReady(page);
+      await selectApiKeyById(page, apiKeyId);
+
+      const modelSelectorTrigger = page
+        .getByTestId(E2eTestId.ChatModelSelectorTrigger)
+        .or(page.getByRole("button", { name: /select model/i }))
+        .first();
+      await modelSelectorTrigger.click();
+      await selectRuntimeModelFromDialog(page, runtimeModel);
+
+      const textarea = page.getByTestId(E2eTestId.ChatPromptTextarea);
+      const sentTexts: string[] = [];
+      let stopRequests = 0;
+      page.on("request", (request) => {
+        if (request.method() !== "POST") return;
+        if (new URL(request.url()).pathname.endsWith("/stop")) stopRequests++;
+        if (new URL(request.url()).pathname === "/api/chat") {
+          const messages = request.postDataJSON().messages;
+          const latestUserMessage = messages.findLast(
+            (message: { role: string }) => message.role === "user",
+          );
+          sentTexts.push(latestUserMessage.parts[0].text);
+        }
+      });
+      await textarea.fill("Start a slow response chat-queue-e2e-test");
+      await page.keyboard.press("Enter");
+      await expect(
+        page.getByText(/Reconnect stream part one/).first(),
+      ).toBeVisible({ timeout: 30_000 });
+
+      let releaseStop: (() => void) | undefined;
+      if (queueTiming === "during") {
+        const pendingStop = new Promise<void>((resolve) => {
+          releaseStop = resolve;
+        });
+        await page.route("**/api/chat/conversations/*/stop", async (route) => {
+          await pendingStop;
+          await route.continue();
+        });
+        const stopRequested = page.waitForRequest(
+          "**/api/chat/conversations/*/stop",
+        );
+        await textarea.press("Escape");
+        await stopRequested;
+      }
+
+      const queuedText = `change direction ${Math.random().toString(36).slice(2, 10)}`;
+      await textarea.fill(queuedText);
+      await page.keyboard.press("Enter");
+
+      const queuedItem = page
+        .getByTestId(E2eTestId.ChatMessageQueueItem)
+        .filter({ hasText: queuedText });
+      await expect(queuedItem).toBeVisible();
+
+      const secondQueuedText = "Then summarize the revised plan";
+      await textarea.fill(secondQueuedText);
+      await textarea.press("Enter");
+      await expect(
+        page.getByTestId(E2eTestId.ChatMessageQueueItem),
+      ).toHaveCount(2);
+
+      await textarea.evaluate((element) => {
+        for (const _attempt of [1, 2, 3]) {
+          element.dispatchEvent(
+            new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+          );
+        }
+      });
+      releaseStop?.();
+
+      await expect(queuedItem).toHaveCount(0, { timeout: 30_000 });
+      expect(stopRequests).toBe(1);
+      await expect(
+        page.getByText(/part three part four part five/),
+      ).toHaveCount(0);
+      await expect(page.getByText(queuedText).first()).toBeVisible({
+        timeout: 30_000,
+      });
+      await expect(
+        page.getByText(/part three part four part five/),
+      ).toHaveCount(2, {
+        timeout: 90_000,
+      });
+      await expect(
+        page.getByTestId(E2eTestId.ChatMessageQueueItem),
+      ).toHaveCount(0);
+      expect(sentTexts).toEqual([
+        "Start a slow response chat-queue-e2e-test",
+        queuedText,
+        secondQueuedText,
+      ]);
+    });
+  }
+
+  test("queues a message with an attachment and sends the attachment with it", async ({
+    page,
+    request,
+    makeApiRequest,
+    syncModels,
+  }) => {
+    await expectWireMockReady();
+
+    const { apiKeyId, runtimeModel } =
+      await ensureWireMockAnthropicChatProvider({
+        request,
+        makeApiRequest,
+        syncModels,
+      });
+
+    await goToChat(page);
+    await expectChatReady(page);
+    await selectApiKeyById(page, apiKeyId);
+
+    const modelSelectorTrigger = page
+      .getByTestId(E2eTestId.ChatModelSelectorTrigger)
+      .or(page.getByRole("button", { name: /select model/i }))
+      .first();
+    await modelSelectorTrigger.click();
+    await selectRuntimeModelFromDialog(page, runtimeModel);
+
+    const textarea = page.getByTestId(E2eTestId.ChatPromptTextarea);
+    const sentUserMessages: { parts: { type: string; text?: string }[] }[] = [];
+    page.on("request", (request) => {
+      if (request.method() !== "POST") return;
+      if (new URL(request.url()).pathname === "/api/chat") {
+        const messages = request.postDataJSON().messages;
+        sentUserMessages.push(
+          messages.findLast(
+            (message: { role: string }) => message.role === "user",
+          ),
+        );
+      }
+    });
+    await textarea.fill("Start a slow response chat-queue-e2e-test");
+    await page.keyboard.press("Enter");
+    await expect(
+      page.getByText(/Reconnect stream part one/).first(),
+    ).toBeVisible({ timeout: 30_000 });
+
+    const queuedText = `check this screenshot ${Math.random().toString(36).slice(2, 10)}`;
+    await page.getByLabel("Upload files").setInputFiles({
+      name: "screenshot.png",
+      mimeType: "image/png",
+      buffer: Buffer.from(ONE_PIXEL_PNG_BASE64, "base64"),
+    });
+    await textarea.fill(queuedText);
+    await textarea.press("Enter");
+
+    const queuedItem = page
+      .getByTestId(E2eTestId.ChatMessageQueueItem)
+      .filter({ hasText: queuedText });
+    await expect(queuedItem).toBeVisible();
+    await expect(
+      queuedItem.getByRole("img", { name: "1 attachment" }),
+    ).toBeVisible();
+
+    await textarea.press("Escape");
+
+    await expect(queuedItem).toHaveCount(0, { timeout: 30_000 });
+    await expect
+      .poll(() => sentUserMessages.length, { timeout: 30_000 })
+      .toBe(2);
+    expect(sentUserMessages[1].parts).toEqual([
+      { type: "text", text: queuedText },
+      expect.objectContaining({
+        type: "file",
+        mediaType: "image/png",
+        filename: "screenshot.png",
+        url: expect.stringMatching(/^data:image\/png;base64,/),
+      }),
+    ]);
+  });
+
+  // A manual /compact rewrites the thread over REST while the chat stream sits
+  // idle, so nothing about it is "in flight" from the composer's point of view.
+  // The composer still has to stay usable, park the message in the queue rather
+  // than firing a turn at a thread that is being replaced, and send it once
+  // compaction settles.
+  test("queues a message typed during compaction and sends it once compaction finishes", async ({
+    page,
+    request,
+    makeApiRequest,
+    syncModels,
+  }) => {
+    await expectWireMockReady();
+
+    const { apiKeyId, runtimeModel } =
+      await ensureWireMockAnthropicChatProvider({
+        request,
+        makeApiRequest,
+        syncModels,
+      });
+
+    await goToChat(page);
+    await expectChatReady(page);
+    await selectApiKeyById(page, apiKeyId);
+
+    const modelSelectorTrigger = page
+      .getByTestId(E2eTestId.ChatModelSelectorTrigger)
+      .or(page.getByRole("button", { name: /select model/i }))
+      .first();
+    await expect(modelSelectorTrigger).toBeVisible({ timeout: 10_000 });
+    await modelSelectorTrigger.click();
+    await expect(page.getByTestId(E2eTestId.ChatSetupMenu)).toBeVisible({
+      timeout: 5_000,
+    });
+    await selectRuntimeModelFromDialog(page, runtimeModel);
+
+    // Hold the compaction response open so the in-flight window is wide enough
+    // to type into. The real one is a model round-trip — far longer than this.
+    let releaseCompaction: (() => void) | undefined;
+    const compactionHeld = new Promise<void>((resolve) => {
+      releaseCompaction = resolve;
+    });
+    await page.route(COMPACT_ROUTE, async (route) => {
+      await compactionHeld;
+      await route.continue();
+    });
+
+    // Each test has a fresh browser conversation. A human-readable marker
+    // avoids the secret scan that a random, hyphenated token can trigger.
+    const marker = "queue compaction scenario";
+    const textarea = page.getByTestId(E2eTestId.ChatPromptTextarea);
+    await expect(textarea).toBeVisible({ timeout: 15_000 });
+    await textarea.fill(
+      `Test message ${marker} chat-ui-e2e-test: open the conversation.`,
+    );
+    await page.keyboard.press("Enter");
+    await expect(page.getByText(MOCK_RESPONSE).first()).toBeVisible({
+      timeout: 90_000,
+    });
+
+    // Kick off the manual compaction; the route above leaves it hanging.
+    await textarea.fill("/compact");
+    await page.keyboard.press("Enter");
+    await expect(
+      page.getByText(/Compacting conversation context/).first(),
+    ).toBeVisible({ timeout: 15_000 });
+
+    // The regression: compaction used to disable the composer outright once the
+    // stream had settled, so a follow-up could be neither typed nor queued.
+    await expect(textarea).toBeEnabled();
+
+    const queuedText = `queued during compaction ${marker}`;
+    await textarea.fill(queuedText);
+    await page.keyboard.press("Enter");
+
+    // The message waits in the queue instead of starting a turn of its own.
+    const queuedItem = page
+      .getByTestId(E2eTestId.ChatMessageQueueItem)
+      .filter({ hasText: queuedText });
+    await expect(queuedItem).toBeVisible({ timeout: 10_000 });
+
+    // And it keeps waiting: the drain has to hold until compaction settles, not
+    // fire the moment the message lands in the queue. Without the hold the chip
+    // would flash and disappear, which the assertion above alone would miss.
+    await page.waitForTimeout(3_000);
+    await expect(queuedItem).toBeVisible();
+
+    releaseCompaction?.();
+
+    // Once compaction settles the queue drains on its own: the chip goes away
+    // and the message becomes a real turn in the thread.
+    await expect(queuedItem).toHaveCount(0, { timeout: 30_000 });
+    await expect(page.getByText(queuedText).first()).toBeVisible({
+      timeout: 30_000,
+    });
+  });
+});
+
+async function expectWireMockReady() {
+  try {
+    const response = await fetch(`${WIREMOCK_BASE_URL}/__admin/health`);
+    if (response.ok) {
+      return;
+    }
+
+    throw new Error(`${response.status} ${await response.text()}`);
+  } catch (error) {
+    throw new Error(
+      `WireMock is not reachable at ${WIREMOCK_BASE_URL}. Run tilt trigger e2e-test-dependencies before this e2e. ${String(
+        error,
+      )}`,
+    );
+  }
+}

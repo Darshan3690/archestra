@@ -1,55 +1,19 @@
-import type { IdpRoleMappingConfig } from "@shared";
-import {
-  IDENTITY_TRUSTED_PROVIDER_IDS,
-  MEMBER_ROLE_NAME,
-  OAUTH_TOKEN_TYPE,
-} from "@shared";
+import type { IdpRoleMappingConfig } from "@archestra/shared";
+import { MEMBER_ROLE_NAME, OAUTH_TOKEN_TYPE } from "@archestra/shared";
 import { APIError } from "better-auth";
 import { vi } from "vitest";
 import { retrieveIdpGroups } from "@/auth/idp-team-sync-cache.ee";
 import config from "@/config";
 import db, { schema } from "@/database";
 import { describe, expect, test } from "@/test";
+import { setupTestCacheManager } from "@/test/cache-manager";
 import AccountModel from "./account";
 import IdentityProviderModel, {
   type IdpGetRoleData,
 } from "./identity-provider.ee";
 
-// Mock the logger to avoid console output during tests
-vi.mock("@/logging", () => ({
-  default: {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  },
-}));
-
-// Mock cacheManager for SSO groups caching tests (preserves LRUCacheManager, CacheKey exports)
-const mockCacheStore = new Map<string, unknown>();
-vi.mock("@/cache-manager", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/cache-manager")>();
-  return {
-    ...actual,
-    cacheManager: {
-      get: vi.fn(async (key: string) => mockCacheStore.get(key)),
-      set: vi.fn(async (key: string, value: unknown, _ttl?: number) => {
-        mockCacheStore.set(key, value);
-        return value;
-      }),
-      delete: vi.fn(async (key: string) => {
-        const existed = mockCacheStore.has(key);
-        mockCacheStore.delete(key);
-        return existed;
-      }),
-      getAndDelete: vi.fn(async (key: string) => {
-        const value = mockCacheStore.get(key);
-        mockCacheStore.delete(key);
-        return value;
-      }),
-    },
-  };
-});
+// The real cache, stored in this file's test database.
+setupTestCacheManager();
 
 const mockProvider = {
   id: "test-provider-id",
@@ -165,6 +129,80 @@ describe("IdentityProviderModel", () => {
       }
     });
 
+    test("keeps the discovered userinfo endpoint off an Entra On-Behalf-Of provider", async ({
+      makeOrganization,
+      makeUser,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+      const registerSSOProvider = vi.fn(async ({ body }) => {
+        await db.insert(schema.identityProvidersTable).values({
+          id: crypto.randomUUID(),
+          providerId: body.providerId,
+          issuer: body.issuer,
+          domain: body.domain,
+          organizationId: org.id,
+          userId: user.id,
+          oidcConfig: JSON.stringify(
+            body.oidcConfig,
+          ) as unknown as typeof schema.identityProvidersTable.$inferInsert.oidcConfig,
+        });
+      });
+      const issuer = "https://login.microsoftonline.com/tenant-id/v2.0";
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          issuer,
+          authorization_endpoint:
+            "https://login.microsoftonline.com/tenant-id/oauth2/v2.0/authorize",
+          token_endpoint:
+            "https://login.microsoftonline.com/tenant-id/oauth2/v2.0/token",
+          jwks_uri:
+            "https://login.microsoftonline.com/tenant-id/discovery/v2.0/keys",
+          userinfo_endpoint: "https://graph.microsoft.com/oidc/userinfo",
+        }),
+      });
+
+      try {
+        const created = await IdentityProviderModel.create(
+          {
+            providerId: "EntraID",
+            issuer,
+            domain: "example.com",
+            userId: user.id,
+            oidcConfig: {
+              issuer,
+              pkce: true,
+              clientId: "entra-client",
+              clientSecret: "secret",
+              discoveryEndpoint: `${issuer}/.well-known/openid-configuration`,
+              scopes: [
+                "openid",
+                "profile",
+                "api://entra-client/access_as_user",
+              ],
+              enterpriseManagedCredentials: {
+                exchangeStrategy: "entra_obo",
+              },
+            },
+          },
+          org.id,
+          new Headers(),
+          {
+            api: { registerSSOProvider },
+          } as unknown as Parameters<typeof IdentityProviderModel.create>[3],
+        );
+
+        expect(created.oidcConfig?.tokenEndpoint).toBe(
+          "https://login.microsoftonline.com/tenant-id/oauth2/v2.0/token",
+        );
+        expect(created.oidcConfig?.userInfoEndpoint).toBeUndefined();
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
     test("persists enterprise-managed credentials inside oidcConfig", async ({
       makeOrganization,
       makeUser,
@@ -233,7 +271,7 @@ describe("IdentityProviderModel", () => {
       ).toBe(OAUTH_TOKEN_TYPE.AccessToken);
     });
 
-    test("clears persisted allowed email domains for non-Google API submissions", async ({
+    test("keeps persisted allowed email domains for non-Google API submissions", async ({
       makeOrganization,
       makeUser,
     }) => {
@@ -282,14 +320,14 @@ describe("IdentityProviderModel", () => {
       expect(registerSSOProvider).toHaveBeenCalledWith(
         expect.objectContaining({
           body: expect.objectContaining({
-            domain: "sso-placeholder.example.com",
+            domain: "example.com",
           }),
         }),
       );
-      expect(created.domain).toBe("");
+      expect(created.domain).toBe("example.com");
     });
 
-    test("keeps persisted allowed email domains for Google API submissions", async ({
+    test("uses a registration placeholder without persisting it when allowed domains are empty", async ({
       makeOrganization,
       makeUser,
     }) => {
@@ -312,18 +350,18 @@ describe("IdentityProviderModel", () => {
 
       const created = await IdentityProviderModel.create(
         {
-          providerId: "Google",
-          issuer: "https://accounts.google.com",
-          domain: "example.com",
+          providerId: "Okta",
+          issuer: "https://integrator-8514409.okta.com",
+          domain: "",
           userId: user.id,
           oidcConfig: {
-            issuer: "https://accounts.google.com",
+            issuer: "https://integrator-8514409.okta.com",
             skipDiscovery: true,
             pkce: true,
-            clientId: "google-client-id",
-            clientSecret: "google-client-secret",
+            clientId: "okta-client-id",
+            clientSecret: "okta-client-secret",
             discoveryEndpoint:
-              "https://accounts.google.com/.well-known/openid-configuration",
+              "https://integrator-8514409.okta.com/.well-known/openid-configuration",
           },
         },
         org.id,
@@ -335,7 +373,166 @@ describe("IdentityProviderModel", () => {
         } as unknown as Parameters<typeof IdentityProviderModel.create>[3],
       );
 
-      expect(created.domain).toBe("example.com");
+      expect(registerSSOProvider).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.objectContaining({
+            domain: "sso-placeholder.example.com",
+          }),
+        }),
+      );
+      expect(created.domain).toBe("");
+    });
+
+    test("registers a discovery-less provider without fetching or sending a blank discovery endpoint", async ({
+      makeOrganization,
+      makeUser,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+
+      const registerSSOProvider = vi.fn(async ({ body }) => {
+        await db.insert(schema.identityProvidersTable).values({
+          id: crypto.randomUUID(),
+          providerId: body.providerId,
+          issuer: body.issuer,
+          domain: body.domain,
+          organizationId: org.id,
+          userId: user.id,
+          oidcConfig: JSON.stringify(
+            body.oidcConfig,
+          ) as unknown as typeof schema.identityProvidersTable.$inferInsert.oidcConfig,
+        });
+      });
+
+      const originalFetch = globalThis.fetch;
+      const fetchMock = vi.fn();
+      globalThis.fetch = fetchMock;
+
+      try {
+        const created = await IdentityProviderModel.create(
+          {
+            providerId: "discovery-less-idp",
+            issuer: "https://idp.example.com",
+            domain: "example.com",
+            userId: user.id,
+            oidcConfig: {
+              issuer: "https://idp.example.com",
+              skipDiscovery: true,
+              pkce: false,
+              clientId: "client-id",
+              clientSecret: "secret",
+              discoveryEndpoint: "",
+              authorizationEndpoint: "https://idp.example.com/oauth/authorize",
+              tokenEndpoint: "https://idp.example.com/oauth/access_token",
+              userInfoEndpoint: "https://api.idp.example.com/user",
+              scopes: ["read:user"],
+            },
+          },
+          org.id,
+          new Headers(),
+          {
+            api: {
+              registerSSOProvider,
+            },
+          } as unknown as Parameters<typeof IdentityProviderModel.create>[3],
+        );
+
+        expect(fetchMock).not.toHaveBeenCalled();
+
+        /**
+         * Better Auth validates every endpoint on the registration body with
+         * `z.url()`, so an empty string is rejected rather than read as "not
+         * configured". The key must be absent, not blank.
+         */
+        const registeredOidcConfig =
+          registerSSOProvider.mock.calls[0]?.[0]?.body?.oidcConfig;
+        expect(registeredOidcConfig).not.toHaveProperty("discoveryEndpoint");
+        expect(registeredOidcConfig).toEqual(
+          expect.objectContaining({
+            skipDiscovery: true,
+            authorizationEndpoint: "https://idp.example.com/oauth/authorize",
+            tokenEndpoint: "https://idp.example.com/oauth/access_token",
+            userInfoEndpoint: "https://api.idp.example.com/user",
+          }),
+        );
+
+        // The stored config keeps the blank string the API schema requires.
+        expect(created.oidcConfig?.discoveryEndpoint).toBe("");
+        expect(created.oidcConfig?.skipDiscovery).toBe(true);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    test("persists the issuer-derived discovery endpoint when none was configured", async ({
+      makeOrganization,
+      makeUser,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+
+      const registerSSOProvider = vi.fn(async ({ body }) => {
+        await db.insert(schema.identityProvidersTable).values({
+          id: crypto.randomUUID(),
+          providerId: body.providerId,
+          issuer: body.issuer,
+          domain: body.domain,
+          organizationId: org.id,
+          userId: user.id,
+          oidcConfig: JSON.stringify(
+            body.oidcConfig,
+          ) as unknown as typeof schema.identityProvidersTable.$inferInsert.oidcConfig,
+        });
+      });
+
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          issuer: "https://idp.example.com/oauth2/example",
+          authorization_endpoint:
+            "https://idp.example.com/oauth2/example/v1/authorize",
+          token_endpoint: "https://idp.example.com/oauth2/example/v1/token",
+          jwks_uri: "https://idp.example.com/oauth2/example/v1/keys",
+        }),
+      });
+
+      try {
+        const created = await IdentityProviderModel.create(
+          {
+            providerId: "derived-discovery-idp",
+            issuer: "https://idp.example.com/oauth2/example",
+            domain: "example.com",
+            userId: user.id,
+            oidcConfig: {
+              issuer: "https://idp.example.com/oauth2/example",
+              pkce: true,
+              clientId: "client-id",
+              clientSecret: "secret",
+              discoveryEndpoint: "",
+            },
+          },
+          org.id,
+          new Headers(),
+          {
+            api: {
+              registerSSOProvider,
+            },
+          } as unknown as Parameters<typeof IdentityProviderModel.create>[3],
+        );
+
+        const expectedDiscoveryEndpoint =
+          "https://idp.example.com/oauth2/example/.well-known/openid-configuration";
+        expect(globalThis.fetch).toHaveBeenCalledWith(
+          expectedDiscoveryEndpoint,
+          expect.anything(),
+        );
+        expect(created.oidcConfig?.discoveryEndpoint).toBe(
+          expectedDiscoveryEndpoint,
+        );
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
     });
 
     test("rejects registration when discovery fetch returns a non-2xx response", async ({
@@ -807,82 +1004,27 @@ describe("IdentityProviderModel", () => {
       expect(providerIds).toContain("Google");
       expect(providerIds).toContain("GitHub");
     });
-  });
 
-  describe("getTrustedAccountLinkingProviderIds", () => {
-    test("returns built-in trusted providers when no custom identity providers exist", async () => {
-      await expect(
-        IdentityProviderModel.getTrustedAccountLinkingProviderIds(),
-      ).resolves.toEqual([...IDENTITY_TRUSTED_PROVIDER_IDS]);
-    });
-
-    test("includes configured generic OIDC and SAML provider IDs", async ({
+    test("serves the process-local cache until a provider write invalidates it", async ({
       makeOrganization,
       makeIdentityProvider,
     }) => {
       const org = await makeOrganization();
-
-      await makeIdentityProvider(org.id, {
-        providerId: "custom-oidc",
-        oidcConfig: { clientId: "client-id" },
-      });
-      await makeIdentityProvider(org.id, {
-        providerId: "custom-saml",
-        samlConfig: { entryPoint: "https://example.com/saml" },
+      const provider = await makeIdentityProvider(org.id, {
+        providerId: "Okta",
       });
 
-      await expect(
-        IdentityProviderModel.getTrustedAccountLinkingProviderIds(),
-      ).resolves.toEqual([
-        ...IDENTITY_TRUSTED_PROVIDER_IDS,
-        "custom-oidc",
-        "custom-saml",
-      ]);
-    });
+      // Prime the cache, then insert behind the model's back: the cached
+      // list must be served (that's the point of the cache)...
+      expect(await IdentityProviderModel.findAllPublic()).toHaveLength(1);
+      await makeIdentityProvider(org.id, { providerId: "Google" });
+      expect(await IdentityProviderModel.findAllPublic()).toHaveLength(1);
 
-    test("deduplicates built-in providers that are also configured in the database", async ({
-      makeOrganization,
-      makeIdentityProvider,
-    }) => {
-      const org = await makeOrganization();
-
-      await makeIdentityProvider(org.id, { providerId: "Okta" });
-
-      await expect(
-        IdentityProviderModel.getTrustedAccountLinkingProviderIds(),
-      ).resolves.toEqual([...IDENTITY_TRUSTED_PROVIDER_IDS]);
-    });
-
-    test("returns the built-in trusted providers before database initialization", async () => {
-      vi.resetModules();
-      vi.doMock("@/database", async () => {
-        const actual =
-          await vi.importActual<typeof import("@/database")>("@/database");
-
-        return {
-          ...actual,
-          default: new Proxy(
-            {},
-            {
-              get() {
-                throw new Error(
-                  "Database not initialized. Call initializeDatabase() first.",
-                );
-              },
-            },
-          ),
-        };
-      });
-
-      const { default: IsolatedIdentityProviderModel } = await import(
-        "./identity-provider.ee"
-      );
-
-      await expect(
-        IsolatedIdentityProviderModel.getTrustedAccountLinkingProviderIds(),
-      ).resolves.toEqual([...IDENTITY_TRUSTED_PROVIDER_IDS]);
-
-      vi.doUnmock("@/database");
+      // ...while a write through the model must invalidate, so the login
+      // page reflects provider changes immediately on this pod.
+      await IdentityProviderModel.delete(provider.id, org.id);
+      const fresh = await IdentityProviderModel.findAllPublic();
+      expect(fresh.map((p) => p.providerId)).toEqual(["Google"]);
     });
   });
 
@@ -1132,29 +1274,8 @@ describe("IdentityProviderModel", () => {
 
       expect(updated).not.toBeNull();
       expect(updated?.issuer).toBe("https://new-issuer.com");
-      expect(updated?.domain).toBe("");
-      expect(updated?.providerId).toBe("Okta"); // Unchanged
-    });
-
-    test("keeps updated allowed email domains for Google providers", async ({
-      makeOrganization,
-      makeIdentityProvider,
-    }) => {
-      const org = await makeOrganization();
-
-      const inserted = await makeIdentityProvider(org.id, {
-        providerId: "Google",
-        issuer: "https://accounts.google.com",
-        domain: "old.example.com",
-      });
-
-      const updated = await IdentityProviderModel.update(
-        inserted.id,
-        { domain: "new.example.com" },
-        org.id,
-      );
-
       expect(updated?.domain).toBe("new.example.com");
+      expect(updated?.providerId).toBe("Okta"); // Unchanged
     });
 
     test("can update oidcConfig", async ({
@@ -1419,14 +1540,7 @@ describe("IdentityProviderModel", () => {
     });
   });
 
-  /**
-   * Test for domainVerified workaround.
-   * With `domainVerification: { enabled: true }` in Better Auth's SSO plugin,
-   * all SSO providers need `domainVerified: true` for sign-in to work.
-   * See: https://github.com/better-auth/better-auth/issues/6481
-   * TODO: Remove this test once the upstream issue is fixed.
-   */
-  describe("domainVerified workaround", () => {
+  describe("trusted-domain account linking", () => {
     test("SAML providers are created with domainVerified: true", async ({
       makeOrganization,
       makeIdentityProvider,
@@ -1476,7 +1590,6 @@ describe("IdentityProviderModel", () => {
       );
 
       expect(provider).not.toBeNull();
-      // With domainVerification enabled, OIDC providers also need domainVerified: true
       expect(provider?.domainVerified).toBe(true);
     });
 
@@ -1486,7 +1599,6 @@ describe("IdentityProviderModel", () => {
     }) => {
       const org = await makeOrganization();
 
-      // Create a provider (will have domainVerified: true from create)
       const provider = await makeIdentityProvider(org.id, {
         providerId: "Update-Test",
         oidcConfig: {
@@ -1498,28 +1610,23 @@ describe("IdentityProviderModel", () => {
         },
       });
 
-      // Manually set domainVerified to false to simulate old data
-      // (This simulates providers created before the workaround was added)
       await IdentityProviderModel.setDomainVerifiedForTesting(
         provider.id,
         false,
       );
 
-      // Verify it's now false
       const beforeUpdate = await IdentityProviderModel.findById(
         provider.id,
         org.id,
       );
       expect(beforeUpdate?.domainVerified).toBe(false);
 
-      // Update the provider (change domain)
       await IdentityProviderModel.update(
         provider.id,
         { domain: "updated.example.com" },
         org.id,
       );
 
-      // After update, domainVerified should be set back to true
       const afterUpdate = await IdentityProviderModel.findById(
         provider.id,
         org.id,
@@ -2446,6 +2553,107 @@ describe("resolveSsoRole", () => {
 
   describe("when SSO provider has no role mapping configured", () => {
     test("returns default member role", async ({
+      makeOrganization,
+      makeIdentityProvider,
+    }) => {
+      const org = await makeOrganization();
+      const provider = await makeIdentityProvider(org.id);
+
+      const params = createParams({
+        user: { id: "user-1", email: "user@example.com" },
+        provider: { providerId: provider.providerId },
+        token: { email: "user@example.com" },
+      });
+
+      const result = await IdentityProviderModel.resolveSsoRole(params);
+
+      expect(result).toBe(MEMBER_ROLE_NAME);
+    });
+  });
+
+  describe("organization default role fallback", () => {
+    test("uses the org default role when the provider has no role mapping", async ({
+      makeOrganization,
+      makeIdentityProvider,
+    }) => {
+      const org = await makeOrganization({
+        defaultMemberRole: "member,editor",
+      });
+      const provider = await makeIdentityProvider(org.id);
+
+      const params = createParams({
+        user: { id: "user-1", email: "user@example.com" },
+        provider: { providerId: provider.providerId },
+        token: { email: "user@example.com" },
+      });
+
+      const result = await IdentityProviderModel.resolveSsoRole(params);
+
+      expect(result).toBe("member,editor");
+    });
+
+    test("uses the org default role when no rule matches and the provider has no defaultRole", async ({
+      makeOrganization,
+      makeIdentityProvider,
+    }) => {
+      const org = await makeOrganization({
+        defaultMemberRole: "member,editor",
+      });
+      const roleMapping: IdpRoleMappingConfig = {
+        rules: [
+          {
+            expression: '{{#includes groups "admins"}}true{{/includes}}',
+            role: "admin",
+          },
+        ],
+      };
+      const provider = await makeIdentityProvider(org.id, {
+        roleMapping: roleMapping as unknown as Record<string, unknown>,
+      });
+
+      const params = createParams({
+        user: { id: "user-1", email: "user@example.com" },
+        provider: { providerId: provider.providerId },
+        token: { groups: ["users"] },
+      });
+
+      const result = await IdentityProviderModel.resolveSsoRole(params);
+
+      expect(result).toBe("member,editor");
+    });
+
+    test("prefers the provider's own defaultRole over the org default", async ({
+      makeOrganization,
+      makeIdentityProvider,
+    }) => {
+      const org = await makeOrganization({
+        defaultMemberRole: "member,editor",
+      });
+      const roleMapping: IdpRoleMappingConfig = {
+        rules: [
+          {
+            expression: '{{#includes groups "admins"}}true{{/includes}}',
+            role: "admin",
+          },
+        ],
+        defaultRole: "member,viewer",
+      };
+      const provider = await makeIdentityProvider(org.id, {
+        roleMapping: roleMapping as unknown as Record<string, unknown>,
+      });
+
+      const params = createParams({
+        user: { id: "user-1", email: "user@example.com" },
+        provider: { providerId: provider.providerId },
+        token: { groups: ["users"] },
+      });
+
+      const result = await IdentityProviderModel.resolveSsoRole(params);
+
+      expect(result).toBe("member,viewer");
+    });
+
+    test("falls back to the member role when the org leaves the default unset", async ({
       makeOrganization,
       makeIdentityProvider,
     }) => {

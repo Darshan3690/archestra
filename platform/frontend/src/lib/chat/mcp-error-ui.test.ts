@@ -1,92 +1,22 @@
-import { TOOL_INVOCATION_UNTRUSTED_CONTEXT_REASON } from "@shared";
-import { describe, expect, it } from "vitest";
+// @vitest-environment node
+import { describe, expect, it, vi } from "vitest";
 import {
+  desktopAddPromptCopy,
   extractCatalogIdFromInstallUrl,
   extractIdsFromReauthUrl,
   hasToolPartsWithAuthErrors,
   isAuthInstructionText,
+  isInstallAuthAction,
+  isInstallAuthResolved,
+  isNoDeviceError,
+  noDevicePromptCopy,
   parseAuthRequired,
   parseExpiredAuth,
-  parsePolicyDenied,
   resolveAssistantTextAuthState,
+  resolveMcpAppToolCallAuthState,
   resolveToolAuthState,
+  type ToolAuthState,
 } from "./mcp-error-ui";
-
-describe("parsePolicyDenied", () => {
-  it("parses a plain-text policy denial with tool name, args, and reason", () => {
-    const text = `\nI tried to invoke the upstash__context7__get-library-docs tool with the following arguments: {"context7CompatibleLibraryID":"/websites/p5js_reference"}.\n\nHowever, I was denied by a tool invocation policy:\n\n${TOOL_INVOCATION_UNTRUSTED_CONTEXT_REASON}`;
-    const result = parsePolicyDenied(text);
-    expect(result).not.toBeNull();
-    expect(result?.type).toBe("tool-upstash__context7__get-library-docs");
-    expect(result?.state).toBe("output-denied");
-    expect(result?.input).toEqual({
-      context7CompatibleLibraryID: "/websites/p5js_reference",
-    });
-    const errorInfo = JSON.parse(result?.errorText ?? "");
-    expect(errorInfo.reason).toContain("context contains sensitive data");
-    expect(result?.unsafeContextActiveAtRequestStart).toBe(true);
-  });
-
-  it("parses a JSON-wrapped policy denial (originalError.message)", () => {
-    const inner =
-      '\nI tried to invoke the my-tool tool with the following arguments: {"key":"value"}.\n\nHowever, I was denied by a tool invocation policy:\n\nBlocked by admin';
-    const text = JSON.stringify({
-      code: "unknown",
-      originalError: { message: inner },
-    });
-    const result = parsePolicyDenied(text);
-    expect(result).not.toBeNull();
-    expect(result?.type).toBe("tool-my-tool");
-    expect(result?.input).toEqual({ key: "value" });
-    expect(result?.unsafeContextActiveAtRequestStart).toBe(false);
-  });
-
-  it("uses structured reasonType for policy denials when available", () => {
-    const text = JSON.stringify({
-      _meta: {
-        archestraError: {
-          type: "policy_denied",
-          message: "blocked",
-          toolName: "some-tool",
-          input: {},
-          reason: TOOL_INVOCATION_UNTRUSTED_CONTEXT_REASON,
-          reasonType: "sensitive_context",
-        },
-      },
-    });
-
-    const result = parsePolicyDenied(text);
-
-    expect(result).not.toBeNull();
-    expect(result?.type).toBe("tool-some-tool");
-    expect(result?.unsafeContextActiveAtRequestStart).toBe(true);
-  });
-
-  it("parses a JSON-wrapped policy denial (message)", () => {
-    const inner =
-      "\nI tried to invoke the some-tool tool with the following arguments: {}.\n\nHowever, I was denied by a tool invocation policy:\n\nNot allowed";
-    const text = JSON.stringify({ message: inner });
-    const result = parsePolicyDenied(text);
-    expect(result).not.toBeNull();
-    expect(result?.type).toBe("tool-some-tool");
-  });
-
-  it("returns null for unrelated text", () => {
-    expect(parsePolicyDenied("Hello world")).toBeNull();
-  });
-
-  it("returns null for text missing required keywords", () => {
-    expect(
-      parsePolicyDenied("The tool was denied access to the resource"),
-    ).toBeNull();
-  });
-
-  it("returns null for text with keywords but no matching pattern", () => {
-    const text =
-      "The tool invocation was denied by policy but has no structured format";
-    expect(parsePolicyDenied(text)).toBeNull();
-  });
-});
 
 describe("parseAuthRequired", () => {
   const makeDirectErrorText = (catalogName: string, installUrl: string) =>
@@ -158,12 +88,6 @@ describe("parseAuthRequired", () => {
   it("returns null when Authentication required is present but URL is missing", () => {
     const text =
       'Authentication required for "some-tool".\n\nPlease authenticate.';
-    expect(parseAuthRequired(text)).toBeNull();
-  });
-
-  it("returns null for policy denial errors", () => {
-    const text =
-      "\nI tried to invoke the my-tool tool with the following arguments: {}.\n\nHowever, I was denied by a tool invocation policy:\n\nBlocked";
     expect(parseAuthRequired(text)).toBeNull();
   });
 
@@ -372,13 +296,68 @@ describe("resolveToolAuthState", () => {
     });
   });
 
-  it("parses policy-denied tool errors from errorText", () => {
+  it("propagates a personal credential scope for structured auth-expired errors", () => {
+    expect(
+      resolveToolAuthState({
+        rawOutput: {
+          archestraError: {
+            type: "auth_expired",
+            message: "Expired",
+            catalogName: "GitHub",
+            catalogId: "cat_1",
+            serverId: "s_1",
+            reauthUrl:
+              "http://localhost:3000/mcp/registry?reauth=cat_1&server=s_1",
+            credentialScope: "personal",
+          },
+        },
+      }),
+    ).toEqual({
+      kind: "auth-expired",
+      catalogName: "GitHub",
+      reauthUrl: "http://localhost:3000/mcp/registry?reauth=cat_1&server=s_1",
+      catalogId: "cat_1",
+      serverId: "s_1",
+      credentialScope: "personal",
+    });
+  });
+
+  it("carries the owning team name for team-scoped auth-expired errors", () => {
+    expect(
+      resolveToolAuthState({
+        rawOutput: {
+          archestraError: {
+            type: "auth_expired",
+            message: "Expired",
+            catalogName: "GitHub",
+            catalogId: "cat_1",
+            serverId: "s_1",
+            reauthUrl:
+              "http://localhost:3000/mcp/registry?reauth=cat_1&server=s_1",
+            credentialScope: "team",
+            credentialTeamName: "Platform Team",
+          },
+        },
+      }),
+    ).toMatchObject({
+      kind: "auth-expired",
+      credentialScope: "team",
+      credentialTeamName: "Platform Team",
+    });
+  });
+
+  it("leaves scope undefined for text-parsed expired-auth errors", () => {
     const authState = resolveToolAuthState({
-      errorText:
-        "\nI tried to invoke the my-tool tool with the following arguments: {}.\n\nHowever, I was denied by a tool invocation policy:\n\nBlocked",
+      errorText: [
+        'Expired or invalid authentication for "GitHub".',
+        "To re-authenticate, please visit: http://localhost:3000/mcp/registry?reauth=cat_1&server=s_1",
+      ].join("\n"),
     });
 
-    expect(authState?.kind).toBe("policy-denied");
+    expect(authState?.kind).toBe("auth-expired");
+    expect(
+      (authState as { credentialScope?: string }).credentialScope,
+    ).toBeUndefined();
   });
 
   it("parses auth-required fallbacks from raw string output", () => {
@@ -395,6 +374,119 @@ describe("resolveToolAuthState", () => {
       providerId: null,
       catalogId: "cat_123",
     });
+  });
+});
+
+describe("resolveMcpAppToolCallAuthState", () => {
+  const authRequiredError = {
+    type: "auth_required",
+    message: 'Authentication required for "Slack"',
+    catalogName: "Slack",
+    catalogId: "cat_slack",
+    action: "install_mcp_credentials",
+    actionUrl: "http://localhost:3000/mcp/registry?install=cat_slack",
+  };
+
+  it("detects the structured auth-required error in _meta on an isError result", () => {
+    expect(
+      resolveMcpAppToolCallAuthState({
+        isError: true,
+        content: [{ type: "text", text: authRequiredError.message }],
+        _meta: { archestraError: authRequiredError },
+      }),
+    ).toMatchObject({
+      kind: "auth-required",
+      catalogName: "Slack",
+      actionUrl: authRequiredError.actionUrl,
+      catalogId: "cat_slack",
+    });
+  });
+
+  it("detects the structured error mirrored only in structuredContent", () => {
+    expect(
+      resolveMcpAppToolCallAuthState({
+        isError: true,
+        content: [{ type: "text", text: authRequiredError.message }],
+        structuredContent: { archestraError: authRequiredError },
+      }),
+    ).toMatchObject({
+      kind: "auth-required",
+      actionUrl: authRequiredError.actionUrl,
+    });
+  });
+
+  it("detects structured auth-expired errors with the reauth URL", () => {
+    expect(
+      resolveMcpAppToolCallAuthState({
+        isError: true,
+        content: [{ type: "text", text: "Expired credentials" }],
+        _meta: {
+          archestraError: {
+            type: "auth_expired",
+            message: "Expired",
+            catalogName: "GitHub",
+            catalogId: "cat_github",
+            serverId: "srv_1",
+            reauthUrl:
+              "http://localhost:3000/mcp/registry?reauth=cat_github&server=srv_1",
+          },
+        },
+      }),
+    ).toMatchObject({
+      kind: "auth-expired",
+      catalogName: "GitHub",
+      reauthUrl:
+        "http://localhost:3000/mcp/registry?reauth=cat_github&server=srv_1",
+    });
+  });
+
+  it("falls back to parsing the auth prose in text content blocks", () => {
+    expect(
+      resolveMcpAppToolCallAuthState({
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: 'Authentication required for "Slack"\n\nNo credentials were found for your account.\nTo set up your credentials, visit this URL: http://localhost:3000/mcp/registry?install=cat_slack\nOnce you have completed authentication, retry this tool call.',
+          },
+        ],
+      }),
+    ).toMatchObject({
+      kind: "auth-required",
+      catalogName: "Slack",
+      actionUrl: "http://localhost:3000/mcp/registry?install=cat_slack",
+      catalogId: "cat_slack",
+    });
+  });
+
+  it("ignores successful results even when they carry auth-like content", () => {
+    expect(
+      resolveMcpAppToolCallAuthState({
+        isError: false,
+        content: [{ type: "text", text: authRequiredError.message }],
+        _meta: { archestraError: authRequiredError },
+      }),
+    ).toBeNull();
+    expect(
+      resolveMcpAppToolCallAuthState({
+        content: [{ type: "text", text: authRequiredError.message }],
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null for non-auth tool errors", () => {
+    expect(
+      resolveMcpAppToolCallAuthState({
+        isError: true,
+        content: [{ type: "text", text: "Upstream server returned 500" }],
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null for non-object results", () => {
+    expect(resolveMcpAppToolCallAuthState(null)).toBeNull();
+    expect(resolveMcpAppToolCallAuthState("error text")).toBeNull();
+    expect(resolveMcpAppToolCallAuthState(undefined)).toBeNull();
   });
 });
 
@@ -448,8 +540,7 @@ describe("hasToolPartsWithAuthErrors", () => {
     expect(
       hasToolPartsWithAuthErrors([
         {
-          errorText:
-            "\nI tried to invoke the my-tool tool with the following arguments: {}.\n\nHowever, I was denied by a tool invocation policy:\n\nBlocked",
+          errorText: "Tool call failed: upstream timed out",
         },
       ]),
     ).toBe(false);
@@ -505,6 +596,232 @@ describe("extractIdsFromReauthUrl", () => {
     expect(extractIdsFromReauthUrl("not-a-url")).toEqual({
       catalogId: null,
       serverId: null,
+    });
+  });
+});
+
+describe("a desktop MCP server that is not on the caller's computer", () => {
+  const url = "http://localhost:3000/mcp/registry?install=cat_desktop";
+  // The text the backend sends for a desktop MCP tool the caller has not added.
+  const text = `"MATLAB" is not on your computer.\n\n"MATLAB" runs on your own computer, and you have not added it yet.\nTo add "MATLAB" to your computer, visit this URL: ${url}\n\nIMPORTANT: You MUST display the URL above to the user exactly as shown, in your reply text, never inside a question form. Do NOT omit it or paraphrase it.\n\nOnce "MATLAB" is on your computer, retry this tool call.`;
+
+  it("is read from the structured error with its own action", () => {
+    expect(
+      resolveToolAuthState({
+        rawOutput: {
+          _meta: {
+            archestraError: {
+              type: "auth_required",
+              message: text,
+              catalogId: "cat_desktop",
+              catalogName: "MATLAB",
+              action: "add_desktop_mcp_server",
+              actionUrl: url,
+            },
+          },
+        },
+      }),
+    ).toEqual({
+      kind: "auth-required",
+      catalogName: "MATLAB",
+      actionUrl: url,
+      action: "add_desktop_mcp_server",
+      providerId: null,
+      catalogId: "cat_desktop",
+    });
+  });
+
+  it("is read from the text alone, as adding to a computer and not as credentials", () => {
+    expect(parseAuthRequired(text)).toEqual({
+      catalogName: "MATLAB",
+      actionUrl: url,
+      action: "add_desktop_mcp_server",
+      providerId: null,
+    });
+    expect(resolveAssistantTextAuthState(text)).toMatchObject({
+      kind: "auth-required",
+      action: "add_desktop_mcp_server",
+      catalogId: "cat_desktop",
+    });
+  });
+
+  it("opens the chat's own dialog, and is resolved once the server is added", () => {
+    expect(isInstallAuthAction("add_desktop_mcp_server")).toBe(true);
+    expect(isInstallAuthAction("install_mcp_credentials")).toBe(true);
+    expect(isInstallAuthAction("connect_identity_provider")).toBe(false);
+    const authState = resolveAssistantTextAuthState(text);
+    expect(
+      isInstallAuthResolved({
+        authState,
+        connectedCatalogIds: new Set(["cat_desktop"]),
+      }),
+    ).toBe(true);
+    expect(
+      isInstallAuthResolved({ authState, connectedCatalogIds: new Set() }),
+    ).toBe(false);
+  });
+
+  it("is worded with the desktop vocabulary", () => {
+    const prompt = desktopAddPromptCopy({
+      catalogName: "MATLAB",
+      resolved: false,
+    });
+    expect(prompt).toEqual({
+      title: "Not connected from your device",
+      description:
+        "\u201cMATLAB\u201d runs on your linked device. Connect it to use this tool.",
+      buttonText: "Connect from my device",
+    });
+    const added = desktopAddPromptCopy({
+      catalogName: "MATLAB",
+      resolved: true,
+    });
+    expect(added.title).toBe("Connected from your device");
+    expect(added.buttonText).toBeUndefined();
+    for (const copy of [prompt, added]) {
+      expect(`${copy.title} ${copy.description}`).not.toMatch(
+        /install|credential|authenticat/i,
+      );
+    }
+  });
+});
+
+describe("isInstallAuthResolved", () => {
+  const installState: ToolAuthState = {
+    kind: "auth-required",
+    catalogName: "Atlassian Cloud MCP",
+    actionUrl: "http://localhost:3000/mcp/registry?install=cat_1",
+    action: "install_mcp_credentials",
+    providerId: null,
+    catalogId: "cat_1",
+  };
+
+  it("treats an install prompt as resolved once a server for its catalog is connected", () => {
+    expect(
+      isInstallAuthResolved({
+        authState: installState,
+        connectedCatalogIds: new Set(["cat_1"]),
+      }),
+    ).toBe(true);
+  });
+
+  it("stays unresolved while no server for the catalog is connected", () => {
+    expect(
+      isInstallAuthResolved({
+        authState: installState,
+        connectedCatalogIds: new Set(["other-catalog"]),
+      }),
+    ).toBe(false);
+  });
+
+  it("ignores identity-provider connect prompts even when the catalog is connected", () => {
+    expect(
+      isInstallAuthResolved({
+        authState: {
+          ...installState,
+          action: "connect_identity_provider",
+          providerId: "EntraID",
+        },
+        connectedCatalogIds: new Set(["cat_1"]),
+      }),
+    ).toBe(false);
+  });
+
+  it("ignores expired/re-auth prompts even when the catalog is connected", () => {
+    expect(
+      isInstallAuthResolved({
+        authState: {
+          kind: "auth-expired",
+          catalogName: "Atlassian Cloud MCP",
+          reauthUrl:
+            "http://localhost:3000/mcp/registry?reauth=cat_1&server=s_1",
+          catalogId: "cat_1",
+          serverId: "s_1",
+        },
+        connectedCatalogIds: new Set(["cat_1"]),
+      }),
+    ).toBe(false);
+  });
+
+  it("stays unresolved when the prompt carries no catalog id", () => {
+    expect(
+      isInstallAuthResolved({
+        authState: { ...installState, catalogId: null },
+        connectedCatalogIds: new Set(["cat_1"]),
+      }),
+    ).toBe(false);
+  });
+
+  it("stays unresolved when there is no auth state", () => {
+    expect(
+      isInstallAuthResolved({
+        authState: null,
+        connectedCatalogIds: new Set(["cat_1"]),
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("auth parsers on unrelated text", () => {
+  it("rejects text without the markers before parsing it as JSON", () => {
+    const parse = vi.spyOn(JSON, "parse");
+    const output = JSON.stringify({
+      rows: Array.from({ length: 50 }, (_, i) => ({ i })),
+    });
+
+    expect(parseAuthRequired(output)).toBeNull();
+    expect(parseExpiredAuth(output)).toBeNull();
+    expect(parse).not.toHaveBeenCalled();
+    parse.mockRestore();
+  });
+
+  it("still finds the markers inside a JSON error envelope", () => {
+    const envelope = JSON.stringify({
+      originalError: {
+        message:
+          'Authentication required for "GitHub". To authenticate, visit: https://example.com/connect/github',
+      },
+    });
+    expect(parseAuthRequired(envelope)?.catalogName).toBe("GitHub");
+  });
+});
+
+describe("a tool call that finds no device with the MCP bridge", () => {
+  it("is read from the error text, in the current and the older wording", () => {
+    expect(
+      isNoDeviceError({
+        errorText:
+          "MCP error -32603: No device is linked. Set up the MCP bridge on your device from the Device tab of Personal Settings and try again.",
+      }),
+    ).toBe(true);
+    expect(
+      isNoDeviceError({
+        errorText:
+          "MCP error -32603: No device is connected. Start the MCP bridge on your computer from the Connect page and try again.",
+      }),
+    ).toBe(true);
+    expect(
+      isNoDeviceError({ rawOutput: "No device is linked. Set up ..." }),
+    ).toBe(true);
+  });
+
+  it("is not a device that is linked but offline", () => {
+    expect(
+      isNoDeviceError({
+        errorText:
+          'Device "MBP" is offline. Start the MCP bridge on that device and try again.',
+      }),
+    ).toBe(false);
+    expect(isNoDeviceError({})).toBe(false);
+  });
+
+  it("offers the MCP bridge setup until a device is linked", () => {
+    expect(noDevicePromptCopy({ linked: false }).buttonText).toBe(
+      "Set up the MCP bridge",
+    );
+    expect(noDevicePromptCopy({ linked: true })).toEqual({
+      title: "Device linked",
+      description: "Your device is linked. Try again.",
     });
   });
 });

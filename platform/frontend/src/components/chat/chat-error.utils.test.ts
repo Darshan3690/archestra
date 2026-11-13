@@ -1,4 +1,9 @@
-import { ChatErrorCode, ChatErrorMessages, RetryableErrorCodes } from "@shared";
+// @vitest-environment node
+import {
+  ChatErrorCode,
+  ChatErrorMessages,
+  RetryableErrorCodes,
+} from "@archestra/shared";
 import { describe, expect, it } from "vitest";
 import {
   AI_SDK_INTERNAL_TYPES,
@@ -211,6 +216,21 @@ describe("chat-error.utils", () => {
       });
     });
 
+    it("classifies Safari fetch failures without treating arbitrary TypeErrors as network failures", () => {
+      expect(mapClientError(new TypeError("Load failed"))).toEqual({
+        code: ChatErrorCode.NetworkError,
+        message: ChatErrorMessages[ChatErrorCode.NetworkError],
+        isRetryable: true,
+      });
+      expect(
+        mapClientError(new TypeError("Cannot read properties of undefined"))
+          .code,
+      ).toBe(ChatErrorCode.Unknown);
+      expect(
+        mapClientError(new Error("Load failed for unsupported document")).code,
+      ).toBe(ChatErrorCode.Unknown);
+    });
+
     it("extracts backend error.message from JSON envelopes", () => {
       expect(
         mapClientError(
@@ -220,6 +240,62 @@ describe("chat-error.utils", () => {
         code: ChatErrorCode.Unknown,
         message: "Request failed",
         isRetryable: RetryableErrorCodes.has(ChatErrorCode.Unknown),
+      });
+    });
+
+    it("maps api_payload_too_large_error to InvalidRequest with backend message", () => {
+      const backendMessage =
+        "Request body too large: 65.0 MB (limit 50 MB). Use a smaller attachment, or raise ARCHESTRA_API_BODY_LIMIT.";
+      expect(
+        mapClientError(
+          new Error(
+            JSON.stringify({
+              error: {
+                message: backendMessage,
+                type: "api_payload_too_large_error",
+              },
+            }),
+          ),
+        ),
+      ).toEqual({
+        code: ChatErrorCode.InvalidRequest,
+        message: backendMessage,
+        isRetryable: RetryableErrorCodes.has(ChatErrorCode.InvalidRequest),
+      });
+    });
+
+    it("maps an HTML error page to a retryable ServerError with friendly copy", () => {
+      // The AI SDK throws the response text verbatim, so a proxy/ingress 502
+      // in front of the backend produces an Error whose message is raw HTML.
+      const result = mapClientError(
+        new Error(
+          "<html> <head><title>502 Bad Gateway</title></head> <body> <center><h1>502 Bad Gateway</h1></center> </body> </html> <!-- a padding to disable MSIE and Chrome friendly error page -->",
+        ),
+      );
+      expect(result).toEqual({
+        code: ChatErrorCode.ServerError,
+        message:
+          "The service is temporarily unavailable. Please try again shortly.",
+        isRetryable: true,
+      });
+    });
+
+    it("maps api_internal_server_error to retryable ServerError", () => {
+      expect(
+        mapClientError(
+          new Error(
+            JSON.stringify({
+              error: {
+                message: "Database connection failed",
+                type: "api_internal_server_error",
+              },
+            }),
+          ),
+        ),
+      ).toEqual({
+        code: ChatErrorCode.ServerError,
+        message: "Database connection failed",
+        isRetryable: RetryableErrorCodes.has(ChatErrorCode.ServerError),
       });
     });
   });

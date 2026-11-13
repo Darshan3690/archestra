@@ -59,26 +59,7 @@ Before starting, verify the development environment is running:
 
 ---
 
-## Test 3: Disable Optimization Rules (Clean Baseline)
-
-**Objective**: Ensure no cost optimization rules or tool result compression interfere with testing.
-
-### Steps
-
-1. Navigate to Cost Settings → Optimization Rules (`http://localhost:3000/llm/cost/optimization-rules`)
-2. Disable or delete any existing optimization rules
-3. Navigate to Organization Settings
-4. Ensure "Tool Result Compression (TOON)" is DISABLED at the organization level
-5. If there are no existing optimization rules - try to refresh the page completely. Try this at most once.
-
-### Expected Result
-
-- TOON compression shows as "Disabled" in the UI
-- No active optimization rules (or all are disabled)
-
----
-
-## Test 4: GitHub Issues Overview (Initial Request)
+## Test 3: GitHub Issues Overview (Initial Request)
 
 **Objective**: Verify MCP tools execute correctly and return meaningful data.
 
@@ -87,7 +68,7 @@ Before starting, verify the development environment is running:
 1. Navigate to Chat (`http://localhost:3000/chat`)
 2. Select the profile with GitHub tools assigned
 3. Start a new conversation
-4. Send message: "Give a short overview of the open issues in https://github.com/archestra-ai/website"
+4. Send message: "Give a short overview of the open issues in https://github.com/archestra-ai/archestra"
 
 ### Expected Result
 
@@ -103,113 +84,7 @@ Before starting, verify the development environment is running:
 
 ---
 
-## Test 5: Tool Invocation Policy (Untrusted Data Blocking)
-
-**Objective**: Verify that tool invocation is blocked when context contains untrusted data.
-
-### Precondition
-
-The previous conversation from Test 4 contains tool results (untrusted data by default).
-
-### Steps
-
-1. **In the same conversation from Test 4**, send another message:
-   "github whoami"
-
-This prompt forces a tool invocation (`get_me`) rather than allowing the LLM to answer from context.
-
-### Expected Result
-
-- Tool invocation is BLOCKED
-- Response indicates tools cannot be invoked due to tool invocation policy
-- Error message mentions "untrusted data" or "tool invocation policy"
-
-### Verification
-
-1. Check LLM Proxy Logs - should show blocked tool invocation
-2. Interaction should be recorded with policy violation
-
-### Alternative Test (if untrusted data policy doesn't exist)
-
-Create a tool invocation policy:
-1. Navigate to the profile's Policies tab
-2. Create a Trusted Data Policy that marks `list_issues` results as untrusted
-3. Retry the conversation
-
----
-
-## Test 6: Tool Result Compression (TOON Format)
-
-**Objective**: Verify TOON compression is applied to tool results when enabled.
-
-### Steps
-
-1. Navigate to Organization Settings
-2. Enable "Tool Result Compression (TOON)" at organization level
-3. Navigate to Chat and start a NEW conversation
-4. Select the profile with GitHub tools
-5. Send message: "Give a short overview of the open issues in https://github.com/archestra-ai/website"
-
-### Expected Result
-
-- Tool executes successfully
-- In LLM Proxy Logs, the **processed request** shows tool results in TOON format
-
-### TOON Format Verification
-
-Look for compressed format in logs:
-```
-issues[N]{title,number,state,...}  // TOON format
-```
-
-Instead of standard JSON:
-```json
-[{"title": "...", "number": 1, "state": "open", ...}]
-```
-
-### Additional Step (if needed)
-
-If `list_issues` is blocked in untrusted context due to Test 5:
-1. Navigate to profile Policies
-2. Add a Trusted Data Policy that allows `list_issues` execution in untrusted context
-3. Retry the test
-
-### Cleanup
-
-- Keep TOON enabled for next test, or note to disable after testing
-
----
-
-## Test 7: Model Optimization Rules
-
-**Objective**: Verify cost optimization rules correctly swap models and display savings.
-
-### Steps
-
-1. Navigate to Cost Settings → Optimization Rules (`http://localhost:3000/llm/cost/optimization-rules`)
-2. Create a new optimization rule:
-   - Provider: Based on the user prompt.
-   - Condition: `maxLength < 10000`
-   - Enabled: true
-3. Navigate to Chat and start a NEW conversation
-4. Send a short message that matches the rule condition:
-   "Give a short overview of the open issues in https://github.com/archestra-ai/website"
-
-### Expected Result
-
-- Response includes cost optimization percentage indicator
-- In LLM Proxy Logs, the interaction shows "optimized model" was used
-- Cost savings are displayed in the UI or logs
-
-### Verification
-
-1. Check LLM Proxy Logs for the request
-2. Look for `optimizedModel` field in the interaction data
-3. Verify the model in the request differs from the original model specified
-
----
-
-## Test 8: LLM Proxy Tool Discovery (External MCP Server)
+## Test 4: LLM Proxy Tool Discovery (External MCP Server)
 
 **Objective**: Verify tools can be discovered via LLM Proxy when MCP server runs externally (not in Archestra's K8s).
 

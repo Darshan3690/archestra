@@ -1,46 +1,60 @@
 "use client";
 
-import { E2eTestId } from "@shared";
-import type { ColumnDef } from "@tanstack/react-table";
-import { formatDistanceToNow } from "date-fns";
-import { Copy, Eye, Plus, Shield, Trash2, UserCog } from "lucide-react";
+import { E2eTestId, getRoleDisplayName } from "@archestra/shared";
+import type { ColumnDef, RowSelectionState } from "@tanstack/react-table";
+import { formatDistanceToNow } from "date-fns/formatDistanceToNow";
+import {
+  Copy,
+  Eye,
+  Plus,
+  ShieldAlert,
+  ShieldCheck,
+  Trash2,
+  UserCog,
+  Users,
+} from "lucide-react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { ErrorBoundary } from "@/app/_parts/error-boundary";
 import { AuthProviderIcon } from "@/components/auth-provider-icon";
 import { DeleteConfirmDialog } from "@/components/delete-confirm-dialog";
+import {
+  CollectionFilters,
+  FilterBar,
+  filterSearchClass,
+} from "@/components/filter-bar";
 import { FormDialog } from "@/components/form-dialog";
 import { InviteByLinkCard } from "@/components/invite-by-link-card";
-import { LoadingSpinner, LoadingWrapper } from "@/components/loading";
-import { RoleOptionLabel } from "@/components/role-type-icon";
+import { LoadingWrapper } from "@/components/loading";
+import { RoleAssignmentBlockedNotice } from "@/components/role-assignment-blocked-notice";
 import { SearchInput } from "@/components/search-input";
-import { TableFilters } from "@/components/table-filters";
+import { SmallTeamTierBanner } from "@/components/small-team-tier-banner";
 import { TableRowActions } from "@/components/table-row-actions";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
+import { BulkActions } from "@/components/ui/bulk-actions-bar";
+import { BulkActionsScope } from "@/components/ui/bulk-actions-context";
+import { createSelectColumn } from "@/components/ui/bulk-select-column";
 import { Button } from "@/components/ui/button";
 import { DataTable } from "@/components/ui/data-table";
 import { DialogBody, DialogStickyFooter } from "@/components/ui/dialog";
 import { PermissionButton } from "@/components/ui/permission-button";
 import { RoleSelect } from "@/components/ui/role-select";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { DEFAULT_TABLE_LIMIT } from "@/consts";
 import { useHasPermissions, useSession } from "@/lib/auth/auth.query";
+import { type BulkOutcome, reportBulkOutcome } from "@/lib/bulk-action";
+import { copyToClipboard } from "@/lib/clipboard";
 import { useDisableInvitations } from "@/lib/config/config.query";
+import { useControlledRowSelection } from "@/lib/hooks/use-bulk-selection";
 import {
   useCanImpersonate,
   useImpersonateUser,
-  useImpersonationCandidates,
 } from "@/lib/impersonation.query";
 import {
   type Invitation,
   type Member,
+  useAllMatchingMembers,
+  useBulkDeleteMembers,
   useCancelInvitationMutation,
   useInvitationsPaginated,
   useMembersPaginated,
@@ -48,18 +62,19 @@ import {
   useUpdateMemberRole,
 } from "@/lib/member.query";
 import {
-  type PendingSignupMember,
-  useActiveOrganization,
+  useActiveOrganizationId,
   useDeletePendingSignupMember,
   useMemberSignupStatus,
+  useOrganization,
 } from "@/lib/organization.query";
-import { useRoles } from "@/lib/role.query";
-import { cn } from "@/lib/utils";
+import { formatRoleName } from "@/lib/utils/role";
+import { cn } from "@/lib/utils/tailwind";
 import { useSetSettingsAction } from "../layout";
 
 export default function UsersPageClient() {
   return (
     <ErrorBoundary>
+      <SmallTeamTierBanner />
       <UsersPageContent />
     </ErrorBoundary>
   );
@@ -67,12 +82,21 @@ export default function UsersPageClient() {
 
 function UsersPageContent() {
   const setActionButton = useSetSettingsAction();
-  const { data: activeOrg, isPending: isOrgPending } = useActiveOrganization();
+  const { data: activeOrganizationId, isPending: isOrgPending } =
+    useActiveOrganizationId();
   const searchParams = useSearchParams();
   const router = useRouter();
   const pathname = usePathname();
 
-  const activeTab = searchParams.get("tab") || "users";
+  const invitationsEnabled = useInvitationsEnabled();
+  // A deployment with invitations turned off has no invitations tab to select,
+  // so a `?tab=invitations` link (a bookmark, or one shared before the flag was
+  // flipped) resolves to the users tab rather than an unreachable panel.
+  const tabFromUrl = searchParams.get("tab") || "users";
+  const activeTab =
+    tabFromUrl === "invitations" && invitationsEnabled
+      ? "invitations"
+      : "users";
 
   const setActiveTab = useCallback(
     (tab: string) => {
@@ -88,19 +112,31 @@ function UsersPageContent() {
 
   useEffect(() => {
     setActionButton(
-      activeOrg ? <InviteUserButton organizationId={activeOrg.id} /> : null,
+      activeOrganizationId ? (
+        <InviteUserButton organizationId={activeOrganizationId} />
+      ) : null,
     );
 
     return () => setActionButton(null);
-  }, [activeOrg, setActionButton]);
+  }, [activeOrganizationId, setActionButton]);
+
+  // With invitations off there is only one thing to show, so no tablist is
+  // rendered — and a tabpanel whose aria-labelledby points at a tab button that
+  // does not exist is worse than a plain container.
+  const tabPanelProps = invitationsEnabled
+    ? ({
+        // Single always-mounted panel keeps each tab's aria-controls
+        // pointing at an element that exists (the panel's content swaps).
+        role: "tabpanel",
+        id: USERS_TABPANEL_ID,
+        "aria-labelledby": `${activeTab}-tab`,
+      } as const)
+    : {};
 
   return (
-    <LoadingWrapper
-      isPending={isOrgPending}
-      loadingFallback={<LoadingSpinner />}
-    >
-      {activeOrg ? (
-        <div className="space-y-6">
+    <LoadingWrapper isPending={isOrgPending} loadingFallback={null}>
+      {activeOrganizationId ? (
+        <div className="space-y-6" {...tabPanelProps}>
           {activeTab === "users" ? (
             <MembersTab activeTab={activeTab} onTabChange={setActiveTab} />
           ) : (
@@ -117,6 +153,28 @@ function UsersPageContent() {
   );
 }
 
+const USERS_TABPANEL_ID = "users-tabpanel";
+
+const USER_TABS = [
+  { id: "users", label: "Users" },
+  { id: "invitations", label: "Invitations" },
+] as const;
+
+/**
+ * Whether this deployment can invite anyone at all.
+ *
+ * Invitations are a deployment-level switch
+ * (`ARCHESTRA_AUTH_DISABLE_INVITATIONS`), not a permission: with them off the
+ * invite endpoints refuse, so every invitation affordance — the invite button
+ * and the invitations tab — stays hidden rather than leading somewhere that
+ * cannot work. `undefined` means the public config is still in flight; treat
+ * that as off so the affordance never flashes in and then disappears.
+ */
+function useInvitationsEnabled() {
+  const disableInvitations = useDisableInvitations();
+  return disableInvitations === undefined ? false : !disableInvitations;
+}
+
 function TabButtons({
   activeTab,
   onTabChange,
@@ -124,24 +182,57 @@ function TabButtons({
   activeTab: string;
   onTabChange: (tab: string) => void;
 }) {
+  const invitationsEnabled = useInvitationsEnabled();
+  const tabs = USER_TABS.filter(
+    (tab) => tab.id !== "invitations" || invitationsEnabled,
+  );
+
+  // Switching tabs swaps the whole MembersTab/InvitationsTab subtree —
+  // including this component — so the newly active tab button must be
+  // re-focused after the replacement mounts or keyboard focus drops to <body>.
+  const selectTab = (tabId: string) => {
+    onTabChange(tabId);
+    requestAnimationFrame(() => {
+      document.getElementById(`${tabId}-tab`)?.focus();
+    });
+  };
+
+  // A switcher with a single destination is a label, not a control.
+  if (tabs.length < 2) return null;
+
   return (
-    <div className="flex gap-1 rounded-lg bg-muted p-1">
-      <Button
-        variant={activeTab === "users" ? "secondary" : "ghost"}
-        size="sm"
-        onClick={() => onTabChange("users")}
-        className={cn("px-3", activeTab === "users" && "shadow-sm")}
-      >
-        Users
-      </Button>
-      <Button
-        variant={activeTab === "invitations" ? "secondary" : "ghost"}
-        size="sm"
-        onClick={() => onTabChange("invitations")}
-        className={cn("px-3", activeTab === "invitations" && "shadow-sm")}
-      >
-        Invitations
-      </Button>
+    <div
+      role="tablist"
+      aria-label="Users and invitations"
+      // `h-8 p-0.5` keeps the switcher level with the filter bar's controls;
+      // the stock `p-1` around size-sm buttons stands 8px taller than the row.
+      className="flex h-8 items-center gap-1 rounded-lg bg-muted p-0.5"
+    >
+      {tabs.map((tab) => {
+        const isActive = activeTab === tab.id;
+        return (
+          <Button
+            key={tab.id}
+            role="tab"
+            id={`${tab.id}-tab`}
+            aria-selected={isActive}
+            aria-controls={USERS_TABPANEL_ID}
+            tabIndex={isActive ? 0 : -1}
+            variant={isActive ? "secondary" : "ghost"}
+            size="sm"
+            onClick={() => selectTab(tab.id)}
+            onKeyDown={(e) => {
+              if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+                e.preventDefault();
+                selectTab(tab.id === "users" ? "invitations" : "users");
+              }
+            }}
+            className={cn("h-7 px-3", isActive && "shadow-sm")}
+          >
+            {tab.label}
+          </Button>
+        );
+      })}
     </div>
   );
 }
@@ -149,9 +240,7 @@ function TabButtons({
 function InviteUserButton({ organizationId }: { organizationId: string }) {
   const [inviteDialogOpen, setInviteDialogOpen] = useState(false);
   const { data: canInvite } = useHasPermissions({ invitation: ["create"] });
-  const disableInvitations = useDisableInvitations();
-  const invitationsEnabled =
-    disableInvitations === undefined ? false : !disableInvitations;
+  const invitationsEnabled = useInvitationsEnabled();
 
   if (!invitationsEnabled || !canInvite) return null;
 
@@ -159,6 +248,7 @@ function InviteUserButton({ organizationId }: { organizationId: string }) {
     <>
       <PermissionButton
         permissions={{ invitation: ["create"] }}
+        size="sm"
         onClick={() => setInviteDialogOpen(true)}
       >
         <Plus className="h-4 w-4" />
@@ -191,6 +281,7 @@ function MembersTab({
   const searchParams = useSearchParams();
   const router = useRouter();
   const pathname = usePathname();
+  const { data: organization } = useOrganization();
 
   const pageFromUrl = searchParams.get("page");
   const limitFromUrl = searchParams.get("limit");
@@ -213,18 +304,19 @@ function MembersTab({
   });
 
   const updateMemberRole = useUpdateMemberRole();
+  const bulkDeleteMembers = useBulkDeleteMembers();
   const removeMember = useRemoveMember();
-  const { data: signupStatus } = useMemberSignupStatus();
+  const pageMemberIds = membersResponse?.data?.map((member) => member.userId);
+  const { data: signupStatus } = useMemberSignupStatus({
+    userIds: pageMemberIds ?? [],
+    enabled: (pageMemberIds?.length ?? 0) > 0,
+  });
   const pendingSignupMembers = signupStatus?.pendingSignupMembers ?? [];
   const deletePendingSignupMember = useDeletePendingSignupMember();
 
   const { data: session } = useSession();
   const currentUserId = session?.user.id;
   const canImpersonate = useCanImpersonate();
-  const { data: impersonationCandidates } = useImpersonationCandidates();
-  const impersonableUserIds = new Set(
-    (impersonationCandidates ?? []).map((c) => c.id),
-  );
   const { mutate: impersonateUser, isPending: isImpersonatingUser } =
     useImpersonateUser();
 
@@ -250,22 +342,94 @@ function MembersTab({
 
   const members = membersResponse?.data || [];
   const pagination = membersResponse?.pagination;
-  const tableRows =
-    pageIndex === 0 ? [...pendingSignupMembers, ...members] : members;
 
-  const columns: ColumnDef<Member | PendingSignupMember>[] = [
+  /**
+   * Pending-signup users are ordinary rows of the `member` table — the
+   * signup-status endpoint just reports which of them have no account record
+   * yet — so `/api/members` already returns them, on whichever page they sort
+   * onto. Their pending-ness is therefore an attribute of a member row, looked
+   * up here, and never a row of its own: prepending them produced a duplicate
+   * of each on page one, a first page longer than the page size, and a total
+   * inflated past the real member count, which in turn advertised a trailing
+   * page whose offset lands beyond the last member and renders empty.
+   */
+  const pendingSignupByUserId = new Map(
+    pendingSignupMembers.map((pending) => [pending.userId, pending]),
+  );
+  const pendingSignupFor = (member: Member) =>
+    pendingSignupByUserId.get(member.userId);
+
+  // Show the column while the requirement is on, and keep showing it once
+  // anyone is enrolled — turning the requirement off should not blind admins
+  // to who still has 2FA.
+  const showTwoFactorColumn =
+    !!organization?.requireTwoFactor ||
+    members.some((member) => member.twoFactorEnabled);
+
+  const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
+  const [bulkRemoveOpen, setBulkRemoveOpen] = useState(false);
+  const clearSelection = useCallback(() => {
+    setRowSelection({});
+    setEscalatedFor(null);
+  }, []);
+
+  /**
+   * Your own membership is never part of a selection — removing yourself from
+   * the organization mid-batch would revoke the session doing the removing.
+   */
+  const isSelf = (row: Member) => row.userId === currentUserId;
+
+  const filterSignature = JSON.stringify({ nameFilter, roleFilter });
+  const [escalatedFor, setEscalatedFor] = useState<string | null>(null);
+  const allMatchingSelected = escalatedFor === filterSignature;
+  const { effectiveRowSelection, onRowSelectionChange } =
+    useControlledRowSelection({
+      rowSelection,
+      setRowSelection,
+      rows: members,
+      getRowId: (row) => row.id,
+      allMatchingSelected,
+      clearEscalation: () => setEscalatedFor(null),
+      canSelect: (row) => !isSelf(row),
+    });
+  const { data: allMatchingMembers, isFetching: isFetchingAllMatching } =
+    useAllMatchingMembers(
+      { name: nameFilter || undefined, role: roleFilter || undefined },
+      { enabled: allMatchingSelected },
+    );
+
+  const pageSelection = members.filter(
+    (row) => !isSelf(row) && effectiveRowSelection[row.id],
+  );
+  const selectedMembers =
+    allMatchingSelected && allMatchingMembers
+      ? allMatchingMembers.filter((row) => !isSelf(row))
+      : pageSelection;
+
+  const selectableTotal = allMatchingMembers
+    ? allMatchingMembers.filter((row) => !isSelf(row)).length
+    : Math.max(0, (pagination?.total ?? 0) - (members.some(isSelf) ? 1 : 0));
+
+  const columns: ColumnDef<Member>[] = [
+    createSelectColumn<Member>({
+      rowLabel: (row) => `Select ${row.email}`,
+      allLabel: "Select all users on this page",
+      canSelect: (row) => !isSelf(row),
+      disabledReason: () => "You cannot remove your own account",
+    }),
     {
       id: "avatar",
       size: 40,
       header: "",
       cell: ({ row }) => {
         const member = row.original;
-        if ("provider" in member) {
+        const pending = pendingSignupFor(member);
+        if (pending) {
           return (
             <div className="flex items-center justify-center">
               <div className="flex h-8 w-8 items-center justify-center rounded-full border bg-muted/40">
                 <AuthProviderIcon
-                  providerId={member.provider}
+                  providerId={pending.provider}
                   size={16}
                   className="rounded-sm"
                 />
@@ -309,15 +473,43 @@ function MembersTab({
       header: "Role",
       cell: ({ row }) => (
         <Badge variant="outline" className="capitalize">
-          {row.original.role}
+          {getRoleDisplayName(row.original.role)}
         </Badge>
       ),
     },
+    ...(showTwoFactorColumn
+      ? [
+          {
+            id: "twoFactor",
+            header: "2FA",
+            cell: ({ row }) =>
+              pendingSignupFor(row.original) ? (
+                <span className="text-sm text-muted-foreground">—</span>
+              ) : row.original.twoFactorEnabled ? (
+                <span
+                  className="inline-flex items-center gap-1 text-sm text-green-600 dark:text-green-500"
+                  title="Two-factor authentication enrolled"
+                >
+                  <ShieldCheck className="h-4 w-4" />
+                  <span>Enrolled</span>
+                </span>
+              ) : (
+                <span
+                  className="inline-flex items-center gap-1 text-sm text-amber-600 dark:text-amber-500"
+                  title="Not yet enrolled — signed out until they set 2FA up"
+                >
+                  <ShieldAlert className="h-4 w-4" />
+                  <span>Not enrolled</span>
+                </span>
+              ),
+          } satisfies ColumnDef<Member>,
+        ]
+      : []),
     {
       id: "joined",
       header: "Joined",
       cell: ({ row }) =>
-        "provider" in row.original ? (
+        pendingSignupFor(row.original) ? (
           <span className="text-sm text-muted-foreground">
             Pending (auto-provisioned)
           </span>
@@ -335,21 +527,23 @@ function MembersTab({
       enableHiding: false,
       cell: ({ row }) => {
         const member = row.original;
-        if ("provider" in member) {
+        const pending = pendingSignupFor(member);
+        if (pending) {
           return (
             <TableRowActions
+              itemName={member.email}
               actions={[
                 {
                   icon: <Copy className="h-4 w-4" />,
                   label: "Copy invitation link",
-                  disabled: !member.invitationId,
-                  disabledTooltip: member.invitationId
+                  disabled: !pending.invitationId,
+                  disabledTooltip: pending.invitationId
                     ? undefined
                     : "No invitation link available",
                   onClick: async () => {
-                    if (!member.invitationId) return;
-                    const link = `${window.location.origin}/auth/sign-up-with-invitation?invitationId=${member.invitationId}&email=${encodeURIComponent(member.email)}`;
-                    await navigator.clipboard.writeText(link);
+                    if (!pending.invitationId) return;
+                    const link = `${window.location.origin}/auth/sign-up-with-invitation?invitationId=${pending.invitationId}&email=${encodeURIComponent(member.email)}`;
+                    await copyToClipboard(link);
                   },
                 },
                 {
@@ -365,13 +559,13 @@ function MembersTab({
           );
         }
 
+        // Every listed member except the caller can be impersonated.
         const canImpersonateThisUser =
-          canImpersonate &&
-          member.userId !== currentUserId &&
-          impersonableUserIds.has(member.userId);
+          canImpersonate && !!currentUserId && member.userId !== currentUserId;
 
         return (
           <TableRowActions
+            itemName={member.email}
             actions={[
               {
                 icon: <UserCog className="h-4 w-4" />,
@@ -385,7 +579,7 @@ function MembersTab({
                     {
                       icon: <Eye className="h-4 w-4" />,
                       label: "View as user",
-                      permissions: { member: ["update"] },
+                      permissions: { member: ["impersonate"] },
                       disabled: isImpersonatingUser,
                       testId: `${E2eTestId.ImpersonationViewAsButton}-${member.userId}`,
                       onClick: () => impersonateUser(member.userId),
@@ -407,34 +601,69 @@ function MembersTab({
   ];
 
   return (
-    <>
-      <TableFilters>
-        <SearchInput
-          objectNamePlural="users"
-          searchFields={["name", "email"]}
-          paramName="name"
-        />
-        <RoleFilterDropdown />
-        <div className="ml-auto flex items-center gap-2">
-          <TabButtons activeTab={activeTab} onTabChange={onTabChange} />
-        </div>
-      </TableFilters>
+    <BulkActionsScope>
+      <CollectionFilters>
+        <FilterBar
+          actions={
+            <TabButtons activeTab={activeTab} onTabChange={onTabChange} />
+          }
+          search={
+            <SearchInput
+              isLoading={isFetching}
+              objectNamePlural="users"
+              searchFields={["name", "email"]}
+              paramName="name"
+              className={filterSearchClass}
+            />
+          }
+        >
+          <RoleFilterDropdown />
+        </FilterBar>
+      </CollectionFilters>
 
-      <LoadingWrapper
-        isPending={isPending}
-        loadingFallback={<LoadingSpinner />}
-      >
+      <LoadingWrapper isPending={isPending} loadingFallback={null}>
+        <BulkActions
+          count={selectedMembers.length}
+          noun="user"
+          onClear={clearSelection}
+          busy={bulkDeleteMembers.isPending || isFetchingAllMatching}
+          selectAllMatching={{
+            total: selectableTotal,
+            pageFullySelected:
+              members.length > 0 &&
+              members
+                .filter((row) => !isSelf(row))
+                .every((row) => effectiveRowSelection[row.id]),
+            active: allMatchingSelected,
+            onSelectAll: () => setEscalatedFor(filterSignature),
+            matchDescription: nameFilter
+              ? "match this search query"
+              : "match the current filters",
+          }}
+        >
+          <PermissionButton
+            permissions={{ member: ["delete"] }}
+            variant="destructive"
+            size="sm"
+            onClick={() => setBulkRemoveOpen(true)}
+          >
+            <Trash2 className="h-4 w-4" />
+            <span>Remove</span>
+          </PermissionButton>
+        </BulkActions>
+
         <DataTable
           columns={columns}
-          data={tableRows}
+          data={members}
+          rowSelection={effectiveRowSelection}
+          onRowSelectionChange={onRowSelectionChange}
+          hideSelectedCount
           manualPagination
-          getRowId={(row) =>
-            "provider" in row ? `pending-${row.userId}` : row.id
-          }
+          getRowId={(row) => row.id}
           pagination={{
             pageIndex,
             pageSize,
-            total: (pagination?.total || 0) + pendingSignupMembers.length,
+            total: pagination?.total || 0,
           }}
           onPaginationChange={handlePaginationChange}
           isLoading={isFetching}
@@ -444,25 +673,79 @@ function MembersTab({
             params.delete("name");
             params.delete("role");
             params.set("page", "1");
-            router.push(`${pathname}?${params.toString()}`, { scroll: false });
+            router.push(`${pathname}?${params.toString()}`, {
+              scroll: false,
+            });
           }}
         />
       </LoadingWrapper>
-
       {/* Change Role Dialog */}
       {changingRole && (
         <ChangeRoleDialog
           member={changingRole.member}
           open={!!changingRole}
-          onOpenChange={(open) => !open && setChangingRole(null)}
+          onOpenChange={(open) => {
+            if (open) return;
+            setChangingRole(null);
+            updateMemberRole.reset();
+          }}
           onConfirm={async (newRole) => {
-            await updateMemberRole.mutateAsync({
-              memberId: changingRole.member.id,
-              role: newRole,
-            });
+            const updated = await updateMemberRole
+              .mutateAsync({
+                memberId: changingRole.member.id,
+                role: newRole,
+              })
+              // The dialog shows a refused role; other errors were toasted.
+              .catch(() => null);
+            if (!updated) return;
             setChangingRole(null);
           }}
+          onRoleChange={() => updateMemberRole.reset()}
+          error={updateMemberRole.error}
           isPending={updateMemberRole.isPending}
+        />
+      )}
+
+      {bulkRemoveOpen && (
+        <DeleteConfirmDialog
+          open={bulkRemoveOpen}
+          onOpenChange={setBulkRemoveOpen}
+          title="Remove users"
+          description={`Remove ${selectedMembers.length} ${
+            selectedMembers.length === 1 ? "user" : "users"
+          } from the organization? Pending invitations are withdrawn; accepted members lose access.`}
+          isPending={bulkDeleteMembers.isPending}
+          onConfirm={() => {
+            const labels = new Map(
+              selectedMembers.map((member) => [
+                pendingSignupFor(member)
+                  ? `pendingSignup:${member.userId}`
+                  : `member:${member.id}`,
+                member.email,
+              ]),
+            );
+            bulkDeleteMembers.mutate(
+              selectedMembers.map((member) =>
+                pendingSignupFor(member)
+                  ? { kind: "pendingSignup" as const, id: member.userId }
+                  : { kind: "member" as const, id: member.id },
+              ),
+              {
+                onSuccess: (outcome) => {
+                  reportBulkOutcome({
+                    outcome: toBulkOutcome(outcome, labels),
+                    verb: "Removed",
+                    failureVerb: "remove",
+                    noun: "user",
+                  });
+                  setBulkRemoveOpen(false);
+                  if (outcome.failed.length === 0) clearSelection();
+                },
+              },
+            );
+          }}
+          confirmLabel="Remove users"
+          pendingLabel="Removing..."
         />
       )}
 
@@ -481,7 +764,7 @@ function MembersTab({
           pendingLabel="Removing..."
         />
       )}
-    </>
+    </BulkActionsScope>
   );
 }
 
@@ -489,10 +772,8 @@ function RoleFilterDropdown() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const pathname = usePathname();
-  const { data: roles = [] } = useRoles();
 
   const currentRole = searchParams.get("role") || "all";
-  const selectedRole = roles.find((role) => role.role === currentRole);
 
   const handleChange = useCallback(
     (value: string) => {
@@ -509,30 +790,12 @@ function RoleFilterDropdown() {
   );
 
   return (
-    <Select value={currentRole} onValueChange={handleChange}>
-      <SelectTrigger className="w-[180px]">
-        {selectedRole ? (
-          <RoleOptionLabel
-            predefined={selectedRole.predefined}
-            label={selectedRole.name}
-            className="pr-6"
-          />
-        ) : (
-          <div className="flex items-center gap-2 text-muted-foreground">
-            <Shield className="h-4 w-4" />
-            <SelectValue placeholder="Filter by role" />
-          </div>
-        )}
-      </SelectTrigger>
-      <SelectContent>
-        <SelectItem value="all">All Roles</SelectItem>
-        {roles.map((role) => (
-          <SelectItem key={role.id} value={role.role}>
-            <RoleOptionLabel predefined={role.predefined} label={role.name} />
-          </SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
+    <RoleSelect
+      mode="filter"
+      value={currentRole}
+      onValueChange={handleChange}
+      data-testid={E2eTestId.UsersRoleFilter}
+    />
   );
 }
 
@@ -541,12 +804,16 @@ function ChangeRoleDialog({
   open,
   onOpenChange,
   onConfirm,
+  onRoleChange,
+  error,
   isPending,
 }: {
   member: Member;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onConfirm: (role: string) => void;
+  onRoleChange: () => void;
+  error: unknown;
   isPending: boolean;
 }) {
   const [selectedRole, setSelectedRole] = useState(member.role);
@@ -559,10 +826,10 @@ function ChangeRoleDialog({
     <FormDialog
       open={open}
       onOpenChange={onOpenChange}
-      title="Change Role"
+      title="Change Roles"
       description={
         <>
-          Update the role for{" "}
+          Update the roles for{" "}
           <span className="font-medium text-foreground">
             {member.name || member.email}
           </span>
@@ -572,9 +839,18 @@ function ChangeRoleDialog({
     >
       <DialogBody className="space-y-4">
         <RoleSelect
+          multiple
           value={selectedRole}
-          onValueChange={setSelectedRole}
+          onValueChange={(role) => {
+            setSelectedRole(role);
+            onRoleChange();
+          }}
+          ariaLabel="Roles"
           className="w-full"
+        />
+        <RoleAssignmentBlockedNotice
+          error={error}
+          name={formatRoleName(selectedRole)}
         />
       </DialogBody>
       <DialogStickyFooter>
@@ -585,7 +861,7 @@ function ChangeRoleDialog({
           onClick={() => onConfirm(selectedRole)}
           disabled={isPending || selectedRole === member.role}
         >
-          {isPending ? "Updating..." : "Update Role"}
+          {isPending ? "Updating..." : "Update Roles"}
         </Button>
       </DialogStickyFooter>
     </FormDialog>
@@ -613,7 +889,11 @@ function InvitationsTab({
   const pageSize = Number(limitFromUrl) || DEFAULT_TABLE_LIMIT;
   const offset = pageIndex * pageSize;
 
-  const { data: invitationsResponse, isPending } = useInvitationsPaginated({
+  const {
+    data: invitationsResponse,
+    isPending,
+    isFetching,
+  } = useInvitationsPaginated({
     limit: pageSize,
     offset,
   });
@@ -653,7 +933,7 @@ function InvitationsTab({
       header: "Role",
       cell: ({ row }) => (
         <Badge variant="outline" className="capitalize">
-          {row.original.role ?? "member"}
+          {getRoleDisplayName(row.original.role ?? "member")}
         </Badge>
       ),
     },
@@ -689,6 +969,7 @@ function InvitationsTab({
       enableHiding: false,
       cell: ({ row }) => (
         <TableRowActions
+          itemName={row.original.email}
           actions={[
             {
               icon: <Trash2 className="h-4 w-4" />,
@@ -704,17 +985,16 @@ function InvitationsTab({
   ];
 
   return (
-    <>
-      <div className="flex items-center gap-4 mb-4">
-        <div className="ml-auto">
-          <TabButtons activeTab={activeTab} onTabChange={onTabChange} />
-        </div>
-      </div>
+    <div>
+      <CollectionFilters>
+        <FilterBar
+          actions={
+            <TabButtons activeTab={activeTab} onTabChange={onTabChange} />
+          }
+        />
+      </CollectionFilters>
 
-      <LoadingWrapper
-        isPending={isPending}
-        loadingFallback={<LoadingSpinner />}
-      >
+      <LoadingWrapper isPending={isPending} loadingFallback={null}>
         <DataTable
           columns={columns}
           data={invitations}
@@ -725,7 +1005,8 @@ function InvitationsTab({
             total: pagination?.total || 0,
           }}
           onPaginationChange={handlePaginationChange}
-          isLoading={isPending}
+          isLoading={isFetching}
+          emptyIcon={Users}
           emptyMessage="No invitations"
         />
       </LoadingWrapper>
@@ -745,13 +1026,31 @@ function InvitationsTab({
           pendingLabel="Cancelling..."
         />
       )}
-    </>
+    </div>
   );
 }
 
 // ===
 // Helpers
 // ===
+
+function toBulkOutcome(
+  outcome: {
+    succeeded: Array<{ kind: string; id: string }>;
+    failed: Array<{ kind: string; id: string; error: string }>;
+  },
+  labels: ReadonlyMap<string, string>,
+): BulkOutcome {
+  const labelFor = (target: { kind: string; id: string }) =>
+    labels.get(`${target.kind}:${target.id}`) ?? "Unknown";
+  return {
+    succeeded: outcome.succeeded.map(labelFor),
+    failed: outcome.failed.map((target) => ({
+      label: labelFor(target),
+      error: target.error,
+    })),
+  };
+}
 
 function getInitials(name: string): string {
   return name

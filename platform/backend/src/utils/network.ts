@@ -1,4 +1,5 @@
 import { isIP, isIPv4 } from "node:net";
+import ipaddr from "ipaddr.js";
 
 /**
  * Check whether an IP address string is a loopback (localhost) address.
@@ -7,14 +8,39 @@ import { isIP, isIPv4 } from "node:net";
  *  - IPv4 loopback range `127.0.0.0/8`  (any `127.x.x.x`)
  *  - IPv6 loopback `::1`
  *  - IPv4-mapped IPv6 loopback `::ffff:127.x.x.x`
+ *
+ * Accepts a possibly-missing value: Fastify types `request.ip` as `string` but
+ * it can be `undefined` at runtime (e.g. a socket with no remote address, or an
+ * empty `X-Forwarded-For` under `trustProxy`). An unknown origin is treated as
+ * non-loopback — the secure default — rather than throwing on `.startsWith`.
  */
-export function isLoopbackAddress(ip: string): boolean {
+export function isLoopbackAddress(ip: string | null | undefined): boolean {
+  if (typeof ip !== "string") return false;
   if (ip === "::1") return true;
 
   // Handle IPv4-mapped IPv6 (e.g. "::ffff:127.0.0.1")
   const ipv4Part = ip.startsWith("::ffff:") ? ip.slice(7) : ip;
 
   return isIPv4(ipv4Part) && ipv4Part.startsWith("127.");
+}
+
+/**
+ * Whether a request actually arrived over the loopback socket.
+ *
+ * Reads the raw socket peer, NOT `request.ip`. Under `trustProxy` Fastify
+ * rewrites `request.ip` from forwarded headers, so a remote caller could
+ * otherwise present itself as loopback and take the seams reserved for the
+ * in-process callers that dial the API over 127.0.0.1 — the provider base-URL
+ * override, the internal chat-api-key header, and the keyless-provider
+ * allowance. Every such trust decision must go through this, never `request.ip`.
+ *
+ * Structurally typed rather than taking a FastifyRequest so this module stays
+ * free of a Fastify import; the raw `IncomingMessage` shape works too.
+ */
+export function isLoopbackRequest(request: {
+  socket?: { remoteAddress?: string | undefined } | undefined;
+}): boolean {
+  return isLoopbackAddress(request.socket?.remoteAddress);
 }
 
 /**
@@ -107,6 +133,41 @@ export function loopbackRedirectUriMatchesIgnoringPort(
   });
 }
 
+/**
+ * Whether a host (a URL hostname, possibly a bracketed IPv6 literal such as
+ * `[::1]`) is an IP-address literal rather than a domain name.
+ */
+export function isIpLiteralHost(host: string): boolean {
+  return isIP(stripIpBrackets(host)) !== 0;
+}
+
+/**
+ * Whether an IP-literal host falls within any of the given CIDR ranges. Handles
+ * bracketed IPv6 hosts and never throws on malformed input or on an IPv4/IPv6
+ * kind mismatch (those simply do not match).
+ */
+export function ipMatchesAnyCidr(host: string, cidrs: string[]): boolean {
+  let addr: ipaddr.IPv4 | ipaddr.IPv6;
+  try {
+    addr = ipaddr.parse(stripIpBrackets(host));
+  } catch {
+    return false;
+  }
+  return cidrs.some((cidr) => {
+    let range: [ipaddr.IPv4 | ipaddr.IPv6, number];
+    try {
+      range = ipaddr.parseCIDR(cidr);
+    } catch {
+      return false;
+    }
+    return addr.kind() === range[0].kind() && addr.match(range);
+  });
+}
+
+function stripIpBrackets(host: string): string {
+  return host.trim().replace(/^\[(.*)\]$/, "$1");
+}
+
 function isPrivateIpv4Address(ipAddress: string): boolean {
   const octets = ipAddress.split(".").map((segment) => Number(segment));
   const [firstOctet, secondOctet] = octets;
@@ -140,4 +201,58 @@ function isPrivateIpv6Address(ipAddress: string): boolean {
   }
 
   return false;
+}
+
+/**
+ * Whether `value` is an IPv4 or IPv6 CIDR a Kubernetes NetworkPolicy accepts:
+ * canonical octets (no leading zeros) and an in-range prefix.
+ */
+export function isValidCidr(value: string): boolean {
+  const [address, prefixRaw, ...rest] = value.split("/");
+  if (!address || !prefixRaw || rest.length > 0 || !/^\d+$/.test(prefixRaw)) {
+    return false;
+  }
+
+  const prefix = Number(prefixRaw);
+  if (address.includes(":")) {
+    return prefix >= 0 && prefix <= 128 && isValidIpv6(address);
+  }
+
+  return prefix >= 0 && prefix <= 32 && isValidIpv4(address);
+}
+
+function isValidIpv4(value: string): boolean {
+  const parts = value.split(".");
+  return (
+    parts.length === 4 &&
+    parts.every((part) => {
+      if (!/^\d+$/.test(part)) return false;
+      const number = Number(part);
+      return number >= 0 && number <= 255 && String(number) === part;
+    })
+  );
+}
+
+function isValidIpv6(value: string): boolean {
+  if (value === "::") {
+    return true;
+  }
+
+  if (!/^[0-9a-f:]+$/i.test(value) || value.includes(":::")) {
+    return false;
+  }
+
+  const doubleColonCount = value.split("::").length - 1;
+  if (doubleColonCount > 1) {
+    return false;
+  }
+
+  const groups = value
+    .split("::")
+    .flatMap((part) => (part.length === 0 ? [] : part.split(":")));
+  return (
+    groups.length <= (doubleColonCount === 1 ? 7 : 8) &&
+    groups.length >= (doubleColonCount === 1 ? 1 : 8) &&
+    groups.every((group) => /^[0-9a-f]{1,4}$/i.test(group))
+  );
 }

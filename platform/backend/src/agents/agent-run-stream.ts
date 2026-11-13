@@ -1,0 +1,600 @@
+// The shared agent-run streamText primitive for every agent run surface
+// (interactive chat SSE, headless/A2A, scheduled, ChatOps). It owns the
+// `streamText` invocation, the empty/abortive/context-length recovery loop, and
+// the stream-level `onError` capture — but not the stop policy: each caller
+// passes its own `stopWhen` in `config` (this module only exports the shared
+// `MAX_AGENT_STEPS`).
+//
+// It probes a streamText `fullStream` just far enough to decide whether the turn
+// will produce anything renderable, so a caller can silently retry a clean-but-
+// empty response before committing the stream to the consumer.
+//
+// It pulls the stream iterator manually (never via `for await`) and returns
+// without calling `iterator.return()` — an early `for await` break would cancel
+// the underlying generation and break the subsequent `toUIMessageStream` merge.
+
+import { type ModelMessage, streamText } from "ai";
+import { isReasoningSummaryVerificationError } from "@/agents/openai-reasoning-summary";
+import logger from "@/logging";
+import {
+  parseContextLengthError,
+  trimMessagesToTokenLimit,
+} from "@/routes/chat/context-trimming";
+import { EmptyModelResponseError } from "@/routes/chat/errors";
+import { applyPromptCacheBreakpoints } from "@/routes/chat/normalization/apply-prompt-cache";
+import {
+  parseTokenBucketError,
+  refitOutputBudgetToTokenBucket,
+} from "@/routes/chat/token-bucket-refit";
+
+// Maximum agent steps (tool round-trips) per run, shared by every surface. The
+// primitive does not inject this — callers pass `stopWhen: stepCountIs(MAX_AGENT_STEPS)`
+// (plus any surface-specific stops).
+export const MAX_AGENT_STEPS = 500;
+
+type StreamTextConfig = Parameters<typeof streamText>[0];
+
+/**
+ * Run streamText, probing each attempt's stream for its first renderable event
+ * before the caller merges it to the consumer. This lets us, before anything
+ * reaches the consumer:
+ *   - trim + retry on a context-length rejection (vLLM/LiteLLM) — `messages`
+ *     input only; a `prompt`-only run skips trimming,
+ *   - silently retry a clean-but-empty response (a stupid-model / inference
+ *     glitch), then surface a stream error if it persists, and
+ *   - retry an abortive tool call (the model started streaming tool input but
+ *     the stream ended before a completed `tool-call`), then surface the
+ *     existing IncompleteToolCall error if it persists.
+ * The AI SDK internally buffers `fullStream` per accessor, so reading the probe
+ * prefix here does not drop events from the caller's own consumers (its
+ * toUIMessageStream merge, `.text`/`.usage`/`.finishReason`). Commit happens on
+ * the first *committing* event — content or a completed `tool-call`, not the
+ * opening `tool-input-start` — so an abortive tool call is caught before
+ * anything reaches the consumer; the cost is a slightly later tool indicator.
+ *
+ * A probed error other than a trimmable context-length rejection returns the
+ * errored result so the caller's merge surfaces it through the existing
+ * toUIMessageStream onError (preserving e.g. unavailable-tool handling); the
+ * buffered stream replays the error to the caller's consumers.
+ *
+ * A stream-level `onError` is injected so the committed attempt's error is
+ * captured (exposed via `getCapturedStreamError`, used by A2A to map a generic
+ * NoOutputGeneratedError to its real cause). The capture is reset before each
+ * attempt so a discarded retry's error never leaks into the committed mapping.
+ * The injected callback chains to any caller `config.onError`; if none is set it
+ * logs the error, preserving the observability the AI-SDK default console.error
+ * gave.
+ */
+export async function runAgentStream(params: {
+  config: StreamTextConfig;
+  promptCache?: {
+    provider: string;
+    model: string;
+    anthropicNativeEndpoint: boolean;
+  };
+  recovery?: {
+    logContext?: Record<string, unknown>;
+    /**
+     * Fires when empty-response retries exhaust, right before the
+     * EmptyModelResponseError throw — i.e. while nothing has been merged to the
+     * consumer yet, so the caller can persist state it would otherwise lose.
+     */
+    onEmptyResponseExhausted?: () => Promise<void>;
+    /**
+     * Fires when a probed error shows the OpenAI credential cannot generate
+     * reasoning summaries (unverified organization) and the attempt is being
+     * retried without them — so the caller can negative-cache the verdict and
+     * skip the doomed request on later turns.
+     */
+    onReasoningSummaryUnsupported?: () => Promise<void> | void;
+  };
+}): Promise<{
+  result: ReturnType<typeof streamText>;
+  getCapturedStreamError: () => unknown;
+  /**
+   * The committed turn's finishReason when it was abortive (a tool call started
+   * but never completed), else null. The probe observes this before the caller
+   * commits, so onStepFinish may not have recorded it yet — the abortive-turn
+   * tracker uses this as the authoritative source for a `length` truncation.
+   */
+  getAbortiveFinishReason: () => string | null;
+}> {
+  const { config, promptCache, recovery } = params;
+  const logContext = recovery?.logContext ?? {};
+  // Set when the committed attempt is abortive; read by the abortive-turn
+  // tracker to classify a `length` truncation as non-retryable.
+  let abortiveFinishReason: string | null = null;
+  const finalize = (result: ReturnType<typeof streamText>) => ({
+    result,
+    getCapturedStreamError: () => capturedStreamError,
+    getAbortiveFinishReason: () => abortiveFinishReason,
+  });
+
+  const MAX_EMPTY_RESPONSE_ATTEMPTS = 3;
+  // a still-too-long trimmed payload reproduces the same context error (trim
+  // is deterministic from the unchanged messages), so cap trim retries to
+  // avoid an unbounded loop; on the cap we fall through to the merge and let
+  // the existing onError surface it.
+  const MAX_CONTEXT_TRIM_ATTEMPTS = 1;
+  // a truncated tool call is usually a transient provider glitch; one retry
+  // recovers most. On the cap we return the abortive result so the abortive-turn
+  // tracker surfaces IncompleteToolCall, the same outcome as before this retry.
+  const MAX_ABORTIVE_TOOL_CALL_ATTEMPTS = 2;
+  // requesting `reasoning.summary` from an unverified OpenAI org rejects the
+  // whole request; retrying once without the option recovers the turn (minus
+  // the thinking block). The strip is deterministic, so a second cannot help.
+  const MAX_REASONING_SUMMARY_STRIP_ATTEMPTS = 1;
+  // Anthropic thinking signatures are bound to the system prompt they were
+  // produced under, so a prompt that changed since an earlier turn (template
+  // helpers, skill or tool changes, prompt edits) invalidates that turn's
+  // replayed thinking. Dropping the replayed reasoning is deterministic, so one
+  // retry is enough.
+  const MAX_REPLAYED_REASONING_STRIP_ATTEMPTS = 1;
+  // One refit is enough: the budget is recomputed from the allowance the
+  // provider itself reported, so a second rejection means something other than
+  // the reservation is over the limit.
+  const MAX_TOKEN_BUCKET_REFIT_ATTEMPTS = 1;
+  let tokenBucketRefitAttempts = 0;
+  let emptyResponseAttempts = 0;
+  let contextTrimAttempts = 0;
+  let abortiveToolCallAttempts = 0;
+  let reasoningSummaryStripAttempts = 0;
+  let replayedReasoningStripAttempts = 0;
+
+  // Capture only the committed attempt's stream error. Reset before each
+  // streamText call so a discarded retry's error never leaks into the mapping.
+  let capturedStreamError: unknown;
+  const callerOnError = config.onError;
+  const onError = (event: { error: unknown }) => {
+    capturedStreamError = event.error;
+    if (callerOnError) {
+      return callerOnError(event);
+    }
+    logger.error(
+      { ...logContext, error: event.error },
+      "[AgentRunStream] stream error",
+    );
+  };
+
+  // the config the loop retries from; trim replaces its messages so a later
+  // empty-response retry reuses the trimmed payload instead of resending the
+  // original (too-large) one.
+  let currentConfig: StreamTextConfig = { ...config, onError };
+  if (promptCache && Array.isArray(currentConfig.messages)) {
+    currentConfig = {
+      ...currentConfig,
+      prompt: undefined,
+      messages: applyPromptCacheBreakpoints({
+        ...promptCache,
+        messages: currentConfig.messages,
+      }),
+    };
+  }
+  // Reset before each attempt so a discarded retry's error never leaks into the
+  // committed mapping. This is safe only because the loop always probes an
+  // attempt to a terminal event (finish/error/done) before deciding to retry —
+  // a discarded stream's onError therefore fires during that probe, before the
+  // next reset. Retrying *before* reaching a terminal probe event would break
+  // the "only the committed attempt's error is captured" guarantee.
+  const runAttempt = (): ReturnType<typeof streamText> => {
+    capturedStreamError = undefined;
+    return streamText(currentConfig);
+  };
+  let result = runAttempt();
+
+  while (true) {
+    const probe = await probeFirstRenderableEvent(
+      result.fullStream[Symbol.asyncIterator](),
+    );
+
+    if (probe.kind === "renderable" || probe.kind === "aborted") {
+      return finalize(result);
+    }
+
+    if (probe.kind === "error") {
+      const contextError = parseContextLengthError(probe.error);
+      if (
+        contextError !== null &&
+        Array.isArray(currentConfig.messages) &&
+        contextTrimAttempts < MAX_CONTEXT_TRIM_ATTEMPTS
+      ) {
+        contextTrimAttempts++;
+        const trimmed = trimMessagesToTokenLimit({
+          messages: currentConfig.messages,
+          maxTokens: contextError.maxInputTokens,
+          requestedTokens: contextError.requestedTokens,
+          systemPrompt:
+            typeof config.system === "string" ? config.system : undefined,
+        });
+        logger.info(
+          {
+            ...logContext,
+            maxTokens: contextError.maxInputTokens,
+            requestedTokens: contextError.requestedTokens,
+            originalMessages: currentConfig.messages.length,
+            trimmedMessages: trimmed.length,
+          },
+          "[ContextTrimming] retrying with trimmed messages",
+        );
+        // `prompt: undefined` keeps the object on the `messages` side of the
+        // streamText `messages | prompt` union after the spread (the trim branch
+        // only runs when `currentConfig.messages` is an array, so there is no
+        // prompt).
+        currentConfig = {
+          ...currentConfig,
+          prompt: undefined,
+          messages: trimmed,
+        };
+        result = runAttempt();
+        continue;
+      }
+      // The provider charges our output reservation against a per-minute token
+      // bucket and this request did not fit. Refit the budget from the
+      // allowance it reported and retry — trimming messages cannot help here,
+      // since the reservation is counted whether or not the conversation is
+      // empty.
+      const tokenBucket = parseTokenBucketError(probe.error);
+      if (
+        tokenBucket !== null &&
+        tokenBucketRefitAttempts < MAX_TOKEN_BUCKET_REFIT_ATTEMPTS &&
+        typeof currentConfig.maxOutputTokens === "number"
+      ) {
+        const refittedMaxOutputTokens = refitOutputBudgetToTokenBucket({
+          bucket: tokenBucket,
+          currentMaxOutputTokens: currentConfig.maxOutputTokens,
+        });
+        if (refittedMaxOutputTokens !== null) {
+          tokenBucketRefitAttempts++;
+          logger.info(
+            {
+              ...logContext,
+              limitTokens: tokenBucket.limitTokens,
+              requestedTokens: tokenBucket.requestedTokens,
+              previousMaxOutputTokens: currentConfig.maxOutputTokens,
+              refittedMaxOutputTokens,
+            },
+            "[TokenBucket] retrying with an output budget refitted to the provider's reported limit",
+          );
+          currentConfig = {
+            ...currentConfig,
+            maxOutputTokens: refittedMaxOutputTokens,
+          };
+          result = runAttempt();
+          continue;
+        }
+      }
+
+      if (
+        reasoningSummaryStripAttempts < MAX_REASONING_SUMMARY_STRIP_ATTEMPTS &&
+        configRequestsOpenAiReasoningSummary(currentConfig) &&
+        isReasoningSummaryVerificationError(probe.error)
+      ) {
+        reasoningSummaryStripAttempts++;
+        logger.warn(
+          logContext,
+          "[ReasoningSummary] OpenAI org not verified for reasoning summaries, retrying without",
+        );
+        try {
+          await recovery?.onReasoningSummaryUnsupported?.();
+        } catch (callbackError) {
+          // The callback is bookkeeping (negative-caching the verdict); its
+          // failure must not abort a recovery that can still save the turn.
+          logger.warn(
+            { ...logContext, error: callbackError },
+            "[ReasoningSummary] onReasoningSummaryUnsupported callback failed, continuing retry",
+          );
+        }
+        currentConfig = withoutOpenAiReasoningSummary(currentConfig);
+        result = runAttempt();
+        continue;
+      }
+
+      const messagesWithoutReplayedReasoning =
+        replayedReasoningStripAttempts <
+          MAX_REPLAYED_REASONING_STRIP_ATTEMPTS &&
+        Array.isArray(currentConfig.messages) &&
+        isReplayedReasoningRejection(probe.error)
+          ? withoutReplayedReasoning(currentConfig.messages)
+          : null;
+      if (messagesWithoutReplayedReasoning !== null) {
+        replayedReasoningStripAttempts++;
+        logger.warn(
+          logContext,
+          "[ReplayedReasoning] provider rejected replayed reasoning, retrying without earlier reasoning",
+        );
+        currentConfig = {
+          ...currentConfig,
+          prompt: undefined,
+          messages: messagesWithoutReplayedReasoning,
+        };
+        result = runAttempt();
+        continue;
+      }
+      return finalize(result);
+    }
+
+    if (probe.kind === "abortive") {
+      abortiveToolCallAttempts++;
+      // A `length` truncation is deterministic in the tool-call payload size —
+      // retrying re-truncates. Only retry a non-length abortive turn (a
+      // transient mid-stream drop); surface a `length` one immediately.
+      const isDeterministicTruncation = probe.finishReason === "length";
+      if (
+        !isDeterministicTruncation &&
+        abortiveToolCallAttempts < MAX_ABORTIVE_TOOL_CALL_ATTEMPTS
+      ) {
+        logger.warn(
+          {
+            ...logContext,
+            finishReason: probe.finishReason,
+            rawFinishReason: probe.rawFinishReason,
+            attempt: abortiveToolCallAttempts,
+          },
+          "[AbortiveToolCall] tool call truncated mid-stream, retrying",
+        );
+        result = runAttempt();
+        continue;
+      }
+      // Exhausted (or a deterministic `length` truncation): surface the abortive
+      // turn through the merge so the abortive-turn tracker emits the mapped
+      // error (ToolCallOutputTruncated for `length`, else IncompleteToolCall).
+      logger.warn(
+        {
+          ...logContext,
+          finishReason: probe.finishReason,
+          rawFinishReason: probe.rawFinishReason,
+          attempts: abortiveToolCallAttempts,
+          deterministicTruncation: isDeterministicTruncation,
+        },
+        "[AbortiveToolCall] surfacing incomplete tool call",
+      );
+      // The probe already observed the terminal finishReason; expose it so the
+      // tracker classifies a `length` truncation even when the committed turn's
+      // onStepFinish fired during the probe (before hasCommittedResult).
+      abortiveFinishReason = probe.finishReason;
+      return finalize(result);
+    }
+
+    // probe.kind === "empty": the provider finished with no content.
+    emptyResponseAttempts++;
+    const canRetryEmptyResponse =
+      isRetryableEmptyFinishReason(probe.finishReason) &&
+      emptyResponseAttempts < MAX_EMPTY_RESPONSE_ATTEMPTS;
+    if (canRetryEmptyResponse) {
+      logger.warn(
+        {
+          ...logContext,
+          finishReason: probe.finishReason,
+          rawFinishReason: probe.rawFinishReason,
+          attempt: emptyResponseAttempts,
+        },
+        "[EmptyResponse] model produced no content, retrying",
+      );
+      result = runAttempt();
+      continue;
+    }
+
+    // Exhausted retries (or a non-retryable finishReason): treat the empty
+    // turn as a stream error.
+    await recovery?.onEmptyResponseExhausted?.();
+    throw new EmptyModelResponseError({
+      finishReason: probe.finishReason,
+      rawFinishReason: probe.rawFinishReason,
+      attempts: emptyResponseAttempts,
+    });
+  }
+}
+
+/** @public — exported for testability */
+export type StreamProbeEvent = {
+  type: string;
+  finishReason?: unknown;
+  rawFinishReason?: unknown;
+  error?: unknown;
+};
+
+type StreamProbeOutcome =
+  | { kind: "renderable" }
+  | { kind: "empty"; finishReason: string; rawFinishReason?: string }
+  // The model began streaming a tool call (tool-input-*) but the stream ended
+  // before the call completed (no tool-call). Recoverable like an empty turn.
+  | { kind: "abortive"; finishReason: string; rawFinishReason?: string }
+  | { kind: "aborted" }
+  | { kind: "error"; error: unknown };
+
+// fullStream event types that carry (or commit to) content the chat UI renders.
+// Seeing any of these means the turn is not empty and should stream normally.
+// `tool-input-*` is deliberately absent: a lone tool-input stream that never
+// reaches `tool-call` is an abortive (truncated) tool call we want to retry, so
+// the probe holds commit until the completed `tool-call` arrives. The cost is a
+// slightly later tool indicator (after args finish streaming) for healthy turns.
+// `text-start` is absent too: a provider's empty first chunk (OpenAI-compatible
+// streams open with `content: ""`) opens a text part with no text, and a turn
+// that stops there has no reply. Only a text delta counts.
+const RENDERABLE_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "text-delta",
+  "reasoning-start",
+  "reasoning-delta",
+  "tool-call",
+  "tool-result",
+  // tool failure, denial, and approval-request parts are all UI-rendered turn
+  // state. A resume turn (input arrived in a prior turn) can open with one of
+  // these and no preceding tool-input-start, so they must count as renderable.
+  "tool-error",
+  "tool-output-denied",
+  "tool-approval-request",
+  "source",
+  "file",
+]);
+
+// tool-input streaming events: pending, not committing. Seeing one means a tool
+// call started; if the stream ends before a committing `tool-call`, it was
+// abortive.
+const PENDING_TOOL_INPUT_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "tool-input-start",
+  "tool-input-delta",
+  "tool-input-end",
+]);
+
+// finishReasons where a content-free turn is plausibly a transient model/inference
+// glitch worth retrying. A *finish* event carrying "error" or "other" with no content
+// is a provider-glitch shape, not a real API failure — those reach the probe as error
+// parts (or thrown stream errors) before any finish. Gemini's frequent
+// MALFORMED_FUNCTION_CALL maps to "error" and OTHER/FINISH_REASON_UNSPECIFIED to
+// "other"; some "other" raws may be deterministic, but with the hard attempt cap the
+// worst case is two wasted calls before the same error card. Excludes "length"
+// (retrying with the same output budget cannot fix its exhaustion), "content-filter"
+// (deterministic block), and "tool-calls" (which only finishes that way when tool
+// calls — renderable — exist).
+const RETRYABLE_EMPTY_FINISH_REASONS: ReadonlySet<string> = new Set([
+  "stop",
+  "unknown",
+  "error",
+  "other",
+]);
+
+/** @public — exported for testability */
+export function isRetryableEmptyFinishReason(finishReason: string): boolean {
+  return RETRYABLE_EMPTY_FINISH_REASONS.has(finishReason);
+}
+
+/** @public — exported for testability */
+export async function probeFirstRenderableEvent(
+  iterator: AsyncIterator<StreamProbeEvent>,
+): Promise<StreamProbeOutcome> {
+  // A tool call started streaming (tool-input-*) but has not yet reached a
+  // committing `tool-call`. If the stream ends in this state, the turn is
+  // abortive rather than merely empty.
+  let sawPendingToolInput = false;
+
+  while (true) {
+    let result: IteratorResult<StreamProbeEvent>;
+    try {
+      result = await iterator.next();
+    } catch (error) {
+      return { kind: "error", error };
+    }
+
+    if (result.done) {
+      // stream ended without a terminal finish event.
+      return sawPendingToolInput
+        ? { kind: "abortive", finishReason: "unknown" }
+        : { kind: "empty", finishReason: "unknown" };
+    }
+
+    const event = result.value;
+
+    if (RENDERABLE_EVENT_TYPES.has(event.type)) {
+      return { kind: "renderable" };
+    }
+
+    if (PENDING_TOOL_INPUT_EVENT_TYPES.has(event.type)) {
+      sawPendingToolInput = true;
+      continue;
+    }
+
+    switch (event.type) {
+      case "error":
+        return { kind: "error", error: event.error };
+      case "abort":
+        return { kind: "aborted" };
+      case "finish": {
+        const finishReason =
+          typeof event.finishReason === "string"
+            ? event.finishReason
+            : "unknown";
+        const rawFinishReason =
+          typeof event.rawFinishReason === "string"
+            ? { rawFinishReason: event.rawFinishReason }
+            : {};
+        return sawPendingToolInput
+          ? { kind: "abortive", finishReason, ...rawFinishReason }
+          : { kind: "empty", finishReason, ...rawFinishReason };
+      }
+      // control parts (start, start-step, text-start, text-end, finish-step,
+      // ...) carry no content on their own — keep pulling until content,
+      // finish, or error.
+      default:
+        break;
+    }
+  }
+}
+
+function configRequestsOpenAiReasoningSummary(
+  config: StreamTextConfig,
+): boolean {
+  return config.providerOptions?.openai?.reasoningSummary != null;
+}
+
+function isReplayedReasoningRejection(error: unknown): boolean {
+  // SDK wrappers can nest the provider rejection under `cause`.
+  let current: unknown = error;
+  for (
+    let depth = 0;
+    depth < MAX_ERROR_CAUSE_DEPTH &&
+    current !== null &&
+    typeof current === "object";
+    depth++
+  ) {
+    const { message, responseBody } = current as {
+      message?: unknown;
+      responseBody?: unknown;
+    };
+    if (
+      [message, responseBody].some(
+        (text) =>
+          typeof text === "string" &&
+          REPLAYED_REASONING_REJECTION_PATTERN.test(text),
+      )
+    ) {
+      return true;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
+ * Drops reasoning parts from assistant messages, and assistant messages left
+ * empty by that. Null when there is nothing to drop, so a retry that cannot
+ * change the request is skipped.
+ */
+function withoutReplayedReasoning(
+  messages: ModelMessage[],
+): ModelMessage[] | null {
+  let stripped = false;
+  const result = messages.flatMap((message): ModelMessage[] => {
+    if (message.role !== "assistant" || typeof message.content === "string") {
+      return [message];
+    }
+    const content = message.content.filter((part) => part.type !== "reasoning");
+    if (content.length === message.content.length) {
+      return [message];
+    }
+    stripped = true;
+    return content.length === 0 ? [] : [{ ...message, content }];
+  });
+  return stripped ? result : null;
+}
+
+// Signed thinking can become invalid after a system-prompt change. Bedrock
+// also rejects reasoning replayed across model families: GPT redacted content
+// is not Claude thinking, and GPT does not accept Claude reasoning text.
+const REPLAYED_REASONING_REJECTION_PATTERN =
+  /invalid `?signature`? in `?thinking`? block|invalid `?data`? in `?redacted_thinking`? block|doesn't support the reasoningContent\.reasoningText\.text field for assistant messages/i;
+
+const MAX_ERROR_CAUSE_DEPTH = 5;
+
+function withoutOpenAiReasoningSummary(
+  config: StreamTextConfig,
+): StreamTextConfig {
+  const { reasoningSummary: _stripped, ...openaiOptions } =
+    config.providerOptions?.openai ?? {};
+  return {
+    ...config,
+    providerOptions: {
+      ...config.providerOptions,
+      openai: openaiOptions,
+    },
+  };
+}

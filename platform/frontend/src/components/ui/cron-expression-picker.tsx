@@ -9,12 +9,13 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { cn } from "@/lib/utils";
 import { formatCronSchedule } from "@/lib/utils/format-cron";
+import { cn } from "@/lib/utils/tailwind";
 
 export type CronPresetOption = {
   label: string;
   value: string;
+  description?: string;
 };
 
 export const DEFAULT_CRON_PRESET_OPTIONS: CronPresetOption[] = [
@@ -86,7 +87,7 @@ export function CronExpressionPicker({
           role="combobox"
           aria-expanded={open}
           className={cn(
-            "border-input h-9 w-[200px] justify-between bg-transparent font-normal shadow-xs hover:bg-transparent hover:text-foreground",
+            "border-input w-[200px] justify-between bg-transparent font-normal shadow-xs hover:bg-transparent hover:text-foreground",
             !value && "text-muted-foreground",
             className,
           )}
@@ -121,7 +122,7 @@ export function CronExpressionPicker({
               <span className="min-w-0 flex-1">
                 {preset.label}
                 <span className="block text-xs text-muted-foreground">
-                  {formatCronSchedule(preset.value)}
+                  {preset.description ?? formatCronSchedule(preset.value)}
                 </span>
               </span>
               <Check
@@ -140,6 +141,7 @@ export function CronExpressionPicker({
           </p>
           <div className="flex items-center gap-1.5">
             <Input
+              aria-label="Custom cron expression"
               placeholder={customPlaceholder}
               value={customDraft}
               onChange={(event) => setCustomDraft(event.target.value)}
@@ -154,7 +156,7 @@ export function CronExpressionPicker({
             <Button
               variant="ghost"
               size="sm"
-              className="h-8 shrink-0 px-2 text-xs"
+              className="shrink-0"
               disabled={!customDraft.trim()}
               onClick={commitCustomValue}
             >

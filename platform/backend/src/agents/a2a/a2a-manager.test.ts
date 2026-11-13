@@ -1,3 +1,5 @@
+import { generateText } from "ai";
+import { MockLanguageModelV3 } from "ai/test";
 import { vi } from "vitest";
 import { A2AContextModel, A2AMessageModel, A2ATaskModel } from "@/models";
 import { describe, expect, test } from "@/test";
@@ -153,7 +155,7 @@ function buildGetTaskRequest(params: {
 
 describe("A2AManager.sendMessage", () => {
   test("empty message parts", async ({ makeAgent }) => {
-    const agent = await makeAgent({ name: "agent1", teams: [] });
+    const agent = await makeAgent({ name: "agent1" });
     const manager = new A2AManager();
     const prevContextCount = await A2AContextModel.getTotalCount();
     const prevTaskCount = await A2ATaskModel.getTotalCount();
@@ -168,8 +170,248 @@ describe("A2AManager.sendMessage", () => {
     expect(await A2AMessageModel.getTotalCount()).toBe(prevMessageCount);
   });
 
+  test.for([
+    ["an empty", ""],
+    ["a whitespace-only", "   \n  "],
+  ])("%s text part is nothing to execute", async ([, text], { makeAgent }) => {
+    const agent = await makeAgent({ name: "agent1" });
+    const manager = new A2AManager();
+    executeA2AMessage.mockClear();
+    const prevContextCount = await A2AContextModel.getTotalCount();
+    const prevTaskCount = await A2ATaskModel.getTotalCount();
+    const prevMessageCount = await A2AMessageModel.getTotalCount();
+
+    const err = await getThrown(async () =>
+      sendMessageWithParts(manager, agent.id, [{ text }]),
+    );
+
+    expect(err).toBeInstanceOf(A2AError);
+    expect((err as A2AError).kind).toBe(A2AErrorKind.NothingToExecute);
+    // The defect this pins was a *provider* call, not the error code: a blank
+    // turn reached the model as prior context alone, ending on an assistant
+    // message, which providers without prefill support reject.
+    expect(executeA2AMessage).not.toHaveBeenCalled();
+    expect(await A2AContextModel.getTotalCount()).toBe(prevContextCount);
+    expect(await A2ATaskModel.getTotalCount()).toBe(prevTaskCount);
+    expect(await A2AMessageModel.getTotalCount()).toBe(prevMessageCount);
+  });
+
+  test("a blank text part alongside a file still executes", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "agent1" });
+    const manager = new A2AManager();
+    executeA2AMessage.mockClear();
+    executeA2AMessage.mockReturnValue({
+      responseUiMessage: {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        parts: [{ type: "text", text: "response" }],
+      },
+      text: "response(text)",
+    });
+
+    await sendMessageWithParts(manager, agent.id, [
+      { text: "" },
+      {
+        raw: new Uint8Array([1, 2, 3]),
+        mediaType: "image/png",
+        filename: "pixel.png",
+      },
+    ]);
+
+    expect(executeA2AMessage).toHaveBeenCalledTimes(1);
+    expect(executeA2AMessage.mock.calls[0][0].attachments).toHaveLength(1);
+  });
+
+  test("a single part carrying blank text and a file keeps the file", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "agent1" });
+    const manager = new A2AManager();
+    executeA2AMessage.mockClear();
+    executeA2AMessage.mockReturnValue({
+      responseUiMessage: {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        parts: [{ type: "text", text: "response" }],
+      },
+      text: "response(text)",
+    });
+
+    await sendMessageWithParts(manager, agent.id, [
+      {
+        text: "",
+        raw: new Uint8Array([1, 2, 3]),
+        mediaType: "image/png",
+        filename: "pixel.png",
+      },
+    ]);
+
+    expect(executeA2AMessage).toHaveBeenCalledTimes(1);
+    expect(executeA2AMessage.mock.calls[0][0].attachments).toHaveLength(1);
+  });
+
+  test("a single part carrying text and a file sends both", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "agent1" });
+    const manager = new A2AManager();
+    executeA2AMessage.mockClear();
+    executeA2AMessage.mockReturnValue({
+      responseUiMessage: {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        parts: [{ type: "text", text: "response" }],
+      },
+      text: "response(text)",
+    });
+
+    await sendMessageWithParts(manager, agent.id, [
+      {
+        text: "look at this",
+        raw: new Uint8Array([1, 2, 3]),
+        mediaType: "image/png",
+        filename: "pixel.png",
+      },
+    ]);
+
+    // The text branch returns before the file branch, so the file never becomes
+    // a message part — it still reaches the executor because attachments are
+    // collected from the request parts independently.
+    expect(executeA2AMessage).toHaveBeenCalledTimes(1);
+    const call = executeA2AMessage.mock.calls[0][0];
+    expect(call.message).toBe("look at this");
+    expect(call.attachments).toEqual([
+      {
+        contentType: "image/png",
+        contentBase64: Buffer.from([1, 2, 3]).toString("base64"),
+        name: "pixel.png",
+      },
+    ]);
+  });
+
+  test("multiple text parts are joined into the executed turn", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "agent1" });
+    const manager = new A2AManager();
+    executeA2AMessage.mockClear();
+    executeA2AMessage.mockReturnValue({
+      responseUiMessage: {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        parts: [{ type: "text", text: "response" }],
+      },
+      text: "response(text)",
+    });
+
+    await sendMessageWithParts(manager, agent.id, [
+      { text: "first" },
+      { text: "second" },
+    ]);
+
+    expect(executeA2AMessage).toHaveBeenCalledTimes(1);
+    expect(executeA2AMessage.mock.calls[0][0].message).toBe("first\nsecond");
+  });
+
+  test("a service-account actor runs the turn as that account", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "agent1" });
+    const manager = new A2AManager({ stateless: true });
+    executeA2AMessage.mockClear();
+    executeA2AMessage.mockReturnValue({
+      responseUiMessage: {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        parts: [{ type: "text", text: "response" }],
+      },
+      text: "response(text)",
+    });
+
+    await manager.sendMessage({
+      actor: { id: "sa1", kind: "serviceAccount", organizationId: "org1" },
+      agentId: agent.id,
+      request: {
+        message: {
+          messageId: crypto.randomUUID(),
+          role: A2AProtocolRole.User,
+          parts: [{ text: "hi" }],
+        },
+        configuration: {},
+        metadata: {},
+      },
+    });
+
+    expect(executeA2AMessage).toHaveBeenCalledTimes(1);
+    const call = executeA2AMessage.mock.calls[0][0];
+    expect(call.userId).toBe("service-account:sa1");
+  });
+
+  test("a blank text part does not pad the joined turn", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "agent1" });
+    const manager = new A2AManager();
+    executeA2AMessage.mockClear();
+    executeA2AMessage.mockReturnValue({
+      responseUiMessage: {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        parts: [{ type: "text", text: "response" }],
+      },
+      text: "response(text)",
+    });
+
+    await sendMessageWithParts(manager, agent.id, [
+      { text: "" },
+      { text: "hi" },
+    ]);
+
+    expect(executeA2AMessage).toHaveBeenCalledTimes(1);
+    // Not "\nhi" — the blank part is gone before the join, so it contributes no
+    // separator to the text the model receives.
+    expect(executeA2AMessage.mock.calls[0][0].message).toBe("hi");
+  });
+
+  test("a message carrying only a file part executes", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "agent1" });
+    const manager = new A2AManager();
+    executeA2AMessage.mockClear();
+    executeA2AMessage.mockReturnValue({
+      responseUiMessage: {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        parts: [{ type: "text", text: "response" }],
+      },
+      text: "response(text)",
+    });
+
+    await sendMessageWithParts(manager, agent.id, [
+      {
+        raw: new Uint8Array([1, 2, 3]),
+        mediaType: "image/png",
+        filename: "pixel.png",
+      },
+    ]);
+
+    expect(executeA2AMessage).toHaveBeenCalledTimes(1);
+    const call = executeA2AMessage.mock.calls[0][0];
+    expect(call.message).toBe("");
+    expect(call.attachments).toEqual([
+      {
+        contentType: "image/png",
+        contentBase64: Buffer.from([1, 2, 3]).toString("base64"),
+        name: "pixel.png",
+      },
+    ]);
+  });
+
   test("Text message", async ({ makeAgent }) => {
-    const agent = await makeAgent({ name: "agent1", teams: [] });
+    const agent = await makeAgent({ name: "agent1" });
     const manager = new A2AManager();
     const prevContextCount = await A2AContextModel.getTotalCount();
     const prevTaskCount = await A2ATaskModel.getTotalCount();
@@ -199,6 +441,13 @@ describe("A2AManager.sendMessage", () => {
     }
     expect(dbMessage.contextId).toBe(response.message.contextId);
     expect(dbMessage.parts).toEqual(response.message.parts);
+    expect(dbMessage.role).toBe(A2AProtocolRole.Agent);
+    expect(dbMessage.taskId).toBeNull();
+    expect(dbMessage.content).toEqual({
+      id: response.message.messageId,
+      role: "assistant",
+      parts: [{ type: "text", text: "response" }],
+    });
 
     expect(await A2AContextModel.getTotalCount()).toBe(prevContextCount + 1);
     expect(await A2ATaskModel.getTotalCount()).toBe(prevTaskCount);
@@ -208,7 +457,7 @@ describe("A2AManager.sendMessage", () => {
   test("Text message: client messageId equals db messageId", async ({
     makeAgent,
   }) => {
-    const agent = await makeAgent({ name: "agent1", teams: [] });
+    const agent = await makeAgent({ name: "agent1" });
     const manager = new A2AManager();
 
     executeA2AMessage.mockReturnValue({
@@ -243,7 +492,7 @@ describe("A2AManager.sendMessage", () => {
   });
 
   test("Continue conversation within context", async ({ makeAgent }) => {
-    const agent = await makeAgent({ name: "agent1", teams: [] });
+    const agent = await makeAgent({ name: "agent1" });
     const manager = new A2AManager();
     executeA2AMessage.mockReturnValue({
       responseUiMessage: {
@@ -317,7 +566,7 @@ describe("A2AManager.sendMessage", () => {
   });
 
   test("Text message stateless", async ({ makeAgent }) => {
-    const agent = await makeAgent({ name: "agent1", teams: [] });
+    const agent = await makeAgent({ name: "agent1" });
     const manager = new A2AManager({ stateless: true });
     const prevContextCount = await A2AContextModel.getTotalCount();
     const prevTaskCount = await A2ATaskModel.getTotalCount();
@@ -344,7 +593,7 @@ describe("A2AManager.sendMessage", () => {
 
   describe("Approval flow", () => {
     test("Simple", async ({ makeAgent }) => {
-      const agent = await makeAgent({ name: "agent1", teams: [] });
+      const agent = await makeAgent({ name: "agent1" });
       const manager = new A2AManager();
 
       mockA2AExecuteMessageWithApprovalRequests(crypto.randomUUID(), ["1"]);
@@ -409,10 +658,17 @@ describe("A2AManager.sendMessage", () => {
         throw new Error("Message should be stored in the database");
       }
       expect(dbMessage.parts).toEqual(response2.message.parts);
+      expect(dbMessage.role).toBe(A2AProtocolRole.Agent);
+      expect(dbMessage.taskId).toBe(response.task.id);
+      expect(dbMessage.content).toEqual({
+        id: response2.message.messageId,
+        role: "assistant",
+        parts: [{ type: "text", text: "response" }],
+      });
     });
 
     test("Multi request in single turn", async ({ makeAgent }) => {
-      const agent = await makeAgent({ name: "agent1", teams: [] });
+      const agent = await makeAgent({ name: "agent1" });
       const manager = new A2AManager();
 
       mockA2AExecuteMessageWithApprovalRequests(crypto.randomUUID(), [
@@ -520,7 +776,7 @@ describe("A2AManager.sendMessage", () => {
     });
 
     test("Stateless without contextId", async ({ makeAgent }) => {
-      const agent = await makeAgent({ name: "agent1", teams: [] });
+      const agent = await makeAgent({ name: "agent1" });
       const manager = new A2AManager({ stateless: true });
       const actor: A2AActor = {
         id: "actor1",
@@ -659,7 +915,7 @@ describe("A2AManager.sendMessage", () => {
       //   without user message in between.
       // Path: user-msg -> approval-req1 -> user-resolve-full -> execute -> approval-req2
 
-      const agent = await makeAgent({ name: "agent1", teams: [] });
+      const agent = await makeAgent({ name: "agent1" });
       const manager = new A2AManager();
 
       const approvalMessageId = crypto.randomUUID();
@@ -785,7 +1041,7 @@ describe("A2AManager.sendMessage", () => {
     });
 
     test("Multi-turn messages history", async ({ makeAgent }) => {
-      const agent = await makeAgent({ name: "agent1", teams: [] });
+      const agent = await makeAgent({ name: "agent1" });
       const manager = new A2AManager();
 
       const approvalMessageId = crypto.randomUUID();
@@ -971,5 +1227,168 @@ describe("A2AManager.sendMessage", () => {
       });
       expect(task.status?.state).toBe(A2AProtocolTaskState.Completed);
     });
+  });
+});
+
+describe("A2AManager.sendMessage history replay", () => {
+  test("continues the same context after interrupted tools without rewriting history", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "Interrupted tools" });
+    const manager = new A2AManager();
+    const assistantId = crypto.randomUUID();
+    executeA2AMessage.mockReturnValueOnce({
+      messageId: assistantId,
+      text: "",
+      finishReason: "other",
+      responseUiMessage: {
+        id: assistantId,
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolName: "fixture",
+            toolCallId: "interrupted-dynamic",
+            state: "input-available",
+            input: {},
+          },
+          {
+            type: "tool-fixture",
+            toolCallId: "interrupted-static",
+            state: "input-available",
+            input: {},
+          },
+        ],
+      },
+    });
+    const first = await sendTextMessage(manager, agent.id, "Start a task");
+    const contextId = first.message?.contextId;
+    expect(contextId).toBeDefined();
+    const persistedBefore = await A2AMessageModel.findById(assistantId);
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => ({
+        content: [{ type: "text", text: "Conversation continues" }],
+        finishReason: { unified: "stop", raw: "stop" },
+        usage: {
+          inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+          outputTokens: { total: 1, text: 1, reasoning: 0 },
+        },
+        warnings: [],
+      }),
+    });
+    executeA2AMessage.mockImplementation(async ({ messages, message }) => {
+      // Run the SDK's real prompt validation; mock only the provider boundary.
+      const result = await generateText({
+        model,
+        messages: [...messages, { role: "user", content: message }],
+        maxRetries: 0,
+      });
+      const id = crypto.randomUUID();
+      return {
+        messageId: id,
+        text: result.text,
+        finishReason: result.finishReason,
+        responseUiMessage: {
+          id,
+          role: "assistant",
+          parts: [{ type: "text", text: result.text }],
+        },
+      };
+    });
+    for (const text of ["Change the task", "Continue again"]) {
+      const response = await manager.sendMessage({
+        actor,
+        agentId: agent.id,
+        request: {
+          message: {
+            messageId: crypto.randomUUID(),
+            role: A2AProtocolRole.User,
+            contextId,
+            parts: [{ text }],
+          },
+        },
+      });
+      expect(response.message?.contextId).toBe(contextId);
+      expect(response.message?.parts).toContainEqual({
+        text: "Conversation continues",
+      });
+    }
+    expect(model.doGenerateCalls).toHaveLength(2);
+    expect(await A2AMessageModel.findById(assistantId)).toEqual(
+      persistedBefore,
+    );
+  });
+
+  test("coerces a poisoned tool input from context history before replay", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "a2a-coerce" });
+    const manager = new A2AManager();
+
+    // Turn 1: the agent persists an assistant turn whose tool call carries a
+    // malformed (non-object) input, poisoning the context history.
+    executeA2AMessage.mockReturnValueOnce({
+      messageId: crypto.randomUUID(),
+      text: "built",
+      finishReason: "stop",
+      responseUiMessage: {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        parts: [
+          { type: "text", text: "built" },
+          {
+            type: "dynamic-tool",
+            toolName: "edit_app",
+            toolCallId: "call_poison",
+            state: "output-available",
+            output: "ok",
+            input: '{"old_str">x',
+          },
+        ],
+      },
+    });
+    const first = await sendTextMessage(manager, agent.id, "build it");
+    const contextId = first.message?.contextId;
+    if (!contextId) {
+      throw new Error("contextId should be defined");
+    }
+
+    // Turn 2: replays the poisoned history. Capture what the executor receives.
+    executeA2AMessage.mockReturnValueOnce({
+      messageId: crypto.randomUUID(),
+      text: "ok",
+      finishReason: "stop",
+      responseUiMessage: {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        parts: [{ type: "text", text: "ok" }],
+      },
+    });
+    await manager.sendMessage({
+      actor,
+      agentId: agent.id,
+      request: {
+        message: {
+          messageId: crypto.randomUUID(),
+          role: A2AProtocolRole.User,
+          contextId,
+          parts: [{ text: "change it" }],
+        },
+      },
+    });
+
+    const lastParams = executeA2AMessage.mock.calls.at(-1)?.[0] as {
+      originalUiMessages: {
+        parts?: { toolCallId?: string; input?: unknown }[];
+      }[];
+    };
+    const replayed = lastParams.originalUiMessages
+      .flatMap((m) => m.parts ?? [])
+      .find((p) => p.toolCallId === "call_poison");
+
+    expect(replayed).toBeDefined();
+    expect(typeof replayed?.input).toBe("object");
+    expect(replayed?.input).not.toBeNull();
+    expect(Array.isArray(replayed?.input)).toBe(false);
   });
 });

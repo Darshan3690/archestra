@@ -1,16 +1,17 @@
-import { vi } from "vitest";
-import { afterEach, describe, expect, test } from "@/test";
-
-import { isTransientDbError, withDbRetry, wrapPoolWithRetry } from "./retry";
-
-// Suppress logger output during tests
-vi.mock("@/logging", () => ({
-  default: {
-    warn: vi.fn(),
-    error: vi.fn(),
-    info: vi.fn(),
-  },
-}));
+import { DrizzleQueryError } from "drizzle-orm/errors";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import config from "@/config";
+import {
+  getDatabaseOutageErrorCode,
+  getDbResourceExhaustionErrorCode,
+  getTransientDbErrorCode,
+  installDbErrorSafetyNet,
+  isDbStatementTimeoutError,
+  isTransientDbError,
+  withDbRetry,
+  withTransactionRetry,
+  wrapPoolWithRetry,
+} from "./retry";
 
 describe("isTransientDbError", () => {
   test("returns false for non-Error values", () => {
@@ -41,6 +42,34 @@ describe("isTransientDbError", () => {
 
   test("detects ETIMEDOUT", () => {
     expect(isTransientDbError(new Error("connect ETIMEDOUT"))).toBe(true);
+  });
+
+  test("detects EAI_AGAIN (temporary DNS resolution failure)", () => {
+    expect(
+      isTransientDbError(
+        new Error("getaddrinfo EAI_AGAIN db.example.internal"),
+      ),
+    ).toBe(true);
+  });
+
+  test("detects ENOTFOUND (DNS name did not resolve)", () => {
+    expect(
+      isTransientDbError(
+        new Error("getaddrinfo ENOTFOUND db.example.internal"),
+      ),
+    ).toBe(true);
+  });
+
+  test("detects ENOTFOUND wrapped as a DrizzleQueryError cause", () => {
+    const pgError = Object.assign(
+      new Error("getaddrinfo ENOTFOUND postgresql.archestra-dev"),
+      { code: "ENOTFOUND" },
+    );
+    const drizzleError = new Error(
+      'Failed query: select "id" from "agents" where "slug" = $1',
+      { cause: pgError },
+    );
+    expect(isTransientDbError(drizzleError)).toBe(true);
   });
 
   test("detects 'Connection terminated'", () => {
@@ -128,6 +157,244 @@ describe("isTransientDbError", () => {
   });
 });
 
+describe("getTransientDbErrorCode", () => {
+  test("returns a stable code for socket-level errors", () => {
+    expect(
+      getTransientDbErrorCode(new Error("connect ECONNREFUSED 10.0.0.1:5432")),
+    ).toBe("ECONNREFUSED");
+    expect(
+      getTransientDbErrorCode(new Error("getaddrinfo EAI_AGAIN db.internal")),
+    ).toBe("EAI_AGAIN");
+    expect(
+      getTransientDbErrorCode(new Error("getaddrinfo ENOTFOUND db.internal")),
+    ).toBe("ENOTFOUND");
+  });
+
+  test("maps message patterns to low-cardinality codes", () => {
+    expect(
+      getTransientDbErrorCode(
+        new Error("timeout exceeded when trying to connect"),
+      ),
+    ).toBe("pool_connect_timeout");
+    expect(
+      getTransientDbErrorCode(new Error("Connection terminated unexpectedly")),
+    ).toBe("connection_terminated");
+  });
+
+  test("returns the SQLSTATE code for transient PostgreSQL errors", () => {
+    const error = Object.assign(new Error("db error"), { code: "57P01" });
+    expect(getTransientDbErrorCode(error)).toBe("57P01");
+  });
+
+  test("unwraps the cause chain (DrizzleQueryError pattern)", () => {
+    const drizzleError = new Error("Failed query: select 1", {
+      cause: new Error("getaddrinfo EAI_AGAIN db.internal"),
+    });
+    expect(getTransientDbErrorCode(drizzleError)).toBe("EAI_AGAIN");
+  });
+
+  test("returns null for non-transient errors", () => {
+    expect(getTransientDbErrorCode(new Error("duplicate key"))).toBeNull();
+    expect(getTransientDbErrorCode("not an error")).toBeNull();
+    expect(getTransientDbErrorCode(null)).toBeNull();
+  });
+
+  // A DB host resolving to several addresses (e.g. IPv6 + IPv4) where every
+  // connect fails: net.connect throws AggregateError with an EMPTY message,
+  // the syscall code on `code`, and one error per address in `errors`.
+  test("detects a multi-address connection failure (AggregateError, empty message)", () => {
+    const aggregate = Object.assign(
+      new AggregateError(
+        [
+          new Error("connect ECONNREFUSED ::1:5432"),
+          new Error("connect ECONNREFUSED 127.0.0.1:5432"),
+        ],
+        "",
+      ),
+      { code: "ECONNREFUSED" },
+    );
+    expect(getTransientDbErrorCode(aggregate)).toBe("ECONNREFUSED");
+
+    const drizzleWrapped = new Error("Failed query: select 1", {
+      cause: aggregate,
+    });
+    expect(getTransientDbErrorCode(drizzleWrapped)).toBe("ECONNREFUSED");
+    expect(isTransientDbError(drizzleWrapped)).toBe(true);
+  });
+
+  test("traverses AggregateError sub-errors when no code is set on the aggregate", () => {
+    const aggregate = new AggregateError(
+      [new Error("connect ETIMEDOUT 10.0.0.1:5432")],
+      "",
+    );
+    expect(getTransientDbErrorCode(aggregate)).toBe("ETIMEDOUT");
+  });
+
+  test("returns null for an AggregateError of non-transient errors", () => {
+    const aggregate = new AggregateError([new Error("duplicate key")], "");
+    expect(getTransientDbErrorCode(aggregate)).toBeNull();
+  });
+
+  // Egress to the database rejected or black-holed at the syscall while a
+  // managed cluster reprograms network policy: PostgreSQL is never reached, so
+  // the failure carries an errno and no SQLSTATE.
+  test("detects connection syscall failures that never reach PostgreSQL", () => {
+    expect(
+      getTransientDbErrorCode(
+        new Error("connect EPERM 172.20.81.106:5432 - Local (0.0.0.0:0)"),
+      ),
+    ).toBe("EPERM");
+    expect(
+      getTransientDbErrorCode(new Error("connect EHOSTUNREACH 10.0.0.1:5432")),
+    ).toBe("EHOSTUNREACH");
+    expect(
+      getTransientDbErrorCode(new Error("connect EADDRNOTAVAIL 10.0.0.1:5432")),
+    ).toBe("EADDRNOTAVAIL");
+  });
+
+  test("detects a connection syscall failure reported only on `code`", () => {
+    const error = Object.assign(new AggregateError([], ""), { code: "EPERM" });
+    expect(getTransientDbErrorCode(error)).toBe("EPERM");
+    expect(isTransientDbError(error)).toBe(true);
+  });
+
+  test("unwraps a connection syscall failure the ORM wrapped", () => {
+    const drizzleError = new Error(
+      'Failed query: select "id" from "agents" where "slug" = $1',
+      { cause: new Error("connect EPERM 172.20.81.106:5432") },
+    );
+    expect(getTransientDbErrorCode(drizzleError)).toBe("EPERM");
+    expect(isTransientDbError(drizzleError)).toBe(true);
+  });
+
+  // The ORM interpolates the failing statement's parameters into its message,
+  // so a bare substring match would let user-supplied data mark a permanent
+  // failure (here, a constraint violation) as retryable.
+  test("does not treat an errno inside query parameters as a connection failure", () => {
+    expect(
+      getTransientDbErrorCode(
+        new Error(
+          'Failed query: insert into "agents" ("name") values ($1)\nparams: EPERM_REVIEW_BOT',
+        ),
+      ),
+    ).toBeNull();
+    expect(
+      getTransientDbErrorCode(
+        new Error(
+          "duplicate key value violates unique constraint\nparams: role=EACCES",
+        ),
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("isDbStatementTimeoutError", () => {
+  test("detects the pg error by SQLSTATE code 57014", () => {
+    const error = Object.assign(
+      new Error("canceling statement due to statement timeout"),
+      { code: "57014" },
+    );
+    expect(isDbStatementTimeoutError(error)).toBe(true);
+  });
+
+  test("detects the statement-timeout message without a code", () => {
+    expect(
+      isDbStatementTimeoutError(
+        new Error("canceling statement due to statement timeout"),
+      ),
+    ).toBe(true);
+  });
+
+  test("unwraps the cause chain (DrizzleQueryError pattern)", () => {
+    const pgError = Object.assign(
+      new Error("canceling statement due to statement timeout"),
+      { code: "57014" },
+    );
+    const drizzleError = new Error('Failed query: select "id" from "agents"', {
+      cause: pgError,
+    });
+    expect(isDbStatementTimeoutError(drizzleError)).toBe(true);
+  });
+
+  test("returns false for other errors and non-errors", () => {
+    expect(isDbStatementTimeoutError(new Error("duplicate key"))).toBe(false);
+    const otherPgError = Object.assign(new Error("db error"), {
+      code: "23505",
+    });
+    expect(isDbStatementTimeoutError(otherPgError)).toBe(false);
+    expect(isDbStatementTimeoutError("not an error")).toBe(false);
+    expect(isDbStatementTimeoutError(null)).toBe(false);
+  });
+
+  // Retrying a query that just burned the full statement timeout would
+  // multiply load on an already-slow database, so it must stay non-transient.
+  test("statement timeouts are not classified as transient (not retried)", () => {
+    const pgError = Object.assign(
+      new Error("canceling statement due to statement timeout"),
+      { code: "57014" },
+    );
+    const drizzleError = new Error("Failed query: select 1", {
+      cause: pgError,
+    });
+    expect(isTransientDbError(drizzleError)).toBe(false);
+  });
+});
+
+describe("getDbResourceExhaustionErrorCode", () => {
+  test("maps SQLSTATE class 53 codes to stable names", () => {
+    for (const [code, name] of [
+      ["53100", "disk_full"],
+      ["53200", "out_of_memory"],
+      ["53300", "too_many_connections"],
+    ] as const) {
+      const pgError = Object.assign(new Error("server error"), { code });
+      expect(getDbResourceExhaustionErrorCode(pgError)).toBe(name);
+    }
+  });
+
+  test("unwraps the cause chain (DrizzleQueryError pattern)", () => {
+    const pgError = Object.assign(
+      new Error("could not extend file: No space left on device"),
+      { code: "53100" },
+    );
+    const drizzleError = new Error('Failed query: select "id" from "agents"', {
+      cause: pgError,
+    });
+    expect(getDbResourceExhaustionErrorCode(drizzleError)).toBe("disk_full");
+  });
+
+  test("detects disk-full reports without a SQLSTATE by message", () => {
+    // Raised during connection startup rather than query execution — no code.
+    const drizzleError = new Error("Failed query: select 1", {
+      cause: new Error("could not write init file: No space left on device"),
+    });
+    expect(getDbResourceExhaustionErrorCode(drizzleError)).toBe("disk_full");
+  });
+
+  test("returns null for unrelated errors", () => {
+    expect(getDbResourceExhaustionErrorCode(new Error("boom"))).toBeNull();
+    expect(
+      getDbResourceExhaustionErrorCode(
+        Object.assign(new Error("dup"), { code: "23505" }),
+      ),
+    ).toBeNull();
+    expect(getDbResourceExhaustionErrorCode(null)).toBeNull();
+  });
+
+  // A server out of disk or memory will not recover within the retry budget;
+  // retrying only adds load, so these must stay non-transient.
+  test("resource exhaustion is not classified as transient (not retried)", () => {
+    const pgError = Object.assign(
+      new Error("could not write init file: No space left on device"),
+      { code: "53100" },
+    );
+    const drizzleError = new Error("Failed query: select 1", {
+      cause: pgError,
+    });
+    expect(isTransientDbError(drizzleError)).toBe(false);
+  });
+});
+
 describe("withDbRetry", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -144,6 +411,25 @@ describe("withDbRetry", () => {
     const fn = vi
       .fn()
       .mockRejectedValueOnce(new Error("connect ECONNREFUSED 10.2.124.50:5432"))
+      .mockResolvedValue("recovered");
+
+    const result = await withDbRetry(fn, { maxRetries: 3 });
+    expect(result).toBe("recovered");
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  test("retries a multi-address connection failure (AggregateError) and succeeds", async () => {
+    const fn = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new AggregateError(
+          [
+            new Error("connect ECONNREFUSED ::1:5432"),
+            new Error("connect ECONNREFUSED 127.0.0.1:5432"),
+          ],
+          "",
+        ),
+      )
       .mockResolvedValue("recovered");
 
     const result = await withDbRetry(fn, { maxRetries: 3 });
@@ -216,6 +502,26 @@ describe("withDbRetry", () => {
     expect(fn).toHaveBeenCalledTimes(2);
   });
 
+  test("stops retrying when the time budget is exhausted", async () => {
+    vi.useFakeTimers();
+    const fn = vi
+      .fn()
+      .mockRejectedValue(new Error("connect ECONNREFUSED 10.2.124.50:5432"));
+
+    // Budget allows the first backoff (~100-125ms) but not the second
+    // (~200-250ms on top of ~100-125ms elapsed).
+    const promise = withDbRetry(fn, { maxRetries: 5, budgetMs: 250 });
+    const assertion = expect(promise).rejects.toThrow("ECONNREFUSED");
+
+    await vi.advanceTimersByTimeAsync(1000);
+    await assertion;
+
+    // 1 initial + 1 retry, then the budget cuts it off despite maxRetries: 5
+    expect(fn).toHaveBeenCalledTimes(2);
+
+    vi.useRealTimers();
+  });
+
   test("applies backoff delay between retries", async () => {
     vi.useFakeTimers();
     const fn = vi
@@ -234,6 +540,34 @@ describe("withDbRetry", () => {
     expect(fn).toHaveBeenCalledTimes(2);
 
     vi.useRealTimers();
+  });
+});
+
+describe("withTransactionRetry", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test("does not replay transaction callbacks on a deadlock", async () => {
+    const error = Object.assign(new Error("transaction aborted"), {
+      code: "40P01",
+    });
+    const runTransaction = vi.fn().mockRejectedValue(error);
+    await expect(withTransactionRetry(runTransaction)).rejects.toBe(error);
+    expect(runTransaction).toHaveBeenCalledTimes(1);
+    expect(isTransientDbError(error)).toBe(false);
+  });
+
+  test("retries the whole transaction operation on transient errors", async () => {
+    const runTransaction = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Connection terminated unexpectedly"))
+      .mockResolvedValue("committed");
+
+    const result = await withTransactionRetry(runTransaction);
+
+    expect(result).toBe("committed");
+    expect(runTransaction).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -264,6 +598,35 @@ describe("wrapPoolWithRetry", () => {
 
     await expect(pool.query("INVALID SQL")).rejects.toThrow("syntax error");
     expect(mockQuery).toHaveBeenCalledTimes(1);
+  });
+
+  test("retries an autocommit statement rolled back by a deadlock", async () => {
+    const error = Object.assign(new Error("statement aborted"), {
+      code: "40P01",
+    });
+    const query = vi
+      .fn()
+      .mockRejectedValueOnce(error)
+      .mockResolvedValue({ rows: [{ id: 1 }] });
+    const pool = { query };
+    wrapPoolWithRetry(pool);
+    await expect(pool.query("SELECT 1")).resolves.toEqual({
+      rows: [{ id: 1 }],
+    });
+    expect(query).toHaveBeenCalledTimes(2);
+  });
+
+  test("does not replay a SQL batch that could have committed earlier statements", async () => {
+    const error = Object.assign(new Error("statement aborted"), {
+      code: "40P01",
+    });
+    const query = vi.fn().mockRejectedValue(error);
+    const pool = { query };
+    wrapPoolWithRetry(pool);
+    await expect(pool.query("BEGIN; SELECT 1; COMMIT; SELECT 2")).rejects.toBe(
+      error,
+    );
+    expect(query).toHaveBeenCalledTimes(1);
   });
 
   test("passes through callback-style calls without retry", async () => {
@@ -329,5 +692,135 @@ describe("wrapPoolWithRetry", () => {
     expect(result).toEqual({ rows: [{ id: 1 }], rowCount: 1 });
     // Should be 2 (1 initial + 1 retry), NOT 4+ from double-wrapped retries
     expect(mockQuery).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("installDbErrorSafetyNet", () => {
+  // installDbErrorSafetyNet is idempotent (module-scoped flag), so capture
+  // the handlers once via a process.on spy on the first install, then drive
+  // them directly. Tests are independent because each invokes a captured
+  // handler reference, not a live process event.
+  const processOnSpy = vi.spyOn(process, "on");
+  installDbErrorSafetyNet();
+  const uncaughtHandler = processOnSpy.mock.calls.find(
+    ([event]) => event === "uncaughtException",
+  )?.[1] as (err: unknown) => void;
+  const rejectionHandler = processOnSpy.mock.calls.find(
+    ([event]) => event === "unhandledRejection",
+  )?.[1] as (reason: unknown) => void;
+  processOnSpy.mockRestore();
+
+  let processExitSpy: ReturnType<typeof vi.spyOn>;
+
+  function armExit(): void {
+    processExitSpy = vi.spyOn(process, "exit").mockImplementation(((
+      code?: number,
+    ) => {
+      throw new Error(`process.exit called with ${code}`);
+    }) as never);
+  }
+
+  afterEach(() => {
+    processExitSpy?.mockRestore();
+  });
+
+  test("registers handlers for uncaughtException and unhandledRejection", () => {
+    expect(uncaughtHandler).toBeDefined();
+    expect(rejectionHandler).toBeDefined();
+  });
+
+  test("swallows transient pg errors on uncaughtException without exiting", () => {
+    armExit();
+    uncaughtHandler(new Error("Connection terminated unexpectedly"));
+    uncaughtHandler(new Error("read ECONNRESET"));
+    expect(processExitSpy).not.toHaveBeenCalled();
+  });
+
+  test("exits on non-transient uncaughtException", () => {
+    armExit();
+    expect(() => uncaughtHandler(new Error("Something unrelated"))).toThrow(
+      /process\.exit called with 1/,
+    );
+    expect(processExitSpy).toHaveBeenCalledWith(1);
+  });
+
+  test("swallows transient pg rejections on unhandledRejection without exiting", () => {
+    armExit();
+    rejectionHandler(new Error("Connection terminated"));
+    expect(processExitSpy).not.toHaveBeenCalled();
+  });
+
+  test("exits on non-transient unhandledRejection", () => {
+    armExit();
+    expect(() => rejectionHandler(new Error("not a connection error"))).toThrow(
+      /process\.exit called with 1/,
+    );
+    expect(processExitSpy).toHaveBeenCalledWith(1);
+  });
+
+  test("is idempotent — second call does not register new handlers", () => {
+    const spy = vi.spyOn(process, "on");
+    installDbErrorSafetyNet();
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+});
+
+describe("getDatabaseOutageErrorCode", () => {
+  const timeout = () =>
+    Object.assign(new Error("Request timed out"), { code: "ETIMEDOUT" });
+
+  test("does not call a bare socket timeout from another client a database outage", () => {
+    expect(getDatabaseOutageErrorCode(timeout())).toBeNull();
+    expect(
+      getDatabaseOutageErrorCode(new Error("request failed: ECONNRESET")),
+    ).toBeNull();
+  });
+
+  test("reports the same timeout once the ORM or the pool raised it", async () => {
+    expect(
+      getDatabaseOutageErrorCode(
+        new DrizzleQueryError("select 1", [], timeout()),
+      ),
+    ).toBe("ETIMEDOUT");
+
+    const queryFailure = timeout();
+    const connectFailure = timeout();
+    const pool = {
+      query: vi.fn().mockRejectedValue(queryFailure),
+      connect: vi.fn().mockRejectedValue(connectFailure),
+    };
+    wrapPoolWithRetry(pool);
+    await expect(
+      withDbRetry(() => pool.query("select 1") as Promise<unknown>, {
+        maxRetries: 0,
+      }),
+    ).rejects.toBe(queryFailure);
+    await expect(pool.connect()).rejects.toBe(connectFailure);
+
+    expect(getDatabaseOutageErrorCode(queryFailure)).toBe("ETIMEDOUT");
+    expect(getDatabaseOutageErrorCode(connectFailure)).toBe("ETIMEDOUT");
+  });
+
+  test("reports a connection failure whose target is the database", () => {
+    const databaseHost = new URL(config.database.url).hostname;
+    expect(
+      getDatabaseOutageErrorCode(
+        new Error(`getaddrinfo EAI_AGAIN ${databaseHost}`),
+      ),
+    ).toBe("EAI_AGAIN");
+  });
+
+  test("reports SQLSTATE connection codes and the PostgreSQL client's own wording without provenance", () => {
+    expect(
+      getDatabaseOutageErrorCode(
+        Object.assign(new Error("terminating connection"), { code: "57P01" }),
+      ),
+    ).toBe("57P01");
+    expect(
+      getDatabaseOutageErrorCode(
+        new Error("timeout exceeded when trying to connect"),
+      ),
+    ).toBe("pool_connect_timeout");
   });
 });

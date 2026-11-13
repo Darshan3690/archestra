@@ -1,0 +1,1231 @@
+"use client";
+
+import {
+  type archestraApiTypes,
+  INPUT_MODALITY_OPTIONS,
+  type ModelInputModality,
+  type ModelOutputModality,
+  OUTPUT_MODALITY_OPTIONS,
+  SUPPORTED_EMBEDDING_DIMENSIONS,
+} from "@archestra/shared";
+import {
+  isValidModelPrice,
+  normalizeModelPrice,
+} from "@archestra/shared/model-price";
+import { AlertCircle, Boxes, RotateCcw } from "lucide-react";
+import Image from "next/image";
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useForm } from "react-hook-form";
+import { AdvancedLabelsSection } from "@/components/advanced-labels-section";
+import type { ProfileLabel, ProfileLabelsRef } from "@/components/agent-labels";
+import { PROVIDER_CONFIG } from "@/components/llm-provider-api-key-form";
+import { ResourceAccessSection } from "@/components/resource-access-section";
+import { TabbedDialogShell } from "@/components/tabbed-dialog-shell";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
+import { GroupedNumberInput } from "@/components/ui/grouped-number-input";
+import { Input } from "@/components/ui/input";
+import { MultiSelectCombobox } from "@/components/ui/multi-select-combobox";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Separator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
+import { useHasPermissions } from "@/lib/auth/auth.query";
+import { useAppName } from "@/lib/hooks/use-app-name";
+import { type ModelWithApiKeys, useUpdateModel } from "@/lib/llm-models.query";
+import { useLlmProviderApiKeys } from "@/lib/llm-provider-api-keys.query";
+import type { ModelCostBackfillPrices } from "@/lib/model-cost-backfill.query";
+import {
+  formatMediaPricing,
+  formatPricePerMillion,
+} from "@/lib/model-price-format";
+import { useOrganization } from "@/lib/organization.query";
+import { useAssignableTeams } from "@/lib/teams/team.query";
+import { formatThousands } from "@/lib/utils/format-thousands";
+import {
+  buildConfiguredParameters,
+  type ConfiguredParametersFormValues,
+  getConfiguredParameterDefaults,
+  isKnowledgeBaseEmbeddingModel,
+  type OLLAMA_NATIVE_PARAM_RULES,
+  parseCustomTokenLimit,
+  validateConfiguredParameter,
+  validateCustomTokenLimit,
+} from "../models-page-utils";
+import { ModelCostBackfillSection } from "./model-cost-backfill-section";
+
+/**
+ * The dialog's pages, in sidebar order. Each one owns a slice of the catalog
+ * entry; the model's identity lives in the sidebar header rather than taking up
+ * a page of its own.
+ */
+type ModelDialogSection =
+  | "availability"
+  | "pricing"
+  | "limits"
+  | "modalities"
+  | "embedding"
+  | "parameters";
+
+/**
+ * Which page owns each form field, used to open the page holding a rejected
+ * value. Without it a blocked save points at a message on a page the user
+ * cannot see.
+ */
+const SECTION_BY_FIELD: Record<string, ModelDialogSection> = {
+  ignored: "availability",
+  customPricePerMillionInput: "pricing",
+  customPricePerMillionOutput: "pricing",
+  customPricePerMillionCacheRead: "pricing",
+  customPricePerMillionCacheWrite: "pricing",
+  longContextThreshold: "pricing",
+  longContextPricePerMillionInput: "pricing",
+  longContextPricePerMillionOutput: "pricing",
+  longContextPricePerMillionCacheRead: "pricing",
+  longContextPricePerMillionCacheWrite: "pricing",
+  customContextLength: "limits",
+  customOutputLength: "limits",
+  inputModalities: "modalities",
+  outputModalities: "modalities",
+  embeddingDimensions: "embedding",
+  configuredParameters: "parameters",
+};
+
+/**
+ * A dialog page. Inactive pages are hidden rather than unmounted: react-hook-form
+ * skips validation for fields that are not mounted, so unmounting them would let
+ * a value rejected on one page reach the update route as soon as the user
+ * switched to another.
+ */
+function DialogSection({
+  id,
+  activeSection,
+  children,
+}: {
+  id: ModelDialogSection;
+  activeSection: ModelDialogSection;
+  children: React.ReactNode;
+}) {
+  return (
+    <div hidden={id !== activeSection} className="space-y-4">
+      {children}
+    </div>
+  );
+}
+
+type UpdateModelBody = archestraApiTypes.UpdateModelData["body"];
+type UpdateModelEmbeddingDimensions = NonNullable<
+  UpdateModelBody["embeddingDimensions"]
+>;
+
+const EMBEDDING_DIMENSION_MAP = {
+  "384": 384,
+  "768": 768,
+  "1024": 1024,
+  "1536": 1536,
+  "3072": 3072,
+} satisfies Record<string, UpdateModelEmbeddingDimensions>;
+const NOT_EMBEDDING_MODEL_VALUE = "none";
+
+type EditModelEmbeddingDimensionsValue =
+  | ""
+  | keyof typeof EMBEDDING_DIMENSION_MAP;
+
+// "user" shares the model with named individuals — the finer-grained peer of a
+// team restriction. Stored as grants beside the team list, not as a scope.
+
+interface EditModelFormValues {
+  customPricePerMillionInput: string;
+  customPricePerMillionOutput: string;
+  customPricePerMillionCacheRead: string;
+  customPricePerMillionCacheWrite: string;
+  longContextThreshold: string;
+  longContextPricePerMillionInput: string;
+  longContextPricePerMillionOutput: string;
+  longContextPricePerMillionCacheRead: string;
+  longContextPricePerMillionCacheWrite: string;
+  customContextLength: string;
+  customOutputLength: string;
+  ignored: boolean;
+  embeddingDimensions: EditModelEmbeddingDimensionsValue;
+  inputModalities: string[];
+  outputModalities: string[];
+  configuredParameters: ConfiguredParametersFormValues;
+}
+
+export function EditModelDialog({
+  model,
+  open,
+  onOpenChange,
+}: {
+  model: ModelWithApiKeys;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const appName = useAppName();
+  const [activeSection, setActiveSection] =
+    useState<ModelDialogSection>("availability");
+  const [_inputModalityToAdd, _setInputModalityToAdd] = useState("");
+  const [_outputModalityToAdd, _setOutputModalityToAdd] = useState("");
+  const updateModel = useUpdateModel();
+  const [labels, setLabels] = useState<ProfileLabel[]>(model.labels);
+  const labelsRef = useRef<ProfileLabelsRef>(null);
+  // The permissions section keeps its edits in its own form. This dialog's
+  // Save Changes is the only Save on screen, so it commits them too.
+  const permissionsSave = useRef<(() => Promise<void>) | null>(null);
+  const registerPermissionsSave = useCallback(
+    (save: (() => Promise<void>) | null) => {
+      permissionsSave.current = save;
+    },
+    [],
+  );
+  const [permissionsDirty, setPermissionsDirty] = useState(false);
+  // The Pricing page's "Apply new prices to" recompute starts after the
+  // prices are saved, so it runs at exactly the stored prices.
+  const backfillStart = useRef<(() => Promise<boolean>) | null>(null);
+  const registerBackfillStart = useCallback(
+    (start: (() => Promise<boolean>) | null) => {
+      backfillStart.current = start;
+    },
+    [],
+  );
+  const [backfillDirty, setBackfillDirty] = useState(false);
+  const { data: canReadTeams } = useHasPermissions({ team: ["read"] });
+  // Model catalog managers restrict models across the whole org, so the
+  // picker offers every team (not just the editor's own).
+  const { data: assignableTeams = [] } = useAssignableTeams({
+    isResourceAdmin: true,
+    enabled: !!canReadTeams,
+  });
+  const { data: organization } = useOrganization();
+  const { data: apiKeys = [] } = useLlmProviderApiKeys();
+  const providerConfig = PROVIDER_CONFIG[model.provider];
+  const embeddingConfigLocked = isKnowledgeBaseEmbeddingModel({
+    model,
+    embeddingModel: organization?.embeddingModel,
+    embeddingChatApiKeyId: organization?.embeddingChatApiKeyId,
+    availableApiKeys: apiKeys,
+  });
+  const fallbackPricing = getFallbackPricing(model);
+  const _teamScopeUnavailable = !canReadTeams || assignableTeams.length === 0;
+  const nonNegativePriceRule = {
+    validate: (v: string) => {
+      if (!v.trim()) return true;
+      if (!isValidModelPrice(v))
+        return "Enter a decimal number between 0 and 99999999.99 (use a dot)";
+      return true;
+    },
+  };
+  // The threshold and its four prices are one setting: all set or all empty.
+  const longContextRule = (validateValue: (v: string) => true | string) => ({
+    deps: [...LONG_CONTEXT_FIELDS],
+    validate: (v: string, values: EditModelFormValues) => {
+      if (!v.trim()) {
+        return LONG_CONTEXT_FIELDS.some((name) => values[name].trim())
+          ? "Set the threshold and all four long-context prices, or leave all empty"
+          : true;
+      }
+      return validateValue(v);
+    },
+  });
+  const form = useForm<EditModelFormValues>({
+    defaultValues: getDefaults(model),
+  });
+  const selectedEmbeddingDimensions = form.watch("embeddingDimensions");
+  // The `num_ctx` ceiling follows the window currently entered in this dialog,
+  // not the saved one: the update route validates the post-patch pair, so
+  // raising the window and `num_ctx` in one save has to pass here too.
+  const contextCeiling =
+    parseCustomTokenLimit(form.watch("customContextLength")) ??
+    model.contextLength;
+  const backfillPrices = toBackfillPrices({
+    input: form.watch("customPricePerMillionInput"),
+    output: form.watch("customPricePerMillionOutput"),
+    cacheRead: form.watch("customPricePerMillionCacheRead"),
+    cacheWrite: form.watch("customPricePerMillionCacheWrite"),
+  });
+  const pricesChanged = PRICE_FIELDS.some(
+    (price) => form.formState.dirtyFields[price.name],
+  );
+
+  // An embedding model whose embedding client is text-only can't take image
+  // input — the backend rejects the save, so disable the option here with the
+  // reason instead of letting the form run into a 400.
+  const imageInputUnavailable =
+    !!selectedEmbeddingDimensions &&
+    model.embeddingClientImageCapable === false;
+  // Rows synced without modality metadata (providers whose catalog reports
+  // none) carry null modality lists. Requiring modalities on those rows would
+  // block unrelated edits — a price-only save must not force the admin to
+  // invent modality data first. Once modalities are recorded, clearing a
+  // required list entirely stays invalid.
+  const hadInputModalities = (model.inputModalities ?? []).length > 0;
+  const hadOutputModalities = (model.outputModalities ?? []).length > 0;
+  const inputModalityOptions = INPUT_MODALITY_OPTIONS.map((option) =>
+    imageInputUnavailable && option.value === "image"
+      ? {
+          value: option.value,
+          label: option.label,
+          disabled: true,
+          description:
+            "Unavailable: the embedding client for this model supports text input only.",
+        }
+      : {
+          value: option.value,
+          label: option.label,
+          description: option.description,
+        },
+  );
+  const outputModalityOptions = OUTPUT_MODALITY_OPTIONS.map((option) => ({
+    value: option.value,
+    label: option.label,
+    description: option.description,
+  }));
+
+  // Top-level field errors, surfaced next to the submit button — see the footer
+  // for why. Nested `configuredParameters.*` errors are deliberately not
+  // included: those inputs spread `field` onto a real DOM node, so
+  // react-hook-form focuses and scrolls to them on its own.
+  const blockingErrors = Object.values(form.formState.errors)
+    .map((error) => (error as { message?: string } | undefined)?.message)
+    .filter((message): message is string => Boolean(message));
+
+  useEffect(() => {
+    if (open) {
+      form.reset(getDefaults(model));
+      setLabels(model.labels);
+      setActiveSection("availability");
+    }
+  }, [open, model, form]);
+
+  const handleSubmit = async (values: EditModelFormValues) => {
+    // Taken now: the range can still change while the update is in flight.
+    const startBackfill = backfillStart.current;
+    const finalLabels = labelsRef.current?.saveUnsavedLabel() ?? labels;
+    await permissionsSave.current?.();
+    const inputPrice = values.customPricePerMillionInput.trim() || null;
+    const outputPrice = values.customPricePerMillionOutput.trim() || null;
+    const cacheReadPrice = values.customPricePerMillionCacheRead.trim() || null;
+    const cacheWritePrice =
+      values.customPricePerMillionCacheWrite.trim() || null;
+    const embeddingDimensions = getEmbeddingDimensionsValue(
+      values.embeddingDimensions,
+    );
+
+    const result = await updateModel.mutateAsync({
+      id: model.id,
+      longContextThreshold: parseCustomTokenLimit(values.longContextThreshold),
+      longContextPricePerMillionInput:
+        values.longContextPricePerMillionInput.trim() || null,
+      longContextPricePerMillionOutput:
+        values.longContextPricePerMillionOutput.trim() || null,
+      longContextPricePerMillionCacheRead:
+        values.longContextPricePerMillionCacheRead.trim() || null,
+      longContextPricePerMillionCacheWrite:
+        values.longContextPricePerMillionCacheWrite.trim() || null,
+      customPricePerMillionInput: inputPrice,
+      customPricePerMillionOutput: outputPrice,
+      customPricePerMillionCacheRead: cacheReadPrice,
+      customPricePerMillionCacheWrite: cacheWritePrice,
+      // Empty clears the override, which is how the provider's own figure
+      // becomes visible again after one has been set.
+      customContextLength: parseCustomTokenLimit(values.customContextLength),
+      customOutputLength: parseCustomTokenLimit(values.customOutputLength),
+      ignored: values.ignored,
+      labels: finalLabels,
+      // Both lists always go, so switching between Teams and Users revokes
+      // what the previous choice left behind instead of stranding it.
+      embeddingDimensions,
+      // Sent only when actually changed: a row synced without modality
+      // metadata stores null, and a price-only save must not coerce that null
+      // into an empty list (null reads as "unknown" downstream, [] as
+      // "known: none").
+      ...(sameModalities(values.inputModalities, model.inputModalities ?? [])
+        ? {}
+        : { inputModalities: values.inputModalities as ModelInputModality[] }),
+      ...(sameModalities(values.outputModalities, model.outputModalities ?? [])
+        ? {}
+        : {
+            outputModalities: values.outputModalities as ModelOutputModality[],
+          }),
+      // Configured parameters are only applied by the native Ollama provider;
+      // for other providers leave the field untouched. Sent only when actually
+      // edited: the update replaces the object wholesale, so including it on an
+      // unrelated save (a price tweak) would rewrite parameters the form no
+      // longer renders — `seed` among them.
+      ...(model.provider === "ollama-native" &&
+      form.formState.dirtyFields.configuredParameters
+        ? {
+            configuredParameters: buildConfiguredParameters(
+              values.configuredParameters,
+              model.configuredParameters,
+            ),
+          }
+        : {}),
+    });
+    if (!result) return;
+    if ((await startBackfill?.()) === false) return;
+    onOpenChange(false);
+  };
+
+  const handleResetPricing = () => {
+    form.setValue("customPricePerMillionInput", "");
+    form.setValue("customPricePerMillionOutput", "");
+    form.setValue("customPricePerMillionCacheRead", "");
+    form.setValue("customPricePerMillionCacheWrite", "");
+  };
+
+  // Parameters are Ollama-only: the native transport sends them, and the
+  // OpenAI-compatible one reports the defaults this page displays.
+  const showsParameters =
+    model.provider === "ollama-native" ||
+    (model.provider === "ollama" &&
+      !!model.defaultParameters &&
+      Object.keys(model.defaultParameters).length > 0);
+
+  const navItems = useMemo(
+    () => [
+      { id: "availability" as const, label: "Availability" },
+      { id: "pricing" as const, label: "Pricing" },
+      { id: "limits" as const, label: "Limits" },
+      { id: "modalities" as const, label: "Modalities" },
+      { id: "embedding" as const, label: "Embedding" },
+      ...(showsParameters
+        ? [{ id: "parameters" as const, label: "Parameters" }]
+        : []),
+    ],
+    [showsParameters],
+  );
+
+  // A rejected field is useless on a page the user cannot see, so the first one
+  // brings its page forward.
+  const showFirstInvalidSection = () => {
+    const firstInvalidField = Object.keys(form.formState.errors).find(
+      (field) => field in SECTION_BY_FIELD,
+    );
+    if (firstInvalidField) {
+      setActiveSection(SECTION_BY_FIELD[firstInvalidField]);
+    }
+  };
+
+  return (
+    <TabbedDialogShell
+      open={open}
+      onOpenChange={onOpenChange}
+      title="Edit Model"
+      description={`Update the catalog entry for "${model.modelId}".`}
+      sidebarLabel={model.modelId}
+      sidebarDescription={providerConfig?.name ?? model.provider}
+      sidebarIcon={
+        providerConfig ? (
+          <Image
+            src={providerConfig.icon}
+            alt={providerConfig.name}
+            width={16}
+            height={16}
+            className="rounded dark:invert"
+          />
+        ) : (
+          <Boxes className="h-4 w-4 text-muted-foreground" />
+        )
+      }
+      activeSection={activeSection}
+      navItems={navItems}
+      onActiveSectionChange={setActiveSection}
+      onSubmit={form.handleSubmit(handleSubmit, showFirstInvalidSection)}
+      isDirty={form.formState.isDirty || permissionsDirty || backfillDirty}
+      wrapForm={(formContent) => <Form {...form}>{formContent}</Form>}
+      footer={
+        <>
+          {/* The dialog body scrolls while this footer is pinned, so a field
+              error can render hundreds of pixels above the fold — and the
+              modality fields never forward a ref, so react-hook-form cannot
+              scroll to them either. Without this, a blocked submit looks
+              exactly like a button that does nothing. */}
+          {blockingErrors.length > 0 && (
+            <p
+              role="alert"
+              className="mr-auto text-sm text-destructive"
+              data-testid="edit-model-form-errors"
+            >
+              {blockingErrors.join(". ")}
+            </p>
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+          >
+            Cancel
+          </Button>
+          <Button type="submit" disabled={form.formState.isSubmitting}>
+            {form.formState.isSubmitting ? "Saving..." : "Save Changes"}
+          </Button>
+        </>
+      }
+    >
+      <DialogSection id="availability" activeSection={activeSection}>
+        {/* Availability: hide toggle + team restriction */}
+        <div className="space-y-3">
+          <div className="space-y-1">
+            <span className="text-sm font-medium">Availability</span>
+            <p className="text-sm text-muted-foreground">
+              Whether this model can be selected or used through {appName}.
+            </p>
+          </div>
+
+          <FormField
+            control={form.control}
+            name="ignored"
+            render={({ field }) => (
+              <FormItem>
+                <div className="flex items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <FormLabel>Hide this model</FormLabel>
+                    <p className="text-sm text-muted-foreground">
+                      Hidden models remain synced and editable in this catalog,
+                      but cannot be selected or used through {appName},
+                      including direct API requests. Show the model to enable it
+                      again.
+                    </p>
+                  </div>
+                  <FormControl>
+                    <Switch
+                      checked={field.value}
+                      onCheckedChange={field.onChange}
+                    />
+                  </FormControl>
+                </div>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        </div>
+        <ResourceAccessSection
+          resource="llmModel"
+          id={model.id}
+          registerSave={registerPermissionsSave}
+          onDirtyChange={setPermissionsDirty}
+        />
+        <AdvancedLabelsSection
+          ref={labelsRef}
+          labels={labels}
+          onLabelsChange={setLabels}
+        />
+      </DialogSection>
+
+      <DialogSection id="pricing" activeSection={activeSection}>
+        <div className="space-y-6">
+          <div className="space-y-4">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-sm font-medium">
+                Token prices ($/M tokens)
+              </span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="xs"
+                onClick={handleResetPricing}
+              >
+                <RotateCcw className="h-3 w-3" />
+                <span>Reset</span>
+              </Button>
+            </div>
+            <div className="grid grid-cols-1 gap-3 min-[420px]:grid-cols-2">
+              {PRICE_FIELDS.map((price) => (
+                <FormField
+                  key={price.name}
+                  control={form.control}
+                  name={price.name}
+                  rules={nonNegativePriceRule}
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{price.label}</FormLabel>
+                      <FormControl>
+                        <Input
+                          inputMode="decimal"
+                          placeholder={fallbackPricing[price.fallback]}
+                          className="tabular-nums"
+                          {...field}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              ))}
+            </div>
+            {(model.mediaPricing ||
+              model.priceSource === "default" ||
+              model.cachePriceSource === "derived_multiplier") && (
+              <div className="space-y-1 text-xs text-muted-foreground">
+                {model.mediaPricing ? (
+                  <p>
+                    Image and audio calls are charged at the vendor's media
+                    rates, {formatMediaPricing(model.mediaPricing)}, not at
+                    these token prices.
+                  </p>
+                ) : (
+                  model.priceSource === "default" && (
+                    <p>
+                      Input and output prices are estimated. Set a custom price
+                      for accurate cost tracking.
+                    </p>
+                  )
+                )}
+                {model.cachePriceSource === "derived_multiplier" && (
+                  <p>
+                    Cache prices are estimated from the input price. Set a
+                    custom cache price to override.
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="space-y-2 pt-2">
+            <div className="flex min-h-7 items-center">
+              <span className="text-sm font-medium">
+                Long-context Pricing ($/M tokens)
+              </span>
+            </div>
+            <FormField
+              control={form.control}
+              name="longContextThreshold"
+              rules={longContextRule(validateCustomTokenLimit)}
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Above prompt tokens</FormLabel>
+                  <FormControl>
+                    <GroupedNumberInput placeholder="Not set" {...field} />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <div className="grid grid-cols-2 gap-3">
+              {LONG_CONTEXT_PRICE_FIELDS.map(({ name, label }) => (
+                <FormField
+                  key={name}
+                  control={form.control}
+                  name={name}
+                  rules={longContextRule(nonNegativePriceRule.validate)}
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{label}</FormLabel>
+                      <FormControl>
+                        <Input {...field} />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              ))}
+            </div>
+          </div>
+          <Separator />
+          <ModelCostBackfillSection
+            key={open ? model.id : "closed"}
+            modelId={model.id}
+            prices={backfillPrices}
+            pricesChanged={pricesChanged}
+            visible={open && activeSection === "pricing"}
+            registerStart={registerBackfillStart}
+            onDirtyChange={setBackfillDirty}
+          />
+        </div>
+      </DialogSection>
+
+      <DialogSection id="limits" activeSection={activeSection}>
+        {/* Context window + max output tokens */}
+        <div className="space-y-3">
+          <div className="space-y-1">
+            <span className="text-sm font-medium">Limits</span>
+            <p className="text-sm text-muted-foreground">
+              The context window and output ceiling {appName} assumes for this
+              model. Leave a field empty to use whatever the provider reports;
+              set it when the provider reports nothing, or reports a value that
+              does not match how this model is actually served.
+            </p>
+          </div>
+          {model.contextLength === null && model.outputLength === null && (
+            <p className="text-xs text-muted-foreground">
+              This provider reports neither limit for this model, so chat
+              context usage and output budgets fall back to conservative
+              defaults until you set them here.
+            </p>
+          )}
+          <div className="grid grid-cols-2 gap-3">
+            <FormField
+              control={form.control}
+              name="customContextLength"
+              rules={{ validate: validateCustomTokenLimit }}
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Context window (tokens)</FormLabel>
+                  <FormControl>
+                    <GroupedNumberInput
+                      placeholder={providerLimitPlaceholder(
+                        model.contextLength,
+                      )}
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="customOutputLength"
+              rules={{ validate: validateCustomTokenLimit }}
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Max output tokens</FormLabel>
+                  <FormControl>
+                    <GroupedNumberInput
+                      placeholder={providerLimitPlaceholder(model.outputLength)}
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </div>
+        </div>
+      </DialogSection>
+
+      <DialogSection id="modalities" activeSection={activeSection}>
+        <div className="space-y-3">
+          <div className="space-y-1">
+            <span className="text-sm font-medium">Modalities</span>
+            <p className="text-sm text-muted-foreground">
+              These settings describe what the model can accept as input and
+              what it can produce as output.
+            </p>
+          </div>
+          <Alert>
+            <AlertCircle />
+            <AlertTitle>How {appName} chat support is determined</AlertTitle>
+            <AlertDescription>
+              <ul className="list-disc space-y-1 pl-5">
+                <li>
+                  Text input means the model can accept normal chat prompts. In{" "}
+                  {appName} chat, it also enables text-based uploads such as{" "}
+                  <code>.txt</code> and <code>.csv</code>, which are passed to
+                  the model as text content. Text output means the model can
+                  return standard chat responses.
+                </li>
+                <li>
+                  In {appName} chat, a model appears as a standard chat model
+                  when it supports both text input and text output and is not
+                  hidden.
+                </li>
+                <li>
+                  Image, audio, video, and PDF input modalities control whether
+                  chat file upload is enabled for the model and which uploaded
+                  file types are accepted.
+                </li>
+                <li>
+                  Output modalities describe the response formats the model can
+                  generate, but they do not enable file uploads by themselves.
+                </li>
+              </ul>
+            </AlertDescription>
+          </Alert>
+
+          <div className="grid items-start gap-3 md:grid-cols-2">
+            <FormField
+              control={form.control}
+              name="inputModalities"
+              rules={{
+                validate: (v) => {
+                  if (v.length === 0 && hadInputModalities) {
+                    return "At least one input modality is required";
+                  }
+                  if (imageInputUnavailable && v.includes("image")) {
+                    return "The embedding client for this model supports text input only — remove the Image input modality or unset the embedding dimensions.";
+                  }
+                  return true;
+                },
+              }}
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Input</FormLabel>
+                  <FormControl>
+                    <MultiSelectCombobox
+                      options={inputModalityOptions}
+                      value={field.value}
+                      onChange={field.onChange}
+                      placeholder="Add input modality…"
+                      emptyMessage="No modalities found."
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <FormField
+              control={form.control}
+              name="outputModalities"
+              rules={{
+                validate: (v) =>
+                  shouldRequireOutputModalities(selectedEmbeddingDimensions) &&
+                  hadOutputModalities
+                    ? v.length > 0 || "At least one output modality is required"
+                    : true,
+              }}
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Output</FormLabel>
+                  <FormControl>
+                    <MultiSelectCombobox
+                      options={outputModalityOptions}
+                      value={field.value}
+                      onChange={field.onChange}
+                      placeholder="Add output modality…"
+                      emptyMessage="No modalities found."
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </div>
+        </div>
+      </DialogSection>
+
+      <DialogSection id="embedding" activeSection={activeSection}>
+        <div className="space-y-3">
+          <div className="space-y-1">
+            <span className="text-sm font-medium">Embedding</span>
+            <p className="text-sm text-muted-foreground">
+              Set embedding dimensions to make this model available for
+              knowledge base embeddings. Leave it unset for chat-only models.
+              This must match the vector size the provider returns or the size
+              you intentionally truncate to.
+            </p>
+          </div>
+
+          <Alert>
+            <AlertCircle />
+            <AlertTitle>How embedding input modalities are used</AlertTitle>
+            <AlertDescription>
+              <ul className="list-disc space-y-1 pl-5">
+                <li>
+                  Input modalities control which source content types can be
+                  sent to this model when {appName} generates embeddings for
+                  knowledge connectors and uploaded files.
+                </li>
+                <li>
+                  Text input enables text-based content such as documents,
+                  pages, and extracted file text.
+                </li>
+                <li>
+                  Image input enables image files to be considered for embedding
+                  when the connector and model both support it.
+                </li>
+                <li>
+                  Output modalities are not required for embedding-only models.
+                </li>
+              </ul>
+            </AlertDescription>
+          </Alert>
+
+          <FormField
+            control={form.control}
+            name="embeddingDimensions"
+            render={({ field }) => (
+              <FormItem>
+                <Select
+                  value={field.value || NOT_EMBEDDING_MODEL_VALUE}
+                  disabled={embeddingConfigLocked}
+                  onValueChange={(value) =>
+                    field.onChange(
+                      value === NOT_EMBEDDING_MODEL_VALUE ? "" : value,
+                    )
+                  }
+                >
+                  <FormControl>
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder="Not an embedding model" />
+                    </SelectTrigger>
+                  </FormControl>
+                  <SelectContent>
+                    <SelectItem value={NOT_EMBEDDING_MODEL_VALUE}>
+                      Not an embedding model
+                    </SelectItem>
+                    {SUPPORTED_EMBEDDING_DIMENSIONS.map((dimension) => (
+                      <SelectItem key={dimension} value={dimension.toString()}>
+                        {dimension}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {embeddingConfigLocked && (
+                  <p className="text-sm text-muted-foreground">
+                    This model is used for knowledge base embeddings, so its
+                    embedding configuration is locked. To change it, drop the
+                    embedding configuration in{" "}
+                    <Link
+                      href="/settings/knowledge"
+                      className="underline underline-offset-2"
+                    >
+                      Knowledge settings
+                    </Link>{" "}
+                    first — all documents will need to be re-embedded.
+                  </p>
+                )}
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        </div>
+      </DialogSection>
+
+      <DialogSection id="parameters" activeSection={activeSection}>
+        {model.provider === "ollama" &&
+          model.defaultParameters &&
+          Object.keys(model.defaultParameters).length > 0 && (
+            <div className="space-y-2">
+              <span className="text-sm font-medium">Default parameters</span>
+              <p className="text-sm text-muted-foreground">
+                Defaults reported by Ollama for this model, shown for reference.{" "}
+                {appName} does not apply them to requests.
+              </p>
+              <dl className="divide-y rounded-lg border text-sm">
+                {Object.entries(model.defaultParameters).map(([key, value]) => (
+                  <div
+                    key={key}
+                    className="flex items-center justify-between gap-4 px-3 py-2"
+                  >
+                    <dt className="font-mono text-muted-foreground">{key}</dt>
+                    <dd className="font-mono">
+                      {Array.isArray(value) ? value.join(", ") : String(value)}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          )}
+
+        {model.provider === "ollama-native" && (
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <span className="text-sm font-medium">Model parameters</span>
+              <p className="text-sm text-muted-foreground">
+                Sent to Ollama on every chat turn. Leave a field empty to
+                inherit Ollama's own default
+                {model.defaultParameters &&
+                Object.keys(model.defaultParameters).length > 0
+                  ? " (shown as the placeholder)."
+                  : "."}
+              </p>
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              {OLLAMA_NATIVE_PARAM_FIELDS.map((param) => (
+                <FormField
+                  key={param.name}
+                  control={form.control}
+                  name={`configuredParameters.${param.name}`}
+                  rules={{
+                    validate: (value: string) =>
+                      validateConfiguredParameter({
+                        name: param.name,
+                        value,
+                        contextLength: contextCeiling,
+                      }),
+                  }}
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel className="font-mono text-xs">
+                        {param.name}
+                      </FormLabel>
+                      <FormControl>
+                        <Input
+                          inputMode="decimal"
+                          placeholder={ollamaDefaultPlaceholder(
+                            model,
+                            param.name,
+                          )}
+                          {...field}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              ))}
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <FormField
+                control={form.control}
+                name="configuredParameters.stop"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel className="font-mono text-xs">stop</FormLabel>
+                    <FormControl>
+                      <Textarea
+                        rows={3}
+                        placeholder={ollamaDefaultPlaceholder(model, "stop")}
+                        {...field}
+                      />
+                    </FormControl>
+                    <p className="text-xs text-muted-foreground">
+                      One sequence per line.
+                    </p>
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="configuredParameters.reasoning_effort"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Thinking</FormLabel>
+                    <Select
+                      // Rows saved before this control collapsed to on/off
+                      // still hold "low"/"high"; both mean thinking is on.
+                      value={
+                        field.value
+                          ? field.value === "none"
+                            ? "none"
+                            : "medium"
+                          : "inherit"
+                      }
+                      onValueChange={(value) =>
+                        field.onChange(value === "inherit" ? "" : value)
+                      }
+                    >
+                      <FormControl>
+                        <SelectTrigger>
+                          <SelectValue placeholder="Inherit" />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent>
+                        {/* Ollama's `think` is a boolean on this provider,
+                                so low/medium/high would all be identical on the
+                                wire — offering them implied a granularity that
+                                does not exist. */}
+                        <SelectItem value="inherit">Inherit</SelectItem>
+                        <SelectItem value="medium">On</SelectItem>
+                        <SelectItem value="none">Off</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-muted-foreground">
+                      Thinking-capable models only. "Inherit" uses Ollama's own
+                      default.
+                    </p>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
+          </div>
+        )}
+      </DialogSection>
+    </TabbedDialogShell>
+  );
+}
+
+/**
+ * Placeholder prices shown in the custom-price inputs: the backend's resolved
+ * effective price (synced or estimated) for input/output, and the resolved
+ * cache prices (null when the model's provider has no cache pricing). The
+ * effective price equals the custom override when one is set, but in that case
+ * the input is non-empty so the placeholder is not shown.
+ */
+function getFallbackPricing(model: ModelWithApiKeys): {
+  input: string;
+  output: string;
+  cacheRead: string;
+  cacheWrite: string;
+} {
+  return {
+    input: model.pricePerMillionInput ?? "",
+    output: model.pricePerMillionOutput ?? "",
+    cacheRead: model.pricePerMillionCacheRead ?? "",
+    cacheWrite: model.pricePerMillionCacheWrite ?? "",
+  };
+}
+
+const PRICE_FIELDS = [
+  { name: "customPricePerMillionInput", label: "Input", fallback: "input" },
+  { name: "customPricePerMillionOutput", label: "Output", fallback: "output" },
+  {
+    name: "customPricePerMillionCacheRead",
+    label: "Cache read",
+    fallback: "cacheRead",
+  },
+  {
+    name: "customPricePerMillionCacheWrite",
+    label: "Cache write",
+    fallback: "cacheWrite",
+  },
+] as const satisfies ReadonlyArray<{
+  name: keyof EditModelFormValues;
+  label: string;
+  fallback: keyof ReturnType<typeof getFallbackPricing>;
+}>;
+
+/**
+ * The custom prices as the recompute preview takes them: blank means "no
+ * custom price". Null while any field holds an invalid price, so the preview
+ * keeps its last answer instead of pricing a half-typed number.
+ */
+function toBackfillPrices(
+  values: Record<keyof ModelCostBackfillPrices, string>,
+): ModelCostBackfillPrices | null {
+  const prices = {} as ModelCostBackfillPrices;
+  for (const key of Object.keys(values) as Array<
+    keyof ModelCostBackfillPrices
+  >) {
+    const value = values[key].trim();
+    if (!value) {
+      prices[key] = null;
+      continue;
+    }
+    const normalized = normalizeModelPrice(value);
+    if (normalized === null) return null;
+    prices[key] = normalized;
+  }
+  return prices;
+}
+
+/**
+ * Placeholder for a limit input: the provider's own figure, or a note that it
+ * published none. An empty field means "use the provider's value", so the
+ * placeholder has to say what that value is — including when there isn't one.
+ */
+function providerLimitPlaceholder(value: number | null): string {
+  return value === null
+    ? "Not reported by the provider"
+    : formatThousands(value);
+}
+
+const LONG_CONTEXT_PRICE_FIELDS = [
+  { name: "longContextPricePerMillionInput", label: "Long input" },
+  { name: "longContextPricePerMillionOutput", label: "Long output" },
+  { name: "longContextPricePerMillionCacheRead", label: "Long cache read" },
+  { name: "longContextPricePerMillionCacheWrite", label: "Long cache write" },
+] as const;
+
+const LONG_CONTEXT_FIELDS = [
+  "longContextThreshold",
+  ...LONG_CONTEXT_PRICE_FIELDS.map(({ name }) => name),
+] as const;
+
+function sameModalities(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((modality) => b.includes(modality));
+}
+
+function getDefaults(model: ModelWithApiKeys): EditModelFormValues {
+  return {
+    customPricePerMillionInput: formatPricePerMillion(
+      model.customPricePerMillionInput ?? "",
+    ),
+    customPricePerMillionOutput: formatPricePerMillion(
+      model.customPricePerMillionOutput ?? "",
+    ),
+    customPricePerMillionCacheRead: formatPricePerMillion(
+      model.customPricePerMillionCacheRead ?? "",
+    ),
+    customPricePerMillionCacheWrite: formatPricePerMillion(
+      model.customPricePerMillionCacheWrite ?? "",
+    ),
+    longContextThreshold: model.longContextThreshold?.toString() ?? "",
+    longContextPricePerMillionInput: formatPricePerMillion(
+      model.longContextPricePerMillionInput ?? "",
+    ),
+    longContextPricePerMillionOutput: formatPricePerMillion(
+      model.longContextPricePerMillionOutput ?? "",
+    ),
+    longContextPricePerMillionCacheRead: formatPricePerMillion(
+      model.longContextPricePerMillionCacheRead ?? "",
+    ),
+    longContextPricePerMillionCacheWrite: formatPricePerMillion(
+      model.longContextPricePerMillionCacheWrite ?? "",
+    ),
+    customContextLength: model.customContextLength?.toString() ?? "",
+    customOutputLength: model.customOutputLength?.toString() ?? "",
+    ignored: model.ignored,
+    embeddingDimensions: model.embeddingDimensions
+      ? getEmbeddingDimensionsString(model.embeddingDimensions)
+      : "",
+    inputModalities: model.inputModalities ?? [],
+    outputModalities: model.outputModalities ?? [],
+    configuredParameters: getConfiguredParameterDefaults(model),
+  };
+}
+
+function getEmbeddingDimensionsString(
+  value: UpdateModelEmbeddingDimensions,
+): EditModelEmbeddingDimensionsValue {
+  if (value === 384) return "384";
+  if (value === 768) return "768";
+  if (value === 1024) return "1024";
+  if (value === 1536) return "1536";
+  if (value === 3072) return "3072";
+  return "";
+}
+
+function getEmbeddingDimensionsValue(
+  value: EditModelEmbeddingDimensionsValue,
+): UpdateModelEmbeddingDimensions | null {
+  if (!value) {
+    return null;
+  }
+
+  return EMBEDDING_DIMENSION_MAP[value];
+}
+
+function shouldRequireOutputModalities(
+  embeddingDimensions: EditModelEmbeddingDimensionsValue,
+): boolean {
+  return !embeddingDimensions;
+}
+
+/**
+ * The numeric native-Ollama parameters rendered as a grid in the model dialog.
+ * `stop` (a newline-delimited textarea) and `reasoning_effort` (a select) are
+ * rendered separately.
+ */
+const OLLAMA_NATIVE_PARAM_FIELDS: Array<{
+  name: keyof typeof OLLAMA_NATIVE_PARAM_RULES;
+}> = [
+  { name: "num_ctx" },
+  { name: "num_predict" },
+  { name: "temperature" },
+  { name: "top_p" },
+  { name: "top_k" },
+  { name: "repeat_penalty" },
+];
+
+function ollamaDefaultPlaceholder(
+  model: ModelWithApiKeys,
+  name: string,
+): string {
+  const value = model.defaultParameters?.[name];
+  if (value === undefined || value === null) return "inherit";
+  // Newline-joined, matching the delimiter `buildConfiguredParameters` parses.
+  // `/api/show` routinely reports several `stop` sequences, and a comma-joined
+  // placeholder invited admins to copy it back in as one sequence containing a
+  // comma — the exact value the newline switch was made to stop producing.
+  return Array.isArray(value) ? value.join("\n") : String(value);
+}

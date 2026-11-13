@@ -1,0 +1,640 @@
+"use client";
+
+import type { ColumnDef } from "@tanstack/react-table";
+import {
+  Bot,
+  ListFilter,
+  Pencil,
+  Plus,
+  Power,
+  PowerOff,
+  Trash2,
+} from "lucide-react";
+import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { AgentIcon } from "@/components/agent-icon";
+import { AgentNameCell } from "@/components/agent-name-cell";
+import { openRowOnPlainClick } from "@/components/agent-pages/row-click-shield";
+import { DeleteConfirmDialog } from "@/components/delete-confirm-dialog";
+import { EntityLabelFilter } from "@/components/entity-label-filter";
+import {
+  CollectionFilters,
+  FilterBar,
+  FilterSelect,
+  filterControlClass,
+  filterSearchClass,
+} from "@/components/filter-bar";
+import { QueryLoadError } from "@/components/query-load-error";
+import { ResourceListActions } from "@/components/resource-list-actions";
+import { SearchInput } from "@/components/search-input";
+import { AccountHealthBadge } from "@/components/service-account-status-badge";
+import { TableRowActions } from "@/components/table-row-actions";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { BulkActions } from "@/components/ui/bulk-actions-bar";
+import { BulkActionsScope } from "@/components/ui/bulk-actions-context";
+import { createSelectColumn } from "@/components/ui/bulk-select-column";
+import { DataTable } from "@/components/ui/data-table";
+import { PermissionButton } from "@/components/ui/permission-button";
+import { RoleSelect } from "@/components/ui/role-select";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { UnstyledButton } from "@/components/ui/unstyled-button";
+import {
+  useHasPermissions,
+  useScopedCapabilities,
+} from "@/lib/auth/auth.query";
+import { holdsItemGrant } from "@/lib/auth/auth.utils";
+import { reportBulkOutcome } from "@/lib/bulk-action";
+import {
+  useServiceAccountLabelKeys,
+  useServiceAccountLabelValues,
+} from "@/lib/entity-labels.query";
+import { useBulkSelection } from "@/lib/hooks/use-bulk-selection";
+import { useDataTableQueryParams } from "@/lib/hooks/use-data-table-query-params";
+import {
+  type ServiceAccount,
+  useBulkDeleteServiceAccounts,
+  useBulkSetServiceAccountsDisabled,
+  useDeleteServiceAccount,
+  useServiceAccounts,
+} from "@/lib/service-account.query";
+import {
+  ACCOUNT_HEALTH_LABELS,
+  type AccountHealth,
+  getAccountHealth,
+} from "@/lib/service-account-status";
+import { formatRelativeTimeFromNow } from "@/lib/utils/date-time";
+import { formatRoleName } from "@/lib/utils/role";
+import { useSetSettingsAction } from "../layout";
+import { CreateServiceAccountDialog } from "./_parts/create-service-account-dialog";
+
+const ALL = "all";
+
+/**
+ * Statuses worth filtering to, most actionable first. "No usable key" is the
+ * reason this filter exists: those accounts look healthy in every other column
+ * and are exactly the ones an operator needs to find.
+ */
+const STATUS_FILTERS: AccountHealth[] = [
+  "no-usable-keys",
+  "expiring",
+  "no-keys",
+  "active",
+  "disabled",
+];
+
+export default function ServiceAccountsSettingsPage() {
+  const router = useRouter();
+  const { searchParams, updateQueryParams } = useDataTableQueryParams();
+  const setActionButton = useSetSettingsAction();
+  const [isCreateOpen, setIsCreateOpen] = useState(false);
+  const { data: canReadServiceAccounts, isPending: isCheckingPermissions } =
+    useHasPermissions({ serviceAccount: ["read"] });
+  const { data: scopedGrants } = useScopedCapabilities();
+  const canOnAccount = useCallback(
+    (account: ServiceAccount, action: "update" | "delete") =>
+      holdsItemGrant({
+        grants: scopedGrants,
+        resource: "serviceAccount",
+        action,
+        id: account.id,
+      }),
+    [scopedGrants],
+  );
+  // Label filtering is server-side, so the value rides the query rather than
+  // narrowing the already-fetched list in the browser.
+  const labelsFilter = searchParams.get("labels") || undefined;
+  const {
+    data: serviceAccounts = [],
+    isPending,
+    isFetching,
+    isLoadingError: isServiceAccountsLoadError,
+    refetch: refetchServiceAccounts,
+  } = useServiceAccounts({ labels: labelsFilter });
+  const deleteMutation = useDeleteServiceAccount();
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const bulkDelete = useBulkDeleteServiceAccounts();
+  const bulkSetDisabled = useBulkSetServiceAccountsDisabled();
+
+  const [accountToDelete, setAccountToDelete] = useState<ServiceAccount | null>(
+    null,
+  );
+  const search = searchParams.get("search") || "";
+  const roleFilter = searchParams.get("role") || ALL;
+  const statusFilter = searchParams.get("status") || ALL;
+  const hasActiveFilters =
+    search.trim().length > 0 ||
+    roleFilter !== ALL ||
+    statusFilter !== ALL ||
+    Boolean(labelsFilter);
+
+  useEffect(() => {
+    setActionButton(
+      <div className="flex items-center gap-2">
+        <PermissionButton
+          permissions={{ serviceAccount: ["create"] }}
+          size="sm"
+          onClick={() => setIsCreateOpen(true)}
+        >
+          <Plus className="h-4 w-4" />
+          Create service account
+        </PermissionButton>
+        <ResourceListActions resource="serviceAccount" />
+      </div>,
+    );
+
+    return () => setActionButton(null);
+  }, [setActionButton]);
+
+  const clearFilters = useCallback(
+    () =>
+      updateQueryParams({
+        search: null,
+        role: null,
+        status: null,
+        labels: null,
+        page: "1",
+      }),
+    [updateQueryParams],
+  );
+
+  const filteredServiceAccounts = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    const now = new Date();
+
+    return serviceAccounts.filter((account) => {
+      if (query && !account.name.toLowerCase().includes(query)) return false;
+      if (roleFilter !== ALL && !account.role.split(",").includes(roleFilter))
+        return false;
+      if (
+        statusFilter !== ALL &&
+        getAccountHealth(account, now) !== statusFilter
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }, [serviceAccounts, search, roleFilter, statusFilter]);
+
+  const {
+    rowSelection,
+    setRowSelection,
+    onPageRowIdsChange,
+    clearSelection,
+    selected: selectedAccounts,
+    selectAllMatching,
+  } = useBulkSelection({
+    rows: filteredServiceAccounts,
+    getId: (account) => account.id,
+    filterSignature: `${search}|${roleFilter}|${statusFilter}|${labelsFilter ?? ""}`,
+    matchDescription: hasActiveFilters ? "match these filters" : "exist",
+  });
+
+  const canUpdateSelected = selectedAccounts.every((account) =>
+    canOnAccount(account, "update"),
+  );
+  const canDeleteSelected = selectedAccounts.every((account) =>
+    canOnAccount(account, "delete"),
+  );
+  const hasAnyRowActions = filteredServiceAccounts.some(
+    (account) =>
+      canOnAccount(account, "update") || canOnAccount(account, "delete"),
+  );
+
+  const setDisabled = bulkSetDisabled.mutate;
+  const renderRowActions = useCallback(
+    (account: ServiceAccount) => (
+      <TableRowActions
+        itemName={account.name}
+        actions={[
+          ...(canOnAccount(account, "update")
+            ? [
+                {
+                  icon: <Pencil className="h-4 w-4" />,
+                  label: "Edit service account",
+                  onClick: () =>
+                    router.push(
+                      `/settings/service-accounts/${account.id}/edit`,
+                    ),
+                },
+                {
+                  icon: account.disabled ? (
+                    <Power className="h-4 w-4" />
+                  ) : (
+                    <PowerOff className="h-4 w-4" />
+                  ),
+                  label: account.disabled
+                    ? "Enable service account"
+                    : "Disable service account",
+                  onClick: () =>
+                    setDisabled({
+                      accounts: [account],
+                      disabled: !account.disabled,
+                    }),
+                },
+              ]
+            : []),
+          ...(canOnAccount(account, "delete")
+            ? [
+                {
+                  icon: <Trash2 className="h-4 w-4" />,
+                  label: "Delete service account",
+                  onClick: () => setAccountToDelete(account),
+                  variant: "destructive" as const,
+                },
+              ]
+            : []),
+        ]}
+      />
+    ),
+    [canOnAccount, setDisabled, router],
+  );
+
+  // `DataTable` sets the table's `minWidth` to the sum of these sizes, so the
+  // sum has to fit the settings shell's content column (~718px at 1200px wide)
+  // or trailing columns disappear behind a horizontal scroll. These add up to
+  // 710 including the 56px select column, and each is wide enough for its own
+  // header to sit on one line.
+  const columns: ColumnDef<ServiceAccount>[] = useMemo(() => {
+    const baseColumns: ColumnDef<ServiceAccount>[] = [
+      createSelectColumn<ServiceAccount>({
+        rowLabel: (account) => `Select ${account.name}`,
+        allLabel: "Select all service accounts on this page",
+      }),
+      {
+        accessorKey: "name",
+        header: "Account",
+        size: 128,
+        cell: ({ row }) => (
+          <AgentNameCell
+            name={row.original.name}
+            icon={<AgentIcon icon={row.original.icon} size={20} />}
+            labels={row.original.labels}
+            href={`/settings/service-accounts/${row.original.id}`}
+          />
+        ),
+      },
+      {
+        accessorKey: "role",
+        header: "Roles",
+        size: 128,
+        cell: ({ row }) => <RolesCell role={row.original.role} />,
+      },
+      {
+        accessorKey: "disabled",
+        header: "Status",
+        size: 112,
+        cell: ({ row }) => (
+          <AccountHealthBadge health={getAccountHealth(row.original)} />
+        ),
+      },
+      {
+        accessorKey: "tokenCount",
+        header: "API keys",
+        size: 90,
+        cell: ({ row }) => <KeyCount account={row.original} />,
+      },
+      {
+        accessorKey: "lastUsedAt",
+        header: "Last used",
+        size: 108,
+        cell: ({ row }) => <LastUsed account={row.original} />,
+      },
+      // "Created" is deliberately absent. The settings shell gives this table a
+      // narrower column than a top-level page, and an eighth column pushed
+      // Actions off-screen. For a machine identity "last used" is the
+      // operational question; the creation date is archival and still shown on
+      // the account's page.
+    ];
+
+    if (!hasAnyRowActions) {
+      return baseColumns;
+    }
+
+    return [
+      ...baseColumns,
+      {
+        id: "actions",
+        header: "Actions",
+        // Three actions need their own width; the name column can give up space.
+        size: 128,
+        cell: ({ row }) => renderRowActions(row.original),
+      },
+    ];
+  }, [hasAnyRowActions, renderRowActions]);
+
+  const handleDelete = async () => {
+    if (!accountToDelete) return;
+    await deleteMutation.mutateAsync(accountToDelete.id);
+    setAccountToDelete(null);
+  };
+
+  const applyBulkDisabled = (disabled: boolean) =>
+    bulkSetDisabled.mutate(
+      { accounts: selectedAccounts, disabled },
+      {
+        onSuccess: (outcome) => {
+          reportBulkOutcome({
+            outcome,
+            verb: disabled ? "Disabled" : "Enabled",
+            failureVerb: disabled ? "disable" : "enable",
+            noun: "service account",
+          });
+          if (outcome.failed.length === 0) clearSelection();
+        },
+      },
+    );
+
+  return (
+    <div className="space-y-6">
+      {!isCheckingPermissions && !canReadServiceAccounts ? (
+        <Alert variant="destructive">
+          <AlertTitle>Access denied</AlertTitle>
+          <AlertDescription>
+            You do not have permission to view service accounts.
+          </AlertDescription>
+        </Alert>
+      ) : (
+        /* The filters and the table report their own first load rather than
+           being replaced by a centred loader. Swapping a full-height indicator
+           out for the whole view meant the toolbar and headers arrived a beat
+           after the wait had visibly ended, so one navigation read as loader,
+           then components, then content. */
+        <BulkActionsScope>
+          <div>
+            <CollectionFilters>
+              <FilterBar
+                onClearFilters={hasActiveFilters ? clearFilters : undefined}
+                search={
+                  <SearchInput
+                    objectNamePlural="service accounts"
+                    searchFields={["name"]}
+                    className={filterSearchClass}
+                  />
+                }
+              >
+                <RoleSelect
+                  mode="filter"
+                  value={roleFilter}
+                  onValueChange={(value) =>
+                    updateQueryParams({
+                      role: value === ALL ? null : value,
+                      page: "1",
+                    })
+                  }
+                  allOptionValue={ALL}
+                />
+                <FilterSelect
+                  value={statusFilter}
+                  onValueChange={(value) =>
+                    updateQueryParams({
+                      status: value === ALL ? null : value,
+                      page: "1",
+                    })
+                  }
+                  placeholder="Filter by status"
+                  // Each option renders as the reading it selects, so the
+                  // filter and the Status column teach one vocabulary rather
+                  // than two. `label` stays the bare word, which is what the
+                  // list is searched and announced by.
+                  items={[
+                    {
+                      value: ALL,
+                      label: "All statuses",
+                      content: (
+                        <span className="inline-flex items-center gap-1.5 text-sm">
+                          <ListFilter
+                            aria-hidden
+                            className="size-3.5 shrink-0 text-muted-foreground"
+                          />
+                          All statuses
+                        </span>
+                      ),
+                    },
+                    ...STATUS_FILTERS.map((health) => ({
+                      value: health,
+                      label: ACCOUNT_HEALTH_LABELS[health],
+                      content: <AccountHealthBadge health={health} />,
+                    })),
+                  ]}
+                />
+                <EntityLabelFilter
+                  useLabelKeys={useServiceAccountLabelKeys}
+                  useLabelValues={useServiceAccountLabelValues}
+                  className={filterControlClass({
+                    active: Boolean(labelsFilter),
+                  })}
+                />
+              </FilterBar>
+            </CollectionFilters>
+            {isServiceAccountsLoadError ? (
+              <QueryLoadError
+                title="Couldn't load your service accounts"
+                onRetry={() => refetchServiceAccounts()}
+              />
+            ) : (
+              <>
+                <BulkActions
+                  count={selectedAccounts.length}
+                  noun="service account"
+                  onClear={clearSelection}
+                  busy={bulkDelete.isPending || bulkSetDisabled.isPending}
+                  selectAllMatching={selectAllMatching}
+                >
+                  <PermissionButton
+                    permissions={{}}
+                    disabled={!canUpdateSelected}
+                    tooltip={
+                      canUpdateSelected
+                        ? undefined
+                        : "You can't update every selected service account"
+                    }
+                    variant="outline"
+                    size="sm"
+                    onClick={() => applyBulkDisabled(false)}
+                  >
+                    <Power className="h-4 w-4" />
+                    <span>Enable</span>
+                  </PermissionButton>
+                  <PermissionButton
+                    permissions={{}}
+                    disabled={!canUpdateSelected}
+                    tooltip={
+                      canUpdateSelected
+                        ? undefined
+                        : "You can't update every selected service account"
+                    }
+                    variant="outline"
+                    size="sm"
+                    onClick={() => applyBulkDisabled(true)}
+                  >
+                    <PowerOff className="h-4 w-4" />
+                    <span>Disable</span>
+                  </PermissionButton>
+                  <PermissionButton
+                    permissions={{}}
+                    disabled={!canDeleteSelected}
+                    tooltip={
+                      canDeleteSelected
+                        ? undefined
+                        : "You can't delete every selected service account"
+                    }
+                    variant="destructive"
+                    size="sm"
+                    onClick={() => setBulkDeleteOpen(true)}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                    <span>Delete</span>
+                  </PermissionButton>
+                </BulkActions>
+                <DataTable
+                  columns={columns}
+                  data={filteredServiceAccounts}
+                  isLoading={
+                    (isPending || isFetching) && serviceAccounts.length === 0
+                  }
+                  getRowId={(row) => row.id}
+                  rowSelection={rowSelection}
+                  onRowSelectionChange={setRowSelection}
+                  onPageRowIdsChange={onPageRowIdsChange}
+                  hideSelectedCount
+                  onRowClick={(account, event) =>
+                    openRowOnPlainClick(event, () =>
+                      router.push(`/settings/service-accounts/${account.id}`),
+                    )
+                  }
+                  emptyIcon={Bot}
+                  emptyMessage="No service accounts yet"
+                  emptyDescription="Service accounts are organization-owned identities that let scripts and integrations call the platform API."
+                  hasActiveFilters={hasActiveFilters}
+                  filteredEmptyMessage="No service accounts match your filters"
+                  onClearFilters={clearFilters}
+                  hidePaginationWhenSinglePage
+                  fixedWidthColumnIds={[
+                    "role",
+                    "disabled",
+                    "tokenCount",
+                    "lastUsedAt",
+                    "actions",
+                  ]}
+                  flexibleColumnIds={["name"]}
+                />
+              </>
+            )}
+          </div>
+        </BulkActionsScope>
+      )}
+
+      {bulkDeleteOpen && (
+        <DeleteConfirmDialog
+          open={bulkDeleteOpen}
+          onOpenChange={setBulkDeleteOpen}
+          title="Delete service accounts"
+          description={`Delete ${selectedAccounts.length} ${
+            selectedAccounts.length === 1
+              ? "service account"
+              : "service accounts"
+          }? Their keys stop working immediately. To stop them reversibly, disable them instead.`}
+          isPending={bulkDelete.isPending}
+          onConfirm={() => {
+            bulkDelete.mutate(selectedAccounts, {
+              onSuccess: (outcome) => {
+                reportBulkOutcome({
+                  outcome,
+                  verb: "Deleted",
+                  failureVerb: "delete",
+                  noun: "service account",
+                });
+                setBulkDeleteOpen(false);
+                if (outcome.failed.length === 0) clearSelection();
+              },
+            });
+          }}
+          confirmLabel="Delete service accounts"
+          pendingLabel="Deleting..."
+        />
+      )}
+
+      <DeleteConfirmDialog
+        open={!!accountToDelete}
+        onOpenChange={(open) => {
+          if (!open) setAccountToDelete(null);
+        }}
+        title="Delete service account"
+        description="Deleting a service account immediately invalidates all of its API keys. To stop it reversibly, disable it instead."
+        isPending={deleteMutation.isPending}
+        onConfirm={handleDelete}
+      />
+
+      <CreateServiceAccountDialog
+        open={isCreateOpen}
+        onOpenChange={setIsCreateOpen}
+      />
+    </div>
+  );
+}
+
+// === Internal helpers
+
+function RolesCell({ role }: { role: string }) {
+  const roles = role.split(",").map((value) => formatRoleName(value.trim()));
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <UnstyledButton
+          type="button"
+          aria-label={`View assigned roles: ${roles.join(", ")}`}
+          className="flex min-w-0 max-w-full items-center gap-1"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <Badge variant="secondary" className="min-w-0 shrink">
+            <span className="truncate">{roles[0]}</span>
+          </Badge>
+          {roles.length > 1 && (
+            <span className="shrink-0 text-xs text-muted-foreground">
+              +{roles.length - 1}
+            </span>
+          )}
+        </UnstyledButton>
+      </TooltipTrigger>
+      <TooltipContent>
+        <div className="flex max-w-xs flex-wrap gap-1">
+          {roles.map((name) => (
+            <Badge key={name} variant="secondary">
+              {name}
+            </Badge>
+          ))}
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+/**
+ * Keys as "usable of total", collapsing to one number when they agree. `2` and
+ * `0 of 2` are very different situations that a bare count renders identically.
+ */
+function KeyCount({ account }: { account: ServiceAccount }) {
+  if (account.tokenCount === 0) return <span>None</span>;
+  if (account.activeTokenCount === account.tokenCount) {
+    return <span>{account.tokenCount}</span>;
+  }
+  return (
+    <span
+      title={`${account.activeTokenCount} of ${account.tokenCount} keys usable`}
+    >
+      {account.activeTokenCount} / {account.tokenCount}
+    </span>
+  );
+}
+
+function LastUsed({ account }: { account: ServiceAccount }) {
+  if (!account.lastUsedAt) {
+    return <span className="text-muted-foreground">Never used</span>;
+  }
+  return <span>{formatRelativeTimeFromNow(account.lastUsedAt)}</span>;
+}

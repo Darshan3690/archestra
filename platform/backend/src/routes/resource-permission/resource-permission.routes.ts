@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+import {
+  ManagedResourceSchema,
+  ResourcePermissionActionSchema,
+  ResourcePermissionScopeSchema,
+  ResourceSharedWithQuerySchema,
+  RouteId,
+  withoutWildcardCoveredGrants,
+} from "@archestra/shared";
+import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
+import { z } from "zod";
+import { ResourcePermissions } from "@/services/resource-permissions";
+import { constructResponseSchema } from "@/types";
+import {
+  PermissionSubjectOptionSchema,
+  ResourcePermissionsResponseSchema,
+  UpdateResourcePermissionPolicySchema,
+} from "@/types/resource-permission";
+
+const resourcePermissionRoutes: FastifyPluginAsyncZod = async (fastify) => {
+  fastify.get(
+    "/api/resource-permissions/:resource/creation-subjects",
+    {
+      schema: {
+        operationId: RouteId.SearchInitialPermissionSubjects,
+        tags: ["Permissions"],
+        params: z.object({ resource: ManagedResourceSchema }),
+        querystring: z.object({
+          query: z.string().max(200).default(""),
+          exclude: ResourceSharedWithQuerySchema.refine(
+            (subjects) => !subjects || subjects.length <= 200,
+            "At most 200 recipients may be excluded",
+          ).describe(
+            "Exclude already selected recipients, using comma-separated subject keys.",
+          ),
+        }),
+        response: constructResponseSchema(
+          z.array(PermissionSubjectOptionSchema),
+        ),
+      },
+    },
+    async (request, reply) =>
+      reply.send(
+        await ResourcePermissions.searchInitialSubjects({
+          ...request.params,
+          query: request.query.query,
+          exclude: request.query.exclude,
+          organizationId: request.organizationId,
+          userId: request.user.id,
+        }),
+      ),
+  );
+  fastify.get(
+    "/api/resource-permissions",
+    {
+      schema: {
+        operationId: RouteId.GetScopedCapabilities,
+        tags: ["Permissions"],
+        description:
+          "The signed-in actor's explicit scoped capabilities. Single-object grants that a `*` grant for the same resource and action covers are left out. Used for discovery; each operation still authorizes its target.",
+        response: constructResponseSchema(
+          z.array(
+            z.object({
+              organizationId: z.string(),
+              resource: ManagedResourceSchema,
+              scope: ResourcePermissionScopeSchema,
+              action: ResourcePermissionActionSchema,
+            }),
+          ),
+        ),
+      },
+    },
+    async (request, reply) =>
+      reply.send(
+        withoutWildcardCoveredGrants(
+          await ResourcePermissions.resolveUiCapabilities({
+            userId: request.user.id,
+            organizationId: request.organizationId,
+          }),
+        ),
+      ),
+  );
+  fastify.get(
+    "/api/resource-permissions/:resource/:scope/subjects",
+    {
+      schema: {
+        operationId: RouteId.SearchResourcePermissionSubjects,
+        tags: ["Permissions"],
+        params: ParamsSchema,
+        querystring: z.object({
+          query: z.string().max(200).default(""),
+          exclude: ResourceSharedWithQuerySchema.refine(
+            (subjects) => !subjects || subjects.length <= 200,
+            "At most 200 recipients may be excluded",
+          ).describe(
+            "Exclude already selected recipients, using comma-separated subject keys.",
+          ),
+        }),
+        response: constructResponseSchema(
+          z.array(PermissionSubjectOptionSchema),
+        ),
+      },
+    },
+    async (request, reply) =>
+      reply.send(
+        await ResourcePermissions.searchSubjects({
+          ...request.params,
+          query: request.query.query,
+          exclude: request.query.exclude,
+          userId: request.user.id,
+          organizationId: request.organizationId,
+        }),
+      ),
+  );
+  fastify.get(
+    "/api/resource-permissions/:resource/:scope",
+    {
+      schema: {
+        operationId: RouteId.GetResourcePermissions,
+        tags: ["Permissions"],
+        description:
+          "Read direct grants and effective actions for an object or all objects of one resource type",
+        params: ParamsSchema,
+        response: constructResponseSchema(ResourcePermissionsResponseSchema),
+      },
+    },
+    async (request, reply) =>
+      reply.send(
+        await ResourcePermissions.getPolicy({
+          ...request.params,
+          organizationId: request.organizationId,
+          userId: request.user.id,
+        }),
+      ),
+  );
+
+  fastify.put(
+    "/api/resource-permissions/:resource/:scope",
+    {
+      schema: {
+        operationId: RouteId.UpdateResourcePermissions,
+        tags: ["Permissions"],
+        description:
+          "Replace direct resource grants with optimistic concurrency and delegation checks",
+        params: ParamsSchema,
+        body: UpdateResourcePermissionPolicySchema,
+        response: constructResponseSchema(ResourcePermissionsResponseSchema),
+      },
+    },
+    async (request, reply) =>
+      reply.send(
+        await ResourcePermissions.updatePolicy({
+          ...request.params,
+          ...request.body,
+          organizationId: request.organizationId,
+          userId: request.user.id,
+        }),
+      ),
+  );
+};
+
+export default resourcePermissionRoutes;
+
+const ParamsSchema = z.object({
+  resource: ManagedResourceSchema,
+  scope: ResourcePermissionScopeSchema,
+});

@@ -1,52 +1,77 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
-import db, { schema } from "@/database";
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+import type { ScopedResource } from "@archestra/shared";
+import {
+  and,
+  eq,
+  inArray,
+  isNull,
+  or,
+  type SQLWrapper,
+  sql,
+} from "drizzle-orm";
+import { canUseAgent } from "@/auth/permission-gated";
+import db, { schema, withDbTransaction } from "@/database";
 import logger from "@/logging";
-import type { AgentAccessContext } from "@/types";
+import { readConfig } from "@/services/config-cache";
+import type { AgentAccessContext, LabelWithDetails } from "@/types";
+import AgentModel from "./agent";
 import { findAgentAccessContextById } from "./agent-access-context";
+import ResourcePermissionPolicyModel from "./resource-permission-policy";
+import ResourcePermissionSubjectModel, {
+  type GrantPrincipal,
+  type PrincipalSource,
+} from "./resource-permission-subject";
+import TeamModel from "./team";
+import TeamLabelModel from "./team-label";
 
 class AgentTeamModel {
-  /**
-   * Get all agent IDs that a user has access to.
-   * Three sources of access:
-   * 1. Org-scoped agents (visible to all)
-   * 2. Author's own personal agents
-   * 3. Team-scoped agents where user is a team member
-   */
+  static async credentialHasAgentAccess(params: {
+    organizationId: string;
+    agentId: string;
+    teamId: string | null;
+  }): Promise<boolean> {
+    const [agent] = await db
+      .select({
+        agentType: schema.agentsTable.agentType,
+        organizationId: schema.agentsTable.organizationId,
+      })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.id, params.agentId),
+          isNull(schema.agentsTable.deletedAt),
+        ),
+      );
+    if (!agent || agent.organizationId !== params.organizationId) return false;
+    const resource = agent.agentType === "mcp_gateway" ? "mcpGateway" : "agent";
+    const key = {
+      organizationId: params.organizationId,
+      resource,
+      scope: params.agentId,
+    } as const;
+    return ResourcePermissionPolicyModel.sharedCredentialHasAccess({
+      ...key,
+      teamId: params.teamId,
+      action: "use",
+    });
+  }
+
+  /** Get all agent IDs that a user can read. */
   static async getUserAccessibleAgentIds(
     userId: string,
     isAgentAdmin: boolean,
+    /** The caller's already-resolved principals, when the query has them. */
+    principals?: GrantPrincipal[],
   ): Promise<string[]> {
     logger.debug(
       { userId, isAgentAdmin },
       "AgentTeamModel.getUserAccessibleAgentIds: starting",
     );
-    // Agent admins have access to all agents
-    if (isAgentAdmin) {
-      const allAgents = await db
-        .select({ id: schema.agentsTable.id })
-        .from(schema.agentsTable);
-
-      logger.debug(
-        { userId, count: allAgents.length },
-        "AgentTeamModel.getUserAccessibleAgentIds: admin access to all agents",
-      );
-      return allAgents.map((agent) => agent.id);
-    }
-
-    // Single query: UNION of org-scoped, author's own, and team-scoped agents
-    const result = await db.execute<{ id: string }>(sql`
-      SELECT id FROM agents WHERE scope = 'org'
-      UNION
-      SELECT id FROM agents WHERE author_id = ${userId} AND scope = 'personal'
-      UNION
-      SELECT at.agent_id AS id
-        FROM agent_team at
-        INNER JOIN agents a ON at.agent_id = a.id
-        INNER JOIN team_member tm ON at.team_id = tm.team_id
-        WHERE tm.user_id = ${userId} AND a.scope = 'team'
-    `);
-
-    const accessibleAgentIds = result.rows.map((r) => r.id);
+    const accessibleAgentIds = await AgentModel.findAccessibleIdsForUser(
+      userId,
+      isAgentAdmin,
+      principals,
+    );
 
     logger.debug(
       { userId, agentCount: accessibleAgentIds.length },
@@ -56,149 +81,168 @@ class AgentTeamModel {
   }
 
   /**
-   * Check if a user has access to a specific agent.
-   * Access rules (in order):
-   * 1. Admin → true
-   * 2. scope = 'org' → true
-   * 3. scope = 'personal' → only the author has access
-   * 4. scope = 'team' AND user is in one of agent's teams → true
+   * Check if a user has access to a specific agent: an LLM proxy serves its
+   * organization's members (any proxy for an admin); a grant decides for an
+   * agent or MCP gateway.
    */
-  static async userHasAgentAccess(
-    userId: string,
-    agentId: string,
-    isAgentAdmin: boolean,
-    agentAccessContext?: AgentAccessContext | null,
-  ): Promise<boolean> {
+  static async userHasAgentAccess(params: {
+    userId: string;
+    agentId: string;
+    isAgentAdmin: boolean;
+    agentAccessContext?: AgentAccessContext | null;
+    action?: "read" | "use";
+    lookups?: PrincipalSource;
+  }): Promise<boolean> {
+    const {
+      userId,
+      agentId,
+      isAgentAdmin,
+      agentAccessContext,
+      action = "read",
+      lookups,
+    } = params;
     logger.debug(
       { userId, agentId, isAgentAdmin },
       "AgentTeamModel.userHasAgentAccess: checking access",
     );
-    // 1. Admin → true
-    if (isAgentAdmin) {
-      logger.debug(
-        { userId, agentId },
-        "AgentTeamModel.userHasAgentAccess: admin has access",
-      );
-      return true;
-    }
-
     const agent =
       agentAccessContext ?? (await findAgentAccessContextById(agentId));
 
     if (!agent) {
       return false;
     }
-
-    // 2. scope = 'org' → true
-    if (agent.scope === "org") {
-      logger.debug(
-        { userId, agentId },
-        "AgentTeamModel.userHasAgentAccess: org-scoped agent, granting access",
+    if (
+      !(await canUseAgent(agentId, {
+        userId,
+        organizationId: agent.organizationId,
+      }))
+    )
+      return false;
+    // Agents and MCP gateways are reached through grants alone. An LLM proxy
+    // has no grant namespace of its own: the organization's proxy serves every
+    // member, and an administrator reaches any proxy row.
+    if (agent.agentType === "llm_proxy")
+      return (
+        isAgentAdmin ||
+        AgentModel.isOrganizationLlmProxyFor({ agentId, userId })
       );
-      return true;
-    }
 
-    // 3. scope = 'personal' → only the author has access
-    if (agent.scope === "personal") {
-      const hasAccess = agent.authorId === userId;
-      logger.debug(
-        { userId, agentId, hasAccess },
-        "AgentTeamModel.userHasAgentAccess: personal agent check",
-      );
-      return hasAccess;
-    }
-
-    // 4. scope = 'team' AND user is in one of agent's teams
-    if (agent.scope === "team") {
-      const userTeams = await db
-        .select({ teamId: schema.teamMembersTable.teamId })
-        .from(schema.teamMembersTable)
-        .where(eq(schema.teamMembersTable.userId, userId));
-
-      const teamIds = userTeams.map((t) => t.teamId);
-
-      if (teamIds.length === 0) {
-        logger.debug(
-          { userId, agentId },
-          "AgentTeamModel.userHasAgentAccess: user has no teams",
-        );
-        return false;
-      }
-
-      const agentTeam = await db
-        .select()
-        .from(schema.agentTeamsTable)
-        .where(
-          and(
-            eq(schema.agentTeamsTable.agentId, agentId),
-            inArray(schema.agentTeamsTable.teamId, teamIds),
-          ),
-        )
-        .limit(1);
-
-      const hasAccess = agentTeam.length > 0;
-      logger.debug(
-        { userId, agentId, hasAccess },
-        "AgentTeamModel.userHasAgentAccess: team check completed",
-      );
-      return hasAccess;
-    }
-
-    return false;
+    const table = schema.agentsTable;
+    const principal = await ResourcePermissionSubjectModel.resolvePrincipalFrom(
+      lookups,
+      { organizationId: agent.organizationId, userId },
+    );
+    return readConfig(
+      `agent-grant\0${action}\0${agentId}\0${agent.organizationId}\0${userId}`,
+      async () => {
+        const [granted] = await db
+          .select({ id: table.id })
+          .from(table)
+          .where(
+            and(
+              eq(table.id, agentId),
+              or(
+                and(
+                  inArray(table.agentType, ["agent", "profile"]),
+                  ResourcePermissionPolicyModel.grantCondition({
+                    ...principal,
+                    resource: "agent",
+                    scopeColumn: table.id,
+                    action,
+                  }),
+                ),
+                and(
+                  eq(table.agentType, "mcp_gateway"),
+                  ResourcePermissionPolicyModel.grantCondition({
+                    ...principal,
+                    resource: "mcpGateway",
+                    scopeColumn: table.id,
+                    action,
+                  }),
+                ),
+              ),
+            ),
+          )
+          .limit(1);
+        return granted !== undefined;
+      },
+    );
   }
 
   /**
-   * Get all team IDs assigned to a specific agent
+   * The teams an agent's own policy grants read to. Team limits and team
+   * statistics read this, so an agent shared with a team by grant counts as
+   * that team's agent.
    */
   static async getTeamsForAgent(agentId: string): Promise<string[]> {
-    logger.debug(
-      { agentId },
-      "AgentTeamModel.getTeamsForAgent: fetching teams",
+    return (
+      (await AgentTeamModel.getTeamsForAgents([agentId])).get(agentId) ?? []
     );
-    const agentTeams = await db
-      .select({ teamId: schema.agentTeamsTable.teamId })
-      .from(schema.agentTeamsTable)
-      .where(eq(schema.agentTeamsTable.agentId, agentId));
-
-    const teamIds = agentTeams.map((at) => at.teamId);
-    logger.debug(
-      { agentId, count: teamIds.length },
-      "AgentTeamModel.getTeamsForAgent: completed",
-    );
-    return teamIds;
   }
 
   /**
-   * Get team details (id and name) for a specific agent
+   * The agent's teams a call belongs to: those the caller is in, directly or
+   * through a sub-team. Team limits and usage use this, so another team's
+   * limit on a shared agent never applies to the caller.
    */
+  static async getCallerTeamsForAgent(params: {
+    agentId: string;
+    userId: string | null | undefined;
+    teamSource?: AgentTeamSource;
+  }): Promise<string[]> {
+    if (!params.userId) return [];
+    const [agentTeamIds, callerTeamIds] = await Promise.all([
+      params.teamSource
+        ? params.teamSource.agentTeamIds(params.agentId)
+        : AgentTeamModel.getTeamsForAgent(params.agentId),
+      TeamModel.getUserTeamIds(params.userId),
+    ]);
+    const callerTeams = new Set(callerTeamIds);
+    return agentTeamIds.filter((teamId) => callerTeams.has(teamId));
+  }
+
+  /**
+   * Get team details with labels for a specific agent, shaped for trace span
+   * attributes. Combines team id/name with each team's labels.
+   */
+  static async getTeamLabelInfoForAgent(
+    agentId: string,
+    teamSource?: AgentTeamSource,
+  ): Promise<
+    Array<{
+      id: string;
+      name: string;
+      labels: LabelWithDetails[];
+    }>
+  > {
+    const teams = teamSource
+      ? await AgentTeamModel.findTeamDetails(
+          await teamSource.agentTeamIds(agentId),
+        )
+      : await AgentTeamModel.getTeamDetailsForAgent(agentId);
+    if (teams.length === 0) {
+      return [];
+    }
+
+    const labelsByTeam = await TeamLabelModel.getLabelsForTeams(
+      teams.map((team) => team.id),
+    );
+
+    return teams.map((team) => ({
+      id: team.id,
+      name: team.name,
+      labels: labelsByTeam.get(team.id) ?? [],
+    }));
+  }
+
+  /** Team details (id and name) for {@link getTeamsForAgent}. */
   static async getTeamDetailsForAgent(
     agentId: string,
   ): Promise<Array<{ id: string; name: string }>> {
-    logger.debug(
-      { agentId },
-      "AgentTeamModel.getTeamDetailsForAgent: fetching team details",
+    return (
+      (await AgentTeamModel.getTeamDetailsForAgents([agentId])).get(agentId) ??
+      []
     );
-    const agentTeams = await db
-      .select({
-        teamId: schema.agentTeamsTable.teamId,
-        teamName: schema.teamsTable.name,
-      })
-      .from(schema.agentTeamsTable)
-      .innerJoin(
-        schema.teamsTable,
-        eq(schema.agentTeamsTable.teamId, schema.teamsTable.id),
-      )
-      .where(eq(schema.agentTeamsTable.agentId, agentId));
-
-    const teams = agentTeams.map((at) => ({
-      id: at.teamId,
-      name: at.teamName,
-    }));
-    logger.debug(
-      { agentId, count: teams.length },
-      "AgentTeamModel.getTeamDetailsForAgent: completed",
-    );
-    return teams;
   }
 
   /**
@@ -212,7 +256,7 @@ class AgentTeamModel {
       { agentId, teamCount: teamIds.length },
       "AgentTeamModel.syncAgentTeams: syncing teams",
     );
-    await db.transaction(async (tx) => {
+    await withDbTransaction(async (tx) => {
       // Delete all existing team assignments
       await tx
         .delete(schema.agentTeamsTable)
@@ -296,162 +340,150 @@ class AgentTeamModel {
     return removed;
   }
 
-  /**
-   * Check if a team token can access an agent.
-   * Access rules:
-   * 1. scope = 'org' → true
-   * 2. scope = 'team' AND agent assigned to the given team → true
-   * 3. Otherwise → false (personal agents NOT accessible via team tokens)
-   */
-  static async teamHasAgentAccess(
-    agentId: string,
-    teamId: string | null,
-    agentAccessContext?: AgentAccessContext | null,
-  ): Promise<boolean> {
-    logger.debug(
-      { agentId, teamId },
-      "AgentTeamModel.teamHasAgentAccess: checking access",
-    );
-
-    const agent =
-      agentAccessContext ?? (await findAgentAccessContextById(agentId));
-
-    if (!agent) {
-      return false;
-    }
-
-    // 1. scope = 'org' → true
-    if (agent.scope === "org") {
-      logger.debug(
-        { agentId, teamId },
-        "AgentTeamModel.teamHasAgentAccess: org-scoped agent, granting access",
-      );
-      return true;
-    }
-
-    // 2. scope = 'team' AND agent assigned to the given team
-    if (agent.scope === "team" && teamId) {
-      const match = await db
-        .select({ teamId: schema.agentTeamsTable.teamId })
-        .from(schema.agentTeamsTable)
-        .where(
-          and(
-            eq(schema.agentTeamsTable.agentId, agentId),
-            eq(schema.agentTeamsTable.teamId, teamId),
-          ),
-        )
-        .limit(1);
-
-      const hasAccess = match.length > 0;
-      logger.debug(
-        { agentId, teamId, hasAccess },
-        "AgentTeamModel.teamHasAgentAccess: team check completed",
-      );
-      return hasAccess;
-    }
-
-    // 3. Personal agents or no teamId → false
-    logger.debug(
-      { agentId, teamId },
-      "AgentTeamModel.teamHasAgentAccess: denying access",
-    );
-    return false;
-  }
-
-  /**
-   * Get team IDs for multiple agents in one query to avoid N+1
-   */
+  /** {@link getTeamsForAgent} for several agents at once. */
   static async getTeamsForAgents(
     agentIds: string[],
   ): Promise<Map<string, string[]>> {
-    logger.debug(
-      { agentCount: agentIds.length },
-      "AgentTeamModel.getTeamsForAgents: fetching teams",
+    const recipients = await ResourcePermissionPolicyModel.findReadRecipients({
+      resources: AGENT_RESOURCES,
+      scopes: agentIds,
+    });
+    return new Map(
+      agentIds.map((agentId) => [
+        agentId,
+        recipients.get(agentId)?.teamIds ?? [],
+      ]),
     );
-    if (agentIds.length === 0) {
-      logger.debug("AgentTeamModel.getTeamsForAgents: no agents provided");
-      return new Map();
-    }
-
-    const agentTeams = await db
-      .select({
-        agentId: schema.agentTeamsTable.agentId,
-        teamId: schema.agentTeamsTable.teamId,
-      })
-      .from(schema.agentTeamsTable)
-      .where(inArray(schema.agentTeamsTable.agentId, agentIds));
-
-    const teamsMap = new Map<string, string[]>();
-
-    // Initialize all agent IDs with empty arrays
-    for (const agentId of agentIds) {
-      teamsMap.set(agentId, []);
-    }
-
-    // Populate the map with teams
-    for (const { agentId, teamId } of agentTeams) {
-      const teams = teamsMap.get(agentId) || [];
-      teams.push(teamId);
-      teamsMap.set(agentId, teams);
-    }
-
-    logger.debug(
-      { agentCount: agentIds.length, assignmentCount: agentTeams.length },
-      "AgentTeamModel.getTeamsForAgents: completed",
-    );
-    return teamsMap;
   }
 
-  /**
-   * Get team details (id and name) for multiple agents in one query to avoid N+1
-   */
+  /** Team details (id and name) for {@link getTeamsForAgents}. */
   static async getTeamDetailsForAgents(
     agentIds: string[],
   ): Promise<Map<string, Array<{ id: string; name: string }>>> {
-    logger.debug(
-      { agentCount: agentIds.length },
-      "AgentTeamModel.getTeamDetailsForAgents: fetching team details",
+    const teamsByAgent = await AgentTeamModel.getTeamsForAgents(agentIds);
+    const nameById = await AgentTeamModel.findTeamNames([
+      ...new Set([...teamsByAgent.values()].flat()),
+    ]);
+    return new Map(
+      agentIds.map((agentId) => [
+        agentId,
+        withTeamNames(teamsByAgent.get(agentId) ?? [], nameById),
+      ]),
     );
-    if (agentIds.length === 0) {
-      logger.debug(
-        "AgentTeamModel.getTeamDetailsForAgents: no agents provided",
-      );
-      return new Map();
-    }
+  }
 
-    const agentTeams = await db
-      .select({
-        agentId: schema.agentTeamsTable.agentId,
-        teamId: schema.agentTeamsTable.teamId,
-        teamName: schema.teamsTable.name,
+  private static async findTeamDetails(
+    teamIds: string[],
+  ): Promise<Array<{ id: string; name: string }>> {
+    const unique = [...new Set(teamIds)];
+    return withTeamNames(teamIds, await AgentTeamModel.findTeamNames(unique));
+  }
+
+  private static async findTeamNames(
+    teamIds: string[],
+  ): Promise<Map<string, string>> {
+    const teams =
+      teamIds.length === 0
+        ? []
+        : await db
+            .select({ id: schema.teamsTable.id, name: schema.teamsTable.name })
+            .from(schema.teamsTable)
+            .where(inArray(schema.teamsTable.id, teamIds));
+    return new Map(teams.map((team) => [team.id, team.name]));
+  }
+
+  /** Agents and MCP gateways whose own policy grants read to `teamId`. */
+  static async getAgentIdsForTeam(params: {
+    organizationId: string;
+    teamId: string;
+  }): Promise<string[]> {
+    return ResourcePermissionPolicyModel.findScopesReadByTeam({
+      ...params,
+      resources: AGENT_RESOURCES,
+    });
+  }
+
+  /**
+   * Object-local team read assignments, with EXISTS set semantics. Every agent's
+   * policy is expanded unless narrowed: `agentIds` (a subquery of agent ids) or
+   * `teamIds`, which the grants index answers without reading every policy.
+   */
+  static readAssignments(
+    organizationId: string,
+    options: { agentIds?: SQLWrapper; teamIds?: string[] } = {},
+  ) {
+    const agent = schema.agentsTable;
+    const policy = schema.resourcePermissionPoliciesTable;
+    return db
+      .selectDistinct({
+        agentId: sql<string>`${agent.id}`.as("agent_id"),
+        teamId: sql<string>`${schema.teamsTable.id}`.as("team_id"),
       })
-      .from(schema.agentTeamsTable)
+      .from(agent)
+      .innerJoin(
+        policy,
+        and(
+          eq(policy.organizationId, agent.organizationId),
+          eq(
+            policy.resource,
+            sql`CASE WHEN ${agent.agentType} = 'mcp_gateway' THEN 'mcpGateway' ELSE 'agent' END`,
+          ),
+          eq(policy.scope, sql`${agent.id}::text`),
+        ),
+      )
+      .innerJoin(
+        sql`jsonb_array_elements(${policy.grants}) AS team_grant`,
+        ResourcePermissionPolicyModel.teamReadGrantCondition(sql`team_grant`),
+      )
       .innerJoin(
         schema.teamsTable,
-        eq(schema.agentTeamsTable.teamId, schema.teamsTable.id),
+        eq(schema.teamsTable.id, sql`team_grant->'subject'->>'id'`),
       )
-      .where(inArray(schema.agentTeamsTable.agentId, agentIds));
-
-    const teamsMap = new Map<string, Array<{ id: string; name: string }>>();
-
-    // Initialize all agent IDs with empty arrays
-    for (const agentId of agentIds) {
-      teamsMap.set(agentId, []);
-    }
-
-    // Populate the map with team details
-    for (const { agentId, teamId, teamName } of agentTeams) {
-      const teams = teamsMap.get(agentId) || [];
-      teams.push({ id: teamId, name: teamName });
-      teamsMap.set(agentId, teams);
-    }
-
-    logger.debug(
-      { agentCount: agentIds.length, assignmentCount: agentTeams.length },
-      "AgentTeamModel.getTeamDetailsForAgents: completed",
-    );
-    return teamsMap;
+      .where(
+        and(
+          eq(agent.organizationId, organizationId),
+          isNull(agent.deletedAt),
+          options.agentIds ? inArray(agent.id, options.agentIds) : undefined,
+          options.teamIds
+            ? teamGrantContainment(policy.grants, options.teamIds)
+            : undefined,
+        ),
+      )
+      .as("agent_team_read_assignments");
   }
 }
 
+/** A request-scoped source of an agent's team ids, read once per request. */
+export type AgentTeamSource = {
+  agentTeamIds(agentId: string): Promise<string[]>;
+};
+
+/**
+ * Policies naming any of `teamIds` as a subject, in a form the grants GIN index
+ * answers. A pre-filter only: the grant join still checks the read action.
+ */
+function teamGrantContainment(grants: SQLWrapper, teamIds: string[]) {
+  if (teamIds.length === 0) return sql`false`;
+  return sql`${grants} @> ANY(ARRAY[${sql.join(
+    teamIds.map(
+      (id) =>
+        sql`${JSON.stringify([{ subject: { type: "team", id } }])}::jsonb`,
+    ),
+    sql`, `,
+  )}])`;
+}
+
+function withTeamNames(
+  teamIds: string[],
+  nameById: Map<string, string>,
+): Array<{ id: string; name: string }> {
+  return teamIds.flatMap((id) => {
+    const name = nameById.get(id);
+    return name === undefined ? [] : [{ id, name }];
+  });
+}
+
 export default AgentTeamModel;
+
+// An LLM proxy has no grant namespace, so it reaches no team.
+const AGENT_RESOURCES: ScopedResource[] = ["agent", "mcpGateway"];

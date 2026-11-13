@@ -4,23 +4,35 @@
  * vLLM exposes an OpenAI-compatible API, so these routes mirror the OpenAI routes.
  * See: https://docs.vllm.ai/en/latest/features/openai_api.html
  */
+
+import { RouteId } from "@archestra/shared";
 import fastifyHttpProxy from "@fastify/http-proxy";
-import { RouteId } from "@shared";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
 import config from "@/config";
 import logger from "@/logging";
-import { constructResponseSchema, UuidIdSchema, Vllm } from "@/types";
-import { vllmAdapterFactory } from "../adapters";
+import { constructResponseSchema, OpenAi, UuidIdSchema, Vllm } from "@/types";
+import {
+  makeOpenAiCompatibleEmbeddingsAdapterFactory,
+  vllmAdapterFactory,
+} from "../adapters";
 import { PROXY_API_PREFIX, PROXY_BODY_LIMIT } from "../common";
+import { createPassthroughAuthenticator } from "../llm-proxy-auth";
 import { handleLLMProxy } from "../llm-proxy-handler";
 import { createProxyPreHandler } from "./proxy-prehandler";
+
+const vllmEmbeddingsAdapterFactory =
+  makeOpenAiCompatibleEmbeddingsAdapterFactory(
+    "vllm",
+    () => config.llm.vllm.baseUrl,
+  );
 
 const vllmProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
   const API_PREFIX = `${PROXY_API_PREFIX}/vllm`;
   const CHAT_COMPLETIONS_SUFFIX = "/chat/completions";
+  const EMBEDDINGS_SUFFIX = "/embeddings";
 
-  logger.info("[UnifiedProxy] Registering unified vLLM routes");
+  logger.debug("[UnifiedProxy] Registering unified vLLM routes");
 
   // Only register HTTP proxy if vLLM is configured (has baseUrl)
   // Routes are always registered for OpenAPI schema generation
@@ -31,16 +43,74 @@ const vllmProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
       rewritePrefix: "",
       preHandler: createProxyPreHandler({
         apiPrefix: API_PREFIX,
-        endpointSuffix: CHAT_COMPLETIONS_SUFFIX,
+        endpointSuffix: [CHAT_COMPLETIONS_SUFFIX, EMBEDDINGS_SUFFIX],
         upstream: config.llm.vllm.baseUrl as string,
         providerName: "vLLM",
+        authenticate: createPassthroughAuthenticator("vllm"),
       }),
     });
   } else {
-    logger.info(
+    logger.debug(
       "[UnifiedProxy] vLLM base URL not configured, HTTP proxy disabled",
     );
   }
+
+  fastify.post(
+    `${API_PREFIX}${EMBEDDINGS_SUFFIX}`,
+    {
+      bodyLimit: PROXY_BODY_LIMIT,
+      schema: {
+        operationId: RouteId.VllmEmbeddingsWithDefaultAgent,
+        description: "Create embeddings with vLLM (uses default agent)",
+        tags: ["LLM Proxy"],
+        body: OpenAi.API.EmbeddingRequestSchema,
+        headers: OpenAi.API.ChatCompletionsHeadersSchema,
+        response: constructResponseSchema(OpenAi.API.EmbeddingResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      logger.debug(
+        { url: request.url },
+        "[UnifiedProxy] Handling vLLM embeddings request (default agent)",
+      );
+      return handleLLMProxy(
+        request.body as OpenAi.Types.EmbeddingRequest,
+        request,
+        reply,
+        vllmEmbeddingsAdapterFactory,
+      );
+    },
+  );
+
+  fastify.post(
+    `${API_PREFIX}/:agentId${EMBEDDINGS_SUFFIX}`,
+    {
+      bodyLimit: PROXY_BODY_LIMIT,
+      schema: {
+        operationId: RouteId.VllmEmbeddingsWithAgent,
+        description: "Create embeddings with vLLM for a specific agent",
+        tags: ["LLM Proxy"],
+        params: z.object({
+          agentId: UuidIdSchema,
+        }),
+        body: OpenAi.API.EmbeddingRequestSchema,
+        headers: OpenAi.API.ChatCompletionsHeadersSchema,
+        response: constructResponseSchema(OpenAi.API.EmbeddingResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      logger.debug(
+        { url: request.url, agentId: request.params.agentId },
+        "[UnifiedProxy] Handling vLLM embeddings request (with agent)",
+      );
+      return handleLLMProxy(
+        request.body as OpenAi.Types.EmbeddingRequest,
+        request,
+        reply,
+        vllmEmbeddingsAdapterFactory,
+      );
+    },
+  );
 
   fastify.post(
     `${API_PREFIX}${CHAT_COMPLETIONS_SUFFIX}`,
@@ -58,15 +128,6 @@ const vllmProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
       },
     },
     async (request, reply) => {
-      if (!config.llm.vllm.enabled) {
-        return reply.status(500).send({
-          error: {
-            message:
-              "vLLM provider is not configured. Set ARCHESTRA_VLLM_BASE_URL to enable.",
-            type: "api_internal_server_error",
-          },
-        });
-      }
       logger.debug(
         { url: request.url },
         "[UnifiedProxy] Handling vLLM request (default agent)",
@@ -94,15 +155,6 @@ const vllmProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
       },
     },
     async (request, reply) => {
-      if (!config.llm.vllm.enabled) {
-        return reply.status(500).send({
-          error: {
-            message:
-              "vLLM provider is not configured. Set ARCHESTRA_VLLM_BASE_URL to enable.",
-            type: "api_internal_server_error",
-          },
-        });
-      }
       logger.debug(
         { url: request.url, agentId: request.params.agentId },
         "[UnifiedProxy] Handling vLLM request (with agent)",

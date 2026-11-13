@@ -19,25 +19,28 @@ export const ChatCompletionUsageSchema = z
   })
   .describe("Token usage statistics for the completion");
 
-export const FinishReasonSchema = z.enum([
-  "stop",
-  "length",
-  "tool_calls",
-  "content_filter",
-  "function_call",
-]);
+// Persist/read-back must tolerate nonconforming finish_reasons (same as OpenAI).
+export const FinishReasonSchema = z
+  .enum(["stop", "length", "tool_calls", "content_filter", "function_call"])
+  .or(z.string());
 
 const ChoiceSchema = z
   .object({
     finish_reason: FinishReasonSchema,
-    index: z.number(),
-    logprobs: z.any().nullable(),
+    // Some OpenAI-compatible upstreams omit `index` on choices; without
+    // optional() the response fails serialization (500).
+    index: z.number().optional(),
+    // Log probabilities may be omitted when the upstream did not request them.
+    logprobs: z.any().nullable().optional(),
     message: z
       .object({
-        content: z.string().nullable(),
+        // Tool-call-only replies often omit `content` entirely.
+        content: z.string().nullable().optional(),
         refusal: z.string().nullable().optional(),
         role: z.enum(["assistant"]),
-        annotations: z.array(z.any()).optional(),
+        // Some OpenAI-compatible upstreams return `annotations: null` instead of
+        // omitting it; without nullable() the response fails serialization (500).
+        annotations: z.array(z.any()).nullable().optional(),
         audio: z.any().nullable().optional(),
         function_call: z
           .object({
@@ -46,6 +49,10 @@ const ChoiceSchema = z
           })
           .nullable()
           .optional(),
+        // DeepSeek-style reasoning models return thinking in `reasoning_content`
+        // and require it passed back on tool-call turns; response serialization
+        // must preserve it or clients can never satisfy that contract.
+        reasoning_content: z.string().nullable().optional(),
         tool_calls: z.array(ToolCallSchema).optional(),
       })
       .describe("The assistant message in the response"),
@@ -68,6 +75,12 @@ export const ChatCompletionRequestSchema = z
     stop: z.union([z.string(), z.array(z.string())]).optional(),
     seed: z.number().nullable().optional(),
     n: z.number().nullable().optional(),
+    /**
+     * Reasoning depth, which Ollama's `/v1` maps onto its own `think` field.
+     * Must be declared: inbound validation drops anything this schema does not
+     * name, so an undeclared field never reaches the adapter.
+     */
+    reasoning_effort: z.string().nullable().optional(),
   })
   .describe("Ollama chat completion request (OpenAI-compatible)");
 
